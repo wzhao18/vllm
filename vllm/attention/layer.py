@@ -512,6 +512,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.kv_lora_rank = kv_lora_rank
         self.head_size = kv_lora_rank + qk_rope_head_dim
         self.layer_name = prefix
+        self.kv_b_proj = kv_b_proj
 
         if cache_config is not None:
             kv_cache_dtype = cache_config.cache_dtype
