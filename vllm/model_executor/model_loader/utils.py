@@ -115,7 +115,8 @@ def process_weights_after_loading(
         ):
             # TODO(lucas): see if there is a way to unify the signatures
             # of process_weights_after_loading
-            module.process_weights_after_loading(model_config.dtype)
+            with device_loading_context(module, target_device):
+                module.process_weights_after_loading(model_config.dtype)
 
 
 @contextmanager
