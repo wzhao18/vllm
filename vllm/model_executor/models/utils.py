@@ -536,32 +536,41 @@ def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
     if _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES:
         return module
 
-    pin_memory = is_pin_memory_available()
     uva_available = is_uva_available()
 
     assert uva_available, "V1 CPU offloading requires uva (pin memory) support"
-    uva_offloading = False
-    pin_memory = False
+    uva_offloading = True
 
     # offload parameters to CPU
     # use pin_memory if possible, which helps cudagraph capture speed
     offloaded_parameters = False
-    for p in module.parameters():
+    for name, p in module.named_parameters():
         if _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES:
             # we use per-parameter offloading
             # one module might have some parameters offloaded and some not
             break
 
+        # logger.info(f"Offloading parameter {name} to CPU")
+        # logger.info(f"Parameter shape: {p.data.shape}")
+        # logger.info(f"Parameter dtype: {p.data.dtype}")
+        # logger.info(f"Parameter device: {p.data.device}")
+        # logger.info(f"Parameter numel: {p.data.numel()}")
+        # logger.info(f"Parameter element size: {p.data.element_size()}")
+        # logger.info(f"Parameter total size: {p.data.numel() * p.data.element_size()}")
+        # logger.info(f"Parameter total size: {p.data.numel() * p.data.element_size()}")
+        # logger.info(f"Parameter stride: {p.data.stride()}")
+        # logger.info(f"Parameter size: {p.data.size()}")
+        # logger.info(f"Parameter layout: {p.data.layout}")
+
         cpu_data = p.data.to(device="cpu")
-        if pin_memory:
-            cpu_data = cpu_data.pin_memory()
-        
+
         if not uva_offloading:
             p.data = cpu_data
         else:
             # keep the cpu data alive
             p._vllm_offloaded_cpu_data = cpu_data
             p.data = get_cuda_view_from_cpu_tensor(cpu_data)
+    
         _CPU_OFFLOAD_BYTES += p.data.numel() * p.data.element_size()
         offloaded_parameters = True
 
