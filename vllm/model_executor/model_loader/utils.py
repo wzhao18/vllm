@@ -20,6 +20,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.model_executor.models.interfaces import SupportsQuant, supports_multimodal
 from vllm.utils.platform_utils import is_pin_memory_available
+from vllm.utils.torch_utils import get_cuda_view_from_cpu_tensor
 
 logger = init_logger(__name__)
 
@@ -127,12 +128,15 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
         return
 
     original_device_states: dict[str, torch.device] = {}
+    uva_offloaded_parameters: list[str] = []
 
     # Store original device states and move parameters to GPU if they're on CPU
     for name, p in module.named_parameters():
         if p.device.type == "cpu":
-            original_device_states[name] = p.device
+            original_device_states[name] = torch.device("cpu")
             p.data = p.data.to(target_device)
+        if getattr(p, "_vllm_is_uva_offloaded", False):
+            uva_offloaded_parameters.append(name)
         # Parameters already on target device are not touched
 
     try:
@@ -140,16 +144,14 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
 
     finally:
         # Restore parameters to their original devices, ignoring new parameters
-        pin_memory = is_pin_memory_available()
-        pin_memory = False
         for name, p in module.named_parameters():
             if name in original_device_states:
                 original_device: torch.device = original_device_states[name]
                 p.data = p.data.to(original_device)
-                if original_device.type == "cpu" and pin_memory:
-                    p.data = p.data.pin_memory()
-        # New parameters or parameters already on target device are untouched
 
+            if name in uva_offloaded_parameters and not getattr(p, "_vllm_is_uva_offloaded", False):
+                p.data = get_cuda_view_from_cpu_tensor(p.data.to(device="cpu"))
+                p._vllm_is_uva_offloaded = True
 
 _MODEL_ARCH_BY_HASH = dict[int, tuple[type[nn.Module], str]]()
 """Caches the outputs of `_get_model_architecture`."""
