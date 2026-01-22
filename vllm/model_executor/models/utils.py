@@ -38,6 +38,7 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
     get_cuda_view_from_cpu_tensor,
 )
+import vllm.envs as envs
 
 logger = init_logger(__name__)
 
@@ -633,12 +634,8 @@ def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
     if _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES:
         return module
 
-    pin_memory = is_pin_memory_available()
-    uva_available = is_uva_available()
-
-    assert uva_available, "V1 CPU offloading requires uva (pin memory) support"
-    uva_offloading = False
-    pin_memory = False
+    pin_memory = is_pin_memory_available() and not envs.VLLM_OFFLOADING_DISABLE_PIN_MEMORY
+    uva_offloading = is_uva_available() and not envs.VLLM_OFFLOADING_DISABLE_UVA
 
     # offload parameters to CPU
     # use pin_memory if possible, which helps cudagraph capture speed
@@ -652,13 +649,13 @@ def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
         cpu_data = p.data.to(device="cpu")
         if pin_memory:
             cpu_data = cpu_data.pin_memory()
-        
+
         if not uva_offloading:
             p.data = cpu_data
         else:
-            # keep the cpu data alive
-            p._vllm_offloaded_cpu_data = cpu_data
             p.data = get_cuda_view_from_cpu_tensor(cpu_data)
+            p._vllm_is_uva_offloaded = True
+    
         _CPU_OFFLOAD_BYTES += p.data.numel() * p.data.element_size()
         offloaded_parameters = True
 
@@ -675,7 +672,7 @@ def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
             }
 
             # set `tie_weights=False` as tied weights in original model
-            # become untied when calling .to(device)
+            # become untied when calling .to(device) individually
             output = functional_call(module, device_state, args=args, kwargs=kwargs, tie_weights=False)
             module.forward = forward
             return output
