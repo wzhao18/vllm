@@ -1,107 +1,99 @@
 #include <torch/all.h>
-#include <torch/cuda.h>
 #include <cuda_runtime.h>
+#include <sys/mman.h> // Required for mmap
+#include <malloc.h>   // Required for malloc_trim if you stay with free
 #include <unistd.h>
-#include <memory>
 #include <iostream>
 #include <fstream>
-#include <string>
-#include <unistd.h>
+#include <sstream>
+#include <c10/util/Logging.h>
 
-double get_process_rss_mb() {
-  long rss = 0;
-  std::ifstream stat_stream("/proc/self/statm", std::ios_base::in);
-  if (stat_stream.is_open()) {
-      stat_stream >> rss; // The second entry in statm is the RSS in pages
-      stat_stream.close();
+
+double get_available_memory_gb() {
+  std::ifstream file("/proc/meminfo");
+  if (!file.is_open()) return -1.0;
+
+  std::string line;
+  unsigned long mem_available_kb = 0;
+  bool found = false;
+
+  while (std::getline(file, line)) {
+      if (line.compare(0, 13, "MemAvailable:") == 0) {
+          // Format is "MemAvailable:       123456 kB"
+          std::stringstream ss(line.substr(13));
+          ss >> mem_available_kb;
+          found = true;
+          break;
+      }
   }
-  return (rss * sysconf(_SC_PAGESIZE)) / (1024.0 * 1024.0);
+
+  return static_cast<double>(mem_available_kb) / 1048576.0;
 }
 
-// This function assumes that `cpu_tensor` is a CPU tensor, and that
-// UVA (Unified Virtual Addressing) is enabled.
 torch::Tensor get_cuda_view_from_cpu_tensor(torch::Tensor& cpu_tensor) {
   TORCH_CHECK(cpu_tensor.device().is_cpu(), "Input must be a CPU tensor");
 
+  // 1. Handle Pinned Memory (Short-circuit)
   if (cpu_tensor.is_pinned()) {
-    // For pinned memory, we can get the device pointer immediately
-    
-    // Get raw host pointer from CPU tensor
     void* host_ptr = const_cast<void*>(cpu_tensor.data_ptr());
-    
-    // Get a device pointer corresponding to the pinned host memory
     void* device_ptr = nullptr;
     cudaError_t err = cudaHostGetDevicePointer(&device_ptr, host_ptr, 0);
-    TORCH_CHECK(err == cudaSuccess,
-                "cudaHostGetDevicePointer failed: ", cudaGetErrorString(err));
+    TORCH_CHECK(err == cudaSuccess, "cudaHostGetDevicePointer failed: ", cudaGetErrorString(err));
 
-    // Return a view that aliases the original CPU tensor's storage
-    // This ensures the CPU tensor's lifetime keeps the memory alive
     return torch::from_blob(
-        device_ptr,
-        cpu_tensor.sizes(),
-        cpu_tensor.strides(),
-        [base = cpu_tensor](void*) {}, // Keep cpu_tensor alive until deleter is called
+        device_ptr, cpu_tensor.sizes(), cpu_tensor.strides(),
+        [base = cpu_tensor](void*) {}, 
         cpu_tensor.options().device(torch::kCUDA)
     );
   }
 
-  // If cpu_tensor is not pinned, allocate page-aligned memory and register with CUDA
-  torch::Tensor contiguous_cpu = cpu_tensor.contiguous();
+  // 2. Prepare Allocation Parameters
   
-  static const size_t page_size = []() {
-      long sz = sysconf(_SC_PAGESIZE);
-      TORCH_CHECK(sz > 0, "sysconf(_SC_PAGESIZE) failed");
-      return sz;
-  }();
-
+  torch::Tensor contiguous_cpu = cpu_tensor.contiguous();
   size_t nbytes = contiguous_cpu.nbytes();
-  // Round up to the nearest page size
+  long page_size = sysconf(_SC_PAGESIZE);
   size_t aligned_size = (nbytes + page_size - 1) & ~(page_size - 1);
 
-  void* host_ptr = nullptr;
-  int res = posix_memalign(&host_ptr, page_size, aligned_size);
-  TORCH_CHECK(res == 0, "Failed to allocate page-aligned memory");
+  LOG(WARNING) << "Allocating UVA memory for " << aligned_size << " bytes";
+  
+  // 3. Use mmap instead of posix_memalign
+  // MAP_PRIVATE | MAP_ANONYMOUS creates a private memory buffer not backed by a file.
+  void* host_ptr = mmap(nullptr, aligned_size, PROT_READ | PROT_WRITE, 
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  
+  if (host_ptr == MAP_FAILED) {
+      AT_ERROR("mmap failed to allocate ", aligned_size, " bytes");
+  }
 
   std::memcpy(host_ptr, contiguous_cpu.data_ptr(), nbytes);
 
-  cudaError_t err = cudaHostRegister(host_ptr, aligned_size, cudaHostRegisterMapped);
+  // 4. Register with CUDA
+  cudaError_t err = cudaHostRegister(host_ptr, aligned_size, cudaHostRegisterDefault);
   if (err != cudaSuccess) {
-      std::free(host_ptr);
+      munmap(host_ptr, aligned_size);
       AT_ERROR("cudaHostRegister failed: ", cudaGetErrorString(err));
   }
 
   void* device_ptr = nullptr;
-  err = cudaHostGetDevicePointer(&device_ptr, host_ptr, 0);
-  if (err != cudaSuccess) {
-      cudaHostUnregister(host_ptr);
-      std::free(host_ptr);
-      AT_ERROR("cudaHostGetDevicePointer failed: ", cudaGetErrorString(err));
-  }
+  cudaHostGetDevicePointer(&device_ptr, host_ptr, 0);
 
-  auto deleter = [host_ptr](void*) {
-    double mem_before = get_process_rss_mb();
+  // 5. The Deleter (Using munmap)
+  auto deleter = [host_ptr, aligned_size](void*) {
+    double mem_before = get_available_memory_gb();
     
-    cudaError_t err = cudaHostUnregister(host_ptr);
-    std::free(host_ptr);
+    cudaHostUnregister(host_ptr);
     
-    double mem_after = get_process_rss_mb();
-
-    std::cout << "[UVA Deleter] Unregistering " << host_ptr 
-              << " | Process RSS: " << mem_before << "MB -> " 
-              << mem_after << "MB" << std::endl;
-
-    if (err != cudaSuccess) {
-        std::cerr << "CRITICAL: cudaHostUnregister failed in deleter: " 
-                  << cudaGetErrorString(err) << std::endl;
-    }
+    // CRITICAL: munmap returns memory to the KERNEL immediately.
+    // std::free(host_ptr) would keep it in the process heap.
+    munmap(host_ptr, aligned_size);
+    
+    double mem_after = get_available_memory_gb();
+    LOG(WARNING) << "[UVA Deleter] Released " << (aligned_size / (1024*1024)) << " MB"
+              << " | OS Available: " << mem_before << "GB -> " << mem_after << "GB";
   };
 
   return torch::from_blob(
-      device_ptr,
-      contiguous_cpu.sizes(),
-      contiguous_cpu.strides(),
-      deleter,
-      contiguous_cpu.options().device(torch::kCUDA)
+      device_ptr, contiguous_cpu.sizes(), contiguous_cpu.strides(),
+      deleter, contiguous_cpu.options().device(torch::kCUDA)
   );
 }

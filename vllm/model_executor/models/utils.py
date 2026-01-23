@@ -550,7 +550,7 @@ def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
             # one module might have some parameters offloaded and some not
             break
 
-        cpu_data = p.data.to(device="cpu").pin_memory()
+        cpu_data = p.data.to(device="cpu")
 
         if not uva_offloading:
             p.data = cpu_data
