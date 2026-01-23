@@ -40,6 +40,7 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
     get_cuda_view_from_cpu_tensor,
 )
+import vllm.envs as envs
 
 logger = init_logger(__name__)
 
@@ -536,21 +537,21 @@ def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
     if _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES:
         return module
 
-    uva_available = is_uva_available()
-
-    # use UVA offloading if supported
-    uva_offloading = uva_available and True
+    pin_memory = is_pin_memory_available() and not envs.VLLM_OFFLOADING_DISABLE_PIN_MEMORY
+    uva_offloading = is_uva_available() and not envs.VLLM_OFFLOADING_DISABLE_UVA
 
     # offload parameters to CPU
     # use pin_memory if possible, which helps cudagraph capture speed
     offloaded_parameters = False
-    for name, p in module.named_parameters():
+    for p in module.parameters():
         if _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES:
             # we use per-parameter offloading
             # one module might have some parameters offloaded and some not
             break
 
         cpu_data = p.data.to(device="cpu")
+        if pin_memory:
+            cpu_data = cpu_data.pin_memory()
 
         if not uva_offloading:
             p.data = cpu_data
