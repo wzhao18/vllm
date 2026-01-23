@@ -538,8 +538,8 @@ def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
 
     uva_available = is_uva_available()
 
-    assert uva_available, "V1 CPU offloading requires uva (pin memory) support"
-    uva_offloading = True
+    # use UVA offloading if supported
+    uva_offloading = uva_available and True
 
     # offload parameters to CPU
     # use pin_memory if possible, which helps cudagraph capture speed
@@ -550,26 +550,13 @@ def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
             # one module might have some parameters offloaded and some not
             break
 
-        # logger.info(f"Offloading parameter {name} to CPU")
-        # logger.info(f"Parameter shape: {p.data.shape}")
-        # logger.info(f"Parameter dtype: {p.data.dtype}")
-        # logger.info(f"Parameter device: {p.data.device}")
-        # logger.info(f"Parameter numel: {p.data.numel()}")
-        # logger.info(f"Parameter element size: {p.data.element_size()}")
-        # logger.info(f"Parameter total size: {p.data.numel() * p.data.element_size()}")
-        # logger.info(f"Parameter total size: {p.data.numel() * p.data.element_size()}")
-        # logger.info(f"Parameter stride: {p.data.stride()}")
-        # logger.info(f"Parameter size: {p.data.size()}")
-        # logger.info(f"Parameter layout: {p.data.layout}")
-
-        cpu_data = p.data.to(device="cpu")
+        cpu_data = p.data.to(device="cpu").pin_memory()
 
         if not uva_offloading:
             p.data = cpu_data
         else:
-            # keep the cpu data alive
-            p._vllm_offloaded_cpu_data = cpu_data
             p.data = get_cuda_view_from_cpu_tensor(cpu_data)
+            p._vllm_is_uva_offloaded = True
     
         _CPU_OFFLOAD_BYTES += p.data.numel() * p.data.element_size()
         offloaded_parameters = True
@@ -587,7 +574,7 @@ def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
             }
 
             # set `tie_weights=False` as tied weights in original model
-            # become untied when calling .to(device)
+            # become untied when calling .to(device) individually
             output = functional_call(module, device_state, args=args, kwargs=kwargs, tie_weights=False)
             module.forward = forward
             return output
