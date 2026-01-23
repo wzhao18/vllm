@@ -1560,18 +1560,6 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             is_act_and_mul=self.moe.is_act_and_mul,
         )
 
-        if getattr(layer.w13_weight, '_vllm_is_uva_offloaded', False):
-            logger.info(f"Replacing uva offloaded w13_weight: bytes: {layer.w13_weight.data.numel() * layer.w13_weight.data.element_size()}")
-        
-            # Explicitly delete the old tensor to trigger the deleter
-            old_data = layer.w13_weight.data
-            del layer.w13_weight
-            del old_data
-            
-            import gc
-            gc.collect()
-            torch.cuda.empty_cache()
-
         replace_parameter(layer, "w13_weight", w13)
         replace_parameter(layer, "w13_weight_scale", w13_scale)
         replace_parameter(layer, "w13_weight_scale_2", w13_scale_2)
