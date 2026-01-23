@@ -150,29 +150,8 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
                 p.data = p.data.to(original_device)
 
             if name in uva_offloaded_parameters and not getattr(p, "_vllm_is_uva_offloaded", False):
-
-                old_data = p.data
-                cpu_data = old_data.to(device="cpu")
-                del old_data  # Free the old CUDA view immediately
-                
-                # Force cleanup before allocating new pinned memory
-                import gc
-                gc.collect()
-                torch.cuda.empty_cache()
-                
-                # Now allocate new pinned memory
-                p.data = get_cuda_view_from_cpu_tensor(cpu_data)
+                p.data = get_cuda_view_from_cpu_tensor(p.data.to(device="cpu"))
                 p._vllm_is_uva_offloaded = True
-                
-                del cpu_data  # Clean up intermediate CPU tensor
-
-                # show cpu memory available
-                import psutil
-                print(f"CPU memory used: {psutil.virtual_memory().used / 1024**3} GB")
-
-                free_bytes, total_bytes = torch.cuda.mem_get_info()
-                print(f"GPU memory available: {free_bytes / 1024**3} GB")
-
 
 _MODEL_ARCH_BY_HASH = dict[int, tuple[type[nn.Module], str]]()
 """Caches the outputs of `_get_model_architecture`."""
