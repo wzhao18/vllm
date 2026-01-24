@@ -13,6 +13,7 @@ from torch.func import functional_call
 from torch.nn.modules.module import register_module_module_registration_hook
 from transformers import PretrainedConfig
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -38,7 +39,6 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
     get_cuda_view_from_cpu_tensor,
 )
-import vllm.envs as envs
 
 logger = init_logger(__name__)
 
@@ -634,7 +634,9 @@ def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
     if _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES:
         return module
 
-    pin_memory = is_pin_memory_available() and not envs.VLLM_OFFLOADING_DISABLE_PIN_MEMORY
+    pin_memory = (
+        is_pin_memory_available() and not envs.VLLM_OFFLOADING_DISABLE_PIN_MEMORY
+    )
     uva_offloading = is_uva_available() and not envs.VLLM_OFFLOADING_DISABLE_UVA
 
     # offload parameters to CPU
@@ -655,7 +657,7 @@ def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
         else:
             p.data = get_cuda_view_from_cpu_tensor(cpu_data)
             p._vllm_is_uva_offloaded = True
-    
+
         _CPU_OFFLOAD_BYTES += p.data.numel() * p.data.element_size()
         offloaded_parameters = True
 
@@ -673,7 +675,9 @@ def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
 
             # set `tie_weights=False` as tied weights in original model
             # become untied when calling .to(device) individually
-            output = functional_call(module, device_state, args=args, kwargs=kwargs, tie_weights=False)
+            output = functional_call(
+                module, device_state, args=args, kwargs=kwargs, tie_weights=False
+            )
             module.forward = forward
             return output
 
