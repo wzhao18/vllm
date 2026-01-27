@@ -299,6 +299,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.v_head_dim = v_head_dim
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
+        self.kv_b_proj = kv_b_proj
         self.head_size = kv_lora_rank + qk_rope_head_dim
         self.layer_name = prefix
 
