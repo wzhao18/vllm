@@ -27,8 +27,24 @@ def to_float8(x, dtype=torch.float8_e4m3fn):
 
 # FP4 (NVFP4 / E2M1) helpers, adapted from flashinfer/tests/test_helpers/utils_fp4.py
 _FLOAT4_E2M1_MAX = 6.0
-_E2M1_TO_FLOAT32 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-                    0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+_E2M1_TO_FLOAT32 = [
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+]
 
 
 def _cast_from_fp4(x):
@@ -60,7 +76,9 @@ def _ref_fp4_quant(x, global_scale, block_size):
     sliced = x.reshape(x.shape[:-1] + (x.shape[-1] // block_size, block_size))
     vec_max = sliced.float().abs().max(dim=-1, keepdim=True)[0]
     scale = (global_scale * vec_max / _FLOAT4_E2M1_MAX).to(torch.float8_e4m3fn).float()
-    inv_scale = torch.where(scale == 0, torch.zeros_like(scale), 1.0 / scale / global_scale)
+    inv_scale = torch.where(
+        scale == 0, torch.zeros_like(scale), 1.0 / scale / global_scale
+    )
     scaled = (sliced.float() * inv_scale).clamp(-6.0, 6.0).reshape(x.shape)
     return _cast_to_fp4(scaled), scale.squeeze(-1)
 
@@ -73,7 +91,7 @@ def _recover_swizzled_scales(scale, m, n, block_size, sf_start_index=0):
     tmp = scale.reshape(1, full_m // 128, rounded_n // 4, 32, 4, 4)
     tmp = tmp.permute(0, 1, 4, 3, 2, 5)
     result = tmp.reshape(full_m, rounded_n).float()
-    return result[sf_start_index: sf_start_index + m, :scale_n]
+    return result[sf_start_index : sf_start_index + m, :scale_n]
 
 
 @torch.no_grad()
@@ -127,10 +145,12 @@ def benchmark_decode(
         q_lens = torch.randint(1, max_q_len + 1, (batch_size,), dtype=torch.int32)
         q_lens[-1] = max_q_len
         seq_lens = (kv_lens + q_lens).to(torch.int32)
-        q_indptr = torch.cat([
-            torch.zeros(1, dtype=torch.int32),
-            q_lens.cumsum(0, dtype=torch.int32),
-        ])
+        q_indptr = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int32),
+                q_lens.cumsum(0, dtype=torch.int32),
+            ]
+        )
         total_q = int(q_lens.sum().item())
     else:
         seq_lens = kv_lens
@@ -283,13 +303,19 @@ def benchmark_decode(
         if pad > 0:
             trtllm_q_indptr = torch.cat([q_indptr, q_indptr[-1:].expand(pad)])
             trtllm_seq_lens = torch.cat([seq_lens, torch.ones(pad, dtype=torch.int32)])
-            trtllm_block_tables = torch.cat([block_tables, block_tables.new_zeros(pad, block_tables.shape[1])])
+            trtllm_block_tables = torch.cat(
+                [block_tables, block_tables.new_zeros(pad, block_tables.shape[1])]
+            )
 
     # q_len_per_req=None tells the kernel to use max_q_len + cum_seq_lens_q for
     # variable-length spec-decode; leaving it at the default (1) would override
     # max_q_len and compute the wrong batch_size.
     if max_q_len is not None and max_q_len > 1:
-        trtllm_extra = {"q_len_per_req": None, "max_q_len": max_q_len, "cum_seq_lens_q": trtllm_q_indptr}
+        trtllm_extra = {
+            "q_len_per_req": None,
+            "max_q_len": max_q_len,
+            "cum_seq_lens_q": trtllm_q_indptr,
+        }
     else:
         trtllm_extra = {}
 
@@ -315,8 +341,14 @@ def benchmark_decode(
     actual_k_scale = kv_inv_scale.item() if kv_inv_scale is not None else k_scale
     actual_v_scale = kv_inv_scale.item() if kv_inv_scale is not None else v_scale
     # Baseline uses fake-quantized bf16 reference to match fp8 precision loss
-    ref_q_check = query.to(dtype) * actual_q_scale if q_inv_scale is not None else ref_query
-    ref_kv_check = kv_cache.to(dtype) * actual_k_scale if kv_inv_scale is not None else ref_kv_cache
+    ref_q_check = (
+        query.to(dtype) * actual_q_scale if q_inv_scale is not None else ref_query
+    )
+    ref_kv_check = (
+        kv_cache.to(dtype) * actual_k_scale
+        if kv_inv_scale is not None
+        else ref_kv_cache
+    )
     wrapper.run(ref_q_check, ref_kv_check, out=output_baseline)
     flashinfer.decode.trtllm_batch_decode_with_kv_cache(
         query=query,
@@ -369,7 +401,9 @@ def benchmark_decode(
         )
         # Use RMSE to be robust against outlier elements from different kernel
         # accumulation orders; threshold is looser for FP8 quantization.
-        rmse_tol = 0.1 if (q_quant_dtype == FP8_DTYPE or kv_quant_dtype == FP8_DTYPE) else 0.05
+        rmse_tol = (
+            0.1 if (q_quant_dtype == FP8_DTYPE or kv_quant_dtype == FP8_DTYPE) else 0.05
+        )
         rmse = torch.sqrt(torch.mean((out_ref - out_trt) ** 2))
         assert rmse.item() < rmse_tol, (
             f"Output RMSE too large: {rmse.item():.4f} (tol={rmse_tol}), "
