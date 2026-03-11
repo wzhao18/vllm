@@ -720,13 +720,10 @@ def _run_single_benchmark(
     if is_sparse and indexer is not None:
         indexer.fill_random_indices(total_q, max_kv_len)
 
-    # Determine which forward method to use
-    # All MLA backends use forward_mqa. Sparse backends have a different metadata
-    # structure (no .decode attribute), so they must be dispatched first.
     if is_sparse or metadata.decode is not None:
         forward_fn = lambda: impl.forward_mqa(decode_inputs, kv_cache, metadata, layer)
     elif metadata.prefill is not None:
-        forward_fn = lambda: impl._forward_prefill(
+        forward_fn = lambda: impl.forward_mha(
             prefill_inputs["q"],
             prefill_inputs["k_c_normed"],
             prefill_inputs["k_pe"],
