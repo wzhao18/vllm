@@ -143,10 +143,11 @@ def create_minimal_vllm_config(
     _add_mock_methods_to_model_config(model_config)
 
     # Create sub-configs
+    vllm_cache_dtype = "auto" if kv_cache_dtype == "bfloat16" else kv_cache_dtype
     cache_config = CacheConfig(
         block_size=block_size,
         gpu_memory_utilization=0.9,
-        cache_dtype=kv_cache_dtype,
+        cache_dtype=vllm_cache_dtype,
         enable_prefix_caching=False,
     )
 
@@ -528,7 +529,7 @@ def _create_backend_impl(
         "num_kv_heads": mla_dims["num_kv_heads"],
         "alibi_slopes": None,
         "sliding_window": None,
-        "kv_cache_dtype": kv_cache_dtype,
+        "kv_cache_dtype": "auto" if kv_cache_dtype == "bfloat16" else kv_cache_dtype,
         "logits_soft_cap": None,
         "attn_type": "decoder",
         "kv_sharing_target_layer_name": None,
@@ -682,8 +683,8 @@ def _run_single_benchmark(
     # Create KV cache
     # kv_cache_dtype param takes priority (allows caller to pass remapped dtype)
     if kv_cache_dtype is None:
-        kv_cache_dtype = getattr(config, "kv_cache_dtype", "auto")
-    is_fp8_kvcache = kv_cache_dtype.startswith("fp8")
+        kv_cache_dtype = getattr(config, "kv_cache_dtype", "bfloat16")
+    is_fp8_kvcache = kv_cache_dtype == "fp8"
     head_size = mla_dims["kv_lora_rank"] + mla_dims["qk_rope_head_dim"]
     if kv_cache_dtype == "fp8_ds_mla":
         # FlashMLA sparse custom format: 656 bytes per token, stored as uint8.
@@ -696,8 +697,8 @@ def _run_single_benchmark(
             device=device,
             dtype=torch.uint8,
         )
-    elif kv_cache_dtype.startswith("fp8"):
-        # Standard fp8: same shape as bf16 but stored as uint8 viewed as fp8 dtype
+    elif kv_cache_dtype == "fp8":
+        # fp8: same shape as bfloat16 but stored as uint8 viewed as fp8 dtype
         from vllm.platforms import current_platform
 
         kv_cache = torch.zeros(
@@ -754,10 +755,20 @@ def _run_single_benchmark(
     else:
         raise RuntimeError("Metadata has neither decode nor prefill metadata")
 
-    # Warmup
+    # Warmup — also initializes any lazy buffers (workspace, fp8 scales, etc.)
     for _ in range(config.warmup_iters):
         forward_fn()
     torch.accelerator.synchronize()
+
+    # Optionally capture a CUDA graph after warmup.
+    # Graph replay eliminates CPU dispatch overhead so timings reflect pure GPU time.
+    if config.use_cuda_graphs:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            forward_fn()
+        benchmark_fn = graph.replay
+    else:
+        benchmark_fn = forward_fn
 
     # Benchmark
     times = []
@@ -767,7 +778,7 @@ def _run_single_benchmark(
 
         start.record()
         for _ in range(config.num_layers):
-            forward_fn()
+            benchmark_fn()
         end.record()
 
         torch.accelerator.synchronize()
@@ -832,11 +843,11 @@ def _run_mla_benchmark_batched(
     is_sparse = backend_cfg.get("is_sparse", False)
 
     # Extract kv_cache_dtype from the first config
-    kv_cache_dtype = getattr(first_config, "kv_cache_dtype", "auto")
+    kv_cache_dtype = getattr(first_config, "kv_cache_dtype", "bfloat16")
 
-    # FlashMLA sparse only supports "fp8_ds_mla" for fp8 (not generic "fp8").
+    # FlashMLA sparse only supports "fp8_ds_mla" internally (not generic "fp8").
     # Remap here so the user can pass --kv-cache-dtype fp8 regardless of backend.
-    if backend.upper() == "FLASHMLA_SPARSE" and kv_cache_dtype.startswith("fp8"):
+    if backend.upper() == "FLASHMLA_SPARSE" and kv_cache_dtype == "fp8":
         kv_cache_dtype = "fp8_ds_mla"
 
     # Create and set vLLM config for MLA (reused across all benchmarks)

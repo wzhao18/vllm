@@ -218,8 +218,8 @@ class BenchmarkConfig:
     qk_rope_head_dim: int | None = None
     v_head_dim: int | None = None
 
-    # KV cache dtype: "auto" (bfloat16), "fp8", "fp8_e4m3"
-    kv_cache_dtype: str = "auto"
+    # KV cache dtype exposed to users: "bfloat16" or "fp8"
+    kv_cache_dtype: str = "bfloat16"
 
     # Backend-specific tuning
     num_kv_splits: int | None = None  # CUTLASS MLA

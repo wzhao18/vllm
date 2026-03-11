@@ -473,9 +473,15 @@ def main():
     parser.add_argument("--profile-memory", action="store_true", help="Profile memory")
     parser.add_argument(
         "--kv-cache-dtype",
-        default="auto",
-        choices=["auto", "fp8", "fp8_e4m3"],
-        help="KV cache dtype: auto (bfloat16), fp8, fp8_e4m3",
+        default="bfloat16",
+        choices=["bfloat16", "fp8"],
+        help="KV cache dtype: bfloat16 or fp8",
+    )
+    parser.add_argument(
+        "--cuda-graphs",
+        action="store_true",
+        default=False,
+        help="Capture and replay CUDA graphs to eliminate CPU dispatch overhead",
     )
 
     # Parameter sweep (use YAML config for advanced sweeps)
@@ -570,6 +576,8 @@ def main():
             args.profile_memory = yaml_config["profile_memory"]
         if "kv_cache_dtype" in yaml_config:
             args.kv_cache_dtype = yaml_config["kv_cache_dtype"]
+        if "cuda_graphs" in yaml_config:
+            args.cuda_graphs = yaml_config["cuda_graphs"]
 
         # Parameter sweep configuration
         if "parameter_sweep" in yaml_config:
@@ -626,6 +634,7 @@ def main():
     console.print(f"Backends: {', '.join(backends)}")
     console.print(f"Batch specs: {', '.join(args.batch_specs)}")
     console.print(f"KV cache dtype: {args.kv_cache_dtype}")
+    console.print(f"CUDA graphs: {args.cuda_graphs}")
     console.print()
 
     init_workspace_manager(args.device)
@@ -683,6 +692,7 @@ def main():
                         warmup_iters=args.warmup_iters,
                         profile_memory=args.profile_memory,
                         kv_cache_dtype=args.kv_cache_dtype,
+                        use_cuda_graphs=args.cuda_graphs,
                     )
 
                     # Add decode pipeline config
@@ -836,6 +846,7 @@ def main():
             "warmup_iters": args.warmup_iters,
             "profile_memory": args.profile_memory,
             "kv_cache_dtype": args.kv_cache_dtype,
+            "use_cuda_graphs": args.cuda_graphs,
         }
         all_results = run_model_parameter_sweep(
             backends,
@@ -859,6 +870,7 @@ def main():
             "warmup_iters": args.warmup_iters,
             "profile_memory": args.profile_memory,
             "kv_cache_dtype": args.kv_cache_dtype,
+            "use_cuda_graphs": args.cuda_graphs,
         }
         all_results = run_parameter_sweep(
             backends, args.batch_specs, base_config_args, args.parameter_sweep, console
@@ -884,6 +896,7 @@ def main():
                         warmup_iters=args.warmup_iters,
                         profile_memory=args.profile_memory,
                         kv_cache_dtype=args.kv_cache_dtype,
+                        use_cuda_graphs=args.cuda_graphs,
                     )
 
                     result = run_benchmark(config)
