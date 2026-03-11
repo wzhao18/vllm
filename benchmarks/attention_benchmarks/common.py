@@ -218,7 +218,7 @@ class BenchmarkConfig:
     qk_rope_head_dim: int | None = None
     v_head_dim: int | None = None
 
-    # KV cache dtype exposed to users: "bfloat16" or "fp8"
+    # "bfloat16" or "fp8"
     kv_cache_dtype: str = "bfloat16"
 
     # Backend-specific tuning

@@ -356,38 +356,20 @@ def _create_input_tensors(
     - Decode: Uses kv_lora_rank (512) dimension
     - Prefill: Uses qk_nope_head_dim (128) to stay under FlashAttention's 256 limit
 
-    When quantize_query=True, the decode query is created as a pre-quantized fp8
-    tensor (concatenated nope+pe) to match what mla_attention.py produces via
-    _DecodeConcatQuantFP8 before calling impl.forward_mqa. Only set this for
-    backends with supports_quant_query_input=True (e.g. FlashInfer MLA sparse).
-
     Args:
         total_q: Total number of query tokens
         mla_dims: MLA dimension configuration
         query_format: Either "tuple" or "concat"
         device: Target device
         dtype: Tensor dtype
-        quantize_query: When True, create decode query as fp8 (concat nope+pe)
+        quantize_query: When True, create decode query as fp8
 
     Returns:
         Tuple of (decode_inputs, prefill_inputs)
         - decode_inputs: Query tensor(s) for decode mode
         - prefill_inputs: Dict with 'q', 'k_c_normed', 'k_pe', 'k_scale' for prefill
     """
-    if quantize_query:
-        # mla_attention.py quantizes via _DecodeConcatQuantFP8 which concatenates
-        # (q_nope, q_pe) and quantizes to fp8 before calling impl.forward_mqa.
-        # Pre-create the fp8 tensor so the benchmark only times the attention kernel.
-        from vllm.platforms import current_platform
-
-        decode_inputs = torch.zeros(
-            total_q,
-            mla_dims["num_q_heads"],
-            mla_dims["kv_lora_rank"] + mla_dims["qk_rope_head_dim"],
-            device=device,
-            dtype=torch.uint8,
-        ).view(current_platform.fp8_dtype())
-    elif query_format == "tuple":
+    if query_format == "tuple":
         # Decode mode format: (q_nope, q_pe) where q_nope has kv_lora_rank dim
         q_nope_decode = torch.randn(
             total_q,
@@ -404,18 +386,8 @@ def _create_input_tensors(
             dtype=dtype,
         )
         decode_inputs = (q_nope_decode, q_pe)
-    else:  # concat
-        decode_inputs = torch.randn(
-            total_q,
-            mla_dims["num_q_heads"],
-            mla_dims["kv_lora_rank"] + mla_dims["qk_rope_head_dim"],
-            device=device,
-            dtype=dtype,
-        )
 
-    # Prefill always uses bfloat16 regardless of kv_cache_dtype
-    if query_format == "tuple" and not quantize_query:
-        q_pe = decode_inputs[1]  # already created above
+        # For prefill, we need q with qk_nope_head_dim instead of kv_lora_rank
         q_nope_prefill = torch.randn(
             total_q,
             mla_dims["num_q_heads"],
@@ -424,8 +396,15 @@ def _create_input_tensors(
             dtype=dtype,
         )
         prefill_q = torch.cat([q_nope_prefill, q_pe], dim=-1)
-    else:
-        # For prefill with concat format (or quantize_query — prefill stays bf16)
+    else:  # concat
+        decode_inputs = torch.randn(
+            total_q,
+            mla_dims["num_q_heads"],
+            mla_dims["kv_lora_rank"] + mla_dims["qk_rope_head_dim"],
+            device=device,
+            dtype=dtype,
+        )
+        # For prefill with concat format
         prefill_q = torch.randn(
             total_q,
             mla_dims["num_q_heads"],
@@ -433,6 +412,13 @@ def _create_input_tensors(
             device=device,
             dtype=dtype,
         )
+
+    # Post-process: quantize the decode query to fp8 when the backend expects it.
+    if quantize_query:
+        assert query_format == "concat"
+        from vllm.platforms import current_platform
+
+        decode_inputs = decode_inputs.to(torch.uint8).view(current_platform.fp8_dtype())
 
     # Create additional inputs needed for prefill forward
     k_c_normed = torch.randn(
@@ -717,9 +703,6 @@ def _run_single_benchmark(
             dtype=torch.bfloat16,
         )
 
-    # Create input tensors for both decode and prefill modes.
-    # Query quantization to fp8 mirrors mla_attention.py: only when the backend
-    # has supports_quant_query_input=True AND fp8 kv cache is active.
     quantize_query = is_fp8_kvcache and getattr(
         impl, "supports_quant_query_input", False
     )
