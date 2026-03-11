@@ -218,6 +218,9 @@ class BenchmarkConfig:
     qk_rope_head_dim: int | None = None
     v_head_dim: int | None = None
 
+    # KV cache dtype: "auto" (bfloat16), "fp8", "fp8_e4m3"
+    kv_cache_dtype: str = "auto"
+
     # Backend-specific tuning
     num_kv_splits: int | None = None  # CUTLASS MLA
     reorder_batch_threshold: int | None = None  # FlashAttn MLA, FlashMLA

@@ -62,6 +62,7 @@ def create_minimal_vllm_config(
     max_num_seqs: int = 256,
     mla_dims: dict | None = None,
     index_topk: int | None = None,
+    kv_cache_dtype: str = "auto",
 ) -> VllmConfig:
     """
     Create minimal VllmConfig for MLA benchmarks.
@@ -145,7 +146,7 @@ def create_minimal_vllm_config(
     cache_config = CacheConfig(
         block_size=block_size,
         gpu_memory_utilization=0.9,
-        cache_dtype="auto",
+        cache_dtype=kv_cache_dtype,
         enable_prefix_caching=False,
     )
 
@@ -345,6 +346,7 @@ def _create_input_tensors(
     query_format: str,
     device: torch.device,
     dtype: torch.dtype,
+    quantize_query: bool = False,
 ):
     """
     Create input tensors for both decode and prefill modes.
@@ -353,19 +355,38 @@ def _create_input_tensors(
     - Decode: Uses kv_lora_rank (512) dimension
     - Prefill: Uses qk_nope_head_dim (128) to stay under FlashAttention's 256 limit
 
+    When quantize_query=True, the decode query is created as a pre-quantized fp8
+    tensor (concatenated nope+pe) to match what mla_attention.py produces via
+    _DecodeConcatQuantFP8 before calling impl.forward_mqa. Only set this for
+    backends with supports_quant_query_input=True (e.g. FlashInfer MLA sparse).
+
     Args:
         total_q: Total number of query tokens
         mla_dims: MLA dimension configuration
         query_format: Either "tuple" or "concat"
         device: Target device
         dtype: Tensor dtype
+        quantize_query: When True, create decode query as fp8 (concat nope+pe)
 
     Returns:
         Tuple of (decode_inputs, prefill_inputs)
         - decode_inputs: Query tensor(s) for decode mode
         - prefill_inputs: Dict with 'q', 'k_c_normed', 'k_pe', 'k_scale' for prefill
     """
-    if query_format == "tuple":
+    if quantize_query:
+        # mla_attention.py quantizes via _DecodeConcatQuantFP8 which concatenates
+        # (q_nope, q_pe) and quantizes to fp8 before calling impl.forward_mqa.
+        # Pre-create the fp8 tensor so the benchmark only times the attention kernel.
+        from vllm.platforms import current_platform
+
+        decode_inputs = torch.zeros(
+            total_q,
+            mla_dims["num_q_heads"],
+            mla_dims["kv_lora_rank"] + mla_dims["qk_rope_head_dim"],
+            device=device,
+            dtype=torch.uint8,
+        ).view(current_platform.fp8_dtype())
+    elif query_format == "tuple":
         # Decode mode format: (q_nope, q_pe) where q_nope has kv_lora_rank dim
         q_nope_decode = torch.randn(
             total_q,
@@ -382,16 +403,6 @@ def _create_input_tensors(
             dtype=dtype,
         )
         decode_inputs = (q_nope_decode, q_pe)
-
-        # For prefill, we need q with qk_nope_head_dim instead of kv_lora_rank
-        q_nope_prefill = torch.randn(
-            total_q,
-            mla_dims["num_q_heads"],
-            mla_dims["qk_nope_head_dim"],
-            device=device,
-            dtype=dtype,
-        )
-        prefill_q = torch.cat([q_nope_prefill, q_pe], dim=-1)
     else:  # concat
         decode_inputs = torch.randn(
             total_q,
@@ -400,7 +411,20 @@ def _create_input_tensors(
             device=device,
             dtype=dtype,
         )
-        # For prefill with concat format
+
+    # Prefill always uses bfloat16 regardless of kv_cache_dtype
+    if query_format == "tuple" and not quantize_query:
+        q_pe = decode_inputs[1]  # already created above
+        q_nope_prefill = torch.randn(
+            total_q,
+            mla_dims["num_q_heads"],
+            mla_dims["qk_nope_head_dim"],
+            device=device,
+            dtype=dtype,
+        )
+        prefill_q = torch.cat([q_nope_prefill, q_pe], dim=-1)
+    else:
+        # For prefill with concat format (or quantize_query — prefill stays bf16)
         prefill_q = torch.randn(
             total_q,
             mla_dims["num_q_heads"],
@@ -455,6 +479,7 @@ def _create_backend_impl(
     device: torch.device,
     max_num_tokens: int = 8192,
     index_topk: int | None = None,
+    kv_cache_dtype: str = "auto",
 ):
     """
     Create backend implementation instance.
@@ -503,7 +528,7 @@ def _create_backend_impl(
         "num_kv_heads": mla_dims["num_kv_heads"],
         "alibi_slopes": None,
         "sliding_window": None,
-        "kv_cache_dtype": "auto",
+        "kv_cache_dtype": kv_cache_dtype,
         "logits_soft_cap": None,
         "attn_type": "decoder",
         "kv_sharing_target_layer_name": None,
@@ -621,6 +646,7 @@ def _run_single_benchmark(
     mla_dims: dict,
     device: torch.device,
     indexer=None,
+    kv_cache_dtype: str | None = None,
 ) -> BenchmarkResult:
     """
     Run a single benchmark iteration.
@@ -654,21 +680,55 @@ def _run_single_benchmark(
     )
 
     # Create KV cache
-    kv_cache = torch.zeros(
-        num_blocks,
-        block_size,
-        mla_dims["kv_lora_rank"] + mla_dims["qk_rope_head_dim"],
-        device=device,
-        dtype=torch.bfloat16,
-    )
+    # kv_cache_dtype param takes priority (allows caller to pass remapped dtype)
+    if kv_cache_dtype is None:
+        kv_cache_dtype = getattr(config, "kv_cache_dtype", "auto")
+    is_fp8_kvcache = kv_cache_dtype.startswith("fp8")
+    head_size = mla_dims["kv_lora_rank"] + mla_dims["qk_rope_head_dim"]
+    if kv_cache_dtype == "fp8_ds_mla":
+        # FlashMLA sparse custom format: 656 bytes per token, stored as uint8.
+        # Layout: kv_lora_rank fp8 bytes + 4 float32 tile scales + 2*rope_dim bf16 bytes
+        # = 512 + 16 + 128 = 656 bytes for DeepSeek dims (see flashmla_sparse.py).
+        kv_cache = torch.zeros(
+            num_blocks,
+            block_size,
+            656,
+            device=device,
+            dtype=torch.uint8,
+        )
+    elif kv_cache_dtype.startswith("fp8"):
+        # Standard fp8: same shape as bf16 but stored as uint8 viewed as fp8 dtype
+        from vllm.platforms import current_platform
 
-    # Create input tensors for both decode and prefill modes
+        kv_cache = torch.zeros(
+            num_blocks,
+            block_size,
+            head_size,
+            device=device,
+            dtype=torch.uint8,
+        ).view(current_platform.fp8_dtype())
+    else:
+        kv_cache = torch.zeros(
+            num_blocks,
+            block_size,
+            head_size,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+
+    # Create input tensors for both decode and prefill modes.
+    # Query quantization to fp8 mirrors mla_attention.py: only when the backend
+    # has supports_quant_query_input=True AND fp8 kv cache is active.
+    quantize_query = is_fp8_kvcache and getattr(
+        impl, "supports_quant_query_input", False
+    )
     decode_inputs, prefill_inputs = _create_input_tensors(
         total_q,
         mla_dims,
         backend_cfg["query_format"],
         device,
         torch.bfloat16,
+        quantize_query=quantize_query,
     )
 
     # Fill indexer with random indices for sparse backends
@@ -677,13 +737,10 @@ def _run_single_benchmark(
         indexer.fill_random_indices(total_q, max_kv_len)
 
     # Determine which forward method to use
-    if is_sparse:
-        # Sparse backends use forward_mqa
+    # All MLA backends use forward_mqa. Sparse backends have a different metadata
+    # structure (no .decode attribute), so they must be dispatched first.
+    if is_sparse or metadata.decode is not None:
         forward_fn = lambda: impl.forward_mqa(decode_inputs, kv_cache, metadata, layer)
-    elif metadata.decode is not None:
-        forward_fn = lambda: impl._forward_decode(
-            decode_inputs, kv_cache, metadata, layer
-        )
     elif metadata.prefill is not None:
         forward_fn = lambda: impl._forward_prefill(
             prefill_inputs["q"],
@@ -774,12 +831,21 @@ def _run_mla_benchmark_batched(
     # Determine if this is a sparse backend
     is_sparse = backend_cfg.get("is_sparse", False)
 
+    # Extract kv_cache_dtype from the first config
+    kv_cache_dtype = getattr(first_config, "kv_cache_dtype", "auto")
+
+    # FlashMLA sparse only supports "fp8_ds_mla" for fp8 (not generic "fp8").
+    # Remap here so the user can pass --kv-cache-dtype fp8 regardless of backend.
+    if backend.upper() == "FLASHMLA_SPARSE" and kv_cache_dtype.startswith("fp8"):
+        kv_cache_dtype = "fp8_ds_mla"
+
     # Create and set vLLM config for MLA (reused across all benchmarks)
     vllm_config = create_minimal_vllm_config(
         model_name="deepseek-v3",  # Used only for model path
         block_size=block_size,
         mla_dims=mla_dims,  # Use custom dims from config or default
         index_topk=index_topk if is_sparse else None,
+        kv_cache_dtype=kv_cache_dtype,
     )
 
     results = []
@@ -792,6 +858,7 @@ def _run_mla_benchmark_batched(
             vllm_config,
             device,
             index_topk=index_topk if is_sparse else None,
+            kv_cache_dtype=kv_cache_dtype,
         )
 
         # Run each benchmark with the shared impl
@@ -818,6 +885,7 @@ def _run_mla_benchmark_batched(
                     mla_dims,
                     device,
                     indexer=indexer,
+                    kv_cache_dtype=kv_cache_dtype,
                 )
                 results.append(result)
 

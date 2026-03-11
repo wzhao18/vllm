@@ -47,6 +47,8 @@ from common import (
     is_mla_backend,
 )
 
+from vllm.v1.worker.workspace import init_workspace_manager
+
 
 def run_standard_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
     """Run standard attention benchmark (Flash/Triton/FlashInfer)."""
@@ -469,6 +471,12 @@ def main():
     parser.add_argument("--repeats", type=int, default=1, help="Repetitions")
     parser.add_argument("--warmup-iters", type=int, default=3, help="Warmup iterations")
     parser.add_argument("--profile-memory", action="store_true", help="Profile memory")
+    parser.add_argument(
+        "--kv-cache-dtype",
+        default="auto",
+        choices=["auto", "fp8", "fp8_e4m3"],
+        help="KV cache dtype: auto (bfloat16), fp8, fp8_e4m3",
+    )
 
     # Parameter sweep (use YAML config for advanced sweeps)
     parser.add_argument(
@@ -560,6 +568,8 @@ def main():
             args.warmup_iters = yaml_config["warmup_iters"]
         if "profile_memory" in yaml_config:
             args.profile_memory = yaml_config["profile_memory"]
+        if "kv_cache_dtype" in yaml_config:
+            args.kv_cache_dtype = yaml_config["kv_cache_dtype"]
 
         # Parameter sweep configuration
         if "parameter_sweep" in yaml_config:
@@ -615,7 +625,10 @@ def main():
     backends = args.backends or ([args.backend] if args.backend else ["flash"])
     console.print(f"Backends: {', '.join(backends)}")
     console.print(f"Batch specs: {', '.join(args.batch_specs)}")
+    console.print(f"KV cache dtype: {args.kv_cache_dtype}")
     console.print()
+
+    init_workspace_manager(args.device)
 
     # Run benchmarks
     all_results = []
@@ -669,6 +682,7 @@ def main():
                         repeats=args.repeats,
                         warmup_iters=args.warmup_iters,
                         profile_memory=args.profile_memory,
+                        kv_cache_dtype=args.kv_cache_dtype,
                     )
 
                     # Add decode pipeline config
@@ -821,6 +835,7 @@ def main():
             "repeats": args.repeats,
             "warmup_iters": args.warmup_iters,
             "profile_memory": args.profile_memory,
+            "kv_cache_dtype": args.kv_cache_dtype,
         }
         all_results = run_model_parameter_sweep(
             backends,
@@ -843,6 +858,7 @@ def main():
             "repeats": args.repeats,
             "warmup_iters": args.warmup_iters,
             "profile_memory": args.profile_memory,
+            "kv_cache_dtype": args.kv_cache_dtype,
         }
         all_results = run_parameter_sweep(
             backends, args.batch_specs, base_config_args, args.parameter_sweep, console
@@ -867,6 +883,7 @@ def main():
                         repeats=args.repeats,
                         warmup_iters=args.warmup_iters,
                         profile_memory=args.profile_memory,
+                        kv_cache_dtype=args.kv_cache_dtype,
                     )
 
                     result = run_benchmark(config)
