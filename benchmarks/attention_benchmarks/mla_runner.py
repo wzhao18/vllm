@@ -17,6 +17,11 @@ from common import (
     MockIndexer,
     MockKVBProj,
     MockLayer,
+    check_close,
+    compute_mha_reference,
+    compute_mqa_reference,
+    mla_kv_cache_to_bf16,
+    populate_mla_kv_cache,
     setup_mla_dims,
 )
 
@@ -29,6 +34,10 @@ from vllm.config import (
     VllmConfig,
     set_current_vllm_config,
 )
+from vllm.logger import init_logger
+
+logger = init_logger(f"vllm.{__name__}")
+
 
 # ============================================================================
 # VllmConfig Creation
@@ -60,9 +69,11 @@ def create_minimal_vllm_config(
     model_name: str = "deepseek-v3",
     block_size: int = 128,
     max_num_seqs: int = 256,
+    max_num_batched_tokens: int = 8192,
     mla_dims: dict | None = None,
     index_topk: int | None = None,
     prefill_backend: str | None = None,
+    kv_cache_dtype: str = "auto",
 ) -> VllmConfig:
     """
     Create minimal VllmConfig for MLA benchmarks.
@@ -149,13 +160,13 @@ def create_minimal_vllm_config(
     cache_config = CacheConfig(
         block_size=block_size,
         gpu_memory_utilization=0.9,
-        cache_dtype="auto",
+        cache_dtype=kv_cache_dtype,
         enable_prefix_caching=False,
     )
 
     scheduler_config = SchedulerConfig(
         max_num_seqs=max_num_seqs,
-        max_num_batched_tokens=8192,
+        max_num_batched_tokens=max(max_num_batched_tokens, max_num_seqs),
         max_model_len=32768,
         is_encoder_decoder=False,
         enable_chunked_prefill=True,
@@ -340,8 +351,12 @@ def _build_attention_metadata(
         builder_instance: Metadata builder instance
 
     Returns:
-        Tuple of (metadata, kv_cache_num_blocks)
+        Tuple of (metadata, kv_cache_num_blocks, block_table_gpu)
     """
+    # Sort requests so decode requests come before prefill requests.
+    # split_decodes_and_prefills expects this ordering.
+    requests = sorted(requests, key=lambda r: r.q_len)
+
     q_lens = [r.q_len for r in requests]
     kv_lens = [r.kv_len for r in requests]
     total_q = sum(q_lens)
@@ -416,111 +431,94 @@ def _build_attention_metadata(
         fast_build=False,
     )
 
-    return metadata, current_block
+    return metadata, current_block, block_table_gpu
 
 
-def _create_input_tensors(
-    total_q: int,
+def _create_query_tensors(
+    num_decode: int,
+    num_prefill: int,
     mla_dims: dict,
     query_format: str,
     device: torch.device,
     dtype: torch.dtype,
+    quantize_query: bool = False,
 ):
     """
-    Create input tensors for both decode and prefill modes.
+    Create query tensors for decode and prefill respectively.
 
-    MLA requires different tensor formats for decode vs prefill:
+     MLA requires different tensor formats for decode vs prefill:
     - Decode: Uses kv_lora_rank (512) dimension
     - Prefill: Uses qk_nope_head_dim (128) to stay under FlashAttention's 256 limit
 
     Args:
-        total_q: Total number of query tokens
+        num_decode: Number of decode tokens
+        num_prefill: Number of prefill tokens
         mla_dims: MLA dimension configuration
         query_format: Either "tuple" or "concat"
         device: Target device
         dtype: Tensor dtype
+        quantize_query: When True, cast decode query to fp8
 
     Returns:
-        Tuple of (decode_inputs, prefill_inputs)
-        - decode_inputs: Query tensor(s) for decode mode
-        - prefill_inputs: Dict with 'q', 'k_c_normed', 'k_pe', 'k_scale' for prefill
+        Tuple of (decode_q, prefill_q)
+        - decode_q: Query tensor(s) for decode [num_decode, ...]
+        - prefill_q: Query tensor for prefill [num_prefill, ...]
     """
     if query_format == "tuple":
-        # Decode mode format: (q_nope, q_pe) where q_nope has kv_lora_rank dim
         q_nope_decode = torch.randn(
-            total_q,
+            num_decode,
             mla_dims["num_q_heads"],
             mla_dims["kv_lora_rank"],
             device=device,
             dtype=dtype,
         )
-        q_pe = torch.randn(
-            total_q,
+        q_pe_decode = torch.randn(
+            num_decode,
             mla_dims["num_q_heads"],
             mla_dims["qk_rope_head_dim"],
             device=device,
             dtype=dtype,
         )
-        decode_inputs = (q_nope_decode, q_pe)
+        decode_q = (q_nope_decode, q_pe_decode)
 
-        # For prefill, we need q with qk_nope_head_dim instead of kv_lora_rank
         q_nope_prefill = torch.randn(
-            total_q,
+            num_prefill,
             mla_dims["num_q_heads"],
             mla_dims["qk_nope_head_dim"],
             device=device,
             dtype=dtype,
         )
-        prefill_q = torch.cat([q_nope_prefill, q_pe], dim=-1)
+        q_pe_prefill = torch.randn(
+            num_prefill,
+            mla_dims["num_q_heads"],
+            mla_dims["qk_rope_head_dim"],
+            device=device,
+            dtype=dtype,
+        )
+        prefill_q = torch.cat([q_nope_prefill, q_pe_prefill], dim=-1)
     else:  # concat
-        decode_inputs = torch.randn(
-            total_q,
+        decode_q = torch.randn(
+            num_decode,
             mla_dims["num_q_heads"],
             mla_dims["kv_lora_rank"] + mla_dims["qk_rope_head_dim"],
             device=device,
             dtype=dtype,
         )
-        # For prefill with concat format
         prefill_q = torch.randn(
-            total_q,
+            num_prefill,
             mla_dims["num_q_heads"],
             mla_dims["qk_nope_head_dim"] + mla_dims["qk_rope_head_dim"],
             device=device,
             dtype=dtype,
         )
 
-    # Create additional inputs needed for prefill forward
-    k_c_normed = torch.randn(
-        total_q,
-        mla_dims["kv_lora_rank"],
-        device=device,
-        dtype=dtype,
-    )
-    k_pe = torch.randn(
-        total_q,
-        1,  # Single head for MLA
-        mla_dims["qk_rope_head_dim"],
-        device=device,
-        dtype=dtype,
-    )
-    k_scale = torch.ones(1, device=device, dtype=torch.float32)
+    if quantize_query:
+        from vllm.platforms import current_platform
 
-    output = torch.zeros(
-        total_q,
-        mla_dims["num_q_heads"] * mla_dims["v_head_dim"],
-        device=device,
-        dtype=dtype,
-    )
+        # quantize_query forces concat format, so decode_q is always a tensor
+        decode_q = decode_q.to(current_platform.fp8_dtype())
 
-    prefill_inputs = {
-        "q": prefill_q,
-        "k_c_normed": k_c_normed,
-        "k_pe": k_pe,
-        "k_scale": k_scale,
-        "output": output,
-    }
-
-    return decode_inputs, prefill_inputs
+    return decode_q, prefill_q
 
 
 # ============================================================================
@@ -535,6 +533,7 @@ def _create_backend_impl(
     device: torch.device,
     max_num_tokens: int = 8192,
     index_topk: int | None = None,
+    kv_cache_dtype: str = "auto",
 ):
     """
     Create backend implementation instance.
@@ -562,6 +561,8 @@ def _create_backend_impl(
         num_heads=mla_dims["num_q_heads"],
         qk_nope_head_dim=mla_dims["qk_nope_head_dim"],
         v_head_dim=mla_dims["v_head_dim"],
+        kv_lora_rank=mla_dims["kv_lora_rank"],
+        device=device,
     )
 
     # Create indexer for sparse backends
@@ -583,7 +584,7 @@ def _create_backend_impl(
         "num_kv_heads": mla_dims["num_kv_heads"],
         "alibi_slopes": None,
         "sliding_window": None,
-        "kv_cache_dtype": "auto",
+        "kv_cache_dtype": kv_cache_dtype,
         "logits_soft_cap": None,
         "attn_type": "decoder",
         "kv_sharing_target_layer_name": None,
@@ -701,6 +702,10 @@ def _run_single_benchmark(
     mla_dims: dict,
     device: torch.device,
     indexer=None,
+    kv_cache_dtype: str | None = None,
+    check_correctness: bool = False,
+    atol: float = 0.5,
+    rtol: float = 1e-2,
 ) -> BenchmarkResult:
     """
     Run a single benchmark iteration.
@@ -714,41 +719,70 @@ def _run_single_benchmark(
         mla_dims: MLA dimension configuration
         device: Target device
         indexer: Optional MockIndexer for sparse backends
-
-    Returns:
-        BenchmarkResult with timing statistics
+        check_correctness: Run SDPA correctness check alongside benchmark
+        atol: Absolute tolerance for correctness check
+        rtol: Relative tolerance for correctness check
     """
-    # Parse batch spec
-    requests = parse_batch_spec(config.batch_spec)
+    # Parse batch spec – sort to match _build_attention_metadata (decode first)
+    requests = sorted(parse_batch_spec(config.batch_spec), key=lambda r: r.q_len)
     q_lens = [r.q_len for r in requests]
     kv_lens = [r.kv_len for r in requests]
     total_q = sum(q_lens)
     max_kv_len = max(kv_lens)
+    seq_lens_gpu = torch.tensor(kv_lens, dtype=torch.int32, device=device)
 
     # Determine block size
     block_size = backend_cfg["block_size"] or config.block_size
 
     # Build metadata
-    metadata, num_blocks = _build_attention_metadata(
+    metadata, num_blocks, block_table = _build_attention_metadata(
         requests, block_size, device, builder_instance
     )
 
     # Create KV cache
-    kv_cache = torch.zeros(
-        num_blocks,
-        block_size,
-        mla_dims["kv_lora_rank"] + mla_dims["qk_rope_head_dim"],
-        device=device,
-        dtype=torch.bfloat16,
+    if kv_cache_dtype is None:
+        kv_cache_dtype = getattr(config, "kv_cache_dtype", "auto")
+    is_fp8_kvcache = kv_cache_dtype == "fp8"
+    logger.info(
+        "Running %s %s  kv_cache_dtype=%s",
+        config.backend,
+        config.batch_spec,
+        kv_cache_dtype,
     )
+    head_size = mla_dims["kv_lora_rank"] + mla_dims["qk_rope_head_dim"]
 
-    # Create input tensors for both decode and prefill modes
-    decode_inputs, prefill_inputs = _create_input_tensors(
-        total_q,
-        mla_dims,
-        backend_cfg["query_format"],
-        device,
-        torch.bfloat16,
+    if kv_cache_dtype == "fp8_ds_mla":
+        # FlashMLA sparse custom format: 656 bytes per token, stored as uint8.
+        # Layout: kv_lora_rank fp8 bytes + 4 float32 tile scales + 2*rope_dim bf16 bytes
+        # = 512 + 16 + 128 = 656 bytes for DeepSeek dims (see flashmla_sparse.py).
+        kv_cache = torch.zeros(
+            num_blocks,
+            block_size,
+            656,
+            device=device,
+            dtype=torch.uint8,
+        )
+    elif kv_cache_dtype == "fp8":
+        from vllm.platforms import current_platform
+
+        kv_cache = torch.zeros(
+            num_blocks,
+            block_size,
+            head_size,
+            device=device,
+            dtype=torch.uint8,
+        ).view(current_platform.fp8_dtype())
+    else:
+        kv_cache = torch.zeros(
+            num_blocks,
+            block_size,
+            head_size,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+
+    quantize_query = is_fp8_kvcache and getattr(
+        impl, "supports_quant_query_input", False
     )
 
     # Fill indexer with random indices for sparse backends
@@ -756,26 +790,144 @@ def _run_single_benchmark(
     if is_sparse and indexer is not None:
         indexer.fill_random_indices(total_q, max_kv_len)
 
-    # Determine which forward method to use based on metadata
-    if metadata.decode is not None:
-        forward_fn = lambda: impl.forward_mqa(decode_inputs, kv_cache, metadata, layer)
-    elif metadata.prefill is not None:
-        forward_fn = lambda: impl.forward_mha(
-            prefill_inputs["q"],
-            prefill_inputs["k_c_normed"],
-            prefill_inputs["k_pe"],
-            kv_cache,
-            metadata,
-            prefill_inputs["k_scale"],
-            prefill_inputs["output"],
-        )
-    else:
+    # Determine which forward method to use based on metadata.
+    has_decode = is_sparse or metadata.decode is not None
+    has_prefill = not is_sparse and metadata.prefill is not None
+    if not has_decode and not has_prefill:
         raise RuntimeError("Metadata has neither decode nor prefill metadata")
+
+    num_decode = (
+        metadata.num_decode_tokens
+        if (has_decode and has_prefill)
+        else total_q
+        if has_decode
+        else 0
+    )
+    num_prefill = total_q - num_decode
+
+    # Populate KV cache with random data
+    populate_mla_kv_cache(
+        kv_cache,
+        block_table,
+        seq_lens_gpu,
+        block_size,
+        mla_dims,
+        kv_cache_dtype,
+    )
+
+    # Read new-token k_c / k_pe from KV cache for forward_mha
+    kv_lora_rank = mla_dims["kv_lora_rank"]
+    slot_indices = metadata.slot_mapping.long()
+    block_indices = slot_indices // block_size
+    block_offsets = slot_indices % block_size
+    kv_cache_bf16 = mla_kv_cache_to_bf16(kv_cache, kv_cache_dtype, mla_dims)
+    entries = kv_cache_bf16[block_indices, block_offsets]  # [total_q, head_size]
+    k_c_normed = entries[:, :kv_lora_rank]  # [total_q, kv_lora_rank]
+    k_pe_new = entries[:, kv_lora_rank:].unsqueeze(1)  # [total_q, 1, rope_dim]
+    k_scale = torch.ones(1, device=device, dtype=torch.float32)
+
+    # Create query tensor and output buffer
+    query_fmt = "concat" if quantize_query else backend_cfg["query_format"]
+    decode_q, prefill_q = _create_query_tensors(
+        num_decode,
+        num_prefill,
+        mla_dims,
+        query_fmt,
+        device,
+        torch.bfloat16,
+        quantize_query=quantize_query,
+    )
+
+    prefill_output = torch.zeros(
+        num_prefill,
+        mla_dims["num_q_heads"] * mla_dims["v_head_dim"],
+        device=device,
+        dtype=torch.bfloat16,
+    )
+
+    def forward_fn():
+        results = []
+        if has_decode:
+            results.append(impl.forward_mqa(decode_q, kv_cache, metadata, layer))
+        if has_prefill:
+            results.append(
+                impl.forward_mha(
+                    prefill_q,
+                    k_c_normed[num_decode:],
+                    k_pe_new[num_decode:],
+                    kv_cache,
+                    metadata,
+                    k_scale,
+                    prefill_output,
+                )
+            )
+        return results[0] if len(results) == 1 else tuple(results)
+
+    if check_correctness:
+        # Clone sparse indices so the reference uses the same positions the
+        # kernel will attend to — no need to replace with sequential indices.
+        sparse_indices = None
+        if is_sparse and indexer is not None:
+            sparse_indices = indexer.topk_indices_buffer[:total_q].clone()
+
+        has_kv_b_proj = hasattr(impl, "kv_b_proj")
+        kv_b_proj_weight = impl.kv_b_proj.weight if has_kv_b_proj else None
+
+        # Enable real projection in MockKVBProj in forward_mha
+        # so the reference can reproduce
+        if has_kv_b_proj:
+            impl.kv_b_proj._use_real_weight = True
+
+        prefill_output.zero_()
+        result = forward_fn()
+        torch.accelerator.synchronize()
+
+        # Disable real projection for the timing loop
+        # to only benchmark the attention kernel
+        if has_kv_b_proj:
+            impl.kv_b_proj._use_real_weight = False
+
+        # Reference functions expect a bfloat16 kv_cache; decode fp8 formats first.
+        kv_cache_ref = mla_kv_cache_to_bf16(kv_cache, kv_cache_dtype, mla_dims)
+
+        prefix = f"{config.backend} {config.batch_spec}"
+
+        if has_decode:
+            decode_result = result[0] if has_prefill else result
+            backend_out, _ = decode_result
+            ref = compute_mqa_reference(
+                decode_q,
+                kv_cache_ref,
+                metadata,
+                mla_dims,
+                is_sparse,
+                sparse_indices=sparse_indices,
+            )
+            check_close(f"{prefix} mqa", backend_out, ref, atol, rtol)
+        if has_prefill:
+            ref = compute_mha_reference(
+                prefill_q,
+                kv_cache_ref,
+                metadata,
+                kv_b_proj_weight,
+                mla_dims,
+            )
+            check_close(f"{prefix} mha", prefill_output, ref, atol, rtol)
 
     # Warmup
     for _ in range(config.warmup_iters):
         forward_fn()
     torch.accelerator.synchronize()
+
+    # Optionally capture a CUDA graph after warmup.
+    # Graph replay eliminates CPU launch overhead so timings reflect pure kernel time.
+    if config.use_cuda_graphs:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            forward_fn()
+        benchmark_fn = graph.replay
+    else:
+        benchmark_fn = forward_fn
 
     # Benchmark
     times = []
@@ -785,7 +937,7 @@ def _run_single_benchmark(
 
         start.record()
         for _ in range(config.num_layers):
-            forward_fn()
+            benchmark_fn()
         end.record()
 
         torch.accelerator.synchronize()
@@ -808,6 +960,7 @@ def _run_mla_benchmark_batched(
     configs_with_params: list[tuple],  # [(config, threshold, num_splits), ...]
     index_topk: int = 2048,
     prefill_backend: str | None = None,
+    check_correctness: bool = False,
 ) -> list[BenchmarkResult]:
     """
     Unified batched MLA benchmark runner for all backends.
@@ -834,6 +987,7 @@ def _run_mla_benchmark_batched(
         return []
 
     backend_cfg = _get_backend_config(backend)
+    backend_class = backend_cfg["backend_class"]
     device = torch.device(configs_with_params[0][0].device)
     torch.accelerator.set_device_index(device)
 
@@ -852,13 +1006,47 @@ def _run_mla_benchmark_batched(
     # Determine if this is a sparse backend
     is_sparse = backend_cfg.get("is_sparse", False)
 
+    # Extract kv_cache_dtype from the first config
+    kv_cache_dtype = getattr(first_config, "kv_cache_dtype", "auto")
+
+    # FlashMLA sparse only supports "fp8_ds_mla" internally (not generic "fp8").
+    # Remap here so the user can pass --kv-cache-dtype fp8 regardless of backend.
+    if backend.upper() == "FLASHMLA_SPARSE" and kv_cache_dtype == "fp8":
+        kv_cache_dtype = "fp8_ds_mla"
+
+    # Check backend supports the requested kv_cache_dtype.
+    if not backend_class.supports_kv_cache_dtype(kv_cache_dtype):
+        raise ValueError(
+            f"{backend} does not support kv_cache_dtype='{kv_cache_dtype}'"
+        )
+
+    # Check device compute capability
+    if hasattr(backend_class, "supports_compute_capability"):
+        from vllm.platforms import current_platform
+
+        capability = current_platform.get_device_capability(device.index or 0)
+        if not backend_class.supports_compute_capability(capability):
+            raise ValueError(
+                f"{backend} does not support compute capability "
+                f"{capability.major}.{capability.minor} on this device"
+            )
+
+    # Compute max total_q across all configs so the metadata builder buffer
+    # is large enough
+    max_total_q = max(
+        sum(r.q_len for r in parse_batch_spec(cfg.batch_spec))
+        for cfg, *_ in configs_with_params
+    )
+
     # Create and set vLLM config for MLA (reused across all benchmarks)
     vllm_config = create_minimal_vllm_config(
         model_name="deepseek-v3",  # Used only for model path
         block_size=block_size,
+        max_num_batched_tokens=max_total_q,
         mla_dims=mla_dims,  # Use custom dims from config or default
         index_topk=index_topk if is_sparse else None,
         prefill_backend=prefill_backend,
+        kv_cache_dtype=kv_cache_dtype,
     )
 
     results = []
@@ -883,7 +1071,9 @@ def _run_mla_benchmark_batched(
             mla_dims,
             vllm_config,
             device,
+            max_num_tokens=max_total_q,
             index_topk=index_topk if is_sparse else None,
+            kv_cache_dtype=kv_cache_dtype,
         )
 
         # Verify the actual prefill backend matches what was requested
@@ -942,6 +1132,8 @@ def _run_mla_benchmark_batched(
                     mla_dims,
                     device,
                     indexer=indexer,
+                    kv_cache_dtype=kv_cache_dtype,
+                    check_correctness=check_correctness,
                 )
                 results.append(result)
 
@@ -969,6 +1161,7 @@ def run_mla_benchmark(
     num_kv_splits: int | None = None,
     index_topk: int = 2048,
     prefill_backend: str | None = None,
+    check_correctness: bool = False,
 ) -> BenchmarkResult | list[BenchmarkResult]:
     """
     Unified MLA benchmark runner for all backends.
@@ -1012,7 +1205,11 @@ def run_mla_benchmark(
 
     # Use unified batched execution
     results = _run_mla_benchmark_batched(
-        backend, configs_with_params, index_topk, prefill_backend=prefill_backend
+        backend,
+        configs_with_params,
+        index_topk,
+        prefill_backend=prefill_backend,
+        check_correctness=check_correctness,
     )
 
     # Return single result or list based on input

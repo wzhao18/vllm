@@ -47,29 +47,42 @@ from common import (
     is_mla_backend,
 )
 
+from vllm.v1.worker.workspace import init_workspace_manager
 
-def run_standard_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
+
+def run_standard_attention_benchmark(
+    config: BenchmarkConfig, check_correctness: bool = False
+) -> BenchmarkResult:
     """Run standard attention benchmark (Flash/Triton/FlashInfer)."""
     from runner import run_attention_benchmark
 
-    return run_attention_benchmark(config)
+    return run_attention_benchmark(config, check_correctness=check_correctness)
 
 
-def run_mla_benchmark(config: BenchmarkConfig, **kwargs) -> BenchmarkResult:
+def run_mla_benchmark(
+    config: BenchmarkConfig, check_correctness: bool = False, **kwargs
+) -> BenchmarkResult:
     """Run MLA benchmark with appropriate backend."""
     from mla_runner import run_mla_benchmark as run_mla
 
     return run_mla(
-        config.backend, config, prefill_backend=config.prefill_backend, **kwargs
+        config.backend,
+        config,
+        prefill_backend=config.prefill_backend,
+        check_correctness=check_correctness,
+        **kwargs,
     )
 
 
-def run_benchmark(config: BenchmarkConfig, **kwargs) -> BenchmarkResult:
+def run_benchmark(
+    config: BenchmarkConfig, check_correctness: bool = False, **kwargs
+) -> BenchmarkResult:
     """
     Run a single benchmark with proper backend selection.
 
     Args:
         config: BenchmarkConfig with backend, batch_spec, and model params
+        check_correctness: Run SDPA correctness check alongside benchmark
         **kwargs: Additional arguments passed to MLA benchmarks
 
     Returns:
@@ -77,9 +90,13 @@ def run_benchmark(config: BenchmarkConfig, **kwargs) -> BenchmarkResult:
     """
     try:
         if is_mla_backend(config.backend):
-            return run_mla_benchmark(config, **kwargs)
+            return run_mla_benchmark(
+                config, check_correctness=check_correctness, **kwargs
+            )
         else:
-            return run_standard_attention_benchmark(config)
+            return run_standard_attention_benchmark(
+                config, check_correctness=check_correctness
+            )
     except Exception as e:
         return BenchmarkResult(
             config=config,
@@ -97,6 +114,7 @@ def run_model_parameter_sweep(
     base_config_args: dict,
     sweep: ModelParameterSweep,
     console: Console,
+    check_correctness: bool = False,
 ) -> list[BenchmarkResult]:
     """
     Run model parameter sweep for given backends and batch specs.
@@ -133,7 +151,9 @@ def run_model_parameter_sweep(
                     )
 
                     # Run benchmark
-                    result = run_benchmark(clean_config)
+                    result = run_benchmark(
+                        clean_config, check_correctness=check_correctness
+                    )
 
                     # Replace backend with labeled version for display
                     backend_label = sweep.get_label(backend, value)
@@ -264,6 +284,7 @@ def run_parameter_sweep(
     base_config_args: dict,
     sweep: ParameterSweep,
     console: Console,
+    check_correctness: bool = False,
 ) -> list[BenchmarkResult]:
     """
     Run parameter sweep for given backends and batch specs.
@@ -304,7 +325,9 @@ def run_parameter_sweep(
                         kwargs[sweep.param_name] = value
 
                     # Run benchmark
-                    result = run_benchmark(config, **kwargs)
+                    result = run_benchmark(
+                        config, check_correctness=check_correctness, **kwargs
+                    )
 
                     # Replace backend with labeled version for display
                     backend_label = sweep.get_label(backend, value)
@@ -462,7 +485,7 @@ def main():
     parser.add_argument(
         "--batch-specs",
         nargs="+",
-        default=["q2k", "8q1s1k"],
+        default=None,
         help="Batch specifications using extended grammar",
     )
 
@@ -478,6 +501,27 @@ def main():
     parser.add_argument("--repeats", type=int, default=1, help="Repetitions")
     parser.add_argument("--warmup-iters", type=int, default=3, help="Warmup iterations")
     parser.add_argument("--profile-memory", action="store_true", help="Profile memory")
+    parser.add_argument(
+        "--kv-cache-dtype",
+        default="auto",
+        choices=["auto", "fp8"],
+        help="KV cache dtype: auto (use model dtype) or fp8",
+    )
+    parser.add_argument(
+        "--cuda-graphs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Launch kernels with CUDA graphs to eliminate CPU overhead"
+            "in measurements (default: True)"
+        ),
+    )
+    parser.add_argument(
+        "--check-correctness",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run correctness check alongside benchmark (default: True)",
+    )
 
     # Parameter sweep (use YAML config for advanced sweeps)
     parser.add_argument(
@@ -536,21 +580,24 @@ def main():
 
         # Batch specs and sizes
         # Support both explicit batch_specs and generated batch_spec_ranges
-        if "batch_spec_ranges" in yaml_config:
-            # Generate batch specs from ranges
-            generated_specs = generate_batch_specs_from_ranges(
-                yaml_config["batch_spec_ranges"]
-            )
-            # Combine with any explicit batch_specs
-            if "batch_specs" in yaml_config:
-                args.batch_specs = yaml_config["batch_specs"] + generated_specs
-            else:
-                args.batch_specs = generated_specs
-            console.print(
-                f"[dim]Generated {len(generated_specs)} batch specs from ranges[/]"
-            )
-        elif "batch_specs" in yaml_config:
-            args.batch_specs = yaml_config["batch_specs"]
+        # CLI --batch-specs takes precedence over YAML when provided.
+        cli_batch_specs_provided = args.batch_specs is not None
+        if not cli_batch_specs_provided:
+            if "batch_spec_ranges" in yaml_config:
+                # Generate batch specs from ranges
+                generated_specs = generate_batch_specs_from_ranges(
+                    yaml_config["batch_spec_ranges"]
+                )
+                # Combine with any explicit batch_specs
+                if "batch_specs" in yaml_config:
+                    args.batch_specs = yaml_config["batch_specs"] + generated_specs
+                else:
+                    args.batch_specs = generated_specs
+                console.print(
+                    f"[dim]Generated {len(generated_specs)} batch specs from ranges[/]"
+                )
+            elif "batch_specs" in yaml_config:
+                args.batch_specs = yaml_config["batch_specs"]
 
         if "batch_sizes" in yaml_config:
             args.batch_sizes = yaml_config["batch_sizes"]
@@ -575,6 +622,12 @@ def main():
             args.warmup_iters = yaml_config["warmup_iters"]
         if "profile_memory" in yaml_config:
             args.profile_memory = yaml_config["profile_memory"]
+        if "kv_cache_dtype" in yaml_config:
+            args.kv_cache_dtype = yaml_config["kv_cache_dtype"]
+        if "cuda_graphs" in yaml_config:
+            args.cuda_graphs = yaml_config["cuda_graphs"]
+        if "check_correctness" in yaml_config:
+            args.check_correctness = yaml_config["check_correctness"]
 
         # Parameter sweep configuration
         if "parameter_sweep" in yaml_config:
@@ -629,11 +682,19 @@ def main():
     # Determine backends
     backends = args.backends or ([args.backend] if args.backend else ["flash"])
     prefill_backends = getattr(args, "prefill_backends", None)
+    if not args.batch_specs:
+        args.batch_specs = ["q2k", "8q1s1k"]
     console.print(f"Backends: {', '.join(backends)}")
     if prefill_backends:
         console.print(f"Prefill backends: {', '.join(prefill_backends)}")
     console.print(f"Batch specs: {', '.join(args.batch_specs)}")
+    console.print(f"KV cache dtype: {args.kv_cache_dtype}")
+    console.print(f"CUDA graphs: {args.cuda_graphs}")
     console.print()
+
+    init_workspace_manager(args.device)
+
+    check_correctness = getattr(args, "check_correctness", False)
 
     # Run benchmarks
     all_results = []
@@ -687,6 +748,8 @@ def main():
                         repeats=args.repeats,
                         warmup_iters=args.warmup_iters,
                         profile_memory=args.profile_memory,
+                        kv_cache_dtype=args.kv_cache_dtype,
+                        use_cuda_graphs=args.cuda_graphs,
                     )
 
                     # Add decode pipeline config
@@ -714,7 +777,11 @@ def main():
                     from mla_runner import run_mla_benchmark as run_mla
 
                     # Use batched API: pass list of (config, threshold) tuples
-                    timing_results = run_mla(backend, configs_with_thresholds)
+                    timing_results = run_mla(
+                        backend,
+                        configs_with_thresholds,
+                        check_correctness=check_correctness,
+                    )
 
                     # Create BenchmarkResult objects from timing results
                     for (config, _), timing in zip(
@@ -839,6 +906,8 @@ def main():
             "repeats": args.repeats,
             "warmup_iters": args.warmup_iters,
             "profile_memory": args.profile_memory,
+            "kv_cache_dtype": args.kv_cache_dtype,
+            "use_cuda_graphs": args.cuda_graphs,
         }
         all_results = run_model_parameter_sweep(
             backends,
@@ -846,6 +915,7 @@ def main():
             base_config_args,
             args.model_parameter_sweep,
             console,
+            check_correctness=check_correctness,
         )
 
     # Handle parameter sweep mode (unified)
@@ -861,9 +931,16 @@ def main():
             "repeats": args.repeats,
             "warmup_iters": args.warmup_iters,
             "profile_memory": args.profile_memory,
+            "kv_cache_dtype": args.kv_cache_dtype,
+            "use_cuda_graphs": args.cuda_graphs,
         }
         all_results = run_parameter_sweep(
-            backends, args.batch_specs, base_config_args, args.parameter_sweep, console
+            backends,
+            args.batch_specs,
+            base_config_args,
+            args.parameter_sweep,
+            console,
+            check_correctness=check_correctness,
         )
 
     else:
@@ -891,9 +968,13 @@ def main():
                             repeats=args.repeats,
                             warmup_iters=args.warmup_iters,
                             profile_memory=args.profile_memory,
+                            kv_cache_dtype=args.kv_cache_dtype,
+                            use_cuda_graphs=args.cuda_graphs,
                         )
 
-                        result = run_benchmark(config)
+                        result = run_benchmark(
+                            config, check_correctness=check_correctness
+                        )
                         decode_results.append(result)
 
                         if not result.success:

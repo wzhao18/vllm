@@ -15,7 +15,16 @@ from contextlib import contextmanager
 import numpy as np
 import torch
 from batch_spec import parse_batch_spec, reorder_for_flashinfer
-from common import BenchmarkConfig, BenchmarkResult, MockLayer, get_attention_scale
+from common import (
+    BenchmarkConfig,
+    BenchmarkResult,
+    MockLayer,
+    check_close,
+    compute_std_attn_reference,
+    get_attention_scale,
+    populate_std_kv_cache,
+    read_std_kv_cache,
+)
 
 from vllm.config import (
     CacheConfig,
@@ -83,41 +92,46 @@ def log_warnings_and_errors_only():
 
 
 def _build_common_attn_metadata(
-    q_lens: list[int],
-    kv_lens: list[int],
+    requests: list,
     block_size: int,
     device: torch.device,
 ) -> CommonAttentionMetadata:
-    """Build CommonAttentionMetadata from query/kv lengths."""
-    batch_size = len(q_lens)
+    """Build CommonAttentionMetadata from requests."""
+    batch_size = len(requests)
+    q_lens = [r.q_len for r in requests]
+    kv_lens = [r.kv_len for r in requests]
     total_tokens = sum(q_lens)
 
     query_start_loc = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
     query_start_loc[1:] = torch.tensor(q_lens, dtype=torch.int32, device=device).cumsum(
         0
     )
-    query_start_loc_cpu = query_start_loc.cpu()
 
     seq_lens = torch.tensor(kv_lens, dtype=torch.int32, device=device)
-    max_seq_len = int(seq_lens.max().item())
 
     max_blocks = (max(kv_lens) + block_size - 1) // block_size
-    num_blocks = batch_size * max_blocks
     block_table_tensor = torch.arange(
-        num_blocks, dtype=torch.int32, device=device
+        batch_size * max_blocks, dtype=torch.int32, device=device
     ).view(batch_size, max_blocks)
-    slot_mapping = torch.arange(total_tokens, dtype=torch.int64, device=device)
 
-    max_query_len = max(q_lens)
+    slot_mapping = torch.zeros(total_tokens, dtype=torch.int64, device=device)
+    q_offset = 0
+    for i, req in enumerate(requests):
+        for j in range(req.q_len):
+            pos = req.context_len + j
+            slot_mapping[q_offset + j] = (
+                i * max_blocks + pos // block_size
+            ) * block_size + pos % block_size
+        q_offset += req.q_len
 
     return CommonAttentionMetadata(
         query_start_loc=query_start_loc,
-        query_start_loc_cpu=query_start_loc_cpu,
+        query_start_loc_cpu=query_start_loc.cpu(),
         seq_lens=seq_lens,
         num_reqs=batch_size,
         num_actual_tokens=total_tokens,
-        max_query_len=max_query_len,
-        max_seq_len=max_seq_len,
+        max_query_len=max(q_lens),
+        max_seq_len=int(seq_lens.max().item()),
         block_table_tensor=block_table_tensor,
         slot_mapping=slot_mapping,
         causal=True,
@@ -140,7 +154,7 @@ def _create_vllm_config(
 
     cache_config = CacheConfig(
         block_size=config.block_size,
-        cache_dtype="auto",
+        cache_dtype=config.kv_cache_dtype,
     )
     cache_config.num_gpu_blocks = max_num_blocks
     cache_config.num_cpu_blocks = 0
@@ -215,7 +229,7 @@ def _create_backend_impl(
         num_kv_heads=config.num_kv_heads,
         alibi_slopes=None,
         sliding_window=None,
-        kv_cache_dtype="auto",
+        kv_cache_dtype=config.kv_cache_dtype,
     )
 
     kv_cache_spec = FullAttentionSpec(
@@ -283,32 +297,28 @@ def _create_metadata_builder(
 # ============================================================================
 
 
-def _create_input_tensors(
+def _create_query_tensors(
     config: BenchmarkConfig,
     total_q: int,
     device: torch.device,
     dtype: torch.dtype,
-) -> tuple:
-    """Create Q, K, V input tensors for all layers."""
-    q_list = [
+) -> list[torch.Tensor]:
+    """Create query tensors for all layers.
+
+    When kv_cache_dtype is fp8, queries are cast to fp8 to match backends
+    that require query/key/value dtype consistency (Triton, FlashInfer).
+    """
+    q_dtype = dtype
+    if config.kv_cache_dtype == "fp8":
+        from vllm.platforms import current_platform
+
+        q_dtype = current_platform.fp8_dtype()
+    return [
         torch.randn(
             total_q, config.num_q_heads, config.head_dim, device=device, dtype=dtype
-        )
+        ).to(q_dtype)
         for _ in range(config.num_layers)
     ]
-    k_list = [
-        torch.randn(
-            total_q, config.num_kv_heads, config.head_dim, device=device, dtype=dtype
-        )
-        for _ in range(config.num_layers)
-    ]
-    v_list = [
-        torch.randn(
-            total_q, config.num_kv_heads, config.head_dim, device=device, dtype=dtype
-        )
-        for _ in range(config.num_layers)
-    ]
-    return q_list, k_list, v_list
 
 
 def _create_kv_cache(
@@ -322,6 +332,7 @@ def _create_kv_cache(
 
     Uses the backend's get_kv_cache_shape() and get_kv_cache_stride_order()
     to create the cache with the correct shape and memory layout.
+    Respects config.kv_cache_dtype for fp8 quantized caches.
     """
     # Get the logical shape from the backend
     cache_shape = backend_class.get_kv_cache_shape(
@@ -344,10 +355,17 @@ def _create_kv_cache(
     # Compute inverse permutation to get back to logical view
     inv_order = [stride_order.index(i) for i in range(len(stride_order))]
 
+    # Use fp8 dtype for cache when requested.
+    cache_dtype = dtype
+    if config.kv_cache_dtype == "fp8":
+        from vllm.platforms import current_platform
+
+        cache_dtype = current_platform.fp8_dtype()
+
     cache_list = []
     for _ in range(config.num_layers):
         # Allocate in physical layout order (contiguous in memory)
-        cache = torch.zeros(*physical_shape, device=device, dtype=dtype)
+        cache = torch.zeros(*physical_shape, device=device, dtype=cache_dtype)
         # Permute to logical view
         cache = cache.permute(*inv_order)
         cache_list.append(cache)
@@ -365,18 +383,68 @@ def _run_single_benchmark(
     impl,
     layer,
     q_list: list,
-    k_list: list,
-    v_list: list,
     cache_list: list,
     attn_metadata,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    requests: list,
     device: torch.device,
     dtype: torch.dtype,
+    check_correctness: bool = False,
+    atol: float = 1e-2,
+    rtol: float = 1e-2,
 ) -> tuple:
     """Run single benchmark iteration with warmup and timing loop."""
     total_q = q_list[0].shape[0]
     out = torch.empty(
         total_q, config.num_q_heads, config.head_dim, device=device, dtype=dtype
     )
+
+    # Populate KV cache with random data
+    populate_std_kv_cache(
+        impl,
+        layer,
+        cache_list,
+        block_table,
+        seq_lens,
+        config.block_size,
+        config.num_kv_heads,
+        config.head_dim,
+        dtype,
+    )
+
+    # Read new-token K/V from cache
+    block_size = config.block_size
+    slot_mapping = attn_metadata.slot_mapping
+
+    k_list: list[torch.Tensor] = []
+    v_list: list[torch.Tensor] = []
+    for cache in cache_list:
+        k_new, v_new = read_std_kv_cache(cache, slot_mapping, block_size)
+        k_list.append(k_new)
+        v_list.append(v_new)
+
+    # Correctness check on layer 0 before warmup.
+    if check_correctness:
+        impl.forward(
+            layer,
+            q_list[0],
+            k_list[0],
+            v_list[0],
+            cache_list[0],
+            attn_metadata,
+            output=out,
+        )
+        torch.accelerator.synchronize()
+        ref = compute_std_attn_reference(
+            q_list[0],
+            k_list[0],
+            v_list[0],
+            cache_list[0],
+            block_table,
+            attn_metadata,
+        )
+        check_close(f"{config.backend} {config.batch_spec}", out, ref, atol, rtol)
 
     # Warmup
     for _ in range(config.warmup_iters):
@@ -430,7 +498,12 @@ def _run_single_benchmark(
 # ============================================================================
 
 
-def run_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
+def run_attention_benchmark(
+    config: BenchmarkConfig,
+    check_correctness: bool = False,
+    atol: float = 1e-2,
+    rtol: float = 1e-2,
+) -> BenchmarkResult:
     """
     Run standard attention benchmark with real kernels.
 
@@ -438,6 +511,9 @@ def run_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
 
     Args:
         config: Benchmark configuration
+        check_correctness: Run SDPA correctness check
+        atol: Absolute tolerance for correctness check
+        rtol: Relative tolerance for correctness check
 
     Returns:
         BenchmarkResult with timing and memory statistics
@@ -446,6 +522,13 @@ def run_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
     torch.accelerator.set_device_index(device)
 
     backend_cfg = _get_backend_config(config.backend)
+    backend_class = backend_cfg["backend_class"]
+
+    if not backend_class.supports_kv_cache_dtype(config.kv_cache_dtype):
+        raise ValueError(
+            f"{config.backend} does not support kv_cache_dtype="
+            f"'{config.kv_cache_dtype}'"
+        )
 
     requests = parse_batch_spec(config.batch_spec)
 
@@ -483,7 +566,7 @@ def run_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
                 get_kv_cache_layout.cache_clear()
 
             common_metadata = _build_common_attn_metadata(
-                q_lens, kv_lens, config.block_size, device
+                requests, config.block_size, device
             )
 
             kv_cache_spec = FullAttentionSpec(
@@ -502,9 +585,7 @@ def run_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
                 common_attn_metadata=common_metadata,
             )
 
-            q_list, k_list, v_list = _create_input_tensors(
-                config, total_q, device, dtype
-            )
+            q_list = _create_query_tensors(config, total_q, device, dtype)
 
             cache_list = _create_kv_cache(
                 config, max_num_blocks, backend_class, device, dtype
@@ -515,12 +596,16 @@ def run_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
                 impl,
                 layer,
                 q_list,
-                k_list,
-                v_list,
                 cache_list,
                 attn_metadata,
+                common_metadata.block_table_tensor,
+                common_metadata.seq_lens,
+                requests,
                 device,
                 dtype,
+                check_correctness=check_correctness,
+                atol=atol,
+                rtol=rtol,
             )
 
     mean_time = np.mean(times)
