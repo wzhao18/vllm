@@ -10,6 +10,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from vllm.logger import init_logger
+
+logger = init_logger("vllm.benchmark")
+
 import torch
 from batch_spec import get_batch_type, parse_batch_spec
 from rich.console import Console
@@ -78,8 +82,8 @@ class MockKVBProj:
     - True (correctness check): __call__ does the real float32 matmul so
       forward_mha produces numerically correct output for comparison.
 
-    A deterministic weight (seed=0) is always stored in self.weight so the
-    SDPA reference can reproduce the projection independently.
+    self.weight is always available so the SDPA reference can reproduce the
+    projection using the same weight the backend used.
     """
 
     def __init__(
@@ -95,21 +99,18 @@ class MockKVBProj:
         self.v_head_dim = v_head_dim
         self.out_dim = qk_nope_head_dim + v_head_dim
         self.quant_method = None
-        # Toggle to switch between real projection (correctness) and random
-        # output (benchmark).  Python's special-method dispatch always goes
-        # through the class, so toggling a flag inside __call__ is the only
-        # reliable way to change behavior without monkey-patching the class.
-        self._use_real_weight = False
         out_features = num_heads * self.out_dim
-        # Deterministic weight — fork_rng isolates from global random state.
-        with torch.random.fork_rng():
-            torch.manual_seed(0)
-            self.weight = torch.randn(
-                out_features,
-                kv_lora_rank,
-                dtype=torch.bfloat16,
-                device=device,
-            ) / (kv_lora_rank**0.5)
+
+        # Toggle to switch between real projection (correctness) and random
+        # output (benchmark).
+        self._use_real_weight = False
+
+        self.weight = torch.randn(
+            out_features,
+            kv_lora_rank,
+            dtype=torch.bfloat16,
+            device=device,
+        ) / (kv_lora_rank**0.5)
 
     def __call__(self, x: torch.Tensor) -> tuple[torch.Tensor, None]:
         """Project x or return random output depending on _use_real_weight.
@@ -612,9 +613,8 @@ def populate_mla_kv_cache_full(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     kv_cache_dtype: str,
-    seed: int = 1,
 ) -> None:
-    """Write deterministic random KV data into ALL kv_cache positions.
+    """Write random KV data into ALL kv_cache positions.
 
     Unlike populate_mla_kv_cache (which only writes new-token positions via
     slot_mapping), this writes positions 0..kv_len-1 for every request using
@@ -646,16 +646,8 @@ def populate_mla_kv_cache_full(
     _off = torch.cat(off_list)
     total = int(_blk.shape[0])
 
-    with torch.random.fork_rng():
-        torch.manual_seed(seed)
-        k_c = (
-            torch.randn(total, kv_lora_rank, dtype=torch.bfloat16, device=device)
-            * 0.1
-        )
-        k_pe = (
-            torch.randn(total, qk_rope_head_dim, dtype=torch.bfloat16, device=device)
-            * 0.1
-        )
+    k_c = torch.randn(total, kv_lora_rank, dtype=torch.bfloat16, device=device) * 0.1
+    k_pe = torch.randn(total, qk_rope_head_dim, dtype=torch.bfloat16, device=device) * 0.1
 
     if kv_cache_dtype == "fp8_ds_mla":
         fp8_dtype = current_platform.fp8_dtype()
@@ -759,6 +751,24 @@ def sdpa_for_request(
         scale=scale,
     )
     return out.squeeze(0).transpose(0, 1)  # [q_len, N, D_v]
+
+
+def check_close(
+    label: str,
+    backend_out: torch.Tensor,
+    ref_out: torch.Tensor,
+    atol: float,
+    rtol: float,
+) -> None:
+    """Assert backend_out ≈ ref_out and print a pass line with max_diff."""
+    b = backend_out.float()
+    r = ref_out.float().reshape(backend_out.shape)
+    max_diff = (b - r).abs().max().item()
+    assert torch.allclose(b, r, atol=atol, rtol=rtol), (
+        f"Correctness check FAILED [{label}]  "
+        f"max_diff={max_diff:.4e}  (atol={atol}, rtol={rtol})"
+    )
+    logger.info("Correctness check passed [%s]", label)
 
 
 # ---- MLA correctness helpers ----

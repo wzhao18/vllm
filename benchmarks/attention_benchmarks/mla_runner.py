@@ -17,6 +17,7 @@ from common import (
     MockIndexer,
     MockKVBProj,
     MockLayer,
+    check_close,
     compute_mha_reference,
     compute_mqa_reference,
     mla_kv_cache_to_bf16,
@@ -915,22 +916,28 @@ def _run_single_benchmark(
         # Python special-method dispatch always goes through the class, so
         # we use the _use_real_weight flag rather than monkey-patching __call__.
         # The flag is reset in the finally block before the timing loop.
-        kv_b_proj_weight = impl.kv_b_proj.weight
-        impl.kv_b_proj._use_real_weight = True
+        # Sparse impls don't have kv_b_proj (they never call it in forward_mqa).
+        has_kv_b_proj = hasattr(impl, "kv_b_proj")
+        kv_b_proj_weight = impl.kv_b_proj.weight if has_kv_b_proj else None
+        if has_kv_b_proj:
+            impl.kv_b_proj._use_real_weight = True
 
         try:
             prefill_inputs["output"].zero_()
             result = forward_fn()
             torch.accelerator.synchronize()
         finally:
-            impl.kv_b_proj._use_real_weight = False
+            if has_kv_b_proj:
+                impl.kv_b_proj._use_real_weight = False
             # Restore random indices for the timing loop.
             if is_sparse and indexer is not None:
                 indexer.fill_random_indices(total_q, max_kv_len)
 
-        n_dec = metadata.num_decode_tokens or 0
+        n_dec = getattr(metadata, "num_decode_tokens", None) or 0
         # Reference functions expect a bfloat16 kv_cache; decode fp8 formats first.
         kv_cache_ref = mla_kv_cache_to_bf16(kv_cache, kv_cache_dtype, mla_dims)
+
+        prefix = f"{config.backend} {config.batch_spec}"
 
         if is_sparse or (metadata.decode is not None and metadata.prefill is None):
             backend_out, _ = result
@@ -942,21 +949,12 @@ def _run_single_benchmark(
                 is_sparse,
                 sparse_indices=sparse_indices_for_ref,
             )
-            b, r = backend_out.float(), ref.float().reshape(backend_out.shape)
-            assert torch.allclose(b, r, atol=atol, rtol=rtol), (
-                f"Correctness check failed: {config.backend} / {config.batch_spec} "
-                f"max_diff={(b - r).abs().max().item():.4e} (atol={atol}, rtol={rtol})"
-            )
+            check_close(f"{prefix} mqa", backend_out, ref, atol, rtol)
         elif metadata.prefill is not None and metadata.decode is None:
-            backend_out = prefill_inputs["output"]
             ref = compute_mha_reference(
                 prefill_inputs["q"], kv_cache_ref, metadata, kv_b_proj_weight, mla_dims
             )
-            b, r = backend_out.float(), ref.float().reshape(backend_out.shape)
-            assert torch.allclose(b, r, atol=atol, rtol=rtol), (
-                f"Correctness check failed: {config.backend} / {config.batch_spec} "
-                f"max_diff={(b - r).abs().max().item():.4e} (atol={atol}, rtol={rtol})"
-            )
+            check_close(f"{prefix} mha", prefill_inputs["output"], ref, atol, rtol)
         elif metadata.decode is not None and metadata.prefill is not None:
             dec_slice = (
                 tuple(t[:n_dec] for t in decode_inputs)
@@ -964,7 +962,6 @@ def _run_single_benchmark(
                 else decode_inputs[:n_dec]
             )
             (backend_dec_out, _), _ = result
-            backend_pf_out = prefill_inputs["output"][n_dec:]
             ref_dec = compute_mqa_reference(
                 dec_slice, kv_cache_ref, metadata, mla_dims, False
             )
@@ -975,12 +972,8 @@ def _run_single_benchmark(
                 kv_b_proj_weight,
                 mla_dims,
             )
-            for b_out, r_out in [(backend_dec_out, ref_dec), (backend_pf_out, ref_pf)]:
-                b, r = b_out.float(), r_out.float().reshape(b_out.shape)
-                assert torch.allclose(b, r, atol=atol, rtol=rtol), (
-                    f"Correctness check failed: {config.backend} / {config.batch_spec} "
-                    f"max_diff={(b - r).abs().max().item():.4e} (atol={atol}, rtol={rtol})"
-                )
+            check_close(f"{prefix} mqa", backend_dec_out, ref_dec, atol, rtol)
+            check_close(f"{prefix} mha", prefill_inputs["output"][n_dec:], ref_pf, atol, rtol)
 
     # Warmup — also initializes any lazy buffers (workspace, fp8 scales, etc.)
     for _ in range(config.warmup_iters):
