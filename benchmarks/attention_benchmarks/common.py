@@ -530,8 +530,9 @@ def compute_mqa_reference(
     device = kv_cache.device
     kv_lora_rank = mla_dims["kv_lora_rank"]
     qk_rope_head_dim = mla_dims["qk_rope_head_dim"]
+    qk_nope_head_dim = mla_dims["qk_nope_head_dim"]
     num_q_heads = mla_dims["num_q_heads"]
-    scale = 1.0 / math.sqrt(kv_lora_rank + qk_rope_head_dim)
+    scale = 1.0 / math.sqrt(qk_nope_head_dim + qk_rope_head_dim)
     block_size = kv_cache.shape[1]
 
     if isinstance(decode_inputs, tuple):
@@ -604,11 +605,11 @@ def compute_mha_reference(
         q_start = int(query_start_loc[i].item())
         q_end = int(query_start_loc[i + 1].item())
         q_len = q_end - q_start
-        ctx_len = (
-            int(chunked_context.seq_lens[i].item())
-            if chunked_context is not None
-            else 0
-        )
+        if chunked_context is not None:
+            # seq_lens is 2D [num_chunks, num_prefills]; sum over chunks
+            ctx_len = int(chunked_context.seq_lens[:, i].sum().item())
+        else:
+            ctx_len = 0
         kv_len = q_len + ctx_len
 
         t = torch.arange(kv_len, device=device)

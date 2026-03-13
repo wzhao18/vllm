@@ -865,6 +865,23 @@ def _run_single_benchmark(
     else:
         raise RuntimeError("Metadata has neither decode nor prefill metadata")
 
+    # Pre-populate kv_cache with k_c_normed and k_pe at new-token slot positions.
+    # forward_mqa reads K/V from kv_cache (never writes it), and
+    # compute_mqa_reference / compute_mha_reference both read from kv_cache.
+    # Without this, kv_cache stays zero and the reference mismatches the backend.
+    if not is_sparse and kv_cache_dtype not in ("fp8", "fp8_ds_mla"):
+        _sm = metadata.slot_mapping
+        _blocks = (_sm // block_size).long()
+        _offsets = (_sm % block_size).long()
+        _kv_lora_rank = mla_dims["kv_lora_rank"]
+        kv_cache[_blocks, _offsets, :_kv_lora_rank] = prefill_inputs["k_c_normed"].to(
+            kv_cache.dtype
+        )
+        kv_cache[_blocks, _offsets, _kv_lora_rank:] = prefill_inputs["k_pe"][
+            :, 0, :
+        ].to(kv_cache.dtype)
+        torch.accelerator.synchronize()
+
     # ---- Optional inline correctness check ----
     if check_correctness:
         prefill_inputs["output"].zero_()
