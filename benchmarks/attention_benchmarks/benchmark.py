@@ -512,7 +512,7 @@ def main():
         action="store_true",
         default=True,
         help="Run SDPA correctness check for MLA backends before benchmarking "
-        "(bfloat16 KV cache only; fp8 is skipped)",
+        "(supports bfloat16, fp8, and fp8_ds_mla KV cache dtypes)",
     )
 
     # Parameter sweep (use YAML config for advanced sweeps)

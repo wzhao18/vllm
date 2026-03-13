@@ -500,11 +500,13 @@ def _create_input_tensors(
         )
 
     # Post-process: quantize the decode query to fp8 when the backend expects it.
+    # Callers must use "concat" query_format when quantize_query=True.
+    # Use direct cast to fp8 dtype (mirrors _decode_concat_quant_fp8_op with scale=1.0).
+    # Do NOT use .to(uint8).view(fp8) — negative float values wrap to 255=NaN in fp8.
     if quantize_query:
-        assert query_format == "concat"
         from vllm.platforms import current_platform
 
-        decode_inputs = decode_inputs.to(torch.uint8).view(current_platform.fp8_dtype())
+        decode_inputs = decode_inputs.to(current_platform.fp8_dtype())
 
     # Create additional inputs needed for prefill forward
     k_c_normed = torch.randn(
@@ -715,6 +717,98 @@ def _extract_mla_dims_from_config(config) -> dict | None:
 # ============================================================================
 
 
+def _populate_kv_cache(
+    kv_cache: torch.Tensor,
+    prefill_inputs: dict,
+    metadata,
+    block_size: int,
+    kv_lora_rank: int,
+    kv_cache_dtype: str,
+) -> None:
+    """Write new-token KV data into kv_cache at slot positions.
+
+    Handles bfloat16, fp8, and fp8_ds_mla (DeepSeek 656-byte packed format).
+    """
+    from vllm.platforms import current_platform
+
+    _sm = metadata.slot_mapping
+    _blocks = (_sm // block_size).long()
+    _offsets = (_sm % block_size).long()
+    k_c = prefill_inputs["k_c_normed"]  # [total_tokens, kv_lora_rank]
+    k_p = prefill_inputs["k_pe"][:, 0, :]  # [total_tokens, qk_rope_head_dim]
+
+    if kv_cache_dtype == "fp8_ds_mla":
+        fp8_dtype = current_platform.fp8_dtype()
+        fp8_max = torch.finfo(fp8_dtype).max
+        k_c_f = k_c.float()
+        num_groups = kv_lora_rank // 128
+        fp8_parts: list[torch.Tensor] = []
+        scale_parts: list[torch.Tensor] = []
+        for j in range(num_groups):
+            chunk = k_c_f[:, j * 128 : (j + 1) * 128]
+            scale = chunk.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12) / fp8_max
+            scale_parts.append(scale.to(torch.float32))  # [N, 1] f32
+            fp8_parts.append((chunk / scale).to(fp8_dtype).view(torch.uint8))
+        fp8_bytes = torch.cat(fp8_parts, dim=-1)  # [N, kv_lora_rank] u8
+        scale_bytes = torch.cat(scale_parts, dim=-1).view(torch.uint8)  # [N, num_groups*4] u8
+        rope_bytes = k_p.to(torch.bfloat16).view(torch.uint8)  # [N, rope_dim*2] u8
+        token_data = torch.cat([fp8_bytes, scale_bytes, rope_bytes], dim=-1)
+        kv_cache[_blocks, _offsets] = token_data
+    elif kv_cache_dtype == "fp8":
+        fp8_dtype = current_platform.fp8_dtype()
+        kv_cache[_blocks, _offsets, :kv_lora_rank] = k_c.to(fp8_dtype)
+        kv_cache[_blocks, _offsets, kv_lora_rank:] = k_p.to(fp8_dtype)
+    else:  # bfloat16
+        kv_cache[_blocks, _offsets, :kv_lora_rank] = k_c.to(kv_cache.dtype)
+        kv_cache[_blocks, _offsets, kv_lora_rank:] = k_p.to(kv_cache.dtype)
+    torch.accelerator.synchronize()
+
+
+def _kv_cache_to_bf16(
+    kv_cache: torch.Tensor,
+    kv_cache_dtype: str,
+    mla_dims: dict,
+) -> torch.Tensor:
+    """Return a bfloat16 [num_blocks, block_size, kv_lora_rank+qk_rope_head_dim]
+    tensor suitable for passing to compute_mqa_reference / compute_mha_reference.
+
+    For bfloat16 caches the original tensor is returned unchanged.
+    For fp8, standard dequantization via .float() is used.
+    For fp8_ds_mla the 656-byte packed format is decoded: 512 fp8 values
+    (with per-128 float32 scales) followed by 64 unquantized bfloat16 rope values.
+    """
+    if kv_cache_dtype not in ("fp8", "fp8_ds_mla"):
+        return kv_cache
+
+    from vllm.platforms import current_platform
+
+    kv_lora_rank = mla_dims["kv_lora_rank"]
+    qk_rope_head_dim = mla_dims["qk_rope_head_dim"]
+    num_blocks, block_size = kv_cache.shape[:2]
+
+    if kv_cache_dtype == "fp8":
+        return kv_cache.float().bfloat16()
+
+    # fp8_ds_mla: [num_blocks, block_size, 656] uint8
+    fp8_dtype = current_platform.fp8_dtype()
+    num_groups = kv_lora_rank // 128
+    flat = kv_cache.reshape(num_blocks * block_size, 656)  # [N, 656] u8
+
+    # First kv_lora_rank bytes are fp8 values
+    fp8_vals = flat[:, :kv_lora_rank].view(fp8_dtype).float()  # [N, 512]
+    # Next num_groups*4 bytes are float32 per-128 scales
+    scale_start = kv_lora_rank
+    scale_end = scale_start + num_groups * 4
+    scales = flat[:, scale_start:scale_end].view(torch.float32)  # [N, num_groups]
+    for j in range(num_groups):
+        fp8_vals[:, j * 128 : (j + 1) * 128] *= scales[:, j : j + 1]
+    # Remaining bytes are bfloat16 rope values
+    k_pe_vals = flat[:, scale_end:].view(torch.bfloat16).float()  # [N, 64]
+
+    result = torch.cat([fp8_vals, k_pe_vals], dim=-1).bfloat16()
+    return result.reshape(num_blocks, block_size, kv_lora_rank + qk_rope_head_dim)
+
+
 def _run_single_benchmark(
     config,
     impl,
@@ -810,10 +904,15 @@ def _run_single_benchmark(
     quantize_query = is_fp8_kvcache and getattr(
         impl, "supports_quant_query_input", False
     )
+    # When quantizing the decode query to fp8, the real serving path concatenates
+    # q_nope and q_pe into a single tensor before quantizing (mla_attention.py).
+    # Both CUTLASS_MLA and FLASHINFER_MLA accept concat input in forward_mqa, so
+    # always use "concat" format when quantizing regardless of backend default.
+    query_fmt = "concat" if quantize_query else backend_cfg["query_format"]
     decode_inputs, prefill_inputs = _create_input_tensors(
         total_q,
         mla_dims,
-        backend_cfg["query_format"],
+        query_fmt,
         device,
         torch.bfloat16,
         quantize_query=quantize_query,
@@ -869,18 +968,15 @@ def _run_single_benchmark(
     # forward_mqa reads K/V from kv_cache (never writes it), and
     # compute_mqa_reference / compute_mha_reference both read from kv_cache.
     # Without this, kv_cache stays zero and the reference mismatches the backend.
-    if not is_sparse and kv_cache_dtype not in ("fp8", "fp8_ds_mla"):
-        _sm = metadata.slot_mapping
-        _blocks = (_sm // block_size).long()
-        _offsets = (_sm % block_size).long()
-        _kv_lora_rank = mla_dims["kv_lora_rank"]
-        kv_cache[_blocks, _offsets, :_kv_lora_rank] = prefill_inputs["k_c_normed"].to(
-            kv_cache.dtype
+    if not is_sparse:
+        _populate_kv_cache(
+            kv_cache,
+            prefill_inputs,
+            metadata,
+            block_size,
+            mla_dims["kv_lora_rank"],
+            kv_cache_dtype,
         )
-        kv_cache[_blocks, _offsets, _kv_lora_rank:] = prefill_inputs["k_pe"][
-            :, 0, :
-        ].to(kv_cache.dtype)
-        torch.accelerator.synchronize()
 
     # ---- Optional inline correctness check ----
     if check_correctness:
@@ -889,11 +985,14 @@ def _run_single_benchmark(
         torch.accelerator.synchronize()
 
         n_dec = metadata.num_decode_tokens or 0
+        # Reference functions expect a bfloat16 kv_cache; decode fp8 formats first.
+        kv_cache_ref = _kv_cache_to_bf16(kv_cache, kv_cache_dtype, mla_dims)
+
 
         if is_sparse or (metadata.decode is not None and metadata.prefill is None):
             backend_out, _ = result
             ref = compute_mqa_reference(
-                decode_inputs, kv_cache, metadata, mla_dims, is_sparse
+                decode_inputs, kv_cache_ref, metadata, mla_dims, is_sparse
             )
             b, r = backend_out.float(), ref.float().reshape(backend_out.shape)
             assert torch.allclose(b, r, atol=atol, rtol=rtol), (
@@ -907,7 +1006,7 @@ def _run_single_benchmark(
         ):
             backend_out = prefill_inputs["output"]
             ref = compute_mha_reference(
-                prefill_inputs["q"], kv_cache, metadata, kv_b_proj_weight, mla_dims
+                prefill_inputs["q"], kv_cache_ref, metadata, kv_b_proj_weight, mla_dims
             )
             b, r = backend_out.float(), ref.float().reshape(backend_out.shape)
             assert torch.allclose(b, r, atol=atol, rtol=rtol), (
@@ -927,11 +1026,11 @@ def _run_single_benchmark(
             (backend_dec_out, _), _ = result
             backend_pf_out = prefill_inputs["output"][n_dec:]
             ref_dec = compute_mqa_reference(
-                dec_slice, kv_cache, metadata, mla_dims, False
+                dec_slice, kv_cache_ref, metadata, mla_dims, False
             )
             ref_pf = compute_mha_reference(
                 prefill_inputs["q"][n_dec:],
-                kv_cache,
+                kv_cache_ref,
                 metadata,
                 kv_b_proj_weight,
                 mla_dims,
@@ -1072,7 +1171,7 @@ def _run_mla_benchmark_batched(
         # SDPA reference can reproduce kv_b_proj(k_c_normed) with the same weights.
         kv_b_proj_weight = None
         kv_b_proj_for_impl = None
-        if check_correctness and kv_cache_dtype != "fp8_ds_mla":
+        if check_correctness:
             torch.manual_seed(0)
             num_q_heads = mla_dims["num_q_heads"]
             kv_lora_rank = mla_dims["kv_lora_rank"]
