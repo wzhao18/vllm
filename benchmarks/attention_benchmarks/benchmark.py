@@ -479,7 +479,7 @@ def main():
     parser.add_argument(
         "--batch-specs",
         nargs="+",
-        default=["q2k", "8q1s1k"],
+        default=None,
         help="Batch specifications using extended grammar",
     )
 
@@ -572,21 +572,24 @@ def main():
 
         # Batch specs and sizes
         # Support both explicit batch_specs and generated batch_spec_ranges
-        if "batch_spec_ranges" in yaml_config:
-            # Generate batch specs from ranges
-            generated_specs = generate_batch_specs_from_ranges(
-                yaml_config["batch_spec_ranges"]
-            )
-            # Combine with any explicit batch_specs
-            if "batch_specs" in yaml_config:
-                args.batch_specs = yaml_config["batch_specs"] + generated_specs
-            else:
-                args.batch_specs = generated_specs
-            console.print(
-                f"[dim]Generated {len(generated_specs)} batch specs from ranges[/]"
-            )
-        elif "batch_specs" in yaml_config:
-            args.batch_specs = yaml_config["batch_specs"]
+        # CLI --batch-specs takes precedence over YAML when provided.
+        cli_batch_specs_provided = args.batch_specs is not None
+        if not cli_batch_specs_provided:
+            if "batch_spec_ranges" in yaml_config:
+                # Generate batch specs from ranges
+                generated_specs = generate_batch_specs_from_ranges(
+                    yaml_config["batch_spec_ranges"]
+                )
+                # Combine with any explicit batch_specs
+                if "batch_specs" in yaml_config:
+                    args.batch_specs = yaml_config["batch_specs"] + generated_specs
+                else:
+                    args.batch_specs = generated_specs
+                console.print(
+                    f"[dim]Generated {len(generated_specs)} batch specs from ranges[/]"
+                )
+            elif "batch_specs" in yaml_config:
+                args.batch_specs = yaml_config["batch_specs"]
 
         if "batch_sizes" in yaml_config:
             args.batch_sizes = yaml_config["batch_sizes"]
@@ -671,6 +674,8 @@ def main():
     # Determine backends
     backends = args.backends or ([args.backend] if args.backend else ["flash"])
     prefill_backends = getattr(args, "prefill_backends", None)
+    if not args.batch_specs:
+        args.batch_specs = ["q2k", "8q1s1k"]
     console.print(f"Backends: {', '.join(backends)}")
     if prefill_backends:
         console.print(f"Prefill backends: {', '.join(prefill_backends)}")

@@ -21,6 +21,7 @@ from common import (
     compute_mqa_reference,
     mla_kv_cache_to_bf16,
     populate_mla_kv_cache,
+    populate_mla_kv_cache_full,
     setup_mla_dims,
 )
 
@@ -756,6 +757,8 @@ def _run_single_benchmark(
     kv_lens = [r.kv_len for r in requests]
     total_q = sum(q_lens)
     max_kv_len = max(kv_lens)
+    num_reqs = len(requests)
+    seq_lens_gpu = torch.tensor(kv_lens, dtype=torch.int32, device=device)
 
     # Determine block size
     block_size = backend_cfg["block_size"] or config.block_size
@@ -865,11 +868,26 @@ def _run_single_benchmark(
     else:
         raise RuntimeError("Metadata has neither decode nor prefill metadata")
 
-    # Pre-populate kv_cache with k_c_normed and k_pe at new-token slot positions.
-    # forward_mqa reads K/V from kv_cache (never writes it), and
-    # compute_mqa_reference / compute_mha_reference both read from kv_cache.
-    # Without this, kv_cache stays zero and the reference mismatches the backend.
-    if not is_sparse:
+    # Pre-populate kv_cache so both the backend and the correctness reference
+    # read the same K/V data.
+    #
+    # Non-sparse: only new-token slots matter (forward_mqa reads kv_cache; the
+    # context positions happen to be zero-initialised, and the reference uses
+    # zeros for context too via slot_mapping-based addressing).
+    #
+    # Sparse: the indexer can point to ANY position 0..kv_len-1, so we must
+    # populate ALL positions with deterministic random data before the check.
+    if is_sparse:
+        populate_mla_kv_cache_full(
+            kv_cache,
+            metadata.block_table,
+            seq_lens_gpu,
+            block_size,
+            mla_dims["kv_lora_rank"],
+            mla_dims["qk_rope_head_dim"],
+            kv_cache_dtype,
+        )
+    else:
         populate_mla_kv_cache(
             kv_cache,
             prefill_inputs,
@@ -881,6 +899,17 @@ def _run_single_benchmark(
 
     # ---- Optional inline correctness check ----
     if check_correctness:
+        # For sparse backends, temporarily replace random indices with sequential
+        # 0..min(kv_len-1, topk-1) indices so the SDPA reference can exactly
+        # reproduce what the kernel attended to.  Random indices are restored
+        # after the check for the timing loop.
+        sparse_indices_for_ref = None
+        if is_sparse and indexer is not None:
+            indexer.fill_sequential_indices(
+                num_reqs, seq_lens_gpu, metadata.query_start_loc
+            )
+            sparse_indices_for_ref = indexer.topk_indices_buffer[:total_q].clone()
+
         # Enable real projection in MockKVBProj so forward_mha uses
         # deterministic K/V that the SDPA reference can reproduce.
         # Python special-method dispatch always goes through the class, so
@@ -895,6 +924,9 @@ def _run_single_benchmark(
             torch.accelerator.synchronize()
         finally:
             impl.kv_b_proj._use_real_weight = False
+            # Restore random indices for the timing loop.
+            if is_sparse and indexer is not None:
+                indexer.fill_random_indices(total_q, max_kv_len)
 
         n_dec = metadata.num_decode_tokens or 0
         # Reference functions expect a bfloat16 kv_cache; decode fp8 formats first.
@@ -903,7 +935,12 @@ def _run_single_benchmark(
         if is_sparse or (metadata.decode is not None and metadata.prefill is None):
             backend_out, _ = result
             ref = compute_mqa_reference(
-                decode_inputs, kv_cache_ref, metadata, mla_dims, is_sparse
+                decode_inputs,
+                kv_cache_ref,
+                metadata,
+                mla_dims,
+                is_sparse,
+                sparse_indices=sparse_indices_for_ref,
             )
             b, r = backend_out.float(), ref.float().reshape(backend_out.shape)
             assert torch.allclose(b, r, atol=atol, rtol=rtol), (
