@@ -501,13 +501,8 @@ def _create_input_tensors(
             dtype=dtype,
         )
 
-    # Post-process: quantize the decode query to fp8 when the backend expects it.
-    # Callers must use "concat" query_format when quantize_query=True.
-    # Use direct cast to fp8 dtype (mirrors _decode_concat_quant_fp8_op with scale=1.0).
-    # Do NOT use .to(uint8).view(fp8) — negative float values wrap to 255=NaN in fp8.
     if quantize_query:
         from vllm.platforms import current_platform
-
         decode_inputs = decode_inputs.to(current_platform.fp8_dtype())
 
     # Create additional inputs needed for prefill forward
@@ -557,7 +552,6 @@ def _create_backend_impl(
     max_num_tokens: int = 8192,
     index_topk: int | None = None,
     kv_cache_dtype: str = "auto",
-    kv_b_proj=None,
 ):
     """
     Create backend implementation instance.
@@ -580,16 +574,16 @@ def _create_backend_impl(
     # Calculate scale
     scale = 1.0 / np.sqrt(mla_dims["qk_nope_head_dim"] + mla_dims["qk_rope_head_dim"])
 
-    # Create kv_b_proj: use caller-supplied one when check_correctness=True,
-    # otherwise use MockKVBProj (random output, no real weight matrix).
-    if kv_b_proj is None:
-        mock_kv_b_proj = MockKVBProj(
-            num_heads=mla_dims["num_q_heads"],
-            qk_nope_head_dim=mla_dims["qk_nope_head_dim"],
-            v_head_dim=mla_dims["v_head_dim"],
-        )
-    else:
-        mock_kv_b_proj = kv_b_proj
+    # MockKVBProj: __call__ returns random output (no matmul, no benchmark timing
+    # impact) but stores a deterministic weight at self.weight so correctness
+    # reference functions can read it without going through __call__.
+    mock_kv_b_proj = MockKVBProj(
+        num_heads=mla_dims["num_q_heads"],
+        qk_nope_head_dim=mla_dims["qk_nope_head_dim"],
+        v_head_dim=mla_dims["v_head_dim"],
+        kv_lora_rank=mla_dims["kv_lora_rank"],
+        device=device,
+    )
 
     # Create indexer for sparse backends
     indexer = None
@@ -730,7 +724,6 @@ def _run_single_benchmark(
     indexer=None,
     kv_cache_dtype: str | None = None,
     check_correctness: bool = False,
-    kv_b_proj_weight: torch.Tensor | None = None,
     atol: float = 0.5,
     rtol: float = 1e-2,
 ) -> BenchmarkResult:
@@ -741,9 +734,8 @@ def _run_single_benchmark(
       - The KV cache is pre-populated with deterministic random data.
       - After the forward pass the output is compared against an SDPA reference
         computed from the exact same inputs.
-      - kv_b_proj_weight must be provided (shape [N*(P+V), L]) so the reference
-        can reproduce kv_b_proj(k_c_normed).
-      - The result is stored in BenchmarkResult.correctness.
+      - impl.kv_b_proj.weight (set by MockKVBProj at construction time) is used
+        by the reference to reproduce kv_b_proj(k_c_normed).
 
     Args:
         config: BenchmarkConfig instance
@@ -755,7 +747,6 @@ def _run_single_benchmark(
         device: Target device
         indexer: Optional MockIndexer for sparse backends
         check_correctness: Run SDPA correctness check alongside benchmark
-        kv_b_proj_weight: Weight tensor for prefill reference [N*(P+V), L]
         atol: Absolute tolerance for correctness check
         rtol: Relative tolerance for correctness check
     """
@@ -890,14 +881,24 @@ def _run_single_benchmark(
 
     # ---- Optional inline correctness check ----
     if check_correctness:
-        prefill_inputs["output"].zero_()
-        result = forward_fn()
-        torch.accelerator.synchronize()
+        # Enable real projection in MockKVBProj so forward_mha uses
+        # deterministic K/V that the SDPA reference can reproduce.
+        # Python special-method dispatch always goes through the class, so
+        # we use the _use_real_weight flag rather than monkey-patching __call__.
+        # The flag is reset in the finally block before the timing loop.
+        kv_b_proj_weight = impl.kv_b_proj.weight
+        impl.kv_b_proj._use_real_weight = True
+
+        try:
+            prefill_inputs["output"].zero_()
+            result = forward_fn()
+            torch.accelerator.synchronize()
+        finally:
+            impl.kv_b_proj._use_real_weight = False
 
         n_dec = metadata.num_decode_tokens or 0
         # Reference functions expect a bfloat16 kv_cache; decode fp8 formats first.
         kv_cache_ref = mla_kv_cache_to_bf16(kv_cache, kv_cache_dtype, mla_dims)
-
 
         if is_sparse or (metadata.decode is not None and metadata.prefill is None):
             backend_out, _ = result
@@ -909,11 +910,7 @@ def _run_single_benchmark(
                 f"Correctness check failed: {config.backend} / {config.batch_spec} "
                 f"max_diff={(b - r).abs().max().item():.4e} (atol={atol}, rtol={rtol})"
             )
-        elif (
-            metadata.prefill is not None
-            and metadata.decode is None
-            and kv_b_proj_weight is not None
-        ):
+        elif metadata.prefill is not None and metadata.decode is None:
             backend_out = prefill_inputs["output"]
             ref = compute_mha_reference(
                 prefill_inputs["q"], kv_cache_ref, metadata, kv_b_proj_weight, mla_dims
@@ -923,11 +920,7 @@ def _run_single_benchmark(
                 f"Correctness check failed: {config.backend} / {config.batch_spec} "
                 f"max_diff={(b - r).abs().max().item():.4e} (atol={atol}, rtol={rtol})"
             )
-        elif (
-            metadata.decode is not None
-            and metadata.prefill is not None
-            and kv_b_proj_weight is not None
-        ):
+        elif metadata.decode is not None and metadata.prefill is not None:
             dec_slice = (
                 tuple(t[:n_dec] for t in decode_inputs)
                 if isinstance(decode_inputs, tuple)
@@ -1077,31 +1070,6 @@ def _run_mla_benchmark_batched(
         use_cudnn_prefill.cache_clear()
         use_trtllm_ragged_deepseek_prefill.cache_clear()
 
-        # When check_correctness=True, build a plain-tensor kv_b_proj so the
-        # SDPA reference can reproduce kv_b_proj(k_c_normed) with the same weights.
-        kv_b_proj_weight = None
-        kv_b_proj_for_impl = None
-        if check_correctness:
-            torch.manual_seed(0)
-            num_q_heads = mla_dims["num_q_heads"]
-            kv_lora_rank = mla_dims["kv_lora_rank"]
-            qk_nope_head_dim = mla_dims["qk_nope_head_dim"]
-            v_head_dim = mla_dims["v_head_dim"]
-            w = torch.randn(
-                num_q_heads * (qk_nope_head_dim + v_head_dim),
-                kv_lora_rank,
-                dtype=torch.bfloat16,
-                device=device,
-            ) / (kv_lora_rank**0.5)
-            kv_b_proj_weight = w.contiguous()  # [N*(P+V), L]
-
-            def _kv_b_proj(x: torch.Tensor) -> tuple[torch.Tensor, None]:
-                return (x @ kv_b_proj_weight.T, None)
-
-            _kv_b_proj.weight = kv_b_proj_weight  # type: ignore[attr-defined]
-            _kv_b_proj.quant_method = None  # type: ignore[attr-defined]
-            kv_b_proj_for_impl = _kv_b_proj
-
         # Create backend impl, layer, builder, and indexer (reused across benchmarks)
         impl, layer, builder_instance, indexer = _create_backend_impl(
             backend_cfg,
@@ -1110,7 +1078,6 @@ def _run_mla_benchmark_batched(
             device,
             index_topk=index_topk if is_sparse else None,
             kv_cache_dtype=kv_cache_dtype,
-            kv_b_proj=kv_b_proj_for_impl,
         )
 
         # Verify the actual prefill backend matches what was requested
@@ -1171,7 +1138,6 @@ def _run_mla_benchmark_batched(
                     indexer=indexer,
                     kv_cache_dtype=kv_cache_dtype,
                     check_correctness=check_correctness,
-                    kv_b_proj_weight=kv_b_proj_weight,
                 )
                 results.append(result)
 

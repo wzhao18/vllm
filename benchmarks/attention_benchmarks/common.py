@@ -69,36 +69,73 @@ class MockKVBProj:
     """Mock KV projection layer for MLA prefill mode.
 
     Mimics ColumnParallelLinear behavior for kv_b_proj in MLA backends.
-    Projects kv_c_normed to [qk_nope_head_dim + v_head_dim] per head.
+    Projects kv_c_normed ([num_tokens, kv_lora_rank]) to
+    ([num_tokens, num_heads * (qk_nope_head_dim + v_head_dim)]).
+
+    Supports two modes controlled by self._use_real_weight:
+    - False (default, benchmarking): __call__ returns random output with no
+      matmul, so forward_mha benchmark timing is unaffected.
+    - True (correctness check): __call__ does the real float32 matmul so
+      forward_mha produces numerically correct output for comparison.
+
+    A deterministic weight (seed=0) is always stored in self.weight so the
+    SDPA reference can reproduce the projection independently.
     """
 
-    def __init__(self, num_heads: int, qk_nope_head_dim: int, v_head_dim: int):
+    def __init__(
+        self,
+        num_heads: int,
+        qk_nope_head_dim: int,
+        v_head_dim: int,
+        kv_lora_rank: int,
+        device: torch.device | str = "cpu",
+    ):
         self.num_heads = num_heads
         self.qk_nope_head_dim = qk_nope_head_dim
         self.v_head_dim = v_head_dim
         self.out_dim = qk_nope_head_dim + v_head_dim
-        self.weight = torch.empty(0, dtype=torch.bfloat16)
+        self.quant_method = None
+        # Toggle to switch between real projection (correctness) and random
+        # output (benchmark).  Python's special-method dispatch always goes
+        # through the class, so toggling a flag inside __call__ is the only
+        # reliable way to change behavior without monkey-patching the class.
+        self._use_real_weight = False
+        out_features = num_heads * self.out_dim
+        # Deterministic weight — fork_rng isolates from global random state.
+        with torch.random.fork_rng():
+            torch.manual_seed(0)
+            self.weight = torch.randn(
+                out_features,
+                kv_lora_rank,
+                dtype=torch.bfloat16,
+                device=device,
+            ) / (kv_lora_rank**0.5)
 
-    def __call__(self, x: torch.Tensor) -> tuple[torch.Tensor]:
-        """
-        Project kv_c_normed to output space.
+    def __call__(self, x: torch.Tensor) -> tuple[torch.Tensor, None]:
+        """Project x or return random output depending on _use_real_weight.
 
         Args:
             x: Input tensor [num_tokens, kv_lora_rank]
 
         Returns:
-            Tuple containing output tensor
-                [num_tokens, num_heads, qk_nope_head_dim + v_head_dim]
+            (output, None) matching the ColumnParallelLinear API,
+            where output has shape [num_tokens, num_heads * out_dim].
         """
-        num_tokens = x.shape[0]
-        result = torch.randn(
-            num_tokens,
-            self.num_heads,
-            self.out_dim,
-            device=x.device,
-            dtype=x.dtype,
+        if self._use_real_weight:
+            # Float32 matmul for numerical accuracy during correctness checks.
+            return (
+                (x.float() @ self.weight.T.float()).to(x.dtype),
+                None,
+            )
+        return (
+            torch.randn(
+                x.shape[0],
+                self.num_heads * self.out_dim,
+                device=x.device,
+                dtype=x.dtype,
+            ),
+            None,
         )
-        return (result,)  # Return as tuple to match ColumnParallelLinear API
 
 
 class MockIndexer:
