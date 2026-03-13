@@ -50,28 +50,39 @@ from common import (
 from vllm.v1.worker.workspace import init_workspace_manager
 
 
-def run_standard_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
+def run_standard_attention_benchmark(
+    config: BenchmarkConfig, check_correctness: bool = False
+) -> BenchmarkResult:
     """Run standard attention benchmark (Flash/Triton/FlashInfer)."""
     from runner import run_attention_benchmark
 
-    return run_attention_benchmark(config)
+    return run_attention_benchmark(config, check_correctness=check_correctness)
 
 
-def run_mla_benchmark(config: BenchmarkConfig, **kwargs) -> BenchmarkResult:
+def run_mla_benchmark(
+    config: BenchmarkConfig, check_correctness: bool = False, **kwargs
+) -> BenchmarkResult:
     """Run MLA benchmark with appropriate backend."""
     from mla_runner import run_mla_benchmark as run_mla
 
     return run_mla(
-        config.backend, config, prefill_backend=config.prefill_backend, **kwargs
+        config.backend,
+        config,
+        prefill_backend=config.prefill_backend,
+        check_correctness=check_correctness,
+        **kwargs,
     )
 
 
-def run_benchmark(config: BenchmarkConfig, **kwargs) -> BenchmarkResult:
+def run_benchmark(
+    config: BenchmarkConfig, check_correctness: bool = False, **kwargs
+) -> BenchmarkResult:
     """
     Run a single benchmark with proper backend selection.
 
     Args:
         config: BenchmarkConfig with backend, batch_spec, and model params
+        check_correctness: Run SDPA correctness check alongside benchmark
         **kwargs: Additional arguments passed to MLA benchmarks
 
     Returns:
@@ -79,9 +90,13 @@ def run_benchmark(config: BenchmarkConfig, **kwargs) -> BenchmarkResult:
     """
     try:
         if is_mla_backend(config.backend):
-            return run_mla_benchmark(config, **kwargs)
+            return run_mla_benchmark(
+                config, check_correctness=check_correctness, **kwargs
+            )
         else:
-            return run_standard_attention_benchmark(config)
+            return run_standard_attention_benchmark(
+                config, check_correctness=check_correctness
+            )
     except Exception as e:
         return BenchmarkResult(
             config=config,
@@ -492,6 +507,13 @@ def main():
         default=False,
         help="Capture and replay CUDA graphs to eliminate CPU dispatch overhead",
     )
+    parser.add_argument(
+        "--check-correctness",
+        action="store_true",
+        default=True,
+        help="Run SDPA correctness check for MLA backends before benchmarking "
+        "(bfloat16 KV cache only; fp8 is skipped)",
+    )
 
     # Parameter sweep (use YAML config for advanced sweeps)
     parser.add_argument(
@@ -593,6 +615,8 @@ def main():
             args.kv_cache_dtype = yaml_config["kv_cache_dtype"]
         if "cuda_graphs" in yaml_config:
             args.cuda_graphs = yaml_config["cuda_graphs"]
+        if "check_correctness" in yaml_config:
+            args.check_correctness = yaml_config["check_correctness"]
 
         # Parameter sweep configuration
         if "parameter_sweep" in yaml_config:
@@ -904,6 +928,8 @@ def main():
             # No prefill backends specified: compare decode backends as before
             total = len(backends) * len(args.batch_specs)
 
+            check_correctness = getattr(args, "check_correctness", False)
+
             with tqdm(total=total, desc="Benchmarking") as pbar:
                 for spec in args.batch_specs:
                     for backend in backends:
@@ -923,7 +949,9 @@ def main():
                             use_cuda_graphs=args.cuda_graphs,
                         )
 
-                        result = run_benchmark(config)
+                        result = run_benchmark(
+                            config, check_correctness=check_correctness
+                        )
                         decode_results.append(result)
 
                         if not result.success:

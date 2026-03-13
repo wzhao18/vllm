@@ -17,6 +17,8 @@ from common import (
     MockIndexer,
     MockKVBProj,
     MockLayer,
+    compute_mha_reference,
+    compute_mqa_reference,
     setup_mla_dims,
 )
 
@@ -344,6 +346,10 @@ def _build_attention_metadata(
     Returns:
         Tuple of (metadata, kv_cache_num_blocks)
     """
+    # Sort requests so decode requests come before prefill requests.
+    # split_decodes_and_prefills expects this ordering.
+    requests = sorted(requests, key=lambda r: r.q_len)
+
     q_lens = [r.q_len for r in requests]
     kv_lens = [r.kv_len for r in requests]
     total_q = sum(q_lens)
@@ -547,6 +553,7 @@ def _create_backend_impl(
     max_num_tokens: int = 8192,
     index_topk: int | None = None,
     kv_cache_dtype: str = "auto",
+    kv_b_proj=None,
 ):
     """
     Create backend implementation instance.
@@ -569,12 +576,16 @@ def _create_backend_impl(
     # Calculate scale
     scale = 1.0 / np.sqrt(mla_dims["qk_nope_head_dim"] + mla_dims["qk_rope_head_dim"])
 
-    # Create mock kv_b_proj layer for prefill mode
-    mock_kv_b_proj = MockKVBProj(
-        num_heads=mla_dims["num_q_heads"],
-        qk_nope_head_dim=mla_dims["qk_nope_head_dim"],
-        v_head_dim=mla_dims["v_head_dim"],
-    )
+    # Create kv_b_proj: use caller-supplied one when check_correctness=True,
+    # otherwise use MockKVBProj (random output, no real weight matrix).
+    if kv_b_proj is None:
+        mock_kv_b_proj = MockKVBProj(
+            num_heads=mla_dims["num_q_heads"],
+            qk_nope_head_dim=mla_dims["qk_nope_head_dim"],
+            v_head_dim=mla_dims["v_head_dim"],
+        )
+    else:
+        mock_kv_b_proj = kv_b_proj
 
     # Create indexer for sparse backends
     indexer = None
@@ -714,9 +725,21 @@ def _run_single_benchmark(
     device: torch.device,
     indexer=None,
     kv_cache_dtype: str | None = None,
+    check_correctness: bool = False,
+    kv_b_proj_weight: torch.Tensor | None = None,
+    atol: float = 0.5,
+    rtol: float = 1e-2,
 ) -> BenchmarkResult:
     """
-    Run a single benchmark iteration.
+    Run a single benchmark iteration, optionally with an inline correctness check.
+
+    When check_correctness=True:
+      - The KV cache is pre-populated with deterministic random data.
+      - After the forward pass the output is compared against an SDPA reference
+        computed from the exact same inputs.
+      - kv_b_proj_weight must be provided (shape [N*(P+V), L]) so the reference
+        can reproduce kv_b_proj(k_c_normed).
+      - The result is stored in BenchmarkResult.correctness.
 
     Args:
         config: BenchmarkConfig instance
@@ -727,12 +750,13 @@ def _run_single_benchmark(
         mla_dims: MLA dimension configuration
         device: Target device
         indexer: Optional MockIndexer for sparse backends
-
-    Returns:
-        BenchmarkResult with timing statistics
+        check_correctness: Run SDPA correctness check alongside benchmark
+        kv_b_proj_weight: Weight tensor for prefill reference [N*(P+V), L]
+        atol: Absolute tolerance for correctness check
+        rtol: Relative tolerance for correctness check
     """
-    # Parse batch spec
-    requests = parse_batch_spec(config.batch_spec)
+    # Parse batch spec – sort to match _build_attention_metadata (decode first)
+    requests = sorted(parse_batch_spec(config.batch_spec), key=lambda r: r.q_len)
     q_lens = [r.q_len for r in requests]
     kv_lens = [r.kv_len for r in requests]
     total_q = sum(q_lens)
@@ -800,10 +824,16 @@ def _run_single_benchmark(
     if is_sparse and indexer is not None:
         indexer.fill_random_indices(total_q, max_kv_len)
 
-    # Determine which forward method to use based on metadata
-    if metadata.decode is not None:
+    # Determine which forward method to use based on metadata.
+    # Mirrors forward_impl in mla_attention.py: decode tokens → forward_mqa,
+    # prefill tokens → forward_mha. Mixed batches call both with sliced inputs.
+    # Requests were sorted by q_len in _build_attention_metadata so decode
+    # tokens occupy the first num_decode_tokens positions in all input tensors.
+    if is_sparse or (metadata.decode is not None and metadata.prefill is None):
+        # Pure decode or sparse: all tokens go to forward_mqa
         forward_fn = lambda: impl.forward_mqa(decode_inputs, kv_cache, metadata, layer)
-    elif metadata.prefill is not None:
+    elif metadata.prefill is not None and metadata.decode is None:
+        # Pure prefill: all tokens go to forward_mha
         forward_fn = lambda: impl.forward_mha(
             prefill_inputs["q"],
             prefill_inputs["k_c_normed"],
@@ -813,8 +843,88 @@ def _run_single_benchmark(
             prefill_inputs["k_scale"],
             prefill_inputs["output"],
         )
+    elif metadata.decode is not None and metadata.prefill is not None:
+        # Mixed batch: slice inputs by num_decode_tokens and call both
+        n_dec = metadata.num_decode_tokens
+        if isinstance(decode_inputs, tuple):
+            dec_slice = tuple(t[:n_dec] for t in decode_inputs)
+        else:
+            dec_slice = decode_inputs[:n_dec]
+        forward_fn = lambda: (
+            impl.forward_mqa(dec_slice, kv_cache, metadata, layer),
+            impl.forward_mha(
+                prefill_inputs["q"][n_dec:],
+                prefill_inputs["k_c_normed"][n_dec:],
+                prefill_inputs["k_pe"][n_dec:],
+                kv_cache,
+                metadata,
+                prefill_inputs["k_scale"],
+                prefill_inputs["output"][n_dec:],
+            ),
+        )
     else:
         raise RuntimeError("Metadata has neither decode nor prefill metadata")
+
+    # ---- Optional inline correctness check ----
+    if check_correctness:
+        prefill_inputs["output"].zero_()
+        result = forward_fn()
+        torch.accelerator.synchronize()
+
+        n_dec = metadata.num_decode_tokens or 0
+
+        if is_sparse or (metadata.decode is not None and metadata.prefill is None):
+            backend_out, _ = result
+            ref = compute_mqa_reference(
+                decode_inputs, kv_cache, metadata, mla_dims, is_sparse
+            )
+            b, r = backend_out.float(), ref.float().reshape(backend_out.shape)
+            assert torch.allclose(b, r, atol=atol, rtol=rtol), (
+                f"Correctness check failed: {config.backend} / {config.batch_spec} "
+                f"max_diff={(b - r).abs().max().item():.4e} (atol={atol}, rtol={rtol})"
+            )
+        elif (
+            metadata.prefill is not None
+            and metadata.decode is None
+            and kv_b_proj_weight is not None
+        ):
+            backend_out = prefill_inputs["output"]
+            ref = compute_mha_reference(
+                prefill_inputs["q"], kv_cache, metadata, kv_b_proj_weight, mla_dims
+            )
+            b, r = backend_out.float(), ref.float().reshape(backend_out.shape)
+            assert torch.allclose(b, r, atol=atol, rtol=rtol), (
+                f"Correctness check failed: {config.backend} / {config.batch_spec} "
+                f"max_diff={(b - r).abs().max().item():.4e} (atol={atol}, rtol={rtol})"
+            )
+        elif (
+            metadata.decode is not None
+            and metadata.prefill is not None
+            and kv_b_proj_weight is not None
+        ):
+            dec_slice = (
+                tuple(t[:n_dec] for t in decode_inputs)
+                if isinstance(decode_inputs, tuple)
+                else decode_inputs[:n_dec]
+            )
+            (backend_dec_out, _), _ = result
+            backend_pf_out = prefill_inputs["output"][n_dec:]
+            ref_dec = compute_mqa_reference(
+                dec_slice, kv_cache, metadata, mla_dims, False
+            )
+            ref_pf = compute_mha_reference(
+                prefill_inputs["q"][n_dec:],
+                kv_cache,
+                metadata,
+                kv_b_proj_weight,
+                mla_dims,
+            )
+            for b_out, r_out in [(backend_dec_out, ref_dec), (backend_pf_out, ref_pf)]:
+                b, r = b_out.float(), r_out.float().reshape(b_out.shape)
+                assert torch.allclose(b, r, atol=atol, rtol=rtol), (
+                    f"Correctness check failed: {config.backend} / {config.batch_spec} "
+                    f"max_diff={(b - r).abs().max().item():.4e} (atol={atol}, rtol={rtol})"
+                )
 
     # Warmup — also initializes any lazy buffers (workspace, fp8 scales, etc.)
     for _ in range(config.warmup_iters):
@@ -862,6 +972,7 @@ def _run_mla_benchmark_batched(
     configs_with_params: list[tuple],  # [(config, threshold, num_splits), ...]
     index_topk: int = 2048,
     prefill_backend: str | None = None,
+    check_correctness: bool = False,
 ) -> list[BenchmarkResult]:
     """
     Unified batched MLA benchmark runner for all backends.
@@ -940,6 +1051,31 @@ def _run_mla_benchmark_batched(
         use_cudnn_prefill.cache_clear()
         use_trtllm_ragged_deepseek_prefill.cache_clear()
 
+        # When check_correctness=True, build a plain-tensor kv_b_proj so the
+        # SDPA reference can reproduce kv_b_proj(k_c_normed) with the same weights.
+        kv_b_proj_weight = None
+        kv_b_proj_for_impl = None
+        if check_correctness and kv_cache_dtype != "fp8_ds_mla":
+            torch.manual_seed(0)
+            num_q_heads = mla_dims["num_q_heads"]
+            kv_lora_rank = mla_dims["kv_lora_rank"]
+            qk_nope_head_dim = mla_dims["qk_nope_head_dim"]
+            v_head_dim = mla_dims["v_head_dim"]
+            w = torch.randn(
+                num_q_heads * (qk_nope_head_dim + v_head_dim),
+                kv_lora_rank,
+                dtype=torch.bfloat16,
+                device=device,
+            ) / (kv_lora_rank**0.5)
+            kv_b_proj_weight = w.contiguous()  # [N*(P+V), L]
+
+            def _kv_b_proj(x: torch.Tensor) -> tuple[torch.Tensor, None]:
+                return (x @ kv_b_proj_weight.T, None)
+
+            _kv_b_proj.weight = kv_b_proj_weight  # type: ignore[attr-defined]
+            _kv_b_proj.quant_method = None  # type: ignore[attr-defined]
+            kv_b_proj_for_impl = _kv_b_proj
+
         # Create backend impl, layer, builder, and indexer (reused across benchmarks)
         impl, layer, builder_instance, indexer = _create_backend_impl(
             backend_cfg,
@@ -948,6 +1084,7 @@ def _run_mla_benchmark_batched(
             device,
             index_topk=index_topk if is_sparse else None,
             kv_cache_dtype=kv_cache_dtype,
+            kv_b_proj=kv_b_proj_for_impl,
         )
 
         # Verify the actual prefill backend matches what was requested
@@ -1007,6 +1144,8 @@ def _run_mla_benchmark_batched(
                     device,
                     indexer=indexer,
                     kv_cache_dtype=kv_cache_dtype,
+                    check_correctness=check_correctness,
+                    kv_b_proj_weight=kv_b_proj_weight,
                 )
                 results.append(result)
 
@@ -1034,6 +1173,7 @@ def run_mla_benchmark(
     num_kv_splits: int | None = None,
     index_topk: int = 2048,
     prefill_backend: str | None = None,
+    check_correctness: bool = False,
 ) -> BenchmarkResult | list[BenchmarkResult]:
     """
     Unified MLA benchmark runner for all backends.
@@ -1077,7 +1217,11 @@ def run_mla_benchmark(
 
     # Use unified batched execution
     results = _run_mla_benchmark_batched(
-        backend, configs_with_params, index_topk, prefill_backend=prefill_backend
+        backend,
+        configs_with_params,
+        index_topk,
+        prefill_backend=prefill_backend,
+        check_correctness=check_correctness,
     )
 
     # Return single result or list based on input

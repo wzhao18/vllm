@@ -478,3 +478,249 @@ def is_mla_backend(backend: str) -> bool:
         return backend_class.is_mla()
     except (KeyError, ValueError, ImportError, AttributeError):
         return False
+
+
+# ============================================================================
+# Correctness helpers
+# ============================================================================
+
+
+def sdpa_for_request(
+    q: torch.Tensor,  # [q_len, N, D_q]
+    k: torch.Tensor,  # [kv_len, N, D_q]
+    v: torch.Tensor,  # [kv_len, N, D_v]
+    ctx_len: int,
+    scale: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """Causal per-request SDPA. Returns [q_len, N, D_v]."""
+    q_len = q.shape[0]
+    kv_len = k.shape[0]
+
+    attn_mask = torch.zeros(q_len, kv_len, dtype=torch.bool, device=device)
+    attn_mask[:, :ctx_len] = True
+    causal = torch.tril(torch.ones(q_len, q_len, dtype=torch.bool, device=device))
+    attn_mask[:, ctx_len:] = causal
+
+    out = torch.nn.functional.scaled_dot_product_attention(
+        q.unsqueeze(0).transpose(1, 2),
+        k.unsqueeze(0).transpose(1, 2),
+        v.unsqueeze(0).transpose(1, 2),
+        attn_mask=attn_mask,
+        scale=scale,
+    )
+    return out.squeeze(0).transpose(0, 1)  # [q_len, N, D_v]
+
+
+# ---- MLA correctness helpers ----
+
+
+def compute_mqa_reference(
+    decode_inputs,  # tuple (q_nope [T,N,L], q_pe [T,N,R]) or concat [T,N,L+R]
+    kv_cache: torch.Tensor,  # [num_blocks, block_size, kv_lora_rank + qk_rope_head_dim]
+    metadata,
+    mla_dims: dict,
+    is_sparse: bool = False,
+) -> torch.Tensor:
+    """SDPA reference for forward_mqa. Called after the forward pass.
+
+    Reads K/V directly from kv_cache (context=zeros, new token written by forward).
+    Returns [total_decode_tokens, num_q_heads, kv_lora_rank].
+    """
+    device = kv_cache.device
+    kv_lora_rank = mla_dims["kv_lora_rank"]
+    qk_rope_head_dim = mla_dims["qk_rope_head_dim"]
+    num_q_heads = mla_dims["num_q_heads"]
+    scale = 1.0 / math.sqrt(kv_lora_rank + qk_rope_head_dim)
+    block_size = kv_cache.shape[1]
+
+    if isinstance(decode_inputs, tuple):
+        q = torch.cat([decode_inputs[0], decode_inputs[1]], dim=-1).float()
+    else:
+        q = decode_inputs.float()
+
+    if is_sparse:
+        block_table = metadata.block_table
+        seq_lens = metadata.seq_lens
+        query_start_loc = metadata.query_start_loc
+    else:
+        block_table = metadata.decode.block_table
+        seq_lens = metadata.decode.seq_lens
+        batch_size = int(seq_lens.shape[0])
+        query_start_loc = torch.arange(batch_size + 1, device=device)
+
+    out_parts: list[torch.Tensor] = []
+    for i in range(int(seq_lens.shape[0])):
+        q_start = int(query_start_loc[i].item())
+        q_end = int(query_start_loc[i + 1].item())
+        kv_len = int(seq_lens[i].item())
+        ctx_len = kv_len - (q_end - q_start)
+
+        t = torch.arange(kv_len, device=device)
+        blk = block_table[i, t // block_size].long()
+        off = (t % block_size).long()
+        entries = kv_cache[blk, off].float()  # [kv_len, L+R]
+        kv_c = entries[:, :kv_lora_rank]
+        k_pe = entries[:, kv_lora_rank:]
+
+        k = torch.cat([kv_c, k_pe], dim=-1).unsqueeze(1).expand(-1, num_q_heads, -1)
+        v = kv_c.unsqueeze(1).expand(-1, num_q_heads, -1)
+        out_parts.append(
+            sdpa_for_request(q[q_start:q_end], k, v, ctx_len, scale, device)
+        )
+
+    return torch.cat(out_parts, dim=0)
+
+
+def compute_mha_reference(
+    q: torch.Tensor,  # [total_prefill_tokens, N, qk_nope_head_dim + qk_rope_head_dim]
+    kv_cache: torch.Tensor,  # [num_blocks, block_size, kv_lora_rank + qk_rope_head_dim]
+    metadata,
+    kv_b_proj_weight: torch.Tensor,  # [N*(qk_nope_head_dim + v_head_dim), kv_lora_rank]
+    mla_dims: dict,
+) -> torch.Tensor:
+    """SDPA reference for forward_mha. Called after the forward pass.
+
+    Reads K/V directly from kv_cache (context=zeros, new tokens written by forward).
+    Returns [total_prefill_tokens, N * v_head_dim].
+    """
+    device = kv_cache.device
+    kv_lora_rank = mla_dims["kv_lora_rank"]
+    qk_nope_head_dim = mla_dims["qk_nope_head_dim"]
+    qk_rope_head_dim = mla_dims["qk_rope_head_dim"]
+    v_head_dim = mla_dims["v_head_dim"]
+    num_q_heads = mla_dims["num_q_heads"]
+    scale = 1.0 / math.sqrt(qk_nope_head_dim + qk_rope_head_dim)
+    block_size = kv_cache.shape[1]
+
+    prefill_meta = metadata.prefill
+    block_table = prefill_meta.block_table
+    query_start_loc = prefill_meta.query_start_loc
+    chunked_context = prefill_meta.chunked_context
+
+    w = kv_b_proj_weight.float()
+    out_parts: list[torch.Tensor] = []
+    for i in range(block_table.shape[0]):
+        q_start = int(query_start_loc[i].item())
+        q_end = int(query_start_loc[i + 1].item())
+        q_len = q_end - q_start
+        ctx_len = (
+            int(chunked_context.seq_lens[i].item())
+            if chunked_context is not None
+            else 0
+        )
+        kv_len = q_len + ctx_len
+
+        t = torch.arange(kv_len, device=device)
+        blk = block_table[i, t // block_size].long()
+        off = (t % block_size).long()
+        entries = kv_cache[blk, off].float()  # [kv_len, L+R]
+        kv_c_seq = entries[:, :kv_lora_rank]
+        k_pe_seq = entries[:, kv_lora_rank:]
+
+        kv_exp = (kv_c_seq @ w.T).view(
+            kv_len, num_q_heads, qk_nope_head_dim + v_head_dim
+        )
+        k = torch.cat(
+            [
+                kv_exp[:, :, :qk_nope_head_dim],
+                k_pe_seq.unsqueeze(1).expand(-1, num_q_heads, -1),
+            ],
+            dim=-1,
+        )
+        v = kv_exp[:, :, qk_nope_head_dim:]
+        out_parts.append(
+            sdpa_for_request(
+                q[q_start:q_end].float(), k, v, ctx_len, scale, device
+            ).flatten(start_dim=-2)
+        )
+
+    return torch.cat(out_parts, dim=0)
+
+
+# ---- Standard attention correctness helpers ----
+
+
+def _extract_seq_info(
+    attn_metadata,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extract (seq_lens, query_start_loc) from metadata.
+
+    Handles multiple metadata types:
+    - FlashAttentionMetadata / TritonAttentionMetadata: seq_lens at top level
+    - FlashInferMetadata: seq_lens nested in decode/prefill sub-metadata
+    """
+    if hasattr(attn_metadata, "seq_lens") and attn_metadata.seq_lens is not None:
+        return attn_metadata.seq_lens, attn_metadata.query_start_loc
+
+    # FlashInfer: seq_lens in decode/prefill sub-metadata.
+    # Decode requests are reordered first by reorder_for_flashinfer.
+    seq_lens_parts: list[torch.Tensor] = []
+    q_start_list: list[int] = [0]
+    dc = getattr(attn_metadata, "decode", None)
+    pf = getattr(attn_metadata, "prefill", None)
+    if dc is not None:
+        seq_lens_parts.append(dc.seq_lens)
+        for _ in range(int(dc.seq_lens.shape[0])):
+            q_start_list.append(q_start_list[-1] + 1)  # decode: q_len = 1
+    if pf is not None:
+        seq_lens_parts.append(pf.seq_lens)
+        deltas = (pf.cum_seq_lens_q[1:] - pf.cum_seq_lens_q[:-1]).tolist()
+        for dq in deltas:
+            q_start_list.append(q_start_list[-1] + int(dq))
+    if not seq_lens_parts:
+        raise AttributeError(f"Cannot find seq_lens in {type(attn_metadata).__name__}")
+    seq_lens = torch.cat(seq_lens_parts)
+    query_start_loc = torch.tensor(q_start_list, dtype=torch.int32, device=device)
+    return seq_lens, query_start_loc
+
+
+def compute_std_attn_reference(
+    q: torch.Tensor,  # [total_q, num_q_heads, head_size]
+    k_new: torch.Tensor,  # [total_q, num_kv_heads, head_size]
+    v_new: torch.Tensor,  # [total_q, num_kv_heads, head_size]
+    cache: torch.Tensor,  # kv_cache (unused; context is zero-initialized)
+    attn_metadata,
+) -> torch.Tensor:
+    """Per-request causal SDPA reference. Returns [total_q, num_q_heads, head_size].
+
+    Takes the same inputs as impl.forward (minus layer/output). Context
+    positions are zero-initialized (cache starts at zero, context is never
+    written), so the reference constructs context K/V as zeros directly —
+    no cache reading required, which avoids backend-specific cache layouts.
+    New token K/V come from k_new/v_new (same values written to cache by
+    impl.do_kv_cache_update before impl.forward is called).
+    """
+    device = q.device
+    scale = 1.0 / math.sqrt(q.shape[-1])
+    num_kv_heads = k_new.shape[1]
+    head_size = k_new.shape[2]
+    seq_lens, query_start_loc = _extract_seq_info(attn_metadata, device)
+    batch_size = int(seq_lens.shape[0])
+    head_rep = q.shape[1] // num_kv_heads
+    out_parts: list[torch.Tensor] = []
+    for i in range(batch_size):
+        q_start = int(query_start_loc[i].item())
+        q_end = int(query_start_loc[i + 1].item())
+        kv_len = int(seq_lens[i].item())
+        ctx_len = kv_len - (q_end - q_start)
+        qi = q[q_start:q_end]
+        ki_new = k_new[q_start:q_end]
+        vi_new = v_new[q_start:q_end]
+        if ctx_len > 0:
+            zeros_k = torch.zeros(
+                ctx_len, num_kv_heads, head_size, dtype=k_new.dtype, device=device
+            )
+            zeros_v = torch.zeros(
+                ctx_len, num_kv_heads, head_size, dtype=v_new.dtype, device=device
+            )
+            ki = torch.cat([zeros_k, ki_new], dim=0)
+            vi = torch.cat([zeros_v, vi_new], dim=0)
+        else:
+            ki, vi = ki_new, vi_new
+        if head_rep > 1:
+            ki = ki.repeat_interleave(head_rep, dim=1)
+            vi = vi.repeat_interleave(head_rep, dim=1)
+        out_parts.append(sdpa_for_request(qi, ki, vi, ctx_len, scale, device))
+    return torch.cat(out_parts, dim=0)

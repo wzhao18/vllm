@@ -74,7 +74,7 @@ def parse_batch_spec(spec: str) -> list[BatchRequest]:
     """
     Parse batch specification string into list of BatchRequest objects.
 
-    Grammar: (<count>?) q<q_len>(k?) (s<seq_len>(k?))?
+    Grammar: (<count>?) q<q_len>(k?) (s<seq_len>(k?) | kv<kv_len>(k?))?
 
     Args:
         spec: Batch specification string (see module docstring for grammar)
@@ -89,7 +89,7 @@ def parse_batch_spec(spec: str) -> list[BatchRequest]:
 
     for seg in spec.split("_"):
         # Unified pattern: (<count>?) q<q_len>(k?) (s<seq_len>(k?))?
-        m = re.match(r"^(?:(\d+))?q(\d+)(k?)(?:s(\d+)(k?))?$", seg)
+        m = re.match(r"^(?:(\d+))?q(\d+)(k?)(?:(?:s|kv)(\d+)(k?))?$", seg)
         if m:
             cnt = int(m.group(1)) if m.group(1) else 1
             q_len = _parse_size(m.group(2), m.group(3))
