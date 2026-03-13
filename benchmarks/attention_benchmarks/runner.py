@@ -19,6 +19,7 @@ from common import (
     BenchmarkConfig,
     BenchmarkResult,
     MockLayer,
+    check_close,
     compute_std_attn_reference,
     get_attention_scale,
 )
@@ -116,9 +117,6 @@ def _build_common_attn_metadata(
         batch_size * max_blocks, dtype=torch.int32, device=device
     ).view(batch_size, max_blocks)
 
-    # New token j of request i maps to sequence position context_len[i]+j,
-    # giving slot = (i * max_blocks + pos // block_size) * block_size + pos % block_size.
-    # This avoids colliding with pre-populated context slots.
     slot_mapping = torch.zeros(total_tokens, dtype=torch.int64, device=device)
     q_offset = 0
     for i, req in enumerate(requests):
@@ -400,8 +398,6 @@ def _run_single_benchmark(
         total_q, config.num_q_heads, config.head_dim, device=device, dtype=dtype
     )
 
-    # impl.forward reads K/V from kv_cache (not from the k/v tensors directly).
-    # Pre-populate all caches once so warmup and timing see valid K/V.
     slot_mapping = attn_metadata.slot_mapping
     for i in range(config.num_layers):
         impl.do_kv_cache_update(
@@ -424,11 +420,7 @@ def _run_single_benchmark(
         ref = compute_std_attn_reference(
             q_list[0], k_list[0], v_list[0], cache_list[0], attn_metadata
         )
-        b, r = out.float(), ref.float()
-        assert torch.allclose(b, r, atol=atol, rtol=rtol), (
-            f"Correctness check failed: {config.backend} / {config.batch_spec} "
-            f"max_diff={(b - r).abs().max().item():.4e} (atol={atol}, rtol={rtol})"
-        )
+        check_close(f"{config.backend} {config.batch_spec}", out, ref, atol, rtol)
 
     # Warmup
     for _ in range(config.warmup_iters):
@@ -493,17 +485,14 @@ def run_attention_benchmark(
 
     Supports: FLASH_ATTN, TRITON_ATTN, FLASHINFER
 
-    When check_correctness=True, a single forward pass (layer 0) is compared
-    against a per-request causal SDPA reference before the timing loop.
-
     Args:
         config: Benchmark configuration
-        check_correctness: Run SDPA correctness check before timing
+        check_correctness: Run SDPA correctness check
         atol: Absolute tolerance for correctness check
         rtol: Relative tolerance for correctness check
 
     Returns:
-        BenchmarkResult with timing, memory, and optional correctness statistics
+        BenchmarkResult with timing and memory statistics
     """
     device = torch.device(config.device)
     torch.accelerator.set_device_index(device)
