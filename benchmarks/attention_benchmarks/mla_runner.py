@@ -576,9 +576,7 @@ def _create_backend_impl(
     # Calculate scale
     scale = 1.0 / np.sqrt(mla_dims["qk_nope_head_dim"] + mla_dims["qk_rope_head_dim"])
 
-    # MockKVBProj: __call__ returns random output (no matmul, no benchmark timing
-    # impact) but stores a deterministic weight at self.weight so correctness
-    # reference functions can read it without going through __call__.
+    # Create mock kv_b_proj layer for prefill mode
     mock_kv_b_proj = MockKVBProj(
         num_heads=mla_dims["num_q_heads"],
         qk_nope_head_dim=mla_dims["qk_nope_head_dim"],
@@ -730,14 +728,7 @@ def _run_single_benchmark(
     rtol: float = 1e-2,
 ) -> BenchmarkResult:
     """
-    Run a single benchmark iteration, optionally with an inline correctness check.
-
-    When check_correctness=True:
-      - The KV cache is pre-populated with deterministic random data.
-      - After the forward pass the output is compared against an SDPA reference
-        computed from the exact same inputs.
-      - impl.kv_b_proj.weight (set by MockKVBProj at construction time) is used
-        by the reference to reproduce kv_b_proj(k_c_normed).
+    Run a single benchmark iteration.
 
     Args:
         config: BenchmarkConfig instance
@@ -809,10 +800,8 @@ def _run_single_benchmark(
     quantize_query = is_fp8_kvcache and getattr(
         impl, "supports_quant_query_input", False
     )
-    # When quantizing the decode query to fp8, the real serving path concatenates
-    # q_nope and q_pe into a single tensor before quantizing (mla_attention.py).
-    # Both CUTLASS_MLA and FLASHINFER_MLA accept concat input in forward_mqa, so
-    # always use "concat" format when quantizing regardless of backend default.
+
+    # Create input tensors for both decode and prefill modes
     query_fmt = "concat" if quantize_query else backend_cfg["query_format"]
     decode_inputs, prefill_inputs = _create_input_tensors(
         total_q,
@@ -829,55 +818,35 @@ def _run_single_benchmark(
         indexer.fill_random_indices(total_q, max_kv_len)
 
     # Determine which forward method to use based on metadata.
-    # Mirrors forward_impl in mla_attention.py: decode tokens → forward_mqa,
-    # prefill tokens → forward_mha. Mixed batches call both with sliced inputs.
-    # Requests were sorted by q_len in _build_attention_metadata so decode
-    # tokens occupy the first num_decode_tokens positions in all input tensors.
-    if is_sparse or (metadata.decode is not None and metadata.prefill is None):
-        # Pure decode or sparse: all tokens go to forward_mqa
-        forward_fn = lambda: impl.forward_mqa(decode_inputs, kv_cache, metadata, layer)
-    elif metadata.prefill is not None and metadata.decode is None:
-        # Pure prefill: all tokens go to forward_mha
-        forward_fn = lambda: impl.forward_mha(
-            prefill_inputs["q"],
-            prefill_inputs["k_c_normed"],
-            prefill_inputs["k_pe"],
-            kv_cache,
-            metadata,
-            prefill_inputs["k_scale"],
-            prefill_inputs["output"],
-        )
-    elif metadata.decode is not None and metadata.prefill is not None:
-        # Mixed batch: slice inputs by num_decode_tokens and call both
-        n_dec = metadata.num_decode_tokens
-        if isinstance(decode_inputs, tuple):
-            dec_slice = tuple(t[:n_dec] for t in decode_inputs)
-        else:
-            dec_slice = decode_inputs[:n_dec]
-        forward_fn = lambda: (
-            impl.forward_mqa(dec_slice, kv_cache, metadata, layer),
-            impl.forward_mha(
-                prefill_inputs["q"][n_dec:],
-                prefill_inputs["k_c_normed"][n_dec:],
-                prefill_inputs["k_pe"][n_dec:],
+    has_decode = is_sparse or metadata.decode is not None
+    has_prefill = not is_sparse and metadata.prefill is not None
+    if not has_decode and not has_prefill:
+        raise RuntimeError("Metadata has neither decode nor prefill metadata")
+
+    num_decode = (
+        metadata.num_decode_tokens if (has_decode and has_prefill) else total_q if has_decode else 0
+    )
+    if isinstance(decode_inputs, tuple):
+        decode_q = tuple(t[:num_decode] for t in decode_inputs)
+    else:
+        decode_q = decode_inputs[:num_decode]
+
+    def forward_fn():
+        results = []
+        if has_decode:
+            results.append(impl.forward_mqa(decode_q, kv_cache, metadata, layer))
+        if has_prefill:
+            results.append(impl.forward_mha(
+                prefill_inputs["q"][num_decode:],
+                prefill_inputs["k_c_normed"][num_decode:],
+                prefill_inputs["k_pe"][num_decode:],
                 kv_cache,
                 metadata,
                 prefill_inputs["k_scale"],
-                prefill_inputs["output"][n_dec:],
-            ),
-        )
-    else:
-        raise RuntimeError("Metadata has neither decode nor prefill metadata")
+                prefill_inputs["output"][num_decode:],
+            ))
+        return results[0] if len(results) == 1 else tuple(results)
 
-    # Pre-populate kv_cache so both the backend and the correctness reference
-    # read the same K/V data.
-    #
-    # Non-sparse: only new-token slots matter (forward_mqa reads kv_cache; the
-    # context positions happen to be zero-initialised, and the reference uses
-    # zeros for context too via slot_mapping-based addressing).
-    #
-    # Sparse: the indexer can point to ANY position 0..kv_len-1, so we must
-    # populate ALL positions with deterministic random data before the check.
     if is_sparse:
         populate_mla_kv_cache_full(
             kv_cache,
@@ -898,7 +867,6 @@ def _run_single_benchmark(
             kv_cache_dtype,
         )
 
-    # ---- Optional inline correctness check ----
     if check_correctness:
         # For sparse backends, temporarily replace random indices with sequential
         # 0..min(kv_len-1, topk-1) indices so the SDPA reference can exactly
@@ -911,38 +879,37 @@ def _run_single_benchmark(
             )
             sparse_indices_for_ref = indexer.topk_indices_buffer[:total_q].clone()
 
-        # Enable real projection in MockKVBProj so forward_mha uses
-        # deterministic K/V that the SDPA reference can reproduce.
-        # Python special-method dispatch always goes through the class, so
-        # we use the _use_real_weight flag rather than monkey-patching __call__.
-        # The flag is reset in the finally block before the timing loop.
-        # Sparse impls don't have kv_b_proj (they never call it in forward_mqa).
         has_kv_b_proj = hasattr(impl, "kv_b_proj")
         kv_b_proj_weight = impl.kv_b_proj.weight if has_kv_b_proj else None
+
+        # Enable real projection in MockKVBProj in forward_mha
+        # so the reference can reproduce
         if has_kv_b_proj:
             impl.kv_b_proj._use_real_weight = True
 
-        try:
-            prefill_inputs["output"].zero_()
-            result = forward_fn()
-            torch.accelerator.synchronize()
-        finally:
-            if has_kv_b_proj:
-                impl.kv_b_proj._use_real_weight = False
-            # Restore random indices for the timing loop.
-            if is_sparse and indexer is not None:
-                indexer.fill_random_indices(total_q, max_kv_len)
+        prefill_inputs["output"].zero_()
+        result = forward_fn()
+        torch.accelerator.synchronize()
 
-        n_dec = getattr(metadata, "num_decode_tokens", None) or 0
+        # Disable real projection for the timing loop
+        # to only benchmark the attention kernel
+        if has_kv_b_proj:
+            impl.kv_b_proj._use_real_weight = False
+
+        # Restore random indices for the timing loop.
+        if is_sparse and indexer is not None:
+            indexer.fill_random_indices(total_q, max_kv_len)
+
         # Reference functions expect a bfloat16 kv_cache; decode fp8 formats first.
         kv_cache_ref = mla_kv_cache_to_bf16(kv_cache, kv_cache_dtype, mla_dims)
 
         prefix = f"{config.backend} {config.batch_spec}"
 
-        if is_sparse or (metadata.decode is not None and metadata.prefill is None):
-            backend_out, _ = result
+        if has_decode:
+            decode_result = result[0] if has_prefill else result
+            backend_out, _ = decode_result
             ref = compute_mqa_reference(
-                decode_inputs,
+                decode_q,
                 kv_cache_ref,
                 metadata,
                 mla_dims,
@@ -950,30 +917,15 @@ def _run_single_benchmark(
                 sparse_indices=sparse_indices_for_ref,
             )
             check_close(f"{prefix} mqa", backend_out, ref, atol, rtol)
-        elif metadata.prefill is not None and metadata.decode is None:
+        if has_prefill:
             ref = compute_mha_reference(
-                prefill_inputs["q"], kv_cache_ref, metadata, kv_b_proj_weight, mla_dims
-            )
-            check_close(f"{prefix} mha", prefill_inputs["output"], ref, atol, rtol)
-        elif metadata.decode is not None and metadata.prefill is not None:
-            dec_slice = (
-                tuple(t[:n_dec] for t in decode_inputs)
-                if isinstance(decode_inputs, tuple)
-                else decode_inputs[:n_dec]
-            )
-            (backend_dec_out, _), _ = result
-            ref_dec = compute_mqa_reference(
-                dec_slice, kv_cache_ref, metadata, mla_dims, False
-            )
-            ref_pf = compute_mha_reference(
-                prefill_inputs["q"][n_dec:],
+                prefill_inputs["q"][num_decode:],
                 kv_cache_ref,
                 metadata,
                 kv_b_proj_weight,
                 mla_dims,
             )
-            check_close(f"{prefix} mqa", backend_dec_out, ref_dec, atol, rtol)
-            check_close(f"{prefix} mha", prefill_inputs["output"][n_dec:], ref_pf, atol, rtol)
+            check_close(f"{prefix} mha", prefill_inputs["output"][num_decode:], ref, atol, rtol)
 
     # Warmup — also initializes any lazy buffers (workspace, fp8 scales, etc.)
     for _ in range(config.warmup_iters):
