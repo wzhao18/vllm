@@ -481,6 +481,103 @@ def is_mla_backend(backend: str) -> bool:
 
 
 # ============================================================================
+# KV cache population and decoding helpers
+# ============================================================================
+
+
+def populate_mla_kv_cache(
+    kv_cache: torch.Tensor,
+    prefill_inputs: dict,
+    metadata,
+    block_size: int,
+    kv_lora_rank: int,
+    kv_cache_dtype: str,
+) -> None:
+    """Write new-token KV data into kv_cache at slot positions.
+
+    Handles bfloat16, fp8, and fp8_ds_mla (DeepSeek 656-byte packed format).
+    """
+    from vllm.platforms import current_platform
+
+    _sm = metadata.slot_mapping
+    _blocks = (_sm // block_size).long()
+    _offsets = (_sm % block_size).long()
+    k_c = prefill_inputs["k_c_normed"]  # [total_tokens, kv_lora_rank]
+    k_p = prefill_inputs["k_pe"][:, 0, :]  # [total_tokens, qk_rope_head_dim]
+
+    if kv_cache_dtype == "fp8_ds_mla":
+        fp8_dtype = current_platform.fp8_dtype()
+        fp8_max = torch.finfo(fp8_dtype).max
+        k_c_f = k_c.float()
+        num_groups = kv_lora_rank // 128
+        fp8_parts: list[torch.Tensor] = []
+        scale_parts: list[torch.Tensor] = []
+        for j in range(num_groups):
+            chunk = k_c_f[:, j * 128 : (j + 1) * 128]
+            scale = chunk.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12) / fp8_max
+            scale_parts.append(scale.to(torch.float32))  # [N, 1] f32
+            fp8_parts.append((chunk / scale).to(fp8_dtype).view(torch.uint8))
+        fp8_bytes = torch.cat(fp8_parts, dim=-1)  # [N, kv_lora_rank] u8
+        scale_bytes = torch.cat(scale_parts, dim=-1).view(torch.uint8)  # [N, num_groups*4] u8
+        rope_bytes = k_p.to(torch.bfloat16).view(torch.uint8)  # [N, rope_dim*2] u8
+        token_data = torch.cat([fp8_bytes, scale_bytes, rope_bytes], dim=-1)
+        kv_cache[_blocks, _offsets] = token_data
+    elif kv_cache_dtype == "fp8":
+        fp8_dtype = current_platform.fp8_dtype()
+        kv_cache[_blocks, _offsets, :kv_lora_rank] = k_c.to(fp8_dtype)
+        kv_cache[_blocks, _offsets, kv_lora_rank:] = k_p.to(fp8_dtype)
+    else:  # bfloat16
+        kv_cache[_blocks, _offsets, :kv_lora_rank] = k_c.to(kv_cache.dtype)
+        kv_cache[_blocks, _offsets, kv_lora_rank:] = k_p.to(kv_cache.dtype)
+    torch.accelerator.synchronize()
+
+
+def mla_kv_cache_to_bf16(
+    kv_cache: torch.Tensor,
+    kv_cache_dtype: str,
+    mla_dims: dict,
+) -> torch.Tensor:
+    """Return a bfloat16 [num_blocks, block_size, kv_lora_rank+qk_rope_head_dim]
+    tensor suitable for passing to compute_mqa_reference / compute_mha_reference.
+
+    For bfloat16 caches the original tensor is returned unchanged.
+    For fp8, standard dequantization via .float() is used.
+    For fp8_ds_mla the 656-byte packed format is decoded: 512 fp8 values
+    (with per-128 float32 scales) followed by 64 unquantized bfloat16 rope values.
+    """
+    if kv_cache_dtype not in ("fp8", "fp8_ds_mla"):
+        return kv_cache
+
+    from vllm.platforms import current_platform
+
+    kv_lora_rank = mla_dims["kv_lora_rank"]
+    qk_rope_head_dim = mla_dims["qk_rope_head_dim"]
+    num_blocks, block_size = kv_cache.shape[:2]
+
+    if kv_cache_dtype == "fp8":
+        return kv_cache.float().bfloat16()
+
+    # fp8_ds_mla: [num_blocks, block_size, 656] uint8
+    fp8_dtype = current_platform.fp8_dtype()
+    num_groups = kv_lora_rank // 128
+    flat = kv_cache.reshape(num_blocks * block_size, 656)  # [N, 656] u8
+
+    # First kv_lora_rank bytes are fp8 values
+    fp8_vals = flat[:, :kv_lora_rank].view(fp8_dtype).float()  # [N, 512]
+    # Next num_groups*4 bytes are float32 per-128 scales
+    scale_start = kv_lora_rank
+    scale_end = scale_start + num_groups * 4
+    scales = flat[:, scale_start:scale_end].view(torch.float32)  # [N, num_groups]
+    for j in range(num_groups):
+        fp8_vals[:, j * 128 : (j + 1) * 128] *= scales[:, j : j + 1]
+    # Remaining bytes are bfloat16 rope values
+    k_pe_vals = flat[:, scale_end:].view(torch.bfloat16).float()  # [N, 64]
+
+    result = torch.cat([fp8_vals, k_pe_vals], dim=-1).bfloat16()
+    return result.reshape(num_blocks, block_size, kv_lora_rank + qk_rope_head_dim)
+
+
+# ============================================================================
 # Correctness helpers
 # ============================================================================
 
