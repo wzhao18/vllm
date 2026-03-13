@@ -761,11 +761,11 @@ def _run_single_benchmark(
     )
 
     # Create KV cache
-    # kv_cache_dtype param takes priority (allows caller to pass remapped dtype)
     if kv_cache_dtype is None:
         kv_cache_dtype = getattr(config, "kv_cache_dtype", "bfloat16")
     is_fp8_kvcache = kv_cache_dtype == "fp8"
     head_size = mla_dims["kv_lora_rank"] + mla_dims["qk_rope_head_dim"]
+
     if kv_cache_dtype == "fp8_ds_mla":
         # FlashMLA sparse custom format: 656 bytes per token, stored as uint8.
         # Layout: kv_lora_rank fp8 bytes + 4 float32 tile scales + 2*rope_dim bf16 bytes
@@ -778,7 +778,6 @@ def _run_single_benchmark(
             dtype=torch.uint8,
         )
     elif kv_cache_dtype == "fp8":
-        # fp8: same shape as bfloat16 but stored as uint8 viewed as fp8 dtype
         from vllm.platforms import current_platform
 
         kv_cache = torch.zeros(

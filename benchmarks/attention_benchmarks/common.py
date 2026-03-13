@@ -75,15 +75,6 @@ class MockKVBProj:
     Mimics ColumnParallelLinear behavior for kv_b_proj in MLA backends.
     Projects kv_c_normed ([num_tokens, kv_lora_rank]) to
     ([num_tokens, num_heads * (qk_nope_head_dim + v_head_dim)]).
-
-    Supports two modes controlled by self._use_real_weight:
-    - False (default, benchmarking): __call__ returns random output with no
-      matmul, so forward_mha benchmark timing is unaffected.
-    - True (correctness check): __call__ does the real float32 matmul so
-      forward_mha produces numerically correct output for comparison.
-
-    self.weight is always available so the SDPA reference can reproduce the
-    projection using the same weight the backend used.
     """
 
     def __init__(
@@ -123,7 +114,6 @@ class MockKVBProj:
             where output has shape [num_tokens, num_heads * out_dim].
         """
         if self._use_real_weight:
-            # Float32 matmul for numerical accuracy during correctness checks.
             return (
                 (x.float() @ self.weight.T.float()).to(x.dtype),
                 None,
