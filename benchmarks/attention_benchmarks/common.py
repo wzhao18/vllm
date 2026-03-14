@@ -10,14 +10,14 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from vllm.logger import init_logger
-
-logger = init_logger("vllm.benchmark")
-
 import torch
 from batch_spec import get_batch_type, parse_batch_spec
 from rich.console import Console
 from rich.table import Table
+
+from vllm.logger import init_logger
+
+logger = init_logger("vllm.benchmark")
 
 
 def batch_spec_sort_key(spec: str) -> tuple[int, int, int]:
@@ -185,13 +185,9 @@ class MockIndexer:
             q_start = int(qsl_list[i])
             q_end = int(qsl_list[i + 1])
             num_valid = min(kv_len, self.topk_tokens)
-            row = torch.full(
-                (self.topk_tokens,), -1, dtype=torch.int32, device=dev
-            )
+            row = torch.full((self.topk_tokens,), -1, dtype=torch.int32, device=dev)
             if num_valid > 0:
-                row[:num_valid] = torch.arange(
-                    num_valid, dtype=torch.int32, device=dev
-                )
+                row[:num_valid] = torch.arange(num_valid, dtype=torch.int32, device=dev)
             # Broadcast same row to all query tokens in this request
             self.topk_indices_buffer[q_start:q_end] = row.unsqueeze(0)
 
@@ -581,7 +577,9 @@ def populate_mla_kv_cache(
             scale_parts.append(scale.to(torch.float32))  # [N, 1] f32
             fp8_parts.append((chunk / scale).to(fp8_dtype).view(torch.uint8))
         fp8_bytes = torch.cat(fp8_parts, dim=-1)  # [N, kv_lora_rank] u8
-        scale_bytes = torch.cat(scale_parts, dim=-1).view(torch.uint8)  # [N, num_groups*4] u8
+        scale_bytes = torch.cat(scale_parts, dim=-1).view(
+            torch.uint8
+        )  # [N, num_groups*4] u8
         rope_bytes = k_p.to(torch.bfloat16).view(torch.uint8)  # [N, rope_dim*2] u8
         token_data = torch.cat([fp8_bytes, scale_bytes, rope_bytes], dim=-1)
         kv_cache[_blocks, _offsets] = token_data
@@ -598,7 +596,7 @@ def populate_mla_kv_cache(
 def populate_mla_kv_cache_full(
     kv_cache: torch.Tensor,
     block_table: torch.Tensor,  # [batch_size, max_blocks_per_req] int32
-    seq_lens: torch.Tensor,     # [batch_size] int32
+    seq_lens: torch.Tensor,  # [batch_size] int32
     block_size: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
@@ -637,7 +635,9 @@ def populate_mla_kv_cache_full(
     total = int(_blk.shape[0])
 
     k_c = torch.randn(total, kv_lora_rank, dtype=torch.bfloat16, device=device) * 0.1
-    k_pe = torch.randn(total, qk_rope_head_dim, dtype=torch.bfloat16, device=device) * 0.1
+    k_pe = (
+        torch.randn(total, qk_rope_head_dim, dtype=torch.bfloat16, device=device) * 0.1
+    )
 
     if kv_cache_dtype == "fp8_ds_mla":
         fp8_dtype = current_platform.fp8_dtype()
@@ -770,7 +770,8 @@ def compute_mqa_reference(
     metadata,
     mla_dims: dict,
     is_sparse: bool = False,
-    sparse_indices: torch.Tensor | None = None,  # [total_q, topk] per-request token indices
+    sparse_indices: torch.Tensor
+    | None = None,  # [total_q, topk] per-request token indices
 ) -> torch.Tensor:
     """SDPA reference for forward_mqa. Called after the forward pass.
 
@@ -796,9 +797,7 @@ def compute_mqa_reference(
 
     if is_sparse:
         if sparse_indices is None:
-            raise ValueError(
-                "sparse_indices must be provided for sparse MQA reference"
-            )
+            raise ValueError("sparse_indices must be provided for sparse MQA reference")
         block_table = metadata.block_table
         query_start_loc = metadata.query_start_loc
         num_reqs = int(block_table.shape[0])
@@ -828,18 +827,28 @@ def compute_mqa_reference(
 
             blk = block_table[i, valid_indices // block_size].long()
             off = (valid_indices % block_size).long()
-            entries = kv_cache[blk, off].float()  # [num_valid, kv_lora_rank+qk_rope_head_dim]
+            entries = kv_cache[
+                blk, off
+            ].float()  # [num_valid, kv_lora_rank+qk_rope_head_dim]
 
             k_sparse = entries.unsqueeze(1).expand(-1, num_q_heads, -1)
-            v_sparse = entries[:, :kv_lora_rank].unsqueeze(1).expand(-1, num_q_heads, -1)
+            v_sparse = (
+                entries[:, :kv_lora_rank].unsqueeze(1).expand(-1, num_q_heads, -1)
+            )
 
             q_tok = q[g_tok : g_tok + 1]  # [1, N, full_dim]
-            out_tok = torch.nn.functional.scaled_dot_product_attention(
-                q_tok.unsqueeze(0).transpose(1, 2),     # [1, N, 1, D]
-                k_sparse.unsqueeze(0).transpose(1, 2),  # [1, N, num_valid, D]
-                v_sparse.unsqueeze(0).transpose(1, 2),  # [1, N, num_valid, kv_lora_rank]
-                scale=scale,
-            ).squeeze(0).transpose(0, 1)  # [1, N, kv_lora_rank]
+            out_tok = (
+                torch.nn.functional.scaled_dot_product_attention(
+                    q_tok.unsqueeze(0).transpose(1, 2),  # [1, N, 1, D]
+                    k_sparse.unsqueeze(0).transpose(1, 2),  # [1, N, num_valid, D]
+                    v_sparse.unsqueeze(0).transpose(
+                        1, 2
+                    ),  # [1, N, num_valid, kv_lora_rank]
+                    scale=scale,
+                )
+                .squeeze(0)
+                .transpose(0, 1)
+            )  # [1, N, kv_lora_rank]
             out_parts.append(out_tok)
 
         return torch.cat(out_parts, dim=0)  # [total_q, N, kv_lora_rank]

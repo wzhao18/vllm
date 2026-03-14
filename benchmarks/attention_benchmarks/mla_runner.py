@@ -505,6 +505,7 @@ def _create_input_tensors(
 
     if quantize_query:
         from vllm.platforms import current_platform
+
         decode_inputs = decode_inputs.to(current_platform.fp8_dtype())
 
     # Create additional inputs needed for prefill forward
@@ -823,7 +824,11 @@ def _run_single_benchmark(
         raise RuntimeError("Metadata has neither decode nor prefill metadata")
 
     num_decode = (
-        metadata.num_decode_tokens if (has_decode and has_prefill) else total_q if has_decode else 0
+        metadata.num_decode_tokens
+        if (has_decode and has_prefill)
+        else total_q
+        if has_decode
+        else 0
     )
     if isinstance(decode_inputs, tuple):
         decode_q = tuple(t[:num_decode] for t in decode_inputs)
@@ -835,15 +840,17 @@ def _run_single_benchmark(
         if has_decode:
             results.append(impl.forward_mqa(decode_q, kv_cache, metadata, layer))
         if has_prefill:
-            results.append(impl.forward_mha(
-                prefill_inputs["q"][num_decode:],
-                prefill_inputs["k_c_normed"][num_decode:],
-                prefill_inputs["k_pe"][num_decode:],
-                kv_cache,
-                metadata,
-                prefill_inputs["k_scale"],
-                prefill_inputs["output"][num_decode:],
-            ))
+            results.append(
+                impl.forward_mha(
+                    prefill_inputs["q"][num_decode:],
+                    prefill_inputs["k_c_normed"][num_decode:],
+                    prefill_inputs["k_pe"][num_decode:],
+                    kv_cache,
+                    metadata,
+                    prefill_inputs["k_scale"],
+                    prefill_inputs["output"][num_decode:],
+                )
+            )
         return results[0] if len(results) == 1 else tuple(results)
 
     if is_sparse:
@@ -924,7 +931,9 @@ def _run_single_benchmark(
                 kv_b_proj_weight,
                 mla_dims,
             )
-            check_close(f"{prefix} mha", prefill_inputs["output"][num_decode:], ref, atol, rtol)
+            check_close(
+                f"{prefix} mha", prefill_inputs["output"][num_decode:], ref, atol, rtol
+            )
 
     # Warmup — also initializes any lazy buffers (workspace, fp8 scales, etc.)
     for _ in range(config.warmup_iters):

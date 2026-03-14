@@ -151,7 +151,9 @@ def run_model_parameter_sweep(
                     )
 
                     # Run benchmark
-                    result = run_benchmark(clean_config, check_correctness=check_correctness)
+                    result = run_benchmark(
+                        clean_config, check_correctness=check_correctness
+                    )
 
                     # Replace backend with labeled version for display
                     backend_label = sweep.get_label(backend, value)
@@ -323,7 +325,9 @@ def run_parameter_sweep(
                         kwargs[sweep.param_name] = value
 
                     # Run benchmark
-                    result = run_benchmark(config, check_correctness=check_correctness, **kwargs)
+                    result = run_benchmark(
+                        config, check_correctness=check_correctness, **kwargs
+                    )
 
                     # Replace backend with labeled version for display
                     backend_label = sweep.get_label(backend, value)
@@ -507,13 +511,16 @@ def main():
         "--cuda-graphs",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Capture and replay CUDA graphs to eliminate CPU dispatch overhead (default: True)",
+        help=(
+            "Launch kernels with CUDA graphs to eliminate CPU overhead"
+            "in measurements (default: True)"
+        ),
     )
     parser.add_argument(
         "--check-correctness",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Run SDPA correctness check for MLA backends before benchmarking (default: True)",
+        help="Run correctness check alongside benchmark (default: True)",
     )
 
     # Parameter sweep (use YAML config for advanced sweeps)
@@ -770,8 +777,11 @@ def main():
                     from mla_runner import run_mla_benchmark as run_mla
 
                     # Use batched API: pass list of (config, threshold) tuples
-                    timing_results = run_mla(backend, configs_with_thresholds,
-                                             check_correctness=check_correctness)
+                    timing_results = run_mla(
+                        backend,
+                        configs_with_thresholds,
+                        check_correctness=check_correctness,
+                    )
 
                     # Create BenchmarkResult objects from timing results
                     for (config, _), timing in zip(
@@ -925,7 +935,11 @@ def main():
             "use_cuda_graphs": args.cuda_graphs,
         }
         all_results = run_parameter_sweep(
-            backends, args.batch_specs, base_config_args, args.parameter_sweep, console,
+            backends,
+            args.batch_specs,
+            base_config_args,
+            args.parameter_sweep,
+            console,
             check_correctness=check_correctness,
         )
 
