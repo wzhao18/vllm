@@ -66,6 +66,7 @@ def create_minimal_vllm_config(
     model_name: str = "deepseek-v3",
     block_size: int = 128,
     max_num_seqs: int = 256,
+    max_num_batched_tokens: int = 8192,
     mla_dims: dict | None = None,
     index_topk: int | None = None,
     prefill_backend: str | None = None,
@@ -163,7 +164,7 @@ def create_minimal_vllm_config(
 
     scheduler_config = SchedulerConfig(
         max_num_seqs=max_num_seqs,
-        max_num_batched_tokens=8192,
+        max_num_batched_tokens=max(max_num_batched_tokens, max_num_seqs),
         max_model_len=32768,
         is_encoder_decoder=False,
         enable_chunked_prefill=True,
@@ -1034,10 +1035,18 @@ def _run_mla_benchmark_batched(
     if backend.upper() == "FLASHMLA_SPARSE" and kv_cache_dtype == "fp8":
         kv_cache_dtype = "fp8_ds_mla"
 
+    # Compute max total_q across all configs so the metadata builder buffer
+    # is large enough
+    max_total_q = max(
+        sum(r.q_len for r in parse_batch_spec(cfg.batch_spec))
+        for cfg, *_ in configs_with_params
+    )
+
     # Create and set vLLM config for MLA (reused across all benchmarks)
     vllm_config = create_minimal_vllm_config(
         model_name="deepseek-v3",  # Used only for model path
         block_size=block_size,
+        max_num_batched_tokens=max_total_q,
         mla_dims=mla_dims,  # Use custom dims from config or default
         index_topk=index_topk if is_sparse else None,
         prefill_backend=prefill_backend,
@@ -1066,6 +1075,7 @@ def _run_mla_benchmark_batched(
             mla_dims,
             vllm_config,
             device,
+            max_num_tokens=max_total_q,
             index_topk=index_topk if is_sparse else None,
             kv_cache_dtype=kv_cache_dtype,
         )
