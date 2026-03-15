@@ -157,11 +157,10 @@ def create_minimal_vllm_config(
     _add_mock_methods_to_model_config(model_config)
 
     # Create sub-configs
-    vllm_cache_dtype = "auto" if kv_cache_dtype == "bfloat16" else kv_cache_dtype
     cache_config = CacheConfig(
         block_size=block_size,
         gpu_memory_utilization=0.9,
-        cache_dtype=vllm_cache_dtype,
+        cache_dtype=kv_cache_dtype,
         enable_prefix_caching=False,
     )
 
@@ -445,13 +444,11 @@ def _create_query_tensors(
     quantize_query: bool = False,
 ):
     """
-    Create query tensors sized to exactly the decode and prefill token counts.
+    Create query tensors for decode and prefill respectively.
 
-    MLA uses different query dimensions for decode vs prefill:
-    - Decode (forward_mqa): q_nope has kv_lora_rank dim (absorbed/compressed
-      space, dot-products directly with compressed KV cache entries).
-    - Prefill (forward_mha): q_nope has qk_nope_head_dim (original space;
-      kv_b_proj expands the compressed KV to match).
+     MLA requires different tensor formats for decode vs prefill:
+    - Decode: Uses kv_lora_rank (512) dimension
+    - Prefill: Uses qk_nope_head_dim (128) to stay under FlashAttention's 256 limit
 
     Args:
         num_decode: Number of decode tokens
@@ -587,7 +584,7 @@ def _create_backend_impl(
         "num_kv_heads": mla_dims["num_kv_heads"],
         "alibi_slopes": None,
         "sliding_window": None,
-        "kv_cache_dtype": "auto" if kv_cache_dtype == "bfloat16" else kv_cache_dtype,
+        "kv_cache_dtype": kv_cache_dtype,
         "logits_soft_cap": None,
         "attn_type": "decoder",
         "kv_sharing_target_layer_name": None,
@@ -744,7 +741,7 @@ def _run_single_benchmark(
 
     # Create KV cache
     if kv_cache_dtype is None:
-        kv_cache_dtype = getattr(config, "kv_cache_dtype", "bfloat16")
+        kv_cache_dtype = getattr(config, "kv_cache_dtype", "auto")
     is_fp8_kvcache = kv_cache_dtype == "fp8"
     logger.info(
         "Running %s %s  kv_cache_dtype=%s",
@@ -917,13 +914,13 @@ def _run_single_benchmark(
             )
             check_close(f"{prefix} mha", prefill_output, ref, atol, rtol)
 
-    # Warmup — also initializes any lazy buffers (workspace, fp8 scales, etc.)
+    # Warmup
     for _ in range(config.warmup_iters):
         forward_fn()
     torch.accelerator.synchronize()
 
     # Optionally capture a CUDA graph after warmup.
-    # Graph replay eliminates CPU dispatch overhead so timings reflect pure GPU time.
+    # Graph replay eliminates CPU launch overhead so timings reflect pure kernel time.
     if config.use_cuda_graphs:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -1010,7 +1007,7 @@ def _run_mla_benchmark_batched(
     is_sparse = backend_cfg.get("is_sparse", False)
 
     # Extract kv_cache_dtype from the first config
-    kv_cache_dtype = getattr(first_config, "kv_cache_dtype", "bfloat16")
+    kv_cache_dtype = getattr(first_config, "kv_cache_dtype", "auto")
 
     # FlashMLA sparse only supports "fp8_ds_mla" internally (not generic "fp8").
     # Remap here so the user can pass --kv-cache-dtype fp8 regardless of backend.
@@ -1018,13 +1015,12 @@ def _run_mla_benchmark_batched(
         kv_cache_dtype = "fp8_ds_mla"
 
     # Check backend supports the requested kv_cache_dtype.
-    vllm_kv_dtype = "auto" if kv_cache_dtype == "bfloat16" else kv_cache_dtype
-    if not backend_class.supports_kv_cache_dtype(vllm_kv_dtype):
+    if not backend_class.supports_kv_cache_dtype(kv_cache_dtype):
         raise ValueError(
             f"{backend} does not support kv_cache_dtype='{kv_cache_dtype}'"
         )
 
-    # Check device compute capability (e.g. FlashMLA requires Hopper SM90+).
+    # Check device compute capability
     if hasattr(backend_class, "supports_compute_capability"):
         from vllm.platforms import current_platform
 

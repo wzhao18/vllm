@@ -37,16 +37,12 @@ from vllm.config import (
     VllmConfig,
     set_current_vllm_config,
 )
-from vllm.logger import init_logger
 from vllm.v1.attention.backends.utils import (
     CommonAttentionMetadata,
     get_kv_cache_layout,
     set_kv_cache_layout,
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec
-
-logger = init_logger(f"vllm.{__name__}")
-
 
 # ============================================================================
 # Backend Configuration
@@ -80,20 +76,14 @@ def _get_backend_config(backend: str) -> dict:
 
 @contextmanager
 def log_warnings_and_errors_only():
-    """Temporarily set vLLM logger to WARNING level.
-
-    Preserves the benchmark logger so its INFO messages still appear.
-    """
-    vllm_logger = logging.getLogger("vllm")
-    old_level = vllm_logger.level
-    vllm_logger.setLevel(logging.WARNING)
-    # Keep benchmark loggers at INFO so kv_cache_dtype / correctness logs show.
-    bench_logger = logging.getLogger(f"vllm.{__name__}")
-    bench_logger.setLevel(logging.INFO)
+    """Temporarily set vLLM logger to WARNING level."""
+    logger = logging.getLogger("vllm")
+    old_level = logger.level
+    logger.setLevel(logging.WARNING)
     try:
         yield
     finally:
-        vllm_logger.setLevel(old_level)
+        logger.setLevel(old_level)
 
 
 # ============================================================================
@@ -106,12 +96,7 @@ def _build_common_attn_metadata(
     block_size: int,
     device: torch.device,
 ) -> CommonAttentionMetadata:
-    """Build CommonAttentionMetadata from requests.
-
-    slot_mapping places each new token j of request i at its correct sequence
-    position (context_len[i] + j), consistent with the block table, so that
-    the KV cache can be pre-populated with context without slot collisions.
-    """
+    """Build CommonAttentionMetadata from requests."""
     batch_size = len(requests)
     q_lens = [r.q_len for r in requests]
     kv_lens = [r.kv_len for r in requests]
@@ -167,14 +152,9 @@ def _create_vllm_config(
         max_model_len=1024,
     )
 
-    # Map benchmark kv_cache_dtype to vllm CacheConfig format:
-    # "bfloat16" -> "auto" (use model dtype), "fp8" -> "fp8"
-    vllm_cache_dtype = (
-        "auto" if config.kv_cache_dtype == "bfloat16" else config.kv_cache_dtype
-    )
     cache_config = CacheConfig(
         block_size=config.block_size,
-        cache_dtype=vllm_cache_dtype,
+        cache_dtype=config.kv_cache_dtype,
     )
     cache_config.num_gpu_blocks = max_num_blocks
     cache_config.num_cpu_blocks = 0
@@ -242,11 +222,6 @@ def _create_backend_impl(
 
     scale = get_attention_scale(config.head_dim)
 
-    # Map benchmark kv_cache_dtype to vllm format:
-    # "bfloat16" -> "auto" (use model dtype), "fp8" -> "fp8"
-    vllm_kv_cache_dtype = (
-        "auto" if config.kv_cache_dtype == "bfloat16" else config.kv_cache_dtype
-    )
     impl = backend_class.get_impl_cls()(
         num_heads=config.num_q_heads,
         head_size=config.head_dim,
@@ -254,7 +229,7 @@ def _create_backend_impl(
         num_kv_heads=config.num_kv_heads,
         alibi_slopes=None,
         sliding_window=None,
-        kv_cache_dtype=vllm_kv_cache_dtype,
+        kv_cache_dtype=config.kv_cache_dtype,
     )
 
     kv_cache_spec = FullAttentionSpec(
@@ -328,7 +303,7 @@ def _create_query_tensors(
     device: torch.device,
     dtype: torch.dtype,
 ) -> list[torch.Tensor]:
-    """Create Q input tensors for all layers.
+    """Create query tensors for all layers.
 
     When kv_cache_dtype is fp8, queries are cast to fp8 to match backends
     that require query/key/value dtype consistency (Triton, FlashInfer).
@@ -425,7 +400,7 @@ def _run_single_benchmark(
         total_q, config.num_q_heads, config.head_dim, device=device, dtype=dtype
     )
 
-    # Populate full KV cache with random data
+    # Populate KV cache with random data
     populate_std_kv_cache(
         impl,
         layer,
@@ -549,11 +524,7 @@ def run_attention_benchmark(
     backend_cfg = _get_backend_config(config.backend)
     backend_class = backend_cfg["backend_class"]
 
-    # Map benchmark kv_cache_dtype to vllm format for the support check.
-    vllm_kv_dtype = (
-        "auto" if config.kv_cache_dtype == "bfloat16" else config.kv_cache_dtype
-    )
-    if not backend_class.supports_kv_cache_dtype(vllm_kv_dtype):
+    if not backend_class.supports_kv_cache_dtype(config.kv_cache_dtype):
         raise ValueError(
             f"{config.backend} does not support kv_cache_dtype="
             f"'{config.kv_cache_dtype}'"

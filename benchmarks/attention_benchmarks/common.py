@@ -110,8 +110,8 @@ class MockKVBProj:
             x: Input tensor [num_tokens, kv_lora_rank]
 
         Returns:
-            (output, None) matching the ColumnParallelLinear API,
-            where output has shape [num_tokens, num_heads * out_dim].
+            Tuple containing output tensor
+                [num_tokens, num_heads, qk_nope_head_dim + v_head_dim]
         """
         if self._use_real_weight:
             return (
@@ -248,8 +248,8 @@ class BenchmarkConfig:
     qk_rope_head_dim: int | None = None
     v_head_dim: int | None = None
 
-    # "bfloat16" or "fp8"
-    kv_cache_dtype: str = "bfloat16"
+    # "auto" or "fp8"
+    kv_cache_dtype: str = "auto"
 
     # Backend-specific tuning
     num_kv_splits: int | None = None  # CUTLASS MLA

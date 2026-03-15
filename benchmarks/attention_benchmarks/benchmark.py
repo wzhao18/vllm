@@ -503,9 +503,9 @@ def main():
     parser.add_argument("--profile-memory", action="store_true", help="Profile memory")
     parser.add_argument(
         "--kv-cache-dtype",
-        default="bfloat16",
-        choices=["bfloat16", "fp8"],
-        help="KV cache dtype: bfloat16 or fp8",
+        default="auto",
+        choices=["auto", "fp8"],
+        help="KV cache dtype: auto (use model dtype) or fp8",
     )
     parser.add_argument(
         "--cuda-graphs",
