@@ -22,6 +22,8 @@ from common import (
     check_close,
     compute_std_attn_reference,
     get_attention_scale,
+    populate_std_kv_cache,
+    read_std_kv_cache,
 )
 
 from vllm.config import (
@@ -35,12 +37,16 @@ from vllm.config import (
     VllmConfig,
     set_current_vllm_config,
 )
+from vllm.logger import init_logger
 from vllm.v1.attention.backends.utils import (
     CommonAttentionMetadata,
     get_kv_cache_layout,
     set_kv_cache_layout,
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+logger = init_logger(f"vllm.{__name__}")
+
 
 # ============================================================================
 # Backend Configuration
@@ -74,14 +80,20 @@ def _get_backend_config(backend: str) -> dict:
 
 @contextmanager
 def log_warnings_and_errors_only():
-    """Temporarily set vLLM logger to WARNING level."""
-    logger = logging.getLogger("vllm")
-    old_level = logger.level
-    logger.setLevel(logging.WARNING)
+    """Temporarily set vLLM logger to WARNING level.
+
+    Preserves the benchmark logger so its INFO messages still appear.
+    """
+    vllm_logger = logging.getLogger("vllm")
+    old_level = vllm_logger.level
+    vllm_logger.setLevel(logging.WARNING)
+    # Keep benchmark loggers at INFO so kv_cache_dtype / correctness logs show.
+    bench_logger = logging.getLogger(f"vllm.{__name__}")
+    bench_logger.setLevel(logging.INFO)
     try:
         yield
     finally:
-        logger.setLevel(old_level)
+        vllm_logger.setLevel(old_level)
 
 
 # ============================================================================
@@ -155,9 +167,14 @@ def _create_vllm_config(
         max_model_len=1024,
     )
 
+    # Map benchmark kv_cache_dtype to vllm CacheConfig format:
+    # "bfloat16" -> "auto" (use model dtype), "fp8" -> "fp8"
+    vllm_cache_dtype = (
+        "auto" if config.kv_cache_dtype == "bfloat16" else config.kv_cache_dtype
+    )
     cache_config = CacheConfig(
         block_size=config.block_size,
-        cache_dtype="auto",
+        cache_dtype=vllm_cache_dtype,
     )
     cache_config.num_gpu_blocks = max_num_blocks
     cache_config.num_cpu_blocks = 0
@@ -225,6 +242,11 @@ def _create_backend_impl(
 
     scale = get_attention_scale(config.head_dim)
 
+    # Map benchmark kv_cache_dtype to vllm format:
+    # "bfloat16" -> "auto" (use model dtype), "fp8" -> "fp8"
+    vllm_kv_cache_dtype = (
+        "auto" if config.kv_cache_dtype == "bfloat16" else config.kv_cache_dtype
+    )
     impl = backend_class.get_impl_cls()(
         num_heads=config.num_q_heads,
         head_size=config.head_dim,
@@ -232,7 +254,7 @@ def _create_backend_impl(
         num_kv_heads=config.num_kv_heads,
         alibi_slopes=None,
         sliding_window=None,
-        kv_cache_dtype="auto",
+        kv_cache_dtype=vllm_kv_cache_dtype,
     )
 
     kv_cache_spec = FullAttentionSpec(
@@ -300,32 +322,28 @@ def _create_metadata_builder(
 # ============================================================================
 
 
-def _create_input_tensors(
+def _create_query_tensors(
     config: BenchmarkConfig,
     total_q: int,
     device: torch.device,
     dtype: torch.dtype,
-) -> tuple:
-    """Create Q, K, V input tensors for all layers."""
-    q_list = [
+) -> list[torch.Tensor]:
+    """Create Q input tensors for all layers.
+
+    When kv_cache_dtype is fp8, queries are cast to fp8 to match backends
+    that require query/key/value dtype consistency (Triton, FlashInfer).
+    """
+    q_dtype = dtype
+    if config.kv_cache_dtype == "fp8":
+        from vllm.platforms import current_platform
+
+        q_dtype = current_platform.fp8_dtype()
+    return [
         torch.randn(
             total_q, config.num_q_heads, config.head_dim, device=device, dtype=dtype
-        )
+        ).to(q_dtype)
         for _ in range(config.num_layers)
     ]
-    k_list = [
-        torch.randn(
-            total_q, config.num_kv_heads, config.head_dim, device=device, dtype=dtype
-        )
-        for _ in range(config.num_layers)
-    ]
-    v_list = [
-        torch.randn(
-            total_q, config.num_kv_heads, config.head_dim, device=device, dtype=dtype
-        )
-        for _ in range(config.num_layers)
-    ]
-    return q_list, k_list, v_list
 
 
 def _create_kv_cache(
@@ -339,6 +357,7 @@ def _create_kv_cache(
 
     Uses the backend's get_kv_cache_shape() and get_kv_cache_stride_order()
     to create the cache with the correct shape and memory layout.
+    Respects config.kv_cache_dtype for fp8 quantized caches.
     """
     # Get the logical shape from the backend
     cache_shape = backend_class.get_kv_cache_shape(
@@ -361,10 +380,17 @@ def _create_kv_cache(
     # Compute inverse permutation to get back to logical view
     inv_order = [stride_order.index(i) for i in range(len(stride_order))]
 
+    # Use fp8 dtype for cache when requested.
+    cache_dtype = dtype
+    if config.kv_cache_dtype == "fp8":
+        from vllm.platforms import current_platform
+
+        cache_dtype = current_platform.fp8_dtype()
+
     cache_list = []
     for _ in range(config.num_layers):
         # Allocate in physical layout order (contiguous in memory)
-        cache = torch.zeros(*physical_shape, device=device, dtype=dtype)
+        cache = torch.zeros(*physical_shape, device=device, dtype=cache_dtype)
         # Permute to logical view
         cache = cache.permute(*inv_order)
         cache_list.append(cache)
@@ -382,10 +408,11 @@ def _run_single_benchmark(
     impl,
     layer,
     q_list: list,
-    k_list: list,
-    v_list: list,
     cache_list: list,
     attn_metadata,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    requests: list,
     device: torch.device,
     dtype: torch.dtype,
     check_correctness: bool = False,
@@ -398,12 +425,29 @@ def _run_single_benchmark(
         total_q, config.num_q_heads, config.head_dim, device=device, dtype=dtype
     )
 
+    # Populate full KV cache with random data
+    populate_std_kv_cache(
+        impl,
+        layer,
+        cache_list,
+        block_table,
+        seq_lens,
+        config.block_size,
+        config.num_kv_heads,
+        config.head_dim,
+        dtype,
+    )
+
+    # Read new-token K/V from cache
+    block_size = config.block_size
     slot_mapping = attn_metadata.slot_mapping
-    for i in range(config.num_layers):
-        impl.do_kv_cache_update(
-            layer, k_list[i], v_list[i], cache_list[i], slot_mapping
-        )
-    torch.accelerator.synchronize()
+
+    k_list: list[torch.Tensor] = []
+    v_list: list[torch.Tensor] = []
+    for cache in cache_list:
+        k_new, v_new = read_std_kv_cache(cache, slot_mapping, block_size)
+        k_list.append(k_new)
+        v_list.append(v_new)
 
     # Correctness check on layer 0 before warmup.
     if check_correctness:
@@ -418,7 +462,12 @@ def _run_single_benchmark(
         )
         torch.accelerator.synchronize()
         ref = compute_std_attn_reference(
-            q_list[0], k_list[0], v_list[0], cache_list[0], attn_metadata
+            q_list[0],
+            k_list[0],
+            v_list[0],
+            cache_list[0],
+            block_table,
+            attn_metadata,
         )
         check_close(f"{config.backend} {config.batch_spec}", out, ref, atol, rtol)
 
@@ -498,6 +547,17 @@ def run_attention_benchmark(
     torch.accelerator.set_device_index(device)
 
     backend_cfg = _get_backend_config(config.backend)
+    backend_class = backend_cfg["backend_class"]
+
+    # Map benchmark kv_cache_dtype to vllm format for the support check.
+    vllm_kv_dtype = (
+        "auto" if config.kv_cache_dtype == "bfloat16" else config.kv_cache_dtype
+    )
+    if not backend_class.supports_kv_cache_dtype(vllm_kv_dtype):
+        raise ValueError(
+            f"{config.backend} does not support kv_cache_dtype="
+            f"'{config.kv_cache_dtype}'"
+        )
 
     requests = parse_batch_spec(config.batch_spec)
 
@@ -554,9 +614,7 @@ def run_attention_benchmark(
                 common_attn_metadata=common_metadata,
             )
 
-            q_list, k_list, v_list = _create_input_tensors(
-                config, total_q, device, dtype
-            )
+            q_list = _create_query_tensors(config, total_q, device, dtype)
 
             cache_list = _create_kv_cache(
                 config, max_num_blocks, backend_class, device, dtype
@@ -567,10 +625,11 @@ def run_attention_benchmark(
                 impl,
                 layer,
                 q_list,
-                k_list,
-                v_list,
                 cache_list,
                 attn_metadata,
+                common_metadata.block_table_tensor,
+                common_metadata.seq_lens,
+                requests,
                 device,
                 dtype,
                 check_correctness=check_correctness,

@@ -160,37 +160,6 @@ class MockIndexer:
         )
         self.topk_indices_buffer[:num_tokens] = indices
 
-    def fill_sequential_indices(
-        self,
-        num_reqs: int,
-        seq_lens: torch.Tensor,
-        query_start_loc: torch.Tensor,
-    ):
-        """Fill topk_indices_buffer with sequential 0..min(kv_len-1,topk-1) per request.
-
-        Used during correctness checks so the sparse reference can reproduce
-        exactly which positions the kernel attends to (first topk positions of
-        each request's KV cache).  Invalid positions are filled with -1.
-
-        Args:
-            num_reqs: Number of requests.
-            seq_lens: [num_reqs] int32 tensor of KV lengths.
-            query_start_loc: [num_reqs + 1] int32 tensor of query start positions.
-        """
-        seq_lens_list = seq_lens.cpu().tolist()
-        qsl_list = query_start_loc.cpu().tolist()
-        dev = self.topk_indices_buffer.device
-        for i in range(num_reqs):
-            kv_len = int(seq_lens_list[i])
-            q_start = int(qsl_list[i])
-            q_end = int(qsl_list[i + 1])
-            num_valid = min(kv_len, self.topk_tokens)
-            row = torch.full((self.topk_tokens,), -1, dtype=torch.int32, device=dev)
-            if num_valid > 0:
-                row[:num_valid] = torch.arange(num_valid, dtype=torch.int32, device=dev)
-            # Broadcast same row to all query tokens in this request
-            self.topk_indices_buffer[q_start:q_end] = row.unsqueeze(0)
-
 
 class MockLayer(AttentionLayerBase):
     """Mock attention layer with scale parameters and impl.
@@ -546,126 +515,191 @@ def is_mla_backend(backend: str) -> bool:
 # ============================================================================
 
 
-def populate_mla_kv_cache(
-    kv_cache: torch.Tensor,
-    prefill_inputs: dict,
-    metadata,
-    block_size: int,
+def _pack_fp8_ds_mla(
+    k_c: torch.Tensor,  # [N, kv_lora_rank] bfloat16
+    k_pe: torch.Tensor,  # [N, qk_rope_head_dim] bfloat16
     kv_lora_rank: int,
-    kv_cache_dtype: str,
-) -> None:
-    """Write new-token KV data into kv_cache at slot positions.
-
-    Handles bfloat16, fp8, and fp8_ds_mla (DeepSeek 656-byte packed format).
-    """
+) -> torch.Tensor:
+    """Pack k_c and k_pe into the 656-byte fp8_ds_mla token format."""
     from vllm.platforms import current_platform
 
-    _sm = metadata.slot_mapping
-    _blocks = (_sm // block_size).long()
-    _offsets = (_sm % block_size).long()
-    k_c = prefill_inputs["k_c_normed"]  # [total_tokens, kv_lora_rank]
-    k_p = prefill_inputs["k_pe"][:, 0, :]  # [total_tokens, qk_rope_head_dim]
-
-    if kv_cache_dtype == "fp8_ds_mla":
-        fp8_dtype = current_platform.fp8_dtype()
-        fp8_max = torch.finfo(fp8_dtype).max
-        k_c_f = k_c.float()
-        num_groups = kv_lora_rank // 128
-        fp8_parts: list[torch.Tensor] = []
-        scale_parts: list[torch.Tensor] = []
-        for j in range(num_groups):
-            chunk = k_c_f[:, j * 128 : (j + 1) * 128]
-            scale = chunk.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12) / fp8_max
-            scale_parts.append(scale.to(torch.float32))  # [N, 1] f32
-            fp8_parts.append((chunk / scale).to(fp8_dtype).view(torch.uint8))
-        fp8_bytes = torch.cat(fp8_parts, dim=-1)  # [N, kv_lora_rank] u8
-        scale_bytes = torch.cat(scale_parts, dim=-1).view(
-            torch.uint8
-        )  # [N, num_groups*4] u8
-        rope_bytes = k_p.to(torch.bfloat16).view(torch.uint8)  # [N, rope_dim*2] u8
-        token_data = torch.cat([fp8_bytes, scale_bytes, rope_bytes], dim=-1)
-        kv_cache[_blocks, _offsets] = token_data
-    elif kv_cache_dtype == "fp8":
-        fp8_dtype = current_platform.fp8_dtype()
-        kv_cache[_blocks, _offsets, :kv_lora_rank] = k_c.to(fp8_dtype)
-        kv_cache[_blocks, _offsets, kv_lora_rank:] = k_p.to(fp8_dtype)
-    else:  # bfloat16
-        kv_cache[_blocks, _offsets, :kv_lora_rank] = k_c.to(kv_cache.dtype)
-        kv_cache[_blocks, _offsets, kv_lora_rank:] = k_p.to(kv_cache.dtype)
-    torch.accelerator.synchronize()
+    fp8_dtype = current_platform.fp8_dtype()
+    fp8_max = torch.finfo(fp8_dtype).max
+    num_groups = kv_lora_rank // 128
+    k_c_float = k_c.float()
+    fp8_parts: list[torch.Tensor] = []
+    scale_parts: list[torch.Tensor] = []
+    for group in range(num_groups):
+        chunk = k_c_float[:, group * 128 : (group + 1) * 128]
+        scale = chunk.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12) / fp8_max
+        scale_parts.append(scale.to(torch.float32))
+        fp8_parts.append((chunk / scale).to(fp8_dtype).view(torch.uint8))
+    return torch.cat(
+        [
+            torch.cat(fp8_parts, dim=-1),  # [N, kv_lora_rank] u8
+            torch.cat(scale_parts, dim=-1).view(torch.uint8),  # [N, num_groups*4] u8
+            k_pe.to(torch.bfloat16).view(torch.uint8),  # [N, rope_dim*2] u8
+        ],
+        dim=-1,
+    )
 
 
-def populate_mla_kv_cache_full(
-    kv_cache: torch.Tensor,
+def block_table_to_slot_mapping(
     block_table: torch.Tensor,  # [batch_size, max_blocks_per_req] int32
     seq_lens: torch.Tensor,  # [batch_size] int32
     block_size: int,
-    kv_lora_rank: int,
-    qk_rope_head_dim: int,
-    kv_cache_dtype: str,
-) -> None:
-    """Write random KV data into ALL kv_cache positions.
+) -> torch.Tensor:
+    """Build a flat slot_mapping from a block table and per-request sequence lengths.
 
-    Unlike populate_mla_kv_cache (which only writes new-token positions via
-    slot_mapping), this writes positions 0..kv_len-1 for every request using
-    block_table for addressing.  Required for sparse backends where the indexer
-    can attend to any context position, not just the newly written token slot.
-
-    Handles bfloat16, fp8, and fp8_ds_mla kv_cache formats.
+    Returns an int64 tensor of shape [total_tokens] where each entry is the
+    physical slot index (block_index * block_size + offset_within_block) for
+    that token position across all requests concatenated in order.
     """
-    from vllm.platforms import current_platform
-
-    device = kv_cache.device
-    num_reqs = block_table.shape[0]
-
-    # Collect (block, offset) pairs for all token positions across all requests.
-    blk_list: list[torch.Tensor] = []
-    off_list: list[torch.Tensor] = []
-    for i in range(num_reqs):
-        kv_len = int(seq_lens[i].item())
+    device = block_table.device
+    slot_list: list[torch.Tensor] = []
+    for req in range(block_table.shape[0]):
+        kv_len = int(seq_lens[req].item())
         if kv_len == 0:
             continue
-        t = torch.arange(kv_len, device=device)
-        blk_list.append(block_table[i, t // block_size].long())
-        off_list.append((t % block_size).long())
-
-    if not blk_list:
-        return
-
-    _blk = torch.cat(blk_list)
-    _off = torch.cat(off_list)
-    total = int(_blk.shape[0])
-
-    k_c = torch.randn(total, kv_lora_rank, dtype=torch.bfloat16, device=device) * 0.1
-    k_pe = (
-        torch.randn(total, qk_rope_head_dim, dtype=torch.bfloat16, device=device) * 0.1
+        positions = torch.arange(kv_len, device=device)
+        block_indices = block_table[req, positions // block_size].long()
+        slots = block_indices * block_size + (positions % block_size)
+        slot_list.append(slots)
+    return (
+        torch.cat(slot_list)
+        if slot_list
+        else torch.empty(0, dtype=torch.int64, device=device)
     )
 
+
+def populate_mla_kv_cache(
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,  # [num_reqs, max_blocks_per_req] int32
+    seq_lens: torch.Tensor,  # [num_reqs] int32
+    block_size: int,
+    mla_dims: dict,
+    kv_cache_dtype: str,
+) -> None:
+    """Generate random KV data and write to kv_cache."""
+    from vllm.platforms import current_platform
+
+    slot_mapping = block_table_to_slot_mapping(block_table, seq_lens, block_size)
+
+    kv_lora_rank = mla_dims["kv_lora_rank"]
+    qk_rope_head_dim = mla_dims["qk_rope_head_dim"]
+    num_tokens = int(slot_mapping.shape[0])
+    device = kv_cache.device
+
+    k_c = (
+        torch.randn(
+            num_tokens,
+            kv_lora_rank,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.1
+    )
+    k_pe = (
+        torch.randn(
+            num_tokens,
+            qk_rope_head_dim,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.1
+    )
+
+    block_indices = (slot_mapping // block_size).long()
+    block_offsets = (slot_mapping % block_size).long()
+
     if kv_cache_dtype == "fp8_ds_mla":
-        fp8_dtype = current_platform.fp8_dtype()
-        fp8_max = torch.finfo(fp8_dtype).max
-        k_c_f = k_c.float()
-        num_groups = kv_lora_rank // 128
-        fp8_parts: list[torch.Tensor] = []
-        scale_parts: list[torch.Tensor] = []
-        for j in range(num_groups):
-            chunk = k_c_f[:, j * 128 : (j + 1) * 128]
-            scale = chunk.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12) / fp8_max
-            scale_parts.append(scale.to(torch.float32))
-            fp8_parts.append((chunk / scale).to(fp8_dtype).view(torch.uint8))
-        fp8_bytes = torch.cat(fp8_parts, dim=-1)
-        scale_bytes = torch.cat(scale_parts, dim=-1).view(torch.uint8)
-        rope_bytes = k_pe.to(torch.bfloat16).view(torch.uint8)
-        token_data = torch.cat([fp8_bytes, scale_bytes, rope_bytes], dim=-1)
-        kv_cache[_blk, _off] = token_data
+        kv_cache[block_indices, block_offsets] = _pack_fp8_ds_mla(
+            k_c, k_pe, kv_lora_rank
+        )
     elif kv_cache_dtype == "fp8":
         fp8_dtype = current_platform.fp8_dtype()
-        kv_cache[_blk, _off, :kv_lora_rank] = k_c.to(fp8_dtype)
-        kv_cache[_blk, _off, kv_lora_rank:] = k_pe.to(fp8_dtype)
+        kv_cache[block_indices, block_offsets, :kv_lora_rank] = k_c.to(fp8_dtype)
+        kv_cache[block_indices, block_offsets, kv_lora_rank:] = k_pe.to(fp8_dtype)
     else:  # bfloat16
-        kv_cache[_blk, _off, :kv_lora_rank] = k_c.to(kv_cache.dtype)
-        kv_cache[_blk, _off, kv_lora_rank:] = k_pe.to(kv_cache.dtype)
+        kv_cache[block_indices, block_offsets, :kv_lora_rank] = k_c.to(kv_cache.dtype)
+        kv_cache[block_indices, block_offsets, kv_lora_rank:] = k_pe.to(kv_cache.dtype)
     torch.accelerator.synchronize()
+
+
+def populate_std_kv_cache(
+    impl,
+    layer,
+    cache_list: list[torch.Tensor],
+    block_table: torch.Tensor,  # [num_reqs, max_blocks_per_req] int32
+    seq_lens: torch.Tensor,  # [num_reqs] int32
+    block_size: int,
+    num_kv_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+) -> None:
+    """Generate independent random KV data per layer and write to each cache.
+
+    Uses impl.do_kv_cache_update to write, so the cache format is
+    handled by the backend.
+    """
+    slot_mapping = block_table_to_slot_mapping(block_table, seq_lens, block_size)
+    total_kv = int(slot_mapping.shape[0])
+    device = cache_list[0].device
+
+    for cache in cache_list:
+        k_full = (
+            torch.randn(
+                total_kv,
+                num_kv_heads,
+                head_dim,
+                device=device,
+                dtype=dtype,
+            )
+            * 0.1
+        )
+        v_full = (
+            torch.randn(
+                total_kv,
+                num_kv_heads,
+                head_dim,
+                device=device,
+                dtype=dtype,
+            )
+            * 0.1
+        )
+        impl.do_kv_cache_update(layer, k_full, v_full, cache, slot_mapping)
+    torch.accelerator.synchronize()
+
+
+def _split_kv_cache(
+    cache: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split a standard KV cache into key and value caches.
+
+    Supports both FlashAttention layout [2, num_blocks, block_size, ...]
+    and Triton layout [num_blocks, 2, block_size, ...] by finding the
+    K/V split dimension (the one with size 2).
+    """
+    kv_dim = list(cache.shape).index(2)
+    return cache.unbind(kv_dim)
+
+
+def read_std_kv_cache(
+    cache: torch.Tensor,
+    slot_mapping: torch.Tensor,  # [num_tokens] int64
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Read K/V entries from a standard attention cache at the given slots.
+
+    Returns:
+        (k, v) each of shape [num_tokens, num_kv_heads, head_size].
+    """
+    key_cache, value_cache = _split_kv_cache(cache)
+    block_indices = (slot_mapping // block_size).long()
+    block_offsets = (slot_mapping % block_size).long()
+    k = key_cache[block_indices, block_offsets]
+    v = value_cache[block_indices, block_offsets]
+    return k, v
 
 
 def mla_kv_cache_to_bf16(
@@ -675,11 +709,6 @@ def mla_kv_cache_to_bf16(
 ) -> torch.Tensor:
     """Return a bfloat16 [num_blocks, block_size, kv_lora_rank+qk_rope_head_dim]
     tensor suitable for passing to compute_mqa_reference / compute_mha_reference.
-
-    For bfloat16 caches the original tensor is returned unchanged.
-    For fp8, standard dequantization via .float() is used.
-    For fp8_ds_mla the 656-byte packed format is decoded: 512 fp8 values
-    (with per-128 float32 scales) followed by 64 unquantized bfloat16 rope values.
     """
     if kv_cache_dtype not in ("fp8", "fp8_ds_mla"):
         return kv_cache
@@ -766,6 +795,25 @@ def check_close(
 # ---- MLA correctness helpers ----
 
 
+def _gather_kv_from_block_table(
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    req_idx: int,
+    positions: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    """Gather float32 KV cache entries for the given token positions of one request.
+
+    Args:
+        positions: 1-D int64 tensor of token positions within the request's KV sequence.
+    Returns:
+        float32 tensor of shape [len(positions), head_size].
+    """
+    block_indices = block_table[req_idx, positions // block_size].long()
+    block_offsets = (positions % block_size).long()
+    return kv_cache[block_indices, block_offsets].float()
+
+
 def compute_mqa_reference(
     decode_inputs,  # tuple (q_nope [T,N,L], q_pe [T,N,R]) or concat [T,N,L+R]
     kv_cache: torch.Tensor,  # [num_blocks, block_size, kv_lora_rank + qk_rope_head_dim]
@@ -775,9 +823,10 @@ def compute_mqa_reference(
     sparse_indices: torch.Tensor
     | None = None,  # [total_q, topk] per-request token indices
 ) -> torch.Tensor:
-    """SDPA reference for forward_mqa. Called after the forward pass.
+    """SDPA reference for forward_mqa.
 
-    Reads K/V directly from kv_cache (context=zeros, new token written by forward).
+    Reads K/V directly from kv_cache (all positions pre-populated with
+    random data).
     Returns [total_decode_tokens, num_q_heads, kv_lora_rank].
 
     When is_sparse=True, sparse_indices must be provided: a [total_q, topk] int32
@@ -827,11 +876,9 @@ def compute_mqa_reference(
                 )
                 continue
 
-            blk = block_table[i, valid_indices // block_size].long()
-            off = (valid_indices % block_size).long()
-            entries = kv_cache[
-                blk, off
-            ].float()  # [num_valid, kv_lora_rank+qk_rope_head_dim]
+            entries = _gather_kv_from_block_table(
+                kv_cache, block_table, i, valid_indices, block_size
+            )  # [num_valid, kv_lora_rank+qk_rope_head_dim]
 
             k_sparse = entries.unsqueeze(1).expand(-1, num_q_heads, -1)
             v_sparse = (
@@ -868,10 +915,10 @@ def compute_mqa_reference(
         kv_len = int(seq_lens[i].item())
         ctx_len = kv_len - (q_end - q_start)
 
-        t = torch.arange(kv_len, device=device)
-        blk = block_table[i, t // block_size].long()
-        off = (t % block_size).long()
-        entries = kv_cache[blk, off].float()  # [kv_len, L+R]
+        positions = torch.arange(kv_len, device=device)
+        entries = _gather_kv_from_block_table(
+            kv_cache, block_table, i, positions, block_size
+        )  # [kv_len, kv_lora_rank+qk_rope_head_dim]
         kv_c = entries[:, :kv_lora_rank]
         k_pe = entries[:, kv_lora_rank:]
 
@@ -891,9 +938,7 @@ def compute_mha_reference(
     kv_b_proj_weight: torch.Tensor,  # [N*(qk_nope_head_dim + v_head_dim), kv_lora_rank]
     mla_dims: dict,
 ) -> torch.Tensor:
-    """SDPA reference for forward_mha. Called after the forward pass.
-
-    Reads K/V directly from kv_cache (context=zeros, new tokens written by forward).
+    """SDPA reference for forward_mha.
     Returns [total_prefill_tokens, N * v_head_dim].
     """
     device = kv_cache.device
@@ -923,10 +968,10 @@ def compute_mha_reference(
             ctx_len = 0
         kv_len = q_len + ctx_len
 
-        t = torch.arange(kv_len, device=device)
-        blk = block_table[i, t // block_size].long()
-        off = (t % block_size).long()
-        entries = kv_cache[blk, off].float()  # [kv_len, L+R]
+        positions = torch.arange(kv_len, device=device)
+        entries = _gather_kv_from_block_table(
+            kv_cache, block_table, i, positions, block_size
+        )  # [kv_len, kv_lora_rank+qk_rope_head_dim]
         kv_c_seq = entries[:, :kv_lora_rank]
         k_pe_seq = entries[:, kv_lora_rank:]
 
@@ -990,24 +1035,24 @@ def _extract_seq_info(
 
 def compute_std_attn_reference(
     q: torch.Tensor,  # [total_q, num_q_heads, head_size]
-    k_new: torch.Tensor,  # [total_q, num_kv_heads, head_size]
-    v_new: torch.Tensor,  # [total_q, num_kv_heads, head_size]
-    cache: torch.Tensor,  # kv_cache (unused; context is zero-initialized)
+    k_new: torch.Tensor,  # [total_q, num_kv_heads, head_size] (already in cache)
+    v_new: torch.Tensor,  # [total_q, num_kv_heads, head_size] (already in cache)
+    cache: torch.Tensor,
+    block_table: torch.Tensor,  # [num_reqs, max_blocks_per_req]
     attn_metadata,
 ) -> torch.Tensor:
     """Per-request causal SDPA reference. Returns [total_q, num_q_heads, head_size].
 
-    Takes the same inputs as impl.forward (minus layer/output). Context
-    positions are zero-initialized (cache starts at zero, context is never
-    written), so the reference constructs context K/V as zeros directly —
-    no cache reading required, which avoids backend-specific cache layouts.
-    New token K/V come from k_new/v_new (same values written to cache by
-    impl.do_kv_cache_update before impl.forward is called).
+    Takes the same inputs as impl.forward (plus block_table for cache reads).
+    k_new/v_new are already written to the cache by impl.forward, so the
+    reference reads everything from the cache.
     """
     device = q.device
     scale = 1.0 / math.sqrt(q.shape[-1])
-    num_kv_heads = k_new.shape[1]
-    head_size = k_new.shape[2]
+    key_cache, value_cache = _split_kv_cache(cache)
+    # key_cache: [num_blocks, block_size, num_kv_heads, head_size]
+    block_size = key_cache.shape[1]
+    num_kv_heads = key_cache.shape[2]
     seq_lens, query_start_loc = _extract_seq_info(attn_metadata, device)
     batch_size = int(seq_lens.shape[0])
     head_rep = q.shape[1] // num_kv_heads
@@ -1017,20 +1062,15 @@ def compute_std_attn_reference(
         q_end = int(query_start_loc[i + 1].item())
         kv_len = int(seq_lens[i].item())
         ctx_len = kv_len - (q_end - q_start)
-        qi = q[q_start:q_end]
-        ki_new = k_new[q_start:q_end]
-        vi_new = v_new[q_start:q_end]
-        if ctx_len > 0:
-            zeros_k = torch.zeros(
-                ctx_len, num_kv_heads, head_size, dtype=k_new.dtype, device=device
-            )
-            zeros_v = torch.zeros(
-                ctx_len, num_kv_heads, head_size, dtype=v_new.dtype, device=device
-            )
-            ki = torch.cat([zeros_k, ki_new], dim=0)
-            vi = torch.cat([zeros_v, vi_new], dim=0)
-        else:
-            ki, vi = ki_new, vi_new
+
+        # Gather full-sequence K/V from cache via block table.
+        positions = torch.arange(kv_len, device=device)
+        blk_idx = block_table[i, positions // block_size].long()
+        blk_off = (positions % block_size).long()
+        ki = key_cache[blk_idx, blk_off].float()  # [kv_len, num_kv_heads, head_size]
+        vi = value_cache[blk_idx, blk_off].float()
+
+        qi = q[q_start:q_end].float()
         if head_rep > 1:
             ki = ki.repeat_interleave(head_rep, dim=1)
             vi = vi.repeat_interleave(head_rep, dim=1)
