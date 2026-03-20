@@ -527,8 +527,9 @@ def make_fp8_moe_quant_config(
             is_nvfp4_scale_swizzled=False,
         )
 
-    # Flashinfer TRTLLM FP8 block-scale requires a_scale in column-major layout:
-    # [hidden_size // 128, seq_len]
+    # Flashinfer TRTLLM FP8 block-scale requires a_scale to have layout:
+    # [hidden_size // 128, seq_len] thus set is_fp8_a_scale_column_major=True
+    # to produce a_scale in column-major layout if possible.
     if fp8_backend == Fp8MoeBackend.FLASHINFER_TRTLLM and block_shape is not None:
         return FusedMoEQuantConfig.make(
             torch.float8_e4m3fn,
