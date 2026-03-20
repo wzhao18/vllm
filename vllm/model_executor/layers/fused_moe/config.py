@@ -229,6 +229,7 @@ class FusedMoEQuantConfig:
     _w1: FusedMoEQuantDesc
     _w2: FusedMoEQuantDesc
     is_nvfp4_scale_swizzled: bool = True
+    is_fp8_a_scale_column_major: bool = False
 
     def __post_init__(self):
         assert not self.per_act_token_quant or self.block_shape is None, (
@@ -477,6 +478,7 @@ class FusedMoEQuantConfig:
         w2_zp: torch.Tensor | None = None,
         weight_dtype: torch.dtype | str | None = None,
         is_nvfp4_scale_swizzled: bool = True,
+        is_fp8_a_scale_column_major: bool = False,
     ) -> "FusedMoEQuantConfig":
         """
         General builder function for a FusedMoEQuantConfig.
@@ -507,6 +509,10 @@ class FusedMoEQuantConfig:
         - w1_zp: Optional w1 zero points for int4/int8 quantization.
         - w2_zp: Optional w2 zero points for int4/int8 quantization.
         - is_nvfp4_scale_swizzled: Whether to swizzle the nvfp4 scale swizzling.
+        - is_fp8_a_scale_column_major: Whether to produce a_scale in column major
+        from prepare() as input to the MoE kernel. This is useful for MoE
+        backends that requires transposed a_scale. This is opportunistic and not
+        necessary for PrepareAndFinalize backends.
         """
         assert not isinstance(quant_dtype, str) or quant_dtype in {
             "nvfp4",
@@ -540,6 +546,7 @@ class FusedMoEQuantConfig:
                 weight_dtype, w_shape, w2_scale, g2_alphas, w2_zp, w2_bias
             ),
             is_nvfp4_scale_swizzled=is_nvfp4_scale_swizzled,
+            is_fp8_a_scale_column_major=is_fp8_a_scale_column_major,
         )
         assert quant_config.per_act_token_quant == per_act_token_quant
         assert quant_config.per_out_ch_quant == per_out_ch_quant

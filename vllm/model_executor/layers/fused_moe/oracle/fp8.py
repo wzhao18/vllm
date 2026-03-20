@@ -527,6 +527,21 @@ def make_fp8_moe_quant_config(
             is_nvfp4_scale_swizzled=False,
         )
 
+    # Flashinfer TRTLLM FP8 block-scale requires a_scale in column-major layout:
+    # [hidden_size // 128, seq_len]
+    if fp8_backend == Fp8MoeBackend.FLASHINFER_TRTLLM and block_shape is not None:
+        return FusedMoEQuantConfig.make(
+            torch.float8_e4m3fn,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            a1_scale=a1_scale,
+            a2_scale=a2_scale,
+            block_shape=block_shape,
+            per_act_token_quant=per_act_token_quant,
+            per_out_ch_quant=per_out_ch_quant,
+            is_fp8_a_scale_column_major=True,
+        )
+
     # All other backends use normal config.
     return fp8_w8a8_moe_quant_config(
         w1_scale=w1_scale,
