@@ -127,6 +127,7 @@ def _fp8_quantize(
     A_scale: torch.Tensor | None,
     per_act_token: bool,
     block_shape: list[int] | None = None,
+    column_major_scales: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Perform fp8 quantization on the inputs.  If a block_shape
@@ -142,7 +143,9 @@ def _fp8_quantize(
         assert not per_act_token
         assert len(block_shape) == 2
         _, block_k = block_shape[0], block_shape[1]
-        A, A_scale = per_token_group_quant_fp8(A, block_k)
+        A, A_scale = per_token_group_quant_fp8(
+            A, block_k, column_major_scales=column_major_scales
+        )
         assert cdiv(A.size(-1), block_k) == A_scale.size(-1)
 
     return A, A_scale
@@ -252,6 +255,7 @@ def moe_kernel_quantize_input(
     per_act_token_quant: bool,
     block_shape: list[int] | None = None,
     is_fp4_scale_swizzled: bool = True,
+    fp8_column_major_scales: bool = False,
     ocp_mx_scheme: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     # Handle OCP MX scheme that requires QDQ (quantize-dequantize) for emulation
@@ -274,7 +278,13 @@ def moe_kernel_quantize_input(
         # activation quantization below.
 
     if quant_dtype == current_platform.fp8_dtype():
-        return _fp8_quantize(A, A_scale, per_act_token_quant, block_shape)
+        return _fp8_quantize(
+            A,
+            A_scale,
+            per_act_token_quant,
+            block_shape,
+            column_major_scales=fp8_column_major_scales,
+        )
     elif quant_dtype == torch.int8:
         return _int8_quantize(A, A_scale, per_act_token_quant, block_shape)
     elif quant_dtype == "nvfp4":

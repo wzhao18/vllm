@@ -31,6 +31,7 @@ def _quantize_input(
         per_act_token_quant=quant_config.per_act_token_quant,
         block_shape=quant_config.block_shape,
         is_fp4_scale_swizzled=quant_config.is_nvfp4_scale_swizzled,
+        fp8_column_major_scales=quant_config.is_fp8_a_scale_column_major,
     )
 
     return a1q, a1q_scale
