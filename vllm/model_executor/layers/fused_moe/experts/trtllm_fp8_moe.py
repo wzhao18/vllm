@@ -152,7 +152,7 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
         apply_router_weight_on_input: bool,
     ):
         import flashinfer
-        from flashinfer.fused_moe import Fp8QuantizationType
+        from flashinfer.fused_moe import Fp8QuantizationType, WeightLayout
 
         # Pack topk ids and weights into format expected by the kernel.
         packed_topk_ids = trtllm_moe_pack_topk_ids_weights(topk_ids, topk_weights)
@@ -170,11 +170,24 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
         if is_mxfp8:
             fp8_quant_type = Fp8QuantizationType.MxFp8
             use_shuffled_weight = True
+            weight_layout = WeightLayout.MajorK.value
             hidden_states_scale = a1q_scale
         else:
             fp8_quant_type = Fp8QuantizationType.DeepSeekFp8
-            use_shuffled_weight = False
+            use_shuffled_weight = True
+            weight_layout = WeightLayout.BlockMajorK.value
             hidden_states_scale = a1q_scale.t().contiguous()
+
+        # BlockMajorK weights are stored as 3D (E, Mn, K) to keep vLLM's
+        # weight-shape infrastructure happy, but the kernel's check_moe()
+        # requires the 4D layout (E, K/bk, Mn, bk).  Reshape here; this is a
+        # zero-copy view because the bytes are already in BlockMajorK order.
+        if weight_layout == WeightLayout.BlockMajorK.value:
+            block_k = 128
+            E, Mn1, K1 = w1.shape
+            w1 = w1.reshape(E, K1 // block_k, Mn1, block_k)
+            E, Mn2, K2 = w2.shape
+            w2 = w2.reshape(E, K2 // block_k, Mn2, block_k)
 
         # `trtllm_fp8_block_scale_routed_moe` has a bug and does not write to the
         # output tensor in-place so we need to manually copy the result to the
@@ -199,7 +212,7 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
             routed_scaling_factor=None,
             routing_method_type=1,
             use_shuffled_weight=use_shuffled_weight,
-            weight_layout=0,
+            weight_layout=weight_layout,
             fp8_quantization_type=fp8_quant_type,
             # output=output,
         )
@@ -322,7 +335,7 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
         topk_group: int | None = None,
     ) -> torch.Tensor:
         import flashinfer
-        from flashinfer.fused_moe import Fp8QuantizationType
+        from flashinfer.fused_moe import Fp8QuantizationType, WeightLayout
 
         assert not apply_router_weight_on_input
         assert activation == MoEActivation.SILU
@@ -342,11 +355,21 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
         if is_mxfp8:
             fp8_quant_type = Fp8QuantizationType.MxFp8
             use_shuffled_weight = True
+            weight_layout = WeightLayout.MajorK.value
             hidden_states_scale = a1q_scale
         else:
             fp8_quant_type = Fp8QuantizationType.DeepSeekFp8
-            use_shuffled_weight = False
+            use_shuffled_weight = True
+            weight_layout = WeightLayout.BlockMajorK.value
             hidden_states_scale = a1q_scale.t().contiguous()
+
+        # BlockMajorK weights are stored as 3D; reshape to 4D for the kernel.
+        if weight_layout == WeightLayout.BlockMajorK.value:
+            block_k = 128
+            E, Mn1, K1 = w1.shape
+            w1 = w1.reshape(E, K1 // block_k, Mn1, block_k)
+            E, Mn2, K2 = w2.shape
+            w2 = w2.reshape(E, K2 // block_k, Mn2, block_k)
 
         return flashinfer.fused_moe.trtllm_fp8_block_scale_moe(
             routing_logits=router_logits,
@@ -367,6 +390,7 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
             routed_scaling_factor=routed_scaling_factor,
             routing_method_type=self.routing_method_type,
             use_shuffled_weight=use_shuffled_weight,
+            weight_layout=weight_layout,
             fp8_quantization_type=fp8_quant_type,
         )
 
