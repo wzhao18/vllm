@@ -112,6 +112,38 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
         ]
         return (weight_key, activation_key) in SUPPORTED_W_A
 
+    def moe_problem_size(
+        self,
+        a1: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> tuple[int, int, int, int, int]:
+        """Override to handle 4D BlockMajorK weights (E, K/bk, Mn, bk)
+        in addition to the standard 3D layout (E, Mn, K)."""
+        if w1.dim() == 4:
+            # BlockMajorK: (E, K/bk, Mn, bk)
+            E = w1.shape[0]
+            N = w1.shape[2]  # Mn dimension
+        else:
+            assert w1.dim() == 3
+            E, N, _ = w1.shape
+
+        K = a1.size(-1)
+
+        if a1.dim() == 2:
+            assert topk_ids.size(0) == a1.size(0)
+            M = a1.size(0)
+        else:
+            assert a1.dim() == 3
+            assert a1.size(0) == E
+            M = a1.size(1)
+
+        assert topk_ids.dim() == 2
+        topk = topk_ids.size(1)
+
+        return E, M, N, K, topk
+
     def workspace_shapes(
         self,
         M: int,
@@ -170,24 +202,13 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
         if is_mxfp8:
             fp8_quant_type = Fp8QuantizationType.MxFp8
             use_shuffled_weight = True
-            weight_layout = WeightLayout.MajorK.value
+            weight_layout = WeightLayout.MajorK
             hidden_states_scale = a1q_scale
         else:
             fp8_quant_type = Fp8QuantizationType.DeepSeekFp8
             use_shuffled_weight = True
-            weight_layout = WeightLayout.BlockMajorK.value
+            weight_layout = WeightLayout.BlockMajorK
             hidden_states_scale = a1q_scale.t().contiguous()
-
-        # BlockMajorK weights are stored as 3D (E, Mn, K) to keep vLLM's
-        # weight-shape infrastructure happy, but the kernel's check_moe()
-        # requires the 4D layout (E, K/bk, Mn, bk).  Reshape here; this is a
-        # zero-copy view because the bytes are already in BlockMajorK order.
-        if weight_layout == WeightLayout.BlockMajorK.value:
-            block_k = 128
-            E, Mn1, K1 = w1.shape
-            w1 = w1.reshape(E, K1 // block_k, Mn1, block_k)
-            E, Mn2, K2 = w2.shape
-            w2 = w2.reshape(E, K2 // block_k, Mn2, block_k)
 
         # `trtllm_fp8_block_scale_routed_moe` has a bug and does not write to the
         # output tensor in-place so we need to manually copy the result to the
@@ -355,21 +376,13 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
         if is_mxfp8:
             fp8_quant_type = Fp8QuantizationType.MxFp8
             use_shuffled_weight = True
-            weight_layout = WeightLayout.MajorK.value
+            weight_layout = WeightLayout.MajorK
             hidden_states_scale = a1q_scale
         else:
             fp8_quant_type = Fp8QuantizationType.DeepSeekFp8
             use_shuffled_weight = True
-            weight_layout = WeightLayout.BlockMajorK.value
+            weight_layout = WeightLayout.BlockMajorK
             hidden_states_scale = a1q_scale.t().contiguous()
-
-        # BlockMajorK weights are stored as 3D; reshape to 4D for the kernel.
-        if weight_layout == WeightLayout.BlockMajorK.value:
-            block_k = 128
-            E, Mn1, K1 = w1.shape
-            w1 = w1.reshape(E, K1 // block_k, Mn1, block_k)
-            E, Mn2, K2 = w2.shape
-            w2 = w2.reshape(E, K2 // block_k, Mn2, block_k)
 
         return flashinfer.fused_moe.trtllm_fp8_block_scale_moe(
             routing_logits=router_logits,

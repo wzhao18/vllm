@@ -312,15 +312,17 @@ def _shuffle_deepseek_fp8_moe_weights(
     """Preprocess DeepSeek FP8 block-scale weights for the FlashInfer TRT-LLM
     kernel using the shuffle + BlockMajorK layout variant.
 
+    Following flashinfer/tests/moe/test_trtllm_gen_fused_moe.py
+    FP8BlockScaleMoe.prepare_static_weights_for_kernel:
+
     Per expert:
       1. shuffle_matrix_a          (epilogue_tile_m=64 for DeepSeekFp8)
       2. convert_to_block_layout   (block_k=128)
 
     Scales are left unchanged — DeepSeekFp8 does not shuffle scales.
 
-    The output tensors are reshaped back to their original 3D shapes
-    (num_experts, rows, cols) so vLLM's shape assertions remain satisfied.
-    The kernel interprets the raw bytes via weight_layout=BlockMajorK.
+    Returns 4D weight tensors in BlockMajorK layout
+    (E, K/block_k, Mn, block_k) matching the format the kernel expects.
     """
     from flashinfer import shuffle_matrix_a
     from flashinfer.fused_moe import convert_to_block_layout
@@ -340,15 +342,11 @@ def _shuffle_deepseek_fp8_moe_weights(
         t2 = convert_to_block_layout(t2, block_k)
         w2_shuffled.append(t2)
 
-    # convert_to_block_layout turns each per-expert weight from 2D (Mn, K) to
-    # 3D (K/bk, Mn, bk), making the stacked result 4D.  Reshape back to the
-    # original 3D shape (E, Mn, K) so vLLM's weight-shape infrastructure
-    # (moe_problem_size, deep_gemm_warmup, etc.) stays intact.  The kernel
-    # call site reshapes to 4D again just before dispatch; because the tensor
-    # is contiguous this is a zero-copy view and the BlockMajorK byte order
-    # written by convert_to_block_layout is preserved end-to-end.
-    w13_out = torch.stack(w13_shuffled).view(torch.float8_e4m3fn).reshape(w13.shape)
-    w2_out = torch.stack(w2_shuffled).view(torch.float8_e4m3fn).reshape(w2.shape)
+    # Stack and view as fp8. Result is 4D: (E, K/block_k, Mn, block_k).
+    # This matches the test reference which passes 4D weights directly
+    # to the kernel.
+    w13_out = torch.stack(w13_shuffled).view(torch.float8_e4m3fn)
+    w2_out = torch.stack(w2_shuffled).view(torch.float8_e4m3fn)
     return w13_out, w2_out
 
 
