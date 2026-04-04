@@ -119,30 +119,16 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
         w2: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> tuple[int, int, int, int, int]:
-        """Override to handle 4D BlockMajorK weights (E, K/bk, Mn, bk)
-        in addition to the standard 3D layout (E, Mn, K)."""
+        """Override to handle 4D BlockMajorK weights (E, K/bk, Mn, bk)."""
         if w1.dim() == 4:
             # BlockMajorK: (E, K/bk, Mn, bk)
             E = w1.shape[0]
-            N = w1.shape[2]  # Mn dimension
-        else:
-            assert w1.dim() == 3
-            E, N, _ = w1.shape
-
-        K = a1.size(-1)
-
-        if a1.dim() == 2:
-            assert topk_ids.size(0) == a1.size(0)
-            M = a1.size(0)
-        else:
-            assert a1.dim() == 3
-            assert a1.size(0) == E
-            M = a1.size(1)
-
-        assert topk_ids.dim() == 2
-        topk = topk_ids.size(1)
-
-        return E, M, N, K, topk
+            N = w1.shape[2]
+            K = a1.size(-1)
+            M = a1.size(0) if a1.dim() == 2 else a1.size(1)
+            topk = topk_ids.size(1)
+            return E, M, N, K, topk
+        return super().moe_problem_size(a1, w1, w2, topk_ids)
 
     def workspace_shapes(
         self,
