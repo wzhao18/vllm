@@ -925,55 +925,23 @@ class FusedMoE(CustomOp):
         # Index the loaded weight for tp sharding.
         # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
         if self.moe_config.is_act_and_mul:
-            # padded_shard_size: used to split expert_data into w1/w3 halves.
-            # May be larger than the true intermediate size when block-quant
-            # padding rounds up the allocation.
             padded_shard_size = expert_data.shape[shard_dim] // 2
         else:
             padded_shard_size = expert_data.shape[shard_dim]
 
-        # checkpoint_shard_size: used to compute the TP slice offset into the
-        # on-disk weight.  When the allocation was padded for block-quant
-        # alignment we must use the original (unpadded) size so that every TP
-        # rank reads the correct rows from the checkpoint.
-        unpadded = self.moe_config.intermediate_size_per_partition_unpadded
-        padded = self.moe_config.intermediate_size_per_partition
-        is_scale_with_padding = False
-        if (
-            unpadded is not None
-            and unpadded != padded
-            and expert_data.shape[shard_dim] == 2 * padded
-        ):
-            # This is the actual weight tensor (not a scale): use the unpadded
-            # size so each TP rank loads the correct number of rows.
-            checkpoint_shard_size = unpadded
-        else:
-            checkpoint_shard_size = padded_shard_size
-            # If padding was applied and this is a scale tensor (shape is
-            # smaller than the weight allocation), the TP start offset in the
-            # checkpoint scale must use the block-aligned formula because
-            # unpadded is not a multiple of block_n.
-            if unpadded is not None and unpadded != padded:
-                is_scale_with_padding = True
-
         # Only narrow if the loaded_weight is not a scalar (0-dim tensor)
         # and we're not loading the full weight
         if not load_full and loaded_weight.ndim > 0:
-            if is_scale_with_padding and padded_shard_size > 0:
-                # Scale tensor: block boundaries don't coincide with TP
-                # partition boundaries when unpadded % block_n != 0.
-                # Each rank's rows start at global row tp_rank*unpadded, so
-                # the first scale block is (tp_rank*unpadded) // block_n.
-                # block_n = padded / (padded // block_n) = padded / padded_shard_size
-                block_n = padded // padded_shard_size
-                start_offset = (tp_rank * unpadded) // block_n
-            else:
-                start_offset = checkpoint_shard_size * tp_rank
+            checkpoint_shard_size, start_offset = (
+                self.quant_method.get_checkpoint_shard_info(
+                    expert_data, shard_dim, shard_id, tp_rank,
+                    padded_shard_size,
+                )
+            )
             available = loaded_weight.shape[shard_dim] - start_offset
             if available <= 0:
-                # If there is no available weight to load for this TP rank
-                # (can happen on last TP rank with padding), we can skip
-                # loading and return early
+                # No available weight for this TP rank (can happen on last
+                # TP rank with padding) — skip loading.
                 return
             narrow_size = min(checkpoint_shard_size, available)
             loaded_weight = loaded_weight.narrow(shard_dim, start_offset, narrow_size)
@@ -1006,48 +974,21 @@ class FusedMoE(CustomOp):
     ):
         # Index the loaded weight for tp sharding.
         # down_proj: "RowParallel" so tp sharding on input_dim
-        # Narrow parameter and load.
         padded_shard_size = expert_data.shape[shard_dim]
-
-        # When block-quant padding enlarged the allocation, use the original
-        # (unpadded) intermediate size as the TP slice width so each rank
-        # reads the correct rows from the checkpoint.  Scale tensors have a
-        # much smaller dimension (num_scale_blocks << intermediate_size) so
-        # the condition expert_data.shape[shard_dim] == padded only matches
-        # the actual weight tensor.
-        unpadded = self.moe_config.intermediate_size_per_partition_unpadded
-        padded = self.moe_config.intermediate_size_per_partition
-        is_scale_with_padding = False
-        if (
-            unpadded is not None
-            and unpadded != padded
-            and expert_data.shape[shard_dim] == padded
-        ):
-            checkpoint_shard_size = unpadded
-        else:
-            checkpoint_shard_size = padded_shard_size
-            # If padding was applied and this is a scale tensor (dimension is
-            # smaller than the padded weight size), use the block-aligned
-            # offset formula because unpadded is not a multiple of block_n.
-            if unpadded is not None and unpadded != padded:
-                is_scale_with_padding = True
 
         # Only narrow if the loaded_weight is not a scalar (0-dim tensor)
         # and we're not loading the full weight
         if not load_full and loaded_weight.ndim > 0:
-            if is_scale_with_padding and padded_shard_size > 0:
-                # Scale tensor: first block index for this rank is
-                # (tp_rank * unpadded) // block_n, where
-                # block_n = padded / padded_shard_size.
-                block_n = padded // padded_shard_size
-                start_offset = (tp_rank * unpadded) // block_n
-            else:
-                start_offset = checkpoint_shard_size * tp_rank
+            checkpoint_shard_size, start_offset = (
+                self.quant_method.get_checkpoint_shard_info(
+                    expert_data, shard_dim, "w2", tp_rank,
+                    padded_shard_size,
+                )
+            )
             available = loaded_weight.shape[shard_dim] - start_offset
             if available <= 0:
-                # If there is no available weight to load for this TP rank
-                # (can happen on last TP rank with padding), we can skip
-                # loading and return early
+                # No available weight for this TP rank (can happen on last
+                # TP rank with padding) — skip loading.
                 return
             narrow_size = min(checkpoint_shard_size, available)
             loaded_weight = loaded_weight.narrow(shard_dim, start_offset, narrow_size)

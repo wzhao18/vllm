@@ -64,6 +64,36 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         """
         return False
 
+    def get_checkpoint_shard_info(
+        self,
+        expert_data: torch.Tensor,
+        shard_dim: int,
+        shard_id: str,
+        tp_rank: int,
+        padded_shard_size: int,
+    ) -> tuple[int, int]:
+        """Return (checkpoint_shard_size, start_offset) for TP weight loading.
+
+        When quantization methods pad the intermediate dimension (e.g. for
+        block-alignment), checkpoint tensors are smaller than the padded
+        allocation.  Override this method to compute the correct slice into the
+        checkpoint for each TP rank.
+
+        Args:
+            expert_data: The (possibly padded) parameter tensor.
+            shard_dim: Dimension being sharded across TP ranks.
+            shard_id: One of "w1", "w2", "w3".
+            tp_rank: This rank's TP index.
+            padded_shard_size: Size of a single shard in the padded
+                allocation (already accounts for w1/w3 splitting).
+
+        Returns:
+            checkpoint_shard_size: Number of elements each TP rank reads
+                from the checkpoint along ``shard_dim``.
+            start_offset: Offset into the checkpoint tensor for this rank.
+        """
+        return padded_shard_size, padded_shard_size * tp_rank
+
     def maybe_roundup_sizes(
         self,
         hidden_size: int,
