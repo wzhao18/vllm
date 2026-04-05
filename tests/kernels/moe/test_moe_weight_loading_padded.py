@@ -296,7 +296,7 @@ class TestWeightLoadingWithPaddedHiddenSize:
 
 
 def _make_fused_moe_mock(*, is_act_and_mul: bool = True):
-    """Build a minimal ``FusedMoE`` mock for weight loading tests."""
+    """Build a FusedMoE mock for weight loading tests."""
     moe_module = MagicMock(spec=FusedMoE)
     moe_module.moe_config = MagicMock()
     moe_module.moe_config.is_act_and_mul = is_act_and_mul
@@ -308,15 +308,9 @@ def _make_fused_moe_mock(*, is_act_and_mul: bool = True):
     return moe_module
 
 
-class TestFp8BlockQuantPaddedHiddenAndIntermediateSize:
+class TestBlockQuantPaddedHiddenAndIntermediateSize:
     """Tests weight loading with padded hidden_size and intermediate_size
     across TP ranks.
-
-    When ``maybe_roundup_sizes`` pads ``intermediate_size_per_partition``
-    to the next ``block_n`` multiple, each TP rank loads a block-aligned
-    shard using padded offsets (``padded_shard_size * tp_rank``).  The
-    last rank may receive fewer rows; ``_narrow_expert_data_for_padding``
-    handles the mismatch.  This keeps weights and scales aligned.
 
     hidden_size: 192 -> 256 (DeepEP-style round-up)
     intermediate_size_per_partition: 448 -> 512 (block_n=128 alignment)
@@ -328,13 +322,10 @@ class TestFp8BlockQuantPaddedHiddenAndIntermediateSize:
     INTERMEDIATE_UNPADDED = 448
     INTERMEDIATE_PADDED = math.ceil(INTERMEDIATE_UNPADDED / BLOCK_N) * BLOCK_N
     TP_SIZE = 4
-    # Global intermediate size in the checkpoint.
     GLOBAL_INTER = INTERMEDIATE_UNPADDED * TP_SIZE
 
     def _make_fused_moe(self):
         return _make_fused_moe_mock()
-
-    # -- w13 weights (gate / up projection) --------------------------------
 
     def test_load_w1_weight_all_tp_ranks(self):
         """Each TP rank loads block-aligned rows into the w1 half.
@@ -388,8 +379,6 @@ class TestFp8BlockQuantPaddedHiddenAndIntermediateSize:
         )
         assert torch.all(w3[n_available:] == 0)
 
-    # -- w2 weights (down projection) --------------------------------------
-
     def test_load_w2_weight_all_tp_ranks(self):
         """Each TP rank loads block-aligned columns of w2."""
         moe_module = self._make_fused_moe()
@@ -412,8 +401,6 @@ class TestFp8BlockQuantPaddedHiddenAndIntermediateSize:
             )
             assert torch.all(expert_data[:, n_available:] == 0)
             assert torch.all(expert_data[self.HIDDEN_UNPADDED :] == 0)
-
-    # -- w13 block scales ---------------------------------------------------
 
     def test_load_w1_scale_all_tp_ranks(self):
         """Each TP rank loads block-aligned scale rows for w1."""
@@ -441,8 +428,6 @@ class TestFp8BlockQuantPaddedHiddenAndIntermediateSize:
             expected = checkpoint_scale[start : start + loaded]
             assert torch.equal(w1_scale[:loaded, :n_cols_ckpt], expected)
 
-    # -- w2 block scales ----------------------------------------------------
-
     def test_load_w2_scale_all_tp_ranks(self):
         """Each TP rank loads block-aligned scale columns for w2."""
         moe_module = self._make_fused_moe()
@@ -465,8 +450,6 @@ class TestFp8BlockQuantPaddedHiddenAndIntermediateSize:
             loaded = min(n_cols_local, n_cols_global - start)
             expected = checkpoint_scale[:, start : start + loaded]
             assert torch.equal(expert_data[:, :loaded], expected)
-
-    # -- no padding (backward compat) --------------------------------------
 
     def test_no_padding_matches_simple_shard(self):
         """When sizes are already block-aligned, loading is a simple
