@@ -932,21 +932,13 @@ class FusedMoE(CustomOp):
         # Only narrow if the loaded_weight is not a scalar (0-dim tensor)
         # and we're not loading the full weight
         if not load_full and loaded_weight.ndim > 0:
-            checkpoint_shard_size, start_offset = (
-                self.quant_method.get_checkpoint_shard_info(
-                    expert_data,
-                    shard_dim,
-                    shard_id,
-                    tp_rank,
-                    padded_shard_size,
-                )
-            )
+            start_offset = padded_shard_size * tp_rank
             available = loaded_weight.shape[shard_dim] - start_offset
             if available <= 0:
                 # No available weight for this TP rank (can happen on last
                 # TP rank with padding) — skip loading.
                 return
-            narrow_size = min(checkpoint_shard_size, available)
+            narrow_size = min(padded_shard_size, available)
             loaded_weight = loaded_weight.narrow(shard_dim, start_offset, narrow_size)
         # Narrow parameter and load.
         # w1, gate_proj: Load into first logical weight of w13.
@@ -982,21 +974,13 @@ class FusedMoE(CustomOp):
         # Only narrow if the loaded_weight is not a scalar (0-dim tensor)
         # and we're not loading the full weight
         if not load_full and loaded_weight.ndim > 0:
-            checkpoint_shard_size, start_offset = (
-                self.quant_method.get_checkpoint_shard_info(
-                    expert_data,
-                    shard_dim,
-                    "w2",
-                    tp_rank,
-                    padded_shard_size,
-                )
-            )
+            start_offset = padded_shard_size * tp_rank
             available = loaded_weight.shape[shard_dim] - start_offset
             if available <= 0:
                 # No available weight for this TP rank (can happen on last
                 # TP rank with padding) — skip loading.
                 return
-            narrow_size = min(checkpoint_shard_size, available)
+            narrow_size = min(padded_shard_size, available)
             loaded_weight = loaded_weight.narrow(shard_dim, start_offset, narrow_size)
         # w2, down_proj: Load into only logical weight of w2.
         hidden_dim = self._get_hidden_dim(shard_dim, expert_data.ndim)

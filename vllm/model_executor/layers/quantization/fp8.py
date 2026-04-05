@@ -609,46 +609,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             allow_vllm_cutlass=False,
         )
 
-    def get_checkpoint_shard_info(
-        self,
-        expert_data: torch.Tensor,
-        shard_dim: int,
-        shard_id: str,
-        tp_rank: int,
-        padded_shard_size: int,
-    ) -> tuple[int, int]:
-        if not self.block_quant:
-            return super().get_checkpoint_shard_info(
-                expert_data, shard_dim, shard_id, tp_rank, padded_shard_size
-            )
-
-        unpadded = self.moe.intermediate_size_per_partition_unpadded
-        padded = self.moe.intermediate_size_per_partition
-        if unpadded is None or unpadded == padded:
-            return super().get_checkpoint_shard_info(
-                expert_data, shard_dim, shard_id, tp_rank, padded_shard_size
-            )
-
-        # Detect weight vs scale tensor by comparing the shard dimension
-        # against the padded intermediate size.  Weight tensors match
-        # exactly (2*padded for w13, padded for w2); scale tensors are
-        # much smaller (ceil(intermediate / block_n)).
-        if shard_id in ("w1", "w3"):
-            is_weight = expert_data.shape[shard_dim] == 2 * padded
-        else:
-            is_weight = expert_data.shape[shard_dim] == padded
-
-        if is_weight:
-            # Actual weight: each TP rank reads `unpadded` rows starting
-            # at tp_rank * unpadded.
-            return unpadded, unpadded * tp_rank
-
-        # Scale tensor
-        assert self.weight_block_size is not None
-        block_n = self.weight_block_size[0]
-        start_offset = (tp_rank * unpadded) // block_n
-        return padded_shard_size, start_offset
-
     def maybe_roundup_sizes(
         self,
         hidden_size: int,

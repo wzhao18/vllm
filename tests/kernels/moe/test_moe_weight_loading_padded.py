@@ -295,44 +295,8 @@ class TestWeightLoadingWithPaddedHiddenSize:
             )
 
 
-def _make_block_fp8_moe_method(
-    *,
-    padded_intermediate: int,
-    unpadded_intermediate: int,
-    block_n: int,
-    block_k: int = 128,
-):
-    """Build a block-quant Fp8MoEMethod"""
-    from types import SimpleNamespace
-
-    from vllm.model_executor.layers.quantization.fp8 import Fp8MoEMethod
-
-    method = object.__new__(Fp8MoEMethod)
-    method.block_quant = True
-    method.weight_block_size = [block_n, block_k]
-    method.moe = SimpleNamespace(
-        intermediate_size_per_partition=padded_intermediate,
-        intermediate_size_per_partition_unpadded=unpadded_intermediate,
-    )
-    return method
-
-
-def _make_non_block_fp8_moe_method():
-    """Build a non block-quant Fp8MoEMethod"""
-    from vllm.model_executor.layers.quantization.fp8 import Fp8MoEMethod
-
-    method = object.__new__(Fp8MoEMethod)
-    method.block_quant = False
-    method.weight_block_size = None
-    return method
-
-
-def _make_fused_moe_mock(
-    quant_method,
-    *,
-    is_act_and_mul: bool = True,
-):
-    """Build a minimal FusedMoE mock wired to a quant method."""
+def _make_fused_moe_mock(*, is_act_and_mul: bool = True):
+    """Build a minimal ``FusedMoE`` mock for weight loading tests."""
     moe_module = MagicMock(spec=FusedMoE)
     moe_module.moe_config = MagicMock()
     moe_module.moe_config.is_act_and_mul = is_act_and_mul
@@ -341,36 +305,42 @@ def _make_fused_moe_mock(
     moe_module._narrow_expert_data_for_padding = (
         FusedMoE._narrow_expert_data_for_padding
     )
-
-    moe_module.quant_method = quant_method
     return moe_module
 
 
 class TestFp8BlockQuantPaddedHiddenAndIntermediateSize:
-    """Tests Fp8 Block Quant weight loading with padded hidden_size and
-    intermediate_size across TP ranks.
+    """Tests weight loading with padded hidden_size and intermediate_size
+    across TP ranks.
+
+    When ``maybe_roundup_sizes`` pads ``intermediate_size_per_partition``
+    to the next ``block_n`` multiple, each TP rank loads a block-aligned
+    shard using padded offsets (``padded_shard_size * tp_rank``).  The
+    last rank may receive fewer rows; ``_narrow_expert_data_for_padding``
+    handles the mismatch.  This keeps weights and scales aligned.
+
+    hidden_size: 192 -> 256 (DeepEP-style round-up)
+    intermediate_size_per_partition: 448 -> 512 (block_n=128 alignment)
     """
 
     BLOCK_N = 128
     HIDDEN_UNPADDED = 192
-    HIDDEN_PADDED = 256
+    HIDDEN_PADDED = math.ceil(HIDDEN_UNPADDED / BLOCK_N) * BLOCK_N
     INTERMEDIATE_UNPADDED = 448
     INTERMEDIATE_PADDED = math.ceil(INTERMEDIATE_UNPADDED / BLOCK_N) * BLOCK_N
     TP_SIZE = 4
+    # Global intermediate size in the checkpoint.
+    GLOBAL_INTER = INTERMEDIATE_UNPADDED * TP_SIZE
 
-    def _make_fp8_block_fused_moe(self):
-        method = _make_block_fp8_moe_method(
-            padded_intermediate=self.INTERMEDIATE_PADDED,
-            unpadded_intermediate=self.INTERMEDIATE_UNPADDED,
-            block_n=self.BLOCK_N,
-        )
-        return _make_fused_moe_mock(method)
+    def _make_fused_moe(self):
+        return _make_fused_moe_mock()
+
+    # -- w13 weights (gate / up projection) --------------------------------
 
     def test_load_w1_weight_all_tp_ranks(self):
-        """Each TP rank loads the correct unpadded rows into the w1 half."""
-        moe_module = self._make_fp8_block_fused_moe()
-        global_inter = self.INTERMEDIATE_UNPADDED * self.TP_SIZE
-        checkpoint = torch.randn(global_inter, self.HIDDEN_UNPADDED)
+        """Each TP rank loads block-aligned rows into the w1 half.
+        The last rank gets fewer rows; the rest is padding."""
+        moe_module = self._make_fused_moe()
+        checkpoint = torch.randn(self.GLOBAL_INTER, self.HIDDEN_UNPADDED)
 
         for tp_rank in range(self.TP_SIZE):
             expert_data = torch.zeros(2 * self.INTERMEDIATE_PADDED, self.HIDDEN_PADDED)
@@ -383,23 +353,19 @@ class TestFp8BlockQuantPaddedHiddenAndIntermediateSize:
                 tp_rank=tp_rank,
             )
             w1 = expert_data[: self.INTERMEDIATE_PADDED]
-            start = tp_rank * self.INTERMEDIATE_UNPADDED
-            expected = checkpoint[start : start + self.INTERMEDIATE_UNPADDED]
+            start = tp_rank * self.INTERMEDIATE_PADDED
+            n_available = min(self.INTERMEDIATE_PADDED, self.GLOBAL_INTER - start)
+            expected = checkpoint[start : start + n_available]
 
-            assert torch.equal(
-                w1[: self.INTERMEDIATE_UNPADDED, : self.HIDDEN_UNPADDED], expected
-            )
-            assert torch.all(w1[self.INTERMEDIATE_UNPADDED :] == 0)
-            assert torch.all(
-                w1[: self.INTERMEDIATE_UNPADDED, self.HIDDEN_UNPADDED :] == 0
-            )
+            assert torch.equal(w1[:n_available, : self.HIDDEN_UNPADDED], expected)
+            assert torch.all(w1[n_available:] == 0)
+            assert torch.all(w1[:n_available, self.HIDDEN_UNPADDED :] == 0)
             assert torch.all(expert_data[self.INTERMEDIATE_PADDED :] == 0)
 
     def test_load_w3_weight_into_second_half(self):
         """w3 weight is written into the second half of the w13 allocation."""
-        moe_module = self._make_fp8_block_fused_moe()
-        global_inter = self.INTERMEDIATE_UNPADDED * self.TP_SIZE
-        checkpoint = torch.randn(global_inter, self.HIDDEN_UNPADDED)
+        moe_module = self._make_fused_moe()
+        checkpoint = torch.randn(self.GLOBAL_INTER, self.HIDDEN_UNPADDED)
         tp_rank = 2
 
         expert_data = torch.zeros(2 * self.INTERMEDIATE_PADDED, self.HIDDEN_PADDED)
@@ -414,18 +380,20 @@ class TestFp8BlockQuantPaddedHiddenAndIntermediateSize:
         assert torch.all(expert_data[: self.INTERMEDIATE_PADDED] == 0)
 
         w3 = expert_data[self.INTERMEDIATE_PADDED :]
-        start = tp_rank * self.INTERMEDIATE_UNPADDED
+        start = tp_rank * self.INTERMEDIATE_PADDED
+        n_available = min(self.INTERMEDIATE_PADDED, self.GLOBAL_INTER - start)
         assert torch.equal(
-            w3[: self.INTERMEDIATE_UNPADDED, : self.HIDDEN_UNPADDED],
-            checkpoint[start : start + self.INTERMEDIATE_UNPADDED],
+            w3[:n_available, : self.HIDDEN_UNPADDED],
+            checkpoint[start : start + n_available],
         )
-        assert torch.all(w3[self.INTERMEDIATE_UNPADDED :] == 0)
+        assert torch.all(w3[n_available:] == 0)
+
+    # -- w2 weights (down projection) --------------------------------------
 
     def test_load_w2_weight_all_tp_ranks(self):
-        """Each TP rank loads the correct unpadded columns of w2."""
-        moe_module = self._make_fp8_block_fused_moe()
-        global_inter = self.INTERMEDIATE_UNPADDED * self.TP_SIZE
-        checkpoint = torch.randn(self.HIDDEN_UNPADDED, global_inter)
+        """Each TP rank loads block-aligned columns of w2."""
+        moe_module = self._make_fused_moe()
+        checkpoint = torch.randn(self.HIDDEN_UNPADDED, self.GLOBAL_INTER)
 
         for tp_rank in range(self.TP_SIZE):
             expert_data = torch.zeros(self.HIDDEN_PADDED, self.INTERMEDIATE_PADDED)
@@ -436,20 +404,21 @@ class TestFp8BlockQuantPaddedHiddenAndIntermediateSize:
                 loaded_weight=checkpoint.clone(),
                 tp_rank=tp_rank,
             )
-            start = tp_rank * self.INTERMEDIATE_UNPADDED
-            expected = checkpoint[:, start : start + self.INTERMEDIATE_UNPADDED]
+            start = tp_rank * self.INTERMEDIATE_PADDED
+            n_available = min(self.INTERMEDIATE_PADDED, self.GLOBAL_INTER - start)
+            expected = checkpoint[:, start : start + n_available]
             assert torch.equal(
-                expert_data[: self.HIDDEN_UNPADDED, : self.INTERMEDIATE_UNPADDED],
-                expected,
+                expert_data[: self.HIDDEN_UNPADDED, :n_available], expected
             )
-            assert torch.all(expert_data[:, self.INTERMEDIATE_UNPADDED :] == 0)
+            assert torch.all(expert_data[:, n_available:] == 0)
             assert torch.all(expert_data[self.HIDDEN_UNPADDED :] == 0)
+
+    # -- w13 block scales ---------------------------------------------------
 
     def test_load_w1_scale_all_tp_ranks(self):
         """Each TP rank loads block-aligned scale rows for w1."""
-        moe_module = self._make_fp8_block_fused_moe()
-        global_inter = self.INTERMEDIATE_UNPADDED * self.TP_SIZE
-        n_rows_global = math.ceil(global_inter / self.BLOCK_N)
+        moe_module = self._make_fused_moe()
+        n_rows_global = math.ceil(self.GLOBAL_INTER / self.BLOCK_N)
         n_cols_ckpt = math.ceil(self.HIDDEN_UNPADDED / self.BLOCK_N)
         n_rows_local = math.ceil(self.INTERMEDIATE_PADDED / self.BLOCK_N)
         n_cols_alloc = math.ceil(self.HIDDEN_PADDED / self.BLOCK_N)
@@ -467,17 +436,18 @@ class TestFp8BlockQuantPaddedHiddenAndIntermediateSize:
                 tp_rank=tp_rank,
             )
             w1_scale = expert_data[:n_rows_local]
-            start = (tp_rank * self.INTERMEDIATE_UNPADDED) // self.BLOCK_N
+            start = n_rows_local * tp_rank
             loaded = min(n_rows_local, n_rows_global - start)
             expected = checkpoint_scale[start : start + loaded]
             assert torch.equal(w1_scale[:loaded, :n_cols_ckpt], expected)
 
+    # -- w2 block scales ----------------------------------------------------
+
     def test_load_w2_scale_all_tp_ranks(self):
         """Each TP rank loads block-aligned scale columns for w2."""
-        moe_module = self._make_fp8_block_fused_moe()
-        global_inter = self.INTERMEDIATE_UNPADDED * self.TP_SIZE
+        moe_module = self._make_fused_moe()
         n_rows = math.ceil(self.HIDDEN_UNPADDED / self.BLOCK_N)
-        n_cols_global = math.ceil(global_inter / self.BLOCK_N)
+        n_cols_global = math.ceil(self.GLOBAL_INTER / self.BLOCK_N)
         n_cols_local = math.ceil(self.INTERMEDIATE_PADDED / self.BLOCK_N)
 
         checkpoint_scale = torch.randn(n_rows, n_cols_global)
@@ -491,45 +461,19 @@ class TestFp8BlockQuantPaddedHiddenAndIntermediateSize:
                 loaded_weight=checkpoint_scale.clone(),
                 tp_rank=tp_rank,
             )
-            start = (tp_rank * self.INTERMEDIATE_UNPADDED) // self.BLOCK_N
+            start = n_cols_local * tp_rank
             loaded = min(n_cols_local, n_cols_global - start)
             expected = checkpoint_scale[:, start : start + loaded]
             assert torch.equal(expert_data[:, :loaded], expected)
 
+    # -- no padding (backward compat) --------------------------------------
+
     def test_no_padding_matches_simple_shard(self):
-        """When unpadded == padded, the real Fp8MoEMethod delegates to the
-        base class default: offset = shard_size * tp_rank."""
+        """When sizes are already block-aligned, loading is a simple
+        shard_size * tp_rank partition."""
         intermediate = 512
         hidden = 256
-        method = _make_block_fp8_moe_method(
-            padded_intermediate=intermediate,
-            unpadded_intermediate=intermediate,
-            block_n=128,
-        )
-        moe_module = _make_fused_moe_mock(method)
-        checkpoint = torch.randn(intermediate * self.TP_SIZE, hidden)
-
-        for tp_rank in range(self.TP_SIZE):
-            expert_data = torch.zeros(2 * intermediate, hidden)
-            FusedMoE._load_w13(
-                moe_module,
-                expert_data=expert_data,
-                shard_dim=0,
-                shard_id="w1",
-                loaded_weight=checkpoint.clone(),
-                tp_rank=tp_rank,
-            )
-            w1 = expert_data[:intermediate]
-            start = tp_rank * intermediate
-            assert torch.equal(w1, checkpoint[start : start + intermediate])
-
-    def test_non_block_quant_simple_shard(self):
-        """Fp8MoEMethod with block_quant=False delegates to the base class
-        default: offset = shard_size * tp_rank."""
-        intermediate = 512
-        hidden = 256
-        method = _make_non_block_fp8_moe_method()
-        moe_module = _make_fused_moe_mock(method)
+        moe_module = _make_fused_moe_mock()
         checkpoint = torch.randn(intermediate * self.TP_SIZE, hidden)
 
         for tp_rank in range(self.TP_SIZE):
