@@ -934,7 +934,10 @@ class FusedMoE(CustomOp):
         if not load_full and loaded_weight.ndim > 0:
             checkpoint_shard_size, start_offset = (
                 self.quant_method.get_checkpoint_shard_info(
-                    expert_data, shard_dim, shard_id, tp_rank,
+                    expert_data,
+                    shard_dim,
+                    shard_id,
+                    tp_rank,
                     padded_shard_size,
                 )
             )
@@ -981,7 +984,10 @@ class FusedMoE(CustomOp):
         if not load_full and loaded_weight.ndim > 0:
             checkpoint_shard_size, start_offset = (
                 self.quant_method.get_checkpoint_shard_info(
-                    expert_data, shard_dim, "w2", tp_rank,
+                    expert_data,
+                    shard_dim,
+                    "w2",
+                    tp_rank,
                     padded_shard_size,
                 )
             )

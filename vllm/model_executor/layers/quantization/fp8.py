@@ -667,9 +667,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             block_n = self.weight_block_size[0]
             if intermediate_size_per_partition % block_n != 0:
                 padded = (
-                    (intermediate_size_per_partition + block_n - 1)
-                    // block_n
-                    * block_n
+                    (intermediate_size_per_partition + block_n - 1) // block_n * block_n
                 )
                 logger.info_once(
                     "Padding MoE intermediate size per partition from %d to "
