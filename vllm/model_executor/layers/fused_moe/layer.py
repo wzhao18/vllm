@@ -932,11 +932,14 @@ class FusedMoE(CustomOp):
         # Only narrow if the loaded_weight is not a scalar (0-dim tensor)
         # and we're not loading the full weight
         if not load_full and loaded_weight.ndim > 0:
+            # Handle padding: loaded_weight might be smaller than shard_size on last
+            # TP rank
             start_offset = shard_size * tp_rank
             available = loaded_weight.shape[shard_dim] - start_offset
             if available <= 0:
-                # No available weight for this TP rank (can happen on last
-                # TP rank with padding) — skip loading.
+                # If there is no available weight to load for this TP rank
+                # (can happen on last TP rank with padding), we can skip
+                # loading and return early
                 return
             narrow_size = min(shard_size, available)
             loaded_weight = loaded_weight.narrow(shard_dim, start_offset, narrow_size)
@@ -967,16 +970,20 @@ class FusedMoE(CustomOp):
     ):
         # Index the loaded weight for tp sharding.
         # down_proj: "RowParallel" so tp sharding on input_dim
+        # Narrow parameter and load.
         shard_size = expert_data.shape[shard_dim]
 
         # Only narrow if the loaded_weight is not a scalar (0-dim tensor)
         # and we're not loading the full weight
         if not load_full and loaded_weight.ndim > 0:
+            # Handle padding: loaded_weight might be smaller than shard_size on last
+            # TP rank
             start_offset = shard_size * tp_rank
             available = loaded_weight.shape[shard_dim] - start_offset
             if available <= 0:
-                # No available weight for this TP rank (can happen on last
-                # TP rank with padding) — skip loading.
+                # If there is no available weight to load for this TP rank
+                # (can happen on last TP rank with padding), we can skip
+                # loading and return early
                 return
             narrow_size = min(shard_size, available)
             loaded_weight = loaded_weight.narrow(shard_dim, start_offset, narrow_size)
