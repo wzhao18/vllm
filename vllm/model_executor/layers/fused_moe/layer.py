@@ -925,31 +925,29 @@ class FusedMoE(CustomOp):
         # Index the loaded weight for tp sharding.
         # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
         if self.moe_config.is_act_and_mul:
-            padded_shard_size = expert_data.shape[shard_dim] // 2
+            shard_size = expert_data.shape[shard_dim] // 2
         else:
-            padded_shard_size = expert_data.shape[shard_dim]
+            shard_size = expert_data.shape[shard_dim]
 
         # Only narrow if the loaded_weight is not a scalar (0-dim tensor)
         # and we're not loading the full weight
         if not load_full and loaded_weight.ndim > 0:
-            start_offset = padded_shard_size * tp_rank
+            start_offset = shard_size * tp_rank
             available = loaded_weight.shape[shard_dim] - start_offset
             if available <= 0:
                 # No available weight for this TP rank (can happen on last
                 # TP rank with padding) — skip loading.
                 return
-            narrow_size = min(padded_shard_size, available)
+            narrow_size = min(shard_size, available)
             loaded_weight = loaded_weight.narrow(shard_dim, start_offset, narrow_size)
         # Narrow parameter and load.
         # w1, gate_proj: Load into first logical weight of w13.
         if shard_id == "w1":
-            expert_data = expert_data.narrow(shard_dim, 0, padded_shard_size)
+            expert_data = expert_data.narrow(shard_dim, 0, shard_size)
         # w3, up_proj: Load into second logical weight of w13.
         else:
             assert shard_id == "w3"
-            expert_data = expert_data.narrow(
-                shard_dim, padded_shard_size, padded_shard_size
-            )
+            expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
         hidden_dim = self._get_hidden_dim(shard_dim, expert_data.ndim)
         expert_data = self._narrow_expert_data_for_padding(
             expert_data,
@@ -969,18 +967,18 @@ class FusedMoE(CustomOp):
     ):
         # Index the loaded weight for tp sharding.
         # down_proj: "RowParallel" so tp sharding on input_dim
-        padded_shard_size = expert_data.shape[shard_dim]
+        shard_size = expert_data.shape[shard_dim]
 
         # Only narrow if the loaded_weight is not a scalar (0-dim tensor)
         # and we're not loading the full weight
         if not load_full and loaded_weight.ndim > 0:
-            start_offset = padded_shard_size * tp_rank
+            start_offset = shard_size * tp_rank
             available = loaded_weight.shape[shard_dim] - start_offset
             if available <= 0:
                 # No available weight for this TP rank (can happen on last
                 # TP rank with padding) — skip loading.
                 return
-            narrow_size = min(padded_shard_size, available)
+            narrow_size = min(shard_size, available)
             loaded_weight = loaded_weight.narrow(shard_dim, start_offset, narrow_size)
         # w2, down_proj: Load into only logical weight of w2.
         hidden_dim = self._get_hidden_dim(shard_dim, expert_data.ndim)
