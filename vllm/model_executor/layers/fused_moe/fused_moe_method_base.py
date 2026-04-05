@@ -80,7 +80,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         checkpoint for each TP rank.
 
         Args:
-            expert_data: The (possibly padded) parameter tensor.
+            expert_data: The parameter tensor.
             shard_dim: Dimension being sharded across TP ranks.
             shard_id: One of "w1", "w2", "w3".
             tp_rank: This rank's TP index.

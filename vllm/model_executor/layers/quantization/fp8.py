@@ -643,10 +643,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # at tp_rank * unpadded.
             return unpadded, unpadded * tp_rank
 
-        # Scale tensor: block boundaries may not coincide with TP
-        # partition boundaries when unpadded % block_n != 0.
-        # The first scale block for this rank is
-        # floor(tp_rank * unpadded / block_n).
+        # Scale tensor
         assert self.weight_block_size is not None
         block_n = self.weight_block_size[0]
         start_offset = (tp_rank * unpadded) // block_n

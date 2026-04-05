@@ -845,7 +845,7 @@ class FusedMoE(CustomOp):
                 expert_data,
                 loaded_weight,
                 hidden_dim=hidden_dim,
-                shard_dim=shard_dim,
+                intermediate_dim=shard_dim,
             )
             expert_data.copy_(loaded_weight)
         elif shard_id in ("w1", "w3"):
@@ -885,13 +885,13 @@ class FusedMoE(CustomOp):
         expert_data: torch.Tensor,
         loaded_weight: torch.Tensor,
         hidden_dim: int,
-        shard_dim: int = -1,
+        intermediate_dim: int = -1,
     ) -> torch.Tensor:
         """Narrow expert_data to match loaded_weight for padded dimensions.
 
         When backends (e.g., DeepEP) round up hidden_size, weight parameters
         are larger than checkpoint weights. Similarly, on the last TP rank the
-        shard dimension of loaded_weight may be smaller than the padded
+        intermediate dimension of loaded_weight may be smaller than the padded
         allocation. Narrow both dimensions before copying.
 
         Args:
@@ -899,11 +899,11 @@ class FusedMoE(CustomOp):
             loaded_weight: The checkpoint weight tensor with original size.
             hidden_dim: The dimension index corresponding to hidden_size.
                 Must be non-negative.
-            shard_dim: The dimension index corresponding to the shard
-                (intermediate) dimension. When >= 0, expert_data is also
-                narrowed along this axis if it is larger than loaded_weight.
+            intermediate_dim: The dimension index corresponding to the
+                intermediate size. When >= 0, expert_data is also narrowed
+                along this axis if it is larger than loaded_weight.
         """
-        for dim in (hidden_dim, shard_dim):
+        for dim in (hidden_dim, intermediate_dim):
             if (
                 loaded_weight.ndim > 0
                 and 0 <= dim < expert_data.ndim
@@ -960,7 +960,7 @@ class FusedMoE(CustomOp):
             expert_data,
             loaded_weight,
             hidden_dim=hidden_dim,
-            shard_dim=shard_dim,
+            intermediate_dim=shard_dim,
         )
         expert_data.copy_(loaded_weight)
 
@@ -998,7 +998,7 @@ class FusedMoE(CustomOp):
             expert_data,
             loaded_weight,
             hidden_dim=hidden_dim,
-            shard_dim=shard_dim,
+            intermediate_dim=shard_dim,
         )
         expert_data.copy_(loaded_weight)
 
