@@ -277,16 +277,15 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
     ) -> bool:
         """
         The FlashInfer TRTLLM FP8 kernel expects bfloat16 router_logits by default.
-        DeepSeekV3 routing supports float32 router_logits (converted internally).
-        Simulated routing generates synthetic decisions and is agnostic to dtype.
+        DeepSeekV3, MiniMax2, and SigmoidRenorm routing support float32 router_logits
+        (converted internally). Simulated routing generates synthetic decisions and
+        is agnostic to dtype.
         """
         if router_logits_dtype == torch.float32:
-            # DeepSeekV3 routing handles float32 logits internally.
-            # Simulated routing generates synthetic decisions, so the
-            # kernel doesn't care about the actual logits dtype.
-            # https://github.com/flashinfer-ai/flashinfer/issues/2469
             return routing_method in (
                 RoutingMethodType.DeepSeekV3,
+                RoutingMethodType.MiniMax2,
+                RoutingMethodType.SigmoidRenorm,
                 RoutingMethodType.Simulated,
             )
         return True
@@ -305,21 +304,23 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
             (kFp8Static128BlockSym, kFp8Dynamic128Sym),
             (kMxfp8Static, kMxfp8Dynamic),
         ]:
-            # NOTE(rob): potentially allow others here. This is a conservative list.
             return routing_method in [
                 RoutingMethodType.DeepSeekV3,
                 RoutingMethodType.Simulated,
                 RoutingMethodType.Renormalize,
                 RoutingMethodType.RenormalizeNaive,
+                RoutingMethodType.SigmoidRenorm,
+                RoutingMethodType.MiniMax2,
             ]
         elif (weight_key, activation_key) == (kFp8StaticTensorSym, kFp8StaticTensorSym):
-            # NOTE(dbari): as above, potentially allow others here.
             return routing_method in [
                 RoutingMethodType.DeepSeekV3,
                 RoutingMethodType.Llama4,
                 RoutingMethodType.Simulated,
                 RoutingMethodType.Renormalize,
                 RoutingMethodType.RenormalizeNaive,
+                RoutingMethodType.SigmoidRenorm,
+                RoutingMethodType.MiniMax2,
             ]
         else:
             raise ValueError("Unsupported quantization scheme.")
@@ -355,7 +356,12 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
         # TODO: fuse into the quant kernel.
         assert a1q_scale is not None
 
-        if self.routing_method_type == RoutingMethodType.DeepSeekV3:
+        # Sigmoid-based routing methods require float32 logits for precision.
+        if self.routing_method_type in (
+            RoutingMethodType.DeepSeekV3,
+            RoutingMethodType.MiniMax2,
+            RoutingMethodType.SigmoidRenorm,
+        ):
             router_logits = router_logits.to(torch.float32)
 
         # Currently FI requires bfloat16 routing bias.
@@ -429,8 +435,12 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
         else:
             assert not apply_router_weight_on_input
 
-        # The DeepSeekV3 routing method requires float32 router logits.
-        if self.routing_method_type == RoutingMethodType.DeepSeekV3:
+        # Sigmoid-based routing methods require float32 router logits.
+        if self.routing_method_type in (
+            RoutingMethodType.DeepSeekV3,
+            RoutingMethodType.MiniMax2,
+            RoutingMethodType.SigmoidRenorm,
+        ):
             router_logits = router_logits.to(torch.float32)
 
         # Currently FI requires bfloat16 routing bias.

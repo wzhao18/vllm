@@ -259,13 +259,14 @@ class TrtLlmNvFp4ExpertsMonolithic(
         weight_key: QuantKey | None,
         activation_key: QuantKey | None,
     ) -> bool:
-        # NOTE(rob): this is a conservative list.
         return routing_method_type in [
             RoutingMethodType.DeepSeekV3,
             RoutingMethodType.Renormalize,
             RoutingMethodType.RenormalizeNaive,
             RoutingMethodType.Llama4,
             RoutingMethodType.Simulated,
+            RoutingMethodType.SigmoidRenorm,
+            RoutingMethodType.MiniMax2,
         ]
 
     @staticmethod
@@ -275,16 +276,15 @@ class TrtLlmNvFp4ExpertsMonolithic(
     ) -> bool:
         """
         The FlashInfer TRTLLM NvFp4 kernel expects bfloat16 router_logits by default.
-        DeepSeekV3 routing supports float32 router_logits (converted internally).
-        Simulated routing generates synthetic decisions and is agnostic to dtype.
+        Sigmoid-based routing methods support float32 router_logits (converted
+        internally). Simulated routing generates synthetic decisions and is
+        agnostic to dtype.
         """
         if router_logits_dtype == torch.float32:
-            # DeepSeekV3 routing handles float32 logits internally.
-            # Simulated routing generates synthetic decisions, so the
-            # kernel doesn't care about the actual logits dtype.
-            # https://github.com/flashinfer-ai/flashinfer/issues/2469
             return routing_method in (
                 RoutingMethodType.DeepSeekV3,
+                RoutingMethodType.MiniMax2,
+                RoutingMethodType.SigmoidRenorm,
                 RoutingMethodType.Simulated,
             )
         return True
@@ -318,12 +318,13 @@ class TrtLlmNvFp4ExpertsMonolithic(
             and self.routing_method_type != RoutingMethodType.Llama4
         )
 
-        # Prepare router logits for kernel format.
-        router_logits = (
-            router_logits.to(torch.float32)
-            if self.routing_method_type == RoutingMethodType.DeepSeekV3
-            else router_logits
-        )
+        # Sigmoid-based routing methods require float32 logits for precision.
+        if self.routing_method_type in (
+            RoutingMethodType.DeepSeekV3,
+            RoutingMethodType.MiniMax2,
+            RoutingMethodType.SigmoidRenorm,
+        ):
+            router_logits = router_logits.to(torch.float32)
 
         # Currently FI requires bfloat16 routing bias.
         # https://github.com/flashinfer-ai/flashinfer/issues/2909

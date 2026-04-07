@@ -112,12 +112,15 @@ class RoutingMethodType(IntEnum):
     RenormalizeNaive = (4,)
     # TopK: TopK (no softmax)
     TopK = (5,)
-    # Custom
-    Custom = (6,)
-    # Simulated
-    Simulated = (7,)
+    # SigmoidRenorm: Sigmoid -> TopK -> Renormalize (divide by sum of top-K)
+    SigmoidRenorm = (6,)
+    # MiniMax2: Sigmoid + Bias -> TopK -> ScaledSumNormalize
+    MiniMax2 = (7,)
     # Unspecified
-    Unspecified = 8.0
+    Unspecified = (8,)
+    # vLLM-internal routing types (not passed to FlashInfer kernels)
+    Custom = (100,)
+    Simulated = (101,)
 
 
 def get_routing_method_type(
@@ -130,12 +133,18 @@ def get_routing_method_type(
     if has_e_score_bias:
         if (num_expert_group or 0) > 0 and scoring_func == "sigmoid":
             return RoutingMethodType.DeepSeekV3
+        elif scoring_func == "sigmoid":
+            # MiniMax-M2: Sigmoid + Bias -> TopK -> ScaledSumNormalize
+            return RoutingMethodType.MiniMax2
         else:
             return RoutingMethodType.Unspecified
 
     if scoring_func == "sigmoid":
         if top_k == 1:
             return RoutingMethodType.Llama4
+        elif renormalize:
+            # Sigmoid -> TopK -> Renormalize (divide by sum of top-K)
+            return RoutingMethodType.SigmoidRenorm
         else:
             return RoutingMethodType.Unspecified
 
