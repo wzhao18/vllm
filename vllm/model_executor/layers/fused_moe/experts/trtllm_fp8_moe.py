@@ -277,9 +277,8 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
     ) -> bool:
         """
         The FlashInfer TRTLLM FP8 kernel expects bfloat16 router_logits by default.
-        DeepSeekV3, MiniMax2, and SigmoidRenorm routing support float32 router_logits
-        (converted internally). Simulated routing generates synthetic decisions and
-        is agnostic to dtype.
+        Sigmoid-based routing methods support float32 router_logits (converted
+        internally).
         """
         if router_logits_dtype == torch.float32:
             return routing_method in (
