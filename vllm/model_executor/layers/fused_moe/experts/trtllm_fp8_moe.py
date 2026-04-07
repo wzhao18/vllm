@@ -217,7 +217,7 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
             local_expert_offset=self.ep_rank * self.local_num_experts,
             local_num_experts=self.local_num_experts,
             routed_scaling_factor=None,
-            routing_method_type=1,
+            routing_method_type=1,  # not used
             use_shuffled_weight=use_shuffled_weight,
             weight_layout=weight_layout,
             fp8_quantization_type=fp8_quant_type,
@@ -286,7 +286,6 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
                 RoutingMethodType.DeepSeekV3,
                 RoutingMethodType.MiniMax2,
                 RoutingMethodType.SigmoidRenorm,
-                RoutingMethodType.Simulated,
             )
         return True
 
@@ -306,7 +305,6 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
         ]:
             return routing_method in [
                 RoutingMethodType.DeepSeekV3,
-                RoutingMethodType.Simulated,
                 RoutingMethodType.Renormalize,
                 RoutingMethodType.RenormalizeNaive,
                 RoutingMethodType.SigmoidRenorm,
@@ -316,7 +314,6 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
             return routing_method in [
                 RoutingMethodType.DeepSeekV3,
                 RoutingMethodType.Llama4,
-                RoutingMethodType.Simulated,
                 RoutingMethodType.Renormalize,
                 RoutingMethodType.RenormalizeNaive,
                 RoutingMethodType.SigmoidRenorm,

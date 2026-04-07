@@ -231,7 +231,7 @@ class TrtLlmNvFp4ExpertsModular(TrtLlmNvFp4ExpertsBase, mk.FusedMoEExpertsModula
             local_expert_offset=self.ep_rank * self.local_num_experts,
             local_num_experts=self.local_num_experts,
             routed_scaling_factor=None,
-            routing_method_type=1,
+            routing_method_type=1,  # not used
             do_finalize=True,
             activation_type=activation_to_flashinfer_int(activation),
             output=output,
@@ -264,7 +264,6 @@ class TrtLlmNvFp4ExpertsMonolithic(
             RoutingMethodType.Renormalize,
             RoutingMethodType.RenormalizeNaive,
             RoutingMethodType.Llama4,
-            RoutingMethodType.Simulated,
             RoutingMethodType.SigmoidRenorm,
             RoutingMethodType.MiniMax2,
         ]
@@ -277,15 +276,13 @@ class TrtLlmNvFp4ExpertsMonolithic(
         """
         The FlashInfer TRTLLM NvFp4 kernel expects bfloat16 router_logits by default.
         Sigmoid-based routing methods support float32 router_logits (converted
-        internally). Simulated routing generates synthetic decisions and is
-        agnostic to dtype.
+        internally).
         """
         if router_logits_dtype == torch.float32:
             return routing_method in (
                 RoutingMethodType.DeepSeekV3,
                 RoutingMethodType.MiniMax2,
                 RoutingMethodType.SigmoidRenorm,
-                RoutingMethodType.Simulated,
             )
         return True
 
