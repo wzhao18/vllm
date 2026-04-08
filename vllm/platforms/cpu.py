@@ -76,7 +76,9 @@ class CpuPlatform(Platform):
     dist_backend: str = "gloo"
     device_control_env_var = "CPU_VISIBLE_MEMORY_NODES"
     omp_process_manager = None
-    smt = 1  # SMT level for OMP - 4 threads on PowerPC, 1 on others
+    # Simultaneous Multithreading (SMT) level for OpenMP:
+    # 4 on PowerPC, 1 on non-PowerPC architectures
+    smt = 1
     global_cpu_mask = None
     simulate_numa = int(os.environ.get("_SIM_MULTI_NUMA", 0))
 
@@ -381,7 +383,12 @@ class CpuPlatform(Platform):
     def get_global_cpu_mask(cls) -> set[int]:
         # get global cpu mask
         if cls.global_cpu_mask is None:
-            cls.global_cpu_mask = os.sched_getaffinity(0)
+            if hasattr(os, "sched_getaffinity"):
+                cls.global_cpu_mask = os.sched_getaffinity(0)
+            else:
+                # macOS does not support sched_getaffinity
+                cpu_count = os.cpu_count() or 1
+                cls.global_cpu_mask = set(range(cpu_count))
         return cls.global_cpu_mask
 
     @classmethod
