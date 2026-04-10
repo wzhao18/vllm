@@ -260,13 +260,14 @@ __global__ void per_token_group_quant_8bit_packed_kernel(
   const int mn_idx = static_cast<int>(global_group_id / padded_groups_per_row);
 
   // Padding groups: write a zero byte and exit.
-  // Skip writes beyond the storage (num_scale_elems int32s).
   if (!((mn_idx < mn) && (sf_k_idx < groups_per_row))) {
     if (lane_id == 0) {
       // each uint32 in output_s_packed stores 4 packed scales
       const int sf_k_pack_idx = sf_k_idx / 4;
       const int pos = sf_k_idx % 4;
       const int out_idx = sf_k_pack_idx * tma_aligned_mn + mn_idx;
+
+      // skip writes beyond the storage size
       if (out_idx < num_scale_elems) {
         reinterpret_cast<uint8_t*>(output_s_packed)[out_idx * 4 + pos] = 0;
       }
@@ -290,14 +291,15 @@ __global__ void per_token_group_quant_8bit_packed_kernel(
       ComputeGroupScale<T, true>(group_input, smem_group, group_size, lane_id,
                                  threads_per_group, eps, max_8bit);
 
-  // reinterpret the UE8M0 scale y_s as IEEE bits, extract the 8-bit
-  // exponent, and write it to the correct byte position in output_s_packed.
+  // pack 4 scales into a uint32
   if (lane_id == 0) {
     // each uint32 in output_s_packed stores 4 packed scales
     const int sf_k_pack_idx = sf_k_idx / 4;
     const int pos = sf_k_idx % 4;
     const int out_idx = sf_k_pack_idx * tma_aligned_mn + mn_idx;
 
+    // reinterpret the UE8M0 scale y_s as IEEE bits, extract the 8-bit
+    // exponent, and write it to the correct byte position in output_s_packed.
     const unsigned int bits = __float_as_uint(y_s);
     const uint8_t exponent = static_cast<uint8_t>((bits >> 23u) & 0xffu);
     reinterpret_cast<uint8_t*>(output_s_packed)[out_idx * 4 + pos] = exponent;
