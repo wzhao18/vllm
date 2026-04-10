@@ -242,8 +242,8 @@ __global__ void per_token_group_quant_8bit_packed_kernel(
     unsigned int* __restrict__ output_s_packed, const int group_size,
     const int num_groups_padded, const int groups_per_block,
     const int padded_groups_per_row, const int groups_per_row, const int mn,
-    const int tma_aligned_mn, const float eps, const float min_8bit,
-    const float max_8bit) {
+    const int tma_aligned_mn, const int num_scale_elems, const float eps,
+    const float min_8bit, const float max_8bit) {
   const int threads_per_group = 16;
   const int64_t local_group_id = threadIdx.x / threads_per_group;
   const int lane_id = threadIdx.x % threads_per_group;
@@ -254,22 +254,19 @@ __global__ void per_token_group_quant_8bit_packed_kernel(
     return;
   }
 
-  // Map flat padded group id to 2D position in the padded grid.
+  // map flat group id to 2D indices (mn_idx, sf_k_idx)
   const int sf_k_idx =
       static_cast<int>(global_group_id % padded_groups_per_row);
   const int mn_idx = static_cast<int>(global_group_id / padded_groups_per_row);
-  const bool is_valid = (mn_idx < mn) && (sf_k_idx < groups_per_row);
 
   // Padding groups: write a zero byte and exit.
-  // Skip writes beyond the storage, which has
-  // mn + (padded_groups_per_row / 4 - 1) * tma_aligned_mn int32s.
-  if (!is_valid) {
+  // Skip writes beyond the storage (num_scale_elems int32s).
+  if (!((mn_idx < mn) && (sf_k_idx < groups_per_row))) {
     if (lane_id == 0) {
+      // each uint32 in output_s_packed stores 4 packed scales
       const int sf_k_pack_idx = sf_k_idx / 4;
       const int pos = sf_k_idx % 4;
       const int out_idx = sf_k_pack_idx * tma_aligned_mn + mn_idx;
-      const int num_scale_elems =
-          mn + (padded_groups_per_row / 4 - 1) * tma_aligned_mn;
       if (out_idx < num_scale_elems) {
         reinterpret_cast<uint8_t*>(output_s_packed)[out_idx * 4 + pos] = 0;
       }
@@ -293,8 +290,10 @@ __global__ void per_token_group_quant_8bit_packed_kernel(
       ComputeGroupScale<T, true>(group_input, smem_group, group_size, lane_id,
                                  threads_per_group, eps, max_8bit);
 
-  // Write the 8-bit UE8M0 exponent directly to the correct byte position.
+  // reinterpret the UE8M0 scale y_s as IEEE bits, extract the 8-bit
+  // exponent, and write it to the correct byte position in output_s_packed.
   if (lane_id == 0) {
+    // each uint32 in output_s_packed stores 4 packed scales
     const int sf_k_pack_idx = sf_k_idx / 4;
     const int pos = sf_k_idx % 4;
     const int out_idx = sf_k_pack_idx * tma_aligned_mn + mn_idx;
@@ -343,6 +342,12 @@ void per_token_group_quant_8bit_packed(const torch::stable::Tensor& input,
                   "output_s_packed shape must be [", mn, ", ", k_num_packed_sfk,
                   "], but got [", output_s_packed.size(0), ", ",
                   output_s_packed.size(1), "].");
+  // Verify column-major TMA-aligned layout
+  STD_TORCH_CHECK(output_s_packed.stride(0) == 1 &&
+                      output_s_packed.stride(1) == tma_aligned_mn,
+                  "output_s_packed must have strides [1, ", tma_aligned_mn,
+                  "], but got [", output_s_packed.stride(0), ", ",
+                  output_s_packed.stride(1), "].");
 
   cudaStream_t stream = get_current_cuda_stream();
 
@@ -350,9 +355,10 @@ void per_token_group_quant_8bit_packed(const torch::stable::Tensor& input,
 
   // Expand the grid to cover MN and K padding so every byte in
   // output_s_packed is written (padding bytes get zeroed by the kernel).
-  // This eliminates the need for a separate zero-init pass.
   const int64_t padded_groups_per_row = k_num_packed_sfk * 4;
   const int64_t num_groups_padded = tma_aligned_mn * padded_groups_per_row;
+  // Number of uint32 elements in output_s_packed.
+  const int64_t num_scale_elems = mn + (k_num_packed_sfk - 1) * tma_aligned_mn;
 
   const int groups_per_block = GetGroupsPerBlock(num_groups_padded);
 
@@ -373,7 +379,8 @@ void per_token_group_quant_8bit_packed(const torch::stable::Tensor& input,
             static_cast<int>(group_size), static_cast<int>(num_groups_padded), \
             groups_per_block, static_cast<int>(padded_groups_per_row),         \
             static_cast<int>(groups_per_row), static_cast<int>(mn),            \
-            static_cast<int>(tma_aligned_mn), static_cast<float>(eps),         \
+            static_cast<int>(tma_aligned_mn),                                  \
+            static_cast<int>(num_scale_elems), static_cast<float>(eps),        \
             static_cast<float>(min_8bit), static_cast<float>(max_8bit));       \
   } while (0)
 
