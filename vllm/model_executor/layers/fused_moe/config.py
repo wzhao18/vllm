@@ -510,9 +510,9 @@ class FusedMoEQuantConfig:
         - w2_zp: Optional w2 zero points for int4/int8 quantization.
         - is_nvfp4_scale_swizzled: Whether to swizzle the nvfp4 scale swizzling.
         - is_fp8_a_scale_column_major: Whether to produce a_scale in column major
-        from prepare() as input to the MoE kernel. This is useful for MoE
-        backends that requires transposed a_scale. This is opportunistic and not
-        necessary for PrepareAndFinalize backends.
+        from PrepareAndFinalize backends as input to the MoE kernel. This is
+        useful for MoE backends (e.g., trtllm_fp8_block_scale_moe) that require
+        transposed a_scale. This is opportunistic and not strictly necessary.
         """
         assert not isinstance(quant_dtype, str) or quant_dtype in {
             "nvfp4",
