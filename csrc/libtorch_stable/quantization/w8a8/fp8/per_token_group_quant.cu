@@ -262,7 +262,7 @@ __global__ void per_token_group_quant_8bit_packed_kernel(
   // whether it is a valid group (not padding)
   const bool is_valid_group = (mn_idx < mn) && (sf_k_idx < groups_per_row);
 
-  // Only valid groups read input and compute scales via shared memory.
+  // shared memory to cache each group's data to avoid double DRAM reads.
   extern __shared__ __align__(16) char smem_raw[];
   T* smem = reinterpret_cast<T*>(smem_raw);
   T* smem_group = smem + local_group_id * group_size;
@@ -277,7 +277,7 @@ __global__ void per_token_group_quant_8bit_packed_kernel(
                                      lane_id, threads_per_group, eps, max_8bit);
   }
 
-  // write scale byte: exponent for valid groups, zero for padding.
+  // pack 4 scales into a uint32 exponent
   if (lane_id == 0) {
     // each uint32 in output_s_packed stores 4 packed scales
     const int sf_k_pack_idx = sf_k_idx / 4;
@@ -291,7 +291,7 @@ __global__ void per_token_group_quant_8bit_packed_kernel(
       const uint8_t exponent = static_cast<uint8_t>((bits >> 23u) & 0xffu);
       reinterpret_cast<uint8_t*>(output_s_packed)[out_idx * 4 + pos] = exponent;
     } else if (out_idx < num_scale_elems) {
-      // skip writes beyond the storage size
+      // write zero for padding groups if within bounds of output_s_packed
       reinterpret_cast<uint8_t*>(output_s_packed)[out_idx * 4 + pos] = 0;
     }
   }
@@ -356,7 +356,7 @@ void per_token_group_quant_8bit_packed(const torch::stable::Tensor& input,
   // output_s_packed is written (padding bytes get zeroed by the kernel).
   const int64_t padded_groups_per_row = k_num_packed_sfk * 4;
   const int64_t num_groups_padded = tma_aligned_mn * padded_groups_per_row;
-  // Number of uint32 elements in output_s_packed.
+  // Number of elements in output_s_packed.
   const int64_t num_scale_elems = mn + (k_num_packed_sfk - 1) * tma_aligned_mn;
 
   const int groups_per_block = GetGroupsPerBlock(num_groups_padded);
