@@ -259,56 +259,53 @@ __global__ void per_token_group_quant_8bit_packed_kernel(
       static_cast<int>(global_group_id % padded_groups_per_row);
   const int mn_idx = static_cast<int>(global_group_id / padded_groups_per_row);
 
-  // Padding groups: write a zero byte and exit.
-  if (!((mn_idx < mn) && (sf_k_idx < groups_per_row))) {
-    if (lane_id == 0) {
-      // each uint32 in output_s_packed stores 4 packed scales
-      const int sf_k_pack_idx = sf_k_idx / 4;
-      const int pos = sf_k_idx % 4;
-      const int out_idx = sf_k_pack_idx * tma_aligned_mn + mn_idx;
+  // whether it is a valid group (not padding)
+  const bool is_valid_group = (mn_idx < mn) && (sf_k_idx < groups_per_row);
 
-      // skip writes beyond the storage size
-      if (out_idx < num_scale_elems) {
-        reinterpret_cast<uint8_t*>(output_s_packed)[out_idx * 4 + pos] = 0;
-      }
-    }
-    return;
-  }
-
-  const int64_t block_group_offset =
-      static_cast<int64_t>(mn_idx) * groups_per_row * group_size +
-      sf_k_idx * group_size;
-
-  const T* group_input = input + block_group_offset;
-  DST_DTYPE* group_output =
-      static_cast<DST_DTYPE*>(output_q) + block_group_offset;
-
-  // shared memory to cache each group's data to avoid double DRAM reads.
+  // Only valid groups read input and compute scales via shared memory.
   extern __shared__ __align__(16) char smem_raw[];
   T* smem = reinterpret_cast<T*>(smem_raw);
   T* smem_group = smem + local_group_id * group_size;
-  const float y_s =
-      ComputeGroupScale<T, true>(group_input, smem_group, group_size, lane_id,
-                                 threads_per_group, eps, max_8bit);
 
-  // pack 4 scales into a uint32
+  // compute scale for valid groups
+  float y_s = 0.f;
+  if (is_valid_group) {
+    const T* group_input =
+        input + static_cast<int64_t>(mn_idx) * groups_per_row * group_size +
+        sf_k_idx * group_size;
+    y_s = ComputeGroupScale<T, true>(group_input, smem_group, group_size,
+                                     lane_id, threads_per_group, eps, max_8bit);
+  }
+
+  // write scale byte: exponent for valid groups, zero for padding.
   if (lane_id == 0) {
     // each uint32 in output_s_packed stores 4 packed scales
     const int sf_k_pack_idx = sf_k_idx / 4;
     const int pos = sf_k_idx % 4;
     const int out_idx = sf_k_pack_idx * tma_aligned_mn + mn_idx;
 
-    // reinterpret the UE8M0 scale y_s as IEEE bits, extract the 8-bit
-    // exponent, and write it to the correct byte position in output_s_packed.
-    const unsigned int bits = __float_as_uint(y_s);
-    const uint8_t exponent = static_cast<uint8_t>((bits >> 23u) & 0xffu);
-    reinterpret_cast<uint8_t*>(output_s_packed)[out_idx * 4 + pos] = exponent;
+    if (is_valid_group) {
+      // reinterpret the UE8M0 scale y_s as IEEE bits, extract the 8-bit
+      // exponent, and place it into the correct byte of the 32-bit word.
+      const unsigned int bits = __float_as_uint(y_s);
+      const uint8_t exponent = static_cast<uint8_t>((bits >> 23u) & 0xffu);
+      reinterpret_cast<uint8_t*>(output_s_packed)[out_idx * 4 + pos] = exponent;
+    } else if (out_idx < num_scale_elems) {
+      // skip writes beyond the storage size
+      reinterpret_cast<uint8_t*>(output_s_packed)[out_idx * 4 + pos] = 0;
+    }
   }
 
   __syncthreads();
 
-  QuantizeGroup<T, DST_DTYPE>(smem_group, group_output, group_size, lane_id,
-                              threads_per_group, y_s, min_8bit, max_8bit);
+  if (is_valid_group) {
+    DST_DTYPE* group_output =
+        static_cast<DST_DTYPE*>(output_q) +
+        static_cast<int64_t>(mn_idx) * groups_per_row * group_size +
+        sf_k_idx * group_size;
+    QuantizeGroup<T, DST_DTYPE>(smem_group, group_output, group_size, lane_id,
+                                threads_per_group, y_s, min_8bit, max_8bit);
+  }
 }
 
 void per_token_group_quant_8bit_packed(const torch::stable::Tensor& input,

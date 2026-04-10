@@ -49,36 +49,41 @@ def test_per_token_group_quant_fp8(
 
 
 @pytest.mark.parametrize(
-    "num_tokens,hidden_dim",
+    "num_tokens,hidden_dim,group_size",
     [
         # No padding: mn=4 (mult of 4), groups_per_row=56 (mult of 4)
-        (4, 7168),
+        (4, 7168, 128),
         # MN padding only: mn=1, tma_aligned_mn=4
-        (1, 7168),
+        (1, 7168, 128),
         # MN padding only: mn=3, tma_aligned_mn=4
-        (3, 7168),
+        (3, 7168, 128),
         # K padding only: groups_per_row=5 (5%4=1)
-        (4, 640),
+        (4, 640, 128),
         # K padding only: groups_per_row=6 (6%4=2)
-        (4, 768),
+        (4, 768, 128),
         # Single packed column, no padding: k_num_packed=1, mn%4=0
-        (4, 384),
+        (4, 384, 128),
         # Both MN and K padding
-        (1, 384),
-        (3, 640),
+        (1, 384, 128),
+        (3, 640, 128),
         # Larger shapes with no padding
-        (64, 7168),
-        (128, 14336),
+        (64, 7168, 128),
+        (128, 14336, 128),
         # Larger shapes with padding
-        (127, 7168),
-        (253, 640),
+        (127, 7168, 128),
+        (253, 640, 128),
+        # Non-power-of-2 group size
+        (4, 768, 96),  # 768/96=8 groups, no padding
+        (3, 768, 96),  # 768/96=8 groups, MN padding
+        (4, 480, 96),  # 480/96=5 groups, K padding
+        (1, 480, 96),  # both MN and K padding
     ],
 )
-@pytest.mark.parametrize("group_size", [128])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_per_token_group_quant_fp8_packed(num_tokens, hidden_dim, group_size):
     """Test the packed DeepGEMM quantization kernel against the Triton
     reference (row-major, UE8M0 scales)."""
+
     device = "cuda"
     torch.manual_seed(42)
 
