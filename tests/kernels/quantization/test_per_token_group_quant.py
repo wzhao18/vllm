@@ -61,12 +61,17 @@ def test_per_token_group_quant_fp8(
         (4, 640),
         # K padding only: groups_per_row=6 (6%4=2)
         (4, 768),
+        # Single packed column, no padding: k_num_packed=1, mn%4=0
+        (4, 384),
         # Both MN and K padding
         (1, 384),
         (3, 640),
-        # Larger shapes
+        # Larger shapes with no padding
         (64, 7168),
         (128, 14336),
+        # Larger shapes with padding
+        (127, 7168),
+        (253, 640),
     ],
 )
 @pytest.mark.parametrize("group_size", [128])
@@ -97,69 +102,31 @@ def test_per_token_group_quant_fp8_packed(num_tokens, hidden_dim, group_size):
     # Quantized values must match.
     assert torch.equal(out_q, ref_q), "Quantized output mismatch"
 
-    # Verify packed scales against reference float scales.
-    # ref_s is row-major float32 with shape [mn, groups_per_row].
-    # out_s_packed is int32 with 4 UE8M0 exponent bytes per word.
+    # Verify packed scales (valid exponents + padding zeros)
     mn = num_tokens
     groups_per_row = hidden_dim // group_size
     k_num_packed = (groups_per_row + 3) // 4
     tma_aligned_mn = ((mn + 3) // 4) * 4
+    num_scale_elems = mn + (k_num_packed - 1) * tma_aligned_mn
 
-    # Extract reference exponents from float scales.
-    # UE8M0 scale = 2^(exponent - 127), so the IEEE exponent byte encodes it.
+    # Extract reference exponents from the Triton float32 scales.
     ref_s_flat = ref_s.reshape(mn, groups_per_row)
     ref_exponents = (ref_s_flat.view(torch.int32) >> 23) & 0xFF
 
-    # Read packed buffer as raw bytes.
-    packed_bytes = out_s_packed.view(torch.int32).cpu()
-    # The physical layout is column-major: stride (1, tma_aligned_mn).
-    # packed_bytes has shape [mn, k_num_packed].
+    expected = torch.zeros(num_scale_elems, dtype=torch.int32)
     for row in range(mn):
         for g in range(groups_per_row):
             pack_col = g // 4
             pos = g % 4
-            word = packed_bytes[row, pack_col].item()
-            byte_val = (word >> (pos * 8)) & 0xFF
-            expected = ref_exponents[row, g].item()
-            assert byte_val == expected, (
-                f"Scale mismatch at row={row}, group={g}: "
-                f"packed={byte_val}, expected={expected}"
-            )
+            idx = pack_col * tma_aligned_mn + row
+            expected[idx] |= int(ref_exponents[row, g].item()) << (pos * 8)
 
-    # Verify padding bytes are zero.
-    # out_s_packed has shape [mn, k_num_packed] with strides (1, tma_aligned_mn).
-    # The storage has mn + (k_num_packed - 1) * tma_aligned_mn int32s,
-    # which does NOT include the last column's MN padding (those bytes are
-    # beyond the allocation and never read by DeepGEMM).
-    storage_size = mn + (k_num_packed - 1) * tma_aligned_mn
-    raw_flat = torch.as_strided(out_s_packed, (storage_size,), (1,)).cpu()
-
-    # Helper to read a physical int32 at column c, row r.
-    def read_word(c, r):
-        idx = c * tma_aligned_mn + r
-        assert idx < storage_size
-        return raw_flat[idx].item()
-
-    # Check MN padding rows (mn..tma_aligned_mn-1) in each column,
-    # but skip the last column where these positions are beyond the storage.
-    for c in range(k_num_packed - 1):
-        for r in range(mn, tma_aligned_mn):
-            assert read_word(c, r) == 0, (
-                f"MN padding not zero at col={c}, row={r}: 0x{read_word(c, r):08x}"
-            )
-
-    # Check K padding bytes within valid MN rows
-    padded_groups_per_row = k_num_packed * 4
-    if padded_groups_per_row > groups_per_row:
-        for r in range(mn):
-            for g in range(groups_per_row, padded_groups_per_row):
-                pack_col = g // 4
-                pos = g % 4
-                word = read_word(pack_col, r)
-                byte_val = (word >> (pos * 8)) & 0xFF
-                assert byte_val == 0, (
-                    f"K padding not zero at row={r}, group={g}: {byte_val}"
-                )
+    actual = torch.as_strided(out_s_packed, (num_scale_elems,), (1,)).cpu()
+    assert torch.equal(actual, expected), (
+        f"Packed scale storage mismatch.\n"
+        f"First diff at index "
+        f"{(actual != expected).nonzero(as_tuple=True)[0][0].item()}"
+    )
 
 
 @pytest.mark.parametrize("shape", [(32, 128), (64, 256), (16, 512)])
