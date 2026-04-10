@@ -127,23 +127,25 @@ def test_per_token_group_quant_fp8_packed(num_tokens, hidden_dim, group_size):
             )
 
     # Verify padding bytes are zero.
-    # MN padding: rows mn..tma_aligned_mn-1 in each column.
-    raw = out_s_packed.cpu().contiguous()
-    # Physical buffer is k_num_packed * tma_aligned_mn int32s.
-    # Stride is (1, tma_aligned_mn) so column c starts at int32 offset
-    # c * tma_aligned_mn.
-    raw_int32 = torch.zeros(k_num_packed, tma_aligned_mn, dtype=torch.int32)
-    for c in range(k_num_packed):
-        for r in range(tma_aligned_mn):
-            # physical offset = c * tma_aligned_mn + r
-            raw_int32[c, r] = raw.view(-1)[c * tma_aligned_mn + r]
+    # out_s_packed has shape [mn, k_num_packed] with strides (1, tma_aligned_mn).
+    # The storage has mn + (k_num_packed - 1) * tma_aligned_mn int32s,
+    # which does NOT include the last column's MN padding (those bytes are
+    # beyond the allocation and never read by DeepGEMM).
+    storage_size = mn + (k_num_packed - 1) * tma_aligned_mn
+    raw_flat = torch.as_strided(out_s_packed, (storage_size,), (1,)).cpu()
 
-    # Check MN padding rows
-    for c in range(k_num_packed):
+    # Helper to read a physical int32 at column c, row r.
+    def read_word(c, r):
+        idx = c * tma_aligned_mn + r
+        assert idx < storage_size
+        return raw_flat[idx].item()
+
+    # Check MN padding rows (mn..tma_aligned_mn-1) in each column,
+    # but skip the last column where these positions are beyond the storage.
+    for c in range(k_num_packed - 1):
         for r in range(mn, tma_aligned_mn):
-            assert raw_int32[c, r].item() == 0, (
-                f"MN padding not zero at col={c}, row={r}: "
-                f"0x{raw_int32[c, r].item():08x}"
+            assert read_word(c, r) == 0, (
+                f"MN padding not zero at col={c}, row={r}: 0x{read_word(c, r):08x}"
             )
 
     # Check K padding bytes within valid MN rows
@@ -153,7 +155,7 @@ def test_per_token_group_quant_fp8_packed(num_tokens, hidden_dim, group_size):
             for g in range(groups_per_row, padded_groups_per_row):
                 pack_col = g // 4
                 pos = g % 4
-                word = raw_int32[pack_col, r].item()
+                word = read_word(pack_col, r)
                 byte_val = (word >> (pos * 8)) & 0xFF
                 assert byte_val == 0, (
                     f"K padding not zero at row={r}, group={g}: {byte_val}"

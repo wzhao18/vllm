@@ -261,12 +261,18 @@ __global__ void per_token_group_quant_8bit_packed_kernel(
   const bool is_valid = (mn_idx < mn) && (sf_k_idx < groups_per_row);
 
   // Padding groups: write a zero byte and exit.
+  // Skip writes beyond the storage, which has
+  // mn + (padded_groups_per_row / 4 - 1) * tma_aligned_mn int32s.
   if (!is_valid) {
     if (lane_id == 0) {
       const int sf_k_pack_idx = sf_k_idx / 4;
       const int pos = sf_k_idx % 4;
       const int out_idx = sf_k_pack_idx * tma_aligned_mn + mn_idx;
-      reinterpret_cast<uint8_t*>(output_s_packed)[out_idx * 4 + pos] = 0;
+      const int num_scale_elems =
+          mn + (padded_groups_per_row / 4 - 1) * tma_aligned_mn;
+      if (out_idx < num_scale_elems) {
+        reinterpret_cast<uint8_t*>(output_s_packed)[out_idx * 4 + pos] = 0;
+      }
     }
     return;
   }
