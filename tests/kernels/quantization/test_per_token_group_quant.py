@@ -79,8 +79,11 @@ def test_per_token_group_quant_fp8(
         (1, 480, 96),  # both MN and K padding
     ],
 )
+@pytest.mark.parametrize("poisoned_scales", [False, True])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_per_token_group_quant_fp8_packed(num_tokens, hidden_dim, group_size):
+def test_per_token_group_quant_fp8_packed(
+    num_tokens, hidden_dim, group_size, poisoned_scales
+):
     """Test the packed DeepGEMM quantization kernel against the Triton
     reference (row-major, UE8M0 scales)."""
 
@@ -89,12 +92,40 @@ def test_per_token_group_quant_fp8_packed(num_tokens, hidden_dim, group_size):
 
     x = torch.randn((num_tokens, hidden_dim), device=device, dtype=torch.bfloat16) * 8
 
-    # Packed CUDA kernel under test
-    out_q, out_s_packed = fp8_utils.per_token_group_quant_fp8_packed_for_deepgemm(
-        x,
-        group_size=group_size,
-        use_ue8m0=True,
-    )
+    mn = num_tokens
+    groups_per_row = hidden_dim // group_size
+    k_num_packed = (groups_per_row + 3) // 4
+    tma_aligned_mn = ((mn + 3) // 4) * 4
+    num_scale_elems = mn + (k_num_packed - 1) * tma_aligned_mn
+
+    if poisoned_scales:
+        # Call the kernel with poisoned scale buffer to
+        # ensure padded indices are correctly zeroed.
+        fp8_dtype = torch.float8_e4m3fn
+        finfo = torch.finfo(fp8_dtype)
+        out_q = torch.empty_like(x, dtype=fp8_dtype)
+        out_s_packed = torch.empty_strided(
+            (mn, k_num_packed),
+            (1, tma_aligned_mn),
+            device=device,
+            dtype=torch.int32,
+        )
+        torch.as_strided(out_s_packed, (num_scale_elems,), (1,)).fill_(0x7F7F7F7F)
+        torch.ops._C.per_token_group_fp8_quant_packed(
+            x,
+            out_q,
+            out_s_packed,
+            group_size,
+            1e-10,
+            finfo.min,
+            finfo.max,
+        )
+    else:
+        out_q, out_s_packed = fp8_utils.per_token_group_quant_fp8_packed_for_deepgemm(
+            x,
+            group_size=group_size,
+            use_ue8m0=True,
+        )
 
     # Triton reference (row-major float32 scales, UE8M0)
     with patch("vllm.platforms.current_platform.is_cuda", return_value=False):
@@ -107,14 +138,7 @@ def test_per_token_group_quant_fp8_packed(num_tokens, hidden_dim, group_size):
     # Quantized values must match.
     assert torch.equal(out_q, ref_q), "Quantized output mismatch"
 
-    # Verify packed scales (valid exponents + padding zeros)
-    mn = num_tokens
-    groups_per_row = hidden_dim // group_size
-    k_num_packed = (groups_per_row + 3) // 4
-    tma_aligned_mn = ((mn + 3) // 4) * 4
-    num_scale_elems = mn + (k_num_packed - 1) * tma_aligned_mn
-
-    # Extract reference exponents from the Triton float32 scales.
+    # Verify packed scales (valid exponents + padding zeros).
     ref_s_flat = ref_s.reshape(mn, groups_per_row)
     ref_exponents = (ref_s_flat.view(torch.int32) >> 23) & 0xFF
 
