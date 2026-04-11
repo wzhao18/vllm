@@ -118,7 +118,7 @@ def test_per_token_group_quant_fp8_packed(num_tokens, hidden_dim, group_size):
     ref_s_flat = ref_s.reshape(mn, groups_per_row)
     ref_exponents = (ref_s_flat.view(torch.int32) >> 23) & 0xFF
 
-    expected = torch.zeros(num_scale_elems, dtype=torch.int32)
+    expected = torch.zeros(num_scale_elems, dtype=torch.int32, device="cpu")
     for row in range(mn):
         for g in range(groups_per_row):
             pack_col = g // 4
