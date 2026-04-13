@@ -264,7 +264,7 @@ class TestAllReduceRMSNormGroupQuantFP8PackedModel(torch.nn.Module):
         (TestAllReduceRMSNormStaticQuantFP8Model, True),
         (TestAllReduceRMSNormStaticQuantFP8Model, False),
         (TestAllReduceFusedAddRMSNormStaticQuantFP4Model, False),
-        (TestAllReduceRMSNormGroupQuantFP8PackedModel, False),
+        (TestAllReduceRMSNormGroupQuantFP8PackedModel, True),
     ],
 )
 @pytest.mark.parametrize("batch_size", [8])
@@ -305,6 +305,7 @@ def test_all_reduce_fusion_pass_replace(
 
         if not is_deep_gemm_supported():
             pytest.skip("Skip as per-token-group packed FP8 quant requires DeepGEMM")
+
         gs = TestAllReduceRMSNormGroupQuantFP8PackedModel.GROUP_SIZE
         if hidden_size % gs != 0:
             pytest.skip(f"hidden_size={hidden_size} not divisible by group_size={gs}")
@@ -366,14 +367,12 @@ def all_reduce_fusion_pass_on_test_model(
         custom_ops.append("+rms_norm")
     if enable_quant_fp8_custom_op:
         custom_ops.append("+quant_fp8")
-    # Group quant model needs QuantFP8 custom op enabled to use CUDA path,
-    # and the DeepGemm oracle initialized for the packed quant path.
-    if test_model_cls == TestAllReduceRMSNormGroupQuantFP8PackedModel:
-        if "+quant_fp8" not in custom_ops:
-            custom_ops.append("+quant_fp8")
-        from vllm.utils.deep_gemm import DeepGemmQuantScaleFMT
 
-        DeepGemmQuantScaleFMT.init_oracle_cache()
+    if test_model_cls == TestAllReduceRMSNormGroupQuantFP8PackedModel:
+        from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used
+
+        if not is_deep_gemm_e8m0_used():
+            pytest.skip("Skip as DeepGEMM E8M0 is not supported on this system")
 
     vllm_config = VllmConfig(
         compilation_config=CompilationConfig(
@@ -415,36 +414,9 @@ def all_reduce_fusion_pass_on_test_model(
         results_fused = compiled_model(hidden_states)
         torch.testing.assert_close(results_unfused, results_fused, atol=1e-2, rtol=1e-2)
 
-        if test_model_cls == TestAllReduceRMSNormGroupQuantFP8PackedModel:
-            if not enable_rms_norm_custom_op:
-                # Native RMSNorm ops → patterns can't match the rmsnorm node
-                pass
-            elif flashinfer_allreduce_backend == "mnnvl":
-                # mnnvl doesn't support quant fusion; only non-quant
-                # AR+RMSNorm patterns fire (2 of 4 allreduce points
-                # have quant after them → those won't match the quant
-                # pattern on mnnvl, but the non-quant pattern still
-                # matches all 4 allreduce+rmsnorm points).
-                assert all_reduce_fusion_pass.matched_count >= 2, (
-                    f"Expected at least 2 allreduce fusions on mnnvl, got "
-                    f"{all_reduce_fusion_pass.matched_count}"
-                )
-            else:
-                # trtllm backend + custom RMSNorm enabled: all 4 allreduce
-                # patterns should match (2 with quant, 2 without).
-                assert all_reduce_fusion_pass.matched_count == 4, (
-                    f"Expected 4 allreduce fusions (2 with group quant), "
-                    f"got {all_reduce_fusion_pass.matched_count}"
-                )
-                # Verify the group quant op was actually fused
-                backend.check_before_ops(
-                    model.ops_in_model_before(), fully_replaced=False
-                )
-                backend.check_after_ops(model.ops_in_model_after())
-        else:
-            assert all_reduce_fusion_pass.matched_count == 4, (
-                f"{all_reduce_fusion_pass.matched_count=}"
-            )
-            backend.check_before_ops(model.ops_in_model_before(), fully_replaced=False)
-            backend.check_after_ops(model.ops_in_model_after())
+        assert all_reduce_fusion_pass.matched_count == 4, (
+            f"{all_reduce_fusion_pass.matched_count=}"
+        )
+        backend.check_before_ops(model.ops_in_model_before(), fully_replaced=False)
+        backend.check_after_ops(model.ops_in_model_after())
         del all_reduce_fusion_pass
