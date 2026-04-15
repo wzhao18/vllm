@@ -118,7 +118,7 @@ class RoutingMethodType(IntEnum):
     MiniMax2 = (7,)
     # Unspecified
     Unspecified = (8,)
-    # vLLM-internal routing types (not passed to FlashInfer kernels)
+    # other routing types (not passed to FlashInfer kernels)
     Custom = (100,)
     Simulated = (101,)
 

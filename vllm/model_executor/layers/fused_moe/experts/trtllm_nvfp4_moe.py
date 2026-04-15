@@ -252,6 +252,7 @@ class TrtLlmNvFp4ExpertsMonolithic(
         weight_key: QuantKey | None,
         activation_key: QuantKey | None,
     ) -> bool:
+        # NOTE(rob): this is a conservative list.
         return routing_method_type in [
             RoutingMethodType.DeepSeekV3,
             RoutingMethodType.Renormalize,
