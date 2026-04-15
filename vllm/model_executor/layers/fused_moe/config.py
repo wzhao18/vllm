@@ -134,7 +134,6 @@ def get_routing_method_type(
         if (num_expert_group or 0) > 0 and scoring_func == "sigmoid":
             return RoutingMethodType.DeepSeekV3
         elif scoring_func == "sigmoid":
-            # MiniMax-M2: Sigmoid + Bias -> TopK -> ScaledSumNormalize
             return RoutingMethodType.MiniMax2
         else:
             return RoutingMethodType.Unspecified
@@ -143,7 +142,6 @@ def get_routing_method_type(
         if top_k == 1:
             return RoutingMethodType.Llama4
         elif renormalize:
-            # Sigmoid -> TopK -> Renormalize (divide by sum of top-K)
             return RoutingMethodType.SigmoidRenorm
         else:
             return RoutingMethodType.Unspecified

@@ -196,13 +196,6 @@ class TrtLlmNvFp4ExpertsModular(TrtLlmNvFp4ExpertsBase, mk.FusedMoEExpertsModula
         # Pack topk ids and weights into format expected by the kernel.
         packed_tensor = trtllm_moe_pack_topk_ids_weights(topk_ids, topk_weights)
 
-        # trtllm_fp4_block_scale_routed_moe does not support autotuning
-        # so skip this kernel during dummy run for autotuning.
-        import vllm.utils.flashinfer as fi_utils
-
-        if fi_utils._is_fi_autotuning:
-            return
-
         # Invoke kernel.
         flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe(
             topk_ids=packed_tensor,
@@ -266,6 +259,7 @@ class TrtLlmNvFp4ExpertsMonolithic(
             RoutingMethodType.Llama4,
             RoutingMethodType.SigmoidRenorm,
             RoutingMethodType.MiniMax2,
+            RoutingMethodType.Simulated,
         ]
 
     @staticmethod
@@ -273,17 +267,6 @@ class TrtLlmNvFp4ExpertsMonolithic(
         router_logits_dtype: torch.dtype | None,
         routing_method: RoutingMethodType,
     ) -> bool:
-        """
-        The FlashInfer TRTLLM NvFp4 kernel expects bfloat16 router_logits by default.
-        Sigmoid-based routing methods support float32 router_logits (converted
-        internally).
-        """
-        if router_logits_dtype == torch.float32:
-            return routing_method in (
-                RoutingMethodType.DeepSeekV3,
-                RoutingMethodType.MiniMax2,
-                RoutingMethodType.SigmoidRenorm,
-            )
         return True
 
     def apply(
@@ -314,14 +297,6 @@ class TrtLlmNvFp4ExpertsMonolithic(
             not apply_router_weight_on_input
             and self.routing_method_type != RoutingMethodType.Llama4
         )
-
-        # Sigmoid-based routing methods require float32 logits for precision.
-        if self.routing_method_type in (
-            RoutingMethodType.DeepSeekV3,
-            RoutingMethodType.MiniMax2,
-            RoutingMethodType.SigmoidRenorm,
-        ):
-            router_logits = router_logits.to(torch.float32)
 
         # Currently FI requires bfloat16 routing bias.
         # https://github.com/flashinfer-ai/flashinfer/issues/2909

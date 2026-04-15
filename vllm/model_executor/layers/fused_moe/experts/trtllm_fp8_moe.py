@@ -175,13 +175,6 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
         # Pack topk ids and weights into format expected by the kernel.
         packed_topk_ids = trtllm_moe_pack_topk_ids_weights(topk_ids, topk_weights)
 
-        # trtllm_fp8_block_scale_routed_moe does not support autotuning
-        # so skip this kernel during dummy run for autotuning.
-        import vllm.utils.flashinfer as fi_utils
-
-        if fi_utils._is_fi_autotuning:
-            return
-
         assert a1q_scale is not None
 
         is_mxfp8 = self.quant_config.block_shape == [1, 32]
@@ -196,11 +189,7 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
             weight_layout = WeightLayout.BlockMajorK
             hidden_states_scale = a1q_scale.t().contiguous()
 
-        # `trtllm_fp8_block_scale_routed_moe` has a bug and does not write to the
-        # output tensor in-place so we need to manually copy the result to the
-        # output tensor
-        # https://github.com/flashinfer-ai/flashinfer/issues/2703
-        result = flashinfer.fused_moe.trtllm_fp8_block_scale_routed_moe(
+        flashinfer.fused_moe.trtllm_fp8_block_scale_routed_moe(
             topk_ids=packed_topk_ids,
             routing_bias=None,
             hidden_states=hidden_states,
@@ -221,9 +210,8 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
             use_shuffled_weight=use_shuffled_weight,
             weight_layout=weight_layout,
             fp8_quantization_type=fp8_quant_type,
-            # output=output,
+            output=output,
         )
-        output.copy_(result)
 
 
 class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolithic):
@@ -275,17 +263,6 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
         router_logits_dtype: torch.dtype | None,
         routing_method: RoutingMethodType,
     ) -> bool:
-        """
-        The FlashInfer TRTLLM FP8 kernel expects bfloat16 router_logits by default.
-        Sigmoid-based routing methods support float32 router_logits (converted
-        internally).
-        """
-        if router_logits_dtype == torch.float32:
-            return routing_method in (
-                RoutingMethodType.DeepSeekV3,
-                RoutingMethodType.MiniMax2,
-                RoutingMethodType.SigmoidRenorm,
-            )
         return True
 
     @staticmethod
@@ -308,6 +285,7 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
                 RoutingMethodType.RenormalizeNaive,
                 RoutingMethodType.SigmoidRenorm,
                 RoutingMethodType.MiniMax2,
+                RoutingMethodType.Simulated,
             ]
         elif (weight_key, activation_key) == (kFp8StaticTensorSym, kFp8StaticTensorSym):
             return routing_method in [
@@ -317,6 +295,7 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
                 RoutingMethodType.RenormalizeNaive,
                 RoutingMethodType.SigmoidRenorm,
                 RoutingMethodType.MiniMax2,
+                RoutingMethodType.Simulated,
             ]
         else:
             raise ValueError("Unsupported quantization scheme.")
@@ -351,19 +330,6 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
         assert global_num_experts <= 512
         # TODO: fuse into the quant kernel.
         assert a1q_scale is not None
-
-        # Sigmoid-based routing methods require float32 logits for precision.
-        if self.routing_method_type in (
-            RoutingMethodType.DeepSeekV3,
-            RoutingMethodType.MiniMax2,
-            RoutingMethodType.SigmoidRenorm,
-        ):
-            router_logits = router_logits.to(torch.float32)
-
-        # Currently FI requires bfloat16 routing bias.
-        # https://github.com/flashinfer-ai/flashinfer/issues/2909
-        if e_score_correction_bias is not None:
-            e_score_correction_bias = e_score_correction_bias.to(torch.bfloat16)
 
         is_mxfp8 = self.quant_config.block_shape == [1, 32]
         if is_mxfp8:
@@ -430,14 +396,6 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
             assert apply_router_weight_on_input
         else:
             assert not apply_router_weight_on_input
-
-        # Sigmoid-based routing methods require float32 router logits.
-        if self.routing_method_type in (
-            RoutingMethodType.DeepSeekV3,
-            RoutingMethodType.MiniMax2,
-            RoutingMethodType.SigmoidRenorm,
-        ):
-            router_logits = router_logits.to(torch.float32)
 
         # Currently FI requires bfloat16 routing bias.
         # https://github.com/flashinfer-ai/flashinfer/issues/2909

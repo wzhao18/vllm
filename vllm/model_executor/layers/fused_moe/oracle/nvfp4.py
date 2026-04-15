@@ -271,7 +271,6 @@ def select_nvfp4_moe_backend(
                 activation_key,
                 activation_format,
             )
-
             if supported:
                 logger.info_once(_make_log_backend(backend), scope="local")
                 return backend, k_cls
