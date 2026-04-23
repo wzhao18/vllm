@@ -1522,6 +1522,17 @@ class VllmConfig:
                     )
                 # de-duplicate and sort the sizes
                 cudagraph_capture_sizes = sorted(set(cudagraph_capture_sizes))
+                # Ensure max_cudagraph_capture_size is the last entry so that
+                # decode steps that fill the batch up to max_num_batched_tokens
+                # always hit a captured graph. Without this, e.g.
+                # max_num_batched_tokens=700 would round the top capture down
+                # to 688 (range stride 16), and every full-sized batch would
+                # silently fall back to eager in the dispatcher.
+                if (
+                    cudagraph_capture_sizes
+                    and cudagraph_capture_sizes[-1] < max_cudagraph_capture_size
+                ):
+                    cudagraph_capture_sizes.append(max_cudagraph_capture_size)
 
             if (
                 self.parallel_config.tensor_parallel_size > 1
