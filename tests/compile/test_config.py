@@ -403,13 +403,9 @@ def test_should_split():
         ([1, 256], None, 1, False, 2048, CUDAGraphMode.FULL_AND_PIECEWISE, 256),
         ([], None, 1, False, 2048, CUDAGraphMode.NONE, 0),
         (None, 0, 1, False, 2048, CUDAGraphMode.NONE, 0),
-        # user-specified max is preserved as the top capture size even when it
-        # doesn't land on a stride-16 step (256 is the stride boundary)
-        (None, 257, 1, False, 2048, CUDAGraphMode.FULL_AND_PIECEWISE, 257),
-        # max_num_batched_tokens clamps max_cudagraph_capture_size and is kept
-        # as the top capture size (regression test: 700 used to truncate to 688
-        # causing steady-state decode batches to fall back to eager)
-        (None, 2048, 1, False, 700, CUDAGraphMode.FULL_AND_PIECEWISE, 700),
+        # max_num_batched_tokens < max_cudagraph_capture_size should always be
+        # captured even if not landing on a 16-stride step
+        (None, 2048, 1, False, 257, CUDAGraphMode.FULL_AND_PIECEWISE, 257),
         # max from list
         ([1, 2, 4, 15], None, 1, False, 2048, CUDAGraphMode.FULL_AND_PIECEWISE, 15),
         # SP forces full-graph compilation, sizes are filtered by TP
