@@ -1521,8 +1521,11 @@ class VllmConfig:
                         range(256, max_cudagraph_capture_size + 1, 16)
                     )
                 # ensure max_num_tokens is captured if within max capture size
-                if max_cudagraph_capture_size not in cudagraph_capture_sizes:
-                    cudagraph_capture_sizes.append(max_cudagraph_capture_size)
+                if (
+                    max_num_tokens <= max_cudagraph_capture_size
+                    and max_num_tokens not in cudagraph_capture_sizes
+                ):
+                    cudagraph_capture_sizes.append(max_num_tokens)
                 # de-duplicate and sort the sizes
                 cudagraph_capture_sizes = sorted(set(cudagraph_capture_sizes))
 
