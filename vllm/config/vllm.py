@@ -1520,7 +1520,7 @@ class VllmConfig:
                     cudagraph_capture_sizes += list(
                         range(256, max_cudagraph_capture_size + 1, 16)
                     )
-                # always ensure the max batch size is in the capture sizes
+                # ensure max_num_tokens is captured if within max capture size
                 if max_cudagraph_capture_size not in cudagraph_capture_sizes:
                     cudagraph_capture_sizes.append(max_cudagraph_capture_size)
                 # de-duplicate and sort the sizes
