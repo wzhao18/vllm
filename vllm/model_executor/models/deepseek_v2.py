@@ -50,6 +50,8 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
     GateLinear,
+    RoutingMethodType,
+    fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -335,6 +337,21 @@ class DeepseekV2MoE(nn.Module):
             if self.is_fusion_moe_shared_experts_enabled
             else None,
         )
+
+        # Pre-cast the bias to match the gate output dtype so the
+        # conversion is not repeated on every forward pass.  All
+        # downstream references (FusedMoE, router) share the same
+        # nn.Parameter object, so mutating .data propagates everywhere.
+        # Weight loading uses copy_(), which handles the dtype conversion.
+        # Only needed on ROCm where the aiter biased_grouped_topk kernel
+        # requires the bias dtype to match the gating output dtype.
+        if (
+            self.is_rocm_aiter_moe_enabled
+            and self.gate.e_score_correction_bias is not None
+        ):
+            self.gate.e_score_correction_bias.data = (
+                self.gate.e_score_correction_bias.data.to(self.gate.out_dtype)
+            )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
@@ -1420,7 +1437,7 @@ class DeepseekV2ForCausalLM(
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        return FusedMoE.make_expert_params_mapping(
+        return fused_moe_make_expert_params_mapping(
             self,
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
@@ -1462,7 +1479,7 @@ class DeepseekV2ForCausalLM(
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+        expert_params_mapping = fused_moe_make_expert_params_mapping(
             self,
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
