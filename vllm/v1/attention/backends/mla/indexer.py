@@ -164,6 +164,10 @@ class DeepseekV4IndexerBackend(DeepseekV32IndexerBackend):
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         return [256]
 
+    @staticmethod
+    def get_builder_cls() -> type["DeepseekV32IndexerMetadataBuilder"]:
+        return DeepseekV4IndexerMetadataBuilder
+
 
 @dataclass
 class DeepseekV32IndexerPrefillChunkMetadata:
@@ -636,6 +640,10 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         )
 
         return attn_metadata
+
+
+class DeepseekV4IndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
+    natively_supported_next_n_fp4: list[int] = [1]
 
 
 def build_prefill_chunk_metadata(
