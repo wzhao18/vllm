@@ -1100,8 +1100,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         super().__init__()
 
         # Lazy import to avoid top-level tilelang dependency.
-        # Registers both torch.ops.vllm.mhc_pre and mhc_post,
-        # so hc_post() doesn't need its own import.
+        # Registers both torch.ops.vllm.mhc_pre and mhc_post
         import vllm.model_executor.layers.mhc  # noqa: F401
 
         config = vllm_config.model_config.hf_config
