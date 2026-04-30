@@ -107,9 +107,9 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     import os
 
     import torch.distributed as dist
+    from flashinfer.autotuner import AutoTuner
 
     import vllm.utils.flashinfer as fi_utils
-    from flashinfer.autotuner import AutoTuner
 
     rank = dist.get_rank() if dist.is_initialized() else 0
     tuner = AutoTuner.get()
@@ -162,6 +162,4 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
 
     if save_path:
         tuner.save_configs(save_path)
-        logger.info(
-            "[FlashInfer autotune] rank %d cache saved to %s", rank, save_path
-        )
+        logger.info("[FlashInfer autotune] rank %d cache saved to %s", rank, save_path)
