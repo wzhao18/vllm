@@ -81,20 +81,30 @@ def kernel_warmup(worker: "Worker"):
 def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     """
     Autotune FlashInfer operations.
-    FlashInfer have many implementations for the same operation,
-    autotuning runs benchmarks for each implementation and stores
-    the results. The results are cached transparently and
-    future calls to FlashInfer will use the best implementation.
-    Without autotuning, FlashInfer will rely on heuristics, which may
-    be significantly slower.
+    Only rank 0 runs the profiling; other ranks participate in the
+    dummy_run (so collectives don't deadlock) but enter the autotune
+    context with ``tune_mode=False`` and fall through to the default
+    tactic on every kernel call.
+
+    Setting ``VLLM_FLASHINFER_AUTOTUNE_SAVE_DIR=<dir>`` saves rank 0's
+    profiling cache to ``<dir>/rank_0.json`` after autotune. No save
+    happens unless the env var is set.
     """
+    import os
+
+    import torch.distributed as dist
+
     import vllm.utils.flashinfer as fi_utils
 
-    with torch.inference_mode(), fi_utils.autotune():
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    is_rank_zero = rank == 0
+
+    with torch.inference_mode(), fi_utils.autotune(tune_mode=is_rank_zero):
         # Certain FlashInfer kernels (e.g. nvfp4 routed moe) are
         # incompatible with autotuning. This state is used to skip
-        # those kernels during the autotuning process.
-        fi_utils._is_fi_autotuning = True
+        # those kernels during the autotuning process. Set per-rank so
+        # only rank 0's MoE wrapper opens its inner autotune(True) context.
+        fi_utils._is_fi_autotuning = is_rank_zero
 
         # We skip EPLB here since we don't want to record dummy metrics
         # When autotuning with number of tokens m, flashinfer will autotune
@@ -107,3 +117,14 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
         )
 
         fi_utils._is_fi_autotuning = False
+
+    save_dir = os.environ.get("VLLM_FLASHINFER_AUTOTUNE_SAVE_DIR")
+    if save_dir and is_rank_zero:
+        from flashinfer.autotuner import AutoTuner
+
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, f"rank_{rank}.json")
+        AutoTuner.get().save_configs(save_path)
+        logger.info(
+            "[FlashInfer autotune] rank %d cache saved to %s", rank, save_path
+        )
