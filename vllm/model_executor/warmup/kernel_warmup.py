@@ -98,11 +98,18 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     to disable saving).
 
     Setting ``VLLM_FLASHINFER_AUTOTUNE_LOAD_FILE=<path>`` pre-populates
-    every rank's cache from that single file before the dummy_run. Loaded
-    entries become cache hits during autotune so profiling is skipped for
-    any shape already present, giving reproducible tactic selection across
-    runs (useful for accuracy debugging — e.g. force all ranks onto rank
-    7's saved tactics by pointing this at ``rank_7.json``).
+    every rank's cache from that single file before the dummy_run. Use this
+    to force all ranks onto a specific rank's saved tactics (e.g. point at
+    ``rank_7.json``).
+
+    Setting ``VLLM_FLASHINFER_AUTOTUNE_LOAD_DIRECTORY=<dir>`` pre-populates
+    each rank from ``<dir>/rank_{rank}.json``. Use this to replay a prior
+    run where every rank had its own tuned cache. ``LOAD_FILE`` takes
+    precedence if both are set.
+
+    Loaded entries become cache hits during autotune so profiling is
+    skipped for any shape already present, giving reproducible tactic
+    selection across runs (useful for accuracy debugging).
     """
     import os
 
@@ -115,20 +122,27 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     tuner = AutoTuner.get()
 
     load_file = os.environ.get("VLLM_FLASHINFER_AUTOTUNE_LOAD_FILE")
+    load_dir = os.environ.get("VLLM_FLASHINFER_AUTOTUNE_LOAD_DIRECTORY")
     if load_file:
-        if os.path.isfile(load_file):
-            tuner.load_configs(load_file)
+        load_path: str | None = load_file
+    elif load_dir:
+        load_path = os.path.join(load_dir, f"rank_{rank}.json")
+    else:
+        load_path = None
+    if load_path:
+        if os.path.isfile(load_path):
+            tuner.load_configs(load_path)
             logger.info(
                 "[FlashInfer autotune] rank %d preloaded cache from %s",
                 rank,
-                load_file,
+                load_path,
             )
         else:
             logger.warning(
                 "[FlashInfer autotune] rank %d load file %s not found; "
                 "tuning from scratch",
                 rank,
-                load_file,
+                load_path,
             )
 
     save_dir = os.environ.get(
@@ -136,11 +150,20 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
         "vllm_flashinfer_autotune_cache",
     )
     save_path: str | None
+    # Save only if this rank's file does not already exist; once a rank has
+    # a saved cache we leave it untouched so reruns reuse the previous
+    # tactics. Delete the file (or the whole directory) to force a fresh
+    # save. The check is per-rank to avoid races when multiple workers race
+    # to create the directory.
     if save_dir in ("", "0"):
         save_path = None
     else:
-        os.makedirs(save_dir, exist_ok=True)
-        save_path = os.path.join(save_dir, f"rank_{rank}.json")
+        candidate = os.path.join(save_dir, f"rank_{rank}.json")
+        if os.path.isfile(candidate):
+            save_path = None
+        else:
+            os.makedirs(save_dir, exist_ok=True)
+            save_path = candidate
 
     with torch.inference_mode(), fi_utils.autotune():
         # Certain FlashInfer kernels (e.g. nvfp4 routed moe) are
