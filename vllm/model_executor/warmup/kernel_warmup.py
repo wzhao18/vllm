@@ -81,29 +81,32 @@ def kernel_warmup(worker: "Worker"):
 def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     """
     Autotune FlashInfer operations.
-    FlashInfer have many implementations for the same operation,
-    autotuning runs benchmarks for each implementation and stores
-    the results. The results are cached transparently and
-    future calls to FlashInfer will use the best implementation.
-    Without autotuning, FlashInfer will rely on heuristics, which may
-    be significantly slower.
+    Only rank 0 actually profiles; other ranks skip tuning and load rank 0's
+    cache from disk after a barrier so every worker uses the same tactics.
     """
+    import torch.distributed as dist
+
     import vllm.utils.flashinfer as fi_utils
+    from flashinfer.autotuner import AutoTuner
 
-    with torch.inference_mode(), fi_utils.autotune():
-        # Certain FlashInfer kernels (e.g. nvfp4 routed moe) are
-        # incompatible with autotuning. This state is used to skip
-        # those kernels during the autotuning process.
-        fi_utils._is_fi_autotuning = True
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    is_rank_zero = rank == 0
+    cache_path = "/tmp/vllm_flashinfer_autotune_rank0.json"
 
-        # We skip EPLB here since we don't want to record dummy metrics
-        # When autotuning with number of tokens m, flashinfer will autotune
-        # operations for all number of tokens up to m.
-        # So we only need to run with the max number of tokens.
+    with torch.inference_mode(), fi_utils.autotune(tune_mode=is_rank_zero):
+        # Only rank 0 should profile; others fall through to default tactic.
+        fi_utils._is_fi_autotuning = is_rank_zero
         runner._dummy_run(
             runner.scheduler_config.max_num_batched_tokens,
             skip_eplb=True,
             is_profile=True,
         )
-
         fi_utils._is_fi_autotuning = False
+
+    tuner = AutoTuner.get()
+    if is_rank_zero:
+        tuner.save_configs(cache_path)
+    if dist.is_initialized():
+        dist.barrier()
+    if not is_rank_zero:
+        tuner.load_configs(cache_path)
