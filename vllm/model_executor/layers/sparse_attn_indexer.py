@@ -81,6 +81,16 @@ def kv_cache_as_quant_view(
     return kv_cache.unsqueeze(-2)
 
 
+def _clean_logits(logits: torch.Tensor, seq_lens: torch.Tensor) -> None:
+    """Fill logits[i, seq_lens[i]:] with -inf."""
+    seq_lens_flat = seq_lens.reshape(-1)
+    positions = torch.arange(
+        logits.shape[1], device=logits.device, dtype=seq_lens_flat.dtype
+    )
+    tail_mask = positions.unsqueeze(0) >= seq_lens_flat.unsqueeze(1)
+    logits.masked_fill_(tail_mask, float("-inf"))
+
+
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
     k_cache_prefix: LayerNameType,
@@ -317,6 +327,12 @@ def sparse_attn_indexer(
             max_model_len=max_model_len,
             clean_logits=False,
         )
+
+        # equivalent to passing clean_logits=True to fp8_fp4_paged_mqa_logits
+        # use python implementation for now as deep_gemm's clean_logits=True is
+        # incompatible with 2D context_lens
+        _clean_logits(logits, seq_lens)
+
         num_rows = logits.shape[0]
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
