@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -424,6 +425,14 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         self.intermediate_size = intermediate_size
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
 
+        # Static EPLB: extract this layer's index from its prefix so we can
+        # look up its permutation. None for prefixes that don't match the
+        # standard "...layers.<N>..." pattern.
+        m = re.search(r"layers\.(\d+)", prefix)
+        self._eplb_layer_idx: int | None = int(m.group(1)) if m else None
+        # GPU copy of the permutation, populated on first forward call.
+        self._eplb_perm_gpu: torch.Tensor | None = None
+
         weight_attrs = {"weight_loader": self.weight_loader}
         self.w13_weight = nn.Parameter(
             torch.zeros(
@@ -482,6 +491,19 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         compilation_config.static_forward_context[prefix] = self
 
     def _map_global_expert_id(self, expert_id: int) -> int:
+        # If static EPLB is enabled, the logical expert id is remapped to a
+        # physical position via the calibrated per-layer permutation.
+        perms = _load_dsv4_eplb_perms()
+        if perms is not None and self._eplb_layer_idx is not None:
+            layer_perm = perms.get(self._eplb_layer_idx)
+            if layer_perm is not None:
+                physical = int(layer_perm[expert_id].item())
+                if (
+                    physical < self.experts_start_idx
+                    or physical >= self.experts_end_idx
+                ):
+                    return -1
+                return physical - self.experts_start_idx
         if expert_id < self.experts_start_idx or expert_id >= self.experts_end_idx:
             return -1
         return expert_id - self.experts_start_idx
@@ -650,6 +672,20 @@ class DeepseekV4MegaMoEExperts(nn.Module):
 
         symm_buffer = self.get_symm_buffer()
         num_tokens = hidden_states.shape[0]
+
+        # Static EPLB: remap topk_ids from logical to physical positions.
+        # Sentinel -1 routes are preserved (they're masked at the kernel level).
+        if self._eplb_perm_gpu is None:
+            perms = _load_dsv4_eplb_perms()
+            if perms is not None and self._eplb_layer_idx is not None:
+                layer_perm = perms.get(self._eplb_layer_idx)
+                if layer_perm is not None:
+                    self._eplb_perm_gpu = layer_perm.to(topk_ids.device)
+        if self._eplb_perm_gpu is not None:
+            mask = topk_ids >= 0
+            safe = topk_ids.clamp(min=0)
+            topk_ids = torch.where(mask, self._eplb_perm_gpu[safe], topk_ids)
+
         _stage_deepseek_v4_mega_moe_inputs(
             hidden_states,
             topk_weights,
@@ -677,6 +713,47 @@ class DeepseekV4MegaMoEExperts(nn.Module):
 
 
 DeepseekV4MegaMoEExperts.weight_loader.supports_moe_loading = True  # type: ignore[attr-defined]
+
+
+# Static EPLB rearrangement for DSv4 MegaMoE.
+#
+# Calibration: collect cumulative per-expert load offline, then run a greedy
+# bin-pack to compute, per MoE layer, a permutation that maps logical expert
+# ids to physical positions balanced across EP ranks. Save the result as a
+# torch.save'd dict[layer_idx -> Tensor[num_experts]] and point
+# VLLM_DSV4_EPLB_PERM_FILE at it to activate at load time.
+#
+# Effects:
+#   - weight_loader: expert with logical id L is stored at physical position
+#     perm[L] (only loaded if perm[L] falls within this rank's range).
+#   - _run_mega_moe: topk_ids are remapped from logical->physical before the
+#     kernel call so dispatch hits the rearranged experts.
+_DSV4_EPLB_PERM_FILE = os.environ.get("VLLM_DSV4_EPLB_PERM_FILE", "")
+_dsv4_eplb_perms: dict[int, torch.Tensor] | None = None
+_dsv4_eplb_perms_loaded: bool = False
+
+
+def _load_dsv4_eplb_perms() -> dict[int, torch.Tensor] | None:
+    """Lazy-load the per-layer permutation table from disk. Returns None if
+    VLLM_DSV4_EPLB_PERM_FILE is unset."""
+    global _dsv4_eplb_perms, _dsv4_eplb_perms_loaded
+    if not _DSV4_EPLB_PERM_FILE:
+        return None
+    if not _dsv4_eplb_perms_loaded:
+        from vllm.logger import init_logger
+
+        _dsv4_eplb_perms = torch.load(
+            _DSV4_EPLB_PERM_FILE, map_location="cpu", weights_only=False
+        )
+        for L in list(_dsv4_eplb_perms):
+            _dsv4_eplb_perms[L] = _dsv4_eplb_perms[L].to(torch.long)
+        _dsv4_eplb_perms_loaded = True
+        init_logger(__name__).info(
+            "Loaded DSv4 static EPLB permutation file %s (%d layers)",
+            _DSV4_EPLB_PERM_FILE,
+            len(_dsv4_eplb_perms),
+        )
+    return _dsv4_eplb_perms
 
 
 def _deepseek_v4_mega_moe_experts_op(
