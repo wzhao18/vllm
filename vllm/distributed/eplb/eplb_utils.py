@@ -61,44 +61,54 @@ class CpuGpuEvent:
         self._recorded.set()
 
 
-def override_envs_for_eplb(parallel_config: ParallelConfig) -> None:
+def override_envs_for_eplb(
+    parallel_config: ParallelConfig,
+    moe_backend: str | None = None,
+) -> None:
     """
     Override environment variables for EPLB when specific conditions are met.
 
     Args:
         parallel_config: The parallel configuration object.
+        moe_backend: The configured MoE backend (e.g. ``deep_gemm_mega_moe``).
+            Used to detect cooperative-launch kernels in the same hang class
+            as DeepEP low-latency.
     """
     is_data_parallel = parallel_config.data_parallel_size > 1
     is_eplb_enabled = parallel_config.enable_eplb
-    async_eplb = parallel_config.eplb_config.use_async
     is_deepep_ll = parallel_config.all2all_backend == "deepep_low_latency"
     is_nccl_based_eplb_communicator = parallel_config.eplb_config.communicator in (
         "torch_nccl",
         "pynccl",
     )
+    # DeepGEMM MegaMoE dispatches via PyTorch symmetric memory and launches
+    # cooperative kernels that try to grab most of the GPU's SMs, the same
+    # class of kernel as DeepEP LL. Both deadlock against a concurrent NCCL
+    # collective that occupies those SMs.
+    is_cooperative_moe = moe_backend == "deep_gemm_mega_moe"
 
-    # Override NCCL_MAX_CTAS to avoid hangs when using async EPLB with the
-    # DeepEP low-latency backend.
+    # Override NCCL_MAX_CTAS to avoid hangs when EPLB's NCCL weight exchange
+    # collides with a cooperative-launch MoE backend.
     #
-    # The hang happens when two ranks interleave kernel launches differently
-    # between NCCL collectives (used by async EPLB weight exchange) and DeepEP
-    # low-latency (LL) kernels. DeepEP LL uses a cooperative launch and tries
-    # to reserve a large fraction of the GPU's SMs; if those SMs are currently
-    # occupied by NCCL, the DeepEP LL launch blocks until enough SMs are
-    # freed.
+    # The MoE kernel uses a cooperative launch and tries to reserve a large
+    # fraction of the GPU's SMs; if those SMs are currently occupied by NCCL,
+    # the MoE launch blocks until enough SMs are freed. Conversely NCCL P2P
+    # only completes when all peers participate -- so if any peer is stalled
+    # waiting for SMs the entire collective hangs.
     #
-    # If rank A enters DeepEP LL in main thread while rank B is still executing
-    # NCCL in async thread, rank A can block waiting for SMs, while rank B can
-    # block inside NCCL waiting for rank A to participate in the collective.
-    # This circular wait causes a deadlock.
-    # Limiting NCCL occupancy via NCCL_MAX_CTAS leaves space for the DeepEP
-    # cooperative kernel to launch and complete, breaking the deadlock.
+    # Originally observed with async EPLB + DeepEP LL (NCCL on background
+    # thread, DeepEP on main); also reproduces with sync EPLB + DeepGEMM
+    # MegaMoE, because NCCL P2P runs on its own internal stream and can
+    # overlap with the next forward's cooperative kernel on the default
+    # stream.
+    #
+    # Limiting NCCL occupancy via NCCL_MAX_CTAS leaves SMs available for the
+    # cooperative kernel, breaking the cycle.
     # See: https://github.com/deepseek-ai/DeepEP/issues/496
     if (
         is_data_parallel
         and is_eplb_enabled
-        and is_deepep_ll
-        and async_eplb
+        and (is_deepep_ll or is_cooperative_moe)
         and is_nccl_based_eplb_communicator
     ):
         current_value_str = os.getenv("NCCL_MAX_CTAS")
@@ -108,9 +118,10 @@ def override_envs_for_eplb(parallel_config: ParallelConfig) -> None:
 
         override_value = 8
         os.environ["NCCL_MAX_CTAS"] = str(override_value)
+        trigger = "deepep_low_latency" if is_deepep_ll else "deep_gemm_mega_moe"
         logger.info_once(
             f"EPLB: Setting NCCL_MAX_CTAS={override_value} "
-            "for expert parallel with NCCL-based EPLB communicator and "
-            "deepep_low_latency backend",
+            f"for expert parallel with NCCL-based EPLB communicator and "
+            f"cooperative MoE backend ({trigger})",
             scope="global",
         )

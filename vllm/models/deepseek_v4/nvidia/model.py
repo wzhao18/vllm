@@ -392,6 +392,15 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         set_weight_attrs(self.w2_weight_scale, weight_attrs)
         self.w2_weight_scale.quant_method = "block"
 
+        # Pre-shuffled L1/L2 tiles consumed by the deepgemm MegaMoE kernel.
+        # Populated once by ``finalize_weights`` (either lazily on first
+        # forward, or eagerly when ``get_expert_weights`` is called so the
+        # EPLB orchestrator sees these as the expert weights to migrate).
+        # After finalize, the raw loader-side parameters that are not needed
+        # by the kernel are dropped. ``_transformed_l2_weights[0]`` aliases
+        # ``self.w2_weight.data`` storage, so when EPLB rebalances
+        # ``w2_weight`` in place the L2 weight view picks up the new bytes
+        # for free.
         self._transformed_l1_weights: tuple[torch.Tensor, torch.Tensor] | None = None
         self._transformed_l2_weights: tuple[torch.Tensor, torch.Tensor] | None = None
 
@@ -509,28 +518,28 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             (1, 32),
             self.num_local_experts,
         )
+        # ``transform_weights_for_mega_moe`` allocates fresh tensors for the
+        # interleaved L1 weight and the UTCCP-transposed L1/L2 SF tiles. The
+        # L2 weight is passed through as a view of ``self.w2_weight.data``.
         self._transformed_l1_weights, self._transformed_l2_weights = (
             deep_gemm.transform_weights_for_mega_moe(
                 (self.w13_weight.data.view(torch.int8).contiguous(), w13_scale),
                 (self.w2_weight.data.view(torch.int8).contiguous(), w2_scale),
             )
         )
-        # Drop the original loader-side parameters: the MegaMoE kernels only
-        # consume the transformed views above. transform_weights_for_mega_moe
-        # allocates a fresh tensor for the L1 weight (see _interleave_l1_weights)
-        # and fresh SF tensors for L1/L2; the L2 weight is the only tensor that
-        # aliases the original storage, and _transformed_l2_weights still holds
-        # it, so the storage stays live after we drop the Parameter.
-        #
-        # When EPLB is enabled we keep the originals around because the EPLB
-        # orchestrator migrates these tensors between ranks on rebalance; the
-        # transformed views are re-derived on the next forward by clearing
-        # _transformed_l1_weights / _transformed_l2_weights in update_expert_map.
+
+        # Drop the loader-side parameters that the kernel does not consume.
+        # When EPLB is enabled we additionally need ``w2_weight`` to stay
+        # alive as a registered Parameter so the orchestrator can rebalance
+        # its storage in place -- ``_transformed_l2_weights[0]`` aliases it
+        # and therefore picks up the migrated bytes for free.
+        self.w13_weight = None
+        self.w13_weight_scale = None
+        self.w2_weight_scale = None
         if not self.enable_eplb:
-            self.w13_weight = None
-            self.w13_weight_scale = None
+            # The L2 weight alias is the sole remaining handle to the
+            # storage, so dropping the Parameter is safe.
             self.w2_weight = None
-            self.w2_weight_scale = None
 
     def get_symm_buffer(self):
         from vllm.utils.deep_gemm import _import_deep_gemm
@@ -580,34 +589,72 @@ class DeepseekV4MegaMoEExperts(nn.Module):
 
     def get_expert_weights(self) -> list[torch.Tensor]:
         """Return per-expert tensors that the EPLB orchestrator will migrate
-        between ranks on rearrangement. Order must be stable; the matching
-        ``expert_buffer`` is allocated as ``torch.empty_like`` of each entry.
+        between ranks on rearrangement. We expose the *pre-shuffled* tensors
+        the kernel actually reads (not the raw loader-side weights) so the
+        orchestrator can rebalance them in place; this keeps captured
+        cudagraphs valid because their kernel arguments resolve to the same
+        stable storage on every replay. ``_transformed_l2_weights[0]`` is a
+        view of ``self.w2_weight.data``, so we return the raw ``w2_weight``
+        as L2[0] -- migrating its storage causes the view to see the new
+        bytes for free.
         """
-        weights: list[torch.Tensor] = []
-        for name in (
-            "w13_weight",
-            "w13_weight_scale",
-            "w2_weight",
-            "w2_weight_scale",
-        ):
-            param = getattr(self, name, None)
-            if param is None:
-                continue
-            weights.append(param.data)
-        return weights
+        # finalize_weights must have committed the transforms before EPLB
+        # claims its expert weight handles; the orchestrator calls this
+        # method from ``set_eplb_state`` *before* the first forward.
+        self.finalize_weights()
+        assert self._transformed_l1_weights is not None
+        assert self._transformed_l2_weights is not None
+        assert self.w2_weight is not None, (
+            "DSv4 EPLB requires w2_weight to remain registered so the "
+            "orchestrator can migrate it in place."
+        )
+        def _to_eplb_view(name: str, t: torch.Tensor) -> torch.Tensor:
+            """Return a per-expert (first-dim row-major) view of ``t``.
+
+            The UTCCP SF transforms emitted by deepgemm have the inner two
+            dims swapped relative to the logical layout (stride pattern
+            ``(N, 1, M)`` for shape ``(experts, M, N)``). The actual
+            per-expert byte layout is contiguous — only the metadata is
+            transposed. We follow FusedMoE.get_expert_weights and hand
+            EPLB the transposed-back view, which is contiguous and
+            describes the exact same storage with the same first-dim row
+            stride that EPLB's row-indexed P2P expects.
+            """
+            if t.is_contiguous():
+                return t.view(self.num_local_experts, -1)
+            if (
+                t.dim() == 3
+                and t.stride(1) == 1
+                and t.stride(2) == t.shape[1]
+            ):
+                back = torch.transpose(t, 1, 2)
+                assert back.is_contiguous(), (
+                    f"DSv4 EPLB {name}: transpose-back did not yield "
+                    f"contiguous tensor (shape={tuple(t.shape)} "
+                    f"stride={tuple(t.stride())})"
+                )
+                return back.view(self.num_local_experts, -1)
+            raise AssertionError(
+                f"DSv4 EPLB {name}: non-contiguous expert tensor with "
+                f"unexpected layout shape={tuple(t.shape)} "
+                f"stride={tuple(t.stride())} dtype={t.dtype}"
+            )
+
+        return [
+            _to_eplb_view("l1_packed", self._transformed_l1_weights[0]),
+            _to_eplb_view("l1_scale", self._transformed_l1_weights[1]),
+            _to_eplb_view("l2_weight", self.w2_weight.data),
+            _to_eplb_view("l2_scale", self._transformed_l2_weights[1]),
+        ]
 
     def update_expert_map(self) -> None:
-        """Called after the EPLB orchestrator updates the per-rank expert
-        placement (either at startup or after a rearrangement). Invalidate
-        cached transforms so the next forward re-runs ``finalize_weights``
-        against the (possibly migrated) raw weights.
+        """Called by ``update_physical_experts_metadata`` on elastic-EP scale
+        events. For the cases we support today the local physical-expert
+        count is fixed, the orchestrator migrates the same set of
+        per-expert tensors we already expose, and ``_transformed_l2_weights``
+        aliases ``w2_weight.data`` -- so there is nothing to invalidate.
         """
-        self._transformed_l1_weights = None
-        self._transformed_l2_weights = None
-        # The symm buffer is sized by num_experts; if num_physical changes
-        # (e.g. update_physical_experts_metadata bumped the redundant count)
-        # we'd also need to invalidate it. For now num_physical is fixed
-        # after init.
+        # No-op: keep the symbol available for the EPLB protocol.
 
     # -------------------------------------------------------------------------
 
@@ -653,20 +700,14 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         symm_buffer = self.get_symm_buffer()
         num_tokens = hidden_states.shape[0]
 
-        # EPLB: record per-logical-expert load for the orchestrator, then
-        # remap topk_ids from logical -> physical. Routes to a replicated
-        # logical expert are scattered round-robin across its replicas via
-        # (token_idx * num_topk + slot) % replica_count.
+        # EPLB: remap topk_ids logical -> physical, then record load by
+        # physical expert id. Routes to a replicated logical expert are
+        # scattered round-robin across its replicas via
+        # (token_idx * num_topk + slot) % replica_count. All ops are
+        # shape-stable so the path is cudagraph-safe.
         if self.logical_to_physical_map is not None:
             mask = topk_ids >= 0
-            safe = topk_ids.clamp(min=0)
-            # Per-step load: count routes per logical expert this rank emits.
-            valid = safe[mask]
-            if valid.numel() > 0:
-                load_inc = torch.bincount(
-                    valid, minlength=self.num_logical_experts
-                ).to(self.expert_load_view.dtype)
-                self.expert_load_view.add_(load_inc)
+            safe = topk_ids.clamp(min=0).long()
 
             counts = self.logical_replica_count[safe]
             nt, k = topk_ids.shape
@@ -675,7 +716,16 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             ).view(nt, k)
             replica_idx = indices % counts.clamp(min=1)
             physical = self.logical_to_physical_map[safe, replica_idx]
-            topk_ids = torch.where(mask, physical, topk_ids)
+            topk_ids = torch.where(mask, physical.to(topk_ids.dtype), topk_ids)
+
+            # Accumulate per-physical-expert load. `expert_load_view` has
+            # shape (num_physical_experts,) — matching the orchestrator's
+            # expectation. Use scatter_add so invalid (-1) slots are masked
+            # by zero weights instead of via boolean indexing (which would
+            # be cudagraph-incompatible).
+            flat_physical = topk_ids.flatten().clamp(min=0).long()
+            flat_weights = mask.flatten().to(self.expert_load_view.dtype)
+            self.expert_load_view.scatter_add_(0, flat_physical, flat_weights)
 
         _stage_deepseek_v4_mega_moe_inputs(
             hidden_states,
