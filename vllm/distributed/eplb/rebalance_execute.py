@@ -510,6 +510,7 @@ def rearrange_expert_weights_inplace(
     communicator: EplbCommunicator,
     is_profile: bool = False,
     rank_mapping: dict[int, int] | None = None,
+    weights_buffer: list[torch.Tensor] | None = None,
 ) -> None:
     """
     Rearranges the expert weights in place according to the new expert indices.
@@ -530,6 +531,13 @@ def rearrange_expert_weights_inplace(
             This is used during profile run, where we only perform dummy
             communications to reserve enough memory for the buffers.
         rank_mapping: A dictionary mapping old rank to new rank.
+        weights_buffer: Optional pre-allocated per-tensor scratch buffers
+            matching ``expert_weights[0]`` in shape/dtype. When provided
+            (the EPLB orchestrator passes its persistent ``expert_buffer``),
+            we reuse it instead of allocating a fresh ~one-layer-sized
+            scratch on every rebalance. This avoids the GiB-scale double
+            allocation that shows up as a profile-peak spike on
+            memory-tight setups.
     """
     if rank_mapping is not None:
         if len(rank_mapping) == ep_group.size():
@@ -564,25 +572,40 @@ def rearrange_expert_weights_inplace(
     if is_profile:
         if communicator.needs_profile_buffer_reservation:
             # Reserve NCCL communication buffers via a dummy all_gather.
-            # Backends that pre-allocate their own transfer buffers
-            # skip this to avoid the extra memory spike during profiling.
-            weights_buffer: list[torch.Tensor] = [
-                torch.empty_like(w) for w in first_layer_weights
-            ]
-            for weight, buffer in zip(expert_weights[0], weights_buffer):
-                dummy_recv_buffer = [buffer for _ in range(ep_size)]
-                torch.distributed.barrier()
-                all_gather(
-                    dummy_recv_buffer,
-                    weight,
-                    group=ep_group,
+            # Backends that pre-allocate their own transfer buffers skip
+            # this to avoid the extra memory spike during profiling.
+            #
+            # NCCL's per-channel internal buffers are fixed-size
+            # (NCCL_BUFFSIZE, typically a few MiB) and are allocated on
+            # first use of a (dtype, op) combination -- not sized to the
+            # message. So we only need to *touch* the channels with each
+            # dtype, not exercise full-size transfers. Using a small
+            # fixed buffer here saves the GiB-scale transient peak that
+            # the per-layer-sized buffer caused on memory-tight setups.
+            DUMMY_BYTES = 16 << 20  # 16 MiB per dtype is plenty
+            seen_dtypes: set[torch.dtype] = set()
+            for weight in first_layer_weights:
+                if weight.dtype in seen_dtypes:
+                    continue
+                seen_dtypes.add(weight.dtype)
+                numel = max(DUMMY_BYTES // weight.element_size(), 1)
+                dummy_send = torch.empty(
+                    numel, dtype=weight.dtype, device=weight.device
                 )
+                dummy_recv = [
+                    torch.empty_like(dummy_send) for _ in range(ep_size)
+                ]
+                torch.distributed.barrier()
+                all_gather(dummy_recv, dummy_send, group=ep_group)
         return
 
-    # Buffers to hold the expert weights during the exchange.
-    # NOTE: Currently we assume the same weights across different layers
-    # have the same shape.
-    weights_buffer = [torch.empty_like(w) for w in first_layer_weights]
+    # Buffers to hold the expert weights during the exchange. We assume the
+    # same weights across different layers have the same shape, so a single
+    # set of per-tensor buffers is reused across all layers. If the caller
+    # supplied one (e.g. the orchestrator's persistent ``expert_buffer``),
+    # reuse it -- otherwise allocate a fresh set sized to the first layer.
+    if weights_buffer is None:
+        weights_buffer = [torch.empty_like(w) for w in first_layer_weights]
 
     # NOTE(bowen): We need this synchronize to run, but I don't know why.
     # If you figure out the reason, please let me know -- thank you!

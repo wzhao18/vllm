@@ -396,11 +396,9 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         # Populated once by ``finalize_weights`` (either lazily on first
         # forward, or eagerly when ``get_expert_weights`` is called so the
         # EPLB orchestrator sees these as the expert weights to migrate).
-        # After finalize, the raw loader-side parameters that are not needed
-        # by the kernel are dropped. ``_transformed_l2_weights[0]`` aliases
-        # ``self.w2_weight.data`` storage, so when EPLB rebalances
-        # ``w2_weight`` in place the L2 weight view picks up the new bytes
-        # for free.
+        # After finalize, all four loader-side Parameters are dropped; the
+        # transformed L2 weight is a view of the original w2_weight storage,
+        # which the transformed tuple keeps alive on its own.
         self._transformed_l1_weights: tuple[torch.Tensor, torch.Tensor] | None = None
         self._transformed_l2_weights: tuple[torch.Tensor, torch.Tensor] | None = None
 
@@ -528,18 +526,17 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             )
         )
 
-        # Drop the loader-side parameters that the kernel does not consume.
-        # When EPLB is enabled we additionally need ``w2_weight`` to stay
-        # alive as a registered Parameter so the orchestrator can rebalance
-        # its storage in place -- ``_transformed_l2_weights[0]`` aliases it
-        # and therefore picks up the migrated bytes for free.
+        # Drop the loader-side parameters: the kernel only consumes the
+        # transformed tensors above. ``_transformed_l2_weights[0]`` is a view
+        # of ``self.w2_weight.data``'s storage (deep_gemm's
+        # transform_weights_for_mega_moe passes L2 through unchanged), so
+        # dropping the Parameter is safe -- the view keeps the storage
+        # alive, and EPLB migration in place updates the storage that the
+        # view sees.
         self.w13_weight = None
         self.w13_weight_scale = None
+        self.w2_weight = None
         self.w2_weight_scale = None
-        if not self.enable_eplb:
-            # The L2 weight alias is the sole remaining handle to the
-            # storage, so dropping the Parameter is safe.
-            self.w2_weight = None
 
     def get_symm_buffer(self):
         from vllm.utils.deep_gemm import _import_deep_gemm
@@ -593,10 +590,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         the kernel actually reads (not the raw loader-side weights) so the
         orchestrator can rebalance them in place; this keeps captured
         cudagraphs valid because their kernel arguments resolve to the same
-        stable storage on every replay. ``_transformed_l2_weights[0]`` is a
-        view of ``self.w2_weight.data``, so we return the raw ``w2_weight``
-        as L2[0] -- migrating its storage causes the view to see the new
-        bytes for free.
+        stable storage on every replay.
         """
         # finalize_weights must have committed the transforms before EPLB
         # claims its expert weight handles; the orchestrator calls this
@@ -604,10 +598,6 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         self.finalize_weights()
         assert self._transformed_l1_weights is not None
         assert self._transformed_l2_weights is not None
-        assert self.w2_weight is not None, (
-            "DSv4 EPLB requires w2_weight to remain registered so the "
-            "orchestrator can migrate it in place."
-        )
         def _to_eplb_view(name: str, t: torch.Tensor) -> torch.Tensor:
             """Return a per-expert (first-dim row-major) view of ``t``.
 
@@ -643,7 +633,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         return [
             _to_eplb_view("l1_packed", self._transformed_l1_weights[0]),
             _to_eplb_view("l1_scale", self._transformed_l1_weights[1]),
-            _to_eplb_view("l2_weight", self.w2_weight.data),
+            _to_eplb_view("l2_weight", self._transformed_l2_weights[0]),
             _to_eplb_view("l2_scale", self._transformed_l2_weights[1]),
         ]
 
