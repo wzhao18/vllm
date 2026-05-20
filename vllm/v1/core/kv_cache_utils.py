@@ -1226,6 +1226,13 @@ def _get_kv_cache_config_deepseek_v4(
                 bucket = b.get(ps)
                 if bucket is not None and tuple_idx < len(bucket):
                     shared_by.append(bucket[tuple_idx])
+            if not shared_by:
+                # No layer occupies this (tuple_idx, ps) slot — happens when
+                # buckets within a group have uneven sizes and num_layer_tuples
+                # is set by a larger bucket. Skip to avoid allocating storage
+                # that no layer references (breaks KV connectors and wastes
+                # transient GPU memory during allocation).
+                continue
             kv_cache_tensors.append(
                 KVCacheTensor(size=ps * num_blocks, shared_by=shared_by)
             )

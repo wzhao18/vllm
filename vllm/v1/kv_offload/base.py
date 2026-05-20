@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from vllm.logger import init_logger
+from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -348,10 +349,12 @@ class OffloadingSpec(ABC):
             * parallel_config.prefill_context_parallel_size
         )
 
-        # block size used by vLLM for hashing request tokens for the sake
-        # of enabling prefix caching
-        self.hash_block_size = (
-            vllm_config.cache_config.block_size * context_parallel_factor
+        # Granularity at which the scheduler hashes request tokens for prefix
+        # reuse. Must match `request_block_hasher` (see vllm/v1/engine/core.py),
+        # which is built from the same resolver — otherwise offload keys would
+        # index the wrong slice of `request.block_hashes`.
+        _, self.hash_block_size = resolve_kv_cache_block_sizes(
+            kv_cache_config, vllm_config
         )
         # gpu block size per group
         self.gpu_block_size: tuple[int, ...] = tuple(
@@ -363,8 +366,10 @@ class OffloadingSpec(ABC):
             assert block_size % self.hash_block_size == 0, (
                 f"gpu_block_size={block_size} not divisible by "
                 f"hash_block_size={self.hash_block_size}. "
-                f"Hybrid models (e.g. Mamba+Attention) need "
-                f"--enable-prefix-caching to align block sizes."
+                f"KV cache groups have block sizes that cannot share a common "
+                f"hash granularity (e.g. Mamba+Attention with "
+                f"mamba_cache_mode != 'align'). KV offloading is not supported "
+                f"for this configuration."
             )
 
         # offloaded_block_size / gpu_block_size

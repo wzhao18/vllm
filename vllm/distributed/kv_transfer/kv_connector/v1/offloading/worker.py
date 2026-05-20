@@ -194,13 +194,23 @@ class OffloadingConnectorWorker:
             tensor_layer_names = kv_cache_tensor.shared_by
 
             # verify all layers in the group reference the exact same tensors
-            assert len({len(tensors_per_block[n]) for n in tensor_layer_names}) == 1
-            assert (
-                len({tensors_per_block[n][0].data_ptr() for n in tensor_layer_names})
-                == 1
+            tensor_lens = {n: len(tensors_per_block[n]) for n in tensor_layer_names}
+            assert len(set(tensor_lens.values())) == 1, (
+                f"Layers sharing kv_cache_tensor (size={kv_cache_tensor.size}) "
+                f"produced different numbers of canonical block tensors: "
+                f"{tensor_lens}. shared_by={list(tensor_layer_names)}."
             )
-            assert (
-                len({tensors_per_block[n][0].stride() for n in tensor_layer_names}) == 1
+            data_ptrs = {
+                n: tensors_per_block[n][0].data_ptr() for n in tensor_layer_names
+            }
+            assert len(set(data_ptrs.values())) == 1, (
+                f"Layers sharing kv_cache_tensor have different data_ptr: "
+                f"{data_ptrs}. shared_by={list(tensor_layer_names)}."
+            )
+            strides = {n: tensors_per_block[n][0].stride() for n in tensor_layer_names}
+            assert len(set(strides.values())) == 1, (
+                f"Layers sharing kv_cache_tensor have different strides: "
+                f"{strides}. shared_by={list(tensor_layer_names)}."
             )
 
             # pick the first layer to represent the group
