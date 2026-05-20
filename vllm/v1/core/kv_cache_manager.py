@@ -370,8 +370,9 @@ class KVCacheManager:
         # insufficient free blocks.
         # Should call this function before allocating new blocks to reduce
         # the number of evicted blocks.
+        max_cache_hit_length = request.num_tokens - 1 if self.enable_caching else None
         self.coordinator.remove_skipped_blocks(
-            request.request_id, total_computed_tokens
+            request.request_id, total_computed_tokens, max_cache_hit_length
         )
 
         num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(

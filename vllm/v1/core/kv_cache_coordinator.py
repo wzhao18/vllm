@@ -236,7 +236,10 @@ class KVCacheCoordinator(ABC):
         ]
 
     def remove_skipped_blocks(
-        self, request_id: str, total_computed_tokens: int
+        self,
+        request_id: str,
+        total_computed_tokens: int,
+        max_cache_hit_length: int | None = None,
     ) -> None:
         """
         Remove the blocks that are no longer needed from `blocks` and replace
@@ -246,9 +249,19 @@ class KVCacheCoordinator(ABC):
             request_id: The request ID.
             total_computed_tokens: The total number of computed tokens, including
                 local computed tokens and external computed tokens.
+            max_cache_hit_length: The largest cache hit length this request can
+                use later. Hybrid sliding-window MLA managers use this to keep
+                the latest exact-prefix checkpoint while freeing older local
+                state.
         """
+        alignment_tokens = getattr(self, "lcm_block_size", None)
         for manager in self.single_type_managers:
-            manager.remove_skipped_blocks(request_id, total_computed_tokens)
+            manager.remove_skipped_blocks(
+                request_id,
+                total_computed_tokens,
+                max_cache_hit_length=max_cache_hit_length,
+                alignment_tokens=alignment_tokens,
+            )
 
     def get_blocks(self, request_id: str) -> tuple[list[KVCacheBlock], ...]:
         """

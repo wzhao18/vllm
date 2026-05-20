@@ -416,21 +416,35 @@ class BlockPool:
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
 
-    def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
+    def free_blocks(
+        self, ordered_blocks: Iterable[KVCacheBlock], *, prepend: bool = False
+    ) -> None:
         """Free a list of blocks. The blocks should be ordered by their
         eviction priority, where the first block will be evicted first.
 
         Args:
             ordered_blocks: A list of blocks to free ordered by their eviction
                 priority.
+            prepend: If True, put the freed blocks at the front of the free
+                queue. This is intended for uncached scratch blocks that should
+                be reused before evicting cached prefix blocks.
         """
         # Materialize the iterable to allow multiple passes.
         blocks_list = list(ordered_blocks)
         for block in blocks_list:
             block.ref_cnt -= 1
-        self.free_block_queue.append_n(
-            [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
-        )
+        free_blocks = [
+            block for block in blocks_list if block.ref_cnt == 0 and not block.is_null
+        ]
+        if prepend:
+            self.free_block_queue.prepend_n(free_blocks)
+        else:
+            self.free_block_queue.append_n(free_blocks)
+
+    def evict_cached_blocks(self, blocks: Iterable[KVCacheBlock]) -> None:
+        """Evict cached hashes for the given blocks without freeing them."""
+        for block in blocks:
+            self._maybe_evict_cached_block(block)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.

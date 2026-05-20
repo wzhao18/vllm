@@ -418,7 +418,11 @@ class SingleTypeKVCacheManager(ABC):
         raise NotImplementedError
 
     def remove_skipped_blocks(
-        self, request_id: str, total_computed_tokens: int
+        self,
+        request_id: str,
+        total_computed_tokens: int,
+        max_cache_hit_length: int | None = None,
+        alignment_tokens: int | None = None,
     ) -> None:
         """
         Remove and free the blocks that are no longer needed for attention computation.
@@ -431,6 +435,10 @@ class SingleTypeKVCacheManager(ABC):
             request_id: The request ID.
             total_computed_tokens: The total number of computed tokens, including
                 local computed tokens and external computed tokens.
+            max_cache_hit_length: Optional largest reusable prefix-cache hit
+                length for the request. Ignored by the base manager.
+            alignment_tokens: Optional cache-hit alignment. Ignored by the base
+                manager.
         """
         # Remove the blocks that will be skipped during attention computation.
         num_skipped_tokens = self.get_num_skipped_tokens(total_computed_tokens)
@@ -543,6 +551,92 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
     def __init__(self, kv_cache_spec: SlidingWindowSpec, **kwargs) -> None:
         super().__init__(kv_cache_spec, **kwargs)
         self.sliding_window = kv_cache_spec.sliding_window
+        self._preserved_skipped_block_indices: defaultdict[str, set[int]] = defaultdict(
+            set
+        )
+
+    def remove_skipped_blocks(
+        self,
+        request_id: str,
+        total_computed_tokens: int,
+        max_cache_hit_length: int | None = None,
+        alignment_tokens: int | None = None,
+    ) -> None:
+        if not (
+            self.enable_caching
+            and isinstance(self.kv_cache_spec, SlidingWindowMLASpec)
+            and max_cache_hit_length is not None
+            and alignment_tokens is not None
+        ):
+            super().remove_skipped_blocks(
+                request_id,
+                total_computed_tokens,
+                max_cache_hit_length=max_cache_hit_length,
+                alignment_tokens=alignment_tokens,
+            )
+            return
+
+        num_skipped_tokens = self.get_num_skipped_tokens(total_computed_tokens)
+        if num_skipped_tokens <= 0:
+            return
+
+        blocks = self.req_to_blocks[request_id]
+        num_skipped_blocks = min(num_skipped_tokens // self.block_size, len(blocks))
+        if num_skipped_blocks <= 0:
+            return
+
+        cache_hit_boundary = (
+            min(total_computed_tokens, max_cache_hit_length)
+            // alignment_tokens
+            * alignment_tokens
+        )
+        tail_blocks = cdiv(self.sliding_window - 1, self.block_size)
+        preserve_end = cache_hit_boundary // self.block_size
+        preserve_start = max(0, preserve_end - tail_blocks)
+        preserve_indices = set(range(preserve_start, preserve_end))
+        old_preserved_indices = self._preserved_skipped_block_indices[request_id]
+
+        reusable_blocks: list[KVCacheBlock] = []
+        for i in old_preserved_indices - preserve_indices:
+            if i < len(blocks) and blocks[i] != self._null_block:
+                reusable_blocks.append(blocks[i])
+                blocks[i] = self._null_block
+
+        new_preserved_indices: set[int] = {
+            i
+            for i in old_preserved_indices & preserve_indices
+            if i < len(blocks)
+            and blocks[i] != self._null_block
+            and blocks[i].block_hash is not None
+        }
+        for i in range(num_skipped_blocks - 1, -1, -1):
+            if blocks[i] == self._null_block:
+                break
+
+            block = blocks[i]
+            preserve_for_prefix_hit = (
+                i in preserve_indices and block.block_hash is not None
+            )
+            if preserve_for_prefix_hit:
+                new_preserved_indices.add(i)
+                continue
+
+            reusable_blocks.append(block)
+            blocks[i] = self._null_block
+
+        self._preserved_skipped_block_indices[request_id] = new_preserved_indices
+
+        # If a skipped block is still shared by another active request, keep
+        # its hash intact. The block will not be put on the free queue yet, and
+        # the other request may still rely on it as a cacheable checkpoint.
+        self.block_pool.evict_cached_blocks(
+            block for block in reusable_blocks if block.ref_cnt == 1
+        )
+        self.block_pool.free_blocks(reusable_blocks, prepend=True)
+
+    def free(self, request_id: str) -> None:
+        self._preserved_skipped_block_indices.pop(request_id, None)
+        super().free(request_id)
 
     @classmethod
     def find_longest_cache_hit(
@@ -902,7 +996,13 @@ class MambaManager(SingleTypeKVCacheManager):
 
         return computed_blocks
 
-    def remove_skipped_blocks(self, request_id: str, num_computed_tokens: int) -> None:
+    def remove_skipped_blocks(
+        self,
+        request_id: str,
+        num_computed_tokens: int,
+        max_cache_hit_length: int | None = None,
+        alignment_tokens: int | None = None,
+    ) -> None:
         assert isinstance(self.kv_cache_spec, MambaSpec)
 
         # NOTE (tdoublep) with async scheduling, the num_computed_tokens can contain
@@ -912,7 +1012,12 @@ class MambaManager(SingleTypeKVCacheManager):
         # that we might actually need.
         num_computed_tokens = max(0, num_computed_tokens - self.num_speculative_blocks)
 
-        super().remove_skipped_blocks(request_id, num_computed_tokens)
+        super().remove_skipped_blocks(
+            request_id,
+            num_computed_tokens,
+            max_cache_hit_length=max_cache_hit_length,
+            alignment_tokens=alignment_tokens,
+        )
         if self.mamba_cache_mode == "align":
             # `last_state_block_idx` refers to the block index allocated two steps ago.
             # The block allocated in the previous step is used to copy Mamba states
