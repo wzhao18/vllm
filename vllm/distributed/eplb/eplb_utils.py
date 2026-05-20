@@ -83,25 +83,22 @@ def override_envs_for_eplb(
     )
 
     # Override NCCL_MAX_CTAS to avoid hangs when EPLB's NCCL weight exchange
-    # collides with a cooperative-launch MoE backend on the GPU's SMs.
+    # contends with a cooperative-launch on GPU SMs.
     #
-    # The MoE kernel uses a cooperative launch and tries to reserve a large
-    # fraction of the GPU's SMs; if those SMs are currently occupied by NCCL,
-    # the MoE launch blocks until enough SMs are freed. Conversely NCCL P2P
-    # only completes when all peers participate -- so if any peer is stalled
-    # waiting for SMs the entire collective hangs.
+    # DeepEP low-latency:
+    # The hang happens when two ranks interleave kernel launches differently
+    # between NCCL collectives (used by async EPLB weight exchange) and DeepEP
+    # low-latency (LL) kernels. DeepEP LL uses a cooperative launch and tries
+    # to reserve a large fraction of the GPU's SMs; if those SMs are currently
+    # occupied by NCCL, the DeepEP LL launch blocks until enough SMs are
+    # freed.
     #
-    # Per-backend trigger:
-    #   - DeepEP low-latency: only with async EPLB (NCCL on a background
-    #     thread races MoE on the main thread). Sync DeepEP LL is safe
-    #     because both run sequentially on the same thread.
-    #   - DeepGEMM MegaMoE: with EPLB enabled, sync or async. Sync still
-    #     hits the race because NCCL P2P runs on its own internal stream
-    #     and can extend past the rearrange call return into the next
-    #     forward's cooperative kernel.
-    #
-    # Limiting NCCL occupancy via NCCL_MAX_CTAS leaves SMs available for the
-    # cooperative kernel, breaking the cycle.
+    # If rank A enters DeepEP LL in main thread while rank B is still executing
+    # NCCL in async thread, rank A can block waiting for SMs, while rank B can
+    # block inside NCCL waiting for rank A to participate in the collective.
+    # This circular wait causes a deadlock.
+    # Limiting NCCL occupancy via NCCL_MAX_CTAS leaves space for the DeepEP
+    # cooperative kernel to launch and complete, breaking the deadlock.
     # See: https://github.com/deepseek-ai/DeepEP/issues/496
     if (
         is_data_parallel
@@ -116,10 +113,10 @@ def override_envs_for_eplb(
 
         override_value = 8
         os.environ["NCCL_MAX_CTAS"] = str(override_value)
-        trigger = "deepep_low_latency" if is_deepep_ll else "deep_gemm_mega_moe"
+        backend = "deepep_low_latency" if is_deepep_ll else "deep_gemm_mega_moe"
         logger.info_once(
             f"EPLB: Setting NCCL_MAX_CTAS={override_value} "
             f"for expert parallel with NCCL-based EPLB communicator and "
-            f"cooperative MoE backend ({trigger})",
+            f"cooperative MoE backend ({backend})",
             scope="global",
         )

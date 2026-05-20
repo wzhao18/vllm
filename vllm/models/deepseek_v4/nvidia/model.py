@@ -394,16 +394,12 @@ class DeepseekV4MegaMoEExperts(nn.Module):
     def _map_global_expert_id(self, expert_id: int) -> list[int]:
         """Return local (per-rank) slot offsets where logical expert
         `expert_id` should land on this rank.
-
-        With EPLB redundancy, a logical expert can have multiple physical
-        copies; any whose physical id falls in [experts_start_idx,
-        experts_end_idx) maps to a local slot on this rank.
         """
-        physicals: list[int] = []
+        physical_ids: list[int] = []
         for p in range(self.experts_start_idx, self.experts_end_idx):
             if p % self.num_logical_experts == expert_id:
-                physicals.append(p - self.experts_start_idx)
-        return physicals
+                physical_ids.append(p - self.experts_start_idx)
+        return physical_ids
 
     def weight_loader(
         self,
@@ -414,12 +410,12 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         expert_id: int,
         return_success: bool = False,
     ) -> bool | None:
-        local_ids = self._map_global_expert_id(expert_id)
-        if not local_ids:
+        local_expert_ids = self._map_global_expert_id(expert_id)
+        if not local_expert_ids:
             return False if return_success else None
 
         loaded_any = False
-        for local_expert_id in local_ids:
+        for local_expert_id in local_expert_ids:
             expert_data = param.data[local_expert_id]
             if shard_id in ("w1", "w3"):
                 if "w13_" not in weight_name:
@@ -496,7 +492,6 @@ class DeepseekV4MegaMoEExperts(nn.Module):
                 (self.w2_weight.data.view(torch.int8).contiguous(), w2_scale),
             )
         )
-
         # Drop the original loader-side parameters: the MegaMoE kernels only
         # consume the transformed views above. transform_weights_for_mega_moe
         # allocates a fresh tensor for the L1 weight (see _interleave_l1_weights)
