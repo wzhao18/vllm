@@ -544,45 +544,24 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         self.logical_replica_count = logical_replica_count[moe_layer_idx]
 
     def get_expert_weights(self) -> list[torch.Tensor]:
-        """Return per-expert tensors that the EPLB orchestrator will migrate
-        between ranks on rearrangement. We expose the *pre-shuffled* tensors
-        the kernel actually reads (not the raw loader-side weights) so the
-        orchestrator can rebalance them in place; this keeps captured
-        cudagraphs valid because their kernel arguments resolve to the same
-        stable storage on every replay.
-        """
-        # finalize_weights must have committed the transforms before EPLB
-        # claims its expert weight handles; the orchestrator calls this
-        # method from ``set_eplb_state`` *before* the first forward.
         self.finalize_weights()
         assert self._transformed_l1_weights is not None
         assert self._transformed_l2_weights is not None
         def _to_eplb_view(name: str, t: torch.Tensor) -> torch.Tensor:
-            """Return a per-expert (first-dim row-major) view of ``t``.
-
-            The UTCCP SF transforms emitted by deepgemm have the inner two
-            dims swapped relative to the logical layout (stride pattern
-            ``(N, 1, M)`` for shape ``(experts, M, N)``). The actual
-            per-expert byte layout is contiguous — only the metadata is
-            transposed. We follow FusedMoE.get_expert_weights and hand
-            EPLB the transposed-back view, which is contiguous and
-            describes the exact same storage with the same first-dim row
-            stride that EPLB's row-indexed P2P expects.
-            """
+            """Return a (num_local_experts, -1) view with contiguous memory layout."""
+            assert t.shape[0] == self.num_local_experts
             if t.is_contiguous():
                 return t.view(self.num_local_experts, -1)
-            if (
+            elif (
                 t.dim() == 3
                 and t.stride(1) == 1
                 and t.stride(2) == t.shape[1]
             ):
+                # scales have shape (E, M, N) with memory layout (E, N, M)
                 back = torch.transpose(t, 1, 2)
-                assert back.is_contiguous(), (
-                    f"DSv4 EPLB {name}: transpose-back did not yield "
-                    f"contiguous tensor (shape={tuple(t.shape)} "
-                    f"stride={tuple(t.stride())})"
-                )
+                assert back.is_contiguous()
                 return back.view(self.num_local_experts, -1)
+
             raise AssertionError(
                 f"DSv4 EPLB {name}: non-contiguous expert tensor with "
                 f"unexpected layout shape={tuple(t.shape)} "
@@ -597,13 +576,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         ]
 
     def update_expert_map(self) -> None:
-        """Called by ``update_physical_experts_metadata`` on elastic-EP scale
-        events. For the cases we support today the local physical-expert
-        count is fixed, the orchestrator migrates the same set of
-        per-expert tensors we already expose, and ``_transformed_l2_weights``
-        aliases ``w2_weight.data`` -- so there is nothing to invalidate.
-        """
-        # No-op: keep the symbol available for the EPLB protocol.
+        pass
 
     def forward(
         self,
