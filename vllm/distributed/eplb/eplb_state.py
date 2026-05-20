@@ -761,10 +761,7 @@ class EplbState:
                     eplb_model_state.physical_to_logical_map.cpu(),
                 )
 
-                # Update expert weights. Reuse the persistent
-                # ``expert_buffer`` as the sync rebalance scratch so we
-                # don't double-allocate ~one-layer-worth of weights only to
-                # have one buffer freed at function exit.
+                # Update expert weights
                 rearrange_expert_weights_inplace(
                     eplb_model_state.physical_to_logical_map,
                     new_physical_to_logical_map,
@@ -773,7 +770,6 @@ class EplbState:
                     eplb_model_state.communicator,
                     is_profile,
                     rank_mapping,
-                    weights_buffer=eplb_model_state.expert_buffer,
                 )
 
                 if not is_profile:

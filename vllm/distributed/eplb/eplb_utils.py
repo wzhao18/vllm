@@ -71,8 +71,6 @@ def override_envs_for_eplb(
     Args:
         parallel_config: The parallel configuration object.
         moe_backend: The configured MoE backend (e.g. ``deep_gemm_mega_moe``).
-            Used to detect cooperative-launch kernels in the same hang class
-            as DeepEP low-latency.
     """
     is_data_parallel = parallel_config.data_parallel_size > 1
     is_eplb_enabled = parallel_config.enable_eplb
