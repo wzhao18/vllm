@@ -76,19 +76,16 @@ def override_envs_for_eplb(
     """
     is_data_parallel = parallel_config.data_parallel_size > 1
     is_eplb_enabled = parallel_config.enable_eplb
+    async_eplb = parallel_config.eplb_config.use_async
     is_deepep_ll = parallel_config.all2all_backend == "deepep_low_latency"
+    is_mega_moe = moe_backend == "deep_gemm_mega_moe"
     is_nccl_based_eplb_communicator = parallel_config.eplb_config.communicator in (
         "torch_nccl",
         "pynccl",
     )
-    # DeepGEMM MegaMoE dispatches via PyTorch symmetric memory and launches
-    # cooperative kernels that try to grab most of the GPU's SMs, the same
-    # class of kernel as DeepEP LL. Both deadlock against a concurrent NCCL
-    # collective that occupies those SMs.
-    is_cooperative_moe = moe_backend == "deep_gemm_mega_moe"
 
     # Override NCCL_MAX_CTAS to avoid hangs when EPLB's NCCL weight exchange
-    # collides with a cooperative-launch MoE backend.
+    # collides with a cooperative-launch MoE backend on the GPU's SMs.
     #
     # The MoE kernel uses a cooperative launch and tries to reserve a large
     # fraction of the GPU's SMs; if those SMs are currently occupied by NCCL,
@@ -96,11 +93,14 @@ def override_envs_for_eplb(
     # only completes when all peers participate -- so if any peer is stalled
     # waiting for SMs the entire collective hangs.
     #
-    # Originally observed with async EPLB + DeepEP LL (NCCL on background
-    # thread, DeepEP on main); also reproduces with sync EPLB + DeepGEMM
-    # MegaMoE, because NCCL P2P runs on its own internal stream and can
-    # overlap with the next forward's cooperative kernel on the default
-    # stream.
+    # Per-backend trigger:
+    #   - DeepEP low-latency: only with async EPLB (NCCL on a background
+    #     thread races MoE on the main thread). Sync DeepEP LL is safe
+    #     because both run sequentially on the same thread.
+    #   - DeepGEMM MegaMoE: with EPLB enabled, sync or async. Sync still
+    #     hits the race because NCCL P2P runs on its own internal stream
+    #     and can extend past the rearrange call return into the next
+    #     forward's cooperative kernel.
     #
     # Limiting NCCL occupancy via NCCL_MAX_CTAS leaves SMs available for the
     # cooperative kernel, breaking the cycle.
@@ -108,8 +108,8 @@ def override_envs_for_eplb(
     if (
         is_data_parallel
         and is_eplb_enabled
-        and (is_deepep_ll or is_cooperative_moe)
         and is_nccl_based_eplb_communicator
+        and ((is_deepep_ll and async_eplb) or is_mega_moe)
     ):
         current_value_str = os.getenv("NCCL_MAX_CTAS")
 

@@ -45,13 +45,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.interfaces import MixtureOfExperts, SupportsPP
-from vllm.model_executor.utils import set_weight_attrs
-from vllm.platforms import current_platform
-from vllm.sequence import IntermediateTensors
-from vllm.triton_utils import tl, triton
-from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
@@ -336,11 +330,9 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
-        self.enable_eplb = vllm_config.parallel_config.enable_eplb
 
         # EPLB state. Populated by set_eplb_state() after model init. While
         # None we run with sequential physical placement (no remap).
-        self._eplb_layer_idx: int | None = None
         self.expert_load_view: torch.Tensor | None = None
         self.logical_to_physical_map: torch.Tensor | None = None
         self.logical_replica_count: torch.Tensor | None = None
@@ -579,7 +571,6 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         """Bind this layer's slice of the global EPLB state tensors. The
         layer reads the mapping in forward and writes per-step expert load
         counts back into ``expert_load_view``."""
-        self._eplb_layer_idx = moe_layer_idx
         self.expert_load_view = expert_load_view[moe_layer_idx]
         self.logical_to_physical_map = logical_to_physical_map[moe_layer_idx]
         self.logical_replica_count = logical_replica_count[moe_layer_idx]
@@ -892,7 +883,6 @@ class DeepseekV4MoE(nn.Module):
         # EPLB layout. Without EPLB, n_redundant_experts==0 so n_physical equals
         # n_logical and the layout reduces to the original sequential one.
         eplb_config = vllm_config.parallel_config.eplb_config
-        self.enable_eplb = vllm_config.parallel_config.enable_eplb
         self.n_redundant_experts = eplb_config.num_redundant_experts
         self.n_routed_experts = config.n_routed_experts
         self.n_shared_experts = config.n_shared_experts or 0

@@ -207,42 +207,6 @@ class EplbModelState:
     """
 
 
-def _allocate_contiguous_expert_buffer(
-    expert_weights: Sequence[torch.Tensor],
-) -> list[torch.Tensor]:
-    """Allocate one contiguous byte buffer sized to fit every expert-weight
-    tensor end-to-end, then return per-tensor views into it. This replaces
-    the naive ``[torch.empty_like(w) for w in expert_weights]`` pattern,
-    which produces one allocator block per tensor and tends to fragment
-    the caching allocator (each block can only be reused for an allocation
-    of identical size). A single contiguous block has the same total cost
-    but is far easier for the allocator to satisfy and to reuse.
-
-    Each returned view has the same shape and dtype as the corresponding
-    input tensor. Element offsets are aligned to 256 bytes, which is safe
-    for every dtype torch supports.
-    """
-    if not expert_weights:
-        return []
-    device = expert_weights[0].device
-    ALIGN = 256
-    total_bytes = 0
-    offsets: list[int] = []
-    for t in expert_weights:
-        offsets.append(total_bytes)
-        nbytes = t.numel() * t.element_size()
-        # Round each slot up to ALIGN so dtype reinterpretation stays
-        # aligned regardless of preceding tensor sizes.
-        total_bytes += (nbytes + ALIGN - 1) // ALIGN * ALIGN
-    buf = torch.empty(total_bytes, dtype=torch.uint8, device=device)
-    views: list[torch.Tensor] = []
-    for t, off in zip(expert_weights, offsets):
-        nbytes = t.numel() * t.element_size()
-        view = buf.narrow(0, off, nbytes).view(t.dtype).view(t.shape)
-        views.append(view)
-    return views
-
-
 class EplbState:
     """
     EplbState of each expert parallel model. Key is the model config hash.
@@ -396,24 +360,15 @@ class EplbState:
             physical_to_logical_map_list,
             device=self.device,
         )
-        # Cap on the second dimension of ``logical_to_physical_map``: the
-        # maximum number of physical replicas any single logical expert can
-        # have at the same time. Bounded by ``num_redundant_experts + 1``
-        # (the +1 is for the primary replica). Used to be hardcoded at
-        # 1024 to leave headroom for 128-node × 8-GPU elastic-EP scale-up,
-        # but for non-elastic setups that wastes ~190 MiB per rank on
-        # padding (61 layers × 384 logical × 1023 unused int64 slots).
+        # Assuming 8 GPUs per node, this supports up to
+        # (1023 + 1) / 8 = 128 nodes for now.
+        # TODO(rui): make this configurable
         MAX_EXPERT_REDUNDANCY = 1023
         assert model.num_redundant_experts <= MAX_EXPERT_REDUNDANCY, (
             f"num_redundant_experts {model.num_redundant_experts} "
             f"must be less than or equal to {MAX_EXPERT_REDUNDANCY}"
         )
-        if self.parallel_config.enable_elastic_ep:
-            # Elastic EP may scale up at runtime and need additional slots
-            # beyond the initial num_redundant_experts.
-            max_slots_per_logical_expert = MAX_EXPERT_REDUNDANCY + 1
-        else:
-            max_slots_per_logical_expert = model.num_redundant_experts + 1
+        max_slots_per_logical_expert = MAX_EXPERT_REDUNDANCY + 1
         logical_to_physical_map = torch.full(
             (model.num_logical_experts, max_slots_per_logical_expert),
             -1,
@@ -490,11 +445,7 @@ class EplbState:
             logical_replica_count,
         )
         self._init_should_record_tensor(model)
-        # Single contiguous allocation, then per-tensor views. Avoids
-        # fragmenting the caching allocator across one block per expert
-        # weight tensor, which matters especially on memory-tight setups
-        # (~2 GiB total for DSv4 MegaMoE).
-        expert_buffer = _allocate_contiguous_expert_buffer(model.expert_weights[0])
+        expert_buffer = [torch.empty_like(w) for w in model.expert_weights[0]]
 
         communicator = create_eplb_communicator(
             group_coordinator=get_eplb_group(),
