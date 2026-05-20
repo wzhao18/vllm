@@ -316,13 +316,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
     ):
         super().__init__()
         self.prefix = prefix
-        # `num_experts` here is the *physical* count = logical + redundant.
-        # `num_logical_experts` is the gate output range and the leading
-        # dimension of the EPLB lookup tables.
         self.num_experts = num_experts
-        self.num_logical_experts = (
-            num_logical_experts if num_logical_experts is not None else num_experts
-        )
         self.num_local_experts = num_local_experts
         self.experts_start_idx = experts_start_idx
         self.experts_end_idx = experts_start_idx + num_local_experts
@@ -331,8 +325,11 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         self.intermediate_size = intermediate_size
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
 
-        # EPLB state. Populated by set_eplb_state() after model init. While
-        # None we run with sequential physical placement (no remap).
+        self.num_logical_experts = (
+            num_logical_experts if num_logical_experts is not None else num_experts
+        )
+
+        # EPLB state
         self.expert_load_view: torch.Tensor | None = None
         self.logical_to_physical_map: torch.Tensor | None = None
         self.logical_replica_count: torch.Tensor | None = None
@@ -384,13 +381,6 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         set_weight_attrs(self.w2_weight_scale, weight_attrs)
         self.w2_weight_scale.quant_method = "block"
 
-        # Pre-shuffled L1/L2 tiles consumed by the deepgemm MegaMoE kernel.
-        # Populated once by ``finalize_weights`` (either lazily on first
-        # forward, or eagerly when ``get_expert_weights`` is called so the
-        # EPLB orchestrator sees these as the expert weights to migrate).
-        # After finalize, all four loader-side Parameters are dropped; the
-        # transformed L2 weight is a view of the original w2_weight storage,
-        # which the transformed tuple keeps alive on its own.
         self._transformed_l1_weights: tuple[torch.Tensor, torch.Tensor] | None = None
         self._transformed_l2_weights: tuple[torch.Tensor, torch.Tensor] | None = None
 
@@ -403,20 +393,12 @@ class DeepseekV4MegaMoEExperts(nn.Module):
 
     def _map_global_expert_id(self, expert_id: int) -> list[int]:
         """Return local (per-rank) slot offsets where logical expert
-        ``expert_id`` should land on this rank.
+        `expert_id` should land on this rank.
 
         With EPLB redundancy, a logical expert can have multiple physical
         copies; any whose physical id falls in [experts_start_idx,
-        experts_end_idx) maps to a local slot on this rank. Without EPLB
-        (n_redundant_experts==0) the result has at most one entry — the
-        sequential mapping `expert_id - experts_start_idx`.
+        experts_end_idx) maps to a local slot on this rank.
         """
-        # At weight-load time the EPLB state has not been set yet, so we use
-        # the orchestrator's initial layout, which is:
-        #   physical_to_logical_map[i] = i % num_logical_experts
-        # i.e. the first num_logical_experts physicals carry the original
-        # routed experts and any extra (redundant) slots replicate the first
-        # n_redundant logical experts. This matches FusedMoE behavior.
         physicals: list[int] = []
         for p in range(self.experts_start_idx, self.experts_end_idx):
             if p % self.num_logical_experts == expert_id:
@@ -508,9 +490,6 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             (1, 32),
             self.num_local_experts,
         )
-        # ``transform_weights_for_mega_moe`` allocates fresh tensors for the
-        # interleaved L1 weight and the UTCCP-transposed L1/L2 SF tiles. The
-        # L2 weight is passed through as a view of ``self.w2_weight.data``.
         self._transformed_l1_weights, self._transformed_l2_weights = (
             deep_gemm.transform_weights_for_mega_moe(
                 (self.w13_weight.data.view(torch.int8).contiguous(), w13_scale),
@@ -518,13 +497,12 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             )
         )
 
-        # Drop the loader-side parameters: the kernel only consumes the
-        # transformed tensors above. ``_transformed_l2_weights[0]`` is a view
-        # of ``self.w2_weight.data``'s storage (deep_gemm's
-        # transform_weights_for_mega_moe passes L2 through unchanged), so
-        # dropping the Parameter is safe -- the view keeps the storage
-        # alive, and EPLB migration in place updates the storage that the
-        # view sees.
+        # Drop the original loader-side parameters: the MegaMoE kernels only
+        # consume the transformed views above. transform_weights_for_mega_moe
+        # allocates a fresh tensor for the L1 weight (see _interleave_l1_weights)
+        # and fresh SF tensors for L1/L2; the L2 weight is the only tensor that
+        # aliases the original storage, and _transformed_l2_weights still holds
+        # it, so the storage stays live after we drop the Parameter.
         self.w13_weight = None
         self.w13_weight_scale = None
         self.w2_weight = None
@@ -559,8 +537,6 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             self._symm_buffer_cache[key] = symm_buffer
         return symm_buffer
 
-    # ----- EPLB protocol hooks (used by vllm.distributed.eplb) ---------------
-
     def set_eplb_state(
         self,
         moe_layer_idx: int,
@@ -568,9 +544,6 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         logical_to_physical_map: torch.Tensor,
         logical_replica_count: torch.Tensor,
     ) -> None:
-        """Bind this layer's slice of the global EPLB state tensors. The
-        layer reads the mapping in forward and writes per-step expert load
-        counts back into ``expert_load_view``."""
         self.expert_load_view = expert_load_view[moe_layer_idx]
         self.logical_to_physical_map = logical_to_physical_map[moe_layer_idx]
         self.logical_replica_count = logical_replica_count[moe_layer_idx]
@@ -636,8 +609,6 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         aliases ``w2_weight.data`` -- so there is nothing to invalidate.
         """
         # No-op: keep the symbol available for the EPLB protocol.
-
-    # -------------------------------------------------------------------------
 
     def forward(
         self,
@@ -880,8 +851,6 @@ class DeepseekV4MoE(nn.Module):
         self.ep_size = self.ep_group.world_size
         self.ep_rank = self.ep_group.rank_in_group
 
-        # EPLB layout. Without EPLB, n_redundant_experts==0 so n_physical equals
-        # n_logical and the layout reduces to the original sequential one.
         eplb_config = vllm_config.parallel_config.eplb_config
         self.n_redundant_experts = eplb_config.num_redundant_experts
         self.n_routed_experts = config.n_routed_experts
@@ -897,7 +866,7 @@ class DeepseekV4MoE(nn.Module):
         self.physical_expert_end = (
             self.physical_expert_start + self.n_local_physical_experts
         )
-        # Keep legacy names available for any callers that still read them.
+
         self.n_local_experts = self.n_local_physical_experts
         self.experts_start_idx = self.physical_expert_start
         self.experts_end_idx = self.physical_expert_end
@@ -1725,11 +1694,6 @@ def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
 
 
 class DeepseekV4MixtureOfExperts(MixtureOfExperts):
-    """Implements the EPLB ``MixtureOfExperts`` Protocol for DSv4.
-
-    Populated lazily by ``set_moe_parameters`` after the model is built so we
-    can walk ``self.model.layers`` and pick up the MoE wrappers + experts.
-    """
 
     moe_mlp_layers: list["DeepseekV4MoE"]
 
@@ -1743,11 +1707,6 @@ class DeepseekV4MixtureOfExperts(MixtureOfExperts):
             self.num_routed_experts = 0
             self.num_shared_experts = 0
             self.num_redundant_experts = 0
-            from vllm.logger import init_logger
-
-            init_logger(__name__).warning(
-                "DeepSeek V4: No DeepseekV4MoE layer found; EPLB disabled."
-            )
             return
         self.num_logical_experts = example_moe.n_logical_experts
         self.num_physical_experts = example_moe.n_physical_experts
@@ -1804,8 +1763,6 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV4MixtureOfExperts):
             self.model.make_empty_intermediate_tensors
         )
 
-        # Populate the EPLB ``MixtureOfExperts`` protocol surface after the
-        # model is fully constructed so we can walk the layer list.
         self.set_moe_parameters()
 
     def set_moe_parameters(self) -> None:
@@ -1824,8 +1781,7 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV4MixtureOfExperts):
                 example_moe = layer.ffn
                 self.moe_mlp_layers.append(layer.ffn)
                 self.moe_layers.append(layer.ffn.experts)
-        # DSv4-Pro is all-MoE; if a future variant has dense layers, count only
-        # the MoE ones.
+
         self.num_moe_layers = len(self.moe_layers)
         self.extract_moe_parameters(example_moe)
 
