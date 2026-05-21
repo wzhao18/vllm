@@ -83,7 +83,7 @@ def override_envs_for_eplb(
     )
 
     # Override NCCL_MAX_CTAS to avoid hangs when EPLB's NCCL weight exchange
-    # contends with cooperative-launch on GPU SMs.
+    # contends with MoE backend's cooperative-launch on GPU SMs.
     #
     # DeepEP low-latency:
     # The hang happens when two ranks interleave kernel launches differently
