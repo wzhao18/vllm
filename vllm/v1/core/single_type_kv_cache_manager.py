@@ -422,6 +422,7 @@ class SingleTypeKVCacheManager(ABC):
         request_id: str,
         total_computed_tokens: int,
         max_cache_hit_length: int | None = None,
+        max_cache_hit_lengths: Sequence[int] | None = None,
         alignment_tokens: int | None = None,
     ) -> None:
         """
@@ -437,6 +438,8 @@ class SingleTypeKVCacheManager(ABC):
                 local computed tokens and external computed tokens.
             max_cache_hit_length: Optional largest reusable prefix-cache hit
                 length for the request. Ignored by the base manager.
+            max_cache_hit_lengths: Optional reusable prefix-cache hit lengths
+                for the request. Ignored by the base manager.
             alignment_tokens: Optional cache-hit alignment. Ignored by the base
                 manager.
         """
@@ -560,18 +563,28 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         request_id: str,
         total_computed_tokens: int,
         max_cache_hit_length: int | None = None,
+        max_cache_hit_lengths: Sequence[int] | None = None,
         alignment_tokens: int | None = None,
     ) -> None:
+        cache_hit_lengths: tuple[int, ...]
+        if max_cache_hit_lengths is None:
+            cache_hit_lengths = (
+                () if max_cache_hit_length is None else (max_cache_hit_length,)
+            )
+        else:
+            cache_hit_lengths = tuple(max_cache_hit_lengths)
+
         if not (
             self.enable_caching
             and isinstance(self.kv_cache_spec, SlidingWindowMLASpec)
-            and max_cache_hit_length is not None
+            and cache_hit_lengths
             and alignment_tokens is not None
         ):
             super().remove_skipped_blocks(
                 request_id,
                 total_computed_tokens,
                 max_cache_hit_length=max_cache_hit_length,
+                max_cache_hit_lengths=max_cache_hit_lengths,
                 alignment_tokens=alignment_tokens,
             )
             return
@@ -585,15 +598,17 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         if num_skipped_blocks <= 0:
             return
 
-        cache_hit_boundary = (
-            min(total_computed_tokens, max_cache_hit_length)
-            // alignment_tokens
-            * alignment_tokens
-        )
         tail_blocks = cdiv(self.sliding_window - 1, self.block_size)
-        preserve_end = cache_hit_boundary // self.block_size
-        preserve_start = max(0, preserve_end - tail_blocks)
-        preserve_indices = set(range(preserve_start, preserve_end))
+        preserve_indices: set[int] = set()
+        for cache_hit_length in cache_hit_lengths:
+            cache_hit_boundary = (
+                min(total_computed_tokens, cache_hit_length)
+                // alignment_tokens
+                * alignment_tokens
+            )
+            preserve_end = cache_hit_boundary // self.block_size
+            preserve_start = max(0, preserve_end - tail_blocks)
+            preserve_indices.update(range(preserve_start, preserve_end))
         old_preserved_indices = self._preserved_skipped_block_indices[request_id]
 
         reusable_blocks: list[KVCacheBlock] = []
@@ -1001,6 +1016,7 @@ class MambaManager(SingleTypeKVCacheManager):
         request_id: str,
         num_computed_tokens: int,
         max_cache_hit_length: int | None = None,
+        max_cache_hit_lengths: Sequence[int] | None = None,
         alignment_tokens: int | None = None,
     ) -> None:
         assert isinstance(self.kv_cache_spec, MambaSpec)
@@ -1016,6 +1032,7 @@ class MambaManager(SingleTypeKVCacheManager):
             request_id,
             num_computed_tokens,
             max_cache_hit_length=max_cache_hit_length,
+            max_cache_hit_lengths=max_cache_hit_lengths,
             alignment_tokens=alignment_tokens,
         )
         if self.mamba_cache_mode == "align":

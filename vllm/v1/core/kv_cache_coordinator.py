@@ -240,6 +240,7 @@ class KVCacheCoordinator(ABC):
         request_id: str,
         total_computed_tokens: int,
         max_cache_hit_length: int | None = None,
+        max_cache_hit_lengths: Sequence[int] | None = None,
     ) -> None:
         """
         Remove the blocks that are no longer needed from `blocks` and replace
@@ -253,6 +254,10 @@ class KVCacheCoordinator(ABC):
                 use later. Hybrid sliding-window MLA managers use this to keep
                 the latest exact-prefix checkpoint while freeing older local
                 state.
+            max_cache_hit_lengths: Reusable cache hit lengths this request can
+                use later. Hybrid sliding-window MLA managers use this to keep
+                multiple compact checkpoints, e.g. prompt reuse and final
+                sequence reuse when a request finishes after generation.
         """
         alignment_tokens = getattr(self, "lcm_block_size", None)
         for manager in self.single_type_managers:
@@ -260,6 +265,7 @@ class KVCacheCoordinator(ABC):
                 request_id,
                 total_computed_tokens,
                 max_cache_hit_length=max_cache_hit_length,
+                max_cache_hit_lengths=max_cache_hit_lengths,
                 alignment_tokens=alignment_tokens,
             )
 

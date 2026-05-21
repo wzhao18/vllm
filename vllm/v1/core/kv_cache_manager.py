@@ -435,10 +435,23 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
+        if self.enable_caching and request.num_computed_tokens > 0:
+            cache_hit_lengths = {request.num_tokens - 1}
+            if request.num_prompt_tokens > 0:
+                cache_hit_lengths.add(request.num_prompt_tokens - 1)
+            self.coordinator.remove_skipped_blocks(
+                request.request_id,
+                request.num_computed_tokens,
+                max_cache_hit_lengths=tuple(cache_hit_lengths),
+            )
         self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(
-        self, request_id: str, total_computed_tokens: int
+        self,
+        request_id: str,
+        total_computed_tokens: int,
+        max_cache_hit_length: int | None = None,
+        max_cache_hit_lengths: Sequence[int] | None = None,
     ) -> None:
         """Remove the blocks that are no longer needed from `blocks` and replace
         the removed blocks with null_block.
@@ -447,8 +460,15 @@ class KVCacheManager:
             request_id: The request ID.
             total_computed_tokens: The total number of computed tokens, including
                 local computed tokens and external computed tokens.
+            max_cache_hit_length: Optional largest reusable cache hit length.
+            max_cache_hit_lengths: Optional reusable cache hit lengths.
         """
-        self.coordinator.remove_skipped_blocks(request_id, total_computed_tokens)
+        self.coordinator.remove_skipped_blocks(
+            request_id,
+            total_computed_tokens,
+            max_cache_hit_length=max_cache_hit_length,
+            max_cache_hit_lengths=max_cache_hit_lengths,
+        )
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
