@@ -38,6 +38,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpecKind,
     MambaSpec,
+    SlidingWindowMLASpec,
     SlidingWindowSpec,
 )
 
@@ -2598,6 +2599,94 @@ def test_hybrid_cache_blocks_swa_tail_window_only():
             assert cached is None, (
                 f"SWA hash {i} cannot serve any lcm-aligned hit; should not be cached"
             )
+
+
+def test_hybrid_mla_retains_exact_prefix_checkpoint_under_swa_churn():
+    """DSv4-like SWA MLA groups should retain the latest reusable prefix
+    checkpoint without keeping every intermediate local-state checkpoint.
+
+    The pool below can hold the compact exact-prefix state for the target and
+    two filler prompts, but not every per-segment SWA checkpoint for them. This
+    catches regressions where skipped SWA MLA blocks or the final prefill chunk
+    churn through the global free queue and evict the target's exact-prefix
+    checkpoint.
+    """
+    hash_block_size = 1
+    lcm_block_size = 8
+    prompt_len = 64
+    chunk_size = 32
+    kv_cache_config = KVCacheConfig(
+        num_blocks=90,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=lcm_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float16,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["swa_mla_2"],
+                SlidingWindowMLASpec(
+                    block_size=2,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float16,
+                    sliding_window=4,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["swa_mla_1"],
+                SlidingWindowMLASpec(
+                    block_size=1,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float16,
+                    sliding_window=2,
+                ),
+            ),
+        ],
+    )
+    manager = KVCacheManager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=prompt_len,
+        max_num_batched_tokens=chunk_size,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+
+    def run_prompt(request_id: str, start_token: int) -> list[int]:
+        token_ids = list(range(start_token, start_token + prompt_len))
+        req = make_request(request_id, token_ids, hash_block_size, sha256)
+        computed_blocks, num_computed_tokens = manager.get_computed_blocks(req)
+        assert num_computed_tokens == 0
+        assert not any(computed_blocks.blocks)
+
+        while req.num_computed_tokens < req.num_tokens:
+            num_new_tokens = min(chunk_size, req.num_tokens - req.num_computed_tokens)
+            blocks = manager.allocate_slots(req, num_new_tokens)
+            assert blocks is not None
+            req.num_computed_tokens += num_new_tokens
+            manager.new_step_starts()
+
+        manager.free(req)
+        return token_ids
+
+    target_ids = run_prompt("target", 10_000)
+
+    warm_req = make_request("warm", target_ids, hash_block_size, sha256)
+    _, warm_hit_tokens = manager.get_computed_blocks(warm_req)
+    assert warm_hit_tokens == prompt_len - lcm_block_size
+
+    run_prompt("filler-0", 20_000)
+    run_prompt("filler-1", 30_000)
+
+    probe_req = make_request("probe", target_ids, hash_block_size, sha256)
+    _, hit_tokens = manager.get_computed_blocks(probe_req)
+    assert hit_tokens == prompt_len - lcm_block_size
 
 
 def test_hybrid_cache_blocks_clamped_to_lcm():
