@@ -620,11 +620,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         symm_buffer = self.get_symm_buffer()
         num_tokens = hidden_states.shape[0]
 
-        # EPLB: remap topk_ids logical -> physical, then record load by
-        # physical expert id. Routes to a replicated logical expert are
-        # scattered round-robin across its replicas via
-        # (token_idx * num_topk + slot) % replica_count. All ops are
-        # shape-stable so the path is cudagraph-safe.
+        # EPLB: record expert load
         if self.logical_to_physical_map is not None:
             mask = topk_ids >= 0
             safe = topk_ids.clamp(min=0).long()
@@ -638,11 +634,6 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             physical = self.logical_to_physical_map[safe, replica_idx]
             topk_ids = torch.where(mask, physical.to(topk_ids.dtype), topk_ids)
 
-            # Accumulate per-physical-expert load. `expert_load_view` has
-            # shape (num_physical_experts,) — matching the orchestrator's
-            # expectation. Use scatter_add so invalid (-1) slots are masked
-            # by zero weights instead of via boolean indexing (which would
-            # be cudagraph-incompatible).
             flat_physical = topk_ids.flatten().clamp(min=0).long()
             flat_weights = mask.flatten().to(self.expert_load_view.dtype)
             self.expert_load_view.scatter_add_(0, flat_physical, flat_weights)
