@@ -279,6 +279,48 @@ def _stage_deepseek_v4_mega_moe_inputs(
     )
 
 
+_EPLB_REPLICA_HASH_MULTIPLIER = 2654435769
+
+
+def _map_mega_moe_logical_to_physical_and_record_load(
+    topk_ids: torch.Tensor,
+    *,
+    expert_load_view: torch.Tensor,
+    logical_to_physical_map: torch.Tensor,
+    logical_replica_count: torch.Tensor,
+) -> torch.Tensor:
+    # Clamp invalid IDs before indexing; the mask restores them afterward.
+    valid_expert_mask = topk_ids >= 0
+    safe_logical_expert_ids = topk_ids.clamp(min=0).long()
+
+    # Pick a replica slot for each routed logical expert:
+    # replica_idx[token, slot] = hash(token) % replica_count.
+    replica_counts = logical_replica_count[safe_logical_expert_ids]
+    num_routed_tokens, top_k = topk_ids.shape
+    route_positions = torch.arange(
+        num_routed_tokens * top_k, device=topk_ids.device, dtype=torch.long
+    ).view(num_routed_tokens, top_k)
+    token_indices = route_positions // top_k
+    hashed_token_indices = (token_indices * _EPLB_REPLICA_HASH_MULTIPLIER) & 0xFFFFFFFF
+    replica_indices = hashed_token_indices % replica_counts.clamp(min=1)
+
+    # Replace logical expert IDs with physical expert IDs.
+    physical_expert_ids = logical_to_physical_map[
+        safe_logical_expert_ids, replica_indices
+    ]
+    topk_ids = torch.where(
+        valid_expert_mask,
+        physical_expert_ids.to(topk_ids.dtype),
+        topk_ids,
+    )
+
+    # Record one load unit per valid routed expert assignment.
+    flat_physical_expert_ids = topk_ids.flatten().clamp(min=0).long()
+    load_increments = valid_expert_mask.flatten().to(expert_load_view.dtype)
+    expert_load_view.scatter_add_(0, flat_physical_expert_ids, load_increments)
+    return topk_ids
+
+
 def make_deepseek_v4_expert_params_mapping(
     num_experts: int,
 ) -> list[tuple[str, str, int, str]]:
@@ -625,31 +667,12 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             assert logical_replica_count is not None
             assert expert_load_view is not None
 
-            valid_expert_mask = topk_ids >= 0
-            safe_logical_expert_ids = topk_ids.clamp(min=0).long()
-
-            # Pick a replica slot for each routed logical expert.
-            replica_counts = logical_replica_count[safe_logical_expert_ids]
-            num_routed_tokens, top_k = topk_ids.shape
-            route_positions = torch.arange(
-                num_routed_tokens * top_k, device=topk_ids.device, dtype=torch.long
-            ).view(num_routed_tokens, top_k)
-            replica_indices = route_positions % replica_counts.clamp(min=1)
-
-            # Replace logical expert IDs with physical expert IDs.
-            physical_expert_ids = logical_to_physical_map[
-                safe_logical_expert_ids, replica_indices
-            ]
-            topk_ids = torch.where(
-                valid_expert_mask,
-                physical_expert_ids.to(topk_ids.dtype),
+            topk_ids = _map_mega_moe_logical_to_physical_and_record_load(
                 topk_ids,
+                expert_load_view=expert_load_view,
+                logical_to_physical_map=logical_to_physical_map,
+                logical_replica_count=logical_replica_count,
             )
-
-            # Record one load unit per valid routed expert assignment.
-            flat_physical_expert_ids = topk_ids.flatten().clamp(min=0).long()
-            load_increments = valid_expert_mask.flatten().to(expert_load_view.dtype)
-            expert_load_view.scatter_add_(0, flat_physical_expert_ids, load_increments)
 
         _stage_deepseek_v4_mega_moe_inputs(
             hidden_states,
