@@ -83,7 +83,7 @@ def override_envs_for_eplb(
     )
 
     # Override NCCL_MAX_CTAS to avoid hangs when EPLB's NCCL weight exchange
-    # contends with a cooperative-launch on GPU SMs.
+    # contends with cooperative-launch on GPU SMs.
     #
     # DeepEP low-latency:
     # The hang happens when two ranks interleave kernel launches differently
@@ -100,6 +100,9 @@ def override_envs_for_eplb(
     # Limiting NCCL occupancy via NCCL_MAX_CTAS leaves space for the DeepEP
     # cooperative kernel to launch and complete, breaking the deadlock.
     # See: https://github.com/deepseek-ai/DeepEP/issues/496
+    #
+    # DeepGEMM Mega MoE also uses cooperative launch and will cause hang even
+    # with sync EPLB.
     if (
         is_data_parallel
         and is_eplb_enabled
