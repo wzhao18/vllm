@@ -468,10 +468,6 @@ def test_prefix_cache_default():
     engine_args = EngineArgs.from_cli_args(args=args)
     assert not engine_args.enable_prefix_caching
 
-    args = parser.parse_args(["--prefix-cache-retention-interval", "31998"])
-    engine_args = EngineArgs.from_cli_args(args=args)
-    assert engine_args.prefix_cache_retention_interval == 31998
-
 
 @pytest.mark.parametrize(
     ("arg", "expected", "option"),

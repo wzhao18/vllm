@@ -110,7 +110,7 @@ class CacheConfig:
     """DeepSeek V4 only: retain local sliding-window KV checkpoints at this
     token interval for prefix caching. ``None`` preserves the default dense
     local checkpointing behavior. ``0`` retains only the latest completed
-    prompt/replay boundary. Positive values are rounded to the nearest hybrid
+    replayable prompt boundary. Positive values are rounded up to the next
     LCM boundary."""
     calculate_kv_scales: bool = False
     """Deprecated: This option is deprecated and will be removed in v0.19.

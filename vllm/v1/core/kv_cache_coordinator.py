@@ -5,6 +5,7 @@ from collections.abc import Sequence
 from math import lcm
 
 from vllm.logger import init_logger
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
@@ -445,10 +446,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         else:
             self.local_kv_retention_interval = max(
                 self.lcm_block_size,
-                (
-                    (local_kv_retention_interval + self.lcm_block_size // 2)
-                    // self.lcm_block_size
-                )
+                cdiv(local_kv_retention_interval, self.lcm_block_size)
                 * self.lcm_block_size,
             )
         if self.local_kv_retention_interval is not None:
@@ -520,41 +518,33 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         num_computed_tokens = (
             num_computed_tokens // self.lcm_block_size * self.lcm_block_size
         )
-        latest_prompt_boundaries: tuple[int, ...] = ()
+        latest_replay_boundaries: tuple[int, ...] = ()
         if (
             self.local_kv_retention_interval is not None
             and raw_num_computed_tokens >= request.num_prompt_tokens
         ):
-            prompt_boundary = (
-                request.num_prompt_tokens // self.lcm_block_size * self.lcm_block_size
-            )
             # get_computed_blocks() caps hits at prompt_length - 1 so logits
-            # can be recomputed. Keep that replay boundary too when it differs
-            # from the prompt continuation boundary.
+            # can be recomputed. Use the same replayable boundary for the
+            # extra latest checkpoint instead of retaining a non-replayable boundary.
             replay_boundary = (
                 max(request.num_prompt_tokens - 1, 0)
                 // self.lcm_block_size
                 * self.lcm_block_size
             )
-            latest_prompt_boundaries = tuple(
-                b for b in dict.fromkeys((replay_boundary, prompt_boundary)) if b > 0
+            latest_replay_boundaries = (
+                (replay_boundary,) if replay_boundary > 0 else ()
             )
 
         for manager in self.single_type_managers:
             if self.local_kv_retention_interval is not None and isinstance(
                 manager, SlidingWindowManager
             ):
-                local_num_tokens = (
-                    max(latest_prompt_boundaries)
-                    if latest_prompt_boundaries
-                    else num_computed_tokens
-                )
                 manager.cache_blocks_at_boundaries(
                     request=request,
-                    num_tokens=local_num_tokens,
+                    num_tokens=num_computed_tokens,
                     alignment_tokens=self.lcm_block_size,
                     interval_tokens=self.local_kv_retention_interval,
-                    latest_boundary_tokens=latest_prompt_boundaries,
+                    latest_boundary_tokens=latest_replay_boundaries,
                 )
             else:
                 manager.cache_blocks(

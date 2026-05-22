@@ -2601,7 +2601,7 @@ def test_hybrid_cache_blocks_swa_tail_window_only():
             )
 
 
-def test_hybrid_local_kv_retention_interval_rounds_and_keeps_latest():
+def test_hybrid_local_kv_retention_interval_rounds_up_and_keeps_latest():
     block_size = 8
     kv_cache_config = KVCacheConfig(
         num_blocks=100,
@@ -2633,12 +2633,12 @@ def test_hybrid_local_kv_retention_interval_rounds_and_keeps_latest():
         max_model_len=8192,
         enable_caching=True,
         hash_block_size=block_size,
-        local_kv_retention_interval=48,
+        local_kv_retention_interval=33,
     )
     assert manager.coordinator.local_kv_retention_interval == 64
 
     # 16 hash-blocks of 8 tokens (128 tokens). Full attention is cached
-    # densely, while the SWA group keeps the rounded 64-token interval
+    # densely, while the SWA group keeps the rounded-up 64-token interval
     # boundaries plus the exact-prompt replay boundary at 96 tokens.
     token_ids = [i for i in range(16) for _ in range(block_size)]
     req = make_request("0", token_ids, block_size, sha256)
@@ -2793,7 +2793,7 @@ def test_hybrid_local_kv_retention_latest_only_reuses_replay_boundary():
     assert blocks is not None
 
     pool = manager.block_pool
-    expected_swa_cached = {11, 15}
+    expected_swa_cached = {11}
     for i in range(16):
         cached = pool.get_cached_block(req0.block_hashes[i], [1])
         if i in expected_swa_cached:
