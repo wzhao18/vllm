@@ -86,7 +86,7 @@ class SingleTypeKVCacheManager(ABC):
     def _get_num_evictable_blocks(cls, blocks: Sequence[KVCacheBlock]):
         return sum(blk.ref_cnt == 0 and not blk.is_null for blk in blocks)
 
-    def _is_low_priority_cached_block(
+    def _is_retained_checkpoint_block(
         self, _request_id: str, _block: KVCacheBlock
     ) -> bool:
         return False
@@ -391,7 +391,7 @@ class SingleTypeKVCacheManager(ABC):
             block
             for block in ordered_blocks
             if block.block_hash is not None
-            and self._is_low_priority_cached_block(request_id, block)
+            and self._is_retained_checkpoint_block(request_id, block)
         ]
         if low_priority_blocks:
             low_priority_block_ids = {block.block_id for block in low_priority_blocks}
@@ -513,7 +513,7 @@ class SingleTypeKVCacheManager(ABC):
                 break
             if blocks[i].block_hash is None:
                 removed_uncached_blocks.append(blocks[i])
-            elif self._is_low_priority_cached_block(request_id, blocks[i]):
+            elif self._is_retained_checkpoint_block(request_id, blocks[i]):
                 removed_low_priority_cached_blocks.append(blocks[i])
             else:
                 removed_cached_blocks.append(blocks[i])
@@ -722,7 +722,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         num_tokens: int,
         alignment_tokens: int,
         interval_tokens: int,
-        latest_boundary_tokens: Sequence[int],
+        latest_boundary_token: int | None,
     ) -> None:
         assert alignment_tokens % self.block_size == 0
         assert interval_tokens == 0 or interval_tokens % alignment_tokens == 0
@@ -737,14 +737,16 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
                 boundary += interval_tokens
             self._last_interval_retention_boundary[request_id] = last_boundary
 
-        latest_boundaries = self._latest_retention_boundaries.setdefault(
-            request_id, set()
-        )
-        for boundary in latest_boundary_tokens:
-            if boundary > num_tokens or boundary in latest_boundaries:
-                continue
-            self._cache_tail_at_boundary(request, boundary)
-            latest_boundaries.add(boundary)
+        if latest_boundary_token is not None:
+            latest_boundaries = self._latest_retention_boundaries.setdefault(
+                request_id, set()
+            )
+            if (
+                latest_boundary_token <= num_tokens
+                and latest_boundary_token not in latest_boundaries
+            ):
+                self._cache_tail_at_boundary(request, latest_boundary_token)
+                latest_boundaries.add(latest_boundary_token)
 
         self.num_cached_block[request_id] = max(
             self.num_cached_block.get(request_id, 0),
@@ -772,7 +774,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             if block.block_hash is not None:
                 retained_hashes.add(block.block_hash)
 
-    def _is_low_priority_cached_block(
+    def _is_retained_checkpoint_block(
         self, request_id: str, block: KVCacheBlock
     ) -> bool:
         retained_hashes = self._retention_block_hashes.get(request_id)

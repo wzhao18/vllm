@@ -518,7 +518,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         num_computed_tokens = (
             num_computed_tokens // self.lcm_block_size * self.lcm_block_size
         )
-        latest_replay_boundaries: tuple[int, ...] = ()
+        latest_replay_boundary: int | None = None
         if (
             self.local_kv_retention_interval is not None
             and raw_num_computed_tokens >= request.num_prompt_tokens
@@ -531,9 +531,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 // self.lcm_block_size
                 * self.lcm_block_size
             )
-            latest_replay_boundaries = (
-                (replay_boundary,) if replay_boundary > 0 else ()
-            )
+            latest_replay_boundary = replay_boundary if replay_boundary > 0 else None
 
         for manager in self.single_type_managers:
             if self.local_kv_retention_interval is not None and isinstance(
@@ -544,7 +542,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     num_tokens=num_computed_tokens,
                     alignment_tokens=self.lcm_block_size,
                     interval_tokens=self.local_kv_retention_interval,
-                    latest_boundary_tokens=latest_replay_boundaries,
+                    latest_boundary_token=latest_replay_boundary,
                 )
             else:
                 manager.cache_blocks(
