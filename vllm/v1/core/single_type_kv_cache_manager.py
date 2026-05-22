@@ -86,6 +86,11 @@ class SingleTypeKVCacheManager(ABC):
     def _get_num_evictable_blocks(cls, blocks: Sequence[KVCacheBlock]):
         return sum(blk.ref_cnt == 0 and not blk.is_null for blk in blocks)
 
+    def _is_low_priority_cached_block(
+        self, _request_id: str, _block: KVCacheBlock
+    ) -> bool:
+        return False
+
     def get_num_blocks_to_allocate(
         self,
         request_id: str,
@@ -377,9 +382,27 @@ class SingleTypeKVCacheManager(ABC):
 
         # Free blocks in reverse order so that the tail blocks are
         # freed first.
-        ordered_blocks = reversed(req_blocks)
+        ordered_blocks = list(reversed(req_blocks))
+        if not ordered_blocks:
+            self.num_cached_block.pop(request_id, None)
+            return
+
+        low_priority_blocks = [
+            block
+            for block in ordered_blocks
+            if block.block_hash is not None
+            and self._is_low_priority_cached_block(request_id, block)
+        ]
+        if low_priority_blocks:
+            low_priority_block_ids = {block.block_id for block in low_priority_blocks}
+            ordered_blocks = [
+                block
+                for block in ordered_blocks
+                if block.block_id not in low_priority_block_ids
+            ]
 
         self.block_pool.free_blocks(ordered_blocks)
+        self.block_pool.free_blocks(low_priority_blocks)
         self.num_cached_block.pop(request_id, None)
 
     @abstractmethod
@@ -478,6 +501,7 @@ class SingleTypeKVCacheManager(ABC):
         # this request.
         num_skipped_blocks = min(num_skipped_blocks, len(blocks))
         removed_cached_blocks: list[KVCacheBlock] = []
+        removed_low_priority_cached_blocks: list[KVCacheBlock] = []
         removed_uncached_blocks: list[KVCacheBlock] = []
         # Because the block starts from index 0, the num_skipped_block-th block
         # corresponds to index num_skipped_blocks - 1.
@@ -489,10 +513,13 @@ class SingleTypeKVCacheManager(ABC):
                 break
             if blocks[i].block_hash is None:
                 removed_uncached_blocks.append(blocks[i])
+            elif self._is_low_priority_cached_block(request_id, blocks[i]):
+                removed_low_priority_cached_blocks.append(blocks[i])
             else:
                 removed_cached_blocks.append(blocks[i])
             blocks[i] = self._null_block
         self.block_pool.free_blocks(removed_cached_blocks)
+        self.block_pool.free_blocks(removed_low_priority_cached_blocks)
         self.block_pool.free_blocks(removed_uncached_blocks, prepend=True)
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
@@ -580,7 +607,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         self.sliding_window = kv_cache_spec.sliding_window
         self._last_interval_retention_boundary: dict[str, int] = {}
         self._latest_retention_boundaries: dict[str, set[int]] = {}
-        self._pinned_retention_blocks: dict[str, dict[int, KVCacheBlock]] = {}
+        self._retention_block_hashes: dict[str, set[BlockHashWithGroupId]] = {}
 
     @classmethod
     def find_longest_cache_hit(
@@ -730,9 +757,9 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         end_block = boundary_tokens // self.block_size
         start_block = max(0, end_block - tail_blocks)
         self._cache_block_range(request, start_block, end_block)
-        self._pin_block_range(request.request_id, start_block, end_block)
+        self._mark_retention_block_range(request.request_id, start_block, end_block)
 
-    def _pin_block_range(
+    def _mark_retention_block_range(
         self, request_id: str, start_block: int, end_block: int
     ) -> None:
         blocks = self.req_to_blocks[request_id]
@@ -740,24 +767,22 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         if start_block >= end_block:
             return
 
-        pinned_blocks = self._pinned_retention_blocks.setdefault(request_id, {})
-        blocks_to_touch: list[KVCacheBlock] = []
+        retained_hashes = self._retention_block_hashes.setdefault(request_id, set())
         for block in blocks[start_block:end_block]:
-            if block.is_null or block.block_id in pinned_blocks:
-                continue
-            pinned_blocks[block.block_id] = block
-            blocks_to_touch.append(block)
+            if block.block_hash is not None:
+                retained_hashes.add(block.block_hash)
 
-        if blocks_to_touch:
-            self.block_pool.touch(blocks_to_touch)
+    def _is_low_priority_cached_block(
+        self, request_id: str, block: KVCacheBlock
+    ) -> bool:
+        retained_hashes = self._retention_block_hashes.get(request_id)
+        return retained_hashes is not None and block.block_hash in retained_hashes
 
     def free(self, request_id: str) -> None:
-        pinned_blocks = list(self._pinned_retention_blocks.pop(request_id, {}).values())
         super().free(request_id)
-        if pinned_blocks:
-            self.block_pool.free_blocks(pinned_blocks)
         self._last_interval_retention_boundary.pop(request_id, None)
         self._latest_retention_boundaries.pop(request_id, None)
+        self._retention_block_hashes.pop(request_id, None)
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """

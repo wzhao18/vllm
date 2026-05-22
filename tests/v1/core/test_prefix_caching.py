@@ -2718,8 +2718,8 @@ def test_hybrid_local_kv_retention_interval_survives_recycling():
     )
 
     # This mirrors the DSv4 pressure pattern: small local-cache block sizes
-    # allocate many logical blocks while prefill progresses, so cached local
-    # checkpoints must not become evictable before the request finishes.
+    # allocate many logical blocks while prefill progresses, so retained local
+    # checkpoints must be reused after scratch and ordinary cached blocks.
     def fill_request(request_id: str, token_offset: int) -> list[int]:
         token_ids = [
             token_offset + i for i in range(1024) for _ in range(hash_block_size)
@@ -2800,6 +2800,11 @@ def test_hybrid_local_kv_retention_latest_only_reuses_replay_boundary():
             assert cached is not None
         else:
             assert cached is None
+
+    manager.free(req0)
+    retained_swa_block = pool.get_cached_block(req0.block_hashes[11], [1])
+    assert retained_swa_block is not None
+    assert retained_swa_block[0].ref_cnt == 0
 
     req1 = make_request("1", token_ids, block_size, sha256)
     computed_blocks, num_computed_tokens = manager.get_computed_blocks(req1)
