@@ -335,6 +335,36 @@ class SingleTypeKVCacheManager(ABC):
         """
         return None
 
+    def _cache_block_range(
+        self, request: Request, start_block: int, end_block: int
+    ) -> None:
+        """Cache selected blocks in ``[start_block, end_block)``.
+
+        Unlike ``cache_blocks()``, this helper does not rely on the monotonic
+        ``num_cached_block`` cursor. It is used by sparse local-retention
+        policies that may skip a range first and later retain a tail checkpoint
+        inside that skipped range.
+        """
+        blocks = self.req_to_blocks[request.request_id]
+        end_block = min(end_block, len(blocks))
+        if start_block >= end_block:
+            return
+        block_mask = [
+            not blocks[i].is_null and blocks[i].block_hash is None
+            for i in range(start_block, end_block)
+        ]
+        if not any(block_mask):
+            return
+        self.block_pool.cache_full_blocks(
+            request=request,
+            blocks=blocks,
+            num_cached_blocks=start_block,
+            num_full_blocks=end_block,
+            block_size=self.block_size,
+            kv_cache_group_id=self.kv_cache_group_id,
+            block_mask=block_mask,
+        )
+
     def free(self, request_id: str) -> None:
         """
         Free the blocks for the request.
@@ -447,7 +477,8 @@ class SingleTypeKVCacheManager(ABC):
         # range), so we must cap to the number of blocks that currently exist for
         # this request.
         num_skipped_blocks = min(num_skipped_blocks, len(blocks))
-        removed_blocks: list[KVCacheBlock] = []
+        removed_cached_blocks: list[KVCacheBlock] = []
+        removed_uncached_blocks: list[KVCacheBlock] = []
         # Because the block starts from index 0, the num_skipped_block-th block
         # corresponds to index num_skipped_blocks - 1.
         for i in range(num_skipped_blocks - 1, -1, -1):
@@ -456,9 +487,13 @@ class SingleTypeKVCacheManager(ABC):
                 # should also have been set to null blocks by the previous calls
                 # to this function.
                 break
-            removed_blocks.append(blocks[i])
+            if blocks[i].block_hash is None:
+                removed_uncached_blocks.append(blocks[i])
+            else:
+                removed_cached_blocks.append(blocks[i])
             blocks[i] = self._null_block
-        self.block_pool.free_blocks(removed_blocks)
+        self.block_pool.free_blocks(removed_cached_blocks)
+        self.block_pool.free_blocks(removed_uncached_blocks, prepend=True)
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """
@@ -543,6 +578,9 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
     def __init__(self, kv_cache_spec: SlidingWindowSpec, **kwargs) -> None:
         super().__init__(kv_cache_spec, **kwargs)
         self.sliding_window = kv_cache_spec.sliding_window
+        self._last_interval_retention_boundary: dict[str, int] = {}
+        self._latest_retention_boundaries: dict[str, set[int]] = {}
+        self._pinned_retention_blocks: dict[str, dict[int, KVCacheBlock]] = {}
 
     @classmethod
     def find_longest_cache_hit(
@@ -650,6 +688,76 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         return [
             i % per_segment >= skip for i in range(num_cached_blocks, num_full_blocks)
         ]
+
+    def cache_blocks_at_boundaries(
+        self,
+        request: Request,
+        num_tokens: int,
+        alignment_tokens: int,
+        interval_tokens: int,
+        latest_boundary_tokens: Sequence[int],
+    ) -> None:
+        assert alignment_tokens % self.block_size == 0
+        assert interval_tokens == 0 or interval_tokens % alignment_tokens == 0
+
+        request_id = request.request_id
+        if interval_tokens > 0:
+            last_boundary = self._last_interval_retention_boundary.get(request_id, 0)
+            boundary = ((last_boundary // interval_tokens) + 1) * interval_tokens
+            while boundary <= num_tokens:
+                self._cache_tail_at_boundary(request, boundary)
+                last_boundary = boundary
+                boundary += interval_tokens
+            self._last_interval_retention_boundary[request_id] = last_boundary
+
+        latest_boundaries = self._latest_retention_boundaries.setdefault(
+            request_id, set()
+        )
+        for boundary in latest_boundary_tokens:
+            if boundary > num_tokens or boundary in latest_boundaries:
+                continue
+            self._cache_tail_at_boundary(request, boundary)
+            latest_boundaries.add(boundary)
+
+        self.num_cached_block[request_id] = max(
+            self.num_cached_block.get(request_id, 0),
+            num_tokens // self.block_size,
+        )
+
+    def _cache_tail_at_boundary(self, request: Request, boundary_tokens: int) -> None:
+        assert boundary_tokens % self.block_size == 0
+        tail_blocks = cdiv(self.sliding_window - 1, self.block_size)
+        end_block = boundary_tokens // self.block_size
+        start_block = max(0, end_block - tail_blocks)
+        self._cache_block_range(request, start_block, end_block)
+        self._pin_block_range(request.request_id, start_block, end_block)
+
+    def _pin_block_range(
+        self, request_id: str, start_block: int, end_block: int
+    ) -> None:
+        blocks = self.req_to_blocks[request_id]
+        end_block = min(end_block, len(blocks))
+        if start_block >= end_block:
+            return
+
+        pinned_blocks = self._pinned_retention_blocks.setdefault(request_id, {})
+        blocks_to_touch: list[KVCacheBlock] = []
+        for block in blocks[start_block:end_block]:
+            if block.is_null or block.block_id in pinned_blocks:
+                continue
+            pinned_blocks[block.block_id] = block
+            blocks_to_touch.append(block)
+
+        if blocks_to_touch:
+            self.block_pool.touch(blocks_to_touch)
+
+    def free(self, request_id: str) -> None:
+        pinned_blocks = list(self._pinned_retention_blocks.pop(request_id, {}).values())
+        super().free(request_id)
+        if pinned_blocks:
+            self.block_pool.free_blocks(pinned_blocks)
+        self._last_interval_retention_boundary.pop(request_id, None)
+        self._latest_retention_boundaries.pop(request_id, None)
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """
