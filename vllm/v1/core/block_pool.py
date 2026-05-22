@@ -426,8 +426,7 @@ class BlockPool:
             ordered_blocks: A list of blocks to free ordered by their eviction
                 priority.
             prepend: Whether to put newly-free blocks at the front of the free
-                queue. This is used for uncached scratch blocks that should be
-                reused before evictable prefix-cache blocks.
+                queue to be prioritized for reuse.
         """
         # Materialize the iterable to allow multiple passes.
         blocks_list = list(ordered_blocks)

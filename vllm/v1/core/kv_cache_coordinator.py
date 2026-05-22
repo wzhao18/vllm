@@ -438,23 +438,17 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         assert dcp_world_size == 1, "DCP not support hybrid attn now."
         assert pcp_world_size == 1, "PCP not support hybrid attn now."
         self.verify_and_split_kv_cache_groups()
-        self.requested_local_kv_retention_interval = local_kv_retention_interval
-        if local_kv_retention_interval is None:
-            self.local_kv_retention_interval = None
-        elif local_kv_retention_interval == 0:
-            self.local_kv_retention_interval = 0
-        else:
+
+        self.local_kv_retention_interval = local_kv_retention_interval
+        # align with lcm_block_size
+        if (
+            self.local_kv_retention_interval is not None
+            and self.local_kv_retention_interval > 0
+        ):
             self.local_kv_retention_interval = max(
                 self.lcm_block_size,
                 cdiv(local_kv_retention_interval, self.lcm_block_size)
                 * self.lcm_block_size,
-            )
-        if self.local_kv_retention_interval is not None:
-            logger.info(
-                "Hybrid local KV retention interval: requested=%s effective=%s lcm=%s",
-                self.requested_local_kv_retention_interval,
-                self.local_kv_retention_interval,
-                self.lcm_block_size,
             )
 
     def verify_and_split_kv_cache_groups(self) -> None:
@@ -514,24 +508,23 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # aligned region, SWA groups only consult a subset of blocks per
         # ``lcm_block_size``-segment so the unused blocks also stay out of the
         # prefix-cache hash map.
-        raw_num_computed_tokens = num_computed_tokens
+        prompt_complete = num_computed_tokens >= request.num_prompt_tokens
         num_computed_tokens = (
             num_computed_tokens // self.lcm_block_size * self.lcm_block_size
         )
-        latest_replay_boundary: int | None = None
-        if (
-            self.local_kv_retention_interval is not None
-            and raw_num_computed_tokens >= request.num_prompt_tokens
-        ):
+
+        # Cache the latest prompt boundary in addition to the interval boundaries.
+        latest_retention_boundary: int | None = None
+        if self.local_kv_retention_interval is not None and prompt_complete:
             # get_computed_blocks() caps hits at prompt_length - 1 so logits
             # can be recomputed. Use the same replayable boundary for the
-            # extra latest checkpoint instead of retaining a non-replayable boundary.
-            replay_boundary = (
-                max(request.num_prompt_tokens - 1, 0)
+            # extra latest checkpoint.
+            retention_boundary = (
+                (request.num_prompt_tokens - 1)
                 // self.lcm_block_size
                 * self.lcm_block_size
             )
-            latest_replay_boundary = replay_boundary if replay_boundary > 0 else None
+            latest_retention_boundary = retention_boundary if retention_boundary > 0 else None
 
         for manager in self.single_type_managers:
             if self.local_kv_retention_interval is not None and isinstance(
@@ -542,7 +535,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     num_tokens=num_computed_tokens,
                     alignment_tokens=self.lcm_block_size,
                     interval_tokens=self.local_kv_retention_interval,
-                    latest_boundary_token=latest_replay_boundary,
+                    latest_boundary_token=latest_retention_boundary,
                 )
             else:
                 manager.cache_blocks(

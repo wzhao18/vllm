@@ -345,10 +345,10 @@ class SingleTypeKVCacheManager(ABC):
     ) -> None:
         """Cache selected blocks in ``[start_block, end_block)``.
 
-        Unlike ``cache_blocks()``, this helper does not rely on the monotonic
-        ``num_cached_block`` cursor. It is used by sparse local-retention
-        policies that may skip a range first and later retain a tail checkpoint
-        inside that skipped range.
+        The normal ``cache_blocks()`` path is prefix-oriented: it processes from
+        ``num_cached_block`` up to the current full-block count. Sparse local
+        retention is range-oriented because it only keeps the local tail for
+        selected checkpoint boundaries.
         """
         blocks = self.req_to_blocks[request.request_id]
         end_block = min(end_block, len(blocks))
@@ -387,6 +387,7 @@ class SingleTypeKVCacheManager(ABC):
             self.num_cached_block.pop(request_id, None)
             return
 
+        # put retained checkpoint blocks later in the free queue than ordinary blocks.
         retained_checkpoint_blocks = [
             block
             for block in ordered_blocks
@@ -502,6 +503,11 @@ class SingleTypeKVCacheManager(ABC):
         # range), so we must cap to the number of blocks that currently exist for
         # this request.
         num_skipped_blocks = min(num_skipped_blocks, len(blocks))
+
+        # Reuse skipped local blocks in order:
+        #   scratch blocks: no prefix-cache value, reuse first.
+        #   ordinary cached blocks: reusable prefix cache, but not retained.
+        #   retained checkpoints: selected checkpoint tails, reuse last.
         removed_cached_blocks: list[KVCacheBlock] = []
         removed_retained_checkpoint_blocks: list[KVCacheBlock] = []
         removed_uncached_blocks: list[KVCacheBlock] = []
@@ -520,6 +526,9 @@ class SingleTypeKVCacheManager(ABC):
             else:
                 removed_cached_blocks.append(blocks[i])
             blocks[i] = self._null_block
+        # `prepend=True` makes uncached scratch blocks the next allocation
+        # candidates, while retained checkpoints stay behind ordinary cached
+        # blocks as best-effort prefix-cache entries.
         self.block_pool.free_blocks(removed_cached_blocks)
         self.block_pool.free_blocks(removed_retained_checkpoint_blocks)
         self.block_pool.free_blocks(removed_uncached_blocks, prepend=True)
@@ -725,10 +734,19 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         interval_tokens: int,
         latest_boundary_token: int | None,
     ) -> None:
+        """Cache local tails at retained checkpoint boundaries.
+
+        "interval_tokens" selects regular checkpoint boundaries. "0" means
+        no regular interval checkpoints. "latest_boundary_token" optionally
+        adds the prompt replay boundary that exact prompt replays can hit.
+        """
         assert alignment_tokens % self.block_size == 0
         assert interval_tokens == 0 or interval_tokens % alignment_tokens == 0
 
         request_id = request.request_id
+
+        # Iterate over interval boundaries and cache the local tail at each
+        # boundary.
         if interval_tokens > 0:
             last_boundary = self._last_interval_retention_boundary.get(request_id, 0)
             boundary = ((last_boundary // interval_tokens) + 1) * interval_tokens
@@ -738,18 +756,21 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
                 boundary += interval_tokens
             self._last_interval_retention_boundary[request_id] = last_boundary
 
+        # optionally cache the latest prompt boundary
         if latest_boundary_token is not None and latest_boundary_token <= num_tokens:
             self._cache_tail_at_boundary(request, latest_boundary_token)
 
+        # update the num_cached_block cursor
         self.num_cached_block[request_id] = max(
             self.num_cached_block.get(request_id, 0),
             num_tokens // self.block_size,
         )
 
-    def _cache_tail_at_boundary(self, request: Request, boundary_tokens: int) -> None:
-        assert boundary_tokens % self.block_size == 0
+    def _cache_tail_at_boundary(self, request: Request, boundary_token: int) -> None:
+        """Cache the sliding-window tail needed to reuse "boundary_token"."""
+        assert boundary_token % self.block_size == 0
         tail_blocks = cdiv(self.sliding_window - 1, self.block_size)
-        end_block = boundary_tokens // self.block_size
+        end_block = boundary_token // self.block_size
         start_block = max(0, end_block - tail_blocks)
         self._cache_block_range(request, start_block, end_block)
         self._mark_retention_block_range(request.request_id, start_block, end_block)
@@ -757,6 +778,11 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
     def _mark_retention_block_range(
         self, request_id: str, start_block: int, end_block: int
     ) -> None:
+        """Mark cached blocks in a retained checkpoint tail.
+
+        Marked blocks are still evictable, but skipped-block cleanup and request
+        cleanup return them to the free queue after ordinary cached blocks.
+        """
         blocks = self.req_to_blocks[request_id]
         end_block = min(end_block, len(blocks))
         if start_block >= end_block:

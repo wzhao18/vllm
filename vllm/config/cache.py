@@ -107,11 +107,9 @@ class CacheConfig:
     - "xxhash_cbor" combines canonical CBOR serialization with xxHash for
       reproducible hashing. Requires the optional ``xxhash`` package."""
     prefix_cache_retention_interval: int | None = Field(default=None, ge=0)
-    """DeepSeek V4 only: retain local sliding-window KV checkpoints at this
-    token interval for prefix caching. ``None`` preserves the default dense
-    local checkpointing behavior. ``0`` retains only the latest completed
-    replayable prompt boundary. Positive values are rounded up to the next
-    LCM boundary."""
+    """Retain local sliding-window KV checkpoints at this token interval for
+    prefix caching. "None" preserves the default dense local checkpointing
+    behavior. "0" retains only the latest completed prompt boundary."""
     calculate_kv_scales: bool = False
     """Deprecated: This option is deprecated and will be removed in v0.19.
     It enables dynamic calculation of `k_scale` and `v_scale` when

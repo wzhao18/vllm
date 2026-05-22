@@ -2133,19 +2133,12 @@ class VllmConfig:
     def validate_prefix_cache_retention_interval(self) -> "VllmConfig":
         if self.model_config is None:
             return self
-        interval = self.cache_config.prefix_cache_retention_interval
-        if interval is None:
+        if self.cache_config.prefix_cache_retention_interval is None:
             return self
         if not self.cache_config.enable_prefix_caching:
-            raise ValueError(
-                "--prefix-cache-retention-interval can only be set with "
-                "--enable-prefix-caching"
-            )
-        model_type = getattr(self.model_config.hf_text_config, "model_type", None)
-        if model_type != "deepseek_v4":
-            raise ValueError(
-                "--prefix-cache-retention-interval currently supports DeepSeek V4 "
-                "models only"
+            logger.warning(
+                "--prefix-cache-retention-interval is only effective when "
+                "prefix caching is enabled. This flag is ignored."
             )
         return self
 
