@@ -387,22 +387,24 @@ class SingleTypeKVCacheManager(ABC):
             self.num_cached_block.pop(request_id, None)
             return
 
-        low_priority_blocks = [
+        retained_checkpoint_blocks = [
             block
             for block in ordered_blocks
             if block.block_hash is not None
             and self._is_retained_checkpoint_block(request_id, block)
         ]
-        if low_priority_blocks:
-            low_priority_block_ids = {block.block_id for block in low_priority_blocks}
+        if retained_checkpoint_blocks:
+            retained_checkpoint_block_ids = {
+                block.block_id for block in retained_checkpoint_blocks
+            }
             ordered_blocks = [
                 block
                 for block in ordered_blocks
-                if block.block_id not in low_priority_block_ids
+                if block.block_id not in retained_checkpoint_block_ids
             ]
 
         self.block_pool.free_blocks(ordered_blocks)
-        self.block_pool.free_blocks(low_priority_blocks)
+        self.block_pool.free_blocks(retained_checkpoint_blocks)
         self.num_cached_block.pop(request_id, None)
 
     @abstractmethod
@@ -501,7 +503,7 @@ class SingleTypeKVCacheManager(ABC):
         # this request.
         num_skipped_blocks = min(num_skipped_blocks, len(blocks))
         removed_cached_blocks: list[KVCacheBlock] = []
-        removed_low_priority_cached_blocks: list[KVCacheBlock] = []
+        removed_retained_checkpoint_blocks: list[KVCacheBlock] = []
         removed_uncached_blocks: list[KVCacheBlock] = []
         # Because the block starts from index 0, the num_skipped_block-th block
         # corresponds to index num_skipped_blocks - 1.
@@ -514,12 +516,12 @@ class SingleTypeKVCacheManager(ABC):
             if blocks[i].block_hash is None:
                 removed_uncached_blocks.append(blocks[i])
             elif self._is_retained_checkpoint_block(request_id, blocks[i]):
-                removed_low_priority_cached_blocks.append(blocks[i])
+                removed_retained_checkpoint_blocks.append(blocks[i])
             else:
                 removed_cached_blocks.append(blocks[i])
             blocks[i] = self._null_block
         self.block_pool.free_blocks(removed_cached_blocks)
-        self.block_pool.free_blocks(removed_low_priority_cached_blocks)
+        self.block_pool.free_blocks(removed_retained_checkpoint_blocks)
         self.block_pool.free_blocks(removed_uncached_blocks, prepend=True)
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
@@ -606,7 +608,6 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         super().__init__(kv_cache_spec, **kwargs)
         self.sliding_window = kv_cache_spec.sliding_window
         self._last_interval_retention_boundary: dict[str, int] = {}
-        self._latest_retention_boundaries: dict[str, set[int]] = {}
         self._retention_block_hashes: dict[str, set[BlockHashWithGroupId]] = {}
 
     @classmethod
@@ -737,16 +738,8 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
                 boundary += interval_tokens
             self._last_interval_retention_boundary[request_id] = last_boundary
 
-        if latest_boundary_token is not None:
-            latest_boundaries = self._latest_retention_boundaries.setdefault(
-                request_id, set()
-            )
-            if (
-                latest_boundary_token <= num_tokens
-                and latest_boundary_token not in latest_boundaries
-            ):
-                self._cache_tail_at_boundary(request, latest_boundary_token)
-                latest_boundaries.add(latest_boundary_token)
+        if latest_boundary_token is not None and latest_boundary_token <= num_tokens:
+            self._cache_tail_at_boundary(request, latest_boundary_token)
 
         self.num_cached_block[request_id] = max(
             self.num_cached_block.get(request_id, 0),
@@ -783,7 +776,6 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
     def free(self, request_id: str) -> None:
         super().free(request_id)
         self._last_interval_retention_boundary.pop(request_id, None)
-        self._latest_retention_boundaries.pop(request_id, None)
         self._retention_block_hashes.pop(request_id, None)
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
