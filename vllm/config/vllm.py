@@ -2154,6 +2154,7 @@ class VllmConfig:
                 "--prefix-cache-retention-interval is only effective when "
                 "prefix caching is enabled. This flag is ignored."
             )
+            self.cache_config.prefix_cache_retention_interval = None
         return self
 
 
