@@ -3,8 +3,9 @@
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from itertools import islice
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
+from vllm import envs
 from vllm.distributed.kv_events import BlockRemoved, BlockStored, KVCacheEvent
 from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
@@ -35,6 +36,9 @@ from vllm.v1.kv_offload.base import (
 )
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
+
+if TYPE_CHECKING:
+    from vllm.v1.core.block_pool import BlockPool
 
 logger = init_logger(__name__)
 
@@ -163,6 +167,10 @@ class RequestGroupState:
     block_ids: list[int] = field(default_factory=list)
     # index of next block (of size offloaded_block_size) to offload
     next_stored_block_idx: int = 0
+    # Indices already covered by store scheduling. Used by sparse
+    # prefix-cached-only mode where cacheable store candidates can appear
+    # after earlier uncached blocks.
+    covered_store_block_indices: set[int] = field(default_factory=set)
     # number of offloaded blocks hit (including GPU prefix cache)
     # when the request first started
     num_hit_blocks: int = 0
@@ -280,16 +288,53 @@ class OffloadingConnectorScheduler:
         # protected by their ref_cnt) and for sliding window blocks (which can
         # be freed before a request finishes).
         self._block_id_to_pending_jobs: dict[int, set[int]] = {}
+        self._gpu_block_pool: BlockPool | None = None
+        self._prefix_cached_only = envs.VLLM_KV_OFFLOAD_PREFIX_CACHED_ONLY
+
+    def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
+        self._gpu_block_pool = gpu_block_pool
 
     def _generate_job_id(self) -> int:
         job_id = self._job_counter
         self._job_counter += 1
         return job_id
 
+    def _is_prefix_cached_store_block(
+        self, block_ids: list[int], offloaded_block_idx: int
+    ) -> bool:
+        if not self._prefix_cached_only:
+            return True
+        if self._gpu_block_pool is None:
+            raise RuntimeError(
+                "VLLM_KV_OFFLOAD_PREFIX_CACHED_ONLY=1 requires the GPU block "
+                "pool to be bound before building store jobs."
+            )
+
+        start = offloaded_block_idx * self.config.block_size_factor
+        end = start + self.config.block_size_factor
+        for block_id in block_ids[start:end]:
+            if block_id == 0:
+                continue
+            block = self._gpu_block_pool.blocks[block_id]
+            if block.is_null:
+                continue
+            if block.block_hash is None:
+                return False
+        return True
+
+    @staticmethod
+    def _advance_sparse_store_idx(group_state: RequestGroupState) -> None:
+        while (
+            group_state.next_stored_block_idx in group_state.covered_store_block_indices
+        ):
+            group_state.next_stored_block_idx += 1
+
     def _remove_pending_job(self, job_id: int, block_ids: list[int] | None) -> None:
-        for bid in block_ids or ():
-            pending = self._block_id_to_pending_jobs[bid]
-            pending.remove(job_id)
+        for bid in set(block_ids or ()):
+            pending = self._block_id_to_pending_jobs.get(bid)
+            if pending is None:
+                continue
+            pending.discard(job_id)
             if not pending:
                 del self._block_id_to_pending_jobs[bid]
 
@@ -611,7 +656,11 @@ class OffloadingConnectorScheduler:
                 # For P/D prefill requests (do_remote_decode=True), we do
                 # NOT skip saving the hit prefix, as we need to stream the
                 # entire KV cache so a remote decode node can consume it.
-                group_state.next_stored_block_idx = num_blocks
+                if self._prefix_cached_only:
+                    group_state.covered_store_block_indices.update(range(num_blocks))
+                    self._advance_sparse_store_idx(group_state)
+                else:
+                    group_state.next_stored_block_idx = num_blocks
 
         # Fence dst blocks against finished-request pending stores.
         if (
@@ -687,6 +736,7 @@ class OffloadingConnectorScheduler:
             # Filter out blocks skipped due to sliding window attention / SSM
             # or unreachable by the load path's alignment constraints.
             new_offload_keys: list[OffloadKey] = []
+            prepared_store_blocks: list[tuple[RequestGroupState, int]] = []
             for group_config, group_state in zip(
                 self.config.kv_group_configs, req_status.group_states
             ):
@@ -716,7 +766,15 @@ class OffloadingConnectorScheduler:
                 for key_idx, (offload_key, block_id) in enumerate(
                     zip(offload_keys, offload_block_ids)
                 ):
+                    abs_block_idx = start_block_idx + key_idx
+                    if (
+                        self._prefix_cached_only
+                        and abs_block_idx in group_state.covered_store_block_indices
+                    ):
+                        continue
                     if block_id == 0:
+                        if self._prefix_cached_only:
+                            group_state.covered_store_block_indices.add(abs_block_idx)
                         continue
                     # Skip SWA blocks that can never serve a load hit:
                     # within each full-attention alignment segment, only the
@@ -725,14 +783,27 @@ class OffloadingConnectorScheduler:
                     # tokens this reduces SWA stores by ~78%.
                     if alignment_block_count is not None:
                         assert tail is not None
-                        abs_block_idx = start_block_idx + key_idx
                         pos_in_segment = abs_block_idx % alignment_block_count
                         if pos_in_segment < alignment_block_count - tail:
+                            if self._prefix_cached_only:
+                                group_state.covered_store_block_indices.add(
+                                    abs_block_idx
+                                )
                             continue
+                    if not self._is_prefix_cached_store_block(
+                        group_state.block_ids, abs_block_idx
+                    ):
+                        continue
                     new_offload_keys.append(offload_key)
+                    if self._prefix_cached_only:
+                        prepared_store_blocks.append((group_state, abs_block_idx))
+
+                if self._prefix_cached_only:
+                    self._advance_sparse_store_idx(group_state)
 
             if not new_offload_keys:
-                req_status.advance_stored_idx(num_offloadable_tokens)
+                if not self._prefix_cached_only:
+                    req_status.advance_stored_idx(num_offloadable_tokens)
                 continue
 
             store_output = self.manager.prepare_store(
@@ -743,7 +814,13 @@ class OffloadingConnectorScheduler:
                 continue
 
             if not store_output.keys_to_store:
-                req_status.advance_stored_idx(num_offloadable_tokens)
+                if self._prefix_cached_only:
+                    for group_state, block_idx in prepared_store_blocks:
+                        group_state.covered_store_block_indices.add(block_idx)
+                    for group_state in req_status.group_states:
+                        self._advance_sparse_store_idx(group_state)
+                else:
+                    req_status.advance_stored_idx(num_offloadable_tokens)
                 continue
 
             self._touch(req_status)
@@ -791,7 +868,14 @@ class OffloadingConnectorScheduler:
 
                 group_sizes.append(num_group_blocks)
                 block_indices.append(start_gpu_block_idx or 0)
-                group_state.next_stored_block_idx = num_blocks
+                if not self._prefix_cached_only:
+                    group_state.next_stored_block_idx = num_blocks
+
+            if self._prefix_cached_only:
+                for group_state, block_idx in prepared_store_blocks:
+                    group_state.covered_store_block_indices.add(block_idx)
+                for group_state in req_status.group_states:
+                    self._advance_sparse_store_idx(group_state)
 
             src_spec = GPULoadStoreSpec(
                 src_block_ids, group_sizes=group_sizes, block_indices=block_indices
@@ -981,6 +1065,7 @@ class OffloadingConnectorScheduler:
         for status in self._req_status.values():
             for group_state in status.group_states:
                 group_state.next_stored_block_idx = 0
+                group_state.covered_store_block_indices.clear()
 
         # Discard jobs and save job_counter to be able to discard worker responses
         self._stale_job_threshold = self._job_counter

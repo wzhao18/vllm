@@ -169,6 +169,7 @@ class RequestRunner:
         block_size_factor: int = 1,
         async_scheduling: bool = True,
         kv_cache_groups: list[KVCacheGroupSpec] | None = None,
+        enable_prefix_caching: bool = True,
     ):
         assert block_size_factor == 1 or kv_cache_groups is None, (
             "block_size_factor > 1 requires all groups to have the same "
@@ -187,6 +188,7 @@ class RequestRunner:
             max_num_batched_tokens=1000,
             disable_hybrid_kv_cache_manager=False,
         )
+        vllm_config.cache_config.enable_prefix_caching = enable_prefix_caching
         vllm_config.scheduler_config.async_scheduling = async_scheduling
 
         extra_config: dict[str, Any] = {
@@ -591,6 +593,7 @@ def request_runner():
         async_scheduling,
         block_size_factor=1,
         kv_cache_groups=None,
+        enable_prefix_caching=True,
     ):
         runner = RequestRunner(
             block_size=block_size,
@@ -598,6 +601,7 @@ def request_runner():
             block_size_factor=block_size_factor,
             async_scheduling=async_scheduling,
             kv_cache_groups=kv_cache_groups,
+            enable_prefix_caching=enable_prefix_caching,
         )
         runners.append(runner)
         return runner

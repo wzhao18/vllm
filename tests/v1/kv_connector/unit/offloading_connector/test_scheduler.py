@@ -11,11 +11,12 @@ from tests.v1.kv_connector.unit.offloading_connector.utils import (
     to_keys,
 )
 from tests.v1.kv_connector.unit.utils import EOS_TOKEN_ID
+from vllm import envs
 from vllm.distributed.kv_events import BlockRemoved, BlockStored
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
 )
-from vllm.v1.core.kv_cache_utils import BlockHash
+from vllm.v1.core.kv_cache_utils import BlockHash, make_block_hash_with_group_id
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheGroupSpec,
@@ -28,6 +29,12 @@ from vllm.v1.kv_offload.base import (
     get_offload_block_hash,
 )
 from vllm.v1.request import RequestStatus
+
+
+def _set_prefix_cached_only_env(monkeypatch, enabled: bool):
+    monkeypatch.setenv("VLLM_KV_OFFLOAD_PREFIX_CACHED_ONLY", "1" if enabled else "0")
+    if hasattr(envs.__getattr__, "cache_clear"):
+        envs.__getattr__.cache_clear()
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])
@@ -165,6 +172,92 @@ def test_offloading_connector(request_runner, async_scheduling: bool):
     assert isinstance(event, BlockRemoved)
     assert event.block_hashes == to_hashes([4, 5, 6])
     assert event.medium == "B"
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+@pytest.mark.parametrize(
+    ("prefix_cached_only", "enable_prefix_caching", "expected_stored"),
+    [
+        (False, False, (0, 1, 2)),
+        (True, False, ()),
+        (True, True, (0, 1, 2)),
+    ],
+)
+def test_prefix_cached_only_store_filter(
+    request_runner,
+    monkeypatch,
+    async_scheduling: bool,
+    prefix_cached_only: bool,
+    enable_prefix_caching: bool,
+    expected_stored: tuple[int, ...],
+):
+    _set_prefix_cached_only_env(monkeypatch, prefix_cached_only)
+
+    block_size = 4
+    block_size_factor = 3
+    offloaded_block_size = block_size * block_size_factor
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=100,
+        async_scheduling=async_scheduling,
+        block_size_factor=block_size_factor,
+        enable_prefix_caching=enable_prefix_caching,
+    )
+
+    runner.new_request(token_ids=[0] * offloaded_block_size)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_stored=expected_stored,
+        expected_flushed=(
+            expected_stored if expected_stored and not async_scheduling else ()
+        ),
+    )
+
+    if expected_stored:
+        runner.manager.prepare_store.assert_called()
+    else:
+        runner.manager.prepare_store.assert_not_called()
+
+
+def test_prefix_cached_only_reconsiders_late_cached_blocks(request_runner, monkeypatch):
+    _set_prefix_cached_only_env(monkeypatch, True)
+
+    block_size = 4
+    block_size_factor = 3
+    offloaded_block_size = block_size * block_size_factor
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=100,
+        async_scheduling=False,
+        block_size_factor=block_size_factor,
+        enable_prefix_caching=False,
+    )
+
+    runner.new_request(token_ids=[0] * offloaded_block_size)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(decoded_tokens=[0])
+    runner.manager.prepare_store.assert_not_called()
+
+    request = runner.scheduler.requests[str(runner.req_id)]
+    group_blocks = runner.scheduler.kv_cache_manager.get_blocks(
+        request.request_id
+    ).blocks[0]
+    for idx, block in enumerate(group_blocks[:block_size_factor]):
+        block.block_hash = make_block_hash_with_group_id(request.block_hashes[idx], 0)
+
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_stored=(0, 1, 2),
+        expected_flushed=(0, 1, 2),
+    )
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])
@@ -616,6 +709,15 @@ def test_two_groups_different_block_sizes(request_runner, async_scheduling: bool
 # ---------------------------------------------------------------------------
 # Unit tests for _maximal_prefix_lookup / _sliding_window_lookup
 # ---------------------------------------------------------------------------
+
+
+def test_remove_pending_job_is_idempotent_for_duplicate_blocks():
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler._block_id_to_pending_jobs = {519: {7}}
+
+    scheduler._remove_pending_job(7, [519, 519, 520])
+
+    assert scheduler._block_id_to_pending_jobs == {}
 
 
 def _make_scheduler_with_lookup(
