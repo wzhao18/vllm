@@ -174,8 +174,8 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         if self.force_balanced_topk:
             logger.warning_once(
                 "Forcing DeepSeek V4 MegaMoE topk_ids to a synthetic balanced "
-                "expert distribution. Model outputs are invalid; use this only "
-                "for performance experiments."
+                "expert distribution across EP ranks. Model outputs are invalid; "
+                "use this only for performance experiments."
             )
 
         weight_attrs = {"weight_loader": self.weight_loader}
@@ -422,6 +422,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             force_balanced_topk=self.force_balanced_topk,
             num_experts=self.num_experts,
             balanced_topk_stride=self.balanced_topk_stride,
+            balanced_topk_offset=self.experts_start_idx,
         )
 
         # This method must have been already called during the weight loading phase.

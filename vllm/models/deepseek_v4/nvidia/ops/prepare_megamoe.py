@@ -40,6 +40,7 @@ def _prepare_megamoe_inputs_kernel(
     force_balanced_topk: tl.constexpr,
     num_experts: tl.constexpr,
     balanced_topk_stride: tl.constexpr,
+    balanced_topk_offset: tl.constexpr,
     BLOCK_K: tl.constexpr,
     GROUP_K: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
@@ -91,7 +92,9 @@ def _prepare_megamoe_inputs_kernel(
 
         if force_balanced_topk:
             token_topk_idx = token_id * top_k + topk_offsets
-            ids = (token_topk_idx * balanced_topk_stride) % num_experts
+            ids = (
+                token_topk_idx * balanced_topk_stride + balanced_topk_offset
+            ) % num_experts
             ids = ids.to(tl.int64)
         else:
             ids = tl.load(
@@ -137,6 +140,7 @@ def prepare_megamoe_inputs(
     force_balanced_topk: bool = False,
     num_experts: int | None = None,
     balanced_topk_stride: int = 1,
+    balanced_topk_offset: int = 0,
 ) -> None:
     num_tokens, hidden_size = hidden_states.shape
     if num_tokens == 0:
@@ -162,6 +166,11 @@ def prepare_megamoe_inputs(
             raise ValueError(
                 "DeepSeek V4 MegaMoE balanced topk staging requires "
                 "balanced_topk_stride to be positive."
+            )
+        if balanced_topk_offset < 0:
+            raise ValueError(
+                "DeepSeek V4 MegaMoE balanced topk staging requires "
+                "balanced_topk_offset to be non-negative."
             )
 
     block_k = 128
@@ -194,6 +203,7 @@ def prepare_megamoe_inputs(
         force_balanced_topk,
         num_experts or 1,
         balanced_topk_stride,
+        balanced_topk_offset,
         BLOCK_K=block_k,
         GROUP_K=32,
         BLOCK_TOPK=block_topk,
