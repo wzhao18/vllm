@@ -3,11 +3,13 @@
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
+from math import gcd
 
 import regex as re
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -17,6 +19,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
@@ -63,6 +66,8 @@ from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_i
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import direct_register_custom_op
+
+logger = init_logger(__name__)
 
 
 class DeepseekV4MLP(nn.Module):
@@ -160,6 +165,18 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        self.force_balanced_topk = (
+            envs.VLLM_DEEPSEEK_V4_MEGA_MOE_FORCE_BALANCED_TOPK
+        )
+        self.balanced_topk_stride = self._make_balanced_topk_stride(
+            num_experts, top_k
+        )
+        if self.force_balanced_topk:
+            logger.warning_once(
+                "Forcing DeepSeek V4 MegaMoE topk_ids to a synthetic balanced "
+                "expert distribution. Model outputs are invalid; use this only "
+                "for performance experiments."
+            )
 
         weight_attrs = {"weight_loader": self.weight_loader}
         self.w13_weight = nn.Parameter(
@@ -217,6 +234,13 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
+
+    @staticmethod
+    def _make_balanced_topk_stride(num_experts: int, top_k: int) -> int:
+        stride = max(1, num_experts // max(1, top_k))
+        while gcd(stride, num_experts) != 1:
+            stride += 1
+        return stride
 
     def _map_global_expert_id(self, expert_id: int) -> int:
         if expert_id < self.experts_start_idx or expert_id >= self.experts_end_idx:
@@ -282,7 +306,9 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             return
 
         self._check_runtime_supported()
-        import vllm.third_party.deep_gemm as deep_gemm
+        from vllm.utils.deep_gemm import _import_deep_gemm
+
+        deep_gemm = _import_deep_gemm()
 
         w13_scale = deep_gemm.transform_sf_into_required_layout(
             self._ue8m0_uint8_to_float(self.w13_weight_scale.data).contiguous(),
@@ -316,7 +342,9 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         self.w2_weight_scale = None
 
     def get_symm_buffer(self):
-        import vllm.third_party.deep_gemm as deep_gemm
+        from vllm.utils.deep_gemm import _import_deep_gemm
+
+        deep_gemm = _import_deep_gemm()
 
         group = get_ep_group().device_group
         device = torch.accelerator.current_device_index()
@@ -377,7 +405,9 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         activation_clamp: float | None,
         fast_math: bool,
     ) -> None:
-        import vllm.third_party.deep_gemm as deep_gemm
+        from vllm.utils.deep_gemm import _import_deep_gemm
+
+        deep_gemm = _import_deep_gemm()
 
         symm_buffer = self.get_symm_buffer()
         num_tokens = hidden_states.shape[0]
@@ -389,6 +419,9 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             symm_buffer.x_sf[:num_tokens],
             symm_buffer.topk_idx[:num_tokens],
             symm_buffer.topk_weights[:num_tokens],
+            force_balanced_topk=self.force_balanced_topk,
+            num_experts=self.num_experts,
+            balanced_topk_stride=self.balanced_topk_stride,
         )
 
         # This method must have been already called during the weight loading phase.

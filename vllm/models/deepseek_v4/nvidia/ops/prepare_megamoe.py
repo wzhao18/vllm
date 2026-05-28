@@ -37,6 +37,9 @@ def _prepare_megamoe_inputs_kernel(
     topk_weights_out_stride_k: tl.constexpr,
     hidden_size: tl.constexpr,
     top_k: tl.constexpr,
+    force_balanced_topk: tl.constexpr,
+    num_experts: tl.constexpr,
+    balanced_topk_stride: tl.constexpr,
     BLOCK_K: tl.constexpr,
     GROUP_K: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
@@ -86,11 +89,18 @@ def _prepare_megamoe_inputs_kernel(
         topk_offsets = tl.arange(0, BLOCK_TOPK)
         topk_mask = topk_offsets < top_k
 
-        ids = tl.load(
-            topk_ids + token_id * topk_ids_stride_m + topk_offsets * topk_ids_stride_k,
-            mask=topk_mask,
-            other=0,
-        ).to(tl.int64)
+        if force_balanced_topk:
+            token_topk_idx = token_id * top_k + topk_offsets
+            ids = (token_topk_idx * balanced_topk_stride) % num_experts
+            ids = ids.to(tl.int64)
+        else:
+            ids = tl.load(
+                topk_ids
+                + token_id * topk_ids_stride_m
+                + topk_offsets * topk_ids_stride_k,
+                mask=topk_mask,
+                other=0,
+            ).to(tl.int64)
         tl.store(
             topk_idx_out
             + token_id * topk_idx_stride_m
@@ -123,6 +133,10 @@ def prepare_megamoe_inputs(
     x_sf: torch.Tensor,
     topk_idx_out: torch.Tensor,
     topk_weights_out: torch.Tensor,
+    *,
+    force_balanced_topk: bool = False,
+    num_experts: int | None = None,
+    balanced_topk_stride: int = 1,
 ) -> None:
     num_tokens, hidden_size = hidden_states.shape
     if num_tokens == 0:
@@ -138,6 +152,17 @@ def prepare_megamoe_inputs(
             "DeepSeek V4 MegaMoE input staging requires topk_weights and "
             "topk_ids to have the same shape."
         )
+    if force_balanced_topk:
+        if num_experts is None or num_experts <= 0:
+            raise ValueError(
+                "DeepSeek V4 MegaMoE balanced topk staging requires "
+                "num_experts to be positive."
+            )
+        if balanced_topk_stride <= 0:
+            raise ValueError(
+                "DeepSeek V4 MegaMoE balanced topk staging requires "
+                "balanced_topk_stride to be positive."
+            )
 
     block_k = 128
     grid = (num_tokens, triton.cdiv(hidden_size, block_k))
@@ -166,6 +191,9 @@ def prepare_megamoe_inputs(
         topk_weights_out.stride(1),
         hidden_size,
         top_k,
+        force_balanced_topk,
+        num_experts or 1,
+        balanced_topk_stride,
         BLOCK_K=block_k,
         GROUP_K=32,
         BLOCK_TOPK=block_topk,

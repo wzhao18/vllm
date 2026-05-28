@@ -178,6 +178,7 @@ if TYPE_CHECKING:
         "full",
         "relax",
     ] = "relax"
+    VLLM_DEEPSEEK_V4_MEGA_MOE_FORCE_BALANCED_TOPK: bool = False
     VLLM_USE_FUSED_MOE_GROUPED_TOPK: bool = True
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_FP16: bool = False
@@ -1409,6 +1410,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "full",
             "relax",
         ],
+    ),
+    # Experiment-only knob: force DeepSeek V4 MegaMoE expert IDs to a synthetic
+    # balanced distribution for performance upper-bound studies. This makes
+    # model outputs meaningless and should not be used for correctness runs.
+    "VLLM_DEEPSEEK_V4_MEGA_MOE_FORCE_BALANCED_TOPK": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_MEGA_MOE_FORCE_BALANCED_TOPK", "0"))
     ),
     # Whether to use fused grouped_topk used for MoE expert selection.
     "VLLM_USE_FUSED_MOE_GROUPED_TOPK": lambda: bool(
