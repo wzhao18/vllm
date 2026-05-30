@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -226,6 +227,43 @@ if TYPE_CHECKING:
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 logger = init_logger(__name__)
+
+
+def _debug_env_flag(name: str) -> bool:
+    return os.environ.get(name, "").lower() in ("1", "true", "yes", "on")
+
+
+_KV_OFFLOAD_SYNC_MODEL_EXECUTE = _debug_env_flag("VLLM_KV_OFFLOAD_SYNC_MODEL_EXECUTE")
+_KV_OFFLOAD_SYNC_SAMPLE = _debug_env_flag("VLLM_KV_OFFLOAD_SYNC_SAMPLE")
+
+
+def _kv_connector_debug_summary(scheduler_output: Any) -> str:
+    metadata = scheduler_output.kv_connector_metadata
+    if metadata is None:
+        return "kv_connector_metadata=None"
+    load_jobs = getattr(metadata, "load_jobs", None)
+    store_jobs = getattr(metadata, "store_jobs", None)
+    jobs_to_flush = getattr(metadata, "jobs_to_flush", None)
+
+    def _job_summary(jobs: Any) -> str:
+        if not jobs:
+            return "0"
+        try:
+            job_ids = list(jobs.keys())
+        except AttributeError:
+            job_ids = list(jobs)
+        return f"{len(job_ids)} first={job_ids[:4]}"
+
+    return (
+        f"kv_connector_metadata={type(metadata).__name__}, "
+        f"load_jobs={_job_summary(load_jobs)}, "
+        f"store_jobs={_job_summary(store_jobs)}, "
+        f"jobs_to_flush={_job_summary(jobs_to_flush)}, "
+        "total_num_scheduled_tokens="
+        f"{scheduler_output.total_num_scheduled_tokens}, "
+        f"finished_req_ids={len(scheduler_output.finished_req_ids)}"
+    )
+
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -4235,6 +4273,15 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            if _KV_OFFLOAD_SYNC_MODEL_EXECUTE and has_kv_transfer_group():
+                try:
+                    torch.cuda.current_stream().synchronize()
+                except Exception:
+                    logger.exception(
+                        "CUDA error while synchronizing after model forward: %s",
+                        _kv_connector_debug_summary(scheduler_output),
+                    )
+                    raise
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4362,6 +4409,15 @@ class GPUModelRunner(
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+            if _KV_OFFLOAD_SYNC_SAMPLE and has_kv_transfer_group():
+                try:
+                    torch.cuda.current_stream().synchronize()
+                except Exception:
+                    logger.exception(
+                        "CUDA error while synchronizing after sampling: %s",
+                        _kv_connector_debug_summary(scheduler_output),
+                    )
+                    raise
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output

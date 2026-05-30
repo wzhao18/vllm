@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -25,6 +26,23 @@ from vllm.v1.kv_offload.worker.worker import (
 )
 
 logger = init_logger(__name__)
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").lower() in ("1", "true", "yes", "on")
+
+
+_DEBUG_SYNC_TRANSFER = _env_flag("VLLM_KV_OFFLOAD_SYNC_TRANSFER")
+_DEBUG_LOG_TRANSFER = _env_flag("VLLM_KV_OFFLOAD_LOG_TRANSFER")
+_DEBUG_VALIDATE_TRANSFER = _DEBUG_SYNC_TRANSFER or _env_flag(
+    "VLLM_KV_OFFLOAD_VALIDATE_TRANSFER"
+)
+
+
+def _block_range(block_ids: np.ndarray) -> str:
+    if len(block_ids) == 0:
+        return "empty"
+    return f"{int(block_ids.min())}..{int(block_ids.max())} (n={len(block_ids)})"
 
 
 @dataclass
@@ -179,6 +197,151 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         # list of CUDA events available for re-use
         self._event_pool: list[torch.Event] = []
 
+    def _transfer_summary(
+        self,
+        job_id: int,
+        src_blocks: np.ndarray,
+        dst_blocks: np.ndarray,
+        group_sizes: list[int],
+        block_indices: list[int],
+        num_copy_ops: int,
+        num_transfer_bytes: int,
+    ) -> str:
+        src_page_sizes = sorted({int(t.shape[1]) for t in self.src_tensors})
+        dst_page_sizes = sorted({int(t.shape[1]) for t in self.dst_tensors})
+        group_ref_counts = [len(refs) for refs in self.kv_cache_groups_data_refs]
+        group_ref_page_ranges = [
+            (
+                min(ref.page_size_bytes for ref in refs),
+                max(ref.page_size_bytes for ref in refs),
+            )
+            if refs
+            else (0, 0)
+            for refs in self.kv_cache_groups_data_refs
+        ]
+        return (
+            f"job_id={job_id}, direction={self.transfer_type[0]}->"
+            f"{self.transfer_type[1]}, src_blocks={_block_range(src_blocks)}, "
+            f"dst_blocks={_block_range(dst_blocks)}, group_sizes={group_sizes}, "
+            f"block_indices={block_indices}, num_copy_ops={num_copy_ops}, "
+            f"num_transfer_bytes={num_transfer_bytes}, "
+            f"src_shape0={tuple(self.src_tensors[0].shape)}, "
+            f"dst_shape0={tuple(self.dst_tensors[0].shape)}, "
+            f"src_page_sizes={src_page_sizes}, "
+            f"dst_page_sizes={dst_page_sizes}, "
+            f"group_ref_counts={group_ref_counts}, "
+            f"group_ref_page_ranges={group_ref_page_ranges}"
+        )
+
+    @staticmethod
+    def _validate_block_ids(
+        job_id: int,
+        direction: str,
+        group_idx: int,
+        tensor_idx: int,
+        block_ids: np.ndarray,
+        tensor: torch.Tensor,
+    ) -> None:
+        if len(block_ids) == 0:
+            return
+        min_block = int(block_ids.min())
+        max_block = int(block_ids.max())
+        num_blocks = int(tensor.shape[0])
+        if min_block < 0 or max_block >= num_blocks:
+            raise RuntimeError(
+                "KV offload transfer block id out of range: "
+                f"job_id={job_id}, direction={direction}, "
+                f"group_idx={group_idx}, tensor_idx={tensor_idx}, "
+                f"block_range={min_block}..{max_block}, "
+                f"num_tensor_blocks={num_blocks}"
+            )
+
+    def _validate_transfer_bounds(
+        self,
+        job_id: int,
+        src_blocks: np.ndarray,
+        dst_blocks: np.ndarray,
+        group_sizes: list[int],
+        block_indices: list[int],
+    ) -> None:
+        src_offset = 0
+        dst_offset = 0
+        num_src_blocks = len(src_blocks)
+        num_dst_blocks = len(dst_blocks)
+        for group_idx, (group_size, block_idx, group_data_refs) in enumerate(
+            zip(group_sizes, block_indices, self.kv_cache_groups_data_refs)
+        ):
+            if group_size == 0:
+                continue
+
+            src_logical_blocks_to_skip = block_idx % self.src_block_size_factor
+            dst_logical_blocks_to_skip = block_idx % self.dst_block_size_factor
+            src_logical_blocks_count = group_size + src_logical_blocks_to_skip
+            dst_logical_blocks_count = group_size + dst_logical_blocks_to_skip
+
+            dst_blocks_count = cdiv(
+                dst_logical_blocks_count, self.dst_block_size_factor
+            )
+            dst_end_offset = dst_offset + dst_blocks_count
+            if dst_end_offset > num_dst_blocks:
+                raise RuntimeError(
+                    "KV offload transfer dst spec overrun: "
+                    f"job_id={job_id}, group_idx={group_idx}, "
+                    f"dst_end_offset={dst_end_offset}, "
+                    f"num_dst_blocks={num_dst_blocks}"
+                )
+
+            src_blocks_count = cdiv(
+                src_logical_blocks_count, self.src_block_size_factor
+            )
+            src_end_offset = src_offset + src_blocks_count
+            if src_end_offset > num_src_blocks:
+                raise RuntimeError(
+                    "KV offload transfer src spec overrun: "
+                    f"job_id={job_id}, group_idx={group_idx}, "
+                    f"src_end_offset={src_end_offset}, "
+                    f"num_src_blocks={num_src_blocks}"
+                )
+
+            group_src = src_blocks[src_offset:src_end_offset]
+            group_dst = dst_blocks[dst_offset:dst_end_offset]
+            for data_ref in group_data_refs:
+                tensor_idx = data_ref.tensor_idx
+                src_tensor = self.src_tensors[tensor_idx]
+                dst_tensor = self.dst_tensors[tensor_idx]
+                self._validate_block_ids(
+                    job_id, "src", group_idx, tensor_idx, group_src, src_tensor
+                )
+                self._validate_block_ids(
+                    job_id, "dst", group_idx, tensor_idx, group_dst, dst_tensor
+                )
+
+                src_sub_block_size = src_tensor.shape[1] // self.src_block_size_factor
+                dst_sub_block_size = dst_tensor.shape[1] // self.dst_block_size_factor
+                if (
+                    data_ref.page_size_bytes > src_sub_block_size
+                    or data_ref.page_size_bytes > dst_sub_block_size
+                ):
+                    raise RuntimeError(
+                        "KV offload transfer page size out of range: "
+                        f"job_id={job_id}, group_idx={group_idx}, "
+                        f"tensor_idx={tensor_idx}, "
+                        f"page_size_bytes={data_ref.page_size_bytes}, "
+                        f"src_sub_block_size={src_sub_block_size}, "
+                        f"dst_sub_block_size={dst_sub_block_size}"
+                    )
+
+            src_offset = src_end_offset
+            dst_offset = dst_end_offset
+
+        if src_offset != num_src_blocks or dst_offset != num_dst_blocks:
+            raise RuntimeError(
+                "KV offload transfer did not consume all block ids: "
+                f"job_id={job_id}, src_offset={src_offset}, "
+                f"num_src_blocks={num_src_blocks}, dst_offset={dst_offset}, "
+                f"num_dst_blocks={num_dst_blocks}"
+            )
+
     def transfer_async(self, job_id: int, transfer_spec: TransferSpec) -> bool:
         src_spec, dst_spec = transfer_spec
         assert isinstance(src_spec, BlockIDsLoadStoreSpec)
@@ -214,12 +377,17 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         # extract group_sizes from the GPU spec
         gpu_spec = src_spec if self.gpu_to_cpu else dst_spec
         assert isinstance(gpu_spec, GPULoadStoreSpec)
-        group_sizes = gpu_spec.group_sizes
+        group_sizes = list(gpu_spec.group_sizes)
         assert len(group_sizes) == len(self.kv_cache_groups_data_refs)
 
         # extract block indices from the GPU spec
-        block_indices = gpu_spec.block_indices
+        block_indices = list(gpu_spec.block_indices)
         assert len(block_indices) == len(self.kv_cache_groups_data_refs)
+
+        if _DEBUG_VALIDATE_TRANSFER:
+            self._validate_transfer_bounds(
+                job_id, src_blocks, dst_blocks, group_sizes, block_indices
+            )
 
         num_copy_ops = 0
         for group_size, group_data_refs in zip(
@@ -333,6 +501,28 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
                     is_src_access_order_any=is_src_access_order_any,
                 )
             end_event.record(stream)
+
+        if _DEBUG_LOG_TRANSFER or _DEBUG_SYNC_TRANSFER:
+            summary = self._transfer_summary(
+                job_id,
+                src_blocks,
+                dst_blocks,
+                group_sizes,
+                block_indices,
+                num_copy_ops,
+                num_transfer_bytes,
+            )
+            if _DEBUG_LOG_TRANSFER:
+                logger.info("Submitted KV offload transfer: %s", summary)
+            if _DEBUG_SYNC_TRANSFER:
+                try:
+                    stream.synchronize()
+                except Exception:
+                    logger.exception(
+                        "CUDA error while synchronizing KV offload transfer: %s",
+                        summary,
+                    )
+                    raise
 
         self._transfer_events[job_id] = end_event
         self._transfers.append(
