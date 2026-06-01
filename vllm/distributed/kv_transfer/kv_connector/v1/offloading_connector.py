@@ -104,17 +104,17 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         pass
 
     def wait_for_save(self):
-        # Store deferral is handled in get_finished(), which always runs even
-        # when wait_for_save() is skipped (e.g. kv_connector_no_forward).
+        # Native KV offload stores are submitted from get_finished(), which
+        # always runs even when wait_for_save() is skipped (e.g.
+        # kv_connector_no_forward).
         pass
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         assert self.connector_worker is not None
         assert isinstance(self._connector_metadata, OffloadingConnectorMetadata)
 
-        # Defer store jobs to the next step's start_kv_transfers. Done here
-        # (rather than wait_for_save) so stores are queued even on steps where
-        # wait_for_save is skipped.
+        # Submit store jobs here rather than wait_for_save so stores are
+        # handled even on steps where wait_for_save is skipped.
         self.connector_worker.prepare_store_kv(self._connector_metadata)
 
         return self.connector_worker.get_finished(finished_req_ids)

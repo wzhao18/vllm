@@ -102,10 +102,9 @@ void swap_blocks_batch(const torch::stable::Tensor& src_ptrs,
 
   const cudaStream_t stream = get_current_cuda_stream();
 
-  // Use cuMemcpyBatchAsync / hipMemcpyBatchAsync to submit all copies in a
-  // single driver call, amortizing per-copy submission overhead. int64_t
-  // and CUdeviceptr/void*/size_t are all 8 bytes on 64-bit platforms, so we
-  // reinterpret_cast the tensor data directly to avoid copies.
+  // Use hipMemcpyBatchAsync on ROCm. On CUDA, temporarily use the per-copy
+  // fallback while native KV offload isolates cuMemcpyBatchAsync batch
+  // metadata and driver behavior.
   static_assert(sizeof(size_t) == sizeof(int64_t));
 #if !defined(USE_ROCM) && defined(CUDA_VERSION) && CUDA_VERSION >= 12080
   static_assert(sizeof(CUdeviceptr) == sizeof(int64_t));
@@ -167,14 +166,13 @@ void swap_blocks_batch(const torch::stable::Tensor& src_ptrs,
   }
 #endif
   {
-    // Fallback for CUDA < 12.8, older CUDA drivers, and ROCm < 7.1:
-    // individual async copies. cudaMemcpyDefault lets the driver infer
-    // direction from pointer types.
+    // CUDA fallback and ROCm < 7.1 fallback: individual async copies.
+    // cudaMemcpyDefault lets the driver infer direction from pointer types.
     for (int64_t i = 0; i < n; i++) {
-      cudaMemcpyAsync(reinterpret_cast<void*>(dst_data[i]),
-                      reinterpret_cast<void*>(src_data[i]),
-                      static_cast<size_t>(size_data[i]), cudaMemcpyDefault,
-                      stream);
+      C10_CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(dst_data[i]),
+                                     reinterpret_cast<void*>(src_data[i]),
+                                     static_cast<size_t>(size_data[i]),
+                                     cudaMemcpyDefault, stream));
     }
   }
 }

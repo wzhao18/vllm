@@ -3,6 +3,7 @@
 from collections.abc import Iterator
 
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_offload.base import (
@@ -16,6 +17,8 @@ from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.gpu_worker import CpuGpuOffloadingHandlers
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.worker.worker import OffloadingHandler
+
+logger = init_logger(__name__)
 
 
 class CPUOffloadingSpec(OffloadingSpec):
@@ -47,6 +50,19 @@ class CPUOffloadingSpec(OffloadingSpec):
         world_size = vllm_config.parallel_config.world_size
         self.cpu_page_size_per_worker: int = (
             kv_bytes_per_offloaded_block // world_size if world_size > 0 else 0
+        )
+        logger.info(
+            "CPU KV offloading capacity: cpu_bytes_to_use=%.2f GiB, "
+            "num_cpu_blocks=%d, kv_bytes_per_block=%d, "
+            "kv_bytes_per_offloaded_block=%d, cpu_page_size_per_worker=%d, "
+            "block_size_factor=%d, world_size=%d",
+            int(cpu_bytes_to_use) / (1 << 30),
+            self.num_blocks,
+            kv_bytes_per_block,
+            kv_bytes_per_offloaded_block,
+            self.cpu_page_size_per_worker,
+            self.block_size_factor,
+            world_size,
         )
 
         # scheduler-side

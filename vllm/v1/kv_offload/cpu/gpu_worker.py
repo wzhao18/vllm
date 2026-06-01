@@ -34,6 +34,89 @@ class Transfer:
     start_event: torch.Event
     end_event: torch.Event
     num_bytes: int
+    batch_src: torch.Tensor
+    batch_dst: torch.Tensor
+    batch_sizes: torch.Tensor
+
+
+def validate_block_id_range(
+    block_ids: np.ndarray,
+    tensors: list[torch.Tensor],
+    medium: str,
+    transfer_type: tuple[str, str],
+    job_id: int,
+) -> None:
+    if len(block_ids) == 0:
+        return
+
+    min_block_id = int(block_ids.min())
+    max_block_id = int(block_ids.max())
+    for tensor_idx, tensor in enumerate(tensors):
+        num_blocks = tensor.shape[0]
+        if min_block_id < 0 or max_block_id >= num_blocks:
+            raise RuntimeError(
+                f"{transfer_type} transfer {job_id} has {medium} block IDs "
+                f"outside tensor {tensor_idx}: range=[{min_block_id}, "
+                f"{max_block_id}], num_blocks={num_blocks}"
+            )
+
+
+def compute_sub_block_ids(
+    block_ids: np.ndarray,
+    block_size_factor: int,
+    output: np.ndarray,
+    skip_count: int = 0,
+):
+    assert skip_count < block_size_factor
+
+    num_sub_blocks = len(output)
+    if block_size_factor == 1:
+        output[:] = block_ids[:num_sub_blocks]
+        return
+
+    all_ids = np.repeat(block_ids.astype(np.int64), block_size_factor)
+    output[:] = all_ids[skip_count : skip_count + num_sub_blocks]
+
+
+def validate_non_overlapping_ranges(
+    ptrs: np.ndarray,
+    sizes: np.ndarray,
+    medium: str,
+    transfer_type: tuple[str, str],
+    job_id: int,
+    group_indices: np.ndarray,
+    tensor_indices: np.ndarray,
+    block_ids: np.ndarray,
+) -> None:
+    if len(ptrs) <= 1:
+        return
+
+    order = np.argsort(ptrs, kind="stable")
+    prev_idx = int(order[0])
+    prev_start = int(ptrs[prev_idx])
+    prev_end = prev_start + int(sizes[prev_idx])
+
+    for pos in range(1, len(order)):
+        idx = int(order[pos])
+        start = int(ptrs[idx])
+        end = start + int(sizes[idx])
+        if start < prev_end:
+            raise RuntimeError(
+                f"{transfer_type} transfer {job_id} has overlapping {medium} "
+                f"copy ranges: op {prev_idx} "
+                f"(group={int(group_indices[prev_idx])}, "
+                f"tensor={int(tensor_indices[prev_idx])}, "
+                f"block={int(block_ids[prev_idx])}, "
+                f"range=[{prev_start:#x}, {prev_end:#x})) overlaps op {idx} "
+                f"(group={int(group_indices[idx])}, "
+                f"tensor={int(tensor_indices[idx])}, "
+                f"block={int(block_ids[idx])}, "
+                f"range=[{start:#x}, {end:#x}))"
+            )
+        if end > prev_end:
+            prev_idx = idx
+            prev_start = start
+            prev_end = end
 
 
 def compute_sub_block_ptrs(
@@ -191,6 +274,20 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
 
         num_src_blocks = len(src_blocks)
         num_dst_blocks = len(dst_blocks)
+        validate_block_id_range(
+            src_blocks,
+            self.src_tensors,
+            self.transfer_type[0],
+            self.transfer_type,
+            job_id,
+        )
+        validate_block_id_range(
+            dst_blocks,
+            self.dst_tensors,
+            self.transfer_type[1],
+            self.transfer_type,
+            job_id,
+        )
 
         # There are 2 types of transfers:
         # 1. GPU -> CPU
@@ -230,14 +327,17 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         all_src = np.empty(num_copy_ops, dtype=np.int64)
         all_dst = np.empty(num_copy_ops, dtype=np.int64)
         all_sizes = np.empty(num_copy_ops, dtype=np.int64)
+        all_group_indices = np.empty(num_copy_ops, dtype=np.int64)
+        all_tensor_indices = np.empty(num_copy_ops, dtype=np.int64)
+        all_dst_block_ids = np.empty(num_copy_ops, dtype=np.int64)
 
         src_offset = 0
         dst_offset = 0
         op_idx = 0
         # count total number of bytes copied
         num_transfer_bytes = 0
-        for group_size, block_idx, group_data_refs in zip(
-            group_sizes, block_indices, self.kv_cache_groups_data_refs
+        for group_idx, (group_size, block_idx, group_data_refs) in enumerate(
+            zip(group_sizes, block_indices, self.kv_cache_groups_data_refs)
         ):
             if group_size == 0:
                 continue
@@ -265,23 +365,64 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             for data_ref in group_data_refs:
                 t_idx = data_ref.tensor_idx
                 end_idx = op_idx + group_size
+                src_tensor = self.src_tensors[t_idx]
+                dst_tensor = self.dst_tensors[t_idx]
+                if src_tensor.shape[1] % self.src_block_size_factor != 0:
+                    raise RuntimeError(
+                        f"{self.transfer_type} transfer {job_id} source tensor "
+                        f"{t_idx} page size {src_tensor.shape[1]} is not "
+                        f"divisible by block factor {self.src_block_size_factor}"
+                    )
+                if dst_tensor.shape[1] % self.dst_block_size_factor != 0:
+                    raise RuntimeError(
+                        f"{self.transfer_type} transfer {job_id} destination "
+                        f"tensor {t_idx} page size {dst_tensor.shape[1]} is "
+                        f"not divisible by block factor "
+                        f"{self.dst_block_size_factor}"
+                    )
+                src_sub_block_size = (
+                    src_tensor.shape[1] // self.src_block_size_factor
+                )
+                dst_sub_block_size = (
+                    dst_tensor.shape[1] // self.dst_block_size_factor
+                )
+                if data_ref.page_size_bytes > src_sub_block_size:
+                    raise RuntimeError(
+                        f"{self.transfer_type} transfer {job_id} copy size "
+                        f"{data_ref.page_size_bytes} exceeds source tensor "
+                        f"{t_idx} sub-block size {src_sub_block_size}"
+                    )
+                if data_ref.page_size_bytes > dst_sub_block_size:
+                    raise RuntimeError(
+                        f"{self.transfer_type} transfer {job_id} copy size "
+                        f"{data_ref.page_size_bytes} exceeds destination "
+                        f"tensor {t_idx} sub-block size {dst_sub_block_size}"
+                    )
 
                 compute_sub_block_ptrs(
                     group_src,
                     self.src_block_size_factor,
                     all_src[op_idx:end_idx],
-                    self.src_tensors[t_idx],
+                    src_tensor,
                     skip_count=src_logical_blocks_to_skip,
                 )
                 compute_sub_block_ptrs(
                     group_dst,
                     self.dst_block_size_factor,
                     all_dst[op_idx:end_idx],
-                    self.dst_tensors[t_idx],
+                    dst_tensor,
+                    skip_count=dst_logical_blocks_to_skip,
+                )
+                compute_sub_block_ids(
+                    group_dst,
+                    self.dst_block_size_factor,
+                    all_dst_block_ids[op_idx:end_idx],
                     skip_count=dst_logical_blocks_to_skip,
                 )
 
                 all_sizes[op_idx:end_idx] = data_ref.page_size_bytes
+                all_group_indices[op_idx:end_idx] = group_idx
+                all_tensor_indices[op_idx:end_idx] = t_idx
                 num_transfer_bytes += group_size * data_ref.page_size_bytes
                 op_idx = end_idx
 
@@ -291,6 +432,16 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         assert src_offset == num_src_blocks
         assert dst_offset == num_dst_blocks
         assert op_idx == num_copy_ops
+        validate_non_overlapping_ranges(
+            all_dst,
+            all_sizes,
+            self.transfer_type[1],
+            self.transfer_type,
+            job_id,
+            all_group_indices,
+            all_tensor_indices,
+            all_dst_block_ids,
+        )
 
         batch_src = torch.from_numpy(all_src)
         batch_dst = torch.from_numpy(all_dst)
@@ -342,8 +493,16 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
                 start_event=start_event,
                 end_event=end_event,
                 num_bytes=num_transfer_bytes,
+                batch_src=batch_src,
+                batch_dst=batch_dst,
+                batch_sizes=batch_sizes,
             )
         )
+
+        # Debug mode: make native KV offload copies synchronous so CUDA copy
+        # failures surface at the transfer site instead of a later unrelated
+        # synchronization point in model execution.
+        end_event.synchronize()
 
         # success
         return True

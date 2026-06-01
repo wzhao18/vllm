@@ -50,6 +50,16 @@ class OffloadingConnectorWorker:
         self._unsubmitted_store_jobs: list[tuple[int, TransferSpec]] = []
         self._connector_worker_meta = OffloadingWorkerMetadata()
 
+    def _submit_and_wait(self, jobs: list[tuple[int, TransferSpec]]) -> None:
+        submitted_jobs: set[int] = set()
+        for job_id, transfer_spec in jobs:
+            success = self.worker.transfer_async(job_id, transfer_spec)
+            assert success
+            submitted_jobs.add(job_id)
+
+        if submitted_jobs:
+            self.worker.wait(submitted_jobs)
+
     def _register_handlers(self, kv_caches: CanonicalKVCaches):
         for src_cls, dst_cls, handler in self.spec.get_handlers(kv_caches):
             self.worker.register_handler(src_cls, dst_cls, handler)
@@ -230,31 +240,32 @@ class OffloadingConnectorWorker:
         self._register_handlers(canonical_kv_caches)
 
     def handle_preemptions(self, kv_connector_metadata: OffloadingConnectorMetadata):
-        for job_id, transfer_spec in self._unsubmitted_store_jobs:
-            success = self.worker.transfer_async(job_id, transfer_spec)
-            assert success
+        self._submit_and_wait(self._unsubmitted_store_jobs)
         self._unsubmitted_store_jobs.clear()
 
         if kv_connector_metadata.jobs_to_flush:
             self.worker.wait(kv_connector_metadata.jobs_to_flush)
 
     def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
-        for job_id, transfer_spec in self._unsubmitted_store_jobs:
-            success = self.worker.transfer_async(job_id, transfer_spec)
-            assert success
+        self._submit_and_wait(self._unsubmitted_store_jobs)
         self._unsubmitted_store_jobs.clear()
 
+        submitted_load_jobs: set[int] = set()
         for job_id, entry in metadata.load_jobs.items():
             self._load_jobs[job_id] = entry.req_id
             success = self.worker.transfer_async(job_id, entry.transfer_spec)
             assert success
+            submitted_load_jobs.add(job_id)
+
+        if submitted_load_jobs:
+            self.worker.wait(submitted_load_jobs)
 
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
-        for job_id, entry in metadata.store_jobs.items():
-            # NOTE(orozery): defer the store to the beginning of the next
-            # engine step, so that offloading starts AFTER transfers related
-            # to token sampling, thereby avoiding delays to token generation.
-            self._unsubmitted_store_jobs.append((job_id, entry.transfer_spec))
+        store_jobs = [
+            (job_id, entry.transfer_spec)
+            for job_id, entry in metadata.store_jobs.items()
+        ]
+        self._submit_and_wait(store_jobs)
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """

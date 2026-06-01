@@ -4,6 +4,7 @@ import random
 import time
 import uuid
 
+import numpy as np
 import pytest
 import torch
 
@@ -16,7 +17,10 @@ from vllm.v1.kv_offload.base import (
     GPULoadStoreSpec,
 )
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
-from vllm.v1.kv_offload.cpu.gpu_worker import CpuGpuOffloadingHandlers
+from vllm.v1.kv_offload.cpu.gpu_worker import (
+    CpuGpuOffloadingHandlers,
+    validate_non_overlapping_ranges,
+)
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 
 NUM_GPU_BLOCKS = [64]
@@ -29,6 +33,35 @@ DEVICE_TYPE = current_platform.device_type
 DEVICES = [f"{DEVICE_TYPE}:0"]
 NUM_MAPPINGS = [3]
 NUM_MAPPINGS_PER_GROUP = [2]
+
+
+def test_validate_non_overlapping_ranges() -> None:
+    group_indices = np.array([0, 0, 1], dtype=np.int64)
+    tensor_indices = np.array([2, 2, 3], dtype=np.int64)
+    block_ids = np.array([4, 5, 6], dtype=np.int64)
+
+    validate_non_overlapping_ranges(
+        np.array([0x1000, 0x1100, 0x1200], dtype=np.int64),
+        np.array([0x80, 0x80, 0x80], dtype=np.int64),
+        "GPU",
+        ("CPU", "GPU"),
+        1,
+        group_indices,
+        tensor_indices,
+        block_ids,
+    )
+
+    with pytest.raises(RuntimeError, match="overlapping GPU copy ranges"):
+        validate_non_overlapping_ranges(
+            np.array([0x1000, 0x1070, 0x1200], dtype=np.int64),
+            np.array([0x80, 0x80, 0x80], dtype=np.int64),
+            "GPU",
+            ("CPU", "GPU"),
+            2,
+            group_indices,
+            tensor_indices,
+            block_ids,
+        )
 
 
 @pytest.mark.parametrize("gpu_to_cpu", [True, False])
