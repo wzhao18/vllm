@@ -14,8 +14,12 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cfloat>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 #ifdef USE_ROCM
   #include <hip/hip_bf16.h>
@@ -29,6 +33,16 @@ constexpr float kFp8ScaleDivisor = 224.f;
 #else
 constexpr float kFp8ScaleDivisor = 448.f;
 #endif
+
+namespace {
+
+bool env_flag_enabled(const char* name) {
+  const char* value = std::getenv(name);
+  return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0 &&
+         std::strcmp(value, "false") != 0 && std::strcmp(value, "False") != 0;
+}
+
+}  // namespace
 
 void swap_blocks(torch::stable::Tensor& src, torch::stable::Tensor& dst,
                  int64_t block_size_in_bytes,
@@ -102,12 +116,26 @@ void swap_blocks_batch(const torch::stable::Tensor& src_ptrs,
 
   const cudaStream_t stream = get_current_cuda_stream();
 
-  // Use hipMemcpyBatchAsync on ROCm. On CUDA, temporarily use the per-copy
-  // fallback while native KV offload isolates cuMemcpyBatchAsync batch
-  // metadata and driver behavior.
+  // Use hipMemcpyBatchAsync on ROCm. On CUDA, default to the per-copy fallback
+  // while native KV offload isolates cuMemcpyBatchAsync batch metadata and
+  // driver behavior. Set VLLM_KV_OFFLOAD_USE_CU_MEMCPY_BATCH=1 to opt back in.
   static_assert(sizeof(size_t) == sizeof(int64_t));
 #if !defined(USE_ROCM) && defined(CUDA_VERSION) && CUDA_VERSION >= 12080
   static_assert(sizeof(CUdeviceptr) == sizeof(int64_t));
+  static const bool use_cuda_batch =
+      env_flag_enabled("VLLM_KV_OFFLOAD_USE_CU_MEMCPY_BATCH");
+  static std::atomic<bool> logged_cuda_path{false};
+  bool expected_logged_cuda_path = false;
+  if (logged_cuda_path.compare_exchange_strong(expected_logged_cuda_path, true)) {
+    std::fprintf(stderr,
+                 "vLLM native KV offload swap_blocks_batch: using CUDA %s "
+                 "(VLLM_KV_OFFLOAD_USE_CU_MEMCPY_BATCH=%s)\n",
+                 use_cuda_batch ? "cuMemcpyBatchAsync"
+                                : "cudaMemcpyAsync loop",
+                 use_cuda_batch ? "enabled" : "unset/false");
+    std::fflush(stderr);
+  }
+
   // Resolve cuMemcpyBatchAsync at runtime via cuGetProcAddress so that
   // binaries compiled with CUDA 12.8+ still work on older drivers, and
   // we avoid the CUDA 13.0 header remapping (#define to _v2 signature).
@@ -126,7 +154,7 @@ void swap_blocks_batch(const torch::stable::Tensor& src_ptrs,
     return reinterpret_cast<BatchFn>(fn_ptr);
   }();
 
-  if (batch_fn != nullptr) {
+  if (use_cuda_batch && batch_fn != nullptr) {
     CUmemcpyAttributes attr = {};
     // ANY lets the DMA engine prefetch source bytes out of stream order,
     // which is only safe when no GPU stream is concurrently writing the
@@ -169,10 +197,14 @@ void swap_blocks_batch(const torch::stable::Tensor& src_ptrs,
     // CUDA fallback and ROCm < 7.1 fallback: individual async copies.
     // cudaMemcpyDefault lets the driver infer direction from pointer types.
     for (int64_t i = 0; i < n; i++) {
-      C10_CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(dst_data[i]),
-                                     reinterpret_cast<void*>(src_data[i]),
-                                     static_cast<size_t>(size_data[i]),
-                                     cudaMemcpyDefault, stream));
+      cudaError_t result =
+          cudaMemcpyAsync(reinterpret_cast<void*>(dst_data[i]),
+                          reinterpret_cast<void*>(src_data[i]),
+                          static_cast<size_t>(size_data[i]), cudaMemcpyDefault,
+                          stream);
+      STD_TORCH_CHECK(result == cudaSuccess,
+                      "cudaMemcpyAsync failed at index ", i, " with error ",
+                      cudaGetErrorString(result));
     }
   }
 }
