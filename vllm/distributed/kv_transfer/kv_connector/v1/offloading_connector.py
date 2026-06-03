@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -41,6 +41,9 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_offload.factory import OffloadingSpecFactory
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
+
+if TYPE_CHECKING:
+    from vllm.v1.core.block_pool import BlockPool
 
 
 class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
@@ -127,6 +130,10 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
     def on_new_request(self, request: "Request") -> None:
         assert self.connector_scheduler is not None
         self.connector_scheduler.on_new_request(request)
+
+    def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.bind_gpu_block_pool(gpu_block_pool)
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int

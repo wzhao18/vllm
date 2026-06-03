@@ -16,7 +16,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
 )
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.kv_cache_utils import (
+    BlockHashListWithBlockSize,
+    get_block_hash,
+    get_group_id,
+)
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -58,6 +64,9 @@ class TransferJobStatus:
     # Store src block IDs that may be freed before the request finishes.
     # Registered in _block_id_to_pending_jobs at store creation time.
     sliding_window_block_ids: list[int] | None = None
+    # Store src block IDs pinned in the GPU BlockPool until the async
+    # GPU->CPU copy completes.
+    gpu_block_ids_to_release: list[int] | None = None
 
 
 class GroupOffloadConfig(NamedTuple):
@@ -305,11 +314,19 @@ class OffloadingConnectorScheduler:
         # protected by their ref_cnt) and for sliding window blocks (which can
         # be freed before a request finishes).
         self._block_id_to_pending_jobs: dict[int, set[int]] = {}
+        self._gpu_block_pool: BlockPool | None = None
+        # Stale jobs are ignored for cache-manager completion after reset_cache,
+        # but store source refs still need to be released when workers report
+        # those old jobs as completed.
+        self._stale_gpu_block_ids_to_release: dict[int, tuple[int, list[int]]] = {}
 
     def _generate_job_id(self) -> int:
         job_id = self._job_counter
         self._job_counter += 1
         return job_id
+
+    def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
+        self._gpu_block_pool = gpu_block_pool
 
     def _remove_pending_job(self, job_id: int, block_ids: list[int] | None) -> None:
         for bid in block_ids or ():
@@ -317,6 +334,50 @@ class OffloadingConnectorScheduler:
             pending.remove(job_id)
             if not pending:
                 del self._block_id_to_pending_jobs[bid]
+
+    def _touch_gpu_blocks(self, block_ids: list[int]) -> list[int] | None:
+        if not block_ids:
+            return None
+        assert self._gpu_block_pool is not None
+        unique_block_ids = list(dict.fromkeys(block_ids))
+        self._gpu_block_pool.touch(
+            [self._gpu_block_pool.blocks[bid] for bid in unique_block_ids]
+        )
+        return unique_block_ids
+
+    def _free_gpu_blocks(self, block_ids: list[int] | None) -> None:
+        if not block_ids:
+            return
+        assert self._gpu_block_pool is not None
+        self._gpu_block_pool.free_blocks(
+            self._gpu_block_pool.blocks[bid] for bid in block_ids
+        )
+
+    @staticmethod
+    def _gpu_block_hashes(req: Request, group_config: GroupOffloadConfig):
+        hash_block_size = (
+            group_config.offloaded_block_size // group_config.hash_block_size_factor
+        )
+        if hash_block_size == group_config.gpu_block_size:
+            return req.block_hashes
+        return BlockHashListWithBlockSize(
+            req.block_hashes, hash_block_size, group_config.gpu_block_size
+        )
+
+    def _matches_current_gpu_block(
+        self,
+        group_config: GroupOffloadConfig,
+        gpu_block_hashes,
+        gpu_block_idx: int,
+        block_id: int,
+    ) -> bool:
+        assert self._gpu_block_pool is not None
+        block_hash = self._gpu_block_pool.blocks[block_id].block_hash
+        return (
+            block_hash is not None
+            and get_group_id(block_hash) == group_config.group_idx
+            and get_block_hash(block_hash) == gpu_block_hashes[gpu_block_idx]
+        )
 
     def _maximal_prefix_lookup(
         self, keys: Iterable[OffloadKey], req_context: ReqContext
@@ -749,6 +810,7 @@ class OffloadingConnectorScheduler:
 
                 alignment_block_count = group_config.alignment_block_count
                 tail = group_config.sliding_window_size_in_blocks
+                gpu_block_hashes = self._gpu_block_hashes(req, group_config)
 
                 for key_idx, (offload_key, block_id) in enumerate(
                     zip(offload_keys, offload_block_ids)
@@ -766,6 +828,19 @@ class OffloadingConnectorScheduler:
                         pos_in_segment = abs_block_idx % alignment_block_count
                         if pos_in_segment < alignment_block_count - tail:
                             continue
+                    gpu_block_idx = (start_block_idx + key_idx) * block_size_factor
+                    block_ids = group_state.block_ids
+                    if not all(
+                        block_ids[gpu_block_idx + i] == 0
+                        or self._matches_current_gpu_block(
+                            group_config,
+                            gpu_block_hashes,
+                            gpu_block_idx + i,
+                            block_ids[gpu_block_idx + i],
+                        )
+                        for i in range(block_size_factor)
+                    ):
+                        continue
                     new_offload_keys.append(offload_key)
 
             if not new_offload_keys:
@@ -834,6 +909,7 @@ class OffloadingConnectorScheduler:
                 src_block_ids, group_sizes=group_sizes, block_indices=block_indices
             )
             dst_spec = store_output.store_spec
+            gpu_block_ids_to_release = self._touch_gpu_blocks(src_block_ids)
 
             job_id = self._generate_job_id()
             # a store can only be issued when no load is pending.
@@ -856,6 +932,7 @@ class OffloadingConnectorScheduler:
                 is_store=True,
                 non_sliding_window_block_ids=non_sliding_window_block_ids,
                 sliding_window_block_ids=sliding_window_block_ids or None,
+                gpu_block_ids_to_release=gpu_block_ids_to_release,
             )
 
             store_jobs[job_id] = TransferJob(
@@ -915,6 +992,18 @@ class OffloadingConnectorScheduler:
         for job_id, count in meta.completed_jobs.items():
             assert count > 0
             if job_id < self._stale_job_threshold:
+                stale_release = self._stale_gpu_block_ids_to_release.get(job_id)
+                if stale_release is not None:
+                    pending_count, gpu_block_ids = stale_release
+                    pending_count -= count
+                    if pending_count > 0:
+                        self._stale_gpu_block_ids_to_release[job_id] = (
+                            pending_count,
+                            gpu_block_ids,
+                        )
+                    else:
+                        self._free_gpu_blocks(gpu_block_ids)
+                        del self._stale_gpu_block_ids_to_release[job_id]
                 logger.debug(
                     "Skipping stale completed job %d (pre-reset counter: %d)",
                     job_id,
@@ -929,7 +1018,12 @@ class OffloadingConnectorScheduler:
 
             req_status = self._req_status[job_status.req_id]
             if job_status.is_store:
-                self.manager.complete_store(job_status.keys, req_status.req_context)
+                try:
+                    self.manager.complete_store(
+                        job_status.keys, req_status.req_context
+                    )
+                finally:
+                    self._free_gpu_blocks(job_status.gpu_block_ids_to_release)
             else:
                 self.manager.complete_load(job_status.keys, req_status.req_context)
                 if self._blocks_being_loaded:
@@ -1027,6 +1121,12 @@ class OffloadingConnectorScheduler:
 
         # Discard jobs and save job_counter to be able to discard worker responses
         self._stale_job_threshold = self._job_counter
+        for job_id, status in self._jobs.items():
+            if status.gpu_block_ids_to_release:
+                self._stale_gpu_block_ids_to_release[job_id] = (
+                    status.pending_count,
+                    status.gpu_block_ids_to_release,
+                )
         self._jobs.clear()
         self._block_id_to_pending_jobs.clear()
 
