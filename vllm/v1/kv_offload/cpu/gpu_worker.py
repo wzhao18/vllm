@@ -153,6 +153,64 @@ def _new_descriptor_buffers(
     )
 
 
+def _check_block_ids_in_range(
+    block_ids: np.ndarray,
+    tensor: torch.Tensor,
+    role: str,
+    job_id: int,
+) -> None:
+    if block_ids.size == 0:
+        raise RuntimeError(
+            f"KV offload job {job_id} has no {role} blocks for a non-empty copy"
+        )
+
+    min_block_id = int(block_ids.min())
+    max_block_id = int(block_ids.max())
+    if min_block_id < 0 or max_block_id >= tensor.shape[0]:
+        raise RuntimeError(
+            f"KV offload job {job_id} has out-of-range {role} block IDs "
+            f"[{min_block_id}, {max_block_id}] for tensor with "
+            f"{tensor.shape[0]} blocks"
+        )
+
+
+def _check_copy_ref(
+    data_ref: CanonicalKVCacheRef,
+    src_tensor: torch.Tensor,
+    dst_tensor: torch.Tensor,
+    src_block_size_factor: int,
+    dst_block_size_factor: int,
+    job_id: int,
+) -> None:
+    if data_ref.page_size_bytes < 0:
+        raise RuntimeError(
+            f"KV offload job {job_id} has negative copy size "
+            f"{data_ref.page_size_bytes}"
+        )
+
+    for role, tensor, block_size_factor in (
+        ("source", src_tensor, src_block_size_factor),
+        ("destination", dst_tensor, dst_block_size_factor),
+    ):
+        if tensor.data_ptr() == 0:
+            raise RuntimeError(
+                f"KV offload job {job_id} has a null {role} tensor pointer"
+            )
+        if tensor.shape[1] % block_size_factor != 0:
+            raise RuntimeError(
+                f"KV offload job {job_id} has incompatible {role} tensor "
+                f"shape {tuple(tensor.shape)} and block size factor "
+                f"{block_size_factor}"
+            )
+        sub_block_size = tensor.shape[1] // block_size_factor
+        if data_ref.page_size_bytes > sub_block_size:
+            raise RuntimeError(
+                f"KV offload job {job_id} copy size "
+                f"{data_ref.page_size_bytes} exceeds {role} sub-block size "
+                f"{sub_block_size}"
+            )
+
+
 class SingleDirectionOffloadingHandler(OffloadingHandler):
     """
     SingleDirectionOffloadingHandler handles transfers for a single direction,
@@ -272,10 +330,21 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         block_indices = gpu_spec.block_indices
         assert len(block_indices) == len(self.kv_cache_groups_data_refs)
 
+        group_active_data_refs: list[list[CanonicalKVCacheRef]] = []
+        for group_data_refs in self.kv_cache_groups_data_refs:
+            active_refs: list[CanonicalKVCacheRef] = []
+            for data_ref in group_data_refs:
+                if data_ref.page_size_bytes < 0:
+                    raise RuntimeError(
+                        f"KV offload job {job_id} has negative copy size "
+                        f"{data_ref.page_size_bytes}"
+                    )
+                if data_ref.page_size_bytes > 0:
+                    active_refs.append(data_ref)
+            group_active_data_refs.append(active_refs)
+
         num_copy_ops = 0
-        for group_size, group_data_refs in zip(
-            group_sizes, self.kv_cache_groups_data_refs
-        ):
+        for group_size, group_data_refs in zip(group_sizes, group_active_data_refs):
             num_copy_ops += group_size * len(group_data_refs)
 
         # reuse a pooled buffer set, growing it if this transfer needs more room
@@ -300,7 +369,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         # count total number of bytes copied
         num_transfer_bytes = 0
         for group_size, block_idx, group_data_refs in zip(
-            group_sizes, block_indices, self.kv_cache_groups_data_refs
+            group_sizes, block_indices, group_active_data_refs
         ):
             if group_size == 0:
                 continue
@@ -327,20 +396,45 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
 
             for data_ref in group_data_refs:
                 t_idx = data_ref.tensor_idx
+                if (
+                    t_idx < 0
+                    or t_idx >= len(self.src_tensors)
+                    or t_idx >= len(self.dst_tensors)
+                ):
+                    raise RuntimeError(
+                        f"KV offload job {job_id} has invalid tensor index "
+                        f"{t_idx}"
+                    )
+
+                src_tensor = self.src_tensors[t_idx]
+                dst_tensor = self.dst_tensors[t_idx]
+                _check_copy_ref(
+                    data_ref,
+                    src_tensor,
+                    dst_tensor,
+                    self.src_block_size_factor,
+                    self.dst_block_size_factor,
+                    job_id,
+                )
+                _check_block_ids_in_range(group_src, src_tensor, "source", job_id)
+                _check_block_ids_in_range(
+                    group_dst, dst_tensor, "destination", job_id
+                )
+
                 end_idx = op_idx + group_size
 
                 compute_sub_block_ptrs(
                     group_src,
                     self.src_block_size_factor,
                     all_src[op_idx:end_idx],
-                    self.src_tensors[t_idx],
+                    src_tensor,
                     skip_count=src_logical_blocks_to_skip,
                 )
                 compute_sub_block_ptrs(
                     group_dst,
                     self.dst_block_size_factor,
                     all_dst[op_idx:end_idx],
-                    self.dst_tensors[t_idx],
+                    dst_tensor,
                     skip_count=dst_logical_blocks_to_skip,
                 )
 

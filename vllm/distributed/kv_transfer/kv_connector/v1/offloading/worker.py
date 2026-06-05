@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import defaultdict
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import torch
 
@@ -37,6 +37,13 @@ from vllm.v1.kv_offload.worker.worker import (
 logger = init_logger(__name__)
 
 
+@dataclass
+class DeferredStoreJob:
+    job_id: int
+    transfer_spec: TransferSpec
+    ready_event: torch.cuda.Event | None
+
+
 class OffloadingConnectorWorker:
     """Implementation of Worker side methods"""
 
@@ -47,7 +54,7 @@ class OffloadingConnectorWorker:
         self.kv_connector_stats = OffloadingConnectorStats()
         # job_id -> req_id for in-flight loads.
         self._load_jobs: dict[int, ReqId] = {}
-        self._unsubmitted_store_jobs: list[tuple[int, TransferSpec]] = []
+        self._unsubmitted_store_jobs: list[DeferredStoreJob] = []
         self._connector_worker_meta = OffloadingWorkerMetadata()
 
     def _register_handlers(self, kv_caches: CanonicalKVCaches):
@@ -230,8 +237,10 @@ class OffloadingConnectorWorker:
         self._register_handlers(canonical_kv_caches)
 
     def handle_preemptions(self, kv_connector_metadata: OffloadingConnectorMetadata):
-        for job_id, transfer_spec in self._unsubmitted_store_jobs:
-            success = self.worker.transfer_async(job_id, transfer_spec)
+        for job in self._unsubmitted_store_jobs:
+            if job.ready_event is not None:
+                torch.cuda.current_stream().wait_event(job.ready_event)
+            success = self.worker.transfer_async(job.job_id, job.transfer_spec)
             assert success
         self._unsubmitted_store_jobs.clear()
 
@@ -239,8 +248,10 @@ class OffloadingConnectorWorker:
             self.worker.wait(kv_connector_metadata.jobs_to_flush)
 
     def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
-        for job_id, transfer_spec in self._unsubmitted_store_jobs:
-            success = self.worker.transfer_async(job_id, transfer_spec)
+        for job in self._unsubmitted_store_jobs:
+            if job.ready_event is not None:
+                torch.cuda.current_stream().wait_event(job.ready_event)
+            success = self.worker.transfer_async(job.job_id, job.transfer_spec)
             assert success
         self._unsubmitted_store_jobs.clear()
 
@@ -254,7 +265,13 @@ class OffloadingConnectorWorker:
             # NOTE(orozery): defer the store to the beginning of the next
             # engine step, so that offloading starts AFTER transfers related
             # to token sampling, thereby avoiding delays to token generation.
-            self._unsubmitted_store_jobs.append((job_id, entry.transfer_spec))
+            ready_event = None
+            if torch.cuda.is_available():
+                ready_event = torch.cuda.Event()
+                ready_event.record(torch.cuda.current_stream())
+            self._unsubmitted_store_jobs.append(
+                DeferredStoreJob(job_id, entry.transfer_spec, ready_event)
+            )
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """
