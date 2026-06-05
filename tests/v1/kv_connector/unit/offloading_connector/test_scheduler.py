@@ -15,7 +15,7 @@ from vllm.distributed.kv_events import BlockRemoved, BlockStored
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
 )
-from vllm.v1.core.kv_cache_utils import BlockHash
+from vllm.v1.core.kv_cache_utils import BlockHash, make_block_hash_with_group_id
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheGroupSpec,
@@ -613,6 +613,31 @@ def test_two_groups_different_block_sizes(request_runner, async_scheduling: bool
         expected_loaded=((0, 4), (0, 5), (0, 6), (1, 3), (1, 4)),
     )
     runner.run(decoded_tokens=[EOS_TOKEN_ID])
+
+
+def test_matches_current_gpu_block_rejects_wrong_hash():
+    from types import SimpleNamespace
+
+    expected_hash = BlockHash(b"expected")
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler._gpu_block_pool = SimpleNamespace(
+        enable_caching=True,
+        blocks=[
+            SimpleNamespace(
+                block_hash=make_block_hash_with_group_id(BlockHash(b"actual"), 0)
+            )
+        ]
+    )
+    group_config = SimpleNamespace(group_idx=0)
+
+    assert not scheduler._matches_current_gpu_block(
+        group_config, [expected_hash], 0, 0
+    )
+
+    scheduler._gpu_block_pool.blocks[0].block_hash = make_block_hash_with_group_id(
+        expected_hash, 0
+    )
+    assert scheduler._matches_current_gpu_block(group_config, [expected_hash], 0, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -1347,6 +1372,43 @@ def test_swa_alignment_skip(request_runner, async_scheduling: bool):
             (1, 7),
         ),
     )
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_store_skips_gpu_block_with_mismatched_hash(
+    request_runner, async_scheduling: bool
+):
+    """Do not publish a store key if the source block was reused.
+
+    The CPU offload manager tracks readiness by offload key. If scheduler state
+    points at a valid GPU block ID whose current hash belongs to another block,
+    copying it would mark the old key ready with wrong bytes.
+    """
+    block_size = 4
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=10,
+        async_scheduling=async_scheduling,
+    )
+
+    runner.new_request(token_ids=[0] * block_size)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: None
+    runner.run(decoded_tokens=[0])
+
+    req_status = runner.connector_scheduler._req_status["0"]
+    block_id = req_status.group_states[0].block_ids[0]
+    gpu_pool = runner.scheduler.kv_cache_manager.block_pool
+    assert gpu_pool.blocks[block_id].block_hash is not None
+
+    gpu_pool.blocks[block_id]._block_hash = make_block_hash_with_group_id(
+        BlockHash(b"wrong"), 0
+    )
+
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=())
+    runner.manager.prepare_store.assert_not_called()
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])

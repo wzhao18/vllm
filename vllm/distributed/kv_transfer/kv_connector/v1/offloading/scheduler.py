@@ -18,6 +18,12 @@ from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.kv_cache_utils import (
+    BlockHashList,
+    BlockHashListWithBlockSize,
+    get_block_hash,
+    get_group_id,
+)
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -348,6 +354,37 @@ class OffloadingConnectorScheduler:
         assert self._gpu_block_pool is not None
         self._gpu_block_pool.free_blocks(
             self._gpu_block_pool.blocks[bid] for bid in block_ids
+        )
+
+    @staticmethod
+    def _gpu_block_hashes(
+        req: Request, group_config: GroupOffloadConfig
+    ) -> BlockHashList:
+        hash_block_size = (
+            group_config.offloaded_block_size // group_config.hash_block_size_factor
+        )
+        if hash_block_size == group_config.gpu_block_size:
+            return req.block_hashes
+        return BlockHashListWithBlockSize(
+            req.block_hashes, hash_block_size, group_config.gpu_block_size
+        )
+
+    def _matches_current_gpu_block(
+        self,
+        group_config: GroupOffloadConfig,
+        gpu_block_hashes: BlockHashList,
+        gpu_block_idx: int,
+        block_id: int,
+    ) -> bool:
+        gpu_block_pool = self._gpu_block_pool
+        assert gpu_block_pool is not None
+        if not gpu_block_pool.enable_caching:
+            return True
+        block_hash = gpu_block_pool.blocks[block_id].block_hash
+        return (
+            block_hash is not None
+            and get_group_id(block_hash) == group_config.group_idx
+            and get_block_hash(block_hash) == gpu_block_hashes[gpu_block_idx]
         )
 
     def _maximal_prefix_lookup(
@@ -802,6 +839,7 @@ class OffloadingConnectorScheduler:
 
                 alignment_block_count = group_config.alignment_block_count
                 tail = group_config.sliding_window_size_in_blocks
+                gpu_block_hashes = self._gpu_block_hashes(req, group_config)
 
                 for key_idx, (offload_key, block_id) in enumerate(
                     zip(offload_keys, offload_block_ids)
@@ -819,6 +857,19 @@ class OffloadingConnectorScheduler:
                         pos_in_segment = abs_block_idx % alignment_block_count
                         if pos_in_segment < alignment_block_count - tail:
                             continue
+                    gpu_block_idx = (start_block_idx + key_idx) * block_size_factor
+                    block_ids = group_state.block_ids
+                    if not all(
+                        block_ids[gpu_block_idx + i] == 0
+                        or self._matches_current_gpu_block(
+                            group_config,
+                            gpu_block_hashes,
+                            gpu_block_idx + i,
+                            block_ids[gpu_block_idx + i],
+                        )
+                        for i in range(block_size_factor)
+                    ):
+                        continue
                     new_offload_keys.append(offload_key)
 
             if not new_offload_keys:
