@@ -51,6 +51,7 @@ def swap_blocks_batch(
     dst_addrs: torch.Tensor,
     sizes: torch.Tensor,
     is_src_access_order_any: bool = False,
+    device_index: int = -1,
     *,
     bytes_per_chunk: int,
 ) -> None:
@@ -63,12 +64,14 @@ def swap_blocks_batch(
             dst_addrs,
             sizes,
             is_src_access_order_any=is_src_access_order_any,
+            device_index=device_index,
         )
         return
+    device = torch.device("cuda", device_index) if device_index >= 0 else "cuda"
     _swap_blocks_kernel[(min(NUM_SMS, n),)](
-        src_addrs.to("cuda", non_blocking=True),
-        dst_addrs.to("cuda", non_blocking=True),
-        sizes.to("cuda", non_blocking=True),
+        src_addrs.to(device, non_blocking=True),
+        dst_addrs.to(device, non_blocking=True),
+        sizes.to(device, non_blocking=True),
         n,
         BYTES_PER_CHUNK=bytes_per_chunk,
     )

@@ -692,7 +692,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
   ops.def(
       "swap_blocks_batch(Tensor src_ptrs, Tensor dst_ptrs,"
       "                  Tensor sizes,"
-      "                  bool is_src_access_order_any=False) -> ()");
+      "                  bool is_src_access_order_any=False,"
+      "                  int device_index=-1) -> ()");
 
   // Reshape the key and value tensors and cache them.
   ops.def(

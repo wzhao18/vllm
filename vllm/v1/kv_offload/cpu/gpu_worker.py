@@ -243,12 +243,16 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         """
         assert len(gpu_tensors) == len(cpu_tensors)
         assert len(gpu_tensors) > 0
+        self.device = gpu_tensors[0].device
+        self.device_index = self.device.index
+        assert self.device_index is not None
 
         # assert input tensors are as expected
         for gpu_tensor, cpu_tensor in zip(gpu_tensors, cpu_tensors):
             assert gpu_tensor.dtype == torch.int8
             assert gpu_tensor.ndim == 2
             assert gpu_tensor.is_cuda
+            assert gpu_tensor.device == self.device
             assert cpu_tensor.dtype == torch.int8
             assert cpu_tensor.ndim == 2
             assert cpu_tensor.device.type == "cpu"
@@ -449,7 +453,11 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         assert dst_offset == num_dst_blocks
         assert op_idx == num_copy_ops
 
-        stream = self._stream_pool.pop() if self._stream_pool else torch.cuda.Stream()
+        stream = (
+            self._stream_pool.pop()
+            if self._stream_pool
+            else torch.cuda.Stream(device=self.device)
+        )
         start_event = (
             self._event_pool.pop()
             if self._event_pool
@@ -463,7 +471,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
 
         if self.gpu_to_cpu:
             # wait for model computation to finish before offloading
-            stream.wait_stream(torch.cuda.current_stream())
+            stream.wait_stream(torch.cuda.current_stream(self.device))
         if self._transfers:
             last_transfer: Transfer = self._transfers[-1]
             last_event = last_transfer.end_event
@@ -476,7 +484,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         # writing; we must keep STREAM ordering so source reads are gated
         # by the transfer stream's wait_stream(compute) barrier.
         is_src_access_order_any = not self.gpu_to_cpu
-        with torch.cuda.stream(stream):
+        with torch.cuda.device(self.device), torch.cuda.stream(stream):
             start_event.record(stream)
             if num_copy_ops > 0:
                 self._swap_blocks_batch(
@@ -484,6 +492,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
                     dst,
                     sizes,
                     is_src_access_order_any=is_src_access_order_any,
+                    device_index=self.device_index,
                 )
             end_event.record(stream)
 

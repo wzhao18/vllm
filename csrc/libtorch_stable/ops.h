@@ -449,7 +449,7 @@ void swap_blocks(torch::stable::Tensor& src, torch::stable::Tensor& dst,
 void swap_blocks_batch(const torch::stable::Tensor& src_ptrs,
                        const torch::stable::Tensor& dst_ptrs,
                        const torch::stable::Tensor& sizes,
-                       bool is_src_access_order_any);
+                       bool is_src_access_order_any, int64_t device_index);
 
 void reshape_and_cache(torch::stable::Tensor& key, torch::stable::Tensor& value,
                        torch::stable::Tensor& key_cache,

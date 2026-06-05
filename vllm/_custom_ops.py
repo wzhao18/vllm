@@ -2753,6 +2753,7 @@ def swap_blocks_batch(
     dst_ptrs: torch.Tensor,
     sizes: torch.Tensor,
     is_src_access_order_any: bool = False,
+    device_index: int = -1,
 ) -> None:
     """
     Batch version of swap_blocks: submit all copies in a single driver call.
@@ -2767,9 +2768,10 @@ def swap_blocks_batch(
         out of stream order. Only safe when no GPU stream is concurrently
         writing to the source. Defaults to False (STREAM ordering), which
         is always safe.
+    device_index: CUDA device whose current stream receives the copies.
     """
     torch.ops._C_cache_ops.swap_blocks_batch(
-        src_ptrs, dst_ptrs, sizes, is_src_access_order_any
+        src_ptrs, dst_ptrs, sizes, is_src_access_order_any, device_index
     )
 
 

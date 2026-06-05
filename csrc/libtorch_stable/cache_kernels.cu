@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <optional>
 
 #ifdef USE_ROCM
   #include <hip/hip_bf16.h>
@@ -79,7 +80,7 @@ void swap_blocks(torch::stable::Tensor& src, torch::stable::Tensor& dst,
 void swap_blocks_batch(const torch::stable::Tensor& src_ptrs,
                        const torch::stable::Tensor& dst_ptrs,
                        const torch::stable::Tensor& sizes,
-                       bool is_src_access_order_any) {
+                       bool is_src_access_order_any, int64_t device_index) {
   STD_TORCH_CHECK(src_ptrs.device().is_cpu(), "src_ptrs must be on CPU");
   STD_TORCH_CHECK(dst_ptrs.device().is_cpu(), "dst_ptrs must be on CPU");
   STD_TORCH_CHECK(sizes.device().is_cpu(), "sizes must be on CPU");
@@ -100,7 +101,12 @@ void swap_blocks_batch(const torch::stable::Tensor& src_ptrs,
   int64_t* dst_data = dst_ptrs.mutable_data_ptr<int64_t>();
   int64_t* size_data = sizes.mutable_data_ptr<int64_t>();
 
-  const cudaStream_t stream = get_current_cuda_stream();
+  std::optional<torch::stable::accelerator::DeviceGuard> device_guard;
+  if (device_index >= 0) {
+    device_guard.emplace(static_cast<int32_t>(device_index));
+  }
+  const cudaStream_t stream =
+      get_current_cuda_stream(static_cast<int32_t>(device_index));
 
   // Use cuMemcpyBatchAsync / hipMemcpyBatchAsync to submit all copies in a
   // single driver call, amortizing per-copy submission overhead. int64_t
