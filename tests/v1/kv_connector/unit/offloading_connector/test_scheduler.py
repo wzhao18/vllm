@@ -896,6 +896,48 @@ def test_fence_at_build_store_jobs(request_runner):
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])
+def test_store_pins_gpu_source_blocks_until_completion(
+    request_runner, async_scheduling: bool
+):
+    """In-flight stores keep source GPU blocks alive until copy completion."""
+    block_size = 4
+    block_size_factor = 3
+    offloaded_block_size = block_size * block_size_factor
+
+    runner = request_runner(
+        block_size_factor=block_size_factor,
+        block_size=block_size,
+        num_gpu_blocks=100,
+        async_scheduling=async_scheduling,
+    )
+    runner.new_request(token_ids=[0] * offloaded_block_size)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+
+    runner.run(decoded_tokens=[0], complete_transfers=False)
+
+    store_statuses = [
+        status
+        for status in runner.connector_scheduler._jobs.values()
+        if status.is_store
+    ]
+    assert len(store_statuses) == 1
+    pinned_block_ids = store_statuses[0].gpu_block_ids_to_release
+    assert pinned_block_ids is not None
+    assert len(pinned_block_ids) == block_size_factor
+
+    gpu_pool = runner.scheduler.kv_cache_manager.block_pool
+    for block_id in pinned_block_ids:
+        assert gpu_pool.blocks[block_id].ref_cnt == 2
+
+    runner.run(decoded_tokens=[0], expected_stored=(0, 1, 2))
+
+    for block_id in pinned_block_ids:
+        assert gpu_pool.blocks[block_id].ref_cnt == 1
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
 def test_complete_store_called_per_job(request_runner, async_scheduling: bool):
     """complete_store fires per-job, not deferred to request finish.
     Each call carries only that store's keys."""
