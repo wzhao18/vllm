@@ -432,9 +432,19 @@ class BlockPool:
         blocks_list = list(ordered_blocks)
         for block in blocks_list:
             block.ref_cnt -= 1
-        freed_blocks = [
-            block for block in blocks_list if block.ref_cnt == 0 and not block.is_null
-        ]
+        # The same physical block may appear multiple times in a logical
+        # block list. Decrement every entry above, but only insert the block
+        # into the free queue once when its final refcount reaches zero.
+        freed_blocks: list[KVCacheBlock] = []
+        freed_block_ids: set[int] = set()
+        for block in blocks_list:
+            if (
+                block.ref_cnt == 0
+                and not block.is_null
+                and block.block_id not in freed_block_ids
+            ):
+                freed_blocks.append(block)
+                freed_block_ids.add(block.block_id)
         if prepend:
             self.free_block_queue.prepend_n(freed_blocks)
         else:
