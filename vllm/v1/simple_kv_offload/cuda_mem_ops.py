@@ -116,10 +116,17 @@ class BatchMemcpyParams(NamedTuple):
     stream_handle: int  # raw cudaStream_t / CUstream
 
 
+class BatchMemcpyBuffers(NamedTuple):
+    dst_all: np.ndarray
+    src_all: np.ndarray
+    sz_all: np.ndarray
+
+
 def build_params(
     src_caches: dict[str, torch.Tensor],
     dst_caches: dict[str, torch.Tensor],
     stream: torch.cuda.Stream,
+    is_src_access_order_any: bool,
 ) -> BatchMemcpyParams:
     global _batch_memcpy_fn
     if _batch_memcpy_fn is None:
@@ -137,10 +144,13 @@ def build_params(
         dst_bases.append(d.data_ptr())
         bpb.append(s_bpb)
 
+    # ``srcAccessOrder=1`` == CU_MEMCPY_SRC_ACCESS_ORDER_STREAM.
     # ``srcAccessOrder=3`` == CU_MEMCPY_SRC_ACCESS_ORDER_ANY /
     # hipMemcpySrcAccessOrderAny. See
     # https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MEM.html#group__CUDA__MEM_1g6f1ff58e3065df3eb4b573dba77ad31f  # noqa: E501
-    attrs = _CUmemcpyAttributes(srcAccessOrder=3)
+    attrs = _CUmemcpyAttributes(
+        srcAccessOrder=3 if is_src_access_order_any else 1
+    )
 
     return BatchMemcpyParams(
         src_bases=np.array(src_bases, dtype=np.uint64),
@@ -158,11 +168,11 @@ def copy_blocks(
     src_block_ids: list[int],
     dst_block_ids: list[int],
     params: BatchMemcpyParams,
-) -> None:
+) -> BatchMemcpyBuffers | None:
     """Copy blocks via cuMemcpyBatchAsync / hipMemcpyBatchAsync."""
     n = len(src_block_ids)
     if n == 0:
-        return
+        return None
 
     src_ids = np.array(src_block_ids, dtype=np.uint64)
     dst_ids = np.array(dst_block_ids, dtype=np.uint64)
@@ -196,3 +206,4 @@ def copy_blocks(
         raise RuntimeError(
             f"batch memcpy failed: err={err} failIdx={params.fail_idx.value}"
         )
+    return BatchMemcpyBuffers(dst_all, src_all, sz_all)

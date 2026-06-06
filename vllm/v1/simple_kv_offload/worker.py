@@ -9,7 +9,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.platform_utils import is_pin_memory_available
-from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend
+from vllm.v1.simple_kv_offload.copy_backend import CopyEvent, DmaCopyBackend
 from vllm.v1.simple_kv_offload.cuda_mem_ops import pin_tensor
 from vllm.v1.simple_kv_offload.metadata import (
     SimpleCPUOffloadMetadata,
@@ -46,9 +46,9 @@ class SimpleCPUOffloadWorker:
 
         self._backend = DmaCopyBackend()
 
-        # Ordered (event_idx, Event). Events pre-allocated on main thread.
-        self._load_events: list[tuple[int, torch.Event]] = []
-        self._store_events: list[tuple[int, torch.Event]] = []
+        # Ordered (event_idx, Event, descriptor buffers).
+        self._load_events: list[CopyEvent] = []
+        self._store_events: list[CopyEvent] = []
         # High-water marks: highest event_idx completed per stream.
         # When the event list is empty, the hwm covers all prior events.
         self._load_hwm: int = -1
@@ -206,9 +206,9 @@ class SimpleCPUOffloadWorker:
     ) -> tuple[set[str] | None, set[str] | None]:
         """Submit transfers and report completed events to the scheduler.
 
-        Called after model execution. The manager only schedules stores for
-        blocks whose KV data is confirmed computed, so we launch both loads
-        and stores immediately — no deferral or cross-stream sync needed.
+        Called after model execution. Store copies read live GPU KV cache
+        memory, so they are ordered after the current stream before the
+        background copy thread submits GPU->CPU DMA.
 
         Returns:
             tuple of (finished_sending, finished_recving).
@@ -229,12 +229,16 @@ class SimpleCPUOffloadWorker:
                 )
             # Launch stores (GPU->CPU).
             if metadata.store_gpu_blocks:
+                ready_event = torch.Event()
+                assert self.device is not None
+                ready_event.record(torch.cuda.current_stream(self.device))
                 self._backend.launch_copy(
                     metadata.store_gpu_blocks,
                     metadata.store_cpu_blocks,
                     is_store=True,
                     event_idx=metadata.store_event,
                     events_list=self._store_events,
+                    ready_event=ready_event,
                 )
 
         # (2) Track completed transfer events
@@ -278,12 +282,12 @@ class SimpleCPUOffloadWorker:
 
     def _flush_and_sync_all(self) -> None:
         """Synchronize all in-flight transfer events."""
-        for event_idx, event in self._load_events:
+        for event_idx, event, _buffers in self._load_events:
             event.synchronize()
             self._load_hwm = event_idx
         self._load_events.clear()
 
-        for event_idx, event in self._store_events:
+        for event_idx, event, _buffers in self._store_events:
             event.synchronize()
             self._store_hwm = event_idx
         self._store_events.clear()
@@ -293,7 +297,7 @@ class SimpleCPUOffloadWorker:
         events = self._store_events if is_store else self._load_events
         hwm = self._store_hwm if is_store else self._load_hwm
         while events:
-            event_idx, event = events[0]
+            event_idx, event, _buffers = events[0]
             if not event.query():
                 break
             hwm = event_idx

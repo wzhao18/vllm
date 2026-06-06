@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+import os
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -32,6 +33,14 @@ from vllm.v1.kv_offload.worker.worker import (
 )
 
 logger = init_logger(__name__)
+
+_U64_MASK = (1 << 64) - 1
+_KV_OFFLOAD_DEBUG_SYNC = bool(
+    int(os.getenv("VLLM_KV_OFFLOAD_DEBUG_SYNC", "0"))
+)
+_KV_OFFLOAD_VALIDATE_DESCRIPTORS = bool(
+    int(os.getenv("VLLM_KV_OFFLOAD_VALIDATE_DESCRIPTORS", "0"))
+)
 
 
 def _select_swap_blocks_fn(
@@ -209,6 +218,89 @@ def _check_copy_ref(
                 f"{data_ref.page_size_bytes} exceeds {role} sub-block size "
                 f"{sub_block_size}"
             )
+
+
+def _as_u64(value: int) -> int:
+    return int(value) & _U64_MASK
+
+
+def _tensor_byte_range(tensor: torch.Tensor) -> tuple[int, int]:
+    assert tensor.ndim == 2
+    assert tensor.dtype == torch.int8
+    start = _as_u64(tensor.data_ptr())
+    if tensor.shape[0] == 0 or tensor.shape[1] == 0:
+        return start, start
+    end_offset = (
+        (tensor.shape[0] - 1) * tensor.stride(0)
+        + (tensor.shape[1] - 1) * tensor.stride(1)
+        + 1
+    )
+    return start, start + end_offset
+
+
+def _range_is_contained(
+    ptr: int,
+    size: int,
+    ranges: list[tuple[int, int]],
+) -> bool:
+    end = ptr + size
+    return any(start <= ptr and end <= stop for start, stop in ranges)
+
+
+def _validate_copy_descriptors(
+    src_ptrs: np.ndarray,
+    dst_ptrs: np.ndarray,
+    sizes: np.ndarray,
+    src_tensors: list[torch.Tensor],
+    dst_tensors: list[torch.Tensor],
+    job_id: int,
+) -> None:
+    src_ranges = [_tensor_byte_range(tensor) for tensor in src_tensors]
+    dst_ranges = [_tensor_byte_range(tensor) for tensor in dst_tensors]
+    dst_writes: list[tuple[int, int, int, int, int]] = []
+
+    for idx, (src, dst, size) in enumerate(zip(src_ptrs, dst_ptrs, sizes)):
+        src_int = _as_u64(int(src))
+        dst_int = _as_u64(int(dst))
+        size_int = int(size)
+        if size_int <= 0:
+            raise RuntimeError(
+                f"KV offload job {job_id} descriptor {idx} has "
+                f"invalid size {size_int}"
+            )
+        if not _range_is_contained(src_int, size_int, src_ranges):
+            raise RuntimeError(
+                f"KV offload job {job_id} descriptor {idx} has source "
+                f"range [{src_int}, {src_int + size_int}) outside "
+                f"registered source tensors"
+            )
+        if not _range_is_contained(dst_int, size_int, dst_ranges):
+            raise RuntimeError(
+                f"KV offload job {job_id} descriptor {idx} has destination "
+                f"range [{dst_int}, {dst_int + size_int}) outside "
+                f"registered destination tensors"
+            )
+        dst_writes.append((dst_int, dst_int + size_int, src_int, size_int, idx))
+
+    dst_writes.sort()
+    for prev, curr in zip(dst_writes, dst_writes[1:]):
+        prev_dst, prev_end, prev_src, prev_size, prev_idx = prev
+        curr_dst, curr_end, curr_src, curr_size, curr_idx = curr
+        if curr_dst >= prev_end:
+            continue
+        same_copy = (
+            curr_dst == prev_dst
+            and curr_end == prev_end
+            and curr_src == prev_src
+            and curr_size == prev_size
+        )
+        if same_copy:
+            continue
+        raise RuntimeError(
+            f"KV offload job {job_id} has overlapping destination "
+            f"descriptors {prev_idx} and {curr_idx}: "
+            f"[{prev_dst}, {prev_end}) and [{curr_dst}, {curr_end})"
+        )
 
 
 class SingleDirectionOffloadingHandler(OffloadingHandler):
@@ -453,6 +545,16 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         assert dst_offset == num_dst_blocks
         assert op_idx == num_copy_ops
 
+        if _KV_OFFLOAD_VALIDATE_DESCRIPTORS:
+            _validate_copy_descriptors(
+                all_src[:num_copy_ops],
+                all_dst[:num_copy_ops],
+                all_sizes[:num_copy_ops],
+                self.src_tensors,
+                self.dst_tensors,
+                job_id,
+            )
+
         stream = (
             self._stream_pool.pop()
             if self._stream_pool
@@ -495,6 +597,21 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
                     device_index=self.device_index,
                 )
             end_event.record(stream)
+
+        if _KV_OFFLOAD_DEBUG_SYNC:
+            try:
+                end_event.synchronize()
+            except Exception:
+                logger.exception(
+                    "KV offload transfer %d failed during debug sync "
+                    "(%s -> %s, copy_ops=%d, bytes=%d)",
+                    job_id,
+                    self.transfer_type[0],
+                    self.transfer_type[1],
+                    num_copy_ops,
+                    num_transfer_bytes,
+                )
+                raise
 
         self._transfer_events[job_id] = end_event
         self._transfers.append(

@@ -2285,6 +2285,25 @@ def test_block_stored_event_group_idx_out_of_bounds(monkeypatch):
     assert warnings == ["Group index `1` not in KV cache metadata"]
 
 
+def test_free_blocks_deduplicates_free_queue_insertions():
+    pool = BlockPool(num_gpu_blocks=4, enable_caching=True, hash_block_size=16)
+    block = pool.get_new_blocks(1)[0]
+
+    # Simulate two logical references to the same physical block, as can
+    # happen when a request block list contains duplicate block objects while
+    # an async KV offload store also pins the block.
+    pool.touch([block])
+    assert block.ref_cnt == 2
+
+    pool.free_blocks([block, block])
+
+    free_blocks = pool.free_block_queue.get_all_free_blocks()
+    assert block.ref_cnt == 0
+    assert free_blocks.count(block) == 1
+    assert pool.get_num_free_blocks() == len(free_blocks)
+    pool.get_new_blocks(pool.get_num_free_blocks())
+
+
 @pytest.mark.parametrize("group_id", [0, 1, 2])
 def test_block_removed_event_group_idx(group_id: int):
     """

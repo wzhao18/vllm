@@ -8,6 +8,7 @@ from vllm.v1.kv_offload.base import CanonicalKVCacheRef
 from vllm.v1.kv_offload.cpu.gpu_worker import (
     _check_block_ids_in_range,
     _check_copy_ref,
+    _validate_copy_descriptors,
 )
 
 
@@ -49,3 +50,33 @@ def test_check_copy_ref_allows_sub_block_sized_copy() -> None:
         dst_block_size_factor=3,
         job_id=5,
     )
+
+
+def test_validate_copy_descriptors_rejects_out_of_range_pointer() -> None:
+    src_tensor = torch.empty((2, 8), dtype=torch.int8)
+    dst_tensor = torch.empty((2, 8), dtype=torch.int8)
+
+    with pytest.raises(RuntimeError, match="outside registered source tensors"):
+        _validate_copy_descriptors(
+            np.array([src_tensor.data_ptr() + src_tensor.numel()], dtype=np.int64),
+            np.array([dst_tensor.data_ptr()], dtype=np.int64),
+            np.array([8], dtype=np.int64),
+            [src_tensor],
+            [dst_tensor],
+            job_id=6,
+        )
+
+
+def test_validate_copy_descriptors_rejects_overlapping_destinations() -> None:
+    src_tensor = torch.empty((2, 16), dtype=torch.int8)
+    dst_tensor = torch.empty((2, 16), dtype=torch.int8)
+
+    with pytest.raises(RuntimeError, match="overlapping destination descriptors"):
+        _validate_copy_descriptors(
+            np.array([src_tensor.data_ptr(), src_tensor.data_ptr() + 8]),
+            np.array([dst_tensor.data_ptr(), dst_tensor.data_ptr() + 4]),
+            np.array([8, 8]),
+            [src_tensor],
+            [dst_tensor],
+            job_id=7,
+        )
