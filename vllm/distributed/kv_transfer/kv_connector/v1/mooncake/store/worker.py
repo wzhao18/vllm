@@ -534,7 +534,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
             # Within each lcm region only per-spec relevant chunks are loaded
             # (e.g., SWA or linear attn), so mask out irrelevant chunks
-            store_masks = self.coord.store_mask(token_len)
+            store_masks = self.coord.store_mask(token_len, req_meta.num_prompt_tokens)
             starts: list[int] = []
             ends: list[int] = []
             keys: list[str] = []
@@ -781,6 +781,11 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 addr_list.append(addr)
                 size_list.append(size)
                 block_id_list.append(block_id)
+
+        if not key_list:
+            self.set_finished_request(req_id)
+            self.request_queue.task_done()
+            return
 
         # Rotate aligned lists by tp_rank for load balancing.
         rotation = self.tp_rank % len(key_list)
@@ -1094,6 +1099,7 @@ class MooncakeStoreWorker:
             scheduler_block_size=self.block_size,
             hash_block_size=self.hash_block_size,
             use_eagle=use_eagle,
+            retention_interval=envs.VLLM_PREFIX_CACHE_RETENTION_INTERVAL,
         )
         # One ChunkedTokenDatabase per group; addresses populated in
         # register_kv_caches once the kv-cache layout is known.
@@ -1136,33 +1142,35 @@ class MooncakeStoreWorker:
         self.num_blocks = self.cache_config.num_gpu_blocks
 
         seen_ptrs: set[int] = set()
-        addrs: list[int] = []
-        block_lens: list[int] = []
+        segments_by_layer: dict[str, tuple[int, list[int], list[int]]] = {}
 
-        for value in kv_caches.values():
-            cache = _repr_tensor(value)
+        def _get_cache_segments(
+            cache: torch.Tensor,
+        ) -> tuple[int, list[int], list[int]]:
             cache_storage = cache.untyped_storage()
             base_addr = cache_storage.data_ptr()
-            if base_addr in seen_ptrs:
-                continue
-            seen_ptrs.add(base_addr)
             region_len = cache_storage.nbytes()
 
-            ret = self.store.register_buffer(base_addr, region_len)
-            if ret != 0:
-                logger.error(
-                    "register_buffer failed for addr %#x len %d: %d",
-                    base_addr,
-                    region_len,
-                    ret,
-                )
+            if base_addr not in seen_ptrs:
+                seen_ptrs.add(base_addr)
 
+                ret = self.store.register_buffer(base_addr, region_len)
+                if ret != 0:
+                    logger.error(
+                        "register_buffer failed for addr %#x len %d: %d",
+                        base_addr,
+                        region_len,
+                        ret,
+                    )
+
+            addrs: list[int] = []
+            block_lens: list[int] = []
+            el = cache.element_size()
+            page_size_bytes = region_len // self.num_blocks
             # Detect layout via stride: a dim whose byte-stride exceeds
             # page_size_bytes is an outer segment dim (e.g. the K/V dim of
             # FlashAttn's (2, num_blocks, ...)). FlashInfer/MLA's blocks-
             # outermost layout has no such dim and yields a single segment.
-            el = cache.element_size()
-            page_size_bytes = region_len // self.num_blocks
             outer_dims = [
                 d for d in range(cache.ndim) if cache.stride(d) * el > page_size_bytes
             ]
@@ -1176,17 +1184,53 @@ class MooncakeStoreWorker:
                 for idx in range(cache.shape[outer_dims[0]]):
                     addrs.append(base_addr + idx * seg_stride)
                     block_lens.append(seg_stride // self.num_blocks)
+            return base_addr, addrs, block_lens
 
+        for layer_name, value in kv_caches.items():
+            cache = _repr_tensor(value)
+            segments_by_layer[layer_name] = _get_cache_segments(cache)
+
+        # Cross-layer KV cache is already packed into a single tensor. Keep the
+        # existing behavior for that layout by exposing the packed tensor to
+        # every group DB.
+        cross_layer_only = set(kv_caches) == {"__cross_layer__"}
+        num_segments_by_group: list[int] = []
+        for db, group in zip(self.token_dbs, self._kv_cache_groups, strict=True):
+            group_addrs: list[int] = []
+            group_block_lens: list[int] = []
+            group_seen_ptrs: set[int] = set()
+            layer_names = (
+                ["__cross_layer__"] if cross_layer_only else group.layer_names
+            )
+            for layer_name in layer_names:
+                segments = segments_by_layer.get(layer_name)
+                if segments is None:
+                    continue
+                base_addr, addrs, block_lens = segments
+                if base_addr in group_seen_ptrs:
+                    continue
+                group_seen_ptrs.add(base_addr)
+                group_addrs.extend(addrs)
+                group_block_lens.extend(block_lens)
+
+            db.set_kv_caches_base_addr(group_addrs)
+            db.set_block_len(group_block_lens)
+            num_segments_by_group.append(len(group_addrs))
+
+        num_unique_segments = sum(
+            {
+                base_addr: len(addrs)
+                for base_addr, addrs, _ in segments_by_layer.values()
+            }.values()
+        )
         logger.info(
-            "Registered KV caches: num_groups=%d, num_segments=%d, num_blocks=%d",
+            "Registered KV caches: num_groups=%d, num_unique_segments=%d, "
+            "num_segments_by_group=%s, num_blocks=%d",
             len(self.token_dbs),
-            len(addrs),
+            num_unique_segments,
+            num_segments_by_group,
             self.num_blocks,
         )
-
-        for db in self.token_dbs:
-            db.set_kv_caches_base_addr(addrs)
-            db.set_block_len(block_lens)
 
         # Start transfer threads
         if self.kv_role in ["kv_producer", "kv_both"]:
@@ -1358,18 +1402,25 @@ class MooncakeStoreWorker:
 
         return finished_sending
 
-    def lookup(self, token_len: int, block_hashes: list[BlockHash]) -> int:
+    def lookup(
+        self,
+        token_len: int,
+        block_hashes: list[BlockHash],
+        local_hit_len: int = 0,
+    ) -> int:
         """Check how many prefix tokens exist in the store.
 
         Checks across all TP ranks and PP ranks.
         """
         if not block_hashes or token_len <= 0:
             return 0
+        local_hit_len = min(max(local_hit_len, 0), token_len)
 
         # Build per-(group, hash) candidate keys expanded across TP/PP.
         # candidate_meta[i] is the (group_id, hash_bytes) for candidate_keys[i].
         candidate_keys: list[str] = []
         candidate_meta: list[tuple[int, bytes]] = []
+        local_exists_set: set[tuple[int, bytes]] = set()
         tp_count = min(self.tp_size, self.num_kv_head)
         for g_idx, db in enumerate(self.token_dbs):
             spec_block_size = db.block_size
@@ -1380,14 +1431,18 @@ class MooncakeStoreWorker:
                 start_idx = chunk_id * spec_block_size
                 if start_idx >= token_len:
                     break
+                gh = (g_idx, bytes(h))
+                if start_idx < local_hit_len:
+                    local_exists_set.add(gh)
+                    continue
                 for tp in range(tp_count):
                     for pp in range(self.pp_size):
                         md = dataclasses.replace(db.metadata, tp_rank=tp, pp_rank=pp)
                         candidate_keys.append(PoolKey(md, h.hex()).to_string())
-                        candidate_meta.append((g_idx, bytes(h)))
+                        candidate_meta.append(gh)
 
         if not candidate_keys:
-            return 0
+            return local_hit_len
 
         lookup_start = time.perf_counter()
         try:
@@ -1414,7 +1469,9 @@ class MooncakeStoreWorker:
         for gh, exists in zip(candidate_meta, res, strict=True):
             if exists == 1:
                 present_count[gh] = present_count.get(gh, 0) + 1
-        exists_set = {gh for gh, c in present_count.items() if c >= expected_per_key}
+        exists_set = local_exists_set | {
+            gh for gh, c in present_count.items() if c >= expected_per_key
+        }
 
         _masks, hit_length = self.coord.find_longest_cache_hit(
             block_hashes, token_len, ExternalCachedBlockPool(exists_set)
@@ -1470,10 +1527,13 @@ class LookupKeyServer:
 
                 if msg_type == LOOKUP_MSG:
                     token_len = int.from_bytes(all_frames[1], byteorder="big")
-                    hash_frames = all_frames[2:]
+                    local_hit_len = int.from_bytes(all_frames[2], byteorder="big")
+                    hash_frames = all_frames[3:]
                     hashes_str = self.decoder.decode(hash_frames)
                     block_hashes = [BlockHash(bytes.fromhex(s)) for s in hashes_str]
-                    result = self.store_worker.lookup(token_len, block_hashes)
+                    result = self.store_worker.lookup(
+                        token_len, block_hashes, local_hit_len
+                    )
                     self.socket.send(result.to_bytes(4, "big"))
 
                 elif msg_type == RESET_MSG:
@@ -1531,11 +1591,19 @@ class LookupKeyClient:
             bind=False,
         )
 
-    def lookup(self, token_len: int, block_hashes: list[BlockHash]) -> int:
+    def lookup(
+        self,
+        token_len: int,
+        block_hashes: list[BlockHash],
+        local_hit_len: int = 0,
+    ) -> int:
         hash_strs = [h.hex() for h in block_hashes]
         hash_frames = self.encoder.encode(hash_strs)
         token_len_bytes = token_len.to_bytes(4, byteorder="big")
-        all_frames = [LOOKUP_MSG, token_len_bytes] + list(hash_frames)
+        local_hit_len_bytes = local_hit_len.to_bytes(4, byteorder="big")
+        all_frames = [LOOKUP_MSG, token_len_bytes, local_hit_len_bytes] + list(
+            hash_frames
+        )
         self.socket.send_multipart(all_frames, copy=False)
         resp = self.socket.recv()
         result = int.from_bytes(resp, "big")

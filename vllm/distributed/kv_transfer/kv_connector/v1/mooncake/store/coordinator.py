@@ -62,6 +62,7 @@ class MooncakeStoreCoordinator:
         scheduler_block_size: int,
         hash_block_size: int,
         use_eagle: bool = False,
+        retention_interval: int | None = None,
     ) -> None:
         assert all(
             g.kv_cache_spec.block_size % hash_block_size == 0 for g in kv_cache_groups
@@ -78,6 +79,7 @@ class MooncakeStoreCoordinator:
         self.hash_block_size = hash_block_size
         self.lcm_block_size = scheduler_block_size
         self.use_eagle = use_eagle
+        self.retention_interval = retention_interval
         self._verify_and_split_kv_cache_groups()
 
     def _verify_and_split_kv_cache_groups(self) -> None:
@@ -163,7 +165,9 @@ class MooncakeStoreCoordinator:
         )
         return masks
 
-    def store_mask(self, aligned_token_len: int) -> tuple[list[bool], ...]:
+    def store_mask(
+        self, aligned_token_len: int, num_prompt_tokens: int | None = None
+    ) -> tuple[list[bool], ...]:
         """Per-group store masks: ``mask[g][i]`` is True iff chunk ``i`` of
         group ``g`` would be populated by some future cache hit at length
         ``L = N * lcm_block_size <= aligned_token_len``.
@@ -179,6 +183,24 @@ class MooncakeStoreCoordinator:
             aligned_token_len // g.kv_cache_spec.block_size
             for g in self.kv_cache_groups
         ]
+
+        if self.retention_interval is not None:
+            masks: list[list[bool] | None] = [None] * len(self.kv_cache_groups)
+            for idx, (spec, group_ids, manager_cls) in enumerate(self.attention_groups):
+                group_mask = manager_cls.reachable_block_mask(
+                    start_block=0,
+                    end_block=num_chunks_per_group[group_ids[0]],
+                    alignment_tokens=self.lcm_block_size,
+                    kv_cache_spec=spec,
+                    use_eagle=idx in self.eagle_attn_group_indices,
+                    retention_interval=self.retention_interval,
+                    num_prompt_tokens=num_prompt_tokens,
+                )
+                if group_mask is None:
+                    group_mask = [True] * num_chunks_per_group[group_ids[0]]
+                for gid in group_ids:
+                    masks[gid] = group_mask
+            return tuple(mask if mask is not None else [] for mask in masks)
 
         # Fast path: single group or full attn groups or uniform block_sizes
         if all(

@@ -15,7 +15,7 @@ from vllm.v1.kv_cache_interface import (
 )
 
 
-def _make_coord(groups, hash_block_size, use_eagle=False):
+def _make_coord(groups, hash_block_size, use_eagle=False, retention_interval=None):
     """Construct a coordinator using the natural LCM of group block sizes as
     the scheduler block size — mirrors ``resolve_kv_cache_block_sizes`` for
     the test fixtures."""
@@ -26,6 +26,7 @@ def _make_coord(groups, hash_block_size, use_eagle=False):
         scheduler_block_size=scheduler_block_size,
         hash_block_size=hash_block_size,
         use_eagle=use_eagle,
+        retention_interval=retention_interval,
     )
 
 
@@ -240,6 +241,47 @@ def test_store_mask_swa_wider_window_covers_more_blocks_per_lcm():
     # Boundary at 32: blocks ending in [16, 32) — chunks 2 and 3.
     # Boundary at 64: chunks 6 and 7. Others stay False.
     assert masks[1] == [False, False, True, True, False, False, True, True]
+
+
+def test_store_mask_retention_latest_only_matches_local_swa_boundary():
+    full = _full(32)
+    swa = _swa(block_size=8, sliding_window=8)
+    groups = [KVCacheGroupSpec(["L0"], full), KVCacheGroupSpec(["L1"], swa)]
+    coord = _make_coord(groups, hash_block_size=8, retention_interval=0)
+
+    masks = coord.store_mask(128, num_prompt_tokens=128)
+
+    assert masks[0] == [True] * 4
+    assert masks[1] == [False] * 11 + [True] + [False] * 4
+
+
+def test_store_mask_retention_interval_keeps_segment_and_replay_tails():
+    full = _full(32)
+    swa = _swa(block_size=8, sliding_window=8)
+    groups = [KVCacheGroupSpec(["L0"], full), KVCacheGroupSpec(["L1"], swa)]
+    coord = _make_coord(groups, hash_block_size=8, retention_interval=64)
+
+    masks = coord.store_mask(128, num_prompt_tokens=128)
+
+    assert masks[0] == [True] * 4
+    assert masks[1] == [
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        True,
+        False,
+        False,
+        False,
+        True,
+        False,
+        False,
+        False,
+        True,
+    ]
 
 
 def test_store_mask_dsv4_5_groups_full_mla_plus_4_swa():
