@@ -1161,8 +1161,16 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                         batch_keys, batch_addrs, batch_sizes
                     )
                 else:
-                    res = self.store.batch_get_into(
-                        batch_keys, get_plan.key_ptrs, get_plan.key_sizes
+                    # Use Mooncake's multi-buffer API even though the staging
+                    # destination is contiguous. With prefer_alloc_in_same_node
+                    # enabled, Mooncake groups memory reads by source segment
+                    # and submits one transfer-engine batch per segment instead
+                    # of one batch per key.
+                    res = self.store.batch_get_into_multi_buffers(
+                        batch_keys,
+                        [[ptr] for ptr in get_plan.key_ptrs],
+                        [[size] for size in get_plan.key_sizes],
+                        True,
                     )
                 if tiers_by_key is not None:
                     _log_mooncake_load_tier_summary(
