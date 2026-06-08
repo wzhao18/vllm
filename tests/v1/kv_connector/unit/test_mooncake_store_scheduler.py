@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections import Counter
 from types import SimpleNamespace
 
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
@@ -18,11 +19,15 @@ def _make_bare_scheduler() -> MooncakeStoreScheduler:
     scheduler.kv_role = "kv_both"
     scheduler.original_block_size = 16
     scheduler._block_size = 16
+    scheduler._hash_block_size = 16
     scheduler.load_specs = {}
     scheduler._preempted_req_ids = set()
     scheduler._unfinished_request_ids = {"req-0"}
     scheduler._unfinished_requests = {}
     scheduler._request_trackers = {}
+    scheduler._pending_load_hashes_by_req = {}
+    scheduler._active_load_hashes_by_req = {}
+    scheduler._active_load_hash_counts = Counter()
     return scheduler
 
 
@@ -405,8 +410,15 @@ def test_from_request_tracker_no_load_saves_normally():
 class _StubLookupClient:
     def __init__(self, hit_tokens: int) -> None:
         self._hit_tokens = hit_tokens
+        self.calls: list[tuple[int, list[bytes], int]] = []
 
-    def lookup(self, token_len: int, block_hashes: list[bytes]) -> int:
+    def lookup(
+        self,
+        token_len: int,
+        block_hashes: list[bytes],
+        local_hit_len: int = 0,
+    ) -> int:
+        self.calls.append((token_len, block_hashes, local_hit_len))
         return self._hit_tokens
 
 
@@ -439,6 +451,7 @@ def test_full_external_hit_keeps_kvpool_cached_tokens_block_aligned():
     assert load_spec.vllm_cached_tokens == 16
     assert load_spec.kvpool_cached_tokens == 32
     assert load_spec.kvpool_cached_tokens % 16 == 0
+    assert scheduler.client.calls == [(48, [b"h0", b"h1", b"h2"], 16)]
 
 
 def test_full_external_hit_with_full_local_hit_skips_load():
@@ -463,3 +476,81 @@ def test_full_external_hit_with_full_local_hit_skips_load():
     assert need_to_allocate == 0
     assert load_async is False
     assert "req-0" not in scheduler.load_specs
+
+
+def test_overlapping_external_load_is_deferred_until_active_load_released():
+    scheduler = _make_bare_scheduler()
+    scheduler.load_async = True
+    scheduler.client = _StubLookupClient(hit_tokens=48)
+
+    request_0 = SimpleNamespace(
+        request_id="req-0",
+        num_tokens=64,
+        block_hashes=[b"h0", b"h1", b"h2", b"h3"],
+    )
+
+    need_to_allocate, load_async = scheduler.get_num_new_matched_tokens(
+        request_0, num_computed_tokens=0
+    )
+
+    assert need_to_allocate == 48
+    assert load_async is True
+    scheduler.update_state_after_alloc(
+        request_0,
+        SimpleNamespace(get_block_ids=lambda: ([10, 11, 12],)),
+        num_external_tokens=48,
+    )
+    assert scheduler._active_load_hash_counts == Counter({b"h0": 1, b"h1": 1, b"h2": 1})
+
+    request_1 = SimpleNamespace(
+        request_id="req-1",
+        num_tokens=64,
+        block_hashes=[b"h0", b"h1", b"h2", b"h3"],
+    )
+
+    need_to_allocate, load_async = scheduler.get_num_new_matched_tokens(
+        request_1, num_computed_tokens=0
+    )
+
+    assert need_to_allocate is None
+    assert load_async is False
+    assert "req-1" not in scheduler.load_specs
+
+    # When req-0 is scheduled after recv completion, its loaded blocks have
+    # been promoted into the local prefix cache, so later requests can retry.
+    scheduler.update_state_after_alloc(
+        request_0,
+        SimpleNamespace(get_block_ids=lambda: ([10, 11, 12],)),
+        num_external_tokens=0,
+    )
+
+    need_to_allocate, load_async = scheduler.get_num_new_matched_tokens(
+        request_1, num_computed_tokens=0
+    )
+
+    assert need_to_allocate == 48
+    assert load_async is True
+    assert scheduler.load_specs["req-1"].kvpool_cached_tokens == 48
+
+
+def test_same_request_retry_clears_stale_active_load_marker():
+    scheduler = _make_bare_scheduler()
+    scheduler.load_async = True
+    scheduler.client = _StubLookupClient(hit_tokens=48)
+    scheduler._active_load_hashes_by_req["req-0"] = {b"h0", b"h1", b"h2"}
+    scheduler._active_load_hash_counts = Counter({b"h0": 1, b"h1": 1, b"h2": 1})
+
+    request = SimpleNamespace(
+        request_id="req-0",
+        num_tokens=64,
+        block_hashes=[b"h0", b"h1", b"h2", b"h3"],
+    )
+
+    need_to_allocate, load_async = scheduler.get_num_new_matched_tokens(
+        request, num_computed_tokens=0
+    )
+
+    assert need_to_allocate == 48
+    assert load_async is True
+    assert scheduler._active_load_hash_counts == Counter()
+    assert scheduler._pending_load_hashes_by_req["req-0"] == {b"h0", b"h1", b"h2"}

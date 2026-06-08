@@ -161,7 +161,7 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
         self,
         request: Request,
         num_computed_tokens: int,
-    ) -> tuple[int, bool]:
+    ) -> tuple[int | None, bool]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.get_num_new_matched_tokens(
             request, num_computed_tokens
@@ -212,7 +212,7 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
         if self.role == KVConnectorRole.SCHEDULER:
             assert self.connector_scheduler is not None
             # Clear local references to keys we're about to wipe.
-            self.connector_scheduler.load_specs.clear()
+            self.connector_scheduler.clear_load_state()
             self._kv_cache_events = None
             return self.connector_scheduler.reset_store()
         return None

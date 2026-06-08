@@ -411,6 +411,7 @@ def test_lookup_key_client_lookup_prepends_typed_tag():
     sent_frames = fake_socket.send_multipart.call_args[0][0]
     assert sent_frames[0] == protocol.LOOKUP_MSG
     assert int.from_bytes(sent_frames[1], "big") == 128
+    assert int.from_bytes(sent_frames[2], "big") == 0
 
 
 def test_lookup_key_client_reset_uses_typed_protocol():
@@ -520,8 +521,8 @@ def test_reset_cache_scheduler_role_clears_local_state():
     assert conn.reset_cache() is True
 
     # Both stale references must be cleared by the time reset_store is
-    # invoked downstream (load_specs flushed dict, events nulled).
-    assert sched_inst.load_specs == {}
+    # invoked downstream (scheduler load state cleared, events nulled).
+    sched_inst.clear_load_state.assert_called_once_with()
     assert conn._kv_cache_events is None
 
 

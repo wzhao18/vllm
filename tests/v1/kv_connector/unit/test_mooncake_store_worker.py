@@ -1201,6 +1201,17 @@ def test_lookup_partial_prefix_returns_first_hit_length():
     assert worker.lookup(48, [b"a0", b"a1", b"a2"]) == 32
 
 
+def test_lookup_only_queries_suffix_after_local_hit():
+    worker = _make_bare_worker()
+    worker.store.batch_is_exist.return_value = [1]
+
+    assert worker.lookup(48, [b"a0", b"a1", b"a2"], local_hit_len=32) == 48
+
+    candidate_keys = worker.store.batch_is_exist.call_args[0][0]
+    assert len(candidate_keys) == 1
+    assert b"a2".hex() in candidate_keys[0]
+
+
 def test_lookup_swa_single_group_returns_full_when_tail_window_present():
     """Single-SWA, sliding_window=32 (= 2 blocks): producer stored only the
     tail. Coordinator-driven lookup returns full prefix even though the
@@ -1269,6 +1280,95 @@ def test_register_kv_caches_kv_first_two_segments():
     base = tensor.untyped_storage().data_ptr()
     assert db.kv_caches_base_addr == [base, base + seg_stride]
     assert db.block_len == [seg_stride // num_blocks] * 2
+
+
+def test_register_kv_caches_uses_group_specific_segments():
+    """Each group DB should expose only the tensors for that group's layers."""
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
+
+    num_blocks = 10
+    page_size_elements = 64
+    worker = _make_bare_worker(num_gpu_blocks=num_blocks)
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=8, head_size=64, dtype=None
+    )
+    groups = [
+        KVCacheGroupSpec(["layer0"], spec),
+        KVCacheGroupSpec(["layer1"], spec),
+    ]
+    worker._kv_cache_groups = groups
+    worker.token_dbs = [
+        ChunkedTokenDatabase(
+            KeyMetadata("test-model", 0, 0, 0, 0, group_id=0),
+            block_size=16,
+        ),
+        ChunkedTokenDatabase(
+            KeyMetadata("test-model", 0, 0, 0, 0, group_id=1),
+            block_size=16,
+        ),
+    ]
+    worker.coord = mooncake_store_worker.MooncakeStoreCoordinator(
+        groups,
+        scheduler_block_size=16,
+        hash_block_size=16,
+    )
+
+    tensor0 = torch.zeros(num_blocks, page_size_elements, dtype=torch.float16)
+    tensor1 = torch.zeros(num_blocks, page_size_elements * 2, dtype=torch.float16)
+
+    _register_with_mocked_threads(
+        worker,
+        {
+            "layer0": tensor0,
+            "layer1": tensor1,
+        },
+    )
+
+    db0, db1 = worker.token_dbs
+    assert db0.kv_caches_base_addr == [tensor0.untyped_storage().data_ptr()]
+    assert db0.block_len == [tensor0.untyped_storage().nbytes() // num_blocks]
+    assert db1.kv_caches_base_addr == [tensor1.untyped_storage().data_ptr()]
+    assert db1.block_len == [tensor1.untyped_storage().nbytes() // num_blocks]
+
+
+def test_register_cross_layer_kv_cache_applies_to_all_groups():
+    """Packed cross-layer tensors are already group-complete payloads."""
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
+
+    num_blocks = 10
+    worker = _make_bare_worker(num_gpu_blocks=num_blocks)
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=8, head_size=64, dtype=None
+    )
+    groups = [
+        KVCacheGroupSpec(["layer0"], spec),
+        KVCacheGroupSpec(["layer1"], spec),
+    ]
+    worker._kv_cache_groups = groups
+    worker.token_dbs = [
+        ChunkedTokenDatabase(
+            KeyMetadata("test-model", 0, 0, 0, 0, group_id=0),
+            block_size=16,
+        ),
+        ChunkedTokenDatabase(
+            KeyMetadata("test-model", 0, 0, 0, 0, group_id=1),
+            block_size=16,
+        ),
+    ]
+    worker.coord = mooncake_store_worker.MooncakeStoreCoordinator(
+        groups,
+        scheduler_block_size=16,
+        hash_block_size=16,
+    )
+
+    tensor = torch.zeros(num_blocks, 128, dtype=torch.float16)
+    _register_with_mocked_threads(worker, {"__cross_layer__": tensor})
+
+    expected_addr = tensor.untyped_storage().data_ptr()
+    expected_block_len = tensor.untyped_storage().nbytes() // num_blocks
+    for db in worker.token_dbs:
+        assert db.kv_caches_base_addr == [expected_addr]
+        assert db.block_len == [expected_block_len]
 
 
 def test_register_kv_caches_cross_layer_single_segment():

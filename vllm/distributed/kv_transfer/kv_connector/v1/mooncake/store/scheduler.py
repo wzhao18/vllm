@@ -5,6 +5,8 @@
 # (vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/).
 """Scheduler-side logic for MooncakeStoreConnector."""
 
+from collections import Counter
+from collections.abc import Sequence
 from typing import Any
 
 from vllm.config import VllmConfig
@@ -74,19 +76,79 @@ class MooncakeStoreScheduler:
         self._preempted_req_ids: set[str] = set()  # preempted requests
         self._unfinished_requests: dict[str, tuple[Request, tuple[list[int], ...]]] = {}
         self._unfinished_request_ids: set[str] = set()
+        # Hashes returned by lookup, but not yet assigned to allocated GPU
+        # blocks. These are promoted to _active_load_hashes_by_req after
+        # update_state_after_alloc confirms the allocation.
+        self._pending_load_hashes_by_req: dict[str, set[bytes]] = {}
+        # Hashes currently being loaded into GPU blocks. They are deliberately
+        # kept marked until the request is scheduled after recv completion,
+        # because only then are the blocks promoted into the local prefix cache.
+        self._active_load_hashes_by_req: dict[str, set[bytes]] = {}
+        self._active_load_hash_counts: Counter[bytes] = Counter()
+
+    def _load_hashes(
+        self,
+        block_hashes: Sequence[bytes],
+        start_tokens: int,
+        end_tokens: int,
+    ) -> set[bytes]:
+        """Return hash-block keys for the token range being externally loaded."""
+        if end_tokens <= start_tokens:
+            return set()
+        start_idx = start_tokens // self._hash_block_size
+        end_idx = end_tokens // self._hash_block_size
+        return {bytes(h) for h in block_hashes[start_idx:end_idx]}
+
+    def _activate_load_hashes(self, req_id: str) -> None:
+        load_hashes = self._pending_load_hashes_by_req.pop(req_id, None)
+        if not load_hashes:
+            return
+        self._active_load_hashes_by_req[req_id] = load_hashes
+        self._active_load_hash_counts.update(load_hashes)
+
+    def _release_load_hashes(self, req_id: str) -> None:
+        self._pending_load_hashes_by_req.pop(req_id, None)
+        load_hashes = self._active_load_hashes_by_req.pop(req_id, None)
+        if not load_hashes:
+            return
+        for load_hash in load_hashes:
+            count = self._active_load_hash_counts[load_hash] - 1
+            if count > 0:
+                self._active_load_hash_counts[load_hash] = count
+            else:
+                self._active_load_hash_counts.pop(load_hash, None)
+
+    def clear_load_state(self) -> None:
+        self.load_specs.clear()
+        self._pending_load_hashes_by_req.clear()
+        self._active_load_hashes_by_req.clear()
+        self._active_load_hash_counts.clear()
 
     def get_num_new_matched_tokens(
         self,
         request: Request,
         num_computed_tokens: int,
-    ) -> tuple[int, bool]:
+    ) -> tuple[int | None, bool]:
         """Check for external KV cache hit."""
+        self.load_specs.pop(request.request_id, None)
+        self._release_load_hashes(request.request_id)
+
         # Look up against the full prefill range, not just the prompt.
         token_len = request.num_tokens // self._block_size * self._block_size
         if token_len < self._block_size:
             return 0, False
 
-        num_external_hit_tokens = self.client.lookup(token_len, request.block_hashes)
+        local_hit_len = min(
+            token_len,
+            num_computed_tokens // self._block_size * self._block_size,
+        )
+        miss_tokens = token_len - local_hit_len
+        if miss_tokens <= 0:
+            return 0, False
+
+        num_external_hit_tokens = self.client.lookup(
+            token_len, request.block_hashes, local_hit_len
+        )
 
         if num_external_hit_tokens == request.num_tokens:
             # Leave a sub-block tail uncomputed for sampling, on a block
@@ -112,6 +174,24 @@ class MooncakeStoreScheduler:
         if need_to_allocate <= 0:
             return 0, False
 
+        if self.load_async:
+            load_hashes = self._load_hashes(
+                request.block_hashes, local_hit_len, num_external_hit_tokens
+            )
+            overlap_count = sum(
+                1 for h in load_hashes if h in self._active_load_hash_counts
+            )
+            if overlap_count:
+                logger.debug(
+                    "Reqid: %s, deferring external KV load because %d/%d "
+                    "hash blocks are already being loaded",
+                    request.request_id,
+                    overlap_count,
+                    len(load_hashes),
+                )
+                return None, False
+            self._pending_load_hashes_by_req[request.request_id] = load_hashes
+
         self.load_specs[request.request_id] = LoadSpec(
             vllm_cached_tokens=num_computed_tokens,
             kvpool_cached_tokens=num_external_hit_tokens,
@@ -127,6 +207,9 @@ class MooncakeStoreScheduler:
         num_external_tokens: int,
     ):
         """Update state after block allocation."""
+        if num_external_tokens == 0:
+            self._release_load_hashes(request.request_id)
+
         local_block_ids: tuple[list[int], ...] = ()
         if num_external_tokens > 0:
             local_block_ids = blocks.get_block_ids()
@@ -154,6 +237,8 @@ class MooncakeStoreScheduler:
         )
 
         self.load_specs[request.request_id].can_load = True
+        if self.load_async:
+            self._activate_load_hashes(request.request_id)
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
@@ -162,6 +247,7 @@ class MooncakeStoreScheduler:
         force_skip_save = self.kv_role == "kv_consumer"
 
         for finished_req_id in scheduler_output.finished_req_ids:
+            self._release_load_hashes(finished_req_id)
             self.load_specs.pop(finished_req_id, None)
             self._request_trackers.pop(finished_req_id, None)
             self._unfinished_requests.pop(finished_req_id, None)
@@ -171,6 +257,7 @@ class MooncakeStoreScheduler:
         preempted_ids = scheduler_output.preempted_req_ids or set()
         self._preempted_req_ids.update(preempted_ids)
         for req_id in preempted_ids:
+            self._release_load_hashes(req_id)
             self.load_specs.pop(req_id, None)
             if request_tracker := self._request_trackers.get(req_id):
                 request_tracker.reset()

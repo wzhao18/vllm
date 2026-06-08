@@ -214,6 +214,7 @@ class ReqMeta:
 
     token_ids: list[int] | None = None
     original_block_size: int | None = None
+    num_prompt_tokens: int | None = None
 
     @staticmethod
     def from_request_tracker(
@@ -275,6 +276,7 @@ class ReqMeta:
             is_last_chunk=is_last_chunk,
             token_ids=token_ids,
             original_block_size=original_block_size,
+            num_prompt_tokens=tracker.prefill_end_tokens,
         )
 
 
