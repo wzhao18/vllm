@@ -83,6 +83,7 @@ def _rotate_list(values: list[_T], offset: int) -> list[_T]:
 
 # Mirrors FileStorageConfig::local_buffer_size in Mooncake C++.
 DEFAULT_MOONCAKE_DISK_STAGING_BUFFER_BYTES = 1280 * 1024 * 1024
+_MOONCAKE_STAGING_GROW_BYTES = 64 * 1024 * 1024
 
 # Mirrors DirectIO alignment in Mooncake's AllocateBatch.
 _DIRECT_IO_ALIGNMENT = 4096
@@ -196,6 +197,213 @@ def _estimate_disk_offload_staging_bytes(size_list: list[int]) -> int:
 
 def _sum_batch_bytes(sizes: list[list[int]]) -> int:
     return sum(sum(size) for size in sizes)
+
+
+@dataclass
+class _ContiguousBatchPlan:
+    key_ptrs: list[int]
+    key_sizes: list[int]
+    copy_src_ptrs: torch.Tensor | None
+    copy_dst_ptrs: torch.Tensor | None
+    copy_sizes: torch.Tensor | None
+    num_copy_ops: int
+
+
+class _MooncakeStagingBuffer:
+    """Registered staging arena for Mooncake contiguous put/get APIs."""
+
+    def __init__(self, store: Any, device: int | None):
+        self.store = store
+        self.device = device
+        self.tensor: torch.Tensor | None = None
+        self.capacity_bytes = 0
+        self.base_ptr = 0
+        self.device_type = ""
+        self.stream: torch.cuda.Stream | None = None
+
+    def _ensure_stream(self) -> torch.cuda.Stream:
+        if self.stream is None:
+            if self.device is None:
+                self.stream = torch.cuda.Stream()
+            else:
+                with torch.cuda.device(self.device):
+                    self.stream = torch.cuda.Stream()
+        return self.stream
+
+    def _resize(self, required_bytes: int) -> bool:
+        if required_bytes <= self.capacity_bytes:
+            return True
+        if self.tensor is not None:
+            try:
+                ret = self.store.unregister_buffer(self.base_ptr)
+                if ret != 0:
+                    logger.warning(
+                        "unregister_buffer failed for Mooncake staging "
+                        "buffer addr %#x len %d: %d",
+                        self.base_ptr,
+                        self.capacity_bytes,
+                        ret,
+                    )
+                    return False
+            except Exception as e:
+                logger.warning(
+                    "Failed to unregister Mooncake staging buffer addr %#x: %s",
+                    self.base_ptr,
+                    e,
+                )
+                return False
+            self.tensor = None
+            self.capacity_bytes = 0
+            self.base_ptr = 0
+            self.device_type = ""
+
+        capacity = _align_up(required_bytes, _MOONCAKE_STAGING_GROW_BYTES)
+        try:
+            if self.device is None:
+                tensor = torch.empty(capacity, dtype=torch.uint8, device="cuda")
+            else:
+                with torch.cuda.device(self.device):
+                    tensor = torch.empty(capacity, dtype=torch.uint8, device="cuda")
+            device_type = "cuda"
+        except RuntimeError as cuda_error:
+            try:
+                tensor = torch.empty(
+                    capacity,
+                    dtype=torch.uint8,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                device_type = "cpu_pinned"
+            except RuntimeError as pinned_error:
+                try:
+                    tensor = torch.empty(capacity, dtype=torch.uint8, device="cpu")
+                    device_type = "cpu"
+                except RuntimeError as cpu_error:
+                    logger.warning(
+                        "Failed to allocate Mooncake staging buffer of %d "
+                        "bytes (cuda=%s, pinned_cpu=%s, cpu=%s)",
+                        capacity,
+                        cuda_error,
+                        pinned_error,
+                        cpu_error,
+                    )
+                    return False
+
+        base_ptr = tensor.data_ptr()
+        ret = self.store.register_buffer(base_ptr, capacity)
+        if ret != 0:
+            logger.warning(
+                "register_buffer failed for Mooncake staging buffer "
+                "addr %#x len %d: %d",
+                base_ptr,
+                capacity,
+                ret,
+            )
+            return False
+
+        self.tensor = tensor
+        self.capacity_bytes = capacity
+        self.base_ptr = base_ptr
+        self.device_type = device_type
+        logger.info(
+            "Registered Mooncake %s staging buffer: addr=%#x len=%d",
+            device_type,
+            base_ptr,
+            capacity,
+        )
+        return True
+
+    def build_plan(
+        self,
+        addrs: list[list[int]],
+        sizes: list[list[int]],
+        *,
+        pack_to_staging: bool,
+    ) -> _ContiguousBatchPlan | None:
+        if len(addrs) != len(sizes):
+            raise ValueError(
+                f"Staging batch shape mismatch: addrs={len(addrs)}, "
+                f"sizes={len(sizes)}"
+            )
+        if not addrs:
+            return _ContiguousBatchPlan([], [], None, None, None, 0)
+        if all(
+            len(addr) == 1 and len(size) == 1
+            for addr, size in zip(addrs, sizes, strict=True)
+        ):
+            return _ContiguousBatchPlan(
+                [addr[0] for addr in addrs],
+                [size[0] for size in sizes],
+                None,
+                None,
+                None,
+                0,
+            )
+
+        key_sizes = [sum(size) for size in sizes]
+        required_bytes = sum(key_sizes)
+        if required_bytes == 0 or not self._resize(required_bytes):
+            return None
+
+        key_ptrs: list[int] = []
+        copy_src_ptrs: list[int] = []
+        copy_dst_ptrs: list[int] = []
+        copy_sizes: list[int] = []
+        offset = 0
+        for key_addrs, key_sizes_for_addrs, total_size in zip(
+            addrs, sizes, key_sizes, strict=True
+        ):
+            if len(key_addrs) != len(key_sizes_for_addrs):
+                raise ValueError(
+                    "Staging key shape mismatch: "
+                    f"addrs={len(key_addrs)}, sizes={len(key_sizes_for_addrs)}"
+                )
+            staging_key_ptr = self.base_ptr + offset
+            key_ptrs.append(staging_key_ptr)
+            inner_offset = 0
+            for addr, size in zip(key_addrs, key_sizes_for_addrs, strict=True):
+                staging_ptr = staging_key_ptr + inner_offset
+                if pack_to_staging:
+                    copy_src_ptrs.append(addr)
+                    copy_dst_ptrs.append(staging_ptr)
+                else:
+                    copy_src_ptrs.append(staging_ptr)
+                    copy_dst_ptrs.append(addr)
+                copy_sizes.append(size)
+                inner_offset += size
+            offset += total_size
+
+        return _ContiguousBatchPlan(
+            key_ptrs,
+            key_sizes,
+            torch.tensor(copy_src_ptrs, dtype=torch.int64),
+            torch.tensor(copy_dst_ptrs, dtype=torch.int64),
+            torch.tensor(copy_sizes, dtype=torch.int64),
+            len(copy_sizes),
+        )
+
+    def run_copy(
+        self,
+        plan: _ContiguousBatchPlan,
+        *,
+        is_src_access_order_any: bool,
+    ) -> None:
+        if plan.num_copy_ops == 0:
+            return
+        assert plan.copy_src_ptrs is not None
+        assert plan.copy_dst_ptrs is not None
+        assert plan.copy_sizes is not None
+        from vllm import _custom_ops as ops
+
+        stream = self._ensure_stream()
+        with torch.cuda.stream(stream):
+            ops.swap_blocks_batch(
+                plan.copy_src_ptrs,
+                plan.copy_dst_ptrs,
+                plan.copy_sizes,
+                is_src_access_order_any=is_src_access_order_any,
+            )
+        stream.synchronize()
 
 
 def _get_usable_disk_offload_buffer_budget_bytes(raw_budget_bytes: int) -> int:
@@ -366,6 +574,9 @@ class KVTransferThread(threading.Thread):
         self.tp_rank = tp_rank
         self.token_databases = token_databases
         self._record_operation_cb = record_operation
+        self.cuda_device = (
+            torch.cuda.current_device() if torch.cuda.is_available() else None
+        )
         self.done_task_lock = threading.Lock()
         self.request_queue: queue.Queue[Any] = queue.Queue()
         self.finished_requests: set[str] = set()
@@ -467,6 +678,14 @@ class KVCacheStoreSendingThread(KVTransferThread):
         # Caller always passes a non-None ReplicateConfig — see
         # MooncakeStoreWorker.__init__ where store_replicate_config is built.
         self.replicate_config = replicate_config
+        prefer_alloc_in_same_node = bool(
+            getattr(replicate_config, "prefer_alloc_in_same_node", False)
+        )
+        self._staging_buffer = (
+            _MooncakeStagingBuffer(store, self.cuda_device)
+            if hasattr(store, "batch_put_from") and not prefer_alloc_in_same_node
+            else None
+        )
 
         # Pause store requests when CPU/disk offloading is under pressure.
         self._store_pressure_active = False
@@ -639,14 +858,58 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 current_event.synchronize()
 
             batch_bytes = _sum_batch_bytes(sizes)
+            put_plan: _ContiguousBatchPlan | None = None
+            if self._staging_buffer is not None:
+                pack_start = time.perf_counter()
+                try:
+                    put_plan = self._staging_buffer.build_plan(
+                        addrs, sizes, pack_to_staging=True
+                    )
+                    if put_plan is not None and put_plan.num_copy_ops > 0:
+                        self._staging_buffer.run_copy(
+                            put_plan,
+                            is_src_access_order_any=False,
+                        )
+                        self._record_operation(
+                            "save_pack",
+                            pack_start,
+                            len(keys),
+                            num_bytes=batch_bytes,
+                        )
+                except Exception as e:
+                    self._record_operation(
+                        "save_pack",
+                        pack_start,
+                        len(keys),
+                        num_bytes=batch_bytes,
+                        status="error",
+                        num_failed_keys=len(keys),
+                    )
+                    logger.warning(
+                        "Failed to pack Mooncake store batch; falling back to "
+                        "multi-buffer put (num_keys=%d, batch_bytes=%d): %s",
+                        len(keys),
+                        batch_bytes,
+                        e,
+                    )
+                    put_plan = None
+
             put_start = time.perf_counter()
             try:
-                res = self.store.batch_put_from_multi_buffers(
-                    keys,
-                    addrs,
-                    sizes,
-                    self.replicate_config,
-                )
+                if put_plan is None:
+                    res = self.store.batch_put_from_multi_buffers(
+                        keys,
+                        addrs,
+                        sizes,
+                        self.replicate_config,
+                    )
+                else:
+                    res = self.store.batch_put_from(
+                        keys,
+                        put_plan.key_ptrs,
+                        put_plan.key_sizes,
+                        self.replicate_config,
+                    )
                 failed = [i for i, v in enumerate(res) if v < 0]
                 self._record_operation(
                     "save_put",
@@ -736,6 +999,11 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             else _get_usable_disk_offload_buffer_budget_bytes(
                 disk_offload_buffer_budget_bytes
             )
+        )
+        self._staging_buffer = (
+            _MooncakeStagingBuffer(store, self.cuda_device)
+            if hasattr(store, "batch_get_into")
+            else None
         )
         self.coord = coord
 
@@ -848,14 +1116,54 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 current_batch_keys = batch_keys
                 current_batch_block_ids = batch_block_ids
                 batch_bytes = _sum_batch_bytes(batch_sizes)
+                get_plan: _ContiguousBatchPlan | None = None
+                if self._staging_buffer is not None:
+                    load_prepare_start = time.perf_counter()
+                    try:
+                        get_plan = self._staging_buffer.build_plan(
+                            batch_addrs,
+                            batch_sizes,
+                            pack_to_staging=False,
+                        )
+                        if get_plan is not None and get_plan.num_copy_ops > 0:
+                            self._record_operation(
+                                "load_prepare",
+                                load_prepare_start,
+                                len(batch_keys),
+                                num_bytes=batch_bytes,
+                            )
+                    except Exception as e:
+                        self._record_operation(
+                            "load_prepare",
+                            load_prepare_start,
+                            len(batch_keys),
+                            num_bytes=batch_bytes,
+                            status="error",
+                            num_failed_keys=len(batch_keys),
+                        )
+                        logger.warning(
+                            "Failed to prepare Mooncake load staging; falling "
+                            "back to multi-buffer get (num_keys=%d, "
+                            "batch_bytes=%d): %s",
+                            len(batch_keys),
+                            batch_bytes,
+                            e,
+                        )
+                        get_plan = None
+
                 tiers_by_key: dict[str, str] | None = None
                 if envs.VLLM_MOONCAKE_STORE_TIER_LOG:
                     tiers_by_key = _get_replica_tiers_by_key(self.store, batch_keys)
                 # Reset so the recorded RPC duration excludes tier lookup.
                 load_get_start = time.perf_counter()
-                res = self.store.batch_get_into_multi_buffers(
-                    batch_keys, batch_addrs, batch_sizes
-                )
+                if get_plan is None:
+                    res = self.store.batch_get_into_multi_buffers(
+                        batch_keys, batch_addrs, batch_sizes
+                    )
+                else:
+                    res = self.store.batch_get_into(
+                        batch_keys, get_plan.key_ptrs, get_plan.key_sizes
+                    )
                 if tiers_by_key is not None:
                     _log_mooncake_load_tier_summary(
                         req_id, batch_keys, res, tiers_by_key
@@ -875,10 +1183,48 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     status="partial_failure" if failed else "ok",
                     num_failed_keys=len(failed),
                 )
+                if (
+                    get_plan is not None
+                    and get_plan.num_copy_ops > 0
+                    and not failed
+                ):
+                    scatter_start = time.perf_counter()
+                    try:
+                        self._staging_buffer.run_copy(
+                            get_plan,
+                            is_src_access_order_any=True,
+                        )
+                        self._record_operation(
+                            "load_scatter",
+                            scatter_start,
+                            len(batch_keys),
+                            num_bytes=batch_bytes,
+                        )
+                    except Exception as e:
+                        self._add_load_error_block_ids(batch_block_ids)
+                        self._record_operation(
+                            "load_scatter",
+                            scatter_start,
+                            len(batch_keys),
+                            num_bytes=batch_bytes,
+                            status="error",
+                            num_failed_keys=len(batch_keys),
+                        )
+                        logger.warning(
+                            "Failed to scatter Mooncake load batch "
+                            "(batch_keys=%d, batch_bytes=%d): %s",
+                            len(batch_keys),
+                            batch_bytes,
+                            e,
+                        )
+                        break
                 if failed:
-                    self._add_load_error_block_ids(
-                        [block_id for _, _, block_id in failed]
-                    )
+                    if get_plan is not None and get_plan.num_copy_ops > 0:
+                        self._add_load_error_block_ids(batch_block_ids)
+                    else:
+                        self._add_load_error_block_ids(
+                            [block_id for _, _, block_id in failed]
+                        )
                     logger.warning(
                         "Failed to get %d Mooncake keys from sub-batch "
                         "(batch_keys=%d, first_failures=%s)",
