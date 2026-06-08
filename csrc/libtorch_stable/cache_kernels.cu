@@ -127,7 +127,8 @@ void swap_blocks_batch(const torch::stable::Tensor& src_ptrs,
     return reinterpret_cast<BatchFn>(fn_ptr);
   }();
 
-  if (batch_fn != nullptr) {
+  // if (batch_fn != nullptr) {
+  if (false) {
     CUmemcpyAttributes attr = {};
     // ANY lets the DMA engine prefetch source bytes out of stream order,
     // which is only safe when no GPU stream is concurrently writing the
