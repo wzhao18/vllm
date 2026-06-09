@@ -287,11 +287,19 @@ class MooncakeStoreScheduler:
                 unfolded_block_ids = (request.block_ids.copy(),)
 
             prefill_tokens = _new_req_prefill_tokens(request)
+            initial_saved_tokens = 0
+            if not force_skip_save and not (
+                load_spec is not None and load_spec.can_load
+            ):
+                initial_saved_tokens = min(
+                    request.num_computed_tokens // self._block_size * self._block_size,
+                    num_tokens_to_compute,
+                )
             request_tracker = RequestTracker(
                 req_id=request.req_id,
                 token_len=num_tokens_to_compute,
                 allocated_block_ids=unfolded_block_ids,
-                num_saved_tokens=0,
+                num_saved_tokens=initial_saved_tokens,
                 token_ids=prefill_tokens[:num_tokens_to_compute],
                 prefill_end_tokens=len(prefill_tokens),
             )

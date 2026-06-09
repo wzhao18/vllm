@@ -51,6 +51,7 @@ def _make_store_sending_thread(
     token_databases: list[ChunkedTokenDatabase] | None = None,
     block_size: int = 16,
     replicate_config: object | None = None,
+    save_batch_max_requests: int = 1,
 ) -> mooncake_store_worker.KVCacheStoreSendingThread:
     if coord is None:
         coord = _default_send_coord()
@@ -59,6 +60,8 @@ def _make_store_sending_thread(
         db.set_kv_caches_base_addr([0x1000])
         db.set_block_len([256])
         token_databases = [db]
+    if hasattr(store, "batch_put_from"):
+        del store.batch_put_from
     thread = mooncake_store_worker.KVCacheStoreSendingThread(
         store=store,
         token_databases=token_databases,
@@ -69,6 +72,7 @@ def _make_store_sending_thread(
         kv_role="kv_producer",
         ready_event=threading.Event(),
         replicate_config=replicate_config,
+        save_batch_max_requests=save_batch_max_requests,
     )
     thread.request_queue.task_done = MagicMock()
     return thread
@@ -127,14 +131,21 @@ def _make_load_req(
     )
 
 
-def _make_store_req(req_id: str, block_hashes: list[bytes]) -> ReqMeta:
+def _make_store_req(
+    req_id: str,
+    block_hashes: list[bytes],
+    *,
+    token_len: int = 32,
+    save_start_tokens: int = 0,
+) -> ReqMeta:
     return ReqMeta(
         req_id=req_id,
-        token_len_chunk=32,
-        block_ids=([0, 1],),
+        token_len_chunk=token_len,
+        block_ids=(list(range(len(block_hashes))),),
         block_hashes=block_hashes,
         can_save=True,
         original_block_size=16,
+        save_start_tokens=save_start_tokens,
     )
 
 
@@ -437,6 +448,61 @@ def test_store_sending_thread_records_mooncake_metrics():
     assert len(stats.data["save_put"]) == 1
     assert stats.data["save_put"][0]["num_bytes"] == 512
     assert stats.data["save_put"][0]["status"] == "ok"
+
+
+def test_store_sending_thread_batches_multiple_requests():
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.side_effect = lambda keys, *_: [256] * len(keys)
+    thread = _make_store_sending_thread(store, save_batch_max_requests=2)
+
+    thread.add_stored_request("req-a")
+    thread.add_stored_request("req-b")
+    thread._handle_requests(
+        [
+            _make_store_req("req-a", [b"a0"]),
+            _make_store_req("req-b", [b"b0"]),
+        ]
+    )
+
+    assert store.batch_is_exist.call_count == 1
+    assert len(store.batch_is_exist.call_args.args[0]) == 2
+    put_call = (
+        store.batch_put_from.call_args
+        if hasattr(store, "batch_put_from") and store.batch_put_from.call_count
+        else store.batch_put_from_multi_buffers.call_args
+    )
+    assert len(put_call.args[0]) == 2
+    assert thread.stored_requests["req-a"] == 0
+    assert thread.stored_requests["req-b"] == 0
+    assert thread.request_queue.task_done.call_count == 2
+
+
+def test_store_sending_thread_skips_already_saved_prefix():
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.side_effect = lambda keys, *_: [256] * len(keys)
+    thread = _make_store_sending_thread(store)
+
+    thread.add_stored_request("req-a")
+    thread._handle_request(
+        _make_store_req(
+            "req-a",
+            [b"a0", b"a1", b"a2"],
+            token_len=48,
+            save_start_tokens=32,
+        )
+    )
+
+    checked_keys = store.batch_is_exist.call_args.args[0]
+    assert len(checked_keys) == 1
+    assert checked_keys[0].endswith("@6132")
+    put_call = (
+        store.batch_put_from.call_args
+        if hasattr(store, "batch_put_from") and store.batch_put_from.call_count
+        else store.batch_put_from_multi_buffers.call_args
+    )
+    assert put_call.args[0] == checked_keys
 
 
 def test_store_sending_thread_only_skips_on_no_available_handle():
@@ -1289,9 +1355,7 @@ def test_register_kv_caches_uses_group_specific_segments():
     num_blocks = 10
     page_size_elements = 64
     worker = _make_bare_worker(num_gpu_blocks=num_blocks)
-    spec = FullAttentionSpec(
-        block_size=16, num_kv_heads=8, head_size=64, dtype=None
-    )
+    spec = FullAttentionSpec(block_size=16, num_kv_heads=8, head_size=64, dtype=None)
     groups = [
         KVCacheGroupSpec(["layer0"], spec),
         KVCacheGroupSpec(["layer1"], spec),
@@ -1337,9 +1401,7 @@ def test_register_cross_layer_kv_cache_applies_to_all_groups():
 
     num_blocks = 10
     worker = _make_bare_worker(num_gpu_blocks=num_blocks)
-    spec = FullAttentionSpec(
-        block_size=16, num_kv_heads=8, head_size=64, dtype=None
-    )
+    spec = FullAttentionSpec(block_size=16, num_kv_heads=8, head_size=64, dtype=None)
     groups = [
         KVCacheGroupSpec(["layer0"], spec),
         KVCacheGroupSpec(["layer1"], spec),

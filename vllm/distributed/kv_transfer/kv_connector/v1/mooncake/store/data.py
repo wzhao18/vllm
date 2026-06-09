@@ -215,6 +215,7 @@ class ReqMeta:
     token_ids: list[int] | None = None
     original_block_size: int | None = None
     num_prompt_tokens: int | None = None
+    save_start_tokens: int = 0
 
     @staticmethod
     def from_request_tracker(
@@ -233,6 +234,7 @@ class ReqMeta:
 
         chunk_boundary = cdiv(tracker.num_saved_tokens + 1, block_size) * block_size
         num_tokens_to_save = input_token_len // block_size * block_size
+        save_start_tokens = tracker.num_saved_tokens // block_size * block_size
 
         skip_save = skip_save or num_tokens_to_save < chunk_boundary
         # A ReqMeta must never carry both a save AND a load.
@@ -277,6 +279,7 @@ class ReqMeta:
             token_ids=token_ids,
             original_block_size=original_block_size,
             num_prompt_tokens=tracker.prefill_end_tokens,
+            save_start_tokens=save_start_tokens if not skip_save else 0,
         )
 
 
