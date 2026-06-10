@@ -1257,6 +1257,94 @@ def test_register_kv_caches_kv_first_two_segments():
     assert db.block_len == [seg_stride // num_blocks] * 2
 
 
+def test_register_kv_caches_uses_group_specific_segments():
+    """Each group DB should expose only tensors for that group's layers."""
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
+
+    num_blocks = 10
+    block_size = 16
+    page_size_elements = 64
+    worker = _make_bare_worker(num_gpu_blocks=num_blocks, block_size=block_size)
+    spec = FullAttentionSpec(
+        block_size=block_size, num_kv_heads=8, head_size=64, dtype=None
+    )
+    groups = [
+        KVCacheGroupSpec(["layer0"], spec),
+        KVCacheGroupSpec(["layer1"], spec),
+    ]
+    worker._kv_cache_groups = groups
+    worker.token_dbs = [
+        ChunkedTokenDatabase(
+            KeyMetadata("test-model", 0, 0, 0, 0, group_id=0),
+            block_size=block_size,
+            hash_block_size=block_size,
+        ),
+        ChunkedTokenDatabase(
+            KeyMetadata("test-model", 0, 0, 0, 0, group_id=1),
+            block_size=block_size,
+            hash_block_size=block_size,
+        ),
+    ]
+    worker.coord = mooncake_store_worker.MooncakeStoreCoordinator(
+        groups,
+        scheduler_block_size=block_size,
+        hash_block_size=block_size,
+    )
+
+    tensor0 = torch.zeros(num_blocks, page_size_elements, dtype=torch.float16)
+    tensor1 = torch.zeros(num_blocks, page_size_elements * 2, dtype=torch.float16)
+    _register_with_mocked_threads(worker, {"layer0": tensor0, "layer1": tensor1})
+
+    db0, db1 = worker.token_dbs
+    assert db0.kv_caches_base_addr == [tensor0.untyped_storage().data_ptr()]
+    assert db0.block_len == [tensor0.untyped_storage().nbytes() // num_blocks]
+    assert db1.kv_caches_base_addr == [tensor1.untyped_storage().data_ptr()]
+    assert db1.block_len == [tensor1.untyped_storage().nbytes() // num_blocks]
+
+
+def test_register_cross_layer_kv_cache_applies_to_all_groups():
+    """A packed cross-layer tensor remains visible to every group DB."""
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
+
+    num_blocks = 10
+    block_size = 16
+    worker = _make_bare_worker(num_gpu_blocks=num_blocks, block_size=block_size)
+    spec = FullAttentionSpec(
+        block_size=block_size, num_kv_heads=8, head_size=64, dtype=None
+    )
+    groups = [
+        KVCacheGroupSpec(["layer0"], spec),
+        KVCacheGroupSpec(["layer1"], spec),
+    ]
+    worker._kv_cache_groups = groups
+    worker.token_dbs = [
+        ChunkedTokenDatabase(
+            KeyMetadata("test-model", 0, 0, 0, 0, group_id=0),
+            block_size=block_size,
+            hash_block_size=block_size,
+        ),
+        ChunkedTokenDatabase(
+            KeyMetadata("test-model", 0, 0, 0, 0, group_id=1),
+            block_size=block_size,
+            hash_block_size=block_size,
+        ),
+    ]
+    worker.coord = mooncake_store_worker.MooncakeStoreCoordinator(
+        groups,
+        scheduler_block_size=block_size,
+        hash_block_size=block_size,
+    )
+
+    tensor = torch.zeros(num_blocks, 128, dtype=torch.float16)
+    _register_with_mocked_threads(worker, {"__cross_layer__": tensor})
+
+    expected_addr = tensor.untyped_storage().data_ptr()
+    expected_block_len = tensor.untyped_storage().nbytes() // num_blocks
+    for db in worker.token_dbs:
+        assert db.kv_caches_base_addr == [expected_addr]
+        assert db.block_len == [expected_block_len]
+
+
 def test_register_kv_caches_cross_layer_single_segment():
     """Cross-layer tensor: single segment with block_len = page_size * num_layers."""
     num_blocks = 10
