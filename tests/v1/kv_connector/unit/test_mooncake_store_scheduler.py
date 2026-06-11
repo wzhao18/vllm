@@ -405,7 +405,12 @@ class _StubLookupClient:
     def __init__(self, hit_tokens: int) -> None:
         self._hit_tokens = hit_tokens
 
-    def lookup(self, token_len: int, block_hashes: list[bytes]) -> int:
+    def lookup(
+        self,
+        token_len: int,
+        block_hashes: list[bytes],
+        num_prompt_tokens: int | None = None,
+    ) -> int:
         return self._hit_tokens
 
 

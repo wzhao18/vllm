@@ -82,7 +82,11 @@ class MooncakeStoreScheduler:
         if token_len < self._block_size:
             return 0, False
 
-        num_external_hit_tokens = self.client.lookup(token_len, request.block_hashes)
+        num_external_hit_tokens = self.client.lookup(
+            token_len,
+            request.block_hashes,
+            getattr(request, "num_prompt_tokens", request.num_tokens),
+        )
 
         if num_external_hit_tokens == request.num_tokens:
             # Leave a sub-block tail uncomputed for sampling, on a block

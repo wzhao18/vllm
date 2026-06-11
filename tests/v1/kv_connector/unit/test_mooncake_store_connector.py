@@ -406,11 +406,12 @@ def test_lookup_key_client_lookup_prepends_typed_tag():
     fake_socket = mock_make_socket.return_value
     fake_socket.recv.return_value = (5).to_bytes(4, "big")
 
-    assert client.lookup(token_len=128, block_hashes=[]) == 5
+    assert client.lookup(token_len=128, block_hashes=[], num_prompt_tokens=96) == 5
 
     sent_frames = fake_socket.send_multipart.call_args[0][0]
     assert sent_frames[0] == protocol.LOOKUP_MSG
     assert int.from_bytes(sent_frames[1], "big") == 128
+    assert int.from_bytes(sent_frames[2], "big") == 96
 
 
 def test_lookup_key_client_reset_uses_typed_protocol():

@@ -1396,7 +1396,12 @@ class MooncakeStoreWorker:
 
         return finished_sending
 
-    def lookup(self, token_len: int, block_hashes: list[BlockHash]) -> int:
+    def lookup(
+        self,
+        token_len: int,
+        block_hashes: list[BlockHash],
+        num_prompt_tokens: int | None = None,
+    ) -> int:
         """Check how many prefix tokens exist in the store.
 
         Checks across all TP ranks and PP ranks.
@@ -1408,9 +1413,13 @@ class MooncakeStoreWorker:
         # candidate_meta[i] is the (group_id, hash_bytes) for candidate_keys[i].
         candidate_keys: list[str] = []
         candidate_meta: list[tuple[int, bytes]] = []
+        store_masks = self.coord.store_mask(
+            token_len, num_prompt_tokens=num_prompt_tokens
+        )
         tp_count = min(self.tp_size, self.num_kv_head)
         for g_idx, db in enumerate(self.token_dbs):
             spec_block_size = db.block_size
+            store_mask = store_masks[g_idx]
             group_hashes = self.coord.block_hashes_for_spec(
                 block_hashes, self._kv_cache_groups[g_idx].kv_cache_spec
             )
@@ -1418,6 +1427,8 @@ class MooncakeStoreWorker:
                 start_idx = chunk_id * spec_block_size
                 if start_idx >= token_len:
                     break
+                if chunk_id >= len(store_mask) or not store_mask[chunk_id]:
+                    continue
                 for tp in range(tp_count):
                     for pp in range(self.pp_size):
                         md = dataclasses.replace(db.metadata, tp_rank=tp, pp_rank=pp)
@@ -1508,10 +1519,16 @@ class LookupKeyServer:
 
                 if msg_type == LOOKUP_MSG:
                     token_len = int.from_bytes(all_frames[1], byteorder="big")
-                    hash_frames = all_frames[2:]
+                    num_prompt_tokens_raw = int.from_bytes(
+                        all_frames[2], byteorder="big"
+                    )
+                    num_prompt_tokens = num_prompt_tokens_raw or None
+                    hash_frames = all_frames[3:]
                     hashes_str = self.decoder.decode(hash_frames)
                     block_hashes = [BlockHash(bytes.fromhex(s)) for s in hashes_str]
-                    result = self.store_worker.lookup(token_len, block_hashes)
+                    result = self.store_worker.lookup(
+                        token_len, block_hashes, num_prompt_tokens
+                    )
                     self.socket.send(result.to_bytes(4, "big"))
 
                 elif msg_type == RESET_MSG:
@@ -1569,11 +1586,23 @@ class LookupKeyClient:
             bind=False,
         )
 
-    def lookup(self, token_len: int, block_hashes: list[BlockHash]) -> int:
+    def lookup(
+        self,
+        token_len: int,
+        block_hashes: list[BlockHash],
+        num_prompt_tokens: int | None = None,
+    ) -> int:
         hash_strs = [h.hex() for h in block_hashes]
         hash_frames = self.encoder.encode(hash_strs)
         token_len_bytes = token_len.to_bytes(4, byteorder="big")
-        all_frames = [LOOKUP_MSG, token_len_bytes] + list(hash_frames)
+        num_prompt_tokens_bytes = (num_prompt_tokens or 0).to_bytes(
+            4, byteorder="big"
+        )
+        all_frames = [
+            LOOKUP_MSG,
+            token_len_bytes,
+            num_prompt_tokens_bytes,
+        ] + list(hash_frames)
         self.socket.send_multipart(all_frames, copy=False)
         resp = self.socket.recv()
         result = int.from_bytes(resp, "big")

@@ -1207,6 +1207,37 @@ def test_lookup_swa_single_group_returns_full_when_tail_window_present():
     assert worker.lookup(64, [b"h0", b"h1", b"h2", b"h3"]) == 64
 
 
+def test_lookup_skips_store_ineligible_swa_chunks():
+    """Lookup should not query SWA chunks that the store path would not write."""
+    from vllm.v1.kv_cache_interface import KVCacheGroupSpec, SlidingWindowSpec
+
+    worker = _make_bare_worker(block_size=16)
+    swa = SlidingWindowSpec(
+        block_size=16, num_kv_heads=8, head_size=64, dtype=None, sliding_window=32
+    )
+    worker._kv_cache_groups = [KVCacheGroupSpec(["layer0"], swa)]
+    worker.coord = mooncake_store_worker.MooncakeStoreCoordinator(
+        worker._kv_cache_groups,
+        scheduler_block_size=worker.hash_block_size,
+        hash_block_size=worker.hash_block_size,
+        retention_interval=0,
+    )
+    worker.store.batch_is_exist.return_value = [1, 1]
+
+    result = worker.lookup(
+        64,
+        [b"h0", b"h1", b"h2", b"h3"],
+        num_prompt_tokens=64,
+    )
+
+    assert result == 48
+    keys = worker.store.batch_is_exist.call_args.args[0]
+    assert keys == [
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6831",
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6832",
+    ]
+
+
 # ---------------------------------------------------------------------------
 # register_kv_caches tests
 # ---------------------------------------------------------------------------
