@@ -207,6 +207,41 @@ class MooncakeStoreCoordinator:
             masks.append(mask)
         return tuple(masks)
 
+    def lookup_mask(
+        self,
+        aligned_token_len: int,
+    ) -> tuple[Sequence[bool] | None, ...]:
+        """Per-group lookup masks.
+
+        Lookup cannot use the sparse, prompt-specific ``store_mask`` directly:
+        external prefix hits may end at an earlier request's replay boundary,
+        not only at the current request's replay boundary. Use dense reachable
+        masks so lookup checks every chunk that could validate an aligned hit
+        boundary, while still skipping SWA chunks that can never participate in
+        a hit.
+        """
+        assert aligned_token_len % self.lcm_block_size == 0, (
+            f"aligned_token_len ({aligned_token_len}) must be a multiple of "
+            f"lcm_block_size ({self.lcm_block_size})"
+        )
+        masks: list[Sequence[bool] | None] = []
+        for g_idx, g in enumerate(self.kv_cache_groups):
+            spec = _unwrap_spec(g.kv_cache_spec)
+            num_chunks = aligned_token_len // spec.block_size
+            manager_cls = KVCacheSpecRegistry.get_manager_class(spec)
+            assert manager_cls is not None
+            mask = manager_cls.reachable_block_mask(
+                start_block=0,
+                end_block=num_chunks,
+                alignment_tokens=self.lcm_block_size,
+                kv_cache_spec=spec,
+                use_eagle=g_idx in self.eagle_group_ids,
+            )
+            if mask is not None:
+                assert len(mask) == num_chunks
+            masks.append(mask)
+        return tuple(masks)
+
     def block_hashes_for_spec(
         self, block_hashes: list[BlockHash], spec: KVCacheSpec
     ) -> BlockHashList:

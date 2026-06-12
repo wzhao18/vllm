@@ -1415,13 +1415,11 @@ class MooncakeStoreWorker:
         # candidate_meta[i] is the (group_id, hash_bytes) for candidate_keys[i].
         candidate_keys: list[str] = []
         candidate_meta: list[tuple[int, bytes]] = []
-        store_masks = self.coord.store_mask(
-            token_len, num_prompt_tokens=num_prompt_tokens
-        )
+        lookup_masks = self.coord.lookup_mask(token_len)
         tp_count = min(self.tp_size, self.num_kv_head)
         for g_idx, db in enumerate(self.token_dbs):
             spec_block_size = db.block_size
-            store_mask = store_masks[g_idx]
+            lookup_mask = lookup_masks[g_idx]
             group_hashes = self.coord.block_hashes_for_spec(
                 block_hashes, self._kv_cache_groups[g_idx].kv_cache_spec
             )
@@ -1429,8 +1427,8 @@ class MooncakeStoreWorker:
                 start_idx = chunk_id * spec_block_size
                 if start_idx >= token_len:
                     break
-                if store_mask is not None and (
-                    chunk_id >= len(store_mask) or not store_mask[chunk_id]
+                if lookup_mask is not None and (
+                    chunk_id >= len(lookup_mask) or not lookup_mask[chunk_id]
                 ):
                     continue
                 for tp in range(tp_count):
