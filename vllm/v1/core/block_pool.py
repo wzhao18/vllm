@@ -216,7 +216,7 @@ class BlockPool:
         num_full_blocks: int,
         block_size: int,
         kv_cache_group_id: int,
-        block_mask: list[bool] | None = None,
+        block_mask: Sequence[bool] | None = None,
     ) -> None:
         """Cache a list of full blocks for prefix caching.
         This function takes a list of blocks that will have their block hash

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """External-store cache-hit coordinator for MooncakeStoreConnector."""
 
+from collections.abc import Sequence
 from typing import cast
 
 from vllm.v1.core.block_pool import BlockPool
@@ -172,10 +173,12 @@ class MooncakeStoreCoordinator:
         self,
         aligned_token_len: int,
         num_prompt_tokens: int | None = None,
-    ) -> tuple[list[bool], ...]:
-        """Per-group store masks: ``mask[g][i]`` is True iff chunk ``i`` of
-        group ``g`` should be written to the store so a future cache hit can
-        consume it.
+    ) -> tuple[Sequence[bool] | None, ...]:
+        """Per-group store masks.
+
+        ``mask[g][i]`` is True iff chunk ``i`` of group ``g`` should be
+        written to the store so a future cache hit can consume it. ``None`` is
+        the all-True sentinel.
 
         Reuses the engine's ``SingleTypeKVCacheManager.reachable_block_mask``
         so the store retains exactly the blocks the local prefix cache would.
@@ -184,7 +187,7 @@ class MooncakeStoreCoordinator:
             f"aligned_token_len ({aligned_token_len}) must be a multiple of "
             f"lcm_block_size ({self.lcm_block_size})"
         )
-        masks: list[list[bool]] = []
+        masks: list[Sequence[bool] | None] = []
         for g_idx, g in enumerate(self.kv_cache_groups):
             spec = _unwrap_spec(g.kv_cache_spec)
             num_chunks = aligned_token_len // spec.block_size
@@ -199,7 +202,9 @@ class MooncakeStoreCoordinator:
                 retention_interval=self.retention_interval,
                 num_prompt_tokens=num_prompt_tokens,
             )
-            masks.append([True] * num_chunks if mask is None else mask)
+            if mask is not None:
+                assert len(mask) == num_chunks
+            masks.append(mask)
         return tuple(masks)
 
     def block_hashes_for_spec(

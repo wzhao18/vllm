@@ -548,7 +548,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 for chunk_idx, (start, end, key) in enumerate(
                     db.process_tokens(token_len, req_meta.block_hashes)
                 ):
-                    if chunk_idx >= len(mask) or not mask[chunk_idx]:
+                    if mask is not None and (
+                        chunk_idx >= len(mask) or not mask[chunk_idx]
+                    ):
                         continue
                     starts.append(start)
                     ends.append(end)
@@ -1427,7 +1429,9 @@ class MooncakeStoreWorker:
                 start_idx = chunk_id * spec_block_size
                 if start_idx >= token_len:
                     break
-                if chunk_id >= len(store_mask) or not store_mask[chunk_id]:
+                if store_mask is not None and (
+                    chunk_id >= len(store_mask) or not store_mask[chunk_id]
+                ):
                     continue
                 for tp in range(tp_count):
                     for pp in range(self.pp_size):

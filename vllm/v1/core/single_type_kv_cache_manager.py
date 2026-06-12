@@ -4,6 +4,8 @@ import itertools
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
+from functools import lru_cache
+from typing import overload
 
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
@@ -27,6 +29,78 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
+
+
+class _SlidingWindowReachableBlockMask(Sequence[bool]):
+    """Lazy read-only mask for SWA prefix-cache reachable blocks."""
+
+    __slots__ = (
+        "_end_block",
+        "_length",
+        "_need",
+        "_per_segment",
+        "_prompt_end_block",
+        "_prompt_start_block",
+        "_shift",
+        "_start_block",
+    )
+
+    def __init__(
+        self,
+        start_block: int,
+        end_block: int,
+        need: int,
+        shift: int,
+        per_segment: int | None,
+        prompt_start_block: int | None,
+        prompt_end_block: int | None,
+    ) -> None:
+        self._start_block = start_block
+        self._end_block = end_block
+        self._length = end_block - start_block
+        self._need = need
+        self._shift = shift
+        self._per_segment = per_segment
+        self._prompt_start_block = prompt_start_block
+        self._prompt_end_block = prompt_end_block
+
+    def __len__(self) -> int:
+        return self._length
+
+    @overload
+    def __getitem__(self, index: int) -> bool:
+        ...
+
+    @overload
+    def __getitem__(self, index: slice) -> list[bool]:
+        ...
+
+    def __getitem__(self, index: int | slice) -> bool | list[bool]:
+        if isinstance(index, slice):
+            return [self[i] for i in range(*index.indices(self._length))]
+        if index < 0:
+            index += self._length
+        if index < 0 or index >= self._length:
+            raise IndexError(index)
+        return self._is_reachable(self._start_block + index)
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Sequence):
+            return False
+        return len(self) == len(other) and all(
+            self[i] == other[i] for i in range(self._length)
+        )
+
+    def _is_reachable(self, block_idx: int) -> bool:
+        if self._per_segment is not None and block_idx >= self._shift:
+            segment_offset = (block_idx - self._shift) % self._per_segment
+            if segment_offset >= self._per_segment - self._need:
+                return True
+        return (
+            self._prompt_start_block is not None
+            and self._prompt_end_block is not None
+            and self._prompt_start_block <= block_idx < self._prompt_end_block
+        )
 
 
 class SingleTypeKVCacheManager(ABC):
@@ -350,7 +424,7 @@ class SingleTypeKVCacheManager(ABC):
         use_eagle: bool,
         retention_interval: int | None = None,
         num_prompt_tokens: int | None = None,
-    ) -> list[bool] | None:
+    ) -> Sequence[bool] | None:
         """Per-block mask for ``cache_full_blocks``. ``None`` means cache
         every (non-null) block — the default for full attention.
 
@@ -694,7 +768,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         use_eagle: bool,
         retention_interval: int | None = None,
         num_prompt_tokens: int | None = None,
-    ) -> list[bool] | None:
+    ) -> Sequence[bool] | None:
         assert isinstance(kv_cache_spec, SlidingWindowSpec)
         if alignment_tokens is None:
             # Fast path: when the coordinator imposes no alignment constraint.
@@ -702,9 +776,41 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         assert alignment_tokens % kv_cache_spec.block_size == 0
 
         block_size = kv_cache_spec.block_size
+        segment_tokens = (
+            alignment_tokens
+            if retention_interval is None
+            else (None if retention_interval == 0 else retention_interval)
+        )
+        replay_boundary_tokens = (
+            (num_prompt_tokens - 1) // alignment_tokens * alignment_tokens
+            if retention_interval is not None and num_prompt_tokens is not None
+            else None
+        )
+        return cls._reachable_block_mask_cached(
+            start_block=start_block,
+            end_block=end_block,
+            block_size=block_size,
+            sliding_window=kv_cache_spec.sliding_window,
+            use_eagle=use_eagle,
+            segment_tokens=segment_tokens,
+            replay_boundary_tokens=replay_boundary_tokens,
+        )
+
+    @classmethod
+    @lru_cache(maxsize=1024)
+    def _reachable_block_mask_cached(
+        cls,
+        start_block: int,
+        end_block: int,
+        block_size: int,
+        sliding_window: int,
+        use_eagle: bool,
+        segment_tokens: int | None,
+        replay_boundary_tokens: int | None,
+    ) -> Sequence[bool] | None:
         # Contiguous blocks a hit needs at a boundary (incl. the EAGLE peek).
         need = cls._contiguous_blocks_for_hit(
-            window_size=kv_cache_spec.sliding_window,
+            window_size=sliding_window,
             block_size=block_size,
             use_eagle=use_eagle,
         )
@@ -713,40 +819,36 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         # before the boundary (shift=0).
         shift = 1 if use_eagle else 0
 
-        mask = [False] * (end_block - start_block)
-
         # (1) Segment-boundary tails. ``retention_interval``:
         #   None -> dense (a tail at every ``alignment_tokens`` boundary);
         #   0    -> no dense tails (only the replay boundary below);
         #   >0   -> a tail once per ``retention_interval``-sized segment.
-        segment_tokens = (
-            alignment_tokens
-            if retention_interval is None
-            else (None if retention_interval == 0 else retention_interval)
-        )
+        per_segment: int | None = None
         if segment_tokens is not None:
             per_segment = segment_tokens // block_size
             if need >= per_segment:
                 # Every block is reachable; cache them all.
                 return None
-            for i in range(start_block, end_block):
-                if i >= shift and (i - shift) % per_segment >= per_segment - need:
-                    mask[i - start_block] = True
 
         # (2) Replay-boundary tail. ``get_computed_blocks`` caps hits at
         # ``num_prompt - 1`` (to recompute the last token's logits), so an exact
         # prompt replay can only land on the latest *fine*-aligned boundary.
         # Sparse retention would otherwise skip it, so keep its tail explicitly.
-        if retention_interval is not None and num_prompt_tokens is not None:
-            latest = (num_prompt_tokens - 1) // alignment_tokens * alignment_tokens
-            prompt_end_block = latest // block_size + shift
-            for i in range(
-                max(start_block, prompt_end_block - need),
-                min(end_block, prompt_end_block),
-            ):
-                mask[i - start_block] = True
+        prompt_start_block: int | None = None
+        prompt_end_block: int | None = None
+        if replay_boundary_tokens is not None:
+            prompt_end_block = replay_boundary_tokens // block_size + shift
+            prompt_start_block = prompt_end_block - need
 
-        return mask
+        return _SlidingWindowReachableBlockMask(
+            start_block=start_block,
+            end_block=end_block,
+            need=need,
+            shift=shift,
+            per_segment=per_segment,
+            prompt_start_block=prompt_start_block,
+            prompt_end_block=prompt_end_block,
+        )
 
     def free(self, request_id: str) -> None:
         # similar to remove_skipped_blocks(), prepend the uncached blocks
