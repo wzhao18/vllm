@@ -22,7 +22,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker import (
 )
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+from vllm.v1.core.kv_cache_utils import BlockHash, resolve_kv_cache_block_sizes
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import Request
@@ -82,7 +82,32 @@ class MooncakeStoreScheduler:
         if token_len < self._block_size:
             return 0, False
 
-        num_external_hit_tokens = self.client.lookup(token_len, request.block_hashes)
+        vllm_cached_tokens = min(
+            token_len,
+            num_computed_tokens // self._block_size * self._block_size,
+        )
+        vllm_cached_hashes: list[BlockHash] = []
+        if vllm_cached_tokens > 0:
+            num_cached_hashes = vllm_cached_tokens // self._hash_block_size
+            vllm_cached_hashes = request.block_hashes[:num_cached_hashes]
+
+        if vllm_cached_tokens >= token_len:
+            self.client.lookup_async(vllm_cached_tokens, vllm_cached_hashes)
+            logger.debug(
+                "Reqid: %s, Total tokens %d, vLLM hit tokens cover lookup "
+                "range: %d",
+                request.request_id,
+                request.num_tokens,
+                vllm_cached_tokens,
+            )
+            return 0, False
+
+        num_external_hit_tokens = self.client.lookup(
+            token_len,
+            request.block_hashes,
+            skip_lookup_token_len=vllm_cached_tokens,
+        )
+        self.client.lookup_async(vllm_cached_tokens, vllm_cached_hashes)
 
         if num_external_hit_tokens == request.num_tokens:
             # Leave a sub-block tail uncomputed for sampling, on a block
@@ -115,6 +140,9 @@ class MooncakeStoreScheduler:
         )
 
         return need_to_allocate, self.load_async
+
+    def close(self) -> None:
+        self.client.close()
 
     def update_state_after_alloc(
         self,

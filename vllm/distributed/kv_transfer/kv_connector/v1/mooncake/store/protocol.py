@@ -11,7 +11,8 @@ Wire format (REQ/REP over IPC):
 
       msg_type == LOOKUP_MSG:
           frame 1: token_len (u32 big-endian, 4 bytes)
-          frame 2..n: msgpack-encoded list[str] of block-hash hex digests
+          frame 2: skip_lookup_token_len (u32 big-endian, 4 bytes)
+          frame 3..n: msgpack-encoded list[str] of block-hash hex digests
         Response: [hit_count: u32 big-endian, 4 bytes]
 
       msg_type == RESET_MSG:

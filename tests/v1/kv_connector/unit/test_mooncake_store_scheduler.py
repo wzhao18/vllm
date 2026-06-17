@@ -17,12 +17,78 @@ def _make_bare_scheduler() -> MooncakeStoreScheduler:
     scheduler = object.__new__(MooncakeStoreScheduler)
     scheduler.kv_role = "kv_both"
     scheduler._block_size = 16
+    scheduler._hash_block_size = 16
+    scheduler.load_async = True
     scheduler.load_specs = {}
     scheduler._preempted_req_ids = set()
     scheduler._unfinished_request_ids = {"req-0"}
     scheduler._unfinished_requests = {}
     scheduler._request_trackers = {}
     return scheduler
+
+
+class _FakeLookupClient:
+    def __init__(self, hit_tokens: int):
+        self.hit_tokens = hit_tokens
+        self.lookups = []
+        self.async_lookups = []
+
+    def lookup(
+        self,
+        token_len: int,
+        block_hashes: list[bytes],
+        skip_lookup_token_len: int = 0,
+    ) -> int:
+        self.lookups.append((token_len, block_hashes, skip_lookup_token_len))
+        return self.hit_tokens
+
+    def lookup_async(self, token_len: int, block_hashes: list[bytes]) -> None:
+        self.async_lookups.append((token_len, block_hashes))
+
+
+def test_get_num_new_matched_tokens_skips_local_hit_blocks():
+    scheduler = _make_bare_scheduler()
+    client = _FakeLookupClient(hit_tokens=64)
+    scheduler.client = client
+    request = SimpleNamespace(
+        request_id="req-0",
+        num_tokens=80,
+        block_hashes=[b"h0", b"h1", b"h2", b"h3", b"h4"],
+    )
+
+    num_tokens, load_async = scheduler.get_num_new_matched_tokens(
+        request,
+        num_computed_tokens=32,
+    )
+
+    assert (num_tokens, load_async) == (32, True)
+    assert client.lookups == [(80, request.block_hashes, 32)]
+    assert client.async_lookups == [(32, [b"h0", b"h1"])]
+    assert scheduler.load_specs["req-0"] == LoadSpec(
+        vllm_cached_tokens=32,
+        kvpool_cached_tokens=64,
+        can_load=False,
+    )
+
+
+def test_get_num_new_matched_tokens_only_async_refreshes_full_local_hit():
+    scheduler = _make_bare_scheduler()
+    client = _FakeLookupClient(hit_tokens=0)
+    scheduler.client = client
+    request = SimpleNamespace(
+        request_id="req-0",
+        num_tokens=64,
+        block_hashes=[b"h0", b"h1", b"h2", b"h3"],
+    )
+
+    assert scheduler.get_num_new_matched_tokens(
+        request,
+        num_computed_tokens=64,
+    ) == (0, False)
+
+    assert client.lookups == []
+    assert client.async_lookups == [(64, request.block_hashes)]
+    assert scheduler.load_specs == {}
 
 
 def _make_scheduler_output(*, scheduled_spec_tokens: list[int] | None):
@@ -404,9 +470,18 @@ def test_from_request_tracker_no_load_saves_normally():
 class _StubLookupClient:
     def __init__(self, hit_tokens: int) -> None:
         self._hit_tokens = hit_tokens
+        self.async_lookups = []
 
-    def lookup(self, token_len: int, block_hashes: list[bytes]) -> int:
+    def lookup(
+        self,
+        token_len: int,
+        block_hashes: list[bytes],
+        skip_lookup_token_len: int = 0,
+    ) -> int:
         return self._hit_tokens
+
+    def lookup_async(self, token_len: int, block_hashes: list[bytes]) -> None:
+        self.async_lookups.append((token_len, block_hashes))
 
 
 def test_full_external_hit_keeps_kvpool_cached_tokens_block_aligned():

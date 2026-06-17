@@ -157,10 +157,14 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
         """Release connector resources on teardown.
 
         Closes the worker's MooncakeDistributedStore handle so its
-        TransferEngine and RDMA registrations are released. Invoked from the
-        engine's explicit shutdown path and as a backstop from ``__del__``;
-        a no-op on the scheduler role, which holds no store handle.
+        TransferEngine and RDMA registrations are released. The scheduler role
+        owns the lookup client and closes its background refresh thread here.
+        Invoked from the engine's explicit shutdown path and as a backstop
+        from ``__del__``.
         """
+        scheduler = getattr(self, "connector_scheduler", None)
+        if scheduler is not None:
+            scheduler.close()
         worker = getattr(self, "connector_worker", None)
         if worker is not None:
             worker.close()
