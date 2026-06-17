@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from vllm.config import set_current_vllm_config
@@ -17,11 +18,14 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import (
     worker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+    ChunkedTokenDatabase,
+    KeyMetadata,
     MooncakeStoreConnectorMetadata,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.metrics import (
     MooncakeStoreConnectorStats,
 )
+from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -406,11 +410,113 @@ def test_lookup_key_client_lookup_prepends_typed_tag():
     fake_socket = mock_make_socket.return_value
     fake_socket.recv.return_value = (5).to_bytes(4, "big")
 
-    assert client.lookup(token_len=128, block_hashes=[]) == 5
+    assert client.lookup(
+        token_len=128,
+        block_hashes=[],
+        skip_lookup_token_len=64,
+    ) == 5
 
     sent_frames = fake_socket.send_multipart.call_args[0][0]
     assert sent_frames[0] == protocol.LOOKUP_MSG
     assert int.from_bytes(sent_frames[1], "big") == 128
+    assert int.from_bytes(sent_frames[2], "big") == 64
+    client.close()
+
+
+def test_lookup_key_client_async_lookup_uses_background_socket():
+    """LookupKeyClient.lookup_async() sends LOOKUP_MSG off the sync socket."""
+    vllm_config = _make_vllm_config()
+    sync_socket = MagicMock()
+    async_socket = MagicMock()
+    async_socket.recv.return_value = (0).to_bytes(4, "big")
+
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store."
+        "worker.make_zmq_socket",
+        side_effect=[sync_socket, async_socket],
+    ):
+        client = worker.LookupKeyClient(vllm_config)
+        client.lookup_async(16, [BlockHash(b"h0")])
+        client._async_lookup_queue.join()
+
+    client.close()
+    sent_frames = async_socket.send_multipart.call_args[0][0]
+    assert sent_frames[0] == protocol.LOOKUP_MSG
+    assert int.from_bytes(sent_frames[1], "big") == 16
+    assert int.from_bytes(sent_frames[2], "big") == 0
+    sync_socket.send_multipart.assert_not_called()
+
+
+def test_store_worker_lookup_skips_local_prefix_remote_checks():
+    """Skipped local-hit blocks count as present without remote lookups."""
+
+    class FakeCoord:
+        def __init__(self):
+            self.exists_set = None
+
+        def lookup_mask(self, token_len):
+            return (None,)
+
+        def block_hashes_for_spec(self, block_hashes, spec):
+            return block_hashes
+
+        def find_longest_cache_hit(
+            self,
+            block_hashes,
+            token_len,
+            cached_block_pool,
+        ):
+            self.exists_set = cached_block_pool._exists
+            expected = {
+                (0, bytes(block_hash))
+                for block_hash in block_hashes[: token_len // 16]
+            }
+            return (), token_len if expected <= self.exists_set else 0
+
+    class FakeStore:
+        def __init__(self):
+            self.keys = []
+
+        def batch_is_exist(self, keys):
+            self.keys = keys
+            return [1] * len(keys)
+
+    store_worker = object.__new__(worker.MooncakeStoreWorker)
+    store_worker.coord = FakeCoord()
+    store_worker.store = FakeStore()
+    store_worker.tp_size = 1
+    store_worker.num_kv_head = 1
+    store_worker.pp_size = 1
+    store_worker._kv_cache_groups = [SimpleNamespace(kv_cache_spec=object())]
+    store_worker.token_dbs = [
+        ChunkedTokenDatabase(
+            KeyMetadata(
+                model_name="model",
+                tp_rank=0,
+                pcp_rank=0,
+                dcp_rank=0,
+                pp_rank=0,
+            ),
+            block_size=16,
+            hash_block_size=16,
+        )
+    ]
+    store_worker._record_kv_connector_operation = MagicMock()
+
+    hit_length = store_worker.lookup(
+        token_len=48,
+        block_hashes=[BlockHash(b"h0"), BlockHash(b"h1"), BlockHash(b"h2")],
+        skip_lookup_token_len=32,
+    )
+
+    assert hit_length == 48
+    assert len(store_worker.store.keys) == 1
+    assert store_worker.store.keys[0].endswith(f"@{BlockHash(b'h2').hex()}")
+    assert store_worker.coord.exists_set == {
+        (0, b"h0"),
+        (0, b"h1"),
+        (0, b"h2"),
+    }
 
 
 def test_lookup_key_client_reset_uses_typed_protocol():
@@ -433,6 +539,7 @@ def test_lookup_key_client_reset_uses_typed_protocol():
     # NACK path: server returns RESP_ERR -> client returns False.
     fake_socket.recv.return_value = protocol.RESP_ERR
     assert client.reset() is False
+    client.close()
 
 
 def test_protocol_tags_are_distinct_and_non_empty():

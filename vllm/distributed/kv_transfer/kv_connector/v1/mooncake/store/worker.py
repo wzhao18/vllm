@@ -93,6 +93,12 @@ MooncakeMode = Literal["embedded", "standalone-store"]
 
 
 @dataclass
+class _AsyncLookupRequest:
+    token_len: int
+    block_hashes: list[BlockHash]
+
+
+@dataclass
 class MooncakeStoreConfig:
     """Configuration for MooncakeDistributedStore.
 
@@ -1365,20 +1371,42 @@ class MooncakeStoreWorker:
 
         return finished_sending
 
-    def lookup(self, token_len: int, block_hashes: list[BlockHash]) -> int:
+    def lookup(
+        self,
+        token_len: int,
+        block_hashes: list[BlockHash],
+        skip_lookup_token_len: int = 0,
+    ) -> int:
         """Check how many prefix tokens exist in the store.
 
-        Checks across all TP ranks and PP ranks.
+        Checks across all TP ranks and PP ranks. ``skip_lookup_token_len``
+        marks an already-local prefix that should count as present while
+        avoiding a blocking remote existence check for those keys.
         """
+        total_start = time.perf_counter()
         if not block_hashes or token_len <= 0:
+            logger.info(
+                "Mooncake worker lookup profile: token_len=%d hashes=%d "
+                "skip_lookup_token_len=%d early_return=empty total_ms=%.3f",
+                token_len,
+                len(block_hashes),
+                skip_lookup_token_len,
+                (time.perf_counter() - total_start) * 1000,
+            )
             return 0
+
+        skip_lookup_token_len = max(0, min(skip_lookup_token_len, token_len))
 
         # Build per-(group, hash) candidate keys expanded across TP/PP.
         # candidate_meta[i] is the (group_id, hash_bytes) for candidate_keys[i].
         candidate_keys: list[str] = []
         candidate_meta: list[tuple[int, bytes]] = []
+        local_prefix_exists: set[tuple[int, bytes]] = set()
+        mask_start = time.perf_counter()
         lookup_masks = self.coord.lookup_mask(token_len)
+        mask_duration = time.perf_counter() - mask_start
         tp_count = min(self.tp_size, self.num_kv_head)
+        build_start = time.perf_counter()
         for g_idx, db in enumerate(self.token_dbs):
             spec_block_size = db.block_size
             lookup_mask = lookup_masks[g_idx]
@@ -1393,44 +1421,98 @@ class MooncakeStoreWorker:
                     chunk_id >= len(lookup_mask) or not lookup_mask[chunk_id]
                 ):
                     continue
+                if start_idx < skip_lookup_token_len:
+                    local_prefix_exists.add((g_idx, bytes(h)))
+                    continue
                 for tp in range(tp_count):
                     for pp in range(self.pp_size):
                         md = dataclasses.replace(db.metadata, tp_rank=tp, pp_rank=pp)
                         candidate_keys.append(PoolKey(md, h.hex()).to_string())
                         candidate_meta.append((g_idx, bytes(h)))
+        build_duration = time.perf_counter() - build_start
 
-        if not candidate_keys:
+        exists_set = set(local_prefix_exists)
+        if not candidate_keys and not exists_set:
+            logger.info(
+                "Mooncake worker lookup profile: token_len=%d hashes=%d "
+                "skip_lookup_token_len=%d candidate_keys=0 "
+                "local_prefix_keys=0 groups=%d tp_count=%d pp_size=%d "
+                "early_return=no_candidates mask_ms=%.3f "
+                "build_keys_ms=%.3f total_ms=%.3f",
+                token_len,
+                len(block_hashes),
+                skip_lookup_token_len,
+                len(self.token_dbs),
+                tp_count,
+                self.pp_size,
+                mask_duration * 1000,
+                build_duration * 1000,
+                (time.perf_counter() - total_start) * 1000,
+            )
             return 0
 
-        lookup_start = time.perf_counter()
-        try:
-            res = self.store.batch_is_exist(candidate_keys)
-            self._record_kv_connector_operation(
-                "lookup_exists",
-                time.perf_counter() - lookup_start,
-                len(candidate_keys),
-            )
-        except Exception as e:
-            self._record_kv_connector_operation(
-                "lookup_exists",
-                time.perf_counter() - lookup_start,
-                len(candidate_keys),
-                status="error",
-                num_failed_keys=len(candidate_keys),
-            )
-            logger.error("Remote connection failed in lookup: %s", e)
-            return 0
+        batch_exists_duration = 0.0
+        aggregate_duration = 0.0
+        if candidate_keys:
+            lookup_start = time.perf_counter()
+            try:
+                res = self.store.batch_is_exist(candidate_keys)
+                self._record_kv_connector_operation(
+                    "lookup_exists",
+                    time.perf_counter() - lookup_start,
+                    len(candidate_keys),
+                )
+            except Exception as e:
+                self._record_kv_connector_operation(
+                    "lookup_exists",
+                    time.perf_counter() - lookup_start,
+                    len(candidate_keys),
+                    status="error",
+                    num_failed_keys=len(candidate_keys),
+                )
+                logger.error("Remote connection failed in lookup: %s", e)
+                return 0
+            batch_exists_duration = time.perf_counter() - lookup_start
 
-        # A (group, hash) is "present" only when every TP*PP rank has it.
-        expected_per_key = max(1, tp_count * self.pp_size)
-        present_count: dict[tuple[int, bytes], int] = {}
-        for gh, exists in zip(candidate_meta, res, strict=True):
-            if exists == 1:
-                present_count[gh] = present_count.get(gh, 0) + 1
-        exists_set = {gh for gh, c in present_count.items() if c >= expected_per_key}
+            aggregate_start = time.perf_counter()
+            # A (group, hash) is "present" only when every TP*PP rank has it.
+            expected_per_key = max(1, tp_count * self.pp_size)
+            present_count: dict[tuple[int, bytes], int] = {}
+            for gh, exists in zip(candidate_meta, res, strict=True):
+                if exists == 1:
+                    present_count[gh] = present_count.get(gh, 0) + 1
+            exists_set.update(
+                gh for gh, c in present_count.items() if c >= expected_per_key
+            )
+            aggregate_duration = time.perf_counter() - aggregate_start
 
+        hit_start = time.perf_counter()
         _masks, hit_length = self.coord.find_longest_cache_hit(
             block_hashes, token_len, ExternalCachedBlockPool(exists_set)
+        )
+        hit_duration = time.perf_counter() - hit_start
+        logger.info(
+            "Mooncake worker lookup profile: token_len=%d hashes=%d "
+            "skip_lookup_token_len=%d candidate_keys=%d local_prefix_keys=%d "
+            "complete_keys=%d groups=%d tp_count=%d pp_size=%d hit_length=%d "
+            "mask_ms=%.3f build_keys_ms=%.3f batch_exists_ms=%.3f "
+            "aggregate_ms=%.3f hit_compute_ms=%.3f total_ms=%.3f",
+            token_len,
+            len(block_hashes),
+            skip_lookup_token_len,
+            len(candidate_keys),
+            len(local_prefix_exists),
+            len(exists_set),
+            len(self.token_dbs),
+            tp_count,
+            self.pp_size,
+            hit_length,
+            mask_duration * 1000,
+            build_duration * 1000,
+            batch_exists_duration * 1000,
+            aggregate_duration * 1000,
+            hit_duration * 1000,
+            (time.perf_counter() - total_start) * 1000,
         )
         return hit_length
 
@@ -1495,15 +1577,51 @@ class LookupKeyServer:
         def process_request():
             while self.running:
                 all_frames = self.socket.recv_multipart(copy=False)
+                request_start = time.perf_counter()
                 msg_type = bytes(all_frames[0])
 
                 if msg_type == LOOKUP_MSG:
+                    parse_start = time.perf_counter()
                     token_len = int.from_bytes(all_frames[1], byteorder="big")
-                    hash_frames = all_frames[2:]
+                    skip_lookup_token_len = int.from_bytes(
+                        all_frames[2], byteorder="big"
+                    )
+                    hash_frames = all_frames[3:]
+                    parse_duration = time.perf_counter() - parse_start
+                    decode_start = time.perf_counter()
                     hashes_str = self.decoder.decode(hash_frames)
+                    decode_duration = time.perf_counter() - decode_start
+                    convert_start = time.perf_counter()
                     block_hashes = [BlockHash(bytes.fromhex(s)) for s in hashes_str]
-                    result = self.store_worker.lookup(token_len, block_hashes)
+                    convert_duration = time.perf_counter() - convert_start
+                    worker_start = time.perf_counter()
+                    result = self.store_worker.lookup(
+                        token_len,
+                        block_hashes,
+                        skip_lookup_token_len=skip_lookup_token_len,
+                    )
+                    worker_duration = time.perf_counter() - worker_start
+                    send_start = time.perf_counter()
                     self.socket.send(result.to_bytes(4, "big"))
+                    send_duration = time.perf_counter() - send_start
+                    logger.info(
+                        "Mooncake lookup server profile: token_len=%d "
+                        "skip_lookup_token_len=%d frames=%d hashes=%d "
+                        "result=%d parse_ms=%.3f msgpack_decode_ms=%.3f "
+                        "hex_to_bytes_ms=%.3f worker_lookup_ms=%.3f "
+                        "send_ms=%.3f total_ms=%.3f",
+                        token_len,
+                        skip_lookup_token_len,
+                        len(all_frames),
+                        len(block_hashes),
+                        result,
+                        parse_duration * 1000,
+                        decode_duration * 1000,
+                        convert_duration * 1000,
+                        worker_duration * 1000,
+                        send_duration * 1000,
+                        (time.perf_counter() - request_start) * 1000,
+                    )
 
                 elif msg_type == RESET_MSG:
                     try:
@@ -1552,23 +1670,140 @@ class LookupKeyClient:
     def __init__(self, vllm_config: VllmConfig):
         self.encoder = MsgpackEncoder()
         self.ctx = zmq.Context()  # type: ignore[attr-defined]
-        socket_path = get_zmq_rpc_path_lookup(vllm_config)
+        self.socket_path = get_zmq_rpc_path_lookup(vllm_config)
         self.socket = make_zmq_socket(
             self.ctx,
-            socket_path,
+            self.socket_path,
             zmq.REQ,  # type: ignore[attr-defined]
             bind=False,
         )
+        self._async_lookup_queue: queue.Queue[_AsyncLookupRequest | None] = (
+            queue.Queue()
+        )
+        self._closed = False
+        self._async_lookup_closed = False
+        self._async_lookup_lock = threading.Lock()
+        self._async_lookup_thread = threading.Thread(
+            target=self._process_async_lookups,
+            daemon=True,
+            name="MooncakeLookupKeyClientAsync",
+        )
+        self._async_lookup_thread.start()
 
-    def lookup(self, token_len: int, block_hashes: list[BlockHash]) -> int:
+    @staticmethod
+    def _lookup(
+        socket: Any,
+        encoder: MsgpackEncoder,
+        token_len: int,
+        block_hashes: list[BlockHash],
+        skip_lookup_token_len: int = 0,
+        lookup_label: str = "sync",
+    ) -> int:
+        profile_start = time.perf_counter()
+        skip_lookup_token_len = max(0, min(skip_lookup_token_len, token_len))
+        hex_start = time.perf_counter()
         hash_strs = [h.hex() for h in block_hashes]
-        hash_frames = self.encoder.encode(hash_strs)
+        hex_duration = time.perf_counter() - hex_start
+        encode_start = time.perf_counter()
+        hash_frames = encoder.encode(hash_strs)
+        encode_duration = time.perf_counter() - encode_start
+        frame_start = time.perf_counter()
         token_len_bytes = token_len.to_bytes(4, byteorder="big")
-        all_frames = [LOOKUP_MSG, token_len_bytes] + list(hash_frames)
-        self.socket.send_multipart(all_frames, copy=False)
-        resp = self.socket.recv()
+        skip_lookup_token_len_bytes = skip_lookup_token_len.to_bytes(
+            4,
+            byteorder="big",
+        )
+        all_frames = (
+            [LOOKUP_MSG, token_len_bytes, skip_lookup_token_len_bytes]
+            + list(hash_frames)
+        )
+        frame_duration = time.perf_counter() - frame_start
+        rpc_start = time.perf_counter()
+        socket.send_multipart(all_frames, copy=False)
+        resp = socket.recv()
+        rpc_duration = time.perf_counter() - rpc_start
+        parse_start = time.perf_counter()
         result = int.from_bytes(resp, "big")
+        parse_duration = time.perf_counter() - parse_start
+        logger.info(
+            "Mooncake lookup client profile: label=%s token_len=%d "
+            "skip_lookup_token_len=%d hashes=%d frames=%d result=%d "
+            "hex_ms=%.3f msgpack_encode_ms=%.3f frame_build_ms=%.3f "
+            "send_recv_ms=%.3f parse_ms=%.3f total_ms=%.3f",
+            lookup_label,
+            token_len,
+            skip_lookup_token_len,
+            len(block_hashes),
+            len(all_frames),
+            result,
+            hex_duration * 1000,
+            encode_duration * 1000,
+            frame_duration * 1000,
+            rpc_duration * 1000,
+            parse_duration * 1000,
+            (time.perf_counter() - profile_start) * 1000,
+        )
         return result
+
+    def _process_async_lookups(self) -> None:
+        socket = None
+        encoder = MsgpackEncoder()
+        try:
+            while True:
+                request = self._async_lookup_queue.get()
+                try:
+                    if request is None:
+                        return
+                    if socket is None:
+                        socket = make_zmq_socket(
+                            self.ctx,
+                            self.socket_path,
+                            zmq.REQ,  # type: ignore[attr-defined]
+                            bind=False,
+                        )
+                    self._lookup(
+                        socket,
+                        encoder,
+                        request.token_len,
+                        request.block_hashes,
+                        lookup_label="async_prefix",
+                    )
+                except Exception as e:
+                    logger.warning("Mooncake async lookup failed: %s", e)
+                    if socket is not None:
+                        socket.close(linger=0)
+                        socket = None
+                finally:
+                    self._async_lookup_queue.task_done()
+        finally:
+            if socket is not None:
+                socket.close(linger=0)
+
+    def lookup(
+        self,
+        token_len: int,
+        block_hashes: list[BlockHash],
+        skip_lookup_token_len: int = 0,
+        lookup_label: str = "sync",
+    ) -> int:
+        return self._lookup(
+            self.socket,
+            self.encoder,
+            token_len,
+            block_hashes,
+            skip_lookup_token_len,
+            lookup_label,
+        )
+
+    def lookup_async(self, token_len: int, block_hashes: list[BlockHash]) -> None:
+        if token_len <= 0 or not block_hashes:
+            return
+        with self._async_lookup_lock:
+            if self._async_lookup_closed:
+                return
+            self._async_lookup_queue.put_nowait(
+                _AsyncLookupRequest(token_len, list(block_hashes))
+            )
 
     def reset(self) -> bool:
         """Trigger ``store.remove_all(force=True)`` on worker rank 0.
@@ -1578,11 +1813,22 @@ class LookupKeyClient:
         holds naturally at the step boundary after weight updates and
         rollout drain. Returns True on ACK, False on NACK.
         """
+        self._async_lookup_queue.join()
         self.socket.send(RESET_MSG)
         resp = self.socket.recv()
         return bytes(resp) == RESP_OK
 
     def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        with self._async_lookup_lock:
+            if not self._async_lookup_closed:
+                self._async_lookup_closed = True
+                self._async_lookup_queue.put(None)
+        self._async_lookup_thread.join(timeout=1.0)
+        if self._async_lookup_thread.is_alive():
+            logger.warning("Mooncake async lookup thread did not exit cleanly.")
         self.socket.close(linger=0)
 
 

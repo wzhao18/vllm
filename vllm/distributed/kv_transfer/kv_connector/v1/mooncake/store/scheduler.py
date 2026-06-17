@@ -5,6 +5,7 @@
 # (vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/).
 """Scheduler-side logic for MooncakeStoreConnector."""
 
+import time
 from typing import Any
 
 from vllm.config import VllmConfig
@@ -22,7 +23,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker import (
 )
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+from vllm.v1.core.kv_cache_utils import BlockHash, resolve_kv_cache_block_sizes
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import Request
@@ -77,13 +78,80 @@ class MooncakeStoreScheduler:
         num_computed_tokens: int,
     ) -> tuple[int, bool]:
         """Check for external KV cache hit."""
+        profile_start = time.perf_counter()
         # Look up against the full prefill range, not just the prompt.
+        token_len_start = time.perf_counter()
         token_len = request.num_tokens // self._block_size * self._block_size
+        token_len_duration = time.perf_counter() - token_len_start
         if token_len < self._block_size:
+            logger.info(
+                "Mooncake get_num_new_matched_tokens profile: "
+                "reqid=%s total_tokens=%d block_hashes=%d "
+                "early_return=short_prompt token_len=%d token_len_ms=%.3f "
+                "total_ms=%.3f",
+                request.request_id,
+                request.num_tokens,
+                len(request.block_hashes),
+                token_len,
+                token_len_duration * 1000,
+                (time.perf_counter() - profile_start) * 1000,
+            )
             return 0, False
 
-        num_external_hit_tokens = self.client.lookup(token_len, request.block_hashes)
+        vllm_cached_tokens = min(
+            token_len,
+            num_computed_tokens // self._block_size * self._block_size,
+        )
+        vllm_cached_hashes: list[BlockHash] = []
+        if vllm_cached_tokens > 0:
+            num_cached_hashes = vllm_cached_tokens // self._hash_block_size
+            vllm_cached_hashes = request.block_hashes[:num_cached_hashes]
 
+        full_external_hit_tokens = 0
+        pruned_external_hit_tokens = 0
+        full_lookup_duration = 0.0
+        pruned_lookup_duration = 0.0
+        pruned_lookup_executed = False
+        if 0 < vllm_cached_tokens < token_len:
+            pruned_lookup_start = time.perf_counter()
+            pruned_external_hit_tokens = self.client.lookup(
+                token_len,
+                request.block_hashes,
+                skip_lookup_token_len=vllm_cached_tokens,
+                lookup_label="pruned_sync",
+            )
+            pruned_lookup_duration = time.perf_counter() - pruned_lookup_start
+            pruned_lookup_executed = True
+            num_external_hit_tokens = pruned_external_hit_tokens
+            full_lookup_start = time.perf_counter()
+            full_external_hit_tokens = self.client.lookup(
+                token_len,
+                request.block_hashes,
+                lookup_label="full_sync",
+            )
+            full_lookup_duration = time.perf_counter() - full_lookup_start
+            self.client.lookup_async(vllm_cached_tokens, vllm_cached_hashes)
+        elif vllm_cached_tokens >= token_len:
+            num_external_hit_tokens = vllm_cached_tokens
+            full_lookup_start = time.perf_counter()
+            full_external_hit_tokens = self.client.lookup(
+                token_len,
+                request.block_hashes,
+                lookup_label="full_sync",
+            )
+            full_lookup_duration = time.perf_counter() - full_lookup_start
+            self.client.lookup_async(vllm_cached_tokens, vllm_cached_hashes)
+        else:
+            full_lookup_start = time.perf_counter()
+            full_external_hit_tokens = self.client.lookup(
+                token_len,
+                request.block_hashes,
+                lookup_label="full_sync",
+            )
+            full_lookup_duration = time.perf_counter() - full_lookup_start
+            num_external_hit_tokens = full_external_hit_tokens
+
+        postprocess_start = time.perf_counter()
         if num_external_hit_tokens == request.num_tokens:
             # Leave a sub-block tail uncomputed for sampling, on a block
             # boundary so the recv-side load mask covers every yielded chunk.
@@ -96,6 +164,7 @@ class MooncakeStoreScheduler:
             need_to_allocate = 0
         else:
             need_to_allocate = num_external_hit_tokens - num_computed_tokens
+        postprocess_duration = time.perf_counter() - postprocess_start
 
         logger.debug(
             "Reqid: %s, Total tokens %d, kvpool hit tokens: %d, need to load: %d",
@@ -106,15 +175,76 @@ class MooncakeStoreScheduler:
         )
 
         if need_to_allocate <= 0:
+            logger.info(
+                "Mooncake get_num_new_matched_tokens profile: "
+                "reqid=%s total_tokens=%d computed_tokens=%d "
+                "vllm_cached_tokens=%d block_hashes=%d token_len=%d "
+                "full_external_hit_tokens=%d pruned_external_hit_tokens=%d "
+                "selected_external_hit_tokens=%d need_to_allocate=%d "
+                "load_async=%s pruned_lookup_executed=%s token_len_ms=%.3f "
+                "full_lookup_ms=%.3f pruned_lookup_ms=%.3f postprocess_ms=%.3f "
+                "load_spec_ms=0.000 total_ms=%.3f",
+                request.request_id,
+                request.num_tokens,
+                num_computed_tokens,
+                vllm_cached_tokens,
+                len(request.block_hashes),
+                token_len,
+                full_external_hit_tokens,
+                pruned_external_hit_tokens,
+                num_external_hit_tokens,
+                need_to_allocate,
+                False,
+                pruned_lookup_executed,
+                token_len_duration * 1000,
+                full_lookup_duration * 1000,
+                pruned_lookup_duration * 1000,
+                postprocess_duration * 1000,
+                (time.perf_counter() - profile_start) * 1000,
+            )
             return 0, False
 
+        load_spec_start = time.perf_counter()
         self.load_specs[request.request_id] = LoadSpec(
             vllm_cached_tokens=num_computed_tokens,
             kvpool_cached_tokens=num_external_hit_tokens,
             can_load=False,
         )
+        load_spec_duration = time.perf_counter() - load_spec_start
+
+        logger.info(
+            "Mooncake get_num_new_matched_tokens profile: "
+            "reqid=%s total_tokens=%d computed_tokens=%d "
+            "vllm_cached_tokens=%d block_hashes=%d token_len=%d "
+            "full_external_hit_tokens=%d pruned_external_hit_tokens=%d "
+            "selected_external_hit_tokens=%d need_to_allocate=%d "
+            "load_async=%s pruned_lookup_executed=%s token_len_ms=%.3f "
+            "full_lookup_ms=%.3f pruned_lookup_ms=%.3f postprocess_ms=%.3f "
+            "load_spec_ms=%.3f total_ms=%.3f",
+            request.request_id,
+            request.num_tokens,
+            num_computed_tokens,
+            vllm_cached_tokens,
+            len(request.block_hashes),
+            token_len,
+            full_external_hit_tokens,
+            pruned_external_hit_tokens,
+            num_external_hit_tokens,
+            need_to_allocate,
+            self.load_async,
+            pruned_lookup_executed,
+            token_len_duration * 1000,
+            full_lookup_duration * 1000,
+            pruned_lookup_duration * 1000,
+            postprocess_duration * 1000,
+            load_spec_duration * 1000,
+            (time.perf_counter() - profile_start) * 1000,
+        )
 
         return need_to_allocate, self.load_async
+
+    def close(self) -> None:
+        self.client.close()
 
     def update_state_after_alloc(
         self,
