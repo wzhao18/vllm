@@ -15,6 +15,11 @@ Wire format (REQ/REP over IPC):
           frame 3..n: msgpack-encoded list[str] of block-hash hex digests
         Response: [hit_count: u32 big-endian, 4 bytes]
 
+      msg_type == TOUCH_MSG:
+          frame 1: token_len (u32 big-endian, 4 bytes)
+          frame 2..n: msgpack-encoded list[str] of block-hash hex digests
+        Response: [RESP_OK] or [RESP_ERR]
+
       msg_type == RESET_MSG:
           (no payload frames)
         Response: [RESP_OK] or [RESP_ERR]
@@ -30,6 +35,7 @@ Mirrors the named-tag convention used by the NIXL connector (see
 
 # Request message-type tags. Frame 0 of every request.
 LOOKUP_MSG: bytes = b"lookup"
+TOUCH_MSG: bytes = b"touch"
 RESET_MSG: bytes = b"reset"
 
 # Single-byte response status codes for admin commands.

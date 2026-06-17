@@ -423,12 +423,12 @@ def test_lookup_key_client_lookup_prepends_typed_tag():
     client.close()
 
 
-def test_lookup_key_client_async_lookup_uses_background_socket():
-    """LookupKeyClient.lookup_async() sends LOOKUP_MSG off the critical path."""
+def test_lookup_key_client_async_lookup_uses_touch_background_socket():
+    """LookupKeyClient.lookup_async() sends TOUCH_MSG off the critical path."""
     vllm_config = _make_vllm_config()
     sync_socket = MagicMock()
     async_socket = MagicMock()
-    async_socket.recv.return_value = (0).to_bytes(4, "big")
+    async_socket.recv.return_value = protocol.RESP_OK
 
     with patch(
         "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store."
@@ -441,10 +441,19 @@ def test_lookup_key_client_async_lookup_uses_background_socket():
 
     client.close()
     sent_frames = async_socket.send_multipart.call_args[0][0]
-    assert sent_frames[0] == protocol.LOOKUP_MSG
+    assert sent_frames[0] == protocol.TOUCH_MSG
     assert int.from_bytes(sent_frames[1], "big") == 16
-    assert int.from_bytes(sent_frames[2], "big") == 0
     sync_socket.send_multipart.assert_not_called()
+
+
+def test_lookup_key_client_async_uses_separate_endpoint():
+    vllm_config = _make_vllm_config()
+    sync_path = worker.get_zmq_rpc_path_lookup(vllm_config)
+    async_path = worker.get_zmq_rpc_path_lookup_async(vllm_config)
+
+    assert sync_path != async_path
+    assert "lookup_rpc_port" in sync_path
+    assert "lookup_async_rpc_port" in async_path
 
 
 def test_store_worker_lookup_skips_local_prefix_remote_checks():
@@ -519,6 +528,60 @@ def test_store_worker_lookup_skips_local_prefix_remote_checks():
     }
 
 
+def test_store_worker_touch_refreshes_without_hit_compute():
+    """Touch refreshes candidate keys but skips longest-hit aggregation."""
+
+    class FakeCoord:
+        def lookup_mask(self, token_len):
+            return (None,)
+
+        def block_hashes_for_spec(self, block_hashes, spec):
+            return block_hashes
+
+        def find_longest_cache_hit(self, *args, **kwargs):
+            raise AssertionError("touch must not compute hit length")
+
+    class FakeStore:
+        def __init__(self):
+            self.keys = []
+
+        def batch_is_exist(self, keys):
+            self.keys = keys
+            return [1] * len(keys)
+
+    store_worker = object.__new__(worker.MooncakeStoreWorker)
+    store_worker.coord = FakeCoord()
+    store_worker.store = FakeStore()
+    store_worker.tp_size = 1
+    store_worker.num_kv_head = 1
+    store_worker.pp_size = 1
+    store_worker._kv_cache_groups = [SimpleNamespace(kv_cache_spec=object())]
+    store_worker.token_dbs = [
+        ChunkedTokenDatabase(
+            KeyMetadata(
+                model_name="model",
+                tp_rank=0,
+                pcp_rank=0,
+                dcp_rank=0,
+                pp_rank=0,
+            ),
+            block_size=16,
+            hash_block_size=16,
+        )
+    ]
+    store_worker._record_kv_connector_operation = MagicMock()
+
+    assert store_worker.touch(
+        token_len=32,
+        block_hashes=[BlockHash(b"h0"), BlockHash(b"h1")],
+    )
+    assert len(store_worker.store.keys) == 2
+    store_worker._record_kv_connector_operation.assert_called_once()
+    assert store_worker._record_kv_connector_operation.call_args.args[0] == (
+        "touch_exists"
+    )
+
+
 def test_lookup_key_client_reset_uses_typed_protocol():
     """LookupKeyClient.reset() sends RESET_MSG and parses RESP_OK / RESP_ERR."""
     vllm_config = _make_vllm_config()
@@ -544,8 +607,8 @@ def test_lookup_key_client_reset_uses_typed_protocol():
 
 def test_protocol_tags_are_distinct_and_non_empty():
     """Protocol tags must be unique and non-empty to avoid collision."""
-    tags = {protocol.LOOKUP_MSG, protocol.RESET_MSG}
-    assert len(tags) == 2
+    tags = {protocol.LOOKUP_MSG, protocol.TOUCH_MSG, protocol.RESET_MSG}
+    assert len(tags) == 3
     for tag in tags:
         assert isinstance(tag, bytes)
         assert len(tag) > 0

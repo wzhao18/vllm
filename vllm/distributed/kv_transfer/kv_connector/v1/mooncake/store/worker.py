@@ -55,6 +55,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.protocol import
     RESET_MSG,
     RESP_ERR,
     RESP_OK,
+    TOUCH_MSG,
 )
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_ip, make_zmq_socket
@@ -1371,25 +1372,14 @@ class MooncakeStoreWorker:
 
         return finished_sending
 
-    def lookup(
+    def _build_lookup_candidate_keys(
         self,
         token_len: int,
         block_hashes: list[BlockHash],
         skip_lookup_token_len: int = 0,
-    ) -> int:
-        """Check how many prefix tokens exist in the store.
-
-        Checks across all TP ranks and PP ranks. ``skip_lookup_token_len``
-        marks an already-local prefix that should count as present while
-        avoiding a blocking remote existence check for those keys.
-        """
-        if not block_hashes or token_len <= 0:
-            return 0
-
+    ) -> tuple[list[str], list[tuple[int, bytes]], set[tuple[int, bytes]], int]:
         skip_lookup_token_len = max(0, min(skip_lookup_token_len, token_len))
 
-        # Build per-(group, hash) candidate keys expanded across TP/PP.
-        # candidate_meta[i] is the (group_id, hash_bytes) for candidate_keys[i].
         candidate_keys: list[str] = []
         candidate_meta: list[tuple[int, bytes]] = []
         local_prefix_exists: set[tuple[int, bytes]] = set()
@@ -1417,6 +1407,32 @@ class MooncakeStoreWorker:
                         md = dataclasses.replace(db.metadata, tp_rank=tp, pp_rank=pp)
                         candidate_keys.append(PoolKey(md, h.hex()).to_string())
                         candidate_meta.append((g_idx, bytes(h)))
+        return candidate_keys, candidate_meta, local_prefix_exists, tp_count
+
+    def lookup(
+        self,
+        token_len: int,
+        block_hashes: list[BlockHash],
+        skip_lookup_token_len: int = 0,
+    ) -> int:
+        """Check how many prefix tokens exist in the store.
+
+        Checks across all TP ranks and PP ranks. ``skip_lookup_token_len``
+        marks an already-local prefix that should count as present while
+        avoiding a blocking remote existence check for those keys.
+        """
+        if not block_hashes or token_len <= 0:
+            return 0
+
+        # Build per-(group, hash) candidate keys expanded across TP/PP.
+        # candidate_meta[i] is the (group_id, hash_bytes) for candidate_keys[i].
+        candidate_keys, candidate_meta, local_prefix_exists, tp_count = (
+            self._build_lookup_candidate_keys(
+                token_len,
+                block_hashes,
+                skip_lookup_token_len,
+            )
+        )
 
         exists_set = set(local_prefix_exists)
         if not candidate_keys and not exists_set:
@@ -1457,6 +1473,42 @@ class MooncakeStoreWorker:
         )
         return hit_length
 
+    def touch(self, token_len: int, block_hashes: list[BlockHash]) -> bool:
+        """Refresh store LRU state for already-local prefix blocks.
+
+        This is intentionally cheaper than ``lookup``: it issues Mooncake
+        existence checks to refresh LRU state, but does not aggregate
+        TP/PP-complete hits or compute a longest prefix hit length.
+        """
+        if not block_hashes or token_len <= 0:
+            return True
+
+        candidate_keys, _candidate_meta, _local_prefix_exists, _tp_count = (
+            self._build_lookup_candidate_keys(token_len, block_hashes)
+        )
+        if not candidate_keys:
+            return True
+
+        touch_start = time.perf_counter()
+        try:
+            self.store.batch_is_exist(candidate_keys)
+            self._record_kv_connector_operation(
+                "touch_exists",
+                time.perf_counter() - touch_start,
+                len(candidate_keys),
+            )
+            return True
+        except Exception as e:
+            self._record_kv_connector_operation(
+                "touch_exists",
+                time.perf_counter() - touch_start,
+                len(candidate_keys),
+                status="error",
+                num_failed_keys=len(candidate_keys),
+            )
+            logger.error("Remote connection failed in touch: %s", e)
+            return False
+
     def get_kv_events(self) -> list[BlockStored]:
         if self.enable_kv_events and self.kv_send_thread is not None:
             return self.kv_send_thread.get_kv_events()
@@ -1485,13 +1537,16 @@ class MooncakeStoreWorker:
 
 
 class LookupKeyServer:
-    """ZMQ server on worker rank 0 for the LookupKey admin channel.
+    """ZMQ servers on worker rank 0 for LookupKey admin channels.
 
-    Handles two request types, tagged at frame 0:
+    The sync endpoint handles request types tagged at frame 0:
     - ``LOOKUP_MSG``: prefix-cache hit query, returns hit count.
     - ``RESET_MSG``: drains the send thread queue, then runs
       ``store.remove_all(force=True)``. Caller must have paused the
       scheduler first.
+
+    The async endpoint handles ``TOUCH_MSG`` only, so best-effort LRU
+    refreshes do not queue on the sync REP socket.
     """
 
     def __init__(
@@ -1499,7 +1554,8 @@ class LookupKeyServer:
         store_worker: MooncakeStoreWorker,
         vllm_config: VllmConfig,
     ):
-        self.decoder = MsgpackDecoder()
+        self.lookup_decoder = MsgpackDecoder()
+        self.touch_decoder = MsgpackDecoder()
         self.ctx = zmq.Context()  # type: ignore[attr-defined]
         socket_path = get_zmq_rpc_path_lookup(vllm_config)
         self._ipc_path = socket_path.removeprefix("ipc://")
@@ -1511,11 +1567,21 @@ class LookupKeyServer:
             zmq.REP,  # type: ignore[attr-defined]
             bind=True,
         )
+        async_socket_path = get_zmq_rpc_path_lookup_async(vllm_config)
+        self._async_ipc_path = async_socket_path.removeprefix("ipc://")
+        if os.path.exists(self._async_ipc_path):
+            os.unlink(self._async_ipc_path)
+        self.async_socket = make_zmq_socket(
+            self.ctx,
+            async_socket_path,
+            zmq.REP,  # type: ignore[attr-defined]
+            bind=True,
+        )
 
         self.store_worker = store_worker
         self.running = True
 
-        def process_request():
+        def process_lookup_request():
             while self.running:
                 all_frames = self.socket.recv_multipart(copy=False)
                 msg_type = bytes(all_frames[0])
@@ -1526,7 +1592,7 @@ class LookupKeyServer:
                         all_frames[2], byteorder="big"
                     )
                     hash_frames = all_frames[3:]
-                    hashes_str = self.decoder.decode(hash_frames)
+                    hashes_str = self.lookup_decoder.decode(hash_frames)
                     block_hashes = [BlockHash(bytes.fromhex(s)) for s in hashes_str]
                     result = self.store_worker.lookup(
                         token_len,
@@ -1557,13 +1623,39 @@ class LookupKeyServer:
                     )
                     self.socket.send(RESP_ERR)
 
-        self.thread = threading.Thread(target=process_request, daemon=True)
+        def process_touch_request():
+            while self.running:
+                all_frames = self.async_socket.recv_multipart(copy=False)
+                msg_type = bytes(all_frames[0])
+
+                if msg_type == TOUCH_MSG:
+                    token_len = int.from_bytes(all_frames[1], byteorder="big")
+                    hash_frames = all_frames[2:]
+                    hashes_str = self.touch_decoder.decode(hash_frames)
+                    block_hashes = [BlockHash(bytes.fromhex(s)) for s in hashes_str]
+                    ok = self.store_worker.touch(token_len, block_hashes)
+                    self.async_socket.send(RESP_OK if ok else RESP_ERR)
+
+                else:
+                    logger.warning(
+                        "LookupKeyServer async endpoint received unknown "
+                        "msg_type: %r",
+                        msg_type,
+                    )
+                    self.async_socket.send(RESP_ERR)
+
+        self.thread = threading.Thread(target=process_lookup_request, daemon=True)
         self.thread.start()
+        self.async_thread = threading.Thread(target=process_touch_request, daemon=True)
+        self.async_thread.start()
 
     def close(self):
         self.socket.close(linger=0)
+        self.async_socket.close(linger=0)
         if os.path.exists(self._ipc_path):
             os.unlink(self._ipc_path)
+        if os.path.exists(self._async_ipc_path):
+            os.unlink(self._async_ipc_path)
 
 
 # ============================================================
@@ -1583,6 +1675,7 @@ class LookupKeyClient:
         self.encoder = MsgpackEncoder()
         self.ctx = zmq.Context()  # type: ignore[attr-defined]
         self.socket_path = get_zmq_rpc_path_lookup(vllm_config)
+        self.async_socket_path = get_zmq_rpc_path_lookup_async(vllm_config)
         self.socket = make_zmq_socket(
             self.ctx,
             self.socket_path,
@@ -1627,6 +1720,21 @@ class LookupKeyClient:
         result = int.from_bytes(resp, "big")
         return result
 
+    @staticmethod
+    def _touch(
+        socket: Any,
+        encoder: MsgpackEncoder,
+        token_len: int,
+        block_hashes: list[BlockHash],
+    ) -> bool:
+        hash_strs = [h.hex() for h in block_hashes]
+        hash_frames = encoder.encode(hash_strs)
+        token_len_bytes = token_len.to_bytes(4, byteorder="big")
+        all_frames = [TOUCH_MSG, token_len_bytes] + list(hash_frames)
+        socket.send_multipart(all_frames, copy=False)
+        resp = socket.recv()
+        return bytes(resp) == RESP_OK
+
     def _process_async_lookups(self) -> None:
         socket = None
         encoder = MsgpackEncoder()
@@ -1639,18 +1747,18 @@ class LookupKeyClient:
                     if socket is None:
                         socket = make_zmq_socket(
                             self.ctx,
-                            self.socket_path,
+                            self.async_socket_path,
                             zmq.REQ,  # type: ignore[attr-defined]
                             bind=False,
                         )
-                    self._lookup(
+                    self._touch(
                         socket,
                         encoder,
                         request.token_len,
                         request.block_hashes,
                     )
                 except Exception as e:
-                    logger.warning("Mooncake async lookup failed: %s", e)
+                    logger.warning("Mooncake async touch failed: %s", e)
                     if socket is not None:
                         socket.close(linger=0)
                         socket = None
@@ -1724,4 +1832,21 @@ def get_zmq_rpc_path_lookup(vllm_config: VllmConfig) -> str:
     logger.debug("Base URL: %s, RPC Port: %s", base_url, rpc_port)
     return (
         f"ipc://{base_url}/lookup_rpc_port_{rpc_port}_host_{hostname}_dp_rank{dp_rank}"
+    )
+
+
+def get_zmq_rpc_path_lookup_async(vllm_config: VllmConfig) -> str:
+    """Construct IPC path for async lookup-touch socket."""
+    assert vllm_config.kv_transfer_config is not None
+    dp_rank = get_mooncake_dp_engine_index(vllm_config.parallel_config)
+    base_url = envs.VLLM_RPC_BASE_PATH
+    rpc_port = 0
+    hostname = socket.gethostname()
+    extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
+    if "lookup_rpc_port" in extra_config:
+        rpc_port = extra_config["lookup_rpc_port"]
+    logger.debug("Base URL: %s, Async RPC Port: %s", base_url, rpc_port)
+    return (
+        f"ipc://{base_url}/lookup_async_rpc_port_{rpc_port}_host_"
+        f"{hostname}_dp_rank{dp_rank}"
     )
