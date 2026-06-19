@@ -1204,6 +1204,7 @@ def _make_bare_worker(
         scheduler_block_size=block_size,
         hash_block_size=block_size,
     )
+    worker._init_lookup_key_prefixes()
     return worker
 
 
@@ -1211,6 +1212,29 @@ def test_lookup_partial_prefix_returns_first_hit_length():
     worker = _make_bare_worker()
     worker.store.batch_is_exist.return_value = [1, 1, 0]
     assert worker.lookup(48, [b"a0", b"a1", b"a2"]) == 32
+
+
+def test_lookup_expands_key_prefixes_across_tp_and_pp():
+    worker = _make_bare_worker()
+    worker.tp_size = 2
+    worker.num_kv_head = 2
+    worker.pp_size = 2
+    worker._init_lookup_key_prefixes()
+    worker.store.batch_is_exist.return_value = [1, 1, 1, 1, 1, 1, 0, 1]
+
+    assert worker.lookup(32, [b"a0", b"a1"]) == 16
+
+    keys = worker.store.batch_is_exist.call_args.args[0]
+    assert keys == [
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6130",
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:1@group:0@6130",
+        "test-model@tp_rank:1@pcp0@dcp0@pp_rank:0@group:0@6130",
+        "test-model@tp_rank:1@pcp0@dcp0@pp_rank:1@group:0@6130",
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6131",
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:1@group:0@6131",
+        "test-model@tp_rank:1@pcp0@dcp0@pp_rank:0@group:0@6131",
+        "test-model@tp_rank:1@pcp0@dcp0@pp_rank:1@group:0@6131",
+    ]
 
 
 def test_lookup_swa_single_group_returns_full_when_tail_window_present():
@@ -1271,6 +1295,7 @@ def test_lookup_checks_all_potential_swa_hit_boundaries():
         hash_block_size=8,
         retention_interval=0,
     )
+    worker._init_lookup_key_prefixes()
     # Candidate order: 3 full-attention chunks, then SWA chunks 3, 7, 11.
     # Only the first full chunk and the SWA chunk ending at token 32 exist, so
     # lookup should recover a 32-token external prefix hit. A sparse
