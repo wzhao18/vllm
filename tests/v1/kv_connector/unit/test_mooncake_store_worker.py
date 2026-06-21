@@ -22,6 +22,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import (
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import (
     worker as mooncake_store_worker,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator import (  # noqa: E501
+    StoreMaskRange,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
     BlobBlockHashes,
     ChunkedTokenDatabase,
@@ -33,7 +36,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.metrics import (
     MooncakeStoreConnectorStats,
 )
-from vllm.v1.core.kv_cache_utils import BlockHash
+from vllm.v1.core.kv_cache_utils import BlockHash, BlockHashListWithBlockSize
 
 
 def _default_send_coord() -> mooncake_store_worker.MooncakeStoreCoordinator:
@@ -53,6 +56,8 @@ def _make_store_sending_thread(
     coord: mooncake_store_worker.MooncakeStoreCoordinator | None = None,
     token_databases: list[ChunkedTokenDatabase] | None = None,
     block_size: int = 16,
+    tp_rank: int = 0,
+    put_step: int = 1,
     replicate_config: object | None = None,
 ) -> mooncake_store_worker.KVCacheStoreSendingThread:
     if coord is None:
@@ -67,8 +72,8 @@ def _make_store_sending_thread(
         token_databases=token_databases,
         block_size=block_size,
         coord=coord,
-        tp_rank=0,
-        put_step=1,
+        tp_rank=tp_rank,
+        put_step=put_step,
         kv_role="kv_producer",
         ready_event=threading.Event(),
         replicate_config=replicate_config,
@@ -389,6 +394,231 @@ def test_store_sending_thread_records_mooncake_metrics():
     assert len(stats.data["save_put"]) == 1
     assert stats.data["save_put"][0]["num_bytes"] == 512
     assert stats.data["save_put"][0]["status"] == "ok"
+
+
+def test_process_tokens_uses_mask_num_as_start_chunk(monkeypatch):
+    db = ChunkedTokenDatabase(
+        KeyMetadata("test-model", 0, 0, 0, 0),
+        block_size=32,
+        hash_block_size=8,
+    )
+    block_hashes = [bytes([i]) for i in range(16)]
+
+    accessed_chunks: list[int] = []
+    original_get_value_at = BlockHashListWithBlockSize._get_value_at
+
+    def spy_get_value_at(self, idx):
+        accessed_chunks.append(idx)
+        return original_get_value_at(self, idx)
+
+    monkeypatch.setattr(
+        BlockHashListWithBlockSize,
+        "_get_value_at",
+        spy_get_value_at,
+    )
+
+    results = list(
+        db.process_tokens(
+            token_len=96,
+            block_hashes=block_hashes,
+            mask_num=64,
+        )
+    )
+
+    assert accessed_chunks == [2]
+    assert [(start, end, key.chunk_hash) for start, end, key in results] == [
+        (64, 96, b"".join(block_hashes[8:12]).hex())
+    ]
+
+
+def test_process_token_hashes_applies_chunk_mask_before_hash_access(monkeypatch):
+    db = ChunkedTokenDatabase(
+        KeyMetadata("test-model", 0, 0, 0, 0),
+        block_size=32,
+        hash_block_size=8,
+    )
+    block_hashes = [bytes([i]) for i in range(16)]
+
+    accessed_chunks: list[int] = []
+    original_get_value_at = BlockHashListWithBlockSize._get_value_at
+
+    def spy_get_value_at(self, idx):
+        accessed_chunks.append(idx)
+        return original_get_value_at(self, idx)
+
+    monkeypatch.setattr(
+        BlockHashListWithBlockSize,
+        "_get_value_at",
+        spy_get_value_at,
+    )
+
+    results = list(
+        db.process_token_hashes(
+            token_len=128,
+            block_hashes=block_hashes,
+            mask_num=64,
+            chunk_mask=[False, True],
+        )
+    )
+
+    assert accessed_chunks == [3]
+    assert results == [(96, 128, b"".join(block_hashes[12:16]))]
+
+
+def test_process_token_hashes_applies_stride_before_hash_access(monkeypatch):
+    db = ChunkedTokenDatabase(
+        KeyMetadata("test-model", 0, 0, 0, 0),
+        block_size=32,
+        hash_block_size=8,
+    )
+    block_hashes = [bytes([i]) for i in range(16)]
+
+    accessed_chunks: list[int] = []
+    original_get_value_at = BlockHashListWithBlockSize._get_value_at
+
+    def spy_get_value_at(self, idx):
+        accessed_chunks.append(idx)
+        return original_get_value_at(self, idx)
+
+    monkeypatch.setattr(
+        BlockHashListWithBlockSize,
+        "_get_value_at",
+        spy_get_value_at,
+    )
+
+    results = list(
+        db.process_token_hashes(
+            token_len=128,
+            block_hashes=block_hashes,
+            mask_num=64,
+            candidate_index_start=0,
+            candidate_stride=2,
+            candidate_remainder=1,
+        )
+    )
+
+    assert accessed_chunks == [3]
+    assert results == [(96, 128, b"".join(block_hashes[12:16]))]
+
+
+def test_store_sending_thread_delta_saves_only_new_full_attention_chunks():
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.return_value = [256, 256]
+    thread = _make_store_sending_thread(store)
+
+    thread.add_stored_request("req-a")
+    thread._handle_request(
+        ReqMeta(
+            req_id="req-a",
+            token_len_chunk=64,
+            block_ids=([0, 1, 2, 3],),
+            block_hashes=[b"a0", b"a1", b"a2", b"a3"],
+            save_start_token=32,
+            can_save=True,
+        )
+    )
+
+    keys = store.batch_is_exist.call_args.args[0]
+    assert keys == [
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6132",
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6133",
+    ]
+    assert store.batch_put_from_multi_buffers.call_args.args[0] == keys
+
+
+def test_store_sending_thread_delta_preserves_put_step_striding_phase():
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.return_value = [256]
+    thread = _make_store_sending_thread(store, tp_rank=0, put_step=2)
+
+    thread.add_stored_request("req-a")
+    thread._handle_request(
+        ReqMeta(
+            req_id="req-a",
+            token_len_chunk=64,
+            block_ids=([0, 1, 2, 3],),
+            block_hashes=[b"a0", b"a1", b"a2", b"a3"],
+            save_start_token=16,
+            can_save=True,
+        )
+    )
+
+    keys = store.batch_is_exist.call_args.args[0]
+    assert keys == [
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6132",
+    ]
+    assert store.batch_put_from_multi_buffers.call_args.args[0] == keys
+
+
+def test_store_sending_thread_delta_saves_only_new_masked_chunks():
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.side_effect = (
+        lambda keys, addrs, sizes, replicate_config: [256] * len(keys)
+    )
+    coord = SimpleNamespace(
+        lcm_block_size=16,
+        store_mask=lambda token_len, num_prompt_tokens=None: (
+            None,
+            [True, False, True, False],
+        ),
+        store_mask_ranges=lambda token_len, start_token, num_prompt_tokens=None: (
+            StoreMaskRange(
+                start_chunk=2,
+                end_chunk=4,
+                mask=None,
+                prefix_candidate_count=2,
+                total_candidate_count=4,
+            ),
+            StoreMaskRange(
+                start_chunk=2,
+                end_chunk=4,
+                mask=[True, False],
+                prefix_candidate_count=1,
+                total_candidate_count=2,
+            ),
+        ),
+    )
+
+    db_full = ChunkedTokenDatabase(
+        KeyMetadata("test-model", 0, 0, 0, 0, group_id=0),
+        block_size=16,
+    )
+    db_full.set_kv_caches_base_addr([0x1000])
+    db_full.set_block_len([256])
+    db_masked = ChunkedTokenDatabase(
+        KeyMetadata("test-model", 0, 0, 0, 0, group_id=1),
+        block_size=16,
+    )
+    db_masked.set_kv_caches_base_addr([0x2000])
+    db_masked.set_block_len([256])
+
+    thread = _make_store_sending_thread(
+        store,
+        coord=coord,
+        token_databases=[db_full, db_masked],
+    )
+
+    thread.add_stored_request("req-a")
+    thread._handle_request(
+        ReqMeta(
+            req_id="req-a",
+            token_len_chunk=64,
+            block_ids=([0, 1, 2, 3], [0, 1, 2, 3]),
+            block_hashes=[b"a0", b"a1", b"a2", b"a3"],
+            save_start_token=32,
+            can_save=True,
+        )
+    )
+
+    keys = store.batch_is_exist.call_args.args[0]
+    full_hashes = [k.rsplit("@", 1)[-1] for k in keys if "@group:0" in k]
+    masked_hashes = [k.rsplit("@", 1)[-1] for k in keys if "@group:1" in k]
+
+    assert full_hashes == [b"a2".hex(), b"a3".hex()]
+    assert masked_hashes == [b"a2".hex()]
 
 
 def test_store_sending_thread_only_skips_on_no_available_handle():
@@ -1047,8 +1277,8 @@ def test_store_sending_thread_only_stores_swa_blocks_in_window():
 
     store = MagicMock()
     store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
-    store.batch_put_from_multi_buffers.side_effect = lambda keys, addrs, sizes: (
-        [256] * len(keys)
+    store.batch_put_from_multi_buffers.side_effect = (
+        lambda keys, addrs, sizes, replicate_config: [256] * len(keys)
     )
 
     full_spec = FullAttentionSpec(
@@ -1111,6 +1341,77 @@ def test_store_sending_thread_only_stores_swa_blocks_in_window():
     assert len(swa_keys) == 2
     swa_hashes = {k.rsplit("@", 1)[-1] for k in swa_keys}
     assert swa_hashes == {hs[3].hex(), hs[7].hex()}
+
+
+def test_store_sending_thread_delta_saves_only_new_swa_boundary_chunks():
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheGroupSpec,
+        SlidingWindowSpec,
+    )
+
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.side_effect = (
+        lambda keys, addrs, sizes, replicate_config: [256] * len(keys)
+    )
+
+    full_spec = FullAttentionSpec(
+        block_size=32, num_kv_heads=8, head_size=64, dtype=None
+    )
+    swa_spec = SlidingWindowSpec(
+        block_size=8,
+        num_kv_heads=8,
+        head_size=64,
+        dtype=None,
+        sliding_window=8,
+    )
+    coord = mooncake_store_worker.MooncakeStoreCoordinator(
+        [KVCacheGroupSpec(["L0"], full_spec), KVCacheGroupSpec(["L1"], swa_spec)],
+        scheduler_block_size=32,
+        hash_block_size=8,
+    )
+
+    db_full = ChunkedTokenDatabase(
+        KeyMetadata("test-model", 0, 0, 0, 0, group_id=0),
+        block_size=32,
+        hash_block_size=8,
+    )
+    db_full.set_kv_caches_base_addr([0x1000])
+    db_full.set_block_len([512])
+    db_swa = ChunkedTokenDatabase(
+        KeyMetadata("test-model", 0, 0, 0, 0, group_id=1),
+        block_size=8,
+        hash_block_size=8,
+    )
+    db_swa.set_kv_caches_base_addr([0x2000])
+    db_swa.set_block_len([128])
+
+    thread = _make_store_sending_thread(
+        store,
+        coord=coord,
+        token_databases=[db_full, db_swa],
+        block_size=32,
+    )
+
+    hs = [bytes([i + 1]) * 4 for i in range(8)]
+    thread.add_stored_request("r0")
+    thread._handle_request(
+        ReqMeta(
+            req_id="r0",
+            token_len_chunk=64,
+            block_ids=([0, 1], list(range(8))),
+            block_hashes=hs,
+            save_start_token=32,
+            can_save=True,
+        )
+    )
+
+    keys = store.batch_put_from_multi_buffers.call_args.args[0]
+    full_hashes = [k.rsplit("@", 1)[-1] for k in keys if "@group:0" in k]
+    swa_hashes = [k.rsplit("@", 1)[-1] for k in keys if "@group:1" in k]
+    assert full_hashes == ["".join(h.hex() for h in hs[4:8])]
+    assert swa_hashes == [hs[7].hex()]
 
 
 def test_store_sending_thread_kv_events_use_group_chunk_metadata():
