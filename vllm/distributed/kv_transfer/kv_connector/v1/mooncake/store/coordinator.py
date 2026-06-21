@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """External-store cache-hit coordinator for MooncakeStoreConnector."""
 
+from dataclasses import dataclass
 from typing import cast
 
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -18,9 +20,21 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheGroupSpec,
     KVCacheSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+
+
+@dataclass(frozen=True)
+class StoreMaskRange:
+    """Range-local store mask plus absolute candidate counts."""
+
+    start_chunk: int
+    end_chunk: int
+    mask: list[bool] | None
+    prefix_candidate_count: int
+    total_candidate_count: int
 
 
 class ExternalCachedBlockPool:
@@ -188,6 +202,25 @@ class MooncakeStoreCoordinator:
             num_prompt_tokens=num_prompt_tokens,
         )
 
+    def store_mask_ranges(
+        self,
+        aligned_token_len: int,
+        start_token: int,
+        num_prompt_tokens: int | None = None,
+    ) -> tuple[StoreMaskRange, ...]:
+        """Per-group store masks for the suffix starting at ``start_token``.
+
+        ``prefix_candidate_count`` and ``total_candidate_count`` are counts in
+        the full candidate stream. They let callers preserve absolute striding
+        without materializing the full prefix mask.
+        """
+        return self._reachable_mask_ranges(
+            aligned_token_len,
+            start_token,
+            retention_interval=self.retention_interval,
+            num_prompt_tokens=num_prompt_tokens,
+        )
+
     def lookup_mask(
         self,
         aligned_token_len: int,
@@ -234,6 +267,175 @@ class MooncakeStoreCoordinator:
                 assert len(mask) == num_chunks
             masks.append(mask)
         return tuple(masks)
+
+    def _reachable_mask_ranges(
+        self,
+        aligned_token_len: int,
+        start_token: int,
+        *,
+        retention_interval: int | None,
+        num_prompt_tokens: int | None,
+    ) -> tuple[StoreMaskRange, ...]:
+        assert aligned_token_len % self.lcm_block_size == 0, (
+            f"aligned_token_len ({aligned_token_len}) must be a multiple of "
+            f"lcm_block_size ({self.lcm_block_size})"
+        )
+        ranges: list[StoreMaskRange] = []
+        for g_idx, g in enumerate(self.kv_cache_groups):
+            spec = _unwrap_spec(g.kv_cache_spec)
+            end_chunk = aligned_token_len // spec.block_size
+            start_chunk = min(end_chunk, max(0, cdiv(start_token, spec.block_size)))
+            manager_cls = KVCacheSpecRegistry.get_manager_class(spec)
+            assert manager_cls is not None
+            use_eagle = g_idx in self.eagle_group_ids
+            mask = manager_cls.reachable_block_mask(
+                start_block=start_chunk,
+                end_block=end_chunk,
+                alignment_tokens=self.lcm_block_size,
+                kv_cache_spec=spec,
+                use_eagle=use_eagle,
+                retention_interval=retention_interval,
+                num_prompt_tokens=num_prompt_tokens,
+            )
+            if mask is not None:
+                assert len(mask) == end_chunk - start_chunk
+                suffix_candidate_count = sum(mask)
+            else:
+                suffix_candidate_count = end_chunk - start_chunk
+            prefix_candidate_count = self._count_reachable_blocks(
+                g_idx,
+                spec,
+                start_block=0,
+                end_block=start_chunk,
+                retention_interval=retention_interval,
+                num_prompt_tokens=num_prompt_tokens,
+            )
+            ranges.append(
+                StoreMaskRange(
+                    start_chunk=start_chunk,
+                    end_chunk=end_chunk,
+                    mask=mask,
+                    prefix_candidate_count=prefix_candidate_count,
+                    total_candidate_count=(
+                        prefix_candidate_count + suffix_candidate_count
+                    ),
+                )
+            )
+        return tuple(ranges)
+
+    def _count_reachable_blocks(
+        self,
+        group_idx: int,
+        spec: KVCacheSpec,
+        *,
+        start_block: int,
+        end_block: int,
+        retention_interval: int | None,
+        num_prompt_tokens: int | None,
+    ) -> int:
+        if start_block >= end_block:
+            return 0
+        use_eagle = group_idx in self.eagle_group_ids
+        if isinstance(spec, SlidingWindowSpec):
+            return self._count_sliding_window_reachable_blocks(
+                spec,
+                start_block=start_block,
+                end_block=end_block,
+                use_eagle=use_eagle,
+                retention_interval=retention_interval,
+                num_prompt_tokens=num_prompt_tokens,
+            )
+
+        manager_cls = KVCacheSpecRegistry.get_manager_class(spec)
+        assert manager_cls is not None
+        mask = manager_cls.reachable_block_mask(
+            start_block=start_block,
+            end_block=end_block,
+            alignment_tokens=self.lcm_block_size,
+            kv_cache_spec=spec,
+            use_eagle=use_eagle,
+            retention_interval=retention_interval,
+            num_prompt_tokens=num_prompt_tokens,
+        )
+        if mask is None:
+            return end_block - start_block
+        return sum(mask)
+
+    def _count_sliding_window_reachable_blocks(
+        self,
+        spec: SlidingWindowSpec,
+        *,
+        start_block: int,
+        end_block: int,
+        use_eagle: bool,
+        retention_interval: int | None,
+        num_prompt_tokens: int | None,
+    ) -> int:
+        assert self.lcm_block_size % spec.block_size == 0
+
+        block_size = spec.block_size
+        need = cdiv(spec.sliding_window - 1, block_size)
+        shift = 1 if use_eagle else 0
+        if use_eagle:
+            need += 1
+
+        segment_tokens = (
+            self.lcm_block_size
+            if retention_interval is None
+            else (None if retention_interval == 0 else retention_interval)
+        )
+        segment_count = 0
+        per_segment = 0
+        if segment_tokens is not None:
+            per_segment = segment_tokens // block_size
+            if need >= per_segment:
+                return end_block - start_block
+            segment_count = self._count_repeating_tail_blocks(
+                start_block,
+                end_block,
+                per_segment=per_segment,
+                need=need,
+                shift=shift,
+            )
+
+        if retention_interval is None or num_prompt_tokens is None:
+            return segment_count
+
+        latest = (num_prompt_tokens - 1) // self.lcm_block_size * self.lcm_block_size
+        prompt_end_block = latest // block_size + shift
+        replay_start = max(start_block, prompt_end_block - need)
+        replay_end = min(end_block, prompt_end_block)
+        if replay_start >= replay_end:
+            return segment_count
+
+        replay_count = replay_end - replay_start
+        if segment_tokens is not None:
+            replay_count -= self._count_repeating_tail_blocks(
+                replay_start,
+                replay_end,
+                per_segment=per_segment,
+                need=need,
+                shift=shift,
+            )
+        return segment_count + replay_count
+
+    @staticmethod
+    def _count_repeating_tail_blocks(
+        start_block: int,
+        end_block: int,
+        *,
+        per_segment: int,
+        need: int,
+        shift: int,
+    ) -> int:
+        def count_before(limit: int) -> int:
+            if limit <= shift:
+                return 0
+            shifted = limit - shift
+            full_segments, remainder = divmod(shifted, per_segment)
+            return full_segments * need + max(0, remainder - (per_segment - need))
+
+        return count_before(end_block) - count_before(start_block)
 
     def block_hashes_for_spec(
         self, block_hashes: list[BlockHash], spec: KVCacheSpec
