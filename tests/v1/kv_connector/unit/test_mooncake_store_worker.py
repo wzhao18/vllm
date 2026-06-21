@@ -36,7 +36,26 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.metrics import (
     MooncakeStoreConnectorStats,
 )
-from vllm.v1.core.kv_cache_utils import BlockHash, BlockHashListWithBlockSize
+from vllm.v1.core.kv_cache_utils import BlockHash
+
+
+class _RecordingBlockHashes:
+    def __init__(self, values: list[bytes]):
+        self.values = values
+        self.accessed: list[int] = []
+
+    def __len__(self):
+        return len(self.values)
+
+    def __getitem__(self, idx):
+        if isinstance(idx, slice):
+            return [self[i] for i in range(*idx.indices(len(self)))]
+        if idx < 0:
+            idx += len(self.values)
+        if not 0 <= idx < len(self.values):
+            raise IndexError(idx)
+        self.accessed.append(idx)
+        return self.values[idx]
 
 
 def _default_send_coord() -> mooncake_store_worker.MooncakeStoreCoordinator:
@@ -396,26 +415,13 @@ def test_store_sending_thread_records_mooncake_metrics():
     assert stats.data["save_put"][0]["status"] == "ok"
 
 
-def test_process_tokens_uses_mask_num_as_start_chunk(monkeypatch):
+def test_process_tokens_uses_mask_num_as_start_chunk():
     db = ChunkedTokenDatabase(
         KeyMetadata("test-model", 0, 0, 0, 0),
         block_size=32,
         hash_block_size=8,
     )
-    block_hashes = [bytes([i]) for i in range(16)]
-
-    accessed_chunks: list[int] = []
-    original_get_value_at = BlockHashListWithBlockSize._get_value_at
-
-    def spy_get_value_at(self, idx):
-        accessed_chunks.append(idx)
-        return original_get_value_at(self, idx)
-
-    monkeypatch.setattr(
-        BlockHashListWithBlockSize,
-        "_get_value_at",
-        spy_get_value_at,
-    )
+    block_hashes = _RecordingBlockHashes([bytes([i]) for i in range(16)])
 
     results = list(
         db.process_tokens(
@@ -425,32 +431,19 @@ def test_process_tokens_uses_mask_num_as_start_chunk(monkeypatch):
         )
     )
 
-    assert accessed_chunks == [2]
+    assert block_hashes.accessed == [11]
     assert [(start, end, key.chunk_hash) for start, end, key in results] == [
-        (64, 96, b"".join(block_hashes[8:12]).hex())
+        (64, 96, bytes([11]).hex())
     ]
 
 
-def test_process_token_hashes_applies_chunk_mask_before_hash_access(monkeypatch):
+def test_process_token_hashes_applies_chunk_mask_before_hash_access():
     db = ChunkedTokenDatabase(
         KeyMetadata("test-model", 0, 0, 0, 0),
         block_size=32,
         hash_block_size=8,
     )
-    block_hashes = [bytes([i]) for i in range(16)]
-
-    accessed_chunks: list[int] = []
-    original_get_value_at = BlockHashListWithBlockSize._get_value_at
-
-    def spy_get_value_at(self, idx):
-        accessed_chunks.append(idx)
-        return original_get_value_at(self, idx)
-
-    monkeypatch.setattr(
-        BlockHashListWithBlockSize,
-        "_get_value_at",
-        spy_get_value_at,
-    )
+    block_hashes = _RecordingBlockHashes([bytes([i]) for i in range(16)])
 
     results = list(
         db.process_token_hashes(
@@ -461,30 +454,17 @@ def test_process_token_hashes_applies_chunk_mask_before_hash_access(monkeypatch)
         )
     )
 
-    assert accessed_chunks == [3]
-    assert results == [(96, 128, b"".join(block_hashes[12:16]))]
+    assert block_hashes.accessed == [15]
+    assert results == [(96, 128, bytes([15]))]
 
 
-def test_process_token_hashes_applies_stride_before_hash_access(monkeypatch):
+def test_process_token_hashes_applies_stride_before_hash_access():
     db = ChunkedTokenDatabase(
         KeyMetadata("test-model", 0, 0, 0, 0),
         block_size=32,
         hash_block_size=8,
     )
-    block_hashes = [bytes([i]) for i in range(16)]
-
-    accessed_chunks: list[int] = []
-    original_get_value_at = BlockHashListWithBlockSize._get_value_at
-
-    def spy_get_value_at(self, idx):
-        accessed_chunks.append(idx)
-        return original_get_value_at(self, idx)
-
-    monkeypatch.setattr(
-        BlockHashListWithBlockSize,
-        "_get_value_at",
-        spy_get_value_at,
-    )
+    block_hashes = _RecordingBlockHashes([bytes([i]) for i in range(16)])
 
     results = list(
         db.process_token_hashes(
@@ -497,8 +477,8 @@ def test_process_token_hashes_applies_stride_before_hash_access(monkeypatch):
         )
     )
 
-    assert accessed_chunks == [3]
-    assert results == [(96, 128, b"".join(block_hashes[12:16]))]
+    assert block_hashes.accessed == [15]
+    assert results == [(96, 128, bytes([15]))]
 
 
 def test_store_sending_thread_delta_saves_only_new_full_attention_chunks():
@@ -1410,7 +1390,7 @@ def test_store_sending_thread_delta_saves_only_new_swa_boundary_chunks():
     keys = store.batch_put_from_multi_buffers.call_args.args[0]
     full_hashes = [k.rsplit("@", 1)[-1] for k in keys if "@group:0" in k]
     swa_hashes = [k.rsplit("@", 1)[-1] for k in keys if "@group:1" in k]
-    assert full_hashes == ["".join(h.hex() for h in hs[4:8])]
+    assert full_hashes == [hs[7].hex()]
     assert swa_hashes == [hs[7].hex()]
 
 

@@ -551,7 +551,6 @@ class KVCacheStoreSendingThread(KVTransferThread):
             rank_stride = self.tp_rank % self.put_step
             for g_idx, db in enumerate(self.token_databases):
                 mask_range = store_mask_ranges[g_idx]
-                key_prefix = PoolKey.build_prefix(db.metadata)
                 for start, end, block_hash in db.process_token_hashes(
                     token_len,
                     req_meta.block_hashes,
@@ -565,9 +564,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 ):
                     starts.append(start)
                     ends.append(end)
-                    keys.append(
-                        PoolKey.build_key_string(key_prefix, block_hash.hex())
-                    )
+                    keys.append(PoolKey(db.metadata, block_hash.hex()).to_string())
                     if self.enable_kv_event:
                         event_block_hashes.append(block_hash)
                     group_indices.append(g_idx)
