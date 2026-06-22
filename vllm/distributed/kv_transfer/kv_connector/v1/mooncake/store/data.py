@@ -203,7 +203,6 @@ class ChunkedTokenDatabase:
         mask_num: int = 0,
         *,
         chunk_mask: list[bool] | None = None,
-        put_step_index_start: int = 0,
         put_step: int = 1,
         put_step_rank: int = 0,
     ) -> Iterable[tuple[int, int, BlockHash]]:
@@ -220,8 +219,6 @@ class ChunkedTokenDatabase:
             mask_num: Number of tokens to skip from the beginning.
             chunk_mask: Optional mask relative to the first chunk after
                 ``mask_num``. False entries are skipped before hash access.
-            put_step_index_start: Logical chunk index where ``put_step``
-                filtering starts.
             put_step: Stride for filtering logical chunks before hash access.
             put_step_rank: Rank to keep within the ``put_step`` stride.
         """
@@ -235,7 +232,7 @@ class ChunkedTokenDatabase:
         max_chunks = min(len(chunk_hashes), cdiv(token_len, self.block_size))
         if chunk_mask is not None:
             max_chunks = min(max_chunks, start_chunk + len(chunk_mask))
-        put_step_index = put_step_index_start
+        put_step_index = 0
         for chunk_id in range(start_chunk, max_chunks):
             if chunk_mask is not None and not chunk_mask[chunk_id - start_chunk]:
                 continue

@@ -469,7 +469,6 @@ def test_process_tokens_applies_stride_before_hash_access():
             token_len=128,
             block_hashes=block_hashes,
             mask_num=64,
-            put_step_index_start=0,
             put_step=2,
             put_step_rank=1,
         )
@@ -505,7 +504,7 @@ def test_store_sending_thread_delta_saves_only_new_full_attention_chunks():
     assert store.batch_put_from_multi_buffers.call_args.args[0] == keys
 
 
-def test_store_sending_thread_delta_preserves_put_step_striding_phase():
+def test_store_sending_thread_delta_strides_with_local_phase():
     store = MagicMock()
     store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
     store.batch_put_from_multi_buffers.return_value = [256]
@@ -525,15 +524,16 @@ def test_store_sending_thread_delta_preserves_put_step_striding_phase():
 
     keys = store.batch_is_exist.call_args.args[0]
     assert keys == [
-        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6132",
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6131",
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6133",
     ]
     assert store.batch_put_from_multi_buffers.call_args.args[0] == keys
 
 
-def test_store_sending_thread_skipped_delta_advances_put_step_phase():
+def test_store_sending_thread_skipped_delta_does_not_advance_stride_phase():
     store = MagicMock()
     store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
-    store.batch_put_from_multi_buffers.return_value = [256]
+    store.batch_put_from_multi_buffers.return_value = [256, 256]
     thread = _make_store_sending_thread(store, tp_rank=0, put_step=2)
 
     thread._store_pressure_active = True
@@ -555,6 +555,32 @@ def test_store_sending_thread_skipped_delta_advances_put_step_phase():
 
     thread._store_pressure_active = False
     thread._skip_store_requests.clear()
+
+    thread.add_stored_request("req-a")
+    thread._handle_request(
+        ReqMeta(
+            req_id="req-a",
+            token_len_chunk=64,
+            block_ids=([0, 1, 2, 3],),
+            block_hashes=[b"a0", b"a1", b"a2", b"a3"],
+            save_start_token=16,
+            can_save=True,
+        )
+    )
+
+    keys = store.batch_is_exist.call_args.args[0]
+    assert keys == [
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6131",
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6133",
+    ]
+    assert store.batch_put_from_multi_buffers.call_args.args[0] == keys
+
+
+def test_store_sending_thread_delta_start_rank_saves_second_local_chunk():
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.return_value = [256]
+    thread = _make_store_sending_thread(store, tp_rank=1, put_step=2)
 
     thread.add_stored_request("req-a")
     thread._handle_request(
