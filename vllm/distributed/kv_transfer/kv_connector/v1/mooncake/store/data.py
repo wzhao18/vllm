@@ -170,9 +170,6 @@ class ChunkedTokenDatabase:
         self.kv_caches_base_addr: list[int] = []
         self.block_len: list[int] = []
 
-    def _make_key_by_hash(self, chunk_hash: str) -> PoolKey:
-        return PoolKey(self.metadata, chunk_hash)
-
     def set_kv_caches_base_addr(self, kv_caches_base_addr: list[int]):
         self.kv_caches_base_addr = kv_caches_base_addr
 
@@ -204,8 +201,16 @@ class ChunkedTokenDatabase:
         token_len: int,
         block_hashes: list[BlockHash],
         mask_num: int = 0,
-    ) -> Iterable[tuple[int, int, PoolKey]]:
-        """Process tokens and yield (start_idx, end_idx, pool_key) tuples.
+        *,
+        chunk_mask: list[bool] | None = None,
+        put_step_index_start: int = 0,
+        put_step: int = 1,
+        put_step_rank: int = 0,
+    ) -> Iterable[tuple[int, int, BlockHash]]:
+        """Process tokens and yield (start_idx, end_idx, block_hash) tuples.
+
+        When there are fewer KV heads than TP ranks, chunks are distributed
+        across TP ranks to avoid duplicate load/store.
 
         Args:
             token_len: Total number of tokens.
@@ -213,27 +218,14 @@ class ChunkedTokenDatabase:
                 When ``block_size > hash_block_size`` each group's ``block_size`` chunk
                 is keyed by its last sub-hash via ``chunk_hashes_for_block_size``.
             mask_num: Number of tokens to skip from the beginning.
+            chunk_mask: Optional mask relative to the first chunk after
+                ``mask_num``. False entries are skipped before hash access.
+            put_step_index_start: Logical chunk index where ``put_step``
+                filtering starts.
+            put_step: Stride for filtering logical chunks before hash access.
+            put_step_rank: Rank to keep within the ``put_step`` stride.
         """
-        for start_idx, end_idx, h in self.process_token_hashes(
-            token_len,
-            block_hashes,
-            mask_num,
-        ):
-            yield start_idx, end_idx, self._make_key_by_hash(h.hex())
-
-    def process_token_hashes(
-        self,
-        token_len: int,
-        block_hashes: list[BlockHash],
-        mask_num: int = 0,
-        *,
-        chunk_mask: list[bool] | None = None,
-        candidate_index_start: int = 0,
-        candidate_stride: int = 1,
-        candidate_remainder: int = 0,
-    ) -> Iterable[tuple[int, int, BlockHash]]:
-        """Process tokens and yield (start_idx, end_idx, block_hash) tuples."""
-        assert candidate_stride > 0
+        assert put_step > 0
         if not block_hashes:
             return
         chunk_hashes: Sequence[BlockHash] = chunk_hashes_for_block_size(
@@ -243,18 +235,18 @@ class ChunkedTokenDatabase:
         max_chunks = min(len(chunk_hashes), cdiv(token_len, self.block_size))
         if chunk_mask is not None:
             max_chunks = min(max_chunks, start_chunk + len(chunk_mask))
-        candidate_index = candidate_index_start
+        put_step_index = put_step_index_start
         for chunk_id in range(start_chunk, max_chunks):
             if chunk_mask is not None and not chunk_mask[chunk_id - start_chunk]:
                 continue
-            if candidate_index % candidate_stride != candidate_remainder:
-                candidate_index += 1
+            if put_step_index % put_step != put_step_rank:
+                put_step_index += 1
                 continue
             h = chunk_hashes[chunk_id]
             start_idx = chunk_id * self.block_size
             end_idx = min(start_idx + self.block_size, token_len)
             yield start_idx, end_idx, h
-            candidate_index += 1
+            put_step_index += 1
 
 
 @dataclass

@@ -474,7 +474,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         # Pause store requests when CPU/disk offloading is under pressure.
         self._store_pressure_active = False
         self._skip_store_requests: set[str] = set()
-        self._saved_candidate_state: dict[str, tuple[int, list[int]]] = {}
+        self._saved_store_chunk_state: dict[str, tuple[int, list[int]]] = {}
 
     def add_stored_request(self, req_id: str):
         with self.done_task_lock:
@@ -490,15 +490,15 @@ class KVCacheStoreSendingThread(KVTransferThread):
             if req_id in self.stored_requests:
                 del self.stored_requests[req_id]
             self._skip_store_requests.discard(req_id)
-            self._saved_candidate_state.pop(req_id, None)
+            self._saved_store_chunk_state.pop(req_id, None)
 
-    def _get_saved_candidate_counts(
+    def _get_saved_store_chunk_counts(
         self,
         req_id: str,
         save_start_token: int,
         num_prompt_tokens: int | None,
     ) -> list[int]:
-        saved_state = self._saved_candidate_state.get(req_id)
+        saved_state = self._saved_store_chunk_state.get(req_id)
         if saved_state is not None:
             saved_token, saved_counts = saved_state
             if saved_token == save_start_token:
@@ -513,16 +513,16 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 num_prompt_tokens=num_prompt_tokens,
             )
             counts = [
-                self._count_mask_candidates(mask_range)
+                self._count_store_chunks(mask_range)
                 for mask_range in prefix_ranges
             ]
 
-        self._saved_candidate_state[req_id] = (save_start_token, counts)
+        self._saved_store_chunk_state[req_id] = (save_start_token, counts)
         if saved_state is None:
             return counts
 
         logger.debug(
-            "Reconciled Mooncake store candidate state for request %s "
+            "Reconciled Mooncake store chunk state for request %s "
             "from token %d to %d",
             req_id,
             saved_state[0],
@@ -531,7 +531,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         return counts
 
     @staticmethod
-    def _count_mask_candidates(mask_range: StoreMaskRange) -> int:
+    def _count_store_chunks(mask_range: StoreMaskRange) -> int:
         if mask_range.mask is None:
             return mask_range.end_chunk - mask_range.start_chunk
         return sum(mask_range.mask)
@@ -582,15 +582,15 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 req_meta.save_start_token,
                 num_prompt_tokens=req_meta.num_prompt_tokens,
             )
-            saved_candidate_counts = self._get_saved_candidate_counts(
+            saved_store_chunk_counts = self._get_saved_store_chunk_counts(
                 req_id,
                 req_meta.save_start_token,
                 req_meta.num_prompt_tokens,
             )
-            next_candidate_counts = saved_candidate_counts.copy()
+            new_store_chunk_counts = saved_store_chunk_counts.copy()
             for g_idx, mask_range in enumerate(store_mask_ranges):
-                next_candidate_counts[g_idx] += self._count_mask_candidates(mask_range)
-            self._saved_candidate_state[req_id] = (token_len, next_candidate_counts)
+                new_store_chunk_counts[g_idx] += self._count_store_chunks(mask_range)
+            self._saved_store_chunk_state[req_id] = (token_len, new_store_chunk_counts)
 
             if self._should_skip_request(req_id):
                 logger.debug(
@@ -603,31 +603,31 @@ class KVCacheStoreSendingThread(KVTransferThread):
             starts: list[int] = []
             ends: list[int] = []
             keys: list[str] = []
-            event_block_hashes: list[BlockHash] = []
+            kv_event_block_hashes: list[BlockHash] = []
             group_indices: list[int] = []
-            candidate_offset = 0
-            rank_stride = self.tp_rank % self.put_step
+            store_chunk_offset = 0
+            put_step_rank = self.tp_rank % self.put_step
             for g_idx, db in enumerate(self.token_databases):
                 mask_range = store_mask_ranges[g_idx]
-                group_candidate_count = saved_candidate_counts[g_idx]
-                for start, end, block_hash in db.process_token_hashes(
+                group_store_chunk_count = saved_store_chunk_counts[g_idx]
+                for start, end, block_hash in db.process_tokens(
                     token_len,
                     req_meta.block_hashes,
                     mask_num=req_meta.save_start_token,
                     chunk_mask=mask_range.mask,
-                    candidate_index_start=(
-                        candidate_offset + group_candidate_count
+                    put_step_index_start=(
+                        store_chunk_offset + group_store_chunk_count
                     ),
-                    candidate_stride=self.put_step,
-                    candidate_remainder=rank_stride,
+                    put_step=self.put_step,
+                    put_step_rank=put_step_rank,
                 ):
                     starts.append(start)
                     ends.append(end)
                     keys.append(PoolKey(db.metadata, block_hash.hex()).to_string())
                     if self.enable_kv_event:
-                        event_block_hashes.append(block_hash)
+                        kv_event_block_hashes.append(block_hash)
                     group_indices.append(g_idx)
-                candidate_offset += next_candidate_counts[g_idx]
+                store_chunk_offset += new_store_chunk_counts[g_idx]
 
             if not keys:
                 return
@@ -662,18 +662,17 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 ends = [ends[i] for i in missing_indices]
                 keys = [keys[i] for i in missing_indices]
                 if self.enable_kv_event:
-                    event_block_hashes = [
-                        event_block_hashes[i] for i in missing_indices
+                    kv_event_block_hashes = [
+                        kv_event_block_hashes[i] for i in missing_indices
                     ]
                 group_indices = [group_indices[i] for i in missing_indices]
 
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    "Storing KV cache for %d blocks (groups=%s) for request %s",
-                    len(keys),
-                    set(group_indices),
-                    req_id,
-                )
+            logger.debug(
+                "Storing KV cache for %d blocks (groups=%s) for request %s",
+                len(keys),
+                set(group_indices),
+                req_id,
+            )
 
             addrs: list[list[int]] = []
             sizes: list[list[int]] = []
@@ -682,7 +681,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             if self.enable_kv_event:
                 prev_key_per_group: dict[int, Any] = {}
                 new_block_hashes = [
-                    maybe_convert_block_hash(bh) for bh in event_block_hashes
+                    maybe_convert_block_hash(bh) for bh in kv_event_block_hashes
                 ]
 
             for idx, (s, e, g_idx) in enumerate(
@@ -845,7 +844,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         block_id_list: list[int] = []
         for g_idx, db in enumerate(self.token_databases):
             mask = load_mask_per_group[g_idx]
-            for start, end, key in db.process_tokens(
+            for start, end, block_hash in db.process_tokens(
                 token_len, req_meta.block_hashes, mask_num
             ):
                 chunk_idx = start // db.block_size
@@ -854,7 +853,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 addr, size, block_id = db.prepare_value(
                     start, end, req_meta.block_ids[g_idx]
                 )
-                key_list.append(key.to_string())
+                key_list.append(PoolKey(db.metadata, block_hash.hex()).to_string())
                 addr_list.append(addr)
                 size_list.append(size)
                 block_id_list.append(block_id)

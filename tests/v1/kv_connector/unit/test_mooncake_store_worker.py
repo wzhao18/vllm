@@ -432,12 +432,10 @@ def test_process_tokens_uses_mask_num_as_start_chunk():
     )
 
     assert block_hashes.accessed == [11]
-    assert [(start, end, key.chunk_hash) for start, end, key in results] == [
-        (64, 96, bytes([11]).hex())
-    ]
+    assert results == [(64, 96, bytes([11]))]
 
 
-def test_process_token_hashes_applies_chunk_mask_before_hash_access():
+def test_process_tokens_applies_chunk_mask_before_hash_access():
     db = ChunkedTokenDatabase(
         KeyMetadata("test-model", 0, 0, 0, 0),
         block_size=32,
@@ -446,7 +444,7 @@ def test_process_token_hashes_applies_chunk_mask_before_hash_access():
     block_hashes = _RecordingBlockHashes([bytes([i]) for i in range(16)])
 
     results = list(
-        db.process_token_hashes(
+        db.process_tokens(
             token_len=128,
             block_hashes=block_hashes,
             mask_num=64,
@@ -458,7 +456,7 @@ def test_process_token_hashes_applies_chunk_mask_before_hash_access():
     assert results == [(96, 128, bytes([15]))]
 
 
-def test_process_token_hashes_applies_stride_before_hash_access():
+def test_process_tokens_applies_stride_before_hash_access():
     db = ChunkedTokenDatabase(
         KeyMetadata("test-model", 0, 0, 0, 0),
         block_size=32,
@@ -467,13 +465,13 @@ def test_process_token_hashes_applies_stride_before_hash_access():
     block_hashes = _RecordingBlockHashes([bytes([i]) for i in range(16)])
 
     results = list(
-        db.process_token_hashes(
+        db.process_tokens(
             token_len=128,
             block_hashes=block_hashes,
             mask_num=64,
-            candidate_index_start=0,
-            candidate_stride=2,
-            candidate_remainder=1,
+            put_step_index_start=0,
+            put_step=2,
+            put_step_rank=1,
         )
     )
 
@@ -1194,7 +1192,8 @@ def test_worker_put_striding_covers_every_rank_get_namespace(
         db = w.token_dbs[0]
         token_len = len(block_hashes) * db.block_size
         keys = [
-            key.to_string() for _, _, key in db.process_tokens(token_len, block_hashes)
+            PoolKey(db.metadata, block_hash.hex()).to_string()
+            for _, _, block_hash in db.process_tokens(token_len, block_hashes)
         ]
         assert len(keys) == len(block_hashes)
         # PUT side: mirrors KVCacheStoreSendingThread's striding slice.
