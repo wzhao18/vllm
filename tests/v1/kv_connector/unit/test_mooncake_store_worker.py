@@ -532,6 +532,51 @@ def test_store_sending_thread_delta_preserves_put_step_striding_phase():
     assert store.batch_put_from_multi_buffers.call_args.args[0] == keys
 
 
+def test_store_sending_thread_skipped_delta_advances_put_step_phase():
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.return_value = [256]
+    thread = _make_store_sending_thread(store, tp_rank=0, put_step=2)
+
+    thread._store_pressure_active = True
+    thread._skip_store_requests.add("req-a")
+
+    thread.add_stored_request("req-a")
+    thread._handle_request(
+        ReqMeta(
+            req_id="req-a",
+            token_len_chunk=16,
+            block_ids=([0],),
+            block_hashes=[b"a0"],
+            save_start_token=0,
+            can_save=True,
+        )
+    )
+
+    store.batch_is_exist.assert_not_called()
+
+    thread._store_pressure_active = False
+    thread._skip_store_requests.clear()
+
+    thread.add_stored_request("req-a")
+    thread._handle_request(
+        ReqMeta(
+            req_id="req-a",
+            token_len_chunk=64,
+            block_ids=([0, 1, 2, 3],),
+            block_hashes=[b"a0", b"a1", b"a2", b"a3"],
+            save_start_token=16,
+            can_save=True,
+        )
+    )
+
+    keys = store.batch_is_exist.call_args.args[0]
+    assert keys == [
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6132",
+    ]
+    assert store.batch_put_from_multi_buffers.call_args.args[0] == keys
+
+
 def test_store_sending_thread_delta_saves_only_new_masked_chunks():
     store = MagicMock()
     store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
@@ -549,15 +594,11 @@ def test_store_sending_thread_delta_saves_only_new_masked_chunks():
                 start_chunk=2,
                 end_chunk=4,
                 mask=None,
-                prefix_candidate_count=2,
-                total_candidate_count=4,
             ),
             StoreMaskRange(
                 start_chunk=2,
                 end_chunk=4,
                 mask=[True, False],
-                prefix_candidate_count=1,
-                total_candidate_count=2,
             ),
         ),
     )

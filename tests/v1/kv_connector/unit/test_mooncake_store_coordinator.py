@@ -369,7 +369,7 @@ def test_store_mask_retention_interval_keeps_segment_and_replay_tails():
     assert masks[1] == [i in (7, 11, 15) for i in range(16)]
 
 
-def test_store_mask_ranges_match_full_masks_and_counts():
+def test_store_mask_ranges_match_full_mask_suffixes():
     coord = _make_coord(_retention_groups(), hash_block_size=8, retention_interval=64)
     masks = coord.store_mask(128, num_prompt_tokens=100)
     ranges = coord.store_mask_ranges(128, start_token=64, num_prompt_tokens=100)
@@ -385,12 +385,8 @@ def test_store_mask_ranges_match_full_masks_and_counts():
         assert mask_range.end_chunk == end_chunk
         if mask is None:
             assert mask_range.mask is None
-            assert mask_range.prefix_candidate_count == start_chunk
-            assert mask_range.total_candidate_count == end_chunk
         else:
             assert mask_range.mask == mask[start_chunk:end_chunk]
-            assert mask_range.prefix_candidate_count == sum(mask[:start_chunk])
-            assert mask_range.total_candidate_count == sum(mask[:end_chunk])
 
 
 def test_store_mask_retention_prefix_stable_as_aligned_length_grows():

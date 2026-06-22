@@ -44,6 +44,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator import (  # noqa: E501
     ExternalCachedBlockPool,
     MooncakeStoreCoordinator,
+    StoreMaskRange,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  # noqa: E501
     BlobBlockHashes,
@@ -473,6 +474,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
         # Pause store requests when CPU/disk offloading is under pressure.
         self._store_pressure_active = False
         self._skip_store_requests: set[str] = set()
+        self._saved_candidate_counts: dict[str, list[int]] = {}
+        self._saved_candidate_tokens: dict[str, int] = {}
 
     def add_stored_request(self, req_id: str):
         with self.done_task_lock:
@@ -488,6 +491,60 @@ class KVCacheStoreSendingThread(KVTransferThread):
             if req_id in self.stored_requests:
                 del self.stored_requests[req_id]
             self._skip_store_requests.discard(req_id)
+            self._saved_candidate_counts.pop(req_id, None)
+            self._saved_candidate_tokens.pop(req_id, None)
+
+    def _get_saved_candidate_counts(
+        self,
+        req_id: str,
+        save_start_token: int,
+        num_prompt_tokens: int | None,
+    ) -> list[int]:
+        saved_token = self._saved_candidate_tokens.get(req_id)
+        if saved_token == save_start_token:
+            return self._saved_candidate_counts[req_id]
+
+        if save_start_token == 0:
+            counts = [0] * len(self.token_databases)
+        else:
+            prefix_ranges = self.coord.store_mask_ranges(
+                save_start_token,
+                0,
+                num_prompt_tokens=num_prompt_tokens,
+            )
+            counts = [
+                self._count_mask_candidates(mask_range)
+                for mask_range in prefix_ranges
+            ]
+
+        self._saved_candidate_counts[req_id] = counts
+        self._saved_candidate_tokens[req_id] = save_start_token
+        if saved_token is None:
+            return counts
+
+        logger.debug(
+            "Reconciled Mooncake store candidate state for request %s "
+            "from token %d to %d",
+            req_id,
+            saved_token,
+            save_start_token,
+        )
+        return counts
+
+    def _advance_saved_candidate_counts(
+        self,
+        req_id: str,
+        token_len: int,
+        counts: list[int],
+    ) -> None:
+        self._saved_candidate_counts[req_id] = counts
+        self._saved_candidate_tokens[req_id] = token_len
+
+    @staticmethod
+    def _count_mask_candidates(mask_range: StoreMaskRange) -> int:
+        if mask_range.mask is None:
+            return mask_range.end_chunk - mask_range.start_chunk
+        return sum(mask_range.mask)
 
     def _should_skip_request(self, req_id: str) -> bool:
         with self.done_task_lock:
@@ -527,13 +584,6 @@ class KVCacheStoreSendingThread(KVTransferThread):
         try:
             if token_len == 0:
                 return
-            if self._should_skip_request(req_id):
-                logger.debug(
-                    "Skipping Mooncake store for request %s while CPU/disk "
-                    "offloading is under pressure",
-                    req_id,
-                )
-                return
 
             # Within each lcm region only per-spec relevant chunks are loaded
             # (e.g., SWA or linear attn), so mask out irrelevant chunks
@@ -542,6 +592,28 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 req_meta.save_start_token,
                 num_prompt_tokens=req_meta.num_prompt_tokens,
             )
+            saved_candidate_counts = self._get_saved_candidate_counts(
+                req_id,
+                req_meta.save_start_token,
+                req_meta.num_prompt_tokens,
+            )
+            next_candidate_counts = saved_candidate_counts.copy()
+            for g_idx, mask_range in enumerate(store_mask_ranges):
+                next_candidate_counts[g_idx] += self._count_mask_candidates(mask_range)
+            self._advance_saved_candidate_counts(
+                req_id,
+                token_len,
+                next_candidate_counts,
+            )
+
+            if self._should_skip_request(req_id):
+                logger.debug(
+                    "Skipping Mooncake store for request %s while CPU/disk "
+                    "offloading is under pressure",
+                    req_id,
+                )
+                return
+
             starts: list[int] = []
             ends: list[int] = []
             keys: list[str] = []
@@ -551,13 +623,14 @@ class KVCacheStoreSendingThread(KVTransferThread):
             rank_stride = self.tp_rank % self.put_step
             for g_idx, db in enumerate(self.token_databases):
                 mask_range = store_mask_ranges[g_idx]
+                group_candidate_count = saved_candidate_counts[g_idx]
                 for start, end, block_hash in db.process_token_hashes(
                     token_len,
                     req_meta.block_hashes,
                     mask_num=req_meta.save_start_token,
                     chunk_mask=mask_range.mask,
                     candidate_index_start=(
-                        candidate_offset + mask_range.prefix_candidate_count
+                        candidate_offset + group_candidate_count
                     ),
                     candidate_stride=self.put_step,
                     candidate_remainder=rank_stride,
@@ -568,7 +641,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     if self.enable_kv_event:
                         event_block_hashes.append(block_hash)
                     group_indices.append(g_idx)
-                candidate_offset += mask_range.total_candidate_count
+                candidate_offset += next_candidate_counts[g_idx]
 
             if not keys:
                 return
