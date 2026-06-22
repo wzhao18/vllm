@@ -474,8 +474,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         # Pause store requests when CPU/disk offloading is under pressure.
         self._store_pressure_active = False
         self._skip_store_requests: set[str] = set()
-        self._saved_candidate_counts: dict[str, list[int]] = {}
-        self._saved_candidate_tokens: dict[str, int] = {}
+        self._saved_candidate_state: dict[str, tuple[int, list[int]]] = {}
 
     def add_stored_request(self, req_id: str):
         with self.done_task_lock:
@@ -491,8 +490,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             if req_id in self.stored_requests:
                 del self.stored_requests[req_id]
             self._skip_store_requests.discard(req_id)
-            self._saved_candidate_counts.pop(req_id, None)
-            self._saved_candidate_tokens.pop(req_id, None)
+            self._saved_candidate_state.pop(req_id, None)
 
     def _get_saved_candidate_counts(
         self,
@@ -500,9 +498,11 @@ class KVCacheStoreSendingThread(KVTransferThread):
         save_start_token: int,
         num_prompt_tokens: int | None,
     ) -> list[int]:
-        saved_token = self._saved_candidate_tokens.get(req_id)
-        if saved_token == save_start_token:
-            return self._saved_candidate_counts[req_id]
+        saved_state = self._saved_candidate_state.get(req_id)
+        if saved_state is not None:
+            saved_token, saved_counts = saved_state
+            if saved_token == save_start_token:
+                return saved_counts
 
         if save_start_token == 0:
             counts = [0] * len(self.token_databases)
@@ -517,28 +517,18 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 for mask_range in prefix_ranges
             ]
 
-        self._saved_candidate_counts[req_id] = counts
-        self._saved_candidate_tokens[req_id] = save_start_token
-        if saved_token is None:
+        self._saved_candidate_state[req_id] = (save_start_token, counts)
+        if saved_state is None:
             return counts
 
         logger.debug(
             "Reconciled Mooncake store candidate state for request %s "
             "from token %d to %d",
             req_id,
-            saved_token,
+            saved_state[0],
             save_start_token,
         )
         return counts
-
-    def _advance_saved_candidate_counts(
-        self,
-        req_id: str,
-        token_len: int,
-        counts: list[int],
-    ) -> None:
-        self._saved_candidate_counts[req_id] = counts
-        self._saved_candidate_tokens[req_id] = token_len
 
     @staticmethod
     def _count_mask_candidates(mask_range: StoreMaskRange) -> int:
@@ -600,11 +590,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             next_candidate_counts = saved_candidate_counts.copy()
             for g_idx, mask_range in enumerate(store_mask_ranges):
                 next_candidate_counts[g_idx] += self._count_mask_candidates(mask_range)
-            self._advance_saved_candidate_counts(
-                req_id,
-                token_len,
-                next_candidate_counts,
-            )
+            self._saved_candidate_state[req_id] = (token_len, next_candidate_counts)
 
             if self._should_skip_request(req_id):
                 logger.debug(

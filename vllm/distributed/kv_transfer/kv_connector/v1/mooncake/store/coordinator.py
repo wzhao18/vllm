@@ -242,29 +242,13 @@ class MooncakeStoreCoordinator:
         retention_interval: int | None,
         num_prompt_tokens: int | None,
     ) -> tuple[list[bool] | None, ...]:
-        assert aligned_token_len % self.lcm_block_size == 0, (
-            f"aligned_token_len ({aligned_token_len}) must be a multiple of "
-            f"lcm_block_size ({self.lcm_block_size})"
+        ranges = self._reachable_mask_ranges(
+            aligned_token_len,
+            0,
+            retention_interval=retention_interval,
+            num_prompt_tokens=num_prompt_tokens,
         )
-        masks: list[list[bool] | None] = []
-        for g_idx, g in enumerate(self.kv_cache_groups):
-            spec = _unwrap_spec(g.kv_cache_spec)
-            num_chunks = aligned_token_len // spec.block_size
-            manager_cls = KVCacheSpecRegistry.get_manager_class(spec)
-            assert manager_cls is not None
-            mask = manager_cls.reachable_block_mask(
-                start_block=0,
-                end_block=num_chunks,
-                alignment_tokens=self.lcm_block_size,
-                kv_cache_spec=spec,
-                use_eagle=g_idx in self.eagle_group_ids,
-                retention_interval=retention_interval,
-                num_prompt_tokens=num_prompt_tokens,
-            )
-            if mask is not None:
-                assert len(mask) == num_chunks
-            masks.append(mask)
-        return tuple(masks)
+        return tuple(mask_range.mask for mask_range in ranges)
 
     def _reachable_mask_ranges(
         self,

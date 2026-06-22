@@ -204,11 +204,6 @@ class ChunkedTokenDatabase:
         token_len: int,
         block_hashes: list[BlockHash],
         mask_num: int = 0,
-        *,
-        chunk_mask: list[bool] | None = None,
-        candidate_index_start: int = 0,
-        candidate_stride: int = 1,
-        candidate_remainder: int = 0,
     ) -> Iterable[tuple[int, int, PoolKey]]:
         """Process tokens and yield (start_idx, end_idx, pool_key) tuples.
 
@@ -218,22 +213,11 @@ class ChunkedTokenDatabase:
                 When ``block_size > hash_block_size`` each group's ``block_size`` chunk
                 is keyed by its last sub-hash via ``chunk_hashes_for_block_size``.
             mask_num: Number of tokens to skip from the beginning.
-            chunk_mask: Optional mask relative to the first chunk after
-                ``mask_num``. False entries are skipped before key construction.
-            candidate_index_start: Candidate index of the first unmasked chunk.
-            candidate_stride: Optional stride for filtering candidates before
-                hash access.
-            candidate_remainder: Remainder to keep when ``candidate_stride`` is
-                greater than one.
         """
         for start_idx, end_idx, h in self.process_token_hashes(
             token_len,
             block_hashes,
             mask_num,
-            chunk_mask=chunk_mask,
-            candidate_index_start=candidate_index_start,
-            candidate_stride=candidate_stride,
-            candidate_remainder=candidate_remainder,
         ):
             yield start_idx, end_idx, self._make_key_by_hash(h.hex())
 
