@@ -204,6 +204,12 @@ the vLLM JSON config.
 
 - `load_async` (bool): Enable asynchronous loading for better compute-I/O overlap. Default: `true`.
 - `lookup_async` (bool): Run the external prefix-cache lookup on a background thread so it never blocks the scheduler step. The request is held until the in-flight lookup completes, then resumed on a later step. Default: `false`.
+- `store_policy` (str): Store policy for producer-side KV writes.
+  `"write_through"` keeps the current per-request store behavior.
+  `"write_back"` asynchronously stores hashed GPU prefix-cache blocks when
+  allocation is about to reuse them, then retries allocation in a later
+  scheduler step. Default: `"write_through"`.
+- `write_back_max_blocks_per_step` (int): Maximum number of GPU prefix-cache blocks to enqueue for write-back in one scheduler step when `store_policy` is `"write_back"`. Default: `64`.
 - `enable_cross_layers_blocks` (bool): Enable cross-layer block packing for reduced store operations. Default: `false`.
 - `lookup_rpc_port` (int): Custom port for the ZMQ lookup RPC socket. Default: `0`.
 - `cache_prefix` (str): Namespace prepended to every store key. Lets separate deployments share one Mooncake master without polluting each other — instances configured with different prefixes never see each other's cached blocks, even for identical prompts. All instances that should share a prefix cache must use the same value. Default: `""` (no prefix; keys are byte-identical to the unprefixed format).

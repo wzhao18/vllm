@@ -571,6 +571,23 @@ class BlockPool:
                     self.metrics_collector.on_block_allocated(block)
         return ret
 
+    def peek_free_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
+        """Peek at the first free blocks without removing them."""
+        if num_blocks <= 0:
+            return []
+
+        ret: list[KVCacheBlock] = []
+        curr_block = self.free_block_queue.fake_free_list_head.next_free_block
+        tail = self.free_block_queue.fake_free_list_tail
+        while (
+            curr_block is not None
+            and curr_block is not tail
+            and len(ret) < num_blocks
+        ):
+            ret.append(curr_block)
+            curr_block = curr_block.next_free_block
+        return ret
+
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
         """
         If a block is cached in `cached_block_hash_to_block`, we reset its hash
@@ -633,6 +650,16 @@ class BlockPool:
         # Blocks without hash always get evicted first - prepend them last to the tail
         self.free_block_queue.prepend_n(blocks_without_hash)
         self.free_block_queue.append_n(blocks_with_hash)
+
+    def free_blocks_to_front(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
+        """Free blocks at the front of the free queue in the supplied order."""
+        blocks = []
+        for block in ordered_blocks:
+            block.ref_cnt -= 1
+            if block.ref_cnt == 0 and not block.is_null:
+                blocks.append(block)
+
+        self.free_block_queue.prepend_n(blocks)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.

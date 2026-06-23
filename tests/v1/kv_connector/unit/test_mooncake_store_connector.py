@@ -111,17 +111,21 @@ def test_worker_methods_delegate_to_store_worker():
     worker = mock_worker_cls.return_value
     worker.get_finished.return_value = ({"req-1"}, {"req-2"})
     worker.get_block_ids_with_load_errors.return_value = {3, 4}
+    worker.build_connector_worker_meta.return_value = MagicMock()
     connector.bind_connector_metadata(metadata)
 
     connector.register_kv_caches(kv_caches)
     result = connector.get_finished(finished_req_ids)
     invalid_block_ids = connector.get_block_ids_with_load_errors()
+    worker_meta = connector.build_connector_worker_meta()
 
     worker.register_kv_caches.assert_called_once_with(kv_caches)
     worker.get_finished.assert_called_once_with(finished_req_ids, metadata)
     assert result == ({"req-1"}, {"req-2"})
     worker.get_block_ids_with_load_errors.assert_called_once_with()
     assert invalid_block_ids == {3, 4}
+    worker.build_connector_worker_meta.assert_called_once_with()
+    assert worker_meta is worker.build_connector_worker_meta.return_value
 
 
 def test_get_kv_connector_kv_cache_events_returns_none_when_empty():
@@ -278,7 +282,7 @@ def test_update_connector_output_and_take_events():
         patch(
             "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store."
             "connector.MooncakeStoreScheduler"
-        ),
+        ) as mock_scheduler_cls,
     ):
         connector = mooncake_store_connector.MooncakeStoreConnector(
             vllm_config, KVConnectorRole.SCHEDULER, kv_cache_config
@@ -288,9 +292,32 @@ def test_update_connector_output_and_take_events():
     kv_events.add_events([event])
     connector.update_connector_output(KVConnectorOutput(kv_cache_events=kv_events))
 
+    mock_scheduler_cls.return_value.update_connector_output.assert_called_once()
     assert connector._kv_cache_events is kv_events
     assert list(connector.take_events()) == [event]
     assert connector._kv_cache_events is None
+
+
+def test_write_back_blocks_before_allocate_delegates_to_scheduler():
+    vllm_config = _make_vllm_config()
+    kv_cache_config = _make_kv_cache_config()
+
+    with (
+        set_current_vllm_config(vllm_config),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store."
+            "connector.MooncakeStoreScheduler"
+        ) as mock_scheduler_cls,
+    ):
+        connector = mooncake_store_connector.MooncakeStoreConnector(
+            vllm_config, KVConnectorRole.SCHEDULER, kv_cache_config
+        )
+
+    scheduler_mock = mock_scheduler_cls.return_value
+    scheduler_mock.write_back_blocks_before_allocate.return_value = True
+
+    assert connector.write_back_blocks_before_allocate(3) is True
+    scheduler_mock.write_back_blocks_before_allocate.assert_called_once_with(3)
 
 
 # ============================================================
@@ -410,11 +437,14 @@ def test_lookup_key_client_lookup_prepends_typed_tag():
 
     # Blocking lookup (non_block defaults to False) runs on the executor and
     # returns the resolved hit length.
-    assert client.lookup("req0", token_len=128, block_hashes=[]) == 5
+    assert (
+        client.lookup("req0", token_len=128, block_hashes=[], local_hit_tokens=64) == 5
+    )
 
     sent_frames = fake_socket.send_multipart.call_args[0][0]
     assert sent_frames[0] == protocol.LOOKUP_MSG
     assert int.from_bytes(sent_frames[1], "big") == 128
+    assert int.from_bytes(sent_frames[2], "big") == 64
 
 
 def test_lookup_key_client_reset_uses_typed_protocol():

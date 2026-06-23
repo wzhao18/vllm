@@ -13,12 +13,14 @@ import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
+    KVConnectorWorkerMetadata,
 )
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashListWithBlockSize,
+    BlockHashWithGroupId,
 )
 
 logger = init_logger(__name__)
@@ -211,6 +213,27 @@ class ChunkedTokenDatabase:
             size_list.append(size)
         return addr_list, size_list, block_id
 
+    def prepare_block_value(self, block_id: int) -> tuple[list[int], list[int]]:
+        """Compute memory addresses and sizes for one full KV block."""
+        addr_list = []
+        size_list = []
+        length = len(self.block_len)
+        for index, base_addr in enumerate(self.kv_caches_base_addr):
+            block_len = self.block_len[index % length]
+            addr_list.append(base_addr + block_id * block_len)
+            size_list.append(block_len)
+        return addr_list, size_list
+
+    def store_hash_from_block_hash(self, block_hash: BlockHash) -> BlockHash:
+        """Map a physical prefix-cache block hash to the Mooncake store key hash."""
+        if self.block_size == self.hash_block_size:
+            return block_hash
+        scale_factor = self.block_size // self.hash_block_size
+        hash_len, remainder = divmod(len(block_hash), scale_factor)
+        if hash_len == 0 or remainder != 0:
+            return block_hash
+        return BlockHash(block_hash[-hash_len:])
+
     def process_tokens(
         self,
         token_len: int,
@@ -388,6 +411,16 @@ class ReqMeta:
         )
 
 
+@dataclass
+class WriteBackStoreMeta:
+    """Metadata for storing evictable GPU prefix-cache blocks."""
+
+    event_id: int
+    block_ids: list[int]
+    block_hashes: list[BlockHashWithGroupId]
+    current_event: torch.cuda.Event | None = None
+
+
 class MooncakeStoreConnectorMetadata(KVConnectorMetadata):
     """Metadata passed from scheduler to worker."""
 
@@ -397,8 +430,28 @@ class MooncakeStoreConnectorMetadata(KVConnectorMetadata):
         preempted_req_ids: set[str],
     ):
         self.requests: list[ReqMeta] = []
+        self.write_back_stores: list[WriteBackStoreMeta] = []
         self.unfinished_request_ids = unfinished_request_ids
         self.preempted_req_ids = preempted_req_ids
 
     def add_request(self, req_meta: ReqMeta) -> None:
         self.requests.append(req_meta)
+
+    def add_write_back_store(self, store_meta: WriteBackStoreMeta) -> None:
+        self.write_back_stores.append(store_meta)
+
+
+@dataclass
+class MooncakeStoreWorkerMetadata(KVConnectorWorkerMetadata):
+    """Worker -> scheduler metadata for completed write-back store events."""
+
+    completed_write_back_events: dict[int, int]
+
+    def aggregate(
+        self, other: "KVConnectorWorkerMetadata"
+    ) -> "KVConnectorWorkerMetadata":
+        assert isinstance(other, MooncakeStoreWorkerMetadata)
+        merged = dict(self.completed_write_back_events)
+        for event_id, count in other.completed_write_back_events.items():
+            merged[event_id] = merged.get(event_id, 0) + count
+        return MooncakeStoreWorkerMetadata(completed_write_back_events=merged)

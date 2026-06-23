@@ -327,6 +327,18 @@ class Scheduler(SchedulerInterface):
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
 
+    def _maybe_defer_for_kv_write_back(self, num_blocks: int) -> bool:
+        if self.connector is None or num_blocks <= 0:
+            return False
+        write_back = getattr(
+            self.connector,
+            "write_back_blocks_before_allocate",
+            None,
+        )
+        if write_back is None:
+            return False
+        return bool(write_back(num_blocks))
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -521,15 +533,29 @@ class Scheduler(SchedulerInterface):
 
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
+                deferred_for_write_back = False
+
+                def pre_allocate_blocks(num_blocks: int) -> bool:
+                    nonlocal deferred_for_write_back
+                    deferred_for_write_back = (
+                        self._maybe_defer_for_kv_write_back(num_blocks)
+                    )
+                    return deferred_for_write_back
+
                 while True:
+                    deferred_for_write_back = False
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
                         num_lookahead_tokens=self.num_lookahead_tokens,
+                        pre_allocate_blocks=pre_allocate_blocks,
                     )
 
                     if new_blocks is not None:
                         # The request can be scheduled.
+                        break
+
+                    if deferred_for_write_back:
                         break
 
                     # The request cannot be scheduled.
@@ -882,6 +908,7 @@ class Scheduler(SchedulerInterface):
                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
                     reserved_blocks=reserved_blocks,
                     has_scheduled_reqs=bool(self.running),
+                    pre_allocate_blocks=self._maybe_defer_for_kv_write_back,
                 )
 
                 if new_blocks is None:

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
 
@@ -254,6 +254,7 @@ class KVCacheManager:
         full_sequence_must_fit: bool = False,
         reserved_blocks: int = 0,
         has_scheduled_reqs: bool = True,
+        pre_allocate_blocks: Callable[[int], bool] | None = None,
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -286,6 +287,9 @@ class KVCacheManager:
                 blocks an already in-flight (prefilling) sequence is relying on.
             has_scheduled_reqs: Whether any requests are already scheduled to run
                 this step, controls whether watermark is applied.
+            pre_allocate_blocks: Optional callback invoked after the number of
+                blocks to allocate is known but before new blocks are committed.
+                Returning True defers allocation to a later scheduler step.
 
         Blocks layout:
         ```
@@ -384,6 +388,12 @@ class KVCacheManager:
             )
             required_blocks = num_blocks_to_allocate + watermark_blocks
             if required_blocks > self.block_pool.get_num_free_blocks():
+                if (
+                    num_blocks_to_allocate > 0
+                    and pre_allocate_blocks is not None
+                    and pre_allocate_blocks(num_blocks_to_allocate)
+                ):
+                    return None
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -416,7 +426,20 @@ class KVCacheManager:
         available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
         required_blocks = num_blocks_to_allocate + watermark_blocks
         if required_blocks > available_blocks:
+            if (
+                num_blocks_to_allocate > 0
+                and pre_allocate_blocks is not None
+                and pre_allocate_blocks(num_blocks_to_allocate)
+            ):
+                return None
             # Cannot allocate new blocks
+            return None
+
+        if (
+            num_blocks_to_allocate > 0
+            and pre_allocate_blocks is not None
+            and pre_allocate_blocks(num_blocks_to_allocate)
+        ):
             return None
 
         if (

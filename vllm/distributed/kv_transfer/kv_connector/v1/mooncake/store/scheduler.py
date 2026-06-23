@@ -14,17 +14,27 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  # noqa: E501
     LoadSpec,
     MooncakeStoreConnectorMetadata,
+    MooncakeStoreWorkerMetadata,
     ReqMeta,
     RequestTracker,
+    WriteBackStoreMeta,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker import (  # noqa: E501
     LookupKeyClient,
 )
 from vllm.logger import init_logger
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+from vllm.v1.core.kv_cache_utils import (
+    BlockHashWithGroupId,
+    KVCacheBlock,
+    get_block_hash,
+    get_group_id,
+    resolve_kv_cache_block_sizes,
+)
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -57,12 +67,26 @@ class MooncakeStoreScheduler:
         kvc_extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
         self.load_async = kvc_extra_config.get("load_async", True)
         self.lookup_async = kvc_extra_config.get("lookup_async", False)
-        self.client = LookupKeyClient(vllm_config)
+        self.store_policy = str(
+            kvc_extra_config.get("store_policy", "write_through")
+        ).lower()
+        if self.store_policy not in ("write_through", "write_back"):
+            raise ValueError(
+                "MooncakeStoreConnector store_policy must be either "
+                "'write_through' or 'write_back', got "
+                f"{self.store_policy!r}"
+            )
+        self.write_back_max_blocks_per_step = int(
+            kvc_extra_config.get("write_back_max_blocks_per_step", 64)
+        )
+        if self.write_back_max_blocks_per_step < 0:
+            raise ValueError("write_back_max_blocks_per_step must be >= 0")
 
         # Align with the engine's own scheduler_block_size and hash_block_size.
         self._block_size, self._hash_block_size = resolve_kv_cache_block_sizes(
             kv_cache_config, vllm_config
         )
+        self.client = LookupKeyClient(vllm_config)
 
         # Per-request state
         self.load_specs: dict[str, LoadSpec] = {}  # to be loaded
@@ -70,6 +94,31 @@ class MooncakeStoreScheduler:
         self._preempted_req_ids: set[str] = set()  # preempted requests
         self._unfinished_requests: dict[str, tuple[Request, tuple[list[int], ...]]] = {}
         self._unfinished_request_ids: set[str] = set()
+
+        parallel_config = vllm_config.parallel_config
+        self._expected_worker_count = max(
+            1,
+            int(
+                getattr(
+                    parallel_config,
+                    "world_size",
+                    getattr(parallel_config, "pipeline_parallel_size", 1)
+                    * getattr(parallel_config, "tensor_parallel_size", 1),
+                )
+            ),
+        )
+        self._gpu_block_pool: BlockPool | None = None
+        self._write_back_event_counter = 0
+        self._write_back_events: dict[
+            int, tuple[list[int], list[BlockHashWithGroupId]]
+        ] = {}
+        self._write_back_pending_counts: dict[int, int] = {}
+        self._write_back_inflight_block_ids: set[int] = set()
+        self._write_back_completed_blocks: dict[int, set[BlockHashWithGroupId]] = {}
+        self._pending_write_back_stores: list[WriteBackStoreMeta] = []
+
+    def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
+        self._gpu_block_pool = gpu_block_pool
 
     def get_num_new_matched_tokens(
         self,
@@ -86,34 +135,35 @@ class MooncakeStoreScheduler:
         if token_len < self._block_size:
             return 0, False
 
-        num_external_hit_tokens = self.client.lookup(
+        num_kv_hit_tokens = self.client.lookup(
             request.request_id,
             token_len,
             request.block_hashes,
+            local_hit_tokens=num_computed_tokens,
             non_block=self.lookup_async,
         )
-        if num_external_hit_tokens is None:
+        if num_kv_hit_tokens is None:
             # Lookup not ready yet; scheduler will retry on a later step.
             return None, False
 
-        if num_external_hit_tokens == request.num_tokens:
+        if num_kv_hit_tokens == request.num_tokens:
             # Leave a sub-block tail uncomputed for sampling, on a block
             # boundary so the recv-side load mask covers every yielded chunk.
-            num_external_hit_tokens = max(
+            num_kv_hit_tokens = max(
                 0,
                 (request.num_tokens - 1) // self._block_size * self._block_size,
             )
 
-        if num_external_hit_tokens < num_computed_tokens:
+        if num_kv_hit_tokens < num_computed_tokens:
             need_to_allocate = 0
         else:
-            need_to_allocate = num_external_hit_tokens - num_computed_tokens
+            need_to_allocate = num_kv_hit_tokens - num_computed_tokens
 
         logger.debug(
             "Reqid: %s, Total tokens %d, kvpool hit tokens: %d, need to load: %d",
             request.request_id,
             request.num_tokens,
-            num_external_hit_tokens,
+            num_kv_hit_tokens,
             need_to_allocate,
         )
 
@@ -122,7 +172,7 @@ class MooncakeStoreScheduler:
 
         self.load_specs[request.request_id] = LoadSpec(
             vllm_cached_tokens=num_computed_tokens,
-            kvpool_cached_tokens=num_external_hit_tokens,
+            kvpool_cached_tokens=num_kv_hit_tokens,
             can_load=False,
         )
 
@@ -167,7 +217,9 @@ class MooncakeStoreScheduler:
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
         """Build connector metadata for this scheduler step."""
-        force_skip_save = self.kv_role == "kv_consumer"
+        force_skip_save = (
+            self.kv_role == "kv_consumer" or self.store_policy == "write_back"
+        )
 
         for finished_req_id in scheduler_output.finished_req_ids:
             self.client.discard(finished_req_id)
@@ -236,7 +288,7 @@ class MooncakeStoreScheduler:
 
         # Handle cached (running, or MRV1 resumed-from-preemption) requests
         cached_reqs = scheduler_output.scheduled_cached_reqs
-        if not force_skip_save:
+        if self.kv_role != "kv_consumer":
             for i, req_id in enumerate(cached_reqs.req_ids):
                 new_block_ids = cached_reqs.new_block_ids[i]
                 if not new_block_ids:
@@ -346,13 +398,105 @@ class MooncakeStoreScheduler:
                     request_tracker,
                     self._block_size,
                     load_spec=load_spec,
-                    skip_save=None,
+                    skip_save=force_skip_save,
                     block_hashes=unfinished_req.block_hashes,
                 )
                 if req_meta is not None:
                     meta.add_request(req_meta)
 
+        self._prepare_write_back_event(meta)
         return meta
+
+    def write_back_blocks_before_allocate(self, num_blocks: int) -> bool:
+        if (
+            self.store_policy != "write_back"
+            or self.kv_role == "kv_consumer"
+            or self.write_back_max_blocks_per_step == 0
+            or num_blocks <= 0
+        ):
+            return False
+
+        gpu_pool = self._gpu_block_pool
+        if gpu_pool is None:
+            return False
+
+        pending_block_ids = {
+            block_id
+            for store_meta in self._pending_write_back_stores
+            for block_id in store_meta.block_ids
+        }
+        pending_count = len(pending_block_ids)
+        remaining = self.write_back_max_blocks_per_step - pending_count
+        if remaining <= 0:
+            return bool(
+                self._pending_write_back_stores or self._write_back_inflight_block_ids
+            )
+
+        def needs_write_back(block_id: int, block_hash: BlockHashWithGroupId) -> bool:
+            return (
+                block_id not in self._write_back_inflight_block_ids
+                and block_hash
+                not in self._write_back_completed_blocks.get(block_id, set())
+            )
+
+        block_ids = []
+        block_hashes = []
+        selected_block_count = 0
+        for block in gpu_pool.peek_free_blocks(num_blocks):
+            hashes = [
+                block_hash
+                for block_hash in self._write_back_block_hashes(block)
+                if needs_write_back(block.block_id, block_hash)
+            ]
+            if not hashes:
+                continue
+            for block_hash in hashes:
+                block_ids.append(block.block_id)
+                block_hashes.append(block_hash)
+            selected_block_count += 1
+            if selected_block_count == remaining:
+                break
+
+        if not block_ids:
+            return bool(
+                self._pending_write_back_stores or self._write_back_inflight_block_ids
+            )
+
+        event_id = self._write_back_event_counter
+        self._write_back_event_counter += 1
+        self._write_back_events[event_id] = (block_ids, block_hashes)
+        pinned_block_ids = list(dict.fromkeys(block_ids))
+        self._write_back_inflight_block_ids.update(pinned_block_ids)
+        gpu_pool.touch([gpu_pool.blocks[block_id] for block_id in pinned_block_ids])
+        self._pending_write_back_stores.append(
+            WriteBackStoreMeta(
+                event_id=event_id,
+                block_ids=block_ids,
+                block_hashes=block_hashes,
+            )
+        )
+        return True
+
+    def _write_back_block_hashes(
+        self,
+        block: KVCacheBlock,
+    ) -> list[BlockHashWithGroupId]:
+        block_hash = block.block_hash
+        if block_hash is None or block.is_null or self._gpu_block_pool is None:
+            return []
+        block_hashes = {
+            block_hash,
+            *self._gpu_block_pool.cached_block_hashes_by_block.get(block.block_id, ()),
+        }
+        return sorted(
+            block_hashes,
+            key=lambda h: (get_group_id(h), bytes(get_block_hash(h))),
+        )
+
+    def _prepare_write_back_event(self, meta: MooncakeStoreConnectorMetadata) -> None:
+        for store_meta in self._pending_write_back_stores:
+            meta.add_write_back_store(store_meta)
+        self._pending_write_back_stores.clear()
 
     def request_finished(
         self,
@@ -360,7 +504,7 @@ class MooncakeStoreScheduler:
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
         """Determine whether to delay freeing blocks for async save."""
-        if self.kv_role == "kv_consumer":
+        if self.kv_role == "kv_consumer" or self.store_policy == "write_back":
             return False, None
         tracker = self._request_trackers.get(request.request_id)
         # Missing tracker can happen when the request is aborted before the
@@ -377,6 +521,36 @@ class MooncakeStoreScheduler:
                 request.request_id,
             )
         return delay_free_blocks, None
+
+    def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
+        worker_meta = connector_output.kv_connector_worker_meta
+        if not isinstance(worker_meta, MooncakeStoreWorkerMetadata):
+            return
+        for event_id, count in worker_meta.completed_write_back_events.items():
+            total = self._write_back_pending_counts.get(event_id, 0) + count
+            if total >= self._expected_worker_count:
+                self._write_back_pending_counts.pop(event_id, None)
+                self._process_write_back_event(event_id)
+            else:
+                self._write_back_pending_counts[event_id] = total
+
+    def _process_write_back_event(self, event_id: int) -> None:
+        event = self._write_back_events.pop(event_id, None)
+        if event is None:
+            return
+
+        block_ids, block_hashes = event
+        pinned_block_ids = list(dict.fromkeys(block_ids))
+        self._write_back_inflight_block_ids.difference_update(pinned_block_ids)
+        for block_id, block_hash in zip(block_ids, block_hashes, strict=True):
+            self._write_back_completed_blocks.setdefault(block_id, set()).add(
+                block_hash
+            )
+        if self._gpu_block_pool is None:
+            return
+        self._gpu_block_pool.free_blocks_to_front(
+            self._gpu_block_pool.blocks[block_id] for block_id in pinned_block_ids
+        )
 
     def reset_store(self) -> bool:
         """Trigger a global ``remove_all(force=True)`` on the Mooncake master.
@@ -397,6 +571,11 @@ class MooncakeStoreScheduler:
         try:
             ok = self.client.reset()
             if ok:
+                self._write_back_events.clear()
+                self._write_back_pending_counts.clear()
+                self._write_back_inflight_block_ids.clear()
+                self._write_back_completed_blocks.clear()
+                self._pending_write_back_stores.clear()
                 logger.info("Mooncake store reset via remove_all succeeded.")
             else:
                 logger.warning("Mooncake store reset returned NACK from worker.")

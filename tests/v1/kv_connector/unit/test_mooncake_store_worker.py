@@ -29,11 +29,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
     LoadSpec,
     PoolKey,
     ReqMeta,
+    WriteBackStoreMeta,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.metrics import (
     MooncakeStoreConnectorStats,
 )
-from vllm.v1.core.kv_cache_utils import BlockHash
+from vllm.v1.core.kv_cache_utils import BlockHash, make_block_hash_with_group_id
 
 
 class _RecordingBlockHashes:
@@ -652,6 +653,191 @@ def test_store_sending_thread_delta_saves_only_new_masked_chunks():
 
     assert full_hashes == [b"a2".hex(), b"a3".hex()]
     assert masked_hashes == [b"a2".hex()]
+
+
+def test_store_sending_thread_handles_write_back_block():
+    store = MagicMock()
+    store.batch_is_exist.return_value = [0]
+    store.batch_put_from_multi_buffers.return_value = [256]
+    thread = _make_store_sending_thread(store)
+
+    thread._handle_request(
+        WriteBackStoreMeta(
+            event_id=7,
+            block_ids=[2],
+            block_hashes=[make_block_hash_with_group_id(BlockHash(b"a0"), 0)],
+        )
+    )
+
+    expected_key = "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6130"
+    store.batch_is_exist.assert_called_once_with([expected_key])
+    keys, addrs, sizes, _ = store.batch_put_from_multi_buffers.call_args.args
+    assert keys == [expected_key]
+    assert addrs == [[0x1000 + 2 * 256]]
+    assert sizes == [[256]]
+    assert thread.get_and_clear_completed_write_back_events() == {7: 1}
+
+
+def test_store_sending_thread_write_back_uses_compact_store_hash():
+    store = MagicMock()
+    store.batch_is_exist.return_value = [0]
+    store.batch_put_from_multi_buffers.return_value = [512]
+    db = ChunkedTokenDatabase(
+        KeyMetadata("test-model", 0, 0, 0, 0),
+        block_size=32,
+        hash_block_size=16,
+    )
+    db.set_kv_caches_base_addr([0x1000])
+    db.set_block_len([512])
+    thread = _make_store_sending_thread(
+        store,
+        token_databases=[db],
+        block_size=32,
+    )
+
+    thread._handle_request(
+        WriteBackStoreMeta(
+            event_id=9,
+            block_ids=[2],
+            block_hashes=[make_block_hash_with_group_id(BlockHash(b"a0" + b"a1"), 0)],
+        )
+    )
+
+    expected_key = "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6131"
+    store.batch_is_exist.assert_called_once_with([expected_key])
+    keys, addrs, sizes, _ = store.batch_put_from_multi_buffers.call_args.args
+    assert keys == [expected_key]
+    assert addrs == [[0x1000 + 2 * 512]]
+    assert sizes == [[512]]
+    assert thread.get_and_clear_completed_write_back_events() == {9: 1}
+
+
+def test_store_sending_thread_stripes_write_back_by_put_step():
+    store = MagicMock()
+    thread = _make_store_sending_thread(store, tp_rank=1, put_step=2)
+
+    thread._handle_request(
+        WriteBackStoreMeta(
+            event_id=8,
+            block_ids=[2],
+            block_hashes=[make_block_hash_with_group_id(BlockHash(b"a0"), 0)],
+        )
+    )
+
+    store.batch_is_exist.assert_not_called()
+    store.batch_put_from_multi_buffers.assert_not_called()
+    assert thread.get_and_clear_completed_write_back_events() == {8: 1}
+
+
+def test_write_back_blocks_are_visible_to_lookup():
+    existing_keys: set[str] = set()
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [
+        1 if key in existing_keys else 0 for key in keys
+    ]
+
+    def put_keys(keys, addrs, sizes, replicate_config):
+        existing_keys.update(keys)
+        return [sum(size) for size in sizes]
+
+    store.batch_put_from_multi_buffers.side_effect = put_keys
+    worker = _make_bare_worker()
+    worker.store = store
+    worker.token_dbs[0].set_kv_caches_base_addr([0x1000])
+    worker.token_dbs[0].set_block_len([256])
+    send_thread = _make_store_sending_thread(
+        store,
+        coord=worker.coord,
+        token_databases=worker.token_dbs,
+    )
+    block_hashes = [BlockHash(b"a0"), BlockHash(b"a1"), BlockHash(b"a2")]
+
+    send_thread._handle_request(
+        WriteBackStoreMeta(
+            event_id=10,
+            block_ids=[1, 2, 3],
+            block_hashes=[
+                make_block_hash_with_group_id(block_hash, 0)
+                for block_hash in block_hashes
+            ],
+        )
+    )
+
+    assert worker.lookup(48, block_hashes) == 48
+    assert existing_keys == {
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6130",
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6131",
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6132",
+    }
+    assert send_thread.get_and_clear_completed_write_back_events() == {10: 1}
+
+
+def test_write_back_alias_blocks_are_visible_to_multi_group_lookup():
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
+
+    existing_keys: set[str] = set()
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [
+        1 if key in existing_keys else 0 for key in keys
+    ]
+
+    def put_keys(keys, addrs, sizes, replicate_config):
+        existing_keys.update(keys)
+        return [sum(size) for size in sizes]
+
+    store.batch_put_from_multi_buffers.side_effect = put_keys
+    worker = _make_bare_worker()
+    worker.store = store
+    spec = FullAttentionSpec(block_size=16, num_kv_heads=8, head_size=64, dtype=None)
+    worker._kv_cache_groups = [
+        KVCacheGroupSpec(["layer0"], spec),
+        KVCacheGroupSpec(["layer1"], spec),
+    ]
+    worker.token_dbs = [
+        ChunkedTokenDatabase(
+            KeyMetadata("test-model", 0, 0, 0, 0, group_id=0),
+            block_size=16,
+            hash_block_size=16,
+        ),
+        ChunkedTokenDatabase(
+            KeyMetadata("test-model", 0, 0, 0, 0, group_id=1),
+            block_size=16,
+            hash_block_size=16,
+        ),
+    ]
+    for db, base_addr in zip(worker.token_dbs, (0x1000, 0x2000), strict=True):
+        db.set_kv_caches_base_addr([base_addr])
+        db.set_block_len([256])
+    worker.coord = mooncake_store_worker.MooncakeStoreCoordinator(
+        worker._kv_cache_groups,
+        scheduler_block_size=16,
+        hash_block_size=16,
+    )
+    worker._init_lookup_key_prefixes()
+    send_thread = _make_store_sending_thread(
+        store,
+        coord=worker.coord,
+        token_databases=worker.token_dbs,
+    )
+
+    block_hash = BlockHash(b"a0")
+    send_thread._handle_request(
+        WriteBackStoreMeta(
+            event_id=11,
+            block_ids=[1, 1],
+            block_hashes=[
+                make_block_hash_with_group_id(block_hash, 0),
+                make_block_hash_with_group_id(block_hash, 1),
+            ],
+        )
+    )
+
+    assert worker.lookup(16, [block_hash]) == 16
+    assert existing_keys == {
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6130",
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:1@6130",
+    }
+    assert send_thread.get_and_clear_completed_write_back_events() == {11: 1}
 
 
 def test_store_sending_thread_only_skips_on_no_available_handle():
@@ -1622,6 +1808,24 @@ def test_lookup_partial_prefix_returns_first_hit_length():
     worker = _make_bare_worker()
     worker.store.batch_is_exist.return_value = [1, 1, 0]
     assert worker.lookup(48, [b"a0", b"a1", b"a2"]) == 32
+
+
+def test_lookup_unions_local_gpu_prefix_with_external_store():
+    worker = _make_bare_worker()
+    worker.store.batch_is_exist.return_value = [1, 1]
+
+    result = worker.lookup(
+        48,
+        [b"a0", b"a1", b"a2"],
+        local_hit_tokens=16,
+    )
+
+    assert result == 48
+    keys = worker.store.batch_is_exist.call_args.args[0]
+    assert keys == [
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6131",
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6132",
+    ]
 
 
 def test_lookup_swa_single_group_returns_full_when_tail_window_present():

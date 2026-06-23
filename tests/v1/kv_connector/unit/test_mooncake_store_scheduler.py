@@ -5,17 +5,24 @@ from types import SimpleNamespace
 
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
     LoadSpec,
+    MooncakeStoreConnectorMetadata,
+    MooncakeStoreWorkerMetadata,
     ReqMeta,
     RequestTracker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.scheduler import (
     MooncakeStoreScheduler,
 )
+from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_utils import BlockHash, make_block_hash_with_group_id
+from vllm.v1.outputs import KVConnectorOutput
 
 
 def _make_bare_scheduler() -> MooncakeStoreScheduler:
     scheduler = object.__new__(MooncakeStoreScheduler)
     scheduler.kv_role = "kv_both"
+    scheduler.store_policy = "write_through"
+    scheduler.write_back_max_blocks_per_step = 64
     scheduler.lookup_async = False
     scheduler._block_size = 16
     scheduler.load_specs = {}
@@ -23,7 +30,19 @@ def _make_bare_scheduler() -> MooncakeStoreScheduler:
     scheduler._unfinished_request_ids = {"req-0"}
     scheduler._unfinished_requests = {}
     scheduler._request_trackers = {}
+    scheduler._expected_worker_count = 1
+    scheduler._gpu_block_pool = None
+    scheduler._write_back_event_counter = 0
+    scheduler._write_back_events = {}
+    scheduler._write_back_pending_counts = {}
+    scheduler._write_back_inflight_block_ids = set()
+    scheduler._write_back_completed_blocks = {}
+    scheduler._pending_write_back_stores = []
     return scheduler
+
+
+def _set_block_hash(block, block_hash, *, num_tokens: int = 16) -> None:
+    block.set_block_hash(block_hash, num_tokens=num_tokens)
 
 
 def _make_scheduler_output(*, scheduled_spec_tokens: list[int] | None):
@@ -125,6 +144,185 @@ def test_cached_request_without_spec_decode_keeps_current_step_save_overlap():
     tracker = scheduler._request_trackers["req-0"]
     assert tracker.token_len == 48
     assert tracker.num_saved_tokens == 48
+
+
+def test_write_back_policy_skips_request_save_and_finish_delay():
+    scheduler = _make_bare_scheduler()
+    scheduler.store_policy = "write_back"
+    _add_unfinished_request(
+        scheduler,
+        token_ids=list(range(48)),
+        block_hashes=[b"h0", b"h1", b"h2"],
+        prefill_end_tokens=48,
+    )
+
+    meta = scheduler.build_connector_meta(
+        _make_scheduler_output(scheduled_spec_tokens=None)
+    )
+
+    assert meta.requests == []
+    assert meta.write_back_stores == []
+    tracker = scheduler._request_trackers["req-0"]
+    assert tracker.token_len == 48
+    assert tracker.num_saved_tokens == 32
+    request = SimpleNamespace(request_id="req-0")
+    assert scheduler.request_finished(request, ([0, 1, 2],)) == (False, None)
+
+
+def test_write_back_policy_does_not_scan_free_queue_on_metadata_build():
+    scheduler = _make_bare_scheduler()
+    scheduler.store_policy = "write_back"
+    gpu_block_pool = BlockPool(
+        num_gpu_blocks=4,
+        enable_caching=True,
+        hash_block_size=16,
+    )
+    scheduler.bind_gpu_block_pool(gpu_block_pool)
+    _set_block_hash(
+        gpu_block_pool.blocks[1],
+        make_block_hash_with_group_id(BlockHash(b"a0"), 0),
+    )
+
+    meta = MooncakeStoreConnectorMetadata(set(), set())
+    scheduler._prepare_write_back_event(meta)
+
+    assert meta.write_back_stores == []
+    assert gpu_block_pool.blocks[1].ref_cnt == 0
+
+
+def test_write_back_event_pins_and_releases_gpu_blocks():
+    scheduler = _make_bare_scheduler()
+    scheduler.store_policy = "write_back"
+    scheduler.write_back_max_blocks_per_step = 1
+    gpu_block_pool = BlockPool(
+        num_gpu_blocks=4,
+        enable_caching=True,
+        hash_block_size=16,
+    )
+    scheduler.bind_gpu_block_pool(gpu_block_pool)
+    block_hash = make_block_hash_with_group_id(BlockHash(b"a0"), 0)
+    _set_block_hash(gpu_block_pool.blocks[1], block_hash)
+
+    assert scheduler.write_back_blocks_before_allocate(1) is True
+    meta = MooncakeStoreConnectorMetadata(set(), set())
+    scheduler._prepare_write_back_event(meta)
+
+    assert len(meta.write_back_stores) == 1
+    store_meta = meta.write_back_stores[0]
+    assert store_meta.event_id == 0
+    assert store_meta.block_ids == [1]
+    assert store_meta.block_hashes == [block_hash]
+    assert gpu_block_pool.blocks[1].ref_cnt == 1
+    assert 1 in scheduler._write_back_inflight_block_ids
+
+    scheduler.update_connector_output(
+        KVConnectorOutput(kv_connector_worker_meta=MooncakeStoreWorkerMetadata({0: 1}))
+    )
+
+    assert gpu_block_pool.blocks[1].ref_cnt == 0
+    assert gpu_block_pool.free_block_queue.get_all_free_blocks()[0].block_id == 1
+    assert 1 not in scheduler._write_back_inflight_block_ids
+    assert scheduler._write_back_events == {}
+    assert scheduler._write_back_completed_blocks[1] == {block_hash}
+
+
+def test_completed_write_back_returns_to_allocator_reuse_order():
+    scheduler = _make_bare_scheduler()
+    scheduler.store_policy = "write_back"
+    scheduler.write_back_max_blocks_per_step = 1
+    gpu_block_pool = BlockPool(
+        num_gpu_blocks=5,
+        enable_caching=True,
+        hash_block_size=16,
+    )
+    scheduler.bind_gpu_block_pool(gpu_block_pool)
+    block_hashes = [
+        make_block_hash_with_group_id(BlockHash(b"a0"), 0),
+        make_block_hash_with_group_id(BlockHash(b"a1"), 0),
+        make_block_hash_with_group_id(BlockHash(b"a2"), 0),
+    ]
+    for block_id, block_hash in zip((1, 2, 3), block_hashes, strict=True):
+        _set_block_hash(gpu_block_pool.blocks[block_id], block_hash)
+
+    assert scheduler.write_back_blocks_before_allocate(1) is True
+    first_meta = MooncakeStoreConnectorMetadata(set(), set())
+    scheduler._prepare_write_back_event(first_meta)
+    assert first_meta.write_back_stores[0].block_ids == [1]
+
+    scheduler.update_connector_output(
+        KVConnectorOutput(kv_connector_worker_meta=MooncakeStoreWorkerMetadata({0: 1}))
+    )
+
+    assert gpu_block_pool.free_block_queue.get_all_free_blocks()[0].block_id == 1
+    assert scheduler.write_back_blocks_before_allocate(1) is False
+
+
+def test_write_back_includes_all_hash_aliases_for_reused_block():
+    scheduler = _make_bare_scheduler()
+    scheduler.store_policy = "write_back"
+    scheduler.write_back_max_blocks_per_step = 1
+    gpu_block_pool = BlockPool(
+        num_gpu_blocks=4,
+        enable_caching=True,
+        hash_block_size=16,
+    )
+    scheduler.bind_gpu_block_pool(gpu_block_pool)
+    primary_hash = make_block_hash_with_group_id(BlockHash(b"a0"), 0)
+    alias_hash = make_block_hash_with_group_id(BlockHash(b"a1"), 1)
+    _set_block_hash(gpu_block_pool.blocks[1], primary_hash)
+    gpu_block_pool.cached_block_hashes_by_block[1] = {alias_hash}
+
+    assert scheduler.write_back_blocks_before_allocate(1) is True
+    meta = MooncakeStoreConnectorMetadata(set(), set())
+    scheduler._prepare_write_back_event(meta)
+
+    assert meta.write_back_stores[0].block_ids == [1, 1]
+    assert meta.write_back_stores[0].block_hashes == [primary_hash, alias_hash]
+    assert gpu_block_pool.blocks[1].ref_cnt == 1
+
+    scheduler.update_connector_output(
+        KVConnectorOutput(kv_connector_worker_meta=MooncakeStoreWorkerMetadata({0: 1}))
+    )
+
+    assert gpu_block_pool.blocks[1].ref_cnt == 0
+    assert gpu_block_pool.free_block_queue.get_all_free_blocks()[0].block_id == 1
+    assert scheduler._write_back_completed_blocks[1] == {
+        primary_hash,
+        alias_hash,
+    }
+    assert scheduler.write_back_blocks_before_allocate(1) is False
+
+
+def test_write_back_skips_completed_same_hash_until_reused_with_new_hash():
+    scheduler = _make_bare_scheduler()
+    scheduler.store_policy = "write_back"
+    gpu_block_pool = BlockPool(
+        num_gpu_blocks=4,
+        enable_caching=True,
+        hash_block_size=16,
+    )
+    scheduler.bind_gpu_block_pool(gpu_block_pool)
+    old_hash = make_block_hash_with_group_id(BlockHash(b"a0"), 0)
+    _set_block_hash(gpu_block_pool.blocks[1], old_hash)
+
+    assert scheduler.write_back_blocks_before_allocate(1) is True
+    meta = MooncakeStoreConnectorMetadata(set(), set())
+    scheduler._prepare_write_back_event(meta)
+    scheduler.update_connector_output(
+        KVConnectorOutput(kv_connector_worker_meta=MooncakeStoreWorkerMetadata({0: 1}))
+    )
+
+    assert scheduler.write_back_blocks_before_allocate(3) is False
+
+    new_hash = make_block_hash_with_group_id(BlockHash(b"a1"), 0)
+    gpu_block_pool.blocks[1].reset_hash()
+    _set_block_hash(gpu_block_pool.blocks[1], new_hash)
+
+    assert scheduler.write_back_blocks_before_allocate(3) is True
+    meta = MooncakeStoreConnectorMetadata(set(), set())
+    scheduler._prepare_write_back_event(meta)
+    assert meta.write_back_stores[0].block_ids == [1]
+    assert meta.write_back_stores[0].block_hashes == [new_hash]
 
 
 def test_preemption_resets_tracker_before_request_finished():
@@ -405,14 +603,17 @@ def test_from_request_tracker_no_load_saves_normally():
 class _StubLookupClient:
     def __init__(self, hit_tokens: int) -> None:
         self._hit_tokens = hit_tokens
+        self.local_hit_tokens: int | None = None
 
     def lookup(
         self,
         req_id: str,
         token_len: int,
         block_hashes: list[bytes],
+        local_hit_tokens: int = 0,
         non_block: bool = False,
     ) -> int:
+        self.local_hit_tokens = local_hit_tokens
         return self._hit_tokens
 
 
@@ -441,6 +642,7 @@ def test_full_external_hit_keeps_kvpool_cached_tokens_block_aligned():
     # sub-block tail for sampling. 32 - 16 (local) == 16 to load.
     assert need_to_allocate == 16
     assert load_async is True
+    assert scheduler.client.local_hit_tokens == 16
     load_spec = scheduler.load_specs["req-0"]
     assert load_spec.vllm_cached_tokens == 16
     assert load_spec.kvpool_cached_tokens == 32

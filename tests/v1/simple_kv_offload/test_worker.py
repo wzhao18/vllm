@@ -1,33 +1,39 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Worker-side unit tests for SimpleCPUOffloadConnector.
-
-Covers the GPU->CPU store cross-stream synchronization: the store copy must be
-ordered after the compute stream that writes the KV blocks, otherwise it can
-read partially written / stale blocks and silently corrupt the CPU cache.
-"""
+"""Worker-side unit tests for SimpleCPUOffloadConnector."""
 
 from __future__ import annotations
 
 import time
+from typing import Any
 
 import pytest
 import torch
 
 from vllm.platforms import current_platform
-
-if not current_platform.is_cuda_alike():
-    pytest.skip("Requires CUDA or ROCm", allow_module_level=True)
-
-from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend
-from vllm.v1.simple_kv_offload.cuda_mem_ops import (
-    CU_MEMCPY_SRC_ACCESS_ORDER_ANY,
-    CU_MEMCPY_SRC_ACCESS_ORDER_STREAM,
-    build_params,
-    pin_tensor,
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    KVCacheTensor,
 )
-from vllm.v1.simple_kv_offload.metadata import SimpleCPUOffloadMetadata
+from vllm.v1.simple_kv_offload import worker as worker_module
 from vllm.v1.simple_kv_offload.worker import SimpleCPUOffloadWorker
+
+if current_platform.is_cuda_alike():
+    from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend
+    from vllm.v1.simple_kv_offload.cuda_mem_ops import (
+        CU_MEMCPY_SRC_ACCESS_ORDER_ANY,
+        CU_MEMCPY_SRC_ACCESS_ORDER_STREAM,
+        build_params,
+        pin_tensor,
+    )
+    from vllm.v1.simple_kv_offload.metadata import SimpleCPUOffloadMetadata
+
+requires_cuda = pytest.mark.skipif(
+    not current_platform.is_cuda_alike(),
+    reason="Requires CUDA or ROCm",
+)
 
 NUM_BLOCKS = 64
 BLOCK_BYTES = 4096
@@ -62,8 +68,8 @@ def _drive_store(
 ) -> int:
     """Run ITERS store cycles; return how many landed corrupted in the CPU pool.
 
-    Each cycle writes a unique value on a compute stream (after a deliberate
-    delay) and then issues the GPU->CPU store. The store is issued *after* the
+    Each cycle writes a unique value on a compute stream after a deliberate
+    delay and then issues the GPU-to-CPU store. The store is issued after the
     write in host program order, mirroring the connector's deferred-store
     assumption. Only the compute-done event creates a real device-side
     happens-before edge.
@@ -72,7 +78,7 @@ def _drive_store(
     compute_stream = torch.cuda.Stream()
     corrupt = 0
     for it in range(ITERS):
-        val = (it % 126) + 1  # 1..126; distinct from the zero-initialized pool
+        val = (it % 126) + 1
         with torch.cuda.stream(compute_stream):
             torch.cuda._sleep(SLEEP_CYCLES)
             gpu.fill_(val)
@@ -103,13 +109,9 @@ def _drive_store(
     return corrupt
 
 
+@requires_cuda
 def test_store_orders_after_compute_write():
-    """The store must wait for the compute event; without it, it races.
-
-    Asserts both directions so the test is self-validating: the no-barrier
-    control must actually corrupt (proving the race window is exercised), and
-    the fixed path with the compute-done event must be clean.
-    """
+    """The store must wait for the compute event; without it, it races."""
     backend, gpu, cpu = _make_backend()
     try:
         control = _drive_store(backend, gpu, cpu, with_barrier=False)
@@ -142,6 +144,7 @@ class _RecordingBackend:
         self.calls.append({"is_store": is_store, "wait_event": wait_event})
 
 
+@requires_cuda
 def test_get_finished_passes_wait_event_for_store_only():
     """get_finished gates stores on a compute-done event but not loads."""
     worker = SimpleCPUOffloadWorker(
@@ -168,6 +171,7 @@ def test_get_finished_passes_wait_event_for_store_only():
     assert load_calls[0]["wait_event"] is None
 
 
+@requires_cuda
 def test_build_params_src_access_order():
     """build_params defaults to ANY and honors an explicit STREAM override."""
     gpu = {"k": torch.zeros((4, 64), dtype=torch.int8, device="cuda")}
@@ -181,3 +185,77 @@ def test_build_params_src_access_order():
         gpu, cpu, stream, src_access_order=CU_MEMCPY_SRC_ACCESS_ORDER_STREAM
     )
     assert ordered.attrs.srcAccessOrder == CU_MEMCPY_SRC_ACCESS_ORDER_STREAM
+
+
+class _FakeBackend:
+    def __init__(self) -> None:
+        self.init_args: tuple[Any, ...] | None = None
+
+    def init(self, *args) -> None:
+        self.init_args = args
+
+
+class _FakeStream:
+    cuda_stream = 0
+
+    def __init__(self, priority: int = 0) -> None:
+        self.priority = priority
+
+    @staticmethod
+    def priority_range() -> tuple[int, int]:
+        return 0, 0
+
+
+def test_worker_deduplicates_shared_storage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    num_blocks = 4
+    shared = torch.zeros((num_blocks, 8), dtype=torch.int8)
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=shared.numel() * shared.element_size(),
+                shared_by=["layer_a", "layer_b"],
+            )
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer_a"],
+                FullAttentionSpec(
+                    block_size=16,
+                    num_kv_heads=1,
+                    head_size=4,
+                    dtype=torch.float16,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["layer_b"],
+                FullAttentionSpec(
+                    block_size=16,
+                    num_kv_heads=1,
+                    head_size=4,
+                    dtype=torch.float16,
+                ),
+            ),
+        ],
+    )
+
+    fake_backend = _FakeBackend()
+    handler = SimpleCPUOffloadWorker(
+        vllm_config=None,  # type: ignore[arg-type]
+        kv_cache_config=kv_cache_config,
+        cpu_capacity_bytes=shared.numel() * shared.element_size() * 2,
+    )
+    handler._backend = fake_backend  # type: ignore[assignment]
+
+    monkeypatch.setattr(worker_module, "PIN_MEMORY", False)
+    monkeypatch.setattr(worker_module.torch.cuda, "Stream", _FakeStream)
+
+    handler.register_kv_caches({"layer_a": shared, "layer_b": shared})
+
+    assert list(handler.gpu_kv_caches) == ["layer_a"]
+    assert list(handler.cpu_kv_caches) == ["layer_a"]
+    assert fake_backend.init_args is not None
+    assert fake_backend.init_args[0] is handler.gpu_kv_caches
+    assert fake_backend.init_args[1] is handler.cpu_kv_caches

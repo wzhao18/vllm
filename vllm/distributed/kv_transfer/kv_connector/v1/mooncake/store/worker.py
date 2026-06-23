@@ -49,8 +49,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  
     ChunkedTokenDatabase,
     KeyMetadata,
     MooncakeStoreConnectorMetadata,
+    MooncakeStoreWorkerMetadata,
     PoolKey,
     ReqMeta,
+    WriteBackStoreMeta,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.protocol import (  # noqa: E501
     LOOKUP_MSG,
@@ -62,6 +64,8 @@ from vllm.logger import init_logger
 from vllm.utils.network_utils import get_ip, make_zmq_socket
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
+    get_block_hash,
+    get_group_id,
     maybe_convert_block_hash,
     resolve_kv_cache_block_sizes,
 )
@@ -373,7 +377,7 @@ class KVTransferThread(threading.Thread):
         self.kv_event_lock = threading.Lock()
         self.kv_events: list[BlockStored] = []
 
-    def add_request(self, request: ReqMeta) -> None:
+    def add_request(self, request: Any) -> None:
         self.request_queue.put(request)
 
     def get_and_clear_finished_requests(self) -> set[str]:
@@ -472,6 +476,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         # Pause store requests when CPU/disk offloading is under pressure.
         self._store_pressure_active = False
         self._skip_store_requests: set[str] = set()
+        self.completed_write_back_events: dict[int, int] = {}
 
         # Per-request high-water mark of tokens actually persisted; the next
         # batch resumes here, so pressure-skipped or failed ranges are retried.
@@ -518,7 +523,135 @@ class KVCacheStoreSendingThread(KVTransferThread):
             self._skip_store_requests.clear()
         return True
 
-    def _handle_request(self, req_meta: ReqMeta):
+    def set_completed_write_back_event(self, event_id: int) -> None:
+        with self.done_task_lock:
+            self.completed_write_back_events[event_id] = (
+                self.completed_write_back_events.get(event_id, 0) + 1
+            )
+
+    def get_and_clear_completed_write_back_events(self) -> dict[int, int]:
+        with self.done_task_lock:
+            events = dict(self.completed_write_back_events)
+            self.completed_write_back_events.clear()
+        return events
+
+    def _handle_write_back_request(self, store_meta: WriteBackStoreMeta) -> None:
+        try:
+            keys: list[str] = []
+            addrs: list[list[int]] = []
+            sizes: list[list[int]] = []
+            for block_id, block_hash_with_group in zip(
+                store_meta.block_ids, store_meta.block_hashes, strict=True
+            ):
+                group_id = get_group_id(block_hash_with_group)
+                if group_id >= len(self.token_databases):
+                    logger.warning(
+                        "Skipping Mooncake write-back block %d with invalid "
+                        "group id %d",
+                        block_id,
+                        group_id,
+                    )
+                    continue
+                db = self.token_databases[group_id]
+                block_hash = db.store_hash_from_block_hash(
+                    get_block_hash(block_hash_with_group)
+                )
+                keys.append(PoolKey(db.metadata, block_hash.hex()).to_string())
+                addr, size = db.prepare_block_value(block_id)
+                addrs.append(addr)
+                sizes.append(size)
+
+            if not keys:
+                return
+
+            sl = slice(self.tp_rank % self.put_step, None, self.put_step)
+            keys = keys[sl]
+            addrs = addrs[sl]
+            sizes = sizes[sl]
+            if not keys:
+                return
+
+            exists_start = time.perf_counter()
+            try:
+                exists_states = self.store.batch_is_exist(keys)
+            except Exception:
+                self._record_operation(
+                    "write_back_exists",
+                    exists_start,
+                    len(keys),
+                    status="error",
+                    num_failed_keys=len(keys),
+                )
+                raise
+            self._record_operation("write_back_exists", exists_start, len(keys))
+
+            missing_indices = [
+                i for i, exists in enumerate(exists_states) if exists != 1
+            ]
+            if not missing_indices:
+                return
+
+            keys = [keys[i] for i in missing_indices]
+            addrs = [addrs[i] for i in missing_indices]
+            sizes = [sizes[i] for i in missing_indices]
+
+            if store_meta.current_event is not None:
+                store_meta.current_event.synchronize()
+
+            batch_bytes = _sum_batch_bytes(sizes)
+            put_start = time.perf_counter()
+            try:
+                res = self.store.batch_put_from_multi_buffers(
+                    keys,
+                    addrs,
+                    sizes,
+                    self.replicate_config,
+                )
+                failed = [i for i, v in enumerate(res) if v < 0]
+                self._record_operation(
+                    "write_back_put",
+                    put_start,
+                    len(keys),
+                    num_bytes=batch_bytes,
+                    status="partial_failure" if failed else "ok",
+                    num_failed_keys=len(failed),
+                )
+                if failed:
+                    failed_codes = set(res[i] for i in failed)
+                    logger.warning(
+                        "Mooncake write-back failed: %d/%d keys failed "
+                        "(codes=%s, batch_bytes=%d, num_keys=%d), first_key=%s",
+                        len(failed),
+                        len(keys),
+                        failed_codes,
+                        batch_bytes,
+                        len(keys),
+                        keys[0] if keys else "N/A",
+                    )
+                elif self._clear_store_pressure():
+                    logger.info(
+                        "Mooncake CPU/disk offloading pressure cleared after a "
+                        "successful write-back store batch"
+                    )
+            except Exception as e:
+                self._record_operation(
+                    "write_back_put",
+                    put_start,
+                    len(keys),
+                    num_bytes=batch_bytes,
+                    status="error",
+                    num_failed_keys=len(keys),
+                )
+                logger.error("Failed to write back keys %s, error: %s", keys, e)
+        finally:
+            self.set_completed_write_back_event(store_meta.event_id)
+            self.request_queue.task_done()
+
+    def _handle_request(self, req_meta: ReqMeta | WriteBackStoreMeta):
+        if isinstance(req_meta, WriteBackStoreMeta):
+            self._handle_write_back_request(req_meta)
+            return
+
         # Cache hits are always a multiple of ``lcm_block_size`` tokens, which
         # is also ``store_mask``'s precondition.
         lcm_block_size = self.coord.lcm_block_size
@@ -1312,8 +1445,13 @@ class MooncakeStoreWorker:
         # Issue stores with CUDA event synchronization
         if self.kv_role in ["kv_producer", "kv_both"]:
             current_event = None
-            for request in meta.requests:
-                if request.can_save:
+            if meta.write_back_stores:
+                current_event = torch.cuda.Event()
+                current_event.record()
+            else:
+                for request in meta.requests:
+                    if not request.can_save:
+                        continue
                     current_event = torch.cuda.Event()
                     current_event.record()
                     break
@@ -1325,6 +1463,11 @@ class MooncakeStoreWorker:
                 assert self.kv_send_thread is not None
                 self.kv_send_thread.add_stored_request(request.req_id)
                 self.kv_send_thread.add_request(request)
+
+            for store_meta in meta.write_back_stores:
+                store_meta.current_event = current_event
+                assert self.kv_send_thread is not None
+                self.kv_send_thread.add_request(store_meta)
 
         # Check completion of previously queued transfers
         done_sending = (
@@ -1380,6 +1523,14 @@ class MooncakeStoreWorker:
             self.kv_connector_stats = MooncakeStoreConnectorStats()
             return kv_connector_stats
 
+    def build_connector_worker_meta(self) -> MooncakeStoreWorkerMetadata | None:
+        if self.kv_send_thread is None:
+            return None
+        completed = self.kv_send_thread.get_and_clear_completed_write_back_events()
+        if not completed:
+            return None
+        return MooncakeStoreWorkerMetadata(completed_write_back_events=completed)
+
     def _get_and_clear_finished_sending(
         self,
         finished_req_ids: set[str],
@@ -1410,18 +1561,26 @@ class MooncakeStoreWorker:
 
         return finished_sending
 
-    def lookup(self, token_len: int, block_hashes: Sequence[BlockHash]) -> int:
-        """Check how many prefix tokens exist in the store.
+    def lookup(
+        self,
+        token_len: int,
+        block_hashes: Sequence[BlockHash],
+        local_hit_tokens: int = 0,
+    ) -> int:
+        """Check how many prefix tokens exist in local GPU cache or the store.
 
         Checks across all TP ranks and PP ranks.
         """
         if not block_hashes or token_len <= 0:
             return 0
 
+        local_hit_tokens = max(0, min(local_hit_tokens, token_len))
+
         # Build per-(group, hash) candidate keys expanded across TP/PP.
         # candidate_meta stores the (group, hash_bytes) for key slice.
         candidate_keys: list[str] = []
         candidate_meta: list[tuple[int, bytes]] = []
+        exists_set: set[tuple[int, bytes]] = set()
         lookup_masks = self.coord.lookup_mask(token_len)
         for g_idx, db in enumerate(self.token_dbs):
             spec_block_size = db.block_size
@@ -1438,15 +1597,22 @@ class MooncakeStoreWorker:
                     chunk_id >= len(lookup_mask) or not lookup_mask[chunk_id]
                 ):
                     continue
-                hash_hex = h.hex()
+                h_hex = h.hex()
+                h_bytes = bytes(h)
+                if start_idx + spec_block_size <= local_hit_tokens:
+                    exists_set.add((g_idx, h_bytes))
+                    continue
                 for key_prefix in key_prefixes:
                     candidate_keys.append(
-                        PoolKey.build_key_string(key_prefix, hash_hex)
+                        PoolKey.build_key_string(key_prefix, h_hex)
                     )
-                candidate_meta.append((g_idx, bytes(h)))
+                candidate_meta.append((g_idx, h_bytes))
 
         if not candidate_keys:
-            return 0
+            _masks, hit_length = self.coord.find_longest_cache_hit(
+                block_hashes, token_len, ExternalCachedBlockPool(exists_set)
+            )
+            return hit_length
 
         lookup_start = time.perf_counter()
         try:
@@ -1469,14 +1635,14 @@ class MooncakeStoreWorker:
 
         # A (group, hash) is "present" only when every TP*PP rank has it.
         ranks_per_candidate = self._lookup_expected_per_key
-        exists_set = {
+        exists_set.update(
             (g_idx, hash_bytes)
             for i, (g_idx, hash_bytes) in enumerate(candidate_meta)
             if all(
                 res[i * ranks_per_candidate + j] == 1
                 for j in range(ranks_per_candidate)
             )
-        }
+        )
 
         _masks, hit_length = self.coord.find_longest_cache_hit(
             block_hashes, token_len, ExternalCachedBlockPool(exists_set)
@@ -1547,10 +1713,22 @@ class LookupKeyServer:
 
                 if msg_type == LOOKUP_MSG:
                     token_len = int.from_bytes(all_frames[1], byteorder="big")
-                    hash_len = int.from_bytes(all_frames[2], byteorder="big")
-                    blob = all_frames[3].buffer
+                    if len(all_frames) == 4:
+                        # Backward-compatible decode for any in-flight client
+                        # using the older external-only lookup format.
+                        local_hit_tokens = 0
+                        hash_len = int.from_bytes(all_frames[2], byteorder="big")
+                        blob = all_frames[3].buffer
+                    else:
+                        local_hit_tokens = int.from_bytes(
+                            all_frames[2], byteorder="big"
+                        )
+                        hash_len = int.from_bytes(all_frames[3], byteorder="big")
+                        blob = all_frames[4].buffer
                     block_hashes = BlobBlockHashes(blob, hash_len)
-                    result = self.store_worker.lookup(token_len, block_hashes)
+                    result = self.store_worker.lookup(
+                        token_len, block_hashes, local_hit_tokens
+                    )
                     self.socket.send(result.to_bytes(4, "big"))
 
                 elif msg_type == RESET_MSG:
@@ -1613,11 +1791,17 @@ class LookupKeyClient:
         )
         self.futures: dict[str, Future[int]] = {}
 
-    def _lookup(self, token_len: int, block_hashes: list[BlockHash]) -> int:
+    def _lookup(
+        self,
+        token_len: int,
+        block_hashes: list[BlockHash],
+        local_hit_tokens: int,
+    ) -> int:
         hash_len = len(block_hashes[0]) if block_hashes else 0
         all_frames = (
             LOOKUP_MSG,
             token_len.to_bytes(4, byteorder="big"),
+            local_hit_tokens.to_bytes(4, byteorder="big"),
             hash_len.to_bytes(2, byteorder="big"),
             b"".join(block_hashes),
         )
@@ -1630,13 +1814,16 @@ class LookupKeyClient:
         req_id: str,
         token_len: int,
         block_hashes: list[BlockHash],
+        local_hit_tokens: int = 0,
         non_block: bool = False,
     ) -> int | None:
         """If non_block is True, will return None until the result is ready,
         so the caller retries on a later step."""
         future = self.futures.get(req_id)
         if future is None:
-            future = self.executor.submit(self._lookup, token_len, list(block_hashes))
+            future = self.executor.submit(
+                self._lookup, token_len, list(block_hashes), local_hit_tokens
+            )
             self.futures[req_id] = future
         if non_block and not future.done():
             return None
