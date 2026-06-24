@@ -4137,7 +4137,7 @@ class GPUModelRunner(
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
-            logits_indices, spec_decode_metadata = self._prepare_inputs(
+            logits_indices, _spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,
                 num_scheduled_tokens_np,
             )
@@ -4281,11 +4281,11 @@ class GPUModelRunner(
             )
 
             (
-                input_ids,
-                inputs_embeds,
-                positions,
-                intermediate_tensors,
-                model_kwargs,
+                _input_ids,
+                _inputs_embeds,
+                _positions,
+                _intermediate_tensors,
+                _model_kwargs,
                 ec_connector_output,
             ) = self._preprocess(
                 scheduler_output, num_tokens_padded, intermediate_tensors
@@ -4306,11 +4306,9 @@ class GPUModelRunner(
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
 
-        # Run the model.
-        # Use persistent buffers for CUDA graphs.
-        # When spec decode is enabled, defer connector finalization
-        # (wait_for_save + clear metadata) until after draft model runs.
-        defer_kv_connector_finalize = self.speculative_config is not None
+        # Temporary cache-only path for Mooncake write-back debugging. This
+        # preserves KV connector load/store hooks and scheduler bookkeeping
+        # while bypassing the expensive model forward/logits/sampling kernels.
         with (
             set_forward_context(
                 attn_metadata,
@@ -4324,18 +4322,22 @@ class GPUModelRunner(
                 skip_compiled=has_encoder_input,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
-            self.maybe_get_kv_connector_output(
-                scheduler_output,
-                defer_finalize=defer_kv_connector_finalize,
-            ) as kv_connector_output,
+            self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
+            pass
+
+        self._cache_only_model_runner_output = self._make_cache_only_model_runner_output(
+            kv_connector_output,
+            ec_connector_output,
+            cudagraph_stats,
+        )
+
+        # Now the batch has been launched we can wait for corrections from the
+        # previous model forward without breaking async scheduling.
+        if deferred_state_corrections_fn:
+            deferred_state_corrections_fn()
+
+        return None
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4431,10 +4433,69 @@ class GPUModelRunner(
             <= self.effective_drafter_max_model_len
         )
 
+    def _make_cache_only_model_runner_output(
+        self,
+        kv_connector_output: KVConnectorOutput | None,
+        ec_connector_output: ECConnectorOutput | None,
+        cudagraph_stats: CUDAGraphStat | None,
+    ) -> ModelRunnerOutput:
+        """Temporary cache-only fast path for Mooncake write-back debugging."""
+        num_reqs = self.input_batch.num_reqs
+        discard_req_indices = set(
+            np.nonzero(self.discard_request_mask.np[:num_reqs])[0].tolist()
+        )
+
+        req_ids_output_copy = self.input_batch.req_ids.copy()
+        req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
+        valid_sampled_token_ids: list[list[int]] = []
+        fake_token_id = 0
+
+        for req_idx, req_id in enumerate(req_ids_output_copy):
+            sampled_ids = [] if req_idx in discard_req_indices else [fake_token_id]
+            valid_sampled_token_ids.append(sampled_ids)
+
+            if not sampled_ids:
+                continue
+
+            start_idx = self.input_batch.num_tokens_no_spec[req_idx]
+            end_idx = start_idx + len(sampled_ids)
+            assert end_idx <= self.max_model_len, (
+                "Sampled token IDs exceed the max model length. "
+                f"Total number of tokens: {end_idx} > max_model_len: "
+                f"{self.max_model_len}"
+            )
+
+            self.input_batch.token_ids_cpu[req_idx, start_idx:end_idx] = sampled_ids
+            self.input_batch.is_token_ids[req_idx, start_idx:end_idx] = True
+            self.input_batch.num_tokens_no_spec[req_idx] = end_idx
+            self.requests[req_id].output_token_ids.extend(sampled_ids)
+
+        self.input_batch.prev_sampled_token_ids = None
+        self.input_batch.prev_req_id_to_index = {}
+        self.valid_sampled_token_count_gpu = None
+
+        return ModelRunnerOutput(
+            req_ids=req_ids_output_copy,
+            req_id_to_index=req_id_to_index_output_copy,
+            sampled_token_ids=valid_sampled_token_ids,
+            logprobs=None,
+            prompt_logprobs_dict={},
+            kv_connector_output=kv_connector_output,
+            ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
+            num_nans_in_logits={},
+            cudagraph_stats=cudagraph_stats,
+            routed_experts=None,
+        )
+
     @torch.inference_mode
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        if hasattr(self, "_cache_only_model_runner_output"):
+            output = self._cache_only_model_runner_output
+            del self._cache_only_model_runner_output
+            return output
+
         if self.execute_model_state is None:
             kv_connector_output = self.kv_connector_output
             self.kv_connector_output = None
