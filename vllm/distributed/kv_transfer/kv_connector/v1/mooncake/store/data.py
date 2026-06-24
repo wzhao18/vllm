@@ -226,13 +226,7 @@ class ChunkedTokenDatabase:
 
     def store_hash_from_block_hash(self, block_hash: BlockHash) -> BlockHash:
         """Map a physical prefix-cache block hash to the Mooncake store key hash."""
-        if self.block_size == self.hash_block_size:
-            return block_hash
-        scale_factor = self.block_size // self.hash_block_size
-        hash_len, remainder = divmod(len(block_hash), scale_factor)
-        if hash_len == 0 or remainder != 0:
-            return block_hash
-        return BlockHash(block_hash[-hash_len:])
+        return block_hash
 
     def process_tokens(
         self,

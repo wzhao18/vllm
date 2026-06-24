@@ -678,7 +678,7 @@ def test_store_sending_thread_handles_write_back_block():
     assert thread.get_and_clear_completed_write_back_events() == {7: 1}
 
 
-def test_store_sending_thread_write_back_uses_compact_store_hash():
+def test_store_sending_thread_write_back_uses_cached_store_hash():
     store = MagicMock()
     store.batch_is_exist.return_value = [0]
     store.batch_put_from_multi_buffers.return_value = [512]
@@ -699,7 +699,7 @@ def test_store_sending_thread_write_back_uses_compact_store_hash():
         WriteBackStoreMeta(
             event_id=9,
             block_ids=[2],
-            block_hashes=[make_block_hash_with_group_id(BlockHash(b"a0" + b"a1"), 0)],
+            block_hashes=[make_block_hash_with_group_id(BlockHash(b"a1"), 0)],
         )
     )
 
