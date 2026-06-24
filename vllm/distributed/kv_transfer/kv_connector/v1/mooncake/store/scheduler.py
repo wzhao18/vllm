@@ -420,17 +420,8 @@ class MooncakeStoreScheduler:
         if gpu_pool is None:
             return False
 
-        pending_block_ids = {
-            block_id
-            for store_meta in self._pending_write_back_stores
-            for block_id in store_meta.block_ids
-        }
-        pending_count = len(pending_block_ids)
-        remaining = self.write_back_max_blocks_per_step - pending_count
-        if remaining <= 0:
-            return bool(
-                self._pending_write_back_stores or self._write_back_inflight_block_ids
-            )
+        if self._pending_write_back_stores or self._write_back_inflight_block_ids:
+            return True
 
         def needs_write_back(block_id: int, block_hash: BlockHashWithGroupId) -> bool:
             return (
@@ -441,7 +432,6 @@ class MooncakeStoreScheduler:
 
         block_ids = []
         block_hashes = []
-        selected_block_count = 0
         for block in gpu_pool.peek_free_blocks(num_blocks):
             hashes = [
                 block_hash
@@ -453,14 +443,9 @@ class MooncakeStoreScheduler:
             for block_hash in hashes:
                 block_ids.append(block.block_id)
                 block_hashes.append(block_hash)
-            selected_block_count += 1
-            if selected_block_count == remaining:
-                break
 
         if not block_ids:
-            return bool(
-                self._pending_write_back_stores or self._write_back_inflight_block_ids
-            )
+            return False
 
         event_id = self._write_back_event_counter
         self._write_back_event_counter += 1

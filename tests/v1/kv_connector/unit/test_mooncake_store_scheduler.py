@@ -257,6 +257,60 @@ def test_completed_write_back_returns_to_allocator_reuse_order():
     assert scheduler.write_back_blocks_before_allocate(1) is False
 
 
+def test_write_back_uses_one_event_for_allocator_free_prefix():
+    scheduler = _make_bare_scheduler()
+    scheduler.store_policy = "write_back"
+    scheduler.write_back_max_blocks_per_step = 1
+    gpu_block_pool = BlockPool(
+        num_gpu_blocks=5,
+        enable_caching=True,
+        hash_block_size=16,
+    )
+    scheduler.bind_gpu_block_pool(gpu_block_pool)
+    block_1_hash = make_block_hash_with_group_id(BlockHash(b"a0"), 0)
+    block_3_hash = make_block_hash_with_group_id(BlockHash(b"a2"), 0)
+    _set_block_hash(gpu_block_pool.blocks[1], block_1_hash)
+    _set_block_hash(gpu_block_pool.blocks[3], block_3_hash)
+
+    assert scheduler.write_back_blocks_before_allocate(3) is True
+    meta = MooncakeStoreConnectorMetadata(set(), set())
+    scheduler._prepare_write_back_event(meta)
+
+    assert len(meta.write_back_stores) == 1
+    assert meta.write_back_stores[0].block_ids == [1, 3]
+    assert meta.write_back_stores[0].block_hashes == [block_1_hash, block_3_hash]
+    assert gpu_block_pool.blocks[1].ref_cnt == 1
+    assert gpu_block_pool.blocks[2].ref_cnt == 0
+    assert gpu_block_pool.blocks[3].ref_cnt == 1
+
+
+def test_write_back_waits_for_single_inflight_event():
+    scheduler = _make_bare_scheduler()
+    scheduler.store_policy = "write_back"
+    gpu_block_pool = BlockPool(
+        num_gpu_blocks=5,
+        enable_caching=True,
+        hash_block_size=16,
+    )
+    scheduler.bind_gpu_block_pool(gpu_block_pool)
+    _set_block_hash(
+        gpu_block_pool.blocks[1],
+        make_block_hash_with_group_id(BlockHash(b"a0"), 0),
+    )
+    _set_block_hash(
+        gpu_block_pool.blocks[2],
+        make_block_hash_with_group_id(BlockHash(b"a1"), 0),
+    )
+
+    assert scheduler.write_back_blocks_before_allocate(1) is True
+    meta = MooncakeStoreConnectorMetadata(set(), set())
+    scheduler._prepare_write_back_event(meta)
+
+    assert scheduler.write_back_blocks_before_allocate(2) is True
+    assert len(scheduler._write_back_events) == 1
+    assert scheduler._write_back_event_counter == 1
+
+
 def test_write_back_includes_all_hash_aliases_for_reused_block():
     scheduler = _make_bare_scheduler()
     scheduler.store_policy = "write_back"

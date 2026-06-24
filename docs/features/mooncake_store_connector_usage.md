@@ -209,7 +209,7 @@ the vLLM JSON config.
   `"write_back"` asynchronously stores hashed GPU prefix-cache blocks when
   allocation is about to reuse them, then retries allocation in a later
   scheduler step. Default: `"write_through"`.
-- `write_back_max_blocks_per_step` (int): Maximum number of GPU prefix-cache blocks to enqueue for write-back in one scheduler step when `store_policy` is `"write_back"`. Default: `64`.
+- `write_back_max_blocks_per_step` (int): Compatibility knob for write-back mode. Setting it to `0` disables the pre-allocation write-back path. Positive values do not cap the batch size; the write-back event covers the hashed blocks in the free-queue prefix that the allocator is about to reuse.
 - `enable_cross_layers_blocks` (bool): Enable cross-layer block packing for reduced store operations. Default: `false`.
 - `lookup_rpc_port` (int): Custom port for the ZMQ lookup RPC socket. Default: `0`.
 - `cache_prefix` (str): Namespace prepended to every store key. Lets separate deployments share one Mooncake master without polluting each other — instances configured with different prefixes never see each other's cached blocks, even for identical prompts. All instances that should share a prefix cache must use the same value. Default: `""` (no prefix; keys are byte-identical to the unprefixed format).
