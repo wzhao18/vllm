@@ -1146,39 +1146,43 @@ class MooncakeStoreWorker:
         self._init_lookup_key_prefixes()
 
     def _init_lookup_key_prefixes(self) -> None:
-        """Precompute per-group key prefixes expanded across rank namespaces."""
-        rank_parts = self._lookup_rank_parts()
+        """Prepare per-group key prefixes across parallel rank namespaces."""
+        # (tp_rank, pcp_rank, dcp_rank, pp_rank) namespaces
+        if self.dcp_size > 1:
+            # DCP reuses the TP workers and splits each TP group into
+            # contiguous DCP groups, so dcp_rank == tp_rank % dcp_size.
+            # Store/load paths do not apply KV-head dedup under DCP
+            rank_namespaces = tuple(
+                (tp_rank, pcp_rank, tp_rank % self.dcp_size, pp_rank)
+                for pcp_rank in range(self.pcp_size)
+                for tp_rank in range(self.tp_size)
+                for pp_rank in range(self.pp_size)
+            )
+        else:
+            # Without DCP, TP ranks that share a KV head write identical KV, so
+            # lookup only needs one TP namespace per unique KV head.
+            tp_count = min(self.tp_size, self.num_kv_head)
+            rank_namespaces = tuple(
+                (tp_rank, pcp_rank, 0, pp_rank)
+                for pcp_rank in range(self.pcp_size)
+                for tp_rank in range(tp_count)
+                for pp_rank in range(self.pp_size)
+            )
+
         self._lookup_key_prefixes = tuple(
             tuple(
                 PoolKey.build_prefix(
                     db.metadata,
-                    tp_rank=tp,
-                    pcp_rank=pcp,
-                    dcp_rank=dcp,
-                    pp_rank=pp,
+                    tp_rank=tp_rank,
+                    pcp_rank=pcp_rank,
+                    dcp_rank=dcp_rank,
+                    pp_rank=pp_rank,
                 )
-                for tp, pcp, dcp in rank_parts
-                for pp in range(self.pp_size)
+                for tp_rank, pcp_rank, dcp_rank, pp_rank in rank_namespaces
             )
             for db in self.token_dbs
         )
-        self._lookup_expected_per_key = len(rank_parts) * self.pp_size
-
-    def _lookup_rank_parts(self) -> tuple[tuple[int, int, int], ...]:
-        """Return (tp_rank, pcp_rank, dcp_rank) tuples required for a hit."""
-        if self.dcp_size > 1:
-            return tuple(
-                (tp_rank, pcp_rank, tp_rank % self.dcp_size)
-                for pcp_rank in range(self.pcp_size)
-                for tp_rank in range(self.tp_size)
-            )
-
-        tp_count = min(self.tp_size, self.num_kv_head)
-        return tuple(
-            (tp_rank, pcp_rank, 0)
-            for pcp_rank in range(self.pcp_size)
-            for tp_rank in range(tp_count)
-        )
+        self._lookup_expected_per_key = len(rank_namespaces)
 
     def register_cross_layers_kv_caches(self, kv_cache: torch.Tensor) -> None:
         """Register a cross-layers KV cache tensor.
