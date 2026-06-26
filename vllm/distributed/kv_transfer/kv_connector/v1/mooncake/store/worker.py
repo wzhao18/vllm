@@ -1146,17 +1146,39 @@ class MooncakeStoreWorker:
         self._init_lookup_key_prefixes()
 
     def _init_lookup_key_prefixes(self) -> None:
-        """Precompute per-group key prefixes expanded across TP/PP ranks."""
-        tp_count = min(self.tp_size, self.num_kv_head)
+        """Precompute per-group key prefixes expanded across rank namespaces."""
+        rank_parts = self._lookup_rank_parts()
         self._lookup_key_prefixes = tuple(
             tuple(
-                PoolKey.build_prefix(db.metadata, tp_rank=tp, pp_rank=pp)
-                for tp in range(tp_count)
+                PoolKey.build_prefix(
+                    db.metadata,
+                    tp_rank=tp,
+                    pcp_rank=pcp,
+                    dcp_rank=dcp,
+                    pp_rank=pp,
+                )
+                for tp, pcp, dcp in rank_parts
                 for pp in range(self.pp_size)
             )
             for db in self.token_dbs
         )
-        self._lookup_expected_per_key = tp_count * self.pp_size
+        self._lookup_expected_per_key = len(rank_parts) * self.pp_size
+
+    def _lookup_rank_parts(self) -> tuple[tuple[int, int, int], ...]:
+        """Return (tp_rank, pcp_rank, dcp_rank) tuples required for a hit."""
+        if self.dcp_size > 1:
+            return tuple(
+                (tp_rank, pcp_rank, tp_rank % self.dcp_size)
+                for pcp_rank in range(self.pcp_size)
+                for tp_rank in range(self.tp_size)
+            )
+
+        tp_count = min(self.tp_size, self.num_kv_head)
+        return tuple(
+            (tp_rank, pcp_rank, 0)
+            for pcp_rank in range(self.pcp_size)
+            for tp_rank in range(tp_count)
+        )
 
     def register_cross_layers_kv_caches(self, kv_cache: torch.Tensor) -> None:
         """Register a cross-layers KV cache tensor.
@@ -1413,12 +1435,12 @@ class MooncakeStoreWorker:
     def lookup(self, token_len: int, block_hashes: Sequence[BlockHash]) -> int:
         """Check how many prefix tokens exist in the store.
 
-        Checks across all TP ranks and PP ranks.
+        Checks across all rank-specific key namespaces that may be loaded.
         """
         if not block_hashes or token_len <= 0:
             return 0
 
-        # Build per-(group, hash) candidate keys expanded across TP/PP.
+        # Build per-(group, hash) candidate keys expanded across rank namespaces.
         # candidate_meta stores the (group, hash_bytes) for key slice.
         candidate_keys: list[str] = []
         candidate_meta: list[tuple[int, bytes]] = []
