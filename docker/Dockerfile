@@ -812,13 +812,17 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     fi && \
     rm /tmp/requirements-cuda.txt /tmp/common.txt
 
-# Install FlashInfer JIT cache (requires CUDA-version-specific index URL)
+# Install FlashInfer JIT cache (CUDA-version-specific wheel)
 # https://docs.flashinfer.ai/installation.html
 # From versions.json: .flashinfer.version
-ARG FLASHINFER_VERSION=0.6.13
+# Pinned to nightly release nightly-v0.6.14-20260702. The wheels are not yet on
+# the flashinfer.ai/whl/nightly flat index, so install by direct release URL.
+ARG FLASHINFER_VERSION=0.6.14.dev20260702
+ARG FLASHINFER_NIGHTLY_TAG=nightly-v0.6.14-20260702
 RUN --mount=type=cache,target=/opt/uv/cache \
-    uv pip install --system flashinfer-jit-cache==${FLASHINFER_VERSION} \
-        --index-url https://flashinfer.ai/whl/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
+    CUDA_MAJOR_MINOR=cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') && \
+    uv pip install --system --pre \
+        "https://github.com/flashinfer-ai/flashinfer/releases/download/${FLASHINFER_NIGHTLY_TAG}/flashinfer_jit_cache-${FLASHINFER_VERSION}+${CUDA_MAJOR_MINOR}-cp39-abi3-manylinux_2_28_$(uname -m).whl"
 
 # ============================================================
 # OPENAI API SERVER DEPENDENCIES
