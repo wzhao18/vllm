@@ -37,8 +37,14 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.fused_allreduce_gemma_rms_norm import (
+    _AR_RESIDUAL_RMS_NORM,
+    _can_use_flashinfer,
+    flashinfer_trtllm_fused_allreduce_norm,
+)
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
 )
@@ -67,6 +73,54 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
+
+
+def _fused_allreduce_rms_norm(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    norm: RMSNorm,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """All-reduce + add residual + RMSNorm, fused via FlashInfer when available.
+
+    ``hidden_states`` is the per-rank *partial* output of a row-parallel op run
+    with its all-reduce deferred (o_proj ``reduce_results=False`` / MoE
+    ``skip_final_all_reduce``). Returns ``(normed_output, new_residual)``,
+    equivalent to ``norm(all_reduce(hidden_states), residual)``.
+
+    vLLM's torch.compile pass normally fuses this ``all_reduce -> rms_norm``
+    pattern, but it does not fire when the layer runs eagerly (e.g. under a
+    breakable CUDA graph). This restores the fusion explicitly. Falls back to a
+    plain all-reduce + RMSNorm when the FlashInfer fast path is unavailable, so
+    the result is identical either way.
+    """
+    tp_size = get_tensor_model_parallel_world_size()
+    if tp_size == 1:
+        return norm(hidden_states, residual)
+
+    if flashinfer_trtllm_fused_allreduce_norm is not None:
+        ok, max_token_num = _can_use_flashinfer(hidden_states, tp_size)
+        if ok:
+            norm_out = torch.empty_like(hidden_states)
+            # With norm_out provided, the kernel writes the new residual
+            # (all_reduce(hidden_states) + residual) into hidden_states and the
+            # normalized result into norm_out.
+            flashinfer_trtllm_fused_allreduce_norm(
+                allreduce_in=hidden_states,
+                residual=residual,
+                rms_gamma=norm.weight,
+                rms_eps=norm.variance_epsilon,
+                world_size=tp_size,
+                weight_bias=0.0,
+                launch_with_pdl=True,
+                fp32_acc=True,
+                max_token_num=max_token_num,
+                pattern_code=_AR_RESIDUAL_RMS_NORM,
+                norm_out=norm_out,
+            )
+            return norm_out, hidden_states
+
+    reduced = tensor_model_parallel_all_reduce(hidden_states)
+    return norm(reduced, residual)
 
 
 class MiniMaxM2MoE(nn.Module):
@@ -191,6 +245,9 @@ class MiniMaxM2Attention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+            # Defer the all-reduce; it is fused into the post-attention RMSNorm
+            # via _fused_allreduce_rms_norm in the decoder layer.
+            reduce_results=False,
         )
 
         if (
@@ -289,6 +346,11 @@ class MiniMaxM2DecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.mlp",
         )
+        # Defer the MoE cross-rank all-reduce; it is fused into the next layer's
+        # input_layernorm (or the model's final norm) via
+        # _fused_allreduce_rms_norm. self.block_sparse_moe.experts is the MoE
+        # runner that owns the final all-reduce.
+        self.block_sparse_moe.experts.moe_config.skip_final_all_reduce = True
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -302,18 +364,28 @@ class MiniMaxM2DecoderLayer(nn.Module):
     ) -> torch.Tensor:
         # Self Attention
         if residual is None:
+            # First layer: hidden_states is the (already reduced) embedding.
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            # The previous layer's MoE output is left un-reduced; fuse its
+            # all-reduce into this input_layernorm.
+            hidden_states, residual = _fused_allreduce_rms_norm(
+                hidden_states, residual, self.input_layernorm
+            )
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
         )
 
-        # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        # Fully Connected: o_proj ran reduce_results=False; fuse its all-reduce
+        # into the post-attention RMSNorm.
+        hidden_states, residual = _fused_allreduce_rms_norm(
+            hidden_states, residual, self.post_attention_layernorm
+        )
 
+        # MoE runs with skip_final_all_reduce; its all-reduce is fused into the
+        # next layer's input_layernorm (or the model's final norm).
         hidden_states = self.block_sparse_moe(hidden_states)
 
         return hidden_states, residual
@@ -404,15 +476,39 @@ class MiniMaxM2Model(nn.Module, EagleModelMixin):
             )
 
         if not get_pp_group().is_last_rank:
+            # hidden_states is the last layer's un-reduced MoE output; its
+            # all-reduce is fused into the next PP stage's first input_layernorm.
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
-        hidden_states, _ = self.norm(hidden_states, residual)
+        # Fuse the last layer's deferred MoE all-reduce into the final norm.
+        hidden_states, _ = _fused_allreduce_rms_norm(hidden_states, residual, self.norm)
 
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
 
         return hidden_states
+
+    def _maybe_add_hidden_state(
+        self,
+        aux_hidden_states: list[torch.Tensor],
+        layer_idx: int,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> list[torch.Tensor]:
+        # Layers defer the MoE all-reduce, so between-layer ``hidden_states`` is
+        # a per-rank partial. Reduce it before forming the Eagle3 aux feature
+        # (all_reduce(hidden_states) + residual). At the first capture point
+        # residual is None and hidden_states is the already-reduced embedding.
+        # No-op unless Eagle3 aux collection is active.
+        if layer_idx in self.aux_hidden_state_layers:
+            if residual is not None:
+                if get_tensor_model_parallel_world_size() > 1:
+                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                aux_hidden_states.append(hidden_states + residual)
+            else:
+                aux_hidden_states.append(hidden_states)
+        return aux_hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # Skip spec-decode (MTP) layers; they are appended after the main
