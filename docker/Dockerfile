@@ -824,6 +824,16 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     uv pip install --system --pre \
         "https://github.com/flashinfer-ai/flashinfer/releases/download/${FLASHINFER_NIGHTLY_TAG}/flashinfer_jit_cache-${FLASHINFER_VERSION}+${CUDA_MAJOR_MINOR}-cp39-abi3-manylinux_2_28_$(uname -m).whl"
 
+# Apply CuTeDSL split-K gemm patch (jiahanc/flashinfer branch cutedsl-splitK,
+# flashinfer/gemm changes only) on top of the pinned nightly.
+COPY docker/patches/flashinfer-cutedsl-splitk-gemm.patch /tmp/flashinfer-gemm.patch
+RUN apt-get update -y \
+    && apt-get install -y --no-install-recommends patch \
+    && rm -rf /var/lib/apt/lists/* \
+    && SITE_PACKAGES=$(dirname "$(python3 -c "import importlib.util; print(importlib.util.find_spec('flashinfer').submodule_search_locations[0])")") \
+    && patch -p1 -d "${SITE_PACKAGES}" < /tmp/flashinfer-gemm.patch \
+    && rm /tmp/flashinfer-gemm.patch
+
 # ============================================================
 # OPENAI API SERVER DEPENDENCIES
 # Pre-install these to avoid reinstalling on every vLLM wheel rebuild
