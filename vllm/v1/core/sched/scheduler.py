@@ -790,10 +790,20 @@ class Scheduler(SchedulerInterface):
                         else:
                             num_external_computed_tokens = ext_tokens
 
-                        if hit_diverged and num_external_computed_tokens == 0:
-                            # No external tokens back the deeper local hit, so its
-                            # resume boundary would have no valid Mamba state.
-                            # Reconcile to the boundary every group agrees on.
+                        if hit_diverged:
+                            # MOONCAKE_RETENTION_RECONCILE: reconcile on ANY divergence,
+                            # not only num_external==0. Under sparse retention the connector
+                            # store keeps only sparse Mamba checkpoints (latest <= hit), so a
+                            # nonzero num_external does NOT guarantee a valid Mamba state at
+                            # the deep full-attention boundary; resuming there runs the forward
+                            # with a stale/absent recurrent state. Fall back to the boundary
+                            # every group (incl. Mamba) agrees on.
+                            logger.warning(
+                                "MOONCAKE_RETENTION_RECONCILE: req=%s reconciled divergent "
+                                "hybrid hit (num_external=%d) to group-agreed boundary",
+                                request.request_id,
+                                num_external_computed_tokens,
+                            )
                             (
                                 new_computed_blocks,
                                 num_new_local_computed_tokens,
