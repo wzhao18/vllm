@@ -1768,22 +1768,32 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             64 * 1024,
         )
 
-        # Enforce that we have enough for at least 1 token per request, so
-        # ``workspace // num_prefills_with_context`` in
-        # build_mla_chunked_context_metadata() stays >= 1.
+        # Enforce enough workspace that ``workspace // num_prefills_with_context``
+        # in build_mla_chunked_context_metadata() stays above zero.
         #
-        # This used to demand a full page per request
-        # (max_num_seqs * block_size), which the chunk-start alignment required.
-        # That alignment is not needed off the DCP path (see
-        # build_mla_chunked_context_metadata), and the page-sized floor is very
-        # expensive for hybrid models: Kimi-K3's block_size is 1536 rather than
-        # 32, forced up so the attention page covers a KDA/Mamba page, so the
-        # floor overrode the 64k cap for any max_num_seqs >= 43 and tied
-        # workspace memory to max_num_seqs -- ~6.7KB/row/GPU at TP8, i.e. 10GB
-        # per GPU at max_num_seqs=1024 versus 420MB at the cap.
+        # DCP still rounds that quotient down to block_size, so it needs a whole
+        # page per request or the chunk comes out empty. Everything else only
+        # needs one token per request, since the gather kernels handle chunk
+        # starts at any offset.
+        #
+        # The distinction matters for hybrid models: Kimi-K3's block_size is
+        # 1536 rather than 32, forced up so the attention page covers a
+        # KDA/Mamba page, so a page-sized floor overrides the 64k cap for any
+        # max_num_seqs >= 43 and ties workspace memory to max_num_seqs --
+        # ~6.7KB/token/GPU at TP8, i.e. 10GB per GPU at max_num_seqs=1024
+        # against 420MB at the cap.
+        #
+        # Read DCP from the config rather than the process group: this also runs
+        # during profiling, before the builder resolves its own dcp_world_size.
+        # A config/group mismatch can then only over-allocate, never under.
+        if vllm_config.parallel_config.decode_context_parallel_size > 1:
+            tokens_per_request = cache_config.block_size
+        else:
+            tokens_per_request = 1
+
         chunked_prefill_workspace_size = max(
             chunked_prefill_workspace_size,
-            scheduler_config.max_num_seqs,
+            scheduler_config.max_num_seqs * tokens_per_request,
         )
 
         return chunked_prefill_workspace_size
