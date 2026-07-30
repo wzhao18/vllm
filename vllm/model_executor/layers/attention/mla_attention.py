@@ -1585,8 +1585,13 @@ def build_mla_chunked_context_metadata(
     # more workspace to prefills with longer context lengths.
     max_context_chunk = chunked_prefill_workspace_size // num_prefills_with_context
     if align_chunk_to_block:
-        # The `gather_and_maybe_dequant_cache` kernel cannot handle chunk
-        # starts that are not aligned to block_size, so round down.
+        # Round chunk starts down to block_size. Note this is NOT required by
+        # `gather_and_maybe_dequant_cache` / `cp_gather_cache`: both add
+        # seq_starts into the absolute token offset and then take
+        # ``offset / block_size`` and ``offset % block_size``, which is exact for
+        # any start. (Verified on SM100 with block_size=1536 and starts straddling
+        # block boundaries.) It is still needed for DCP, whose local context
+        # lengths are padded per block.
         max_context_chunk = round_down(max_context_chunk, block_size)
     assert max_context_chunk > 0
 
@@ -1763,10 +1768,22 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             64 * 1024,
         )
 
-        # Enforce that we enough for at least 1 page per request
+        # Enforce that we have enough for at least 1 token per request, so
+        # ``workspace // num_prefills_with_context`` in
+        # build_mla_chunked_context_metadata() stays >= 1.
+        #
+        # This used to demand a full page per request
+        # (max_num_seqs * block_size), which the chunk-start alignment required.
+        # That alignment is not needed off the DCP path (see
+        # build_mla_chunked_context_metadata), and the page-sized floor is very
+        # expensive for hybrid models: Kimi-K3's block_size is 1536 rather than
+        # 32, forced up so the attention page covers a KDA/Mamba page, so the
+        # floor overrode the 64k cap for any max_num_seqs >= 43 and tied
+        # workspace memory to max_num_seqs -- ~6.7KB/row/GPU at TP8, i.e. 10GB
+        # per GPU at max_num_seqs=1024 versus 420MB at the cap.
         chunked_prefill_workspace_size = max(
             chunked_prefill_workspace_size,
-            scheduler_config.max_num_seqs * cache_config.block_size,
+            scheduler_config.max_num_seqs,
         )
 
         return chunked_prefill_workspace_size
@@ -2034,7 +2051,9 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 chunked_prefill_workspace=self.chunked_prefill_workspace,
                 chunked_prefill_workspace_size=self.chunked_prefill_workspace_size,
                 block_size=self.page_size,
-                align_chunk_to_block=True,
+                # DCP pads local context lengths per block, so it still needs
+                # block-aligned chunk starts; the gather kernels do not.
+                align_chunk_to_block=self.dcp_world_size > 1,
                 device=device,
                 dcp_world_size=self.dcp_world_size,
                 dcp_local_block_size=self.dcp_local_block_size,
