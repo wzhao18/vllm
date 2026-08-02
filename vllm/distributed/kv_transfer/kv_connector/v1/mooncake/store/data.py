@@ -283,7 +283,15 @@ class ChunkedTokenDatabase:
         if not block_hashes:
             return
         assert token_len % self.hash_block_size == 0
-        assert token_len // self.hash_block_size <= len(block_hashes)
+        # Speculative decoding advances token_len by up to num_spec_tokens per
+        # step, while block_hashes covers committed tokens only, so the tail
+        # can be unhashed. Save the covered prefix instead of raising out of
+        # KVCacheStoreSendingThread, which kills the decode worker. The load
+        # path already clamps identically -- see lookup()'s
+        # max_units = min(len(block_hashes), token_len // hash_block_size).
+        # Not persisting KV for not-yet-committed speculative tokens is also
+        # the correct behaviour: those tokens may still be rejected.
+        token_len = min(token_len, len(block_hashes) * self.hash_block_size)
         start_chunk = max(0, cdiv(mask_num, self.block_size))
         max_chunks = cdiv(token_len, self.block_size)
         if chunk_mask is not None:

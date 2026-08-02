@@ -499,13 +499,22 @@ def _post_update_kernel(
         )
 
         if output_bin_counts_ptr is not None:
-            token_ptr = (
-                output_bin_counts_ptr
-                + req_state_idx * output_bin_counts_stride
-                + token_id
-            )
-            count = tl.load(token_ptr)
-            tl.store(token_ptr, count + 1)
+            # token_id is the only index in this kernel bounded by a data
+            # value rather than by a shape, and output_bin_counts_stride is
+            # vocab_size, the tightest row bound here. An id outside
+            # [0, vocab_size) either lands in a neighbouring request's row
+            # (silently corrupting its penalty counts) or leaves the
+            # allocation entirely (illegal memory access). There is no bin for
+            # such an id, so skip it. Same hazard class the rejection sampler
+            # guards with `draft_sampled = tl.maximum(0, draft_sampled)`.
+            if 0 <= token_id and token_id < output_bin_counts_stride:
+                token_ptr = (
+                    output_bin_counts_ptr
+                    + req_state_idx * output_bin_counts_stride
+                    + token_id
+                )
+                count = tl.load(token_ptr)
+                tl.store(token_ptr, count + 1)
 
     if query_start_loc_ptr is None:
         query_len = 0

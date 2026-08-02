@@ -108,7 +108,13 @@ def _compute_global_target_argmax(
         mask=blocks_mask,
         other=float("-inf"),
     )
-    max_block_idx = tl.argmax(local_max, axis=0)
+    # tl.argmax combines with `value1 > value2`, which is false for NaN, so if
+    # no real lane is non-NaN the -inf padding lanes win and the index lands in
+    # [vocab_num_blocks, PADDED_VOCAB_NUM_BLOCKS). target_local_argmax is
+    # new_empty and only [0, vocab_num_blocks) is ever written, so the unmasked
+    # load below would return uninitialized memory as a token id. Clamping
+    # bounds the read; it does not fix an all-NaN logits row.
+    max_block_idx = tl.minimum(tl.argmax(local_max, axis=0), vocab_num_blocks - 1)
     return tl.load(
         target_local_argmax_ptr + logit_idx * target_local_argmax_stride + max_block_idx
     ).to(tl.int64)
@@ -508,6 +514,7 @@ def _rejection_kernel(
     # [num_logits, num_blocks]
     local_residual_mass_ptr,
     local_residual_mass_stride,
+    vocab_size,
     vocab_num_blocks,
     PADDED_VOCAB_NUM_BLOCKS: tl.constexpr,
     HAS_DRAFT_LOGITS: tl.constexpr,
@@ -577,7 +584,16 @@ def _rejection_kernel(
                 if SYNTHETIC_MODE:
                     rate = tl.load(synthetic_conditional_rates_ptr + i)
                     # -1 is used for padded draft token ids that should be rejected.
-                    accepted &= (u < rate) & (draft_sampled >= 0)
+                    # The upper bound matters too: unlike the standard path
+                    # below, which only accepts a draft equal to target_argmax
+                    # (bounded by construction), synthetic acceptance stores
+                    # draft_sampled verbatim. An out-of-vocab id would then be
+                    # emitted as a sampled token and later index the embedding
+                    # table, tripping `srcIndex < srcSelectDimSize`. Rejecting
+                    # it falls back to target_argmax, which is in range.
+                    accepted &= (
+                        (u < rate) & (draft_sampled >= 0) & (draft_sampled < vocab_size)
+                    )
                 else:
                     accepted &= target_argmax == draft_sampled
                 tl.store(
@@ -587,9 +603,14 @@ def _rejection_kernel(
             else:
                 # Speculative decoding (Leviathan et al., 2023): https://arxiv.org/abs/2211.17192
                 # -1 is used for padded draft token ids that should be rejected.
-                is_valid_draft = draft_sampled >= 0
+                # Bound above as well. This is the branch taken at temperature
+                # != 0 (the default), draft_sampled indexes the logits rows in
+                # the unmasked load below, and under SYNTHETIC_MODE acceptance
+                # never compares it against target_argmax, so it is stored
+                # verbatim as an output token id.
+                is_valid_draft = (draft_sampled >= 0) & (draft_sampled < vocab_size)
                 # Avoid possible OOB ptr access.
-                draft_sampled = tl.maximum(0, draft_sampled)
+                draft_sampled = tl.minimum(tl.maximum(0, draft_sampled), vocab_size - 1)
                 target_logprob, draft_logprob, target_lse, draft_lse = (
                     _compute_global_logprobs_and_logsumexp(
                         draft_sampled,
@@ -849,7 +870,20 @@ def _insert_resampled_kernel(
         mask=mask,
         other=float("-inf"),
     )
-    resampled_max_block_idx = tl.argmax(resampled_local_max, axis=0)
+    # Same hazard as _compute_global_target_argmax, on the hot path: this
+    # kernel runs for every rejected and every bonus token at temperature != 0.
+    # If every one of the resample_num_blocks real lanes is NaN, a -inf padding
+    # lane wins and the index lands past the written part of
+    # resampled_local_argmax (new_empty, resample_num_blocks columns). The load
+    # below is unmasked, so it would then return uninitialized memory -- the
+    # one value in the rejection sampler not derived from an already-bounded
+    # token id. It flows into `sampled`, req_states.last_sampled_tokens and the
+    # DSpark draft anchor, which indexes the unmasked markov_w1 embedding.
+    # After the clamp `resampled` is always a token id written by
+    # _resample_kernel, i.e. block_idx * BLOCK_SIZE + idx < vocab_size.
+    resampled_max_block_idx = tl.minimum(
+        tl.argmax(resampled_local_max, axis=0), resample_num_blocks - 1
+    )
     resampled = tl.load(
         resampled_local_argmax_ptr
         + req_idx * resampled_local_argmax_stride
@@ -1064,6 +1098,7 @@ def rejection_sample(
         cumulative_log_p,
         local_residual_mass,
         local_residual_mass.stride(0) if local_residual_mass is not None else 0,
+        vocab_size,
         vocab_num_blocks,
         PADDED_VOCAB_NUM_BLOCKS=padded_vocab_num_blocks,
         HAS_DRAFT_LOGITS=has_draft_logits,

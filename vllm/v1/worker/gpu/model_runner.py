@@ -960,6 +960,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             total_num_draft_tokens = int(num_draft_tokens_per_req.sum())
             total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
             num_logits = num_draft_tokens_per_req + num_bonus_tokens
+            # Each request samples from the tail of its own query slice
+            # (logits_start = query_end - num_logits), so a logits window wider
+            # than the query reads the preceding request's tokens and makes
+            # post_update's computed_delta negative.
+            assert (num_logits <= num_scheduled_tokens).all(), (
+                f"num_logits {num_logits} exceeds num_scheduled_tokens "
+                f"{num_scheduled_tokens}"
+            )
             cu_num_logits_np = np.empty(num_reqs + 1, dtype=np.int32)
             cu_num_logits_np[0] = 0
             np.cumsum(num_logits, out=cu_num_logits_np[1:])

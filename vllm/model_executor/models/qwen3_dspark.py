@@ -64,7 +64,15 @@ class DSparkMarkovHead(nn.Module):
 
     def embed(self, token_ids: torch.Tensor) -> torch.Tensor:
         """r-dim Markov embedding of ``token_ids`` ([B] -> [B, r])."""
-        return self.markov_w1(token_ids)
+        # markov_w1 is replicated (see the class docstring), so it is the only
+        # token-id gather in a draft step with no range check: every other one
+        # goes through VocabParallelEmbedding, which masks ids outside the local
+        # shard to row 0 whenever tp_size > 1. token_ids is data -- its first
+        # entry per request is the target's last sampled token -- so a bad id
+        # trips `indexSelectSmallIndex: srcIndex < srcSelectDimSize` and kills
+        # the worker at the next event sync, far from the cause. ATen reads the
+        # index as `unsigned int`, so -1 fails that assert too; bound both ends.
+        return self.markov_w1(token_ids.clamp(0, self.markov_w1.num_embeddings - 1))
 
     def bias(
         self,

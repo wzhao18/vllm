@@ -35,6 +35,22 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             if speculative_config.kv_cache_dtype is not None
             else vllm_config.cache_config
         ),
+        # The draft inherits the target's load_config. With
+        # load_format="fastsafetensors" that breaks single-shard draft weights
+        # under data parallelism: fastsafetensors hands tensors over as DLPack
+        # capsules, which may only be consumed once, and the DP ranks racing on
+        # the one shard hit
+        #   RuntimeError: from_dlpack received an invalid capsule
+        # Deterministic on TP8-prefill + DEP16-decode disagg (3/3 runs, always a
+        # decode rank). Use the standard loader for the DRAFT only -- it is a
+        # single shard so the cost is negligible, while the multi-shard target
+        # keeps fastsafetensors (195 s vs 40+ min serial).
+        load_config=(
+            replace(vllm_config.load_config, load_format="auto")
+            if getattr(vllm_config.load_config, "load_format", None)
+            == "fastsafetensors"
+            else vllm_config.load_config
+        ),
     )
 
     with set_model_tag("dspark_head"):

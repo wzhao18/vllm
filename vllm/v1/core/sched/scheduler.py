@@ -1074,9 +1074,16 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 if pad_spec_decode:
-                    scheduled_spec_decode_tokens[request_id] = [
-                        -1
-                    ] * self.num_spec_tokens
+                    # `num_new_tokens` can still shrink after the padding
+                    # decision above (long_prefill_token_threshold, encoder
+                    # inputs, _mamba_block_aligned_split), so derive the
+                    # placeholder count from the final value. Scheduling more
+                    # draft tokens than query tokens makes the worker's logits
+                    # window (query_end - num_logits) start before this
+                    # request's own query slice.
+                    num_pad_spec = num_new_tokens - self.num_sampled_tokens_per_step
+                    if num_pad_spec > 0:
+                        scheduled_spec_decode_tokens[request_id] = [-1] * num_pad_spec
                 # Only track requests that will still be prefilling after this chunk.
                 if num_computed_tokens + num_new_tokens < request.num_tokens:
                     self._inflight_prefills.add(request)
