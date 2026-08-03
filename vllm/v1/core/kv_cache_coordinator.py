@@ -14,6 +14,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
+    MambaManager,
     SingleTypeKVCacheManager,
     get_manager_for_kv_cache_spec,
 )
@@ -648,6 +649,14 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             if group.use_eagle:
                 for gid in group.group_ids:
                     self.single_type_managers[gid].use_eagle = True
+
+        # The drafting attention group rewinds a fine-grained hit by one hash
+        # unit. Mamba has no draft layer of its own, but its recurrent state
+        # must still exist at that reconciled replay boundary.
+        if self.eagle_group_ids and self.enable_partial_hash_hits:
+            for manager in self.single_type_managers:
+                if isinstance(manager, MambaManager):
+                    manager.cache_speculative_replay_tail = True
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         if self.enable_partial_hash_hits:

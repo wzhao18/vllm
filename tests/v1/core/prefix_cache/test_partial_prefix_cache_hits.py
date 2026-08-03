@@ -77,6 +77,32 @@ def test_mamba_align_split_partial_tail_schedule():
     assert split(self=mock, request=req2, num_new_tokens=1000) == 512
 
 
+def test_mamba_align_split_materializes_speculative_replay_pmu_boundary():
+    """DSpark/EAGLE stops one PMU before the latest prompt-tail boundary."""
+    block_size = 8
+    hash_block_size = 2
+    mock = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=block_size),
+        max_num_scheduled_tokens=16,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+        use_eagle=True,
+        hash_block_size=hash_block_size,
+        mamba_partial_cache_hit=True,
+    )
+    split = Scheduler._mamba_block_aligned_split
+    req = make_request("0", list(range(15)), hash_block_size, sha256)
+
+    # prompt=15: coarse boundary=8, speculative replay boundary=12, and
+    # latest PMU boundary=14. Each state is materialized exactly.
+    assert split(self=mock, request=req, num_new_tokens=15) == 8
+    req.num_computed_tokens = 8
+    assert split(self=mock, request=req, num_new_tokens=7) == 4
+    req.num_computed_tokens = 12
+    assert split(self=mock, request=req, num_new_tokens=3) == 2
+    req.num_computed_tokens = 14
+    assert split(self=mock, request=req, num_new_tokens=1) == 1
+
+
 def test_mamba_align_split_when_block_exceeds_scheduling_budget():
     """Sub-block chunks make progress only when no step can fit a full block."""
     block_size = 11392
@@ -581,13 +607,106 @@ def test_truncate_computed_blocks_preserves_sparse_prefix_positions():
     blocks, num_computed, _ = manager.get_computed_blocks(consumer)
     assert num_computed == 6
     assert [len(group) for group in blocks.blocks] == [3, 2]
-    assert blocks.blocks[1][0].is_null
 
     truncated = manager.truncate_computed_blocks(blocks, 4)
 
     assert [len(group) for group in truncated.blocks] == [2, 1]
     assert truncated.blocks[1][0].is_null
     assert [len(group) for group in blocks.blocks] == [3, 2]
+
+
+def test_connector_truncation_pads_lagging_mamba_positions():
+    """A remote hit can supersede an FA PMU hit while local Mamba has no hit."""
+    hash_block_size = 2
+    block_size = 8
+    kv_cache_config = KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+                is_eagle_group=True,
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        use_eagle=True,
+    )
+    pool = manager.block_pool
+    req = make_request("replay", list(range(16)), hash_block_size, sha256)
+
+    # Only full attention is local: its 14-token PMU entry rewinds to 12 for
+    # DSpark. The Mamba group has no corresponding local state.
+    full_blocks = pool.get_new_blocks(2)
+    pool.cache_full_blocks(
+        request=req,
+        blocks=full_blocks[:1],
+        num_cached_blocks=0,
+        num_full_blocks=1,
+        block_size=block_size,
+        kv_cache_group_id=0,
+    )
+    assert (
+        pool.cache_partial_block(
+            request=req,
+            block=full_blocks[1],
+            num_tokens=14,
+            kv_cache_group_id=0,
+            block_size=block_size,
+        )
+        is not None
+    )
+
+    blocks, num_local, _, hit_diverged = manager.get_computed_blocks_for_connector(req)
+    assert num_local == 12
+    assert hit_diverged
+    assert [len(group) for group in blocks.blocks] == [2, 0]
+
+    # Mooncake reports a strictly longer hit, so the scheduler drops the local
+    # partial tail to 8. Mamba gets a positional null instead of asserting;
+    # the subsequent external allocation will append the transferred state.
+    truncated = manager.truncate_computed_blocks(blocks, 8)
+    assert [len(group) for group in truncated.blocks] == [1, 1]
+    assert truncated.blocks[1][0].is_null
+    assert [len(group) for group in blocks.blocks] == [2, 0]
+
+    # Model the scheduler branch: the 12-token local hit has a 4-token PMU
+    # tail, while the connector contributes 6 tokens beyond the 8-token floor.
+    # External allocation must append a real Mamba state slot after the null.
+    assert (
+        manager.allocate_slots(
+            req,
+            num_new_tokens=1,
+            num_new_computed_tokens=8,
+            new_computed_blocks=truncated,
+            num_external_computed_tokens=6,
+            delay_cache_blocks=True,
+        )
+        is not None
+    )
+    allocated = manager.get_blocks(req.request_id).blocks
+    assert [len(group) for group in allocated] == [2, 2]
+    assert allocated[1][0].is_null
+    assert not allocated[1][1].is_null
 
 
 def test_hybrid_mamba_partial_tail_owner_continue_preserves_later_hit():
@@ -1181,3 +1300,139 @@ def test_hybrid_partial_hit_with_eagle_stays_within_group_blocks():
         len(group) * block_size >= num_computed for group in computed_blocks.blocks
     )
     assert manager.allocate_slots(req1, 4, num_computed, computed_blocks) is not None
+
+
+def test_retention_zero_keeps_coarse_and_latest_pmu_mamba_states(monkeypatch):
+    """Retention zero keeps the coarse replay state independently of PMU.
+
+    With block=8, PMU=2, and prompt=14, the reusable coarse state is at 8
+    while the prompt-tail state is at 14. There is no reason to materialize
+    the intermediate PMU boundary at 12 without speculative replay.
+    """
+    monkeypatch.setenv("VLLM_PREFIX_CACHE_RETENTION_INTERVAL", "0")
+    hash_block_size = 2
+    block_size = 8
+    kv_cache_config = KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+
+    req = make_request("owner", list(range(14)), hash_block_size, sha256)
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(req)
+    assert manager.allocate_slots(req, 8, num_computed, computed_blocks) is not None
+    req.num_computed_tokens = 8
+    manager.new_step_starts()
+    assert manager.allocate_slots(req, 6) is not None
+    req.num_computed_tokens = 14
+    manager.new_step_starts()
+
+    pool = manager.block_pool
+
+    def has_mamba_state(boundary: int) -> bool:
+        block_hash = req.block_hashes[boundary // hash_block_size - 1]
+        return pool.get_cached_block(block_hash, kv_cache_group_ids=[1]) is not None
+
+    assert has_mamba_state(8)
+    assert not has_mamba_state(10)
+    assert not has_mamba_state(12)
+    assert has_mamba_state(14)
+
+
+def test_dspark_keeps_only_usable_pmu_snapshot(monkeypatch):
+    """DSpark retains its replay state, not the adjacent lookahead state."""
+    monkeypatch.setenv("VLLM_PREFIX_CACHE_RETENTION_INTERVAL", "0")
+    hash_block_size = 2
+    block_size = 8
+    kv_cache_config = KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+                is_eagle_group=True,
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        use_eagle=True,
+    )
+
+    owner = make_request("owner", list(range(14)), hash_block_size, sha256)
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(owner)
+    assert manager.allocate_slots(owner, 8, num_computed, computed_blocks) is not None
+    owner.num_computed_tokens = 8
+    manager.new_step_starts()
+    assert manager.allocate_slots(owner, 4) is not None
+    owner.num_computed_tokens = 12
+    manager.new_step_starts()
+    assert manager.allocate_slots(owner, 2) is not None
+    replay_offloads = manager.take_partial_tail_offloads()
+    assert [boundary for _, _, boundary in replay_offloads["owner"]] == [12]
+    owner.num_computed_tokens = 14
+    manager.new_step_starts()
+
+    pool = manager.block_pool
+
+    def has_mamba_state(boundary: int) -> bool:
+        block_hash = owner.block_hashes[boundary // hash_block_size - 1]
+        return pool.get_cached_block(block_hash, kv_cache_group_ids=[1]) is not None
+
+    assert has_mamba_state(8)
+    assert not has_mamba_state(10)
+    assert has_mamba_state(12)
+    assert not has_mamba_state(14)
+
+    replay = make_request("replay", list(range(14)) + [99, 100], 2, sha256)
+    _, num_computed, _ = manager.get_computed_blocks(replay)
+    assert num_computed == 12
+
+    # The latest PMU boundary is an attention lookahead only. Continuing the
+    # request must not create a second Mamba snapshot or Mooncake handoff.
+    owner.append_output_token_ids([101])
+    assert manager.allocate_slots(owner, 1) is not None
+    assert manager.take_partial_tail_offloads() == {}

@@ -14,6 +14,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import (
     worker as mooncake_store_worker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator import (  # noqa: E501
+    ExternalCachedBlockPool,
     MooncakeStoreCoordinator,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
@@ -441,6 +442,103 @@ def test_sub_block_partial_tail_offload_reads_cow_block():
     assert store.puts[fa_key] == [512]
     # Mamba reads the CoW block 7, not block_ids[1][0]=2.
     assert store.puts[mamba_key] == [10_000 + mamba_cow_block * 512]
+
+
+def test_dspark_pre_reconciled_pmu_boundary_round_trip():
+    """Mooncake reuses the replay snapshot without a lookahead snapshot."""
+    hash_block_size = 2
+    block_size = 8
+    full = FullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=8,
+        head_size=64,
+        dtype=None,
+    )
+    mamba = MambaSpec(
+        block_size=block_size,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+    groups = [
+        KVCacheGroupSpec(["L0"], full, is_eagle_group=True),
+        KVCacheGroupSpec(["L1"], mamba),
+    ]
+    coord = MooncakeStoreCoordinator(
+        groups,
+        scheduler_block_size=block_size,
+        hash_block_size=hash_block_size,
+        use_eagle=True,
+        retention_interval=0,
+    )
+    store = _DictStore()
+    token_dbs = []
+    for group_id in range(2):
+        db = ChunkedTokenDatabase(
+            KeyMetadata("m", 0, 0, 0, 0, group_id=group_id),
+            block_size=block_size,
+            hash_block_size=hash_block_size,
+        )
+        db.set_kv_caches_base_addr([group_id * 10_000])
+        db.set_block_len([512])
+        token_dbs.append(db)
+
+    send = KVCacheStoreSendingThread(
+        store=store,
+        coord=coord,
+        token_databases=token_dbs,
+        block_size=block_size,
+        tp_rank=0,
+        group_put_steps=[1, 1],
+        kv_role="kv_both",
+        ready_event=threading.Event(),
+        replicate_config=MagicMock(),
+    )
+    hashes = [BlockHash(bytes([i + 1]) * 4) for i in range(7)]
+
+    def offload(boundary: int, mamba_cow_block: int) -> None:
+        req = ReqMeta(
+            req_id="dspark",
+            token_len_chunk=0,
+            block_ids=([1, 2], [3, 4]),
+            block_hashes=hashes,
+            can_save=True,
+            num_prompt_tokens=14,
+            partial_tail_offloads=[(1, mamba_cow_block, boundary)],
+        )
+        assert send._maybe_offload_partial_tail(req)
+
+    # prompt=14 and PMU=2: all groups store the usable replay state at 12.
+    offload(12, mamba_cow_block=7)
+
+    expected_keys = {
+        token_dbs[group_id].key_for(hashes[boundary // hash_block_size - 1])
+        for group_id in range(2)
+        for boundary in (8, 12)
+    }
+    assert expected_keys == store._data.keys()
+
+    exists = {
+        (group_id, bytes(hashes[boundary // hash_block_size - 1]))
+        for group_id in range(2)
+        for boundary in (8, 12)
+    }
+    _, hit_length = coord.find_longest_cache_hit(
+        hashes,
+        max_length=15,
+        cached_block_pool=ExternalCachedBlockPool(hash_block_size, exists),
+    )
+    assert hit_length == 12
+
+    # The pre-reconciled shortcut is valid only when every group has the
+    # replay boundary. Missing Mamba state must fall back to the coarse hit.
+    exists.remove((1, bytes(hashes[12 // hash_block_size - 1])))
+    _, hit_length = coord.find_longest_cache_hit(
+        hashes,
+        max_length=15,
+        cached_block_pool=ExternalCachedBlockPool(hash_block_size, exists),
+    )
+    assert hit_length == 8
 
 
 def test_offload_syncs_event_before_put():

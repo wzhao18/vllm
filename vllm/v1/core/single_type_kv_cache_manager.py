@@ -1263,6 +1263,7 @@ class MambaManager(SingleTypeKVCacheManager):
         self.block_size = kv_cache_spec.block_size
         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
+        self.cache_speculative_replay_tail = False
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
         if self.mamba_cache_mode == "align":
             # Mapping from request ID to the index of the block
@@ -1715,7 +1716,12 @@ class MambaManager(SingleTypeKVCacheManager):
         latest_prompt_hash_boundary = (
             request.num_prompt_tokens // hash_block_size
         ) * hash_block_size
-        if num_tokens != latest_prompt_hash_boundary:
+        cacheable_boundary = (
+            latest_prompt_hash_boundary - hash_block_size
+            if self.cache_speculative_replay_tail
+            else latest_prompt_hash_boundary
+        )
+        if num_tokens != cacheable_boundary:
             return None
 
         block_idx = num_tokens // self.block_size

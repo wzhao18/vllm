@@ -533,8 +533,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
         return True
 
     def _maybe_offload_partial_tail(self, req_meta: ReqMeta) -> bool:
-        """Offload the request's sub-block partial tail (its last prompt hash
-        boundary) so a later request can hit the sub-block prefix.
+        """Offload a request's selected sub-block PMU boundary so a later
+        request can hit the sub-block prefix.
 
         Covers every block from the normal save's lcm floor to the boundary:
         the normal save floors to ``lcm_block_size``, so a smaller-block
