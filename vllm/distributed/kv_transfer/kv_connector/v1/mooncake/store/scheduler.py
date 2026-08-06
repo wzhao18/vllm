@@ -17,6 +17,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator imp
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  # noqa: E501
     LoadSpec,
     MooncakeStoreConnectorMetadata,
+    MooncakeStoreWorkerMetadata,
     ReqMeta,
     RequestTracker,
 )
@@ -24,10 +25,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker import (
     LookupKeyClient,
 )
 from vllm.logger import init_logger
+from vllm.utils.math_utils import cdiv
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -69,12 +73,100 @@ class MooncakeStoreScheduler:
         self.enable_partial_hash_hits = partial_hash_hits_enabled(
             kv_cache_config.kv_cache_groups, self._hash_block_size
         )
+        self._group_block_sizes = tuple(
+            self._block_size
+            if len(kv_cache_config.kv_cache_groups) == 1
+            else group.kv_cache_spec.block_size
+            for group in kv_cache_config.kv_cache_groups
+        )
 
         # Per-request state
         self.load_specs: dict[str, LoadSpec] = {}  # to be loaded
         self._request_trackers: dict[str, RequestTracker] = {}  # scheduled new requests
         self._unfinished_requests: dict[str, tuple[Request, tuple[list[int], ...]]] = {}
         self._unfinished_request_ids: set[str] = set()
+
+        self._gpu_block_pool: BlockPool | None = None
+        self._store_event_counter = 0
+        self._expected_worker_count = vllm_config.parallel_config.world_size
+        self._store_event_pending_counts: dict[int, int] = {}
+        self._store_event_to_block_ids: dict[int, list[int]] = {}
+
+    def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
+        self._gpu_block_pool = gpu_block_pool
+
+    def _pin_store_event(self, metadata: MooncakeStoreConnectorMetadata) -> None:
+        requests = [request for request in metadata.requests if request.can_save]
+        if not requests:
+            return
+
+        block_ids_to_pin: set[int] = set()
+        for request in requests:
+            for block_size, group in zip(
+                self._group_block_sizes, request.block_ids, strict=True
+            ):
+                first_block = cdiv(request.store_start_tokens, block_size)
+                end_block = cdiv(request.token_len_chunk, block_size)
+                block_ids_to_pin.update(
+                    block_id
+                    for block_id in group[first_block:end_block]
+                    if block_id != 0
+                )
+            if (
+                request.partial_tail_offloads
+                and request.partial_tail_offloads[0][2] > 0
+            ):
+                boundary = request.partial_tail_offloads[0][2]
+                for block_size, group in zip(
+                    self._group_block_sizes, request.block_ids, strict=True
+                ):
+                    last_block = cdiv(boundary, block_size) - 1
+                    first_block = min(
+                        request.store_start_tokens // block_size, last_block
+                    )
+                    block_ids_to_pin.update(
+                        block_id
+                        for block_id in group[first_block : last_block + 1]
+                        if block_id != 0
+                    )
+        block_ids_to_pin.update(
+            block_id
+            for request in requests
+            for _, block_id, _ in request.partial_tail_offloads or ()
+            if block_id != 0
+        )
+        block_ids = sorted(block_ids_to_pin)
+        if not block_ids:
+            return
+
+        assert self._gpu_block_pool is not None
+        blocks = [self._gpu_block_pool.blocks[block_id] for block_id in block_ids]
+        self._gpu_block_pool.touch(blocks)
+
+        event = self._store_event_counter
+        self._store_event_counter += 1
+        self._store_event_to_block_ids[event] = block_ids
+        for request in requests:
+            request.store_event = event
+
+    def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
+        metadata = connector_output.kv_connector_worker_meta
+        if not isinstance(metadata, MooncakeStoreWorkerMetadata):
+            return
+
+        for event, count in metadata.completed_store_events.items():
+            pending = self._store_event_pending_counts.get(event, 0) + count
+            if pending < self._expected_worker_count:
+                self._store_event_pending_counts[event] = pending
+                continue
+
+            assert pending == self._expected_worker_count
+            self._store_event_pending_counts.pop(event, None)
+            block_ids = self._store_event_to_block_ids.pop(event)
+            assert self._gpu_block_pool is not None
+            self._gpu_block_pool.free_blocks(
+                self._gpu_block_pool.blocks[block_id] for block_id in block_ids
+            )
 
     def get_num_new_matched_tokens(
         self,
@@ -135,9 +227,7 @@ class MooncakeStoreScheduler:
         num_external_tokens: int,
     ):
         """Update state after block allocation."""
-        local_block_ids: tuple[list[int], ...] = ()
-        if num_external_tokens > 0:
-            local_block_ids = blocks.get_block_ids()
+        local_block_ids = blocks.get_block_ids()
 
         self._unfinished_requests[request.request_id] = (request, local_block_ids)
         self._unfinished_request_ids.add(request.request_id)
@@ -182,6 +272,15 @@ class MooncakeStoreScheduler:
             if request_tracker := self._request_trackers.get(req_id):
                 request_tracker.reset()
             self._unfinished_requests.pop(req_id, None)
+
+        # Reconcile integer-only trackers with the authoritative manager block
+        # tables after SWA/Mamba reclamation and this step's allocations.
+        for req_id, tracker in self._request_trackers.items():
+            request_tuple = self._unfinished_requests.get(req_id)
+            if request_tuple is not None:
+                tracker.allocated_block_ids = tuple(
+                    group.copy() for group in request_tuple[1]
+                )
 
         meta = MooncakeStoreConnectorMetadata(
             self._unfinished_request_ids,
@@ -302,8 +401,6 @@ class MooncakeStoreScheduler:
                     prefill_end = request_tracker.prefill_end_tokens
                     if num_computed_token >= prefill_end:
                         continue
-                    request_tracker.update(new_block_ids)
-
                     last_chunk_tokens_num = (
                         prefill_end // self._block_size * self._block_size
                     )
@@ -384,9 +481,11 @@ class MooncakeStoreScheduler:
                         can_save=True,
                         num_prompt_tokens=tracker.prefill_end_tokens,
                         partial_tail_offloads=groups,
+                        store_start_tokens=tracker.num_saved_tokens,
                     )
                 )
 
+        self._pin_store_event(meta)
         return meta
 
     def request_finished(
@@ -394,25 +493,17 @@ class MooncakeStoreScheduler:
         request: Request,
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
-        """Determine whether to delay freeing blocks for async save."""
+        """Keep the engine stepping until the final store event completes."""
         if self.kv_role == "kv_consumer":
             return False, None
         tracker = self._request_trackers.get(request.request_id)
-        # Missing tracker can happen when the request is aborted before the
-        # connector observes the normal finished lifecycle or is preempted
-        # before finishing.
         if tracker is None or (
             tracker.num_saved_tokens <= 0 and not tracker.has_pending_offload
         ):
             return False, None
-        total_blocks = sum(len(g) for g in block_ids)
-        delay_free_blocks = total_blocks > 0
+        delay_free_blocks = any(block_ids)
         if delay_free_blocks:
-            logger.debug(
-                "Delaying free of %d blocks for request %s",
-                total_blocks,
-                request.request_id,
-            )
+            logger.debug("Delaying block free for request %s", request.request_id)
         return delay_free_blocks, None
 
     def reset_store(self) -> bool:

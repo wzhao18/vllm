@@ -5,12 +5,16 @@ from types import SimpleNamespace
 
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
     LoadSpec,
+    MooncakeStoreConnectorMetadata,
+    MooncakeStoreWorkerMetadata,
     ReqMeta,
     RequestTracker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.scheduler import (
     MooncakeStoreScheduler,
 )
+from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.outputs import KVConnectorOutput
 
 
 def _make_bare_scheduler(
@@ -22,10 +26,16 @@ def _make_bare_scheduler(
     scheduler._block_size = 16
     scheduler._hash_block_size = hash_block_size
     scheduler.enable_partial_hash_hits = enable_partial_hash_hits
+    scheduler._group_block_sizes = (16,)
     scheduler.load_specs = {}
     scheduler._unfinished_request_ids = {"req-0"}
     scheduler._unfinished_requests = {}
     scheduler._request_trackers = {}
+    scheduler._gpu_block_pool = BlockPool(16, True, hash_block_size)
+    scheduler._store_event_counter = 0
+    scheduler._expected_worker_count = 1
+    scheduler._store_event_pending_counts = {}
+    scheduler._store_event_to_block_ids = {}
     return scheduler
 
 
@@ -75,7 +85,7 @@ def _add_unfinished_request(
         block_hashes=block_hashes,
         num_output_placeholders=0,
     )
-    scheduler._unfinished_requests["req-0"] = (request, ([0, 1],))
+    scheduler._unfinished_requests["req-0"] = (request, ([0, 1, 2],))
     scheduler._request_trackers["req-0"] = RequestTracker(
         req_id="req-0",
         token_len=44,
@@ -130,6 +140,43 @@ def test_cached_request_without_spec_decode_keeps_current_step_save_overlap():
     tracker = scheduler._request_trackers["req-0"]
     assert tracker.token_len == 48
     assert tracker.num_saved_tokens == 48
+
+
+def test_store_event_pin_survives_request_free_until_all_workers_complete():
+    scheduler = _make_bare_scheduler()
+    scheduler._expected_worker_count = 2
+    block_pool = scheduler._gpu_block_pool
+    assert block_pool is not None
+    previous, source = block_pool.get_new_blocks(2)
+    metadata = MooncakeStoreConnectorMetadata(set(), set())
+    request = ReqMeta(
+        req_id="req-0",
+        token_len_chunk=16,
+        block_ids=([previous.block_id, source.block_id],),
+        block_hashes=[b"h0", b"h1"],
+        can_save=True,
+        store_start_tokens=16,
+    )
+    metadata.add_request(request)
+
+    scheduler._pin_store_event(metadata)
+    block_pool.free_blocks([previous, source])
+
+    assert request.store_event == 0
+    assert previous.ref_cnt == 0
+    assert source.ref_cnt == 1
+    assert block_pool.get_num_free_blocks() == 14
+
+    scheduler.update_connector_output(
+        KVConnectorOutput(kv_connector_worker_meta=MooncakeStoreWorkerMetadata({0: 1}))
+    )
+    assert source.ref_cnt == 1
+
+    scheduler.update_connector_output(
+        KVConnectorOutput(kv_connector_worker_meta=MooncakeStoreWorkerMetadata({0: 1}))
+    )
+    assert source.ref_cnt == 0
+    assert block_pool.get_num_free_blocks() == 15
 
 
 def test_preemption_resets_tracker_before_request_finished():

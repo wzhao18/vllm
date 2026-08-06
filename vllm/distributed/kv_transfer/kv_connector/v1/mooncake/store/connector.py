@@ -37,6 +37,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -193,6 +194,10 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
             request, blocks, num_external_tokens
         )
 
+    def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.bind_gpu_block_pool(gpu_block_pool)
+
     def build_connector_meta(
         self,
         scheduler_output: SchedulerOutput,
@@ -233,6 +238,9 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
         return None
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.update_connector_output(connector_output)
+
         kv_cache_events = connector_output.kv_cache_events
         if not kv_cache_events or not isinstance(
             kv_cache_events, MooncakeStoreKVEvents
@@ -246,6 +254,11 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
             self._kv_cache_events.increment_workers(
                 kv_cache_events.get_number_of_workers()
             )
+
+    def build_connector_worker_meta(self):
+        if self.connector_worker is None:
+            return None
+        return self.connector_worker.build_connector_worker_meta()
 
     def take_events(self) -> Iterable[KVCacheEvent]:
         if self._kv_cache_events is not None:

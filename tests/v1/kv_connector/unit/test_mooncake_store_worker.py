@@ -28,6 +28,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
     ChunkedTokenDatabase,
     KeyMetadata,
     LoadSpec,
+    MooncakeStoreWorkerMetadata,
     PoolKey,
     ReqMeta,
 )
@@ -844,9 +845,8 @@ def test_store_sending_thread_only_skips_on_no_available_handle():
     assert store.batch_put_from_multi_buffers.call_count == 2
 
 
-def test_store_sending_thread_releases_pin_on_batch_is_exist_failure():
-    # `batch_is_exist` raising must still decrement `stored_requests` so the
-    # scheduler can drop `delay_free_blocks` and release the pinned GPU blocks.
+def test_store_sending_thread_completes_accounting_on_batch_is_exist_failure():
+    # `batch_is_exist` raising must still decrement `stored_requests`.
     store = MagicMock()
     store.batch_is_exist.side_effect = RuntimeError("mooncake down")
     thread = _make_store_sending_thread(store)
@@ -859,9 +859,8 @@ def test_store_sending_thread_releases_pin_on_batch_is_exist_failure():
     store.batch_put_from_multi_buffers.assert_not_called()
 
 
-def test_store_sending_thread_releases_pin_on_batch_put_failure():
-    # `batch_put_from_multi_buffers` raising is logged (not re-raised), and the
-    # pin must still be released through the finally block.
+def test_store_sending_thread_completes_accounting_on_batch_put_failure():
+    # `batch_put_from_multi_buffers` raising is logged rather than re-raised.
     store = MagicMock()
     store.batch_is_exist.return_value = [0, 0]
     store.batch_put_from_multi_buffers.side_effect = RuntimeError("rdma error")
@@ -871,6 +870,54 @@ def test_store_sending_thread_releases_pin_on_batch_put_failure():
     thread._handle_request(_make_store_req("req-a", [b"a0", b"a1"]))
 
     assert thread.stored_requests["req-a"] == 0
+
+
+def test_store_event_completion_abandons_failed_range_before_pin_release():
+    store = MagicMock()
+    store.batch_is_exist.return_value = [0, 0]
+    store.batch_put_from_multi_buffers.side_effect = RuntimeError("rdma error")
+    thread = _make_store_sending_thread(store)
+    request = _make_store_req("req-a", [b"a0", b"a1"])
+    request.store_event = 7
+    thread.register_store_event(7, 1)
+    thread.add_stored_request("req-a")
+
+    thread._handle_request(request)
+
+    assert thread._saved_offset["req-a"] == 32
+    assert thread.take_completed_store_events() == {7}
+
+
+def test_store_event_completes_after_every_request():
+    store = MagicMock()
+    store.batch_is_exist.return_value = [1, 1]
+    thread = _make_store_sending_thread(store)
+    requests = [
+        _make_store_req("req-a", [b"a0", b"a1"]),
+        _make_store_req("req-b", [b"b0", b"b1"]),
+    ]
+    thread.register_store_event(9, len(requests))
+
+    for request in requests:
+        request.store_event = 9
+        thread.add_stored_request(request.req_id)
+
+    thread._handle_request(requests[0])
+    assert thread.take_completed_store_events() == set()
+    thread._handle_request(requests[1])
+
+    assert thread.take_completed_store_events() == {9}
+
+
+def test_store_worker_reports_completed_store_events():
+    send_thread = MagicMock()
+    send_thread.take_completed_store_events.return_value = {3, 5}
+    store_worker = object.__new__(mooncake_store_worker.MooncakeStoreWorker)
+    store_worker.kv_send_thread = send_thread
+
+    metadata = store_worker.build_connector_worker_meta()
+
+    assert metadata == MooncakeStoreWorkerMetadata({3: 1, 5: 1})
 
 
 def test_store_recving_thread_reports_failed_block_ids():

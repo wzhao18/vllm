@@ -6,7 +6,7 @@
 """Data classes for MooncakeStoreConnector."""
 
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import cast
 
 import numpy as np
@@ -14,6 +14,7 @@ import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
+    KVConnectorWorkerMetadata,
 )
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
@@ -332,23 +333,6 @@ class RequestTracker:
         self.has_pending_offload = False
         self.prefill_end_tokens = 0
 
-    def update(
-        self,
-        new_block_ids: tuple[list[int], ...] | list[int],
-    ) -> None:
-        # Backward-compat: accept a single list (broadcast to single group).
-        if isinstance(new_block_ids, list):
-            new_block_ids = (new_block_ids,)
-        if len(new_block_ids) != len(self.allocated_block_ids):
-            raise ValueError(
-                f"Group count mismatch: tracker has "
-                f"{len(self.allocated_block_ids)} groups, update has "
-                f"{len(new_block_ids)}"
-            )
-        for existing, new in zip(self.allocated_block_ids, new_block_ids, strict=True):
-            if new:
-                existing.extend(new)
-
 
 @dataclass
 class ReqMeta:
@@ -371,6 +355,8 @@ class ReqMeta:
     # Present only on the producer's CoW step; drives the connector's offload
     # (the FA group's block is derived from block_ids and boundary_tokens).
     partial_tail_offloads: list[tuple[int, int, int]] | None = None
+    store_event: int | None = None
+    store_start_tokens: int = 0
 
     @staticmethod
     def from_request_tracker(
@@ -386,7 +372,8 @@ class ReqMeta:
             block_hashes = []
         input_token_len = tracker.token_len
 
-        chunk_boundary = cdiv(tracker.num_saved_tokens + 1, block_size) * block_size
+        store_start_tokens = tracker.num_saved_tokens
+        chunk_boundary = cdiv(store_start_tokens + 1, block_size) * block_size
         num_tokens_to_save = input_token_len // block_size * block_size
 
         skip_save = skip_save or num_tokens_to_save < chunk_boundary
@@ -431,6 +418,7 @@ class ReqMeta:
             is_last_chunk=is_last_chunk,
             token_ids=token_ids,
             num_prompt_tokens=tracker.prefill_end_tokens,
+            store_start_tokens=store_start_tokens,
         )
 
 
@@ -448,3 +436,19 @@ class MooncakeStoreConnectorMetadata(KVConnectorMetadata):
 
     def add_request(self, req_meta: ReqMeta) -> None:
         self.requests.append(req_meta)
+
+
+@dataclass
+class MooncakeStoreWorkerMetadata(KVConnectorWorkerMetadata):
+    """Store events completed by one worker since its previous report."""
+
+    completed_store_events: dict[int, int] = field(default_factory=dict)
+
+    def aggregate(
+        self, other: "KVConnectorWorkerMetadata"
+    ) -> "MooncakeStoreWorkerMetadata":
+        assert isinstance(other, MooncakeStoreWorkerMetadata)
+        completed = dict(self.completed_store_events)
+        for event, count in other.completed_store_events.items():
+            completed[event] = completed.get(event, 0) + count
+        return MooncakeStoreWorkerMetadata(completed)

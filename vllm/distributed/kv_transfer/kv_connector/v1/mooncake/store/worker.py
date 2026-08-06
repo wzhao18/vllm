@@ -49,6 +49,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  
     ChunkedTokenDatabase,
     KeyMetadata,
     MooncakeStoreConnectorMetadata,
+    MooncakeStoreWorkerMetadata,
     PoolKey,
     ReqMeta,
 )
@@ -487,9 +488,34 @@ class KVCacheStoreSendingThread(KVTransferThread):
         self._store_pressure_active = False
         self._skip_store_requests: set[str] = set()
 
-        # Per-request high-water mark of tokens actually persisted; the next
-        # batch resumes here, so pressure-skipped or failed ranges are retried.
+        # Per-request high-water mark that the next store starts from. Failed
+        # event ranges are abandoned when their source block pins are released.
         self._saved_offset: dict[str, int] = {}
+        self._store_event_pending: dict[int, int] = {}
+        self._completed_store_events: set[int] = set()
+
+    def register_store_event(self, event: int, num_requests: int) -> None:
+        assert num_requests > 0
+        with self.done_task_lock:
+            assert event not in self._store_event_pending
+            self._store_event_pending[event] = num_requests
+
+    def _complete_store_event(self, event: int | None) -> None:
+        if event is None:
+            return
+        with self.done_task_lock:
+            pending = self._store_event_pending[event] - 1
+            if pending == 0:
+                del self._store_event_pending[event]
+                self._completed_store_events.add(event)
+            else:
+                self._store_event_pending[event] = pending
+
+    def take_completed_store_events(self) -> set[int]:
+        with self.done_task_lock:
+            completed = self._completed_store_events
+            self._completed_store_events = set()
+        return completed
 
     def add_stored_request(self, req_id: str):
         with self.done_task_lock:
@@ -700,6 +726,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         current_event = req_meta.current_event
 
         if req_id not in self.stored_requests:
+            self._complete_store_event(req_meta.store_event)
             self.request_queue.task_done()
             return
 
@@ -921,6 +948,15 @@ class KVCacheStoreSendingThread(KVTransferThread):
             if self.enable_kv_event and stored_events:
                 self.update_kv_event(stored_events)
         finally:
+            # Once this event releases its block pins, an unsaved range cannot
+            # be retried safely from the same integer block IDs.
+            if req_meta.store_event is not None:
+                with self.done_task_lock:
+                    if req_id in self.stored_requests:
+                        self._saved_offset[req_id] = max(
+                            self._saved_offset.get(req_id, 0), token_len
+                        )
+            self._complete_store_event(req_meta.store_event)
             self.dec_stored_request(req_id)
             self.request_queue.task_done()
 
@@ -1560,9 +1596,24 @@ class MooncakeStoreWorker:
                     current_event.record()
                     break
 
-            for request in meta.requests:
-                if not request.can_save:
-                    continue
+            save_requests = [request for request in meta.requests if request.can_save]
+            store_events = {
+                request.store_event
+                for request in save_requests
+                if request.store_event is not None
+            }
+            assert len(store_events) <= 1
+            if store_events:
+                assert self.kv_send_thread is not None
+                store_event = store_events.pop()
+                self.kv_send_thread.register_store_event(
+                    store_event,
+                    sum(
+                        request.store_event == store_event for request in save_requests
+                    ),
+                )
+
+            for request in save_requests:
                 request.current_event = current_event
                 assert self.kv_send_thread is not None
                 self.kv_send_thread.add_stored_request(request.req_id)
@@ -1587,6 +1638,14 @@ class MooncakeStoreWorker:
             self.tp_rank,
         )
         return done_sending, done_recving
+
+    def build_connector_worker_meta(self) -> MooncakeStoreWorkerMetadata | None:
+        if self.kv_send_thread is None:
+            return None
+        completed = self.kv_send_thread.take_completed_store_events()
+        if not completed:
+            return None
+        return MooncakeStoreWorkerMetadata({event: 1 for event in completed})
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         block_ids: set[int] = set()
