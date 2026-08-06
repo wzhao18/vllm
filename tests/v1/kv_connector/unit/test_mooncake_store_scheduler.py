@@ -151,7 +151,7 @@ def test_store_event_pin_survives_request_free_until_all_workers_complete():
     metadata = MooncakeStoreConnectorMetadata(set(), set())
     request = ReqMeta(
         req_id="req-0",
-        token_len_chunk=16,
+        token_len_chunk=32,
         block_ids=([previous.block_id, source.block_id],),
         block_hashes=[b"h0", b"h1"],
         can_save=True,
@@ -731,11 +731,19 @@ def test_pending_partial_tail_emits_offload_only_reqmeta():
     assert req_meta.partial_tail_offloads == [(1, 7, 12)]
     assert req_meta.num_prompt_tokens == 12
     assert req_meta.block_ids == ([0],)
+    assert req_meta.store_event == 0
+    block_pool = scheduler._gpu_block_pool
+    assert block_pool is not None
+    assert block_pool.blocks[7].ref_cnt == 1
     tracker = scheduler._request_trackers["req-0"]
     assert tracker.num_saved_tokens == 0
     assert tracker.has_pending_offload is True
     request = SimpleNamespace(request_id="req-0")
     assert scheduler.request_finished(request, ([0],)) == (True, None)
+    scheduler.update_connector_output(
+        KVConnectorOutput(kv_connector_worker_meta=MooncakeStoreWorkerMetadata({0: 1}))
+    )
+    assert block_pool.blocks[7].ref_cnt == 0
 
 
 def test_resumed_partial_tail_uses_handoff_boundary():

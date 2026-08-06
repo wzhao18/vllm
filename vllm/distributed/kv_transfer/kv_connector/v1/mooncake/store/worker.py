@@ -730,9 +730,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
             self.request_queue.task_done()
             return
 
-        # Decrement the in-flight counter and signal task_done() in `finally`
-        # so the scheduler can release the GPU blocks it pinned for this
-        # request (via `delay_free_blocks`) even when the store path raises.
+        # Complete the store event and request accounting even when the store
+        # path raises, so the scheduler can release its source-block refs.
         try:
             if self._should_skip_request(req_id):
                 logger.debug(
