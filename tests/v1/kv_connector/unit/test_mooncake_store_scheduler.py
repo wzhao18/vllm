@@ -31,7 +31,6 @@ def _make_bare_scheduler(
     scheduler._unfinished_request_ids = {"req-0"}
     scheduler._unfinished_requests = {}
     scheduler._request_trackers = {}
-    scheduler._early_free_group_ids = {0}
     scheduler._pending_store_block_ids = set()
     return scheduler
 
@@ -139,14 +138,14 @@ def test_cached_request_without_spec_decode_keeps_current_step_save_overlap():
     assert tracker.num_saved_tokens == 48
 
 
-def test_early_free_store_sources_are_tracked_until_reuse():
+def test_store_sources_are_tracked_until_reuse():
     scheduler = _make_bare_scheduler()
     metadata = MooncakeStoreConnectorMetadata(set(), set())
     metadata.add_request(
         ReqMeta(
             req_id="req-0",
             token_len_chunk=48,
-            block_ids=([0, 7, 9],),
+            block_ids=([0, 7], [9, 11]),
             block_hashes=[b"h0", b"h1", b"h2"],
             can_save=True,
         )
@@ -154,7 +153,7 @@ def test_early_free_store_sources_are_tracked_until_reuse():
 
     scheduler._register_store_sources(metadata)
 
-    assert scheduler._pending_store_block_ids == {7, 9}
+    assert scheduler._pending_store_block_ids == {7, 9, 11}
 
 
 def test_reallocated_store_source_requests_pre_overwrite_flush():

@@ -12,7 +12,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator import (  # noqa: E501
-    _unwrap_spec,
     partial_hash_hits_enabled,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  # noqa: E501
@@ -28,7 +27,7 @@ from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec, SlidingWindowSpec
+from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -77,17 +76,9 @@ class MooncakeStoreScheduler:
         self._unfinished_requests: dict[str, tuple[Request, tuple[list[int], ...]]] = {}
         self._unfinished_request_ids: set[str] = set()
 
-        # Full-attention blocks remain request-owned until request_finished().
-        # Mamba and SWA can release blocks while a request is still running, so
-        # remember their queued store sources until a reuse fence drains them.
-        self._early_free_group_ids = {
-            group_id
-            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
-            if isinstance(
-                _unwrap_spec(group.kv_cache_spec),
-                (MambaSpec, SlidingWindowSpec),
-            )
-        }
+        # Mamba and SWA can release blocks while a request is running. Other
+        # groups can release them on preemption. Keep all queued store sources
+        # until a reuse fence drains them.
         self._pending_store_block_ids: set[int] = set()
 
     @staticmethod
@@ -109,27 +100,20 @@ class MooncakeStoreScheduler:
         return block_ids
 
     def _register_store_sources(self, metadata: MooncakeStoreConnectorMetadata) -> None:
-        if not self._early_free_group_ids:
-            return
         for request in metadata.requests:
             if not request.can_save:
                 continue
-            for group_id in self._early_free_group_ids:
-                if group_id >= len(request.block_ids):
-                    continue
-                self._pending_store_block_ids.update(
-                    block_id
-                    for block_id in request.block_ids[group_id]
-                    if block_id != 0
-                )
+            self._pending_store_block_ids.update(
+                block_id
+                for group in request.block_ids
+                for block_id in group
+                if block_id != 0
+            )
 
     def _drop_reused_store_sources(self, block_ids: set[int]) -> None:
         """Remove stale positions before appending their new allocations."""
         for tracker in self._request_trackers.values():
-            for group_id in self._early_free_group_ids:
-                if group_id >= len(tracker.allocated_block_ids):
-                    continue
-                group = tracker.allocated_block_ids[group_id]
+            for group in tracker.allocated_block_ids:
                 for index, block_id in enumerate(group):
                     if block_id in block_ids:
                         group[index] = 0
