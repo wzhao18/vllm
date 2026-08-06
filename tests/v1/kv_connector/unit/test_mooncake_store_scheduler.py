@@ -2,9 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.connector import (
+    MooncakeStoreConnector,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
     LoadSpec,
+    MooncakeStoreConnectorMetadata,
     ReqMeta,
     RequestTracker,
 )
@@ -26,6 +31,8 @@ def _make_bare_scheduler(
     scheduler._unfinished_request_ids = {"req-0"}
     scheduler._unfinished_requests = {}
     scheduler._request_trackers = {}
+    scheduler._early_free_group_ids = {0}
+    scheduler._pending_store_block_ids = set()
     return scheduler
 
 
@@ -130,6 +137,107 @@ def test_cached_request_without_spec_decode_keeps_current_step_save_overlap():
     tracker = scheduler._request_trackers["req-0"]
     assert tracker.token_len == 48
     assert tracker.num_saved_tokens == 48
+
+
+def test_early_free_store_sources_are_tracked_until_reuse():
+    scheduler = _make_bare_scheduler()
+    metadata = MooncakeStoreConnectorMetadata(set(), set())
+    metadata.add_request(
+        ReqMeta(
+            req_id="req-0",
+            token_len_chunk=48,
+            block_ids=([0, 7, 9],),
+            block_hashes=[b"h0", b"h1", b"h2"],
+            can_save=True,
+        )
+    )
+
+    scheduler._register_store_sources(metadata)
+
+    assert scheduler._pending_store_block_ids == {7, 9}
+
+
+def test_reallocated_store_source_requests_pre_overwrite_flush():
+    scheduler = _make_bare_scheduler()
+    scheduler._pending_store_block_ids = {7, 9}
+    output = SimpleNamespace(
+        finished_req_ids=set(),
+        preempted_req_ids=set(),
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=[],
+            new_block_ids=[([7],)],
+            num_computed_tokens=[],
+            resumed_req_ids=set(),
+        ),
+        num_scheduled_tokens={},
+        scheduled_spec_decode_tokens={},
+    )
+
+    metadata = scheduler.build_connector_meta(output)
+
+    assert metadata.flush_store_queue is True
+    assert scheduler._pending_store_block_ids == set()
+
+
+def test_reallocated_source_is_removed_from_old_tracker_position():
+    scheduler = _make_bare_scheduler()
+    scheduler._pending_store_block_ids = {7}
+    scheduler._request_trackers["req-0"] = RequestTracker(
+        req_id="req-0",
+        token_len=16,
+        allocated_block_ids=([7],),
+    )
+    output = SimpleNamespace(
+        finished_req_ids=set(),
+        preempted_req_ids=set(),
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=[],
+            new_block_ids=[([7],)],
+            num_computed_tokens=[],
+            resumed_req_ids=set(),
+        ),
+        num_scheduled_tokens={},
+        scheduled_spec_decode_tokens={},
+    )
+
+    scheduler.build_connector_meta(output)
+
+    assert scheduler._request_trackers["req-0"].allocated_block_ids == ([0],)
+
+
+def test_unrelated_allocation_preserves_pending_store_sources():
+    scheduler = _make_bare_scheduler()
+    scheduler._pending_store_block_ids = {7, 9}
+    output = SimpleNamespace(
+        finished_req_ids=set(),
+        preempted_req_ids=set(),
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=[],
+            new_block_ids=[([11],)],
+            num_computed_tokens=[],
+            resumed_req_ids=set(),
+        ),
+        num_scheduled_tokens={},
+        scheduled_spec_decode_tokens={},
+    )
+
+    metadata = scheduler.build_connector_meta(output)
+
+    assert metadata.flush_store_queue is False
+    assert scheduler._pending_store_block_ids == {7, 9}
+
+
+def test_connector_flushes_before_reused_blocks_are_overwritten():
+    connector = object.__new__(MooncakeStoreConnector)
+    connector.connector_worker = MagicMock()
+    metadata = MooncakeStoreConnectorMetadata(set(), set(), flush_store_queue=True)
+
+    connector.handle_preemptions(metadata)
+
+    connector.connector_worker.flush_store_queue.assert_called_once_with()
 
 
 def test_preemption_resets_tracker_before_request_finished():

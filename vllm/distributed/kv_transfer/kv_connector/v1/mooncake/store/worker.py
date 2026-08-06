@@ -490,6 +490,10 @@ class KVCacheStoreSendingThread(KVTransferThread):
         # Per-request high-water mark of tokens actually persisted; the next
         # batch resumes here, so pressure-skipped or failed ranges are retried.
         self._saved_offset: dict[str, int] = {}
+        # Highest offset covered by a dequeued store. A reuse fence abandons
+        # unsaved ranges through this point because their source block IDs are
+        # no longer safe to retry after the fence releases them.
+        self._dequeued_offset: dict[str, int] = {}
 
     def add_stored_request(self, req_id: str):
         with self.done_task_lock:
@@ -506,12 +510,23 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 del self.stored_requests[req_id]
             self._skip_store_requests.discard(req_id)
             self._saved_offset.pop(req_id, None)
+            self._dequeued_offset.pop(req_id, None)
 
     def _record_saved(self, req_id: str, token_len: int) -> None:
         # Guard on liveness so a concurrent finish/preempt pop isn't recreated.
         with self.done_task_lock:
             if req_id in self.stored_requests:
                 self._saved_offset[req_id] = token_len
+
+    def abandon_dequeued_ranges(self) -> None:
+        """Do not retry store sources released by a completed reuse fence."""
+        with self.done_task_lock:
+            for req_id, token_len in self._dequeued_offset.items():
+                if req_id in self.stored_requests:
+                    self._saved_offset[req_id] = max(
+                        self._saved_offset.get(req_id, 0), token_len
+                    )
+            self._dequeued_offset.clear()
 
     def _should_skip_request(self, req_id: str) -> bool:
         with self.done_task_lock:
@@ -921,6 +936,11 @@ class KVCacheStoreSendingThread(KVTransferThread):
             if self.enable_kv_event and stored_events:
                 self.update_kv_event(stored_events)
         finally:
+            with self.done_task_lock:
+                if req_id in self.stored_requests:
+                    self._dequeued_offset[req_id] = max(
+                        self._dequeued_offset.get(req_id, 0), token_len
+                    )
             self.dec_stored_request(req_id)
             self.request_queue.task_done()
 
@@ -1587,6 +1607,12 @@ class MooncakeStoreWorker:
             self.tp_rank,
         )
         return done_sending, done_recving
+
+    def flush_store_queue(self) -> None:
+        """Wait until every previously queued store has released its source."""
+        if self.kv_send_thread is not None:
+            self.kv_send_thread.request_queue.join()
+            self.kv_send_thread.abandon_dequeued_ranges()
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         block_ids: set[int] = set()

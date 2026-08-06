@@ -200,6 +200,14 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.build_connector_meta(scheduler_output)
 
+    def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata):
+        """Fence queued stores before reused blocks are overwritten."""
+        assert isinstance(kv_connector_metadata, MooncakeStoreConnectorMetadata)
+        if not kv_connector_metadata.flush_store_queue:
+            return
+        assert self.connector_worker is not None
+        self.connector_worker.flush_store_queue()
+
     def request_finished(
         self,
         request: Request,

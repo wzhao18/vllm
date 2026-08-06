@@ -441,10 +441,14 @@ class MooncakeStoreConnectorMetadata(KVConnectorMetadata):
         self,
         unfinished_request_ids: set[str],
         preempted_req_ids: set[str],
+        flush_store_queue: bool = False,
     ):
         self.requests: list[ReqMeta] = []
         self.unfinished_request_ids = unfinished_request_ids
         self.preempted_req_ids = preempted_req_ids
+        # A newly allocated block aliases a source block in a queued store.
+        # Drain prior stores before the model runner zeros or overwrites it.
+        self.flush_store_queue = flush_store_queue
 
     def add_request(self, req_meta: ReqMeta) -> None:
         self.requests.append(req_meta)

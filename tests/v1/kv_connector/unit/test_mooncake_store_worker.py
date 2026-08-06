@@ -871,6 +871,11 @@ def test_store_sending_thread_releases_pin_on_batch_put_failure():
     thread._handle_request(_make_store_req("req-a", [b"a0", b"a1"]))
 
     assert thread.stored_requests["req-a"] == 0
+    assert thread._saved_offset.get("req-a", 0) == 0
+
+    thread.abandon_dequeued_ranges()
+
+    assert thread._saved_offset["req-a"] == 32
 
 
 def test_store_recving_thread_reports_failed_block_ids():
@@ -2615,6 +2620,20 @@ def test_store_worker_close_releases_store():
 
     store.close.assert_called_once_with()
     assert worker.store is None
+
+
+def test_flush_store_queue_waits_for_queued_sources():
+    worker = object.__new__(mooncake_store_worker.MooncakeStoreWorker)
+    request_queue = MagicMock()
+    worker.kv_send_thread = SimpleNamespace(
+        request_queue=request_queue,
+        abandon_dequeued_ranges=MagicMock(),
+    )
+
+    worker.flush_store_queue()
+
+    request_queue.join.assert_called_once_with()
+    worker.kv_send_thread.abandon_dequeued_ranges.assert_called_once_with()
 
 
 def test_store_worker_close_is_idempotent():

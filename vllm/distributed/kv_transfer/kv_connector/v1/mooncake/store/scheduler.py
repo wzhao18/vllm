@@ -12,6 +12,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator import (  # noqa: E501
+    _unwrap_spec,
     partial_hash_hits_enabled,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  # noqa: E501
@@ -27,7 +28,7 @@ from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec, SlidingWindowSpec
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -75,6 +76,63 @@ class MooncakeStoreScheduler:
         self._request_trackers: dict[str, RequestTracker] = {}  # scheduled new requests
         self._unfinished_requests: dict[str, tuple[Request, tuple[list[int], ...]]] = {}
         self._unfinished_request_ids: set[str] = set()
+
+        # Full-attention blocks remain request-owned until request_finished().
+        # Mamba and SWA can release blocks while a request is still running, so
+        # remember their queued store sources until a reuse fence drains them.
+        self._early_free_group_ids = {
+            group_id
+            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+            if isinstance(
+                _unwrap_spec(group.kv_cache_spec),
+                (MambaSpec, SlidingWindowSpec),
+            )
+        }
+        self._pending_store_block_ids: set[int] = set()
+
+    @staticmethod
+    def _new_block_ids(scheduler_output: SchedulerOutput) -> set[int]:
+        block_ids: set[int] = set()
+
+        def add(groups: tuple[list[int], ...] | list[int] | None) -> None:
+            if groups is None:
+                return
+            if isinstance(groups, list):
+                groups = (groups,)
+            for group in groups:
+                block_ids.update(block_id for block_id in group if block_id != 0)
+
+        for request in scheduler_output.scheduled_new_reqs:
+            add(request.block_ids)
+        for groups in scheduler_output.scheduled_cached_reqs.new_block_ids:
+            add(groups)
+        return block_ids
+
+    def _register_store_sources(self, metadata: MooncakeStoreConnectorMetadata) -> None:
+        if not self._early_free_group_ids:
+            return
+        for request in metadata.requests:
+            if not request.can_save:
+                continue
+            for group_id in self._early_free_group_ids:
+                if group_id >= len(request.block_ids):
+                    continue
+                self._pending_store_block_ids.update(
+                    block_id
+                    for block_id in request.block_ids[group_id]
+                    if block_id != 0
+                )
+
+    def _drop_reused_store_sources(self, block_ids: set[int]) -> None:
+        """Remove stale positions before appending their new allocations."""
+        for tracker in self._request_trackers.values():
+            for group_id in self._early_free_group_ids:
+                if group_id >= len(tracker.allocated_block_ids):
+                    continue
+                group = tracker.allocated_block_ids[group_id]
+                for index, block_id in enumerate(group):
+                    if block_id in block_ids:
+                        group[index] = 0
 
     def get_num_new_matched_tokens(
         self,
@@ -183,9 +241,22 @@ class MooncakeStoreScheduler:
                 request_tracker.reset()
             self._unfinished_requests.pop(req_id, None)
 
+        # Allocation only changes block-pool ownership. GPU zeroing and model
+        # writes happen later, after the worker's handle_preemptions() hook.
+        # If an early-free store source was reallocated, use that hook to drain
+        # all prior stores before its address is overwritten.
+        reused_store_sources = self._pending_store_block_ids & self._new_block_ids(
+            scheduler_output
+        )
+        flush_store_queue = bool(reused_store_sources)
+        if flush_store_queue:
+            self._drop_reused_store_sources(reused_store_sources)
+            self._pending_store_block_ids.clear()
+
         meta = MooncakeStoreConnectorMetadata(
             self._unfinished_request_ids,
             preempted_ids,
+            flush_store_queue=flush_store_queue,
         )
 
         # Handle new requests
@@ -386,6 +457,10 @@ class MooncakeStoreScheduler:
                         partial_tail_offloads=groups,
                     )
                 )
+
+        # These requests are queued after handle_preemptions() drains the prior
+        # queue, so keep their sources for conflict detection in later steps.
+        self._register_store_sources(meta)
 
         return meta
 
