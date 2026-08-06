@@ -213,7 +213,11 @@ def _make_vllm_config(
             prefill_context_parallel_size=1,
         ),
         kv_transfer_config=_FakeKVTransferConfig(extra_config=extra_config),
-        cache_config=SimpleNamespace(block_size=16, num_gpu_blocks=10),
+        cache_config=SimpleNamespace(
+            block_size=16,
+            num_gpu_blocks=10,
+            enable_prefix_caching=True,
+        ),
         kv_events_config=SimpleNamespace(enable_kv_cache_events=False),
         speculative_config=None,
     )
@@ -626,7 +630,7 @@ def _make_partial_tail_req(block_ids: list[int]) -> ReqMeta:
         block_ids=(block_ids,),
         block_hashes=[b"a0", b"a1", b"a2"],
         can_save=True,
-        partial_tail_offloads=[(1, 7, 12)],
+        mamba_checkpoint_offloads=[(1, 7, 12)],
     )
 
 
@@ -636,7 +640,7 @@ def test_partial_tail_offload_skips_null_source_blocks():
     store.batch_put_from_multi_buffers.return_value = [256, 256]
     thread = _make_partial_tail_send_thread(store)
 
-    assert thread._maybe_offload_partial_tail(_make_partial_tail_req([0, 2, 3]))
+    assert thread._maybe_offload_mamba_checkpoint(_make_partial_tail_req([0, 2, 3]))
 
     keys, addrs, _sizes, _replicate_config = (
         store.batch_put_from_multi_buffers.call_args.args
@@ -646,6 +650,47 @@ def test_partial_tail_offload_skips_null_source_blocks():
         "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6132",
     ]
     assert addrs == [[0x1000 + 2 * 256], [0x1000 + 3 * 256]]
+
+
+def test_block_aligned_mamba_checkpoint_uses_pinned_block():
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.return_value = [256, 256]
+    coord = SimpleNamespace(
+        enable_partial_hash_hits=False,
+        hash_block_size=16,
+        lcm_block_size=16,
+    )
+    databases = []
+    for group_id in range(2):
+        db = ChunkedTokenDatabase(
+            KeyMetadata("test-model", 0, 0, 0, 0, group_id=group_id),
+            block_size=16,
+            hash_block_size=16,
+        )
+        db.set_kv_caches_base_addr([group_id * 0x10000])
+        db.set_block_len([256])
+        databases.append(db)
+    thread = _make_store_sending_thread(
+        store,
+        coord=coord,
+        token_databases=databases,
+    )
+    request = ReqMeta(
+        req_id="req-a",
+        token_len_chunk=0,
+        block_ids=([3], [4]),
+        block_hashes=[b"a0"],
+        can_save=True,
+        mamba_checkpoint_offloads=[(1, 7, 16)],
+    )
+
+    assert thread._maybe_offload_mamba_checkpoint(request)
+
+    _keys, addrs, _sizes, _replicate_config = (
+        store.batch_put_from_multi_buffers.call_args.args
+    )
+    assert addrs == [[3 * 256], [0x10000 + 7 * 256]]
 
 
 def test_partial_tail_offload_honors_active_pressure_gate():

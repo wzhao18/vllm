@@ -37,7 +37,12 @@ from vllm.v1.core.encoder_cache_manager import (
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.kv_cache_utils import (
+    KVCacheBlock,
+    get_next_retention_checkpoint,
+    get_prefix_replay_checkpoint,
+    get_prompt_replay_checkpoint,
+)
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -288,6 +293,10 @@ class Scheduler(SchedulerInterface):
             metrics_collector=self.kv_metrics_collector,
             watermark=self.scheduler_config.watermark,
         )
+        self.eagle_rewind_tokens = self.kv_cache_manager.coordinator.eagle_rewind_tokens
+        self.replay_alignment_tokens = (
+            self.kv_cache_manager.coordinator.replay_alignment_tokens
+        )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
         if self.connector is not None:
@@ -314,12 +323,14 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
-        # A finer prefix_match_unit is configured: a mamba partial tail entry
-        # can only be registered by a step ending exactly at the prompt's last
-        # hash boundary, so the split adds that stop.
-        self.mamba_partial_cache_hit = (
+        # A Mamba partial-tail entry can only be registered by a step ending
+        # exactly at its selected prompt replay checkpoint.
+        self.enable_mamba_partial_hash_hits = (
             self.need_mamba_block_aligned_split
-            and self.hash_block_size < self.block_size
+            and self.kv_cache_manager.coordinator.enable_partial_hash_hits
+        )
+        self.prefix_cache_retention_interval = (
+            self.kv_cache_manager.coordinator.retention_interval
         )
 
         # Counts of non-empty steps scheduled / processed. update_from_output
@@ -369,10 +380,10 @@ class Scheduler(SchedulerInterface):
         """Clip a prefill chunk so it ends where Mamba state must be cached.
 
         In "align" cache mode reusable SSM states are materialized at block
-        boundaries, plus mandatory early stops (the prompt's partial-tail hash
-        boundary, a detected shared-prefix junction). If a block is larger
-        than the configured prefill chunk limit, intermediate chunks keep
-        private running state until they reach the next cacheable position.
+        boundaries and at selected prompt, retention, and shared-prefix
+        checkpoints. If a block is larger than the configured prefill chunk
+        limit, intermediate chunks keep private running state until they reach
+        the next cacheable position.
         """
         start = (
             request.num_computed_tokens
@@ -385,18 +396,28 @@ class Scheduler(SchedulerInterface):
             return num_new_tokens
 
         block_size = self.cache_config.block_size
-        # The last block-aligned position whose state can be cached. With
-        # Eagle, FullAttn prunes the last matching block, so back off one
-        # block to avoid a Mamba cache miss.
-        last_cache_position = request.num_tokens - request.num_tokens % block_size
-        if self.use_eagle:
-            last_cache_position = max(last_cache_position - block_size, 0)
+        retention_interval = self.prefix_cache_retention_interval
+        partial_hits = self.enable_mamba_partial_hash_hits
+        prompt_replay_checkpoint = get_prompt_replay_checkpoint(
+            request.num_prompt_tokens,
+            self.replay_alignment_tokens,
+            eagle_rewind_tokens=self.eagle_rewind_tokens,
+            enable_partial_hash_hits=partial_hits,
+        )
+        if retention_interval is None:
+            last_block_checkpoint = get_prefix_replay_checkpoint(
+                request.num_tokens,
+                block_size,
+                0 if partial_hits else self.eagle_rewind_tokens,
+            )
+        else:
+            last_block_checkpoint = 0 if partial_hits else prompt_replay_checkpoint
 
         end = start + num_new_tokens
-        # Until `last_cache_position`, prefer chunks ending on block
+        # Until `last_block_checkpoint`, prefer chunks ending on block
         # boundaries. When a block cannot fit in any configured prefill chunk,
         # allow sub-block progress and re-align at the next reachable boundary.
-        if end < last_cache_position:
+        if end < last_block_checkpoint:
             max_prefill_tokens = self.max_num_scheduled_tokens
             long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
             if long_prefill_threshold > 0:
@@ -405,33 +426,41 @@ class Scheduler(SchedulerInterface):
             if aligned_end > start or block_size <= max_prefill_tokens:
                 end = aligned_end
 
-        next_block_boundary = (start // block_size + 1) * block_size
-        tail_boundary = (
-            request.num_prompt_tokens // self.hash_block_size * self.hash_block_size
-            if self.mamba_partial_cache_hit
+        retention_checkpoint = (
+            get_next_retention_checkpoint(
+                start,
+                retention_interval,
+                request.num_tokens,
+                self.replay_alignment_tokens,
+                self.eagle_rewind_tokens,
+            )
+            if retention_interval
             else 0
         )
-        stops = (
-            # Resumed mid-block (fine-grained partial hash hit): re-align to
-            # the block grid before running on, so the crossed boundary's
-            # state is materialized (unless it is past the cacheable range).
-            next_block_boundary
-            if start % block_size != 0 and next_block_boundary <= last_cache_position
-            else 0,
-            # Never run past the last cacheable block boundary mid-chunk.
-            last_cache_position,
-            # Fine-grained hits: the prompt's partial-tail entry can only be
-            # registered by a chunk ending exactly at its last hash boundary.
-            tail_boundary
-            if last_cache_position < tail_boundary < request.num_prompt_tokens
-            else 0,
-            # Marconi shared-prefix junction, block-floored (a sub-block
-            # junction's state is not separately cacheable): cache its state
-            # so sibling requests sharing the prefix can reuse it.
-            start + (request.shared_prefix_boundary - start) // block_size * block_size
-            if start < request.shared_prefix_boundary < end
-            else 0,
+        shared_prefix_checkpoint = get_prefix_replay_checkpoint(
+            request.shared_prefix_boundary,
+            block_size,
+            0,
         )
+        stops = [
+            # Resumed mid-block (fine-grained partial hash hit): re-align to
+            # the block grid before running on, unless it is past the last
+            # cacheable block checkpoint.
+            (start // block_size + 1) * block_size
+            if start % block_size and start < last_block_checkpoint
+            else 0,
+            # Never run past the last cacheable block checkpoint mid-chunk.
+            last_block_checkpoint,
+            # Materialize the next periodic retention checkpoint.
+            retention_checkpoint,
+            # Fine-grained hits require a chunk ending at the prompt replay
+            # checkpoint so its partial-tail state can be registered.
+            prompt_replay_checkpoint if partial_hits else 0,
+            # Cache a block-aligned Marconi shared-prefix checkpoint so sibling
+            # requests can reuse it.
+            shared_prefix_checkpoint,
+        ]
+
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)
         return max(end - start, 0)
@@ -1162,20 +1191,18 @@ class Scheduler(SchedulerInterface):
             self.prev_step_scheduled_req_ids.clear()
             self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
 
-        # Producer partial-tail hand-off for external KV connectors. Drained
-        # before the CoW retentions are released below, so the pin lands while
-        # the cow block still holds a retention ref. Without a producer-side
-        # connector nothing consumes the hand-off, so skip the drain (and its
-        # pin); the manager drops stale entries when the request's blocks are
-        # popped for free.
-        pending_partial_tail_offloads = None
+        # Producer Mamba-checkpoint hand-off for external KV connectors. Drain
+        # before CoW retentions are released so partial checkpoints are pinned
+        # while their copy still holds a reference. Block-aligned checkpoints
+        # need the same pin because Mamba can retire them before an async save.
+        pending_mamba_checkpoint_offloads = None
         if (
             self.connector is not None
             and self.vllm_config.kv_transfer_config is not None
             and self.vllm_config.kv_transfer_config.is_kv_producer
         ):
-            pending_partial_tail_offloads = (
-                self.kv_cache_manager.take_partial_tail_offloads() or None
+            pending_mamba_checkpoint_offloads = (
+                self.kv_cache_manager.take_mamba_checkpoint_offloads() or None
             )
 
         kv_cache_block_copies, cow_retained_blocks = (
@@ -1223,7 +1250,7 @@ class Scheduler(SchedulerInterface):
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
             kv_cache_block_copies=pending_kv_cache_block_copies,
-            partial_tail_offloads=pending_partial_tail_offloads,
+            mamba_checkpoint_offloads=pending_mamba_checkpoint_offloads,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
         )

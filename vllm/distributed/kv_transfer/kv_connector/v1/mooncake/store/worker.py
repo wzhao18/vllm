@@ -532,31 +532,29 @@ class KVCacheStoreSendingThread(KVTransferThread):
             self._skip_store_requests.clear()
         return True
 
-    def _maybe_offload_partial_tail(self, req_meta: ReqMeta) -> bool:
-        """Offload the request's sub-block partial tail (its last prompt hash
-        boundary) so a later request can hit the sub-block prefix.
+    def _maybe_offload_mamba_checkpoint(self, req_meta: ReqMeta) -> bool:
+        """Offload a selected Mamba checkpoint for later prefix reuse.
 
-        Covers every block from the normal save's lcm floor to the boundary:
-        the normal save floors to ``lcm_block_size``, so a smaller-block
-        group's full blocks in that gap are never persisted elsewhere, and
-        the consumer's lookup needs every group at every probed boundary.
-        Full blocks are keyed by their block-end hash, the partial boundary
-        block by the boundary sub-hash; the mamba "align" boundary block is
-        the core-provided CoW block. All keys are deduped against the store.
+        Covers every block from the normal save's LCM floor to the selected
+        boundary. A smaller-block group's full blocks in that gap are never
+        persisted elsewhere, and lookup needs every group at each boundary.
+        Full blocks are keyed by their block-end hash and a partial boundary
+        block by its boundary sub-hash. The Mamba boundary block is the pinned
+        block supplied by core. All keys are deduplicated against the store.
 
         Returns:
             True when no put is needed or every put succeeds, False otherwise.
         """
-        if not self.coord.enable_partial_hash_hits or not req_meta.block_hashes:
+        if not req_meta.block_hashes:
             return True
-        partial_tail_offloads = req_meta.partial_tail_offloads
-        if not partial_tail_offloads:
+        checkpoint_offloads = req_meta.mamba_checkpoint_offloads
+        if not checkpoint_offloads:
             return True
         hash_block_size = self.coord.hash_block_size
-        boundaries = {boundary for _, _, boundary in partial_tail_offloads}
+        boundaries = {boundary for _, _, boundary in checkpoint_offloads}
         if len(boundaries) != 1:
             raise ValueError(
-                "Partial-tail offloads for one request must share a boundary"
+                "Mamba checkpoint offloads for one request must share a boundary"
             )
         boundary = boundaries.pop()
         if boundary == 0:
@@ -564,7 +562,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         if boundary // hash_block_size - 1 >= len(req_meta.block_hashes):
             return True
         mamba_offloads = {
-            group_id: block_id for group_id, block_id, _ in partial_tail_offloads
+            group_id: block_id for group_id, block_id, _ in checkpoint_offloads
         }
 
         keys: list[str] = []
@@ -586,11 +584,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     continue
                 valid_end = min((block_idx + 1) * db.block_size, boundary)
                 key_hash = req_meta.block_hashes[valid_end // hash_block_size - 1]
-                if (
-                    g_idx in mamba_offloads
-                    and valid_end == boundary
-                    and boundary % db.block_size != 0
-                ):
+                if g_idx in mamba_offloads and valid_end == boundary:
                     block_id = mamba_offloads[g_idx]
                 else:
                     if block_idx >= len(group_blocks):
@@ -598,7 +592,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     block_id = group_blocks[block_idx]
                 if block_id == NULL_BLOCK_ID:
                     logger.debug(
-                        "Skipping unavailable partial-tail source block "
+                        "Skipping unavailable checkpoint source block "
                         "(req=%s, group=%d, block=%d)",
                         req_meta.req_id,
                         g_idx,
@@ -624,7 +618,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 num_failed_keys=len(keys),
             )
             logger.error(
-                "Failed to check partial-tail keys for request %s: %s",
+                "Failed to check checkpoint keys for request %s: %s",
                 req_meta.req_id,
                 e,
             )
@@ -655,7 +649,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 num_failed_keys=len(keys),
             )
             logger.error(
-                "Failed to put partial-tail keys for request %s: %s",
+                "Failed to put checkpoint keys for request %s: %s",
                 req_meta.req_id,
                 e,
             )
@@ -673,7 +667,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         if failed:
             failed_codes = {res[i] for i in failed}
             logger.warning(
-                "Partial-tail put failed for request %s: %d/%d keys failed (codes=%s)",
+                "Checkpoint put failed for request %s: %d/%d keys failed (codes=%s)",
                 req_meta.req_id,
                 len(failed),
                 len(keys),
@@ -686,13 +680,13 @@ class KVCacheStoreSendingThread(KVTransferThread):
         if self._clear_store_pressure():
             logger.info(
                 "Mooncake CPU/disk offloading pressure cleared after a "
-                "successful partial-tail batch"
+                "successful checkpoint batch"
             )
         return True
 
     def _handle_request(self, req_meta: ReqMeta):
-        # Cache hits are always a multiple of ``lcm_block_size`` tokens, which
-        # is also ``store_mask``'s precondition.
+        # The normal store path is LCM-aligned. Fine-grained checkpoints are
+        # handled separately by ``_maybe_offload_mamba_checkpoint``.
         lcm_block_size = self.coord.lcm_block_size
         token_len = req_meta.token_len_chunk // lcm_block_size * lcm_block_size
         block_ids_per_group = req_meta.block_ids
@@ -715,10 +709,10 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 )
                 return
 
-            # Offload the sub-block partial tail (independent of the normal
-            # block-aligned save, which may be skipped this step).
-            if req_meta.partial_tail_offloads is not None and not (
-                self._maybe_offload_partial_tail(req_meta)
+            # Offload the pinned Mamba checkpoint independently of the normal
+            # save, which may be delayed past the checkpoint's table lifetime.
+            if req_meta.mamba_checkpoint_offloads is not None and not (
+                self._maybe_offload_mamba_checkpoint(req_meta)
             ):
                 return
 
@@ -974,7 +968,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         return invalid_block_ids
 
     def _handle_request(self, req_meta: ReqMeta):
-        token_len = req_meta.load_spec.token_len  # type: ignore[union-attr]
+        hit_length = req_meta.load_spec.token_len  # type: ignore[union-attr]
         req_id = req_meta.req_id
         mask_num = (
             req_meta.load_spec.vllm_cached_tokens  # type: ignore[union-attr]
@@ -984,7 +978,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
 
         # Skip chunks the consumer's per-group spec wouldn't populate
         # locally (e.g. SWA pre-window) even if the producer stored them.
-        load_mask_per_group = self.coord.load_mask(req_meta.block_hashes, token_len)
+        load_mask_per_group = self.coord.load_mask(req_meta.block_hashes, hit_length)
 
         addr_list: list[list[int]] = []
         size_list: list[list[int]] = []
@@ -994,7 +988,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             mask = load_mask_per_group[g_idx]
             chunks: list[tuple[int, int]] = []
             for start, end, block_hash in db.process_tokens(
-                token_len, req_meta.block_hashes, mask_num
+                hit_length, req_meta.block_hashes, mask_num
             ):
                 chunk_idx = start // db.block_size
                 if chunk_idx >= len(mask) or not mask[chunk_idx]:
@@ -1310,6 +1304,7 @@ class MooncakeStoreWorker:
             hash_block_size=self.hash_block_size,
             use_eagle=use_eagle,
             retention_interval=envs.VLLM_PREFIX_CACHE_RETENTION_INTERVAL,
+            enable_caching=vllm_config.cache_config.enable_prefix_caching,
         )
         # One ChunkedTokenDatabase per group; addresses populated in
         # register_kv_caches once the kv-cache layout is known. Each group's
@@ -1677,14 +1672,13 @@ class MooncakeStoreWorker:
     def lookup(self, num_tokens: int, block_hashes: Sequence[BlockHash]) -> int:
         """Check how many prefix tokens exist in the store.
 
-        Checks across all rank-specific key namespaces that may be loaded. A
-        hit covering all ``num_tokens`` is re-derived below the request end so
-        the last token is recomputed for sampling.
+        Checks across all rank-specific key namespaces that may be loaded. The
+        lookup limit leaves the suffix needed for logits or EAGLE replay.
         """
         if self._capacity_only:
             return 0
 
-        token_len = self.coord.align_lookup_length(num_tokens)
+        token_len = self.coord.get_lookup_limit(num_tokens)
         if not block_hashes or token_len <= 0:
             return 0
 
@@ -1763,20 +1757,11 @@ class MooncakeStoreWorker:
             self.hash_block_size,
             exists_set,
         )
-        _masks, hit_length = self.coord.find_longest_cache_hit(
+        hit_length = self.coord.find_longest_cache_hit(
             block_hashes,
             token_len,
             cached_block_pool,
         )
-        if hit_length >= num_tokens:
-            usable_length = self.coord.align_lookup_length(num_tokens - 1)
-            if usable_length <= 0:
-                return 0
-            _masks, hit_length = self.coord.find_longest_cache_hit(
-                block_hashes,
-                usable_length,
-                cached_block_pool,
-            )
         return hit_length
 
     def get_kv_events(self) -> list[BlockStored]:

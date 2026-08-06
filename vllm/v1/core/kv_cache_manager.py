@@ -14,12 +14,17 @@ from vllm.v1.core.kv_cache_coordinator import (
     get_kv_cache_coordinator,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
+from vllm.v1.core.kv_cache_utils import (
+    KVCacheBlock,
+    KVCacheBlockCopy,
+    get_prefix_cache_hit_limit,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
     EncoderOnlyAttentionSpec,
     KVCacheConfig,
+    MambaSpec,
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,
 )
@@ -186,9 +191,9 @@ class KVCacheManager:
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
 
-        # Off-table cow blocks handed to a KV connector for partial-tail
-        # offload; pinned until the request's blocks are freed.
-        self._partial_tail_pins: dict[str, list[KVCacheBlock]] = {}
+        # Mamba checkpoint blocks handed to a KV connector for offload; pinned
+        # until the request's blocks are freed.
+        self._mamba_checkpoint_pins: dict[str, list[KVCacheBlock]] = {}
 
     @property
     def usage(self) -> float:
@@ -227,8 +232,9 @@ class KVCacheManager:
         )
 
     def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int, int]:
-        """Get the computed (cached) blocks for the request.
-        Note that the computed blocks must be full.
+        """Get the locally cached prefix blocks for the request.
+
+        Fine-grained hybrid-cache hits may end inside the last physical block.
 
         Args:
             request: The request to get the computed blocks.
@@ -250,13 +256,10 @@ class KVCacheManager:
         if not self.prefix_cache_lookup_enabled(request):
             return self.empty_kv_cache_blocks, 0, 0
 
-        # NOTE: When all tokens hit the cache, we must recompute the last token
-        # to obtain logits. Thus, set max_cache_hit_length to prompt_length - 1.
-        # This can trigger recomputation of an entire block, rather than just
-        # the single last token, because allocate_slots() requires
-        # num_computed_tokens to be block-size aligned. Removing this limitation
-        # could slightly improve performance in the future.
-        max_cache_hit_length = request.num_tokens - 1
+        max_cache_hit_length = get_prefix_cache_hit_limit(
+            request.num_tokens,
+            self.coordinator.eagle_rewind_tokens,
+        )
         computed_blocks, num_new_computed_tokens, num_uncached = (
             self.coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length
@@ -328,7 +331,10 @@ class KVCacheManager:
 
         fa_group_id = coordinator.full_attention_group_id
         computed, per_group_hits = coordinator.find_longest_cache_hit_per_group(
-            request.block_hashes, request.num_tokens - 1
+            request.block_hashes,
+            get_prefix_cache_hit_limit(
+                request.num_tokens, coordinator.eagle_rewind_tokens
+            ),
         )
         if any(hit > per_group_hits[fa_group_id] for hit in per_group_hits):
             # A lagging group hit deeper than full attention means its
@@ -414,8 +420,7 @@ class KVCacheManager:
 
         ```
         comp      = request.num_computed_tokens
-        new_comp  = num_new_computed_tokens
-                  = len(new_computed_blocks) * block_size
+        new_comp  = num_new_computed_tokens from the prefix-cache lookup
         ext_comp  = num_external_computed_tokens, cached by the connector
         new       = num_new_tokens, including unverified draft tokens
         lookahead = num_lookahead_tokens
@@ -572,7 +577,7 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
-        pins = self._partial_tail_pins.pop(request.request_id, None)
+        pins = self._mamba_checkpoint_pins.pop(request.request_id, None)
         if pins:
             self.block_pool.free_blocks(pins)
         self.coordinator.free(request.request_id)
@@ -611,7 +616,7 @@ class KVCacheManager:
         # Pins ride the same (possibly deferred) free as the request blocks.
         # Preemption may release a pin under a still-queued offload — the same
         # exposure normal saves of table blocks already have.
-        pins = self._partial_tail_pins.pop(request.request_id, None)
+        pins = self._mamba_checkpoint_pins.pop(request.request_id, None)
         if pins:
             blocks = pins + blocks
         return blocks
@@ -779,7 +784,9 @@ class KVCacheManager:
     ) -> KVCacheBlocks:
         """Return a lookup-result view truncated at an aligned token endpoint.
 
-        Pure slicing: refcounts are untouched and ``blocks`` is not mutated.
+        The input and block reference counts are unchanged. Sparse align-mode
+        Mamba results may end before the requested endpoint; null blocks pad
+        those missing positions so every group describes the same prefix.
         """
         truncated: list[list[KVCacheBlock]] = []
         for group_blocks, manager in zip(
@@ -789,8 +796,15 @@ class KVCacheManager:
         ):
             assert num_computed_tokens % manager.block_size == 0
             num_blocks = num_computed_tokens // manager.block_size
-            assert num_blocks <= len(group_blocks)
-            truncated.append(list(group_blocks[:num_blocks]))
+            if num_blocks <= len(group_blocks):
+                truncated.append(list(group_blocks[:num_blocks]))
+            else:
+                # Sparse Mamba cache results can lag behind full attention.
+                spec = manager.kv_cache_spec
+                assert isinstance(spec, MambaSpec) and spec.mamba_cache_mode == "align"
+                padded = list(group_blocks)
+                padded.extend([self.block_pool.null_block] * (num_blocks - len(padded)))
+                truncated.append(padded)
         return self.create_kv_cache_blocks(tuple(truncated))
 
     def take_new_block_ids(self) -> list[int]:
@@ -845,18 +859,20 @@ class KVCacheManager:
         retained_blocks = [block for pair in pending_copies for block in pair]
         return copies, retained_blocks
 
-    def take_partial_tail_offloads(self) -> dict[str, list[tuple[int, int, int]]]:
-        """Drain producer partial-tail offload hand-offs per request.
+    def take_mamba_checkpoint_offloads(
+        self,
+    ) -> dict[str, list[tuple[int, int, int]]]:
+        """Drain producer Mamba-checkpoint hand-offs per request.
 
         Returns ``{request_id: [(group_id, block_id, boundary_tokens), ...]}``
-        for the durable boundary blocks of producers' last-prompt-boundary
-        partial tails. Only mamba "align" groups contribute; empty otherwise.
+        for producer checkpoints. Only Mamba ``align`` groups contribute.
         A KV connector reads the referenced blocks and offloads them so a later
-        request can hit the sub-block prefix.
+        request can hit the checkpoint.
 
-        Each handed-off block lives off the request block table, so it is
-        pinned here and unpinned when the request's blocks are freed — for a
-        producer with saved tokens, after the connector reports sends done.
+        Each block is pinned here and unpinned when the request's blocks are
+        freed—for a producer with saved tokens, after the connector reports
+        sends done. This also protects block-aligned checkpoints that Mamba can
+        retire while the asynchronous save is pending.
         """
         offloads: dict[str, list[tuple[int, int, int]]] = {}
         for mgr in self.coordinator.single_type_managers:
@@ -865,9 +881,9 @@ class KVCacheManager:
                 group_id,
                 block,
                 boundary_tokens,
-            ) in mgr.take_pending_partial_tail_offloads():
+            ) in mgr.take_pending_mamba_checkpoint_offloads():
                 self.block_pool.touch((block,))
-                self._partial_tail_pins.setdefault(req_id, []).append(block)
+                self._mamba_checkpoint_pins.setdefault(req_id, []).append(block)
                 offloads.setdefault(req_id, []).append(
                     (group_id, block.block_id, boundary_tokens)
                 )

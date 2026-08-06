@@ -1108,12 +1108,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if "VLLM_PLUGINS" not in os.environ
         else os.environ["VLLM_PLUGINS"].split(",")
     ),
-    # Retain local sliding-window KV checkpoints for prefix caching.
+    # Retain sparse hybrid KV checkpoints for prefix caching.
     # Unset (default) preserves the dense local checkpointing behavior. `0`
-    # retains only the latest completed prompt boundary. Positive values retain
-    # checkpoints at the specified interval boundaries (rounded up to the
-    # prefix-cache alignment).
-    # Applies to sliding-window attention for now but not yet Mamba/linear attention.
+    # retains only replay-reachable checkpoints. Positive values also define
+    # periodic attention-aligned retention boundaries; each group retains the
+    # corresponding post-EAGLE replay checkpoint. Fine-grained PMU snapshots
+    # are registered at those replay checkpoints when partial hits are enabled.
+    # Applies to sliding-window attention and Mamba/linear attention.
     "VLLM_PREFIX_CACHE_RETENTION_INTERVAL": lambda: (
         int(os.environ["VLLM_PREFIX_CACHE_RETENTION_INTERVAL"])
         if "VLLM_PREFIX_CACHE_RETENTION_INTERVAL" in os.environ

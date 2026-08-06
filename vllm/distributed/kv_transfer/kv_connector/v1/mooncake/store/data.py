@@ -366,11 +366,10 @@ class ReqMeta:
 
     token_ids: list[int] | None = None
     num_prompt_tokens: int | None = None
-    # Core-provided per-mamba-group
-    # (group_id, cow_block_id, boundary_tokens) for this request's partial tail.
-    # Present only on the producer's CoW step; drives the connector's offload
-    # (the FA group's block is derived from block_ids and boundary_tokens).
-    partial_tail_offloads: list[tuple[int, int, int]] | None = None
+    # Core-provided per-Mamba-group (group_id, block_id, boundary_tokens) for
+    # this request's checkpoint. Attention-group blocks are derived from the
+    # block table.
+    mamba_checkpoint_offloads: list[tuple[int, int, int]] | None = None
 
     @staticmethod
     def from_request_tracker(

@@ -696,7 +696,7 @@ def test_pending_partial_tail_emits_offload_only_reqmeta():
         ),
         num_scheduled_tokens={},
         scheduled_spec_decode_tokens={},
-        partial_tail_offloads={"req-0": [(1, 7, 12)]},
+        mamba_checkpoint_offloads={"req-0": [(1, 7, 12)]},
     )
 
     meta = scheduler.build_connector_meta(out)
@@ -706,7 +706,7 @@ def test_pending_partial_tail_emits_offload_only_reqmeta():
     assert req_meta.req_id == "req-0"
     assert req_meta.can_save is True
     assert req_meta.token_len_chunk == 0
-    assert req_meta.partial_tail_offloads == [(1, 7, 12)]
+    assert req_meta.mamba_checkpoint_offloads == [(1, 7, 12)]
     assert req_meta.num_prompt_tokens == 12
     assert req_meta.block_ids == ([0],)
     tracker = scheduler._request_trackers["req-0"]
@@ -747,13 +747,13 @@ def test_resumed_partial_tail_uses_handoff_boundary():
         ),
         num_scheduled_tokens={},
         scheduled_spec_decode_tokens={},
-        partial_tail_offloads={"req-0": [(1, 7, 12)]},
+        mamba_checkpoint_offloads={"req-0": [(1, 7, 12)]},
     )
 
     meta = scheduler.build_connector_meta(out)
 
     assert len(meta.requests) == 1
-    assert meta.requests[0].partial_tail_offloads == [(1, 7, 12)]
+    assert meta.requests[0].mamba_checkpoint_offloads == [(1, 7, 12)]
     # Ordinary metadata retains the full resumed prefill range.
     assert meta.requests[0].num_prompt_tokens == 20
     tracker = scheduler._request_trackers["req-0"]
@@ -779,13 +779,13 @@ def test_resumed_partial_tail_attached_to_save_keeps_handoff_boundary():
         prefill_end_tokens=48,
     )
     out = _make_scheduler_output(scheduled_spec_tokens=None)
-    out.partial_tail_offloads = {"req-0": [(0, 7, 36)]}
+    out.mamba_checkpoint_offloads = {"req-0": [(0, 7, 36)]}
 
     meta = scheduler.build_connector_meta(out)
 
     assert len(meta.requests) == 1
     assert meta.requests[0].can_save is True
-    assert meta.requests[0].partial_tail_offloads == [(0, 7, 36)]
+    assert meta.requests[0].mamba_checkpoint_offloads == [(0, 7, 36)]
     assert meta.requests[0].num_prompt_tokens == 48
     # Ordinary saving still covers the full resumed prefill range.
     tracker = scheduler._request_trackers["req-0"]

@@ -54,6 +54,233 @@ BlockHashWithGroupId = NewType("BlockHashWithGroupId", bytes)
 ExternalBlockHash: TypeAlias = bytes | int
 
 
+def unwrap_kv_cache_spec(kv_cache_spec: KVCacheSpec) -> KVCacheSpec:
+    """Return the representative concrete spec for a uniform cache group."""
+    if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+        return next(iter(kv_cache_spec.kv_cache_specs.values()))
+    return kv_cache_spec
+
+
+def can_use_mamba_partial_cache_hits(
+    kv_cache_groups: Sequence[KVCacheGroupSpec],
+    hash_block_size: int,
+    *,
+    enable_caching: bool = True,
+    dcp_world_size: int = 1,
+) -> bool:
+    """Return whether this configuration can use a fine Mamba replay grid.
+
+    At least one align-mode Mamba group must need sub-block checkpoints, and
+    every coarser group must support fine-grained lookup. Caching must be
+    enabled and DCP is not supported.
+    """
+    if not enable_caching or dcp_world_size != 1:
+        return False
+
+    has_partial_mamba = False
+    for group in kv_cache_groups:
+        spec = unwrap_kv_cache_spec(group.kv_cache_spec)
+        manager_cls = KVCacheSpecRegistry.get_manager_class(spec)
+        if (
+            spec.block_size > hash_block_size
+            and (
+                manager_cls is None
+                or not manager_cls.supports_fine_grained_hash_lookup
+            )
+        ):
+            return False
+        if (
+            isinstance(spec, MambaSpec)
+            and spec.mamba_cache_mode == "align"
+            and spec.block_size > hash_block_size
+        ):
+            has_partial_mamba = True
+    return has_partial_mamba
+
+
+def get_prefix_replay_checkpoint(
+    prefix_tokens: int,
+    alignment_tokens: int,
+    num_recompute_tokens: int,
+) -> int:
+    """Return the latest replay checkpoint supported by a prefix.
+
+    A replay checkpoint is the cached state from which execution can resume.
+    It is distinct from a retention boundary, which is a policy position that
+    determines when a checkpoint is kept. The checkpoint is computed as
+    ``floor((prefix_tokens - num_recompute_tokens) / alignment_tokens) *
+    alignment_tokens``.
+
+    Args:
+        prefix_tokens: End of the matched or computed prefix that supports the
+            checkpoint.
+        alignment_tokens: Granularity at which cached state can be reused.
+        num_recompute_tokens: Prefix suffix that must remain after the
+            checkpoint for recomputation or speculative lookahead.
+
+    Returns:
+        The aligned replay checkpoint, or zero if none is available.
+    """
+    replay_position = max(prefix_tokens - num_recompute_tokens, 0)
+    return replay_position // alignment_tokens * alignment_tokens
+
+
+def get_prefix_cache_hit_limit(num_tokens: int, eagle_rewind_tokens: int) -> int:
+    """Leave the last token for logits unless EAGLE already leaves a suffix."""
+    return num_tokens if eagle_rewind_tokens else num_tokens - 1
+
+
+def get_next_retention_checkpoint(
+    start: int,
+    retention_interval: int | None,
+    available_prefix_tokens: int,
+    alignment_tokens: int,
+    eagle_rewind_tokens: int = 0,
+) -> int:
+    """Return the next periodically retained replay checkpoint after ``start``.
+
+    With no retention interval, every aligned replay checkpoint is eligible.
+    Otherwise, a retention boundary is a policy position at a multiple of the
+    interval. It determines when enough prefix is available to retain state,
+    but is not necessarily where execution resumes. The replay checkpoint is
+    the aligned position obtained by backing that boundary off by
+    ``eagle_rewind_tokens``. For example, with a retention boundary of 1024
+    and 128 tokens of aligned EAGLE lookahead, the replay checkpoint is 896.
+
+    Args:
+        start: Current computed-token position.
+        retention_interval: Distance between retention policy boundaries.
+            ``None`` selects every aligned replay checkpoint, and zero disables
+            periodic retention.
+        available_prefix_tokens: Matched or computed prefix available to
+            support a checkpoint. With periodic retention, it must also cover
+            the checkpoint's EAGLE suffix through the retention boundary.
+        alignment_tokens: Granularity at which cached state can be reused.
+        eagle_rewind_tokens: Tokens between the replay checkpoint and its
+            retention boundary.
+
+    Returns:
+        The next eligible replay checkpoint, or zero when none is available.
+    """
+    if retention_interval is None:
+        replay_checkpoint = (start // alignment_tokens + 1) * alignment_tokens
+        if replay_checkpoint <= available_prefix_tokens:
+            return replay_checkpoint
+        return 0
+    if retention_interval <= 0:
+        return 0
+    next_aligned_checkpoint = (start // alignment_tokens + 1) * alignment_tokens
+    retention_boundary = cdiv(
+        next_aligned_checkpoint + eagle_rewind_tokens, retention_interval
+    ) * retention_interval
+    return (
+        get_prefix_replay_checkpoint(
+            retention_boundary,
+            alignment_tokens,
+            eagle_rewind_tokens,
+        )
+        if retention_boundary <= available_prefix_tokens
+        else 0
+    )
+
+
+def is_retention_checkpoint(
+    checkpoint: int,
+    retention_interval: int | None,
+    eagle_rewind_tokens: int = 0,
+) -> bool:
+    """Return whether a replay checkpoint belongs to periodic retention.
+
+    The corresponding retention boundary is ``checkpoint +
+    eagle_rewind_tokens`` and must be a multiple of ``retention_interval``.
+    """
+    return (
+        checkpoint > 0
+        and retention_interval is not None
+        and retention_interval > 0
+        and (checkpoint + eagle_rewind_tokens) % retention_interval == 0
+    )
+
+
+class PrefixCacheReplayConfig(NamedTuple):
+    enable_partial_hash_hits: bool
+    replay_alignment_tokens: int
+    eagle_rewind_tokens: int
+
+
+def get_prefix_cache_replay_config(
+    kv_cache_groups: Sequence[KVCacheGroupSpec],
+    scheduler_block_size: int,
+    hash_block_size: int,
+    *,
+    use_eagle: bool,
+    enable_caching: bool,
+    dcp_world_size: int = 1,
+) -> PrefixCacheReplayConfig:
+    """Return the common replay policy for all cache groups."""
+    enable_partial_hash_hits = can_use_mamba_partial_cache_hits(
+        kv_cache_groups,
+        hash_block_size,
+        enable_caching=enable_caching,
+        dcp_world_size=dcp_world_size,
+    )
+    replay_alignment_tokens = (
+        hash_block_size if enable_partial_hash_hits else scheduler_block_size
+    )
+
+    eagle_specs = [
+        unwrap_kv_cache_spec(group.kv_cache_spec)
+        for group in kv_cache_groups
+        if group.is_eagle_group
+    ]
+    if use_eagle and not eagle_specs:
+        eagle_specs = [
+            unwrap_kv_cache_spec(group.kv_cache_spec) for group in kv_cache_groups
+        ]
+
+    eagle_rewind_tokens = 0
+    for spec in eagle_specs:
+        if isinstance(spec, MambaSpec):
+            continue
+        manager_cls = KVCacheSpecRegistry.get_manager_class(spec)
+        assert manager_cls is not None, f"No manager registered for {spec}"
+        rewind_tokens = (
+            hash_block_size
+            if enable_partial_hash_hits
+            and manager_cls.supports_fine_grained_hash_lookup
+            else spec.block_size * dcp_world_size
+        )
+        eagle_rewind_tokens = max(eagle_rewind_tokens, rewind_tokens)
+    return PrefixCacheReplayConfig(
+        enable_partial_hash_hits=enable_partial_hash_hits,
+        replay_alignment_tokens=replay_alignment_tokens,
+        eagle_rewind_tokens=eagle_rewind_tokens,
+    )
+
+
+def get_prompt_replay_checkpoint(
+    num_prompt_tokens: int,
+    replay_alignment_tokens: int,
+    eagle_rewind_tokens: int,
+    *,
+    enable_partial_hash_hits: bool,
+) -> int:
+    """Return the prompt checkpoint selected for prefix caching.
+
+    Coarse hits preserve the final token for logits. Fine-grained hits can end
+    at the prompt unless EAGLE requires a recompute suffix.
+    """
+    if not enable_partial_hash_hits:
+        num_prompt_tokens = get_prefix_cache_hit_limit(
+            num_prompt_tokens, eagle_rewind_tokens
+        )
+    return get_prefix_replay_checkpoint(
+        num_prompt_tokens,
+        replay_alignment_tokens,
+        eagle_rewind_tokens,
+    )
+
+
 def make_block_hash_with_group_id(
     block_hash: BlockHash, group_id: int
 ) -> BlockHashWithGroupId:

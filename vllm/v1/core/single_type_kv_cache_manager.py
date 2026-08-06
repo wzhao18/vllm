@@ -13,6 +13,10 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashListWithBlockSize,
     BlockHashWithGroupId,
     KVCacheBlock,
+    get_next_retention_checkpoint,
+    get_prefix_replay_checkpoint,
+    get_prompt_replay_checkpoint,
+    is_retention_checkpoint,
     resolve_block_hashes,
 )
 from vllm.v1.kv_cache_interface import (
@@ -105,23 +109,18 @@ class SingleTypeKVCacheManager(ABC):
         self.kv_cache_group_id = kv_cache_group_id
         self._null_block = block_pool.null_block
 
-        # Whether this group's prefix-cache hits drop the EAGLE/MTP lookahead
-        # block. Only consulted by managers whose hit logic is sparse within an
-        # aligned segment (SWA). Initialized lazily by the coordinator after
-        # determining the attention groups.
-        self.use_eagle = False
+        # The coordinator overwrites these with the common replay policy.
+        self.eagle_rewind_tokens = 0
+        self.replay_alignment_tokens = scheduler_block_size
 
         # Partial-hit copy-on-write bookkeeping. Populated only by fine-grained
         # managers (full attention, mamba "align"); harmlessly empty elsewhere.
         self._partial_hit_reqs: dict[str, tuple[int, KVCacheBlock]] = {}
         self._pending_cow_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
-        # Partial-tail offload hand-off for external KV connectors: when a
-        # producer registers its last-prompt-boundary partial tail and the
-        # durable boundary block is not on the append-only request block table
-        # (mamba "align" CoW target), record the request, group, block, and
-        # exact token boundary so a connector can offload it under the right
-        # hash. Populated only by mamba "align".
-        self._pending_partial_tail_offloads: list[
+        # Mamba checkpoint hand-off for external KV connectors. Record the
+        # request, group, block, and token boundary so the block can be pinned
+        # while an asynchronous offload reads it.
+        self._pending_mamba_checkpoint_offloads: list[
             tuple[str, int, KVCacheBlock, int]
         ] = []
 
@@ -387,19 +386,19 @@ class SingleTypeKVCacheManager(ABC):
         self._pending_cow_copies = []
         return pending_copies
 
-    def take_pending_partial_tail_offloads(
+    def take_pending_mamba_checkpoint_offloads(
         self,
     ) -> list[tuple[str, int, KVCacheBlock, int]]:
-        """Drain producer partial-tail hand-offs.
+        """Drain producer Mamba-checkpoint hand-offs.
 
         Entries are ``(req_id, group_id, block, boundary_tokens)``.
 
-        Only mamba "align" populates this. The block lives off the request
-        block table, so the caller must pin it until the connector has read
-        it — nothing else keeps it alive once the CoW retention is released.
+        Only Mamba ``align`` populates this. The caller must pin each block
+        until the connector has read it because Mamba can retire checkpoint
+        blocks while the request is still running.
         """
-        pending = self._pending_partial_tail_offloads
-        self._pending_partial_tail_offloads = []
+        pending = self._pending_mamba_checkpoint_offloads
+        self._pending_mamba_checkpoint_offloads = []
         return pending
 
     def _apply_cow(
@@ -440,7 +439,7 @@ class SingleTypeKVCacheManager(ABC):
             retention_interval: Sparse local-checkpoint granularity. ``None``
                 keeps dense checkpointing; ``0`` keeps only the latest replay
                 boundary; a positive multiple of ``scheduler_block_size`` keeps
-                a tail once per that-sized segment. Only SWA acts on it.
+                a tail once per that-sized segment. SWA and Mamba act on it.
         """
         num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
         num_full_blocks = num_tokens // self.block_size
@@ -448,21 +447,16 @@ class SingleTypeKVCacheManager(ABC):
         if num_cached_blocks >= num_full_blocks:
             return
 
-        # Token boundaries whose reachable tail must be retained under sparse
-        # retention: the replay boundary (``num_prompt - 1``, capped by
-        # ``get_computed_blocks``) and any detected shared-prefix junction.
-        reachable_boundaries = [request.num_prompt_tokens - 1]
-        if request.shared_prefix_boundary:
-            reachable_boundaries.append(request.shared_prefix_boundary)
-
         block_mask = self.reachable_block_mask(
             start_block=num_cached_blocks,
             end_block=num_full_blocks,
             alignment_tokens=self.scheduler_block_size,
             kv_cache_spec=self.kv_cache_spec,
-            use_eagle=self.use_eagle,
             retention_interval=retention_interval,
-            reachable_boundaries=reachable_boundaries,
+            num_prompt_tokens=request.num_prompt_tokens,
+            shared_prefix_boundary=request.shared_prefix_boundary,
+            replay_alignment_tokens=self.replay_alignment_tokens,
+            eagle_rewind_tokens=self.eagle_rewind_tokens,
         )
         self.block_pool.cache_full_blocks(
             request=request,
@@ -476,6 +470,50 @@ class SingleTypeKVCacheManager(ABC):
 
         self.num_cached_block[request.request_id] = num_full_blocks
 
+    def _cache_partial_block(
+        self,
+        request: Request,
+        num_tokens: int,
+        retention_interval: int | None,
+    ) -> tuple[BlockHashWithGroupId, int, KVCacheBlock] | None:
+        """Cache a selected replay checkpoint inside a physical block."""
+        hash_block_size = self.block_pool.hash_block_size
+        if (
+            self.replay_alignment_tokens >= self.block_size
+            or num_tokens % self.block_size == 0
+            or num_tokens % hash_block_size != 0
+        ):
+            return None
+
+        prompt_checkpoint = get_prompt_replay_checkpoint(
+            request.num_prompt_tokens,
+            self.replay_alignment_tokens,
+            self.eagle_rewind_tokens,
+            enable_partial_hash_hits=True,
+        )
+        if num_tokens != prompt_checkpoint and not is_retention_checkpoint(
+            num_tokens,
+            retention_interval,
+            self.eagle_rewind_tokens,
+        ):
+            return None
+
+        block_idx = num_tokens // self.block_size
+        blocks = self.req_to_blocks[request.request_id]
+        if block_idx >= len(blocks):
+            return None
+        block = blocks[block_idx]
+        partial_hash = self.block_pool.cache_partial_block(
+            request=request,
+            block=block,
+            num_tokens=num_tokens,
+            kv_cache_group_id=self.kv_cache_group_id,
+            block_size=self.block_size,
+        )
+        if partial_hash is None:
+            return None
+        return partial_hash, block_idx, block
+
     @classmethod
     def reachable_block_mask(
         cls,
@@ -483,17 +521,19 @@ class SingleTypeKVCacheManager(ABC):
         end_block: int,
         alignment_tokens: int | None,
         kv_cache_spec: KVCacheSpec,
-        use_eagle: bool,
         retention_interval: int | None = None,
-        reachable_boundaries: Sequence[int] = (),
+        num_prompt_tokens: int | None = None,
+        shared_prefix_boundary: int = 0,
+        replay_alignment_tokens: int | None = None,
+        eagle_rewind_tokens: int = 0,
     ) -> list[bool] | None:
         """Per-block mask for ``cache_full_blocks``. ``None`` means cache
         every (non-null) block — the default for full attention.
 
         Subclasses with sparse hit semantics (SWA / Mamba) override this to skip
         blocks that can never serve a hit at any alignment-aligned prefix length.
-        ``reachable_boundaries`` are token positions whose reachable tail must be
-        retained; the base (dense) policy ignores them.
+        Prompt and shared-prefix checkpoints remain reachable under sparse
+        retention.
         """
         return None
 
@@ -551,7 +591,6 @@ class SingleTypeKVCacheManager(ABC):
         kv_cache_group_ids: list[int],
         block_pool: BlockPool,
         kv_cache_spec: KVCacheSpec,
-        drop_eagle_block: bool,
         alignment_tokens: int,
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
@@ -561,8 +600,6 @@ class SingleTypeKVCacheManager(ABC):
         `max_length`. The prefix should be a common prefix hit for all the
         kv cache groups in `kv_cache_group_ids`. If no cache hit is found,
         return an empty list.
-        If eagle is enabled, drop the last matched block to force recompute the
-        last block to get the required hidden states for eagle drafting head.
         Need to be customized for each attention type.
 
         Args:
@@ -571,10 +608,6 @@ class SingleTypeKVCacheManager(ABC):
             kv_cache_group_ids: The ids of the kv cache groups.
             block_pool: The block pool.
             kv_cache_spec: The kv cache spec.
-            drop_eagle_block: Whether to drop the last matched block for EAGLE/MTP.
-                Always False for non-EAGLE/MTP groups, but can be False for EAGLE/MTP
-                groups too if the last block is already dropped (e.g., in a
-                convergence loop in `find_longest_cache_hit`).
             alignment_tokens: The returned cache hit length (in tokens) should
                 be a multiple of this value (in tokens). By default, it should
                 be set to the block_size.
@@ -686,7 +719,6 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         kv_cache_group_ids: list[int],
         block_pool: BlockPool,
         kv_cache_spec: KVCacheSpec,
-        drop_eagle_block: bool,
         alignment_tokens: int,
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
@@ -761,15 +793,9 @@ class FullAttentionManager(SingleTypeKVCacheManager):
                 hit_length = (fine_idx + 1) * alignment_tokens
                 break
 
-        # Eagle needs the tokens right before the generation point recomputed:
-        # drop one hash unit when fine-grained (the tail block's KV is
-        # append-only, so it still covers the reduced length), else one cache
-        # block.
-        if drop_eagle_block and hit_length > 0:
-            hit_length -= min(alignment_tokens, block_size)
-        # Round down to the alignment; a no-op when fine-grained (hits land on
-        # hash boundaries by construction) and when alignment_tokens ==
-        # block_size. Then trim blocks past the new tail.
+        # Round down to the alignment; a no-op when fine-grained hits land on
+        # hash boundaries and when alignment_tokens == block_size. Then trim
+        # blocks past the new tail.
         hit_length -= hit_length % alignment_tokens
         num_blocks = cdiv(hit_length, block_size)
         for computed in computed_blocks:
@@ -783,40 +809,7 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         retention_interval: int | None = None,
     ) -> None:
         super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
-        hash_block_size = self.block_pool.hash_block_size
-        if self.block_size == hash_block_size:
-            return
-        self._cache_partial_tail_block(request, num_tokens)
-
-    def _cache_partial_tail_block(
-        self,
-        request: Request,
-        num_tokens: int,
-    ) -> None:
-        """Cache the prompt tail when it ends inside a cache block.
-
-        Only the final prompt hash boundary is registered as a partial
-        prefix-cache entry; intermediate hash boundaries inside the same cache
-        block are intentionally skipped.
-        """
-        hash_block_size = self.block_pool.hash_block_size
-        boundary_tokens = request.num_prompt_tokens // hash_block_size * hash_block_size
-        if boundary_tokens == 0 or boundary_tokens > num_tokens:
-            return
-        if boundary_tokens % self.block_size == 0:
-            return
-
-        blocks = self.req_to_blocks[request.request_id]
-        block_idx = boundary_tokens // self.block_size
-        if block_idx >= len(blocks):
-            return
-        self.block_pool.cache_partial_block(
-            request=request,
-            block=blocks[block_idx],
-            num_tokens=boundary_tokens,
-            kv_cache_group_id=self.kv_cache_group_id,
-            block_size=self.block_size,
-        )
+        self._cache_partial_block(request, num_tokens, retention_interval)
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         blocks = self.req_to_blocks[running_request_id]
@@ -881,17 +874,8 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         self.sliding_window = kv_cache_spec.sliding_window
 
     @classmethod
-    def _contiguous_blocks_for_hit(
-        cls, window_size: int, block_size: int, use_eagle: bool
-    ) -> int:
-        blocks = cdiv(window_size - 1, block_size)
-        if use_eagle:
-            # Need to drop the last matched block if eagle is enabled. For
-            # sliding window layer, we achieve this by increasing the number of
-            # contiguous blocks needed for prefix cache hit by one and dropping
-            # the last matched block.
-            blocks += 1
-        return blocks
+    def _contiguous_blocks_for_hit(cls, window_size: int, block_size: int) -> int:
+        return cdiv(window_size - 1, block_size)
 
     @classmethod
     def find_longest_cache_hit(
@@ -901,7 +885,6 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         kv_cache_group_ids: list[int],
         block_pool: BlockPool,
         kv_cache_spec: KVCacheSpec,
-        drop_eagle_block: bool,
         alignment_tokens: int,
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
@@ -925,7 +908,8 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
 
         # The number of contiguous blocks needed for a prefix cache hit.
         sliding_window_contiguous_blocks = cls._contiguous_blocks_for_hit(
-            kv_cache_spec.sliding_window, kv_cache_spec.block_size, drop_eagle_block
+            kv_cache_spec.sliding_window,
+            kv_cache_spec.block_size,
         )
 
         # TODO: reduce i by sliding_window_contiguous_blocks when cache miss, to
@@ -948,10 +932,12 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             ):
                 # Skip prefix matching check if the block is not aligned with
                 # `alignment_tokens`.
-                if num_contiguous_blocks == 0 and block_size != alignment_tokens:
-                    post_pop_blocks = i if drop_eagle_block else i + 1
-                    if (post_pop_blocks * block_size) % alignment_tokens != 0:
-                        continue
+                if (
+                    num_contiguous_blocks == 0
+                    and block_size != alignment_tokens
+                    and ((i + 1) * block_size) % alignment_tokens != 0
+                ):
+                    continue
                 # Add the cached block to the computed blocks.
                 for computed, cached in zip(computed_blocks, cached_block):
                     computed[i] = cached
@@ -977,18 +963,6 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             ):
                 for computed in computed_blocks:
                     computed.pop()
-        if drop_eagle_block and computed_blocks[0]:
-            for computed in computed_blocks:
-                computed.pop()
-            # Re-align after eagle pop: the pop may break the alignment
-            # when block_size != alignment_tokens (hybrid models with
-            # different page sizes, e.g. Gemma4).
-            while (
-                block_size != alignment_tokens
-                and len(computed_blocks[0]) * block_size % alignment_tokens != 0
-            ):
-                for computed in computed_blocks:
-                    computed.pop()
         hit_length = len(computed_blocks[0]) * block_size
         return computed_blocks, hit_length
 
@@ -999,9 +973,11 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         end_block: int,
         alignment_tokens: int | None,
         kv_cache_spec: KVCacheSpec,
-        use_eagle: bool,
         retention_interval: int | None = None,
-        reachable_boundaries: Sequence[int] = (),
+        num_prompt_tokens: int | None = None,
+        shared_prefix_boundary: int = 0,
+        replay_alignment_tokens: int | None = None,
+        eagle_rewind_tokens: int = 0,
     ) -> list[bool] | None:
         assert isinstance(kv_cache_spec, SlidingWindowSpec)
         if alignment_tokens is None:
@@ -1010,47 +986,70 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         assert alignment_tokens % kv_cache_spec.block_size == 0
 
         block_size = kv_cache_spec.block_size
-        # Contiguous blocks a hit needs at a boundary (incl. the EAGLE peek).
+        # Contiguous blocks a hit needs in the window ending at a checkpoint.
         need = cls._contiguous_blocks_for_hit(
             window_size=kv_cache_spec.sliding_window,
             block_size=block_size,
-            use_eagle=use_eagle,
         )
-        # The matched run's right edge sits on the aligned boundary block when
-        # EAGLE peeks one block past it (shift=1), otherwise on the last block
-        # before the boundary (shift=0).
-        shift = 1 if use_eagle else 0
-
         mask = [False] * (end_block - start_block)
+        replay_checkpoints: list[int] = []
+        if num_prompt_tokens is not None:
+            prompt_checkpoint = get_prompt_replay_checkpoint(
+                num_prompt_tokens,
+                alignment_tokens,
+                eagle_rewind_tokens,
+                enable_partial_hash_hits=False,
+            )
+            if prompt_checkpoint:
+                replay_checkpoints.append(prompt_checkpoint)
+            if shared_prefix_boundary:
+                replay_checkpoints.append(shared_prefix_boundary)
+
+        def retain_window_at_boundary(boundary_tokens: int) -> None:
+            aligned = boundary_tokens // alignment_tokens * alignment_tokens
+            if aligned == 0:
+                return
+            end = aligned // block_size
+            for block_idx in range(max(start_block, end - need), min(end_block, end)):
+                mask[block_idx - start_block] = True
 
         # (1) Segment-boundary tails. ``retention_interval``:
         #   None -> dense (a tail at every ``alignment_tokens`` boundary);
         #   0    -> no dense tails (only the replay boundary below);
         #   >0   -> a tail once per ``retention_interval``-sized segment.
         segment_tokens = (
-            alignment_tokens
-            if retention_interval is None
-            else (None if retention_interval == 0 else retention_interval)
+            alignment_tokens if retention_interval is None else retention_interval
         )
-        if segment_tokens is not None:
+        if segment_tokens:
             per_segment = segment_tokens // block_size
             if need >= per_segment:
-                # Every block is reachable; cache them all.
                 return None
-            for i in range(start_block, end_block):
-                if i >= shift and (i - shift) % per_segment >= per_segment - need:
-                    mask[i - start_block] = True
+            available_prefix_tokens = max(
+                end_block * block_size,
+                num_prompt_tokens or 0,
+            )
+            replay_checkpoint = get_next_retention_checkpoint(
+                0,
+                retention_interval,
+                available_prefix_tokens,
+                alignment_tokens,
+                eagle_rewind_tokens,
+            )
+            while replay_checkpoint:
+                retain_window_at_boundary(replay_checkpoint)
+                replay_checkpoint = get_next_retention_checkpoint(
+                    replay_checkpoint,
+                    retention_interval,
+                    available_prefix_tokens,
+                    alignment_tokens,
+                    eagle_rewind_tokens,
+                )
 
-        # (2) Reachable-boundary tails: the replay boundary (``num_prompt - 1``,
-        # capped by ``get_computed_blocks``) and any shared-prefix junction. Both
-        # land before segments would cover them under sparse retention, so keep
-        # the ``need``-block tail ending on each boundary explicitly.
+        # (2) Prompt and shared-prefix checkpoints can fall between periodically
+        # retained segments, so keep the window ending at each one explicitly.
         if retention_interval is not None:
-            for boundary_tokens in reachable_boundaries:
-                aligned = boundary_tokens // alignment_tokens * alignment_tokens
-                end = aligned // block_size + shift
-                for j in range(max(start_block, end - need), min(end_block, end)):
-                    mask[j - start_block] = True
+            for boundary_tokens in replay_checkpoints:
+                retain_window_at_boundary(boundary_tokens)
 
         return mask
 
@@ -1105,7 +1104,6 @@ class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
         kv_cache_group_ids: list[int],
         block_pool: BlockPool,
         kv_cache_spec: KVCacheSpec,
-        drop_eagle_block: bool,
         alignment_tokens: int,
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
@@ -1136,7 +1134,6 @@ class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
             kv_cache_group_ids: The ids of the kv cache groups.
             block_pool: The block pool.
             kv_cache_spec: The kv cache spec.
-            drop_eagle_block: Whether to drop the last matched block for EAGLE/MTP.
             dcp_world_size: The world size of decode context parallelism.
             pcp_world_size: The world size of prefill context parallelism.
             alignment_tokens: The returned cache hit length (in tokens) should
@@ -1148,9 +1145,6 @@ class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
         assert isinstance(kv_cache_spec, ChunkedLocalAttentionSpec), (
             "ChunkedLocalAttentionManager can only be used for "
             "chunked local attention groups"
-        )
-        assert drop_eagle_block is False, (
-            "Hybrid KV cache is not supported for " + "eagle + chunked local attention."
         )
         assert dcp_world_size == 1, "DCP not support chunked local attn now."
         assert pcp_world_size == 1, "PCP not support chunked local attn now."
@@ -1270,11 +1264,20 @@ class MambaManager(SingleTypeKVCacheManager):
             self.last_state_block_idx: dict[str, int] = {}
             # The set of the requests that have been allocated blocks
             self._allocated_block_reqs: set[str] = set()
-            # Requests that registered their own last-prompt-boundary partial
-            # tail (producers). On the next step's CoW the boundary state moves
-            # into a private cow_block; we record that block for connector
-            # offload (see _pending_partial_tail_offloads).
+            # Requests that registered a sub-block checkpoint. On the next
+            # step's CoW, the state moves into a private block that can be
+            # handed to an external connector.
             self._producer_partial_tail_reqs: dict[str, int] = {}
+
+    @property
+    def enable_partial_hash_hits(self) -> bool:
+        """Whether this manager participates in the coordinator's fine grid."""
+        return (
+            self.enable_caching
+            and self.dcp_world_size == 1
+            and self.mamba_cache_mode == "align"
+            and self.replay_alignment_tokens < self.block_size
+        )
 
     @classmethod
     def find_longest_cache_hit(
@@ -1284,7 +1287,6 @@ class MambaManager(SingleTypeKVCacheManager):
         kv_cache_group_ids: list[int],
         block_pool: BlockPool,
         kv_cache_spec: KVCacheSpec,
-        drop_eagle_block: bool,
         alignment_tokens: int,
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
@@ -1362,21 +1364,22 @@ class MambaManager(SingleTypeKVCacheManager):
         end_block: int,
         alignment_tokens: int | None,
         kv_cache_spec: KVCacheSpec,
-        use_eagle: bool,
         retention_interval: int | None = None,
-        reachable_boundaries: Sequence[int] = (),
+        num_prompt_tokens: int | None = None,
+        shared_prefix_boundary: int = 0,
+        replay_alignment_tokens: int | None = None,
+        eagle_rewind_tokens: int = 0,
     ) -> list[bool] | None:
         """Sparse Mamba state-snapshot retention.
 
         ``retention_interval``:
 
           ``None`` -> dense (cache every block; default, unchanged behavior)
-          ``0``    -> keep only the ``reachable_boundaries`` states
+          ``0``    -> keep only prompt and shared-prefix checkpoints
           ``> 0``  -> keep one state per ``retention_interval``-sized segment
 
-        ``reachable_boundaries`` are proven reuse points (the replay boundary and
-        any cross-request shared-prefix junction, Marconi-style APC); their
-        boundary state is always kept so sparse retention does not defeat reuse.
+        The prompt replay checkpoint and any cross-request shared-prefix
+        junction are always kept so sparse retention does not defeat reuse.
         """
         if retention_interval is None or alignment_tokens is None:
             # Dense caching (default) or no alignment constraint imposed.
@@ -1384,30 +1387,50 @@ class MambaManager(SingleTypeKVCacheManager):
         assert isinstance(kv_cache_spec, MambaSpec)
         block_size = kv_cache_spec.block_size
         mask = [False] * (end_block - start_block)
+        replay_checkpoints: list[int] = []
+        if num_prompt_tokens is not None:
+            assert alignment_tokens is not None
+            replay_alignment_tokens = replay_alignment_tokens or alignment_tokens
+            prompt_checkpoint = get_prompt_replay_checkpoint(
+                num_prompt_tokens,
+                replay_alignment_tokens,
+                eagle_rewind_tokens,
+                enable_partial_hash_hits=(replay_alignment_tokens < alignment_tokens),
+            )
+            if prompt_checkpoint and prompt_checkpoint % block_size == 0:
+                replay_checkpoints.append(prompt_checkpoint)
+            shared_prefix_boundary = get_prefix_replay_checkpoint(
+                shared_prefix_boundary,
+                alignment_tokens,
+                0,
+            )
+            if shared_prefix_boundary:
+                replay_checkpoints.append(shared_prefix_boundary)
 
-        # (1) Segment-boundary states. A Mamba hit needs exactly the single
-        # state block ending on the boundary (no window, and draft models have
-        # no mamba layers, so no eagle shift). Block ``i`` ends at token
-        # ``(i + 1) * block_size``.
-        segment_tokens = None if retention_interval == 0 else retention_interval
-        if segment_tokens is not None:
-            per_segment = segment_tokens // block_size
-            if per_segment <= 1:
+        # (1) Segment-boundary states. A Mamba hit needs the single state block
+        # at the post-EAGLE resume position. Block ``i`` ends at token
+        # ``(i + 1) * block_size``; a sub-block replay state is registered by
+        # ``_cache_partial_block`` instead of this full-block mask.
+        if retention_interval > 0:
+            replay_is_block_aligned = eagle_rewind_tokens % block_size == 0
+            if retention_interval <= block_size and replay_is_block_aligned:
                 # Interval at/below the block size: every block is a boundary.
                 return None
-            first_boundary = (
-                start_block + per_segment
-            ) // per_segment * per_segment - 1
-            for i in range(first_boundary - start_block, len(mask), per_segment):
-                mask[i] = True
+            if replay_is_block_aligned:
+                for block_idx in range(start_block, end_block):
+                    block_end = (block_idx + 1) * block_size
+                    if is_retention_checkpoint(
+                        block_end,
+                        retention_interval,
+                        eagle_rewind_tokens,
+                    ):
+                        mask[block_idx - start_block] = True
 
-        # (2) Reachable-boundary states: the replay boundary (``num_prompt - 1``,
-        # capped by ``get_computed_blocks``) and any shared-prefix junction, both
-        # of which segments would otherwise skip under sparse retention. A Mamba
-        # hit needs exactly the single state block ending on the boundary.
-        for boundary_tokens in reachable_boundaries:
-            aligned = boundary_tokens // alignment_tokens * alignment_tokens
-            boundary_block = aligned // block_size - 1
+        # (2) Prompt/shared-prefix replay checkpoints need the single state
+        # block ending at the checkpoint.
+        for boundary_tokens in replay_checkpoints:
+            assert boundary_tokens % block_size == 0
+            boundary_block = boundary_tokens // block_size - 1
             if start_block <= boundary_block < end_block:
                 mask[boundary_block - start_block] = True
 
@@ -1628,8 +1651,8 @@ class MambaManager(SingleTypeKVCacheManager):
                         if boundary_tokens is not None:
                             # This CoW preserved a producer's own boundary
                             # state in cow_block; hand it to the connector for
-                            # partial-tail offload once the copy has run.
-                            self._pending_partial_tail_offloads.append(
+                            # checkpoint offload once the copy has run.
+                            self._pending_mamba_checkpoint_offloads.append(
                                 (
                                     request_id,
                                     self.kv_cache_group_id,
@@ -1657,9 +1680,9 @@ class MambaManager(SingleTypeKVCacheManager):
             self._producer_partial_tail_reqs.pop(request_id, None)
             # A hand-off whose request died in this same scheduling pass must
             # not reach the connector: its unpin hook (free) has already run.
-            self._pending_partial_tail_offloads = [
+            self._pending_mamba_checkpoint_offloads = [
                 entry
-                for entry in self._pending_partial_tail_offloads
+                for entry in self._pending_mamba_checkpoint_offloads
                 if entry[0] != request_id
             ]
         return super().pop_blocks_for_free(request_id)
@@ -1682,9 +1705,42 @@ class MambaManager(SingleTypeKVCacheManager):
         super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
         if self.mamba_cache_mode == "align":
-            partial_hash = self._cache_partial_tail_block(request, num_tokens)
-            if partial_hash is not None:
+            prompt_checkpoint = get_prompt_replay_checkpoint(
+                request.num_prompt_tokens,
+                self.replay_alignment_tokens,
+                self.eagle_rewind_tokens,
+                enable_partial_hash_hits=self.enable_partial_hash_hits,
+            )
+            if prompt_checkpoint and prompt_checkpoint % self.block_size == 0:
+                checkpoint_idx = prompt_checkpoint // self.block_size - 1
+                if num_cached_blocks_before <= checkpoint_idx < num_cached_blocks_after:
+                    checkpoint_block = self.req_to_blocks[request.request_id][
+                        checkpoint_idx
+                    ]
+                    if (
+                        not checkpoint_block.is_null
+                        and checkpoint_block.block_hash is not None
+                    ):
+                        self._pending_mamba_checkpoint_offloads.append(
+                            (
+                                request.request_id,
+                                self.kv_cache_group_id,
+                                checkpoint_block,
+                                prompt_checkpoint,
+                            )
+                        )
+            partial = self._cache_partial_block(request, num_tokens, retention_interval)
+            if partial is not None:
+                partial_hash, block_idx, source_block = partial
                 self.cached_blocks_this_step.add(partial_hash)
+                # The next forward overwrites this state block, so preserve it
+                # through the existing CoW and connector-offload path.
+                self._partial_hit_reqs[request.request_id] = (
+                    block_idx,
+                    source_block,
+                )
+                self.num_cached_block[request.request_id] = block_idx
+                self._producer_partial_tail_reqs[request.request_id] = num_tokens
         if num_cached_blocks_after > num_cached_blocks_before:
             for block in self.req_to_blocks[request.request_id][
                 num_cached_blocks_before:num_cached_blocks_after
@@ -1699,49 +1755,6 @@ class MambaManager(SingleTypeKVCacheManager):
 
     def new_step_starts(self) -> None:
         self.cached_blocks_this_step.clear()
-
-    def _cache_partial_tail_block(
-        self,
-        request: Request,
-        num_tokens: int,
-    ) -> BlockHashWithGroupId | None:
-        hash_block_size = self.block_pool.hash_block_size
-        if self.block_size == hash_block_size:
-            return None
-        if num_tokens % self.block_size == 0:
-            return None
-        if num_tokens % hash_block_size != 0:
-            return None
-        latest_prompt_hash_boundary = (
-            request.num_prompt_tokens // hash_block_size
-        ) * hash_block_size
-        if num_tokens != latest_prompt_hash_boundary:
-            return None
-
-        block_idx = num_tokens // self.block_size
-        blocks = self.req_to_blocks[request.request_id]
-        if block_idx >= len(blocks):
-            return None
-        source_block = blocks[block_idx]
-        if source_block.is_null:
-            return None
-
-        partial_hash = self.block_pool.cache_partial_block(
-            request=request,
-            block=source_block,
-            num_tokens=num_tokens,
-            kv_cache_group_id=self.kv_cache_group_id,
-            block_size=self.block_size,
-        )
-        if partial_hash is not None:
-            self._partial_hit_reqs[request.request_id] = (block_idx, source_block)
-            self.num_cached_block[request.request_id] = block_idx
-            # Producer of this partial tail: the boundary state currently lives
-            # in ``source_block`` but the next step's forward overwrites it. The
-            # upcoming CoW copies it into a durable cow_block; record the req so
-            # allocate_new_blocks hands that block to the connector for offload.
-            self._producer_partial_tail_reqs[request.request_id] = num_tokens
-        return partial_hash
 
 
 class CrossAttentionManager(SingleTypeKVCacheManager):
@@ -1790,7 +1803,6 @@ class CrossAttentionManager(SingleTypeKVCacheManager):
         kv_cache_group_ids: list[int],
         block_pool: BlockPool,
         kv_cache_spec: KVCacheSpec,
-        drop_eagle_block: bool,
         alignment_tokens: int,
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,

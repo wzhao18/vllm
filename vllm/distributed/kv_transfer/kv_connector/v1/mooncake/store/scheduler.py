@@ -11,9 +11,6 @@ from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator import (  # noqa: E501
-    partial_hash_hits_enabled,
-)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  # noqa: E501
     LoadSpec,
     MooncakeStoreConnectorMetadata,
@@ -25,7 +22,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker import (
 )
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+from vllm.v1.core.kv_cache_utils import (
+    can_use_mamba_partial_cache_hits,
+    resolve_kv_cache_block_sizes,
+)
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import Request
@@ -68,8 +68,12 @@ class MooncakeStoreScheduler:
         self._block_size, self._hash_block_size = resolve_kv_cache_block_sizes(
             kv_cache_config, vllm_config
         )
-        self.enable_partial_hash_hits = partial_hash_hits_enabled(
-            kv_cache_config.kv_cache_groups, self._hash_block_size
+        dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
+        self.enable_partial_hash_hits = can_use_mamba_partial_cache_hits(
+            kv_cache_config.kv_cache_groups,
+            self._hash_block_size,
+            enable_caching=vllm_config.cache_config.enable_prefix_caching,
+            dcp_world_size=dcp_world_size,
         )
 
         # Per-request state
@@ -354,19 +358,18 @@ class MooncakeStoreScheduler:
                 if req_meta is not None:
                     meta.add_request(req_meta)
 
-        # Flush partial-tail offloads in the step they arrive: the CoW copy is
-        # enqueued before the connector event records, so this step's event
-        # fences the cow block. Ride the request's save meta when present, else
-        # emit an offload-only ReqMeta (token_len_chunk=0 skips the normal
-        # save; can_save=True takes the normal enqueue path).
-        step_partial_tails = getattr(scheduler_output, "partial_tail_offloads", None)
-        if step_partial_tails and not force_skip_save:
-            pending = dict(step_partial_tails)
+        # Flush Mamba checkpoints in the step they arrive. For a partial
+        # checkpoint, the CoW copy is enqueued before the connector event, so
+        # this step's event fences its destination. Ride the request's save
+        # metadata when present, otherwise emit an offload-only entry.
+        step_checkpoints = getattr(scheduler_output, "mamba_checkpoint_offloads", None)
+        if step_checkpoints and not force_skip_save:
+            pending = dict(step_checkpoints)
             for req_meta in meta.requests:
                 if req_meta.can_save:
                     groups = pending.pop(req_meta.req_id, None)
                     if groups:
-                        req_meta.partial_tail_offloads = groups
+                        req_meta.mamba_checkpoint_offloads = groups
                         tracker = self._request_trackers.get(req_meta.req_id)
                         if tracker is not None:
                             tracker.has_pending_offload = True
@@ -376,7 +379,7 @@ class MooncakeStoreScheduler:
                 if tracker is None or req_tuple is None:
                     # Request finished/preempted within this step; its blocks
                     # are going away, so the offload is conservatively dropped.
-                    logger.debug("Dropping partial-tail offload for request %s", req_id)
+                    logger.debug("Dropping checkpoint offload for request %s", req_id)
                     continue
                 assert len({boundary for _, _, boundary in groups}) == 1
                 tracker.has_pending_offload = True
@@ -388,7 +391,7 @@ class MooncakeStoreScheduler:
                         block_hashes=req_tuple[0].block_hashes,
                         can_save=True,
                         num_prompt_tokens=tracker.prefill_end_tokens,
-                        partial_tail_offloads=groups,
+                        mamba_checkpoint_offloads=groups,
                     )
                 )
 

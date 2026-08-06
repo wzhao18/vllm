@@ -627,7 +627,7 @@ def test_prefill_hybrid_model_eagle():
         0,
     )
 
-    # Evict the last block of all layers, reduces the hit length to 4.
+    # The last block is beyond the common replay cap and is not needed.
     _test_partial_request_hit(
         manager,
         block_size,
@@ -639,10 +639,10 @@ def test_prefill_hybrid_model_eagle():
             make_block_hash_with_group_id(block_hashes[-1], 1),
             make_block_hash_with_group_id(block_hashes[-1], 2),
         ],
-        4,
+        5,
     )
 
-    # Evict the last block of full attention, reduces the hit length to 4.
+    # Evicting only that full-attention block has the same result.
     _test_partial_request_hit(
         manager,
         block_size,
@@ -650,11 +650,10 @@ def test_prefill_hybrid_model_eagle():
         "5",
         all_token_ids,
         [make_block_hash_with_group_id(block_hashes[-1], 0)],
-        4,
+        5,
     )
 
-    # Since the last block of full attention is dropped for eagle, evict
-    # the second last block of sliding window, reduces the hit length to 3.
+    # Evict a block in the SWA window ending at the replay cap.
     _test_partial_request_hit(
         manager,
         block_size,
@@ -662,11 +661,10 @@ def test_prefill_hybrid_model_eagle():
         "6",
         all_token_ids,
         [make_block_hash_with_group_id(block_hashes[-2], 1)],
-        3,
+        4,
     )
 
-    # Since the last block of full attention is dropped for eagle, evict
-    # the second last block of sliding window, reduces the hit length to 3.
+    # The sibling SWA group follows the same replay-window rule.
     _test_partial_request_hit(
         manager,
         block_size,
@@ -674,14 +672,11 @@ def test_prefill_hybrid_model_eagle():
         "7",
         all_token_ids,
         [make_block_hash_with_group_id(block_hashes[-2], 2)],
-        3,
+        4,
     )
 
     # Evict different set of blocks for full attention and sliding window.
-    # Full loses its last block so it drops to 4 full blocks after the eagle
-    # pop; SWA lost block 0 (outside the sliding window of the final hit),
-    # which is not required for the K+1 anchor at position 4. Coordinated
-    # single-drop aligns both groups at hit=4.
+    # Both evictions are outside the state needed at the replay cap.
     _test_partial_request_hit(
         manager,
         block_size,
@@ -693,7 +688,7 @@ def test_prefill_hybrid_model_eagle():
             make_block_hash_with_group_id(block_hashes[0], 1),
             make_block_hash_with_group_id(block_hashes[0], 2),
         ],
-        4,
+        5,
     )
 
 
@@ -1080,9 +1075,11 @@ def test_hybrid_cache_mamba_align_shared_prefix_detection():
         cache_config=SimpleNamespace(block_size=block_size),
         max_num_scheduled_tokens=3 * block_size,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
-        use_eagle=False,
+        eagle_rewind_tokens=0,
+        replay_alignment_tokens=block_size,
         hash_block_size=block_size,
-        mamba_partial_cache_hit=False,
+        enable_mamba_partial_hash_hits=False,
+        prefix_cache_retention_interval=None,
     )
     req_2.shared_prefix_boundary = shared_prefix_boundary
     num_new_tokens_adjusted = Scheduler._mamba_block_aligned_split(
@@ -2581,9 +2578,8 @@ def test_emit_cached_block_events_zero_cached():
     assert pool.take_events() == []
 
 
-def test_eagle_enabled_removes_last_block():
-    """Verify Eagle does NOT remove blocks when request
-    length is divisible by block size."""
+def test_eagle_aligned_prompt_rewinds_once():
+    """EAGLE's replay rewind also satisfies last-token recomputation."""
     block_size = 16
     manager = make_kv_cache_manager(
         make_kv_cache_config(block_size, num_blocks=10),
@@ -2608,11 +2604,8 @@ def test_eagle_enabled_removes_last_block():
     req_eagle = make_request("eagle_divisible", token_ids, block_size, sha256)
     computed_blocks, num_tokens, _ = manager.get_computed_blocks(req_eagle)
 
-    # Should retain 1 block:
-    # 1. Original 3 blocks → pop last hash → 2 matched blocks
-    # 2. drop last matched block → 1 remaining block
-    assert len(computed_blocks.blocks[0]) == 1
-    assert num_tokens == 1 * block_size  # 16 tokens
+    assert len(computed_blocks.blocks[0]) == 2
+    assert num_tokens == 2 * block_size
 
 
 def test_eagle_with_partial_blocks():
@@ -2639,7 +2632,7 @@ def test_eagle_with_partial_blocks():
     # New request with Eagle enabled
     req_eagle = make_request("partial_eagle", token_ids, block_size, sha256)
     computed_blocks, num_tokens, _ = manager.get_computed_blocks(req_eagle)
-    # Original match: 2 full blocks → Eagle removes 1 → 1 remaining
+    # The common replay cap reserves one block, leaving one reusable block.
     assert len(computed_blocks.blocks[0]) == 1
     assert num_tokens == 1 * block_size
 
@@ -2703,27 +2696,21 @@ def test_eagle_with_sliding_window():
         "partial_eagle_after_evict", token_ids, block_size, sha256
     )
     computed_blocks, num_tokens, _ = manager.get_computed_blocks(req_after_evict)
-    # Cache miss. The only hit prefix is [NULL_BLOCK, BLOCK_2] if eagle is
-    # not considered. But after dropping the last matched block due to eagle,
-    # there will be no matched prefix.
+    # The only cached block before the replay cap is missing, so this is a miss.
     assert len(computed_blocks.blocks[0]) == 0
     assert num_tokens == 0
 
 
-def test_eagle_swa_alignment_caches_extra_block():
-    """Regression: SWA + EAGLE with `sliding_window <= alignment_tokens`.
+def test_eagle_swa_alignment_reuses_common_replay_checkpoint():
+    """SWA can reuse the common EAGLE replay checkpoint.
 
     When the cache-hit alignment (lcm of per-group block sizes) is larger than
-    the SWA window, the SWA mask only kept the last block of each aligned
-    segment. EAGLE/MTP lookup needs ``tail + 1`` contiguous cached blocks and
-    that +1 block lives at the next segment's first position, which was left
-    uncached. The fix caches that extra block when ``use_eagle=True``.
+    the SWA window, the SWA group retains the normal window ending at each
+    checkpoint after the common EAGLE rewind has been applied.
     """
     block_size = 8
     # Full group uses 4 * block_size, so lcm/alignment is 4 * block_size.
     # SWA group has sliding_window = block_size (i.e., tail = 1 block).
-    # Without the fix, the second cached block needed for the EAGLE 2-block
-    # match never exists -> EAGLE cache hit fails entirely.
     kv_cache_config = KVCacheConfig(
         num_blocks=100,
         kv_cache_tensors=[],
@@ -2771,27 +2758,21 @@ def test_eagle_swa_alignment_caches_extra_block():
     assert blocks is not None
     manager.free(req0)
 
-    # Second request with identical prompt should find an EAGLE cache hit.
-    # Without the fix, ``num_computed_tokens`` is 0; with the fix, it lands at
-    # an alignment boundary (multiple of 32 tokens, minus the EAGLE drop).
+    # The second request resumes directly from a common replay checkpoint.
     req1 = make_request("1", token_ids, block_size, sha256)
     _, num_computed_tokens, _ = manager.get_computed_blocks(req1)
     assert num_computed_tokens > 0, (
         "EAGLE + SWA with sliding_window <= alignment failed to find any "
-        "cache hit; the +1 block past each segment boundary must be cached."
+        "cache hit at a common replay checkpoint."
     )
-    # Each aligned segment contributes 4 * block_size = 32 tokens; EAGLE drops
-    # the last block (block_size tokens) from the hit.
     assert num_computed_tokens % (4 * block_size) == 0
 
 
-def test_eagle_swa_boundary_caches_post_boundary_block():
-    """EAGLE + SWA must cache the first block after an alignment boundary.
+def test_eagle_swa_caches_window_ending_at_replay_checkpoint():
+    """EAGLE + SWA caches the window ending at the common replay checkpoint.
 
-    A 40-token computed prefix with 8-token SWA blocks and 32-token hybrid
-    alignment needs SWA blocks 3 and 4 cached to reuse a 32-token prefix:
-    block 3 is the segment tail, and block 4 is the EAGLE lookahead block
-    that gets dropped after lookup.
+    A 40-token computed prefix provides eight tokens of lookahead beyond the
+    32-token checkpoint. Only the SWA window ending at 32 is reusable.
     """
     block_size = 8
     kv_cache_config = KVCacheConfig(
@@ -2841,7 +2822,7 @@ def test_eagle_swa_boundary_caches_post_boundary_block():
 
     pool = manager.block_pool
     assert pool.get_cached_block(req0.block_hashes[3], kv_cache_group_ids=[1])
-    assert pool.get_cached_block(req0.block_hashes[4], kv_cache_group_ids=[1])
+    assert not pool.get_cached_block(req0.block_hashes[4], kv_cache_group_ids=[1])
     manager.free(req0)
 
     req1 = make_request("1", token_ids + [999], block_size, sha256)
@@ -2850,7 +2831,7 @@ def test_eagle_swa_boundary_caches_post_boundary_block():
 
 
 def test_eagle_grouped_swa_siblings_use_same_cache_mask():
-    """Grouped SWA siblings must cache the EAGLE lookahead block together."""
+    """Grouped SWA siblings cache the same replay-checkpoint windows."""
     block_size = 8
     swa_spec = SlidingWindowSpec(
         block_size=block_size,
@@ -2896,8 +2877,8 @@ def test_eagle_grouped_swa_siblings_use_same_cache_mask():
     assert blocks is not None
 
     pool = manager.block_pool
-    assert pool.get_cached_block(req0.block_hashes[4], kv_cache_group_ids=[1, 2])
-    assert pool.get_cached_block(req0.block_hashes[8], kv_cache_group_ids=[1, 2])
+    assert pool.get_cached_block(req0.block_hashes[3], kv_cache_group_ids=[1, 2])
+    assert pool.get_cached_block(req0.block_hashes[7], kv_cache_group_ids=[1, 2])
     manager.free(req0)
 
     req1 = make_request("1", token_ids + [999], block_size, sha256)
@@ -3156,7 +3137,7 @@ def test_hybrid_local_kv_retention_interval_aligns_in_manager(monkeypatch):
     )
 
     # The SWA manager uses the configured 64-token interval (a multiple of the
-    # 32-token lcm_block_size) as its retention segment. For this 128-token
+    # 32-token scheduler block size) as its retention segment. For this 128-token
     # prompt, the retained SWA tails are the 64-token interval boundary, the
     # 96-token replay boundary, and the 128-token interval boundary.
     token_ids = [i for i in range(16) for _ in range(block_size)]
@@ -3389,11 +3370,10 @@ def test_hybrid_local_kv_retention_latest_only_reuses_replay_boundary(monkeypatc
 
 
 def test_hybrid_local_kv_retention_mtp_reuses_latest_boundary(monkeypatch):
-    """Verify MTP/EAGLE SWA retention keeps the extra proof block.
+    """Verify MTP/EAGLE SWA retention keeps its replay window.
 
-    EAGLE/MTP lookup matches one additional local block after the returned
-    prefix and then drops it. Sparse retention must therefore cache the normal
-    local tail at the latest replay boundary plus one extra SWA block.
+    The common replay cap already reserves EAGLE lookahead, so sparse retention
+    only needs the normal local window ending at that checkpoint.
     """
     monkeypatch.setenv("VLLM_PREFIX_CACHE_RETENTION_INTERVAL", "0")
     block_size = 8
@@ -3431,9 +3411,8 @@ def test_hybrid_local_kv_retention_mtp_reuses_latest_boundary(monkeypatch):
         use_eagle=True,
     )
 
-    # 127 tokens: latest replay boundary is floor((127 - 1) / 32) * 32 = 96.
-    # The EAGLE/MTP SWA lookup group must cache the local tail ending at
-    # 104 tokens, and that tail is two 8-token blocks wide: hashes 11 and 12.
+    # 127 tokens: latest replay boundary is floor((127 - 8) / 32) * 32 = 96.
+    # The EAGLE/MTP SWA group caches the one-block window ending at 96.
     token_ids = [i for i in range(15) for _ in range(block_size)] + [15] * 7
     req0 = make_request("0", token_ids, block_size, sha256)
     computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req0)
@@ -3447,7 +3426,7 @@ def test_hybrid_local_kv_retention_mtp_reuses_latest_boundary(monkeypatch):
     assert blocks is not None
 
     pool = manager.block_pool
-    expected_swa_cached = {11, 12}
+    expected_swa_cached = {11}
     for i in range(15):
         cached = pool.get_cached_block(req0.block_hashes[i], kv_cache_group_ids=[1])
         if i in expected_swa_cached:
@@ -4051,15 +4030,20 @@ def test_mamba_reachable_block_mask_sparsifies_retention():
         mamba_cache_mode="align",
     )
 
-    def retained(retention_interval, num_prompt_tokens=256, end_block=16):
+    def retained(
+        retention_interval,
+        num_prompt_tokens=256,
+        end_block=16,
+        eagle_rewind_tokens=0,
+    ):
         m = MambaManager.reachable_block_mask(
             start_block=0,
             end_block=end_block,
             alignment_tokens=block_size,
             kv_cache_spec=spec,
-            use_eagle=False,
             retention_interval=retention_interval,
-            reachable_boundaries=(num_prompt_tokens - 1,),
+            num_prompt_tokens=num_prompt_tokens,
+            eagle_rewind_tokens=eagle_rewind_tokens,
         )
         return None if m is None else {i for i, v in enumerate(m) if v}
 
@@ -4067,100 +4051,15 @@ def test_mamba_reachable_block_mask_sparsifies_retention():
     assert retained(None) is None
     # interval == block_size -> every block is a boundary -> stays dense.
     assert retained(block_size) is None
+    # A fine EAGLE rewind moves those checkpoints inside the preceding block;
+    # the partial-tail path retains them, so the full-block mask does not
+    # become dense (only the explicit coarse replay hint remains here).
+    assert retained(block_size, eagle_rewind_tokens=4) == {14}
     # interval 64 = 4 blocks: segment tails at i%4==3 -> {3,7,11,15}; latest
     # replay boundary 240//16 - 1 = 14. Sparse subset of the 16 blocks.
     assert retained(64) == {3, 7, 11, 14, 15}
     # interval 0 -> only the latest replay boundary (block 14).
     assert retained(0) == {14}
-
-
-def test_mamba_reachable_block_mask_pins_shared_prefix():
-    """A Marconi-detected shared prefix (``shared_prefix_boundary``) lands before
-    ``num_prompt`` so the replay-boundary rule alone would drop it. The mask must
-    pin the single state block ending on that boundary so sparse retention does
-    not defeat cross-request shared-prefix reuse."""
-    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
-
-    block_size = 16
-    spec = MambaSpec(
-        block_size=block_size,
-        shapes=(1, 1),
-        dtypes=(torch.float32,),
-        mamba_cache_mode="align",
-    )
-
-    def retained(retention_interval, shared_prefix_boundary, end_block=16):
-        boundaries = [255]  # replay boundary (num_prompt 256 - 1)
-        if shared_prefix_boundary:
-            boundaries.append(shared_prefix_boundary)
-        m = MambaManager.reachable_block_mask(
-            start_block=0,
-            end_block=end_block,
-            alignment_tokens=block_size,
-            kv_cache_spec=spec,
-            use_eagle=False,
-            retention_interval=retention_interval,
-            reachable_boundaries=boundaries,
-        )
-        return None if m is None else {i for i, v in enumerate(m) if v}
-
-    # interval 0 keeps only replay boundary 14; the shared prefix at token 96
-    # (state block 96//16 - 1 = 5) is now pinned too.
-    assert retained(0, 96) == {5, 14}
-    # A non-aligned boundary floors to the enclosing aligned boundary.
-    assert retained(0, 100) == {5, 14}
-    # Coexists with segment tails (interval 64 -> {3,7,11,15} + replay 14).
-    assert retained(64, 96) == {3, 5, 7, 11, 14, 15}
-    # Dense default ignores the hint (nothing to sparsify).
-    assert retained(None, 96) is None
-    # Out-of-range boundary is a no-op (only replay 14 remains).
-    assert retained(0, 16 * block_size * 2) == {14}
-    # No boundary given -> unchanged replay-only behavior.
-    assert retained(0, 0) == {14}
-    assert retained(0, None) == {14}
-
-
-def test_mamba_shared_prefix_survives_zero_retention(monkeypatch):
-    """Manager-level check of the full wiring: a pinned shared-prefix boundary
-    (``Request.shared_prefix_boundary``, set by the scheduler on Marconi-style
-    detection) keeps its Mamba state block cached under
-    ``VLLM_PREFIX_CACHE_RETENTION_INTERVAL=0``, which otherwise retains only the
-    end-of-prompt replay boundary. Without this, a shared prefix (junction
-    before ``num_prompt``) would be recomputed by every sharing request."""
-    monkeypatch.setenv("VLLM_PREFIX_CACHE_RETENTION_INTERVAL", "0")
-    block_size = 16
-
-    # 16-block (256-token) prompt; replay boundary is block 240 // 16 - 1 = 14.
-    token_ids = [i for i in range(16) for _ in range(block_size)]
-
-    def cached_mamba_blocks(shared_prefix_boundary):
-        # Fresh manager per scenario so cached blocks don't leak between runs.
-        manager = make_kv_cache_manager(
-            _make_hybrid_kv_cache_config(block_size, 100, ["full", "mamba"]),
-            max_model_len=8192,
-            enable_caching=True,
-            hash_block_size=block_size,
-        )
-        req = make_request("r", token_ids, block_size, sha256)
-        req.shared_prefix_boundary = shared_prefix_boundary
-        computed_blocks, num_computed, _ = manager.get_computed_blocks(req)
-        blocks = manager.allocate_slots(
-            req, len(token_ids), num_computed, computed_blocks
-        )
-        assert blocks is not None
-        pool = manager.block_pool
-        return {
-            i
-            for i in range(16)
-            if pool.get_cached_block(req.block_hashes[i], kv_cache_group_ids=[1])
-            is not None
-        }
-
-    # Without a pinned boundary, retention=0 keeps only the replay boundary (14).
-    assert cached_mamba_blocks(0) == {14}
-    # Pinning the shared prefix at token 96 (state block 5) retains it too, so a
-    # later request sharing that prefix can hit the Mamba state.
-    assert cached_mamba_blocks(96) == {5, 14}
 
 
 def test_mamba_shared_prefix_reuse_under_zero_retention(monkeypatch):
@@ -4216,49 +4115,126 @@ def test_mamba_shared_prefix_reuse_under_zero_retention(monkeypatch):
     assert last_req_hit(retention=0, pin=True) == 2 * block_size
 
 
-def test_swa_reachable_block_mask_pins_shared_prefix():
-    """SWA analog of the Mamba pin: the shared-prefix junction must keep the
-    ``need``-block sliding-window tail ending on that boundary (not a single
-    block), so a windowed hit can land there under sparse retention."""
+@pytest.mark.parametrize(
+    ("retention_interval", "expected"),
+    [
+        (None, {3, 7, 11}),
+        (64, {3}),
+    ],
+)
+def test_swa_reachable_block_mask_retains_replay_checkpoint_windows(
+    retention_interval: int | None,
+    expected: set[int],
+):
     from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
 
-    block_size = 16
+    block_size = 8
+    alignment_tokens = 4 * block_size
+    spec = SlidingWindowSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=block_size,
+    )
 
-    def retained(retention, boundary, window, end_block=16):
-        spec = SlidingWindowSpec(
-            block_size=block_size,
-            num_kv_heads=1,
-            head_size=1,
-            dtype=torch.float32,
-            sliding_window=window,
-        )
-        boundaries = [255]  # replay boundary (num_prompt 256 - 1)
-        if boundary:
-            boundaries.append(boundary)
-        m = SlidingWindowManager.reachable_block_mask(
-            start_block=0,
-            end_block=end_block,
-            alignment_tokens=block_size,
-            kv_cache_spec=spec,
-            use_eagle=False,
-            retention_interval=retention,
-            reachable_boundaries=boundaries,
-        )
-        return None if m is None else {i for i, v in enumerate(m) if v}
+    # Only 96 tokens are available. Dense retention still keeps the checkpoint
+    # at 96; the consuming request's replay cap is responsible for reserving
+    # its EAGLE suffix. Periodic retention keeps the checkpoint for boundary 64.
+    mask = SlidingWindowManager.reachable_block_mask(
+        start_block=0,
+        end_block=12,
+        alignment_tokens=alignment_tokens,
+        kv_cache_spec=spec,
+        retention_interval=retention_interval,
+        eagle_rewind_tokens=block_size,
+    )
 
-    # window == block_size -> need = cdiv(15, 16) = 1: single-block tail (like
-    # Mamba). Junction at token 96 -> block 5; replay boundary -> block 14.
-    assert retained(0, 96, block_size) == {5, 14}
-    # window == 3 * block_size -> need = cdiv(47, 16) = 3: the junction keeps a
-    # 3-block WINDOW {3,4,5} (the SWA distinction), plus replay window {12,13,14}.
-    assert retained(0, 96, 3 * block_size) == {3, 4, 5, 12, 13, 14}
-    # Coexists with segment tails (interval 64, need=1): {3,7,11,15} + replay 14
-    # + junction 5.
-    assert retained(64, 96, block_size) == {3, 5, 7, 11, 14, 15}
-    # Dense (all blocks reachable) ignores the hint.
-    assert retained(None, 96, block_size) is None
-    # No boundary -> unchanged replay-only behavior.
-    assert retained(0, 0, block_size) == {14}
+    assert mask is not None
+    assert {i for i, retained in enumerate(mask) if retained} == expected
+
+
+def test_swa_retention_reuses_incremental_mamba_replay_checkpoint(monkeypatch):
+    """Incremental prefill retains SWA state at Mamba replay checkpoints."""
+    monkeypatch.setenv("VLLM_PREFIX_CACHE_RETENTION_INTERVAL", "32")
+    block_size = 8
+    manager = make_kv_cache_manager(
+        make_kv_cache_config_three_types(block_size, 100),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+        use_eagle=True,
+    )
+
+    token_ids = [i for i in range(10) for _ in range(block_size)]
+    producer = make_request("producer", token_ids, block_size, sha256)
+    for num_new_tokens in (24, 32, 16, 8):
+        assert manager.allocate_slots(producer, num_new_tokens) is not None
+        producer.num_computed_tokens += num_new_tokens
+    manager.free(producer)
+
+    consumer = make_request(
+        "consumer",
+        token_ids[:32] + [999] * 16,
+        block_size,
+        sha256,
+    )
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(consumer)
+
+    assert num_computed_tokens == 24
+    assert [len(blocks) for blocks in computed_blocks.blocks] == [3, 3, 3]
+
+
+def test_swa_eagle_replay_cap_reserves_recompute_suffix(monkeypatch):
+    """Sparse SWA lookup leaves the configured EAGLE recompute suffix."""
+    monkeypatch.setenv("VLLM_PREFIX_CACHE_RETENTION_INTERVAL", "0")
+    block_size = 8
+    alignment = 4 * block_size
+    manager = make_kv_cache_manager(
+        KVCacheConfig(
+            num_blocks=64,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    ["full"],
+                    FullAttentionSpec(
+                        block_size=alignment,
+                        num_kv_heads=1,
+                        head_size=1,
+                        dtype=torch.float16,
+                    ),
+                ),
+                KVCacheGroupSpec(
+                    ["swa_mtp"],
+                    SlidingWindowSpec(
+                        block_size=block_size,
+                        num_kv_heads=1,
+                        head_size=1,
+                        dtype=torch.float32,
+                        sliding_window=block_size,
+                    ),
+                    is_eagle_group=True,
+                ),
+            ],
+        ),
+        max_model_len=8192,
+        enable_caching=True,
+        use_eagle=True,
+        hash_block_size=block_size,
+    )
+
+    tokens = list(range(100))
+    owner = make_request("owner", tokens, block_size, sha256)
+    blocks, num_computed, _ = manager.get_computed_blocks(owner)
+    assert manager.allocate_slots(owner, len(tokens), num_computed, blocks) is not None
+    manager.free(owner)
+
+    replay = make_request("replay", tokens + [100], block_size, sha256)
+    _, num_computed, _ = manager.get_computed_blocks(replay)
+
+    # Returning 96 would leave only five tokens to replay, less than the
+    # eight-token EAGLE rewind. The latest eligible checkpoint is 64.
+    assert num_computed == 2 * alignment
 
 
 def test_swa_shared_prefix_reuse_under_zero_retention(monkeypatch):
