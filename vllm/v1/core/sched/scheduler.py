@@ -322,6 +322,17 @@ class Scheduler(SchedulerInterface):
             self.need_mamba_block_aligned_split
             and self.hash_block_size < self.block_size
         )
+        # The grid a prefill chunk must land on for its Mamba state to be kept.
+        # Retention decides which boundaries survive, so stopping at any other
+        # one only shrinks the chunk without caching anything: dense retention
+        # keeps every block boundary, a sparse interval keeps one per segment,
+        # and 0 keeps none (only the explicit stops in the split below).
+        retention_interval = self.kv_cache_manager.coordinator.retention_interval
+        self.mamba_state_grid = (
+            self.block_size
+            if retention_interval is None or 0 < retention_interval <= self.block_size
+            else retention_interval
+        )
 
         # Counts of non-empty steps scheduled / processed. update_from_output
         # is called once per scheduled step in FIFO order, so these stay in sync.
@@ -394,19 +405,20 @@ class Scheduler(SchedulerInterface):
             last_cache_position = max(last_cache_position - block_size, 0)
 
         end = start + num_new_tokens
-        # Until `last_cache_position`, prefer chunks ending on block
-        # boundaries. When a block cannot fit in any configured prefill chunk,
-        # allow sub-block progress and re-align at the next reachable boundary.
-        if end < last_cache_position:
+        # Until `last_cache_position`, prefer chunks ending where a state is
+        # retained. When such a segment cannot fit in any configured prefill
+        # chunk, allow sub-segment progress and re-align at the next one.
+        grid = self.mamba_state_grid
+        if grid and end < last_cache_position:
             max_prefill_tokens = self.max_num_scheduled_tokens
             long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
             if long_prefill_threshold > 0:
                 max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
-            aligned_end = end // block_size * block_size
-            if aligned_end > start or block_size <= max_prefill_tokens:
+            aligned_end = end // grid * grid
+            if aligned_end > start or grid <= max_prefill_tokens:
                 end = aligned_end
 
-        next_block_boundary = (start // block_size + 1) * block_size
+        next_block_boundary = ((start // grid + 1) * grid) if grid else 0
         tail_boundary = (
             request.num_prompt_tokens // self.hash_block_size * self.hash_block_size
             if self.mamba_partial_cache_hit
@@ -417,7 +429,7 @@ class Scheduler(SchedulerInterface):
             # the block grid before running on, so the crossed boundary's
             # state is materialized (unless it is past the cacheable range).
             next_block_boundary
-            if start % block_size != 0 and next_block_boundary <= last_cache_position
+            if grid and start % grid != 0 and next_block_boundary <= last_cache_position
             else 0,
             # Never run past the last cacheable block boundary mid-chunk.
             last_cache_position,
