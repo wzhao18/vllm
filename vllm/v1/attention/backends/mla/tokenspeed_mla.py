@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """TokenSpeed CuTe DSL MLA decode backend (Blackwell, FP8 KV cache only)."""
 
+import os
 from typing import TYPE_CHECKING, ClassVar
 
 import torch
@@ -30,6 +31,14 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
+
+# OFF by default. Restored purely to answer one question with GSM8K: every
+# measurement showing DSpark accuracy-neutral (0.951 at DCP=1 and DCP=4, pipeline
+# 61661482) was taken with this block present, and the first measurement without
+# it came back 0.923 against 0.950 no-spec. It was removed on an acceptance A/B,
+# and acceptance is exactly what a "target sees the drafted KV" defect inflates,
+# so acceptance could not have settled it.
+_DCP_FLATTEN = os.environ.get("VLLM_TS_MLA_DCP_FLATTEN", "0") == "1"
 
 # Workspace upper bound for tokenspeed_mla_decode (per-device, lazy):
 #   num_sms * num_heads * MAX_Q_LEN * (kv_lora_rank + 1) * sizeof(float32)
@@ -266,9 +275,47 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
         seq_lens = attn_metadata.decode.seq_lens
         causal_seqs = attn_metadata.decode.dcp_tot_seq_lens
 
+        # Per-query causal bounds for a causal multi-token block under DCP.
+        # causal_seqs is ONE global bound per request, but query j of a q_len
+        # block ending at global length L must see KV only up to
+        # L - (q_len - 1 - j). The kernel does compute that -- k_bound =
+        # ceil((causal_seqs - cp_rank - (q_len-1) + q_tok) / cp_world) -- which
+        # is why this was removed. Off by default; the flag exists so GSM8K can
+        # decide, because acceptance already gave the wrong answer once.
+        q_len_per_req = num_decode_tokens // num_decodes if num_decodes else 0
+        if (
+            _DCP_FLATTEN
+            and attn_metadata.causal
+            and self.dcp_world_size > 1
+            and q_len_per_req > 1
+            and num_decode_tokens % num_decodes == 0
+            and causal_seqs is not None
+        ):
+            offsets = torch.arange(
+                q_len_per_req - 1, -1, -1,
+                device=causal_seqs.device, dtype=causal_seqs.dtype,
+            )
+            per_q_global = torch.clamp(
+                (causal_seqs.unsqueeze(1) - offsets.unsqueeze(0)).reshape(-1), min=0
+            )
+            # Rank-local length of each global bound, matching
+            # prepare_dcp_local_seq_lens in vllm/v1/worker/gpu/cp_utils.py.
+            interleave = self.cp_kv_cache_interleave_size
+            span = self.dcp_world_size * interleave
+            remainder = torch.clamp(
+                per_q_global % span - self.dcp_rank * interleave, min=0
+            )
+            seq_lens = (per_q_global // span) * interleave + torch.clamp(
+                remainder, max=interleave
+            )
+            causal_seqs = per_q_global
+            block_tables = block_tables.repeat_interleave(q_len_per_req, dim=0)
+            q = q.view(num_decodes * q_len_per_req, 1, q.shape[-2], q.shape[-1])
         # tokenspeed_mla_decode expects query shape
-        # (num_decodes, q_len_per_request, num_heads, head_dim).
-        if num_decode_tokens % num_decodes != 0:
+        # (num_decodes, q_len_per_request, num_heads, head_dim). Standalone `if`,
+        # never chained to the block above: chaining skips the reshape on exactly
+        # the DCP multi-token path and the kernel gets a 3D query.
+        elif num_decode_tokens % num_decodes != 0:
             logger.warning_once(
                 """TokenspeedMLAImpl got a query of uneven length.
                 This usually indicates an issue in batch reordering
