@@ -604,6 +604,21 @@ def hash_block_tokens(
     )
 
 
+def effective_kv_block_size(spec: KVCacheSpec, dcp_world_size: int) -> int:
+    """Tokens one block of this group spans across the DCP ranks.
+
+    Attention blocks are sharded over the DCP ranks, so one logical block
+    spans ``block_size * dcp``. Mamba/linear-attention state is replicated on
+    every rank and never sharded (``MambaSpec.max_num_blocks_per_req`` returns
+    the unscaled value), so it keeps ``block_size``. Scaling every group is a
+    no-op at ``dcp == 1``, which is why the distinction only shows up on hybrid
+    models under DCP.
+    """
+    if isinstance(spec, AttentionSpec):
+        return spec.block_size * dcp_world_size
+    return spec.block_size
+
+
 def resolve_kv_cache_block_sizes(
     kv_cache_config: KVCacheConfig,
     vllm_config: VllmConfig,
@@ -631,10 +646,7 @@ def resolve_kv_cache_block_sizes(
         return bs, bs
 
     group_block_sizes = [
-        g.kv_cache_spec.block_size * dcp
-        if isinstance(g.kv_cache_spec, AttentionSpec)
-        else g.kv_cache_spec.block_size
-        for g in groups
+        effective_kv_block_size(g.kv_cache_spec, dcp) for g in groups
     ]
     scheduler_block_size = math.lcm(*group_block_sizes)
 
