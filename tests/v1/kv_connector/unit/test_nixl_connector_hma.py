@@ -99,8 +99,7 @@ def test_logical_to_kernel_block_ids_with_hma():
 
 @pytest.mark.cpu_test
 @pytest.mark.parametrize(
-    "local_dcp_size,remote_dcp_size,tp_rank,remote_rank,expected_local,"
-    "expected_remote",
+    "local_dcp_size,remote_dcp_size,tp_rank,remote_rank,expected_local,expected_remote",
     [
         (
             1,
@@ -136,9 +135,7 @@ def test_map_block_aligned_dcp_attention_ids(
 
     worker = object.__new__(NixlConnectorWorker)
     worker.vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(
-            decode_context_parallel_size=local_dcp_size
-        )
+        parallel_config=SimpleNamespace(decode_context_parallel_size=local_dcp_size)
     )
     worker.tp_rank = tp_rank
     worker._group_spec_types = (FullAttentionSpec, MambaSpec)
@@ -427,6 +424,17 @@ def test_apply_prefix_caching_mamba_hybrid(
             [[6, 7, 8, 9], [99]],
             id="fa_prefix_hit_and_ssm_trim",
         ),
+        # A full local FA hit contributes no receive blocks for that group.
+        # ``remote[-0:]`` must not accidentally retain the full remote list.
+        pytest.param(
+            10,
+            10,
+            [[], [99]],
+            [list(range(10)), [99]],
+            [[], [99]],
+            [[], [99]],
+            id="fa_full_prefix_hit",
+        ),
         # Multi-slot SSM ("all" mode): a local prefix hit leaves fewer local
         # slots; the earlier remote slots are covered locally → remote tail.
         pytest.param(
@@ -487,6 +495,21 @@ def test_apply_prefix_caching_ssm_prefix_cache_hit(
     assert aligned_remote == expected_remote, (
         f"Expected remote {expected_remote}, got {aligned_remote}"
     )
+
+
+@pytest.mark.cpu_test
+def test_apply_prefix_caching_full_hit_clears_non_hybrid_remote_group():
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
+        NixlConnectorWorker,
+    )
+
+    worker = object.__new__(NixlConnectorWorker)
+    worker._has_mamba = False
+
+    local, remote = worker._apply_prefix_caching([[]], [[1, 2, 3]], 1, 1)
+
+    assert local == [[]]
+    assert remote == [[]]
 
 
 @pytest.mark.cpu_test

@@ -1036,9 +1036,7 @@ class NixlBaseConnectorWorker:
             physical_blocks_per_logical_kv_block=(
                 self._physical_blocks_per_logical_kv_block
             ),
-            dcp_size=(
-                self.vllm_config.parallel_config.decode_context_parallel_size
-            ),
+            dcp_size=(self.vllm_config.parallel_config.decode_context_parallel_size),
             cp_kv_cache_interleave_size=(
                 self.vllm_config.parallel_config.cp_kv_cache_interleave_size
             ),
@@ -1286,9 +1284,7 @@ class NixlBaseConnectorWorker:
             physical_blocks_per_logical_kv_block=(
                 self._physical_blocks_per_logical_kv_block
             ),
-            dcp_size=(
-                self.vllm_config.parallel_config.decode_context_parallel_size
-            ),
+            dcp_size=(self.vllm_config.parallel_config.decode_context_parallel_size),
             cp_kv_cache_interleave_size=(
                 self.vllm_config.parallel_config.cp_kv_cache_interleave_size
             ),
@@ -1756,9 +1752,7 @@ class NixlBaseConnectorWorker:
         remote_physical_per_logical = (
             nixl_agent_meta.physical_blocks_per_logical_kv_block
         )
-        local_dcp_size = (
-            self.vllm_config.parallel_config.decode_context_parallel_size
-        )
+        local_dcp_size = self.vllm_config.parallel_config.decode_context_parallel_size
         remote_dcp_size = nixl_agent_meta.dcp_size
         if local_dcp_size != remote_dcp_size:
             sharded_dcp_size = max(local_dcp_size, remote_dcp_size)
@@ -2173,9 +2167,7 @@ class NixlBaseConnectorWorker:
                         self.vllm_config.parallel_config.decode_context_parallel_size
                     )
                     if remote_info.remote_dcp_size > local_dcp_size:
-                        remote_blocks *= (
-                            remote_info.remote_dcp_size // local_dcp_size
-                        )
+                        remote_blocks *= remote_info.remote_dcp_size // local_dcp_size
                     covered_sub_blocks = min(
                         len(local_group) * block_size_ratio,
                         remote_blocks,
@@ -2467,9 +2459,7 @@ class NixlBaseConnectorWorker:
         remote_info: EngineTransferInfo,
     ) -> tuple[BlockIds, BlockIds]:
         """Pair block-aligned DCP attention shards with an unsharded peer."""
-        local_dcp_size = (
-            self.vllm_config.parallel_config.decode_context_parallel_size
-        )
+        local_dcp_size = self.vllm_config.parallel_config.decode_context_parallel_size
         remote_dcp_size = remote_info.remote_dcp_size
         if local_dcp_size == remote_dcp_size:
             return local_block_ids, remote_block_ids
@@ -2524,7 +2514,9 @@ class NixlBaseConnectorWorker:
                 num_decode_blocks = len(decode_block_ids[i])
                 assert num_decode_blocks <= len(prefill_group)
                 if num_decode_blocks < len(prefill_group):
-                    prefill_block_ids[i] = prefill_group[-num_decode_blocks:]
+                    prefill_block_ids[i] = (
+                        prefill_group[-num_decode_blocks:] if num_decode_blocks else []
+                    )
         else:
             # (NOTE: ZhanqiuHu) HeteroTP can cause different kernel block counts
             # due to logical block rounding.
@@ -2568,7 +2560,9 @@ class NixlBaseConnectorWorker:
                     and num_decode_blocks < num_prefill_blocks
                 ):
                     # Partial prefix cache hit for FA group.
-                    prefill_block_ids[i] = prefill_group[-num_decode_blocks:]
+                    prefill_block_ids[i] = (
+                        prefill_group[-num_decode_blocks:] if num_decode_blocks else []
+                    )
                 else:
                     # TODO Handle prefix caching with different block_sizes
                     # Allocation rounding legitimately leaves up to
