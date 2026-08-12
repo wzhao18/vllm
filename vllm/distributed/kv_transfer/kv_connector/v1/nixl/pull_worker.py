@@ -289,6 +289,12 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             == len(local_block_ids)
             == len(self.kv_cache_config.kv_cache_groups)
         )
+        local_block_ids, remote_block_ids = self._map_dcp_attention_block_ids(
+            local_block_ids,
+            remote_block_ids,
+            read_spec.remote_rank,
+            remote_info,
+        )
         local_block_ids, remote_block_ids = self._apply_prefix_caching(
             decode_block_ids=local_block_ids,
             prefill_block_ids=remote_block_ids,

@@ -395,6 +395,12 @@ class EngineTransferInfo:
     remote_physical_blocks_per_logical: int
     """Physical blocks per logical block."""
 
+    remote_dcp_size: int = 1
+    """Remote decode-context-parallel size."""
+
+    remote_cp_kv_cache_interleave_size: int = 1
+    """Remote DCP KV-cache token interleave."""
+
     remote_pp_rank: int = 0
     """Remote producer PP rank for this engine."""
 
@@ -610,6 +616,7 @@ class TransferTopology:
             f"num_kv_heads={self.total_num_kv_heads if not self.is_mla else 1}, "
             f"local_tp={self.tp_size}, "
             f"remote_tp={info.remote_tp_size}, "
+            f"remote_dcp={info.remote_dcp_size}, "
             f"remote_pp={remote_pp_rank}, "
             f"local_rank={self.tp_rank}, "
             f"remote_block_len={info.remote_block_len})"

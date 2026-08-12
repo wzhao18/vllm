@@ -66,6 +66,8 @@ def compute_tp_mapping(
     transfer_topology: TransferTopology,
     remote_tp_size: int,
     group_spec_types: tuple[type[KVCacheSpec], ...],
+    remote_dcp_size: int = 1,
+    local_dcp_size: int = 1,
 ) -> TPMapping:
     """Build the complete local-to-remote TP mapping.
 
@@ -93,6 +95,17 @@ def compute_tp_mapping(
         heads = np.arange(start, start + abs_tp) * total_num_kv_heads // remote_tp_size
         _, unique_idx = np.unique(heads, return_index=True)
         attn_ranks = (start + np.sort(unique_idx)).tolist()
+
+    if transfer_topology.is_mla and remote_dcp_size > local_dcp_size:
+        assert remote_dcp_size % local_dcp_size == 0
+        dcp_ratio = remote_dcp_size // local_dcp_size
+        tp_ratio = remote_tp_size // tp_size
+        assert tp_ratio == dcp_ratio, (
+            "NIXL DCP gather requires the remote/local DCP ratio to match "
+            "the remote/local TP ratio"
+        )
+        start = tp_rank * dcp_ratio
+        attn_ranks = list(range(start, start + dcp_ratio))
 
     # --- SSM source ranks ---
     has_ssm = any(_is_ssm_spec(t) for t in group_spec_types)

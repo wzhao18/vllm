@@ -628,6 +628,13 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             logger.warning("No blocks to push for request %s", request_id)
             return None
 
+        local_block_ids, remote_block_ids = self._map_dcp_attention_block_ids(
+            local_block_ids,
+            remote_block_ids,
+            read_spec.remote_rank,
+            remote_info,
+        )
+
         # Prefix caching: D allocated only uncached blocks, so on a partial hit it
         # sends fewer than P's. End-trim P's blocks to that same suffix so we WRITE only
         # the uncomputed tail into D's slots. Runs on kernel ids, post-expansion.

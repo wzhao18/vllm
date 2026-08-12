@@ -35,6 +35,8 @@ def _compute_mapping(
     is_mla: bool = False,
     num_kv_heads: int = 8,
     group_spec_types: tuple[type, ...] = (FullAttentionSpec,),
+    remote_dcp_size: int = 1,
+    local_dcp_size: int = 1,
 ) -> TPMapping:
     transfer_topology = SimpleNamespace(
         tp_rank=tp_rank,
@@ -46,6 +48,8 @@ def _compute_mapping(
         transfer_topology=transfer_topology,
         remote_tp_size=remote_tp_size,
         group_spec_types=group_spec_types,
+        remote_dcp_size=remote_dcp_size,
+        local_dcp_size=local_dcp_size,
     )
 
 
@@ -66,6 +70,21 @@ class TestTPMappingStructure:
     def test_source_ranks_p_gt_d(self):
         m = _compute_mapping(tp_size=1, tp_rank=0, remote_tp_size=2)
         assert m.all_source_ranks == (0, 1)
+
+    def test_mla_remote_dcp_gathers_every_shard(self):
+        m = _compute_mapping(
+            tp_size=1,
+            remote_tp_size=8,
+            is_mla=True,
+            remote_dcp_size=8,
+            group_spec_types=(FullAttentionSpec, MambaSpec),
+        )
+
+        assert m.source_ranks_per_group == (
+            tuple(range(8)),
+            tuple(range(8)),
+        )
+        assert m.all_source_ranks == tuple(range(8))
 
 
 # ======================================================================

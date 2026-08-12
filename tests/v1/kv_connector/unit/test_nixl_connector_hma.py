@@ -3,6 +3,7 @@
 """Unit tests for NixlConnectorScheduler with HMA and Mamba N-1 prefill."""
 
 import gc
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -94,6 +95,64 @@ def test_logical_to_kernel_block_ids_with_hma():
     assert kernel_block_ids == expected_kernel_block_ids, (
         f"Expected {expected_kernel_block_ids}, got {kernel_block_ids}"
     )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "local_dcp_size,remote_dcp_size,tp_rank,remote_rank,expected_local,"
+    "expected_remote",
+    [
+        (
+            1,
+            8,
+            0,
+            3,
+            [[3, 11], [90]],
+            [list(range(100, 102)), [91]],
+        ),
+        (
+            8,
+            1,
+            3,
+            0,
+            [list(range(2)), [90]],
+            [[103, 111], [91]],
+        ),
+    ],
+)
+def test_map_block_aligned_dcp_attention_ids(
+    local_dcp_size,
+    remote_dcp_size,
+    tp_rank,
+    remote_rank,
+    expected_local,
+    expected_remote,
+):
+    """DCP ranks select interleaved attention pages without slicing SSM state."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
+        NixlConnectorWorker,
+    )
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+
+    worker = object.__new__(NixlConnectorWorker)
+    worker.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=local_dcp_size
+        )
+    )
+    worker.tp_rank = tp_rank
+    worker._group_spec_types = (FullAttentionSpec, MambaSpec)
+    remote_info = SimpleNamespace(remote_dcp_size=remote_dcp_size)
+
+    local, remote = worker._map_dcp_attention_block_ids(
+        [list(range(16 if local_dcp_size == 1 else 2)), [90]],
+        [list(range(100, 102 if remote_dcp_size == 8 else 116)), [91]],
+        remote_rank,
+        remote_info,
+    )
+
+    assert local == expected_local
+    assert remote == expected_remote
 
 
 @pytest.mark.cpu_test
@@ -1539,6 +1598,7 @@ def test_register_kv_caches_hybrid_mla_dual_purpose_regions():
     kv_cache_config = _make_hybrid_mla_kv_cache_config()
     unified_page = kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
     vllm_config = create_vllm_config(block_size=12)
+    vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = False
     # kv_buffer_device defaults to the *real* platform's device type, which on
     # a CPU-only test host would make this a host-buffer worker: host xfer
     # buffers are per-layer, so the HMA shared tensors would not be
