@@ -655,6 +655,10 @@ class BlockPool:
         Returns:
             A list of new block.
         """
+        if num_blocks < 0:
+            raise ValueError(
+                f"Cannot allocate a negative number of blocks: {num_blocks}"
+            )
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 

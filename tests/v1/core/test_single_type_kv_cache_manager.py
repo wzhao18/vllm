@@ -89,6 +89,33 @@ def test_sliding_window_records_new_blocks_for_zeroing():
     assert manager.take_new_block_ids() == []
 
 
+def test_external_allocation_with_sufficient_request_blocks_is_noop():
+    block_size = 2
+    spec = SlidingWindowSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=4,
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=10, enable_caching=False, hash_block_size=block_size
+    )
+    manager = get_sliding_window_manager(spec, block_pool, enable_caching=False)
+    request_blocks = block_pool.get_new_blocks(2)
+    manager.req_to_blocks["request"].extend(request_blocks)
+    num_free_blocks = block_pool.get_num_free_blocks()
+
+    manager.allocate_external_computed_blocks(
+        "request",
+        num_local_computed_tokens=0,
+        num_external_computed_tokens=block_size,
+    )
+
+    assert manager.req_to_blocks["request"] == request_blocks
+    assert block_pool.get_num_free_blocks() == num_free_blocks
+
+
 def test_chunked_local_attention_records_new_blocks_for_zeroing():
     block_size = 2
     spec = ChunkedLocalAttentionSpec(

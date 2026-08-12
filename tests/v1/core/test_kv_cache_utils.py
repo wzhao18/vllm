@@ -430,6 +430,11 @@ def test_free_kv_cache_block_queue_popleft_n():
     assert blocks[2].next_free_block is queue.fake_free_list_tail
     assert queue.fake_free_list_tail.prev_free_block is blocks[2]
 
+    with pytest.raises(ValueError, match="negative number of blocks"):
+        queue.popleft_n(-1)
+    assert queue.num_free_blocks == 6
+    assert queue.fake_free_list_head.next_free_block is blocks[1]
+
     # Pop 0 block
     # fake_head->b1->b3->b5->b4->b0->b2->fake_tail
     assert len(queue.popleft_n(0)) == 0
