@@ -34,6 +34,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.fa_utils import flash_attn_supports_mla
+from vllm.v1.attention.backends.mla import flashinfer_mla as flashinfer_mla_module
 from vllm.v1.attention.backends.mla import flashmla as flashmla_module
 from vllm.v1.attention.backends.mla import tokenspeed_mla as tokenspeed_mla_module
 from vllm.v1.attention.backends.mla.prefill import (
@@ -840,15 +841,136 @@ def test_tokenspeed_mla_noncausal_capability():
     assert tokenspeed_mla_module.TokenspeedMLABackend.supports_non_causal()
 
 
+def test_flashinfer_mla_dcp_parallel_drafting_reorder_threshold(monkeypatch):
+    """DCP must retain the DSpark target query length during graph capture."""
+
+    def init_without_allocations(
+        self,
+        kv_cache_spec,
+        layer_names,
+        vllm_config,
+        device,
+        metadata_cls=None,
+        supports_dcp_with_varlen=False,
+    ):
+        self.vllm_config = vllm_config
+        supports_spec_decode = self.query_len_support != QueryLenSupport.SINGLE_ONLY
+        self._init_reorder_batch_threshold(
+            self.reorder_batch_threshold,
+            supports_spec_decode,
+            supports_dcp_with_varlen,
+        )
+
+    monkeypatch.setattr(
+        mla_attention_module.MLACommonMetadataBuilder,
+        "__init__",
+        init_without_allocations,
+    )
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=8),
+        speculative_config=SimpleNamespace(
+            num_speculative_tokens=4,
+            parallel_drafting=True,
+        ),
+    )
+
+    builder = flashinfer_mla_module.FlashInferMLAMetadataBuilder(
+        None, [], vllm_config, torch.device("cpu")
+    )
+
+    assert builder.reorder_batch_threshold == 9
+
+
+def test_flashinfer_mla_dcp_multi_token_decode_uses_per_query_bounds(monkeypatch):
+    decode_call = None
+
+    def fake_decode(**kwargs):
+        nonlocal decode_call
+        decode_call = kwargs
+        query = kwargs["query"]
+        output = torch.empty(*query.shape[:-1], 512, dtype=torch.bfloat16)
+        lse = torch.empty(query.shape[0], query.shape[-2], dtype=torch.float32)
+        return output, lse
+
+    monkeypatch.setattr(
+        flashinfer_mla_module,
+        "trtllm_batch_decode_with_kv_cache_mla",
+        fake_decode,
+    )
+    monkeypatch.setattr(
+        flashinfer_mla_module,
+        "_get_workspace_buffer",
+        lambda return_lse: torch.empty(1, dtype=torch.int8),
+    )
+
+    impl = object.__new__(flashinfer_mla_module.FlashInferMLAImpl)
+    impl.dcp_world_size = 2
+    impl.dcp_rank = 1
+    impl.cp_kv_cache_interleave_size = 2
+    impl.need_to_return_lse_for_decode = True
+    impl.kv_lora_rank = 512
+    impl.qk_nope_head_dim = 128
+    impl.qk_rope_head_dim = 64
+    impl.bmm1_scale = 1.0
+    impl.bmm2_scale = 1.0
+
+    block_table = torch.tensor([[1], [2]], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        num_decodes=2,
+        num_decode_tokens=6,
+        max_seq_len=7,
+        causal=True,
+        decode=SimpleNamespace(
+            block_table=block_table,
+            seq_lens=torch.tensor([5, 6], dtype=torch.int32),
+            dcp_tot_seq_lens=torch.tensor([10, 13], dtype=torch.int32),
+        ),
+    )
+    query = torch.empty(6, 2, 576, dtype=torch.bfloat16)
+    kv_cache = torch.empty(3, 16, 576, dtype=torch.bfloat16)
+
+    output, lse = impl.forward_mqa(
+        query,
+        kv_cache,
+        metadata,
+        SimpleNamespace(),
+    )
+
+    assert output.shape == (6, 2, 512)
+    assert lse is not None
+    assert lse.shape == (6, 2)
+    assert decode_call is not None
+    assert impl.supports_mtp_with_cp_non_trivial_interleave_size
+    assert decode_call["query"].shape == (6, 1, 2, 576)
+    torch.testing.assert_close(
+        decode_call["seq_lens"],
+        torch.tensor([4, 4, 4, 5, 6, 6], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        decode_call["block_tables"], block_table.repeat_interleave(3, dim=0)
+    )
+
+
 @pytest.mark.parametrize(
-    ("causal", "tokens_per_decode", "dcp_world_size", "dcp_rank"),
+    (
+        "causal",
+        "tokens_per_decode",
+        "dcp_world_size",
+        "dcp_rank",
+        "cp_kv_cache_interleave_size",
+    ),
     [
-        pytest.param(True, 1, 2, 1, id="causal-dcp"),
-        pytest.param(False, 3, 1, 0, id="noncausal-multi-token"),
+        pytest.param(True, 1, 2, 1, 1, id="causal-dcp"),
+        pytest.param(False, 3, 8, 3, 64, id="noncausal-dcp-interleave"),
     ],
 )
 def test_tokenspeed_mla_decode_contract(
-    monkeypatch, causal, tokens_per_decode, dcp_world_size, dcp_rank
+    monkeypatch,
+    causal,
+    tokens_per_decode,
+    dcp_world_size,
+    dcp_rank,
+    cp_kv_cache_interleave_size,
 ):
     decode_call = None
     num_decodes = 2
@@ -884,7 +1006,7 @@ def test_tokenspeed_mla_decode_contract(
     impl = object.__new__(tokenspeed_mla_module.TokenspeedMLAImpl)
     impl.dcp_world_size = dcp_world_size
     impl.dcp_rank = dcp_rank
-    impl.cp_kv_cache_interleave_size = 1
+    impl.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
     impl.need_to_return_lse_for_decode = True
     impl.kv_lora_rank = kv_lora_rank
     impl.qk_rope_head_dim = qk_rope_head_dim
@@ -925,6 +1047,7 @@ def test_tokenspeed_mla_decode_contract(
     assert lse.shape == (num_decode_tokens, num_heads)
 
     assert decode_call is not None
+    assert impl.supports_mtp_with_cp_non_trivial_interleave_size
     assert decode_call["query"].shape == (
         num_decodes,
         tokens_per_decode,

@@ -167,6 +167,7 @@ class TokenspeedMLABackend(MLACommonBackend):
 
 class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
     can_return_lse_for_decode: bool = True
+    supports_mtp_with_cp_non_trivial_interleave_size: bool = True
     # tokenspeed_mla_decode returns LSE in log2 units; its own DCP test merges
     # partial outputs with exp2(lse).
     lse_base_on_e: bool = False
@@ -292,8 +293,11 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
             and causal_seqs is not None
         ):
             offsets = torch.arange(
-                q_len_per_req - 1, -1, -1,
-                device=causal_seqs.device, dtype=causal_seqs.dtype,
+                q_len_per_req - 1,
+                -1,
+                -1,
+                device=causal_seqs.device,
+                dtype=causal_seqs.dtype,
             )
             per_q_global = torch.clamp(
                 (causal_seqs.unsqueeze(1) - offsets.unsqueeze(0)).reshape(-1), min=0
