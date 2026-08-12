@@ -643,6 +643,127 @@ def test_take_partial_tail_offloads_empty_without_partial_tail():
     assert manager.take_partial_tail_offloads() == {}
 
 
+@pytest.mark.parametrize("num_group_pairs", [1, 10])
+def test_repeated_partial_hit_cow_lifecycle_balances_refs(num_group_pairs: int):
+    """Repeated producer and replay CoWs must not duplicate free-list entries."""
+    hash_block_size = 2
+    block_size = 2 * hash_block_size
+    kv_cache_groups = []
+    for i in range(num_group_pairs):
+        kv_cache_groups.extend(
+            [
+                KVCacheGroupSpec(
+                    [f"full{i}"],
+                    FullAttentionSpec(
+                        block_size=hash_block_size,
+                        num_kv_heads=1,
+                        head_size=1,
+                        dtype=torch.float32,
+                    ),
+                ),
+                KVCacheGroupSpec(
+                    [f"mamba{i}"],
+                    MambaSpec(
+                        block_size=block_size,
+                        shapes=(1, 1),
+                        dtypes=(torch.float32,),
+                        mamba_cache_mode="align",
+                    ),
+                ),
+            ]
+        )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=512,
+        kv_cache_tensors=[],
+        kv_cache_groups=kv_cache_groups,
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+    initial_free_blocks = manager.block_pool.get_num_free_blocks()
+
+    for i in range(20):
+        request = make_request(str(i), [0, 0, 1, 1, 2, 2], hash_block_size, sha256)
+        computed, num_computed, _ = manager.get_computed_blocks(request)
+        assert manager.allocate_slots(request, 6, num_computed, computed) is not None
+
+        request.num_computed_tokens = 6
+        request.append_output_token_ids([3])
+        assert manager.allocate_slots(request, 1) is not None
+
+        manager.take_partial_tail_offloads()
+        _copies, retained = manager.take_kv_cache_block_copies()
+        if i % 2:
+            manager.free(request)
+            manager.block_pool.free_blocks(retained)
+        else:
+            manager.block_pool.free_blocks(retained)
+            manager.free(request)
+        manager.new_step_starts()
+        assert manager.block_pool.get_num_free_blocks() == initial_free_blocks
+
+
+def test_concurrent_partial_hits_balance_shared_source_refs():
+    """A completion burst must release each shared prefix-hit reference once."""
+    hash_block_size = 2
+    block_size = 2 * hash_block_size
+    kv_cache_config = KVCacheConfig(
+        num_blocks=512,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=hash_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+    initial_free_blocks = manager.block_pool.get_num_free_blocks()
+
+    owner = make_request("owner", [0, 0, 1, 1, 2, 2], hash_block_size, sha256)
+    computed, num_computed, _ = manager.get_computed_blocks(owner)
+    assert manager.allocate_slots(owner, 6, num_computed, computed) is not None
+    manager.free(owner)
+    manager.new_step_starts()
+
+    requests = []
+    for i in range(32):
+        request = make_request(str(i), [0, 0, 1, 1, 2, 2], hash_block_size, sha256)
+        computed, num_computed, _ = manager.get_computed_blocks(request)
+        assert manager.allocate_slots(request, 6, num_computed, computed) is not None
+        requests.append(request)
+
+    _copies, retained = manager.take_kv_cache_block_copies()
+    for request in requests:
+        manager.free(request)
+    manager.block_pool.free_blocks(retained)
+    manager.new_step_starts()
+
+    assert manager.block_pool.get_num_free_blocks() == initial_free_blocks
+
+
 def test_truncate_computed_blocks_preserves_sparse_prefix_positions():
     """truncate_computed_blocks slices each group by its own block size,
     keeps null placeholders in the retained prefix, and leaves the original
@@ -935,6 +1056,7 @@ def test_hybrid_full_attention_partial_hash_hit_uses_cow():
         enable_caching=True,
         hash_block_size=hash_block_size,
     )
+    initial_free_blocks = manager.block_pool.get_num_free_blocks()
 
     req0 = make_request("0", [0, 0, 1, 1, 2, 2], hash_block_size, sha256)
     computed_blocks, num_computed, _ = manager.get_computed_blocks(req0)
@@ -974,6 +1096,64 @@ def test_hybrid_full_attention_partial_hash_hit_uses_cow():
     assert partial_full_block[0].ref_cnt == 1
     manager.block_pool.free_blocks(retained)
     assert partial_full_block[0].ref_cnt == 0
+    manager.free(req1)
+    assert manager.block_pool.get_num_free_blocks() == initial_free_blocks
+
+
+def test_partial_hit_cow_uses_boundary_block_with_extra_lookup_block():
+    """EAGLE/DCP lookup bookkeeping may include a block past the resume
+    boundary; CoW must copy the block containing the boundary, not the tail of
+    the returned list.
+    """
+    hash_block_size = 2
+    block_size = 2 * hash_block_size
+    kv_cache_config = KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+
+    owner = make_request("owner", [0, 0, 1, 1, 2, 2], hash_block_size, sha256)
+    computed, num_computed, _ = manager.get_computed_blocks(owner)
+    assert manager.allocate_slots(owner, 6, num_computed, computed) is not None
+    manager.free(owner)
+    manager.new_step_starts()
+
+    replay = make_request("replay", [0, 0, 1, 1, 2, 2, 3, 3], hash_block_size, sha256)
+    computed, num_computed, _ = manager.get_computed_blocks(replay)
+    boundary_block = computed.blocks[0][1]
+    extra_block = manager.block_pool.get_new_blocks(1)[0]
+    computed.blocks[0].append(extra_block)
+
+    assert manager.allocate_slots(replay, 2, num_computed, computed) is not None
+    copies, _ = manager.take_kv_cache_block_copies()
+    assert any(copy.src_block_id == boundary_block.block_id for copy in copies)
+    assert all(copy.src_block_id != extra_block.block_id for copy in copies)
 
 
 def test_hybrid_partial_hit_cow_target_starts_uncached():
@@ -1166,6 +1346,7 @@ def test_cow_retained_blocks_returned_for_release():
         enable_caching=True,
         hash_block_size=hash_block_size,
     )
+    initial_free_blocks = manager.block_pool.get_num_free_blocks()
     req0 = make_request("0", [0, 0, 1, 1, 2, 2], hash_block_size, sha256)
     computed_blocks, num_computed, _ = manager.get_computed_blocks(req0)
     assert manager.allocate_slots(req0, 6, num_computed, computed_blocks) is not None
@@ -1182,6 +1363,8 @@ def test_cow_retained_blocks_returned_for_release():
     # Not freed yet: the retention refs are still held.
     assert all(b.ref_cnt > 0 for b in retained)
     manager.block_pool.free_blocks(retained)
+    manager.free(req0)
+    assert manager.block_pool.get_num_free_blocks() == initial_free_blocks
 
 
 def test_free_cow_retained_blocks_defers_until_copy_step_processed():
