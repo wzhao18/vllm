@@ -2003,6 +2003,46 @@ def test_prefix_cache_stats_disabled():
     assert manager.prefix_cache_stats is None
 
 
+def test_block_pool_usage_stays_bounded_for_inconsistent_free_count():
+    pool = BlockPool(num_gpu_blocks=4, enable_caching=True, hash_block_size=16)
+
+    pool.free_block_queue.num_free_blocks = 4
+    assert pool.get_usage() == 0.0
+
+    pool.free_block_queue.num_free_blocks = -1
+    assert pool.get_usage() == 1.0
+
+
+def test_block_pool_rejects_free_queue_sentinel():
+    pool = BlockPool(num_gpu_blocks=2, enable_caching=True, hash_block_size=16)
+    pool.get_new_blocks(1)
+
+    pool.free_block_queue.num_free_blocks = 1
+    with pytest.raises(AssertionError, match="sentinel or null block"):
+        pool.get_new_blocks(1)
+
+
+def test_block_pool_ignores_null_block_refcounting():
+    pool = BlockPool(num_gpu_blocks=4, enable_caching=True, hash_block_size=16)
+    initial_free_blocks = pool.get_num_free_blocks()
+
+    pool.touch((pool.null_block,))
+    pool.free_blocks((pool.null_block,))
+
+    assert pool.null_block.ref_cnt == 0
+    assert pool.get_num_free_blocks() == initial_free_blocks
+
+
+def test_block_pool_rejects_duplicate_free_queue_insertion():
+    pool = BlockPool(num_gpu_blocks=4, enable_caching=True, hash_block_size=16)
+    block = pool.get_new_blocks(1)[0]
+    pool.free_blocks((block,))
+
+    block.ref_cnt = 1
+    with pytest.raises(AssertionError, match="already in the free queue"):
+        pool.free_blocks((block,))
+
+
 def test_maybe_evict_cached_block():
     pool = BlockPool(num_gpu_blocks=4, enable_caching=True, hash_block_size=16)
     block_hash0 = make_block_hash_with_group_id(BlockHash(b"10"), 1000)

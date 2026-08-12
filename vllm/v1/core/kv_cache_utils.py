@@ -205,6 +205,11 @@ class FreeKVCacheBlockQueue:
     """
 
     def __init__(self, blocks: list[KVCacheBlock]) -> None:
+        block_ids = [block.block_id for block in blocks]
+        assert len(block_ids) == len(set(block_ids)), (
+            "Free block queue cannot contain duplicate block IDs"
+        )
+        self._free_block_ids = set(block_ids)
         self.num_free_blocks = len(blocks)
 
         # Initialize doubly links of consecutive blocks
@@ -268,7 +273,10 @@ class FreeKVCacheBlockQueue:
         # Remove the block from the linked list.
         first_block.prev_free_block = first_block.next_free_block = None
 
+        assert first_block.block_id in self._free_block_ids
+        self._free_block_ids.remove(first_block.block_id)
         self.num_free_blocks -= 1
+        assert self.num_free_blocks == len(self._free_block_ids)
         return first_block
 
     def popleft_n(self, n: int) -> list[KVCacheBlock]:
@@ -283,13 +291,18 @@ class FreeKVCacheBlockQueue:
         if n == 0:
             return []
         assert self.num_free_blocks >= n
-        self.num_free_blocks -= n
-
         curr_block = self.fake_free_list_head.next_free_block
         # Pop n blocks from the head of the list
         ret = []
         for _ in range(n):
-            assert curr_block is not None
+            assert (
+                curr_block is not None and curr_block is not self.fake_free_list_tail
+            ), "Free block queue returned a sentinel or null block"
+            assert curr_block.block_id in self._free_block_ids, (
+                f"Block {curr_block.block_id} is linked in the free queue but "
+                "missing from its membership set"
+            )
+            self._free_block_ids.remove(curr_block.block_id)
             ret.append(curr_block)
             last_block = curr_block
             curr_block = curr_block.next_free_block
@@ -302,6 +315,8 @@ class FreeKVCacheBlockQueue:
             # the new first block.
             self.fake_free_list_head.next_free_block = curr_block
             curr_block.prev_free_block = self.fake_free_list_head
+        self.num_free_blocks -= n
+        assert self.num_free_blocks == len(self._free_block_ids)
         return ret
 
     def remove(self, block: KVCacheBlock) -> None:
@@ -314,6 +329,10 @@ class FreeKVCacheBlockQueue:
             # This should not happen if the block is from the free list.
             # It indicates a bug in the caller's logic.
             raise RuntimeError(f"remove() called on an invalid block: {block}")
+        assert block.block_id in self._free_block_ids, (
+            f"Block {block.block_id} is linked in the free queue but missing "
+            "from its membership set"
+        )
 
         # Link the previous block to the next block.
         block.prev_free_block.next_free_block = block.next_free_block
@@ -322,7 +341,9 @@ class FreeKVCacheBlockQueue:
 
         # Remove the block from the linked list.
         block.prev_free_block = block.next_free_block = None
+        self._free_block_ids.remove(block.block_id)
         self.num_free_blocks -= 1
+        assert self.num_free_blocks == len(self._free_block_ids)
 
     def append(self, block: KVCacheBlock) -> None:
         """Put a block back into the free list and increase
@@ -331,6 +352,9 @@ class FreeKVCacheBlockQueue:
         Args:
             block: The block to append.
         """
+        assert block.block_id not in self._free_block_ids, (
+            f"Block {block.block_id} is already in the free queue"
+        )
         if self.fake_free_list_tail.prev_free_block is None:
             raise RuntimeError(
                 "prev_free_block of fake_free_list_tail should always exist"
@@ -345,12 +369,23 @@ class FreeKVCacheBlockQueue:
         block.next_free_block = self.fake_free_list_tail
         self.fake_free_list_tail.prev_free_block = block
 
+        self._free_block_ids.add(block.block_id)
         self.num_free_blocks += 1
+        assert self.num_free_blocks == len(self._free_block_ids)
 
     def prepend_n(self, blocks: list[KVCacheBlock]) -> None:
         """Put a list of blocks at the front of the free list."""
         if len(blocks) == 0:
             return
+
+        block_ids = [block.block_id for block in blocks]
+        assert len(block_ids) == len(set(block_ids)), (
+            f"Duplicate blocks passed to prepend_n: {block_ids}"
+        )
+        duplicate_ids = self._free_block_ids.intersection(block_ids)
+        assert not duplicate_ids, (
+            f"Blocks already in the free queue passed to prepend_n: {duplicate_ids}"
+        )
 
         first_block = self.fake_free_list_head.next_free_block
         assert first_block is not None, (
@@ -366,7 +401,9 @@ class FreeKVCacheBlockQueue:
         prev_block.next_free_block = first_block
         first_block.prev_free_block = prev_block
 
+        self._free_block_ids.update(block_ids)
         self.num_free_blocks += len(blocks)
+        assert self.num_free_blocks == len(self._free_block_ids)
 
     def append_n(self, blocks: list[KVCacheBlock]) -> None:
         """Put a list of blocks back into the free list
@@ -376,6 +413,15 @@ class FreeKVCacheBlockQueue:
         """
         if len(blocks) == 0:
             return
+
+        block_ids = [block.block_id for block in blocks]
+        assert len(block_ids) == len(set(block_ids)), (
+            f"Duplicate blocks passed to append_n: {block_ids}"
+        )
+        duplicate_ids = self._free_block_ids.intersection(block_ids)
+        assert not duplicate_ids, (
+            f"Blocks already in the free queue passed to append_n: {duplicate_ids}"
+        )
 
         last_block = self.fake_free_list_tail.prev_free_block
         assert last_block is not None, (
@@ -391,7 +437,9 @@ class FreeKVCacheBlockQueue:
         last_block.next_free_block = self.fake_free_list_tail
         self.fake_free_list_tail.prev_free_block = last_block
 
+        self._free_block_ids.update(block_ids)
         self.num_free_blocks += len(blocks)
+        assert self.num_free_blocks == len(self._free_block_ids)
 
     def get_all_free_blocks(self) -> list[KVCacheBlock]:
         """Get all free blocks in the free list. Mainly used for testing.
@@ -645,9 +693,7 @@ def resolve_kv_cache_block_sizes(
         bs = cache_config.block_size * dcp
         return bs, bs
 
-    group_block_sizes = [
-        effective_kv_block_size(g.kv_cache_spec, dcp) for g in groups
-    ]
+    group_block_sizes = [effective_kv_block_size(g.kv_cache_spec, dcp) for g in groups]
     scheduler_block_size = math.lcm(*group_block_sizes)
 
     # Block hashes are only consumed by prefix caching and KV connectors

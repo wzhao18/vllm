@@ -659,6 +659,9 @@ class BlockPool:
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
         ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        assert all(block.block_id >= 0 and not block.is_null for block in ret), (
+            "Free block queue returned a sentinel or null block"
+        )
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
@@ -708,9 +711,18 @@ class BlockPool:
             blocks: A list of blocks to touch.
         """
         for block in blocks:
+            if block.is_null:
+                continue
+            is_linked = (
+                block.prev_free_block is not None and block.next_free_block is not None
+            )
+            assert (block.ref_cnt == 0) == is_linked, (
+                f"Block {block.block_id} has ref_cnt={block.ref_cnt} but "
+                f"free_queue_linked={is_linked}"
+            )
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
-            if block.ref_cnt == 0 and not block.is_null:
+            if block.ref_cnt == 0:
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
             if self.metrics_collector:
@@ -728,8 +740,17 @@ class BlockPool:
         blocks_to_evict_last = []
         blocks_to_evict_first = []
         for block in ordered_blocks:
+            if block.is_null:
+                continue
+            assert block.ref_cnt > 0, (
+                f"Cannot free block {block.block_id} with ref_cnt={block.ref_cnt}"
+            )
+            assert block.prev_free_block is None and block.next_free_block is None, (
+                f"Block {block.block_id} with ref_cnt={block.ref_cnt} is already "
+                "in the free queue"
+            )
             block.ref_cnt -= 1
-            if block.ref_cnt == 0 and not block.is_null:
+            if block.ref_cnt == 0:
                 if block.block_hash is None or not self.enable_caching:
                     # LIFO reuse of non-cached blocks for better GPU locality.
                     blocks_to_evict_first.append(block)
@@ -816,7 +837,17 @@ class BlockPool:
         total_gpu_blocks = self.num_gpu_blocks - 1
         if not total_gpu_blocks:
             return 0
-        return 1.0 - (self.get_num_free_blocks() / total_gpu_blocks)
+        num_free_blocks = self.get_num_free_blocks()
+        usage = 1.0 - (num_free_blocks / total_gpu_blocks)
+        if not 0.0 <= usage <= 1.0:
+            logger.warning_once(
+                "KV cache usage is outside [0, 1]: usage=%f, free=%d, total=%d",
+                usage,
+                num_free_blocks,
+                total_gpu_blocks,
+            )
+            return min(max(usage, 0.0), 1.0)
+        return usage
 
     def take_events(self) -> list[KVCacheEvent]:
         """Atomically takes all events and clears the queue.
