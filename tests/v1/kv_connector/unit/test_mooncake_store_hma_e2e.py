@@ -14,6 +14,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import (
     worker as mooncake_store_worker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator import (  # noqa: E501
+    ExternalCachedBlockPool,
     MooncakeStoreCoordinator,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
@@ -441,6 +442,102 @@ def test_sub_block_partial_tail_offload_reads_cow_block():
     assert store.puts[fa_key] == [512]
     # Mamba reads the CoW block 7, not block_ids[1][0]=2.
     assert store.puts[mamba_key] == [10_000 + mamba_cow_block * 512]
+
+
+def test_dspark_pmu_boundary_requires_eagle_proof():
+    """Mooncake stores the dropped EAGLE unit that proves a replay snapshot."""
+    hash_block_size = 2
+    block_size = 8
+    full = FullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=8,
+        head_size=64,
+        dtype=None,
+    )
+    mamba = MambaSpec(
+        block_size=block_size,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+    groups = [
+        KVCacheGroupSpec(["L0"], full),
+        KVCacheGroupSpec(["L1"], mamba),
+    ]
+    coord = MooncakeStoreCoordinator(
+        groups,
+        scheduler_block_size=block_size,
+        hash_block_size=hash_block_size,
+        use_eagle=True,
+        retention_interval=0,
+    )
+    store = _DictStore()
+    token_dbs = []
+    for group_id in range(2):
+        db = ChunkedTokenDatabase(
+            KeyMetadata("m", 0, 0, 0, 0, group_id=group_id),
+            block_size=block_size,
+            hash_block_size=hash_block_size,
+        )
+        db.set_kv_caches_base_addr([group_id * 10_000])
+        db.set_block_len([512])
+        token_dbs.append(db)
+
+    send = KVCacheStoreSendingThread(
+        store=store,
+        coord=coord,
+        token_databases=token_dbs,
+        block_size=block_size,
+        tp_rank=0,
+        group_put_steps=[1, 1],
+        kv_role="kv_both",
+        ready_event=threading.Event(),
+        replicate_config=MagicMock(),
+    )
+    hashes = [BlockHash(bytes([i + 1]) * 4) for i in range(7)]
+    req = ReqMeta(
+        req_id="dspark",
+        token_len_chunk=0,
+        block_ids=([1, 2], [3, 4]),
+        block_hashes=hashes,
+        can_save=True,
+        num_prompt_tokens=14,
+        num_computed_tokens=12,
+        partial_tail_offloads=[(1, 7, 12)],
+    )
+    assert send._maybe_offload_partial_tail(req)
+
+    replay_hash = hashes[12 // hash_block_size - 1]
+    proof_hash = hashes[14 // hash_block_size - 1]
+    assert token_dbs[0].key_for(replay_hash) in store._data
+    assert token_dbs[0].key_for(proof_hash) not in store._data
+
+    req.num_computed_tokens = 14
+    assert send._maybe_offload_partial_tail(req)
+    assert token_dbs[0].key_for(proof_hash) in store._data
+    assert token_dbs[1].key_for(replay_hash) in store._data
+    assert token_dbs[1].key_for(proof_hash) not in store._data
+
+    exists = {
+        (group_id, bytes(hashes[boundary // hash_block_size - 1]))
+        for group_id in range(2)
+        for boundary in (8, 12)
+    }
+    exists.add((0, bytes(proof_hash)))
+    _, hit_length = coord.find_longest_cache_hit(
+        hashes,
+        max_length=15,
+        cached_block_pool=ExternalCachedBlockPool(hash_block_size, exists),
+    )
+    assert hit_length == 12
+
+    exists.remove((0, bytes(proof_hash)))
+    _, hit_length = coord.find_longest_cache_hit(
+        hashes,
+        max_length=15,
+        cached_block_pool=ExternalCachedBlockPool(hash_block_size, exists),
+    )
+    assert hit_length == 8
 
 
 def test_offload_syncs_event_before_put():

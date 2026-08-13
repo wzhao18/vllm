@@ -135,10 +135,14 @@ class SingleTypeKVCacheManager(ABC):
         if num_local_computed_tokens % self.block_size == 0:
             return False
         block_idx = num_local_computed_tokens // self.block_size
+        if block_idx >= len(new_computed_blocks):
+            return False
+        boundary_block = new_computed_blocks[block_idx]
+        cached_boundary = boundary_block.block_hash_num_tokens
         return (
-            block_idx < len(new_computed_blocks)
-            and new_computed_blocks[block_idx].block_hash_num_tokens
-            == num_local_computed_tokens
+            not boundary_block.is_null
+            and cached_boundary is not None
+            and cached_boundary >= num_local_computed_tokens
         )
 
     def get_num_blocks_to_allocate(

@@ -15,6 +15,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
+    MambaManager,
     SingleTypeKVCacheManager,
     get_manager_for_kv_cache_spec,
 )
@@ -672,6 +673,14 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     "cache managers require block-aligned lookups: %s.",
                     ", ".join(sorted(unsupported_partial_hit_managers)),
                 )
+
+        # A speculative attention group drops one fine-grained hash unit from
+        # its hit. Mamba has no draft layer, but its recurrent checkpoint must
+        # be cached at the same replay boundary.
+        if self.eagle_group_ids and self.enable_partial_hash_hits:
+            for manager in self.single_type_managers:
+                if isinstance(manager, MambaManager):
+                    manager.use_eagle = True
 
     @property
     def _cache_hit_alignment_tokens(self) -> int:

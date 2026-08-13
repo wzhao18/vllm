@@ -93,7 +93,11 @@ def _split(
 
 
 def _run_chunked_prefill(
-    manager: KVCacheManager, request: Request, budgets: list[int]
+    manager: KVCacheManager,
+    request: Request,
+    budgets: list[int],
+    *,
+    partial_hit: bool = False,
 ) -> dict[int, int]:
     """Prefill `request`, one step per entry in `budgets`.
 
@@ -112,13 +116,20 @@ def _run_chunked_prefill(
         if computed >= request.num_tokens:
             break
         budget = budgets[step] if step < len(budgets) else request.num_tokens
-        num_new = _split(request, min(request.num_tokens - computed, budget))
+        num_new = _split(
+            request,
+            min(request.num_tokens - computed, budget),
+            partial_hit=partial_hit,
+        )
         if num_new == 0:
             continue
         assert (
             manager.allocate_slots(request, num_new, num_lookahead_tokens=NUM_SPEC)
             is not None
         )
+        copies, _ = manager.take_kv_cache_block_copies()
+        for copy in copies:
+            state_at[copy.dst_block_id] = state_at[copy.src_block_id]
         request.num_computed_tokens = computed + num_new
         blocks = mamba_manager.req_to_blocks[request.request_id]
         running = cdiv(request.num_computed_tokens, MAMBA_BLOCK_SIZE) - 1
@@ -176,6 +187,29 @@ def test_fragmented_tail_chunk_does_not_poison_mamba_prefix_cache() -> None:
     after it crossed 3200, publishing slot 1 as state@3200.
     """
     assert _prefill(3602, budgets=[1600, 1000, 3602]) > 0
+
+
+def test_fine_grained_replay_checkpoint_matches_saved_mamba_state() -> None:
+    manager = _make_hybrid_kv_cache_manager()
+    (request,) = create_requests(1, num_tokens=3602, block_size=ATTN_BLOCK_SIZE)
+    state_at = _run_chunked_prefill(
+        manager,
+        request,
+        budgets=[request.num_tokens],
+        partial_hit=True,
+    )
+
+    replay_boundary = (
+        request.num_prompt_tokens // ATTN_BLOCK_SIZE * ATTN_BLOCK_SIZE
+        - ATTN_BLOCK_SIZE
+    )
+    replay_hash = request.block_hashes[replay_boundary // ATTN_BLOCK_SIZE - 1]
+    (replay_block,) = manager.block_pool.get_cached_block(
+        replay_hash, kv_cache_group_ids=[MAMBA_GROUP_ID]
+    )
+
+    assert replay_block.block_hash_num_tokens == replay_boundary
+    assert state_at[replay_block.block_id] == replay_boundary
 
 
 @pytest.mark.parametrize("first_chunk", [800, 900, 1599, 1601, 2000])
