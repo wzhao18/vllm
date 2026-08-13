@@ -115,11 +115,19 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
                     f"{cache_block_size} (mamba_cache_mode != 'align')"
                 )
         pcp = vllm_config.parallel_config.prefill_context_parallel_size
-        dcp = vllm_config.parallel_config.decode_context_parallel_size
-        if len(kv_cache_config.kv_cache_groups) > 1 and pcp * dcp > 1:
-            unsupported.append(
-                f"PCP/DCP > 1 (pcp={pcp}, dcp={dcp}) with hybrid attention"
-            )
+        if len(kv_cache_config.kv_cache_groups) > 1 and pcp > 1:
+            # DCP is supported on hybrid models: the worker rescales each group
+            # to its effective block size (attention sharded over the CP ranks
+            # and scaled, Mamba replicated and unscaled -- see
+            # ``effective_kv_block_size``), and the store keys already carry
+            # ``dcp_rank`` so every rank round-trips its own shard. The
+            # divisibility invariant the coordinator needs is enforced upstream
+            # by ``resolve_kv_cache_block_sizes``, which raises if a group's
+            # DCP-scaled block size is not a multiple of ``prefix_match_unit``.
+            #
+            # PCP remains unsupported: it expands the world size and shards the
+            # prefill differently, which this connector has never been run with.
+            unsupported.append(f"PCP > 1 (pcp={pcp}) with hybrid attention")
         if unsupported:
             raise ValueError(
                 "MooncakeStoreConnector does not support: " + "; ".join(unsupported)
