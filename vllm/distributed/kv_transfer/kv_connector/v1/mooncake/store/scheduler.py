@@ -388,6 +388,7 @@ class MooncakeStoreScheduler:
                         block_hashes=req_tuple[0].block_hashes,
                         can_save=True,
                         num_prompt_tokens=tracker.prefill_end_tokens,
+                        num_computed_tokens=tracker.token_len,
                         partial_tail_offloads=groups,
                     )
                 )

@@ -653,6 +653,41 @@ class KVCacheStoreSendingThread(KVTransferThread):
                         )
                     )
 
+            # Fine-grained EAGLE lookup proves a replay boundary by matching
+            # one additional hash unit and dropping it. The proof entry is
+            # never loaded, but it must exist so external lookup enforces the
+            # same condition as the local prefix cache.
+            proof_unit = getattr(self.coord, "eagle_proof_units", {}).get(g_idx)
+            proof_end = boundary + proof_unit if proof_unit is not None else 0
+            if (
+                proof_unit is not None
+                and proof_end // hash_block_size <= len(req_meta.block_hashes)
+                and (req_meta.num_computed_tokens or 0) >= proof_end
+            ):
+                proof_block_idx = cdiv(proof_end, db.block_size) - 1
+                if (
+                    proof_block_idx % put_step == put_step_rank
+                    and proof_block_idx < len(group_blocks)
+                ):
+                    proof_block_id = group_blocks[proof_block_idx]
+                    if proof_block_id != NULL_BLOCK_ID:
+                        proof_hash = req_meta.block_hashes[
+                            proof_end // hash_block_size - 1
+                        ]
+                        proof_key = db.key_for(proof_hash)
+                        if proof_key not in keys:
+                            addr, size = db.prepare_value_for_block(proof_block_id)
+                            keys.append(proof_key)
+                            addrs.append(addr)
+                            sizes.append(size)
+                            if group_ids is not None:
+                                group_ids.append(
+                                    _make_mooncake_group_id(
+                                        db.metadata,
+                                        proof_key.rsplit("@", 1)[-1],
+                                    )
+                                )
+
         if not keys:
             return True
         exists_start = time.perf_counter()

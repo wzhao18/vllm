@@ -1155,6 +1155,69 @@ def test_partial_hit_cow_uses_boundary_block_with_extra_lookup_block():
     assert all(copy.src_block_id != extra_block.block_id for copy in copies)
 
 
+def test_eagle_rewind_cows_lookahead_partial_block():
+    """A speculative hit resumes below the partial block's hash boundary."""
+    hash_block_size = 2
+    block_size = 8
+    kv_cache_config = KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        use_eagle=True,
+    )
+    pool = manager.block_pool
+    owner = make_request("owner", list(range(16)), hash_block_size, sha256)
+
+    full_blocks = pool.get_new_blocks(2)
+    pool.cache_full_blocks(owner, full_blocks, 0, 1, block_size, 0)
+    pool.cache_partial_block(owner, full_blocks[1], 14, 0, block_size)
+    mamba_blocks = pool.get_new_blocks(2)
+    pool.cache_full_blocks(owner, mamba_blocks, 0, 1, block_size, 1)
+    pool.cache_partial_block(owner, mamba_blocks[1], 12, 1, block_size)
+
+    replay = make_request(
+        "replay", list(range(14)) + [99, 100], hash_block_size, sha256
+    )
+    computed, num_computed, _ = manager.get_computed_blocks(replay)
+    assert num_computed == 12
+    assert computed.blocks[0][-1].block_hash_num_tokens == 14
+    assert computed.blocks[1][-1].block_hash_num_tokens == 12
+
+    full_source = computed.blocks[0][-1]
+    mamba_source = computed.blocks[1][-1]
+    assert manager.allocate_slots(replay, 2, num_computed, computed) is not None
+    copies, _ = manager.take_kv_cache_block_copies()
+
+    assert any(copy.src_block_id == full_source.block_id for copy in copies)
+    assert any(copy.src_block_id == mamba_source.block_id for copy in copies)
+    assert manager.get_blocks("replay").blocks[0][-1] is not full_source
+
+
 def test_hybrid_partial_hit_cow_target_starts_uncached():
     hash_block_size = 2
     block_size = 2 * hash_block_size
@@ -1570,6 +1633,28 @@ def test_mamba_align_split_stops_below_eagle_proof_boundary():
     assert split(self=mock, request=req, num_new_tokens=1537) == 24576 - 23040
 
 
+def test_mamba_align_split_materializes_dspark_replay_checkpoints():
+    """DSpark keeps the coarse and replay boundaries ordered."""
+    block_size = 8
+    hash_block_size = 2
+    mock = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=block_size),
+        max_num_scheduled_tokens=16,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+        use_eagle=True,
+        hash_block_size=hash_block_size,
+        mamba_partial_cache_hit=True,
+    )
+    split = Scheduler._mamba_block_aligned_split
+    req = make_request("0", list(range(15)), hash_block_size, sha256)
+
+    assert split(self=mock, request=req, num_new_tokens=15) == 8
+    req.num_computed_tokens = 8
+    assert split(self=mock, request=req, num_new_tokens=7) == 4
+    req.num_computed_tokens = 12
+    assert split(self=mock, request=req, num_new_tokens=3) == 3
+
+
 def test_mamba_partial_tail_hits_below_eagle_proof_boundary():
     """Regression: a prompt whose last hash boundary coincides with its last
     mamba block boundary registered its only fine-grained checkpoint at a
@@ -1634,6 +1719,68 @@ def test_mamba_partial_tail_hits_below_eagle_proof_boundary():
     req1 = make_request("1", [7] * 9 + [9] * 4, hash_block_size, sha256)
     _, num_computed, _ = manager.get_computed_blocks(req1)
     assert num_computed == 6
+
+
+def test_dcp_hybrid_dspark_reuses_fine_grained_mamba_checkpoint():
+    """DCP scales attention blocks but keeps replicated Mamba blocks intact."""
+    hash_block_size = 2
+    dcp_world_size = 4
+    scheduler_block_size = 8
+    kv_cache_config = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=hash_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+                is_eagle_group=True,
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=scheduler_block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        scheduler_block_size=scheduler_block_size,
+        dcp_world_size=dcp_world_size,
+        use_eagle=True,
+    )
+
+    owner = make_request("owner", list(range(15)), hash_block_size, sha256)
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(owner)
+    assert num_computed == 0
+    assert manager.allocate_slots(owner, 8, num_computed, computed_blocks) is not None
+    owner.num_computed_tokens = 8
+    manager.new_step_starts()
+    assert manager.allocate_slots(owner, 4) is not None
+    owner.num_computed_tokens = 12
+    manager.new_step_starts()
+    assert manager.allocate_slots(owner, 3) is not None
+    owner.num_computed_tokens = 15
+    manager.free(owner)
+    manager.new_step_starts()
+
+    replay = make_request(
+        "replay", list(range(15)) + [99, 100], hash_block_size, sha256
+    )
+    blocks, num_computed, _ = manager.get_computed_blocks(replay)
+    assert num_computed == 12
+    assert [len(group) for group in blocks.blocks] == [2, 2]
 
 
 def test_mamba_coarse_checkpoint_retained_below_eagle_proof_boundary(monkeypatch):

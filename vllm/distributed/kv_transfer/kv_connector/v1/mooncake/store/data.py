@@ -366,6 +366,7 @@ class ReqMeta:
 
     token_ids: list[int] | None = None
     num_prompt_tokens: int | None = None
+    num_computed_tokens: int | None = None
     # Core-provided per-mamba-group
     # (group_id, cow_block_id, boundary_tokens) for this request's partial tail.
     # Present only on the producer's CoW step; drives the connector's offload
@@ -431,6 +432,7 @@ class ReqMeta:
             is_last_chunk=is_last_chunk,
             token_ids=token_ids,
             num_prompt_tokens=tracker.prefill_end_tokens,
+            num_computed_tokens=tracker.token_len,
         )
 
 

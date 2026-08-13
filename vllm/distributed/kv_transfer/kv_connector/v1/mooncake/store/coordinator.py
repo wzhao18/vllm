@@ -146,6 +146,18 @@ class MooncakeStoreCoordinator:
         self.eagle_group_ids = {
             gid for g in attention_groups if g.use_eagle for gid in g.group_ids
         }
+        self.eagle_proof_units = {
+            gid: (
+                self.hash_block_size
+                if self.enable_partial_hash_hits
+                and g.manager_cls.supports_fine_grained_hash_lookup
+                and g.spec.block_size > self.hash_block_size
+                else g.spec.block_size
+            )
+            for g in attention_groups
+            if g.use_eagle and not isinstance(g.spec, MambaSpec)
+            for gid in g.group_ids
+        }
 
     def find_longest_cache_hit(
         self,
