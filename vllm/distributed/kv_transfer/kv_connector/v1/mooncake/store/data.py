@@ -300,6 +300,14 @@ class ChunkedTokenDatabase:
 
 
 @dataclass
+class MooncakeLookupResult:
+    """External hit length and non-default hashes selected for loading."""
+
+    hit_length: int
+    load_hash_overrides: tuple[tuple[int, int, BlockHash], ...] = ()
+
+
+@dataclass
 class LoadSpec:
     """Specification for loading KV cache from external store."""
 
@@ -307,6 +315,7 @@ class LoadSpec:
     kvpool_cached_tokens: int
     can_load: bool
     token_len: int = 0
+    load_hash_overrides: tuple[tuple[int, int, BlockHash], ...] = ()
 
 
 @dataclass

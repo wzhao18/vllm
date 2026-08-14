@@ -5,6 +5,8 @@ import threading
 import time
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from vllm.config import set_current_vllm_config
 from vllm.distributed.kv_events import BlockStored
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -19,11 +21,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import (
     worker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+    MooncakeLookupResult,
     MooncakeStoreConnectorMetadata,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.metrics import (
     MooncakeStoreConnectorStats,
 )
+from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -32,7 +36,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import KVConnectorOutput
 
-from .utils import create_vllm_config
+from .utils import create_vllm_config, make_kv_cache_config
 
 
 def _make_vllm_config():
@@ -51,6 +55,38 @@ def _make_kv_cache_config() -> KVCacheConfig:
         kv_cache_tensors=[KVCacheTensor(size=8192, shared_by=["layer0"])],
         kv_cache_groups=[KVCacheGroupSpec(["layer0"], spec)],
     )
+
+
+def _make_hybrid_kv_cache_config() -> KVCacheConfig:
+    return make_kv_cache_config(
+        block_size=16,
+        mamba_enabled=True,
+        mamba_cache_mode="align",
+        num_blocks=4,
+    )
+
+
+def test_hybrid_dcp_is_supported():
+    vllm_config = _make_vllm_config()
+    kv_cache_config = _make_hybrid_kv_cache_config()
+    vllm_config.parallel_config.decode_context_parallel_size = 4
+
+    mooncake_store_connector.MooncakeStoreConnector._validate_kv_cache_config(
+        vllm_config, kv_cache_config
+    )
+    with patch.object(scheduler, "LookupKeyClient"):
+        store_scheduler = scheduler.MooncakeStoreScheduler(vllm_config, kv_cache_config)
+    assert store_scheduler.enable_partial_hash_hits is True
+
+
+def test_hybrid_pcp_is_rejected():
+    vllm_config = _make_vllm_config()
+    kv_cache_config = _make_hybrid_kv_cache_config()
+    vllm_config.parallel_config.prefill_context_parallel_size = 2
+    with pytest.raises(ValueError, match="PCP > 1"):
+        mooncake_store_connector.MooncakeStoreConnector._validate_kv_cache_config(
+            vllm_config, kv_cache_config
+        )
 
 
 def _make_block_stored() -> BlockStored:
@@ -406,11 +442,13 @@ def test_lookup_key_client_lookup_prepends_typed_tag():
         client = worker.LookupKeyClient(vllm_config)
 
     fake_socket = mock_make_socket.return_value
-    fake_socket.recv.return_value = (5).to_bytes(4, "big")
+    fake_socket.recv_multipart.return_value = [(5).to_bytes(4, "big"), b""]
 
     # Blocking lookup (non_block defaults to False) runs on the executor and
     # returns the resolved hit length.
-    assert client.lookup("req0", num_tokens=128, block_hashes=[]) == 5
+    result = client.lookup("req0", num_tokens=128, block_hashes=[])
+    assert result is not None
+    assert result.hit_length == 5
 
     sent_frames = fake_socket.send_multipart.call_args[0][0]
     assert sent_frames[0] == protocol.LOOKUP_MSG
@@ -445,7 +483,7 @@ def _poll_lookup(client, req_id, num_tokens=128, block_hashes=(), timeout=5.0):
     while time.monotonic() < deadline:
         result = client.lookup(req_id, num_tokens, list(block_hashes), non_block=True)
         if result is not None:
-            return result
+            return result.hit_length
         time.sleep(0.005)
     return None
 
@@ -456,7 +494,7 @@ def _gated_recv(gate: threading.Event, value: int):
 
     def recv():
         gate.wait()
-        return value.to_bytes(4, "big")
+        return [value.to_bytes(4, "big"), b""]
 
     return recv
 
@@ -475,7 +513,7 @@ def test_lookup_key_client_non_block_lookup_async():
     fake_socket = mock_make_socket.return_value
     # Hold the executor's lookup pending until we release the gate.
     gate = threading.Event()
-    fake_socket.recv.side_effect = _gated_recv(gate, 7)
+    fake_socket.recv_multipart.side_effect = _gated_recv(gate, 7)
 
     # First query submits the lookup and returns None while it is in flight.
     assert client.lookup("req1", 128, [], non_block=True) is None
@@ -498,7 +536,7 @@ def test_lookup_key_client_discard_clears_state():
 
     fake_socket = mock_make_socket.return_value
     gate = threading.Event()
-    fake_socket.recv.side_effect = _gated_recv(gate, 9)
+    fake_socket.recv_multipart.side_effect = _gated_recv(gate, 9)
 
     # Submit while gated so the call returns None and the Future stays in
     # `futures` (unconsumed) once it resolves.
@@ -553,11 +591,13 @@ def test_get_num_new_matched_tokens_async_defers_then_reports():
 
     # Lookup ready with a hit -> report need_to_allocate + async-load flag.
     hit = 3 * block_size
-    mock_client.lookup.return_value = hit
+    override = (0, 2, BlockHash(b"proof"))
+    mock_client.lookup.return_value = MooncakeLookupResult(hit, (override,))
     need, load_async = sched.get_num_new_matched_tokens(request, 0)
     assert need == hit
     assert load_async == sched.load_async
     assert sched.load_specs["r1"].kvpool_cached_tokens == hit
+    assert sched.load_specs["r1"].load_hash_overrides == (override,)
 
 
 def test_protocol_tags_are_distinct_and_non_empty():
@@ -568,6 +608,19 @@ def test_protocol_tags_are_distinct_and_non_empty():
         assert isinstance(tag, bytes)
         assert len(tag) > 0
     assert protocol.RESP_OK != protocol.RESP_ERR
+
+
+def test_lookup_response_round_trips_hash_overrides():
+    result = MooncakeLookupResult(
+        hit_length=20,
+        load_hash_overrides=((3, 7, BlockHash(b"hash")),),
+    )
+
+    decoded = protocol.decode_lookup_response(
+        protocol.encode_lookup_response(result), hash_len=4
+    )
+
+    assert decoded == result
 
 
 def test_scheduler_reset_connector_cache_invokes_connector_reset():

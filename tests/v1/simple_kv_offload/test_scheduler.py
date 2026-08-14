@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -39,6 +40,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
+    MambaSpec,
 )
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
@@ -1652,6 +1654,39 @@ def test_cp_block_size_scaling(dcp_world_size: int, pcp_world_size: int) -> None
 
     assert sched.cp_world_size == dcp_world_size
     assert sched.block_size == BLOCK_SIZE * dcp_world_size
+
+
+def test_hybrid_dcp_group_block_sizes() -> None:
+    sched = object.__new__(SimpleCPUOffloadScheduler)
+    sched.cp_world_size = 2
+    attention = _make_kv_cache_config(num_blocks=1).kv_cache_groups[0].kv_cache_spec
+    mamba = MambaSpec(
+        block_size=BLOCK_SIZE,
+        shapes=((1,),),
+        dtypes=(DTYPE,),
+        mamba_cache_mode="align",
+    )
+
+    assert sched._group_block_size(attention) == 2 * BLOCK_SIZE
+    assert sched._group_block_size(mamba) == BLOCK_SIZE
+
+
+def test_dcp_external_hit_is_scheduler_block_aligned() -> None:
+    sched = _make_cp_scheduler(dcp_world_size=2).scheduler
+    request = _make_cp_request(num_blocks=4, virtual_block_size=2 * BLOCK_SIZE)
+
+    with patch.object(
+        sched.cpu_coordinator,
+        "find_longest_cache_hit",
+        return_value=(([], []), 3 * BLOCK_SIZE, 0),
+    ):
+        hit_length, is_async = sched.get_num_new_matched_tokens(
+            request, num_computed_tokens=0
+        )
+
+    assert hit_length == 2 * BLOCK_SIZE
+    assert is_async is True
+    assert sched._pending_cpu_hits[request.request_id][1] == 2 * BLOCK_SIZE
 
 
 # ---------------------------------------------------------------------------

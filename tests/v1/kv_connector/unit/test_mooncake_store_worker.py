@@ -36,6 +36,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.metrics import 
 )
 from vllm.v1.core.kv_cache_utils import BlockHash
 
+from .utils import make_kv_cache_config
+
 
 class _RecordingBlockHashes:
     def __init__(self, values: list[bytes]):
@@ -141,6 +143,7 @@ def _make_load_req(
     *,
     token_len: int,
     vllm_cached_tokens: int = 0,
+    load_hash_overrides: tuple[tuple[int, int, BlockHash], ...] = (),
 ) -> ReqMeta:
     return ReqMeta(
         req_id=req_id,
@@ -152,6 +155,7 @@ def _make_load_req(
             kvpool_cached_tokens=token_len,
             can_load=True,
             token_len=token_len,
+            load_hash_overrides=load_hash_overrides,
         ),
     )
 
@@ -249,6 +253,15 @@ def _make_kv_cache_config(*, block_size: int = 16) -> object:
         num_blocks=10,
         kv_cache_tensors=[],
         kv_cache_groups=[KVCacheGroupSpec(["layer0"], spec)],
+    )
+
+
+def _make_hybrid_kv_cache_config(*, block_size: int = 16) -> object:
+    return make_kv_cache_config(
+        block_size=block_size,
+        mamba_enabled=True,
+        mamba_cache_mode="align",
+        num_blocks=10,
     )
 
 
@@ -1333,6 +1346,27 @@ def test_recv_thread_uses_single_batch_when_no_disk_offload_budget(monkeypatch):
     store.batch_get_replica_desc.assert_not_called()
 
 
+def test_recv_thread_uses_lookup_selected_hash_override():
+    store = MagicMock()
+    store.batch_get_into_multi_buffers.return_value = [256, 256]
+    thread = _make_store_recving_thread(store)
+
+    req = _make_load_req(
+        "req-a",
+        [b"a0", b"a1"],
+        token_len=32,
+        load_hash_overrides=((0, 1, BlockHash(b"proof")),),
+    )
+
+    thread._handle_request(req)
+
+    keys = store.batch_get_into_multi_buffers.call_args.args[0]
+    assert keys == [
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6130",
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@70726f6f66",
+    ]
+
+
 def test_recv_thread_logs_tier_summary_when_enabled(monkeypatch, caplog_vllm):
     monkeypatch.setenv("VLLM_MOONCAKE_STORE_TIER_LOG", "1")
     caplog_vllm.set_level(logging.INFO, logger=worker.logger.name)
@@ -1575,6 +1609,40 @@ def test_requester_worker_init_uses_positional_setup(tmp_path, monkeypatch):
         "mlx5_0",
         "10.0.0.7:50051",
     )
+
+
+def test_worker_scales_only_attention_groups_under_hybrid_dcp(tmp_path, monkeypatch):
+    store = MagicMock()
+    store.setup.return_value = 0
+    _install_fake_mooncake(monkeypatch, store)
+    _patch_worker_runtime(monkeypatch, dcp_size=4)
+    monkeypatch.setenv(
+        "MOONCAKE_CONFIG_PATH",
+        _write_mooncake_config(
+            tmp_path,
+            {
+                "metadata_server": "http://metadata/endpoint",
+                "protocol": "tcp",
+                "device_name": "",
+                "master_server_address": "10.0.0.7:50051",
+            },
+        ),
+    )
+
+    vllm_config = _make_vllm_config(decode_context_parallel_size=4)
+    vllm_config.cache_config.enable_prefix_caching = True
+    vllm_config.cache_config.prefix_match_unit = None
+    store_worker = worker.MooncakeStoreWorker(
+        vllm_config, _make_hybrid_kv_cache_config()
+    )
+
+    assert store_worker.block_size == 64
+    assert store_worker.hash_block_size == 16
+    assert [
+        group.kv_cache_spec.block_size for group in store_worker._kv_cache_groups
+    ] == [64, 16]
+    assert [database.block_size for database in store_worker.token_dbs] == [64, 16]
+    assert store_worker.coord.enable_partial_hash_hits is True
 
 
 def test_requester_worker_init_prefers_local_hostname_override(
@@ -2551,6 +2619,67 @@ def test_lookup_full_hit_with_eagle_pops_once_not_twice():
     # and return 32.
     assert worker.lookup(64, [b"h0", b"h1", b"h2", b"h3"]) == 48
     assert worker.store.batch_is_exist.call_count == 1
+
+
+def test_lookup_plan_preserves_fine_grained_eagle_proof_hash():
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheGroupSpec,
+        MambaSpec,
+    )
+
+    worker = _make_bare_worker(block_size=16)
+    full = FullAttentionSpec(block_size=16, num_kv_heads=8, head_size=64, dtype=None)
+    mamba = MambaSpec(
+        block_size=16,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+    worker._kv_cache_groups = [
+        KVCacheGroupSpec(["full"], full),
+        KVCacheGroupSpec(["mamba"], mamba),
+    ]
+    worker.hash_block_size = 4
+    worker.token_dbs = [
+        ChunkedTokenDatabase(
+            KeyMetadata("test-model", 0, 0, 0, 0, group_id=group_id),
+            block_size=16,
+            hash_block_size=4,
+        )
+        for group_id in range(2)
+    ]
+    worker.coord = mooncake_store_worker.MooncakeStoreCoordinator(
+        worker._kv_cache_groups,
+        scheduler_block_size=16,
+        hash_block_size=4,
+        use_eagle=True,
+    )
+    _refresh_group_tp_replication_factors(worker)
+    hashes = [BlockHash(f"h{i}".encode()) for i in range(6)]
+    present = {
+        (0, bytes(hashes[3])),
+        (0, bytes(hashes[5])),
+        (1, bytes(hashes[4])),
+    }
+
+    def exists(keys):
+        return [
+            int(
+                any(
+                    f"@group:{group_id}@{block_hash.hex()}" in key
+                    for group_id, block_hash in present
+                )
+            )
+            for key in keys
+        ]
+
+    worker.store.batch_is_exist.side_effect = exists
+
+    result = worker.lookup_with_load_plan(25, hashes)
+
+    assert result.hit_length == 20
+    assert result.load_hash_overrides == ((0, 1, hashes[5]),)
 
 
 def test_lookup_full_hit_swa_degrades_when_no_stored_boundary_is_usable():

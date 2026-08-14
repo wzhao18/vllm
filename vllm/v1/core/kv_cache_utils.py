@@ -604,6 +604,13 @@ def hash_block_tokens(
     )
 
 
+def effective_kv_block_size(spec: KVCacheSpec, cp_world_size: int) -> int:
+    """Return the token span of a cache block under context parallelism."""
+    if isinstance(spec, AttentionSpec):
+        return spec.block_size * cp_world_size
+    return spec.block_size
+
+
 def resolve_kv_cache_block_sizes(
     kv_cache_config: KVCacheConfig,
     vllm_config: VllmConfig,
@@ -630,12 +637,7 @@ def resolve_kv_cache_block_sizes(
         bs = cache_config.block_size * dcp
         return bs, bs
 
-    group_block_sizes = [
-        g.kv_cache_spec.block_size * dcp
-        if isinstance(g.kv_cache_spec, AttentionSpec)
-        else g.kv_cache_spec.block_size
-        for g in groups
-    ]
+    group_block_sizes = [effective_kv_block_size(g.kv_cache_spec, dcp) for g in groups]
     scheduler_block_size = math.lcm(*group_block_sizes)
 
     # Block hashes are only consumed by prefix caching and KV connectors

@@ -45,6 +45,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  
     BlobBlockHashes,
     ChunkedTokenDatabase,
     KeyMetadata,
+    MooncakeLookupResult,
     MooncakeStoreConnectorMetadata,
     PoolKey,
     ReqMeta,
@@ -54,6 +55,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.protocol import
     RESET_MSG,
     RESP_ERR,
     RESP_OK,
+    decode_lookup_response,
+    encode_lookup_response,
 )
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
@@ -61,6 +64,8 @@ from vllm.utils.network_utils import get_ip, make_zmq_socket
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
+    effective_kv_block_size,
+    get_block_hash,
     maybe_convert_block_hash,
     resolve_kv_cache_block_sizes,
 )
@@ -1048,6 +1053,12 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         # Skip chunks the consumer's per-group spec wouldn't populate
         # locally (e.g. SWA pre-window) even if the producer stored them.
         load_mask_per_group = self.coord.load_mask(req_meta.block_hashes, token_len)
+        load_hash_overrides = {
+            (group_id, chunk_id): block_hash
+            for group_id, chunk_id, block_hash in (
+                req_meta.load_spec.load_hash_overrides  # type: ignore[union-attr]
+            )
+        }
 
         addr_list: list[list[int]] = []
         size_list: list[list[int]] = []
@@ -1062,6 +1073,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 chunk_idx = start // db.block_size
                 if chunk_idx >= len(mask) or not mask[chunk_idx]:
                     continue
+                block_hash = load_hash_overrides.get((g_idx, chunk_idx), block_hash)
                 key_list.append(db.key_for(block_hash))
                 chunks.append((start, end))
             g_addrs, g_sizes, g_block_ids = db.prepare_values(
@@ -1364,20 +1376,19 @@ class MooncakeStoreWorker:
             )
             return
 
-        # Single-group + PCP/DCP > 1: scale the lone group's spec.block_size to
-        # self.block_size (= scheduler_block_size) so the coordinator's
-        # ``block_size % hash_block_size == 0`` invariant holds.
-        groups = list(kv_cache_config.kv_cache_groups)
-        if len(groups) == 1 and groups[0].kv_cache_spec.block_size != self.block_size:
-            g = groups[0]
-            groups = [
-                dataclasses.replace(
-                    g,
+        # Attention blocks are CP-sharded; Mamba state is replicated.
+        cp_world_size = self.dcp_size * self.pcp_size
+        groups = []
+        for group in kv_cache_config.kv_cache_groups:
+            block_size = effective_kv_block_size(group.kv_cache_spec, cp_world_size)
+            if block_size != group.kv_cache_spec.block_size:
+                group = dataclasses.replace(
+                    group,
                     kv_cache_spec=dataclasses.replace(
-                        g.kv_cache_spec, block_size=self.block_size
+                        group.kv_cache_spec, block_size=block_size
                     ),
                 )
-            ]
+            groups.append(group)
         self._kv_cache_groups: list[KVCacheGroupSpec] = groups
         spec_cfg = getattr(vllm_config, "speculative_config", None)
         use_eagle = bool(
@@ -1391,6 +1402,7 @@ class MooncakeStoreWorker:
             hash_block_size=self.hash_block_size,
             use_eagle=use_eagle,
             retention_interval=envs.VLLM_PREFIX_CACHE_RETENTION_INTERVAL,
+            dcp_world_size=self.dcp_size,
         )
         # One ChunkedTokenDatabase per group; addresses populated in
         # register_kv_caches once the kv-cache layout is known. Each group's
@@ -1757,7 +1769,9 @@ class MooncakeStoreWorker:
 
         return finished_sending
 
-    def lookup(self, num_tokens: int, block_hashes: Sequence[BlockHash]) -> int:
+    def lookup_with_load_plan(
+        self, num_tokens: int, block_hashes: Sequence[BlockHash]
+    ) -> MooncakeLookupResult:
         """Check how many prefix tokens exist in the store.
 
         Checks across all rank-specific key namespaces that may be loaded. A
@@ -1765,11 +1779,11 @@ class MooncakeStoreWorker:
         the last token is recomputed for sampling.
         """
         if self._capacity_only:
-            return 0
+            return MooncakeLookupResult(0)
 
         token_len = self.coord.align_lookup_length(num_tokens)
         if not block_hashes or token_len <= 0:
-            return 0
+            return MooncakeLookupResult(0)
 
         # Build per-(group, hash) candidate keys expanded across rank namespaces.
         # candidate_meta stores the (group, hash_bytes) for key slice.
@@ -1810,7 +1824,7 @@ class MooncakeStoreWorker:
                 candidate_meta.append((g_idx, bytes(h)))
 
         if not candidate_keys:
-            return 0
+            return MooncakeLookupResult(0)
 
         lookup_start = time.perf_counter()
         try:
@@ -1829,7 +1843,7 @@ class MooncakeStoreWorker:
                 num_failed_keys=len(candidate_keys),
             )
             logger.error("Remote connection failed in lookup: %s", e)
-            return 0
+            return MooncakeLookupResult(0)
 
         # A (group, hash) is "present" only when every namespace that will be
         # loaded has it (per-group count: sharded groups need every rank's
@@ -1846,7 +1860,7 @@ class MooncakeStoreWorker:
             self.hash_block_size,
             exists_set,
         )
-        _masks, hit_length = self.coord.find_longest_cache_hit(
+        hit_blocks, hit_length = self.coord.find_longest_cache_hit_blocks(
             block_hashes,
             token_len,
             cached_block_pool,
@@ -1854,13 +1868,30 @@ class MooncakeStoreWorker:
         if hit_length >= num_tokens:
             usable_length = self.coord.align_lookup_length(num_tokens - 1)
             if usable_length <= 0:
-                return 0
-            _masks, hit_length = self.coord.find_longest_cache_hit(
+                return MooncakeLookupResult(0)
+            hit_blocks, hit_length = self.coord.find_longest_cache_hit_blocks(
                 block_hashes,
                 usable_length,
                 cached_block_pool,
             )
-        return hit_length
+        overrides = []
+        for group_id, (db, blocks) in enumerate(
+            zip(self.token_dbs, hit_blocks, strict=True)
+        ):
+            for chunk_id, block in enumerate(blocks):
+                if block.is_null or block.block_hash is None:
+                    continue
+                end = min((chunk_id + 1) * db.block_size, hit_length)
+                if end <= 0:
+                    continue
+                default_hash = block_hashes[end // self.hash_block_size - 1]
+                selected_hash = get_block_hash(block.block_hash)
+                if selected_hash != default_hash:
+                    overrides.append((group_id, chunk_id, selected_hash))
+        return MooncakeLookupResult(hit_length, tuple(overrides))
+
+    def lookup(self, num_tokens: int, block_hashes: Sequence[BlockHash]) -> int:
+        return self.lookup_with_load_plan(num_tokens, block_hashes).hit_length
 
     def get_kv_events(self) -> list[BlockStored]:
         if self.enable_kv_events and self.kv_send_thread is not None:
@@ -1929,8 +1960,10 @@ class LookupKeyServer:
                     hash_len = int.from_bytes(all_frames[2], byteorder="big")
                     blob = all_frames[3].buffer
                     block_hashes = BlobBlockHashes(blob, hash_len)
-                    result = self.store_worker.lookup(num_tokens, block_hashes)
-                    self.socket.send(result.to_bytes(4, "big"))
+                    result = self.store_worker.lookup_with_load_plan(
+                        num_tokens, block_hashes
+                    )
+                    self.socket.send_multipart(encode_lookup_response(result))
 
                 elif msg_type == RESET_MSG:
                     try:
@@ -1990,9 +2023,11 @@ class LookupKeyClient:
         self.executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="MooncakeLookupClient"
         )
-        self.futures: dict[str, Future[int]] = {}
+        self.futures: dict[str, Future[MooncakeLookupResult]] = {}
 
-    def _lookup(self, num_tokens: int, block_hashes: list[BlockHash]) -> int:
+    def _lookup(
+        self, num_tokens: int, block_hashes: list[BlockHash]
+    ) -> MooncakeLookupResult:
         hash_len = len(block_hashes[0]) if block_hashes else 0
         all_frames = (
             LOOKUP_MSG,
@@ -2001,8 +2036,8 @@ class LookupKeyClient:
             b"".join(block_hashes),
         )
         self.socket.send_multipart(all_frames, copy=False)
-        resp = self.socket.recv()
-        return int.from_bytes(resp, "big")
+        resp = self.socket.recv_multipart()
+        return decode_lookup_response(resp, hash_len)
 
     def lookup(
         self,
@@ -2010,7 +2045,7 @@ class LookupKeyClient:
         num_tokens: int,
         block_hashes: list[BlockHash],
         non_block: bool = False,
-    ) -> int | None:
+    ) -> MooncakeLookupResult | None:
         """If non_block is True, will return None until the result is ready,
         so the caller retries on a later step."""
         future = self.futures.get(req_id)
@@ -2023,7 +2058,7 @@ class LookupKeyClient:
             return future.result()
         except Exception as e:
             logger.error("Async Mooncake lookup failed for %s: %s", req_id, e)
-            return 0
+            return MooncakeLookupResult(0)
         finally:
             del self.futures[req_id]
 

@@ -16,6 +16,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator imp
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  # noqa: E501
     LoadSpec,
+    MooncakeLookupResult,
     MooncakeStoreConnectorMetadata,
     ReqMeta,
     RequestTracker,
@@ -69,7 +70,9 @@ class MooncakeStoreScheduler:
             kv_cache_config, vllm_config
         )
         self.enable_partial_hash_hits = partial_hash_hits_enabled(
-            kv_cache_config.kv_cache_groups, self._hash_block_size
+            kv_cache_config.kv_cache_groups,
+            self._hash_block_size,
+            vllm_config.parallel_config.decode_context_parallel_size,
         )
 
         # Per-request state
@@ -99,15 +102,18 @@ class MooncakeStoreScheduler:
         if request.num_tokens < align:
             return 0, False
 
-        num_external_hit_tokens = self.client.lookup(
+        lookup_result = self.client.lookup(
             request.request_id,
             request.num_tokens,
             request.block_hashes,
             non_block=self.lookup_async,
         )
-        if num_external_hit_tokens is None:
+        if lookup_result is None:
             # Lookup not ready yet; scheduler will retry on a later step.
             return None, False
+        if isinstance(lookup_result, int):
+            lookup_result = MooncakeLookupResult(lookup_result)
+        num_external_hit_tokens = lookup_result.hit_length
 
         if num_external_hit_tokens < num_computed_tokens:
             need_to_allocate = 0
@@ -129,6 +135,7 @@ class MooncakeStoreScheduler:
             vllm_cached_tokens=num_computed_tokens,
             kvpool_cached_tokens=num_external_hit_tokens,
             can_load=False,
+            load_hash_overrides=lookup_result.load_hash_overrides,
         )
 
         return need_to_allocate, self.load_async

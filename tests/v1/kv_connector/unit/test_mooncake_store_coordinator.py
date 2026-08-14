@@ -10,9 +10,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator imp
     MooncakeStoreCoordinator,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+    BlobBlockHashes,
     chunk_hashes_for_block_size,
 )
-from vllm.v1.core.kv_cache_utils import BlockHash
+from vllm.v1.core.kv_cache_utils import BlockHash, get_block_hash
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheGroupSpec,
@@ -66,6 +67,18 @@ def test_external_cached_block_pool_hit_all_groups():
     assert len(res) == 2
     assert res[0] is not cmap.null_block
     assert res[1] is not cmap.null_block
+
+
+def test_external_cached_block_pool_preserves_blob_hash():
+    raw_hash = b"\x11\x22\x33\x44"
+    h = BlobBlockHashes(memoryview(raw_hash), len(raw_hash))[0]
+    cmap = ExternalCachedBlockPool(16, {(0, raw_hash)})
+
+    res = cmap.get_cached_block(h, [0])
+
+    assert res is not None
+    assert res[0].block_hash is not None
+    assert get_block_hash(res[0].block_hash) == raw_hash
 
 
 def test_external_cached_block_pool_miss_one_group():
