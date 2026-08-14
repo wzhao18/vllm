@@ -289,8 +289,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         if not self.draft_attn_layer_names:
             return None
         assert num_query_per_req is None  # Omitted for DFlash, read from self instead
-        assert dcp_local_seq_lens is None  # Computed from DFlash's input buffers
-        if self.block_tables.cp_size > 1:
+        if dcp_local_seq_lens is None and self.block_tables.cp_size > 1:
             # prepare_dflash_inputs has already written the draft's absolute
             # sequence length (context + query block) into input_buffers.seq_lens,
             # so this is the same call the target makes.

@@ -838,6 +838,7 @@ def test_mock_mla_dcp_fp8_decode_gathers_quantized_query(
 def test_tokenspeed_mla_noncausal_capability():
     builder = tokenspeed_mla_module.TokenspeedMLAMetadataBuilder
     assert builder.supports_non_causal_multi_token_decode
+    assert builder.supports_non_causal_multi_token_dcp
     assert tokenspeed_mla_module.TokenspeedMLABackend.supports_non_causal()
 
 
@@ -940,7 +941,6 @@ def test_flashinfer_mla_dcp_multi_token_decode_uses_per_query_bounds(monkeypatch
     assert lse is not None
     assert lse.shape == (6, 2)
     assert decode_call is not None
-    assert impl.supports_mtp_with_cp_non_trivial_interleave_size
     assert decode_call["query"].shape == (6, 1, 2, 576)
     torch.testing.assert_close(
         decode_call["seq_lens"],
