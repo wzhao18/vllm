@@ -215,6 +215,7 @@ class FlashInferMLABackend(MLACommonBackend):
 
 class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
     can_return_lse_for_decode: bool = True
+    supports_mtp_with_cp_non_trivial_interleave_size: bool = True
     # trtllm-gen MLA decode emits LSE in log2 (per flashinfer's own
     # reference at flashinfer/trace/templates/attention.py:81:
     # `logsumexp / log(2.0)`). Override the AttentionImplBase default
