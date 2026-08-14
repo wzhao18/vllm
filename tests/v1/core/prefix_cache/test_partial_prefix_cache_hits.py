@@ -121,8 +121,8 @@ def make_full_mamba_manager(
 def test_mamba_align_split_partial_tail_schedule(dcp_world_size: int):
     """Chunk ends with partial hits on: block-aligned chunks, one extra stop
     at the prompt's last hash boundary (registering the partial tail), then
-    the remaining tokens. With DCP, replay boundaries use the DCP-scaled
-    scheduler block, while the partial tail remains hash-block-aligned."""
+    the remaining tokens. Physical Mamba checkpoints are independent of the
+    DCP-scaled scheduler block."""
     block_size = 512
     scheduler_block_size = block_size * dcp_world_size
     hash_block_size = 32
@@ -143,14 +143,9 @@ def test_mamba_align_split_partial_tail_schedule(dcp_world_size: int):
     req.num_computed_tokens = 0
     assert split(self=mock, request=req, num_new_tokens=8192) == 8192
     req.num_computed_tokens = 8192
-    if dcp_world_size == 1:
-        # Stop at the last replay boundary (9728), then at the partial tail.
-        assert split(self=mock, request=req, num_new_tokens=1808) == 1536
-        req.num_computed_tokens = 9728
-        assert split(self=mock, request=req, num_new_tokens=272) == 256
-    else:
-        # 8192 is already the last DCP replay boundary, so stop at the tail.
-        assert split(self=mock, request=req, num_new_tokens=1808) == 1792
+    assert split(self=mock, request=req, num_new_tokens=1808) == 1536
+    req.num_computed_tokens = 9728
+    assert split(self=mock, request=req, num_new_tokens=272) == 256
     req.num_computed_tokens = 9984
     # Final 16 tokens run unchanged (no mid-block-resume stop: the next
     # block boundary is past the last block boundary).
@@ -1013,6 +1008,8 @@ def test_hybrid_full_attention_partial_hash_hit_uses_cow():
     computed_blocks, num_computed, _ = manager.get_computed_blocks(req1)
     assert num_computed == 6
     assert [len(group) for group in computed_blocks.blocks] == [2, 2]
+    # DCP/EAGLE lookup may include a block beyond the reconciled resume point.
+    computed_blocks.blocks[0].append(manager.block_pool.get_new_blocks(1)[0])
 
     new_blocks = manager.allocate_slots(req1, 2, num_computed, computed_blocks)
     assert new_blocks is not None

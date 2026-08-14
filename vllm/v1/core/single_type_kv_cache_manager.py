@@ -283,7 +283,7 @@ class SingleTypeKVCacheManager(ABC):
             # allocate_new_blocks; cap the cached count at the full blocks so
             # cache_blocks() re-caches the private copy once full.
             block_idx = num_local_computed_tokens // self.block_size
-            self._partial_hit_reqs[request_id] = (block_idx, new_computed_blocks[-1])
+            self._partial_hit_reqs[request_id] = (block_idx, req_blocks[block_idx])
             self.num_cached_block[request_id] = block_idx
 
     def allocate_external_computed_blocks(
