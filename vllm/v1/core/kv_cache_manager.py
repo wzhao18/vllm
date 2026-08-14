@@ -802,6 +802,30 @@ class KVCacheManager:
             truncated.append(list(group_blocks[:num_blocks]))
         return self.create_kv_cache_blocks(tuple(truncated))
 
+    def truncate_attention_blocks_for_external_load(
+        self, blocks: KVCacheBlocks, num_local_computed_tokens: int
+    ) -> KVCacheBlocks:
+        """Drop cached attention pages overlapping an external load.
+
+        A fine-grained local hit can end inside a larger attention page. The
+        page is shared through the prefix cache, so an external suffix must use
+        a newly allocated private page instead of overwriting it in place.
+        Non-attention cache groups retain their connector-specific handling.
+        """
+        truncated: list[list[KVCacheBlock]] = []
+        for group_blocks, manager, group in zip(
+            blocks.blocks,
+            self.coordinator.single_type_managers,
+            self.kv_cache_config.kv_cache_groups,
+            strict=True,
+        ):
+            if isinstance(group.kv_cache_spec, AttentionSpec):
+                num_blocks = num_local_computed_tokens // manager.block_size
+                truncated.append(list(group_blocks[:num_blocks]))
+            else:
+                truncated.append(list(group_blocks))
+        return self.create_kv_cache_blocks(tuple(truncated))
+
     def take_new_block_ids(self) -> list[int]:
         """Drain and return new attention block IDs for zeroing."""
         ids: list[int] = []

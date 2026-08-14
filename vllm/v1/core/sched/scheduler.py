@@ -885,6 +885,15 @@ class Scheduler(SchedulerInterface):
                                 request.shared_prefix_boundary,
                             ) = self.kv_cache_manager.get_computed_blocks(request)
 
+                        if num_external_computed_tokens > 0:
+                            new_computed_blocks = (
+                                self.kv_cache_manager
+                                .truncate_attention_blocks_for_external_load(
+                                    new_computed_blocks,
+                                    num_new_local_computed_tokens,
+                                )
+                            )
+
                         connector_prefix_cache_queries = (
                             request.num_tokens - num_new_local_computed_tokens
                         )

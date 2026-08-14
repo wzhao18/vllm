@@ -884,6 +884,75 @@ def test_truncate_computed_blocks_allows_short_mamba_group_only():
     assert [len(group) for group in blocks.blocks] == [3, 2]
 
 
+def test_external_load_drops_shared_attention_page_at_fine_boundary():
+    """A remote suffix gets a private page when its local hit is sub-page."""
+    hash_block_size = 2
+    attention_block_size = 8
+    kv_cache_config = KVCacheConfig(
+        num_blocks=24,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["draft"],
+                FullAttentionSpec(
+                    block_size=attention_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=attention_block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+    owner = make_request("owner", [0, 0, 1, 1, 2, 2], hash_block_size, sha256)
+    blocks, num_computed, _ = manager.get_computed_blocks(owner)
+    assert manager.allocate_slots(owner, 6, num_computed, blocks) is not None
+    manager.free(owner)
+    manager.new_step_starts()
+
+    replay = make_request(
+        "replay", [0, 0, 1, 1, 2, 2, 3, 3], hash_block_size, sha256
+    )
+    blocks, num_computed, _ = manager.get_computed_blocks(replay)
+    assert num_computed == 6
+    shared_attention_page = blocks.blocks[0][0]
+
+    truncated = manager.truncate_attention_blocks_for_external_load(
+        blocks, num_computed
+    )
+    assert len(truncated.blocks[0]) == 0
+    assert list(truncated.blocks[1]) == list(blocks.blocks[1])
+
+    assert (
+        manager.allocate_slots(
+            replay,
+            num_new_tokens=0,
+            num_new_computed_tokens=num_computed,
+            new_computed_blocks=truncated,
+            num_external_computed_tokens=2,
+            delay_cache_blocks=True,
+        )
+        is not None
+    )
+    replay_attention_page = manager.get_blocks("replay").blocks[0][0]
+    assert replay_attention_page is not shared_attention_page
+    assert replay_attention_page.block_hash is None
+
+
 def test_hybrid_mamba_partial_tail_owner_continue_preserves_later_hit():
     hash_block_size = 2
     block_size = 2 * hash_block_size
