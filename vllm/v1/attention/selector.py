@@ -37,6 +37,7 @@ class AttentionSelectorConfig(NamedTuple):
     use_batch_invariant: bool = False
     use_kv_connector: bool = False
     use_pcp: bool = False
+    use_dcp: bool = False
 
     def __repr__(self):
         return (
@@ -54,7 +55,8 @@ class AttentionSelectorConfig(NamedTuple):
             f"use_non_causal={self.use_non_causal}, "
             f"use_batch_invariant={self.use_batch_invariant}, "
             f"use_kv_connector={self.use_kv_connector}, "
-            f"use_pcp={self.use_pcp})"
+            f"use_pcp={self.use_pcp}, "
+            f"use_dcp={self.use_dcp})"
         )
 
 
@@ -153,6 +155,7 @@ def get_attn_backend(
         use_batch_invariant=envs.VLLM_BATCH_INVARIANT,
         use_kv_connector=use_kv_connector,
         use_pcp=vllm_config.parallel_config.prefill_context_parallel_size > 1,
+        use_dcp=vllm_config.parallel_config.decode_context_parallel_size > 1,
     )
 
     # A per-KV-group override (keyed by KVCacheSpecKind) takes precedence over
