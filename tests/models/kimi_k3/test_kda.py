@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 
 from vllm import _custom_ops as ops
+from vllm.model_executor.layers.mamba.mamba_utils import MambaStateDtypeCalculator
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_update
 from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
     gather_initial_states,
@@ -22,10 +23,13 @@ from vllm.models.kimi_k3.amd.ops.third_party.kda import (
 )
 from vllm.models.kimi_k3.nvidia import kda as nvidia_kda
 from vllm.models.kimi_k3.nvidia.kda import (
+    _flashinfer_kda_prefill,
     _flashkda_prefill,
     _store_cache_checkpoints_kernel,
+    is_flashinfer_kda_prefill_supported,
     is_flashkda_supported,
     is_fused_kda_decode_supported,
+    resolve_kda_prefill_backend,
 )
 from vllm.models.kimi_k3.nvidia.model import KimiLinearForCausalLM
 from vllm.models.kimi_k3.nvidia.ops import recoverssm as recoverssm_ops
@@ -87,6 +91,7 @@ def test_kda_recoverssm_config_state_layout():
         ),
         cache_config=SimpleNamespace(
             mamba_cache_dtype="auto",
+            mamba_ssm_cache_dtype="auto",
             use_kda_recoverssm=True,
         ),
         parallel_config=SimpleNamespace(tensor_parallel_size=1),
@@ -103,6 +108,156 @@ def test_kda_recoverssm_config_state_layout():
         (4, 3, 32),
         (4, 3, 64),
     )
+
+
+@pytest.mark.parametrize(
+    ("ssm_cache_dtype", "expected"),
+    [
+        ("auto", torch.float32),
+        ("float32", torch.float32),
+        ("bfloat16", torch.bfloat16),
+    ],
+)
+def test_kda_state_dtype_respects_explicit_ssm_override(
+    ssm_cache_dtype: str,
+    expected: torch.dtype,
+):
+    assert MambaStateDtypeCalculator.kda_state_dtype(
+        torch.bfloat16,
+        "auto",
+        ssm_cache_dtype,
+    ) == (torch.bfloat16, expected)
+
+
+def test_kda_state_dtype_rejects_float16_ssm_state():
+    with pytest.raises(ValueError, match="supports only"):
+        MambaStateDtypeCalculator.kda_state_dtype(
+            torch.bfloat16,
+            "auto",
+            "float16",
+        )
+
+
+def test_resolve_kda_prefill_backend_prefers_flashinfer_for_bf16(monkeypatch):
+    monkeypatch.setattr(
+        nvidia_kda,
+        "is_flashinfer_kda_prefill_supported",
+        lambda *_: True,
+    )
+    monkeypatch.setattr(nvidia_kda, "is_flashkda_supported", lambda *_: True)
+
+    assert (
+        resolve_kda_prefill_backend(
+            "auto",
+            head_dim=128,
+            input_dtype=torch.bfloat16,
+            recurrent_state_dtype=torch.bfloat16,
+            lower_bound=-5.0,
+        )
+        == "flashinfer"
+    )
+
+
+def test_resolve_kda_prefill_backend_falls_back_without_flashinfer(monkeypatch):
+    monkeypatch.setattr(
+        nvidia_kda,
+        "is_flashinfer_kda_prefill_supported",
+        lambda *_: False,
+    )
+    monkeypatch.setattr(nvidia_kda, "is_flashkda_supported", lambda *_: True)
+
+    assert (
+        resolve_kda_prefill_backend(
+            "auto",
+            head_dim=128,
+            input_dtype=torch.bfloat16,
+            recurrent_state_dtype=torch.bfloat16,
+            lower_bound=-5.0,
+        )
+        == "flashkda"
+    )
+    with pytest.raises(RuntimeError, match="0.6.18"):
+        resolve_kda_prefill_backend(
+            "flashinfer",
+            head_dim=128,
+            input_dtype=torch.bfloat16,
+            recurrent_state_dtype=torch.bfloat16,
+            lower_bound=-5.0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("capability", "cuda_version", "expected"),
+    [
+        ((10, 3), "12.9", True),
+        ((10, 3), "12.8", False),
+        ((10, 0), "12.8", True),
+        ((10, 0), "12.7", False),
+        ((9, 0), "13.0", False),
+    ],
+)
+def test_flashinfer_kda_prefill_arch_support(
+    monkeypatch,
+    capability: tuple[int, int],
+    cuda_version: str,
+    expected: bool,
+):
+    monkeypatch.setattr(nvidia_kda.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        nvidia_kda.current_platform,
+        "get_device_capability",
+        lambda: SimpleNamespace(major=capability[0], minor=capability[1]),
+    )
+    monkeypatch.setattr(nvidia_kda, "has_flashinfer_kda_prefill", lambda: True)
+    monkeypatch.setattr(nvidia_kda.torch.version, "cuda", cuda_version)
+
+    assert (
+        is_flashinfer_kda_prefill_supported(
+            head_dim=128,
+            input_dtype=torch.bfloat16,
+            recurrent_state_dtype=torch.bfloat16,
+            lower_bound=-5.0,
+        )
+        is expected
+    )
+
+
+def test_flashinfer_kda_prefill_argument_contract(monkeypatch):
+    captured: dict = {}
+
+    def recurrent_kda(**kwargs):
+        captured.update(kwargs)
+        return kwargs["output"], kwargs["initial_state"]
+
+    monkeypatch.setattr(nvidia_kda, "flashinfer_recurrent_kda", recurrent_kda)
+    q = torch.randn(1, 5, 2, 4, dtype=torch.bfloat16)
+    beta_storage = torch.randn(1, 5, 5, dtype=torch.bfloat16)
+    raw_beta = beta_storage[..., ::2]
+    initial_state = torch.randn(2, 2, 4, 4, dtype=torch.bfloat16)
+    out = torch.empty_like(q)
+
+    actual_out, actual_state = _flashinfer_kda_prefill(
+        q=q,
+        k=q,
+        v=q,
+        raw_g=q,
+        raw_beta=raw_beta,
+        A_log=torch.randn(2, dtype=torch.float32),
+        dt_bias=torch.randn(2, 4, dtype=torch.float32),
+        lower_bound=-5.0,
+        initial_state=initial_state,
+        cu_seqlens=torch.tensor([0, 2, 5], dtype=torch.int32),
+        out=out,
+    )
+
+    assert actual_out.data_ptr() == out.data_ptr()
+    assert actual_state.data_ptr() == initial_state.data_ptr()
+    assert captured["use_qk_l2norm_in_kernel"]
+    assert captured["use_gate_in_kernel"]
+    assert captured["beta_is_logit"]
+    assert captured["output_final_state"]
+    assert captured["beta"].is_contiguous()
+    assert captured["scale"] == 0.5
 
 
 @torch.inference_mode()
