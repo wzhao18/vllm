@@ -235,6 +235,8 @@ def test_flashinfer_kda_prefill_argument_contract(monkeypatch):
     raw_beta = beta_storage[..., ::2]
     initial_state = torch.randn(2, 2, 4, 4, dtype=torch.bfloat16)
     out = torch.empty_like(q)
+    seq_order = torch.tensor([1, 0], dtype=torch.int32)
+    prefill_workspace = object()
 
     actual_out, actual_state = _flashinfer_kda_prefill(
         q=q,
@@ -248,6 +250,8 @@ def test_flashinfer_kda_prefill_argument_contract(monkeypatch):
         initial_state=initial_state,
         cu_seqlens=torch.tensor([0, 2, 5], dtype=torch.int32),
         out=out,
+        seq_order=seq_order,
+        prefill_workspace=prefill_workspace,
     )
 
     assert actual_out.data_ptr() == out.data_ptr()
@@ -255,7 +259,9 @@ def test_flashinfer_kda_prefill_argument_contract(monkeypatch):
     assert captured["use_qk_l2norm_in_kernel"]
     assert captured["use_gate_in_kernel"]
     assert captured["beta_is_logit"]
-    assert captured["output_final_state"]
+    assert not captured["output_final_state"]
+    assert captured["seq_order"] is seq_order
+    assert captured["prefill_workspace"] is prefill_workspace
     assert captured["beta"].is_contiguous()
     assert captured["scale"] == 0.5
 

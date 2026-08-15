@@ -1,33 +1,42 @@
 # Kimi K3 FlashInfer KDA Optimization Plan
 
-Last updated: 2026-08-14
+Last updated: 2026-08-15
 
-## Execution status (2026-08-14)
+## Execution status (2026-08-15)
 
-The first gather/scatter recurrent-prefill adapter is implemented in the
-working tree and is not yet ready to submit upstream.
+The first gather/scatter recurrent-prefill adapter and its reusable vLLM
+microbenchmark are implemented on `integrate-flashinfer-kda-prefill`. The
+change is not yet ready to submit upstream because full-model evaluation and
+serving validation remain outstanding.
 
-- Installed and import-checked `flashinfer-python==0.6.18.dev20260814` and
-  `flashinfer-cubin==0.6.18.dev20260814` from the official
-  `nightly-v0.6.18-20260814` release.
+- Installed and import-checked `flashinfer-python==0.6.18.dev20260811`,
+  `flashinfer-cubin==0.6.18.dev20260811`, and
+  `flashinfer-jit-cache==0.6.18.dev20260811+cu130` from the official
+  `nightly-v0.6.18-20260811` release.
 - The nightly exposes `flashinfer.kda.recurrent_kda` and its frozen recurrent
   prefill supports SM100 and SM103, BF16 state, D=128, and H=12 beta padding.
-- No matching CUDA 13.0 nightly JIT-cache wheel was published, so the stale
-  0.6.16 JIT-cache package was removed. The KDA extension must JIT locally.
 - Added opt-in BF16 KDA state through `--mamba-ssm-cache-dtype bfloat16` while
   preserving FP32 for `auto` and `float32`.
 - Added `flashinfer` backend resolution with SM100/SM103, dtype, head-dimension,
   gate, and API capability guards. Automatic selection prefers it only for
   eligible BF16-state configurations.
 - Added the public-API adapter, caller-owned output path, existing state
-  gather/scatter integration, and FP32-only native decode guard.
+  gather/scatter integration, and FP32-only native decode guard. The hot path
+  reuses int64 sequence offsets and sorted sequence order across KDA layers and
+  keeps a dedicated FlashInfer prefill workspace per layer.
 - Added focused dtype, selection, SM103/CUDA-version eligibility,
   call-contract, decode-safety, and BF16-recurrence correctness tests.
-- The focused suite passes on an NVIDIA B300: 14 passed. The real launch used
+- The focused suite passes on an NVIDIA B300: 24 passed. The real launch used
   the nightly's `flash_kda_bf16_fused_m128_sm100f` specialization for H=12.
-- Still required: full-model evaluation and performance benchmarks on
-  B300/GB300; serving-level mixed-batch and graph-boundary validation; and
-  official duplicate checks with `gh` before proposing a PR.
+- Added `benchmarks/kernels/benchmark_kimi_k3_kda_prefill.py`, reusing
+  FlashInfer's CUPTI, cold-L2, packed-sequence, sorted-sequence, and rotating
+  state methodology while invoking the actual vLLM adapters.
+- A 50-sample cold-L2 B300 TP8 sweep shows FlashInfer speedups over the current
+  Triton fallback from 1.32x to 13.20x. Detailed results and the exact command
+  are recorded under Performance benchmark plan.
+- Still required: complete-layer and full-model evaluation on B300/GB300;
+  serving-level mixed-batch and graph-boundary validation; and official
+  duplicate checks with `gh` before proposing a PR.
 
 The repository's stable FlashInfer requirement remains unchanged. Stable
 0.6.17 lacks the KDA modules, so this backend is capability-gated and requires
@@ -447,6 +456,37 @@ hide an H=12 regression.
 
 Use cold-L2 and steady-state graph measurements where appropriate, report the
 method, and retain per-shape results rather than only a geometric mean.
+
+### First B300 kernel results (2026-08-15)
+
+Command:
+
+```bash
+FLASHINFER_WORKSPACE_BASE=/tmp .venv/bin/python \
+  benchmarks/kernels/benchmark_kimi_k3_kda_prefill.py \
+  --warmup-iters 10 --benchmark-iters 50 \
+  --json /tmp/vllm_k3_kda_prefill_b300.json
+```
+
+Environment: NVIDIA B300 SXM6 AC, CC 10.3, Torch 2.13.0+cu130,
+FlashInfer 0.6.18.dev20260811, CUDA 13.0, and cupti-python 13.3.1. Results are
+median GPU spans with cold L2, H=12, D=128, and BF16 recurrent state.
+
+| Case | Sequence lengths | FlashInfer | Triton | Speedup |
+| --- | --- | ---: | ---: | ---: |
+| `fixed128` | 128 | 21.728 us | 286.897 us | 13.20x |
+| `fixed512` | 512 | 44.352 us | 288.545 us | 6.51x |
+| `fixed2048` | 2048 | 135.105 us | 326.161 us | 2.41x |
+| `fixed8192` | 8192 | 498.066 us | 656.867 us | 1.32x |
+| `mixed` | 128, 256, 512, 1024, 2048, 4096 | 257.425 us | 540.082 us | 2.10x |
+| `uniform` | 8 x 1024 | 76.945 us | 490.402 us | 6.37x |
+
+These are core KDA backend spans, not complete-layer or end-to-end results.
+The benchmark excludes convolution, state gather/scatter, output norm, and
+projection. Its cross-backend diagnostics report approximately 0.44%-0.45%
+output relative L2 and 0.31%-0.34% state relative L2; this is expected because
+FlashInfer rounds BF16 state after every token while Triton accumulates within
+a chunk.
 
 ## Acceptance criteria
 
