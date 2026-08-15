@@ -138,7 +138,19 @@ def test_kda_state_dtype_rejects_float16_ssm_state():
         )
 
 
-def test_resolve_kda_prefill_backend_prefers_flashinfer_for_bf16(monkeypatch):
+def test_store_recurrent_state_casts_to_cache_dtype():
+    state = torch.zeros(3, 2, 4, 4, dtype=torch.bfloat16)
+    indices = torch.tensor([2, 0], dtype=torch.int32)
+    updated = torch.randn(2, 2, 4, 4, dtype=torch.float32)
+
+    nvidia_kda._store_recurrent_state(state, indices, updated)
+
+    torch.testing.assert_close(state[indices.long()], updated.to(torch.bfloat16))
+
+
+def test_resolve_kda_prefill_backend_prefers_flashinfer_for_bf16(
+    monkeypatch: pytest.MonkeyPatch,
+):
     monkeypatch.setattr(
         nvidia_kda,
         "is_flashinfer_kda_prefill_supported",

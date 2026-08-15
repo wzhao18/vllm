@@ -488,6 +488,59 @@ output relative L2 and 0.31%-0.34% state relative L2; this is expected because
 FlashInfer rounds BF16 state after every token while Triton accumulates within
 a chunk.
 
+### First B300 end-to-end validation (2026-08-15)
+
+The TP8 server used MXFP4 weights, FP8 KV cache, BF16 KDA state, TRT-LLM
+ragged MLA prefill with query quantization, and disabled FlashInfer autotuning:
+
+```bash
+VLLM_USE_V2_MODEL_RUNNER=1 vllm serve ~/models/Kimi-K3 \
+  --tensor-parallel-size 8 \
+  --load-format fastsafetensors \
+  --no-enable-flashinfer-autotune \
+  --trust-remote-code \
+  --language-model-only \
+  --attention-config \
+    '{"mla_prefill_backend":"TRTLLM_RAGGED","use_prefill_query_quantization":true}' \
+  --kv-cache-dtype fp8 \
+  --mamba-ssm-cache-dtype bfloat16 \
+  --kda-prefill-backend flashinfer
+```
+
+The resolved configuration used `CUDAGraphMode.FULL_AND_PIECEWISE`. vLLM
+captured all 83 piecewise and 83 full graph sizes, then loaded
+`flash_kda_bf16_fused_m128_sm100f` on every B300 worker. Graph capture used
+6.05 GiB per GPU. The server reported 45.14 GiB per GPU available for KV cache
+and a 3,488,884-token aggregate cache capacity.
+
+Accuracy command:
+
+```bash
+lm_eval --model local-completions \
+  --model_args \
+    "base_url=http://0.0.0.0:8000/v1/completions,max_length=8192,tokenized_requests=False,tokenizer_backend=None,num_concurrent=32" \
+  --tasks gsm8k --num_fewshot 5
+```
+
+| Metric | Result |
+| --- | ---: |
+| GSM8K flexible exact match | 0.9644 +/- 0.0051 |
+| GSM8K strict exact match | 0.9636 +/- 0.0052 |
+| Requests | 1,319 |
+| Generation wall time | 4:06 |
+| Request rate | 5.36 requests/s |
+
+All observed completion requests returned HTTP 200 and no KDA or CUDA Graph
+error occurred. The request rate is validation evidence, not a controlled
+end-to-end performance comparison. A matched Triton run must use the same
+server and evaluation configuration with only `--kda-prefill-backend triton`
+changed.
+
+The attempted matched baseline exposed that Triton returns FP32 final state
+while an opt-in BF16 cache requires BF16 scatter input. The integration now
+casts the updated state to the cache dtype before scatter. Its focused
+regression test passes; the matched baseline remains to be rerun.
+
 ## Acceptance criteria
 
 ### Required for merge

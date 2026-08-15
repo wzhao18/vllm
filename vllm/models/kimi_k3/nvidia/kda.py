@@ -61,6 +61,14 @@ logger = init_logger(__name__)
 _KDA_GATE_LOGBOUND_MIN = -5.0
 
 
+def _store_recurrent_state(
+    recurrent_state: torch.Tensor,
+    state_indices: torch.Tensor,
+    updated_state: torch.Tensor,
+) -> None:
+    recurrent_state[state_indices] = updated_state.to(recurrent_state.dtype)
+
+
 def a_log_weight_loader(
     shard_axis: int,
 ) -> Callable[[torch.Tensor, torch.Tensor], None]:
@@ -1150,7 +1158,11 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         use_qk_l2norm_in_kernel=True,
                         cu_seqlens=non_spec_query_start_loc,
                     )
-                recurrent_state[non_spec_state_indices_tensor] = last_recurrent_state
+                _store_recurrent_state(
+                    recurrent_state,
+                    non_spec_state_indices_tensor,
+                    last_recurrent_state,
+                )
             else:
                 # Pure non-speculative decode.
                 assert non_spec_state_indices_tensor is not None
