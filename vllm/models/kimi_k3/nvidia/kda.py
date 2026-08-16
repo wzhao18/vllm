@@ -782,7 +782,6 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         self._flashinfer_kda_output_spec: tuple[tuple[int, ...], torch.dtype] | None = (
             None
         )
-        self._flashinfer_kda_workspace: object | None = None
         if self.kda_prefill_backend == "flashkda":
             T = vllm_config.scheduler_config.max_num_batched_tokens
             N = vllm_config.scheduler_config.max_num_seqs
@@ -1266,14 +1265,6 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         m.flashinfer_prefill_seq_order = torch.argsort(
                             flashinfer_query_start_loc.diff(), descending=True
                         ).to(torch.int32)
-                    if self._flashinfer_kda_workspace is None:
-                        from flashinfer.kda_prefill import (
-                            RecurrentKDAPrefillWorkspace,
-                        )
-
-                        self._flashinfer_kda_workspace = RecurrentKDAPrefillWorkspace(
-                            q_ns.device
-                        )
                     flashinfer_out = core_attn_out[:, : q_ns.shape[1]]
                     if has_spec_decode:
                         assert self._flashinfer_kda_output_spec is not None
@@ -1281,6 +1272,8 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                             self._flashinfer_kda_output_spec
                         )
                         flashinfer_out = workspace_out[:, : q_ns.shape[1]]
+                    # This path is an eager callback during breakable graph replay.
+                    # FlashInfer owns a separate workspace for each CUDA stream.
                     (
                         core_attn_out_non_spec,
                         last_recurrent_state,
@@ -1297,7 +1290,6 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         cu_seqlens=m.flashinfer_prefill_query_start_loc,
                         out=flashinfer_out,
                         seq_order=m.flashinfer_prefill_seq_order,
-                        prefill_workspace=self._flashinfer_kda_workspace,
                     )
                 else:
                     (

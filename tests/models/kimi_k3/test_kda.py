@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 
 from vllm import _custom_ops as ops
+from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateDtypeCalculator
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_update
 from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
@@ -1541,6 +1542,64 @@ def test_flashkda_near_collinear_keys_remain_finite():
 
     assert torch.isfinite(output).all()
     assert torch.isfinite(final_state).all()
+
+
+@torch.inference_mode()
+def test_flashinfer_kda_prefill_breakable_graph_cross_stream():
+    if not is_flashinfer_kda_prefill_supported(
+        128,
+        torch.bfloat16,
+        torch.bfloat16,
+        -5.0,
+    ):
+        pytest.skip("FlashInfer KDA prefill is not supported on this platform")
+
+    B, T, H, D = 1, 8, 12, 128
+    q, k, v, raw_g = [
+        torch.randn(B, T, H, D, dtype=torch.bfloat16, device=DEVICE) for _ in range(4)
+    ]
+    raw_beta = torch.randn(B, T, H, dtype=torch.bfloat16, device=DEVICE)
+    initial_state = torch.randn(
+        B,
+        H,
+        D,
+        D,
+        dtype=torch.bfloat16,
+        device=DEVICE,
+    )
+    kwargs = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "raw_g": raw_g,
+        "raw_beta": raw_beta,
+        "A_log": torch.randn(H, dtype=torch.float32, device=DEVICE),
+        "dt_bias": torch.randn(H, D, dtype=torch.float32, device=DEVICE),
+        "lower_bound": -5.0,
+        "initial_state": initial_state,
+        "cu_seqlens": torch.tensor([0, T], dtype=torch.int64, device=DEVICE),
+        "out": torch.empty_like(q),
+        "seq_order": torch.zeros(B, dtype=torch.int32, device=DEVICE),
+    }
+
+    capture_stream = torch.Stream(device=DEVICE)
+    original_stream = torch.accelerator.current_stream()
+    torch.accelerator.set_stream(capture_stream)
+    try:
+        graph_value = torch.zeros(1, device=DEVICE)
+        capture = BreakableCUDAGraphCapture()
+        with capture:
+            graph_value.add_(1)
+            capture.add_eager(lambda: _flashinfer_kda_prefill(**kwargs))
+            graph_value.add_(1)
+        capture_stream.synchronize()
+    finally:
+        torch.accelerator.set_stream(original_stream)
+
+    torch.testing.assert_close(graph_value, torch.zeros_like(graph_value))
+    capture.replay()
+    torch.accelerator.synchronize()
+    torch.testing.assert_close(graph_value, torch.full_like(graph_value, 2))
 
 
 @torch.inference_mode()

@@ -24,7 +24,8 @@ validation remain outstanding.
 - Added the public-API adapter, caller-owned output path, existing state
   gather/scatter integration, and FP32-only native decode guard. The hot path
   reuses int64 sequence offsets and sorted sequence order across KDA layers and
-  keeps a dedicated FlashInfer prefill workspace per layer.
+  lets FlashInfer manage per-stream prefill workspaces for vLLM's breakable
+  CUDA Graph eager callbacks.
 - Added focused dtype, selection, SM103/CUDA-version eligibility,
   call-contract, decode-safety, and BF16-recurrence correctness tests.
 - Added `--kda-decode-backend {auto,native,flashinfer,triton}`. The automatic
@@ -279,11 +280,12 @@ gather initial recurrent states
 - [ ] Validate Q/K/V/G contiguity and explicitly account for any materialization
   in benchmarks.
 - [ ] Provide contiguous beta if required by the released API.
-- [ ] Request a caller-owned FlashInfer workspace suitable for capture.
-- [ ] Warm every specialization and descriptor before CUDA Graph capture.
+- [x] Use FlashInfer's per-stream workspace for breakable CUDA Graph eager
+  callbacks; an explicit workspace cannot move between capture and replay
+  streams.
+- [ ] For future direct prefill capture, warm every specialization and use one
+  caller-owned workspace per captured invocation.
 - [ ] Do not allocate or compile during graph replay.
-- [ ] Use one safe workspace per captured invocation if required by the final
-  FlashInfer workspace contract.
 
 ### Backend resolution
 
@@ -614,7 +616,7 @@ may depend on workload mix.
 | Native fused decode crashes on BF16 | Include recurrent dtype in support checks; use Triton/FlashInfer fallback |
 | CAKE kernel gain is hidden by gather/scatter | Measure complete layer span; adopt indexed interface after merge |
 | Projection views force materialization | Validate strides and use PR #4445 strided beta support |
-| CUDA Graph workspace aliasing | Warm explicitly and follow one-workspace-per-captured-invocation contract |
+| CUDA Graph workspace aliasing | Use per-stream eager workspaces for breakable graphs; use one warmed workspace per invocation for direct capture |
 | Checkpoint alignment differs from vLLM block size | Enable only for compatible multiples of 32; otherwise fall back |
 | FlashInfer API changes before release | Depend on released public API and capability detection |
 | B200 results fail to transfer to B300 | Require direct SM103 microbenchmark and full-model evidence |
