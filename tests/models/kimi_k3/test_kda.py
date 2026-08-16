@@ -23,12 +23,15 @@ from vllm.models.kimi_k3.amd.ops.third_party.kda import (
 )
 from vllm.models.kimi_k3.nvidia import kda as nvidia_kda
 from vllm.models.kimi_k3.nvidia.kda import (
+    _flashinfer_fused_kda_decode,
     _flashinfer_kda_prefill,
     _flashkda_prefill,
     _store_cache_checkpoints_kernel,
+    is_flashinfer_kda_decode_supported,
     is_flashinfer_kda_prefill_supported,
     is_flashkda_supported,
     is_fused_kda_decode_supported,
+    resolve_kda_decode_backend,
     resolve_kda_prefill_backend,
 )
 from vllm.models.kimi_k3.nvidia.model import KimiLinearForCausalLM
@@ -196,6 +199,181 @@ def test_resolve_kda_prefill_backend_falls_back_without_flashinfer(monkeypatch):
             recurrent_state_dtype=torch.bfloat16,
             lower_bound=-5.0,
         )
+
+
+@pytest.mark.parametrize(
+    ("backend", "state_dtype", "native_supported", "expected"),
+    [
+        ("auto", torch.float32, True, "native"),
+        ("auto", torch.bfloat16, False, "flashinfer"),
+        ("flashinfer", torch.float32, True, "flashinfer"),
+    ],
+)
+def test_resolve_kda_decode_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    backend: str,
+    state_dtype: torch.dtype,
+    native_supported: bool,
+    expected: str,
+):
+    monkeypatch.setattr(
+        kda_module,
+        "is_fused_kda_decode_supported",
+        lambda *_: native_supported,
+    )
+    monkeypatch.setattr(
+        kda_module,
+        "is_flashinfer_kda_decode_supported",
+        lambda *_: True,
+    )
+
+    assert (
+        resolve_kda_decode_backend(
+            backend,
+            num_heads=12,
+            head_dim=128,
+            conv_width=4,
+            num_spec=0,
+            input_dtype=torch.bfloat16,
+            conv_state_dtype=torch.bfloat16,
+            recurrent_state_dtype=state_dtype,
+        )
+        == expected
+    )
+
+
+def test_resolve_kda_decode_backend_explicit_flashinfer_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        kda_module,
+        "is_fused_kda_decode_supported",
+        lambda *_: False,
+    )
+    monkeypatch.setattr(
+        kda_module,
+        "is_flashinfer_kda_decode_supported",
+        lambda *_: False,
+    )
+
+    with pytest.raises(RuntimeError, match="0.6.18.dev20260811"):
+        resolve_kda_decode_backend(
+            "flashinfer",
+            num_heads=12,
+            head_dim=128,
+            conv_width=4,
+            num_spec=0,
+            input_dtype=torch.bfloat16,
+            conv_state_dtype=torch.bfloat16,
+            recurrent_state_dtype=torch.bfloat16,
+        )
+
+
+def test_resolve_kda_decode_backend_native_does_not_probe_flashinfer(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        kda_module,
+        "is_fused_kda_decode_supported",
+        lambda *_: True,
+    )
+
+    def fail_if_probed(*_):
+        raise AssertionError("FlashInfer should not be probed for native decode")
+
+    monkeypatch.setattr(
+        kda_module,
+        "is_flashinfer_kda_decode_supported",
+        fail_if_probed,
+    )
+
+    assert (
+        resolve_kda_decode_backend(
+            "auto",
+            num_heads=12,
+            head_dim=128,
+            conv_width=4,
+            num_spec=0,
+            input_dtype=torch.bfloat16,
+            conv_state_dtype=torch.bfloat16,
+            recurrent_state_dtype=torch.float32,
+        )
+        == "native"
+    )
+
+
+@pytest.mark.parametrize(
+    ("capability", "cuda_version", "expected"),
+    [
+        ((10, 3), "12.9", True),
+        ((10, 3), "12.8", False),
+        ((10, 0), "12.8", True),
+        ((9, 0), "13.0", False),
+    ],
+)
+def test_flashinfer_kda_decode_arch_support(
+    monkeypatch: pytest.MonkeyPatch,
+    capability: tuple[int, int],
+    cuda_version: str,
+    expected: bool,
+):
+    monkeypatch.setattr(kda_module.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        kda_module.current_platform,
+        "get_device_capability",
+        lambda: SimpleNamespace(major=capability[0], minor=capability[1]),
+    )
+    monkeypatch.setattr(kda_module, "has_flashinfer_kda_decode", lambda: True)
+    monkeypatch.setattr(kda_module.torch.version, "cuda", cuda_version)
+    monkeypatch.setattr(kda_module, "is_conv_state_dim_first", lambda: False)
+
+    assert (
+        is_flashinfer_kda_decode_supported(
+            num_heads=12,
+            head_dim=128,
+            conv_width=4,
+            num_spec=0,
+            input_dtype=torch.bfloat16,
+            conv_state_dtype=torch.bfloat16,
+            recurrent_state_dtype=torch.bfloat16,
+        )
+        is expected
+    )
+
+
+def test_flashinfer_fused_kda_decode_argument_contract(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured: dict = {}
+
+    def fused_kda_decode(**kwargs):
+        captured.update(kwargs)
+        return kwargs["output"]
+
+    monkeypatch.setattr(kda_module, "flashinfer_fused_kda_decode", fused_kda_decode)
+    x = torch.randn(2, 24, dtype=torch.bfloat16)
+    out = torch.empty(1, 2, 1, 8, dtype=torch.bfloat16)
+    actual = _flashinfer_fused_kda_decode(
+        x=x,
+        weight=torch.randn(3, 4, 8),
+        conv_state=torch.randn(3, 24, 3, dtype=torch.bfloat16),
+        raw_g=torch.randn(1, 2, 1, 8, dtype=torch.bfloat16),
+        raw_beta=torch.randn(1, 2, 1, dtype=torch.bfloat16),
+        A_log=torch.randn(1),
+        dt_bias=torch.randn(8),
+        state_indices=torch.tensor([1, 2], dtype=torch.int32),
+        state=torch.randn(3, 1, 8, 8, dtype=torch.bfloat16),
+        output_gate=torch.randn(2, 1, 8, dtype=torch.bfloat16),
+        norm_weight=torch.randn(8),
+        lower_bound=-5.0,
+        norm_eps=1e-5,
+        out=out,
+    )
+
+    assert actual.data_ptr() == out.data_ptr()
+    assert captured["raw_gate"].shape == (1, 2, 1, 8)
+    assert captured["output"] is out
+    assert captured["lower_bound"] == -5.0
 
 
 @pytest.mark.parametrize(
@@ -1082,6 +1260,7 @@ def test_kda_recoverssm_verify_and_group_commit(
         (96, 1, -5.0, True, "DS"),
     ],
 )
+@pytest.mark.parametrize("decode_backend", ["native", "flashinfer"])
 @torch.inference_mode()
 def test_fused_kda_decode_correctness(
     num_heads: int,
@@ -1089,17 +1268,36 @@ def test_fused_kda_decode_correctness(
     lower_bound: float | None,
     fuse_output_norm: bool,
     conv_layout: str,
+    decode_backend: str,
 ):
     D, W = 128, 4
-    if not is_fused_kda_decode_supported(
-        num_heads,
-        D,
-        W,
-        num_spec=0,
-        input_dtype=torch.bfloat16,
-        conv_state_dtype=torch.bfloat16,
-    ):
-        pytest.skip("Fused KDA decode is not supported on this platform")
+    state_dtype = torch.bfloat16 if decode_backend == "flashinfer" else torch.float32
+    if decode_backend == "flashinfer":
+        if conv_layout == "DS":
+            pytest.skip("FlashInfer fused decode requires SD conv-state layout")
+        if not fuse_output_norm:
+            pytest.skip("FlashInfer's fused decode always applies output norm")
+        supported = is_flashinfer_kda_decode_supported(
+            num_heads,
+            D,
+            W,
+            num_spec=0,
+            input_dtype=torch.bfloat16,
+            conv_state_dtype=torch.bfloat16,
+            recurrent_state_dtype=state_dtype,
+        )
+    else:
+        supported = is_fused_kda_decode_supported(
+            num_heads,
+            D,
+            W,
+            num_spec=0,
+            input_dtype=torch.bfloat16,
+            conv_state_dtype=torch.bfloat16,
+            recurrent_state_dtype=state_dtype,
+        )
+    if not supported:
+        pytest.skip(f"{decode_backend} fused KDA decode is not supported")
     torch.manual_seed(967 + num_heads + num_seqs + (conv_layout == "DS"))
     dim = num_heads * D
     slots = num_seqs + 2
@@ -1168,7 +1366,7 @@ def test_fused_kda_decode_correctness(
         D,
         dtype=torch.float32,
         device=DEVICE,
-    )
+    ).to(state_dtype)
 
     conv_ref = conv_seed.clone()
     state_ref = state_seed.clone()
@@ -1203,7 +1401,7 @@ def test_fused_kda_decode_correctness(
     conv_slot_elements = 3 * dim * (W - 1)
     state_slot_elements = num_heads * D * D
     conv_slot_bytes = conv_slot_elements * torch.bfloat16.itemsize
-    page_bytes = conv_slot_bytes + state_slot_elements * torch.float32.itemsize
+    page_bytes = conv_slot_bytes + state_slot_elements * state_dtype.itemsize
     cache_storage = torch.empty(slots * page_bytes, dtype=torch.uint8, device=DEVICE)
     conv_actual = torch.as_strided(
         cache_storage.view(torch.bfloat16),
@@ -1215,30 +1413,69 @@ def test_fused_kda_decode_correctness(
         ),
     )
     state_actual = torch.as_strided(
-        cache_storage.view(torch.float32),
+        cache_storage.view(state_dtype),
         size=(slots, num_heads, D, D),
-        stride=(page_bytes // torch.float32.itemsize, D * D, D, 1),
-        storage_offset=conv_slot_bytes // torch.float32.itemsize,
+        stride=(page_bytes // state_dtype.itemsize, D * D, D, 1),
+        storage_offset=conv_slot_bytes // state_dtype.itemsize,
     )
     conv_actual.copy_(conv_seed)
     state_actual.copy_(state_seed)
     fused_weight = weight.reshape(3, dim, W).transpose(1, 2).contiguous()
-    actual = ops.fused_kda_decode(
-        x=packed_x,
-        weight=fused_weight,
-        bias=None,
-        conv_state=conv_actual,
-        raw_g=raw_g,
-        raw_beta=raw_beta,
-        A_log=A_log,
-        dt_bias=dt_bias,
-        state_indices=state_indices,
-        state=state_actual,
-        lower_bound=lower_bound,
-        output_gate=output_gate if fuse_output_norm else None,
-        norm_weight=norm_weight if fuse_output_norm else None,
-        norm_eps=norm_eps,
-    )
+    if decode_backend == "flashinfer":
+        output = torch.empty(
+            1,
+            num_seqs,
+            num_heads,
+            D,
+            dtype=torch.bfloat16,
+            device=DEVICE,
+        )
+
+        def run_flashinfer_decode() -> torch.Tensor:
+            return _flashinfer_fused_kda_decode(
+                x=packed_x,
+                weight=fused_weight,
+                conv_state=conv_actual,
+                raw_g=raw_g,
+                raw_beta=raw_beta,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                state_indices=state_indices,
+                state=state_actual,
+                output_gate=output_gate,
+                norm_weight=norm_weight,
+                lower_bound=lower_bound,
+                norm_eps=norm_eps,
+                out=output,
+            )
+
+        run_flashinfer_decode()
+        conv_actual.copy_(conv_seed)
+        state_actual.copy_(state_seed)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = run_flashinfer_decode()
+        conv_actual.copy_(conv_seed)
+        state_actual.copy_(state_seed)
+        graph.replay()
+        torch.accelerator.synchronize()
+    else:
+        actual = ops.fused_kda_decode(
+            x=packed_x,
+            weight=fused_weight,
+            bias=None,
+            conv_state=conv_actual,
+            raw_g=raw_g,
+            raw_beta=raw_beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            state_indices=state_indices,
+            state=state_actual,
+            lower_bound=lower_bound,
+            output_gate=output_gate if fuse_output_norm else None,
+            norm_weight=norm_weight if fuse_output_norm else None,
+            norm_eps=norm_eps,
+        )
 
     torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(conv_actual, conv_ref, atol=0, rtol=0)

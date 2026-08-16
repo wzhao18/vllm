@@ -4,10 +4,11 @@ Last updated: 2026-08-15
 
 ## Execution status (2026-08-15)
 
-The first gather/scatter recurrent-prefill adapter and its reusable vLLM
-microbenchmark are implemented on `integrate-flashinfer-kda-prefill`. The
-change is not yet ready to submit upstream because full-model evaluation and
-serving validation remain outstanding.
+The first gather/scatter recurrent-prefill adapter, the FlashInfer fused-decode
+adapter, and reusable vLLM microbenchmarks are implemented on
+`integrate-flashinfer-kda-prefill`. The change is not yet ready to submit
+upstream because matched full-model performance and decode-enabled accuracy
+validation remain outstanding.
 
 - Installed and import-checked `flashinfer-python==0.6.18.dev20260811`,
   `flashinfer-cubin==0.6.18.dev20260811`, and
@@ -26,6 +27,12 @@ serving validation remain outstanding.
   keeps a dedicated FlashInfer prefill workspace per layer.
 - Added focused dtype, selection, SM103/CUDA-version eligibility,
   call-contract, decode-safety, and BF16-recurrence correctness tests.
+- Added `--kda-decode-backend {auto,native,flashinfer,triton}`. The automatic
+  policy preserves native fused decode for the default FP32 state, selects
+  FlashInfer for eligible BF16 state, and retains the Triton fallback.
+- Added FlashInfer fused KDA decode for non-speculative decode on SM100/SM103,
+  including BF16 recurrent state, caller-owned output, padded state slots, and
+  CUDA Graph replay correctness coverage.
 - The focused suite passes on an NVIDIA B300: 24 passed. The real launch used
   the nightly's `flash_kda_bf16_fused_m128_sm100f` specialization for H=12.
 - Added `benchmarks/kernels/benchmark_kimi_k3_kda_prefill.py`, reusing
@@ -120,7 +127,7 @@ Its support predicate does not currently receive the recurrent-state dtype.
 | --- | --- | --- | --- | --- |
 | CAKE recurrent prefill | Yes | BF16 | H=12, D=128 supported | Highest |
 | Indexed/checkpoint CAKE prefill from PR #4445 | Yes | BF16 | Excellent serving contract | Highest after merge |
-| `flashinfer.fused_kda_decode` | Expected to run on SM103; GB300 performance must be measured | BF16 or FP32 | Excellent | Same first milestone or next |
+| `flashinfer.kda_decode.fused_kda_decode` | Yes | BF16 or FP32 | Excellent; measured at H=12 | Integrated |
 | CAKE recurrent/spec decode | Yes | BF16 | Current variants are a partial contract match | Later |
 | Merged packed CuTe T=1 decode from PR #4417 | No; exact SM100/B200 route | BF16 | H=12 supported | Do not use on GB300 |
 
@@ -216,11 +223,11 @@ fallback rather than assuming their presence.
 
 ### Decode safety
 
-- [ ] Add recurrent-state dtype to `is_fused_kda_decode_supported`.
-- [ ] Select the native vLLM fused decoder only for FP32 recurrent state.
-- [ ] Route BF16 state to the existing dtype-generic Triton packed decoder until
-  the FlashInfer fused decoder is enabled.
-- [ ] Add a regression test proving explicit BF16 never calls the FP32-only
+- [x] Add recurrent-state dtype to `is_fused_kda_decode_supported`.
+- [x] Select the native vLLM fused decoder only for FP32 recurrent state.
+- [x] Route BF16 state to FlashInfer when eligible and otherwise to the
+  dtype-generic Triton packed decoder.
+- [x] Add a regression test proving explicit BF16 never calls the FP32-only
   native operation.
 
 ### Memory expectation
@@ -319,18 +326,18 @@ Checkpoint follow-up:
 
 Integrate `flashinfer.fused_kda_decode` after or alongside Phase 2.
 
-- [ ] Add a lazy import through `vllm/utils/flashinfer.py`.
-- [ ] Add an internal decode backend resolver; expose a CLI option only if
+- [x] Add a lazy import through `vllm/utils/flashinfer.py`.
+- [x] Add an internal decode backend resolver; expose a CLI option because
   operational debugging or stable A/B selection requires it.
-- [ ] Enable for non-speculative T=1, D=128, width=4, H in the supported set,
+- [x] Enable for non-speculative T=1, D=128, width=4, H in the supported set,
   BF16 activations, and BF16 or FP32 recurrent state.
-- [ ] Preserve the current native vLLM decoder as the FP32 fallback.
-- [ ] Preserve Triton as the BF16 fallback.
-- [ ] Warm CuTe/JIT work before graph capture.
-- [ ] Verify output, convolution state, and recurrent state after graph replay.
+- [x] Preserve the current native vLLM decoder as the FP32 fallback.
+- [x] Preserve Triton as the BF16 fallback.
+- [x] Warm CuTe/JIT work before graph capture.
+- [x] Verify output, convolution state, and recurrent state after graph replay.
 
-GB300 latency must be measured directly. The existing FlashInfer fused-decode
-performance report is from B200 and is not sufficient evidence for SM103.
+Direct B300 results are recorded below. GB300 should use the same SM103 path,
+but an actual GB300 serving measurement remains required.
 
 ## Phase 5: speculative decode
 
@@ -487,6 +494,35 @@ projection. Its cross-backend diagnostics report approximately 0.44%-0.45%
 output relative L2 and 0.31%-0.34% state relative L2; this is expected because
 FlashInfer rounds BF16 state after every token while Triton accumulates within
 a chunk.
+
+### First B300 fused-decode results (2026-08-15)
+
+Command:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 FLASHINFER_WORKSPACE_BASE=/tmp .venv/bin/python \
+  benchmarks/kernels/benchmark_kimi_k3_kda_decode.py \
+  --tokens 1 8 32 64 128 --heads 12 --layers 69
+```
+
+The benchmark uses one independently allocated state pool per Kimi K3 KDA
+layer and measures CUDA Graph replay only. FlashInfer and the vLLM fallback use
+BF16 recurrent state. The native vLLM fused decoder uses its required FP32
+recurrent state. FlashKDA itself has no decode implementation; therefore the
+FP32 column is labeled native fused decode rather than FlashKDA.
+
+| Tokens/rank | FlashInfer BF16 | Native fused FP32 | vLLM fallback BF16 | FI/native | FI/fallback |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 4.04 us | 6.08 us | 9.76 us | 1.51x | 2.42x |
+| 8 | 4.87 us | 7.30 us | 11.10 us | 1.50x | 2.28x |
+| 32 | 9.89 us | 12.23 us | 16.20 us | 1.24x | 1.64x |
+| 64 | 16.10 us | 23.55 us | 21.90 us | 1.46x | 1.36x |
+| 128 | 27.72 us | 39.60 us | 34.40 us | 1.43x | 1.24x |
+
+FlashInfer BF16 is the fastest of all three paths at every measured graph
+shape. The advantage over the native FP32 decoder is 1.24x-1.51x and over the
+BF16 fallback is 1.24x-2.42x. These are kernel results; TPOT and total serving
+throughput still require matched end-to-end runs.
 
 ### First B300 end-to-end validation (2026-08-15)
 
