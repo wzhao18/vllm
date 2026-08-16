@@ -3,9 +3,10 @@
 """Microbenchmark Kimi K3's KDA prefill backends on NVIDIA Blackwell.
 
 The default cases use Kimi K3's TP8 shape of 12 heads by 128 dimensions.
-FlashInfer is measured through vLLM's adapter, and Triton is measured through
-the fallback used by the model. CUPTI reports the GPU span from the first to
-last kernel in each backend call, with an L2 flush before every iteration.
+FlashInfer and FlashKDA are measured through vLLM's adapters, and Triton is
+measured through the fallback used by the model. CUPTI reports the GPU span
+from the first to last kernel in each backend call, with an L2 flush before
+every iteration.
 
 Example:
     FLASHINFER_WORKSPACE_BASE=/tmp .venv/bin/python \
@@ -25,7 +26,10 @@ from flashinfer.kda_prefill import RecurrentKDAPrefillWorkspace
 from flashinfer.testing import bench_gpu_time
 from flashinfer.utils import get_compute_capability
 
-from vllm.models.kimi_k3.nvidia.kda import _flashinfer_kda_prefill
+from vllm.models.kimi_k3.nvidia.kda import (
+    _flashinfer_kda_prefill,
+    _flashkda_prefill,
+)
 from vllm.models.kimi_k3.nvidia.ops.third_party.kda import (
     chunk_kda_with_fused_gate,
 )
@@ -63,8 +67,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--backends",
         nargs="+",
-        choices=("flashinfer", "triton"),
-        default=("flashinfer", "triton"),
+        choices=("flashinfer", "flashkda", "triton"),
+        default=("flashinfer", "flashkda", "triton"),
     )
     parser.add_argument(
         "--heads",
@@ -166,6 +170,8 @@ def make_inputs(
         "cu_seqlens": cu_seqlens,
         "seq_order": seq_order,
         "flashinfer_output": torch.empty_like(q),
+        "flashkda_output": torch.empty_like(q),
+        "flashkda_final_state": torch.empty_like(initial_state),
     }
 
 
@@ -188,6 +194,12 @@ def measure_backend(
     return statistics.median(samples_us), samples_us
 
 
+def format_metric(value: float | None, width: int, precision: int) -> str:
+    if value is None:
+        value = float("nan")
+    return f"{value:{width}.{precision}f}"
+
+
 def benchmark_case(
     case: Case,
     args: argparse.Namespace,
@@ -206,10 +218,25 @@ def benchmark_case(
     }
 
     flashinfer_state_pool = inputs["state_pool"]
+    flashkda_state_pool = inputs["state_pool"].clone()
     triton_state_pool = inputs["state_pool"].clone()
-    cursors = {"flashinfer": 0, "triton": 0}
+    cursors = {"flashinfer": 0, "flashkda": 0, "triton": 0}
     triton_result: list[torch.Tensor | None] = [None, None]
     flashinfer_workspace = RecurrentKDAPrefillWorkspace(inputs["q"].device)
+    flashkda_workspace = None
+    if "flashkda" in args.backends:
+        import vllm._flashkda_C  # noqa: F401
+
+        workspace_size = torch.ops._flashkda_C.get_workspace_size(
+            inputs["q"].shape[1],
+            args.heads,
+            len(case.seq_lens),
+        )
+        flashkda_workspace = torch.empty(
+            workspace_size,
+            dtype=torch.uint8,
+            device=inputs["q"].device,
+        )
 
     def run_flashinfer() -> None:
         index = cursors["flashinfer"]
@@ -228,6 +255,26 @@ def benchmark_case(
             out=inputs["flashinfer_output"],
             seq_order=inputs["seq_order"],
             prefill_workspace=flashinfer_workspace,
+        )
+
+    def run_flashkda() -> None:
+        assert flashkda_workspace is not None
+        index = cursors["flashkda"]
+        cursors["flashkda"] += 1
+        _flashkda_prefill(
+            q=inputs["q"],
+            k=inputs["k"],
+            v=inputs["v"],
+            g=inputs["raw_g"],
+            beta=inputs["raw_beta"],
+            A_log=inputs["A_log"],
+            dt_bias=inputs["dt_bias"],
+            lower_bound=LOWER_BOUND,
+            initial_state=flashkda_state_pool[index],
+            cu_seqlens=inputs["cu_seqlens"],
+            out=inputs["flashkda_output"],
+            final_state=inputs["flashkda_final_state"],
+            workspace=flashkda_workspace,
         )
 
     def run_triton() -> None:
@@ -249,32 +296,57 @@ def benchmark_case(
         )
         triton_result[:] = output, final_state
 
-    if set(args.backends) == {"flashinfer", "triton"}:
-        run_flashinfer()
+    selected_backends = set(args.backends)
+    if "triton" in selected_backends and selected_backends.intersection(
+        {"flashinfer", "flashkda"}
+    ):
+        if "flashinfer" in selected_backends:
+            run_flashinfer()
+        if "flashkda" in selected_backends:
+            run_flashkda()
         run_triton()
         torch.accelerator.synchronize()
         triton_output, triton_state = triton_result
         assert triton_output is not None and triton_state is not None
-        output_delta = inputs["flashinfer_output"].float() - triton_output.float()
-        state_delta = flashinfer_state_pool[0].float() - triton_state.float()
-        result["triton_comparison"] = {
-            "output_max_abs": output_delta.abs().max().item(),
-            "output_relative_l2": (
-                output_delta.norm() / triton_output.float().norm()
-            ).item(),
-            "state_max_abs": state_delta.abs().max().item(),
-            "state_relative_l2": (
-                state_delta.norm() / triton_state.float().norm()
-            ).item(),
-            "note": (
+
+        def compare_with_triton(
+            output: torch.Tensor,
+            state: torch.Tensor,
+            note: str,
+        ) -> dict[str, float | str]:
+            output_delta = output.float() - triton_output.float()
+            state_delta = state.float() - triton_state.float()
+            return {
+                "output_max_abs": output_delta.abs().max().item(),
+                "output_relative_l2": (
+                    output_delta.norm() / triton_output.float().norm()
+                ).item(),
+                "state_max_abs": state_delta.abs().max().item(),
+                "state_relative_l2": (
+                    state_delta.norm() / triton_state.float().norm()
+                ).item(),
+                "note": note,
+            }
+
+        if "flashinfer" in selected_backends:
+            result["triton_comparison"] = compare_with_triton(
+                inputs["flashinfer_output"],
+                flashinfer_state_pool[0],
                 "Diagnostic only: FlashInfer rounds the recurrent state to BF16 "
-                "after each token, while Triton accumulates within a chunk."
-            ),
-        }
+                "after each token, while Triton accumulates within a chunk.",
+            )
+        if "flashkda" in selected_backends:
+            result["flashkda_triton_comparison"] = compare_with_triton(
+                inputs["flashkda_output"],
+                inputs["flashkda_final_state"],
+                "Diagnostic only: FlashKDA writes a BF16 recurrent state, while "
+                "Triton accumulates within a chunk.",
+            )
 
     timings: dict[str, Any] = {}
     for backend, run, state_pool in (
         ("flashinfer", run_flashinfer, flashinfer_state_pool),
+        ("flashkda", run_flashkda, flashkda_state_pool),
         ("triton", run_triton, triton_state_pool),
     ):
         if backend not in args.backends:
@@ -292,8 +364,18 @@ def benchmark_case(
             "samples_us": samples_us,
         }
     if "flashinfer" in timings and "triton" in timings:
-        timings["speedup"] = (
+        flashinfer_speedup_vs_triton = (
             timings["triton"]["median_us"] / timings["flashinfer"]["median_us"]
+        )
+        timings["speedup"] = flashinfer_speedup_vs_triton
+        timings["flashinfer_speedup_vs_triton"] = flashinfer_speedup_vs_triton
+    if "flashkda" in timings and "triton" in timings:
+        timings["flashkda_speedup_vs_triton"] = (
+            timings["triton"]["median_us"] / timings["flashkda"]["median_us"]
+        )
+    if "flashinfer" in timings and "flashkda" in timings:
+        timings["flashinfer_speedup_vs_flashkda"] = (
+            timings["flashkda"]["median_us"] / timings["flashinfer"]["median_us"]
         )
     result["timings"] = timings
     return result
@@ -330,7 +412,8 @@ def main() -> None:
     )
     print(
         f"{'case':>12} {'tokens':>8} {'seqs':>6} {'FlashInfer us':>14} "
-        f"{'Triton us':>11} {'speedup':>9}"
+        f"{'FlashKDA us':>12} {'Triton us':>11} {'FI/FKDA':>9} "
+        f"{'FI/Triton':>10}"
     )
 
     results = []
@@ -340,13 +423,17 @@ def main() -> None:
         results.append(result)
         timings = result["timings"]
         flashinfer_us = timings.get("flashinfer", {}).get("median_us")
+        flashkda_us = timings.get("flashkda", {}).get("median_us")
         triton_us = timings.get("triton", {}).get("median_us")
-        speedup = timings.get("speedup")
+        flashinfer_vs_flashkda = timings.get("flashinfer_speedup_vs_flashkda")
+        flashinfer_vs_triton = timings.get("flashinfer_speedup_vs_triton")
         print(
             f"{case.name:>12} {sum(case.seq_lens):8d} {len(case.seq_lens):6d} "
-            f"{flashinfer_us if flashinfer_us is not None else float('nan'):14.3f} "
-            f"{triton_us if triton_us is not None else float('nan'):11.3f} "
-            f"{speedup if speedup is not None else float('nan'):8.2f}x"
+            f"{format_metric(flashinfer_us, 14, 3)} "
+            f"{format_metric(flashkda_us, 12, 3)} "
+            f"{format_metric(triton_us, 11, 3)} "
+            f"{format_metric(flashinfer_vs_flashkda, 8, 2)}x "
+            f"{format_metric(flashinfer_vs_triton, 9, 2)}x"
         )
 
     if args.json is not None:
