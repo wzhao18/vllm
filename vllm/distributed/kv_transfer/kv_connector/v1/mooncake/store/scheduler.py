@@ -135,7 +135,7 @@ class MooncakeStoreScheduler:
             vllm_cached_tokens=num_computed_tokens,
             kvpool_cached_tokens=num_external_hit_tokens,
             can_load=False,
-            load_hash_overrides=lookup_result.load_hash_overrides,
+            load_boundaries=lookup_result.load_boundaries,
         )
 
         return need_to_allocate, self.load_async

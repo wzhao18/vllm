@@ -18,8 +18,8 @@ Wire format (REQ/REP over IPC):
                    bytes); the server splits on hash_len
         Response:
           frame 0: hit_count (u32 big-endian, 4 bytes)
-          frame 1: zero or more fixed-size load-hash overrides. Each entry is
-                   group_id (u32), chunk_id (u32), block_hash (hash_len bytes).
+          frame 1: zero or more 12-byte load boundaries. Each entry is
+                   group_id (u32), chunk_id (u32), boundary_tokens (u32).
 
       msg_type == RESET_MSG:
           (no payload frames)
@@ -37,9 +37,9 @@ Mirrors the named-tag convention used by the NIXL connector (see
 from collections.abc import Sequence
 
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+    LoadBoundary,
     MooncakeLookupResult,
 )
-from vllm.v1.core.kv_cache_utils import BlockHash
 
 # Request message-type tags. Frame 0 of every request.
 LOOKUP_MSG: bytes = b"lookup"
@@ -49,31 +49,34 @@ RESET_MSG: bytes = b"reset"
 RESP_OK: bytes = b"\x01"
 RESP_ERR: bytes = b"\x00"
 
+# group_id (u32), chunk_id (u32), boundary_tokens (u32).
+LOAD_BOUNDARY_ENTRY_SIZE: int = 12
+
 
 def encode_lookup_response(result: MooncakeLookupResult) -> tuple[bytes, bytes]:
     payload = bytearray()
-    for group_id, chunk_id, block_hash in result.load_hash_overrides:
-        payload.extend(group_id.to_bytes(4, "big"))
-        payload.extend(chunk_id.to_bytes(4, "big"))
-        payload.extend(block_hash)
+    for boundary in result.load_boundaries:
+        payload.extend(boundary.group_id.to_bytes(4, "big"))
+        payload.extend(boundary.chunk_id.to_bytes(4, "big"))
+        payload.extend(boundary.num_tokens.to_bytes(4, "big"))
     return result.hit_length.to_bytes(4, "big"), bytes(payload)
 
 
-def decode_lookup_response(
-    frames: Sequence[bytes], hash_len: int
-) -> MooncakeLookupResult:
+def decode_lookup_response(frames: Sequence[bytes]) -> MooncakeLookupResult:
     hit_length = int.from_bytes(frames[0], "big")
     if len(frames) == 1 or not frames[1]:
         return MooncakeLookupResult(hit_length)
 
     payload = frames[1]
-    entry_size = 8 + hash_len
-    if hash_len == 0 or len(payload) % entry_size != 0:
+    if len(payload) % LOAD_BOUNDARY_ENTRY_SIZE != 0:
         raise ValueError("Invalid Mooncake lookup response")
-    overrides = []
-    for offset in range(0, len(payload), entry_size):
-        group_id = int.from_bytes(payload[offset : offset + 4], "big")
-        chunk_id = int.from_bytes(payload[offset + 4 : offset + 8], "big")
-        block_hash = BlockHash(payload[offset + 8 : offset + entry_size])
-        overrides.append((group_id, chunk_id, block_hash))
-    return MooncakeLookupResult(hit_length, tuple(overrides))
+    boundaries = []
+    for offset in range(0, len(payload), LOAD_BOUNDARY_ENTRY_SIZE):
+        boundaries.append(
+            LoadBoundary(
+                group_id=int.from_bytes(payload[offset : offset + 4], "big"),
+                chunk_id=int.from_bytes(payload[offset + 4 : offset + 8], "big"),
+                num_tokens=int.from_bytes(payload[offset + 8 : offset + 12], "big"),
+            )
+        )
+    return MooncakeLookupResult(hit_length, tuple(boundaries))

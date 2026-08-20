@@ -27,6 +27,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
     BlobBlockHashes,
     ChunkedTokenDatabase,
     KeyMetadata,
+    LoadBoundary,
     LoadSpec,
     PoolKey,
     ReqMeta,
@@ -143,7 +144,7 @@ def _make_load_req(
     *,
     token_len: int,
     vllm_cached_tokens: int = 0,
-    load_hash_overrides: tuple[tuple[int, int, BlockHash], ...] = (),
+    load_boundaries: tuple[LoadBoundary, ...] = (),
 ) -> ReqMeta:
     return ReqMeta(
         req_id=req_id,
@@ -155,7 +156,7 @@ def _make_load_req(
             kvpool_cached_tokens=token_len,
             can_load=True,
             token_len=token_len,
-            load_hash_overrides=load_hash_overrides,
+            load_boundaries=load_boundaries,
         ),
     )
 
@@ -1346,16 +1347,18 @@ def test_recv_thread_uses_single_batch_when_no_disk_offload_budget(monkeypatch):
     store.batch_get_replica_desc.assert_not_called()
 
 
-def test_recv_thread_uses_lookup_selected_hash_override():
+def test_recv_thread_keys_chunk_by_lookup_selected_boundary():
     store = MagicMock()
     store.batch_get_into_multi_buffers.return_value = [256, 256]
     thread = _make_store_recving_thread(store)
 
+    # 32-token hit over 16-token chunks: chunk 1 would default to the hash at
+    # the 32-token boundary (a1); the lookup matched the 48-token one (a2).
     req = _make_load_req(
         "req-a",
-        [b"a0", b"a1"],
+        [b"a0", b"a1", b"a2"],
         token_len=32,
-        load_hash_overrides=((0, 1, BlockHash(b"proof")),),
+        load_boundaries=(LoadBoundary(group_id=0, chunk_id=1, num_tokens=48),),
     )
 
     thread._handle_request(req)
@@ -1363,7 +1366,7 @@ def test_recv_thread_uses_lookup_selected_hash_override():
     keys = store.batch_get_into_multi_buffers.call_args.args[0]
     assert keys == [
         "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6130",
-        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@70726f6f66",
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6132",
     ]
 
 
@@ -2621,7 +2624,7 @@ def test_lookup_full_hit_with_eagle_pops_once_not_twice():
     assert worker.store.batch_is_exist.call_count == 1
 
 
-def test_lookup_plan_preserves_fine_grained_eagle_proof_hash():
+def test_lookup_plan_preserves_fine_grained_eagle_proof_boundary():
     from vllm.v1.kv_cache_interface import (
         FullAttentionSpec,
         KVCacheGroupSpec,
@@ -2678,8 +2681,13 @@ def test_lookup_plan_preserves_fine_grained_eagle_proof_hash():
 
     result = worker.lookup_with_load_plan(25, hashes)
 
+    # The eagle drop trims the hit to 20 tokens, but the block that survives
+    # truncation is the one keyed at the 24-token boundary (hashes[5]), which
+    # the load path cannot derive from hit_length.
     assert result.hit_length == 20
-    assert result.load_hash_overrides == ((0, 1, hashes[5]),)
+    assert result.load_boundaries == (
+        LoadBoundary(group_id=0, chunk_id=1, num_tokens=24),
+    )
 
 
 def test_lookup_full_hit_swa_degrades_when_no_stored_boundary_is_usable():

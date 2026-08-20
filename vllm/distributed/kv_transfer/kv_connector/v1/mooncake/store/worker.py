@@ -45,6 +45,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  
     BlobBlockHashes,
     ChunkedTokenDatabase,
     KeyMetadata,
+    LoadBoundary,
     MooncakeLookupResult,
     MooncakeStoreConnectorMetadata,
     PoolKey,
@@ -1053,10 +1054,12 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         # Skip chunks the consumer's per-group spec wouldn't populate
         # locally (e.g. SWA pre-window) even if the producer stored them.
         load_mask_per_group = self.coord.load_mask(req_meta.block_hashes, token_len)
-        load_hash_overrides = {
-            (group_id, chunk_id): block_hash
-            for group_id, chunk_id, block_hash in (
-                req_meta.load_spec.load_hash_overrides  # type: ignore[union-attr]
+        # Chunks whose stored object is keyed at a boundary other than the one
+        # process_tokens derives from token_len (see LoadBoundary).
+        load_boundaries = {
+            (boundary.group_id, boundary.chunk_id): boundary.num_tokens
+            for boundary in (
+                req_meta.load_spec.load_boundaries  # type: ignore[union-attr]
             )
         }
 
@@ -1073,7 +1076,11 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 chunk_idx = start // db.block_size
                 if chunk_idx >= len(mask) or not mask[chunk_idx]:
                     continue
-                block_hash = load_hash_overrides.get((g_idx, chunk_idx), block_hash)
+                num_tokens = load_boundaries.get((g_idx, chunk_idx))
+                if num_tokens is not None:
+                    block_hash = req_meta.block_hashes[
+                        num_tokens // db.hash_block_size - 1
+                    ]
                 key_list.append(db.key_for(block_hash))
                 chunks.append((start, end))
             g_addrs, g_sizes, g_block_ids = db.prepare_values(
@@ -1789,6 +1796,10 @@ class MooncakeStoreWorker:
         # candidate_meta stores the (group, hash_bytes) for key slice.
         candidate_keys: list[str] = []
         candidate_meta: list[tuple[int, bytes]] = []
+        # Prefix length each probed hash stands for. Hashes are chained over the
+        # whole prefix, so this is a property of the hash alone and agrees across
+        # groups regardless of their block sizes.
+        boundary_by_hash: dict[bytes, int] = {}
         fine_grained = self.coord.enable_partial_hash_hits
         lookup_masks = None if fine_grained else self.coord.lookup_mask(token_len)
         for g_idx, db in enumerate(self.token_dbs):
@@ -1814,6 +1825,7 @@ class MooncakeStoreWorker:
                     for chunk_id in range(mask_limit)
                     if lookup_mask is None or lookup_mask[chunk_id]
                 ]
+            unit_tokens = self.hash_block_size if fine_grained else spec_block_size
             for chunk_id in unit_ids:
                 h = group_hashes[chunk_id]
                 hash_hex = h.hex()
@@ -1822,6 +1834,7 @@ class MooncakeStoreWorker:
                         PoolKey.build_key_string(key_prefix, hash_hex)
                     )
                 candidate_meta.append((g_idx, bytes(h)))
+                boundary_by_hash[bytes(h)] = (chunk_id + 1) * unit_tokens
 
         if not candidate_keys:
             return MooncakeLookupResult(0)
@@ -1874,21 +1887,23 @@ class MooncakeStoreWorker:
                 usable_length,
                 cached_block_pool,
             )
-        overrides = []
+        # The matcher may select a block keyed at a boundary past the converged
+        # hit (fine-grained tail, eagle drop, or another group capping the hit),
+        # which the load path cannot derive from hit_length alone.
+        load_boundaries = []
         for group_id, (db, blocks) in enumerate(
             zip(self.token_dbs, hit_blocks, strict=True)
         ):
             for chunk_id, block in enumerate(blocks):
-                if block.is_null or block.block_hash is None:
+                if block.block_hash is None:
                     continue
-                end = min((chunk_id + 1) * db.block_size, hit_length)
-                if end <= 0:
-                    continue
-                default_hash = block_hashes[end // self.hash_block_size - 1]
-                selected_hash = get_block_hash(block.block_hash)
-                if selected_hash != default_hash:
-                    overrides.append((group_id, chunk_id, selected_hash))
-        return MooncakeLookupResult(hit_length, tuple(overrides))
+                default_end = min((chunk_id + 1) * db.block_size, hit_length)
+                selected_hash = bytes(get_block_hash(block.block_hash))
+                num_tokens = boundary_by_hash[selected_hash]
+                if num_tokens != default_end:
+                    boundary = LoadBoundary(group_id, chunk_id, num_tokens)
+                    load_boundaries.append(boundary)
+        return MooncakeLookupResult(hit_length, tuple(load_boundaries))
 
     def lookup(self, num_tokens: int, block_hashes: Sequence[BlockHash]) -> int:
         return self.lookup_with_load_plan(num_tokens, block_hashes).hit_length
@@ -2037,7 +2052,7 @@ class LookupKeyClient:
         )
         self.socket.send_multipart(all_frames, copy=False)
         resp = self.socket.recv_multipart()
-        return decode_lookup_response(resp, hash_len)
+        return decode_lookup_response(resp)
 
     def lookup(
         self,

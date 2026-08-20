@@ -21,13 +21,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import (
     worker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+    LoadBoundary,
     MooncakeLookupResult,
     MooncakeStoreConnectorMetadata,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.metrics import (
     MooncakeStoreConnectorStats,
 )
-from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -591,13 +591,13 @@ def test_get_num_new_matched_tokens_async_defers_then_reports():
 
     # Lookup ready with a hit -> report need_to_allocate + async-load flag.
     hit = 3 * block_size
-    override = (0, 2, BlockHash(b"proof"))
-    mock_client.lookup.return_value = MooncakeLookupResult(hit, (override,))
+    boundary = LoadBoundary(group_id=0, chunk_id=2, num_tokens=4 * block_size)
+    mock_client.lookup.return_value = MooncakeLookupResult(hit, (boundary,))
     need, load_async = sched.get_num_new_matched_tokens(request, 0)
     assert need == hit
     assert load_async == sched.load_async
     assert sched.load_specs["r1"].kvpool_cached_tokens == hit
-    assert sched.load_specs["r1"].load_hash_overrides == (override,)
+    assert sched.load_specs["r1"].load_boundaries == (boundary,)
 
 
 def test_protocol_tags_are_distinct_and_non_empty():
@@ -610,15 +610,13 @@ def test_protocol_tags_are_distinct_and_non_empty():
     assert protocol.RESP_OK != protocol.RESP_ERR
 
 
-def test_lookup_response_round_trips_hash_overrides():
+def test_lookup_response_round_trips_load_boundaries():
     result = MooncakeLookupResult(
         hit_length=20,
-        load_hash_overrides=((3, 7, BlockHash(b"hash")),),
+        load_boundaries=(LoadBoundary(group_id=3, chunk_id=7, num_tokens=24),),
     )
 
-    decoded = protocol.decode_lookup_response(
-        protocol.encode_lookup_response(result), hash_len=4
-    )
+    decoded = protocol.decode_lookup_response(protocol.encode_lookup_response(result))
 
     assert decoded == result
 

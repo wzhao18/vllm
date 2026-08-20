@@ -299,12 +299,34 @@ class ChunkedTokenDatabase:
             yield start_idx, end_idx, h
 
 
+@dataclass(frozen=True)
+class LoadBoundary:
+    """A chunk whose stored object is keyed at a non-default boundary.
+
+    The load path keys each chunk by the hash at ``min(chunk end, hit_length)``.
+    The lookup may match a block keyed further along (a fine-grained tail, an
+    eagle drop, or another group capping the hit), in which case it names the
+    boundary here. The key itself is not carried: the load path holds the same
+    ``block_hashes`` list and recovers it as
+    ``block_hashes[num_tokens // hash_block_size - 1]``.
+    """
+
+    group_id: int
+    chunk_id: int
+    # Prefix length, in tokens, that the matched key stands for.
+    num_tokens: int
+
+
 @dataclass
 class MooncakeLookupResult:
-    """External hit length and non-default hashes selected for loading."""
+    """External hit length plus the boundaries the lookup actually matched.
+
+    ``load_boundaries`` is empty in the common case, meaning every
+    default-derived key is correct.
+    """
 
     hit_length: int
-    load_hash_overrides: tuple[tuple[int, int, BlockHash], ...] = ()
+    load_boundaries: tuple[LoadBoundary, ...] = ()
 
 
 @dataclass
@@ -315,7 +337,7 @@ class LoadSpec:
     kvpool_cached_tokens: int
     can_load: bool
     token_len: int = 0
-    load_hash_overrides: tuple[tuple[int, int, BlockHash], ...] = ()
+    load_boundaries: tuple[LoadBoundary, ...] = ()
 
 
 @dataclass
