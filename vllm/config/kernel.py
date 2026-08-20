@@ -125,6 +125,7 @@ MoEBackend = Literal[
     "batched_triton",
     "deep_gemm",
     "deep_gemm_mega_moe",
+    "flashinfer_cutedsl_mega_moe",
     "cutlass",
     "flashinfer_trtllm",
     "flashinfer_cutlass",
@@ -199,6 +200,7 @@ class KernelConfig:
       activation format ([E_local, max_num_tokens, K])
     - "deep_gemm": Use DeepGEMM kernels (FP8 block-quantized only)
     - "deep_gemm_mega_moe": Use DeepGEMM mega MoE kernels
+    - "flashinfer_cutedsl_mega_moe": Use FlashInfer CuTeDSL mega MoE kernels
     - "cutlass": Use vLLM CUTLASS kernels
     - "flashinfer_trtllm": Use FlashInfer with TRTLLM-GEN kernels
     - "flashinfer_cutlass": Use FlashInfer with CUTLASS kernels

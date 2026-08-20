@@ -87,6 +87,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.model_executor.models.vision import is_vit_use_data_parallel
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
@@ -115,7 +116,7 @@ from vllm.transformers_utils.configs.kimi_k3 import KimiK3Config
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.utils.math_utils import cdiv
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
-from vllm.utils.torch_utils import aux_stream
+from vllm.utils.torch_utils import aux_stream, current_stream
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 from ..common.mm_preprocess import (
@@ -133,6 +134,14 @@ logger = init_logger(__name__)
 # so it falls back to sequential.
 _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD = 256
 
+_KIMI_MEGA_MOE_BACKENDS = frozenset(
+    {"deep_gemm_mega_moe", "flashinfer_cutedsl_mega_moe"}
+)
+
+
+def is_kimi_mega_moe_backend(moe_backend: str) -> bool:
+    return moe_backend in _KIMI_MEGA_MOE_BACKENDS
+
 
 def shard_sequence_parallel_mlp(
     hidden_size: int,
@@ -142,8 +151,8 @@ def shard_sequence_parallel_mlp(
 ) -> bool:
     """Whether to TP-shard a sequence-parallel MLP instead of replicating it.
 
-    Opt-in via ``VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT``; see :class:`KimiMLP` for
-    the trade-off and :mod:`vllm.envs` for when it is worth enabling.
+    Opt in via ``VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT``; see :class:`KimiMLP`
+    for the trade-off and :mod:`vllm.envs` for when it is worth enabling.
     """
     enabled = envs.VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT
     if not (use_sequence_parallel and eligible and enabled):
@@ -520,14 +529,291 @@ class KimiK3MegaMoEExperts(DeepseekV4MegaMoEExperts):
         return y
 
 
+class KimiK3FlashInferMegaMoEExperts(KimiK3MegaMoEExperts):
+    """Kimi K3 adapter for the FlashInfer NVFP4 CuTeDSL MegaMoE kernel."""
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        *args,
+        **kwargs,
+    ) -> None:
+        super().__init__(vllm_config, *args, **kwargs)
+        self._dummy_weights = vllm_config.load_config.load_format == "dummy"
+        if vllm_config.parallel_config.enable_eplb:
+            raise NotImplementedError(
+                "FlashInfer CuTeDSL MegaMoE does not support vLLM EPLB."
+            )
+
+        parallel_config = vllm_config.parallel_config
+        uses_sequence_parallel = (
+            parallel_config.pipeline_parallel_size == 1
+            and parallel_config.enable_expert_parallel
+            and parallel_config.tensor_parallel_size > 1
+        )
+        if uses_sequence_parallel:
+            self.max_num_tokens = cdiv(
+                self.max_num_tokens,
+                parallel_config.tensor_parallel_size,
+            )
+
+        weight_attrs = {"weight_loader": self.weight_loader}
+        self.w13_weight_scale = nn.Parameter(
+            torch.empty(
+                self.num_local_experts,
+                2 * self.intermediate_size,
+                self.hidden_size // 16,
+                dtype=torch.float8_e4m3fn,
+            ),
+            requires_grad=False,
+        )
+        set_weight_attrs(self.w13_weight_scale, weight_attrs)
+        self.w13_weight_scale.quant_method = "block"
+        self.w2_weight_scale = nn.Parameter(
+            torch.empty(
+                self.num_local_experts,
+                self.hidden_size,
+                self.intermediate_size // 16,
+                dtype=torch.float8_e4m3fn,
+            ),
+            requires_grad=False,
+        )
+        set_weight_attrs(self.w2_weight_scale, weight_attrs)
+        self.w2_weight_scale.quant_method = "block"
+
+        self.w13_weight_scale_2 = nn.Parameter(
+            torch.empty(self.num_local_experts, 2, dtype=torch.float32),
+            requires_grad=False,
+        )
+        set_weight_attrs(self.w13_weight_scale_2, weight_attrs)
+        self.w2_weight_scale_2 = nn.Parameter(
+            torch.empty(self.num_local_experts, dtype=torch.float32),
+            requires_grad=False,
+        )
+        set_weight_attrs(self.w2_weight_scale_2, weight_attrs)
+        self.w13_input_scale = nn.Parameter(
+            torch.empty(self.num_local_experts, 2, dtype=torch.float32),
+            requires_grad=False,
+        )
+        set_weight_attrs(self.w13_input_scale, weight_attrs)
+        self.w2_input_scale = nn.Parameter(
+            torch.empty(self.num_local_experts, dtype=torch.float32),
+            requires_grad=False,
+        )
+        set_weight_attrs(self.w2_input_scale, weight_attrs)
+        self.register_buffer("_flashinfer_fc1_alpha", None, persistent=False)
+        self.register_buffer("_flashinfer_fc2_alpha", None, persistent=False)
+        self.register_buffer("_flashinfer_fc1_norm_const", None, persistent=False)
+        self._flashinfer_layer: nn.Module | None = None
+
+    def weight_loader(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+        expert_id: int,
+        return_success: bool = False,
+    ) -> bool | None:
+        if "w13_weight_scale_2" not in weight_name and "w13_input_scale" not in (
+            weight_name
+        ):
+            return super().weight_loader(
+                param,
+                loaded_weight,
+                weight_name,
+                shard_id,
+                expert_id,
+                return_success,
+            )
+
+        if shard_id not in ("w1", "w3"):
+            raise ValueError(f"Unsupported FC1 metadata shard id: {shard_id}")
+        local_expert_ids = self._map_global_expert_id(expert_id)
+        shard_index = 0 if shard_id == "w1" else 1
+        for local_expert_id in local_expert_ids:
+            param.data[local_expert_id, shard_index].copy_(loaded_weight)
+        if return_success:
+            return bool(local_expert_ids)
+        return None
+
+    def _check_runtime_supported(self) -> None:
+        device = self.w13_weight.device
+        if torch.cuda.get_device_capability(device)[0] != 10:
+            raise NotImplementedError(
+                "FlashInfer CuTeDSL MegaMoE requires SM100-family GPUs."
+            )
+        if self.hidden_size % 64 != 0 or self.intermediate_size % 64 != 0:
+            raise ValueError(
+                "FlashInfer CuTeDSL MegaMoE requires hidden and intermediate "
+                "sizes to be multiples of 64."
+            )
+
+    def finalize_weights(self) -> None:
+        if self._flashinfer_layer is not None:
+            return
+        self._check_runtime_supported()
+        if self._dummy_weights:
+            self.w13_weight_scale_2[:, 1].copy_(self.w13_weight_scale_2[:, 0])
+        if not torch.equal(
+            self.w13_weight_scale_2[:, 0], self.w13_weight_scale_2[:, 1]
+        ):
+            raise ValueError(
+                "FlashInfer CuTeDSL MegaMoE requires identical gate and up "
+                "projection global scales for each expert."
+            )
+
+        try:
+            from flashinfer.moe_ep import (
+                BootstrapConfig,
+                FleetParams,
+                MegaConfig,
+                MoEEpLayer,
+                MoEWeightPack,
+                Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+            )
+        except ImportError as exc:
+            raise RuntimeError(
+                "FlashInfer CuTeDSL MegaMoE with SiTU support is unavailable."
+            ) from exc
+
+        ep_group = get_ep_group()
+        a13_scale = self.w13_input_scale.max().to(torch.float32)
+        a2_scale = self.w2_input_scale.max().to(torch.float32)
+        if ep_group.world_size > 1:
+            torch.distributed.all_reduce(
+                a13_scale,
+                op=torch.distributed.ReduceOp.MAX,
+                group=ep_group.device_group,
+            )
+            torch.distributed.all_reduce(
+                a2_scale,
+                op=torch.distributed.ReduceOp.MAX,
+                group=ep_group.device_group,
+            )
+
+        fc1_alpha = (
+            self.w13_weight_scale_2[:, 0].to(torch.float32) * a13_scale
+        ).contiguous()
+        fc2_alpha = (self.w2_weight_scale_2.to(torch.float32) * a2_scale).contiguous()
+        fc1_norm_const = (torch.ones_like(fc1_alpha) / a2_scale).contiguous()
+
+        kernel_config = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=self.intermediate_size,
+            top_k=self.top_k,
+            activation=self.activation,
+            situ_beta=self.activation_beta,
+            situ_linear_beta=self.activation_linear_beta,
+            input_norm_const=float((1.0 / a13_scale).item()),
+        )
+        bootstrap = BootstrapConfig(
+            world_size=ep_group.world_size,
+            rank=ep_group.rank_in_group,
+            stream=current_stream().cuda_stream,
+            process_group=ep_group.device_group,
+            device=torch.accelerator.current_device_index(),
+        )
+        fleet_params = FleetParams(
+            num_experts=self.num_experts,
+            max_tokens_per_rank=self.max_num_tokens,
+            token_hidden_size=self.hidden_size,
+        )
+        weights = MoEWeightPack(
+            w13=self.w13_weight.data,
+            w2=self.w2_weight.data,
+            w13_scale=self.w13_weight_scale.data,
+            w2_scale=self.w2_weight_scale.data,
+        )
+        self._flashinfer_layer = MoEEpLayer(
+            bootstrap,
+            fleet_params,
+            weights,
+            backend=MegaConfig(megakernel=kernel_config),
+        )
+        self._flashinfer_fc1_alpha = fc1_alpha
+        self._flashinfer_fc2_alpha = fc2_alpha
+        self._flashinfer_fc1_norm_const = fc1_norm_const
+
+        self.w13_weight = None
+        self.w13_weight_scale = None
+        self.w13_weight_scale_2 = None
+        self.w13_input_scale = None
+        self.w2_weight = None
+        self.w2_weight_scale = None
+        self.w2_weight_scale_2 = None
+        self.w2_input_scale = None
+
+    def get_expert_weights(self) -> list[torch.Tensor]:
+        raise NotImplementedError(
+            "FlashInfer CuTeDSL MegaMoE does not support vLLM EPLB."
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        *,
+        activation_clamp: float | None,
+        fast_math: bool = True,
+    ) -> torch.Tensor:
+        del fast_math
+        if activation_clamp is not None:
+            raise ValueError("SITU does not support activation_clamp.")
+        self.synchronize_first_launch()
+        if hidden_states.shape[0] > self.max_num_tokens:
+            raise ValueError(
+                f"Kimi K3 MegaMoE got {hidden_states.shape[0]} tokens, "
+                f"but its symmetric buffer supports {self.max_num_tokens}."
+            )
+
+        is_padding = None
+        if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
+            is_padding = get_forward_context().is_padding
+            if is_padding is not None:
+                is_padding = is_padding[: hidden_states.shape[0]]
+                topk_ids = torch.where(is_padding.unsqueeze(1), -1, topk_ids)
+        if self.capture_fn is not None:
+            self.capture_fn(topk_ids)
+
+        self.finalize_weights()
+        assert self._flashinfer_layer is not None
+        assert self._flashinfer_fc1_alpha is not None
+        assert self._flashinfer_fc2_alpha is not None
+        assert self._flashinfer_fc1_norm_const is not None
+        from flashinfer.moe_ep import MoEEpTensors
+
+        return self._flashinfer_layer(
+            MoEEpTensors(
+                hidden_states=hidden_states,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                fc1_alpha=self._flashinfer_fc1_alpha,
+                fc2_alpha=self._flashinfer_fc2_alpha,
+                fc1_norm_const=self._flashinfer_fc1_norm_const,
+            )
+        )
+
+
+KimiK3FlashInferMegaMoEExperts.weight_loader.supports_moe_loading = True  # type: ignore[attr-defined]
+
+
 def make_kimi_k3_mega_moe_expert_params_mapping(
     num_experts: int,
+    *,
+    include_nvfp4_metadata: bool = False,
 ) -> list[tuple[str, str, int, str]]:
     mapping = []
+    if include_nvfp4_metadata:
+        # ModelOpt NVFP4 checkpoints store packed bytes under ``.weight``.
+        # Keep that generic suffix last so it cannot match scale metadata.
+        suffixes = ["weight_scale_2", "input_scale", "weight_scale", "weight"]
+    else:
+        suffixes = ["weight_packed", "weight_scale"]
     for expert_id in range(num_experts):
         for shard_id in ("w1", "w2", "w3"):
             param_prefix = "w13" if shard_id in ("w1", "w3") else "w2"
-            for suffix in ("weight_packed", "weight_scale"):
+            for suffix in suffixes:
                 param_suffix = "weight" if suffix == "weight_packed" else suffix
                 mapping.append(
                     (
@@ -577,9 +863,21 @@ class KimiMoE(nn.Module):
         self.moe_router_activation_func = config.moe_router_activation_func
         self.num_shared_experts = config.num_shared_experts
         self.layer_idx = layer_idx
-        self.use_mega_moe = (
-            vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
-        )
+        moe_backend = vllm_config.kernel_config.moe_backend
+        self.use_mega_moe = is_kimi_mega_moe_backend(moe_backend)
+        self.use_flashinfer_mega_moe = moe_backend == "flashinfer_cutedsl_mega_moe"
+        if self.use_flashinfer_mega_moe:
+            resolve_quant_algo = getattr(quant_config, "_resolve_quant_algo", None)
+            quant_algo = (
+                resolve_quant_algo(f"{prefix}.experts")
+                if resolve_quant_algo is not None
+                else getattr(quant_config, "quant_method", None)
+            )
+            if quant_algo != "NVFP4":
+                raise ValueError(
+                    "FlashInfer CuTeDSL MegaMoE requires a serialized ModelOpt "
+                    f"NVFP4 expert checkpoint, got {quant_algo!r}."
+                )
         if self.use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:
             raise NotImplementedError(
                 "Kimi K3 MegaMoE requires expert parallel. Enable it with "
@@ -700,7 +998,12 @@ class KimiMoE(nn.Module):
                     f"EP size {ep_size}."
                 )
             num_local_experts = num_experts // ep_size
-            self.experts = KimiK3MegaMoEExperts(
+            experts_cls = (
+                KimiK3FlashInferMegaMoEExperts
+                if self.use_flashinfer_mega_moe
+                else KimiK3MegaMoEExperts
+            )
+            self.experts = experts_cls(
                 vllm_config,
                 num_experts=num_experts,
                 num_local_experts=num_local_experts,
@@ -878,7 +1181,7 @@ class KimiDecoderLayer(nn.Module):
             and layer_idx % config.moe_layer_freq == 0
         )
 
-        use_mega_moe = vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+        use_mega_moe = is_kimi_mega_moe_backend(vllm_config.kernel_config.moe_backend)
         self.use_sequence_parallel = (
             parallel_config.pipeline_parallel_size == 1
             and parallel_config.enable_expert_parallel
@@ -1130,7 +1433,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         self.attn_res_block_size: int | None = config.attn_res_block_size
         self.use_attn_res = self.attn_res_block_size is not None
         parallel_config = vllm_config.parallel_config
-        use_mega_moe = vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+        use_mega_moe = is_kimi_mega_moe_backend(vllm_config.kernel_config.moe_backend)
         self.use_sequence_parallel = (
             parallel_config.pipeline_parallel_size == 1
             and parallel_config.enable_expert_parallel
@@ -1469,9 +1772,15 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             for module in self.modules()
             if isinstance(module, KimiMoE)
         )
+        use_flashinfer_mega_moe = any(
+            module.use_flashinfer_mega_moe
+            for module in self.modules()
+            if isinstance(module, KimiMoE)
+        )
         if self.config.is_moe and use_mega_moe:
             expert_params_mapping = make_kimi_k3_mega_moe_expert_params_mapping(
-                self.config.num_experts
+                self.config.num_experts,
+                include_nvfp4_metadata=use_flashinfer_mega_moe,
             )
         elif self.config.is_moe:
             # Params for weights, fp8 weight scales, fp8 activation scales
@@ -1705,11 +2014,13 @@ class KimiLinearForCausalLM(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         loaded = loader.load_weights(weights)
-        self.model.finalize_mega_moe_weights()
         # The fused MultiHeadLatentAttention's process_weights_after_loading
         # (W_UK_T / W_UV absorption) is driven by the loader's generic post-load
         # hook for any AttentionLayerBase, so no manual trigger is needed here.
         return loaded
+
+    def process_weights_after_loading(self) -> None:
+        self.model.finalize_mega_moe_weights()
 
 
 def get_spec_layer_idx_from_weight_name(
@@ -2154,3 +2465,6 @@ class KimiK3ForConditionalGeneration(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+    def process_weights_after_loading(self) -> None:
+        self.language_model.process_weights_after_loading()
