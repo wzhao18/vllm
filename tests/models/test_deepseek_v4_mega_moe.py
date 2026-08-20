@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -163,6 +164,255 @@ def test_deepseek_v4_mega_moe_weight_loader_uses_ep_expert_ownership():
     assert torch.equal(experts.w13_weight[0, 128:], w3)
     assert torch.equal(experts.w2_weight[0], w2)
     assert torch.count_nonzero(experts.w13_weight[1]) == 0
+
+
+def _kimi_flashinfer_test_config(
+    *, max_num_batched_tokens: int = 64, tensor_parallel_size: int = 1
+):
+    return SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=max_num_batched_tokens),
+        compilation_config=SimpleNamespace(static_forward_context={}),
+        parallel_config=SimpleNamespace(
+            enable_eplb=False,
+            enable_expert_parallel=True,
+            pipeline_parallel_size=1,
+            tensor_parallel_size=tensor_parallel_size,
+        ),
+    )
+
+
+def test_kimi_flashinfer_mega_moe_mapping_includes_nvfp4_metadata():
+    from vllm.models.kimi_k3.nvidia.model import (
+        make_kimi_k3_mega_moe_expert_params_mapping,
+    )
+
+    mapping = make_kimi_k3_mega_moe_expert_params_mapping(
+        1, include_nvfp4_metadata=True
+    )
+
+    assert [entry[1].rsplit(".", 1)[-1] for entry in mapping[:4]] == [
+        "weight_scale_2",
+        "input_scale",
+        "weight_scale",
+        "weight",
+    ]
+    assert (
+        "experts.w13_weight",
+        "experts.0.w1.weight",
+        0,
+        "w1",
+    ) in mapping
+    assert (
+        "experts.w13_weight_scale_2",
+        "experts.0.w1.weight_scale_2",
+        0,
+        "w1",
+    ) in mapping
+    assert (
+        "experts.w13_input_scale",
+        "experts.0.w3.input_scale",
+        0,
+        "w3",
+    ) in mapping
+    assert (
+        "experts.w2_weight_scale_2",
+        "experts.0.w2.weight_scale_2",
+        0,
+        "w2",
+    ) in mapping
+
+    expected_destinations = {
+        "weight": "experts.w13_weight",
+        "weight_scale": "experts.w13_weight_scale",
+        "weight_scale_2": "experts.w13_weight_scale_2",
+        "input_scale": "experts.w13_input_scale",
+    }
+    for checkpoint_suffix, destination in expected_destinations.items():
+        checkpoint_name = f"layers.1.mlp.experts.0.w1.{checkpoint_suffix}"
+        matched = next(entry for entry in mapping if entry[1] in checkpoint_name)
+        assert matched[0] == destination
+
+
+def test_kimi_flashinfer_mega_moe_loader_preserves_nvfp4_metadata():
+    from vllm.models.kimi_k3.nvidia.model import KimiK3FlashInferMegaMoEExperts
+
+    experts = KimiK3FlashInferMegaMoEExperts(
+        _kimi_flashinfer_test_config(),
+        num_experts=4,
+        num_local_experts=2,
+        experts_start_idx=2,
+        top_k=2,
+        hidden_size=128,
+        intermediate_size=128,
+        activation="situ",
+        activation_beta=4.0,
+        activation_linear_beta=25.0,
+    )
+
+    assert experts.w13_weight_scale.shape == (2, 256, 8)
+    assert experts.w2_weight_scale.shape == (2, 128, 8)
+    assert experts.w13_weight_scale.dtype == torch.float8_e4m3fn
+    assert experts.w2_weight_scale.dtype == torch.float8_e4m3fn
+
+    for parameter, name, shard, value in (
+        (experts.w13_weight_scale_2, "w13_weight_scale_2", "w1", 3.0),
+        (experts.w13_weight_scale_2, "w13_weight_scale_2", "w3", 7.0),
+        (experts.w13_input_scale, "w13_input_scale", "w1", 11.0),
+        (experts.w13_input_scale, "w13_input_scale", "w3", 13.0),
+        (experts.w2_weight_scale_2, "w2_weight_scale_2", "w2", 17.0),
+        (experts.w2_input_scale, "w2_input_scale", "w2", 19.0),
+    ):
+        assert experts.weight_loader(
+            parameter,
+            torch.tensor(value),
+            name,
+            shard_id=shard,
+            expert_id=2,
+            return_success=True,
+        )
+
+    assert torch.equal(experts.w13_weight_scale_2[0], torch.tensor([3.0, 7.0]))
+    assert torch.equal(experts.w13_input_scale[0], torch.tensor([11.0, 13.0]))
+    assert experts.w2_weight_scale_2[0].item() == 17.0
+    assert experts.w2_input_scale[0].item() == 19.0
+
+
+def test_kimi_flashinfer_mega_moe_builds_modelopt_scale_algebra(monkeypatch):
+    import flashinfer.moe_ep as moe_ep
+
+    from vllm.models.kimi_k3.nvidia import model as kimi_model
+
+    experts = kimi_model.KimiK3FlashInferMegaMoEExperts(
+        _kimi_flashinfer_test_config(),
+        num_experts=2,
+        num_local_experts=2,
+        experts_start_idx=0,
+        top_k=2,
+        hidden_size=128,
+        intermediate_size=128,
+        activation="situ",
+        activation_beta=4.0,
+        activation_linear_beta=25.0,
+    )
+    experts.w13_weight_scale_2.data.copy_(torch.tensor([[5.0, 5.0], [7.0, 7.0]]))
+    experts.w2_weight_scale_2.data.copy_(torch.tensor([11.0, 13.0]))
+    experts.w13_input_scale.data.copy_(torch.tensor([[2.0, 1.0], [3.0, 1.0]]))
+    experts.w2_input_scale.data.copy_(torch.tensor([4.0, 2.0]))
+    experts._check_runtime_supported = lambda: None
+
+    ep_group = SimpleNamespace(world_size=1, rank_in_group=0, device_group=None)
+    monkeypatch.setattr(kimi_model, "get_ep_group", lambda: ep_group)
+    monkeypatch.setattr(
+        kimi_model, "current_stream", lambda: SimpleNamespace(cuda_stream=7)
+    )
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+
+    captured: dict[str, Any] = {}
+
+    class FakeMegaLayer(torch.nn.Module):
+        pass
+
+    def make_layer(bootstrap, fleet_params, weights, *, backend):
+        captured.update(
+            bootstrap=bootstrap,
+            fleet_params=fleet_params,
+            weights=weights,
+            backend=backend,
+        )
+        return FakeMegaLayer()
+
+    monkeypatch.setattr(moe_ep, "MoEEpLayer", make_layer)
+
+    experts.finalize_weights()
+
+    kernel = captured["backend"].megakernel
+    assert kernel.fc1_alpha is None
+    assert kernel.fc2_alpha is None
+    assert kernel.fc1_norm_const is None
+    torch.testing.assert_close(
+        experts._flashinfer_fc1_alpha, torch.tensor([15.0, 21.0])
+    )
+    torch.testing.assert_close(
+        experts._flashinfer_fc2_alpha, torch.tensor([44.0, 52.0])
+    )
+    torch.testing.assert_close(
+        experts._flashinfer_fc1_norm_const, torch.tensor([0.25, 0.25])
+    )
+    assert kernel.input_norm_const == pytest.approx(1.0 / 3.0)
+    assert kernel.activation == "situ"
+    assert kernel.situ_beta == 4.0
+    assert kernel.situ_linear_beta == 25.0
+    assert captured["weights"].w13_scale.dtype == torch.float8_e4m3fn
+    assert captured["weights"].w13_scale.shape == (2, 256, 8)
+    assert experts.w13_weight is None
+    assert experts.w2_weight is None
+
+
+def test_kimi_flashinfer_mega_moe_forward_preserves_tensor_contract(monkeypatch):
+    from vllm.models.kimi_k3.nvidia import model as kimi_model
+
+    experts = kimi_model.KimiK3FlashInferMegaMoEExperts.__new__(
+        kimi_model.KimiK3FlashInferMegaMoEExperts
+    )
+    torch.nn.Module.__init__(experts)
+    experts.max_num_tokens = 8
+    experts.capture_fn = None
+    experts._flashinfer_fc1_alpha = torch.ones(2)
+    experts._flashinfer_fc2_alpha = torch.ones(2)
+    experts._flashinfer_fc1_norm_const = torch.ones(2)
+    experts.synchronize_first_launch = lambda: None
+    experts.finalize_weights = lambda: None
+    monkeypatch.setattr(kimi_model, "is_forward_context_available", lambda: False)
+
+    captured = {}
+
+    class FakeMegaLayer(torch.nn.Module):
+        def forward(self, tensors):
+            captured["tensors"] = tensors
+            return tensors.hidden_states.clone()
+
+    experts._flashinfer_layer = FakeMegaLayer()
+    hidden_states = torch.randn(3, 8)
+    topk_ids = torch.tensor([[0, 1], [1, 0], [0, 1]])
+    topk_weights = torch.rand(3, 2)
+
+    output = experts(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        activation_clamp=None,
+    )
+
+    assert output.data_ptr() != hidden_states.data_ptr()
+    assert torch.equal(output, hidden_states)
+    assert captured["tensors"].hidden_states is hidden_states
+    assert captured["tensors"].topk_ids is topk_ids
+    assert captured["tensors"].topk_weights is topk_weights
+    assert captured["tensors"].fc1_alpha is experts._flashinfer_fc1_alpha
+    assert captured["tensors"].fc2_alpha is experts._flashinfer_fc2_alpha
+    assert captured["tensors"].fc1_norm_const is experts._flashinfer_fc1_norm_const
+
+
+def test_kimi_flashinfer_mega_moe_uses_sequence_parallel_token_capacity():
+    from vllm.models.kimi_k3.nvidia.model import KimiK3FlashInferMegaMoEExperts
+
+    experts = KimiK3FlashInferMegaMoEExperts(
+        _kimi_flashinfer_test_config(
+            max_num_batched_tokens=16384,
+            tensor_parallel_size=8,
+        ),
+        num_experts=16,
+        num_local_experts=2,
+        experts_start_idx=0,
+        top_k=2,
+        hidden_size=128,
+        intermediate_size=128,
+        activation="situ",
+        activation_beta=4.0,
+        activation_linear_beta=25.0,
+    )
+
+    assert experts.max_num_tokens == 2048
 
 
 @pytest.mark.skipif(
