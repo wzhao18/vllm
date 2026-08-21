@@ -647,6 +647,10 @@ class KimiFusedSharedExpert(CustomOp):
             )
         return self._transformed_nvfp4_weights
 
+    def finalize_weights(self) -> None:
+        if self.use_nvfp4:
+            self._nvfp4_weights()
+
     def _nvfp4_session(
         self, hidden_states: torch.Tensor
     ) -> "_KimiFlashInferNvfp4SharedSession":
@@ -2945,6 +2949,11 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 shared_experts = module.shared_experts
                 if isinstance(shared_experts, KimiMLP):
                     shared_experts.finalize_fp8_simulation()
+                elif (
+                    isinstance(shared_experts, KimiFusedSharedExpert)
+                    and shared_experts.use_nvfp4
+                ):
+                    shared_experts.finalize_weights()
 
 
 class KimiLinearForCausalLM(
