@@ -138,6 +138,16 @@ _KIMI_MEGA_MOE_BACKENDS = frozenset(
     {"deep_gemm_mega_moe", "flashinfer_cutedsl_mega_moe"}
 )
 
+_KIMI_NVFP4_MEGA_MOE_KNOBS = {
+    "cluster_shape_mnk": (2, 1, 1),
+    "group_hint": 512,
+    "epi_flag_batch": (2, 4),
+    "load_balance_mode": "atomic_counter",
+    "mma_tiler_mnk": (256, 128, 256),
+    "flag_batch": 4,
+    "token_back_mode": "standalone_warps",
+}
+
 
 def is_kimi_mega_moe_backend(moe_backend: str) -> bool:
     return moe_backend in _KIMI_MEGA_MOE_BACKENDS
@@ -705,6 +715,8 @@ class KimiK3FlashInferMegaMoEExperts(KimiK3MegaMoEExperts):
             situ_beta=self.activation_beta,
             situ_linear_beta=self.activation_linear_beta,
             input_norm_const=float((1.0 / a13_scale).item()),
+            in_kernel_fc2_reduce=True,
+            knobs=_KIMI_NVFP4_MEGA_MOE_KNOBS,
         )
         bootstrap = BootstrapConfig(
             world_size=ep_group.world_size,

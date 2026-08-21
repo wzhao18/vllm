@@ -317,6 +317,7 @@ def _kimi_flashinfer_test_config(
     return SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_batched_tokens=max_num_batched_tokens),
         compilation_config=SimpleNamespace(static_forward_context={}),
+        load_config=SimpleNamespace(load_format="auto"),
         parallel_config=SimpleNamespace(
             enable_eplb=False,
             enable_expert_parallel=True,
@@ -487,6 +488,16 @@ def test_kimi_flashinfer_mega_moe_builds_modelopt_scale_algebra(monkeypatch):
     assert kernel.activation == "situ"
     assert kernel.situ_beta == 4.0
     assert kernel.situ_linear_beta == 25.0
+    assert kernel.in_kernel_fc2_reduce
+    assert kernel.knobs == {
+        "cluster_shape_mnk": (2, 1, 1),
+        "group_hint": 512,
+        "epi_flag_batch": (2, 4),
+        "load_balance_mode": "atomic_counter",
+        "mma_tiler_mnk": (256, 128, 256),
+        "flag_batch": 4,
+        "token_back_mode": "standalone_warps",
+    }
     assert captured["weights"].w13_scale.dtype == torch.float8_e4m3fn
     assert captured["weights"].w13_scale.shape == (2, 256, 8)
     assert experts.w13_weight is None
