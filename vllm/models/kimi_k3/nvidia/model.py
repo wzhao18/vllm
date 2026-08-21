@@ -8,6 +8,7 @@ from typing import Any, cast
 
 import torch
 from torch import nn
+from torch.nn import Parameter
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
@@ -18,6 +19,7 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
+from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.activation import SiluAndMul, SituAndMul
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
@@ -30,6 +32,7 @@ from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
     fused_grouped_topk,
 )
+from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -49,6 +52,13 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.compressed_tensors import (
     compressed_tensors,
+)
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    per_token_group_quant_fp8,
+    situ_mul_quant_fp8_packed_triton,
+)
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    kFp8Dynamic128Sym,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -111,6 +121,7 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.kimi_k3 import KimiK3Config
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
+from vllm.utils.deep_gemm import per_block_cast_to_fp8
 from vllm.utils.math_utils import cdiv
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 from vllm.utils.torch_utils import aux_stream, current_stream
@@ -123,6 +134,17 @@ from ..common.mm_preprocess import (
 )
 
 logger = init_logger(__name__)
+
+
+_kimi_shared_expert_stream: torch.cuda.Stream | None = None
+
+
+def kimi_shared_expert_stream() -> torch.cuda.Stream | None:
+    global _kimi_shared_expert_stream
+    if _kimi_shared_expert_stream is None and current_platform.is_cuda_alike():
+        _kimi_shared_expert_stream = torch.cuda.Stream()
+    return _kimi_shared_expert_stream
+
 
 # Token-count cutoff for overlapping the MoE router gate with the routed-expert
 # down projection on a separate CUDA stream (latent MoE). At or below this many
@@ -138,12 +160,97 @@ _KIMI_MEGA_MOE_BACKENDS = frozenset(
 _KIMI_NVFP4_MEGA_MOE_KNOBS = {
     "cluster_shape_mnk": (2, 1, 1),
     "group_hint": 512,
+    "max_active_clusters": 60,
     "epi_flag_batch": (2, 4),
     "load_balance_mode": "atomic_counter",
     "mma_tiler_mnk": (256, 128, 256),
     "flag_batch": 4,
     "token_back_mode": "standalone_warps",
 }
+
+
+def get_kimi_nvfp4_mega_moe_knobs(vllm_config: VllmConfig) -> dict:
+    knobs = dict(_KIMI_NVFP4_MEGA_MOE_KNOBS)
+    additional_config = vllm_config.additional_config
+    if not isinstance(additional_config, dict):
+        return knobs
+    overrides = additional_config.get("kimi_nvfp4_mega_moe_knobs")
+    if overrides is None:
+        return knobs
+    if not isinstance(overrides, dict):
+        raise ValueError("kimi_nvfp4_mega_moe_knobs must be a dictionary.")
+    knobs.update(overrides)
+    for key in ("cluster_shape_mnk", "epi_flag_batch", "mma_tiler_mnk"):
+        value = knobs.get(key)
+        if isinstance(value, list):
+            knobs[key] = tuple(value)
+    return knobs
+
+
+def get_kimi_nvfp4_fused_shared_expert_num_sms(
+    vllm_config: VllmConfig,
+    total_sms: int,
+) -> int:
+    additional_config = vllm_config.additional_config
+    override = None
+    if isinstance(additional_config, dict):
+        override = additional_config.get(
+            "kimi_nvfp4_fused_shared_expert_num_sms"
+        )
+    if override is not None:
+        if not isinstance(override, int) or not 2 <= override <= total_sms:
+            raise ValueError(
+                "kimi_nvfp4_fused_shared_expert_num_sms must be an integer "
+                f"in [2, {total_sms}]."
+            )
+        if override % 2:
+            raise ValueError(
+                "kimi_nvfp4_fused_shared_expert_num_sms must be even."
+            )
+        return override
+
+    knobs = get_kimi_nvfp4_mega_moe_knobs(vllm_config)
+    cluster_shape = knobs["cluster_shape_mnk"]
+    routed_sms = (
+        knobs["max_active_clusters"] * cluster_shape[0] * cluster_shape[1]
+    )
+    shared_sms = (total_sms - routed_sms) // 2 * 2
+    if shared_sms < 2:
+        raise ValueError(
+            "The routed MegaMoE grid leaves fewer than two SMs for the "
+            "fused shared expert."
+        )
+    return shared_sms
+
+
+def get_kimi_nvfp4_mega_moe_combine_dtype(vllm_config: VllmConfig) -> str:
+    additional_config = vllm_config.additional_config
+    if not isinstance(additional_config, dict):
+        return "bf16"
+    combine_dtype = additional_config.get(
+        "kimi_nvfp4_mega_moe_combine_dtype", "bf16"
+    )
+    if combine_dtype not in ("bf16", "mxfp8", "nvfp4"):
+        raise ValueError(
+            "kimi_nvfp4_mega_moe_combine_dtype must be bf16, mxfp8, or nvfp4."
+        )
+    return combine_dtype
+
+
+def get_kimi_nvfp4_mega_moe_in_kernel_reduce(
+    vllm_config: VllmConfig,
+) -> bool:
+    additional_config = vllm_config.additional_config
+    if not isinstance(additional_config, dict):
+        return True
+    value = additional_config.get(
+        "kimi_nvfp4_mega_moe_in_kernel_fc2_reduce", True
+    )
+    if not isinstance(value, bool):
+        raise ValueError(
+            "kimi_nvfp4_mega_moe_in_kernel_fc2_reduce must be a boolean."
+        )
+    return value
 
 
 def is_kimi_mega_moe_backend(moe_backend: str) -> bool:
@@ -237,6 +344,9 @@ class KimiMLP(nn.Module):
         prefix: str = "",
         activation_situ_beta: float | None = None,
         activation_situ_linear_beta: float | None = None,
+        fuse_down_proj: bool = False,
+        fuse_situ_quant: bool = False,
+        simulate_fp8: bool = False,
     ) -> None:
         super().__init__()
 
@@ -247,6 +357,8 @@ class KimiMLP(nn.Module):
             can_shard_sequence_parallel,
         )
         self.run_gemm_rs = self.shard_sequence_parallel and run_gemm_rs
+        self.fuse_situ_quant = fuse_situ_quant
+        self.simulate_fp8 = simulate_fp8
         replicate = use_sequence_parallel and not self.shard_sequence_parallel
 
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -257,18 +369,22 @@ class KimiMLP(nn.Module):
             disable_tp=replicate,
             prefix=f"{prefix}.gate_up_proj",
         )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            # Sharded sequence parallel reduces via the reduce-scatter in
-            # forward(), which also restores the sequence sharding.
-            reduce_results=False if self.shard_sequence_parallel else reduce_results,
-            disable_tp=replicate,
-            prefix=f"{prefix}.down_proj",
-        )
-        if self.run_gemm_rs:
+        self.down_proj = None
+        if not fuse_down_proj:
+            self.down_proj = RowParallelLinear(
+                intermediate_size,
+                hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                # Sharded sequence parallel reduces via the reduce-scatter in
+                # forward(), which also restores the sequence sharding.
+                reduce_results=(
+                    False if self.shard_sequence_parallel else reduce_results
+                ),
+                disable_tp=replicate,
+                prefix=f"{prefix}.down_proj",
+            )
+        if self.run_gemm_rs and self.down_proj is not None:
             from vllm.models.kimi_k3.nvidia.ops.cute_dsl.gemm_rs import get_gemm_rs
 
             self.run_gemm_rs = get_gemm_rs().can_run(self.down_proj)
@@ -290,17 +406,54 @@ class KimiMLP(nn.Module):
                 "Only silu and situ are supported."
             )
 
-    def forward(self, x):
+    def forward_activation(self, x: torch.Tensor) -> torch.Tensor:
         if self.shard_sequence_parallel:
             # Each rank holds a weight shard but only its own tokens, so it
             # cannot finish those tokens alone: gather the full token set,
             # compute this rank's partial for all of them, then reduce-scatter,
             # which sums across TP and restores the sequence sharding.
             x = sp_all_gather(x)
+        if self.simulate_fp8:
+            x = self._simulate_fp8_activation(x)
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        return self.act_fn(gate_up)
+
+    @staticmethod
+    def _simulate_fp8_activation(x: torch.Tensor) -> torch.Tensor:
+        quantized, scale = per_token_group_quant_fp8(
+            x.contiguous(), 128, use_ue8m0=True
+        )
+        return (
+            quantized.float() * scale.repeat_interleave(128, dim=-1)
+        ).to(x.dtype)
+
+    @staticmethod
+    def _simulate_fp8_weight(weight: torch.Tensor) -> None:
+        quantized, scale = per_block_cast_to_fp8(
+            weight, [128, 128], use_ue8m0=True
+        )
+        expanded = scale.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
+        weight.copy_(
+            (quantized.float() * expanded[: weight.shape[0], : weight.shape[1]]).to(
+                weight.dtype
+            )
+        )
+
+    def finalize_fp8_simulation(self) -> None:
+        if not self.simulate_fp8:
+            return
+        if self.down_proj is None:
+            raise RuntimeError("FP8 simulation requires an unfused down projection.")
+        with torch.no_grad():
+            self._simulate_fp8_weight(self.gate_up_proj.weight)
+            self._simulate_fp8_weight(self.down_proj.weight)
+
+    def _forward_down(self, x: torch.Tensor | QuantizedActivation) -> torch.Tensor:
+        if self.down_proj is None:
+            raise RuntimeError("The fused shared-expert tail owns the down projection.")
 
         if self.run_gemm_rs:
+            assert isinstance(x, torch.Tensor)
             from vllm.models.kimi_k3.nvidia.ops.cute_dsl.gemm_rs import get_gemm_rs
 
             gemm_rs = get_gemm_rs()
@@ -311,6 +464,277 @@ class KimiMLP(nn.Module):
         if self.shard_sequence_parallel:
             x = sp_reduce_scatter(x)
         return x
+
+    def forward_from_gate_up(self, gate_up: torch.Tensor) -> torch.Tensor:
+        if self.down_proj is None:
+            raise RuntimeError("The fused shared-expert tail owns the down projection.")
+
+        can_fuse_situ_quant = (
+            self.fuse_situ_quant
+            and not self.simulate_fp8
+            and isinstance(self.act_fn, SituAndMul)
+            and not self.shard_sequence_parallel
+            and not self.run_gemm_rs
+            and getattr(self.down_proj, "input_is_parallel", False)
+            and getattr(self.down_proj, "input_quant_key", None) == kFp8Dynamic128Sym
+        )
+        if can_fuse_situ_quant:
+            q, scale = situ_mul_quant_fp8_packed_triton(
+                gate_up,
+                beta=self.act_fn.beta,
+                linear_beta=self.act_fn.linear_beta,
+            )
+            x = QuantizedActivation(
+                data=q,
+                scale=scale,
+                orig_dtype=gate_up.dtype,
+                orig_shape=torch.Size((*gate_up.shape[:-1], gate_up.shape[-1] // 2)),
+                quant_key=kFp8Dynamic128Sym,
+            )
+        else:
+            x = self.act_fn(gate_up)
+            if self.simulate_fp8:
+                x = self._simulate_fp8_activation(x)
+        return self._forward_down(x)
+
+    def forward(self, x):
+        if self.shard_sequence_parallel:
+            return self._forward_down(self.forward_activation(x))
+        gate_up, _ = self.gate_up_proj(x)
+        return self.forward_from_gate_up(gate_up)
+
+
+class _KimiFusedSharedLinear(nn.Module):
+    def __init__(self, weight_shape: tuple[int, ...], weight_loader=None) -> None:
+        super().__init__()
+        self.weight = Parameter(
+            torch.empty(weight_shape, dtype=torch.get_default_dtype()),
+            requires_grad=False,
+        )
+        if weight_loader is not None:
+            set_weight_attrs(self.weight, {"weight_loader": weight_loader})
+
+
+@CustomOp.register("kimi_fused_shared_expert")
+class KimiFusedSharedExpert(CustomOp):
+    """Replicated BF16 shared experts using local DeepGEMM MegaMoE."""
+
+    shard_sequence_parallel = False
+    gate_up_interleave = 8
+    _sessions: dict[tuple[int, ...], "_KimiDeepGemmSharedSession"] = {}
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        max_num_tokens: int,
+        situ_beta: float,
+        situ_linear_beta: float | None,
+        num_sms: int,
+    ) -> None:
+        super().__init__(enforce_enable=True)
+        if intermediate_size % self.gate_up_interleave:
+            raise ValueError(
+                "The fused shared expert requires intermediate_size to be a "
+                f"multiple of {self.gate_up_interleave}."
+            )
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_shared_experts = 2
+        if intermediate_size % self.num_shared_experts:
+            raise ValueError(
+                "The fused shared expert intermediate size must be divisible "
+                f"by {self.num_shared_experts}."
+            )
+        self.expert_intermediate_size = intermediate_size // self.num_shared_experts
+        self.max_num_tokens = min(
+            max_num_tokens,
+            envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD,
+        )
+        self.situ_beta = situ_beta
+        self.situ_linear_beta = situ_linear_beta
+        self.num_sms = num_sms
+        num_blocks = intermediate_size // self.gate_up_interleave
+        self.gate_up_proj = _KimiFusedSharedLinear(
+            (2 * intermediate_size, hidden_size),
+            self._load_gate_up_weight,
+        )
+        self.down_proj = _KimiFusedSharedLinear((hidden_size, intermediate_size))
+
+    @staticmethod
+    def _load_gate_up_weight(
+        param: Parameter, loaded_weight: torch.Tensor, shard_id: int
+    ) -> None:
+        if shard_id not in (0, 1):
+            raise ValueError(f"gate/up shard_id must be 0 or 1, got {shard_id}.")
+        intermediate_size = param.shape[0] // 2
+        hidden_size = param.shape[1]
+        expected = (intermediate_size, hidden_size)
+        if tuple(loaded_weight.shape) != expected:
+            raise ValueError(
+                f"Expected gate/up shard shape {expected}, "
+                f"got {tuple(loaded_weight.shape)}."
+            )
+        blocks = intermediate_size // KimiFusedSharedExpert.gate_up_interleave
+        target = param.data.view(
+            blocks,
+            2,
+            KimiFusedSharedExpert.gate_up_interleave,
+            hidden_size,
+        )[:, shard_id]
+        target.copy_(loaded_weight.view_as(target))
+
+    def _weights(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.gate_up_proj.weight, self.down_proj.weight
+
+    def _session(self, hidden_states: torch.Tensor) -> "_KimiDeepGemmSharedSession":
+        num_tokens = hidden_states.shape[0]
+        device = hidden_states.device.index
+        if device is None:
+            device = torch.cuda.current_device()
+        key = (
+            device,
+            num_tokens,
+            self.hidden_size,
+            self.expert_intermediate_size,
+            self.num_shared_experts,
+            self.num_sms,
+        )
+        session = self._sessions.get(key)
+        if session is None:
+            session = _KimiDeepGemmSharedSession(
+                num_tokens=num_tokens,
+                hidden_size=self.hidden_size,
+                expert_intermediate_size=self.expert_intermediate_size,
+                num_shared_experts=self.num_shared_experts,
+                num_sms=self.num_sms,
+            )
+            self._sessions[key] = session
+        return session
+
+    def forward_cuda(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if hidden_states.shape[0] > self.max_num_tokens:
+            return self.forward_native(hidden_states)
+        gate_up_weight, down_weight = self._weights()
+        return self._session(hidden_states).run(
+            hidden_states,
+            gate_up_weight,
+            down_weight,
+            situ_beta=self.situ_beta,
+            situ_linear_beta=self.situ_linear_beta,
+        )
+
+    def forward_native(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        packed = self.gate_up_proj.weight.view(
+            self.intermediate_size // self.gate_up_interleave,
+            2,
+            self.gate_up_interleave,
+            self.hidden_size,
+        )
+        gate_weight = packed[:, 0].reshape(self.intermediate_size, self.hidden_size)
+        up_weight = packed[:, 1].reshape(self.intermediate_size, self.hidden_size)
+        gate = hidden_states @ gate_weight.t()
+        up = hidden_states @ up_weight.t()
+        gate = self.situ_beta * torch.tanh(gate / self.situ_beta) * torch.sigmoid(gate)
+        if self.situ_linear_beta is not None:
+            up = self.situ_linear_beta * torch.tanh(up / self.situ_linear_beta)
+        return (gate * up) @ self.down_proj.weight.t()
+
+
+class _KimiSingleRankGroup:
+    @staticmethod
+    def size() -> int:
+        return 1
+
+    @staticmethod
+    def rank() -> int:
+        return 0
+
+    @staticmethod
+    def barrier() -> None:
+        return None
+
+
+class _KimiDeepGemmSharedSession:
+    def __init__(
+        self,
+        *,
+        num_tokens: int,
+        hidden_size: int,
+        expert_intermediate_size: int,
+        num_shared_experts: int,
+        num_sms: int,
+    ) -> None:
+        from vllm.utils.deep_gemm import _import_deep_gemm
+
+        deep_gemm = _import_deep_gemm()
+        if deep_gemm is None:
+            raise RuntimeError("DeepGEMM is required for fused Kimi shared experts.")
+        self.deep_gemm = deep_gemm
+        self.num_sms = num_sms
+        self.buffer = deep_gemm.get_symm_buffer_for_mega_moe(
+            _KimiSingleRankGroup(),
+            1,
+            num_tokens,
+            1,
+            hidden_size,
+            expert_intermediate_size,
+            num_shared_experts=num_shared_experts,
+            mma_type="bf16xbf16",
+            activation="situ",
+        )
+        self.buffer.topk_idx.fill_(-1)
+        self.buffer.topk_weights.zero_()
+        dummy_l1 = torch.zeros(
+            1,
+            2 * expert_intermediate_size,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        dummy_l2 = torch.zeros(
+            1,
+            hidden_size,
+            expert_intermediate_size,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        self.dummy_l1, self.dummy_l2 = deep_gemm.transform_weights_for_mega_moe(
+            dummy_l1,
+            dummy_l2,
+            activation="situ",
+        )
+        self.output = torch.empty(
+            num_tokens,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+
+    def run(
+        self,
+        hidden_states: torch.Tensor,
+        gate_up_weight: torch.Tensor,
+        down_weight: torch.Tensor,
+        *,
+        situ_beta: float,
+        situ_linear_beta: float | None,
+    ) -> torch.Tensor:
+        self.deep_gemm.bf16_mega_moe(
+            self.output,
+            self.dummy_l1,
+            self.dummy_l2,
+            self.buffer,
+            shared_l1_weights=gate_up_weight,
+            shared_l2_weights=down_weight,
+            shared_l1_acts=hidden_states,
+            activation="situ",
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            fast_math=True,
+            num_sms=self.num_sms,
+        )
+        return self.output
 
 
 class KimiRoutedOutputTransform(nn.Module):
@@ -342,6 +766,156 @@ class KimiRoutedOutputTransform(nn.Module):
             return residual.addmm_(hidden_states, self.up_proj.weight.t())
         hidden_states, _ = self.up_proj(hidden_states)
         return hidden_states
+
+
+class KimiSharedActivation(nn.Module):
+    """Weight-free shared-expert SiTU used by fused MoE projections."""
+
+    shard_sequence_parallel = False
+
+    def __init__(self, beta: float, linear_beta: float | None) -> None:
+        super().__init__()
+        self.act_fn = SituAndMul(beta=beta, linear_beta=linear_beta)
+
+    def forward(self, gate_up: torch.Tensor) -> torch.Tensor:
+        return self.act_fn(gate_up)
+
+
+class KimiSharedOutputProjection(nn.Module):
+    """Shared-expert activation and down projection after a fused input."""
+
+    shard_sequence_parallel = False
+
+    def __init__(
+        self,
+        shared_intermediate_size: int,
+        hidden_size: int,
+        beta: float,
+        linear_beta: float | None,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> None:
+        super().__init__()
+        self.act_fn = SituAndMul(beta=beta, linear_beta=linear_beta)
+        self.down_proj = ReplicatedLinear(
+            shared_intermediate_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.down_proj",
+        )
+
+    def forward(self, gate_up: torch.Tensor) -> torch.Tensor:
+        hidden_states, _ = self.down_proj(self.act_fn(gate_up))
+        return hidden_states
+
+
+class KimiFusedMoEInputProjection(nn.Module):
+    """Join the routed down projection and shared gate/up projection."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        routed_hidden_size: int,
+        shared_intermediate_size: int,
+        prefix: str,
+    ) -> None:
+        super().__init__()
+        self.routed_hidden_size = routed_hidden_size
+        self.shared_gate_up_size = 2 * shared_intermediate_size
+        self.proj = ReplicatedLinear(
+            hidden_size,
+            routed_hidden_size + self.shared_gate_up_size,
+            bias=False,
+            quant_config=None,
+            prefix=f"{prefix}.fused_input_proj",
+        )
+
+    def forward(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        projected, _ = self.proj(hidden_states)
+        return projected.split(
+            (self.routed_hidden_size, self.shared_gate_up_size), dim=-1
+        )
+
+
+class KimiFusedMoETail(nn.Module):
+    """Join the shared down projection and routed latent up projection."""
+
+    def __init__(
+        self,
+        norm: RMSNorm | None,
+        shared_intermediate_size: int,
+        routed_hidden_size: int,
+        hidden_size: int,
+        prefix: str,
+    ) -> None:
+        super().__init__()
+        self.norm = norm
+        self.shared_intermediate_size = shared_intermediate_size
+        self.routed_hidden_size = routed_hidden_size
+        self.proj = ReplicatedLinear(
+            shared_intermediate_size + routed_hidden_size,
+            hidden_size,
+            bias=False,
+            quant_config=None,
+            prefix=f"{prefix}.fused_tail_proj",
+        )
+
+    def forward(
+        self,
+        routed_hidden_states: torch.Tensor,
+        shared_activations: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.norm is not None:
+            routed_hidden_states = self.norm(routed_hidden_states)
+        hidden_states = torch.cat((shared_activations, routed_hidden_states), dim=-1)
+        hidden_states, _ = self.proj(hidden_states)
+        return hidden_states
+
+
+def load_kimi_fused_moe_tail_shard(
+    packed_weight: torch.Tensor,
+    loaded_weight: torch.Tensor,
+    shard: str,
+) -> None:
+    if shard == "shared":
+        offset = 0
+    elif shard == "routed":
+        offset = packed_weight.shape[1] - loaded_weight.shape[1]
+    else:
+        raise ValueError(f"Unknown fused MoE tail shard {shard!r}.")
+    target = packed_weight.narrow(1, offset, loaded_weight.shape[1])
+    if target.shape != loaded_weight.shape:
+        raise ValueError(
+            f"Fused MoE tail {shard} shard shape mismatch: "
+            f"expected {tuple(target.shape)}, got {tuple(loaded_weight.shape)}."
+        )
+    target.copy_(loaded_weight)
+
+
+def load_kimi_fused_moe_input_shard(
+    packed_weight: torch.Tensor,
+    loaded_weight: torch.Tensor,
+    shard: str,
+) -> None:
+    routed_size = packed_weight.shape[0] - 2 * loaded_weight.shape[0]
+    if shard == "routed":
+        offset = 0
+    elif shard == "gate":
+        offset = routed_size
+    elif shard == "up":
+        offset = routed_size + loaded_weight.shape[0]
+    else:
+        raise ValueError(f"Unknown fused MoE input shard {shard!r}.")
+    target = packed_weight.narrow(0, offset, loaded_weight.shape[0])
+    if target.shape != loaded_weight.shape:
+        raise ValueError(
+            f"Fused MoE input {shard} shard shape mismatch: "
+            f"expected {tuple(target.shape)}, got {tuple(loaded_weight.shape)}."
+        )
+    target.copy_(loaded_weight)
 
 
 class KimiK3MegaMoEExperts(DeepseekV4MegaMoEExperts):
@@ -525,6 +1099,19 @@ class KimiK3FlashInferMegaMoEExperts(KimiK3MegaMoEExperts):
     ) -> None:
         super().__init__(vllm_config, *args, **kwargs)
         self._dummy_weights = vllm_config.load_config.load_format == "dummy"
+        self._mega_moe_knobs = get_kimi_nvfp4_mega_moe_knobs(vllm_config)
+        self._mega_moe_combine_dtype = get_kimi_nvfp4_mega_moe_combine_dtype(
+            vllm_config
+        )
+        self._mega_moe_in_kernel_reduce = (
+            get_kimi_nvfp4_mega_moe_in_kernel_reduce(vllm_config)
+        )
+        if self._mega_moe_combine_dtype != "bf16":
+            self._mega_moe_in_kernel_reduce = False
+            self._mega_moe_knobs.update(
+                token_back_mode="reuse_dispatch_warps",
+                non_ubulk_fc2_store=True,
+            )
         if vllm_config.parallel_config.enable_eplb:
             raise NotImplementedError(
                 "FlashInfer CuTeDSL MegaMoE does not support vLLM EPLB."
@@ -690,8 +1277,9 @@ class KimiK3FlashInferMegaMoEExperts(KimiK3MegaMoEExperts):
             situ_beta=self.activation_beta,
             situ_linear_beta=self.activation_linear_beta,
             input_norm_const=float((1.0 / a13_scale).item()),
-            in_kernel_fc2_reduce=True,
-            knobs=_KIMI_NVFP4_MEGA_MOE_KNOBS,
+            in_kernel_fc2_reduce=self._mega_moe_in_kernel_reduce,
+            combine_dtype=self._mega_moe_combine_dtype,
+            knobs=self._mega_moe_knobs,
         )
         bootstrap = BootstrapConfig(
             world_size=ep_group.world_size,
@@ -853,6 +1441,74 @@ class KimiMoE(nn.Module):
         moe_backend = vllm_config.kernel_config.moe_backend
         self.use_mega_moe = is_kimi_mega_moe_backend(moe_backend)
         self.use_flashinfer_mega_moe = moe_backend == "flashinfer_cutedsl_mega_moe"
+        additional_config = vllm_config.additional_config
+        self.skip_shared_expert_for_profiling = bool(
+            self.use_flashinfer_mega_moe
+            and isinstance(additional_config, dict)
+            and additional_config.get(
+                "kimi_nvfp4_skip_shared_expert_for_profiling", False
+            )
+        )
+        self.preschedule_shared_expert = bool(
+            self.use_flashinfer_mega_moe
+            and isinstance(additional_config, dict)
+            and additional_config.get(
+                "kimi_nvfp4_preschedule_shared_expert", False
+            )
+        )
+        self.use_fused_shared_expert = bool(
+            self.use_flashinfer_mega_moe
+            and self.num_shared_experts is not None
+            and isinstance(additional_config, dict)
+            and additional_config.get("kimi_nvfp4_fused_shared_expert", False)
+        )
+        self.fused_shared_expert_routed_first = bool(
+            self.use_fused_shared_expert
+            and additional_config.get(
+                "kimi_nvfp4_fused_shared_expert_routed_first", False
+            )
+        )
+        self.use_fused_dense_moe_projections = bool(
+            self.use_flashinfer_mega_moe
+            and self.num_shared_experts is not None
+            and not self.use_fused_shared_expert
+            and isinstance(additional_config, dict)
+            and additional_config.get(
+                "kimi_nvfp4_fused_dense_moe_projections", False
+            )
+        )
+        self.use_fused_moe_input_projection = bool(
+            self.use_fused_dense_moe_projections
+            or (
+                self.use_flashinfer_mega_moe
+                and self.num_shared_experts is not None
+                and not self.use_fused_shared_expert
+                and isinstance(additional_config, dict)
+                and additional_config.get(
+                    "kimi_nvfp4_fused_moe_input_projection", False
+                )
+            )
+        )
+        self.use_fused_mega_moe_tail = bool(
+            self.use_flashinfer_mega_moe
+            and self.num_shared_experts is not None
+            and not self.use_fused_shared_expert
+            and isinstance(additional_config, dict)
+            and (
+                self.use_fused_dense_moe_projections
+                or additional_config.get("kimi_nvfp4_fused_moe_tail", False)
+            )
+        )
+        self.simulate_fp8_shared_expert = bool(
+            self.use_flashinfer_mega_moe
+            and self.num_shared_experts is not None
+            and not self.use_fused_shared_expert
+            and not self.use_fused_mega_moe_tail
+            and isinstance(additional_config, dict)
+            and additional_config.get(
+                "kimi_nvfp4_simulate_fp8_shared_expert", False
+            )
+        )
         if self.use_flashinfer_mega_moe:
             resolve_quant_algo = getattr(quant_config, "_resolve_quant_algo", None)
             quant_algo = (
@@ -912,37 +1568,84 @@ class KimiMoE(nn.Module):
 
         if self.num_shared_experts is not None:
             shared_intermediate_size = moe_intermediate_size * self.num_shared_experts
-            self.shared_experts = KimiMLP(
-                hidden_size=config.hidden_size,
-                intermediate_size=shared_intermediate_size,
-                hidden_act=config.hidden_act,
-                quant_config=quant_config,
-                reduce_results=False,
-                use_sequence_parallel=use_sequence_parallel,
-                # Only the MegaMoE path calls the shared experts directly; the
-                # FusedMoE path below hands them to the runner, which fuses
-                # their reduction and assumes the replicated layout.
-                can_shard_sequence_parallel=self.use_mega_moe,
-                run_gemm_rs=run_gemm_rs,
-                prefix=f"{prefix}.shared_experts",
-                activation_situ_beta=activation_situ_beta,
-                activation_situ_linear_beta=activation_situ_linear_beta,
-            )
+            if self.use_fused_dense_moe_projections:
+                self.shared_experts = KimiSharedActivation(
+                    activation_situ_beta or 1.0,
+                    activation_situ_linear_beta,
+                )
+            elif self.use_fused_moe_input_projection:
+                self.shared_experts = KimiSharedOutputProjection(
+                    shared_intermediate_size,
+                    hidden_size,
+                    activation_situ_beta or 1.0,
+                    activation_situ_linear_beta,
+                    quant_config,
+                    f"{prefix}.shared_experts",
+                )
+            elif self.use_fused_shared_expert:
+                total_sms = torch.cuda.get_device_properties(
+                    torch.cuda.current_device()
+                ).multi_processor_count
+                shared_num_sms = get_kimi_nvfp4_fused_shared_expert_num_sms(
+                    vllm_config,
+                    total_sms,
+                )
+                self.shared_experts = KimiFusedSharedExpert(
+                    config.hidden_size,
+                    shared_intermediate_size,
+                    vllm_config.scheduler_config.max_num_batched_tokens,
+                    activation_situ_beta or 1.0,
+                    activation_situ_linear_beta,
+                    shared_num_sms,
+                )
+            else:
+                self.shared_experts = KimiMLP(
+                    hidden_size=config.hidden_size,
+                    intermediate_size=shared_intermediate_size,
+                    hidden_act=config.hidden_act,
+                    quant_config=quant_config,
+                    reduce_results=False,
+                    use_sequence_parallel=use_sequence_parallel,
+                    # Only the MegaMoE path calls the shared experts directly; the
+                    # FusedMoE path below hands them to the runner, which fuses
+                    # their reduction and assumes the replicated layout.
+                    can_shard_sequence_parallel=self.use_mega_moe,
+                    run_gemm_rs=run_gemm_rs,
+                    prefix=f"{prefix}.shared_experts",
+                    activation_situ_beta=activation_situ_beta,
+                    activation_situ_linear_beta=activation_situ_linear_beta,
+                    fuse_down_proj=self.use_fused_mega_moe_tail,
+                    fuse_situ_quant=self.use_flashinfer_mega_moe,
+                    simulate_fp8=self.simulate_fp8_shared_expert,
+                )
         else:
             self.shared_experts = None
 
         self.routed_expert_down_proj: ReplicatedLinear | None
+        self.fused_input_projection: KimiFusedMoEInputProjection | None
         self.routed_expert_norm: RMSNorm | None
         self.routed_expert_up_proj: ReplicatedLinear | None
-        self.routed_output_transform: KimiRoutedOutputTransform | None
+        self.routed_output_transform: (
+            KimiRoutedOutputTransform | KimiFusedMoETail | None
+        )
         if self.use_latent_moe:
-            self.routed_expert_down_proj = ReplicatedLinear(
-                hidden_size,
-                self.moe_hidden_size,
-                bias=False,
-                quant_config=None,
-                prefix=f"{prefix}.routed_expert_down_proj",
-            )
+            if self.use_fused_moe_input_projection:
+                self.routed_expert_down_proj = None
+                self.fused_input_projection = KimiFusedMoEInputProjection(
+                    hidden_size,
+                    self.moe_hidden_size,
+                    shared_intermediate_size,
+                    prefix,
+                )
+            else:
+                self.routed_expert_down_proj = ReplicatedLinear(
+                    hidden_size,
+                    self.moe_hidden_size,
+                    bias=False,
+                    quant_config=None,
+                    prefix=f"{prefix}.routed_expert_down_proj",
+                )
+                self.fused_input_projection = None
             self.routed_expert_norm = (
                 RMSNorm(self.moe_hidden_size, eps=config.rms_norm_eps)
                 if self.latent_moe_use_norm
@@ -953,24 +1656,35 @@ class KimiMoE(nn.Module):
             # fuse the latent and shared reductions into a single all-reduce
             # (concat the two partials, reduce once), then run the up-proj and
             # shared add locally with no further collective.
-            self.routed_expert_up_proj = ReplicatedLinear(
-                self.moe_hidden_size,
-                hidden_size,
-                bias=False,
-                quant_config=None,
-                prefix=f"{prefix}.routed_expert_up_proj",
-            )
-
-            self.routed_output_transform = KimiRoutedOutputTransform(
-                self.routed_expert_norm, self.routed_expert_up_proj
-            )
+            if self.use_fused_mega_moe_tail:
+                self.routed_expert_up_proj = None
+                self.routed_output_transform = KimiFusedMoETail(
+                    self.routed_expert_norm,
+                    shared_intermediate_size,
+                    self.moe_hidden_size,
+                    hidden_size,
+                    prefix,
+                )
+            else:
+                self.routed_expert_up_proj = ReplicatedLinear(
+                    self.moe_hidden_size,
+                    hidden_size,
+                    bias=False,
+                    quant_config=None,
+                    prefix=f"{prefix}.routed_expert_up_proj",
+                )
+                self.routed_output_transform = KimiRoutedOutputTransform(
+                    self.routed_expert_norm, self.routed_expert_up_proj
+                )
             # Auxiliary CUDA stream to overlap the router gate with the routed
             # down projection on decode-sized batches (gated by
             # _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD).
             self._down_proj_stream: torch.cuda.Stream | None = aux_stream()
             self._down_proj_events = (torch.cuda.Event(), torch.cuda.Event())
+            self._shared_expert_events = (torch.cuda.Event(), torch.cuda.Event())
         else:
             self.routed_expert_down_proj = None
+            self.fused_input_projection = None
             self.routed_expert_norm = None
             self.routed_expert_up_proj = None
             self.routed_output_transform = None
@@ -1048,7 +1762,12 @@ class KimiMoE(nn.Module):
 
     def _maybe_overlap_router_and_down_proj(
         self, hidden_states: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
         """Compute the routed-expert down projection alongside the router,
         overlapping them on separate CUDA streams when latent MoE is enabled.
 
@@ -1059,18 +1778,24 @@ class KimiMoE(nn.Module):
         on the default stream and overlaps the down projection.
 
         Returns:
-            ``(routed_hidden_states, router_output, topk_ids)``.
+            ``(routed_hidden_states, router_output, topk_ids, shared_gate_up)``.
             ``routed_hidden_states`` is the down-projected latent (or the
             original ``hidden_states`` when latent MoE is disabled). For MegaMoE
             ``router_output`` holds the grouped top-k weights and ``topk_ids``
             the selected experts; otherwise ``router_output`` holds the raw gate
-            logits and ``topk_ids`` is ``None``.
+            logits and ``topk_ids`` is ``None``. ``shared_gate_up`` is populated
+            only by the fused dense MoE input projection.
         """
 
         def _router(
             hidden_states: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor | None]:
             router_logits, _ = self.gate(hidden_states)
+            return _select_experts(hidden_states, router_logits)
+
+        def _select_experts(
+            hidden_states: torch.Tensor, router_logits: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor | None]:
             if not self.use_mega_moe:
                 return router_logits, None
             return fused_grouped_topk(
@@ -1085,10 +1810,28 @@ class KimiMoE(nn.Module):
                 routed_scaling_factor=self.routed_scaling_factor,
             )
 
+        fused_input = self.fused_input_projection
+        if fused_input is not None:
+            num_tokens = hidden_states.shape[0]
+            (router_output, topk_ids), (
+                routed_hidden_states,
+                shared_gate_up,
+            ) = maybe_execute_in_parallel(
+                lambda: _router(hidden_states),
+                lambda: fused_input(hidden_states),
+                self._down_proj_events[0],
+                self._down_proj_events[1],
+                self._down_proj_stream
+                if num_tokens <= _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD
+                else None,
+            )
+            return routed_hidden_states, router_output, topk_ids, shared_gate_up
+
         down_proj = self.routed_expert_down_proj
         if down_proj is None:
             router_output, topk_ids = _router(hidden_states)
-            return hidden_states, router_output, topk_ids
+            return hidden_states, router_output, topk_ids, None
+
         num_tokens = hidden_states.shape[0]
         (router_output, topk_ids), (routed_hidden_states, _) = (
             maybe_execute_in_parallel(
@@ -1101,36 +1844,103 @@ class KimiMoE(nn.Module):
                 else None,
             )
         )
-        return routed_hidden_states, router_output, topk_ids
+        return routed_hidden_states, router_output, topk_ids, None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
+        shared_experts = (
+            None if self.skip_shared_expert_for_profiling else self.shared_experts
+        )
+        prescheduled_shared_output = None
+        can_preschedule_shared = (
+            self.use_mega_moe
+            and self.preschedule_shared_expert
+            and isinstance(shared_experts, KimiMLP)
+            and not self.use_fused_mega_moe_tail
+            and not shared_experts.shard_sequence_parallel
+            and num_tokens <= envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
+        )
         # Overlap the gate with the routed down projection; the returned hidden
         # states are already down-projected. Keep the original ``hidden_states``
         # for the shared experts.
-        routed_hidden_states, router_output, topk_ids = (
-            self._maybe_overlap_router_and_down_proj(hidden_states)
-        )
-        if self.use_mega_moe:
-            assert self.routed_output_transform is not None
-            assert topk_ids is not None
-            final_hidden_states = self.experts(
+        if can_preschedule_shared:
+            (
                 routed_hidden_states,
                 router_output,
                 topk_ids,
-                activation_clamp=None,
+                shared_gate_up,
+            ), prescheduled_shared_output = maybe_execute_in_parallel(
+                lambda: self._maybe_overlap_router_and_down_proj(hidden_states),
+                lambda: shared_experts(hidden_states),
+                self._shared_expert_events[0],
+                self._shared_expert_events[1],
+                kimi_shared_expert_stream(),
+                launch_aux_first=True,
             )
-            # The shared output is folded into the up-projection GEMM's beta-add
-            # epilogue, so combining the two branches costs no extra kernel.
-            shared_output = (
-                self.shared_experts(hidden_states)
-                if self.shared_experts is not None
-                else None
+        else:
+            routed_hidden_states, router_output, topk_ids, shared_gate_up = (
+                self._maybe_overlap_router_and_down_proj(hidden_states)
             )
-            final_hidden_states = self.routed_output_transform(
-                final_hidden_states, residual=shared_output
-            )
+        if self.use_mega_moe:
+            assert self.routed_output_transform is not None
+            assert topk_ids is not None
+
+            def run_routed_experts() -> torch.Tensor:
+                return self.experts(
+                    routed_hidden_states,
+                    router_output,
+                    topk_ids,
+                    activation_clamp=None,
+                )
+
+            if shared_experts is None:
+                final_hidden_states = run_routed_experts()
+                shared_output = None
+            elif prescheduled_shared_output is not None:
+                final_hidden_states = run_routed_experts()
+                shared_output = prescheduled_shared_output
+            else:
+                shared_stream = None
+                if (
+                    self.use_flashinfer_mega_moe
+                    and not envs.VLLM_DISABLE_SHARED_EXPERTS_STREAM
+                    and not shared_experts.shard_sequence_parallel
+                    and num_tokens <= envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
+                ):
+                    shared_stream = aux_stream()
+                if self.use_fused_moe_input_projection:
+                    assert shared_gate_up is not None
+                    assert isinstance(
+                        shared_experts,
+                        (KimiSharedActivation, KimiSharedOutputProjection),
+                    )
+                    shared_fn = lambda: shared_experts(shared_gate_up)
+                elif self.use_fused_mega_moe_tail:
+                    shared_fn = lambda: shared_experts.forward_activation(hidden_states)
+                else:
+                    shared_fn = lambda: shared_experts(hidden_states)
+                final_hidden_states, shared_output = maybe_execute_in_parallel(
+                    run_routed_experts,
+                    shared_fn,
+                    self._shared_expert_events[0],
+                    self._shared_expert_events[1],
+                    shared_stream,
+                    launch_aux_first=(
+                        self.use_flashinfer_mega_moe
+                        and not self.fused_shared_expert_routed_first
+                    ),
+                )
+            if self.use_fused_mega_moe_tail:
+                assert shared_output is not None
+                assert isinstance(self.routed_output_transform, KimiFusedMoETail)
+                final_hidden_states = self.routed_output_transform(
+                    final_hidden_states, shared_output
+                )
+            else:
+                final_hidden_states = self.routed_output_transform(
+                    final_hidden_states, residual=shared_output
+                )
         else:
             # Routed experts consume the down-projected latent; shared experts
             # (inside MoERunner) get the original hidden states via
@@ -1800,6 +2610,55 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is not None:
                 continue  # skip spec decode layers for main model
+            fused_input_shard = None
+            if name.endswith(".routed_expert_down_proj.weight"):
+                fused_input_shard = "routed"
+                fused_input_name = name.replace(
+                    ".routed_expert_down_proj.weight",
+                    ".fused_input_projection.proj.weight",
+                )
+            elif name.endswith(".shared_experts.gate_proj.weight"):
+                fused_input_shard = "gate"
+                fused_input_name = name.replace(
+                    ".shared_experts.gate_proj.weight",
+                    ".fused_input_projection.proj.weight",
+                )
+            elif name.endswith(".shared_experts.up_proj.weight"):
+                fused_input_shard = "up"
+                fused_input_name = name.replace(
+                    ".shared_experts.up_proj.weight",
+                    ".fused_input_projection.proj.weight",
+                )
+            if (
+                fused_input_shard is not None
+                and fused_input_name in params_dict
+            ):
+                param = params_dict[fused_input_name]
+                load_kimi_fused_moe_input_shard(
+                    param.data, loaded_weight, fused_input_shard
+                )
+                loaded_params.add(fused_input_name)
+                continue
+            fused_tail_shard = None
+            if name.endswith(".shared_experts.down_proj.weight"):
+                fused_tail_shard = "shared"
+                fused_name = name.replace(
+                    ".shared_experts.down_proj.weight",
+                    ".routed_output_transform.proj.weight",
+                )
+            elif name.endswith(".routed_expert_up_proj.weight"):
+                fused_tail_shard = "routed"
+                fused_name = name.replace(
+                    ".routed_expert_up_proj.weight",
+                    ".routed_output_transform.proj.weight",
+                )
+            if fused_tail_shard is not None and fused_name in params_dict:
+                param = params_dict[fused_name]
+                load_kimi_fused_moe_tail_shard(
+                    param.data, loaded_weight, fused_tail_shard
+                )
+                loaded_params.add(fused_name)
+                continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
@@ -1879,6 +2738,9 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         for module in self.modules():
             if isinstance(module, KimiMoE) and module.use_mega_moe:
                 module.experts.finalize_weights()
+                shared_experts = module.shared_experts
+                if isinstance(shared_experts, KimiMLP):
+                    shared_experts.finalize_fp8_simulation()
 
 
 class KimiLinearForCausalLM(

@@ -19,6 +19,8 @@ def maybe_execute_in_parallel(
     event0: torch.cuda.Event,
     event1: torch.cuda.Event,
     aux_stream: torch.cuda.Stream | None = None,
+    *,
+    launch_aux_first: bool = False,
 ) -> tuple[Any, Any]:
     """Run two functions potentially in parallel on separate CUDA streams.
 
@@ -38,6 +40,8 @@ def maybe_execute_in_parallel(
         aux_stream: The second CUDA stream for fn1.
             Multi-stream is disabled when aux_stream is None or a breakable
             CUDA graph capture is active.
+        launch_aux_first: Queue fn1 before fn0. This lets finite work on the
+            auxiliary stream claim resources before a persistent fn0 kernel.
 
     Returns:
         Tuple of (fn0_result, fn1_result).
@@ -50,11 +54,18 @@ def maybe_execute_in_parallel(
 
     if aux_stream is not None:
         event0.record()
-        result0 = fn0()
-        with torch.cuda.stream(aux_stream):
-            event0.wait()
-            result1 = fn1()
-            event1.record()
+        if launch_aux_first:
+            with torch.cuda.stream(aux_stream):
+                event0.wait()
+                result1 = fn1()
+                event1.record()
+            result0 = fn0()
+        else:
+            result0 = fn0()
+            with torch.cuda.stream(aux_stream):
+                event0.wait()
+                result1 = fn1()
+                event1.record()
         event1.wait()
     else:
         result0 = fn0()

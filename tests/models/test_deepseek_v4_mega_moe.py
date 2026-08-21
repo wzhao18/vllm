@@ -167,12 +167,16 @@ def test_deepseek_v4_mega_moe_weight_loader_uses_ep_expert_ownership():
 
 
 def _kimi_flashinfer_test_config(
-    *, max_num_batched_tokens: int = 64, tensor_parallel_size: int = 1
+    *,
+    max_num_batched_tokens: int = 64,
+    tensor_parallel_size: int = 1,
+    additional_config: dict | None = None,
 ):
     return SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_batched_tokens=max_num_batched_tokens),
         compilation_config=SimpleNamespace(static_forward_context={}),
         load_config=SimpleNamespace(load_format="auto"),
+        additional_config=additional_config or {},
         parallel_config=SimpleNamespace(
             enable_eplb=False,
             enable_expert_parallel=True,
@@ -344,9 +348,11 @@ def test_kimi_flashinfer_mega_moe_builds_modelopt_scale_algebra(monkeypatch):
     assert kernel.situ_beta == 4.0
     assert kernel.situ_linear_beta == 25.0
     assert kernel.in_kernel_fc2_reduce
+    assert kernel.combine_dtype == "bf16"
     assert kernel.knobs == {
         "cluster_shape_mnk": (2, 1, 1),
         "group_hint": 512,
+        "max_active_clusters": 60,
         "epi_flag_batch": (2, 4),
         "load_balance_mode": "atomic_counter",
         "mma_tiler_mnk": (256, 128, 256),
@@ -357,6 +363,409 @@ def test_kimi_flashinfer_mega_moe_builds_modelopt_scale_algebra(monkeypatch):
     assert captured["weights"].w13_scale.shape == (2, 256, 8)
     assert experts.w13_weight is None
     assert experts.w2_weight is None
+
+
+def test_kimi_flashinfer_mega_moe_overrides_kernel_knobs():
+    from vllm.models.kimi_k3.nvidia.model import (
+        get_kimi_nvfp4_mega_moe_knobs,
+    )
+
+    default_knobs = get_kimi_nvfp4_mega_moe_knobs(_kimi_flashinfer_test_config())
+    assert default_knobs["max_active_clusters"] == 60
+
+    config = _kimi_flashinfer_test_config(
+        additional_config={
+            "kimi_nvfp4_mega_moe_knobs": {
+                "max_active_clusters": 72,
+                "mma_tiler_mnk": [256, 256, 256],
+            }
+        }
+    )
+
+    knobs = get_kimi_nvfp4_mega_moe_knobs(config)
+
+    assert knobs["max_active_clusters"] == 72
+    assert knobs["mma_tiler_mnk"] == (256, 256, 256)
+
+
+def test_kimi_fused_shared_expert_uses_routed_grid_complement():
+    from vllm.models.kimi_k3.nvidia.model import (
+        get_kimi_nvfp4_fused_shared_expert_num_sms,
+    )
+
+    config = _kimi_flashinfer_test_config()
+    assert get_kimi_nvfp4_fused_shared_expert_num_sms(config, 148) == 28
+
+    config = _kimi_flashinfer_test_config(
+        additional_config={
+            "kimi_nvfp4_mega_moe_knobs": {"max_active_clusters": 64}
+        }
+    )
+    assert get_kimi_nvfp4_fused_shared_expert_num_sms(config, 148) == 20
+
+
+def test_kimi_fused_shared_expert_num_sms_override():
+    from vllm.models.kimi_k3.nvidia.model import (
+        get_kimi_nvfp4_fused_shared_expert_num_sms,
+    )
+
+    config = _kimi_flashinfer_test_config(
+        additional_config={"kimi_nvfp4_fused_shared_expert_num_sms": 16}
+    )
+    assert get_kimi_nvfp4_fused_shared_expert_num_sms(config, 148) == 16
+
+
+def test_kimi_flashinfer_mega_moe_quantized_combine_configuration():
+    from vllm.models.kimi_k3.nvidia.model import (
+        KimiK3FlashInferMegaMoEExperts,
+    )
+
+    config = _kimi_flashinfer_test_config(
+        additional_config={"kimi_nvfp4_mega_moe_combine_dtype": "mxfp8"}
+    )
+    experts = KimiK3FlashInferMegaMoEExperts(
+        config,
+        num_experts=2,
+        num_local_experts=2,
+        experts_start_idx=0,
+        top_k=2,
+        hidden_size=128,
+        intermediate_size=128,
+        activation="situ",
+        activation_beta=4.0,
+        activation_linear_beta=25.0,
+    )
+
+    assert experts._mega_moe_combine_dtype == "mxfp8"
+    assert experts._mega_moe_knobs["token_back_mode"] == "reuse_dispatch_warps"
+    assert experts._mega_moe_knobs["non_ubulk_fc2_store"]
+
+
+def test_kimi_flashinfer_mega_moe_staged_bf16_combine_configuration():
+    from vllm.models.kimi_k3.nvidia.model import (
+        get_kimi_nvfp4_mega_moe_in_kernel_reduce,
+    )
+
+    config = _kimi_flashinfer_test_config(
+        additional_config={
+            "kimi_nvfp4_mega_moe_in_kernel_fc2_reduce": False
+        }
+    )
+
+    assert not get_kimi_nvfp4_mega_moe_in_kernel_reduce(config)
+
+
+@pytest.mark.parametrize("preschedule", [False, True])
+@pytest.mark.parametrize("routed_first", [False, True])
+def test_kimi_mega_moe_overlaps_replicated_shared_experts(
+    monkeypatch, preschedule, routed_first
+):
+    from vllm.models.kimi_k3.nvidia import model as kimi_model
+
+    moe = kimi_model.KimiMoE.__new__(kimi_model.KimiMoE)
+    torch.nn.Module.__init__(moe)
+    moe.use_mega_moe = True
+    moe.use_flashinfer_mega_moe = True
+    moe.use_fused_mega_moe_tail = False
+    moe.skip_shared_expert_for_profiling = False
+    moe.preschedule_shared_expert = preschedule
+    moe.use_fused_shared_expert = routed_first
+    moe.fused_shared_expert_routed_first = routed_first
+    moe._shared_expert_events = (object(), object())
+
+    class RoutedExperts(torch.nn.Module):
+        def forward(self, hidden_states, *args, **kwargs):
+            return hidden_states + 2
+
+    class SharedExperts(torch.nn.Module):
+        shard_sequence_parallel = False
+
+        def forward(self, hidden_states):
+            return hidden_states + 3
+
+    class RoutedOutputTransform(torch.nn.Module):
+        def forward(self, hidden_states, residual=None):
+            assert residual is not None
+            return hidden_states + residual
+
+    moe.experts = RoutedExperts()
+    moe.shared_experts = SharedExperts()
+    moe.routed_output_transform = RoutedOutputTransform()
+    object.__setattr__(
+        moe,
+        "_maybe_overlap_router_and_down_proj",
+        lambda hidden_states: (
+            hidden_states + 1,
+            torch.ones(hidden_states.shape[0], 1),
+            torch.zeros(hidden_states.shape[0], 1, dtype=torch.int64),
+            None,
+        ),
+    )
+
+    stream = object()
+    captured = {}
+
+    def fake_execute(fn0, fn1, event0, event1, aux, **kwargs):
+        captured["stream"] = aux
+        captured["events"] = (event0, event1)
+        captured["kwargs"] = kwargs
+        return fn0(), fn1()
+
+    monkeypatch.setattr(kimi_model, "maybe_execute_in_parallel", fake_execute)
+    monkeypatch.setattr(kimi_model, "aux_stream", lambda: stream)
+    monkeypatch.setattr(kimi_model, "kimi_shared_expert_stream", lambda: stream)
+    monkeypatch.setattr(kimi_model.envs, "VLLM_DISABLE_SHARED_EXPERTS_STREAM", False)
+    monkeypatch.setattr(
+        kimi_model.envs, "VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD", 256
+    )
+
+    hidden_states = torch.ones(4, 8)
+    output = moe(hidden_states)
+
+    assert captured["stream"] is stream
+    assert captured["events"] == moe._shared_expert_events
+    assert captured["kwargs"] == {"launch_aux_first": not routed_first}
+    torch.testing.assert_close(output, hidden_states * 2 + 6)
+
+
+def test_kimi_fused_moe_tail_matches_two_projection_sum():
+    from vllm.models.kimi_k3.nvidia.model import KimiFusedMoETail
+
+    shared_size = 6
+    routed_size = 4
+    hidden_size = 8
+    tail = KimiFusedMoETail.__new__(KimiFusedMoETail)
+    torch.nn.Module.__init__(tail)
+    tail.norm = None
+
+    class Projection(torch.nn.Module):
+        def __init__(self, weight):
+            super().__init__()
+            self.weight = torch.nn.Parameter(weight)
+
+        def forward(self, hidden_states):
+            return hidden_states @ self.weight.t(), None
+
+    shared_weight = torch.randn(hidden_size, shared_size)
+    routed_weight = torch.randn(hidden_size, routed_size)
+    tail.proj = Projection(torch.cat((shared_weight, routed_weight), dim=1))
+
+    shared_activations = torch.randn(3, shared_size)
+    routed_hidden_states = torch.randn(3, routed_size)
+    expected = (
+        shared_activations @ shared_weight.t()
+        + routed_hidden_states @ routed_weight.t()
+    )
+
+    actual = tail(routed_hidden_states, shared_activations)
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_kimi_fused_moe_tail_loader_packs_input_shards():
+    from vllm.models.kimi_k3.nvidia.model import (
+        load_kimi_fused_moe_tail_shard,
+    )
+
+    packed = torch.zeros(8, 10)
+    shared = torch.randn(8, 6)
+    routed = torch.randn(8, 4)
+
+    load_kimi_fused_moe_tail_shard(packed, shared, "shared")
+    load_kimi_fused_moe_tail_shard(packed, routed, "routed")
+
+    torch.testing.assert_close(packed, torch.cat((shared, routed), dim=1))
+
+
+def test_kimi_fused_moe_input_matches_two_projections():
+    from vllm.models.kimi_k3.nvidia.model import KimiFusedMoEInputProjection
+
+    hidden_size = 8
+    routed_size = 4
+    shared_size = 6
+    projection = KimiFusedMoEInputProjection.__new__(
+        KimiFusedMoEInputProjection
+    )
+    torch.nn.Module.__init__(projection)
+    projection.routed_hidden_size = routed_size
+    projection.shared_gate_up_size = 2 * shared_size
+
+    class Projection(torch.nn.Module):
+        def __init__(self, weight):
+            super().__init__()
+            self.weight = torch.nn.Parameter(weight)
+
+        def forward(self, hidden_states):
+            return hidden_states @ self.weight.t(), None
+
+    routed_weight = torch.randn(routed_size, hidden_size)
+    gate_weight = torch.randn(shared_size, hidden_size)
+    up_weight = torch.randn(shared_size, hidden_size)
+    projection.proj = Projection(
+        torch.cat((routed_weight, gate_weight, up_weight), dim=0)
+    )
+    hidden_states = torch.randn(3, hidden_size)
+
+    routed, gate_up = projection(hidden_states)
+
+    torch.testing.assert_close(routed, hidden_states @ routed_weight.t())
+    torch.testing.assert_close(
+        gate_up,
+        torch.cat(
+            (hidden_states @ gate_weight.t(), hidden_states @ up_weight.t()),
+            dim=-1,
+        ),
+    )
+
+
+def test_kimi_fused_moe_input_loader_packs_output_shards():
+    from vllm.models.kimi_k3.nvidia.model import (
+        load_kimi_fused_moe_input_shard,
+    )
+
+    routed = torch.randn(4, 8)
+    gate = torch.randn(6, 8)
+    up = torch.randn(6, 8)
+    packed = torch.zeros(16, 8)
+
+    load_kimi_fused_moe_input_shard(packed, routed, "routed")
+    load_kimi_fused_moe_input_shard(packed, gate, "gate")
+    load_kimi_fused_moe_input_shard(packed, up, "up")
+
+    torch.testing.assert_close(packed, torch.cat((routed, gate, up), dim=0))
+
+
+def test_kimi_shared_output_projection_matches_activation_and_linear():
+    from vllm.model_executor.layers.activation import SituAndMul
+    from vllm.models.kimi_k3.nvidia.model import KimiSharedOutputProjection
+
+    module = KimiSharedOutputProjection.__new__(KimiSharedOutputProjection)
+    torch.nn.Module.__init__(module)
+    module.act_fn = SituAndMul(beta=1.25, linear_beta=0.5)
+
+    class Projection(torch.nn.Module):
+        def __init__(self, weight):
+            super().__init__()
+            self.weight = torch.nn.Parameter(weight)
+
+        def forward(self, hidden_states):
+            return hidden_states @ self.weight.t(), None
+
+    weight = torch.randn(8, 6)
+    module.down_proj = Projection(weight)
+    gate_up = torch.randn(4, 12)
+
+    expected = module.act_fn(gate_up) @ weight.t()
+
+    torch.testing.assert_close(module(gate_up), expected)
+
+
+def test_kimi_fused_shared_expert_packs_gate_up_blocks_and_matches_reference():
+    from vllm.models.kimi_k3.nvidia.model import KimiFusedSharedExpert
+
+    hidden_size = 8
+    intermediate_size = 64
+    module = KimiFusedSharedExpert.__new__(KimiFusedSharedExpert)
+    torch.nn.Module.__init__(module)
+    module.hidden_size = hidden_size
+    module.intermediate_size = intermediate_size
+    module.situ_beta = 4.0
+    module.situ_linear_beta = 25.0
+    packed = torch.nn.Parameter(torch.empty(2 * intermediate_size, hidden_size))
+    module.gate_up_proj = SimpleNamespace(weight=packed)
+    down_weight = torch.randn(hidden_size, intermediate_size)
+    module.down_proj = SimpleNamespace(weight=down_weight)
+
+    gate_weight = torch.randn(intermediate_size, hidden_size)
+    up_weight = torch.randn(intermediate_size, hidden_size)
+    module._load_gate_up_weight(packed, gate_weight, 0)
+    module._load_gate_up_weight(packed, up_weight, 1)
+
+    fc1_weight, fc2_weight = module._weights()
+    assert fc1_weight.shape == (2 * intermediate_size, hidden_size)
+    assert fc1_weight.is_contiguous()
+    assert fc2_weight.shape == (hidden_size, intermediate_size)
+    assert fc2_weight.is_contiguous()
+
+    hidden_states = torch.randn(3, hidden_size)
+    gate = hidden_states @ gate_weight.t()
+    up = hidden_states @ up_weight.t()
+    gate = 4.0 * torch.tanh(gate / 4.0) * torch.sigmoid(gate)
+    up = 25.0 * torch.tanh(up / 25.0)
+    expected = (gate * up) @ down_weight.t()
+
+    torch.testing.assert_close(module.forward_native(hidden_states), expected)
+
+
+def test_kimi_fused_shared_expert_uses_direct_deepgemm_input():
+    from vllm.models.kimi_k3.nvidia.model import _KimiDeepGemmSharedSession
+
+    session = _KimiDeepGemmSharedSession.__new__(_KimiDeepGemmSharedSession)
+    session.buffer = object()
+    session.dummy_l1 = torch.empty(1)
+    session.dummy_l2 = torch.empty(1)
+    session.output = torch.empty(2, 8)
+    session.num_sms = 28
+    captured = {}
+
+    def bf16_mega_moe(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+
+    session.deep_gemm = SimpleNamespace(
+        bf16_mega_moe=bf16_mega_moe,
+    )
+    hidden_states = torch.randn(2, 8)
+    gate_up_weight = torch.randn(12, 8)
+    down_weight = torch.randn(8, 6)
+
+    output = session.run(
+        hidden_states,
+        gate_up_weight,
+        down_weight,
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    )
+
+    assert output is session.output
+    assert captured["args"][0] is session.output
+    assert captured["args"][1] is session.dummy_l1
+    assert captured["args"][2] is session.dummy_l2
+    assert captured["args"][3] is session.buffer
+    assert captured["kwargs"]["shared_l1_acts"] is hidden_states
+    assert captured["kwargs"]["shared_l1_weights"] is gate_up_weight
+    assert captured["kwargs"]["shared_l2_weights"] is down_weight
+    assert captured["kwargs"]["num_sms"] == 28
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(100),
+    reason="DeepGEMM BF16 MegaMoE requires SM100",
+)
+def test_kimi_fused_shared_expert_deepgemm_matches_native(default_vllm_config):
+    from vllm.models.kimi_k3.nvidia.model import KimiFusedSharedExpert
+
+    torch.manual_seed(0)
+    module = KimiFusedSharedExpert(
+        hidden_size=256,
+        intermediate_size=256,
+        max_num_tokens=64,
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+        num_sms=torch.cuda.get_device_properties(0).multi_processor_count,
+    ).to(device="cuda", dtype=torch.bfloat16)
+    gate = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda") / 32
+    up = torch.randn_like(gate) / 32
+    down = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda") / 32
+    module._load_gate_up_weight(module.gate_up_proj.weight, gate, 0)
+    module._load_gate_up_weight(module.gate_up_proj.weight, up, 1)
+    module.down_proj.weight.data.copy_(down)
+    hidden_states = torch.randn(16, 256, dtype=torch.bfloat16, device="cuda")
+
+    expected = module.forward_native(hidden_states)
+    actual = module.forward_cuda(hidden_states)
+
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.05)
 
 
 def test_kimi_flashinfer_mega_moe_forward_preserves_tensor_contract(monkeypatch):
