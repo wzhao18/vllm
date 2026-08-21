@@ -6,6 +6,8 @@ import pytest
 import torch
 
 from vllm.platforms import current_platform
+from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
+from vllm.v1.worker.gpu import cp_utils
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 
 DEVICE = current_platform.device_type
@@ -51,3 +53,32 @@ def test_make_dummy_distributes_remainder(num_reqs: int, num_tokens: int):
     assert torch.equal(
         batch.query_start_loc.cpu(), torch.from_numpy(batch.query_start_loc_np)
     )
+
+
+def test_prepare_dummy_dcp_local_seq_lens(monkeypatch: pytest.MonkeyPatch):
+    """DCP dummy batches must carry local lengths for MLA metadata."""
+    buffers = InputBuffers(
+        max_num_reqs=4, max_num_tokens=12, device=torch.device("cpu")
+    )
+    batch = InputBatch.make_dummy(4, 12, buffers)
+
+    def prepare(
+        output: torch.Tensor,
+        seq_lens: torch.Tensor,
+        num_reqs: int,
+        dcp_size: int,
+        dcp_rank: int,
+        cp_interleave: int,
+    ) -> None:
+        output[:num_reqs].copy_(
+            get_dcp_local_seq_lens(
+                seq_lens[:num_reqs], dcp_size, dcp_rank, cp_interleave
+            )
+        )
+
+    monkeypatch.setattr(cp_utils, "prepare_dcp_local_seq_lens", prepare)
+    cp_utils.prepare_dummy_dcp_local_seq_lens(batch, buffers, 2, 1, 1)
+
+    assert batch.dcp_local_seq_lens is not None
+    assert torch.equal(batch.dcp_local_seq_lens, torch.ones(4, dtype=torch.int32))
+    assert batch.dcp_local_seq_lens.data_ptr() == buffers.dcp_local_seq_lens.data_ptr()

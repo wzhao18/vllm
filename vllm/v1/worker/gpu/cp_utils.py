@@ -1,8 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from typing import TYPE_CHECKING
+
 import torch
 
 from vllm.triton_utils import tl, triton
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 
 
 def prepare_dcp_local_seq_lens(
@@ -30,6 +35,29 @@ def prepare_dcp_local_seq_lens(
         max_num_reqs,
         BLOCK_SIZE,
     )
+
+
+def prepare_dummy_dcp_local_seq_lens(
+    input_batch: "InputBatch",
+    input_buffers: "InputBuffers",
+    dcp_size: int,
+    dcp_rank: int,
+    cp_interleave: int,
+) -> None:
+    if dcp_size == 1:
+        return
+
+    prepare_dcp_local_seq_lens(
+        input_buffers.dcp_local_seq_lens,
+        input_batch.seq_lens,
+        input_batch.num_reqs,
+        dcp_size,
+        dcp_rank,
+        cp_interleave,
+    )
+    input_batch.dcp_local_seq_lens = input_buffers.dcp_local_seq_lens[
+        : input_batch.num_reqs_after_padding
+    ]
 
 
 @triton.jit

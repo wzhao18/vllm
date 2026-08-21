@@ -89,7 +89,10 @@ from vllm.v1.worker.gpu.buffer_utils import (
     async_copy_to_gpu,
     set_default_max_concurrency,
 )
-from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
+from vllm.v1.worker.gpu.cp_utils import (
+    prepare_dcp_local_seq_lens,
+    prepare_dummy_dcp_local_seq_lens,
+)
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     ModelCudaGraphManager,
@@ -1505,6 +1508,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         self.kv_cache_config.num_blocks,
                         self.max_model_len,
                     )
+                prepare_dummy_dcp_local_seq_lens(
+                    input_batch,
+                    self.input_buffers,
+                    self.dcp_size,
+                    self.dcp_rank,
+                    self.cp_interleave,
+                )
             else:
                 assert batch_desc.cg_mode != CUDAGraphMode.FULL, (
                     "Attention metadata must be prepared for dummy runs when using "
