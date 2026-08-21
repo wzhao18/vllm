@@ -761,6 +761,7 @@ class _KimiFlashInferNvfp4SharedSession:
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
             knobs={"max_active_clusters": num_sms // 2},
+            local_only=True,
         )
         self.topk_ids = torch.zeros(
             num_tokens, 1, dtype=torch.int64, device="cuda"
