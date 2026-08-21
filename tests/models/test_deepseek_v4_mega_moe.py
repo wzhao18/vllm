@@ -835,6 +835,46 @@ def test_kimi_flashinfer_mega_moe_uses_sequence_parallel_token_capacity():
     assert experts.max_num_tokens == 2048
 
 
+def test_kimi_nvfp4_shared_expert_buckets_session_capacity(monkeypatch):
+    from vllm.models.kimi_k3.nvidia import model as kimi_model
+
+    experts = kimi_model.KimiFusedSharedExpert.__new__(
+        kimi_model.KimiFusedSharedExpert
+    )
+    experts.max_num_tokens = 8192
+    experts.overlap_max_num_tokens = 256
+    experts.hidden_size = 128
+    experts.intermediate_size = 256
+    experts.num_sms = 28
+    experts.situ_beta = 4.0
+    experts.situ_linear_beta = 25.0
+    experts._nvfp4_sessions = {}
+
+    capacities = []
+
+    class FakeSession:
+        def __init__(self, *, num_tokens, **kwargs):
+            capacities.append(num_tokens)
+
+    monkeypatch.setattr(
+        kimi_model, "_KimiFlashInferNvfp4SharedSession", FakeSession
+    )
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(multi_processor_count=148),
+    )
+
+    session_129 = experts._nvfp4_session(torch.empty(129, 128))
+    session_200 = experts._nvfp4_session(torch.empty(200, 128))
+    session_257 = experts._nvfp4_session(torch.empty(257, 128))
+
+    assert session_129 is session_200
+    assert session_257 is not session_200
+    assert capacities == [256, 512]
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="DeepSeek V4 MegaMoE fused input staging requires CUDA.",

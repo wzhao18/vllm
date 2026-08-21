@@ -636,6 +636,10 @@ class KimiFusedSharedExpert(CustomOp):
         self, hidden_states: torch.Tensor
     ) -> "_KimiFlashInferNvfp4SharedSession":
         num_tokens = hidden_states.shape[0]
+        session_capacity = min(
+            1 << max(num_tokens - 1, 0).bit_length(),
+            self.max_num_tokens,
+        )
         device = hidden_states.device.index
         if device is None:
             device = torch.cuda.current_device()
@@ -646,7 +650,7 @@ class KimiFusedSharedExpert(CustomOp):
             ).multi_processor_count
         key = (
             device,
-            num_tokens,
+            session_capacity,
             self.hidden_size,
             self.intermediate_size,
             session_num_sms,
@@ -656,7 +660,7 @@ class KimiFusedSharedExpert(CustomOp):
         session = self._nvfp4_sessions.get(key)
         if session is None:
             session = _KimiFlashInferNvfp4SharedSession(
-                num_tokens=num_tokens,
+                num_tokens=session_capacity,
                 hidden_size=self.hidden_size,
                 intermediate_size=self.intermediate_size,
                 num_sms=session_num_sms,
@@ -764,6 +768,7 @@ class _KimiFlashInferNvfp4SharedSession:
         )
 
         self.num_tokens = num_tokens
+        self.active_num_tokens = 0
         self.buffer = get_symm_buffer_for_mega_moe(
             1,
             num_tokens,
@@ -791,6 +796,12 @@ class _KimiFlashInferNvfp4SharedSession:
             stage_mega_moe_inputs,
         )
 
+        num_tokens = hidden_states.shape[0]
+        if num_tokens > self.num_tokens:
+            raise ValueError(
+                f"Shared-expert input has {num_tokens} tokens, but the session "
+                f"capacity is {self.num_tokens}."
+            )
         stage_mega_moe_inputs(
             hidden_states,
             self.topk_weights,
@@ -800,6 +811,7 @@ class _KimiFlashInferNvfp4SharedSession:
             self.buffer.topk_idx,
             self.buffer.topk_weights,
         )
+        self.active_num_tokens = num_tokens
 
     def run(self, transformed_weights) -> torch.Tensor:
         from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.nvfp4 import (
@@ -813,7 +825,7 @@ class _KimiFlashInferNvfp4SharedSession:
             thunk = nvfp4_mega_launch_thunk(fc1, fc2, self.buffer)
             self._thunks[key] = thunk
         thunk()
-        return self.buffer.output_activation[: self.num_tokens]
+        return self.buffer.output_activation[: self.active_num_tokens]
 
 
 class _KimiDeepGemmSharedSession:
