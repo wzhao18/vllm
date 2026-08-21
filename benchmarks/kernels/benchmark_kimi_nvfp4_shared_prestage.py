@@ -17,6 +17,7 @@ def main() -> None:
     parser.add_argument("--tokens", type=int, default=64)
     parser.add_argument("--hidden", type=int, default=7168)
     parser.add_argument("--intermediate", type=int, default=6144)
+    parser.add_argument("--cudagraph-replays", type=int, default=0)
     args = parser.parse_args()
 
     torch.manual_seed(0)
@@ -52,6 +53,15 @@ def main() -> None:
 
     module.stage_nvfp4(hidden)
     actual = module.forward_staged_nvfp4(hidden).clone()
+    if args.cudagraph_replays:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            module.stage_nvfp4(hidden)
+            graph_output = module.forward_staged_nvfp4(hidden)
+        for _ in range(args.cudagraph_replays):
+            graph.replay()
+        torch.cuda.synchronize()
+        actual = graph_output.clone()
     gate_output = hidden @ gate.t()
     up_output = hidden @ up.t()
     gate_output = 4.0 * torch.tanh(gate_output / 4.0) * torch.sigmoid(gate_output)
