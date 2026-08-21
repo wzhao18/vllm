@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import time
 
 import torch
 
@@ -21,6 +22,7 @@ def main() -> None:
     args = parser.parse_args()
 
     torch.manual_seed(0)
+    started = time.perf_counter()
     with set_current_vllm_config(VllmConfig()):
         module = KimiFusedSharedExpert(
             args.hidden,
@@ -50,6 +52,12 @@ def main() -> None:
     hidden = torch.randn(
         args.tokens, args.hidden, dtype=torch.bfloat16, device="cuda"
     )
+    torch.cuda.synchronize()
+    weights_ready = time.perf_counter()
+
+    module.finalize_weights()
+    torch.cuda.synchronize()
+    weights_transformed = time.perf_counter()
 
     module.stage_nvfp4(hidden)
     actual = module.forward_staged_nvfp4(hidden).clone()
@@ -73,6 +81,10 @@ def main() -> None:
     cosine = torch.nn.functional.cosine_similarity(
         actual.float().flatten(), expected.float().flatten(), dim=0
     ).item()
+    print(
+        f"setup_seconds={weights_ready - started:.3f} "
+        f"transform_seconds={weights_transformed - weights_ready:.3f}"
+    )
     print(f"relative_l2={relative_l2:.6f} cosine={cosine:.8f}")
 
 
