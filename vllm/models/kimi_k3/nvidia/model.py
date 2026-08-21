@@ -551,7 +551,8 @@ class KimiFusedSharedExpert(CustomOp):
                 f"by {self.num_shared_experts}."
             )
         self.expert_intermediate_size = intermediate_size // self.num_shared_experts
-        self.max_num_tokens = min(
+        self.max_num_tokens = max_num_tokens
+        self.overlap_max_num_tokens = min(
             max_num_tokens,
             envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD,
         )
@@ -591,6 +592,8 @@ class KimiFusedSharedExpert(CustomOp):
         target.copy_(loaded_weight.view_as(target))
 
     def _weights(self) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self.gate_up_proj.weight is not None
+        assert self.down_proj.weight is not None
         return self.gate_up_proj.weight, self.down_proj.weight
 
     def _canonical_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -626,6 +629,8 @@ class KimiFusedSharedExpert(CustomOp):
     def finalize_weights(self) -> None:
         if self.use_nvfp4:
             self._nvfp4_weights()
+            self.gate_up_proj.register_parameter("weight", None)
+            self.down_proj.register_parameter("weight", None)
 
     def _nvfp4_session(
         self, hidden_states: torch.Tensor
@@ -634,12 +639,17 @@ class KimiFusedSharedExpert(CustomOp):
         device = hidden_states.device.index
         if device is None:
             device = torch.cuda.current_device()
+        session_num_sms = self.num_sms
+        if num_tokens > self.overlap_max_num_tokens:
+            session_num_sms = torch.cuda.get_device_properties(
+                device
+            ).multi_processor_count
         key = (
             device,
             num_tokens,
             self.hidden_size,
             self.intermediate_size,
-            self.num_sms,
+            session_num_sms,
             self.situ_beta,
             self.situ_linear_beta,
         )
@@ -649,7 +659,7 @@ class KimiFusedSharedExpert(CustomOp):
                 num_tokens=num_tokens,
                 hidden_size=self.hidden_size,
                 intermediate_size=self.intermediate_size,
-                num_sms=self.num_sms,
+                num_sms=session_num_sms,
                 situ_beta=self.situ_beta,
                 situ_linear_beta=self.situ_linear_beta,
             )
@@ -688,11 +698,16 @@ class KimiFusedSharedExpert(CustomOp):
         return session
 
     def forward_cuda(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if hidden_states.shape[0] > self.max_num_tokens:
-            return self.forward_native(hidden_states)
         if self.use_nvfp4:
+            if hidden_states.shape[0] > self.max_num_tokens:
+                raise ValueError(
+                    "NVFP4 shared-expert input exceeds max_num_batched_tokens: "
+                    f"{hidden_states.shape[0]} > {self.max_num_tokens}."
+                )
             self.stage_nvfp4(hidden_states)
             return self.forward_staged_nvfp4(hidden_states)
+        if hidden_states.shape[0] > self.overlap_max_num_tokens:
+            return self.forward_native(hidden_states)
         gate_up_weight, down_weight = self._weights()
         return self._session(hidden_states).run(
             hidden_states,
@@ -2011,10 +2026,15 @@ class KimiMoE(nn.Module):
             None if self.skip_shared_expert_for_profiling else self.shared_experts
         )
         prescheduled_shared_output = None
-        staged_nvfp4_shared = bool(
+        uses_nvfp4_shared = bool(
             isinstance(shared_experts, KimiFusedSharedExpert)
             and shared_experts.use_nvfp4
             and num_tokens <= shared_experts.max_num_tokens
+        )
+        staged_nvfp4_shared = bool(
+            uses_nvfp4_shared
+            and isinstance(shared_experts, KimiFusedSharedExpert)
+            and num_tokens <= shared_experts.overlap_max_num_tokens
         )
         can_preschedule_shared = (
             self.use_mega_moe
@@ -2060,6 +2080,9 @@ class KimiMoE(nn.Module):
             routed_hidden_states, router_output, topk_ids, shared_gate_up = (
                 self._maybe_overlap_router_and_down_proj(hidden_states)
             )
+            if uses_nvfp4_shared:
+                assert isinstance(shared_experts, KimiFusedSharedExpert)
+                shared_experts.stage_nvfp4(hidden_states)
         if self.use_mega_moe:
             assert self.routed_output_transform is not None
             assert topk_ids is not None
@@ -2087,7 +2110,7 @@ class KimiMoE(nn.Module):
                     and num_tokens <= envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
                 ):
                     shared_stream = aux_stream()
-                if staged_nvfp4_shared:
+                if uses_nvfp4_shared:
                     assert isinstance(shared_experts, KimiFusedSharedExpert)
                     shared_fn = lambda: shared_experts.forward_staged_nvfp4(
                         hidden_states

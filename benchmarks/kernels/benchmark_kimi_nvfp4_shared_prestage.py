@@ -58,6 +58,8 @@ def main() -> None:
     module.finalize_weights()
     torch.cuda.synchronize()
     weights_transformed = time.perf_counter()
+    assert module.gate_up_proj.weight is None
+    assert module.down_proj.weight is None
 
     module.stage_nvfp4(hidden)
     actual = module.forward_staged_nvfp4(hidden).clone()
