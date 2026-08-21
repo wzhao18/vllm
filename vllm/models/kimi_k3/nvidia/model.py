@@ -3,7 +3,7 @@
 """Kimi-K3 multimodal model implementation for vLLM."""
 
 import math
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any, cast
 
 import torch
@@ -546,6 +546,9 @@ class KimiFusedSharedExpert(CustomOp):
     shard_sequence_parallel = False
     gate_up_interleave = 8
     _sessions: dict[tuple[int, ...], "_KimiDeepGemmSharedSession"] = {}
+    _nvfp4_sessions: dict[
+        tuple[int, ...], "_KimiFlashInferNvfp4SharedSession"
+    ] = {}
 
     def __init__(
         self,
@@ -555,6 +558,7 @@ class KimiFusedSharedExpert(CustomOp):
         situ_beta: float,
         situ_linear_beta: float | None,
         num_sms: int,
+        use_nvfp4: bool = False,
     ) -> None:
         super().__init__(enforce_enable=True)
         if intermediate_size % self.gate_up_interleave:
@@ -578,6 +582,8 @@ class KimiFusedSharedExpert(CustomOp):
         self.situ_beta = situ_beta
         self.situ_linear_beta = situ_linear_beta
         self.num_sms = num_sms
+        self.use_nvfp4 = use_nvfp4
+        self._transformed_nvfp4_weights = None
         num_blocks = intermediate_size // self.gate_up_interleave
         self.gate_up_proj = _KimiFusedSharedLinear(
             (2 * intermediate_size, hidden_size),
@@ -611,6 +617,71 @@ class KimiFusedSharedExpert(CustomOp):
     def _weights(self) -> tuple[torch.Tensor, torch.Tensor]:
         return self.gate_up_proj.weight, self.down_proj.weight
 
+    def _canonical_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
+        gate_up_weight, down_weight = self._weights()
+        packed = gate_up_weight.view(
+            self.intermediate_size // self.gate_up_interleave,
+            2,
+            self.gate_up_interleave,
+            self.hidden_size,
+        )
+        gate = packed[:, 0].reshape(self.intermediate_size, self.hidden_size)
+        up = packed[:, 1].reshape(self.intermediate_size, self.hidden_size)
+        return torch.cat((gate, up), dim=0), down_weight
+
+    def _nvfp4_weights(self):
+        if self._transformed_nvfp4_weights is None:
+            from flashinfer.moe_ep import MoEWeightPack
+            from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.weights import (
+                preprocess_mega_weights,
+            )
+
+            gate_up_weight, down_weight = self._canonical_weights()
+            self._transformed_nvfp4_weights = preprocess_mega_weights(
+                MoEWeightPack(
+                    w13=gate_up_weight.unsqueeze(0),
+                    w2=down_weight.unsqueeze(0),
+                ),
+                intermediate_size=self.intermediate_size,
+                hidden_size=self.hidden_size,
+            )
+        return self._transformed_nvfp4_weights
+
+    def _nvfp4_session(
+        self, hidden_states: torch.Tensor
+    ) -> "_KimiFlashInferNvfp4SharedSession":
+        num_tokens = hidden_states.shape[0]
+        device = hidden_states.device.index
+        if device is None:
+            device = torch.cuda.current_device()
+        key = (
+            device,
+            num_tokens,
+            self.hidden_size,
+            self.intermediate_size,
+            self.num_sms,
+            self.situ_beta,
+            self.situ_linear_beta,
+        )
+        session = self._nvfp4_sessions.get(key)
+        if session is None:
+            session = _KimiFlashInferNvfp4SharedSession(
+                num_tokens=num_tokens,
+                hidden_size=self.hidden_size,
+                intermediate_size=self.intermediate_size,
+                num_sms=self.num_sms,
+                situ_beta=self.situ_beta,
+                situ_linear_beta=self.situ_linear_beta,
+            )
+            self._nvfp4_sessions[key] = session
+        return session
+
+    def stage_nvfp4(self, hidden_states: torch.Tensor) -> None:
+        self._nvfp4_session(hidden_states).stage(hidden_states)
+
+    def forward_staged_nvfp4(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self._nvfp4_session(hidden_states).run(self._nvfp4_weights())
+
     def _session(self, hidden_states: torch.Tensor) -> "_KimiDeepGemmSharedSession":
         num_tokens = hidden_states.shape[0]
         device = hidden_states.device.index
@@ -639,6 +710,9 @@ class KimiFusedSharedExpert(CustomOp):
     def forward_cuda(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.shape[0] > self.max_num_tokens:
             return self.forward_native(hidden_states)
+        if self.use_nvfp4:
+            self.stage_nvfp4(hidden_states)
+            return self.forward_staged_nvfp4(hidden_states)
         gate_up_weight, down_weight = self._weights()
         return self._session(hidden_states).run(
             hidden_states,
@@ -677,6 +751,73 @@ class _KimiSingleRankGroup:
     @staticmethod
     def barrier() -> None:
         return None
+
+
+class _KimiFlashInferNvfp4SharedSession:
+    def __init__(
+        self,
+        *,
+        num_tokens: int,
+        hidden_size: int,
+        intermediate_size: int,
+        num_sms: int,
+        situ_beta: float,
+        situ_linear_beta: float | None,
+    ) -> None:
+        from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.nvfp4 import (
+            get_symm_buffer_for_mega_moe,
+        )
+
+        self.num_tokens = num_tokens
+        self.buffer = get_symm_buffer_for_mega_moe(
+            1,
+            num_tokens,
+            1,
+            hidden_size,
+            2 * intermediate_size,
+            0,
+            1,
+            activation="situ",
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            knobs={"max_active_clusters": num_sms // 2},
+        )
+        self.topk_ids = torch.zeros(
+            num_tokens, 1, dtype=torch.int64, device="cuda"
+        )
+        self.topk_weights = torch.ones(
+            num_tokens, 1, dtype=torch.float32, device="cuda"
+        )
+        self._thunks: dict[tuple[int, ...], Callable[[], None]] = {}
+
+    def stage(self, hidden_states: torch.Tensor) -> None:
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.staging import (
+            stage_mega_moe_inputs,
+        )
+
+        stage_mega_moe_inputs(
+            hidden_states,
+            self.topk_weights,
+            self.topk_ids,
+            self.buffer.x,
+            self.buffer.x_sf,
+            self.buffer.topk_idx,
+            self.buffer.topk_weights,
+        )
+
+    def run(self, transformed_weights) -> torch.Tensor:
+        from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.nvfp4 import (
+            nvfp4_mega_launch_thunk,
+        )
+
+        fc1, fc2 = transformed_weights
+        key = tuple(t.data_ptr() for pair in transformed_weights for t in pair)
+        thunk = self._thunks.get(key)
+        if thunk is None:
+            thunk = nvfp4_mega_launch_thunk(fc1, fc2, self.buffer)
+            self._thunks[key] = thunk
+        thunk()
+        return self.buffer.output_activation[: self.num_tokens]
 
 
 class _KimiDeepGemmSharedSession:
@@ -1480,11 +1621,22 @@ class KimiMoE(nn.Module):
                 "kimi_nvfp4_preschedule_shared_expert", False
             )
         )
+        self.use_nvfp4_fused_shared_expert = bool(
+            self.use_flashinfer_mega_moe
+            and self.num_shared_experts is not None
+            and isinstance(additional_config, dict)
+            and additional_config.get(
+                "kimi_nvfp4_fused_shared_expert_nvfp4", False
+            )
+        )
         self.use_fused_shared_expert = bool(
             self.use_flashinfer_mega_moe
             and self.num_shared_experts is not None
             and isinstance(additional_config, dict)
-            and additional_config.get("kimi_nvfp4_fused_shared_expert", False)
+            and (
+                self.use_nvfp4_fused_shared_expert
+                or additional_config.get("kimi_nvfp4_fused_shared_expert", False)
+            )
         )
         self.fused_shared_expert_routed_first = bool(
             self.use_fused_shared_expert
@@ -1621,6 +1773,7 @@ class KimiMoE(nn.Module):
                     activation_situ_beta or 1.0,
                     activation_situ_linear_beta,
                     shared_num_sms,
+                    use_nvfp4=self.use_nvfp4_fused_shared_expert,
                 )
             else:
                 self.shared_experts = KimiMLP(
@@ -1877,6 +2030,11 @@ class KimiMoE(nn.Module):
             None if self.skip_shared_expert_for_profiling else self.shared_experts
         )
         prescheduled_shared_output = None
+        staged_nvfp4_shared = bool(
+            isinstance(shared_experts, KimiFusedSharedExpert)
+            and shared_experts.use_nvfp4
+            and num_tokens <= shared_experts.max_num_tokens
+        )
         can_preschedule_shared = (
             self.use_mega_moe
             and self.preschedule_shared_expert
@@ -1888,7 +2046,22 @@ class KimiMoE(nn.Module):
         # Overlap the gate with the routed down projection; the returned hidden
         # states are already down-projected. Keep the original ``hidden_states``
         # for the shared experts.
-        if can_preschedule_shared:
+        if staged_nvfp4_shared:
+            assert isinstance(shared_experts, KimiFusedSharedExpert)
+            (
+                routed_hidden_states,
+                router_output,
+                topk_ids,
+                shared_gate_up,
+            ), _ = maybe_execute_in_parallel(
+                lambda: self._maybe_overlap_router_and_down_proj(hidden_states),
+                lambda: shared_experts.stage_nvfp4(hidden_states),
+                self._shared_expert_events[0],
+                self._shared_expert_events[1],
+                kimi_shared_expert_stream(),
+                launch_aux_first=True,
+            )
+        elif can_preschedule_shared:
             (
                 routed_hidden_states,
                 router_output,
@@ -1933,7 +2106,12 @@ class KimiMoE(nn.Module):
                     and num_tokens <= envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
                 ):
                     shared_stream = aux_stream()
-                if self.use_fused_moe_input_projection:
+                if staged_nvfp4_shared:
+                    assert isinstance(shared_experts, KimiFusedSharedExpert)
+                    shared_fn = lambda: shared_experts.forward_staged_nvfp4(
+                        hidden_states
+                    )
+                elif self.use_fused_moe_input_projection:
                     assert shared_gate_up is not None
                     assert isinstance(
                         shared_experts,
