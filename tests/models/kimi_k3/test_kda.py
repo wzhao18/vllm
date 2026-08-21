@@ -13,14 +13,17 @@ import torch
 import torch.nn.functional as F
 
 from vllm import _custom_ops as ops
+from vllm.model_executor import parameter
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_update
 from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
     gather_initial_states,
 )
+from vllm.model_executor.parameter import BlockQuantScaleParameter
 from vllm.models.kimi_k3.amd.ops.third_party.kda import (
     fused_recurrent_kda_packed_decode as fused_recurrent_kda_packed_decode_amd,
 )
 from vllm.models.kimi_k3.nvidia.kda import (
+    _KimiGDNMergedColumnParallelLinear,
     _flashkda_prefill,
     _store_cache_checkpoints_kernel,
     is_flashkda_supported,
@@ -57,6 +60,33 @@ PACKED_DECODE_IMPLS = {
     "nvidia": fused_recurrent_kda_packed_decode,
     "amd": fused_recurrent_kda_packed_decode_amd,
 }
+
+
+def test_kda_replicates_subblock_scale_across_tp_ranks(monkeypatch):
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: 3)
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_world_size", lambda: 8)
+    layer = object.__new__(_KimiGDNMergedColumnParallelLinear)
+    torch.nn.Module.__init__(layer)
+    layer.output_sizes = [12288, 12288, 12288, 12288, 1024, 96, 928]
+    layer.replicated_shard_id = 4
+    layer.tp_size = 8
+    layer.tp_rank = 3
+    layer.weight_block_size = [128, 128]
+    scale = BlockQuantScaleParameter(
+        data=torch.zeros(50, 1, 56, 1),
+        input_dim=2,
+        output_dim=0,
+        weight_loader=lambda *_: None,
+    )
+    scale.tp_size = 8
+    scale.tp_rank = 3
+    loaded_beta_scale = torch.ones(1, 1, 56, 1)
+
+    layer.weight_loader_v2(scale, loaded_beta_scale, loaded_shard_id=5)
+
+    assert torch.equal(scale[49], loaded_beta_scale[0])
+    assert layer.tp_rank == 3
+    assert scale.tp_rank == 3
 
 
 def test_kda_recoverssm_config_state_layout():

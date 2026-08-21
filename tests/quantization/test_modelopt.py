@@ -82,6 +82,12 @@ def _mixed_precision_config(quantized_layers: dict) -> ModelOptMixedPrecisionCon
             kv_cache_quant_method=None,
             exclude_modules=[],
         ),
+        fp8_pb_wo_config=ModelOptFp8Config(
+            quant_method="FP8_PB_WO",
+            is_checkpoint_fp8_serialized=True,
+            kv_cache_quant_method=None,
+            exclude_modules=[],
+        ),
         nvfp4_config=ModelOptNvFp4Config(
             is_checkpoint_nvfp4_serialized=True,
             kv_cache_quant_algo=None,
@@ -709,6 +715,58 @@ def test_modelopt_mixed_precision_dispatches_w4a16_layer(
     expected_cls = getattr(m, expected_linear_cls_name)
     assert isinstance(method, expected_cls), (
         f"Expected {expected_linear_cls_name}, got {type(method).__name__}"
+    )
+
+
+def test_modelopt_mixed_precision_dispatches_fp8_pb_wo_layer():
+    from vllm.model_executor.layers.linear import LinearBase
+    from vllm.model_executor.layers.quantization import modelopt as m
+
+    config = m.ModelOptMixedPrecisionConfig.from_config(
+        {
+            "quantization": {
+                "quant_algo": "MIXED_PRECISION",
+                "kv_cache_quant_algo": None,
+                "exclude_modules": [],
+                "group_size": 16,
+                "quantized_layers": {
+                    "model.layers.0.fake_proj": {"quant_algo": "FP8_PB_WO"},
+                },
+            }
+        }
+    )
+
+    fake_layer = MagicMock(spec=LinearBase)
+    with patch.object(m, "ModelOptFp8PbWoLinearMethod") as method_cls:
+        method = config.get_quant_method(fake_layer, "model.layers.0.fake_proj")
+
+    method_cls.assert_called_once_with(config.fp8_pb_wo_config)
+    assert method is method_cls.return_value
+
+
+def test_modelopt_fp8_pb_wo_finalizes_selected_kernel():
+    from vllm.model_executor.layers.quantization import modelopt as m
+
+    method = object.__new__(m.ModelOptFp8PbWoLinearMethod)
+    method.w8a8_block_fp8_linear = MagicMock()
+    layer = torch.nn.Module()
+    layer.register_parameter(
+        "weight",
+        torch.nn.Parameter(
+            torch.empty((128, 128), dtype=torch.float8_e4m3fn),
+            requires_grad=False,
+        ),
+    )
+    layer.register_parameter(
+        "weight_scale",
+        torch.nn.Parameter(torch.ones((1, 1, 1, 1)), requires_grad=False),
+    )
+
+    method.process_weights_after_loading(layer)
+
+    assert layer.weight_scale.shape == (1, 1)
+    method.w8a8_block_fp8_linear.process_weights_after_loading.assert_called_once_with(
+        layer
     )
 
 
