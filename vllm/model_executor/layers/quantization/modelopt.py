@@ -2449,15 +2449,3 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         super().apply_vllm_mapper(hf_to_vllm_mapper)
         if self.quantized_layers:
             self.quantized_layers = hf_to_vllm_mapper.apply_dict(self.quantized_layers)
-
-
-def is_modelopt_fp8_pb_wo_layer(
-    quant_config: QuantizationConfig | None,
-    prefix: str,
-) -> bool:
-    """Return whether ``prefix`` uses ModelOpt FP8 block-wise weights."""
-    if isinstance(quant_config, ModelOptFp8Config):
-        return quant_config.quant_method == "FP8_PB_WO"
-    if isinstance(quant_config, ModelOptMixedPrecisionConfig):
-        return quant_config._resolve_quant_algo(prefix) == "FP8_PB_WO"
-    return False
