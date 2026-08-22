@@ -1091,6 +1091,51 @@ def test_kimi_nvfp4_integrated_shared_expert_uses_active_views():
     assert inputs.output_activation.shape[0] == active_tokens
 
 
+def test_kimi_nvfp4_shared_expert_stages_matching_scale_layout(monkeypatch):
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl import (
+        staging,
+    )
+    from flashinfer.moe_ep.kernel_src import cutedsl_megamoe
+    from vllm.models.kimi_k3.nvidia import model as kimi_model
+
+    session = kimi_model._KimiFlashInferNvfp4SharedSession.__new__(
+        kimi_model._KimiFlashInferNvfp4SharedSession
+    )
+    session.num_tokens = 8
+    session.active_num_tokens = 0
+    session.topk_ids = torch.zeros(8, 1, dtype=torch.int64)
+    session.topk_weights = torch.ones(8, 1)
+    session.activation_sf = torch.empty(128, 8)
+    session.buffer = SimpleNamespace(
+        x=torch.empty(8, 64),
+        x_sf=torch.empty(8, 8),
+        topk_idx=torch.empty(8, 1, dtype=torch.int64),
+        topk_weights=torch.empty(8, 1),
+    )
+    calls = []
+    monkeypatch.setattr(
+        cutedsl_megamoe,
+        "fused_quant_stage",
+        lambda *args, **kwargs: calls.append(("blocked", args, kwargs)),
+    )
+    monkeypatch.setattr(
+        staging,
+        "stage_mega_moe_inputs",
+        lambda *args, **kwargs: calls.append(("row_major", args, kwargs)),
+    )
+    hidden_states = torch.empty(5, 128)
+
+    session.stage(hidden_states, integrated=True)
+    session.stage(hidden_states, integrated=False)
+
+    assert calls[0][0] == "blocked"
+    assert calls[0][1][4] is session.activation_sf
+    assert calls[0][2]["sf_layout"] == "blocked_128x4"
+    assert calls[1][0] == "row_major"
+    assert calls[1][1][4] is session.buffer.x_sf
+    assert session.active_num_tokens == 5
+
+
 def test_kimi_nvfp4_shared_expert_caches_thunks_per_stream(monkeypatch):
     from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim import nvfp4
     from vllm.models.kimi_k3.nvidia import model as kimi_model

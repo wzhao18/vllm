@@ -694,8 +694,12 @@ class KimiFusedSharedExpert(CustomOp):
             self._nvfp4_sessions[key] = session
         return session
 
-    def stage_nvfp4(self, hidden_states: torch.Tensor) -> None:
-        self._nvfp4_session(hidden_states).stage(hidden_states)
+    def stage_nvfp4(
+        self, hidden_states: torch.Tensor, *, integrated: bool = False
+    ) -> None:
+        self._nvfp4_session(hidden_states).stage(
+            hidden_states, integrated=integrated
+        )
 
     def forward_staged_nvfp4(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self._nvfp4_session(hidden_states).run(self._nvfp4_weights())
@@ -837,29 +841,46 @@ class _KimiFlashInferNvfp4SharedSession:
         )
         self._thunks: dict[tuple[int, ...], Callable[[], None]] = {}
 
-    def stage(self, hidden_states: torch.Tensor) -> None:
-        from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
-            fused_quant_stage,
-        )
-
+    def stage(
+        self, hidden_states: torch.Tensor, *, integrated: bool = False
+    ) -> None:
         num_tokens = hidden_states.shape[0]
         if num_tokens > self.num_tokens:
             raise ValueError(
                 f"Shared-expert input has {num_tokens} tokens, but the session "
                 f"capacity is {self.num_tokens}."
             )
-        fused_quant_stage(
-            hidden_states,
-            self.topk_ids,
-            self.topk_weights,
-            self.buffer.x,
-            self.activation_sf,
-            self.buffer.topk_idx,
-            self.buffer.topk_weights,
-            quant_type="nvfp4",
-            norm_const=1.0,
-            sf_layout="blocked_128x4",
-        )
+        if integrated:
+            from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+                fused_quant_stage,
+            )
+
+            fused_quant_stage(
+                hidden_states,
+                self.topk_ids,
+                self.topk_weights,
+                self.buffer.x,
+                self.activation_sf,
+                self.buffer.topk_idx,
+                self.buffer.topk_weights,
+                quant_type="nvfp4",
+                norm_const=1.0,
+                sf_layout="blocked_128x4",
+            )
+        else:
+            from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.staging import (
+                stage_mega_moe_inputs,
+            )
+
+            stage_mega_moe_inputs(
+                hidden_states,
+                self.topk_weights,
+                self.topk_ids,
+                self.buffer.x,
+                self.buffer.x_sf,
+                self.buffer.topk_idx,
+                self.buffer.topk_weights,
+            )
         self.active_num_tokens = num_tokens
 
     def integrated_inputs(self, transformed_weights):
@@ -2217,7 +2238,9 @@ class KimiMoE(nn.Module):
                 shared_gate_up,
             ), _ = maybe_execute_in_parallel(
                 lambda: self._maybe_overlap_router_and_down_proj(hidden_states),
-                lambda: shared_experts.stage_nvfp4(hidden_states),
+                lambda: shared_experts.stage_nvfp4(
+                    hidden_states, integrated=integrate_shared_fc12
+                ),
                 self._shared_expert_events[0],
                 self._shared_expert_events[1],
                 kimi_shared_expert_stream(),
@@ -2243,7 +2266,9 @@ class KimiMoE(nn.Module):
             )
             if uses_nvfp4_shared:
                 assert isinstance(shared_experts, KimiFusedSharedExpert)
-                shared_experts.stage_nvfp4(hidden_states)
+                shared_experts.stage_nvfp4(
+                    hidden_states, integrated=integrate_shared_fc12
+                )
         if self.use_mega_moe:
             assert self.routed_output_transform is not None
             assert topk_ids is not None
