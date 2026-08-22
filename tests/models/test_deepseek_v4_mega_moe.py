@@ -1020,6 +1020,48 @@ def test_kimi_nvfp4_shared_expert_buckets_session_capacity(monkeypatch):
     assert capacities == [256, 512]
 
 
+def test_kimi_nvfp4_shared_expert_caches_thunks_per_stream(monkeypatch):
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim import nvfp4
+    from vllm.models.kimi_k3.nvidia import model as kimi_model
+
+    session = kimi_model._KimiFlashInferNvfp4SharedSession.__new__(
+        kimi_model._KimiFlashInferNvfp4SharedSession
+    )
+    session.active_num_tokens = 2
+    session.buffer = SimpleNamespace(output_activation=torch.empty(4, 8))
+    session._thunks = {}
+    transformed_weights = (
+        (torch.empty(1), torch.empty(1)),
+        (torch.empty(1), torch.empty(1)),
+    )
+    stream = [11]
+    created_on = []
+    launched_on = []
+
+    def make_thunk(*args):
+        created_on.append(stream[0])
+
+        def launch():
+            launched_on.append(stream[0])
+
+        return launch
+
+    monkeypatch.setattr(nvfp4, "nvfp4_mega_launch_thunk", make_thunk)
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda: SimpleNamespace(cuda_stream=stream[0]),
+    )
+
+    session.run(transformed_weights)
+    session.run(transformed_weights)
+    stream[0] = 22
+    session.run(transformed_weights)
+
+    assert created_on == [11, 22]
+    assert launched_on == [11, 11, 22]
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="DeepSeek V4 MegaMoE fused input staging requires CUDA.",

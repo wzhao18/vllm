@@ -843,7 +843,10 @@ class _KimiFlashInferNvfp4SharedSession:
         )
 
         fc1, fc2 = transformed_weights
-        key = tuple(t.data_ptr() for pair in transformed_weights for t in pair)
+        key = (
+            *(t.data_ptr() for pair in transformed_weights for t in pair),
+            torch.cuda.current_stream().cuda_stream,
+        )
         thunk = self._thunks.get(key)
         if thunk is None:
             thunk = nvfp4_mega_launch_thunk(fc1, fc2, self.buffer)
