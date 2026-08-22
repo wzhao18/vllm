@@ -768,7 +768,10 @@ def test_kimi_fused_shared_expert_deepgemm_matches_native(default_vllm_config):
     torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.05)
 
 
-def test_kimi_flashinfer_mega_moe_forward_preserves_tensor_contract(monkeypatch):
+@pytest.mark.parametrize("with_shared_expert", [False, True])
+def test_kimi_flashinfer_mega_moe_forward_preserves_tensor_contract(
+    monkeypatch, with_shared_expert
+):
     from vllm.models.kimi_k3.nvidia import model as kimi_model
 
     experts = kimi_model.KimiK3FlashInferMegaMoEExperts.__new__(
@@ -780,6 +783,7 @@ def test_kimi_flashinfer_mega_moe_forward_preserves_tensor_contract(monkeypatch)
     experts._flashinfer_fc1_alpha = torch.ones(2)
     experts._flashinfer_fc2_alpha = torch.ones(2)
     experts._flashinfer_fc1_norm_const = torch.ones(2)
+    experts._integrated_shared_expert = None
     experts.synchronize_first_launch = lambda: None
     experts.finalize_weights = lambda: None
     monkeypatch.setattr(kimi_model, "is_forward_context_available", lambda: False)
@@ -795,6 +799,26 @@ def test_kimi_flashinfer_mega_moe_forward_preserves_tensor_contract(monkeypatch)
     hidden_states = torch.randn(3, 8)
     topk_ids = torch.tensor([[0, 1], [1, 0], [0, 1]])
     topk_weights = torch.rand(3, 2)
+    shared_inputs = None
+
+    if with_shared_expert:
+        shared_inputs = object()
+
+        class FakeSharedSession:
+            def integrated_inputs(self, weights):
+                assert weights is shared_weights
+                return shared_inputs
+
+        class FakeSharedExpert(torch.nn.Module):
+            def _nvfp4_session(self, states):
+                assert states is hidden_states
+                return FakeSharedSession()
+
+            def _nvfp4_weights(self):
+                return shared_weights
+
+        shared_weights = object()
+        experts._integrated_shared_expert = FakeSharedExpert()
 
     output = experts(
         hidden_states,
@@ -811,6 +835,7 @@ def test_kimi_flashinfer_mega_moe_forward_preserves_tensor_contract(monkeypatch)
     assert captured["tensors"].fc1_alpha is experts._flashinfer_fc1_alpha
     assert captured["tensors"].fc2_alpha is experts._flashinfer_fc2_alpha
     assert captured["tensors"].fc1_norm_const is experts._flashinfer_fc1_norm_const
+    assert captured["tensors"].mega_shared_inputs is shared_inputs
 
 
 def test_kimi_flashinfer_mega_moe_uses_sequence_parallel_token_capacity():

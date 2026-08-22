@@ -1713,12 +1713,17 @@ class KimiMoE(nn.Module):
                 "kimi_nvfp4_preschedule_shared_expert", False
             )
         )
-        self.use_in_kernel_shared_fc1 = bool(
+        self.use_in_kernel_shared_fc12 = bool(
             self.use_flashinfer_mega_moe
             and self.num_shared_experts is not None
             and isinstance(additional_config, dict)
-            and additional_config.get(
-                "kimi_nvfp4_in_kernel_shared_fc1", False
+            and (
+                additional_config.get(
+                    "kimi_nvfp4_in_kernel_shared_fc12", False
+                )
+                or additional_config.get(
+                    "kimi_nvfp4_in_kernel_shared_fc1", False
+                )
             )
         )
         self.use_nvfp4_fused_shared_expert = bool(
@@ -1726,7 +1731,7 @@ class KimiMoE(nn.Module):
             and self.num_shared_experts is not None
             and isinstance(additional_config, dict)
             and (
-                self.use_in_kernel_shared_fc1
+                self.use_in_kernel_shared_fc12
                 or additional_config.get(
                     "kimi_nvfp4_fused_shared_expert_nvfp4", False
                 )
@@ -1997,7 +2002,7 @@ class KimiMoE(nn.Module):
                 activation_beta=activation_situ_beta,
                 activation_linear_beta=activation_situ_linear_beta,
             )
-            if self.use_in_kernel_shared_fc1:
+            if self.use_in_kernel_shared_fc12:
                 assert isinstance(self.experts, KimiK3FlashInferMegaMoEExperts)
                 assert isinstance(self.shared_experts, KimiFusedSharedExpert)
                 self.experts.set_integrated_shared_expert(self.shared_experts)
@@ -2212,7 +2217,7 @@ class KimiMoE(nn.Module):
             elif prescheduled_shared_output is not None:
                 final_hidden_states = run_routed_experts()
                 shared_output = prescheduled_shared_output
-            elif self.use_in_kernel_shared_fc1:
+            elif self.use_in_kernel_shared_fc12:
                 assert isinstance(shared_experts, KimiFusedSharedExpert)
                 final_hidden_states = run_routed_experts()
                 shared_output = shared_experts._nvfp4_session(
