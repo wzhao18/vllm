@@ -768,9 +768,12 @@ def test_kimi_fused_shared_expert_deepgemm_matches_native(default_vllm_config):
     torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.05)
 
 
-@pytest.mark.parametrize("with_shared_expert", [False, True])
+@pytest.mark.parametrize(
+    ("with_shared_expert", "integrate_shared_expert"),
+    [(False, True), (True, True), (True, False)],
+)
 def test_kimi_flashinfer_mega_moe_forward_preserves_tensor_contract(
-    monkeypatch, with_shared_expert
+    monkeypatch, with_shared_expert, integrate_shared_expert
 ):
     from vllm.models.kimi_k3.nvidia import model as kimi_model
 
@@ -825,6 +828,7 @@ def test_kimi_flashinfer_mega_moe_forward_preserves_tensor_contract(
         topk_weights,
         topk_ids,
         activation_clamp=None,
+        integrate_shared_expert=integrate_shared_expert,
     )
 
     assert output.data_ptr() != hidden_states.data_ptr()
@@ -835,7 +839,10 @@ def test_kimi_flashinfer_mega_moe_forward_preserves_tensor_contract(
     assert captured["tensors"].fc1_alpha is experts._flashinfer_fc1_alpha
     assert captured["tensors"].fc2_alpha is experts._flashinfer_fc2_alpha
     assert captured["tensors"].fc1_norm_const is experts._flashinfer_fc1_norm_const
-    assert captured["tensors"].mega_shared_inputs is shared_inputs
+    expected_shared_inputs = (
+        shared_inputs if integrate_shared_expert else None
+    )
+    assert captured["tensors"].mega_shared_inputs is expected_shared_inputs
 
 
 def test_kimi_flashinfer_mega_moe_uses_sequence_parallel_token_capacity():
@@ -891,13 +898,52 @@ def test_kimi_nvfp4_shared_expert_buckets_session_capacity(monkeypatch):
         lambda device: SimpleNamespace(multi_processor_count=148),
     )
 
+    session_65 = experts._nvfp4_session(torch.empty(65, 128))
     session_129 = experts._nvfp4_session(torch.empty(129, 128))
     session_200 = experts._nvfp4_session(torch.empty(200, 128))
     session_257 = experts._nvfp4_session(torch.empty(257, 128))
+    session_320 = experts._nvfp4_session(torch.empty(320, 128))
 
+    assert session_65 is not session_129
     assert session_129 is session_200
     assert session_257 is not session_200
-    assert capacities == [256, 512]
+    assert session_257 is session_320
+    assert capacities == [128, 256, 512]
+
+
+def test_kimi_nvfp4_integrated_shared_expert_uses_active_views():
+    from vllm.models.kimi_k3.nvidia import model as kimi_model
+
+    capacity = 512
+    active_tokens = 320
+    session = kimi_model._KimiFlashInferNvfp4SharedSession.__new__(
+        kimi_model._KimiFlashInferNvfp4SharedSession
+    )
+    session.active_num_tokens = active_tokens
+    session.buffer = SimpleNamespace(
+        x=torch.empty(capacity, 8),
+        fc1_alpha=torch.empty(1),
+        fc2_alpha=torch.empty(1),
+        fc1_norm_const=torch.empty(1),
+        output_activation=torch.empty(capacity, 8),
+    )
+    session.activation_sf = torch.empty(capacity, 2)
+    session.fc1_output = torch.empty(capacity, 4)
+    session.fc1_output_sf = torch.empty(capacity, 2)
+    session.fc1_done_counter = torch.empty(capacity, dtype=torch.int32)
+    weights = (
+        (torch.empty(1), torch.empty(1)),
+        (torch.empty(1), torch.empty(1)),
+    )
+
+    inputs = session.integrated_inputs(weights)
+
+    assert inputs.activation.shape[0] == active_tokens
+    assert inputs.activation_sf.shape[0] == 384
+    assert inputs.fc1_output.shape[0] == active_tokens
+    assert inputs.fc1_output_sf.shape[0] == 384
+    assert inputs.fc1_done_counter.shape[0] == active_tokens
+    assert inputs.output_activation.shape[0] == active_tokens
 
 
 def test_kimi_nvfp4_shared_expert_caches_thunks_per_stream(monkeypatch):
