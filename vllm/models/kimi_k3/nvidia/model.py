@@ -868,20 +868,22 @@ class _KimiFlashInferNvfp4SharedSession:
         )
 
         fc1, fc2 = transformed_weights
+        num_tokens = self.active_num_tokens
+        sf_rows = cdiv(num_tokens, 128) * 128
         return MegaMoESharedNvfp4Inputs(
-            activation=self.buffer.x,
-            activation_sf=self.activation_sf,
+            activation=self.buffer.x[:num_tokens],
+            activation_sf=self.activation_sf[:sf_rows],
             fc1_weight=fc1[0],
             fc1_weight_sf=fc1[1],
-            fc1_output=self.fc1_output,
-            fc1_output_sf=self.fc1_output_sf,
+            fc1_output=self.fc1_output[:num_tokens],
+            fc1_output_sf=self.fc1_output_sf[:sf_rows],
             fc2_weight=fc2[0],
             fc2_weight_sf=fc2[1],
             fc1_alpha=self.buffer.fc1_alpha,
             fc2_alpha=self.buffer.fc2_alpha,
             fc1_norm_const=self.buffer.fc1_norm_const,
-            fc1_done_counter=self.fc1_done_counter,
-            output_activation=self.buffer.output_activation,
+            fc1_done_counter=self.fc1_done_counter[: max(num_tokens, 1)],
+            output_activation=self.buffer.output_activation[:num_tokens],
         )
 
     def output(self) -> torch.Tensor:
@@ -1602,6 +1604,7 @@ class KimiK3FlashInferMegaMoEExperts(KimiK3MegaMoEExperts):
         *,
         activation_clamp: float | None,
         fast_math: bool = True,
+        integrate_shared_expert: bool = True,
     ) -> torch.Tensor:
         del fast_math
         if activation_clamp is not None:
@@ -1630,7 +1633,7 @@ class KimiK3FlashInferMegaMoEExperts(KimiK3MegaMoEExperts):
         from flashinfer.moe_ep import MoEEpTensors
 
         shared_inputs = None
-        if self._integrated_shared_expert is not None:
+        if integrate_shared_expert and self._integrated_shared_expert is not None:
             shared_session = self._integrated_shared_expert._nvfp4_session(
                 hidden_states
             )
@@ -1750,6 +1753,20 @@ class KimiMoE(nn.Module):
                 )
             )
         )
+        self.in_kernel_shared_fc12_max_tokens = (
+            int(
+                additional_config.get(
+                    "kimi_nvfp4_in_kernel_shared_fc12_max_tokens", 1024
+                )
+            )
+            if self.use_in_kernel_shared_fc12
+            else 0
+        )
+        if self.in_kernel_shared_fc12_max_tokens < 0:
+            raise ValueError(
+                "kimi_nvfp4_in_kernel_shared_fc12_max_tokens must be "
+                "non-negative."
+            )
         self.use_nvfp4_fused_shared_expert = bool(
             self.use_flashinfer_mega_moe
             and self.num_shared_experts is not None
@@ -2162,6 +2179,10 @@ class KimiMoE(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
+        integrate_shared_fc12 = bool(
+            self.use_in_kernel_shared_fc12
+            and num_tokens <= self.in_kernel_shared_fc12_max_tokens
+        )
         shared_experts = (
             None if self.skip_shared_expert_for_profiling else self.shared_experts
         )
@@ -2228,6 +2249,17 @@ class KimiMoE(nn.Module):
             assert topk_ids is not None
 
             def run_routed_experts() -> torch.Tensor:
+                if self.use_in_kernel_shared_fc12:
+                    assert isinstance(
+                        self.experts, KimiK3FlashInferMegaMoEExperts
+                    )
+                    return self.experts(
+                        routed_hidden_states,
+                        router_output,
+                        topk_ids,
+                        activation_clamp=None,
+                        integrate_shared_expert=integrate_shared_fc12,
+                    )
                 return self.experts(
                     routed_hidden_states,
                     router_output,
@@ -2241,7 +2273,7 @@ class KimiMoE(nn.Module):
             elif prescheduled_shared_output is not None:
                 final_hidden_states = run_routed_experts()
                 shared_output = prescheduled_shared_output
-            elif self.use_in_kernel_shared_fc12:
+            elif integrate_shared_fc12:
                 assert isinstance(shared_experts, KimiFusedSharedExpert)
                 final_hidden_states = run_routed_experts()
                 shared_output = shared_experts._nvfp4_session(
