@@ -789,11 +789,33 @@ class _KimiFlashInferNvfp4SharedSession:
         self.topk_weights = torch.ones(
             num_tokens, 1, dtype=torch.float32, device="cuda"
         )
+        sf_rows = cdiv(num_tokens, 128) * 128
+        self.activation_sf = torch.zeros(
+            sf_rows,
+            cdiv(hidden_size // 16, 4) * 4,
+            dtype=torch.float8_e4m3fn,
+            device="cuda",
+        )
+        self.fc1_output = torch.empty(
+            num_tokens,
+            intermediate_size // 2,
+            dtype=torch.float4_e2m1fn_x2,
+            device="cuda",
+        )
+        self.fc1_output_sf = torch.zeros(
+            sf_rows,
+            cdiv(intermediate_size // 16, 4) * 4,
+            dtype=torch.float8_e4m3fn,
+            device="cuda",
+        )
+        self.fc1_done_counter = torch.zeros(
+            max(num_tokens, 1), dtype=torch.int32, device="cuda"
+        )
         self._thunks: dict[tuple[int, ...], Callable[[], None]] = {}
 
     def stage(self, hidden_states: torch.Tensor) -> None:
-        from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.staging import (
-            stage_mega_moe_inputs,
+        from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+            fused_quant_stage,
         )
 
         num_tokens = hidden_states.shape[0]
@@ -802,16 +824,44 @@ class _KimiFlashInferNvfp4SharedSession:
                 f"Shared-expert input has {num_tokens} tokens, but the session "
                 f"capacity is {self.num_tokens}."
             )
-        stage_mega_moe_inputs(
+        fused_quant_stage(
             hidden_states,
-            self.topk_weights,
             self.topk_ids,
+            self.topk_weights,
             self.buffer.x,
-            self.buffer.x_sf,
+            self.activation_sf,
             self.buffer.topk_idx,
             self.buffer.topk_weights,
+            quant_type="nvfp4",
+            norm_const=1.0,
+            sf_layout="blocked_128x4",
         )
         self.active_num_tokens = num_tokens
+
+    def integrated_inputs(self, transformed_weights):
+        from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+            MegaMoESharedNvfp4Inputs,
+        )
+
+        fc1, fc2 = transformed_weights
+        return MegaMoESharedNvfp4Inputs(
+            activation=self.buffer.x,
+            activation_sf=self.activation_sf,
+            fc1_weight=fc1[0],
+            fc1_weight_sf=fc1[1],
+            fc1_output=self.fc1_output,
+            fc1_output_sf=self.fc1_output_sf,
+            fc2_weight=fc2[0],
+            fc2_weight_sf=fc2[1],
+            fc1_alpha=self.buffer.fc1_alpha,
+            fc2_alpha=self.buffer.fc2_alpha,
+            fc1_norm_const=self.buffer.fc1_norm_const,
+            fc1_done_counter=self.fc1_done_counter,
+            output_activation=self.buffer.output_activation,
+        )
+
+    def output(self) -> torch.Tensor:
+        return self.buffer.output_activation[: self.active_num_tokens]
 
     def run(self, transformed_weights) -> torch.Tensor:
         from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.nvfp4 import (
@@ -1353,6 +1403,17 @@ class KimiK3FlashInferMegaMoEExperts(KimiK3MegaMoEExperts):
         self.register_buffer("_flashinfer_fc2_alpha", None, persistent=False)
         self.register_buffer("_flashinfer_fc1_norm_const", None, persistent=False)
         self._flashinfer_layer: nn.Module | None = None
+        self._integrated_shared_expert: KimiFusedSharedExpert | None = None
+
+    def set_integrated_shared_expert(
+        self, shared_expert: KimiFusedSharedExpert
+    ) -> None:
+        if self._flashinfer_layer is not None:
+            raise RuntimeError(
+                "The integrated shared expert must be configured before "
+                "FlashInfer weight finalization."
+            )
+        self._integrated_shared_expert = shared_expert
 
     def weight_loader(
         self,
@@ -1456,6 +1517,16 @@ class KimiK3FlashInferMegaMoEExperts(KimiK3MegaMoEExperts):
             in_kernel_fc2_reduce=self._mega_moe_in_kernel_reduce,
             combine_dtype=self._mega_moe_combine_dtype,
             knobs=self._mega_moe_knobs,
+            shared_hidden_size=(
+                self._integrated_shared_expert.hidden_size
+                if self._integrated_shared_expert is not None
+                else None
+            ),
+            shared_intermediate_size=(
+                self._integrated_shared_expert.intermediate_size
+                if self._integrated_shared_expert is not None
+                else None
+            ),
         )
         bootstrap = BootstrapConfig(
             world_size=ep_group.world_size,
@@ -1534,6 +1605,15 @@ class KimiK3FlashInferMegaMoEExperts(KimiK3MegaMoEExperts):
         assert self._flashinfer_fc1_norm_const is not None
         from flashinfer.moe_ep import MoEEpTensors
 
+        shared_inputs = None
+        if self._integrated_shared_expert is not None:
+            shared_session = self._integrated_shared_expert._nvfp4_session(
+                hidden_states
+            )
+            shared_inputs = shared_session.integrated_inputs(
+                self._integrated_shared_expert._nvfp4_weights()
+            )
+
         return self._flashinfer_layer(
             MoEEpTensors(
                 hidden_states=hidden_states,
@@ -1542,6 +1622,7 @@ class KimiK3FlashInferMegaMoEExperts(KimiK3MegaMoEExperts):
                 fc1_alpha=self._flashinfer_fc1_alpha,
                 fc2_alpha=self._flashinfer_fc2_alpha,
                 fc1_norm_const=self._flashinfer_fc1_norm_const,
+                mega_shared_inputs=shared_inputs,
             )
         )
 
@@ -1632,12 +1713,23 @@ class KimiMoE(nn.Module):
                 "kimi_nvfp4_preschedule_shared_expert", False
             )
         )
-        self.use_nvfp4_fused_shared_expert = bool(
+        self.use_in_kernel_shared_fc1 = bool(
             self.use_flashinfer_mega_moe
             and self.num_shared_experts is not None
             and isinstance(additional_config, dict)
             and additional_config.get(
-                "kimi_nvfp4_fused_shared_expert_nvfp4", False
+                "kimi_nvfp4_in_kernel_shared_fc1", False
+            )
+        )
+        self.use_nvfp4_fused_shared_expert = bool(
+            self.use_flashinfer_mega_moe
+            and self.num_shared_experts is not None
+            and isinstance(additional_config, dict)
+            and (
+                self.use_in_kernel_shared_fc1
+                or additional_config.get(
+                    "kimi_nvfp4_fused_shared_expert_nvfp4", False
+                )
             )
         )
         self.use_fused_shared_expert = bool(
@@ -1905,6 +1997,10 @@ class KimiMoE(nn.Module):
                 activation_beta=activation_situ_beta,
                 activation_linear_beta=activation_situ_linear_beta,
             )
+            if self.use_in_kernel_shared_fc1:
+                assert isinstance(self.experts, KimiK3FlashInferMegaMoEExperts)
+                assert isinstance(self.shared_experts, KimiFusedSharedExpert)
+                self.experts.set_integrated_shared_expert(self.shared_experts)
         else:
             self.experts = FusedMoEFactory(
                 shared_experts=self.shared_experts,
@@ -2116,6 +2212,12 @@ class KimiMoE(nn.Module):
             elif prescheduled_shared_output is not None:
                 final_hidden_states = run_routed_experts()
                 shared_output = prescheduled_shared_output
+            elif self.use_in_kernel_shared_fc1:
+                assert isinstance(shared_experts, KimiFusedSharedExpert)
+                final_hidden_states = run_routed_experts()
+                shared_output = shared_experts._nvfp4_session(
+                    hidden_states
+                ).output()
             else:
                 shared_stream = None
                 if (
