@@ -23,8 +23,8 @@ from vllm.models.kimi_k3.amd.ops.third_party.kda import (
     fused_recurrent_kda_packed_decode as fused_recurrent_kda_packed_decode_amd,
 )
 from vllm.models.kimi_k3.nvidia.kda import (
-    _KimiGDNMergedColumnParallelLinear,
     _flashkda_prefill,
+    _KimiGDNMergedColumnParallelLinear,
     _store_cache_checkpoints_kernel,
     is_flashkda_supported,
     is_fused_kda_decode_supported,

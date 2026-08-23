@@ -28,7 +28,7 @@ from vllm.model_executor.parameter import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, tldevice, triton
+from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import (
     get_tma_aligned_size,
     is_deep_gemm_e8m0_used,
@@ -118,7 +118,7 @@ def _per_token_group_quant_fp8(
 
 
 @triton.jit
-def _gated_mul_quant_fp8_packed_kernel(
+def _silu_mul_quant_fp8_packed_kernel(
     input_ptr,
     output_q_ptr,
     output_scale_ptr,
@@ -129,8 +129,6 @@ def _gated_mul_quant_fp8_packed_kernel(
     clamp_limit,
     alpha,
     beta,
-    situ_beta,
-    situ_linear_beta,
     N: tl.constexpr,
     GROUPS_PER_ROW: tl.constexpr,
     PACKS_PER_ROW: tl.constexpr,
@@ -140,8 +138,6 @@ def _gated_mul_quant_fp8_packed_kernel(
     PACKS_PER_CTA: tl.constexpr,
     BLOCK_M: tl.constexpr,
     HAS_CLAMP: tl.constexpr,
-    IS_SITU: tl.constexpr,
-    HAS_SITU_LINEAR_BETA: tl.constexpr,
 ):
     GROUPS_PER_PACK: tl.constexpr = 4
     hidden_size: tl.constexpr = N // 2
@@ -190,15 +186,10 @@ def _gated_mul_quant_fp8_packed_kernel(
             gate = tl.minimum(gate, clamp_limit)
             up = tl.clamp(up, -clamp_limit, clamp_limit)
 
-        if IS_SITU:
-            glu = situ_beta * tldevice.tanh(gate / situ_beta) / (1.0 + tl.exp(-gate))
-            if HAS_SITU_LINEAR_BETA:
-                up = situ_linear_beta * tldevice.tanh(up / situ_linear_beta)
-            y = up * glu
-        else:
-            # silu == swigluoai with alpha=1, beta=0.
-            glu = gate / (1.0 + tl.exp(-gate * alpha))
-            y = (up + beta) * glu
+        # Unified gated activation: silu == swigluoai with alpha=1, beta=0.
+        #   glu = gate * sigmoid(alpha * gate); y = (up + beta) * glu
+        glu = gate / (1.0 + tl.exp(-gate * alpha))
+        y = (up + beta) * glu
         # Round through bf16 to match unfused precision path
         y = y.to(tl.bfloat16).to(tl.float32)
 
@@ -236,15 +227,13 @@ def _gated_mul_quant_fp8_packed_kernel(
         row_start += row_step
 
 
-def _gated_mul_quant_fp8_packed_triton(
+def silu_mul_quant_fp8_packed_triton(
     input: torch.Tensor,
     group_size: int = 128,
     output_q: torch.Tensor | None = None,
     clamp_limit: float | None = None,
     alpha: float = 1.0,
     beta: float = 0.0,
-    situ_beta: float | None = None,
-    situ_linear_beta: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert input.dim() == 2
     assert input.is_contiguous()
@@ -287,9 +276,7 @@ def _gated_mul_quant_fp8_packed_triton(
     grid = (grid_n, grid_m)
 
     has_clamp = clamp_limit is not None
-    is_situ = situ_beta is not None
-    has_situ_linear_beta = situ_linear_beta is not None
-    _gated_mul_quant_fp8_packed_kernel[grid](
+    _silu_mul_quant_fp8_packed_kernel[grid](
         input,
         output_q,
         output_scale_packed,
@@ -300,8 +287,6 @@ def _gated_mul_quant_fp8_packed_triton(
         clamp_limit if has_clamp else 0.0,
         alpha,
         beta,
-        situ_beta if is_situ else 1.0,
-        situ_linear_beta if has_situ_linear_beta else 0.0,
         N=N,
         GROUPS_PER_ROW=groups_per_row,
         PACKS_PER_ROW=packs_per_row,
@@ -311,47 +296,11 @@ def _gated_mul_quant_fp8_packed_triton(
         PACKS_PER_CTA=packs_per_cta,
         BLOCK_M=BM,
         HAS_CLAMP=has_clamp,
-        IS_SITU=is_situ,
-        HAS_SITU_LINEAR_BETA=has_situ_linear_beta,
         num_warps=num_warps,
         num_stages=num_stages,
     )
 
     return output_q, output_scale_packed
-
-
-def silu_mul_quant_fp8_packed_triton(
-    input: torch.Tensor,
-    group_size: int = 128,
-    output_q: torch.Tensor | None = None,
-    clamp_limit: float | None = None,
-    alpha: float = 1.0,
-    beta: float = 0.0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return _gated_mul_quant_fp8_packed_triton(
-        input,
-        group_size,
-        output_q,
-        clamp_limit,
-        alpha,
-        beta,
-    )
-
-
-def situ_mul_quant_fp8_packed_triton(
-    input: torch.Tensor,
-    group_size: int = 128,
-    output_q: torch.Tensor | None = None,
-    beta: float = 1.0,
-    linear_beta: float | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return _gated_mul_quant_fp8_packed_triton(
-        input,
-        group_size,
-        output_q,
-        situ_beta=beta,
-        situ_linear_beta=linear_beta,
-    )
 
 
 @triton.jit

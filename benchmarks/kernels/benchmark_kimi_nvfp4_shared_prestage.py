@@ -31,27 +31,30 @@ def main() -> None:
             4.0,
             25.0,
             28,
-            use_nvfp4=True,
         ).cuda()
-    gate = torch.randn(
-        args.intermediate,
-        args.hidden,
-        dtype=torch.bfloat16,
-        device="cuda",
-    ) / 64
+    gate = (
+        torch.randn(
+            args.intermediate,
+            args.hidden,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        / 64
+    )
     up = torch.randn_like(gate) / 64
-    down = torch.randn(
-        args.hidden,
-        args.intermediate,
-        dtype=torch.bfloat16,
-        device="cuda",
-    ) / 64
+    down = (
+        torch.randn(
+            args.hidden,
+            args.intermediate,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        / 64
+    )
     module._load_gate_up_weight(module.gate_up_proj.weight, gate, 0)
     module._load_gate_up_weight(module.gate_up_proj.weight, up, 1)
     module.down_proj.weight.data.copy_(down)
-    hidden = torch.randn(
-        args.tokens, args.hidden, dtype=torch.bfloat16, device="cuda"
-    )
+    hidden = torch.randn(args.tokens, args.hidden, dtype=torch.bfloat16, device="cuda")
     torch.cuda.synchronize()
     weights_ready = time.perf_counter()
 

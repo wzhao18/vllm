@@ -8,10 +8,6 @@ from typing import ClassVar
 import torch
 from typing_extensions import Self
 
-from vllm.model_executor.layers.fusion.quant_activation import (
-    QuantizedActivation,
-    as_quantized_activation,
-)
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     process_fp8_weight_block_strategy,
@@ -101,7 +97,7 @@ class Fp8BlockScaledMMLinearKernel(
     def apply_weights(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor | QuantizedActivation,
+        x: torch.Tensor,
         bias: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -116,17 +112,11 @@ class Fp8BlockScaledMMLinearKernel(
         input_scale = params.input_scale
         scale_up = params.input_scale_ub
 
-        qa = as_quantized_activation(x, self.input_quant_key())
-        if qa is None:
-            assert isinstance(x, torch.Tensor)
-            input_2d = x.view(-1, x.shape[-1])
-            output_shape = [*x.shape[:-1], weight.shape[0]]
-        else:
-            input_2d = qa.data.view(-1, qa.data.shape[-1])
-            input_scale = qa.scale
-            output_shape = [*qa.orig_shape[:-1], weight.shape[0]]
+        # View input as 2D matrix for fp8 methods
+        input_2d = x.view(-1, x.shape[-1])
+        output_shape = [*x.shape[:-1], weight.shape[0]]
 
-        if self.apply_input_quant and qa is None:
+        if self.apply_input_quant:
             q_input, input_scale = self.quant_fp8(
                 input_2d, input_scale, scale_up, use_triton=self.use_triton
             )
