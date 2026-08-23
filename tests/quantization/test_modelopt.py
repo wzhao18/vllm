@@ -748,6 +748,7 @@ def test_modelopt_fp8_pb_wo_finalizes_selected_kernel():
     from vllm.model_executor.layers.quantization import modelopt as m
 
     method = object.__new__(m.ModelOptFp8PbWoLinearMethod)
+    method.output_padding = 0
     method.w8a8_block_fp8_linear = MagicMock()
     layer = torch.nn.Module()
     layer.register_parameter(
