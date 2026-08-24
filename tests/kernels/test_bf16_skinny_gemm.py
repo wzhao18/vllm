@@ -18,6 +18,7 @@ from vllm.model_executor.kernels.linear.scaled_mm import deep_gemm as deep_gemm_
 from vllm.models.deepseek_v32.nvidia import glm52_low_latency_gemm as glm52_gemm
 from vllm.models.kimi_k3.nvidia import low_latency_gemm as k3_gemm
 from vllm.models.kimi_k3.nvidia.low_latency_gemm import KIMI_K3_PROJECTIONS
+from vllm.utils import deep_gemm as deep_gemm_utils
 
 # Keyed by local (N, K): (cute token counts, dsv3 token counts). 1536x7168 is
 # the unified shared_gate_up_proj/mla_g_proj entry (dsv3 M1..16).
@@ -405,6 +406,14 @@ def test_build_plan_matches_selector() -> None:
                 assert plan[num_tokens][0] == backend
 
 
+def test_kimi_k3_fp8_pb_wo_plan_uses_contiguous_measured_range() -> None:
+    expected_plan = {m: 256 for m in range(17, 257)}
+    assert {
+        (12288, 128): expected_plan,
+        (7168, 12288): expected_plan,
+    } == k3_gemm.KIMI_K3_FP8_PB_WO_BLOCK_M_PLANS
+
+
 def test_installation_is_shape_and_quant_method_specific(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -492,7 +501,7 @@ def test_installation_is_shape_and_quant_method_specific(
     assert pbwo_kernel._block_m_multiple_plan == {}
 
 
-def test_deep_gemm_layout_override_is_restored_after_launch_failure(
+def test_deep_gemm_layout_constraint_is_forwarded_per_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     kernel = deep_gemm_kernel.DeepGemmFp8BlockScaledMMKernel.__new__(
@@ -501,27 +510,57 @@ def test_deep_gemm_layout_override_is_restored_after_launch_failure(
     kernel.config = SimpleNamespace(out_dtype=torch.bfloat16)
     kernel.use_deep_gemm_e8m0 = True
     kernel._block_m_multiple_plan = {}
-    monkeypatch.setattr(deep_gemm_kernel, "_layout_overrides_enabled", False)
     kernel.set_block_m_multiple_plan({32: 256})
 
     constraints: list[tuple[int, int]] = []
-    monkeypatch.setattr(
-        deep_gemm_kernel,
-        "set_block_size_multiple_of",
-        lambda value: constraints.append(value),
-    )
 
-    def fail_launch(*args: object) -> None:
-        raise RuntimeError("launch failed")
+    def record_launch(
+        _A: torch.Tensor,
+        _As: torch.Tensor,
+        _B: torch.Tensor,
+        _Bs: torch.Tensor,
+        _output: torch.Tensor,
+        _use_deep_gemm_e8m0: bool,
+        block_m_multiple_of: int,
+        block_n_multiple_of: int,
+    ) -> None:
+        constraints.append((block_m_multiple_of, block_n_multiple_of))
 
-    monkeypatch.setattr(deep_gemm_kernel, "_launch_fp8_gemm_nt", fail_launch)
+    monkeypatch.setattr(deep_gemm_kernel, "_launch_fp8_gemm_nt", record_launch)
     A = torch.empty((32, 128), dtype=torch.float8_e4m3fn)
     B = torch.empty((128, 128), dtype=torch.float8_e4m3fn)
     As = torch.empty((32, 1), dtype=torch.int32)
     Bs = torch.empty((1, 1), dtype=torch.int32)
 
+    kernel.apply_block_scaled_mm(A, B, As, Bs)
+    kernel.apply_block_scaled_mm(A[:31], B, As[:31], Bs)
+
+    assert constraints == [(256, 1), (1, 1)]
+
+
+def test_deep_gemm_layout_constraint_is_restored_after_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    constraints: list[tuple[int, int]] = []
+    fake_deep_gemm = SimpleNamespace(
+        set_block_size_multiple_of=lambda value: constraints.append(value)
+    )
+    monkeypatch.setattr(deep_gemm_utils, "_lazy_init", lambda: None)
+    monkeypatch.setattr(deep_gemm_utils, "_import_deep_gemm", lambda: fake_deep_gemm)
+    monkeypatch.setattr(
+        deep_gemm_utils, "supports_block_size_multiple_of", lambda: True
+    )
+
+    def fail_launch(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("launch failed")
+
+    monkeypatch.setattr(deep_gemm_utils, "_fp8_gemm_nt_impl", fail_launch)
+
     with pytest.raises(RuntimeError, match="launch failed"):
-        kernel.apply_block_scaled_mm(A, B, As, Bs)
+        deep_gemm_utils.fp8_gemm_nt(
+            block_size_multiple_of=(256, 1),
+            is_deep_gemm_e8m0_used=True,
+        )
 
     assert constraints == [(256, 1), (1, 1)]
 

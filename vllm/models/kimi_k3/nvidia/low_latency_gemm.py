@@ -287,22 +287,9 @@ KIMI_K3_PROJECTIONS: dict[tuple[int, int], ProjectionSpec] = {
 }
 
 # These SM103 TP1 shapes select a faster non-swapped DeepGEMM layout when
-# block-M candidates are restricted to multiples of 256. Only token counts
-# with at least 5% end-to-end projection speedup in paired CUDA-graph runs are
-# included.
+# block-M candidates are restricted to multiples of 256.
 KIMI_K3_FP8_PB_WO_BLOCK_M_PLANS: dict[tuple[int, int], dict[int, int]] = {
-    (12288, 128): {
-        m: 256
-        for m in (
-            23,
-            24,
-            28,
-            29,
-            *range(33, 56),
-            *range(57, 65),
-        )
-    },
-    (7168, 12288): {m: 256 for m in range(20, 65)},
+    shape: {m: 256 for m in range(17, 257)} for shape in ((12288, 128), (7168, 12288))
 }
 
 
