@@ -14,6 +14,7 @@ from torch import nn
 from vllm.model_executor.kernels.linear.cute_dsl.skinny_gemm import (
     SkinnyGemmConfig,
 )
+from vllm.model_executor.kernels.linear.scaled_mm import deep_gemm as deep_gemm_kernel
 from vllm.models.deepseek_v32.nvidia import glm52_low_latency_gemm as glm52_gemm
 from vllm.models.kimi_k3.nvidia import low_latency_gemm as k3_gemm
 from vllm.models.kimi_k3.nvidia.low_latency_gemm import KIMI_K3_PROJECTIONS
@@ -404,7 +405,7 @@ def test_build_plan_matches_selector() -> None:
                 assert plan[num_tokens][0] == backend
 
 
-def test_installation_is_shape_specific_and_unquantized(
+def test_installation_is_shape_and_quant_method_specific(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FakeLinear(nn.Module):
@@ -425,6 +426,15 @@ def test_installation_is_shape_specific_and_unquantized(
     # quantized: must be left untouched.
     quantized_method = object()
     root.quantized = FakeLinear(quantized_method, 6288, 7168)
+    pbwo_method = k3_gemm.ModelOptFp8PbWoLinearMethod.__new__(
+        k3_gemm.ModelOptFp8PbWoLinearMethod
+    )
+    pbwo_kernel = k3_gemm.DeepGemmFp8BlockScaledMMKernel.__new__(
+        k3_gemm.DeepGemmFp8BlockScaledMMKernel
+    )
+    pbwo_kernel._block_m_multiple_plan = {}
+    pbwo_method.w8a8_block_fp8_linear = pbwo_kernel
+    root.pbwo = FakeLinear(pbwo_method, 7168, 12288)
     # cute shape.
     root.cute = FakeLinear(k3_gemm.UnquantizedLinearMethod(), 6288, 7168)
     # cute + residual shape.
@@ -436,6 +446,7 @@ def test_installation_is_shape_specific_and_unquantized(
     monkeypatch.setattr(k3_gemm, "LinearBase", FakeLinear)
     monkeypatch.setattr(k3_gemm, "ParallelLMHead", FakeHead)
     monkeypatch.setattr(k3_gemm, "_is_sm103", lambda: True)
+    monkeypatch.setattr(k3_gemm, "supports_block_size_multiple_of", lambda: True)
     warmup_configs: set[SkinnyGemmConfig] = set()
     residual_warmup_configs: set[SkinnyGemmConfig] = set()
     monkeypatch.setattr(k3_gemm.shape_dynamic_skinny_gemm, "is_available", lambda: True)
@@ -456,6 +467,10 @@ def test_installation_is_shape_specific_and_unquantized(
     assert isinstance(root.cute.quant_method, k3_gemm.KimiK3LowLatencyLinearMethod)
     assert isinstance(root.residual.quant_method, k3_gemm.KimiK3LowLatencyLinearMethod)
     assert root.quantized.quant_method is quantized_method
+    assert (
+        pbwo_kernel._block_m_multiple_plan
+        == (k3_gemm.KIMI_K3_FP8_PB_WO_BLOCK_M_PLANS[(7168, 12288)])
+    )
     assert type(root.unlisted.quant_method) is k3_gemm.UnquantizedLinearMethod
     assert isinstance(
         root.lm_head.quant_method, k3_gemm.KimiK3LowLatencyEmbeddingMethod
@@ -470,6 +485,45 @@ def test_installation_is_shape_specific_and_unquantized(
         config
         for _, config in k3_gemm.KIMI_K3_PROJECTIONS[(7168, 3584)].residual_configs
     }
+
+    pbwo_kernel._block_m_multiple_plan = {}
+    monkeypatch.setattr(k3_gemm, "supports_block_size_multiple_of", lambda: False)
+    k3_gemm.enable_kimi_k3_low_latency_gemm(root, torch.bfloat16)
+    assert pbwo_kernel._block_m_multiple_plan == {}
+
+
+def test_deep_gemm_layout_override_is_restored_after_launch_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kernel = deep_gemm_kernel.DeepGemmFp8BlockScaledMMKernel.__new__(
+        deep_gemm_kernel.DeepGemmFp8BlockScaledMMKernel
+    )
+    kernel.config = SimpleNamespace(out_dtype=torch.bfloat16)
+    kernel.use_deep_gemm_e8m0 = True
+    kernel._block_m_multiple_plan = {}
+    monkeypatch.setattr(deep_gemm_kernel, "_layout_overrides_enabled", False)
+    kernel.set_block_m_multiple_plan({32: 256})
+
+    constraints: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        deep_gemm_kernel,
+        "set_block_size_multiple_of",
+        lambda value: constraints.append(value),
+    )
+
+    def fail_launch(*args: object) -> None:
+        raise RuntimeError("launch failed")
+
+    monkeypatch.setattr(deep_gemm_kernel, "_launch_fp8_gemm_nt", fail_launch)
+    A = torch.empty((32, 128), dtype=torch.float8_e4m3fn)
+    B = torch.empty((128, 128), dtype=torch.float8_e4m3fn)
+    As = torch.empty((32, 1), dtype=torch.int32)
+    Bs = torch.empty((1, 1), dtype=torch.int32)
+
+    with pytest.raises(RuntimeError, match="launch failed"):
+        kernel.apply_block_scaled_mm(A, B, As, Bs)
+
+    assert constraints == [(256, 1), (1, 1)]
 
 
 @pytest.mark.parametrize(

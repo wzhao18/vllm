@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kimi-K3 decode GEMM selection for unquantized BF16 on SM103.
+"""Kimi-K3 decode GEMM selection on SM103.
 
-Dispatch is purely by local ``(N, K)`` shape and token count ``M`` — the module
-name plays no role. Each measured shape maps to a :class:`ProjectionSpec`
-holding the winning backend per token count. The static part of the decision is
-resolved once per module at install time into a small ``{M: call}`` plan, so the
-per-forward path is a single dict lookup.
+Dispatch is purely by local ``(N, K)`` shape and token count ``M``. Unquantized
+BF16 projections select between the CuTe skinny and fused-A kernels. ModelOpt
+FP8_PB_WO projections can constrain DeepGEMM's layout candidates for measured
+decode shapes. Plans are installed once per module.
 """
 
 from __future__ import annotations
@@ -23,12 +22,19 @@ from vllm.model_executor.kernels.linear.cute_dsl.skinny_gemm import (
     SkinnyGemmConfig,
     shape_dynamic_skinny_gemm,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.deep_gemm import (
+    DeepGemmFp8BlockScaledMMKernel,
+)
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+from vllm.model_executor.layers.quantization.modelopt import (
+    ModelOptFp8PbWoLinearMethod,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     UnquantizedEmbeddingMethod,
 )
 from vllm.platforms import current_platform
+from vllm.utils.deep_gemm import supports_block_size_multiple_of
 
 Backend = Literal["cute", "dsv3_fused_a"]
 # A resolved per-token-count call: the backend plus its CuTe config (None for
@@ -280,6 +286,25 @@ KIMI_K3_PROJECTIONS: dict[tuple[int, int], ProjectionSpec] = {
     # vector_width=2, which measured slower than cuBLAS.
 }
 
+# These SM103 TP1 shapes select a faster non-swapped DeepGEMM layout when
+# block-M candidates are restricted to multiples of 256. Only token counts
+# with at least 5% end-to-end projection speedup in paired CUDA-graph runs are
+# included.
+KIMI_K3_FP8_PB_WO_BLOCK_M_PLANS: dict[tuple[int, int], dict[int, int]] = {
+    (12288, 128): {
+        m: 256
+        for m in (
+            23,
+            24,
+            28,
+            29,
+            *range(33, 56),
+            *range(57, 65),
+        )
+    },
+    (7168, 12288): {m: 256 for m in range(20, 65)},
+}
+
 
 def _backend_for(
     spec: ProjectionSpec, num_tokens: int, has_residual: bool
@@ -464,17 +489,28 @@ def enable_kimi_k3_low_latency_gemm(
     module: nn.Module,
     dtype: torch.dtype,
 ) -> None:
-    """Install shape-selected low-latency GEMMs and register CuTe warmups.
-
-    Modules are matched purely by type, an exactly-unquantized method, and a
-    local ``(N, K)`` present in :data:`KIMI_K3_PROJECTIONS`.
-    """
+    """Install shape-selected low-latency GEMMs and register CuTe warmups."""
     if dtype != torch.bfloat16 or not _is_sm103():
         return
 
     warmup_configs: set[SkinnyGemmConfig] = set()
     residual_warmup_configs: set[SkinnyGemmConfig] = set()
     for child in module.modules():
+        if (
+            not envs.VLLM_BATCH_INVARIANT
+            and isinstance(child, LinearBase)
+            and isinstance(child.quant_method, ModelOptFp8PbWoLinearMethod)
+        ):
+            kernel = child.quant_method.w8a8_block_fp8_linear
+            plan = KIMI_K3_FP8_PB_WO_BLOCK_M_PLANS.get(tuple(child.weight.shape))
+            if (
+                plan is not None
+                and isinstance(kernel, DeepGemmFp8BlockScaledMMKernel)
+                and supports_block_size_multiple_of()
+            ):
+                kernel.set_block_m_multiple_plan(plan)
+            continue
+
         is_linear = (
             isinstance(child, LinearBase)
             and type(child.quant_method) is UnquantizedLinearMethod

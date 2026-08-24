@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import threading
+
 import torch
 
 import vllm.envs as envs
@@ -20,6 +22,7 @@ from vllm.utils.deep_gemm import (
     fp8_gemm_nt,
     is_deep_gemm_e8m0_used,
     is_deep_gemm_supported,
+    set_block_size_multiple_of,
     should_auto_disable_deep_gemm,
     should_use_deepgemm_for_fp8_linear,
 )
@@ -29,6 +32,20 @@ from .BlockScaledMMLinearKernel import (
     Fp8BlockScaledMMLinearKernel,
     FP8ScaledMMLinearLayerConfig,
 )
+
+_layout_override_lock = threading.Lock()
+_layout_overrides_enabled = False
+
+
+def _launch_fp8_gemm_nt(
+    A: torch.Tensor,
+    As: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    output: torch.Tensor,
+    use_deep_gemm_e8m0: bool,
+) -> None:
+    torch.ops.vllm.fp8_gemm_nt_op(A, As, B, Bs, output, use_deep_gemm_e8m0)
 
 
 class DeepGemmFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
@@ -44,6 +61,18 @@ class DeepGemmFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             tma_aligned_scales=envs.VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES,
             column_major_scales=True,
         )
+        self._block_m_multiple_plan: dict[int, int] = {}
+
+    def set_block_m_multiple_plan(self, plan: dict[int, int]) -> None:
+        """Select restricted DeepGEMM layout candidates for specific M values."""
+        global _layout_overrides_enabled
+        if any(m <= 0 or multiple <= 0 for m, multiple in plan.items()):
+            raise ValueError("M values and block-M multiples must be positive")
+        self._block_m_multiple_plan = dict(plan)
+        if plan:
+            # Plans are installed during model initialization. Keep this flag
+            # monotonic because other kernel instances may still have a plan.
+            _layout_overrides_enabled = True
 
     def input_quant_key(self) -> QuantKey | None:
         if DeepGemmQuantScaleFMT.from_oracle() == DeepGemmQuantScaleFMT.UE8M0:
@@ -126,7 +155,22 @@ class DeepGemmFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             dtype=out_dtype,
             device=A.device,
         )
-        torch.ops.vllm.fp8_gemm_nt_op(A, As, B, Bs, output, self.use_deep_gemm_e8m0)
+        block_m_multiple = self._block_m_multiple_plan.get(A.shape[0])
+        if not _layout_overrides_enabled:
+            _launch_fp8_gemm_nt(A, As, B, Bs, output, self.use_deep_gemm_e8m0)
+            return output
+
+        # DeepGEMM's layout constraint is process-global. Serialize every
+        # launch so an unconstrained GEMM cannot observe another call's
+        # temporary override if model execution ever uses multiple threads.
+        with _layout_override_lock:
+            if block_m_multiple is not None:
+                set_block_size_multiple_of((block_m_multiple, 1))
+            try:
+                _launch_fp8_gemm_nt(A, As, B, Bs, output, self.use_deep_gemm_e8m0)
+            finally:
+                if block_m_multiple is not None:
+                    set_block_size_multiple_of((1, 1))
         return output
 
 

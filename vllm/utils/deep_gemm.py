@@ -323,6 +323,22 @@ def set_num_sms(num_sms: int) -> None:
     dg.set_num_sms(num_sms)
 
 
+def set_block_size_multiple_of(value: int | tuple[int, int]) -> None:
+    """Set DeepGEMM's process-wide block-size candidate constraints."""
+    _lazy_init()
+    dg = _import_deep_gemm()
+    if dg is None or not hasattr(dg, "set_block_size_multiple_of"):
+        raise RuntimeError("DeepGEMM block-size constraints are not available")
+    dg.set_block_size_multiple_of(value)
+
+
+def supports_block_size_multiple_of() -> bool:
+    """Return whether DeepGEMM exposes block-size candidate constraints."""
+    _lazy_init()
+    dg = _import_deep_gemm()
+    return dg is not None and hasattr(dg, "set_block_size_multiple_of")
+
+
 def get_mk_alignment_for_contiguous_layout() -> list[int]:
     _lazy_init()
     if _get_mk_alignment_for_contiguous_layout_impl is None:
@@ -783,6 +799,8 @@ __all__ = [
     "is_deep_gemm_supported",
     "get_num_sms",
     "set_num_sms",
+    "set_block_size_multiple_of",
+    "supports_block_size_multiple_of",
     "should_use_deepgemm_for_fp8_linear",
     "get_col_major_tma_aligned_tensor",
     "get_mk_alignment_for_contiguous_layout",
