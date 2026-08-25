@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""FlashInfer ``moe_ep`` helpers for DeepSeek V4 vLLM integration."""
+"""FlashInfer ``moe_ep`` helpers for vLLM model integrations."""
 
 from __future__ import annotations
 
@@ -243,6 +243,11 @@ def build_fi_mega_config(
     top_k: int,
     activation_clamp: float | None,
     megakernel: str,
+    activation: str = "swiglu",
+    situ_beta: float | None = None,
+    situ_linear_beta: float | None = None,
+    shared_hidden_size: int | None = None,
+    shared_intermediate_size: int | None = None,
 ):
     from flashinfer.moe_ep import (
         DeepGemmMegaMoeConfig,
@@ -264,6 +269,11 @@ def build_fi_mega_config(
             intermediate_size=intermediate_size,
             top_k=top_k,
             activation_clamp=activation_clamp,
+            activation=activation,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            shared_hidden_size=shared_hidden_size,
+            shared_intermediate_size=shared_intermediate_size,
             fast_math=True,
         )
     else:
@@ -292,6 +302,11 @@ def build_fi_mega_layer(
     top_k: int,
     activation_clamp: float | None,
     weights,
+    activation: str = "swiglu",
+    situ_beta: float | None = None,
+    situ_linear_beta: float | None = None,
+    shared_hidden_size: int | None = None,
+    shared_intermediate_size: int | None = None,
 ) -> MoEEpMegaLayer:
     from flashinfer.moe_ep import FleetParams, MoEEpLayer
 
@@ -303,6 +318,11 @@ def build_fi_mega_layer(
         top_k=top_k,
         activation_clamp=activation_clamp,
         megakernel=megakernel,
+        activation=activation,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+        shared_hidden_size=shared_hidden_size,
+        shared_intermediate_size=shared_intermediate_size,
     )
     layer = MoEEpLayer(
         bootstrap=bootstrap,

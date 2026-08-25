@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""FlashInfer ``moe_ep`` expert module for DeepSeek V4."""
+"""FlashInfer ``moe_ep`` expert module shared by model integrations."""
 
 from __future__ import annotations
 
@@ -28,7 +28,10 @@ if TYPE_CHECKING:
 _MOE_SKIP_PADDING: bool | None = None
 
 
-def ckpt_uses_nvfp4_experts(vllm_config: VllmConfig) -> bool:
+def ckpt_uses_nvfp4_experts(
+    vllm_config: VllmConfig,
+    prefix: str | None = None,
+) -> bool:
     """True when the loaded checkpoint quantizes experts with modelopt NVFP4
     (e2m1 + fp8-e4m3 per-16 block scales + per-tensor weight_scale_2), i.e.
     the recipe the nvfp4_cutedsl prequantized-weights path consumes verbatim.
@@ -37,7 +40,15 @@ def ckpt_uses_nvfp4_experts(vllm_config: VllmConfig) -> bool:
     their ``quantization_config``, which DeepseekV4FP8Config surfaces as
     ``moe_quant_algo``.
     """
-    return getattr(vllm_config.quant_config, "moe_quant_algo", "") == "NVFP4"
+    quant_config = vllm_config.quant_config
+    if getattr(quant_config, "moe_quant_algo", "") == "NVFP4":
+        return True
+    resolve_quant_algo = getattr(quant_config, "_resolve_quant_algo", None)
+    return bool(
+        prefix is not None
+        and resolve_quant_algo is not None
+        and resolve_quant_algo(prefix) == "NVFP4"
+    )
 
 
 def resolve_mega_moe_is_padding(num_tokens: int) -> torch.Tensor | None:
@@ -142,7 +153,13 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
         self._mega_layer: MoEEpMegaLayer | None = None
         self._fast_ctx: tuple[Any, Any, Any, int, bool] | None = None
         self._epilogue_alphas: tuple[torch.Tensor, torch.Tensor] | None = None
-        self._nvfp4_prequant = ckpt_uses_nvfp4_experts(vllm_config)
+        self._shared_expert_weights: Any | None = None
+        self._fi_activation = "swiglu"
+        self._fi_situ_beta: float | None = None
+        self._fi_situ_linear_beta: float | None = None
+        self._nvfp4_prequant = ckpt_uses_nvfp4_experts(
+            vllm_config, kwargs.get("prefix")
+        )
         if self._nvfp4_prequant:
             megakernel = fi_moe_ep_backend_spec(
                 vllm_config.kernel_config.moe_backend
@@ -221,9 +238,12 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
             return_success,
         )
 
+    def _prepare_shared_expert_weights(
+        self, shared_experts: DeepseekV4MLP | None
+    ) -> tuple[Any | None, int | None, int | None]:
+        return None, None, None
+
     def finalize_weights(self, shared_experts: DeepseekV4MLP | None = None) -> None:
-        # The FlashInfer megakernel has no shared-expert fusion; the caller's
-        # serial shared MLP path handles shared_experts.
         if self._mega_layer is not None:
             return
         if self.w13_weight is None:
@@ -257,6 +277,11 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
                     self._vllm_config.kernel_config.moe_backend
                 ).megakernel,
             )
+        (
+            self._shared_expert_weights,
+            shared_hidden_size,
+            shared_intermediate_size,
+        ) = self._prepare_shared_expert_weights(shared_experts)
         self._mega_layer = build_fi_mega_layer(
             make_fi_moe_ep_bootstrap(),
             vllm_config=self._vllm_config,
@@ -267,6 +292,11 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
             top_k=self.top_k,
             activation_clamp=self._activation_clamp,
             weights=weights,
+            activation=self._fi_activation,
+            situ_beta=self._fi_situ_beta,
+            situ_linear_beta=self._fi_situ_linear_beta,
+            shared_hidden_size=shared_hidden_size,
+            shared_intermediate_size=shared_intermediate_size,
         )
         del weights
         # Allocate (or attach to) the pooled workspace before first
@@ -318,12 +348,14 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
         *,
         activation_clamp: float | None,
         fast_math: bool = True,
+        shared_hidden_states: torch.Tensor | None = None,
+        shared_expert_output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # fast_math is a native deep_gemm knob; the FI kernels have no
         # equivalent toggle, so it is accepted for signature parity only.
         if hidden_states.shape[0] > self.max_num_tokens:
             raise ValueError(
-                f"DeepSeek V4 MegaMoE got {hidden_states.shape[0]} tokens, "
+                f"FlashInfer MegaMoE got {hidden_states.shape[0]} tokens, "
                 f"but the symmetric buffer was sized for {self.max_num_tokens}."
             )
 
@@ -352,6 +384,9 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
                 topk_weights=topk_weights,
                 fc1_alpha=fc1_alpha,
                 fc2_alpha=fc2_alpha,
+                shared_hidden_states=shared_hidden_states,
+                shared_expert_weights=self._shared_expert_weights,
+                shared_expert_output=shared_expert_output,
             )
             kernel.stage_inputs(t, workspace, quantize_input=True)
             if zero_copy:
@@ -379,6 +414,9 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
                 topk_weights=topk_weights,
                 fc1_alpha=fc1_alpha,
                 fc2_alpha=fc2_alpha,
+                shared_hidden_states=shared_hidden_states,
+                shared_expert_weights=self._shared_expert_weights,
+                shared_expert_output=shared_expert_output,
             )
         )
         layer = self._mega_layer

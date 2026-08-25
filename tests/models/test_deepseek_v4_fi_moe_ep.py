@@ -52,6 +52,11 @@ class _FakeNvfp4CutedslMegaMoeConfig:
     intermediate_size: int
     top_k: int
     activation_clamp: float | None
+    activation: str
+    situ_beta: float | None
+    situ_linear_beta: float | None
+    shared_hidden_size: int | None
+    shared_intermediate_size: int | None
     fast_math: bool
 
 
@@ -104,13 +109,16 @@ def test_fi_backend_strings_are_registered_mega_moe_backends():
 def test_fi_moe_ep_backend_rejected_for_non_dsv4(moe_backend):
     """An FI moe_ep backend with a non-DSv4 model must fail at config time
     instead of silently falling through to the generic FusedMoE path."""
-    with pytest.raises(ValueError, match="only supported for DeepSeek-V4"):
+    with pytest.raises(ValueError, match="FlashInfer moe_ep integration"):
         validate_flashinfer_moe_ep_model(moe_backend, ["MixtralForCausalLM"])
 
 
 @pytest.mark.parametrize("moe_backend", sorted(FLASHINFER_MOE_EP_BACKENDS))
-def test_fi_moe_ep_backend_accepted_for_dsv4(moe_backend):
-    validate_flashinfer_moe_ep_model(moe_backend, ["DeepseekV4ForCausalLM"])
+@pytest.mark.parametrize(
+    "architecture", ["DeepseekV4ForCausalLM", "KimiK3ForConditionalGeneration"]
+)
+def test_fi_moe_ep_backend_accepted_for_integrated_models(moe_backend, architecture):
+    validate_flashinfer_moe_ep_model(moe_backend, [architecture])
 
 
 @pytest.mark.parametrize(
@@ -214,8 +222,18 @@ def test_build_fi_mega_config_selects_kernel_config(fake_flashinfer):
         top_k=8,
         activation_clamp=None,
         megakernel="nvfp4_cutedsl",
+        activation="situ",
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+        shared_hidden_size=7168,
+        shared_intermediate_size=6144,
     )
     assert isinstance(cd.megakernel, _FakeNvfp4CutedslMegaMoeConfig)
+    assert cd.megakernel.activation == "situ"
+    assert cd.megakernel.situ_beta == 4.0
+    assert cd.megakernel.situ_linear_beta == 25.0
+    assert cd.megakernel.shared_hidden_size == 7168
+    assert cd.megakernel.shared_intermediate_size == 6144
 
     with pytest.raises(ValueError, match="Unsupported fi_moe_ep megakernel"):
         build_fi_mega_config(
@@ -237,6 +255,24 @@ def test_ckpt_uses_nvfp4_experts_reads_moe_quant_algo():
 
     no_algo = SimpleNamespace(quant_config=SimpleNamespace())
     assert not ckpt_uses_nvfp4_experts(no_algo)
+
+    mixed = SimpleNamespace(
+        quant_config=SimpleNamespace(_resolve_quant_algo=lambda prefix: "NVFP4")
+    )
+    assert ckpt_uses_nvfp4_experts(mixed, "model.layers.1.mlp.experts")
+
+
+def test_kimi_nvfp4_mega_moe_mapping_loads_all_scale_planes():
+    from vllm.models.kimi_k3.nvidia.model import (
+        make_kimi_k3_mega_moe_expert_params_mapping,
+    )
+
+    mapping = make_kimi_k3_mega_moe_expert_params_mapping(1, prequantized_nvfp4=True)
+    assert mapping == [
+        ("experts.w13_", "experts.0.w1.", 0, "w1"),
+        ("experts.w2_", "experts.0.w2.", 0, "w2"),
+        ("experts.w13_", "experts.0.w3.", 0, "w3"),
+    ]
 
 
 def test_dequant_fp4_ue8m0_gran32_decodes_lut_and_scales():

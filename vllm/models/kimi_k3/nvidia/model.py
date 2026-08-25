@@ -11,6 +11,7 @@ from torch import nn
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
+from vllm.config.kernel import MEGA_MOE_BACKENDS
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
@@ -113,6 +114,10 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.kimi_k3 import KimiK3Config
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
+from vllm.utils.flashinfer_moe_ep import (
+    is_fi_moe_ep_backend,
+    validate_fi_moe_ep_config,
+)
 from vllm.utils.math_utils import cdiv
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 from vllm.utils.torch_utils import aux_stream
@@ -522,7 +527,19 @@ class KimiK3MegaMoEExperts(DeepseekV4MegaMoEExperts):
 
 def make_kimi_k3_mega_moe_expert_params_mapping(
     num_experts: int,
+    prequantized_nvfp4: bool = False,
 ) -> list[tuple[str, str, int, str]]:
+    if prequantized_nvfp4:
+        return [
+            (
+                "experts.w13_" if shard_id in ("w1", "w3") else "experts.w2_",
+                f"experts.{expert_id}.{shard_id}.",
+                expert_id,
+                shard_id,
+            )
+            for expert_id in range(num_experts)
+            for shard_id in ("w1", "w2", "w3")
+        ]
     mapping = []
     for expert_id in range(num_experts):
         for shard_id in ("w1", "w2", "w3"):
@@ -577,9 +594,10 @@ class KimiMoE(nn.Module):
         self.moe_router_activation_func = config.moe_router_activation_func
         self.num_shared_experts = config.num_shared_experts
         self.layer_idx = layer_idx
-        self.use_mega_moe = (
-            vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
-        )
+        moe_backend = vllm_config.kernel_config.moe_backend
+        validate_fi_moe_ep_config(vllm_config)
+        self.use_mega_moe = moe_backend in MEGA_MOE_BACKENDS
+        self.use_fi_mega_moe = is_fi_moe_ep_backend(moe_backend)
         if self.use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:
             raise NotImplementedError(
                 "Kimi K3 MegaMoE requires expert parallel. Enable it with "
@@ -637,7 +655,9 @@ class KimiMoE(nn.Module):
                 # Only the MegaMoE path calls the shared experts directly; the
                 # FusedMoE path below hands them to the runner, which fuses
                 # their reduction and assumes the replicated layout.
-                can_shard_sequence_parallel=self.use_mega_moe,
+                can_shard_sequence_parallel=(
+                    self.use_mega_moe and not self.use_fi_mega_moe
+                ),
                 run_gemm_rs_ar=run_gemm_rs_ar,
                 prefix=f"{prefix}.shared_experts",
                 activation_situ_beta=activation_situ_beta,
@@ -700,8 +720,7 @@ class KimiMoE(nn.Module):
                     f"EP size {ep_size}."
                 )
             num_local_experts = num_experts // ep_size
-            self.experts = KimiK3MegaMoEExperts(
-                vllm_config,
+            expert_kwargs: dict[str, Any] = dict(
                 num_experts=num_experts,
                 num_local_experts=num_local_experts,
                 experts_start_idx=ep_rank * num_local_experts,
@@ -713,6 +732,14 @@ class KimiMoE(nn.Module):
                 activation_beta=activation_situ_beta,
                 activation_linear_beta=activation_situ_linear_beta,
             )
+            if self.use_fi_mega_moe:
+                from vllm.models.kimi_k3.nvidia.fi_moe import (
+                    KimiK3MegaMoEExpertsFI,
+                )
+
+                self.experts = KimiK3MegaMoEExpertsFI(vllm_config, **expert_kwargs)
+            else:
+                self.experts = KimiK3MegaMoEExperts(vllm_config, **expert_kwargs)
         else:
             self.experts = FusedMoEFactory(
                 shared_experts=self.shared_experts,
@@ -825,19 +852,30 @@ class KimiMoE(nn.Module):
         if self.use_mega_moe:
             assert self.routed_output_transform is not None
             assert topk_ids is not None
-            final_hidden_states = self.experts(
-                routed_hidden_states,
-                router_output,
-                topk_ids,
-                activation_clamp=None,
-            )
+            if self.use_fi_mega_moe and self.shared_experts is not None:
+                shared_output = torch.empty_like(hidden_states)
+                final_hidden_states = self.experts(
+                    routed_hidden_states,
+                    router_output,
+                    topk_ids,
+                    activation_clamp=None,
+                    shared_hidden_states=hidden_states,
+                    shared_expert_output=shared_output,
+                )
+            else:
+                final_hidden_states = self.experts(
+                    routed_hidden_states,
+                    router_output,
+                    topk_ids,
+                    activation_clamp=None,
+                )
+                shared_output = (
+                    self.shared_experts(hidden_states)
+                    if self.shared_experts is not None
+                    else None
+                )
             # The shared output is folded into the up-projection GEMM's beta-add
             # epilogue, so combining the two branches costs no extra kernel.
-            shared_output = (
-                self.shared_experts(hidden_states)
-                if self.shared_experts is not None
-                else None
-            )
             final_hidden_states = self.routed_output_transform(
                 final_hidden_states, residual=shared_output
             )
@@ -878,7 +916,7 @@ class KimiDecoderLayer(nn.Module):
             and layer_idx % config.moe_layer_freq == 0
         )
 
-        use_mega_moe = vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+        use_mega_moe = vllm_config.kernel_config.moe_backend in MEGA_MOE_BACKENDS
         self.use_sequence_parallel = (
             parallel_config.pipeline_parallel_size == 1
             and parallel_config.enable_expert_parallel
@@ -1130,7 +1168,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         self.attn_res_block_size: int | None = config.attn_res_block_size
         self.use_attn_res = self.attn_res_block_size is not None
         parallel_config = vllm_config.parallel_config
-        use_mega_moe = vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+        use_mega_moe = vllm_config.kernel_config.moe_backend in MEGA_MOE_BACKENDS
         self.use_sequence_parallel = (
             parallel_config.pipeline_parallel_size == 1
             and parallel_config.enable_expert_parallel
@@ -1470,8 +1508,14 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             if isinstance(module, KimiMoE)
         )
         if self.config.is_moe and use_mega_moe:
+            prequantized_nvfp4 = any(
+                getattr(module.experts, "_nvfp4_prequant", False)
+                for module in self.modules()
+                if isinstance(module, KimiMoE)
+            )
             expert_params_mapping = make_kimi_k3_mega_moe_expert_params_mapping(
-                self.config.num_experts
+                self.config.num_experts,
+                prequantized_nvfp4=prequantized_nvfp4,
             )
         elif self.config.is_moe:
             # Params for weights, fp8 weight scales, fp8 activation scales
@@ -1584,7 +1628,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
     def finalize_mega_moe_weights(self) -> None:
         for module in self.modules():
             if isinstance(module, KimiMoE) and module.use_mega_moe:
-                module.experts.finalize_weights()
+                module.experts.finalize_weights(module.shared_experts)
 
 
 class KimiLinearForCausalLM(

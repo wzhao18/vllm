@@ -164,6 +164,8 @@ FLASHINFER_MOE_EP_ARCHITECTURES = frozenset(
     {
         "DeepseekV4ForCausalLM",
         "DeepSeekV4MTPModel",
+        "KimiK3ForConditionalGeneration",
+        "KimiLinearForCausalLM",
     }
 )
 
@@ -176,8 +178,9 @@ def validate_flashinfer_moe_ep_model(
         return
     if not any(arch in FLASHINFER_MOE_EP_ARCHITECTURES for arch in architectures):
         raise ValueError(
-            f"moe_backend={moe_backend!r} is only supported for DeepSeek-V4 "
-            f"models ({sorted(FLASHINFER_MOE_EP_ARCHITECTURES)}), but the "
+            f"moe_backend={moe_backend!r} is only supported for models with "
+            "a FlashInfer moe_ep integration "
+            f"({sorted(FLASHINFER_MOE_EP_ARCHITECTURES)}), but the "
             f"model is {list(architectures)}."
         )
 

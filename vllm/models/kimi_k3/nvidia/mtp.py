@@ -275,8 +275,14 @@ class KimiK3MTP(nn.Module):
             if isinstance(module, KimiMoE)
         )
         if self.config.is_moe and use_mega_moe:
+            prequantized_nvfp4 = any(
+                getattr(module.experts, "_nvfp4_prequant", False)
+                for module in self.modules()
+                if isinstance(module, KimiMoE)
+            )
             expert_params_mapping = make_kimi_k3_mega_moe_expert_params_mapping(
-                self.config.num_experts
+                self.config.num_experts,
+                prequantized_nvfp4=prequantized_nvfp4,
             )
         elif self.config.is_moe:
             expert_params_mapping = fused_moe_make_expert_params_mapping(
@@ -409,7 +415,7 @@ class KimiK3MTP(nn.Module):
         if use_mega_moe:
             for module in self.modules():
                 if isinstance(module, KimiMoE) and module.use_mega_moe:
-                    module.experts.finalize_weights()
+                    module.experts.finalize_weights(module.shared_experts)
 
         return loaded_params
 
