@@ -184,6 +184,19 @@ def get_kimi_nvfp4_mega_moe_knobs(vllm_config: VllmConfig) -> dict:
     return knobs
 
 
+def get_kimi_nvfp4_integrated_mega_moe_knobs(vllm_config: VllmConfig) -> dict:
+    knobs = get_kimi_nvfp4_mega_moe_knobs(vllm_config)
+    additional_config = vllm_config.additional_config
+    overrides = (
+        additional_config.get("kimi_nvfp4_mega_moe_knobs")
+        if isinstance(additional_config, dict)
+        else None
+    )
+    if not isinstance(overrides, dict) or "max_active_clusters" not in overrides:
+        knobs.pop("max_active_clusters", None)
+    return knobs
+
+
 def get_kimi_nvfp4_fused_shared_expert_num_sms(
     vllm_config: VllmConfig,
     total_sms: int,
@@ -812,6 +825,9 @@ class KimiK3FlashInferMegaMoEExperts(KimiK3MegaMoEExperts):
         super().__init__(vllm_config, *args, **kwargs)
         self._dummy_weights = vllm_config.load_config.load_format == "dummy"
         self._mega_moe_knobs = get_kimi_nvfp4_mega_moe_knobs(vllm_config)
+        self._integrated_mega_moe_knobs = (
+            get_kimi_nvfp4_integrated_mega_moe_knobs(vllm_config)
+        )
         self._mega_moe_combine_dtype = get_kimi_nvfp4_mega_moe_combine_dtype(
             vllm_config
         )
@@ -1002,7 +1018,11 @@ class KimiK3FlashInferMegaMoEExperts(KimiK3MegaMoEExperts):
             input_norm_const=float((1.0 / a13_scale).item()),
             in_kernel_fc2_reduce=self._mega_moe_in_kernel_reduce,
             combine_dtype=self._mega_moe_combine_dtype,
-            knobs=self._mega_moe_knobs,
+            knobs=(
+                self._integrated_mega_moe_knobs
+                if self._integrated_shared_expert is not None
+                else self._mega_moe_knobs
+            ),
             shared_hidden_size=(
                 self._integrated_shared_expert.hidden_size
                 if self._integrated_shared_expert is not None

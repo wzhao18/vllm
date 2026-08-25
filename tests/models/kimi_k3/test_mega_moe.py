@@ -124,7 +124,10 @@ def test_kimi_flashinfer_mega_moe_loader_preserves_nvfp4_metadata():
     assert experts.w2_input_scale[0].item() == 19.0
 
 
-def test_kimi_flashinfer_mega_moe_builds_modelopt_scale_algebra(monkeypatch):
+@pytest.mark.parametrize("integrated_shared", [False, True])
+def test_kimi_flashinfer_mega_moe_builds_modelopt_scale_algebra(
+    monkeypatch, integrated_shared
+):
     import flashinfer.moe_ep as moe_ep
 
     from vllm.models.kimi_k3.nvidia import model as kimi_model
@@ -146,6 +149,10 @@ def test_kimi_flashinfer_mega_moe_builds_modelopt_scale_algebra(monkeypatch):
     experts.w13_input_scale.data.copy_(torch.tensor([[2.0, 1.0], [3.0, 1.0]]))
     experts.w2_input_scale.data.copy_(torch.tensor([4.0, 2.0]))
     experts._check_runtime_supported = lambda: None
+    if integrated_shared:
+        experts.set_integrated_shared_expert(
+            SimpleNamespace(hidden_size=128, intermediate_size=256)
+        )
 
     ep_group = SimpleNamespace(world_size=1, rank_in_group=0, device_group=None)
     monkeypatch.setattr(kimi_model, "get_ep_group", lambda: ep_group)
@@ -191,7 +198,7 @@ def test_kimi_flashinfer_mega_moe_builds_modelopt_scale_algebra(monkeypatch):
     assert kernel.situ_linear_beta == 25.0
     assert kernel.in_kernel_fc2_reduce
     assert kernel.combine_dtype == "bf16"
-    assert kernel.knobs == {
+    expected_knobs = {
         "cluster_shape_mnk": (2, 1, 1),
         "group_hint": 512,
         "max_active_clusters": 60,
@@ -201,6 +208,11 @@ def test_kimi_flashinfer_mega_moe_builds_modelopt_scale_algebra(monkeypatch):
         "flag_batch": 4,
         "token_back_mode": "standalone_warps",
     }
+    if integrated_shared:
+        expected_knobs.pop("max_active_clusters")
+        assert kernel.shared_hidden_size == 128
+        assert kernel.shared_intermediate_size == 256
+    assert kernel.knobs == expected_knobs
     assert captured["weights"].w13_scale.dtype == torch.float8_e4m3fn
     assert captured["weights"].w13_scale.shape == (2, 256, 8)
     assert experts.w13_weight is None
@@ -228,6 +240,25 @@ def test_kimi_flashinfer_mega_moe_overrides_kernel_knobs():
 
     assert knobs["max_active_clusters"] == 72
     assert knobs["mma_tiler_mnk"] == (256, 256, 256)
+
+
+def test_kimi_integrated_mega_moe_uses_full_hardware_grid_by_default():
+    from vllm.models.kimi_k3.nvidia.model import (
+        get_kimi_nvfp4_integrated_mega_moe_knobs,
+    )
+
+    knobs = get_kimi_nvfp4_integrated_mega_moe_knobs(
+        _kimi_flashinfer_test_config()
+    )
+    assert "max_active_clusters" not in knobs
+
+    config = _kimi_flashinfer_test_config(
+        additional_config={
+            "kimi_nvfp4_mega_moe_knobs": {"max_active_clusters": 64}
+        }
+    )
+    knobs = get_kimi_nvfp4_integrated_mega_moe_knobs(config)
+    assert knobs["max_active_clusters"] == 64
 
 
 def test_kimi_fused_shared_expert_uses_routed_grid_complement():
