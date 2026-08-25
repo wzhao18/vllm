@@ -4,7 +4,7 @@
 
 import math
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, cast
 
 import torch
 from torch import nn
@@ -127,20 +127,7 @@ from ..common.mm_preprocess import (
     KimiK3ProcessingInfo,
 )
 
-if TYPE_CHECKING:
-    from flashinfer.moe_ep import Nvfp4CutedslSharedExpertSession
-
 logger = init_logger(__name__)
-
-
-_kimi_shared_expert_stream: torch.cuda.Stream | None = None
-
-
-def kimi_shared_expert_stream() -> torch.cuda.Stream | None:
-    global _kimi_shared_expert_stream
-    if _kimi_shared_expert_stream is None and current_platform.is_cuda_alike():
-        _kimi_shared_expert_stream = torch.cuda.Stream()
-    return _kimi_shared_expert_stream
 
 
 # Token-count cutoff for overlapping the MoE router gate with the routed-expert
@@ -457,7 +444,6 @@ class KimiFusedSharedExpert(CustomOp):
 
     shard_sequence_parallel = False
     gate_up_interleave = 8
-    _nvfp4_sessions: dict[tuple[int, ...], "Nvfp4CutedslSharedExpertSession"] = {}
 
     def __init__(
         self,
@@ -477,13 +463,7 @@ class KimiFusedSharedExpert(CustomOp):
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.max_num_tokens = max_num_tokens
-        self.overlap_max_num_tokens = min(
-            max_num_tokens,
-            envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD,
-        )
-        self.situ_beta = situ_beta
-        self.situ_linear_beta = situ_linear_beta
-        self.num_sms = num_sms
+        del situ_beta, situ_linear_beta, num_sms
         self._transformed_nvfp4_weights = None
         self.gate_up_proj = _KimiFusedSharedLinear(
             (2 * intermediate_size, hidden_size),
@@ -554,62 +534,11 @@ class KimiFusedSharedExpert(CustomOp):
         self.gate_up_proj.register_parameter("weight", None)
         self.down_proj.register_parameter("weight", None)
 
-    def _nvfp4_session(
-        self, hidden_states: torch.Tensor
-    ) -> "Nvfp4CutedslSharedExpertSession":
-        num_tokens = hidden_states.shape[0]
-        if num_tokens > self.max_num_tokens:
-            raise ValueError(
-                "NVFP4 shared-expert input exceeds max_num_batched_tokens: "
-                f"{num_tokens} > {self.max_num_tokens}."
-            )
-        session_capacity = min(
-            1 << max(num_tokens - 1, 0).bit_length(),
-            self.max_num_tokens,
-        )
-        device = hidden_states.device.index
-        if device is None:
-            device = torch.cuda.current_device()
-        session_num_sms = self.num_sms
-        if num_tokens > self.overlap_max_num_tokens:
-            session_num_sms = torch.cuda.get_device_properties(
-                device
-            ).multi_processor_count
-        key = (
-            device,
-            session_capacity,
-            self.hidden_size,
-            self.intermediate_size,
-            session_num_sms,
-            self.situ_beta,
-            self.situ_linear_beta,
-        )
-        session = self._nvfp4_sessions.get(key)
-        if session is None:
-            from flashinfer.moe_ep import Nvfp4CutedslSharedExpertSession
-
-            session = Nvfp4CutedslSharedExpertSession(
-                max_num_tokens=session_capacity,
-                hidden_size=self.hidden_size,
-                intermediate_size=self.intermediate_size,
-                num_sms=session_num_sms,
-                situ_beta=self.situ_beta,
-                situ_linear_beta=self.situ_linear_beta,
-            )
-            self._nvfp4_sessions[key] = session
-        return session
-
-    def stage_nvfp4(
-        self, hidden_states: torch.Tensor, *, integrated: bool = False
-    ) -> None:
-        self._nvfp4_session(hidden_states).stage(hidden_states, integrated=integrated)
-
-    def forward_staged_nvfp4(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self._nvfp4_session(hidden_states).run(self._nvfp4_weights())
-
     def forward_cuda(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        self.stage_nvfp4(hidden_states)
-        return self.forward_staged_nvfp4(hidden_states)
+        del hidden_states
+        raise RuntimeError(
+            "KimiFusedSharedExpert must execute inside FlashInfer MegaMoE."
+        )
 
 
 class KimiRoutedOutputTransform(nn.Module):
@@ -825,8 +754,8 @@ class KimiK3FlashInferMegaMoEExperts(KimiK3MegaMoEExperts):
         super().__init__(vllm_config, *args, **kwargs)
         self._dummy_weights = vllm_config.load_config.load_format == "dummy"
         self._mega_moe_knobs = get_kimi_nvfp4_mega_moe_knobs(vllm_config)
-        self._integrated_mega_moe_knobs = (
-            get_kimi_nvfp4_integrated_mega_moe_knobs(vllm_config)
+        self._integrated_mega_moe_knobs = get_kimi_nvfp4_integrated_mega_moe_knobs(
+            vllm_config
         )
         self._mega_moe_combine_dtype = get_kimi_nvfp4_mega_moe_combine_dtype(
             vllm_config
@@ -1084,7 +1013,9 @@ class KimiK3FlashInferMegaMoEExperts(KimiK3MegaMoEExperts):
         *,
         activation_clamp: float | None,
         fast_math: bool = True,
-        integrate_shared_expert: bool = True,
+        shared_hidden_states: torch.Tensor | None = None,
+        shared_expert_weights: Any = None,
+        shared_expert_output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         del fast_math
         if activation_clamp is not None:
@@ -1112,15 +1043,6 @@ class KimiK3FlashInferMegaMoEExperts(KimiK3MegaMoEExperts):
         assert self._flashinfer_fc1_norm_const is not None
         from flashinfer.moe_ep import MoEEpTensors
 
-        shared_inputs = None
-        if integrate_shared_expert and self._integrated_shared_expert is not None:
-            shared_session = self._integrated_shared_expert._nvfp4_session(
-                hidden_states
-            )
-            shared_inputs = shared_session.integrated_inputs(
-                self._integrated_shared_expert._nvfp4_weights()
-            )
-
         return self._flashinfer_layer(
             MoEEpTensors(
                 hidden_states=hidden_states,
@@ -1129,7 +1051,9 @@ class KimiK3FlashInferMegaMoEExperts(KimiK3MegaMoEExperts):
                 fc1_alpha=self._flashinfer_fc1_alpha,
                 fc2_alpha=self._flashinfer_fc2_alpha,
                 fc1_norm_const=self._flashinfer_fc1_norm_const,
-                mega_shared_inputs=shared_inputs,
+                shared_hidden_states=shared_hidden_states,
+                shared_expert_weights=shared_expert_weights,
+                shared_expert_output=shared_expert_output,
             )
         )
 
@@ -1212,19 +1136,6 @@ class KimiMoE(nn.Module):
             and isinstance(additional_config, dict)
             and additional_config.get("kimi_nvfp4_in_kernel_shared_fc12", False)
         )
-        self.in_kernel_shared_fc12_max_tokens = (
-            int(
-                additional_config.get(
-                    "kimi_nvfp4_in_kernel_shared_fc12_max_tokens", 1024
-                )
-            )
-            if self.use_in_kernel_shared_fc12
-            else 0
-        )
-        if self.in_kernel_shared_fc12_max_tokens < 0:
-            raise ValueError(
-                "kimi_nvfp4_in_kernel_shared_fc12_max_tokens must be non-negative."
-            )
         if self.use_flashinfer_mega_moe:
             resolve_quant_algo = getattr(quant_config, "_resolve_quant_algo", None)
             quant_algo = (
@@ -1357,7 +1268,6 @@ class KimiMoE(nn.Module):
             # _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD).
             self._down_proj_stream: torch.cuda.Stream | None = aux_stream()
             self._down_proj_events = (torch.cuda.Event(), torch.cuda.Event())
-            self._shared_expert_events = (torch.cuda.Event(), torch.cuda.Event())
         else:
             self.routed_expert_down_proj = None
             self.routed_expert_norm = None
@@ -1500,59 +1410,34 @@ class KimiMoE(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
-        integrate_shared_fc12 = bool(
-            self.use_in_kernel_shared_fc12
-            and num_tokens <= self.in_kernel_shared_fc12_max_tokens
-        )
+        integrate_shared_fc12 = self.use_in_kernel_shared_fc12
         shared_experts = self.shared_experts
         uses_nvfp4_shared = isinstance(shared_experts, KimiFusedSharedExpert)
-        staged_nvfp4_shared = bool(
-            uses_nvfp4_shared and num_tokens <= shared_experts.overlap_max_num_tokens
-        )
         # Overlap the gate with the routed down projection; the returned hidden
         # states are already down-projected. Keep the original ``hidden_states``
         # for the shared experts.
-        if staged_nvfp4_shared:
-            assert isinstance(shared_experts, KimiFusedSharedExpert)
-            (
-                (
-                    routed_hidden_states,
-                    router_output,
-                    topk_ids,
-                ),
-                _,
-            ) = maybe_execute_in_parallel(
-                lambda: self._maybe_overlap_router_and_down_proj(hidden_states),
-                lambda: shared_experts.stage_nvfp4(
-                    hidden_states, integrated=integrate_shared_fc12
-                ),
-                self._shared_expert_events[0],
-                self._shared_expert_events[1],
-                kimi_shared_expert_stream(),
-                launch_aux_first=True,
-            )
-        else:
-            routed_hidden_states, router_output, topk_ids = (
-                self._maybe_overlap_router_and_down_proj(hidden_states)
-            )
-            if uses_nvfp4_shared:
-                assert isinstance(shared_experts, KimiFusedSharedExpert)
-                shared_experts.stage_nvfp4(
-                    hidden_states, integrated=integrate_shared_fc12
-                )
+        routed_hidden_states, router_output, topk_ids = (
+            self._maybe_overlap_router_and_down_proj(hidden_states)
+        )
         if self.use_mega_moe:
             assert self.routed_output_transform is not None
             assert topk_ids is not None
+            integrated_shared_output = (
+                torch.empty_like(hidden_states) if integrate_shared_fc12 else None
+            )
 
             def run_routed_experts() -> torch.Tensor:
-                if self.use_in_kernel_shared_fc12:
+                if integrate_shared_fc12:
                     assert isinstance(self.experts, KimiK3FlashInferMegaMoEExperts)
+                    assert isinstance(shared_experts, KimiFusedSharedExpert)
                     return self.experts(
                         routed_hidden_states,
                         router_output,
                         topk_ids,
                         activation_clamp=None,
-                        integrate_shared_expert=integrate_shared_fc12,
+                        shared_hidden_states=hidden_states,
+                        shared_expert_weights=shared_experts._nvfp4_weights(),
+                        shared_expert_output=integrated_shared_output,
                     )
                 return self.experts(
                     routed_hidden_states,
@@ -1563,14 +1448,11 @@ class KimiMoE(nn.Module):
 
             final_hidden_states = run_routed_experts()
             if integrate_shared_fc12:
-                assert isinstance(shared_experts, KimiFusedSharedExpert)
-                shared_output = shared_experts._nvfp4_session(hidden_states).output()
+                shared_output = integrated_shared_output
             elif shared_experts is None:
                 shared_output = None
-            elif uses_nvfp4_shared:
-                assert isinstance(shared_experts, KimiFusedSharedExpert)
-                shared_output = shared_experts.forward_staged_nvfp4(hidden_states)
             else:
+                assert not uses_nvfp4_shared
                 shared_output = shared_experts(hidden_states)
             final_hidden_states = self.routed_output_transform(
                 final_hidden_states, residual=shared_output

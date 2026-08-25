@@ -247,15 +247,11 @@ def test_kimi_integrated_mega_moe_uses_full_hardware_grid_by_default():
         get_kimi_nvfp4_integrated_mega_moe_knobs,
     )
 
-    knobs = get_kimi_nvfp4_integrated_mega_moe_knobs(
-        _kimi_flashinfer_test_config()
-    )
+    knobs = get_kimi_nvfp4_integrated_mega_moe_knobs(_kimi_flashinfer_test_config())
     assert "max_active_clusters" not in knobs
 
     config = _kimi_flashinfer_test_config(
-        additional_config={
-            "kimi_nvfp4_mega_moe_knobs": {"max_active_clusters": 64}
-        }
+        additional_config={"kimi_nvfp4_mega_moe_knobs": {"max_active_clusters": 64}}
     )
     knobs = get_kimi_nvfp4_integrated_mega_moe_knobs(config)
     assert knobs["max_active_clusters"] == 64
@@ -349,12 +345,9 @@ def test_kimi_flashinfer_mega_moe_staged_bf16_combine_configuration():
     assert not get_kimi_nvfp4_mega_moe_in_kernel_reduce(config)
 
 
-@pytest.mark.parametrize(
-    ("with_shared_expert", "integrate_shared_expert"),
-    [(False, True), (True, True), (True, False)],
-)
+@pytest.mark.parametrize("with_shared_expert", [False, True])
 def test_kimi_flashinfer_mega_moe_forward_preserves_tensor_contract(
-    monkeypatch, with_shared_expert, integrate_shared_expert
+    monkeypatch, with_shared_expert
 ):
     from vllm.models.kimi_k3.nvidia import model as kimi_model
 
@@ -367,7 +360,6 @@ def test_kimi_flashinfer_mega_moe_forward_preserves_tensor_contract(
     experts._flashinfer_fc1_alpha = torch.ones(2)
     experts._flashinfer_fc2_alpha = torch.ones(2)
     experts._flashinfer_fc1_norm_const = torch.ones(2)
-    experts._integrated_shared_expert = None
     experts.synchronize_first_launch = lambda: None
     experts.finalize_weights = lambda: None
     monkeypatch.setattr(kimi_model, "is_forward_context_available", lambda: False)
@@ -383,33 +375,23 @@ def test_kimi_flashinfer_mega_moe_forward_preserves_tensor_contract(
     hidden_states = torch.randn(3, 8)
     topk_ids = torch.tensor([[0, 1], [1, 0], [0, 1]])
     topk_weights = torch.rand(3, 2)
-    shared_inputs = None
+    shared_hidden_states = None
+    shared_weights = None
+    shared_output = None
 
     if with_shared_expert:
-        shared_inputs = object()
-
-        class FakeSharedSession:
-            def integrated_inputs(self, weights):
-                assert weights is shared_weights
-                return shared_inputs
-
-        class FakeSharedExpert(torch.nn.Module):
-            def _nvfp4_session(self, states):
-                assert states is hidden_states
-                return FakeSharedSession()
-
-            def _nvfp4_weights(self):
-                return shared_weights
-
+        shared_hidden_states = torch.randn(3, 16)
         shared_weights = object()
-        experts._integrated_shared_expert = FakeSharedExpert()
+        shared_output = torch.empty_like(shared_hidden_states)
 
     output = experts(
         hidden_states,
         topk_weights,
         topk_ids,
         activation_clamp=None,
-        integrate_shared_expert=integrate_shared_expert,
+        shared_hidden_states=shared_hidden_states,
+        shared_expert_weights=shared_weights,
+        shared_expert_output=shared_output,
     )
 
     assert output.data_ptr() != hidden_states.data_ptr()
@@ -420,8 +402,9 @@ def test_kimi_flashinfer_mega_moe_forward_preserves_tensor_contract(
     assert captured["tensors"].fc1_alpha is experts._flashinfer_fc1_alpha
     assert captured["tensors"].fc2_alpha is experts._flashinfer_fc2_alpha
     assert captured["tensors"].fc1_norm_const is experts._flashinfer_fc1_norm_const
-    expected_shared_inputs = shared_inputs if integrate_shared_expert else None
-    assert captured["tensors"].mega_shared_inputs is expected_shared_inputs
+    assert captured["tensors"].shared_hidden_states is shared_hidden_states
+    assert captured["tensors"].shared_expert_weights is shared_weights
+    assert captured["tensors"].shared_expert_output is shared_output
 
 
 def test_kimi_flashinfer_mega_moe_uses_sequence_parallel_token_capacity():
@@ -446,64 +429,21 @@ def test_kimi_flashinfer_mega_moe_uses_sequence_parallel_token_capacity():
     assert experts.max_num_tokens == 2048
 
 
-def test_kimi_nvfp4_shared_expert_buckets_session_capacity(monkeypatch):
-    import flashinfer.moe_ep as moe_ep
-
-    from vllm.models.kimi_k3.nvidia import model as kimi_model
-
-    experts = kimi_model.KimiFusedSharedExpert.__new__(kimi_model.KimiFusedSharedExpert)
-    experts.max_num_tokens = 8192
-    experts.overlap_max_num_tokens = 256
-    experts.hidden_size = 128
-    experts.intermediate_size = 256
-    experts.num_sms = 28
-    experts.situ_beta = 4.0
-    experts.situ_linear_beta = 25.0
-    experts._nvfp4_sessions = {}
-
-    capacities = []
-
-    class FakeSession:
-        def __init__(self, *, max_num_tokens, **kwargs):
-            capacities.append(max_num_tokens)
-
-    monkeypatch.setattr(moe_ep, "Nvfp4CutedslSharedExpertSession", FakeSession)
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda device: SimpleNamespace(multi_processor_count=148),
-    )
-
-    session_65 = experts._nvfp4_session(torch.empty(65, 128))
-    session_129 = experts._nvfp4_session(torch.empty(129, 128))
-    session_200 = experts._nvfp4_session(torch.empty(200, 128))
-    session_257 = experts._nvfp4_session(torch.empty(257, 128))
-    session_320 = experts._nvfp4_session(torch.empty(320, 128))
-
-    assert session_65 is not session_129
-    assert session_129 is session_200
-    assert session_257 is not session_200
-    assert session_257 is session_320
-    assert capacities == [128, 256, 512]
-
-
-def test_kimi_moe_stages_shared_input_before_integrated_kernel(monkeypatch):
+def test_kimi_moe_passes_shared_input_to_integrated_kernel():
     from vllm.models.kimi_k3.nvidia import model as kimi_model
 
     calls = []
-    shared_output = torch.full((2, 8), 3.0)
 
     class SharedExpert(kimi_model.KimiFusedSharedExpert):
-        def stage_nvfp4(self, hidden_states, *, integrated=False):
-            calls.append(("stage", integrated, hidden_states.shape[0]))
-
-        def _nvfp4_session(self, hidden_states):
-            return SimpleNamespace(output=lambda: shared_output)
+        def _nvfp4_weights(self):
+            return "shared_weights"
 
     class RoutedExperts(kimi_model.KimiK3FlashInferMegaMoEExperts):
-        def forward(self, hidden_states, *args, integrate_shared_expert=True, **kwargs):
-            calls.append(("routed", integrate_shared_expert))
+        def forward(self, hidden_states, *args, **kwargs):
+            assert kwargs["shared_hidden_states"].shape == (2, 8)
+            assert kwargs["shared_expert_weights"] == "shared_weights"
+            kwargs["shared_expert_output"].fill_(3.0)
+            calls.append("routed")
             return torch.full_like(hidden_states, 2.0)
 
     class OutputTransform(torch.nn.Module):
@@ -512,19 +452,16 @@ def test_kimi_moe_stages_shared_input_before_integrated_kernel(monkeypatch):
 
     shared = SharedExpert.__new__(SharedExpert)
     torch.nn.Module.__init__(shared)
-    shared.overlap_max_num_tokens = 256
     routed = RoutedExperts.__new__(RoutedExperts)
     torch.nn.Module.__init__(routed)
 
     moe = kimi_model.KimiMoE.__new__(kimi_model.KimiMoE)
     torch.nn.Module.__init__(moe)
     moe.use_in_kernel_shared_fc12 = True
-    moe.in_kernel_shared_fc12_max_tokens = 1024
     moe.use_mega_moe = True
     moe.shared_experts = shared
     moe.experts = routed
     moe.routed_output_transform = OutputTransform()
-    moe._shared_expert_events = (object(), object())
     object.__setattr__(
         moe,
         "_maybe_overlap_router_and_down_proj",
@@ -535,16 +472,7 @@ def test_kimi_moe_stages_shared_input_before_integrated_kernel(monkeypatch):
         ),
     )
 
-    def execute(fn0, fn1, *args, **kwargs):
-        assert kwargs == {"launch_aux_first": True}
-        result1 = fn1()
-        result0 = fn0()
-        return result0, result1
-
-    monkeypatch.setattr(kimi_model, "maybe_execute_in_parallel", execute)
-    monkeypatch.setattr(kimi_model, "kimi_shared_expert_stream", lambda: object())
-
     output = moe(torch.ones(2, 8))
 
-    assert calls == [("stage", True, 2), ("routed", True)]
+    assert calls == ["routed"]
     torch.testing.assert_close(output, torch.full((2, 8), 5.0))
