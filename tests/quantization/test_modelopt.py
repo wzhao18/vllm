@@ -6,6 +6,7 @@ Run `pytest tests/quantization/test_modelopt.py`.
 """
 
 import os
+from types import SimpleNamespace
 from typing import Any, NoReturn
 from unittest.mock import MagicMock, Mock, patch
 
@@ -200,6 +201,65 @@ def test_modelopt_fp8_pb_wo_hides_output_padding(default_vllm_config):
     assert output.is_contiguous()
     kernel.apply_weights.assert_called_once()
     assert kernel.apply_weights.call_args.args[2] is None
+
+
+def test_modelopt_fp8_pb_wo_shares_only_identical_input_quantizers():
+    class FakeKernel:
+        def __init__(self, key: object, *, tma_aligned_scales: bool = True) -> None:
+            self._key = key
+            self.use_triton = False
+            self.quant_fp8 = Mock(return_value=(torch.ones(2, 4), torch.ones(2, 1)))
+            for name, value in {
+                "group_shape": (1, 128),
+                "num_token_padding": None,
+                "column_major_scales": True,
+                "tma_aligned_scales": tma_aligned_scales,
+                "use_ue8m0": True,
+            }.items():
+                setattr(self.quant_fp8, name, value)
+
+        def input_quant_key(self):
+            return self._key
+
+    key = object()
+    method = object.__new__(ModelOptFp8PbWoLinearMethod)
+    method.w8a8_block_fp8_linear = FakeKernel(key)
+    other = object.__new__(ModelOptFp8PbWoLinearMethod)
+    other.w8a8_block_fp8_linear = FakeKernel(key)
+    x = torch.randn(2, 4)
+
+    quantized = method.try_quantize_shared_input(other, x)
+
+    assert quantized is not None
+    assert quantized.orig_shape == x.shape
+    assert quantized.orig_dtype == x.dtype
+    assert quantized.quant_key is key
+    call = method.w8a8_block_fp8_linear.quant_fp8.call_args
+    assert call.args[0].data_ptr() == x.data_ptr()
+    assert call.args[0].shape == x.shape
+    assert call.args[1:] == (None, None)
+    assert call.kwargs == {"use_triton": False}
+
+    other.w8a8_block_fp8_linear = FakeKernel(key, tma_aligned_scales=False)
+    assert method.try_quantize_shared_input(other, x) is None
+    assert method.try_quantize_shared_input(SimpleNamespace(), x) is None
+
+
+def test_modelopt_fp8_pb_wo_exposes_packed_ue8m0_input_key():
+    from vllm.model_executor.kernels.linear.scaled_mm.deep_gemm import (
+        DeepGemmFp8BlockScaledMMKernel,
+    )
+
+    key = object()
+    kernel = object.__new__(DeepGemmFp8BlockScaledMMKernel)
+    kernel.use_deep_gemm_e8m0 = True
+    kernel.input_quant_key = Mock(return_value=key)
+    method = object.__new__(ModelOptFp8PbWoLinearMethod)
+    method.w8a8_block_fp8_linear = kernel
+
+    assert method.packed_ue8m0_input_quant_key() is key
+    kernel.use_deep_gemm_e8m0 = False
+    assert method.packed_ue8m0_input_quant_key() is None
 
 
 def test_modelopt_nvfp4_leaves_excluded_parallel_lm_head_unquantized():
@@ -519,22 +579,22 @@ def test_modelopt_fp8_pb_wo_checkpoint_setup(default_vllm_config, vllm_runner):
             assert gate_up_proj.weight.dtype == torch.float8_e4m3fn
             assert down_proj.weight.dtype == torch.float8_e4m3fn
 
-            # Block scales; should be materialized as a 2D [out_blk, in_blk] tensor.
-            assert hasattr(qkv_proj, "weight_scale")
-            assert qkv_proj.weight_scale.dtype == torch.float32
-            assert qkv_proj.weight_scale.dim() == 2
+            from vllm.model_executor.kernels.linear.scaled_mm.deep_gemm import (
+                DeepGemmFp8BlockScaledMMKernel,
+            )
 
-            assert hasattr(o_proj, "weight_scale")
-            assert o_proj.weight_scale.dtype == torch.float32
-            assert o_proj.weight_scale.dim() == 2
-
-            assert hasattr(gate_up_proj, "weight_scale")
-            assert gate_up_proj.weight_scale.dtype == torch.float32
-            assert gate_up_proj.weight_scale.dim() == 2
-
-            assert hasattr(down_proj, "weight_scale")
-            assert down_proj.weight_scale.dtype == torch.float32
-            assert down_proj.weight_scale.dim() == 2
+            # DeepGEMM packs four UE8M0 scales into each int32 after loading.
+            for projection in (qkv_proj, o_proj, gate_up_proj, down_proj):
+                kernel = projection.quant_method.w8a8_block_fp8_linear
+                packed_ue8m0 = (
+                    isinstance(kernel, DeepGemmFp8BlockScaledMMKernel)
+                    and kernel.use_deep_gemm_e8m0
+                )
+                assert hasattr(projection, "weight_scale")
+                assert projection.weight_scale.dtype == (
+                    torch.int32 if packed_ue8m0 else torch.float32
+                )
+                assert projection.weight_scale.dim() == 2
 
         llm.apply_model(check_model)
 
@@ -748,6 +808,7 @@ def test_modelopt_fp8_pb_wo_finalizes_selected_kernel():
 
     method = object.__new__(m.ModelOptFp8PbWoLinearMethod)
     method.w8a8_block_fp8_linear = MagicMock()
+    method.output_padding = 0
     layer = torch.nn.Module()
     layer.register_parameter(
         "weight",

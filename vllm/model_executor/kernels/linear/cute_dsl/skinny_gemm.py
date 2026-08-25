@@ -24,6 +24,7 @@ class SkinnyGemmConfig:
     k_unroll: int = 1
     vector_width: int = 8
     static_k: int | None = None
+    max_registers: int = 64
 
 
 class ShapeDynamicSkinnyGemm:
@@ -148,7 +149,9 @@ class ShapeDynamicSkinnyGemm:
             residual,
             c,
             self._stream(),
-            options="--enable-tvm-ffi --ptxas-options -maxrregcount=64",
+            options=(
+                f"--enable-tvm-ffi --ptxas-options -maxrregcount={config.max_registers}"
+            ),
         )
 
     def request_warmup_configs(
@@ -191,6 +194,8 @@ class ShapeDynamicSkinnyGemm:
                     item[1].outputs_per_block,
                     item[1].k_unroll,
                     item[1].vector_width,
+                    item[1].static_k or -1,
+                    item[1].max_registers,
                     item[2],
                 ),
             )

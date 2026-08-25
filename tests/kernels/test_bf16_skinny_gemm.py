@@ -27,10 +27,10 @@ EXPECTED_SELECTIONS = {
     (3072, 128): (set(), set(range(1, 17))),
     (1536, 7168): (set(), set(range(1, 17))),
     (3072, 7168): (set(range(1, 6)), set()),
-    (2112, 7168): (set(), set(range(1, 17))),
+    (2112, 7168): ({1, 2}, set(range(1, 17))),
     (2304, 1536): (set(), set(range(1, 17))),
     (4608, 1536): (set(), set(range(1, 17))),
-    (3584, 7168): ({1}, set(range(2, 9))),
+    (3584, 7168): (set(range(1, 6)), set(range(6, 9))),
     (6288, 7168): (set(range(1, 5)), set()),
     (12448, 7168): (set(range(1, 4)), set()),
     (7168, 768): (set(), set(range(1, 17))),
@@ -51,6 +51,13 @@ EXPECTED_SELECTIONS = {
     (7168, 384): (set(), set(range(1, 9))),
     (4224, 7168): (set(range(1, 4)), set(range(4, 9))),
     (10240, 7168): (set(range(1, 5)), set()),
+    (7168, 33792): (set(range(1, 5)), set()),
+    # Replicated TP1 DSpark projections.
+    (7168, 35840): (set(range(1, 6)), set()),
+    (2880, 7168): (set(range(1, 6)), set()),
+    (12288, 1536): (set(range(1, 4)), set()),
+    (7168, 8192): (set(range(1, 5)), set()),
+    (7168, 14336): (set(range(1, 5)), set()),
 }
 
 CUTE_CASES = [
@@ -77,7 +84,13 @@ EXPECTED_CUTE_CONFIGS = {
     (3072, 7168, 3): (128, 2, 1, 8),
     (3072, 7168, 4): (64, 2, 2, 8),
     (3072, 7168, 5): (128, 3, 1, 8),
-    (3584, 7168, 1): (224, 2, 4, 8),
+    (2112, 7168, 1): (224, 3, 1, 8),
+    (2112, 7168, 2): (224, 2, 1, 8),
+    (3584, 7168, 1): (128, 1, 1, 4),
+    (3584, 7168, 2): (64, 4, 1, 8),
+    (3584, 7168, 3): (64, 4, 1, 8),
+    (3584, 7168, 4): (64, 4, 1, 8),
+    (3584, 7168, 5): (64, 4, 1, 8),
     (6288, 7168, 1): (224, 3, 4, 8),
     (6288, 7168, 2): (64, 3, 2, 8),
     (6288, 7168, 3): (32, 3, 4, 8),
@@ -124,14 +137,66 @@ EXPECTED_CUTE_CONFIGS = {
     (10240, 7168, 2): (32, 2, 4, 8),
     (10240, 7168, 3): (64, 4, 1, 8),
     (10240, 7168, 4): (64, 4, 1, 8),
+    (67584, 7168, 1): (32, 1, 1, 8),
+    (67584, 7168, 2): (64, 4, 1, 4),
+    (67584, 7168, 3): (64, 4, 1, 4),
+    (67584, 7168, 4): (64, 4, 1, 4),
+    (7168, 33792, 1): (192, 1, 1, 8),
+    (7168, 33792, 2): (128, 4, 1, 8),
+    (7168, 33792, 3): (128, 4, 1, 4),
+    (7168, 33792, 4): (128, 4, 1, 4),
+    # Replicated TP1 DSpark projections.
+    (7168, 35840, 1): (160, 1, 1, 8),
+    (7168, 35840, 2): (128, 4, 1, 8),
+    (7168, 35840, 3): (128, 4, 1, 8),
+    (7168, 35840, 4): (128, 4, 1, 4),
+    (7168, 35840, 5): (128, 4, 1, 4),
+    (2880, 7168, 1): (256, 2, 1, 4),
+    (2880, 7168, 2): (256, 2, 1, 4),
+    (2880, 7168, 3): (128, 8, 1, 8),
+    (2880, 7168, 4): (128, 8, 1, 8),
+    (2880, 7168, 5): (64, 4, 1, 8),
+    (12288, 1536, 1): (32, 4, 1, 8),
+    (12288, 1536, 2): (32, 8, 1, 8),
+    (12288, 1536, 3): (32, 8, 1, 8),
+    (7168, 8192, 1): (128, 1, 1, 4),
+    (7168, 8192, 2): (64, 8, 1, 8),
+    (7168, 8192, 3): (64, 8, 1, 8),
+    (7168, 8192, 4): (64, 8, 1, 8),
+    (28672, 7168, 1): (224, 4, 4, 4),
+    (28672, 7168, 2): (64, 4, 2, 8),
+    (28672, 7168, 3): (64, 2, 4, 4),
+    (7168, 14336, 1): (64, 1, 1, 4),
+    (7168, 14336, 2): (64, 4, 1, 8),
+    (7168, 14336, 3): (64, 8, 1, 8),
+    (7168, 14336, 4): (32, 2, 1, 8),
+    (163840, 7168, 1): (224, 4, 4, 4),
+    (163840, 7168, 2): (224, 4, 2, 8),
+    (163840, 7168, 3): (64, 2, 4, 4),
+    (163840, 7168, 4): (64, 4, 1, 8),
 }
 
 EXPECTED_RESIDUAL_CUTE_CONFIGS = {
-    (7168, 3584, 1): (64, 4, 2, 8),
-    (7168, 3584, 2): (64, 7, 2, 8),
-    (7168, 3584, 3): (64, 2, 1, 8),
-    (7168, 3584, 4): (64, 2, 1, 8),
+    (7168, 3584, 1): (64, 2, 1, 4),
+    (7168, 3584, 2): (64, 8, 1, 4),
+    (7168, 3584, 3): (32, 4, 1, 8),
+    (7168, 3584, 4): (32, 4, 1, 8),
 }
+
+EXPECTED_STATIC_K_CONFIGS = {
+    **{(2112, 7168, m): (7168, 64) for m in range(1, 3)},
+    **{(3584, 7168, m): (7168, 64) for m in range(1, 6)},
+    **{(67584, 7168, m): (7168, 64) for m in range(1, 5)},
+    **{(7168, 33792, m): (33792, 64) for m in range(1, 5)},
+    **{(7168, 35840, m): (35840, 64) for m in range(1, 6)},
+    **{(2880, 7168, m): (7168, 64) for m in range(1, 6)},
+    **{(12288, 1536, m): (1536, 64) for m in range(1, 4)},
+    **{(7168, 8192, m): (8192, 64) for m in range(1, 5)},
+    (7168, 14336, 1): (14336, 48),
+    **{(7168, 14336, m): (14336, 64) for m in range(2, 5)},
+}
+
+EXPECTED_RESIDUAL_STATIC_K_CONFIGS = {(7168, 3584, m): (3584, 64) for m in range(1, 5)}
 
 
 def _config_tuple(config) -> tuple[int, int, int, int]:
@@ -219,16 +284,31 @@ def test_cute_configs_match_measured_table() -> None:
         for n, k, num_tokens, config in configs
     }
     assert actual == EXPECTED_CUTE_CONFIGS
-    assert all(config.static_k is None for *_, config in configs)
+    actual_static = {
+        (n, k, num_tokens): (config.static_k, config.max_registers)
+        for n, k, num_tokens, config in configs
+        if config.static_k is not None
+    }
+    assert actual_static == EXPECTED_STATIC_K_CONFIGS
 
 
 def test_residual_cute_configs_match_measured_table() -> None:
-    actual = {
-        (spec.n, spec.k, num_tokens): _config_tuple(config)
+    configs = [
+        (spec.n, spec.k, num_tokens, config)
         for spec in k3_gemm.KIMI_K3_PROJECTIONS.values()
         for num_tokens, config in spec.residual_configs
+    ]
+    actual = {
+        (n, k, num_tokens): _config_tuple(config)
+        for n, k, num_tokens, config in configs
     }
     assert actual == EXPECTED_RESIDUAL_CUTE_CONFIGS
+    actual_static = {
+        (n, k, num_tokens): (config.static_k, config.max_registers)
+        for n, k, num_tokens, config in configs
+        if config.static_k is not None
+    }
+    assert actual_static == EXPECTED_RESIDUAL_STATIC_K_CONFIGS
 
 
 def test_glm52_projection_plans_are_separate() -> None:
@@ -406,12 +486,73 @@ def test_build_plan_matches_selector() -> None:
                 assert plan[num_tokens][0] == backend
 
 
-def test_kimi_k3_fp8_pb_wo_plan_uses_contiguous_measured_range() -> None:
-    expected_plan = {m: 256 for m in range(17, 257)}
+def test_dense_gate_up_uses_deepgemm_at_measured_ranges() -> None:
+    for num_tokens in range(1, 5):
+        assert k3_gemm.select_kimi_k3_backend(num_tokens, 67584, 7168) == "cute"
+    for num_tokens in (5, *range(17, 65)):
+        assert (
+            k3_gemm.select_kimi_k3_backend(num_tokens, 67584, 7168) == "deepgemm_bf16"
+        )
+    for num_tokens in range(6, 17):
+        assert k3_gemm.select_kimi_k3_backend(num_tokens, 67584, 7168) is None
+    spec = k3_gemm.KIMI_K3_PROJECTIONS[(67584, 7168)]
+    plan = k3_gemm._build_plan(spec)
+    assert plan[1][0] == "cute"
+    assert isinstance(plan[1][1], SkinnyGemmConfig)
+    assert plan[5] == ("deepgemm_bf16", (1, 1))
+    assert plan[17] == ("deepgemm_bf16", (64, 64))
+    assert plan[48] == ("deepgemm_bf16", (64, 64))
+    assert plan[49] == ("deepgemm_bf16", (1, 1))
+    assert plan[64] == ("deepgemm_bf16", (1, 1))
+    assert set(plan) == {*range(1, 6), *range(17, 65)}
+
+
+def test_tp1_dspark_plans_use_measured_ranges() -> None:
+    gate = k3_gemm._build_plan(k3_gemm.KIMI_K3_PROJECTIONS[(28672, 7168)])
+    assert set(gate) == set(range(1, 65))
+    assert gate[1][0] == "cute"
+    assert gate[3][0] == "cute"
+    assert gate[4] == ("deepgemm_bf16", (1, 1))
+    assert gate[64] == ("deepgemm_bf16", (1, 1))
+
+    head = k3_gemm._build_plan(k3_gemm.KIMI_K3_PROJECTIONS[(163840, 7168)])
+    assert set(head) == set(range(1, 65))
+    assert head[1][0] == "cute"
+    assert head[4][0] == "cute"
+    assert head[5] == ("deepgemm_bf16", (1, 1))
+    assert head[10] == ("deepgemm_bf16", (64, 64))
+    assert head[48] == ("deepgemm_bf16", (64, 64))
+    assert head[49] == ("deepgemm_bf16", (1, 1))
+    assert head[64] == ("deepgemm_bf16", (1, 1))
+
+    markov = k3_gemm._build_plan(k3_gemm.KIMI_K3_PROJECTIONS[(163840, 256)])
+    assert set(markov) == set(range(43, 49))
+    assert set(markov.values()) == {("deepgemm_bf16", (1, 1))}
+
+
+def test_unavailable_deepgemm_is_removed_from_installed_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = k3_gemm.KIMI_K3_PROJECTIONS[(67584, 7168)]
+
+    monkeypatch.setattr(k3_gemm, "_deepgemm_bf16_available", lambda: False)
+    assert set(k3_gemm._available_plan(spec)) == set(range(1, 5))
+    assert all(
+        backend == "cute" for backend, _ in k3_gemm._available_plan(spec).values()
+    )
+
+    monkeypatch.setattr(k3_gemm, "_deepgemm_bf16_available", lambda: True)
+    assert k3_gemm._available_plan(spec) == k3_gemm._build_plan(spec)
+
+
+def test_kimi_k3_fp8_pb_wo_plan_uses_measured_ranges() -> None:
     assert {
-        (12288, 128): expected_plan,
-        (7168, 12288): expected_plan,
+        (7168, 12288): {m: 256 for m in range(11, 257)},
+        (18432, 1536): {m: 256 for m in range(17, 65)},
     } == k3_gemm.KIMI_K3_FP8_PB_WO_BLOCK_M_PLANS
+    assert {
+        (2176, 7168): {m: (256, 64) for m in range(1, 65)},
+    } == k3_gemm.KIMI_K3_FP8_PB_WO_BLOCK_SIZE_PLANS
 
 
 def test_installation_is_shape_and_quant_method_specific(
@@ -442,12 +583,43 @@ def test_installation_is_shape_and_quant_method_specific(
         k3_gemm.DeepGemmFp8BlockScaledMMKernel
     )
     pbwo_kernel._block_m_multiple_plan = {}
+    pbwo_kernel._block_size_multiple_plan = {}
     pbwo_method.w8a8_block_fp8_linear = pbwo_kernel
     root.pbwo = FakeLinear(pbwo_method, 7168, 12288)
+    pbwo_q_b_method = k3_gemm.ModelOptFp8PbWoLinearMethod.__new__(
+        k3_gemm.ModelOptFp8PbWoLinearMethod
+    )
+    pbwo_q_b_kernel = k3_gemm.DeepGemmFp8BlockScaledMMKernel.__new__(
+        k3_gemm.DeepGemmFp8BlockScaledMMKernel
+    )
+    pbwo_q_b_kernel._block_m_multiple_plan = {}
+    pbwo_q_b_kernel._block_size_multiple_plan = {}
+    pbwo_q_b_method.w8a8_block_fp8_linear = pbwo_q_b_kernel
+    root.pbwo_q_b = FakeLinear(pbwo_q_b_method, 18432, 1536)
+    pbwo_qkv_method = k3_gemm.ModelOptFp8PbWoLinearMethod.__new__(
+        k3_gemm.ModelOptFp8PbWoLinearMethod
+    )
+    pbwo_qkv_kernel = k3_gemm.DeepGemmFp8BlockScaledMMKernel.__new__(
+        k3_gemm.DeepGemmFp8BlockScaledMMKernel
+    )
+    pbwo_qkv_kernel._block_m_multiple_plan = {}
+    pbwo_qkv_kernel._block_size_multiple_plan = {}
+    pbwo_qkv_method.w8a8_block_fp8_linear = pbwo_qkv_kernel
+    root.pbwo_qkv = FakeLinear(pbwo_qkv_method, 2176, 7168)
+    pbwo_fb_method = k3_gemm.ModelOptFp8PbWoLinearMethod.__new__(
+        k3_gemm.ModelOptFp8PbWoLinearMethod
+    )
+    pbwo_fb_kernel = k3_gemm.DeepGemmFp8BlockScaledMMKernel.__new__(
+        k3_gemm.DeepGemmFp8BlockScaledMMKernel
+    )
+    pbwo_fb_kernel.config = object()
+    pbwo_fb_method.w8a8_block_fp8_linear = pbwo_fb_kernel
+    root.pbwo_fb = FakeLinear(pbwo_fb_method, 12288, 128)
     # cute shape.
     root.cute = FakeLinear(k3_gemm.UnquantizedLinearMethod(), 6288, 7168)
     # cute + residual shape.
     root.residual = FakeLinear(k3_gemm.UnquantizedLinearMethod(), 7168, 3584)
+    root.dense_gate_up = FakeLinear(k3_gemm.UnquantizedLinearMethod(), 67584, 7168)
     # shape absent from the table: must be left untouched.
     root.unlisted = FakeLinear(k3_gemm.UnquantizedLinearMethod(), 1234, 5678)
     root.lm_head = FakeHead(20480, 7168)
@@ -456,6 +628,16 @@ def test_installation_is_shape_and_quant_method_specific(
     monkeypatch.setattr(k3_gemm, "ParallelLMHead", FakeHead)
     monkeypatch.setattr(k3_gemm, "_is_sm103", lambda: True)
     monkeypatch.setattr(k3_gemm, "supports_block_size_multiple_of", lambda: True)
+
+    class FakeFusedK128Kernel:
+        def __init__(self, config: object) -> None:
+            self.config = config
+
+    monkeypatch.setattr(
+        k3_gemm,
+        "KimiK3FusedK128Fp8LinearKernel",
+        FakeFusedK128Kernel,
+    )
     warmup_configs: set[SkinnyGemmConfig] = set()
     residual_warmup_configs: set[SkinnyGemmConfig] = set()
     monkeypatch.setattr(k3_gemm.shape_dynamic_skinny_gemm, "is_available", lambda: True)
@@ -475,11 +657,26 @@ def test_installation_is_shape_and_quant_method_specific(
     assert isinstance(root.dsv3_only.quant_method, k3_gemm.KimiK3LowLatencyLinearMethod)
     assert isinstance(root.cute.quant_method, k3_gemm.KimiK3LowLatencyLinearMethod)
     assert isinstance(root.residual.quant_method, k3_gemm.KimiK3LowLatencyLinearMethod)
+    assert isinstance(
+        root.dense_gate_up.quant_method,
+        k3_gemm.KimiK3LowLatencyLinearMethod,
+    )
     assert root.quantized.quant_method is quantized_method
     assert (
         pbwo_kernel._block_m_multiple_plan
         == (k3_gemm.KIMI_K3_FP8_PB_WO_BLOCK_M_PLANS[(7168, 12288)])
     )
+    assert (
+        pbwo_q_b_kernel._block_m_multiple_plan
+        == (k3_gemm.KIMI_K3_FP8_PB_WO_BLOCK_M_PLANS[(18432, 1536)])
+    )
+    assert (
+        pbwo_qkv_kernel._block_size_multiple_plan
+        == (k3_gemm.KIMI_K3_FP8_PB_WO_BLOCK_SIZE_PLANS[(2176, 7168)])
+    )
+    installed_fb_kernel = root.pbwo_fb.quant_method.w8a8_block_fp8_linear
+    assert isinstance(installed_fb_kernel, FakeFusedK128Kernel)
+    assert installed_fb_kernel.config is pbwo_fb_kernel.config
     assert type(root.unlisted.quant_method) is k3_gemm.UnquantizedLinearMethod
     assert isinstance(
         root.lm_head.quant_method, k3_gemm.KimiK3LowLatencyEmbeddingMethod
@@ -487,7 +684,12 @@ def test_installation_is_shape_and_quant_method_specific(
     # Warmup covers only the installed modules' local (N, K).
     assert warmup_configs == {
         config
-        for key in ((6288, 7168), (7168, 3584), (20480, 7168))
+        for key in (
+            (6288, 7168),
+            (7168, 3584),
+            (20480, 7168),
+            (67584, 7168),
+        )
         for _, config in k3_gemm.KIMI_K3_PROJECTIONS[key].cute_configs
     }
     assert residual_warmup_configs == {
@@ -496,9 +698,13 @@ def test_installation_is_shape_and_quant_method_specific(
     }
 
     pbwo_kernel._block_m_multiple_plan = {}
+    pbwo_q_b_kernel._block_m_multiple_plan = {}
+    pbwo_qkv_kernel._block_size_multiple_plan = {}
     monkeypatch.setattr(k3_gemm, "supports_block_size_multiple_of", lambda: False)
     k3_gemm.enable_kimi_k3_low_latency_gemm(root, torch.bfloat16)
     assert pbwo_kernel._block_m_multiple_plan == {}
+    assert pbwo_q_b_kernel._block_m_multiple_plan == {}
+    assert pbwo_qkv_kernel._block_size_multiple_plan == {}
 
 
 def test_deep_gemm_layout_constraint_is_forwarded_per_call(
@@ -510,7 +716,8 @@ def test_deep_gemm_layout_constraint_is_forwarded_per_call(
     kernel.config = SimpleNamespace(out_dtype=torch.bfloat16)
     kernel.use_deep_gemm_e8m0 = True
     kernel._block_m_multiple_plan = {}
-    kernel.set_block_m_multiple_plan({32: 256})
+    kernel._block_size_multiple_plan = {}
+    kernel.set_block_size_multiple_plan({32: (256, 64)})
 
     constraints: list[tuple[int, int]] = []
 
@@ -535,7 +742,7 @@ def test_deep_gemm_layout_constraint_is_forwarded_per_call(
     kernel.apply_block_scaled_mm(A, B, As, Bs)
     kernel.apply_block_scaled_mm(A[:31], B, As[:31], Bs)
 
-    assert constraints == [(256, 1), (1, 1)]
+    assert constraints == [(256, 64), (1, 1)]
 
 
 def test_deep_gemm_layout_constraint_is_restored_after_failure(
@@ -602,6 +809,64 @@ def _require_sm103_and_cute() -> None:
         pytest.skip("Kimi-K3 production selection requires SM103")
     if not k3_gemm.shape_dynamic_skinny_gemm.is_available():
         pytest.skip("CuTe DSL is not available")
+
+
+def _fused_k128_reference(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    x_float = x.float()
+    x_scale = (x_float.abs().amax(dim=1) / 448.0).clamp_min(1e-10)
+    x_scale = torch.pow(2.0, torch.ceil(torch.log2(x_scale)))
+    x_quant = (x_float / x_scale[:, None]).clamp(-448.0, 448.0).to(weight.dtype)
+    output = x_quant.float() @ weight.float().t()
+    return output * x_scale[:, None] * weight_scale[:, 0].repeat_interleave(128)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 2, 3, 16, 48, 63, 64])
+def test_kimi_k3_fused_k128_fp8_gemm(num_tokens: int) -> None:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
+        pytest.skip("Kimi-K3 fused K=128 GEMM requires SM103")
+    torch.manual_seed(42)
+    storage = torch.randn(
+        num_tokens,
+        49408,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    x = storage[:, -128:]
+    weight = torch.randn(12288, 128, dtype=torch.bfloat16, device="cuda").to(
+        torch.float8_e4m3fn
+    )
+    weight_scale = torch.rand(96, 1, dtype=torch.float32, device="cuda") + 0.5
+
+    output = k3_gemm.fused_k128_fp8_gemm(x, weight, weight_scale)
+    reference = _fused_k128_reference(x, weight, weight_scale)
+
+    assert x.stride(0) == 49408
+    torch.testing.assert_close(output.float(), reference, rtol=2e-2, atol=2e-1)
+
+
+def test_kimi_k3_fused_k128_fp8_gemm_cuda_graph() -> None:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
+        pytest.skip("Kimi-K3 fused K=128 GEMM requires SM103")
+    x = torch.randn(64, 128, dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(12288, 128, dtype=torch.bfloat16, device="cuda").to(
+        torch.float8_e4m3fn
+    )
+    weight_scale = torch.ones(96, 1, dtype=torch.float32, device="cuda")
+    k3_gemm.fused_k128_fp8_gemm(x, weight, weight_scale)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = k3_gemm.fused_k128_fp8_gemm(x, weight, weight_scale)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    reference = _fused_k128_reference(x, weight, weight_scale)
+    torch.testing.assert_close(output.float(), reference, rtol=2e-2, atol=2e-1)
 
 
 @pytest.mark.parametrize("spec,config", GLM_CUTE_CASES)

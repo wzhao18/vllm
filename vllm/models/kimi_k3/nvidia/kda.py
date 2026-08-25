@@ -14,6 +14,7 @@ from vllm.config import VllmConfig
 from vllm.distributed import divide, get_tensor_model_parallel_rank
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -41,6 +42,9 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.kimi_k3.nvidia.kda_metadata import (
     KimiK3KDAAttentionBackend,
     KimiK3KDAMetadata,
+)
+from vllm.models.kimi_k3.nvidia.ops.fused_kda_rms_gated_quant import (
+    fused_kda_rms_gated_quant,
 )
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
@@ -499,6 +503,16 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             quant_config=self.quant_config,
             prefix=f"{prefix}.o_proj",
         )
+        packed_quant_key = getattr(
+            self.o_proj.quant_method,
+            "packed_ue8m0_input_quant_key",
+            lambda: None,
+        )()
+        self._o_proj_packed_quant_key = (
+            packed_quant_key
+            if self.local_num_heads == 96 and self.head_dim == 128
+            else None
+        )
         self.run_gemm_rs = run_gemm_rs
         if self.run_gemm_rs:
             from vllm.models.kimi_k3.nvidia.ops.cute_dsl.gemm_rs import get_gemm_rs
@@ -541,7 +555,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
-        self._forward(
+        quantized_output = self._forward(
             mixed_qkv=mixed_qkv,
             g1=g1,
             g2=g2,
@@ -549,13 +563,16 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             core_attn_out=core_attn_out,
         )
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
-        if self.run_gemm_rs:
+        projection_input = (
+            core_attn_out if quantized_output is None else quantized_output
+        )
+        if self.run_gemm_rs and quantized_output is None:
             from vllm.models.kimi_k3.nvidia.ops.cute_dsl.gemm_rs import get_gemm_rs
 
             gemm_rs = get_gemm_rs()
             if gemm_rs.should_run(core_attn_out):
                 return gemm_rs(core_attn_out, self.o_proj.weight)
-        return self.o_proj(core_attn_out)[0]
+        return self.o_proj(projection_input)[0]
 
     @eager_break_during_capture
     def _forward(
@@ -565,7 +582,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         g2: torch.Tensor,
         beta: torch.Tensor,
         core_attn_out: torch.Tensor,
-    ) -> None:
+    ) -> QuantizedActivation | None:
         forward_context = get_forward_context()
         attn_metadata_raw = forward_context.attn_metadata
         if attn_metadata_raw is None:
@@ -870,4 +887,20 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             assert core_attn_out_spec is not None
         # Triton normalizes in place, so this is a self-copy with no device
         # work. Keep it for the out-of-place native implementation.
+        if self._o_proj_packed_quant_key is not None and core_attn_out.shape[1] <= 64:
+            q_output, output_scale = fused_kda_rms_gated_quant(
+                core_attn_out,
+                g2,
+                self.o_norm.weight,
+                self.o_norm.eps,
+            )
+            return QuantizedActivation(
+                data=q_output,
+                scale=output_scale,
+                orig_dtype=core_attn_out.dtype,
+                orig_shape=torch.Size((core_attn_out.shape[1], self.projection_size)),
+                quant_key=self._o_proj_packed_quant_key,
+            )
+
         core_attn_out.copy_(self.o_norm(core_attn_out, g2))
+        return None

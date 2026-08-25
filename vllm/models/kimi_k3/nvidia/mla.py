@@ -57,6 +57,7 @@ from vllm.model_executor.layers.attention.mla_attention import (
     neutralize_empty_context_partials,
 )
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -479,6 +480,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        projection_input: torch.Tensor | QuantizedActivation | None = None,
     ) -> torch.Tensor:
         """Attention front-end: fused qkv-a proj -> norms -> q_b -> attention.
 
@@ -486,8 +488,10 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         num_local_heads * v_head_dim]``. On a profile/dummy run
         it returns a zeroed buffer.
         """
+        if projection_input is None:
+            projection_input = hidden_states
         if self.q_lora_rank is not None:
-            qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+            qkv_lora = self.fused_qkv_a_proj(projection_input)[0]
             q_c, kv_c, k_pe = qkv_lora.split(
                 [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
             )
@@ -520,6 +524,22 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         self._attention(positions, q, kv_c_normed, k_pe, attn_out)
         return attn_out
 
+    def _shared_projection_input(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor | QuantizedActivation:
+        if self.q_lora_rank is None or self.g_proj is None:
+            return hidden_states
+        quantize = getattr(
+            self.fused_qkv_a_proj.quant_method,
+            "try_quantize_shared_input",
+            None,
+        )
+        if quantize is None:
+            return hidden_states
+        quantized = quantize(self.g_proj.quant_method, hidden_states)
+        return hidden_states if quantized is None else quantized
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -528,6 +548,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         # Both branches produce (attn_out, gate); they differ only in whether
         # the g_proj GEMM is overlapped on the aux stream.
         g_proj = self.g_proj
+        projection_input = self._shared_projection_input(hidden_states)
         events = self._gate_events
         if (
             g_proj is not None
@@ -536,15 +557,15 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             and hidden_states.shape[0] < _GATE_MULTI_STREAM_TOKEN_THRESHOLD
         ):
             attn_out, gate = maybe_execute_in_parallel(
-                lambda: self._forward_attn(positions, hidden_states),
-                lambda: g_proj(hidden_states)[0],
+                lambda: self._forward_attn(positions, hidden_states, projection_input),
+                lambda: g_proj(projection_input)[0],
                 events[0],
                 events[1],
                 self.aux_stream,
             )
         else:
-            attn_out = self._forward_attn(positions, hidden_states)
-            gate = g_proj(hidden_states)[0] if g_proj is not None else None
+            attn_out = self._forward_attn(positions, hidden_states, projection_input)
+            gate = g_proj(projection_input)[0] if g_proj is not None else None
 
         if gate is not None:
             attn_out = _gate_sigmoid_mul(attn_out, gate)

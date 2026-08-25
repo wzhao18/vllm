@@ -18,6 +18,9 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_upd
 from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
     gather_initial_states,
 )
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    per_token_group_quant_fp8_packed_for_deepgemm,
+)
 from vllm.model_executor.parameter import BlockQuantScaleParameter
 from vllm.models.kimi_k3.amd.ops.third_party.kda import (
     fused_recurrent_kda_packed_decode as fused_recurrent_kda_packed_decode_amd,
@@ -29,6 +32,9 @@ from vllm.models.kimi_k3.nvidia.kda import (
 )
 from vllm.models.kimi_k3.nvidia.model import KimiLinearForCausalLM
 from vllm.models.kimi_k3.nvidia.ops import recoverssm as recoverssm_ops
+from vllm.models.kimi_k3.nvidia.ops.fused_kda_rms_gated_quant import (
+    fused_kda_rms_gated_quant,
+)
 from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
     KDARecoverSSMCommitContext,
     kda_recoverssm_verify,
@@ -42,6 +48,7 @@ from vllm.models.kimi_k3.nvidia.ops.third_party.kda import (
     fused_recurrent_kda_packed_decode,
 )
 from vllm.platforms import current_platform
+from vllm.third_party.flash_linear_attention.ops.kda import rms_norm_gated
 from vllm.third_party.flash_linear_attention.ops.l2norm import l2norm_fwd
 
 DEVICE = current_platform.device_type
@@ -57,6 +64,65 @@ PACKED_DECODE_IMPLS = {
     "nvidia": fused_recurrent_kda_packed_decode,
     "amd": fused_recurrent_kda_packed_decode_amd,
 }
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+@pytest.mark.parametrize("num_tokens", [1, 17, 42, 43, 50, 51, 63, 64])
+def test_fused_kda_rms_gated_quant_matches_existing_path(num_tokens: int):
+    torch.manual_seed(0)
+    num_heads, head_dim = 96, 128
+    core = torch.randn(
+        (1, num_tokens, num_heads, head_dim),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    gate_base = torch.randn((num_tokens, 49408), dtype=torch.bfloat16, device="cuda")
+    gate = gate_base[:, 3 * num_heads * head_dim : 4 * num_heads * head_dim]
+    gate = gate.view(num_tokens, num_heads, head_dim)
+    weight = torch.randn(head_dim, dtype=torch.bfloat16, device="cuda")
+
+    normalized = rms_norm_gated(
+        core.clone(), gate, weight, None, activation="sigmoid", eps=1e-5
+    ).view(num_tokens, num_heads * head_dim)
+    expected_q, expected_scale = per_token_group_quant_fp8_packed_for_deepgemm(
+        normalized, 128
+    )
+    actual_q, actual_scale = fused_kda_rms_gated_quant(core, gate, weight, 1e-5)
+
+    assert torch.equal(actual_q, expected_q)
+    assert torch.equal(actual_scale, expected_scale)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+def test_fused_kda_rms_gated_quant_cuda_graph_replay():
+    torch.manual_seed(0)
+    num_tokens, num_heads, head_dim = 64, 96, 128
+    core = torch.randn(
+        (1, num_tokens, num_heads, head_dim),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    gate_base = torch.randn((num_tokens, 49408), dtype=torch.bfloat16, device="cuda")
+    gate = gate_base[:, 3 * num_heads * head_dim : 4 * num_heads * head_dim]
+    gate = gate.view(num_tokens, num_heads, head_dim)
+    weight = torch.randn(head_dim, dtype=torch.bfloat16, device="cuda")
+    fused_kda_rms_gated_quant(core, gate, weight, 1e-5)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual_q, actual_scale = fused_kda_rms_gated_quant(core, gate, weight, 1e-5)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    normalized = rms_norm_gated(
+        core.clone(), gate, weight, None, activation="sigmoid", eps=1e-5
+    ).view(num_tokens, num_heads * head_dim)
+    expected_q, expected_scale = per_token_group_quant_fp8_packed_for_deepgemm(
+        normalized, 128
+    )
+    assert torch.equal(actual_q, expected_q)
+    assert torch.equal(actual_scale, expected_scale)
 
 
 def test_kda_replicates_subblock_scale_across_tp_ranks(monkeypatch):

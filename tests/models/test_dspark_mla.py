@@ -63,6 +63,40 @@ def test_dspark_mla_shares_frozen_target_weights_and_skips_training_head():
 
 
 @pytest.mark.cpu_test
+def test_dspark_mla_installs_kimi_low_latency_gemms(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class DummyModel(nn.Module):
+        pass
+
+    draft_model = DummyModel()
+    installs = []
+    monkeypatch.setattr(dspark_mla, "K3DSparkModel", lambda **_: draft_model)
+    monkeypatch.setattr(
+        dspark_mla,
+        "enable_kimi_k3_low_latency_gemm",
+        lambda module, dtype: installs.append((module, dtype)),
+    )
+    monkeypatch.setattr(dspark_mla, "LogitsProcessor", lambda *_, **__: DummyModel())
+
+    draft_config = SimpleNamespace(draft_vocab_size=128)
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            draft_model_config=SimpleNamespace(hf_config=draft_config)
+        ),
+        model_config=SimpleNamespace(
+            dtype=torch.bfloat16,
+            get_num_layers=lambda _: 92,
+        ),
+        parallel_config=SimpleNamespace(),
+    )
+
+    K3DSparkForCausalLM(vllm_config=vllm_config)
+
+    assert installs == [(draft_model, torch.bfloat16)]
+
+
+@pytest.mark.cpu_test
 def test_dspark_markov_head_is_replicated(
     monkeypatch: pytest.MonkeyPatch,
 ):

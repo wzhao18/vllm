@@ -3,13 +3,14 @@
 """Kimi-K3 decode GEMM selection on SM103.
 
 Dispatch is purely by local ``(N, K)`` shape and token count ``M``. Unquantized
-BF16 projections select between the CuTe skinny and fused-A kernels. ModelOpt
-FP8_PB_WO projections can constrain DeepGEMM's layout candidates for measured
-decode shapes. Plans are installed once per module.
+BF16 projections select between CuTe skinny, fused-A, and DeepGEMM kernels.
+ModelOpt FP8_PB_WO projections can select Triton or constrain DeepGEMM's layout
+candidates for measured decode shapes. Plans are installed once per module.
 """
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 from typing import Literal
 
@@ -25,6 +26,10 @@ from vllm.model_executor.kernels.linear.cute_dsl.skinny_gemm import (
 from vllm.model_executor.kernels.linear.scaled_mm.deep_gemm import (
     DeepGemmFp8BlockScaledMMKernel,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.triton import (
+    TritonFp8BlockScaledMMKernel,
+)
+from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptFp8PbWoLinearMethod,
@@ -33,13 +38,20 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     UnquantizedEmbeddingMethod,
 )
+from vllm.models.kimi_k3.nvidia.ops.fused_k128_fp8_gemm import (
+    fused_k128_fp8_gemm,
+)
 from vllm.platforms import current_platform
-from vllm.utils.deep_gemm import supports_block_size_multiple_of
+from vllm.utils.deep_gemm import (
+    _block_size_multiple_scope,
+    _import_deep_gemm,
+    supports_block_size_multiple_of,
+)
+from vllm.utils.torch_utils import direct_register_custom_op
 
-Backend = Literal["cute", "dsv3_fused_a"]
-# A resolved per-token-count call: the backend plus its CuTe config (None for
-# dsv3, which needs no config).
-ResolvedCall = tuple[Backend, SkinnyGemmConfig | None]
+Backend = Literal["cute", "dsv3_fused_a", "deepgemm_bf16"]
+# A resolved per-token-count call and its optional backend configuration.
+ResolvedCall = tuple[Backend, SkinnyGemmConfig | tuple[int, int] | None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,12 +62,16 @@ class ProjectionSpec:
     cute_configs: tuple[tuple[int, SkinnyGemmConfig], ...] = ()
     residual_configs: tuple[tuple[int, SkinnyGemmConfig], ...] = ()
     name: str = ""  # optional debug label; never used for dispatch
+    deepgemm_configs: tuple[tuple[int, tuple[int, int]], ...] = ()
 
     def cute_config(self, num_tokens: int) -> SkinnyGemmConfig | None:
         return dict(self.cute_configs).get(num_tokens)
 
     def residual_config(self, num_tokens: int) -> SkinnyGemmConfig | None:
         return dict(self.residual_configs).get(num_tokens)
+
+    def deepgemm_config(self, num_tokens: int) -> tuple[int, int] | None:
+        return dict(self.deepgemm_configs).get(num_tokens)
 
 
 def _cute(
@@ -64,6 +80,9 @@ def _cute(
     outputs_per_block: int,
     k_unroll: int,
     vector_width: int = 8,
+    *,
+    static_k: int | None = None,
+    max_registers: int = 64,
 ) -> SkinnyGemmConfig:
     return SkinnyGemmConfig(
         num_tokens,
@@ -71,6 +90,8 @@ def _cute(
         outputs_per_block,
         k_unroll,
         vector_width,
+        static_k,
+        max_registers,
     )
 
 
@@ -100,14 +121,29 @@ KIMI_K3_PROJECTIONS: dict[tuple[int, int], ProjectionSpec] = {
         ),
         name="shared_gate_up_proj",
     ),
-    (2112, 7168): ProjectionSpec(2112, 7168, _M1_TO_16, name="fused_qkv_a_proj"),
+    (2112, 7168): ProjectionSpec(
+        2112,
+        7168,
+        _M1_TO_16,
+        cute_configs=(
+            (1, _cute(1, 224, 3, 1, static_k=7168)),
+            (2, _cute(2, 224, 2, 1, static_k=7168)),
+        ),
+        name="fused_qkv_a_proj",
+    ),
     (2304, 1536): ProjectionSpec(2304, 1536, _M1_TO_16, name="q_b_proj"),
     (4608, 1536): ProjectionSpec(4608, 1536, _M1_TO_16, name="q_b_proj"),
     (3584, 7168): ProjectionSpec(
         3584,
         7168,
-        frozenset(range(2, 9)),
-        ((1, _cute(1, 224, 2, 4)),),
+        frozenset(range(6, 9)),
+        cute_configs=(
+            (1, _cute(1, 128, 1, 1, 4, static_k=7168)),
+            (2, _cute(2, 64, 4, 1, static_k=7168)),
+            (3, _cute(3, 64, 4, 1, static_k=7168)),
+            (4, _cute(4, 64, 4, 1, static_k=7168)),
+            (5, _cute(5, 64, 4, 1, static_k=7168)),
+        ),
         name="routed_expert_down_proj",
     ),
     (6288, 7168): ProjectionSpec(
@@ -152,10 +188,10 @@ KIMI_K3_PROJECTIONS: dict[tuple[int, int], ProjectionSpec] = {
             (2, _cute(2, 64, 4, 2)),
         ),
         residual_configs=(
-            (1, _cute(1, 64, 4, 2)),
-            (2, _cute(2, 64, 7, 2)),
-            (3, _cute(3, 64, 2, 1)),
-            (4, _cute(4, 64, 2, 1)),
+            (1, _cute(1, 64, 2, 1, 4, static_k=3584)),
+            (2, _cute(2, 64, 8, 1, 4, static_k=3584)),
+            (3, _cute(3, 32, 4, 1, static_k=3584)),
+            (4, _cute(4, 32, 4, 1, static_k=3584)),
         ),
         name="routed_expert_up_proj",
     ),
@@ -281,15 +317,150 @@ KIMI_K3_PROJECTIONS: dict[tuple[int, int], ProjectionSpec] = {
         ),
         name="lm_head",
     ),
+    (67584, 7168): ProjectionSpec(
+        67584,
+        7168,
+        cute_configs=(
+            (1, _cute(1, 32, 1, 1, static_k=7168)),
+            (2, _cute(2, 64, 4, 1, 4, static_k=7168)),
+            (3, _cute(3, 64, 4, 1, 4, static_k=7168)),
+            (4, _cute(4, 64, 4, 1, 4, static_k=7168)),
+        ),
+        name="dense_gate_up_proj",
+        deepgemm_configs=(
+            (5, (1, 1)),
+            *((m, (64, 64)) for m in range(17, 49)),
+            *((m, (1, 1)) for m in range(49, 65)),
+        ),
+    ),
+    (7168, 33792): ProjectionSpec(
+        7168,
+        33792,
+        cute_configs=(
+            (1, _cute(1, 192, 1, 1, static_k=33792)),
+            (2, _cute(2, 128, 4, 1, static_k=33792)),
+            (3, _cute(3, 128, 4, 1, 4, static_k=33792)),
+            (4, _cute(4, 128, 4, 1, 4, static_k=33792)),
+        ),
+        name="dense_down_proj",
+    ),
+    # Replicated TP1 DSpark projections. The draft model has a separate
+    # installation hook; the shared full-vocabulary LM head is also exercised
+    # by target verification.
+    (7168, 35840): ProjectionSpec(
+        7168,
+        35840,
+        cute_configs=(
+            (1, _cute(1, 160, 1, 1, static_k=35840)),
+            (2, _cute(2, 128, 4, 1, static_k=35840)),
+            (3, _cute(3, 128, 4, 1, static_k=35840)),
+            (4, _cute(4, 128, 4, 1, 4, static_k=35840)),
+            (5, _cute(5, 128, 4, 1, 4, static_k=35840)),
+        ),
+        name="draft_context_proj",
+    ),
+    (2880, 7168): ProjectionSpec(
+        2880,
+        7168,
+        cute_configs=(
+            (1, _cute(1, 256, 2, 1, 4, static_k=7168)),
+            (2, _cute(2, 256, 2, 1, 4, static_k=7168)),
+            (3, _cute(3, 128, 8, 1, static_k=7168)),
+            (4, _cute(4, 128, 8, 1, static_k=7168)),
+            (5, _cute(5, 64, 4, 1, static_k=7168)),
+        ),
+        name="draft_context_kv_proj",
+    ),
+    (12288, 1536): ProjectionSpec(
+        12288,
+        1536,
+        cute_configs=(
+            (1, _cute(1, 32, 4, 1, static_k=1536)),
+            (2, _cute(2, 32, 8, 1, static_k=1536)),
+            (3, _cute(3, 32, 8, 1, static_k=1536)),
+        ),
+        name="draft_q_b_proj",
+    ),
+    (7168, 8192): ProjectionSpec(
+        7168,
+        8192,
+        cute_configs=(
+            (1, _cute(1, 128, 1, 1, 4, static_k=8192)),
+            (2, _cute(2, 64, 8, 1, static_k=8192)),
+            (3, _cute(3, 64, 8, 1, static_k=8192)),
+            (4, _cute(4, 64, 8, 1, static_k=8192)),
+        ),
+        name="draft_mla_o_proj",
+    ),
+    (28672, 7168): ProjectionSpec(
+        28672,
+        7168,
+        cute_configs=(
+            (1, _cute(1, 224, 4, 4, 4)),
+            (2, _cute(2, 64, 4, 2)),
+            (3, _cute(3, 64, 2, 4, 4)),
+        ),
+        name="draft_dense_gate_up",
+        deepgemm_configs=tuple((m, (1, 1)) for m in range(1, 65)),
+    ),
+    (7168, 14336): ProjectionSpec(
+        7168,
+        14336,
+        cute_configs=(
+            (
+                1,
+                _cute(
+                    1,
+                    64,
+                    1,
+                    1,
+                    4,
+                    static_k=14336,
+                    max_registers=48,
+                ),
+            ),
+            (2, _cute(2, 64, 4, 1, static_k=14336)),
+            (3, _cute(3, 64, 8, 1, static_k=14336)),
+            (4, _cute(4, 32, 2, 1, static_k=14336)),
+        ),
+        name="draft_dense_down",
+    ),
+    (163840, 7168): ProjectionSpec(
+        163840,
+        7168,
+        cute_configs=(
+            (1, _cute(1, 224, 4, 4, 4)),
+            (2, _cute(2, 224, 4, 2)),
+            (3, _cute(3, 64, 2, 4, 4)),
+            (4, _cute(4, 64, 4, 1)),
+        ),
+        name="tp1_lm_head",
+        deepgemm_configs=(
+            *((m, (1, 1)) for m in range(1, 10)),
+            *((m, (64, 64)) for m in range(10, 49)),
+            *((m, (1, 1)) for m in range(49, 65)),
+        ),
+    ),
+    (163840, 256): ProjectionSpec(
+        163840,
+        256,
+        name="draft_markov_w2",
+        deepgemm_configs=tuple((m, (1, 1)) for m in range(43, 49)),
+    ),
     # 7168x2112 (TP16 dense down_proj) has no entry on purpose: K=2112 divides
     # none of the fused-A tile_k values, and the CuTe kernel is left with
     # vector_width=2, which measured slower than cuBLAS.
 }
 
-# These SM103 TP1 shapes select a faster non-swapped DeepGEMM layout when
-# block-M candidates are restricted to multiples of 256.
 KIMI_K3_FP8_PB_WO_BLOCK_M_PLANS: dict[tuple[int, int], dict[int, int]] = {
-    shape: {m: 256 for m in range(17, 257)} for shape in ((12288, 128), (7168, 12288))
+    (7168, 12288): {m: 256 for m in range(11, 257)},
+    (18432, 1536): {m: 256 for m in range(17, 65)},
+}
+
+KIMI_K3_FP8_PB_WO_BLOCK_SIZE_PLANS: dict[
+    tuple[int, int], dict[int, tuple[int, int]]
+] = {
+    (2176, 7168): {m: (256, 64) for m in range(1, 65)},
 }
 
 
@@ -300,6 +471,8 @@ def _backend_for(
         return "cute" if spec.residual_config(num_tokens) is not None else None
     if spec.cute_config(num_tokens) is not None:
         return "cute"
+    if spec.deepgemm_config(num_tokens) is not None:
+        return "deepgemm_bf16"
     if num_tokens in spec.dsv3_tokens:
         return "dsv3_fused_a"
     return None
@@ -319,13 +492,40 @@ def select_kimi_k3_backend(
 
 def _build_plan(spec: ProjectionSpec) -> dict[int, ResolvedCall]:
     plan: dict[int, ResolvedCall] = {}
-    for num_tokens in range(1, 17):
+    token_counts = set(range(1, 17))
+    token_counts.update(num_tokens for num_tokens, _ in spec.deepgemm_configs)
+    for num_tokens in sorted(token_counts):
         backend = _backend_for(spec, num_tokens, has_residual=False)
         if backend == "cute":
             plan[num_tokens] = ("cute", spec.cute_config(num_tokens))
         elif backend == "dsv3_fused_a":
             plan[num_tokens] = ("dsv3_fused_a", None)
+        elif backend == "deepgemm_bf16":
+            plan[num_tokens] = ("deepgemm_bf16", spec.deepgemm_config(num_tokens))
     return plan
+
+
+@functools.cache
+def _deepgemm_bf16_available() -> bool:
+    deep_gemm = _import_deep_gemm()
+    return (
+        deep_gemm is not None
+        and hasattr(deep_gemm, "bf16_gemm_nt")
+        and supports_block_size_multiple_of()
+    )
+
+
+def _available_plan(spec: ProjectionSpec) -> dict[int, ResolvedCall]:
+    plan = _build_plan(spec)
+    if not any(entry[0] == "deepgemm_bf16" for entry in plan.values()):
+        return plan
+    if _deepgemm_bf16_available():
+        return plan
+    return {
+        num_tokens: entry
+        for num_tokens, entry in plan.items()
+        if entry[0] != "deepgemm_bf16"
+    }
 
 
 def _build_residual_plan(spec: ProjectionSpec) -> dict[int, SkinnyGemmConfig]:
@@ -371,7 +571,15 @@ def _run_plan(
     if entry is None:
         return None
     backend, config = entry
+    if backend == "deepgemm_bf16":
+        assert isinstance(config, tuple)
+        output = torch.empty(
+            (x.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device
+        )
+        _launch_kimi_k3_bf16_gemm_nt(x, weight, output, *config)
+        return output
     if backend == "cute":
+        assert isinstance(config, SkinnyGemmConfig)
         if not shape_dynamic_skinny_gemm.is_available():
             return None
         return shape_dynamic_skinny_gemm(x, weight, config, None)
@@ -380,6 +588,57 @@ def _run_plan(
     output = torch.empty((x.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
     ops.dsv3_fused_a_gemm(output, x, weight.t(), enable_pdl=True)
     return output
+
+
+def _launch_kimi_k3_bf16_gemm_nt(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    output: torch.Tensor,
+    block_m_multiple: int,
+    block_n_multiple: int,
+) -> None:
+    torch.ops.vllm.kimi_k3_bf16_gemm_nt(
+        x,
+        weight,
+        output,
+        block_m_multiple,
+        block_n_multiple,
+    )
+
+
+def _kimi_k3_bf16_gemm_nt(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    output: torch.Tensor,
+    block_m_multiple: int,
+    block_n_multiple: int,
+) -> None:
+    deep_gemm = _import_deep_gemm()
+    if deep_gemm is None or not hasattr(deep_gemm, "bf16_gemm_nt"):
+        raise RuntimeError("DeepGEMM BF16 GEMM is unavailable")
+    if (block_m_multiple, block_n_multiple) == (1, 1):
+        deep_gemm.bf16_gemm_nt(x, weight, output)
+        return
+    with _block_size_multiple_scope((block_m_multiple, block_n_multiple)):
+        deep_gemm.bf16_gemm_nt(x, weight, output)
+
+
+def _kimi_k3_bf16_gemm_nt_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    output: torch.Tensor,
+    block_m_multiple: int,
+    block_n_multiple: int,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    "kimi_k3_bf16_gemm_nt",
+    _kimi_k3_bf16_gemm_nt,
+    mutates_args=["output"],
+    fake_impl=_kimi_k3_bf16_gemm_nt_fake,
+)
 
 
 def _run_residual_plan(
@@ -411,7 +670,7 @@ def try_low_latency_gemm(
     if spec is None:
         return None
     if residual is None:
-        return _run_plan(_build_plan(spec), x, weight)
+        return _run_plan(_available_plan(spec), x, weight)
     if not _residual_ok(x, weight, residual):
         return None
     return _run_residual_plan(_build_residual_plan(spec), x, weight, residual)
@@ -472,6 +731,35 @@ class KimiK3LowLatencyEmbeddingMethod(
     pass
 
 
+class KimiK3FusedK128Fp8LinearKernel(TritonFp8BlockScaledMMKernel):
+    def apply_weights(
+        self,
+        layer: nn.Module,
+        x: torch.Tensor | QuantizedActivation,
+        bias: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        if isinstance(x, torch.Tensor) and x.shape[-1] == 128:
+            input_2d = x.view(-1, x.shape[-1])
+            if input_2d.shape[0] <= 64:
+                params = self._get_layer_params(layer)
+                weight_scale = (
+                    params.weight_scale
+                    if params.weight_scale_inv is None
+                    else params.weight_scale_inv
+                )
+                assert weight_scale is not None
+                output = fused_k128_fp8_gemm(
+                    input_2d,
+                    params.weight,
+                    weight_scale,
+                )
+                if bias is not None:
+                    output.add_(bias)
+                return output.view(*x.shape[:-1], params.weight.shape[0])
+        return super().apply_weights(layer, x, bias, **kwargs)
+
+
 def enable_kimi_k3_low_latency_gemm(
     module: nn.Module,
     dtype: torch.dtype,
@@ -489,13 +777,28 @@ def enable_kimi_k3_low_latency_gemm(
             and isinstance(child.quant_method, ModelOptFp8PbWoLinearMethod)
         ):
             kernel = child.quant_method.w8a8_block_fp8_linear
-            plan = KIMI_K3_FP8_PB_WO_BLOCK_M_PLANS.get(tuple(child.weight.shape))
+            if tuple(child.weight.shape) == (12288, 128) and isinstance(
+                kernel, DeepGemmFp8BlockScaledMMKernel
+            ):
+                child.quant_method.w8a8_block_fp8_linear = (
+                    KimiK3FusedK128Fp8LinearKernel(kernel.config)
+                )
+                continue
+            shape = tuple(child.weight.shape)
+            block_size_plan = KIMI_K3_FP8_PB_WO_BLOCK_SIZE_PLANS.get(shape)
+            block_m_plan = KIMI_K3_FP8_PB_WO_BLOCK_M_PLANS.get(shape)
             if (
-                plan is not None
+                block_size_plan is not None
                 and isinstance(kernel, DeepGemmFp8BlockScaledMMKernel)
                 and supports_block_size_multiple_of()
             ):
-                kernel.set_block_m_multiple_plan(plan)
+                kernel.set_block_size_multiple_plan(block_size_plan)
+            elif (
+                block_m_plan is not None
+                and isinstance(kernel, DeepGemmFp8BlockScaledMMKernel)
+                and supports_block_size_multiple_of()
+            ):
+                kernel.set_block_m_multiple_plan(block_m_plan)
             continue
 
         is_linear = (
@@ -518,10 +821,10 @@ def enable_kimi_k3_low_latency_gemm(
             continue
         if is_linear:
             child.quant_method = KimiK3LowLatencyLinearMethod(
-                _build_plan(spec), _build_residual_plan(spec)
+                _available_plan(spec), _build_residual_plan(spec)
             )
         else:
-            child.quant_method = KimiK3LowLatencyEmbeddingMethod(_build_plan(spec))
+            child.quant_method = KimiK3LowLatencyEmbeddingMethod(_available_plan(spec))
         # Warm up only the configs measured for this module's local (N, K) so a
         # TP8 deployment does not compile TP4 configs and vice versa.
         warmup_configs.update(config for _, config in spec.cute_configs)

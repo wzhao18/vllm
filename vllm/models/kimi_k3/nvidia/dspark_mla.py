@@ -23,6 +23,9 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.models.common.ops.fused_allreduce_rms_norm import fused_allreduce_rms_norm
+from vllm.models.kimi_k3.nvidia.low_latency_gemm import (
+    enable_kimi_k3_low_latency_gemm,
+)
 from vllm.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
 from vllm.models.kimi_k3.nvidia.model import KimiMLP
 from vllm.utils.torch_utils import is_quantized_kv_cache
@@ -424,6 +427,7 @@ class K3DSparkForCausalLM(nn.Module):
             start_layer_id=target_layer_num,
             prefix=maybe_prefix(prefix, "model"),
         )
+        enable_kimi_k3_low_latency_gemm(self.model, vllm_config.model_config.dtype)
 
         # Assigned by load_dspark_model from the target. Keeping no placeholder
         # avoids a transient full-vocabulary allocation for this 163k-vocab model.

@@ -18,8 +18,8 @@ logger = init_logger(__name__)
 class GateLinear(ReplicatedLinear):
     """MoE gate linear layer with multi-tier GEMM dispatch:
 
-    1. cuteDSL ll_bf16_gemm (SM90+, M<=16, bf16 in, fp32 out,
-       K divisible by 8)
+    1. cuteDSL ll_bf16_gemm (SM90+, M<=16 or a shape-tuned larger M,
+       bf16 in, fp32 out, K divisible by 8)
     2. DSV3 specialized kernel (SM90+, M<=16, H=7168 E=256/384, H=6144 E=256)
     3. fp32 specialized kernel  (SM90+, bf16/fp32 in, fp32 out, M<=32,
        (H, E) in {(3072, 256), (6144, 128), (6144, 256)})
@@ -180,13 +180,19 @@ class GateLinear(ReplicatedLinear):
         self, x: torch.Tensor
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
         # Tier 1: cuteDSL ll_bf16_gemm (SM90+, any dims)
-        if self.allow_ll_bf16_gemm and x.shape[0] <= 16 and x.dtype == torch.bfloat16:
+        if self.allow_ll_bf16_gemm and x.dtype == torch.bfloat16:
             from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
+                has_tuned_config,
                 ll_bf16_gemm,
             )
 
-            output = ll_bf16_gemm(x, self.weight)
-            return output, None
+            if x.shape[0] <= 16 or has_tuned_config(
+                M=x.shape[0],
+                K=x.shape[1],
+                N=self.weight.shape[0],
+            ):
+                output = ll_bf16_gemm(x, self.weight)
+                return output, None
 
         # Tier 2: DSV3 specialized kernel (fallback for when cuteDSL unavailable)
         if self.allow_dsv3_router_gemm and x.shape[0] <= self._dsv3_max_batch:

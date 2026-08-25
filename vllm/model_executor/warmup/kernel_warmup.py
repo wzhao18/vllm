@@ -47,7 +47,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-_LL_BF16_WARMUP_M_RANGE = range(1, 17)
+_LL_BF16_WARMUP_M_RANGE = range(1, 65)
 
 
 def _ll_bf16_router_shapes_from_model(

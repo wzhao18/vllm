@@ -67,12 +67,25 @@ class DeepGemmFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             column_major_scales=True,
         )
         self._block_m_multiple_plan: dict[int, int] = {}
+        self._block_size_multiple_plan: dict[int, tuple[int, int]] = {}
 
     def set_block_m_multiple_plan(self, plan: dict[int, int]) -> None:
         """Select restricted DeepGEMM layout candidates for specific M values."""
         if any(m <= 0 or multiple <= 0 for m, multiple in plan.items()):
             raise ValueError("M values and block-M multiples must be positive")
         self._block_m_multiple_plan = dict(plan)
+
+    def set_block_size_multiple_plan(
+        self,
+        plan: dict[int, tuple[int, int]],
+    ) -> None:
+        """Select restricted DeepGEMM layout candidates for specific M values."""
+        if any(
+            m <= 0 or block_m <= 0 or block_n <= 0
+            for m, (block_m, block_n) in plan.items()
+        ):
+            raise ValueError("M values and block-size multiples must be positive")
+        self._block_size_multiple_plan = dict(plan)
 
     def input_quant_key(self) -> QuantKey | None:
         if DeepGemmQuantScaleFMT.from_oracle() == DeepGemmQuantScaleFMT.UE8M0:
@@ -155,7 +168,12 @@ class DeepGemmFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             dtype=out_dtype,
             device=A.device,
         )
-        block_m_multiple = self._block_m_multiple_plan.get(A.shape[0], 1)
+        block_size_multiple = self._block_size_multiple_plan.get(A.shape[0])
+        if block_size_multiple is None:
+            block_size_multiple = (
+                self._block_m_multiple_plan.get(A.shape[0], 1),
+                1,
+            )
         _launch_fp8_gemm_nt(
             A,
             As,
@@ -163,8 +181,7 @@ class DeepGemmFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             Bs,
             output,
             self.use_deep_gemm_e8m0,
-            block_m_multiple,
-            1,
+            *block_size_multiple,
         )
         return output
 

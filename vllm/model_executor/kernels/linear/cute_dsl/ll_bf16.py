@@ -76,6 +76,15 @@ _SM90_TUNED_SPLITK_CONFIGS: dict[tuple[int, int], dict[int, tuple[int, int]]] = 
     },
 }
 
+_SM103_TUNED_SPLITK_CONFIGS: dict[tuple[int, int], dict[int, tuple[int, int]]] = {
+    (7168, 896): {
+        **{M: (5, 4) for M in range(5, 12)},
+        **{M: (5, 5) for M in range(12, 17)},
+        **{M: (2, 6) for M in range(17, 33)},
+        **{M: (3, 3) for M in range(41, 48)},
+    },
+}
+
 
 def _arch_tuned_configs() -> tuple[
     dict[tuple[int, int], dict[int, int]],
@@ -83,6 +92,8 @@ def _arch_tuned_configs() -> tuple[
 ]:
     from vllm.platforms import current_platform
 
+    if current_platform.is_device_capability((10, 3)):
+        return {}, _SM103_TUNED_SPLITK_CONFIGS
     if current_platform.is_device_capability_family(100):
         return (
             _SM100F_TUNED_DOTPROD_BS,
@@ -94,6 +105,12 @@ def _arch_tuned_configs() -> tuple[
             _SM90_TUNED_SPLITK_CONFIGS,
         )
     return {}, {}
+
+
+def has_tuned_config(*, M: int, K: int, N: int) -> bool:
+    tuned_bs, tuned_splitk = _arch_tuned_configs()
+    shape = (K, N)
+    return M in tuned_bs.get(shape, {}) or M in tuned_splitk.get(shape, {})
 
 
 _cute_ctx = None

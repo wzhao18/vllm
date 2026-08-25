@@ -358,7 +358,14 @@ def test_cudagraph_input_update():
 # =================================================================
 
 
-def _make_gate_linear(monkeypatch, *, params_dtype, out_dtype=torch.float32):
+def _make_gate_linear(
+    monkeypatch,
+    *,
+    params_dtype,
+    out_dtype=torch.float32,
+    input_size=2048,
+    output_size=64,
+):
     monkeypatch.setattr(
         "vllm.model_executor.layers.linear.get_tensor_model_parallel_rank",
         lambda: 0,
@@ -383,8 +390,8 @@ def _make_gate_linear(monkeypatch, *, params_dtype, out_dtype=torch.float32):
         lambda: True,
     )
     return GateLinear(
-        input_size=2048,
-        output_size=64,
+        input_size=input_size,
+        output_size=output_size,
         bias=False,
         out_dtype=out_dtype,
         params_dtype=params_dtype,
@@ -478,6 +485,70 @@ def test_gate_linear_m_gt_16_falls_back(monkeypatch):
     out, _ = gate(x)
     assert out.shape == (17, 64)
     assert out.dtype == torch.float32
+
+
+def test_gate_linear_m_gt_16_uses_shape_tuned_ll_bf16(monkeypatch):
+    gate = _make_gate_linear(
+        monkeypatch,
+        params_dtype=torch.bfloat16,
+        input_size=7168,
+        output_size=896,
+    )
+    x = torch.randn(17, 7168, dtype=torch.bfloat16, device="cuda")
+    calls = []
+
+    def fake_ll_bf16_gemm(hidden_states, router_weight):
+        calls.append((hidden_states, router_weight))
+        return torch.empty(
+            (hidden_states.shape[0], router_weight.shape[0]),
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
+
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.cute_dsl.ll_bf16.ll_bf16_gemm",
+        fake_ll_bf16_gemm,
+    )
+    out, bias = gate(x)
+    assert bias is None
+    assert out.shape == (17, 896)
+    assert calls == [(x, gate.weight)]
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() != (10, 3), reason="SM103 tuning only"
+)
+@pytest.mark.parametrize(
+    ("M", "expected"),
+    [
+        (5, (5, 4)),
+        (11, (5, 4)),
+        (12, (5, 5)),
+        (16, (5, 5)),
+        (17, (2, 6)),
+        (32, (2, 6)),
+        (41, (3, 3)),
+        (47, (3, 3)),
+    ],
+)
+def test_sm103_kimi_k3_router_tuned_dispatch(M, expected):
+    from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import LLBf16Gemm
+
+    key = LLBf16Gemm().dispatch(M=M, K=7168, N=896)
+    assert key.backend == "splitk"
+    assert (key.split_k, key.num_stages) == expected
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() != (10, 3), reason="SM103 tuning only"
+)
+@pytest.mark.parametrize("M", [33, 40, 48, 64])
+def test_sm103_kimi_k3_router_untuned_gaps(M):
+    from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
+        has_tuned_config,
+    )
+
+    assert not has_tuned_config(M=M, K=7168, N=896)
 
 
 # =================================================================

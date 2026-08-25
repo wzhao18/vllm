@@ -42,6 +42,7 @@ from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
     select_nvfp4_moe_backend,
 )
 from vllm.model_executor.layers.fusion.quant_activation import (
+    QuantizedActivation,
     expose_input_quant_key,
 )
 from vllm.model_executor.layers.linear import (
@@ -70,6 +71,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
+    QuantKey,
     create_fp8_quant_key,
     is_layer_skipped,
     kFp8DynamicTokenSym,
@@ -719,6 +721,62 @@ class ModelOptFp8PbWoLinearMethod(LinearMethodBase):
             module_name=self.__class__.__name__,
         )
 
+    def try_quantize_shared_input(
+        self,
+        other: "ModelOptFp8PbWoLinearMethod",
+        x: torch.Tensor,
+    ) -> QuantizedActivation | None:
+        """Quantize once when two FP8 block linears have identical consumers."""
+        if not isinstance(other, ModelOptFp8PbWoLinearMethod):
+            return None
+        kernel = self.w8a8_block_fp8_linear
+        other_kernel = other.w8a8_block_fp8_linear
+        quant_key = kernel.input_quant_key()
+        quantizer_attrs = (
+            "group_shape",
+            "num_token_padding",
+            "column_major_scales",
+            "tma_aligned_scales",
+            "use_ue8m0",
+        )
+        if (
+            type(kernel) is not type(other_kernel)
+            or quant_key is None
+            or quant_key != other_kernel.input_quant_key()
+            or any(
+                getattr(kernel.quant_fp8, attr) != getattr(other_kernel.quant_fp8, attr)
+                for attr in quantizer_attrs
+            )
+        ):
+            return None
+        x_2d = x.view(-1, x.shape[-1])
+        q, scale = kernel.quant_fp8(
+            x_2d,
+            None,
+            None,
+            use_triton=kernel.use_triton,
+        )
+        return QuantizedActivation(
+            data=q,
+            scale=scale,
+            orig_dtype=x.dtype,
+            orig_shape=x.shape,
+            quant_key=quant_key,
+        )
+
+    def packed_ue8m0_input_quant_key(self) -> QuantKey | None:
+        """Return the key when the selected kernel consumes packed UE8M0."""
+        from vllm.model_executor.kernels.linear.scaled_mm.deep_gemm import (
+            DeepGemmFp8BlockScaledMMKernel,
+        )
+
+        kernel = self.w8a8_block_fp8_linear
+        if not isinstance(kernel, DeepGemmFp8BlockScaledMMKernel):
+            return None
+        if not kernel.use_deep_gemm_e8m0:
+            return None
+        return kernel.input_quant_key()
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # Keep weight in [out, in] layout for Fp8BlockScaledMMLinearKernel.
         weight = layer.weight.data
@@ -748,7 +806,7 @@ class ModelOptFp8PbWoLinearMethod(LinearMethodBase):
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
+        x: torch.Tensor | QuantizedActivation,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         kernel_bias = None if self.output_padding else bias

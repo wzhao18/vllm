@@ -9,6 +9,7 @@ would, chunk for chunk.
 """
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -41,6 +42,30 @@ _WORKSPACE_TOKENS = 128
 # the last request without any context.
 _CONTEXT_LENS = [200, 48, 32, 0]
 _QUERY_LENS = [8, 4, 6, 5]
+
+
+def test_mla_reuses_compatible_projection_quantization() -> None:
+    hidden_states = torch.randn(2, 4)
+    quantized = object()
+    producer = Mock()
+    producer.try_quantize_shared_input.return_value = quantized
+    consumer = object()
+    layer = SimpleNamespace(
+        q_lora_rank=2,
+        fused_qkv_a_proj=SimpleNamespace(quant_method=producer),
+        g_proj=SimpleNamespace(quant_method=consumer),
+    )
+
+    result = MultiHeadLatentAttention._shared_projection_input(layer, hidden_states)
+
+    assert result is quantized
+    producer.try_quantize_shared_input.assert_called_once_with(consumer, hidden_states)
+
+    producer.try_quantize_shared_input.return_value = None
+    assert (
+        MultiHeadLatentAttention._shared_projection_input(layer, hidden_states)
+        is hidden_states
+    )
 
 
 def test_modelopt_fp8_block_kv_proj_casts_gathered_latent():
