@@ -101,16 +101,29 @@ def test_fi_backend_strings_are_registered_mega_moe_backends():
 
 
 @pytest.mark.parametrize("moe_backend", sorted(FLASHINFER_MOE_EP_BACKENDS))
-def test_fi_moe_ep_backend_rejected_for_non_dsv4(moe_backend):
-    """An FI moe_ep backend with a non-DSv4 model must fail at config time
+def test_fi_moe_ep_backend_rejected_for_unsupported_model(moe_backend):
+    """An FI moe_ep backend with an unsupported model must fail at config time
     instead of silently falling through to the generic FusedMoE path."""
-    with pytest.raises(ValueError, match="only supported for DeepSeek-V4"):
+    with pytest.raises(ValueError, match="only supported for models"):
         validate_flashinfer_moe_ep_model(moe_backend, ["MixtralForCausalLM"])
 
 
 @pytest.mark.parametrize("moe_backend", sorted(FLASHINFER_MOE_EP_BACKENDS))
 def test_fi_moe_ep_backend_accepted_for_dsv4(moe_backend):
     validate_flashinfer_moe_ep_model(moe_backend, ["DeepseekV4ForCausalLM"])
+
+
+@pytest.mark.parametrize("moe_backend", sorted(FLASHINFER_MOE_EP_BACKENDS))
+@pytest.mark.parametrize(
+    "architecture",
+    [
+        "KimiK3ForConditionalGeneration",
+        "KimiK3MTPModel",
+        "KimiLinearForCausalLM",
+    ],
+)
+def test_fi_moe_ep_backend_accepted_for_kimi_k3(moe_backend, architecture):
+    validate_flashinfer_moe_ep_model(moe_backend, [architecture])
 
 
 @pytest.mark.parametrize(

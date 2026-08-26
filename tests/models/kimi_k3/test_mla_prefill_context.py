@@ -16,7 +16,11 @@ import torch
 from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonBaseImpl,
     MLACommonPrefillMetadata,
+    _get_kv_b_proj_input_dtype,
     build_mla_chunked_context_metadata,
+)
+from vllm.model_executor.layers.quantization.modelopt import (
+    ModelOptFp8PbWoLinearMethod,
 )
 from vllm.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
 from vllm.platforms import current_platform
@@ -37,6 +41,19 @@ _WORKSPACE_TOKENS = 128
 # the last request without any context.
 _CONTEXT_LENS = [200, 48, 32, 0]
 _QUERY_LENS = [8, 4, 6, 5]
+
+
+def test_modelopt_fp8_block_kv_proj_casts_gathered_latent():
+    method = object.__new__(ModelOptFp8PbWoLinearMethod)
+    method.input_dtype = torch.bfloat16
+    kv_b_proj = SimpleNamespace(
+        weight=torch.empty(1, dtype=current_platform.fp8_dtype()),
+        params_dtype=torch.bfloat16,
+        quant_method=method,
+    )
+
+    assert _get_kv_b_proj_input_dtype(kv_b_proj, False) == torch.bfloat16
+    assert _get_kv_b_proj_input_dtype(kv_b_proj, True) == torch.bfloat16
 
 
 class _RecordingPrefillBackend:

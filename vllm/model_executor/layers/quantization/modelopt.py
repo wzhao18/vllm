@@ -2176,6 +2176,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         exclude_modules: list[str],
         quantized_layers: dict[str, dict[str, Any]],
         fp8_config: ModelOptFp8Config,
+        fp8_pb_wo_config: ModelOptFp8Config,
         nvfp4_config: ModelOptNvFp4Config,
         w4a16_nvfp4_config: ModelOptNvFp4Config,
         mxfp8_config: ModelOptMxFp8Config,
@@ -2184,6 +2185,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         self.kv_cache_quant_method = kv_cache_quant_method
         self.quantized_layers = quantized_layers
         self.fp8_config = fp8_config
+        self.fp8_pb_wo_config = fp8_pb_wo_config
         self.nvfp4_config = nvfp4_config
         self.w4a16_nvfp4_config = w4a16_nvfp4_config
         self.mxfp8_config = mxfp8_config
@@ -2258,6 +2260,12 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             kv_cache_quant_method=kv_cache_quant_method,
             exclude_modules=[],
         )
+        fp8_pb_wo_config = ModelOptFp8Config(
+            quant_method="FP8_PB_WO",
+            is_checkpoint_fp8_serialized=True,
+            kv_cache_quant_method=kv_cache_quant_method,
+            exclude_modules=[],
+        )
         nvfp4_config = ModelOptNvFp4Config(
             is_checkpoint_nvfp4_serialized=True,
             kv_cache_quant_algo=kv_cache_quant_method,
@@ -2288,6 +2296,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             exclude_modules=exclude_modules,
             quantized_layers=quantized_layers,
             fp8_config=fp8_config,
+            fp8_pb_wo_config=fp8_pb_wo_config,
             nvfp4_config=nvfp4_config,
             w4a16_nvfp4_config=w4a16_nvfp4_config,
             mxfp8_config=mxfp8_config,
@@ -2411,7 +2420,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             if quant_algo == "FP8":
                 return ModelOptFp8LinearMethod(self.fp8_config)
             if quant_algo == "FP8_PB_WO":
-                return ModelOptFp8PbWoLinearMethod(self.fp8_config)
+                return ModelOptFp8PbWoLinearMethod(self.fp8_pb_wo_config)
             if quant_algo == "NVFP4":
                 return ModelOptNvFp4LinearMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":

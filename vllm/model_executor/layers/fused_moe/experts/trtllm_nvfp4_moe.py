@@ -43,6 +43,17 @@ logger = init_logger(__name__)
 _PER_TOKEN_BASE_GLOBAL_SCALE = 1.0 / (448.0 * 6.0)
 
 
+def _compute_g1_scale_c(
+    moe_config: FusedMoEConfig, quant_config: FusedMoEQuantConfig
+) -> torch.Tensor:
+    assert quant_config.g1_alphas is not None
+    assert quant_config.a2_gscale is not None
+    # SiTU passes g1_alphas separately as output1_scale_gate_scalar.
+    if moe_config.is_act_and_mul and moe_config.activation != MoEActivation.SITU:
+        return quant_config.g1_alphas * quant_config.a2_gscale
+    return quant_config.a2_gscale.clone()
+
+
 class TrtLlmNvFp4ExpertsBase:
     """
     NvFp4 TRTLLM-Gen MoE kernels. Supports modular and monolithic interface.
@@ -73,7 +84,7 @@ class TrtLlmNvFp4ExpertsBase:
         self.ep_rank = moe_config.moe_parallel_config.ep_rank
         self.is_situ = moe_config.activation == MoEActivation.SITU
 
-        self.g1_scale_c = self._compute_g1_scale_c()
+        self.g1_scale_c = _compute_g1_scale_c(moe_config, quant_config)
 
         # Fall back to moe_config.swiglu_* when quant_config doesn't carry them
         # (ModelOpt NVFP4 checkpoints store these on moe_config, not quant_config).
@@ -136,28 +147,13 @@ class TrtLlmNvFp4ExpertsBase:
             clamp,
         )
 
-    def _compute_g1_scale_c(self) -> torch.Tensor:
-        assert self.quant_config.g1_alphas is not None
-        assert self.quant_config.a2_gscale is not None
-        if not self.moe_config.is_act_and_mul:
-            return self.quant_config.a2_gscale.clone()
-        if self.is_situ:
-            # SITU applies its nonlinear activation after g1_alphas, so only
-            # the output quantization factor belongs in g1_scale_c.
-            return self.quant_config.a2_gscale.clone()
-
-        # g1_alphas = a13_scale * w13_scale_2
-        # a2_gscale = 1 / a2_scale
-        # g1_scale_c = a13_scale * w13_scale_2 / a2_scale
-        return self.quant_config.g1_alphas * self.quant_config.a2_gscale
-
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.w13_weight_scale_2.data.mul_(layer.w13_input_scale)
         layer.w2_weight_scale_2.data.mul_(layer.w2_input_scale)
         # Recompute g1_scale_c since g1_alphas was just fused in-place.
         # Register as a layer parameter so EPLB rearranges it alongside
         # other expert weights.
-        g1_scale_c = self._compute_g1_scale_c()
+        g1_scale_c = _compute_g1_scale_c(self.moe_config, self.quant_config)
         layer.register_parameter(
             "g1_scale_c",
             torch.nn.Parameter(g1_scale_c, requires_grad=False),
