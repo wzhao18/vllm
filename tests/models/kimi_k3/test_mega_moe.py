@@ -206,7 +206,7 @@ def test_kimi_flashinfer_mega_moe_builds_modelopt_scale_algebra(
         "load_balance_mode": "atomic_counter",
         "mma_tiler_mnk": (256, 128, 256),
         "flag_batch": 4,
-        "token_back_mode": "standalone_warps",
+        "token_back_mode": "epi_warps",
     }
     if integrated_shared:
         expected_knobs.pop("max_active_clusters")
@@ -443,7 +443,7 @@ def test_kimi_moe_passes_shared_input_to_integrated_kernel():
             assert kwargs["shared_hidden_states"].shape == (2, 8)
             assert kwargs["shared_expert_weights"] == "shared_weights"
             kwargs["shared_expert_output"].fill_(3.0)
-            calls.append("routed")
+            calls.append(kwargs["shared_expert_output"].data_ptr())
             return torch.full_like(hidden_states, 2.0)
 
     class OutputTransform(torch.nn.Module):
@@ -457,11 +457,14 @@ def test_kimi_moe_passes_shared_input_to_integrated_kernel():
 
     moe = kimi_model.KimiMoE.__new__(kimi_model.KimiMoE)
     torch.nn.Module.__init__(moe)
+    moe.hidden_size = 8
     moe.use_in_kernel_shared_fc12 = True
     moe.use_mega_moe = True
     moe.shared_experts = shared
     moe.experts = routed
     moe.routed_output_transform = OutputTransform()
+    shared_output_workspace = torch.empty(4, 8)
+    moe.set_integrated_shared_output_workspace(shared_output_workspace)
     object.__setattr__(
         moe,
         "_maybe_overlap_router_and_down_proj",
@@ -474,5 +477,47 @@ def test_kimi_moe_passes_shared_input_to_integrated_kernel():
 
     output = moe(torch.ones(2, 8))
 
-    assert calls == ["routed"]
+    assert calls == [shared_output_workspace.data_ptr()]
     torch.testing.assert_close(output, torch.full((2, 8), 5.0))
+
+
+def test_kimi_model_reuses_one_integrated_shared_output_workspace():
+    from vllm.models.kimi_k3.nvidia import model as kimi_model
+
+    class Experts(torch.nn.Module):
+        def __init__(self, capacity):
+            super().__init__()
+            self.max_num_tokens = capacity
+
+        def finalize_weights(self):
+            pass
+
+    def make_moe(capacity):
+        moe = kimi_model.KimiMoE.__new__(kimi_model.KimiMoE)
+        torch.nn.Module.__init__(moe)
+        moe.hidden_size = 8
+        moe.use_mega_moe = True
+        moe.use_in_kernel_shared_fc12 = True
+        moe.experts = Experts(capacity)
+        moe.shared_experts = None
+        moe._integrated_shared_output_workspace = None
+        return moe
+
+    model = kimi_model.KimiLinearModel.__new__(kimi_model.KimiLinearModel)
+    torch.nn.Module.__init__(model)
+    model.model_dtype = torch.float32
+    model.register_buffer("_mega_moe_shared_output_workspace", None, persistent=False)
+    model.register_parameter("device_anchor", torch.nn.Parameter(torch.empty(0)))
+    model.moe0 = make_moe(2)
+    model.moe1 = make_moe(4)
+
+    model.finalize_mega_moe_weights()
+    workspace = model._mega_moe_shared_output_workspace
+
+    assert workspace is not None
+    assert workspace.shape == (4, 8)
+    assert model.moe0._integrated_shared_output_workspace is workspace
+    assert model.moe1._integrated_shared_output_workspace is workspace
+
+    model.finalize_mega_moe_weights()
+    assert model._mega_moe_shared_output_workspace is workspace

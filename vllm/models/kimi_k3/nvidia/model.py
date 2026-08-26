@@ -149,7 +149,7 @@ _KIMI_NVFP4_MEGA_MOE_KNOBS = {
     "load_balance_mode": "atomic_counter",
     "mma_tiler_mnk": (256, 128, 256),
     "flag_batch": 4,
-    "token_back_mode": "standalone_warps",
+    "token_back_mode": "epi_warps",
 }
 
 
@@ -1032,9 +1032,11 @@ class KimiK3FlashInferMegaMoEExperts(KimiK3MegaMoEExperts):
             is_padding = get_forward_context().is_padding
             if is_padding is not None:
                 is_padding = is_padding[: hidden_states.shape[0]]
-                topk_ids = torch.where(is_padding.unsqueeze(1), -1, topk_ids)
         if self.capture_fn is not None:
-            self.capture_fn(topk_ids)
+            captured_topk_ids = topk_ids
+            if is_padding is not None:
+                captured_topk_ids = torch.where(is_padding.unsqueeze(1), -1, topk_ids)
+            self.capture_fn(captured_topk_ids)
 
         self.finalize_weights()
         assert self._flashinfer_layer is not None
@@ -1048,6 +1050,7 @@ class KimiK3FlashInferMegaMoEExperts(KimiK3MegaMoEExperts):
                 hidden_states=hidden_states,
                 topk_ids=topk_ids,
                 topk_weights=topk_weights,
+                is_padding=is_padding,
                 fc1_alpha=self._flashinfer_fc1_alpha,
                 fc2_alpha=self._flashinfer_fc2_alpha,
                 fc1_norm_const=self._flashinfer_fc1_norm_const,
@@ -1102,6 +1105,7 @@ class KimiMoE(nn.Module):
     ):
         super().__init__()
         hidden_size = config.hidden_size
+        self.hidden_size = hidden_size
         moe_intermediate_size = config.moe_intermediate_size
         num_experts = config.num_experts
         num_experts_per_token = config.num_experts_per_token
@@ -1136,6 +1140,7 @@ class KimiMoE(nn.Module):
             and isinstance(additional_config, dict)
             and additional_config.get("kimi_nvfp4_in_kernel_shared_fc12", False)
         )
+        self._integrated_shared_output_workspace: torch.Tensor | None = None
         if self.use_flashinfer_mega_moe:
             resolve_quant_algo = getattr(quant_config, "_resolve_quant_algo", None)
             quant_algo = (
@@ -1349,6 +1354,16 @@ class KimiMoE(nn.Module):
                 moe_intermediate_size // self.tp_size
             )
 
+    def set_integrated_shared_output_workspace(self, workspace: torch.Tensor) -> None:
+        if not self.use_in_kernel_shared_fc12:
+            raise RuntimeError("Shared output workspace requires integrated FC1+FC2.")
+        if workspace.ndim != 2 or workspace.shape[1] != self.hidden_size:
+            raise ValueError(
+                "Shared output workspace must have shape "
+                f"(capacity, {self.hidden_size}), got {tuple(workspace.shape)}."
+            )
+        self._integrated_shared_output_workspace = workspace
+
     def _maybe_overlap_router_and_down_proj(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
@@ -1422,9 +1437,19 @@ class KimiMoE(nn.Module):
         if self.use_mega_moe:
             assert self.routed_output_transform is not None
             assert topk_ids is not None
-            integrated_shared_output = (
-                torch.empty_like(hidden_states) if integrate_shared_fc12 else None
-            )
+            integrated_shared_output = None
+            if integrate_shared_fc12:
+                workspace = self._integrated_shared_output_workspace
+                if workspace is None:
+                    raise RuntimeError(
+                        "Integrated shared output workspace was not initialized."
+                    )
+                if hidden_states.shape[0] > workspace.shape[0]:
+                    raise ValueError(
+                        f"Integrated shared output needs {hidden_states.shape[0]} "
+                        f"tokens, but its capacity is {workspace.shape[0]}."
+                    )
+                integrated_shared_output = workspace[: hidden_states.shape[0]]
 
             def run_routed_experts() -> torch.Tensor:
                 if integrate_shared_fc12:
@@ -1743,6 +1768,11 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
 
         config = vllm_config.model_config.hf_text_config
         self.config = config
+        self.model_dtype = vllm_config.model_config.dtype
+        self._mega_moe_shared_output_workspace: torch.Tensor | None
+        self.register_buffer(
+            "_mega_moe_shared_output_workspace", None, persistent=False
+        )
         self.attn_res_block_size: int | None = config.attn_res_block_size
         self.use_attn_res = self.attn_res_block_size is not None
         parallel_config = vllm_config.parallel_config
@@ -2204,12 +2234,41 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         return loaded_params
 
     def finalize_mega_moe_weights(self) -> None:
+        integrated_moe_layers: list[KimiMoE] = []
         for module in self.modules():
             if isinstance(module, KimiMoE) and module.use_mega_moe:
                 module.experts.finalize_weights()
                 shared_experts = module.shared_experts
                 if isinstance(shared_experts, KimiFusedSharedExpert):
                     shared_experts.finalize_weights()
+                if module.use_in_kernel_shared_fc12:
+                    integrated_moe_layers.append(module)
+
+        if integrated_moe_layers:
+            capacity = max(
+                module.experts.max_num_tokens for module in integrated_moe_layers
+            )
+            hidden_size = integrated_moe_layers[0].hidden_size
+            if self._mega_moe_shared_output_workspace is None:
+                device = next(self.parameters()).device
+                self._mega_moe_shared_output_workspace = torch.empty(
+                    capacity,
+                    hidden_size,
+                    dtype=self.model_dtype,
+                    device=device,
+                )
+            elif self._mega_moe_shared_output_workspace.shape != (
+                capacity,
+                hidden_size,
+            ):
+                raise RuntimeError(
+                    "Integrated shared output workspace shape changed after "
+                    "initialization."
+                )
+            for module in integrated_moe_layers:
+                module.set_integrated_shared_output_workspace(
+                    self._mega_moe_shared_output_workspace
+                )
 
 
 class KimiLinearForCausalLM(
