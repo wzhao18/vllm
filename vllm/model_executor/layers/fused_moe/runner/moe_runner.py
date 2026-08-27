@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, cast
 import torch
 import torch.nn.functional as F
 
+import vllm.envs as envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.parallel import ExpertPlacementStrategy
 from vllm.distributed import (
@@ -53,6 +54,47 @@ from vllm.utils.torch_utils import (
 )
 
 logger = init_logger(__name__)
+
+_BALANCED_ROUTER_LOGITS_CACHE: dict[
+    tuple[str, torch.dtype, int, int, int, int], torch.Tensor
+] = {}
+
+
+def balanced_router_logits(
+    router_logits: torch.Tensor,
+    top_k: int,
+    dp_rank: int,
+) -> torch.Tensor:
+    """Build deterministic logits with maximally balanced expert selection."""
+    num_tokens, num_experts = router_logits.shape
+    if top_k > num_experts:
+        raise ValueError(
+            f"top_k ({top_k}) must not exceed num_experts ({num_experts})"
+        )
+    token_offsets = torch.arange(num_tokens, device=router_logits.device)
+    token_offsets = token_offsets * top_k + dp_rank * num_tokens * top_k
+    expert_ids = torch.arange(num_experts, device=router_logits.device)
+    selected = (expert_ids[None, :] - token_offsets[:, None]).remainder(num_experts)
+    selected = selected < top_k
+    return selected.to(router_logits.dtype).mul(40).sub(20)
+
+
+def _get_balanced_router_logits(
+    num_tokens: int,
+    num_experts: int,
+    top_k: int,
+    dp_rank: int,
+    dtype: torch.dtype,
+    device: torch.device | str,
+) -> torch.Tensor:
+    device = torch.device(device)
+    key = (str(device), dtype, num_tokens, num_experts, top_k, dp_rank)
+    cached = _BALANCED_ROUTER_LOGITS_CACHE.get(key)
+    if cached is None:
+        prototype = torch.empty(num_tokens, num_experts, dtype=dtype, device=device)
+        cached = balanced_router_logits(prototype, top_k, dp_rank)
+        _BALANCED_ROUTER_LOGITS_CACHE[key] = cached
+    return cached
 
 
 def register_layer_for_moe_forward_op(
@@ -271,7 +313,6 @@ class MoERunner(MoERunnerInterface):
         self.shared_expert_gate = shared_expert_gate
         self.routed_experts = routed_experts
         self.enable_dbo = enable_dbo
-
         # When both gates are present and FSE is enabled, fuse their
         # weight matrices into [num_experts + num_shared, hidden] so one
         # F.linear produces combined logits. The topk kernel can then
@@ -592,6 +633,20 @@ class MoERunner(MoERunnerInterface):
         self._maybe_apply_shared_experts(
             shared_experts_input, SharedExpertsOrder.NO_OVERLAP
         )
+
+        if envs.VLLM_MOE_BALANCED_ROUTER_LOGITS:
+            logger.warning_once(
+                "Replacing MoE router logits with a balanced diagnostic pattern. "
+                "Model outputs are not valid."
+            )
+            router_logits = _get_balanced_router_logits(
+                router_logits.shape[0],
+                router_logits.shape[1],
+                self.moe_config.experts_per_token,
+                self.moe_config.dp_rank,
+                router_logits.dtype,
+                router_logits.device,
+            )
 
         if self.routed_experts.quant_method.is_monolithic:
             # Monolithic kernels: pass router_logits to routed_experts

@@ -1751,6 +1751,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MOE_ROUTING_SIMULATION_STRATEGY": lambda: os.environ.get(
         "VLLM_MOE_ROUTING_SIMULATION_STRATEGY", ""
     ).lower(),
+    # Replace router logits with a deterministic, maximally balanced pattern.
+    # This preserves the configured MoE backend and is only for performance tests.
+    "VLLM_MOE_BALANCED_ROUTER_LOGITS": lambda: os.environ.get(
+        "VLLM_MOE_BALANCED_ROUTER_LOGITS", "0"
+    ).lower()
+    in ("1", "true"),
     # Regex timeout for use by the vLLM tool parsing plugins.
     "VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS": lambda: int(
         os.getenv("VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS", "1")

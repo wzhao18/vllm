@@ -23,6 +23,9 @@ from vllm.model_executor.layers.fused_moe.router.routing_simulator_router import
     DistributionBasedRouting,
     RoutingSimulator,
 )
+from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
+    balanced_router_logits,
+)
 
 
 @pytest.fixture
@@ -208,3 +211,34 @@ def test_instance_compatibility():
 
     assert topk_weights.shape == (10, 2)
     assert topk_ids.shape == (10, 2)
+
+
+def test_balanced_router_logits_minimize_expert_load_skew(device):
+    """Balanced diagnostic logits give every expert floor or ceil assignments."""
+    num_tokens = 315
+    num_experts = 896
+    top_k = 16
+    logits = torch.empty(num_tokens, num_experts, device=device)
+
+    balanced = balanced_router_logits(logits, top_k=top_k, dp_rank=0)
+    selected = balanced > 0
+    counts = selected.sum(dim=0)
+
+    assert torch.all(selected.sum(dim=1) == top_k)
+    assert counts.max() - counts.min() <= 1
+
+
+def test_balanced_router_logits_offset_data_parallel_ranks(device):
+    """DP-rank offsets balance the aggregate rather than repeating one subset."""
+    num_tokens = 20
+    num_experts = 896
+    top_k = 16
+    logits = torch.empty(num_tokens, num_experts, device=device)
+
+    aggregate = sum(
+        balanced_router_logits(logits, top_k=top_k, dp_rank=rank) > 0
+        for rank in range(16)
+    )
+    counts = aggregate.sum(dim=0)
+
+    assert counts.max() - counts.min() <= 1
