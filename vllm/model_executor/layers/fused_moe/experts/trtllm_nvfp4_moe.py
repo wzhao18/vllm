@@ -22,6 +22,7 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 )
 from vllm.model_executor.layers.fused_moe.utils import (
     fi_moe_largest_bucket,
+    fi_moe_tune_max_num_tokens,
     trtllm_moe_pack_topk_ids_weights,
 )
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
@@ -588,7 +589,9 @@ class TrtLlmNvFp4ExpertsMonolithic(
             do_finalize=not defer,
             activation_type=activation_to_flashinfer_int(activation),
             per_token_scale=per_token_scale,
-            tune_max_num_tokens=fi_moe_largest_bucket(self.moe_config),
+            tune_max_num_tokens=fi_moe_tune_max_num_tokens(
+                self.moe_config, deferred_finalize=defer
+            ),
             routing_replay_out=routing_replay_out,
         )
         routed_output = convert_flashinfer_moe_output(

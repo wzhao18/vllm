@@ -503,6 +503,19 @@ def fi_moe_largest_bucket(moe_config: "FusedMoEConfig") -> int:
     return max(moe_config.max_num_tokens * moe_config.dp_size, 8192)
 
 
+def fi_moe_tune_max_num_tokens(
+    moe_config: "FusedMoEConfig", *, deferred_finalize: bool
+) -> int:
+    max_num_tokens = fi_moe_largest_bucket(moe_config)
+    if not deferred_finalize:
+        return max_num_tokens
+
+    deferred_max = moe_config.defer_moe_finalize_max_num_tokens
+    if deferred_max >= 0:
+        return min(max_num_tokens, deferred_max)
+    return max_num_tokens
+
+
 def trtllm_moe_pack_topk_ids_weights(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,

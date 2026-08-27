@@ -247,6 +247,19 @@ def _flashinfer_autotune_skip_ops(runner: "GPUModelRunner") -> set[str] | None:
     return None
 
 
+def _flashinfer_autotune_token_counts(runner: "GPUModelRunner") -> tuple[int, ...]:
+    max_tokens = runner.scheduler_config.max_num_batched_tokens
+    deferred_limits: set[int] = set()
+    for module in runner.get_model().modules():
+        moe_config = getattr(module, "moe_config", None)
+        if moe_config is None or not moe_config.use_deferred_moe_finalize:
+            continue
+        limit = moe_config.defer_moe_finalize_max_num_tokens
+        if 0 < limit < max_tokens:
+            deferred_limits.add(limit)
+    return (max_tokens, *sorted(deferred_limits, reverse=True))
+
+
 def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     """
     Autotune FlashInfer operations.
@@ -292,7 +305,6 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     # MoE kernel entirely, and cause hang due to all-reduce collective
     # during synchronized autotuning.
     dummy_run_kwargs = dict(
-        num_tokens=runner.scheduler_config.max_num_batched_tokens,
         skip_eplb=True,
         is_profile=True,
         randomize_inputs=True,
@@ -316,7 +328,8 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
             torch.inference_mode(),
             fi_utils.autotune(tune_mode=True, **autotune_kwargs),
         ):
-            runner._dummy_run(**dummy_run_kwargs)
+            for num_tokens in _flashinfer_autotune_token_counts(runner):
+                runner._dummy_run(num_tokens=num_tokens, **dummy_run_kwargs)
     finally:
         set_autotune_process_group(None)
 
