@@ -18,6 +18,8 @@ from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     amax_for_moe_activation_quant,
 )
+from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe import RoutedExperts
@@ -32,6 +34,40 @@ __all__ = [
 ]
 
 
+@triton.jit
+def _swap_tensor_halves_kernel(
+    tensor,
+    num_pairs,
+    half_stride,
+    dim_stride,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = (tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)).to(tl.int64)
+    mask = offsets < num_pairs
+    outer = offsets // half_stride
+    within = offsets % half_stride
+    first = outer * dim_stride + within
+    second = first + half_stride
+    first_value = tl.load(tensor + first, mask=mask)
+    second_value = tl.load(tensor + second, mask=mask)
+    tl.store(tensor + first, second_value, mask=mask)
+    tl.store(tensor + second, first_value, mask=mask)
+
+
+def _swap_tensor_halves_(tensor: torch.Tensor, dim: int) -> None:
+    dim %= tensor.dim()
+    half_stride = tensor.shape[dim] // 2 * tensor.stride(dim)
+    num_pairs = tensor.numel() // 2
+    block_size = 4096
+    _swap_tensor_halves_kernel[(triton.cdiv(num_pairs, block_size),)](
+        tensor,
+        num_pairs,
+        half_stride,
+        2 * half_stride,
+        BLOCK_SIZE=block_size,
+    )
+
+
 def reorder_w1w3_to_w3w1(
     weight: torch.Tensor, scale: torch.Tensor, dim: int = -2
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -43,27 +79,31 @@ def reorder_w1w3_to_w3w1(
     assert scale.is_contiguous(), "scale must be contiguous"
     size = weight.size(dim)
     assert size % 2 == 0, f"Expected even size in dim {dim}, got {size}"
-    half = size // 2
     d = dim % weight.dim()
 
-    # 64 MB transient cap
-    bytes_per_row = max(
-        weight.numel() // size * weight.element_size(),
-        scale.numel() // size * scale.element_size(),
-    )
-    chunk = max(1, min(half, (64 << 20) // max(bytes_per_row, 1)))
-
-    fa, fb = [slice(None)] * weight.dim(), [slice(None)] * weight.dim()
-    for off in range(0, half, chunk):
-        end = min(off + chunk, half)
-        fa[d], fb[d] = slice(off, end), slice(half + off, half + end)
-        a, b = tuple(fa), tuple(fb)
-        for t in (weight, scale):
-            tmp = t[b].clone()
-            t[b] = t[a]
-            t[a] = tmp
+    _swap_tensor_halves_(weight, d)
+    _swap_tensor_halves_(scale, d)
 
     return weight, scale
+
+
+def _release_cached_memory_for_weight_conversion(*tensors: torch.Tensor) -> None:
+    required_bytes = sum(t.numel() * t.element_size() for t in tensors)
+    free_bytes, _ = current_platform.mem_get_info()
+    if free_bytes >= required_bytes:
+        return
+
+    device = tensors[0].device
+    releasable_bytes = torch.accelerator.memory_reserved(
+        device
+    ) - torch.accelerator.memory_allocated(device)
+    if releasable_bytes <= 0:
+        return
+
+    # FastSafeTensors can leave completed transfer buffers in the caching
+    # allocator. Reclaim them before creating a complete shuffled MoE layer.
+    torch.accelerator.synchronize(device)
+    torch.accelerator.empty_cache()
 
 
 def interleave_linear_and_gate(
@@ -207,7 +247,7 @@ def prepare_static_weights_for_trtllm_fp4_moe(
         get_w2_permute_indices_with_cache,
     )
 
-    _cache_permute_indices: dict[torch.Size, torch.Tensor] = {}
+    _cache_permute_indices: dict[object, torch.Tensor] = {}
     """Prepare quantized weights for kernel (done offline with weights)."""
     epilogue_tile_m = 128  # FIXME: this depends on the kernel internals
     gemm1_intermediate_size = (
@@ -231,85 +271,67 @@ def prepare_static_weights_for_trtllm_fp4_moe(
         torch.float8_e4m3fn
     ).reshape(num_experts, hidden_size, intermediate_size // 16)  # fp8 scaling factors
 
-    gemm1_weights_fp4_shuffled = []
-    gemm1_scales_fp4_shuffled = []
-    gemm2_weights_fp4_shuffled = []
-    gemm2_scales_fp4_shuffled = []
-    for i in range(num_experts):
-        # Calculate the permute indices for the following:
-        # 1. Reorder rows of W1 and scales for fused gated activation
-        # 2. Shuffle weights and scaling factors for transposed mma output
-        # for both w3_w1 and w2 weights and scale factors
-        permute_indices = _maybe_get_cached_w3_w1_permute_indices(
-            _cache_permute_indices,
-            gemm1_weights_fp4[i].view(torch.uint8),
-            epilogue_tile_m,
-            is_gated_act_gemm=is_gated_activation,
-        )
-        gemm1_weights_fp4_shuffled.append(
-            gemm1_weights_fp4[i]
-            .view(torch.uint8)[permute_indices.to(gemm1_weights_fp4.device)]
-            .contiguous()
-        )
-
-        permute_sf_indices = _maybe_get_cached_w3_w1_permute_indices(
-            _cache_permute_indices,
-            gemm1_scales_linear_fp4[i].view(torch.uint8),
-            epilogue_tile_m,
-            num_elts_per_sf=16,
-            is_gated_act_gemm=is_gated_activation,
-        )
-        gemm1_scales_fp4_shuffled.append(
-            nvfp4_block_scale_interleave(
-                gemm1_scales_linear_fp4[i]
-                .view(torch.uint8)[
-                    permute_sf_indices.to(gemm1_scales_linear_fp4.device)
-                ]
-                .contiguous()
-            )
-        )
-
-        permute_indices = get_w2_permute_indices_with_cache(
-            _cache_permute_indices,
-            gemm2_weights_fp4[i].view(torch.uint8),
-            epilogue_tile_m,
-        )
-        gemm2_weights_fp4_shuffled.append(
-            gemm2_weights_fp4[i]
-            .view(torch.uint8)[permute_indices.to(gemm2_weights_fp4.device)]
-            .contiguous()
-        )
-
-        permute_sf_indices = get_w2_permute_indices_with_cache(
-            _cache_permute_indices,
-            gemm2_scales_linear_fp4[i].view(torch.uint8),
-            epilogue_tile_m,
-            num_elts_per_sf=16,
-        )
-        gemm2_scales_fp4_shuffled.append(
-            nvfp4_block_scale_interleave(
-                gemm2_scales_linear_fp4[i]
-                .view(torch.uint8)[
-                    permute_sf_indices.to(gemm2_scales_linear_fp4.device)
-                ]
-                .contiguous()
-            )
-        )
-
-    # Stack weights for all experts
-    gemm1_weights_fp4_shuffled = torch.stack(gemm1_weights_fp4_shuffled)
-    gemm1_scales_fp4_shuffled = (
-        torch.stack(gemm1_scales_fp4_shuffled)
-        .view(torch.float8_e4m3fn)
-        .reshape(num_experts, gemm1_intermediate_size, hidden_size // 16)
+    gemm1_weight_indices = _maybe_get_cached_w3_w1_permute_indices(
+        _cache_permute_indices,
+        gemm1_weights_fp4[0].view(torch.uint8),
+        epilogue_tile_m,
+        is_gated_act_gemm=is_gated_activation,
+    )
+    gemm1_scale_indices = _maybe_get_cached_w3_w1_permute_indices(
+        _cache_permute_indices,
+        gemm1_scales_linear_fp4[0].view(torch.uint8),
+        epilogue_tile_m,
+        num_elts_per_sf=16,
+        is_gated_act_gemm=is_gated_activation,
+    )
+    gemm2_weight_indices = get_w2_permute_indices_with_cache(
+        _cache_permute_indices,
+        gemm2_weights_fp4[0].view(torch.uint8),
+        epilogue_tile_m,
+    )
+    gemm2_scale_indices = get_w2_permute_indices_with_cache(
+        _cache_permute_indices,
+        gemm2_scales_linear_fp4[0].view(torch.uint8),
+        epilogue_tile_m,
+        num_elts_per_sf=16,
     )
 
-    gemm2_weights_fp4_shuffled = torch.stack(gemm2_weights_fp4_shuffled)
-    gemm2_scales_fp4_shuffled = (
-        torch.stack(gemm2_scales_fp4_shuffled)
-        .view(torch.float8_e4m3fn)
-        .reshape(num_experts, hidden_size, intermediate_size // 16)
-    )
+    gemm1_weights_fp4_shuffled = torch.empty_like(gemm1_weights_fp4, dtype=torch.uint8)
+    gemm1_scales_fp4_shuffled = torch.empty_like(gemm1_scales_linear_fp4)
+    gemm2_weights_fp4_shuffled = torch.empty_like(gemm2_weights_fp4, dtype=torch.uint8)
+    gemm2_scales_fp4_shuffled = torch.empty_like(gemm2_scales_linear_fp4)
+
+    for expert_id in range(num_experts):
+        torch.index_select(
+            gemm1_weights_fp4[expert_id].view(torch.uint8),
+            0,
+            gemm1_weight_indices,
+            out=gemm1_weights_fp4_shuffled[expert_id],
+        )
+        gemm1_scale = torch.index_select(
+            gemm1_scales_linear_fp4[expert_id].view(torch.uint8),
+            0,
+            gemm1_scale_indices,
+        )
+        gemm1_scales_fp4_shuffled[expert_id].view(torch.uint8).reshape(-1).copy_(
+            nvfp4_block_scale_interleave(gemm1_scale)
+        )
+
+        torch.index_select(
+            gemm2_weights_fp4[expert_id].view(torch.uint8),
+            0,
+            gemm2_weight_indices,
+            out=gemm2_weights_fp4_shuffled[expert_id],
+        )
+        gemm2_scale = torch.index_select(
+            gemm2_scales_linear_fp4[expert_id].view(torch.uint8),
+            0,
+            gemm2_scale_indices,
+        )
+        gemm2_scales_fp4_shuffled[expert_id].view(torch.uint8).reshape(-1).copy_(
+            nvfp4_block_scale_interleave(gemm2_scale)
+        )
+
     return (
         gemm1_weights_fp4_shuffled,
         gemm1_scales_fp4_shuffled,
@@ -353,6 +375,9 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
         NvFp4MoeBackend.FLASHINFER_CUTEDSL_BATCHED,
         NvFp4MoeBackend.FLASHINFER_B12X,
     ]
+
+    if backend == NvFp4MoeBackend.FLASHINFER_TRTLLM:
+        _release_cached_memory_for_weight_conversion(w13, w13_scale, w2, w2_scale)
 
     # Reorder [w1, w3] to [w3, w1] for FI NVFP4 MoE kernels.
     is_gated = layer.activation.is_gated
