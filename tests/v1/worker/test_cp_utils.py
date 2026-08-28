@@ -1,10 +1,34 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+import vllm.v1.worker.cp_utils as cp_utils
+from vllm.v1.attention.backends.mla.tokenspeed_mla import TokenspeedMLAImpl
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.worker.cp_utils import should_skip_dcp_context_attention
+
+
+def test_tokenspeed_mla_accepts_speculation_with_interleaved_dcp(monkeypatch):
+    impl = object.__new__(TokenspeedMLAImpl)
+    impl.need_to_return_lse_for_decode = True
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=8,
+            cp_kv_cache_interleave_size=16,
+        ),
+        speculative_config=SimpleNamespace(method="dspark"),
+    )
+    monkeypatch.setattr(
+        cp_utils,
+        "get_layers_from_vllm_config",
+        lambda *_: {"model.layers.0.self_attn": SimpleNamespace(impl=impl)},
+    )
+
+    cp_utils.check_attention_cp_compatibility(config)
 
 
 def test_skip_gate_only_for_zero_context():
