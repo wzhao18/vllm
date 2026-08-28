@@ -155,6 +155,25 @@ class DFlashSpeculator(DraftModelSpeculator):
             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
         )
 
+    def _prepare_dummy_sampling_inputs(self, num_reqs: int) -> int:
+        num_reqs = min(num_reqs, self.max_num_tokens // self.num_query_per_req)
+        num_steps = self.num_speculative_steps
+        num_samples = num_reqs * num_steps
+        sample_offset = 0 if self.sample_from_anchor else 1
+        req_indices = torch.arange(num_reqs, device=self.device)
+        step_indices = torch.arange(num_steps, device=self.device)
+        query_indices = (
+            req_indices[:, None] * self.num_query_per_req
+            + sample_offset
+            + step_indices
+        )
+        self.sample_indices[:num_samples].copy_(query_indices.flatten())
+        self.sample_pos[:num_samples].copy_(step_indices.repeat(num_reqs) + 1)
+        self.sample_idx_mapping[:num_samples].copy_(
+            req_indices.repeat_interleave(num_steps)
+        )
+        return num_reqs
+
     def load_draft_model(
         self,
         target_model: nn.Module,
@@ -369,6 +388,8 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.hidden_states[:num_target_tokens],
                 self.context_positions[:num_target_tokens],
             )
+            num_reqs = self._prepare_dummy_sampling_inputs(num_reqs)
+            num_query_tokens = num_reqs * self.num_query_per_req
             # DFlash processes all speculative tokens in one forward pass,
             # so the real token count is num_query_tokens.
             self._prepare_eplb_forward(num_query_tokens)

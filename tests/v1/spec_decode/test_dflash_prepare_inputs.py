@@ -9,10 +9,11 @@ import torch
 
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+    DFlashSpeculator,
     prepare_dflash_inputs,
 )
 
-pytestmark = pytest.mark.skipif(
+requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires a CUDA device"
 )
 
@@ -118,6 +119,7 @@ def _run_prepare(
     )
 
 
+@requires_cuda
 def test_prepare_dflash_inputs_excludes_rejected_context_suffix():
     # Positions 10/11 use physical block 7. Rejected positions 12/13 would use
     # block 8, but must be PAD context rather than contaminating draft KV.
@@ -141,6 +143,7 @@ def test_prepare_dflash_inputs_excludes_rejected_context_suffix():
     assert out.seeds[2].item() == 17
 
 
+@requires_cuda
 def test_prepare_dflash_inputs_excludes_rejected_context_suffix_with_dcp():
     out = _run_prepare(
         target_positions=[10, 11, 12, 13],
@@ -155,6 +158,7 @@ def test_prepare_dflash_inputs_excludes_rejected_context_suffix_with_dcp():
     assert out.query_slot_mapping[:3].tolist() == [PAD_SLOT_ID, PAD_SLOT_ID, 30]
 
 
+@requires_cuda
 def test_prepare_dflash_inputs_never_writes_the_null_block():
     # The valid context uses logical block 0 and the replacement query uses
     # logical block 1. Both map to the null block and must remain unwritable.
@@ -174,3 +178,33 @@ def test_prepare_dflash_inputs_never_writes_the_null_block():
         PAD_SLOT_ID,
         PAD_SLOT_ID,
     ]
+
+
+@pytest.mark.parametrize(
+    ("sample_from_anchor", "num_query_per_req", "expected_indices"),
+    [
+        (True, 3, [0, 1, 2, 3, 4, 5]),
+        (False, 4, [1, 2, 3, 5, 6, 7]),
+    ],
+)
+def test_prepare_dummy_sampling_inputs(
+    sample_from_anchor, num_query_per_req, expected_indices
+):
+    speculator = object.__new__(DFlashSpeculator)
+    speculator.num_speculative_steps = 3
+    speculator.num_query_per_req = num_query_per_req
+    speculator.sample_from_anchor = sample_from_anchor
+    speculator.max_num_tokens = num_query_per_req * 2
+    speculator.device = torch.device("cpu")
+    speculator.sample_indices = torch.full((12,), -1, dtype=torch.int64)
+    speculator.sample_pos = torch.full((12,), -1, dtype=torch.int64)
+    speculator.sample_idx_mapping = torch.full((12,), -1, dtype=torch.int32)
+
+    num_reqs = speculator._prepare_dummy_sampling_inputs(3)
+
+    assert num_reqs == 2
+    assert speculator.sample_indices.tolist() == expected_indices + [-1] * 6
+    assert speculator.sample_pos.tolist() == [1, 2, 3, 1, 2, 3] + [-1] * 6
+    assert speculator.sample_idx_mapping.tolist() == [0, 0, 0, 1, 1, 1] + [
+        -1
+    ] * 6
