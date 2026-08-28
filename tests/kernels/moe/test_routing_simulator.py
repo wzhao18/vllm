@@ -23,6 +23,7 @@ from vllm.model_executor.layers.fused_moe.router.routing_simulator_router import
     DistributionBasedRouting,
     RoutingSimulator,
 )
+from vllm.model_executor.layers.fused_moe.runner import moe_runner
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
     balanced_router_logits,
 )
@@ -32,6 +33,28 @@ from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
 def device():
     """Fixture to provide the appropriate device for testing."""
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def test_balanced_router_logits_only_caches_graph_inputs(monkeypatch):
+    moe_runner._BALANCED_ROUTER_LOGITS_CACHE.clear()
+    args = (8, 16, 4, 0, torch.float32, torch.device("cpu"))
+
+    monkeypatch.setattr(
+        moe_runner, "_should_cache_balanced_router_logits", lambda _: False
+    )
+    eager_logits = moe_runner._get_balanced_router_logits(*args)
+    next_eager_logits = moe_runner._get_balanced_router_logits(*args)
+    assert eager_logits.data_ptr() != next_eager_logits.data_ptr()
+    assert not moe_runner._BALANCED_ROUTER_LOGITS_CACHE
+
+    monkeypatch.setattr(
+        moe_runner, "_should_cache_balanced_router_logits", lambda _: True
+    )
+    captured_logits = moe_runner._get_balanced_router_logits(*args)
+    replay_logits = moe_runner._get_balanced_router_logits(*args)
+    assert captured_logits.data_ptr() == replay_logits.data_ptr()
+    assert len(moe_runner._BALANCED_ROUTER_LOGITS_CACHE) == 1
+    moe_runner._BALANCED_ROUTER_LOGITS_CACHE.clear()
 
 
 @pytest.mark.parametrize("num_tokens", [1, 16, 256])

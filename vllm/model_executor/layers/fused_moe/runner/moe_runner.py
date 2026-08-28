@@ -60,6 +60,10 @@ _BALANCED_ROUTER_LOGITS_CACHE: dict[
 ] = {}
 
 
+def _should_cache_balanced_router_logits(device: torch.device) -> bool:
+    return device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+
+
 def balanced_router_logits(
     router_logits: torch.Tensor,
     top_k: int,
@@ -93,7 +97,8 @@ def _get_balanced_router_logits(
     if cached is None:
         prototype = torch.empty(num_tokens, num_experts, dtype=dtype, device=device)
         cached = balanced_router_logits(prototype, top_k, dp_rank)
-        _BALANCED_ROUTER_LOGITS_CACHE[key] = cached
+        if _should_cache_balanced_router_logits(device):
+            _BALANCED_ROUTER_LOGITS_CACHE[key] = cached
     return cached
 
 
