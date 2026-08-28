@@ -1027,8 +1027,10 @@ def test_mock_mla_dcp_fp8_decode_gathers_quantized_query(
 
 def test_tokenspeed_mla_noncausal_capability():
     builder = tokenspeed_mla_module.TokenspeedMLAMetadataBuilder
+    impl = tokenspeed_mla_module.TokenspeedMLAImpl
     assert builder.supports_non_causal_multi_token_decode
     assert builder.supports_non_causal_multi_token_dcp
+    assert impl.supports_mtp_with_cp_non_trivial_interleave_size
     assert tokenspeed_mla_module.TokenspeedMLABackend.supports_non_causal()
 
 
