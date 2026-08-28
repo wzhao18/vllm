@@ -119,6 +119,7 @@ def _make_store_recving_thread(
     *,
     tp_rank: int = 0,
     disk_offload_buffer_budget_bytes: int | None = None,
+    max_load_batch_keys: int | None = None,
 ) -> mooncake_store_worker.KVCacheStoreRecvingThread:
     from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
 
@@ -141,6 +142,7 @@ def _make_store_recving_thread(
         ready_event=threading.Event(),
         coord=coord,
         disk_offload_buffer_budget_bytes=disk_offload_buffer_budget_bytes,
+        max_load_batch_keys=max_load_batch_keys,
     )
     thread.request_queue.task_done = MagicMock()
     return thread
@@ -1438,6 +1440,40 @@ def test_recv_thread_uses_single_batch_when_no_disk_offload_budget(monkeypatch):
     store.batch_get_replica_desc.assert_not_called()
 
 
+def test_recv_thread_splits_load_by_max_keys(monkeypatch):
+    monkeypatch.delenv("VLLM_MOONCAKE_STORE_TIER_LOG", raising=False)
+    store = MagicMock()
+    store.batch_get_into_multi_buffers.side_effect = ([256, 256], [256])
+    thread = _make_store_recving_thread(store, max_load_batch_keys=2)
+
+    req = _make_load_req("req-a", [b"a0", b"a1", b"a2"], token_len=48)
+    thread._handle_request(req)
+
+    assert store.batch_get_into_multi_buffers.call_count == 2
+    first_keys = store.batch_get_into_multi_buffers.call_args_list[0].args[0]
+    second_keys = store.batch_get_into_multi_buffers.call_args_list[1].args[0]
+    assert first_keys == [
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6130",
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6131",
+    ]
+    assert second_keys == [
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6132"
+    ]
+
+
+def test_recv_thread_invalidates_unattempted_max_key_sub_batches(monkeypatch):
+    monkeypatch.delenv("VLLM_MOONCAKE_STORE_TIER_LOG", raising=False)
+    store = MagicMock()
+    store.batch_get_into_multi_buffers.return_value = [256, -10]
+    thread = _make_store_recving_thread(store, max_load_batch_keys=2)
+
+    req = _make_load_req("req-a", [b"a0", b"a1", b"a2"], token_len=48)
+    thread._handle_request(req)
+
+    assert store.batch_get_into_multi_buffers.call_count == 1
+    assert thread.get_and_clear_block_ids_with_load_errors() == {1, 2}
+
+
 def test_recv_thread_keys_chunk_by_lookup_selected_boundary():
     store = MagicMock()
     store.batch_get_into_multi_buffers.return_value = [256, 256]
@@ -1619,7 +1655,7 @@ def test_recv_thread_stops_after_first_failing_disk_offload_sub_batch():
     thread._handle_request(req)
 
     assert store.batch_get_into_multi_buffers.call_count == 1
-    assert thread.get_and_clear_block_ids_with_load_errors() == {0, 1}
+    assert thread.get_and_clear_block_ids_with_load_errors() == {0, 1, 2}
 
 
 def test_recv_thread_skips_split_when_budget_holds_all_keys():
@@ -2469,6 +2505,7 @@ def _make_bare_worker(
     )
 
     worker.disk_offload_buffer_budget_bytes = None
+    worker.max_load_batch_keys = None
     worker.store_replicate_config = SimpleNamespace()
     worker.enable_group_semantics = False
     worker._supports_group_ids = False

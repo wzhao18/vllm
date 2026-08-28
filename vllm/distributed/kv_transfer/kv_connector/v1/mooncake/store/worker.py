@@ -1136,6 +1136,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         tp_rank: int,
         ready_event: threading.Event,
         disk_offload_buffer_budget_bytes: int | None = None,
+        max_load_batch_keys: int | None = None,
         record_operation: Callable[..., None] | None = None,
         request_queue: queue.Queue[Any] | None = None,
     ):
@@ -1153,6 +1154,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         self._invalid_block_ids_lock = threading.Lock()
         self._invalid_block_ids: set[int] = set()
         self.disk_offload_buffer_budget_bytes = disk_offload_buffer_budget_bytes
+        if max_load_batch_keys is not None and max_load_batch_keys <= 0:
+            raise ValueError("max_load_batch_keys must be positive")
+        self.max_load_batch_keys = max_load_batch_keys
         self.usable_disk_offload_buffer_budget_bytes = (
             None
             if disk_offload_buffer_budget_bytes is None
@@ -1273,11 +1277,35 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     )
                     block_id_offset = next_block_id_offset
 
+        if self.max_load_batch_keys is not None:
+            load_batches = [
+                (
+                    batch_keys[start : start + self.max_load_batch_keys],
+                    batch_addrs[start : start + self.max_load_batch_keys],
+                    batch_sizes[start : start + self.max_load_batch_keys],
+                    batch_block_ids[start : start + self.max_load_batch_keys],
+                )
+                for (
+                    batch_keys,
+                    batch_addrs,
+                    batch_sizes,
+                    batch_block_ids,
+                ) in load_batches
+                for start in range(0, len(batch_keys), self.max_load_batch_keys)
+            ]
+
         current_batch_keys: list[str] = key_list_c
         current_batch_block_ids: list[int] = block_id_list_c
+        current_batch_index = 0
         batch_bytes = 0
         try:
-            for batch_keys, batch_addrs, batch_sizes, batch_block_ids in load_batches:
+            for batch_index, (
+                batch_keys,
+                batch_addrs,
+                batch_sizes,
+                batch_block_ids,
+            ) in enumerate(load_batches):
+                current_batch_index = batch_index
                 current_batch_keys = batch_keys
                 current_batch_block_ids = batch_block_ids
                 batch_bytes = _sum_batch_bytes(batch_sizes)
@@ -1309,8 +1337,14 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     num_failed_keys=len(failed),
                 )
                 if failed:
+                    unattempted_block_ids = [
+                        block_id
+                        for future_batch in load_batches[batch_index + 1 :]
+                        for block_id in future_batch[3]
+                    ]
                     self._add_load_error_block_ids(
                         [block_id for _, _, block_id in failed]
+                        + unattempted_block_ids
                     )
                     logger.warning(
                         "Failed to get %d Mooncake keys from sub-batch "
@@ -1321,7 +1355,14 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     )
                     break
         except Exception as e:
-            self._add_load_error_block_ids(current_batch_block_ids)
+            unattempted_block_ids = [
+                block_id
+                for future_batch in load_batches[current_batch_index + 1 :]
+                for block_id in future_batch[3]
+            ]
+            self._add_load_error_block_ids(
+                current_batch_block_ids + unattempted_block_ids
+            )
             self._record_operation(
                 "load_get",
                 load_get_start,
@@ -1495,6 +1536,12 @@ class MooncakeStoreWorker:
         # Pool of load-receive threads
         self.kv_recv_threads: list[KVCacheStoreRecvingThread] = []
         self.num_recv_threads = max(1, envs.VLLM_MOONCAKE_LOAD_RECV_THREADS)
+        max_load_batch_keys = extra_config.get("max_load_batch_keys")
+        self.max_load_batch_keys = (
+            None if max_load_batch_keys is None else int(max_load_batch_keys)
+        )
+        if self.max_load_batch_keys is not None and self.max_load_batch_keys <= 0:
+            raise ValueError("max_load_batch_keys must be positive")
         self.recv_request_queue: queue.Queue[ReqMeta] = queue.Queue()
         self.finished_store_req: set[str] = set()
         self._kv_connector_stats_lock = threading.Lock()
@@ -1747,6 +1794,7 @@ class MooncakeStoreWorker:
                 self.tp_rank,
                 ready_event_recving,
                 disk_offload_buffer_budget_bytes=self.disk_offload_buffer_budget_bytes,
+                max_load_batch_keys=self.max_load_batch_keys,
                 record_operation=self._record_kv_connector_operation,
                 request_queue=self.recv_request_queue,
             )
