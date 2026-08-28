@@ -782,6 +782,10 @@ class NixlBaseConnectorWorker:
                 remote_physical_blocks_per_logical=(
                     metadata.physical_blocks_per_logical_kv_block
                 ),
+                remote_dcp_size=metadata.dcp_size,
+                remote_cp_kv_cache_interleave_size=(
+                    metadata.cp_kv_cache_interleave_size
+                ),
             ),
         )
         return self.nixl_wrapper.add_remote_agent(metadata.agent_metadata)
@@ -1245,6 +1249,9 @@ class NixlBaseConnectorWorker:
             ),
             dcp_size=self.dcp_size,
             pcp_size=self.pcp_size,
+            cp_kv_cache_interleave_size=(
+                self.vllm_config.parallel_config.cp_kv_cache_interleave_size
+            ),
         )
         # Wrap metadata in payload with hash for defensive decoding
         assert self.compat_hash is not None
@@ -1553,6 +1560,10 @@ class NixlBaseConnectorWorker:
             remote_block_size=nixl_agent_meta.block_size,
             remote_block_len=nixl_agent_meta.block_lens[0],
             remote_physical_blocks_per_logical=physical_blocks_per_logical,
+            remote_dcp_size=nixl_agent_meta.dcp_size,
+            remote_cp_kv_cache_interleave_size=(
+                nixl_agent_meta.cp_kv_cache_interleave_size
+            ),
         )
         transfer_topo.register_remote_engine(engine_id, transfer_info)
         logger.info("Transfer plan: %s", transfer_topo.describe(engine_id))
@@ -1561,6 +1572,8 @@ class NixlBaseConnectorWorker:
             transfer_topology=transfer_topo,
             remote_tp_size=remote_tp_size,
             group_spec_types=self._group_spec_types,
+            remote_dcp_size=nixl_agent_meta.dcp_size,
+            local_dcp_size=self.dcp_size,
         )
 
         remote_agent_name = self.nixl_wrapper.add_remote_agent(
@@ -1701,10 +1714,31 @@ class NixlBaseConnectorWorker:
         remote_physical_per_logical = (
             nixl_agent_meta.physical_blocks_per_logical_kv_block
         )
+        local_dcp_size = self.dcp_size
+        remote_dcp_size = nixl_agent_meta.dcp_size
+        if local_dcp_size != remote_dcp_size:
+            sharded_dcp_size = max(local_dcp_size, remote_dcp_size)
+            assert min(local_dcp_size, remote_dcp_size) == 1, (
+                "NIXL DCP transfer currently requires one side to use DCP=1"
+            )
+            sharded_interleave = (
+                self.vllm_config.parallel_config.cp_kv_cache_interleave_size
+                if local_dcp_size == sharded_dcp_size
+                else nixl_agent_meta.cp_kv_cache_interleave_size
+            )
+            if sharded_interleave != self.block_size:
+                raise RuntimeError(
+                    "NIXL DCP transfer requires block-aligned KV-cache "
+                    f"interleaving ({self.block_size} tokens), got "
+                    f"{sharded_interleave}. Set "
+                    "--cp-kv-cache-interleave-size to the physical NIXL "
+                    "block size."
+                )
         if (
             self._has_mamba
             and remote_physical_per_logical
             != self._physical_blocks_per_logical_kv_block
+            and local_dcp_size == remote_dcp_size
             and self.vllm_config.cache_config.enable_prefix_caching
         ):
             raise RuntimeError(
@@ -2094,9 +2128,15 @@ class NixlBaseConnectorWorker:
                         continue
                     # Number of remote-sized sub-blocks the transfer covered;
                     # everything past this was clipped and must be zeroed.
+                    remote_blocks = len(meta.remote.block_ids[g])
+                    local_dcp_size = self.dcp_size
+                    if remote_info.remote_dcp_size > local_dcp_size:
+                        remote_blocks *= (
+                            remote_info.remote_dcp_size // local_dcp_size
+                        )
                     covered_sub_blocks = min(
                         len(local_group) * block_size_ratio,
-                        len(meta.remote.block_ids[g]),
+                        remote_blocks,
                     )
                     block_ids_for_blocksize_post_process[block_size_ratio].append(
                         (local_group, covered_sub_blocks)
@@ -2377,6 +2417,35 @@ class NixlBaseConnectorWorker:
                 )
         return physical_block_ids
 
+    def _map_dcp_attention_block_ids(
+        self,
+        local_block_ids: BlockIds,
+        remote_block_ids: BlockIds,
+        remote_rank: int,
+        remote_info: EngineTransferInfo,
+    ) -> tuple[BlockIds, BlockIds]:
+        """Pair block-aligned DCP attention shards with an unsharded peer."""
+        local_dcp_size = self.dcp_size
+        remote_dcp_size = remote_info.remote_dcp_size
+        if local_dcp_size == remote_dcp_size:
+            return local_block_ids, remote_block_ids
+
+        local_block_ids = [list(group) for group in local_block_ids]
+        remote_block_ids = [list(group) for group in remote_block_ids]
+        if remote_dcp_size > local_dcp_size:
+            assert local_dcp_size == 1
+            dcp_rank = remote_rank % remote_dcp_size
+            for i, group in enumerate(local_block_ids):
+                if _is_attention_spec(self._group_spec_types[i]):
+                    local_block_ids[i] = group[dcp_rank::remote_dcp_size]
+        else:
+            assert remote_dcp_size == 1
+            dcp_rank = self.tp_rank % local_dcp_size
+            for i, group in enumerate(remote_block_ids):
+                if _is_attention_spec(self._group_spec_types[i]):
+                    remote_block_ids[i] = group[dcp_rank::local_dcp_size]
+        return local_block_ids, remote_block_ids
+
     def _apply_prefix_caching(
         self,
         decode_block_ids: BlockIds,
@@ -2411,7 +2480,9 @@ class NixlBaseConnectorWorker:
                 num_decode_blocks = len(decode_block_ids[i])
                 assert num_decode_blocks <= len(prefill_group)
                 if num_decode_blocks < len(prefill_group):
-                    prefill_block_ids[i] = prefill_group[-num_decode_blocks:]
+                    prefill_block_ids[i] = (
+                        prefill_group[-num_decode_blocks:] if num_decode_blocks else []
+                    )
         else:
             # (NOTE: ZhanqiuHu) HeteroTP can cause different kernel block counts
             # due to logical block rounding.
@@ -2455,7 +2526,9 @@ class NixlBaseConnectorWorker:
                     and num_decode_blocks < num_prefill_blocks
                 ):
                     # Partial prefix cache hit for FA group.
-                    prefill_block_ids[i] = prefill_group[-num_decode_blocks:]
+                    prefill_block_ids[i] = (
+                        prefill_group[-num_decode_blocks:] if num_decode_blocks else []
+                    )
                 else:
                     # TODO Handle prefix caching with different block_sizes
                     # Allocation rounding legitimately leaves up to
