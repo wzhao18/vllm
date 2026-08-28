@@ -159,9 +159,7 @@ class MooncakeStoreScheduler:
         num_external_tokens: int,
     ):
         """Update state after block allocation."""
-        local_block_ids: tuple[list[int], ...] = ()
-        if num_external_tokens > 0:
-            local_block_ids = blocks.get_block_ids()
+        local_block_ids = blocks.get_block_ids()
 
         self._unfinished_requests[request.request_id] = (request, local_block_ids)
         self._unfinished_request_ids.add(request.request_id)
@@ -170,7 +168,10 @@ class MooncakeStoreScheduler:
             return
 
         if num_external_tokens == 0:
-            self.load_specs[request.request_id].can_load = False
+            # Another MultiConnector child may have won the load after this
+            # connector reported a hit. Keep the real allocation for saves,
+            # but discard this connector's unchosen load.
+            self.load_specs.pop(request.request_id)
             return
 
         assert (

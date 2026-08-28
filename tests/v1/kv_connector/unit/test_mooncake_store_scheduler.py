@@ -743,6 +743,24 @@ def test_full_external_hit_with_full_local_hit_skips_load():
     assert "req-0" not in scheduler.load_specs
 
 
+def test_unchosen_multiconnector_load_keeps_blocks_for_store():
+    scheduler = _make_bare_scheduler()
+    scheduler.load_specs["req-0"] = LoadSpec(
+        vllm_cached_tokens=0,
+        kvpool_cached_tokens=32,
+        can_load=False,
+    )
+    request = SimpleNamespace(request_id="req-0")
+    block_ids = ([1, 2], [3], [4, 5], [6])
+    blocks = SimpleNamespace(get_block_ids=lambda: block_ids)
+
+    # MultiConnector passes zero when another child was selected to load.
+    scheduler.update_state_after_alloc(request, blocks, num_external_tokens=0)
+
+    assert "req-0" not in scheduler.load_specs
+    assert scheduler._unfinished_requests["req-0"] == (request, block_ids)
+
+
 def test_partial_hash_hit_block_aligned_local_loads_partial_tail():
     # Fine-grained on (hash=4, block=16): a block-aligned local hit can pull a
     # sub-block remote hit (24 = a hash boundary inside block 1). Loads [16, 24).
