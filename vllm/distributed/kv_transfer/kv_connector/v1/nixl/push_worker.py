@@ -711,6 +711,13 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
     # --- Notification handling on engine main thread ------------------ #
 
+    @staticmethod
+    def _prepare_recv_metadata_for_completion(meta: ReqMeta) -> None:
+        assert meta.remote is not None
+        meta.remote.block_ids = tuple(
+            list(group) for group in meta.local_physical_block_ids
+        )
+
     def _get_new_notifs(self) -> set[str]:
         """Drain HB / completion notifs forwarded by the writer thread.
 
@@ -746,6 +753,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                     if notifs < expected_notifs:
                         continue
                     del self.consumer_notification_counts_by_req[req_id]
+                    self._prepare_recv_metadata_for_completion(meta)
                     # P drove the transfer (we own no NIXL handle), so
                     # materialise an empty ``_recving_transfers`` entry for
                     # ``_pop_done_transfers`` to report done.

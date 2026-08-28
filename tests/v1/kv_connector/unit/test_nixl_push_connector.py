@@ -357,6 +357,7 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w.engine_id = "test-decode-engine"
         w._remote_agents = {}
         w._physical_blocks_per_logical_kv_block = 1
+        w.dcp_size = 1
         # Single non-hybrid attention group, matching the stub block id lists.
         w._has_mamba = False
         w._group_spec_types = (FullAttentionSpec,)
@@ -720,7 +721,10 @@ class TestPushWriterNotifs:
         # Pretend the writer thread already forwarded a completion notif
         # for a request whose KV is being received.
         request_id = "req-recv-1"
-        w._recving_metadata[request_id] = MagicMock(pp_size=1)
+        meta = MagicMock(pp_size=1)
+        meta.remote.engine_id = "prefill-engine"
+        meta.remote.block_ids = ([10, 11],)
+        w._recving_metadata[request_id] = meta
         # Compose the standard completion notif: req_id:tp_size.
         notif_msg = f"{request_id}:1".encode()
         w._pending_completion_notifs.put(notif_msg)
@@ -734,6 +738,16 @@ class TestPushWriterNotifs:
         # Notif consumed; D-side just touches _recving_transfers.
         assert notified == set()
         assert request_id in w._recving_transfers
+
+    def test_completion_uses_registered_local_kernel_group_coverage(self):
+        meta = MagicMock()
+        meta.remote.engine_id = "prefill-engine"
+        meta.remote.block_ids = ([10, 11],)
+        meta.local_physical_block_ids = ([20, 21, 22, 23], [30])
+
+        NixlPushConnectorWorker._prepare_recv_metadata_for_completion(meta)
+
+        assert meta.remote.block_ids == ([20, 21, 22, 23], [30])
 
     def test_get_finished_evicts_completed_state(self):
         """``get_finished`` should enqueue evictions and wake the writer."""
@@ -1232,6 +1246,7 @@ class TestPushPrefixCaching:
             remote_physical_blocks_per_logical=1,
             remote_block_size=16,
             remote_tp_size=1,
+            remote_dcp_size=1,
         )
         w.transfer_topo.tp_ratio.return_value = 1
         w.transfer_topo.block_size_ratio.return_value = 1
