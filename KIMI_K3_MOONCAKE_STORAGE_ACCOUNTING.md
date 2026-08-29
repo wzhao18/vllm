@@ -906,3 +906,152 @@ that can exceed the legacy 135,500-key ceiling without eviction, stable
 external-prefix hit rate, and collapse of rewrite-after-eviction PUTs. If these
 storage metrics improve while throughput remains capped, the remaining limit
 is scheduling or P-to-D transfer rather than Mooncake capacity.
+
+### Request-level EAGLE replay-boundary trace
+
+A matched c16 experiment traced every request through AIPerf, Dynamo, and the
+Mooncake prefill lookup. AIPerf exported the source trace identity and its
+64-token leading-hash reuse opportunity. The analyzer aligned that value to the
+128-token prefix-match unit, recorded the realized prompt-cache-read tokens,
+and joined Dynamo's external request ID to vLLM's internal request ID. The
+Mooncake diagnostic recorded the reconciled external lookup plus separate
+FullAttention group 3 and Mamba groups 0--2 frontiers. All 236 records in each
+run joined successfully; each measured phase contained 59 successful requests
+and one duration-cancelled request with zero errors.
+
+The source-trace value is a within-trajectory opportunity, not a strict global
+upper bound. Runtime reuse may exceed it through common prefixes shared across
+different trajectories. The realized `usage_prompt_cache_read_tokens` is the
+authoritative hit count. The per-group Mooncake frontier is diagnostic rather
+than identical to that count because local GPU hits can supplement the
+external lookup.
+
+The baseline was job `615753`, under
+`vllm-investigation-runs/prefix-hit-trace-baseline-c16/615753`. The candidate
+was job `615754`, under
+`vllm-investigation-runs/prefix-hit-trace-pr53945-c16/615754`, with the four
+commits from vLLM PR #53945 applied. The generated per-request tables are
+`prefix_hit_trace.csv` in the respective job directories.
+
+PR #53945 materially improved reuse in this workload:
+
+- Frontend prompt-cache hit share increased from 85.716% to 89.562%, while the
+  sampled source-trace opportunity was 90.798% and 90.924%, respectively.
+- Of 58 source-identical profiling requests, 46 gained hit tokens, eight were
+  unchanged, and four regressed. Net realized reuse increased by 159,104
+  tokens.
+- The positive deficit from the PMU/EAGLE-aligned source opportunity fell from
+  167,424 to 16,896 tokens. Requests losing more than 128 tokens fell from 23
+  to two, and expected-nonzero requests with a zero hit fell from three to
+  zero.
+- Total throughput increased from 22,002 to 23,182 tokens/s (+5.4%). P90 TTFT
+  decreased from 3.004 s to 2.037 s, and p90 ITL decreased from 11.56 ms to
+  10.75 ms. These aggregate changes are supportive rather than standalone
+  proof because the duration-limited profiling phases sampled one different
+  source request.
+
+The mechanism can be concurrency-sensitive without being a capacity failure.
+Before the fix, the shared-prefix checkpoint is floored to the 1,536-token
+hybrid scheduler block even though EAGLE can resume on the 128-token hash grid.
+`request.shared_prefix_boundary` is exercised when sibling prompts overlap in
+the scheduler, which becomes more common at higher concurrency. PR #53945
+shares one replay-boundary policy between the scheduler and Mooncake and
+materializes the Mamba checkpoint at the EAGLE resume position.
+
+The c16 candidate is not yet sufficient for promotion. One matched candidate
+request still had a 16,640-token deficit: FullAttention was present through
+85,888 tokens, but all three Mamba groups stopped at 73,728 tokens. There were
+no Mooncake PUT/GET errors or eviction messages for that request. This is a
+separate Mamba-state retention/population miss that must be explained, and the
+candidate still requires c80/c120 validation plus the standard model accuracy
+evaluation before integration.
+
+### Lease-aware recurrent lookup
+
+Mooncake's master implementation confirms that both `ExistKey` and every
+successful member of `BatchExistKey` call `GrantReadLease` with the configured
+KV lease TTL. The exhaustive fine-grained lookup therefore does more than ask
+which PMU hashes exist: it renews the lease of every historical KDA checkpoint
+that it probes. With a long lease this makes the full append history
+temporarily unevictable. With the restored 10-second lease, the same problem
+persists whenever successive turns touch those historical keys faster than
+their leases expire.
+
+The clean capacity control is to preserve the content-addressed key space but
+stop touching states that cannot win the restore plan. Full-attention endpoint
+queries remain batched because every contiguous MLA block below the selected
+frontier is required. Recurrent groups are queried together, newest first, one
+PMU boundary per request. The search stops at the first boundary for which all
+three KDA groups and all eight DCP rank namespaces exist. Consequently only the
+selected KDA checkpoint receives a read lease; missing candidates consume no
+capacity, and older branches remain correct because they receive a lease if a
+request actually selects them.
+
+This changes effective rather than immediate unconstrained residency. Mooncake
+does not eagerly delete an object merely because its lease expires; the object
+becomes eligible for normal LRU eviction. A valid capacity test must therefore
+also constrain the store near the modeled live working set. For 120 active
+sessions, one compact KDA checkpoint costs about 19.57 MiB times three groups
+times eight rank namespaces, or roughly 56 GiB total. Adding that to the
+roughly 320 GB MLA token-cache estimate gives a first practical target near
+380 GB, with a modest safety margin for uneven placement and in-flight turns.
+The decisive result is not low resident bytes in an oversized 3.52 TB store;
+it is sustaining the request-derived PMU hit ceiling when the store is reduced
+to approximately 400--480 GB deployment-wide.
+
+The combined PR #53945 plus staged-lookup prototype is isolated on
+`wzhao/mooncake-eagle-spec-aware`. Completed MLA endpoint windows are 16;
+partial MLA-tail and recurrent-state windows are one. The full Mooncake worker
+suite passes 158 tests. This includes three recurrent groups expanded across
+eight DCP namespaces, one-at-a-time KDA probes, and randomized equivalence to
+the exhaustive hit and per-group load boundaries across 64 hybrid availability
+patterns with and without EAGLE. Runtime canary job `615916` is queued under
+`vllm-investigation-runs/prefix-hit-trace-pr53945-mla16-tail1-kda1-c16/615916`.
+
+High concurrency also amplifies lookup leases through scheduler retries. An
+async lookup future is removed as soon as its result is consumed. If the
+request cannot then obtain GPU blocks, it remains at zero computed tokens and
+the scheduler submits another external lookup on a later pass. Historical
+compact runs show this retry rate increasing with concurrency:
+
+| Concurrency | Requests, including warmup | Mooncake lookup RPCs | RPCs/request |
+| ---: | ---: | ---: | ---: |
+| 16 | 265 | 475 | 1.79 |
+| 80 | 1,415 | 3,095 | 2.19 |
+| 120 | 1,927 | 4,709 | 2.44 |
+
+The exhaustive implementation renewed leases for 24.6 million keys at c16,
+150.6 million at c80, and 211.6 million at c120. Caching a completed lookup
+indefinitely is not safe with a 10-second lease because allocation can be
+delayed beyond the lease and the selected values may then be evicted before
+load. It can also lose reuse that appears while a request waits. In the matched
+c16 PR #53945 trace, three requests improved from a zero external frontier to
+12,288 tokens across retries; one request was looked up 26 times before
+admission. Caching the first result would have forced unnecessary recompute.
+Staged lookup addresses the amplification without stale plans: every retry
+revalidates the required MLA ancestry and selected KDA checkpoint, but no
+longer renews every historical PMU checkpoint.
+
+Per-request staged diagnostics are isolated on
+`wzhao/mooncake-eagle-spec-aware-diagnostic` at `8e55ef62e7`. The diagnostic
+records the actual reconciled hit, each manager frontier, every queried rank
+namespace, and whether an owned missing key was previously stored. The full
+Mooncake worker suite passes 159 tests with this instrumentation. It will be
+used for the c80 candidate after the non-diagnostic c16 canary succeeds.
+
+The largest remaining c16 PR #53945 deficit is consistent with an incomplete
+asynchronous save rather than eviction. Turn 5 of one append-only trajectory
+completed with a 90,809-token prompt. Its next turn arrived about two seconds
+later: MLA existed only through 85,888 tokens and all three KDA groups stopped
+at 73,728 tokens. The following turn arrived roughly five seconds later and
+recovered a 93,696-token external frontier. There were no PUT failures or
+evictions. This makes save publication latency a concrete explanation for a
+zero-eviction miss and a plausible high-concurrency amplifier.
+
+Commit `ec50c34894` on the same diagnostic branch adds per-request store-job
+queue time, partial-tail publication time, total completion time, token
+boundaries, and wall-clock publication timestamps. The resulting c80 trace can
+therefore classify a missing boundary as not yet published, previously stored
+but absent, incomplete across rank namespaces, or present but rejected by the
+hybrid/EAGLE reconciliation rules. The Mooncake worker suite passes 160 tests
+with the save timeline included.
