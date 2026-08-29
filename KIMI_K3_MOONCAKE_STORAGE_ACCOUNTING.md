@@ -991,13 +991,14 @@ This changes effective rather than immediate unconstrained residency. Mooncake
 does not eagerly delete an object merely because its lease expires; the object
 becomes eligible for normal LRU eviction. A valid capacity test must therefore
 also constrain the store near the modeled live working set. For 120 active
-sessions, one compact KDA checkpoint costs about 19.57 MiB times three groups
-times eight rank namespaces, or roughly 56 GiB total. Adding that to the
-roughly 320 GB MLA token-cache estimate gives a first practical target near
-380 GB, with a modest safety margin for uneven placement and in-flight turns.
+sessions, one compact KDA value costs 19.57 MB (18.67 MiB). Across three groups
+and eight rank namespaces, one session costs 0.4375 GiB; 120 current sessions
+cost about 52.5 GiB. Adding that to the roughly 320 GiB MLA token-cache estimate
+gives a first practical target near 373 GiB, with a modest safety margin for
+uneven placement and in-flight turns.
 The decisive result is not low resident bytes in an oversized 3.52 TB store;
 it is sustaining the request-derived PMU hit ceiling when the store is reduced
-to approximately 400--480 GB deployment-wide.
+to approximately 400--480 GiB deployment-wide.
 
 The combined PR #53945 plus staged-lookup prototype is isolated on
 `wzhao/mooncake-eagle-spec-aware`. Completed MLA endpoint windows are 16;
@@ -1032,6 +1033,25 @@ Staged lookup addresses the amplification without stale plans: every retry
 revalidates the required MLA ancestry and selected KDA checkpoint, but no
 longer renews every historical PMU checkpoint.
 
+The retained request traces quantify this reduction. Exhaustive fine-grained
+lookup constructs about 38.43 million KDA namespace candidates at c80 and
+50.83 million at c120. When the newest checkpoint is complete, staged lookup
+constructs only 24 KDA keys per request: 33,960 and 46,248 keys respectively,
+about 1,132x and 1,099x fewer KDA lease touches. An append-only DCP8 regression
+test verifies that this count stays exactly 24 across increasing prompt lengths
+even when all historical checkpoints remain present.
+
+A 10-second lease can still retain more than one recently selected checkpoint
+per active session. Sliding a 10-second window over the retained traces gives a
+conservative maximum of 130 arrivals at c80 and 189 at c120. If every arrival
+selected a distinct KDA boundary, those checkpoints would occupy at most
+56.9 GiB and 82.7 GiB respectively. The actual value is lower because first
+turns have no predecessor and retries often renew the same key. Nevertheless,
+the c120 upper bound plus approximately 320 GiB of MLA state is 402.7 GiB. The
+432 GiB high-water capacity test therefore leaves only about 29 GiB for
+placement skew and in-flight saves; it is a meaningful rather than oversized
+capacity gate.
+
 Per-request staged diagnostics are isolated on
 `wzhao/mooncake-eagle-spec-aware-diagnostic` at `8e55ef62e7`. The diagnostic
 records the actual reconciled hit, each manager frontier, every queried rank
@@ -1055,3 +1075,38 @@ therefore classify a missing boundary as not yet published, previously stored
 but absent, incomplete across rank namespaces, or present but rejected by the
 hybrid/EAGLE reconciliation rules. The Mooncake worker suite passes 160 tests
 with the save timeline included.
+
+### Constrained-capacity validation gate
+
+The one-hour experimental lease was removed from the submission path. The
+`srt-slurm` commit `c49c40c` restores the original 10-second read lease. This
+does not delete old values immediately, but it allows checkpoints that the
+staged lookup no longer touches to participate in normal LRU eviction.
+
+Two capacity recipes are prepared, but must not be submitted until the c16
+staged-lookup canary succeeds:
+
+- `kimi-k3-mxfp4-dcp8-dep16-pr53945-staged-lookup-capacity480gb-c80.yaml`
+- `kimi-k3-mxfp4-dcp8-dep16-pr53945-staged-lookup-capacity480gb-c120.yaml`
+
+Mooncake parses the `20GB` setting using binary units. Both recipes therefore
+use a 20 GiB global segment on each of the 24 registered ranks: 480 GiB
+deployment-wide, or about 432 GiB below Mooncake's 0.9 high watermark. This is
+intentionally close to the modeled approximately 373 GiB live set while leaving
+headroom for placement skew and in-flight saves. Both recipes pass YAML loading
+and `srtctl dry-run` validation.
+
+Promotion requires more than a successful benchmark. For each request, the
+trace must show whether any deficit beyond one 128-token PMU comes from a prior
+turn whose required boundary was not yet published, a previously stored key
+that became absent, an incomplete DCP rank/group set, or reconciliation logic.
+The constrained c80 and c120 runs must retain the c16 PR #53945 hit behavior
+without store failures and without exhaustive historical KDA lease renewal.
+
+An independent save-publication prototype is checkpointed at `b464b40627` on
+`wzhao/mooncake-priority-boundary-save`. It admits jobs carrying the final
+prompt-boundary checkpoint before bulk-only saves while preserving FIFO order
+within each class. Reordered older jobs cannot regress the persisted high-water
+mark. All 162 Mooncake worker tests pass. This remains experimental until the
+save timeline proves queue delay is a material source of misses and an end-to-
+end comparison demonstrates recovery.
