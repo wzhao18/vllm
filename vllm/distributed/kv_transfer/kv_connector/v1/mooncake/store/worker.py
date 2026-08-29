@@ -71,6 +71,7 @@ from vllm.v1.core.kv_cache_utils import (
     resolve_kv_cache_block_sizes,
 )
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
@@ -80,7 +81,6 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
     group_kernel_blocks,
 )
-
 from .metrics import MooncakeStoreConnectorStats
 
 logger = init_logger(__name__)
@@ -90,6 +90,7 @@ DEFAULT_LOCAL_BUFFER_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
 DEFAULT_TENANT_ID = "default"
 
 MOONCAKE_NO_AVAILABLE_HANDLE = -200
+MOONCAKE_COMPACT_GROUP_IO_FORMAT = "compact-group-io-v1"
 _T = TypeVar("_T")
 
 
@@ -111,6 +112,93 @@ def _make_mooncake_group_id(metadata: KeyMetadata, chunk_hash: str) -> str:
     # a prefix chunk, so shard dimensions stay only in the object key.
     prefix = f"{metadata.cache_prefix}@" if metadata.cache_prefix else ""
     return f"vllm-mooncake-store:{prefix}{metadata.model_name}@{chunk_hash}"
+
+
+def _compact_group_io_cache_prefix(cache_prefix: str, layout_name: str) -> str:
+    value_format = f"{MOONCAKE_COMPACT_GROUP_IO_FORMAT}-{layout_name.lower()}"
+    if cache_prefix:
+        return f"{cache_prefix}|{value_format}"
+    return value_format
+
+
+def _group_layer_spec(group: KVCacheGroupSpec, layer_name: str) -> KVCacheSpec:
+    spec = group.kv_cache_spec
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        return spec.kv_cache_specs[layer_name]
+    return spec
+
+
+def _unpadded_page_size(spec: KVCacheSpec) -> int:
+    if isinstance(spec, AttentionSpec):
+        return spec.unpadded_page_size_bytes
+    if isinstance(spec, MambaSpec):
+        return dataclasses.replace(spec, page_size_padded=None).page_size_bytes
+    raise ValueError(f"Compact Mooncake I/O does not support {type(spec).__name__}")
+
+
+def _compact_regions_for_group(
+    group: KVCacheGroupSpec,
+    kv_caches: dict[str, torch.Tensor],
+    num_blocks: int,
+) -> tuple[list[int], list[int], list[int]]:
+    base_addrs: list[int] = []
+    block_strides: list[int] = []
+    transfer_lens: list[int] = []
+    seen: set[tuple[int, int, int]] = set()
+
+    def add_region(base_addr: int, block_stride: int, transfer_len: int) -> None:
+        if transfer_len > block_stride:
+            raise ValueError(
+                "Compact Mooncake transfer length exceeds its block stride: "
+                f"length={transfer_len}, stride={block_stride}"
+            )
+        region = (base_addr, block_stride, transfer_len)
+        if region in seen:
+            return
+        seen.add(region)
+        base_addrs.append(base_addr)
+        block_strides.append(block_stride)
+        transfer_lens.append(transfer_len)
+
+    for layer_name in group.layer_names:
+        cache = kv_caches.get(layer_name)
+        if cache is None:
+            raise ValueError(
+                f"KV cache group layer {layer_name!r} has no registered tensor"
+            )
+        cache = group_kernel_blocks(cache, num_blocks)
+        spec = _group_layer_spec(group, layer_name)
+        transfer_len = _unpadded_page_size(spec)
+        element_size = cache.element_size()
+        if is_non_overlapping_and_dense(cache[0]):
+            add_region(
+                cache.data_ptr(),
+                cache.stride(0) * element_size,
+                transfer_len,
+            )
+            continue
+
+        num_head_regions = cache.shape[1]
+        if transfer_len % num_head_regions:
+            raise ValueError(
+                "Compact Mooncake page cannot be divided across head regions: "
+                f"page={transfer_len}, heads={num_head_regions}"
+            )
+        head_transfer_len = transfer_len // num_head_regions
+        for head_idx in range(num_head_regions):
+            head_cache = cache[:, head_idx]
+            if not is_non_overlapping_and_dense(head_cache[0]):
+                raise ValueError(
+                    "Compact Mooncake I/O only supports one scattered head "
+                    "dimension"
+                )
+            add_region(
+                head_cache.data_ptr(),
+                head_cache.stride(0) * element_size,
+                head_transfer_len,
+            )
+
+    return base_addrs, block_strides, transfer_lens
 
 
 # Mirrors FileStorageConfig::local_buffer_size in Mooncake C++.
@@ -1425,6 +1513,15 @@ class MooncakeStoreWorker:
         assert kv_role is not None
         self.kv_role = kv_role
         extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
+        self.compact_group_io = (
+            str(extra_config.get("compact_group_io", "False")).strip().lower()
+            == "true"
+        )
+        self.kv_cache_layout = (
+            vllm_config.cache_config.get_resolved_kv_cache_layout()
+            if self.compact_group_io
+            else None
+        )
         self.can_put = self.kv_role in ("kv_producer", "kv_both") or (
             extra_config.get("save_decode_cache", False)
         )
@@ -1591,17 +1688,19 @@ class MooncakeStoreWorker:
         # key namespace is its TP shard id: ranks holding identical bytes
         # (MLA / shared GQA KV heads) share a namespace, TP-sharded Mamba
         # state gets one namespace per rank.
+        cache_prefix = str(extra_config.get("cache_prefix", ""))
+        if self.compact_group_io:
+            assert self.kv_cache_layout is not None
+            cache_prefix = _compact_group_io_cache_prefix(
+                cache_prefix, self.kv_cache_layout.name
+            )
         metadata = KeyMetadata(
             model_name=model_config.model.rstrip("/").split("/")[-1],
             tp_rank=self.tp_rank,
             pcp_rank=self.pcp_rank,
             dcp_rank=self.dcp_rank,
             pp_rank=self.pp_rank,
-            cache_prefix=str(
-                vllm_config.kv_transfer_config.kv_connector_extra_config.get(
-                    "cache_prefix", ""
-                )
-            ),
+            cache_prefix=cache_prefix,
         )
         self._group_tp_replication_factors: tuple[int, ...] = (
             self._compute_group_tp_replication_factors()
@@ -1697,6 +1796,20 @@ class MooncakeStoreWorker:
         assert self.cache_config.num_gpu_blocks is not None
         self.num_blocks = self.cache_config.num_gpu_blocks
 
+        if self.compact_group_io and (
+            self.kv_cache_layout is None
+            or not self.kv_cache_layout.is_layer_compact
+        ):
+            layout_name = (
+                self.kv_cache_layout.name
+                if self.kv_cache_layout is not None
+                else "unknown"
+            )
+            raise ValueError(
+                "Compact Mooncake group I/O currently requires a layer-compact "
+                f"KV cache layout, got {layout_name}"
+            )
+
         seen_storage_ptrs: set[int] = set()
         seen_region_ptrs: set[int] = set()
         addrs: list[int] = []
@@ -1758,9 +1871,31 @@ class MooncakeStoreWorker:
             self.num_blocks,
         )
 
-        for db in self.token_dbs:
-            db.set_kv_caches_base_addr(addrs)
-            db.set_block_len(block_lens)
+        if self.compact_group_io:
+            region_counts = []
+            value_sizes = []
+            for group, db in zip(
+                self._kv_cache_config.kv_cache_groups,
+                self.token_dbs,
+                strict=True,
+            ):
+                group_addrs, group_strides, group_lens = (
+                    _compact_regions_for_group(group, kv_caches, self.num_blocks)
+                )
+                db.set_kv_cache_regions(group_addrs, group_strides, group_lens)
+                region_counts.append(len(group_addrs))
+                value_sizes.append(sum(group_lens))
+            logger.info(
+                "Compact Mooncake group I/O enabled: format=%s, "
+                "regions_per_group=%s, bytes_per_value=%s",
+                MOONCAKE_COMPACT_GROUP_IO_FORMAT,
+                region_counts,
+                value_sizes,
+            )
+        else:
+            for db in self.token_dbs:
+                db.set_kv_caches_base_addr(addrs)
+                db.set_block_len(block_lens)
 
         # Start transfer threads
         if self.can_put:

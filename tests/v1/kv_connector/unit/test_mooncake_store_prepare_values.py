@@ -88,3 +88,34 @@ def test_prepare_values_rejects_unaligned_chunk():
     db = _make_db(4, 4)
     with pytest.raises(AssertionError):
         db.prepare_values([(0, BLOCK_SIZE + 1)], [0, 1])
+
+
+def test_prepare_values_separates_block_stride_from_transfer_length():
+    db = ChunkedTokenDatabase(
+        KeyMetadata(model_name="t", tp_rank=0, pcp_rank=0, dcp_rank=0, pp_rank=0),
+        BLOCK_SIZE,
+    )
+    db.set_kv_cache_regions(
+        base_addrs=[0x1000, 0x8000],
+        block_strides=[0x100, 0x200],
+        transfer_lens=[0xC0, 0x180],
+    )
+
+    addrs, sizes, block_ids = db.prepare_values(
+        [(0, 2 * BLOCK_SIZE)], [3, 4]
+    )
+
+    assert block_ids == [3]
+    assert addrs == [[0x1300, 0x8600, 0x1400, 0x8800]]
+    assert sizes == [[0xC0, 0x180, 0xC0, 0x180]]
+
+
+def test_set_kv_cache_regions_rejects_invalid_geometry():
+    db = ChunkedTokenDatabase(
+        KeyMetadata(model_name="t", tp_rank=0, pcp_rank=0, dcp_rank=0, pp_rank=0),
+        BLOCK_SIZE,
+    )
+    with pytest.raises(ValueError, match="lengths must match"):
+        db.set_kv_cache_regions([0x1000], [256, 256], [128])
+    with pytest.raises(ValueError, match="cannot exceed"):
+        db.set_kv_cache_regions([0x1000], [128], [256])

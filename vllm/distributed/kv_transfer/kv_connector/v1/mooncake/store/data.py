@@ -184,6 +184,7 @@ class ChunkedTokenDatabase:
             )
         self.kv_caches_base_addr: list[int] = []
         self.block_len: list[int] = []
+        self.block_stride: list[int] = []
         self._key_prefix = PoolKey.build_prefix(metadata)
 
     def key_for(self, chunk_hash: BlockHash) -> str:
@@ -194,6 +195,26 @@ class ChunkedTokenDatabase:
 
     def set_block_len(self, block_len: list[int]):
         self.block_len = block_len
+        self.block_stride = block_len
+
+    def set_kv_cache_regions(
+        self,
+        base_addrs: list[int],
+        block_strides: list[int],
+        transfer_lens: list[int],
+    ) -> None:
+        if not (len(base_addrs) == len(block_strides) == len(transfer_lens)):
+            raise ValueError("KV cache region metadata lengths must match")
+        if any(length <= 0 for length in (*block_strides, *transfer_lens)):
+            raise ValueError("KV cache region strides and lengths must be positive")
+        if any(
+            length > stride
+            for stride, length in zip(block_strides, transfer_lens, strict=True)
+        ):
+            raise ValueError("KV cache transfer length cannot exceed block stride")
+        self.kv_caches_base_addr = base_addrs
+        self.block_stride = block_strides
+        self.block_len = transfer_lens
 
     def prepare_value(
         self, start: int, end: int, block_ids: list[int]
@@ -226,6 +247,13 @@ class ChunkedTokenDatabase:
             [self.block_len[i % length] for i in range(base.shape[0])],
             dtype=np.int64,
         )
+        strides = np.asarray(
+            [
+                self.block_stride[i % len(self.block_stride)]
+                for i in range(base.shape[0])
+            ],
+            dtype=np.int64,
+        )
         n = len(chunks)
         starts = np.fromiter((c[0] for c in chunks), dtype=np.int64, count=n)
         spans = np.fromiter((c[1] for c in chunks), dtype=np.int64, count=n) - starts
@@ -235,10 +263,24 @@ class ChunkedTokenDatabase:
             dtype=np.int64,
             count=n,
         )
-        addrs = base[None, :] + bids[:, None] * blen[None, :]
+        addrs = base[None, :] + bids[:, None] * strides[None, :]
         block_counts = (spans + self.block_size - 1) // self.block_size
-        sizes = blen[None, :] * block_counts[:, None]
-        return addrs.tolist(), sizes.tolist(), bids.tolist()
+        if np.array_equal(strides, blen):
+            sizes = blen[None, :] * block_counts[:, None]
+            return addrs.tolist(), sizes.tolist(), bids.tolist()
+
+        addr_lists: list[list[int]] = []
+        size_lists: list[list[int]] = []
+        for row, count in zip(addrs, block_counts.tolist(), strict=True):
+            addr_lists.append(
+                [
+                    int(addr + block_offset * stride)
+                    for block_offset in range(count)
+                    for addr, stride in zip(row, strides, strict=True)
+                ]
+            )
+            size_lists.append([int(size) for _ in range(count) for size in blen])
+        return addr_lists, size_lists, bids.tolist()
 
     def prepare_value_for_block(self, block_id: int) -> tuple[list[int], list[int]]:
         """Return addresses and sizes for one physical block slot."""
@@ -246,7 +288,7 @@ class ChunkedTokenDatabase:
         size_list = []
         length = len(self.block_len)
         for index, base_addr in enumerate(self.kv_caches_base_addr):
-            addr = base_addr + block_id * self.block_len[index % length]
+            addr = base_addr + block_id * self.block_stride[index % length]
             addr_list.append(addr)
             size_list.append(self.block_len[index % length])
         return addr_list, size_list
