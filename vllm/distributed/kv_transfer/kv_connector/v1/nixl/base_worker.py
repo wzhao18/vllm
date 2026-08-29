@@ -830,7 +830,7 @@ class NixlBaseConnectorWorker:
         self._handshake_futures: dict[
             EngineId, Future[tuple[dict[tuple[int, int], str], float]]
         ] = {}
-        # Protects _handshake_futures and _remote_agents.
+        # Protects handshake and remote-engine lifecycle state.
         self._handshake_lock = threading.RLock()
 
         # TTL-based eviction of stale remote engine state.
@@ -1269,9 +1269,10 @@ class NixlBaseConnectorWorker:
         returned future.
         Failures to handshake are logged and the request is marked as failed.
         """
-        self._evict_stale_engines()
         with self._handshake_lock:
+            self._evict_stale_engines()
             if engine_id in self._remote_agents:
+                self._engine_last_active[engine_id] = time.perf_counter()
                 return None
             fut = self._handshake_futures.get(engine_id)
             if fut is not None:
@@ -3475,10 +3476,11 @@ class NixlBaseConnectorWorker:
             return
 
         now = time.perf_counter()
-        busy = self._engines_with_inflight_transfers()
-        for eid, last_active in list(self._engine_last_active.items()):
-            if now - last_active > self._engine_ttl and eid not in busy:
-                self._cleanup_remote_engine(eid)
+        with self._handshake_lock:
+            busy = self._engines_with_inflight_transfers()
+            for eid, last_active in list(self._engine_last_active.items()):
+                if now - last_active > self._engine_ttl and eid not in busy:
+                    self._cleanup_remote_engine(eid)
 
     def _engines_with_inflight_transfers(self) -> set[EngineId]:
         """Remote engines a transfer is still reading from.
@@ -3503,32 +3505,32 @@ class NixlBaseConnectorWorker:
         all per-engine data structures. Used by both TTL eviction and
         shutdown.
         """
-        assert engine_id in self._remote_agents
-
-        # Notif-only engines (push-mode D side) have no descriptor state.
-        for handle in self.dst_xfer_side_handles.pop(engine_id, {}).values():
-            self.nixl_wrapper.release_dlist_handle(handle)
-        # Pop under the handshake lock; NIXL teardown stays outside it.
         with self._handshake_lock:
-            agents = self._remote_agents.pop(engine_id)
-        for agent_name in agents.values():
-            self.nixl_wrapper.remove_remote_agent(agent_name)
+            remote_agents = self._remote_agents.pop(engine_id, None)
+            if remote_agents is None:
+                self._engine_clock_offset.pop(engine_id, None)
+                self._engine_last_active.pop(engine_id, None)
+                return
 
-        self.kv_caches_base_addr.pop(engine_id, None)
-        self.dst_num_blocks.pop(engine_id, None)
-        self.dst_region_num_blocks.pop(engine_id, None)
-        self.dst_region_group_ids.pop(engine_id, None)
-        self.dst_uses_region_group_mapping.pop(engine_id, None)
-        self.dst_region_mem_types.pop(engine_id, None)
-        self.tp_mappings.pop(engine_id, None)
-        if self.transfer_topo is not None:
-            self.transfer_topo.unregister_remote_engine(engine_id)
+            # Notif-only engines (push-mode D side) have no descriptor state.
+            for handle in self.dst_xfer_side_handles.pop(engine_id, {}).values():
+                self.nixl_wrapper.release_dlist_handle(handle)
+            for agent_name in remote_agents.values():
+                self.nixl_wrapper.remove_remote_agent(agent_name)
 
-        # Drop the cached clock offset; it is re-measured on the next handshake.
-        self._engine_clock_offset.pop(engine_id, None)
-        # A just-completed handshake may not have recorded activity yet, so
-        # tolerate a missing entry.
-        last_active = self._engine_last_active.pop(engine_id, None)
+            self.kv_caches_base_addr.pop(engine_id, None)
+            self.dst_num_blocks.pop(engine_id, None)
+            self.dst_region_num_blocks.pop(engine_id, None)
+            self.dst_region_group_ids.pop(engine_id, None)
+            self.dst_uses_region_group_mapping.pop(engine_id, None)
+            self.dst_region_mem_types.pop(engine_id, None)
+            self.tp_mappings.pop(engine_id, None)
+            if self.transfer_topo is not None:
+                self.transfer_topo.unregister_remote_engine(engine_id)
+
+            # Drop cached timing state; it is rebuilt on the next handshake.
+            self._engine_clock_offset.pop(engine_id, None)
+            last_active = self._engine_last_active.pop(engine_id, None)
         if log_eviction and last_active is not None:
             logger.info(
                 "Evicted stale remote engine %s (inactive for %.1fs).",
