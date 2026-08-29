@@ -25,7 +25,7 @@ import queue
 import threading
 import time
 from collections import defaultdict
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -908,6 +908,65 @@ def test_cleanup_remote_engine_pops_under_handshake_lock():
     t.join(timeout=2.0)
     assert "D-old" not in w._remote_agents
     w.nixl_wrapper.remove_remote_agent.assert_called_once_with("agent-D-old")
+
+
+def test_remote_engine_cleanup_is_concurrent_and_idempotent():
+    w = _eviction_worker(engine_ttl=30.0)
+    engine_id = "prefill-engine"
+    w._remote_agents[engine_id] = {
+        (0, 0): "agent-0",
+        (0, 1): "agent-1",
+    }
+    w.dst_xfer_side_handles[engine_id] = {0: 100, 1: 200}
+    w._engine_last_active[engine_id] = time.perf_counter()
+    w.transfer_topo = MagicMock()
+    barrier = threading.Barrier(8)
+    errors: list[BaseException] = []
+
+    def cleanup() -> None:
+        barrier.wait()
+        try:
+            w._cleanup_remote_engine(engine_id)
+        except BaseException as error:
+            errors.append(error)
+
+    threads = [threading.Thread(target=cleanup) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not errors
+    assert w.nixl_wrapper.release_dlist_handle.call_count == 2
+    assert w.nixl_wrapper.remove_remote_agent.call_count == 2
+    w.transfer_topo.unregister_remote_engine.assert_called_once_with(engine_id)
+
+
+def test_registration_survives_stale_engine_rehandshake():
+    """TTL cleanup followed by a handshake must retain the registration."""
+    w = _eviction_worker(engine_ttl=30.0)
+    engine_id = "prefill-engine"
+    old_agent = "old-agent"
+    new_agent = "new-agent"
+    w._remote_agents[engine_id] = {(0, 0): old_agent}
+    w._engine_last_active[engine_id] = time.perf_counter() - 10_000.0
+    w._handshake_futures = {}
+    w._handshake_initiation_executor = ThreadPoolExecutor(max_workers=1)
+    w._nixl_handshake = MagicMock(return_value=({(0, 0): new_agent}, 0.0))
+    w._do_send_reg_notif = MagicMock()
+
+    registration = _registration_data("req")
+    try:
+        w._send_registration_to_p("req", registration)
+        retried_id, retried_registration = w._reg_send_inbox.get(timeout=2.0)
+        w._send_registration_to_p(retried_id, retried_registration)
+    finally:
+        w._handshake_initiation_executor.shutdown()
+        del w._handshake_initiation_executor
+
+    w.nixl_wrapper.remove_remote_agent.assert_called_once_with(old_agent)
+    w._do_send_reg_notif.assert_called_once_with("req", registration)
+    assert w._remote_agents[engine_id] == {(0, 0): new_agent}
 
 
 class TestPushWriterNotifs:
