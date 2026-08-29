@@ -185,6 +185,7 @@ class ChunkedTokenDatabase:
         self.kv_caches_base_addr: list[int] = []
         self.block_len: list[int] = []
         self.block_stride: list[int] = []
+        self._compact_regions = False
         self._key_prefix = PoolKey.build_prefix(metadata)
 
     def key_for(self, chunk_hash: BlockHash) -> str:
@@ -196,6 +197,7 @@ class ChunkedTokenDatabase:
     def set_block_len(self, block_len: list[int]):
         self.block_len = block_len
         self.block_stride = block_len
+        self._compact_regions = False
 
     def set_kv_cache_regions(
         self,
@@ -215,6 +217,7 @@ class ChunkedTokenDatabase:
         self.kv_caches_base_addr = base_addrs
         self.block_stride = block_strides
         self.block_len = transfer_lens
+        self._compact_regions = True
 
     def prepare_value(
         self, start: int, end: int, block_ids: list[int]
@@ -258,25 +261,44 @@ class ChunkedTokenDatabase:
         starts = np.fromiter((c[0] for c in chunks), dtype=np.int64, count=n)
         spans = np.fromiter((c[1] for c in chunks), dtype=np.int64, count=n) - starts
         assert not (spans % self.hash_block_size).any()
+        block_indices = starts // self.block_size
         bids = np.fromiter(
-            (block_ids[i] for i in (starts // self.block_size).tolist()),
+            (block_ids[i] for i in block_indices.tolist()),
             dtype=np.int64,
             count=n,
         )
-        addrs = base[None, :] + bids[:, None] * strides[None, :]
         block_counts = (spans + self.block_size - 1) // self.block_size
-        if np.array_equal(strides, blen):
-            sizes = blen[None, :] * block_counts[:, None]
-            return addrs.tolist(), sizes.tolist(), bids.tolist()
-
+        if self._compact_regions and (block_counts > 1).any():
+            raise ValueError(
+                "Compact Mooncake values must span exactly one database block"
+            )
         addr_lists: list[list[int]] = []
         size_lists: list[list[int]] = []
-        for row, count in zip(addrs, block_counts.tolist(), strict=True):
+        for block_index, count in zip(
+            block_indices.tolist(), block_counts.tolist(), strict=True
+        ):
+            chunk_block_ids = block_ids[block_index : block_index + count]
+            if len(chunk_block_ids) != count:
+                raise ValueError("Token range exceeds the supplied block IDs")
+            consecutive = all(
+                right == left + 1
+                for left, right in zip(chunk_block_ids, chunk_block_ids[1:])
+            )
+            if np.array_equal(strides, blen) and consecutive:
+                first_block_id = chunk_block_ids[0]
+                addr_lists.append(
+                    [
+                        int(addr + first_block_id * stride)
+                        for addr, stride in zip(base, strides, strict=True)
+                    ]
+                )
+                size_lists.append([int(size * count) for size in blen])
+                continue
             addr_lists.append(
                 [
-                    int(addr + block_offset * stride)
-                    for block_offset in range(count)
-                    for addr, stride in zip(row, strides, strict=True)
+                    int(addr + block_id * stride)
+                    for block_id in chunk_block_ids
+                    for addr, stride in zip(base, strides, strict=True)
                 ]
             )
             size_lists.append([int(size) for _ in range(count) for size in blen])

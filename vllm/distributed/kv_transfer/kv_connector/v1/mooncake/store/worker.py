@@ -11,6 +11,7 @@ and MooncakeDistributedStore integration.
 """
 
 import dataclasses
+import hashlib
 import json
 import os
 import queue
@@ -114,8 +115,56 @@ def _make_mooncake_group_id(metadata: KeyMetadata, chunk_hash: str) -> str:
     return f"vllm-mooncake-store:{prefix}{metadata.model_name}@{chunk_hash}"
 
 
-def _compact_group_io_cache_prefix(cache_prefix: str, layout_name: str) -> str:
-    value_format = f"{MOONCAKE_COMPACT_GROUP_IO_FORMAT}-{layout_name.lower()}"
+def _compact_group_io_schema_fingerprint(
+    groups: Sequence[KVCacheGroupSpec],
+    layout_name: str,
+    chunk_block_sizes: Sequence[int],
+    hash_block_size: int,
+) -> str:
+    if len(groups) != len(chunk_block_sizes):
+        raise ValueError("Compact Mooncake schema group metadata lengths must match")
+    schema = []
+    for group, chunk_block_size in zip(groups, chunk_block_sizes, strict=True):
+        layers = []
+        for layer_name in group.layer_names:
+            spec = _group_layer_spec(group, layer_name)
+            layers.append(
+                {
+                    "name": layer_name,
+                    "spec": f"{type(spec).__module__}.{type(spec).__qualname__}",
+                    "block_size": spec.block_size,
+                    "page_size": spec.page_size_bytes,
+                    "unpadded_page_size": _unpadded_page_size(spec),
+                    "state_content_size": spec.state_content_size_bytes,
+                    "num_heads": spec.num_heads,
+                    "dtype": str(getattr(spec, "dtype", None)),
+                    "shapes": getattr(spec, "shapes", None),
+                    "dtypes": [
+                        str(dtype) for dtype in getattr(spec, "dtypes", ())
+                    ],
+                    "page_size_padded": getattr(spec, "page_size_padded", None),
+                }
+            )
+        schema.append({"chunk_block_size": chunk_block_size, "layers": layers})
+    encoded = json.dumps(
+        {
+            "layout": layout_name,
+            "hash_block_size": hash_block_size,
+            "groups": schema,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()[:32]
+
+
+def _compact_group_io_cache_prefix(
+    cache_prefix: str, layout_name: str, schema_fingerprint: str
+) -> str:
+    value_format = (
+        f"{MOONCAKE_COMPACT_GROUP_IO_FORMAT}-{layout_name.lower()}-"
+        f"{schema_fingerprint}"
+    )
     if cache_prefix:
         return f"{cache_prefix}|{value_format}"
     return value_format
@@ -146,6 +195,38 @@ def _compact_regions_for_group(
     transfer_lens: list[int] = []
     seen: set[tuple[int, int, int]] = set()
 
+    def regions_overlap(
+        left: tuple[int, int, int], right: tuple[int, int, int]
+    ) -> bool:
+        left_base, left_stride, left_len = left
+        right_base, right_stride, right_len = right
+        left_end = left_base + (num_blocks - 1) * left_stride + left_len
+        right_end = right_base + (num_blocks - 1) * right_stride + right_len
+        if left_end <= right_base or right_end <= left_base:
+            return False
+        if left_stride == right_stride:
+            delta = right_base - left_base
+            min_offset = (-right_len - delta) // left_stride + 1
+            max_offset = (left_len - delta - 1) // left_stride
+            valid_offset = num_blocks - 1
+            return max(min_offset, -valid_offset) <= min(
+                max_offset, valid_offset
+            )
+        left_idx = right_idx = 0
+        while left_idx < num_blocks and right_idx < num_blocks:
+            left_start = left_base + left_idx * left_stride
+            right_start = right_base + right_idx * right_stride
+            if (
+                left_start < right_start + right_len
+                and right_start < left_start + left_len
+            ):
+                return True
+            if left_start + left_len <= right_start:
+                left_idx += 1
+            else:
+                right_idx += 1
+        return False
+
     def add_region(base_addr: int, block_stride: int, transfer_len: int) -> None:
         if transfer_len > block_stride:
             raise ValueError(
@@ -155,6 +236,12 @@ def _compact_regions_for_group(
         region = (base_addr, block_stride, transfer_len)
         if region in seen:
             return
+        for existing in seen:
+            if regions_overlap(existing, region):
+                raise ValueError(
+                    "Compact Mooncake regions overlap with different geometry: "
+                    f"{existing} and {region}"
+                )
         seen.add(region)
         base_addrs.append(base_addr)
         block_strides.append(block_stride)
@@ -1691,8 +1778,14 @@ class MooncakeStoreWorker:
         cache_prefix = str(extra_config.get("cache_prefix", ""))
         if self.compact_group_io:
             assert self.kv_cache_layout is not None
+            schema_fingerprint = _compact_group_io_schema_fingerprint(
+                kv_cache_config.kv_cache_groups,
+                self.kv_cache_layout.name,
+                [group.kv_cache_spec.block_size for group in self._kv_cache_groups],
+                self.hash_block_size,
+            )
             cache_prefix = _compact_group_io_cache_prefix(
-                cache_prefix, self.kv_cache_layout.name
+                cache_prefix, self.kv_cache_layout.name, schema_fingerprint
             )
         metadata = KeyMetadata(
             model_name=model_config.model.rstrip("/").split("/")[-1],

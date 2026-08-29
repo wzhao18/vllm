@@ -47,6 +47,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheLayout,
     MambaSpec,
+    UniformTypeKVCacheSpecs,
 )
 
 
@@ -3412,17 +3413,84 @@ def test_register_kv_caches_compact_group_regions_rejects_block_outer_layout(
 
 
 def test_compact_group_io_cache_prefix_versions_values():
-    assert (
-        mooncake_store_worker._compact_group_io_cache_prefix("", "LBNHC")
-        == mooncake_store_worker.MOONCAKE_COMPACT_GROUP_IO_FORMAT + "-lbnhc"
+    fingerprint = "0123456789abcdef0123456789abcdef"
+    expected = (
+        mooncake_store_worker.MOONCAKE_COMPACT_GROUP_IO_FORMAT
+        + "-lbnhc-"
+        + fingerprint
     )
     assert mooncake_store_worker._compact_group_io_cache_prefix(
-        "deployment", "LHBNC"
+        "", "LBNHC", fingerprint
+    ) == expected
+    assert mooncake_store_worker._compact_group_io_cache_prefix(
+        "deployment", "LHBNC", fingerprint
     ) == (
         "deployment|"
         + mooncake_store_worker.MOONCAKE_COMPACT_GROUP_IO_FORMAT
-        + "-lhbnc"
+        + "-lhbnc-"
+        + fingerprint
     )
+
+
+def test_compact_group_io_schema_fingerprint_covers_layer_geometry():
+    spec = FullAttentionSpec(
+        block_size=4,
+        num_kv_heads=2,
+        head_size=8,
+        dtype=torch.float16,
+    )
+    group = KVCacheGroupSpec(["layer0"], spec)
+    fingerprint = mooncake_store_worker._compact_group_io_schema_fingerprint(
+        [group], "LBNHC", [32], 4
+    )
+    assert len(fingerprint) == 32
+    assert fingerprint == mooncake_store_worker._compact_group_io_schema_fingerprint(
+        [group], "LBNHC", [32], 4
+    )
+    changed_group = KVCacheGroupSpec(["draft.layer0"], spec)
+    assert fingerprint != mooncake_store_worker._compact_group_io_schema_fingerprint(
+        [changed_group], "LBNHC", [32], 4
+    )
+    same_bytes_different_dtype = FullAttentionSpec(
+        block_size=4,
+        num_kv_heads=2,
+        head_size=4,
+        dtype=torch.float32,
+    )
+    assert fingerprint != mooncake_store_worker._compact_group_io_schema_fingerprint(
+        [KVCacheGroupSpec(["layer0"], same_bytes_different_dtype)],
+        "LBNHC",
+        [32],
+        4,
+    )
+    assert fingerprint != mooncake_store_worker._compact_group_io_schema_fingerprint(
+        [group], "LBNHC", [64], 4
+    )
+    assert fingerprint != mooncake_store_worker._compact_group_io_schema_fingerprint(
+        [group], "LBNHC", [32], 8
+    )
+
+
+def test_compact_group_regions_reject_overlapping_nonidentical_aliases():
+    first = FullAttentionSpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.float16,
+    )
+    second = dataclasses.replace(first, head_size=4)
+    group_spec = UniformTypeKVCacheSpecs(
+        block_size=4,
+        kv_cache_specs={"layer0": first, "layer1": second},
+    )
+    group = KVCacheGroupSpec(["layer0", "layer1"], group_spec)
+    cache = torch.zeros(2, 1, 4, 32, dtype=torch.uint8)
+    with pytest.raises(ValueError, match="overlap with different geometry"):
+        mooncake_store_worker._compact_regions_for_group(
+            group,
+            {"layer0": cache, "layer1": cache},
+            num_blocks=2,
+        )
 
 
 # ---------------------------------------------------------------------------

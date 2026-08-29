@@ -21,14 +21,26 @@ def _reference_prepare_value(
     """Compute a token range with the original scalar implementation."""
     addr_list = []
     size_list = []
-    block_id = block_ids[start // db.block_size]
+    first_block = start // db.block_size
+    block_count = cdiv(end - start, db.block_size)
+    chunk_block_ids = block_ids[first_block : first_block + block_count]
+    block_id = chunk_block_ids[0]
     length = len(db.block_len)
-    for index, base_addr in enumerate(db.kv_caches_base_addr):
-        addr = base_addr + block_id * db.block_len[index % length]
-        assert (end - start) % db.block_size == 0
-        size = db.block_len[index % length] * cdiv(end - start, db.block_size)
-        addr_list.append(addr)
-        size_list.append(size)
+    consecutive = all(
+        right == left + 1
+        for left, right in zip(chunk_block_ids, chunk_block_ids[1:])
+    )
+    if consecutive:
+        for index, base_addr in enumerate(db.kv_caches_base_addr):
+            addr_list.append(base_addr + block_id * db.block_len[index % length])
+            size_list.append(db.block_len[index % length] * block_count)
+    else:
+        for current_block_id in chunk_block_ids:
+            for index, base_addr in enumerate(db.kv_caches_base_addr):
+                addr_list.append(
+                    base_addr + current_block_id * db.block_len[index % length]
+                )
+                size_list.append(db.block_len[index % length])
     return addr_list, size_list, block_id
 
 
@@ -102,12 +114,67 @@ def test_prepare_values_separates_block_stride_from_transfer_length():
     )
 
     addrs, sizes, block_ids = db.prepare_values(
-        [(0, 2 * BLOCK_SIZE)], [3, 4]
+        [(0, BLOCK_SIZE), (BLOCK_SIZE, 2 * BLOCK_SIZE)], [3, 9]
     )
 
-    assert block_ids == [3]
-    assert addrs == [[0x1300, 0x8600, 0x1400, 0x8800]]
-    assert sizes == [[0xC0, 0x180, 0xC0, 0x180]]
+    assert block_ids == [3, 9]
+    assert addrs == [[0x1300, 0x8600], [0x1900, 0x9200]]
+    assert sizes == [[0xC0, 0x180], [0xC0, 0x180]]
+
+
+def test_compact_regions_reject_multiblock_value():
+    db = ChunkedTokenDatabase(
+        KeyMetadata(model_name="t", tp_rank=0, pcp_rank=0, dcp_rank=0, pp_rank=0),
+        BLOCK_SIZE,
+    )
+    db.set_kv_cache_regions(
+        base_addrs=[0x1000],
+        block_strides=[0x100],
+        transfer_lens=[0xC0],
+    )
+    with pytest.raises(ValueError, match="exactly one database block"):
+        db.prepare_values([(0, 2 * BLOCK_SIZE)], [3, 9])
+
+
+def test_compact_regions_round_trip_noncontiguous_blocks_and_preserve_padding():
+    db = ChunkedTokenDatabase(
+        KeyMetadata(model_name="t", tp_rank=0, pcp_rank=0, dcp_rank=0, pp_rank=0),
+        BLOCK_SIZE,
+    )
+    db.set_kv_cache_regions(
+        base_addrs=[0, 0x1000],
+        block_strides=[32, 48],
+        transfer_lens=[24, 40],
+    )
+    source = bytearray(0x2000)
+    for index in range(len(source)):
+        source[index] = index % 251
+    restored = bytearray([0xA5] * len(source))
+
+    addrs, sizes, _ = db.prepare_values(
+        [(0, BLOCK_SIZE), (BLOCK_SIZE, 2 * BLOCK_SIZE)], [5, 1]
+    )
+    value = b"".join(
+        source[addr : addr + size]
+        for chunk_addrs, chunk_sizes in zip(addrs, sizes, strict=True)
+        for addr, size in zip(chunk_addrs, chunk_sizes, strict=True)
+    )
+    offset = 0
+    for chunk_addrs, chunk_sizes in zip(addrs, sizes, strict=True):
+        for addr, size in zip(chunk_addrs, chunk_sizes, strict=True):
+            restored[addr : addr + size] = value[offset : offset + size]
+            offset += size
+
+    for chunk_addrs, chunk_sizes in zip(addrs, sizes, strict=True):
+        for addr, size in zip(chunk_addrs, chunk_sizes, strict=True):
+            assert restored[addr : addr + size] == source[addr : addr + size]
+    for block_id in (5, 1):
+        assert restored[block_id * 32 + 24 : (block_id + 1) * 32] == bytes(
+            [0xA5] * 8
+        )
+        assert restored[
+            0x1000 + block_id * 48 + 40 : 0x1000 + (block_id + 1) * 48
+        ] == bytes([0xA5] * 8)
 
 
 def test_set_kv_cache_regions_rejects_invalid_geometry():
