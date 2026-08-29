@@ -719,6 +719,78 @@ def test_full_external_hit_keeps_kvpool_cached_tokens_block_aligned():
     assert load_spec.kvpool_cached_tokens % 16 == 0
 
 
+def test_pending_external_hit_is_reused_until_allocation():
+    scheduler = _make_bare_scheduler()
+    scheduler.load_async = True
+    scheduler.client = _StubLookupClient(hit_tokens=32)
+
+    request = SimpleNamespace(
+        request_id="req-0",
+        num_tokens=48,
+        block_hashes=[b"h0", b"h1", b"h2"],
+    )
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (32, True)
+    assert scheduler.get_num_new_matched_tokens(request, 16) == (16, True)
+
+    assert scheduler.client.num_tokens == [48]
+    load_spec = scheduler.load_specs["req-0"]
+    assert load_spec.vllm_cached_tokens == 16
+    assert load_spec.kvpool_cached_tokens == 32
+
+
+def test_pending_external_hit_covered_by_local_cache_is_discarded():
+    scheduler = _make_bare_scheduler()
+    scheduler.load_async = True
+    scheduler.client = _StubLookupClient(hit_tokens=32)
+
+    request = SimpleNamespace(
+        request_id="req-0",
+        num_tokens=48,
+        block_hashes=[b"h0", b"h1", b"h2"],
+    )
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (32, True)
+    assert scheduler.get_num_new_matched_tokens(request, 32) == (0, False)
+
+    assert scheduler.client.num_tokens == [48]
+    assert "req-0" not in scheduler.load_specs
+
+
+class _SequenceLookupClient:
+    def __init__(self, hit_tokens: list[int]) -> None:
+        self._hit_tokens = iter(hit_tokens)
+        self.num_calls = 0
+
+    def lookup(
+        self,
+        req_id: str,
+        num_tokens: int,
+        block_hashes: list[bytes],
+        non_block: bool = False,
+    ) -> MooncakeLookupResult:
+        self.num_calls += 1
+        return MooncakeLookupResult(next(self._hit_tokens))
+
+
+def test_zero_external_hit_is_retried_until_cache_is_published():
+    scheduler = _make_bare_scheduler()
+    scheduler.load_async = True
+    scheduler.client = _SequenceLookupClient([0, 32])
+
+    request = SimpleNamespace(
+        request_id="req-0",
+        num_tokens=48,
+        block_hashes=[b"h0", b"h1", b"h2"],
+    )
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (32, True)
+
+    assert scheduler.client.num_calls == 2
+    assert scheduler.load_specs["req-0"].kvpool_cached_tokens == 32
+
+
 def test_full_external_hit_with_full_local_hit_skips_load():
     # When local prefix cache already covers the block-aligned external hit,
     # there is nothing for the connector to load. The pre-fix behavior would

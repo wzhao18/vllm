@@ -116,6 +116,17 @@ class MooncakeStoreScheduler:
         if request.num_tokens < align:
             return 0, False
 
+        load_spec = self.load_specs.get(request.request_id)
+        if load_spec is not None and not load_spec.can_load:
+            need_to_allocate = (
+                load_spec.kvpool_cached_tokens - num_computed_tokens
+            )
+            if need_to_allocate <= 0:
+                self.load_specs.pop(request.request_id)
+                return 0, False
+            load_spec.vllm_cached_tokens = num_computed_tokens
+            return need_to_allocate, self.load_async
+
         lookup_result = self.client.lookup(
             request.request_id,
             request.num_tokens,
