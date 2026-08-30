@@ -715,6 +715,32 @@ def resolve_kv_cache_block_sizes(
     return scheduler_block_size, hash_block_size
 
 
+def replay_boundary(
+    num_prompt_tokens: int, scheduler_block_size: int, use_eagle: bool
+) -> int:
+    """Return the position a later request replaying this prompt resumes at.
+
+    A cache hit is the shortest hit across all groups, so this is a model-level
+    position: every group has to retain state here, whether or not it is the
+    group that drops. Groups differ only in how much they keep around it --
+    EAGLE groups also keep the block above, which they match and drop back from
+    (see ``reachable_block_mask``).
+
+    Under EAGLE that block must exist, so the boundary sits one alignment unit
+    below the prompt's last aligned position; every group's block size divides
+    the alignment, so the block above always fits in the prompt.
+
+    Shared by the engine (``KVCacheCoordinator.get_replay_boundary``) and by
+    external stores (``MooncakeStoreCoordinator.get_replay_boundary``). A store
+    that retains at a different position than the engine resumes at keeps state
+    where nothing can reach it, so the two must not drift apart.
+    """
+    if not use_eagle:
+        return num_prompt_tokens - 1
+    aligned = num_prompt_tokens // scheduler_block_size * scheduler_block_size
+    return max(aligned - scheduler_block_size, 0)
+
+
 def get_request_block_hasher(
     hash_block_size: int,
     caching_hash_fn: Callable[[Any], bytes],

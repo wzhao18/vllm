@@ -107,7 +107,6 @@ class SingleTypeKVCacheManager(ABC):
         # aligned segment (SWA). Initialized lazily by the coordinator after
         # determining the attention groups.
         self.use_eagle = False
-
         # Partial-hit copy-on-write bookkeeping. Populated only by fine-grained
         # managers (full attention, mamba "align"); harmlessly empty elsewhere.
         self._partial_hit_reqs: dict[str, tuple[int, KVCacheBlock]] = {}
@@ -426,6 +425,8 @@ class SingleTypeKVCacheManager(ABC):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        *,
+        replay_boundary: int,
     ) -> None:
         """
         Cache the blocks for the request.
@@ -448,7 +449,7 @@ class SingleTypeKVCacheManager(ABC):
         # Token boundaries whose reachable tail must be retained under sparse
         # retention: the replay boundary (``num_prompt - 1``, capped by
         # ``get_computed_blocks``) and any detected shared-prefix junction.
-        reachable_boundaries = [request.num_prompt_tokens - 1]
+        reachable_boundaries = [replay_boundary]
         if request.shared_prefix_boundary:
             reachable_boundaries.append(request.shared_prefix_boundary)
 
@@ -783,8 +784,15 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        *,
+        replay_boundary: int,
     ) -> None:
-        super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
+        super().cache_blocks(
+            request,
+            num_tokens,
+            retention_interval=retention_interval,
+            replay_boundary=replay_boundary,
+        )
         hash_block_size = self.block_pool.hash_block_size
         if self.block_size == hash_block_size:
             return
@@ -1712,9 +1720,16 @@ class MambaManager(SingleTypeKVCacheManager):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        *,
+        replay_boundary: int,
     ) -> None:
         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
-        super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
+        super().cache_blocks(
+            request,
+            num_tokens,
+            retention_interval=retention_interval,
+            replay_boundary=replay_boundary,
+        )
         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
         if self.mamba_cache_mode == "align":
             partial_hash = self._cache_partial_tail_block(request, num_tokens)
@@ -1750,7 +1765,40 @@ class MambaManager(SingleTypeKVCacheManager):
         latest_prompt_hash_boundary = (
             request.num_prompt_tokens // hash_block_size
         ) * hash_block_size
-        if num_tokens != latest_prompt_hash_boundary:
+        if self.use_eagle:
+            # Eagle groups match one hash unit past the candidate and drop it,
+            # so register the tail one unit lower.
+            latest_prompt_hash_boundary = max(
+                latest_prompt_hash_boundary - hash_block_size, 0
+            )
+        # When the shared prefix ends BEFORE this prompt's tail -- a system
+        # prompt followed by a per-request suffix -- a sibling's match stops at
+        # the last shared block boundary and eagle drops one unit below that.
+        # The tail position above is over this request's own suffix and cannot
+        # serve it, so accept the block-grid resume point too. Prompt only:
+        # during decode the target is the running state block, mutated in place
+        # and only equal to what its key promises after that step's forward.
+        block_grid_resume_point = (
+            self.use_eagle
+            and num_tokens <= request.num_prompt_tokens
+            and (num_tokens + hash_block_size) % self.block_size == 0
+        )
+        # A junction is a position a sibling was observed resuming from, so the
+        # scheduler already split the chunk here (`scheduler.py:474`). Register
+        # the state it stopped for, otherwise the split costs a forward pass and
+        # buys nothing -- and having replaced the block-boundary stop, it leaves
+        # less cached than block-flooring would have. Prompt only, for the same
+        # reason as the block-grid clause.
+        junction_resume_point = (
+            self.use_eagle
+            and num_tokens <= request.num_prompt_tokens
+            and num_tokens == request.shared_prefix_boundary
+        )
+        if (
+            num_tokens != latest_prompt_hash_boundary
+            and not block_grid_resume_point
+            and not junction_resume_point
+        ):
             return None
 
         block_idx = num_tokens // self.block_size
@@ -1807,6 +1855,8 @@ class CrossAttentionManager(SingleTypeKVCacheManager):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        *,
+        replay_boundary: int,
     ) -> None:
         # We do not cache blocks for cross-attention to be shared between
         # requests, so this method is not relevant.

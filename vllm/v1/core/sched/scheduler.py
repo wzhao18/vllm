@@ -442,6 +442,18 @@ class Scheduler(SchedulerInterface):
             if self.mamba_partial_cache_hit
             else 0
         )
+        if tail_boundary and self.use_eagle:
+            # Eagle matches one hash unit past the candidate and drops it, so
+            # nothing proves the prompt's own last hash boundary. Materialize
+            # the state one unit lower, where the hit can actually land.
+            tail_boundary = max(tail_boundary - self.hash_block_size, 0)
+        junction = request.shared_prefix_boundary
+        if self.mamba_partial_cache_hit and self.use_eagle:
+            junction_stop = junction // self.hash_block_size * self.hash_block_size
+            if junction_stop > request.num_prompt_tokens:
+                junction_stop = 0
+        else:
+            junction_stop = start + (junction - start) // block_size * block_size
         stops = (
             # Same invariant: a chunk starting mid-block stops at the boundary
             # rather than running past it.
@@ -453,12 +465,13 @@ class Scheduler(SchedulerInterface):
             tail_boundary
             if last_cache_position < tail_boundary < request.num_prompt_tokens
             else 0,
-            # Marconi shared-prefix junction, block-floored (a sub-block
-            # junction's state is not separately cacheable): cache its state
-            # so sibling requests sharing the prefix can reuse it.
-            start + (request.shared_prefix_boundary - start) // block_size * block_size
-            if start < request.shared_prefix_boundary < end
-            else 0,
+            # Marconi shared-prefix junction. Under eagle the sibling resumes
+            # one hash unit below the boundary full attention matched, which is
+            # not on the block grid, so floor to the hash grid instead -- block
+            # flooring rounds the resume point away. Prompt only: the tail entry
+            # is registered during the prompt, so a junction past it would split
+            # the chunk for a check-point that is never written.
+            junction_stop if start < request.shared_prefix_boundary < end else 0,
         )
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)
