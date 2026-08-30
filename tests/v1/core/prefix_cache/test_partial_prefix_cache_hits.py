@@ -808,9 +808,8 @@ def test_partial_tail_offload_dropped_when_request_freed_before_drain():
     assert manager.take_partial_tail_offloads() == {}
 
 
-def test_take_partial_tail_offloads_empty_without_partial_tail():
-    """A prompt ending on a block boundary registers no partial tail, so there
-    is nothing to offload."""
+def test_take_partial_tail_offloads_includes_full_recurrent_boundary():
+    """An exact recurrent-page boundary is handed off without a CoW copy."""
     hash_block_size = 2
     block_size = 2 * hash_block_size
     kv_cache_config = KVCacheConfig(
@@ -844,16 +843,27 @@ def test_take_partial_tail_offloads_empty_without_partial_tail():
         hash_block_size=hash_block_size,
     )
 
-    # 4-token prompt ends exactly on the mamba block boundary (block_size=4).
     req0 = make_request("0", [0, 0, 1, 1], hash_block_size, sha256)
     computed_blocks, num_computed, _ = manager.get_computed_blocks(req0)
     assert manager.allocate_slots(req0, 4, num_computed, computed_blocks) is not None
+    mamba_block_id = manager.get_blocks("0").get_block_ids()[1][0]
     assert manager.take_partial_tail_offloads() == {}
+
+    manager.finalize_partial_tail_offloads([req0.request_id])
+    assert manager.take_partial_tail_offloads() == {
+        "0": [(1, mamba_block_id, 4)]
+    }
+    assert manager.take_kv_cache_block_copies()[0] == []
+    mamba_block = manager.block_pool.blocks[mamba_block_id]
+    assert mamba_block.ref_cnt == 2
 
     req0.num_computed_tokens = 4
     req0.append_output_token_ids([2])
     assert manager.allocate_slots(req0, 1) is not None
     assert manager.take_partial_tail_offloads() == {}
+
+    manager.free(req0)
+    assert mamba_block.ref_cnt == 0
 
 
 def test_truncate_computed_blocks_preserves_sparse_prefix_positions():

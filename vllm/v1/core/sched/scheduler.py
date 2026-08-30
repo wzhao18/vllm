@@ -1278,6 +1278,20 @@ class Scheduler(SchedulerInterface):
             and self.vllm_config.kv_transfer_config is not None
             and self.vllm_config.kv_transfer_config.is_kv_producer
         ):
+            terminal_remote_prefills = []
+            for req_id, num_scheduled in num_scheduled_tokens.items():
+                request = self.requests[req_id]
+                params = request.kv_transfer_params
+                if (
+                    params is not None
+                    and params.get("do_remote_decode")
+                    and request.num_computed_tokens + num_scheduled
+                    >= request.num_prompt_tokens
+                ):
+                    terminal_remote_prefills.append(req_id)
+            self.kv_cache_manager.finalize_partial_tail_offloads(
+                terminal_remote_prefills
+            )
             pending_partial_tail_offloads = (
                 self.kv_cache_manager.take_partial_tail_offloads() or None
             )

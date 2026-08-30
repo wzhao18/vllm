@@ -398,6 +398,9 @@ class SingleTypeKVCacheManager(ABC):
         self._pending_partial_tail_offloads = []
         return pending
 
+    def finalize_partial_tail_offload(self, request_id: str) -> None:
+        """Finalize a producer partial tail that will not be overwritten."""
+
     def _apply_cow(
         self,
         request_id: str,
@@ -1707,6 +1710,29 @@ class MambaManager(SingleTypeKVCacheManager):
             ]
         return super().pop_blocks_for_free(request_id)
 
+    def finalize_partial_tail_offload(self, request_id: str) -> None:
+        if self.mamba_cache_mode != "align":
+            return
+        boundary_tokens = self._producer_partial_tail_reqs.pop(request_id, None)
+        if boundary_tokens is None:
+            return
+
+        block_idx = cdiv(boundary_tokens, self.block_size) - 1
+        blocks = self.req_to_blocks.get(request_id)
+        if blocks is None or block_idx >= len(blocks):
+            return
+        source_block = blocks[block_idx]
+        if source_block.is_null:
+            return
+        self._pending_partial_tail_offloads.append(
+            (
+                request_id,
+                self.kv_cache_group_id,
+                source_block,
+                boundary_tokens,
+            )
+        )
+
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """
         Get the number of tokens whose mamba state are not needed anymore. Mamba only
@@ -1758,7 +1784,7 @@ class MambaManager(SingleTypeKVCacheManager):
         hash_block_size = self.block_pool.hash_block_size
         if self.block_size == hash_block_size:
             return None
-        if num_tokens % self.block_size == 0:
+        if num_tokens <= 0:
             return None
         if num_tokens % hash_block_size != 0:
             return None
@@ -1801,13 +1827,18 @@ class MambaManager(SingleTypeKVCacheManager):
         ):
             return None
 
-        block_idx = num_tokens // self.block_size
+        is_full_boundary = num_tokens % self.block_size == 0
+        block_idx = cdiv(num_tokens, self.block_size) - 1
         blocks = self.req_to_blocks[request.request_id]
         if block_idx >= len(blocks):
             return None
         source_block = blocks[block_idx]
         if source_block.is_null:
             return None
+
+        if is_full_boundary:
+            self._producer_partial_tail_reqs[request.request_id] = num_tokens
+            return source_block.block_hash
 
         partial_hash = self.block_pool.cache_partial_block(
             request=request,
