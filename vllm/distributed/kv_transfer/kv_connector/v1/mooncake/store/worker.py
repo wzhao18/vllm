@@ -832,9 +832,11 @@ class KVCacheStoreSendingThread(KVTransferThread):
         the normal save floors to ``lcm_block_size``, so a smaller-block
         group's full blocks in that gap are never persisted elsewhere, and
         the consumer's lookup needs every group at every probed boundary.
-        Full blocks are keyed by their block-end hash, the partial boundary
-        block by the boundary sub-hash; the mamba "align" boundary block is
-        the core-provided CoW block. All keys are deduped against the store.
+        Full blocks are keyed by their block-end hash. Recurrent groups use
+        the replay boundary and the core-provided CoW block. EAGLE groups
+        without a recurrent handoff also publish through the prompt boundary
+        so lookup can verify one hash unit ahead before dropping back to the
+        recurrent checkpoint. All keys are deduped against the store.
 
         Returns:
             True when no put is needed or every put succeeds, False otherwise.
@@ -845,19 +847,30 @@ class KVCacheStoreSendingThread(KVTransferThread):
         if not partial_tail_offloads:
             return True
         hash_block_size = self.coord.hash_block_size
-        boundaries = {boundary for _, _, boundary in partial_tail_offloads}
-        if len(boundaries) != 1:
+        offload_sources = {
+            group_id: (block_id, boundary)
+            for group_id, block_id, boundary in partial_tail_offloads
+        }
+        replay_boundaries = {boundary for _, boundary in offload_sources.values()}
+        if len(replay_boundaries) != 1:
             raise ValueError(
                 "Partial-tail offloads for one request must share a boundary"
             )
-        boundary = boundaries.pop()
-        if boundary == 0:
+        replay_boundary = replay_boundaries.pop()
+        if replay_boundary == 0:
             return True
-        if boundary // hash_block_size - 1 >= len(req_meta.block_hashes):
+        prompt_boundary = (
+            replay_boundary
+            if req_meta.num_prompt_tokens is None
+            else req_meta.num_prompt_tokens // hash_block_size * hash_block_size
+        )
+        lookup_boundary = (
+            max(replay_boundary, prompt_boundary)
+            if self.coord.eagle_group_ids
+            else replay_boundary
+        )
+        if lookup_boundary // hash_block_size - 1 >= len(req_meta.block_hashes):
             return True
-        mamba_offloads = {
-            group_id: block_id for group_id, block_id, _ in partial_tail_offloads
-        }
 
         keys: list[str] = []
         addrs: list[list[int]] = []
@@ -867,26 +880,32 @@ class KVCacheStoreSendingThread(KVTransferThread):
         )
         saved = self._saved_offset.get(req_meta.req_id, 0)
         for g_idx, db in enumerate(self.token_databases):
+            group_boundary = (
+                lookup_boundary
+                if g_idx in self.coord.eagle_group_ids
+                and g_idx not in offload_sources
+                else replay_boundary
+            )
             group_blocks = req_meta.block_ids[g_idx]
             # Distribute across ranks by the same rule as normal chunks.
             put_step = self.group_put_steps[g_idx]
             put_step_rank = (self.tp_rank + g_idx) % put_step
             # Always include the boundary block: its sub-hash key is written
             # only here, even if normal saves already advanced past it.
-            last_block = cdiv(boundary, db.block_size) - 1
+            last_block = cdiv(group_boundary, db.block_size) - 1
             for block_idx in range(
                 min(saved // db.block_size, last_block), last_block + 1
             ):
                 if block_idx % put_step != put_step_rank:
                     continue
-                valid_end = min((block_idx + 1) * db.block_size, boundary)
+                valid_end = min((block_idx + 1) * db.block_size, group_boundary)
                 key_hash = req_meta.block_hashes[valid_end // hash_block_size - 1]
                 if (
-                    g_idx in mamba_offloads
-                    and valid_end == boundary
-                    and boundary % db.block_size != 0
+                    g_idx in offload_sources
+                    and valid_end == group_boundary
+                    and group_boundary % db.block_size != 0
                 ):
-                    block_id = mamba_offloads[g_idx]
+                    block_id = offload_sources[g_idx][0]
                 else:
                     if block_idx >= len(group_blocks):
                         continue

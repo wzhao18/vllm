@@ -656,6 +656,7 @@ def _make_partial_tail_send_thread(
         enable_partial_hash_hits=True,
         hash_block_size=4,
         lcm_block_size=16,
+        eagle_group_ids=set(),
     )
     db = ChunkedTokenDatabase(
         KeyMetadata("test-model", 0, 0, 0, 0),
@@ -2808,6 +2809,75 @@ def test_lookup_partial_tail_uses_hash_alignment():
     worker.store.batch_is_exist.return_value = [0, 0, 1, 0, 0, 1]
 
     assert worker.lookup(13, [b"h0", b"h1", b"h2"]).hit_length == 12
+
+
+def test_partial_tail_store_separates_eagle_proof_and_replay_boundaries():
+    worker = _make_bare_worker(block_size=16)
+    full = FullAttentionSpec(
+        block_size=16, num_kv_heads=8, head_size=64, dtype=None
+    )
+    mamba = MambaSpec(
+        block_size=16,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+    worker._kv_cache_groups = [
+        KVCacheGroupSpec(["full"], full, is_eagle_group=True),
+        KVCacheGroupSpec(["mamba"], mamba),
+    ]
+    worker.hash_block_size = 4
+    worker.token_dbs = [
+        ChunkedTokenDatabase(
+            KeyMetadata("test-model", 0, 0, 0, 0, group_id=group_id),
+            block_size=16,
+            hash_block_size=4,
+        )
+        for group_id in range(2)
+    ]
+    for group_id, db in enumerate(worker.token_dbs):
+        db.set_kv_caches_base_addr([0x1000 * (group_id + 1)])
+        db.set_block_len([256])
+    worker.coord = mooncake_store_worker.MooncakeStoreCoordinator(
+        worker._kv_cache_groups,
+        scheduler_block_size=16,
+        hash_block_size=4,
+        use_eagle=True,
+    )
+    _refresh_group_tp_replication_factors(worker)
+
+    stored_keys: set[str] = set()
+
+    def is_exist(keys):
+        return [int(key in stored_keys) for key in keys]
+
+    def put(keys, addrs, sizes, replicate_config):
+        stored_keys.update(keys)
+        return [0] * len(keys)
+
+    worker.store.batch_is_exist.side_effect = is_exist
+    worker.store.batch_put_from_multi_buffers.side_effect = put
+    sender = _make_store_sending_thread(
+        worker.store,
+        coord=worker.coord,
+        token_databases=worker.token_dbs,
+    )
+    hashes = [BlockHash(f"h{index}".encode()) for index in range(6)]
+    request = ReqMeta(
+        req_id="producer",
+        token_len_chunk=0,
+        block_ids=([1, 2], [7, 8]),
+        block_hashes=hashes[:5],
+        can_save=True,
+        num_prompt_tokens=21,
+        partial_tail_offloads=[(1, 8, 16)],
+    )
+
+    assert sender._maybe_offload_partial_tail(request)
+    assert worker.token_dbs[0].key_for(hashes[4]) in stored_keys
+    assert worker.token_dbs[1].key_for(hashes[3]) in stored_keys
+    assert worker.token_dbs[1].key_for(hashes[4]) not in stored_keys
+    assert worker.lookup(25, hashes).hit_length == 16
 
 
 def test_lookup_full_hit_reuses_existing_boundary():
