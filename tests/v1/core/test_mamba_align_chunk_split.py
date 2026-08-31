@@ -265,12 +265,13 @@ def test_unaligned_resume_never_runs_past_its_block(
     """
     prompt_len = 3602
     (request,) = create_requests(1, num_tokens=prompt_len, block_size=ATTN_BLOCK_SIZE)
-    # Under eagle the partial-tail stop sits one hash unit below the prompt's
-    # last hash boundary: eagle matches a unit past its candidate and drops it,
-    # so nothing proves that last boundary.
     tail_stop = prompt_len // ATTN_BLOCK_SIZE * ATTN_BLOCK_SIZE
+    tail_stops = (tail_stop,)
     if use_eagle:
-        tail_stop -= ATTN_BLOCK_SIZE
+        # Keep the latest two terminal proof boundaries. The lower boundary is
+        # needed when an appended turn diverges inside the producer's final
+        # hash unit; EAGLE then drops the unit above the reusable state.
+        tail_stops = (tail_stop - 2 * ATTN_BLOCK_SIZE, tail_stop - ATTN_BLOCK_SIZE)
 
     pos, ends = resume_at, []
     while pos < prompt_len:
@@ -295,7 +296,7 @@ def test_unaligned_resume_never_runs_past_its_block(
 
     for end in ends[:-1]:
         aligned = end % MAMBA_BLOCK_SIZE == 0
-        assert aligned or (partial_hit and end == tail_stop), (
+        assert aligned or (partial_hit and end in tail_stops), (
             f"intermediate chunk end {end} is neither block-aligned nor the "
-            f"partial-tail stop ({tail_stop})"
+            f"partial-tail stops {tail_stops}"
         )

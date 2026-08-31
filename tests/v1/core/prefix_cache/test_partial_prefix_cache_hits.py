@@ -15,6 +15,8 @@ from tests.v1.core.test_prefix_caching import make_kv_cache_manager, make_reques
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import (
     KVCacheBlockCopy,
+    eagle_partial_tail_boundaries,
+    eagle_partial_tail_boundary,
     get_block_hash,
     get_group_id,
     init_none_hash,
@@ -353,6 +355,7 @@ def test_eagle_group_registers_unaligned_tail_under_partial_hash_hits():
                     shapes=(1, 1),
                     dtypes=(torch.float32,),
                     mamba_cache_mode="align",
+                    num_prefill_checkpoint_blocks=1,
                 ),
             ),
         ],
@@ -891,7 +894,9 @@ def test_exact_page_handoff_does_not_consume_ordinary_partial_tail():
         hash_block_size=hash_block_size,
         use_eagle=True,
     )
-    request = make_request("0", [0, 0, 1, 1, 2, 2, 3, 3, 4, 4], hash_block_size, sha256)
+    request = make_request(
+        "0", [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5], hash_block_size, sha256
+    )
     computed_blocks, num_computed, _ = manager.get_computed_blocks(request)
 
     # The first chunk registers the ordinary six-token partial page.
@@ -1656,7 +1661,12 @@ def test_mamba_align_split_stops_below_eagle_proof_boundary():
         req.num_computed_tokens = 23040
         assert (
             split(self=mock, request=req, num_new_tokens=prompt_len - 23040)
-            == 24448 - 23040
+            == 24320 - 23040
+        )
+        req.num_computed_tokens = 24320
+        assert (
+            split(self=mock, request=req, num_new_tokens=prompt_len - 24320)
+            == 24448 - 24320
         )
 
     # Without eagle the tail stays at the prompt's own last hash boundary.
@@ -1730,6 +1740,309 @@ def test_mamba_partial_tail_hits_below_eagle_proof_boundary():
     req1 = make_request("1", [7] * 9 + [9] * 4, hash_block_size, sha256)
     _, num_computed, _ = manager.get_computed_blocks(req1)
     assert num_computed == 6
+
+
+def test_mamba_eagle_exact_prompt_boundary_preserves_append_replay():
+    """An exact-PMU prompt end must not advance past the replayable tail.
+
+    A subsequent chat turn replaces the terminal generation marker, so its
+    shared prefix can stop inside the producer's final hash unit. Eagle then
+    rewinds one more unit. The producer must retain that earlier state even
+    when its own prompt length is exactly hash aligned.
+    """
+    hash_block_size = 2
+    mamba_block_size = 4
+    kv_cache_config = KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=hash_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=mamba_block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+        prefix_cache_retention_interval=0,
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        use_eagle=True,
+    )
+
+    producer = make_request("producer", [7] * 8, hash_block_size, sha256)
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(producer)
+    assert num_computed == 0
+    assert (
+        manager.allocate_slots(producer, 4, num_computed, computed_blocks) is not None
+    )
+    producer.num_computed_tokens = 4
+    manager.new_step_starts()
+    assert manager.allocate_slots(producer, 4) is not None
+    producer.num_computed_tokens = 8
+    manager.free(producer)
+    manager.new_step_starts()
+
+    successor = make_request("successor", [7] * 7 + [9, 9], hash_block_size, sha256)
+    _, num_computed, _ = manager.get_computed_blocks(successor)
+    assert num_computed == 4
+
+
+def test_eagle_partial_tail_boundary_append_stress():
+    """Sweep prompt and successor lengths across PMU and KDA boundaries."""
+    hash_block_size = 128
+    for producer_length in range(1, 65537):
+        aligned = producer_length // hash_block_size * hash_block_size
+        latest = max(aligned - hash_block_size, 0)
+        previous = max(latest - hash_block_size, 0)
+
+        assert eagle_partial_tail_boundary(producer_length, hash_block_size) == latest
+        assert eagle_partial_tail_boundaries(producer_length, hash_block_size) == tuple(
+            dict.fromkeys((previous, latest))
+        )
+
+
+@pytest.mark.parametrize(
+    ("producer_length", "successor_lcp", "expected_replay_boundary"),
+    [
+        (1664, 1663, 1408),
+        (1665, 1664, 1536),
+        (3201, 3200, 3072),
+        (4737, 4736, 4608),
+        (39807, 39739, 39552),
+        (39808, 39739, 39552),
+        (39809, 39739, 39552),
+        *[
+            (
+                36864 + residue,
+                36864 + residue - 69,
+                max(((36864 + residue - 69) // 128 - 1) * 128, 0),
+            )
+            for residue in range(1, 129)
+        ],
+    ],
+)
+def test_kimi_dcp8_eagle_prompt_boundaries_preserve_append_replay(
+    producer_length: int,
+    successor_lcp: int,
+    expected_replay_boundary: int,
+):
+    """Cover the AgentX cliff and exact recurrent-page boundaries."""
+    num_computed, chunk_ends = _run_kimi_dcp8_eagle_replay(
+        producer_length, successor_lcp
+    )
+    assert expected_replay_boundary in chunk_ends
+    assert num_computed == expected_replay_boundary
+
+
+def _run_kimi_dcp8_eagle_replay(
+    producer_length: int,
+    successor_lcp: int,
+) -> tuple[int, list[int]]:
+    """Run a production-shaped Kimi prefill followed by a divergent replay."""
+    manager, scheduler = _make_kimi_dcp8_eagle_manager()
+    hash_block_size = 128
+
+    producer = make_request("producer", [7] * producer_length, hash_block_size, sha256)
+    chunk_ends = _prefill_kimi_dcp8_request(manager, scheduler, producer)
+    manager.free(producer)
+    manager.new_step_starts()
+
+    successor = make_request(
+        "successor",
+        [7] * successor_lcp + [9] * 128,
+        hash_block_size,
+        sha256,
+    )
+    _, num_computed, _, hit_diverged = manager.get_computed_blocks_for_connector(
+        successor
+    )
+    if hit_diverged:
+        _, num_computed, _ = manager.get_computed_blocks(successor)
+    return num_computed, chunk_ends
+
+
+def _make_kimi_dcp8_eagle_manager(retention_interval: int = 0):
+    hash_block_size = 128
+    # Kimi's hybrid cache builder expands the attention page to the 1,536-token
+    # recurrent page. DCP8 then makes its effective token span 12,288 tokens.
+    full_block_size = 1536
+    mamba_block_size = 1536
+    dcp_world_size = 8
+    kv_cache_config = KVCacheConfig(
+        num_blocks=2048,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=full_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=mamba_block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                    num_speculative_blocks=4,
+                    num_prefill_checkpoint_blocks=1,
+                ),
+            ),
+        ],
+        prefix_cache_retention_interval=retention_interval,
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=1 << 20,
+        enable_caching=True,
+        dcp_world_size=dcp_world_size,
+        scheduler_block_size=lcm(full_block_size * dcp_world_size, mamba_block_size),
+        hash_block_size=hash_block_size,
+        use_eagle=True,
+    )
+
+    scheduler = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            block_size=mamba_block_size,
+            prefix_cache_retention_interval=retention_interval,
+        ),
+        max_num_scheduled_tokens=16384,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+        use_eagle=True,
+        hash_block_size=hash_block_size,
+        mamba_partial_cache_hit=True,
+        mamba_has_prefill_checkpoint_blocks=True,
+    )
+    return manager, scheduler
+
+
+def _prefill_kimi_dcp8_request(manager, scheduler, request) -> list[int]:
+    computed_blocks, num_computed, junction = manager.get_computed_blocks(request)
+    request.shared_prefix_boundary = junction
+    chunk_ends = []
+    while request.num_computed_tokens < request.num_tokens:
+        num_new_tokens = min(
+            scheduler.max_num_scheduled_tokens,
+            request.num_tokens - request.num_computed_tokens - num_computed,
+        )
+        num_new_tokens = Scheduler._mamba_block_aligned_split(
+            scheduler,
+            request,
+            num_new_tokens,
+            num_computed if request.num_computed_tokens == 0 else 0,
+            0,
+        )
+        assert num_new_tokens > 0
+        if request.num_computed_tokens == 0:
+            allocated = manager.allocate_slots(
+                request, num_new_tokens, num_computed, computed_blocks
+            )
+            request.num_computed_tokens = num_computed
+        else:
+            allocated = manager.allocate_slots(request, num_new_tokens)
+        assert allocated is not None
+        request.num_computed_tokens += num_new_tokens
+        chunk_ends.append(request.num_computed_tokens)
+        manager.new_step_starts()
+        num_computed = 0
+    return chunk_ends
+
+
+@pytest.mark.parametrize(
+    ("producer_length", "successor_lcp"),
+    [
+        (45641, 12297),
+        (334623, 36272),
+        (181183, 180721),
+        (34250, 33535),
+        (34830, 33599),
+        (18764, 12675),
+    ],
+)
+def test_kimi_dcp8_retention_zero_does_not_claim_unmaterialized_rewinds(
+    producer_length: int,
+    successor_lcp: int,
+):
+    """Pin the reset/parallel misses whose recurrent state was unavailable."""
+    num_computed, _ = _run_kimi_dcp8_eagle_replay(producer_length, successor_lcp)
+    assert num_computed == 0
+
+
+def test_kimi_dcp8_completed_sibling_materializes_shared_junction():
+    """A completed first consumer makes a shared prefix reusable by the next."""
+    manager, scheduler = _make_kimi_dcp8_eagle_manager()
+    hash_block_size = scheduler.hash_block_size
+    common = [7] * 12675
+    requests = [
+        make_request("source", common + [8] * 6089, hash_block_size, sha256),
+        make_request("first", common + [9] * 6092, hash_block_size, sha256),
+        make_request("second", common + [10] * 6089, hash_block_size, sha256),
+    ]
+    _prefill_kimi_dcp8_request(manager, scheduler, requests[0])
+    manager.free(requests[0])
+    manager.new_step_starts()
+
+    _, first_hit, first_junction = manager.get_computed_blocks(requests[1])
+    assert first_hit == 0
+    assert first_junction > 0
+    _prefill_kimi_dcp8_request(manager, scheduler, requests[1])
+    manager.free(requests[1])
+    manager.new_step_starts()
+
+    _, second_hit, _ = manager.get_computed_blocks(requests[2])
+    assert second_hit == first_junction
+
+
+@pytest.mark.parametrize(
+    ("producer_length", "successor_lcp", "expected_minimum"),
+    [
+        (45641, 12297, 0),
+        (334623, 36272, 24576),
+        (181183, 180721, 172032),
+    ],
+)
+def test_kimi_dcp8_periodic_retention_recovers_reset_prefixes(
+    producer_length: int,
+    successor_lcp: int,
+    expected_minimum: int,
+):
+    """Periodic KDA checkpoints bound reset-context recomputation."""
+    manager, scheduler = _make_kimi_dcp8_eagle_manager(12288)
+    producer = make_request(
+        "producer", [7] * producer_length, scheduler.hash_block_size, sha256
+    )
+    _prefill_kimi_dcp8_request(manager, scheduler, producer)
+    manager.free(producer)
+    manager.new_step_starts()
+
+    successor = make_request(
+        "successor",
+        [7] * successor_lcp + [9] * 128,
+        scheduler.hash_block_size,
+        sha256,
+    )
+    _, hit, _ = manager.get_computed_blocks(successor)
+    assert hit == expected_minimum
 
 
 def test_mamba_coarse_checkpoint_retained_below_eagle_proof_boundary():

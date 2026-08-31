@@ -13,6 +13,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashListWithBlockSize,
     BlockHashWithGroupId,
     KVCacheBlock,
+    eagle_partial_tail_boundaries,
     resolve_block_hashes,
 )
 from vllm.v1.kv_cache_interface import (
@@ -805,24 +806,44 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         hash_block_size = self.block_pool.hash_block_size
         if self.block_size == hash_block_size:
             return
-        self._cache_partial_tail_block(request, num_tokens)
+        self._cache_partial_tail_block(request, num_tokens, retention_interval)
 
     def _cache_partial_tail_block(
         self,
         request: Request,
         num_tokens: int,
+        retention_interval: int | None = None,
     ) -> None:
-        """Cache the prompt tail when it ends inside a cache block.
-
-        Only the final prompt hash boundary is registered as a partial
-        prefix-cache entry; intermediate hash boundaries inside the same cache
-        block are intentionally skipped.
-        """
+        """Cache the prompt's reachable fine-grained proof boundaries."""
         hash_block_size = self.block_pool.hash_block_size
-        boundary_tokens = request.num_prompt_tokens // hash_block_size * hash_block_size
+        prompt_tokens = request.num_prompt_tokens
+        if self.use_eagle:
+            latest_proof = prompt_tokens // hash_block_size * hash_block_size
+            proof_boundaries = [
+                max(latest_proof - hash_block_size, 0),
+                latest_proof,
+            ]
+            if retention_interval:
+                periodic_resume = (
+                    max(num_tokens - hash_block_size, 0)
+                    // retention_interval
+                    * retention_interval
+                )
+                if periodic_resume:
+                    proof_boundaries.append(periodic_resume + hash_block_size)
+        else:
+            proof_boundaries = [
+                prompt_tokens // hash_block_size * hash_block_size,
+            ]
+        boundary_tokens = max(
+            (
+                boundary
+                for boundary in proof_boundaries
+                if boundary <= num_tokens and boundary % self.block_size != 0
+            ),
+            default=0,
+        )
         if boundary_tokens == 0 or boundary_tokens > num_tokens:
-            return
-        if boundary_tokens % self.block_size == 0:
             return
 
         blocks = self.req_to_blocks[request.request_id]
@@ -835,6 +856,7 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             num_tokens=boundary_tokens,
             kv_cache_group_id=self.kv_cache_group_id,
             block_size=self.block_size,
+            replace_older=not self.use_eagle,
         )
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
@@ -1776,14 +1798,12 @@ class MambaManager(SingleTypeKVCacheManager):
             return None
         if num_tokens % hash_block_size != 0:
             return None
-        latest_prompt_hash_boundary = (
-            request.num_prompt_tokens // hash_block_size
-        ) * hash_block_size
+        prompt_hash_boundaries = (
+            request.num_prompt_tokens // hash_block_size * hash_block_size,
+        )
         if self.use_eagle:
-            # Eagle groups match one hash unit past the candidate and drop it,
-            # so register the tail one unit lower.
-            latest_prompt_hash_boundary = max(
-                latest_prompt_hash_boundary - hash_block_size, 0
+            prompt_hash_boundaries = eagle_partial_tail_boundaries(
+                request.num_prompt_tokens, hash_block_size
             )
         # When the shared prefix ends BEFORE this prompt's tail -- a system
         # prompt followed by a per-request suffix -- a sibling's match stops at
@@ -1809,7 +1829,7 @@ class MambaManager(SingleTypeKVCacheManager):
             and num_tokens == request.shared_prefix_boundary
         )
         if (
-            num_tokens != latest_prompt_hash_boundary
+            num_tokens not in prompt_hash_boundaries
             and not block_grid_resume_point
             and not junction_resume_point
         ):
@@ -1827,6 +1847,15 @@ class MambaManager(SingleTypeKVCacheManager):
             return None
 
         if is_exact_page:
+            if source_block.block_hash is None:
+                self.block_pool.cache_full_blocks(
+                    request=request,
+                    blocks=blocks,
+                    num_cached_blocks=block_idx,
+                    num_full_blocks=block_idx + 1,
+                    block_size=self.block_size,
+                    kv_cache_group_id=self.kv_cache_group_id,
+                )
             if source_block.block_hash is None:
                 return None
             self._pending_exact_page_offloads.append(

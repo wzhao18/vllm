@@ -741,6 +741,27 @@ def replay_boundary(
     return max(aligned - scheduler_block_size, 0)
 
 
+def eagle_partial_tail_boundary(num_prompt_tokens: int, hash_block_size: int) -> int:
+    """Return the latest fine-grained prompt state reusable under EAGLE.
+
+    A later chat turn can either append exactly or replace a terminal suffix.
+    EAGLE then drops one additional matched hash unit.
+    """
+    if num_prompt_tokens <= 0:
+        return 0
+    aligned = num_prompt_tokens // hash_block_size * hash_block_size
+    return max(aligned - hash_block_size, 0)
+
+
+def eagle_partial_tail_boundaries(
+    num_prompt_tokens: int, hash_block_size: int
+) -> tuple[int, ...]:
+    """Return both tail states reachable after a terminal-unit replacement."""
+    latest = eagle_partial_tail_boundary(num_prompt_tokens, hash_block_size)
+    previous = max(latest - hash_block_size, 0)
+    return tuple(dict.fromkeys((previous, latest)))
+
+
 def get_request_block_hasher(
     hash_block_size: int,
     caching_hash_fn: Callable[[Any], bytes],

@@ -37,7 +37,11 @@ from vllm.v1.core.encoder_cache_manager import (
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.kv_cache_utils import (
+    KVCacheBlock,
+    eagle_partial_tail_boundaries,
+    eagle_partial_tail_boundary,
+)
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -442,11 +446,17 @@ class Scheduler(SchedulerInterface):
             if self.mamba_partial_cache_hit
             else 0
         )
+        tail_boundaries = (tail_boundary,)
         if tail_boundary and self.use_eagle:
             # Eagle matches one hash unit past the candidate and drops it, so
             # nothing proves the prompt's own last hash boundary. Materialize
             # the state one unit lower, where the hit can actually land.
-            tail_boundary = max(tail_boundary - self.hash_block_size, 0)
+            tail_boundary = eagle_partial_tail_boundary(
+                request.num_prompt_tokens, self.hash_block_size
+            )
+            tail_boundaries = eagle_partial_tail_boundaries(
+                request.num_prompt_tokens, self.hash_block_size
+            )
         junction = request.shared_prefix_boundary
         if self.mamba_partial_cache_hit and self.use_eagle:
             junction_stop = junction // self.hash_block_size * self.hash_block_size
@@ -454,6 +464,12 @@ class Scheduler(SchedulerInterface):
                 junction_stop = 0
         else:
             junction_stop = start + (junction - start) // block_size * block_size
+        periodic_stop = 0
+        retention_interval = getattr(
+            self.cache_config, "prefix_cache_retention_interval", None
+        )
+        if retention_interval:
+            periodic_stop = (start // retention_interval + 1) * retention_interval
         stops = (
             # Same invariant: a chunk starting mid-block stops at the boundary
             # rather than running past it.
@@ -462,9 +478,12 @@ class Scheduler(SchedulerInterface):
             last_cache_position,
             # Fine-grained hits: the prompt's partial-tail entry can only be
             # registered by a chunk ending exactly at its last hash boundary.
-            tail_boundary
-            if last_cache_position < tail_boundary < request.num_prompt_tokens
-            else 0,
+            *(
+                boundary
+                if last_cache_position < boundary < request.num_prompt_tokens
+                else 0
+                for boundary in tail_boundaries
+            ),
             # Marconi shared-prefix junction. Under eagle the sibling resumes
             # one hash unit below the boundary full attention matched, which is
             # not on the block grid, so floor to the hash grid instead -- block
@@ -472,6 +491,9 @@ class Scheduler(SchedulerInterface):
             # is registered during the prompt, so a junction past it would split
             # the chunk for a check-point that is never written.
             junction_stop if start < request.shared_prefix_boundary < end else 0,
+            # A retained recurrent checkpoint must be materialized by a
+            # forward that ends at its exact interval boundary.
+            periodic_stop if periodic_stop < request.num_prompt_tokens else 0,
         )
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)

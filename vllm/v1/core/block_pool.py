@@ -449,6 +449,8 @@ class BlockPool:
         num_tokens: int,
         kv_cache_group_id: int,
         block_size: int,
+        *,
+        replace_older: bool = True,
     ) -> BlockHashWithGroupId | None:
         """Register a partial prefix-cache entry for an existing block.
 
@@ -476,6 +478,7 @@ class BlockPool:
                 entry hash itself is always the prefix-chain hash at
                 ``num_tokens``; ``block_size`` is used to assert that the
                 entry is partial within the owning cache block.
+            replace_older: Remove earlier aliases owned by the same block.
 
         Returns:
             The hash key with group ID if a partial entry can be registered;
@@ -498,7 +501,8 @@ class BlockPool:
             )
         )
         if (
-            not already_cached
+            replace_older
+            and not already_cached
             and block.block_hash is not None
             and block.block_hash_num_tokens is not None
             and block.block_hash_num_tokens < num_hash_blocks * self.hash_block_size
