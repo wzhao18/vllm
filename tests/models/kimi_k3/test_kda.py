@@ -26,7 +26,7 @@ from vllm.models.kimi_k3.nvidia import kda as nvidia_kda
 from vllm.models.kimi_k3.nvidia.kda import (
     _flashkda_prefill,
     _KimiGDNMergedColumnParallelLinear,
-    _store_cache_checkpoints,
+    _store_cache_checkpoints_kernel,
     is_flashkda_supported,
     is_fused_kda_decode_supported,
 )
@@ -1200,20 +1200,23 @@ def test_flashkda_correctness():
     assert_close("checkpoint_ht", expected_state, checkpoint_final_state, 0.01)
     assert_close("checkpoint", expected_checkpoint, checkpoint_state[:1], 0.01)
 
-    conv_state = torch.full(
-        (2, H * D, 7),
-        torch.nan,
-        dtype=q.dtype,
-        device=DEVICE,
-    )
+    conv_state = torch.zeros(2, H * D, 3, dtype=q.dtype, device=DEVICE)
     recurrent_storage = torch.zeros(2, H * D * D + 8, device=DEVICE)
     recurrent_state = recurrent_storage[:, : H * D * D].view(2, H, D, D)
     conv_input = q[0].flatten(1)
     checkpoint_state_indices = torch.tensor(
         [1, NULL_BLOCK_ID], dtype=torch.int32, device=DEVICE
     )
-    conv_kernel_size = 4
-    _store_cache_checkpoints(
+    state_len = conv_state.shape[-1]
+    width = H * D
+    recurrent_row_size = checkpoint_state[0].numel()
+    block_size = 256
+    _store_cache_checkpoints_kernel[
+        (
+            checkpoint_state_indices.numel(),
+            (max(width * state_len, recurrent_row_size) + block_size - 1) // block_size,
+        )
+    ](
         conv_input,
         conv_state,
         checkpoint_state,
@@ -1221,12 +1224,19 @@ def test_flashkda_correctness():
         cu_seqlens,
         checkpoint_offsets,
         checkpoint_state_indices,
-        conv_kernel_size,
+        conv_input.stride(0),
+        conv_input.stride(1),
+        conv_state.stride(0),
+        conv_state.stride(1),
+        conv_state.stride(2),
+        checkpoint_state.stride(0),
+        recurrent_state.stride(0),
+        checkpoint_offsets.stride(0),
+        state_len,
+        width,
+        recurrent_row_size,
+        NULL_BLOCK_ID,
+        block_size,
     )
-    conv_history_len = conv_kernel_size - 1
-    torch.testing.assert_close(
-        conv_state[1, :, :conv_history_len],
-        q[0, 13:16].flatten(1).transpose(0, 1),
-    )
-    assert torch.isnan(conv_state[1, :, conv_history_len:]).all()
+    torch.testing.assert_close(conv_state[1], q[0, 13:16].flatten(1).transpose(0, 1))
     torch.testing.assert_close(recurrent_state[1], checkpoint_state[0])
