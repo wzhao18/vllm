@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
 
@@ -881,11 +881,6 @@ class KVCacheManager:
                     (group_id, block.block_id, boundary_tokens)
                 )
         return offloads
-
-    def finalize_partial_tail_offloads(self, request_ids: Iterable[str]) -> None:
-        for request_id in request_ids:
-            for mgr in self.coordinator.single_type_managers:
-                mgr.finalize_partial_tail_offload(request_id)
 
     def new_step_starts(self) -> None:
         """Notify the coordinator that a new step is starting."""
