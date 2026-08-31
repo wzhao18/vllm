@@ -1021,6 +1021,25 @@ def test_pending_partial_tail_emits_offload_only_reqmeta():
     assert tracker.has_pending_offload is True
 
 
+def test_pending_partial_tails_preserve_multiple_boundaries():
+    scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
+    out = _add_pending_partial_tail_request(
+        scheduler,
+        num_tokens=20,
+        block_hashes=[b"h0", b"h1", b"h2", b"h3", b"h4"],
+        block_ids=([0, 1],),
+    )
+    out.partial_tail_offloads = {"req-0": [(1, 7, 12), (1, 8, 16)]}
+
+    meta = scheduler.build_connector_meta(out)
+
+    assert len(meta.requests) == 1
+    assert meta.requests[0].partial_tail_offloads == [
+        (1, 7, 12),
+        (1, 8, 16),
+    ]
+
+
 def test_resumed_partial_tail_uses_handoff_boundary():
     scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
     # Resumption replays prompt + previously generated tokens.
@@ -1093,6 +1112,26 @@ def test_partial_tail_cow_block_is_referenced_for_the_job():
     # It leads the list, as in `pop_blocks_for_free`, so that the reversed free
     # puts it last in eviction priority.
     assert scheduler._pinned_saves[store_job_id][0] == [7, 0]
+    assert pool.blocks[7].ref_cnt == 1
+
+    scheduler.update_connector_output(_make_worker_output({store_job_id: 1}))
+    assert pool.blocks[7].ref_cnt == 0
+
+
+def test_exact_page_handoff_block_is_referenced_once():
+    scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
+    out = _add_pending_partial_tail_request(
+        scheduler,
+        num_tokens=12,
+        block_hashes=[b"h0", b"h1", b"h2"],
+        block_ids=([7],),
+    )
+    pool = scheduler._gpu_block_pool
+
+    meta = scheduler.build_connector_meta(out)
+
+    store_job_id = meta.requests[0].store_job_id
+    assert scheduler._pinned_saves[store_job_id][0] == [7]
     assert pool.blocks[7].ref_cnt == 1
 
     scheduler.update_connector_output(_make_worker_output({store_job_id: 1}))

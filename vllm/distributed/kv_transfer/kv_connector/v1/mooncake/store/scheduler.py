@@ -413,7 +413,6 @@ class MooncakeStoreScheduler:
                     # are going away, so the offload is conservatively dropped.
                     logger.debug("Dropping partial-tail offload for request %s", req_id)
                     continue
-                assert len({boundary for _, _, boundary in groups}) == 1
                 tracker.has_pending_offload = True
                 meta.add_request(
                     ReqMeta(
@@ -448,16 +447,15 @@ class MooncakeStoreScheduler:
             self._next_store_job_id += 1
             block_ids: list[int] = []
             if req_meta.partial_tail_offloads:
-                # A partial-tail CoW block is deliberately kept out of the
-                # request's block table, so it is absent from `block_ids` even
-                # though the worker DMAs out of it just as asynchronously.
-                # It leads the list, as in `pop_blocks_for_free`.
+                # A partial-tail CoW block is kept out of the request table,
+                # while an exact-page handoff remains in it.
                 block_ids += [bid for _, bid, _ in req_meta.partial_tail_offloads]
             # Every allocated block is referenced, not just the ones covering
             # this job's token range: a rank resumes from its own last
             # successful offset, which lags the scheduler's whenever a save was
             # skipped or failed, so it may read anywhere below the range.
             block_ids += [bid for group in req_meta.block_ids for bid in group]
+            block_ids = list(dict.fromkeys(block_ids))
             if not block_ids:
                 continue
             self._pinned_saves[store_job_id] = (block_ids, self._num_workers)

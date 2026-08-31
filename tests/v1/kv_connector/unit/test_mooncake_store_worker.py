@@ -704,6 +704,46 @@ def test_partial_tail_offload_skips_null_source_blocks():
     assert addrs == [[0x1000 + 2 * 256], [0x1000 + 3 * 256]]
 
 
+def test_exact_page_offload_uses_explicit_handoff_block():
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.return_value = [256, 256]
+    thread = _make_partial_tail_send_thread(store)
+    request = _make_partial_tail_req([0, 2, 3])
+    request.partial_tail_offloads = [(0, 7, 12)]
+
+    assert thread._maybe_offload_partial_tail(request)
+
+    keys, addrs, _sizes, _replicate_config = (
+        store.batch_put_from_multi_buffers.call_args.args
+    )
+    assert keys == [
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6131",
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6132",
+    ]
+    assert addrs == [[0x1000 + 2 * 256], [0x1000 + 7 * 256]]
+
+
+def test_partial_tail_offload_partitions_multiple_boundaries():
+    thread = _make_partial_tail_send_thread(MagicMock())
+    thread._offload_partial_tail_boundary = MagicMock(return_value=True)
+    request = _make_partial_tail_req([0, 2, 3])
+    request.partial_tail_offloads = [
+        (1, 7, 12),
+        (2, 8, 16),
+        (3, 9, 12),
+    ]
+
+    assert thread._maybe_offload_partial_tail(request)
+    boundary_calls = [
+        call.args[1] for call in thread._offload_partial_tail_boundary.call_args_list
+    ]
+    assert boundary_calls == [
+        [(1, 7, 12), (3, 9, 12)],
+        [(2, 8, 16)],
+    ]
+
+
 def test_store_sending_thread_skips_null_sparse_group_blocks():
     from vllm.v1.kv_cache_interface import (
         FullAttentionSpec,

@@ -856,6 +856,70 @@ def test_take_partial_tail_offloads_empty_without_partial_tail():
     assert manager.take_partial_tail_offloads() == {}
 
 
+def test_exact_page_handoff_does_not_consume_ordinary_partial_tail():
+    hash_block_size = 2
+    block_size = 2 * hash_block_size
+    kv_cache_config = KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=hash_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                    num_prefill_checkpoint_blocks=1,
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        use_eagle=True,
+    )
+    request = make_request("0", [0, 0, 1, 1, 2, 2, 3, 3, 4, 4], hash_block_size, sha256)
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(request)
+
+    # The first chunk registers the ordinary six-token partial page.
+    assert manager.allocate_slots(request, 6, num_computed, computed_blocks) is not None
+    assert manager.take_partial_tail_offloads() == {}
+    partial_hash = request.block_hashes[6 // hash_block_size - 1]
+    partial_source = manager.block_pool.get_cached_block(
+        partial_hash, kv_cache_group_ids=[1]
+    )
+    assert partial_source is not None
+
+    # Continuing to the exact eight-token replay boundary preserves the
+    # ordinary page through CoW and independently hands off the completed page.
+    request.num_computed_tokens = 6
+    assert manager.allocate_slots(request, 2) is not None
+    copies, _ = manager.take_kv_cache_block_copies()
+    assert len(copies) == 1
+    partial_copy = next(
+        copy for copy in copies if copy.src_block_id == partial_source[0].block_id
+    )
+    exact_page = manager.get_blocks("0").get_block_ids()[1][1]
+    offloads = manager.take_partial_tail_offloads()["0"]
+
+    assert (1, partial_copy.dst_block_id, 6) in offloads
+    assert (1, exact_page, 8) in offloads
+    assert partial_copy.dst_block_id != exact_page
+
+
 def test_truncate_computed_blocks_preserves_sparse_prefix_positions():
     """truncate_computed_blocks slices each group by its own block size,
     keeps null placeholders in the retained prefix, and leaves the original

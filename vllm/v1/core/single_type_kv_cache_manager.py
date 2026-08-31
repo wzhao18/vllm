@@ -120,6 +120,7 @@ class SingleTypeKVCacheManager(ABC):
         self._pending_partial_tail_offloads: list[
             tuple[str, int, KVCacheBlock, int]
         ] = []
+        self._pending_exact_page_offloads: list[tuple[str, int, KVCacheBlock, int]] = []
 
     @classmethod
     def _get_num_evictable_blocks(cls, blocks: Sequence[KVCacheBlock]):
@@ -396,6 +397,14 @@ class SingleTypeKVCacheManager(ABC):
         """
         pending = self._pending_partial_tail_offloads
         self._pending_partial_tail_offloads = []
+        return pending
+
+    def take_pending_exact_page_offloads(
+        self,
+    ) -> list[tuple[str, int, KVCacheBlock, int]]:
+        """Drain completed recurrent-page hand-offs."""
+        pending = self._pending_exact_page_offloads
+        self._pending_exact_page_offloads = []
         return pending
 
     def _apply_cow(
@@ -1705,6 +1714,11 @@ class MambaManager(SingleTypeKVCacheManager):
                 for entry in self._pending_partial_tail_offloads
                 if entry[0] != request_id
             ]
+            self._pending_exact_page_offloads = [
+                entry
+                for entry in self._pending_exact_page_offloads
+                if entry[0] != request_id
+            ]
         return super().pop_blocks_for_free(request_id)
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
@@ -1758,7 +1772,7 @@ class MambaManager(SingleTypeKVCacheManager):
         hash_block_size = self.block_pool.hash_block_size
         if self.block_size == hash_block_size:
             return None
-        if num_tokens % self.block_size == 0:
+        if num_tokens <= 0:
             return None
         if num_tokens % hash_block_size != 0:
             return None
@@ -1801,13 +1815,29 @@ class MambaManager(SingleTypeKVCacheManager):
         ):
             return None
 
-        block_idx = num_tokens // self.block_size
+        is_exact_page = num_tokens % self.block_size == 0
+        if is_exact_page and not self.use_eagle:
+            return None
+        block_idx = cdiv(num_tokens, self.block_size) - 1
         blocks = self.req_to_blocks[request.request_id]
         if block_idx >= len(blocks):
             return None
         source_block = blocks[block_idx]
         if source_block.is_null:
             return None
+
+        if is_exact_page:
+            if source_block.block_hash is None:
+                return None
+            self._pending_exact_page_offloads.append(
+                (
+                    request.request_id,
+                    self.kv_cache_group_id,
+                    source_block,
+                    num_tokens,
+                )
+            )
+            return source_block.block_hash
 
         partial_hash = self.block_pool.cache_partial_block(
             request=request,

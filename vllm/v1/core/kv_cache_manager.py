@@ -863,18 +863,14 @@ class KVCacheManager:
         A KV connector reads the referenced blocks and offloads them so a later
         request can hit the sub-block prefix.
 
-        Each handed-off block lives off the request block table, so it is
-        pinned here and unpinned when the request's blocks are freed — for a
-        producer with saved tokens, after the connector reports sends done.
+        Partial-page CoW blocks live off the request block table; exact-page
+        blocks remain in it. Both are pinned here until the request is freed.
         """
         offloads: dict[str, list[tuple[int, int, int]]] = {}
         for mgr in self.coordinator.single_type_managers:
-            for (
-                req_id,
-                group_id,
-                block,
-                boundary_tokens,
-            ) in mgr.take_pending_partial_tail_offloads():
+            pending = mgr.take_pending_partial_tail_offloads()
+            pending += mgr.take_pending_exact_page_offloads()
+            for req_id, group_id, block, boundary_tokens in pending:
                 self.block_pool.touch((block,))
                 self._partial_tail_pins.setdefault(req_id, []).append(block)
                 offloads.setdefault(req_id, []).append(

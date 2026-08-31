@@ -846,6 +846,21 @@ class KVCacheStoreSendingThread(KVTransferThread):
         partial_tail_offloads = req_meta.partial_tail_offloads
         if not partial_tail_offloads:
             return True
+        offloads_by_boundary: dict[int, list[tuple[int, int, int]]] = {}
+        for offload in partial_tail_offloads:
+            offloads_by_boundary.setdefault(offload[2], []).append(offload)
+
+        successful = True
+        for boundary_offloads in offloads_by_boundary.values():
+            if not self._offload_partial_tail_boundary(req_meta, boundary_offloads):
+                successful = False
+        return successful
+
+    def _offload_partial_tail_boundary(
+        self,
+        req_meta: ReqMeta,
+        partial_tail_offloads: list[tuple[int, int, int]],
+    ) -> bool:
         hash_block_size = self.coord.hash_block_size
         offload_sources = {
             group_id: (block_id, boundary)
@@ -900,11 +915,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     continue
                 valid_end = min((block_idx + 1) * db.block_size, group_boundary)
                 key_hash = req_meta.block_hashes[valid_end // hash_block_size - 1]
-                if (
-                    g_idx in offload_sources
-                    and valid_end == group_boundary
-                    and group_boundary % db.block_size != 0
-                ):
+                if g_idx in offload_sources and valid_end == group_boundary:
                     block_id = offload_sources[g_idx][0]
                 else:
                     if block_idx >= len(group_blocks):
