@@ -598,35 +598,110 @@ class _ReplicaDesc:
         return self.tier == "disk"
 
 
-def test_store_sending_thread_skips_request_during_cpu_pressure():
+def test_store_sending_thread_retries_only_pressure_failed_keys():
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    calls = []
+
+    def batch_put(keys, addrs, sizes, config):
+        calls.append((keys, addrs, sizes, config.group_ids.copy()))
+        return [256, -200] if len(calls) == 1 else [256]
+
+    store.batch_put_from_multi_buffers.side_effect = batch_put
+    replicate_config = SimpleNamespace(group_ids=None)
+    thread = _make_store_sending_thread(
+        store,
+        replicate_config=replicate_config,
+        enable_group_semantics=True,
+        supports_group_ids=True,
+    )
+
+    with patch.object(mooncake_store_worker.time, "sleep") as sleep:
+        _run_store_req(thread, _make_store_req("req-a", [b"a0", b"a1"]))
+
+    first_key = "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6130"
+    retry_key = "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6131"
+    assert calls == [
+        (
+            [first_key, retry_key],
+            [[0x1100], [0x1200]],
+            [[256], [256]],
+            [
+                "vllm-mooncake-store:test-model@6130",
+                "vllm-mooncake-store:test-model@6131",
+            ],
+        ),
+        (
+            [retry_key],
+            [[0x1200]],
+            [[256]],
+            ["vllm-mooncake-store:test-model@6131"],
+        ),
+    ]
+    sleep.assert_called_once_with(0.02)
+    assert thread._store_pressure_active is False
+    assert thread._saved_offset["req-a"] == 32
+
+
+def test_pressure_retry_clears_group_ids_for_ungrouped_put():
+    observed_group_ids = []
+    store = MagicMock()
+
+    def batch_put(keys, addrs, sizes, config):
+        group_ids = config.group_ids
+        observed_group_ids.append(None if group_ids is None else group_ids.copy())
+        return [256] * len(keys)
+
+    store.batch_put_from_multi_buffers.side_effect = batch_put
+    thread = _make_store_sending_thread(
+        store,
+        replicate_config=SimpleNamespace(group_ids=None),
+        enable_group_semantics=True,
+        supports_group_ids=True,
+    )
+
+    thread._batch_put_with_pressure_retry(
+        ["grouped"], [[0x1100]], [[256]], ["group-id"]
+    )
+    thread._batch_put_with_pressure_retry(["ungrouped"], [[0x1200]], [[256]], None)
+
+    assert observed_group_ids == [["group-id"], None]
+
+
+def test_store_sending_thread_skips_request_after_pressure_retries_exhausted():
     store = MagicMock()
     store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
     store.batch_put_from_multi_buffers.side_effect = [
+        [-200, -200],
+        [-200, -200],
+        [-200, -200],
         [-200, -200],
         [256, 256],
         [256, 256],
     ]
     thread = _make_store_sending_thread(store)
 
-    _run_store_req(thread, _make_store_req("req-a", [b"a0", b"a1"]))
+    with patch.object(mooncake_store_worker.time, "sleep") as sleep:
+        _run_store_req(thread, _make_store_req("req-a", [b"a0", b"a1"]))
 
     assert thread._store_pressure_active is True
     assert "req-a" in thread._skip_store_requests
-    assert store.batch_put_from_multi_buffers.call_count == 1
+    assert store.batch_put_from_multi_buffers.call_count == 4
+    assert [call.args[0] for call in sleep.call_args_list] == [0.02, 0.04, 0.08]
 
     _run_store_req(thread, _make_store_req("req-a", [b"a2", b"a3"]))
 
-    assert store.batch_put_from_multi_buffers.call_count == 1
+    assert store.batch_put_from_multi_buffers.call_count == 4
 
     _run_store_req(thread, _make_store_req("req-b", [b"b0", b"b1"]))
 
     assert thread._store_pressure_active is False
     assert "req-a" not in thread._skip_store_requests
-    assert store.batch_put_from_multi_buffers.call_count == 2
+    assert store.batch_put_from_multi_buffers.call_count == 5
 
     _run_store_req(thread, _make_store_req("req-a", [b"a4", b"a5"]))
 
-    assert store.batch_put_from_multi_buffers.call_count == 3
+    assert store.batch_put_from_multi_buffers.call_count == 6
 
 
 def test_store_sending_thread_records_mooncake_metrics():
@@ -1077,17 +1152,40 @@ def test_partial_tail_offload_honors_active_pressure_gate():
 def test_partial_tail_put_failure_activates_pressure_gate():
     store = MagicMock()
     store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
-    store.batch_put_from_multi_buffers.return_value = [256, -200, 256]
+    store.batch_put_from_multi_buffers.side_effect = [
+        [256, -200, 256, 256],
+        [-200],
+        [-200],
+        [-200],
+    ]
     thread = _make_partial_tail_send_thread(store)
 
-    _run_store_req(thread, _make_partial_tail_req([1, 2, 3]))
+    with patch.object(mooncake_store_worker.time, "sleep"):
+        _run_store_req(thread, _make_partial_tail_req([1, 2, 3]))
 
     assert thread._store_pressure_active is True
     assert thread._skip_store_requests == {"req-a"}
     assert thread._saved_offset.get("req-a", 0) == 0
 
     _run_store_req(thread, _make_partial_tail_req([1, 2, 3]))
-    assert store.batch_put_from_multi_buffers.call_count == 1
+    assert store.batch_put_from_multi_buffers.call_count == 4
+
+
+def test_partial_tail_put_recovers_from_transient_pressure():
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.side_effect = [
+        [256, -200, 256, 256],
+        [256],
+    ]
+    thread = _make_partial_tail_send_thread(store)
+
+    with patch.object(mooncake_store_worker.time, "sleep"):
+        _run_store_req(thread, _make_partial_tail_req([1, 2, 3]))
+
+    assert store.batch_put_from_multi_buffers.call_count == 2
+    assert thread._store_pressure_active is False
+    assert thread._skip_store_requests == set()
 
 
 def test_normal_save_excludes_mamba_group_and_null_blocks():
