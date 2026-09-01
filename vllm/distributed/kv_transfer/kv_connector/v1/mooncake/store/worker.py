@@ -82,6 +82,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
     group_kernel_blocks,
 )
+
 from .metrics import MooncakeStoreConnectorStats
 
 logger = init_logger(__name__)
@@ -91,6 +92,7 @@ DEFAULT_LOCAL_BUFFER_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
 DEFAULT_TENANT_ID = "default"
 
 MOONCAKE_NO_AVAILABLE_HANDLE = -200
+MOONCAKE_PUT_RETRY_BACKOFF_SECONDS = (0.02, 0.04, 0.08)
 MOONCAKE_COMPACT_GROUP_IO_FORMAT = "compact-group-io-v1"
 _T = TypeVar("_T")
 
@@ -824,6 +826,56 @@ class KVCacheStoreSendingThread(KVTransferThread):
             self._skip_store_requests.clear()
         return True
 
+    def _batch_put_with_pressure_retry(
+        self,
+        keys: list[str],
+        addrs: list[list[int]],
+        sizes: list[list[int]],
+        group_ids: list[str] | None,
+    ) -> list[int]:
+        """Retry allocation failures while the source blocks remain pinned."""
+        results = [MOONCAKE_NO_AVAILABLE_HANDLE] * len(keys)
+        pending = list(range(len(keys)))
+
+        for attempt in range(len(MOONCAKE_PUT_RETRY_BACKOFF_SECONDS) + 1):
+            if attempt:
+                delay = MOONCAKE_PUT_RETRY_BACKOFF_SECONDS[attempt - 1]
+                logger.info(
+                    "Retrying %d Mooncake PUT keys after %.0f ms",
+                    len(pending),
+                    delay * 1000,
+                )
+                time.sleep(delay)
+
+            retry_keys = [keys[i] for i in pending]
+            retry_addrs = [addrs[i] for i in pending]
+            retry_sizes = [sizes[i] for i in pending]
+            if group_ids is not None:
+                self.replicate_config.group_ids = [group_ids[i] for i in pending]
+
+            retry_results = self.store.batch_put_from_multi_buffers(
+                retry_keys,
+                retry_addrs,
+                retry_sizes,
+                self.replicate_config,
+            )
+            if len(retry_results) != len(pending):
+                raise RuntimeError(
+                    "Mooncake batch PUT returned "
+                    f"{len(retry_results)} results for {len(pending)} keys"
+                )
+
+            next_pending = []
+            for original_idx, result in zip(pending, retry_results, strict=True):
+                results[original_idx] = result
+                if result == MOONCAKE_NO_AVAILABLE_HANDLE:
+                    next_pending.append(original_idx)
+            pending = next_pending
+            if not pending:
+                break
+
+        return results
+
     def _maybe_offload_partial_tail(self, req_meta: ReqMeta) -> bool:
         """Offload the request's sub-block partial tail (its last prompt hash
         boundary) so a later request can hit the sub-block prefix.
@@ -976,12 +1028,11 @@ class KVCacheStoreSendingThread(KVTransferThread):
             req_meta.current_event.synchronize()
         if group_ids is not None:
             assert len(group_ids) == len(keys)
-            self.replicate_config.group_ids = group_ids
         batch_bytes = _sum_batch_bytes(sizes)
         put_start = time.perf_counter()
         try:
-            res = self.store.batch_put_from_multi_buffers(
-                keys, addrs, sizes, self.replicate_config
+            res = self._batch_put_with_pressure_retry(
+                keys, addrs, sizes, group_ids
             )
         except Exception as e:
             self._record_operation(
@@ -1244,16 +1295,15 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
             if group_ids is not None:
                 assert len(group_ids) == len(keys)
-                self.replicate_config.group_ids = group_ids
 
             batch_bytes = _sum_batch_bytes(sizes)
             put_start = time.perf_counter()
             try:
-                res = self.store.batch_put_from_multi_buffers(
+                res = self._batch_put_with_pressure_retry(
                     keys,
                     addrs,
                     sizes,
-                    self.replicate_config,
+                    group_ids,
                 )
                 failed = [i for i, v in enumerate(res) if v < 0]
                 self._record_operation(
