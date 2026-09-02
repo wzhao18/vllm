@@ -79,6 +79,20 @@ def _missing_sparse_mla(*_: Any, **__: Any) -> NoReturn:
     )
 
 
+def _missing_kda_prefill(*_: Any, **__: Any) -> NoReturn:
+    raise RuntimeError(
+        "FlashInfer recurrent KDA prefill is not available. Install "
+        "flashinfer-python 0.6.18.dev20260811 or newer."
+    )
+
+
+def _missing_kda_decode(*_: Any, **__: Any) -> NoReturn:
+    raise RuntimeError(
+        "FlashInfer fused KDA decode is not available. Install "
+        "flashinfer-python 0.6.18.dev20260811 or newer."
+    )
+
+
 def _get_submodule(module_name: str) -> Any | None:
     """Safely import a submodule and return it, or None if not available."""
     try:
@@ -162,6 +176,16 @@ flashinfer_trtllm_batch_decode_sparse_mla_dsv4 = _lazy_import_wrapper(
 flashinfer_xqa_batch_decode_with_kv_cache = _lazy_import_wrapper(
     "flashinfer.decode",
     "xqa_batch_decode_with_kv_cache",
+)
+flashinfer_recurrent_kda = _lazy_import_wrapper(
+    "flashinfer.kda",
+    "recurrent_kda",
+    fallback_fn=_missing_kda_prefill,
+)
+flashinfer_fused_kda_decode = _lazy_import_wrapper(
+    "flashinfer.kda_decode",
+    "fused_kda_decode",
+    fallback_fn=_missing_kda_decode,
 )
 
 
@@ -258,6 +282,28 @@ def has_flashinfer_cutedsl() -> bool:
     """Return ``True`` if FlashInfer cutedsl module is available."""
     return (
         has_flashinfer() and importlib.util.find_spec("flashinfer.cute_dsl") is not None
+    )
+
+
+@functools.cache
+def has_flashinfer_kda_prefill() -> bool:
+    """Return whether FlashInfer recurrent KDA prefill is available."""
+    if not has_flashinfer():
+        return False
+    mod = _get_submodule("flashinfer.kda")
+    return mod is not None and callable(getattr(mod, "recurrent_kda", None))
+
+
+@functools.cache
+def has_flashinfer_kda_decode() -> bool:
+    """Return whether FlashInfer fused KDA decode is available."""
+    if not has_flashinfer():
+        return False
+    mod = _get_submodule("flashinfer.kda_decode")
+    return (
+        mod is not None
+        and bool(getattr(mod, "_FUSED_KDA_DECODE_AVAILABLE", False))
+        and callable(getattr(mod, "fused_kda_decode", None))
     )
 
 
@@ -1093,6 +1139,8 @@ __all__ = [
     "flashinfer_trtllm_batch_decode_with_kv_cache_mla",
     "flashinfer_trtllm_batch_decode_sparse_mla_dsv4",
     "flashinfer_xqa_batch_decode_with_kv_cache",
+    "flashinfer_recurrent_kda",
+    "flashinfer_fused_kda_decode",
     "autotune",
     "has_flashinfer_moe",
     "has_flashinfer_comm",
@@ -1100,6 +1148,8 @@ __all__ = [
     "has_flashinfer_nvlink_one_sided",
     "has_flashinfer_cutlass_fused_moe",
     "has_flashinfer_cutedsl_grouped_gemm_nt_masked",
+    "has_flashinfer_kda_prefill",
+    "has_flashinfer_kda_decode",
     "has_flashinfer_cutedsl_moe_nvfp4",
     "has_flashinfer_b12x_moe",
     "has_flashinfer_b12x_gemm",

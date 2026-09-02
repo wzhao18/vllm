@@ -1,21 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Microbenchmark for the fused Kimi-K3 KDA decode kernel on ROCm.
+"""Microbenchmark Kimi K3's KDA decode backends under CUDA graph replay.
 
-Compares the single fused launch against the three-kernel Triton chain it
-replaces (packed causal conv1d update -> recurrent delta-rule decode -> gated
-output RMSNorm), at Kimi-K3 KDA shapes: 96 heads x 128, conv width 4,
-gate_lower_bound -5.0. Per-step figures scale the per-layer number by the 69
-KDA layers in the model.
-
-The recurrent state dominates the traffic (num_heads x 128 x 128 fp32 read and
-written per token), so the reported bandwidth is the useful metric: the fusion
-removes launches and the intermediate QKV / core-output round trips, not the
-state traffic itself.
+Compares FlashInfer fused decode with BF16 recurrent state, vLLM's native fused
+decode with FP32 recurrent state, and vLLM's Triton fallback with BF16 state.
+The default shape is Kimi K3 TP8: 12 heads x 128, convolution width 4, and gate
+lower bound -5.0. By default, each graph contains independently allocated state
+for all 69 KDA layers in the model.
 
 Example:
-    python benchmarks/kernels/benchmark_kimi_k3_kda_decode.py \
-        --tokens 1 8 32 64 128 --heads 12
+    .venv/bin/python benchmarks/kernels/benchmark_kimi_k3_kda_decode.py \
+        --tokens 1 8 32 64 128 --heads 12 --layers 69
 """
 
 import argparse
@@ -31,10 +26,6 @@ GATE_LOWER_BOUND = -5.0
 NORM_EPS = 1e-5
 NUM_KDA_LAYERS = 69
 DTYPE = torch.bfloat16
-
-
-def _bench(fn) -> float:
-    return triton.testing.do_bench(fn, warmup=50, rep=300, return_mode="median")
 
 
 def _bench_graph_layers(calls: list) -> float:
@@ -55,33 +46,13 @@ def _bench_graph_layers(calls: list) -> float:
     return total / len(calls)
 
 
-def _bench_graph(fn, repeats: int = NUM_KDA_LAYERS) -> float:
-    """Per-call milliseconds under CUDA-graph replay, as decode actually runs.
-
-    Eager timings credit a fusion for every Python dispatch it removes; inside a
-    captured graph those are gone, so this is the number that decides whether
-    the kernel is worth it in the server. The graph holds `repeats` calls (one
-    per KDA layer) because a one-call graph is swamped by the ~19 us HIP
-    graph-launch overhead, which a real 93-layer graph amortises away.
-    """
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        for _ in range(3):
-            fn()
-    torch.cuda.current_stream().wait_stream(stream)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        for _ in range(repeats):
-            fn()
-    total = triton.testing.do_bench(
-        graph.replay, warmup=50, rep=300, return_mode="median"
-    )
-    return total / repeats
-
-
 class Inputs:
-    def __init__(self, num_tokens: int, num_heads: int) -> None:
+    def __init__(
+        self,
+        num_tokens: int,
+        num_heads: int,
+        state_dtype: torch.dtype,
+    ) -> None:
         torch.manual_seed(0)
         device = "cuda"
         dim = num_heads * HEAD_DIM
@@ -102,7 +73,12 @@ class Inputs:
             num_slots, CONV_WIDTH - 1, 3 * dim, device=device, dtype=DTYPE
         )
         self.recurrent_state = torch.randn(
-            num_slots, num_heads, HEAD_DIM, HEAD_DIM, device=device, dtype=torch.float32
+            num_slots,
+            num_heads,
+            HEAD_DIM,
+            HEAD_DIM,
+            device=device,
+            dtype=state_dtype,
         )
         self.g1 = torch.randn(
             1, num_tokens, num_heads, HEAD_DIM, device=device, dtype=DTYPE
@@ -126,19 +102,6 @@ class Inputs:
         )
         self.conv_out = torch.empty_like(self.mixed_qkv)
 
-    def state_bytes(self) -> int:
-        """Recurrent-state traffic, identical for both implementations."""
-        return self.num_tokens * self.num_heads * HEAD_DIM * HEAD_DIM * 4 * 2
-
-
-def _gated_rmsnorm(
-    x: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor, eps: float
-) -> torch.Tensor:
-    x_float = x.float()
-    variance = x_float.pow(2).mean(dim=-1, keepdim=True)
-    normed = x_float * torch.rsqrt(variance + eps) * weight.float()
-    return (normed * torch.sigmoid(gate.float())).to(x.dtype)
-
 
 def _triton_gated_norm(inp: Inputs, core_attn_out: torch.Tensor) -> torch.Tensor:
     from vllm.third_party.flash_linear_attention.ops.kda import rms_norm_gated
@@ -153,11 +116,11 @@ def _triton_gated_norm(inp: Inputs, core_attn_out: torch.Tensor) -> torch.Tensor
     )
 
 
-def triton_chain(inp: Inputs, fused_norm: bool = False) -> None:
+def vllm_fallback_bf16(inp: Inputs) -> None:
     from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
         causal_conv1d_update,
     )
-    from vllm.models.kimi_k3.amd.ops.third_party.kda import (
+    from vllm.models.kimi_k3.nvidia.ops.third_party.kda import (
         fused_recurrent_kda_packed_decode,
     )
 
@@ -181,15 +144,10 @@ def triton_chain(inp: Inputs, fused_norm: bool = False) -> None:
         initial_state=inp.recurrent_state,
         state_indices=inp.state_indices,
     )
-    if fused_norm:
-        inp.out.copy_(_triton_gated_norm(inp, core_attn_out))
-    else:
-        inp.out.copy_(
-            _gated_rmsnorm(core_attn_out, inp.g2, inp.norm_weight_bf16, NORM_EPS)
-        )
+    inp.out.copy_(_triton_gated_norm(inp, core_attn_out))
 
 
-def fused(inp: Inputs) -> None:
+def native_fused_fp32(inp: Inputs) -> None:
     from vllm import _custom_ops as ops
 
     ops.fused_kda_decode(
@@ -211,23 +169,38 @@ def fused(inp: Inputs) -> None:
     )
 
 
+def flashinfer_fused_bf16(inp: Inputs) -> None:
+    from vllm.models.kimi_k3.nvidia.kda import _flashinfer_fused_kda_decode
+
+    _flashinfer_fused_kda_decode(
+        x=inp.mixed_qkv,
+        weight=inp.decode_conv1d_weight,
+        conv_state=inp.conv_state_t,
+        raw_g=inp.g1,
+        raw_beta=inp.beta,
+        A_log=inp.A_log,
+        dt_bias=inp.dt_bias,
+        state_indices=inp.state_indices,
+        state=inp.recurrent_state,
+        output_gate=inp.g2,
+        norm_weight=inp.decode_norm_weight,
+        lower_bound=GATE_LOWER_BOUND,
+        norm_eps=NORM_EPS,
+        out=inp.out,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tokens", type=int, nargs="+", default=[1, 8, 32, 64, 128])
     parser.add_argument(
-        "--graph",
-        action="store_true",
-        help="time under CUDA-graph replay instead of eager dispatch",
-    )
-    parser.add_argument(
         "--layers",
         type=int,
-        default=1,
+        default=NUM_KDA_LAYERS,
         help=(
-            "with --graph, give each of N layers its own state buffers so the "
-            "recurrent state cannot stay resident in Infinity Cache. "
-            f"Use {NUM_KDA_LAYERS} for a production-shaped step (needs "
-            "~0.9 GB per layer at 128 tokens / 12 heads)."
+            "give each of N layers its own state buffers so the recurrent "
+            "state cannot remain resident in L2; defaults to Kimi K3's "
+            f"{NUM_KDA_LAYERS} KDA layers"
         ),
     )
     parser.add_argument(
@@ -238,52 +211,61 @@ def main() -> None:
         help="KDA heads per rank (96 total / TP size)",
     )
     args = parser.parse_args()
+    if args.layers <= 0:
+        parser.error("--layers must be positive")
 
     if not hasattr(torch.ops._C, "fused_kda_decode"):
         raise SystemExit("vLLM was built without the fused KDA decode kernel")
 
     props = torch.cuda.get_device_properties(0)
-    bench = _bench_graph if args.graph else _bench
-    mode = "cuda-graph replay" if args.graph else "eager dispatch"
-    print(f"device: {props.name} ({props.gcnArchName})  timing: {mode}")
+    print(f"device: {props.name}  timing: cuda-graph replay  layers: {args.layers}")
     print(
-        f"{'heads':>6} {'tokens':>7} {'eager-norm':>11} {'triton-norm':>12} "
-        f"{'fused us':>9} {'speedup':>8} {'state TB/s':>11} {'saved ms/step':>14}"
+        f"{'heads':>6} {'tokens':>7} {'FI BF16 us':>11} "
+        f"{'native FP32 us':>14} {'fallback BF16 us':>16} "
+        f"{'FI/native':>10} {'FI/fallback':>12}"
     )
     for num_heads in args.heads:
         for num_tokens in args.tokens:
-            if args.graph and args.layers > 1:
-                layers = [Inputs(num_tokens, num_heads) for _ in range(args.layers)]
-                eager_ms = _bench_graph_layers(
-                    [functools.partial(triton_chain, i, False) for i in layers]
-                )
-                triton_ms = _bench_graph_layers(
-                    [functools.partial(triton_chain, i, True) for i in layers]
-                )
-                fused_ms = _bench_graph_layers(
-                    [functools.partial(fused, i) for i in layers]
-                )
-                inp = layers[0]
-                del layers
-                torch.accelerator.empty_cache()
-            else:
-                inp = Inputs(num_tokens, num_heads)
-                eager_ms = bench(functools.partial(triton_chain, inp, False))
-                triton_ms = bench(functools.partial(triton_chain, inp, True))
-                fused_ms = bench(functools.partial(fused, inp))
-            bandwidth = inp.state_bytes() * 1e3 / fused_ms / 1e12
-            saved = (triton_ms - fused_ms) * NUM_KDA_LAYERS
+            layers = [
+                Inputs(num_tokens, num_heads, torch.bfloat16)
+                for _ in range(args.layers)
+            ]
+            flashinfer_ms = _bench_graph_layers(
+                [functools.partial(flashinfer_fused_bf16, inp) for inp in layers]
+            )
+            del layers
+            torch.accelerator.empty_cache()
+
+            layers = [
+                Inputs(num_tokens, num_heads, torch.float32) for _ in range(args.layers)
+            ]
+            native_ms = _bench_graph_layers(
+                [functools.partial(native_fused_fp32, inp) for inp in layers]
+            )
+            del layers
+            torch.accelerator.empty_cache()
+
+            layers = [
+                Inputs(num_tokens, num_heads, torch.bfloat16)
+                for _ in range(args.layers)
+            ]
+            fallback_ms = _bench_graph_layers(
+                [functools.partial(vllm_fallback_bf16, inp) for inp in layers]
+            )
+            del layers
+            torch.accelerator.empty_cache()
+
             print(
-                f"{num_heads:>6} {num_tokens:>7} {eager_ms * 1e3:>11.2f} "
-                f"{triton_ms * 1e3:>12.2f} {fused_ms * 1e3:>9.2f} "
-                f"{triton_ms / fused_ms:>7.2f}x {bandwidth:>10.2f} {saved:>14.3f}"
+                f"{num_heads:>6} {num_tokens:>7} "
+                f"{flashinfer_ms * 1e3:>11.2f} {native_ms * 1e3:>14.2f} "
+                f"{fallback_ms * 1e3:>16.2f} "
+                f"{native_ms / flashinfer_ms:>9.2f}x "
+                f"{fallback_ms / flashinfer_ms:>11.2f}x"
             )
     print(
-        f"\n'eager-norm' is the chain as it runs today (FusedRMSNormGated falls "
-        f"back to ~10 eager ops when custom_ops are off);\n'triton-norm' uses the "
-        f"Triton rms_norm_gated kernel, which is the honest baseline for this "
-        f"fusion.\nspeedup and saved ms/step are against 'triton-norm', over "
-        f"{NUM_KDA_LAYERS} KDA layers per forward pass."
+        "\nFI/native and FI/fallback are speedups: values above 1 mean "
+        "FlashInfer BF16 is faster. Every measurement replays one CUDA graph "
+        "containing one call for each independently allocated KDA layer."
     )
 
 

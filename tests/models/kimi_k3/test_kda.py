@@ -12,8 +12,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+import vllm.models.kimi_k3.nvidia.kda as kda_module
 from vllm import _custom_ops as ops
 from vllm.model_executor import parameter
+from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+from vllm.model_executor.layers.mamba.mamba_utils import MambaStateDtypeCalculator
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_update
 from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
     gather_initial_states,
@@ -27,8 +30,14 @@ from vllm.models.kimi_k3.nvidia.kda import (
     _flashkda_prefill,
     _KimiGDNMergedColumnParallelLinear,
     _store_cache_checkpoints_kernel,
+    _flashinfer_fused_kda_decode,
+    _flashinfer_kda_prefill,
+    is_flashinfer_kda_decode_supported,
+    is_flashinfer_kda_prefill_supported,
     is_flashkda_supported,
     is_fused_kda_decode_supported,
+    resolve_kda_decode_backend,
+    resolve_kda_prefill_backend,
 )
 from vllm.models.kimi_k3.nvidia.model import KimiLinearForCausalLM
 from vllm.models.kimi_k3.nvidia.ops import recoverssm as recoverssm_ops
@@ -117,6 +126,7 @@ def test_kda_recoverssm_config_state_layout():
         ),
         cache_config=SimpleNamespace(
             mamba_cache_dtype="auto",
+            mamba_ssm_cache_dtype="auto",
             use_kda_recoverssm=True,
         ),
         parallel_config=SimpleNamespace(tensor_parallel_size=1),
@@ -133,6 +143,353 @@ def test_kda_recoverssm_config_state_layout():
         (4, 3, 32),
         (4, 3, 64),
     )
+
+
+@pytest.mark.parametrize(
+    ("ssm_cache_dtype", "expected"),
+    [
+        ("auto", torch.float32),
+        ("float32", torch.float32),
+        ("bfloat16", torch.bfloat16),
+    ],
+)
+def test_kda_state_dtype_respects_explicit_ssm_override(
+    ssm_cache_dtype: str,
+    expected: torch.dtype,
+):
+    assert MambaStateDtypeCalculator.kda_state_dtype(
+        torch.bfloat16,
+        "auto",
+        ssm_cache_dtype,
+    ) == (torch.bfloat16, expected)
+
+
+def test_kda_state_dtype_rejects_float16_ssm_state():
+    with pytest.raises(ValueError, match="supports only"):
+        MambaStateDtypeCalculator.kda_state_dtype(
+            torch.bfloat16,
+            "auto",
+            "float16",
+        )
+
+
+def test_store_recurrent_state_casts_to_cache_dtype():
+    state = torch.zeros(3, 2, 4, 4, dtype=torch.bfloat16)
+    indices = torch.tensor([2, 0], dtype=torch.int32)
+    updated = torch.randn(2, 2, 4, 4, dtype=torch.float32)
+
+    kda_module._store_recurrent_state(state, indices, updated)
+
+    torch.testing.assert_close(state[indices.long()], updated.to(torch.bfloat16))
+
+
+def test_resolve_kda_prefill_backend_prefers_flashinfer_for_bf16(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        kda_module,
+        "is_flashinfer_kda_prefill_supported",
+        lambda *_: True,
+    )
+    monkeypatch.setattr(kda_module, "is_flashkda_supported", lambda *_: True)
+
+    assert (
+        resolve_kda_prefill_backend(
+            "auto",
+            head_dim=128,
+            input_dtype=torch.bfloat16,
+            recurrent_state_dtype=torch.bfloat16,
+            lower_bound=-5.0,
+        )
+        == "flashinfer"
+    )
+
+
+def test_resolve_kda_prefill_backend_falls_back_without_flashinfer(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        kda_module,
+        "is_flashinfer_kda_prefill_supported",
+        lambda *_: False,
+    )
+    monkeypatch.setattr(kda_module, "is_flashkda_supported", lambda *_: True)
+
+    assert (
+        resolve_kda_prefill_backend(
+            "auto",
+            head_dim=128,
+            input_dtype=torch.bfloat16,
+            recurrent_state_dtype=torch.bfloat16,
+            lower_bound=-5.0,
+        )
+        == "flashkda"
+    )
+    with pytest.raises(RuntimeError, match="0.6.18.dev20260811"):
+        resolve_kda_prefill_backend(
+            "flashinfer",
+            head_dim=128,
+            input_dtype=torch.bfloat16,
+            recurrent_state_dtype=torch.bfloat16,
+            lower_bound=-5.0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("backend", "state_dtype", "native_supported", "expected"),
+    [
+        ("auto", torch.float32, True, "native"),
+        ("auto", torch.bfloat16, False, "flashinfer"),
+        ("flashinfer", torch.float32, True, "flashinfer"),
+    ],
+)
+def test_resolve_kda_decode_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    backend: str,
+    state_dtype: torch.dtype,
+    native_supported: bool,
+    expected: str,
+):
+    monkeypatch.setattr(
+        kda_module,
+        "is_fused_kda_decode_supported",
+        lambda *_: native_supported,
+    )
+    monkeypatch.setattr(
+        kda_module,
+        "is_flashinfer_kda_decode_supported",
+        lambda *_: True,
+    )
+
+    assert (
+        resolve_kda_decode_backend(
+            backend,
+            num_heads=12,
+            head_dim=128,
+            conv_width=4,
+            num_spec=0,
+            input_dtype=torch.bfloat16,
+            conv_state_dtype=torch.bfloat16,
+            recurrent_state_dtype=state_dtype,
+        )
+        == expected
+    )
+
+
+def test_resolve_kda_decode_backend_explicit_flashinfer_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        kda_module,
+        "is_fused_kda_decode_supported",
+        lambda *_: False,
+    )
+    monkeypatch.setattr(
+        kda_module,
+        "is_flashinfer_kda_decode_supported",
+        lambda *_: False,
+    )
+
+    with pytest.raises(RuntimeError, match="0.6.18.dev20260811"):
+        resolve_kda_decode_backend(
+            "flashinfer",
+            num_heads=12,
+            head_dim=128,
+            conv_width=4,
+            num_spec=0,
+            input_dtype=torch.bfloat16,
+            conv_state_dtype=torch.bfloat16,
+            recurrent_state_dtype=torch.bfloat16,
+        )
+
+
+def test_resolve_kda_decode_backend_native_does_not_probe_flashinfer(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        kda_module,
+        "is_fused_kda_decode_supported",
+        lambda *_: True,
+    )
+
+    def fail_if_probed(*_):
+        raise AssertionError("FlashInfer should not be probed for native decode")
+
+    monkeypatch.setattr(
+        kda_module,
+        "is_flashinfer_kda_decode_supported",
+        fail_if_probed,
+    )
+
+    assert (
+        resolve_kda_decode_backend(
+            "auto",
+            num_heads=12,
+            head_dim=128,
+            conv_width=4,
+            num_spec=0,
+            input_dtype=torch.bfloat16,
+            conv_state_dtype=torch.bfloat16,
+            recurrent_state_dtype=torch.float32,
+        )
+        == "native"
+    )
+
+
+@pytest.mark.parametrize(
+    ("capability", "cuda_version", "expected"),
+    [
+        ((10, 3), "12.9", True),
+        ((10, 3), "12.8", False),
+        ((10, 0), "12.8", True),
+        ((9, 0), "13.0", False),
+    ],
+)
+def test_flashinfer_kda_decode_arch_support(
+    monkeypatch: pytest.MonkeyPatch,
+    capability: tuple[int, int],
+    cuda_version: str,
+    expected: bool,
+):
+    monkeypatch.setattr(kda_module.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        kda_module.current_platform,
+        "get_device_capability",
+        lambda: SimpleNamespace(major=capability[0], minor=capability[1]),
+    )
+    monkeypatch.setattr(kda_module, "has_flashinfer_kda_decode", lambda: True)
+    monkeypatch.setattr(kda_module.torch.version, "cuda", cuda_version)
+    monkeypatch.setattr(kda_module, "is_conv_state_dim_first", lambda: False)
+
+    assert (
+        is_flashinfer_kda_decode_supported(
+            num_heads=12,
+            head_dim=128,
+            conv_width=4,
+            num_spec=0,
+            input_dtype=torch.bfloat16,
+            conv_state_dtype=torch.bfloat16,
+            recurrent_state_dtype=torch.bfloat16,
+        )
+        is expected
+    )
+
+
+def test_flashinfer_fused_kda_decode_argument_contract(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured: dict = {}
+
+    def fused_kda_decode(**kwargs):
+        captured.update(kwargs)
+        return kwargs["output"]
+
+    monkeypatch.setattr(kda_module, "flashinfer_fused_kda_decode", fused_kda_decode)
+    x = torch.randn(2, 24, dtype=torch.bfloat16)
+    out = torch.empty(1, 2, 1, 8, dtype=torch.bfloat16)
+    actual = _flashinfer_fused_kda_decode(
+        x=x,
+        weight=torch.randn(3, 4, 8),
+        conv_state=torch.randn(3, 24, 3, dtype=torch.bfloat16),
+        raw_g=torch.randn(1, 2, 1, 8, dtype=torch.bfloat16),
+        raw_beta=torch.randn(1, 2, 1, dtype=torch.bfloat16),
+        A_log=torch.randn(1),
+        dt_bias=torch.randn(8),
+        state_indices=torch.tensor([1, 2], dtype=torch.int32),
+        state=torch.randn(3, 1, 8, 8, dtype=torch.bfloat16),
+        output_gate=torch.randn(2, 1, 8, dtype=torch.bfloat16),
+        norm_weight=torch.randn(8),
+        lower_bound=-5.0,
+        norm_eps=1e-5,
+        out=out,
+    )
+
+    assert actual.data_ptr() == out.data_ptr()
+    assert captured["raw_gate"].shape == (1, 2, 1, 8)
+    assert captured["output"] is out
+    assert captured["lower_bound"] == -5.0
+
+
+@pytest.mark.parametrize(
+    ("capability", "cuda_version", "expected"),
+    [
+        ((10, 3), "12.9", True),
+        ((10, 3), "12.8", False),
+        ((10, 0), "12.8", True),
+        ((10, 0), "12.7", False),
+        ((9, 0), "13.0", False),
+    ],
+)
+def test_flashinfer_kda_prefill_arch_support(
+    monkeypatch: pytest.MonkeyPatch,
+    capability: tuple[int, int],
+    cuda_version: str,
+    expected: bool,
+):
+    monkeypatch.setattr(kda_module.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        kda_module.current_platform,
+        "get_device_capability",
+        lambda: SimpleNamespace(major=capability[0], minor=capability[1]),
+    )
+    monkeypatch.setattr(kda_module, "has_flashinfer_kda_prefill", lambda: True)
+    monkeypatch.setattr(kda_module.torch.version, "cuda", cuda_version)
+
+    assert (
+        is_flashinfer_kda_prefill_supported(
+            head_dim=128,
+            input_dtype=torch.bfloat16,
+            recurrent_state_dtype=torch.bfloat16,
+            lower_bound=-5.0,
+        )
+        is expected
+    )
+
+
+def test_flashinfer_kda_prefill_argument_contract(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured: dict = {}
+
+    def recurrent_kda(**kwargs):
+        captured.update(kwargs)
+        return kwargs["output"], kwargs["initial_state"]
+
+    monkeypatch.setattr(kda_module, "flashinfer_recurrent_kda", recurrent_kda)
+    q = torch.randn(1, 5, 2, 4, dtype=torch.bfloat16)
+    beta_storage = torch.randn(1, 5, 5, dtype=torch.bfloat16)
+    raw_beta = beta_storage[..., ::2]
+    initial_state = torch.randn(2, 2, 4, 4, dtype=torch.bfloat16)
+    out = torch.empty_like(q)
+    seq_order = torch.tensor([1, 0], dtype=torch.int32)
+    prefill_workspace = object()
+
+    actual_out, actual_state = _flashinfer_kda_prefill(
+        q=q,
+        k=q,
+        v=q,
+        raw_g=q,
+        raw_beta=raw_beta,
+        A_log=torch.randn(2, dtype=torch.float32),
+        dt_bias=torch.randn(2, 4, dtype=torch.float32),
+        lower_bound=-5.0,
+        initial_state=initial_state,
+        cu_seqlens=torch.tensor([0, 2, 5], dtype=torch.int32),
+        out=out,
+        seq_order=seq_order,
+        prefill_workspace=prefill_workspace,
+    )
+
+    assert actual_out.data_ptr() == out.data_ptr()
+    assert actual_state.data_ptr() == initial_state.data_ptr()
+    assert captured["use_qk_l2norm_in_kernel"]
+    assert captured["use_gate_in_kernel"]
+    assert captured["beta_is_logit"]
+    assert not captured["output_final_state"]
+    assert captured["seq_order"] is seq_order
+    assert captured["prefill_workspace"] is prefill_workspace
+    assert captured["beta"].is_contiguous()
+    assert captured["scale"] == 0.5
 
 
 @torch.inference_mode()
@@ -190,6 +547,49 @@ def naive_recurrent_kda(
     if not output_final_state:
         S = None
     return o.to(dtype), S
+
+
+def bf16_state_recurrent_kda_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    raw_g: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    lower_bound: float,
+    initial_state: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reference recurrence that rounds the state to BF16 after every token."""
+    _, _, num_heads, head_dim = q.shape
+    q_flat = F.normalize(q.float(), dim=-1).view(-1, num_heads, head_dim)
+    k_flat = F.normalize(k.float(), dim=-1).view(-1, num_heads, head_dim)
+    v_flat = v.float().view(-1, num_heads, head_dim)
+    raw_g_flat = raw_g.float().view(-1, num_heads, head_dim)
+    beta = raw_beta.float().sigmoid().view(-1, num_heads)
+    gate = lower_bound * torch.sigmoid(
+        A_log.exp().view(1, num_heads, 1)
+        * (raw_g_flat + dt_bias.view(1, num_heads, head_dim))
+    )
+    decay = gate.exp()
+    state = initial_state.clone()
+    output = torch.empty_like(v_flat)
+    offsets = cu_seqlens.tolist()
+
+    for sequence, (start, end) in enumerate(zip(offsets[:-1], offsets[1:])):
+        for token in range(start, end):
+            decayed = state[sequence].float() * decay[token].unsqueeze(1)
+            predicted = torch.einsum("hk,hvk->hv", k_flat[token], decayed)
+            residual = beta[token].unsqueeze(-1) * (v_flat[token] - predicted)
+            updated = decayed + residual.unsqueeze(-1) * k_flat[token].unsqueeze(1)
+            state[sequence] = updated.to(torch.bfloat16)
+            projected = torch.einsum(
+                "hk,hvk->hv", q_flat[token], state[sequence].float()
+            )
+            output[token] = (head_dim**-0.5 * projected).to(torch.bfloat16)
+
+    return output.view_as(v).to(v.dtype), state
 
 
 def assert_close(
@@ -929,28 +1329,46 @@ def test_kda_recoverssm_verify_and_group_commit(
     [
         (12, 1, -5.0, True),
         (12, 4, None, False),
-        (24, 4, None, False),
+        (24, 4, -5.0, True),
         (48, 1, -5.0, True),
         (96, 1, -5.0, True),
     ],
 )
+@pytest.mark.parametrize("decode_backend", ["native", "flashinfer"])
 @torch.inference_mode()
 def test_fused_kda_decode_correctness(
     num_heads: int,
     num_seqs: int,
     lower_bound: float | None,
     fuse_output_norm: bool,
+    decode_backend: str,
 ):
     D, W = 128, 4
-    if not is_fused_kda_decode_supported(
-        num_heads,
-        D,
-        W,
-        num_spec=0,
-        input_dtype=torch.bfloat16,
-        conv_state_dtype=torch.bfloat16,
-    ):
-        pytest.skip("Fused KDA decode is not supported on this platform")
+    state_dtype = torch.bfloat16 if decode_backend == "flashinfer" else torch.float32
+    if decode_backend == "flashinfer":
+        if not fuse_output_norm:
+            pytest.skip("FlashInfer's fused decode always applies output norm")
+        supported = is_flashinfer_kda_decode_supported(
+            num_heads,
+            D,
+            W,
+            num_spec=0,
+            input_dtype=torch.bfloat16,
+            conv_state_dtype=torch.bfloat16,
+            recurrent_state_dtype=state_dtype,
+        )
+    else:
+        supported = is_fused_kda_decode_supported(
+            num_heads,
+            D,
+            W,
+            num_spec=0,
+            input_dtype=torch.bfloat16,
+            conv_state_dtype=torch.bfloat16,
+            recurrent_state_dtype=state_dtype,
+        )
+    if not supported:
+        pytest.skip(f"{decode_backend} fused KDA decode is not supported")
     torch.manual_seed(967 + num_heads + num_seqs)
     dim = num_heads * D
     slots = num_seqs + 2
@@ -1007,7 +1425,7 @@ def test_fused_kda_decode_correctness(
         D,
         dtype=torch.float32,
         device=DEVICE,
-    )
+    ).to(state_dtype)
 
     conv_ref = conv_seed.clone()
     state_ref = state_seed.clone()
@@ -1042,7 +1460,7 @@ def test_fused_kda_decode_correctness(
     conv_slot_elements = 3 * dim * (W - 1)
     state_slot_elements = num_heads * D * D
     conv_slot_bytes = conv_slot_elements * torch.bfloat16.itemsize
-    page_bytes = conv_slot_bytes + state_slot_elements * torch.float32.itemsize
+    page_bytes = conv_slot_bytes + state_slot_elements * state_dtype.itemsize
     cache_storage = torch.empty(slots * page_bytes, dtype=torch.uint8, device=DEVICE)
     conv_actual = torch.as_strided(
         cache_storage.view(torch.bfloat16),
@@ -1050,30 +1468,69 @@ def test_fused_kda_decode_correctness(
         stride=(page_bytes // torch.bfloat16.itemsize, 1, 3 * dim),
     )
     state_actual = torch.as_strided(
-        cache_storage.view(torch.float32),
+        cache_storage.view(state_dtype),
         size=(slots, num_heads, D, D),
-        stride=(page_bytes // torch.float32.itemsize, D * D, D, 1),
-        storage_offset=conv_slot_bytes // torch.float32.itemsize,
+        stride=(page_bytes // state_dtype.itemsize, D * D, D, 1),
+        storage_offset=conv_slot_bytes // state_dtype.itemsize,
     )
     conv_actual.copy_(conv_seed)
     state_actual.copy_(state_seed)
     fused_weight = weight.reshape(3, dim, W).transpose(1, 2).contiguous()
-    actual = ops.fused_kda_decode(
-        x=packed_x,
-        weight=fused_weight,
-        bias=None,
-        conv_state=conv_actual,
-        raw_g=raw_g,
-        raw_beta=raw_beta,
-        A_log=A_log,
-        dt_bias=dt_bias,
-        state_indices=state_indices,
-        state=state_actual,
-        lower_bound=lower_bound,
-        output_gate=output_gate if fuse_output_norm else None,
-        norm_weight=norm_weight if fuse_output_norm else None,
-        norm_eps=norm_eps,
-    )
+    if decode_backend == "flashinfer":
+        output = torch.empty(
+            1,
+            num_seqs,
+            num_heads,
+            D,
+            dtype=torch.bfloat16,
+            device=DEVICE,
+        )
+
+        def run_flashinfer_decode() -> torch.Tensor:
+            return _flashinfer_fused_kda_decode(
+                x=packed_x,
+                weight=fused_weight,
+                conv_state=conv_actual,
+                raw_g=raw_g,
+                raw_beta=raw_beta,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                state_indices=state_indices,
+                state=state_actual,
+                output_gate=output_gate,
+                norm_weight=norm_weight,
+                lower_bound=lower_bound,
+                norm_eps=norm_eps,
+                out=output,
+            )
+
+        run_flashinfer_decode()
+        conv_actual.copy_(conv_seed)
+        state_actual.copy_(state_seed)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = run_flashinfer_decode()
+        conv_actual.copy_(conv_seed)
+        state_actual.copy_(state_seed)
+        graph.replay()
+        torch.accelerator.synchronize()
+    else:
+        actual = ops.fused_kda_decode(
+            x=packed_x,
+            weight=fused_weight,
+            bias=None,
+            conv_state=conv_actual,
+            raw_g=raw_g,
+            raw_beta=raw_beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            state_indices=state_indices,
+            state=state_actual,
+            lower_bound=lower_bound,
+            output_gate=output_gate if fuse_output_norm else None,
+            norm_weight=norm_weight if fuse_output_norm else None,
+            norm_eps=norm_eps,
+        )
 
     torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(conv_actual, conv_ref, atol=0, rtol=0)
@@ -1088,7 +1545,137 @@ def test_fused_kda_decode_rejects_speculative_conv_state():
         num_spec=2,
         input_dtype=torch.bfloat16,
         conv_state_dtype=torch.bfloat16,
+        recurrent_state_dtype=torch.float32,
     )
+
+
+def test_fused_kda_decode_rejects_bfloat16_recurrent_state():
+    assert not is_fused_kda_decode_supported(
+        num_heads=12,
+        head_dim=128,
+        conv_width=4,
+        num_spec=0,
+        input_dtype=torch.bfloat16,
+        conv_state_dtype=torch.bfloat16,
+        recurrent_state_dtype=torch.bfloat16,
+    )
+
+
+@torch.inference_mode()
+def test_flashinfer_kda_prefill_correctness():
+    if not is_flashinfer_kda_prefill_supported(
+        128,
+        torch.bfloat16,
+        torch.bfloat16,
+        -5.0,
+    ):
+        pytest.skip("FlashInfer KDA prefill is not supported on this platform")
+
+    B, T, H, D = 1, 48, 12, 128
+    torch.manual_seed(27)
+    q, k, v, raw_g = [
+        torch.randn(B, T, H, D, dtype=torch.bfloat16, device=DEVICE) for _ in range(4)
+    ]
+    beta_storage = torch.randn(B, T, 2 * H, dtype=torch.bfloat16, device=DEVICE)
+    raw_beta = beta_storage[..., ::2]
+    A_log = 0.5 * torch.randn(H, dtype=torch.float32, device=DEVICE)
+    dt_bias = 0.1 * torch.randn(H, D, dtype=torch.float32, device=DEVICE)
+    cu_seqlens = torch.tensor([0, 17, T], dtype=torch.int32, device=DEVICE)
+    initial_state = 0.1 * torch.randn(
+        2,
+        H,
+        D,
+        D,
+        dtype=torch.bfloat16,
+        device=DEVICE,
+    )
+
+    expected_out, expected_state = bf16_state_recurrent_kda_reference(
+        q=q,
+        k=k,
+        v=v,
+        raw_g=raw_g,
+        raw_beta=raw_beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=-5.0,
+        initial_state=initial_state.clone(),
+        cu_seqlens=cu_seqlens,
+    )
+    actual_out, actual_state = _flashinfer_kda_prefill(
+        q=q,
+        k=k,
+        v=v,
+        raw_g=raw_g,
+        raw_beta=raw_beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=-5.0,
+        initial_state=initial_state.clone(),
+        cu_seqlens=cu_seqlens,
+        out=torch.empty_like(q),
+    )
+
+    torch.testing.assert_close(actual_out, expected_out, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(actual_state, expected_state, atol=1e-2, rtol=1e-2)
+
+
+@torch.inference_mode()
+def test_flashinfer_kda_prefill_breakable_graph_cross_stream():
+    if not is_flashinfer_kda_prefill_supported(
+        128,
+        torch.bfloat16,
+        torch.bfloat16,
+        -5.0,
+    ):
+        pytest.skip("FlashInfer KDA prefill is not supported on this platform")
+
+    B, T, H, D = 1, 8, 12, 128
+    q, k, v, raw_g = [
+        torch.randn(B, T, H, D, dtype=torch.bfloat16, device=DEVICE) for _ in range(4)
+    ]
+    raw_beta = torch.randn(B, T, H, dtype=torch.bfloat16, device=DEVICE)
+    initial_state = torch.randn(
+        B,
+        H,
+        D,
+        D,
+        dtype=torch.bfloat16,
+        device=DEVICE,
+    )
+    kwargs = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "raw_g": raw_g,
+        "raw_beta": raw_beta,
+        "A_log": torch.randn(H, dtype=torch.float32, device=DEVICE),
+        "dt_bias": torch.randn(H, D, dtype=torch.float32, device=DEVICE),
+        "lower_bound": -5.0,
+        "initial_state": initial_state,
+        "cu_seqlens": torch.tensor([0, T], dtype=torch.int64, device=DEVICE),
+        "out": torch.empty_like(q),
+        "seq_order": torch.zeros(B, dtype=torch.int32, device=DEVICE),
+    }
+
+    capture_stream = torch.Stream(device=DEVICE)
+    original_stream = torch.accelerator.current_stream()
+    torch.accelerator.set_stream(capture_stream)
+    try:
+        graph_value = torch.zeros(1, device=DEVICE)
+        capture = BreakableCUDAGraphCapture()
+        with capture:
+            graph_value.add_(1)
+            capture.add_eager(lambda: _flashinfer_kda_prefill(**kwargs))
+            graph_value.add_(1)
+        capture_stream.synchronize()
+    finally:
+        torch.accelerator.set_stream(original_stream)
+
+    torch.testing.assert_close(graph_value, torch.zeros_like(graph_value))
+    capture.replay()
+    torch.accelerator.synchronize()
+    torch.testing.assert_close(graph_value, torch.full_like(graph_value, 2))
 
 
 @torch.inference_mode()
