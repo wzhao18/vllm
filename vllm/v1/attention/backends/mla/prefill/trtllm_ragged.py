@@ -103,12 +103,14 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
             raise ValueError(
                 "TRTLLM ragged prefill requires a non-empty 1D query-length tensor"
             )
-        if bool(torch.any(query_lens_cpu < 0).item()):
-            raise ValueError("TRTLLM ragged prefill query lengths must be non-negative")
-        active_rows = query_lens_cpu > 0
-        self._has_active_rows = bool(torch.all(active_rows).item())
+        min_query_len = int(torch.min(query_lens_cpu).item())
+        if min_query_len < 0:
+            raise ValueError(
+                "TRTLLM ragged prefill query lengths must be non-negative"
+            )
+        self._has_active_rows = min_query_len > 0
         if not self._has_active_rows:
-            has_mixed_rows = bool(torch.any(active_rows).item())
+            has_mixed_rows = bool(torch.any(query_lens_cpu > 0).item())
             if not self._use_pcp or has_mixed_rows:
                 raise ValueError(
                     "TRTLLM ragged prefill contains mixed active and empty query "
