@@ -152,7 +152,7 @@ def test_store_recurrent_state_casts_to_cache_dtype():
     torch.testing.assert_close(state[indices.long()], updated.to(torch.bfloat16))
 
 
-def test_resolve_kda_prefill_backend_prefers_flashinfer_for_bf16(
+def test_resolve_kda_prefill_backend_preserves_flashkda_default(
     monkeypatch: pytest.MonkeyPatch,
 ):
     monkeypatch.setattr(
@@ -170,7 +170,7 @@ def test_resolve_kda_prefill_backend_prefers_flashinfer_for_bf16(
             recurrent_state_dtype=torch.bfloat16,
             lower_bound=-5.0,
         )
-        == "flashinfer"
+        == "flashkda"
     )
 
 
@@ -206,7 +206,7 @@ def test_resolve_kda_prefill_backend_falls_back_without_flashinfer(monkeypatch):
     ("backend", "state_dtype", "native_supported", "expected"),
     [
         ("auto", torch.float32, True, "native"),
-        ("auto", torch.bfloat16, False, "flashinfer"),
+        ("auto", torch.bfloat16, False, "triton"),
         ("flashinfer", torch.float32, True, "flashinfer"),
     ],
 )
@@ -1491,6 +1491,19 @@ def test_fused_kda_decode_rejects_speculative_conv_state():
         num_spec=2,
         input_dtype=torch.bfloat16,
         conv_state_dtype=torch.bfloat16,
+        recurrent_state_dtype=torch.float32,
+    )
+
+
+def test_fused_kda_decode_rejects_bfloat16_recurrent_state():
+    assert not is_fused_kda_decode_supported(
+        num_heads=12,
+        head_dim=128,
+        conv_width=4,
+        num_spec=0,
+        input_dtype=torch.bfloat16,
+        conv_state_dtype=torch.bfloat16,
+        recurrent_state_dtype=torch.bfloat16,
     )
 
 

@@ -166,7 +166,7 @@ def is_fused_kda_decode_supported(
     num_spec: int,
     input_dtype: torch.dtype,
     conv_state_dtype: torch.dtype,
-    recurrent_state_dtype: torch.dtype | None = None,
+    recurrent_state_dtype: torch.dtype,
 ) -> bool:
     # The fused kernel handles both conv-state cache layouts (SD and DS); the
     # inner strides are selected from the tensor at launch time.
@@ -177,6 +177,7 @@ def is_fused_kda_decode_supported(
         or num_spec != 0
         or input_dtype != torch.bfloat16
         or conv_state_dtype != torch.bfloat16
+        or recurrent_state_dtype != torch.float32
         or not hasattr(torch.ops._C, "fused_kda_decode")
     ):
         return False
@@ -256,8 +257,8 @@ def resolve_kda_decode_backend(
     if backend == "native":
         raise RuntimeError(
             "Native fused KDA decode requires a supported CUDA architecture, "
-            "bfloat16 activations and convolution state, head_dim=128, "
-            "convolution width 4, and no speculation."
+            "bfloat16 activations and convolution state, float32 recurrent "
+            "state, head_dim=128, convolution width 4, and no speculation."
         )
 
     flashinfer_supported = is_flashinfer_kda_decode_supported(
@@ -269,7 +270,7 @@ def resolve_kda_decode_backend(
         conv_state_dtype,
         recurrent_state_dtype,
     )
-    if flashinfer_supported:
+    if flashinfer_supported and backend == "flashinfer":
         logger.info_once("Using FlashInfer fused KDA decode backend.")
         return "flashinfer"
     if backend == "flashinfer":
@@ -538,7 +539,7 @@ def resolve_kda_prefill_backend(
             "FlashKDA requires CUDA SM90/SM10x/SM12x, bfloat16, "
             "head_dim=128, and a bounded KDA gate."
         )
-    if flashinfer_supported and backend in ("auto", "flashinfer"):
+    if flashinfer_supported and backend == "flashinfer":
         logger.info_once("Using FlashInfer KDA prefill backend.")
         return "flashinfer"
     if flashkda_supported and backend in ("auto", "flashkda"):
