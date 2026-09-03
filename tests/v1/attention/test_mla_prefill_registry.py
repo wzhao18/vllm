@@ -165,8 +165,9 @@ def test_trtllm_ragged_rejects_inactive_context_row():
 
 
 @pytest.mark.parametrize("return_softmax_lse", [False, True])
+@pytest.mark.parametrize("num_padded_tokens", [0, 4])
 def test_trtllm_ragged_handles_empty_pcp_rank_without_kernel_launch(
-    monkeypatch, return_softmax_lse
+    monkeypatch, return_softmax_lse, num_padded_tokens
 ):
     backend = object.__new__(TrtllmRaggedPrefillBackend)
     backend.num_heads = 2
@@ -189,9 +190,9 @@ def test_trtllm_ragged_handles_empty_pcp_rank_without_kernel_launch(
         "flashinfer.prefill.trtllm_ragged_attention_deepseek",
         fail_ragged_attention,
     )
-    q = torch.empty(0, 2, 192)
-    k = torch.empty(0, 2, 192)
-    v = torch.empty(0, 2, 128)
+    q = torch.empty(num_padded_tokens, 2, 192)
+    k = torch.empty(num_padded_tokens, 2, 192)
+    v = torch.empty(num_padded_tokens, 2, 128)
     result = backend.run_prefill_new_tokens(
         q,
         k,
@@ -201,11 +202,14 @@ def test_trtllm_ragged_handles_empty_pcp_rank_without_kernel_launch(
 
     if return_softmax_lse:
         out, lse = result
-        assert out.shape == (0, 2, 128)
-        assert lse.shape == (2, 0)
+        assert out.shape == (num_padded_tokens, 2, 128)
+        assert torch.count_nonzero(out) == 0
+        assert lse.shape == (2, num_padded_tokens)
+        assert torch.isneginf(lse).all()
     else:
         assert isinstance(result, torch.Tensor)
-        assert result.shape == (0, 2, 128)
+        assert result.shape == (num_padded_tokens, 2, 128)
+        assert torch.count_nonzero(result) == 0
 
 
 @pytest.fixture(autouse=True)
