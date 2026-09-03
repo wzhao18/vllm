@@ -270,6 +270,7 @@ class KDACheckpointMetadata:
 class KimiK3KDAMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
     flashinfer_prefill_query_start_loc: torch.Tensor | None = None
     flashinfer_prefill_seq_order: torch.Tensor | None = None
+    flashinfer_spec_query_start_loc: torch.Tensor | None = None
     recoverssm_commit: KDARecoverSSMCommitMetadata | None = None
     recoverssm_context: "KDARecoverSSMCommitContext | None" = field(
         default=None, repr=False, compare=False
@@ -322,6 +323,22 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
         self.spec_state_slots = 1 if self.use_recoverssm else self.num_spec + 1
         self.recoverssm_num_accepted_tokens: torch.Tensor | None = None
         self.recoverssm_context: KDARecoverSSMCommitContext | None = None
+        additional_config = vllm_config.additional_config
+        use_flashinfer_spec_decode = (
+            isinstance(additional_config, dict)
+            and additional_config.get("kda_decode_backend") == "flashinfer"
+            and self.num_spec > 0
+        )
+        self.flashinfer_spec_query_start_loc = (
+            torch.arange(
+                self.decode_cudagraph_max_bs + 1,
+                dtype=torch.int32,
+                device=device,
+            )
+            * (self.num_spec + 1)
+            if use_flashinfer_spec_decode
+            else None
+        )
         if self.use_recoverssm:
             max_num_reqs = vllm_config.scheduler_config.max_num_seqs
             self.spec_state_indices_tensor = torch.empty(
@@ -414,6 +431,9 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
                 if num_spec_decodes == 0:
                     spec_sequence_masks_cpu = None
 
+        flashinfer_spec_query_start_loc = None
+        full_spec_windows = False
+        staged_spec_metadata = False
         spec_request_indices = None
         if num_spec_decodes == 0:
             # The runner orders ordinary decodes before prefills.
@@ -473,6 +493,9 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
                 num_decode_tokens = num_non_spec_tokens
 
             num_spec_decode_tokens = num_query_tokens - num_non_spec_tokens
+            full_spec_windows = torch.all(
+                query_lens_cpu[spec_sequence_masks_cpu] == self.num_spec + 1
+            ).item()
 
             if num_prefills == 0 and num_decodes == 0:
                 spec_token_indx = None
@@ -651,6 +674,7 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
             and batch_size <= self.spec_state_indices_tensor.shape[0]
             and num_spec_decode_tokens <= self.decode_cudagraph_max_bs
         ):
+            staged_spec_metadata = True
             # Equivalent PyTorch staging:
             #   state[:N].copy_(state_src); state[N:].fill_(NULL_BLOCK_ID)
             #   qsl[:N + 1].copy_(qsl_src); qsl[N + 1:].fill_(qsl_src[-1])
@@ -668,6 +692,22 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
             spec_state_indices_tensor = self.spec_state_indices_tensor[:batch_size]
             spec_query_start_loc = self.spec_query_start_loc[: batch_size + 1]
             num_accepted_tokens = self.num_accepted_tokens[:batch_size]
+            if (
+                full_spec_windows
+                and self.flashinfer_spec_query_start_loc is not None
+                and m.num_actual_tokens == batch_size * (self.num_spec + 1)
+            ):
+                flashinfer_spec_query_start_loc = self.flashinfer_spec_query_start_loc[
+                    : batch_size + 1
+                ]
+
+        if (
+            num_spec_decodes > 0
+            and full_spec_windows
+            and not staged_spec_metadata
+            and flashinfer_spec_query_start_loc is None
+        ):
+            flashinfer_spec_query_start_loc = spec_query_start_loc
 
         if (
             self.use_full_cuda_graph
@@ -720,6 +760,7 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
             spec_token_indx=spec_token_indx,
             non_spec_token_indx=non_spec_token_indx,
             num_accepted_tokens=num_accepted_tokens,
+            flashinfer_spec_query_start_loc=flashinfer_spec_query_start_loc,
             recoverssm_commit=recoverssm_commit,
             recoverssm_context=(
                 self._get_recoverssm_context()

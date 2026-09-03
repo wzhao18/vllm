@@ -26,6 +26,7 @@ from vllm.models.kimi_k3.nvidia import kda as nvidia_kda
 from vllm.models.kimi_k3.nvidia.kda import (
     _flashinfer_fused_kda_decode,
     _flashinfer_kda_prefill,
+    _flashinfer_recurrent_kda_decode,
     _flashkda_prefill,
     _store_cache_checkpoints_kernel,
     is_flashinfer_kda_decode_supported,
@@ -277,6 +278,33 @@ def test_resolve_kda_decode_backend(
     )
 
 
+def test_resolve_kda_decode_backend_supports_flashinfer_spec_decode(monkeypatch):
+    monkeypatch.setattr(
+        nvidia_kda,
+        "is_fused_kda_decode_supported",
+        lambda *_: False,
+    )
+    monkeypatch.setattr(
+        nvidia_kda,
+        "is_flashinfer_kda_decode_supported",
+        lambda *_: True,
+    )
+
+    assert (
+        resolve_kda_decode_backend(
+            "flashinfer",
+            num_heads=12,
+            head_dim=128,
+            conv_width=4,
+            num_spec=4,
+            input_dtype=torch.bfloat16,
+            conv_state_dtype=torch.bfloat16,
+            recurrent_state_dtype=torch.bfloat16,
+        )
+        == "flashinfer"
+    )
+
+
 def test_resolve_kda_decode_backend_explicit_flashinfer_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -376,6 +404,36 @@ def test_flashinfer_kda_decode_arch_support(
     )
 
 
+def test_flashinfer_recurrent_kda_decode_requires_bfloat16_state(monkeypatch):
+    monkeypatch.setattr(nvidia_kda.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        nvidia_kda.current_platform,
+        "get_device_capability",
+        lambda: SimpleNamespace(major=10, minor=3),
+    )
+    monkeypatch.setattr(nvidia_kda, "has_flashinfer_recurrent_kda_decode", lambda: True)
+    monkeypatch.setattr(nvidia_kda.torch.version, "cuda", "12.9")
+
+    assert is_flashinfer_kda_decode_supported(
+        num_heads=12,
+        head_dim=128,
+        conv_width=4,
+        num_spec=4,
+        input_dtype=torch.bfloat16,
+        conv_state_dtype=torch.bfloat16,
+        recurrent_state_dtype=torch.bfloat16,
+    )
+    assert not is_flashinfer_kda_decode_supported(
+        num_heads=12,
+        head_dim=128,
+        conv_width=4,
+        num_spec=4,
+        input_dtype=torch.bfloat16,
+        conv_state_dtype=torch.bfloat16,
+        recurrent_state_dtype=torch.float32,
+    )
+
+
 def test_flashinfer_fused_kda_decode_argument_contract(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -409,6 +467,44 @@ def test_flashinfer_fused_kda_decode_argument_contract(
     assert captured["raw_gate"].shape == (1, 2, 1, 8)
     assert captured["output"] is out
     assert captured["lower_bound"] == -5.0
+
+
+def test_flashinfer_recurrent_kda_decode_argument_contract(monkeypatch):
+    captured: dict = {}
+
+    def recurrent_kda(**kwargs):
+        captured.update(kwargs)
+        return kwargs["output"], None
+
+    monkeypatch.setattr(nvidia_kda, "flashinfer_recurrent_kda", recurrent_kda)
+    storage = torch.randn(1, 5, 7, 4, dtype=torch.bfloat16)
+    q = storage[:, :, ::3]
+    state = torch.randn(7, 2, 4, 4, dtype=torch.bfloat16)
+    state_indices = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.int32)
+    out = torch.empty_like(q.contiguous())
+
+    actual, actual_state = _flashinfer_recurrent_kda_decode(
+        q=q,
+        k=q,
+        v=q,
+        raw_g=q,
+        raw_beta=torch.randn(1, 5, 2, dtype=torch.bfloat16),
+        A_log=torch.randn(2),
+        dt_bias=torch.randn(8),
+        lower_bound=-5.0,
+        initial_state=state,
+        cu_seqlens=torch.tensor([0, 5], dtype=torch.int32),
+        ssm_state_indices=state_indices,
+        num_accepted_tokens=torch.ones(1, dtype=torch.int32),
+        out=out,
+    )
+
+    assert actual is out
+    assert actual_state is state
+    assert captured["initial_state"] is state
+    assert captured["num_spec_tokens"] == 4
+    assert captured["beta_is_logit"] is True
+    assert captured["q"].is_contiguous()
 
 
 @pytest.mark.parametrize(
@@ -1517,6 +1613,108 @@ def test_fused_kda_decode_correctness(
     torch.testing.assert_close(state_actual, state_ref, atol=3e-2, rtol=3e-2)
 
 
+@torch.inference_mode()
+def test_flashinfer_recurrent_kda_spec_decode_correctness():
+    num_seqs, num_heads, head_dim, num_spec = 4, 12, 128, 4
+    if not is_flashinfer_kda_decode_supported(
+        num_heads,
+        head_dim,
+        conv_width=4,
+        num_spec=num_spec,
+        input_dtype=torch.bfloat16,
+        conv_state_dtype=torch.bfloat16,
+        recurrent_state_dtype=torch.bfloat16,
+    ):
+        pytest.skip("FlashInfer recurrent KDA decode is not supported")
+
+    torch.manual_seed(967)
+    num_tokens = num_seqs * (num_spec + 1)
+    packed_qkv = torch.randn(
+        num_tokens,
+        3 * num_heads * head_dim,
+        dtype=torch.bfloat16,
+        device=DEVICE,
+    )
+    q, k, v = (
+        x.view(1, num_tokens, num_heads, head_dim)
+        for x in packed_qkv.split(num_heads * head_dim, dim=-1)
+    )
+    raw_g = torch.randn_like(q)
+    raw_beta = torch.randn(
+        1, num_tokens, num_heads, dtype=torch.bfloat16, device=DEVICE
+    )
+    A_log = torch.randn(num_heads, dtype=torch.float32, device=DEVICE)
+    dt_bias = torch.randn(num_heads * head_dim, dtype=torch.float32, device=DEVICE)
+    cu_seqlens = torch.arange(
+        0,
+        num_tokens + 1,
+        num_spec + 1,
+        dtype=torch.int32,
+        device=DEVICE,
+    )
+    state_indices = torch.arange(
+        1, num_tokens + 1, dtype=torch.int32, device=DEVICE
+    ).view(num_seqs, num_spec + 1)
+    num_accepted_tokens = torch.tensor([1, 2, 4, 5], dtype=torch.int32, device=DEVICE)
+    state_seed = 0.01 * torch.randn(
+        num_tokens + 1,
+        num_heads,
+        head_dim,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=DEVICE,
+    )
+
+    expected_state = state_seed.clone()
+    expected, _ = fused_recurrent_kda(
+        q=q,
+        k=k,
+        v=v,
+        raw_g=raw_g,
+        raw_beta=raw_beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=-5.0,
+        initial_state=expected_state,
+        cu_seqlens=cu_seqlens,
+        ssm_state_indices=state_indices,
+        num_accepted_tokens=num_accepted_tokens,
+    )
+
+    actual_state = state_seed.clone()
+    output = torch.empty_like(expected)
+
+    def run_flashinfer_decode() -> torch.Tensor:
+        actual, _ = _flashinfer_recurrent_kda_decode(
+            q=q,
+            k=k,
+            v=v,
+            raw_g=raw_g,
+            raw_beta=raw_beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=-5.0,
+            initial_state=actual_state,
+            cu_seqlens=cu_seqlens,
+            ssm_state_indices=state_indices,
+            num_accepted_tokens=num_accepted_tokens,
+            out=output,
+        )
+        return actual
+
+    run_flashinfer_decode()
+    actual_state.copy_(state_seed)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = run_flashinfer_decode()
+    actual_state.copy_(state_seed)
+    graph.replay()
+    torch.accelerator.synchronize()
+
+    torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(actual_state, expected_state, atol=3e-2, rtol=3e-2)
+
+
 def test_fused_kda_decode_rejects_speculative_conv_state():
     assert not is_fused_kda_decode_supported(
         num_heads=12,
@@ -1545,9 +1743,7 @@ def test_fused_kda_decode_rejects_bfloat16_recurrent_state():
 def test_flashkda_near_collinear_keys_remain_finite():
     """Guard against unstable inversion of near-collinear key blocks."""
     lower_bound = -5.0
-    if not is_flashkda_supported(
-        128, torch.bfloat16, torch.float32, lower_bound
-    ):
+    if not is_flashkda_supported(128, torch.bfloat16, torch.float32, lower_bound):
         pytest.skip("FlashKDA is not supported on this platform")
 
     import vllm._flashkda_C  # noqa: F401

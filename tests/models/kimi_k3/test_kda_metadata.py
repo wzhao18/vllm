@@ -94,6 +94,7 @@ def _make_builder(
     mamba_cache_mode: str = "none",
     use_recoverssm: bool = False,
     num_prefill_checkpoint_blocks: int = 0,
+    kda_decode_backend: str | None = None,
 ) -> AttentionMetadataBuilder:
     vllm_config = create_vllm_config(
         model_name="Qwen/Qwen3.5-0.8B",
@@ -110,6 +111,8 @@ def _make_builder(
     vllm_config.cache_config.mamba_cache_mode = mamba_cache_mode
     vllm_config.cache_config.use_replayssm = use_recoverssm
     vllm_config.cache_config.use_kda_recoverssm = use_recoverssm
+    if kda_decode_backend is not None:
+        vllm_config.additional_config["kda_decode_backend"] = kda_decode_backend
     builder = builder_cls(
         kv_cache_spec=MambaSpec(
             block_size=BLOCK_SIZE,
@@ -444,6 +447,55 @@ def test_mixed_regular_and_spec_decode_uses_packed_decode_metadata():
     torch.testing.assert_close(
         actual.spec_query_start_loc,
         torch.tensor([0, 3], dtype=torch.int32),
+    )
+
+
+def test_flashinfer_spec_decode_requires_full_windows():
+    common_attn_metadata = create_common_attn_metadata(
+        BatchSpec(seq_lens=[100, 65], query_lens=[3, 2]), BLOCK_SIZE, DEVICE
+    ).replace(is_prefilling=torch.tensor([False, False]))
+    actual = _make_builder(
+        KimiK3KDAMetadataBuilder,
+        num_speculative_tokens=2,
+        full_cuda_graph=False,
+        kda_decode_backend="flashinfer",
+    ).build(
+        0,
+        common_attn_metadata,
+        num_decode_draft_tokens_cpu=torch.tensor([2, 1], dtype=torch.int32),
+        num_accepted_tokens=torch.ones(2, dtype=torch.int32),
+    )
+
+    assert actual.flashinfer_spec_query_start_loc is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_flashinfer_spec_decode_uses_fixed_offsets_for_graph_padding():
+    device = torch.device("cuda")
+    common_attn_metadata = create_common_attn_metadata(
+        BatchSpec(seq_lens=[100, 65, 0], query_lens=[3, 3, 0]),
+        BLOCK_SIZE,
+        device,
+    ).replace(
+        is_prefilling=torch.tensor([False, False, False]),
+        num_actual_tokens=9,
+    )
+    actual = _make_builder(
+        KimiK3KDAMetadataBuilder,
+        num_speculative_tokens=2,
+        full_cuda_graph=True,
+        device=device,
+        kda_decode_backend="flashinfer",
+    ).build(
+        0,
+        common_attn_metadata,
+        num_decode_draft_tokens_cpu=torch.tensor([2, 2, -1], dtype=torch.int32),
+        num_accepted_tokens=torch.ones(3, dtype=torch.int32, device=device),
+    )
+
+    torch.testing.assert_close(
+        actual.flashinfer_spec_query_start_loc,
+        torch.tensor([0, 3, 6, 9], dtype=torch.int32, device=device),
     )
 
 
