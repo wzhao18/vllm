@@ -95,16 +95,25 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
             prefill_metadata.query_start_loc[1:] - prefill_metadata.query_start_loc[:-1]
         )
         query_lens_cpu = prefill_metadata.query_lens_cpu
-        assert query_lens_cpu is not None, (
-            "TRTLLM ragged prefill requires CPU query lengths"
-        )
+        if query_lens_cpu is None:
+            raise ValueError("TRTLLM ragged prefill requires CPU query lengths")
+        if query_lens_cpu.device.type != "cpu":
+            raise ValueError("TRTLLM ragged prefill query lengths must be on CPU")
+        if query_lens_cpu.ndim != 1 or query_lens_cpu.numel() == 0:
+            raise ValueError(
+                "TRTLLM ragged prefill requires a non-empty 1D query-length tensor"
+            )
+        if bool(torch.any(query_lens_cpu < 0).item()):
+            raise ValueError("TRTLLM ragged prefill query lengths must be non-negative")
         active_rows = query_lens_cpu > 0
         self._has_active_rows = bool(torch.all(active_rows).item())
         if not self._has_active_rows:
-            assert self._use_pcp and not bool(torch.any(active_rows).item()), (
-                "TRTLLM ragged prefill contains mixed active and empty query rows: "
-                f"query_lens={query_lens_cpu.tolist()}"
-            )
+            has_mixed_rows = bool(torch.any(active_rows).item())
+            if not self._use_pcp or has_mixed_rows:
+                raise ValueError(
+                    "TRTLLM ragged prefill contains mixed active and empty query "
+                    f"rows: query_lens={query_lens_cpu.tolist()}"
+                )
 
     def supports_out(self) -> bool:
         # Output head dim is v.shape[-1] == v_head_dim, so `out` is unpadded.
@@ -179,9 +188,10 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from flashinfer.prefill import trtllm_ragged_attention_deepseek
 
-        assert chunk.all_rows_active, (
-            "TRTLLM ragged context prefill contains an empty query or KV row"
-        )
+        if not chunk.all_rows_active:
+            raise ValueError(
+                "TRTLLM ragged context prefill contains an empty query or KV row"
+            )
 
         if out is None:
             out = torch.empty(

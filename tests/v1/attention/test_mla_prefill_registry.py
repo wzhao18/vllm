@@ -138,15 +138,50 @@ def test_trtllm_ragged_records_pcp_mode(monkeypatch, pcp_size, expected):
     assert backend._use_pcp is expected
 
 
-def test_trtllm_ragged_rejects_empty_query_row():
+@pytest.mark.parametrize(
+    ("use_pcp", "query_lens_cpu"),
+    [
+        (False, torch.tensor([2, 0], dtype=torch.int32)),
+        (False, torch.tensor([0], dtype=torch.int32)),
+        (True, torch.tensor([2, 0], dtype=torch.int32)),
+    ],
+)
+def test_trtllm_ragged_rejects_empty_query_row(use_pcp, query_lens_cpu):
+    backend = object.__new__(TrtllmRaggedPrefillBackend)
+    backend._use_pcp = use_pcp
+    query_start_loc = torch.cat(
+        [torch.zeros(1, dtype=torch.int32), query_lens_cpu.cumsum(0)]
+    )
+
+    with pytest.raises(ValueError, match="mixed active and empty query rows"):
+        backend.prepare_metadata(
+            SimpleNamespace(
+                query_start_loc=query_start_loc,
+                query_lens_cpu=query_lens_cpu,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("query_lens_cpu", "message"),
+    [
+        (None, "requires CPU query lengths"),
+        (torch.tensor([], dtype=torch.int32), "non-empty 1D"),
+        (torch.tensor([[1]], dtype=torch.int32), "non-empty 1D"),
+        (torch.tensor([-1], dtype=torch.int32), "non-negative"),
+    ],
+)
+def test_trtllm_ragged_rejects_invalid_cpu_query_lengths(
+    query_lens_cpu, message
+):
     backend = object.__new__(TrtllmRaggedPrefillBackend)
     backend._use_pcp = False
 
-    with pytest.raises(AssertionError, match="mixed active and empty query rows"):
+    with pytest.raises(ValueError, match=message):
         backend.prepare_metadata(
             SimpleNamespace(
-                query_start_loc=torch.tensor([0, 2, 2], dtype=torch.int32),
-                query_lens_cpu=torch.tensor([2, 0], dtype=torch.int32),
+                query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+                query_lens_cpu=query_lens_cpu,
             )
         )
 
@@ -155,7 +190,7 @@ def test_trtllm_ragged_rejects_inactive_context_row():
     backend = object.__new__(TrtllmRaggedPrefillBackend)
     backend._use_pcp = False
 
-    with pytest.raises(AssertionError, match="empty query or KV row"):
+    with pytest.raises(ValueError, match="empty query or KV row"):
         backend.run_prefill_context_chunk(
             SimpleNamespace(all_rows_active=False),
             torch.empty(0),
