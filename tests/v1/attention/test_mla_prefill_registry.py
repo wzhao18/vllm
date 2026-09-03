@@ -61,6 +61,7 @@ def test_trtllm_ragged_uses_trusted_active_row_path(monkeypatch, method):
     backend = object.__new__(TrtllmRaggedPrefillBackend)
     backend.scale = 0.5
     backend._workspace_buffer = torch.empty(1, dtype=torch.uint8)
+    backend._use_pcp = False
     backend.prepare_metadata(
         SimpleNamespace(
             query_start_loc=query_start_loc,
@@ -111,10 +112,37 @@ def test_trtllm_ragged_uses_trusted_active_row_path(monkeypatch, method):
     assert captured["skip_all_rows_active_check"] is True
 
 
+@pytest.mark.parametrize(("pcp_size", "expected"), [(1, False), (2, True)])
+def test_trtllm_ragged_records_pcp_mode(monkeypatch, pcp_size, expected):
+    workspace = torch.empty(1, dtype=torch.uint8)
+    manager = SimpleNamespace(get_simultaneous=lambda _: (workspace,))
+    monkeypatch.setattr(
+        "vllm.v1.attention.backends.mla.prefill.trtllm_ragged."
+        "current_workspace_manager",
+        lambda: manager,
+    )
+    backend = TrtllmRaggedPrefillBackend(
+        num_heads=2,
+        scale=0.5,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                prefill_context_parallel_size=pcp_size,
+            )
+        ),
+    )
+
+    assert backend._use_pcp is expected
+
+
 def test_trtllm_ragged_rejects_empty_query_row():
     backend = object.__new__(TrtllmRaggedPrefillBackend)
+    backend._use_pcp = False
 
-    with pytest.raises(AssertionError, match="empty query row"):
+    with pytest.raises(AssertionError, match="mixed active and empty query rows"):
         backend.prepare_metadata(
             SimpleNamespace(
                 query_start_loc=torch.tensor([0, 2, 2], dtype=torch.int32),
@@ -125,6 +153,7 @@ def test_trtllm_ragged_rejects_empty_query_row():
 
 def test_trtllm_ragged_rejects_inactive_context_row():
     backend = object.__new__(TrtllmRaggedPrefillBackend)
+    backend._use_pcp = False
 
     with pytest.raises(AssertionError, match="empty query or KV row"):
         backend.run_prefill_context_chunk(
@@ -133,6 +162,50 @@ def test_trtllm_ragged_rejects_inactive_context_row():
             torch.empty(0),
             torch.empty(0),
         )
+
+
+@pytest.mark.parametrize("return_softmax_lse", [False, True])
+def test_trtllm_ragged_handles_empty_pcp_rank_without_kernel_launch(
+    monkeypatch, return_softmax_lse
+):
+    backend = object.__new__(TrtllmRaggedPrefillBackend)
+    backend.num_heads = 2
+    backend.scale = 0.5
+    backend._workspace_buffer = torch.empty(1, dtype=torch.uint8)
+    backend._use_pcp = True
+    backend.prepare_metadata(
+        SimpleNamespace(
+            query_start_loc=torch.tensor([0, 0], dtype=torch.int32),
+            max_query_len=0,
+            output_dtype=torch.float32,
+            query_lens_cpu=torch.tensor([0], dtype=torch.int32),
+        )
+    )
+
+    def fail_ragged_attention(**kwargs):
+        pytest.fail("empty PCP rank must not launch ragged attention")
+
+    monkeypatch.setattr(
+        "flashinfer.prefill.trtllm_ragged_attention_deepseek",
+        fail_ragged_attention,
+    )
+    q = torch.empty(0, 2, 192)
+    k = torch.empty(0, 2, 192)
+    v = torch.empty(0, 2, 128)
+    result = backend.run_prefill_new_tokens(
+        q,
+        k,
+        v,
+        return_softmax_lse=return_softmax_lse,
+    )
+
+    if return_softmax_lse:
+        out, lse = result
+        assert out.shape == (0, 2, 128)
+        assert lse.shape == (2, 0)
+    else:
+        assert isinstance(result, torch.Tensor)
+        assert result.shape == (0, 2, 128)
 
 
 @pytest.fixture(autouse=True)

@@ -82,6 +82,9 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
                 torch.uint8,
             ),
         )
+        self._use_pcp = (
+            vllm_config.parallel_config.prefill_context_parallel_size > 1
+        )
 
     def prepare_metadata(
         self,
@@ -95,10 +98,13 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
         assert query_lens_cpu is not None, (
             "TRTLLM ragged prefill requires CPU query lengths"
         )
-        assert bool(torch.all(query_lens_cpu > 0).item()), (
-            "TRTLLM ragged prefill contains an empty query row: "
-            f"query_lens={query_lens_cpu.tolist()}"
-        )
+        active_rows = query_lens_cpu > 0
+        self._has_active_rows = bool(torch.all(active_rows).item())
+        if not self._has_active_rows:
+            assert self._use_pcp and not bool(torch.any(active_rows).item()), (
+                "TRTLLM ragged prefill contains mixed active and empty query rows: "
+                f"query_lens={query_lens_cpu.tolist()}"
+            )
 
     def supports_out(self) -> bool:
         # Output head dim is v.shape[-1] == v_head_dim, so `out` is unpadded.
@@ -123,6 +129,18 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
                 device=q.device,
                 dtype=self._prefill_metadata.output_dtype,
             )
+
+        if not self._has_active_rows:
+            out.zero_()
+            if return_softmax_lse:
+                lse = torch.empty(
+                    self.num_heads,
+                    q.shape[0],
+                    dtype=torch.float32,
+                    device=q.device,
+                )
+                return out, lse.fill_(-float("inf"))
+            return out
 
         ret = trtllm_ragged_attention_deepseek(
             query=q,
