@@ -2078,6 +2078,10 @@ class MambaManager(SingleTypeKVCacheManager):
         latest_prompt_hash_boundary = (
             request.num_prompt_tokens // hash_block_size
         ) * hash_block_size
+        if num_tokens <= getattr(request, "num_externally_loaded_tokens", 0):
+            # Loaded state is private; publishing it would require an unreserved
+            # copy-on-write block before the request could continue.
+            return None
         if self.use_eagle:
             # Eagle groups match one hash unit past the candidate and drop it,
             # so register the tail one unit lower.
