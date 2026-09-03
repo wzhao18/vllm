@@ -218,12 +218,12 @@ def test_resolve_kda_decode_backend(
     expected: str,
 ):
     monkeypatch.setattr(
-        kda_module,
+        nvidia_kda,
         "is_fused_kda_decode_supported",
         lambda *_: native_supported,
     )
     monkeypatch.setattr(
-        kda_module,
+        nvidia_kda,
         "is_flashinfer_kda_decode_supported",
         lambda *_: True,
     )
@@ -247,17 +247,17 @@ def test_resolve_kda_decode_backend_explicit_flashinfer_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ):
     monkeypatch.setattr(
-        kda_module,
+        nvidia_kda,
         "is_fused_kda_decode_supported",
         lambda *_: False,
     )
     monkeypatch.setattr(
-        kda_module,
+        nvidia_kda,
         "is_flashinfer_kda_decode_supported",
         lambda *_: False,
     )
 
-    with pytest.raises(RuntimeError, match="0.6.18.dev20260811"):
+    with pytest.raises(RuntimeError, match="0.6.18"):
         resolve_kda_decode_backend(
             "flashinfer",
             num_heads=12,
@@ -274,7 +274,7 @@ def test_resolve_kda_decode_backend_native_does_not_probe_flashinfer(
     monkeypatch: pytest.MonkeyPatch,
 ):
     monkeypatch.setattr(
-        kda_module,
+        nvidia_kda,
         "is_fused_kda_decode_supported",
         lambda *_: True,
     )
@@ -283,7 +283,7 @@ def test_resolve_kda_decode_backend_native_does_not_probe_flashinfer(
         raise AssertionError("FlashInfer should not be probed for native decode")
 
     monkeypatch.setattr(
-        kda_module,
+        nvidia_kda,
         "is_flashinfer_kda_decode_supported",
         fail_if_probed,
     )
@@ -318,15 +318,15 @@ def test_flashinfer_kda_decode_arch_support(
     cuda_version: str,
     expected: bool,
 ):
-    monkeypatch.setattr(kda_module.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(nvidia_kda.current_platform, "is_cuda", lambda: True)
     monkeypatch.setattr(
-        kda_module.current_platform,
+        nvidia_kda.current_platform,
         "get_device_capability",
         lambda: SimpleNamespace(major=capability[0], minor=capability[1]),
     )
-    monkeypatch.setattr(kda_module, "has_flashinfer_kda_decode", lambda: True)
-    monkeypatch.setattr(kda_module.torch.version, "cuda", cuda_version)
-    monkeypatch.setattr(kda_module, "is_conv_state_dim_first", lambda: False)
+    monkeypatch.setattr(nvidia_kda, "has_flashinfer_kda_decode", lambda: True)
+    monkeypatch.setattr(nvidia_kda.torch.version, "cuda", cuda_version)
+    monkeypatch.setattr(nvidia_kda, "is_conv_state_dim_first", lambda: False)
 
     assert (
         is_flashinfer_kda_decode_supported(
@@ -351,7 +351,7 @@ def test_flashinfer_fused_kda_decode_argument_contract(
         captured.update(kwargs)
         return kwargs["output"]
 
-    monkeypatch.setattr(kda_module, "flashinfer_fused_kda_decode", fused_kda_decode)
+    monkeypatch.setattr(nvidia_kda, "flashinfer_fused_kda_decode", fused_kda_decode)
     x = torch.randn(2, 24, dtype=torch.bfloat16)
     out = torch.empty(1, 2, 1, 8, dtype=torch.bfloat16)
     actual = _flashinfer_fused_kda_decode(
