@@ -389,7 +389,6 @@ def has_flashinfer_recurrent_kda_decode() -> bool:
     return (
         mod is not None
         and bool(getattr(mod, "_RECURRENT_KDA_AVAILABLE", False))
-        and bool(getattr(mod, "_RECURRENT_KDA_INT64_STATE_STRIDES", False))
         and callable(getattr(mod, "recurrent_kda", None))
     )
 
