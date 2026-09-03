@@ -91,6 +91,10 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
         self._query_seq_lens = (
             prefill_metadata.query_start_loc[1:] - prefill_metadata.query_start_loc[:-1]
         )
+        query_lens_cpu = prefill_metadata.query_lens_cpu
+        self._all_new_token_rows_active = query_lens_cpu is not None and bool(
+            torch.all(query_lens_cpu > 0).item()
+        )
 
     def supports_out(self) -> bool:
         # Output head dim is v.shape[-1] == v_head_dim, so `out` is unpadded.
@@ -135,6 +139,7 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
             is_causal=True,
             return_lse=return_softmax_lse,
             out=out,
+            assume_all_rows_active=self._all_new_token_rows_active,
         )
 
         if isinstance(ret, tuple):
@@ -180,6 +185,7 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
             is_causal=False,
             return_lse=True,
             out=out,
+            assume_all_rows_active=chunk.all_rows_active,
         )
 
         # Convert from (q_len, num_heads) to (num_heads, q_len)

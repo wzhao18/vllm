@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for MLA prefill backend registry."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -9,6 +11,9 @@ from vllm.v1.attention.backends.mla.prefill.base import MLAPrefillBackend
 from vllm.v1.attention.backends.mla.prefill.registry import (
     MLAPrefillBackendEnum,
     register_mla_prefill_backend,
+)
+from vllm.v1.attention.backends.mla.prefill.trtllm_ragged import (
+    TrtllmRaggedPrefillBackend,
 )
 
 
@@ -48,6 +53,67 @@ def test_prefill_backend_clone_has_isolated_metadata():
     backend._prefill_metadata = object()
     clone._prefill_metadata = object()
     assert clone._prefill_metadata is not backend._prefill_metadata
+
+
+@pytest.mark.parametrize("method", ["new_tokens", "context_chunk"])
+@pytest.mark.parametrize("all_rows_active", [True, False])
+def test_trtllm_ragged_forwards_precomputed_row_activity(
+    monkeypatch, method, all_rows_active
+):
+    query_start_loc = torch.tensor(
+        [0, 2] if all_rows_active else [0, 2, 2], dtype=torch.int32
+    )
+    backend = object.__new__(TrtllmRaggedPrefillBackend)
+    backend.scale = 0.5
+    backend._workspace_buffer = torch.empty(1, dtype=torch.uint8)
+    backend.prepare_metadata(
+        SimpleNamespace(
+            query_start_loc=query_start_loc,
+            max_query_len=2,
+            output_dtype=torch.float32,
+            query_lens_cpu=torch.diff(query_start_loc),
+        )
+    )
+    captured = {}
+
+    def fake_ragged_attention(**kwargs):
+        captured.update(kwargs)
+        if method == "context_chunk":
+            return kwargs["out"], torch.empty(2, 2)
+        return kwargs["out"]
+
+    monkeypatch.setattr(
+        "flashinfer.prefill.trtllm_ragged_attention_deepseek",
+        fake_ragged_attention,
+    )
+    q = torch.empty(2, 2, 192)
+    num_kv_tokens = 3 if method == "context_chunk" else 2
+    k = torch.empty(num_kv_tokens, 2, 192)
+    v = torch.empty(num_kv_tokens, 2, 128)
+
+    if method == "new_tokens":
+        backend.run_prefill_new_tokens(q, k, v, return_softmax_lse=False)
+    else:
+        seq_lens = torch.tensor([3] if all_rows_active else [3, 0], dtype=torch.int32)
+        cu_seq_lens = torch.cat(
+            [torch.zeros(1, dtype=torch.int32), torch.cumsum(seq_lens, dim=0)]
+        )
+        backend.run_prefill_context_chunk(
+            SimpleNamespace(
+                seq_lens=seq_lens,
+                max_query_len=2,
+                max_seq_len=3,
+                num_requests=seq_lens.shape[0],
+                query_start_loc=query_start_loc,
+                cu_seq_lens=cu_seq_lens,
+                all_rows_active=all_rows_active,
+            ),
+            q,
+            k,
+            v,
+        )
+
+    assert captured["assume_all_rows_active"] is all_rows_active
 
 
 @pytest.fixture(autouse=True)
