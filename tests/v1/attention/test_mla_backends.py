@@ -1032,7 +1032,7 @@ def test_tokenspeed_mla_noncausal_capability():
     assert tokenspeed_mla_module.TokenspeedMLABackend.supports_non_causal()
 
 
-def test_flashinfer_mla_dspark_dcp_supports_target_and_draft(monkeypatch):
+def test_flashinfer_mla_dspark_dcp_supports_target_only(monkeypatch):
     flashinfer_mla_module = pytest.importorskip(
         "vllm.v1.attention.backends.mla.flashinfer_mla"
     )
@@ -1064,7 +1064,7 @@ def test_flashinfer_mla_dspark_dcp_supports_target_and_draft(monkeypatch):
     assert reason is None
     assert backend.supports_non_causal()
     assert builder.supports_non_causal_multi_token_decode
-    assert backend.supports_non_causal_dcp()
+    assert not backend.supports_non_causal_dcp()
 
 
 @pytest.mark.parametrize(

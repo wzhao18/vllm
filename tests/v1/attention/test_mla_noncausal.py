@@ -109,7 +109,7 @@ def test_noncausal_decode_metadata_keeps_live_request_buffers():
     )
 
 
-def test_mla_cache_marker_is_a_group_property():
+def test_mla_cache_marker_is_promoted_to_group_capability():
     kwargs = {
         "block_size": 64,
         "num_kv_heads": 1,
@@ -120,8 +120,7 @@ def test_mla_cache_marker_is_a_group_property():
     unmarked = MLAAttentionSpec(**kwargs)
 
     assert MLAAttentionSpec.merge([marked, marked]).non_causal_multi_token_decode
+    assert MLAAttentionSpec.merge([marked, unmarked]).non_causal_multi_token_decode
     assert not MLAAttentionSpec.merge(
         [unmarked, unmarked]
     ).non_causal_multi_token_decode
-    with pytest.raises(AssertionError, match="non_causal_multi_token_decode"):
-        MLAAttentionSpec.merge([marked, unmarked])
