@@ -56,13 +56,8 @@ def test_prefill_backend_clone_has_isolated_metadata():
 
 
 @pytest.mark.parametrize("method", ["new_tokens", "context_chunk"])
-@pytest.mark.parametrize("all_rows_active", [True, False])
-def test_trtllm_ragged_forwards_precomputed_row_activity(
-    monkeypatch, method, all_rows_active
-):
-    query_start_loc = torch.tensor(
-        [0, 2] if all_rows_active else [0, 2, 2], dtype=torch.int32
-    )
+def test_trtllm_ragged_uses_trusted_active_row_path(monkeypatch, method):
+    query_start_loc = torch.tensor([0, 2], dtype=torch.int32)
     backend = object.__new__(TrtllmRaggedPrefillBackend)
     backend.scale = 0.5
     backend._workspace_buffer = torch.empty(1, dtype=torch.uint8)
@@ -94,7 +89,7 @@ def test_trtllm_ragged_forwards_precomputed_row_activity(
     if method == "new_tokens":
         backend.run_prefill_new_tokens(q, k, v, return_softmax_lse=False)
     else:
-        seq_lens = torch.tensor([3] if all_rows_active else [3, 0], dtype=torch.int32)
+        seq_lens = torch.tensor([3], dtype=torch.int32)
         cu_seq_lens = torch.cat(
             [torch.zeros(1, dtype=torch.int32), torch.cumsum(seq_lens, dim=0)]
         )
@@ -106,14 +101,38 @@ def test_trtllm_ragged_forwards_precomputed_row_activity(
                 num_requests=seq_lens.shape[0],
                 query_start_loc=query_start_loc,
                 cu_seq_lens=cu_seq_lens,
-                all_rows_active=all_rows_active,
+                all_rows_active=True,
             ),
             q,
             k,
             v,
         )
 
-    assert captured["assume_all_rows_active"] is all_rows_active
+    assert captured["skip_all_rows_active_check"] is True
+
+
+def test_trtllm_ragged_rejects_empty_query_row():
+    backend = object.__new__(TrtllmRaggedPrefillBackend)
+
+    with pytest.raises(AssertionError, match="empty query row"):
+        backend.prepare_metadata(
+            SimpleNamespace(
+                query_start_loc=torch.tensor([0, 2, 2], dtype=torch.int32),
+                query_lens_cpu=torch.tensor([2, 0], dtype=torch.int32),
+            )
+        )
+
+
+def test_trtllm_ragged_rejects_inactive_context_row():
+    backend = object.__new__(TrtllmRaggedPrefillBackend)
+
+    with pytest.raises(AssertionError, match="empty query or KV row"):
+        backend.run_prefill_context_chunk(
+            SimpleNamespace(all_rows_active=False),
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty(0),
+        )
 
 
 @pytest.fixture(autouse=True)
