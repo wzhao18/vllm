@@ -286,7 +286,8 @@ def resolve_kda_decode_backend(
 
 def is_flashkda_supported(
     head_dim: int,
-    dtype: torch.dtype,
+    input_dtype: torch.dtype,
+    recurrent_state_dtype: torch.dtype,
     lower_bound: float | None,
 ) -> bool:
     if not current_platform.is_cuda():
@@ -296,7 +297,8 @@ def is_flashkda_supported(
         capability is not None
         and capability.major in (9, 10, 12)
         and head_dim == 128
-        and dtype == torch.bfloat16
+        and input_dtype == torch.bfloat16
+        and recurrent_state_dtype == torch.float32
         and lower_bound is not None
     )
 
@@ -525,6 +527,7 @@ def resolve_kda_prefill_backend(
     flashkda_supported = is_flashkda_supported(
         head_dim,
         input_dtype,
+        recurrent_state_dtype,
         lower_bound,
     )
     if backend == "flashinfer" and not flashinfer_supported:
@@ -536,8 +539,8 @@ def resolve_kda_prefill_backend(
         )
     if backend == "flashkda" and not flashkda_supported:
         raise RuntimeError(
-            "FlashKDA requires CUDA SM90/SM10x/SM12x, bfloat16, "
-            "head_dim=128, and a bounded KDA gate."
+            "FlashKDA requires CUDA SM90/SM10x/SM12x, bfloat16 input, "
+            "float32 recurrent state, head_dim=128, and a bounded KDA gate."
         )
     if flashinfer_supported and backend == "flashinfer":
         logger.info_once("Using FlashInfer KDA prefill backend.")

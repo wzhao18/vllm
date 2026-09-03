@@ -167,10 +167,32 @@ def test_resolve_kda_prefill_backend_preserves_flashkda_default(
             "auto",
             head_dim=128,
             input_dtype=torch.bfloat16,
-            recurrent_state_dtype=torch.bfloat16,
+            recurrent_state_dtype=torch.float32,
             lower_bound=-5.0,
         )
         == "flashkda"
+    )
+
+
+def test_resolve_kda_prefill_backend_auto_does_not_select_flashinfer(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        nvidia_kda,
+        "is_flashinfer_kda_prefill_supported",
+        lambda *_: True,
+    )
+    monkeypatch.setattr(nvidia_kda, "is_flashkda_supported", lambda *_: False)
+
+    assert (
+        resolve_kda_prefill_backend(
+            "auto",
+            head_dim=128,
+            input_dtype=torch.bfloat16,
+            recurrent_state_dtype=torch.bfloat16,
+            lower_bound=-5.0,
+        )
+        == "triton"
     )
 
 
@@ -187,7 +209,7 @@ def test_resolve_kda_prefill_backend_falls_back_without_flashinfer(monkeypatch):
             "auto",
             head_dim=128,
             input_dtype=torch.bfloat16,
-            recurrent_state_dtype=torch.bfloat16,
+            recurrent_state_dtype=torch.float32,
             lower_bound=-5.0,
         )
         == "flashkda"
@@ -197,9 +219,21 @@ def test_resolve_kda_prefill_backend_falls_back_without_flashinfer(monkeypatch):
             "flashinfer",
             head_dim=128,
             input_dtype=torch.bfloat16,
-            recurrent_state_dtype=torch.bfloat16,
+            recurrent_state_dtype=torch.float32,
             lower_bound=-5.0,
         )
+
+
+def test_flashkda_rejects_bfloat16_recurrent_state(monkeypatch):
+    monkeypatch.setattr(nvidia_kda.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        nvidia_kda.current_platform,
+        "get_device_capability",
+        lambda: SimpleNamespace(major=10),
+    )
+
+    assert is_flashkda_supported(128, torch.bfloat16, torch.float32, -5.0)
+    assert not is_flashkda_supported(128, torch.bfloat16, torch.bfloat16, -5.0)
 
 
 @pytest.mark.parametrize(
@@ -1511,7 +1545,9 @@ def test_fused_kda_decode_rejects_bfloat16_recurrent_state():
 def test_flashkda_near_collinear_keys_remain_finite():
     """Guard against unstable inversion of near-collinear key blocks."""
     lower_bound = -5.0
-    if not is_flashkda_supported(128, torch.bfloat16, lower_bound):
+    if not is_flashkda_supported(
+        128, torch.bfloat16, torch.float32, lower_bound
+    ):
         pytest.skip("FlashKDA is not supported on this platform")
 
     import vllm._flashkda_C  # noqa: F401
@@ -1617,7 +1653,7 @@ def test_flashinfer_kda_prefill_breakable_graph_cross_stream():
 
 @torch.inference_mode()
 def test_flashkda_correctness():
-    if not is_flashkda_supported(128, torch.bfloat16, -3.0):
+    if not is_flashkda_supported(128, torch.bfloat16, torch.float32, -3.0):
         pytest.skip("FlashKDA is not supported on this platform")
 
     import vllm._flashkda_C  # noqa: F401
