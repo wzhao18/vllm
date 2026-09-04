@@ -259,6 +259,34 @@ def test_cached_request_with_spec_decode_does_not_save_scheduled_drafts():
     assert tracker.allocated_block_ids == ([0, 1, 2],)
 
 
+def test_cached_request_defers_save_until_boundary_hash_is_published():
+    scheduler = _make_bare_scheduler()
+    _add_unfinished_request(
+        scheduler,
+        token_ids=list(range(48)),
+        block_hashes=[b"h0", b"h1"],
+        prefill_end_tokens=48,
+    )
+
+    meta = scheduler.build_connector_meta(
+        _make_scheduler_output(scheduled_spec_tokens=None)
+    )
+
+    assert meta.requests == []
+    tracker = scheduler._request_trackers["req-0"]
+    assert tracker.token_len == 48
+    assert tracker.num_saved_tokens == 32
+
+    scheduler._unfinished_requests["req-0"][0].block_hashes.append(b"h2")
+    meta = scheduler.build_connector_meta(
+        _make_scheduler_output(scheduled_spec_tokens=None)
+    )
+
+    assert len(meta.requests) == 1
+    assert meta.requests[0].token_len_chunk == 48
+    assert tracker.num_saved_tokens == 48
+
+
 def test_cached_request_without_spec_decode_keeps_current_step_save_overlap():
     scheduler = _make_bare_scheduler()
     _add_unfinished_request(
@@ -707,6 +735,37 @@ def test_from_request_tracker_no_load_saves_normally():
     assert req_meta.can_save is True
     assert req_meta.load_spec is None
     assert tracker.num_saved_tokens == 48
+
+
+def test_from_request_tracker_defers_boundary_without_hash():
+    tracker = RequestTracker(
+        req_id="req-0",
+        token_len=64,
+        allocated_block_ids=([0, 1],),
+        num_saved_tokens=0,
+    )
+
+    req_meta = ReqMeta.from_request_tracker(
+        tracker,
+        block_size=32,
+        hash_block_size=16,
+        block_hashes=[b"h0", b"h1", b"h2"],
+    )
+
+    assert req_meta is not None
+    assert req_meta.token_len_chunk == 32
+    assert tracker.num_saved_tokens == 32
+
+    req_meta = ReqMeta.from_request_tracker(
+        tracker,
+        block_size=32,
+        hash_block_size=16,
+        block_hashes=[b"h0", b"h1", b"h2", b"h3"],
+    )
+
+    assert req_meta is not None
+    assert req_meta.token_len_chunk == 64
+    assert tracker.num_saved_tokens == 64
 
 
 class _StubLookupClient:
@@ -1300,7 +1359,7 @@ def test_resumed_partial_tail_attached_to_save_keeps_exact_boundary():
     scheduler._boundary_state_group_ids = frozenset({0})
     request = SimpleNamespace(
         all_token_ids=list(range(48)),
-        block_hashes=[b"h0", b"h1", b"h2"],
+        block_hashes=[f"h{i}".encode() for i in range(12)],
         num_output_placeholders=0,
         num_prompt_tokens=36,
     )
