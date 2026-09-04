@@ -1151,7 +1151,7 @@ class VllmConfig:
         self._verify_sampling_replay_config()
         self._verify_trace_replay_config()
 
-        # A NIXL side is either fully replicated or fully DCP-sharded; MLA only.
+        # NIXL DCP shards MLA attention; recurrent groups remain replicated.
         if (
             self.kv_transfer_config is not None
             and self.kv_transfer_config.has_connector("NixlConnector")
@@ -1170,11 +1170,6 @@ class VllmConfig:
                     "PD with decode_context_parallel_size > 1 is only "
                     "supported for MLA models."
                 )
-                assert not (self.model_config.is_hybrid and dcp_size > 1), (
-                    "PD with decode_context_parallel_size > 1 is not "
-                    "supported for hybrid Mamba/SSM models."
-                )
-
         if self.lora_config is not None:
             self.lora_config.verify_with_model_config(self.model_config)
 

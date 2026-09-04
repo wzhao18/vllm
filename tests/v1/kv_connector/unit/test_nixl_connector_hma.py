@@ -438,6 +438,98 @@ def test_read_blocks_for_req_expands_remote_ids(
 
 
 @pytest.mark.cpu_test
+def test_read_blocks_for_req_dcp_keeps_mamba_state_replicated():
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NixlConnectorMetadata,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
+        TPMapping,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
+        NixlConnectorWorker,
+    )
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+
+    worker = object.__new__(NixlConnectorWorker)
+    worker._physical_blocks_per_logical_kv_block = 1
+    worker._engine_last_active = {}
+    worker._recving_transfers = {}
+    worker._bidirectional_kv_xfer_enabled = False
+    worker.dcp_size = 2
+    worker.dcp_rank = 0
+    worker._group_spec_types = (FullAttentionSpec, MambaSpec)
+    worker._has_mamba = True
+    worker.use_mla = True
+
+    remote_engine_id = "remote-engine"
+    worker.transfer_topo = MagicMock()
+    worker.transfer_topo.tp_ratio.return_value = 1
+    remote_info = MagicMock(
+        remote_physical_blocks_per_logical=1,
+        remote_dcp_size=2,
+        remote_tp_size=2,
+        remote_block_size=16,
+    )
+    worker.transfer_topo.get_engine_info.return_value = remote_info
+
+    plan = MagicMock(spec=TPMapping)
+    plan.all_source_ranks = (0,)
+    plan.source_ranks_per_group = ({0}, {0})
+    plan.local_consumers = 1
+    worker.tp_mappings = {remote_engine_id: plan}
+    worker.src_xfer_handles_by_block_size = {16: 1}
+    worker.dst_xfer_side_handles = {remote_engine_id: {0: 2}}
+    worker._read_blocks = MagicMock()
+    worker._apply_dcp_prefix_caching = MagicMock(return_value=([10], [30]))
+
+    metadata = NixlConnectorMetadata()
+    metadata.add_new_req_to_recv(
+        request_id="test-req",
+        local_block_ids=([10, 11], [20]),
+        kv_transfer_params={
+            "remote_block_ids": ([30, 31], [40]),
+            "remote_engine_id": remote_engine_id,
+            "remote_request_id": "prefill-test-req",
+            "remote_host": "localhost",
+            "remote_port": 1234,
+            "tp_size": 2,
+        },
+        local_num_computed_blocks=(0, 0),
+    )
+
+    worker._read_blocks_for_req("test-req", metadata.reqs_to_recv["test-req"])
+
+    worker._apply_dcp_prefix_caching.assert_called_once()
+    read_spec = worker._read_blocks.call_args.kwargs["read_spec"]
+    assert read_spec.local_block_ids == [[10], [20]]
+    assert read_spec.remote_block_ids == [[30], [40]]
+
+
+@pytest.mark.cpu_test
+def test_hybrid_dcp_handshake_rejects_mismatched_sizes():
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
+        NixlConnectorWorker,
+    )
+
+    worker = object.__new__(NixlConnectorWorker)
+    worker.dcp_size = 2
+    worker._has_mamba = True
+    worker.transfer_topo = MagicMock()
+    worker.transfer_topo.get_engine_info.return_value = MagicMock(
+        remote_tp_size=4,
+        remote_dcp_size=4,
+    )
+    remote_metadata = MagicMock(engine_id="remote-engine")
+
+    with pytest.raises(RuntimeError, match="require matching DCP sizes"):
+        worker._validate_remote_agent_handshake(
+            remote_metadata,
+            remote_tp_size=4,
+            remote_dcp_size=4,
+        )
+
+
+@pytest.mark.cpu_test
 @pytest.mark.parametrize(
     "local_physical_per_logical,remote_physical_per_logical,"
     "local_block_ids,remote_block_ids,"
