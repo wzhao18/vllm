@@ -138,17 +138,10 @@ def test_trtllm_ragged_records_pcp_mode(monkeypatch, pcp_size, expected):
     assert backend._use_pcp is expected
 
 
-@pytest.mark.parametrize(
-    ("use_pcp", "query_lens_cpu"),
-    [
-        (False, torch.tensor([2, 0], dtype=torch.int32)),
-        (False, torch.tensor([0], dtype=torch.int32)),
-        (True, torch.tensor([2, 0], dtype=torch.int32)),
-    ],
-)
-def test_trtllm_ragged_rejects_empty_query_row(use_pcp, query_lens_cpu):
+def test_trtllm_ragged_rejects_empty_pcp_query_row():
     backend = object.__new__(TrtllmRaggedPrefillBackend)
-    backend._use_pcp = use_pcp
+    backend._use_pcp = True
+    query_lens_cpu = torch.tensor([2, 0], dtype=torch.int32)
     query_start_loc = torch.cat(
         [torch.zeros(1, dtype=torch.int32), query_lens_cpu.cumsum(0)]
     )
@@ -175,7 +168,7 @@ def test_trtllm_ragged_rejects_invalid_cpu_query_lengths(
     query_lens_cpu, message
 ):
     backend = object.__new__(TrtllmRaggedPrefillBackend)
-    backend._use_pcp = False
+    backend._use_pcp = True
 
     with pytest.raises(ValueError, match=message):
         backend.prepare_metadata(
@@ -184,6 +177,20 @@ def test_trtllm_ragged_rejects_invalid_cpu_query_lengths(
                 query_lens_cpu=query_lens_cpu,
             )
         )
+
+
+def test_trtllm_ragged_non_pcp_uses_scheduler_active_row_invariant():
+    backend = object.__new__(TrtllmRaggedPrefillBackend)
+    backend._use_pcp = False
+
+    backend.prepare_metadata(
+        SimpleNamespace(
+            query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+            query_lens_cpu=None,
+        )
+    )
+
+    assert backend._has_active_rows
 
 
 def test_trtllm_ragged_rejects_inactive_context_row():

@@ -94,6 +94,10 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
         self._query_seq_lens = (
             prefill_metadata.query_start_loc[1:] - prefill_metadata.query_start_loc[:-1]
         )
+        self._has_active_rows = True
+        if not self._use_pcp:
+            return
+
         query_lens_cpu = prefill_metadata.query_lens_cpu
         if query_lens_cpu is None:
             raise ValueError("TRTLLM ragged prefill requires CPU query lengths")
