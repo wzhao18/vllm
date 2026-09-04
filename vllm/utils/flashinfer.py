@@ -151,20 +151,6 @@ def _missing_sparse_mla(*_: Any, **__: Any) -> NoReturn:
     )
 
 
-def _missing_kda_prefill(*_: Any, **__: Any) -> NoReturn:
-    raise RuntimeError(
-        "FlashInfer recurrent KDA prefill is not available. Install "
-        "flashinfer-python 0.6.18 or newer."
-    )
-
-
-def _missing_kda_decode(*_: Any, **__: Any) -> NoReturn:
-    raise RuntimeError(
-        "FlashInfer fused KDA decode is not available. Install "
-        "flashinfer-python 0.6.18 or newer."
-    )
-
-
 def _get_submodule(module_name: str) -> Any | None:
     """Safely import a submodule and return it, or None if not available."""
     try:
@@ -255,12 +241,10 @@ flashinfer_xqa_batch_decode_with_kv_cache = _lazy_import_wrapper(
 flashinfer_recurrent_kda = _lazy_import_wrapper(
     "flashinfer.kda",
     "recurrent_kda",
-    fallback_fn=_missing_kda_prefill,
 )
 flashinfer_fused_kda_decode = _lazy_import_wrapper(
     "flashinfer.kda_decode",
     "fused_kda_decode",
-    fallback_fn=_missing_kda_decode,
 )
 
 
@@ -372,7 +356,7 @@ def has_flashinfer_bf16_fp4() -> bool:
 
 
 @functools.cache
-def has_flashinfer_kda_prefill() -> bool:
+def has_flashinfer_recurrent_kda() -> bool:
     """Return whether FlashInfer recurrent KDA prefill is available."""
     if not has_flashinfer():
         return False
@@ -381,7 +365,7 @@ def has_flashinfer_kda_prefill() -> bool:
 
 
 @functools.cache
-def has_flashinfer_kda_decode() -> bool:
+def has_flashinfer_fused_kda_decode() -> bool:
     """Return whether FlashInfer fused KDA decode is available."""
     if not has_flashinfer():
         return False
@@ -1272,8 +1256,8 @@ __all__ = [
     "has_flashinfer_nvlink_one_sided",
     "has_flashinfer_cutlass_fused_moe",
     "has_flashinfer_cutedsl_grouped_gemm_nt_masked",
-    "has_flashinfer_kda_prefill",
-    "has_flashinfer_kda_decode",
+    "has_flashinfer_recurrent_kda",
+    "has_flashinfer_fused_kda_decode",
     "has_flashinfer_cutedsl_moe_nvfp4",
     "has_flashinfer_bf16_fp4",
     "has_flashinfer_b12x_moe",

@@ -142,16 +142,6 @@ def test_kda_state_dtype_rejects_float16_ssm_state():
         )
 
 
-def test_store_recurrent_state_casts_to_cache_dtype():
-    state = torch.zeros(3, 2, 4, 4, dtype=torch.bfloat16)
-    indices = torch.tensor([2, 0], dtype=torch.int32)
-    updated = torch.randn(2, 2, 4, 4, dtype=torch.float32)
-
-    nvidia_kda._store_recurrent_state(state, indices, updated)
-
-    torch.testing.assert_close(state[indices.long()], updated.to(torch.bfloat16))
-
-
 def test_resolve_kda_prefill_backend_preserves_flashkda_default(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -358,7 +348,7 @@ def test_flashinfer_kda_decode_arch_support(
         "get_device_capability",
         lambda: SimpleNamespace(major=capability[0], minor=capability[1]),
     )
-    monkeypatch.setattr(nvidia_kda, "has_flashinfer_kda_decode", lambda: True)
+    monkeypatch.setattr(nvidia_kda, "has_flashinfer_fused_kda_decode", lambda: True)
     monkeypatch.setattr(nvidia_kda.torch.version, "cuda", cuda_version)
     monkeypatch.setattr(nvidia_kda, "is_conv_state_dim_first", lambda: False)
 
@@ -433,7 +423,7 @@ def test_flashinfer_kda_prefill_arch_support(
         "get_device_capability",
         lambda: SimpleNamespace(major=capability[0], minor=capability[1]),
     )
-    monkeypatch.setattr(nvidia_kda, "has_flashinfer_kda_prefill", lambda: True)
+    monkeypatch.setattr(nvidia_kda, "has_flashinfer_recurrent_kda", lambda: True)
     monkeypatch.setattr(nvidia_kda.torch.version, "cuda", cuda_version)
 
     assert (

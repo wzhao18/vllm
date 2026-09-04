@@ -50,8 +50,8 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.flashinfer import (
     flashinfer_fused_kda_decode,
     flashinfer_recurrent_kda,
-    has_flashinfer_kda_decode,
-    has_flashinfer_kda_prefill,
+    has_flashinfer_fused_kda_decode,
+    has_flashinfer_recurrent_kda,
 )
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
@@ -61,14 +61,6 @@ from vllm.v1.worker.workspace import current_workspace_manager
 logger = init_logger(__name__)
 
 _KDA_GATE_LOGBOUND_MIN = -5.0
-
-
-def _store_recurrent_state(
-    recurrent_state: torch.Tensor,
-    state_indices: torch.Tensor,
-    updated_state: torch.Tensor,
-) -> None:
-    recurrent_state[state_indices] = updated_state.to(recurrent_state.dtype)
 
 
 def a_log_weight_loader(
@@ -200,7 +192,7 @@ def is_flashinfer_kda_decode_supported(
 ) -> bool:
     if (
         not current_platform.is_cuda()
-        or not has_flashinfer_kda_decode()
+        or not has_flashinfer_fused_kda_decode()
         or torch.version.cuda is None
     ):
         return False
@@ -278,8 +270,7 @@ def resolve_kda_decode_backend(
             "FlashInfer fused KDA decode requires CUDA SM100 with CUDA 12.8+ "
             "or SM103 with CUDA 12.9+, bfloat16 activations and convolution "
             "state, bfloat16 or float32 recurrent state, head_dim=128, "
-            "convolution width 4, no speculation, and flashinfer-python "
-            "0.6.18 or newer."
+            "convolution width 4, no speculation."
         )
     return "triton"
 
@@ -309,7 +300,7 @@ def is_flashinfer_kda_prefill_supported(
     recurrent_state_dtype: torch.dtype,
     lower_bound: float | None,
 ) -> bool:
-    if not current_platform.is_cuda() or not has_flashinfer_kda_prefill():
+    if not current_platform.is_cuda() or not has_flashinfer_recurrent_kda():
         return False
     capability = current_platform.get_device_capability()
     if capability is None or torch.version.cuda is None:
@@ -1277,8 +1268,6 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                             self._flashinfer_kda_output_spec
                         )
                         flashinfer_out = workspace_out[:, : q_ns.shape[1]]
-                    # This path is an eager callback during breakable graph replay.
-                    # FlashInfer owns a separate workspace for each CUDA stream.
                     (
                         core_attn_out_non_spec,
                         last_recurrent_state,
@@ -1314,10 +1303,8 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         use_qk_l2norm_in_kernel=True,
                         cu_seqlens=non_spec_query_start_loc,
                     )
-                _store_recurrent_state(
-                    recurrent_state,
-                    non_spec_state_indices_tensor,
-                    last_recurrent_state,
+                recurrent_state[non_spec_state_indices_tensor] = (
+                    last_recurrent_state.to(recurrent_state.dtype)
                 )
             else:
                 # Pure non-speculative decode.
