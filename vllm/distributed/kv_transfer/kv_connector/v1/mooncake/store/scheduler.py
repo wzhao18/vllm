@@ -268,6 +268,7 @@ class MooncakeStoreScheduler:
                 # producer. Loads are still carried by the same metadata.
                 skip_save=is_consumer,
                 block_hashes=request_real.block_hashes,
+                hash_block_size=self._hash_block_size,
             )
             if req_meta is not None:
                 meta.add_request(req_meta)
@@ -318,6 +319,7 @@ class MooncakeStoreScheduler:
                         load_spec=load_spec,
                         skip_save=is_consumer,
                         block_hashes=request_real.block_hashes,
+                        hash_block_size=self._hash_block_size,
                     )
                 else:
                     # Decode/chunked request
@@ -359,6 +361,7 @@ class MooncakeStoreScheduler:
                         load_spec=None,
                         skip_save=False,
                         block_hashes=unfinished_req.block_hashes,
+                        hash_block_size=self._hash_block_size,
                     )
 
                 if req_meta is not None:
@@ -393,6 +396,7 @@ class MooncakeStoreScheduler:
                     load_spec=load_spec,
                     skip_save=None,
                     block_hashes=unfinished_req.block_hashes,
+                    hash_block_size=self._hash_block_size,
                 )
                 if req_meta is not None:
                     meta.add_request(req_meta)

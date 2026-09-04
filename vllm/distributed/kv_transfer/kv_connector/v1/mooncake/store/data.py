@@ -770,15 +770,23 @@ class ReqMeta:
         load_spec: LoadSpec | None = None,
         skip_save: bool | None = False,
         block_hashes: list[BlockHash] | None = None,
+        hash_block_size: int | None = None,
     ) -> "ReqMeta | None":
         """Create ReqMeta from a RequestTracker."""
         if block_hashes is None:
             block_hashes = []
+        if hash_block_size is None:
+            hash_block_size = block_size
         input_token_len = tracker.token_len
 
         token_ids_start = tracker.num_saved_tokens
         chunk_boundary = cdiv(token_ids_start + 1, block_size) * block_size
         num_tokens_to_save = input_token_len // block_size * block_size
+        hashed_tokens = len(block_hashes) * hash_block_size
+        num_tokens_to_save = min(
+            num_tokens_to_save,
+            hashed_tokens // block_size * block_size,
+        )
 
         skip_save = skip_save or num_tokens_to_save < chunk_boundary
         # A ReqMeta must never carry both a save AND a load.
