@@ -1295,12 +1295,16 @@ class Scheduler(SchedulerInterface):
             snapshot_req_ids = {req.req_id for req in new_reqs_data}
             snapshot_req_ids.update(
                 req_id
-                for req_id, block_ids in zip(
+                for req_id, block_ids, num_computed_tokens in zip(
                     cached_reqs_data.req_ids,
                     cached_reqs_data.new_block_ids,
+                    cached_reqs_data.num_computed_tokens,
                     strict=True,
                 )
                 if block_ids
+                or num_computed_tokens // self.block_size
+                < (num_computed_tokens + num_scheduled_tokens[req_id])
+                // self.block_size
             )
             snapshot_req_ids.update(
                 req_id for req_id in boundary_state_offloads if req_id in self.requests

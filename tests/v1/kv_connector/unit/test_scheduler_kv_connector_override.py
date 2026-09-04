@@ -18,6 +18,7 @@ from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request
 
 
@@ -110,6 +111,7 @@ def _load_plugin():
         yield
     # Reset again so other tests are not affected.
     plugins_module.plugins_loaded = False
+    KVConnectorFactory._registry.pop("DummyKVConnector", None)
 
 
 def test_connector_receives_block_hashes(_load_plugin):
@@ -144,3 +146,38 @@ def test_connector_receives_block_hashes(_load_plugin):
     }
     assert meta.block_ids_by_req == expected_block_ids
     assert output.kv_connector_block_state is None
+
+
+def test_connector_receives_cached_block_ids_at_block_boundary(_load_plugin):
+    block_size = 16
+    scheduler = create_scheduler(
+        use_kv_connector="DummyKVConnector",
+        block_size=block_size,
+        max_num_seqs=1,
+        max_num_batched_tokens=block_size - 1,
+        max_model_len=2 * block_size,
+    )
+    (request,) = create_requests(num_requests=1, num_tokens=block_size)
+    scheduler.add_request(request)
+
+    first_output = scheduler.schedule()
+    scheduler.update_from_output(
+        first_output,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    second_output = scheduler.schedule()
+
+    assert second_output.scheduled_cached_reqs.new_block_ids == [None]
+    meta = second_output.kv_connector_metadata
+    assert isinstance(meta, DummyConnectorMetadata)
+    assert meta.block_ids_by_req[
+        request.request_id
+    ] == scheduler.kv_cache_manager.get_block_ids(request.request_id)
