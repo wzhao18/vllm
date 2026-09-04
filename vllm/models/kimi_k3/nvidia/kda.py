@@ -52,7 +52,6 @@ from vllm.utils.flashinfer import (
     flashinfer_recurrent_kda,
     has_flashinfer_kda_decode,
     has_flashinfer_kda_prefill,
-    has_flashinfer_recurrent_kda_decode,
 )
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
@@ -199,7 +198,11 @@ def is_flashinfer_kda_decode_supported(
     conv_state_dtype: torch.dtype,
     recurrent_state_dtype: torch.dtype,
 ) -> bool:
-    if not current_platform.is_cuda() or torch.version.cuda is None:
+    if (
+        not current_platform.is_cuda()
+        or not has_flashinfer_kda_decode()
+        or torch.version.cuda is None
+    ):
         return False
     capability = current_platform.get_device_capability()
     if capability is None:
@@ -210,27 +213,17 @@ def is_flashinfer_kda_decode_supported(
         return False
     compute_capability = (capability.major, capability.minor)
     minimum_cuda = (12, 9) if compute_capability == (10, 3) else (12, 8)
-    common_supported = (
+    return (
         compute_capability in ((10, 0), (10, 3))
         and cuda_version >= minimum_cuda
         and num_heads in (12, 24, 32, 48, 96)
         and head_dim == 128
         and conv_width == 4
+        and num_spec == 0
         and input_dtype == torch.bfloat16
         and conv_state_dtype == torch.bfloat16
-    )
-    if not common_supported:
-        return False
-    if num_spec > 0:
-        return (
-            recurrent_state_dtype == torch.bfloat16
-            and has_flashinfer_recurrent_kda_decode()
-        )
-    return (
-        num_spec == 0
         and recurrent_state_dtype in (torch.float32, torch.bfloat16)
         and not is_conv_state_dim_first()
-        and has_flashinfer_kda_decode()
     )
 
 
@@ -278,27 +271,15 @@ def resolve_kda_decode_backend(
         recurrent_state_dtype,
     )
     if flashinfer_supported and backend == "flashinfer":
-        if num_spec > 0:
-            logger.info_once(
-                "Using FlashInfer recurrent KDA speculative decode backend."
-            )
-        else:
-            logger.info_once("Using FlashInfer fused KDA decode backend.")
+        logger.info_once("Using FlashInfer fused KDA decode backend.")
         return "flashinfer"
     if backend == "flashinfer":
-        if num_spec > 0:
-            raise RuntimeError(
-                "FlashInfer recurrent KDA speculative decode requires CUDA "
-                "SM100 with CUDA 12.8+ or SM103 with CUDA 12.9+, bfloat16 "
-                "activations, convolution state, and recurrent state, "
-                "head_dim=128, convolution width 4, and a FlashInfer build "
-                "with 64-bit recurrent-state strides."
-            )
         raise RuntimeError(
             "FlashInfer fused KDA decode requires CUDA SM100 with CUDA 12.8+ "
             "or SM103 with CUDA 12.9+, bfloat16 activations and convolution "
             "state, bfloat16 or float32 recurrent state, head_dim=128, "
-            "convolution width 4, and flashinfer-python 0.6.18 or newer."
+            "convolution width 4, no speculation, and flashinfer-python "
+            "0.6.18 or newer."
         )
     return "triton"
 
@@ -427,45 +408,6 @@ def _flashinfer_kda_prefill(
         beta_is_logit=True,
         seq_order=seq_order,
         prefill_workspace=prefill_workspace,
-    )
-    return output, initial_state
-
-
-def _flashinfer_recurrent_kda_decode(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    raw_g: torch.Tensor,
-    raw_beta: torch.Tensor,
-    A_log: torch.Tensor,
-    dt_bias: torch.Tensor,
-    lower_bound: float,
-    initial_state: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    ssm_state_indices: torch.Tensor,
-    num_accepted_tokens: torch.Tensor,
-    out: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    output, _ = flashinfer_recurrent_kda(
-        q=q.contiguous(),
-        k=k.contiguous(),
-        v=v.contiguous(),
-        g=raw_g.contiguous(),
-        beta=raw_beta.contiguous(),
-        A_log=A_log.contiguous(),
-        dt_bias=dt_bias.contiguous(),
-        scale=q.shape[-1] ** -0.5,
-        initial_state=initial_state,
-        output_final_state=False,
-        use_qk_l2norm_in_kernel=True,
-        use_gate_in_kernel=True,
-        lower_bound=lower_bound,
-        cu_seqlens=cu_seqlens.contiguous(),
-        ssm_state_indices=ssm_state_indices.contiguous(),
-        num_spec_tokens=ssm_state_indices.shape[1] - 1,
-        num_accepted_tokens=num_accepted_tokens.contiguous(),
-        output=out,
-        beta_is_logit=True,
     )
     return output, initial_state
 
@@ -789,7 +731,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             recurrent_state_dtype,
         )
         decode_conv1d_weight = None
-        if self.kda_decode_backend != "triton" and self.num_spec == 0:
+        if self.kda_decode_backend != "triton":
             decode_conv1d_weight = torch.empty(
                 3,
                 self.conv_size,
@@ -1162,26 +1104,6 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                     query_start_loc=spec_cu_seqlens,
                     state_indices=spec_state_indices_tensor[: m.num_spec_decodes, 0],
                     spec_query_len=self.spec_query_len,
-                    out=spec_out,
-                )
-            elif (
-                self.kda_decode_backend == "flashinfer"
-                and m.flashinfer_spec_query_start_loc is not None
-            ):
-                assert self.gate_lower_bound is not None
-                core_attn_out_spec, _ = _flashinfer_recurrent_kda_decode(
-                    q=q_spec,
-                    k=k_spec,
-                    v=v_spec,
-                    raw_g=g1_spec,
-                    raw_beta=beta_spec,
-                    A_log=self.A_log,
-                    dt_bias=self.dt_bias,
-                    lower_bound=self.gate_lower_bound,
-                    initial_state=recurrent_state,
-                    cu_seqlens=m.flashinfer_spec_query_start_loc,
-                    ssm_state_indices=spec_state_indices_tensor,
-                    num_accepted_tokens=num_accepted_tokens,
                     out=spec_out,
                 )
             else:

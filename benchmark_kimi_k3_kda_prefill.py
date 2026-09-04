@@ -5,12 +5,12 @@
 The default cases use Kimi K3's TP8 shape of 12 heads by 128 dimensions.
 FlashInfer and FlashKDA are measured through vLLM's adapters, and Triton is
 measured through the fallback used by the model. CUPTI reports the GPU span
-from the first to last kernel in each backend call, with an L2 flush before
-every iteration.
+from the first to last kernel in each CUDA graph replay, with an L2 flush
+before every iteration.
 
 Example:
     FLASHINFER_WORKSPACE_BASE=/tmp .venv/bin/python \
-        benchmarks/kernels/benchmark_kimi_k3_kda_prefill.py
+        benchmark_kimi_k3_kda_prefill.py
 """
 
 import argparse
@@ -194,6 +194,19 @@ def measure_backend(
     return statistics.median(samples_us), samples_us
 
 
+def capture_graph(run) -> torch.cuda.CUDAGraph:
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            run()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            run()
+    torch.cuda.current_stream().wait_stream(stream)
+    return graph
+
+
 def format_metric(value: float | None, width: int, precision: int) -> str:
     if value is None:
         value = float("nan")
@@ -342,6 +355,18 @@ def benchmark_case(
                 "Diagnostic only: FlashKDA writes a BF16 recurrent state, while "
                 "Triton accumulates within a chunk.",
             )
+        if {"flashinfer", "flashkda"}.issubset(selected_backends):
+            output_delta = (
+                inputs["flashinfer_output"].float() - inputs["flashkda_output"].float()
+            )
+            state_delta = (
+                flashinfer_state_pool[0].float()
+                - inputs["flashkda_final_state"].float()
+            )
+            result["flashinfer_flashkda_comparison"] = {
+                "output_max_abs": output_delta.abs().max().item(),
+                "state_max_abs": state_delta.abs().max().item(),
+            }
 
     timings: dict[str, Any] = {}
     for backend, run, state_pool in (
@@ -353,8 +378,11 @@ def benchmark_case(
             continue
         state_pool.copy_(inputs["initial_state"].unsqueeze(0))
         cursors[backend] = 0
+        if backend == "flashinfer":
+            flashinfer_workspace = RecurrentKDAPrefillWorkspace(inputs["q"].device)
+        graph = capture_graph(run)
         median_us, samples_us = measure_backend(
-            run,
+            graph.replay,
             warmup_iters=args.warmup_iters,
             benchmark_iters=args.benchmark_iters,
             cold_l2_cache=not args.warm_l2,

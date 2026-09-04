@@ -381,19 +381,6 @@ def has_flashinfer_kda_prefill() -> bool:
 
 
 @functools.cache
-def has_flashinfer_recurrent_kda_decode() -> bool:
-    """Return whether FlashInfer recurrent KDA decode is available."""
-    if not has_flashinfer():
-        return False
-    mod = _get_submodule("flashinfer.kda_decode")
-    return (
-        mod is not None
-        and bool(getattr(mod, "_RECURRENT_KDA_AVAILABLE", False))
-        and callable(getattr(mod, "recurrent_kda", None))
-    )
-
-
-@functools.cache
 def has_flashinfer_kda_decode() -> bool:
     """Return whether FlashInfer fused KDA decode is available."""
     if not has_flashinfer():
@@ -1286,7 +1273,6 @@ __all__ = [
     "has_flashinfer_cutlass_fused_moe",
     "has_flashinfer_cutedsl_grouped_gemm_nt_masked",
     "has_flashinfer_kda_prefill",
-    "has_flashinfer_recurrent_kda_decode",
     "has_flashinfer_kda_decode",
     "has_flashinfer_cutedsl_moe_nvfp4",
     "has_flashinfer_bf16_fp4",
