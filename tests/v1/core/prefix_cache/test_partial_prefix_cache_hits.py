@@ -92,32 +92,48 @@ def make_full_mamba_manager(
     mamba_block_size: int = 4,
     num_blocks: int = 32,
     use_eagle: bool = False,
+    annotated_eagle_group: bool = False,
     num_prefill_checkpoint_blocks: int = 0,
+    max_model_len: int = 8192,
 ):
-    kv_cache_config = KVCacheConfig(
-        num_blocks=num_blocks,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
+    groups = [
+        KVCacheGroupSpec(
+            ["full"],
+            FullAttentionSpec(
+                block_size=full_block_size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["mamba"],
+            MambaSpec(
+                block_size=mamba_block_size,
+                shapes=(1, 1),
+                dtypes=(torch.float32,),
+                mamba_cache_mode="align",
+                num_prefill_checkpoint_blocks=num_prefill_checkpoint_blocks,
+            ),
+        ),
+    ]
+    if annotated_eagle_group:
+        groups.append(
             KVCacheGroupSpec(
-                ["full"],
+                ["draft_full"],
                 FullAttentionSpec(
                     block_size=full_block_size,
                     num_kv_heads=1,
-                    head_size=1,
+                    head_size=2,
                     dtype=torch.float32,
                 ),
-            ),
-            KVCacheGroupSpec(
-                ["mamba"],
-                MambaSpec(
-                    block_size=mamba_block_size,
-                    shapes=(1, 1),
-                    dtypes=(torch.float32,),
-                    mamba_cache_mode="align",
-                    num_prefill_checkpoint_blocks=num_prefill_checkpoint_blocks,
-                ),
-            ),
-        ],
+                is_eagle_group=True,
+            )
+        )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=groups,
     )
     scheduler_block_size = lcm(
         full_block_size * dcp_world_size,
@@ -125,7 +141,7 @@ def make_full_mamba_manager(
     )
     return make_kv_cache_manager(
         kv_cache_config=kv_cache_config,
-        max_model_len=8192,
+        max_model_len=max_model_len,
         enable_caching=True,
         dcp_world_size=dcp_world_size,
         scheduler_block_size=scheduler_block_size,
@@ -743,6 +759,62 @@ def test_boundary_state_offloads_returns_cow_target():
 
     manager.block_pool.free_blocks(retained)
     manager.free(req0)
+
+
+def test_eagle_exact_page_offload_waits_for_cow_snapshot():
+    """An exact-page recurrent state is published only after it is copied."""
+    hash_block_size = 2
+    block_size = 2 * hash_block_size
+    manager = make_full_mamba_manager(
+        dcp_world_size=1,
+        hash_block_size=hash_block_size,
+        full_block_size=block_size,
+        mamba_block_size=block_size,
+        num_blocks=64,
+        use_eagle=True,
+    )
+    manager.coordinator.retention_interval = 0
+
+    request = make_request(
+        "producer",
+        [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5],
+        hash_block_size,
+        sha256,
+    )
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(request)
+    assert manager.allocate_slots(request, 6, num_computed, computed_blocks) is not None
+
+    request.num_computed_tokens = 6
+    manager.new_step_starts()
+    assert manager.allocate_slots(request, 2) is not None
+
+    mamba_manager = manager.coordinator.single_type_managers[1]
+    source_block_id = mamba_manager.req_to_blocks[request.request_id][1].block_id
+    assert request.request_id in mamba_manager._partial_hit_reqs
+    # The state at token 8 is produced by this forward, so it cannot be offered
+    # from the still-live request block during the same scheduler step.
+    assert all(
+        boundary != 8
+        for _, _, boundary in drain_boundary_state_offloads(manager).get(
+            request.request_id, []
+        )
+    )
+
+    request.num_computed_tokens = 8
+    manager.new_step_starts()
+    assert manager.allocate_slots(request, 1) is not None
+    copies, _ = manager.take_kv_cache_block_copies()
+    offloads = drain_boundary_state_offloads(manager)
+    assert request.request_id in offloads, (copies, mamba_manager._partial_hit_reqs)
+    ((group_id, snapshot_block_id, boundary),) = offloads[request.request_id]
+
+    assert group_id == 1
+    assert boundary == 8
+    assert any(
+        copy.src_block_id == source_block_id and copy.dst_block_id == snapshot_block_id
+        for copy in copies
+    )
+    assert snapshot_block_id != source_block_id
 
 
 def test_finished_partial_tail_uses_table_source_once():
@@ -2069,6 +2141,137 @@ def test_dcp_partial_hit_with_eagle_rewinds_one_hash_unit():
     assert num_computed == 4
     assert [len(group) for group in computed_blocks.blocks] == [1, 1]
     assert manager.allocate_slots(req1, 4, num_computed, computed_blocks) is not None
+
+
+def test_eagle_replay_retention_with_annotated_draft_group():
+    """Target groups retain the boundary consumed after the draft-group drop."""
+    hash_block_size = 2
+    block_size = 8
+
+    def consumer_hit(enable_model_replay_retention: bool) -> tuple[int, set[int]]:
+        manager = make_full_mamba_manager(
+            dcp_world_size=1,
+            hash_block_size=hash_block_size,
+            full_block_size=block_size,
+            mamba_block_size=block_size,
+            num_blocks=128,
+            use_eagle=True,
+            annotated_eagle_group=True,
+        )
+        manager.coordinator.retention_interval = 0
+        managers = manager.coordinator.single_type_managers
+        assert [cache_manager.use_eagle for cache_manager in managers] == [
+            False,
+            False,
+            True,
+        ]
+        if not enable_model_replay_retention:
+            for cache_manager in managers:
+                cache_manager.use_eagle_replay = cache_manager.use_eagle
+        else:
+            assert all(cache_manager.use_eagle_replay for cache_manager in managers)
+
+        prefix = list(range(14))
+        producer = make_request("producer", prefix, hash_block_size, sha256)
+        computed_blocks, num_computed, _ = manager.get_computed_blocks(producer)
+        assert (
+            manager.allocate_slots(producer, 10, num_computed, computed_blocks)
+            is not None
+        )
+        offload_boundaries: set[int] = set()
+        producer.num_computed_tokens = 10
+        manager.new_step_starts()
+        assert manager.allocate_slots(producer, 2) is not None
+        offload_boundaries.update(
+            boundary
+            for _, _, boundary in drain_boundary_state_offloads(manager).get(
+                producer.request_id, []
+            )
+        )
+        producer.num_computed_tokens = 12
+        manager.new_step_starts()
+        assert manager.allocate_slots(producer, 2) is not None
+        offload_boundaries.update(
+            boundary
+            for _, _, boundary in drain_boundary_state_offloads(manager).get(
+                producer.request_id, []
+            )
+        )
+        producer.num_computed_tokens = 14
+        manager.free(producer)
+        manager.new_step_starts()
+
+        consumer = make_request(
+            "consumer", prefix[:12] + [100, 101], hash_block_size, sha256
+        )
+        return manager.get_computed_blocks(consumer)[1], offload_boundaries
+
+    assert consumer_hit(enable_model_replay_retention=False) == (0, set())
+    assert consumer_hit(enable_model_replay_retention=True) == (10, {10, 12})
+
+
+@pytest.mark.parametrize(
+    "prompt_tokens",
+    [
+        (96 + page_offset) * 128 + tail
+        for page_offset in range(12)
+        for tail in (0, 1, 127)
+    ],
+)
+def test_kimi_dcp_eagle_replay_retains_fine_grained_boundary(prompt_tokens):
+    """Exercise Kimi's DCP8, 128-token hash, and 1536-token Mamba geometry."""
+    hash_block_size = 128
+    cache_block_size = 1536
+    dcp_world_size = 8
+    manager = make_full_mamba_manager(
+        dcp_world_size=dcp_world_size,
+        hash_block_size=hash_block_size,
+        full_block_size=cache_block_size,
+        mamba_block_size=cache_block_size,
+        num_blocks=256,
+        use_eagle=True,
+        annotated_eagle_group=True,
+        max_model_len=65536,
+    )
+    manager.coordinator.retention_interval = 0
+
+    prefix = list(range(prompt_tokens))
+    producer = make_request("producer", prefix, hash_block_size, sha256)
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(producer)
+    latest_boundary = prompt_tokens // hash_block_size * hash_block_size
+    first_boundary = latest_boundary - 2 * hash_block_size
+    assert (
+        manager.allocate_slots(producer, first_boundary, num_computed, computed_blocks)
+        is not None
+    )
+    offload_boundaries: set[int] = set()
+    for boundary in (first_boundary, first_boundary + hash_block_size):
+        producer.num_computed_tokens = boundary
+        manager.new_step_starts()
+        assert manager.allocate_slots(producer, hash_block_size) is not None
+        offload_boundaries.update(
+            offload_boundary
+            for _, _, offload_boundary in drain_boundary_state_offloads(manager).get(
+                producer.request_id, []
+            )
+        )
+    producer.num_computed_tokens = latest_boundary
+    if latest_boundary < prompt_tokens:
+        manager.new_step_starts()
+        assert (
+            manager.allocate_slots(producer, prompt_tokens - latest_boundary)
+            is not None
+        )
+        producer.num_computed_tokens = prompt_tokens
+    manager.free(producer)
+    manager.new_step_starts()
+
+    consumer = make_request(
+        "consumer", prefix + [prompt_tokens, prompt_tokens + 1], hash_block_size, sha256
+    )
+    expected_boundary = latest_boundary - hash_block_size
+    assert expected_boundary in offload_boundaries
+    assert manager.get_computed_blocks(consumer)[1] == expected_boundary
 
 
 def _snapshot_offload_kv_cache_config(

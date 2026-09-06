@@ -12,6 +12,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlock,
     dcp_world_size_for_kv_cache_spec,
+    replay_boundary,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
@@ -151,6 +152,8 @@ class KVCacheCoordinator(ABC):
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
+        for manager in self.single_type_managers:
+            manager.use_eagle_replay = bool(self.eagle_group_ids)
 
         # A positive retention interval must be a multiple of the base hit granularity
         # (``scheduler_block_size``) to land on real cache-hit boundaries.
@@ -303,6 +306,18 @@ class KVCacheCoordinator(ABC):
             for manager in self.single_type_managers
         )
 
+    def get_replay_boundary(self, request: Request) -> int:
+        """Position a later request replaying this prompt resumes at.
+
+        See ``kv_cache_utils.replay_boundary``; external stores share it so
+        their retention names the same position the engine resumes at.
+        """
+        return replay_boundary(
+            request.num_prompt_tokens,
+            self.scheduler_block_size,
+            bool(self.eagle_group_ids),
+        )
+
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """
         Cache the blocks for the request.
@@ -313,6 +328,7 @@ class KVCacheCoordinator(ABC):
                 that need to be cached
                 (including tokens that are already cached).
         """
+        replay_boundary = self.get_replay_boundary(request)
         for manager in self.single_type_managers:
             # Only cache tokens with finalized KV. The last num_reprefillable_tokens
             # tokens can be re-prefilled during multi-module MTP.
@@ -323,6 +339,7 @@ class KVCacheCoordinator(ABC):
                 request,
                 num_tokens_to_cache,
                 retention_interval=self.retention_interval,
+                replay_boundary=replay_boundary,
             )
 
     def free(self, request_id: str) -> None:
@@ -747,6 +764,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         cached_num_computed_tokens = self._align_cacheable(num_computed_tokens)
+        replay_boundary = self.get_replay_boundary(request)
         for manager in self.single_type_managers:
             num_tokens_to_cache = cached_num_computed_tokens
             # EAGLE groups match one block past each aligned boundary and drop
@@ -773,6 +791,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 request,
                 num_tokens_to_cache,
                 retention_interval=self.retention_interval,
+                replay_boundary=replay_boundary,
             )
 
     def find_longest_cache_hit(
