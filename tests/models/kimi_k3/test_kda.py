@@ -458,18 +458,41 @@ def test_packed_kda_decode_correctness(
 
 
 @pytest.mark.parametrize(
-    ("H", "fuse_gate"),
-    [(12, True), (12, False), (12, None), (96, None)],
+    ("H", "fuse_gate", "lower_bound", "num_seqs", "state_dtype"),
+    [
+        pytest.param(12, True, -5.0, 3, torch.float32, id="fused-lower-bound"),
+        pytest.param(12, True, None, 3, torch.float32, id="fused-softplus"),
+        pytest.param(12, False, -5.0, 3, torch.float32, id="split-lower-bound"),
+        pytest.param(12, False, None, 3, torch.float32, id="split-softplus"),
+        pytest.param(12, None, -5.0, 3, torch.float32, id="default-lower-bound"),
+        pytest.param(12, None, None, 3, torch.float32, id="default-softplus"),
+        pytest.param(96, None, -5.0, 3, torch.float32, id="many-heads-bound"),
+        pytest.param(96, None, None, 3, torch.float32, id="many-heads-softplus"),
+        pytest.param(
+            12,
+            True,
+            -5.0,
+            25,
+            torch.bfloat16,
+            id="bf16-cache-preprocessed",
+        ),
+    ],
 )
-@pytest.mark.parametrize("lower_bound", [-5.0, None])
 @torch.inference_mode()
 def test_kda_spec_decode_correctness(
     H: int,
     fuse_gate: bool | None,
     lower_bound: float | None,
+    num_seqs: int,
+    state_dtype: torch.dtype,
 ):
-    num_seqs, query_len, D = 3, 3, 128
-    T = num_seqs * query_len
+    query_len = 5 if state_dtype == torch.bfloat16 else 3
+    D = 128
+    if state_dtype == torch.bfloat16:
+        query_lens = [seq % 2 + 4 for seq in range(num_seqs)]
+    else:
+        query_lens = [query_len] * num_seqs
+    T = sum(query_lens)
     torch.manual_seed(1234)
 
     qkv_storage = torch.randn(
@@ -499,31 +522,35 @@ def test_kda_spec_decode_correctness(
     raw_beta = beta_storage[..., :H]
     A_log = 0.5 * torch.randn(H, dtype=torch.float32, device=DEVICE)
     dt_bias = 0.1 * torch.randn(H, D, dtype=torch.float32, device=DEVICE)
-    cu_seqlens = torch.arange(
-        0,
-        T + 1,
-        query_len,
-        dtype=torch.int32,
-        device=DEVICE,
+    cu_seqlens = torch.cat(
+        [
+            torch.zeros(1, dtype=torch.int32, device=DEVICE),
+            torch.tensor(query_lens, dtype=torch.int32, device=DEVICE).cumsum(0),
+        ]
     )
     state_indices = torch.arange(
         1,
-        T + 1,
+        num_seqs * query_len + 1,
         dtype=torch.int32,
         device=DEVICE,
     ).view(num_seqs, query_len)
-    num_accepted_tokens = torch.tensor(
-        [1, 2, 3],
-        dtype=torch.int32,
-        device=DEVICE,
-    )
+    if state_dtype == torch.bfloat16:
+        num_accepted_tokens = torch.tensor(query_lens, dtype=torch.int32, device=DEVICE)
+    else:
+        num_accepted_tokens = (
+            torch.arange(num_seqs, dtype=torch.int32, device=DEVICE) % query_len + 1
+        )
     state_storage = 0.01 * torch.randn(
-        T + 1,
+        num_seqs * query_len + 1,
         H * D * D + 17,
         dtype=torch.float32,
         device=DEVICE,
     )
-    state = state_storage[:, : H * D * D].view(T + 1, H, D, D)
+    state = (
+        state_storage[:, : H * D * D]
+        .view(num_seqs * query_len + 1, H, D, D)
+        .to(state_dtype)
+    )
     output_storage = torch.full(
         (1, T, H * D + 11),
         torch.nan,
@@ -543,29 +570,50 @@ def test_kda_spec_decode_correctness(
     q_norm = l2norm_fwd(q.contiguous())
     k_norm = l2norm_fwd(k.contiguous())
     expected_state = state.clone()
-    expected_outputs = []
-    for seq, accepted in enumerate(num_accepted_tokens.tolist()):
-        recurrent_state = expected_state[state_indices[seq, accepted - 1]].transpose(
-            -1, -2
+    if state_dtype == torch.bfloat16:
+        expected, _ = fused_recurrent_kda_fwd(
+            q=q,
+            k=k,
+            v=v,
+            g=raw_g,
+            beta=raw_beta,
+            scale=D**-0.5,
+            initial_state=expected_state,
+            inplace_final_state=True,
+            cu_seqlens=cu_seqlens,
+            ssm_state_indices=state_indices,
+            num_accepted_tokens=num_accepted_tokens,
+            use_qk_l2norm_in_kernel=True,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=lower_bound,
+            use_gate_in_kernel=True,
+            use_beta_sigmoid_in_kernel=True,
         )
-        start = seq * query_len
-        for token in range(query_len):
-            token_slice = slice(start + token, start + token + 1)
-            token_output, recurrent_state = naive_recurrent_kda(
-                q_norm[:, token_slice],
-                k_norm[:, token_slice],
-                v[:, token_slice],
-                gate[:, token_slice],
-                beta[:, token_slice],
-                initial_state=recurrent_state,
-                output_final_state=True,
-            )
-            assert recurrent_state is not None
-            expected_outputs.append(token_output)
-            expected_state[state_indices[seq, token]] = recurrent_state.transpose(
-                -1, -2
-            )
-    expected = torch.cat(expected_outputs, dim=1)
+    else:
+        expected_outputs = []
+        for seq, accepted in enumerate(num_accepted_tokens.tolist()):
+            recurrent_state = expected_state[
+                state_indices[seq, accepted - 1]
+            ].transpose(-1, -2)
+            start = seq * query_len
+            for token in range(query_len):
+                token_slice = slice(start + token, start + token + 1)
+                token_output, recurrent_state = naive_recurrent_kda(
+                    q_norm[:, token_slice],
+                    k_norm[:, token_slice],
+                    v[:, token_slice],
+                    gate[:, token_slice],
+                    beta[:, token_slice],
+                    initial_state=recurrent_state,
+                    output_final_state=True,
+                )
+                assert recurrent_state is not None
+                expected_outputs.append(token_output)
+                expected_state[state_indices[seq, token]] = recurrent_state.transpose(
+                    -1, -2
+                )
+        expected = torch.cat(expected_outputs, dim=1)
 
     actual_state = state.clone()
     actual, _ = fused_recurrent_kda(

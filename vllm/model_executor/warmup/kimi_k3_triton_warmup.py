@@ -114,7 +114,9 @@ def _warm_recurrent_kda(
     h = int(layer.local_num_heads)
     d = int(layer.head_dim)
     tokens_per_sequence = num_speculative_tokens + 1
-    for num_sequences in get_fused_recurrent_kda_fwd_warmup_profiles(h):
+    for num_sequences in get_fused_recurrent_kda_fwd_warmup_profiles(
+        h, tokens_per_sequence
+    ):
         num_tokens = num_sequences * tokens_per_sequence
         packed_qkv = torch.empty(
             (num_tokens, 3 * h * d),
