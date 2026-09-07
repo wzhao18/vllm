@@ -65,6 +65,10 @@ class MooncakeStoreScheduler:
         # Skips lookup CPU cost on instances that never load KV from the store.
         self.enable_lookup = kvc_extra_config.get("enable_lookup", True)
         self.save_decode_cache = kvc_extra_config.get("save_decode_cache", False)
+        speculative_config = vllm_config.speculative_config
+        self.use_eagle = (
+            speculative_config is not None and speculative_config.use_eagle()
+        )
         kv_event_config = vllm_config.kv_events_config
         self.enable_kv_events = bool(
             kv_event_config and kv_event_config.enable_kv_cache_events
@@ -329,24 +333,38 @@ class MooncakeStoreScheduler:
                     # requests keep saving past the original prompt boundary.
                     prefill_end = request_tracker.prefill_end_tokens
                     is_decode = num_computed_token >= prefill_end
-                    if is_decode and not self.save_decode_cache:
-                        continue
-
-                    num_new_tokens = scheduler_output.num_scheduled_tokens[req_id]
                     req_tuple = self._unfinished_requests.get(req_id)
-                    if req_tuple:
-                        unfinished_req = req_tuple[0]
-                        num_current_tokens = request_tracker.token_len
-                        new_token_ids = unfinished_req.all_token_ids[
-                            num_current_tokens : num_current_tokens + num_new_tokens
-                        ]
-                        request_tracker.token_len += len(new_token_ids)
-                        if request_tracker.token_ids is not None:
-                            request_tracker.token_ids.extend(new_token_ids)
-                    else:
+                    if req_tuple is None:
                         raise ValueError(
                             f"Request {req_id} is not in _unfinished_requests"
                         )
+                    unfinished_req = req_tuple[0]
+                    if is_decode and not self.save_decode_cache:
+                        if not self.use_eagle:
+                            prompt_save_tokens = (
+                                prefill_end // self._block_size * self._block_size
+                            )
+                            if request_tracker.num_saved_tokens < prompt_save_tokens:
+                                req_meta = ReqMeta.from_request_tracker(
+                                    request_tracker,
+                                    self._block_size,
+                                    load_spec=None,
+                                    skip_save=False,
+                                    block_hashes=unfinished_req.block_hashes,
+                                    hash_block_size=self._hash_block_size,
+                                )
+                                if req_meta is not None:
+                                    meta.add_request(req_meta)
+                        continue
+
+                    num_new_tokens = scheduler_output.num_scheduled_tokens[req_id]
+                    num_current_tokens = request_tracker.token_len
+                    new_token_ids = unfinished_req.all_token_ids[
+                        num_current_tokens : num_current_tokens + num_new_tokens
+                    ]
+                    request_tracker.token_len += len(new_token_ids)
+                    if request_tracker.token_ids is not None:
+                        request_tracker.token_ids.extend(new_token_ids)
                     # A block is usually allocated before the step that fills
                     # it, so reaching a save boundary does not imply that this
                     # step has new block ids.

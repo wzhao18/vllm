@@ -21,6 +21,7 @@ from vllm.v1.core.sched.output import KVConnectorBlockState
 
 def _make_bare_scheduler(
     *,
+    block_size: int = 16,
     hash_block_size: int = 16,
     enable_partial_hash_hits: bool = False,
     kv_role: str = "kv_both",
@@ -32,7 +33,8 @@ def _make_bare_scheduler(
     scheduler.enable_kv_events = False
     scheduler.lookup_async = False
     scheduler.enable_lookup = True
-    scheduler._block_size = 16
+    scheduler.use_eagle = False
+    scheduler._block_size = block_size
     scheduler._hash_block_size = hash_block_size
     scheduler.enable_partial_hash_hits = enable_partial_hash_hits
     scheduler.kv_cache_config = SimpleNamespace(
@@ -83,7 +85,10 @@ def _make_scheduler_output(*, scheduled_spec_tokens: list[int] | None):
 
 
 def _make_decode_scheduler_output(
-    *, num_computed_tokens: int, num_scheduled_tokens: int = 1
+    *,
+    num_computed_tokens: int,
+    num_scheduled_tokens: int = 1,
+    block_ids: tuple[list[int], ...] = ([0, 1, 2],),
 ) -> SimpleNamespace:
     return SimpleNamespace(
         finished_req_ids=set(),
@@ -98,7 +103,7 @@ def _make_decode_scheduler_output(
         ),
         num_scheduled_tokens={"req-0": num_scheduled_tokens},
         scheduled_spec_decode_tokens={},
-        kv_connector_block_state=_make_connector_block_state(block_ids=([0, 1, 2],)),
+        kv_connector_block_state=_make_connector_block_state(block_ids=block_ids),
     )
 
 
@@ -350,6 +355,163 @@ def test_decode_tracking_is_skipped_by_default(kv_role):
     assert tracker.num_saved_tokens == 32
     assert tracker.allocated_block_ids == ([0, 1, 2],)
     assert tracker.token_ids == list(range(47))
+
+
+@pytest.mark.parametrize(
+    ("block_size", "hash_block_size", "prompt_tokens"),
+    [
+        (16, 16, 49),
+        (1536, 128, 1536),
+        (1536, 128, 1537),
+        (1536, 128, 1665),
+        (1536, 128, 3071),
+        (1536, 128, 3072),
+        (1536, 128, 3073),
+        (1536, 128, 156333),
+        (1536, 128, 499474),
+        (1536, 128, 673179),
+    ],
+)
+def test_decode_flushes_prompt_save_when_boundary_hash_becomes_available(
+    block_size: int, hash_block_size: int, prompt_tokens: int
+):
+    scheduler = _make_bare_scheduler(
+        block_size=block_size,
+        hash_block_size=hash_block_size,
+        kv_role="kv_both",
+    )
+    save_boundary = prompt_tokens // block_size * block_size
+    num_blocks = (prompt_tokens + block_size - 1) // block_size
+    num_hashes = save_boundary // hash_block_size
+    scheduler._gpu_block_pool = BlockPool(
+        num_gpu_blocks=num_blocks + 1,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+    _add_unfinished_request(
+        scheduler,
+        token_ids=[0],
+        block_hashes=[f"h{i}".encode() for i in range(num_hashes - 1)],
+        prefill_end_tokens=prompt_tokens,
+    )
+    tracker = scheduler._request_trackers["req-0"]
+    tracker.token_len = prompt_tokens
+    tracker.allocated_block_ids = (list(range(num_blocks)),)
+    tracker.num_saved_tokens = save_boundary - block_size
+
+    request = scheduler._unfinished_requests["req-0"][0]
+    meta = scheduler.build_connector_meta(
+        _make_decode_scheduler_output(
+            num_computed_tokens=prompt_tokens,
+            block_ids=(list(range(num_blocks)),),
+        )
+    )
+    assert meta.requests == []
+    assert tracker.num_saved_tokens == save_boundary - block_size
+
+    request.block_hashes.append(f"h{num_hashes - 1}".encode())
+    meta = scheduler.build_connector_meta(
+        _make_decode_scheduler_output(
+            num_computed_tokens=prompt_tokens,
+            block_ids=(list(range(num_blocks)),),
+        )
+    )
+
+    assert len(meta.requests) == 1
+    assert meta.requests[0].token_len_chunk == save_boundary
+    assert tracker.num_saved_tokens == save_boundary
+
+    meta = scheduler.build_connector_meta(
+        _make_decode_scheduler_output(
+            num_computed_tokens=prompt_tokens + 1,
+            block_ids=(list(range(num_blocks)),),
+        )
+    )
+    assert meta.requests == []
+
+
+def test_eagle_decode_does_not_flush_deferred_prompt_save():
+    """EAGLE recurrent boundaries are published by exact state hand-offs."""
+    scheduler = _make_bare_scheduler(
+        block_size=1536,
+        hash_block_size=128,
+        kv_role="kv_both",
+    )
+    scheduler.use_eagle = True
+    prompt_tokens = 66_303
+    save_boundary = prompt_tokens // scheduler._block_size * scheduler._block_size
+    num_blocks = (prompt_tokens + scheduler._block_size - 1) // scheduler._block_size
+    num_hashes = prompt_tokens // scheduler._hash_block_size
+    _add_unfinished_request(
+        scheduler,
+        token_ids=[0],
+        block_hashes=[f"h{i}".encode() for i in range(num_hashes)],
+        prefill_end_tokens=prompt_tokens,
+    )
+    tracker = scheduler._request_trackers["req-0"]
+    tracker.token_len = prompt_tokens
+    tracker.allocated_block_ids = (list(range(num_blocks)),)
+    tracker.num_saved_tokens = save_boundary - scheduler._block_size
+
+    meta = scheduler.build_connector_meta(
+        _make_decode_scheduler_output(
+            num_computed_tokens=prompt_tokens,
+            block_ids=(list(range(num_blocks)),),
+        )
+    )
+
+    assert meta.requests == []
+    assert tracker.num_saved_tokens == save_boundary - scheduler._block_size
+
+
+def test_no_spec_decode_joins_prompt_save_with_exact_recurrent_handoff():
+    """The delayed dense suffix and its exact KDA state publish together."""
+    scheduler = _make_bare_scheduler(
+        block_size=1536,
+        hash_block_size=128,
+        kv_role="kv_both",
+    )
+    prompt_tokens = 66_303
+    save_boundary = prompt_tokens // scheduler._block_size * scheduler._block_size
+    num_blocks = (prompt_tokens + scheduler._block_size - 1) // scheduler._block_size
+    num_hashes = prompt_tokens // scheduler._hash_block_size
+    full_blocks = list(range(1, num_blocks + 1))
+    kda_blocks = list(range(num_blocks + 1, 2 * num_blocks + 1))
+    cow_block = 2 * num_blocks + 1
+    scheduler._gpu_block_pool = BlockPool(
+        num_gpu_blocks=cow_block + 1,
+        enable_caching=True,
+        hash_block_size=scheduler._hash_block_size,
+    )
+    scheduler._boundary_state_group_ids = frozenset({1})
+    _add_unfinished_request(
+        scheduler,
+        token_ids=[0],
+        block_hashes=[f"h{i}".encode() for i in range(num_hashes)],
+        prefill_end_tokens=prompt_tokens,
+    )
+    tracker = scheduler._request_trackers["req-0"]
+    tracker.token_len = prompt_tokens
+    tracker.allocated_block_ids = (full_blocks.copy(), kda_blocks.copy())
+    tracker.num_saved_tokens = save_boundary - scheduler._block_size
+
+    output = _make_decode_scheduler_output(
+        num_computed_tokens=prompt_tokens,
+        block_ids=(full_blocks, kda_blocks),
+    )
+    output.kv_connector_block_state = _make_connector_block_state(
+        block_ids=(full_blocks, kda_blocks),
+        offloads=[(1, cow_block, save_boundary)],
+    )
+    meta = scheduler.build_connector_meta(output)
+
+    assert len(meta.requests) == 1
+    request = meta.requests[0]
+    assert request.token_len_chunk == save_boundary
+    assert request.boundary_state_offloads == [(1, cow_block, save_boundary)]
+    pinned, remaining = scheduler._pinned_saves[request.store_job_id]
+    assert set(pinned) == {*full_blocks, cow_block}
+    assert remaining == 1
 
 
 def test_fresh_consumer_first_decode_save_can_backfill_missing_prompt():
