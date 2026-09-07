@@ -48,6 +48,7 @@ from vllm.v1.core.kv_cache_utils import BlockHash, maybe_convert_block_hash
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheGroupSpec,
+    MambaSpec,
     RSWASpec,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
@@ -2409,6 +2410,14 @@ def test_tp_sharded_layout_rejects_full_attention_subclasses():
     assert not store_worker._supports_tp_sharded_store_layout(LBHNCStoreLayout, {})
 
 
+def test_compact_group_io_rejects_store_tp_layout():
+    store_worker = object.__new__(worker.MooncakeStoreWorker)
+    store_worker.compact_group_io = True
+
+    with pytest.raises(ValueError, match="cannot be enabled together"):
+        store_worker._select_store_layout({"store_tp_size": 4})
+
+
 @pytest.mark.parametrize(
     ("extra_config", "expected"),
     [
@@ -3414,6 +3423,8 @@ def _make_bare_worker(
     worker.tp_rank = 0
     worker.enable_kv_events = False
     worker.load_async = True
+    worker.compact_group_io = False
+    worker.kv_cache_layout = None
     worker.kv_send_thread = None
     worker.kv_recv_threads = []
     worker.num_recv_threads = 1
@@ -4224,6 +4235,231 @@ def test_register_kv_caches_separate_head_groups():
     assert db.kv_caches_base_addr == expected_addrs
     assert db.block_len == [head_block_bytes] * len(expected_addrs)
     worker.store.register_buffer.assert_called_once_with(raw.data_ptr(), raw.nbytes)
+
+
+def test_register_kv_caches_compact_group_io_isolates_group_layers():
+    num_blocks = 3
+    block_size = 4
+    worker = _make_bare_worker(num_gpu_blocks=num_blocks, block_size=block_size)
+    spec = FullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=2,
+        head_size=8,
+        dtype=torch.float16,
+    )
+    worker._kv_cache_groups = [
+        KVCacheGroupSpec(["layer0"], spec),
+        KVCacheGroupSpec(["layer1"], spec),
+    ]
+    worker.token_dbs = [
+        ChunkedTokenDatabase(
+            KeyMetadata("test-model", 0, 0, 0, 0, group_id=group_id),
+            block_size=block_size,
+            hash_block_size=block_size,
+        )
+        for group_id in range(2)
+    ]
+    worker.compact_group_io = True
+    worker.kv_cache_layout = KVCacheLayout.LBHNC
+    cache_shape = (
+        num_blocks,
+        spec.num_heads,
+        spec.num_states,
+        spec.state_content_size_bytes,
+    )
+    layer0 = torch.zeros(cache_shape, dtype=torch.int8)
+    layer1 = torch.zeros(cache_shape, dtype=torch.int8)
+
+    _register_with_mocked_threads(worker, {"layer0": layer0, "layer1": layer1})
+
+    assert worker.token_dbs[0].kv_caches_base_addr == [layer0.data_ptr()]
+    assert worker.token_dbs[1].kv_caches_base_addr == [layer1.data_ptr()]
+
+
+@pytest.mark.parametrize(
+    (
+        "global_heads",
+        "local_heads",
+        "block_size",
+        "kernel_blocks_per_page",
+        "kernel_block_size",
+    ),
+    [
+        pytest.param(8, 1, 4, 1, 4, id="head-sharded"),
+        pytest.param(1, 1, 32, 1, 4, id="dcp-state-sharded"),
+        pytest.param(1, 1, 96, 24, 4, id="kernel-block-split"),
+    ],
+)
+def test_register_kv_caches_compact_group_io_uses_rank_local_attention_page(
+    global_heads: int,
+    local_heads: int,
+    block_size: int,
+    kernel_blocks_per_page: int,
+    kernel_block_size: int,
+):
+    num_blocks = 3
+    spec = FullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=global_heads,
+        head_size=8,
+        dtype=torch.float16,
+    )
+    state_bytes = spec.state_content_size_bytes
+    cache = torch.zeros(
+        num_blocks * kernel_blocks_per_page,
+        local_heads,
+        kernel_block_size,
+        state_bytes,
+        dtype=torch.int8,
+    )
+    worker = _make_bare_worker(num_gpu_blocks=num_blocks, block_size=block_size)
+    worker.compact_group_io = True
+    worker.kv_cache_layout = KVCacheLayout.LBHNC
+    worker._kv_cache_groups = [KVCacheGroupSpec(["layer0"], spec)]
+    worker.token_dbs = [
+        ChunkedTokenDatabase(
+            KeyMetadata("test-model", 0, 0, 0, 0, group_id=0),
+            block_size=block_size,
+        )
+    ]
+
+    _register_with_mocked_threads(worker, {"layer0": cache})
+
+    db = worker.token_dbs[0]
+    expected_bytes = (
+        kernel_blocks_per_page * kernel_block_size * state_bytes * local_heads
+    )
+    assert db.block_len == [expected_bytes]
+    assert db.store_layout.block_stride == [expected_bytes]
+
+
+@pytest.mark.parametrize(
+    "layout", [KVCacheLayout.LBHNC, KVCacheLayout.LBNHC, KVCacheLayout.LHBNC]
+)
+def test_register_kv_caches_compact_group_regions(layout: KVCacheLayout):
+    num_blocks = 3
+    spec = FullAttentionSpec(
+        block_size=4,
+        num_kv_heads=2,
+        head_size=8,
+        dtype=torch.float16,
+    )
+    raw = torch.zeros(2 * num_blocks * spec.page_size_bytes, dtype=torch.int8)
+    large_group_caches = dense_kv_cache_views(raw, spec, num_blocks, 2, layout)
+    small_group_cache = dense_kv_cache_views(raw, spec, num_blocks, 1, layout)[0]
+
+    worker = _make_bare_worker(num_gpu_blocks=num_blocks)
+    worker.compact_group_io = True
+    worker.kv_cache_layout = layout
+    worker._kv_cache_groups = [
+        KVCacheGroupSpec(["large.0", "large.1"], spec),
+        KVCacheGroupSpec(["small.0"], spec),
+    ]
+    worker.token_dbs = [
+        ChunkedTokenDatabase(
+            KeyMetadata("test-model", 0, 0, 0, 0, group_id=group_id),
+            block_size=spec.block_size,
+        )
+        for group_id in range(2)
+    ]
+
+    _register_with_mocked_threads(
+        worker,
+        {
+            "large.0": large_group_caches[0],
+            "large.1": large_group_caches[1],
+            "small.0": small_group_cache,
+        },
+    )
+
+    large_db, small_db = worker.token_dbs
+    regions_per_layer = spec.num_kv_heads if layout == KVCacheLayout.LHBNC else 1
+    expected_large_addrs = (
+        [
+            cache[:, head_idx].data_ptr()
+            for cache in large_group_caches
+            for head_idx in range(cache.shape[1])
+        ]
+        if layout == KVCacheLayout.LHBNC
+        else [cache.data_ptr() for cache in large_group_caches]
+    )
+    assert large_db.kv_caches_base_addr == expected_large_addrs
+    assert len(large_db.kv_caches_base_addr) == 2 * regions_per_layer
+    assert len(small_db.kv_caches_base_addr) == regions_per_layer
+    assert sum(large_db.block_len) == 2 * spec.unpadded_page_size_bytes
+    assert sum(small_db.block_len) == spec.unpadded_page_size_bytes
+    assert (
+        small_db.kv_caches_base_addr == large_db.kv_caches_base_addr[:regions_per_layer]
+    )
+
+
+def test_register_kv_caches_compact_group_regions_strip_mamba_padding():
+    num_blocks = 3
+    spec = MambaSpec(
+        block_size=4,
+        shapes=((3, 4),),
+        dtypes=(torch.float16,),
+        page_size_padded=32,
+    )
+    raw = torch.zeros(num_blocks * spec.page_size_bytes, dtype=torch.int8)
+    cache = dense_kv_cache_views(
+        raw,
+        spec,
+        num_blocks,
+        1,
+        KVCacheLayout.LBNHC,
+    )[0]
+
+    worker = _make_bare_worker(num_gpu_blocks=num_blocks)
+    worker.compact_group_io = True
+    worker.kv_cache_layout = KVCacheLayout.LBNHC
+    worker._kv_cache_groups = [KVCacheGroupSpec(["mamba"], spec)]
+    worker.token_dbs = [
+        ChunkedTokenDatabase(
+            KeyMetadata("test-model", 0, 0, 0, 0, group_id=0),
+            block_size=spec.block_size,
+        )
+    ]
+
+    _register_with_mocked_threads(worker, {"mamba": cache})
+
+    db = worker.token_dbs[0]
+    assert isinstance(db.store_layout, RankLocalStoreLayout)
+    assert db.store_layout.block_stride == [spec.page_size_bytes]
+    assert db.block_len == [24]
+    assert db.prepare_value_for_block(2) == (
+        [cache.data_ptr() + 2 * spec.page_size_bytes],
+        [24],
+    )
+
+
+@pytest.mark.parametrize(
+    "layout", [KVCacheLayout.BLHNC, KVCacheLayout.BLNHC, KVCacheLayout.BHLNC]
+)
+def test_register_kv_caches_compact_group_regions_rejects_block_outer_layout(
+    layout: KVCacheLayout,
+):
+    worker = _make_bare_worker(num_gpu_blocks=2)
+    worker.compact_group_io = True
+    worker.kv_cache_layout = layout
+    tensor = torch.zeros(2, 64, dtype=torch.float16)
+
+    with pytest.raises(ValueError, match="requires a layer-compact"):
+        _register_with_mocked_threads(worker, {"layer0": tensor})
+
+
+def test_compact_group_io_cache_prefix_versions_values():
+    assert (
+        mooncake_store_worker._compact_group_io_cache_prefix("", "LBNHC")
+        == mooncake_store_worker.MOONCAKE_COMPACT_GROUP_IO_FORMAT + "-lbnhc"
+    )
+    assert mooncake_store_worker._compact_group_io_cache_prefix(
+        "deployment", "LHBNC"
+    ) == (
+        "deployment|"
+        + mooncake_store_worker.MOONCAKE_COMPACT_GROUP_IO_FORMAT
+        + "-lhbnc"
+    )
 
 
 # ---------------------------------------------------------------------------
