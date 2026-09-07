@@ -26,7 +26,10 @@ from vllm.logger import init_logger
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+from vllm.v1.core.kv_cache_utils import (
+    eagle_partial_tail_boundaries,
+    resolve_kv_cache_block_sizes,
+)
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.outputs import KVConnectorOutput
@@ -94,6 +97,9 @@ class MooncakeStoreScheduler:
             spec.mamba_cache_mode == "align" for spec in mamba_groups.values()
         ), "MooncakeStoreScheduler requires mamba_cache_mode='align'"
         self._boundary_state_group_ids = frozenset(mamba_groups)
+        self._boundary_state_block_sizes = {
+            group_id: spec.block_size for group_id, spec in mamba_groups.items()
+        }
 
         self._gpu_block_pool: BlockPool | None = None
         self._num_workers = vllm_config.parallel_config.world_size
@@ -489,17 +495,18 @@ class MooncakeStoreScheduler:
             assert NULL_BLOCK_ID not in block_ids, (
                 "A null block cannot back a boundary-state offload"
             )
-            # Every allocated block is referenced, not just the ones covering
-            # this job's token range: a rank resumes from its own last
-            # successful offset, which lags the scheduler's whenever a save was
-            # skipped or failed, so it may read anywhere below the range.
-            block_ids.extend(
-                block_id
-                for group_id, group in enumerate(req_meta.block_ids)
-                if group_id not in self._boundary_state_group_ids
-                for block_id in group
-                if block_id != NULL_BLOCK_ID
-            )
+            # Normal saves can resume below this job's range after a skipped or
+            # failed save. Partial tails also read positional cache blocks.
+            if req_meta.token_len_chunk or self._boundary_offload_reads_block_table(
+                req_meta
+            ):
+                block_ids.extend(
+                    block_id
+                    for group_id, group in enumerate(req_meta.block_ids)
+                    if group_id not in self._boundary_state_group_ids
+                    for block_id in group
+                    if block_id != NULL_BLOCK_ID
+                )
             # An aligned boundary block may also be present in the request's
             # block table. Take and release exactly one reference per block.
             block_ids = list(dict.fromkeys(block_ids))
@@ -508,6 +515,25 @@ class MooncakeStoreScheduler:
                 continue
             self._pinned_saves[store_job_id] = (block_ids, self._num_workers)
             pool.touch([pool.blocks[block_id] for block_id in block_ids])
+
+    def _boundary_offload_reads_block_table(self, req_meta: ReqMeta) -> bool:
+        """Return whether an offload-only job reads positional cache blocks."""
+        if not self.enable_partial_hash_hits or not req_meta.boundary_state_offloads:
+            return False
+        eagle_tail_boundaries = (
+            set(
+                eagle_partial_tail_boundaries(
+                    req_meta.num_prompt_tokens, self._hash_block_size
+                )
+            )
+            if self.use_eagle and req_meta.num_prompt_tokens is not None
+            else set()
+        )
+        return any(
+            boundary % self._boundary_state_block_sizes[group_id] != 0
+            or boundary in eagle_tail_boundaries
+            for group_id, _, boundary in req_meta.boundary_state_offloads
+        )
 
     def register_finished_partial_tail(
         self,

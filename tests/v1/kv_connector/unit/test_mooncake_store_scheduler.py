@@ -15,6 +15,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.scheduler import (
     MooncakeStoreScheduler,
 )
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.sched.output import KVConnectorBlockState
 
@@ -52,6 +53,7 @@ def _make_bare_scheduler(
     scheduler._next_store_job_id = 0
     scheduler._pinned_saves = {}
     scheduler._boundary_state_group_ids = frozenset({1})
+    scheduler._boundary_state_block_sizes = {1: block_size}
     return scheduler
 
 
@@ -1487,6 +1489,57 @@ def test_boundary_state_release_is_per_store_job():
     assert scheduler._gpu_block_pool.blocks[8].ref_cnt == 1
     assert first_job_id not in scheduler._pinned_saves
     assert second_job_id in scheduler._pinned_saves
+
+
+def test_aligned_boundary_only_job_does_not_pin_attention_blocks():
+    scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
+    _register_offload_request(scheduler, prefill_end_tokens=64, num_prompt_tokens=64)
+    out = _make_offload_only_output([(1, 7, 32)], block_ids=([3, 4], [NULL_BLOCK_ID]))
+
+    meta = scheduler.build_connector_meta(out)
+
+    store_job_id = meta.requests[0].store_job_id
+    assert scheduler._pinned_saves[store_job_id][0] == [7]
+    assert scheduler._gpu_block_pool.blocks[3].ref_cnt == 0
+    assert scheduler._gpu_block_pool.blocks[4].ref_cnt == 0
+
+
+def test_aligned_boundary_only_job_preserves_attention_cache_capacity():
+    scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
+    _register_offload_request(scheduler, prefill_end_tokens=64, num_prompt_tokens=64)
+    attention_blocks = list(range(1, 63))
+    out = _make_offload_only_output(
+        [(1, 63, 32)], block_ids=(attention_blocks, [NULL_BLOCK_ID])
+    )
+
+    scheduler.build_connector_meta(out)
+
+    pool = scheduler._gpu_block_pool
+    assert pool.get_num_free_blocks() == len(attention_blocks)
+    assert [block.block_id for block in pool.get_new_blocks(len(attention_blocks))]
+
+
+def test_partial_boundary_only_job_pins_attention_blocks():
+    scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
+    _register_offload_request(scheduler, prefill_end_tokens=64, num_prompt_tokens=64)
+    out = _make_offload_only_output([(1, 7, 12)], block_ids=([3, 4], [NULL_BLOCK_ID]))
+
+    meta = scheduler.build_connector_meta(out)
+
+    store_job_id = meta.requests[0].store_job_id
+    assert scheduler._pinned_saves[store_job_id][0] == [7, 3, 4]
+
+
+def test_eagle_tail_boundary_only_job_pins_attention_blocks():
+    scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
+    scheduler.use_eagle = True
+    _register_offload_request(scheduler, prefill_end_tokens=20, num_prompt_tokens=20)
+    out = _make_offload_only_output([(1, 7, 16)], block_ids=([3, 4], [NULL_BLOCK_ID]))
+
+    meta = scheduler.build_connector_meta(out)
+
+    store_job_id = meta.requests[0].store_job_id
+    assert scheduler._pinned_saves[store_job_id][0] == [7, 3, 4]
 
 
 def test_preemption_and_request_id_reuse_do_not_release_inflight_job():
