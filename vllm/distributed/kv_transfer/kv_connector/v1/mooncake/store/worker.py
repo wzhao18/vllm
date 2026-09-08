@@ -2421,8 +2421,12 @@ class MooncakeStoreWorker:
             return MooncakeLookupResult(0)
 
         lookup_start = time.perf_counter()
+        no_lease_lookup = getattr(self.store, "batch_is_exist_no_lease", None)
         try:
-            res = self.store.batch_is_exist(candidate_keys)
+            if callable(no_lease_lookup):
+                res = no_lease_lookup(candidate_keys)
+            else:
+                res = self.store.batch_is_exist(candidate_keys)
             self._record_kv_connector_operation(
                 "lookup_exists",
                 time.perf_counter() - lookup_start,
@@ -2468,7 +2472,7 @@ class MooncakeStoreWorker:
                 usable_length,
                 cached_block_pool,
             )
-        return MooncakeLookupResult(
+        result = MooncakeLookupResult(
             hit_length,
             self._tail_key_boundaries(
                 block_hashes,
@@ -2476,6 +2480,66 @@ class MooncakeStoreWorker:
                 cached_block_pool,
             ),
         )
+        if callable(no_lease_lookup) and hit_length > 0:
+            lease_keys = self._lookup_load_keys(block_hashes, result)
+            lease_start = time.perf_counter()
+            try:
+                lease_results = self.store.batch_is_exist(lease_keys)
+                self._record_kv_connector_operation(
+                    "lookup_lease",
+                    time.perf_counter() - lease_start,
+                    len(lease_keys),
+                )
+            except Exception as e:
+                self._record_kv_connector_operation(
+                    "lookup_lease",
+                    time.perf_counter() - lease_start,
+                    len(lease_keys),
+                    status="error",
+                    num_failed_keys=len(lease_keys),
+                )
+                logger.error("Failed to lease Mooncake lookup result: %s", e)
+                return MooncakeLookupResult(0)
+            if any(exists != 1 for exists in lease_results):
+                logger.info(
+                    "Mooncake lookup result changed before lease acquisition; "
+                    "falling back to recompute"
+                )
+                return MooncakeLookupResult(0)
+        return result
+
+    def _lookup_load_keys(
+        self,
+        block_hashes: Sequence[BlockHash],
+        result: MooncakeLookupResult,
+    ) -> list[str]:
+        """Return the deployment-wide keys that may satisfy a lookup result."""
+        token_len = result.hit_length
+        load_masks = self.coord.load_mask(block_hashes, token_len)
+        tail_boundaries = {
+            boundary.group_id: boundary.num_tokens
+            for boundary in result.tail_key_boundaries
+        }
+        keys = []
+        for group_id, db in enumerate(self.token_dbs):
+            if not self._kv_cache_groups[group_id].kv_cache_spec.prefix_cacheable:
+                continue
+            load_mask = load_masks[group_id]
+            for start, end, block_hash in db.process_tokens(token_len, block_hashes, 0):
+                chunk_id = start // db.block_size
+                if chunk_id >= len(load_mask) or not load_mask[chunk_id]:
+                    continue
+                boundary_tokens = (
+                    tail_boundaries.get(group_id) if end == token_len else None
+                )
+                if boundary_tokens is not None:
+                    block_hash = block_hashes[boundary_tokens // db.hash_block_size - 1]
+                hash_hex = block_hash.hex()
+                keys.extend(
+                    PoolKey.build_key_string(key_prefix, hash_hex)
+                    for key_prefix in self._lookup_key_prefixes[group_id]
+                )
+        return keys
 
     def _tail_key_boundaries(
         self,

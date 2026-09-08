@@ -3415,6 +3415,7 @@ def _make_bare_worker(
     worker.cache_config = MagicMock()
     worker.cache_config.num_gpu_blocks = num_gpu_blocks
     worker.store = MagicMock()
+    worker.store.batch_is_exist_no_lease = None
     worker.store.register_buffer.return_value = 0
     worker.kv_role = kv_role
     worker.can_put = kv_role in ("kv_producer", "kv_both") or save_decode_cache
@@ -3710,6 +3711,101 @@ def test_lookup_rejects_boundary_missing_one_mamba_shard():
         0 if "tp_rank:1" in k and "group:1" in k else 1 for k in keys
     ]
     assert worker.lookup(33, [b"h0", b"h1"]).hit_length == 0
+
+
+def test_lookup_leases_only_selected_mamba_checkpoint():
+    """Broad discovery must not lease every historical recurrent checkpoint."""
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheGroupSpec,
+        MambaSpec,
+    )
+
+    hash_block_size = 128
+    page_size = 1536
+    num_tokens = 128 * 1024
+    num_hashes = num_tokens // hash_block_size
+    worker = _make_bare_worker(block_size=page_size)
+    worker.tp_size = 8
+    worker.dcp_size = 8
+    worker.num_kv_head = 1
+    mamba = MambaSpec(
+        block_size=page_size,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+    full = FullAttentionSpec(
+        block_size=page_size,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=None,
+    )
+    worker._kv_cache_groups = [
+        KVCacheGroupSpec([f"mamba_{group_id}"], mamba) for group_id in range(3)
+    ] + [KVCacheGroupSpec(["full"], full)]
+    worker.hash_block_size = hash_block_size
+    worker.token_dbs = [
+        ChunkedTokenDatabase(
+            KeyMetadata("test-model", 0, 0, 0, 0, group_id=group_id),
+            block_size=page_size,
+            hash_block_size=hash_block_size,
+        )
+        for group_id in range(4)
+    ]
+    worker.coord = mooncake_store_worker.MooncakeStoreCoordinator(
+        worker._kv_cache_groups,
+        scheduler_block_size=page_size,
+        hash_block_size=hash_block_size,
+    )
+    _refresh_group_tp_replication_factors(worker)
+
+    hashes = [f"h{hash_id:04d}".encode() for hash_id in range(num_hashes)]
+    periodic_hashes = {
+        hash_value.hex()
+        for hash_id, hash_value in enumerate(hashes, start=1)
+        if hash_id % (page_size // hash_block_size) == 0
+    }
+
+    def discover(keys):
+        return [
+            int(
+                int(key.split("@group:")[1].split("@")[0]) == 3
+                or key.rsplit("@", 1)[1] in periodic_hashes
+            )
+            for key in keys
+        ]
+
+    worker.store.batch_is_exist_no_lease = MagicMock(side_effect=discover)
+    worker.store.batch_is_exist.return_value = []
+    worker.store.batch_is_exist.side_effect = lambda keys: [1] * len(keys)
+
+    result = worker.lookup(num_tokens, hashes)
+
+    discovery_keys = worker.store.batch_is_exist_no_lease.call_args.args[0]
+    leased_keys = worker.store.batch_is_exist.call_args.args[0]
+    discovered_mamba_keys = [
+        key
+        for key, exists in zip(discovery_keys, discover(discovery_keys))
+        if exists and int(key.split("@group:")[1].split("@")[0]) < 3
+    ]
+    leased_mamba_keys = [
+        key for key in leased_keys if int(key.split("@group:")[1].split("@")[0]) < 3
+    ]
+    checkpoints_per_group = num_tokens // page_size
+    assert result.hit_length == checkpoints_per_group * page_size
+    assert len(discovery_keys) == 4 * 8 * num_hashes
+    assert len(discovered_mamba_keys) == 3 * 8 * checkpoints_per_group
+    assert len(leased_mamba_keys) == 3 * 8
+    assert len(leased_keys) == (3 + checkpoints_per_group) * 8
+
+
+def test_lookup_recomputes_if_selected_key_disappears_before_lease():
+    worker = _make_bare_worker(block_size=16)
+    worker.store.batch_is_exist_no_lease = MagicMock(return_value=[1])
+    worker.store.batch_is_exist.return_value = [0]
+
+    assert worker.lookup(16, [b"h0"]).hit_length == 0
 
 
 def test_lookup_requires_all_dcp_rank_namespaces():
