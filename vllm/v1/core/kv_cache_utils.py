@@ -36,6 +36,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
     compute_layout_strides,
+    eagle_append_replay_boundary,
     iter_layer_specs,
     replace_as,
 )
@@ -791,6 +792,15 @@ def resolve_kv_cache_block_sizes(
             f"Got alignments={sorted(prefix_alignments)}."
         )
     return scheduler_block_size, hash_block_size
+
+
+def replay_boundary(
+    num_prompt_tokens: int, scheduler_block_size: int, use_eagle: bool
+) -> int:
+    """Return the position where a later request resumes this prompt."""
+    if not use_eagle:
+        return num_prompt_tokens - 1
+    return eagle_append_replay_boundary(num_prompt_tokens, scheduler_block_size)
 
 
 def get_request_block_hasher(

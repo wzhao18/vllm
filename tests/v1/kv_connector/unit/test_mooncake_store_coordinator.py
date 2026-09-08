@@ -104,6 +104,21 @@ def _swa(block_size=16, sliding_window=32):
     )
 
 
+def test_eagle_store_retention_uses_engine_replay_boundary():
+    groups = [
+        KVCacheGroupSpec(["full"], _full(16)),
+        KVCacheGroupSpec(["mamba"], _mamba_align(16)),
+    ]
+    coord = _make_coord(groups, hash_block_size=4, use_eagle=True)
+
+    assert [coord.get_replay_boundary(length) for length in (1, 16, 17, 33)] == [
+        0,
+        0,
+        0,
+        16,
+    ]
+
+
 def _hashes(n: int) -> list[BlockHash]:
     return [BlockHash(bytes([i + 1]) * 4) for i in range(n)]
 

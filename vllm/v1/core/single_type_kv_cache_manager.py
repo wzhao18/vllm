@@ -14,6 +14,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashListWithBlockSize,
     BlockHashWithGroupId,
     KVCacheBlock,
+    eagle_append_replay_boundary,
     resolve_block_hashes,
 )
 from vllm.v1.kv_cache_interface import (
@@ -119,6 +120,9 @@ class SingleTypeKVCacheManager(ABC):
         # aligned segment (SWA). Initialized lazily by the coordinator after
         # determining the attention groups.
         self.use_eagle = False
+        # Every target group must retain the model-level append boundary reached
+        # after an EAGLE group drops its lookahead block.
+        self.use_eagle_replay = False
         # ``CacheConfig.enable_mamba_fine_grained_prefix_cache``, narrowed and set
         # by ``KVCacheManager``; only an EAGLE Mamba "align" group ever gets it.
         self.fine_grained_prefix_cache = False
@@ -836,14 +840,13 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         request: Request,
         num_tokens: int,
     ) -> None:
-        """Cache the prompt tail when it ends inside a cache block.
-
-        Only the final prompt hash boundary is registered as a partial
-        prefix-cache entry; intermediate hash boundaries inside the same cache
-        block are intentionally skipped.
-        """
+        """Cache this group's proof for an append-only prompt reuse."""
         hash_block_size = self.block_pool.hash_block_size
         boundary_tokens = request.num_prompt_tokens // hash_block_size * hash_block_size
+        if self.use_eagle_replay and not self.use_eagle:
+            boundary_tokens = eagle_append_replay_boundary(
+                request.num_prompt_tokens, hash_block_size
+            )
         if boundary_tokens == 0 or boundary_tokens > num_tokens:
             return
         if boundary_tokens % self.block_size == 0:
@@ -1967,6 +1970,14 @@ class MambaManager(SingleTypeKVCacheManager):
                 self.cached_blocks_this_step.add(block.block_hash)
                 if self.mamba_cache_mode == "align":
                     assert block.block_hash_num_tokens is not None
+                    producer_tail = self._producer_partial_tail_reqs.get(
+                        request.request_id
+                    )
+                    if producer_tail == (block, block.block_hash_num_tokens):
+                        # This live block reaches the advertised boundary only
+                        # after the scheduled forward. Its next-step CoW copy
+                        # is the durable snapshot a connector may publish.
+                        continue
                     # Offer every retained boundary with its exact block.
                     # The connector filters against its save window, which may
                     # extend past the original prompt during resumed prefill.
@@ -2007,16 +2018,18 @@ class MambaManager(SingleTypeKVCacheManager):
             )
         if self.block_size == hash_block_size:
             return None
-        if num_tokens % self.block_size == 0:
+        if num_tokens <= 0:
             return None
         if num_tokens % hash_block_size != 0:
             return None
         latest_prompt_hash_boundary = (
             request.num_prompt_tokens // hash_block_size
         ) * hash_block_size
-        if self.use_eagle:
-            # Eagle groups match one hash unit past the candidate and drop it,
-            # so register the tail one unit lower.
+        if self.use_eagle_replay:
+            latest_prompt_hash_boundary = eagle_append_replay_boundary(
+                request.num_prompt_tokens, hash_block_size
+            )
+        elif self.use_eagle:
             latest_prompt_hash_boundary = max(
                 latest_prompt_hash_boundary - hash_block_size, 0
             )
@@ -2032,13 +2045,36 @@ class MambaManager(SingleTypeKVCacheManager):
         ):
             return None
 
-        block_idx = num_tokens // self.block_size
+        is_exact_page = num_tokens % self.block_size == 0
+        if is_exact_page and not self.use_eagle_replay:
+            return None
+        block_idx = cdiv(num_tokens, self.block_size) - 1
         blocks = self.req_to_blocks[request.request_id]
         if block_idx >= len(blocks):
             return None
         source_block = blocks[block_idx]
         if source_block.is_null:
             return None
+
+        if is_exact_page:
+            if source_block.block_hash is None:
+                self.block_pool.cache_full_blocks(
+                    request=request,
+                    blocks=blocks,
+                    num_cached_blocks=block_idx,
+                    num_full_blocks=block_idx + 1,
+                    block_size=self.block_size,
+                    kv_cache_group_id=self.kv_cache_group_id,
+                )
+            if source_block.block_hash is None:
+                return None
+            self._partial_hit_reqs[request.request_id] = (block_idx, source_block)
+            self.num_cached_block[request.request_id] = block_idx
+            self._producer_partial_tail_reqs[request.request_id] = (
+                source_block,
+                num_tokens,
+            )
+            return source_block.block_hash
 
         partial_hash = self.block_pool.cache_partial_block(
             request=request,

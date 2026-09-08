@@ -844,6 +844,7 @@ def _make_partial_tail_send_thread(
         hash_block_size=4,
         lcm_block_size=16,
         mamba_group_ids={1},
+        eagle_group_ids=set(),
     )
     db = ChunkedTokenDatabase(
         KeyMetadata("test-model", 0, 0, 0, 0),
@@ -904,6 +905,68 @@ def test_partial_tail_offload_skips_null_source_blocks():
         [0x1000 + 3 * 256],
         [0x2000 + 7 * 256],
     ]
+
+
+def test_eagle_append_boundary_stores_its_attention_proof_block():
+    store = MagicMock()
+    stored_keys: set[str] = set()
+    store.batch_is_exist.side_effect = lambda keys: [
+        int(key in stored_keys) for key in keys
+    ]
+
+    def put(keys, *args):
+        stored_keys.update(keys)
+        return [256] * len(keys)
+
+    store.batch_put_from_multi_buffers.side_effect = put
+    thread = _make_partial_tail_send_thread(store)
+    thread.coord.eagle_group_ids = {0}
+    hashes = [BlockHash(f"a{i}".encode()) for i in range(5)]
+    req = ReqMeta(
+        req_id="req-a",
+        token_len_chunk=0,
+        block_ids=([1, 2, 3, 4, 5], [1]),
+        block_hashes=hashes,
+        can_save=True,
+        num_prompt_tokens=21,
+        boundary_state_offloads=[(1, 7, 16)],
+    )
+
+    assert thread._maybe_offload_boundary_states(req)
+    full_db, mamba_db = thread.token_databases
+    assert full_db.key_for(hashes[4]) in stored_keys
+    assert mamba_db.key_for(hashes[3]) in stored_keys
+    assert mamba_db.key_for(hashes[4]) not in stored_keys
+
+
+def test_eagle_non_append_boundary_keeps_existing_packaging():
+    store = MagicMock()
+    stored_keys: set[str] = set()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+
+    def put(keys, *args):
+        stored_keys.update(keys)
+        return [256] * len(keys)
+
+    store.batch_put_from_multi_buffers.side_effect = put
+    thread = _make_partial_tail_send_thread(store)
+    thread.coord.eagle_group_ids = {0}
+    hashes = [BlockHash(f"a{i}".encode()) for i in range(5)]
+    req = ReqMeta(
+        req_id="req-a",
+        token_len_chunk=0,
+        block_ids=([1, 2, 3, 4, 5], [1]),
+        block_hashes=hashes,
+        can_save=True,
+        num_prompt_tokens=21,
+        boundary_state_offloads=[(1, 7, 12)],
+    )
+
+    assert thread._maybe_offload_boundary_states(req)
+    full_db, mamba_db = thread.token_databases
+    assert full_db.key_for(hashes[2]) in stored_keys
+    assert mamba_db.key_for(hashes[2]) in stored_keys
+    assert full_db.key_for(hashes[3]) not in stored_keys
 
 
 def test_store_sending_thread_skips_null_sparse_group_blocks():

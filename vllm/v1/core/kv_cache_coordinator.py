@@ -12,6 +12,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlock,
     dcp_world_size_for_kv_cache_spec,
+    replay_boundary,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
@@ -150,6 +151,10 @@ class KVCacheCoordinator(ABC):
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
+        # Every target cache group must retain the model-level boundary where
+        # an EAGLE group rewinds, even when only the draft group is annotated.
+        for manager in self.single_type_managers:
+            manager.use_eagle_replay = bool(self.eagle_group_ids)
         # Match Mamba checkpoints to Eagle's attention replay boundary.
         if use_eagle:
             for manager in self.single_type_managers:
@@ -320,14 +325,11 @@ class KVCacheCoordinator(ABC):
         unit below the prompt's last aligned position; every group's block size
         divides the alignment, so the block above always fits in the prompt.
         """
-        if not self.eagle_group_ids:
-            return request.num_prompt_tokens - 1
-        aligned = (
-            request.num_prompt_tokens
-            // self.scheduler_block_size
-            * self.scheduler_block_size
+        return replay_boundary(
+            request.num_prompt_tokens,
+            self.scheduler_block_size,
+            bool(self.eagle_group_ids),
         )
-        return max(aligned - self.scheduler_block_size, 0)
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """

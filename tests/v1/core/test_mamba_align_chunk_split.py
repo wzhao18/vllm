@@ -22,6 +22,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     MambaSpec,
+    get_mamba_prefill_checkpoint_position,
     is_mamba_prefill_checkpoint_valid,
 )
 from vllm.v1.request import Request
@@ -37,6 +38,27 @@ MAMBA_BLOCK_SIZE = 1600
 NUM_SPEC = 3
 PROMPT_LEN = 2002
 MAMBA_GROUP_ID = 1
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "drop_eagle_block", "expected"),
+    [
+        (18_432, False, 18_304),
+        (18_433, False, 18_432),
+        (18_432, True, 18_304),
+        (18_433, True, 18_304),
+        (18_560, True, 18_432),
+    ],
+)
+def test_mamba_prefill_checkpoint_position(
+    num_tokens: int, drop_eagle_block: bool, expected: int
+) -> None:
+    assert (
+        get_mamba_prefill_checkpoint_position(
+            num_tokens, hash_block_size=128, drop_eagle_block=drop_eagle_block
+        )
+        == expected
+    )
 
 
 @pytest.mark.parametrize(

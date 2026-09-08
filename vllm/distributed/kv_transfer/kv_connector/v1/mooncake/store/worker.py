@@ -70,6 +70,7 @@ from vllm.utils.network_utils import get_ip, make_zmq_socket
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
+    eagle_append_replay_boundary,
     maybe_convert_block_hash,
     resolve_dcp_kv_cache_spec,
     resolve_kv_cache_block_sizes,
@@ -739,11 +740,20 @@ class KVCacheStoreSendingThread(KVTransferThread):
             raise ValueError(
                 "Sub-block partial-tail offloads for one request must share a boundary"
             )
-        boundary = boundaries.pop()
+        replay_boundary = boundaries.pop()
         hash_block_size = self.coord.hash_block_size
-        if boundary == 0 or boundary // hash_block_size - 1 >= len(
-            req_meta.block_hashes
-        ):
+        if replay_boundary == 0:
+            return []
+        is_eagle_append = (
+            bool(self.coord.eagle_group_ids)
+            and req_meta.num_prompt_tokens is not None
+            and replay_boundary
+            == eagle_append_replay_boundary(req_meta.num_prompt_tokens, hash_block_size)
+        )
+        lookup_boundary = (
+            replay_boundary + hash_block_size if is_eagle_append else replay_boundary
+        )
+        if lookup_boundary // hash_block_size - 1 >= len(req_meta.block_hashes):
             return []
 
         mamba_offloads = {group_id: block_id for group_id, block_id, _ in entries}
@@ -752,22 +762,29 @@ class KVCacheStoreSendingThread(KVTransferThread):
         for g_idx, db in enumerate(self.token_databases):
             if not self.group_participates[g_idx]:
                 continue
+            group_boundary = (
+                lookup_boundary
+                if is_eagle_append
+                and g_idx in self.coord.eagle_group_ids
+                and g_idx not in mamba_offloads
+                else replay_boundary
+            )
             group_blocks = req_meta.block_ids[g_idx]
             # Distribute across ranks by the same rule as normal chunks.
             put_step = self.group_put_steps[g_idx]
             put_step_rank = (self.tp_rank + g_idx) % put_step
             # Always include the boundary block: its sub-hash key is written
             # only here, even if normal saves already advanced past it.
-            last_block = cdiv(boundary, db.block_size) - 1
+            last_block = cdiv(group_boundary, db.block_size) - 1
             for block_idx in range(
                 min(saved // db.block_size, last_block), last_block + 1
             ):
                 if block_idx % put_step != put_step_rank:
                     continue
-                valid_end = min((block_idx + 1) * db.block_size, boundary)
+                valid_end = min((block_idx + 1) * db.block_size, group_boundary)
                 key_hash = req_meta.block_hashes[valid_end // hash_block_size - 1]
                 if g_idx in mamba_offloads:
-                    if valid_end != boundary:
+                    if valid_end != group_boundary:
                         # Interior align-mode state positions are null or
                         # stale (the block table is not append-only) and never
                         # valid gap content; only the boundary block is
@@ -818,9 +835,19 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
         snapshots: list[tuple[int, int, int]] = []
         sub_block: list[tuple[int, int, int]] = []
+        eagle_append_boundary = (
+            eagle_append_replay_boundary(
+                req_meta.num_prompt_tokens, self.coord.hash_block_size
+            )
+            if self.coord.eagle_group_ids and req_meta.num_prompt_tokens is not None
+            else None
+        )
         for group_id, block_id, boundary in offloads:
             entry = (group_id, block_id, boundary)
-            if boundary % self.token_databases[group_id].block_size == 0:
+            if (
+                boundary % self.token_databases[group_id].block_size == 0
+                and boundary != eagle_append_boundary
+            ):
                 snapshots.append(entry)
             else:
                 sub_block.append(entry)

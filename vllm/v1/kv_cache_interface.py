@@ -958,15 +958,21 @@ class MambaSpec(KVCacheSpec):
         )
 
 
+def eagle_append_replay_boundary(num_prompt_tokens: int, hash_block_size: int) -> int:
+    """Return the longest reusable boundary for an append-only EAGLE hit."""
+    aligned = num_prompt_tokens // hash_block_size * hash_block_size
+    return max(aligned - hash_block_size, 0)
+
+
 def get_mamba_prefill_checkpoint_position(
     num_tokens: int,
     hash_block_size: int,
     drop_eagle_block: bool,
 ) -> int:
     """Return the reusable Mamba checkpoint boundary for a prefill."""
-    checkpoint_position = (num_tokens - 1) // hash_block_size * hash_block_size
     if drop_eagle_block:
-        checkpoint_position -= hash_block_size
+        return eagle_append_replay_boundary(num_tokens, hash_block_size)
+    checkpoint_position = (num_tokens - 1) // hash_block_size * hash_block_size
     return max(checkpoint_position, 0)
 
 
