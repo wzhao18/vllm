@@ -188,6 +188,31 @@ def test_kv_offloading_does_not_adjust_dcp_interleave_size():
     assert config.parallel_config.cp_kv_cache_interleave_size == 1
 
 
+def test_pd_hybrid_dcp_preserves_token_interleave_size():
+    config = VllmConfig(
+        cache_config=CacheConfig(block_size=16),
+        device_config=DeviceConfig(device="cpu"),
+        parallel_config=ParallelConfig(
+            tensor_parallel_size=2,
+            decode_context_parallel_size=2,
+            cp_kv_cache_interleave_size=1,
+            distributed_executor_backend="mp",
+        ),
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="NixlConnector",
+            kv_role="kv_both",
+        ),
+    )
+    config.model_config = SimpleNamespace(is_hybrid=True)
+    kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16))]
+    )
+
+    config.adjust_dcp_kv_cache_interleave_size(kv_cache_config)
+
+    assert config.parallel_config.cp_kv_cache_interleave_size == 1
+
+
 def test_kv_offloading_does_not_skip_dcp_interleave_validation():
     config = SimpleNamespace(
         cache_config=SimpleNamespace(

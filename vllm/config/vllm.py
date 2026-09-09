@@ -2819,6 +2819,12 @@ class VllmConfig:
         ):
             return
 
+        # Symmetric hybrid DCP transfers preserve rank-local cache layouts, so
+        # they do not require block-granular interleaving. The NIXL handshake
+        # rejects asymmetric hybrid DCP before any transfer is issued.
+        if self.model_config is not None and self.model_config.is_hybrid:
+            return
+
         # Get the kernel block_size, but don't use resolve_kv_cache_block_size to avoid
         # scaling by dcp_size (we need the local block_size here).
         local_block_size = min(
