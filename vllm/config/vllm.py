@@ -2793,7 +2793,8 @@ class VllmConfig:
         """Normalize DCP interleave size against block_size for NIXL P/D.
 
         Called by each worker (via ensure_kv_transfer_initialized), once it knows its
-        own final block_size via kv_cache_config.
+        own final block_size via kv_cache_config. Symmetric hybrid DCP transfers keep
+        token-level interleaving; their matching DCP sizes are enforced at handshake.
         """
         dcp_size = self.parallel_config.decode_context_parallel_size
         if dcp_size <= 1:
@@ -2813,6 +2814,13 @@ class VllmConfig:
 
         if self.kv_transfer_config is None or not self.kv_transfer_config.has_connector(
             "NixlConnector"
+        ):
+            return
+
+        if (
+            self.model_config is not None
+            and self.model_config.is_hybrid
+            and self.parallel_config.cp_kv_cache_interleave_size == 1
         ):
             return
 

@@ -438,6 +438,30 @@ def test_read_blocks_for_req_expands_remote_ids(
 
 
 @pytest.mark.cpu_test
+def test_hybrid_dcp_handshake_rejects_mismatched_sizes():
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
+        NixlConnectorWorker,
+    )
+
+    worker = object.__new__(NixlConnectorWorker)
+    worker.dcp_size = 2
+    worker._has_mamba = True
+    worker.transfer_topo = MagicMock()
+    worker.transfer_topo.get_engine_info.return_value = MagicMock(
+        remote_tp_size=4,
+        remote_dcp_size=4,
+    )
+    remote_metadata = MagicMock(engine_id="remote-engine")
+
+    with pytest.raises(RuntimeError, match="require matching DCP sizes"):
+        worker._validate_remote_agent_handshake(
+            remote_metadata,
+            remote_tp_size=4,
+            remote_dcp_size=4,
+        )
+
+
+@pytest.mark.cpu_test
 @pytest.mark.parametrize(
     "local_physical_per_logical,remote_physical_per_logical,"
     "local_block_ids,remote_block_ids,"
