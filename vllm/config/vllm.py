@@ -2832,6 +2832,16 @@ class VllmConfig:
         if self.parallel_config.cp_kv_cache_interleave_size != local_block_size:
             interleave = self.parallel_config.cp_kv_cache_interleave_size
             self.parallel_config.cp_kv_cache_interleave_size = local_block_size
+            draft_parallel_config = (
+                self.speculative_config.draft_parallel_config
+                if self.speculative_config is not None
+                else None
+            )
+            if (
+                draft_parallel_config is not None
+                and draft_parallel_config.decode_context_parallel_size == dcp_size
+            ):
+                draft_parallel_config.cp_kv_cache_interleave_size = local_block_size
             logger.info_once(
                 "When using PD disaggregation with DCP "
                 "(decode_context_parallel_size=%d), "

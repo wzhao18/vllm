@@ -140,7 +140,7 @@ def test_per_request_spec_decode_metrics_requires_spec_decode():
     ],
 )
 def test_pd_dcp_interleave_size_is_adjusted_to_block_size(
-    caplog, disable_log_dedup, kv_transfer_config
+    caplog_vllm, disable_log_dedup, kv_transfer_config
 ):
     config = VllmConfig(
         cache_config=CacheConfig(block_size=16),
@@ -157,11 +157,79 @@ def test_pd_dcp_interleave_size_is_adjusted_to_block_size(
     kv_cache_config = SimpleNamespace(
         kv_cache_groups=[SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16))]
     )
-    with caplog.at_level(logging.INFO):
+    with caplog_vllm.at_level(logging.INFO, logger="vllm"):
         config.adjust_dcp_kv_cache_interleave_size(kv_cache_config)
 
     assert config.parallel_config.cp_kv_cache_interleave_size == 16
-    assert "automatically adjusted from 3 to block_size 16" in caplog.text
+    assert "automatically adjusted from 3 to block_size 16" in caplog_vllm.text
+
+
+def test_pd_dcp_interleave_adjustment_updates_draft_config():
+    config = VllmConfig(
+        cache_config=CacheConfig(block_size=16),
+        device_config=DeviceConfig(device="cpu"),
+        parallel_config=ParallelConfig(
+            tensor_parallel_size=2,
+            decode_context_parallel_size=2,
+            cp_kv_cache_interleave_size=3,
+            distributed_executor_backend="mp",
+        ),
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="NixlConnector",
+            kv_role="kv_both",
+        ),
+    )
+    draft_parallel_config = ParallelConfig(
+        tensor_parallel_size=2,
+        decode_context_parallel_size=2,
+        cp_kv_cache_interleave_size=3,
+        distributed_executor_backend="mp",
+    )
+    config.speculative_config = SimpleNamespace(
+        draft_parallel_config=draft_parallel_config
+    )
+    kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16))]
+    )
+
+    config.adjust_dcp_kv_cache_interleave_size(kv_cache_config)
+
+    assert config.parallel_config.cp_kv_cache_interleave_size == 16
+    assert draft_parallel_config.cp_kv_cache_interleave_size == 16
+
+
+def test_draft_parallel_config_copies_compatible_dcp_settings():
+    target = ParallelConfig(
+        tensor_parallel_size=8,
+        decode_context_parallel_size=8,
+        dcp_kv_cache_interleave_size=4,
+        dcp_comm_backend="a2a",
+        dcp_q_replicate=True,
+        cp_kv_cache_interleave_size=16,
+        distributed_executor_backend="mp",
+    )
+
+    draft = SpeculativeConfig.create_draft_parallel_config(target, 8)
+
+    assert draft.decode_context_parallel_size == 8
+    assert draft.dcp_kv_cache_interleave_size == 4
+    assert draft.dcp_comm_backend == "a2a"
+    assert draft.dcp_q_replicate
+    assert draft.cp_kv_cache_interleave_size == 16
+
+
+def test_draft_parallel_config_disables_incompatible_dcp_size():
+    target = ParallelConfig(
+        tensor_parallel_size=8,
+        decode_context_parallel_size=8,
+        cp_kv_cache_interleave_size=16,
+        distributed_executor_backend="mp",
+    )
+
+    draft = SpeculativeConfig.create_draft_parallel_config(target, 1)
+
+    assert draft.decode_context_parallel_size == 1
+    assert draft.cp_kv_cache_interleave_size == 16
 
 
 def test_symmetric_hybrid_pd_dcp_keeps_token_interleave():

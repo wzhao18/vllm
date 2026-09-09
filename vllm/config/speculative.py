@@ -1698,9 +1698,22 @@ class SpeculativeConfig:
 
         This is mostly a copy of the target parallel config, except the tp_size.
         """
+        draft_dcp_size = target_parallel_config.decode_context_parallel_size
+        if speculative_draft_tensor_parallel_size % draft_dcp_size != 0:
+            draft_dcp_size = 1
+
         draft_parallel_config = ParallelConfig(
             pipeline_parallel_size=1,
             tensor_parallel_size=speculative_draft_tensor_parallel_size,
+            decode_context_parallel_size=draft_dcp_size,
+            dcp_kv_cache_interleave_size=(
+                target_parallel_config.dcp_kv_cache_interleave_size
+            ),
+            dcp_comm_backend=target_parallel_config.dcp_comm_backend,
+            dcp_q_replicate=target_parallel_config.dcp_q_replicate,
+            cp_kv_cache_interleave_size=(
+                target_parallel_config.cp_kv_cache_interleave_size
+            ),
             distributed_executor_backend=target_parallel_config.distributed_executor_backend,
             max_parallel_loading_workers=target_parallel_config.max_parallel_loading_workers,
             disable_custom_all_reduce=target_parallel_config.disable_custom_all_reduce,

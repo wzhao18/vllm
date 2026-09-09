@@ -1435,6 +1435,17 @@ def test_v2_runner_snapshots_late_interleave_adjustment(monkeypatch):
     runner = object.__new__(v2_model_runner_module.GPUModelRunner)
     runner.parallel_config = SimpleNamespace(cp_kv_cache_interleave_size=16)
     runner.cp_interleave = 1
+    runner.vllm_config = SimpleNamespace()
+
+    def check_compatibility(vllm_config):
+        assert vllm_config is runner.vllm_config
+        assert runner.cp_interleave == 16
+
+    monkeypatch.setattr(
+        v2_model_runner_module,
+        "check_attention_cp_compatibility",
+        check_compatibility,
+    )
 
     class StopInitialization(Exception):
         pass
