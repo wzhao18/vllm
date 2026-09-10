@@ -1,0 +1,124 @@
+diff --git a/csrc/flash_kda.cpp b/csrc/flash_kda.cpp
+index a10d7fe..3c80f15 100644
+--- a/csrc/flash_kda.cpp
++++ b/csrc/flash_kda.cpp
+@@ -87,8 +87,9 @@ void fwd(
+             cs.is_cuda() && cs.is_contiguous(),
+             "checkpoint_state must be a contiguous CUDA tensor");
+         STD_TORCH_CHECK(
+-            cs.scalar_type() == ScalarType::Float,
+-            "checkpoint_state must be float32");
++            cs.scalar_type() == ScalarType::Float ||
++                cs.scalar_type() == ScalarType::BFloat16,
++            "checkpoint_state must be bfloat16 or float32");
+         STD_TORCH_CHECK(
+             co.is_cuda() && co.is_contiguous(),
+             "checkpoint_offsets must be a contiguous CUDA tensor");
+@@ -161,9 +162,11 @@ void fwd(
+     // Get state pointers (nullptr if not present)
+     void const* initial_state_raw = has_state_in ? initial_state->const_data_ptr() : nullptr;
+     void* final_state_raw = has_state_out ? final_state->mutable_data_ptr() : nullptr;
+-    float* checkpoint_state_raw = has_checkpoint
+-        ? static_cast<float*>(checkpoint_state->mutable_data_ptr())
++    void* checkpoint_state_raw = has_checkpoint
++        ? checkpoint_state->mutable_data_ptr()
+         : nullptr;
++    bool checkpoint_fp32 = has_checkpoint &&
++        checkpoint_state->scalar_type() == ScalarType::Float;
+ 
+     // Determine cu_seqlens and N
+     bool is_varlen = cu_seqlens.has_value();
+@@ -245,7 +248,7 @@ void fwd(
+             launch_fwd<128, HI, HO, FP32, CKPT, VL>( \
+                 q_ptr, k_ptr, v_ptr, g_ptr, beta_t_ptr, \
+                 initial_state_raw, scale_f, final_state_raw, \
+-                checkpoint_state_raw, typed_checkpoint_offsets, out_ptr, \
++                checkpoint_state_raw, checkpoint_fp32, typed_checkpoint_offsets, out_ptr, \
+                 workspace_ptr, total_tiles, \
+                 int(T_total), int(H), int(N_val), typed_cu_seqlens, \
+                 A_log_ptr, dt_bias_ptr, gate_scale, use_vsplit, stream)
+diff --git a/csrc/fwd.h b/csrc/fwd.h
+index c59b2a3..2f72c16 100644
+--- a/csrc/fwd.h
++++ b/csrc/fwd.h
+@@ -20,7 +20,8 @@ void launch_fwd(
+     void const* initial_state_ptr,
+     float scale,
+     void* final_state_ptr,
+-    float* checkpoint_state_ptr,
++    void* checkpoint_state_ptr,
++    bool checkpoint_fp32,
+     SeqlenT const* checkpoint_offsets_ptr,
+     cutlass::bfloat16_t* out_ptr,
+     void* workspace_ptr,
+diff --git a/csrc/smxx/fwd_kernel2.cuh b/csrc/smxx/fwd_kernel2.cuh
+index add4054..09f97ca 100644
+--- a/csrc/smxx/fwd_kernel2.cuh
++++ b/csrc/smxx/fwd_kernel2.cuh
+@@ -147,7 +147,8 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
+     CUTE_GRID_CONSTANT TmaStoreState const tma_store_final_state,
+     CUTE_GRID_CONSTANT TmaStoreOut const tma_store_out,
+     cutlass::bfloat16_t* out_raw_ptr,
+-    float* checkpoint_state_ptr,
++    void* checkpoint_state_ptr,
++    bool checkpoint_fp32,
+     SeqlenT const* checkpoint_offsets,
+     int T_total,
+     int H,
+@@ -775,8 +776,13 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
+                          state_idx += kComputeThreads) {
+                         const int row = state_idx / D;
+                         const int col = state_idx % D;
+-                        checkpoint_state_ptr[checkpoint_base + state_idx] =
+-                            float(s_acc(row, col));
++                        if (checkpoint_fp32) {
++                            static_cast<float*>(checkpoint_state_ptr)[
++                                checkpoint_base + state_idx] = float(s_acc(row, col));
++                        } else {
++                            static_cast<BF16*>(checkpoint_state_ptr)[
++                                checkpoint_base + state_idx] = BF16(s_acc(row, col));
++                        }
+                     }
+                     checkpoint_barrier.arrive_and_wait();
+                 }
+diff --git a/csrc/smxx/fwd_launch.cu b/csrc/smxx/fwd_launch.cu
+index aef5514..e976b4c 100644
+--- a/csrc/smxx/fwd_launch.cu
++++ b/csrc/smxx/fwd_launch.cu
+@@ -22,7 +22,8 @@ void launch_fwd(
+     void const* initial_state_ptr,
+     float scale,
+     void* final_state_ptr,
+-    float* checkpoint_state_ptr,
++    void* checkpoint_state_ptr,
++    bool checkpoint_fp32,
+     SeqlenT const* checkpoint_offsets_ptr,
+     cutlass::bfloat16_t* out_ptr,
+     void* workspace_ptr,
+@@ -217,7 +218,7 @@ void launch_fwd(
+                 tma_load_initial_state_vsplit,
+                 tma_store_final_state_vsplit,
+                 tma_store_out_vsplit,
+-                out_ptr, checkpoint_state_ptr, checkpoint_offsets_ptr,
++                out_ptr, checkpoint_state_ptr, checkpoint_fp32, checkpoint_offsets_ptr,
+                 T_total, H, N, cu_seqlens_ptr, total_tiles,
+                 ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk);
+             return;
+@@ -247,7 +248,7 @@ void launch_fwd(
+             tma_load_initial_state,
+             tma_store_final_state,
+             tma_store_out,
+-            out_ptr, checkpoint_state_ptr, checkpoint_offsets_ptr,
++            out_ptr, checkpoint_state_ptr, checkpoint_fp32, checkpoint_offsets_ptr,
+             T_total, H, N, cu_seqlens_ptr, total_tiles,
+             ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk
+         );
+@@ -261,7 +262,7 @@ void launch_fwd(
+         cutlass::bfloat16_t const*, cutlass::bfloat16_t const*, \
+         cutlass::bfloat16_t const*, cutlass::bfloat16_t const*, \
+         cutlass::bfloat16_t const*, void const*, float, void*, \
+-        float*, SEQLEN_T const*, cutlass::bfloat16_t*, void*, \
++        void*, bool, SEQLEN_T const*, cutlass::bfloat16_t*, void*, \
+         int, int, int, int, \
+         SEQLEN_T const*, float const*, float const*, float, bool, \
+         cudaStream_t);

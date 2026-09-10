@@ -22,6 +22,22 @@ endif()
 FetchContent_MakeAvailable(flashkda)
 message(STATUS "FlashKDA is available at ${flashkda_SOURCE_DIR}")
 
+# Keep BF16 prefix-cache checkpoints native to the FlashKDA export kernel.
+find_package(Git REQUIRED)
+set(FLASH_KDA_BF16_PATCH
+  "${CMAKE_CURRENT_LIST_DIR}/../patches/flashkda_bf16_checkpoint.patch")
+execute_process(
+  COMMAND "${GIT_EXECUTABLE}" apply --reverse --check "${FLASH_KDA_BF16_PATCH}"
+  WORKING_DIRECTORY "${flashkda_SOURCE_DIR}"
+  RESULT_VARIABLE FLASH_KDA_BF16_PATCH_APPLIED
+  OUTPUT_QUIET ERROR_QUIET)
+if(NOT FLASH_KDA_BF16_PATCH_APPLIED EQUAL 0)
+  execute_process(
+    COMMAND "${GIT_EXECUTABLE}" apply "${FLASH_KDA_BF16_PATCH}"
+    WORKING_DIRECTORY "${flashkda_SOURCE_DIR}"
+    COMMAND_ERROR_IS_FATAL ANY)
+endif()
+
 set(FLASH_KDA_SUPPORT_ARCHS)
 if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.0)
   list(APPEND FLASH_KDA_SUPPORT_ARCHS "9.0a")
