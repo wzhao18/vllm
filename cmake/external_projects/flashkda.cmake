@@ -12,8 +12,8 @@ if(FLASH_KDA_SRC_DIR)
 else()
   FetchContent_Declare(
     flashkda
-    GIT_REPOSITORY https://github.com/vllm-project/FlashKDA.git
-    GIT_TAG 3b225bf26bb8e218928a1fe14751cb48cf31d11b
+    GIT_REPOSITORY https://github.com/wzhao18/FlashKDA.git
+    GIT_TAG 11ea580380578ae61f13f1f2a34b1e9e8b623909
     GIT_PROGRESS TRUE
     GIT_SUBMODULES cutlass
   )
@@ -21,22 +21,6 @@ endif()
 
 FetchContent_MakeAvailable(flashkda)
 message(STATUS "FlashKDA is available at ${flashkda_SOURCE_DIR}")
-
-# Keep BF16 prefix-cache checkpoints native to the FlashKDA export kernel.
-find_package(Git REQUIRED)
-set(FLASH_KDA_BF16_PATCH
-  "${CMAKE_CURRENT_LIST_DIR}/../patches/flashkda_bf16_checkpoint.patch")
-execute_process(
-  COMMAND "${GIT_EXECUTABLE}" apply --reverse --check "${FLASH_KDA_BF16_PATCH}"
-  WORKING_DIRECTORY "${flashkda_SOURCE_DIR}"
-  RESULT_VARIABLE FLASH_KDA_BF16_PATCH_APPLIED
-  OUTPUT_QUIET ERROR_QUIET)
-if(NOT FLASH_KDA_BF16_PATCH_APPLIED EQUAL 0)
-  execute_process(
-    COMMAND "${GIT_EXECUTABLE}" apply "${FLASH_KDA_BF16_PATCH}"
-    WORKING_DIRECTORY "${flashkda_SOURCE_DIR}"
-    COMMAND_ERROR_IS_FATAL ANY)
-endif()
 
 set(FLASH_KDA_SUPPORT_ARCHS)
 if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.0)

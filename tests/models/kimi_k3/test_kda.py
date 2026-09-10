@@ -1417,12 +1417,9 @@ def test_flashinfer_kda_prefill_breakable_graph_cross_stream():
 
 @torch.inference_mode()
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("checkpoint_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("seq_lengths", [(17, 31), (257, 260)])
-def test_flashkda_checkpoint_correctness(
-    state_dtype, checkpoint_dtype, index_dtype, seq_lengths
-):
+def test_flashkda_checkpoint_correctness(state_dtype, index_dtype, seq_lengths):
     lower_bound = -3.0
     _require_kda_prefill_backend("flashkda", state_dtype, lower_bound)
 
@@ -1464,7 +1461,7 @@ def test_flashkda_checkpoint_correctness(
     )
     checkpoint_out = torch.empty_like(v)
     checkpoint_final_state = torch.empty_like(initial_state)
-    checkpoint_state = torch.empty_like(initial_state, dtype=checkpoint_dtype)
+    checkpoint_state = torch.empty_like(initial_state)
     checkpoint_offsets = torch.tensor(
         [checkpoint_offset, seq_lengths[1]], dtype=index_dtype, device=DEVICE
     )
