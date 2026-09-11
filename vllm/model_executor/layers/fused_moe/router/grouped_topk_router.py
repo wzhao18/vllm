@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from functools import partial
+from typing import Any
 
 import torch
 
@@ -20,7 +21,10 @@ from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
     fused_topk_bias,
 )
-from vllm.model_executor.layers.fused_moe.router.fused_topk_router import fused_topk
+from vllm.model_executor.layers.fused_moe.router.fused_topk_router import (
+    _get_padding_mask,
+    fused_topk,
+)
 from vllm.model_executor.utils import maybe_disable_graph_partition
 from vllm.platforms import current_platform
 
@@ -35,6 +39,7 @@ def fused_grouped_topk(
     topk_group: int = 0,
     scoring_func: str = "softmax",
     routed_scaling_factor: float = 1.0,
+    is_padding: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert hidden_states.size(0) == gating_output.size(0), "Number of tokens mismatch"
 
@@ -49,6 +54,7 @@ def fused_grouped_topk(
             routed_scaling_factor,
             e_score_correction_bias,
             1,  # scoring_func=1 for sigmoid
+            is_padding=is_padding,
         )
     elif scoring_func == "softmax":
         # Apply softmax in Python, then use fused kernel
@@ -63,6 +69,7 @@ def fused_grouped_topk(
             routed_scaling_factor,
             e_score_correction_bias,
             0,  # scoring_func=0 (no activation, scores already computed)
+            is_padding=is_padding,
         )
     else:
         raise ValueError(f"Unsupported scoring function: {scoring_func}")
@@ -87,6 +94,7 @@ def grouped_topk(
     scoring_func: str = "softmax",
     routed_scaling_factor: float = 1.0,
     e_score_correction_bias: torch.Tensor | None = None,
+    is_padding: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if (
         envs.VLLM_USE_FUSED_MOE_GROUPED_TOPK
@@ -101,6 +109,7 @@ def grouped_topk(
             topk=topk,
             renormalize=renormalize,
             e_score_correction_bias=e_score_correction_bias,
+            is_padding=is_padding,
             num_expert_group=num_expert_group,
             topk_group=topk_group,
             scoring_func=scoring_func,
@@ -158,6 +167,10 @@ def grouped_topk(
 
     if routed_scaling_factor != 1.0:
         topk_weights = topk_weights * routed_scaling_factor
+
+    if is_padding is not None:
+        topk_ids = topk_ids.masked_fill(is_padding[:, None], -1)
+        topk_weights = topk_weights.masked_fill(is_padding[:, None], 0)
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
 
@@ -334,6 +347,16 @@ class GroupedTopKRouter(BaseRouter):
         else:
             grouped_topk_impl = grouped_topk
 
+        padding_kwargs: dict[str, Any] = {}
+        if (
+            current_platform.is_cuda()
+            and self.num_expert_group == 1
+            and self.topk_group == 1
+            and router_logits.shape[-1] <= 1024
+            and self.top_k <= 16
+        ):
+            padding_kwargs["is_padding"] = _get_padding_mask(router_logits.shape[0])
+
         topk_weights, topk_ids = grouped_topk_impl(
             hidden_states=hidden_states,
             gating_output=router_logits,
@@ -344,6 +367,7 @@ class GroupedTopKRouter(BaseRouter):
             scoring_func=self.scoring_func,
             routed_scaling_factor=self.routed_scaling_factor,
             e_score_correction_bias=self.e_score_correction_bias,
+            **padding_kwargs,
         )
 
         return topk_weights, topk_ids

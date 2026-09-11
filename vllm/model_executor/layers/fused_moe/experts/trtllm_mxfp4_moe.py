@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import inspect
+
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -169,6 +173,14 @@ class TrtLlmMxfp4ExpertsMonolithic(
     Wraps flashinfer.trtllm_fp4_block_scale_moe().
     """
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        from flashinfer import trtllm_fp4_block_scale_moe
+
+        self._supports_padding_mask = (
+            "is_padding" in inspect.signature(trtllm_fp4_block_scale_moe).parameters
+        )
+
     def supports_routing_replay_capture(self) -> bool:
         return True
 
@@ -243,6 +255,16 @@ class TrtLlmMxfp4ExpertsMonolithic(
             num_tokens=num_tokens,
             device=hidden_states.device,
         )
+        padding_kwargs = {}
+        if (
+            self._supports_padding_mask
+            and envs.VLLM_MOE_SKIP_PADDING
+            and (num_expert_group or 0) <= 1
+            and is_forward_context_available()
+        ):
+            is_padding = get_forward_context().is_padding
+            if is_padding is not None:
+                padding_kwargs["is_padding"] = is_padding[:num_tokens]
         flashinfer_output = trtllm_fp4_block_scale_moe(
             routing_logits=router_logits,
             routing_bias=e_score_correction_bias,
@@ -274,6 +296,7 @@ class TrtLlmMxfp4ExpertsMonolithic(
             tune_max_num_tokens=fi_moe_largest_bucket(self.moe_config),
             output=finalized_output,
             routing_replay_out=routing_replay_out,
+            **padding_kwargs,
         )
         routed_output = convert_flashinfer_moe_output(
             flashinfer_output,

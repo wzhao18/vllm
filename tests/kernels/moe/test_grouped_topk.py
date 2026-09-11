@@ -15,8 +15,11 @@ from vllm.config import (
     get_cached_compilation_config,
     set_current_vllm_config,
 )
+from vllm.forward_context import set_forward_context
+from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
     GroupedTopk,
+    GroupedTopKRouter,
     fused_grouped_topk,
 )
 from vllm.platforms import current_platform
@@ -68,6 +71,61 @@ def _single_group_reference(
         values /= values.sum(dim=-1, keepdim=True) + 1e-20
     values *= routed_scaling_factor
     return values, indices.to(torch.int32)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+@pytest.mark.parametrize("num_experts", [128, 896])
+@pytest.mark.parametrize("scoring_func", ["sigmoid", "softmax"])
+@pytest.mark.parametrize("renormalize", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_single_group_router_padding_changes_on_graph_replay(
+    monkeypatch, num_experts, scoring_func, renormalize, dtype
+):
+    """Single-group routing preserves real tokens and skips graph padding."""
+    monkeypatch.setattr(envs, "VLLM_MOE_SKIP_PADDING", True)
+    set_random_seed(17)
+    logits = torch.randn((32, num_experts), dtype=dtype, device="cuda")
+    bias = torch.randn(num_experts, device="cuda")
+    hidden = torch.empty((32, 0), dtype=dtype, device="cuda")
+    padding = torch.zeros(32, dtype=torch.bool, device="cuda")
+    router = GroupedTopKRouter(
+        top_k=16,
+        global_num_experts=num_experts,
+        num_expert_group=1,
+        topk_group=1,
+        scoring_func=scoring_func,
+        renormalize=renormalize,
+        routed_scaling_factor=2.5,
+        e_score_correction_bias=bias,
+    )
+    if scoring_func == "sigmoid" and renormalize:
+        assert router.routing_method_type == RoutingMethodType.DeepSeekV3
+    expected_weights, expected_ids = _run_single_group_topk(
+        logits,
+        bias,
+        16,
+        scoring_func=scoring_func,
+        renormalize=renormalize,
+        routed_scaling_factor=2.5,
+    )
+    with set_forward_context(None, VllmConfig(), num_tokens=32, is_padding=padding):
+        router.select_experts(hidden, logits)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            weights, ids = router.select_experts(hidden, logits)
+    for pattern in ("full", "prefix", "empty", "gaps", "full"):
+        padding.fill_(pattern == "empty")
+        if pattern == "prefix":
+            padding[9:] = True
+        elif pattern == "gaps":
+            padding[1::2] = True
+        graph.replay()
+        torch.testing.assert_close(ids[~padding], expected_ids[~padding])
+        torch.testing.assert_close(
+            weights[~padding], expected_weights[~padding], atol=2e-5, rtol=0
+        )
+        assert (ids[padding] == -1).all()
+        assert (weights[padding] == 0).all()
 
 
 @pytest.mark.skipif(
