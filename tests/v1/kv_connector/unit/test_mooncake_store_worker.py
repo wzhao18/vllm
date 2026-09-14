@@ -11,7 +11,7 @@ import sys
 import threading
 import types
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
@@ -4157,6 +4157,62 @@ def test_register_kv_caches_separate_head_groups():
     assert db.kv_caches_base_addr == expected_addrs
     assert db.block_len == [head_block_bytes] * len(expected_addrs)
     worker.store.register_buffer.assert_called_once_with(raw.data_ptr(), raw.nbytes)
+
+
+def test_register_kv_caches_respects_max_mr_size(monkeypatch):
+    num_blocks = 10
+    tensor = torch.zeros(num_blocks, 64, dtype=torch.float16)
+    block_bytes = tensor.untyped_storage().nbytes() // num_blocks
+    chunk_bytes = 4 * block_bytes
+    monkeypatch.setenv("MC_MAX_MR_SIZE", str(chunk_bytes))
+    worker = _make_bare_worker(num_gpu_blocks=num_blocks)
+
+    _register_with_mocked_threads(worker, {"layer0": tensor})
+
+    base_addr = tensor.untyped_storage().data_ptr()
+    assert worker.store.register_buffer.call_args_list == [
+        call(base_addr, chunk_bytes),
+        call(base_addr + chunk_bytes, chunk_bytes),
+        call(base_addr + 2 * chunk_bytes, 2 * block_bytes),
+    ]
+
+
+@pytest.mark.parametrize("limit", ["invalid", "0", "-1"])
+def test_register_kv_caches_rejects_invalid_max_mr_size(monkeypatch, limit):
+    monkeypatch.setenv("MC_MAX_MR_SIZE", limit)
+    worker = _make_bare_worker()
+
+    with pytest.raises(RuntimeError, match="invalid MC_MAX_MR_SIZE"):
+        _register_with_mocked_threads(
+            worker, {"layer0": torch.zeros(10, 64, dtype=torch.float16)}
+        )
+
+
+def test_register_kv_caches_rejects_limit_smaller_than_block(monkeypatch):
+    num_blocks = 10
+    tensor = torch.zeros(num_blocks, 64, dtype=torch.float16)
+    block_bytes = tensor.untyped_storage().nbytes() // num_blocks
+    monkeypatch.setenv("MC_MAX_MR_SIZE", str(block_bytes - 1))
+    worker = _make_bare_worker(num_gpu_blocks=num_blocks)
+
+    with pytest.raises(RuntimeError, match="smaller than a KV block"):
+        _register_with_mocked_threads(worker, {"layer0": tensor})
+
+
+def test_register_kv_caches_rolls_back_chunks_on_failure(monkeypatch):
+    num_blocks = 10
+    tensor = torch.zeros(num_blocks, 64, dtype=torch.float16)
+    block_bytes = tensor.untyped_storage().nbytes() // num_blocks
+    chunk_bytes = 4 * block_bytes
+    monkeypatch.setenv("MC_MAX_MR_SIZE", str(chunk_bytes))
+    worker = _make_bare_worker(num_gpu_blocks=num_blocks)
+    worker.store.register_buffer.side_effect = [0, -1]
+
+    base_addr = tensor.untyped_storage().data_ptr()
+    with pytest.raises(RuntimeError, match="register_buffer failed"):
+        _register_with_mocked_threads(worker, {"layer0": tensor})
+
+    worker.store.unregister_buffer.assert_called_once_with(base_addr)
 
 
 # ---------------------------------------------------------------------------

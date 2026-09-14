@@ -1915,6 +1915,18 @@ class MooncakeStoreWorker:
         seen_storage_ptrs: set[int] = set()
         cache_tensors: list[torch.Tensor] = []
 
+        chunk_limit_raw = os.environ.get("MC_MAX_MR_SIZE")
+        chunk_limit: int | None = None
+        if chunk_limit_raw is not None:
+            try:
+                chunk_limit = int(chunk_limit_raw)
+            except ValueError as error:
+                raise RuntimeError(
+                    f"invalid MC_MAX_MR_SIZE={chunk_limit_raw!r}"
+                ) from error
+            if chunk_limit <= 0:
+                raise RuntimeError(f"invalid MC_MAX_MR_SIZE={chunk_limit}")
+
         for cache in kv_caches.values():
             cache = group_kernel_blocks(cache, self.num_blocks)
             cache_tensors.append(cache)
@@ -1924,14 +1936,63 @@ class MooncakeStoreWorker:
 
             if base_addr not in seen_storage_ptrs:
                 seen_storage_ptrs.add(base_addr)
-                ret = self.store.register_buffer(base_addr, region_len)
-                if ret != 0:
-                    logger.error(
-                        "register_buffer failed for addr %#x len %d: %d",
-                        base_addr,
-                        region_len,
-                        ret,
+
+                if chunk_limit is None:
+                    ret = self.store.register_buffer(base_addr, region_len)
+                    if ret != 0:
+                        logger.error(
+                            "register_buffer failed for addr %#x len %d: %d",
+                            base_addr,
+                            region_len,
+                            ret,
+                        )
+                    continue
+
+                # Keep each registration bounded without splitting a KV block.
+                if region_len % self.num_blocks:
+                    raise RuntimeError(
+                        "KV storage is not block aligned: "
+                        f"bytes={region_len} num_blocks={self.num_blocks}"
                     )
+                block_bytes = region_len // self.num_blocks
+                blocks_per_chunk = chunk_limit // block_bytes
+                if blocks_per_chunk <= 0:
+                    raise RuntimeError(
+                        "MC_MAX_MR_SIZE is smaller than a KV block: "
+                        f"limit={chunk_limit} block_bytes={block_bytes}"
+                    )
+                chunk_bytes = blocks_per_chunk * block_bytes
+                chunks = tuple(
+                    (base_addr + offset, min(chunk_bytes, region_len - offset))
+                    for offset in range(0, region_len, chunk_bytes)
+                )
+                logger.info(
+                    "Registering KV cache in %d block-aligned regions of at "
+                    "most %d bytes",
+                    len(chunks),
+                    chunk_limit,
+                )
+
+                registered: list[int] = []
+                try:
+                    for chunk_addr, chunk_len in chunks:
+                        ret = self.store.register_buffer(chunk_addr, chunk_len)
+                        if ret != 0:
+                            raise RuntimeError(
+                                "Mooncake register_buffer failed: "
+                                f"base={chunk_addr:#x} bytes={chunk_len} ret={ret}"
+                            )
+                        registered.append(chunk_addr)
+                except Exception:
+                    for chunk_addr in reversed(registered):
+                        try:
+                            self.store.unregister_buffer(chunk_addr)
+                        except Exception:
+                            logger.exception(
+                                "Failed to roll back Mooncake registration at %#x",
+                                chunk_addr,
+                            )
+                    raise
 
         logger.info(
             "Registered KV caches: num_groups=%d, num_tensors=%d, num_blocks=%d",
