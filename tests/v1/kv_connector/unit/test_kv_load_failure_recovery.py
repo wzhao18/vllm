@@ -133,6 +133,104 @@ def test_async_load_failure(
     assert scheduler.connector.get_num_new_matched_tokens.call_count == 3
 
 
+def test_async_load_reserves_full_remainder_before_admission():
+    """A small remote prefix must not bypass full-sequence reservations."""
+    vllm_config = create_vllm_config(max_num_batched_tokens=16)
+    scheduler = create_scheduler(vllm_config, num_blocks=10)
+    first = create_request(num_tokens=8 * scheduler.block_size)
+    second = create_request(num_tokens=5 * scheduler.block_size)
+    scheduler.add_request(first)
+    scheduler.add_request(second)
+
+    scheduler.connector = Mock()
+    scheduler.connector.get_num_new_matched_tokens.return_value = (
+        scheduler.block_size,
+        True,
+    )
+    scheduler.connector.take_events.return_value = ()
+
+    load_output = scheduler.schedule()
+    assert first.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert second.status == RequestStatus.WAITING
+    assert not any(scheduler.kv_cache_manager.get_block_ids(second.request_id))
+
+    scheduler.update_from_output(
+        load_output,
+        create_model_runner_output(reqs=[], finished_recving={first.request_id}),
+    )
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens[first.request_id] == 16
+    assert first.status == RequestStatus.RUNNING
+    assert second.status == RequestStatus.WAITING
+
+
+def test_decode_growth_does_not_strand_completed_async_load():
+    """A growing decoder must leave a completed remote prefill schedulable."""
+    scheduler = create_scheduler(create_vllm_config(), num_blocks=10)
+    decoder = create_request(num_tokens=16, max_tokens=128)
+    waiting = create_request(num_tokens=7 * scheduler.block_size)
+    scheduler.connector = Mock()
+    scheduler.connector.take_events.return_value = ()
+    scheduler.connector.has_pending_block_frees.return_value = False
+    scheduler.connector.request_finished.return_value = (False, None)
+    scheduler.connector.get_num_new_matched_tokens.side_effect = (
+        lambda req, _: (scheduler.block_size, True) if req is waiting else (0, False)
+    )
+    scheduler.add_request(decoder)
+    output = scheduler.schedule()
+    scheduler.update_from_output(output, create_model_runner_output([decoder]))
+    scheduler.add_request(waiting)
+    for step in range(48):
+        output = scheduler.schedule()
+        scheduled = [scheduler.requests[rid] for rid in output.num_scheduled_tokens]
+        scheduler.update_from_output(
+            output,
+            create_model_runner_output(
+                scheduled,
+                finished_recving={waiting.request_id} if step == 47 else None,
+            ),
+        )
+    assert waiting.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert (
+        scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
+        < scheduler._request_remaining_blocks(waiting)
+    )
+    for _ in range(128):
+        output = scheduler.schedule()
+        if waiting.request_id in output.num_scheduled_tokens:
+            break
+        scheduled = [scheduler.requests[rid] for rid in output.num_scheduled_tokens]
+        scheduler.update_from_output(output, create_model_runner_output(scheduled))
+    assert waiting.request_id in output.num_scheduled_tokens
+    assert decoder.num_preemptions > 0
+
+
+def test_async_load_retry_does_not_reserve_its_own_sequence_twice():
+    """A failed load can retry within the capacity it was already admitted into."""
+    scheduler = create_scheduler(
+        create_vllm_config(kv_load_failure_policy="recompute"), num_blocks=10
+    )
+    request = create_request(num_tokens=8 * scheduler.block_size)
+    scheduler.connector = Mock()
+    scheduler.connector.take_events.return_value = ()
+    scheduler.connector.get_num_new_matched_tokens.return_value = (
+        scheduler.block_size,
+        True,
+    )
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    (blocks,) = scheduler.kv_cache_manager.get_block_ids(request.request_id)
+    scheduler.update_from_output(
+        output,
+        create_model_runner_output(
+            [], invalid_block_ids={blocks[0]}, finished_recving={request.request_id}
+        ),
+    )
+    scheduler.schedule()
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert request.num_computed_tokens == scheduler.block_size
+
+
 @pytest.mark.parametrize(
     "num_prompt_blocks,num_external_computed_blocks,invalid_block_idxs",
     [

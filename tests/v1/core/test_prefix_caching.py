@@ -4888,11 +4888,14 @@ def test_can_fit_full_sequence_swa_cap_admits_long_prompt():
     )
 
 
-@pytest.mark.parametrize(("reserved_blocks", "fits"), [(4, True), (10, False)])
-def test_full_sequence_admission_reserves_device_blocks_for_immediate_chunk(
-    reserved_blocks, fits
+@pytest.mark.parametrize(
+    ("delay_cache_blocks", "reserved_blocks", "fits"),
+    [(False, 4, True), (False, 10, False), (True, 2, True), (True, 3, False)],
+)
+def test_full_sequence_admission_reserves_device_blocks(
+    delay_cache_blocks, reserved_blocks, fits
 ):
-    """Reservations constrain the current allocation, not the entire prompt."""
+    """Async loads reserve the full prompt; synchronous chunks need only fit now."""
     block_size = 16
     config = KVCacheConfig(
         num_blocks=11,  # Ten usable blocks after the null block.
@@ -4919,6 +4922,7 @@ def test_full_sequence_admission_reserves_device_blocks_for_immediate_chunk(
         block_size,
         full_sequence_must_fit=True,
         reserved_blocks=reserved_blocks,
+        delay_cache_blocks=delay_cache_blocks,
     )
 
     assert (blocks is not None) is fits

@@ -520,6 +520,9 @@ class KVCacheManager:
                 apply_admission_cap=True,
             )
             required_blocks = num_blocks_to_allocate + watermark_blocks
+            if delay_cache_blocks:
+                # Async loads must leave room for admitted prefills to finish.
+                required_blocks += reserved_blocks
             if required_blocks > self.block_pool.get_num_free_blocks():
                 return None
 

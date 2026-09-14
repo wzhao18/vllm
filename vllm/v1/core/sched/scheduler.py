@@ -1155,7 +1155,7 @@ class Scheduler(SchedulerInterface):
                     # no forward progress and isn't preemptible here. Admit it
                     # only if it fits in (free - other in-flight reservations), to
                     # avoid deadlock and predictable preemptions.
-                    reserved_blocks = self._inflight_prefill_reserved_blocks()
+                    reserved_blocks = self._inflight_prefill_reserved_blocks(request)
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
@@ -2928,11 +2928,15 @@ class Scheduler(SchedulerInterface):
             apply_admission_cap=True,
         )
 
-    def _inflight_prefill_reserved_blocks(self) -> int:
-        """Num blocks in-flight prefills still need to finish (their reservation)."""
+    def _inflight_prefill_reserved_blocks(
+        self, exclude_request: Request | None = None
+    ) -> int:
+        """Blocks other in-flight prefills still need to finish."""
 
         return sum(
-            self._request_remaining_blocks(req) for req in self._inflight_prefills
+            self._request_remaining_blocks(req)
+            for req in self._inflight_prefills
+            if req is not exclude_request
         )
 
     def _update_waiting_for_remote_kv(self, request: Request) -> None:
