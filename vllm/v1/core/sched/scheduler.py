@@ -1155,7 +1155,9 @@ class Scheduler(SchedulerInterface):
                     # no forward progress and isn't preemptible here. Admit it
                     # only if it fits in (free - other in-flight reservations), to
                     # avoid deadlock and predictable preemptions.
-                    reserved_blocks = self._inflight_prefill_reserved_blocks()
+                    reserved_blocks = self._inflight_prefill_reserved_blocks(
+                        exclude=request
+                    )
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
@@ -1166,7 +1168,10 @@ class Scheduler(SchedulerInterface):
                     num_external_computed_tokens=num_external_computed_tokens,
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
-                    full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                    full_sequence_must_fit=(
+                        self.scheduler_reserve_full_isl
+                        and request not in self._inflight_prefills
+                    ),
                     reserved_blocks=reserved_blocks,
                     has_scheduled_reqs=bool(self.running),
                 )
@@ -2943,11 +2948,13 @@ class Scheduler(SchedulerInterface):
             apply_admission_cap=True,
         )
 
-    def _inflight_prefill_reserved_blocks(self) -> int:
-        """Num blocks in-flight prefills still need to finish (their reservation)."""
+    def _inflight_prefill_reserved_blocks(self, exclude: Request | None = None) -> int:
+        """Return blocks reserved for other in-flight prefills."""
 
         return sum(
-            self._request_remaining_blocks(req) for req in self._inflight_prefills
+            self._request_remaining_blocks(req)
+            for req in self._inflight_prefills
+            if req is not exclude
         )
 
     def _update_waiting_for_remote_kv(self, request: Request) -> None:
@@ -2978,6 +2985,7 @@ class Scheduler(SchedulerInterface):
                 # There may be a local cache hit on retry.
                 # (Freed blocks are re-recorded for zeroing when
                 # reallocated, so the skipped blocks need no handling.)
+                self._inflight_prefills.discard(request)
                 self.kv_cache_manager.free(request)
 
             self.failed_recving_kv_req_ids.remove(request.request_id)

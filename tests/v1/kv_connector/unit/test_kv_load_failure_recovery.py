@@ -133,6 +133,77 @@ def test_async_load_failure(
     assert scheduler.connector.get_num_new_matched_tokens.call_count == 3
 
 
+def test_failed_async_load_can_retry_under_tight_capacity():
+    """A failed load must not reserve capacity against its own retry."""
+    vllm_config = create_vllm_config(kv_load_failure_policy="recompute")
+    scheduler = create_scheduler(vllm_config, num_blocks=5)
+    request = create_request(num_tokens=4 * scheduler.block_size)
+    scheduler.add_request(request)
+
+    scheduler.connector = Mock()
+    scheduler.connector.get_num_new_matched_tokens.return_value = (
+        3 * scheduler.block_size,
+        True,
+    )
+    scheduler.connector.take_events.return_value = ()
+
+    scheduler_output = scheduler.schedule()
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+
+    (block_ids,) = scheduler.kv_cache_manager.get_block_ids(request.request_id)
+    model_runner_output = create_model_runner_output(
+        reqs=[],
+        finished_recving={request.request_id},
+        invalid_block_ids={block_ids[0]},
+    )
+    scheduler.update_from_output(scheduler_output, model_runner_output)
+
+    scheduler.schedule()
+
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert scheduler.connector.get_num_new_matched_tokens.call_count == 2
+
+
+def test_partial_async_load_failure_continues_without_readmission():
+    """A partially loaded request remains admitted when capacity changes."""
+    vllm_config = create_vllm_config(
+        kv_load_failure_policy="recompute",
+        max_num_batched_tokens=16,
+    )
+    scheduler = create_scheduler(vllm_config, num_blocks=10)
+    request = create_request(num_tokens=8 * scheduler.block_size)
+    scheduler.add_request(request)
+
+    scheduler.connector = Mock()
+    scheduler.connector.get_num_new_matched_tokens.return_value = (
+        4 * scheduler.block_size,
+        True,
+    )
+    scheduler.connector.take_events.return_value = ()
+
+    scheduler_output = scheduler.schedule()
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert request in scheduler._inflight_prefills
+
+    # Model unrelated post-admission block retention, such as an asynchronous
+    # store job pinning blocks while this request's load is in flight.
+    retained_blocks = scheduler.kv_cache_manager.block_pool.get_new_blocks(2)
+    (block_ids,) = scheduler.kv_cache_manager.get_block_ids(request.request_id)
+    model_runner_output = create_model_runner_output(
+        reqs=[],
+        finished_recving={request.request_id},
+        invalid_block_ids={block_ids[2]},
+    )
+    scheduler.update_from_output(scheduler_output, model_runner_output)
+
+    retry_output = scheduler.schedule()
+
+    assert request.status == RequestStatus.RUNNING
+    assert retry_output.num_scheduled_tokens[request.request_id] == 16
+    assert request in scheduler._inflight_prefills
+    scheduler.kv_cache_manager.block_pool.free_blocks(retained_blocks)
+
+
 @pytest.mark.parametrize(
     "num_prompt_blocks,num_external_computed_blocks,invalid_block_idxs",
     [
