@@ -33,8 +33,8 @@ from vllm.model_executor.layers.attention.mla_attention import (
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
-from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
-from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, is_quantized_kv_cache
+from vllm.v1.attention.backend import AttentionCGSupport, CommonAttentionMetadata
 from vllm.v1.attention.backends.fa_utils import flash_attn_supports_mla
 from vllm.v1.attention.backends.mla import flashmla as flashmla_module
 from vllm.v1.attention.backends.mla import tokenspeed_mla as tokenspeed_mla_module
@@ -506,10 +506,9 @@ def create_and_prepopulate_kv_cache(
     block_table = common_attn_metadata.block_table_tensor
     slot_mapping = common_attn_metadata.slot_mapping
 
+    use_nvfp4_mla = kv_cache_dtype == "nvfp4"
     use_nvfp4_ds_mla = kv_cache_dtype == "nvfp4_ds_mla"
-    fp8_attention = (
-        bool(kv_cache_dtype and kv_cache_dtype.startswith("fp8")) or use_nvfp4_ds_mla
-    )
+    fp8_attention = bool(kv_cache_dtype) and is_quantized_kv_cache(kv_cache_dtype)
     use_fp8_ds_mla = kv_cache_dtype == "fp8_ds_mla"
 
     if fp8_attention:
@@ -519,6 +518,8 @@ def create_and_prepopulate_kv_cache(
             # 4 * 4: 4 float32 scale values for 128-element tiles
             # 2 * rope_dim: 16-bit RoPE values
             kv_entry_size = kv_lora_rank + 4 * 4 + 2 * rope_dim
+        elif use_nvfp4_mla:
+            kv_entry_size = 324
         elif use_nvfp4_ds_mla:
             kv_lora_rank = kv_c_contexts[0].shape[-1]
             rope_dim = k_pe_contexts[0].shape[-1]
@@ -560,14 +561,27 @@ def create_and_prepopulate_kv_cache(
 
         if fp8_attention:
             slots = torch.arange(context_len, device=device, dtype=torch.long) + start
-            ops.concat_and_cache_mla(
-                kv_c_context,
-                k_pe_context.squeeze(1),
-                kv_cache.squeeze(1),
-                slots,
-                kv_cache_dtype=kv_cache_dtype,
-                scale=scale_tensor,
-            )
+            if use_nvfp4_mla:
+                from vllm.v1.attention.backends.mla.nvfp4_mla import (
+                    store_nvfp4_mla,
+                )
+
+                store_nvfp4_mla(
+                    kv_c_context,
+                    k_pe_context.squeeze(1),
+                    kv_cache.squeeze(1),
+                    slots,
+                    scale_tensor,
+                )
+            else:
+                ops.concat_and_cache_mla(
+                    kv_c_context,
+                    k_pe_context.squeeze(1),
+                    kv_cache.squeeze(1),
+                    slots,
+                    kv_cache_dtype=kv_cache_dtype,
+                    scale=scale_tensor,
+                )
         else:
             kv_context = torch.cat([kv_c_context, k_pe_context.squeeze(1)], dim=-1)
             end = start + kv_context.shape[0]
@@ -680,7 +694,7 @@ class MockSparseMLAAttentionLayer:
     ) -> torch.Tensor:
         """Forward for sparse MLA - uses forward_mqa for all tokens."""
         kv_cache_dtype = getattr(self.impl, "kv_cache_dtype", "auto")
-        fp8_attention = kv_cache_dtype.startswith("fp8")
+        fp8_attention = is_quantized_kv_cache(kv_cache_dtype)
 
         # Impls see the bind-time-squeezed [B, N, C] cache; mirror bind_kv_cache.
         if kv_cache.ndim == 4:
@@ -697,7 +711,11 @@ class MockSparseMLAAttentionLayer:
                 scale=self._k_scale,
             )
 
-        if fp8_attention and kv_cache_dtype != "fp8_ds_mla":
+        if fp8_attention and kv_cache_dtype not in (
+            "fp8_ds_mla",
+            "nvfp4",
+            "nvfp4_ds_mla",
+        ):
             kv_cache = kv_cache.view(current_platform.fp8_dtype())
 
         num_tokens = q.shape[0]
@@ -827,18 +845,35 @@ class MockMLAAttentionLayer(MLAAttention):
 
         # Write to KV cache
         kv_cache_dtype = getattr(self.impl, "kv_cache_dtype", "auto")
-        fp8_attention = kv_cache_dtype.startswith("fp8")
+        fp8_attention = is_quantized_kv_cache(kv_cache_dtype)
         if kv_cache.numel() > 0:
-            ops.concat_and_cache_mla(
-                kv_c,
-                k_pe.squeeze(1),
-                kv_cache,
-                attn_metadata.slot_mapping.flatten(),
-                kv_cache_dtype=kv_cache_dtype,
-                scale=self._k_scale,
-            )
+            if kv_cache_dtype == "nvfp4":
+                from vllm.v1.attention.backends.mla.nvfp4_mla import (
+                    store_nvfp4_mla,
+                )
 
-        if fp8_attention and kv_cache_dtype != "fp8_ds_mla":
+                store_nvfp4_mla(
+                    kv_c,
+                    k_pe.squeeze(1),
+                    kv_cache,
+                    attn_metadata.slot_mapping.flatten(),
+                    self._k_scale,
+                )
+            else:
+                ops.concat_and_cache_mla(
+                    kv_c,
+                    k_pe.squeeze(1),
+                    kv_cache,
+                    attn_metadata.slot_mapping.flatten(),
+                    kv_cache_dtype=kv_cache_dtype,
+                    scale=self._k_scale,
+                )
+
+        if fp8_attention and kv_cache_dtype not in (
+            "fp8_ds_mla",
+            "nvfp4",
+            "nvfp4_ds_mla",
+        ):
             kv_cache = kv_cache.view(current_platform.fp8_dtype())
 
         # Determine decode vs prefill split
@@ -1031,6 +1066,20 @@ def test_tokenspeed_mla_noncausal_capability():
     assert builder.supports_non_causal_multi_token_decode
     assert builder.supports_non_causal_multi_token_dcp
     assert tokenspeed_mla_module.TokenspeedMLABackend.supports_non_causal()
+
+
+def test_tokenspeed_nvfp4_staging_disables_cudagraph():
+    spec = SimpleNamespace(cache_dtype_str="nvfp4")
+    support = tokenspeed_mla_module.TokenspeedMLAMetadataBuilder.get_cudagraph_support(
+        SimpleNamespace(), spec
+    )
+    assert support == AttentionCGSupport.NEVER
+
+    spec.cache_dtype_str = "fp8"
+    support = tokenspeed_mla_module.TokenspeedMLAMetadataBuilder.get_cudagraph_support(
+        SimpleNamespace(), spec
+    )
+    assert support == AttentionCGSupport.UNIFORM_BATCH
 
 
 def test_flashinfer_mla_dspark_dcp_supports_target_and_draft(monkeypatch):
@@ -1773,6 +1822,8 @@ def _run_backend_correctness(
         "auto": 1e-2,
         "fp8": 1.5e-1,
         "fp8_e4m3": 1.5e-1,
+        "nvfp4": 4e-1,
+        "nvfp4_ds_mla": 4e-1,
     }[kv_cache_dtype]
     failures = []
     for backend_idx, backend_name in enumerate(backends_to_test):
@@ -1792,9 +1843,23 @@ def _run_backend_correctness(
                 vllm_config.parallel_config
             ),
             head_size=vllm_config.model_config.get_head_size(),
-            dtype=vllm_config.model_config.dtype,
+            dtype=(
+                torch.uint8
+                if kv_cache_dtype in ("nvfp4", "nvfp4_ds_mla")
+                else vllm_config.model_config.dtype
+            ),
             sliding_window=vllm_config.model_config.get_sliding_window(),
             cache_dtype_str=kv_cache_dtype,
+            kv_quant_mode=(
+                KVQuantMode.NVFP4
+                if kv_cache_dtype == "nvfp4"
+                else (
+                    KVQuantMode.NVFP4_DS_MLA
+                    if kv_cache_dtype == "nvfp4_ds_mla"
+                    else KVQuantMode.NONE
+                )
+            ),
+            state_content_bytes={"nvfp4": 324, "nvfp4_ds_mla": 352}.get(kv_cache_dtype),
         )
 
         backend_output = run_attention_backend(
@@ -1919,6 +1984,27 @@ def test_backend_correctness(
         prefill_backend,
         qk_nope_head_dim,
         v_head_dim,
+    )
+
+
+def test_tokenspeed_nvfp4_decode_correctness(
+    default_vllm_config,
+    dist_init,
+    workspace_init,
+):
+    _run_backend_correctness(
+        default_vllm_config,
+        dist_init,
+        workspace_init,
+        batch_spec_name="small_decode",
+        model="deepseek-ai/DeepSeek-R1",
+        tensor_parallel_size=8,
+        kv_cache_dtype="nvfp4",
+        q_scale=2.0,
+        k_scale=3.0,
+        prefill_backend=MLAPrefillBackendEnum.TRTLLM_RAGGED,
+        qk_nope_head_dim=128,
+        v_head_dim=128,
     )
 
 

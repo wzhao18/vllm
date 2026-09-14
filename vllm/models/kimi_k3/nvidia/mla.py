@@ -428,8 +428,11 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             dtype=kv_cache_dtype,
             cache_dtype_str=self.kv_cache_dtype,
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
-            # fp8_ds_mla: 656-byte custom layout; see flashmla_sparse.py.
-            state_content_bytes=656 if self.kv_cache_dtype == "fp8_ds_mla" else None,
+            # Packed MLA layouts are opaque byte blobs rather than head_size
+            # elements. NVFP4 uses 288 packed data bytes plus 36 E4M3 scales.
+            state_content_bytes={"fp8_ds_mla": 656, "nvfp4": 324}.get(
+                self.kv_cache_dtype
+            ),
             non_causal_multi_token_decode=self.non_causal_multi_token_decode,
         )
 
@@ -498,9 +501,9 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         the fp8_ds_mla layout keeps its native uint8 view.
         """
         cache = self.kv_cache
-        if (
-            is_quantized_kv_cache(self.kv_cache_dtype)
-            and self.kv_cache_dtype != "fp8_ds_mla"
+        if is_quantized_kv_cache(self.kv_cache_dtype) and self.kv_cache_dtype not in (
+            "fp8_ds_mla",
+            "nvfp4",
         ):
             return cache.view(current_platform.fp8_dtype())
         return cache
@@ -746,6 +749,29 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
     ) -> torch.Tensor:
         """Fused decode query-concat + latent cache insert, dispatched by cache
         dtype (same policy as prefill: fp8 cache -> fp8 query)."""
+        if self.kv_cache_dtype == "nvfp4":
+            if positions is not None or cos_sin_cache is not None:
+                raise NotImplementedError(
+                    "Kimi-K3 NVFP4 MLA staging currently supports NoPE layers only."
+                )
+            cache = self.kv_cache
+            if cache.dtype != torch.uint8:
+                cache = cache.view(torch.uint8)
+            from vllm.v1.attention.backends.mla.nvfp4_mla import store_nvfp4_mla
+
+            store_nvfp4_mla(
+                kv_c_normed,
+                k_pe.reshape(k_pe.shape[0], -1),
+                cache,
+                slot_mapping,
+                self._k_scale,
+            )
+            mqa_q = torch.cat((ql_nope, q_pe), dim=-1)
+            original_shape = mqa_q.shape
+            mqa_q, _ = ops.scaled_fp8_quant(
+                mqa_q.reshape(-1, original_shape[-1]), scale=self._q_scale
+            )
+            return mqa_q.view(original_shape)
         if self.kv_cache_dtype == "fp8_ds_mla":
             cache = self.kv_cache
             if cache.dtype != torch.uint8:
@@ -938,7 +964,20 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         workspace = prefill.chunked_context.workspace
         toks = chunk.num_context_tokens
         block_table = prefill.block_table[chunk.request_slice]
-        if self.kv_cache_dtype == "fp8_ds_mla":
+        if self.kv_cache_dtype == "nvfp4":
+            from vllm.v1.attention.backends.mla.nvfp4_mla import (
+                gather_nvfp4_mla_as_bf16,
+            )
+
+            gather_nvfp4_mla_as_bf16(
+                src_cache=kv_cache.view(torch.uint8),
+                dst=workspace[:toks],
+                block_table=block_table,
+                workspace_starts=chunk.cu_seq_lens,
+                batch_size=chunk.num_requests,
+                k_scale=self._k_scale,
+            )
+        elif self.kv_cache_dtype == "fp8_ds_mla":
             ops.cp_gather_and_upconvert_fp8_kv_cache(
                 src_cache=kv_cache,
                 dst=workspace[:toks],
@@ -1001,7 +1040,29 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         )
         k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
 
-        if self.kv_cache_dtype == "fp8_ds_mla":
+        if self.kv_cache_dtype == "nvfp4":
+            if positions is not None or cos_sin_cache is not None:
+                raise NotImplementedError(
+                    "Kimi-K3 NVFP4 MLA staging currently supports NoPE layers only."
+                )
+            cache = self.kv_cache
+            if cache.dtype != torch.uint8:
+                cache = cache.view(torch.uint8)
+            from vllm.v1.attention.backends.mla.nvfp4_mla import store_nvfp4_mla
+
+            store_nvfp4_mla(
+                kv_c_normed,
+                k_pe.reshape(k_pe.shape[0], -1),
+                cache,
+                slot_mapping,
+                self._k_scale,
+            )
+            if fp8_prefill:
+                q = q.to(current_platform.fp8_dtype())
+                k, v = fused_mla_kv_concat_quant_fp8(k_nope, k_pe, v)
+            else:
+                k = fused_mla_kv_concat(k_nope, k_pe)
+        elif self.kv_cache_dtype == "fp8_ds_mla":
             # fp8_ds_mla cache (656B, per-tile self-scaled); bf16 attention.
             assert not fp8_prefill, (
                 "Kimi-K3 fp8_ds_mla uses a bf16 prefill query; fp8 prefill "

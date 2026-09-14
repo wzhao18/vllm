@@ -22,6 +22,8 @@ QK_HEAD_DIM = NOPE_HEAD_DIM + ROPE_HEAD_DIM
 V_HEAD_DIM = 128
 CACHE_ENTRY = KV_LORA_RANK + ROPE_HEAD_DIM
 DS_MLA_CACHE_ENTRY = 656
+NVFP4_DS_MLA_CACHE_ENTRY = 352
+NVFP4_MLA_CACHE_ENTRY = 324
 BLOCK_SIZE = 8
 OWNED_TOKEN_INDICES = [1, 3]
 
@@ -220,6 +222,56 @@ def test_decode_concat_ignores_negative_slots_for_cache(cache_format: str) -> No
     else:
         torch.testing.assert_close(output, expected, rtol=0, atol=0)
     _assert_cache_matches_reference(mixed_cache, reference_cache, initial_cache)
+
+
+def test_kimi_nvfp4_decode_concat_and_cache() -> None:
+    capability = current_platform.get_device_capability()
+    if capability is None or capability.major != 10:
+        pytest.skip("Kimi-K3 NVFP4 MLA cache requires SM 10.x")
+
+    from vllm.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
+    from vllm.v1.attention.backends.mla.nvfp4_mla import store_nvfp4_mla
+
+    inputs = _inputs()
+    slots = _slot_mapping()
+    cache = torch.full(
+        (1, BLOCK_SIZE, NVFP4_MLA_CACHE_ENTRY),
+        165,
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    reference_cache = cache.clone()
+    q_scale = torch.tensor(2.0, device="cuda", dtype=torch.float32)
+    k_scale = torch.tensor(3.0, device="cuda", dtype=torch.float32)
+    store_nvfp4_mla(
+        inputs["kv_c"],
+        inputs["k_pe"],
+        reference_cache,
+        slots,
+        k_scale,
+    )
+
+    layer = MultiHeadLatentAttention.__new__(MultiHeadLatentAttention)
+    torch.nn.Module.__init__(layer)
+    layer.kv_cache_dtype = "nvfp4"
+    layer.kv_cache = cache
+    layer._q_scale = q_scale
+    layer._k_scale = k_scale
+    output = layer._decode_concat_cache(
+        inputs["ql_nope"],
+        inputs["q_pe"],
+        inputs["kv_c"],
+        inputs["k_pe"],
+        positions=None,
+        cos_sin_cache=None,
+        slot_mapping=slots,
+    )
+
+    expected_q = (_latent_query(inputs["ql_nope"], inputs["q_pe"]) / q_scale).to(
+        torch.float8_e4m3fn
+    )
+    torch.testing.assert_close(output.float(), expected_q.float(), rtol=0, atol=0)
+    assert torch.equal(cache, reference_cache)
 
 
 def test_ds_mla_cache_insert_bit_compatible_with_reference() -> None:

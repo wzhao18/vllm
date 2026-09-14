@@ -811,6 +811,12 @@ class Platform:
 
         # Compute attention page size for 1 token
         if model_config.use_mla:
+            # Kimi K3's storage-only NVFP4 layout packs each 576-element MLA
+            # latent into 288 E2M1 data bytes and 36 E4M3 scale bytes. Hybrid
+            # models must size attention pages from the packed representation;
+            # using the logical head size can otherwise make the Mamba page
+            # larger than, and indivisible by, the real attention page.
+            state_content_bytes = 324 if cache_config.cache_dtype == "nvfp4" else None
             attn_page_size_1_token = MLAAttentionSpec(
                 block_size=1,
                 num_kv_heads=model_config.get_num_kv_heads(parallel_config),
@@ -818,6 +824,7 @@ class Platform:
                 dtype=kv_cache_dtype,
                 cache_dtype_str=cache_config.cache_dtype,
                 kv_quant_mode=kv_quant_mode,
+                state_content_bytes=state_content_bytes,
             ).page_size_bytes
         elif cache_config.cache_dtype.startswith("turboquant_"):
             # TQ has a packed K|V layout; the standard FullAttentionSpec

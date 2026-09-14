@@ -1163,6 +1163,86 @@ def test_concat_and_cache_nvfp4_ds_mla(
         assert ((rope_vals - k_pe_ref).abs() <= rope_tol).all()
 
 
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_stage_nvfp4_mla_as_fp8(device: str) -> None:
+    if current_platform.is_rocm():
+        pytest.skip("NVFP4 DS-MLA requires CUDA")
+    device_capability = current_platform.get_device_capability()
+    if device_capability is None or device_capability.major != 10:
+        pytest.skip("The NVFP4 DS-MLA kv-cache dtype requires SM 10.x")
+
+    from vllm.v1.attention.backends.mla.nvfp4_mla import (
+        NVFP4_MLA_ENTRY_BYTES,
+        gather_nvfp4_mla_as_bf16,
+        stage_nvfp4_mla_as_fp8,
+        store_nvfp4_mla,
+    )
+
+    torch.set_default_device(device)
+    torch.accelerator.set_device_index(device)
+    set_random_seed(0)
+    num_blocks, block_size = 8, 16
+    num_tokens = num_blocks * block_size
+    kv_c = torch.randn(num_tokens, 512, dtype=torch.bfloat16)
+    k_pe = torch.randn(num_tokens, 64, dtype=torch.bfloat16)
+    cache = torch.empty(
+        num_blocks,
+        block_size,
+        NVFP4_MLA_ENTRY_BYTES,
+        dtype=torch.uint8,
+    )
+    slot_mapping = torch.arange(num_tokens, dtype=torch.long)
+    scale = torch.tensor(0.5, dtype=torch.float32)
+    store_nvfp4_mla(kv_c, k_pe, cache, slot_mapping, scale)
+
+    # Include an out-of-order and a duplicated physical page. Each reference
+    # gets a separate slot in the compact staging cache used by TokenSpeed.
+    block_table = torch.tensor([[3, 1, -1], [0, 3, 5]], dtype=torch.int32)
+    staged = torch.empty(
+        block_table.numel(), block_size, 576, dtype=torch.float8_e4m3fn
+    )
+    stage_nvfp4_mla_as_fp8(cache, block_table, staged)
+
+    dequantized_pages = {}
+    for staged_page, physical_page in enumerate(block_table.flatten().tolist()):
+        if physical_page < 0:
+            assert not staged[staged_page].byte().any()
+            continue
+        entries = cache[physical_page]
+        sf = (
+            entries[:, 288:324]
+            .view(torch.float8_e4m3fn)
+            .float()
+            .repeat_interleave(16, dim=-1)
+        )
+        dequantized = _unpack_e2m1(entries[:, :288]).view(block_size, 576) * sf
+        dequantized_pages[physical_page] = dequantized
+        expected = dequantized.clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        torch.testing.assert_close(staged[staged_page].float(), expected.float())
+
+    # Chunked prefill consumes the same storage through a BF16 gather and
+    # restores the layer's cache scale.
+    gather_table = torch.tensor([[3, 1], [0, 5]], dtype=torch.int32)
+    workspace_starts = torch.tensor([0, 2 * block_size], dtype=torch.int32)
+    gathered = torch.empty(4 * block_size, 576, dtype=torch.bfloat16)
+    gather_nvfp4_mla_as_bf16(
+        cache,
+        gathered,
+        gather_table,
+        workspace_starts,
+        batch_size=2,
+        k_scale=scale,
+    )
+    expected_gather = torch.cat(tuple(dequantized_pages[page] for page in (3, 1, 0, 5)))
+    torch.testing.assert_close(
+        gathered.float(),
+        (expected_gather * scale).to(torch.bfloat16).float(),
+        rtol=0,
+        atol=0,
+    )
+
+
 @pytest.mark.parametrize("kv_lora_rank", KV_LORA_RANKS)
 @pytest.mark.parametrize("qk_rope_head_dim", QK_ROPE_HEAD_DIMS)
 @pytest.mark.parametrize("block_size", BLOCK_SIZES_MLA)
