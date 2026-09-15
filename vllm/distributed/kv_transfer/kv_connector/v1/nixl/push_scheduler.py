@@ -171,6 +171,13 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         local_block_ids: BlockIds = blocks.get_unhashed_block_ids_all_groups()
         local_block_ids = self.get_exchange_clipped_blocks(local_block_ids)
 
+        # Blocks already covered by D's local prefix cache. P needs these
+        # per-group positions to align an asymmetric-DCP push with D's suffix.
+        local_num_computed_blocks = tuple(
+            sum(block.block_hash is not None and not block.is_null for block in group)
+            for group in blocks.blocks
+        )
+
         # ``remote_*`` fields are P's coordinates (from D's perspective).
         # ``decode_*`` fields are D's own info that P needs for the
         # reverse handshake before WRITE-ing.
@@ -181,6 +188,7 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             "decode_port": self.side_channel_port,
             "decode_tp_size": (self.vllm_config.parallel_config.tensor_parallel_size),
             "local_block_ids": local_block_ids,
+            "local_num_computed_blocks": local_num_computed_blocks,
             "remote_engine_id": params["remote_engine_id"],
             "remote_host": params["remote_host"],
             "remote_port": params["remote_port"],

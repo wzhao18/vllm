@@ -86,6 +86,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
     iter_layer_specs,
 )
@@ -1647,6 +1648,14 @@ class NixlBaseConnectorWorker:
             region_mem_types=self.region_mem_types,
             dcp_size=self.dcp_size,
             pcp_size=self.pcp_size,
+            pp_size=self.pp_size,
+            cp_kv_cache_interleave_size=(
+                self.vllm_config.parallel_config.cp_kv_cache_interleave_size
+            ),
+            has_transferable_swa=any(
+                issubclass(spec_type, SlidingWindowSpec)
+                for spec_type in self._group_spec_types
+            ),
         )
         # Wrap metadata in payload with hash for defensive decoding
         assert self.compat_hash is not None
@@ -2221,6 +2230,75 @@ class NixlBaseConnectorWorker:
 
         return remote_agent_name
 
+    def _validate_asymmetric_dcp(
+        self,
+        nixl_agent_meta: NixlAgentMetadata,
+        remote_dcp_size: int,
+    ) -> bool:
+        """Validate the block geometry used by asymmetric DCP."""
+        if self.dcp_size == remote_dcp_size:
+            return False
+
+        if self._TRANSFER_MODE != "push":
+            if self._has_mamba:
+                raise RuntimeError(
+                    "Hybrid MLA+Mamba NIXL transfers require matching DCP sizes, "
+                    f"got local={self.dcp_size}, remote={remote_dcp_size}."
+                )
+            return False
+
+        if min(self.dcp_size, remote_dcp_size) != 1:
+            raise RuntimeError(
+                "Asymmetric-DCP NIXL transfers "
+                "require one side to use DCP=1, "
+                f"got local={self.dcp_size}, remote={remote_dcp_size}."
+            )
+        if max(self.dcp_size, remote_dcp_size) != 8:
+            raise RuntimeError(
+                "Asymmetric-DCP NIXL transfers currently support only "
+                f"DCP8 and DCP1, got local={self.dcp_size}, "
+                f"remote={remote_dcp_size}."
+            )
+        if self.pp_size != 1 or nixl_agent_meta.pp_size != 1:
+            raise RuntimeError(
+                "Asymmetric-DCP NIXL push requires PP=1 on both sides, got "
+                f"local PP={self.pp_size}, remote PP={nixl_agent_meta.pp_size}."
+            )
+        local_has_swa = any(
+            issubclass(spec_type, SlidingWindowSpec)
+            for spec_type in getattr(self, "_group_spec_types", ())
+        )
+        if local_has_swa or getattr(nixl_agent_meta, "has_transferable_swa", False):
+            raise RuntimeError(
+                "Asymmetric-DCP NIXL push does not support transferable "
+                "sliding-window attention groups."
+            )
+
+        if self.dcp_size > remote_dcp_size:
+            sharded_interleave = (
+                self.vllm_config.parallel_config.cp_kv_cache_interleave_size
+            )
+            sharded_block_size = self.block_size
+        else:
+            sharded_interleave = nixl_agent_meta.cp_kv_cache_interleave_size
+            sharded_block_size = nixl_agent_meta.block_size
+            if sharded_interleave is None:
+                raise RuntimeError(
+                    "The remote NIXL agent did not advertise "
+                    "cp_kv_cache_interleave_size required for "
+                    "asymmetric-DCP correctness."
+                )
+
+        if sharded_interleave != sharded_block_size:
+            raise RuntimeError(
+                "Asymmetric-DCP NIXL transfers "
+                "require block-aligned KV-cache interleaving on the sharded "
+                f"side ({sharded_block_size} tokens), got {sharded_interleave}. "
+                "Set --cp-kv-cache-interleave-size to the KV-cache block size."
+            )
+
+        return True
+
     def _validate_remote_agent_handshake(
         self,
         nixl_agent_meta: NixlAgentMetadata,
@@ -2237,6 +2315,9 @@ class NixlBaseConnectorWorker:
         remote_info = self.transfer_topo.get_engine_info(remote_engine_id)
         assert remote_info.remote_tp_size == remote_tp_size
         assert remote_info.remote_dcp_size == remote_dcp_size
+        asymmetric_dcp = self._validate_asymmetric_dcp(
+            nixl_agent_meta, remote_dcp_size
+        )
         # DCP sizes must divide one another; this is what keeps the
         # read-slicing math in pull_worker a closed form.
         assert (
@@ -2245,12 +2326,6 @@ class NixlBaseConnectorWorker:
             f"DCP sizes must divide one another: local={self.dcp_size}, "
             f"remote={remote_dcp_size} (engine {remote_engine_id})."
         )
-        if self._has_mamba and self.dcp_size != remote_dcp_size:
-            raise RuntimeError(
-                "Hybrid MLA+Mamba NIXL transfers require matching DCP sizes, "
-                f"got local={self.dcp_size}, remote={remote_dcp_size}."
-            )
-
         tp_ratio = self.transfer_topo.tp_ratio(remote_tp_size)
         block_size_ratio = self.transfer_topo.block_size_ratio(
             nixl_agent_meta.block_size
@@ -2270,6 +2345,7 @@ class NixlBaseConnectorWorker:
             self._has_mamba
             and remote_physical_per_logical
             != self._physical_blocks_per_logical_kv_block
+            and not asymmetric_dcp
             and self.vllm_config.cache_config.enable_prefix_caching
         ):
             raise RuntimeError(
@@ -2695,16 +2771,24 @@ class NixlBaseConnectorWorker:
                 remote_info.remote_physical_blocks_per_logical
                 != self._physical_blocks_per_logical_kv_block
             )
-            if block_size_ratio > 1 or self.enable_permute_local_kv or hetero_ppl:
+            if (
+                block_size_ratio > 1
+                or self.enable_permute_local_kv
+                or hetero_ppl
+                or meta.aggregate_remote_coverage
+            ):
                 for g, local_group in enumerate(meta.local_physical_block_ids):
                     if not local_group or _is_ssm_spec(self._group_spec_types[g]):
                         continue
-                    # Number of remote-sized sub-blocks the transfer covered;
-                    # everything past this was clipped and must be zeroed.
-                    covered_sub_blocks = min(
-                        len(local_group) * block_size_ratio,
-                        len(meta.remote.block_ids[g]),
+                    local_sub_blocks = len(local_group) * block_size_ratio
+                    # Push fan-in reports exact aggregate physical-page
+                    # coverage. Pull transfers derive it from remote IDs.
+                    remote_coverage = (
+                        meta.aggregate_remote_coverage[g]
+                        if g < len(meta.aggregate_remote_coverage)
+                        else len(meta.remote.block_ids[g])
                     )
+                    covered_sub_blocks = min(local_sub_blocks, remote_coverage)
                     block_ids_for_blocksize_post_process[block_size_ratio].append(
                         (local_group, covered_sub_blocks)
                     )
@@ -3011,6 +3095,63 @@ class NixlBaseConnectorWorker:
                     ).tolist()
                 )
         return physical_block_ids
+
+    def _map_dcp_attention_block_ids(
+        self,
+        local_block_ids: BlockIds,
+        remote_block_ids: BlockIds,
+        remote_rank: int,
+        remote_info: EngineTransferInfo,
+        remote_num_computed_blocks: tuple[int, ...] = (),
+    ) -> tuple[BlockIds, BlockIds]:
+        """Pair block-aligned attention shards with an unsharded DCP peer."""
+        local_dcp_size = self.dcp_size
+        remote_dcp_size = remote_info.remote_dcp_size
+        if local_dcp_size == remote_dcp_size:
+            return local_block_ids, remote_block_ids
+
+        if local_dcp_size < remote_dcp_size:
+            raise RuntimeError(
+                "NixlPush asymmetric DCP only supports a sharded producer "
+                "and DCP=1 consumer; got producer DCP "
+                f"{local_dcp_size} and consumer DCP {remote_dcp_size}."
+            )
+
+        local_groups = [list(group) for group in local_block_ids]
+        remote_groups = [list(group) for group in remote_block_ids]
+        assert remote_dcp_size == 1
+        for i, decode_group in enumerate(remote_groups):
+            if _is_attention_spec(self._group_spec_types[i]):
+                cached_physical = (
+                    remote_num_computed_blocks[i]
+                    * remote_info.remote_physical_blocks_per_logical
+                )
+                decode_slice, prefill_slice = self._apply_dcp_prefix_caching(
+                    local_ids=decode_group,
+                    remote_ids=local_groups[i],
+                    remote_rank=self.dcp_rank,
+                    local_dcp_size=1,
+                    local_dcp_rank=0,
+                    remote_dcp_size=local_dcp_size,
+                    local_num_computed_blocks=cached_physical,
+                )
+                remote_groups[i] = decode_slice
+                local_groups[i] = prefill_slice
+
+        return local_groups, remote_groups
+
+    def _asymmetric_dcp_group_start(
+        self,
+        group_idx: int,
+        remote_info: EngineTransferInfo,
+        remote_num_computed_blocks: tuple[int, ...],
+    ) -> int:
+        """Return this producer's first position in DCP1's uncached suffix."""
+        cached_physical = (
+            remote_num_computed_blocks[group_idx]
+            * remote_info.remote_physical_blocks_per_logical
+        )
+        return (self.dcp_rank - cached_physical) % self.dcp_size
 
     def _apply_dcp_prefix_caching(
         self,

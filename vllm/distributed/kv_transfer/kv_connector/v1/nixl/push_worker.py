@@ -48,6 +48,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
     NixlBaseConnectorWorker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    PUSH_DONE_NOTIF_PREFIX,
     PUSH_REG_NOTIF_PREFIX,
     NixlConnectorMetadata,
     RemoteMeta,
@@ -122,6 +123,11 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         self._evict_finished_inbox: queue.Queue[str] = queue.Queue()
         # Handshakes that have just completed and are ready for the WRITE on wthread
         self._deferred_push_inbox = queue.Queue[tuple[str, BlockIds, dict[str, Any]]]()
+        # D-side asymmetric push coverage, keyed by request then producer
+        # DCP rank. PP>1 asymmetric push is rejected, so rank is unique.
+        self._push_coverage_by_req: dict[
+            ReqId, dict[int, tuple[tuple[int, int], ...]]
+        ] = defaultdict(dict)
 
         # Wake signal from engine main thread (start_load_kv / get_finished).
         # Writer self-polls at _PUSH_WRITER_POLL_INTERVAL_MS while it has
@@ -294,7 +300,6 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         if not isinstance(rid, str):
             logger.warning("PUSH_REG notif missing request_id; dropping")
             return
-
         match = self._pop_matching_finished_blocks(rid)
         if match is not None:
             fin_id, blocks = match
@@ -437,6 +442,9 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         # (D's, from the PUSH_REG notif) are also logical.
         decode_engine_id = registration_data["decode_engine_id"]
         remote_block_ids = registration_data["local_block_ids"]
+        remote_num_computed_blocks = tuple(
+            registration_data.get("local_num_computed_blocks", ())
+        )
         decode_request_id = registration_data["request_id"]
 
         # Runs on the background executor; defer the WRITE until it's ready.
@@ -465,6 +473,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
             fut.add_done_callback(_on_handshake)
             return
+
         # Keep the engine alive while it is actively receiving pushes, mirroring
         # how pull-mode transfers touch _engine_last_active in start_load_kv.
         self._engine_last_active[decode_engine_id] = time.perf_counter()
@@ -479,6 +488,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             local_block_ids=logical_local,
             local_physical_block_ids=physical_local,
             tp_size=self.world_size,
+            local_num_computed_blocks=remote_num_computed_blocks,
             remote=RemoteMeta(
                 block_ids=logical_remote,
                 host="",
@@ -603,6 +613,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 remote_request_id=meta.remote.request_id,
                 local_xfer_side_handle=local_xfer_side_handle,
                 remote_xfer_side_handle=remote_xfer_side_handle,
+                remote_num_computed_blocks=meta.local_num_computed_blocks,
             )
             if handle is not None:
                 handles.append(handle)
@@ -622,6 +633,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         remote_request_id: str,
         local_xfer_side_handle: int,
         remote_xfer_side_handle: int,
+        remote_num_computed_blocks: tuple[int, ...],
     ) -> int | None:
         """Post a WRITE point-to-point xfer request.
 
@@ -634,6 +646,16 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         remote_block_ids = read_spec.remote_block_ids
 
         remote_info = self.transfer_topo.get_engine_info(dst_engine_id)
+        if (
+            self.dcp_size != remote_info.remote_dcp_size
+            and len(remote_num_computed_blocks) != len(remote_block_ids)
+        ):
+            raise RuntimeError(
+                "Asymmetric-DCP PUSH_REG requires one "
+                "local_num_computed_blocks value per cache group, got "
+                f"{len(remote_num_computed_blocks)} for "
+                f"{len(remote_block_ids)} groups."
+            )
         block_size_ratio = self.transfer_topo.block_size_ratio(
             remote_info.remote_block_size
         )
@@ -644,7 +666,13 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 )
             )
 
-        notif_id = f"{remote_request_id}:{self.world_size}".encode()
+        local_block_ids, remote_block_ids = self._map_dcp_attention_block_ids(
+            local_block_ids,
+            remote_block_ids,
+            remote_rank,
+            remote_info,
+            remote_num_computed_blocks,
+        )
 
         if len(local_block_ids) == 0:
             logger.warning("No blocks to push for request %s", request_id)
@@ -672,6 +700,28 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 f"{len(local_block_ids[i])} local vs "
                 f"{len(remote_block_ids[i])} remote blocks"
             )
+
+        if self.dcp_size != remote_info.remote_dcp_size:
+            if self.pp_size != 1:
+                raise RuntimeError(
+                    "NixlPush asymmetric DCP does not support a PP-sharded producer."
+                )
+            coverage = tuple(
+                (
+                    self._asymmetric_dcp_group_start(
+                        i, remote_info, remote_num_computed_blocks
+                    ),
+                    len(group),
+                )
+                if _is_attention_spec(self._group_spec_types[i])
+                else (-1, 0)
+                for i, group in enumerate(remote_block_ids)
+            )
+            notif_id = PUSH_DONE_NOTIF_PREFIX + msgspec.msgpack.encode(
+                (remote_request_id, self.world_size, self.dcp_rank, coverage)
+            )
+        else:
+            notif_id = f"{remote_request_id}:{self.world_size}".encode()
 
         # Get descs ids.
         remote_block_descs_ids = self._compute_desc_ids(
@@ -743,26 +793,128 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             except queue.Empty:
                 break
 
-            msg = notif.decode("utf-8")
-            if msg.startswith("HB:"):
-                self._handle_heartbeat(msg[3:])
-                continue
-
-            req_id, tp_size = msg.rsplit(":", 1)
+            coverage = None
+            producer_dcp_rank = None
+            if notif.startswith(PUSH_DONE_NOTIF_PREFIX):
+                try:
+                    payload = msgspec.msgpack.decode(
+                        notif[len(PUSH_DONE_NOTIF_PREFIX) :]
+                    )
+                except msgspec.DecodeError:
+                    logger.error("Malformed PUSH_DONE notification")
+                    continue
+                if not isinstance(payload, (list, tuple)) or len(payload) != 4:
+                    malformed_req_id = (
+                        payload[0]
+                        if isinstance(payload, (list, tuple)) and payload
+                        else None
+                    )
+                    if (
+                        isinstance(malformed_req_id, str)
+                        and malformed_req_id in self._recving_metadata
+                    ):
+                        self._reject_push_done(
+                            malformed_req_id, "malformed PUSH_DONE notification"
+                        )
+                    else:
+                        logger.error("Malformed PUSH_DONE notification")
+                    continue
+                req_id, tp_size, producer_dcp_rank, raw_coverage = payload
+                if (
+                    not isinstance(req_id, str)
+                    or not isinstance(tp_size, int)
+                    or not isinstance(producer_dcp_rank, int)
+                ):
+                    if isinstance(req_id, str) and req_id in self._recving_metadata:
+                        self._reject_push_done(req_id, "malformed PUSH_DONE identity")
+                    else:
+                        logger.error("Malformed PUSH_DONE identity: %r", payload)
+                    continue
+                try:
+                    coverage = tuple(
+                        (int(start), int(count)) for start, count in raw_coverage
+                    )
+                except (TypeError, ValueError):
+                    if req_id in self._recving_metadata:
+                        self._reject_push_done(req_id, "malformed PUSH_DONE coverage")
+                    else:
+                        logger.error("Malformed PUSH_DONE coverage for %s", req_id)
+                    continue
+            else:
+                msg = notif.decode("utf-8")
+                if msg.startswith("HB:"):
+                    self._handle_heartbeat(msg[3:])
+                    continue
+                req_id, tp_size_text = msg.rsplit(":", 1)
+                tp_size = int(tp_size_text)
 
             # Not tracked as a P-side send/process for this notif.
             if req_id not in self._reqs_to_send and req_id not in self._reqs_to_process:
+                if req_id in self._recv_failures:
+                    continue
                 if (meta := self._recving_metadata.get(req_id)) is not None:
+                    assert meta.remote is not None
+                    remote_info = self.transfer_topo.get_engine_info(
+                        meta.remote.engine_id
+                    )
+                    asymmetric_dcp = self.dcp_size != remote_info.remote_dcp_size
+                    if asymmetric_dcp:
+                        if coverage is None or producer_dcp_rank is None:
+                            self._reject_push_done(
+                                req_id,
+                                "missing v12 asymmetric-DCP coverage certificate",
+                            )
+                            continue
+                        if len(coverage) != len(meta.local_physical_block_ids):
+                            self._reject_push_done(
+                                req_id, "coverage cache-group count mismatch"
+                            )
+                            continue
+                        producer_dcp_rank = int(producer_dcp_rank)
+                        by_rank = self._push_coverage_by_req[req_id]
+                        if producer_dcp_rank in by_rank:
+                            self._reject_push_done(
+                                req_id,
+                                f"duplicate producer DCP rank {producer_dcp_rank}",
+                            )
+                            continue
+                        by_rank[producer_dcp_rank] = coverage
                     # Consumer waits for one notif per producer rank writing
                     # here: pp_size stages * producers-per-consumer (>1 when
                     # producer TP > consumer TP; tp_size is the producer TP).
-                    producers_per_consumer = max(1, int(tp_size) // self.world_size)
-                    expected_notifs = meta.pp_size * producers_per_consumer
+                    if asymmetric_dcp:
+                        if meta.pp_size != 1:
+                            self._reject_push_done(
+                                req_id,
+                                "asymmetric DCP does not support PP>1 producers",
+                            )
+                            continue
+                        expected_notifs = remote_info.remote_dcp_size
+                    else:
+                        producers_per_consumer = max(
+                            1, int(tp_size) // self.world_size
+                        )
+                        expected_notifs = meta.pp_size * producers_per_consumer
                     self.consumer_notification_counts_by_req[req_id] += 1
                     notifs = self.consumer_notification_counts_by_req[req_id]
                     if notifs < expected_notifs:
                         continue
                     del self.consumer_notification_counts_by_req[req_id]
+                    if asymmetric_dcp:
+                        aggregate = self._validate_push_coverage(
+                            req_id,
+                            remote_info.remote_dcp_size,
+                            tuple(
+                                len(group)
+                                * self.transfer_topo.block_size_ratio(
+                                    remote_info.remote_block_size
+                                )
+                                for group in meta.local_physical_block_ids
+                            ),
+                        )
+                        if aggregate is None:
+                            continue
+                        meta.aggregate_remote_coverage = aggregate
                     # P drove the transfer (we own no NIXL handle), so
                     # materialise an empty ``_recving_transfers`` entry for
                     # ``_pop_done_transfers`` to report done.
@@ -790,6 +942,63 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 self._reqs_to_send.pop(req_id, None)
         return notified_req_ids
 
+    def _reject_push_done(self, req_id: str, reason: str) -> None:
+        logger.error("Rejecting PUSH_DONE for %s: %s", req_id, reason)
+        self.consumer_notification_counts_by_req.pop(req_id, None)
+        self._push_coverage_by_req.pop(req_id, None)
+        self._recv_failures.add(req_id)
+        self._failed_recv_reqs.put(req_id)
+        self._recving_transfers.setdefault(req_id, [])
+
+    def _validate_push_coverage(
+        self,
+        req_id: str,
+        producer_dcp_size: int,
+        local_group_capacities: tuple[int, ...],
+    ) -> tuple[int, ...] | None:
+        by_rank = self._push_coverage_by_req.pop(req_id, {})
+        if set(by_rank) != set(range(producer_dcp_size)):
+            self._reject_push_done(req_id, "producer DCP identities are incomplete")
+            return None
+
+        aggregate: list[int] = []
+        for group_idx, capacity in enumerate(local_group_capacities):
+            if not _is_attention_spec(self._group_spec_types[group_idx]):
+                if any(
+                    certificate[group_idx] != (-1, 0)
+                    for certificate in by_rank.values()
+                ):
+                    self._reject_push_done(req_id, "invalid SSM coverage")
+                    return None
+                aggregate.append(0)
+                continue
+
+            counts_by_residue: dict[int, int] = {}
+            for certificate in by_rank.values():
+                start, count = certificate[group_idx]
+                if (
+                    count < 0
+                    or not 0 <= start < producer_dcp_size
+                    or start in counts_by_residue
+                ):
+                    self._reject_push_done(req_id, "invalid coverage range")
+                    return None
+                counts_by_residue[start] = count
+            covered = sum(counts_by_residue.values())
+            full_rounds, remainder = divmod(covered, producer_dcp_size)
+            expected_counts = {
+                residue: full_rounds + int(residue < remainder)
+                for residue in range(producer_dcp_size)
+            }
+            if counts_by_residue != expected_counts:
+                self._reject_push_done(req_id, "coverage has a gap or overlap")
+                return None
+            if covered > capacity:
+                self._reject_push_done(req_id, "coverage exceeds local capacity")
+                return None
+            aggregate.append(covered)
+        return tuple(aggregate)
+
     def get_transfer_results(self) -> KVConnectorTransferResults:
         # Engine main thread asking for completions: also wake the writer
         # so it gets a chance to drain NIXL notifs (heartbeats, completion
@@ -798,6 +1007,8 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
         results = super().get_transfer_results()
         done_sending = results.finished_sending
+        for req_id in results.finished_recving:
+            self._push_coverage_by_req.pop(req_id, None)
 
         # ``_pop_done_transfers`` mutates ``_sending_transfers``; the
         # writer thread also appends to it, so guard the pop.
