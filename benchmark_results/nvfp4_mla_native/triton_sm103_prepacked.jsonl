@@ -1,0 +1,10 @@
+{"batch":1,"capability":[10,3],"context":128,"finite":true,"gpu":"NVIDIA GB300","heads":128,"latency_ms":0.2808192014694214,"output_norm":6.834561824798584,"tma":false}
+{"batch":1,"capability":[10,3],"context":1024,"finite":true,"gpu":"NVIDIA GB300","heads":128,"latency_ms":0.3348207950592041,"output_norm":6.822428226470947,"tma":false}
+{"batch":1,"capability":[10,3],"context":4096,"finite":true,"gpu":"NVIDIA GB300","heads":128,"latency_ms":0.35178399085998535,"output_norm":6.825774669647217,"tma":false}
+{"batch":1,"capability":[10,3],"context":16384,"finite":true,"gpu":"NVIDIA GB300","heads":128,"latency_ms":0.3534048080444336,"output_norm":6.823812961578369,"tma":false}
+{"batch":1,"capability":[10,3],"context":65536,"finite":true,"gpu":"NVIDIA GB300","heads":128,"latency_ms":0.3744879961013794,"output_norm":7.203081130981445,"tma":false}
+{"batch":1,"capability":[10,3],"context":128,"finite":true,"gpu":"NVIDIA GB300","heads":128,"latency_ms":0.3227936029434204,"output_norm":6.8411970138549805,"tma":true}
+{"batch":1,"capability":[10,3],"context":1024,"finite":true,"gpu":"NVIDIA GB300","heads":128,"latency_ms":0.3452735900878906,"output_norm":6.813499450683594,"tma":true}
+{"batch":1,"capability":[10,3],"context":4096,"finite":true,"gpu":"NVIDIA GB300","heads":128,"latency_ms":0.4035056114196777,"output_norm":6.8242340087890625,"tma":true}
+{"batch":1,"capability":[10,3],"context":16384,"finite":true,"gpu":"NVIDIA GB300","heads":128,"latency_ms":0.3854543924331665,"output_norm":6.826190948486328,"tma":true}
+{"batch":1,"capability":[10,3],"context":65536,"finite":true,"gpu":"NVIDIA GB300","heads":128,"latency_ms":0.3945039987564087,"output_norm":7.205312252044678,"tma":true}
