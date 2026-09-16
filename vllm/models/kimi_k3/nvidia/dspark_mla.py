@@ -205,12 +205,18 @@ class K3DSparkModel(nn.Module):
         context_states: torch.Tensor,
         context_positions: torch.Tensor,
         context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None = None,
+        context_query_start_loc: torch.Tensor | None = None,
+        state_indices: torch.Tensor | None = None,
     ) -> None:
         """Project target-derived context into each draft layer's latent cache."""
         if not hasattr(self, "_num_context_layers"):
             self._build_fused_context_kv_metadata()
         self._precompute_fused_context_kv(
-            context_states, context_positions, context_slot_mapping
+            context_states,
+            context_positions,
+            context_slot_mapping,
+            context_query_start_loc,
+            state_indices,
         )
 
     def _build_fused_context_kv_metadata(self) -> None:
@@ -250,6 +256,8 @@ class K3DSparkModel(nn.Module):
         context_states: torch.Tensor,
         context_positions: torch.Tensor,
         context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None,
+        context_query_start_loc: torch.Tensor | None,
+        state_indices: torch.Tensor | None,
     ) -> None:
         num_ctx = context_states.shape[0]
         num_layers = self._num_context_layers
@@ -298,6 +306,46 @@ class K3DSparkModel(nn.Module):
 
         cache_layers = [layer.self_attn for layer in self.layers]
         cache_dtype = cache_layers[0].kv_cache_dtype
+        if cache_dtype == "nvfp4_kimi_k3":
+            if context_query_start_loc is None or state_indices is None:
+                raise ValueError(
+                    "Kimi-K3 NVFP4 DSpark context insertion requires request "
+                    "boundaries and persistent state indices."
+                )
+            from vllm.v1.attention.backends.mla.kimi_k3_nvfp4_native import (
+                update_kimi_k3_nvfp4_prefill_cache,
+            )
+
+            for layer_idx, layer in enumerate(self.layers):
+                slot_mapping = (
+                    context_slot_mapping[layer_idx]
+                    if isinstance(context_slot_mapping, (list, tuple))
+                    else context_slot_mapping
+                )
+                if slot_mapping is None:
+                    continue
+                attn = layer.self_attn
+                latent = torch.cat(
+                    (all_kv_c_normed[layer_idx], all_k_pe[layer_idx].squeeze(1)),
+                    dim=-1,
+                )
+                # DSpark has already applied global-position RoPE to k_pe.
+                # PROCESS_Q=False makes this tensor shape-only for the native writer.
+                query_dummy = latent.unsqueeze(1)
+                update_kimi_k3_nvfp4_prefill_cache(
+                    attn,
+                    latent=latent,
+                    query=query_dummy,
+                    cache=attn.kv_cache,
+                    slot_mapping=slot_mapping,
+                    positions=context_positions,
+                    query_start_loc=context_query_start_loc,
+                    state_indices=state_indices,
+                    rotary_cos_sin=None,
+                    max_state_slots=attn._nvfp4_max_state_slots,
+                    max_rewind=attn._nvfp4_max_rewind,
+                )
+            return
         if (
             cache_dtype in _GROUPED_KV_CACHE_DTYPES
             and all(cl.kv_cache_dtype == cache_dtype for cl in cache_layers)
@@ -411,6 +459,8 @@ class K3DSparkModel(nn.Module):
 
 
 class K3DSparkForCausalLM(nn.Module):
+    supports_persistent_context_cache_state = True
+
     has_own_embed_tokens = False
     has_own_lm_head = False
     draft_id_to_target_id = None
@@ -465,9 +515,15 @@ class K3DSparkForCausalLM(nn.Module):
         context_states: torch.Tensor,
         context_positions: torch.Tensor,
         context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None = None,
+        context_query_start_loc: torch.Tensor | None = None,
+        state_indices: torch.Tensor | None = None,
     ) -> None:
         self.model.precompute_and_store_context_kv(
-            context_states, context_positions, context_slot_mapping
+            context_states,
+            context_positions,
+            context_slot_mapping,
+            context_query_start_loc,
+            state_indices,
         )
 
     def forward(

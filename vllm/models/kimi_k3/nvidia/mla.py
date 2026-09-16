@@ -681,6 +681,12 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
                     positions, q[..., self.qk_nope_head_dim :], k_pe
                 )
+                # The K3 RoPE table is FP32, so the unfused rotary path returns
+                # an FP32 key tail.  Restore the activation dtype before
+                # concatenating it with the BF16 latent for native FP4 cache
+                # quantization.  Assignment into the Q slice above already
+                # performs the corresponding cast for Q.
+                k_pe = k_pe.to(kv_c_normed.dtype)
                 # Native FP4 cache addressing is DCP-local, while RoPE positions
                 # are global. Rotate before cache insertion to keep those two
                 # coordinate systems independent.
@@ -1269,7 +1275,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                         dcp_rank=dcp_rank,
                         cp_kv_cache_interleave_size=(self.cp_kv_cache_interleave_size),
                     )
-                run_kimi_k3_nvfp4_attention(
+                max_scores, denom = run_kimi_k3_nvfp4_attention(
                     self.impl,
                     q_fp4=q_fp4,
                     q_sf=q_sf,
@@ -1281,9 +1287,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                     sm_scale=self.scale,
                 )
                 if self.dcp_world_size > 1:
-                    lse = self.impl._kimi_k3_nvfp4_max + torch.log(  # type: ignore[attr-defined]
-                        self.impl._kimi_k3_nvfp4_denom  # type: ignore[attr-defined]
-                    )
+                    lse = max_scores + torch.log(denom)
                     lse.masked_fill_(seq_lens[:, None] == 0, float("-inf"))
                     latent_out = self.dcp_manager.combine(
                         latent_out,

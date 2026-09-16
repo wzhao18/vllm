@@ -66,6 +66,7 @@ def _prepare_dflash_inputs_to_capture(
             kv_cache_config=kv_cache_config,
             for_cudagraph_capture=True,
             causal=causal,
+            persistent_state_indices=input_batch.idx_mapping[:num_reqs],
         )
     return AttentionState(attn_metadata, slot_mappings_by_layer)
 

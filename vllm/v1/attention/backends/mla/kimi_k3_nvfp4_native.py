@@ -840,7 +840,10 @@ def update_kimi_k3_nvfp4_decode_cache(
     )
 
     if latent.dtype != torch.bfloat16 or latent.shape[-1] != 576:
-        raise ValueError("Kimi-K3 NVFP4 cache update requires BF16 [tokens, 576].")
+        raise ValueError(
+            "Kimi-K3 NVFP4 cache update requires BF16 [tokens, 576], "
+            f"but received dtype={latent.dtype}, shape={tuple(latent.shape)}."
+        )
     num_tokens = latent.shape[0]
     if num_tokens % query_len_per_seq:
         raise ValueError("Kimi-K3 NVFP4 decode tokens must be request-uniform.")
@@ -1246,12 +1249,14 @@ def run_kimi_k3_nvfp4_attention(
     output: torch.Tensor,
     query_len_per_seq: int,
     sm_scale: float,
-) -> None:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Run native FP4 QK/PV attention from a vLLM opaque cache page."""
-    if cache.shape[2] != FP4_MLA_TOKENS_PER_BLOCK:
+    # MLA layers squeeze the singleton head-slot axis when binding the cache,
+    # so accept both manager views [B, 1, N, C] and bound views [B, N, C].
+    if cache.shape[-2] != FP4_MLA_TOKENS_PER_BLOCK:
         raise ValueError(
             "Kimi-K3 NVFP4 attention requires a 128-token kernel page, got "
-            f"{cache.shape[2]}."
+            f"{cache.shape[-2]}."
         )
     num_queries, num_heads = output.shape[:2]
     if num_queries % query_len_per_seq:
@@ -1349,3 +1354,4 @@ def run_kimi_k3_nvfp4_attention(
         sm_scale=float(sm_scale),
         q_global_scale=q_global_scale,
     )
+    return max_scores, denom

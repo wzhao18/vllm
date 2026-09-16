@@ -420,10 +420,19 @@ class DFlashSpeculator(DraftModelSpeculator):
             ]
         else:
             context_slots = self._context_slot_mappings[0][:num_target_tokens]
+        context_cache_kwargs: dict[str, torch.Tensor] = {}
+        if getattr(self.model, "supports_persistent_context_cache_state", False):
+            context_cache_kwargs = {
+                "context_query_start_loc": input_batch.query_start_loc[
+                    : num_reqs + 1
+                ],
+                "state_indices": input_batch.idx_mapping[:num_reqs],
+            }
         self.model.precompute_and_store_context_kv(
             self.hidden_states[:num_target_tokens],
             self.context_positions[:num_target_tokens],
             context_slots,
+            **context_cache_kwargs,
         )
 
         batch_sync, num_batch_tokens = (

@@ -2075,13 +2075,12 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
             tl.static_assert(STORE_K_RESIDUAL)
             tl.static_assert(HEAD_D - K_RESIDUAL_D == V_HEAD_D)
             tl.static_assert(K_RESIDUAL_D % FP4_BLOCK == 0)
-            position = first_new_pos.to(tl.int64)
-            if USE_EXTERNAL_ROPE_POSITIONS:
-                position = tl.load(rope_positions_ptr + latent_token).to(tl.int64)
-            if position < 0:
+            latent_token = seq_idx * QUERY_STRIDE + prompt_offset
+            storage_position = first_new_pos.to(tl.int64)
+            if storage_position < 0:
                 return
-            page_idx = position // page_size
-            page_pos = position - page_idx * page_size
+            page_idx = storage_position // page_size
+            page_pos = storage_position - page_idx * page_size
             physical_page_offset = page_start + page_idx
             if (
                 (page_pos < 0)
@@ -2101,7 +2100,6 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
             if (hp_index < 0) | (hp_index >= num_hp_pages):
                 return
 
-            latent_token = seq_idx * QUERY_STRIDE + prompt_offset
             tail_byte_offsets = tl.arange(0, K_RESIDUAL_D // 2)
             tail_even_d = V_HEAD_D + tail_byte_offsets * 2
             tail_odd_d = tail_even_d + 1
@@ -2117,7 +2115,16 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
             ).to(tl.float32)
             rope_pair_offsets = tail_byte_offsets
             if APPLY_ROPE:
-                rotary_offsets = position * (ROPE_DIM * 2) + rope_pair_offsets * 2
+                rope_position = storage_position
+                if USE_EXTERNAL_ROPE_POSITIONS:
+                    rope_position = tl.load(
+                        rope_positions_ptr + latent_token
+                    ).to(tl.int64)
+                if rope_position < 0:
+                    return
+                rotary_offsets = (
+                    rope_position * (ROPE_DIM * 2) + rope_pair_offsets * 2
+                )
                 cos = tl.load(rotary_cos_sin_ptr + rotary_offsets).to(tl.float32)
                 sin = tl.load(rotary_cos_sin_ptr + rotary_offsets + 1).to(tl.float32)
                 tail_even, tail_odd = _fp4_mla_rope_fp32(tail_even, tail_odd, cos, sin)
@@ -2205,7 +2212,7 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
                 residual_stored_scale,
             )
 
-            hp_slot = position % HP_POOL_SIZE
+            hp_slot = storage_position % HP_POOL_SIZE
             hp_store_base = (
                 hp_pool_ptr
                 + hp_index * pool_s0

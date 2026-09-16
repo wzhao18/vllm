@@ -173,13 +173,16 @@ class KimiK3NVFP4MLAImpl(MLACommonImpl[KimiK3NVFP4Metadata]):
             )
         if attn_type != AttentionType.DECODER:
             raise NotImplementedError("Kimi-K3 NVFP4 supports decoder attention only.")
+        # The native cache stores the 512-wide compressed KV latent plus the
+        # 64-wide RoPE key. v_head_dim is the post-kv_b_proj value width; it
+        # is part of K3's model contract but is not the cached value width.
         if (
             self.kv_lora_rank,
             self.qk_rope_head_dim,
             self.v_head_dim,
-        ) != (512, 64, 512):
+        ) != (512, 64, 128):
             raise ValueError(
-                "Kimi-K3 NVFP4 requires MLA dimensions (512, 64, 512), got "
+                "Kimi-K3 NVFP4 requires MLA dimensions (512, 64, 128), got "
                 f"({self.kv_lora_rank}, {self.qk_rope_head_dim}, "
                 f"{self.v_head_dim})."
             )
@@ -213,7 +216,7 @@ class KimiK3NVFP4MLAImpl(MLACommonImpl[KimiK3NVFP4Metadata]):
             dtype=torch.bfloat16,
             device=q_fp4.device,
         )
-        run_kimi_k3_nvfp4_attention(
+        max_scores, denom = run_kimi_k3_nvfp4_attention(
             self,
             q_fp4=q_fp4,
             q_sf=q_sf,
@@ -224,5 +227,8 @@ class KimiK3NVFP4MLAImpl(MLACommonImpl[KimiK3NVFP4Metadata]):
             query_len_per_seq=query_len,
             sm_scale=self.scale,
         )
-        lse = self._kimi_k3_nvfp4_max + torch.log(self._kimi_k3_nvfp4_denom)
+        # Use the active views returned by the workspace helper.  The backing
+        # allocations can be larger after warmup, whereas DCP requires LSE to
+        # match the current output's exact [tokens, heads] shape.
+        lse = max_scores + torch.log(denom)
         return output, lse if self.need_to_return_lse_for_decode else None
