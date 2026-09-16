@@ -1591,6 +1591,7 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
     Q1_KV_BLOCKS_PER_PROGRAM: tl.constexpr,
     USE_EXTERNAL_ROPE_POSITIONS: tl.constexpr,
     QUERY_STRIDE: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
     PROCESS_Q: tl.constexpr,
 ):
     q1_shared_main: tl.constexpr = FUSE_ROPE_CACHE_STORE and MAX_GEN_TILES == 1
@@ -2262,7 +2263,14 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
         new_token_offsets = abs_positions - first_new_pos
         # Linear MTP uses a uniform generation length, so each sequence
         # occupies one contiguous gen_len slice in latent_cache.
-        latent_tokens = seq_idx * QUERY_STRIDE + prompt_offset + new_token_offsets
+        # vLLM keeps the current query in global-token order under DCP. With
+        # interleave size one, a rank's cache rows therefore come from source
+        # rows r, r + DCP_SIZE, ... rather than a contiguous TRT-LLM slice.
+        latent_tokens = (
+            seq_idx * QUERY_STRIDE
+            + prompt_offset
+            + new_token_offsets * DCP_SIZE
+        )
         safe_latent_tokens = tl.where(valid_tokens & from_latent, latent_tokens, 0).to(
             tl.int64
         )

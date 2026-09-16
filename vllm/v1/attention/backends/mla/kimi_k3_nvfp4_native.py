@@ -1017,6 +1017,7 @@ def update_kimi_k3_nvfp4_decode_cache(
         Q1_KV_BLOCKS_PER_PROGRAM=1,
         USE_EXTERNAL_ROPE_POSITIONS=positions is not None,
         QUERY_STRIDE=query_len_per_seq,
+        DCP_SIZE=getattr(owner, "dcp_world_size", 1),
         PROCESS_Q=apply_rope,
         maxnreg=56,
     )

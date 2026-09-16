@@ -373,6 +373,15 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         )
         self.dcp_world_size = parallel_config.decode_context_parallel_size
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
+        if (
+            self.kv_cache_dtype == "nvfp4_kimi_k3"
+            and self.dcp_world_size > 1
+            and self.cp_kv_cache_interleave_size != 1
+        ):
+            raise NotImplementedError(
+                "Kimi-K3 NVFP4 DCP currently requires "
+                "cp_kv_cache_interleave_size=1."
+            )
         self.dcp_manager: MLADCPManager | None = None
         if self.dcp_world_size > 1:
             query_dtype = (
