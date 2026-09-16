@@ -126,12 +126,13 @@ full GSM8K benchmark.
 |---|---:|---:|---:|---:|
 | `nvfp4_kimi_k3` / native | 32 / 32 | 3,349 | 204.42 | 16.38 |
 | `fp8` / TOKENSPEED_MLA | 32 / 32 | 3,393 | 48.46 | 70.01 |
+| `fp8` / FLASHINFER_MLA | 32 / 32 | 3,389 | 52.17 | 64.96 |
 
 Before per-query DCP causal localization, NVFP4 scored 25/32 and reached only
 6.93 output tok/s, so the correction addresses both wrong masking and a large
 part of the observed slowdown. Native Triton is nevertheless 4.27x slower than
-FP8/Tokenspeed on this batched DSpark workload and is not yet performance
-competitive.
+FP8/Tokenspeed and 3.97x slower than FP8/FlashInfer on this batched DSpark
+workload, so it is not yet performance competitive.
 
 With the real-weight batch-8 configuration, vLLM reported 617,378 cache tokens
 for NVFP4 versus 600,250 for FP8 (+2.85% end-to-end capacity). A simpler dummy
