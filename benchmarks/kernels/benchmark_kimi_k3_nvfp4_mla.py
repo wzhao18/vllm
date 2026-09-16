@@ -131,6 +131,29 @@ def load_backend(source_dir: str):
     return module
 
 
+def load_vllm_adapter(source_dir: str):
+    import triton
+
+    package_name = "vllm_native_fp4_mla"
+    package = types.ModuleType(package_name)
+    package.__path__ = [source_dir]
+    sys.modules[package_name] = package
+    vllm = types.ModuleType("vllm")
+    triton_utils = types.ModuleType("vllm.triton_utils")
+    triton_utils.triton = triton
+    sys.modules["vllm"] = vllm
+    sys.modules["vllm.triton_utils"] = triton_utils
+    module_name = f"{package_name}.kimi_k3_nvfp4_native"
+    spec = importlib.util.spec_from_file_location(
+        module_name, os.path.join(source_dir, "kimi_k3_nvfp4_native.py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 class CacheManager:
     def __init__(self, kv, sf, v_sf):
         self.kv = kv
@@ -150,7 +173,7 @@ class CacheManager:
         return self.v_sf.view(torch.uint8).flatten(0, 1)
 
 
-def build_case(fp4, batch: int, heads: int, context: int):
+def build_case(fp4, batch: int, heads: int, context: int, *, opaque_vllm_cache: bool):
     device = torch.device("cuda")
     page = fp4.FP4_MLA_TOKENS_PER_BLOCK
     pages_per_seq = (context + page - 1) // page
@@ -167,15 +190,54 @@ def build_case(fp4, batch: int, heads: int, context: int):
         dtype=torch.uint8,
     )
     high = torch.randint(0, 8, low.shape, device=device, dtype=torch.uint8)
-    kv = low | (high << 4)
-    sf = torch.ones(
-        (total_pages, page, storage_dim // 16), device=device, dtype=torch.float8_e4m3fn
-    )
-    v_sf = torch.ones(
-        (1, total_pages, fp4.get_fp4_mla_v_scale_pool_size(512, page)),
-        device=device,
-        dtype=torch.float8_e4m3fn,
-    )
+    packed = low | (high << 4)
+    v_sf_page_bytes = fp4.get_fp4_mla_v_scale_pool_size(512, page)
+    if opaque_vllm_cache:
+        # vLLM allocates one opaque [B, H=1, N=128, C=392] byte page.
+        # Native consumers reinterpret three page-major regions without copies.
+        bytes_per_token = storage_dim // 2 + storage_dim // 16 + 32
+        raw = torch.empty(
+            (total_pages, 1, page, bytes_per_token),
+            device=device,
+            dtype=torch.uint8,
+        )
+        page_stride = raw.stride(0)
+        base = raw.storage_offset()
+        data_bytes = page * (storage_dim // 2)
+        sf_bytes = page * (storage_dim // 16)
+        kv = torch.as_strided(
+            raw,
+            (total_pages, 1, page, 1, storage_dim // 2),
+            (page_stride, data_bytes, storage_dim // 2, storage_dim // 2, 1),
+            base,
+        )
+        sf = torch.as_strided(
+            raw,
+            (total_pages, page, storage_dim // 16),
+            (page_stride, storage_dim // 16, 1),
+            base + data_bytes,
+        ).view(torch.float8_e4m3fn)
+        v_sf = torch.as_strided(
+            raw,
+            (1, total_pages, v_sf_page_bytes),
+            (total_pages * page_stride, page_stride, 1),
+            base + data_bytes + sf_bytes,
+        ).view(torch.float8_e4m3fn)
+        kv.copy_(packed)
+        sf.fill_(1.0)
+        v_sf.fill_(1.0)
+    else:
+        kv = packed
+        sf = torch.ones(
+            (total_pages, page, storage_dim // 16),
+            device=device,
+            dtype=torch.float8_e4m3fn,
+        )
+        v_sf = torch.ones(
+            (1, total_pages, v_sf_page_bytes),
+            device=device,
+            dtype=torch.float8_e4m3fn,
+        )
     manager = CacheManager(kv, sf, v_sf)
 
     page_ids = torch.arange(total_pages, device=device, dtype=torch.int32)
@@ -232,6 +294,9 @@ def main():
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--validate", action="store_true")
+    parser.add_argument("--opaque-vllm-cache", action="store_true")
+    parser.add_argument("--validate-vllm-adapter", action="store_true")
+    parser.add_argument("--validate-cache-update", action="store_true")
     args = parser.parse_args()
 
     os.environ.setdefault("TRTLLM_FP4_MLA_ATTENTION_BACKEND", "triton")
@@ -254,7 +319,11 @@ def main():
             # Another Rubin CTM scheduling hint absent from the public DSL.
             cute.nvgpu.warp_switch = lambda: None
     metadata, q, packed_q, q_sf, output = build_case(
-        fp4, args.batch, args.heads, args.context
+        fp4,
+        args.batch,
+        args.heads,
+        args.context,
+        opaque_vllm_cache=args.opaque_vllm_cache,
     )
 
     def run():
@@ -288,6 +357,7 @@ def main():
         "capability": torch.cuda.get_device_capability(),
         "batch": args.batch,
         "heads": args.heads,
+        "layout": "vllm-opaque" if args.opaque_vllm_cache else "split",
         "context": args.context,
         "latency_ms": ms,
         "finite": bool(torch.isfinite(output).all().item()),
@@ -297,6 +367,246 @@ def main():
         result.update(
             validate_output(fp4, metadata, packed_q, q_sf, output, args.context, 0.1)
         )
+    if args.validate_vllm_adapter:
+        if not args.opaque_vllm_cache:
+            raise ValueError("--validate-vllm-adapter requires --opaque-vllm-cache")
+        adapter_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+            "vllm",
+            "v1",
+            "attention",
+            "backends",
+            "mla",
+        )
+        adapter = load_vllm_adapter(adapter_dir)
+        query = torch.randn(
+            (args.batch, args.heads, 576),
+            dtype=torch.bfloat16,
+            device=output.device,
+        )
+        adapter_q, adapter_q_sf = adapter.quantize_kimi_k3_nvfp4_query(
+            SimpleNamespace(), query
+        )
+        dequant_q = dequant_fp4(
+            adapter_q,
+            adapter_q_sf,
+            640,
+            adapter.FP4_MLA_Q_GLOBAL_SCALE,
+        )
+        physical_tail = dequant_q[:, 512:].reshape(-1, 4, 2, 16)
+        tail_main = physical_tail[:, :, 0, :].reshape(-1, 64)
+        tail_residual = physical_tail[:, :, 1, :].reshape(-1, 64)
+        query_2d = query.float().view(-1, 576)
+        restored_q = torch.cat((dequant_q[:, :512], tail_main + tail_residual), dim=-1)
+        query_error = restored_q - query_2d
+        result["q_quant_rel_l2"] = float(
+            torch.linalg.vector_norm(query_error)
+            / torch.linalg.vector_norm(query.float())
+        )
+        result["q_prefix_quant_rel_l2"] = float(
+            torch.linalg.vector_norm(query_error[:, :512])
+            / torch.linalg.vector_norm(query_2d[:, :512])
+        )
+        result["q_rope_main_rel_l2"] = float(
+            torch.linalg.vector_norm(tail_main - query_2d[:, 512:])
+            / torch.linalg.vector_norm(query_2d[:, 512:])
+        )
+        result["q_rope_residual_norm"] = float(
+            torch.linalg.vector_norm(tail_residual)
+            / torch.linalg.vector_norm(query_2d[:, 512:])
+        )
+        result["q_rope_quant_rel_l2"] = float(
+            torch.linalg.vector_norm(query_error[:, 512:])
+            / torch.linalg.vector_norm(query.float().view(-1, 576)[:, 512:])
+        )
+        manager = metadata.kv_cache_manager
+        raw = torch.as_strided(
+            manager.kv,
+            (
+                manager.kv.shape[0],
+                1,
+                fp4.FP4_MLA_TOKENS_PER_BLOCK,
+                adapter.FP4_MLA_BYTES_PER_TOKEN,
+            ),
+            (
+                manager.kv.stride(0),
+                manager.kv.stride(1),
+                adapter.FP4_MLA_BYTES_PER_TOKEN,
+                1,
+            ),
+            manager.kv.storage_offset(),
+        )
+        adapter_output = torch.empty_like(output)
+        adapter_owner = SimpleNamespace()
+        pages_per_seq = (args.context + fp4.FP4_MLA_TOKENS_PER_BLOCK - 1) // (
+            fp4.FP4_MLA_TOKENS_PER_BLOCK
+        )
+        adapter.run_kimi_k3_nvfp4_attention(
+            adapter_owner,
+            q_fp4=packed_q,
+            q_sf=q_sf,
+            cache=raw,
+            block_table=metadata._paged_kv_indices.view(args.batch, pages_per_seq),
+            seq_lens=metadata.kv_lens_cuda_runtime,
+            output=adapter_output,
+            query_len_per_seq=1,
+            sm_scale=0.1,
+        )
+        torch.cuda.synchronize()
+        adapter_error = adapter_output.float() - output.float()
+        result["adapter_max_abs"] = float(adapter_error.abs().max().item())
+        result["adapter_rel_l2"] = float(
+            torch.linalg.vector_norm(adapter_error)
+            / torch.linalg.vector_norm(output.float())
+        )
+        if args.validate_cache_update:
+            update_cache = torch.zeros(
+                (
+                    1,
+                    1,
+                    fp4.FP4_MLA_TOKENS_PER_BLOCK,
+                    adapter.FP4_MLA_BYTES_PER_TOKEN,
+                ),
+                dtype=torch.uint8,
+                device=output.device,
+            )
+            update_latent = torch.randn(
+                (1, 576), dtype=torch.bfloat16, device=output.device
+            )
+            update_q_pe = torch.randn(
+                (1, args.heads, 64), dtype=torch.bfloat16, device=output.device
+            )
+            update_owner = SimpleNamespace()
+            updated_q_pe = adapter.update_kimi_k3_nvfp4_decode_cache(
+                update_owner,
+                latent=update_latent,
+                q_pe=update_q_pe,
+                cache=update_cache,
+                block_table=torch.zeros(
+                    (1, 1), dtype=torch.int32, device=output.device
+                ),
+                seq_lens=torch.ones(1, dtype=torch.int32, device=output.device),
+                state_indices=torch.zeros(1, dtype=torch.int32, device=output.device),
+                slot_mapping=torch.zeros(1, dtype=torch.int64, device=output.device),
+                positions=None,
+                query_len_per_seq=1,
+                rotary_cos_sin=None,
+                max_state_slots=1,
+                max_rewind=0,
+            )
+            torch.cuda.synchronize()
+            update_kv, update_sf, _ = adapter.split_kimi_k3_nvfp4_cache(update_cache)
+            update_dequant = dequant_fp4(
+                update_kv[0, 0, 0],
+                update_sf[0],
+                640,
+                adapter.FP4_MLA_KV_GLOBAL_SCALE,
+            )[0]
+            restored_k = torch.cat(
+                (
+                    update_dequant[:512],
+                    update_dequant[512:576] + update_dequant[576:],
+                )
+            )
+            update_error = restored_k - update_latent[0].float()
+            result["cache_update_rel_l2"] = float(
+                torch.linalg.vector_norm(update_error)
+                / torch.linalg.vector_norm(update_latent.float())
+            )
+            result["cache_update_norm_ratio"] = float(
+                torch.linalg.vector_norm(restored_k)
+                / torch.linalg.vector_norm(update_latent.float())
+            )
+            result["cache_update_nonzero_bytes"] = int(
+                torch.count_nonzero(update_cache).item()
+            )
+            result["cache_update_q_exact"] = bool(
+                torch.equal(updated_q_pe, update_q_pe)
+            )
+            dcp_cache = torch.zeros_like(update_cache)
+            dcp_latent = torch.randn(
+                (6, 576), dtype=torch.bfloat16, device=output.device
+            )
+            adapter.update_kimi_k3_nvfp4_decode_cache(
+                SimpleNamespace(),
+                latent=dcp_latent,
+                q_pe=torch.randn(
+                    (6, args.heads, 64),
+                    dtype=torch.bfloat16,
+                    device=output.device,
+                ),
+                cache=dcp_cache,
+                block_table=torch.zeros(
+                    (1, 1), dtype=torch.int32, device=output.device
+                ),
+                seq_lens=torch.tensor([3], dtype=torch.int32, device=output.device),
+                state_indices=torch.zeros(1, dtype=torch.int32, device=output.device),
+                slot_mapping=torch.tensor(
+                    [-1, -1, -1, 0, 1, 2],
+                    dtype=torch.int64,
+                    device=output.device,
+                ),
+                positions=None,
+                query_len_per_seq=6,
+                rotary_cos_sin=None,
+                max_state_slots=1,
+                max_rewind=5,
+            )
+            torch.cuda.synchronize()
+            dcp_kv, dcp_sf, _ = adapter.split_kimi_k3_nvfp4_cache(dcp_cache)
+            dcp_dequant = dequant_fp4(
+                dcp_kv[0, 0, 0],
+                dcp_sf[0],
+                640,
+                adapter.FP4_MLA_KV_GLOBAL_SCALE,
+            )[0]
+            restored_dcp = torch.cat(
+                (dcp_dequant[:512], dcp_dequant[512:576] + dcp_dequant[576:])
+            )
+            result["dcp_offset_update_rel_l2"] = float(
+                torch.linalg.vector_norm(restored_dcp - dcp_latent[3].float())
+                / torch.linalg.vector_norm(dcp_latent[3].float())
+            )
+            prefill_cache = torch.zeros_like(update_cache)
+            prefill_latent = torch.randn(
+                (16, 576), dtype=torch.bfloat16, device=output.device
+            )
+            prefill_query = torch.randn(
+                (16, args.heads, 192), dtype=torch.bfloat16, device=output.device
+            )
+            adapter.update_kimi_k3_nvfp4_prefill_cache(
+                SimpleNamespace(),
+                latent=prefill_latent,
+                query=prefill_query,
+                cache=prefill_cache,
+                slot_mapping=torch.arange(16, dtype=torch.int64, device=output.device),
+                positions=torch.arange(16, dtype=torch.int64, device=output.device),
+                query_start_loc=torch.tensor(
+                    [0, 16], dtype=torch.int32, device=output.device
+                ),
+                state_indices=torch.zeros(1, dtype=torch.int32, device=output.device),
+                rotary_cos_sin=None,
+                max_state_slots=1,
+                max_rewind=0,
+            )
+            torch.cuda.synchronize()
+            prefill_kv, prefill_sf, _ = adapter.split_kimi_k3_nvfp4_cache(prefill_cache)
+            prefill_dequant = dequant_fp4(
+                prefill_kv[0, 0, 0],
+                prefill_sf[0],
+                640,
+                adapter.FP4_MLA_KV_GLOBAL_SCALE,
+            )[0]
+            restored_prefill = torch.cat(
+                (
+                    prefill_dequant[:512],
+                    prefill_dequant[512:576] + prefill_dequant[576:],
+                )
+            )
+            result["prefill_update_rel_l2_token0"] = float(
+                torch.linalg.vector_norm(restored_prefill - prefill_latent[0].float())
+                / torch.linalg.vector_norm(prefill_latent[0].float())
+            )
     print(json.dumps(result, sort_keys=True))
 
 

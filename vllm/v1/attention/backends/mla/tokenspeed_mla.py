@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""TokenSpeed CuTe DSL MLA decode backend (Blackwell, FP8 execution)."""
+"""TokenSpeed CuTe DSL MLA decode backend (Blackwell, FP8 KV cache only)."""
 
 from typing import TYPE_CHECKING, ClassVar
 
@@ -26,7 +26,7 @@ from vllm.v1.attention.backend import (
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-    from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
+    from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
 
@@ -38,7 +38,6 @@ logger = init_logger(__name__)
 _TOKENSPEED_MAX_Q_LEN = 8
 
 _g_workspace: dict[torch.device, torch.Tensor] = {}
-_g_nvfp4_mla_staging: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
 
 
 def _get_workspace(
@@ -55,36 +54,6 @@ def _get_workspace(
     return _g_workspace[device]
 
 
-def _get_nvfp4_mla_staging(
-    device: torch.device,
-    num_page_refs: int,
-    block_size: int,
-    block_table_dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Get device-global staging shared by all layers on the same stream."""
-    head_size = 576
-    needed = num_page_refs * block_size * head_size
-    existing = _g_nvfp4_mla_staging.get(device)
-    if (
-        existing is None
-        or existing[0].numel() < needed
-        or existing[1].numel() < num_page_refs
-        or existing[1].dtype != block_table_dtype
-    ):
-        # Decode layers execute in stream order, so a single buffer can be
-        # overwritten by each layer. This avoids an FP8 cache-sized allocation
-        # for every model layer while retaining the NVFP4 persistent cache.
-        existing = (
-            torch.empty(needed, dtype=torch.float8_e4m3fn, device=device),
-            torch.arange(num_page_refs, dtype=block_table_dtype, device=device),
-        )
-        _g_nvfp4_mla_staging[device] = existing
-    return (
-        existing[0][:needed].view(num_page_refs, block_size, head_size),
-        existing[1][:num_page_refs],
-    )
-
-
 class TokenspeedMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.UNIFORM
@@ -92,20 +61,6 @@ class TokenspeedMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
     # block can remain fused instead of being flattened to single tokens.
     supports_non_causal_multi_token_decode: ClassVar[bool] = True
     supports_non_causal_multi_token_dcp: ClassVar[bool] = True
-
-    @classmethod
-    def get_cudagraph_support(
-        cls,
-        vllm_config: "VllmConfig",
-        kv_cache_spec: "KVCacheSpec",
-    ) -> AttentionCGSupport:
-        # CUDAGraph capture deliberately reports max_model_len as max_seq_len.
-        # The staged implementation must instead size its FP8 buffer from each
-        # eager batch's real max_seq_len, or a long-context model such as K3
-        # would reserve hundreds of GB during capture.
-        if getattr(kv_cache_spec, "cache_dtype_str", None) == "nvfp4":
-            return AttentionCGSupport.NEVER
-        return cls._cudagraph_support
 
     def __init__(
         self,
@@ -129,7 +84,6 @@ class TokenspeedMLABackend(MLACommonBackend):
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "fp8",
         "fp8_e4m3",
-        "nvfp4",
     ]
 
     @staticmethod
@@ -251,8 +205,8 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
 
         if not is_quantized_kv_cache(self.kv_cache_dtype):
             raise NotImplementedError(
-                "TokenspeedMLAImpl requires a quantized KV cache "
-                "(--kv-cache-dtype fp8, fp8_e4m3, or nvfp4); "
+                "TokenspeedMLAImpl requires an FP8 KV cache "
+                "(--kv-cache-dtype fp8 or fp8_e4m3); "
                 f"got kv_cache_dtype={self.kv_cache_dtype!r}."
             )
 
@@ -288,42 +242,6 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata.decode is not None
 
-        block_tables = attn_metadata.decode.block_table
-        # The runner's block-table allocation is sized for max_model_len, but
-        # this batch can only address pages below max_seq_len. Trimming the
-        # unused columns is particularly important for NVFP4 staging: without
-        # it a short request would allocate and convert a max-length FP8 table.
-        block_size = kv_c_and_k_pe_cache.shape[1]
-        active_block_columns = (
-            attn_metadata.max_seq_len + block_size - 1
-        ) // block_size
-        block_tables = block_tables[:, :active_block_columns]
-        if self.kv_cache_dtype == "nvfp4":
-            from vllm.v1.attention.backends.mla.nvfp4_mla import (
-                stage_nvfp4_mla_as_fp8,
-            )
-
-            num_page_refs = block_tables.numel()
-            required_shape = (
-                num_page_refs,
-                kv_c_and_k_pe_cache.shape[1],
-                self.kv_lora_rank + self.qk_rope_head_dim,
-            )
-            staging_cache, staging_block_table = _get_nvfp4_mla_staging(
-                kv_c_and_k_pe_cache.device,
-                num_page_refs,
-                block_size,
-                block_tables.dtype,
-            )
-            assert staging_cache.shape == required_shape
-            stage_nvfp4_mla_as_fp8(
-                kv_c_and_k_pe_cache,
-                block_tables,
-                staging_cache,
-            )
-            kv_c_and_k_pe_cache = staging_cache
-            block_tables = staging_block_table.view_as(block_tables)
-
         if isinstance(q, tuple):
             q_nope, q_pe = q
             q = torch.cat([q_nope, q_pe], dim=-1)
@@ -341,6 +259,7 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
 
         num_decodes = attn_metadata.num_decodes
         num_decode_tokens = attn_metadata.num_decode_tokens
+        block_tables = attn_metadata.decode.block_table
         seq_lens = attn_metadata.decode.seq_lens
         causal_seqs = attn_metadata.decode.dcp_tot_seq_lens
 

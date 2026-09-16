@@ -118,6 +118,7 @@ def _get_backend_priorities(
                     ]
 
             return [
+                AttentionBackendEnum.KIMI_K3_NVFP4_MLA,
                 AttentionBackendEnum.FLASHINFER_MLA,
                 # R1 dims + FP8 KV only; rejected by supports_combination
                 # otherwise. Behind FLASHINFER_MLA: wins past bs≈8, regresses

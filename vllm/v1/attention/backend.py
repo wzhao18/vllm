@@ -451,6 +451,13 @@ class CommonAttentionMetadata:
     table. Rows of one request are adjacent, so equal neighbours are PCP
     chunks sharing one KV context."""
 
+    persistent_state_indices: torch.Tensor | None = None
+    """Stable per-request state slots supplied by a hybrid recurrent group.
+
+    Specialized attention caches may use these for bounded state whose
+    lifetime follows the request rather than the full token history.
+    """
+
     mm_req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None
     """PrefixLM bidirectional ranges for multimodal tokens. Maps
     request index to list of (start, end) token position ranges

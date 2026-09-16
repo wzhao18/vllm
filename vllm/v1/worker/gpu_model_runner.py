@@ -2455,6 +2455,15 @@ class GPUModelRunner(
                 self.input_batch.replayssm_decode_base_cpu_tensor[:num_reqs_padded]
             )
 
+        persistent_state_indices = None
+        for state_gid, state_group in enumerate(kv_cache_groups):
+            if (
+                get_kv_cache_spec_kind(state_group.kv_cache_spec)
+                == KVCacheSpecKind.MAMBA
+            ):
+                persistent_state_indices = _get_block_table(state_gid)[:, 0]
+                break
+
         cm_base = CommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
@@ -2472,6 +2481,7 @@ class GPUModelRunner(
             positions=self.positions[:num_tokens_padded],
             mm_req_doc_ranges=req_doc_ranges,
             rswa_prefix_lens=rswa_prefix_lens,
+            persistent_state_indices=persistent_state_indices,
         )
 
         if self.dcp_world_size > 1:

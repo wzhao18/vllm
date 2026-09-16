@@ -2417,7 +2417,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
 
         use_packed_fp8_cache = vllm_config.cache_config.cache_dtype in (
             "fp8_ds_mla",
-            "nvfp4",
+            "nvfp4_kimi_k3",
         )
         self.dcp_manager: MLADCPManager | None = None
         if self.dcp_world_size > 1:

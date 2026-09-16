@@ -364,6 +364,8 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         self.q_pad_num_heads = getattr(self.impl, "q_pad_num_heads", None)
 
         vllm_config = get_current_vllm_config()
+        self._nvfp4_max_state_slots = vllm_config.scheduler_config.max_num_seqs
+        self._nvfp4_max_rewind = vllm_config.num_speculative_tokens
         parallel_config = vllm_config.parallel_config
         assert parallel_config.prefill_context_parallel_size == 1, (
             "Kimi-K3 MultiHeadLatentAttention does not support prefill context "
@@ -375,7 +377,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             query_dtype = (
                 torch.float8_e4m3fn
                 if is_quantized_kv_cache(self.kv_cache_dtype)
-                and self.kv_cache_dtype != "fp8_ds_mla"
+                and self.kv_cache_dtype not in ("fp8_ds_mla", "nvfp4_kimi_k3")
                 else dtype
             )
             self.dcp_manager = MLADCPManager(
@@ -421,7 +423,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             self.kv_cache_dtype, vllm_config.model_config
         )
         # TODO: Remove this mypy workaround once the K3 PR is fully merged.
-        return MLAAttentionSpec(  # type: ignore[call-arg]
+        spec = MLAAttentionSpec(  # type: ignore[call-arg]
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_size,
@@ -429,12 +431,11 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             cache_dtype_str=self.kv_cache_dtype,
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
             # Packed MLA layouts are opaque byte blobs rather than head_size
-            # elements. NVFP4 uses 288 packed data bytes plus 36 E4M3 scales.
-            state_content_bytes={"fp8_ds_mla": 656, "nvfp4": 324}.get(
-                self.kv_cache_dtype
-            ),
+            # elements. Backends may further specialize their physical layout.
+            state_content_bytes={"fp8_ds_mla": 656}.get(self.kv_cache_dtype),
             non_causal_multi_token_decode=self.non_causal_multi_token_decode,
         )
+        return self.attn_backend.customize_spec(spec)  # type: ignore[return-value]
 
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
         """Absorb ``kv_b_proj`` into decode-time ``W_UK_T`` / ``W_UV`` bmm weights.
@@ -503,7 +504,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         cache = self.kv_cache
         if is_quantized_kv_cache(self.kv_cache_dtype) and self.kv_cache_dtype not in (
             "fp8_ds_mla",
-            "nvfp4",
+            "nvfp4_kimi_k3",
         ):
             return cache.view(current_platform.fp8_dtype())
         return cache
@@ -675,6 +676,14 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             # fp32 and does the RoPE math in fp32) -- no per-forward dtype cast.
             cos_sin_cache = self.rotary_emb.cos_sin_cache
             rope_positions = positions
+            if self.kv_cache_dtype == "nvfp4_kimi_k3":
+                q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
+                    positions, q[..., self.qk_nope_head_dim :], k_pe
+                )
+                # Native FP4 cache addressing is DCP-local, while RoPE positions
+                # are global. Rotate before cache insertion to keep those two
+                # coordinate systems independent.
+                cos_sin_cache = None
 
         # Decode tokens are laid out first, prefill tokens after. The fused
         # prefill covers every supported config (bf16 / plain-fp8 /
@@ -715,6 +724,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 rope_positions[:num_mqa_tokens] if rope_positions is not None else None,
                 cos_sin_cache,
                 slot_mapping[:num_mqa_tokens],
+                attn_metadata,
             )
             if self.dcp_world_size > 1:
                 assert self.dcp_manager is not None
@@ -746,32 +756,38 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         positions: torch.Tensor | None,
         cos_sin_cache: torch.Tensor | None,
         slot_mapping: torch.Tensor,
+        attn_metadata: "MLACommonMetadata",
     ) -> torch.Tensor:
         """Fused decode query-concat + latent cache insert, dispatched by cache
         dtype (same policy as prefill: fp8 cache -> fp8 query)."""
-        if self.kv_cache_dtype == "nvfp4":
-            if positions is not None or cos_sin_cache is not None:
-                raise NotImplementedError(
-                    "Kimi-K3 NVFP4 MLA staging currently supports NoPE layers only."
-                )
-            cache = self.kv_cache
-            if cache.dtype != torch.uint8:
-                cache = cache.view(torch.uint8)
-            from vllm.v1.attention.backends.mla.nvfp4_mla import store_nvfp4_mla
+        if self.kv_cache_dtype == "nvfp4_kimi_k3":
+            assert attn_metadata.decode is not None
+            state_indices = getattr(attn_metadata, "state_indices", None)
+            if state_indices is None:
+                raise RuntimeError("Kimi-K3 NVFP4 requires persistent state slots.")
+            from vllm.v1.attention.backends.mla.kimi_k3_nvfp4_native import (
+                update_kimi_k3_nvfp4_decode_cache,
+            )
 
-            store_nvfp4_mla(
-                kv_c_normed,
-                k_pe.reshape(k_pe.shape[0], -1),
-                cache,
-                slot_mapping,
-                self._k_scale,
+            num_decodes = attn_metadata.num_decodes
+            query_len = ql_nope.shape[0] // num_decodes
+            latent = torch.cat((kv_c_normed, k_pe.flatten(1)), dim=-1)
+            q_pe = update_kimi_k3_nvfp4_decode_cache(
+                self,
+                latent=latent,
+                q_pe=q_pe,
+                cache=self.kv_cache,
+                block_table=attn_metadata.decode.block_table,
+                seq_lens=attn_metadata.decode.seq_lens,
+                state_indices=state_indices[:num_decodes],
+                slot_mapping=slot_mapping,
+                positions=positions,
+                query_len_per_seq=query_len,
+                rotary_cos_sin=cos_sin_cache,
+                max_state_slots=self._nvfp4_max_state_slots,
+                max_rewind=self._nvfp4_max_rewind,
             )
-            mqa_q = torch.cat((ql_nope, q_pe), dim=-1)
-            original_shape = mqa_q.shape
-            mqa_q, _ = ops.scaled_fp8_quant(
-                mqa_q.reshape(-1, original_shape[-1]), scale=self._q_scale
-            )
-            return mqa_q.view(original_shape)
+            return torch.cat((ql_nope, q_pe), dim=-1)
         if self.kv_cache_dtype == "fp8_ds_mla":
             cache = self.kv_cache
             if cache.dtype != torch.uint8:
@@ -964,18 +980,11 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         workspace = prefill.chunked_context.workspace
         toks = chunk.num_context_tokens
         block_table = prefill.block_table[chunk.request_slice]
-        if self.kv_cache_dtype == "nvfp4":
-            from vllm.v1.attention.backends.mla.nvfp4_mla import (
-                gather_nvfp4_mla_as_bf16,
-            )
-
-            gather_nvfp4_mla_as_bf16(
-                src_cache=kv_cache.view(torch.uint8),
-                dst=workspace[:toks],
-                block_table=block_table,
-                workspace_starts=chunk.cu_seq_lens,
-                batch_size=chunk.num_requests,
-                k_scale=self._k_scale,
+        if self.kv_cache_dtype == "nvfp4_kimi_k3":
+            raise NotImplementedError(
+                "Kimi-K3 native NVFP4 chunked-context prefill requires a "
+                "range-aware native attention launch; dequantizing the history "
+                "into the BF16 workspace is intentionally unsupported."
             )
         elif self.kv_cache_dtype == "fp8_ds_mla":
             ops.cp_gather_and_upconvert_fp8_kv_cache(
@@ -1040,23 +1049,33 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         )
         k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
 
-        if self.kv_cache_dtype == "nvfp4":
-            if positions is not None or cos_sin_cache is not None:
-                raise NotImplementedError(
-                    "Kimi-K3 NVFP4 MLA staging currently supports NoPE layers only."
-                )
-            cache = self.kv_cache
-            if cache.dtype != torch.uint8:
-                cache = cache.view(torch.uint8)
-            from vllm.v1.attention.backends.mla.nvfp4_mla import store_nvfp4_mla
-
-            store_nvfp4_mla(
-                kv_c_normed,
-                k_pe.reshape(k_pe.shape[0], -1),
-                cache,
-                slot_mapping,
-                self._k_scale,
+        if self.kv_cache_dtype == "nvfp4_kimi_k3":
+            state_indices = getattr(attn_metadata, "state_indices", None)
+            if state_indices is None:
+                raise RuntimeError("Kimi-K3 NVFP4 requires persistent state slots.")
+            from vllm.v1.attention.backends.mla.kimi_k3_nvfp4_native import (
+                update_kimi_k3_nvfp4_prefill_cache,
             )
+
+            latent = torch.cat((kv_c_normed, k_pe.flatten(1)), dim=-1)
+            latent, q = update_kimi_k3_nvfp4_prefill_cache(
+                self,
+                latent=latent,
+                query=q,
+                cache=self.kv_cache,
+                slot_mapping=slot_mapping,
+                positions=(
+                    positions
+                    if positions is not None
+                    else torch.arange(q.shape[0], dtype=torch.int64, device=q.device)
+                ),
+                query_start_loc=prefill.query_start_loc,
+                state_indices=state_indices[attn_metadata.num_decodes :],
+                rotary_cos_sin=cos_sin_cache,
+                max_state_slots=self._nvfp4_max_state_slots,
+                max_rewind=self._nvfp4_max_rewind,
+            )
+            k_pe = latent[:, self.kv_lora_rank :].unsqueeze(1)
             if fp8_prefill:
                 q = q.to(current_platform.fp8_dtype())
                 k, v = fused_mla_kv_concat_quant_fp8(k_nope, k_pe, v)

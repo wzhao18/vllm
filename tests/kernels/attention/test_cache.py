@@ -356,34 +356,22 @@ def test_reshape_and_cache_flash(
             dequant_nvfp4_kv_cache,
         )
 
-        def dequant_nvfp4_cache(data_cache, scale_cache, global_scale, swizzled_scales):
+        def dequant_nvfp4_cache(data_cache, scale_cache, global_scale):
             # data_cache:  [B, N, H, data_dim]  logical view (layout in strides)
             # scale_cache: [B, N, H, scale_dim] logical view (layout in strides)
             # Permute to [B, H, N, dim] for the dequant utility.
             data_hnd = data_cache.permute(0, 2, 1, 3)
             scale_hnd = scale_cache.permute(0, 2, 1, 3)
             result_hnd = dequant_nvfp4_kv_cache(
-                data_hnd,
-                scale_hnd,
-                global_scale,
-                head_size,
-                block_size,
-                swizzled_scales=swizzled_scales,
+                data_hnd, scale_hnd, global_scale, head_size, block_size
             )
             return result_hnd.permute(0, 2, 1, 3)  # back to [B, N, H, dim]
 
-        # The kernel writes K scales linearly on every arch and V scales in
-        # the 4x4 swizzle of the SM100 trtllm-gen reader. The FlashInfer
-        # reader used on SM12x expects linear V scales as well.
-        v_scales_swizzled = not current_platform.is_device_capability_family(120)
         result_key_cache = dequant_nvfp4_cache(
-            nvfp4_key_data, key_scale_cache, k_scale.item(), swizzled_scales=False
+            nvfp4_key_data, key_scale_cache, k_scale.item()
         )
         result_value_cache = dequant_nvfp4_cache(
-            nvfp4_value_data,
-            value_scale_cache,
-            v_scale.item(),
-            swizzled_scales=v_scales_swizzled,
+            nvfp4_value_data, value_scale_cache, v_scale.item()
         )
 
         # Flatten [num_blocks, block_size] → [num_slots] and index by slot_mapping.
@@ -496,7 +484,6 @@ def test_nvfp4_4over6_selects_lower_error_scale(
             scale.item(),
             head_size,
             block_size,
-            swizzled_scales=False,
         )[0, 0, 0]
 
     default = quantize_and_dequantize("nvfp4")
@@ -805,94 +792,6 @@ def test_concat_and_cache_mla(
         torch.testing.assert_close(kv_cache, ref_kv_cache)
 
 
-@pytest.mark.parametrize("device", CUDA_DEVICES)
-@pytest.mark.parametrize("shared_slot_mapping", [False, True])
-@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8", "fp8_e5m2"])
-@torch.inference_mode()
-def test_concat_and_cache_mla_grouped(
-    device: str,
-    shared_slot_mapping: bool,
-    kv_cache_dtype: str,
-) -> None:
-    if kv_cache_dtype == "fp8_e5m2" and current_platform.is_rocm():
-        pytest.skip("fp8_e5m2 KV cache is not supported on ROCm/HIP")
-
-    set_random_seed(0)
-    torch.set_default_device(device)
-    torch.accelerator.set_device_index(device)
-
-    num_layers = 5
-    num_tokens = 42
-    num_blocks = 8
-    block_size = 16
-    kv_lora_rank = 512
-    qk_rope_head_dim = 64
-    entry_size = kv_lora_rank + qk_rope_head_dim
-    total_slots = num_blocks * block_size
-
-    kv_c = torch.randn(num_layers, num_tokens, kv_lora_rank, dtype=torch.bfloat16)
-    k_pe = torch.randn(num_layers, num_tokens, qk_rope_head_dim, dtype=torch.bfloat16)
-    kv_caches = torch.zeros(
-        num_layers,
-        num_blocks,
-        block_size,
-        entry_size,
-        dtype=torch.bfloat16 if kv_cache_dtype == "auto" else torch.uint8,
-    )
-    reference = torch.zeros_like(kv_caches)
-    scales = torch.linspace(0.05, 0.25, num_layers, dtype=torch.float32)
-
-    slot_mapping = torch.stack(
-        [torch.randperm(total_slots)[:num_tokens] for _ in range(num_layers)]
-    )
-    slot_mapping[:, -1] = -1
-    if shared_slot_mapping:
-        slot_mapping = slot_mapping[:1].expand(num_layers, -1)
-
-    for layer_idx in range(num_layers):
-        ops.concat_and_cache_mla(
-            kv_c[layer_idx],
-            k_pe[layer_idx],
-            reference[layer_idx],
-            slot_mapping[layer_idx],
-            kv_cache_dtype,
-            scales[layer_idx],
-        )
-
-    cache_ptrs = torch.tensor(
-        [kv_caches[layer_idx].data_ptr() for layer_idx in range(num_layers)],
-        dtype=torch.int64,
-    )
-    ref_cache = kv_caches[0]
-
-    def run_grouped(kv_scales: torch.Tensor | None) -> None:
-        ops.concat_and_cache_mla_grouped(
-            kv_c,
-            k_pe,
-            cache_ptrs,
-            slot_mapping,
-            ref_cache.size(1),
-            ref_cache.stride(0),
-            ref_cache.stride(1),
-            kv_scales,
-            kv_cache_dtype,
-        )
-
-    run_grouped(None if kv_cache_dtype == "auto" else scales)
-
-    torch.testing.assert_close(kv_caches, reference, rtol=0, atol=0)
-
-    if kv_cache_dtype == "fp8" and not shared_slot_mapping:
-        noncontiguous_scales = torch.ones(num_layers, 2)[:, 0]
-        assert not noncontiguous_scales.is_contiguous()
-        for invalid_scales, error in (
-            (scales.cpu(), "same CUDA device"),
-            (noncontiguous_scales, "must be contiguous"),
-        ):
-            with pytest.raises(RuntimeError, match=error):
-                run_grouped(invalid_scales)
-
-
 @pytest.mark.parametrize("kv_lora_rank", KV_LORA_RANKS)
 @pytest.mark.parametrize("qk_rope_head_dim", QK_ROPE_HEAD_DIMS)
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS_MLA)
@@ -1161,86 +1060,6 @@ def test_concat_and_cache_nvfp4_ds_mla(
         rope_vals = rope_payload.view(torch.float8_e4m3fn).to(torch.float32)
         rope_tol = k_pe_ref.abs() * 2.0**-3 + 2.0**-9
         assert ((rope_vals - k_pe_ref).abs() <= rope_tol).all()
-
-
-@pytest.mark.parametrize("device", CUDA_DEVICES)
-@torch.inference_mode()
-def test_stage_nvfp4_mla_as_fp8(device: str) -> None:
-    if current_platform.is_rocm():
-        pytest.skip("NVFP4 DS-MLA requires CUDA")
-    device_capability = current_platform.get_device_capability()
-    if device_capability is None or device_capability.major != 10:
-        pytest.skip("The NVFP4 DS-MLA kv-cache dtype requires SM 10.x")
-
-    from vllm.v1.attention.backends.mla.nvfp4_mla import (
-        NVFP4_MLA_ENTRY_BYTES,
-        gather_nvfp4_mla_as_bf16,
-        stage_nvfp4_mla_as_fp8,
-        store_nvfp4_mla,
-    )
-
-    torch.set_default_device(device)
-    torch.accelerator.set_device_index(device)
-    set_random_seed(0)
-    num_blocks, block_size = 8, 16
-    num_tokens = num_blocks * block_size
-    kv_c = torch.randn(num_tokens, 512, dtype=torch.bfloat16)
-    k_pe = torch.randn(num_tokens, 64, dtype=torch.bfloat16)
-    cache = torch.empty(
-        num_blocks,
-        block_size,
-        NVFP4_MLA_ENTRY_BYTES,
-        dtype=torch.uint8,
-    )
-    slot_mapping = torch.arange(num_tokens, dtype=torch.long)
-    scale = torch.tensor(0.5, dtype=torch.float32)
-    store_nvfp4_mla(kv_c, k_pe, cache, slot_mapping, scale)
-
-    # Include an out-of-order and a duplicated physical page. Each reference
-    # gets a separate slot in the compact staging cache used by TokenSpeed.
-    block_table = torch.tensor([[3, 1, -1], [0, 3, 5]], dtype=torch.int32)
-    staged = torch.empty(
-        block_table.numel(), block_size, 576, dtype=torch.float8_e4m3fn
-    )
-    stage_nvfp4_mla_as_fp8(cache, block_table, staged)
-
-    dequantized_pages = {}
-    for staged_page, physical_page in enumerate(block_table.flatten().tolist()):
-        if physical_page < 0:
-            assert not staged[staged_page].byte().any()
-            continue
-        entries = cache[physical_page]
-        sf = (
-            entries[:, 288:324]
-            .view(torch.float8_e4m3fn)
-            .float()
-            .repeat_interleave(16, dim=-1)
-        )
-        dequantized = _unpack_e2m1(entries[:, :288]).view(block_size, 576) * sf
-        dequantized_pages[physical_page] = dequantized
-        expected = dequantized.clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
-        torch.testing.assert_close(staged[staged_page].float(), expected.float())
-
-    # Chunked prefill consumes the same storage through a BF16 gather and
-    # restores the layer's cache scale.
-    gather_table = torch.tensor([[3, 1], [0, 5]], dtype=torch.int32)
-    workspace_starts = torch.tensor([0, 2 * block_size], dtype=torch.int32)
-    gathered = torch.empty(4 * block_size, 576, dtype=torch.bfloat16)
-    gather_nvfp4_mla_as_bf16(
-        cache,
-        gathered,
-        gather_table,
-        workspace_starts,
-        batch_size=2,
-        k_scale=scale,
-    )
-    expected_gather = torch.cat(tuple(dequantized_pages[page] for page in (3, 1, 0, 5)))
-    torch.testing.assert_close(
-        gathered.float(),
-        (expected_gather * scale).to(torch.bfloat16).float(),
-        rtol=0,
-        atol=0,
-    )
 
 
 @pytest.mark.parametrize("kv_lora_rank", KV_LORA_RANKS)

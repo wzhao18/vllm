@@ -3143,24 +3143,18 @@ class VllmConfig:
     def validate_nvfp4_kv_cache_with_mla(self) -> "VllmConfig":
         if self.model_config is None:
             return self
-        # Plain NVFP4 uses an attention-specific physical layout. Kimi-K3's
-        # NVIDIA MLA implementation supplies the dense 324-byte latent layout;
-        # other MLA models must use an explicitly supported specialized dtype.
-        is_kimi_k3 = any(
-            architecture.startswith("KimiK3")
-            or architecture == "KimiLinearForCausalLM"
-            for architecture in self.model_config.architectures
-        )
+        cache_dtype = self.cache_config.cache_dtype
+        if cache_dtype == "nvfp4_kimi_k3" and not self.model_config.use_mla:
+            raise ValueError("nvfp4_kimi_k3 requires an MLA model.")
         if (
-            self.cache_config.cache_dtype.startswith("nvfp4")
-            and self.cache_config.cache_dtype != "nvfp4_ds_mla"
+            cache_dtype.startswith("nvfp4")
+            and cache_dtype not in ("nvfp4_ds_mla", "nvfp4_kimi_k3")
             and self.model_config.use_mla
-            and not (self.cache_config.cache_dtype == "nvfp4" and is_kimi_k3)
         ):
             raise ValueError(
-                "Plain nvfp4 MLA KV cache is currently supported only for "
-                "Kimi-K3; use a cache dtype supported by the selected MLA "
-                "backend for other models."
+                "Plain nvfp4 KV cache does not define an MLA layout; select an "
+                "explicit MLA cache dtype such as nvfp4_kimi_k3 or "
+                "nvfp4_ds_mla."
             )
         return self
 

@@ -18,12 +18,11 @@ decode kernels from TensorRT-LLM MR 10576 before integrating them with vLLM.
 The harness uses a synthetic but structurally valid native cache containing
 packed E2M1 values, swizzled E4M3 scales, the auxiliary PV scale view, and a
 fixed-stride page table. Timings use CUDA events after five warmup iterations
-and average 20 decode iterations. Cache construction and persistent V repack
-are outside the timed region.
+and average 20 decode iterations.
 
 ## Triton native FP4 QK/PV
 
-The prepacked-V kernel compiles and executes correctly on SM103. Validation at
+The native kernel compiles and executes correctly on SM103. Validation at
 context length 128 against a dequantized reference produced:
 
 - output relative L2 error: `0.00134254`
@@ -31,22 +30,31 @@ context length 128 against a dequantized reference produced:
 - output maximum absolute error: `0.00012090`
 - probability maximum absolute error: `0.00125946`
 
+The final SM103 path reads V directly from the canonical 392-byte/token page.
+It uses `BLOCK_V=128`, because the 32-wide inline transpose issues a
+misaligned access on SM103. It does not allocate a persistent transposed V
+copy or a context-sized dequantization buffer.
+
 | Context tokens | TMA disabled (ms) | TMA enabled (ms) |
 |---:|---:|---:|
-| 128 | 0.2808 | 0.3228 |
-| 1,024 | 0.3348 | 0.3453 |
-| 4,096 | 0.3518 | 0.4035 |
-| 16,384 | 0.3534 | 0.3855 |
-| 65,536 | 0.3745 | 0.3945 |
+| 128 | 0.2808 | 0.2744 |
+| 1,024 | 0.3184 | 0.3156 |
+| 4,096 | 0.3555 | 0.3608 |
+| 16,384 | 0.3409 | 0.3593 |
+| 65,536 | 0.3589 | 0.3611 |
 
-TMA was not beneficial for this batch-1 shape. More batch sizes and an FP8
-backend comparison are still required.
+TMA was not clearly beneficial for this batch-1 shape and defaults off on
+SM103. More batch sizes and an FP8 backend comparison are still required.
 
-The on-the-fly V transpose variant consistently fails in the PV kernel with a
-CUDA `misaligned address`, with both TMA enabled and disabled. The prepacked-V
-variant avoids that path, but its persistent V view costs another 256 bytes per
-token per layer. We should fix the SM103 inline V path or use a fused-V kernel
-before treating this as the final memory-efficient implementation.
+The vLLM adapter was also validated against the TRT-LLM wrapper using the same
+opaque page allocation: maximum absolute and relative L2 differences were both
+zero. Native cache insertion produced the expected quantization error:
+
+- one-token decode update relative L2: about `0.09` to `0.10`
+- full 16-token prefill tile relative L2: about `0.10`
+- DCP speculative-offset case relative L2: `0.1039`
+- Q prefix relative L2: about `0.095`
+- Q RoPE tail with residual relative L2: about `0.0088`
 
 ## CuTe DSL status
 
@@ -68,8 +76,8 @@ evaluating SM103 code generation and performance.
 
 ## Reproduction
 
-The benchmark script intentionally loads the MR source from an external source
-directory so no TensorRT-LLM implementation is silently vendored into vLLM:
+The benchmark can compare the integrated vLLM adapter with an extracted copy
+of the MR source:
 
 ```bash
 python benchmarks/kernels/benchmark_kimi_k3_nvfp4_mla.py \
@@ -77,4 +85,5 @@ python benchmarks/kernels/benchmark_kimi_k3_nvfp4_mla.py \
   --batch 1 --heads 128 --context 128 --warmup 5 --iters 20 --validate
 ```
 
-Set `TRTLLM_FP4_MLA_TRITON_PREPACK_V=1` for the currently working SM103 path.
+The integrated SM103 path selects `BLOCK_V=128` automatically. It can be
+overridden with `VLLM_KIMI_K3_NVFP4_BLOCK_V` for tuning.
