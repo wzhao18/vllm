@@ -2082,9 +2082,9 @@ class MambaManager(SingleTypeKVCacheManager):
             # Loaded state is private; publishing it would require an unreserved
             # copy-on-write block before the request could continue.
             return None
-        if self.use_eagle:
-            # Eagle groups match one hash unit past the candidate and drop it,
-            # so register the tail one unit lower.
+        if self.drop_eagle_checkpoint_block:
+            # Match the scheduler's replay boundary even when only attention
+            # groups are marked as draft groups.
             latest_prompt_hash_boundary = max(
                 latest_prompt_hash_boundary - hash_block_size, 0
             )
