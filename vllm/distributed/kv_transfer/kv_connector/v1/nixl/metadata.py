@@ -24,6 +24,7 @@ GET_META_MSG = b"get_meta_msg"
 # Sent worker-to-worker over NIXL: D worker -> P worker, encoded as
 # PUSH_REG_NOTIF_PREFIX + msgpack(registration_data).
 PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
+PUSH_DONE_NOTIF_PREFIX = b"PUSH_DONE:"
 #
 # NIXL Connector Version
 #
@@ -48,8 +49,9 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #  10: Add dense virtual transfer pages for compressed MLA caches
 #  11: Add per-region transfer geometry and memory types to NixlAgentMetadata
 #  12: Add per-region member names for PP push
+#  13: Add CP KV-cache interleave geometry and exact push coverage
 #
-NIXL_CONNECTOR_VERSION: int = 12
+NIXL_CONNECTOR_VERSION: int = 13
 
 
 @dataclass
@@ -74,6 +76,9 @@ class NixlAgentMetadata:
     pcp_size: int = 1
     # Layer names sharing each advertised region, in region order.
     region_members: list[list[str]] = field(default_factory=list)
+    pp_size: int = 1
+    cp_kv_cache_interleave_size: int | None = None
+    has_transferable_swa: bool = False
 
 
 @dataclass
@@ -252,6 +257,9 @@ class ReqMeta:
     # True only when the scheduler parked the request in WAITING_FOR_REMOTE_KVS
     # and expects it in finished_recving; notify-only recvs must not be reported.
     awaiting_kvs: bool = False
+    # Exact number of physical attention pages written across all producer
+    # shards, per cache group. Empty for pull transfers.
+    aggregate_remote_coverage: tuple[int, ...] = ()
 
 
 class NixlConnectorMetadata(KVConnectorMetadata):
