@@ -88,3 +88,36 @@ python benchmarks/kernels/benchmark_kimi_k3_nvfp4_mla.py \
 
 The integrated SM103 path selects `BLOCK_V=128` automatically. It can be
 overridden with `VLLM_KIMI_K3_NVFP4_BLOCK_V` for tuning.
+
+## vLLM end-to-end status
+
+The integrated backend was exercised with real Kimi-K3 weights on two GB300
+nodes (TP8, DCP8), including the RoPE-enabled K3 DSpark draft and standard
+speculative rejection. The run completed with native FP4 cache reads for both
+target and draft. A DCP-specific cache corruption found during bring-up was
+fixed: vLLM keeps query tokens in global order, so an interleave-1 DCP rank
+must gather source rows `r, r + dcp_size, ...`; the original TRT-LLM writer
+assumed its generation rows were contiguous. The implementation currently
+rejects DCP interleave sizes other than one.
+
+The real-weight arithmetic smoke recovered the expected reasoning after that
+fix (`17 + 29 = 46`, `9 + 11 = 20`) under TP8/DCP8/DSpark. TP8/DCP1 and the
+existing FP8 path were also used as isolation controls.
+
+A 12-request probe using the first 12 GSM8K test examples produced the
+following controlled comparison. These are raw text prompts, not Kimi-K3's
+chat template, and therefore are **not** reportable GSM8K accuracy numbers;
+the identical low exact-match result mainly confirms that this prompt-format
+failure is not specific to NVFP4.
+
+| Cache/backend | Exact match | Output tokens | Elapsed (s) | Output tok/s |
+|---|---:|---:|---:|---:|
+| `nvfp4_kimi_k3` / native | 2 / 12 | 1,536 | 79.55 | 19.31 |
+| `fp8` / TOKENSPEED_MLA | 2 / 12 | 1,536 | 17.30 | 88.81 |
+
+The native Triton integration is consequently functional but not yet
+performance competitive for this batched DSpark workload. The same hybrid
+configuration reported 722,199 cache tokens with NVFP4 versus 679,191 with
+FP8 (+6.3% end-to-end capacity); the attention-state payload itself is 392
+versus 576 bytes per token per layer. A full chat-templated GSM8K evaluation
+and kernel profiling/tuning remain required before production enablement.
