@@ -34,7 +34,12 @@ import msgspec
 import pytest
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorRole,
     KVConnectorTransferResults,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector import (
+    NixlBaseConnector,
+    NixlPushConnector,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     PUSH_DONE_NOTIF_PREFIX,
@@ -131,6 +136,36 @@ def _stub_sw_clipping(scheduler) -> None:
 # ----------------------------------------------------------------- #
 #  Scheduler-side tests                                              #
 # ----------------------------------------------------------------- #
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    ("role", "constructor_name"),
+    [
+        (KVConnectorRole.SCHEDULER, "NixlPushConnectorScheduler"),
+        (KVConnectorRole.WORKER, "NixlPushConnectorWorker"),
+    ],
+)
+def test_push_connector_allows_dcp(role, constructor_name):
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=8)
+    )
+    kv_cache_config = MagicMock()
+    constructor = MagicMock()
+
+    def init_base(connector: Any, *_args: Any) -> None:
+        connector.engine_id = "engine"
+
+    with (
+        patch.object(NixlBaseConnector, "__init__", init_base),
+        patch(
+            f"vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector.{constructor_name}",
+            constructor,
+        ),
+    ):
+        NixlPushConnector(config, role, kv_cache_config)
+
+    constructor.assert_called_once_with(config, "engine", kv_cache_config)
 
 
 class TestPushScheduler:
