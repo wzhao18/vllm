@@ -100,6 +100,15 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _SHARED_REGION_GROUP_ID = -1
+_REGION_METADATA_FIELDS = (
+    "kv_caches_base_addr",
+    "block_lens",
+    "block_strides",
+    "region_num_blocks",
+    "region_group_ids",
+    "region_names",
+    "region_mem_types",
+)
 
 
 def _region_sort_key(layer_name: str) -> tuple[tuple[int, int | str], ...]:
@@ -364,6 +373,71 @@ class NixlBaseConnectorWorker:
         contains multiple source ranks for the sharded SSM state.
         """
         return tp_ratio < 0 and (not self.use_mla or len(plan.all_source_ranks) > 1)
+
+    @staticmethod
+    def _slice_remote_regions(
+        metadata: NixlAgentMetadata, region_indices: list[int]
+    ) -> None:
+        """Select and order every per-region metadata array identically."""
+        num_regions = len(metadata.kv_caches_base_addr)
+        for field in _REGION_METADATA_FIELDS:
+            values = getattr(metadata, field)
+            if values is None:
+                continue
+            if len(values) != num_regions:
+                raise ValueError(
+                    f"NIXL metadata field {field!r} has {len(values)} entries, "
+                    f"expected {num_regions}."
+                )
+            setattr(metadata, field, [values[i] for i in region_indices])
+
+    def _align_push_remote_regions(self, metadata: NixlAgentMetadata) -> None:
+        """Align a push consumer's regions with the producer's logical caches.
+
+        A decode engine may register additional KV regions, for example for a
+        speculative draft model. Those regions are not present on a
+        language-model-only prefill engine and must not participate in the
+        WRITE. Region names are the wire-level logical identity; align by
+        name (and occurrence for segmented regions) rather than assuming the
+        two allocators produced equal, positionally identical arrays.
+        """
+        if self._TRANSFER_MODE != "push" or metadata.region_names is None:
+            return
+        if metadata.region_names == self.region_names:
+            return
+
+        remote_indices_by_name: defaultdict[str, list[int]] = defaultdict(list)
+        for index, name in enumerate(metadata.region_names):
+            remote_indices_by_name[name].append(index)
+
+        occurrence_by_name: defaultdict[str, int] = defaultdict(int)
+        selected: list[int] = []
+        for name in self.region_names:
+            occurrence = occurrence_by_name[name]
+            candidates = remote_indices_by_name[name]
+            if occurrence >= len(candidates):
+                raise ValueError(
+                    "NIXL push consumer is missing producer region "
+                    f"{name!r} occurrence {occurrence}; "
+                    f"producer={self.region_names}, remote={metadata.region_names}."
+                )
+            selected.append(candidates[occurrence])
+            occurrence_by_name[name] += 1
+
+        selected_set = set(selected)
+        ignored = [
+            name
+            for index, name in enumerate(metadata.region_names)
+            if index not in selected_set
+        ]
+        logger.info(
+            "Aligned NIXL push regions by logical name: producer=%d, "
+            "consumer=%d, ignored consumer-only regions=%s",
+            len(self.region_names),
+            len(metadata.region_names),
+            ignored,
+        )
+        self._slice_remote_regions(metadata, selected)
 
     def _fa_desc_replicated(self, num_fa_descs: int) -> list[bool]:
         """Per-FA-descriptor replicate flag, in _build_fa_local emission order
@@ -2061,6 +2135,8 @@ class NixlBaseConnectorWorker:
                 nixl_agent_meta.region_num_blocks = nixl_agent_meta.region_num_blocks[
                     start:end
                 ]
+
+        self._align_push_remote_regions(nixl_agent_meta)
 
         ### Register remote engine in TransferTopology (idempotent).
         assert self.transfer_topo is not None

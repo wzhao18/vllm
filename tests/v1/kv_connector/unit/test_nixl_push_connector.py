@@ -1525,6 +1525,59 @@ class TestPushPipelineParallel:
         assert meta.block_lens == [block_len, block_len]
 
 
+class TestPushRegionAlignment:
+    """Producer and consumer allocation geometry need not have equal regions."""
+
+    @staticmethod
+    def _metadata(region_names: list[str]) -> NixlAgentMetadata:
+        count = len(region_names)
+        return NixlAgentMetadata(
+            engine_id="decode-engine",
+            agent_metadata=b"agent",
+            kv_caches_base_addr=[100 + i for i in range(count)],
+            device_id=0,
+            num_blocks=8,
+            block_lens=[1000 + i for i in range(count)],
+            block_strides=[2000 + i for i in range(count)],
+            kv_cache_layout="HND",
+            block_size=16,
+            ssm_sizes=(0, 0),
+            attn_backend_name="FLASH_ATTN",
+            physical_blocks_per_logical_kv_block=1,
+            region_num_blocks=[3000 + i for i in range(count)],
+            region_group_ids=[4000 + i for i in range(count)],
+            region_names=region_names,
+            region_mem_types=[f"mem-{i}" for i in range(count)],
+        )
+
+    def test_aligns_and_filters_consumer_regions_by_logical_name(self):
+        worker = _StubWriterWorker.fresh()
+        worker.region_names = ["target.0", "shared", "shared", "target.1"]
+        metadata = self._metadata(
+            ["draft.0", "shared", "target.1", "target.0", "shared"]
+        )
+
+        worker._align_push_remote_regions(metadata)
+
+        # The producer's logical order wins. Duplicate/segmented names are
+        # matched by occurrence; the decode-only draft cache is excluded.
+        assert metadata.region_names == worker.region_names
+        assert metadata.kv_caches_base_addr == [103, 101, 104, 102]
+        assert metadata.block_lens == [1003, 1001, 1004, 1002]
+        assert metadata.block_strides == [2003, 2001, 2004, 2002]
+        assert metadata.region_num_blocks == [3003, 3001, 3004, 3002]
+        assert metadata.region_group_ids == [4003, 4001, 4004, 4002]
+        assert metadata.region_mem_types == ["mem-3", "mem-1", "mem-4", "mem-2"]
+
+    def test_rejects_missing_producer_region(self):
+        worker = _StubWriterWorker.fresh()
+        worker.region_names = ["target.0", "target.1"]
+        metadata = self._metadata(["target.0", "draft.0"])
+
+        with pytest.raises(ValueError, match="missing producer region 'target.1'"):
+            worker._align_push_remote_regions(metadata)
+
+
 class TestPushWriterMlaReplication:
     """MLA latent KV is replicated across D's TP ranks, so when D_TP > P_TP
     (``tp_ratio < 0``) the producer must *WRITE* the latent into every D rank
