@@ -92,8 +92,8 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
     ):
         super().__init__(vllm_config, engine_id, kv_cache_config)
 
-        # Heartbeat handshakes to a PP-sharded producer must be notif-only,
-        # like the PUSH_REG path.
+        # Decode only sends notifications to the producer in push mode, so
+        # heartbeat handshakes use the same notification-only path as PUSH_REG.
         self._hb_handshake_notif_only = True
 
         # Push-specific state.

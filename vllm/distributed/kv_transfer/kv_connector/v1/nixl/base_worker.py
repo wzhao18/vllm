@@ -3064,7 +3064,7 @@ class NixlBaseConnectorWorker:
                     hb_info.tp_size,
                     hb_info.dcp_size,
                     hb_info.pp_size,
-                    self._hb_handshake_notif_only and hb_info.pp_size > 1,
+                    self._hb_handshake_notif_only,
                 )
                 is not None
             ):
