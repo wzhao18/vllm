@@ -185,3 +185,17 @@ def test_mtp_index_share_override(
         speculative_config.draft_model_config.hf_config.index_share_for_mtp_iteration
         is expected
     )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(("draft_is_moe", "expected"), [(False, False), (True, True)])
+def test_draft_inherits_expert_parallel_only_for_moe(
+    draft_is_moe: bool, expected: bool
+):
+    draft_parallel_config = SpeculativeConfig.create_draft_parallel_config(
+        ParallelConfig(enable_expert_parallel=True),
+        speculative_draft_tensor_parallel_size=1,
+        draft_model_config=MagicMock(is_moe=draft_is_moe),
+    )
+
+    assert draft_parallel_config.enable_expert_parallel is expected
