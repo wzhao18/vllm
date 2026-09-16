@@ -48,7 +48,9 @@ SM103. More batch sizes and an FP8 backend comparison are still required.
 
 The vLLM adapter was also validated against the TRT-LLM wrapper using the same
 opaque page allocation: maximum absolute and relative L2 differences were both
-zero. Native cache insertion produced the expected quantization error:
+zero. This includes the DSpark target shape (batch 8, query length 5, context
+1,024), which ran in `0.3299 ms` per attention layer on GB300. Native cache
+insertion produced the expected quantization error:
 
 - one-token decode update relative L2: about `0.09` to `0.10`
 - full 16-token prefill tile relative L2: about `0.10`
@@ -83,7 +85,8 @@ of the MR source:
 ```bash
 python benchmarks/kernels/benchmark_kimi_k3_nvfp4_mla.py \
   --source-dir /path/to/trtllm-mr10576/fp4_mla \
-  --batch 1 --heads 128 --context 128 --warmup 5 --iters 20 --validate
+  --batch 8 --heads 128 --context 1024 --query-len 5 \
+  --warmup 5 --iters 20 --opaque-vllm-cache --validate-vllm-adapter
 ```
 
 The integrated SM103 path selects `BLOCK_V=128` automatically. It can be
@@ -93,31 +96,46 @@ overridden with `VLLM_KIMI_K3_NVFP4_BLOCK_V` for tuning.
 
 The integrated backend was exercised with real Kimi-K3 weights on two GB300
 nodes (TP8, DCP8), including the RoPE-enabled K3 DSpark draft and standard
-speculative rejection. The run completed with native FP4 cache reads for both
-target and draft. A DCP-specific cache corruption found during bring-up was
-fixed: vLLM keeps query tokens in global order, so an interleave-1 DCP rank
-must gather source rows `r, r + dcp_size, ...`; the original TRT-LLM writer
-assumed its generation rows were contiguous. The implementation currently
-rejects DCP interleave sizes other than one.
+block rejection. The run completed with native FP4 cache reads for both target
+and draft. Two DCP-specific issues found during bring-up were fixed:
+
+- vLLM keeps query tokens in global order, so an interleave-1 DCP rank must
+  gather cache-update source rows `r, r + dcp_size, ...`; the original TRT-LLM
+  writer assumed its generation rows were contiguous.
+- Each speculative target row's global causal bound must be localized to the
+  current DCP rank independently. Subtracting query offsets from one already
+  localized final length is incorrect under round-robin sharding (for example,
+  rank 1 at world size 2 maps global bounds `[8, 9, 10]` to `[4, 4, 5]`, not
+  `[3, 4, 5]`). The corrected bounds and expanded block table are prepared once
+  per batch in stable metadata buffers and reused by every layer.
+
+The implementation currently rejects DCP interleave sizes other than one.
 
 The real-weight arithmetic smoke recovered the expected reasoning after that
 fix (`17 + 29 = 46`, `9 + 11 = 20`) under TP8/DCP8/DSpark. TP8/DCP1 and the
 existing FP8 path were also used as isolation controls.
 
-A 12-request probe using the first 12 GSM8K test examples produced the
-following controlled comparison. These are raw text prompts, not Kimi-K3's
-chat template, and therefore are **not** reportable GSM8K accuracy numbers;
-the identical low exact-match result mainly confirms that this prompt-format
-failure is not specific to NVFP4.
+A deterministic 32-request probe used the first five GSM8K training examples
+as few-shot demonstrations and evaluated the first 32 test examples. Both runs
+used identical completion prompts, temperature 0, a 256-token output cap,
+batch size 8, TP8, DCP8, the 4-token DSpark draft, and block rejection. Timings
+exclude an explicit batch-8 warmup. This is a controlled subset check, not a
+full GSM8K benchmark.
 
 | Cache/backend | Exact match | Output tokens | Elapsed (s) | Output tok/s |
 |---|---:|---:|---:|---:|
-| `nvfp4_kimi_k3` / native | 2 / 12 | 1,536 | 79.55 | 19.31 |
-| `fp8` / TOKENSPEED_MLA | 2 / 12 | 1,536 | 17.30 | 88.81 |
+| `nvfp4_kimi_k3` / native | 32 / 32 | 3,349 | 204.42 | 16.38 |
+| `fp8` / TOKENSPEED_MLA | 32 / 32 | 3,393 | 48.46 | 70.01 |
 
-The native Triton integration is consequently functional but not yet
-performance competitive for this batched DSpark workload. The same hybrid
-configuration reported 722,199 cache tokens with NVFP4 versus 679,191 with
-FP8 (+6.3% end-to-end capacity); the attention-state payload itself is 392
-versus 576 bytes per token per layer. A full chat-templated GSM8K evaluation
-and kernel profiling/tuning remain required before production enablement.
+Before per-query DCP causal localization, NVFP4 scored 25/32 and reached only
+6.93 output tok/s, so the correction addresses both wrong masking and a large
+part of the observed slowdown. Native Triton is nevertheless 4.27x slower than
+FP8/Tokenspeed on this batched DSpark workload and is not yet performance
+competitive.
+
+With the real-weight batch-8 configuration, vLLM reported 617,378 cache tokens
+for NVFP4 versus 600,250 for FP8 (+2.85% end-to-end capacity). A simpler dummy
+configuration reported 722,199 versus 679,191 (+6.3%). Hybrid recurrent-state
+groups dilute the attention-cache saving; the attention-state payload itself
+is 392 versus 576 bytes per token per layer. Kernel profiling/tuning and a
+production-compatible CuTe DSL port remain required before enablement.

@@ -173,7 +173,15 @@ class CacheManager:
         return self.v_sf.view(torch.uint8).flatten(0, 1)
 
 
-def build_case(fp4, batch: int, heads: int, context: int, *, opaque_vllm_cache: bool):
+def build_case(
+    fp4,
+    batch: int,
+    heads: int,
+    context: int,
+    query_len: int,
+    *,
+    opaque_vllm_cache: bool,
+):
     device = torch.device("cuda")
     page = fp4.FP4_MLA_TOKENS_PER_BLOCK
     pages_per_seq = (context + page - 1) // page
@@ -243,14 +251,17 @@ def build_case(fp4, batch: int, heads: int, context: int, *, opaque_vllm_cache: 
     page_ids = torch.arange(total_pages, device=device, dtype=torch.int32)
     indptr = torch.arange(batch + 1, device=device, dtype=torch.int32) * pages_per_seq
     kv_lens = torch.full((batch,), context, device=device, dtype=torch.int32)
-    append_lens = torch.ones((batch,), device=device, dtype=torch.int32)
+    num_tokens = batch * query_len
+    append_lens = torch.full(
+        (batch,), query_len, device=device, dtype=torch.int32
+    )
     metadata = SimpleNamespace(
         kv_cache_manager=manager,
         fp4_mla_v_scale_pool=v_sf,
         page_size=page,
         num_contexts=0,
         num_seqs=batch,
-        num_tokens=batch,
+        num_tokens=num_tokens,
         num_ctx_tokens=0,
         fp4_mla_page_table_stride=pages_per_seq,
         _fp4_mla_device_page_table=True,
@@ -262,7 +273,7 @@ def build_case(fp4, batch: int, heads: int, context: int, *, opaque_vllm_cache: 
         prompt_lens_cuda_runtime=append_lens,
         fp4_mla_generation_kv_lens=kv_lens.clone(),
         fp4_mla_generation_append_lens=append_lens.clone(),
-        fp4_mla_generation_lengths_num_tokens=batch,
+        fp4_mla_generation_lengths_num_tokens=num_tokens,
         fp4_mla_generation_lengths_num_seqs=batch,
         fp4_mla_generation_lengths_num_contexts=0,
         _fp4_mla_generation_lengths_capture_recorded=False,
@@ -275,13 +286,15 @@ def build_case(fp4, batch: int, heads: int, context: int, *, opaque_vllm_cache: 
         is_cuda_graph=False,
     )
 
-    q = torch.zeros((batch, heads, 576), device=device, dtype=torch.bfloat16)
+    q = torch.zeros((num_tokens, heads, 576), device=device, dtype=torch.bfloat16)
     packed_q = torch.randint(
-        0, 256, (batch * heads, 320), device=device, dtype=torch.uint8
+        0, 256, (num_tokens * heads, 320), device=device, dtype=torch.uint8
     )
-    q_sf_size = fp4._get_fp4_mla_swizzled_scale_size(batch * heads, 640)
+    q_sf_size = fp4._get_fp4_mla_swizzled_scale_size(num_tokens * heads, 640)
     q_sf = torch.ones((q_sf_size,), device=device, dtype=torch.float8_e4m3fn)
-    output = torch.empty((batch, heads, 512), device=device, dtype=torch.bfloat16)
+    output = torch.empty(
+        (num_tokens, heads, 512), device=device, dtype=torch.bfloat16
+    )
     return metadata, q, packed_q, q_sf, output
 
 
@@ -291,6 +304,7 @@ def main():
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--heads", type=int, default=128)
     parser.add_argument("--context", type=int, default=4096)
+    parser.add_argument("--query-len", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--validate", action="store_true")
@@ -323,6 +337,7 @@ def main():
         args.batch,
         args.heads,
         args.context,
+        args.query_len,
         opaque_vllm_cache=args.opaque_vllm_cache,
     )
 
@@ -338,7 +353,7 @@ def main():
             qk_rope_head_dim=64,
             prequantized_q=packed_q,
             prequantized_q_sf=q_sf,
-            q_batch_capacity=args.batch,
+            q_batch_capacity=args.batch * args.query_len,
         )
 
     for _ in range(args.warmup):
@@ -359,6 +374,7 @@ def main():
         "heads": args.heads,
         "layout": "vllm-opaque" if args.opaque_vllm_cache else "split",
         "context": args.context,
+        "query_len": args.query_len,
         "latency_ms": ms,
         "finite": bool(torch.isfinite(output).all().item()),
         "output_norm": float(torch.linalg.vector_norm(output.float()).item()),
@@ -380,7 +396,7 @@ def main():
         )
         adapter = load_vllm_adapter(adapter_dir)
         query = torch.randn(
-            (args.batch, args.heads, 576),
+            (args.batch * args.query_len, args.heads, 576),
             dtype=torch.bfloat16,
             device=output.device,
         )
@@ -449,7 +465,7 @@ def main():
             block_table=metadata._paged_kv_indices.view(args.batch, pages_per_seq),
             seq_lens=metadata.kv_lens_cuda_runtime,
             output=adapter_output,
-            query_len_per_seq=1,
+            query_len_per_seq=args.query_len,
             sm_scale=0.1,
         )
         torch.cuda.synchronize()

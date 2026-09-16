@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, ClassVar
 import torch
 
 from vllm.config.cache import CacheDType
+from vllm.distributed.parallel_state import get_dcp_group
 from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonBackend,
     MLACommonImpl,
@@ -27,22 +28,50 @@ from vllm.v1.attention.backends.mla.kimi_k3_nvfp4_native import (
     quantize_kimi_k3_nvfp4_query,
     run_kimi_k3_nvfp4_attention,
 )
+from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 
 if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import AttentionSpec
 
 
+def _expand_dcp_causal_seq_lens(
+    global_final_lens: torch.Tensor,
+    query_len: int,
+    dcp_world_size: int,
+    dcp_rank: int,
+    interleave_size: int,
+    token_offsets: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Expand final request lengths into per-query rank-local causal bounds."""
+    num_decodes = global_final_lens.numel()
+    expanded = output[: num_decodes * query_len].view(num_decodes, query_len)
+    expanded.copy_(global_final_lens[:, None])
+    expanded.sub_(query_len - 1 - token_offsets[:query_len])
+    local_lens = get_dcp_local_seq_lens(
+        expanded,
+        dcp_world_size,
+        dcp_rank,
+        interleave_size,
+    )
+    expanded.copy_(local_lens)
+    return expanded.flatten()
+
+
 class KimiK3NVFP4Metadata(MLACommonMetadata):
     state_indices: torch.Tensor | None = None
     cache_seq_lens: torch.Tensor | None = None
+    expanded_decode_block_table: torch.Tensor | None = None
+    expanded_decode_seq_lens: torch.Tensor | None = None
 
 
 class KimiK3NVFP4MetadataBuilder(MLACommonMetadataBuilder[KimiK3NVFP4Metadata]):
+    requires_block_table_width: ClassVar[bool] = True
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.UNIFORM
     supports_non_causal_multi_token_decode: ClassVar[bool] = True
     supports_non_causal_multi_token_dcp: ClassVar[bool] = True
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args, block_table_width: int, **kwargs) -> None:
         super().__init__(
             *args,
             **kwargs,
@@ -52,6 +81,23 @@ class KimiK3NVFP4MetadataBuilder(MLACommonMetadataBuilder[KimiK3NVFP4Metadata]):
         # The native writer quantizes Q itself for decode; prefill continues to
         # use the model's BF16 flash-attention path for newly supplied tokens.
         self.q_data_type = torch.bfloat16
+        max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
+        # Multi-token DCP needs a causal KV bound for every query row. Keep the
+        # expanded metadata in builder-owned storage so CUDA-graph captures see
+        # stable addresses, and so all attention layers reuse the same work.
+        self._expanded_decode_seq_lens = torch.empty(
+            max_tokens, dtype=torch.int32, device=self.device
+        )
+        self._expanded_decode_block_table = torch.empty(
+            (max_tokens, block_table_width), dtype=torch.int32, device=self.device
+        )
+        self._decode_token_offsets = torch.arange(
+            max_tokens, dtype=torch.int32, device=self.device
+        )
+        try:
+            self.dcp_rank = get_dcp_group().rank_in_group
+        except AssertionError:
+            self.dcp_rank = 0
 
     def build(
         self,
@@ -74,6 +120,52 @@ class KimiK3NVFP4MetadataBuilder(MLACommonMetadataBuilder[KimiK3NVFP4Metadata]):
         )
         if metadata.cache_seq_lens is None:
             raise ValueError("Kimi-K3 NVFP4 requires device sequence lengths.")
+
+        metadata.expanded_decode_block_table = None
+        metadata.expanded_decode_seq_lens = None
+        decode = metadata.decode
+        if decode is None or metadata.num_decodes == 0:
+            return metadata
+        if metadata.num_decode_tokens % metadata.num_decodes:
+            raise ValueError("Kimi-K3 NVFP4 requires uniform decode query lengths.")
+        query_len = metadata.num_decode_tokens // metadata.num_decodes
+        if query_len <= 1:
+            return metadata
+
+        # A non-causal DSpark draft row always sees the same committed prefix.
+        # A causal target row sees progressively more of the speculative block.
+        # Under DCP those global causal bounds must each be localized separately:
+        # subtracting query offsets from one rank-local final length is incorrect
+        # because successive global tokens are owned round-robin by DCP ranks.
+        if metadata.causal:
+            if self.dcp_world_size == 1:
+                return metadata
+            global_final_lens = decode.dcp_tot_seq_lens
+            assert global_final_lens is not None
+            expanded_seq_lens = _expand_dcp_causal_seq_lens(
+                global_final_lens,
+                query_len,
+                self.dcp_world_size,
+                self.dcp_rank,
+                self.cp_kv_cache_interleave_size,
+                self._decode_token_offsets,
+                self._expanded_decode_seq_lens,
+            )
+        else:
+            expanded_seq_lens = self._expanded_decode_seq_lens[
+                : metadata.num_decode_tokens
+            ].view(metadata.num_decodes, query_len)
+            expanded_seq_lens.copy_(decode.seq_lens[:, None])
+            expanded_seq_lens = expanded_seq_lens.flatten()
+
+        expanded_block_table = self._expanded_decode_block_table[
+            : metadata.num_decode_tokens, : decode.block_table.shape[1]
+        ]
+        expanded_block_table.view(
+            metadata.num_decodes, query_len, decode.block_table.shape[1]
+        ).copy_(decode.block_table[:, None, :])
+        metadata.expanded_decode_seq_lens = expanded_seq_lens
+        metadata.expanded_decode_block_table = expanded_block_table
         return metadata
 
 
@@ -207,9 +299,10 @@ class KimiK3NVFP4MLAImpl(MLACommonImpl[KimiK3NVFP4Metadata]):
         query_len = num_decode_tokens // num_decodes
         block_table = attn_metadata.decode.block_table
         seq_lens = attn_metadata.decode.seq_lens
-        if not attn_metadata.causal and query_len > 1:
-            block_table = block_table.repeat_interleave(query_len, dim=0)
-            seq_lens = seq_lens.repeat_interleave(query_len)
+        if attn_metadata.expanded_decode_seq_lens is not None:
+            assert attn_metadata.expanded_decode_block_table is not None
+            block_table = attn_metadata.expanded_decode_block_table
+            seq_lens = attn_metadata.expanded_decode_seq_lens
             query_len = 1
         output = torch.empty(
             (num_decode_tokens, q_fp4.shape[0] // num_decode_tokens, 512),
