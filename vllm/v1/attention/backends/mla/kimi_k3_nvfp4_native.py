@@ -911,11 +911,11 @@ def update_kimi_k3_nvfp4_decode_cache(
         )
         owner._kimi_k3_nvfp4_q_global_scale = q_global_scale
 
-    q_rope_out = torch.empty_like(q_pe)
+    apply_rope = rotary_cos_sin is not None
+    q_rope_out = torch.empty_like(q_pe) if apply_rope else q_pe
     q_full_dummy = latent.unsqueeze(1).expand(-1, q_pe.shape[1], -1)
     q_fp4_dummy = torch.empty((1, 1), dtype=torch.uint8, device=latent.device)
     q_sf_dummy = torch.empty((1,), dtype=torch.float8_e4m3fn, device=latent.device)
-    apply_rope = rotary_cos_sin is not None
     if apply_rope and positions is None:
         raise ValueError("Kimi-K3 NVFP4 RoPE cache updates require token positions.")
     rope_positions = positions if positions is not None else gen_lens
@@ -933,7 +933,10 @@ def update_kimi_k3_nvfp4_decode_cache(
     kv_work_blocks = 512 // FP4_BLOCK_SIZE + 1 if max_gen_len == 1 else num_dim_blocks
     grid = (
         num_seqs,
-        max(kv_work_blocks, max_gen_len * q_head_blocks * q_work_blocks),
+        max(
+            kv_work_blocks,
+            max_gen_len * q_head_blocks * q_work_blocks if apply_rope else 0,
+        ),
     )
     _fp4_mla_generation_fused_qk_rope_cache_update_kernel[grid](
         kv,
@@ -1011,6 +1014,7 @@ def update_kimi_k3_nvfp4_decode_cache(
         Q1_KV_BLOCKS_PER_PROGRAM=1,
         USE_EXTERNAL_ROPE_POSITIONS=positions is not None,
         QUERY_STRIDE=query_len_per_seq,
+        PROCESS_Q=apply_rope,
         maxnreg=56,
     )
     return q_rope_out if apply_rope else q_pe

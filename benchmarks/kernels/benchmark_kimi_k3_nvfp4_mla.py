@@ -567,6 +567,67 @@ def main():
                 torch.linalg.vector_norm(restored_dcp - dcp_latent[3].float())
                 / torch.linalg.vector_norm(dcp_latent[3].float())
             )
+            continuation_cache = torch.zeros_like(update_cache)
+            continuation_owner = SimpleNamespace()
+            continuation_prefix = torch.randn(
+                (3, 576), dtype=torch.bfloat16, device=output.device
+            )
+            continuation_suffix = torch.randn(
+                (5, 576), dtype=torch.bfloat16, device=output.device
+            )
+            for values, slots, seq_len in (
+                (continuation_prefix, (0, 3), 3),
+                (continuation_suffix, (3, 8), 8),
+            ):
+                adapter.update_kimi_k3_nvfp4_decode_cache(
+                    continuation_owner,
+                    latent=values,
+                    q_pe=torch.randn(
+                        (values.shape[0], args.heads, 64),
+                        dtype=torch.bfloat16,
+                        device=output.device,
+                    ),
+                    cache=continuation_cache,
+                    block_table=torch.zeros(
+                        (1, 1), dtype=torch.int32, device=output.device
+                    ),
+                    seq_lens=torch.tensor(
+                        [seq_len], dtype=torch.int32, device=output.device
+                    ),
+                    state_indices=torch.zeros(
+                        1, dtype=torch.int32, device=output.device
+                    ),
+                    slot_mapping=torch.arange(
+                        *slots, dtype=torch.int64, device=output.device
+                    ),
+                    positions=None,
+                    query_len_per_seq=values.shape[0],
+                    rotary_cos_sin=None,
+                    max_state_slots=1,
+                    max_rewind=5,
+                )
+            torch.cuda.synchronize()
+            continuation_kv, continuation_sf, _ = adapter.split_kimi_k3_nvfp4_cache(
+                continuation_cache
+            )
+            continuation_dequant = dequant_fp4(
+                continuation_kv[0, 0, 0],
+                continuation_sf[0],
+                640,
+                adapter.FP4_MLA_KV_GLOBAL_SCALE,
+            )[0]
+            restored_continuation = torch.cat(
+                (
+                    continuation_dequant[:512],
+                    continuation_dequant[512:576] + continuation_dequant[576:],
+                )
+            )
+            result["continuation_update_rel_l2_token0"] = float(
+                torch.linalg.vector_norm(
+                    restored_continuation - continuation_prefix[0].float()
+                )
+                / torch.linalg.vector_norm(continuation_prefix[0].float())
+            )
             prefill_cache = torch.zeros_like(update_cache)
             prefill_latent = torch.randn(
                 (16, 576), dtype=torch.bfloat16, device=output.device

@@ -1591,6 +1591,7 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
     Q1_KV_BLOCKS_PER_PROGRAM: tl.constexpr,
     USE_EXTERNAL_ROPE_POSITIONS: tl.constexpr,
     QUERY_STRIDE: tl.constexpr,
+    PROCESS_Q: tl.constexpr,
 ):
     q1_shared_main: tl.constexpr = FUSE_ROPE_CACHE_STORE and MAX_GEN_TILES == 1
     q1_grouped_kv: tl.constexpr = q1_shared_main and Q1_KV_BLOCKS_PER_PROGRAM > 1
@@ -1622,7 +1623,7 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
     if FUSE_ROPE_CACHE_STORE:
         work_idx = tl.program_id(1)
         dim_block = work_idx
-        if work_idx >= 0:
+        if PROCESS_Q and work_idx >= 0:
             q_program = work_idx
             if (
                 q1_grouped_kv

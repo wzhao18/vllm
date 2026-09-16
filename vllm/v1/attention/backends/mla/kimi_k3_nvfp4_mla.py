@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 
 class KimiK3NVFP4Metadata(MLACommonMetadata):
     state_indices: torch.Tensor | None = None
+    cache_seq_lens: torch.Tensor | None = None
 
 
 class KimiK3NVFP4MetadataBuilder(MLACommonMetadataBuilder[KimiK3NVFP4Metadata]):
@@ -66,6 +67,13 @@ class KimiK3NVFP4MetadataBuilder(MLACommonMetadataBuilder[KimiK3NVFP4Metadata]):
             raise ValueError(
                 "Kimi-K3 NVFP4 requires a hybrid recurrent-state cache group."
             )
+        metadata.cache_seq_lens = (
+            common_attn_metadata.dcp_local_seq_lens
+            if self.dcp_world_size > 1
+            else common_attn_metadata.seq_lens
+        )
+        if metadata.cache_seq_lens is None:
+            raise ValueError("Kimi-K3 NVFP4 requires device sequence lengths.")
         return metadata
 
 

@@ -53,6 +53,7 @@ zero. Native cache insertion produced the expected quantization error:
 - one-token decode update relative L2: about `0.09` to `0.10`
 - full 16-token prefill tile relative L2: about `0.10`
 - DCP speculative-offset case relative L2: `0.1039`
+- mid-tile chunked-prefill continuation relative L2: about `0.10`
 - Q prefix relative L2: about `0.095`
 - Q RoPE tail with residual relative L2: about `0.0088`
 

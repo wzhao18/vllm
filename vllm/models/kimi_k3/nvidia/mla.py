@@ -372,6 +372,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             "parallelism."
         )
         self.dcp_world_size = parallel_config.decode_context_parallel_size
+        self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
         self.dcp_manager: MLADCPManager | None = None
         if self.dcp_world_size > 1:
             query_dtype = (
@@ -690,6 +691,9 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         # fp8_ds_mla), so there is no dense-MHA (forward_mha) fallback.
         num_mqa_tokens = attn_metadata.num_decode_tokens
         num_mha_tokens = q.size(0) - num_mqa_tokens
+        cache_positions = (
+            positions if self.kv_cache_dtype == "nvfp4_kimi_k3" else rope_positions
+        )
 
         # Both the prefill and decode fused epilogues write their own cache
         # slice, so there is no separate do_kv_cache_update.
@@ -700,7 +704,9 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 q[num_mqa_tokens:],
                 kv_c_normed[num_mqa_tokens:],
                 k_pe[num_mqa_tokens:],
-                rope_positions[num_mqa_tokens:] if rope_positions is not None else None,
+                cache_positions[num_mqa_tokens:]
+                if cache_positions is not None
+                else None,
                 cos_sin_cache,
                 slot_mapping[num_mqa_tokens:num_actual_toks],
                 attn_metadata,
@@ -721,7 +727,9 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 mqa_q_pe,
                 kv_c_normed[:num_mqa_tokens],
                 k_pe[:num_mqa_tokens],
-                rope_positions[:num_mqa_tokens] if rope_positions is not None else None,
+                cache_positions[:num_mqa_tokens]
+                if cache_positions is not None
+                else None,
                 cos_sin_cache,
                 slot_mapping[:num_mqa_tokens],
                 attn_metadata,
@@ -1044,43 +1052,25 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         has_context = prefill.chunked_context is not None
         fp8_prefill = prefill.q_data_type == current_platform.fp8_dtype()
 
+        if self.kv_cache_dtype == "nvfp4_kimi_k3" and self._forward_prefill_nvfp4(
+            q,
+            kv_c_normed,
+            k_pe,
+            positions,
+            cos_sin_cache,
+            slot_mapping,
+            attn_metadata,
+            out,
+        ):
+            return
+
         kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
             -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
         )
         k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
 
         if self.kv_cache_dtype == "nvfp4_kimi_k3":
-            state_indices = getattr(attn_metadata, "state_indices", None)
-            if state_indices is None:
-                raise RuntimeError("Kimi-K3 NVFP4 requires persistent state slots.")
-            from vllm.v1.attention.backends.mla.kimi_k3_nvfp4_native import (
-                update_kimi_k3_nvfp4_prefill_cache,
-            )
-
-            latent = torch.cat((kv_c_normed, k_pe.flatten(1)), dim=-1)
-            latent, q = update_kimi_k3_nvfp4_prefill_cache(
-                self,
-                latent=latent,
-                query=q,
-                cache=self.kv_cache,
-                slot_mapping=slot_mapping,
-                positions=(
-                    positions
-                    if positions is not None
-                    else torch.arange(q.shape[0], dtype=torch.int64, device=q.device)
-                ),
-                query_start_loc=prefill.query_start_loc,
-                state_indices=state_indices[attn_metadata.num_decodes :],
-                rotary_cos_sin=cos_sin_cache,
-                max_state_slots=self._nvfp4_max_state_slots,
-                max_rewind=self._nvfp4_max_rewind,
-            )
-            k_pe = latent[:, self.kv_lora_rank :].unsqueeze(1)
-            if fp8_prefill:
-                q = q.to(current_platform.fp8_dtype())
-                k, v = fused_mla_kv_concat_quant_fp8(k_nope, k_pe, v)
-            else:
-                k = fused_mla_kv_concat(k_nope, k_pe)
+            k = fused_mla_kv_concat(k_nope, k_pe)
         elif self.kv_cache_dtype == "fp8_ds_mla":
             # fp8_ds_mla cache (656B, per-tile self-scaled); bf16 attention.
             assert not fp8_prefill, (
@@ -1180,3 +1170,127 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             )
         elif not writes_out:
             out.copy_(output_prefill[..., : self.v_head_dim].flatten(start_dim=-2))
+
+    def _forward_prefill_nvfp4(
+        self,
+        q: torch.Tensor,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        positions: torch.Tensor | None,
+        cos_sin_cache: torch.Tensor | None,
+        slot_mapping: torch.Tensor,
+        attn_metadata,
+        out: torch.Tensor,
+    ) -> bool:
+        """Update native pages and optionally run chunked-context attention.
+
+        A first prompt still uses the configured flash prefill backend. A
+        continuation reads the now-complete FP4 cache directly in bounded query
+        tiles, avoiding both a context-sized dequantization buffer and a
+        query-by-context probability allocation.
+        """
+        prefill = attn_metadata.prefill
+        assert prefill is not None
+        state_indices = getattr(attn_metadata, "state_indices", None)
+        cache_seq_lens = getattr(attn_metadata, "cache_seq_lens", None)
+        if state_indices is None or cache_seq_lens is None:
+            raise RuntimeError(
+                "Kimi-K3 NVFP4 prefill requires persistent state slots and "
+                "device sequence lengths."
+            )
+        if positions is None:
+            raise RuntimeError("Kimi-K3 NVFP4 prefill requires token positions.")
+
+        from vllm.v1.attention.backends.mla.kimi_k3_nvfp4_native import (
+            quantize_kimi_k3_nvfp4_query,
+            run_kimi_k3_nvfp4_attention,
+            update_kimi_k3_nvfp4_decode_cache,
+        )
+
+        latent = torch.cat((kv_c_normed, k_pe.flatten(1)), dim=-1)
+        query_lens = prefill.query_lens_cpu.tolist()
+        request_offset = attn_metadata.num_decodes
+        token_start = 0
+        for request_idx, query_len in enumerate(query_lens):
+            token_end = token_start + query_len
+            metadata_idx = request_offset + request_idx
+            update_kimi_k3_nvfp4_decode_cache(
+                self,
+                latent=latent[token_start:token_end],
+                q_pe=q[token_start:token_end, :, self.qk_nope_head_dim :],
+                cache=self.kv_cache,
+                block_table=prefill.block_table[request_idx : request_idx + 1],
+                seq_lens=cache_seq_lens[metadata_idx : metadata_idx + 1],
+                state_indices=state_indices[metadata_idx : metadata_idx + 1],
+                slot_mapping=slot_mapping[token_start:token_end],
+                positions=positions[token_start:token_end],
+                query_len_per_seq=query_len,
+                rotary_cos_sin=cos_sin_cache,
+                max_state_slots=self._nvfp4_max_state_slots,
+                max_rewind=self._nvfp4_max_rewind,
+            )
+            token_start = token_end
+
+        if prefill.chunked_context is None:
+            return False
+
+        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        ql_nope = torch.bmm(q_nope.transpose(0, 1), self.W_UK_T).transpose(0, 1)
+        mqa_q = torch.cat((ql_nope, q_pe), dim=-1)
+        if self.dcp_world_size > 1:
+            assert self.dcp_manager is not None
+            assert self.dcp_manager.query_gather is not None
+            mqa_q = self.dcp_manager.query_gather(mqa_q)
+            from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
+
+            dcp_rank = self.dcp_manager.group.rank_in_group
+
+        query_tile = 16
+        token_start = 0
+        for request_idx, query_len in enumerate(query_lens):
+            token_end = token_start + query_len
+            request_table = prefill.block_table[request_idx : request_idx + 1]
+            for tile_start in range(token_start, token_end, query_tile):
+                tile_end = min(tile_start + query_tile, token_end)
+                query = mqa_q[tile_start:tile_end]
+                tile_tokens = tile_end - tile_start
+                q_fp4, q_sf = quantize_kimi_k3_nvfp4_query(self.impl, query)
+                latent_out = torch.empty(
+                    (tile_tokens, query.shape[1], self.kv_lora_rank),
+                    dtype=torch.bfloat16,
+                    device=query.device,
+                )
+                block_table = request_table.expand(tile_tokens, -1)
+                seq_lens = positions[tile_start:tile_end] + 1
+                if self.dcp_world_size > 1:
+                    seq_lens = get_dcp_local_seq_lens(
+                        seq_lens,
+                        dcp_size=self.dcp_world_size,
+                        dcp_rank=dcp_rank,
+                        cp_kv_cache_interleave_size=(self.cp_kv_cache_interleave_size),
+                    )
+                run_kimi_k3_nvfp4_attention(
+                    self.impl,
+                    q_fp4=q_fp4,
+                    q_sf=q_sf,
+                    cache=self.kv_cache,
+                    block_table=block_table,
+                    seq_lens=seq_lens,
+                    output=latent_out,
+                    query_len_per_seq=1,
+                    sm_scale=self.scale,
+                )
+                if self.dcp_world_size > 1:
+                    lse = self.impl._kimi_k3_nvfp4_max + torch.log(  # type: ignore[attr-defined]
+                        self.impl._kimi_k3_nvfp4_denom  # type: ignore[attr-defined]
+                    )
+                    lse.masked_fill_(seq_lens[:, None] == 0, float("-inf"))
+                    latent_out = self.dcp_manager.combine(
+                        latent_out,
+                        lse,
+                        seq_lens=None,
+                        query_start_loc=None,
+                    )
+                self._v_up_proj(latent_out, out=out[tile_start:tile_end])
+            token_start = token_end
+        return True
