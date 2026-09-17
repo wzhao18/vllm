@@ -2288,6 +2288,43 @@ def test_requester_worker_init_uses_positional_setup(tmp_path, monkeypatch):
     assert w.coord.retention_interval == 0
 
 
+def test_worker_init_requires_selective_lease_api(monkeypatch):
+    store = MagicMock()
+    store.setup.return_value = 0
+    store.batch_is_exist_no_lease = None
+    _install_fake_mooncake(monkeypatch, store)
+    _patch_worker_runtime(monkeypatch)
+    monkeypatch.setattr(
+        worker.MooncakeStoreConfig,
+        "load_from_config",
+        staticmethod(lambda: _make_config()),
+    )
+
+    with pytest.raises(RuntimeError, match="batch_is_exist_no_lease"):
+        worker.MooncakeStoreWorker(
+            _make_vllm_config(extra_config={"require_selective_lease": True}),
+            _make_kv_cache_config(),
+        )
+
+
+def test_worker_init_rejects_required_but_disabled_selective_lease(monkeypatch):
+    store = MagicMock()
+    store.setup.return_value = 0
+    _install_fake_mooncake(monkeypatch, store)
+    _patch_worker_runtime(monkeypatch)
+
+    with pytest.raises(ValueError, match="enable_selective_lease=False"):
+        worker.MooncakeStoreWorker(
+            _make_vllm_config(
+                extra_config={
+                    "enable_selective_lease": False,
+                    "require_selective_lease": True,
+                }
+            ),
+            _make_kv_cache_config(),
+        )
+
+
 def test_requester_worker_init_prefers_local_hostname_override(
     tmp_path,
     monkeypatch,
@@ -3430,6 +3467,7 @@ def _make_bare_worker(
     worker.cache_config.num_gpu_blocks = num_gpu_blocks
     worker.store = MagicMock()
     worker.store.batch_is_exist_no_lease = None
+    worker.enable_selective_lease = True
     worker.store.register_buffer.return_value = 0
     worker.kv_role = kv_role
     worker.can_put = kv_role in ("kv_producer", "kv_both") or save_decode_cache
@@ -3751,21 +3789,23 @@ def test_lookup_leases_only_selected_mamba_checkpoint():
     )
 
     hash_block_size = 128
-    page_size = 1536
-    num_tokens = 128 * 1024
-    num_hashes = num_tokens // hash_block_size
-    worker = _make_bare_worker(block_size=page_size)
+    mamba_block_size = 896
+    attention_block_size = 7168
+    lookup_tokens = 128 * 1024 + hash_block_size
+    request_tokens = lookup_tokens + 1
+    num_hashes = lookup_tokens // hash_block_size
+    worker = _make_bare_worker(block_size=attention_block_size)
     worker.tp_size = 8
     worker.dcp_size = 8
     worker.num_kv_head = 1
     mamba = MambaSpec(
-        block_size=page_size,
+        block_size=mamba_block_size,
         shapes=((1, 1),),
         dtypes=(torch.float32,),
         mamba_cache_mode="align",
     )
     full = FullAttentionSpec(
-        block_size=page_size,
+        block_size=attention_block_size,
         num_kv_heads=1,
         head_size=64,
         dtype=None,
@@ -3777,30 +3817,34 @@ def test_lookup_leases_only_selected_mamba_checkpoint():
     worker.token_dbs = [
         ChunkedTokenDatabase(
             KeyMetadata("test-model", 0, 0, 0, 0, group_id=group_id),
-            block_size=page_size,
+            block_size=(
+                mamba_block_size if group_id < 3 else attention_block_size
+            ),
             hash_block_size=hash_block_size,
         )
         for group_id in range(4)
     ]
     worker.coord = mooncake_store_worker.MooncakeStoreCoordinator(
         worker._kv_cache_groups,
-        scheduler_block_size=page_size,
+        scheduler_block_size=attention_block_size,
         hash_block_size=hash_block_size,
+        retention_interval=0,
     )
     _refresh_group_tp_replication_factors(worker)
 
     hashes = [f"h{hash_id:04d}".encode() for hash_id in range(num_hashes)]
-    periodic_hashes = {
+    mamba_hashes = {
         hash_value.hex()
         for hash_id, hash_value in enumerate(hashes, start=1)
-        if hash_id % (page_size // hash_block_size) == 0
+        if hash_id % (mamba_block_size // hash_block_size) == 0
     }
+    mamba_hashes.add(hashes[-1].hex())
 
     def discover(keys):
         return [
             int(
                 int(key.split("@group:")[1].split("@")[0]) == 3
-                or key.rsplit("@", 1)[1] in periodic_hashes
+                or key.rsplit("@", 1)[1] in mamba_hashes
             )
             for key in keys
         ]
@@ -3809,7 +3853,7 @@ def test_lookup_leases_only_selected_mamba_checkpoint():
     worker.store.batch_is_exist.return_value = []
     worker.store.batch_is_exist.side_effect = lambda keys: [1] * len(keys)
 
-    result = worker.lookup(num_tokens, hashes)
+    result = worker.lookup(request_tokens, hashes)
 
     discovery_keys = worker.store.batch_is_exist_no_lease.call_args.args[0]
     leased_keys = worker.store.batch_is_exist.call_args.args[0]
@@ -3821,20 +3865,36 @@ def test_lookup_leases_only_selected_mamba_checkpoint():
     leased_mamba_keys = [
         key for key in leased_keys if int(key.split("@group:")[1].split("@")[0]) < 3
     ]
-    checkpoints_per_group = num_tokens // page_size
-    assert result.hit_length == checkpoints_per_group * page_size
+    checkpoints_per_group = lookup_tokens // mamba_block_size
+    attention_chunks = (lookup_tokens + attention_block_size - 1) // attention_block_size
+    assert result.hit_length == lookup_tokens
+    assert all(
+        boundary.num_tokens == lookup_tokens for boundary in result.tail_key_boundaries
+    )
     assert len(discovery_keys) == 4 * 8 * num_hashes
-    assert len(discovered_mamba_keys) == 3 * 8 * checkpoints_per_group
+    assert len(discovered_mamba_keys) == 3 * 8 * (checkpoints_per_group + 1)
     assert len(leased_mamba_keys) == 3 * 8
-    assert len(leased_keys) == (3 + checkpoints_per_group) * 8
+    assert len(leased_keys) == (3 + attention_chunks) * 8
 
 
-def test_lookup_recomputes_if_selected_key_disappears_before_lease():
+@pytest.mark.parametrize("lease_result", [[0], []])
+def test_lookup_recomputes_if_selected_key_disappears_before_lease(lease_result):
     worker = _make_bare_worker(block_size=16)
     worker.store.batch_is_exist_no_lease = MagicMock(return_value=[1])
-    worker.store.batch_is_exist.return_value = [0]
+    worker.store.batch_is_exist.return_value = lease_result
 
     assert worker.lookup(16, [b"h0"]).hit_length == 0
+
+
+def test_lookup_can_disable_selective_lease_with_capable_runtime():
+    worker = _make_bare_worker(block_size=16)
+    worker.enable_selective_lease = False
+    worker.store.batch_is_exist_no_lease = MagicMock(return_value=[1, 1])
+    worker.store.batch_is_exist.return_value = [1, 1]
+
+    assert worker.lookup(33, [b"h0", b"h1"]).hit_length == 32
+    worker.store.batch_is_exist_no_lease.assert_not_called()
+    worker.store.batch_is_exist.assert_called_once()
 
 
 def test_lookup_requires_all_dcp_rank_namespaces():
@@ -4326,7 +4386,8 @@ def test_register_kv_caches_shared_storage(layout: KVCacheLayout):
     worker.store.register_buffer.assert_called_once_with(raw.data_ptr(), raw.nbytes)
 
 
-def test_register_kv_caches_uses_transfer_group_memory_domain():
+@pytest.mark.parametrize("compact_group_io", [False, True])
+def test_register_kv_caches_uses_transfer_group_memory_domain(compact_group_io):
     """Derived GPU caches must not change host-source transfer addresses."""
     from vllm.v1.kv_cache_interface import (
         KVCacheConfig,
@@ -4376,6 +4437,8 @@ def test_register_kv_caches_uses_transfer_group_memory_domain():
         hisparse_host_num_blocks=host_num_blocks,
     )
     worker = _make_bare_worker(num_gpu_blocks=gpu_num_blocks)
+    worker.compact_group_io = compact_group_io
+    worker.kv_cache_layout = KVCacheLayout.LBHNC
     worker._kv_cache_config = config
     worker._kv_cache_groups = list(config.transfer_groups)
     worker.token_dbs = [
@@ -4642,7 +4705,7 @@ def test_register_kv_caches_compact_group_regions_strip_mamba_padding():
         )
     ]
 
-    _register_with_mocked_threads(worker, {"mamba": cache})
+    _register_with_mocked_threads(worker, {"mamba": [cache]})
 
     db = worker.token_dbs[0]
     assert isinstance(db.store_layout, RankLocalStoreLayout)
@@ -4652,6 +4715,126 @@ def test_register_kv_caches_compact_group_regions_strip_mamba_padding():
         [cache.data_ptr() + 2 * spec.page_size_bytes],
         [24],
     )
+
+
+def test_compact_mamba_real_geometry_roundtrip_preserves_padding_pages():
+    """Model 23 Kimi Mamba layers packed into 29 padded backing pages."""
+    from vllm.v1.kv_cache_interface import KVCacheConfig
+
+    num_blocks = 2
+    num_layers = 23
+    backing_pages = 29
+    physical_page_bytes = 516096
+    useful_page_bytes = 457728
+    block_size = 896
+    raw_block_bytes = backing_pages * physical_page_bytes
+    spec = MambaSpec(
+        block_size=block_size,
+        shapes=((useful_page_bytes,),),
+        dtypes=(torch.uint8,),
+        page_size_padded=physical_page_bytes,
+    )
+    layer_names = [f"mamba.{i}" for i in range(num_layers)]
+    group = KVCacheGroupSpec(layer_names, spec)
+    source = torch.full(
+        (num_blocks * raw_block_bytes,), 0xA5, dtype=torch.uint8
+    )
+    destination = torch.full_like(source, 0x5A)
+
+    def views(raw):
+        result = {}
+        for layer_id, layer_name in enumerate(layer_names):
+            # Current Mamba registration passes [conv, recurrent] views that
+            # share one raw allocation. The first view identifies the page;
+            # its block stride spans every backing page.
+            page = raw.as_strided(
+                (num_blocks, 1),
+                (raw_block_bytes, 1),
+                storage_offset=layer_id * physical_page_bytes,
+            )
+            result[layer_name] = [page, page]
+        return result
+
+    source_views = views(source)
+    destination_views = views(destination)
+    for block_id in range(num_blocks):
+        for layer_id in range(num_layers):
+            start = block_id * raw_block_bytes + layer_id * physical_page_bytes
+            source[start : start + useful_page_bytes].fill_(layer_id + block_id + 1)
+
+    worker = _make_bare_worker(
+        num_gpu_blocks=num_blocks, block_size=block_size
+    )
+    worker.compact_group_io = True
+    worker.kv_cache_layout = KVCacheLayout.LBNHC
+    worker._kv_cache_groups = [group]
+    worker._kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[group],
+    )
+    worker.token_dbs = [
+        ChunkedTokenDatabase(
+            KeyMetadata("test-model", 0, 0, 0, 0, group_id=0),
+            block_size=block_size,
+            hash_block_size=128,
+        )
+    ]
+
+    _register_with_mocked_threads(worker, source_views)
+    source_layout = worker.token_dbs[0].store_layout
+    assert isinstance(source_layout, RankLocalStoreLayout)
+    assert len(source_layout.kv_caches_base_addr) == num_layers
+    assert source_layout.block_stride == [raw_block_bytes] * num_layers
+    assert sum(source_layout.block_len) == 10527744
+
+    destination_layout = RankLocalStoreLayout(
+        source_layout.metadata, block_size, 128
+    )
+    destination_layout.set_kv_cache_regions(
+        [destination_views[name][0].data_ptr() for name in layer_names],
+        [raw_block_bytes] * num_layers,
+        [useful_page_bytes] * num_layers,
+    )
+    chunks = [(0, block_size), (block_size, 2 * block_size)]
+    source_addrs, sizes, _ = source_layout.prepare_values(chunks, [0, 1], [0, 0])
+    destination_addrs, destination_sizes, _ = destination_layout.prepare_values(
+        chunks, [0, 1], [0, 0]
+    )
+    assert sizes == destination_sizes
+    for src_row, dst_row, size_row in zip(
+        source_addrs, destination_addrs, sizes, strict=True
+    ):
+        for src_addr, dst_addr, size in zip(
+            src_row, dst_row, size_row, strict=True
+        ):
+            src_offset = src_addr - source.data_ptr()
+            dst_offset = dst_addr - destination.data_ptr()
+            destination[dst_offset : dst_offset + size].copy_(
+                source[src_offset : src_offset + size]
+            )
+
+    for block_id in range(num_blocks):
+        block_start = block_id * raw_block_bytes
+        for layer_id in range(num_layers):
+            start = block_start + layer_id * physical_page_bytes
+            assert torch.equal(
+                destination[start : start + useful_page_bytes],
+                source[start : start + useful_page_bytes],
+            )
+            assert torch.all(
+                destination[
+                    start + useful_page_bytes : start + physical_page_bytes
+                ]
+                == 0x5A
+            )
+        assert torch.all(
+            destination[
+                block_start + num_layers * physical_page_bytes :
+                block_start + backing_pages * physical_page_bytes
+            ]
+            == 0x5A
+        )
 
 
 @pytest.mark.parametrize(

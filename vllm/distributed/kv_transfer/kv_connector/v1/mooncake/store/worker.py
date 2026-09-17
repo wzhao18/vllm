@@ -1667,6 +1667,19 @@ class MooncakeStoreWorker:
             str(extra_config.get("compact_group_io", "False")).strip().lower()
             == "true"
         )
+        self.enable_selective_lease = (
+            str(extra_config.get("enable_selective_lease", "True")).strip().lower()
+            == "true"
+        )
+        require_selective_lease = (
+            str(extra_config.get("require_selective_lease", "False")).strip().lower()
+            == "true"
+        )
+        if require_selective_lease and not self.enable_selective_lease:
+            raise ValueError(
+                "require_selective_lease cannot be used with "
+                "enable_selective_lease=False"
+            )
         self.kv_cache_layout = (
             self.cache_config.get_resolved_kv_cache_layout()
             if self.compact_group_io
@@ -1718,6 +1731,13 @@ class MooncakeStoreWorker:
             msg = "Initialize MooncakeDistributedStore failed."
             logger.error(msg)
             raise RuntimeError(msg)
+        if require_selective_lease and not callable(
+            getattr(self.store, "batch_is_exist_no_lease", None)
+        ):
+            raise RuntimeError(
+                "require_selective_lease requires a Mooncake runtime with "
+                "batch_is_exist_no_lease support"
+            )
 
         preferred_segment = rdma_utils.get_configured_preferred_segment(extra_config)
         self.preferred_segment = preferred_segment
@@ -2515,7 +2535,11 @@ class MooncakeStoreWorker:
             return MooncakeLookupResult(0)
 
         lookup_start = time.perf_counter()
-        no_lease_lookup = getattr(self.store, "batch_is_exist_no_lease", None)
+        no_lease_lookup = (
+            getattr(self.store, "batch_is_exist_no_lease", None)
+            if getattr(self, "enable_selective_lease", True)
+            else None
+        )
         try:
             if callable(no_lease_lookup):
                 res = no_lease_lookup(candidate_keys)
@@ -2594,7 +2618,9 @@ class MooncakeStoreWorker:
                 )
                 logger.error("Failed to lease Mooncake lookup result: %s", e)
                 return MooncakeLookupResult(0)
-            if any(exists != 1 for exists in lease_results):
+            if len(lease_results) != len(lease_keys) or any(
+                exists != 1 for exists in lease_results
+            ):
                 logger.info(
                     "Mooncake lookup result changed before lease acquisition; "
                     "falling back to recompute"
