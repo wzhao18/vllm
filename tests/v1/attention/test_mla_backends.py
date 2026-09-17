@@ -1053,6 +1053,45 @@ def test_tokenspeed_mla_noncausal_capability():
     assert tokenspeed_mla_module.TokenspeedMLABackend.supports_non_causal()
 
 
+@pytest.mark.parametrize("interleave_size", [1, 64])
+def test_tokenspeed_mla_impl_stores_cp_interleave_size(monkeypatch, interleave_size):
+    monkeypatch.setitem(
+        sys.modules,
+        "tokenspeed_mla",
+        SimpleNamespace(warmup_compile_prefill=lambda **kwargs: None),
+    )
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=8,
+            cp_kv_cache_interleave_size=interleave_size,
+        )
+    )
+
+    with set_current_vllm_config(vllm_config):
+        impl = tokenspeed_mla_module.TokenspeedMLAImpl(
+            num_heads=128,
+            head_size=576,
+            scale=1.0,
+            num_kv_heads=1,
+            alibi_slopes=None,
+            sliding_window=None,
+            kv_cache_dtype="fp8",
+            logits_soft_cap=None,
+            attn_type=tokenspeed_mla_module.AttentionType.DECODER,
+            kv_sharing_target_layer_name=None,
+            q_lora_rank=1536,
+            kv_lora_rank=512,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            qk_head_dim=192,
+            v_head_dim=128,
+            kv_b_proj=object(),
+        )
+
+    assert impl.dcp_world_size == 8
+    assert impl.cp_kv_cache_interleave_size == interleave_size
+
+
 def test_flashinfer_mla_dspark_dcp_supports_target_and_draft(monkeypatch):
     flashinfer_mla_module = pytest.importorskip(
         "vllm.v1.attention.backends.mla.flashinfer_mla"
