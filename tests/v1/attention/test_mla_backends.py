@@ -1093,6 +1093,7 @@ def test_flashinfer_mla_dspark_dcp_supports_target_and_draft(monkeypatch):
     [
         pytest.param(True, 1, 2, 1, id="causal-dcp"),
         pytest.param(False, 3, 1, 0, id="noncausal-multi-token"),
+        pytest.param(False, 4, 8, 3, id="dspark-noncausal-dcp8"),
     ],
 )
 def test_tokenspeed_mla_decode_contract(
@@ -1132,7 +1133,7 @@ def test_tokenspeed_mla_decode_contract(
     impl = object.__new__(tokenspeed_mla_module.TokenspeedMLAImpl)
     impl.dcp_world_size = dcp_world_size
     impl.dcp_rank = dcp_rank
-    impl.cp_kv_cache_interleave_size = 1
+    impl.cp_kv_cache_interleave_size = 64
     impl.need_to_return_lse_for_decode = True
     impl.kv_lora_rank = kv_lora_rank
     impl.qk_rope_head_dim = qk_rope_head_dim
@@ -1191,6 +1192,7 @@ def test_tokenspeed_mla_decode_contract(
     assert decode_call["return_lse"] is True
     assert decode_call["cp_world"] == dcp_world_size
     assert decode_call["cp_rank"] == dcp_rank
+    assert decode_call["cp_interleave_size"] == 64
 
 
 @pytest.mark.parametrize("is_fp8_kvcache", [False, True], ids=["bf16", "fp8"])

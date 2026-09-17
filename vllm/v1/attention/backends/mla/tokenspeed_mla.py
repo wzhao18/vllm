@@ -155,6 +155,7 @@ class TokenspeedMLABackend(MLACommonBackend):
 class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
     can_return_lse_for_decode: bool = True
     supports_dcp: bool = True
+    supports_mtp_with_cp_non_trivial_interleave_size: bool = True
     # tokenspeed_mla_decode returns LSE in log2 units; its own DCP test merges
     # partial outputs with exp2(lse).
     lse_base_on_e: bool = False
@@ -311,6 +312,7 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
             causal_seqs=causal_seqs if self.dcp_world_size > 1 else None,
             cp_world=self.dcp_world_size,
             cp_rank=self.dcp_rank,
+            cp_interleave_size=self.cp_kv_cache_interleave_size,
         )
         if return_lse:
             o, lse = kernel_out
