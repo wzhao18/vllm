@@ -2533,7 +2533,12 @@ def test_boundary_states_offered_past_prompt_for_resumed_prefill():
     assert req0.num_prompt_tokens < 2 * block_size
 
 
-def _make_kimi_dcp8_retention_manager():
+def _make_kimi_dcp8_retention_manager(
+    retention_interval: int = 0,
+    *,
+    use_eagle: bool = True,
+    annotate_fa_eagle: bool = True,
+):
     """Production Kimi-K3 cache geometry, without allocating model tensors."""
     hash_block_size = 128
     mamba_block_size = 896
@@ -2559,34 +2564,62 @@ def _make_kimi_dcp8_retention_manager():
                 head_size=1,
                 dtype=torch.float32,
             ),
+            is_eagle_group=annotate_fa_eagle,
         ),
     ]
     manager = make_kv_cache_manager(
         kv_cache_config=KVCacheConfig(
-            num_blocks=256,
+            num_blocks=2048,
             kv_cache_tensors=[],
             kv_cache_groups=groups,
-            prefix_cache_retention_interval=0,
+            prefix_cache_retention_interval=retention_interval,
         ),
-        max_model_len=32_768,
+        max_model_len=1_048_576,
         enable_caching=True,
         dcp_world_size=dcp_world_size,
         scheduler_block_size=mamba_block_size * dcp_world_size,
         hash_block_size=hash_block_size,
-        use_eagle=True,
+        use_eagle=use_eagle,
     )
     return manager
 
 
-def test_kimi_dcp8_retention_selects_minimal_strict_append_states():
+@pytest.mark.parametrize(
+    ("use_eagle", "annotate_fa_eagle", "eagle_group_ids", "mamba_group_eagle"),
+    [
+        (False, False, set(), False),
+        (True, False, {0, 1, 2, 3}, True),
+        (True, True, {3}, False),
+    ],
+)
+def test_mamba_replay_boundary_is_independent_of_group_eagle_drop(
+    use_eagle: bool,
+    annotate_fa_eagle: bool,
+    eagle_group_ids: set[int],
+    mamba_group_eagle: bool,
+):
+    manager = _make_kimi_dcp8_retention_manager(
+        use_eagle=use_eagle,
+        annotate_fa_eagle=annotate_fa_eagle,
+    )
+
+    assert manager.coordinator.eagle_group_ids == eagle_group_ids
+    for mamba_manager in manager.coordinator.single_type_managers[:3]:
+        assert mamba_manager.use_eagle is mamba_group_eagle
+        assert mamba_manager.drop_eagle_checkpoint_block is use_eagle
+
+
+@pytest.mark.parametrize("prompt_len", [1_153, 106_988, 191_147])
+def test_kimi_dcp8_retention_selects_minimal_eagle_safe_states(
+    prompt_len: int,
+):
     """The coordinator, not a manually supplied worker fixture, selects the
     retained states for a production-shaped strict-append turn.
 
-    Sparse retention must preserve the reusable prefix to PMU precision while
+    Sparse retention must preserve the current-policy Eagle-safe prefix while
     handing off no more than two distinct Mamba checkpoints for one turn.
     """
     hash_block_size = 128
-    prompt_len = 1_153
     manager = _make_kimi_dcp8_retention_manager()
     producer = make_request(
         "producer", list(range(prompt_len)), hash_block_size, sha256
@@ -2638,8 +2671,12 @@ def test_kimi_dcp8_retention_selects_minimal_strict_append_states():
     )
     _, hit_tokens, _ = manager.get_computed_blocks(appended)
 
-    assert prompt_len - hit_tokens < hash_block_size, (
-        hit_tokens,
-        sorted(offered_boundaries),
-    )
+    hash_boundary = prompt_len // hash_block_size * hash_block_size
+    eagle_safe_boundary = hash_boundary - hash_block_size
+    assert hit_tokens == eagle_safe_boundary
+    assert offered_boundaries == {eagle_safe_boundary}
     assert len(offered_boundaries) <= 2
+    # This explicitly records the still-unmet raw-prefix target: current Eagle
+    # policy unconditionally rewinds one PMU in addition to the unaligned raw
+    # tail. Avoid treating this passing selector test as proof of <=1 PMU loss.
+    assert hash_block_size <= prompt_len - hit_tokens <= 2 * hash_block_size - 1
