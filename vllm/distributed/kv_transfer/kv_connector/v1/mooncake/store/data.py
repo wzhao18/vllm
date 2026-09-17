@@ -795,6 +795,9 @@ class ReqMeta:
     # Absolute request offset represented by token_ids[0].
     token_ids_start: int = 0
     num_prompt_tokens: int | None = None
+    # Absolute token extent made readable by this job's CUDA event. This is
+    # distinct from token_len_chunk, which uses full-page save granularity.
+    computed_end_tokens: int | None = None
     # Identifies this store job for the engine's lifetime. A request id cannot
     # serve that purpose: it is reused once a preempted request resumes, so it
     # would release the wrong job's blocks.
@@ -866,6 +869,7 @@ class ReqMeta:
             token_ids=token_ids,
             token_ids_start=token_ids_start,
             num_prompt_tokens=tracker.prefill_end_tokens,
+            computed_end_tokens=tracker.token_len,
         )
 
 

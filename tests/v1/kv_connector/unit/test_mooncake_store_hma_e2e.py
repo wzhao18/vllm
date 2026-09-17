@@ -68,7 +68,11 @@ class _DictStore:
 
 
 def _run_dcp8_aligned_tail_replay(
-    prompt_tail: int, replay_boundary: int
+    prompt_tail: int,
+    replay_boundary: int,
+    computed_end_tokens: int | None = None,
+    append_tokens: int = 0,
+    block_publication: bool = False,
 ) -> tuple[int, dict[int, int], dict[int, int]]:
     """Save exact Kimi-K3 group geometry, then perform an identical lookup."""
     mamba = MambaSpec(
@@ -94,7 +98,32 @@ def _run_dcp8_aligned_tail_replay(
         retention_interval=0,
         dcp_world_size=8,
     )
-    store = _DictStore()
+    put_entered = threading.Event()
+    release_put = threading.Event()
+
+    class _PublicationStore(_DictStore):
+        def __init__(self):
+            super().__init__()
+            self.discovery_calls: list[list[str]] = []
+            self.lease_calls: list[list[str]] = []
+
+        def batch_is_exist(self, keys):
+            self.lease_calls.append(list(keys))
+            return super().batch_is_exist(keys)
+
+        def batch_is_exist_no_lease(self, keys):
+            self.discovery_calls.append(list(keys))
+            return super().batch_is_exist(keys)
+
+        def batch_put_from_multi_buffers(self, keys, addrs, sizes, *args, **kwargs):
+            if block_publication:
+                put_entered.set()
+                assert release_put.wait(timeout=5)
+            return super().batch_put_from_multi_buffers(
+                keys, addrs, sizes, *args, **kwargs
+            )
+
+    store = _PublicationStore()
     dbs = []
     for group_id, block_size in enumerate((896, 896, 896, 7168)):
         db = ChunkedTokenDatabase(
@@ -117,29 +146,32 @@ def _run_dcp8_aligned_tail_replay(
         ready_event=threading.Event(),
         replicate_config=MagicMock(),
     )
-    hash_count = prompt_tail // 128 + 1
+    # num_prompt_tokens is prompt_tail + 1, so prompt_tail is the final full
+    # 128-token hash boundary.  Do not synthesize a future hash beyond the
+    # producer's tokens: EAGLE lookup may only use proof the producer computed.
+    hash_count = prompt_tail // 128
     block_hashes = [
         BlockHash(i.to_bytes(8, byteorder="little")) for i in range(1, hash_count + 1)
     ]
     req = ReqMeta(
         req_id="r0",
         token_len_chunk=0,
-        block_ids=([1] * 16, [2] * 16, [3] * 16, [4] * 4),
+        block_ids=(
+            [1] * 16,
+            [2] * 16,
+            [3] * 16,
+            [4] * ((prompt_tail + 7167) // 7168 + 1),
+        ),
         block_hashes=block_hashes,
         can_save=True,
         num_prompt_tokens=prompt_tail + 1,
+        computed_end_tokens=computed_end_tokens,
         boundary_state_offloads=[
             (group_id, 20 + group_id, boundary)
             for boundary in (replay_boundary, prompt_tail)
             for group_id in range(3)
         ],
     )
-    assert sender._maybe_offload_boundary_states(req)
-    # Model the normal positional save of completed attention pages. Boundary
-    # hand-offs only add the partial page that contains each retained state.
-    for boundary in range(7168, prompt_tail + 1, 7168):
-        store._data[dbs[3].key_for(block_hashes[boundary // 128 - 1])] = b"x"
-
     worker = object.__new__(mooncake_store_worker.MooncakeStoreWorker)
     worker._capacity_only = False
     worker.coord = coord
@@ -162,10 +194,61 @@ def _run_dcp8_aligned_tail_replay(
             for group_id in range(4)
         }
 
-    hit = worker.lookup(
-        num_tokens=prompt_tail + 1, block_hashes=block_hashes
-    ).hit_length
-    return hit, group_counts(replay_boundary), group_counts(prompt_tail)
+    target_tokens = prompt_tail + 1 + append_tokens
+    target_hash_count = target_tokens // 128
+    target_hashes = block_hashes + [
+        BlockHash(i.to_bytes(8, byteorder="little"))
+        for i in range(hash_count + 1, target_hash_count + 1)
+    ]
+    if block_publication:
+        save_result: list[bool] = []
+        save_thread = threading.Thread(
+            target=lambda: save_result.append(
+                sender._maybe_offload_boundary_states(req)
+            )
+        )
+        save_thread.start()
+        assert put_entered.wait(timeout=5)
+        assert worker.lookup(target_tokens, target_hashes).hit_length == 0
+        release_put.set()
+        save_thread.join(timeout=5)
+        assert not save_thread.is_alive()
+        assert save_result == [True]
+    else:
+        assert sender._maybe_offload_boundary_states(req)
+    # Model the normal positional save of completed attention pages. Boundary
+    # hand-offs only add the partial page that contains each retained state.
+    for boundary in range(7168, prompt_tail + 1, 7168):
+        store._data[dbs[3].key_for(block_hashes[boundary // 128 - 1])] = b"x"
+
+    store.discovery_calls.clear()
+    store.lease_calls.clear()
+    result = worker.lookup(num_tokens=target_tokens, block_hashes=target_hashes)
+    load_keys = worker._lookup_load_keys(target_hashes, result)
+    lease_keys = store.lease_calls[0] if result.hit_length else []
+    assert all(key in store._data for key in load_keys)
+    if result.hit_length:
+        assert store.lease_calls == [lease_keys]
+        assert set(lease_keys) <= set(store.discovery_calls[0])
+    if result.hit_length == replay_boundary and prompt_tail == replay_boundary + 128:
+        tail_boundaries = {
+            boundary.group_id: boundary.num_tokens
+            for boundary in result.tail_key_boundaries
+        }
+        assert tail_boundaries == {
+            0: replay_boundary,
+            1: replay_boundary,
+            2: replay_boundary,
+            3: replay_boundary,
+        }
+        proof_key = dbs[3].key_for(block_hashes[prompt_tail // 128 - 1])
+        assert proof_key in store.discovery_calls[0]
+        assert proof_key not in load_keys
+        assert proof_key in lease_keys
+        proof_value = store._data.pop(proof_key)
+        assert worker.lookup(target_tokens, target_hashes).hit_length < replay_boundary
+        store._data[proof_key] = proof_value
+    return result.hit_length, group_counts(replay_boundary), group_counts(prompt_tail)
 
 
 @pytest.mark.parametrize("prompt_tail", [1792, 1920])

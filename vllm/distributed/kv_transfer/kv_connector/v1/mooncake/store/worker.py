@@ -828,6 +828,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         entries: list[tuple[int, int, int]],
         *,
         include_mamba_boundary: bool = True,
+        only_groups: frozenset[int] | None = None,
     ) -> list[tuple[str, list[int], list[int], KeyMetadata]]:
         """Puts for the request's sub-block partial tail (its last prompt hash
         boundary), so a later request can hit the sub-block prefix.
@@ -857,6 +858,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
         puts: list[tuple[str, list[int], list[int], KeyMetadata]] = []
         for g_idx, db in enumerate(self.token_databases):
             if not self.group_participates[g_idx]:
+                continue
+            if only_groups is not None and g_idx not in only_groups:
                 continue
             group_blocks = req_meta.block_ids[g_idx]
             # Distribute across ranks by the same rule as normal chunks.
@@ -936,6 +939,47 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 sub_block.append(entry)
 
         puts = self._boundary_snapshot_puts(req_meta, snapshots)
+
+        def add_attention_tail(
+            boundary_entries: list[tuple[int, int, int]],
+            *,
+            include_boundary: bool,
+        ) -> None:
+            """Persist attention bytes needed to prove a recurrent boundary."""
+            boundary = boundary_entries[0][2]
+            if include_boundary:
+                puts.extend(
+                    self._sub_block_tail_puts(
+                        req_meta,
+                        boundary_entries,
+                        include_mamba_boundary=False,
+                    )
+                )
+            # EAGLE verifies the next hash boundary and then rewinds one hash
+            # unit. Whole-request hashes arrive before their cache bytes, so
+            # only the scheduler's event-covered computed extent authorizes
+            # reading this look-ahead proof.
+            peek_boundary = boundary + self.coord.hash_block_size
+            if (
+                req_meta.computed_end_tokens is None
+                or peek_boundary > req_meta.computed_end_tokens
+            ):
+                return
+            eagle_attention_groups = frozenset(
+                self.coord.eagle_group_ids - self.coord.mamba_group_ids
+            )
+            puts.extend(
+                self._sub_block_tail_puts(
+                    req_meta,
+                    [
+                        (group_id, block_id, peek_boundary)
+                        for group_id, block_id, _ in boundary_entries
+                    ],
+                    include_mamba_boundary=False,
+                    only_groups=eagle_attention_groups,
+                )
+            )
+
         if self.coord.enable_partial_hash_hits:
             # A boundary can be block-aligned for Mamba but still fall inside a
             # larger attention block (DCP8: 896-token Mamba vs. 7168-token FA).
@@ -950,16 +994,13 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     and boundary % db.block_size != 0
                     for g_idx, db in enumerate(self.token_databases)
                 )
-                if needs_attention_tail:
-                    puts.extend(
-                        self._sub_block_tail_puts(
-                            req_meta,
-                            boundary_entries,
-                            include_mamba_boundary=False,
-                        )
-                    )
+                add_attention_tail(
+                    boundary_entries,
+                    include_boundary=needs_attention_tail,
+                )
         if sub_block and self.coord.enable_partial_hash_hits:
             puts.extend(self._sub_block_tail_puts(req_meta, sub_block))
+            add_attention_tail(sub_block, include_boundary=False)
 
         if not puts:
             return True
@@ -2637,7 +2678,9 @@ class MooncakeStoreWorker:
             ),
         )
         if callable(no_lease_lookup) and hit_length > 0:
-            lease_keys = self._lookup_load_keys(block_hashes, result)
+            lease_keys = self._lookup_lease_keys(
+                block_hashes, result, cached_block_pool
+            )
             lease_start = time.perf_counter()
             try:
                 lease_results = self.store.batch_is_exist(lease_keys)
@@ -2698,6 +2741,35 @@ class MooncakeStoreWorker:
                     for key_prefix in self._lookup_key_prefixes[group_id]
                 )
         return keys
+
+    def _lookup_lease_keys(
+        self,
+        block_hashes: Sequence[BlockHash],
+        result: MooncakeLookupResult,
+        cached_block_pool: ExternalCachedBlockPool,
+    ) -> list[str]:
+        """Return selected GET keys plus keys required to prove that hit."""
+        keys = self._lookup_load_keys(block_hashes, result)
+        if not self.coord.enable_partial_hash_hits or result.hit_length <= 0:
+            return keys
+        for group_id in self.coord.eagle_group_ids - self.coord.mamba_group_ids:
+            db = self.token_dbs[group_id]
+            hit_hash_idx = result.hit_length // self.hash_block_size - 1
+            next_chunk_hash_idx = min(
+                (result.hit_length // db.block_size + 1)
+                * db.block_size
+                // self.hash_block_size,
+                len(block_hashes),
+            )
+            for hash_idx in range(hit_hash_idx + 1, next_chunk_hash_idx):
+                proof_hash = block_hashes[hash_idx]
+                if cached_block_pool.contains(group_id, proof_hash):
+                    keys.extend(
+                        PoolKey.build_key_string(key_prefix, proof_hash.hex())
+                        for key_prefix in self._lookup_key_prefixes[group_id]
+                    )
+                    break
+        return list(dict.fromkeys(keys))
 
     def _tail_key_boundaries(
         self,
