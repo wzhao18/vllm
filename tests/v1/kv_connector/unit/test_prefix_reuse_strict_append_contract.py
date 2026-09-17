@@ -443,7 +443,12 @@ def test_dcp8_strict_append_worker_reuses_eagle_safe_prefix(
     # proof from already-computed attention bytes, without inventing Mamba
     # state or a future hash.
     assert source_keys == {0: 0, 1: 0, 2: 0, 3: 1}
-    assert eagle_keys == {0: 1, 1: 1, 2: 1, 3: 1}
+    assert eagle_keys == {
+        0: 1,
+        1: 1,
+        2: 1,
+        3: int(eagle_safe % FA == 0),
+    }
     assert hit == eagle_safe
 
     # Raw source prefix is source_hash_boundary + the token excluded for
@@ -484,6 +489,28 @@ def test_dcp8_eagle_proof_never_uses_uncomputed_future_bytes() -> None:
 
     assert source_keys == {0: 0, 1: 0, 2: 0, 3: 0}
     assert eagle_keys == {0: 1, 1: 1, 2: 1, 3: 1}
+    assert hit == 0
+
+
+def test_dcp8_eagle_proof_requires_hash_coverage() -> None:
+    """Computed bytes alone cannot name a proof beyond the hash list."""
+    eagle_safe = MAMBA + PMU
+    proof_boundary = eagle_safe + PMU
+    hit, eagle_keys, proof_keys = _run_dcp8_aligned_tail_replay(
+        prompt_tail=proof_boundary,
+        replay_boundary=eagle_safe,
+        computed_end_tokens=proof_boundary,
+        hash_coverage_tokens=eagle_safe,
+        append_tokens=PMU,
+        boundary_state_offloads=[
+            (group_id, 20 + group_id, eagle_safe) for group_id in range(3)
+        ],
+    )
+
+    # Without the proof hash, retain FA@E instead of dropping it in favor of
+    # an impossible FA@T key.
+    assert eagle_keys == {0: 1, 1: 1, 2: 1, 3: 1}
+    assert proof_keys == {0: 0, 1: 0, 2: 0, 3: 0}
     assert hit == 0
 
 
@@ -605,7 +632,7 @@ def test_eagle_proof_is_not_visible_until_put_completes() -> None:
             block_publication=True,
         )
     assert hit == 1024
-    assert eagle_keys == {0: 1, 1: 1, 2: 1, 3: 1}
+    assert eagle_keys == {0: 1, 1: 1, 2: 1, 3: 0}
     assert source_keys == {0: 0, 1: 0, 2: 0, 3: 1}
 
 

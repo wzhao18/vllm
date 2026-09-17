@@ -71,6 +71,7 @@ def _run_dcp8_aligned_tail_replay(
     prompt_tail: int,
     replay_boundary: int,
     computed_end_tokens: int | None = None,
+    hash_coverage_tokens: int | None = None,
     append_tokens: int = 0,
     block_publication: bool = False,
     boundary_state_offloads: list[tuple[int, int, int]] | None = None,
@@ -154,7 +155,7 @@ def _run_dcp8_aligned_tail_replay(
     # num_prompt_tokens is prompt_tail + 1, so prompt_tail is the final full
     # 128-token hash boundary.  Do not synthesize a future hash beyond the
     # producer's tokens: EAGLE lookup may only use proof the producer computed.
-    hash_count = prompt_tail // 128
+    hash_count = (hash_coverage_tokens or prompt_tail) // 128
     block_hashes = [
         BlockHash(i.to_bytes(8, byteorder="little")) for i in range(1, hash_count + 1)
     ]
@@ -193,7 +194,37 @@ def _run_dcp8_aligned_tail_replay(
     )
     worker._record_kv_connector_operation = lambda *_args, **_kwargs: None
 
+    if prompt_tail == replay_boundary + 128:
+        entries = [(group_id, 20 + group_id, replay_boundary) for group_id in range(3)]
+        boundary_puts = sender._sub_block_tail_puts(
+            req,
+            entries,
+            include_mamba_boundary=False,
+            only_groups=frozenset({3}),
+        )
+        proof_puts = sender._sub_block_tail_puts(
+            req,
+            [(group_id, 20 + group_id, prompt_tail) for group_id in range(3)],
+            include_mamba_boundary=False,
+            only_groups=frozenset({3}),
+        )
+        if (
+            prompt_tail // 128 <= len(block_hashes)
+            and (replay_boundary + 7167) // 7168
+            == (prompt_tail + 7167) // 7168
+        ):
+            boundary_key = dbs[3].key_for(
+                block_hashes[replay_boundary // 128 - 1]
+            )
+            proof_key = dbs[3].key_for(block_hashes[prompt_tail // 128 - 1])
+            [boundary_put] = [put for put in boundary_puts if put[0] == boundary_key]
+            [proof_put] = [put for put in proof_puts if put[0] == proof_key]
+            assert boundary_put[0] != proof_put[0]
+            assert boundary_put[1:3] == proof_put[1:3]
+
     def group_counts(boundary: int) -> dict[int, int]:
+        if boundary // 128 > len(block_hashes):
+            return dict.fromkeys(range(4), 0)
         suffix = "@" + block_hashes[boundary // 128 - 1].hex()
         return {
             group_id: sum(
@@ -269,12 +300,26 @@ def _run_dcp8_aligned_tail_replay(
             0: replay_boundary,
             1: replay_boundary,
             2: replay_boundary,
-            3: replay_boundary,
+            3: (
+                replay_boundary
+                if replay_boundary % 7168 == 0
+                else prompt_tail
+            ),
         }
+        boundary_key = dbs[3].key_for(
+            block_hashes[replay_boundary // 128 - 1]
+        )
         proof_key = dbs[3].key_for(block_hashes[prompt_tail // 128 - 1])
         assert proof_key in store.discovery_calls[0]
-        assert proof_key not in load_keys
         assert proof_key in lease_keys
+        if replay_boundary % 7168:
+            assert proof_key in load_keys
+            assert boundary_key not in store._data
+            assert boundary_key not in load_keys
+            assert boundary_key not in lease_keys
+        else:
+            assert boundary_key in load_keys
+            assert proof_key not in load_keys
         proof_value = store._data.pop(proof_key)
         assert worker.lookup(target_tokens, target_hashes).hit_length < replay_boundary
         store._data[proof_key] = proof_value
