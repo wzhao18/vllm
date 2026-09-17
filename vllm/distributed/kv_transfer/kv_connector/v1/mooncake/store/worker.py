@@ -829,6 +829,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         *,
         include_mamba_boundary: bool = True,
         only_groups: frozenset[int] | None = None,
+        skip_boundary_groups: frozenset[int] = frozenset(),
     ) -> list[tuple[str, list[int], list[int], KeyMetadata]]:
         """Puts for the request's sub-block partial tail (its last prompt hash
         boundary), so a later request can hit the sub-block prefix.
@@ -874,6 +875,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 if block_idx % put_step != put_step_rank:
                     continue
                 valid_end = min((block_idx + 1) * db.block_size, boundary)
+                if valid_end == boundary and g_idx in skip_boundary_groups:
+                    continue
                 key_hash = req_meta.block_hashes[valid_end // hash_block_size - 1]
                 if g_idx in self.coord.mamba_group_ids and not include_mamba_boundary:
                     continue
@@ -940,6 +943,26 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
         puts = self._boundary_snapshot_puts(req_meta, snapshots)
 
+        def event_covered_eagle_groups(boundary: int) -> frozenset[int]:
+            peek_boundary = boundary + self.coord.hash_block_size
+            if (
+                req_meta.computed_end_tokens is None
+                or peek_boundary > req_meta.computed_end_tokens
+                or peek_boundary
+                > len(req_meta.block_hashes) * self.coord.hash_block_size
+            ):
+                return frozenset()
+            return frozenset(self.coord.eagle_group_ids - self.coord.mamba_group_ids)
+
+        def same_page_proof_groups(boundary: int) -> frozenset[int]:
+            peek_boundary = boundary + self.coord.hash_block_size
+            return frozenset(
+                group_id
+                for group_id in event_covered_eagle_groups(boundary)
+                if cdiv(boundary, self.token_databases[group_id].block_size)
+                == cdiv(peek_boundary, self.token_databases[group_id].block_size)
+            )
+
         def add_attention_tail(
             boundary_entries: list[tuple[int, int, int]],
             *,
@@ -953,6 +976,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                         req_meta,
                         boundary_entries,
                         include_mamba_boundary=False,
+                        skip_boundary_groups=same_page_proof_groups(boundary),
                     )
                 )
             # EAGLE verifies the next hash boundary and then rewinds one hash
@@ -960,14 +984,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
             # only the scheduler's event-covered computed extent authorizes
             # reading this look-ahead proof.
             peek_boundary = boundary + self.coord.hash_block_size
-            if (
-                req_meta.computed_end_tokens is None
-                or peek_boundary > req_meta.computed_end_tokens
-            ):
+            eagle_attention_groups = event_covered_eagle_groups(boundary)
+            if not eagle_attention_groups:
                 return
-            eagle_attention_groups = frozenset(
-                self.coord.eagle_group_ids - self.coord.mamba_group_ids
-            )
             puts.extend(
                 self._sub_block_tail_puts(
                     req_meta,
@@ -999,7 +1018,14 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     include_boundary=needs_attention_tail,
                 )
         if sub_block and self.coord.enable_partial_hash_hits:
-            puts.extend(self._sub_block_tail_puts(req_meta, sub_block))
+            boundary = sub_block[0][2]
+            puts.extend(
+                self._sub_block_tail_puts(
+                    req_meta,
+                    sub_block,
+                    skip_boundary_groups=same_page_proof_groups(boundary),
+                )
+            )
             add_attention_tail(sub_block, include_boundary=False)
 
         if not puts:
