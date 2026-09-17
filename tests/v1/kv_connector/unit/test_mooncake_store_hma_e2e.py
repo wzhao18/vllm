@@ -73,6 +73,8 @@ def _run_dcp8_aligned_tail_replay(
     computed_end_tokens: int | None = None,
     append_tokens: int = 0,
     block_publication: bool = False,
+    boundary_state_offloads: list[tuple[int, int, int]] | None = None,
+    branch_lcp: int | None = None,
 ) -> tuple[int, dict[int, int], dict[int, int]]:
     """Save exact Kimi-K3 group geometry, then perform an identical lookup."""
     mamba = MambaSpec(
@@ -166,11 +168,15 @@ def _run_dcp8_aligned_tail_replay(
         can_save=True,
         num_prompt_tokens=prompt_tail + 1,
         computed_end_tokens=computed_end_tokens,
-        boundary_state_offloads=[
-            (group_id, 20 + group_id, boundary)
-            for boundary in (replay_boundary, prompt_tail)
-            for group_id in range(3)
-        ],
+        boundary_state_offloads=(
+            boundary_state_offloads
+            if boundary_state_offloads is not None
+            else [
+                (group_id, 20 + group_id, boundary)
+                for boundary in (replay_boundary, prompt_tail)
+                for group_id in range(3)
+            ]
+        ),
     )
     worker = object.__new__(mooncake_store_worker.MooncakeStoreWorker)
     worker._capacity_only = False
@@ -200,6 +206,15 @@ def _run_dcp8_aligned_tail_replay(
         BlockHash(i.to_bytes(8, byteorder="little"))
         for i in range(hash_count + 1, target_hash_count + 1)
     ]
+    if branch_lcp is not None:
+        first_different_hash = branch_lcp // 128
+        target_hashes[first_different_hash:] = [
+            BlockHash((i + 1_000_000).to_bytes(8, byteorder="little"))
+            for i in range(
+                first_different_hash,
+                len(target_hashes),
+            )
+        ]
     if block_publication:
         save_result: list[bool] = []
         save_thread = threading.Thread(

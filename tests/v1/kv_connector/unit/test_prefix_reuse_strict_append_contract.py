@@ -12,6 +12,11 @@ from unittest.mock import patch
 
 import pytest
 
+from tests.v1.core.prefix_cache.test_partial_prefix_cache_hits import (
+    _make_kimi_dcp8_retention_manager,
+    drain_boundary_state_offloads,
+)
+from tests.v1.core.test_prefix_caching import make_request
 from tests.v1.kv_connector.unit.test_mooncake_store_hma_e2e import (
     _run_dcp8_aligned_tail_replay,
 )
@@ -29,11 +34,84 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import (
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker import (
     KVCacheStoreSendingThread,
 )
+from vllm.utils.hashing import sha256
+from vllm.v1.core.kv_cache_utils import init_none_hash
+from vllm.v1.core.sched.scheduler import Scheduler
 
 
 PMU = 128
 MAMBA = 896
 FA = 7168
+
+
+def test_retained_mamba_checkpoint_survives_real_branch_lookup() -> None:
+    """A production-selected 64K checkpoint is usable by Mooncake lookup."""
+    init_none_hash(sha256)
+    prompt_len = 191_147
+    branch_lcp = 100_000
+    manager = _make_kimi_dcp8_retention_manager(retention_interval=64_512)
+    producer = make_request(
+        "producer", list(range(prompt_len)), PMU, sha256
+    )
+    scheduler = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=MAMBA),
+        max_num_scheduled_tokens=8192,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+        use_eagle=True,
+        use_eagle_block_drop=True,
+        hash_block_size=PMU,
+        mamba_partial_cache_hit=True,
+        mamba_fine_grained_prefix_cache=True,
+        mamba_has_prefill_checkpoint_blocks=False,
+    )
+
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(producer)
+    offloads: list[tuple[int, int, int]] = []
+    first = True
+    while producer.num_computed_tokens < producer.num_tokens:
+        remaining = producer.num_tokens - producer.num_computed_tokens
+        scheduled = Scheduler._mamba_block_aligned_split(
+            scheduler, producer, min(8192, remaining)
+        )
+        manager.new_step_starts()
+        allocated = manager.allocate_slots(
+            producer,
+            scheduled,
+            num_computed if first else 0,
+            computed_blocks if first else None,
+        )
+        first = False
+        assert allocated is not None
+        producer.num_computed_tokens += scheduled
+        offloads.extend(
+            drain_boundary_state_offloads(manager).get(producer.request_id, [])
+        )
+
+    boundaries = {boundary for _, _, boundary in offloads}
+    assert boundaries == {64_512, 129_024, 190_976}
+    assert len(offloads) == 3 * len(boundaries)
+
+    manager.free(producer)
+    manager.new_step_starts()
+    branch = make_request(
+        "branch",
+        list(range(branch_lcp)) + list(range(1_000_000, 1_008_192)),
+        PMU,
+        sha256,
+    )
+    _, local_hit, _ = manager.get_computed_blocks(branch)
+    assert local_hit == 64_512
+
+    source_hash_boundary = prompt_len // PMU * PMU
+    hit, _, _ = _run_dcp8_aligned_tail_replay(
+        prompt_tail=source_hash_boundary,
+        replay_boundary=64_512,
+        computed_end_tokens=prompt_len,
+        append_tokens=8192,
+        boundary_state_offloads=offloads,
+        branch_lcp=branch_lcp,
+    )
+    assert hit == 64_512
 
 
 @pytest.mark.parametrize(
