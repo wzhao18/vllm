@@ -75,6 +75,9 @@ def _run_dcp8_aligned_tail_replay(
     block_publication: bool = False,
     boundary_state_offloads: list[tuple[int, int, int]] | None = None,
     branch_lcp: int | None = None,
+    prior_boundary_state_offloads: (
+        list[tuple[int, list[tuple[int, int, int]]]] | None
+    ) = None,
 ) -> tuple[int, dict[int, int], dict[int, int]]:
     """Save exact Kimi-K3 group geometry, then perform an identical lookup."""
     mamba = MambaSpec(
@@ -215,6 +218,18 @@ def _run_dcp8_aligned_tail_replay(
                 len(target_hashes),
             )
         ]
+    for prior_end, prior_offloads in prior_boundary_state_offloads or []:
+        prior_req = ReqMeta(
+            req_id=f"prior-{prior_end}",
+            token_len_chunk=0,
+            block_ids=req.block_ids,
+            block_hashes=block_hashes[: prior_end // 128],
+            can_save=True,
+            num_prompt_tokens=prior_end,
+            computed_end_tokens=prior_end,
+            boundary_state_offloads=prior_offloads,
+        )
+        assert sender._maybe_offload_boundary_states(prior_req)
     if block_publication:
         save_result: list[bool] = []
         save_thread = threading.Thread(

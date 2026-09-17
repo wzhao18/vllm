@@ -175,6 +175,84 @@ def test_flashkda_checkpoint_replays_observed_long_prompt_shape() -> None:
     _assert_flashkda_checkpoint_replay(206_256, chunk_size=8192)
 
 
+def _run_observed_warm_store_sequence() -> int:
+    manager = _make_kimi_dcp8_retention_manager(
+        retention_interval=0,
+        num_prefill_checkpoint_blocks=1,
+    )
+    scheduler = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=MAMBA),
+        max_num_scheduled_tokens=8192,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+        use_eagle=True,
+        use_eagle_block_drop=True,
+        hash_block_size=PMU,
+        mamba_partial_cache_hit=True,
+        mamba_fine_grained_prefix_cache=True,
+        mamba_has_prefill_checkpoint_blocks=True,
+        mamba_prefill_checkpoint_alignment=16,
+    )
+
+    def run_turn(request_id: str, prompt_len: int):
+        producer = make_request(
+            request_id, list(range(prompt_len)), PMU, sha256
+        )
+        blocks, local_hit, _ = manager.get_computed_blocks(producer)
+        first = True
+        offloads = []
+        while producer.num_computed_tokens < producer.num_tokens:
+            uncached = local_hit if first else 0
+            remaining = producer.num_tokens - producer.num_computed_tokens - uncached
+            scheduled = Scheduler._mamba_block_aligned_split(
+                scheduler,
+                producer,
+                min(8192, remaining),
+                num_new_local_computed_tokens=uncached,
+            )
+            manager.new_step_starts()
+            was_first = first
+            if first:
+                allocated = manager.allocate_slots(
+                    producer, scheduled, local_hit, blocks
+                )
+                first = False
+            else:
+                allocated = manager.allocate_slots(producer, scheduled)
+            assert allocated is not None
+            producer.num_computed_tokens += scheduled + (
+                local_hit if was_first else 0
+            )
+            offloads.extend(
+                drain_boundary_state_offloads(manager).get(request_id, [])
+            )
+        manager.free(producer)
+        manager.new_step_starts()
+        return local_hit, offloads
+
+    seed_hit, seed_offloads = run_turn("seed", 34_305)
+    warm_hit, warm_offloads = run_turn("warm", 206_256)
+    assert seed_hit == 0
+    assert {boundary for _, _, boundary in seed_offloads} == {34_176}
+    assert warm_hit == 34_176
+    assert {boundary for _, _, boundary in warm_offloads} == {206_080}
+
+    hit, _, _ = _run_dcp8_aligned_tail_replay(
+        prompt_tail=206_208,
+        replay_boundary=206_080,
+        computed_end_tokens=206_256,
+        append_tokens=3_473,
+        boundary_state_offloads=warm_offloads,
+        prior_boundary_state_offloads=[(34_305, seed_offloads)],
+    )
+    return hit
+
+
+def test_warm_store_sequence_reuses_latest_flashkda_checkpoint() -> None:
+    """After both PUTs finish, the current worker reuses the latest state."""
+    init_none_hash(sha256)
+    assert _run_observed_warm_store_sequence() == 206_080
+
+
 def _assert_flashkda_checkpoint_replay(
     prompt_len: int,
     expected_hit: int | None = None,
@@ -262,6 +340,30 @@ def test_forensic_base_worker_misses_flashkda_checkpoint_without_attention_proof
     expected_hit: int,
 ) -> None:
     """The base worker stores Mamba E but not its required FA proof at T."""
+    old_method = _base_worker_boundary_method()
+
+    with patch.object(
+        KVCacheStoreSendingThread,
+        "_maybe_offload_boundary_states",
+        old_method,
+    ):
+        _assert_flashkda_checkpoint_replay(
+            prompt_len, expected_hit=expected_hit, chunk_size=chunk_size
+        )
+
+
+def test_forensic_base_worker_warm_store_falls_back_to_seed() -> None:
+    """Completed old-worker PUTs still leave the latest proof unavailable."""
+    init_none_hash(sha256)
+    with patch.object(
+        KVCacheStoreSendingThread,
+        "_maybe_offload_boundary_states",
+        _base_worker_boundary_method(),
+    ):
+        assert _run_observed_warm_store_sequence() == 34_176
+
+
+def _base_worker_boundary_method():
     source = subprocess.check_output(
         [
             "git",
@@ -287,15 +389,7 @@ def test_forensic_base_worker_misses_flashkda_checkpoint_without_attention_proof
     namespace = vars(mooncake_store_worker).copy()
     module = ast.fix_missing_locations(ast.Module([method], []))
     exec(compile(module, "<888>", "exec"), namespace)
-
-    with patch.object(
-        KVCacheStoreSendingThread,
-        "_maybe_offload_boundary_states",
-        namespace["_maybe_offload_boundary_states"],
-    ):
-        _assert_flashkda_checkpoint_replay(
-            prompt_len, expected_hit=expected_hit, chunk_size=chunk_size
-        )
+    return namespace["_maybe_offload_boundary_states"]
 
 
 @pytest.mark.parametrize(
