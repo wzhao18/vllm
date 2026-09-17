@@ -120,7 +120,7 @@ def test_retained_mamba_checkpoint_survives_real_branch_lookup() -> None:
     "use_original_method",
     [True, False],
 )
-def test_flashkda_checkpoint_uses_event_provable_eagle_boundary(
+def test_forensic_original_core_method_matches_flashkda_checkpoint_path(
     use_original_method: bool,
 ) -> None:
     """FlashKDA's reserved checkpoint bypasses the changed fallback branch."""
@@ -162,9 +162,25 @@ def test_flashkda_checkpoint_uses_event_provable_eagle_boundary(
         _assert_flashkda_checkpoint_replay(prompt_len)
 
 
-def _assert_flashkda_checkpoint_replay(
-    prompt_len: int, expected_hit: int | None = None
+@pytest.mark.parametrize("prompt_len", [7_169, 7_297])
+def test_flashkda_checkpoint_uses_event_provable_eagle_boundary(
+    prompt_len: int,
 ) -> None:
+    """The production checkpoint and worker preserve reusable FA proof."""
+    _assert_flashkda_checkpoint_replay(prompt_len)
+
+
+def test_flashkda_checkpoint_replays_observed_long_prompt_shape() -> None:
+    """A multi-chunk 206K producer preserves its final reusable checkpoint."""
+    _assert_flashkda_checkpoint_replay(206_256, chunk_size=8192)
+
+
+def _assert_flashkda_checkpoint_replay(
+    prompt_len: int,
+    expected_hit: int | None = None,
+    chunk_size: int | None = None,
+) -> None:
+    init_none_hash(sha256)
     manager = _make_kimi_dcp8_retention_manager(
         retention_interval=0,
         num_prefill_checkpoint_blocks=1,
@@ -189,30 +205,62 @@ def _assert_flashkda_checkpoint_replay(
         mamba_prefill_checkpoint_alignment=16,
     )
     blocks, local_hit, _ = manager.get_computed_blocks(producer)
-    scheduled = Scheduler._mamba_block_aligned_split(
-        scheduler, producer, prompt_len
-    )
-    assert scheduled == prompt_len
-    manager.new_step_starts()
-    assert manager.allocate_slots(producer, scheduled, local_hit, blocks) is not None
-    producer.num_computed_tokens += scheduled
-    offloads = drain_boundary_state_offloads(manager)[producer.request_id]
+    first = True
+    offloads: list[tuple[int, int, int]] = []
+    computed_end = 0
+    while producer.num_computed_tokens < producer.num_tokens:
+        remaining = producer.num_tokens - producer.num_computed_tokens
+        scheduled = Scheduler._mamba_block_aligned_split(
+            scheduler,
+            producer,
+            min(chunk_size or prompt_len, remaining),
+        )
+        manager.new_step_starts()
+        if first:
+            allocated = manager.allocate_slots(
+                producer, scheduled, local_hit, blocks
+            )
+            first = False
+        else:
+            allocated = manager.allocate_slots(producer, scheduled)
+        assert allocated is not None
+        producer.num_computed_tokens += scheduled
+        step_offloads = drain_boundary_state_offloads(manager).get(
+            producer.request_id, []
+        )
+        if step_offloads:
+            offloads.extend(step_offloads)
+            computed_end = producer.num_computed_tokens
     source_boundary = prompt_len // PMU * PMU
     checkpoint_boundary = (prompt_len - 1) // PMU * PMU - PMU
-    assert {num_tokens for _, _, num_tokens in offloads} == {checkpoint_boundary}
-    assert len(offloads) == 3
+    boundaries = {num_tokens for _, _, num_tokens in offloads}
+    expected_boundaries = (
+        {193_536, checkpoint_boundary}
+        if prompt_len == 206_256
+        else {checkpoint_boundary}
+    )
+    assert boundaries == expected_boundaries
+    assert len(offloads) == 3 * len(expected_boundaries)
 
     hit, _, _ = _run_dcp8_aligned_tail_replay(
         prompt_tail=source_boundary,
         replay_boundary=checkpoint_boundary,
-        computed_end_tokens=prompt_len,
+        computed_end_tokens=computed_end,
         append_tokens=8192,
         boundary_state_offloads=offloads,
     )
     assert hit == (checkpoint_boundary if expected_hit is None else expected_hit)
 
 
-def test_base_worker_misses_flashkda_checkpoint_without_attention_proof() -> None:
+@pytest.mark.parametrize(
+    ("prompt_len", "chunk_size", "expected_hit"),
+    [(7_297, None, 0), (206_256, 8192, 193_536)],
+)
+def test_forensic_base_worker_misses_flashkda_checkpoint_without_attention_proof(
+    prompt_len: int,
+    chunk_size: int | None,
+    expected_hit: int,
+) -> None:
     """The base worker stores Mamba E but not its required FA proof at T."""
     source = subprocess.check_output(
         [
@@ -245,7 +293,9 @@ def test_base_worker_misses_flashkda_checkpoint_without_attention_proof() -> Non
         "_maybe_offload_boundary_states",
         namespace["_maybe_offload_boundary_states"],
     ):
-        _assert_flashkda_checkpoint_replay(7_297, expected_hit=0)
+        _assert_flashkda_checkpoint_replay(
+            prompt_len, expected_hit=expected_hit, chunk_size=chunk_size
+        )
 
 
 @pytest.mark.parametrize(
