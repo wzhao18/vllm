@@ -2538,6 +2538,7 @@ def _make_kimi_dcp8_retention_manager(
     *,
     use_eagle: bool = True,
     annotate_fa_eagle: bool = True,
+    num_prefill_checkpoint_blocks: int = 0,
 ):
     """Production Kimi-K3 cache geometry, without allocating model tensors."""
     hash_block_size = 128
@@ -2552,6 +2553,10 @@ def _make_kimi_dcp8_retention_manager(
                     shapes=(1, 1),
                     dtypes=(torch.float32,),
                     mamba_cache_mode="align",
+                    num_prefill_checkpoint_blocks=num_prefill_checkpoint_blocks,
+                    prefill_checkpoint_alignment=(
+                        16 if num_prefill_checkpoint_blocks else None
+                    ),
                 ),
             )
             for i in range(3)
@@ -2684,24 +2689,33 @@ def test_kimi_dcp8_retention_selects_minimal_eagle_safe_states(
 
 @pytest.mark.parametrize(
     (
+        "retention_interval",
+        "num_prefill_checkpoint_blocks",
         "first_prompt_len",
         "first_boundaries",
         "resumed_boundaries",
         "branch_hit",
     ),
     [
-        (1_153, {1_024}, {179_200, 190_976}, 1_024),
-        (106_988, {64_512, 106_752}, {190_976}, 64_512),
+        (64_512, 0, 1_153, {1_024}, {179_200, 190_976}, 1_024),
+        (64_512, 0, 106_988, {64_512, 106_752}, {190_976}, 64_512),
+        (0, 1, 1_153, {1_024}, {179_200, 190_976}, 1_024),
+        (0, 1, 106_988, {106_752}, {190_976}, 0),
     ],
 )
 def test_kimi_retention_grid_depends_on_resumed_prefix_phase(
+    retention_interval: int,
+    num_prefill_checkpoint_blocks: int,
     first_prompt_len: int,
     first_boundaries: set[int],
     resumed_boundaries: set[int],
     branch_hit: int,
 ):
     """Retention checkpoints are relative to the resumed request layout."""
-    manager = _make_kimi_dcp8_retention_manager(retention_interval=64_512)
+    manager = _make_kimi_dcp8_retention_manager(
+        retention_interval=retention_interval,
+        num_prefill_checkpoint_blocks=num_prefill_checkpoint_blocks,
+    )
     scheduler = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=896),
         max_num_scheduled_tokens=8192,
@@ -2711,7 +2725,10 @@ def test_kimi_retention_grid_depends_on_resumed_prefix_phase(
         hash_block_size=128,
         mamba_partial_cache_hit=True,
         mamba_fine_grained_prefix_cache=True,
-        mamba_has_prefill_checkpoint_blocks=False,
+        mamba_has_prefill_checkpoint_blocks=bool(num_prefill_checkpoint_blocks),
+        mamba_prefill_checkpoint_alignment=(
+            16 if num_prefill_checkpoint_blocks else None
+        ),
     )
 
     def run_turn(request_id: str, prompt_len: int) -> tuple[int, set[int]]:

@@ -7,6 +7,7 @@ the last hash-aligned source prefix and its one-PMU EAGLE-safe rewind.
 
 import ast
 import subprocess
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -37,6 +38,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker import (
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import init_none_hash
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core import single_type_kv_cache_manager
 
 
 PMU = 128
@@ -112,6 +114,138 @@ def test_retained_mamba_checkpoint_survives_real_branch_lookup() -> None:
         branch_lcp=branch_lcp,
     )
     assert hit == 64_512
+
+
+@pytest.mark.parametrize(
+    "use_original_method",
+    [True, False],
+)
+def test_flashkda_checkpoint_uses_event_provable_eagle_boundary(
+    use_original_method: bool,
+) -> None:
+    """FlashKDA's reserved checkpoint bypasses the changed fallback branch."""
+    init_none_hash(sha256)
+    prompt_len = 7_169
+    context = nullcontext()
+    if use_original_method:
+        source = subprocess.check_output(
+            [
+                "git",
+                "show",
+                "97049c476437c399fd2d313126677ee3ca1043c0:"
+                "vllm/v1/core/single_type_kv_cache_manager.py",
+            ],
+            text=True,
+        )
+        tree = ast.parse(source)
+        cls = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "MambaManager"
+        )
+        method = next(
+            node
+            for node in cls.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_cache_partial_tail_block"
+        )
+        namespace = vars(single_type_kv_cache_manager).copy()
+        module = ast.fix_missing_locations(ast.Module([method], []))
+        exec(compile(module, "<pre-fix>", "exec"), namespace)
+        context = patch.object(
+            single_type_kv_cache_manager.MambaManager,
+            "_cache_partial_tail_block",
+            namespace["_cache_partial_tail_block"],
+        )
+
+    with context:
+        _assert_flashkda_checkpoint_replay(prompt_len)
+
+
+def _assert_flashkda_checkpoint_replay(
+    prompt_len: int, expected_hit: int | None = None
+) -> None:
+    manager = _make_kimi_dcp8_retention_manager(
+        retention_interval=0,
+        num_prefill_checkpoint_blocks=1,
+    )
+    assert all(
+        mamba_manager.drop_eagle_checkpoint_block
+        for mamba_manager in manager.coordinator.single_type_managers[:3]
+    )
+    producer = make_request(
+        "producer", list(range(prompt_len)), PMU, sha256
+    )
+    scheduler = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=MAMBA),
+        max_num_scheduled_tokens=8192,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+        use_eagle=True,
+        use_eagle_block_drop=True,
+        hash_block_size=PMU,
+        mamba_partial_cache_hit=True,
+        mamba_fine_grained_prefix_cache=True,
+        mamba_has_prefill_checkpoint_blocks=True,
+        mamba_prefill_checkpoint_alignment=16,
+    )
+    blocks, local_hit, _ = manager.get_computed_blocks(producer)
+    scheduled = Scheduler._mamba_block_aligned_split(
+        scheduler, producer, prompt_len
+    )
+    assert scheduled == prompt_len
+    manager.new_step_starts()
+    assert manager.allocate_slots(producer, scheduled, local_hit, blocks) is not None
+    producer.num_computed_tokens += scheduled
+    offloads = drain_boundary_state_offloads(manager)[producer.request_id]
+    source_boundary = prompt_len // PMU * PMU
+    checkpoint_boundary = (prompt_len - 1) // PMU * PMU - PMU
+    assert {num_tokens for _, _, num_tokens in offloads} == {checkpoint_boundary}
+    assert len(offloads) == 3
+
+    hit, _, _ = _run_dcp8_aligned_tail_replay(
+        prompt_tail=source_boundary,
+        replay_boundary=checkpoint_boundary,
+        computed_end_tokens=prompt_len,
+        append_tokens=8192,
+        boundary_state_offloads=offloads,
+    )
+    assert hit == (checkpoint_boundary if expected_hit is None else expected_hit)
+
+
+def test_base_worker_misses_flashkda_checkpoint_without_attention_proof() -> None:
+    """The base worker stores Mamba E but not its required FA proof at T."""
+    source = subprocess.check_output(
+        [
+            "git",
+            "show",
+            "8880433fb76c3911910b25f62aad7d8f292c1791:"
+            "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py",
+        ],
+        text=True,
+    )
+    tree = ast.parse(source)
+    cls = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "KVCacheStoreSendingThread"
+    )
+    method = next(
+        node
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_maybe_offload_boundary_states"
+    )
+    namespace = vars(mooncake_store_worker).copy()
+    module = ast.fix_missing_locations(ast.Module([method], []))
+    exec(compile(module, "<888>", "exec"), namespace)
+
+    with patch.object(
+        KVCacheStoreSendingThread,
+        "_maybe_offload_boundary_states",
+        namespace["_maybe_offload_boundary_states"],
+    ):
+        _assert_flashkda_checkpoint_replay(7_297, expected_hit=0)
 
 
 @pytest.mark.parametrize(
