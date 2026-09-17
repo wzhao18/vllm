@@ -79,6 +79,30 @@ def test_rank_local_descriptors_handle_empty_and_invalid_chunks():
         layout.prepare_values([(0, BLOCK_SIZE + 1)], [0, 1], [0])
 
 
+def test_rank_local_descriptors_separate_stride_from_transfer_length():
+    metadata = KeyMetadata("test-model", 1, 0, 0, 0)
+    layout = RankLocalStoreLayout(metadata, BLOCK_SIZE, BLOCK_SIZE)
+    layout.set_kv_cache_regions(
+        base_addrs=[0x1000, 0x2000],
+        block_strides=[0x100, 0x200],
+        transfer_lens=[0x80, 0x180],
+    )
+
+    addrs, sizes, selected_blocks = layout.prepare_values(
+        [(0, 2 * BLOCK_SIZE)], [3, 4], [0]
+    )
+
+    assert addrs == [
+        [0x1300, 0x2600, 0x1400, 0x2800],
+    ]
+    assert sizes == [[0x80, 0x180, 0x80, 0x180]]
+    assert selected_blocks == [3]
+    assert layout.prepare_value_for_block(4) == (
+        [0x1400, 0x2800],
+        [0x80, 0x180],
+    )
+
+
 @pytest.mark.parametrize(
     ("layout_cls", "store_format"),
     [

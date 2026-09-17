@@ -235,6 +235,7 @@ class RankLocalStoreLayout(StoreLayout):
         self._key_prefix = PoolKey.build_prefix(metadata)
         self.kv_caches_base_addr: list[int] = []
         self.block_len: list[int] = []
+        self.block_stride: list[int] = []
 
     @property
     def local_shard_ids(self) -> tuple[StoreShardId, ...]:
@@ -264,6 +265,26 @@ class RankLocalStoreLayout(StoreLayout):
 
     def set_block_len(self, block_lens: list[int]) -> None:
         self.block_len = block_lens
+        self.block_stride = block_lens
+
+    def set_kv_cache_regions(
+        self,
+        base_addrs: list[int],
+        block_strides: list[int],
+        transfer_lens: list[int],
+    ) -> None:
+        if not (len(base_addrs) == len(block_strides) == len(transfer_lens)):
+            raise ValueError("KV cache region metadata lengths must match")
+        if any(length <= 0 for length in (*block_strides, *transfer_lens)):
+            raise ValueError("KV cache region strides and lengths must be positive")
+        if any(
+            length > stride
+            for stride, length in zip(block_strides, transfer_lens, strict=True)
+        ):
+            raise ValueError("KV cache transfer length cannot exceed block stride")
+        self.kv_caches_base_addr = base_addrs
+        self.block_stride = block_strides
+        self.block_len = transfer_lens
 
     def register_kv_caches(
         self,
@@ -302,6 +323,7 @@ class RankLocalStoreLayout(StoreLayout):
                 block_lens.append(cache.stride(0) * cache.element_size())
         self.kv_caches_base_addr = base_addrs
         self.block_len = block_lens
+        self.block_stride = block_lens
 
     def prepare_values(
         self,
@@ -316,8 +338,12 @@ class RankLocalStoreLayout(StoreLayout):
         )
         base = np.asarray(self.kv_caches_base_addr, dtype=np.int64)
         length = len(self.block_len)
-        blen = np.asarray(
+        transfer_lens = np.asarray(
             [self.block_len[i % length] for i in range(base.shape[0])],
+            dtype=np.int64,
+        )
+        block_strides = np.asarray(
+            [self.block_stride[i % length] for i in range(base.shape[0])],
             dtype=np.int64,
         )
         n = len(chunks)
@@ -329,16 +355,32 @@ class RankLocalStoreLayout(StoreLayout):
             dtype=np.int64,
             count=n,
         )
-        addrs = base[None, :] + bids[:, None] * blen[None, :]
+        addrs = base[None, :] + bids[:, None] * block_strides[None, :]
         block_counts = (spans + self.block_size - 1) // self.block_size
-        sizes = blen[None, :] * block_counts[:, None]
-        return addrs.tolist(), sizes.tolist(), bids.tolist()
+        if np.array_equal(block_strides, transfer_lens):
+            sizes = transfer_lens[None, :] * block_counts[:, None]
+            return addrs.tolist(), sizes.tolist(), bids.tolist()
+
+        addr_lists: list[list[int]] = []
+        size_lists: list[list[int]] = []
+        for row, count in zip(addrs, block_counts.tolist(), strict=True):
+            addr_lists.append(
+                [
+                    int(addr + block_offset * stride)
+                    for block_offset in range(count)
+                    for addr, stride in zip(row, block_strides, strict=True)
+                ]
+            )
+            size_lists.append(
+                [int(size) for _ in range(count) for size in transfer_lens]
+            )
+        return addr_lists, size_lists, bids.tolist()
 
     def prepare_value_for_block(self, block_id: int) -> tuple[list[int], list[int]]:
         length = len(self.block_len)
         return (
             [
-                base_addr + block_id * self.block_len[index % length]
+                base_addr + block_id * self.block_stride[index % length]
                 for index, base_addr in enumerate(self.kv_caches_base_addr)
             ],
             [
