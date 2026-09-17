@@ -2531,3 +2531,115 @@ def test_boundary_states_offered_past_prompt_for_resumed_prefill():
     offered = [b for _, _, b in drain_boundary_state_offloads(manager).get("0", [])]
     assert 2 * block_size in offered
     assert req0.num_prompt_tokens < 2 * block_size
+
+
+def _make_kimi_dcp8_retention_manager():
+    """Production Kimi-K3 cache geometry, without allocating model tensors."""
+    hash_block_size = 128
+    mamba_block_size = 896
+    dcp_world_size = 8
+    groups = [
+        *(
+            KVCacheGroupSpec(
+                [f"mamba{i}"],
+                MambaSpec(
+                    block_size=mamba_block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            )
+            for i in range(3)
+        ),
+        KVCacheGroupSpec(
+            ["full"],
+            FullAttentionSpec(
+                block_size=mamba_block_size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        ),
+    ]
+    manager = make_kv_cache_manager(
+        kv_cache_config=KVCacheConfig(
+            num_blocks=256,
+            kv_cache_tensors=[],
+            kv_cache_groups=groups,
+            prefix_cache_retention_interval=0,
+        ),
+        max_model_len=32_768,
+        enable_caching=True,
+        dcp_world_size=dcp_world_size,
+        scheduler_block_size=mamba_block_size * dcp_world_size,
+        hash_block_size=hash_block_size,
+        use_eagle=True,
+    )
+    return manager
+
+
+def test_kimi_dcp8_retention_selects_minimal_strict_append_states():
+    """The coordinator, not a manually supplied worker fixture, selects the
+    retained states for a production-shaped strict-append turn.
+
+    Sparse retention must preserve the reusable prefix to PMU precision while
+    handing off no more than two distinct Mamba checkpoints for one turn.
+    """
+    hash_block_size = 128
+    prompt_len = 1_153
+    manager = _make_kimi_dcp8_retention_manager()
+    producer = make_request(
+        "producer", list(range(prompt_len)), hash_block_size, sha256
+    )
+    scheduler = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=896),
+        max_num_scheduled_tokens=8192,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+        use_eagle=True,
+        use_eagle_block_drop=True,
+        hash_block_size=hash_block_size,
+        mamba_partial_cache_hit=True,
+        mamba_fine_grained_prefix_cache=True,
+        mamba_has_prefill_checkpoint_blocks=False,
+    )
+
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(producer)
+    offered_boundaries: set[int] = set()
+    first = True
+    while producer.num_computed_tokens < producer.num_tokens:
+        remaining = producer.num_tokens - producer.num_computed_tokens
+        scheduled = Scheduler._mamba_block_aligned_split(
+            scheduler, producer, min(8192, remaining)
+        )
+        assert scheduled > 0
+        manager.new_step_starts()
+        if first:
+            allocated = manager.allocate_slots(
+                producer, scheduled, num_computed, computed_blocks
+            )
+            first = False
+        else:
+            allocated = manager.allocate_slots(producer, scheduled)
+        assert allocated is not None
+        producer.num_computed_tokens += scheduled
+        for group_id, _, boundary in drain_boundary_state_offloads(manager).get(
+            producer.request_id, []
+        ):
+            if group_id in (0, 1, 2):
+                offered_boundaries.add(boundary)
+
+    manager.free(producer)
+    manager.new_step_starts()
+    appended = make_request(
+        "appended",
+        list(range(prompt_len)) + [prompt_len, prompt_len + 1],
+        hash_block_size,
+        sha256,
+    )
+    _, hit_tokens, _ = manager.get_computed_blocks(appended)
+
+    assert prompt_len - hit_tokens < hash_block_size, (
+        hit_tokens,
+        sorted(offered_boundaries),
+    )
+    assert len(offered_boundaries) <= 2
