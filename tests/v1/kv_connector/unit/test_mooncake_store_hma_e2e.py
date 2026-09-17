@@ -8,6 +8,7 @@ import threading
 import types
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
 from tests.v1.attention.utils import dense_kv_cache_views
@@ -21,6 +22,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
     ChunkedTokenDatabase,
     KeyMetadata,
     LoadSpec,
+    PoolKey,
     ReqMeta,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker import (  # noqa: E501
@@ -63,6 +65,130 @@ class _DictStore:
 
     def batch_get_into_multi_buffers(self, keys, addrs, sizes, *_args, **_kwargs):
         return [0 if k in self._data else -1 for k in keys]
+
+
+def _run_dcp8_aligned_tail_replay(
+    prompt_tail: int, replay_boundary: int
+) -> tuple[int, dict[int, int], dict[int, int]]:
+    """Save exact Kimi-K3 group geometry, then perform an identical lookup."""
+    mamba = MambaSpec(
+        block_size=896,
+        shapes=((1, 1),),
+        dtypes=(torch.bfloat16,),
+        mamba_cache_mode="align",
+    )
+    full = FullAttentionSpec(
+        block_size=7168,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float8_e4m3fn,
+    )
+    groups = [KVCacheGroupSpec([f"m{i}"], mamba) for i in range(3)] + [
+        KVCacheGroupSpec(["fa"], full, is_eagle_group=True)
+    ]
+    coord = MooncakeStoreCoordinator(
+        groups,
+        scheduler_block_size=7168,
+        hash_block_size=128,
+        use_eagle=True,
+        retention_interval=0,
+        dcp_world_size=8,
+    )
+    store = _DictStore()
+    dbs = []
+    for group_id, block_size in enumerate((896, 896, 896, 7168)):
+        db = ChunkedTokenDatabase(
+            KeyMetadata("model", 0, 0, 0, 0, group_id=group_id),
+            block_size=block_size,
+            hash_block_size=128,
+        )
+        db.set_kv_caches_base_addr([group_id * 10_000])
+        db.set_block_len([512])
+        dbs.append(db)
+
+    sender = KVCacheStoreSendingThread(
+        store=store,
+        coord=coord,
+        token_databases=dbs,
+        block_size=7168,
+        tp_rank=0,
+        group_put_steps=[1, 1, 1, 1],
+        kv_role="kv_both",
+        ready_event=threading.Event(),
+        replicate_config=MagicMock(),
+    )
+    hash_count = prompt_tail // 128 + 1
+    block_hashes = [
+        BlockHash(i.to_bytes(8, byteorder="little")) for i in range(1, hash_count + 1)
+    ]
+    req = ReqMeta(
+        req_id="r0",
+        token_len_chunk=0,
+        block_ids=([1] * 16, [2] * 16, [3] * 16, [4] * 4),
+        block_hashes=block_hashes,
+        can_save=True,
+        num_prompt_tokens=prompt_tail + 1,
+        boundary_state_offloads=[
+            (group_id, 20 + group_id, boundary)
+            for boundary in (replay_boundary, prompt_tail)
+            for group_id in range(3)
+        ],
+    )
+    assert sender._maybe_offload_boundary_states(req)
+    # Model the normal positional save of completed attention pages. Boundary
+    # hand-offs only add the partial page that contains each retained state.
+    for boundary in range(7168, prompt_tail + 1, 7168):
+        store._data[dbs[3].key_for(block_hashes[boundary // 128 - 1])] = b"x"
+
+    worker = object.__new__(mooncake_store_worker.MooncakeStoreWorker)
+    worker._capacity_only = False
+    worker.coord = coord
+    worker.token_dbs = dbs
+    worker._kv_cache_groups = groups
+    worker.hash_block_size = 128
+    worker.store = store
+    worker._lookup_key_prefixes = tuple(
+        (PoolKey.build_prefix(db.metadata),) for db in dbs
+    )
+    worker._record_kv_connector_operation = lambda *_args, **_kwargs: None
+
+    def group_counts(boundary: int) -> dict[int, int]:
+        suffix = "@" + block_hashes[boundary // 128 - 1].hex()
+        return {
+            group_id: sum(
+                f"@group:{group_id}@" in key and key.endswith(suffix)
+                for key in store._data
+            )
+            for group_id in range(4)
+        }
+
+    hit = worker.lookup(
+        num_tokens=prompt_tail + 1, block_hashes=block_hashes
+    ).hit_length
+    return hit, group_counts(replay_boundary), group_counts(prompt_tail)
+
+
+@pytest.mark.parametrize("prompt_tail", [1792, 1920])
+def test_dcp8_mamba_aligned_replay_has_attention_tail(prompt_tail: int):
+    """Aligned and neighboring prompt tails both preserve the 896 replay hit."""
+    hit, replay_keys, tail_keys = _run_dcp8_aligned_tail_replay(
+        prompt_tail=prompt_tail, replay_boundary=896
+    )
+
+    assert replay_keys == {0: 1, 1: 1, 2: 1, 3: 1}
+    assert tail_keys == {0: 1, 1: 1, 2: 1, 3: 1}
+    assert hit == 896
+
+
+def test_dcp8_aligned_replay_after_full_attention_page():
+    """The aligned-tail fix also retains a replay inside a later FA page."""
+    hit, replay_keys, tail_keys = _run_dcp8_aligned_tail_replay(
+        prompt_tail=8960, replay_boundary=8064
+    )
+
+    assert replay_keys == {0: 1, 1: 1, 2: 1, 3: 1}
+    assert tail_keys == {0: 1, 1: 1, 2: 1, 3: 1}
+    assert hit == 8064
 
 
 def _minimal_vllm_config(cache_block_size=16):

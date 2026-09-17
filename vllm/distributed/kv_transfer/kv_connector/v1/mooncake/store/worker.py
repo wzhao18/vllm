@@ -823,7 +823,11 @@ class KVCacheStoreSendingThread(KVTransferThread):
         return puts
 
     def _sub_block_tail_puts(
-        self, req_meta: ReqMeta, entries: list[tuple[int, int, int]]
+        self,
+        req_meta: ReqMeta,
+        entries: list[tuple[int, int, int]],
+        *,
+        include_mamba_boundary: bool = True,
     ) -> list[tuple[str, list[int], list[int], KeyMetadata]]:
         """Puts for the request's sub-block partial tail (its last prompt hash
         boundary), so a later request can hit the sub-block prefix.
@@ -868,6 +872,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     continue
                 valid_end = min((block_idx + 1) * db.block_size, boundary)
                 key_hash = req_meta.block_hashes[valid_end // hash_block_size - 1]
+                if g_idx in self.coord.mamba_group_ids and not include_mamba_boundary:
+                    continue
                 if g_idx in mamba_offloads:
                     if valid_end != boundary:
                         # Interior align-mode state positions are null or
@@ -920,19 +926,51 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
         snapshots: list[tuple[int, int, int]] = []
         sub_block: list[tuple[int, int, int]] = []
+        snapshots_by_boundary: dict[int, list[tuple[int, int, int]]] = {}
         for group_id, block_id, boundary in offloads:
             entry = (group_id, block_id, boundary)
             if boundary % self.token_databases[group_id].block_size == 0:
                 snapshots.append(entry)
+                snapshots_by_boundary.setdefault(boundary, []).append(entry)
             else:
                 sub_block.append(entry)
 
         puts = self._boundary_snapshot_puts(req_meta, snapshots)
+        if self.coord.enable_partial_hash_hits:
+            # A boundary can be block-aligned for Mamba but still fall inside a
+            # larger attention block (DCP8: 896-token Mamba vs. 7168-token FA).
+            # The exact Mamba snapshot alone cannot form a joint hybrid hit, so
+            # persist the attention tail under the same boundary hash. Keep the
+            # Mamba source on the pinned hand-off above; never resolve it from
+            # the mutable positional table here.
+            for boundary, boundary_entries in snapshots_by_boundary.items():
+                needs_attention_tail = any(
+                    self.group_participates[g_idx]
+                    and g_idx not in self.coord.mamba_group_ids
+                    and boundary % db.block_size != 0
+                    for g_idx, db in enumerate(self.token_databases)
+                )
+                if needs_attention_tail:
+                    puts.extend(
+                        self._sub_block_tail_puts(
+                            req_meta,
+                            boundary_entries,
+                            include_mamba_boundary=False,
+                        )
+                    )
         if sub_block and self.coord.enable_partial_hash_hits:
             puts.extend(self._sub_block_tail_puts(req_meta, sub_block))
 
         if not puts:
             return True
+        # Multiple retained boundaries can cover the same earlier full chunk.
+        # Submit each key once while preserving the first exact source chosen.
+        puts_by_key: dict[
+            str, tuple[str, list[int], list[int], KeyMetadata]
+        ] = {}
+        for put in puts:
+            puts_by_key.setdefault(put[0], put)
+        puts = list(puts_by_key.values())
         keys = [key for key, _, _, _ in puts]
         addrs = [addr for _, addr, _, _ in puts]
         sizes = [size for _, _, size, _ in puts]

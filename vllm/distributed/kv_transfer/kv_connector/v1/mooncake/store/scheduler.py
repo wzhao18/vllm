@@ -525,6 +525,16 @@ class MooncakeStoreScheduler:
                 return False
             pinned_block_ids.append(block_id)
             remapped_offloads.append((store_group_id, block_id, boundary))
+        # The worker also reads attention tail bytes positionally from the
+        # request's block table. This finish-time job outlives request cleanup,
+        # so retain those blocks alongside the exact Mamba hand-offs.
+        pinned_block_ids.extend(
+            block_id
+            for store_group_id, kv_cache_group_id in enumerate(self._store_group_ids)
+            if store_group_id not in self._boundary_state_group_ids
+            for block_id in block_ids[kv_cache_group_id]
+            if block_id != NULL_BLOCK_ID
+        )
         pinned_block_ids = list(dict.fromkeys(pinned_block_ids))
 
         pool = self._gpu_block_pool

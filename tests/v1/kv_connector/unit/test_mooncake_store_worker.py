@@ -1225,6 +1225,56 @@ def test_block_aligned_snapshot_offload_uses_provided_block():
     assert addrs == [[0x2000 + 7 * 256]]
 
 
+def test_block_aligned_mamba_snapshot_covers_larger_attention_tail():
+    """A Mamba-aligned boundary inside a larger attention page needs both keys.
+
+    The recurrent value must still come from the exact pinned hand-off, while
+    attention is safe to resolve from the request's pinned block table.
+    """
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.side_effect = lambda keys, *a: [256] * len(keys)
+    coord = SimpleNamespace(
+        enable_partial_hash_hits=True,
+        hash_block_size=4,
+        lcm_block_size=64,
+        mamba_group_ids={1},
+    )
+    db_full = ChunkedTokenDatabase(
+        KeyMetadata("test-model", 0, 0, 0, 0),
+        block_size=64,
+        hash_block_size=4,
+    )
+    db_full.set_kv_caches_base_addr([0x1000])
+    db_full.set_block_len([256])
+    db_mamba = ChunkedTokenDatabase(
+        KeyMetadata("test-model", 0, 0, 0, 0, group_id=1),
+        block_size=16,
+        hash_block_size=4,
+    )
+    db_mamba.set_kv_caches_base_addr([0x2000])
+    db_mamba.set_block_len([256])
+    thread = _make_store_sending_thread(
+        store, coord=coord, token_databases=[db_full, db_mamba]
+    )
+    hs = [bytes([i + 1]) * 4 for i in range(8)]
+    req = ReqMeta(
+        req_id="req-a",
+        token_len_chunk=0,
+        block_ids=([3], [5]),
+        block_hashes=hs,
+        can_save=True,
+        boundary_state_offloads=[(1, 7, 32)],
+    )
+
+    assert thread._maybe_offload_boundary_states(req)
+
+    keys, addrs, _sizes, _ = store.batch_put_from_multi_buffers.call_args.args
+    boundary_hash = BlockHash(hs[7])
+    assert keys == [db_mamba.key_for(boundary_hash), db_full.key_for(boundary_hash)]
+    assert addrs == [[0x2000 + 7 * 256], [0x1000 + 3 * 256]]
+
+
 def test_mixed_snapshot_and_sub_block_offloads():
     """A retention snapshot and the prompt-end sub-block CoW tail can arrive
     in one hand-off; the sub-block path covers FA gap blocks but reads the
