@@ -2680,3 +2680,87 @@ def test_kimi_dcp8_retention_selects_minimal_eagle_safe_states(
     # policy unconditionally rewinds one PMU in addition to the unaligned raw
     # tail. Avoid treating this passing selector test as proof of <=1 PMU loss.
     assert hash_block_size <= prompt_len - hit_tokens <= 2 * hash_block_size - 1
+
+
+@pytest.mark.parametrize(
+    (
+        "first_prompt_len",
+        "first_boundaries",
+        "resumed_boundaries",
+        "branch_hit",
+    ),
+    [
+        (1_153, {1_024}, {179_200, 190_976}, 1_024),
+        (106_988, {64_512, 106_752}, {190_976}, 64_512),
+    ],
+)
+def test_kimi_retention_grid_depends_on_resumed_prefix_phase(
+    first_prompt_len: int,
+    first_boundaries: set[int],
+    resumed_boundaries: set[int],
+    branch_hit: int,
+):
+    """Retention checkpoints are relative to the resumed request layout."""
+    manager = _make_kimi_dcp8_retention_manager(retention_interval=64_512)
+    scheduler = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=896),
+        max_num_scheduled_tokens=8192,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+        use_eagle=True,
+        use_eagle_block_drop=True,
+        hash_block_size=128,
+        mamba_partial_cache_hit=True,
+        mamba_fine_grained_prefix_cache=True,
+        mamba_has_prefill_checkpoint_blocks=False,
+    )
+
+    def run_turn(request_id: str, prompt_len: int) -> tuple[int, set[int]]:
+        request = make_request(
+            request_id, list(range(prompt_len)), 128, sha256
+        )
+        blocks, hit, _ = manager.get_computed_blocks(request)
+        first = True
+        offered: set[int] = set()
+        while request.num_computed_tokens < request.num_tokens:
+            uncached = hit if first else 0
+            remaining = request.num_tokens - request.num_computed_tokens - uncached
+            scheduled = Scheduler._mamba_block_aligned_split(
+                scheduler,
+                request,
+                min(8192, remaining),
+                num_new_local_computed_tokens=uncached,
+            )
+            manager.new_step_starts()
+            was_first = first
+            if first:
+                allocated = manager.allocate_slots(request, scheduled, hit, blocks)
+                first = False
+            else:
+                allocated = manager.allocate_slots(request, scheduled)
+            assert allocated is not None
+            request.num_computed_tokens += scheduled + (hit if was_first else 0)
+            offered.update(
+                boundary
+                for _, _, boundary in drain_boundary_state_offloads(manager).get(
+                    request.request_id, []
+                )
+            )
+        manager.free(request)
+        manager.new_step_starts()
+        return hit, offered
+
+    first_hit, actual_first_boundaries = run_turn("first", first_prompt_len)
+    resumed_hit, actual_resumed_boundaries = run_turn("resumed", 191_147)
+    assert first_hit == 0
+    assert actual_first_boundaries == first_boundaries
+    assert resumed_hit == first_prompt_len // 128 * 128 - 128
+    assert actual_resumed_boundaries == resumed_boundaries
+
+    branch = make_request(
+        "branch",
+        list(range(100_000)) + list(range(1_000_000, 1_008_192)),
+        128,
+        sha256,
+    )
+    _, actual_branch_hit, _ = manager.get_computed_blocks(branch)
+    assert actual_branch_hit == branch_hit
