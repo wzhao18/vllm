@@ -105,6 +105,8 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         # ``_sending_transfers_lock``.
         self._sending_transfers = defaultdict[ReqId, list[TransferHandle]](list)
         self._sending_transfers_lock = threading.Lock()
+        # Shares the sending lock; failures must survive later successful polls.
+        self._failed_sending_reqs: set[ReqId] = set()
 
         # Writer-thread owned matching state.
         # P-side: finished request blocks received from scheduler metadata
@@ -762,6 +764,9 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             # writes) so P can free blocks once all of them are done.
             return handle
         except Exception as e:
+            # Publish the failure before the caller publishes any WRITE handles.
+            with self._sending_transfers_lock:
+                self._failed_sending_reqs.add(request_id)
             self._log_failure(
                 failure_type="transfer_setup_failed",
                 req_id=request_id,
@@ -1018,13 +1023,10 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             done_pushing, failed_pushing = self._pop_done_transfers(
                 self._sending_transfers
             )
+            self._failed_sending_reqs.update(failed_pushing)
+            done_pushing -= self._failed_sending_reqs
         # A failed send must never be reported as done: its blocks
         # are freed via the lease / watchdog instead.
-        done_pushing = {
-            req_id
-            for req_id in done_pushing - failed_pushing
-            if req_id in self._recving_metadata
-        }
         for req_id in done_pushing:
             self._reqs_to_send.pop(req_id, None)
             self._reqs_to_process.discard(req_id)
@@ -1035,6 +1037,8 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         # request that just finished (push completed) or expired
         # (lease ran out without a D registration ever arriving).
         for req_id in done_sending:
+            with self._sending_transfers_lock:
+                self._failed_sending_reqs.discard(req_id)
             self._evict_finished_inbox.put(req_id)
         if done_sending:
             self._push_writer_wake.set()
