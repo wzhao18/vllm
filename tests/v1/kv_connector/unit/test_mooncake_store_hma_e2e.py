@@ -8,6 +8,7 @@ import threading
 import types
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
 from tests.v1.attention.utils import dense_kv_cache_views
@@ -22,6 +23,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
     KeyMetadata,
     LoadSpec,
     ReqMeta,
+    RequestTracker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker import (  # noqa: E501
     KVCacheStoreRecvingThread,
@@ -690,6 +692,107 @@ def test_worker_lookup_hits_sub_block_partial_tail():
 
     # A 13-token prompt sharing the prefix must hit the stored boundary at 12.
     assert worker.lookup(num_tokens=13, block_hashes=hs).hit_length == 12
+
+
+def _hybrid_tail_store(mamba_block_size, use_eagle):
+    full = FullAttentionSpec(
+        block_size=32, num_kv_heads=1, head_size=8, dtype=torch.float32
+    )
+    mamba = MambaSpec(
+        block_size=mamba_block_size,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+    config = KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["L0"], full, is_eagle_group=use_eagle),
+            KVCacheGroupSpec(["L1"], mamba),
+        ],
+    )
+    vllm_config = _minimal_vllm_config(cache_block_size=32)
+    vllm_config.cache_config.prefix_match_unit = 4
+    if use_eagle:
+        vllm_config.speculative_config = MagicMock()
+        vllm_config.speculative_config.use_eagle.return_value = True
+    store = _DictStore()
+    worker = _build_worker_with_dict_store(vllm_config, config, store)
+    for group_id, db in enumerate(worker.token_dbs):
+        db.set_kv_caches_base_addr([10_000 * (group_id + 1)])
+        db.set_block_len([512])
+    sender = KVCacheStoreSendingThread(
+        store=store,
+        token_databases=worker.token_dbs,
+        block_size=worker.block_size,
+        coord=worker.coord,
+        tp_rank=0,
+        group_put_steps=[1, 1],
+        kv_role="kv_both",
+        ready_event=threading.Event(),
+        replicate_config=MagicMock(),
+    )
+    return worker, sender
+
+
+def _save_hybrid_boundary(sender, request, boundary, completed_tokens):
+    """Use production metadata construction, including completed-token coverage."""
+    tracker = RequestTracker(
+        req_id=request.request_id,
+        token_len=completed_tokens,
+        allocated_block_ids=([1, 2, 3, 4], [5] * 16),
+        prefill_end_tokens=request.num_prompt_tokens,
+    )
+    meta = ReqMeta.from_request_tracker(
+        tracker, block_size=32, block_hashes=request.block_hashes
+    )
+    assert meta is not None
+    meta.boundary_state_offloads = [(1, 7, boundary)]
+    meta.store_job_id = 1
+    sender.add_request(meta)
+    sender._handle_request(sender.request_queue.get())
+
+
+@pytest.mark.parametrize(
+    "mamba_block_size,use_eagle",
+    [(8, False), (8, True), (32, True)],
+    ids=["aligned-unequal", "aligned-unequal-eagle", "partial-eagle"],
+)
+def test_external_append_chain_reuses_each_saved_mamba_tail(
+    mamba_block_size, use_eagle
+):
+    """After local eviction, appended turns must reuse the external boundary."""
+    from tests.v1.core.test_prefix_caching import make_request
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.kv_cache_utils import init_none_hash
+
+    init_none_hash(sha256)
+    worker, sender = _hybrid_tail_store(mamba_block_size, use_eagle)
+    previous_boundary = None
+    for turn, boundary in enumerate((40, 56, 72, 88)):
+        length = boundary + (4 if use_eagle else 0) + 1
+        request = make_request(str(turn), list(range(length)), 4, sha256)
+        result = worker.lookup(length, request.block_hashes)
+        assert result.hit_length == (previous_boundary or 0), turn
+        _save_hybrid_boundary(sender, request, boundary, length)
+        previous_boundary = boundary
+
+
+@pytest.mark.parametrize("use_eagle", [False, True], ids=["plain", "eagle"])
+def test_external_internal_mamba_checkpoint_has_matching_attention(use_eagle):
+    """A retained state inside a larger attention page must form a joint hit."""
+    from tests.v1.core.test_prefix_caching import make_request
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.kv_cache_utils import init_none_hash
+
+    init_none_hash(sha256)
+    worker, sender = _hybrid_tail_store(8, use_eagle)
+    producer = make_request("producer", list(range(97)), 4, sha256)
+    # Mid-prefill handoff, before the attention page through token 64 is saved.
+    _save_hybrid_boundary(sender, producer, boundary=40, completed_tokens=48)
+    sibling = make_request("sibling", list(range(48)) + [999] * 16, 4, sha256)
+    assert worker.lookup(sibling.num_tokens, sibling.block_hashes).hit_length == 40
 
 
 def test_worker_setup_tolerates_finer_scratch_group():

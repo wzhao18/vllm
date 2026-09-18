@@ -725,8 +725,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
         The two entry kinds use different Mamba sources:
 
         - block-aligned for its group: a committed boundary-state snapshot,
-          the handed-off block itself; only a prompt replay boundary includes
-          an attention companion;
+          the handed-off block itself; include an attention companion for a
+          prompt replay boundary or a boundary inside a larger attention page;
         - not block-aligned: the sub-block CoW partial tail, which also has to
           cover the other groups' blocks in the normal save's lcm gap.
 
@@ -757,8 +757,14 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 boundary + margin <= req_meta.completed_token_len
                 for margin in self.coord.eagle_peek_margin_by_group.values()
             )
+            needs_attention_tail = any(
+                self.group_participates[group_id]
+                and group_id not in self.coord.mamba_group_ids
+                and boundary % db.block_size != 0
+                for group_id, db in enumerate(self.token_databases)
+            )
             if self.coord.enable_partial_hash_hits and (
-                has_sub_block or can_write_proof
+                has_sub_block or can_write_proof or needs_attention_tail
             ):
                 puts.extend(self._boundary_tail_puts(req_meta, entries))
             else:

@@ -1147,6 +1147,46 @@ def test_finished_partial_tail_is_pre_pinned_as_store_job():
     assert scheduler._gpu_block_pool.blocks[3].ref_cnt == 0
 
 
+@pytest.mark.parametrize("scratch_group", [False, True], ids=["direct", "remapped"])
+def test_finished_tail_sources_cannot_be_reallocated_before_save(scratch_group):
+    """Request cleanup must not let another request overwrite an unfinished PUT."""
+    scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
+    pool = BlockPool(num_gpu_blocks=4, enable_caching=True, hash_block_size=4)
+    scheduler._gpu_block_pool = pool
+    attention, state, scratch = pool.get_new_blocks(3)
+    block_ids = ([attention.block_id], [state.block_id])
+    scheduler._store_group_ids = (0, 1)
+    scheduler._store_group_id_by_kv_cache_group_id = {0: 0, 1: 1}
+    state_group = 1
+    if scratch_group:
+        block_ids = ([scratch.block_id], *block_ids)
+        scheduler._store_group_ids = (1, 2)
+        scheduler._store_group_id_by_kv_cache_group_id = {1: 0, 2: 1}
+        state_group = 2
+    scheduler._request_trackers["req-0"] = RequestTracker(
+        req_id="req-0",
+        token_len=12,
+        allocated_block_ids=block_ids,
+        prefill_end_tokens=12,
+    )
+    request = SimpleNamespace(
+        request_id="req-0",
+        block_hashes=[b"h0", b"h1", b"h2"],
+        num_computed_tokens=12,
+    )
+    scheduler.register_finished_partial_tail(
+        request, block_ids, [(state_group, state.block_id, 12)]
+    )
+    pool.free_blocks([attention, state])
+    replacement = pool.get_new_blocks(pool.get_num_free_blocks())
+    assert {block.block_id for block in replacement}.isdisjoint(
+        {attention.block_id, state.block_id}
+    )
+    job_id = next(iter(scheduler._pinned_saves))
+    scheduler.update_connector_output(_make_worker_output({job_id: 1}))
+    assert pool.get_num_free_blocks() == 2
+
+
 def test_decode_boundary_state_offload_dropped_unclaimed():
     # A hand-off past the prefill end can never complete a joint hybrid hit
     # (every other group stops saving there), so it is neither transferred nor

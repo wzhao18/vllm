@@ -530,9 +530,9 @@ class MooncakeStoreScheduler:
         # scheduling pass, so pin those too until every rank reports the job.
         pinned_block_ids.extend(
             block_id
-            for group_id, group in enumerate(block_ids)
-            if group_id not in self._boundary_state_group_ids
-            for block_id in group
+            for store_group_id, kv_cache_group_id in enumerate(self._store_group_ids)
+            if store_group_id not in self._boundary_state_group_ids
+            for block_id in block_ids[kv_cache_group_id]
             if block_id != NULL_BLOCK_ID
         )
         pinned_block_ids = list(dict.fromkeys(pinned_block_ids))
