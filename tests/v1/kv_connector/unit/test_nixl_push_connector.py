@@ -345,6 +345,7 @@ class _StubWriterWorker(NixlPushConnectorWorker):
 
         w._sending_transfers = defaultdict[ReqId, list[TransferHandle]](list)
         w._sending_transfers_lock = threading.Lock()
+        w._failed_sending_reqs = set()
         w._push_finished_blocks = {}
         w._pending_d_registrations = {}
         w._reg_send_inbox = queue.Queue()
@@ -367,6 +368,7 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w._reqs_to_process = set()
         w._reqs_to_send = {}
         w.consumer_notification_counts_by_req = defaultdict(int)
+        w.expected_consumer_notifications_by_req = {}
         w.tp_rank = 0
         w.pcp_rank = 0
         w.pcp_dcp_sharded = False
@@ -1000,9 +1002,8 @@ class TestPushWriterNotifs:
         assert request_id not in w._sending_transfers
 
     @pytest.mark.parametrize(("pp_size", "is_hma"), [(1, False), (2, True)])
-    def test_completed_push_send_waits_for_consumer_notif(self, pp_size, is_hma):
-        """P-side sends are completed by consumer notifs / lease expiry,
-        not by local WRITE-handle completion."""
+    def test_completed_push_send_releases_without_consumer_notif(self, pp_size, is_hma):
+        """All local WRITE handles completing releases producer ownership."""
         w = self._pollable_worker()
         w.pp_size = pp_size
         w._is_hma_required = is_hma
@@ -1016,14 +1017,8 @@ class TestPushWriterNotifs:
 
         results = w.get_transfer_results()
 
-        assert request_id not in results.finished_sending
-        assert request_id in w._reqs_to_send
-        assert request_id not in w._sending_transfers
-
-        # The consumer notif is what completes the send.
-        w._pending_completion_notifs.put(f"{request_id}:1".encode())
-        results = w.get_transfer_results()
         assert request_id in results.finished_sending
+        assert request_id not in w._sending_transfers
         assert request_id not in w._reqs_to_send
         assert request_id not in w._reqs_to_process
         assert w._evict_finished_inbox.get_nowait() == request_id
@@ -2039,3 +2034,121 @@ def test_layer_handshake_rejects_unsupported_geometry(
     assert not worker.kv_caches_base_addr
     with pytest.raises(KeyError):
         worker.transfer_topo.get_engine_info(metadata.engine_id)
+
+
+def _completion_worker():
+    w = TestPushWriterNotifs._pollable_worker()
+    # Also initialized for the original source, allowing identical test inputs.
+    w._failed_sending_reqs = set()
+    return w
+
+
+def _completion_request(w):
+    return TestPushWriterNotifs()._make_sending_req(w)
+
+
+@pytest.mark.parametrize("pp_size,is_hma", [(1, False), (2, True)])
+def test_completed_push_releases_without_receive_metadata_or_ack(pp_size, is_hma):
+    w = _completion_worker()
+    w.pp_size, w._is_hma_required = pp_size, is_hma
+    req = _completion_request(w)
+    assert req not in w._recving_metadata
+    w.nixl_wrapper.check_xfer_state.side_effect = ["DONE", "PROC", "DONE"]
+    assert w.get_transfer_results().finished_sending == set()
+    assert w._sending_transfers[req] == [102]
+    assert w.get_transfer_results().finished_sending == {req}
+    assert req not in w._reqs_to_send
+    assert req not in w._reqs_to_process
+    assert w._evict_finished_inbox.get_nowait() == req
+    assert w.get_transfer_results().finished_sending == set()
+    assert w._evict_finished_inbox.empty()
+    assert w.nixl_wrapper.release_xfer_handle.call_count == 2
+    w.xfer_stats.record_kv_expired_req.assert_not_called()
+
+
+def test_failed_handle_stays_failed_across_polls_until_lease_expiry():
+    w = _completion_worker()
+    req = _completion_request(w)
+    w.nixl_wrapper.check_xfer_state.side_effect = ["ERR", "PROC", "DONE"]
+    assert w.get_transfer_results().finished_sending == set()
+    assert w.get_transfer_results().finished_sending == set()
+    assert req in w._failed_sending_reqs
+    assert req in w._reqs_to_send
+    w._reqs_to_send[req] = time.perf_counter() - 1
+    assert w.get_transfer_results().finished_sending == {req}
+    assert req not in w._failed_sending_reqs
+
+
+def test_release_failure_retains_handle_and_failure_after_later_cleanup():
+    w = _completion_worker()
+    req = _completion_request(w)
+    w._sending_transfers[req] = [101]
+    w.nixl_wrapper.check_xfer_state.side_effect = ["ERR", "DONE"]
+    w.nixl_wrapper.release_xfer_handle.side_effect = [
+        RuntimeError("release failed"),
+        None,
+    ]
+    assert w.get_transfer_results().finished_sending == set()
+    assert w._sending_transfers[req] == [101]
+    assert w.get_transfer_results().finished_sending == set()
+    assert req in w._failed_sending_reqs
+    assert req in w._reqs_to_send
+
+
+@pytest.mark.parametrize("failure_at", ["make_prepped_xfer", "transfer"])
+def test_submission_failure_is_published_before_handle_list(failure_at):
+    w, _ = TestPushPrefixCaching._worker_driving_xfer()
+    w._failed_sending_reqs = set()
+    w.xfer_stats = MagicMock()
+    w._log_failure = MagicMock()
+    getattr(w.nixl_wrapper, failure_at).side_effect = RuntimeError("submission failed")
+    req = "req-submit-failed"
+    NixlPushConnectorWorker._do_start_push_kv(
+        w,
+        req,
+        ([10, 11],),
+        _registration_data(req, local_block_ids=([500, 501],)),
+    )
+    assert req in w._failed_sending_reqs
+    assert req not in w._sending_transfers
+
+
+def test_mixed_submission_failure_cannot_complete_as_success():
+    w, engine = TestPushPrefixCaching._worker_driving_xfer()
+    w._failed_sending_reqs = set()
+    w.use_mla = True
+    w.transfer_topo.tp_ratio.return_value = -2
+    w.transfer_topo.get_engine_info.return_value.remote_tp_size = 2
+    w.dst_xfer_side_handles[engine] = {0: 5000, 1: 5001}
+    w._remote_agents = {engine: {(0, 0): "a0", (0, 1): "a1"}}
+    w.xfer_stats = MagicMock()
+    w._log_failure = MagicMock()
+    w._pending_recv_notifs = {}
+    w._replicated_pcp_done_sending = set()
+    w.use_host_buffer = False
+    req = "req-mixed"
+    calls = []
+
+    def submit(handle):
+        # Even after first successful submission, no partial list is published.
+        assert req not in w._sending_transfers
+        calls.append(handle)
+        if len(calls) == 2:
+            raise RuntimeError("second target failed")
+
+    w.nixl_wrapper.make_prepped_xfer.side_effect = [7, 8]
+    w.nixl_wrapper.transfer.side_effect = submit
+    NixlPushConnectorWorker._do_start_push_kv(
+        w,
+        req,
+        ([10, 11],),
+        _registration_data(req, local_block_ids=([500, 501],)),
+    )
+    assert calls == [7, 8]
+    assert w._sending_transfers[req] == [7]
+    assert req in w._failed_sending_reqs
+    w._reqs_to_send[req] = time.perf_counter() + 60
+    w._reqs_to_process.add(req)
+    w.nixl_wrapper.check_xfer_state.return_value = "DONE"
+    assert w.get_transfer_results().finished_sending == set()
+    assert req in w._reqs_to_send
