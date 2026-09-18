@@ -301,6 +301,10 @@ from vllm.v1.attention.ops.mla_concat import (
     can_use_triton_concat,
     concat_mla_k,
 )
+from vllm.v1.attention.ops.mla_context_cast import (
+    can_fuse_context_cast,
+    fused_context_cast_concat,
+)
 from vllm.v1.attention.ops.pcp import (
     finalize_mla_pcp_decode,
     maybe_gather_mla_latent_cache_inputs,
@@ -2858,6 +2862,27 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
         self.v_head_dim = v_head_dim
         self.kv_b_proj = kv_b_proj
 
+    def _prepare_prefill_context_kv(
+        self,
+        kv_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        fp8_dtype: torch.dtype | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if (
+            not self._use_flashinfer_concat_mla_k
+            and self.qk_nope_head_dim == self.v_head_dim == 128
+            and self.qk_rope_head_dim == 64
+            and current_platform.is_cuda()
+            and can_fuse_context_cast(kv_nope, k_pe, fp8_dtype)
+            and current_platform.is_device_capability(103)
+        ):
+            return fused_context_cast_concat(kv_nope, k_pe)
+        if fp8_dtype is not None:
+            kv_nope = kv_nope.to(fp8_dtype)
+            k_pe = k_pe.to(fp8_dtype)
+        k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        return self._concat_k_nope_k_pe(k_nope, k_pe), v
+
     def _concat_k_nope_k_pe(
         self, k_nope: torch.Tensor, k_pe: torch.Tensor
     ) -> torch.Tensor:
@@ -2982,12 +3007,11 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
             )
 
             # To Do: Use epilogue of kv_b_proj to generate fp8 kv_nope.
-            if use_fp8_prefill:
-                kv_nope = kv_nope.to(prefill_metadata.q_data_type)
-                k_pe = k_pe.to(prefill_metadata.q_data_type)
-            k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-
-            k = self._concat_k_nope_k_pe(k_nope, k_pe)
+            k, v = self._prepare_prefill_context_kv(
+                kv_nope,
+                k_pe,
+                prefill_metadata.q_data_type if use_fp8_prefill else None,
+            )
 
             attn_output, attn_softmax_lse = (
                 prefill_metadata.prefill_backend.run_prefill_context_chunk(
@@ -3117,11 +3141,11 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
             kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
                 -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
             )
-            if use_fp8_prefill:
-                kv_nope = kv_nope.to(prefill_metadata.q_data_type)
-                k_pe = k_pe.to(prefill_metadata.q_data_type)
-            k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-            k = self._concat_k_nope_k_pe(k_nope, k_pe)
+            k, v = self._prepare_prefill_context_kv(
+                kv_nope,
+                k_pe,
+                prefill_metadata.q_data_type if use_fp8_prefill else None,
+            )
 
             attn_output, attn_softmax_lse = (
                 prefill_metadata.prefill_backend.run_prefill_context_chunk(
