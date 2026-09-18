@@ -147,6 +147,26 @@ def _sibling_hit(manager, shared, suffix, hash_block_size):
     return manager.get_computed_blocks(request)[1]
 
 
+@pytest.mark.parametrize("eagle_group", [None, 0], ids=["all-groups", "attention-only"])
+def test_append_chain_reuses_each_completed_mamba_tail(eagle_group):
+    """A resend and successive extensions must recover the preceding replay tail."""
+    block_size, hash_block_size = 32, 4
+    manager = _manager(
+        block_size, hash_block_size, eagle_group=eagle_group, num_prefill_lookahead=1
+    )
+    stub = _stub(manager, block_size, hash_block_size)
+    previous_length = None
+    for turn, length in enumerate((48, 48, 57, 73, 89)):
+        request = make_request(str(turn), PREFIX[:length], hash_block_size, sha256)
+        if previous_length is not None:
+            expected = previous_length // hash_block_size * hash_block_size - 4
+            assert manager.get_computed_blocks(request)[1] == expected, turn
+            assert manager.get_computed_blocks_for_connector(request)[1] == expected
+        _prefill(manager, stub, request)
+        manager.free(request)
+        previous_length = length
+
+
 # --------------------------------------------------------------------------
 # The two positions a sibling resumes at
 
