@@ -186,6 +186,110 @@ def test_concat_k_nope_k_pe_matches_torch_cat(qk_rope_head_dim):
     assert (k.data_ptr() == k_nope.data_ptr()) == (qk_rope_head_dim == 0)
 
 
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA concat")
+@pytest.mark.parametrize("num_heads", [1, 4, 12, 16, 128])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("large", [False, True])
+def test_concat_k_preserves_payloads_and_projection_view(
+    num_heads, dtype, large, monkeypatch
+):
+    """Both dispatch arms preserve strided K/V and broadcast RoPE byte values."""
+    size = torch.empty((), dtype=dtype).element_size()
+    # Each large case tests the real dispatch threshold, rather than forcing the
+    # kernel on small tensors. Peak live tensors stay below roughly 0.4 GiB.
+    tokens = (64 * 1024 * 1024 // (num_heads * 192 * size) + 1) if large else 17
+    bits = torch.uint8 if size == 1 else torch.int16
+    low, high = (0, 256) if size == 1 else (-32768, 32768)
+    kv = torch.randint(
+        low, high, (tokens, num_heads, 256), device="cuda", dtype=bits
+    ).view(dtype)
+    k_nope, v = kv.split([128, 128], dim=-1)
+    rope = torch.randint(low, high, (tokens, 1, 128), device="cuda", dtype=bits).view(
+        dtype
+    )[..., ::2]
+    before_v = v.view(bits).clone()
+    pointer, stride = v.data_ptr(), v.stride()
+    calls = []
+    kernel = mla_attention_module.concat_mla_k
+
+    def counted(*args):
+        calls.append(True)
+        return kernel(*args)
+
+    monkeypatch.setattr(mla_attention_module, "concat_mla_k", counted)
+    impl = SimpleNamespace(_use_flashinfer_concat_mla_k=False)
+    result = MLACommonBaseImpl._concat_k_nope_k_pe(impl, k_nope, rope)
+    expected = torch.cat((k_nope, rope.expand(-1, num_heads, -1)), dim=-1)
+    assert torch.equal(result.view(bits), expected.view(bits))
+    assert result.is_contiguous()
+    assert len(calls) == int(large and current_platform.is_device_capability(103))
+    assert torch.equal(v.view(bits), before_v)
+    assert (v.data_ptr(), v.stride()) == (pointer, stride)
+    assert MLACommonBaseImpl._concat_k_nope_k_pe(impl, k_nope, rope[..., :0]) is k_nope
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA graph concat")
+def test_concat_k_graph_replay_uses_updated_fp8_inputs():
+    tokens, heads = 32768, 12
+    kv = torch.randint(
+        0, 256, (tokens, heads, 256), device="cuda", dtype=torch.uint8
+    ).view(torch.float8_e4m3fn)
+    rope = torch.randint(
+        0, 256, (tokens, 1, 64), device="cuda", dtype=torch.uint8
+    ).view(torch.float8_e4m3fn)
+    nope = kv[..., :128]
+    impl = SimpleNamespace(_use_flashinfer_concat_mla_k=False)
+    MLACommonBaseImpl._concat_k_nope_k_pe(impl, nope, rope)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = MLACommonBaseImpl._concat_k_nope_k_pe(impl, nope, rope)
+    kv.view(torch.uint8).bitwise_xor_(1)
+    rope.view(torch.uint8).bitwise_xor_(1)
+    graph.replay()
+    expected = torch.cat((nope, rope.expand(-1, heads, -1)), dim=-1)
+    assert torch.equal(result.view(torch.uint8), expected.view(torch.uint8))
+
+
+def test_concat_k_flashinfer_dispatch_is_preserved(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "flashinfer_concat_mla_k",
+        lambda *args: calls.append(args),
+        raising=False,
+    )
+    impl = SimpleNamespace(_use_flashinfer_concat_mla_k=True)
+    nope = torch.empty(2, 128, 128)
+    rope = torch.empty(2, 1, 64)
+    result = MLACommonBaseImpl._concat_k_nope_k_pe(impl, nope, rope)
+    assert len(calls) == 1
+    assert calls[0][0] is result and calls[0][1] is nope and calls[0][2] is rope
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA 64-bit offsets")
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
+def test_concat_k_handles_input_offsets_beyond_int32(dtype):
+    from vllm.v1.attention.ops.mla_concat import concat_mla_k
+
+    bits = torch.uint8 if dtype == torch.float8_e4m3fn else torch.int16
+    # A real >2**31-element stride cannot be exercised with a small allocation.
+    # Only two short slices are touched, but backing storage is 2/4 GiB. Skip
+    # explicitly on constrained devices instead of risking an unrelated OOM.
+    required_bytes = (2**31 + 128) * torch.empty((), dtype=bits).element_size()
+    free_bytes, _ = torch.cuda.mem_get_info()
+    if free_bytes < required_bytes + 256 * 1024 * 1024:
+        pytest.skip("64-bit input-offset regression requires 2/4 GiB free storage")
+    storage = torch.empty(2**31 + 128, device="cuda", dtype=bits)
+    nope = torch.as_strided(storage, (2, 1, 128), (2**31, 128, 1)).view(dtype)
+    nope.view(bits).copy_(torch.arange(256, device="cuda").reshape(2, 1, 128).to(bits))
+    rope = torch.ones(2, 1, 64, device="cuda", dtype=bits).view(dtype)
+    out = torch.empty(2, 1, 192, device="cuda", dtype=dtype)
+    concat_mla_k(out, nope, rope)
+    expected = torch.cat((nope, rope), dim=-1)
+    assert torch.equal(out.view(bits), expected.view(bits))
+
+
 def test_masked_mha_routing_is_dimension_specific():
     assert _use_masked_mha(
         backend_name="FLASHMLA_SPARSE",

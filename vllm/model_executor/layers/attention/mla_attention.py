@@ -296,6 +296,11 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.attention.ops.dcp import MLADCPManager
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
+from vllm.v1.attention.ops.mla_concat import (
+    MIN_TRITON_CONCAT_BYTES,
+    can_use_triton_concat,
+    concat_mla_k,
+)
 from vllm.v1.attention.ops.pcp import (
     finalize_mla_pcp_decode,
     maybe_gather_mla_latent_cache_inputs,
@@ -2882,6 +2887,13 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
 
         if self._use_flashinfer_concat_mla_k:
             torch.ops.vllm.flashinfer_concat_mla_k(k, k_nope, k_pe)
+        elif (
+            k.numel() * k.element_size() >= MIN_TRITON_CONCAT_BYTES
+            and current_platform.is_cuda()
+            and can_use_triton_concat(k, k_nope, k_pe)
+            and current_platform.is_device_capability(103)
+        ):
+            concat_mla_k(k, k_nope, k_pe)
         else:
             # Fallback: Direct copies with efficient broadcasting
             k[..., : k_nope.shape[-1]] = k_nope
