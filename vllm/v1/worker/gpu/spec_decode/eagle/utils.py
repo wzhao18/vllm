@@ -94,14 +94,28 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
                 cache_dtype=speculative_config.kv_cache_dtype,
             ),
         )
-    if speculative_config.attention_backend is not None:
+    if (
+        speculative_config.attention_backend is not None
+        or speculative_config.tokenspeed_mla_min_split_kv
+        != vllm_config.attention_config.tokenspeed_mla_min_split_kv
+        or speculative_config.tokenspeed_mla_enable_packed_q
+        != vllm_config.attention_config.tokenspeed_mla_enable_packed_q
+    ):
         # Before get_model(): the backend is read off the constructed layers.
         # Only when set, so the draft keeps a KV cache layout the target shares.
         vllm_config = replace(
             vllm_config,
             attention_config=replace(
                 vllm_config.attention_config,
-                backend=speculative_config.attention_backend,
+                backend=(
+                    speculative_config.attention_backend
+                    if speculative_config.attention_backend is not None
+                    else vllm_config.attention_config.backend
+                ),
+                tokenspeed_mla_min_split_kv=(
+                    speculative_config.tokenspeed_mla_min_split_kv
+                ),
+                tokenspeed_mla_enable_packed_q=speculative_config.tokenspeed_mla_enable_packed_q,
             ),
         )
     draft_load_config = get_pp_safe_draft_load_config(vllm_config.load_config)

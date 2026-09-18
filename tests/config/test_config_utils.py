@@ -3,10 +3,14 @@
 
 from dataclasses import dataclass
 from enum import Enum
+from types import SimpleNamespace
 
 import pytest
 
+from vllm.config.attention import AttentionConfig
 from vllm.config.cache import CacheConfig
+from vllm.config.speculative import SpeculativeConfig
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.config.scheduler import SchedulerConfig
 from vllm.config.utils import get_hash_factors, hash_factors, normalize_value
 
@@ -303,3 +307,97 @@ print(hash_factors(envs.compile_factors()))
         "HOME relocation changed the compile-cache env hash - a "
         "location-only derived var is leaking into the key"
     )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("tokenspeed_mla_min_split_kv", 8), ("tokenspeed_mla_enable_packed_q", True)],
+)
+def test_draft_tokenspeed_policy_changes_compilation_hash(field, value):
+    config = SimpleNamespace(
+        method="dspark",
+        tokenspeed_mla_min_split_kv=1,
+        tokenspeed_mla_enable_packed_q=False,
+        draft_model_config=SimpleNamespace(
+            compute_hash=lambda: "same-model", hf_config=SimpleNamespace()
+        ),
+    )
+    before = SpeculativeConfig.compute_hash(config)
+    setattr(config, field, value)
+    assert SpeculativeConfig.compute_hash(config) != before
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [{"tokenspeed_mla_min_split_kv": 8}, {"tokenspeed_mla_enable_packed_q": True}],
+)
+def test_target_tokenspeed_policy_changes_compilation_hash(policy):
+    backend = AttentionBackendEnum.TOKENSPEED_MLA
+    assert (
+        AttentionConfig(backend=backend).compute_hash()
+        != AttentionConfig(backend=backend, **policy).compute_hash()
+    )
+
+
+@pytest.mark.parametrize("floor,packed", [(8, False), (1, True), (8, True)])
+@pytest.mark.parametrize("backend", [None, AttentionBackendEnum.FLASHINFER_MLA])
+def test_tokenspeed_policy_requires_explicit_backend(backend, floor, packed):
+    with pytest.raises(ValueError, match="explicitly selecting TOKENSPEED_MLA"):
+        AttentionConfig(
+            backend=backend,
+            tokenspeed_mla_min_split_kv=floor,
+            tokenspeed_mla_enable_packed_q=packed,
+        )
+
+
+@pytest.mark.parametrize("floor,packed", [(8, False), (1, True), (8, True)])
+@pytest.mark.parametrize("per_kind", [False, True])
+def test_tokenspeed_policy_accepts_explicit_backend(floor, packed, per_kind):
+    backend = AttentionBackendEnum.TOKENSPEED_MLA
+    selection = (
+        {"backend_per_kind": {"mla_attention": backend}}
+        if per_kind
+        else {"backend": backend}
+    )
+    config = AttentionConfig(
+        **selection,
+        tokenspeed_mla_min_split_kv=floor,
+        tokenspeed_mla_enable_packed_q=packed,
+    )
+    assert config.tokenspeed_mla_min_split_kv == floor
+    assert config.tokenspeed_mla_enable_packed_q == packed
+
+
+@pytest.mark.parametrize("floor,packed", [(8, False), (1, True), (8, True)])
+@pytest.mark.parametrize("backend", [None, AttentionBackendEnum.FLASHINFER_MLA])
+def test_draft_tokenspeed_policy_rejects_other_backend(backend, floor, packed):
+    config = SimpleNamespace(
+        attention_backend=backend,
+        tokenspeed_mla_min_split_kv=floor,
+        tokenspeed_mla_enable_packed_q=packed,
+    )
+    with pytest.raises(ValueError, match="attention_backend=TOKENSPEED_MLA"):
+        SpeculativeConfig._validate_tokenspeed_mla_split_policy(config)
+
+
+@pytest.mark.parametrize("floor,packed", [(8, False), (1, True), (8, True)])
+def test_draft_tokenspeed_policy_accepts_explicit_backend(floor, packed):
+    config = SimpleNamespace(
+        attention_backend=AttentionBackendEnum.TOKENSPEED_MLA,
+        tokenspeed_mla_min_split_kv=floor,
+        tokenspeed_mla_enable_packed_q=packed,
+    )
+    SpeculativeConfig._validate_tokenspeed_mla_split_policy(config)
+
+
+@pytest.mark.parametrize("backend", [None, AttentionBackendEnum.FLASHINFER_MLA])
+def test_default_tokenspeed_policy_accepts_other_backend(backend):
+    target = AttentionConfig(backend=backend)
+    assert target.tokenspeed_mla_min_split_kv == 1
+    assert target.tokenspeed_mla_enable_packed_q is False
+    draft = SimpleNamespace(
+        attention_backend=backend,
+        tokenspeed_mla_min_split_kv=1,
+        tokenspeed_mla_enable_packed_q=False,
+    )
+    SpeculativeConfig._validate_tokenspeed_mla_split_policy(draft)

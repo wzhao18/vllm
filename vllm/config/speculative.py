@@ -416,6 +416,11 @@ class SpeculativeConfig:
     kv_cache_dtype: CacheDType | None = None
     """KV cache dtype for the draft model. When `None`, the draft inherits the
     target model's `--kv-cache-dtype`."""
+    tokenspeed_mla_min_split_kv: int = Field(default=1, ge=1)
+    """TokenSpeed MLA split-K floor for the draft, independent of the target.
+    Non-default values require attention_backend="TOKENSPEED_MLA"."""
+    tokenspeed_mla_enable_packed_q: bool = False
+    """TokenSpeed query packing for the draft, independent of the target."""
     max_model_len: int | None = Field(default=None, ge=1)
     """The maximum model length of the draft model. Used when testing the
     ability to skip speculation for some sequences."""
@@ -619,6 +624,8 @@ class SpeculativeConfig:
             "dspark",
         )
         factors.append(uses_aux_hidden_states)
+        factors.append(self.tokenspeed_mla_min_split_kv)
+        factors.append(self.tokenspeed_mla_enable_packed_q)
 
         if self.draft_model_config is not None:
             factors.append(self.draft_model_config.compute_hash())
@@ -1098,7 +1105,18 @@ class SpeculativeConfig:
         parts = model.split(".")
         return len(parts) >= 2 and all(part.isidentifier() for part in parts)
 
+    def _validate_tokenspeed_mla_split_policy(self) -> None:
+        if (
+            (self.tokenspeed_mla_min_split_kv != 1 or self.tokenspeed_mla_enable_packed_q)
+            and self.attention_backend != AttentionBackendEnum.TOKENSPEED_MLA
+        ):
+            raise ValueError(
+                "draft TokenSpeed MLA split/packing settings require "
+                "attention_backend=TOKENSPEED_MLA"
+            )
+
     def __post_init__(self):
+        self._validate_tokenspeed_mla_split_policy()
         # Note: "method" is a new parameter that helps to extend the
         # configuration of non-model-based proposers, and the "model" parameter
         # will be used to set the draft model, eagle head, or additional weight

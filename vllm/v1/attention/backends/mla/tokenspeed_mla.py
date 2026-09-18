@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, ClassVar
 
 import torch
 
+from vllm.config import get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import (
@@ -38,12 +39,37 @@ logger = init_logger(__name__)
 _TOKENSPEED_MAX_Q_LEN = 8
 
 _g_workspace: dict[torch.device, torch.Tensor] = {}
+_g_split_workspace: dict[tuple[torch.device, int], torch.Tensor] = {}
 
 
 def _get_workspace(
-    device: torch.device, num_heads: int, kv_lora_rank: int
+    device: torch.device,
+    num_heads: int,
+    kv_lora_rank: int,
+    max_query_tokens: int,
+    min_split_kv: int,
+    enable_packed_q: bool = False,
 ) -> torch.Tensor:
     from tokenspeed_mla import get_num_sm
+
+    if min_split_kv != 1 or enable_packed_q:
+        from tokenspeed_mla import get_tokenspeed_mla_decode_workspace_capacity
+
+        packing_kwargs = {"enable_packed_q": True} if enable_packed_q else {}
+        needed = get_tokenspeed_mla_decode_workspace_capacity(
+            max_query_tokens=max_query_tokens,
+            num_heads=num_heads,
+            kv_lora_rank=kv_lora_rank,
+            num_sms=get_num_sm(device),
+            min_split_kv=min_split_kv,
+            **packing_kwargs,
+        )
+        key = (device, needed)
+        if key not in _g_split_workspace:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("TokenSpeed split workspace must be warmed before capture")
+            _g_split_workspace[key] = torch.empty(needed, dtype=torch.int8, device=device)
+        return _g_split_workspace[key]
 
     needed = (
         get_num_sm(device) * num_heads * _TOKENSPEED_MAX_Q_LEN * (kv_lora_rank + 1) * 4
@@ -217,6 +243,36 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
         self._workspace_buffer: torch.Tensor | None = None
         self.softmax_scale: float | None = None
         self.output_scale: float | None = None
+        self._decode_with_split_kv = None
+        config = get_current_vllm_config()
+        self.min_split_kv = config.attention_config.tokenspeed_mla_min_split_kv
+        self.enable_packed_q = config.attention_config.tokenspeed_mla_enable_packed_q
+        self.max_query_tokens = max(
+            config.scheduler_config.max_num_batched_tokens,
+            config.compilation_config.max_cudagraph_capture_size or 0,
+        )
+        if self.min_split_kv != 1 or self.enable_packed_q:
+            try:
+                from tokenspeed_mla import (
+                    get_tokenspeed_mla_decode_workspace_capacity,
+                    tokenspeed_mla_decode_with_split_kv,
+                )
+            except ImportError as exc:
+                raise ValueError(
+                    "TokenSpeed MLA split or packed-Q settings require the "
+                    "TokenSpeed split-policy and packed-Q APIs"
+                ) from exc
+            self._decode_with_split_kv = tokenspeed_mla_decode_with_split_kv
+            packing_kwargs = {"enable_packed_q": True} if self.enable_packed_q else {}
+            # Validate the policy before model warmup; this call does not touch CUDA.
+            get_tokenspeed_mla_decode_workspace_capacity(
+                max_query_tokens=self.max_query_tokens,
+                num_heads=num_heads,
+                kv_lora_rank=self.kv_lora_rank,
+                num_sms=1,
+                min_split_kv=self.min_split_kv,
+                **packing_kwargs,
+            )
 
         # Pre-JIT BF16 and FP8 prefill kernels here too — decode impl always
         # runs when tokenspeed is selected, prefill backend may not (user can
@@ -289,8 +345,23 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
         if self._workspace_buffer is None:
             # Parallelism can change the runtime query head count.
             self._workspace_buffer = _get_workspace(
-                q.device, q.shape[-2], self.kv_lora_rank
+                q.device,
+                q.shape[-2],
+                self.kv_lora_rank,
+                self.max_query_tokens,
+                self.min_split_kv,
+                self.enable_packed_q,
             )
+
+        split_kwargs: dict[str, int | bool] = {}
+        if self.min_split_kv != 1 or self.enable_packed_q:
+            if q.shape[0] * q.shape[1] > self.max_query_tokens:
+                raise ValueError("decode query exceeds the TokenSpeed workspace capacity")
+            assert self._decode_with_split_kv is not None
+            tokenspeed_mla_decode = self._decode_with_split_kv
+            split_kwargs["min_split_kv"] = self.min_split_kv
+            if self.enable_packed_q:
+                split_kwargs["enable_packed_q"] = True
 
         # vLLM kv_c_and_k_pe_cache is already (num_blocks, block_size, head_size).
         # tokenspeed_mla_decode wants 3D — pass as-is (no unsqueeze, unlike trtllm).
@@ -312,6 +383,7 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
             causal_seqs=causal_seqs if self.dcp_world_size > 1 else None,
             cp_world=self.dcp_world_size,
             cp_rank=self.dcp_rank,
+            **split_kwargs,
         )
         if return_lse:
             o, lse = kernel_out

@@ -29,6 +29,8 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             vllm_config.attention_config,
             use_non_causal=dflash_has_any_non_causal(draft_model_config.hf_config),
             backend=speculative_config.attention_backend,
+            tokenspeed_mla_min_split_kv=speculative_config.tokenspeed_mla_min_split_kv,
+            tokenspeed_mla_enable_packed_q=speculative_config.tokenspeed_mla_enable_packed_q,
         ),
         cache_config=(
             replace(

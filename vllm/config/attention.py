@@ -73,6 +73,15 @@ class AttentionConfig:
     disable_flashinfer_q_quantization: bool = False
     """If set, when using fp8 kv, do not quantize Q to fp8."""
 
+    tokenspeed_mla_min_split_kv: int = Field(default=1, ge=1)
+    """Split-K floor for TokenSpeed MLA decode. One keeps the backend heuristic.
+    Non-default values require an explicit TokenSpeed backend selection, including
+    per-kind overrides. Other kinds are unaffected. Higher values reserve
+    additional workspace and may slow short contexts."""
+
+    tokenspeed_mla_enable_packed_q: bool = False
+    """Opt into contiguous query/head packing for TokenSpeed MLA decode."""
+
     mla_prefill_backend: MLAPrefillBackendEnum | None = None
     """MLA prefill backend to use. If None, will be selected automatically.
     Valid options: FLASH_ATTN (FA3/FA4), FLASHINFER, TRTLLM_RAGGED."""
@@ -133,6 +142,13 @@ class AttentionConfig:
     versions."""
 
     def __post_init__(self) -> None:
+        if (self.tokenspeed_mla_min_split_kv != 1 or self.tokenspeed_mla_enable_packed_q) and (
+            AttentionBackendEnum.TOKENSPEED_MLA
+            not in (self.backend, *self.backend_per_kind.values())
+        ):
+            raise ValueError(
+                "TokenSpeed MLA split/packing settings require explicitly selecting TOKENSPEED_MLA"
+            )
         msa_aliases: dict[AttentionBackendEnum, MiniMaxM3MSADecodeBackend] = {
             AttentionBackendEnum.CUTLASS_MSA: "cutlass",
             AttentionBackendEnum.TRITON_MSA: "triton",

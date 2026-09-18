@@ -1294,6 +1294,8 @@ class SpecDecodeBaseProposer:
             attention_config=replace(
                 base.attention_config,
                 backend=spec_cfg.attention_backend,
+                tokenspeed_mla_min_split_kv=spec_cfg.tokenspeed_mla_min_split_kv,
+                tokenspeed_mla_enable_packed_q=spec_cfg.tokenspeed_mla_enable_packed_q,
             ),
         )
 
