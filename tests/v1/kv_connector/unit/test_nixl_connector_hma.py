@@ -31,6 +31,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheTensor,
     MLAAttentionSpec,
+    SlidingWindowSpec,
 )
 
 from .utils import (
@@ -275,6 +276,186 @@ def test_needs_split_local_xfer_handles(use_mla, source_ranks, tp_ratio, expecte
     plan.all_source_ranks = source_ranks
 
     assert worker._needs_split_local_xfer_handles(tp_ratio, plan) is expected
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    (
+        "local_dcp_size,remote_dcp_size,local_block_size,remote_block_size,"
+        "local_interleave,remote_interleave,expected"
+    ),
+    [
+        pytest.param(1, 8, 64, 128, 1, 128, True, id="dcp8_prefill_to_dcp1_decode"),
+        pytest.param(8, 1, 64, 128, 64, 1, True, id="dcp8_decode_from_dcp1_prefill"),
+        pytest.param(8, 8, 64, 128, 1, 1, False, id="symmetric_dcp"),
+    ],
+)
+def test_validate_asymmetric_dcp_block_aligned(
+    local_dcp_size,
+    remote_dcp_size,
+    local_block_size,
+    remote_block_size,
+    local_interleave,
+    remote_interleave,
+    expected,
+):
+    worker = object.__new__(NixlConnectorWorker)
+    worker._has_mamba = True
+    worker._TRANSFER_MODE = "push"
+    worker.dcp_size = local_dcp_size
+    worker.pp_size = 1
+    worker.block_size = local_block_size
+    worker.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=local_interleave)
+    )
+    remote = SimpleNamespace(
+        cp_kv_cache_interleave_size=remote_interleave,
+        block_size=remote_block_size,
+        pp_size=1,
+    )
+
+    assert worker._validate_asymmetric_dcp(remote, remote_dcp_size) is expected
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    (
+        "local_dcp_size,remote_dcp_size,local_block_size,remote_block_size,"
+        "local_interleave,remote_interleave,match"
+    ),
+    [
+        (1, 8, 64, 128, 1, 64, "block-aligned"),
+        (8, 1, 64, 128, 128, 1, "block-aligned"),
+        (2, 8, 64, 128, 64, 128, "one side to use DCP=1"),
+        (4, 1, 64, 128, 64, 1, "only DCP8 and DCP1"),
+    ],
+)
+def test_validate_asymmetric_dcp_rejects_unsupported_geometry(
+    local_dcp_size,
+    remote_dcp_size,
+    local_block_size,
+    remote_block_size,
+    local_interleave,
+    remote_interleave,
+    match,
+):
+    worker = object.__new__(NixlConnectorWorker)
+    worker._has_mamba = True
+    worker._TRANSFER_MODE = "push"
+    worker.dcp_size = local_dcp_size
+    worker.pp_size = 1
+    worker.block_size = local_block_size
+    worker.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=local_interleave)
+    )
+    remote = SimpleNamespace(
+        cp_kv_cache_interleave_size=remote_interleave,
+        block_size=remote_block_size,
+        pp_size=1,
+    )
+
+    with pytest.raises(RuntimeError, match=match):
+        worker._validate_asymmetric_dcp(remote, remote_dcp_size)
+
+
+@pytest.mark.cpu_test
+def test_validate_asymmetric_dcp_rejects_pure_mla_non_dcp1_ratio():
+    worker = object.__new__(NixlConnectorWorker)
+    worker._has_mamba = False
+    worker._TRANSFER_MODE = "push"
+    worker.dcp_size = 2
+    worker.pp_size = 1
+    worker.block_size = 64
+    worker.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=64)
+    )
+    remote = SimpleNamespace(
+        cp_kv_cache_interleave_size=64, block_size=64, pp_size=1
+    )
+
+    with pytest.raises(RuntimeError, match="one side to use DCP=1"):
+        worker._validate_asymmetric_dcp(remote, remote_dcp_size=8)
+
+
+@pytest.mark.cpu_test
+def test_validate_asymmetric_dcp_rejects_missing_remote_interleave():
+    worker = object.__new__(NixlConnectorWorker)
+    worker._has_mamba = True
+    worker._TRANSFER_MODE = "push"
+    worker.dcp_size = 1
+    worker.pp_size = 1
+    worker.block_size = 64
+    worker.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=1)
+    )
+    remote = SimpleNamespace(
+        cp_kv_cache_interleave_size=None, block_size=64, pp_size=1
+    )
+
+    with pytest.raises(RuntimeError, match="did not advertise"):
+        worker._validate_asymmetric_dcp(remote, remote_dcp_size=8)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("local_pp_size,remote_pp_size", [(2, 1), (1, 2)])
+def test_validate_asymmetric_dcp_rejects_pipeline_parallelism(
+    local_pp_size, remote_pp_size
+):
+    worker = object.__new__(NixlConnectorWorker)
+    worker._has_mamba = True
+    worker._TRANSFER_MODE = "push"
+    worker.dcp_size = 1
+    worker.pp_size = local_pp_size
+    worker.block_size = 64
+    worker.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=1)
+    )
+    remote = SimpleNamespace(
+        cp_kv_cache_interleave_size=64,
+        block_size=64,
+        pp_size=remote_pp_size,
+    )
+
+    with pytest.raises(RuntimeError, match="PP=1 on both sides"):
+        worker._validate_asymmetric_dcp(remote, remote_dcp_size=8)
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "local_has_swa,remote_has_swa", [(True, False), (False, True)]
+)
+def test_validate_asymmetric_dcp_rejects_sliding_window_attention(
+    local_has_swa, remote_has_swa
+):
+    worker = object.__new__(NixlConnectorWorker)
+    worker._has_mamba = False
+    worker._TRANSFER_MODE = "push"
+    worker._group_spec_types = (SlidingWindowSpec,) if local_has_swa else ()
+    worker.dcp_size = 1
+    worker.pp_size = 1
+    worker.block_size = 64
+    worker.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=1)
+    )
+    remote = SimpleNamespace(
+        cp_kv_cache_interleave_size=64,
+        block_size=64,
+        pp_size=1,
+        has_transferable_swa=remote_has_swa,
+    )
+
+    with pytest.raises(RuntimeError, match="sliding-window attention"):
+        worker._validate_asymmetric_dcp(remote, remote_dcp_size=8)
+
+
+@pytest.mark.cpu_test
+def test_pull_preserves_pure_mla_divisible_asymmetric_dcp():
+    worker = object.__new__(NixlConnectorWorker)
+    worker._TRANSFER_MODE = "pull"
+    worker._has_mamba = False
+    worker.dcp_size = 2
+    remote = SimpleNamespace()
+
+    assert worker._validate_asymmetric_dcp(remote, remote_dcp_size=8) is False
 
 
 @pytest.mark.cpu_test

@@ -3,10 +3,14 @@
 """Unit tests for the scheduler-driven heartbeat / lease-renewal system."""
 
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
+    NixlPushConnectorWorker,
+)
 from vllm.v1.outputs import KVConnectorOutput
 
 from .utils import create_request, make_nixl_scheduler
@@ -163,3 +167,33 @@ def test_handle_heartbeat():
     assert w._reqs_to_send["req-b"] >= far_future
     # req-unknown: not added.
     assert "req-unknown" not in w._reqs_to_send
+
+
+def test_push_heartbeat_handshake_is_notification_only():
+    """Decode only needs the producer's agent for heartbeat notifications."""
+    worker = object.__new__(NixlPushConnectorWorker)
+    worker._hb_handshake_notif_only = True
+    worker._ensure_handshake = MagicMock(return_value=MagicMock())
+    metadata = SimpleNamespace(
+        heartbeat_by_engine={
+            _ENGINE_A: SimpleNamespace(
+                host="my-host",
+                port=1234,
+                tp_size=8,
+                dcp_size=8,
+                pp_size=1,
+            )
+        }
+    )
+
+    worker._send_heartbeats(metadata)
+
+    worker._ensure_handshake.assert_called_once_with(
+        _ENGINE_A,
+        "my-host",
+        1234,
+        8,
+        8,
+        1,
+        True,
+    )
