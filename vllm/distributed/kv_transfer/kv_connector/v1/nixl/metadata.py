@@ -24,6 +24,7 @@ GET_META_MSG = b"get_meta_msg"
 # Sent worker-to-worker over NIXL: D worker -> P worker, encoded as
 # PUSH_REG_NOTIF_PREFIX + msgpack(registration_data).
 PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
+PUSH_DONE_NOTIF_PREFIX = b"PUSH_DONE:"
 #
 # NIXL Connector Version
 #
@@ -49,8 +50,9 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #  11: Add per-region transfer geometry and memory types to NixlAgentMetadata
 #  12: Add per-region member names for PP push
 #  13: Add packed-member layouts and order-independent packed-push backend hashes
+#  14: Add CP KV-cache interleave geometry and exact push coverage
 #
-NIXL_CONNECTOR_VERSION: int = 13
+NIXL_CONNECTOR_VERSION: int = 14
 
 
 @dataclass
@@ -77,6 +79,9 @@ class NixlAgentMetadata:
     region_members: list[list[str]] = field(default_factory=list)
     # Packed member -> (byte offset in its region's block, bytes per page).
     packed_member_layouts: dict[str, tuple[int, int]] = field(default_factory=dict)
+    pp_size: int = 1
+    cp_kv_cache_interleave_size: int | None = None
+    has_transferable_swa: bool = False
 
 
 @dataclass
@@ -258,6 +263,9 @@ class ReqMeta:
     # Worker-only, per-region physical pages to zero after a successful pull.
     # None selects group-based completion; empty lists mean no zeroing.
     region_blocks_to_zero: BlockIds | None = None
+    # Exact number of physical attention pages written across all producer
+    # shards, per cache group. Empty for pull transfers.
+    aggregate_remote_coverage: tuple[int, ...] = ()
 
 
 class NixlConnectorMetadata(KVConnectorMetadata):
