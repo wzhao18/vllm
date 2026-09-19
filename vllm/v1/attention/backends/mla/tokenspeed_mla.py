@@ -185,6 +185,7 @@ class TokenspeedMLABackend(MLACommonBackend):
 class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
     can_return_lse_for_decode: bool = True
     supports_dcp: bool = True
+    supports_mtp_with_cp_non_trivial_interleave_size: bool = True
     # tokenspeed_mla_decode returns LSE in log2 units; its own DCP test merges
     # partial outputs with exp2(lse).
     lse_base_on_e: bool = False
@@ -216,6 +217,9 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
             attn_type,
             kv_sharing_target_layer_name,
             **mla_args,
+        )
+        self.cp_kv_cache_interleave_size = (
+            get_current_vllm_config().parallel_config.cp_kv_cache_interleave_size
         )
 
         unsupported_features = [alibi_slopes, sliding_window, logits_soft_cap]
@@ -358,6 +362,9 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
         # vLLM kv_c_and_k_pe_cache is already (num_blocks, block_size, head_size).
         # tokenspeed_mla_decode wants 3D — pass as-is (no unsqueeze, unlike trtllm).
         return_lse = self.need_to_return_lse_for_decode
+        cp_kwargs: dict[str, int] = {}
+        if self.dcp_world_size > 1 and self.cp_kv_cache_interleave_size > 1:
+            cp_kwargs["cp_interleave_size"] = self.cp_kv_cache_interleave_size
         kernel_out = tokenspeed_mla_decode(
             query=q,
             kv_cache=kv_c_and_k_pe_cache,
@@ -376,6 +383,7 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
             cp_world=self.dcp_world_size,
             cp_rank=self.dcp_rank,
             **self._decode_kwargs,
+            **cp_kwargs,
         )
         if return_lse:
             o, lse = kernel_out

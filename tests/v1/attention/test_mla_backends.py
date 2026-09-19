@@ -1097,8 +1097,15 @@ def test_flashinfer_mla_dspark_dcp_supports_target_and_draft(monkeypatch):
     ],
 )
 @pytest.mark.parametrize("min_split_kv", [1, 8])
+@pytest.mark.parametrize("interleave_size", [1, 64])
 def test_tokenspeed_mla_decode_contract(
-    monkeypatch, causal, tokens_per_decode, dcp_world_size, dcp_rank, min_split_kv
+    monkeypatch,
+    causal,
+    tokens_per_decode,
+    dcp_world_size,
+    dcp_rank,
+    min_split_kv,
+    interleave_size,
 ):
     decode_call = None
     num_decodes = 2
@@ -1134,7 +1141,7 @@ def test_tokenspeed_mla_decode_contract(
     impl = object.__new__(tokenspeed_mla_module.TokenspeedMLAImpl)
     impl.dcp_world_size = dcp_world_size
     impl.dcp_rank = dcp_rank
-    impl.cp_kv_cache_interleave_size = 1
+    impl.cp_kv_cache_interleave_size = interleave_size
     impl.need_to_return_lse_for_decode = True
     impl.kv_lora_rank = kv_lora_rank
     impl.qk_rope_head_dim = qk_rope_head_dim
@@ -1199,6 +1206,10 @@ def test_tokenspeed_mla_decode_contract(
     assert decode_call["return_lse"] is True
     assert decode_call["cp_world"] == dcp_world_size
     assert decode_call["cp_rank"] == dcp_rank
+    if dcp_world_size > 1 and interleave_size > 1:
+        assert decode_call["cp_interleave_size"] == interleave_size
+    else:
+        assert "cp_interleave_size" not in decode_call
     if min_split_kv > 1:
         assert decode_call["min_split_kv"] == min_split_kv
     else:
@@ -1294,6 +1305,7 @@ def test_tokenspeed_min_split_startup(monkeypatch, floor, supports_floor, error)
         tokenspeed_mla_module,
         "get_current_vllm_config",
         lambda: SimpleNamespace(
+            parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=64),
             speculative_config=SimpleNamespace(num_speculative_tokens=4),
             scheduler_config=SimpleNamespace(
                 max_num_batched_tokens=8192, max_num_seqs=32
@@ -1329,6 +1341,7 @@ def test_tokenspeed_min_split_startup(monkeypatch, floor, supports_floor, error)
             construct()
     else:
         impl = construct()
+        assert impl.cp_kv_cache_interleave_size == 64
         assert impl._decode_kwargs == ({"min_split_kv": floor} if floor > 1 else {})
         assert impl._max_decode_tokens == (512 if floor > 1 else 0)
 
