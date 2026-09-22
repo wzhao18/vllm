@@ -191,6 +191,82 @@ def test_megakernel_requires_expert_parallel(megakernel_host):
     assert not supported and "parallel config" in reason
 
 
+@pytest.mark.parametrize(
+    "backend,beta,linear_beta,expected",
+    [
+        (FLASHINFER_MOE_EP_CUTEDSL, 4.0, None, True),
+        (FLASHINFER_MOE_EP_CUTEDSL, 4.0, 25.0, True),
+        (FLASHINFER_MOE_EP_CUTEDSL, None, None, False),
+        (FLASHINFER_MOE_EP_CUTEDSL, 0.0, None, False),
+        (FLASHINFER_MOE_EP_CUTEDSL, float("nan"), None, False),
+        (FLASHINFER_MOE_EP_CUTEDSL, 4.0, -1.0, False),
+        (FLASHINFER_MOE_EP_DEEP_GEMM, 4.0, 25.0, False),
+    ],
+)
+def test_megakernel_situ_support(megakernel_host, backend, beta, linear_beta, expected):
+    moe = _megakernel_moe(
+        backend,
+        activation=MoEActivation.SITU,
+        activation_situ_beta=beta,
+        activation_situ_linear_beta=linear_beta,
+    )
+    weight_key = kNvfp4Static if backend == FLASHINFER_MOE_EP_CUTEDSL else kMxfp4Static
+    activation_key = kNvfp4Dynamic if backend == FLASHINFER_MOE_EP_CUTEDSL else None
+    supported, reason = _is_supported(moe, weight_key, activation_key)
+    assert supported == expected, reason
+
+
+@pytest.mark.parametrize(
+    "activation,beta,linear_beta",
+    [(MoEActivation.SILU, None, None), (MoEActivation.SITU, 4.0, 25.0)],
+)
+def test_megakernel_forwards_activation_parameters(
+    monkeypatch, activation, beta, linear_beta
+):
+    from unittest.mock import Mock
+
+    config_constructor = Mock(side_effect=lambda **kwargs: SimpleNamespace(**kwargs))
+    api = SimpleNamespace(
+        BootstrapConfig=SimpleNamespace,
+        FleetParams=SimpleNamespace,
+        MoEWeightPack=SimpleNamespace,
+        Nvfp4CutedslMegaMoeConfig=config_constructor,
+        MegaConfig=SimpleNamespace,
+        MoEEpTensors=SimpleNamespace,
+        MoEEpMegaLayer=Mock(),
+    )
+    monkeypatch.setattr(fi_ep, "_load_flashinfer_moe_ep_api", lambda: api)
+    monkeypatch.setattr(
+        fi_ep,
+        "get_ep_group",
+        lambda: SimpleNamespace(world_size=1, rank_in_group=0, device_group=None),
+    )
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+    moe = _megakernel_moe(
+        FLASHINFER_MOE_EP_CUTEDSL,
+        activation=activation,
+        activation_situ_beta=beta,
+        activation_situ_linear_beta=linear_beta,
+        num_experts=8,
+        max_num_tokens=128,
+        intermediate_size=128,
+        experts_per_token=2,
+        swiglu_limit=None,
+    )
+    adapter = fi_ep.FlashInferMoeEp(
+        moe,
+        fi_ep.FlashInferMoeEpWeights(torch.empty(0), torch.empty(0)),
+        apply_topk_in_fc1=False,
+    )
+    config = config_constructor.call_args.kwargs
+    assert config["activation"] == (
+        "situ" if activation == MoEActivation.SITU else "swiglu"
+    )
+    assert config["situ_beta"] == beta
+    assert config["situ_linear_beta"] == linear_beta
+    adapter.destroy()
+
+
 def test_megakernel_reports_its_own_constraints(megakernel_host):
     """Constraints the framework does not know about surface as reasons."""
     _, reason = _is_supported(
