@@ -893,6 +893,76 @@ def test_concat_and_cache_mla_grouped(
                 run_grouped(invalid_scales)
 
 
+@pytest.mark.parametrize("device", CUDA_DEVICES[:1])
+@torch.inference_mode()
+def test_concat_and_cache_mla_grouped_all_padding_in_cudagraph(device: str) -> None:
+    """A DCP rank with no local context must execute an inert graph replay."""
+    if not current_platform.is_cuda():
+        pytest.skip("Kimi-K3 DCP CUDA graph coverage requires CUDA")
+
+    torch.set_default_device(device)
+    torch.accelerator.set_device_index(device)
+    num_layers = 5
+    num_tokens = 5
+    num_blocks = 2
+    block_size = 16
+    kv_lora_rank = 512
+    qk_rope_head_dim = 64
+    entry_size = kv_lora_rank + qk_rope_head_dim
+
+    kv_c = torch.randn(num_layers, num_tokens, kv_lora_rank, dtype=torch.bfloat16)
+    k_pe = torch.randn(num_layers, num_tokens, qk_rope_head_dim, dtype=torch.bfloat16)
+    kv_caches = torch.randn(
+        num_layers,
+        num_blocks,
+        block_size,
+        entry_size,
+        dtype=torch.bfloat16,
+    )
+    reference = kv_caches.clone()
+    cache_ptrs = torch.tensor(
+        [kv_caches[layer_idx].data_ptr() for layer_idx in range(num_layers)],
+        dtype=torch.int64,
+    )
+    slot_mapping = torch.full((num_layers, num_tokens), -1, dtype=torch.int64)
+    ref_cache = kv_caches[0]
+
+    def run_grouped() -> None:
+        ops.concat_and_cache_mla_grouped(
+            kv_c,
+            k_pe,
+            cache_ptrs,
+            slot_mapping,
+            ref_cache.size(1),
+            ref_cache.stride(0),
+            ref_cache.stride(1),
+            None,
+            "auto",
+        )
+
+    # Warm up lazy dispatch before capture, then prove both capture and replay
+    # leave every cache untouched when this rank owns no context slots.
+    run_grouped()
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_grouped()
+    graph.replay()
+    torch.accelerator.synchronize()
+
+    torch.testing.assert_close(kv_caches, reference, rtol=0, atol=0)
+
+    # Prove that the grouped insert itself was captured rather than accepting
+    # an empty graph: change the static slot buffer and replay the same graph.
+    slot_mapping[:, 0] = 0
+    graph.replay()
+    torch.accelerator.synchronize()
+    expected = reference.clone()
+    expected[:, 0, 0, :kv_lora_rank] = kv_c[:, 0]
+    expected[:, 0, 0, kv_lora_rank:] = k_pe[:, 0]
+    torch.testing.assert_close(kv_caches, expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("kv_lora_rank", KV_LORA_RANKS)
 @pytest.mark.parametrize("qk_rope_head_dim", QK_ROPE_HEAD_DIMS)
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS_MLA)

@@ -535,6 +535,7 @@ def _prepare_dflash_inputs_kernel(
     out_seeds_ptr,
     # Inputs from target batch
     target_positions_ptr,
+    target_seq_lens_ptr,
     target_query_start_loc_ptr,
     idx_mapping_ptr,
     last_sampled_ptr,
@@ -582,7 +583,17 @@ def _prepare_dflash_inputs_kernel(
         # Chunked prefilling: splice in the next prefill token.
         bonus_token = tl.load(next_prefill_tokens_ptr + req_state_idx).to(tl.int32)
 
-    last_valid_pos = tl.load(target_positions_ptr + valid_ctx_end - 1)
+    # DCP ranks can own no rows for a request (notably for short sequences with
+    # a large CP interleave). In that case there is no local position to read.
+    # seq_lens is replicated across DCP ranks and gives the same global position
+    # without requiring a host transfer.
+    global_last_valid_pos = tl.load(target_seq_lens_ptr + req_idx) - num_rejected - 1
+    last_local_pos_idx = tl.maximum(valid_ctx_end - 1, 0)
+    last_valid_pos = tl.load(
+        target_positions_ptr + last_local_pos_idx,
+        mask=num_valid_ctx > 0,
+        other=global_last_valid_pos,
+    )
     query_base = req_idx * num_query_per_req
 
     j = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -777,6 +788,7 @@ def prepare_dflash_inputs(
         temperature,
         seeds,
         input_batch.positions,
+        input_batch.seq_lens,
         input_batch.query_start_loc,
         input_batch.idx_mapping,
         last_sampled,
