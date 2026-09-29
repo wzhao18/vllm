@@ -26,6 +26,8 @@ def _run_prepare(
     cp_size: int = 1,
     cp_interleave: int = 1,
     draft_dcp_size: int | None = None,
+    global_seq_len: int | None = None,
+    num_rejected: int = 2,
 ):
     device = torch.device("cuda")
     max_num_reqs = 4
@@ -40,13 +42,19 @@ def _run_prepare(
         ),
         seq_lens=torch.full((max_num_reqs,), -1, dtype=torch.int32, device=device),
     )
+    num_target_tokens = len(target_positions)
+    if global_seq_len is None:
+        global_seq_len = target_positions[-1] + 1
     input_batch = SimpleNamespace(
         num_reqs=1,
-        num_tokens=4,
-        num_scheduled_tokens=np.array([4], dtype=np.int32),
-        seq_lens_cpu_upper_bound=torch.tensor([target_positions[-1] + 1]),
+        num_tokens=num_target_tokens,
+        num_scheduled_tokens=np.array([num_target_tokens], dtype=np.int32),
+        seq_lens=torch.tensor([global_seq_len], dtype=torch.int32, device=device),
+        seq_lens_cpu_upper_bound=torch.tensor([global_seq_len]),
         positions=torch.tensor(target_positions, dtype=torch.int64, device=device),
-        query_start_loc=torch.tensor([0, 4], dtype=torch.int32, device=device),
+        query_start_loc=torch.tensor(
+            [0, num_target_tokens], dtype=torch.int32, device=device
+        ),
         idx_mapping=torch.tensor([2], dtype=torch.int32, device=device),
     )
     query_slot_mapping = torch.full(
@@ -81,6 +89,7 @@ def _run_prepare(
     class InputsPrepared(Exception):
         pass
 
+    precompute_calls = []
     draft = SimpleNamespace(
         input_buffers=input_buffers,
         context_positions=context_positions,
@@ -92,6 +101,10 @@ def _run_prepare(
         seeds=seeds,
         hidden_states=torch.zeros(4, 1, device=device),
         prepare_context_anchor=lambda *args: None,
+        _precompute_context_kv=lambda *args: precompute_calls.append(args),
+        _capture_context_kv_in_graph=(
+            cp_size == 1 if draft_dcp_size is None else draft_dcp_size == 1
+        ),
         query_cudagraph_manager=None,
         dp_size=1,
         dp_rank=0,
@@ -131,7 +144,7 @@ def _run_prepare(
             draft.hidden_states,
             None,
             torch.tensor([1], dtype=torch.int32, device=device),
-            torch.tensor([2], dtype=torch.int32, device=device),
+            torch.tensor([num_rejected], dtype=torch.int32, device=device),
             last_sampled,
             next_prefill_tokens,
             input_temperature,
@@ -146,6 +159,7 @@ def _run_prepare(
         sample_indices=sample_indices.cpu(),
         sample_pos=sample_pos.cpu(),
         sample_idx_mapping=sample_idx_mapping.cpu(),
+        precompute_calls=precompute_calls,
         temperature=temperature.cpu(),
         seeds=seeds.cpu(),
     )
@@ -212,3 +226,29 @@ def test_prepare_dflash_inputs_never_writes_the_null_block():
         PAD_SLOT_ID,
         PAD_SLOT_ID,
     ]
+
+
+def test_prepare_dflash_inputs_empty_local_dcp_context():
+    # With a large interleave, a short sequence is entirely owned by CP rank 0.
+    # Other ranks still need to construct queries from the replicated global
+    # sequence length, without reading target_positions[-1].
+    out = _run_prepare(
+        target_positions=[],
+        block_table_values=[7, 8, 9, 10],
+        cp_rank=1,
+        cp_size=8,
+        cp_interleave=896,
+        global_seq_len=5,
+        num_rejected=0,
+    )
+
+    assert out.input_buffers.input_ids[:3].cpu().tolist() == [99, 123, 123]
+    assert out.input_buffers.positions[:3].cpu().tolist() == [5, 6, 7]
+    assert out.input_buffers.seq_lens[0].item() == 8
+    assert out.query_slot_mapping[:3].tolist() == [
+        PAD_SLOT_ID,
+        PAD_SLOT_ID,
+        PAD_SLOT_ID,
+    ]
+    assert out.sample_pos[:3].tolist() == [6, 7, 8]
+    assert out.precompute_calls == [(0, 0, False)]

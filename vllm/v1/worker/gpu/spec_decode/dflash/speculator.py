@@ -50,6 +50,10 @@ class DFlashSpeculator(DraftModelSpeculator):
             ),
         )
         super().__init__(vllm_config, device)
+        # Context K/V precompute includes DCP collectives when the MLA draft is
+        # sharded. Those collectives cannot safely be captured in this separate
+        # draft graph, so retain eager precompute for DCP drafts.
+        self._capture_context_kv_in_graph = self.dcp_size == 1
 
         self.hidden_states = torch.zeros(
             self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
@@ -166,8 +170,12 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.kv_cache_config,
             self.max_model_len,
             causal=self._group_causal,
-            precompute_context_kv=lambda num_reqs: self._precompute_context_kv(
-                0, self._num_graph_context_tokens(num_reqs)
+            precompute_context_kv=(
+                lambda num_reqs: self._precompute_context_kv(
+                    0, self._num_graph_context_tokens(num_reqs)
+                )
+                if self._capture_context_kv_in_graph
+                else None
             ),
             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
         )
@@ -444,6 +452,11 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.sample_from_anchor,
             )
 
+        if not self._capture_context_kv_in_graph:
+            # DCP ranks can have no local context, and context precompute contains
+            # collectives that cannot safely run in the separate draft graph.
+            self._precompute_context_kv(0, num_target_tokens, dummy_run)
+
         batch_sync, num_batch_tokens = (
             self._build_uniform_batch_dp_sync(dp_sync, num_reqs, self.num_query_per_req)
             if dp_sync is not None
@@ -465,23 +478,24 @@ class DFlashSpeculator(DraftModelSpeculator):
             batch_sync.num_tokens_across_dp if batch_sync is not None else None
         )
 
-        if batch_desc.cg_mode == CUDAGraphMode.FULL:
-            # The graph stores the first num_context context rows.
-            assert batch_desc.num_reqs is not None
-            num_context = self._num_graph_context_tokens(batch_desc.num_reqs)
-            if dummy_run:
-                # Dummy block tables are placeholders: write no context K/V.
-                self._context_slot_mappings[:, :num_context].fill_(PAD_SLOT_ID)
-            elif num_target_tokens <= num_context:
-                # Rows past the batch keep stale positions but write no K/V.
-                self._context_slot_mappings[:, num_target_tokens:num_context].fill_(
-                    PAD_SLOT_ID
-                )
+        if self._capture_context_kv_in_graph:
+            if batch_desc.cg_mode == CUDAGraphMode.FULL:
+                # The graph stores the first num_context context rows.
+                assert batch_desc.num_reqs is not None
+                num_context = self._num_graph_context_tokens(batch_desc.num_reqs)
+                if dummy_run:
+                    # Dummy block tables are placeholders: write no context K/V.
+                    self._context_slot_mappings[:, :num_context].fill_(PAD_SLOT_ID)
+                elif num_target_tokens <= num_context:
+                    # Rows past the batch keep stale positions but write no K/V.
+                    self._context_slot_mappings[:, num_target_tokens:num_context].fill_(
+                        PAD_SLOT_ID
+                    )
+                else:
+                    # Prefill context beyond the graph's rows is stored before replay.
+                    self._precompute_context_kv(num_context, num_target_tokens)
             else:
-                # Prefill context beyond the graph's rows is stored before replay.
-                self._precompute_context_kv(num_context, num_target_tokens)
-        else:
-            self._precompute_context_kv(0, num_target_tokens, dummy_run)
+                self._precompute_context_kv(0, num_target_tokens, dummy_run)
 
         # Rebuild the draft attention metadata even when replaying the FULL
         # graph so that any attention metadata builder state is updated.
@@ -535,6 +549,7 @@ def _prepare_dflash_inputs_kernel(
     out_seeds_ptr,
     # Inputs from target batch
     target_positions_ptr,
+    target_seq_lens_ptr,
     target_query_start_loc_ptr,
     idx_mapping_ptr,
     last_sampled_ptr,
@@ -582,7 +597,17 @@ def _prepare_dflash_inputs_kernel(
         # Chunked prefilling: splice in the next prefill token.
         bonus_token = tl.load(next_prefill_tokens_ptr + req_state_idx).to(tl.int32)
 
-    last_valid_pos = tl.load(target_positions_ptr + valid_ctx_end - 1)
+    # DCP ranks can own no rows for a request (notably for short sequences with
+    # a large CP interleave). In that case there is no local position to read.
+    # seq_lens is replicated across DCP ranks and gives the same global position
+    # without requiring a host transfer.
+    global_last_valid_pos = tl.load(target_seq_lens_ptr + req_idx) - num_rejected - 1
+    last_local_pos_idx = tl.maximum(valid_ctx_end - 1, 0)
+    last_valid_pos = tl.load(
+        target_positions_ptr + last_local_pos_idx,
+        mask=num_valid_ctx > 0,
+        other=global_last_valid_pos,
+    )
     query_base = req_idx * num_query_per_req
 
     j = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -777,6 +802,7 @@ def prepare_dflash_inputs(
         temperature,
         seeds,
         input_batch.positions,
+        input_batch.seq_lens,
         input_batch.query_start_loc,
         input_batch.idx_mapping,
         last_sampled,
