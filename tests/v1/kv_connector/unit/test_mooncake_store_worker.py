@@ -36,6 +36,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
     LBNHCStoreLayout,
     LoadSpec,
     MooncakeLookupResult,
+    MooncakeStoreConnectorMetadata,
     PoolKey,
     RankLocalStoreLayout,
     ReqMeta,
@@ -954,6 +955,7 @@ def _make_partial_tail_send_thread(
         hash_block_size=4,
         lcm_block_size=16,
         mamba_group_ids={1},
+        eagle_proof_margin_by_group={},
     )
     db = ChunkedTokenDatabase(
         KeyMetadata("test-model", 0, 0, 0, 0),
@@ -989,6 +991,38 @@ def _make_partial_tail_req(block_ids: list[int]) -> ReqMeta:
         can_save=True,
         boundary_state_offloads=[(1, 7, 12)],
     )
+
+
+def test_eagle_attention_proof_published_after_checkpoint_handoff():
+    store = MagicMock()
+    stored = set()
+    store.batch_is_exist.side_effect = lambda keys: [int(k in stored) for k in keys]
+
+    def put(keys, *args):
+        stored.update(keys)
+        return [256] * len(keys)
+
+    store.batch_put_from_multi_buffers.side_effect = put
+    thread = _make_partial_tail_send_thread(store)
+    thread.coord.eagle_proof_margin_by_group = {0: 4}
+    metadata = _make_partial_tail_req([1, 2, 3])
+    metadata.num_prompt_tokens = 13
+    metadata.completed_token_len = 8
+    metadata.boundary_state_offloads = [(1, 7, 8)]
+
+    assert thread._maybe_offload_boundary_states(metadata)
+    mamba_key = thread.token_databases[1].key_for(b"a1")
+    attention_key = thread.token_databases[0].key_for(b"a2")
+    assert mamba_key in stored
+    assert attention_key not in stored
+
+    metadata.completed_token_len = 13
+    metadata.boundary_state_offloads = None
+    assert thread._maybe_offload_boundary_states(metadata)
+    assert attention_key in stored
+    keys, addrs, *_ = store.batch_put_from_multi_buffers.call_args.args
+    assert addrs[keys.index(attention_key)] == [0x1000 + 3 * 256]
+    assert mamba_key not in keys
 
 
 def test_partial_tail_offload_skips_null_source_blocks():
@@ -3521,6 +3555,7 @@ def _make_bare_worker(
     worker.num_recv_threads = 1
     worker.recv_request_queue = queue.Queue()
     worker.finished_store_req = set()
+    worker._issued_store_metadata = None
     worker.tp_size = 1
     worker.store_tp_size = None
     worker.num_kv_head = 1
@@ -3578,6 +3613,76 @@ def _make_bare_worker(
     )
     _refresh_group_tp_replication_factors(worker)
     return worker
+
+
+@pytest.mark.parametrize("allow_partial_hash_hits", [False, True])
+@pytest.mark.parametrize("use_eagle", [False, True])
+def test_mooncake_lookup_respects_explicit_pmu_policy(
+    allow_partial_hash_hits, use_eagle
+):
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import (
+        coordinator as mooncake_coordinator,
+    )
+
+    groups = [
+        KVCacheGroupSpec(
+            ["full"],
+            FullAttentionSpec(
+                block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+            ),
+            is_eagle_group=use_eagle,
+        ),
+        KVCacheGroupSpec(
+            ["mamba"],
+            MambaSpec(
+                block_size=16,
+                shapes=(1, 1),
+                dtypes=(torch.float32,),
+                mamba_cache_mode="align",
+            ),
+        ),
+    ]
+    coordinator = mooncake_coordinator.MooncakeStoreCoordinator(
+        groups,
+        scheduler_block_size=128,
+        hash_block_size=16,
+        dcp_world_size=8,
+        allow_partial_hash_hits=allow_partial_hash_hits,
+    )
+    hashes = [BlockHash(bytes([i]) * 16) for i in range(32)]
+    pool = mooncake_coordinator.ExternalCachedBlockPool(
+        hash_block_size=16,
+        exists={(group, bytes(h)) for group in range(2) for h in hashes},
+    )
+    _, hit = coordinator.find_longest_cache_hit(hashes, 511, pool)
+    assert coordinator.enable_partial_hash_hits == allow_partial_hash_hits
+    assert hit == (496 if allow_partial_hash_hits else 384)
+
+
+def test_get_finished_issues_store_without_forward_once():
+    worker = _make_bare_worker()
+    worker.kv_send_thread = MagicMock()
+    request = ReqMeta(
+        req_id="preempted",
+        token_len_chunk=0,
+        block_ids=([3],),
+        block_hashes=[b"hash"],
+        can_save=True,
+    )
+    metadata = MooncakeStoreConnectorMetadata(
+        unfinished_request_ids=set(), preempted_req_ids={request.req_id}
+    )
+    metadata.add_request(request)
+    event = MagicMock()
+    with patch.object(torch.cuda, "Event", return_value=event):
+        # No wait_for_save call: this scheduler step has no model forward.
+        worker.get_finished(set(), metadata)
+        worker.get_finished(set(), metadata)
+        worker.wait_for_save(metadata)
+
+    event.record.assert_called_once_with()
+    assert request.current_event is event
+    worker.kv_send_thread.add_request.assert_called_once_with(request)
 
 
 def test_lookup_key_prefixes_cover_dcp_rank_namespaces():

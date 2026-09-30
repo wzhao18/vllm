@@ -84,10 +84,13 @@ class MooncakeStoreScheduler:
         self._block_size, self._hash_block_size = resolve_kv_cache_block_sizes(
             kv_cache_config, vllm_config
         )
-        self.enable_partial_hash_hits = partial_hash_hits_enabled(
-            store_groups,
-            self._hash_block_size,
-            vllm_config.parallel_config.decode_context_parallel_size,
+        self.enable_partial_hash_hits = (
+            vllm_config.cache_config.prefix_match_unit is not None
+            and partial_hash_hits_enabled(
+                store_groups,
+                self._hash_block_size,
+                vllm_config.parallel_config.decode_context_parallel_size,
+            )
         )
         mamba_groups = {
             group_id: group.kv_cache_spec
@@ -273,6 +276,7 @@ class MooncakeStoreScheduler:
                 # producer. Loads are still carried by the same metadata.
                 skip_save=is_consumer,
                 block_hashes=request_real.block_hashes,
+                save_partial_tail=self.enable_partial_hash_hits,
             )
             if req_meta is not None:
                 meta.add_request(req_meta)
@@ -323,6 +327,7 @@ class MooncakeStoreScheduler:
                         load_spec=load_spec,
                         skip_save=is_consumer,
                         block_hashes=request_real.block_hashes,
+                        save_partial_tail=self.enable_partial_hash_hits,
                     )
                 else:
                     # Decode/chunked request
@@ -364,6 +369,7 @@ class MooncakeStoreScheduler:
                         load_spec=None,
                         skip_save=False,
                         block_hashes=unfinished_req.block_hashes,
+                        save_partial_tail=self.enable_partial_hash_hits,
                     )
 
                 if req_meta is not None:
@@ -525,6 +531,15 @@ class MooncakeStoreScheduler:
                 return False
             pinned_block_ids.append(block_id)
             remapped_offloads.append((store_group_id, block_id, boundary))
+        # Companion attention proof reads must survive request cleanup too.
+        pinned_block_ids.extend(
+            block_id
+            for group_id in self._store_group_ids
+            if self._store_group_id_by_kv_cache_group_id[group_id]
+            not in self._boundary_state_group_ids
+            for block_id in block_ids[group_id]
+            if block_id != NULL_BLOCK_ID
+        )
         pinned_block_ids = list(dict.fromkeys(pinned_block_ids))
 
         pool = self._gpu_block_pool
@@ -548,6 +563,7 @@ class MooncakeStoreScheduler:
             num_prompt_tokens=tracker.prefill_end_tokens,
             store_job_id=store_job_id,
             boundary_state_offloads=remapped_offloads,
+            completed_token_len=request.num_computed_tokens,
         )
         tracker.has_pending_offload = True
         # The store job owns exact block refs, so request cleanup need not wait.
@@ -605,6 +621,7 @@ class MooncakeStoreScheduler:
                     can_save=True,
                     num_prompt_tokens=tracker.prefill_end_tokens,
                     boundary_state_offloads=accepted,
+                    completed_token_len=tracker.token_len,
                 )
             )
 

@@ -25,6 +25,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MambaSpec,
     SlidingWindowSpec,
+    get_mamba_prefill_checkpoint_position,
 )
 from vllm.v1.request import Request
 
@@ -314,19 +315,19 @@ class KVCacheCoordinator(ABC):
         at each position; EAGLE groups also keep the block above, which they
         match and drop back from (see ``reachable_block_mask``).
 
-        Two positions are reachable: a resend of the identical prompt is capped
-        at ``num_tokens - 1`` (its last token is recomputed for logits), a
-        longer sibling matches the final aligned block. They differ only on a
-        block-aligned prompt, where retaining just the higher one collapses the
-        resend's hit to 0. The alignment is the scheduler block size, not the
-        finer hash granularity, which would over-estimate the reach.
+        EAGLE verifies attention through the prompt end before dropping a
+        block. Other requests must recompute the last token. The resulting
+        boundary serves both a resend and a strict extension.
         """
-        if not self.eagle_group_ids:
-            return (request.num_prompt_tokens - 1,)
-        block = self.scheduler_block_size
-        resend = (request.num_prompt_tokens - 1) // block * block
-        extension = request.num_prompt_tokens // block * block
-        return tuple(sorted({max(resend - block, 0), max(extension - block, 0)}))
+        return (
+            get_mamba_prefill_checkpoint_position(
+                request.num_prompt_tokens,
+                self.hash_block_size
+                if self.enable_partial_hash_hits
+                else self.scheduler_block_size,
+                bool(self.eagle_group_ids),
+            ),
+        )
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """Cache the blocks for the request.
@@ -908,7 +909,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                         else group_block_size
                     )
                     _max_length = min(
-                        curr_hit_length + eagle_margin, max_cache_hit_length
+                        curr_hit_length + eagle_margin,
+                        len(block_hashes) * self.hash_block_size,
                     )
                 hit_blocks, _new_hit_length = manager_cls.find_longest_cache_hit(
                     block_hashes=block_hashes,
@@ -984,9 +986,22 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
 
         for spec, group_ids, manager_cls, use_eagle in self.attention_groups:
             manager = self.single_type_managers[group_ids[0]]
+            lookup_length = max_cache_hit_length
+            if use_eagle and not isinstance(spec, MambaSpec):
+                eagle_margin = (
+                    self.hash_block_size
+                    if self.enable_partial_hash_hits
+                    and manager_cls.supports_fine_grained_hash_lookup
+                    and manager.block_size > self.hash_block_size
+                    else manager.block_size
+                )
+                lookup_length = min(
+                    max_cache_hit_length + eagle_margin,
+                    len(block_hashes) * self.hash_block_size,
+                )
             blocks, group_hit = manager_cls.find_longest_cache_hit(
                 block_hashes=block_hashes,
-                max_length=max_cache_hit_length,
+                max_length=lookup_length,
                 kv_cache_group_ids=group_ids,
                 block_pool=manager.block_pool,
                 kv_cache_spec=spec,

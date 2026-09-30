@@ -146,6 +146,7 @@ class KVCacheManager:
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
         enable_mamba_shared_prefix_checkpoint: bool = False,
+        allow_partial_hash_hits: bool = True,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -177,7 +178,12 @@ class KVCacheManager:
             hash_block_size=hash_block_size,
             metrics_collector=self.metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
+            allow_partial_hash_hits=allow_partial_hash_hits,
         )
+        if not allow_partial_hash_hits:
+            for manager in self.coordinator.single_type_managers:
+                if isinstance(manager, MambaManager):
+                    manager.has_prefill_checkpoint_blocks = False
         # One predicate, read by both sides of the feature, so the scheduler
         # cannot end a chunk at a junction the manager would refuse -- a refused
         # junction costs a forward pass and displaces the block-boundary stop.
@@ -929,7 +935,7 @@ class KVCacheManager:
         return offloads
 
     def finalize_partial_tail_offloads(
-        self, request: Request
+        self, request: Request, allow_in_flight: bool = False
     ) -> list[tuple[int, int, int]]:
         """Consume safe producer partial tails when a request finishes.
 
@@ -937,13 +943,16 @@ class KVCacheManager:
         token was forwarded. The connector pins and queues the exact table
         block before request cleanup, then releases the pin when every worker
         reports the store job complete.
+
+        Preemption may hand off an in-flight boundary: the connector must
+        fence the store read after that forward completes.
         """
         offloads: list[tuple[int, int, int]] = []
         for mgr in self.coordinator.single_type_managers:
             finalized = mgr.finalize_partial_tail_offload(
                 request.request_id,
                 request.num_computed_tokens,
-                request.num_in_flight_tokens,
+                0 if allow_in_flight else request.num_in_flight_tokens,
             )
             if finalized is None:
                 continue

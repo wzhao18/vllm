@@ -28,12 +28,58 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     MambaSpec,
     SlidingWindowSpec,
+    get_mamba_prefill_checkpoint_position,
 )
 
 
 @pytest.fixture(autouse=True)
 def _auto_init_hash_fn():
     init_none_hash(sha256)
+
+
+@pytest.mark.parametrize("prompt_tokens", [127, 128, 129, 7040, 7168, 7296, 7449])
+@pytest.mark.parametrize("drop_eagle_block", [False, True])
+def test_prefill_checkpoint_has_resend_attention_proof(prompt_tokens, drop_eagle_block):
+    unit = 128
+    checkpoint = get_mamba_prefill_checkpoint_position(
+        prompt_tokens, unit, drop_eagle_block
+    )
+    # EAGLE verifies a hash through P before dropping it; otherwise the last
+    # token must be recomputed to produce logits on an exact resend.
+    proof_limit = prompt_tokens if drop_eagle_block else prompt_tokens - 1
+    proof = proof_limit // unit * unit
+    expected = max(proof - unit, 0) if drop_eagle_block else proof
+    assert checkpoint == expected
+
+
+@pytest.mark.parametrize("prompt_tokens", [7040, 7168, 7296])
+@pytest.mark.parametrize("extension_tokens", [0, 256])
+def test_eagle_resend_and_extension_reuse_prompt_checkpoint(
+    prompt_tokens, extension_tokens
+):
+    manager = make_full_mamba_manager(
+        dcp_world_size=8,
+        hash_block_size=128,
+        full_block_size=896,
+        mamba_block_size=896,
+        num_blocks=128,
+        use_eagle=True,
+        num_speculative_blocks=4,
+        num_prefill_checkpoint_blocks=1,
+    )
+    producer = make_request("producer", list(range(prompt_tokens)), 128, sha256)
+    assert manager.allocate_slots(producer, prompt_tokens) is not None
+    producer.num_computed_tokens = prompt_tokens
+    manager.free(producer)
+    manager.new_step_starts()
+
+    replay = make_request(
+        "replay", list(range(prompt_tokens + extension_tokens)), 128, sha256
+    )
+    _, hit, _ = manager.get_computed_blocks(replay)
+    assert hit == prompt_tokens - 128
+    _, connector_hit, _, _ = manager.get_computed_blocks_for_connector(replay)
+    assert connector_hit == hit
 
 
 def test_connector_without_divergent_hit_support_uses_common_lookup():
@@ -98,6 +144,7 @@ def make_full_mamba_manager(
     use_eagle: bool = False,
     num_speculative_blocks: int = 0,
     num_prefill_checkpoint_blocks: int = 0,
+    allow_partial_hash_hits: bool = True,
 ):
     mamba_group = KVCacheGroupSpec(
         ["mamba"],
@@ -141,7 +188,68 @@ def make_full_mamba_manager(
         scheduler_block_size=scheduler_block_size,
         hash_block_size=hash_block_size,
         use_eagle=use_eagle,
+        allow_partial_hash_hits=allow_partial_hash_hits,
     )
+
+
+@pytest.mark.parametrize("prompt_tokens", [512, 513])
+@pytest.mark.parametrize("use_eagle", [False, True])
+@pytest.mark.parametrize("extension_tokens", [0, 32])
+def test_without_pmu_reuses_lcm_checkpoint(prompt_tokens, use_eagle, extension_tokens):
+    manager = make_full_mamba_manager(
+        dcp_world_size=8,
+        hash_block_size=16,
+        full_block_size=16,
+        mamba_block_size=16,
+        num_blocks=128,
+        use_eagle=use_eagle,
+        num_prefill_checkpoint_blocks=1,
+        allow_partial_hash_hits=False,
+    )
+    manager.coordinator.retention_interval = 0
+    assert not manager.coordinator.enable_partial_hash_hits
+    scheduler = SimpleNamespace(
+        block_size=128,
+        cache_config=SimpleNamespace(block_size=16),
+        hash_block_size=16,
+        max_num_scheduled_tokens=8192,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+        use_eagle_block_drop=use_eagle,
+        mamba_partial_cache_hit=False,
+        mamba_shared_prefix_checkpoint=False,
+        mamba_has_prefill_checkpoint_blocks=False,
+    )
+    producer = make_request("producer", list(range(prompt_tokens)), 16, sha256)
+    while producer.num_computed_tokens < prompt_tokens:
+        scheduled = Scheduler._mamba_block_aligned_split(
+            scheduler, producer, prompt_tokens - producer.num_computed_tokens
+        )
+        assert scheduled > 0
+        manager.new_step_starts()
+        assert manager.allocate_slots(producer, scheduled) is not None
+        producer.num_computed_tokens += scheduled
+    manager.free(producer)
+    manager.new_step_starts()
+
+    replay = make_request(
+        "replay", list(range(prompt_tokens + extension_tokens)), 16, sha256
+    )
+    _, hit, _ = manager.get_computed_blocks(replay)
+    expected = (
+        (prompt_tokens // 128 - 1) * 128
+        if use_eagle
+        else ((prompt_tokens - 1) // 128 * 128)
+    )
+    assert hit == expected
+    cached_states = {
+        end
+        for end in range(128, prompt_tokens + 1, 128)
+        if manager.block_pool.get_cached_block(
+            producer.block_hashes[end // 16 - 1], [1]
+        )
+        is not None
+    }
+    assert cached_states == {expected}
 
 
 def test_dcp_fine_hit_retention_uses_hash_alignment_without_eagle():
@@ -810,6 +918,65 @@ def test_external_mamba_hit_same_block_uses_running_cow_on_continue():
     moved = manager.block_pool.get_cached_block(partial_hash, kv_cache_group_ids=[1])
     assert moved is not None
     assert moved[0].block_id == cow_copy.dst_block_id
+
+
+def test_external_mamba_tail_does_not_require_unreserved_cow():
+    manager = make_full_mamba_manager(
+        dcp_world_size=1,
+        hash_block_size=2,
+        full_block_size=2,
+        mamba_block_size=8,
+    )
+    request = make_request("loaded", list(range(15)), 2, sha256)
+    assert (
+        manager.allocate_slots(
+            request,
+            num_new_tokens=0,
+            num_external_computed_tokens=14,
+            delay_cache_blocks=True,
+        )
+        is not None
+    )
+
+    request.num_computed_tokens = 14
+    manager.cache_blocks(request, 14)
+    partial_hash = request.block_hashes[6]
+    assert manager.block_pool.get_cached_block(partial_hash, [1]) is None
+    assert manager.finalize_partial_tail_offloads(request) == []
+
+    source_block_id = manager.get_blocks(request.request_id).get_block_ids()[1][1]
+    assert manager.allocate_slots(request, num_new_tokens=1) is not None
+    assert (
+        manager.get_blocks(request.request_id).get_block_ids()[1][1] == source_block_id
+    )
+    copies, _ = manager.take_kv_cache_block_copies()
+    assert copies == []
+
+
+def test_failed_external_mamba_load_can_publish_recomputed_tail():
+    manager = make_full_mamba_manager(
+        dcp_world_size=1,
+        hash_block_size=2,
+        full_block_size=2,
+        mamba_block_size=8,
+    )
+    request = make_request("retry", list(range(15)), 2, sha256)
+    assert (
+        manager.allocate_slots(
+            request,
+            num_new_tokens=0,
+            num_external_computed_tokens=14,
+            delay_cache_blocks=True,
+        )
+        is not None
+    )
+
+    # Hybrid load failure releases the private states before recomputation.
+    manager.free(request)
+    manager.new_step_starts()
+    assert manager.allocate_slots(request, num_new_tokens=14) is not None
+    partial_hash = request.block_hashes[6]
+    assert manager.block_pool.get_cached_block(partial_hash, [1]) is not None
 
 
 def test_boundary_state_offloads_returns_cow_target():

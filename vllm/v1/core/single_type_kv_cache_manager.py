@@ -1469,6 +1469,7 @@ class MambaManager(SingleTypeKVCacheManager):
             self._num_retired_blocks: dict[str, int] = {}
             # The set of the requests that have been allocated blocks
             self._allocated_block_reqs: set[str] = set()
+            self._externally_loaded_tokens: dict[str, int] = {}
             # checkpoint position and reserved block index for the current
             # allocation.
             self._checkpoints: dict[str, tuple[int, int]] = {}
@@ -1799,6 +1800,20 @@ class MambaManager(SingleTypeKVCacheManager):
             )
             return num_new_blocks + num_evictable_computed_blocks
 
+    def allocate_external_computed_blocks(
+        self,
+        request_id: str,
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> None:
+        super().allocate_external_computed_blocks(
+            request_id, num_local_computed_tokens, num_external_computed_tokens
+        )
+        if self.mamba_cache_mode == "align" and num_external_computed_tokens > 0:
+            self._externally_loaded_tokens[request_id] = (
+                num_local_computed_tokens + num_external_computed_tokens
+            )
+
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
     ) -> list[KVCacheBlock]:
@@ -1955,6 +1970,7 @@ class MambaManager(SingleTypeKVCacheManager):
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
         if self.mamba_cache_mode == "align":
             self._allocated_block_reqs.discard(request_id)
+            self._externally_loaded_tokens.pop(request_id, None)
             self.last_state_block_idx.pop(request_id, None)
             self._num_retired_blocks.pop(request_id, None)
             self._checkpoints.pop(request_id, None)
@@ -2081,21 +2097,25 @@ class MambaManager(SingleTypeKVCacheManager):
             return None
         if num_tokens % hash_block_size != 0:
             return None
+        if num_tokens <= self._externally_loaded_tokens.get(request.request_id, 0):
+            # Loaded states are private; publishing them requires unreserved CoW.
+            return None
+        resend_boundary = get_mamba_prefill_checkpoint_position(
+            request.num_prompt_tokens,
+            hash_block_size,
+            self.drop_eagle_checkpoint_block,
+        )
         latest_prompt_hash_boundary = (
-            request.num_prompt_tokens // hash_block_size
-        ) * hash_block_size
-        if self.drop_eagle_checkpoint_block:
-            # Eagle groups match one hash unit past the candidate and drop it,
-            # so register the tail one unit lower.
-            latest_prompt_hash_boundary = max(
-                latest_prompt_hash_boundary - hash_block_size, 0
-            )
+            resend_boundary
+            if self.drop_eagle_checkpoint_block
+            else request.num_prompt_tokens // hash_block_size * hash_block_size
+        )
         # The junction is the other position a sibling resumes at: where one was
         # observed to stop, and where the scheduler already ends a chunk. Bounded
         # to the prompt chunk being computed -- during decode the target is the
         # running state block, mutated in place, which equals what its key
         # promises only after that step's forward.
-        if num_tokens != latest_prompt_hash_boundary and not (
+        if num_tokens not in (resend_boundary, latest_prompt_hash_boundary) and not (
             self.shared_prefix_checkpoint
             and num_tokens == request.shared_prefix_boundary
             and request.num_computed_tokens < num_tokens <= request.num_prompt_tokens

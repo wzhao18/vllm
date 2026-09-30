@@ -770,6 +770,24 @@ def test_from_request_tracker_load_overrides_caller_skip_save():
     assert tracker.num_saved_tokens == 0
 
 
+def test_prefill_completion_emits_proof_job_without_new_lcm_block():
+    tracker = RequestTracker(
+        req_id="tail",
+        token_len=8,
+        allocated_block_ids=([1], [2]),
+        prefill_end_tokens=13,
+    )
+    assert ReqMeta.from_request_tracker(tracker, 16, save_partial_tail=True) is None
+    tracker.token_len = 13
+    metadata = ReqMeta.from_request_tracker(tracker, 16, save_partial_tail=True)
+    assert metadata is not None
+    assert metadata.can_save
+    assert metadata.token_len_chunk == 0
+    assert metadata.completed_token_len == 13
+    assert metadata.boundary_state_offloads is None
+    assert ReqMeta.from_request_tracker(tracker, 16, save_partial_tail=True) is None
+
+
 def test_from_request_tracker_load_with_can_load_false_still_saves():
     # A LoadSpec with can_load=False (e.g., no external tokens to load after
     # update_state_after_alloc) must not suppress the save.
@@ -1088,6 +1106,7 @@ def test_finished_partial_tail_is_pre_pinned_as_store_job():
     request = SimpleNamespace(
         request_id="req-0",
         block_hashes=[b"h0", b"h1", b"h2"],
+        num_computed_tokens=12,
     )
     scheduler._request_trackers["req-0"] = RequestTracker(
         req_id="req-0",
@@ -1108,7 +1127,7 @@ def test_finished_partial_tail_is_pre_pinned_as_store_job():
     # before the next connector metadata build.
     assert delay_free is False
     assert scheduler._gpu_block_pool.blocks[9].ref_cnt == 1
-    assert scheduler._gpu_block_pool.blocks[3].ref_cnt == 0
+    assert scheduler._gpu_block_pool.blocks[3].ref_cnt == 1
 
     out = SimpleNamespace(
         finished_req_ids={"req-0"},
@@ -1133,12 +1152,13 @@ def test_finished_partial_tail_is_pre_pinned_as_store_job():
     assert req_meta.block_ids == block_ids
     assert req_meta.block_hashes == request.block_hashes
     assert req_meta.boundary_state_offloads == [(1, 9, 12)]
-    assert scheduler._pinned_saves[req_meta.store_job_id][0] == [9]
+    assert scheduler._pinned_saves[req_meta.store_job_id][0] == [9, 3]
     assert scheduler._gpu_block_pool.blocks[9].ref_cnt == 1
     assert scheduler._finished_partial_tail_metas == {}
 
     scheduler.update_connector_output(_make_worker_output({req_meta.store_job_id: 1}))
     assert scheduler._gpu_block_pool.blocks[9].ref_cnt == 0
+    assert scheduler._gpu_block_pool.blocks[3].ref_cnt == 0
 
 
 def test_decode_boundary_state_offload_dropped_unclaimed():

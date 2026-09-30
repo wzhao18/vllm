@@ -80,6 +80,9 @@ class MambaPrefillCheckpointBuilder:
             return None
         if self.kv_cache_spec.num_prefill_checkpoint_blocks == 0:
             return None
+        if self.vllm_config.cache_config.prefix_match_unit is None:
+            # Without PMU, scheduler chunk boundaries materialize LCM states.
+            return None
         assert m.seq_lens_cpu_upper_bound is not None
         all_query_lens = m.query_start_loc_cpu.diff().tolist()
         query_lens = [all_query_lens[row] for row in request_rows]

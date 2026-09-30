@@ -83,6 +83,7 @@ class MooncakeStoreCoordinator:
         use_eagle: bool = False,
         retention_interval: int | None = None,
         dcp_world_size: int = 1,
+        allow_partial_hash_hits: bool = True,
     ) -> None:
         # Mirrors core's resolve_kv_cache_block_sizes: the hash unit only has
         # to divide groups that participate in prefix caching. Non-shareable
@@ -110,8 +111,11 @@ class MooncakeStoreCoordinator:
         }
         self.hash_block_size = hash_block_size
         self.lcm_block_size = scheduler_block_size
-        self.enable_partial_hash_hits = partial_hash_hits_enabled(
-            kv_cache_groups, hash_block_size, dcp_world_size
+        self.enable_partial_hash_hits = (
+            allow_partial_hash_hits
+            and partial_hash_hits_enabled(
+                kv_cache_groups, hash_block_size, dcp_world_size
+            )
         )
         self.use_eagle = use_eagle
         # Mirror vLLM core's KVCacheCoordinator.retention_interval.
@@ -166,6 +170,18 @@ class MooncakeStoreCoordinator:
         # group sharing the spec.
         self.eagle_group_ids = {
             gid for g in attention_groups if g.use_eagle for gid in g.group_ids
+        }
+        self.eagle_proof_margin_by_group = {
+            gid: (
+                self.hash_block_size
+                if self.enable_partial_hash_hits
+                and group.manager_cls.supports_fine_grained_hash_lookup
+                and group.spec.block_size > self.hash_block_size
+                else group.spec.block_size
+            )
+            for group in attention_groups
+            if group.use_eagle and not isinstance(group.spec, MambaSpec)
+            for gid in group.group_ids
         }
 
     def find_longest_cache_hit(
@@ -401,7 +417,10 @@ class MooncakeStoreCoordinator:
                         and spec.block_size > self.hash_block_size
                         else spec.block_size
                     )
-                    _max_length = min(curr_hit_length + eagle_margin, max_length)
+                    _max_length = min(
+                        curr_hit_length + eagle_margin,
+                        len(block_hashes) * self.hash_block_size,
+                    )
                 hit_blocks, _new_hit_length = manager_cls.find_longest_cache_hit(
                     block_hashes=block_hashes,  # type: ignore[arg-type]
                     max_length=_max_length,

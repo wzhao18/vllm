@@ -85,6 +85,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
+    get_mamba_prefill_checkpoint_position,
     group_kernel_blocks,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
@@ -611,7 +612,10 @@ class KVCacheStoreSendingThread(KVTransferThread):
         return puts
 
     def _sub_block_tail_puts(
-        self, req_meta: ReqMeta, entries: list[tuple[int, int, int]]
+        self,
+        req_meta: ReqMeta,
+        entries: list[tuple[int, int, int]],
+        boundary: int | None = None,
     ) -> list[tuple[str, list[int], list[int], KeyMetadata]]:
         """Puts for the request's sub-block partial tail (its last prompt hash
         boundary), so a later request can hit the sub-block prefix.
@@ -624,12 +628,13 @@ class KVCacheStoreSendingThread(KVTransferThread):
         boundary block by the boundary sub-hash; a mamba "align" group
         contributes only its boundary block, from the core-provided CoW block.
         """
-        boundaries = {boundary for _, _, boundary in entries}
-        if len(boundaries) != 1:
+        boundaries = {position for _, _, position in entries}
+        if boundary is None and len(boundaries) != 1:
             raise ValueError(
                 "Sub-block partial-tail offloads for one request must share a boundary"
             )
-        boundary = boundaries.pop()
+        if boundary is None:
+            boundary = boundaries.pop()
         hash_block_size = self.coord.hash_block_size
         if boundary == 0 or boundary // hash_block_size - 1 >= len(
             req_meta.block_hashes
@@ -642,19 +647,29 @@ class KVCacheStoreSendingThread(KVTransferThread):
         for g_idx, db in enumerate(self.token_databases):
             if not self.group_participates[g_idx]:
                 continue
+            group_boundary = boundary + self.coord.eagle_proof_margin_by_group.get(
+                g_idx, 0
+            )
+            completed = req_meta.completed_token_len
+            if completed is None:
+                completed = boundary
+            if group_boundary > completed:
+                continue
+            if group_boundary // hash_block_size > len(req_meta.block_hashes):
+                continue
             group_blocks = req_meta.block_ids[g_idx]
             # Distribute across ranks by the same rule as normal chunks.
             put_step = self.group_put_steps[g_idx]
             put_step_rank = (self.tp_rank + g_idx) % put_step
             # Always include the boundary block: its sub-hash key is written
             # only here, even if normal saves already advanced past it.
-            last_block = cdiv(boundary, db.block_size) - 1
+            last_block = cdiv(group_boundary, db.block_size) - 1
             for block_idx in range(
                 min(saved // db.block_size, last_block), last_block + 1
             ):
                 if block_idx % put_step != put_step_rank:
                     continue
-                valid_end = min((block_idx + 1) * db.block_size, boundary)
+                valid_end = min((block_idx + 1) * db.block_size, group_boundary)
                 key_hash = req_meta.block_hashes[valid_end // hash_block_size - 1]
                 if g_idx in mamba_offloads:
                     if valid_end != boundary:
@@ -703,8 +718,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
             True when no put is needed or every put succeeds, False otherwise.
 
         """
-        offloads = req_meta.boundary_state_offloads
-        if not offloads or not req_meta.block_hashes:
+        offloads = req_meta.boundary_state_offloads or []
+        if not req_meta.block_hashes:
             return True
 
         snapshots: list[tuple[int, int, int]] = []
@@ -719,6 +734,23 @@ class KVCacheStoreSendingThread(KVTransferThread):
         puts = self._boundary_snapshot_puts(req_meta, snapshots)
         if sub_block and self.coord.enable_partial_hash_hits:
             puts.extend(self._sub_block_tail_puts(req_meta, sub_block))
+        if (
+            req_meta.completed_token_len is not None
+            and req_meta.num_prompt_tokens
+            and req_meta.completed_token_len >= req_meta.num_prompt_tokens
+            and self.coord.enable_partial_hash_hits
+        ):
+            boundary = get_mamba_prefill_checkpoint_position(
+                req_meta.num_prompt_tokens,
+                self.coord.hash_block_size,
+                bool(self.coord.eagle_proof_margin_by_group),
+            )
+            puts.extend(self._sub_block_tail_puts(req_meta, [], boundary))
+        puts = list(
+            {
+                key: (key, addr, size, metadata) for key, addr, size, metadata in puts
+            }.values()
+        )
 
         if not puts:
             return True
@@ -833,7 +865,10 @@ class KVCacheStoreSendingThread(KVTransferThread):
             block_ids_per_group = req_meta.block_ids
             current_event = req_meta.current_event
 
-            if not self.is_live_store_job(req_meta):
+            is_pinned_handoff = req_meta.token_len_chunk == 0 and bool(
+                req_meta.boundary_state_offloads
+            )
+            if not is_pinned_handoff and not self.is_live_store_job(req_meta):
                 return
 
             if self.enable_kv_event:
@@ -854,9 +889,14 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
             # Offload the handed-off mamba boundary states (independent of the
             # normal positional save, which may be skipped this step).
-            if req_meta.boundary_state_offloads is not None and not (
-                self._maybe_offload_boundary_states(req_meta)
-            ):
+            if (
+                req_meta.boundary_state_offloads is not None
+                or (
+                    req_meta.completed_token_len is not None
+                    and req_meta.num_prompt_tokens
+                    and req_meta.completed_token_len >= req_meta.num_prompt_tokens
+                )
+            ) and not self._maybe_offload_boundary_states(req_meta):
                 return
 
             if token_len == 0:
@@ -1588,6 +1628,7 @@ class MooncakeStoreWorker:
         self.num_recv_threads = max(1, envs.VLLM_MOONCAKE_LOAD_RECV_THREADS)
         self.recv_request_queue: queue.Queue[ReqMeta] = queue.Queue()
         self.finished_store_req: set[str] = set()
+        self._issued_store_metadata: MooncakeStoreConnectorMetadata | None = None
         self._kv_connector_stats_lock = threading.Lock()
         self.kv_connector_stats = MooncakeStoreConnectorStats()
 
@@ -1627,6 +1668,7 @@ class MooncakeStoreWorker:
             use_eagle=use_eagle_block_drop,
             retention_interval=kv_cache_config.prefix_cache_retention_interval,
             dcp_world_size=self.dcp_size,
+            allow_partial_hash_hits=self.cache_config.prefix_match_unit is not None,
         )
         self.store_tp_size, store_namespace, store_layout_cls = (
             self._select_store_layout(extra_config)
@@ -2077,6 +2119,13 @@ class MooncakeStoreWorker:
         """
         if self._capacity_only or not self.can_put:
             return
+        self._issue_store_jobs(metadata)
+
+    def _issue_store_jobs(self, metadata: MooncakeStoreConnectorMetadata) -> None:
+        """Issue store jobs once, including steps without a forward."""
+        if metadata is self._issued_store_metadata:
+            return
+        self._issued_store_metadata = metadata
 
         current_event = None
         for request in metadata.requests:
@@ -2097,12 +2146,13 @@ class MooncakeStoreWorker:
     ) -> tuple[set[str], set[str]]:
         """Get completed send/recv request IDs.
 
-        Loads are issued in start_load_kv() and stores in wait_for_save().
+        Issue pending stores on no-forward steps, then collect completions.
         """
         if self._capacity_only:
             return set(), set()
 
         if self.can_put:
+            self._issue_store_jobs(meta)
             self._close_ended_store_requests(finished_req_ids, meta)
 
         # Blocks read by a store job are released by the scheduler when the job

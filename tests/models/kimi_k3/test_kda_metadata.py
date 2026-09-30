@@ -196,7 +196,7 @@ def test_kda_recoverssm_startup_metadata_flow_without_model(monkeypatch):
         cache_config=SimpleNamespace(
             mamba_cache_mode="align",
             use_kda_recoverssm=True,
-            prefix_match_unit=None,
+            prefix_match_unit=BLOCK_SIZE,
         ),
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
         speculative_config=SimpleNamespace(
@@ -287,7 +287,8 @@ def test_kda_recoverssm_startup_metadata_flow_without_model(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_internal_checkpoint_metadata_targets_last_aligned_boundary():
+@pytest.mark.parametrize("prefix_match_unit", [None, 16])
+def test_internal_checkpoint_metadata_targets_last_aligned_boundary(prefix_match_unit):
     device = torch.device("cuda")
     batch = BatchSpec(seq_lens=[50, 32], query_lens=[50, 16])
     common_attn_metadata = create_common_attn_metadata(
@@ -299,6 +300,7 @@ def test_internal_checkpoint_metadata_targets_last_aligned_boundary():
         full_cuda_graph=False,
         mamba_cache_mode="align",
         num_prefill_checkpoint_blocks=1,
+        prefix_match_unit=prefix_match_unit,
         device=device,
     )
     assert isinstance(builder, KimiK3KDAMetadataBuilder)
@@ -310,6 +312,9 @@ def test_internal_checkpoint_metadata_targets_last_aligned_boundary():
     )
     actual = builder.build(0, common_attn_metadata)
 
+    if prefix_match_unit is None:
+        assert actual.checkpoint is None
+        return
     assert actual.checkpoint is not None
     torch.testing.assert_close(
         actual.checkpoint.state_indices,
@@ -322,17 +327,24 @@ def test_internal_checkpoint_metadata_targets_last_aligned_boundary():
 
 
 @pytest.mark.parametrize(
-    ("disable_eagle_block_drop", "prefix_match_unit", "expected_offset"),
-    [(False, 16, 80), (True, 16, 96), (False, 8, None)],
+    ("seq_len", "disable_eagle_block_drop", "prefix_match_unit", "expected_offset"),
+    [
+        (100, False, 16, 80),
+        (100, True, 16, 96),
+        (100, False, 8, None),
+        (96, False, 16, 80),
+        (96, True, 16, 80),
+    ],
 )
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_spec_internal_checkpoint_metadata_targets_replay_boundary(
+    seq_len: int,
     disable_eagle_block_drop: bool,
     prefix_match_unit: int,
     expected_offset: int | None,
 ) -> None:
     device = torch.device("cuda")
-    batch = BatchSpec(seq_lens=[100], query_lens=[100])
+    batch = BatchSpec(seq_lens=[seq_len], query_lens=[seq_len])
     common_attn_metadata = create_common_attn_metadata(
         batch, BLOCK_SIZE, device, arange_block_indices=True
     )
@@ -390,6 +402,7 @@ def test_internal_checkpoint_metadata_skips_unaligned_offset():
         full_cuda_graph=False,
         mamba_cache_mode="align",
         num_prefill_checkpoint_blocks=1,
+        prefix_match_unit=16,
         device=device,
     )
     assert isinstance(builder, KimiK3KDAMetadataBuilder)

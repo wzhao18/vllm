@@ -325,6 +325,7 @@ class Scheduler(SchedulerInterface):
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
             watermark=self.scheduler_config.watermark,
+            allow_partial_hash_hits=self.cache_config.prefix_match_unit is not None,
             enable_mamba_shared_prefix_checkpoint=(
                 self.cache_config.enable_mamba_shared_prefix_checkpoint
             ),
@@ -364,10 +365,14 @@ class Scheduler(SchedulerInterface):
             ),
             None,
         )
-        self.mamba_has_prefill_checkpoint_blocks = self.has_mamba_layers and all(
-            not isinstance(group.kv_cache_spec, MambaSpec)
-            or group.kv_cache_spec.num_prefill_checkpoint_blocks > 0
-            for group in kv_cache_config.kv_cache_groups
+        self.mamba_has_prefill_checkpoint_blocks = (
+            self.has_mamba_layers
+            and self.cache_config.prefix_match_unit is not None
+            and all(
+                not isinstance(group.kv_cache_spec, MambaSpec)
+                or group.kv_cache_spec.num_prefill_checkpoint_blocks > 0
+                for group in kv_cache_config.kv_cache_groups
+            )
         )
         # A finer prefix_match_unit is configured: a mamba partial tail entry
         # can only be registered by a step ending exactly at the prompt's last
@@ -441,14 +446,19 @@ class Scheduler(SchedulerInterface):
         # The last block-aligned position whose state can be cached. With
         # Eagle, FullAttn prunes the last matching block, so back off one
         # block to avoid a Mamba cache miss.
-        last_cache_position = request.num_tokens - request.num_tokens % block_size
-        if self.use_eagle_block_drop:
-            last_cache_position = max(last_cache_position - block_size, 0)
+        checkpoint_unit = (
+            self.hash_block_size if self.mamba_partial_cache_hit else self.block_size
+        )
+        last_cache_position = get_mamba_prefill_checkpoint_position(
+            request.num_tokens,
+            block_size if self.mamba_partial_cache_hit else self.block_size,
+            self.use_eagle_block_drop,
+        )
 
         end = start + num_new_tokens
         checkpoint_position = get_mamba_prefill_checkpoint_position(
             prefill_end,
-            self.hash_block_size,
+            checkpoint_unit,
             drop_eagle_block=self.use_eagle_block_drop,
         )
         use_internal_checkpoint = (
@@ -481,18 +491,14 @@ class Scheduler(SchedulerInterface):
 
         next_block_boundary = (start // block_size + 1) * block_size
         tail_boundary = (
-            request.num_prompt_tokens // self.hash_block_size * self.hash_block_size
+            get_mamba_prefill_checkpoint_position(
+                request.num_prompt_tokens,
+                self.hash_block_size,
+                self.use_eagle_block_drop,
+            )
             if self.mamba_partial_cache_hit and not use_internal_checkpoint
             else 0
         )
-        if tail_boundary and self.use_eagle_block_drop:
-            # Eagle matches one hash unit past the candidate and drops it, so
-            # nothing proves the prompt's own last hash boundary. Materialize
-            # the state one unit lower, where the hit can actually land. Keyed on
-            # the block-drop bit, not plain use_eagle: this shift exists only to
-            # compensate for the drop, and the Mamba manager's matching gate
-            # reads the same bit (the coordinator is handed use_eagle_block_drop).
-            tail_boundary = max(tail_boundary - self.hash_block_size, 0)
         junction = request.shared_prefix_boundary
         # Block-floored: a sub-block junction's state is not separately cacheable.
         block_floored = start + (junction - start) // block_size * block_size
@@ -1552,6 +1558,23 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        if (
+            self.connector is not None
+            and kv_transfer_config is not None
+            and kv_transfer_config.is_kv_producer
+        ):
+            partial_tails = self.kv_cache_manager.finalize_partial_tail_offloads(
+                request, allow_in_flight=True
+            )
+            if partial_tails:
+                block_ids = self.kv_cache_manager.get_block_ids_for_computed_tokens(
+                    request_id=request.request_id,
+                    num_computed_tokens=request.num_computed_tokens,
+                )
+                self.connector.register_finished_partial_tail(
+                    request, block_ids, partial_tails
+                )
         if self.aux_output_connector is not None:
             self.aux_output_connector.request_finished(request)
         self._free_request_blocks(request)
