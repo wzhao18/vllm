@@ -36,7 +36,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
     LBNHCStoreLayout,
     LoadSpec,
     MooncakeLookupResult,
-    MooncakeStoreConnectorMetadata,
     PoolKey,
     RankLocalStoreLayout,
     ReqMeta,
@@ -3555,7 +3554,6 @@ def _make_bare_worker(
     worker.num_recv_threads = 1
     worker.recv_request_queue = queue.Queue()
     worker.finished_store_req = set()
-    worker._issued_store_metadata = None
     worker.tp_size = 1
     worker.store_tp_size = None
     worker.num_kv_head = 1
@@ -3657,32 +3655,6 @@ def test_mooncake_lookup_respects_explicit_pmu_policy(
     _, hit = coordinator.find_longest_cache_hit(hashes, 511, pool)
     assert coordinator.enable_partial_hash_hits == allow_partial_hash_hits
     assert hit == (496 if allow_partial_hash_hits else 384)
-
-
-def test_get_finished_issues_store_without_forward_once():
-    worker = _make_bare_worker()
-    worker.kv_send_thread = MagicMock()
-    request = ReqMeta(
-        req_id="preempted",
-        token_len_chunk=0,
-        block_ids=([3],),
-        block_hashes=[b"hash"],
-        can_save=True,
-    )
-    metadata = MooncakeStoreConnectorMetadata(
-        unfinished_request_ids=set(), preempted_req_ids={request.req_id}
-    )
-    metadata.add_request(request)
-    event = MagicMock()
-    with patch.object(torch.cuda, "Event", return_value=event):
-        # No wait_for_save call: this scheduler step has no model forward.
-        worker.get_finished(set(), metadata)
-        worker.get_finished(set(), metadata)
-        worker.wait_for_save(metadata)
-
-    event.record.assert_called_once_with()
-    assert request.current_event is event
-    worker.kv_send_thread.add_request.assert_called_once_with(request)
 
 
 def test_lookup_key_prefixes_cover_dcp_rank_namespaces():

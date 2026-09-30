@@ -865,10 +865,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             block_ids_per_group = req_meta.block_ids
             current_event = req_meta.current_event
 
-            is_pinned_handoff = req_meta.token_len_chunk == 0 and bool(
-                req_meta.boundary_state_offloads
-            )
-            if not is_pinned_handoff and not self.is_live_store_job(req_meta):
+            if not self.is_live_store_job(req_meta):
                 return
 
             if self.enable_kv_event:
@@ -1628,7 +1625,6 @@ class MooncakeStoreWorker:
         self.num_recv_threads = max(1, envs.VLLM_MOONCAKE_LOAD_RECV_THREADS)
         self.recv_request_queue: queue.Queue[ReqMeta] = queue.Queue()
         self.finished_store_req: set[str] = set()
-        self._issued_store_metadata: MooncakeStoreConnectorMetadata | None = None
         self._kv_connector_stats_lock = threading.Lock()
         self.kv_connector_stats = MooncakeStoreConnectorStats()
 
@@ -2119,13 +2115,6 @@ class MooncakeStoreWorker:
         """
         if self._capacity_only or not self.can_put:
             return
-        self._issue_store_jobs(metadata)
-
-    def _issue_store_jobs(self, metadata: MooncakeStoreConnectorMetadata) -> None:
-        """Issue store jobs once, including steps without a forward."""
-        if metadata is self._issued_store_metadata:
-            return
-        self._issued_store_metadata = metadata
 
         current_event = None
         for request in metadata.requests:
@@ -2146,13 +2135,12 @@ class MooncakeStoreWorker:
     ) -> tuple[set[str], set[str]]:
         """Get completed send/recv request IDs.
 
-        Issue pending stores on no-forward steps, then collect completions.
+        Loads are issued in start_load_kv() and stores in wait_for_save().
         """
         if self._capacity_only:
             return set(), set()
 
         if self.can_put:
-            self._issue_store_jobs(meta)
             self._close_ended_store_requests(finished_req_ids, meta)
 
         # Blocks read by a store job are released by the scheduler when the job

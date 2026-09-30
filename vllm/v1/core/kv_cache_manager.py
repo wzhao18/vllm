@@ -935,7 +935,7 @@ class KVCacheManager:
         return offloads
 
     def finalize_partial_tail_offloads(
-        self, request: Request, allow_in_flight: bool = False
+        self, request: Request
     ) -> list[tuple[int, int, int]]:
         """Consume safe producer partial tails when a request finishes.
 
@@ -943,16 +943,13 @@ class KVCacheManager:
         token was forwarded. The connector pins and queues the exact table
         block before request cleanup, then releases the pin when every worker
         reports the store job complete.
-
-        Preemption may hand off an in-flight boundary: the connector must
-        fence the store read after that forward completes.
         """
         offloads: list[tuple[int, int, int]] = []
         for mgr in self.coordinator.single_type_managers:
             finalized = mgr.finalize_partial_tail_offload(
                 request.request_id,
                 request.num_computed_tokens,
-                0 if allow_in_flight else request.num_in_flight_tokens,
+                request.num_in_flight_tokens,
             )
             if finalized is None:
                 continue

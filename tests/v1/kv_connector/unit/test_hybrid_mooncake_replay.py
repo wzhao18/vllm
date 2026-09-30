@@ -12,7 +12,6 @@ import pytest
 from tests.v1.kv_connector.unit.hybrid_mooncake_replay import (
     NUM_BLOCKS,
     REPLAY_SETUP,
-    PreemptionReplay,
     Replay,
     Sequence,
 )
@@ -88,15 +87,3 @@ def test_hybrid_mooncake_replay(sequence: Sequence, cache_backend: str):
             )
         local_history.append((length, suffix))
         store_history.append((length, suffix))
-
-
-def test_hybrid_mooncake_replay_preemption():
-    sequence = Sequence(
-        "pr55142-preempt", (8_193, 8_500, "preempt", "resume", "reset", 8_500)
-    )
-    result = PreemptionReplay(sequence).run_sequence()
-    assert result["handoffs"], "preemption did not hand off the pending checkpoint"
-    assert result["preemption_state_present"], "checkpoint was not stored before resume"
-    expected = (8_500 // REPLAY_SETUP.pmu - 1) * REPLAY_SETUP.pmu
-    assert expected <= result["local_hit"] < 8_500
-    assert expected <= result["mooncake_hit"] < 8_500
