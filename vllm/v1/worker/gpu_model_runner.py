@@ -7081,17 +7081,6 @@ class GPUModelRunner(
         self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
     ) -> None:
         """Create the metadata builders for all KV cache groups and attn groups."""
-        from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
-
-        scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
-            kv_cache_config, self.vllm_config
-        )
-        self.cache_config.hash_block_size = hash_block_size
-        self.cache_config.checkpoint_block_size = (
-            hash_block_size
-            if self.cache_config.prefix_match_unit is not None
-            else scheduler_block_size
-        )
         for kv_cache_group_id in range(len(kv_cache_config.kv_cache_groups)):
             for attn_group in self.attn_groups[kv_cache_group_id]:
                 attn_group.create_metadata_builders(

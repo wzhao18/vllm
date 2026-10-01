@@ -2052,27 +2052,10 @@ class MambaManager(SingleTypeKVCacheManager):
     ) -> BlockHashWithGroupId | None:
         hash_block_size = self.block_pool.hash_block_size
         loaded_tokens = self._externally_loaded_tokens.get(request.request_id, 0)
-        if num_tokens > 0 and num_tokens == loaded_tokens:
-            block_idx = cdiv(num_tokens, self.block_size) - 1
-            block = self.req_to_blocks[request.request_id][block_idx]
-            if block.block_hash_num_tokens == num_tokens:
-                return None
-            partial_hash = self.block_pool.cache_partial_block(
-                request=request,
-                block=block,
-                num_tokens=num_tokens,
-                kv_cache_group_id=self.kv_cache_group_id,
-                block_size=self.block_size,
-                replace_existing_hashes=num_tokens % self.block_size == 0,
-            )
-            if partial_hash is not None and num_tokens % self.block_size:
-                # Preserve the loaded checkpoint before the running state changes.
-                self._partial_hit_reqs[request.request_id] = (block_idx, block)
-                self.num_cached_block[request.request_id] = block_idx
-            return partial_hash
+        is_loaded_tail = num_tokens > 0 and num_tokens == loaded_tokens
         # Re-key the reserved block at its exported checkpoint boundary.
         checkpoint = self._checkpoints.get(request.request_id)
-        if checkpoint is not None:
+        if checkpoint is not None and not is_loaded_tail:
             checkpoint_position, checkpoint_idx = checkpoint
             blocks = self.req_to_blocks[request.request_id]
             assert 0 <= checkpoint_idx < len(blocks)
@@ -2110,13 +2093,12 @@ class MambaManager(SingleTypeKVCacheManager):
                 block_size=self.block_size,
                 replace_existing_hashes=True,
             )
-        if self.cache_hit_alignment_tokens >= self.block_size:
-            return None
-        if num_tokens % self.block_size == 0:
-            return None
-        if num_tokens % hash_block_size != 0:
-            return None
-        if num_tokens <= self._externally_loaded_tokens.get(request.request_id, 0):
+        if not is_loaded_tail and (
+            self.cache_hit_alignment_tokens >= self.block_size
+            or num_tokens % self.block_size == 0
+            or num_tokens % hash_block_size != 0
+            or num_tokens <= loaded_tokens
+        ):
             return None
         latest_prompt_hash_boundary = get_mamba_prefill_checkpoint_position(
             request.num_prompt_tokens,
@@ -2128,19 +2110,27 @@ class MambaManager(SingleTypeKVCacheManager):
         # to the prompt chunk being computed -- during decode the target is the
         # running state block, mutated in place, which equals what its key
         # promises only after that step's forward.
-        if num_tokens != latest_prompt_hash_boundary and not (
-            self.shared_prefix_checkpoint
-            and num_tokens == request.shared_prefix_boundary
-            and request.num_computed_tokens < num_tokens <= request.num_prompt_tokens
+        if (
+            not is_loaded_tail
+            and num_tokens != latest_prompt_hash_boundary
+            and not (
+                self.shared_prefix_checkpoint
+                and num_tokens == request.shared_prefix_boundary
+                and request.num_computed_tokens
+                < num_tokens
+                <= request.num_prompt_tokens
+            )
         ):
             return None
 
-        block_idx = num_tokens // self.block_size
+        block_idx = cdiv(num_tokens, self.block_size) - 1
         blocks = self.req_to_blocks[request.request_id]
         if block_idx >= len(blocks):
             return None
         source_block = blocks[block_idx]
         if source_block.is_null:
+            return None
+        if is_loaded_tail and source_block.block_hash_num_tokens == num_tokens:
             return None
 
         partial_hash = self.block_pool.cache_partial_block(
@@ -2149,18 +2139,17 @@ class MambaManager(SingleTypeKVCacheManager):
             num_tokens=num_tokens,
             kv_cache_group_id=self.kv_cache_group_id,
             block_size=self.block_size,
+            replace_existing_hashes=num_tokens % self.block_size == 0,
         )
-        if partial_hash is not None:
+        if partial_hash is not None and num_tokens % self.block_size:
             self._partial_hit_reqs[request.request_id] = (block_idx, source_block)
             self.num_cached_block[request.request_id] = block_idx
-            # Producer of this partial tail: the boundary state currently lives
-            # in ``source_block`` but the next step's forward overwrites it. The
-            # upcoming CoW copies it into a durable cow_block; record the req so
-            # allocate_new_blocks hands that block to the connector for offload.
-            self._producer_partial_tail_reqs[request.request_id] = (
-                source_block,
-                num_tokens,
-            )
+            if not is_loaded_tail:
+                # Offload the preserved producer state; loaded states are stored.
+                self._producer_partial_tail_reqs[request.request_id] = (
+                    source_block,
+                    num_tokens,
+                )
         return partial_hash
 
 

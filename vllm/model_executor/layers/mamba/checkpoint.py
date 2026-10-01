@@ -73,15 +73,6 @@ class MambaPrefillCheckpointBuilder:
     def __init__(self, vllm_config: VllmConfig, kv_cache_spec: MambaSpec) -> None:
         self.vllm_config = vllm_config
         self.kv_cache_spec = kv_cache_spec
-        cache_config = vllm_config.cache_config
-        self.checkpoint_block_size = (
-            cache_config.checkpoint_block_size
-            or cache_config.prefix_match_unit
-            or kv_cache_spec.block_size
-        )
-        self.hash_block_size = (
-            cache_config.hash_block_size or self.checkpoint_block_size
-        )
 
     def build(
         self,
@@ -97,6 +88,10 @@ class MambaPrefillCheckpointBuilder:
         query_lens = [all_query_lens[row] for row in request_rows]
         seq_lens = m.seq_lens_cpu_upper_bound.tolist()
         block_size = self.kv_cache_spec.block_size
+        cache_config = self.vllm_config.cache_config
+        hash_block_size = (
+            cache_config.hash_block_size or cache_config.prefix_match_unit or block_size
+        )
         speculative_config = self.vllm_config.speculative_config
         drop_eagle_block = (
             speculative_config is not None and speculative_config.use_eagle_block_drop()
@@ -104,11 +99,11 @@ class MambaPrefillCheckpointBuilder:
         checkpoint_offsets, checkpoint_cols = compute_mamba_prefill_checkpoints(
             [seq_lens[row] for row in request_rows],
             query_lens,
-            hash_block_size=self.hash_block_size,
+            hash_block_size=hash_block_size,
             mamba_block_size=block_size,
             checkpoint_alignment=self.kv_cache_spec.prefill_checkpoint_alignment,
             drop_eagle_block=drop_eagle_block,
-            checkpoint_unit=self.checkpoint_block_size,
+            checkpoint_unit=cache_config.checkpoint_block_size or hash_block_size,
         )
         if not any(checkpoint_offsets):
             return None

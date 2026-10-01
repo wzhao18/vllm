@@ -719,7 +719,13 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
         """
         offloads = req_meta.boundary_state_offloads or []
-        if not req_meta.block_hashes:
+        num_prompt_tokens = req_meta.num_prompt_tokens or 0
+        publish_tail = (
+            req_meta.completed_token_len is not None
+            and 0 < num_prompt_tokens <= req_meta.completed_token_len
+            and self.coord.enable_partial_hash_hits
+        )
+        if not req_meta.block_hashes or not (offloads or publish_tail):
             return True
 
         snapshots: list[tuple[int, int, int]] = []
@@ -734,23 +740,14 @@ class KVCacheStoreSendingThread(KVTransferThread):
         puts = self._boundary_snapshot_puts(req_meta, snapshots)
         if sub_block and self.coord.enable_partial_hash_hits:
             puts.extend(self._sub_block_tail_puts(req_meta, sub_block))
-        if (
-            req_meta.completed_token_len is not None
-            and req_meta.num_prompt_tokens
-            and req_meta.completed_token_len >= req_meta.num_prompt_tokens
-            and self.coord.enable_partial_hash_hits
-        ):
+        if publish_tail:
             boundary = get_mamba_prefill_checkpoint_position(
-                req_meta.num_prompt_tokens,
+                num_prompt_tokens,
                 self.coord.hash_block_size,
                 bool(self.coord.eagle_proof_margin_by_group),
             )
             puts.extend(self._sub_block_tail_puts(req_meta, [], boundary))
-        puts = list(
-            {
-                key: (key, addr, size, metadata) for key, addr, size, metadata in puts
-            }.values()
-        )
+        puts = list({put[0]: put for put in puts}.values())
 
         if not puts:
             return True
@@ -886,14 +883,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
             # Offload the handed-off mamba boundary states (independent of the
             # normal positional save, which may be skipped this step).
-            if (
-                req_meta.boundary_state_offloads is not None
-                or (
-                    req_meta.completed_token_len is not None
-                    and req_meta.num_prompt_tokens
-                    and req_meta.completed_token_len >= req_meta.num_prompt_tokens
-                )
-            ) and not self._maybe_offload_boundary_states(req_meta):
+            if not self._maybe_offload_boundary_states(req_meta):
                 return
 
             if token_len == 0:
