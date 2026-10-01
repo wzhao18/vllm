@@ -144,7 +144,6 @@ def make_full_mamba_manager(
     use_eagle: bool = False,
     num_speculative_blocks: int = 0,
     num_prefill_checkpoint_blocks: int = 0,
-    allow_partial_hash_hits: bool = True,
 ):
     mamba_group = KVCacheGroupSpec(
         ["mamba"],
@@ -188,14 +187,13 @@ def make_full_mamba_manager(
         scheduler_block_size=scheduler_block_size,
         hash_block_size=hash_block_size,
         use_eagle=use_eagle,
-        allow_partial_hash_hits=allow_partial_hash_hits,
     )
 
 
 @pytest.mark.parametrize("prompt_tokens", [512, 513])
 @pytest.mark.parametrize("use_eagle", [False, True])
 @pytest.mark.parametrize("extension_tokens", [0, 32])
-def test_without_pmu_reuses_lcm_checkpoint(prompt_tokens, use_eagle, extension_tokens):
+def test_dcp_reuses_gcd_checkpoint(prompt_tokens, use_eagle, extension_tokens):
     manager = make_full_mamba_manager(
         dcp_world_size=8,
         hash_block_size=16,
@@ -204,10 +202,9 @@ def test_without_pmu_reuses_lcm_checkpoint(prompt_tokens, use_eagle, extension_t
         num_blocks=128,
         use_eagle=use_eagle,
         num_prefill_checkpoint_blocks=1,
-        allow_partial_hash_hits=False,
     )
     manager.coordinator.retention_interval = 0
-    assert not manager.coordinator.enable_partial_hash_hits
+    assert manager.coordinator.enable_partial_hash_hits
     scheduler = SimpleNamespace(
         block_size=128,
         cache_config=SimpleNamespace(block_size=16),
@@ -215,7 +212,7 @@ def test_without_pmu_reuses_lcm_checkpoint(prompt_tokens, use_eagle, extension_t
         max_num_scheduled_tokens=8192,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         use_eagle_block_drop=use_eagle,
-        mamba_partial_cache_hit=False,
+        mamba_partial_cache_hit=True,
         mamba_shared_prefix_checkpoint=False,
         mamba_has_prefill_checkpoint_blocks=True,
         mamba_prefill_checkpoint_alignment=16,
@@ -237,14 +234,14 @@ def test_without_pmu_reuses_lcm_checkpoint(prompt_tokens, use_eagle, extension_t
     )
     _, hit, _ = manager.get_computed_blocks(replay)
     expected = (
-        (prompt_tokens // 128 - 1) * 128
+        (prompt_tokens // 16 - 1) * 16
         if use_eagle
-        else ((prompt_tokens - 1) // 128 * 128)
+        else ((prompt_tokens - 1) // 16 * 16)
     )
     assert hit == expected
     cached_states = {
         end
-        for end in range(128, prompt_tokens + 1, 128)
+        for end in range(16, prompt_tokens + 1, 16)
         if manager.block_pool.get_cached_block(
             producer.block_hashes[end // 16 - 1], [1]
         )
@@ -444,7 +441,7 @@ def test_hybrid_mamba_align_partial_hash_hit():
         hash_block_size=hash_block_size,
     )
 
-    req0 = make_request("0", [0, 0, 1, 1, 2, 2], hash_block_size, sha256)
+    req0 = make_request("0", [0, 0, 1, 1, 2, 2, 3], hash_block_size, sha256)
     computed_blocks, num_computed, _ = manager.get_computed_blocks(req0)
     assert num_computed == 0
     blocks = manager.allocate_slots(req0, 6, num_computed, computed_blocks)
@@ -593,7 +590,7 @@ def test_hybrid_mamba_partial_tail_owner_uses_cow_on_continue():
         hash_block_size=hash_block_size,
     )
 
-    req0 = make_request("0", [0, 0, 1, 1, 2, 2], hash_block_size, sha256)
+    req0 = make_request("0", [0, 0, 1, 1, 2, 2, 3], hash_block_size, sha256)
     computed_blocks, num_computed, _ = manager.get_computed_blocks(req0)
     assert num_computed == 0
     assert manager.allocate_slots(req0, 6, num_computed, computed_blocks) is not None
@@ -643,7 +640,7 @@ def test_partial_hit_then_internal_checkpoint_uses_distinct_mamba_blocks():
         num_prefill_checkpoint_blocks=1,
     )
 
-    owner = make_request("owner", [0, 0, 1, 1, 2, 2], hash_block_size, sha256)
+    owner = make_request("owner", [0, 0, 1, 1, 2, 2, 3], hash_block_size, sha256)
     computed_blocks, num_computed, _ = manager.get_computed_blocks(owner)
     assert manager.allocate_slots(owner, 6, num_computed, computed_blocks) is not None
     manager.free(owner)
@@ -832,9 +829,9 @@ def test_hash_aligned_query_end_uses_regular_partial_tail():
         mamba_block_size=mamba_block_size,
         num_prefill_checkpoint_blocks=1,
     )
-    request = make_request("producer", list(range(14)), hash_block_size, sha256)
+    request = make_request("producer", list(range(15)), hash_block_size, sha256)
 
-    new_blocks = manager.allocate_slots(request, request.num_tokens)
+    new_blocks = manager.allocate_slots(request, 14)
 
     assert new_blocks is not None
     mamba_manager = manager.coordinator.single_type_managers[1]
@@ -1054,7 +1051,7 @@ def test_boundary_state_offloads_returns_cow_target():
         hash_block_size=hash_block_size,
     )
 
-    req0 = make_request("0", [0, 0, 1, 1, 2, 2], hash_block_size, sha256)
+    req0 = make_request("0", [0, 0, 1, 1, 2, 2, 3], hash_block_size, sha256)
     computed_blocks, num_computed, _ = manager.get_computed_blocks(req0)
     assert manager.allocate_slots(req0, 6, num_computed, computed_blocks) is not None
 
@@ -1130,7 +1127,7 @@ def test_finished_partial_tail_uses_table_source_once():
         hash_block_size=hash_block_size,
     )
 
-    req0 = make_request("0", [0, 0, 1, 1, 2, 2], hash_block_size, sha256)
+    req0 = make_request("0", [0, 0, 1, 1, 2, 2, 3], hash_block_size, sha256)
     computed_blocks, num_computed, _ = manager.get_computed_blocks(req0)
     assert manager.allocate_slots(req0, 6, num_computed, computed_blocks) is not None
     source_block_id = manager.get_blocks("0").get_block_ids()[1][1]
@@ -1150,7 +1147,7 @@ def test_finished_partial_tail_uses_table_source_once():
         enable_caching=True,
         hash_block_size=hash_block_size,
     )
-    req1 = make_request("1", [0, 0, 1, 1, 2, 2], hash_block_size, sha256)
+    req1 = make_request("1", [0, 0, 1, 1, 2, 2, 3], hash_block_size, sha256)
     computed_blocks, num_computed, _ = advanced_manager.get_computed_blocks(req1)
     assert (
         advanced_manager.allocate_slots(req1, 6, num_computed, computed_blocks)
@@ -1338,7 +1335,7 @@ def test_truncate_computed_blocks_preserves_sparse_prefix_positions():
         enable_caching=True,
         hash_block_size=hash_block_size,
     )
-    producer = make_request("producer", [0, 0, 1, 1, 2, 2], hash_block_size, sha256)
+    producer = make_request("producer", [0, 0, 1, 1, 2, 2, 3], hash_block_size, sha256)
     blocks, num_computed, _ = manager.get_computed_blocks(producer)
     assert manager.allocate_slots(producer, 6, num_computed, blocks) is not None
     manager.free(producer)
@@ -1393,7 +1390,7 @@ def test_truncate_computed_blocks_allows_short_mamba_group_only():
         enable_caching=True,
         hash_block_size=hash_block_size,
     )
-    producer = make_request("producer", [0, 0, 1, 1, 2, 2], hash_block_size, sha256)
+    producer = make_request("producer", [0, 0, 1, 1, 2, 2, 3], hash_block_size, sha256)
     blocks, num_computed, _ = manager.get_computed_blocks(producer)
     assert manager.allocate_slots(producer, 6, num_computed, blocks) is not None
     manager.free(producer)
@@ -1457,7 +1454,7 @@ def test_hybrid_mamba_partial_tail_owner_continue_preserves_later_hit():
         hash_block_size=hash_block_size,
     )
 
-    req0 = make_request("0", [0, 0, 1, 1, 2, 2], hash_block_size, sha256)
+    req0 = make_request("0", [0, 0, 1, 1, 2, 2, 3], hash_block_size, sha256)
     computed_blocks, num_computed, _ = manager.get_computed_blocks(req0)
     assert num_computed == 0
     assert manager.allocate_slots(req0, 6, num_computed, computed_blocks) is not None
@@ -1537,7 +1534,7 @@ def test_hybrid_mamba_moved_partial_entry_defers_same_step_hit():
         hash_block_size=hash_block_size,
     )
 
-    req0 = make_request("0", [0, 0, 1, 1, 2, 2], hash_block_size, sha256)
+    req0 = make_request("0", [0, 0, 1, 1, 2, 2, 3], hash_block_size, sha256)
     computed_blocks, num_computed, _ = manager.get_computed_blocks(req0)
     assert num_computed == 0
     assert manager.allocate_slots(req0, 6, num_computed, computed_blocks) is not None
@@ -1596,7 +1593,7 @@ def test_hybrid_full_attention_partial_hash_hit_uses_cow():
         hash_block_size=hash_block_size,
     )
 
-    req0 = make_request("0", [0, 0, 1, 1, 2, 2], hash_block_size, sha256)
+    req0 = make_request("0", [0, 0, 1, 1, 2, 2, 3], hash_block_size, sha256)
     computed_blocks, num_computed, _ = manager.get_computed_blocks(req0)
     assert num_computed == 0
     assert manager.allocate_slots(req0, 6, num_computed, computed_blocks) is not None
@@ -1670,7 +1667,7 @@ def test_hybrid_partial_hit_cow_target_starts_uncached():
         hash_block_size=hash_block_size,
     )
 
-    req0 = make_request("0", [0, 0, 1, 1, 2, 2], hash_block_size, sha256)
+    req0 = make_request("0", [0, 0, 1, 1, 2, 2, 3], hash_block_size, sha256)
     computed_blocks, num_computed, _ = manager.get_computed_blocks(req0)
     assert num_computed == 0
     assert manager.allocate_slots(req0, 6, num_computed, computed_blocks) is not None
@@ -1826,7 +1823,7 @@ def test_cow_retained_blocks_returned_for_release():
         enable_caching=True,
         hash_block_size=hash_block_size,
     )
-    req0 = make_request("0", [0, 0, 1, 1, 2, 2], hash_block_size, sha256)
+    req0 = make_request("0", [0, 0, 1, 1, 2, 2, 3], hash_block_size, sha256)
     computed_blocks, num_computed, _ = manager.get_computed_blocks(req0)
     assert manager.allocate_slots(req0, 6, num_computed, computed_blocks) is not None
 
@@ -2305,7 +2302,7 @@ def test_opted_out_scratch_group_keeps_partial_hash_hits():
 
     assert manager.coordinator.enable_partial_hash_hits
 
-    req0 = make_request("0", [0, 0, 1, 1, 2, 2], hash_block_size, sha256)
+    req0 = make_request("0", [0, 0, 1, 1, 2, 2, 3], hash_block_size, sha256)
     computed_blocks, num_computed, _ = manager.get_computed_blocks(req0)
     assert manager.allocate_slots(req0, 6, num_computed, computed_blocks) is not None
     manager.free(req0)
@@ -2366,7 +2363,7 @@ def test_kpool_tail_supports_128_token_partial_hash_hits():
     assert manager.coordinator.enable_partial_hash_hits
 
     shared_prefix = [10] * (12 * hash_block_size)
-    req0 = make_request("0", shared_prefix, hash_block_size, sha256)
+    req0 = make_request("0", shared_prefix + [11], hash_block_size, sha256)
     computed_blocks, num_computed, _ = manager.get_computed_blocks(req0)
     assert (
         manager.allocate_slots(req0, len(shared_prefix), num_computed, computed_blocks)
@@ -2392,7 +2389,7 @@ def test_hybrid_partial_hash_hit_uses_cow_under_dcp(dcp_world_size: int):
     )
     assert manager.coordinator.enable_partial_hash_hits
 
-    req0 = make_request("dcp-owner", [0, 0, 1, 1, 2, 2], 2, sha256)
+    req0 = make_request("dcp-owner", [0, 0, 1, 1, 2, 2, 3], 2, sha256)
     computed_blocks, num_computed, _ = manager.get_computed_blocks(req0)
     assert manager.allocate_slots(req0, 6, num_computed, computed_blocks) is not None
     manager.free(req0)

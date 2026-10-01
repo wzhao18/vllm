@@ -1654,7 +1654,6 @@ class MooncakeStoreWorker:
             use_eagle=use_eagle_block_drop,
             retention_interval=kv_cache_config.prefix_cache_retention_interval,
             dcp_world_size=self.dcp_size,
-            allow_partial_hash_hits=self.cache_config.prefix_match_unit is not None,
         )
         self.store_tp_size, store_namespace, store_layout_cls = (
             self._select_store_layout(extra_config)

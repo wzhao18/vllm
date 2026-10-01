@@ -3613,13 +3613,17 @@ def _make_bare_worker(
     return worker
 
 
-@pytest.mark.parametrize("allow_partial_hash_hits", [False, True])
 @pytest.mark.parametrize("use_eagle", [False, True])
-def test_mooncake_lookup_respects_explicit_pmu_policy(
-    allow_partial_hash_hits, use_eagle
+@pytest.mark.parametrize("prefix_match_unit", [None, 8])
+@pytest.mark.parametrize("dcp_world_size,mamba_block_size", [(1, 32), (8, 16)])
+def test_mooncake_lookup_reuses_resolved_hash_checkpoint(
+    use_eagle, prefix_match_unit, dcp_world_size, mamba_block_size
 ):
     from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import (
         coordinator as mooncake_coordinator,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.scheduler import (
+        MooncakeStoreScheduler,
     )
 
     groups = [
@@ -3633,28 +3637,52 @@ def test_mooncake_lookup_respects_explicit_pmu_policy(
         KVCacheGroupSpec(
             ["mamba"],
             MambaSpec(
-                block_size=16,
+                block_size=mamba_block_size,
                 shapes=(1, 1),
                 dtypes=(torch.float32,),
                 mamba_cache_mode="align",
             ),
         ),
     ]
+    config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_role="kv_both", kv_connector_extra_config={}
+        ),
+        kv_events_config=None,
+        cache_config=SimpleNamespace(
+            block_size=16,
+            enable_prefix_caching=True,
+            prefix_match_unit=prefix_match_unit,
+        ),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=dcp_world_size, world_size=dcp_world_size
+        ),
+    )
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store."
+        "scheduler.LookupKeyClient"
+    ):
+        scheduler = MooncakeStoreScheduler(
+            config,
+            KVCacheConfig(num_blocks=128, kv_cache_tensors=[], kv_cache_groups=groups),
+        )
+    assert scheduler.enable_partial_hash_hits
+    hash_block_size = prefix_match_unit or 16
+    assert scheduler._hash_block_size == hash_block_size
     coordinator = mooncake_coordinator.MooncakeStoreCoordinator(
         groups,
-        scheduler_block_size=128,
-        hash_block_size=16,
-        dcp_world_size=8,
-        allow_partial_hash_hits=allow_partial_hash_hits,
+        scheduler_block_size=math.lcm(16 * dcp_world_size, mamba_block_size),
+        hash_block_size=hash_block_size,
+        dcp_world_size=dcp_world_size,
     )
-    hashes = [BlockHash(bytes([i]) * 16) for i in range(32)]
+    hashes = [BlockHash(bytes([i]) * 16) for i in range(512 // hash_block_size)]
     pool = mooncake_coordinator.ExternalCachedBlockPool(
-        hash_block_size=16,
+        hash_block_size=hash_block_size,
         exists={(group, bytes(h)) for group in range(2) for h in hashes},
     )
     _, hit = coordinator.find_longest_cache_hit(hashes, 511, pool)
-    assert coordinator.enable_partial_hash_hits == allow_partial_hash_hits
-    assert hit == (496 if allow_partial_hash_hits else 384)
+    assert coordinator.enable_partial_hash_hits
+    assert hit == 512 - hash_block_size
 
 
 def test_lookup_key_prefixes_cover_dcp_rank_namespaces():

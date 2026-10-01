@@ -9,9 +9,6 @@ from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator import (  # noqa: E501
-    partial_hash_hits_enabled,
-)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  # noqa: E501
     LoadSpec,
     MooncakeStoreConnectorMetadata,
@@ -26,7 +23,10 @@ from vllm.logger import init_logger
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+from vllm.v1.core.kv_cache_utils import (
+    partial_hash_hits_enabled,
+    resolve_kv_cache_block_sizes,
+)
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.outputs import KVConnectorOutput
@@ -84,13 +84,10 @@ class MooncakeStoreScheduler:
         self._block_size, self._hash_block_size = resolve_kv_cache_block_sizes(
             kv_cache_config, vllm_config
         )
-        self.enable_partial_hash_hits = (
-            vllm_config.cache_config.prefix_match_unit is not None
-            and partial_hash_hits_enabled(
-                store_groups,
-                self._hash_block_size,
-                vllm_config.parallel_config.decode_context_parallel_size,
-            )
+        self.enable_partial_hash_hits = partial_hash_hits_enabled(
+            store_groups,
+            self._hash_block_size,
+            vllm_config.parallel_config.decode_context_parallel_size,
         )
         mamba_groups = {
             group_id: group.kv_cache_spec

@@ -226,7 +226,7 @@ class CacheConfig:
     hash_block_size: int | None = field(default=None, init=False)
     """Resolved prefix-hash granularity in tokens."""
     checkpoint_block_size: int | None = field(default=None, init=False)
-    """Resolved Mamba checkpoint alignment in tokens (PMU or LCM)."""
+    """Resolved Mamba checkpoint alignment in tokens (hash size or LCM)."""
     effective_attention_block_size: int | None = field(default=None, init=False)
     """Full-attention block size in tokens, including DCP, or None if unavailable."""
     kv_cache_size_tokens: int | None = field(default=None, init=False)

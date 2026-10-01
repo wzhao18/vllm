@@ -13,6 +13,7 @@ from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlock,
+    partial_hash_hits_enabled,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     SingleTypeKVCacheManager,
@@ -83,7 +84,6 @@ class MooncakeStoreCoordinator:
         use_eagle: bool = False,
         retention_interval: int | None = None,
         dcp_world_size: int = 1,
-        allow_partial_hash_hits: bool = True,
     ) -> None:
         # Mirrors core's resolve_kv_cache_block_sizes: the hash unit only has
         # to divide groups that participate in prefix caching. Non-shareable
@@ -111,11 +111,8 @@ class MooncakeStoreCoordinator:
         }
         self.hash_block_size = hash_block_size
         self.lcm_block_size = scheduler_block_size
-        self.enable_partial_hash_hits = (
-            allow_partial_hash_hits
-            and partial_hash_hits_enabled(
-                kv_cache_groups, hash_block_size, dcp_world_size
-            )
+        self.enable_partial_hash_hits = partial_hash_hits_enabled(
+            kv_cache_groups, hash_block_size, dcp_world_size
         )
         self.use_eagle = use_eagle
         # Mirror vLLM core's KVCacheCoordinator.retention_interval.
@@ -468,20 +465,3 @@ def _unwrap_spec(spec: KVCacheSpec) -> KVCacheSpec:
     if isinstance(spec, UniformTypeKVCacheSpecs):
         return next(iter(spec.kv_cache_specs.values()))
     return spec
-
-
-def partial_hash_hits_enabled(
-    kv_cache_groups: Sequence[KVCacheGroupSpec],
-    hash_block_size: int,
-    dcp_world_size: int = 1,
-) -> bool:
-    """Match core's DCP-aware Mamba partial-hit condition."""
-    return any(
-        isinstance(spec := _unwrap_spec(g.kv_cache_spec), MambaSpec)
-        and spec.mamba_cache_mode == "align"
-        and (
-            (dcp_world_size == 1 and spec.block_size > hash_block_size)
-            or (dcp_world_size > 1 and spec.block_size >= hash_block_size)
-        )
-        for g in kv_cache_groups
-    )

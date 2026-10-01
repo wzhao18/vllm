@@ -11,6 +11,7 @@ from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlock,
+    partial_hash_hits_enabled,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
@@ -680,19 +681,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # managers in every group. TP needs hashing finer than the Mamba block;
         # DCP accepts equality because it scales the effective full-attention
         # block instead.
-        has_partial_mamba_group = any(
-            isinstance(g.kv_cache_spec, MambaSpec)
-            and g.kv_cache_spec.mamba_cache_mode == "align"
-            and (
-                (dcp_world_size == 1 and g.kv_cache_spec.block_size > hash_block_size)
-                or (
-                    dcp_world_size > 1 and g.kv_cache_spec.block_size >= hash_block_size
-                )
-            )
-            for g in kv_cache_config.kv_cache_groups
-        )
         self.enable_partial_hash_hits = (
-            allow_partial_hash_hits and has_partial_mamba_group
+            allow_partial_hash_hits
+            and partial_hash_hits_enabled(
+                kv_cache_config.kv_cache_groups, hash_block_size, dcp_world_size
+            )
         )
         if self.enable_partial_hash_hits:
             unsupported_partial_hit_managers = {
