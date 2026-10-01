@@ -92,6 +92,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
     reorder_batch_threshold: int = 1
 
+    def set_prefix_cache_block_sizes(
+        self, hit_block_size: int, hash_block_size: int
+    ) -> None:
+        self.checkpoint_builder.checkpoint_unit = hit_block_size
+        self.checkpoint_builder.hash_block_size = hash_block_size
+
     def __init__(
         self,
         kv_cache_spec: MambaSpec,

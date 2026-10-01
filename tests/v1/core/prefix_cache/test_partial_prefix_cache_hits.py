@@ -217,7 +217,8 @@ def test_without_pmu_reuses_lcm_checkpoint(prompt_tokens, use_eagle, extension_t
         use_eagle_block_drop=use_eagle,
         mamba_partial_cache_hit=False,
         mamba_shared_prefix_checkpoint=False,
-        mamba_has_prefill_checkpoint_blocks=False,
+        mamba_has_prefill_checkpoint_blocks=True,
+        mamba_prefill_checkpoint_alignment=16,
     )
     producer = make_request("producer", list(range(prompt_tokens)), 16, sha256)
     while producer.num_computed_tokens < prompt_tokens:
@@ -920,7 +921,8 @@ def test_external_mamba_hit_same_block_uses_running_cow_on_continue():
     assert moved[0].block_id == cow_copy.dst_block_id
 
 
-def test_external_mamba_tail_does_not_require_unreserved_cow():
+@pytest.mark.parametrize("loaded_tokens", [8, 14])
+def test_external_mamba_state_is_reusable_after_continuation(loaded_tokens):
     manager = make_full_mamba_manager(
         dcp_world_size=1,
         hash_block_size=2,
@@ -932,25 +934,61 @@ def test_external_mamba_tail_does_not_require_unreserved_cow():
         manager.allocate_slots(
             request,
             num_new_tokens=0,
-            num_external_computed_tokens=14,
+            num_external_computed_tokens=loaded_tokens,
             delay_cache_blocks=True,
         )
         is not None
     )
 
-    request.num_computed_tokens = 14
-    manager.cache_blocks(request, 14)
-    partial_hash = request.block_hashes[6]
-    assert manager.block_pool.get_cached_block(partial_hash, [1]) is None
+    request.num_computed_tokens = loaded_tokens
+    manager.cache_blocks(request, loaded_tokens)
+    partial_hash = request.block_hashes[loaded_tokens // 2 - 1]
+    cached = manager.block_pool.get_cached_block(partial_hash, [1])
+    assert cached is not None
     assert manager.finalize_partial_tail_offloads(request) == []
 
-    source_block_id = manager.get_blocks(request.request_id).get_block_ids()[1][1]
+    source_block_id = cached[0].block_id
+    if loaded_tokens % 8:
+        held = manager.block_pool.get_new_blocks(
+            manager.block_pool.get_num_free_blocks() - 1
+        )
+        assert manager.allocate_slots(request, num_new_tokens=1) is None
+        assert manager.block_pool.get_cached_block(partial_hash, [1])[0] is cached[0]
+        assert manager.take_kv_cache_block_copies() == ([], [])
+        manager.block_pool.free_blocks(held)
     assert manager.allocate_slots(request, num_new_tokens=1) is not None
-    assert (
-        manager.get_blocks(request.request_id).get_block_ids()[1][1] == source_block_id
+    copies, retained = manager.take_kv_cache_block_copies()
+    cached = manager.block_pool.get_cached_block(partial_hash, [1])
+    assert cached is not None
+    if loaded_tokens % 8:
+        assert any(
+            copy.src_block_id == source_block_id
+            and copy.dst_block_id == cached[0].block_id
+            for copy in copies
+        )
+        assert cached[0].block_id != source_block_id
+    manager.block_pool.free_blocks(retained)
+    request.num_computed_tokens += 1
+    manager.free(request)
+    manager.new_step_starts()
+
+    replay = make_request("replay", list(range(15)), 2, sha256)
+    blocks, hit, _ = manager.get_computed_blocks(replay)
+    assert hit == loaded_tokens
+    cached = manager.block_pool.get_cached_block(partial_hash, [1])
+    assert cached is not None and cached[0].ref_cnt == 0
+    assert manager.allocate_slots(replay, 1, hit, blocks) is not None
+    assert cached[0].ref_cnt > 0
+    _, retained = manager.take_kv_cache_block_copies()
+    manager.block_pool.free_blocks(retained)
+    manager.free(replay)
+    assert cached[0].ref_cnt == 0
+    assert manager.block_pool.get_cached_block(partial_hash, [1]) is not None
+    reclaimed = manager.block_pool.get_new_blocks(
+        manager.block_pool.get_num_free_blocks()
     )
-    copies, _ = manager.take_kv_cache_block_copies()
-    assert copies == []
+    assert manager.block_pool.get_cached_block(partial_hash, [1]) is None
+    manager.block_pool.free_blocks(reclaimed)
 
 
 def test_failed_external_mamba_load_can_publish_recomputed_tail():

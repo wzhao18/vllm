@@ -180,10 +180,6 @@ class KVCacheManager:
             num_prefill_lookahead=num_prefill_lookahead,
             allow_partial_hash_hits=allow_partial_hash_hits,
         )
-        if not allow_partial_hash_hits:
-            for manager in self.coordinator.single_type_managers:
-                if isinstance(manager, MambaManager):
-                    manager.has_prefill_checkpoint_blocks = False
         # One predicate, read by both sides of the feature, so the scheduler
         # cannot end a chunk at a junction the manager would refuse -- a refused
         # junction costs a forward pass and displaces the block-boundary stop.

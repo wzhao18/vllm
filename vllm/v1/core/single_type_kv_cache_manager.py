@@ -1768,7 +1768,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 num_new_blocks = max(num_new_blocks, 0) + 1
             checkpoint_position = get_mamba_prefill_checkpoint_position(
                 num_tokens,
-                self.block_pool.hash_block_size,
+                self.cache_hit_alignment_tokens,
                 self.drop_eagle_checkpoint_block,
             )
             if not self._needs_internal_checkpoint(
@@ -2051,6 +2051,25 @@ class MambaManager(SingleTypeKVCacheManager):
         retention_interval: int | None,
     ) -> BlockHashWithGroupId | None:
         hash_block_size = self.block_pool.hash_block_size
+        loaded_tokens = self._externally_loaded_tokens.get(request.request_id, 0)
+        if num_tokens > 0 and num_tokens == loaded_tokens:
+            block_idx = cdiv(num_tokens, self.block_size) - 1
+            block = self.req_to_blocks[request.request_id][block_idx]
+            if block.block_hash_num_tokens == num_tokens:
+                return None
+            partial_hash = self.block_pool.cache_partial_block(
+                request=request,
+                block=block,
+                num_tokens=num_tokens,
+                kv_cache_group_id=self.kv_cache_group_id,
+                block_size=self.block_size,
+                replace_existing_hashes=num_tokens % self.block_size == 0,
+            )
+            if partial_hash is not None and num_tokens % self.block_size:
+                # Preserve the loaded checkpoint before the running state changes.
+                self._partial_hit_reqs[request.request_id] = (block_idx, block)
+                self.num_cached_block[request.request_id] = block_idx
+            return partial_hash
         # Re-key the reserved block at its exported checkpoint boundary.
         checkpoint = self._checkpoints.get(request.request_id)
         if checkpoint is not None:
@@ -2065,7 +2084,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 checkpoint_position
                 == get_mamba_prefill_checkpoint_position(
                     request.num_prompt_tokens,
-                    hash_block_size,
+                    self.cache_hit_alignment_tokens,
                     self.drop_eagle_checkpoint_block,
                 )
             )
@@ -2091,14 +2110,13 @@ class MambaManager(SingleTypeKVCacheManager):
                 block_size=self.block_size,
                 replace_existing_hashes=True,
             )
-        if self.block_size == hash_block_size:
+        if self.cache_hit_alignment_tokens >= self.block_size:
             return None
         if num_tokens % self.block_size == 0:
             return None
         if num_tokens % hash_block_size != 0:
             return None
         if num_tokens <= self._externally_loaded_tokens.get(request.request_id, 0):
-            # Loaded states are private; publishing them requires unreserved CoW.
             return None
         resend_boundary = get_mamba_prefill_checkpoint_position(
             request.num_prompt_tokens,

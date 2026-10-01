@@ -252,6 +252,16 @@ def init_attn_backend(
     kernel_block_sizes = prepare_kernel_block_sizes(kv_cache_config, attn_groups)
 
     # Phase 3: create metadata builders and determine cudagraph support.
+    from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+
+    scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
+        kv_cache_config, vllm_config
+    )
+    prefix_cache_block_size = (
+        hash_block_size
+        if vllm_config.cache_config.prefix_match_unit is not None
+        else scheduler_block_size
+    )
     attn_backend_workspace: torch.Tensor | None = None
     for kv_cache_group_id, groups in enumerate(attn_groups):
         kernel_block_size = None
@@ -271,6 +281,9 @@ def init_attn_backend(
             # attention on the one compute stream the threads hand off, so the
             # buffer is written serially, as it already is across steps.
             for builder in group.metadata_builders:
+                builder.set_prefix_cache_block_sizes(
+                    prefix_cache_block_size, hash_block_size
+                )
                 if attn_backend_workspace is None:
                     if hasattr(builder, "_get_workspace_buffer"):
                         attn_backend_workspace = builder._get_workspace_buffer()

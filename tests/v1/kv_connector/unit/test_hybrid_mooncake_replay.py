@@ -75,10 +75,8 @@ def test_hybrid_mooncake_replay(sequence: Sequence, cache_backend: str):
             ("connector bookkeeping", result["initial_connector_hit"], local_expected),
             ("Mooncake lookup/store", result["initial_mooncake_hit"], store_expected),
         )
-        # Loaded private states need not be GPU cache entries. Check GPU-alone
-        # and Mooncake-backed replay separately, with the same sequence oracle.
         for path, actual, expected in (
-            observations[:2] if cache_backend == "gpu" else observations[2:]
+            observations[:2] if cache_backend == "gpu" else observations
         ):
             assert expected <= actual < length and actual % unit == 0, (
                 f"{sequence.name}, action {turn}, {path}: "

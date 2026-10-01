@@ -290,6 +290,21 @@ class Replay:
         request.shared_prefix_boundary = junction
 
         first = True
+        if external_hit:
+            allocated = self.manager.allocate_slots(
+                request,
+                num_new_tokens=0,
+                num_new_computed_tokens=local_hit,
+                new_computed_blocks=computed_blocks,
+                num_external_computed_tokens=external_hit,
+                delay_cache_blocks=True,
+            )
+            assert allocated is not None
+            request.num_computed_tokens = local_hit + external_hit
+            # Production publishes loaded blocks after async receive completes.
+            self.manager.cache_blocks(request, request.num_computed_tokens)
+            self.complete_step()
+            first = False
         while request.num_computed_tokens < request.num_tokens:
             admitted_hit = local_hit + external_hit if first else 0
             remaining = request.num_tokens - request.num_computed_tokens - admitted_hit

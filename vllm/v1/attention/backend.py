@@ -630,6 +630,12 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
     def set_kernel_block_size(self, kernel_block_size: int) -> None:
         self.kernel_block_size = kernel_block_size
 
+    def set_prefix_cache_block_sizes(
+        self, hit_block_size: int, hash_block_size: int
+    ) -> None:
+        """Configure resolved prefix-cache hit and hash granularities."""
+        pass
+
     @classmethod
     def get_cudagraph_support(
         cls: type["AttentionMetadataBuilder"],

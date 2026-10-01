@@ -312,9 +312,6 @@ def test_internal_checkpoint_metadata_targets_last_aligned_boundary(prefix_match
     )
     actual = builder.build(0, common_attn_metadata)
 
-    if prefix_match_unit is None:
-        assert actual.checkpoint is None
-        return
     assert actual.checkpoint is not None
     torch.testing.assert_close(
         actual.checkpoint.state_indices,
@@ -324,6 +321,35 @@ def test_internal_checkpoint_metadata_targets_last_aligned_boundary(prefix_match
         actual.checkpoint.checkpoint_offsets,
         torch.tensor([48, 0], dtype=torch.int32, device=device),
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("prefix_match_unit,expected", [(None, 512), (16, 528)])
+@pytest.mark.parametrize("query_start", [0, 480])
+def test_internal_checkpoint_uses_resolved_hit_granularity(
+    prefix_match_unit, expected, query_start
+):
+    device = torch.device("cuda")
+    builder = _make_builder(
+        KimiK3KDAMetadataBuilder,
+        num_speculative_tokens=0,
+        full_cuda_graph=False,
+        mamba_cache_mode="align",
+        num_prefill_checkpoint_blocks=1,
+        prefix_match_unit=prefix_match_unit,
+        device=device,
+    )
+    builder.set_prefix_cache_block_sizes(prefix_match_unit or 128, 16)
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[530], query_lens=[530 - query_start]),
+        BLOCK_SIZE,
+        device,
+        arange_block_indices=True,
+    )
+    checkpoint = builder.checkpoint_builder.build(common, [0])
+    assert checkpoint is not None
+    assert checkpoint.checkpoint_offsets.tolist() == [expected - query_start]
+    assert checkpoint.state_indices.tolist() == [32]
 
 
 @pytest.mark.parametrize(
