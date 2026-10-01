@@ -2110,19 +2110,6 @@ class MambaManager(SingleTypeKVCacheManager):
         if source_block.is_null:
             return None
 
-        if num_tokens % self.block_size == 0:
-            # Sparse LCM retention may skip a block-aligned prompt tail.
-            if source_block.block_hash_num_tokens != num_tokens:
-                self.block_pool.cache_full_blocks(
-                    request=request,
-                    blocks=blocks,
-                    num_cached_blocks=block_idx,
-                    num_full_blocks=block_idx + 1,
-                    block_size=self.block_size,
-                    kv_cache_group_id=self.kv_cache_group_id,
-                )
-            return None
-
         partial_hash = self.block_pool.cache_partial_block(
             request=request,
             block=source_block,
@@ -2130,7 +2117,7 @@ class MambaManager(SingleTypeKVCacheManager):
             kv_cache_group_id=self.kv_cache_group_id,
             block_size=self.block_size,
         )
-        if partial_hash is not None:
+        if partial_hash is not None and num_tokens % self.block_size:
             self._partial_hit_reqs[request.request_id] = (block_idx, source_block)
             self.num_cached_block[request.request_id] = block_idx
             # Producer of this partial tail: the boundary state currently lives

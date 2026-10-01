@@ -455,12 +455,15 @@ class BlockPool:
         block_size: int,
         replace_existing_hashes: bool = False,
     ) -> BlockHashWithGroupId | None:
-        """Register a partial prefix-cache entry for an existing block.
+        """Register a prefix-cache entry for an existing block at a hash boundary.
 
         Prefix-cache keys normally identify full cache blocks. A partial entry
         makes an existing cache block reachable from a fine-grained prefix
         boundary inside that block without allocating or copying a new
         ``KVCacheBlock``.
+
+        Block-aligned boundaries are supported too, so prompt tails skipped by
+        sparse full-block retention can use the same registration path.
 
         The partial entry is lookup metadata owned by ``block``. If ``block``
         has no primary hash, the key becomes its primary hash. If the block
@@ -479,8 +482,8 @@ class BlockPool:
             kv_cache_group_id: KV cache group that owns the partial entry.
             block_size: Cache block size for the owning group. The partial
                 entry hash itself is always the prefix-chain hash at
-                ``num_tokens``; ``block_size`` is used to assert that the
-                entry is partial within the owning cache block.
+                ``num_tokens``; ``block_size`` must be a multiple of the hash
+                block size.
             replace_existing_hashes: Whether the block contents were replaced
                 and all existing cache entries must be removed before the new
                 entry is registered.
@@ -494,9 +497,6 @@ class BlockPool:
             return None
 
         assert block_size % self.hash_block_size == 0
-        assert replace_existing_hashes or (
-            block_size > self.hash_block_size and num_tokens % block_size != 0
-        )
         block_hash = self._get_partial_block_hash(request, num_tokens)
         num_hash_blocks = num_tokens // self.hash_block_size
         block_hash_with_group_id = make_block_hash_with_group_id(
