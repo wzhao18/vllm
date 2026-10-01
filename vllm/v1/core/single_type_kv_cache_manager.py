@@ -2118,22 +2118,17 @@ class MambaManager(SingleTypeKVCacheManager):
             return None
         if num_tokens <= self._externally_loaded_tokens.get(request.request_id, 0):
             return None
-        resend_boundary = get_mamba_prefill_checkpoint_position(
+        latest_prompt_hash_boundary = get_mamba_prefill_checkpoint_position(
             request.num_prompt_tokens,
             hash_block_size,
             self.drop_eagle_checkpoint_block,
-        )
-        latest_prompt_hash_boundary = (
-            resend_boundary
-            if self.drop_eagle_checkpoint_block
-            else request.num_prompt_tokens // hash_block_size * hash_block_size
         )
         # The junction is the other position a sibling resumes at: where one was
         # observed to stop, and where the scheduler already ends a chunk. Bounded
         # to the prompt chunk being computed -- during decode the target is the
         # running state block, mutated in place, which equals what its key
         # promises only after that step's forward.
-        if num_tokens not in (resend_boundary, latest_prompt_hash_boundary) and not (
+        if num_tokens != latest_prompt_hash_boundary and not (
             self.shared_prefix_checkpoint
             and num_tokens == request.shared_prefix_boundary
             and request.num_computed_tokens < num_tokens <= request.num_prompt_tokens
