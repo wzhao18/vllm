@@ -310,15 +310,11 @@ class KVCacheCoordinator(ABC):
         )
 
     def get_replay_boundaries(self, request: Request) -> tuple[int, ...]:
-        """Positions a later request replaying this prompt can resume at.
+        """Return the prompt checkpoint to retain for resends and extensions.
 
-        A hit is the shortest across all groups, so every group retains state
-        at each position; EAGLE groups also keep the block above, which they
-        match and drop back from (see ``reachable_block_mask``).
-
-        EAGLE verifies attention through the prompt end before dropping a
-        block. Other requests must recompute the last token. The resulting
-        boundary serves both a resend and a strict extension.
+        Sparse managers use this boundary to select reusable cache blocks.
+        EAGLE attention also retains the proof above it before dropping back
+        to the checkpoint; without EAGLE, the last prompt token is recomputed.
         """
         return (
             get_mamba_prefill_checkpoint_position(

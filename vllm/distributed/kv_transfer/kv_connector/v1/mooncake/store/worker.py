@@ -618,20 +618,16 @@ class KVCacheStoreSendingThread(KVTransferThread):
         boundary: int,
         mamba_offloads: list[tuple[int, int, int]],
     ) -> list[tuple[str, list[int], list[int], KeyMetadata]]:
-        """Puts for the request's sub-block partial tail (its last prompt hash
-        boundary), so a later request can hit the sub-block prefix.
+        """Prepare PUT arguments for a prompt checkpoint and its attention proof.
 
-        Covers every group's blocks from the normal save's lcm floor to the
-        boundary: the normal save floors to ``lcm_block_size``, so a
-        smaller-block group's full blocks in that gap are never persisted
-        elsewhere, and the consumer's lookup needs every group at every probed
-        boundary. Full blocks are keyed by their block-end hash and the partial
-        boundary block by the boundary sub-hash; a mamba "align" group
-        contributes only its boundary block, from the core-provided CoW block.
+        ``boundary`` is the checkpoint token position. ``mamba_offloads`` gives
+        its exact Mamba source blocks; an empty list prepares attention only.
 
-        ``boundary`` is the checkpoint token position. ``mamba_offloads`` supplies
-        exact Mamba source blocks at that position; an empty list prepares
-        attention proofs only. This prepares PUT arguments, not a transfer.
+        Attention covers the gap after the normal save's LCM floor, including
+        any extra EAGLE proof. Full blocks use their block-end hashes; the
+        final partial block uses its proof-end hash. Mamba uses only the
+        handed-off checkpoint, never an intermediate block-table position.
+        This prepares arguments without starting a transfer.
         """
         if any(position != boundary for _, _, position in mamba_offloads):
             raise ValueError(
