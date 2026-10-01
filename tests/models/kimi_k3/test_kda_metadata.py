@@ -123,6 +123,12 @@ def _make_builder(
     vllm_config.cache_config.use_replayssm = use_recoverssm
     vllm_config.cache_config.use_kda_recoverssm = use_recoverssm
     vllm_config.cache_config.prefix_match_unit = prefix_match_unit
+    vllm_config.cache_config.hash_block_size = (
+        mamba_block_size if prefix_match_unit is None else prefix_match_unit
+    )
+    vllm_config.cache_config.checkpoint_block_size = (
+        vllm_config.cache_config.hash_block_size
+    )
     if prefix_cache_block_sizes is not None:
         (
             vllm_config.cache_config.checkpoint_block_size,
