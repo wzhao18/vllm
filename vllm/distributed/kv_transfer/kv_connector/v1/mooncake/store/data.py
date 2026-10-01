@@ -27,10 +27,16 @@ from vllm.v1.core.kv_cache_utils import (
 logger = init_logger(__name__)
 
 
-def partial_tail_block_range(
+def partial_tail_block_indices(
     boundary: int, proof_end: int, block_size: int, lcm_block_size: int
 ) -> range:
-    """Blocks covering the LCM gap, including the boundary's proof block."""
+    """Return logical block indices needed to store a partial tail.
+
+    Token boundaries and block sizes use the same group-resolved units.
+    Include the gap after the normal save's LCM floor through ``proof_end``,
+    which may extend past ``boundary`` for EAGLE. Always include the final
+    proof block, even when the checkpoint is LCM-aligned.
+    """
     last_block = cdiv(proof_end, block_size) - 1
     start = boundary // lcm_block_size * lcm_block_size
     return range(min(start // block_size, last_block), last_block + 1)

@@ -8,7 +8,7 @@ from typing import NamedTuple, cast
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
     ReqMeta,
     chunk_hashes_for_block_size,
-    partial_tail_block_range,
+    partial_tail_block_indices,
 )
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
@@ -123,8 +123,14 @@ class MooncakeStoreCoordinator:
         self.retention_interval = retention_interval
         self._verify_and_split_kv_cache_groups()
 
-    def tail_block_ids(self, req_meta: ReqMeta) -> list[int]:
-        """Attention sources read by the partial-tail store path."""
+    def tail_attention_block_ids(self, req_meta: ReqMeta) -> list[int]:
+        """Return attention source block IDs read by this job's partial tails.
+
+        Cover handed-off checkpoint boundaries and the prompt-derived tail,
+        including EAGLE proof margins. Mamba source blocks are supplied
+        separately by ``boundary_state_offloads`` and are excluded here.
+        This only selects blocks; the caller deduplicates and pins them.
+        """
         if not self.enable_partial_hash_hits or not req_meta.block_hashes:
             return []
         boundaries = {
@@ -164,7 +170,7 @@ class MooncakeStoreCoordinator:
                 block_size = self.kv_cache_groups[group_id].kv_cache_spec.block_size
                 block_ids.extend(
                     group_blocks[idx]
-                    for idx in partial_tail_block_range(
+                    for idx in partial_tail_block_indices(
                         boundary, proof_end, block_size, self.lcm_block_size
                     )
                     if idx < len(group_blocks) and group_blocks[idx] != NULL_BLOCK_ID

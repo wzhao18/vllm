@@ -56,7 +56,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  
     StoreShardId,
     TailKeyBoundary,
     TPShardedStoreLayout,
-    partial_tail_block_range,
+    partial_tail_block_indices,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.protocol import (  # noqa: E501
     LOOKUP_MSG,
@@ -628,6 +628,10 @@ class KVCacheStoreSendingThread(KVTransferThread):
         boundary. Full blocks are keyed by their block-end hash and the partial
         boundary block by the boundary sub-hash; a mamba "align" group
         contributes only its boundary block, from the core-provided CoW block.
+
+        ``boundary`` is the checkpoint token position. ``entries`` supplies
+        exact Mamba source blocks at that position; an empty list prepares
+        attention proofs only. This prepares PUT arguments, not a transfer.
         """
         if any(position != boundary for _, _, position in entries):
             raise ValueError(
@@ -659,7 +663,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             put_step = self.group_put_steps[g_idx]
             put_step_rank = (self.tp_rank + g_idx) % put_step
             # Earlier full blocks belong to normal save jobs, not this tail.
-            for block_idx in partial_tail_block_range(
+            for block_idx in partial_tail_block_indices(
                 boundary, group_boundary, db.block_size, self.coord.lcm_block_size
             ):
                 if block_idx % put_step != put_step_rank:

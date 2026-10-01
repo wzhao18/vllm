@@ -480,6 +480,7 @@ class MooncakeStoreScheduler:
         The worker DMAs out of these blocks after the step that scheduled them,
         so a reference keeps them out of the free queue even once the request
         itself is freed, until every rank reports the job done.
+        Finish-time jobs already own references and are not pinned again.
         """
         pool = self._gpu_block_pool
         for req_meta in meta.requests:
@@ -502,7 +503,7 @@ class MooncakeStoreScheduler:
                 "A null block cannot back a boundary-state offload"
             )
             if req_meta.token_len_chunk == 0:
-                block_ids.extend(self._store_coord.tail_block_ids(req_meta))
+                block_ids.extend(self._store_coord.tail_attention_block_ids(req_meta))
             else:
                 # Normal saves can retry from a rank's last successful offset.
                 block_ids.extend(
@@ -527,7 +528,14 @@ class MooncakeStoreScheduler:
         block_ids: tuple[list[int], ...],
         partial_tail_offloads: list[tuple[int, int, int]],
     ) -> bool:
-        """Queue and pin a finish-time tail for the next connector step."""
+        """Pin and queue a final tail before request cleanup releases its blocks.
+
+        Called from the scheduler's request-finished hook. Take references to
+        the exact Mamba and attention sources now, then emit the job in the
+        next connector metadata build. Its store job ID prevents double pinning
+        in ``_reference_save_blocks``. Return False: these references allow
+        normal request cleanup without delaying it for the PUT.
+        """
         if self.kv_role == "kv_consumer" or not partial_tail_offloads:
             return False
         tracker = self._request_trackers.get(request.request_id)
@@ -564,7 +572,7 @@ class MooncakeStoreScheduler:
             boundary_state_offloads=remapped_offloads,
             completed_token_len=request.num_computed_tokens,
         )
-        pinned_block_ids.extend(self._store_coord.tail_block_ids(req_meta))
+        pinned_block_ids.extend(self._store_coord.tail_attention_block_ids(req_meta))
         pinned_block_ids = list(dict.fromkeys(pinned_block_ids))
 
         pool = self._gpu_block_pool
