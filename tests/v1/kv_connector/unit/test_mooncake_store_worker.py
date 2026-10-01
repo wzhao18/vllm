@@ -1071,7 +1071,11 @@ def test_tail_store_reads_only_lcm_gap_even_when_normal_save_lags(
         num_prompt_tokens=49 if use_eagle else 45,
         completed_token_len=49 if use_eagle else 45,
     )
-    assert thread._maybe_offload_boundary_states(req)
+    with patch.object(
+        thread, "_sub_block_tail_puts", wraps=thread._sub_block_tail_puts
+    ) as prepare_tail:
+        assert thread._maybe_offload_boundary_states(req)
+    prepare_tail.assert_called_once_with(req, 44, [(1, 50, 44)])
     keys, addresses, *_ = store.batch_put_from_multi_buffers.call_args.args
     proof_end = 48 if use_eagle else 44
     expected_keys = [

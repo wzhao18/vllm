@@ -724,24 +724,25 @@ class KVCacheStoreSendingThread(KVTransferThread):
             return True
 
         snapshots: list[tuple[int, int, int]] = []
-        sub_block: list[tuple[int, int, int]] = []
+        tails: dict[int, list[tuple[int, int, int]]] = {}
         for group_id, block_id, boundary in offloads:
             entry = (group_id, block_id, boundary)
             if boundary % self.token_databases[group_id].block_size == 0:
                 snapshots.append(entry)
             else:
-                sub_block.append(entry)
+                tails.setdefault(boundary, []).append(entry)
 
         puts = self._boundary_snapshot_puts(req_meta, snapshots)
-        if sub_block and self.coord.enable_partial_hash_hits:
-            puts.extend(self._sub_block_tail_puts(req_meta, sub_block[0][2], sub_block))
         if publish_tail:
             boundary = get_mamba_prefill_checkpoint_position(
                 num_prompt_tokens,
                 self.coord.hash_block_size,
                 bool(self.coord.eagle_proof_margin_by_group),
             )
-            puts.extend(self._sub_block_tail_puts(req_meta, boundary, []))
+            tails.setdefault(boundary, [])
+        if self.coord.enable_partial_hash_hits:
+            for boundary, entries in tails.items():
+                puts.extend(self._sub_block_tail_puts(req_meta, boundary, entries))
         puts = list({put[0]: put for put in puts}.values())
 
         if not puts:
