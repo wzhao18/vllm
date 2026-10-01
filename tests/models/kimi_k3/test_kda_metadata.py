@@ -100,6 +100,7 @@ def _make_builder(
     prefix_match_unit: int | None = None,
     use_eagle: bool = False,
     disable_eagle_block_drop: bool = False,
+    prefix_cache_block_sizes: tuple[int, int] | None = None,
 ) -> AttentionMetadataBuilder:
     vllm_config = create_vllm_config(
         model_name="Qwen/Qwen3.5-0.8B",
@@ -137,6 +138,7 @@ def _make_builder(
         layer_names=["layer.0"],
         vllm_config=vllm_config,
         device=device,
+        prefix_cache_block_sizes=prefix_cache_block_sizes,
     )
     if use_recoverssm:
         assert isinstance(builder, KimiK3KDAMetadataBuilder)
@@ -338,8 +340,8 @@ def test_internal_checkpoint_uses_resolved_hit_granularity(
         num_prefill_checkpoint_blocks=1,
         prefix_match_unit=prefix_match_unit,
         device=device,
+        prefix_cache_block_sizes=(prefix_match_unit or 128, 16),
     )
-    builder.set_prefix_cache_block_sizes(prefix_match_unit or 128, 16)
     common = create_common_attn_metadata(
         BatchSpec(seq_lens=[530], query_lens=[530 - query_start]),
         BLOCK_SIZE,

@@ -609,6 +609,7 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
     supports_update_block_table: bool = False
     # Whether the builder constructor requires the block-table width.
     requires_block_table_width: ClassVar[bool] = False
+    requires_prefix_cache_block_sizes: ClassVar[bool] = False
     # Whether all step-dependent draft decode metadata can be updated in place,
     # allowing one metadata build to be reused across autoregressive draft steps.
     supports_draft_decode_metadata_update: bool = False
@@ -629,12 +630,6 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
 
     def set_kernel_block_size(self, kernel_block_size: int) -> None:
         self.kernel_block_size = kernel_block_size
-
-    def set_prefix_cache_block_sizes(
-        self, hit_block_size: int, hash_block_size: int
-    ) -> None:
-        """Configure resolved prefix-cache hit and hash granularities."""
-        pass
 
     @classmethod
     def get_cudagraph_support(

@@ -7102,11 +7102,8 @@ class GPUModelRunner(
                     num_metadata_builders=1
                     if not self.parallel_config.use_ubatching
                     else self.parallel_config.num_ubatches,
+                    prefix_cache_block_sizes=(prefix_cache_block_size, hash_block_size),
                 )
-                for builder in attn_group.metadata_builders:
-                    builder.set_prefix_cache_block_sizes(
-                        prefix_cache_block_size, hash_block_size
-                    )
         # Calculate reorder batch threshold (if needed)
         # Note (tdoublep): do this *after* constructing builders,
         # because some of them change the threshold at init time.

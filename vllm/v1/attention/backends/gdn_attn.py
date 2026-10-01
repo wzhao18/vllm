@@ -91,12 +91,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
 
     reorder_batch_threshold: int = 1
-
-    def set_prefix_cache_block_sizes(
-        self, hit_block_size: int, hash_block_size: int
-    ) -> None:
-        self.checkpoint_builder.checkpoint_unit = hit_block_size
-        self.checkpoint_builder.hash_block_size = hash_block_size
+    requires_prefix_cache_block_sizes = True
 
     def __init__(
         self,
@@ -104,12 +99,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         layer_names: list[str],
         vllm_config: VllmConfig,
         device: torch.device,
+        prefix_cache_block_sizes: tuple[int, int] | None = None,
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.compilation_config = vllm_config.compilation_config
         self.speculative_config = vllm_config.speculative_config
         self.checkpoint_builder = MambaPrefillCheckpointBuilder(
-            vllm_config, kv_cache_spec
+            vllm_config, kv_cache_spec, prefix_cache_block_sizes
         )
         from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
             _resolve_gdn_prefill_backend,

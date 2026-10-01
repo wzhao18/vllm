@@ -276,14 +276,12 @@ def init_attn_backend(
                 # builders keep the prepared metadata on themselves (MLA stores
                 # it on the prefill backend), so each ubatch needs its own.
                 num_metadata_builders=get_num_ubatches(vllm_config.parallel_config),
+                prefix_cache_block_sizes=(prefix_cache_block_size, hash_block_size),
             )
             # The microbatches' builders share the workspace: they all issue
             # attention on the one compute stream the threads hand off, so the
             # buffer is written serially, as it already is across steps.
             for builder in group.metadata_builders:
-                builder.set_prefix_cache_block_sizes(
-                    prefix_cache_block_size, hash_block_size
-                )
                 if attn_backend_workspace is None:
                     if hasattr(builder, "_get_workspace_buffer"):
                         attn_backend_workspace = builder._get_workspace_buffer()

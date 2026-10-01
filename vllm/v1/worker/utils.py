@@ -274,6 +274,7 @@ class AttentionGroup:
         device,
         kernel_block_size: int | None = None,
         num_metadata_builders: int = 1,
+        prefix_cache_block_sizes: tuple[int, int] | None = None,
     ):
         if kernel_block_size is None:
             kv_cache_spec_builder = self.kv_cache_spec
@@ -290,6 +291,8 @@ class AttentionGroup:
             )
         builder_cls = self.backend.get_builder_cls()
         builder_kwargs = {}
+        if builder_cls.requires_prefix_cache_block_sizes:
+            builder_kwargs["prefix_cache_block_sizes"] = prefix_cache_block_sizes
         if builder_cls.requires_block_table_width:
             max_num_blocks = self.kv_cache_spec.max_num_blocks_per_req(
                 vllm_config, vllm_config.model_config.max_model_len

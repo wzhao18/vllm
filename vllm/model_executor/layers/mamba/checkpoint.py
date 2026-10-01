@@ -70,13 +70,20 @@ class MambaPrefillCheckpointMetadata:
 class MambaPrefillCheckpointBuilder:
     """Build backend-neutral prefill checkpoint locations."""
 
-    def __init__(self, vllm_config: VllmConfig, kv_cache_spec: MambaSpec) -> None:
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        kv_cache_spec: MambaSpec,
+        prefix_cache_block_sizes: tuple[int, int] | None = None,
+    ) -> None:
         self.vllm_config = vllm_config
         self.kv_cache_spec = kv_cache_spec
         self.checkpoint_unit = (
             vllm_config.cache_config.prefix_match_unit or kv_cache_spec.block_size
         )
         self.hash_block_size = self.checkpoint_unit
+        if prefix_cache_block_sizes is not None:
+            self.checkpoint_unit, self.hash_block_size = prefix_cache_block_sizes
 
     def build(
         self,
