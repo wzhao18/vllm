@@ -126,12 +126,12 @@ def _make_builder(
     vllm_config.cache_config.hash_block_size = (
         mamba_block_size if prefix_match_unit is None else prefix_match_unit
     )
-    vllm_config.cache_config.checkpoint_block_size = (
+    vllm_config.cache_config.mamba_ckpt_block_size = (
         vllm_config.cache_config.hash_block_size
     )
     if prefix_cache_block_sizes is not None:
         (
-            vllm_config.cache_config.checkpoint_block_size,
+            vllm_config.cache_config.mamba_ckpt_block_size,
             vllm_config.cache_config.hash_block_size,
         ) = prefix_cache_block_sizes
     builder = builder_cls(
@@ -210,7 +210,7 @@ def test_kda_recoverssm_startup_metadata_flow_without_model(monkeypatch):
             use_kda_recoverssm=True,
             prefix_match_unit=BLOCK_SIZE,
             hash_block_size=BLOCK_SIZE,
-            checkpoint_block_size=BLOCK_SIZE,
+            mamba_ckpt_block_size=BLOCK_SIZE,
         ),
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
         speculative_config=SimpleNamespace(

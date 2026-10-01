@@ -114,7 +114,7 @@ def test_normalize_value_uuid_and_to_json():
     [
         (lambda x: x),
         (type("CallableInstance", (), {"__call__": lambda self: 0}))(),
-        (lambda: (lambda: 0))(),  # nested function instance
+        (lambda: lambda: 0)(),  # nested function instance
     ],
 )
 def test_error_cases(bad):
@@ -217,7 +217,7 @@ def test_cache_config_hash_ignores_kv_cache_sizing_knobs():
     assert CacheConfig(gpu_memory_utilization=0.5).compute_hash() == base_hash
     config = CacheConfig()
     config.hash_block_size = 128
-    config.checkpoint_block_size = 7168
+    config.mamba_ckpt_block_size = 7168
     config.effective_attention_block_size = 64
     assert config.compute_hash() == base_hash
 

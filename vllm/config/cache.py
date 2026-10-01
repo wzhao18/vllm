@@ -225,7 +225,7 @@ class CacheConfig:
     # Set after KV cache initialization.
     hash_block_size: int | None = field(default=None, init=False)
     """Resolved prefix-hash granularity in tokens."""
-    checkpoint_block_size: int | None = field(default=None, init=False)
+    mamba_ckpt_block_size: int | None = field(default=None, init=False)
     """Resolved Mamba checkpoint alignment in tokens (hash size or LCM)."""
     effective_attention_block_size: int | None = field(default=None, init=False)
     """Full-attention block size in tokens, including DCP, or None if unavailable."""
@@ -302,7 +302,7 @@ class CacheConfig:
             "num_gpu_blocks",
             "num_cpu_blocks",
             "hash_block_size",
-            "checkpoint_block_size",
+            "mamba_ckpt_block_size",
             "effective_attention_block_size",
             "kv_cache_size_tokens",
             "kv_cache_max_concurrency",

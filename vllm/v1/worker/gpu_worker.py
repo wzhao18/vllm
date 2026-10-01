@@ -837,7 +837,7 @@ class Worker(WorkerBase):
             kv_cache_config, self.vllm_config
         )
         self.cache_config.hash_block_size = hash_block_size
-        self.cache_config.checkpoint_block_size = (
+        self.cache_config.mamba_ckpt_block_size = (
             hash_block_size
             if partial_hash_hits_enabled(
                 kv_cache_config.kv_cache_groups,
