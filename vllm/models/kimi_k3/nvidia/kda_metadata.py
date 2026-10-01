@@ -312,11 +312,8 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
         layer_names: list[str],
         vllm_config: VllmConfig,
         device: torch.device,
-        prefix_cache_block_sizes: tuple[int, int] | None = None,
     ) -> None:
-        super().__init__(
-            kv_cache_spec, layer_names, vllm_config, device, prefix_cache_block_sizes
-        )
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         additional_config = vllm_config.additional_config
         self.use_flashinfer_prefill = (
             isinstance(additional_config, dict)

@@ -7086,7 +7086,8 @@ class GPUModelRunner(
         scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
             kv_cache_config, self.vllm_config
         )
-        prefix_cache_block_size = (
+        self.cache_config.hash_block_size = hash_block_size
+        self.cache_config.checkpoint_block_size = (
             hash_block_size
             if self.cache_config.prefix_match_unit is not None
             else scheduler_block_size
@@ -7102,7 +7103,6 @@ class GPUModelRunner(
                     num_metadata_builders=1
                     if not self.parallel_config.use_ubatching
                     else self.parallel_config.num_ubatches,
-                    prefix_cache_block_sizes=(prefix_cache_block_size, hash_block_size),
                 )
         # Calculate reorder batch threshold (if needed)
         # Note (tdoublep): do this *after* constructing builders,

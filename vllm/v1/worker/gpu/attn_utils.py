@@ -257,7 +257,8 @@ def init_attn_backend(
     scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
         kv_cache_config, vllm_config
     )
-    prefix_cache_block_size = (
+    vllm_config.cache_config.hash_block_size = hash_block_size
+    vllm_config.cache_config.checkpoint_block_size = (
         hash_block_size
         if vllm_config.cache_config.prefix_match_unit is not None
         else scheduler_block_size
@@ -276,7 +277,6 @@ def init_attn_backend(
                 # builders keep the prepared metadata on themselves (MLA stores
                 # it on the prefill backend), so each ubatch needs its own.
                 num_metadata_builders=get_num_ubatches(vllm_config.parallel_config),
-                prefix_cache_block_sizes=(prefix_cache_block_size, hash_block_size),
             )
             # The microbatches' builders share the workspace: they all issue
             # attention on the one compute stream the threads hand off, so the

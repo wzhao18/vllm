@@ -123,6 +123,11 @@ def _make_builder(
     vllm_config.cache_config.use_replayssm = use_recoverssm
     vllm_config.cache_config.use_kda_recoverssm = use_recoverssm
     vllm_config.cache_config.prefix_match_unit = prefix_match_unit
+    if prefix_cache_block_sizes is not None:
+        (
+            vllm_config.cache_config.checkpoint_block_size,
+            vllm_config.cache_config.hash_block_size,
+        ) = prefix_cache_block_sizes
     builder = builder_cls(
         kv_cache_spec=MambaSpec(
             block_size=mamba_block_size,
@@ -138,7 +143,6 @@ def _make_builder(
         layer_names=["layer.0"],
         vllm_config=vllm_config,
         device=device,
-        prefix_cache_block_sizes=prefix_cache_block_sizes,
     )
     if use_recoverssm:
         assert isinstance(builder, KimiK3KDAMetadataBuilder)
@@ -199,6 +203,8 @@ def test_kda_recoverssm_startup_metadata_flow_without_model(monkeypatch):
             mamba_cache_mode="align",
             use_kda_recoverssm=True,
             prefix_match_unit=BLOCK_SIZE,
+            hash_block_size=BLOCK_SIZE,
+            checkpoint_block_size=BLOCK_SIZE,
         ),
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
         speculative_config=SimpleNamespace(
