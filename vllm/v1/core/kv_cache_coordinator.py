@@ -26,7 +26,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MambaSpec,
     SlidingWindowSpec,
-    get_mamba_prefill_checkpoint_position,
 )
 from vllm.v1.request import Request
 
@@ -310,21 +309,25 @@ class KVCacheCoordinator(ABC):
         )
 
     def get_replay_boundaries(self, request: Request) -> tuple[int, ...]:
-        """Return the prompt checkpoint to retain for resends and extensions.
+        """Positions a later request replaying this prompt can resume at.
 
-        Sparse managers use this boundary to select reusable cache blocks.
-        EAGLE attention also retains the proof above it before dropping back
-        to the checkpoint; without EAGLE, the last prompt token is recomputed.
+        A hit is the shortest across all groups, so every group retains state
+        at each position; EAGLE groups also keep the block above, which they
+        match and drop back from (see ``reachable_block_mask``).
+
+        Two positions are reachable: a resend of the identical prompt is capped
+        at ``num_tokens - 1`` (its last token is recomputed for logits), a
+        longer sibling matches the final aligned block. They differ only on a
+        block-aligned prompt, where retaining just the higher one collapses the
+        resend's hit to 0. The alignment is the scheduler block size, not the
+        finer hash granularity, which would over-estimate the reach.
         """
-        return (
-            get_mamba_prefill_checkpoint_position(
-                request.num_prompt_tokens,
-                self.hash_block_size
-                if self.enable_partial_hash_hits
-                else self.scheduler_block_size,
-                bool(self.eagle_group_ids),
-            ),
-        )
+        if not self.eagle_group_ids:
+            return (request.num_prompt_tokens - 1,)
+        block = self.scheduler_block_size
+        resend = (request.num_prompt_tokens - 1) // block * block
+        extension = request.num_prompt_tokens // block * block
+        return tuple(sorted({max(resend - block, 0), max(extension - block, 0)}))
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """Cache the blocks for the request.

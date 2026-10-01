@@ -2083,11 +2083,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 block_size=self.block_size,
                 replace_existing_hashes=True,
             )
-        if self.block_size == hash_block_size:
-            return None
-        if num_tokens % self.block_size == 0:
-            return None
-        if num_tokens % hash_block_size != 0:
+        if num_tokens <= 0 or num_tokens % hash_block_size != 0:
             return None
         latest_prompt_hash_boundary = get_mamba_prefill_checkpoint_position(
             request.num_prompt_tokens,
@@ -2106,12 +2102,25 @@ class MambaManager(SingleTypeKVCacheManager):
         ):
             return None
 
-        block_idx = num_tokens // self.block_size
+        block_idx = cdiv(num_tokens, self.block_size) - 1
         blocks = self.req_to_blocks[request.request_id]
         if block_idx >= len(blocks):
             return None
         source_block = blocks[block_idx]
         if source_block.is_null:
+            return None
+
+        if num_tokens % self.block_size == 0:
+            # Sparse LCM retention may skip a block-aligned prompt tail.
+            if source_block.block_hash_num_tokens != num_tokens:
+                self.block_pool.cache_full_blocks(
+                    request=request,
+                    blocks=blocks,
+                    num_cached_blocks=block_idx,
+                    num_full_blocks=block_idx + 1,
+                    block_size=self.block_size,
+                    kv_cache_group_id=self.kv_cache_group_id,
+                )
             return None
 
         partial_hash = self.block_pool.cache_partial_block(
