@@ -54,8 +54,9 @@ def test_prefill_checkpoint_has_resend_attention_proof(prompt_tokens, drop_eagle
 
 @pytest.mark.parametrize("prompt_tokens", [7040, 7168, 7296])
 @pytest.mark.parametrize("extension_tokens", [0, 256])
-def test_eagle_resend_and_extension_reuse_prompt_checkpoint(
-    prompt_tokens, extension_tokens
+@pytest.mark.parametrize("use_eagle", [False, True])
+def test_resend_and_extension_reuse_prompt_checkpoint(
+    prompt_tokens, extension_tokens, use_eagle
 ):
     manager = make_full_mamba_manager(
         dcp_world_size=8,
@@ -63,8 +64,8 @@ def test_eagle_resend_and_extension_reuse_prompt_checkpoint(
         full_block_size=896,
         mamba_block_size=896,
         num_blocks=128,
-        use_eagle=True,
-        num_speculative_blocks=4,
+        use_eagle=use_eagle,
+        num_speculative_blocks=4 if use_eagle else 0,
         num_prefill_checkpoint_blocks=1,
     )
     producer = make_request("producer", list(range(prompt_tokens)), 128, sha256)
@@ -77,7 +78,11 @@ def test_eagle_resend_and_extension_reuse_prompt_checkpoint(
         "replay", list(range(prompt_tokens + extension_tokens)), 128, sha256
     )
     _, hit, _ = manager.get_computed_blocks(replay)
-    assert hit == prompt_tokens - 128
+    if not use_eagle and extension_tokens:
+        # Normal full-block caching can improve on the reusable checkpoint.
+        assert prompt_tokens - 128 <= hit <= prompt_tokens
+    else:
+        assert hit == prompt_tokens - 128
     _, connector_hit, _, _ = manager.get_computed_blocks_for_connector(replay)
     assert connector_hit == hit
 
@@ -2441,7 +2446,7 @@ def test_dcp_partial_hit_resumes_on_replicated_mamba_snapshot(
     assert manager.coordinator.single_type_managers[1].block_size == block_size
 
     prefix = list(range(12))
-    req0 = make_request("snapshot-owner", prefix, block_size, sha256)
+    req0 = make_request("snapshot-owner", prefix + [12], block_size, sha256)
     computed_blocks, num_computed, _ = manager.get_computed_blocks(req0)
     assert manager.allocate_slots(req0, 12, num_computed, computed_blocks) is not None
     manager.free(req0)
@@ -2478,7 +2483,7 @@ def test_dcp_joint_hit_is_bounded_by_replicated_mamba_snapshots():
         mamba_block_size=block_size,
     )
     prefix = list(range(12))
-    req0 = make_request("joint-owner", prefix, block_size, sha256)
+    req0 = make_request("joint-owner", prefix + [12], block_size, sha256)
     computed_blocks, num_computed, _ = manager.get_computed_blocks(req0)
     assert manager.allocate_slots(req0, 8, num_computed, computed_blocks) is not None
     manager.new_step_starts()

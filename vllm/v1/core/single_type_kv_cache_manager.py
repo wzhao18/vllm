@@ -861,34 +861,32 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         request: Request,
         num_tokens: int,
     ) -> None:
-        """Cache the attention proof for the reusable prompt tail.
-
-        Attention can prove both the prompt end and the resend boundary using
-        the same computed KV, without another Mamba checkpoint output.
-        """
+        """Cache one attention proof for the reusable prompt tail."""
         hash_block_size = self.block_pool.hash_block_size
-        prompt_end = request.num_prompt_tokens // hash_block_size * hash_block_size
-        boundaries = [prompt_end]
-        if not self.use_eagle and request.num_prompt_tokens % hash_block_size == 0:
-            boundaries.append(max(prompt_end - hash_block_size, 0))
+        # EAGLE lookup drops one hash unit from the attention proof.
+        proof_limit = (
+            request.num_prompt_tokens
+            if self.use_eagle
+            else request.num_prompt_tokens - 1
+        )
+        boundary_tokens = proof_limit // hash_block_size * hash_block_size
+        if (
+            boundary_tokens <= 0
+            or boundary_tokens > num_tokens
+            or boundary_tokens % self.block_size == 0
+        ):
+            return
+        block_idx = boundary_tokens // self.block_size
         blocks = self.req_to_blocks[request.request_id]
-        for boundary_tokens in boundaries:
-            if (
-                boundary_tokens == 0
-                or boundary_tokens > num_tokens
-                or boundary_tokens % self.block_size == 0
-            ):
-                continue
-            block_idx = boundary_tokens // self.block_size
-            if block_idx >= len(blocks):
-                continue
-            self.block_pool.cache_partial_block(
-                request=request,
-                block=blocks[block_idx],
-                num_tokens=boundary_tokens,
-                kv_cache_group_id=self.kv_cache_group_id,
-                block_size=self.block_size,
-            )
+        if block_idx >= len(blocks):
+            return
+        self.block_pool.cache_partial_block(
+            request=request,
+            block=blocks[block_idx],
+            num_tokens=boundary_tokens,
+            kv_cache_group_id=self.kv_cache_group_id,
+            block_size=self.block_size,
+        )
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         blocks = self.req_to_blocks[running_request_id]
