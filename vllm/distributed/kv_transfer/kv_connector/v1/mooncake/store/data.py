@@ -27,6 +27,15 @@ from vllm.v1.core.kv_cache_utils import (
 logger = init_logger(__name__)
 
 
+def partial_tail_block_range(
+    boundary: int, proof_end: int, block_size: int, lcm_block_size: int
+) -> range:
+    """Blocks covering the LCM gap, including the boundary's proof block."""
+    last_block = cdiv(proof_end, block_size) - 1
+    start = boundary // lcm_block_size * lcm_block_size
+    return range(min(start // block_size, last_block), last_block + 1)
+
+
 class BlobBlockHashes(Sequence[BlockHash]):
     """Lazy view over a flat buffer of fixed-size block hashes to avoid the overhead
     of materializing all hashes upfront.

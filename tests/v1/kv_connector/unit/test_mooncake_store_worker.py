@@ -1049,6 +1049,41 @@ def test_partial_tail_offload_skips_null_source_blocks():
     ]
 
 
+@pytest.mark.parametrize("saved_tokens", [0, 32])
+@pytest.mark.parametrize("use_eagle", [False, True])
+def test_tail_store_reads_only_lcm_gap_even_when_normal_save_lags(
+    saved_tokens, use_eagle
+):
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.side_effect = lambda keys, *a: [256] * len(keys)
+    thread = _make_partial_tail_send_thread(store)
+    thread.coord.eagle_proof_margin_by_group = {0: 4} if use_eagle else {}
+    thread._saved_offset["req-a"] = saved_tokens
+    hashes = [bytes([i]) for i in range(12)]
+    req = ReqMeta(
+        req_id="req-a",
+        token_len_chunk=0,
+        block_ids=(list(range(1, 14)), [0, 0, 0]),
+        block_hashes=hashes,
+        can_save=True,
+        boundary_state_offloads=[(1, 50, 44)],
+        num_prompt_tokens=49 if use_eagle else 45,
+        completed_token_len=49 if use_eagle else 45,
+    )
+    assert thread._maybe_offload_boundary_states(req)
+    keys, addresses, *_ = store.batch_put_from_multi_buffers.call_args.args
+    proof_end = 48 if use_eagle else 44
+    expected_keys = [
+        thread.token_databases[0].key_for(hashes[i]) for i in range(8, proof_end // 4)
+    ]
+    expected_keys.append(thread.token_databases[1].key_for(hashes[10]))
+    assert keys == expected_keys
+    assert addresses == [[0x1000 + (i + 1) * 256] for i in range(8, proof_end // 4)] + [
+        [0x2000 + 50 * 256]
+    ]
+
+
 def test_store_sending_thread_skips_null_sparse_group_blocks():
     from vllm.v1.kv_cache_interface import (
         FullAttentionSpec,
@@ -1335,7 +1370,7 @@ def test_mixed_snapshot_and_sub_block_offloads():
     req = ReqMeta(
         req_id="req-a",
         token_len_chunk=0,
-        block_ids=([1, 2, 3], [0, 0, 0]),
+        block_ids=(list(range(1, 12)), [0, 0, 0]),
         block_hashes=hs,
         can_save=True,
         boundary_state_offloads=[(1, 9, 32), (1, 7, 44)],
@@ -1347,18 +1382,18 @@ def test_mixed_snapshot_and_sub_block_offloads():
     assert keys == [
         # Aligned snapshot: boundary 32 from the handed-off block 9.
         db_mamba.key_for(BlockHash(hs[7])),
-        # Sub-block boundary 44: FA gap blocks ending at 4, 8, 12.
-        db_full.key_for(BlockHash(hs[0])),
-        db_full.key_for(BlockHash(hs[1])),
-        db_full.key_for(BlockHash(hs[2])),
+        # Sub-block boundary 44: FA gap blocks ending at 36, 40, 44.
+        db_full.key_for(BlockHash(hs[8])),
+        db_full.key_for(BlockHash(hs[9])),
+        db_full.key_for(BlockHash(hs[10])),
         # Mamba boundary block from the CoW hand-off (block 7).
         db_mamba.key_for(BlockHash(hs[10])),
     ]
     assert addrs == [
         [0x2000 + 9 * 256],
-        [0x1000 + 1 * 256],
-        [0x1000 + 2 * 256],
-        [0x1000 + 3 * 256],
+        [0x1000 + 9 * 256],
+        [0x1000 + 10 * 256],
+        [0x1000 + 11 * 256],
         [0x2000 + 7 * 256],
     ]
 
@@ -3645,6 +3680,7 @@ def test_mooncake_lookup_reuses_resolved_hash_checkpoint(
         ),
     ]
     config = SimpleNamespace(
+        speculative_config=None,
         kv_transfer_config=SimpleNamespace(
             kv_role="kv_both", kv_connector_extra_config={}
         ),

@@ -6,9 +6,12 @@ from collections.abc import Sequence
 from typing import NamedTuple, cast
 
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+    ReqMeta,
     chunk_hashes_for_block_size,
+    partial_tail_block_range,
 )
 from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -24,6 +27,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MambaSpec,
     UniformTypeKVCacheSpecs,
+    get_mamba_prefill_checkpoint_position,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
@@ -118,6 +122,54 @@ class MooncakeStoreCoordinator:
         # Mirror vLLM core's KVCacheCoordinator.retention_interval.
         self.retention_interval = retention_interval
         self._verify_and_split_kv_cache_groups()
+
+    def tail_block_ids(self, req_meta: ReqMeta) -> list[int]:
+        """Attention sources read by the partial-tail store path."""
+        if not self.enable_partial_hash_hits or not req_meta.block_hashes:
+            return []
+        boundaries = {
+            boundary
+            for group_id, _, boundary in req_meta.boundary_state_offloads or []
+            if boundary % self.kv_cache_groups[group_id].kv_cache_spec.block_size
+        }
+        completed = req_meta.completed_token_len
+        prompt_tokens = req_meta.num_prompt_tokens
+        if (
+            completed is not None
+            and prompt_tokens is not None
+            and 0 < prompt_tokens <= completed
+        ):
+            boundaries.add(
+                get_mamba_prefill_checkpoint_position(
+                    prompt_tokens,
+                    self.hash_block_size,
+                    bool(self.eagle_proof_margin_by_group),
+                )
+            )
+        block_ids: list[int] = []
+        for boundary in boundaries:
+            if boundary <= 0 or boundary // self.hash_block_size > len(
+                req_meta.block_hashes
+            ):
+                continue
+            for group_id in range(len(self.kv_cache_groups)):
+                if group_id in self.mamba_group_ids:
+                    continue
+                proof_end = boundary + self.eagle_proof_margin_by_group.get(group_id, 0)
+                if proof_end > (boundary if completed is None else completed):
+                    continue
+                if proof_end // self.hash_block_size > len(req_meta.block_hashes):
+                    continue
+                group_blocks = req_meta.block_ids[group_id]
+                block_size = self.kv_cache_groups[group_id].kv_cache_spec.block_size
+                block_ids.extend(
+                    group_blocks[idx]
+                    for idx in partial_tail_block_range(
+                        boundary, proof_end, block_size, self.lcm_block_size
+                    )
+                    if idx < len(group_blocks) and group_blocks[idx] != NULL_BLOCK_ID
+                )
+        return block_ids
 
     def align_lookup_length(self, length: int) -> int:
         alignment = (

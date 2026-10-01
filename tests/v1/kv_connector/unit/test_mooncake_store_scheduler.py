@@ -7,6 +7,9 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator import (
+    MooncakeStoreCoordinator,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
     LoadSpec,
     MooncakeLookupResult,
@@ -62,6 +65,30 @@ def _make_bare_scheduler(
     scheduler._next_store_job_id = 0
     scheduler._pinned_saves = {}
     scheduler._boundary_state_group_ids = frozenset({1})
+    scheduler._store_coord = MooncakeStoreCoordinator(
+        [
+            KVCacheGroupSpec(
+                ["attention"],
+                FullAttentionSpec(
+                    block_size=max(16, hash_block_size),
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=max(16, hash_block_size),
+                    shapes=((1,),),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+        max(16, hash_block_size),
+        hash_block_size,
+    )
     return scheduler
 
 
@@ -268,6 +295,7 @@ def _make_qsa_hybrid_cache_config():
 
 def test_scheduler_projects_nonprefix_groups_and_mamba_ids():
     vllm_config = SimpleNamespace(
+        speculative_config=None,
         kv_transfer_config=SimpleNamespace(
             kv_role="kv_both", kv_connector_extra_config={}
         ),
@@ -1159,6 +1187,67 @@ def test_finished_partial_tail_is_pre_pinned_as_store_job():
     scheduler.update_connector_output(_make_worker_output({req_meta.store_job_id: 1}))
     assert scheduler._gpu_block_pool.blocks[9].ref_cnt == 0
     assert scheduler._gpu_block_pool.blocks[3].ref_cnt == 0
+
+
+@pytest.mark.parametrize("attention_block_size", [4, 8])
+@pytest.mark.parametrize("use_eagle", [False, True])
+def test_finished_tail_releases_prefix_but_retains_proof_until_all_ranks_finish(
+    attention_block_size, use_eagle
+):
+    scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
+    scheduler._store_group_ids = (0, 1)
+    scheduler._num_workers = 2
+    groups = list(scheduler._store_coord.kv_cache_groups)
+    groups[0] = KVCacheGroupSpec(
+        ["attention"],
+        FullAttentionSpec(
+            block_size=attention_block_size,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+        ),
+        is_eagle_group=use_eagle,
+    )
+    scheduler._store_coord = MooncakeStoreCoordinator(groups, 16, 4, use_eagle)
+    prompt_tokens = 49 if use_eagle else 45
+    request = SimpleNamespace(
+        request_id="req-0",
+        block_hashes=[bytes([i]) for i in range(prompt_tokens // 4)],
+        num_computed_tokens=prompt_tokens,
+    )
+    attention_ids = list(
+        range(1, (prompt_tokens + attention_block_size - 1) // attention_block_size + 1)
+    )
+    scheduler._request_trackers["req-0"] = RequestTracker(
+        req_id="req-0",
+        token_len=prompt_tokens,
+        allocated_block_ids=(attention_ids, []),
+        prefill_end_tokens=prompt_tokens,
+    )
+    pool = scheduler._gpu_block_pool
+    owned_ids = attention_ids + [50]
+    pool.touch([pool.blocks[i] for i in owned_ids])
+    scheduler.register_finished_partial_tail(
+        request, (attention_ids, []), [(1, 50, 44)]
+    )
+    req_meta = scheduler._finished_partial_tail_metas["req-0"]
+    proof_end = 48 if use_eagle else 44
+    expected = attention_ids[
+        32 // attention_block_size : (proof_end + attention_block_size - 1)
+        // attention_block_size
+    ]
+    assert set(scheduler._pinned_saves[req_meta.store_job_id][0]) == {50, *expected}
+
+    # Request cleanup may recycle the prefix, but not any async-store source.
+    pool.free_blocks([pool.blocks[i] for i in owned_ids])
+    assert all(
+        pool.blocks[i].ref_cnt == (1 if i in expected else 0) for i in attention_ids
+    )
+    assert pool.blocks[50].ref_cnt == 1
+    scheduler.update_connector_output(_make_worker_output({req_meta.store_job_id: 1}))
+    assert all(pool.blocks[i].ref_cnt == 1 for i in expected + [50])
+    scheduler.update_connector_output(_make_worker_output({req_meta.store_job_id: 1}))
+    assert all(pool.blocks[i].ref_cnt == 0 for i in owned_ids)
 
 
 def test_decode_boundary_state_offload_dropped_unclaimed():

@@ -56,6 +56,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  
     StoreShardId,
     TailKeyBoundary,
     TPShardedStoreLayout,
+    partial_tail_block_range,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.protocol import (  # noqa: E501
     LOOKUP_MSG,
@@ -642,7 +643,6 @@ class KVCacheStoreSendingThread(KVTransferThread):
             return []
 
         mamba_offloads = {group_id: block_id for group_id, block_id, _ in entries}
-        saved = self._saved_offset.get(req_meta.req_id, 0)
         puts: list[tuple[str, list[int], list[int], KeyMetadata]] = []
         for g_idx, db in enumerate(self.token_databases):
             if not self.group_participates[g_idx]:
@@ -661,11 +661,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
             # Distribute across ranks by the same rule as normal chunks.
             put_step = self.group_put_steps[g_idx]
             put_step_rank = (self.tp_rank + g_idx) % put_step
-            # Always include the boundary block: its sub-hash key is written
-            # only here, even if normal saves already advanced past it.
-            last_block = cdiv(group_boundary, db.block_size) - 1
-            for block_idx in range(
-                min(saved // db.block_size, last_block), last_block + 1
+            # Earlier full blocks belong to normal save jobs, not this tail.
+            for block_idx in partial_tail_block_range(
+                boundary, group_boundary, db.block_size, self.coord.lcm_block_size
             ):
                 if block_idx % put_step != put_step_rank:
                     continue
