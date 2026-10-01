@@ -146,7 +146,6 @@ class KVCacheManager:
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
         enable_mamba_shared_prefix_checkpoint: bool = False,
-        allow_partial_hash_hits: bool = True,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -178,7 +177,6 @@ class KVCacheManager:
             hash_block_size=hash_block_size,
             metrics_collector=self.metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
-            allow_partial_hash_hits=allow_partial_hash_hits,
         )
         # One predicate, read by both sides of the feature, so the scheduler
         # cannot end a chunk at a junction the manager would refuse -- a refused
