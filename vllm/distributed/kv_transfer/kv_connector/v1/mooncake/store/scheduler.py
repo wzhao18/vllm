@@ -503,9 +503,14 @@ class MooncakeStoreScheduler:
                 "A null block cannot back a boundary-state offload"
             )
             if req_meta.token_len_chunk == 0:
+                # Tail-only save: pin the companion attention proof.
                 block_ids.extend(self._store_coord.tail_attention_block_ids(req_meta))
             else:
-                # Normal saves can retry from a rank's last successful offset.
+                # Normal prefix save: pin all attention sources for retries.
+                # Every allocated block is referenced, not just the ones covering
+                # this job's token range: a rank resumes from its own last
+                # successful offset, which lags the scheduler's whenever a save was
+                # skipped or failed, so it may read anywhere below the range.
                 block_ids.extend(
                     block_id
                     for group_id, group in enumerate(req_meta.block_ids)
