@@ -989,7 +989,23 @@ def _make_partial_tail_req(block_ids: list[int]) -> ReqMeta:
         block_hashes=[b"a0", b"a1", b"a2"],
         can_save=True,
         boundary_state_offloads=[(1, 7, 12)],
+        num_prompt_tokens=13,
     )
+
+
+@pytest.mark.parametrize("use_eagle", [False, True])
+def test_partial_tail_offload_rejects_wrong_prompt_boundary(use_eagle):
+    store = MagicMock()
+    thread = _make_partial_tail_send_thread(store)
+    thread.coord.eagle_proof_margin_by_group = {0: 4} if use_eagle else {}
+    req = _make_partial_tail_req([1, 2, 3])
+    req.num_prompt_tokens = 17 if use_eagle else 13
+    req.boundary_state_offloads = [(1, 7, 8)]
+
+    with pytest.raises(AssertionError, match="Mamba tail.*prompt checkpoint"):
+        thread._maybe_offload_boundary_states(req)
+    store.batch_is_exist.assert_not_called()
+    store.batch_put_from_multi_buffers.assert_not_called()
 
 
 def test_eagle_attention_proof_published_after_checkpoint_handoff():
@@ -1204,6 +1220,7 @@ def test_partial_tail_offload_skips_cap_omitted_mamba_group():
         can_save=True,
         # The scheduler accepted group 1 and omitted group 2 at boundary 12.
         boundary_state_offloads=[(1, 7, 12)],
+        num_prompt_tokens=13,
     )
     assert thread._maybe_offload_boundary_states(req)
 
@@ -1378,6 +1395,7 @@ def test_mixed_snapshot_and_sub_block_offloads():
         block_hashes=hs,
         can_save=True,
         boundary_state_offloads=[(1, 9, 32), (1, 7, 44)],
+        num_prompt_tokens=45,
     )
     assert thread._maybe_offload_boundary_states(req)
 

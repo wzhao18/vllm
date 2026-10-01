@@ -730,27 +730,25 @@ class KVCacheStoreSendingThread(KVTransferThread):
             return True
 
         mamba_snapshots: list[tuple[int, int, int]] = []
-        mamba_tails: dict[int, list[tuple[int, int, int]]] = {}
+        mamba_tails: list[tuple[int, int, int]] = []
         for group_id, block_id, boundary in mamba_offloads:
             entry = (group_id, block_id, boundary)
             if boundary % self.token_databases[group_id].block_size == 0:
                 mamba_snapshots.append(entry)
             else:
-                mamba_tails.setdefault(boundary, []).append(entry)
+                mamba_tails.append(entry)
 
         puts = self._boundary_snapshot_puts(req_meta, mamba_snapshots)
-        if publish_tail:
+        if self.coord.enable_partial_hash_hits and (mamba_tails or publish_tail):
             boundary = get_mamba_prefill_checkpoint_position(
                 num_prompt_tokens,
                 self.coord.hash_block_size,
                 bool(self.coord.eagle_proof_margin_by_group),
             )
-            mamba_tails.setdefault(boundary, [])
-        if self.coord.enable_partial_hash_hits:
-            for boundary, mamba_entries in mamba_tails.items():
-                puts.extend(
-                    self._sub_block_tail_puts(req_meta, boundary, mamba_entries)
-                )
+            assert all(position == boundary for _, _, position in mamba_tails), (
+                "Mamba tail offloads must match the prompt checkpoint boundary"
+            )
+            puts.extend(self._sub_block_tail_puts(req_meta, boundary, mamba_tails))
         puts = list({put[0]: put for put in puts}.values())
 
         if not puts:
