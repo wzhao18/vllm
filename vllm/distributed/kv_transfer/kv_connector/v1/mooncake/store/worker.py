@@ -615,8 +615,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
     def _sub_block_tail_puts(
         self,
         req_meta: ReqMeta,
+        boundary: int,
         entries: list[tuple[int, int, int]],
-        boundary: int | None = None,
     ) -> list[tuple[str, list[int], list[int], KeyMetadata]]:
         """Puts for the request's sub-block partial tail (its last prompt hash
         boundary), so a later request can hit the sub-block prefix.
@@ -629,13 +629,10 @@ class KVCacheStoreSendingThread(KVTransferThread):
         boundary block by the boundary sub-hash; a mamba "align" group
         contributes only its boundary block, from the core-provided CoW block.
         """
-        boundaries = {position for _, _, position in entries}
-        if boundary is None and len(boundaries) != 1:
+        if any(position != boundary for _, _, position in entries):
             raise ValueError(
                 "Sub-block partial-tail offloads for one request must share a boundary"
             )
-        if boundary is None:
-            boundary = boundaries.pop()
         hash_block_size = self.coord.hash_block_size
         if boundary == 0 or boundary // hash_block_size - 1 >= len(
             req_meta.block_hashes
@@ -737,14 +734,14 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
         puts = self._boundary_snapshot_puts(req_meta, snapshots)
         if sub_block and self.coord.enable_partial_hash_hits:
-            puts.extend(self._sub_block_tail_puts(req_meta, sub_block))
+            puts.extend(self._sub_block_tail_puts(req_meta, sub_block[0][2], sub_block))
         if publish_tail:
             boundary = get_mamba_prefill_checkpoint_position(
                 num_prompt_tokens,
                 self.coord.hash_block_size,
                 bool(self.coord.eagle_proof_margin_by_group),
             )
-            puts.extend(self._sub_block_tail_puts(req_meta, [], boundary))
+            puts.extend(self._sub_block_tail_puts(req_meta, boundary, []))
         puts = list({put[0]: put for put in puts}.values())
 
         if not puts:
