@@ -505,12 +505,7 @@ class Scheduler(SchedulerInterface):
             and junction <= request.num_prompt_tokens
             else block_floored
         )
-        retention_interval = self.cache_config.prefix_cache_retention_interval
         stops = (
-            # Materialize every requested retention checkpoint before passing it.
-            (start // retention_interval + 1) * retention_interval
-            if retention_interval
-            else 0,
             # Same invariant: a chunk starting mid-block stops at the boundary
             # rather than running past it.
             next_block_boundary
