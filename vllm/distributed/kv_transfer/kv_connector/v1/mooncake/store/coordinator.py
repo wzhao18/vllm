@@ -124,23 +124,13 @@ class MooncakeStoreCoordinator:
         self._verify_and_split_kv_cache_groups()
 
     def tail_attention_block_ids(self, req_meta: ReqMeta) -> list[int]:
-        """Return attention source IDs needed alongside Mamba tail checkpoints.
+        """Return full-attention block IDs needed to complete a Mamba tail hit.
 
-        A full-attention/Mamba prefix hit needs both attention KV through the
-        hit boundary and the Mamba state at that boundary. Select the full-
-        attention blocks not covered by normal LCM-aligned saves, including
-        any extra EAGLE proof coverage.
+        Include KV beyond normal LCM-aligned saves and any EAGLE proof margin.
+        For example, with LCM 16, attention blocks of 4 tokens, and a Mamba
+        checkpoint at 44, select the blocks covering [32, 44).
 
-        For example, without EAGLE, let the LCM/Mamba block size be 16, the
-        full-attention block size and hash unit be 4, and the Mamba checkpoint
-        be the state after 44 tokens in block ID 50. Normal attention saves
-        cover through token 32. If attention table indices 8, 9, 10 contain
-        IDs 18, 19, 20, return those IDs for KV ranges [32, 36), [36, 40),
-        [40, 44). Together with the earlier saved attention KV and Mamba
-        state 50, they provide the cache contents for a hit at token 44.
-
-        Mamba source IDs come from ``boundary_state_offloads`` and are not
-        returned here. The caller deduplicates and pins the selected IDs.
+        Mamba state IDs are handled separately.
         """
         if not self.enable_partial_hash_hits or not req_meta.block_hashes:
             return []

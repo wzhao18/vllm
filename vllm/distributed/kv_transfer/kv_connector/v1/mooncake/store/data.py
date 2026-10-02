@@ -30,16 +30,23 @@ logger = init_logger(__name__)
 def partial_tail_block_indices(
     boundary: int, proof_end: int, block_size: int, lcm_block_size: int
 ) -> range:
-    """Return logical block indices needed to store a partial tail.
+    """Return full-attention blocks IDs for the partial tail.
 
-    Token boundaries and block sizes use the same group-resolved units.
-    Include the gap after the normal save's LCM floor through ``proof_end``,
-    which may extend past ``boundary`` for EAGLE. Always include the final
-    proof block, even when the checkpoint is LCM-aligned.
+    Args:
+        boundary: Prefix-cache replay boundary.
+        proof_end: Full-attention boundary including the EAGLE margin;
+            When EAGLE is not used, this becomes same as boundary.
+        block_size: Physical block size.
+        lcm_block_size: LCM block size used for normal external saves.
+
+    Example: boundary=44, proof_end=48, block_size=4,
+    and lcm_block_size=16, return indices 8–11, covering [32, 48).
+    Without EAGLE, proof_end=44, the returned indices are 8–10.
+
     """
     last_block = cdiv(proof_end, block_size) - 1
     start = boundary // lcm_block_size * lcm_block_size
-    return range(min(start // block_size, last_block), last_block + 1)
+    return range(start // block_size, last_block + 1)
 
 
 class BlobBlockHashes(Sequence[BlockHash]):
@@ -782,7 +789,7 @@ class ReqMeta:
     # a non-aligned entry is the sub-block CoW tail. The store-job reference
     # keeps each exact block alive until every worker rank finishes the job.
     boundary_state_offloads: list[tuple[int, int, int]] | None = None
-    # The save range is LCM-rounded; proof publication needs the actual end.
+    # Total computed prefix length at the end of this step.
     completed_token_len: int | None = None
 
     @staticmethod
