@@ -2061,16 +2061,25 @@ class MambaManager(SingleTypeKVCacheManager):
                     self.drop_eagle_checkpoint_block,
                 )
             )
+            is_retained_checkpoint = False
+            if checkpoint_position % self.block_size == 0:
+                block_idx = checkpoint_position // self.block_size - 1
+                retained = self.reachable_block_mask(
+                    block_idx,
+                    block_idx + 1,
+                    self.cache_hit_alignment_tokens,
+                    self.kv_cache_spec,
+                    self.drop_eagle_checkpoint_block,
+                    retention_interval=retention_interval,
+                )
+                is_retained_checkpoint = retained is None or retained[0]
             if (
-                retention_interval is not None
-                and num_tokens < request.num_prompt_tokens
-                and not is_prompt_checkpoint
+                not is_prompt_checkpoint
+                and not is_retained_checkpoint
                 and checkpoint_position != request.shared_prefix_boundary
             ):
-                # Sparse retention keeps this transient checkpoint
-                # request-local. The slot may carry a hash from this step's
-                # full-block pass; that must go too, since the checkpoint
-                # state is about to overwrite the block.
+                # The transient state overwrites this slot, so neither it nor
+                # the full-block hash registered earlier this step is reusable.
                 self.block_pool._maybe_evict_cached_block(checkpoint_block)
                 return None
             if checkpoint_block.block_hash_num_tokens == checkpoint_position:

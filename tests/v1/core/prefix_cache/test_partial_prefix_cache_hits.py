@@ -670,48 +670,70 @@ def test_internal_checkpoint_uses_partial_hash_lifecycle():
     assert num_computed == 112
 
 
-@pytest.mark.parametrize(
-    "retention_interval,transient_published",
-    [(None, True), (0, False), (64, False), (256, False)],
-)
+@pytest.mark.parametrize("retention_interval", [None, 0, 32, 64, 256])
+@pytest.mark.parametrize("hash_block_size", [16, 32])
+@pytest.mark.parametrize("use_eagle", [False, True])
 def test_internal_checkpoint_publication_respects_retention(
-    retention_interval, transient_published
+    retention_interval, hash_block_size, use_eagle
 ):
-    """Sparse retention keeps transient internal checkpoints request-local.
-
-    Prompt-end checkpoints and dense retention (None) remain unchanged.
-    """
-    hash_block_size = 16
+    """Publish only retained block boundaries and the final prompt checkpoint."""
     manager = make_full_mamba_manager(
         dcp_world_size=1,
         hash_block_size=hash_block_size,
         full_block_size=hash_block_size,
         mamba_block_size=32,
         num_prefill_checkpoint_blocks=1,
+        use_eagle=use_eagle,
     )
     manager.coordinator.retention_interval = retention_interval
 
     request = make_request("producer", list(range(240)), hash_block_size, sha256)
     computed_blocks, num_computed, _ = manager.get_computed_blocks(request)
 
-    # Mid-prompt chunk: exports a transient checkpoint at 112.
+    # The EAGLE adjustment can make a chunk checkpoint block-aligned or partial.
     assert manager.allocate_slots(request, 128, num_computed, computed_blocks)
-    transient_hash = request.block_hashes[112 // hash_block_size - 1]
+    checkpoint = (128 if use_eagle else 127) // hash_block_size * hash_block_size - (
+        hash_block_size if use_eagle else 0
+    )
+    retained_checkpoint = checkpoint % 32 == 0 and (
+        retention_interval is None
+        or (retention_interval > 0 and checkpoint % retention_interval == 0)
+    )
+    transient_hash = request.block_hashes[checkpoint // hash_block_size - 1]
     transient_hit = manager.block_pool.get_cached_block(transient_hash, [1])
-    assert (transient_hit is not None) == transient_published
+    assert (transient_hit is not None) == retained_checkpoint
     offloads = drain_boundary_state_offloads(manager).get(request.request_id, [])
-    assert any(position == 112 for _, _, position in offloads) == transient_published
-    if retention_interval == 64:
+    assert any(position == checkpoint for _, _, position in offloads) == (
+        retained_checkpoint
+    )
+    assert all(
+        position % 32 == 0
+        and (
+            retention_interval is None
+            or (retention_interval > 0 and position % retention_interval == 0)
+        )
+        for _, _, position in offloads
+    )
+    if retention_interval in (None, 32, 64):
         retained_hash = request.block_hashes[128 // hash_block_size - 1]
         assert manager.block_pool.get_cached_block(retained_hash, [1]) is not None
 
     request.num_computed_tokens = 128
     manager.new_step_starts()
 
-    # Final chunk: the prompt-end checkpoint at 224 stays published.
+    # The final checkpoint is reusable regardless of the retention interval.
     assert manager.allocate_slots(request, 112) is not None
-    end_hash = request.block_hashes[224 // hash_block_size - 1]
+    prompt_checkpoint = (
+        240 if use_eagle else 239
+    ) // hash_block_size * hash_block_size - (hash_block_size if use_eagle else 0)
+    end_hash = request.block_hashes[prompt_checkpoint // hash_block_size - 1]
     assert manager.block_pool.get_cached_block(end_hash, [1]) is not None
+    assert any(
+        position == prompt_checkpoint
+        for _, _, position in drain_boundary_state_offloads(manager).get(
+            request.request_id, []
+        )
+    )
 
 
 def test_transient_checkpoint_evicts_retained_boundary_hash():
