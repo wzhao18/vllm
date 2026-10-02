@@ -780,7 +780,7 @@ class ReqMeta:
     # Absolute request offset represented by token_ids[0].
     token_ids_start: int = 0
     num_prompt_tokens: int | None = None
-    # Save horizon includes generated tokens replayed after preemption.
+    # Total prefill tokens, including generated tokens replayed after preemption.
     prefill_end_tokens: int | None = None
     # Identifies this store job for the engine's lifetime. A request id cannot
     # serve that purpose: it is reused once a preempted request resumes, so it
