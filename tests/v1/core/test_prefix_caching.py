@@ -4834,9 +4834,9 @@ def test_hybrid_mamba_retention_mtp_resend_of_aligned_prompt():
         assert blocks is not None
         req0.num_computed_tokens = chunk_end
 
-    # Only the reusable checkpoint at 96 (block 2) needs to survive retention.
+    # Both materialized replay checkpoints survive; resend and extension use 96.
     pool = manager.block_pool
-    expected_mamba_cached = {2}
+    expected_mamba_cached = {1, 2}
     for i in range(4):
         cached = pool.get_cached_block(req0.block_hashes[i], kv_cache_group_ids=[1])
         if i in expected_mamba_cached:

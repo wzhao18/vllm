@@ -798,24 +798,6 @@ def test_from_request_tracker_load_overrides_caller_skip_save():
     assert tracker.num_saved_tokens == 0
 
 
-def test_prefill_completion_emits_proof_job_without_new_lcm_block():
-    tracker = RequestTracker(
-        req_id="tail",
-        token_len=8,
-        allocated_block_ids=([1], [2]),
-        prefill_end_tokens=13,
-    )
-    assert ReqMeta.from_request_tracker(tracker, 16, save_partial_tail=True) is None
-    tracker.token_len = 13
-    metadata = ReqMeta.from_request_tracker(tracker, 16, save_partial_tail=True)
-    assert metadata is not None
-    assert metadata.can_save
-    assert metadata.token_len_chunk == 0
-    assert metadata.completed_token_len == 13
-    assert metadata.boundary_state_offloads is None
-    assert ReqMeta.from_request_tracker(tracker, 16, save_partial_tail=True) is None
-
-
 def test_from_request_tracker_load_with_can_load_false_still_saves():
     # A LoadSpec with can_load=False (e.g., no external tokens to load after
     # update_state_after_alloc) must not suppress the save.
@@ -842,13 +824,19 @@ def test_from_request_tracker_load_with_can_load_false_still_saves():
     assert tracker.num_saved_tokens == 48
 
 
-def test_from_request_tracker_no_load_saves_normally():
+@pytest.mark.parametrize("token_len,save_partial_tail", [(48, False), (13, True)])
+def test_from_request_tracker_no_load_saves_normally(token_len, save_partial_tail):
     tracker = RequestTracker(
         req_id="req-0",
-        token_len=48,
+        token_len=token_len,
         allocated_block_ids=([0, 1, 2],),
         num_saved_tokens=0,
+        prefill_end_tokens=token_len,
     )
+    if save_partial_tail:
+        tracker.token_len = 8
+        assert ReqMeta.from_request_tracker(tracker, 16, save_partial_tail=True) is None
+        tracker.token_len = token_len
 
     req_meta = ReqMeta.from_request_tracker(
         tracker,
@@ -856,12 +844,20 @@ def test_from_request_tracker_no_load_saves_normally():
         load_spec=None,
         skip_save=False,
         block_hashes=[b"h0", b"h1", b"h2"],
+        save_partial_tail=save_partial_tail,
     )
 
     assert req_meta is not None
     assert req_meta.can_save is True
     assert req_meta.load_spec is None
-    assert tracker.num_saved_tokens == 48
+    assert req_meta.token_len_chunk == token_len // 16 * 16
+    assert req_meta.completed_token_len == token_len
+    assert req_meta.boundary_state_offloads is None
+    assert tracker.num_saved_tokens == token_len // 16 * 16
+    assert (
+        ReqMeta.from_request_tracker(tracker, 16, save_partial_tail=save_partial_tail)
+        is None
+    )
 
 
 class _StubLookupClient:
@@ -1064,7 +1060,7 @@ def _add_pending_partial_tail_request(
         all_token_ids=list(range(num_tokens)),
         block_hashes=block_hashes,
         num_output_placeholders=0,
-        num_prompt_tokens=12,
+        num_prompt_tokens=13,
     )
     scheduler._unfinished_requests["req-0"] = (request, block_ids)
     scheduler._request_trackers["req-0"] = RequestTracker(
@@ -1103,7 +1099,7 @@ def test_pending_partial_tail_emits_offload_only_reqmeta():
     scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
     out = _add_pending_partial_tail_request(
         scheduler,
-        num_tokens=12,
+        num_tokens=13,
         block_hashes=[b"h0", b"h1", b"h2"],
         block_ids=([0],),
     )
@@ -1116,7 +1112,7 @@ def test_pending_partial_tail_emits_offload_only_reqmeta():
     assert req_meta.can_save is True
     assert req_meta.token_len_chunk == 0
     assert req_meta.boundary_state_offloads == [(1, 7, 12)]
-    assert req_meta.num_prompt_tokens == 12
+    assert req_meta.num_prompt_tokens == 13
     assert req_meta.block_ids == ([0],)
     store_job_id = req_meta.store_job_id
     assert scheduler._pinned_saves[store_job_id][0] == [7]
@@ -1127,35 +1123,68 @@ def test_pending_partial_tail_emits_offload_only_reqmeta():
     assert tracker.has_pending_offload is True
 
 
-def test_finished_partial_tail_is_pre_pinned_as_store_job():
+@pytest.mark.parametrize("attention_block_size", [4, 8, 16])
+@pytest.mark.parametrize("use_eagle", [False, True])
+@pytest.mark.parametrize("num_workers", [1, 2])
+def test_finished_partial_tail_is_pre_pinned_as_store_job(
+    attention_block_size, use_eagle, num_workers
+):
     scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
     scheduler._store_group_ids = (0, 1)
     scheduler.client = SimpleNamespace(discard=lambda *_: None)
+    scheduler._num_workers = num_workers
+    groups = list(scheduler._store_coord.kv_cache_groups)
+    groups[0] = KVCacheGroupSpec(
+        ["attention"],
+        FullAttentionSpec(
+            block_size=attention_block_size,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+        ),
+        is_eagle_group=use_eagle,
+    )
+    scheduler._store_coord = MooncakeStoreCoordinator(groups, 16, 4, use_eagle)
+    prompt_tokens = 49 if use_eagle else 45
+    attention_ids = list(
+        range(1, (prompt_tokens + attention_block_size - 1) // attention_block_size + 1)
+    )
+    block_ids = (attention_ids, [50])
     request = SimpleNamespace(
         request_id="req-0",
-        block_hashes=[b"h0", b"h1", b"h2"],
-        num_computed_tokens=12,
+        block_hashes=[bytes([i]) for i in range(prompt_tokens // 4)],
+        num_computed_tokens=prompt_tokens,
     )
     scheduler._request_trackers["req-0"] = RequestTracker(
         req_id="req-0",
-        token_len=12,
-        allocated_block_ids=([3], [9]),
-        token_ids=list(range(12)),
-        prefill_end_tokens=12,
+        token_len=prompt_tokens,
+        allocated_block_ids=block_ids,
+        token_ids=list(range(prompt_tokens)),
+        prefill_end_tokens=prompt_tokens,
     )
-    block_ids = ([3], [9])
+    pool = scheduler._gpu_block_pool
+    owned_ids = attention_ids + [50]
+    pool.touch([pool.blocks[i] for i in owned_ids])
 
     delay_free = scheduler.register_finished_partial_tail(
         request,
         block_ids,
-        [(1, 9, 12)],
+        [(1, 50, 44)],
     )
 
     # The exact source is pinned immediately, so the request can be freed
     # before the next connector metadata build.
     assert delay_free is False
-    assert scheduler._gpu_block_pool.blocks[9].ref_cnt == 1
-    assert scheduler._gpu_block_pool.blocks[3].ref_cnt == 1
+    proof_end = 48 if use_eagle else 44
+    expected = attention_ids[
+        32 // attention_block_size : (proof_end + attention_block_size - 1)
+        // attention_block_size
+    ]
+    pool.free_blocks([pool.blocks[i] for i in owned_ids])
+    assert all(
+        pool.blocks[i].ref_cnt == (1 if i in expected else 0) for i in attention_ids
+    )
+    assert pool.blocks[50].ref_cnt == 1
 
     out = SimpleNamespace(
         finished_req_ids={"req-0"},
@@ -1179,73 +1208,16 @@ def test_finished_partial_tail_is_pre_pinned_as_store_job():
     assert req_meta.token_len_chunk == 0
     assert req_meta.block_ids == block_ids
     assert req_meta.block_hashes == request.block_hashes
-    assert req_meta.boundary_state_offloads == [(1, 9, 12)]
-    assert scheduler._pinned_saves[req_meta.store_job_id][0] == [9, 3]
-    assert scheduler._gpu_block_pool.blocks[9].ref_cnt == 1
+    assert req_meta.boundary_state_offloads == [(1, 50, 44)]
+    assert set(scheduler._pinned_saves[req_meta.store_job_id][0]) == {50, *expected}
+    assert all(pool.blocks[i].ref_cnt == 1 for i in expected + [50])
     assert scheduler._finished_partial_tail_metas == {}
 
-    scheduler.update_connector_output(_make_worker_output({req_meta.store_job_id: 1}))
-    assert scheduler._gpu_block_pool.blocks[9].ref_cnt == 0
-    assert scheduler._gpu_block_pool.blocks[3].ref_cnt == 0
-
-
-@pytest.mark.parametrize("attention_block_size", [4, 8])
-@pytest.mark.parametrize("use_eagle", [False, True])
-def test_finished_tail_releases_prefix_but_retains_proof_until_all_ranks_finish(
-    attention_block_size, use_eagle
-):
-    scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
-    scheduler._store_group_ids = (0, 1)
-    scheduler._num_workers = 2
-    groups = list(scheduler._store_coord.kv_cache_groups)
-    groups[0] = KVCacheGroupSpec(
-        ["attention"],
-        FullAttentionSpec(
-            block_size=attention_block_size,
-            num_kv_heads=1,
-            head_size=1,
-            dtype=torch.float32,
-        ),
-        is_eagle_group=use_eagle,
-    )
-    scheduler._store_coord = MooncakeStoreCoordinator(groups, 16, 4, use_eagle)
-    prompt_tokens = 49 if use_eagle else 45
-    request = SimpleNamespace(
-        request_id="req-0",
-        block_hashes=[bytes([i]) for i in range(prompt_tokens // 4)],
-        num_computed_tokens=prompt_tokens,
-    )
-    attention_ids = list(
-        range(1, (prompt_tokens + attention_block_size - 1) // attention_block_size + 1)
-    )
-    scheduler._request_trackers["req-0"] = RequestTracker(
-        req_id="req-0",
-        token_len=prompt_tokens,
-        allocated_block_ids=(attention_ids, []),
-        prefill_end_tokens=prompt_tokens,
-    )
-    pool = scheduler._gpu_block_pool
-    owned_ids = attention_ids + [50]
-    pool.touch([pool.blocks[i] for i in owned_ids])
-    scheduler.register_finished_partial_tail(
-        request, (attention_ids, []), [(1, 50, 44)]
-    )
-    req_meta = scheduler._finished_partial_tail_metas["req-0"]
-    proof_end = 48 if use_eagle else 44
-    expected = attention_ids[
-        32 // attention_block_size : (proof_end + attention_block_size - 1)
-        // attention_block_size
-    ]
-    assert set(scheduler._pinned_saves[req_meta.store_job_id][0]) == {50, *expected}
-
-    # Request cleanup may recycle the prefix, but not any async-store source.
-    pool.free_blocks([pool.blocks[i] for i in owned_ids])
-    assert all(
-        pool.blocks[i].ref_cnt == (1 if i in expected else 0) for i in attention_ids
-    )
-    assert pool.blocks[50].ref_cnt == 1
-    scheduler.update_connector_output(_make_worker_output({req_meta.store_job_id: 1}))
-    assert all(pool.blocks[i].ref_cnt == 1 for i in expected + [50])
+    for _ in range(num_workers - 1):
+        scheduler.update_connector_output(
+            _make_worker_output({req_meta.store_job_id: 1})
+        )
+        assert all(pool.blocks[i].ref_cnt == 1 for i in expected + [50])
     scheduler.update_connector_output(_make_worker_output({req_meta.store_job_id: 1}))
     assert all(pool.blocks[i].ref_cnt == 0 for i in owned_ids)
 
@@ -1354,7 +1326,7 @@ def test_resumed_prefill_claims_boundaries_past_prompt_length():
     # missing for boundaries full attention does store and no joint hit could
     # complete there.
     scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
-    _register_offload_request(scheduler, prefill_end_tokens=20, num_prompt_tokens=12)
+    _register_offload_request(scheduler, prefill_end_tokens=21, num_prompt_tokens=13)
     out = _make_offload_only_output([(1, 7, 16), (1, 9, 20), (1, 11, 24)])
 
     meta = scheduler.build_connector_meta(out)
@@ -1569,7 +1541,7 @@ def test_partial_tail_cow_block_is_referenced_for_the_job():
     scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
     out = _add_pending_partial_tail_request(
         scheduler,
-        num_tokens=12,
+        num_tokens=13,
         block_hashes=[b"h0", b"h1", b"h2"],
         block_ids=([0],),
     )

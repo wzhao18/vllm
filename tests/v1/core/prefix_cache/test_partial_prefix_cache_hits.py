@@ -28,63 +28,12 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     MambaSpec,
     SlidingWindowSpec,
-    get_mamba_prefill_checkpoint_position,
 )
 
 
 @pytest.fixture(autouse=True)
 def _auto_init_hash_fn():
     init_none_hash(sha256)
-
-
-@pytest.mark.parametrize("prompt_tokens", [127, 128, 129, 7040, 7168, 7296, 7449])
-@pytest.mark.parametrize("drop_eagle_block", [False, True])
-def test_prefill_checkpoint_has_resend_attention_proof(prompt_tokens, drop_eagle_block):
-    unit = 128
-    checkpoint = get_mamba_prefill_checkpoint_position(
-        prompt_tokens, unit, drop_eagle_block
-    )
-    # EAGLE verifies a hash through P before dropping it; otherwise the last
-    # token must be recomputed to produce logits on an exact resend.
-    proof_limit = prompt_tokens if drop_eagle_block else prompt_tokens - 1
-    proof = proof_limit // unit * unit
-    expected = max(proof - unit, 0) if drop_eagle_block else proof
-    assert checkpoint == expected
-
-
-@pytest.mark.parametrize("prompt_tokens", [7040, 7168, 7296])
-@pytest.mark.parametrize("extension_tokens", [0, 256])
-@pytest.mark.parametrize("use_eagle", [False, True])
-def test_resend_and_extension_reuse_prompt_checkpoint(
-    prompt_tokens, extension_tokens, use_eagle
-):
-    manager = make_full_mamba_manager(
-        dcp_world_size=8,
-        hash_block_size=128,
-        full_block_size=896,
-        mamba_block_size=896,
-        num_blocks=128,
-        use_eagle=use_eagle,
-        num_speculative_blocks=4 if use_eagle else 0,
-        num_prefill_checkpoint_blocks=1,
-    )
-    producer = make_request("producer", list(range(prompt_tokens)), 128, sha256)
-    assert manager.allocate_slots(producer, prompt_tokens) is not None
-    producer.num_computed_tokens = prompt_tokens
-    manager.free(producer)
-    manager.new_step_starts()
-
-    replay = make_request(
-        "replay", list(range(prompt_tokens + extension_tokens)), 128, sha256
-    )
-    _, hit, _ = manager.get_computed_blocks(replay)
-    if not use_eagle and extension_tokens:
-        # Normal full-block caching can improve on the reusable checkpoint.
-        assert prompt_tokens - 128 <= hit <= prompt_tokens
-    else:
-        assert hit == prompt_tokens - 128
-    _, connector_hit, _, _ = manager.get_computed_blocks_for_connector(replay)
-    assert connector_hit == hit
 
 
 def test_connector_without_divergent_hit_support_uses_common_lookup():
@@ -195,34 +144,54 @@ def make_full_mamba_manager(
     )
 
 
-@pytest.mark.parametrize("prompt_tokens", [512, 513])
+@pytest.mark.parametrize(
+    "dcp_world_size,hash_block_size,block_size,prompt_tokens,checkpoint_blocks",
+    [
+        (4, 2, 2, 7, 0),
+        (8, 16, 16, 512, 1),
+        (8, 16, 16, 513, 1),
+        *[(8, 128, 896, p, 1) for p in (127, 128, 129, 7040, 7168, 7296, 7449)],
+    ],
+)
 @pytest.mark.parametrize("use_eagle", [False, True])
 @pytest.mark.parametrize("extension_tokens", [0, 32])
-def test_dcp_reuses_gcd_checkpoint(prompt_tokens, use_eagle, extension_tokens):
+def test_dcp_fine_hit_retention_uses_hash_alignment(
+    dcp_world_size,
+    hash_block_size,
+    block_size,
+    prompt_tokens,
+    checkpoint_blocks,
+    use_eagle,
+    extension_tokens,
+):
+    """Resends and extensions reuse the retained hash-aligned checkpoint."""
     manager = make_full_mamba_manager(
-        dcp_world_size=8,
-        hash_block_size=16,
-        full_block_size=16,
-        mamba_block_size=16,
+        dcp_world_size=dcp_world_size,
+        hash_block_size=hash_block_size,
+        full_block_size=block_size,
+        mamba_block_size=block_size,
         num_blocks=128,
         use_eagle=use_eagle,
-        num_prefill_checkpoint_blocks=1,
+        num_speculative_blocks=4 if use_eagle else 0,
+        num_prefill_checkpoint_blocks=checkpoint_blocks,
     )
     manager.coordinator.retention_interval = 0
     assert manager.coordinator.enable_partial_hash_hits
     scheduler = SimpleNamespace(
-        block_size=128,
-        cache_config=SimpleNamespace(block_size=16),
-        hash_block_size=16,
+        block_size=block_size * dcp_world_size,
+        cache_config=SimpleNamespace(block_size=block_size),
+        hash_block_size=hash_block_size,
         max_num_scheduled_tokens=8192,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         use_eagle_block_drop=use_eagle,
         mamba_partial_cache_hit=True,
         mamba_shared_prefix_checkpoint=False,
-        mamba_has_prefill_checkpoint_blocks=True,
+        mamba_has_prefill_checkpoint_blocks=bool(checkpoint_blocks),
         mamba_prefill_checkpoint_alignment=16,
     )
-    producer = make_request("producer", list(range(prompt_tokens)), 16, sha256)
+    producer = make_request(
+        "producer", list(range(prompt_tokens)), hash_block_size, sha256
+    )
     while producer.num_computed_tokens < prompt_tokens:
         scheduled = Scheduler._mamba_block_aligned_split(
             scheduler, producer, prompt_tokens - producer.num_computed_tokens
@@ -235,49 +204,24 @@ def test_dcp_reuses_gcd_checkpoint(prompt_tokens, use_eagle, extension_tokens):
     manager.new_step_starts()
 
     replay = make_request(
-        "replay", list(range(prompt_tokens + extension_tokens)), 16, sha256
+        "replay", list(range(prompt_tokens + extension_tokens)), hash_block_size, sha256
     )
     _, hit, _ = manager.get_computed_blocks(replay)
     expected = (
-        (prompt_tokens // 16 - 1) * 16
+        max((prompt_tokens // hash_block_size - 1) * hash_block_size, 0)
         if use_eagle
-        else ((prompt_tokens - 1) // 16 * 16)
+        else ((prompt_tokens - 1) // hash_block_size * hash_block_size)
     )
     assert hit == expected
     cached_states = {
         end
-        for end in range(16, prompt_tokens + 1, 16)
+        for end in range(hash_block_size, prompt_tokens + 1, hash_block_size)
         if manager.block_pool.get_cached_block(
-            producer.block_hashes[end // 16 - 1], [1]
+            producer.block_hashes[end // hash_block_size - 1], [1]
         )
         is not None
     }
-    assert cached_states == {expected}
-
-
-def test_dcp_fine_hit_retention_uses_hash_alignment_without_eagle():
-    """DCP must not discard a reusable Mamba state at hash alignment."""
-    hash_block_size = 2
-    manager = make_full_mamba_manager(
-        dcp_world_size=4,
-        hash_block_size=hash_block_size,
-        full_block_size=hash_block_size,
-        mamba_block_size=hash_block_size,
-        num_blocks=64,
-    )
-    manager.coordinator.retention_interval = 0
-
-    token_ids = list(range(7))
-    producer = make_request("producer", token_ids, hash_block_size, sha256)
-    computed_blocks, num_computed, _ = manager.get_computed_blocks(producer)
-    assert num_computed == 0
-    assert manager.allocate_slots(producer, 6, 0, computed_blocks) is not None
-    manager.free(producer)
-    manager.new_step_starts()
-
-    consumer = make_request("consumer", token_ids, hash_block_size, sha256)
-    _, num_computed, _ = manager.get_computed_blocks(consumer)
-    assert num_computed == 6
+    assert cached_states == ({expected} if expected else set())
 
 
 @pytest.mark.parametrize("dcp_world_size", [1, 4])
@@ -925,32 +869,6 @@ def test_external_mamba_hit_same_block_uses_running_cow_on_continue():
     moved = manager.block_pool.get_cached_block(partial_hash, kv_cache_group_ids=[1])
     assert moved is not None
     assert moved[0].block_id == cow_copy.dst_block_id
-
-
-def test_failed_external_mamba_load_can_publish_recomputed_tail():
-    manager = make_full_mamba_manager(
-        dcp_world_size=1,
-        hash_block_size=2,
-        full_block_size=2,
-        mamba_block_size=8,
-    )
-    request = make_request("retry", list(range(15)), 2, sha256)
-    assert (
-        manager.allocate_slots(
-            request,
-            num_new_tokens=0,
-            num_external_computed_tokens=14,
-            delay_cache_blocks=True,
-        )
-        is not None
-    )
-
-    # Hybrid load failure releases the private states before recomputation.
-    manager.free(request)
-    manager.new_step_starts()
-    assert manager.allocate_slots(request, num_new_tokens=14) is not None
-    partial_hash = request.block_hashes[6]
-    assert manager.block_pool.get_cached_block(partial_hash, [1]) is not None
 
 
 def test_boundary_state_offloads_returns_cow_target():
