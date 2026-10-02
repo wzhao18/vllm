@@ -2062,12 +2062,12 @@ class MambaManager(SingleTypeKVCacheManager):
                 )
             )
             if (
-                retention_interval == 0
+                retention_interval is not None
                 and num_tokens < request.num_prompt_tokens
                 and not is_prompt_checkpoint
                 and checkpoint_position != request.shared_prefix_boundary
             ):
-                # retention_interval == 0 keeps this transient checkpoint
+                # Sparse retention keeps this transient checkpoint
                 # request-local. The slot may carry a hash from this step's
                 # full-block pass; that must go too, since the checkpoint
                 # state is about to overwrite the block.

@@ -728,15 +728,14 @@ def test_internal_checkpoint_uses_partial_hash_lifecycle():
 
 @pytest.mark.parametrize(
     "retention_interval,transient_published",
-    [(None, True), (0, False)],
+    [(None, True), (0, False), (64, False), (256, False)],
 )
 def test_internal_checkpoint_publication_respects_retention(
     retention_interval, transient_published
 ):
-    """With retention_interval=0, a mid-prompt internal checkpoint is
-    request-local and must not enter the prefix cache; the prompt-end
-    checkpoint keeps the existing publication behavior. Dense retention
-    (None) is unchanged.
+    """Sparse retention keeps transient internal checkpoints request-local.
+
+    Prompt-end checkpoints and dense retention (None) remain unchanged.
     """
     hash_block_size = 16
     manager = make_full_mamba_manager(
@@ -756,6 +755,11 @@ def test_internal_checkpoint_publication_respects_retention(
     transient_hash = request.block_hashes[112 // hash_block_size - 1]
     transient_hit = manager.block_pool.get_cached_block(transient_hash, [1])
     assert (transient_hit is not None) == transient_published
+    offloads = drain_boundary_state_offloads(manager).get(request.request_id, [])
+    assert any(position == 112 for _, _, position in offloads) == transient_published
+    if retention_interval == 64:
+        retained_hash = request.block_hashes[128 // hash_block_size - 1]
+        assert manager.block_pool.get_cached_block(retained_hash, [1]) is not None
 
     request.num_computed_tokens = 128
     manager.new_step_starts()
