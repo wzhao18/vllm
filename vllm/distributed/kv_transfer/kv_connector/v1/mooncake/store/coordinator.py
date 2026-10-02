@@ -134,48 +134,48 @@ class MooncakeStoreCoordinator:
         """
         if not self.enable_partial_hash_hits or not req_meta.block_hashes:
             return []
-        boundaries = {
+        mamba_tails = [
             boundary
             for group_id, _, boundary in req_meta.boundary_state_offloads or []
             if boundary % self.kv_cache_groups[group_id].kv_cache_spec.block_size
-        }
+        ]
         completed = req_meta.completed_token_len
         prompt_tokens = req_meta.num_prompt_tokens
-        if (
-            completed is not None
-            and prompt_tokens is not None
-            and 0 < prompt_tokens <= completed
+        if prompt_tokens is None:
+            assert not mamba_tails, "Mamba tail offloads require the prompt length"
+            return []
+        boundary = get_mamba_prefill_checkpoint_position(
+            prompt_tokens,
+            self.hash_block_size,
+            bool(self.eagle_proof_margin_by_group),
+        )
+        assert all(position == boundary for position in mamba_tails), (
+            "Mamba tail offloads must match the prompt checkpoint boundary"
+        )
+        if not mamba_tails and (completed is None or prompt_tokens > completed):
+            return []
+        if boundary <= 0 or boundary // self.hash_block_size > len(
+            req_meta.block_hashes
         ):
-            boundaries.add(
-                get_mamba_prefill_checkpoint_position(
-                    prompt_tokens,
-                    self.hash_block_size,
-                    bool(self.eagle_proof_margin_by_group),
-                )
-            )
+            return []
         block_ids: list[int] = []
-        for boundary in boundaries:
-            if boundary <= 0 or boundary // self.hash_block_size > len(
-                req_meta.block_hashes
-            ):
+        for group_id in range(len(self.kv_cache_groups)):
+            if group_id in self.mamba_group_ids:
                 continue
-            for group_id in range(len(self.kv_cache_groups)):
-                if group_id in self.mamba_group_ids:
-                    continue
-                proof_end = boundary + self.eagle_proof_margin_by_group.get(group_id, 0)
-                if proof_end > (boundary if completed is None else completed):
-                    continue
-                if proof_end // self.hash_block_size > len(req_meta.block_hashes):
-                    continue
-                group_blocks = req_meta.block_ids[group_id]
-                block_size = self.kv_cache_groups[group_id].kv_cache_spec.block_size
-                block_ids.extend(
-                    group_blocks[idx]
-                    for idx in partial_tail_block_indices(
-                        boundary, proof_end, block_size, self.lcm_block_size
-                    )
-                    if idx < len(group_blocks) and group_blocks[idx] != NULL_BLOCK_ID
+            proof_end = boundary + self.eagle_proof_margin_by_group.get(group_id, 0)
+            if proof_end > (boundary if completed is None else completed):
+                continue
+            if proof_end // self.hash_block_size > len(req_meta.block_hashes):
+                continue
+            group_blocks = req_meta.block_ids[group_id]
+            block_size = self.kv_cache_groups[group_id].kv_cache_spec.block_size
+            block_ids.extend(
+                group_blocks[idx]
+                for idx in partial_tail_block_indices(
+                    boundary, proof_end, block_size, self.lcm_block_size
                 )
+                if idx < len(group_blocks) and group_blocks[idx] != NULL_BLOCK_ID
+            )
         return block_ids
 
     def align_lookup_length(self, length: int) -> int:
