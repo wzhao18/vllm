@@ -895,7 +895,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             store_masks = self.coord.store_mask(
                 token_len,
                 save_start,
-                num_prompt_tokens=req_meta.num_prompt_tokens,
+                num_prompt_tokens=req_meta.prefill_end_tokens,
             )
 
             starts: list[int] = []

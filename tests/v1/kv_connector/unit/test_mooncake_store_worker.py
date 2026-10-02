@@ -1451,6 +1451,7 @@ def test_store_sending_thread_delta_saves_only_new_masked_chunks():
             [True, False],
         ),
     )
+    coord.store_mask = MagicMock(side_effect=coord.store_mask)
 
     db_full = ChunkedTokenDatabase(
         KeyMetadata("test-model", 0, 0, 0, 0, group_id=0),
@@ -1480,6 +1481,8 @@ def test_store_sending_thread_delta_saves_only_new_masked_chunks():
             block_ids=([0, 1, 2, 3], [0, 1, 2, 3]),
             block_hashes=[b"a0", b"a1", b"a2", b"a3"],
             can_save=True,
+            num_prompt_tokens=33,
+            prefill_end_tokens=64,
         ),
     )
 
@@ -1489,6 +1492,7 @@ def test_store_sending_thread_delta_saves_only_new_masked_chunks():
 
     assert full_hashes == [b"a2".hex(), b"a3".hex()]
     assert masked_hashes == [b"a2".hex()]
+    coord.store_mask.assert_called_once_with(64, 32, num_prompt_tokens=64)
 
 
 def test_store_sending_thread_prepares_missing_chunks_once_per_group():

@@ -780,6 +780,8 @@ class ReqMeta:
     # Absolute request offset represented by token_ids[0].
     token_ids_start: int = 0
     num_prompt_tokens: int | None = None
+    # Save horizon includes generated tokens replayed after preemption.
+    prefill_end_tokens: int | None = None
     # Identifies this store job for the engine's lifetime. A request id cannot
     # serve that purpose: it is reused once a preempted request resumes, so it
     # would release the wrong job's blocks.
@@ -800,8 +802,11 @@ class ReqMeta:
         skip_save: bool | None = False,
         block_hashes: list[BlockHash] | None = None,
         save_partial_tail: bool = False,
+        num_prompt_tokens: int | None = None,
     ) -> "ReqMeta | None":
         """Create ReqMeta from a RequestTracker."""
+        if save_partial_tail:
+            assert num_prompt_tokens is not None
         if block_hashes is None:
             block_hashes = []
         input_token_len = tracker.token_len
@@ -813,7 +818,8 @@ class ReqMeta:
         publish_tail = (
             save_partial_tail
             and not tracker.partial_tail_sent
-            and 0 < tracker.prefill_end_tokens <= input_token_len
+            and num_prompt_tokens is not None
+            and 0 < num_prompt_tokens <= input_token_len
         )
         skip_save = skip_save or (
             num_tokens_to_save < chunk_boundary and not publish_tail
@@ -861,7 +867,8 @@ class ReqMeta:
             block_hashes=block_hashes,
             token_ids=token_ids,
             token_ids_start=token_ids_start,
-            num_prompt_tokens=tracker.prefill_end_tokens,
+            num_prompt_tokens=num_prompt_tokens,
+            prefill_end_tokens=tracker.prefill_end_tokens,
             completed_token_len=input_token_len,
         )
 

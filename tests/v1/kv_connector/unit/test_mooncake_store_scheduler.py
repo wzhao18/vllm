@@ -148,6 +148,7 @@ def _make_new_scheduler_output() -> SimpleNamespace:
         req_id="req-0",
         num_computed_tokens=0,
         prompt_token_ids=list(range(32)),
+        num_prompt_tokens=32,
         prefill_token_ids=None,
         block_ids=([0, 1],),
         block_hashes=[b"h0", b"h1"],
@@ -226,6 +227,7 @@ def _add_unfinished_request(
 ) -> None:
     request = SimpleNamespace(
         all_token_ids=token_ids,
+        num_prompt_tokens=prefill_end_tokens,
         block_hashes=block_hashes,
         num_output_placeholders=0,
     )
@@ -556,6 +558,7 @@ def _make_pending_load_unfinished_request(
 ) -> None:
     request = SimpleNamespace(
         num_tokens=num_tokens,
+        num_prompt_tokens=num_tokens,
         block_hashes=block_hashes,
         num_output_placeholders=0,
     )
@@ -622,6 +625,7 @@ def _make_resumed_unfinished_request(
 ) -> None:
     request = SimpleNamespace(
         all_token_ids=token_ids,
+        num_prompt_tokens=32,
         block_hashes=block_hashes,
         num_computed_tokens=num_computed_tokens,
         num_output_placeholders=0,
@@ -835,7 +839,12 @@ def test_from_request_tracker_no_load_saves_normally(token_len, save_partial_tai
     )
     if save_partial_tail:
         tracker.token_len = 8
-        assert ReqMeta.from_request_tracker(tracker, 16, save_partial_tail=True) is None
+        assert (
+            ReqMeta.from_request_tracker(
+                tracker, 16, save_partial_tail=True, num_prompt_tokens=token_len
+            )
+            is None
+        )
         tracker.token_len = token_len
 
     req_meta = ReqMeta.from_request_tracker(
@@ -845,6 +854,7 @@ def test_from_request_tracker_no_load_saves_normally(token_len, save_partial_tai
         skip_save=False,
         block_hashes=[b"h0", b"h1", b"h2"],
         save_partial_tail=save_partial_tail,
+        num_prompt_tokens=token_len,
     )
 
     assert req_meta is not None
@@ -855,7 +865,12 @@ def test_from_request_tracker_no_load_saves_normally(token_len, save_partial_tai
     assert req_meta.boundary_state_offloads is None
     assert tracker.num_saved_tokens == token_len // 16 * 16
     assert (
-        ReqMeta.from_request_tracker(tracker, 16, save_partial_tail=save_partial_tail)
+        ReqMeta.from_request_tracker(
+            tracker,
+            16,
+            save_partial_tail=save_partial_tail,
+            num_prompt_tokens=token_len,
+        )
         is None
     )
 
@@ -1154,6 +1169,7 @@ def test_finished_partial_tail_is_pre_pinned_as_store_job(
         request_id="req-0",
         block_hashes=[bytes([i]) for i in range(prompt_tokens // 4)],
         num_computed_tokens=prompt_tokens,
+        num_prompt_tokens=prompt_tokens,
     )
     scheduler._request_trackers["req-0"] = RequestTracker(
         req_id="req-0",
@@ -1326,13 +1342,13 @@ def test_resumed_prefill_claims_boundaries_past_prompt_length():
     # missing for boundaries full attention does store and no joint hit could
     # complete there.
     scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
-    _register_offload_request(scheduler, prefill_end_tokens=21, num_prompt_tokens=13)
-    out = _make_offload_only_output([(1, 7, 16), (1, 9, 20), (1, 11, 24)])
+    _register_offload_request(scheduler, prefill_end_tokens=37, num_prompt_tokens=13)
+    out = _make_offload_only_output([(1, 7, 16), (1, 9, 32), (1, 11, 48)])
 
     meta = scheduler.build_connector_meta(out)
 
-    # 16 and 20 are inside the resumed prefill; 24 is past it.
-    assert meta.requests[0].boundary_state_offloads == [(1, 7, 16), (1, 9, 20)]
+    # Aligned states at 16 and 32 are inside the resumed prefill; 48 is past it.
+    assert meta.requests[0].boundary_state_offloads == [(1, 7, 16), (1, 9, 32)]
     store_job_id = meta.requests[0].store_job_id
     assert scheduler._pinned_saves[store_job_id][0] == [7, 9]
 
@@ -1375,6 +1391,7 @@ def test_store_job_pins_current_non_null_non_mamba_blocks():
     request = SimpleNamespace(
         all_token_ids=list(range(48)),
         block_hashes=[bytes([i]) for i in range(12)],
+        num_prompt_tokens=48,
         num_output_placeholders=0,
     )
     scheduler._unfinished_requests["req-0"] = (request, ([7, 2, 0], [21, 0, 22]))
@@ -1494,8 +1511,8 @@ def test_resumed_partial_tail_uses_exact_boundary():
 
     assert len(meta.requests) == 1
     assert meta.requests[0].boundary_state_offloads == [(1, 7, 12)]
-    # Ordinary metadata retains the full resumed prefill range.
-    assert meta.requests[0].num_prompt_tokens == 20
+    assert meta.requests[0].num_prompt_tokens == 13
+    assert meta.requests[0].prefill_end_tokens == 20
     tracker = scheduler._request_trackers["req-0"]
     assert tracker.num_saved_tokens == 0
     assert tracker.has_pending_offload is True
@@ -1508,7 +1525,7 @@ def test_resumed_partial_tail_attached_to_save_keeps_exact_boundary():
         all_token_ids=list(range(48)),
         block_hashes=[b"h0", b"h1", b"h2"],
         num_output_placeholders=0,
-        num_prompt_tokens=36,
+        num_prompt_tokens=37,
     )
     scheduler._unfinished_requests["req-0"] = (request, ([0, 1],))
     scheduler._request_trackers["req-0"] = RequestTracker(
@@ -1527,7 +1544,8 @@ def test_resumed_partial_tail_attached_to_save_keeps_exact_boundary():
     assert len(meta.requests) == 1
     assert meta.requests[0].can_save is True
     assert meta.requests[0].boundary_state_offloads == [(0, 7, 36)]
-    assert meta.requests[0].num_prompt_tokens == 48
+    assert meta.requests[0].num_prompt_tokens == 37
+    assert meta.requests[0].prefill_end_tokens == 48
     # Ordinary saving still covers the full resumed prefill range.
     tracker = scheduler._request_trackers["req-0"]
     assert tracker.num_saved_tokens == 48

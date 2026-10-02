@@ -297,6 +297,7 @@ class MooncakeStoreScheduler:
                 # producer. Loads are still carried by the same metadata.
                 skip_save=is_consumer,
                 block_hashes=request_real.block_hashes,
+                num_prompt_tokens=request_real.num_prompt_tokens,
                 save_partial_tail=self.enable_partial_hash_hits,
             )
             if req_meta is not None:
@@ -348,6 +349,7 @@ class MooncakeStoreScheduler:
                         load_spec=load_spec,
                         skip_save=is_consumer,
                         block_hashes=request_real.block_hashes,
+                        num_prompt_tokens=request_real.num_prompt_tokens,
                         save_partial_tail=self.enable_partial_hash_hits,
                     )
                 else:
@@ -390,6 +392,7 @@ class MooncakeStoreScheduler:
                         load_spec=None,
                         skip_save=False,
                         block_hashes=unfinished_req.block_hashes,
+                        num_prompt_tokens=unfinished_req.num_prompt_tokens,
                         save_partial_tail=self.enable_partial_hash_hits,
                     )
 
@@ -425,6 +428,7 @@ class MooncakeStoreScheduler:
                     load_spec=load_spec,
                     skip_save=None,
                     block_hashes=unfinished_req.block_hashes,
+                    num_prompt_tokens=unfinished_req.num_prompt_tokens,
                 )
                 if req_meta is not None:
                     meta.add_request(req_meta)
@@ -565,7 +569,8 @@ class MooncakeStoreScheduler:
             ),
             block_hashes=list(request.block_hashes),
             can_save=True,
-            num_prompt_tokens=tracker.prefill_end_tokens,
+            num_prompt_tokens=request.num_prompt_tokens,
+            prefill_end_tokens=tracker.prefill_end_tokens,
             boundary_state_offloads=remapped_offloads,
             completed_token_len=request.num_computed_tokens,
         )
@@ -638,7 +643,8 @@ class MooncakeStoreScheduler:
                     block_ids=tracker.allocated_block_ids,
                     block_hashes=req_tuple[0].block_hashes,
                     can_save=True,
-                    num_prompt_tokens=tracker.prefill_end_tokens,
+                    num_prompt_tokens=req_tuple[0].num_prompt_tokens,
+                    prefill_end_tokens=tracker.prefill_end_tokens,
                     boundary_state_offloads=accepted,
                     completed_token_len=tracker.token_len,
                 )
