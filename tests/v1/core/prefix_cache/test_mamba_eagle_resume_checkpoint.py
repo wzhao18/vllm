@@ -66,7 +66,10 @@ def _stub(manager, block_size, hash_block_size, *, block_drop=True):
         hash_block_size < block_size and manager.coordinator.enable_partial_hash_hits
     )
     return SimpleNamespace(
-        cache_config=SimpleNamespace(block_size=block_size),
+        cache_config=SimpleNamespace(
+            block_size=block_size,
+            prefix_cache_retention_interval=manager.coordinator.retention_interval,
+        ),
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         max_num_scheduled_tokens=1 << 20,
         use_eagle=True,

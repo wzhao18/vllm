@@ -179,7 +179,9 @@ def test_dcp_fine_hit_retention_uses_hash_alignment(
     assert manager.coordinator.enable_partial_hash_hits
     scheduler = SimpleNamespace(
         block_size=block_size * dcp_world_size,
-        cache_config=SimpleNamespace(block_size=block_size),
+        cache_config=SimpleNamespace(
+            block_size=block_size, prefix_cache_retention_interval=0
+        ),
         hash_block_size=hash_block_size,
         max_num_scheduled_tokens=8192,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
@@ -235,7 +237,9 @@ def test_mamba_align_split_partial_tail_schedule(dcp_world_size: int):
     hash_block_size = 32
     mock = SimpleNamespace(
         block_size=scheduler_block_size,
-        cache_config=SimpleNamespace(block_size=block_size),
+        cache_config=SimpleNamespace(
+            block_size=block_size, prefix_cache_retention_interval=0
+        ),
         max_num_scheduled_tokens=8192,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         use_eagle_block_drop=False,
@@ -285,7 +289,9 @@ def test_mamba_align_split_when_block_exceeds_scheduling_budget():
     prompt_length = 30000
     mock = SimpleNamespace(
         block_size=block_size,
-        cache_config=SimpleNamespace(block_size=block_size),
+        cache_config=SimpleNamespace(
+            block_size=block_size, prefix_cache_retention_interval=0
+        ),
         max_num_scheduled_tokens=token_budget,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         use_eagle_block_drop=False,
@@ -324,7 +330,9 @@ def test_mamba_align_split_when_block_exceeds_long_prefill_threshold():
     prompt_length = 1300
     mock = SimpleNamespace(
         block_size=block_size,
-        cache_config=SimpleNamespace(block_size=block_size),
+        cache_config=SimpleNamespace(
+            block_size=block_size, prefix_cache_retention_interval=0
+        ),
         max_num_scheduled_tokens=token_budget,
         scheduler_config=SimpleNamespace(
             long_prefill_token_threshold=long_prefill_threshold
@@ -734,6 +742,77 @@ def test_internal_checkpoint_publication_respects_retention(
             request.request_id, []
         )
     )
+
+
+@pytest.mark.parametrize("token_budget", [96, 160])
+@pytest.mark.parametrize("cached_prefix", [False, True])
+@pytest.mark.parametrize("use_eagle", [False, True])
+def test_retention_checkpoints_are_materialized_during_chunked_prefill(
+    token_budget, cached_prefix, use_eagle
+):
+    """Budget changes and prefix hits must not skip periodic Mamba states."""
+    manager = make_full_mamba_manager(
+        dcp_world_size=1,
+        hash_block_size=16,
+        full_block_size=16,
+        mamba_block_size=32,
+        num_blocks=128,
+        num_prefill_checkpoint_blocks=1,
+        use_eagle=use_eagle,
+    )
+    manager.coordinator.retention_interval = 128
+    if cached_prefix:
+        seed_length = 49 if use_eagle else 33
+        seed = make_request("seed", list(range(seed_length)), 16, sha256)
+        assert manager.allocate_slots(seed, seed_length) is not None
+        manager.free(seed)
+        drain_boundary_state_offloads(manager)
+        manager.new_step_starts()
+
+    scheduler = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            block_size=32, prefix_cache_retention_interval=128
+        ),
+        block_size=32,
+        hash_block_size=16,
+        max_num_scheduled_tokens=token_budget,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+        use_eagle_block_drop=use_eagle,
+        mamba_partial_cache_hit=True,
+        mamba_shared_prefix_checkpoint=False,
+        mamba_has_prefill_checkpoint_blocks=True,
+        mamba_prefill_checkpoint_alignment=16,
+    )
+    request = make_request("producer", list(range(400)), 16, sha256)
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(request)
+    assert num_computed == (32 if cached_prefix else 0)
+    while request.num_computed_tokens + num_computed < request.num_prompt_tokens:
+        start = request.num_computed_tokens + num_computed
+        count = Scheduler._mamba_block_aligned_split(
+            scheduler,
+            request,
+            min(token_budget, request.num_prompt_tokens - start),
+            num_new_local_computed_tokens=num_computed,
+        )
+        assert count > 0
+        assert (
+            manager.allocate_slots(request, count, num_computed, computed_blocks)
+            is not None
+        )
+        request.num_computed_tokens = start + count
+        num_computed = 0
+        computed_blocks = None
+        manager.new_step_starts()
+
+    offloads = drain_boundary_state_offloads(manager)[request.request_id]
+    for boundary in (128, 256, 384):
+        assert (
+            manager.block_pool.get_cached_block(
+                request.block_hashes[boundary // 16 - 1], [1]
+            )
+            is not None
+        )
+        assert any(position == boundary for _, _, position in offloads)
 
 
 def test_transient_checkpoint_evicts_retained_boundary_hash():
@@ -1900,7 +1979,9 @@ def test_mamba_align_split_stops_below_eagle_proof_boundary():
     block_size = 1536
     hash_block_size = 128
     mock = SimpleNamespace(
-        cache_config=SimpleNamespace(block_size=block_size),
+        cache_config=SimpleNamespace(
+            block_size=block_size, prefix_cache_retention_interval=0
+        ),
         max_num_scheduled_tokens=8192,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         use_eagle=True,
