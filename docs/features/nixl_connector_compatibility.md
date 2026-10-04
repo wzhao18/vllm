@@ -125,7 +125,7 @@ Current push PP + HMA limitations:
 
 ### Asymmetric DCP with push transfers
 
-`NixlPushConnector` supports a DCP8 prefiller writing to DCP1 decode
+`NixlPushConnector` supports a TP8/DCP8 prefiller writing to DCP1 decode
 workers, including hybrid MLA/Mamba models such as Kimi K3. Decode workers
 may use data and expert parallelism; these do not shard their attention KV.
 

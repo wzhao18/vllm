@@ -101,15 +101,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _SHARED_REGION_GROUP_ID = -1
-_REGION_METADATA_FIELDS = (
-    "kv_caches_base_addr",
-    "block_lens",
-    "block_strides",
-    "region_num_blocks",
-    "region_group_ids",
-    "region_names",
-    "region_mem_types",
-)
 
 
 def _region_sort_key(layer_name: str) -> tuple[tuple[int, int | str], ...]:
@@ -392,76 +383,6 @@ class NixlBaseConnectorWorker:
         contains multiple source ranks for the sharded SSM state.
         """
         return tp_ratio < 0 and (not self.use_mla or len(plan.all_source_ranks) > 1)
-
-    @staticmethod
-    def _slice_remote_regions(
-        metadata: NixlAgentMetadata, region_indices: list[int]
-    ) -> None:
-        """Select and order every per-region metadata array identically."""
-        num_regions = len(metadata.kv_caches_base_addr)
-        for field in _REGION_METADATA_FIELDS:
-            values = getattr(metadata, field)
-            if values is None:
-                continue
-            if len(values) != num_regions:
-                raise ValueError(
-                    f"NIXL metadata field {field!r} has {len(values)} entries, "
-                    f"expected {num_regions}."
-                )
-            setattr(metadata, field, [values[i] for i in region_indices])
-        if metadata.region_members:
-            if len(metadata.region_members) != num_regions:
-                raise ValueError("NIXL region_members length disagrees with regions")
-            metadata.region_members = [
-                metadata.region_members[i] for i in region_indices
-            ]
-
-    def _align_push_remote_regions(self, metadata: NixlAgentMetadata) -> None:
-        """Match hybrid push regions by name, excluding decode-only draft KV.
-
-        Segmented regions with the same name are matched by occurrence.
-        """
-        if (
-            self._TRANSFER_MODE != "push"
-            or not self._has_mamba
-            or metadata.region_names is None
-        ):
-            return
-        if metadata.region_names == self.region_names:
-            return
-
-        remote_indices_by_name: defaultdict[str, list[int]] = defaultdict(list)
-        for index, name in enumerate(metadata.region_names):
-            remote_indices_by_name[name].append(index)
-
-        occurrence_by_name: defaultdict[str, int] = defaultdict(int)
-        selected: list[int] = []
-        for name in self.region_names:
-            occurrence = occurrence_by_name[name]
-            candidates = remote_indices_by_name[name]
-            if occurrence >= len(candidates):
-                raise ValueError(
-                    "NIXL push consumer is missing producer region "
-                    f"{name!r} occurrence {occurrence}; "
-                    f"producer={self.region_names}, remote={metadata.region_names}."
-                )
-            selected.append(candidates[occurrence])
-            occurrence_by_name[name] += 1
-
-        selected_set = set(selected)
-        ignored = [
-            name
-            for index, name in enumerate(metadata.region_names)
-            if index not in selected_set
-        ]
-        logger.info(
-            "Aligned NIXL push regions by logical name: producer=%d, "
-            "consumer=%d, ignored consumer-only regions=%s",
-            len(self.region_names),
-            len(metadata.region_names),
-            ignored,
-        )
-        self._slice_remote_regions(metadata, selected)
 
     def _fa_desc_replicated(self, num_fa_descs: int) -> list[bool]:
         """Per-FA-descriptor replicate flag, in _build_fa_local emission order
@@ -2390,8 +2311,6 @@ class NixlBaseConnectorWorker:
                     start:end
                 ]
 
-        self._align_push_remote_regions(nixl_agent_meta)
-
         ### Register remote engine in TransferTopology (idempotent).
         physical_blocks_per_logical = (
             nixl_agent_meta.physical_blocks_per_logical_kv_block
@@ -2562,70 +2481,15 @@ class NixlBaseConnectorWorker:
         self,
         nixl_agent_meta: NixlAgentMetadata,
         remote_dcp_size: int,
+        remote_tp_size: int,
     ) -> bool:
         """Validate the block geometry used by asymmetric DCP."""
-        if self.dcp_size == remote_dcp_size:
-            return False
-
-        if self._TRANSFER_MODE != "push":
-            if self._has_mamba:
-                raise RuntimeError(
-                    "Hybrid MLA+Mamba NIXL transfers require matching DCP sizes, "
-                    f"got local={self.dcp_size}, remote={remote_dcp_size}."
-                )
-            return False
-
-        if min(self.dcp_size, remote_dcp_size) != 1:
+        if self._has_mamba and self.dcp_size != remote_dcp_size:
             raise RuntimeError(
-                "Asymmetric-DCP NIXL transfers "
-                "require one side to use DCP=1, "
+                "Hybrid MLA+Mamba NIXL transfers require matching DCP sizes, "
                 f"got local={self.dcp_size}, remote={remote_dcp_size}."
             )
-        if max(self.dcp_size, remote_dcp_size) != 8:
-            raise RuntimeError(
-                "Asymmetric-DCP NIXL transfers currently support only "
-                f"DCP8 and DCP1, got local={self.dcp_size}, "
-                f"remote={remote_dcp_size}."
-            )
-        if self.pp_size != 1 or nixl_agent_meta.pp_size != 1:
-            raise RuntimeError(
-                "Asymmetric-DCP NIXL push requires PP=1 on both sides, got "
-                f"local PP={self.pp_size}, remote PP={nixl_agent_meta.pp_size}."
-            )
-        local_has_swa = any(
-            issubclass(spec_type, SlidingWindowSpec)
-            for spec_type in getattr(self, "_group_spec_types", ())
-        )
-        if local_has_swa or getattr(nixl_agent_meta, "has_transferable_swa", False):
-            raise RuntimeError(
-                "Asymmetric-DCP NIXL push does not support transferable "
-                "sliding-window attention groups."
-            )
-
-        if self.dcp_size > remote_dcp_size:
-            sharded_interleave = (
-                self.vllm_config.parallel_config.cp_kv_cache_interleave_size
-            )
-            sharded_block_size = self.block_size
-        else:
-            sharded_interleave = nixl_agent_meta.cp_kv_cache_interleave_size
-            sharded_block_size = nixl_agent_meta.block_size
-            if sharded_interleave is None:
-                raise RuntimeError(
-                    "The remote NIXL agent did not advertise "
-                    "cp_kv_cache_interleave_size required for "
-                    "asymmetric-DCP correctness."
-                )
-
-        if sharded_interleave != sharded_block_size:
-            raise RuntimeError(
-                "Asymmetric-DCP NIXL transfers "
-                "require block-aligned KV-cache interleaving on the sharded "
-                f"side ({sharded_block_size} tokens), got {sharded_interleave}. "
-                "Set --cp-kv-cache-interleave-size to the KV-cache block size."
-            )
-
-        return True
+        return False
 
     def _validate_remote_agent_handshake(
         self,
@@ -2642,7 +2506,9 @@ class NixlBaseConnectorWorker:
         remote_info = self.transfer_topo.get_engine_info(remote_engine_id)
         assert remote_info.remote_tp_size == remote_tp_size
         assert remote_info.remote_dcp_size == remote_dcp_size
-        asymmetric_dcp = self._validate_asymmetric_dcp(nixl_agent_meta, remote_dcp_size)
+        asymmetric_dcp = self._validate_asymmetric_dcp(
+            nixl_agent_meta, remote_dcp_size, remote_tp_size
+        )
         # DCP sizes must divide one another; this is what keeps the
         # read-slicing math in pull_worker a closed form.
         assert (
@@ -3498,49 +3364,6 @@ class NixlBaseConnectorWorker:
                     ).tolist()
                 )
         return physical_block_ids
-
-    def _map_dcp_attention_block_ids(
-        self,
-        local_block_ids: BlockIds,
-        remote_block_ids: BlockIds,
-        remote_info: EngineTransferInfo,
-        remote_num_computed_blocks: tuple[int, ...] = (),
-    ) -> tuple[BlockIds, BlockIds]:
-        """Pair block-aligned attention shards with an unsharded DCP peer."""
-        local_dcp_size = self.dcp_size
-        remote_dcp_size = remote_info.remote_dcp_size
-        if local_dcp_size == remote_dcp_size:
-            return local_block_ids, remote_block_ids
-
-        if local_dcp_size < remote_dcp_size:
-            raise RuntimeError(
-                "NixlPush asymmetric DCP only supports a sharded producer "
-                "and DCP=1 consumer; got producer DCP "
-                f"{local_dcp_size} and consumer DCP {remote_dcp_size}."
-            )
-
-        local_groups = [list(group) for group in local_block_ids]
-        remote_groups = [list(group) for group in remote_block_ids]
-        assert remote_dcp_size == 1
-        for i, decode_group in enumerate(remote_groups):
-            if _is_attention_spec(self._group_spec_types[i]):
-                cached_physical = (
-                    remote_num_computed_blocks[i]
-                    * remote_info.remote_physical_blocks_per_logical
-                )
-                decode_slice, prefill_slice = self._apply_dcp_prefix_caching(
-                    local_ids=decode_group,
-                    remote_ids=local_groups[i],
-                    remote_rank=self.dcp_rank,
-                    local_dcp_size=1,
-                    local_dcp_rank=0,
-                    remote_dcp_size=local_dcp_size,
-                    local_num_computed_blocks=cached_physical,
-                )
-                remote_groups[i] = decode_slice
-                local_groups[i] = prefill_slice
-
-        return local_groups, remote_groups
 
     def _apply_dcp_prefix_caching(
         self,

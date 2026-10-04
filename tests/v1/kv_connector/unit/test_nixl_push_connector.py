@@ -1066,13 +1066,22 @@ class TestPushWriterNotifs:
         assert request_id in w._recving_transfers
         assert meta.aggregate_remote_coverage == ()
 
-    def test_dcp_fan_in_records_exact_clipped_coverage(self):
+    @pytest.mark.parametrize(
+        "counts,capacity,failed",
+        [
+            pytest.param((2, 2, 1, 1, 1, 1, 1, 1), 12, False, id="clipped-tail"),
+            pytest.param((2, 2, 1, 1, 1, 1, 1, 1), 9, True, id="exceeds-capacity"),
+            pytest.param((1, 2, 2, 1, 1, 1, 1, 1), 12, True, id="gap-and-overlap"),
+            pytest.param((-1, 2, 1, 1, 1, 1, 1, 1), 12, True, id="negative-count"),
+        ],
+    )
+    def test_dcp_fan_in_records_exact_clipped_coverage(self, counts, capacity, failed):
         w = _StubWriterWorker.fresh()
         request_id = "req-dcp8-fan-in"
         meta = SimpleNamespace(
             pp_size=1,
             remote=SimpleNamespace(engine_id="prefill-engine"),
-            local_physical_block_ids=(list(range(12)),),
+            local_physical_block_ids=(list(range(capacity)),),
             aggregate_remote_coverage=(),
         )
         w._recving_metadata[request_id] = meta
@@ -1086,7 +1095,7 @@ class TestPushWriterNotifs:
         # Ten pages means residues 0 and 1 carry two pages; the rest carry one.
         for producer_rank in range(8):
             start = (producer_rank - 2) % 8
-            count = 2 if start < 2 else 1
+            count = counts[start]
             notif = PUSH_DONE_NOTIF_PREFIX + msgspec.msgpack.encode(
                 (request_id, 8, producer_rank, ((start, count),))
             )
@@ -1098,7 +1107,11 @@ class TestPushWriterNotifs:
 
         assert request_id in w._recving_transfers
         assert request_id not in w.consumer_notification_counts_by_req
-        assert meta.aggregate_remote_coverage == (10,)
+        if failed:
+            assert w._failed_recv_reqs.get_nowait() == request_id
+            assert meta.aggregate_remote_coverage == ()
+        else:
+            assert meta.aggregate_remote_coverage == (sum(counts),)
 
     @pytest.mark.parametrize("tp_size,dcp_rank", [(8, 0), (8, 8), (4, 1)])
     def test_dcp_fan_in_rejects_invalid_producer_identity(self, tp_size, dcp_rank):
@@ -1671,17 +1684,54 @@ class TestPushPipelineParallel:
         metadata.add_new_req_to_recv("req-default", ([0],), params)
         assert metadata.reqs_to_recv["req-default"].pp_size == 1
 
-    def test_add_remote_agent_slices_remote_regions_to_local_pp_window(self):
-        """With PP>1 the producer registered regions for the full model, but
-        this worker holds only a contiguous layer slice; add_remote_agent
-        trims the remote region list to [offset : offset + num_local_regions]
-        before building descriptors. We stop right after the slice via a
-        sentinel on the next collaborator call."""
+    @pytest.mark.parametrize(
+        "pp_size,has_mamba,local_names,remote_names,selected",
+        [
+            pytest.param(
+                2,
+                False,
+                ["main.2", "main.3"],
+                ["main.0", "main.1", "main.2", "main.3"],
+                [2, 3],
+                id="pp-window",
+            ),
+            pytest.param(
+                1,
+                True,
+                ["main.0", "shared", "shared", "main.1"],
+                ["draft.0", "shared", "main.1", "main.0", "shared"],
+                [3, 1, 4, 2],
+                id="hybrid-draft-and-segments",
+            ),
+            pytest.param(
+                1,
+                True,
+                ["main.0", "main.1"],
+                ["main.0", "draft.0"],
+                None,
+                id="missing-main-region",
+            ),
+            pytest.param(
+                1,
+                False,
+                ["packed.main"],
+                ["main.0", "main.1"],
+                [0, 1],
+                id="non-hybrid-unchanged",
+            ),
+        ],
+    )
+    def test_add_remote_agent_slices_remote_regions_to_local_pp_window(
+        self, pp_size, has_mamba, local_names, remote_names, selected
+    ):
+        """Select corresponding regions before registering remote descriptors."""
         block_len = 4096 * 16
-        w = _StubWriterWorker.fresh()  # seeds writer-thread state for teardown
-        w.pp_size = 2
-        w._remote_region_offset = 2  # this worker owns layers [2, 4)
-        w.block_len_per_layer = [block_len, block_len]  # 2 local layers
+        w = _StubWriterWorker.fresh()
+        w.pp_size = pp_size
+        w._has_mamba = has_mamba
+        w.region_names = local_names
+        w._remote_region_offset = 2
+        w.block_len_per_layer = [block_len] * len(local_names)
         w.nixl_wrapper = MagicMock()
 
         class _StopAfterSlice(RuntimeError):
@@ -1690,96 +1740,44 @@ class TestPushPipelineParallel:
         w.transfer_topo = MagicMock()
         w.transfer_topo.register_remote_engine.side_effect = _StopAfterSlice()
 
+        count = len(remote_names)
         meta = NixlAgentMetadata(
             engine_id="p-engine",
             agent_metadata=b"agent",
-            kv_caches_base_addr=[10, 11, 12, 13],  # full 4-layer model
+            kv_caches_base_addr=[10 + i for i in range(count)],
             device_id=0,
             num_blocks=4,
-            block_lens=[block_len] * 4,
-            # Non-interleaved: consecutive blocks abut, so stride == block length.
-            block_strides=[block_len] * 4,
+            block_lens=[block_len + i for i in range(count)],
+            block_strides=[block_len + i for i in range(count)],
             kv_cache_layout="HND",
             block_size=16,
             ssm_sizes=(0, 0),
             attn_backend_name="FLASH_ATTN",
             physical_blocks_per_logical_kv_block=1,
+            region_num_blocks=[100 + i for i in range(count)],
+            region_group_ids=[i for i in range(count)],
+            region_names=remote_names,
+            region_mem_types=["VRAM"] * count,
+            region_members=[[name] for name in remote_names] if has_mamba else [],
         )
 
+        if selected is None:
+            with pytest.raises(ValueError, match="missing producer region 'main.1'"):
+                w.add_remote_agent(meta, remote_tp_rank=0, remote_tp_size=1)
+            w.transfer_topo.register_remote_engine.assert_not_called()
+            return
         with pytest.raises(_StopAfterSlice):
             w.add_remote_agent(meta, remote_tp_rank=0, remote_tp_size=1)
 
-        # Sliced down to this worker's layer window (regions [2:4]).
-        assert meta.kv_caches_base_addr == [12, 13]
-        assert meta.block_lens == [block_len, block_len]
-
-
-class TestPushRegionAlignment:
-    """Producer and consumer allocation geometry need not have equal regions."""
-
-    @staticmethod
-    def _metadata(region_names: list[str]) -> NixlAgentMetadata:
-        count = len(region_names)
-        return NixlAgentMetadata(
-            engine_id="decode-engine",
-            agent_metadata=b"agent",
-            kv_caches_base_addr=[100 + i for i in range(count)],
-            device_id=0,
-            num_blocks=8,
-            block_lens=[1000 + i for i in range(count)],
-            block_strides=[2000 + i for i in range(count)],
-            kv_cache_layout="HND",
-            block_size=16,
-            ssm_sizes=(0, 0),
-            attn_backend_name="FLASH_ATTN",
-            physical_blocks_per_logical_kv_block=1,
-            region_num_blocks=[3000 + i for i in range(count)],
-            region_group_ids=[4000 + i for i in range(count)],
-            region_names=region_names,
-            region_mem_types=[f"mem-{i}" for i in range(count)],
-        )
-
-    def test_aligns_and_filters_consumer_regions_by_logical_name(self):
-        worker = _StubWriterWorker.fresh()
-        worker._has_mamba = True
-        worker.region_names = ["target.0", "shared", "shared", "target.1"]
-        metadata = self._metadata(
-            ["draft.0", "shared", "target.1", "target.0", "shared"]
-        )
-        metadata.region_members = [[name] for name in metadata.region_names]
-
-        worker._align_push_remote_regions(metadata)
-
-        # The producer's logical order wins. Duplicate/segmented names are
-        # matched by occurrence; the decode-only draft cache is excluded.
-        assert metadata.region_names == worker.region_names
-        assert metadata.kv_caches_base_addr == [103, 101, 104, 102]
-        assert metadata.block_lens == [1003, 1001, 1004, 1002]
-        assert metadata.block_strides == [2003, 2001, 2004, 2002]
-        assert metadata.region_num_blocks == [3003, 3001, 3004, 3002]
-        assert metadata.region_group_ids == [4003, 4001, 4004, 4002]
-        assert metadata.region_mem_types == ["mem-3", "mem-1", "mem-4", "mem-2"]
-        assert metadata.region_members == [[name] for name in worker.region_names]
-
-    def test_rejects_missing_producer_region(self):
-        worker = _StubWriterWorker.fresh()
-        worker._has_mamba = True
-        worker.region_names = ["target.0", "target.1"]
-        metadata = self._metadata(["target.0", "draft.0"])
-
-        with pytest.raises(ValueError, match="missing producer region 'target.1'"):
-            worker._align_push_remote_regions(metadata)
-
-    def test_non_hybrid_keeps_layer_aligned_regions(self):
-        worker = _StubWriterWorker.fresh()
-        worker._has_mamba = False
-        worker.region_names = ["packed.target"]
-        metadata = self._metadata(["target.0", "target.1"])
-
-        worker._align_push_remote_regions(metadata)
-
-        assert metadata.region_names == ["target.0", "target.1"]
-        assert metadata.kv_caches_base_addr == [100, 101]
+        assert meta.kv_caches_base_addr == [10 + i for i in selected]
+        assert meta.block_lens == [block_len + i for i in selected]
+        assert meta.block_strides == [block_len + i for i in selected]
+        assert meta.region_num_blocks == [100 + i for i in selected]
+        assert meta.region_group_ids == selected
+        assert meta.region_names == [remote_names[i] for i in selected]
+        assert meta.region_mem_types == ["VRAM"] * len(selected)
+        if has_mamba:
+            assert meta.region_members == [[name] for name in local_names]
 
 
 class TestPushWriterMlaReplication:
@@ -2012,31 +2010,82 @@ class TestPushPrefixCaching:
         # ("WRITE", local_handle, local_descs, remote_handle, remote_descs)
         return list(args[2]), list(args[4])
 
-    def test_partial_prefix_hit_end_trims_producer_blocks(self):
-        """D registered only its 2 uncomputed suffix blocks; P finished the
-        full 5-block sequence. P must WRITE its LAST 2 blocks into D's slots."""
+    @pytest.mark.parametrize(
+        "dcp_size,dcp_rank,cached,prefill,decode,expected_prefill,expected_decode",
+        [
+            pytest.param(
+                1,
+                0,
+                3,
+                [10, 11, 12, 13, 14],
+                [500, 501],
+                [13, 14],
+                [500, 501],
+                id="symmetric-prefix",
+            ),
+            pytest.param(
+                1,
+                0,
+                0,
+                [10, 11, 12],
+                [500, 501, 502],
+                [10, 11, 12],
+                [500, 501, 502],
+                id="no-prefix",
+            ),
+            pytest.param(
+                8,
+                3,
+                2,
+                [10, 11],
+                list(range(500, 516)),
+                [10, 11],
+                [501, 509],
+                id="dcp-shifted-destination",
+            ),
+            pytest.param(
+                8,
+                0,
+                2,
+                [10, 11, 12],
+                list(range(500, 516)),
+                [11, 12],
+                [506, 514],
+                id="dcp-skip-cached-source",
+            ),
+        ],
+    )
+    def test_partial_prefix_hit_end_trims_producer_blocks(
+        self,
+        dcp_size,
+        dcp_rank,
+        cached,
+        prefill,
+        decode,
+        expected_prefill,
+        expected_decode,
+    ):
+        """Only matching uncached positions may be passed to the NIXL WRITE."""
         w, _ = self._worker_driving_xfer()
-        reg = _registration_data("req-pc", local_block_ids=([500, 501],))
-
-        NixlPushConnectorWorker._do_start_push_kv(
-            w, "req-pc", ([10, 11, 12, 13, 14],), reg
+        w.dcp_size = dcp_size
+        w.world_size = dcp_size
+        w.dcp_rank = dcp_rank
+        reg = _registration_data(
+            "req-pc", local_block_ids=(decode,), local_num_computed_blocks=(cached,)
         )
 
-        local, remote = self._written_block_ids(w)
-        # End-trim (suffix), NOT front-trim: [13, 14], not [10, 11].
-        assert local == [13, 14]
-        assert remote == [500, 501]
+        NixlPushConnectorWorker._do_start_push_kv(w, "req-pc", (prefill,), reg)
 
-    def test_no_prefix_hit_leaves_blocks_untrimmed(self):
-        """Equal counts (no prefix cache hit on D): nothing is trimmed."""
-        w, _ = self._worker_driving_xfer()
-        reg = _registration_data("req-full", local_block_ids=([500, 501, 502],))
-
-        NixlPushConnectorWorker._do_start_push_kv(w, "req-full", ([10, 11, 12],), reg)
-
-        local, remote = self._written_block_ids(w)
-        assert local == [10, 11, 12]
-        assert remote == [500, 501, 502]
+        assert self._written_block_ids(w) == (expected_prefill, expected_decode)
+        if dcp_size > 1:
+            notif = w.nixl_wrapper.make_prepped_xfer.call_args.kwargs["notif_msg"]
+            payload = msgspec.msgpack.decode(notif[len(PUSH_DONE_NOTIF_PREFIX) :])
+            assert payload == [
+                "req-pc",
+                dcp_size,
+                dcp_rank,
+                [[expected_decode[0] - decode[0], len(expected_decode)]],
+            ]
 
     def test_symmetric_push_accepts_registration_without_prefix_counts(self):
         w, _ = self._worker_driving_xfer()
@@ -2058,52 +2107,6 @@ class TestPushPrefixCaching:
             NixlPushConnectorWorker._do_start_push_kv(
                 w, "req-missing", ([10, 11],), reg
             )
-
-    def test_dcp8_prefill_maps_shard_to_dcp1_decode_positions(self):
-        """Each DCP8 producer writes only its positions in DCP1's block table."""
-        w, _ = self._worker_driving_xfer()
-        w.dcp_size = 8
-        w.tp_rank = 3
-        w.dcp_rank = 3
-        w.world_size = 8
-        reg = _registration_data(
-            "req-dcp",
-            local_block_ids=(list(range(500, 516)),),
-            # The uncached suffix starts at global position 2, so rank 3's
-            # first destination is suffix offset 1, not offset 3.
-            local_num_computed_blocks=(2,),
-        )
-
-        NixlPushConnectorWorker._do_start_push_kv(w, "req-dcp", ([10, 11],), reg)
-
-        local, remote = self._written_block_ids(w)
-        assert local == [10, 11]
-        assert remote == [501, 509]
-        notif = w.nixl_wrapper.make_prepped_xfer.call_args.kwargs["notif_msg"]
-        payload = msgspec.msgpack.decode(notif[len(PUSH_DONE_NOTIF_PREFIX) :])
-        assert payload == ["req-dcp", 8, 3, [[1, 2]]]
-
-    def test_dcp8_mapping_skips_producer_blocks_covered_by_prefix(self):
-        w, _ = self._worker_driving_xfer()
-        w.dcp_size = 8
-        w.dcp_rank = 0
-        w.world_size = 8
-        reg = _registration_data(
-            "req-dcp-rank0",
-            local_block_ids=(list(range(500, 516)),),
-            local_num_computed_blocks=(2,),
-        )
-
-        NixlPushConnectorWorker._do_start_push_kv(
-            w, "req-dcp-rank0", ([10, 11, 12],), reg
-        )
-
-        local, remote = self._written_block_ids(w)
-        assert local == [11, 12]
-        assert remote == [506, 514]
-        notif = w.nixl_wrapper.make_prepped_xfer.call_args.kwargs["notif_msg"]
-        payload = msgspec.msgpack.decode(notif[len(PUSH_DONE_NOTIF_PREFIX) :])
-        assert payload == ["req-dcp-rank0", 8, 0, [[6, 2]]]
 
     def test_asymmetric_dcp_mapping_leaves_ssm_group_untouched(self):
         from types import SimpleNamespace

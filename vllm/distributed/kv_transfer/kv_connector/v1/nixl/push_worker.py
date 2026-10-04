@@ -34,13 +34,13 @@ the writer drops any leftover ``_push_finished_blocks`` /
 import queue
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, Any
 
 import msgspec
 
-from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
+from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds, EngineTransferInfo
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorTransferResults,
 )
@@ -50,6 +50,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     PUSH_DONE_NOTIF_PREFIX,
     PUSH_REG_NOTIF_PREFIX,
+    NixlAgentMetadata,
     NixlConnectorMetadata,
     PushCompletion,
     RemoteMeta,
@@ -63,6 +64,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import get_base_request_id
 from vllm.logger import init_logger
+from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
 if TYPE_CHECKING:
     import torch
@@ -86,6 +88,127 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
     _TRANSFER_MODE: str = "push"
 
     _supports_pp_hma = True
+
+    def _validate_asymmetric_dcp(
+        self,
+        metadata: NixlAgentMetadata,
+        remote_dcp_size: int,
+        remote_tp_size: int,
+    ) -> bool:
+        """Require whole-page DCP8 shards from a single TP8 producer group."""
+        if self.dcp_size == remote_dcp_size:
+            return False
+        if (self.dcp_size, remote_dcp_size) not in ((8, 1), (1, 8)):
+            raise RuntimeError("Asymmetric NIXL push supports only DCP8 and DCP1.")
+        producer_tp_size = self.world_size if self.dcp_size == 8 else remote_tp_size
+        if producer_tp_size != 8:
+            raise RuntimeError("Asymmetric NIXL push requires a TP8/DCP8 producer.")
+        if self.pp_size != 1 or metadata.pp_size != 1:
+            raise RuntimeError("Asymmetric NIXL push requires PP=1 on both sides.")
+        if metadata.has_transferable_swa or any(
+            issubclass(spec_type, SlidingWindowSpec)
+            for spec_type in self._group_spec_types
+        ):
+            raise RuntimeError(
+                "Asymmetric NIXL push does not support sliding-window attention."
+            )
+        if self.dcp_size == 8:
+            interleave = self.vllm_config.parallel_config.cp_kv_cache_interleave_size
+            block_size = self.block_size
+        else:
+            interleave = metadata.cp_kv_cache_interleave_size
+            block_size = metadata.block_size
+        if interleave != block_size:
+            raise RuntimeError(
+                "Asymmetric NIXL push requires block-aligned KV interleaving: "
+                f"set --cp-kv-cache-interleave-size to {block_size}, got {interleave}."
+            )
+        return True
+
+    def _add_notif_only_remote_agent(
+        self, metadata: NixlAgentMetadata, remote_tp_size: int, remote_dcp_size: int = 1
+    ) -> str:
+        self._validate_asymmetric_dcp(metadata, remote_dcp_size, remote_tp_size)
+        return super()._add_notif_only_remote_agent(
+            metadata, remote_tp_size, remote_dcp_size
+        )
+
+    def add_remote_agent(
+        self,
+        nixl_agent_meta: NixlAgentMetadata,
+        remote_tp_rank: int = 0,
+        remote_tp_size: int = 1,
+        remote_dcp_size: int = 1,
+    ) -> str:
+        self._align_push_remote_regions(nixl_agent_meta)
+        return super().add_remote_agent(
+            nixl_agent_meta, remote_tp_rank, remote_tp_size, remote_dcp_size
+        )
+
+    def _align_push_remote_regions(self, metadata: NixlAgentMetadata) -> None:
+        """Match hybrid regions by name and occurrence, excluding draft KV."""
+        if not self._has_mamba or metadata.region_names is None:
+            return
+        if metadata.region_names == self.region_names:
+            return
+        regions_by_name: dict[str, deque[int]] = defaultdict(deque)
+        for index, name in enumerate(metadata.region_names):
+            regions_by_name[name].append(index)
+        selected = []
+        for name in self.region_names:
+            if not regions_by_name[name]:
+                raise ValueError(
+                    f"NIXL push consumer is missing producer region {name!r}"
+                )
+            selected.append(regions_by_name[name].popleft())
+
+        num_regions = len(metadata.kv_caches_base_addr)
+        for field in (
+            "kv_caches_base_addr",
+            "block_lens",
+            "block_strides",
+            "region_num_blocks",
+            "region_group_ids",
+            "region_names",
+            "region_mem_types",
+            "region_members",
+        ):
+            values = getattr(metadata, field)
+            if values is None or (field == "region_members" and not values):
+                continue
+            if len(values) != num_regions:
+                raise ValueError(f"NIXL {field} length disagrees with region count")
+            setattr(metadata, field, [values[i] for i in selected])
+
+    def _map_dcp_attention_block_ids(
+        self,
+        local_block_ids: BlockIds,
+        remote_block_ids: BlockIds,
+        remote_info: EngineTransferInfo,
+        remote_num_computed_blocks: tuple[int, ...],
+    ) -> tuple[BlockIds, BlockIds]:
+        """Pair the producer's attention shard with the consumer's uncached suffix."""
+        if self.dcp_size == remote_info.remote_dcp_size:
+            return local_block_ids, remote_block_ids
+        if remote_info.remote_dcp_size != 1:
+            raise RuntimeError("Asymmetric NIXL push requires a sharded producer.")
+        local_groups = list(local_block_ids)
+        remote_groups = list(remote_block_ids)
+        for i, group in enumerate(remote_groups):
+            if _is_attention_spec(self._group_spec_types[i]):
+                remote_groups[i], local_groups[i] = self._apply_dcp_prefix_caching(
+                    local_ids=group,
+                    remote_ids=local_groups[i],
+                    remote_rank=self.dcp_rank,
+                    local_dcp_size=1,
+                    local_dcp_rank=0,
+                    remote_dcp_size=self.dcp_size,
+                    local_num_computed_blocks=(
+                        remote_num_computed_blocks[i]
+                        * remote_info.remote_physical_blocks_per_logical
+                    ),
+                )
+        return local_groups, remote_groups
 
     def __init__(
         self,
@@ -878,7 +1001,6 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                                 req_id, "coverage cache-group count mismatch"
                             )
                             continue
-                        producer_dcp_rank = int(producer_dcp_rank)
                         by_rank = self._push_coverage_by_req[req_id]
                         if producer_dcp_rank in by_rank:
                             self._reject_push_done(
@@ -887,26 +1009,8 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                             )
                             continue
                         by_rank[producer_dcp_rank] = coverage
-                    # Consumer waits for one notif per producer rank writing
-                    # here: pp_size stages * producers-per-consumer (>1 when
-                    # producer TP > consumer TP; tp_size is the producer TP).
-                    if asymmetric_dcp:
-                        if meta.pp_size != 1:
-                            self._reject_push_done(
-                                req_id,
-                                "asymmetric DCP does not support PP>1 producers",
-                            )
+                        if len(by_rank) < remote_info.remote_dcp_size:
                             continue
-                        expected_notifs = remote_info.remote_dcp_size
-                    else:
-                        producers_per_consumer = max(1, int(tp_size) // self.world_size)
-                        expected_notifs = meta.pp_size * producers_per_consumer
-                    self.consumer_notification_counts_by_req[req_id] += 1
-                    notifs = self.consumer_notification_counts_by_req[req_id]
-                    if notifs < expected_notifs:
-                        continue
-                    del self.consumer_notification_counts_by_req[req_id]
-                    if asymmetric_dcp:
                         aggregate = self._validate_push_coverage(
                             req_id,
                             remote_info.remote_dcp_size,
@@ -921,6 +1025,16 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                         if aggregate is None:
                             continue
                         meta.aggregate_remote_coverage = aggregate
+                    else:
+                        producers_per_consumer = max(1, int(tp_size) // self.world_size)
+                        expected_notifs = meta.pp_size * producers_per_consumer
+                        self.consumer_notification_counts_by_req[req_id] += 1
+                        if (
+                            self.consumer_notification_counts_by_req[req_id]
+                            < expected_notifs
+                        ):
+                            continue
+                        del self.consumer_notification_counts_by_req[req_id]
                     # P drove the transfer (we own no NIXL handle), so
                     # materialise an empty ``_recving_transfers`` entry for
                     # ``_pop_done_transfers`` to report done.
@@ -951,7 +1065,6 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
     def _reject_push_done(self, req_id: str, reason: str) -> None:
         logger.error("Rejecting PUSH_DONE for %s: %s", req_id, reason)
-        self.consumer_notification_counts_by_req.pop(req_id, None)
         self._push_coverage_by_req.pop(req_id, None)
         self._recv_failures.add(req_id)
         self._failed_recv_reqs.put(req_id)
@@ -964,10 +1077,6 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         local_group_capacities: tuple[int, ...],
     ) -> tuple[int, ...] | None:
         by_rank = self._push_coverage_by_req.pop(req_id, {})
-        if set(by_rank) != set(range(producer_dcp_size)):
-            self._reject_push_done(req_id, "producer DCP identities are incomplete")
-            return None
-
         aggregate: list[int] = []
         for group_idx, capacity in enumerate(local_group_capacities):
             if not _is_attention_spec(self._group_spec_types[group_idx]):
@@ -980,28 +1089,17 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 aggregate.append(0)
                 continue
 
-            counts_by_residue: dict[int, int] = {}
-            for certificate in by_rank.values():
-                start, count = certificate[group_idx]
-                if (
-                    count < 0
-                    or not 0 <= start < producer_dcp_size
-                    or start in counts_by_residue
-                ):
-                    self._reject_push_done(req_id, "invalid coverage range")
-                    return None
-                counts_by_residue[start] = count
-            covered = sum(counts_by_residue.values())
+            coverage = sorted(
+                certificate[group_idx] for certificate in by_rank.values()
+            )
+            covered = sum(count for _, count in coverage)
             full_rounds, remainder = divmod(covered, producer_dcp_size)
-            expected_counts = {
-                residue: full_rounds + int(residue < remainder)
+            expected = [
+                (residue, full_rounds + int(residue < remainder))
                 for residue in range(producer_dcp_size)
-            }
-            if counts_by_residue != expected_counts:
-                self._reject_push_done(req_id, "coverage has a gap or overlap")
-                return None
-            if covered > capacity:
-                self._reject_push_done(req_id, "coverage exceeds local capacity")
+            ]
+            if not 0 <= covered <= capacity or coverage != expected:
+                self._reject_push_done(req_id, "invalid or noncontiguous page coverage")
                 return None
             aggregate.append(covered)
         return tuple(aggregate)
