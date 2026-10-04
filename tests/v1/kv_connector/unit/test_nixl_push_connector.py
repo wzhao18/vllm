@@ -33,7 +33,10 @@ from unittest.mock import MagicMock, patch
 import msgspec
 import pytest
 
-from vllm.distributed.kv_transfer.kv_connector.utils import TransferTopology
+from vllm.distributed.kv_transfer.kv_connector.utils import (
+    EngineTransferInfo,
+    TransferTopology,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
     KVConnectorTransferResults,
@@ -1259,6 +1262,13 @@ class TestPushWriterNotifs:
         w = self._pollable_worker()
         request_id = self._make_sending_req(w)
         w.transfer_topo.block_size_ratio.return_value = 1
+        w.transfer_topo.get_engine_info.return_value = EngineTransferInfo(
+            remote_tp_size=1,
+            remote_block_size=16,
+            remote_block_len=32,
+            remote_physical_blocks_per_logical=1,
+            remote_dcp_size=1,
+        )
         w._apply_prefix_caching = MagicMock(return_value=([[1]], [[1]]))
         w._compute_desc_ids = MagicMock(return_value=[0])
         w.dst_num_blocks = {w.engine_id: 8}
@@ -1281,6 +1291,7 @@ class TestPushWriterNotifs:
             remote_request_id="decode-request",
             local_xfer_side_handle=1,
             remote_xfer_side_handle=2,
+            remote_num_computed_blocks=(),
         )
         assert handle == (101 if release_fails else None)
         w._sending_transfers[request_id] = [102]
