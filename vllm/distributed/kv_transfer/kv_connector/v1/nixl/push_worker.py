@@ -51,6 +51,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     PUSH_DONE_NOTIF_PREFIX,
     PUSH_REG_NOTIF_PREFIX,
     NixlConnectorMetadata,
+    PushCompletion,
     RemoteMeta,
     ReqId,
     ReqMeta,
@@ -660,10 +661,9 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         remote_block_ids = read_spec.remote_block_ids
 
         remote_info = self.transfer_topo.get_engine_info(dst_engine_id)
-        if (
-            self.dcp_size != remote_info.remote_dcp_size
-            and len(remote_num_computed_blocks) != len(remote_block_ids)
-        ):
+        if self.dcp_size != remote_info.remote_dcp_size and len(
+            remote_num_computed_blocks
+        ) != len(remote_block_ids):
             raise RuntimeError(
                 "Asymmetric-DCP PUSH_REG requires one "
                 "local_num_computed_blocks value per cache group, got "
@@ -683,7 +683,6 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         local_block_ids, remote_block_ids = self._map_dcp_attention_block_ids(
             local_block_ids,
             remote_block_ids,
-            remote_rank,
             remote_info,
             remote_num_computed_blocks,
         )
@@ -720,19 +719,24 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 raise RuntimeError(
                     "NixlPush asymmetric DCP does not support a PP-sharded producer."
                 )
-            coverage = tuple(
-                (
-                    self._asymmetric_dcp_group_start(
-                        i, remote_info, remote_num_computed_blocks
-                    ),
-                    len(group),
-                )
-                if _is_attention_spec(self._group_spec_types[i])
-                else (-1, 0)
-                for i, group in enumerate(remote_block_ids)
-            )
+            group_coverage: list[tuple[int, int]] = []
+            for i, group in enumerate(remote_block_ids):
+                if _is_attention_spec(self._group_spec_types[i]):
+                    cached_pages = (
+                        remote_num_computed_blocks[i]
+                        * remote_info.remote_physical_blocks_per_logical
+                    )
+                    start = (self.dcp_rank - cached_pages) % self.dcp_size
+                    group_coverage.append((start, len(group)))
+                else:
+                    group_coverage.append((-1, 0))
             notif_id = PUSH_DONE_NOTIF_PREFIX + msgspec.msgpack.encode(
-                (remote_request_id, self.world_size, self.dcp_rank, coverage)
+                PushCompletion(
+                    remote_request_id,
+                    self.world_size,
+                    self.dcp_rank,
+                    tuple(group_coverage),
+                )
             )
         else:
             notif_id = f"{remote_request_id}:{self.world_size}".encode()
@@ -812,14 +816,13 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             coverage = None
             producer_dcp_rank = None
             if notif.startswith(PUSH_DONE_NOTIF_PREFIX):
+                payload = None
                 try:
                     payload = msgspec.msgpack.decode(
                         notif[len(PUSH_DONE_NOTIF_PREFIX) :]
                     )
+                    completion = msgspec.convert(payload, type=PushCompletion)
                 except msgspec.DecodeError:
-                    logger.error("Malformed PUSH_DONE notification")
-                    continue
-                if not isinstance(payload, (list, tuple)) or len(payload) != 4:
                     malformed_req_id = (
                         payload[0]
                         if isinstance(payload, (list, tuple)) and payload
@@ -835,27 +838,10 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                     else:
                         logger.error("Malformed PUSH_DONE notification")
                     continue
-                req_id, tp_size, producer_dcp_rank, raw_coverage = payload
-                if (
-                    not isinstance(req_id, str)
-                    or not isinstance(tp_size, int)
-                    or not isinstance(producer_dcp_rank, int)
-                ):
-                    if isinstance(req_id, str) and req_id in self._recving_metadata:
-                        self._reject_push_done(req_id, "malformed PUSH_DONE identity")
-                    else:
-                        logger.error("Malformed PUSH_DONE identity: %r", payload)
-                    continue
-                try:
-                    coverage = tuple(
-                        (int(start), int(count)) for start, count in raw_coverage
-                    )
-                except (TypeError, ValueError):
-                    if req_id in self._recving_metadata:
-                        self._reject_push_done(req_id, "malformed PUSH_DONE coverage")
-                    else:
-                        logger.error("Malformed PUSH_DONE coverage for %s", req_id)
-                    continue
+                req_id = completion.request_id
+                tp_size = completion.tp_size
+                producer_dcp_rank = completion.dcp_rank
+                coverage = completion.coverage
             else:
                 msg = notif.decode("utf-8")
                 if msg.startswith("HB:"):
@@ -878,8 +864,14 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                         if coverage is None or producer_dcp_rank is None:
                             self._reject_push_done(
                                 req_id,
-                                "missing v12 asymmetric-DCP coverage certificate",
+                                "missing asymmetric-DCP page coverage",
                             )
+                            continue
+                        if (
+                            tp_size != remote_info.remote_tp_size
+                            or not 0 <= producer_dcp_rank < remote_info.remote_dcp_size
+                        ):
+                            self._reject_push_done(req_id, "producer topology mismatch")
                             continue
                         if len(coverage) != len(meta.local_physical_block_ids):
                             self._reject_push_done(
@@ -907,9 +899,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                             continue
                         expected_notifs = remote_info.remote_dcp_size
                     else:
-                        producers_per_consumer = max(
-                            1, int(tp_size) // self.world_size
-                        )
+                        producers_per_consumer = max(1, int(tp_size) // self.world_size)
                         expected_notifs = meta.pp_size * producers_per_consumer
                     self.consumer_notification_counts_by_req[req_id] += 1
                     notifs = self.consumer_notification_counts_by_req[req_id]

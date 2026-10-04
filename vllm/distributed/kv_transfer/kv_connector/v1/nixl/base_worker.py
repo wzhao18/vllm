@@ -409,18 +409,23 @@ class NixlBaseConnectorWorker:
                     f"expected {num_regions}."
                 )
             setattr(metadata, field, [values[i] for i in region_indices])
+        if metadata.region_members:
+            if len(metadata.region_members) != num_regions:
+                raise ValueError("NIXL region_members length disagrees with regions")
+            metadata.region_members = [
+                metadata.region_members[i] for i in region_indices
+            ]
 
     def _align_push_remote_regions(self, metadata: NixlAgentMetadata) -> None:
-        """Align a push consumer's regions with the producer's logical caches.
+        """Match hybrid push regions by name, excluding decode-only draft KV.
 
-        A decode engine may register additional KV regions, for example for a
-        speculative draft model. Those regions are not present on a
-        language-model-only prefill engine and must not participate in the
-        WRITE. Region names are the wire-level logical identity; align by
-        name (and occurrence for segmented regions) rather than assuming the
-        two allocators produced equal, positionally identical arrays.
+        Segmented regions with the same name are matched by occurrence.
         """
-        if self._TRANSFER_MODE != "push" or metadata.region_names is None:
+        if (
+            self._TRANSFER_MODE != "push"
+            or not self._has_mamba
+            or metadata.region_names is None
+        ):
             return
         if metadata.region_names == self.region_names:
             return
@@ -2637,9 +2642,7 @@ class NixlBaseConnectorWorker:
         remote_info = self.transfer_topo.get_engine_info(remote_engine_id)
         assert remote_info.remote_tp_size == remote_tp_size
         assert remote_info.remote_dcp_size == remote_dcp_size
-        asymmetric_dcp = self._validate_asymmetric_dcp(
-            nixl_agent_meta, remote_dcp_size
-        )
+        asymmetric_dcp = self._validate_asymmetric_dcp(nixl_agent_meta, remote_dcp_size)
         # DCP sizes must divide one another; this is what keeps the
         # read-slicing math in pull_worker a closed form.
         assert (
@@ -3500,7 +3503,6 @@ class NixlBaseConnectorWorker:
         self,
         local_block_ids: BlockIds,
         remote_block_ids: BlockIds,
-        remote_rank: int,
         remote_info: EngineTransferInfo,
         remote_num_computed_blocks: tuple[int, ...] = (),
     ) -> tuple[BlockIds, BlockIds]:
@@ -3539,19 +3541,6 @@ class NixlBaseConnectorWorker:
                 local_groups[i] = prefill_slice
 
         return local_groups, remote_groups
-
-    def _asymmetric_dcp_group_start(
-        self,
-        group_idx: int,
-        remote_info: EngineTransferInfo,
-        remote_num_computed_blocks: tuple[int, ...],
-    ) -> int:
-        """Return this producer's first position in DCP1's uncached suffix."""
-        cached_physical = (
-            remote_num_computed_blocks[group_idx]
-            * remote_info.remote_physical_blocks_per_logical
-        )
-        return (self.dcp_rank - cached_physical) % self.dcp_size
 
     def _apply_dcp_prefix_caching(
         self,

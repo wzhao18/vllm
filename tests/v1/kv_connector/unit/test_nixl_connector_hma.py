@@ -451,9 +451,7 @@ def test_validate_asymmetric_dcp_rejects_pure_mla_non_dcp1_ratio():
     worker.vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=64)
     )
-    remote = SimpleNamespace(
-        cp_kv_cache_interleave_size=64, block_size=64, pp_size=1
-    )
+    remote = SimpleNamespace(cp_kv_cache_interleave_size=64, block_size=64, pp_size=1)
 
     with pytest.raises(RuntimeError, match="one side to use DCP=1"):
         worker._validate_asymmetric_dcp(remote, remote_dcp_size=8)
@@ -470,9 +468,7 @@ def test_validate_asymmetric_dcp_rejects_missing_remote_interleave():
     worker.vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=1)
     )
-    remote = SimpleNamespace(
-        cp_kv_cache_interleave_size=None, block_size=64, pp_size=1
-    )
+    remote = SimpleNamespace(cp_kv_cache_interleave_size=None, block_size=64, pp_size=1)
 
     with pytest.raises(RuntimeError, match="did not advertise"):
         worker._validate_asymmetric_dcp(remote, remote_dcp_size=8)
@@ -501,10 +497,9 @@ def test_validate_asymmetric_dcp_rejects_pipeline_parallelism(
     with pytest.raises(RuntimeError, match="PP=1 on both sides"):
         worker._validate_asymmetric_dcp(remote, remote_dcp_size=8)
 
+
 @pytest.mark.cpu_test
-@pytest.mark.parametrize(
-    "local_has_swa,remote_has_swa", [(True, False), (False, True)]
-)
+@pytest.mark.parametrize("local_has_swa,remote_has_swa", [(True, False), (False, True)])
 def test_validate_asymmetric_dcp_rejects_sliding_window_attention(
     local_has_swa, remote_has_swa
 ):

@@ -123,6 +123,22 @@ Current push PP + HMA limitations:
 - Non-MLA attention-HMA layer routing requires decode TP to be no greater than prefill TP.
 - Packed layouts under PP require MLA caches. Local and remote packed block strides may differ; layer pages must have equal sizes. MLA supports decode TP greater than prefill TP because its KV is replicated.
 
+### Asymmetric DCP with push transfers
+
+`NixlPushConnector` supports a DCP8 prefiller writing to DCP1 decode
+workers, including hybrid MLA/Mamba models such as Kimi K3. Decode workers
+may use data and expert parallelism; these do not shard their attention KV.
+
+- Both roles must use PP=1.
+- On the prefiller, set `--cp-kv-cache-interleave-size` to the KV-cache
+  block size so each physical attention page belongs to one DCP rank.
+- Transferable sliding-window attention groups are not supported.
+- The reverse direction (DCP1 prefill to DCP8 decode) is not supported.
+
+Each producer writes its attention pages and its TP shard of the Mamba
+state. Decode waits for all eight producers and validates their combined
+attention-page coverage before making the received cache usable.
+
 ### Quantized KV cache
 
 [Quantized KV cache](quantization/quantized_kvcache.md) (e.g., FP8) requires both P and D instances to use the **same** `cache_dtype`. Mismatched cache dtypes will fail the compatibility hash check during handshake.

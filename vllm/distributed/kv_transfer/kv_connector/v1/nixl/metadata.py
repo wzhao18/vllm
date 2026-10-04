@@ -5,6 +5,8 @@
 from dataclasses import dataclass, field
 from typing import Any
 
+import msgspec
+
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds, EngineId
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -25,6 +27,17 @@ GET_META_MSG = b"get_meta_msg"
 # PUSH_REG_NOTIF_PREFIX + msgpack(registration_data).
 PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 PUSH_DONE_NOTIF_PREFIX = b"PUSH_DONE:"
+
+
+class PushCompletion(msgspec.Struct, array_like=True, frozen=True):
+    """Producer completion and per-group physical-page coverage."""
+
+    request_id: str
+    tp_size: int
+    dcp_rank: int
+    coverage: tuple[tuple[int, int], ...]
+
+
 #
 # NIXL Connector Version
 #

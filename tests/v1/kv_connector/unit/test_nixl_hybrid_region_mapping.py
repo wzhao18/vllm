@@ -95,9 +95,7 @@ def test_hybrid_handshake_rejects_unaligned_physical_region_counts():
 def test_push_region_alignment_removes_decode_only_draft_regions():
     worker = _hybrid_worker()
     metadata = _remote_metadata()
-    plan = SimpleNamespace(
-        source_ranks_per_group=([0], [0]), rank_offset_factor=0
-    )
+    plan = SimpleNamespace(source_ranks_per_group=([0], [0]), rank_offset_factor=0)
 
     local_fa = worker._build_fa_local([100, 200], block_size_ratio=1)
     assert len(local_fa) == 8

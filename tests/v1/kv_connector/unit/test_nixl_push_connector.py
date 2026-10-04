@@ -25,7 +25,7 @@ import queue
 import threading
 import time
 from collections import defaultdict
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -1075,7 +1075,7 @@ class TestPushWriterNotifs:
         w._recving_metadata[request_id] = meta
         w.transfer_topo = MagicMock()
         w.transfer_topo.get_engine_info.return_value = SimpleNamespace(
-            remote_dcp_size=8, remote_block_size=16
+            remote_tp_size=8, remote_dcp_size=8, remote_block_size=16
         )
         w.transfer_topo.block_size_ratio.return_value = 1
 
@@ -1097,7 +1097,8 @@ class TestPushWriterNotifs:
         assert request_id not in w.consumer_notification_counts_by_req
         assert meta.aggregate_remote_coverage == (10,)
 
-    def test_dcp_fan_in_rejects_duplicate_producer_identity(self):
+    @pytest.mark.parametrize("tp_size,dcp_rank", [(8, 0), (8, 8), (4, 1)])
+    def test_dcp_fan_in_rejects_invalid_producer_identity(self, tp_size, dcp_rank):
         w = _StubWriterWorker.fresh()
         request_id = "req-duplicate"
         w._recving_metadata[request_id] = SimpleNamespace(
@@ -1108,7 +1109,7 @@ class TestPushWriterNotifs:
         )
         w.transfer_topo = MagicMock()
         w.transfer_topo.get_engine_info.return_value = SimpleNamespace(
-            remote_dcp_size=8, remote_block_size=16
+            remote_tp_size=8, remote_dcp_size=8, remote_block_size=16
         )
         w.transfer_topo.block_size_ratio.return_value = 1
         notif = PUSH_DONE_NOTIF_PREFIX + msgspec.msgpack.encode(
@@ -1116,17 +1117,21 @@ class TestPushWriterNotifs:
         )
 
         w._pending_completion_notifs.put(notif)
-        w._pending_completion_notifs.put(notif)
+        w._pending_completion_notifs.put(
+            PUSH_DONE_NOTIF_PREFIX
+            + msgspec.msgpack.encode((request_id, tp_size, dcp_rank, ((0, 1),)))
+        )
         assert w._get_new_notifs() == set()
         assert w._failed_recv_reqs.get_nowait() == request_id
 
-    def test_known_request_rejects_malformed_push_done_coverage(self):
+    @pytest.mark.parametrize("coverage", ["not-coverage", ((0, 1.5),), ((0, "1"),)])
+    def test_known_request_rejects_malformed_push_done_coverage(self, coverage):
         w = _StubWriterWorker.fresh()
         request_id = "req-malformed"
         w._recving_metadata[request_id] = SimpleNamespace()
         w.transfer_topo = MagicMock()
         notif = PUSH_DONE_NOTIF_PREFIX + msgspec.msgpack.encode(
-            (request_id, 8, 0, "not-coverage")
+            (request_id, 8, 0, coverage)
         )
 
         w._pending_completion_notifs.put(notif)
@@ -1725,10 +1730,12 @@ class TestPushRegionAlignment:
 
     def test_aligns_and_filters_consumer_regions_by_logical_name(self):
         worker = _StubWriterWorker.fresh()
+        worker._has_mamba = True
         worker.region_names = ["target.0", "shared", "shared", "target.1"]
         metadata = self._metadata(
             ["draft.0", "shared", "target.1", "target.0", "shared"]
         )
+        metadata.region_members = [[name] for name in metadata.region_names]
 
         worker._align_push_remote_regions(metadata)
 
@@ -1741,14 +1748,27 @@ class TestPushRegionAlignment:
         assert metadata.region_num_blocks == [3003, 3001, 3004, 3002]
         assert metadata.region_group_ids == [4003, 4001, 4004, 4002]
         assert metadata.region_mem_types == ["mem-3", "mem-1", "mem-4", "mem-2"]
+        assert metadata.region_members == [[name] for name in worker.region_names]
 
     def test_rejects_missing_producer_region(self):
         worker = _StubWriterWorker.fresh()
+        worker._has_mamba = True
         worker.region_names = ["target.0", "target.1"]
         metadata = self._metadata(["target.0", "draft.0"])
 
         with pytest.raises(ValueError, match="missing producer region 'target.1'"):
             worker._align_push_remote_regions(metadata)
+
+    def test_non_hybrid_keeps_layer_aligned_regions(self):
+        worker = _StubWriterWorker.fresh()
+        worker._has_mamba = False
+        worker.region_names = ["packed.target"]
+        metadata = self._metadata(["target.0", "target.1"])
+
+        worker._align_push_remote_regions(metadata)
+
+        assert metadata.region_names == ["target.0", "target.1"]
+        assert metadata.kv_caches_base_addr == [100, 101]
 
 
 class TestPushWriterMlaReplication:
@@ -2007,18 +2027,16 @@ class TestPushPrefixCaching:
         assert local == [10, 11, 12]
         assert remote == [500, 501, 502]
 
-    def test_symmetric_push_accepts_registration_without_v12_prefix_counts(self):
+    def test_symmetric_push_accepts_registration_without_prefix_counts(self):
         w, _ = self._worker_driving_xfer()
         reg = _registration_data("req-v11", local_block_ids=([500, 501],))
         del reg["local_num_computed_blocks"]
 
-        NixlPushConnectorWorker._do_start_push_kv(
-            w, "req-v11", ([10, 11],), reg
-        )
+        NixlPushConnectorWorker._do_start_push_kv(w, "req-v11", ([10, 11],), reg)
 
         assert self._written_block_ids(w) == ([10, 11], [500, 501])
 
-    def test_asymmetric_push_rejects_missing_v12_prefix_counts(self):
+    def test_asymmetric_push_rejects_missing_prefix_counts(self):
         w, _ = self._worker_driving_xfer()
         w.dcp_size = 8
         w.world_size = 8
@@ -2092,7 +2110,6 @@ class TestPushPrefixCaching:
         local, remote = w._map_dcp_attention_block_ids(
             ([10, 11], [20, 21]),
             (list(range(500, 516)), [600, 601]),
-            remote_rank=0,
             remote_info=remote_info,
             remote_num_computed_blocks=(2, 7),
         )
@@ -2112,7 +2129,6 @@ class TestPushPrefixCaching:
             w._map_dcp_attention_block_ids(
                 ([10, 11],),
                 ([500, 501],),
-                remote_rank=0,
                 remote_info=remote_info,
                 remote_num_computed_blocks=(0,),
             )
