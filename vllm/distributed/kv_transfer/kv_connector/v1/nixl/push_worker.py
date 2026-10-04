@@ -100,11 +100,20 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             return False
         if (self.dcp_size, remote_dcp_size) not in ((8, 1), (1, 8)):
             raise RuntimeError("Asymmetric NIXL push supports only DCP8 and DCP1.")
-        producer_tp_size = self.world_size if self.dcp_size == 8 else remote_tp_size
-        if producer_tp_size != 8:
-            raise RuntimeError("Asymmetric NIXL push requires a TP8/DCP8 producer.")
-        if self.pp_size != 1 or metadata.pp_size != 1:
-            raise RuntimeError("Asymmetric NIXL push requires PP=1 on both sides.")
+        if (self.world_size, remote_tp_size) != (self.dcp_size, remote_dcp_size):
+            raise RuntimeError(
+                "Asymmetric NIXL push requires a TP8/DCP8 producer "
+                "and TP1/DCP1 consumer."
+            )
+        if (
+            self.pp_size != 1
+            or metadata.pp_size != 1
+            or self.pcp_size != 1
+            or metadata.pcp_size != 1
+        ):
+            raise RuntimeError(
+                "Asymmetric NIXL push requires PP=1 and PCP=1 on both sides."
+            )
         if metadata.has_transferable_swa or any(
             issubclass(spec_type, SlidingWindowSpec)
             for spec_type in self._group_spec_types

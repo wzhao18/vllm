@@ -366,7 +366,10 @@ def test_needs_split_local_xfer_handles(use_mla, source_ranks, tp_ratio, expecte
     [
         pytest.param({}, {}, None, id="consumer"),
         pytest.param(
-            {"dcp_size": 8, "world_size": 8}, {"dcp_size": 1}, None, id="producer"
+            {"dcp_size": 8, "world_size": 8},
+            {"dcp_size": 1, "tp_size": 1},
+            None,
+            id="producer",
         ),
         pytest.param(
             {},
@@ -382,7 +385,7 @@ def test_needs_split_local_xfer_handles(use_mla, source_ranks, tp_ratio, expecte
         ),
         pytest.param(
             {"dcp_size": 8, "world_size": 8, "cp_kv_cache_interleave_size": 1},
-            {"dcp_size": 1},
+            {"dcp_size": 1, "tp_size": 1},
             "block-aligned",
             id="local-interleave",
         ),
@@ -396,6 +399,15 @@ def test_needs_split_local_xfer_handles(use_mla, source_ranks, tp_ratio, expecte
         pytest.param({}, {"dcp_size": 4}, "only DCP8 and DCP1", id="unsupported-dcp"),
         pytest.param({"pp_size": 2}, {}, "PP=1", id="local-pp"),
         pytest.param({}, {"pp_size": 2}, "PP=1", id="remote-pp"),
+        pytest.param({"pcp_size": 2}, {}, "PCP=1", id="local-pcp"),
+        pytest.param({}, {"pcp_size": 2}, "PCP=1", id="remote-pcp"),
+        pytest.param({"world_size": 2}, {}, "TP1/DCP1", id="local-partial-consumer"),
+        pytest.param(
+            {"dcp_size": 8, "world_size": 8},
+            {"dcp_size": 1, "tp_size": 2},
+            "TP1/DCP1",
+            id="remote-partial-consumer",
+        ),
         pytest.param({"has_swa": True}, {}, "sliding-window", id="local-swa"),
         pytest.param(
             {}, {"has_transferable_swa": True}, "sliding-window", id="remote-swa"
@@ -403,7 +415,7 @@ def test_needs_split_local_xfer_handles(use_mla, source_ranks, tp_ratio, expecte
         pytest.param({}, {"tp_size": 16}, "TP8/DCP8", id="remote-duplicate-dcp-ranks"),
         pytest.param(
             {"dcp_size": 8, "world_size": 16},
-            {"dcp_size": 1},
+            {"dcp_size": 1, "tp_size": 1},
             "TP8/DCP8",
             id="local-duplicate-dcp-ranks",
         ),
@@ -419,6 +431,7 @@ def test_validate_asymmetric_dcp_geometry(local, remote, match, notification_onl
         dcp_size=1,
         world_size=1,
         pp_size=1,
+        pcp_size=1,
         block_size=64,
         cp_kv_cache_interleave_size=64,
         has_swa=False,
@@ -428,6 +441,7 @@ def test_validate_asymmetric_dcp_geometry(local, remote, match, notification_onl
     worker.dcp_size = config["dcp_size"]
     worker.world_size = config["world_size"]
     worker.pp_size = config["pp_size"]
+    worker.pcp_size = config["pcp_size"]
     worker.block_size = config["block_size"]
     worker._group_spec_types = (SlidingWindowSpec,) if config["has_swa"] else ()
     worker.vllm_config = SimpleNamespace(
@@ -439,6 +453,7 @@ def test_validate_asymmetric_dcp_geometry(local, remote, match, notification_onl
         dcp_size=8,
         tp_size=8,
         pp_size=1,
+        pcp_size=1,
         block_size=64,
         cp_kv_cache_interleave_size=64,
         has_transferable_swa=False,
