@@ -30,12 +30,11 @@ PUSH_DONE_NOTIF_PREFIX = b"PUSH_DONE:"
 
 
 class PushCompletion(msgspec.Struct, array_like=True, frozen=True):
-    """Producer completion and per-group physical-page coverage."""
+    """Producer completion and physical attention-page counts per group."""
 
     request_id: str
     tp_size: int
-    dcp_rank: int
-    coverage: tuple[tuple[int, int], ...]
+    num_transferred_blocks: tuple[int, ...]
 
 
 #
@@ -65,8 +64,9 @@ class PushCompletion(msgspec.Struct, array_like=True, frozen=True):
 #  13: Add packed-member layouts and order-independent packed-push backend hashes
 #  14: Add CP KV-cache interleave geometry and exact push coverage
 #  15: Advertise model TP size for topology validation
+#  16: Report transferred-page counts without DCP coverage certificates
 #
-NIXL_CONNECTOR_VERSION: int = 15
+NIXL_CONNECTOR_VERSION: int = 16
 
 
 @dataclass

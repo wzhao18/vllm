@@ -423,7 +423,6 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w._push_writer_wake = threading.Event()
         w._push_writer_stop = threading.Event()
         w._push_writer_thread = None
-        w._push_coverage_by_req = defaultdict(dict)
 
         # Base worker fields touched by start_load_kv / _get_new_notifs.
         w._recving_metadata = {}
@@ -1067,18 +1066,18 @@ class TestPushWriterNotifs:
         assert meta.aggregate_remote_coverage == ()
 
     @pytest.mark.parametrize(
-        "counts,capacity,failed",
+        "counts,capacity",
         [
-            pytest.param((2, 2, 1, 1, 1, 1, 1, 1), 12, False, id="clipped-tail"),
-            pytest.param((2, 1), 4, False, id="dcp2-clipped-tail"),
-            pytest.param((2, 2, 1, 1), 8, False, id="dcp4-clipped-tail"),
-            pytest.param((2, 2) + (1,) * 14, 20, False, id="dcp16-clipped-tail"),
-            pytest.param((2, 2, 1, 1, 1, 1, 1, 1), 9, True, id="exceeds-capacity"),
-            pytest.param((1, 2, 2, 1, 1, 1, 1, 1), 12, True, id="gap-and-overlap"),
-            pytest.param((-1, 2, 1, 1, 1, 1, 1, 1), 12, True, id="negative-count"),
+            pytest.param((2, 2, 1, 1, 1, 1, 1, 1), 12, id="clipped-tail"),
+            pytest.param((2, 1), 4, id="dcp2-clipped-tail"),
+            pytest.param((2, 2, 1, 1), 8, id="dcp4-clipped-tail"),
+            pytest.param((2, 2) + (1,) * 14, 20, id="dcp16-clipped-tail"),
+            pytest.param((0, 0), 2, id="no-attention-pages"),
         ],
     )
-    def test_dcp_fan_in_records_exact_clipped_coverage(self, counts, capacity, failed):
+    def test_dcp_fan_in_waits_for_all_pushes_and_sums_transferred_pages(
+        self, counts, capacity
+    ):
         w = _StubWriterWorker.fresh()
         request_id = "req-dcp-fan-in"
         dcp_size = len(counts)
@@ -1090,72 +1089,23 @@ class TestPushWriterNotifs:
         )
         w._recving_metadata[request_id] = meta
         w.transfer_topo = MagicMock()
-        w.transfer_topo.get_engine_info.return_value = SimpleNamespace(
-            remote_tp_size=dcp_size, remote_dcp_size=dcp_size, remote_block_size=16
-        )
-        w.transfer_topo.block_size_ratio.return_value = 1
-
-        # Cached prefix length 2 shifts each producer's suffix-relative residue.
-        for producer_rank in range(dcp_size):
-            start = (producer_rank - 2) % dcp_size
-            count = counts[start]
+        transferred = 0
+        for index, count in enumerate(reversed(counts)):
             notif = PUSH_DONE_NOTIF_PREFIX + msgspec.msgpack.encode(
-                (request_id, dcp_size, producer_rank, ((start, count),))
+                (request_id, dcp_size, (count,))
             )
             w._pending_completion_notifs.put(notif)
             assert w._get_new_notifs() == set()
-            if producer_rank < dcp_size - 1:
+            transferred += count
+            assert meta.aggregate_remote_coverage == (transferred,)
+            if index < dcp_size - 1:
                 assert request_id not in w._recving_transfers
-                assert meta.aggregate_remote_coverage == ()
+                assert w.consumer_notification_counts_by_req[request_id] == index + 1
 
         assert request_id in w._recving_transfers
         assert request_id not in w.consumer_notification_counts_by_req
-        if failed:
-            assert w._failed_recv_reqs.get_nowait() == request_id
-            assert meta.aggregate_remote_coverage == ()
-        else:
-            assert meta.aggregate_remote_coverage == (sum(counts),)
-
-    @pytest.mark.parametrize("tp_size,dcp_rank", [(8, 0), (8, 8), (4, 1)])
-    def test_dcp_fan_in_rejects_invalid_producer_identity(self, tp_size, dcp_rank):
-        w = _StubWriterWorker.fresh()
-        request_id = "req-duplicate"
-        w._recving_metadata[request_id] = SimpleNamespace(
-            pp_size=1,
-            remote=SimpleNamespace(engine_id="prefill-engine"),
-            local_physical_block_ids=([1],),
-            aggregate_remote_coverage=(),
-        )
-        w.transfer_topo = MagicMock()
-        w.transfer_topo.get_engine_info.return_value = SimpleNamespace(
-            remote_tp_size=8, remote_dcp_size=8, remote_block_size=16
-        )
-        w.transfer_topo.block_size_ratio.return_value = 1
-        notif = PUSH_DONE_NOTIF_PREFIX + msgspec.msgpack.encode(
-            (request_id, 8, 0, ((0, 1),))
-        )
-
-        w._pending_completion_notifs.put(notif)
-        w._pending_completion_notifs.put(
-            PUSH_DONE_NOTIF_PREFIX
-            + msgspec.msgpack.encode((request_id, tp_size, dcp_rank, ((0, 1),)))
-        )
-        assert w._get_new_notifs() == set()
-        assert w._failed_recv_reqs.get_nowait() == request_id
-
-    @pytest.mark.parametrize("coverage", ["not-coverage", ((0, 1.5),), ((0, "1"),)])
-    def test_known_request_rejects_malformed_push_done_coverage(self, coverage):
-        w = _StubWriterWorker.fresh()
-        request_id = "req-malformed"
-        w._recving_metadata[request_id] = SimpleNamespace()
-        w.transfer_topo = MagicMock()
-        notif = PUSH_DONE_NOTIF_PREFIX + msgspec.msgpack.encode(
-            (request_id, 8, 0, coverage)
-        )
-
-        w._pending_completion_notifs.put(notif)
-        assert w._get_new_notifs() == set()
-        assert w._failed_recv_reqs.get_nowait() == request_id
+        assert meta.aggregate_remote_coverage == (sum(counts),)
+        assert w._failed_recv_reqs.empty()
 
     def test_get_transfer_results_evicts_completed_state(self):
         """Transfer completion should enqueue evictions and wake the writer."""
@@ -2114,8 +2064,7 @@ class TestPushPrefixCaching:
             assert payload == [
                 "req-pc",
                 dcp_size,
-                dcp_rank,
-                [[expected_decode[0] - decode[0], len(expected_decode)]],
+                [len(expected_decode)],
             ]
 
     def test_symmetric_push_accepts_registration_without_prefix_counts(self):

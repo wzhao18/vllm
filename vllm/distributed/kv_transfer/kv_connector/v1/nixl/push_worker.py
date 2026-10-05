@@ -244,11 +244,6 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         self._evict_finished_inbox: queue.Queue[str] = queue.Queue()
         # Handshakes that have just completed and are ready for the WRITE on wthread
         self._deferred_push_inbox = queue.Queue[tuple[str, BlockIds, dict[str, Any]]]()
-        # D-side asymmetric push coverage, keyed by request then producer
-        # DCP rank. PP>1 asymmetric push is rejected, so rank is unique.
-        self._push_coverage_by_req: dict[
-            ReqId, dict[int, tuple[tuple[int, int], ...]]
-        ] = defaultdict(dict)
 
         # Wake signal from engine main thread (start_load_kv / get_finished).
         # Writer self-polls at _PUSH_WRITER_POLL_INTERVAL_MS while it has
@@ -832,27 +827,16 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             )
 
         if self.dcp_size != remote_info.remote_dcp_size:
-            if self.pp_size != 1:
-                raise RuntimeError(
-                    "NixlPush asymmetric DCP does not support a PP-sharded producer."
-                )
-            group_coverage: list[tuple[int, int]] = []
-            for i, group in enumerate(remote_block_ids):
-                if _is_attention_spec(self._group_spec_types[i]):
-                    cached_pages = (
-                        remote_num_computed_blocks[i]
-                        * remote_info.remote_physical_blocks_per_logical
-                    )
-                    start = (self.dcp_rank - cached_pages) % self.dcp_size
-                    group_coverage.append((start, len(group)))
-                else:
-                    group_coverage.append((-1, 0))
             notif_id = PUSH_DONE_NOTIF_PREFIX + msgspec.msgpack.encode(
                 PushCompletion(
                     remote_request_id,
                     self.world_size,
-                    self.dcp_rank,
-                    tuple(group_coverage),
+                    tuple(
+                        len(group)
+                        if _is_attention_spec(self._group_spec_types[i])
+                        else 0
+                        for i, group in enumerate(remote_block_ids)
+                    ),
                 )
             )
         else:
@@ -930,35 +914,14 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             except queue.Empty:
                 break
 
-            coverage = None
-            producer_dcp_rank = None
+            num_transferred_blocks = ()
             if notif.startswith(PUSH_DONE_NOTIF_PREFIX):
-                payload = None
-                try:
-                    payload = msgspec.msgpack.decode(
-                        notif[len(PUSH_DONE_NOTIF_PREFIX) :]
-                    )
-                    completion = msgspec.convert(payload, type=PushCompletion)
-                except msgspec.DecodeError:
-                    malformed_req_id = (
-                        payload[0]
-                        if isinstance(payload, (list, tuple)) and payload
-                        else None
-                    )
-                    if (
-                        isinstance(malformed_req_id, str)
-                        and malformed_req_id in self._recving_metadata
-                    ):
-                        self._reject_push_done(
-                            malformed_req_id, "malformed PUSH_DONE notification"
-                        )
-                    else:
-                        logger.error("Malformed PUSH_DONE notification")
-                    continue
+                completion = msgspec.msgpack.decode(
+                    notif[len(PUSH_DONE_NOTIF_PREFIX) :], type=PushCompletion
+                )
                 req_id = completion.request_id
                 tp_size = completion.tp_size
-                producer_dcp_rank = completion.dcp_rank
-                coverage = completion.coverage
+                num_transferred_blocks = completion.num_transferred_blocks
             else:
                 msg = notif.decode("utf-8")
                 if msg.startswith("HB:"):
@@ -972,63 +935,23 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 if req_id in self._recv_failures:
                     continue
                 if (meta := self._recving_metadata.get(req_id)) is not None:
-                    assert meta.remote is not None
-                    remote_info = self.transfer_topo.get_engine_info(
-                        meta.remote.engine_id
-                    )
-                    asymmetric_dcp = self.dcp_size != remote_info.remote_dcp_size
-                    if asymmetric_dcp:
-                        if coverage is None or producer_dcp_rank is None:
-                            self._reject_push_done(
-                                req_id,
-                                "missing asymmetric-DCP page coverage",
-                            )
-                            continue
-                        if (
-                            tp_size != remote_info.remote_tp_size
-                            or not 0 <= producer_dcp_rank < remote_info.remote_dcp_size
-                        ):
-                            self._reject_push_done(req_id, "producer topology mismatch")
-                            continue
-                        if len(coverage) != len(meta.local_physical_block_ids):
-                            self._reject_push_done(
-                                req_id, "coverage cache-group count mismatch"
-                            )
-                            continue
-                        by_rank = self._push_coverage_by_req[req_id]
-                        if producer_dcp_rank in by_rank:
-                            self._reject_push_done(
-                                req_id,
-                                f"duplicate producer DCP rank {producer_dcp_rank}",
-                            )
-                            continue
-                        by_rank[producer_dcp_rank] = coverage
-                        if len(by_rank) < remote_info.remote_dcp_size:
-                            continue
-                        aggregate = self._validate_push_coverage(
-                            req_id,
-                            remote_info.remote_dcp_size,
-                            tuple(
-                                len(group)
-                                * self.transfer_topo.block_size_ratio(
-                                    remote_info.remote_block_size
-                                )
-                                for group in meta.local_physical_block_ids
-                            ),
+                    if num_transferred_blocks:
+                        previous = meta.aggregate_remote_coverage or (
+                            (0,) * len(num_transferred_blocks)
                         )
-                        if aggregate is None:
-                            continue
-                        meta.aggregate_remote_coverage = aggregate
-                    else:
-                        producers_per_consumer = max(1, int(tp_size) // self.world_size)
-                        expected_notifs = meta.pp_size * producers_per_consumer
-                        self.consumer_notification_counts_by_req[req_id] += 1
-                        if (
-                            self.consumer_notification_counts_by_req[req_id]
-                            < expected_notifs
-                        ):
-                            continue
-                        del self.consumer_notification_counts_by_req[req_id]
+                        meta.aggregate_remote_coverage = tuple(
+                            total + count
+                            for total, count in zip(previous, num_transferred_blocks)
+                        )
+                    producers_per_consumer = max(1, int(tp_size) // self.world_size)
+                    expected_notifs = meta.pp_size * producers_per_consumer
+                    self.consumer_notification_counts_by_req[req_id] += 1
+                    if (
+                        self.consumer_notification_counts_by_req[req_id]
+                        < expected_notifs
+                    ):
+                        continue
+                    del self.consumer_notification_counts_by_req[req_id]
                     # P drove the transfer (we own no NIXL handle), so
                     # materialise an empty ``_recving_transfers`` entry for
                     # ``_pop_done_transfers`` to report done.
@@ -1057,47 +980,6 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 self._reqs_to_send.pop(req_id, None)
         return notified_req_ids
 
-    def _reject_push_done(self, req_id: str, reason: str) -> None:
-        logger.error("Rejecting PUSH_DONE for %s: %s", req_id, reason)
-        self._push_coverage_by_req.pop(req_id, None)
-        self._recv_failures.add(req_id)
-        self._failed_recv_reqs.put(req_id)
-        self._recving_transfers.setdefault(req_id, [])
-
-    def _validate_push_coverage(
-        self,
-        req_id: str,
-        producer_dcp_size: int,
-        local_group_capacities: tuple[int, ...],
-    ) -> tuple[int, ...] | None:
-        by_rank = self._push_coverage_by_req.pop(req_id, {})
-        aggregate: list[int] = []
-        for group_idx, capacity in enumerate(local_group_capacities):
-            if not _is_attention_spec(self._group_spec_types[group_idx]):
-                if any(
-                    certificate[group_idx] != (-1, 0)
-                    for certificate in by_rank.values()
-                ):
-                    self._reject_push_done(req_id, "invalid SSM coverage")
-                    return None
-                aggregate.append(0)
-                continue
-
-            coverage = sorted(
-                certificate[group_idx] for certificate in by_rank.values()
-            )
-            covered = sum(count for _, count in coverage)
-            full_rounds, remainder = divmod(covered, producer_dcp_size)
-            expected = [
-                (residue, full_rounds + int(residue < remainder))
-                for residue in range(producer_dcp_size)
-            ]
-            if not 0 <= covered <= capacity or coverage != expected:
-                self._reject_push_done(req_id, "invalid or noncontiguous page coverage")
-                return None
-            aggregate.append(covered)
-        return tuple(aggregate)
-
     def get_transfer_results(self) -> KVConnectorTransferResults:
         # Engine main thread asking for completions: also wake the writer
         # so it gets a chance to drain NIXL notifs (heartbeats, completion
@@ -1106,8 +988,6 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
         results = super().get_transfer_results()
         done_sending = results.finished_sending
-        for req_id in results.finished_recving:
-            self._push_coverage_by_req.pop(req_id, None)
 
         # ``_pop_done_transfers`` mutates ``_sending_transfers``; the
         # writer thread also appends to it, so guard the pop.

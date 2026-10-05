@@ -136,8 +136,8 @@ may use data and expert parallelism; these do not shard their attention KV.
 - The reverse direction (DCP1 prefill to DCP-sharded decode) is not supported.
 
 Each producer writes its attention pages and its TP shard of the Mamba
-state. Decode waits for all N producers and validates their combined
-attention-page coverage before making the received cache usable.
+state. Decode uses the existing notification counter to wait for all N
+producers and sums their transferred attention-page counts for postprocessing.
 
 ### Quantized KV cache
 
