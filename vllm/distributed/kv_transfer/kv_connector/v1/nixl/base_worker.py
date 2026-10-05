@@ -947,7 +947,7 @@ class NixlBaseConnectorWorker:
         )
 
     def _validate_remote_parallel_config(
-        self, agent_metadata: NixlAgentMetadata
+        self, agent_metadata: NixlAgentMetadata, remote_tp_size: int
     ) -> None:
         local_pcp_size = self.pcp_size
         local_dcp_size = self.dcp_size
@@ -965,6 +965,10 @@ class NixlBaseConnectorWorker:
                 "Replicated PCP cannot be paired with a DCP-sharded NIXL peer. "
                 f"Local PCP/DCP={local_pcp_size}/{local_dcp_size}; "
                 f"remote PCP/DCP={remote_pcp_size}/{remote_dcp_size}."
+            )
+        if local_dcp_size != remote_dcp_size:
+            self._validate_asymmetric_dcp_compatibility(
+                agent_metadata, remote_dcp_size, remote_tp_size
             )
 
     def _sync_block_size_with_kernel(self) -> None:
@@ -1129,7 +1133,7 @@ class NixlBaseConnectorWorker:
                         f"Failed to decode NixlAgentMetadata. Error: {e}"
                     ) from e
 
-                self._validate_remote_parallel_config(metadata)
+                self._validate_remote_parallel_config(metadata, remote_tp_size)
 
                 # Ensure engine id matches.
                 if metadata.engine_id != expected_engine_id:
@@ -2507,10 +2511,6 @@ class NixlBaseConnectorWorker:
         assert remote_info.remote_tp_size == remote_tp_size
         assert remote_info.remote_dcp_size == remote_dcp_size
         asymmetric_dcp = self.dcp_size != remote_dcp_size
-        if asymmetric_dcp:
-            self._validate_asymmetric_dcp_compatibility(
-                nixl_agent_meta, remote_dcp_size, remote_tp_size
-            )
         # DCP sizes must divide one another; this is what keeps the
         # read-slicing math in pull_worker a closed form.
         assert (

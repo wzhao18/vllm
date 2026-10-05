@@ -18,6 +18,7 @@ from vllm.config import KVTransferConfig, set_current_vllm_config
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import base_worker as bw
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlAgentMetadata,
+    NixlHandshakePayload,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
     NixlConnectorWorker,
@@ -365,6 +366,12 @@ def test_needs_split_local_xfer_handles(use_mla, source_ranks, tp_ratio, expecte
     "local,remote,match",
     [
         pytest.param({}, {}, None, id="consumer"),
+        pytest.param(
+            {},
+            {"dcp_size": 1, "tp_size": 1, "cp_kv_cache_interleave_size": 1},
+            None,
+            id="symmetric-skips-asymmetric-check",
+        ),
         *[
             pytest.param(
                 {},
@@ -417,8 +424,8 @@ def test_needs_split_local_xfer_handles(use_mla, source_ranks, tp_ratio, expecte
         pytest.param({}, {"dcp_size": 4}, "TP=DCP", id="mismatched-producer-tp"),
         pytest.param({"pp_size": 2}, {}, "PP=1", id="local-pp"),
         pytest.param({}, {"pp_size": 2}, "PP=1", id="remote-pp"),
-        pytest.param({"pcp_size": 2}, {}, "PCP=1", id="local-pcp"),
-        pytest.param({}, {"pcp_size": 2}, "PCP=1", id="remote-pcp"),
+        pytest.param({"pcp_size": 2}, {}, "Replicated PCP", id="local-pcp"),
+        pytest.param({}, {"pcp_size": 2}, "full PCP group", id="remote-pcp"),
         pytest.param({"world_size": 2}, {}, "TP1/DCP1", id="local-partial-consumer"),
         pytest.param(
             {"dcp_size": 8, "world_size": 8},
@@ -441,6 +448,7 @@ def test_needs_split_local_xfer_handles(use_mla, source_ranks, tp_ratio, expecte
 )
 @pytest.mark.parametrize("notification_only", [False, True])
 def test_validate_asymmetric_dcp_geometry(local, remote, match, notification_only):
+    """Reject unsupported peers before either handshake registration path."""
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
         NixlPushConnectorWorker,
     )
@@ -477,27 +485,60 @@ def test_validate_asymmetric_dcp_geometry(local, remote, match, notification_onl
         has_transferable_swa=False,
     )
     peer.update(remote)
-    metadata = SimpleNamespace(**peer)
-    with patch.object(
-        bw.NixlBaseConnectorWorker, "_add_notif_only_remote_agent"
-    ) as register:
-
-        def validate():
-            if notification_only:
-                return worker._add_notif_only_remote_agent(
-                    metadata, metadata.tp_size, metadata.dcp_size
-                )
-            return worker._validate_asymmetric_dcp_compatibility(
-                metadata, metadata.dcp_size, metadata.tp_size
-            )
-
+    remote_tp_size = peer.pop("tp_size")
+    metadata = NixlAgentMetadata(
+        engine_id="peer",
+        agent_metadata=b"agent",
+        kv_caches_base_addr=[0x1000],
+        device_id=0,
+        num_blocks=4,
+        block_lens=[4096],
+        block_strides=[4096],
+        kv_cache_layout="HND",
+        ssm_sizes=(0, 0),
+        attn_backend_name="TOKENSPEED_MLA",
+        physical_blocks_per_logical_kv_block=1,
+        **peer,
+    )
+    worker._is_csa_linear = False
+    worker.use_host_buffer = True
+    worker.compat_hash = "compatible"
+    worker.enforce_compat_hash = True
+    worker.transfer_topo = MagicMock()
+    worker.transfer_topo.handshake_target_ranks.return_value = [0]
+    payload = NixlHandshakePayload(
+        compatibility_hash=worker.compat_hash,
+        agent_metadata_bytes=msgspec.msgpack.encode(metadata),
+    )
+    with (
+        patch.object(bw, "zmq_ctx") as transport,
+        patch.object(worker, "add_remote_agent", return_value="agent") as full,
+        patch.object(
+            worker, "_add_notif_only_remote_agent", return_value="agent"
+        ) as notif,
+    ):
+        sock = transport.return_value.__enter__.return_value
+        sock.recv_multipart.return_value = [
+            msgspec.msgpack.encode(payload),
+            msgspec.msgpack.encode(0.0),
+        ]
+        args = dict(
+            host="localhost",
+            port=1234,
+            remote_tp_size=remote_tp_size,
+            expected_engine_id=metadata.engine_id,
+            remote_dcp_size=metadata.dcp_size,
+            notif_agents_only=notification_only,
+        )
         if match is None:
-            validate()
-            assert register.called is notification_only
+            worker._nixl_handshake(**args)
+            assert notif.called is notification_only
+            assert full.called is not notification_only
         else:
-            with pytest.raises(RuntimeError, match=match):
-                validate()
-            register.assert_not_called()
+            with pytest.raises((RuntimeError, NotImplementedError), match=match):
+                worker._nixl_handshake(**args)
+            full.assert_not_called()
+            notif.assert_not_called()
 
 
 @pytest.mark.cpu_test
@@ -506,14 +547,10 @@ def test_pull_preserves_pure_mla_divisible_asymmetric_dcp():
     worker._TRANSFER_MODE = "pull"
     worker._has_mamba = False
     worker.dcp_size = 2
-    remote = SimpleNamespace()
+    worker.pcp_size = 1
+    remote = SimpleNamespace(dcp_size=8, pcp_size=1)
 
-    assert (
-        worker._validate_asymmetric_dcp_compatibility(
-            remote, remote_dcp_size=8, remote_tp_size=8
-        )
-        is None
-    )
+    assert worker._validate_remote_parallel_config(remote, remote_tp_size=8) is None
 
 
 @pytest.mark.cpu_test

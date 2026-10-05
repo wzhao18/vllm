@@ -136,17 +136,6 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 f"set --cp-kv-cache-interleave-size to {block_size}, got {interleave}."
             )
 
-    def _add_notif_only_remote_agent(
-        self, metadata: NixlAgentMetadata, remote_tp_size: int, remote_dcp_size: int = 1
-    ) -> str:
-        if self.dcp_size != remote_dcp_size:
-            self._validate_asymmetric_dcp_compatibility(
-                metadata, remote_dcp_size, remote_tp_size
-            )
-        return super()._add_notif_only_remote_agent(
-            metadata, remote_tp_size, remote_dcp_size
-        )
-
     def add_remote_agent(
         self,
         nixl_agent_meta: NixlAgentMetadata,
