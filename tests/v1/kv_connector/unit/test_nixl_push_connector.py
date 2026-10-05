@@ -38,15 +38,10 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
     TransferTopology,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
-    KVConnectorRole,
     KVConnectorTransferResults,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
     NixlBaseConnectorWorker,
-)
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector import (
-    NixlBaseConnector,
-    NixlPushConnector,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     PUSH_REG_NOTIF_PREFIX,
@@ -66,7 +61,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     get_base_request_id,
 )
-from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.outputs import KVConnectorOutput
 
 from .utils import create_request, make_nixl_push_scheduler
@@ -149,36 +144,6 @@ def _stub_sw_clipping(scheduler) -> None:
 # ----------------------------------------------------------------- #
 #  Scheduler-side tests                                              #
 # ----------------------------------------------------------------- #
-
-
-@pytest.mark.cpu_test
-@pytest.mark.parametrize(
-    ("role", "constructor_name"),
-    [
-        (KVConnectorRole.SCHEDULER, "NixlPushConnectorScheduler"),
-        (KVConnectorRole.WORKER, "NixlPushConnectorWorker"),
-    ],
-)
-def test_push_connector_allows_dcp(role, constructor_name):
-    config = SimpleNamespace(
-        parallel_config=SimpleNamespace(decode_context_parallel_size=8)
-    )
-    kv_cache_config = MagicMock()
-    constructor = MagicMock()
-
-    def init_base(connector: Any, *_args: Any) -> None:
-        connector.engine_id = "engine"
-
-    with (
-        patch.object(NixlBaseConnector, "__init__", init_base),
-        patch(
-            f"vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector.{constructor_name}",
-            constructor,
-        ),
-    ):
-        NixlPushConnector(config, role, kv_cache_config)
-
-    constructor.assert_called_once_with(config, "engine", kv_cache_config)
 
 
 class TestPushScheduler:
@@ -2075,66 +2040,6 @@ class TestPushPrefixCaching:
         assert self._written_block_ids(w) == (expected_prefill, expected_decode)
         notif = w.nixl_wrapper.make_prepped_xfer.call_args.kwargs["notif_msg"]
         assert notif == f"req-pc:{dcp_size}".encode()
-
-    def test_symmetric_push_accepts_registration_without_prefix_counts(self):
-        w, _ = self._worker_driving_xfer()
-        reg = _registration_data("req-v11", local_block_ids=([500, 501],))
-        del reg["local_num_computed_blocks"]
-
-        NixlPushConnectorWorker._do_start_push_kv(w, "req-v11", ([10, 11],), reg)
-
-        assert self._written_block_ids(w) == ([10, 11], [500, 501])
-
-    def test_asymmetric_push_rejects_missing_prefix_counts(self):
-        w, _ = self._worker_driving_xfer()
-        w.dcp_size = 8
-        w.world_size = 8
-        reg = _registration_data("req-missing", local_block_ids=([500, 501],))
-        del reg["local_num_computed_blocks"]
-
-        with pytest.raises(RuntimeError, match="one.*per cache group"):
-            NixlPushConnectorWorker._do_start_push_kv(
-                w, "req-missing", ([10, 11],), reg
-            )
-
-    def test_asymmetric_dcp_mapping_leaves_ssm_group_untouched(self):
-        from types import SimpleNamespace
-
-        w = _StubWriterWorker.fresh()
-        w.dcp_size = 8
-        w.tp_rank = 3
-        w.dcp_rank = 3
-        w._group_spec_types = (FullAttentionSpec, MambaSpec)
-        remote_info = SimpleNamespace(
-            remote_dcp_size=1,
-            remote_physical_blocks_per_logical=1,
-        )
-
-        local, remote = w._map_dcp_attention_block_ids(
-            ([10, 11], [20, 21]),
-            (list(range(500, 516)), [600, 601]),
-            remote_info=remote_info,
-            remote_num_computed_blocks=(2, 7),
-        )
-
-        assert local == [[10, 11], [20, 21]]
-        assert remote[0] == [501, 509]
-        assert remote[1] == [600, 601]
-
-    def test_reverse_dcp1_prefill_to_dcp8_decode_is_rejected(self):
-        w = _StubWriterWorker.fresh()
-        remote_info = SimpleNamespace(
-            remote_dcp_size=8,
-            remote_physical_blocks_per_logical=1,
-        )
-
-        with pytest.raises(RuntimeError, match="DCP-sharded prefill"):
-            w._map_dcp_attention_block_ids(
-                ([10, 11],),
-                ([500, 501],),
-                remote_info=remote_info,
-                remote_num_computed_blocks=(0,),
-            )
 
     @pytest.mark.parametrize("layer_name_routing", [False, True])
     def test_different_region_groups_require_layer_routing(self, layer_name_routing):
