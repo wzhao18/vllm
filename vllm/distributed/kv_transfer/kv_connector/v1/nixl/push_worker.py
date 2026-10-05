@@ -48,11 +48,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
     NixlBaseConnectorWorker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
-    PUSH_DONE_NOTIF_PREFIX,
     PUSH_REG_NOTIF_PREFIX,
     NixlAgentMetadata,
     NixlConnectorMetadata,
-    PushCompletion,
     RemoteMeta,
     ReqId,
     ReqMeta,
@@ -88,6 +86,24 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
     _TRANSFER_MODE: str = "push"
 
     _supports_pp_hma = True
+
+    def _get_remote_block_count(self, meta: ReqMeta, group_id: int) -> int:
+        """Count attention pages in the producer's uncached DCP suffix."""
+        assert meta.remote is not None
+        if meta.dcp_size == self.dcp_size:
+            return super()._get_remote_block_count(meta, group_id)
+        assert self.transfer_topo is not None
+        remote_info = self.transfer_topo.get_engine_info(meta.remote.engine_id)
+        producer_pages = (
+            len(meta.remote.block_ids[group_id])
+            * remote_info.remote_physical_blocks_per_logical
+            * meta.dcp_size
+        )
+        cached_pages = (
+            meta.local_num_computed_blocks[group_id]
+            * self._physical_blocks_per_logical_kv_block
+        )
+        return max(0, producer_pages - cached_pages)
 
     def _validate_asymmetric_dcp_compatibility(
         self,
@@ -826,21 +842,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 f"{len(remote_block_ids[i])} remote blocks"
             )
 
-        if self.dcp_size != remote_info.remote_dcp_size:
-            notif_id = PUSH_DONE_NOTIF_PREFIX + msgspec.msgpack.encode(
-                PushCompletion(
-                    remote_request_id,
-                    self.world_size,
-                    tuple(
-                        len(group)
-                        if _is_attention_spec(self._group_spec_types[i])
-                        else 0
-                        for i, group in enumerate(remote_block_ids)
-                    ),
-                )
-            )
-        else:
-            notif_id = f"{remote_request_id}:{self.world_size}".encode()
+        notif_id = f"{remote_request_id}:{self.world_size}".encode()
 
         # Get descs ids.
         remote_block_descs_ids = self._compute_desc_ids(
@@ -914,35 +916,18 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             except queue.Empty:
                 break
 
-            num_transferred_blocks = ()
-            if notif.startswith(PUSH_DONE_NOTIF_PREFIX):
-                completion = msgspec.msgpack.decode(
-                    notif[len(PUSH_DONE_NOTIF_PREFIX) :], type=PushCompletion
-                )
-                req_id = completion.request_id
-                tp_size = completion.tp_size
-                num_transferred_blocks = completion.num_transferred_blocks
-            else:
-                msg = notif.decode("utf-8")
-                if msg.startswith("HB:"):
-                    self._handle_heartbeat(msg[3:])
-                    continue
-                req_id, tp_size_text = msg.rsplit(":", 1)
-                tp_size = int(tp_size_text)
+            msg = notif.decode("utf-8")
+            if msg.startswith("HB:"):
+                self._handle_heartbeat(msg[3:])
+                continue
+            req_id, tp_size_text = msg.rsplit(":", 1)
+            tp_size = int(tp_size_text)
 
             # Not tracked as a P-side send/process for this notif.
             if req_id not in self._reqs_to_send and req_id not in self._reqs_to_process:
                 if req_id in self._recv_failures:
                     continue
                 if (meta := self._recving_metadata.get(req_id)) is not None:
-                    if num_transferred_blocks:
-                        previous = meta.aggregate_remote_coverage or (
-                            (0,) * len(num_transferred_blocks)
-                        )
-                        meta.aggregate_remote_coverage = tuple(
-                            total + count
-                            for total, count in zip(previous, num_transferred_blocks)
-                        )
                     producers_per_consumer = max(1, int(tp_size) // self.world_size)
                     expected_notifs = meta.pp_size * producers_per_consumer
                     self.consumer_notification_counts_by_req[req_id] += 1

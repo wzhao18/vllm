@@ -137,7 +137,8 @@ may use data and expert parallelism; these do not shard their attention KV.
 
 Each producer writes its attention pages and its TP shard of the Mamba
 state. Decode uses the existing notification counter to wait for all N
-producers and sums their transferred attention-page counts for postprocessing.
+producers and derives the received page count from the producer's block metadata
+and its own cached prefix.
 
 ### Quantized KV cache
 

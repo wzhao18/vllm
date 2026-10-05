@@ -5,8 +5,6 @@
 from dataclasses import dataclass, field
 from typing import Any
 
-import msgspec
-
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds, EngineId
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -26,17 +24,6 @@ GET_META_MSG = b"get_meta_msg"
 # Sent worker-to-worker over NIXL: D worker -> P worker, encoded as
 # PUSH_REG_NOTIF_PREFIX + msgpack(registration_data).
 PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
-PUSH_DONE_NOTIF_PREFIX = b"PUSH_DONE:"
-
-
-class PushCompletion(msgspec.Struct, array_like=True, frozen=True):
-    """Producer completion and physical attention-page counts per group."""
-
-    request_id: str
-    tp_size: int
-    num_transferred_blocks: tuple[int, ...]
-
-
 #
 # NIXL Connector Version
 #
@@ -65,8 +52,9 @@ class PushCompletion(msgspec.Struct, array_like=True, frozen=True):
 #  14: Add CP KV-cache interleave geometry and exact push coverage
 #  15: Advertise model TP size for topology validation
 #  16: Report transferred-page counts without DCP coverage certificates
+#  17: Derive asymmetric push page counts from retained producer metadata
 #
-NIXL_CONNECTOR_VERSION: int = 16
+NIXL_CONNECTOR_VERSION: int = 17
 
 
 @dataclass
@@ -278,9 +266,6 @@ class ReqMeta:
     # Worker-only, per-region physical pages to zero after a successful pull.
     # None selects group-based completion; empty lists mean no zeroing.
     region_blocks_to_zero: BlockIds | None = None
-    # Exact number of physical attention pages written across all producer
-    # shards, per cache group. Empty for pull transfers.
-    aggregate_remote_coverage: tuple[int, ...] = ()
 
 
 class NixlConnectorMetadata(KVConnectorMetadata):

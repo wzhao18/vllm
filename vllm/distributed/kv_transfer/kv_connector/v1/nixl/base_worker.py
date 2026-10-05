@@ -3022,19 +3022,13 @@ class NixlBaseConnectorWorker:
                 block_size_ratio > 1
                 or self.enable_permute_local_kv
                 or hetero_ppl
-                or meta.aggregate_remote_coverage
+                or (self._TRANSFER_MODE == "push" and meta.dcp_size != self.dcp_size)
             ):
                 for g, local_group in enumerate(meta.local_physical_block_ids):
                     if not local_group or _is_ssm_spec(self._group_spec_types[g]):
                         continue
                     local_sub_blocks = len(local_group) * block_size_ratio
-                    # Push fan-in reports exact aggregate physical-page
-                    # coverage. Pull transfers derive it from remote IDs.
-                    remote_coverage = (
-                        meta.aggregate_remote_coverage[g]
-                        if g < len(meta.aggregate_remote_coverage)
-                        else len(meta.remote.block_ids[g])
-                    )
+                    remote_coverage = self._get_remote_block_count(meta, g)
                     covered_sub_blocks = min(local_sub_blocks, remote_coverage)
                     block_ids_for_blocksize_post_process[block_size_ratio].append(
                         (local_group, covered_sub_blocks)
@@ -3071,6 +3065,11 @@ class NixlBaseConnectorWorker:
             finished_recving=done_recving,
             failed_recving=failed_recv_reqs,
         )
+
+    def _get_remote_block_count(self, meta: ReqMeta, group_id: int) -> int:
+        """Return the remote attention-page count for receive postprocessing."""
+        assert meta.remote is not None
+        return len(meta.remote.block_ids[group_id])
 
     def get_finished(self) -> tuple[set[str], set[str]]:
         """Compatibility wrapper for the legacy completion API."""

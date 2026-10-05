@@ -49,7 +49,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector import (
     NixlPushConnector,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
-    PUSH_DONE_NOTIF_PREFIX,
     PUSH_REG_NOTIF_PREFIX,
     NixlAgentMetadata,
     NixlConnectorMetadata,
@@ -230,16 +229,27 @@ class TestPushScheduler:
         # Tracked as awaiting a recv.
         assert request.request_id in sched._reqs_need_recv
 
-    def test_d_side_registration_carries_cached_blocks_per_group(self):
+    @pytest.mark.parametrize("dcp_size", [1, 2, 4, 8, 16])
+    def test_d_side_registration_carries_cached_blocks_per_group(self, dcp_size):
         sched = make_nixl_push_scheduler()
+        sched.vllm_config.parallel_config.decode_context_parallel_size = 1
         _stub_sw_clipping(sched)
         request = _make_request(request_id="req-d-cached")
+        producer_blocks = ([30, 31, 32], [40])
+        request.kv_transfer_params.update(
+            dcp_size=dcp_size, remote_block_ids=producer_blocks
+        )
         blocks = _BlocksMock(([12], [22, 23]), cached_counts=(2, 1))
 
         sched.update_state_after_alloc(request, blocks, num_external_tokens=48)
 
         reg = sched._push_pending_registrations[request.request_id]
         assert reg["local_num_computed_blocks"] == (2, 1)
+        _, _, cached, _ = sched._reqs_need_recv[request.request_id]
+        assert cached == (2, 1)
+        assert request.kv_transfer_params["remote_block_ids"] == (
+            producer_blocks if dcp_size != 1 else ()
+        )
 
     def test_p_side_request_finished_stages_blocks(self):
         """P scheduler pushes blocks into both _finished_request_blocks (lease)
@@ -982,7 +992,14 @@ def test_start_load_kv_skips_liveness_for_unconnected_engine():
 
 
 class TestPushWriterNotifs:
-    def test_clipped_fan_in_zeroes_unwritten_tail_with_equal_geometry(self):
+    @pytest.mark.parametrize("dcp_size", [2, 4, 8, 16])
+    @pytest.mark.parametrize(
+        "producer_ppl,decode_ppl", [(1, 1), (2, 4), (4, 2), (14, 112)]
+    )
+    @pytest.mark.parametrize("cached", [0, 1, 3])
+    def test_clipped_fan_in_zeroes_unwritten_tail_with_equal_geometry(
+        self, dcp_size, producer_ppl, decode_ppl, cached
+    ):
         from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
             NixlBaseConnectorWorker,
         )
@@ -993,19 +1010,22 @@ class TestPushWriterNotifs:
 
         w = _StubWriterWorker.fresh()
         request_id = "req-clipped-fan-in"
-        local_blocks = list(range(12))
+        producer_blocks = list(range(5))
+        local_blocks = list(range(12 * decode_ppl))
+        w._physical_blocks_per_logical_kv_block = decode_ppl
         w._recving_metadata[request_id] = ReqMeta(
             local_block_ids=(local_blocks,),
             local_physical_block_ids=(local_blocks,),
             tp_size=1,
+            dcp_size=dcp_size,
+            local_num_computed_blocks=(cached,),
             remote=RemoteMeta(
-                block_ids=([],),
+                block_ids=(producer_blocks,),
                 host="",
                 port=0,
                 engine_id="prefill-engine",
                 request_id="prefill-request",
             ),
-            aggregate_remote_coverage=(10,),
         )
         w._recving_transfers[request_id] = []
         w._replicated_pcp_done_sending = set()
@@ -1021,7 +1041,7 @@ class TestPushWriterNotifs:
         w.transfer_topo = MagicMock()
         w.transfer_topo.get_engine_info.return_value = SimpleNamespace(
             remote_block_size=16,
-            remote_physical_blocks_per_logical=1,
+            remote_physical_blocks_per_logical=producer_ppl,
         )
         w.transfer_topo.block_size_ratio.return_value = 1
         w.post_process_device_kv_on_receive = MagicMock()
@@ -1029,9 +1049,25 @@ class TestPushWriterNotifs:
 
         result = NixlBaseConnectorWorker.get_transfer_results(w)
 
+        # Use the producer's actual mapping as the reference, not the count formula.
+        transferred = sum(
+            len(
+                w._apply_dcp_prefix_caching(
+                    local_ids=local_blocks,
+                    remote_ids=list(range(len(producer_blocks) * producer_ppl)),
+                    remote_rank=rank,
+                    local_dcp_size=1,
+                    local_dcp_rank=0,
+                    remote_dcp_size=dcp_size,
+                    local_num_computed_blocks=cached * decode_ppl,
+                )[0]
+            )
+            for rank in range(dcp_size)
+        )
+
         assert result.finished_recving == {request_id}
         w.post_process_device_kv_on_receive.assert_called_once_with(
-            1, [(local_blocks, 10)], False
+            1, [(local_blocks, transferred)], False
         )
 
     def test_get_new_notifs_processes_forwarded_completion_notif(self):
@@ -1045,7 +1081,6 @@ class TestPushWriterNotifs:
             pp_size=1,
             remote=SimpleNamespace(engine_id="prefill-engine"),
             local_physical_block_ids=([1, 2],),
-            aggregate_remote_coverage=(),
         )
         w._recving_metadata[request_id] = meta
         # Compose the standard completion notif: req_id:tp_size.
@@ -1063,48 +1098,28 @@ class TestPushWriterNotifs:
         # Notif consumed; D-side just touches _recving_transfers.
         assert notified == set()
         assert request_id in w._recving_transfers
-        assert meta.aggregate_remote_coverage == ()
 
-    @pytest.mark.parametrize(
-        "counts,capacity",
-        [
-            pytest.param((2, 2, 1, 1, 1, 1, 1, 1), 12, id="clipped-tail"),
-            pytest.param((2, 1), 4, id="dcp2-clipped-tail"),
-            pytest.param((2, 2, 1, 1), 8, id="dcp4-clipped-tail"),
-            pytest.param((2, 2) + (1,) * 14, 20, id="dcp16-clipped-tail"),
-            pytest.param((0, 0), 2, id="no-attention-pages"),
-        ],
-    )
-    def test_dcp_fan_in_waits_for_all_pushes_and_sums_transferred_pages(
-        self, counts, capacity
-    ):
+    @pytest.mark.parametrize("dcp_size", [2, 4, 8, 16])
+    def test_dcp_fan_in_waits_for_all_pushes(self, dcp_size):
         w = _StubWriterWorker.fresh()
         request_id = "req-dcp-fan-in"
-        dcp_size = len(counts)
         meta = SimpleNamespace(
             pp_size=1,
             remote=SimpleNamespace(engine_id="prefill-engine"),
-            local_physical_block_ids=(list(range(capacity)),),
-            aggregate_remote_coverage=(),
+            local_physical_block_ids=([1, 2],),
         )
         w._recving_metadata[request_id] = meta
         w.transfer_topo = MagicMock()
-        transferred = 0
-        for index, count in enumerate(reversed(counts)):
-            notif = PUSH_DONE_NOTIF_PREFIX + msgspec.msgpack.encode(
-                (request_id, dcp_size, (count,))
-            )
+        for index in range(dcp_size):
+            notif = f"{request_id}:{dcp_size}".encode()
             w._pending_completion_notifs.put(notif)
             assert w._get_new_notifs() == set()
-            transferred += count
-            assert meta.aggregate_remote_coverage == (transferred,)
             if index < dcp_size - 1:
                 assert request_id not in w._recving_transfers
                 assert w.consumer_notification_counts_by_req[request_id] == index + 1
 
         assert request_id in w._recving_transfers
         assert request_id not in w.consumer_notification_counts_by_req
-        assert meta.aggregate_remote_coverage == (sum(counts),)
         assert w._failed_recv_reqs.empty()
 
     def test_get_transfer_results_evicts_completed_state(self):
@@ -2058,14 +2073,8 @@ class TestPushPrefixCaching:
         NixlPushConnectorWorker._do_start_push_kv(w, "req-pc", (prefill,), reg)
 
         assert self._written_block_ids(w) == (expected_prefill, expected_decode)
-        if dcp_size > 1:
-            notif = w.nixl_wrapper.make_prepped_xfer.call_args.kwargs["notif_msg"]
-            payload = msgspec.msgpack.decode(notif[len(PUSH_DONE_NOTIF_PREFIX) :])
-            assert payload == [
-                "req-pc",
-                dcp_size,
-                [len(expected_decode)],
-            ]
+        notif = w.nixl_wrapper.make_prepped_xfer.call_args.kwargs["notif_msg"]
+        assert notif == f"req-pc:{dcp_size}".encode()
 
     def test_symmetric_push_accepts_registration_without_prefix_counts(self):
         w, _ = self._worker_driving_xfer()

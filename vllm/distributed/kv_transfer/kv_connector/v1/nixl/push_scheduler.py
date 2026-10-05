@@ -198,15 +198,17 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         self._push_registration_deadlines[request.request_id] = (
             time.perf_counter() + self._push_registration_timeout
         )
-        # In push mode D doesn't know P's blocks; P determines them
-        # from the registration. We still track the request as
-        # needing recv so the engine waits for P's WRITE completion.
-        # ``remote_block_ids`` is also seeded to an empty tuple so the
-        # base scheduler's ``add_new_req_to_recv`` can build the
-        # ReqMeta without a KeyError — the actual remote block IDs are
-        # learned by P over the NIXL handshake at WRITE time.
-        params["remote_block_ids"] = ()
-        self._reqs_need_recv[request.request_id] = (request, local_block_ids, (), False)
+        # Asymmetric DCP needs P's block counts to identify the received tail.
+        if params.get("dcp_size", 1) == (
+            self.vllm_config.parallel_config.decode_context_parallel_size
+        ):
+            params["remote_block_ids"] = ()
+        self._reqs_need_recv[request.request_id] = (
+            request,
+            local_block_ids,
+            local_num_computed_blocks,
+            False,
+        )
 
         # Mark as processed so a re-entry (e.g. preemption + reschedule)
         # doesn't re-stage the registration.
