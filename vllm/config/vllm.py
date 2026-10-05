@@ -3367,9 +3367,10 @@ class VllmConfig:
                 "deprecated when PCP is fully supported."
             )
 
-        if self.kv_transfer_config is None or not self.kv_transfer_config.has_connector(
-            "NixlConnector"
-        ):
+        if self.kv_transfer_config is None:
+            return
+        nixl_push = self.kv_transfer_config.has_connector("NixlPushConnector")
+        if not (self.kv_transfer_config.has_connector("NixlConnector") or nixl_push):
             return
         if not self.parallel_config._allow_auto_resolve_cp_interleave_size:
             return
@@ -3379,6 +3380,15 @@ class VllmConfig:
         local_block_size = min(
             g.kv_cache_spec.block_size for g in kv_cache_config.kv_cache_groups
         )
+        if nixl_push:
+            from vllm.distributed.kv_transfer.kv_connector.utils import (
+                get_current_attn_backends,
+            )
+            from vllm.v1.worker.utils import select_common_block_size
+
+            local_block_size = select_common_block_size(
+                local_block_size, get_current_attn_backends(self)
+            )
         if self.parallel_config.cp_kv_cache_interleave_size != local_block_size:
             interleave = self.parallel_config.cp_kv_cache_interleave_size
             self.parallel_config.cp_kv_cache_interleave_size = local_block_size
