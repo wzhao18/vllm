@@ -49,10 +49,7 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #  11: Add per-region transfer geometry and memory types to NixlAgentMetadata
 #  12: Add per-region member names for PP push
 #  13: Add packed-member layouts and order-independent packed-push backend hashes
-#  14: Add CP KV-cache interleave geometry and exact push coverage
-#  15: Advertise model TP size for topology validation
-#  16: Report transferred-page counts without DCP coverage certificates
-#  17: Derive asymmetric push page counts from retained producer metadata
+#  17: Add asymmetric DCP push geometry and model TP metadata
 #
 NIXL_CONNECTOR_VERSION: int = 17
 

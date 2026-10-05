@@ -3027,9 +3027,12 @@ class NixlBaseConnectorWorker:
                 for g, local_group in enumerate(meta.local_physical_block_ids):
                     if not local_group or _is_ssm_spec(self._group_spec_types[g]):
                         continue
-                    local_sub_blocks = len(local_group) * block_size_ratio
-                    remote_coverage = self._get_remote_block_count(meta, g)
-                    covered_sub_blocks = min(local_sub_blocks, remote_coverage)
+                    # Number of remote-sized sub-blocks the transfer covered;
+                    # everything past this was clipped and must be zeroed.
+                    covered_sub_blocks = min(
+                        len(local_group) * block_size_ratio,
+                        self._get_remote_block_count(meta, g),
+                    )
                     block_ids_for_blocksize_post_process[block_size_ratio].append(
                         (local_group, covered_sub_blocks)
                     )

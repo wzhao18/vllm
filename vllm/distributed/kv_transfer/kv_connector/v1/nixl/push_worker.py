@@ -439,6 +439,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         if not isinstance(rid, str):
             logger.warning("PUSH_REG notif missing request_id; dropping")
             return
+
         match = self._pop_matching_finished_blocks(rid)
         if match is not None:
             fin_id, blocks = match
@@ -616,7 +617,6 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
             fut.add_done_callback(_on_handshake)
             return
-
         # Keep the engine alive while it is actively receiving pushes, mirroring
         # how pull-mode transfers touch _engine_last_active in start_load_kv.
         self._engine_last_active[decode_engine_id] = time.perf_counter()
@@ -808,6 +808,8 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 )
             )
 
+        notif_id = f"{remote_request_id}:{self.world_size}".encode()
+
         local_block_ids, remote_block_ids = self._map_dcp_attention_block_ids(
             local_block_ids,
             remote_block_ids,
@@ -841,8 +843,6 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 f"{len(local_block_ids[i])} local vs "
                 f"{len(remote_block_ids[i])} remote blocks"
             )
-
-        notif_id = f"{remote_request_id}:{self.world_size}".encode()
 
         # Get descs ids.
         remote_block_descs_ids = self._compute_desc_ids(
@@ -920,21 +920,20 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             if msg.startswith("HB:"):
                 self._handle_heartbeat(msg[3:])
                 continue
-            req_id, tp_size_text = msg.rsplit(":", 1)
-            tp_size = int(tp_size_text)
+
+            req_id, tp_size = msg.rsplit(":", 1)
 
             # Not tracked as a P-side send/process for this notif.
             if req_id not in self._reqs_to_send and req_id not in self._reqs_to_process:
-                if req_id in self._recv_failures:
-                    continue
                 if (meta := self._recving_metadata.get(req_id)) is not None:
+                    # Consumer waits for one notif per producer rank writing
+                    # here: pp_size stages * producers-per-consumer (>1 when
+                    # producer TP > consumer TP; tp_size is the producer TP).
                     producers_per_consumer = max(1, int(tp_size) // self.world_size)
                     expected_notifs = meta.pp_size * producers_per_consumer
                     self.consumer_notification_counts_by_req[req_id] += 1
-                    if (
-                        self.consumer_notification_counts_by_req[req_id]
-                        < expected_notifs
-                    ):
+                    notifs = self.consumer_notification_counts_by_req[req_id]
+                    if notifs < expected_notifs:
                         continue
                     del self.consumer_notification_counts_by_req[req_id]
                     # P drove the transfer (we own no NIXL handle), so
