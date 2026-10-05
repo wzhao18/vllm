@@ -5,7 +5,6 @@
 import contextlib
 import itertools
 import logging
-import math
 import os
 import queue
 import threading
@@ -15,7 +14,7 @@ from collections import defaultdict
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import msgspec
 import numpy as np
@@ -60,6 +59,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     _NIXL_SUPPORTED_DEVICE,
     get_representative_spec_type,
+    get_transfer_block_size,
     zmq_ctx,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import (
@@ -574,16 +574,8 @@ class NixlBaseConnectorWorker:
         )
 
         self.kv_cache_config = kv_cache_config
-        transfer_block_sizes = [
-            group.kv_cache_spec.block_size
-            for group in kv_cache_config.transfer_groups
-            if get_representative_spec_type(group.kv_cache_spec)
-            not in (MambaSpec, CircularBufferSpec)
-        ]
-        self.block_size = (
-            math.lcm(*transfer_block_sizes)
-            if transfer_block_sizes
-            else cast(int, vllm_config.cache_config.block_size)
+        self.block_size = get_transfer_block_size(
+            kv_cache_config, vllm_config.cache_config.block_size
         )
         # Per-layer specs, unwrapping UniformTypeKVCacheSpecs group wrappers.
         self._layer_specs: dict[str, KVCacheSpec] = {}

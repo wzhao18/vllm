@@ -3384,10 +3384,14 @@ class VllmConfig:
             from vllm.distributed.kv_transfer.kv_connector.utils import (
                 get_current_attn_backends,
             )
+            from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
+                get_transfer_block_size,
+            )
             from vllm.v1.worker.utils import select_common_block_size
 
             local_block_size = select_common_block_size(
-                local_block_size, get_current_attn_backends(self)
+                get_transfer_block_size(kv_cache_config, self.cache_config.block_size),
+                get_current_attn_backends(self),
             )
         if self.parallel_config.cp_kv_cache_interleave_size != local_block_size:
             interleave = self.parallel_config.cp_kv_cache_interleave_size
