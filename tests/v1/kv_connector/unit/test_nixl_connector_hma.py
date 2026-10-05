@@ -368,24 +368,6 @@ def test_needs_split_local_xfer_handles(use_mla, source_ranks, tp_ratio, expecte
         pytest.param({}, {}, None, id="consumer"),
         pytest.param(
             {},
-            {"handshake_tp_size": 16},
-            "TP size mismatch",
-            id="tp-routing-mismatch",
-        ),
-        pytest.param(
-            {"pull": True},
-            {"tp_size": 1, "pcp_size": 8, "handshake_tp_size": 8},
-            None,
-            id="pull-pcp-shards",
-        ),
-        pytest.param(
-            {"pull": True},
-            {"tp_size": 1, "pcp_size": 8, "handshake_tp_size": 1},
-            "TP size mismatch",
-            id="pull-pcp-routing-mismatch",
-        ),
-        pytest.param(
-            {},
             {"dcp_size": 1, "tp_size": 1, "cp_kv_cache_interleave_size": 1},
             None,
             id="symmetric-skips-asymmetric-check",
@@ -481,11 +463,7 @@ def test_validate_asymmetric_dcp_geometry(local, remote, match, notification_onl
         has_swa=False,
     )
     config.update(local)
-    worker_cls = (
-        NixlConnectorWorker if config.pop("pull", False) else NixlPushConnectorWorker
-    )
-    worker = object.__new__(worker_cls)
-    worker._has_mamba = False
+    worker = object.__new__(NixlPushConnectorWorker)
     worker.dcp_size = config["dcp_size"]
     worker.world_size = config["world_size"]
     worker.pp_size = config["pp_size"]
@@ -507,7 +485,6 @@ def test_validate_asymmetric_dcp_geometry(local, remote, match, notification_onl
         has_transferable_swa=False,
     )
     peer.update(remote)
-    remote_tp_size = peer.pop("handshake_tp_size", peer["tp_size"])
     metadata = NixlAgentMetadata(
         engine_id="peer",
         agent_metadata=b"agent",
@@ -547,7 +524,7 @@ def test_validate_asymmetric_dcp_geometry(local, remote, match, notification_onl
         args = dict(
             host="localhost",
             port=1234,
-            remote_tp_size=remote_tp_size,
+            remote_tp_size=metadata.tp_size,
             expected_engine_id=metadata.engine_id,
             remote_dcp_size=metadata.dcp_size,
             notif_agents_only=notification_only,

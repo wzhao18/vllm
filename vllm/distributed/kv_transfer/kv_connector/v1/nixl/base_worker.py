@@ -1132,17 +1132,6 @@ class NixlBaseConnectorWorker:
                     ) from e
 
                 self._validate_remote_parallel_config(metadata)
-                remote_transfer_tp_size = (
-                    metadata.pcp_size
-                    if metadata.pcp_size > 1 and metadata.dcp_size > 1
-                    else metadata.tp_size
-                )
-                if remote_transfer_tp_size != remote_tp_size:
-                    raise RuntimeError(
-                        "Remote NIXL transfer TP size mismatch: "
-                        f"expected {remote_tp_size}, "
-                        f"received {remote_transfer_tp_size}."
-                    )
 
                 # Ensure engine id matches.
                 if metadata.engine_id != expected_engine_id:
