@@ -1070,6 +1070,9 @@ class TestPushWriterNotifs:
         "counts,capacity,failed",
         [
             pytest.param((2, 2, 1, 1, 1, 1, 1, 1), 12, False, id="clipped-tail"),
+            pytest.param((2, 1), 4, False, id="dcp2-clipped-tail"),
+            pytest.param((2, 2, 1, 1), 8, False, id="dcp4-clipped-tail"),
+            pytest.param((2, 2) + (1,) * 14, 20, False, id="dcp16-clipped-tail"),
             pytest.param((2, 2, 1, 1, 1, 1, 1, 1), 9, True, id="exceeds-capacity"),
             pytest.param((1, 2, 2, 1, 1, 1, 1, 1), 12, True, id="gap-and-overlap"),
             pytest.param((-1, 2, 1, 1, 1, 1, 1, 1), 12, True, id="negative-count"),
@@ -1077,7 +1080,8 @@ class TestPushWriterNotifs:
     )
     def test_dcp_fan_in_records_exact_clipped_coverage(self, counts, capacity, failed):
         w = _StubWriterWorker.fresh()
-        request_id = "req-dcp8-fan-in"
+        request_id = "req-dcp-fan-in"
+        dcp_size = len(counts)
         meta = SimpleNamespace(
             pp_size=1,
             remote=SimpleNamespace(engine_id="prefill-engine"),
@@ -1087,21 +1091,20 @@ class TestPushWriterNotifs:
         w._recving_metadata[request_id] = meta
         w.transfer_topo = MagicMock()
         w.transfer_topo.get_engine_info.return_value = SimpleNamespace(
-            remote_tp_size=8, remote_dcp_size=8, remote_block_size=16
+            remote_tp_size=dcp_size, remote_dcp_size=dcp_size, remote_block_size=16
         )
         w.transfer_topo.block_size_ratio.return_value = 1
 
-        # Cached prefix length 2 shifts producer rank r to residue (r - 2) % 8.
-        # Ten pages means residues 0 and 1 carry two pages; the rest carry one.
-        for producer_rank in range(8):
-            start = (producer_rank - 2) % 8
+        # Cached prefix length 2 shifts each producer's suffix-relative residue.
+        for producer_rank in range(dcp_size):
+            start = (producer_rank - 2) % dcp_size
             count = counts[start]
             notif = PUSH_DONE_NOTIF_PREFIX + msgspec.msgpack.encode(
-                (request_id, 8, producer_rank, ((start, count),))
+                (request_id, dcp_size, producer_rank, ((start, count),))
             )
             w._pending_completion_notifs.put(notif)
             assert w._get_new_notifs() == set()
-            if producer_rank < 7:
+            if producer_rank < dcp_size - 1:
                 assert request_id not in w._recving_transfers
                 assert meta.aggregate_remote_coverage == ()
 
@@ -2053,6 +2056,19 @@ class TestPushPrefixCaching:
                 [506, 514],
                 id="dcp-skip-cached-source",
             ),
+            *[
+                pytest.param(
+                    size,
+                    0,
+                    2,
+                    [10, 11, 12],
+                    list(range(500, 500 + 2 * size)),
+                    [11, 12],
+                    [500 + size - 2, 500 + 2 * size - 2],
+                    id=f"dcp{size}-skip-cached-source",
+                )
+                for size in (2, 4, 16)
+            ],
         ],
     )
     def test_partial_prefix_hit_end_trims_producer_blocks(
@@ -2139,7 +2155,7 @@ class TestPushPrefixCaching:
             remote_physical_blocks_per_logical=1,
         )
 
-        with pytest.raises(RuntimeError, match="sharded producer"):
+        with pytest.raises(RuntimeError, match="DCP-sharded prefill"):
             w._map_dcp_attention_block_ids(
                 ([10, 11],),
                 ([500, 501],),

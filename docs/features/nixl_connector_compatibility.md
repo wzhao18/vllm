@@ -125,7 +125,7 @@ Current push PP + HMA limitations:
 
 ### Asymmetric DCP with push transfers
 
-`NixlPushConnector` supports a TP8/DCP8 prefiller writing to TP1/DCP1 decode
+`NixlPushConnector` supports a TP=N/DCP=N prefiller writing to TP1/DCP1 decode
 workers, including hybrid MLA/Mamba models such as Kimi K3. Decode workers
 may use data and expert parallelism; these do not shard their attention KV.
 
@@ -133,10 +133,10 @@ may use data and expert parallelism; these do not shard their attention KV.
 - On the prefiller, set `--cp-kv-cache-interleave-size` to the KV-cache
   block size so each physical attention page belongs to one DCP rank.
 - Transferable sliding-window attention groups are not supported.
-- The reverse direction (DCP1 prefill to DCP8 decode) is not supported.
+- The reverse direction (DCP1 prefill to DCP-sharded decode) is not supported.
 
 Each producer writes its attention pages and its TP shard of the Mamba
-state. Decode waits for all eight producers and validates their combined
+state. Decode waits for all N producers and validates their combined
 attention-page coverage before making the received cache usable.
 
 ### Quantized KV cache

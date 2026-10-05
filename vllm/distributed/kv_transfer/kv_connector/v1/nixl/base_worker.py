@@ -2477,19 +2477,19 @@ class NixlBaseConnectorWorker:
 
         return remote_agent_name
 
-    def _validate_asymmetric_dcp(
+    def _validate_asymmetric_dcp_compatibility(
         self,
         nixl_agent_meta: NixlAgentMetadata,
         remote_dcp_size: int,
         remote_tp_size: int,
-    ) -> bool:
+    ) -> None:
         """Validate the block geometry used by asymmetric DCP."""
-        if self._has_mamba and self.dcp_size != remote_dcp_size:
+        if self._has_mamba:
             raise RuntimeError(
-                "Hybrid MLA+Mamba NIXL transfers require matching DCP sizes, "
+                "Hybrid MLA+Mamba NIXL transfers currently support only "
+                "matching DCP sizes, "
                 f"got local={self.dcp_size}, remote={remote_dcp_size}."
             )
-        return False
 
     def _validate_remote_agent_handshake(
         self,
@@ -2506,9 +2506,11 @@ class NixlBaseConnectorWorker:
         remote_info = self.transfer_topo.get_engine_info(remote_engine_id)
         assert remote_info.remote_tp_size == remote_tp_size
         assert remote_info.remote_dcp_size == remote_dcp_size
-        asymmetric_dcp = self._validate_asymmetric_dcp(
-            nixl_agent_meta, remote_dcp_size, remote_tp_size
-        )
+        asymmetric_dcp = self.dcp_size != remote_dcp_size
+        if asymmetric_dcp:
+            self._validate_asymmetric_dcp_compatibility(
+                nixl_agent_meta, remote_dcp_size, remote_tp_size
+            )
         # DCP sizes must divide one another; this is what keeps the
         # read-slicing math in pull_worker a closed form.
         assert (

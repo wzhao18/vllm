@@ -365,6 +365,24 @@ def test_needs_split_local_xfer_handles(use_mla, source_ranks, tp_ratio, expecte
     "local,remote,match",
     [
         pytest.param({}, {}, None, id="consumer"),
+        *[
+            pytest.param(
+                {},
+                {"dcp_size": size, "tp_size": size},
+                None,
+                id=f"consumer-dcp{size}",
+            )
+            for size in (2, 4, 16)
+        ],
+        *[
+            pytest.param(
+                {"dcp_size": size, "world_size": size},
+                {"dcp_size": 1, "tp_size": 1},
+                None,
+                id=f"producer-dcp{size}",
+            )
+            for size in (2, 4, 16)
+        ],
         pytest.param(
             {"dcp_size": 8, "world_size": 8},
             {"dcp_size": 1, "tp_size": 1},
@@ -395,8 +413,8 @@ def test_needs_split_local_xfer_handles(use_mla, source_ranks, tp_ratio, expecte
             "block-aligned",
             id="missing-interleave",
         ),
-        pytest.param({"dcp_size": 2}, {}, "only DCP8 and DCP1", id="two-sharded-peers"),
-        pytest.param({}, {"dcp_size": 4}, "only DCP8 and DCP1", id="unsupported-dcp"),
+        pytest.param({"dcp_size": 2}, {}, "DCP1 decode", id="two-sharded-peers"),
+        pytest.param({}, {"dcp_size": 4}, "TP=DCP", id="mismatched-producer-tp"),
         pytest.param({"pp_size": 2}, {}, "PP=1", id="local-pp"),
         pytest.param({}, {"pp_size": 2}, "PP=1", id="remote-pp"),
         pytest.param({"pcp_size": 2}, {}, "PCP=1", id="local-pcp"),
@@ -412,11 +430,11 @@ def test_needs_split_local_xfer_handles(use_mla, source_ranks, tp_ratio, expecte
         pytest.param(
             {}, {"has_transferable_swa": True}, "sliding-window", id="remote-swa"
         ),
-        pytest.param({}, {"tp_size": 16}, "TP8/DCP8", id="remote-duplicate-dcp-ranks"),
+        pytest.param({}, {"tp_size": 16}, "TP=DCP", id="remote-duplicate-dcp-ranks"),
         pytest.param(
             {"dcp_size": 8, "world_size": 16},
             {"dcp_size": 1, "tp_size": 1},
-            "TP8/DCP8",
+            "TP=DCP",
             id="local-duplicate-dcp-ranks",
         ),
     ],
@@ -469,12 +487,12 @@ def test_validate_asymmetric_dcp_geometry(local, remote, match, notification_onl
                 return worker._add_notif_only_remote_agent(
                     metadata, metadata.tp_size, metadata.dcp_size
                 )
-            return worker._validate_asymmetric_dcp(
+            return worker._validate_asymmetric_dcp_compatibility(
                 metadata, metadata.dcp_size, metadata.tp_size
             )
 
         if match is None:
-            assert validate()
+            validate()
             assert register.called is notification_only
         else:
             with pytest.raises(RuntimeError, match=match):
@@ -491,8 +509,10 @@ def test_pull_preserves_pure_mla_divisible_asymmetric_dcp():
     remote = SimpleNamespace()
 
     assert (
-        worker._validate_asymmetric_dcp(remote, remote_dcp_size=8, remote_tp_size=8)
-        is False
+        worker._validate_asymmetric_dcp_compatibility(
+            remote, remote_dcp_size=8, remote_tp_size=8
+        )
+        is None
     )
 
 

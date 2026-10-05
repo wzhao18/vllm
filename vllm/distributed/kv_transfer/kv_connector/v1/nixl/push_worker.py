@@ -89,21 +89,22 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
     _supports_pp_hma = True
 
-    def _validate_asymmetric_dcp(
+    def _validate_asymmetric_dcp_compatibility(
         self,
         metadata: NixlAgentMetadata,
         remote_dcp_size: int,
         remote_tp_size: int,
-    ) -> bool:
-        """Require whole-page DCP8 shards from a single TP8 producer group."""
-        if self.dcp_size == remote_dcp_size:
-            return False
-        if (self.dcp_size, remote_dcp_size) not in ((8, 1), (1, 8)):
-            raise RuntimeError("Asymmetric NIXL push supports only DCP8 and DCP1.")
+    ) -> None:
+        """Validate whole-page DCP shards and an unsharded decode worker."""
+        if min(self.dcp_size, remote_dcp_size) != 1:
+            raise RuntimeError(
+                "Asymmetric NIXL push currently supports only "
+                "DCP prefill to DCP1 decode."
+            )
         if (self.world_size, remote_tp_size) != (self.dcp_size, remote_dcp_size):
             raise RuntimeError(
-                "Asymmetric NIXL push requires a TP8/DCP8 producer "
-                "and TP1/DCP1 consumer."
+                "Asymmetric NIXL push currently supports only "
+                "TP=DCP prefill and TP1/DCP1 decode."
             )
         if (
             self.pp_size != 1
@@ -112,7 +113,8 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             or metadata.pcp_size != 1
         ):
             raise RuntimeError(
-                "Asymmetric NIXL push requires PP=1 and PCP=1 on both sides."
+                "Asymmetric NIXL push currently supports only "
+                "PP=1 and PCP=1 on both sides."
             )
         if metadata.has_transferable_swa or any(
             issubclass(spec_type, SlidingWindowSpec)
@@ -121,7 +123,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             raise RuntimeError(
                 "Asymmetric NIXL push does not support sliding-window attention."
             )
-        if self.dcp_size == 8:
+        if self.dcp_size > 1:
             interleave = self.vllm_config.parallel_config.cp_kv_cache_interleave_size
             block_size = self.block_size
         else:
@@ -129,15 +131,18 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             block_size = metadata.block_size
         if interleave != block_size:
             raise RuntimeError(
-                "Asymmetric NIXL push requires block-aligned KV interleaving: "
+                "Asymmetric NIXL push currently supports only "
+                "block-aligned KV interleaving: "
                 f"set --cp-kv-cache-interleave-size to {block_size}, got {interleave}."
             )
-        return True
 
     def _add_notif_only_remote_agent(
         self, metadata: NixlAgentMetadata, remote_tp_size: int, remote_dcp_size: int = 1
     ) -> str:
-        self._validate_asymmetric_dcp(metadata, remote_dcp_size, remote_tp_size)
+        if self.dcp_size != remote_dcp_size:
+            self._validate_asymmetric_dcp_compatibility(
+                metadata, remote_dcp_size, remote_tp_size
+            )
         return super()._add_notif_only_remote_agent(
             metadata, remote_tp_size, remote_dcp_size
         )
@@ -200,7 +205,10 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         if self.dcp_size == remote_info.remote_dcp_size:
             return local_block_ids, remote_block_ids
         if remote_info.remote_dcp_size != 1:
-            raise RuntimeError("Asymmetric NIXL push requires a sharded producer.")
+            raise RuntimeError(
+                "Asymmetric NIXL push currently supports only "
+                "DCP-sharded prefill to DCP1 decode."
+            )
         local_groups = list(local_block_ids)
         remote_groups = list(remote_block_ids)
         for i, group in enumerate(remote_groups):
