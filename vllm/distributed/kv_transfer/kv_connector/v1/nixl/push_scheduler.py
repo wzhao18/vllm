@@ -198,10 +198,16 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         self._push_registration_deadlines[request.request_id] = (
             time.perf_counter() + self._push_registration_timeout
         )
-        # Asymmetric DCP needs P's block counts to identify the received tail.
-        if params.get("dcp_size", 1) == (
+        asymmetric_dcp = params.get("dcp_size", 1) != (
             self.vllm_config.parallel_config.decode_context_parallel_size
-        ):
+        )
+        # In push mode P determines the blocks to WRITE from D's registration.
+        # We still track the request as needing recv so the engine waits for
+        # P's WRITE completion. For symmetric DCP, D doesn't need P's block IDs;
+        # seed ``remote_block_ids`` with an empty tuple so the base scheduler's
+        # ``add_new_req_to_recv`` can build ReqMeta without a KeyError.
+        # Asymmetric DCP keeps P's block IDs to identify the received tail.
+        if not asymmetric_dcp:
             params["remote_block_ids"] = ()
         self._reqs_need_recv[request.request_id] = (
             request,
