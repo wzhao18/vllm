@@ -1724,8 +1724,15 @@ class TestPushPipelineParallel:
             ),
         ],
     )
+    @pytest.mark.parametrize("already_registered", [False, True])
     def test_add_remote_agent_slices_remote_regions_to_local_pp_window(
-        self, pp_size, has_mamba, local_names, remote_names, selected
+        self,
+        pp_size,
+        has_mamba,
+        local_names,
+        remote_names,
+        selected,
+        already_registered,
     ):
         """Select corresponding regions before registering remote descriptors."""
         block_len = 4096 * 16
@@ -1763,6 +1770,14 @@ class TestPushPipelineParallel:
             region_mem_types=["VRAM"] * count,
             region_members=[[name] for name in remote_names] if has_mamba else [],
         )
+
+        if already_registered:
+            w._remote_agents[meta.engine_id] = {(0, 0): "existing-agent"}
+            original = msgspec.msgpack.encode(meta)
+            assert w.add_remote_agent(meta) == "existing-agent"
+            assert msgspec.msgpack.encode(meta) == original
+            w.transfer_topo.register_remote_engine.assert_not_called()
+            return
 
         if selected is None:
             with pytest.raises(ValueError, match="missing producer region 'main.1'"):

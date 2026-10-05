@@ -136,19 +136,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 f"set --cp-kv-cache-interleave-size to {block_size}, got {interleave}."
             )
 
-    def add_remote_agent(
-        self,
-        nixl_agent_meta: NixlAgentMetadata,
-        remote_tp_rank: int = 0,
-        remote_tp_size: int = 1,
-        remote_dcp_size: int = 1,
-    ) -> str:
-        self._align_push_remote_regions(nixl_agent_meta)
-        return super().add_remote_agent(
-            nixl_agent_meta, remote_tp_rank, remote_tp_size, remote_dcp_size
-        )
-
-    def _align_push_remote_regions(self, metadata: NixlAgentMetadata) -> None:
+    def _prepare_remote_regions(self, metadata: NixlAgentMetadata) -> None:
         """Match hybrid regions by name and occurrence, excluding draft KV."""
         if not self._has_mamba or metadata.region_names is None:
             return

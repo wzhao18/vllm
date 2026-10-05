@@ -2209,6 +2209,10 @@ class NixlBaseConnectorWorker:
         # NIXL_INIT_AGENT to be used for preparations of local descs.
         return self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs), blocks_data
 
+    def _prepare_remote_regions(self, metadata: NixlAgentMetadata) -> None:
+        """Prepare remote cache regions before descriptor registration."""
+        pass
+
     def add_remote_agent(
         self,
         nixl_agent_meta: NixlAgentMetadata,
@@ -2268,6 +2272,8 @@ class NixlBaseConnectorWorker:
                 remote_tp_rank,
             )
             return self._remote_agents[engine_id][(0, remote_tp_rank)]
+
+        self._prepare_remote_regions(nixl_agent_meta)
 
         assert self.transfer_topo is not None
         transfer_topo = self.transfer_topo
