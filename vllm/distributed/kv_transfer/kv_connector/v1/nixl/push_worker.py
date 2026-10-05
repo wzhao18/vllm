@@ -90,7 +90,8 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
     def _get_remote_block_count(self, meta: ReqMeta, group_id: int) -> int:
         """Count attention pages in the producer's uncached DCP suffix."""
         assert meta.remote is not None
-        if meta.dcp_size == self.dcp_size:
+        asymmetric_dcp = meta.dcp_size != self.dcp_size
+        if not asymmetric_dcp:
             return super()._get_remote_block_count(meta, group_id)
         assert self.transfer_topo is not None
         remote_info = self.transfer_topo.get_engine_info(meta.remote.engine_id)

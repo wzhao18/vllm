@@ -3018,11 +3018,12 @@ class NixlBaseConnectorWorker:
                 remote_info.remote_physical_blocks_per_logical
                 != self._physical_blocks_per_logical_kv_block
             )
+            asymmetric_dcp = meta.dcp_size != self.dcp_size
             if (
                 block_size_ratio > 1
                 or self.enable_permute_local_kv
                 or hetero_ppl
-                or (self._TRANSFER_MODE == "push" and meta.dcp_size != self.dcp_size)
+                or (self._TRANSFER_MODE == "push" and asymmetric_dcp)
             ):
                 for g, local_group in enumerate(meta.local_physical_block_ids):
                     if not local_group or _is_ssm_spec(self._group_spec_types[g]):
