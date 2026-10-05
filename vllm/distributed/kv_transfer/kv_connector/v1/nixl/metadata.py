@@ -64,8 +64,9 @@ class PushCompletion(msgspec.Struct, array_like=True, frozen=True):
 #  12: Add per-region member names for PP push
 #  13: Add packed-member layouts and order-independent packed-push backend hashes
 #  14: Add CP KV-cache interleave geometry and exact push coverage
+#  15: Advertise TP size and validate it against handshake routing
 #
-NIXL_CONNECTOR_VERSION: int = 14
+NIXL_CONNECTOR_VERSION: int = 15
 
 
 @dataclass
@@ -86,6 +87,7 @@ class NixlAgentMetadata:
     region_group_ids: list[int] | None = None
     region_names: list[str] | None = None
     region_mem_types: list[str] | None = None
+    tp_size: int = 1
     dcp_size: int = 1
     pcp_size: int = 1
     # Layer names sharing each advertised region, in region order.

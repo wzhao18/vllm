@@ -92,10 +92,10 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
     def _validate_asymmetric_dcp_compatibility(
         self,
         metadata: NixlAgentMetadata,
-        remote_dcp_size: int,
-        remote_tp_size: int,
     ) -> None:
         """Validate whole-page DCP shards and an unsharded decode worker."""
+        remote_dcp_size = metadata.dcp_size
+        remote_tp_size = metadata.tp_size
         if min(self.dcp_size, remote_dcp_size) != 1:
             raise RuntimeError(
                 "Asymmetric NIXL push currently supports only "

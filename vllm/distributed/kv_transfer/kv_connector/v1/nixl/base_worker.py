@@ -947,7 +947,7 @@ class NixlBaseConnectorWorker:
         )
 
     def _validate_remote_parallel_config(
-        self, agent_metadata: NixlAgentMetadata, remote_tp_size: int
+        self, agent_metadata: NixlAgentMetadata
     ) -> None:
         local_pcp_size = self.pcp_size
         local_dcp_size = self.dcp_size
@@ -967,9 +967,7 @@ class NixlBaseConnectorWorker:
                 f"remote PCP/DCP={remote_pcp_size}/{remote_dcp_size}."
             )
         if local_dcp_size != remote_dcp_size:
-            self._validate_asymmetric_dcp_compatibility(
-                agent_metadata, remote_dcp_size, remote_tp_size
-            )
+            self._validate_asymmetric_dcp_compatibility(agent_metadata)
 
     def _sync_block_size_with_kernel(self) -> None:
         backends = get_current_attn_backends(self.vllm_config)
@@ -1133,7 +1131,18 @@ class NixlBaseConnectorWorker:
                         f"Failed to decode NixlAgentMetadata. Error: {e}"
                     ) from e
 
-                self._validate_remote_parallel_config(metadata, remote_tp_size)
+                self._validate_remote_parallel_config(metadata)
+                remote_transfer_tp_size = (
+                    metadata.pcp_size
+                    if metadata.pcp_size > 1 and metadata.dcp_size > 1
+                    else metadata.tp_size
+                )
+                if remote_transfer_tp_size != remote_tp_size:
+                    raise RuntimeError(
+                        "Remote NIXL transfer TP size mismatch: "
+                        f"expected {remote_tp_size}, "
+                        f"received {remote_transfer_tp_size}."
+                    )
 
                 # Ensure engine id matches.
                 if metadata.engine_id != expected_engine_id:
@@ -1878,6 +1887,7 @@ class NixlBaseConnectorWorker:
             region_group_ids=self.region_group_ids,
             region_names=self.region_names,
             region_mem_types=self.region_mem_types,
+            tp_size=self.world_size,
             dcp_size=self.dcp_size,
             pcp_size=self.pcp_size,
             region_members=self.region_members,
@@ -2484,15 +2494,13 @@ class NixlBaseConnectorWorker:
     def _validate_asymmetric_dcp_compatibility(
         self,
         nixl_agent_meta: NixlAgentMetadata,
-        remote_dcp_size: int,
-        remote_tp_size: int,
     ) -> None:
         """Validate the block geometry used by asymmetric DCP."""
         if self._has_mamba:
             raise RuntimeError(
                 "Hybrid MLA+Mamba NIXL transfers currently support only "
                 "matching DCP sizes, "
-                f"got local={self.dcp_size}, remote={remote_dcp_size}."
+                f"got local={self.dcp_size}, remote={nixl_agent_meta.dcp_size}."
             )
 
     def _validate_remote_agent_handshake(
