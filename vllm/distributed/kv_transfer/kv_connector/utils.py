@@ -541,18 +541,20 @@ class TransferTopology:
         """Whether the local engine's KV cache is replicated."""
         return self.is_mla or self.tp_size > self.total_num_kv_heads
 
+    @staticmethod
     def dcp_source_ranks(
-        self, remote_tp_size: int, remote_dcp_size: int, tp_rank: int | None = None
+        remote_tp_size: int,
+        remote_dcp_size: int,
+        local_dcp_size: int,
+        local_dcp_rank: int,
     ) -> list[int]:
         """Remote ranks whose DCP slice overlaps mine (MLA, ``remote_dcp_size > 1``).
 
         Shared by ``handshake_target_ranks`` (who to query metadata from) and
-        ``compute_tp_mapping`` (who to actually read from) — for MLA the two
-        questions have the identical answer for pure MLA. Hybrid models may
-        additionally read SSM head shards from other ranks.
+        ``compute_tp_mapping`` (who to actually read from) — for pure MLA the two
+        questions have the identical answer, since DCP sharding is the only
+        thing keeping a remote rank from being interchangeable with any other.
         """
-        local_dcp_size = self.dcp_size
-        local_dcp_rank = self.dcp_rank if tp_rank is None else tp_rank % self.dcp_size
         if local_dcp_size <= remote_dcp_size:
             # Keep every remote rank whose slice sits inside mine. When
             # local_dcp_size == 1 (replicated locally), local_dcp_rank == 0 reduces to
@@ -563,15 +565,15 @@ class TransferTopology:
         # Local finer-grained: exactly one remote rank covers my whole slice
         return [local_dcp_rank % remote_dcp_size]
 
+    @staticmethod
     def ssm_source_ranks(
-        self, remote_tp_size: int, tp_rank: int | None = None
+        remote_tp_size: int, local_tp_size: int, local_tp_rank: int
     ) -> list[int]:
         """Remote ranks holding this rank's TP-sharded SSM heads."""
-        rank = self.tp_rank if tp_rank is None else tp_rank
-        if self.tp_size < remote_tp_size:
-            shards = remote_tp_size // self.tp_size
-            return list(range(rank * shards, (rank + 1) * shards))
-        return [rank * remote_tp_size // self.tp_size]
+        if local_tp_size < remote_tp_size:
+            shards = remote_tp_size // local_tp_size
+            return list(range(local_tp_rank * shards, (local_tp_rank + 1) * shards))
+        return [local_tp_rank * remote_tp_size // local_tp_size]
 
     def handshake_target_ranks(
         self, remote_tp_size: int, remote_dcp_size: int = 1
@@ -590,9 +592,14 @@ class TransferTopology:
         already has ``tp_size == dcp_size``.
         """
         if remote_dcp_size > 1:
-            ranks = self.dcp_source_ranks(remote_tp_size, remote_dcp_size)
+            ranks = self.dcp_source_ranks(
+                remote_tp_size, remote_dcp_size, self.dcp_size, self.dcp_rank
+            )
             if self.is_mamba:
-                ranks = sorted(set(ranks) | set(self.ssm_source_ranks(remote_tp_size)))
+                ranks = sorted(
+                    set(ranks)
+                    | set(self.ssm_source_ranks(remote_tp_size, self.tp_size, self.tp_rank))
+                )
             return ranks
 
         tp_ratio = self.tp_ratio(remote_tp_size)
@@ -628,8 +635,10 @@ class TransferTopology:
             # A producer may serve different consumers for attention and SSM.
             return sum(
                 remote_rank
-                in self.dcp_source_ranks(remote_tp_size, remote_dcp_size, rank)
-                or remote_rank in self.ssm_source_ranks(remote_tp_size, rank)
+                in self.dcp_source_ranks(
+                    remote_tp_size, remote_dcp_size, self.dcp_size, rank % self.dcp_size
+                )
+                or remote_rank in self.ssm_source_ranks(remote_tp_size, self.tp_size, rank)
                 for rank in range(self.tp_size)
             )
         if remote_dcp_size > 1:
