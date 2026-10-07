@@ -1203,9 +1203,11 @@ def _run_hetero_case(
     assert all(torch.all(page == 0x55) for page in received_attention), (
         "Receive cleanup overwrote transferred attention pages"
     )
-    n_excluded = -(-matched // (local_block * local_dcp_size))
     stale = []
-    for b in local_attn[cached:n_excluded]:
+    for block_idx, b in enumerate(local_attn[cached:], start=cached):
+        # DCP ranks may have allocation padding beyond their matched prefix.
+        if (block_idx * local_dcp_size + local_rank) * local_block >= matched:
+            break
         for region, t in enumerate(worker._test_tensors):
             page = t[b * local_unified : (b + 1) * local_unified]
             n_stale = int((page == 0xAA).sum())

@@ -304,23 +304,6 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                         remote_block_ids=remote_physical_ids,
                     )
                 )
-            if dcp_active and self.block_size == remote_info.remote_block_size:
-                # Clear allocation padding without touching received pages.
-                untouched = []
-                for g, blocks in enumerate(meta.local_physical_block_ids):
-                    received = {
-                        block
-                        for spec in read_specs
-                        for block in spec.local_block_ids[g]
-                    }
-                    untouched.append(
-                        [block for block in blocks if block not in received]
-                        if _is_attention_spec(self._group_spec_types[g])
-                        else []
-                    )
-                meta.region_blocks_to_zero = self._block_ids_by_region(
-                    untouched, local_region_groups
-                )
 
         # D may have to perform multiple reads from different remote ranks.
         # Pure MLA reads once because its cache is replicated. Hybrid
