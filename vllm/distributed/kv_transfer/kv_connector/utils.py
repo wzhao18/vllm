@@ -576,13 +576,18 @@ class TransferTopology:
         return [local_tp_rank * remote_tp_size // local_tp_size]
 
     def handshake_target_ranks(
-        self, remote_tp_size: int, remote_dcp_size: int = 1
+        self,
+        remote_tp_size: int,
+        remote_dcp_size: int = 1,
+        local_tp_rank: int | None = None,
     ) -> list[int]:
         """Pre-registration: compute which remote TP ranks to handshake with.
 
         Pure math based on local/remote TP (and DCP, when the remote shards
         its KV cache) sizes — does not require the remote engine to be
         registered yet.
+
+        ``local_tp_rank`` defaults to this worker's rank.
 
         DCP support is scoped to ``dcp_size in (1, tp_size)`` on each side
         and DCP sizes that divide one another: neither side ever has a
@@ -591,65 +596,41 @@ class TransferTopology:
         exactly to the DTP>=PTP case, since a sharded local side
         already has ``tp_size == dcp_size``.
         """
+        rank = self.tp_rank if local_tp_rank is None else local_tp_rank
         if remote_dcp_size > 1:
-            ranks = self.dcp_source_ranks(
-                remote_tp_size, remote_dcp_size, self.dcp_size, self.dcp_rank
+            dcp_ranks = self.dcp_source_ranks(
+                remote_tp_size, remote_dcp_size, self.dcp_size, rank % self.dcp_size
             )
-            if self.is_mamba:
-                ranks = sorted(
-                    set(ranks)
-                    | set(self.ssm_source_ranks(remote_tp_size, self.tp_size, self.tp_rank))
-                )
-            return ranks
+            mamba_ranks = (
+                self.ssm_source_ranks(remote_tp_size, self.tp_size, rank)
+                if self.is_mamba
+                else []
+            )
+            return sorted(set(dcp_ranks + mamba_ranks))
 
         tp_ratio = self.tp_ratio(remote_tp_size)
         if tp_ratio > 0:
-            return [self.tp_rank // tp_ratio]
+            return [rank // tp_ratio]
         abs_ratio = -tp_ratio
-        return [self.tp_rank * abs_ratio + i for i in range(abs_ratio)]
+        return [rank * abs_ratio + i for i in range(abs_ratio)]
 
     def dcp_consumer_count(
         self,
         remote_tp_size: int,
         remote_dcp_size: int,
-        remote_rank: int | None = None,
+        remote_rank: int,
     ) -> int:
-        """How many local ranks (in aggregate) read from a given remote rank.
+        """Count local ranks that notify a given producer after consuming its KV.
 
-        Used by the producer side to know how many reader notifications to
-        wait for before freeing a request's blocks. Reuses ``tp_ratio``
-        whenever the remote isn't sharded — a sharded local side already
-        has ``tp_size == dcp_size``, so the existing TP-ratio formula is
-        already correct there unmodified.
-
-        For asymmetric hybrid transfers, ``remote_rank`` includes consumers
-        of either its attention pages or its SSM head shards.
+        The producer waits for these notifications before freeing its blocks.
         """
-        if (
-            self.is_mla
-            and self.is_mamba
-            and remote_dcp_size > 1
-            and self.dcp_size != remote_dcp_size
-            and remote_rank is not None
-        ):
-            # A producer may serve different consumers for attention and SSM.
-            return sum(
-                remote_rank
-                in self.dcp_source_ranks(
-                    remote_tp_size, remote_dcp_size, self.dcp_size, rank % self.dcp_size
-                )
-                or remote_rank in self.ssm_source_ranks(remote_tp_size, self.tp_size, rank)
-                for rank in range(self.tp_size)
+        return sum(
+            remote_rank
+            in self.handshake_target_ranks(
+                remote_tp_size, remote_dcp_size, local_tp_rank=rank
             )
-        if remote_dcp_size > 1:
-            if self.dcp_size == 1:
-                # Replicated locally: every local rank reads every shard.
-                return self.tp_size
-            # Both sharded, different degrees.
-            return max(1, self.dcp_size // remote_dcp_size)
-        # Remote replicated: `tp_ratio` local ranks share each remote rank
-        # when local_tp >= remote_tp, else each remote rank has one reader.
-        return max(1, self.tp_ratio(remote_tp_size))
+            for rank in range(self.tp_size)
+        )
 
     def target_remote_ranks(
         self, remote_engine_id: EngineId, remote_pp_rank: int = 0

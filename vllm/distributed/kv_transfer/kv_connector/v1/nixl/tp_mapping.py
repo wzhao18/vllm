@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -57,9 +57,8 @@ class TPMapping:
     # FA head offset factor for hetero-TP (D_TP > P_TP).
     rank_offset_factor: int
 
-    # Local ranks (in aggregate) that read from a given source rank. The producer frees
-    # a request's blocks only once that many notifications have come in.
-    local_consumers: int = 1
+    # Expected completion notifications, indexed by producer TP rank.
+    consumer_counts: dict[int, int] = field(default_factory=dict)
 
 
 # ======================================================================
@@ -147,14 +146,19 @@ def compute_tp_mapping(
         # D TP > P TP: we index into remote to read different heads depending on rank.
         rank_offset_factor = tp_rank % (tp_size // remote_tp_size)
 
-    local_consumers = transfer_topology.dcp_consumer_count(
-        remote_tp_size, remote_dcp_size
-    )
+    consumer_counts = {
+        rank: transfer_topology.dcp_consumer_count(
+            remote_tp_size, remote_dcp_size, rank
+        )
+        for rank in transfer_topology.handshake_target_ranks(
+            remote_tp_size, remote_dcp_size
+        )
+    }
 
     return TPMapping(
         source_ranks_per_group=source_ranks_per_group,
         all_source_ranks=tuple(all_ranks),
         rank_to_attention_slot=rank_to_attention_slot,
         rank_offset_factor=rank_offset_factor,
-        local_consumers=local_consumers,
+        consumer_counts=consumer_counts,
     )

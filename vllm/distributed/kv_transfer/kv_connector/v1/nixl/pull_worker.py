@@ -389,11 +389,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 local_xfer_side_handle=local_xfer_side_handle,
                 local_dram_handle=local_dram_handle,
                 remote_xfer_side_handle=remote_xfer_side_handle,
-                expected_consumers=self.transfer_topo.dcp_consumer_count(
-                    remote_info.remote_tp_size,
-                    remote_info.remote_dcp_size,
-                    spec.remote_rank,
-                ),
+                expected_consumers=plan.consumer_counts[spec.remote_rank],
                 awaiting_kvs=meta.awaiting_kvs,
             ):
                 return
@@ -403,10 +399,11 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             # have the blocks we need so they can update the request state.
             # Same thing for DCP (tp_size == dcp_size), so the raw tp_ratio already
             # reflects whether any remote replica is left unchosen.
-            notif_id = f"{meta.remote.request_id}:{plan.local_consumers}".encode()
             remote_agents = self._remote_agents[meta.remote.engine_id]
             for rank_to_notify, agent in remote_agents.items():
                 if rank_to_notify != (0, read_specs[0].remote_rank):
+                    consumers = plan.consumer_counts[rank_to_notify[1]]
+                    notif_id = f"{meta.remote.request_id}:{consumers}".encode()
                     try:
                         self.nixl_wrapper.send_notif(agent, notif_msg=notif_id)
                     except Exception as e:

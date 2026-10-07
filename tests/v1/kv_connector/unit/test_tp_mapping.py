@@ -133,7 +133,7 @@ def test_dcp_consumer_count_matches_readers(
     for remote_rank in range(remote_tp_size):
         readers = [m for m in mappings if remote_rank in m.all_source_ranks]
         for mapping in readers:
-            assert mapping.local_consumers == len(readers)
+            assert mapping.consumer_counts[remote_rank] == len(readers)
 
 
 # ======================================================================

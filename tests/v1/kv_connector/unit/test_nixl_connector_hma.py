@@ -91,7 +91,7 @@ def region_pull_worker():
         remote_block_size=64,
         remote_physical_blocks_per_logical=2,
     )
-    worker.tp_mappings = {"P": TPMapping(((0,), (0,)), (0,), {0: 0}, 0)}
+    worker.tp_mappings = {"P": TPMapping(((0,), (0,)), (0,), {0: 0}, 0, {0: 1})}
     worker._transfer_layer_group_ids = ()
     worker._mixed_mem_types = True
     worker.src_xfer_handles_by_block_size = {64: 1}
@@ -197,7 +197,9 @@ def test_dcp_region_pull(region_pull_worker, num_pages, region_groups):
     remote.remote_tp_size = remote.remote_dcp_size = 8
     remote.remote_physical_blocks_per_logical = 1
     ranks = tuple(range(8))
-    worker.tp_mappings["P"] = TPMapping((ranks, ranks), ranks, {r: r for r in ranks}, 8)
+    worker.tp_mappings["P"] = TPMapping(
+        (ranks, ranks), ranks, {r: r for r in ranks}, 8, {r: 1 for r in ranks}
+    )
     worker.dst_xfer_side_handles = {"P": {r: 1000 + r for r in ranks}}
     worker._remote_agents = {"P": {(0, r): f"P-rank{r}" for r in ranks}}
     # Two regions with different prefix hits, plus one padding page each.
