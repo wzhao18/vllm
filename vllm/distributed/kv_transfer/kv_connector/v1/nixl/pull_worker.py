@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Pull-specific (READ) worker-side logic for the NIXL connector."""
 
+import math
 import time
 from typing import TYPE_CHECKING
 
@@ -259,6 +260,9 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 remote_info.remote_physical_blocks_per_logical,
             )
             num_groups = len(meta.local_block_ids)
+            local_ratio = self._physical_blocks_per_logical_kv_block
+            remote_ratio = remote_info.remote_physical_blocks_per_logical
+            mapping_ratio = math.gcd(local_ratio, remote_ratio)
 
             def group_ids(block_ids: BlockIds, rank: int) -> list[list[int]]:
                 return [
@@ -269,8 +273,15 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             read_specs = []
             for rank in plan.all_source_ranks:
                 if dcp_active:
-                    local_ids = group_ids(meta.local_block_ids, rank)
-                    remote_ids = group_ids(remote_logical_block_ids, rank)
+                    # Map attention in common interleave units; states stay indivisible.
+                    local_ids = self._logical_to_kernel_block_ids(
+                        group_ids(meta.local_block_ids, rank),
+                        local_ratio // mapping_ratio,
+                    )
+                    remote_ids = self._logical_to_kernel_block_ids(
+                        group_ids(remote_logical_block_ids, rank),
+                        remote_ratio // mapping_ratio,
+                    )
                     for g in range(num_groups):
                         if not local_ids[g] or not _is_attention_spec(
                             self._group_spec_types[g]
@@ -285,14 +296,14 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                             remote_dcp_size=remote_info.remote_dcp_size,
                             local_num_computed_blocks=(
                                 meta.local_num_computed_blocks[g]
+                                * (local_ratio // mapping_ratio)
                             ),
                         )
                     local_physical_ids = self._logical_to_kernel_block_ids(
-                        local_ids, self._physical_blocks_per_logical_kv_block
+                        local_ids, mapping_ratio
                     )
                     remote_physical_ids = self._logical_to_kernel_block_ids(
-                        remote_ids,
-                        remote_info.remote_physical_blocks_per_logical,
+                        remote_ids, mapping_ratio
                     )
                 else:
                     local_physical_ids = group_ids(meta.local_physical_block_ids, rank)

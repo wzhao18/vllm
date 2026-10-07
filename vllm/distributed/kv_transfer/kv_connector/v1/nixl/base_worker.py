@@ -2524,6 +2524,13 @@ class NixlBaseConnectorWorker:
             and remote_physical_per_logical
             != self._physical_blocks_per_logical_kv_block
             and self.vllm_config.cache_config.enable_prefix_caching
+            and not (
+                self._TRANSFER_MODE == "pull"
+                and min(self.dcp_size, remote_dcp_size) == 1
+                and self.block_size == nixl_agent_meta.block_size
+                and self._physical_blocks_per_logical_kv_block * self.dcp_size
+                == remote_physical_per_logical * remote_dcp_size
+            )
         ):
             raise RuntimeError(
                 "Prefix caching with heterogeneous physical_blocks_per_logical "
