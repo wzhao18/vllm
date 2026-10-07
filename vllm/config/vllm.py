@@ -3447,18 +3447,13 @@ class VllmConfig:
         if not self.parallel_config._allow_auto_resolve_cp_interleave_size:
             return
 
-        from vllm.distributed.kv_transfer.kv_connector.utils import (
-            get_current_attn_backends,
-        )
         from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
             get_transfer_block_size,
         )
-        from vllm.v1.worker.utils import select_common_block_size
 
-        # Resolve the same physical attention page size as the NIXL worker.
-        local_block_size = select_common_block_size(
-            get_transfer_block_size(kv_cache_config, self.cache_config.block_size),
-            get_current_attn_backends(self),
+        # Keep each logical attention transfer block on one DCP rank.
+        local_block_size = get_transfer_block_size(
+            kv_cache_config, self.cache_config.block_size
         )
         if self.parallel_config.cp_kv_cache_interleave_size != local_block_size:
             interleave = self.parallel_config.cp_kv_cache_interleave_size

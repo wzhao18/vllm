@@ -593,6 +593,7 @@ def _make_mla_hybrid_worker(
     vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = False
     vllm_config.parallel_config.tensor_parallel_size = tp_size
     vllm_config.parallel_config.decode_context_parallel_size = dcp_size
+    vllm_config.parallel_config.cp_kv_cache_interleave_size = local_block_size
     # kv_buffer_device defaults to the *real* platform's device type, which on
     # a CPU-only test host would make this a host-buffer worker: host xfer
     # buffers are per-layer, so the HMA shared-tensor regions this test builds
@@ -1121,11 +1122,18 @@ def _run_hetero_case(
                 f"tokens {ltok} vs {rtok}"
             )
             if lkind == "attn":
-                ltok = (ltok // kernel * local_dcp_size + local_rank) * kernel
+                ltok = (
+                    (ltok // local_block * local_dcp_size + local_rank) * local_block
+                    + ltok % local_block
+                )
                 rtok = (
-                    rtok // remote_kernel * remote_dcp_size
-                    + remote_rank % remote_dcp_size
-                ) * remote_kernel
+                    (
+                        rtok // remote_block * remote_dcp_size
+                        + remote_rank % remote_dcp_size
+                    )
+                    * remote_block
+                    + rtok % remote_block
+                )
                 assert ltok == rtok, (
                     f"TOKEN MISALIGNMENT: local sub-block holds tokens "
                     f"[{ltok}..) but receives remote tokens [{rtok}..) "
@@ -1153,7 +1161,7 @@ def _run_hetero_case(
             remote_kernel,
         )
     )
-    needed = {t for t in needed if t // kernel % local_dcp_size == local_rank}
+    needed = {t for t in needed if t // local_block % local_dcp_size == local_rank}
     missing = needed - covered_tokens
     assert not missing, (
         f"tokens never transferred: {sorted(missing)[:8]} "
@@ -1217,7 +1225,7 @@ def _run_hetero_case(
 )
 @pytest.mark.parametrize("cached", [0, 1])
 @pytest.mark.parametrize("tail", [1, 9])
-def test_hybrid_dcp_pull_matches_physical_pages(
+def test_hybrid_dcp_pull_matches_logical_blocks(
     local_dcp_size, remote_dcp_size, cached, tail
 ):
     """DCP fan-in preserves token positions, Mamba shards and cached prefixes."""

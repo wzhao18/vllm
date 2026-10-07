@@ -267,24 +267,10 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 ]
 
             read_specs = []
-            asymmetric_hybrid = self._has_mamba and (
-                self.dcp_size != remote_info.remote_dcp_size
-            )
-            local_mapping_ids = meta.local_block_ids
-            remote_mapping_ids = remote_logical_block_ids
-            local_ratio = self._physical_blocks_per_logical_kv_block
-            remote_ratio = remote_info.remote_physical_blocks_per_logical
-            cached_blocks = meta.local_num_computed_blocks
-            if asymmetric_hybrid:
-                # Different logical page sizes share one physical DCP unit.
-                local_mapping_ids = meta.local_physical_block_ids
-                remote_mapping_ids = meta.remote.block_ids
-                cached_blocks = tuple(n * local_ratio for n in cached_blocks)
-                local_ratio = remote_ratio = 1
             for rank in plan.all_source_ranks:
                 if dcp_active:
-                    local_ids = group_ids(local_mapping_ids, rank)
-                    remote_ids = group_ids(remote_mapping_ids, rank)
+                    local_ids = group_ids(meta.local_block_ids, rank)
+                    remote_ids = group_ids(remote_logical_block_ids, rank)
                     for g in range(num_groups):
                         if not local_ids[g] or not _is_attention_spec(
                             self._group_spec_types[g]
@@ -297,13 +283,16 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                             local_dcp_size=self.dcp_size,
                             local_dcp_rank=self.dcp_rank,
                             remote_dcp_size=remote_info.remote_dcp_size,
-                            local_num_computed_blocks=cached_blocks[g],
+                            local_num_computed_blocks=(
+                                meta.local_num_computed_blocks[g]
+                            ),
                         )
                     local_physical_ids = self._logical_to_kernel_block_ids(
-                        local_ids, local_ratio
+                        local_ids, self._physical_blocks_per_logical_kv_block
                     )
                     remote_physical_ids = self._logical_to_kernel_block_ids(
-                        remote_ids, remote_ratio
+                        remote_ids,
+                        remote_info.remote_physical_blocks_per_logical,
                     )
                 else:
                     local_physical_ids = group_ids(meta.local_physical_block_ids, rank)
@@ -315,8 +304,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                         remote_block_ids=remote_physical_ids,
                     )
                 )
-            if asymmetric_hybrid:
-                # Clear only attention pages not covered by any producer's read.
+            if dcp_active and self.block_size == remote_info.remote_block_size:
+                # Clear allocation padding without touching received pages.
                 untouched = []
                 for g, blocks in enumerate(meta.local_physical_block_ids):
                     received = {
