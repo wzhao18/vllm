@@ -593,7 +593,6 @@ def _make_mla_hybrid_worker(
     vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = False
     vllm_config.parallel_config.tensor_parallel_size = tp_size
     vllm_config.parallel_config.decode_context_parallel_size = dcp_size
-    vllm_config.parallel_config.cp_kv_cache_interleave_size = kernel_block_size
     # kv_buffer_device defaults to the *real* platform's device type, which on
     # a CPU-only test host would make this a host-buffer worker: host xfer
     # buffers are per-layer, so the HMA shared-tensor regions this test builds
@@ -1034,7 +1033,6 @@ def _run_hetero_case(
         ),
     )
     meta_r.dcp_size = remote_dcp_size
-    meta_r.cp_kv_cache_interleave_size = remote_kernel
     _register_remote_agents(worker, meta_r, tp_size)
 
     # Sparse ids so neighbors exist between the request's blocks.
@@ -1227,7 +1225,7 @@ def test_hybrid_dcp_pull_matches_physical_pages(
         _run_hetero_case(
             local_block=32,
             kernel=4,
-            remote_block=32 * local_dcp_size // remote_dcp_size,
+            remote_block=32,
             num_tokens=2 * 32 * local_dcp_size + tail,
             tp_size=remote_dcp_size,
             remote_dcp_size=remote_dcp_size,

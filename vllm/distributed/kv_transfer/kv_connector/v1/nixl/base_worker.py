@@ -1883,9 +1883,6 @@ class NixlBaseConnectorWorker:
             pcp_size=self.pcp_size,
             region_members=self.region_members,
             packed_member_layouts=packed_member_layouts,
-            cp_kv_cache_interleave_size=(
-                self.vllm_config.parallel_config.cp_kv_cache_interleave_size
-            ),
         )
         # Wrap metadata in payload with hash for defensive decoding
         assert self.compat_hash is not None
@@ -2495,31 +2492,6 @@ class NixlBaseConnectorWorker:
             f"DCP sizes must divide one another: local={self.dcp_size}, "
             f"remote={remote_dcp_size} (engine {remote_engine_id})."
         )
-        asymmetric_dcp = self.dcp_size != remote_dcp_size
-        if self._has_mamba and asymmetric_dcp:
-            if self._TRANSFER_MODE != "pull" or not self.use_mla:
-                raise RuntimeError(
-                    "Asymmetric hybrid NIXL transfers currently support only "
-                    "MLA attention in pull mode."
-                )
-            if (
-                self.block_size != nixl_agent_meta.block_size
-                or (
-                    self.dcp_size > 1
-                    and self.vllm_config.parallel_config.cp_kv_cache_interleave_size
-                    != self.block_size
-                )
-                or (
-                    remote_dcp_size > 1
-                    and nixl_agent_meta.cp_kv_cache_interleave_size
-                    != nixl_agent_meta.block_size
-                )
-            ):
-                raise RuntimeError(
-                    "Asymmetric hybrid NIXL pulls support matching physical attention "
-                    "block sizes with block-sized KV interleaving."
-                )
-
         tp_ratio = self.transfer_topo.tp_ratio(remote_tp_size)
         block_size_ratio = self.transfer_topo.block_size_ratio(
             nixl_agent_meta.block_size
@@ -2551,7 +2523,6 @@ class NixlBaseConnectorWorker:
             self._has_mamba
             and remote_physical_per_logical
             != self._physical_blocks_per_logical_kv_block
-            and not asymmetric_dcp
             and self.vllm_config.cache_config.enable_prefix_caching
         ):
             raise RuntimeError(

@@ -43,6 +43,7 @@ def _compute_mapping(
     transfer_topology.tp_rank = tp_rank
     transfer_topology.tp_size = tp_size
     transfer_topology.is_mla = is_mla
+    transfer_topology.is_mamba = MambaSpec in group_spec_types
     transfer_topology.total_num_kv_heads = num_kv_heads
     transfer_topology.dcp_size = dcp_size
     return compute_tp_mapping(
@@ -113,8 +114,9 @@ def test_mla_dcp_source_ranks(
         (2, 4, 2, 4),
     ],
 )
+@pytest.mark.parametrize("has_mamba", [False, True])
 def test_dcp_consumer_count_matches_readers(
-    tp_size, remote_tp_size, dcp_size, remote_dcp_size
+    tp_size, remote_tp_size, dcp_size, remote_dcp_size, has_mamba
 ):
     """Each producer waits for exactly the local ranks that read from it."""
     mappings = [
@@ -126,6 +128,9 @@ def test_dcp_consumer_count_matches_readers(
             num_kv_heads=1,
             dcp_size=dcp_size,
             remote_dcp_size=remote_dcp_size,
+            group_spec_types=(FullAttentionSpec, MambaSpec)
+            if has_mamba
+            else (FullAttentionSpec,),
         )
         for tp_rank in range(tp_size)
     ]

@@ -49,9 +49,8 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #  11: Add per-region transfer geometry and memory types to NixlAgentMetadata
 #  12: Add per-region member names for PP push
 #  13: Add packed-member layouts and order-independent packed-push backend hashes
-#  14: Advertise DCP KV interleaving for whole-page hybrid pulls
 #
-NIXL_CONNECTOR_VERSION: int = 14
+NIXL_CONNECTOR_VERSION: int = 13
 
 
 @dataclass
@@ -78,7 +77,6 @@ class NixlAgentMetadata:
     region_members: list[list[str]] = field(default_factory=list)
     # Packed member -> (byte offset in its region's block, bytes per page).
     packed_member_layouts: dict[str, tuple[int, int]] = field(default_factory=dict)
-    cp_kv_cache_interleave_size: int = 1
 
 
 @dataclass
