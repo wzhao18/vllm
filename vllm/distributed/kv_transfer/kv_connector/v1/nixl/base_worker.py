@@ -5,7 +5,6 @@
 import contextlib
 import itertools
 import logging
-import math
 import os
 import queue
 import threading
@@ -15,7 +14,7 @@ from collections import defaultdict
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import msgspec
 import numpy as np
@@ -60,6 +59,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     _NIXL_SUPPORTED_DEVICE,
     get_representative_spec_type,
+    get_transfer_block_size,
     zmq_ctx,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import (
@@ -581,16 +581,8 @@ class NixlBaseConnectorWorker:
         )
 
         self.kv_cache_config = kv_cache_config
-        transfer_block_sizes = [
-            group.kv_cache_spec.block_size
-            for group in kv_cache_config.transfer_groups
-            if get_representative_spec_type(group.kv_cache_spec)
-            not in (MambaSpec, CircularBufferSpec)
-        ]
-        self.block_size = (
-            math.lcm(*transfer_block_sizes)
-            if transfer_block_sizes
-            else cast(int, vllm_config.cache_config.block_size)
+        self.block_size = get_transfer_block_size(
+            kv_cache_config, vllm_config.cache_config.block_size
         )
         # Per-layer specs, unwrapping UniformTypeKVCacheSpecs group wrappers.
         self._layer_specs: dict[str, KVCacheSpec] = {}
@@ -1891,6 +1883,9 @@ class NixlBaseConnectorWorker:
             pcp_size=self.pcp_size,
             region_members=self.region_members,
             packed_member_layouts=packed_member_layouts,
+            cp_kv_cache_interleave_size=(
+                self.vllm_config.parallel_config.cp_kv_cache_interleave_size
+            ),
         )
         # Wrap metadata in payload with hash for defensive decoding
         assert self.compat_hash is not None
@@ -2500,11 +2495,30 @@ class NixlBaseConnectorWorker:
             f"DCP sizes must divide one another: local={self.dcp_size}, "
             f"remote={remote_dcp_size} (engine {remote_engine_id})."
         )
-        if self._has_mamba and self.dcp_size != remote_dcp_size:
-            raise RuntimeError(
-                "Hybrid MLA+Mamba NIXL transfers require matching DCP sizes, "
-                f"got local={self.dcp_size}, remote={remote_dcp_size}."
-            )
+        asymmetric_dcp = self.dcp_size != remote_dcp_size
+        if self._has_mamba and asymmetric_dcp:
+            if self._TRANSFER_MODE != "pull" or not self.use_mla:
+                raise RuntimeError(
+                    "Asymmetric hybrid NIXL transfers currently support only "
+                    "MLA attention in pull mode."
+                )
+            if (
+                self.block_size != nixl_agent_meta.block_size
+                or (
+                    self.dcp_size > 1
+                    and self.vllm_config.parallel_config.cp_kv_cache_interleave_size
+                    != self.block_size
+                )
+                or (
+                    remote_dcp_size > 1
+                    and nixl_agent_meta.cp_kv_cache_interleave_size
+                    != nixl_agent_meta.block_size
+                )
+            ):
+                raise RuntimeError(
+                    "Asymmetric hybrid NIXL pulls support matching physical attention "
+                    "block sizes with block-sized KV interleaving."
+                )
 
         tp_ratio = self.transfer_topo.tp_ratio(remote_tp_size)
         block_size_ratio = self.transfer_topo.block_size_ratio(
@@ -2537,6 +2551,7 @@ class NixlBaseConnectorWorker:
             self._has_mamba
             and remote_physical_per_logical
             != self._physical_blocks_per_logical_kv_block
+            and not asymmetric_dcp
             and self.vllm_config.cache_config.enable_prefix_caching
         ):
             raise RuntimeError(

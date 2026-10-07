@@ -541,16 +541,18 @@ class TransferTopology:
         """Whether the local engine's KV cache is replicated."""
         return self.is_mla or self.tp_size > self.total_num_kv_heads
 
-    def dcp_source_ranks(self, remote_tp_size: int, remote_dcp_size: int) -> list[int]:
+    def dcp_source_ranks(
+        self, remote_tp_size: int, remote_dcp_size: int, tp_rank: int | None = None
+    ) -> list[int]:
         """Remote ranks whose DCP slice overlaps mine (MLA, ``remote_dcp_size > 1``).
 
         Shared by ``handshake_target_ranks`` (who to query metadata from) and
         ``compute_tp_mapping`` (who to actually read from) — for MLA the two
-        questions have the identical answer, since DCP sharding is the only
-        thing keeping a remote rank from being interchangeable with any other.
+        questions have the identical answer for pure MLA. Hybrid models may
+        additionally read SSM head shards from other ranks.
         """
         local_dcp_size = self.dcp_size
-        local_dcp_rank = self.dcp_rank
+        local_dcp_rank = self.dcp_rank if tp_rank is None else tp_rank % self.dcp_size
         if local_dcp_size <= remote_dcp_size:
             # Keep every remote rank whose slice sits inside mine. When
             # local_dcp_size == 1 (replicated locally), local_dcp_rank == 0 reduces to
@@ -560,6 +562,16 @@ class TransferTopology:
             ]
         # Local finer-grained: exactly one remote rank covers my whole slice
         return [local_dcp_rank % remote_dcp_size]
+
+    def ssm_source_ranks(
+        self, remote_tp_size: int, tp_rank: int | None = None
+    ) -> list[int]:
+        """Remote ranks holding this rank's TP-sharded SSM heads."""
+        rank = self.tp_rank if tp_rank is None else tp_rank
+        if self.tp_size < remote_tp_size:
+            shards = remote_tp_size // self.tp_size
+            return list(range(rank * shards, (rank + 1) * shards))
+        return [rank * remote_tp_size // self.tp_size]
 
     def handshake_target_ranks(
         self, remote_tp_size: int, remote_dcp_size: int = 1
@@ -578,7 +590,10 @@ class TransferTopology:
         already has ``tp_size == dcp_size``.
         """
         if remote_dcp_size > 1:
-            return self.dcp_source_ranks(remote_tp_size, remote_dcp_size)
+            ranks = self.dcp_source_ranks(remote_tp_size, remote_dcp_size)
+            if self.is_mamba:
+                ranks = sorted(set(ranks) | set(self.ssm_source_ranks(remote_tp_size)))
+            return ranks
 
         tp_ratio = self.tp_ratio(remote_tp_size)
         if tp_ratio > 0:
@@ -586,7 +601,12 @@ class TransferTopology:
         abs_ratio = -tp_ratio
         return [self.tp_rank * abs_ratio + i for i in range(abs_ratio)]
 
-    def dcp_consumer_count(self, remote_tp_size: int, remote_dcp_size: int) -> int:
+    def dcp_consumer_count(
+        self,
+        remote_tp_size: int,
+        remote_dcp_size: int,
+        remote_rank: int | None = None,
+    ) -> int:
         """How many local ranks (in aggregate) read from a given remote rank.
 
         Used by the producer side to know how many reader notifications to
@@ -594,7 +614,24 @@ class TransferTopology:
         whenever the remote isn't sharded — a sharded local side already
         has ``tp_size == dcp_size``, so the existing TP-ratio formula is
         already correct there unmodified.
+
+        For asymmetric hybrid transfers, ``remote_rank`` includes consumers
+        of either its attention pages or its SSM head shards.
         """
+        if (
+            self.is_mla
+            and self.is_mamba
+            and remote_dcp_size > 1
+            and self.dcp_size != remote_dcp_size
+            and remote_rank is not None
+        ):
+            # A producer may serve different consumers for attention and SSM.
+            return sum(
+                remote_rank
+                in self.dcp_source_ranks(remote_tp_size, remote_dcp_size, rank)
+                or remote_rank in self.ssm_source_ranks(remote_tp_size, rank)
+                for rank in range(self.tp_size)
+            )
         if remote_dcp_size > 1:
             if self.dcp_size == 1:
                 # Replicated locally: every local rank reads every shard.
