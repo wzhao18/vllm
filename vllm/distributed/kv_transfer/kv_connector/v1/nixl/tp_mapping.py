@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -57,9 +57,8 @@ class TPMapping:
     # FA head offset factor for hetero-TP (D_TP > P_TP).
     rank_offset_factor: int
 
-    # Local ranks (in aggregate) that read from a given source rank. The producer frees
-    # a request's blocks only once that many notifications have come in.
-    local_consumers: int = 1
+    # Expected completion notifications, indexed by producer TP rank.
+    consumer_counts: dict[int, int] = field(default_factory=dict)
 
 
 # ======================================================================
@@ -72,6 +71,7 @@ def compute_tp_mapping(
     remote_tp_size: int,
     group_spec_types: tuple[type[KVCacheSpec], ...],
     remote_dcp_size: int = 1,
+    remote_interleave_size: int | None = None,
 ) -> TPMapping:
     """Build the complete local-to-remote TP mapping.
 
@@ -88,7 +88,13 @@ def compute_tp_mapping(
     if transfer_topology.is_mla or tp_size >= remote_tp_size:
         if transfer_topology.is_mla and remote_dcp_size > 1:
             attn_ranks = transfer_topology.dcp_source_ranks(
-                remote_tp_size, remote_dcp_size
+                remote_dcp_size,
+                transfer_topology.dcp_size,
+                transfer_topology.dcp_rank,
+                transfer_topology.dcp_interleave_size,
+                transfer_topology.dcp_interleave_size
+                if remote_interleave_size is None
+                else remote_interleave_size,
             )
         else:
             # D (local TP) > P (remote TP): multiple local ranks read different chunks
@@ -111,11 +117,7 @@ def compute_tp_mapping(
     # --- SSM source ranks ---
     has_ssm = any(_is_ssm_spec(t) for t in group_spec_types)
     if has_ssm:
-        if tp_size < remote_tp_size:
-            abs_tp = remote_tp_size // tp_size
-            ssm_ranks = list(range(tp_rank * abs_tp, (tp_rank + 1) * abs_tp))
-        else:
-            ssm_ranks = list(attn_ranks)
+        ssm_ranks = transfer_topology.ssm_source_ranks(remote_tp_size, tp_size, tp_rank)
     else:
         ssm_ranks = []
 
@@ -148,14 +150,21 @@ def compute_tp_mapping(
         # D TP > P TP: we index into remote to read different heads depending on rank.
         rank_offset_factor = tp_rank % (tp_size // remote_tp_size)
 
-    local_consumers = transfer_topology.dcp_consumer_count(
-        remote_tp_size, remote_dcp_size
-    )
+    consumer_counts = {
+        rank: transfer_topology.dcp_consumer_count(
+            remote_tp_size, remote_dcp_size, rank, remote_interleave_size
+        )
+        for rank in transfer_topology.handshake_target_ranks(
+            remote_tp_size,
+            remote_dcp_size,
+            remote_interleave_size=remote_interleave_size,
+        )
+    }
 
     return TPMapping(
         source_ranks_per_group=source_ranks_per_group,
         all_source_ranks=tuple(all_ranks),
         rank_to_attention_slot=rank_to_attention_slot,
         rank_offset_factor=rank_offset_factor,
-        local_consumers=local_consumers,
+        consumer_counts=consumer_counts,
     )

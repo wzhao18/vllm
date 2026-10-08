@@ -20,7 +20,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
     _is_attention_spec,
 )
 from vllm.logger import init_logger
-from vllm.utils.math_utils import cdiv
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MLAAttentionSpec
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -207,7 +207,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 local_block_ids, local_region_groups
             )
             num_computed_blocks = None
-            num_remote_blocks = None
+            num_remote_tokens = None
             if (
                 meta.remote.num_tokens is not None
                 and meta.local_num_computed_blocks
@@ -220,9 +220,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     * self._physical_blocks_per_logical_kv_block
                     for group in local_region_groups
                 ]
-                num_remote_blocks = cdiv(
-                    meta.remote.num_tokens, remote_info.remote_block_size
-                )
+                num_remote_tokens = meta.remote.num_tokens
             elif any(local_by_region) and (
                 dcp_active
                 or remote_info.remote_physical_blocks_per_logical
@@ -240,9 +238,10 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                         local_by_region,
                         remote_by_region,
                         num_computed_blocks=num_computed_blocks,
-                        num_remote_blocks=num_remote_blocks,
+                        num_remote_tokens=num_remote_tokens,
                         remote_rank=rank,
                         remote_dcp_size=remote_info.remote_dcp_size,
+                        remote_interleave_size=remote_info.remote_dcp_interleave_size,
                     ),
                     block_ids_by_region=True,
                 )
@@ -253,55 +252,112 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 for r, blocks in enumerate(local_by_region)
             ]
         else:
-            remote_logical_block_ids = meta.remote.block_ids
             meta.remote.block_ids = self._logical_to_kernel_block_ids(
-                remote_logical_block_ids,
+                meta.remote.block_ids,
                 remote_info.remote_physical_blocks_per_logical,
             )
             num_groups = len(meta.local_block_ids)
+            block_size_ratio = self.transfer_topo.block_size_ratio(
+                remote_info.remote_block_size
+            )
+            local_ratio = self._physical_blocks_per_logical_kv_block * block_size_ratio
+            remote_ratio = remote_info.remote_physical_blocks_per_logical
+            cached_blocks = (
+                tuple(
+                    meta.local_num_computed_blocks[group_id]
+                    for group_id in self.kv_cache_config.transfer_group_ids
+                )
+                if meta.local_num_computed_blocks
+                else (0,) * num_groups
+            )
+            map_attention = (
+                meta.remote.num_tokens is not None
+                or dcp_active
+                or local_ratio != remote_ratio
+            )
+            local_mapping_ids = self._logical_to_kernel_block_ids(
+                local_block_ids, block_size_ratio
+            )
+            remote_mapping_ids = meta.remote.block_ids
+            groups = self.kv_cache_config.transfer_groups
+            source_ranks = tuple(
+                ranks[:1]
+                if issubclass(self._group_spec_types[g], MLAAttentionSpec)
+                and not groups[g].kv_cache_spec.dcp_sharded
+                else ranks
+                for g, ranks in enumerate(plan.source_ranks_per_group)
+            )
 
             def group_ids(block_ids: BlockIds, rank: int) -> list[list[int]]:
                 return [
-                    list(block_ids[g]) if rank in plan.source_ranks_per_group[g] else []
+                    list(block_ids[g]) if rank in source_ranks[g] else []
                     for g in range(num_groups)
                 ]
 
             read_specs = []
             for rank in plan.all_source_ranks:
-                if dcp_active:
-                    local_ids = group_ids(meta.local_block_ids, rank)
-                    remote_ids = group_ids(remote_logical_block_ids, rank)
+                local_ids = group_ids(local_mapping_ids, rank)
+                remote_ids = group_ids(remote_mapping_ids, rank)
+                if map_attention:
                     for g in range(num_groups):
                         if not local_ids[g] or not _is_attention_spec(
                             self._group_spec_types[g]
                         ):
                             continue
-                        local_ids[g], remote_ids[g] = self._apply_dcp_prefix_caching(
-                            local_ids[g],
-                            remote_ids[g],
-                            remote_rank=rank,
-                            local_dcp_size=self.dcp_size,
-                            local_dcp_rank=self.dcp_rank,
-                            remote_dcp_size=remote_info.remote_dcp_size,
-                            local_num_computed_blocks=(
-                                meta.local_num_computed_blocks[g]
-                            ),
-                        )
-                    local_physical_ids = self._logical_to_kernel_block_ids(
-                        local_ids, self._physical_blocks_per_logical_kv_block
+                        # Only full attention retains a token-zero prefix.
+                        if not issubclass(self._group_spec_types[g], FullAttentionSpec):
+                            continue
+                        dcp_sharded = groups[g].kv_cache_spec.dcp_sharded
+                        try:
+                            local_ids[g], remote_ids[g] = (
+                                self._apply_dcp_prefix_caching(
+                                    local_ids[g],
+                                    remote_ids[g],
+                                    remote_rank=rank,
+                                    local_dcp_size=self.dcp_size if dcp_sharded else 1,
+                                    local_dcp_rank=self.dcp_rank if dcp_sharded else 0,
+                                    remote_dcp_size=(
+                                        remote_info.remote_dcp_size
+                                        if dcp_sharded
+                                        else 1
+                                    ),
+                                    local_num_computed_blocks=cached_blocks[g]
+                                    * local_ratio,
+                                    num_remote_tokens=meta.remote.num_tokens,
+                                    local_interleave_size=(
+                                        self.transfer_topo.dcp_interleave_size
+                                    ),
+                                    remote_interleave_size=(
+                                        remote_info.remote_dcp_interleave_size
+                                    ),
+                                    block_size=remote_info.remote_block_size,
+                                )
+                            )
+                        except ValueError as error:
+                            self._log_failure(
+                                failure_type="transfer_setup_failed",
+                                req_id=req_id,
+                                error=error,
+                                dst_engine_id=engine_id,
+                                remote_rank=rank,
+                                msg="Remote KV pages do not cover the requested range",
+                            )
+                            self._handle_failed_transfer(
+                                req_id,
+                                None,
+                                self._recv_failures,
+                            )
+                            return
+                if block_size_ratio > 1:
+                    # IDs already use remote-sized pages; preserve tail clipping.
+                    local_ids, remote_ids = self._map_block_ids_for_block_size_ratio(
+                        local_ids, remote_ids, 1
                     )
-                    remote_physical_ids = self._logical_to_kernel_block_ids(
-                        remote_ids,
-                        remote_info.remote_physical_blocks_per_logical,
-                    )
-                else:
-                    local_physical_ids = group_ids(meta.local_physical_block_ids, rank)
-                    remote_physical_ids = group_ids(meta.remote.block_ids, rank)
                 read_specs.append(
                     ReadSpec(
                         remote_rank=rank,
-                        local_block_ids=local_physical_ids,
-                        remote_block_ids=remote_physical_ids,
+                        local_block_ids=local_ids,
+                        remote_block_ids=remote_ids,
                     )
                 )
 
@@ -326,7 +382,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             if tp_ratio < 0 and (not self.use_mla or len(read_specs) > 1):
                 # Remote tp_size > local tp_size: we must perform multiple
                 # reads. Get the memory chunk onto which we will write to.
-                split_key = (tp_ratio, remote_block_size)
+                split_key = (tp_ratio, remote_block_size, plan.source_ranks_per_group)
                 local_xfer_side_handle = self.src_xfer_handles_by_tp_ratio[split_key][i]
                 local_dram_handle = (
                     self._dram_src_handles_by_tp_ratio[split_key][i]
@@ -361,7 +417,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 local_xfer_side_handle=local_xfer_side_handle,
                 local_dram_handle=local_dram_handle,
                 remote_xfer_side_handle=remote_xfer_side_handle,
-                expected_consumers=plan.local_consumers,
+                expected_consumers=plan.consumer_counts[spec.remote_rank],
                 awaiting_kvs=meta.awaiting_kvs,
             ):
                 return
@@ -371,10 +427,11 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             # have the blocks we need so they can update the request state.
             # Same thing for DCP (tp_size == dcp_size), so the raw tp_ratio already
             # reflects whether any remote replica is left unchosen.
-            notif_id = f"{meta.remote.request_id}:{plan.local_consumers}".encode()
             remote_agents = self._remote_agents[meta.remote.engine_id]
             for rank_to_notify, agent in remote_agents.items():
                 if rank_to_notify != (0, read_specs[0].remote_rank):
+                    consumers = plan.consumer_counts[rank_to_notify[1]]
+                    notif_id = f"{meta.remote.request_id}:{consumers}".encode()
                     try:
                         self.nixl_wrapper.send_notif(agent, notif_msg=notif_id)
                     except Exception as e:
@@ -418,16 +475,6 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         block_size_ratio = self.transfer_topo.block_size_ratio(
             remote_info.remote_block_size
         )
-        if block_size_ratio > 1:
-            if read_spec.block_ids_by_region:
-                raise NotImplementedError(
-                    "Region-mapped NIXL transfers require matching physical block sizes"
-                )
-            local_block_ids, remote_block_ids = (
-                self._map_block_ids_for_block_size_ratio(
-                    local_block_ids, remote_block_ids, block_size_ratio
-                )
-            )
         # NOTE(rob): having the staging blocks be on the READER side is
         # not going to work well (since we will have to call rearrange tensors).
         # after we detect the txn is complete (which means we cannot make the
@@ -473,17 +520,16 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 == len(local_block_ids)
                 == len(self.kv_cache_config.transfer_groups)
             )
-            if not (self.dcp_size > 1 or remote_info.remote_dcp_size > 1):
-                local_block_ids, remote_block_ids = self._apply_prefix_caching(
-                    decode_block_ids=local_block_ids,
-                    prefill_block_ids=remote_block_ids,
-                    decode_physical_per_logical=(
-                        self._physical_blocks_per_logical_kv_block
-                    ),
-                    prefill_physical_per_logical=(
-                        remote_info.remote_physical_blocks_per_logical
-                    ),
-                )
+            local_block_ids, remote_block_ids = self._apply_prefix_caching(
+                decode_block_ids=local_block_ids,
+                prefill_block_ids=remote_block_ids,
+                decode_physical_per_logical=(
+                    self._physical_blocks_per_logical_kv_block
+                ),
+                prefill_physical_per_logical=(
+                    remote_info.remote_physical_blocks_per_logical
+                ),
+            )
 
         # NOTE (nicolo) With homogeneous TP, each TP worker loads KV from
         # corresponding rank. With heterogeneous TP, fixing D>P, the D tp
