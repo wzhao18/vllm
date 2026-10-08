@@ -3456,7 +3456,6 @@ class NixlBaseConnectorWorker:
         remote to release its blocks without performing a transfer.
 
         """
-        local_tokens = None
         if num_remote_tokens is not None:
             local_tokens = TransferTopology.dcp_num_local_tokens(
                 num_remote_tokens,
@@ -3464,27 +3463,35 @@ class NixlBaseConnectorWorker:
                 local_dcp_rank,
                 local_interleave_size,
             )
-        matched_local, matched_remote = [], []
-        for i, block_id in enumerate(local_ids, local_num_computed_blocks):
-            token_position = i * block_size
-            if local_tokens is not None and token_position >= local_tokens:
-                break
-            cycle, offset = divmod(token_position, local_interleave_size)
-            position = (
-                cycle * local_dcp_size + local_dcp_rank
-            ) * local_interleave_size + offset
-            cycle, offset = divmod(position, remote_interleave_size)
-            if cycle % remote_dcp_size != remote_rank % remote_dcp_size:
-                continue
-            remote_idx = (
-                cycle // remote_dcp_size * remote_interleave_size + offset
-            ) // block_size
-            if remote_idx < len(remote_ids):
-                matched_local.append(block_id)
-                matched_remote.append(remote_ids[remote_idx])
-            elif num_remote_tokens is not None:
-                raise ValueError("Remote KV pages do not cover the requested range")
-        return matched_local, matched_remote
+            local_ids = local_ids[
+                : max(0, cdiv(local_tokens, block_size) - local_num_computed_blocks)
+            ]
+        if not local_ids:
+            return [], []
+        positions = np.arange(
+            local_num_computed_blocks,
+            local_num_computed_blocks + len(local_ids),
+            dtype=np.int64,
+        ) * block_size
+        cycles, offsets = np.divmod(positions, local_interleave_size)
+        positions = (
+            cycles * local_dcp_size + local_dcp_rank
+        ) * local_interleave_size + offsets
+        cycles, offsets = np.divmod(positions, remote_interleave_size)
+        local_indices = np.flatnonzero(
+            cycles % remote_dcp_size == remote_rank % remote_dcp_size
+        )
+        remote_indices = (
+            cycles[local_indices] // remote_dcp_size * remote_interleave_size
+            + offsets[local_indices]
+        ) // block_size
+        available = remote_indices < len(remote_ids)
+        if num_remote_tokens is not None and not np.all(available):
+            raise ValueError("Remote KV pages do not cover the requested range")
+        return (
+            np.asarray(local_ids, dtype=np.int64)[local_indices[available]].tolist(),
+            np.asarray(remote_ids, dtype=np.int64)[remote_indices[available]].tolist(),
+        )
 
     @staticmethod
     def _block_ids_by_region(

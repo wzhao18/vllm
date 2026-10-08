@@ -836,10 +836,10 @@ def test_apply_dcp_prefix_caching_matches_global_logical_positions(
     expected_local,
     expected_remote,
 ):
-    """_apply_dcp_prefix_caching must operate on logical block IDs (DCP
-    interleaves at logical-block granularity) and always return equal-length
-    local/remote slices, so a later, unconditional _apply_prefix_caching
-    trim is a guaranteed no-op rather than double-processing the read."""
+    """Match common-unit block IDs by global DCP position.
+
+    Equal-length slices keep the later prefix-cache trim from trimming twice.
+    """
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
         NixlConnectorWorker,
     )
