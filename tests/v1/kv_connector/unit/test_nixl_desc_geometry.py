@@ -12,6 +12,7 @@ mid-decode (silent corruption of an unrelated request).
 """
 
 from collections import defaultdict
+from dataclasses import replace
 from threading import Event, Lock
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -529,7 +530,15 @@ def test_registration_ignores_a_sub_block_padding_tail(page_covers_view):
     assert _descriptor_geometry(padded) == _descriptor_geometry(unpadded)
 
 
-def _make_mla_hybrid_worker(local_block_size, kernel_block_size, num_logical_blocks):
+def _make_mla_hybrid_worker(
+    local_block_size,
+    kernel_block_size,
+    num_logical_blocks,
+    tp_size=1,
+    tp_rank=0,
+    dcp_size=1,
+    dcp_sharded=True,
+):
     """Build a real pull worker with a hybrid MLA + 2xKDA HMA layout."""
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
         base_worker as bw,
@@ -548,6 +557,7 @@ def _make_mla_hybrid_worker(local_block_size, kernel_block_size, num_logical_blo
 
     mla_spec = MLAAttentionSpec(
         block_size=local_block_size,
+        dcp_sharded=dcp_sharded,
         num_kv_heads=1,
         head_size=6,
         dtype=torch.float16,
@@ -583,6 +593,10 @@ def _make_mla_hybrid_worker(local_block_size, kernel_block_size, num_logical_blo
 
     vllm_config = create_vllm_config(block_size=local_block_size)
     vllm_config.cache_config.enable_prefix_caching = False
+    vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = False
+    vllm_config.parallel_config.tensor_parallel_size = tp_size
+    vllm_config.parallel_config.decode_context_parallel_size = dcp_size
+    vllm_config.parallel_config.cp_kv_cache_interleave_size = local_block_size
     # kv_buffer_device defaults to the *real* platform's device type, which on
     # a CPU-only test host would make this a host-buffer worker: host xfer
     # buffers are per-layer, so the HMA shared-tensor regions this test builds
@@ -601,8 +615,8 @@ def _make_mla_hybrid_worker(local_block_size, kernel_block_size, num_logical_blo
 
     with (
         patch.object(bw, "NixlWrapper", _RecordingNixl),
-        patch.object(bw, "get_tensor_model_parallel_rank", return_value=0),
-        patch.object(bw, "get_tensor_model_parallel_world_size", return_value=1),
+        patch.object(bw, "get_tensor_model_parallel_rank", return_value=tp_rank),
+        patch.object(bw, "get_tensor_model_parallel_world_size", return_value=tp_size),
         patch.object(bw, "get_current_attn_backends", return_value=[fake_backend]),
         patch.object(bw, "current_platform", fake_platform),
         patch(
@@ -839,7 +853,10 @@ def _register_remote_agents(worker, metadata, tp_size):
     """Mirror the async handshake callback that publishes prepared agents."""
     worker._remote_agents[metadata.engine_id] = {
         (0, rank): worker.add_remote_agent(
-            metadata, remote_tp_rank=rank, remote_tp_size=tp_size
+            metadata,
+            remote_tp_rank=rank,
+            remote_tp_size=tp_size,
+            remote_dcp_size=metadata.dcp_size,
         )
         for rank in range(tp_size)
     }
@@ -969,7 +986,19 @@ def _resolve(
 
 
 def _run_hetero_case(
-    local_block, kernel, remote_block, num_tokens, tp_size=2, remote_kernel=None
+    local_block,
+    kernel,
+    remote_block,
+    num_tokens,
+    tp_size=2,
+    remote_kernel=None,
+    remote_dcp_size=1,
+    cached=0,
+    local_dcp_size=1,
+    local_rank=0,
+    include_nontransfer_group=False,
+    interleave=None,
+    replicated_attention=False,
 ):
     """Full pull-path run for one geometry; returns pairing records.
 
@@ -981,17 +1010,37 @@ def _run_hetero_case(
     )
 
     remote_kernel = remote_kernel or kernel
+    local_interleave = interleave or local_block
+    remote_interleave = interleave or remote_block
     block_size_ratio = kernel // remote_kernel
     remote_ppl = remote_block // remote_kernel
     matched = num_tokens - 1  # mamba N-1 rule
-    n_local = -(-num_tokens // local_block)
-    n_remote = -(-matched // remote_block)
+    local_attention_size = 1 if replicated_attention else local_dcp_size
+    remote_attention_size = 1 if replicated_attention else remote_dcp_size
+    local_attention_rank = 0 if replicated_attention else local_rank
+    n_local = -(-num_tokens // (local_block * local_attention_size))
+    n_remote = -(-matched // (remote_block * remote_attention_size))
 
     worker = _make_mla_hybrid_worker(
         local_block_size=local_block,
         kernel_block_size=kernel,
         num_logical_blocks=max(2 * n_local + 4, 8),
+        tp_size=local_dcp_size,
+        tp_rank=local_rank,
+        dcp_size=local_dcp_size,
+        dcp_sharded=not replicated_attention,
     )
+    worker.vllm_config.cache_config.enable_prefix_caching = (
+        remote_dcp_size > 1 or local_dcp_size > 1
+    )
+    worker.vllm_config.parallel_config.cp_kv_cache_interleave_size = local_interleave
+    worker.transfer_topo.dcp_interleave_size = local_interleave
+    if include_nontransfer_group:
+        groups = worker.kv_cache_config.kv_cache_groups
+        worker.kv_cache_config = replace(
+            worker.kv_cache_config,
+            kv_cache_groups=[replace(groups[0], enable_kv_transfer=False), *groups],
+        )
     # Local KDA state pages are (48, 64) bytes; the remote holds 1/tp_size
     # shards of each.
     meta_r = _make_remote_meta(
@@ -999,20 +1048,28 @@ def _run_hetero_case(
         remote_block_size=remote_block,
         remote_kernel_block_size=remote_kernel,
         remote_num_logical=max(2 * n_remote + 4, 8),
-        remote_ssm_sizes=(48 // tp_size, 64 // tp_size),
+        remote_ssm_sizes=(
+            48 * local_dcp_size // tp_size,
+            64 * local_dcp_size // tp_size,
+        ),
     )
+    meta_r.dcp_size = remote_dcp_size
+    meta_r.cp_kv_cache_interleave_size = remote_interleave
     _register_remote_agents(worker, meta_r, tp_size)
 
     # Sparse ids so neighbors exist between the request's blocks.
     local_attn = [2 * i + 1 for i in range(n_local)]
     remote_attn = [2 * i + 2 for i in range(n_remote)]
-    local_ids = (local_attn, [0], [2 * n_local + 2])
+    local_ids = (local_attn[cached:], [0], [2 * n_local + 2])
     remote_ids = [remote_attn, [1], [0]]
 
     metadata = NixlConnectorMetadata()
     metadata.add_new_req_to_recv(
         request_id="req-b",
         local_block_ids=local_ids,
+        local_num_computed_blocks=(0, cached, 0, 0)
+        if include_nontransfer_group
+        else (cached, 0, 0),
         kv_transfer_params={
             "remote_block_ids": remote_ids,
             "remote_engine_id": "remote-engine",
@@ -1020,6 +1077,8 @@ def _run_hetero_case(
             "remote_host": "remote-host",
             "remote_port": 1234,
             "tp_size": tp_size,
+            "dcp_size": remote_dcp_size,
+            "remote_num_tokens": matched,
         },
     )
     meta = metadata.reqs_to_recv["req-b"]
@@ -1049,8 +1108,14 @@ def _run_hetero_case(
     desc_page = worker.block_len_per_layer[0] // block_size_ratio
     meta_r_num_blocks_bytes = (meta_r.num_blocks // remote_ppl) * remote_unified
     covered_tokens = set()
+    mamba_source_ranks = set()
     for op, lh, lids, rh, rids in nixl.xfers:
         larr, rarr = nixl.dlists[lh], nixl.dlists[rh]
+        remote_rank = next(
+            rank
+            for rank, handle in worker.dst_xfer_side_handles["remote-engine"].items()
+            if handle == rh
+        )
         for li, ri in zip(lids, rids):
             lreg, lkind, ltok = _resolve(
                 larr,
@@ -1081,17 +1146,45 @@ def _run_hetero_case(
                 f"tokens {ltok} vs {rtok}"
             )
             if lkind == "attn":
-                assert ltok == rtok, (
-                    f"TOKEN MISALIGNMENT: local sub-block holds tokens "
-                    f"[{ltok}..) but receives remote tokens [{rtok}..) "
-                    f"(geometry local_block={local_block}, "
-                    f"remote_block={remote_block}, N={num_tokens})"
-                )
-                covered_tokens.add(ltok)
+                for offset in range(remote_kernel):
+                    local_token = ltok + offset
+                    remote_token = rtok + offset
+                    local_global = (
+                        local_token // local_interleave * local_attention_size
+                        + local_attention_rank
+                    ) * local_interleave + local_token % local_interleave
+                    remote_global = (
+                        remote_token // remote_interleave * remote_attention_size
+                        + remote_rank % remote_attention_size
+                    ) * remote_interleave + remote_token % remote_interleave
+                    assert local_global == remote_global, (
+                        f"TOKEN MISALIGNMENT: local token {local_global} receives "
+                        f"remote token {remote_global} "
+                        f"(geometry local_block={local_block}, "
+                        f"remote_block={remote_block}, N={num_tokens})"
+                    )
+                    covered_tokens.add(local_global)
+            else:
+                mamba_source_ranks.add(remote_rank)
 
-    # Invariant 3: full coverage of the matched tokens, at the finest
-    # transfer granularity (the remote kernel block).
-    needed = {t for t in range(0, matched - matched % remote_kernel, remote_kernel)}
+    if remote_dcp_size > 1 or local_dcp_size > 1:
+        if tp_size >= local_dcp_size:
+            shards = tp_size // local_dcp_size
+            expected_sources = set(
+                range(local_rank * shards, (local_rank + 1) * shards)
+            )
+        else:
+            expected_sources = {local_rank // (local_dcp_size // tp_size)}
+        assert mamba_source_ranks == expected_sources
+
+    # Invariant 3: full coverage, including token-level DCP interleaving.
+    needed = {
+        t
+        for t in range(matched)
+        if t // local_interleave % local_attention_size == local_attention_rank
+        and (t // (local_interleave * local_attention_size) * local_interleave
+             + t % local_interleave) >= cached * local_block
+    }
     missing = needed - covered_tokens
     assert not missing, (
         f"tokens never transferred: {sorted(missing)[:8]} "
@@ -1105,6 +1198,7 @@ def _run_hetero_case(
     # those blocks must be either written by the transfer or zeroed by the
     # receive post-process. Stale bytes surface as mid-response garbage
     # once decode grows into the untransferred tail.
+    received_attention = []
     for op, lh, lids, rh, rids in nixl.xfers:
         larr = nixl.dlists[lh]
         for li in lids:
@@ -1112,13 +1206,28 @@ def _run_hetero_case(
             for t in worker._test_tensors:
                 off = addr - t.data_ptr()
                 if 0 <= off < t.numel():
-                    t[off : off + length] = 0  # simulate the RDMA write
+                    t[off : off + length] = 0x55  # simulate the RDMA write
+                    _, kind, _ = _resolve(
+                        larr,
+                        li,
+                        local_bases,
+                        t.numel(),
+                        local_unified,
+                        desc_page,
+                        local_attn,
+                        local_block,
+                    )
+                    if kind == "attn":
+                        received_attention.append(t[off : off + length])
                     break
-    done_sending, done_recving = worker.get_finished()
+    with patch("vllm.utils.torch_utils.PIN_MEMORY", False):
+        done_sending, done_recving = worker.get_finished()
     assert "req-b" in done_recving
-    n_excluded = -(-matched // local_block)
+    assert all(torch.all(page == 0x55) for page in received_attention), (
+        "Receive cleanup overwrote transferred attention pages"
+    )
     stale = []
-    for b in local_attn[:n_excluded]:
+    for b in local_attn[cached:]:
         for region, t in enumerate(worker._test_tensors):
             page = t[b * local_unified : (b + 1) * local_unified]
             n_stale = int((page == 0xAA).sum())
@@ -1130,6 +1239,101 @@ def _run_hetero_case(
         f"(geometry local_block={local_block}, remote_block={remote_block}, "
         f"N={num_tokens}, matched={matched})"
     )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("remote_blocks", [(56, 400), (400, 56)])
+@pytest.mark.parametrize("rank", [0, 1])
+def test_hybrid_pull_handles_preserve_each_peers_state_shards(remote_blocks, rank):
+    """A peer's attention fan-in must not change another peer's SSM slices."""
+    worker = _make_mla_hybrid_worker(
+        local_block_size=56,
+        kernel_block_size=4,
+        num_logical_blocks=16,
+        tp_size=2,
+        tp_rank=rank,
+        dcp_size=2,
+    )
+    worker.vllm_config.cache_config.enable_prefix_caching = True
+    for remote_block in remote_blocks:
+        metadata = _make_remote_meta(
+            worker,
+            remote_block_size=remote_block,
+            remote_kernel_block_size=4,
+            remote_num_logical=16,
+            remote_ssm_sizes=(12, 16),
+        )
+        metadata.engine_id = f"producer-{remote_block}"
+        metadata.dcp_size = 8
+        metadata.cp_kv_cache_interleave_size = remote_block
+        _register_remote_agents(worker, metadata, 8)
+        plan = worker.tp_mappings[metadata.engine_id]
+        key = (-4, 4, plan.source_ranks_per_group)
+        handles = worker.src_xfer_handles_by_tp_ratio[key]
+        expected = list(
+            worker._build_local_splits_from_plan(
+                plan, worker.src_blocks_data, worker.num_descs
+            )
+        )
+        assert len(handles) == len(expected)
+        for handle, descriptors in zip(handles, expected):
+            np.testing.assert_array_equal(
+                worker.nixl_wrapper.dlists[handle], descriptors
+            )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("include_nontransfer_group", [False, True])
+@pytest.mark.parametrize(
+    "local_dcp_size,remote_dcp_size,interleave,replicated_attention",
+    [
+        (1, 2, None, False),
+        (1, 2, 4, False),
+        (1, 8, None, False),
+        (1, 8, 4, False),
+        (2, 8, None, False),
+        (2, 8, 4, False),
+        (8, 2, None, False),
+        (8, 2, 4, False),
+        (8, 8, None, False),
+        (8, 8, 4, False),
+        (2, 2, 1, False),
+        (8, 8, 1, False),
+        (1, 8, 4, True),
+        (8, 8, 1, True),
+        (8, 2, 4, True),
+    ],
+)
+@pytest.mark.parametrize("cached", [0, 1])
+@pytest.mark.parametrize("tail", [1, 9])
+@pytest.mark.parametrize("local_block,remote_block", [(32, 32), (56, 400), (400, 56)])
+def test_hybrid_dcp_pull_matches_logical_blocks(
+    local_dcp_size,
+    remote_dcp_size,
+    cached,
+    tail,
+    local_block,
+    remote_block,
+    include_nontransfer_group,
+    interleave,
+    replicated_attention,
+):
+    """DCP fan-in preserves token positions, Mamba shards and cached prefixes."""
+    for rank in range(local_dcp_size):
+        _run_hetero_case(
+            local_block=local_block,
+            kernel=4,
+            remote_block=remote_block,
+            num_tokens=2 * local_block * local_dcp_size + tail,
+            tp_size=remote_dcp_size,
+            remote_dcp_size=remote_dcp_size,
+            cached=cached,
+            local_dcp_size=local_dcp_size,
+            local_rank=rank,
+            include_nontransfer_group=include_nontransfer_group,
+            interleave=interleave,
+            replicated_attention=replicated_attention,
+        )
 
 
 @pytest.mark.cpu_test
