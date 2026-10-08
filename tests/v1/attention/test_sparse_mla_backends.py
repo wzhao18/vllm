@@ -171,6 +171,36 @@ SPARSE_BACKEND_BATCH_SPECS = {
     ]
 }
 
+
+@pytest.mark.parametrize("world_size", [1, 2, 3, 4, 8])
+@pytest.mark.parametrize("topk", [128, 2048])
+def test_dcp_valid_counts_match_empty_row_mask(world_size, topk):
+    from vllm.v1.attention.backends.mla.sparse_utils import (
+        triton_filter_and_convert_dcp_index,
+    )
+
+    requests = torch.zeros(8, device="cuda", dtype=torch.int32)
+    blocks = torch.arange(64, device="cuda", dtype=torch.int32)[None]
+    indices = torch.randint(0, 4096, (8, topk), device="cuda", dtype=torch.int32)
+    indices[0] = -1
+    indices[1] = 0  # Only rank zero owns this row.
+    indices[2, ::2] = -1
+    for rank in range(world_size):
+        physical, counts = triton_filter_and_convert_dcp_index(
+            requests,
+            blocks,
+            indices,
+            world_size,
+            rank,
+            NUM_TOPK_TOKENS=topk,
+            return_valid_counts=True,
+        )
+        torch.testing.assert_close(
+            counts, (physical != -1).sum(dim=-1).int(), rtol=0, atol=0
+        )
+        torch.testing.assert_close(counts == 0, (physical == -1).all(dim=-1))
+
+
 SPARSE_BACKEND_BATCH_SPECS["large_q_prefill"] = BatchSpec(
     seq_lens=[1024] * 2, query_lens=[256] * 2
 )
