@@ -5,6 +5,7 @@
 import contextlib
 import itertools
 import logging
+import math
 import os
 import queue
 import threading
@@ -14,7 +15,7 @@ from collections import defaultdict
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import cached_property
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import msgspec
 import numpy as np
@@ -59,7 +60,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     _NIXL_SUPPORTED_DEVICE,
     get_representative_spec_type,
-    get_transfer_block_size,
     zmq_ctx,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import (
@@ -583,8 +583,16 @@ class NixlBaseConnectorWorker:
         )
 
         self.kv_cache_config = kv_cache_config
-        self.block_size = get_transfer_block_size(
-            kv_cache_config, vllm_config.cache_config.block_size
+        transfer_block_sizes = [
+            group.kv_cache_spec.block_size
+            for group in kv_cache_config.transfer_groups
+            if get_representative_spec_type(group.kv_cache_spec)
+            not in (MambaSpec, CircularBufferSpec)
+        ]
+        self.block_size = (
+            math.lcm(*transfer_block_sizes)
+            if transfer_block_sizes
+            else cast(int, vllm_config.cache_config.block_size)
         )
         # Per-layer specs, unwrapping UniformTypeKVCacheSpecs group wrappers.
         self._layer_specs: dict[str, KVCacheSpec] = {}
@@ -1157,9 +1165,7 @@ class NixlBaseConnectorWorker:
                 self._validate_remote_parallel_config(metadata)
 
                 if self._TRANSFER_MODE == "pull" and not notif_agents_only:
-                    remote_interleave = max(
-                        1, metadata.cp_kv_cache_interleave_size // metadata.block_size
-                    )
+                    remote_interleave = metadata.cp_kv_cache_interleave_size
                     source_ranks = self.transfer_topo.handshake_target_ranks(
                         remote_tp_size,
                         remote_dcp_size,
@@ -1441,10 +1447,8 @@ class NixlBaseConnectorWorker:
             else self.model_config.get_total_num_kv_heads(),
             attn_backends=self.attn_backends,
             dcp_size=self.dcp_size,
-            dcp_interleave_size=max(
-                1,
+            dcp_interleave_size=(
                 self.vllm_config.parallel_config.cp_kv_cache_interleave_size
-                // self.block_size,
             )
             if self.dcp_size > 1
             else 1,
@@ -2363,11 +2367,7 @@ class NixlBaseConnectorWorker:
             remote_block_len=nixl_agent_meta.block_lens[0],
             remote_physical_blocks_per_logical=physical_blocks_per_logical,
             remote_dcp_size=remote_dcp_size,
-            remote_dcp_interleave_size=max(
-                1,
-                nixl_agent_meta.cp_kv_cache_interleave_size
-                // nixl_agent_meta.block_size,
-            ),
+            remote_dcp_interleave_size=nixl_agent_meta.cp_kv_cache_interleave_size,
         )
         transfer_topo.register_remote_engine(engine_id, transfer_info)
         logger.info("Transfer plan: %s", transfer_topo.describe(engine_id))
@@ -3043,23 +3043,45 @@ class NixlBaseConnectorWorker:
             block_size_ratio = self.transfer_topo.block_size_ratio(
                 remote_info.remote_block_size
             )
-            hetero_ppl = (
-                remote_info.remote_physical_blocks_per_logical
-                != self._physical_blocks_per_logical_kv_block
-            )
-            if block_size_ratio > 1 or self.enable_permute_local_kv or hetero_ppl:
-                for g, local_group in enumerate(meta.local_physical_block_ids):
-                    if not local_group or _is_ssm_spec(self._group_spec_types[g]):
-                        continue
-                    # Number of remote-sized sub-blocks the transfer covered;
-                    # everything past this was clipped and must be zeroed.
-                    covered_sub_blocks = min(
-                        len(local_group) * block_size_ratio,
-                        len(meta.remote.block_ids[g]),
+            for g, local_group in enumerate(meta.local_physical_block_ids):
+                if not local_group or _is_ssm_spec(self._group_spec_types[g]):
+                    continue
+                # Zero the allocation padding beyond the received prefix.
+                # Push receivers do not retain the producer's block IDs.
+                covered_sub_blocks = (
+                    len(meta.remote.block_ids[g])
+                    if meta.remote.block_ids
+                    else len(local_group) * block_size_ratio
+                )
+                if meta.remote.num_tokens is not None and issubclass(
+                    self._group_spec_types[g], FullAttentionSpec
+                ):
+                    group_id = self.kv_cache_config.transfer_group_ids[g]
+                    spec = self.kv_cache_config.kv_cache_groups[group_id].kv_cache_spec
+                    local_tokens = TransferTopology.dcp_num_local_tokens(
+                        meta.remote.num_tokens,
+                        self.dcp_size if spec.dcp_sharded else 1,
+                        self.dcp_rank if spec.dcp_sharded else 0,
+                        self.transfer_topo.dcp_interleave_size,
                     )
-                    block_ids_for_blocksize_post_process[block_size_ratio].append(
-                        (local_group, covered_sub_blocks)
+                    cached_blocks = (
+                        meta.local_num_computed_blocks[group_id]
+                        if meta.local_num_computed_blocks
+                        else 0
                     )
+                    covered_sub_blocks = max(
+                        0,
+                        cdiv(local_tokens, remote_info.remote_block_size)
+                        - cached_blocks
+                        * self._physical_blocks_per_logical_kv_block
+                        * block_size_ratio,
+                    )
+                covered_sub_blocks = min(
+                    len(local_group) * block_size_ratio, covered_sub_blocks
+                )
+                block_ids_for_blocksize_post_process[block_size_ratio].append(
+                    (local_group, covered_sub_blocks)
+                )
             # post processing for heterogeneous attention
             if self.enable_heterogeneous_attn_post_process:
                 block_ids_for_heterogeneous_attn_post_process.append(
@@ -3337,7 +3359,7 @@ class NixlBaseConnectorWorker:
         local_block_ids: BlockIds,
         remote_block_ids: BlockIds,
         block_size_ratio: int,
-    ) -> tuple[BlockIds, BlockIds]:
+    ) -> tuple[list[list[int]], list[list[int]]]:
         """Map attention-group block ids to remote-block granularity.
 
         Each local attention block is split into ``block_size_ratio``
@@ -3409,17 +3431,17 @@ class NixlBaseConnectorWorker:
         local_dcp_rank: int,
         remote_dcp_size: int,
         local_num_computed_blocks: int,
-        num_remote_blocks: int | None = None,
+        num_remote_tokens: int | None = None,
         local_interleave_size: int = 1,
         remote_interleave_size: int = 1,
+        block_size: int = 1,
     ) -> tuple[list[int], list[int]]:
         """Match local and remote block IDs by global DCP position.
 
         ``local_ids`` excludes blocks already satisfied by the local prefix
         cache, while ``remote_ids`` contains the full transferable remote list.
-        ``num_remote_blocks``, when provided, is the global block count before
-        DCP partitioning and excludes allocation padding.
-        Interleave sizes specify ownership spans in the input block-ID units.
+        Interleave sizes and ``num_remote_tokens`` are in tokens. Input IDs
+        use the common ``block_size`` transfer unit on both sides.
 
         Example:
             local DCP size 2, rank 0 owns *global positions*=[0, 2, 4, 6]
@@ -3434,54 +3456,35 @@ class NixlBaseConnectorWorker:
         remote to release its blocks without performing a transfer.
 
         """
-        if local_interleave_size != 1 or remote_interleave_size != 1:
-            # A logical allocation can span several remote interleave units.
-            matched_local, matched_remote = [], []
-            for i, block_id in enumerate(local_ids, local_num_computed_blocks):
-                cycle, offset = divmod(i, local_interleave_size)
-                position = (
-                    cycle * local_dcp_size + local_dcp_rank
-                ) * local_interleave_size + offset
-                if num_remote_blocks is not None and position >= num_remote_blocks:
-                    break
-                cycle, offset = divmod(position, remote_interleave_size)
-                if cycle % remote_dcp_size != remote_rank % remote_dcp_size:
-                    continue
-                remote_idx = cycle // remote_dcp_size * remote_interleave_size + offset
-                if remote_idx < len(remote_ids):
-                    matched_local.append(block_id)
-                    matched_remote.append(remote_ids[remote_idx])
-                elif num_remote_blocks is not None:
-                    raise ValueError("Remote KV pages do not cover the requested range")
-            return matched_local, matched_remote
-
-        local_size, remote_size = local_dcp_size, remote_dcp_size
-        if num_remote_blocks is not None:
-            num_local = cdiv(num_remote_blocks - local_dcp_rank, local_size)
-            local_ids = local_ids[: max(0, num_local - local_num_computed_blocks)]
-
-        if local_size == remote_size:
-            local_slice = local_ids
-            remote_slice = remote_ids[local_num_computed_blocks:]
-        elif local_size < remote_size:
-            k = remote_size // local_size
-            p = (remote_rank - local_dcp_rank) // local_size
-            start_local = (p - local_num_computed_blocks) % k
-            start_remote = (local_num_computed_blocks + start_local - p) // k
-            local_slice = local_ids[start_local::k]
-            remote_slice = remote_ids[start_remote:]
-        else:
-            k = local_size // remote_size
-            remote_dcp_rank = remote_rank % remote_size
-            c = (local_dcp_rank - remote_dcp_rank) // remote_size
-            start_remote = c + local_num_computed_blocks * k
-            local_slice = local_ids
-            remote_slice = remote_ids[start_remote::k]
-
-        matched_blocks = min(len(local_slice), len(remote_slice))
-        if num_remote_blocks is not None and matched_blocks < len(local_slice):
-            raise ValueError("Remote KV pages do not cover the requested range")
-        return local_slice[:matched_blocks], remote_slice[:matched_blocks]
+        local_tokens = None
+        if num_remote_tokens is not None:
+            local_tokens = TransferTopology.dcp_num_local_tokens(
+                num_remote_tokens,
+                local_dcp_size,
+                local_dcp_rank,
+                local_interleave_size,
+            )
+        matched_local, matched_remote = [], []
+        for i, block_id in enumerate(local_ids, local_num_computed_blocks):
+            token_position = i * block_size
+            if local_tokens is not None and token_position >= local_tokens:
+                break
+            cycle, offset = divmod(token_position, local_interleave_size)
+            position = (
+                cycle * local_dcp_size + local_dcp_rank
+            ) * local_interleave_size + offset
+            cycle, offset = divmod(position, remote_interleave_size)
+            if cycle % remote_dcp_size != remote_rank % remote_dcp_size:
+                continue
+            remote_idx = (
+                cycle // remote_dcp_size * remote_interleave_size + offset
+            ) // block_size
+            if remote_idx < len(remote_ids):
+                matched_local.append(block_id)
+                matched_remote.append(remote_ids[remote_idx])
+            elif num_remote_tokens is not None:
+                raise ValueError("Remote KV pages do not cover the requested range")
+        return matched_local, matched_remote
 
     @staticmethod
     def _block_ids_by_region(
@@ -3503,9 +3506,10 @@ class NixlBaseConnectorWorker:
         prefill_block_ids: BlockIds,
         *,
         num_computed_blocks: list[int] | None = None,
-        num_remote_blocks: int | None = None,
+        num_remote_tokens: int | None = None,
         remote_rank: int = 0,
         remote_dcp_size: int = 1,
+        remote_interleave_size: int = 1,
     ) -> tuple[BlockIds, BlockIds]:
         """Pair an uncached decode suffix with the same prefill regions."""
         assert len(decode_block_ids) == len(prefill_block_ids)
@@ -3514,7 +3518,7 @@ class NixlBaseConnectorWorker:
             return empty_regions, empty_regions.copy()
 
         if num_computed_blocks is not None:
-            assert num_remote_blocks is not None
+            assert num_remote_tokens is not None
             matched_decode, matched_prefill = [], []
             for decode_region, prefill_region, start in zip(
                 decode_block_ids, prefill_block_ids, num_computed_blocks, strict=True
@@ -3527,7 +3531,12 @@ class NixlBaseConnectorWorker:
                     self.dcp_rank,
                     remote_dcp_size,
                     start,
-                    num_remote_blocks=num_remote_blocks,
+                    num_remote_tokens=num_remote_tokens,
+                    local_interleave_size=(
+                        self.vllm_config.parallel_config.cp_kv_cache_interleave_size
+                    ),
+                    remote_interleave_size=remote_interleave_size,
+                    block_size=self.block_size,
                 )
                 matched_decode.append(local)
                 matched_prefill.append(remote)

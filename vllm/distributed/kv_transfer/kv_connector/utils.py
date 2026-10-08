@@ -423,7 +423,7 @@ class EngineTransferInfo:
     """Remote decode context parallel size."""
 
     remote_dcp_interleave_size: int = 1
-    """Physical pages in each remote DCP ownership span."""
+    """Tokens in each remote DCP ownership span."""
 
 
 # ---- Transfer topology ----
@@ -547,8 +547,17 @@ class TransferTopology:
         return self.is_mla or self.tp_size > self.total_num_kv_heads
 
     @staticmethod
+    def dcp_num_local_tokens(
+        num_tokens: int, dcp_size: int, dcp_rank: int, interleave_size: int
+    ) -> int:
+        """Count the tokens stored on one DCP rank."""
+        cycles, tail = divmod(num_tokens, dcp_size * interleave_size)
+        return cycles * interleave_size + min(
+            max(tail - dcp_rank * interleave_size, 0), interleave_size
+        )
+
+    @staticmethod
     def dcp_source_ranks(
-        remote_tp_size: int,
         remote_dcp_size: int,
         local_dcp_size: int,
         local_dcp_rank: int,
@@ -562,34 +571,24 @@ class TransferTopology:
         questions have the identical answer, since DCP sharding is the only
         thing keeping a remote rank from being interchangeable with any other.
 
-        Interleave sizes are expressed in the same transfer-page units.
+        Interleave sizes are expressed in tokens.
         """
-        if local_interleave_size != remote_interleave_size:
-            period = gcd(
-                local_dcp_size * local_interleave_size,
-                remote_dcp_size * remote_interleave_size,
-            )
-            local_start = local_dcp_rank * local_interleave_size
-            local_end = local_start + local_interleave_size
-            ranks = []
-            for rank in range(remote_tp_size):
-                remote_start = rank % remote_dcp_size * remote_interleave_size
-                remote_end = remote_start + remote_interleave_size
-                # Ownership intervals overlap if their difference spans a period.
-                if local_start - remote_end < (
-                    (local_end - remote_start - 1) // period * period
-                ):
-                    ranks.append(rank)
-            return ranks
-        if local_dcp_size <= remote_dcp_size:
-            # Keep every remote rank whose slice sits inside mine. When
-            # local_dcp_size == 1 (replicated locally), local_dcp_rank == 0 reduces to
-            # every remote rank, since no single one holds the whole sequence.
-            return [
-                r for r in range(remote_tp_size) if r % local_dcp_size == local_dcp_rank
-            ]
-        # Local finer-grained: exactly one remote rank covers my whole slice
-        return [local_dcp_rank % remote_dcp_size]
+        period = gcd(
+            local_dcp_size * local_interleave_size,
+            remote_dcp_size * remote_interleave_size,
+        )
+        local_start = local_dcp_rank * local_interleave_size
+        local_end = local_start + local_interleave_size
+        ranks = []
+        for rank in range(remote_dcp_size):
+            remote_start = rank * remote_interleave_size
+            remote_end = remote_start + remote_interleave_size
+            # Ownership intervals overlap if their difference spans a period.
+            if local_start - remote_end < (
+                (local_end - remote_start - 1) // period * period
+            ):
+                ranks.append(rank)
+        return ranks
 
     @staticmethod
     def ssm_source_ranks(
@@ -626,7 +625,6 @@ class TransferTopology:
         rank = self.tp_rank if local_tp_rank is None else local_tp_rank
         if remote_dcp_size > 1:
             dcp_ranks = self.dcp_source_ranks(
-                remote_tp_size,
                 remote_dcp_size,
                 self.dcp_size,
                 rank % self.dcp_size,

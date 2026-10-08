@@ -88,7 +88,6 @@ def compute_tp_mapping(
     if transfer_topology.is_mla or tp_size >= remote_tp_size:
         if transfer_topology.is_mla and remote_dcp_size > 1:
             attn_ranks = transfer_topology.dcp_source_ranks(
-                remote_tp_size,
                 remote_dcp_size,
                 transfer_topology.dcp_size,
                 transfer_topology.dcp_rank,

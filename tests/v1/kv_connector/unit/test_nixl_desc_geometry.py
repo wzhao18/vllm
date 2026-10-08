@@ -12,6 +12,7 @@ mid-decode (silent corruption of an unrelated request).
 """
 
 from collections import defaultdict
+from dataclasses import replace
 from threading import Event, Lock
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -536,6 +537,7 @@ def _make_mla_hybrid_worker(
     tp_size=1,
     tp_rank=0,
     dcp_size=1,
+    dcp_sharded=True,
 ):
     """Build a real pull worker with a hybrid MLA + 2xKDA HMA layout."""
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
@@ -555,6 +557,7 @@ def _make_mla_hybrid_worker(
 
     mla_spec = MLAAttentionSpec(
         block_size=local_block_size,
+        dcp_sharded=dcp_sharded,
         num_kv_heads=1,
         head_size=6,
         dtype=torch.float16,
@@ -993,6 +996,9 @@ def _run_hetero_case(
     cached=0,
     local_dcp_size=1,
     local_rank=0,
+    include_nontransfer_group=False,
+    interleave=None,
+    replicated_attention=False,
 ):
     """Full pull-path run for one geometry; returns pairing records.
 
@@ -1004,11 +1010,16 @@ def _run_hetero_case(
     )
 
     remote_kernel = remote_kernel or kernel
+    local_interleave = interleave or local_block
+    remote_interleave = interleave or remote_block
     block_size_ratio = kernel // remote_kernel
     remote_ppl = remote_block // remote_kernel
     matched = num_tokens - 1  # mamba N-1 rule
-    n_local = -(-num_tokens // (local_block * local_dcp_size))
-    n_remote = -(-matched // (remote_block * remote_dcp_size))
+    local_attention_size = 1 if replicated_attention else local_dcp_size
+    remote_attention_size = 1 if replicated_attention else remote_dcp_size
+    local_attention_rank = 0 if replicated_attention else local_rank
+    n_local = -(-num_tokens // (local_block * local_attention_size))
+    n_remote = -(-matched // (remote_block * remote_attention_size))
 
     worker = _make_mla_hybrid_worker(
         local_block_size=local_block,
@@ -1017,10 +1028,19 @@ def _run_hetero_case(
         tp_size=local_dcp_size,
         tp_rank=local_rank,
         dcp_size=local_dcp_size,
+        dcp_sharded=not replicated_attention,
     )
     worker.vllm_config.cache_config.enable_prefix_caching = (
         remote_dcp_size > 1 or local_dcp_size > 1
     )
+    worker.vllm_config.parallel_config.cp_kv_cache_interleave_size = local_interleave
+    worker.transfer_topo.dcp_interleave_size = local_interleave
+    if include_nontransfer_group:
+        groups = worker.kv_cache_config.kv_cache_groups
+        worker.kv_cache_config = replace(
+            worker.kv_cache_config,
+            kv_cache_groups=[replace(groups[0], enable_kv_transfer=False), *groups],
+        )
     # Local KDA state pages are (48, 64) bytes; the remote holds 1/tp_size
     # shards of each.
     meta_r = _make_remote_meta(
@@ -1034,7 +1054,7 @@ def _run_hetero_case(
         ),
     )
     meta_r.dcp_size = remote_dcp_size
-    meta_r.cp_kv_cache_interleave_size = remote_block
+    meta_r.cp_kv_cache_interleave_size = remote_interleave
     _register_remote_agents(worker, meta_r, tp_size)
 
     # Sparse ids so neighbors exist between the request's blocks.
@@ -1047,7 +1067,9 @@ def _run_hetero_case(
     metadata.add_new_req_to_recv(
         request_id="req-b",
         local_block_ids=local_ids,
-        local_num_computed_blocks=(cached, 0, 0),
+        local_num_computed_blocks=(0, cached, 0, 0)
+        if include_nontransfer_group
+        else (cached, 0, 0),
         kv_transfer_params={
             "remote_block_ids": remote_ids,
             "remote_engine_id": "remote-engine",
@@ -1124,20 +1146,24 @@ def _run_hetero_case(
                 f"tokens {ltok} vs {rtok}"
             )
             if lkind == "attn":
-                ltok = (
-                    ltok // local_block * local_dcp_size + local_rank
-                ) * local_block + ltok % local_block
-                rtok = (
-                    rtok // remote_block * remote_dcp_size
-                    + remote_rank % remote_dcp_size
-                ) * remote_block + rtok % remote_block
-                assert ltok == rtok, (
-                    f"TOKEN MISALIGNMENT: local sub-block holds tokens "
-                    f"[{ltok}..) but receives remote tokens [{rtok}..) "
-                    f"(geometry local_block={local_block}, "
-                    f"remote_block={remote_block}, N={num_tokens})"
-                )
-                covered_tokens.add(ltok)
+                for offset in range(remote_kernel):
+                    local_token = ltok + offset
+                    remote_token = rtok + offset
+                    local_global = (
+                        local_token // local_interleave * local_attention_size
+                        + local_attention_rank
+                    ) * local_interleave + local_token % local_interleave
+                    remote_global = (
+                        remote_token // remote_interleave * remote_attention_size
+                        + remote_rank % remote_attention_size
+                    ) * remote_interleave + remote_token % remote_interleave
+                    assert local_global == remote_global, (
+                        f"TOKEN MISALIGNMENT: local token {local_global} receives "
+                        f"remote token {remote_global} "
+                        f"(geometry local_block={local_block}, "
+                        f"remote_block={remote_block}, N={num_tokens})"
+                    )
+                    covered_tokens.add(local_global)
             else:
                 mamba_source_ranks.add(remote_rank)
 
@@ -1151,16 +1177,14 @@ def _run_hetero_case(
             expected_sources = {local_rank // (local_dcp_size // tp_size)}
         assert mamba_source_ranks == expected_sources
 
-    # Invariant 3: full coverage of the matched tokens, at the finest
-    # transfer granularity (the remote kernel block).
-    needed = set(
-        range(
-            cached * local_block * local_dcp_size,
-            matched - matched % remote_kernel,
-            remote_kernel,
-        )
-    )
-    needed = {t for t in needed if t // local_block % local_dcp_size == local_rank}
+    # Invariant 3: full coverage, including token-level DCP interleaving.
+    needed = {
+        t
+        for t in range(matched)
+        if t // local_interleave % local_attention_size == local_attention_rank
+        and (t // (local_interleave * local_attention_size) * local_interleave
+             + t % local_interleave) >= cached * local_block
+    }
     missing = needed - covered_tokens
     assert not missing, (
         f"tokens never transferred: {sorted(missing)[:8]} "
@@ -1203,10 +1227,7 @@ def _run_hetero_case(
         "Receive cleanup overwrote transferred attention pages"
     )
     stale = []
-    for block_idx, b in enumerate(local_attn[cached:], start=cached):
-        # DCP ranks may have allocation padding beyond their matched prefix.
-        if (block_idx * local_dcp_size + local_rank) * local_block >= matched:
-            break
+    for b in local_attn[cached:]:
         for region, t in enumerate(worker._test_tensors):
             page = t[b * local_unified : (b + 1) * local_unified]
             n_stale = int((page == 0xAA).sum())
@@ -1262,14 +1283,40 @@ def test_hybrid_pull_handles_preserve_each_peers_state_shards(remote_blocks, ran
 
 
 @pytest.mark.cpu_test
+@pytest.mark.parametrize("include_nontransfer_group", [False, True])
 @pytest.mark.parametrize(
-    "local_dcp_size,remote_dcp_size", [(1, 2), (1, 8), (2, 8), (8, 2), (8, 8)]
+    "local_dcp_size,remote_dcp_size,interleave,replicated_attention",
+    [
+        (1, 2, None, False),
+        (1, 2, 4, False),
+        (1, 8, None, False),
+        (1, 8, 4, False),
+        (2, 8, None, False),
+        (2, 8, 4, False),
+        (8, 2, None, False),
+        (8, 2, 4, False),
+        (8, 8, None, False),
+        (8, 8, 4, False),
+        (2, 2, 1, False),
+        (8, 8, 1, False),
+        (1, 8, 4, True),
+        (8, 8, 1, True),
+        (8, 2, 4, True),
+    ],
 )
 @pytest.mark.parametrize("cached", [0, 1])
 @pytest.mark.parametrize("tail", [1, 9])
 @pytest.mark.parametrize("local_block,remote_block", [(32, 32), (56, 400), (400, 56)])
 def test_hybrid_dcp_pull_matches_logical_blocks(
-    local_dcp_size, remote_dcp_size, cached, tail, local_block, remote_block
+    local_dcp_size,
+    remote_dcp_size,
+    cached,
+    tail,
+    local_block,
+    remote_block,
+    include_nontransfer_group,
+    interleave,
+    replicated_attention,
 ):
     """DCP fan-in preserves token positions, Mamba shards and cached prefixes."""
     for rank in range(local_dcp_size):
@@ -1283,6 +1330,9 @@ def test_hybrid_dcp_pull_matches_logical_blocks(
             cached=cached,
             local_dcp_size=local_dcp_size,
             local_rank=rank,
+            include_nontransfer_group=include_nontransfer_group,
+            interleave=interleave,
+            replicated_attention=replicated_attention,
         )
 
 
