@@ -1621,7 +1621,9 @@ class TestPushWriterMlaReplication:
         w.region_group_ids = [0, 1, 2, 3]
         w.dst_region_group_ids[engine_id] = [0, 1, 2, 3]
         w.dst_xfer_side_handles = {engine_id: {0: 1000, 1: 1001}}
-        w.src_xfer_handles_by_tp_ratio = {(-2, 16): [2000, 2001]}
+        w.src_xfer_handles_by_tp_ratio = {
+            (-2, 16, w.tp_mappings[engine_id].source_ranks_per_group): [2000, 2001]
+        }
 
         writes = []
 

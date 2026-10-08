@@ -357,8 +357,10 @@ class NixlBaseConnectorWorker:
         )
         src_blocks_list = src_blocks_data.tolist()
 
-        for p_idx, p_rank in enumerate(plan.all_source_ranks):
+        ssm_ranks = plan.source_ranks_per_group[ssm_idx] if ssm_idx is not None else ()
+        for p_rank in plan.all_source_ranks:
             fa_slot = plan.rank_to_attention_slot.get(p_rank, 0)
+            ssm_slot = ssm_ranks.index(p_rank) if p_rank in ssm_ranks else 0
 
             handle: list[tuple[int, int, int]] = []
             for j, (addr, local_len, dev) in enumerate(src_blocks_list):
@@ -372,7 +374,7 @@ class NixlBaseConnectorWorker:
                         handle.append((addr + fa_slot * chunk, chunk, dev))
                 elif j < sharded_desc_end:
                     chunk = local_len // ssm_num_splits
-                    handle.append((addr + p_idx * chunk, chunk, dev))
+                    handle.append((addr + ssm_slot * chunk, chunk, dev))
                 else:
                     handle.append((addr, local_len, dev))
             yield handle
@@ -826,9 +828,13 @@ class NixlBaseConnectorWorker:
         # kept for building per-tp-ratio splits at the same granularity.
         self.src_blocks_data_by_block_size: dict[int, np.ndarray] = {}
         # Populated dynamically during handshake based on remote configuration.
-        # Per-source split handles, keyed by (tp_ratio, remote_block_size).
-        self.src_xfer_handles_by_tp_ratio: dict[tuple[int, int], list[int]] = {}
-        self._dram_src_handles_by_tp_ratio: dict[tuple[int, int], list[int]] = {}
+        # Per-source handles, keyed by TP ratio, block size, and source partitions.
+        self.src_xfer_handles_by_tp_ratio: dict[
+            tuple[int, int, tuple[tuple[int, ...], ...]], list[int]
+        ] = {}
+        self._dram_src_handles_by_tp_ratio: dict[
+            tuple[int, int, tuple[tuple[int, ...], ...]], list[int]
+        ] = {}
         # Map of engine_id -> {tp_rank: nixl_prepped_dlist_handle (int)}.
         self.dst_xfer_side_handles = defaultdict[EngineId, dict[int, int]](dict)
 
@@ -966,6 +972,21 @@ class NixlBaseConnectorWorker:
         local_dcp_size = self.dcp_size
         remote_pcp_size = agent_metadata.pcp_size
         remote_dcp_size = agent_metadata.dcp_size
+        local_interleave = self.vllm_config.parallel_config.cp_kv_cache_interleave_size
+        remote_interleave = agent_metadata.cp_kv_cache_interleave_size
+        if self._TRANSFER_MODE == "pull" and (
+            local_dcp_size != remote_dcp_size or local_interleave != remote_interleave
+        ):
+            for dcp_size, interleave, block_size in (
+                (local_dcp_size, local_interleave, self.block_size),
+                (remote_dcp_size, remote_interleave, agent_metadata.block_size),
+            ):
+                if dcp_size > 1 and interleave % block_size:
+                    raise ValueError(
+                        "DCP pulls with different ownership layouts need whole-page "
+                        f"interleaving: interleave={interleave}, "
+                        f"page size={block_size}."
+                    )
         if remote_pcp_size > 1 and remote_dcp_size not in (1, remote_pcp_size):
             raise NotImplementedError(
                 "Remote NixlConnector PCP+DCP does not span the full PCP group. "
@@ -1060,10 +1081,9 @@ class NixlBaseConnectorWorker:
         best_rtt = float("inf")
         best_offset: float | None = None
 
+        pending_ranks = list(itertools.product(range(remote_pp_size), p_remote_ranks))
         with zmq_ctx(zmq.REQ, path) as sock:
-            for remote_pp_rank, remote_rank in itertools.product(
-                range(remote_pp_size), p_remote_ranks
-            ):
+            for remote_pp_rank, remote_rank in pending_ranks:
                 logger.debug(
                     "Querying metadata on path: %s at remote pp rank %s, tp rank %s",
                     path,
@@ -1143,6 +1163,22 @@ class NixlBaseConnectorWorker:
                     ) from e
 
                 self._validate_remote_parallel_config(metadata)
+
+                if self._TRANSFER_MODE == "pull" and not notif_agents_only:
+                    remote_interleave = metadata.cp_kv_cache_interleave_size
+                    source_ranks = self.transfer_topo.handshake_target_ranks(
+                        remote_tp_size,
+                        remote_dcp_size,
+                        remote_interleave_size=remote_interleave,
+                    )
+                    # The first reply supplies the geometry for exact rank selection.
+                    for pp_rank, rank in itertools.product(
+                        range(remote_pp_size), source_ranks
+                    ):
+                        if (pp_rank, rank) not in pending_ranks:
+                            pending_ranks.append((pp_rank, rank))
+                    if remote_rank not in source_ranks:
+                        continue
 
                 # Ensure engine id matches.
                 if metadata.engine_id != expected_engine_id:
@@ -1411,6 +1447,11 @@ class NixlBaseConnectorWorker:
             else self.model_config.get_total_num_kv_heads(),
             attn_backends=self.attn_backends,
             dcp_size=self.dcp_size,
+            dcp_interleave_size=(
+                self.vllm_config.parallel_config.cp_kv_cache_interleave_size
+            )
+            if self.dcp_size > 1
+            else 1,
             # SSM States come in tuples (ssm, conv)
             tensor_shape=next(iter(kv_caches.values())).shape
             if not self._has_mamba
@@ -1889,6 +1930,11 @@ class NixlBaseConnectorWorker:
             region_mem_types=self.region_mem_types,
             dcp_size=self.dcp_size,
             pcp_size=self.pcp_size,
+            cp_kv_cache_interleave_size=(
+                self.vllm_config.parallel_config.cp_kv_cache_interleave_size
+                if self.dcp_size > 1
+                else 1
+            ),
             region_members=self.region_members,
             packed_member_layouts=packed_member_layouts,
         )
@@ -2321,6 +2367,7 @@ class NixlBaseConnectorWorker:
             remote_block_len=nixl_agent_meta.block_lens[0],
             remote_physical_blocks_per_logical=physical_blocks_per_logical,
             remote_dcp_size=remote_dcp_size,
+            remote_dcp_interleave_size=nixl_agent_meta.cp_kv_cache_interleave_size,
         )
         transfer_topo.register_remote_engine(engine_id, transfer_info)
         logger.info("Transfer plan: %s", transfer_topo.describe(engine_id))
@@ -2330,6 +2377,7 @@ class NixlBaseConnectorWorker:
             remote_tp_size=remote_tp_size,
             group_spec_types=self._group_spec_types,
             remote_dcp_size=remote_dcp_size,
+            remote_interleave_size=transfer_info.remote_dcp_interleave_size,
         )
 
         remote_agent_name = self.nixl_wrapper.add_remote_agent(
@@ -2401,7 +2449,7 @@ class NixlBaseConnectorWorker:
             src_blocks_data = self.src_blocks_data_by_block_size[remote_block_size]
 
         ### (Optional) Register local agent memory regions. MLA is not split.
-        split_key = (tp_ratio, remote_block_size)
+        split_key = (tp_ratio, remote_block_size, plan.source_ranks_per_group)
         if self._needs_split_local_xfer_handles(tp_ratio, plan) and (
             split_key not in self.src_xfer_handles_by_tp_ratio
         ):
@@ -2409,7 +2457,7 @@ class NixlBaseConnectorWorker:
             # Logically "split" own regions into per-source chunks. Hybrid
             # MLA+SSM also needs this path: MLA is replicated and read once,
             # while the SSM state is sharded across every remote TP rank.
-            # We only do this once per remote (tp_size, block_size).
+            # Reuse handles only when the per-group source partitions match.
             self.src_xfer_handles_by_tp_ratio[split_key] = []
             if self._mixed_mem_types:
                 self._dram_src_handles_by_tp_ratio[split_key] = []
@@ -2500,12 +2548,6 @@ class NixlBaseConnectorWorker:
             f"DCP sizes must divide one another: local={self.dcp_size}, "
             f"remote={remote_dcp_size} (engine {remote_engine_id})."
         )
-        if self._has_mamba and self.dcp_size != remote_dcp_size:
-            raise RuntimeError(
-                "Hybrid MLA+Mamba NIXL transfers require matching DCP sizes, "
-                f"got local={self.dcp_size}, remote={remote_dcp_size}."
-            )
-
         tp_ratio = self.transfer_topo.tp_ratio(remote_tp_size)
         block_size_ratio = self.transfer_topo.block_size_ratio(
             nixl_agent_meta.block_size
@@ -2538,6 +2580,10 @@ class NixlBaseConnectorWorker:
             and remote_physical_per_logical
             != self._physical_blocks_per_logical_kv_block
             and self.vllm_config.cache_config.enable_prefix_caching
+            and not (
+                self._TRANSFER_MODE == "pull"
+                and self.block_size == nixl_agent_meta.block_size
+            )
         ):
             raise RuntimeError(
                 "Prefix caching with heterogeneous physical_blocks_per_logical "
@@ -2997,23 +3043,45 @@ class NixlBaseConnectorWorker:
             block_size_ratio = self.transfer_topo.block_size_ratio(
                 remote_info.remote_block_size
             )
-            hetero_ppl = (
-                remote_info.remote_physical_blocks_per_logical
-                != self._physical_blocks_per_logical_kv_block
-            )
-            if block_size_ratio > 1 or self.enable_permute_local_kv or hetero_ppl:
-                for g, local_group in enumerate(meta.local_physical_block_ids):
-                    if not local_group or _is_ssm_spec(self._group_spec_types[g]):
-                        continue
-                    # Number of remote-sized sub-blocks the transfer covered;
-                    # everything past this was clipped and must be zeroed.
-                    covered_sub_blocks = min(
-                        len(local_group) * block_size_ratio,
-                        len(meta.remote.block_ids[g]),
+            for g, local_group in enumerate(meta.local_physical_block_ids):
+                if not local_group or _is_ssm_spec(self._group_spec_types[g]):
+                    continue
+                # Zero the allocation padding beyond the received prefix.
+                # Push receivers do not retain the producer's block IDs.
+                covered_sub_blocks = (
+                    len(meta.remote.block_ids[g])
+                    if meta.remote.block_ids
+                    else len(local_group) * block_size_ratio
+                )
+                if meta.remote.num_tokens is not None and issubclass(
+                    self._group_spec_types[g], FullAttentionSpec
+                ):
+                    group_id = self.kv_cache_config.transfer_group_ids[g]
+                    spec = self.kv_cache_config.kv_cache_groups[group_id].kv_cache_spec
+                    local_tokens = TransferTopology.dcp_num_local_tokens(
+                        meta.remote.num_tokens,
+                        self.dcp_size if spec.dcp_sharded else 1,
+                        self.dcp_rank if spec.dcp_sharded else 0,
+                        self.transfer_topo.dcp_interleave_size,
                     )
-                    block_ids_for_blocksize_post_process[block_size_ratio].append(
-                        (local_group, covered_sub_blocks)
+                    cached_blocks = (
+                        meta.local_num_computed_blocks[group_id]
+                        if meta.local_num_computed_blocks
+                        else 0
                     )
+                    covered_sub_blocks = max(
+                        0,
+                        cdiv(local_tokens, remote_info.remote_block_size)
+                        - cached_blocks
+                        * self._physical_blocks_per_logical_kv_block
+                        * block_size_ratio,
+                    )
+                covered_sub_blocks = min(
+                    len(local_group) * block_size_ratio, covered_sub_blocks
+                )
+                block_ids_for_blocksize_post_process[block_size_ratio].append(
+                    (local_group, covered_sub_blocks)
+                )
             # post processing for heterogeneous attention
             if self.enable_heterogeneous_attn_post_process:
                 block_ids_for_heterogeneous_attn_post_process.append(
@@ -3291,7 +3359,7 @@ class NixlBaseConnectorWorker:
         local_block_ids: BlockIds,
         remote_block_ids: BlockIds,
         block_size_ratio: int,
-    ) -> tuple[BlockIds, BlockIds]:
+    ) -> tuple[list[list[int]], list[list[int]]]:
         """Map attention-group block ids to remote-block granularity.
 
         Each local attention block is split into ``block_size_ratio``
@@ -3363,14 +3431,17 @@ class NixlBaseConnectorWorker:
         local_dcp_rank: int,
         remote_dcp_size: int,
         local_num_computed_blocks: int,
-        num_remote_blocks: int | None = None,
+        num_remote_tokens: int | None = None,
+        local_interleave_size: int = 1,
+        remote_interleave_size: int = 1,
+        block_size: int = 1,
     ) -> tuple[list[int], list[int]]:
         """Match local and remote block IDs by global DCP position.
 
         ``local_ids`` excludes blocks already satisfied by the local prefix
         cache, while ``remote_ids`` contains the full transferable remote list.
-        ``num_remote_blocks``, when provided, is the global block count before
-        DCP partitioning and excludes allocation padding.
+        Interleave sizes and ``num_remote_tokens`` are in tokens. Input IDs
+        use the common ``block_size`` transfer unit on both sides.
 
         Example:
             local DCP size 2, rank 0 owns *global positions*=[0, 2, 4, 6]
@@ -3385,33 +3456,35 @@ class NixlBaseConnectorWorker:
         remote to release its blocks without performing a transfer.
 
         """
-        local_size, remote_size = local_dcp_size, remote_dcp_size
-        if num_remote_blocks is not None:
-            num_local = cdiv(num_remote_blocks - local_dcp_rank, local_size)
-            local_ids = local_ids[: max(0, num_local - local_num_computed_blocks)]
-
-        if local_size == remote_size:
-            local_slice = local_ids
-            remote_slice = remote_ids[local_num_computed_blocks:]
-        elif local_size < remote_size:
-            k = remote_size // local_size
-            p = (remote_rank - local_dcp_rank) // local_size
-            start_local = (p - local_num_computed_blocks) % k
-            start_remote = (local_num_computed_blocks + start_local - p) // k
-            local_slice = local_ids[start_local::k]
-            remote_slice = remote_ids[start_remote:]
-        else:
-            k = local_size // remote_size
-            remote_dcp_rank = remote_rank % remote_size
-            c = (local_dcp_rank - remote_dcp_rank) // remote_size
-            start_remote = c + local_num_computed_blocks * k
-            local_slice = local_ids
-            remote_slice = remote_ids[start_remote::k]
-
-        matched_blocks = min(len(local_slice), len(remote_slice))
-        if num_remote_blocks is not None and matched_blocks < len(local_slice):
-            raise ValueError("Remote KV pages do not cover the requested range")
-        return local_slice[:matched_blocks], remote_slice[:matched_blocks]
+        local_tokens = None
+        if num_remote_tokens is not None:
+            local_tokens = TransferTopology.dcp_num_local_tokens(
+                num_remote_tokens,
+                local_dcp_size,
+                local_dcp_rank,
+                local_interleave_size,
+            )
+        matched_local, matched_remote = [], []
+        for i, block_id in enumerate(local_ids, local_num_computed_blocks):
+            token_position = i * block_size
+            if local_tokens is not None and token_position >= local_tokens:
+                break
+            cycle, offset = divmod(token_position, local_interleave_size)
+            position = (
+                cycle * local_dcp_size + local_dcp_rank
+            ) * local_interleave_size + offset
+            cycle, offset = divmod(position, remote_interleave_size)
+            if cycle % remote_dcp_size != remote_rank % remote_dcp_size:
+                continue
+            remote_idx = (
+                cycle // remote_dcp_size * remote_interleave_size + offset
+            ) // block_size
+            if remote_idx < len(remote_ids):
+                matched_local.append(block_id)
+                matched_remote.append(remote_ids[remote_idx])
+            elif num_remote_tokens is not None:
+                raise ValueError("Remote KV pages do not cover the requested range")
+        return matched_local, matched_remote
 
     @staticmethod
     def _block_ids_by_region(
@@ -3433,9 +3506,10 @@ class NixlBaseConnectorWorker:
         prefill_block_ids: BlockIds,
         *,
         num_computed_blocks: list[int] | None = None,
-        num_remote_blocks: int | None = None,
+        num_remote_tokens: int | None = None,
         remote_rank: int = 0,
         remote_dcp_size: int = 1,
+        remote_interleave_size: int = 1,
     ) -> tuple[BlockIds, BlockIds]:
         """Pair an uncached decode suffix with the same prefill regions."""
         assert len(decode_block_ids) == len(prefill_block_ids)
@@ -3444,7 +3518,7 @@ class NixlBaseConnectorWorker:
             return empty_regions, empty_regions.copy()
 
         if num_computed_blocks is not None:
-            assert num_remote_blocks is not None
+            assert num_remote_tokens is not None
             matched_decode, matched_prefill = [], []
             for decode_region, prefill_region, start in zip(
                 decode_block_ids, prefill_block_ids, num_computed_blocks, strict=True
@@ -3457,7 +3531,12 @@ class NixlBaseConnectorWorker:
                     self.dcp_rank,
                     remote_dcp_size,
                     start,
-                    num_remote_blocks=num_remote_blocks,
+                    num_remote_tokens=num_remote_tokens,
+                    local_interleave_size=(
+                        self.vllm_config.parallel_config.cp_kv_cache_interleave_size
+                    ),
+                    remote_interleave_size=remote_interleave_size,
+                    block_size=self.block_size,
                 )
                 matched_decode.append(local)
                 matched_prefill.append(remote)
