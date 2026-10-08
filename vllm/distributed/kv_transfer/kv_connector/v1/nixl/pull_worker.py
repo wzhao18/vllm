@@ -252,9 +252,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 for r, blocks in enumerate(local_by_region)
             ]
         else:
-            remote_logical_block_ids = meta.remote.block_ids
             meta.remote.block_ids = self._logical_to_kernel_block_ids(
-                remote_logical_block_ids,
+                meta.remote.block_ids,
                 remote_info.remote_physical_blocks_per_logical,
             )
             num_groups = len(meta.local_block_ids)
@@ -277,11 +276,9 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 or local_ratio != remote_ratio
             )
             local_mapping_ids = self._logical_to_kernel_block_ids(
-                meta.local_block_ids, local_ratio
+                local_block_ids, block_size_ratio
             )
-            remote_mapping_ids = self._logical_to_kernel_block_ids(
-                remote_logical_block_ids, remote_ratio
-            )
+            remote_mapping_ids = meta.remote.block_ids
             groups = self.kv_cache_config.transfer_groups
             source_ranks = tuple(
                 ranks[:1]
