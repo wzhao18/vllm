@@ -1034,6 +1034,7 @@ def _run_hetero_case(
         ),
     )
     meta_r.dcp_size = remote_dcp_size
+    meta_r.cp_kv_cache_interleave_size = remote_block
     _register_remote_agents(worker, meta_r, tp_size)
 
     # Sparse ids so neighbors exist between the request's blocks.
@@ -1055,6 +1056,7 @@ def _run_hetero_case(
             "remote_port": 1234,
             "tp_size": tp_size,
             "dcp_size": remote_dcp_size,
+            "remote_num_tokens": matched,
         },
     )
     meta = metadata.reqs_to_recv["req-b"]
@@ -1123,17 +1125,12 @@ def _run_hetero_case(
             )
             if lkind == "attn":
                 ltok = (
-                    (ltok // local_block * local_dcp_size + local_rank) * local_block
-                    + ltok % local_block
-                )
+                    ltok // local_block * local_dcp_size + local_rank
+                ) * local_block + ltok % local_block
                 rtok = (
-                    (
-                        rtok // remote_block * remote_dcp_size
-                        + remote_rank % remote_dcp_size
-                    )
-                    * remote_block
-                    + rtok % remote_block
-                )
+                    rtok // remote_block * remote_dcp_size
+                    + remote_rank % remote_dcp_size
+                ) * remote_block + rtok % remote_block
                 assert ltok == rtok, (
                     f"TOKEN MISALIGNMENT: local sub-block holds tokens "
                     f"[{ltok}..) but receives remote tokens [{rtok}..) "
@@ -1147,7 +1144,9 @@ def _run_hetero_case(
     if remote_dcp_size > 1 or local_dcp_size > 1:
         if tp_size >= local_dcp_size:
             shards = tp_size // local_dcp_size
-            expected_sources = set(range(local_rank * shards, (local_rank + 1) * shards))
+            expected_sources = set(
+                range(local_rank * shards, (local_rank + 1) * shards)
+            )
         else:
             expected_sources = {local_rank // (local_dcp_size // tp_size)}
         assert mamba_source_ranks == expected_sources
@@ -1222,21 +1221,63 @@ def _run_hetero_case(
 
 
 @pytest.mark.cpu_test
+@pytest.mark.parametrize("remote_blocks", [(56, 400), (400, 56)])
+@pytest.mark.parametrize("rank", [0, 1])
+def test_hybrid_pull_handles_preserve_each_peers_state_shards(remote_blocks, rank):
+    """A peer's attention fan-in must not change another peer's SSM slices."""
+    worker = _make_mla_hybrid_worker(
+        local_block_size=56,
+        kernel_block_size=4,
+        num_logical_blocks=16,
+        tp_size=2,
+        tp_rank=rank,
+        dcp_size=2,
+    )
+    worker.vllm_config.cache_config.enable_prefix_caching = True
+    for remote_block in remote_blocks:
+        metadata = _make_remote_meta(
+            worker,
+            remote_block_size=remote_block,
+            remote_kernel_block_size=4,
+            remote_num_logical=16,
+            remote_ssm_sizes=(12, 16),
+        )
+        metadata.engine_id = f"producer-{remote_block}"
+        metadata.dcp_size = 8
+        metadata.cp_kv_cache_interleave_size = remote_block
+        _register_remote_agents(worker, metadata, 8)
+        plan = worker.tp_mappings[metadata.engine_id]
+        key = (-4, 4, plan.source_ranks_per_group)
+        handles = worker.src_xfer_handles_by_tp_ratio[key]
+        expected = list(
+            worker._build_local_splits_from_plan(
+                plan, worker.src_blocks_data, worker.num_descs
+            )
+        )
+        assert len(handles) == len(expected)
+        for handle, descriptors in zip(handles, expected):
+            np.testing.assert_array_equal(
+                worker.nixl_wrapper.dlists[handle], descriptors
+            )
+
+
+@pytest.mark.cpu_test
 @pytest.mark.parametrize(
     "local_dcp_size,remote_dcp_size", [(1, 2), (1, 8), (2, 8), (8, 2), (8, 8)]
 )
 @pytest.mark.parametrize("cached", [0, 1])
 @pytest.mark.parametrize("tail", [1, 9])
+@pytest.mark.parametrize("local_block,remote_block", [(32, 32), (56, 400), (400, 56)])
 def test_hybrid_dcp_pull_matches_logical_blocks(
-    local_dcp_size, remote_dcp_size, cached, tail
+    local_dcp_size, remote_dcp_size, cached, tail, local_block, remote_block
 ):
     """DCP fan-in preserves token positions, Mamba shards and cached prefixes."""
     for rank in range(local_dcp_size):
         _run_hetero_case(
-            local_block=32,
+            local_block=local_block,
             kernel=4,
-            remote_block=32,
-            num_tokens=2 * 32 * local_dcp_size + tail,
+            remote_block=remote_block,
+            num_tokens=2 * local_block * local_dcp_size + tail,
             tp_size=remote_dcp_size,
             remote_dcp_size=remote_dcp_size,
             cached=cached,

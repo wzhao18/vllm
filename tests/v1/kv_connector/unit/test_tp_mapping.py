@@ -38,6 +38,8 @@ def _compute_mapping(
     group_spec_types: tuple[type, ...] = (FullAttentionSpec,),
     dcp_size: int = 1,
     remote_dcp_size: int = 1,
+    local_interleave_size: int = 1,
+    remote_interleave_size: int = 1,
 ) -> TPMapping:
     transfer_topology = object.__new__(TransferTopology)
     transfer_topology.tp_rank = tp_rank
@@ -46,11 +48,13 @@ def _compute_mapping(
     transfer_topology.is_mamba = MambaSpec in group_spec_types
     transfer_topology.total_num_kv_heads = num_kv_heads
     transfer_topology.dcp_size = dcp_size
+    transfer_topology.dcp_interleave_size = local_interleave_size
     return compute_tp_mapping(
         transfer_topology=transfer_topology,
         remote_tp_size=remote_tp_size,
         group_spec_types=group_spec_types,
         remote_dcp_size=remote_dcp_size,
+        remote_interleave_size=remote_interleave_size,
     )
 
 
@@ -115,8 +119,18 @@ def test_mla_dcp_source_ranks(
     ],
 )
 @pytest.mark.parametrize("has_mamba", [False, True])
+@pytest.mark.parametrize(
+    "local_interleave_size,remote_interleave_size",
+    [(1, 1), (14, 14), (100, 14), (14, 100), (56, 14)],
+)
 def test_dcp_consumer_count_matches_readers(
-    tp_size, remote_tp_size, dcp_size, remote_dcp_size, has_mamba
+    tp_size,
+    remote_tp_size,
+    dcp_size,
+    remote_dcp_size,
+    has_mamba,
+    local_interleave_size,
+    remote_interleave_size,
 ):
     """Each producer waits for exactly the local ranks that read from it."""
     mappings = [
@@ -128,12 +142,30 @@ def test_dcp_consumer_count_matches_readers(
             num_kv_heads=1,
             dcp_size=dcp_size,
             remote_dcp_size=remote_dcp_size,
+            local_interleave_size=local_interleave_size,
+            remote_interleave_size=remote_interleave_size,
             group_spec_types=(FullAttentionSpec, MambaSpec)
             if has_mamba
             else (FullAttentionSpec,),
         )
         for tp_rank in range(tp_size)
     ]
+
+    # Compare selected attention sources with independently enumerated pages.
+    from math import lcm
+
+    period = lcm(
+        dcp_size * local_interleave_size,
+        remote_dcp_size * remote_interleave_size,
+    )
+    if remote_dcp_size > 1:
+        for rank, mapping in enumerate(mappings):
+            owners = {
+                page // remote_interleave_size % remote_dcp_size
+                for page in range(period)
+                if page // local_interleave_size % dcp_size == rank % dcp_size
+            }
+            assert set(mapping.source_ranks_per_group[0]) == owners
 
     for remote_rank in range(remote_tp_size):
         readers = [m for m in mappings if remote_rank in m.all_source_ranks]
@@ -202,14 +234,16 @@ class TestBuildSrcSplitHandles:
 class TestMambaPlanSplitHandles:
     """Verify split handles for Mamba with FA/SSM distinction."""
 
-    def test_fa_and_ssm_different_split_factors(self):
+    @pytest.mark.parametrize(
+        "fa_readers,ssm_readers", [((0,), (0, 1)), ((1, 3, 5, 7), (4, 5, 6, 7))]
+    )
+    def test_fa_and_ssm_different_split_factors(self, fa_readers, ssm_readers):
         """Section 0 split by num_attn_reads, section 1 by abs_tp."""
-        fa_readers = (0,)
-        ssm_readers = (0, 1)
+        all_readers = tuple(sorted(set(fa_readers) | set(ssm_readers)))
         plan = TPMapping(
             source_ranks_per_group=(fa_readers, ssm_readers),
-            all_source_ranks=(0, 1),
-            rank_to_attention_slot={0: 0, 1: 0},
+            all_source_ranks=all_readers,
+            rank_to_attention_slot={rank: slot for slot, rank in enumerate(fa_readers)},
             rank_offset_factor=0,
         )
 
@@ -226,17 +260,19 @@ class TestMambaPlanSplitHandles:
 
         splits = list(worker._build_local_splits_from_plan(plan, src_blocks_data, 2))
 
-        assert len(splits) == 2  # 2 source ranks
-
-        # Rank 0 (FA source, p_idx=0):
-        # FA: chunk=200//1=200, slot=0 → (1000, 200, 0), (2000, 200, 0)
-        # SSM: chunk=400//2=200, idx=0 → (3000, 200, 0)
-        assert splits[0] == [(1000, 200, 0), (2000, 200, 0), (3000, 200, 0)]
-
-        # Rank 1 (not FA source, p_idx=1):
-        # FA: chunk=200//1=200, slot=0 (skip_fa) → (1000, 200, 0), (2000, 200, 0)
-        # SSM: chunk=400//2=200, idx=1 → (3200, 200, 0)
-        assert splits[1] == [(1000, 200, 0), (2000, 200, 0), (3200, 200, 0)]
+        assert len(splits) == len(all_readers)
+        for rank, descriptors in zip(all_readers, splits):
+            if rank in fa_readers:
+                slot = fa_readers.index(rank)
+                chunk = 200 // len(fa_readers)
+                assert descriptors[:2] == [
+                    (1000 + slot * chunk, chunk, 0),
+                    (2000 + slot * chunk, chunk, 0),
+                ]
+            if rank in ssm_readers:
+                slot = ssm_readers.index(rank)
+                chunk = 400 // len(ssm_readers)
+                assert descriptors[2] == (3000 + slot * chunk, chunk, 0)
 
     def test_hetero_block_size_splits(self):
         """With a block-size ratio, single-source FA sub-block descs pass

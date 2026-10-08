@@ -4,6 +4,7 @@
 
 from collections.abc import Iterator
 from dataclasses import dataclass
+from math import gcd
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import torch
@@ -421,6 +422,9 @@ class EngineTransferInfo:
     remote_dcp_size: int = 1
     """Remote decode context parallel size."""
 
+    remote_dcp_interleave_size: int = 1
+    """Physical pages in each remote DCP ownership span."""
+
 
 # ---- Transfer topology ----
 
@@ -438,6 +442,7 @@ class TransferTopology:
     total_num_kv_heads: int
     attn_backends: list[type[AttentionBackend]]
     dcp_size: int = 1
+    dcp_interleave_size: int = 1
     tensor_shape: torch.Size | None = None
 
     def __post_init__(self):
@@ -547,6 +552,8 @@ class TransferTopology:
         remote_dcp_size: int,
         local_dcp_size: int,
         local_dcp_rank: int,
+        local_interleave_size: int = 1,
+        remote_interleave_size: int = 1,
     ) -> list[int]:
         """Remote ranks whose DCP slice overlaps mine (MLA, ``remote_dcp_size > 1``).
 
@@ -554,7 +561,26 @@ class TransferTopology:
         ``compute_tp_mapping`` (who to actually read from) — for pure MLA the two
         questions have the identical answer, since DCP sharding is the only
         thing keeping a remote rank from being interchangeable with any other.
+
+        Interleave sizes are expressed in the same transfer-page units.
         """
+        if local_interleave_size != remote_interleave_size:
+            period = gcd(
+                local_dcp_size * local_interleave_size,
+                remote_dcp_size * remote_interleave_size,
+            )
+            local_start = local_dcp_rank * local_interleave_size
+            local_end = local_start + local_interleave_size
+            ranks = []
+            for rank in range(remote_tp_size):
+                remote_start = rank % remote_dcp_size * remote_interleave_size
+                remote_end = remote_start + remote_interleave_size
+                # Ownership intervals overlap if their difference spans a period.
+                if local_start - remote_end < (
+                    (local_end - remote_start - 1) // period * period
+                ):
+                    ranks.append(rank)
+            return ranks
         if local_dcp_size <= remote_dcp_size:
             # Keep every remote rank whose slice sits inside mine. When
             # local_dcp_size == 1 (replicated locally), local_dcp_rank == 0 reduces to
@@ -580,6 +606,7 @@ class TransferTopology:
         remote_tp_size: int,
         remote_dcp_size: int = 1,
         local_tp_rank: int | None = None,
+        remote_interleave_size: int | None = None,
     ) -> list[int]:
         """Pre-registration: compute which remote TP ranks to handshake with.
 
@@ -599,7 +626,14 @@ class TransferTopology:
         rank = self.tp_rank if local_tp_rank is None else local_tp_rank
         if remote_dcp_size > 1:
             dcp_ranks = self.dcp_source_ranks(
-                remote_tp_size, remote_dcp_size, self.dcp_size, rank % self.dcp_size
+                remote_tp_size,
+                remote_dcp_size,
+                self.dcp_size,
+                rank % self.dcp_size,
+                self.dcp_interleave_size,
+                self.dcp_interleave_size
+                if remote_interleave_size is None
+                else remote_interleave_size,
             )
             mamba_ranks = (
                 self.ssm_source_ranks(remote_tp_size, self.tp_size, rank)
@@ -619,6 +653,7 @@ class TransferTopology:
         remote_tp_size: int,
         remote_dcp_size: int,
         remote_rank: int,
+        remote_interleave_size: int | None = None,
     ) -> int:
         """Count local ranks that notify a given producer after consuming its KV.
 
@@ -627,7 +662,10 @@ class TransferTopology:
         return sum(
             remote_rank
             in self.handshake_target_ranks(
-                remote_tp_size, remote_dcp_size, local_tp_rank=rank
+                remote_tp_size,
+                remote_dcp_size,
+                local_tp_rank=rank,
+                remote_interleave_size=remote_interleave_size,
             )
             for rank in range(self.tp_size)
         )
