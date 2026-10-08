@@ -2330,7 +2330,9 @@ def test_push_write_hybrid_mla_replicates_attention():
         )
     }
     worker.dst_xfer_side_handles = {engine_id: {0: 100, 1: 101}}
-    worker.src_xfer_handles_by_tp_ratio = {(-2, 4): [200, 201]}
+    worker.src_xfer_handles_by_tp_ratio = {
+        (-2, 4, worker.tp_mappings[engine_id].source_ranks_per_group): [200, 201]
+    }
     worker.src_xfer_handles_by_block_size = {4: 300}
     worker.region_group_ids = [0, 1]
     worker.dst_region_group_ids = {engine_id: [0, 1]}

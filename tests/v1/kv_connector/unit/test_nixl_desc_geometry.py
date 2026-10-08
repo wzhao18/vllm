@@ -1221,6 +1221,47 @@ def _run_hetero_case(
 
 
 @pytest.mark.cpu_test
+@pytest.mark.parametrize("remote_blocks", [(56, 400), (400, 56)])
+@pytest.mark.parametrize("rank", [0, 1])
+def test_hybrid_pull_handles_preserve_each_peers_state_shards(remote_blocks, rank):
+    """A peer's attention fan-in must not change another peer's SSM slices."""
+    worker = _make_mla_hybrid_worker(
+        local_block_size=56,
+        kernel_block_size=4,
+        num_logical_blocks=16,
+        tp_size=2,
+        tp_rank=rank,
+        dcp_size=2,
+    )
+    worker.vllm_config.cache_config.enable_prefix_caching = True
+    for remote_block in remote_blocks:
+        metadata = _make_remote_meta(
+            worker,
+            remote_block_size=remote_block,
+            remote_kernel_block_size=4,
+            remote_num_logical=16,
+            remote_ssm_sizes=(12, 16),
+        )
+        metadata.engine_id = f"producer-{remote_block}"
+        metadata.dcp_size = 8
+        metadata.cp_kv_cache_interleave_size = remote_block
+        _register_remote_agents(worker, metadata, 8)
+        plan = worker.tp_mappings[metadata.engine_id]
+        key = (-4, 4, plan.source_ranks_per_group)
+        handles = worker.src_xfer_handles_by_tp_ratio[key]
+        expected = list(
+            worker._build_local_splits_from_plan(
+                plan, worker.src_blocks_data, worker.num_descs
+            )
+        )
+        assert len(handles) == len(expected)
+        for handle, descriptors in zip(handles, expected):
+            np.testing.assert_array_equal(
+                worker.nixl_wrapper.dlists[handle], descriptors
+            )
+
+
+@pytest.mark.cpu_test
 @pytest.mark.parametrize(
     "local_dcp_size,remote_dcp_size", [(1, 2), (1, 8), (2, 8), (8, 2), (8, 8)]
 )

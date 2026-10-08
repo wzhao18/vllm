@@ -393,7 +393,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             if tp_ratio < 0 and (not self.use_mla or len(read_specs) > 1):
                 # Remote tp_size > local tp_size: we must perform multiple
                 # reads. Get the memory chunk onto which we will write to.
-                split_key = (tp_ratio, remote_block_size)
+                split_key = (tp_ratio, remote_block_size, plan.source_ranks_per_group)
                 local_xfer_side_handle = self.src_xfer_handles_by_tp_ratio[split_key][i]
                 local_dram_handle = (
                     self._dram_src_handles_by_tp_ratio[split_key][i]

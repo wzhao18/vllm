@@ -820,9 +820,13 @@ class NixlBaseConnectorWorker:
         # kept for building per-tp-ratio splits at the same granularity.
         self.src_blocks_data_by_block_size: dict[int, np.ndarray] = {}
         # Populated dynamically during handshake based on remote configuration.
-        # Per-source split handles, keyed by (tp_ratio, remote_block_size).
-        self.src_xfer_handles_by_tp_ratio: dict[tuple[int, int], list[int]] = {}
-        self._dram_src_handles_by_tp_ratio: dict[tuple[int, int], list[int]] = {}
+        # Per-source handles, keyed by TP ratio, block size, and source partitions.
+        self.src_xfer_handles_by_tp_ratio: dict[
+            tuple[int, int, tuple[tuple[int, ...], ...]], list[int]
+        ] = {}
+        self._dram_src_handles_by_tp_ratio: dict[
+            tuple[int, int, tuple[tuple[int, ...], ...]], list[int]
+        ] = {}
         # Map of engine_id -> {tp_rank: nixl_prepped_dlist_handle (int)}.
         self.dst_xfer_side_handles = defaultdict[EngineId, dict[int, int]](dict)
 
@@ -2445,7 +2449,7 @@ class NixlBaseConnectorWorker:
             src_blocks_data = self.src_blocks_data_by_block_size[remote_block_size]
 
         ### (Optional) Register local agent memory regions. MLA is not split.
-        split_key = (tp_ratio, remote_block_size)
+        split_key = (tp_ratio, remote_block_size, plan.source_ranks_per_group)
         if self._needs_split_local_xfer_handles(tp_ratio, plan) and (
             split_key not in self.src_xfer_handles_by_tp_ratio
         ):
@@ -2453,7 +2457,7 @@ class NixlBaseConnectorWorker:
             # Logically "split" own regions into per-source chunks. Hybrid
             # MLA+SSM also needs this path: MLA is replicated and read once,
             # while the SSM state is sharded across every remote TP rank.
-            # We only do this once per remote (tp_size, block_size).
+            # Reuse handles only when the per-group source partitions match.
             self.src_xfer_handles_by_tp_ratio[split_key] = []
             if self._mixed_mem_types:
                 self._dram_src_handles_by_tp_ratio[split_key] = []
