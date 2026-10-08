@@ -935,7 +935,11 @@ class TestNixlHandshake:
             assert remote_info.remote_tp_size == remote_tp_size
             assert -tp_ratio == worker.transfer_topo.tp_ratio(remote_tp_size)
             # ensure src_xfer_handles_by_tp_ratio is populated with tpratio chunks
-            split_key = (-tp_ratio, worker.block_size)
+            split_key = (
+                -tp_ratio,
+                worker.block_size,
+                worker.tp_mappings[remote_engine_id].source_ranks_per_group,
+            )
             assert split_key in worker.src_xfer_handles_by_tp_ratio
             assert len(worker.src_xfer_handles_by_tp_ratio[split_key]) == tp_ratio
             assert remote_engine_id in worker.dst_xfer_side_handles
