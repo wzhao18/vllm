@@ -696,6 +696,7 @@ def test_read_blocks_for_req_expands_remote_ids(
     worker._physical_blocks_per_logical_kv_block = local_physical_per_logical
     worker._invalid_remote_engines = set()
     worker._remote_agents = {"remote-engine": {}}
+    worker.block_size = 64
     worker._engine_last_active = {}
     worker._recving_transfers = {}
     worker._bidirectional_kv_xfer_enabled = False
@@ -720,6 +721,7 @@ def test_read_blocks_for_req_expands_remote_ids(
     worker.transfer_topo.tp_ratio.return_value = tp_ratio
     remote_info = MagicMock()
     remote_info.remote_physical_blocks_per_logical = remote_physical_per_logical
+    remote_info.remote_block_size = 64
     remote_info.remote_dcp_size = 1
     worker.transfer_topo.get_engine_info.return_value = remote_info
     worker.use_mla = False

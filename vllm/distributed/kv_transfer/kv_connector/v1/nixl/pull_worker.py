@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Pull-specific (READ) worker-side logic for the NIXL connector."""
 
-import math
 import time
 from typing import TYPE_CHECKING
 
@@ -262,7 +261,34 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             num_groups = len(meta.local_block_ids)
             local_ratio = self._physical_blocks_per_logical_kv_block
             remote_ratio = remote_info.remote_physical_blocks_per_logical
-            mapping_ratio = math.gcd(local_ratio, remote_ratio)
+            local_interleave = (
+                self.transfer_topo.dcp_interleave_size
+                if self.dcp_size > 1
+                else local_ratio
+            )
+            remote_interleave = (
+                remote_info.remote_dcp_interleave_size
+                if remote_info.remote_dcp_size > 1
+                else remote_ratio
+            )
+            matching_layout = (
+                self.dcp_size == remote_info.remote_dcp_size
+                and local_interleave == remote_interleave
+            )
+            logical_interleaving = (
+                local_interleave == local_ratio and remote_interleave == remote_ratio
+            )
+            mapping_ratio = (
+                local_ratio
+                if local_ratio == remote_ratio
+                and (matching_layout or logical_interleaving)
+                else 1
+            )
+            cached_blocks = meta.local_num_computed_blocks or (0,) * num_groups
+            heterogeneous_pages = (
+                local_ratio != remote_ratio
+                and self.block_size == remote_info.remote_block_size
+            )
 
             def group_ids(block_ids: BlockIds, rank: int) -> list[list[int]]:
                 return [
@@ -272,8 +298,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
 
             read_specs = []
             for rank in plan.all_source_ranks:
-                if dcp_active:
-                    # Map attention in common interleave units; states stay indivisible.
+                if dcp_active or heterogeneous_pages:
+                    # Unequal logical sizes map physical pages; states stay indivisible.
                     local_ids = self._logical_to_kernel_block_ids(
                         group_ids(meta.local_block_ids, rank),
                         local_ratio // mapping_ratio,
@@ -295,8 +321,21 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                             local_dcp_rank=self.dcp_rank,
                             remote_dcp_size=remote_info.remote_dcp_size,
                             local_num_computed_blocks=(
-                                meta.local_num_computed_blocks[g]
-                                * (local_ratio // mapping_ratio)
+                                cached_blocks[g] * (local_ratio // mapping_ratio)
+                            ),
+                            num_remote_blocks=(
+                                cdiv(
+                                    meta.remote.num_tokens,
+                                    self.block_size * mapping_ratio,
+                                )
+                                if meta.remote.num_tokens is not None
+                                else None
+                            ),
+                            local_interleave_size=max(
+                                1, local_interleave // mapping_ratio
+                            ),
+                            remote_interleave_size=max(
+                                1, remote_interleave // mapping_ratio
                             ),
                         )
                     local_physical_ids = self._logical_to_kernel_block_ids(
@@ -314,6 +353,23 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                         local_block_ids=local_physical_ids,
                         remote_block_ids=remote_physical_ids,
                     )
+                )
+
+            if heterogeneous_pages and read_specs:
+                untouched = []
+                for group, blocks in enumerate(meta.local_physical_block_ids):
+                    received = {
+                        block
+                        for spec in read_specs
+                        for block in spec.local_block_ids[group]
+                    }
+                    untouched.append(
+                        [block for block in blocks if block not in received]
+                        if _is_attention_spec(self._group_spec_types[group])
+                        else []
+                    )
+                meta.region_blocks_to_zero = self._block_ids_by_region(
+                    untouched, local_region_groups
                 )
 
         # D may have to perform multiple reads from different remote ranks.

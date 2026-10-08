@@ -1034,6 +1034,7 @@ def _run_hetero_case(
         ),
     )
     meta_r.dcp_size = remote_dcp_size
+    meta_r.cp_kv_cache_interleave_size = remote_block
     _register_remote_agents(worker, meta_r, tp_size)
 
     # Sparse ids so neighbors exist between the request's blocks.
@@ -1055,6 +1056,7 @@ def _run_hetero_case(
             "remote_port": 1234,
             "tp_size": tp_size,
             "dcp_size": remote_dcp_size,
+            "remote_num_tokens": matched,
         },
     )
     meta = metadata.reqs_to_recv["req-b"]
@@ -1123,17 +1125,12 @@ def _run_hetero_case(
             )
             if lkind == "attn":
                 ltok = (
-                    (ltok // local_block * local_dcp_size + local_rank) * local_block
-                    + ltok % local_block
-                )
+                    ltok // local_block * local_dcp_size + local_rank
+                ) * local_block + ltok % local_block
                 rtok = (
-                    (
-                        rtok // remote_block * remote_dcp_size
-                        + remote_rank % remote_dcp_size
-                    )
-                    * remote_block
-                    + rtok % remote_block
-                )
+                    rtok // remote_block * remote_dcp_size
+                    + remote_rank % remote_dcp_size
+                ) * remote_block + rtok % remote_block
                 assert ltok == rtok, (
                     f"TOKEN MISALIGNMENT: local sub-block holds tokens "
                     f"[{ltok}..) but receives remote tokens [{rtok}..) "
@@ -1147,7 +1144,9 @@ def _run_hetero_case(
     if remote_dcp_size > 1 or local_dcp_size > 1:
         if tp_size >= local_dcp_size:
             shards = tp_size // local_dcp_size
-            expected_sources = set(range(local_rank * shards, (local_rank + 1) * shards))
+            expected_sources = set(
+                range(local_rank * shards, (local_rank + 1) * shards)
+            )
         else:
             expected_sources = {local_rank // (local_dcp_size // tp_size)}
         assert mamba_source_ranks == expected_sources
@@ -1227,16 +1226,17 @@ def _run_hetero_case(
 )
 @pytest.mark.parametrize("cached", [0, 1])
 @pytest.mark.parametrize("tail", [1, 9])
+@pytest.mark.parametrize("local_block,remote_block", [(32, 32), (56, 400), (400, 56)])
 def test_hybrid_dcp_pull_matches_logical_blocks(
-    local_dcp_size, remote_dcp_size, cached, tail
+    local_dcp_size, remote_dcp_size, cached, tail, local_block, remote_block
 ):
     """DCP fan-in preserves token positions, Mamba shards and cached prefixes."""
     for rank in range(local_dcp_size):
         _run_hetero_case(
-            local_block=32,
+            local_block=local_block,
             kernel=4,
-            remote_block=32,
-            num_tokens=2 * 32 * local_dcp_size + tail,
+            remote_block=remote_block,
+            num_tokens=2 * local_block * local_dcp_size + tail,
             tp_size=remote_dcp_size,
             remote_dcp_size=remote_dcp_size,
             cached=cached,

@@ -71,6 +71,7 @@ def compute_tp_mapping(
     remote_tp_size: int,
     group_spec_types: tuple[type[KVCacheSpec], ...],
     remote_dcp_size: int = 1,
+    remote_interleave_size: int | None = None,
 ) -> TPMapping:
     """Build the complete local-to-remote TP mapping.
 
@@ -91,6 +92,10 @@ def compute_tp_mapping(
                 remote_dcp_size,
                 transfer_topology.dcp_size,
                 transfer_topology.dcp_rank,
+                transfer_topology.dcp_interleave_size,
+                transfer_topology.dcp_interleave_size
+                if remote_interleave_size is None
+                else remote_interleave_size,
             )
         else:
             # D (local TP) > P (remote TP): multiple local ranks read different chunks
@@ -148,10 +153,12 @@ def compute_tp_mapping(
 
     consumer_counts = {
         rank: transfer_topology.dcp_consumer_count(
-            remote_tp_size, remote_dcp_size, rank
+            remote_tp_size, remote_dcp_size, rank, remote_interleave_size
         )
         for rank in transfer_topology.handshake_target_ranks(
-            remote_tp_size, remote_dcp_size
+            remote_tp_size,
+            remote_dcp_size,
+            remote_interleave_size=remote_interleave_size,
         )
     }
 

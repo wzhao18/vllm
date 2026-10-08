@@ -357,8 +357,10 @@ class NixlBaseConnectorWorker:
         )
         src_blocks_list = src_blocks_data.tolist()
 
-        for p_idx, p_rank in enumerate(plan.all_source_ranks):
+        ssm_ranks = plan.source_ranks_per_group[ssm_idx] if ssm_idx is not None else ()
+        for p_rank in plan.all_source_ranks:
             fa_slot = plan.rank_to_attention_slot.get(p_rank, 0)
+            ssm_slot = ssm_ranks.index(p_rank) if p_rank in ssm_ranks else 0
 
             handle: list[tuple[int, int, int]] = []
             for j, (addr, local_len, dev) in enumerate(src_blocks_list):
@@ -372,7 +374,7 @@ class NixlBaseConnectorWorker:
                         handle.append((addr + fa_slot * chunk, chunk, dev))
                 elif j < sharded_desc_end:
                     chunk = local_len // ssm_num_splits
-                    handle.append((addr + p_idx * chunk, chunk, dev))
+                    handle.append((addr + ssm_slot * chunk, chunk, dev))
                 else:
                     handle.append((addr, local_len, dev))
             yield handle
@@ -958,6 +960,21 @@ class NixlBaseConnectorWorker:
         local_dcp_size = self.dcp_size
         remote_pcp_size = agent_metadata.pcp_size
         remote_dcp_size = agent_metadata.dcp_size
+        local_interleave = self.vllm_config.parallel_config.cp_kv_cache_interleave_size
+        remote_interleave = agent_metadata.cp_kv_cache_interleave_size
+        if self._TRANSFER_MODE == "pull" and (
+            local_dcp_size != remote_dcp_size or local_interleave != remote_interleave
+        ):
+            for dcp_size, interleave, block_size in (
+                (local_dcp_size, local_interleave, self.block_size),
+                (remote_dcp_size, remote_interleave, agent_metadata.block_size),
+            ):
+                if dcp_size > 1 and interleave % block_size:
+                    raise ValueError(
+                        "DCP pulls with different ownership layouts need whole-page "
+                        f"interleaving: interleave={interleave}, "
+                        f"page size={block_size}."
+                    )
         if remote_pcp_size > 1 and remote_dcp_size not in (1, remote_pcp_size):
             raise NotImplementedError(
                 "Remote NixlConnector PCP+DCP does not span the full PCP group. "
@@ -1052,10 +1069,9 @@ class NixlBaseConnectorWorker:
         best_rtt = float("inf")
         best_offset: float | None = None
 
+        pending_ranks = list(itertools.product(range(remote_pp_size), p_remote_ranks))
         with zmq_ctx(zmq.REQ, path) as sock:
-            for remote_pp_rank, remote_rank in itertools.product(
-                range(remote_pp_size), p_remote_ranks
-            ):
+            for remote_pp_rank, remote_rank in pending_ranks:
                 logger.debug(
                     "Querying metadata on path: %s at remote pp rank %s, tp rank %s",
                     path,
@@ -1135,6 +1151,24 @@ class NixlBaseConnectorWorker:
                     ) from e
 
                 self._validate_remote_parallel_config(metadata)
+
+                if self._TRANSFER_MODE == "pull" and not notif_agents_only:
+                    remote_interleave = max(
+                        1, metadata.cp_kv_cache_interleave_size // metadata.block_size
+                    )
+                    source_ranks = self.transfer_topo.handshake_target_ranks(
+                        remote_tp_size,
+                        remote_dcp_size,
+                        remote_interleave_size=remote_interleave,
+                    )
+                    # The first reply supplies the geometry for exact rank selection.
+                    for pp_rank, rank in itertools.product(
+                        range(remote_pp_size), source_ranks
+                    ):
+                        if (pp_rank, rank) not in pending_ranks:
+                            pending_ranks.append((pp_rank, rank))
+                    if remote_rank not in source_ranks:
+                        continue
 
                 # Ensure engine id matches.
                 if metadata.engine_id != expected_engine_id:
@@ -1403,6 +1437,13 @@ class NixlBaseConnectorWorker:
             else self.model_config.get_total_num_kv_heads(),
             attn_backends=self.attn_backends,
             dcp_size=self.dcp_size,
+            dcp_interleave_size=max(
+                1,
+                self.vllm_config.parallel_config.cp_kv_cache_interleave_size
+                // self.block_size,
+            )
+            if self.dcp_size > 1
+            else 1,
             # SSM States come in tuples (ssm, conv)
             tensor_shape=next(iter(kv_caches.values())).shape
             if not self._has_mamba
@@ -1881,6 +1922,11 @@ class NixlBaseConnectorWorker:
             region_mem_types=self.region_mem_types,
             dcp_size=self.dcp_size,
             pcp_size=self.pcp_size,
+            cp_kv_cache_interleave_size=(
+                self.vllm_config.parallel_config.cp_kv_cache_interleave_size
+                if self.dcp_size > 1
+                else 1
+            ),
             region_members=self.region_members,
             packed_member_layouts=packed_member_layouts,
         )
@@ -2313,6 +2359,11 @@ class NixlBaseConnectorWorker:
             remote_block_len=nixl_agent_meta.block_lens[0],
             remote_physical_blocks_per_logical=physical_blocks_per_logical,
             remote_dcp_size=remote_dcp_size,
+            remote_dcp_interleave_size=max(
+                1,
+                nixl_agent_meta.cp_kv_cache_interleave_size
+                // nixl_agent_meta.block_size,
+            ),
         )
         transfer_topo.register_remote_engine(engine_id, transfer_info)
         logger.info("Transfer plan: %s", transfer_topo.describe(engine_id))
@@ -2322,6 +2373,7 @@ class NixlBaseConnectorWorker:
             remote_tp_size=remote_tp_size,
             group_spec_types=self._group_spec_types,
             remote_dcp_size=remote_dcp_size,
+            remote_interleave_size=transfer_info.remote_dcp_interleave_size,
         )
 
         remote_agent_name = self.nixl_wrapper.add_remote_agent(
@@ -2526,10 +2578,7 @@ class NixlBaseConnectorWorker:
             and self.vllm_config.cache_config.enable_prefix_caching
             and not (
                 self._TRANSFER_MODE == "pull"
-                and min(self.dcp_size, remote_dcp_size) == 1
                 and self.block_size == nixl_agent_meta.block_size
-                and self._physical_blocks_per_logical_kv_block * self.dcp_size
-                == remote_physical_per_logical * remote_dcp_size
             )
         ):
             raise RuntimeError(
@@ -3357,6 +3406,8 @@ class NixlBaseConnectorWorker:
         remote_dcp_size: int,
         local_num_computed_blocks: int,
         num_remote_blocks: int | None = None,
+        local_interleave_size: int = 1,
+        remote_interleave_size: int = 1,
     ) -> tuple[list[int], list[int]]:
         """Match local and remote block IDs by global DCP position.
 
@@ -3364,6 +3415,7 @@ class NixlBaseConnectorWorker:
         cache, while ``remote_ids`` contains the full transferable remote list.
         ``num_remote_blocks``, when provided, is the global block count before
         DCP partitioning and excludes allocation padding.
+        Interleave sizes specify ownership spans in the input block-ID units.
 
         Example:
             local DCP size 2, rank 0 owns *global positions*=[0, 2, 4, 6]
@@ -3378,6 +3430,27 @@ class NixlBaseConnectorWorker:
         remote to release its blocks without performing a transfer.
 
         """
+        if local_interleave_size != 1 or remote_interleave_size != 1:
+            # A logical allocation can span several remote interleave units.
+            matched_local, matched_remote = [], []
+            for i, block_id in enumerate(local_ids, local_num_computed_blocks):
+                cycle, offset = divmod(i, local_interleave_size)
+                position = (
+                    cycle * local_dcp_size + local_dcp_rank
+                ) * local_interleave_size + offset
+                if num_remote_blocks is not None and position >= num_remote_blocks:
+                    break
+                cycle, offset = divmod(position, remote_interleave_size)
+                if cycle % remote_dcp_size != remote_rank % remote_dcp_size:
+                    continue
+                remote_idx = cycle // remote_dcp_size * remote_interleave_size + offset
+                if remote_idx < len(remote_ids):
+                    matched_local.append(block_id)
+                    matched_remote.append(remote_ids[remote_idx])
+                elif num_remote_blocks is not None:
+                    raise ValueError("Remote KV pages do not cover the requested range")
+            return matched_local, matched_remote
+
         local_size, remote_size = local_dcp_size, remote_dcp_size
         if num_remote_blocks is not None:
             num_local = cdiv(num_remote_blocks - local_dcp_rank, local_size)
