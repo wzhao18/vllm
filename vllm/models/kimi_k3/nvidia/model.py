@@ -165,7 +165,8 @@ def can_shard_sequence_parallel_shared_expert(vllm_config: VllmConfig) -> bool:
     all-gather/partial-GEMM/reduce-scatter implementation.
     """
     return (
-        vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+        not vllm_config.parallel_config.enable_expert_parallel
+        or vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
         or vllm_config.parallel_config.all2all_backend == "deepep_v2"
     )
 
@@ -898,9 +899,12 @@ class KimiDecoderLayer(nn.Module):
         self.use_sequence_parallel = (
             envs.VLLM_KIMI_K3_SEQUENCE_PARALLEL
             and parallel_config.pipeline_parallel_size == 1
-            and parallel_config.enable_expert_parallel
             and parallel_config.tensor_parallel_size > 1
-            and (use_mega_moe or parallel_config.data_parallel_size > 1)
+            and (
+                not parallel_config.enable_expert_parallel
+                or use_mega_moe
+                or parallel_config.data_parallel_size > 1
+            )
         )
         if config.is_kda_layer(layer_idx):
             kda_config = config.linear_attn_config
@@ -1144,9 +1148,12 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         self.use_sequence_parallel = (
             envs.VLLM_KIMI_K3_SEQUENCE_PARALLEL
             and parallel_config.pipeline_parallel_size == 1
-            and parallel_config.enable_expert_parallel
             and parallel_config.tensor_parallel_size > 1
-            and (use_mega_moe or parallel_config.data_parallel_size > 1)
+            and (
+                not parallel_config.enable_expert_parallel
+                or use_mega_moe
+                or parallel_config.data_parallel_size > 1
+            )
         )
 
         self.vocab_size = config.vocab_size

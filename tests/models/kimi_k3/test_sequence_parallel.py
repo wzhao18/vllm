@@ -11,6 +11,7 @@ from torch import nn
 from vllm.config import ParallelConfig
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.models.common.ops import sequence_parallel as sp_ops
+from vllm.models.kimi_k3.nvidia import latent_moe_runner as latent_runner
 from vllm.models.kimi_k3.nvidia import model as kimi_model
 from vllm.models.kimi_k3.nvidia import mtp as kimi_mtp
 from vllm.platforms import current_platform
@@ -358,24 +359,61 @@ def test_shard_sequence_parallel_mlp_gating(
 
 
 @pytest.mark.parametrize(
-    ("moe_backend", "all2all_backend", "expected"),
+    ("moe_backend", "all2all_backend", "enable_ep", "expected"),
     [
-        ("deep_gemm_mega_moe", "naive", True),
-        ("auto", "deepep_v2", True),
-        ("auto", "deepep_low_latency", False),
+        ("deep_gemm_mega_moe", "naive", True, True),
+        ("auto", "deepep_v2", True, True),
+        ("auto", "deepep_low_latency", True, False),
+        ("flashinfer_trtllm", "naive", False, True),
     ],
 )
 def test_shared_expert_sharding_backend_gate(
     moe_backend: str,
     all2all_backend: str,
+    enable_ep: bool,
     expected: bool,
 ):
     vllm_config = SimpleNamespace(
         kernel_config=SimpleNamespace(moe_backend=moe_backend),
-        parallel_config=SimpleNamespace(all2all_backend=all2all_backend),
+        parallel_config=SimpleNamespace(
+            all2all_backend=all2all_backend, enable_expert_parallel=enable_ep
+        ),
     )
 
     assert kimi_model.can_shard_sequence_parallel_shared_expert(vllm_config) is expected
+
+
+@pytest.mark.parametrize("has_shared_experts", [False, True])
+def test_tp_sp_experts_sum_latent_partials_and_return_local_rows(
+    monkeypatch, has_shared_experts
+):
+    """TP+SP gathers expert inputs and sums partials before the latent transform."""
+    runner = object.__new__(latent_runner.LatentMoERunner)
+    nn.Module.__init__(runner)
+    runner.moe_config = SimpleNamespace(
+        dp_size=1, pcp_size=1, is_sequence_parallel=True, use_ep=False
+    )
+    runner.routed_experts = SimpleNamespace(
+        quant_method=SimpleNamespace(supports_internal_mk=False)
+    )
+    runner._shared_experts = Mock() if has_shared_experts else None
+    latent = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    logits = latent + 10
+    monkeypatch.setattr(latent_runner, "sp_all_gather", lambda x: torch.cat([x, x + 4]))
+    full_latent, full_logits = runner._maybe_dispatch(latent[:2], logits[:2])
+    torch.testing.assert_close(full_latent, latent)
+    torch.testing.assert_close(full_logits, logits)
+    # Two TP weight shards produce distinct partial values for every token.
+    partials = [latent + 1, latent * 2]
+    monkeypatch.setattr(
+        latent_runner, "sp_reduce_scatter", lambda x: (x + partials[1])[:2]
+    )
+    shared = torch.ones(2, 2) if has_shared_experts else None
+    combined = runner._maybe_combine(shared, partials[0])
+    if has_shared_experts:
+        assert combined[0] is shared
+        combined = combined[1]
+    torch.testing.assert_close(combined, (partials[0] + partials[1])[:2])
 
 
 def test_sharded_sequence_parallel_mlp_matches_replicated(default_vllm_config):

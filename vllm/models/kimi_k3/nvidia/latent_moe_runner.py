@@ -4,7 +4,6 @@ from enum import IntEnum
 from typing import cast
 
 import torch
-
 import vllm.envs as envs
 from vllm.config import get_current_vllm_config
 from vllm.distributed import (
@@ -15,6 +14,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner, _unpack
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.models.common.ops.sequence_parallel import sp_all_gather, sp_reduce_scatter
 from vllm.platforms import current_platform
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 from vllm.utils.torch_utils import aux_stream
@@ -180,6 +180,44 @@ class LatentMoERunner(MoERunner):
             and not self._fused_output_is_reduced
             and not self.moe_config.is_sequence_parallel
         )
+
+    def _maybe_dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if (
+            self.do_naive_dispatch_combine
+            and self.moe_config.is_sequence_parallel
+            and not self.moe_config.use_ep
+            and self.moe_config.dp_size == self.moe_config.pcp_size == 1
+        ):
+            # TP experts need every token; projections above run on local rows.
+            return sp_all_gather(hidden_states), sp_all_gather(router_logits)
+        return super()._maybe_dispatch(hidden_states, router_logits)
+
+    def _maybe_combine(
+        self,
+        shared_output: torch.Tensor | None,
+        hidden_states: torch.Tensor | UnfinalizedMoEOutput,
+    ) -> (
+        torch.Tensor
+        | UnfinalizedMoEOutput
+        | tuple[torch.Tensor | None, torch.Tensor | UnfinalizedMoEOutput]
+    ):
+        if (
+            self.do_naive_dispatch_combine
+            and self.moe_config.is_sequence_parallel
+            and not self.moe_config.use_ep
+            and self.moe_config.dp_size == self.moe_config.pcp_size == 1
+        ):
+            assert isinstance(hidden_states, torch.Tensor)
+            # Sum TP partials before the non-linear latent output transform.
+            hidden_states = sp_reduce_scatter(hidden_states)
+            if self.shared_experts is not None:
+                return shared_output, hidden_states
+            return hidden_states
+        return super()._maybe_combine(shared_output, hidden_states)
 
     def _select_tail_tier(
         self,
