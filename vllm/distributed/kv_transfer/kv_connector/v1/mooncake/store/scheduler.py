@@ -115,21 +115,24 @@ class MooncakeStoreScheduler:
 
         dcp_size = vllm_config.parallel_config.decode_context_parallel_size
         spec_config = vllm_config.speculative_config
-        self._store_coord = MooncakeStoreCoordinator(
-            [
-                replace(
-                    group,
-                    kv_cache_spec=resolve_dcp_kv_cache_spec(
-                        group.kv_cache_spec, dcp_size
-                    ),
-                )
-                for group in store_groups
-            ],
-            self._block_size,
-            self._hash_block_size,
-            use_eagle=spec_config is not None and spec_config.use_eagle_block_drop(),
-            dcp_world_size=dcp_size,
-        )
+        self._store_coord: MooncakeStoreCoordinator | None = None
+        if not capacity_only:
+            self._store_coord = MooncakeStoreCoordinator(
+                [
+                    replace(
+                        group,
+                        kv_cache_spec=resolve_dcp_kv_cache_spec(
+                            group.kv_cache_spec, dcp_size
+                        ),
+                    )
+                    for group in store_groups
+                ],
+                self._block_size,
+                self._hash_block_size,
+                use_eagle=spec_config is not None
+                and spec_config.use_eagle_block_drop(),
+                dcp_world_size=dcp_size,
+            )
 
         self._gpu_block_pool: BlockPool | None = None
         self._num_workers = vllm_config.parallel_config.world_size
@@ -515,6 +518,7 @@ class MooncakeStoreScheduler:
             )
             if req_meta.token_len_chunk == 0:
                 # Tail-only save: pin the companion attention proof.
+                assert self._store_coord is not None
                 block_ids.extend(self._store_coord.tail_attention_block_ids(req_meta))
             else:
                 # Normal prefix save: pin all attention sources for retries.
@@ -582,6 +586,7 @@ class MooncakeStoreScheduler:
             boundary_state_offloads=remapped_offloads,
             completed_token_len=request.num_computed_tokens,
         )
+        assert self._store_coord is not None
         pinned_block_ids.extend(self._store_coord.tail_attention_block_ids(req_meta))
         pinned_block_ids = list(dict.fromkeys(pinned_block_ids))
 
