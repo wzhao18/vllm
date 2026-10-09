@@ -22,6 +22,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.kda_checkpoint import (
+    FlashInferKDACheckpointPlan,
     FlashKDAPrefillCheckpointExporter,
     kda_prefill_checkpoint_alignment,
 )
@@ -61,6 +62,7 @@ from vllm.utils.flashinfer import (
     has_flashinfer_packed_fused_kda_decode,
     has_flashinfer_recurrent_kda,
 )
+from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.worker.workspace import current_workspace_manager
@@ -436,8 +438,18 @@ def _flashinfer_kda_prefill(
     out: torch.Tensor,
     seq_order: torch.Tensor | None = None,
     prefill_workspace: object | None = None,
+    checkpoint_plan: FlashInferKDACheckpointPlan | None = None,
+    state_checkpoints: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    output, _ = flashinfer_recurrent_kda(
+    checkpoint_kwargs = {}
+    if checkpoint_plan is not None:
+        assert state_checkpoints is not None
+        checkpoint_kwargs = {
+            "state_checkpoints": state_checkpoints,
+            "checkpoint_cu_starts": checkpoint_plan.cu_starts,
+            "checkpoint_every_n_tokens": checkpoint_plan.every_n_tokens,
+        }
+    result = flashinfer_recurrent_kda(
         q=q.contiguous(),
         k=k.contiguous(),
         v=v.contiguous(),
@@ -456,8 +468,9 @@ def _flashinfer_kda_prefill(
         beta_is_logit=True,
         seq_order=seq_order,
         prefill_workspace=prefill_workspace,
+        **checkpoint_kwargs,
     )
-    return output, initial_state
+    return result[0], initial_state
 
 
 def resolve_kda_prefill_backend(
@@ -759,9 +772,9 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         self._flashkda_buffer_specs: (
             tuple[tuple[tuple[int, ...], torch.dtype], ...] | None
         ) = None
-        self._flashinfer_kda_output_spec: tuple[tuple[int, ...], torch.dtype] | None = (
-            None
-        )
+        self._flashinfer_kda_buffer_specs: (
+            tuple[tuple[tuple[int, ...], torch.dtype], ...] | None
+        ) = None
         self._checkpoint_exporter: FlashKDAPrefillCheckpointExporter | None = None
         if self.kda_prefill_backend == "flashkda":
             T = vllm_config.scheduler_config.max_num_batched_tokens
@@ -779,11 +792,18 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             self._checkpoint_exporter = FlashKDAPrefillCheckpointExporter()
         elif self.kda_prefill_backend == "flashinfer":
             T = vllm_config.scheduler_config.max_num_batched_tokens
+            N = vllm_config.scheduler_config.max_num_seqs
             H, D = self.local_num_heads, self.head_dim
-            self._flashinfer_kda_output_spec = (
-                (1, T, H, D),
-                self.model_config.dtype,
+            self._flashinfer_kda_buffer_specs = (
+                ((1, T, H, D), self.model_config.dtype),
             )
+            if self.cache_config.mamba_cache_mode == "align":
+                # Periodic checkpoints include each sequence's initial state.
+                self._flashinfer_kda_buffer_specs += (
+                    ((cdiv(T, 32) + N, H, D, D), recurrent_state_dtype),
+                    ((N, H, D, D), recurrent_state_dtype),
+                )
+                self._checkpoint_exporter = FlashKDAPrefillCheckpointExporter()
 
         self.o_norm = FusedRMSNormGated(self.head_dim, activation="sigmoid")
         decode_norm_weight = None
@@ -1265,17 +1285,26 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 elif self.kda_prefill_backend == "flashinfer":
                     assert self.gate_lower_bound is not None
                     assert m.flashinfer_prefill_query_start_loc is not None
+                    assert self._flashinfer_kda_buffer_specs is not None
+                    workspace_out, *checkpoint_buffers = (
+                        current_workspace_manager().get_simultaneous(
+                            *self._flashinfer_kda_buffer_specs
+                        )
+                    )
                     if q_ns.shape[1] > initial_state.shape[0]:
                         assert m.flashinfer_prefill_seq_order is not None
                     flashinfer_out = core_attn_out[:, : q_ns.shape[1]]
                     if non_spec_out is not None:
                         flashinfer_out = non_spec_out
                     elif has_spec_decode:
-                        assert self._flashinfer_kda_output_spec is not None
-                        (workspace_out,) = current_workspace_manager().get_simultaneous(
-                            self._flashinfer_kda_output_spec
-                        )
                         flashinfer_out = workspace_out[:, : q_ns.shape[1]]
+                    plan = m.flashinfer_checkpoint_plan
+                    state_checkpoints = None
+                    if checkpoint is not None:
+                        assert plan is not None
+                        assert len(checkpoint_buffers) == 2
+                        state_checkpoints, recurrent_checkpoint = checkpoint_buffers
+                        state_checkpoints = state_checkpoints[: plan.num_checkpoints]
                     (
                         core_attn_out_non_spec,
                         last_recurrent_state,
@@ -1292,7 +1321,28 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         cu_seqlens=m.flashinfer_prefill_query_start_loc,
                         out=flashinfer_out,
                         seq_order=m.flashinfer_prefill_seq_order,
+                        checkpoint_plan=plan,
+                        state_checkpoints=state_checkpoints,
                     )
+                    if checkpoint is not None:
+                        assert plan is not None
+                        assert state_checkpoints is not None
+                        assert self._checkpoint_exporter is not None
+                        num_sequences = initial_state.shape[0]
+                        torch.index_select(
+                            state_checkpoints,
+                            0,
+                            plan.rows,
+                            out=recurrent_checkpoint[:num_sequences],
+                        )
+                        self._checkpoint_exporter.export(
+                            checkpoint,
+                            raw_qkv=mixed_qkv_ns,
+                            conv_state=conv_state,
+                            recurrent_checkpoint=recurrent_checkpoint[:num_sequences],
+                            recurrent_state=recurrent_state,
+                            cu_seqlens=non_spec_query_start_loc,
+                        )
                 else:
                     (
                         core_attn_out_non_spec,

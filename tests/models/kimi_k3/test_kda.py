@@ -16,6 +16,7 @@ from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
 from vllm.model_executor.layers.mamba.checkpoint import MambaPrefillCheckpointMetadata
 from vllm.model_executor.layers.mamba.kda_checkpoint import (
+    FlashInferKDACheckpointPlan,
     FlashKDAPrefillCheckpointExporter,
 )
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_update
@@ -1439,8 +1440,9 @@ def _make_kda_prefill_inputs(
     state_dtype: torch.dtype,
     *,
     lower_bound: float,
+    query_lens: tuple[int, int] = (17, 31),
 ) -> SimpleNamespace:
-    B, T, H, D = 1, 48, 2, 128
+    B, T, H, D = 1, sum(query_lens), 2, 128
     torch.manual_seed(11)
     q, k, v, raw_g = [
         torch.randn(B, T, H, D, dtype=torch.bfloat16, device=DEVICE) for _ in range(4)
@@ -1451,7 +1453,7 @@ def _make_kda_prefill_inputs(
     initial_state = torch.randn(2, H, D, D, dtype=torch.float32, device=DEVICE).to(
         state_dtype
     )
-    cu_seqlens = torch.tensor([0, 17, T], dtype=torch.int32, device=DEVICE)
+    cu_seqlens = torch.tensor([0, query_lens[0], T], dtype=torch.int32, device=DEVICE)
     return SimpleNamespace(
         q=q,
         k=k,
@@ -1713,20 +1715,28 @@ def test_flashinfer_kda_prefill_breakable_graph_cross_stream():
 
 
 @pytest.mark.parametrize(
-    ("state_dtype", "tolerance"),
+    ("backend", "state_dtype", "tolerance"),
     [
-        pytest.param(torch.bfloat16, 0.03, id="bf16"),
-        pytest.param(torch.float32, 0.01, id="fp32"),
+        pytest.param("flashkda", torch.bfloat16, 0.03, id="flashkda-bf16"),
+        pytest.param("flashkda", torch.float32, 0.01, id="flashkda-fp32"),
+        pytest.param("flashinfer", torch.bfloat16, 0.03, id="flashinfer-bf16"),
     ],
 )
+@pytest.mark.parametrize("conv_state_dim_first", [False, True], ids=["SD", "DS"])
 @torch.inference_mode()
-def test_flashkda_checkpoint_correctness(state_dtype: torch.dtype, tolerance: float):
+def test_kda_checkpoint_correctness(
+    backend: str, state_dtype: torch.dtype, tolerance: float, conv_state_dim_first: bool
+):
     lower_bound = -3.0
-    _require_kda_prefill_backend("flashkda", state_dtype, lower_bound)
+    _require_kda_prefill_backend(backend, state_dtype, lower_bound)
 
     import vllm._flashkda_C  # noqa: F401
 
-    inputs = _make_kda_prefill_inputs(state_dtype, lower_bound=lower_bound)
+    checkpoint_offset = 32 if backend == "flashinfer" else 16
+    query_lens = (65, 95) if backend == "flashinfer" else (17, 31)
+    inputs = _make_kda_prefill_inputs(
+        state_dtype, lower_bound=lower_bound, query_lens=query_lens
+    )
     q, k, v = inputs.q, inputs.k, inputs.v
     raw_g, raw_beta = inputs.raw_g, inputs.raw_beta
     A_log, dt_bias = inputs.A_log, inputs.dt_bias
@@ -1740,11 +1750,11 @@ def test_flashkda_checkpoint_correctness(state_dtype: torch.dtype, tolerance: fl
     q_norm = l2norm_fwd(q.contiguous())
     k_norm = l2norm_fwd(k.contiguous())
     _, expected_checkpoint = naive_recurrent_kda(
-        q_norm[:, :16],
-        k_norm[:, :16],
-        v[:, :16],
-        gate[:, :16],
-        beta[:, :16],
+        q_norm[:, :checkpoint_offset],
+        k_norm[:, :checkpoint_offset],
+        v[:, :checkpoint_offset],
+        gate[:, :checkpoint_offset],
+        beta[:, :checkpoint_offset],
         initial_state=initial_state[0:1].transpose(-1, -2),
         output_final_state=True,
     )
@@ -1759,30 +1769,75 @@ def test_flashkda_checkpoint_correctness(state_dtype: torch.dtype, tolerance: fl
     checkpoint_out = torch.empty_like(v)
     checkpoint_final_state = torch.empty_like(initial_state)
     checkpoint_state = torch.empty_like(initial_state)
-    checkpoint_offsets = torch.tensor([16, 31], dtype=torch.int32, device=DEVICE)
-    _flashkda_prefill(
-        q=q,
-        k=k,
-        v=v,
-        g=raw_g,
-        beta=raw_beta,
-        A_log=A_log,
-        dt_bias=dt_bias,
-        lower_bound=lower_bound,
-        initial_state=initial_state,
-        cu_seqlens=cu_seqlens,
-        out=checkpoint_out,
-        final_state=checkpoint_final_state,
-        workspace=workspace,
-        checkpoint_state=checkpoint_state,
-        checkpoint_offsets=checkpoint_offsets,
-    )
+    offsets = [32, 64] if backend == "flashinfer" else [16, 31]
+    checkpoint_offsets = torch.tensor(offsets, dtype=torch.int32, device=DEVICE)
+    if backend == "flashinfer":
+        plan = FlashInferKDACheckpointPlan.build(offsets, list(query_lens), q.device)
+        periodic_states = torch.empty(
+            plan.num_checkpoints, H, D, D, dtype=state_dtype, device=DEVICE
+        )
+        _, checkpoint_final_state = _flashinfer_kda_prefill(
+            q=q,
+            k=k,
+            v=v,
+            raw_g=raw_g,
+            raw_beta=raw_beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=lower_bound,
+            initial_state=initial_state.clone(),
+            cu_seqlens=cu_seqlens.to(torch.int64),
+            out=checkpoint_out,
+            seq_order=torch.tensor([1, 0], dtype=torch.int32, device=DEVICE),
+            checkpoint_plan=plan,
+            state_checkpoints=periodic_states,
+        )
+        torch.index_select(periodic_states, 0, plan.rows, out=checkpoint_state)
+    else:
+        _flashkda_prefill(
+            q=q,
+            k=k,
+            v=v,
+            g=raw_g,
+            beta=raw_beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=lower_bound,
+            initial_state=initial_state,
+            cu_seqlens=cu_seqlens,
+            out=checkpoint_out,
+            final_state=checkpoint_final_state,
+            workspace=workspace,
+            checkpoint_state=checkpoint_state,
+            checkpoint_offsets=checkpoint_offsets,
+        )
 
     assert_close("checkpoint_o", expected_out, checkpoint_out, tolerance)
     assert_close("checkpoint_ht", expected_state, checkpoint_final_state, tolerance)
     assert_close("checkpoint", expected_checkpoint, checkpoint_state[:1], tolerance)
+    if backend == "flashinfer":
+        start, end = query_lens[0], query_lens[0] + offsets[1]
+        _, expected_second = naive_recurrent_kda(
+            q_norm[:, start:end],
+            k_norm[:, start:end],
+            v[:, start:end],
+            gate[:, start:end],
+            beta[:, start:end],
+            initial_state=initial_state[1:2].transpose(-1, -2),
+            output_final_state=True,
+        )
+        assert expected_second is not None
+        assert_close(
+            "second_checkpoint",
+            expected_second.transpose(-1, -2).contiguous(),
+            checkpoint_state[1:2],
+            tolerance,
+        )
 
-    conv_state = torch.zeros(2, H * D, 3, dtype=q.dtype, device=DEVICE)
+    conv_shape = (2, H * D, 3) if conv_state_dim_first else (2, 3, H * D)
+    conv_state = torch.zeros(conv_shape, dtype=q.dtype, device=DEVICE)
+    if not conv_state_dim_first:
+        conv_state = conv_state.transpose(-1, -2)
     recurrent_storage = torch.zeros(2, H * D * D + 8, dtype=state_dtype, device=DEVICE)
     recurrent_state = recurrent_storage[:, : H * D * D].view(2, H, D, D)
     conv_input = q[0].flatten(1)
@@ -1797,5 +1852,29 @@ def test_flashkda_checkpoint_correctness(state_dtype: torch.dtype, tolerance: fl
         recurrent_state=recurrent_state,
         cu_seqlens=cu_seqlens,
     )
-    torch.testing.assert_close(conv_state[1], q[0, 13:16].flatten(1).transpose(0, 1))
+    torch.testing.assert_close(
+        conv_state[1],
+        q[0, checkpoint_offset - 3 : checkpoint_offset].flatten(1).transpose(0, 1),
+    )
     torch.testing.assert_close(recurrent_state[1], checkpoint_state[0])
+
+    end = query_lens[0]
+    resumed_out, resumed_state = _run_kda_prefill_backend(
+        backend,
+        q=q[:, checkpoint_offset:end].contiguous(),
+        k=k[:, checkpoint_offset:end].contiguous(),
+        v=v[:, checkpoint_offset:end].contiguous(),
+        raw_g=raw_g[:, checkpoint_offset:end].contiguous(),
+        raw_beta=raw_beta[:, checkpoint_offset:end].contiguous(),
+        A_log=A_log,
+        dt_bias=dt_bias,
+        initial_state=recurrent_state[1:2],
+        cu_seqlens=torch.tensor(
+            [0, end - checkpoint_offset], dtype=torch.int32, device=DEVICE
+        ),
+        lower_bound=lower_bound,
+    )
+    assert_close(
+        "resumed_o", checkpoint_out[:, checkpoint_offset:end], resumed_out, tolerance
+    )
+    assert_close("resumed_ht", checkpoint_final_state[:1], resumed_state, tolerance)

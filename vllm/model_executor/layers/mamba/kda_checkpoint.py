@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
+from math import gcd
 
 import torch
 
@@ -10,11 +11,48 @@ from vllm.model_executor.layers.mamba.checkpoint import (
     MambaPrefillCheckpointMetadata,
 )
 from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import cdiv
+from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 
 def kda_prefill_checkpoint_alignment(backend: str) -> int | None:
-    return 16 if backend == "flashkda" else None
+    return {"flashkda": 16, "flashinfer": 32}.get(backend)
+
+
+@dataclass
+class FlashInferKDACheckpointPlan:
+    every_n_tokens: int
+    num_checkpoints: int
+    cu_starts: torch.Tensor
+    rows: torch.Tensor
+
+    @classmethod
+    def build(
+        cls,
+        offsets: list[int],
+        query_lens: list[int],
+        device: torch.device,
+    ) -> "FlashInferKDACheckpointPlan":
+        """Select one requested state per sequence from periodic checkpoints.
+
+        FlashInfer includes the initial state as the first checkpoint row of
+        each sequence. A common interval dividing all offsets ensures every
+        requested checkpoint is emitted without splitting the prefill.
+        """
+        every_n_tokens = gcd(*offsets)
+        assert every_n_tokens > 0 and every_n_tokens % 32 == 0
+        cu_starts = [0]
+        rows = []
+        for offset, query_len in zip(offsets, query_lens, strict=True):
+            rows.append(cu_starts[-1] + offset // every_n_tokens if offset else 0)
+            cu_starts.append(cu_starts[-1] + cdiv(query_len, every_n_tokens))
+        return cls(
+            every_n_tokens,
+            cu_starts[-1],
+            async_tensor_h2d(cu_starts, dtype=torch.int64, device=device),
+            async_tensor_h2d(rows, dtype=torch.int64, device=device),
+        )
 
 
 @dataclass(frozen=True)

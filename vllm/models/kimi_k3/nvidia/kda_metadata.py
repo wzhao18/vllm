@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm.config import VllmConfig
+from vllm.model_executor.layers.mamba.kda_checkpoint import FlashInferKDACheckpointPlan
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import async_tensor_h2d
@@ -263,6 +264,7 @@ class KimiK3KDAMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
     non_spec_token_start: int | None = None
     flashinfer_prefill_query_start_loc: torch.Tensor | None = None
     flashinfer_prefill_seq_order: torch.Tensor | None = None
+    flashinfer_checkpoint_plan: FlashInferKDACheckpointPlan | None = None
     recoverssm_commit: KDARecoverSSMCommitMetadata | None = None
     recoverssm_context: "KDARecoverSSMCommitContext | None" = field(
         default=None, repr=False, compare=False
@@ -702,6 +704,16 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
                 request_rows = active_non_spec_mask_cpu.nonzero().flatten().tolist()
             checkpoint = self.checkpoint_builder.build(m, request_rows)
 
+        flashinfer_checkpoint_plan = None
+        if self.use_flashinfer_prefill and checkpoint is not None:
+            assert checkpoint.offsets is not None
+            assert non_spec_query_start_loc_cpu is not None
+            flashinfer_checkpoint_plan = FlashInferKDACheckpointPlan.build(
+                checkpoint.offsets,
+                non_spec_query_start_loc_cpu.diff().tolist(),
+                query_start_loc.device,
+            )
+
         return KimiK3KDAMetadata(
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
@@ -723,6 +735,7 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
             non_spec_token_start=non_spec_token_start,
             flashinfer_prefill_query_start_loc=flashinfer_prefill_query_start_loc,
             flashinfer_prefill_seq_order=flashinfer_prefill_seq_order,
+            flashinfer_checkpoint_plan=flashinfer_checkpoint_plan,
             recoverssm_commit=recoverssm_commit,
             recoverssm_context=(
                 self._get_recoverssm_context()

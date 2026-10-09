@@ -98,6 +98,7 @@ class Instance:
     dcp: int = 1
     kv_config: dict | None = None
     prefix_caching: bool = True
+    kda_prefill_backend: str = "auto"
 
     @property
     def num_gpus(self) -> int:
@@ -105,6 +106,13 @@ class Instance:
 
     def args(self, mode: Mode) -> list[str]:
         args = BASE_ARGS + ["--tensor-parallel-size", str(self.tp)]
+        if self.kda_prefill_backend == "flashinfer":
+            args += [
+                "--additional-config",
+                json.dumps({"kda_prefill_backend": "flashinfer"}),
+                "--mamba-ssm-cache-dtype",
+                "bfloat16",
+            ]
         if mode.spec:
             args += ["--speculative-config", json.dumps(SPEC_CONFIG)]
         if self.dp > 1:
@@ -139,6 +147,7 @@ class Deployment:
 
 DEPLOYMENTS = {
     "plain": Deployment(Instance()),
+    "plain-flashinfer": Deployment(Instance(kda_prefill_backend="flashinfer")),
     "offload": Deployment(Instance(kv_config=OFFLOAD), offload=True),
     "dcp2": Deployment(Instance(tp=2, dcp=2)),
     "dcp2-offload": Deployment(Instance(tp=2, dcp=2, kv_config=OFFLOAD), offload=True),
