@@ -163,6 +163,7 @@ def can_shard_sequence_parallel_shared_expert(vllm_config: VllmConfig) -> bool:
     ``MoERunner``, but its EP combine returns the routed output in the local
     sequence-sharded layout, so the shared expert can use the same
     all-gather/partial-GEMM/reduce-scatter implementation.
+    TP-only experts also return local sequence rows after their reduce-scatter.
     """
     return (
         not vllm_config.parallel_config.enable_expert_parallel

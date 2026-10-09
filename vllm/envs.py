@@ -1643,7 +1643,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ids to -1 so the dispatch and experts drop them. Requires a MoE kernel that
     # treats topk_id == -1 as a skip sentinel
     "VLLM_MOE_SKIP_PADDING": lambda: bool(int(os.getenv("VLLM_MOE_SKIP_PADDING", "1"))),
-    # Enable whole-model sequence parallelism for eligible Kimi K3 EP topologies.
+    # Enable whole-model sequence parallelism for eligible Kimi K3 topologies.
     "VLLM_KIMI_K3_SEQUENCE_PARALLEL": lambda: bool(
         int(os.getenv("VLLM_KIMI_K3_SEQUENCE_PARALLEL", "0"))
     ),
