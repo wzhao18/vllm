@@ -7,14 +7,14 @@ from collections.abc import Hashable, Iterable
 from typing import Any, cast
 
 import torch
-from torch import nn
-
 import vllm.envs as envs
+from torch import nn
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
@@ -345,12 +345,14 @@ class KimiK3MegaMoEExperts(DeepseekV4MegaMoEExperts):
         activation: str,
         activation_beta: float | None,
         activation_linear_beta: float | None,
+        use_sequence_parallel: bool = True,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.activation = activation
         self.activation_beta = activation_beta
         self.activation_linear_beta = activation_linear_beta
+        self.use_sequence_parallel = use_sequence_parallel
         self.register_buffer("_mega_l1_packed", None, persistent=False)
         self.register_buffer("_mega_l1_scale", None, persistent=False)
         self.register_buffer("_mega_l2_packed", None, persistent=False)
@@ -449,6 +451,16 @@ class KimiK3MegaMoEExperts(DeepseekV4MegaMoEExperts):
         fast_math: bool = True,
     ) -> torch.Tensor:
         self.synchronize_first_launch()
+        full_num_tokens = hidden_states.shape[0]
+        is_padding = None
+        if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
+            is_padding = get_forward_context().is_padding
+        if not self.use_sequence_parallel:
+            # MegaMoE dispatch needs unique token rows even without model SP.
+            is_padding = sp_padding_mask(is_padding, hidden_states)
+            hidden_states = sp_shard(hidden_states)
+            topk_weights = sp_shard(topk_weights)
+            topk_ids = sp_shard(topk_ids)
         if hidden_states.shape[0] > self.max_num_tokens:
             raise ValueError(
                 f"Kimi K3 MegaMoE got {hidden_states.shape[0]} tokens, "
@@ -456,11 +468,8 @@ class KimiK3MegaMoEExperts(DeepseekV4MegaMoEExperts):
             )
         y = torch.empty_like(hidden_states, dtype=torch.bfloat16)
         num_tokens = hidden_states.shape[0]
-        is_padding = None
-        if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
-            is_padding = get_forward_context().is_padding
-            if is_padding is not None:
-                is_padding = is_padding[:num_tokens]
+        if is_padding is not None:
+            is_padding = is_padding[:num_tokens]
 
         if self.capture_fn is not None:
             self.capture_fn(topk_ids)
@@ -514,6 +523,8 @@ class KimiK3MegaMoEExperts(DeepseekV4MegaMoEExperts):
             activation_alpha=self.activation_beta or 1.0,
             activation_beta=self.activation_linear_beta or 0.0,
         )
+        if not self.use_sequence_parallel:
+            y = sp_all_gather(y)[:full_num_tokens]
         return y
 
 
@@ -577,6 +588,7 @@ class KimiMoE(nn.Module):
         self.use_mega_moe = (
             vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
         )
+        self.use_sequence_parallel = use_sequence_parallel
         if self.use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:
             raise NotImplementedError(
                 "Kimi K3 MegaMoE requires expert parallel. Enable it with "
@@ -711,6 +723,7 @@ class KimiMoE(nn.Module):
                 activation="situ",
                 activation_beta=activation_situ_beta,
                 activation_linear_beta=activation_situ_linear_beta,
+                use_sequence_parallel=use_sequence_parallel,
             )
         else:
             self.experts = FusedMoEFactory(
@@ -839,6 +852,8 @@ class KimiMoE(nn.Module):
                 if self.shared_experts is not None
                 else None
             )
+            if not self.use_sequence_parallel and shared_output is not None:
+                shared_output = tensor_model_parallel_all_reduce(shared_output)
             final_hidden_states = self.routed_output_transform(
                 final_hidden_states, residual=shared_output
             )
@@ -881,7 +896,8 @@ class KimiDecoderLayer(nn.Module):
 
         use_mega_moe = vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
         self.use_sequence_parallel = (
-            parallel_config.pipeline_parallel_size == 1
+            envs.VLLM_KIMI_K3_SEQUENCE_PARALLEL
+            and parallel_config.pipeline_parallel_size == 1
             and parallel_config.enable_expert_parallel
             and parallel_config.tensor_parallel_size > 1
             and (use_mega_moe or parallel_config.data_parallel_size > 1)
@@ -1126,7 +1142,8 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         parallel_config = vllm_config.parallel_config
         use_mega_moe = vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
         self.use_sequence_parallel = (
-            parallel_config.pipeline_parallel_size == 1
+            envs.VLLM_KIMI_K3_SEQUENCE_PARALLEL
+            and parallel_config.pipeline_parallel_size == 1
             and parallel_config.enable_expert_parallel
             and parallel_config.tensor_parallel_size > 1
             and (use_mega_moe or parallel_config.data_parallel_size > 1)
