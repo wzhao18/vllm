@@ -8,13 +8,69 @@ from unittest.mock import Mock
 import pytest
 import torch
 from torch import nn
-
 from vllm.config import ParallelConfig
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.models.common.ops import sequence_parallel as sp_ops
 from vllm.models.kimi_k3.nvidia import model as kimi_model
 from vllm.models.kimi_k3.nvidia import mtp as kimi_mtp
 from vllm.platforms import current_platform
+
+
+@pytest.mark.parametrize("num_tokens", [1, 7, 8, 9])
+def test_mega_moe_without_model_sp_dispatches_each_token_once(monkeypatch, num_tokens):
+    """Expert-local sharding must not duplicate tokens or return padding rows."""
+    tp_size = 4
+    hidden = torch.arange(num_tokens * 2, dtype=torch.bfloat16).reshape(-1, 2)
+    weights = torch.ones(num_tokens, 2)
+    ids = torch.zeros(num_tokens, 2, dtype=torch.int64)
+    dispatched = []
+    monkeypatch.setattr(sp_ops, "get_tensor_model_parallel_world_size", lambda: tp_size)
+    monkeypatch.setattr(kimi_model, "is_forward_context_available", lambda: False)
+    monkeypatch.setattr(kimi_model, "sp_all_gather", lambda x: hidden * 2)
+
+    expert = object.__new__(kimi_model.KimiK3MegaMoEExperts)
+    nn.Module.__init__(expert)
+    expert.use_sequence_parallel = False
+    expert.max_num_tokens = math.ceil(num_tokens / tp_size)
+    expert.capture_fn = None
+    expert.eplb_state = SimpleNamespace(logical_to_physical_map=None)
+    expert.activation = "situ"
+    expert.activation_beta = None
+    expert.activation_linear_beta = None
+    expert._transformed_l1_weights = (None, None)
+    expert._transformed_l2_weights = (None, None)
+    expert.synchronize_first_launch = lambda: None
+    expert.finalize_weights = lambda: None
+    buffer = SimpleNamespace(
+        x=torch.empty(expert.max_num_tokens, 2, dtype=torch.bfloat16),
+        x_sf=torch.empty(1),
+        topk_idx=torch.empty(expert.max_num_tokens, 2, dtype=torch.int64),
+        topk_weights=torch.empty(expert.max_num_tokens, 2),
+    )
+    expert.get_symm_buffer = lambda: buffer
+
+    def prepare(x, topk_weights, topk_ids, dst, *args, is_padding, **kwargs):
+        dispatched.append((x.clone(), is_padding.clone()))
+        dst.copy_(x)
+        assert topk_weights.shape == topk_ids.shape == x.shape
+
+    def run(*, y, **kwargs):
+        y.copy_(buffer.x * 2)
+
+    monkeypatch.setattr(kimi_model, "prepare_megamoe_inputs", prepare)
+    expert._ensure_backend = lambda: SimpleNamespace(
+        hidden_quant=None, run_mega_moe=run
+    )
+    for rank in range(tp_size):
+        monkeypatch.setattr(
+            sp_ops, "get_tensor_model_parallel_rank", lambda rank=rank: rank
+        )
+        output = expert(hidden, weights, ids, activation_clamp=None)
+        torch.testing.assert_close(output, hidden * 2)
+        assert output.shape[0] == num_tokens
+
+    rows = torch.cat([x[~padding] for x, padding in dispatched])
+    torch.testing.assert_close(rows, hidden)
 
 
 class _IdentityNorm(nn.Module):
