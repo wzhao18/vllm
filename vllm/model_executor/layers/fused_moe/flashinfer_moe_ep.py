@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import contextlib
+import math
 import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -17,6 +18,7 @@ from vllm.config.kernel import (
     FLASHINFER_MOE_EP_DEEP_GEMM,
 )
 from vllm.distributed import get_ep_group
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
@@ -146,6 +148,17 @@ def flashinfer_moe_ep_unsupported_reasons(
         unsupported.append("expert bias")
     if moe.swiglu_alpha is not None or moe.swiglu_beta is not None:
         unsupported.append("custom SwiGLU alpha or beta")
+    if moe.activation == MoEActivation.SITU:
+        if spec.kernel != "cutedsl":
+            unsupported.append("SITU activation")
+        beta = moe.activation_situ_beta
+        linear_beta = moe.activation_situ_linear_beta
+        if beta is None or not math.isfinite(beta) or beta <= 0:
+            unsupported.append("missing or invalid SITU beta")
+        if linear_beta is not None and (
+            not math.isfinite(linear_beta) or linear_beta <= 0
+        ):
+            unsupported.append("invalid SITU linear beta")
     if (
         spec.kernel == "deep_gemm"
         and moe.routing_method is not RoutingMethodType.DeepseekV4
@@ -319,6 +332,17 @@ class FlashInferMoeEp:
                 intermediate_size=moe.intermediate_size,
                 top_k=moe.experts_per_token,
                 gate_up_clamp=moe.swiglu_limit,
+                activation="situ" if moe.activation == MoEActivation.SITU else "swiglu",
+                situ_beta=(
+                    moe.activation_situ_beta
+                    if moe.activation == MoEActivation.SITU
+                    else None
+                ),
+                situ_linear_beta=(
+                    moe.activation_situ_linear_beta
+                    if moe.activation == MoEActivation.SITU
+                    else None
+                ),
                 fast_math=True,
                 apply_topk_in_fc1=apply_topk_in_fc1,
                 enable_in_kernel_fc2_reduce=False,

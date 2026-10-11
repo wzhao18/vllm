@@ -51,7 +51,9 @@ _supported_weight_quant_schemes: frozenset[QuantKey] = frozenset(
     (kNvfp4Static, kMxfp4Static)
 )
 
-_supported_activations: frozenset[MoEActivation] = frozenset((MoEActivation.SILU,))
+_supported_activations: frozenset[MoEActivation] = frozenset(
+    (MoEActivation.SILU, MoEActivation.SITU)
+)
 
 
 class FlashInferMoeEpExperts(mk.FusedMoEExpertsModular):
