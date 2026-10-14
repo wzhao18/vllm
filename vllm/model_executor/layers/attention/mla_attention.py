@@ -378,6 +378,12 @@ def _canonicalize_sparse_mla_kv_cache_dtype(
 def _get_kv_b_proj_input_dtype(
     kv_b_proj: ColumnParallelLinear, use_fp8_prefill: bool
 ) -> torch.dtype | None:
+    from vllm.model_executor.layers.quantization.online.fp8 import OnlineLinearBase
+
+    quant_method = getattr(kv_b_proj, "quant_method", None)
+    if isinstance(quant_method, OnlineLinearBase):
+        return quant_method.input_dtype
+
     weight = getattr(kv_b_proj, "weight", None)
     weight_dtype = weight.dtype if weight is not None else kv_b_proj.params_dtype
     if weight_dtype == torch.int32:
@@ -392,7 +398,6 @@ def _get_kv_b_proj_input_dtype(
             kFp8Static128BlockSym,
         )
 
-        quant_method = getattr(kv_b_proj, "quant_method", None)
         # FP8_PB_WO dynamically quantizes BF16/FP16 inputs in the linear method.
         if (
             isinstance(quant_method, ModelOptLinearMethod)
