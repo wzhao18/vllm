@@ -79,6 +79,12 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
             v_head_dim=v_head_dim,
             vllm_config=vllm_config,
         )
+        self._use_cute_context = (
+            vllm_config.attention_config.use_cute_dsl_prefill_context
+        )
+        self._use_cute_new_tokens = (
+            vllm_config.attention_config.use_cute_dsl_prefill_new_tokens
+        )
         self._workspace_spec = (
             (envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE,),
             torch.uint8,
@@ -92,6 +98,16 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
         prefill_metadata: "MLACommonPrefillMetadata",
     ) -> None:
         super().prepare_metadata(prefill_metadata)
+        # CuTe requires 16-byte-aligned indptrs; contiguous slices may not be.
+        # Prepare them once per batch, rather than copying in each layer.
+        if self._use_cute_new_tokens and prefill_metadata.query_start_loc.data_ptr() % 16:
+            prefill_metadata.query_start_loc = prefill_metadata.query_start_loc.clone()
+        if self._use_cute_context and prefill_metadata.chunked_context is not None:
+            for chunk in prefill_metadata.chunked_context.chunks:
+                if chunk.query_start_loc.data_ptr() % 16:
+                    chunk.query_start_loc = chunk.query_start_loc.clone()
+                if chunk.cu_seq_lens.data_ptr() % 16:
+                    chunk.cu_seq_lens = chunk.cu_seq_lens.clone()
         (self._workspace_buffer,) = current_workspace_manager().get_simultaneous(
             self._workspace_spec
         )
@@ -173,6 +189,7 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
             cum_seq_lens_kv=self._prefill_metadata.query_start_loc,
             enable_pdl=False,
             is_causal=True,
+            backend="cute-dsl" if self._use_cute_new_tokens else "trtllm-gen",
             return_lse=return_softmax_lse,
             out=out,
             skip_all_rows_active_check=True,
@@ -225,6 +242,7 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
             cum_seq_lens_kv=chunk.cu_seq_lens,
             enable_pdl=False,
             is_causal=False,
+            backend="cute-dsl" if self._use_cute_context else "trtllm-gen",
             return_lse=True,
             out=out,
             skip_all_rows_active_check=True,
