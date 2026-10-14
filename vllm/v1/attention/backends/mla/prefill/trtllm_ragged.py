@@ -98,16 +98,6 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
         prefill_metadata: "MLACommonPrefillMetadata",
     ) -> None:
         super().prepare_metadata(prefill_metadata)
-        # CuTe requires 16-byte-aligned indptrs; contiguous slices may not be.
-        # Prepare them once per batch, rather than copying in each layer.
-        if self._use_cute_new_tokens and prefill_metadata.query_start_loc.data_ptr() % 16:
-            prefill_metadata.query_start_loc = prefill_metadata.query_start_loc.clone()
-        if self._use_cute_context and prefill_metadata.chunked_context is not None:
-            for chunk in prefill_metadata.chunked_context.chunks:
-                if chunk.query_start_loc.data_ptr() % 16:
-                    chunk.query_start_loc = chunk.query_start_loc.clone()
-                if chunk.cu_seq_lens.data_ptr() % 16:
-                    chunk.cu_seq_lens = chunk.cu_seq_lens.clone()
         (self._workspace_buffer,) = current_workspace_manager().get_simultaneous(
             self._workspace_spec
         )
