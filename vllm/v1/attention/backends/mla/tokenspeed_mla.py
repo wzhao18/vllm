@@ -232,6 +232,7 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
 
         config = get_current_vllm_config()
         self._min_split_kv = config.attention_config.tokenspeed_mla_min_split_kv
+        self._enable_packed_q = config.attention_config.tokenspeed_mla_enable_packed_q
         self._max_decode_tokens = 0
         if self._min_split_kv > 1:
             spec = config.speculative_config
@@ -348,6 +349,7 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
             cp_rank=self.dcp_rank,
             cp_interleave_size=self._parallel_config.cp_kv_cache_interleave_size,
             min_split_kv=self._min_split_kv,
+            enable_packed_q=self._enable_packed_q,
         )
         if return_lse:
             o, lse = kernel_out

@@ -66,6 +66,10 @@ class AttentionConfig:
     automatic scheduling. Larger values request a split floor and may increase
     workspace memory. Only applies to the TokenSpeed MLA backend."""
 
+    tokenspeed_mla_enable_packed_q: bool = False
+    """Pack query and head rows into TokenSpeed MLA decode tiles.
+    Applies to both target and draft models, including DCP decode."""
+
     tq_max_kv_splits_for_cuda_graph: int = 32
     """TurboQuant max NUM_KV_SPLITS for cuda graph decode.
     Fixes the split count so grid dimensions are constant across captures,
