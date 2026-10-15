@@ -688,19 +688,36 @@ def test_resumed_from_preemption_with_load_skips_save():
     assert tracker.num_saved_tokens == 0
 
 
-def test_resumed_from_preemption_without_load_still_saves():
-    # No load_spec → behavior is unchanged: save proceeds.
+@pytest.mark.parametrize("request_path", ["new", "resumed", "v2_resumed"])
+@pytest.mark.parametrize(
+    "real_tokens,scheduled_end,block_size",
+    [(48, 48, 16), (44, 48, 16), (48, 32, 16), (659452, 659456, 7168)],
+)
+def test_scheduled_saves_count_real_prefill_tokens(
+    request_path, real_tokens, scheduled_end, block_size
+):
+    # Save only computed real tokens, including replayed generated tokens.
     scheduler = _make_bare_scheduler()
+    scheduler._block_size = block_size
+    token_ids = list(range(real_tokens))
     _make_resumed_unfinished_request(
         scheduler,
-        token_ids=list(range(48)),
-        block_hashes=[b"h0", b"h1", b"h2"],
+        token_ids=token_ids,
+        block_hashes=[b"h"] * (real_tokens // 16),
         num_computed_tokens=0,
     )
-
-    meta = scheduler.build_connector_meta(
-        _make_resumed_scheduler_output(num_scheduled_tokens=48)
-    )
+    if request_path == "resumed":
+        output = _make_resumed_scheduler_output(num_scheduled_tokens=scheduled_end)
+    else:
+        output = _make_new_scheduler_output()
+        request = output.request
+        request.prompt_token_ids = token_ids if request_path == "new" else token_ids[:32]
+        request.prefill_token_ids = token_ids if request_path == "v2_resumed" else None
+        request.num_prompt_tokens = len(request.prompt_token_ids)
+        request.block_hashes = [b"h"] * (real_tokens // 16)
+        output.num_scheduled_tokens["req-0"] = scheduled_end
+        scheduler._unfinished_requests["req-0"] = (request, request.block_ids)
+    meta = scheduler.build_connector_meta(output)
 
     assert len(meta.requests) == 1
     req_meta = meta.requests[0]
@@ -708,7 +725,13 @@ def test_resumed_from_preemption_without_load_still_saves():
     assert req_meta.can_save is True
     assert req_meta.load_spec is None
     tracker = scheduler._request_trackers["req-0"]
-    assert tracker.num_saved_tokens == 48
+    computed_real_tokens = min(real_tokens, scheduled_end)
+    save_end = computed_real_tokens // block_size * block_size
+    assert tracker.prefill_end_tokens == real_tokens
+    assert tracker.token_len == computed_real_tokens
+    assert tracker.num_saved_tokens == save_end
+    assert req_meta.completed_token_len == computed_real_tokens
+    assert req_meta.token_len_chunk == save_end
 
 
 def test_running_request_not_in_resumed_req_ids_appends_blocks():

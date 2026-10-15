@@ -345,7 +345,8 @@ class MooncakeStoreScheduler:
             prefill_tokens = _new_req_prefill_tokens(request)
             request_tracker = RequestTracker(
                 req_id=request.req_id,
-                token_len=num_tokens_to_compute,
+                # Scheduled speculative padding has no committed KV/hash state.
+                token_len=min(num_tokens_to_compute, len(prefill_tokens)),
                 allocated_block_ids=unfolded_block_ids,
                 num_saved_tokens=0,
                 token_ids=(
@@ -399,7 +400,7 @@ class MooncakeStoreScheduler:
                     prefill_tokens = list(request_real.all_token_ids)
                     request_tracker = RequestTracker(
                         req_id=req_id,
-                        token_len=num_tokens_to_compute,
+                        token_len=min(num_tokens_to_compute, len(prefill_tokens)),
                         allocated_block_ids=new_block_ids,
                         num_saved_tokens=0,
                         token_ids=(
