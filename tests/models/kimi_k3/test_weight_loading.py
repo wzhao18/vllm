@@ -10,6 +10,81 @@ from torch import nn
 pytestmark = pytest.mark.cpu_test
 
 
+@pytest.mark.parametrize("tp_size,tp_rank", [(1, 0), (8, 0), (8, 7)])
+@pytest.mark.parametrize("loader", ["v1", "v2"])
+def test_padded_kda_projection_quantizes_after_checkpoint_load(
+    default_vllm_config, monkeypatch, tp_size, tp_rank, loader
+):
+    """Padding must not retain source weights or reach quantization uninitialized."""
+    from vllm.distributed import parallel_state
+    from vllm.model_executor.layers import linear
+    from vllm.model_executor.layers.quantization.online import mxfp8
+    from vllm.model_executor.model_loader.reload import meta
+    from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
+    from vllm.models.kimi_k3.nvidia.kda import _KimiGDNMergedColumnParallelLinear
+
+    default_vllm_config.model_config = SimpleNamespace(dtype=torch.bfloat16)
+    monkeypatch.setattr(
+        parallel_state,
+        "get_tp_group",
+        lambda: SimpleNamespace(world_size=tp_size, rank_in_group=tp_rank),
+    )
+    if loader == "v1":
+        monkeypatch.setattr(linear, "WEIGHT_LOADER_V2_SUPPORTED", [])
+    captured = []
+
+    def quantize(weight):
+        captured.append(weight.clone())
+        return weight.to(torch.float8_e4m3fn), torch.ones(weight.shape[0], 1)
+
+    monkeypatch.setattr(mxfp8, "mxfp8_e4m3_quantize", quantize)
+    monkeypatch.setattr(
+        mxfp8,
+        "init_mxfp8_linear_kernel",
+        lambda **kwargs: SimpleNamespace(
+            process_weights_after_loading=lambda layer: None
+        ),
+    )
+    materialize = meta.materialize_meta_tensor
+
+    def materialize_with_nonzero_padding(tensor):
+        tensor = materialize(tensor)
+        tensor.data.fill_(37)
+        return tensor
+
+    monkeypatch.setattr(
+        meta, "materialize_meta_tensor", materialize_with_nonzero_padding
+    )
+    method = mxfp8.Mxfp8OnlineLinearMethod()
+    outputs = [16 * tp_size] * 4 + [8, 4 * tp_size]
+    with torch.device("cpu"):
+        layer = _KimiGDNMergedColumnParallelLinear(
+            32,
+            outputs + [4 * tp_size],
+            replicated_shard_id=4,
+            tp_size=tp_size,
+            padding_size=4,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            quant_config=SimpleNamespace(
+                online_quantization_config=None,
+                get_quant_method=lambda *args, **kwargs: method,
+            ),
+        )
+        expected = []
+        for shard_id, rows in enumerate(outputs):
+            weight = torch.full((rows, 32), shard_id + 1, dtype=torch.bfloat16)
+            layer.weight.weight_loader(layer.weight, weight, shard_id)
+            local_rows = rows if shard_id == 4 else rows // tp_size
+            expected.append(weight[:local_rows])
+        assert len(captured) == 1
+        torch.testing.assert_close(
+            captured[0],
+            torch.cat([*expected, torch.zeros(4, 32, dtype=torch.bfloat16)]),
+        )
+        assert not get_layerwise_info(layer).loaded_weights
+
+
 @pytest.fixture
 def nvfp4_experts():
     from vllm.models.kimi_k3.nvidia.fi_moe import KimiK3FlashInferMegaMoEExperts
