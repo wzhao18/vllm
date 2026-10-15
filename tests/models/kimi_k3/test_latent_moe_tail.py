@@ -21,6 +21,8 @@ from vllm.model_executor.layers.fused_moe.experts.trtllm_mxfp4_moe import (
 )
 from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+from vllm.model_executor.layers.quantization.online.mxfp8 import Mxfp8OnlineLinearMethod
 from vllm.model_executor.warmup.cutedsl_warmup import cutedsl_warmup
 from vllm.models.kimi_k3.nvidia import latent_moe_runner
 from vllm.models.kimi_k3.nvidia.ops.latent_moe_tail import KimiK3LatentMoETailOp
@@ -32,8 +34,10 @@ EPS = 0.1
 TOP_K = 8
 
 
+@pytest.mark.parametrize("quantized_up_proj", [False, True])
 def test_deferred_finalize_enabled_before_moe_kernel_setup(
     monkeypatch: pytest.MonkeyPatch,
+    quantized_up_proj: bool,
 ) -> None:
     class FakeMoEConfig:
         tp_size = 8
@@ -59,7 +63,12 @@ def test_deferred_finalize_enabled_before_moe_kernel_setup(
     transform = SimpleNamespace(
         norm=SimpleNamespace(weight=norm_weight, variance_epsilon=EPS),
         up_proj=SimpleNamespace(
-            weight=SimpleNamespace(shape=(HIDDEN_SIZE, LATENT_SIZE))
+            weight=SimpleNamespace(shape=(HIDDEN_SIZE, LATENT_SIZE)),
+            quant_method=(
+                object.__new__(Mxfp8OnlineLinearMethod)
+                if quantized_up_proj
+                else UnquantizedLinearMethod()
+            ),
         ),
     )
 
@@ -99,9 +108,13 @@ def test_deferred_finalize_enabled_before_moe_kernel_setup(
 
     latent_moe_runner.LatentMoERunner()
 
-    assert moe_config.use_deferred_moe_finalize
-    assert moe_config.defer_moe_finalize_max_num_tokens == 128
-    assert initialized_with["experts_per_token"] == 16
+    if quantized_up_proj:
+        assert not moe_config.use_deferred_moe_finalize
+        assert not initialized_with
+    else:
+        assert moe_config.use_deferred_moe_finalize
+        assert moe_config.defer_moe_finalize_max_num_tokens == 128
+        assert initialized_with["experts_per_token"] == 16
 
 
 def _make_deferred_routed_output(
