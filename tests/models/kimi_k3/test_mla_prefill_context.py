@@ -355,7 +355,7 @@ def _run_dcp_context_loop(monkeypatch, *, q_data_type, fused_mla_kv_concat_fn):
     monkeypatch.setattr(
         mla_attention,
         "reorg_kvcache",
-        lambda kv_c, k_pe, **_: (kv_c[:_DCP_TOKENS].squeeze(1), k_pe[:_DCP_TOKENS]),
+        lambda kv_cache, **_: kv_cache[:_DCP_TOKENS],
     )
     chunk = SimpleNamespace(
         index=0,

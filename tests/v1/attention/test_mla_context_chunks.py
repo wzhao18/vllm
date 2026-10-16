@@ -285,9 +285,12 @@ def test_dcp_chunks_fit_the_per_rank_row_budget():
         assert local_cursor[request] == padded_local
 
 
-def test_dcp_reorg_uses_each_chunks_local_starts():
+@pytest.mark.parametrize(
+    "dcp_world_size,interleave", [(2, 64), (8, 1), (8, 64), (8, 128)]
+)
+def test_dcp_reorg_uses_each_chunks_local_starts(dcp_world_size, interleave):
     """Reorganization drops DCP padding at each request's own chunk offset."""
-    dcp_world_size, interleave, workspace_size = 2, 64, 1024
+    workspace_size = 1024
     metadata = build_chunked_context(
         [3000, 200, 200],
         [4, 4, 4],
@@ -304,7 +307,7 @@ def test_dcp_reorg_uses_each_chunks_local_starts():
         assert chunk.local_starts is not None
 
         toks = chunk.num_local_context_tokens
-        rank_buffers = [torch.full((toks, 1, 1), -1) for _ in range(dcp_world_size)]
+        rank_buffers = [torch.full((toks, 1, 2), -1) for _ in range(dcp_world_size)]
         expected = []
         src_token_idx = 0
         for request, (padded_len, local_lens, local_start) in enumerate(
@@ -321,13 +324,13 @@ def test_dcp_reorg_uses_each_chunks_local_starts():
                     + rank * 10_000
                     + torch.arange(local_start, local_start + actual_len)
                 ).view(-1, 1, 1)
+                values = torch.cat((values, values + 1), dim=-1)
                 rank_buffers[rank][src_token_idx : src_token_idx + actual_len] = values
                 expected.append(values)
             src_token_idx += padded_len
 
         allgathered = torch.cat(rank_buffers)
-        reorganized, _ = reorg_kvcache(
-            allgathered,
+        reorganized = reorg_kvcache(
             allgathered,
             padded_local_chunk_seq_lens_lst=chunk.padded_local_seq_lens,
             local_context_lens_allranks=chunk.local_context_lens_allranks,

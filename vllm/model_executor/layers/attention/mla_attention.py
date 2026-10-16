@@ -2701,25 +2701,26 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
 
 
 def reorg_kvcache(
-    allgatered_kv_c_normed: torch.Tensor,
-    allgatered_k_pe: torch.Tensor,
+    allgathered_kvcache: torch.Tensor,
     padded_local_chunk_seq_lens_lst: list[int],
     local_context_lens_allranks: list[list[int]],
     local_starts: list[int],
     sum_seq_len: int,
     max_seq_len: int,
     toks: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """Reorg and unpad kvcache after cp local gather to tp layout for attn kernel.
+
+    Keep latent KV and RoPE keys packed so they are reordered in one copy.
+
     e.g.
-    allgatered_kv_c_normed = [T0_0, T0_1, T0_2, T0_3, T1_0, T1_1, ...,
+    allgathered_kvcache = [T0_0, T0_1, T0_2, T0_3, T1_0, T1_1, ...,
                               T0_4, T0_5, pad, pad, T1_2, pad, ...]
-    -> reorganized_kv_c_normed = [T0_0, T0_1, T0_2, T0_3, T0_4, T0_5,
+    -> reorganized_kvcache = [T0_0, T0_1, T0_2, T0_3, T0_4, T0_5,
                                   T1_0, T1_1, T1_2, ...]
 
     Args:
-        allgatered_kv_c_normed: all-gathered, padded latent KV cache.
-        allgatered_k_pe: all-gathered, padded RoPE key cache.
+        allgathered_kvcache: all-gathered, padded latent KV and RoPE key cache.
         padded_local_chunk_seq_lens_lst: local chunk context lengths
             under current CP rank.
         local_context_lens_allranks: local context lengths on each CP rank.
@@ -2730,8 +2731,7 @@ def reorg_kvcache(
         toks: the number of tokens for local gather cache.
 
     """
-    kv_c_segments = []
-    k_pe_segments = []
+    segments = []
     src_token_idx = 0
     max_seq_len_check = 0
     for padded_local_chunk_seq_len, local_context_lens, local_start in zip(
@@ -2751,27 +2751,19 @@ def reorg_kvcache(
                 padded_local_chunk_seq_len,
             )
             if local_chunk_len != 0:
-                kv_c_segment = allgatered_kv_c_normed[
+                segment = allgathered_kvcache[
                     rank * toks + src_token_idx : rank * toks
                     + src_token_idx
                     + local_chunk_len
                 ]
-                k_pe_segment = allgatered_k_pe[
-                    rank * toks + src_token_idx : rank * toks
-                    + src_token_idx
-                    + local_chunk_len
-                ]
-                kv_c_segments.append(kv_c_segment)
-                k_pe_segments.append(k_pe_segment)
+                segments.append(segment)
                 cur_seq_len += local_chunk_len
         max_seq_len_check = max(max_seq_len_check, cur_seq_len)
         src_token_idx += padded_local_chunk_seq_len
-    reorganized_kv_c_normed = torch.cat(kv_c_segments, dim=0)
-    reorganized_k_pe = torch.cat(k_pe_segments, dim=0)
-    assert reorganized_kv_c_normed.shape[0] == sum_seq_len
-    assert reorganized_k_pe.shape[0] == sum_seq_len
+    reorganized_kvcache = torch.cat(segments, dim=0)
+    assert reorganized_kvcache.shape[0] == sum_seq_len
     assert max_seq_len_check == max_seq_len
-    return reorganized_kv_c_normed, reorganized_k_pe
+    return reorganized_kvcache
 
 
 def neutralize_empty_context_partials(
@@ -3138,20 +3130,15 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
                 cur_allgather_kvcache.shape[-1]
                 == self.kv_lora_rank + self.qk_rope_head_dim
             )
-            allgatered_kv_c_normed, allgatered_k_pe = cur_allgather_kvcache.unsqueeze(
-                1
-            ).split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-
             kv_c_normed, k_pe = reorg_kvcache(
-                allgatered_kv_c_normed,
-                allgatered_k_pe,
+                cur_allgather_kvcache.unsqueeze(1),
                 padded_local_chunk_seq_lens_lst=chunk.padded_local_seq_lens,
                 local_context_lens_allranks=chunk.local_context_lens_allranks,
                 local_starts=chunk.local_starts,
                 sum_seq_len=chunk.num_context_tokens,
                 max_seq_len=chunk.max_seq_len,
                 toks=toks,
-            )
+            ).split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
             if kv_b_proj_input_dtype is not None:
                 kv_c_normed = kv_c_normed.to(kv_b_proj_input_dtype)
 
