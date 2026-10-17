@@ -910,8 +910,9 @@ class KimiDecoderLayer(nn.Module):
             or not moe.use_latent_moe
             or moe.shared_experts is None
             or not isinstance(moe.experts, LatentMoERunner)
+            or not moe.experts._use_fused_path()
         ):
-            reason = "the MoE is not the TP latent-MoE runner"
+            reason = "the MoE does not support the fused TP latent path"
         self._pf_sp_reason = reason
         if reason is None:
             _pf_sp_wrap_o_proj(o_proj)

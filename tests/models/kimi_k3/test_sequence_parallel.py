@@ -35,13 +35,26 @@ def test_aria_sp_shards_preserve_tokens_and_zero_padding(monkeypatch, num_tokens
 
 
 @pytest.mark.parametrize("use_v2", [False, True])
-def test_aria_sp_initializes_with_current_attention_interface(monkeypatch, use_v2):
-    """SP initialization must not depend on fields absent from this model."""
+@pytest.mark.parametrize("fused_moe", [None, False, True])
+def test_aria_sp_initializes_with_current_attention_interface(
+    monkeypatch, use_v2, fused_moe
+):
+    """Enable SP only when the layer can preserve its token-sharded output."""
     layer = object.__new__(kimi_model.KimiDecoderLayer)
     nn.Module.__init__(layer)
     layer.use_attn_res = True
     layer.use_sequence_parallel = False
-    layer.is_moe_layer = False
+    layer.is_moe_layer = fused_moe is not None
+    if layer.is_moe_layer:
+        runner = object.__new__(latent_moe_runner.LatentMoERunner)
+        nn.Module.__init__(runner)
+        monkeypatch.setattr(runner, "_use_fused_path", lambda: fused_moe)
+        layer.block_sparse_moe = SimpleNamespace(
+            use_mega_moe=False,
+            use_latent_moe=True,
+            shared_experts=object(),
+            experts=runner,
+        )
     projection = object.__new__(kimi_model.RowParallelLinear)
     nn.Module.__init__(projection)
     projection.reduce_results = True
@@ -52,8 +65,12 @@ def test_aria_sp_initializes_with_current_attention_interface(monkeypatch, use_v
 
     layer._pf_sp_init()
 
-    assert layer._pf_sp_reason is None
-    wrap.assert_called_once_with(projection)
+    if fused_moe is False:
+        assert layer._pf_sp_reason is not None
+        wrap.assert_not_called()
+    else:
+        assert layer._pf_sp_reason is None
+        wrap.assert_called_once_with(projection)
 
 
 class _IdentityNorm(nn.Module):
