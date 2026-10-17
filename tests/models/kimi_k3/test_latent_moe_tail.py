@@ -250,7 +250,7 @@ def _test_latent_moe_tail_worker(
     cutedsl_warmup()
 
     # M=65 crosses two 32-CTA token waves and reuses the first DSM slot.
-    for iteration, num_tokens in enumerate((1, 5, 8, 16, 33, 65, 5)):
+    for iteration, num_tokens in enumerate((1, 5, 8, 16, 33, 65, 128, 5)):
         torch.manual_seed(100 * iteration + rank + 1)
         routed_output = torch.randn(
             num_tokens,
