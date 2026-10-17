@@ -1109,6 +1109,7 @@ def test_flashinfer_mla_dspark_dcp_supports_target_and_draft(monkeypatch):
 )
 @pytest.mark.parametrize("cp_interleave_size", [1, 16, 896])
 @pytest.mark.parametrize("min_split_kv", [1, 8])
+@pytest.mark.parametrize("decode_schedule", ["split-kv", "balanced"])
 def test_tokenspeed_mla_decode_contract(
     monkeypatch,
     causal,
@@ -1117,6 +1118,7 @@ def test_tokenspeed_mla_decode_contract(
     dcp_rank,
     cp_interleave_size,
     min_split_kv,
+    decode_schedule,
 ):
     decode_call = None
     num_decodes = 2
@@ -1143,10 +1145,15 @@ def test_tokenspeed_mla_decode_contract(
         lse = torch.empty(q.shape[0], q.shape[1], q.shape[2], dtype=torch.float32)
         return out, lse
 
+    decode_name = (
+        "tokenspeed_mla_decode_with_schedule"
+        if decode_schedule == "balanced"
+        else "tokenspeed_mla_decode"
+    )
     monkeypatch.setitem(
         sys.modules,
         "tokenspeed_mla",
-        SimpleNamespace(tokenspeed_mla_decode=fake_decode),
+        SimpleNamespace(**{decode_name: fake_decode}),
     )
 
     impl = object.__new__(tokenspeed_mla_module.TokenspeedMLAImpl)
@@ -1161,6 +1168,7 @@ def test_tokenspeed_mla_decode_contract(
     impl.softmax_scale = 1.0
     impl.output_scale = 1.0
     impl._min_split_kv = min_split_kv
+    impl._decode_schedule = decode_schedule
     impl._max_decode_tokens = num_decode_tokens
     workspace = torch.empty(1, dtype=torch.int8)
     monkeypatch.setattr(
@@ -1201,7 +1209,11 @@ def test_tokenspeed_mla_decode_contract(
 
     assert decode_call is not None
     assert decode_call["workspace_buffer"] is workspace
-    assert decode_call["min_split_kv"] == min_split_kv
+    if decode_schedule == "balanced":
+        assert decode_call["schedule"] == decode_schedule
+        assert decode_call["split_kv_min_splits"] == min_split_kv
+    else:
+        assert decode_call["min_split_kv"] == min_split_kv
     assert decode_call["query"].shape == (
         num_decodes,
         tokens_per_decode,
@@ -1236,8 +1248,10 @@ def test_tokenspeed_mla_decode_contract(
         pytest.param(896, 8 * 896 + 17, id="block-interleave-full-cycle"),
     ],
 )
+@pytest.mark.parametrize("decode_schedule", ["split-kv", "balanced"])
+@pytest.mark.parametrize("num_heads,query_len", [(128, 4), (96, 5)])
 def test_tokenspeed_mla_dcp_matches_unsharded_decode(
-    monkeypatch, cp_interleave_size, seq_len
+    monkeypatch, cp_interleave_size, seq_len, decode_schedule, num_heads, query_len
 ):
     from tokenspeed_mla import tokenspeed_mla_decode
 
@@ -1255,7 +1269,6 @@ def test_tokenspeed_mla_dcp_matches_unsharded_decode(
     )
     dcp_world_size = 8
     kernel_block_size = 64
-    num_heads = 128
     kv_lora_rank = 512
     qk_rope_head_dim = 64
     head_size = kv_lora_rank + qk_rope_head_dim
@@ -1276,8 +1289,8 @@ def test_tokenspeed_mla_dcp_matches_unsharded_decode(
         ).unsqueeze(0)
         return cache, block_table
 
-    # Four query positions exercise the MTP/DSpark causal-mask path.
-    query = (torch.randn(1, 4, num_heads, head_size, device=device) * 0.1).to(
+    # H96/Q5 exercises packed balanced scheduling; H128/Q4 retains split-KV.
+    query = (torch.randn(1, query_len, num_heads, head_size, device=device) * 0.1).to(
         torch.float8_e4m3fn
     )
     global_tokens = (torch.randn(seq_len, head_size, device=device) * 0.1).to(
@@ -1330,6 +1343,7 @@ def test_tokenspeed_mla_dcp_matches_unsharded_decode(
         impl.softmax_scale = None
         impl.output_scale = None
         impl._min_split_kv = 1
+        impl._decode_schedule = decode_schedule
         impl._max_decode_tokens = query.shape[1]
         metadata = SimpleNamespace(
             num_decodes=1,

@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """TokenSpeed CuTe DSL MLA decode backend (Blackwell, FP8 KV cache only)."""
 
+from collections.abc import Callable
+from functools import cached_property, partial
 from typing import TYPE_CHECKING, ClassVar
 
 import torch
@@ -232,6 +234,7 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
 
         config = get_current_vllm_config()
         self._min_split_kv = config.attention_config.tokenspeed_mla_min_split_kv
+        self._decode_schedule = config.attention_config.tokenspeed_mla_decode_schedule
         self._max_decode_tokens = 0
         if self._min_split_kv > 1:
             spec = config.speculative_config
@@ -263,6 +266,23 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
                 enable_pdl=False,
             )
 
+    @cached_property
+    def _decode(
+        self,
+    ) -> Callable[..., torch.Tensor | tuple[torch.Tensor, torch.Tensor]]:
+        if self._decode_schedule == "balanced":
+            from tokenspeed_mla import tokenspeed_mla_decode_with_schedule
+
+            return partial(
+                tokenspeed_mla_decode_with_schedule,
+                schedule=self._decode_schedule,
+                split_kv_min_splits=self._min_split_kv,
+            )
+
+        from tokenspeed_mla import tokenspeed_mla_decode
+
+        return partial(tokenspeed_mla_decode, min_split_kv=self._min_split_kv)
+
     def forward_mqa(
         self,
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
@@ -270,8 +290,6 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
         attn_metadata: MLACommonMetadata,
         layer: AttentionLayer,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        from tokenspeed_mla import tokenspeed_mla_decode
-
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata.decode is not None
 
@@ -329,7 +347,7 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
         # vLLM kv_c_and_k_pe_cache is already (num_blocks, block_size, head_size).
         # tokenspeed_mla_decode wants 3D — pass as-is (no unsqueeze, unlike trtllm).
         return_lse = self.need_to_return_lse_for_decode
-        kernel_out = tokenspeed_mla_decode(
+        kernel_out = self._decode(
             query=q,
             kv_cache=kv_c_and_k_pe_cache,
             workspace_buffer=workspace,
@@ -340,6 +358,8 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
             max_seq_len=attn_metadata.max_seq_len,
             softmax_scale=self.softmax_scale,
             output_scale=self.output_scale,
+            is_var_seq=True,
+            window_left=-1,
             enable_pdl=False,
             return_lse=return_lse,
             causal_mask=attn_metadata.causal,
@@ -347,7 +367,6 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
             cp_world=self.dcp_world_size,
             cp_rank=self.dcp_rank,
             cp_interleave_size=self._parallel_config.cp_kv_cache_interleave_size,
-            min_split_kv=self._min_split_kv,
         )
         if return_lse:
             o, lse = kernel_out
