@@ -7,10 +7,11 @@ from collections.abc import Hashable, Iterable
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 import vllm.envs as envs
-from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
@@ -100,7 +101,27 @@ from vllm.models.common.ops.sequence_parallel import (
 )
 from vllm.models.kimi_k3.nvidia.kda import KimiK3DeltaAttention
 from vllm.models.kimi_k3.nvidia.latent_moe_runner import (
+    _PF_SP,
+    _PF_SP_BACKEND,
+    _PF_SP_CHECK,
+    _PF_SP_MIN_TOKENS,
+    _PF_SP_V2,
+    _PF_SP_V2_FP8AG,
+    _PF_SP_V2_MOE,
     LatentMoERunner,
+    pf_sp2_begin,
+    pf_sp2_fp8_gather,
+    pf_sp2_fp8_input_reason,
+    pf_sp2_log_once,
+    pf_sp2_reset,
+    pf_sp2_state,
+    pf_sp2_wrap_fp8_linear,
+    pf_sp_all_gather,
+    pf_sp_begin,
+    pf_sp_end,
+    pf_sp_reduce_scatter,
+    pf_sp_state,
+    pf_sp_take_shard,
 )
 from vllm.models.kimi_k3.nvidia.low_latency_gemm import (
     enable_kimi_k3_low_latency_gemm,
@@ -196,6 +217,35 @@ def maybe_init_gemm_rs_ar(vllm_config: VllmConfig, use_sequence_parallel: bool) 
     flag = "VLLM_KIMI_K3_GEMM_AR" if all_reduce else "VLLM_ENABLE_GEMM_RS"
     logger.info_once("To disable %s, set %s=0.", mode, flag)
     return True
+
+
+def _pf_sp_wrap_o_proj(o_proj: RowParallelLinear) -> None:
+    """ARIA pf-sp attention o_proj (installed only with ARIA_PF_SP=1).
+
+    Inside a pf-sp forward: the TP partial for all Tp rows, with the rows past T
+    zero-padded on the (TP-local, narrow) input, and no all-reduce; the decoder
+    layer reduce-scatters it. Otherwise the module's own forward.
+    """
+    stock_forward = o_proj.forward
+
+    def forward(input_):
+        st = pf_sp_state
+        if not st.active:
+            return stock_forward(input_)
+        assert o_proj.input_is_parallel
+        pad = st.num_padded - input_.shape[0]
+        assert pad >= 0, (tuple(input_.shape), st.num_padded)
+        if pad:
+            input_ = F.pad(input_, (0, 0, 0, pad))
+        skip = o_proj.tp_rank > 0 or o_proj.skip_bias_add
+        output = o_proj.quant_method.apply(
+            o_proj, input_, None if skip else o_proj.bias
+        )
+        if not o_proj.return_bias:
+            return output
+        return output, o_proj.bias if o_proj.skip_bias_add else None
+
+    o_proj.forward = forward
 
 
 class KimiMLP(nn.Module):
@@ -677,7 +727,24 @@ class KimiMoE(nn.Module):
                 router_logits=router_output,
                 shared_experts_input=hidden_states,
             )
+            if _PF_SP and pf_sp_state.active:
+                # pf-sp: the latent runner returned this rank's token shard.
+                return final_hidden_states
         return final_hidden_states.view(num_tokens, hidden_size)
+
+    def pf_sp2_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """ARIA pf-sp v2: this rank's ``[c, hidden]`` rows in, its MoE output
+        rows out. The router gate and the latent down-projection run on the
+        shard (see ``LatentMoERunner.pf_sp2_forward``)."""
+        return self.experts.pf_sp2_forward(hidden_states, self._pf_sp2_router_and_down)
+
+    def _pf_sp2_router_and_down(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        routed_hidden_states, router_output, _ = (
+            self._maybe_overlap_router_and_down_proj(hidden_states)
+        )
+        return routed_hidden_states, router_output
 
 
 class KimiDecoderLayer(nn.Module):
@@ -819,6 +886,177 @@ class KimiDecoderLayer(nn.Module):
                 quant_config=None,
                 prefix=f"{prefix}.mlp_res_proj",
             )
+        self._pf_sp_reason: str | None = "ARIA_PF_SP is unset"
+        if _PF_SP:
+            self._pf_sp_init()
+
+    def _pf_sp_init(self) -> None:
+        """ARIA pf-sp: check this layer can run sequence-sharded and, if so,
+        make its attention o_proj skip the all-reduce inside pf-sp forwards."""
+        attn = self.self_attn
+        o_proj = getattr(attn, "o_proj", None)
+        moe = self.block_sparse_moe if self.is_moe_layer else None
+        reason = None
+        if not self.use_attn_res:
+            reason = "no AttnRes"
+        elif self.use_sequence_parallel:
+            reason = "the EP sequence-parallel path is on"
+        elif self._self_attn_writes_output:
+            reason = "the attention writes its own output"
+        elif not isinstance(o_proj, RowParallelLinear) or not o_proj.reduce_results:
+            reason = "o_proj is not an all-reducing RowParallelLinear"
+        elif getattr(attn, "gemm_rs_ar", None) is not None:
+            reason = "o_proj runs GEMM-AR"
+        elif moe is not None and (
+            moe.use_mega_moe
+            or not moe.use_latent_moe
+            or moe.shared_experts is None
+            or not isinstance(moe.experts, LatentMoERunner)
+        ):
+            reason = "the MoE is not the TP latent-MoE runner"
+        self._pf_sp_reason = reason
+        if reason is None:
+            _pf_sp_wrap_o_proj(o_proj)
+            if _PF_SP_V2:
+                self._pf_sp2_init()
+
+    # ARIA pf-sp v2 per-layer choices, decided on the first v2 forward (after
+    # weight loading; the same on every TP rank).
+    _pf_sp2_in_lin = None  # the attention's first GEMM, if it is the only one
+    _pf_sp2_fp8: bool | None = None
+    _pf_sp2_moe_ok: bool | None = None
+
+    def _pf_sp2_init(self) -> None:
+        """ARIA pf-sp v2: find the attention's single input GEMM (MLA
+        ``fused_qkv_a(_g)_proj`` on the q-LoRA path, KDA ``in_proj_qkvgfab``)
+        and let it take the FP8 all-gathered input."""
+        attn = self.self_attn
+        lin = None
+        if isinstance(attn, MultiHeadLatentAttention):
+            if attn.q_lora_rank is not None and attn._gate_events is None:
+                lin = attn.fused_qkv_a_g_proj
+                if lin is None:
+                    lin = attn.fused_qkv_a_proj
+        elif isinstance(attn, KimiK3DeltaAttention):
+            lin = attn.in_proj_qkvgfab
+        if lin is not None and _PF_SP_V2_FP8AG:
+            # A plain attribute, not nn.Module registration: the linear already
+            # belongs to self_attn, and a registered submodule would be shadowed
+            # by the class-level default.
+            object.__setattr__(self, "_pf_sp2_in_lin", lin)
+            pf_sp2_wrap_fp8_linear(lin)
+
+    def _pf_sp2_fp8_lin(self):
+        if self._pf_sp2_fp8 is None:
+            lin = self._pf_sp2_in_lin
+            reason = (
+                "ARIA_PF_SP_V2_FP8AG=0 or no single input GEMM"
+                if lin is None
+                else pf_sp2_fp8_input_reason(lin)
+            )
+            self._pf_sp2_fp8 = reason is None
+            if reason is not None:
+                pf_sp2_log_once(
+                    f"fp8:{reason}",
+                    "layer %d keeps the bf16 attention-input AG: %s",
+                    self.layer_idx,
+                    reason,
+                )
+        return self._pf_sp2_in_lin if self._pf_sp2_fp8 else None
+
+    def _pf_sp2_moe(self) -> bool:
+        if self._pf_sp2_moe_ok is None:
+            reason = None
+            if not self.is_moe_layer:
+                reason = "dense layer"
+            elif not _PF_SP_V2_MOE:
+                reason = "ARIA_PF_SP_V2_MOE=0"
+            else:
+                reason = self.mlp.experts.pf_sp2_reason()
+            self._pf_sp2_moe_ok = reason is None
+            if reason is not None and self.is_moe_layer:
+                pf_sp2_log_once(
+                    f"moe:{reason}",
+                    "layer %d keeps the v1 MoE block: %s",
+                    self.layer_idx,
+                    reason,
+                )
+        return self._pf_sp2_moe_ok
+
+    def _forward_pf_sp2(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor | None,
+        residual: torch.Tensor,
+        prefix_sum: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """ARIA pf-sp v2 layer: ``_forward_pf_sp`` with the attention input
+        all-gathered in FP8 (when its first GEMM allows it) and the MoE block
+        on the token shard."""
+        num_tokens = pf_sp_state.num_tokens
+        hidden_states, prefix_sum, residual = self._pre_attn_norm(
+            hidden_states, residual, prefix_sum
+        )
+        assert hidden_states is not None
+        lin = self._pf_sp2_fp8_lin()
+        if lin is not None:
+            attn_in = pf_sp2_fp8_gather(lin, hidden_states)
+            pf_sp2_state.fp8_layers += 1
+        else:
+            attn_in = pf_sp_all_gather(hidden_states)[:num_tokens]
+        hidden_states = self._run_self_attn(positions, attn_in)
+        if pf_sp2_state.fp8_input is not None:
+            raise RuntimeError(
+                f"ARIA pf-sp v2: layer {self.layer_idx}'s attention did not "
+                "consume its FP8 all-gathered input"
+            )
+        hidden_states = pf_sp_reduce_scatter(hidden_states)
+        hidden_states, prefix_sum, residual = self._post_attn_norm(
+            hidden_states, residual, prefix_sum
+        )
+        if self._pf_sp2_moe():
+            hidden_states = self.mlp.pf_sp2_forward(hidden_states)
+            pf_sp2_state.moe_layers += 1
+        else:
+            gathered = pf_sp_all_gather(hidden_states)
+            if self.is_moe_layer:
+                hidden_states = self.mlp(gathered)
+            else:
+                hidden_states = pf_sp_take_shard(self.mlp(gathered[:num_tokens]))
+        assert prefix_sum is not None
+        return hidden_states, prefix_sum, residual
+
+    def _forward_pf_sp(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor | None,
+        residual: torch.Tensor,
+        prefix_sum: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """ARIA pf-sp layer: the AttnRes / norm work runs on this rank's
+        ``[c, hidden]`` token shard. All-gather before the attention and the
+        MLP; reduce-scatter the o_proj partial; the latent MoE runner
+        reduce-scatters its own output. The dense MLP's output is already
+        reduced (GEMM-AR or all-reduce); this rank keeps its rows."""
+        num_tokens = pf_sp_state.num_tokens
+        hidden_states, prefix_sum, residual = self._pre_attn_norm(
+            hidden_states, residual, prefix_sum
+        )
+        assert hidden_states is not None
+        gathered = pf_sp_all_gather(hidden_states)
+        hidden_states = self._run_self_attn(positions, gathered[:num_tokens])
+        hidden_states = pf_sp_reduce_scatter(hidden_states)
+        hidden_states, prefix_sum, residual = self._post_attn_norm(
+            hidden_states, residual, prefix_sum
+        )
+        gathered = pf_sp_all_gather(hidden_states)
+        if self.is_moe_layer:
+            # All Tp rows; the rows past T are zeros.
+            hidden_states = self.mlp(gathered)
+        else:
+            hidden_states = pf_sp_take_shard(self.mlp(gathered[:num_tokens]))
+        assert prefix_sum is not None
+        return hidden_states, prefix_sum, residual
 
     def _run_self_attn(
         self,
@@ -1023,6 +1261,232 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         assert config.num_attention_heads % world_size == 0, (
             "num_attention_heads must be divisible by world_size"
         )
+        self._pf_sp_enabled = _PF_SP and self._pf_sp_eligible()
+        self._pf_sp2_on = False
+        if _PF_SP_V2 and self._pf_sp_enabled:
+            if _PF_SP_BACKEND != "pynccl":
+                logger.warning(
+                    "ARIA pf-sp v2 disabled: needs ARIA_PF_SP_BACKEND=pynccl, got %s",
+                    _PF_SP_BACKEND,
+                )
+            else:
+                self._pf_sp2_on = True
+                logger.info(
+                    "ARIA pf-sp v2 enabled: MoE block on the token shard %s, FP8 "
+                    "attention-input all-gather %s (per layer on the first forward)",
+                    "on" if _PF_SP_V2_MOE else "off",
+                    "on" if _PF_SP_V2_FP8AG else "off",
+                )
+
+    def _pf_sp_eligible(self) -> bool:
+        """ARIA pf-sp: whether every layer of this model can run sequence-sharded."""
+        reasons = []
+        if get_tensor_model_parallel_world_size() <= 1:
+            reasons.append("TP is 1")
+        if get_pp_group().world_size != 1:
+            reasons.append("PP is above 1")
+        if self.use_sequence_parallel:
+            reasons.append("the EP sequence-parallel path is on")
+        if not self.use_attn_res:
+            reasons.append("no AttnRes")
+        for layer in self.layers[self.start_layer : self.end_layer]:
+            reason = getattr(layer, "_pf_sp_reason", "not a Kimi decoder layer")
+            if reason is not None:
+                reasons.append(f"layer {getattr(layer, 'layer_idx', '?')}: {reason}")
+                break
+        if reasons:
+            logger.warning("ARIA pf-sp disabled: %s", "; ".join(reasons))
+            return False
+        logger.info(
+            "ARIA pf-sp enabled: eager forwards above %d tokens run the residual "
+            "stream sequence-sharded over TP %d (backend %s)",
+            _PF_SP_MIN_TOKENS,
+            get_tensor_model_parallel_world_size(),
+            _PF_SP_BACKEND,
+        )
+        return True
+
+    def _pf_sp_should_run(self, num_tokens: int) -> bool:
+        """pf-sp only on eager forwards above the token threshold: never during a
+        CUDA-graph capture or under a captured runtime mode. The inputs are the
+        same on every TP rank, so every rank takes the same branch."""
+        if num_tokens <= _PF_SP_MIN_TOKENS or torch.cuda.is_current_stream_capturing():
+            return False
+        from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+
+        if BreakableCUDAGraphCapture.is_active():
+            return False
+        return not (
+            is_forward_context_available()
+            and get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.NONE
+        )
+
+    def _forward_pf_sp(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None,
+        inputs_embeds: torch.Tensor | None,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+        """ARIA pf-sp forward (first and last PP rank, AttnRes)."""
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+        else:
+            hidden_states = self.embed_input_ids(input_ids)
+        assert hidden_states is not None
+        pf_sp_begin(positions.shape[0])
+        if self._pf_sp2_on:
+            pf_sp2_begin()
+        ctx = get_forward_context() if is_forward_context_available() else None
+        is_padding = ctx.is_padding if ctx is not None else None
+        try:
+            if is_padding is not None and is_padding.shape[0] < pf_sp_state.num_padded:
+                # The MoE sees all Tp rows; mark the rows past T as padding.
+                assert ctx is not None
+                ctx.is_padding = F.pad(
+                    is_padding,
+                    (0, pf_sp_state.num_padded - is_padding.shape[0]),
+                    value=True,
+                )
+            return self._forward_pf_sp_layers(
+                positions, hidden_states, intermediate_tensors
+            )
+        finally:
+            pf_sp_end()
+            if self._pf_sp2_on:
+                pf_sp2_reset()
+            if ctx is not None:
+                ctx.is_padding = is_padding
+
+    def _forward_pf_sp_layers(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+        num_tokens = pf_sp_state.num_tokens
+        hidden_states = pf_sp_take_shard(hidden_states)
+        remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
+
+        # Sharded aux hidden states, gathered with the output.
+        aux_hidden_states: list[torch.Tensor] = []
+        if self.start_layer in self.aux_hidden_state_layers:
+            aux_hidden_states.append(hidden_states)
+
+        residual = hidden_states.new_empty(
+            hidden_states.size(0),
+            self.num_attn_res_blocks,
+            hidden_states.size(1),
+        )
+        prefix_sum = hidden_states
+        hidden_states = None
+
+        for layer_idx, layer in enumerate(
+            self.layers[self.start_layer : self.end_layer],
+            start=self.start_layer,
+        ):
+            if self._pf_sp2_on:
+                hidden_states, prefix_sum, residual = layer._forward_pf_sp2(
+                    positions, hidden_states, residual, prefix_sum
+                )
+            else:
+                hidden_states, prefix_sum, residual = layer._forward_pf_sp(
+                    positions, hidden_states, residual, prefix_sum
+                )
+            if (layer_idx + 1) in self.aux_hidden_state_layers:
+                aux_hidden_states.append(
+                    self._capture_aux_hidden_stream(
+                        layer_idx, prefix_sum, hidden_states, residual
+                    )
+                )
+
+        hidden_states = attn_res(
+            prefix_sum,
+            hidden_states,
+            residual,
+            self.output_attn_res_norm.weight,
+            self.output_attn_res_proj.weight.squeeze(0),
+            None,
+            num_blocks=self.num_attn_res_blocks,
+            block_write_idx=-1,
+            eps=self.output_attn_res_norm.variance_epsilon,
+            output_norm_eps=0.0,
+        )
+        self._pf_sp_note(hidden_states, prefix_sum)
+        if self._pf_sp2_on:
+            self._pf_sp2_note()
+
+        # The output gathers on its own, so it stays contiguous; the aux states
+        # gather packed (the drafter concatenates them anyway).
+        hidden_states = pf_sp_all_gather(hidden_states)[:num_tokens]
+        if aux_hidden_states:
+            hidden_size = hidden_states.shape[-1]
+            packed_aux = pf_sp_all_gather(torch.cat(aux_hidden_states, dim=-1))
+            aux_hidden_states = list(packed_aux[:num_tokens].split(hidden_size, dim=-1))
+
+        # The final norm runs in compute_logits, as on the stock path.
+        aux_hidden_states = remote_aux + aux_hidden_states
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
+        return hidden_states
+
+    def _pf_sp2_note(self) -> None:
+        """Log what the first real pf-sp v2 forward ran."""
+        if (
+            not is_forward_context_available()
+            or get_forward_context().attn_metadata is None
+        ):
+            return
+        st2 = pf_sp2_state
+        pf_sp2_log_once(
+            "first",
+            "first v2 forward, %d tokens, %d rows per rank: %d MoE blocks on the token "
+            "shard, %d attention inputs all-gathered in FP8, of %d layers",
+            pf_sp_state.num_tokens,
+            pf_sp_state.shard,
+            st2.moe_layers,
+            st2.fp8_layers,
+            self.end_layer - self.start_layer,
+        )
+
+    def _pf_sp_note(
+        self, hidden_states: torch.Tensor, prefix_sum: torch.Tensor
+    ) -> None:
+        """Log the first real pf-sp forward; with ARIA_PF_SP_CHECK=N also check
+        the pad rows and finiteness of the first N (one device sync each)."""
+        if (
+            not is_forward_context_available()
+            or get_forward_context().attn_metadata is None
+        ):
+            return
+        st = pf_sp_state
+        n = getattr(self, "_pf_sp_real_forwards", 0)
+        self._pf_sp_real_forwards = n + 1
+        if n == 0:
+            logger.info(
+                "ARIA pf-sp: first sequence-sharded forward, "
+                "%d tokens, %d rows per rank",
+                st.num_tokens,
+                st.shard,
+            )
+        if n < _PF_SP_CHECK:
+            real = max(0, min(st.shard, st.num_tokens - st.rank * st.shard))
+            pad_nonzero = int((hidden_states[real:] != 0).sum().item()) + int(
+                (prefix_sum[real:] != 0).sum().item()
+            )
+            nonfinite = int((~torch.isfinite(hidden_states)).sum().item())
+            logger.info(
+                "ARIA pf-sp check %d: tokens %d, TP rank %d, "
+                "real rows %d, pad rows %d, "
+                "pad nonzero %d, nonfinite %d",
+                n,
+                st.num_tokens,
+                st.rank,
+                real,
+                st.shard - real,
+                pad_nonzero,
+                nonfinite,
+            )
 
     def make_empty_intermediate_tensors(
         self,
@@ -1117,6 +1581,10 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        if self._pf_sp_enabled and self._pf_sp_should_run(positions.shape[0]):
+            return self._forward_pf_sp(
+                input_ids, positions, intermediate_tensors, inputs_embeds
+            )
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds

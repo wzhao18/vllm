@@ -12,9 +12,26 @@ from torch import nn
 from vllm.config import ParallelConfig
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.models.common.ops import sequence_parallel as sp_ops
+from vllm.models.kimi_k3.nvidia import latent_moe_runner
 from vllm.models.kimi_k3.nvidia import model as kimi_model
 from vllm.models.kimi_k3.nvidia import mtp as kimi_mtp
 from vllm.platforms import current_platform
+
+
+@pytest.mark.parametrize("num_tokens", [1, 8, 17])
+def test_aria_sp_shards_preserve_tokens_and_zero_padding(monkeypatch, num_tokens):
+    """Gathering rank-local rows must recover every token without padded data."""
+    tensor = torch.arange(num_tokens * 3).reshape(num_tokens, 3)
+    shard_size = math.ceil(num_tokens / 8)
+    state = SimpleNamespace(shard=shard_size, rank=0)
+    monkeypatch.setattr(latent_moe_runner, "pf_sp_state", state)
+    shards = []
+    for rank in range(8):
+        state.rank = rank
+        shards.append(latent_moe_runner.pf_sp_take_shard(tensor))
+    gathered = torch.cat(shards)
+    torch.testing.assert_close(gathered[:num_tokens], tensor)
+    assert not gathered[num_tokens:].count_nonzero()
 
 
 class _IdentityNorm(nn.Module):
