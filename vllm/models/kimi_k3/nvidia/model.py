@@ -901,8 +901,6 @@ class KimiDecoderLayer(nn.Module):
             reason = "no AttnRes"
         elif self.use_sequence_parallel:
             reason = "the EP sequence-parallel path is on"
-        elif self._self_attn_writes_output:
-            reason = "the attention writes its own output"
         elif not isinstance(o_proj, RowParallelLinear) or not o_proj.reduce_results:
             reason = "o_proj is not an all-reducing RowParallelLinear"
         elif getattr(attn, "gemm_rs_ar", None) is not None:

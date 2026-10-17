@@ -34,6 +34,28 @@ def test_aria_sp_shards_preserve_tokens_and_zero_padding(monkeypatch, num_tokens
     assert not gathered[num_tokens:].count_nonzero()
 
 
+@pytest.mark.parametrize("use_v2", [False, True])
+def test_aria_sp_initializes_with_current_attention_interface(monkeypatch, use_v2):
+    """SP initialization must not depend on fields absent from this model."""
+    layer = object.__new__(kimi_model.KimiDecoderLayer)
+    nn.Module.__init__(layer)
+    layer.use_attn_res = True
+    layer.use_sequence_parallel = False
+    layer.is_moe_layer = False
+    projection = object.__new__(kimi_model.RowParallelLinear)
+    nn.Module.__init__(projection)
+    projection.reduce_results = True
+    layer.self_attn = SimpleNamespace(o_proj=projection, gemm_rs_ar=None)
+    wrap = Mock()
+    monkeypatch.setattr(kimi_model, "_PF_SP_V2", use_v2)
+    monkeypatch.setattr(kimi_model, "_pf_sp_wrap_o_proj", wrap)
+
+    layer._pf_sp_init()
+
+    assert layer._pf_sp_reason is None
+    wrap.assert_called_once_with(projection)
+
+
 class _IdentityNorm(nn.Module):
     def __init__(self, hidden_size: int = 2) -> None:
         super().__init__()
