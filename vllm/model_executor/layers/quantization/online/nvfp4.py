@@ -5,6 +5,7 @@ import torch
 from torch.nn import Module
 
 from vllm._custom_ops import scaled_fp4_quant
+from vllm.model_executor.kernels.linear import init_nvfp4_linear_kernel
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -15,6 +16,10 @@ from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
     make_nvfp4_moe_kernel,
     make_nvfp4_moe_quant_config,
     select_nvfp4_moe_backend,
+)
+from vllm.model_executor.layers.quantization.online.fp8 import (
+    OnlineLinearBase,
+    _is_tp_sharded,
 )
 from vllm.model_executor.layers.quantization.online.moe_base import (
     OnlineMoEMethodBase,
@@ -27,6 +32,7 @@ from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import 
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     amax_for_moe_weight_quant,
+    amax_for_tp_weight_quant,
     kNvfp4DynamicToken,
     kNvfp4Static,
     weight_amax,
@@ -35,6 +41,43 @@ from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+
+
+class Nvfp4WeightOnlyOnlineLinearMethod(OnlineLinearBase):
+    """Quantize linear weights to NVFP4 while keeping BF16 activations."""
+
+    activation_quant_key = None
+
+    def __init__(self):
+        super().__init__()
+        self.kernel = init_nvfp4_linear_kernel(use_a16=True)
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+        if getattr(layer, "_already_called_process_weights_after_loading", False):
+            return
+
+        weight = self.get_weight_for_quantization(layer)
+        amax = weight_amax(weight).reshape(1)
+        amax = amax_for_tp_weight_quant(amax, _is_tp_sharded(layer))
+        amax = amax.to(torch.float32).clamp_min(1e-8)
+        global_scale = FLOAT4_E2M1_MAX * FLOAT8_E4M3_MAX / amax
+        qweight, weight_scale = scaled_fp4_quant(
+            weight.contiguous(), global_scale, is_sf_swizzled_layout=False
+        )
+        replace_parameter(layer, "weight", qweight)
+        replace_parameter(layer, "weight_scale", weight_scale)
+        replace_parameter(layer, "weight_global_scale", global_scale.reciprocal())
+        self.kernel.process_weights_after_loading(layer)
+        self.release_requantization_source_weights(layer)
+        layer._already_called_process_weights_after_loading = True
+
+    def apply(
+        self,
+        layer: Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.kernel.apply_weights(layer, x, bias)
 
 
 def _quantize_moe_weight_to_nvfp4(

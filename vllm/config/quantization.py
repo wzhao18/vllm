@@ -221,6 +221,9 @@ _ONLINE_SHORTHANDS: dict[str, QuantizationConfigArgs] = {
     "nvfp4_per_token": QuantizationConfigArgs(
         moe=QuantSpec(weight=kNvfp4Static),
     ),
+    "nvfp4_weight_only": QuantizationConfigArgs(
+        linear=QuantSpec(weight=kNvfp4Static),
+    ),
 }
 
 
