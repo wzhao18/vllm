@@ -221,6 +221,7 @@ def _make_dplb_client(num_engines: int = 3, client_count: int = 1) -> DPLBAsyncM
     client._kv_event_sources = {}
     client.vllm_config = SimpleNamespace(
         use_v2_model_runner=True,
+        cache_config=SimpleNamespace(enable_prefix_caching=True),
         parallel_config=SimpleNamespace(all2all_backend="allgather_reducescatter"),
     )
     return client
@@ -373,6 +374,24 @@ def test_dplb_snapshot_backpressure_overrides_inflight():
     )
 
     assert chosen == client.core_engines[1]
+
+
+@pytest.mark.parametrize(
+    "prefix_caching,running,expected",
+    [(False, [6, 6], 1), (True, [6, 6], 0), (False, [5, 6], 0)],
+)
+def test_dplb_context_load_breaks_ties_without_cached_prefixes(
+    prefix_caching, running, expected
+):
+    client = _make_dplb_client(num_engines=2)
+    client.vllm_config.cache_config.enable_prefix_caching = prefix_caching
+    client.lb_engines = [[0, running[0], 0.5], [0, running[1], 0.1]]
+
+    chosen = client.get_core_engine_for_request(
+        make_request(SamplingParams(max_tokens=1))
+    )
+
+    assert chosen == client.core_engines[expected]
 
 
 def test_dplb_kv_pressure_amplifies_waiting_penalty():

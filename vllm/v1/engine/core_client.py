@@ -1756,6 +1756,9 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             # TODO use P2C alg for larger DP sizes
             num_engines = len(current_counts)
             min_score: float = sys.maxsize
+            min_kv_usage = float("inf")
+            # Without cached prefixes, KV occupancy reflects live context load.
+            use_kv_tiebreak = not self.vllm_config.cache_config.enable_prefix_caching
             eng_index = 0
             for i in range(num_engines):
                 # Start from client_index to help with balancing when engines
@@ -1776,16 +1779,21 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                     # pressure: a queue on a KV-bound engine drains slowly, so
                     # new requests should strongly prefer other engines. With
                     # low KV usage the queue is transient (e.g. mid-burst) and
-                    # the penalty stays off, preserving exact round-robin.
+                    # the primary load score is left unchanged.
                     # Ramps from 0 at <=50% usage to 3x waiting at 100%.
                     score += waiting * 6.0 * max(0.0, kv_cache_usage - 0.5)
-                if score < min_score:
+                if score < min_score or (
+                    score == min_score
+                    and use_kv_tiebreak
+                    and kv_cache_usage < min_kv_usage
+                ):
                     min_score = score
+                    min_kv_usage = kv_cache_usage
                     eng_index = idx
             # Increment local waiting count for better balancing between stats
             # updates from the coordinator (which happen every 100ms).
             current_counts[eng_index][0] += self.client_count
-            # Rotate the scan start so that ties (equal scores, e.g. right
+            # Rotate the scan start so that remaining ties (e.g. right
             # after a coordinator stats reset when engines look equally loaded)
             # don't systematically favor the same engine. This removes the
             # fixed tie-break bias without affecting load-aware decisions when
