@@ -113,6 +113,27 @@ def test_resolve_kda_spec_decode_backend(monkeypatch: pytest.MonkeyPatch):
         resolve_kda_spec_decode_backend("flashinfer", *args, False)
 
 
+@pytest.mark.parametrize("conv_layout", ["SD", "DS"])
+@pytest.mark.parametrize("supports_ds", [False, True])
+def test_kda_spec_decode_layout_compatibility(monkeypatch, conv_layout, supports_ds):
+    """Keep DS on the native path until its FlashInfer provider supports it."""
+    monkeypatch.setattr(
+        nvidia_kda, "has_flashinfer_packed_fused_kda_decode", lambda: True
+    )
+    monkeypatch.setattr(
+        nvidia_kda, "has_flashinfer_packed_fused_kda_decode_ds", lambda: supports_ds
+    )
+    monkeypatch.setattr(
+        nvidia_kda, "is_conv_state_dim_first", lambda: conv_layout == "DS"
+    )
+    monkeypatch.setattr(
+        nvidia_kda.current_platform, "is_device_capability_family", lambda *_: True
+    )
+    args = (12, 128, 4, 4, torch.bfloat16, torch.bfloat16, torch.bfloat16, -5.0)
+    expected = "flashinfer" if conv_layout == "SD" or supports_ds else "native"
+    assert resolve_kda_spec_decode_backend("auto", *args, False) == expected
+
+
 def test_kda_recoverssm_config_state_layout():
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
@@ -1210,10 +1231,15 @@ def test_fused_kda_decode_correctness(
 
 @torch.inference_mode()
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("conv_layout", ["SD", "DS"])
 def test_flashinfer_fused_kda_spec_decode_integration(
     monkeypatch: pytest.MonkeyPatch,
     state_dtype: torch.dtype,
+    conv_layout: str,
 ):
+    monkeypatch.setattr(
+        nvidia_kda, "is_conv_state_dim_first", lambda: conv_layout == "DS"
+    )
     if not is_flashinfer_fused_kda_spec_decode_supported(
         num_heads=12,
         head_dim=128,
@@ -1287,6 +1313,8 @@ def test_flashinfer_fused_kda_spec_decode_integration(
             generator=generator,
         )
     ).transpose(1, 2)
+    if conv_layout == "DS":
+        conv_seed = conv_seed.contiguous()
     state_seed = (
         0.5
         * torch.randn(
@@ -1370,9 +1398,10 @@ def test_flashinfer_fused_kda_spec_decode_integration(
         recurrent_state: torch.Tensor,
         output: torch.Tensor,
     ) -> torch.Tensor:
+        cache_conv = conv_state if conv_layout == "DS" else conv_state.transpose(-1, -2)
         layer = SimpleNamespace(
             prefix="test.layer",
-            kv_cache=(conv_state.transpose(-1, -2), recurrent_state),
+            kv_cache=(cache_conv, recurrent_state),
             kda_spec_decode_backend="flashinfer",
             decode_conv1d_weight=fused_weight,
             decode_norm_weight=norm_weight,

@@ -59,6 +59,7 @@ from vllm.utils.flashinfer import (
     flashinfer_recurrent_kda,
     has_flashinfer_fused_kda_decode,
     has_flashinfer_packed_fused_kda_decode,
+    has_flashinfer_packed_fused_kda_decode_ds,
     has_flashinfer_recurrent_kda,
 )
 from vllm.v1.attention.backend import AttentionBackend
@@ -253,7 +254,9 @@ def is_flashinfer_fused_kda_spec_decode_supported(
         and lower_bound is not None
         and lower_bound < 0
         and not use_recoverssm
-        and not is_conv_state_dim_first()
+        and (
+            not is_conv_state_dim_first() or has_flashinfer_packed_fused_kda_decode_ds()
+        )
     )
 
 
@@ -288,7 +291,7 @@ def resolve_kda_spec_decode_backend(
             "packed_fused_kda_decode API, CUDA SM10x, bfloat16 inputs and "
             "convolution state, float32 or bfloat16 recurrent state, D=128, "
             "W=4, a bounded gate, 1-7 speculative tokens, a supported head "
-            "count, the SD convolution-state layout, and RecoverSSM disabled."
+            "count, a supported convolution-state layout, and RecoverSSM disabled."
         )
     if supported and backend != "native":
         logger.info_once("Using FlashInfer packed fused KDA speculative decode.")
