@@ -113,6 +113,27 @@ def test_resolve_kda_spec_decode_backend(monkeypatch: pytest.MonkeyPatch):
         resolve_kda_spec_decode_backend("flashinfer", *args, False)
 
 
+@pytest.mark.parametrize("conv_layout", ["SD", "DS"])
+@pytest.mark.parametrize("supports_ds", [False, True])
+def test_kda_spec_decode_layout_compatibility(monkeypatch, conv_layout, supports_ds):
+    """Keep DS on the native path until its FlashInfer provider supports it."""
+    monkeypatch.setattr(
+        nvidia_kda, "has_flashinfer_packed_fused_kda_decode", lambda: True
+    )
+    monkeypatch.setattr(
+        nvidia_kda, "has_flashinfer_packed_fused_kda_decode_ds", lambda: supports_ds
+    )
+    monkeypatch.setattr(
+        nvidia_kda, "is_conv_state_dim_first", lambda: conv_layout == "DS"
+    )
+    monkeypatch.setattr(
+        nvidia_kda.current_platform, "is_device_capability_family", lambda *_: True
+    )
+    args = (12, 128, 4, 4, torch.bfloat16, torch.bfloat16, torch.bfloat16, -5.0)
+    expected = "flashinfer" if conv_layout == "SD" or supports_ds else "native"
+    assert resolve_kda_spec_decode_backend("auto", *args, False) == expected
+
+
 def test_kda_recoverssm_config_state_layout():
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(

@@ -387,6 +387,16 @@ def has_flashinfer_packed_fused_kda_decode() -> bool:
 
 
 @functools.cache
+def has_flashinfer_packed_fused_kda_decode_ds() -> bool:
+    """Whether packed verification accepts dimension-first convolution state."""
+    if not has_flashinfer_packed_fused_kda_decode():
+        return False
+    module = _get_submodule("flashinfer.kda_decode")
+    layouts = getattr(module, "PACKED_FUSED_KDA_MULTITOKEN_CONV_STATE_LAYOUTS", ())
+    return "DS" in layouts
+
+
+@functools.cache
 def has_flashinfer_nvlink_two_sided() -> bool:
     """Return `True` if FlashInfer mnnvl all2all is available."""
     if not has_flashinfer_comm():
