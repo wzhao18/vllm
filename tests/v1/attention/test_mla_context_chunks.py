@@ -280,12 +280,14 @@ def test_dcp_chunks_fit_the_per_rank_row_budget():
         assert local_cursor[request] == padded_local
 
 
-def test_dcp_reorg_uses_each_chunks_local_starts():
+@pytest.mark.parametrize("context_lens", [[512], [513], [512, 512], [3000, 200, 200]])
+@pytest.mark.parametrize("strided_input", [False, True])
+def test_dcp_reorg_uses_each_chunks_local_starts(context_lens, strided_input):
     """Reorganization drops DCP padding at each request's own chunk offset."""
     dcp_world_size, interleave, workspace_size = 2, 64, 1024
     metadata = build_chunked_context(
-        [3000, 200, 200],
-        [4, 4, 4],
+        context_lens,
+        [4] * len(context_lens),
         workspace_size,
         block_size=128,
         dcp_world_size=dcp_world_size,
@@ -321,9 +323,13 @@ def test_dcp_reorg_uses_each_chunks_local_starts():
             src_token_idx += padded_len
 
         allgathered = torch.cat(rank_buffers)
-        reorganized, _ = reorg_kvcache(
+        allgathered_pe = allgathered + 1
+        if strided_input:
+            packed = torch.cat((allgathered, allgathered_pe), dim=-1)
+            allgathered, allgathered_pe = packed.split(1, dim=-1)
+        reorganized, reorganized_pe = reorg_kvcache(
             allgathered,
-            allgathered,
+            allgathered_pe,
             padded_local_chunk_seq_lens_lst=chunk.padded_local_seq_lens,
             local_context_lens_allranks=chunk.local_context_lens_allranks,
             local_starts=chunk.local_starts,
@@ -333,6 +339,15 @@ def test_dcp_reorg_uses_each_chunks_local_starts():
         )
 
         torch.testing.assert_close(reorganized, torch.cat(expected))
+        torch.testing.assert_close(reorganized_pe, torch.cat(expected) + 1)
+        for output, source in (
+            (reorganized, allgathered),
+            (reorganized_pe, allgathered_pe),
+        ):
+            assert output.is_contiguous()
+            assert output.untyped_storage().data_ptr() != (
+                source.untyped_storage().data_ptr()
+            )
 
 
 def test_chunked_context_metadata_owns_context_lengths():

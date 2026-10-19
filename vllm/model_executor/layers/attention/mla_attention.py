@@ -2744,6 +2744,25 @@ def reorg_kvcache(
         toks: the number of tokens for local gather cache.
 
     """
+    if (
+        len(padded_local_chunk_seq_lens_lst) == 1
+        and padded_local_chunk_seq_lens_lst[0] == toks
+        and sum_seq_len
+        == toks * len(local_context_lens_allranks[0])
+        == allgatered_kv_c_normed.shape[0]
+        == allgatered_k_pe.shape[0]
+        and all(
+            context_len - local_starts[0] >= toks
+            for context_len in local_context_lens_allranks[0]
+        )
+    ):
+        # One unpadded request is already in request-major order.
+        assert max_seq_len == sum_seq_len
+        return (
+            allgatered_kv_c_normed.clone(memory_format=torch.contiguous_format),
+            allgatered_k_pe.clone(memory_format=torch.contiguous_format),
+        )
+
     kv_c_segments = []
     k_pe_segments = []
     src_token_idx = 0
