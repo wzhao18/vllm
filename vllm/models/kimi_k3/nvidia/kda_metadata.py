@@ -11,6 +11,7 @@ For Kimi-K3 speculative decoding, ``--use-replayssm`` selects the simplified
 RecoverSSM path implemented here instead of the Mamba2 ReplaySSM kernel.
 """
 
+import math
 from dataclasses import dataclass, field
 from functools import cache
 from typing import TYPE_CHECKING
@@ -49,25 +50,27 @@ FLASHINFER_KDA_CHECKPOINT_ALIGNMENT = 32
 
 def plan_flashinfer_kda_checkpoints(
     offsets: list[int], query_lens: list[int]
-) -> tuple[list[int], list[int]]:
+) -> tuple[int, list[int], list[int]]:
     """Map periodic boundaries to one retained checkpoint row per request."""
     assert len(offsets) == len(query_lens)
+    every_n_tokens = math.gcd(*offsets) or FLASHINFER_KDA_CHECKPOINT_ALIGNMENT
     cu_starts = [0]
     destinations: list[int] = []
     for row, (offset, query_len) in enumerate(zip(offsets, query_lens)):
-        count = query_len // FLASHINFER_KDA_CHECKPOINT_ALIGNMENT
+        count = query_len // every_n_tokens
         destinations.extend([-1] * count)
         if offset:
             assert 0 < offset <= query_len
             assert offset % FLASHINFER_KDA_CHECKPOINT_ALIGNMENT == 0
-            slot = cu_starts[-1] + offset // FLASHINFER_KDA_CHECKPOINT_ALIGNMENT - 1
+            slot = cu_starts[-1] + offset // every_n_tokens - 1
             destinations[slot] = row
         cu_starts.append(len(destinations))
-    return cu_starts, destinations
+    return every_n_tokens, cu_starts, destinations
 
 
 @dataclass
 class FlashInferKDACheckpointPlan:
+    every_n_tokens: int
     cu_starts: torch.Tensor
     destinations: torch.Tensor
 
@@ -737,10 +740,11 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
         if checkpoint is not None and self.use_flashinfer_prefill:
             assert checkpoint.offsets is not None
             assert checkpoint.query_lens is not None
-            cu_starts, destinations = plan_flashinfer_kda_checkpoints(
+            every_n_tokens, cu_starts, destinations = plan_flashinfer_kda_checkpoints(
                 checkpoint.offsets, checkpoint.query_lens
             )
             flashinfer_prefill_checkpoint_plan = FlashInferKDACheckpointPlan(
+                every_n_tokens=every_n_tokens,
                 cu_starts=async_tensor_h2d(
                     cu_starts, query_start_loc.device, torch.int64
                 ),

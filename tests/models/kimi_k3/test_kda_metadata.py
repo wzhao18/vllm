@@ -58,17 +58,20 @@ PRUNED_METADATA_FIELDS = {
 
 
 @pytest.mark.parametrize(
-    "offsets,query_lens,expected_starts,expected_destinations",
+    "offsets,query_lens,expected_period,expected_starts,expected_destinations",
     [
-        ([64, 0, 32], [96, 16, 64], [0, 3, 3, 5], [-1, 0, -1, 2, -1]),
-        ([0, 32, 0], [0, 32, 1], [0, 0, 1, 1], [1]),
-        ([0, 0], [64, 32], [0, 2, 3], [-1, -1, -1]),
+        ([64, 0, 32], [96, 16, 64], 32, [0, 3, 3, 5], [-1, 0, -1, 2, -1]),
+        ([0, 32, 0], [0, 32, 1], 32, [0, 0, 1, 1], [1]),
+        ([0, 0], [64, 32], 32, [0, 2, 3], [-1, -1, -1]),
+        ([256, 0], [384, 129], 256, [0, 1, 1], [0]),
+        ([384, 256], [512, 256], 128, [0, 4, 6], [-1, -1, 0, -1, -1, 1]),
     ],
 )
 def test_flashinfer_checkpoint_plan_retains_only_requested_states(
-    offsets, query_lens, expected_starts, expected_destinations
+    offsets, query_lens, expected_period, expected_starts, expected_destinations
 ):
-    starts, destinations = plan_flashinfer_kda_checkpoints(offsets, query_lens)
+    period, starts, destinations = plan_flashinfer_kda_checkpoints(offsets, query_lens)
+    assert period == expected_period
     assert starts == expected_starts
     assert destinations == expected_destinations
 
@@ -451,9 +454,10 @@ def test_spec_internal_checkpoint_metadata_targets_replay_boundary(
     if prefill_backend == "flashinfer":
         plan = actual.flashinfer_prefill_checkpoint_plan
         assert plan is not None
-        starts, destinations = plan_flashinfer_kda_checkpoints(
+        period, starts, destinations = plan_flashinfer_kda_checkpoints(
             [expected_offset], [seq_len]
         )
+        assert plan.every_n_tokens == period
         assert plan.cu_starts.tolist() == starts
         assert plan.destinations.tolist() == destinations
 

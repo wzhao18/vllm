@@ -463,7 +463,7 @@ def _flashinfer_kda_prefill(
             state_checkpoints=checkpoint_state,
             checkpoint_cu_starts=checkpoint_plan.cu_starts,
             checkpoint_state_indices=checkpoint_plan.destinations,
-            checkpoint_every_n_tokens=FLASHINFER_KDA_CHECKPOINT_ALIGNMENT,
+            checkpoint_every_n_tokens=checkpoint_plan.every_n_tokens,
         )
     result = flashinfer_recurrent_kda(
         q=q.contiguous(),

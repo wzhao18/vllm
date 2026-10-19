@@ -1749,16 +1749,17 @@ def test_flashinfer_kda_prefill_breakable_graph_cross_stream():
 
 
 @pytest.mark.parametrize(
-    ("backend", "state_dtype", "tolerance"),
+    ("backend", "state_dtype", "tolerance", "offset"),
     [
-        pytest.param("flashkda", torch.bfloat16, 0.03, id="flashkda-bf16"),
-        pytest.param("flashkda", torch.float32, 0.01, id="flashkda-fp32"),
-        pytest.param("flashinfer", torch.bfloat16, 0.03, id="flashinfer-bf16"),
+        pytest.param("flashkda", torch.bfloat16, 0.03, 16, id="flashkda-bf16"),
+        pytest.param("flashkda", torch.float32, 0.01, 16, id="flashkda-fp32"),
+        pytest.param("flashinfer", torch.bfloat16, 0.03, 32, id="flashinfer-bf16"),
+        pytest.param("flashinfer", torch.bfloat16, 0.03, 128, id="flashinfer-bf16-128"),
     ],
 )
 @torch.inference_mode()
 def test_kda_checkpoint_correctness(
-    backend: str, state_dtype: torch.dtype, tolerance: float
+    backend: str, state_dtype: torch.dtype, tolerance: float, offset: int
 ):
     lower_bound = -3.0
     _require_kda_prefill_backend(backend, state_dtype, lower_bound)
@@ -1767,7 +1768,6 @@ def test_kda_checkpoint_correctness(
 
     import vllm._flashkda_C  # noqa: F401
 
-    offset = 32 if backend == "flashinfer" else 16
     inputs = _make_kda_prefill_inputs(
         state_dtype, lower_bound=lower_bound, seq_lens=(offset + 1, 31)
     )
@@ -1805,7 +1805,7 @@ def test_kda_checkpoint_correctness(
     checkpoint_state = torch.full_like(initial_state, 7)
     checkpoint_offsets = torch.tensor([offset, 0], dtype=torch.int32, device=DEVICE)
     if backend == "flashinfer":
-        cu_starts, destinations = plan_flashinfer_kda_checkpoints(
+        every_n_tokens, cu_starts, destinations = plan_flashinfer_kda_checkpoints(
             [offset, 0], [offset + 1, 31]
         )
         checkpoint_out, checkpoint_final_state = _flashinfer_kda_prefill(
@@ -1822,6 +1822,7 @@ def test_kda_checkpoint_correctness(
             out=checkpoint_out,
             checkpoint_state=checkpoint_state,
             checkpoint_plan=FlashInferKDACheckpointPlan(
+                every_n_tokens,
                 torch.tensor(cu_starts, dtype=torch.int64, device=DEVICE),
                 torch.tensor(destinations, dtype=torch.int32, device=DEVICE),
             ),
