@@ -86,6 +86,7 @@ from vllm.models.kimi_k3.nvidia.ops.fused_mla_key_concat_kv_cache import (
     fused_mla_kv_concat_quant_fp8,
     fused_mla_qkv_quant_kv_cache_fp8_insert,
 )
+from vllm.models.kimi_k3.nvidia.ops.mla_context_cast import cast_mla_context
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
@@ -853,7 +854,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             gathered = workspace[: chunk.num_context_tokens]
             kv_c_normed = gathered[..., : self.kv_lora_rank]
             if kv_b_proj_input_dtype is not None:
-                kv_c_normed = kv_c_normed.to(kv_b_proj_input_dtype)
+                kv_c_normed = cast_mla_context(kv_c_normed, kv_b_proj_input_dtype)
             kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
                 -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
             )

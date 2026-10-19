@@ -21,6 +21,8 @@ from vllm.model_executor.layers.attention.mla_attention import (
     build_mla_chunked_context_metadata,
 )
 from vllm.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
+from vllm.models.kimi_k3.nvidia.ops import mla_context_cast
+from vllm.models.kimi_k3.nvidia.ops.mla_context_cast import cast_mla_context
 from vllm.platforms import current_platform
 
 pytestmark = pytest.mark.skipif(
@@ -39,6 +41,67 @@ _WORKSPACE_TOKENS = 128
 # the last request without any context.
 _CONTEXT_LENS = [200, 48, 32, 0]
 _QUERY_LENS = [8, 4, 6, 5]
+
+
+@pytest.mark.parametrize("num_tokens", [0, 1, 15, 16, 17, 384, 66304])
+@pytest.mark.parametrize("row_stride", [512, 576, 608])
+@torch.inference_mode()
+def test_context_cast_preserves_fp8_values_and_workspace(
+    num_tokens: int, row_stride: int
+) -> None:
+    """Cover every FP8 bit pattern, row tails, offset views and untouched RoPE."""
+    patterns = torch.arange(row_stride, device="cuda", dtype=torch.int32).to(
+        torch.uint8
+    )
+    workspace = patterns.expand(num_tokens + 1, -1).clone()
+    row_offsets = (7 * torch.arange(num_tokens + 1, device="cuda")).to(torch.uint8)
+    workspace.add_(row_offsets[:, None])
+    original = workspace.clone()
+    source = workspace.view(torch.float8_e4m3fn)[1:, :512]
+    expected = source.to(torch.bfloat16)
+    actual = cast_mla_context(source, torch.bfloat16)
+
+    assert actual.shape == expected.shape
+    assert actual.dtype == torch.bfloat16
+    assert actual.is_contiguous()
+    if actual.numel():
+        assert (
+            actual.untyped_storage().data_ptr() != source.untyped_storage().data_ptr()
+        )
+    assert torch.equal(torch.isnan(actual), torch.isnan(expected))
+    finite = ~torch.isnan(expected)
+    assert torch.equal(
+        actual.view(torch.int16)[finite], expected.view(torch.int16)[finite]
+    )
+    assert torch.equal(workspace, original)
+
+
+@pytest.mark.parametrize(
+    "source_dtype,target_dtype,width,column_stride,native_fp8",
+    [
+        (torch.bfloat16, torch.bfloat16, 512, 1, True),
+        (torch.float8_e4m3fn, torch.float32, 512, 1, True),
+        (torch.float8_e4m3fn, torch.bfloat16, 256, 1, True),
+        (torch.float8_e4m3fn, torch.bfloat16, 512, 2, True),
+        (torch.float8_e4m3fn, torch.bfloat16, 512, 1, False),
+    ],
+)
+@torch.inference_mode()
+def test_context_cast_other_layouts_match_torch(
+    source_dtype: torch.dtype,
+    target_dtype: torch.dtype,
+    width: int,
+    column_stride: int,
+    native_fp8: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(current_platform, "supports_fp8", lambda: native_fp8)
+    monkeypatch.setattr(mla_context_cast, "_fp8_context_to_bf16", None)
+    source = torch.randn(17, width * column_stride, device="cuda").to(source_dtype)
+    source = source[:, ::column_stride]
+    torch.testing.assert_close(
+        cast_mla_context(source, target_dtype), source.to(target_dtype), atol=0, rtol=0
+    )
 
 
 class _RecordingPrefillBackend:
@@ -207,7 +270,10 @@ def _build_prefill_metadata(
 )
 @torch.inference_mode()
 def test_fused_context_matches_generic_impl(
-    kv_b_proj_quantized: bool, kv_cache_dtype: str, honors_out: bool
+    kv_b_proj_quantized: bool,
+    kv_cache_dtype: str,
+    honors_out: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Cache dtype and ``kv_b_proj`` dtype vary independently.
 
@@ -216,6 +282,15 @@ def test_fused_context_matches_generic_impl(
     ``kv_b_proj`` accepts.
     """
     torch.manual_seed(0)
+    cast_launches = []
+    cast_kernel = mla_context_cast._fp8_context_to_bf16
+
+    class RecordingCastKernel:
+        def __getitem__(self, grid):
+            cast_launches.append(grid)
+            return cast_kernel[grid]
+
+    monkeypatch.setattr(mla_context_cast, "_fp8_context_to_bf16", RecordingCastKernel())
     device = torch.device("cuda")
     fp8 = current_platform.fp8_dtype()
     quantized = kv_cache_dtype == "fp8"
@@ -256,6 +331,15 @@ def test_fused_context_matches_generic_impl(
     fused_out, fused_lse = layer._compute_prefill_context(
         q, SimpleNamespace(prefill=prefill_fused)
     )
+    expected_casts = (
+        sum(
+            chunk.num_context_tokens > 0
+            for chunk in prefill_fused.chunked_context.chunks
+        )
+        if quantized and not kv_b_proj_quantized and current_platform.supports_fp8()
+        else 0
+    )
+    assert len(cast_launches) == expected_casts
 
     impl = _ReferenceImpl(kv_b_proj, kv_cache_dtype)
     ref_out, ref_lse = impl._compute_prefill_context(
