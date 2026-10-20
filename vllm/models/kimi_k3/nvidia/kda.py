@@ -610,6 +610,9 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 "Kimi-K3 supports --use-replayssm only with speculative decoding"
             )
         self.spec_query_len = 1 + self.num_spec
+        # dep_decode_backend=fused: the CuTe RecoverSSM verify, set by
+        # KimiLinearForCausalLM.build_dep_decode.
+        self.dep_verify = None
 
         kda_config = config.linear_attn_config  # type: ignore[attr-defined]
         assert kda_config is not None, "linear_attn_config must be set"
@@ -1119,7 +1122,19 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             )
             if spec_token_start is not None:
                 spec_out = core_attn_out[:, spec_slice]
-            if self.use_recoverssm:
+            if self.use_recoverssm and self.dep_verify is not None:
+                core_attn_out_spec = self.dep_verify(
+                    self,
+                    mixed_qkv_spec,
+                    g1_spec,
+                    beta_spec,
+                    recurrent_state,
+                    recoverssm_records,
+                    spec_cu_seqlens,
+                    spec_state_indices_tensor[: m.num_spec_decodes, 0],
+                    spec_out,
+                )
+            elif self.use_recoverssm:
                 from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
                     kda_recoverssm_verify,
                 )

@@ -38,6 +38,8 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import MambaSpec
 
+from .dep_decode import dep_decode_enabled
+
 if TYPE_CHECKING:
     from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
         KDARecoverSSMCommitContext,
@@ -352,6 +354,12 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
             spec_query_len=1 + self.vllm_config.num_speculative_tokens,
             max_num_reqs=self.vllm_config.scheduler_config.max_num_seqs,
         )
+        if dep_decode_enabled(self.vllm_config):
+            from vllm.models.kimi_k3.nvidia.dep_decode.kda_verify import (
+                install_state_commit,
+            )
+
+            install_state_commit(context)
         self.recoverssm_context = context
         return context
 
