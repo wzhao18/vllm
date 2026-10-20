@@ -1450,8 +1450,8 @@ class KimiLinearForCausalLM(
         self.needs_norm_in_logits = True
 
     def build_dep_decode(self) -> None:
-        from .dep_decode.kda_verify import install_dep_kda
-        from .dep_decode.linear import install_streamk_forward
+        from .dep_decode.kda_verify import KdaOutProj, install_dep_kda
+        from .dep_decode.linear import fp8_rows, install_streamk_forward
         from .dep_decode.moe import DepMoE
 
         for module in self.model.modules():
@@ -1461,6 +1461,8 @@ class KimiLinearForCausalLM(
                 install_streamk_forward(module.o_proj)
                 if getattr(module, "use_recoverssm", False):
                     install_dep_kda(module)
+                if isinstance(module, KimiK3DeltaAttention) and fp8_rows(module.o_proj):
+                    module.dep_out_proj = KdaOutProj(module)
                 if getattr(module, "fused_qkv_a_g_proj", None) is not None:
                     install_streamk_forward(module.fused_qkv_a_g_proj)
 

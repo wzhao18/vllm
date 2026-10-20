@@ -215,3 +215,32 @@ def install_state_commit(context) -> None:
         context.A_log.dtype,
     )
     context.state_commit = kda_cute_commit
+
+
+class KdaOutProj:
+    """KDA's gated output norm, MXFP8 quantization and ``o_proj`` for
+    decode-sized batches: one fused norm + quantize kernel, then the stream-K GEMM
+    (``KimiK3DeltaAttention.dep_out_proj``)."""
+
+    def __init__(self, layer):
+        from .linear import fp8_rows
+
+        rows = fp8_rows(layer.o_proj)
+        assert rows is not None and layer.o_norm.activation == "sigmoid"
+        self.weight, self.scale = rows
+        self.norm = layer.o_norm
+
+    @staticmethod
+    def supports(num_tokens: int) -> bool:
+        from .gemm import MAX_TILE_N
+
+        return 0 < num_tokens <= MAX_TILE_N
+
+    def __call__(self, core_attn_out: torch.Tensor, gate: torch.Tensor):
+        from .elementwise import gated_rms_norm_mxfp8
+        from .gemm import streamk_mxfp8_gemm
+
+        xq, xs = gated_rms_norm_mxfp8(
+            core_attn_out, gate, self.norm.weight, self.norm.eps
+        )
+        return streamk_mxfp8_gemm(xq, xs, self.weight, self.scale)

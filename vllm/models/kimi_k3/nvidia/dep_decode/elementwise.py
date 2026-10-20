@@ -116,6 +116,73 @@ def _rms_norm_mxfp8_kernel(
     tl.store(s_ptr + s_off, exp.to(tl.uint8), mask=blocks < H // 32)
 
 
+@triton.jit
+def _gated_rms_norm_mxfp8_kernel(
+    x_ptr,
+    g_ptr,
+    w_ptr,
+    q_ptr,
+    s_ptr,
+    stride_xm,
+    stride_gm,
+    stride_qm,
+    k_tiles,
+    eps,
+    D: tl.constexpr,
+    HEADS: tl.constexpr,
+):
+    # One program per (token, HEADS heads): RMS per head, then D / 32 MX blocks each.
+    m = tl.program_id(0)
+    heads = tl.program_id(1) * HEADS + tl.arange(0, HEADS)
+    offs = heads[:, None] * D + tl.arange(0, D)[None, :]
+    x = tl.load(x_ptr + m * stride_xm + offs).to(tl.float32)
+    rstd = 1 / tl.sqrt(tl.sum(x * x, axis=1) / D + eps)
+    w = tl.load(w_ptr + tl.arange(0, D)).to(tl.float32)
+    g = tl.load(g_ptr + m * stride_gm + offs).to(tl.float32)
+    y = x * rstd[:, None] * w[None, :] * tl.sigmoid(g)
+    y = tl.reshape(y.to(tl.bfloat16).to(tl.float32), (HEADS * D // 32, 32))
+    amax = tl.maximum(tl.max(tl.abs(y), axis=1), 1.1754943508222875e-38)
+    exp = tl.ceil(tl.log2(amax / 448.0))
+    exp = tl.minimum(tl.maximum(exp + 127.0, 0.0), 254.0)
+    q = (y / tl.exp2(exp - 127.0)[:, None]).to(tl.float8e4nv)
+    tl.store(q_ptr + m * stride_qm + offs, tl.reshape(q, (HEADS, D)))
+    blocks = tl.program_id(1) * (HEADS * D // 32) + tl.arange(0, HEADS * D // 32)
+    s_off = (
+        (((m // 128) * k_tiles + blocks // 4) * 32 + m % 32) * 4 + (m // 32) % 4
+    ) * 4 + blocks % 4
+    tl.store(s_ptr + s_off, exp.to(tl.uint8))
+
+
+def gated_rms_norm_mxfp8(
+    x: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor, eps: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """KDA's per-head ``FusedRMSNormGated`` (sigmoid gate; the stock kernel's
+    order and BF16 output rounding) then MXFP8 quantization. ``x`` and ``gate``
+    are [T, heads * D] (``gate`` may be row strided), ``weight`` is [D]."""
+    m, h = x.shape
+    d = weight.numel()
+    assert x.stride(1) == 1 and gate.stride(1) == 1 and h % d == 0 and d % 32 == 0
+    q = torch.empty(m, h, dtype=torch.float8_e4m3fn, device=x.device)
+    s = torch.empty(swizzled_scale_numel(m, h), dtype=torch.uint8, device=x.device)
+    heads = 8 if (h // d) % 8 == 0 else 1
+    _gated_rms_norm_mxfp8_kernel[(m, h // d // heads)](
+        x,
+        gate,
+        weight,
+        q,
+        s,
+        x.stride(0),
+        gate.stride(0),
+        q.stride(0),
+        triton.cdiv(h // BLOCK, 4),
+        float(eps),
+        D=d,
+        HEADS=heads,
+        num_warps=4,
+    )
+    return q, s
+
+
 def situ_and_mul_mxfp8(
     gate_up: torch.Tensor, beta: float, linear_beta: float | None
 ) -> tuple[torch.Tensor, torch.Tensor]:

@@ -613,6 +613,8 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         # dep_decode_backend=fused: the CuTe RecoverSSM verify, set by
         # KimiLinearForCausalLM.build_dep_decode.
         self.dep_verify = None
+        # dep_decode_backend=fused: fused output norm + MXFP8 o_proj (KdaOutProj).
+        self.dep_out_proj = None
 
         kda_config = config.linear_attn_config  # type: ignore[attr-defined]
         assert kda_config is not None, "linear_attn_config must be set"
@@ -904,14 +906,20 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
+        dep_out = self.dep_out_proj is not None and self.dep_out_proj.supports(
+            num_tokens
+        )
         self._forward(
             mixed_qkv=mixed_qkv,
             g1=g1,
             g2=g2,
             beta=beta,
             core_attn_out=core_attn_out,
+            skip_o_norm=dep_out,
         )
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
+        if dep_out:
+            return self.dep_out_proj(core_attn_out, g_proj_states)
         if self.gemm_rs_ar is not None and self.gemm_rs_ar.should_run(core_attn_out):
             return self.gemm_rs_ar.apply(core_attn_out, self.o_proj)
         return self.o_proj(core_attn_out)[0]
@@ -924,6 +932,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         g2: torch.Tensor,
         beta: torch.Tensor,
         core_attn_out: torch.Tensor,
+        skip_o_norm: bool = False,
     ) -> None:
         forward_context = get_forward_context()
         attn_metadata_raw = forward_context.attn_metadata
@@ -1397,4 +1406,5 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             assert core_attn_out_spec is not None
         # Triton normalizes in place, so this is a self-copy with no device
         # work. Keep it for the out-of-place native implementation.
-        core_attn_out.copy_(self.o_norm(core_attn_out, g2))
+        if not skip_o_norm:
+            core_attn_out.copy_(self.o_norm(core_attn_out, g2))
