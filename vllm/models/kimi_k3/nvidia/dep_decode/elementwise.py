@@ -183,6 +183,62 @@ def gated_rms_norm_mxfp8(
     return q, s
 
 
+@triton.jit
+def _sigmoid_gate_mxfp8_kernel(
+    x_ptr,
+    g_ptr,
+    q_ptr,
+    s_ptr,
+    stride_xm,
+    stride_gm,
+    stride_qm,
+    k_tiles,
+    BLOCKS: tl.constexpr,
+):
+    # One program per (token, BLOCKS MX blocks).
+    m = tl.program_id(0)
+    offs = tl.program_id(1) * BLOCKS * 32 + tl.arange(0, BLOCKS * 32)
+    x = tl.load(x_ptr + m * stride_xm + offs).to(tl.float32)
+    g = tl.load(g_ptr + m * stride_gm + offs).to(tl.float32)
+    y = (x * tl.sigmoid(g)).to(tl.bfloat16).to(tl.float32)
+    y = tl.reshape(y, (BLOCKS, 32))
+    amax = tl.maximum(tl.max(tl.abs(y), axis=1), 1.1754943508222875e-38)
+    exp = tl.ceil(tl.log2(amax / 448.0))
+    exp = tl.minimum(tl.maximum(exp + 127.0, 0.0), 254.0)
+    q = (y / tl.exp2(exp - 127.0)[:, None]).to(tl.float8e4nv)
+    tl.store(q_ptr + m * stride_qm + offs, tl.reshape(q, (BLOCKS * 32,)))
+    blocks = tl.program_id(1) * BLOCKS + tl.arange(0, BLOCKS)
+    s_off = (
+        (((m // 128) * k_tiles + blocks // 4) * 32 + m % 32) * 4 + (m // 32) % 4
+    ) * 4 + blocks % 4
+    tl.store(s_ptr + s_off, exp.to(tl.uint8))
+
+
+def sigmoid_gate_mxfp8(
+    x: torch.Tensor, gate: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """MLA's sigmoid output gate ``x * sigmoid(gate)`` (FP32 math, one BF16
+    rounding) then MXFP8 quantization; ``gate`` may be row strided."""
+    m, h = x.shape
+    blocks = 32
+    assert x.stride(1) == 1 and gate.stride(1) == 1 and h % (blocks * 32) == 0
+    q = torch.empty(m, h, dtype=torch.float8_e4m3fn, device=x.device)
+    s = torch.empty(swizzled_scale_numel(m, h), dtype=torch.uint8, device=x.device)
+    _sigmoid_gate_mxfp8_kernel[(m, h // (blocks * 32))](
+        x,
+        gate,
+        q,
+        s,
+        x.stride(0),
+        gate.stride(0),
+        q.stride(0),
+        triton.cdiv(h // BLOCK, 4),
+        BLOCKS=blocks,
+        num_warps=4,
+    )
+    return q, s
+
+
 def situ_and_mul_mxfp8(
     gate_up: torch.Tensor, beta: float, linear_beta: float | None
 ) -> tuple[torch.Tensor, torch.Tensor]:

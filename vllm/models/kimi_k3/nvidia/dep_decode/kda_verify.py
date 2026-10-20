@@ -244,3 +244,24 @@ class KdaOutProj:
             core_attn_out, gate, self.norm.weight, self.norm.eps
         )
         return streamk_mxfp8_gemm(xq, xs, self.weight, self.scale)
+
+
+class MlaOutProj:
+    """MLA's sigmoid output gate, MXFP8 quantization and ``o_proj`` for
+    decode-sized batches (``MultiHeadLatentAttention.dep_out_proj``)."""
+
+    def __init__(self, layer):
+        from .linear import fp8_rows
+
+        rows = fp8_rows(layer.o_proj)
+        assert rows is not None
+        self.weight, self.scale = rows
+
+    supports = staticmethod(KdaOutProj.supports)
+
+    def __call__(self, attn_out: torch.Tensor, gate: torch.Tensor):
+        from .elementwise import sigmoid_gate_mxfp8
+        from .gemm import streamk_mxfp8_gemm
+
+        xq, xs = sigmoid_gate_mxfp8(attn_out, gate)
+        return streamk_mxfp8_gemm(xq, xs, self.weight, self.scale)
