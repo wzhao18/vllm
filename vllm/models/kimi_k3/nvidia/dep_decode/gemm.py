@@ -20,13 +20,17 @@ K_BLOCK = 128
 
 
 def default_num_ctas(row_tiles: int, k_blocks: int, sms: int) -> int:
-    """Whole row tiles per CTA: a split-K reduction costs more than idle SMs
-    unless the GEMM has very few row tiles, which then use stream-K."""
+    """Whole row tiles per CTA: a split tile's reduction (about 3 us of exposed
+    synchronization) costs more than idle SMs unless the GEMM has very few row
+    tiles, which then split each tile over two CTAs (three below 16 tiles)."""
     tiles_per_cta = -(-row_tiles // sms)
     ctas = -(-row_tiles // tiles_per_cta)
     if 4 * ctas >= sms:
         return ctas
-    return min(sms, max(1, row_tiles * k_blocks // MIN_BLOCKS_PER_CTA))
+    parts = 2 if row_tiles >= 16 else 3
+    return min(
+        sms, row_tiles * parts, max(1, row_tiles * k_blocks // MIN_BLOCKS_PER_CTA)
+    )
 
 
 def tile_n_for(tokens: int) -> int:
@@ -45,7 +49,11 @@ def _num_sms(device_index: int) -> int:
 
 @cache
 def _compile(
-    tile_n: int, residual: bool, b_stages: int, ablate: int = 0, k_tile: int = 128
+    tile_n: int,
+    residual: bool,
+    b_stages: int,
+    ablate: int = 0,
+    k_tile: int = 128,
 ):
     import cutlass
     import cutlass.cute as cute
@@ -98,7 +106,8 @@ class StreamKScratch:
 
     def __init__(self, device: torch.device):
         sms = _num_sms(device.index)
-        # One FP32 accumulator and counter per split tile, indexed by its first CTA.
+        # One FP32 slot per CTA (a CTA helps at most one split tile: the one its
+        # run opens with) and a counter per split tile, indexed by its owner CTA.
         self.workspace = torch.zeros(
             sms * ROW_TILE * MAX_TILE_N, dtype=torch.float32, device=device
         )

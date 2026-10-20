@@ -9,12 +9,14 @@ Swap-AB: the weight is the MMA A operand (128-row tiles) and the M <= 192 decode
 tokens are one MMA N tile, so the kernel streams W exactly once. CTA ``c`` of ``G``
 owns the global K-block range ``[c * T // G, (c + 1) * T // G)`` of the
 ``T = row_tiles * k_blocks`` blocks, so every SM moves the same number of weight
-bytes regardless of N. A row tile whose K range spans several CTAs is reduced in FP32
-in global memory: every part adds its accumulator with fire-and-forget ``red`` and
-bumps the tile's counter; the last arriver reads the sum, stores it, and re-zeroes
-the accumulator and counter for the next launch (graph replays need no reset).
-The FP32 sum order across parts is not fixed, so split tiles are not bitwise
-reproducible run to run.
+bytes regardless of N. A row tile whose K range spans several CTAs is owned by the
+CTA holding its first K range (the last segment of that CTA's run); every other
+part (a helper, whose range opens its CTA's run and so ends early) stores its FP32
+accumulator in its CTA's slot with plain coalesced stores and releases the tile's
+counter. The owner waits for the helpers (all CTAs are resident), resets the
+counter for the next launch (graph replays need no reset) and adds the helper slots
+to its accumulator in CTA order, prefetching the next epilogue tile's slots while
+it stores the current one: split tiles are bitwise reproducible.
 
 Weights and activations have separate producer warps and pipelines. The weight
 stream (as deep as shared memory allows) never waits on the preceding kernel under
@@ -52,6 +54,36 @@ def _cta_of(block: Int32, total: Int32, grid: Int32) -> Int32:
 @cute.jit
 def _cta_start(cta: Int32, total: Int32, grid: Int32) -> Int32:
     return cta * total // grid
+
+
+@cute.jit
+def _gather_helpers(
+    dst: cute.Tensor,
+    workspace: cute.Tensor,
+    owner: Int32,
+    parts: Int32,
+    slot_elems: Int32,
+    e: cutlass.Constexpr,
+    frag: cutlass.Constexpr,
+    threads: cutlass.Constexpr,
+    tidx: Int32,
+):
+    """The helpers' FP32 partials of a split tile's epilogue tile ``e`` (one
+    thread's fragment), summed in CTA order. The first helper's values are plain
+    loads that nothing waits on, so a caller can prefetch them."""
+    base = (owner + 1) * slot_elems + e * frag * threads
+    for i in cutlass.range_constexpr(frag):
+        # .cg: the helpers wrote these during this launch.
+        dst[i] = cute.arch.load(
+            workspace.iterator + (base + i * threads + tidx), Float32, cop="cg"
+        )
+    # Tiles split over more than two CTAs (rare): further helpers.
+    for p in cutlass.range(2, parts, unroll=1):
+        base_p = (owner + p) * slot_elems + e * frag * threads
+        for i in cutlass.range_constexpr(frag):
+            dst[i] = dst[i] + cute.arch.load(
+                workspace.iterator + (base_p + i * threads + tidx), Float32, cop="cg"
+            )
 
 
 class DepMxfp8StreamKGemm(Sm100BlockScaledPersistentDenseGemmKernel):
@@ -158,7 +190,7 @@ class DepMxfp8StreamKGemm(Sm100BlockScaledPersistentDenseGemmKernel):
         mB: cute.Tensor,  # activation [M, K] fp8
         mC: cute.Tensor,  # output [M, N] bf16 (row-major)
         mR: cute.Tensor,  # residual [M, N] bf16, read only when self.residual
-        workspace: cute.Tensor,  # fp32 [grid * ROW_TILE * tile_n], zero at rest
+        workspace: cute.Tensor,  # fp32 [grid * ROW_TILE * tile_n] helper slots
         counters: cute.Tensor,  # int32 [grid], zero between launches
         sf_m: cutlass.Int64,
         sf_n: cutlass.Int64,
@@ -236,7 +268,6 @@ class DepMxfp8StreamKGemm(Sm100BlockScaledPersistentDenseGemmKernel):
             acc_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage]
             acc_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage]
             tmem_holding_buf: cutlass.Int32
-            last_flag: cutlass.Int32
             r_full_mbar_ptr: cutlass.Int64
             sC: cute.struct.Align[
                 cute.struct.MemRange[
@@ -360,7 +391,6 @@ class DepMxfp8StreamKGemm(Sm100BlockScaledPersistentDenseGemmKernel):
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         tmem_holding_buf = storage.tmem_holding_buf.ptr
-        last_flag = storage.last_flag.ptr
 
         a_pipeline = PipelineTmaUmma.create(
             barrier_storage=storage.a_full_mbar_ptr.data_ptr(),
@@ -739,41 +769,50 @@ class DepMxfp8StreamKGemm(Sm100BlockScaledPersistentDenseGemmKernel):
                 # no other split tile shares.
                 split_id = _cta_of(tile_first, total, grid)
                 parts = _cta_of(tile_first + k_blocks - 1, total, grid) - split_id + 1
-                acc_base = split_id * slot_elems
                 if partial & (self.ablate == 0):
-                    # Fire-and-forget FP32 reductions into the tile accumulator,
-                    # thread-major per element so every warp instruction is coalesced.
-                    for e in cutlass.range(num_epi, unroll=1):
-                        cute.copy(
-                            tiled_copy_t2r, tTR_tAcc[(None, None, None, e)], tTR_rAcc
-                        )
-                        for i in cutlass.range_constexpr(frag):
-                            # Result unused: ptxas emits red.global.add.f32.
-                            cute.arch.atomic_add(
-                                workspace.iterator
-                                + (acc_base + (e * frag + i) * epi_threads + tidx),
-                                tTR_rAcc[i],
-                                scope="gpu",
+                    if cta != split_id:
+                        # A helper part: its K range opens the CTA's run, so it ends
+                        # early. Store the FP32 accumulator in the CTA's slot with
+                        # plain coalesced stores and release the tile counter.
+                        slot_base = cta * slot_elems
+                        for e in cutlass.range(num_epi, unroll=1):
+                            cute.copy(
+                                tiled_copy_t2r,
+                                tTR_tAcc[(None, None, None, e)],
+                                tTR_rAcc,
                             )
-                    cute.arch.fence_acq_rel_gpu()
-                    cute.arch.barrier(
-                        barrier_id=self.epilog_sync_bar_id,
-                        number_of_threads=epi_threads,
-                    )
-                    if tidx == 0:
-                        old = cute.arch.atomic_add(
-                            counters.iterator + split_id, Int32(1), scope="gpu"
+                            for i in cutlass.range_constexpr(frag):
+                                workspace[
+                                    slot_base + (e * frag + i) * epi_threads + tidx
+                                ] = tTR_rAcc[i]
+                        cute.arch.fence_acq_rel_gpu()
+                        cute.arch.barrier(
+                            barrier_id=self.epilog_sync_bar_id,
+                            number_of_threads=epi_threads,
                         )
-                        flag = Int32(0)
-                        if old == parts - 1:
-                            flag = Int32(1)
-                        cute.arch.store(last_flag, flag)
-                    cute.arch.barrier(
-                        barrier_id=self.epilog_sync_bar_id,
-                        number_of_threads=epi_threads,
-                    )
-                    is_last = cute.arch.load(last_flag, Int32)
-                    cute.arch.fence_acq_rel_gpu()
+                        if tidx == 0:
+                            cute.arch.atomic_add(
+                                counters.iterator + split_id, Int32(1), scope="gpu"
+                            )
+                        is_last = Int32(0)
+                    else:
+                        # The owner holds the tile's first K range, the last segment
+                        # of its run: wait for the helpers (all CTAs are resident),
+                        # then reset the counter for the next launch.
+                        if tidx == 0:
+                            seen = cute.arch.atomic_add(
+                                counters.iterator + split_id, Int32(0), scope="gpu"
+                            )
+                            while seen < parts - 1:
+                                seen = cute.arch.atomic_add(
+                                    counters.iterator + split_id, Int32(0), scope="gpu"
+                                )
+                            counters[split_id] = Int32(0)
+                        cute.arch.barrier(
+                            barrier_id=self.epilog_sync_bar_id,
+                            number_of_threads=epi_threads,
+                        )
+                        cute.arch.fence_acq_rel_gpu()
                 if (is_last == 1) & (self.ablate < 2):
                     if cutlass.const_expr(self.residual):
                         cute.arch.barrier(
@@ -800,26 +839,51 @@ class DepMxfp8StreamKGemm(Sm100BlockScaledPersistentDenseGemmKernel):
                     bSG_gC = cute.group_modes(
                         bSG_gC_partitioned[(None, None, None, tile, 0, 0)], 1, 3
                     )
-                    for e in cutlass.range(num_epi, unroll=1):
-                        if partial:
-                            for i in cutlass.range_constexpr(frag):
-                                # .cg: other CTAs reduced into these during this launch.
-                                tTR_rAcc[i] = cute.arch.load(
-                                    workspace.iterator
-                                    + (acc_base + (e * frag + i) * epi_threads + tidx),
-                                    Float32,
-                                    cop="cg",
+                    # Split tiles: the helpers' partials for epilogue tile e + 1 are
+                    # loaded (plain loads, nothing waits on them) while tile e is
+                    # stored, so the L2 round trips overlap instead of adding up.
+                    helper = (
+                        cute.make_rmem_tensor((frag,), Float32),
+                        cute.make_rmem_tensor((frag,), Float32),
+                    )
+
+                    if partial:
+                        _gather_helpers(
+                            helper[0],
+                            workspace,
+                            split_id,
+                            parts,
+                            slot_elems,
+                            0,
+                            frag,
+                            epi_threads,
+                            tidx,
+                        )
+                    for e in cutlass.range_constexpr(num_epi):
+                        if cutlass.const_expr(e + 1 < num_epi):
+                            if partial:
+                                _gather_helpers(
+                                    helper[(e + 1) % 2],
+                                    workspace,
+                                    split_id,
+                                    parts,
+                                    slot_elems,
+                                    e + 1,
+                                    frag,
+                                    epi_threads,
+                                    tidx,
                                 )
+                        cute.copy(
+                            tiled_copy_t2r,
+                            tTR_tAcc[(None, None, None, e)],
+                            tTR_rAcc,
+                        )
+                        if partial:
+                            # Owner plus the helpers in CTA order: split tiles are
+                            # bitwise reproducible.
+                            cur = helper[e % 2]
                             for i in cutlass.range_constexpr(frag):
-                                workspace[
-                                    acc_base + (e * frag + i) * epi_threads + tidx
-                                ] = Float32(0.0)
-                        else:
-                            cute.copy(
-                                tiled_copy_t2r,
-                                tTR_tAcc[(None, None, None, e)],
-                                tTR_rAcc,
-                            )
+                                tTR_rAcc[i] = tTR_rAcc[i] + cur[i]
                         if cutlass.const_expr(self.residual):
                             tTR_sR_e = tTR_sR[(None, None, None, e)]
                             for i in cutlass.range_constexpr(frag):
@@ -846,9 +910,6 @@ class DepMxfp8StreamKGemm(Sm100BlockScaledPersistentDenseGemmKernel):
                             number_of_threads=epi_threads,
                         )
                         stores = stores + 1
-                    if partial:  # noqa: SIM102 (dynamic conditions cannot use `and`)
-                        if tidx == 0:
-                            counters[split_id] = Int32(0)
                 cute.arch.fence_view_async_tmem_load()
                 with cute.arch.elect_one():
                     acc_pipeline.consumer_release(acc_consumer)
