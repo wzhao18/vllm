@@ -11,6 +11,8 @@ then ``ceil(log2(amax / 448))`` block scales.
 
 import torch
 
+from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
+
 from vllm.triton_utils import tl, triton
 
 FP8_MAX = tl.constexpr(448.0)
@@ -70,6 +72,10 @@ def _situ_and_mul_mxfp8_kernel(
     HAS_LINEAR_BETA: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
+    # PDL: let the consuming GEMM start streaming its weights, then wait for
+    # this kernel's own inputs.
+    gdc_launch_dependents()
+    gdc_wait()
     pid_m = tl.program_id(0)
     pid_b = tl.program_id(1)
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -104,6 +110,10 @@ def _rms_norm_mxfp8_kernel(
     eps,
     BLOCK_H: tl.constexpr,
 ):
+    # PDL: let the consuming GEMM start streaming its weights, then wait for
+    # this kernel's own inputs.
+    gdc_launch_dependents()
+    gdc_wait()
     # One program per token: the RMS needs the whole row.
     m = tl.program_id(0)
     offs = tl.arange(0, BLOCK_H)
@@ -138,6 +148,10 @@ def _gated_rms_norm_mxfp8_kernel(
     D: tl.constexpr,
     HEADS: tl.constexpr,
 ):
+    # PDL: let the consuming GEMM start streaming its weights, then wait for
+    # this kernel's own inputs.
+    gdc_launch_dependents()
+    gdc_wait()
     # One program per (token, HEADS heads): RMS per head, then D / 32 MX blocks each.
     m = tl.program_id(0)
     heads = tl.program_id(1) * HEADS + tl.arange(0, HEADS)
@@ -183,6 +197,7 @@ def gated_rms_norm_mxfp8(
         D=d,
         HEADS=heads,
         num_warps=4,
+        launch_pdl=True,
     )
     return q, s
 
@@ -199,6 +214,10 @@ def _sigmoid_gate_mxfp8_kernel(
     k_tiles,
     BLOCKS: tl.constexpr,
 ):
+    # PDL: let the consuming GEMM start streaming its weights, then wait for
+    # this kernel's own inputs.
+    gdc_launch_dependents()
+    gdc_wait()
     # One program per (token, BLOCKS MX blocks).
     m = tl.program_id(0)
     offs = tl.program_id(1) * BLOCKS * 32 + tl.arange(0, BLOCKS * 32)
@@ -236,6 +255,7 @@ def sigmoid_gate_mxfp8(
         triton.cdiv(h // BLOCK, 4),
         BLOCKS=blocks,
         num_warps=4,
+        launch_pdl=True,
     )
     return q, s
 
@@ -266,6 +286,7 @@ def situ_and_mul_mxfp8(
         float(linear_beta or 0.0),
         HAS_LINEAR_BETA=linear_beta is not None,
         BLOCK_M=block_m,
+        launch_pdl=True,
     )
     return q, s
 
@@ -290,5 +311,6 @@ def rms_norm_mxfp8(
         triton.cdiv(h // BLOCK, 4),
         float(eps),
         BLOCK_H=triton.next_power_of_2(h),
+        launch_pdl=True,
     )
     return q, s
