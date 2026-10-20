@@ -99,7 +99,13 @@ class DepMoE:
             routed_scaling_factor=moe.routed_scaling_factor,
         )
 
-    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+    def __call__(
+        self,
+        x: torch.Tensor,
+        xq: torch.Tensor | None = None,
+        xs: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """``xq`` / ``xs``: ``x`` in MXFP8 when the producer already quantized it."""
         x = x.contiguous()
         # The router only feeds MegaMoE: on the aux stream it overlaps the whole
         # front GEMM -> activation -> shared down chain, not just the front GEMM.
@@ -109,7 +115,8 @@ class DepMoE:
             aux.wait_event(self.events[0])
             topk_weights, topk_ids = self._router(x)
             self.events[1].record(aux)
-        xq, xs = mxfp8_e4m3_quantize(x, is_sf_swizzled_layout=True)
+        if xq is None:
+            xq, xs = mxfp8_e4m3_quantize(x, is_sf_swizzled_layout=True)
         front = streamk_mxfp8_gemm(xq, xs, self.front_weight, self.front_scale)
         aq, a_s = situ_and_mul_mxfp8(
             front[:, self.latent :], self.beta, self.linear_beta

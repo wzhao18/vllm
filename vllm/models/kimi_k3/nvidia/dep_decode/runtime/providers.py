@@ -11,7 +11,9 @@ from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_update
 from vllm.models.common.ops import fused_q_kv_rmsnorm
 
+from ..gemm import streamk_mxfp8_gemm
 from ..kda_verify import KdaOutProj, MlaOutProj, kda_cute_verify
+from ..linear import fp8_rows
 from ..moe import DepMoE
 
 
@@ -40,10 +42,24 @@ class KdaAttention:
         weight = module.conv1d.weight
         self.conv_weight = weight.view(weight.size(0), weight.size(2))
         self.out_proj = KdaOutProj(module)
+        # The fused q/k/v/gate/f_a/beta projection on the MXFP8 layer input.
+        self.in_proj = fp8_rows(module.in_proj_qkvgfab)
 
-    def project(self, x):
+    def project(self, x, xq, xs):
         """(mixed_qkv [T, 3HK], g_proj [T, HK], f_b gate [T, HK], beta [T, H])."""
         m = self.module
+        sizes = [
+            3 * m.local_projection_size,
+            m.local_projection_size,
+            m.head_dim,
+            m.local_num_heads,
+        ]
+        if m.in_proj_padding:
+            sizes.append(m.in_proj_padding)
+        if self.in_proj is not None:
+            projected = streamk_mxfp8_gemm(xq, xs, *self.in_proj)
+            mixed, g_proj, f_a, beta, *_ = projected.split(sizes, dim=-1)
+            return mixed, g_proj, m.f_b_proj(f_a)[0], beta
         overlap = (
             0 < x.shape[0] <= m._projection_overlap_max_tokens
             and m._projection_events is not None
@@ -65,20 +81,12 @@ class KdaAttention:
                 [3 * m.local_projection_size, m.local_projection_size], dim=-1
             )
             return mixed, g_proj, gate, beta
-        sizes = [
-            3 * m.local_projection_size,
-            m.local_projection_size,
-            m.head_dim,
-            m.local_num_heads,
-        ]
-        if m.in_proj_padding:
-            sizes.append(m.in_proj_padding)
         mixed, g_proj, f_a, beta, *_ = m.in_proj_qkvgfab(x)[0].split(sizes, dim=-1)
         return mixed, g_proj, m.f_b_proj(f_a)[0], beta
 
-    def run(self, x, md, q):
+    def run(self, x, xq, xs, md, q):
         m = self.module
-        mixed, g_proj, gate, beta = self.project(x)
+        mixed, g_proj, gate, beta = self.project(x, xq, xs)
         tokens = md.num_actual_tokens
         conv_state, state, *records = m.kv_cache
         if not is_conv_state_dim_first():
@@ -133,10 +141,15 @@ class MlaAttention:
             module.q_lora_rank + module.kv_lora_rank + module.qk_rope_head_dim
         )
         self.out_proj = MlaOutProj(module)
+        self.qkv_a_g = fp8_rows(module.fused_qkv_a_g_proj)
 
-    def run(self, x, md, positions, core, capacity):
+    def run(self, x, xq, xs, md, positions, core, capacity):
         m = self.module
-        qkv, gate = m.fused_qkv_a_g_proj(x)[0].split(
+        if self.qkv_a_g is not None:
+            projected = streamk_mxfp8_gemm(xq, xs, *self.qkv_a_g)
+        else:
+            projected = m.fused_qkv_a_g_proj(x)[0]
+        qkv, gate = projected.split(
             [self.qkv_rows, m.num_local_heads * m.v_head_dim], dim=-1
         )
         q_c, kv_c, k_pe = qkv.split(

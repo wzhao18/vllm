@@ -14,6 +14,9 @@ def fp8_rows(linear: nn.Module) -> tuple[torch.Tensor, torch.Tensor] | None:
     if weight is None or scale is None or weight.dtype != torch.float8_e4m3fn:
         return None
     weight = weight.t()
-    if not weight.is_contiguous() or scale.dim() != 1 or weight.shape[0] % 128:
+    n, k = weight.shape
+    # Scales cover whole 128-row tiles (zero-padded past N).
+    padded = -(-n // 128) * 128 * (k // 32)
+    if not weight.is_contiguous() or scale.dim() != 1 or scale.numel() != padded:
         return None
     return weight, scale

@@ -19,9 +19,11 @@ from vllm.utils.math_utils import round_up
 
 from ...specialized_decode.cutedsl.attn_res.prepared import PreparedAttnRes
 from ...specialized_decode.runtime.decode import decode_metadata
+from ..cutedsl.attn_res import Mxfp8AttnRes, mxfp8_buffers
 from ..gemm import MAX_TILE_N
 from ..kda_verify import bind_state_commit
 from ..mla import WaveMla
+from ..moe import DepMoE
 from .providers import (
     KdaAttention,
     MlaAttention,
@@ -38,7 +40,7 @@ class Step(NamedTuple):
     positions: torch.Tensor
 
 
-def post_attention_res(layer):
+def post_attention_res(layer, mxfp8):
     """The AttnRes between attention and MLP. At a block-write layer the attention
     output starts the new block: it replaces the prefix instead of adding to it."""
     weights = (
@@ -52,7 +54,7 @@ def post_attention_res(layer):
         layer.mlp_res_norm.variance_epsilon,
         layer.post_attention_layernorm.variance_epsilon,
     )
-    return PreparedAttnRes(weights, key, eps)
+    return (Mxfp8AttnRes if mxfp8 else PreparedAttnRes)(weights, key, eps)
 
 
 class DepDecode:
@@ -70,10 +72,17 @@ class DepDecode:
         self.attention = {d.layer_idx: make_attention(d) for d in layers}
         self.feed_forward = {d.layer_idx: make_feed_forward(d) for d in layers}
         self.before = {
-            d.layer_idx: PreparedAttnRes.for_target(d, has_delta=d is not layers[0])
+            d.layer_idx: Mxfp8AttnRes.for_target(d, has_delta=d is not layers[0])
             for d in layers
         }
-        self.after = {d.layer_idx: post_attention_res(d) for d in layers}
+        # The AttnRes before attention, and before the MoE block, also write the
+        # MXFP8 copy of their output that the next projection reads.
+        self.after = {
+            d.layer_idx: post_attention_res(
+                d, isinstance(self.feed_forward[d.layer_idx], DepMoE)
+            )
+            for d in layers
+        }
         # The final AttnRes also applies the backbone's final norm.
         self.final = PreparedAttnRes.for_target(backbone, final=True)
         # One wave-scheduled MLA core (and split plan per step) for every MLA layer.
@@ -117,7 +126,6 @@ class DepDecode:
         from ..gemm import StreamKScratch, _compile
         from ..kda_verify import _compile as compile_verify
         from ..kda_verify import compile_state_commit
-        from ..moe import DepMoE
 
         embed = self.backbone.embed_tokens.weight
         device, dtype = embed.device, embed.dtype
@@ -237,6 +245,7 @@ class DepDecode:
         prefix = torch.empty_like(x)
         blocks = x.new_empty((b, self.backbone.num_attn_res_blocks, hidden))
         normed = torch.empty_like(x)
+        xq, xs = mxfp8_buffers(b, x.device)
         delta = x  # the first AttnRes takes the embeddings as its prefix
         if self.mla_core is not None:
             # Every MLA layer reads the same lengths: one split plan per step.
@@ -244,16 +253,23 @@ class DepDecode:
             capacity = self.mla_core.plan(md.decode.seq_lens, step.q)
         for layer, md in zip(self.layers, step.metadata):
             index = layer.layer_idx
-            self.before[index].run(delta, prefix, blocks, normed, aux.get(index))
+            self.before[index].run(
+                delta, prefix, blocks, normed, xq, xs, aux.get(index)
+            )
             attention = self.attention[index]
             if isinstance(attention, KdaAttention):
-                attn_out = attention.run(normed, md, step.q)
+                attn_out = attention.run(normed, xq, xs, md, step.q)
             else:
                 attn_out = attention.run(
-                    normed, md, step.positions, self.mla_core, capacity
+                    normed, xq, xs, md, step.positions, self.mla_core, capacity
                 )
-            self.after[index].run(attn_out, prefix, blocks, normed)
-            delta = self.feed_forward[index](normed)
+            feed_forward = self.feed_forward[index]
+            if isinstance(feed_forward, DepMoE):
+                self.after[index].run(attn_out, prefix, blocks, normed, xq, xs)
+                delta = feed_forward(normed, xq, xs)
+            else:
+                self.after[index].run(attn_out, prefix, blocks, normed)
+                delta = feed_forward(normed)
         self.final.run(
             delta, prefix, blocks, out, aux.get(self.layers[-1].layer_idx + 1)
         )
