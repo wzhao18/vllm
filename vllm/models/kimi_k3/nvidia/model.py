@@ -122,6 +122,7 @@ from ..common.mm_preprocess import (
     KimiK3MultiModalProcessor,
     KimiK3ProcessingInfo,
 )
+from .dep_decode.runtime import DepDecodeConfig, dep_decode_config
 from .specialized_decode.runtime import specialized_decode_config
 
 if TYPE_CHECKING:
@@ -1434,18 +1435,25 @@ class KimiLinearForCausalLM(
         )
         # decode_backend=latency_specialized: a specialized decode executor over
         # self.model, built by the model state once the weights are loaded.
-        self.specialized_decode_config = specialized_decode_config(vllm_config)
+        # decode_backend=dep_throughput: the DEP decode executor (dep_decode/) instead.
+        self.specialized_decode_config = specialized_decode_config(
+            vllm_config
+        ) or dep_decode_config(vllm_config)
         self.specialized_decode: SpecializedDecode | None = None
         # The final norm is applied in compute_logits unless the specialized decode
         # applies it in forward.
         self.needs_norm_in_logits = True
 
     def build_specialized_decode(self) -> None:
-        from .specialized_decode.runtime.decode import SpecializedDecode
+        config = self.specialized_decode_config
+        if isinstance(config, DepDecodeConfig):
+            from .dep_decode.runtime.decode import DepDecode
 
-        self.specialized_decode = SpecializedDecode(
-            self.model, self.specialized_decode_config
-        )
+            self.specialized_decode = DepDecode(self.model, config)
+        else:
+            from .specialized_decode.runtime.decode import SpecializedDecode
+
+            self.specialized_decode = SpecializedDecode(self.model, config)
         # From here on forward() returns normalized hidden states on every step: the
         # specialized decode's last AttnRes applies the norm, and forward() applies it
         # to each step that falls back to the stock forward (prefills, larger batches,

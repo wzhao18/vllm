@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Kimi-K3 RecoverSSM speculative verify and accepted-state recovery."""
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -754,6 +754,9 @@ class KDARecoverSSMCommitContext:
     dt_bias: torch.Tensor
     lower_bound: float | None
     spec_query_len: int
+    # Optional replacement for the state fold of a prepared plan (non-aligned
+    # mode): ``state_commit(context, state_indices, batch)``.
+    state_commit: Callable[..., None] | None = None
 
     @classmethod
     def create(
@@ -1010,6 +1013,9 @@ class KDARecoverSSMCommitContext:
             num_warps=4,
         )
 
+        if self.state_commit is not None and block_table is None:
+            self.state_commit(self, state_indices, batch)
+            return
         state_ref = self.checkpoints[0]
         _, num_heads, value_dim, key_dim = state_ref.shape
         block_k = triton.next_power_of_2(key_dim)

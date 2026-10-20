@@ -26,6 +26,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.models.common.ops.fused_allreduce_rms_norm import fused_allreduce_rms_norm
+from vllm.models.kimi_k3.nvidia.dep_decode.runtime import dep_decode_config
 from vllm.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
 from vllm.models.kimi_k3.nvidia.model import KimiMLP
 from vllm.utils.torch_utils import is_quantized_kv_cache
@@ -462,6 +463,8 @@ class K3DSparkForCausalLM(nn.Module):
             self.hf_to_vllm_mapper = self.hf_to_vllm_mapper | WeightsMapper(
                 orig_to_new_substr={"confidence_head": "confidence_head"}
             )
+        # decode_backend=dep_throughput: MXFP8 draft projections (dep_decode/draft.py).
+        self.dep_decode = dep_decode_config(vllm_config) is not None
         target_layer_num = vllm_config.model_config.get_total_num_hidden_layers()
         self.model = K3DSparkModel(
             vllm_config=vllm_config,
@@ -504,9 +507,19 @@ class K3DSparkForCausalLM(nn.Module):
     ) -> torch.Tensor:
         return self.model(input_ids, positions, inputs_embeds)
 
+    def __setattr__(self, name: str, value) -> None:
+        super().__setattr__(name, value)
+        # The target's LM head is shared after loading; the DEP backend drafts
+        # with an MXFP8 copy of it (dep_decode/draft.py).
+        if name == "lm_head" and value is not None and self.dep_decode:
+            from .dep_decode.draft import Mxfp8LogitsHead
+
+            object.__setattr__(self, "dep_lm_head", Mxfp8LogitsHead(value))
+
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         assert self.lm_head is not None
-        return self.logits_processor(self.lm_head, hidden_states)
+        head = getattr(self, "dep_lm_head", None) or self.lm_head
+        return self.logits_processor(head, hidden_states)
 
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.compute_logits(hidden_states)
@@ -535,3 +548,7 @@ class K3DSparkForCausalLM(nn.Module):
 
     def process_weights_after_loading(self) -> None:
         self.model._build_fused_context_kv_metadata()
+        if self.dep_decode:
+            from .dep_decode.draft import quantize_draft
+
+            quantize_draft(self.model)
