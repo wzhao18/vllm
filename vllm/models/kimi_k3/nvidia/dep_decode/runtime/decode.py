@@ -20,6 +20,7 @@ from vllm.utils.math_utils import round_up
 from ...specialized_decode.cutedsl.attn_res.prepared import PreparedAttnRes
 from ...specialized_decode.runtime.decode import decode_metadata
 from ..gemm import MAX_TILE_N
+from ..kda_verify import bind_state_commit
 from ..mla import WaveMla
 from .providers import (
     KdaAttention,
@@ -115,6 +116,7 @@ class DepDecode:
         )
         from ..gemm import StreamKScratch, _compile
         from ..kda_verify import _compile as compile_verify
+        from ..kda_verify import compile_state_commit
         from ..moe import DepMoE
 
         embed = self.backbone.embed_tokens.weight
@@ -129,6 +131,7 @@ class DepDecode:
         if kda:
             heads = kda[0].module.local_num_heads
             compile_verify(heads, self.q, architecture(device))
+            compile_state_commit(kda[0].module, self.q)
 
         def zeros(*shape):
             return torch.zeros(*shape, device=device, dtype=dtype)
@@ -207,6 +210,18 @@ class DepDecode:
         metadata = [decode_metadata(d.self_attn, context, q, b) for d in self.layers]
         if any(md is None for md in metadata):
             return None
+        # KDA verify steps fold the accepted tokens in after sampling: with the
+        # backend's CuTe commit (the context is shared by every KDA layer).
+        contexts = {
+            id(c): c
+            for md in metadata
+            if (c := getattr(md, "recoverssm_context", None))
+        }
+        for context in contexts.values():
+            if not bind_state_commit(context):
+                logger.warning_once(
+                    "Kimi K3 DEP decode keeps the stock RecoverSSM commit"
+                )
         logger.info_once("Kimi K3 DEP decode runs %d-token verify steps", b)
         return Step(q, metadata, positions)
 

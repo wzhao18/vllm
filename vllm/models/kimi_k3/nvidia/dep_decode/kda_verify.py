@@ -91,8 +91,12 @@ def kda_cute_verify(
     return out
 
 
+_compiled_commits: set = set()
+
+
 @cache
 def _compile_commit(heads: int, window: int, arch: str, param_dtype: torch.dtype):
+    _compiled_commits.add((heads, window, arch, param_dtype))
     kernel = KdaCommit(heads, window)
     i32, i64 = torch.int32, torch.int64
     fakes = (
@@ -159,17 +163,33 @@ def kda_cute_commit(context, state_indices: torch.Tensor, batch: int) -> None:
     )
 
 
-def install_state_commit(context) -> None:
-    """Fold RecoverSSM commits with the CuTe kernel (compiled here, outside graph
-    capture)."""
-    state = context.checkpoints[0]
+def compile_state_commit(module, window: int) -> None:
+    """Compile the RecoverSSM state commit for ``module``'s KDA layers (outside
+    graph capture)."""
     _compile_commit(
+        module.local_num_heads,
+        window,
+        architecture(module.A_log.device),
+        module.A_log.dtype,
+    )
+
+
+def bind_state_commit(context) -> bool:
+    """Fold the RecoverSSM commits of ``context`` with the CuTe kernel (compiled by
+    ``compile_state_commit``). Returns whether it is bound."""
+    if context.state_commit is not None:
+        return True
+    state = context.checkpoints[0]
+    key = (
         state.shape[1],
         context.spec_query_len,
         architecture(state.device),
         context.A_log.dtype,
     )
+    if key not in _compiled_commits:
+        return False  # never compile under capture: keep the stock commit
     context.state_commit = kda_cute_commit
+    return True
 
 
 class KdaOutProj:

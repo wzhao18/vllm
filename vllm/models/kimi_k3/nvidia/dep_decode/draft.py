@@ -114,3 +114,26 @@ class Mxfp8LogitsHead(nn.Module):
         self.quant_method = _Mxfp8HeadMethod(self)
         # Not a submodule: the head's weights belong to the target.
         object.__setattr__(self, "stock", stock)
+
+
+class _DraftLogitsProcessor(nn.Module):
+    """The draft's logits processor over a draft-only MXFP8 copy of the LM head it
+    is given (the target's, shared after loading), built on first use: the eager
+    warmup steps, before any graph capture."""
+
+    def __init__(self, stock: nn.Module):
+        super().__init__()
+        self.stock = stock
+        self.heads: dict[int, Mxfp8LogitsHead] = {}
+
+    def forward(self, lm_head: nn.Module, hidden_states: torch.Tensor, *args, **kwargs):
+        head = self.heads.get(id(lm_head))
+        if head is None:
+            head = self.heads[id(lm_head)] = Mxfp8LogitsHead(lm_head)
+        return self.stock(head, hidden_states, *args, **kwargs)
+
+
+def install_draft(model: nn.Module) -> None:
+    """Run the DSpark draft ``model`` on MXFP8 projections and LM head."""
+    quantize_draft(model.model)
+    model.logits_processor = _DraftLogitsProcessor(model.logits_processor)

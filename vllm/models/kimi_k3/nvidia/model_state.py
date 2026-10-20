@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Kimi K3's model runner state: the hybrid (KDA + MLA) state, plus the lifecycle of
-the decode executor ``decode_backend`` selects (``latency_specialized`` or
-``dep_throughput``)."""
+the specialized decode when ``decode_backend=latency_specialized`` selects it."""
 
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 
