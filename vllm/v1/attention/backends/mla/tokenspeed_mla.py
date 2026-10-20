@@ -58,14 +58,58 @@ def _plan_proportional_split_counts(
     tl.store(counts_ptr + offsets, counts.to(tl.int32), offsets < num_reqs)
 
 
+# Wave plans keep the fewest waves that fill at least this fraction of the
+# GPU's concurrent clusters, otherwise one more wave.
+_MIN_WAVE_FILL = 0.9
+
+
+@triton.jit
+def _wave_counts(lengths, mask, total, num_reqs, budget, max_splits):
+    # One split each, plus the remaining budget in proportion to length.
+    extra = tl.floor(lengths * (budget - num_reqs) / total)
+    counts = tl.minimum(1.0 + extra, max_splits)
+    return counts, tl.sum(tl.where(mask, counts, 0.0), 0)
+
+
+@triton.jit(do_not_specialize=["num_reqs", "slots", "query_tiles", "max_splits"])
+def _plan_wave_split_counts(
+    seq_lens_ptr,
+    counts_ptr,
+    num_reqs,
+    slots,
+    query_tiles,
+    max_splits,
+    min_fill,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Split counts for ``waves`` of ``slots`` concurrent clusters (one cluster
+    per split and query tile): the fewest waves that hold one split per request,
+    unless they would be less than ``min_fill`` full."""
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < num_reqs
+    lengths = tl.load(seq_lens_ptr + offsets, mask, other=0).to(tl.float32)
+    total = tl.maximum(tl.sum(lengths, 0), 1.0)
+    waves = (num_reqs * query_tiles + slots - 1) // slots
+    budget = (waves * slots) // query_tiles
+    counts, used = _wave_counts(lengths, mask, total, num_reqs, budget, max_splits)
+    more, _ = _wave_counts(
+        lengths, mask, total, num_reqs, ((waves + 1) * slots) // query_tiles, max_splits
+    )
+    counts = tl.where(used * query_tiles >= min_fill * waves * slots, counts, more)
+    tl.store(counts_ptr + offsets, counts.to(tl.int32), mask)
+
+
 def _prepare_proportional_splits(
     query: torch.Tensor,
     seq_lens: torch.Tensor,
     workspace: torch.Tensor,
     kv_lora_rank: int,
     min_split_kv: int,
+    waves: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None, int | None]:
-    """Plan counts in the existing workspace, with no host synchronization."""
+    """Plan counts in the existing workspace, with no host synchronization.
+    ``waves`` plans whole waves of concurrent clusters instead of a fixed
+    per-request budget."""
     from tokenspeed_mla import get_num_sm, select_mla_decode_tilers
 
     batch, query_len, heads = query.shape[:3]
@@ -96,6 +140,18 @@ def _prepare_proportional_splits(
     if max_splits <= splits_per_request:
         return workspace, None, None
     counts = workspace[-count_bytes:].view(torch.int32)[:batch]
+    if waves:
+        _plan_wave_split_counts[(1,)](
+            seq_lens,
+            counts,
+            batch,
+            get_num_sm(query.device) // ctas_per_tile,
+            query_tiles,
+            max_splits,
+            _MIN_WAVE_FILL,
+            BLOCK_SIZE=triton.next_power_of_2(max(128, batch)),
+        )
+        return scratch, counts, max_splits
     _plan_proportional_split_counts[(1,)](
         seq_lens,
         counts,
@@ -394,9 +450,14 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
             self._max_decode_tokens,
         )
         split_options: dict[str, Any] = {}
-        if self._split_kv_policy == "proportional":
+        if self._split_kv_policy in ("proportional", "waves"):
             workspace, split_counts, split_capacity = _prepare_proportional_splits(
-                q, seq_lens, workspace, self.kv_lora_rank, self._min_split_kv
+                q,
+                seq_lens,
+                workspace,
+                self.kv_lora_rank,
+                self._min_split_kv,
+                waves=self._split_kv_policy == "waves",
             )
             if split_counts is not None:
                 split_options = {
