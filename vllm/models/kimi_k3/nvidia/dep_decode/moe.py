@@ -11,7 +11,7 @@ that read ``x`` run as one stream-K GEMM over a concatenated weight
 (``[down | shared_gate_up]``, N = 3584 + 12288), the shared expert finishes before
 MegaMoE, and the up projection adds the shared output in its epilogue:
 
-    q(x) -> front GEMM ‖ router -> act+q -> shared_down
+    q(x) -> front GEMM -> act+q -> shared_down  ‖  router (aux stream)
          -> MegaMoE(front[:, :3584]) -> norm+q -> up GEMM (+ shared)
 
 The concatenated weight replaces the two stock weights: those modules keep views
@@ -25,7 +25,6 @@ from torch import nn
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     mxfp8_e4m3_quantize,
 )
-from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 
 from .elementwise import rms_norm_mxfp8, situ_and_mul_mxfp8
 from .gemm import MAX_TILE_N, streamk_mxfp8_gemm
@@ -102,18 +101,21 @@ class DepMoE:
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         x = x.contiguous()
+        # The router only feeds MegaMoE: on the aux stream it overlaps the whole
+        # front GEMM -> activation -> shared down chain, not just the front GEMM.
+        main, aux = torch.cuda.current_stream(), self.moe._down_proj_stream
+        self.events[0].record(main)
+        with torch.cuda.stream(aux):
+            aux.wait_event(self.events[0])
+            topk_weights, topk_ids = self._router(x)
+            self.events[1].record(aux)
         xq, xs = mxfp8_e4m3_quantize(x, is_sf_swizzled_layout=True)
-        front, (topk_weights, topk_ids) = maybe_execute_in_parallel(
-            lambda: streamk_mxfp8_gemm(xq, xs, self.front_weight, self.front_scale),
-            lambda: self._router(x),
-            self.events[0],
-            self.events[1],
-            self.moe._down_proj_stream,
-        )
+        front = streamk_mxfp8_gemm(xq, xs, self.front_weight, self.front_scale)
         aq, a_s = situ_and_mul_mxfp8(
             front[:, self.latent :], self.beta, self.linear_beta
         )
         shared = streamk_mxfp8_gemm(aq, a_s, *self.shared_down)
+        main.wait_event(self.events[1])
         routed = self.moe.experts(front[:, : self.latent], topk_weights, topk_ids)
         rq, r_s = rms_norm_mxfp8(routed, self.norm_weight, self.norm_eps)
         return streamk_mxfp8_gemm(rq, r_s, *self.up, residual=shared)
