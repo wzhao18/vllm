@@ -22,7 +22,7 @@ from ...specialized_decode.runtime.decode import decode_metadata
 from ..cutedsl.attn_res import Mxfp8AttnRes, mxfp8_buffers
 from ..gemm import MAX_TILE_N
 from ..kda_verify import bind_state_commit
-from ..mla import WaveMla
+from ..mla import MlaCore
 from ..moe import DepMoE
 from .providers import (
     KdaAttention,
@@ -96,7 +96,9 @@ class DepDecode:
             ),
             None,
         )
-        self.mla_core = WaveMla(mla[0].module, max(self.batches)) if mla else None
+        self.mla_core = (
+            MlaCore(mla[0].module, max(self.batches), self.q) if mla else None
+        )
         # The AttnRes entering each aux layer (or the final one) also stores the
         # updated prefix: the stock aux stream (prefix sum plus the last MLP output).
         self.aux_layers = tuple(backbone.aux_hidden_state_layers)
@@ -180,6 +182,7 @@ class DepDecode:
         module = self.layers[self.mla_index].self_attn
         if module.kv_cache.numel() == 0:
             return
+        self.mla_core.bind(module)
         for b in self.batches:
             self.mla_core.warm_up(module, b // self.q, self.q)
         torch.cuda.synchronize(module.kv_cache.device)
@@ -251,7 +254,7 @@ class DepDecode:
         if self.mla_core is not None:
             # Every MLA layer reads the same lengths: one split plan per step.
             md = step.metadata[self.mla_index]
-            capacity = self.mla_core.plan(md.decode.seq_lens, step.q)
+            self.mla_core.plan(md.decode.seq_lens)
         for layer, md in zip(self.layers, step.metadata):
             index = layer.layer_idx
             self.before[index].run(
@@ -264,7 +267,7 @@ class DepDecode:
                 attn_out = attention.run(normed, xq, xs, md, step.q)
             else:
                 attn_out = attention.run(
-                    normed, xq, xs, md, step.positions, self.mla_core, capacity
+                    normed, xq, xs, md, step.positions, self.mla_core
                 )
             feed_forward = self.feed_forward[index]
             if isinstance(feed_forward, DepMoE):

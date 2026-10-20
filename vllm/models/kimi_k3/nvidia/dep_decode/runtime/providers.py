@@ -144,7 +144,7 @@ class KdaAttention:
 class MlaAttention:
     """An MLA layer's decode or verify step: the fused q-LoRA / KV-A / gate
     projection, the q / KV norms and q up-projection, the latent cache insert, the
-    backend's wave-scheduled MLA core (``WaveMla``), the V up-projection, then the
+    backend's MLA core (``MlaCore``), the V up-projection, then the
     fused sigmoid gate, MXFP8 quantization and o-proj."""
 
     def __init__(self, module):
@@ -157,7 +157,7 @@ class MlaAttention:
         self.out_proj = MlaOutProj(module)
         self.qkv_a_g = fp8_rows(module.fused_qkv_a_g_proj)
 
-    def run(self, x, xq, xs, md, positions, core, capacity):
+    def run(self, x, xq, xs, md, positions, core):
         m = self.module
         if self.qkv_a_g is not None:
             projected = streamk_mxfp8_gemm(xq, xs, *self.qkv_a_g)
@@ -191,5 +191,5 @@ class MlaAttention:
             get_forward_context().slot_mapping[m.layer_name][: x.shape[0]],
         )
         out = x.new_empty((x.shape[0], m.num_local_heads * m.v_head_dim))
-        m._v_up_proj(core(m, query, md, capacity), out=out)
+        m._v_up_proj(core(m, query, md), out=out)
         return self.out_proj(out, gate)
