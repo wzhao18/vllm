@@ -26,6 +26,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.models.common.ops.fused_allreduce_rms_norm import fused_allreduce_rms_norm
+from vllm.models.kimi_k3.nvidia.dep_decode import dep_decode_enabled
 from vllm.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
 from vllm.models.kimi_k3.nvidia.model import KimiMLP
 from vllm.utils.torch_utils import is_quantized_kv_cache
@@ -462,6 +463,8 @@ class K3DSparkForCausalLM(nn.Module):
             self.hf_to_vllm_mapper = self.hf_to_vllm_mapper | WeightsMapper(
                 orig_to_new_substr={"confidence_head": "confidence_head"}
             )
+        # dep_decode_backend=fused: MXFP8 draft projections (dep_decode/draft.py).
+        self.dep_decode = dep_decode_enabled(vllm_config)
         target_layer_num = vllm_config.model_config.get_total_num_hidden_layers()
         self.model = K3DSparkModel(
             vllm_config=vllm_config,
@@ -535,3 +538,7 @@ class K3DSparkForCausalLM(nn.Module):
 
     def process_weights_after_loading(self) -> None:
         self.model._build_fused_context_kv_metadata()
+        if self.dep_decode:
+            from .dep_decode.draft import quantize_draft
+
+            quantize_draft(self.model)
