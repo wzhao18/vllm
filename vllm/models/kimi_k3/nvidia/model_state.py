@@ -18,6 +18,8 @@ class KimiK3ModelState(MambaHybridModelState):
         self.language_model = model
         if model.specialized_decode_config is not None:
             model.build_specialized_decode()
+        if model.dep_decode_enabled:
+            model.build_dep_decode()
 
     def initialize_kv_cache(self, kv_cache_config, block_tables):
         super().initialize_kv_cache(kv_cache_config, block_tables)
