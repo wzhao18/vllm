@@ -7,7 +7,8 @@ expert-parallel MegaMoE (TP1 attention, EP over the DP ranks), enabled by
 Like the latency specialized decode (``specialized_decode/``), it runs every layer of a
 planned decode step from prepared providers and falls back to the stock forward
 otherwise; it targets the throughput end instead: TP1 projections, which are weight
-streaming bound, on the backend's own MXFP8 weights, KDA verify with RecoverSSM, and
+streaming bound, on the backend's own MXFP8 weights, KDA verify with RecoverSSM (the
+stock KDA layer without it), and
 the MegaMoE block. Unlike the TP backend, its ranks share no mailboxes: each DP rank
 may take either path on any step, since both run the same MegaMoE collective.
 """
@@ -100,11 +101,6 @@ def unsupported(vllm_config) -> str | None:
         (
             spec is not None and spec.num_speculative_tokens > 7,
             "more than 7 speculative tokens",
-        ),
-        # KDA verify steps fold accepted tokens in after sampling (RecoverSSM).
-        (
-            spec is not None and not vllm_config.cache_config.use_kda_recoverssm,
-            "speculative decoding without RecoverSSM (--use-replayssm)",
         ),
         (
             not str(vllm_config.cache_config.cache_dtype).startswith("fp8"),

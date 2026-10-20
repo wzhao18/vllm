@@ -20,8 +20,22 @@ from ..moe import DepMoE
 def make_attention(layer):
     attention = layer.self_attn
     if hasattr(attention, "in_proj_qkvgfab"):
-        return KdaAttention(attention)
+        if attention.use_recoverssm:
+            return KdaAttention(attention)
+        return StockKdaAttention(attention)
     return MlaAttention(attention)
+
+
+class StockKdaAttention:
+    """A KDA layer without RecoverSSM (e.g. P/D disaggregation, whose KV
+    connectors do not support it): the stock module, verifying with per-draft
+    states."""
+
+    def __init__(self, module):
+        self.module = module
+
+    def run(self, x, positions):
+        return self.module(hidden_states=x, positions=positions)
 
 
 def make_feed_forward(layer):

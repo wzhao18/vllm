@@ -27,6 +27,7 @@ from ..moe import DepMoE
 from .providers import (
     KdaAttention,
     MlaAttention,
+    StockKdaAttention,
     make_attention,
     make_feed_forward,
 )
@@ -134,7 +135,7 @@ class DepDecode:
             for residual in (False, True):
                 _compile(tile_n, residual, 4)
         kda = [a for a in self.attention.values() if isinstance(a, KdaAttention)]
-        mla = [a for a in self.attention.values() if not isinstance(a, KdaAttention)]
+        mla = [a for a in self.attention.values() if isinstance(a, MlaAttention)]
         moe = [f for f in self.feed_forward.values() if isinstance(f, DepMoE)]
         if kda:
             heads = kda[0].module.local_num_heads
@@ -257,7 +258,9 @@ class DepDecode:
                 delta, prefix, blocks, normed, xq, xs, aux.get(index)
             )
             attention = self.attention[index]
-            if isinstance(attention, KdaAttention):
+            if isinstance(attention, StockKdaAttention):
+                attn_out = attention.run(normed, step.positions)
+            elif isinstance(attention, KdaAttention):
                 attn_out = attention.run(normed, xq, xs, md, step.q)
             else:
                 attn_out = attention.run(
