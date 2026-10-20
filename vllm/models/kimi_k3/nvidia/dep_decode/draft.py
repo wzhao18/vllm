@@ -2,11 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """MXFP8 projections for the BF16 DSpark draft model on DEP decode.
 
-The draft's dense projections are weight-bandwidth bound at decode batch sizes, so
-their BF16 weights are replaced by MXFP8 copies (1x32 E8M0 block scales, the
-online-MXFP8 layout). Decode-sized batches run the stream-K GEMM; larger ones run
-FlashInfer's MXFP8 GEMM. Only the drafted tokens can change, never the verified
-output.
+The draft's dense projections and its LM head (shared with the target) are
+weight-bandwidth bound at decode batch sizes, so the draft runs them on MXFP8
+weights (1x32 E8M0 block scales, the online-MXFP8 layout): its own projections are
+replaced, the shared LM head gets a draft-only copy. Decode-sized batches run the
+stream-K GEMM; larger ones run FlashInfer's MXFP8 GEMM (projections) or the BF16
+head. Only the drafted tokens can change, never the verified output.
 """
 
 import torch
@@ -77,3 +78,39 @@ def quantize_draft(model: nn.Module) -> list[str]:
         names.append(name)
     torch.cuda.empty_cache()
     return names
+
+
+class _Mxfp8HeadMethod:
+    def __init__(self, head: "Mxfp8LogitsHead"):
+        self.head = head
+
+    def apply(self, layer, x: torch.Tensor, bias: torch.Tensor | None = None):
+        assert bias is None
+        head = self.head
+        if 0 < x.shape[0] <= MAX_TILE_N:
+            xq, xs = mxfp8_e4m3_quantize(x.contiguous(), is_sf_swizzled_layout=True)
+            return streamk_mxfp8_gemm(xq, xs, head.weight_fp8, head.scale)
+        stock = head.stock
+        return stock.quant_method.apply(stock, x, bias=bias)
+
+
+class Mxfp8LogitsHead(nn.Module):
+    """A draft-only MXFP8 copy of the target's LM head, in the interface
+    ``LogitsProcessor`` reads (``quant_method.apply``, ``tp_size``)."""
+
+    def __init__(self, stock: nn.Module):
+        super().__init__()
+        assert getattr(stock, "tp_size", 1) == 1
+        weight = stock.weight.data
+        rows = -(-weight.shape[0] // 128) * 128
+        if rows != weight.shape[0]:
+            weight = torch.nn.functional.pad(weight, (0, 0, 0, rows - weight.shape[0]))
+        self.weight_fp8, scale = mxfp8_e4m3_quantize(
+            weight.contiguous(), is_sf_swizzled_layout=True
+        )
+        self.scale = scale.reshape(-1)
+        self.vocab = stock.weight.shape[0]
+        self.tp_size = 1
+        self.quant_method = _Mxfp8HeadMethod(self)
+        # Not a submodule: the head's weights belong to the target.
+        object.__setattr__(self, "stock", stock)

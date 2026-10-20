@@ -507,9 +507,19 @@ class K3DSparkForCausalLM(nn.Module):
     ) -> torch.Tensor:
         return self.model(input_ids, positions, inputs_embeds)
 
+    def __setattr__(self, name: str, value) -> None:
+        super().__setattr__(name, value)
+        # The target's LM head is shared after loading; the DEP backend drafts
+        # with an MXFP8 copy of it (dep_decode/draft.py).
+        if name == "lm_head" and value is not None and self.dep_decode:
+            from .dep_decode.draft import Mxfp8LogitsHead
+
+            object.__setattr__(self, "dep_lm_head", Mxfp8LogitsHead(value))
+
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         assert self.lm_head is not None
-        return self.logits_processor(self.lm_head, hidden_states)
+        head = getattr(self, "dep_lm_head", None) or self.lm_head
+        return self.logits_processor(head, hidden_states)
 
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.compute_logits(hidden_states)
