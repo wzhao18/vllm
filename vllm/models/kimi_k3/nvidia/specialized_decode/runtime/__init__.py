@@ -21,10 +21,13 @@ def specialized_decode_config(vllm_config) -> DecodeConfig | None:
     Raises when the specialized decode is requested for an unsupported deployment."""
     extra = vllm_config.additional_config
     backend = extra.get("decode_backend", "auto") if isinstance(extra, dict) else "auto"
-    if backend == "auto":
+    if backend in ("auto", "dep_throughput"):
         return None
     if backend != "latency_specialized":
-        raise ValueError("Supported decode_backend values are auto/latency_specialized")
+        raise ValueError(
+            "Supported decode_backend values are "
+            "auto/latency_specialized/dep_throughput"
+        )
     reason = unsupported(vllm_config)
     if reason is not None:
         raise ValueError(f"Kimi K3 specialized decode does not support {reason}")

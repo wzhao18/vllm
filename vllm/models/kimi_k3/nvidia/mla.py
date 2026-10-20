@@ -297,8 +297,6 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
-        # dep_decode_backend=fused: fused gate + MXFP8 o_proj (dep_decode MlaOutProj).
-        self.dep_out_proj = None
         self.gemm_rs_ar = None
         if run_gemm_rs_ar:
             from vllm.model_executor.kernels.linear.cute_dsl.gemm_rs_ar import (
@@ -624,9 +622,6 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         else:
             attn_out, gate = self._forward_q_lora(positions, hidden_states)
 
-        dep_out = self.dep_out_proj
-        if gate is not None and dep_out is not None and dep_out.supports(len(gate)):
-            return dep_out(attn_out, gate)
         if gate is not None:
             attn_out = _gate_sigmoid_mul(attn_out, gate)
 

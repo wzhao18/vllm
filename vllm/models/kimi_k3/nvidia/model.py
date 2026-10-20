@@ -122,7 +122,7 @@ from ..common.mm_preprocess import (
     KimiK3MultiModalProcessor,
     KimiK3ProcessingInfo,
 )
-from .dep_decode import dep_decode_enabled
+from .dep_decode.runtime import DepDecodeConfig, dep_decode_config
 from .specialized_decode.runtime import specialized_decode_config
 
 if TYPE_CHECKING:
@@ -569,9 +569,6 @@ class KimiMoE(nn.Module):
                 skip_padding=True,
                 runner_cls=LatentMoERunner if self.use_latent_moe else None,
             )
-        # dep_decode_backend=fused: decode-sized batches run the DEP fused block,
-        # set by KimiLinearForCausalLM.build_dep_decode once weights are loaded.
-        self.dep_decode = None
         if self.padded_moe_intermediate_size != moe_intermediate_size:
             w13_weight = getattr(self.experts, "w13_weight", None)
             if w13_weight is None:
@@ -648,8 +645,6 @@ class KimiMoE(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
-        if self.dep_decode is not None and self.dep_decode.supports(num_tokens):
-            return self.dep_decode(hidden_states)
         # Overlap the gate with the routed down projection; the returned hidden
         # states are already down-projected. Keep the original ``hidden_states``
         # for the shared experts.
@@ -1440,43 +1435,25 @@ class KimiLinearForCausalLM(
         )
         # decode_backend=latency_specialized: a specialized decode executor over
         # self.model, built by the model state once the weights are loaded.
-        self.specialized_decode_config = specialized_decode_config(vllm_config)
+        # decode_backend=dep_throughput: the DEP decode executor (dep_decode/) instead.
+        self.specialized_decode_config = specialized_decode_config(
+            vllm_config
+        ) or dep_decode_config(vllm_config)
         self.specialized_decode: SpecializedDecode | None = None
-        # dep_decode_backend=fused: fused DEP MoE blocks, built by the model state
-        # once the weights are loaded.
-        self.dep_decode_enabled = dep_decode_enabled(vllm_config)
         # The final norm is applied in compute_logits unless the specialized decode
         # applies it in forward.
         self.needs_norm_in_logits = True
 
-    def build_dep_decode(self) -> None:
-        from .dep_decode.kda_verify import KdaOutProj, MlaOutProj, install_dep_kda
-        from .dep_decode.linear import fp8_rows, install_streamk_forward
-        from .dep_decode.moe import DepMoE
-
-        for module in self.model.modules():
-            if isinstance(module, KimiMoE) and module.use_mega_moe:
-                module.dep_decode = DepMoE(module)
-            elif isinstance(module, (KimiK3DeltaAttention, MultiHeadLatentAttention)):
-                install_streamk_forward(module.o_proj)
-                if getattr(module, "use_recoverssm", False):
-                    install_dep_kda(module)
-                if fp8_rows(module.o_proj) is not None:
-                    out_proj = (
-                        KdaOutProj
-                        if isinstance(module, KimiK3DeltaAttention)
-                        else MlaOutProj
-                    )
-                    module.dep_out_proj = out_proj(module)
-                if getattr(module, "fused_qkv_a_g_proj", None) is not None:
-                    install_streamk_forward(module.fused_qkv_a_g_proj)
-
     def build_specialized_decode(self) -> None:
-        from .specialized_decode.runtime.decode import SpecializedDecode
+        config = self.specialized_decode_config
+        if isinstance(config, DepDecodeConfig):
+            from .dep_decode.runtime.decode import DepDecode
 
-        self.specialized_decode = SpecializedDecode(
-            self.model, self.specialized_decode_config
-        )
+            self.specialized_decode = DepDecode(self.model, config)
+        else:
+            from .specialized_decode.runtime.decode import SpecializedDecode
+
+            self.specialized_decode = SpecializedDecode(self.model, config)
         # From here on forward() returns normalized hidden states on every step: the
         # specialized decode's last AttnRes applies the norm, and forward() applies it
         # to each step that falls back to the stock forward (prefills, larger batches,

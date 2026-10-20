@@ -159,51 +159,6 @@ def kda_cute_commit(context, state_indices: torch.Tensor, batch: int) -> None:
     )
 
 
-def dep_kda_verify(
-    layer,
-    mixed_qkv,
-    raw_g,
-    raw_beta,
-    checkpoint_state,
-    records,
-    query_start_loc,
-    state_indices,
-    out,
-):
-    """``KimiK3DeltaAttention.dep_verify``: the RecoverSSM verify of ``layer`` on its
-    stock views (``raw_g`` [1, T, H, K], ``raw_beta`` [1, T, H], ``out`` [1, T, H, K]
-    or None); returns ``out``."""
-    tokens = mixed_qkv.shape[0]
-    if out is None:
-        out = mixed_qkv.new_empty(1, tokens, layer.local_num_heads, layer.head_dim)
-    kda_cute_verify(
-        mixed_qkv,
-        raw_g.view(tokens, -1),
-        raw_beta.view(tokens, -1),
-        layer.A_log,
-        layer.dt_bias,
-        layer.gate_lower_bound,
-        checkpoint_state,
-        records[0],
-        records[1],
-        query_start_loc,
-        state_indices,
-        layer.spec_query_len,
-        out.view(tokens, -1),
-    )
-    return out
-
-
-def install_dep_kda(layer) -> None:
-    """Route ``layer``'s RecoverSSM verify through the CuTe kernel (compiled here,
-    outside graph capture)."""
-    assert layer.A_log.dtype == layer.dt_bias.dtype == torch.float32
-    _compile(
-        layer.local_num_heads, layer.spec_query_len, architecture(layer.A_log.device)
-    )
-    layer.dep_verify = dep_kda_verify
-
-
 def install_state_commit(context) -> None:
     """Fold RecoverSSM commits with the CuTe kernel (compiled here, outside graph
     capture)."""
