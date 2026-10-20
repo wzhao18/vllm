@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     FORCE_COLOR: bool = False
     VLLM_LOG_STATS_INTERVAL: float = 10.0
     VLLM_DP_CONTEXT_TOKEN_BALANCE: bool = False
+    VLLM_NIXL_ASYNC_POST: bool = False
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_PP_LAYER_PARTITION: str | None = None
@@ -868,6 +869,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DP_CONTEXT_TOKEN_BALANCE": lambda: bool(
         int(os.getenv("VLLM_DP_CONTEXT_TOKEN_BALANCE", "0"))
     ),
+    # Post NIXL pull READs from the NIXL background thread. Posting a large
+    # READ can block for tens of ms (one copy per block descriptor), stalling
+    # the worker and, under data parallelism, every rank waiting on it.
+    "VLLM_NIXL_ASYNC_POST": lambda: bool(int(os.getenv("VLLM_NIXL_ASYNC_POST", "0"))),
     "VLLM_LOG_STATS_INTERVAL": lambda: (
         val
         if (val := float(os.getenv("VLLM_LOG_STATS_INTERVAL", "10."))) > 0.0

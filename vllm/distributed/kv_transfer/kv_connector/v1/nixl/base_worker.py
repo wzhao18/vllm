@@ -14,6 +14,7 @@ import uuid
 from collections import defaultdict
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 import msgspec
@@ -123,6 +124,14 @@ def _share_storage_and_block_stride(caches: list[torch.Tensor]) -> bool:
     block_strides = {cache.stride(0) * cache.element_size() for cache in caches}
     storage_ptrs = {cache.untyped_storage().data_ptr() for cache in caches}
     return len(block_strides) == len(storage_ptrs) == 1
+
+
+@dataclass
+class _PendingPost:
+    """A READ handle whose post runs on the NIXL background thread."""
+
+    handle: int
+    future: Future
 
 
 class NixlBaseConnectorWorker:
@@ -892,6 +901,11 @@ class NixlBaseConnectorWorker:
             thread_name_prefix="vllm-nixl-handshake-initiator",
         )
         self._ready_requests = queue.Queue[tuple[ReqId, ReqMeta]]()
+        # VLLM_NIXL_ASYNC_POST: READ posts, off the worker thread (and off the
+        # handshake thread, which a slow peer can hold).
+        self._post_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="vllm-nixl-post"
+        )
         self._handshake_futures: dict[
             EngineId, Future[tuple[dict[tuple[int, int], str], float]]
         ] = {}
@@ -3278,6 +3292,22 @@ class NixlBaseConnectorWorker:
         for req_id, handles in list(transfers.items()):
             in_progress = []
             for handle in handles:
+                if isinstance(handle, _PendingPost):
+                    if not handle.future.done():
+                        in_progress.append(handle)
+                        continue
+                    pending, handle = handle, handle.handle
+                    if (error := pending.future.exception()) is not None:
+                        self._log_failure(
+                            failure_type="transfer_setup_failed",
+                            req_id=req_id,
+                            error=error,
+                        )
+                        if not self._handle_failed_transfer(
+                            req_id, handle, failed_req_ids
+                        ):
+                            in_progress.append(handle)
+                        continue
                 try:
                     xfer_state = self.nixl_wrapper.check_xfer_state(handle)
                     if xfer_state == "DONE":
@@ -3970,8 +4000,14 @@ class NixlBaseConnectorWorker:
             # error happens during init, no need to shutdown
             return
         self._handshake_initiation_executor.shutdown(wait=False)
+        self._post_executor.shutdown(wait=False)
         for handles in self._recving_transfers.values():
             for handle in handles:
+                if isinstance(handle, _PendingPost):
+                    # A post still running may yet start DMA: keep its handle.
+                    if not (handle.future.cancel() or handle.future.done()):
+                        continue
+                    handle = handle.handle
                 self.nixl_wrapper.release_xfer_handle(handle)
         self._recving_transfers.clear()
         self._finish_shutdown()

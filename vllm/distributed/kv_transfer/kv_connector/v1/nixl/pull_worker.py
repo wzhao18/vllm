@@ -7,9 +7,11 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from vllm import envs
 from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
     NixlBaseConnectorWorker,
+    _PendingPost,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlConnectorMetadata,
@@ -551,6 +553,13 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 remote_block_descs_ids,
                 notif_msg=notif_id,
             )
+
+            if envs.VLLM_NIXL_ASYNC_POST:
+                # Posting can block for tens of ms; completion is polled from
+                # the pending post (see _pop_done_transfers).
+                future = self._post_executor.submit(self.nixl_wrapper.transfer, handle)
+                self._recving_transfers[request_id].append(_PendingPost(handle, future))
+                return True
 
             # Begin async xfer.
             self.nixl_wrapper.transfer(handle)
