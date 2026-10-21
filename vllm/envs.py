@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     NO_COLOR: bool = False
     FORCE_COLOR: bool = False
     VLLM_LOG_STATS_INTERVAL: float = 10.0
+    VLLM_DP_CONTEXT_TOKEN_BALANCE: bool = False
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_PP_LAYER_PARTITION: str | None = None
@@ -859,6 +860,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "NO_COLOR": lambda: os.getenv("NO_COLOR", "0") != "0",
     # De-facto standard flag for forcing ANSI color codes (e.g. non-tty case)
     "FORCE_COLOR": lambda: os.getenv("FORCE_COLOR", "0") != "0",
+    # Route DP requests to the engine with the fewest assigned context tokens
+    # (this client's live requests) instead of the fewest requests: decode
+    # attention cost scales with context, and DP engines step in lockstep.
+    "VLLM_DP_CONTEXT_TOKEN_BALANCE": lambda: bool(
+        int(os.getenv("VLLM_DP_CONTEXT_TOKEN_BALANCE", "0"))
+    ),
     # If set, vllm will log stats at this interval in seconds
     # If not set, vllm will log stats every 10 seconds.
     "VLLM_LOG_STATS_INTERVAL": lambda: (
