@@ -56,6 +56,9 @@ class KdaAttention:
         weight = module.conv1d.weight
         self.conv_weight = weight.view(weight.size(0), weight.size(2))
         self.out_proj = KdaOutProj(module)
+        # The verify kernel fuses the short convolution (SiLU, no bias) for a
+        # token-major conv state; a dim-major state keeps the stock convolution.
+        self.fused_conv = not is_conv_state_dim_first() and module.conv1d.bias is None
         # The fused q/k/v/gate/f_a/beta projection on the MXFP8 layer input.
         self.in_proj = fp8_rows(module.in_proj_qkvgfab)
 
@@ -108,6 +111,26 @@ class KdaAttention:
         requests = md.num_spec_decodes
         slots = md.spec_state_indices_tensor[:requests, 0]
         starts = md.spec_query_start_loc[: requests + 1]
+        core = x.new_empty((x.shape[0], m.local_num_heads * m.head_dim))
+        if self.fused_conv:
+            # The verify kernel applies the short convolution (token-major state).
+            kda_cute_verify(
+                mixed[:tokens],
+                gate[:tokens],
+                beta[:tokens],
+                m.A_log,
+                m.dt_bias,
+                m.gate_lower_bound,
+                state,
+                records[0],
+                records[1],
+                starts,
+                slots,
+                q,
+                core[:tokens],
+                conv=(m.kv_cache[0], self.conv_weight, md.num_accepted_tokens),
+            )
+            return self.out_proj(core, g_proj)
         convolved = torch.empty_like(mixed[:tokens])
         causal_conv1d_update(
             mixed[:tokens],
@@ -122,7 +145,6 @@ class KdaAttention:
             validate_data=False,
             out=convolved,
         )
-        core = x.new_empty((x.shape[0], m.local_num_heads * m.head_dim))
         kda_cute_verify(
             convolved,
             gate[:tokens],

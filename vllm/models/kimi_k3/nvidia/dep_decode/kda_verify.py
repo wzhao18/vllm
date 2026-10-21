@@ -13,19 +13,30 @@ from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
     architecture,
     dynamic_fake,
     dynamic_view,
+    fake,
     stream,
 )
 
 from .cutedsl.kda_commit import KdaCommit
-from .cutedsl.kda_verify import KdaChunkedVerify
+from .cutedsl.kda_verify import DEFAULT_STAGES, DEFAULT_WARPS, KdaChunkedVerify
 
 
 @cache
-def _compile(heads: int, window: int, arch: str):
-    kernel = KdaChunkedVerify(heads, window)
+def _compile_variant(
+    heads: int,
+    window: int,
+    arch: str,
+    stages: int = DEFAULT_STAGES,
+    conv: bool = False,
+    norm_dtype: torch.dtype | None = None,
+    warps: int = DEFAULT_WARPS,
+):
+    kernel = KdaChunkedVerify(
+        heads, window, stages, conv, norm=norm_dtype is not None, warps=warps
+    )
     bf16, f32, i32 = torch.bfloat16, torch.float32, torch.int32
     fakes = (
-        dynamic_fake(2, bf16),  # qkv
+        dynamic_fake(2, bf16),  # qkv (raw projection when conv)
         dynamic_fake(2, bf16),  # raw_g
         dynamic_fake(2, bf16),  # raw_beta
         dynamic_fake(1, f32),  # a_log
@@ -37,14 +48,35 @@ def _compile(heads: int, window: int, arch: str):
         dynamic_fake(1, i32),  # query_start
         dynamic_fake(1, i32),  # slots
     )
+    if conv:
+        fakes += (
+            dynamic_fake(3, bf16),  # conv state [slots, Q + 2, 3HK]
+            dynamic_fake(2, bf16),  # conv weight [3HK, 4]
+            dynamic_fake(1, i32),  # accepted tokens
+        )
+    scalars = (cutlass.Float32(0), cutlass.Int32(0))
+    if norm_dtype is not None:
+        fakes += (
+            dynamic_fake(2, bf16),  # g_proj
+            dynamic_fake(1, norm_dtype),  # norm weight
+            dynamic_fake(2, cutlass.Uint8),  # E4M3 values (bytes)
+            fake((cute.sym_int(),), (1,), cutlass.Uint8, align=1),  # scales
+        )
+        scalars += (cutlass.Float32(0),)  # norm eps
     return cute.compile(
         kernel,
         *fakes,
-        cutlass.Float32(0),
-        cutlass.Int32(0),
+        *scalars,
         make_fake_stream(),
         options=f"--gpu-arch={arch}",
     )
+
+
+def _compile(heads: int, window: int, arch: str):
+    """Compile the verify variants a decode step launches (plain and with the fused
+    convolution), outside graph capture; returns the plain one."""
+    _compile_variant(heads, window, arch, conv=True)
+    return _compile_variant(heads, window, arch)
 
 
 def kda_cute_verify(
@@ -61,14 +93,28 @@ def kda_cute_verify(
     state_indices: torch.Tensor,
     spec_query_len: int,
     out: torch.Tensor,
+    conv: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    norm: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]
+    | None = None,
 ) -> torch.Tensor:
     """``kda_recoverssm_verify`` on 2-D views: ``mixed_qkv`` [T, 3 * H * 128] (the
     convolution output), ``raw_g`` [T, H * 128], ``raw_beta`` [T, H], ``out``
-    [T, H * 128]."""
+    [T, H * 128]. With ``conv`` = (conv state [slots, Q + 2, 3 * H * 128] token
+    major, conv weight [3 * H * 128, 4], accepted tokens [B]), ``mixed_qkv`` is the
+    projection and the kernel applies ``causal_conv1d_update`` (SiLU, no bias,
+    speculative rolling) first. With ``norm`` = (g_proj [T, H * 128], norm weight
+    [128], E4M3 values [T, H * 128], swizzled scales, eps), the output is KDA's
+    gated RMSNorm of the result in MXFP8 (``out`` is not written)."""
     from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
     heads = A_log.numel()
-    code = _compile(heads, spec_query_len, architecture(mixed_qkv.device))
+    code = _compile_variant(
+        heads,
+        spec_query_len,
+        architecture(mixed_qkv.device),
+        conv=conv is not None,
+        norm_dtype=None if norm is None else norm[1].dtype,
+    )
     tensors = (
         mixed_qkv,
         raw_g,
@@ -81,13 +127,19 @@ def kda_cute_verify(
         out,
         query_start_loc,
         state_indices,
-    )
-    code(
-        *map(dynamic_view, tensors),
-        cutlass.Float32(lower_bound),
-        cutlass.Int32(NULL_BLOCK_ID),
-        stream(mixed_qkv.device),
-    )
+    ) + (conv or ())
+    views = list(map(dynamic_view, tensors))
+    scalars = [cutlass.Float32(lower_bound), cutlass.Int32(NULL_BLOCK_ID)]
+    if norm is not None:
+        g_proj, weight, values, scales, eps = norm
+        views += [
+            dynamic_view(g_proj),
+            dynamic_view(weight),
+            dynamic_view(values.view(torch.uint8)),
+            dynamic_view(scales.view(torch.uint8), align=1),
+        ]
+        scalars.append(cutlass.Float32(eps))
+    code(*views, *scalars, stream(mixed_qkv.device))
     return out
 
 

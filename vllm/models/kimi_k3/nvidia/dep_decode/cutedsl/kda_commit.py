@@ -67,6 +67,7 @@ class KdaCommit:
         smem = cutlass.utils.SmemAllocator()
         scaled = alloc(smem, Float32, (Q + 1, K))  # k_t e^{L_n - L_t}; row Q: e^{L_n}
         norms = alloc(smem, Float32, (4, Q))
+        corrections = alloc(smem, Float32, (Q, K))  # u_t, staged once
         kv = cute.make_rmem_tensor((Q,), Float32)
         logs = cute.make_rmem_tensor((Q,), Float32)
         coef = cute.make_rmem_tensor((Q + 1, KEYS_PER_LANE), Float32)
@@ -124,6 +125,14 @@ class KdaCommit:
                 for w in cutlass.range_constexpr(4):
                     rows[it, w] = words[w]
 
+            # The corrections, staged in shared memory: read in the row loop, they
+            # would wait behind the previous pass's stores.
+            for t in cutlass.range_constexpr(Q):
+                value = Float32(0)
+                if t < n:
+                    value = corr[t, tid]
+                corrections[t, tid] = value
+
             # ---- Thread c: key channel c's decays and scaled keys. ----
             bias = dt_bias[layer, head, tid].to(Float32)
             a = cute.math.exp(a_log[layer, head].to(Float32))
@@ -156,9 +165,7 @@ class KdaCommit:
             for it in cutlass.range_constexpr(PASSES):
                 r = it * ROWS_PER_PASS + group
                 for t in cutlass.range_constexpr(Q):
-                    u[t] = Float32(0)
-                    if t < n:
-                        u[t] = corr[t, r]
+                    u[t] = corrections[t, r]
                 out = []
                 for w in cutlass.range_constexpr(4):
                     pair = []
