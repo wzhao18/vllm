@@ -109,7 +109,9 @@ def _plan_work_list_kernel(
 
 
 @cache
-def _compile(heads, q, page_size, capacity, arch_cc, use_pdl, reg_split=None):
+def _compile(
+    heads, q, page_size, capacity, arch_cc, use_pdl, reg_split=None, causal=True
+):
     """The FP8 split-KV MLA decode with a work list (packed query rows, causal
     among the q verify rows, FP16 partials, BF16 latent output)."""
     qk_tiler, pv_tiler = select_mla_decode_tilers(
@@ -130,7 +132,7 @@ def _compile(heads, q, page_size, capacity, arch_cc, use_pdl, reg_split=None):
         is_var_seq=True,
         is_var_split_kv=True,
         fold_sq_factor=1,
-        is_causal=True,
+        is_causal=causal,
         num_heads=heads,
         seq_len_q=q,
         window_left=-1,
@@ -214,6 +216,7 @@ class WorkListMla:
         page_size: int = 64,
         use_pdl: bool = False,
         reg_split: tuple[int, int, int] | None = REG_SPLIT,
+        causal: bool = True,
     ):
         self.heads, self.q, self.capacity, self.page_size = (
             heads,
@@ -222,6 +225,8 @@ class WorkListMla:
             page_size,
         )
         self.use_pdl, self.reg_split = use_pdl, reg_split
+        # False: every query row of a request sees its whole KV (a DSpark draft block).
+        self.causal = causal
         self.arch = torch.cuda.get_device_capability(device)
         max_requests = -(-max_tokens // q)
         # HardwareInfo queries the current CUDA context: make sure there is one.
@@ -296,6 +301,7 @@ class WorkListMla:
             self.arch,
             self.use_pdl,
             self.reg_split,
+            self.causal,
         )
         with tvm_ffi.use_torch_stream():
             kernel(

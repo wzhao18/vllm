@@ -133,7 +133,86 @@ class _DraftLogitsProcessor(nn.Module):
         return self.stock(head, hidden_states, *args, **kwargs)
 
 
+class _DraftMla:
+    """The draft's MLA decode on the DEP backend's work-list kernel, non-causal: a
+    DSpark draft block attends to the whole context from every query row. One plan
+    per draft forward (its first layer) serves all layers, which share the block
+    table and lengths. Steps the kernel does not cover (other query layouts, DCP,
+    LSE outputs) keep the stock decode."""
+
+    def __init__(self, heads: int, q: int, max_tokens: int, device):
+        from .mla_decode import WorkListMla
+
+        self.core = WorkListMla(heads, q, max_tokens, device, causal=False)
+        self.q = q
+        self.ready = False  # compiled (outside any graph capture)
+
+    def wrap(self, impl, first: bool):
+        stock = impl.forward_mqa
+
+        def forward_mqa(q, kv_c_and_k_pe_cache, attn_metadata, layer):
+            decode = attn_metadata.decode
+            usable = (
+                isinstance(q, torch.Tensor)
+                and q.dtype == torch.float8_e4m3fn
+                and not attn_metadata.causal
+                and impl.dcp_world_size == 1
+                and not impl.need_to_return_lse_for_decode
+                and attn_metadata.num_decode_tokens
+                == attn_metadata.num_decodes * self.q
+                and q.shape[0] == attn_metadata.num_decode_tokens
+            )
+            if usable and not self.ready:
+                if torch.cuda.is_current_stream_capturing():
+                    usable = False  # never compile under capture
+                else:
+                    self.core.page_size = kv_c_and_k_pe_cache.shape[1]
+                    self.ready = True
+            if not usable:
+                return stock(q, kv_c_and_k_pe_cache, attn_metadata, layer)
+            if first:
+                self.core.plan(decode.seq_lens)
+            out = self.core.decode(
+                q,
+                kv_c_and_k_pe_cache,
+                decode.block_table,
+                decode.seq_lens,
+                impl.scale * layer._q_scale_float * layer._k_scale_float,
+                layer._k_scale_float,
+            )
+            return out, None
+
+        impl.forward_mqa = forward_mqa
+
+
+def install_draft_mla(model: nn.Module) -> None:
+    """Decode the draft's MLA layers with ``_DraftMla``."""
+    from vllm.config import get_current_vllm_config
+
+    config = get_current_vllm_config()
+    spec = config.speculative_config
+    layers = [layer.self_attn for layer in model.model.layers]
+    if spec is None or not layers:
+        return
+    # DSpark drafts N tokens per request (anchor-as-first) or 1 + N (fill-in).
+    hf = spec.draft_model_config.hf_config
+    q = spec.num_speculative_tokens + (
+        0 if getattr(hf, "sample_from_anchor", True) else 1
+    )
+    first = layers[0]
+    draft = _DraftMla(
+        first.num_local_heads,
+        q,
+        config.scheduler_config.max_num_seqs * q,
+        next(first.parameters()).device,
+    )
+    for i, attention in enumerate(layers):
+        draft.wrap(attention.impl, first=i == 0)
+
+
 def install_draft(model: nn.Module) -> None:
-    """Run the DSpark draft ``model`` on MXFP8 projections and LM head."""
+    """Run the DSpark draft ``model`` on MXFP8 projections and LM head, and its MLA
+    decode on the backend's work-list kernel."""
     quantize_draft(model.model)
     model.logits_processor = _DraftLogitsProcessor(model.logits_processor)
+    install_draft_mla(model)
