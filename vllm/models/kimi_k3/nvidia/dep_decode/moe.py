@@ -26,6 +26,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     mxfp8_e4m3_quantize,
 )
 
+from . import megamoe
 from .elementwise import rms_norm_mxfp8, situ_and_mul_mxfp8
 from .gemm import MAX_TILE_N, streamk_mxfp8_gemm
 from .linear import fp8_rows
@@ -75,6 +76,12 @@ class DepMoE:
         norm = moe.routed_expert_norm
         self.norm_weight, self.norm_eps = norm.weight, norm.variance_epsilon
         self.events = (torch.cuda.Event(), torch.cuda.Event())
+        # The DEP MegaMoE kernel (dep_decode/megamoe): installed before the first
+        # MegaMoE launch compiles.
+        from vllm.utils.deep_gemm import _import_deep_gemm
+
+        self.deep_gemm = _import_deep_gemm()
+        megamoe.install(self.deep_gemm)
 
     @staticmethod
     def supports(num_tokens: int) -> bool:
@@ -123,6 +130,12 @@ class DepMoE:
         )
         shared = streamk_mxfp8_gemm(aq, a_s, *self.shared_down)
         main.wait_event(self.events[1])
-        routed = self.moe.experts(front[:, : self.latent], topk_weights, topk_ids)
+        routed = megamoe.mega_moe(
+            self.moe.experts,
+            self.deep_gemm,
+            front[:, : self.latent],
+            topk_weights,
+            topk_ids,
+        )
         rq, r_s = rms_norm_mxfp8(routed, self.norm_weight, self.norm_eps)
         return streamk_mxfp8_gemm(rq, r_s, *self.up, residual=shared)
