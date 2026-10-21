@@ -287,6 +287,11 @@ def bind_state_commit(context) -> bool:
     if key not in _compiled_commits:
         return False  # never compile under capture: keep the stock commit
     context.state_commit = kda_cute_commit
+    # Skip the convolution-history compaction (non-aligned mode): every reader of
+    # the conv state (this backend's fused convolution and the stock fallback)
+    # takes the history at the accepted offset. Bound during graph capture,
+    # before any request, so all serving steps see the same layout.
+    context.lazy_conv = True
     return True
 
 

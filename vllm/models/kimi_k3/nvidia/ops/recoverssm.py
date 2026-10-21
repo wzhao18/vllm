@@ -757,6 +757,11 @@ class KDARecoverSSMCommitContext:
     # Optional replacement for the state fold of a prepared plan (non-aligned
     # mode): ``state_commit(context, state_indices, batch)``.
     state_commit: Callable[..., None] | None = None
+    # Non-aligned mode: keep each window's convolution inputs in place instead of
+    # compacting the accepted history to the front; the next step's convolution
+    # reads it at the accepted offset (num_accepted_tokens), as the speculative
+    # path without RecoverSSM does.
+    lazy_conv: bool = False
 
     @classmethod
     def create(
@@ -992,26 +997,27 @@ class KDARecoverSSMCommitContext:
             SPEC_QUERY_LEN=self.spec_query_len,
             num_warps=1,
         )
-        _compact_conv_state_kernel[(triton.cdiv(conv_dim, 256), batch, num_layers)](
-            conv_ref,
-            self.conv_state_base_addrs,
-            self.conv_state_block_strides,
-            self.conv_state_dim_strides,
-            self.conv_state_token_strides,
-            state_indices,
-            self.commit_lens,
-            self.final_state_indices,
-            self.boundary_state_indices,
-            self.boundary_recovery_lens,
-            NULL_BLOCK_ID,
-            conv_dim,
-            self.conv_history_len,
-            state_indices.stride(0),
-            BLOCK_D=256,
-            BLOCK_HISTORY=block_history,
-            ALIGN_MODE=block_table is not None,
-            num_warps=4,
-        )
+        if not (self.lazy_conv and block_table is None):
+            _compact_conv_state_kernel[(triton.cdiv(conv_dim, 256), batch, num_layers)](
+                conv_ref,
+                self.conv_state_base_addrs,
+                self.conv_state_block_strides,
+                self.conv_state_dim_strides,
+                self.conv_state_token_strides,
+                state_indices,
+                self.commit_lens,
+                self.final_state_indices,
+                self.boundary_state_indices,
+                self.boundary_recovery_lens,
+                NULL_BLOCK_ID,
+                conv_dim,
+                self.conv_history_len,
+                state_indices.stride(0),
+                BLOCK_D=256,
+                BLOCK_HISTORY=block_history,
+                ALIGN_MODE=block_table is not None,
+                num_warps=4,
+            )
 
         if self.state_commit is not None and block_table is None:
             self.state_commit(self, state_indices, batch)

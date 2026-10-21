@@ -594,7 +594,12 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
 
                 num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
 
-            if self.use_recoverssm:
+            lazy_conv = (
+                self.recoverssm_context is not None
+                and self.recoverssm_context.lazy_conv
+                and self.kv_cache_spec.mamba_cache_mode != "align"
+            )
+            if self.use_recoverssm and not lazy_conv:
                 assert self.recoverssm_num_accepted_tokens is not None
                 num_accepted_tokens = self.recoverssm_num_accepted_tokens[
                     :num_spec_decodes
