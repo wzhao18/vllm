@@ -73,9 +73,9 @@ def _compile_variant(
 
 
 def _compile(heads: int, window: int, arch: str):
-    """Compile the verify variants a decode step launches (plain and with the fused
-    convolution), outside graph capture; returns the plain one."""
-    _compile_variant(heads, window, arch, conv=True)
+    """Compile the verify variants a decode step launches (plain, and the tcgen05 one
+    with the fused convolution), outside graph capture; returns the plain one."""
+    _compile_tc(heads, window, arch, _tc_ctas(torch.cuda.current_device()))
     return _compile_variant(heads, window, arch)
 
 
@@ -108,6 +108,32 @@ def kda_cute_verify(
     from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
     heads = A_log.numel()
+    device = mixed_qkv.device
+    if conv is not None and norm is None:
+        # The fused convolution runs on the tcgen05 verify (faster at every batch).
+        code = _compile_tc(
+            heads, spec_query_len, architecture(device), _tc_ctas(device)
+        )
+        tensors = (
+            mixed_qkv,
+            raw_g,
+            raw_beta,
+            A_log,
+            dt_bias,
+            checkpoint_state,
+            correction_cache,
+            kg_cache,
+            out,
+            query_start_loc,
+            state_indices,
+        ) + conv
+        code(
+            *map(dynamic_view, tensors),
+            cutlass.Float32(lower_bound),
+            cutlass.Int32(NULL_BLOCK_ID),
+            stream(device),
+        )
+        return out
     code = _compile_variant(
         heads,
         spec_query_len,
@@ -292,3 +318,41 @@ class MlaOutProj:
 
         xq, xs = sigmoid_gate_mxfp8(attn_out, gate)
         return streamk_mxfp8_gemm(xq, xs, self.weight, self.scale)
+
+
+@cache
+def _compile_tc(heads: int, window: int, arch: str, ctas: int):
+    """The tcgen05 verify with the fused convolution (``cutedsl/kda_verify_tc.py``)."""
+    from .cutedsl.kda_verify_tc import KdaTcVerify
+
+    bf16, f32, i32 = torch.bfloat16, torch.float32, torch.int32
+    fakes = (
+        dynamic_fake(2, bf16),  # raw qkv projection
+        dynamic_fake(2, bf16),  # raw_g
+        dynamic_fake(2, bf16),  # raw_beta
+        dynamic_fake(1, f32),  # a_log
+        dynamic_fake(1, f32),  # dt_bias
+        dynamic_fake(4, bf16),  # state
+        dynamic_fake(4, f32),  # corrections
+        dynamic_fake(4, bf16),  # key / gate records
+        dynamic_fake(2, bf16),  # out
+        dynamic_fake(1, i32),  # query_start
+        dynamic_fake(1, i32),  # slots
+        dynamic_fake(3, bf16),  # conv state [slots, Q + 2, 3HK]
+        dynamic_fake(2, bf16),  # conv weight [3HK, 4]
+        dynamic_fake(1, i32),  # accepted tokens
+    )
+    return cute.compile(
+        KdaTcVerify(heads, window, conv=True, ctas=ctas),
+        *fakes,
+        cutlass.Float32(0),
+        cutlass.Int32(0),
+        make_fake_stream(),
+        options=f"--gpu-arch={arch}",
+    )
+
+
+def _tc_ctas(device) -> int:
+    from .cutedsl.kda_verify_tc import CTAS_PER_SM
+
+    return CTAS_PER_SM * torch.cuda.get_device_properties(device).multi_processor_count
