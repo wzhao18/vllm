@@ -54,6 +54,7 @@ def _plan_work_list_kernel(
     BLOCK_B: tl.constexpr,
     BLOCK_G: tl.constexpr,
     SEARCH_STEPS: tl.constexpr,
+    SKIP_EMPTY: tl.constexpr = False,
 ):
     """Per-request split counts, then the work list.
 
@@ -66,6 +67,9 @@ def _plan_work_list_kernel(
     offs = tl.arange(0, BLOCK_B)
     mask = offs < num_reqs
     lens = tl.load(seq_lens_ptr + offs, mask, other=0)
+    if SKIP_EMPTY:
+        # Empty requests (e.g. unused cross-rank slots) get no work at all.
+        mask = mask & (lens > 0)
     tiles_i = tl.where(mask, tl.maximum((lens + KV_TILE - 1) // KV_TILE, 1), 0)
     tiles = tiles_i.to(tl.float32)[None, :]
     waves_w = tl.arange(0, BLOCK_W) + 1
@@ -81,7 +85,7 @@ def _plan_work_list_kernel(
         low = tl.where(fits, low, mid)
     n = tl.maximum(tl.minimum(tl.ceil(tiles / high[:, None]), capacity), 1.0)
     n = n.to(tl.int32)
-    per = (tiles_i[None, :] + n - 1) // n  # the kernel's chunk, in KV tiles
+    per = tl.maximum((tiles_i[None, :] + n - 1) // n, 1)  # the kernel's chunk
     n = tl.where(mask[None, :], (tiles_i[None, :] + per - 1) // per, 0)
     chunk = tl.max(tl.where(mask[None, :], per, 0), 1)
     used = tl.sum(n, 1) * q_tiles
@@ -110,10 +114,19 @@ def _plan_work_list_kernel(
 
 @cache
 def _compile(
-    heads, q, page_size, capacity, arch_cc, use_pdl, reg_split=None, causal=True
+    heads,
+    q,
+    page_size,
+    capacity,
+    arch_cc,
+    use_pdl,
+    reg_split=None,
+    causal=True,
+    lse=False,
 ):
     """The FP8 split-KV MLA decode with a work list (packed query rows, causal
-    among the q verify rows, FP16 partials, BF16 latent output)."""
+    among the q verify rows unless ``causal`` is off, FP16 partials, BF16 latent
+    output, and the log2-domain LSE of each row with ``lse``)."""
     qk_tiler, pv_tiler = select_mla_decode_tilers(
         heads, q, is_fp8=True, compute_capability=arch_cc
     )
@@ -179,7 +192,11 @@ def _compile(
             stride_order=(3, 2, 1, 0),
             assumed_align=16,
         ),
-        None,  # LSE
+        compact(
+            Float32, (batch, seq_q, num_heads), stride_order=(2, 1, 0), assumed_align=4
+        )
+        if lse
+        else None,  # LSE
         compact(cutlass.Int8, (sym(),), assumed_align=32),
         Int32(capacity),
         lengths,  # cache lengths
@@ -217,6 +234,7 @@ class WorkListMla:
         use_pdl: bool = False,
         reg_split: tuple[int, int, int] | None = REG_SPLIT,
         causal: bool = True,
+        skip_empty: bool = False,
     ):
         self.heads, self.q, self.capacity, self.page_size = (
             heads,
@@ -226,7 +244,7 @@ class WorkListMla:
         )
         self.use_pdl, self.reg_split = use_pdl, reg_split
         # False: every query row of a request sees its whole KV (a DSpark draft block).
-        self.causal = causal
+        self.causal, self.skip_empty = causal, skip_empty
         self.arch = torch.cuda.get_device_capability(device)
         max_requests = -(-max_tokens // q)
         # HardwareInfo queries the current CUDA context: make sure there is one.
@@ -268,6 +286,7 @@ class WorkListMla:
             BLOCK_B=triton.next_power_of_2(max(16, requests)),
             BLOCK_G=triton.next_power_of_2(self.list_len),
             SEARCH_STEPS=20,
+            SKIP_EMPTY=self.skip_empty,
         )
 
     def decode(
@@ -279,9 +298,11 @@ class WorkListMla:
         softmax_scale: float,
         output_scale: float,
         out: torch.Tensor | None = None,
+        lse: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """BF16 latent [T, H, 512] of FP8 ``query`` [T, H, 576] (``q`` rows per
-        request, causal among them) over the FP8 ``cache`` [blocks, page, 576]."""
+        request, causal among them) over the FP8 ``cache`` [blocks, page, 576];
+        with ``lse`` [requests, q, H] FP32, also each row's log2-domain LSE."""
         import tvm_ffi
 
         requests = seq_lens.numel()
@@ -302,6 +323,7 @@ class WorkListMla:
             self.use_pdl,
             self.reg_split,
             self.causal,
+            lse is not None,
         )
         with tvm_ffi.use_torch_stream():
             kernel(
@@ -311,7 +333,7 @@ class WorkListMla:
                 cache[:, :, LATENT:],
                 block_table,
                 out,
-                None,
+                lse,
                 self.workspace,
                 Int32(self.capacity),
                 seq_lens,

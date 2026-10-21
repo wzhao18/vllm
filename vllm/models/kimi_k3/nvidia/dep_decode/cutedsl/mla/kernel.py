@@ -4412,6 +4412,39 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     elif cutlass.const_expr(self.warps_in_n == 2):
                         if cute.elem_less(cLSE[tidx][0], common_params.H):
                             gLSE[tidx] = lse
+                else:
+                    if cutlass.const_expr(not self.skip_lse):
+                        # A single-split request's final LSE (the reduction skips it).
+                        lse = (
+                            cute.math.log2(row_sum, fastmath=True)
+                            + epilogue_params.softmax_scale_log2 * row_max
+                        )
+                        gLSE = cute.local_tile(
+                            epilogue_params.mLSE,
+                            (cta_pv_tiler[0], 1, 1),
+                            (
+                                common_params.blk_coord[0],
+                                common_params.blk_coord[1],
+                                common_params.blk_coord[2],
+                            ),
+                            (1, 1, 1),
+                        )
+                        cLSE = cute.local_tile(
+                            cute.make_identity_tensor(epilogue_params.mLSE.shape),
+                            (cta_pv_tiler[0], 1, 1),
+                            (
+                                common_params.blk_coord[0],
+                                common_params.blk_coord[1],
+                                common_params.blk_coord[2],
+                            ),
+                            (1, 1, 1),
+                        )
+                        if cutlass.const_expr(self.use_m64_ws):
+                            if cute.elem_less(cLSE[tidx][0], common_params.H):
+                                gLSE[tidx] = lse
+                        elif cutlass.const_expr(self.warps_in_n == 2):
+                            if cute.elem_less(cLSE[tidx][0], common_params.H):
+                                gLSE[tidx] = lse
 
             cute.arch.fence_view_async_tmem_load()
             common_params.mma_o_pipeline.consumer_release(mma_o_consumer_state)

@@ -99,6 +99,28 @@ class DepDecode:
         self.mla_core = (
             MlaCore(mla[0].module, max(self.batches), self.q) if mla else None
         )
+        if mla and config.mla_share is not None:
+            from vllm.distributed import get_ep_group
+
+            from ..mla_share import MlaShare
+
+            module = mla[0].module
+            options = dict(config.mla_share)
+            # Before the KV cache is sized: the replica pool is non-KV memory.
+            share = MlaShare(
+                get_ep_group().device_group,
+                module.num_local_heads,
+                self.q,
+                max(self.batches),
+                len(mla),
+                options.pop("page_size", 64),
+                module.W_UV.device,
+                **options,
+            )
+            self.mla_core.enable_share(share, [a.module for a in mla])
+            # Every rank builds the backend together: one eager protocol step
+            # compiles its kernels and starts every rank at the same epoch.
+            share.absent_step()
         # The AttnRes entering each aux layer (or the final one) also stores the
         # updated prefix: the stock aux stream (prefix sum plus the last MLP output).
         self.aux_layers = tuple(backbone.aux_hidden_state_layers)
@@ -182,12 +204,22 @@ class DepDecode:
         self.mla_core.bind(module)
         for b in self.batches:
             self.mla_core.warm_up(module, b // self.q, self.q)
+        if self.mla_core.share is not None:
+            self.mla_core.bind_share()
         torch.cuda.synchronize(module.kv_cache.device)
 
     def embed_input_ids(self, ids):
         return self.backbone.embed_input_ids(ids)
 
     def plan(self, positions, intermediate_tensors):
+        step = self._plan(positions, intermediate_tensors)
+        share = self.mla_core.share if self.mla_core is not None else None
+        if step is None and share is not None:
+            # Stock forward: keep the cross-rank MLA sharing protocol in step.
+            share.absent_step()
+        return step
+
+    def _plan(self, positions, intermediate_tensors):
         """This step's decode plan, or None to run the stock forward instead.
 
         Steps that run the stock forward:
@@ -250,8 +282,7 @@ class DepDecode:
         delta = x  # the first AttnRes takes the embeddings as its prefix
         if self.mla_core is not None:
             # Every MLA layer reads the same lengths: one split plan per step.
-            md = step.metadata[self.mla_index]
-            self.mla_core.plan(md.decode.seq_lens)
+            self.mla_core.begin_step(step.metadata[self.mla_index])
         for layer, md in zip(self.layers, step.metadata):
             index = layer.layer_idx
             self.before[index].run(

@@ -21,6 +21,9 @@ class DepDecodeConfig:
     # Tokens per request in a verify step (1 + draft tokens; 1 without speculation).
     q: int
     capture_sizes: tuple[int, ...]
+    # Cross-rank MLA work sharing (``dep_mla_share``: true or a dict of MlaShare
+    # options), as sorted (option, value) pairs; None when off.
+    mla_share: tuple | None = None
 
 
 def dep_decode_config(vllm_config) -> DepDecodeConfig | None:
@@ -34,11 +37,19 @@ def dep_decode_config(vllm_config) -> DepDecodeConfig | None:
     if reason is not None:
         raise ValueError(f"Kimi K3 DEP decode does not support {reason}")
     spec = vllm_config.speculative_config
+    share = extra.get("dep_mla_share", False)
+    if share is True:
+        share = {}
+    elif not share:
+        share = None
+    elif not isinstance(share, dict):
+        raise ValueError("dep_mla_share takes true or a dict of MlaShare options")
     return DepDecodeConfig(
         q=1 + spec.num_speculative_tokens if spec is not None else 1,
         capture_sizes=tuple(
             vllm_config.compilation_config.cudagraph_capture_sizes or ()
         ),
+        mla_share=tuple(sorted(share.items())) if share is not None else None,
     )
 
 
