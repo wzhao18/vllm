@@ -1873,134 +1873,141 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         k_tile_per_cta = cute.ceil_div(k_tile_total - k_tile_lo, local_split_kv)
         local_split_kv = cute.ceil_div(k_tile_total - k_tile_lo, max(1, k_tile_per_cta))
 
-        # Alloc shared memory
-        smem = cutlass.memory.SmemAllocator()
-        # LSE phase: one weight per lane of warp 0
-        reducer_scale_count = (
-            ceil_div(self.reducer_max_splits, self.threads_per_warp)
-            * self.threads_per_warp
-        )
-        storage = smem.allocate(reducer_scale_count * self.acc_dtype.width // 8, 16)
-        lse_scale_ptr = cute.recast_ptr(storage, dtype=self.acc_dtype)
-        smem_lse_scale = cute.make_tensor(
-            lse_scale_ptr, cute.make_layout(reducer_scale_count)
-        )
-
-        # let the next split kernel get scheduled early; its own wait still orders the data
-        cute.arch.griddepcontrol_launch_dependents()
-        cute.arch.griddepcontrol_wait()
-
-        # issue the first set of partial loads before the LSE phase; later sets
-        # only if the row needs them
-        reducer_threads = self.threads_per_warp * self.num_compute_warps
-        vec = self.reducer_d_tile // reducer_threads
-        gAccO = mAccO[acc_row, None, None, acc_tile, blk_coord[2]]
-        band_ptr = cute.make_ptr(
-            self.partial_dtype,
-            (gAccO.iterator + d_tile_idx * self.reducer_d_tile).toint(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        )
-        partial_copy_atom = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            self.partial_dtype,
-            num_bits_per_copy=vec * self.partial_dtype.width,
-        )
-        partial_thr_copy = cute.make_tiled_copy_tv(
-            partial_copy_atom,
-            cute.make_ordered_layout((1, reducer_threads), order=(1, 0)),
-            cute.make_layout((1, vec)),
-        ).get_slice(tidx)
-        partial_params = SimpleNamespace(
-            band_ptr=band_ptr,
-            split_stride=gAccO.stride[0],
-            copy_atom=partial_copy_atom,
-            thr_copy=partial_thr_copy,
-            local_split_kv=local_split_kv,
-            has_local_visible_lens=has_local_visible_lens,
-            smem_lse_scale=smem_lse_scale,
-            vec=vec,
-        )
-        num_sets = ceil_div(self.reducer_max_splits, self.reducer_batch_splits)
-        num_pre_sets = 1
-        pre_frags = []
-        for s in cutlass.range_constexpr(num_pre_sets):
-            pre_frags.append(
-                self._reducer_issue_set(partial_params, s * self.reducer_batch_splits)
+        # Work list: requests with a single split stored their final output; their
+        # CTAs exit before allocating or waiting (the counts and lengths come from
+        # the plan and the inputs, complete before the split kernel).
+        reduce_row = True
+        if cutlass.const_expr(self.use_work_list):
+            reduce_row = local_split_kv > 1
+        if reduce_row:
+            # Alloc shared memory
+            smem = cutlass.memory.SmemAllocator()
+            # LSE phase: one weight per lane of warp 0
+            reducer_scale_count = (
+                ceil_div(self.reducer_max_splits, self.threads_per_warp)
+                * self.threads_per_warp
+            )
+            storage = smem.allocate(reducer_scale_count * self.acc_dtype.width // 8, 16)
+            lse_scale_ptr = cute.recast_ptr(storage, dtype=self.acc_dtype)
+            smem_lse_scale = cute.make_tensor(
+                lse_scale_ptr, cute.make_layout(reducer_scale_count)
             )
 
-        gLSE = mAccLSE[acc_row, None, acc_tile, blk_coord[2]]
-        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        if warp_idx == 0:
-            # calculate the global lse and exp ^ (local_lse - global_lse)
-            lse_per_thread = cute.ceil_div(
-                self.reducer_max_splits, self.threads_per_warp
-            )
+            # let the next split kernel get scheduled early; its own wait still orders the data
+            cute.arch.griddepcontrol_launch_dependents()
+            cute.arch.griddepcontrol_wait()
 
-            local_lse = cute.make_rmem_tensor(
-                cute.make_layout(lse_per_thread), self.lse_dtype
+            # issue the first set of partial loads before the LSE phase; later sets
+            # only if the row needs them
+            reducer_threads = self.threads_per_warp * self.num_compute_warps
+            vec = self.reducer_d_tile // reducer_threads
+            gAccO = mAccO[acc_row, None, None, acc_tile, blk_coord[2]]
+            band_ptr = cute.make_ptr(
+                self.partial_dtype,
+                (gAccO.iterator + d_tile_idx * self.reducer_d_tile).toint(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
             )
-            lse_max = -self.lse_dtype.inf
-            # find the max lse
-            for i in cutlass.range_constexpr(lse_per_thread):
-                split_kv_idx = tidx + i * self.threads_per_warp
-                local_lse[i] = (
-                    gLSE[split_kv_idx]
-                    if cute.elem_less(split_kv_idx, local_split_kv)
+            partial_copy_atom = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(),
+                self.partial_dtype,
+                num_bits_per_copy=vec * self.partial_dtype.width,
+            )
+            partial_thr_copy = cute.make_tiled_copy_tv(
+                partial_copy_atom,
+                cute.make_ordered_layout((1, reducer_threads), order=(1, 0)),
+                cute.make_layout((1, vec)),
+            ).get_slice(tidx)
+            partial_params = SimpleNamespace(
+                band_ptr=band_ptr,
+                split_stride=gAccO.stride[0],
+                copy_atom=partial_copy_atom,
+                thr_copy=partial_thr_copy,
+                local_split_kv=local_split_kv,
+                has_local_visible_lens=has_local_visible_lens,
+                smem_lse_scale=smem_lse_scale,
+                vec=vec,
+            )
+            num_sets = ceil_div(self.reducer_max_splits, self.reducer_batch_splits)
+            num_pre_sets = 1
+            pre_frags = []
+            for s in cutlass.range_constexpr(num_pre_sets):
+                pre_frags.append(
+                    self._reducer_issue_set(partial_params, s * self.reducer_batch_splits)
+                )
+
+            gLSE = mAccLSE[acc_row, None, acc_tile, blk_coord[2]]
+            warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+            if warp_idx == 0:
+                # calculate the global lse and exp ^ (local_lse - global_lse)
+                lse_per_thread = cute.ceil_div(
+                    self.reducer_max_splits, self.threads_per_warp
+                )
+
+                local_lse = cute.make_rmem_tensor(
+                    cute.make_layout(lse_per_thread), self.lse_dtype
+                )
+                lse_max = -self.lse_dtype.inf
+                # find the max lse
+                for i in cutlass.range_constexpr(lse_per_thread):
+                    split_kv_idx = tidx + i * self.threads_per_warp
+                    local_lse[i] = (
+                        gLSE[split_kv_idx]
+                        if cute.elem_less(split_kv_idx, local_split_kv)
+                        else -self.lse_dtype.inf
+                    )
+                    # reduce the local lse
+                    lse_max = cute.arch.fmax(lse_max, local_lse[i])
+                lse_max = cute.arch.warp_reduction_max(lse_max)
+                lse_max = lse_max if lse_max != -self.lse_dtype.inf else 0.0
+                # calculate sum_lse
+                sum_lse = 0.0
+                for i in cutlass.range_constexpr(lse_per_thread):
+                    sum_lse += cute.math.exp2(local_lse[i] - lse_max, fastmath=True)
+                sum_lse = cute.arch.warp_reduction_sum(sum_lse)
+                # calculate the global_lse
+                global_lse = (
+                    lse_max + cute.math.log2(sum_lse, fastmath=True)
+                    if not sum_lse == self.lse_dtype(0.0)
+                    or sum_lse != sum_lse  # noqa: SIM201
                     else -self.lse_dtype.inf
                 )
-                # reduce the local lse
-                lse_max = cute.arch.fmax(lse_max, local_lse[i])
-            lse_max = cute.arch.warp_reduction_max(lse_max)
-            lse_max = lse_max if lse_max != -self.lse_dtype.inf else 0.0
-            # calculate sum_lse
-            sum_lse = 0.0
-            for i in cutlass.range_constexpr(lse_per_thread):
-                sum_lse += cute.math.exp2(local_lse[i] - lse_max, fastmath=True)
-            sum_lse = cute.arch.warp_reduction_sum(sum_lse)
-            # calculate the global_lse
-            global_lse = (
-                lse_max + cute.math.log2(sum_lse, fastmath=True)
-                if not sum_lse == self.lse_dtype(0.0)
-                or sum_lse != sum_lse  # noqa: SIM201
-                else -self.lse_dtype.inf
-            )
-            if tidx == 0 and d_tile_idx == 0:
-                if cutlass.const_expr(not self.skip_lse):
-                    mLSE[blk_coord[0], blk_coord[1], blk_coord[2]] = global_lse
-            # store the scale to shared memory, including output_scale (0 past local_split_kv)
-            for i in cutlass.range_constexpr(lse_per_thread):
-                split_kv_idx = tidx + i * self.threads_per_warp
-                smem_lse_scale[split_kv_idx] = (
-                    cute.math.exp2(local_lse[i] - global_lse, fastmath=True)
-                    * output_scale
-                    if not has_local_visible_lens or sum_lse != 0.0
-                    else 0.0
+                if tidx == 0 and d_tile_idx == 0:
+                    if cutlass.const_expr(not self.skip_lse):
+                        mLSE[blk_coord[0], blk_coord[1], blk_coord[2]] = global_lse
+                # store the scale to shared memory, including output_scale (0 past local_split_kv)
+                for i in cutlass.range_constexpr(lse_per_thread):
+                    split_kv_idx = tidx + i * self.threads_per_warp
+                    smem_lse_scale[split_kv_idx] = (
+                        cute.math.exp2(local_lse[i] - global_lse, fastmath=True)
+                        * output_scale
+                        if not has_local_visible_lens or sum_lse != 0.0
+                        else 0.0
+                    )
+
+            pipeline.sync(barrier_id=4)
+
+            rAccO = cute.make_rmem_tensor(cute.make_layout(vec), self.acc_dtype)
+            rAccO.fill(0.0)
+            for s in cutlass.range_constexpr(num_pre_sets):
+                self._reducer_accumulate_set(
+                    partial_params, pre_frags[s], s * self.reducer_batch_splits, rAccO
                 )
-
-        pipeline.sync(barrier_id=4)
-
-        rAccO = cute.make_rmem_tensor(cute.make_layout(vec), self.acc_dtype)
-        rAccO.fill(0.0)
-        for s in cutlass.range_constexpr(num_pre_sets):
-            self._reducer_accumulate_set(
-                partial_params, pre_frags[s], s * self.reducer_batch_splits, rAccO
+            for s in cutlass.range_constexpr(num_pre_sets, num_sets):
+                first = s * self.reducer_batch_splits
+                if local_split_kv > first:
+                    frag = self._reducer_issue_set(partial_params, first)
+                    self._reducer_accumulate_set(partial_params, frag, first, rAccO)
+            rO = cute.make_rmem_tensor(cute.make_layout(vec), self.o_dtype)
+            rO.store(rAccO.load().to(self.o_dtype))
+            gO = mO[blk_coord[0], None, blk_coord[1], blk_coord[2]]
+            out_ptr = cute.make_ptr(
+                self.o_dtype,
+                (gO.iterator + d_tile_idx * self.reducer_d_tile + tidx * vec).toint(),
+                cute.AddressSpace.gmem,
+                assumed_align=vec * self.o_dtype.width // 8,
             )
-        for s in cutlass.range_constexpr(num_pre_sets, num_sets):
-            first = s * self.reducer_batch_splits
-            if local_split_kv > first:
-                frag = self._reducer_issue_set(partial_params, first)
-                self._reducer_accumulate_set(partial_params, frag, first, rAccO)
-        rO = cute.make_rmem_tensor(cute.make_layout(vec), self.o_dtype)
-        rO.store(rAccO.load().to(self.o_dtype))
-        gO = mO[blk_coord[0], None, blk_coord[1], blk_coord[2]]
-        out_ptr = cute.make_ptr(
-            self.o_dtype,
-            (gO.iterator + d_tile_idx * self.reducer_d_tile + tidx * vec).toint(),
-            cute.AddressSpace.gmem,
-            assumed_align=vec * self.o_dtype.width // 8,
-        )
-        cute.autovec_copy(rO, cute.make_tensor(out_ptr, cute.make_layout(vec)))
+            cute.autovec_copy(rO, cute.make_tensor(out_ptr, cute.make_layout(vec)))
 
     @cute.jit
     def _reducer_issue_set(self, params: SimpleNamespace, first: int) -> cute.Tensor:
@@ -3876,7 +3883,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
     @cute.jit
     def _tmem_load_partition(
-        self, common_params: SimpleNamespace, tiled_mma_pv: cute.TiledMma, iter_n: int
+        self,
+        common_params: SimpleNamespace,
+        tiled_mma_pv: cute.TiledMma,
+        iter_n: int,
+        final: cutlass.Constexpr = False,
     ) -> tuple[
         cute.TiledMma, cute.TiledMma, cute.TiledMma, cute.TiledMma, cute.TiledMma
     ]:
@@ -3950,7 +3961,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         cta_pv_tiler_mn = cute.select(cta_pv_tiler, mode=[0, 1])
 
         gO = None
-        if cutlass.const_expr(common_params.mAccO is not None):
+        if cutlass.const_expr(common_params.mAccO is not None and not final):
             gO = cute.local_tile(
                 common_params.mAccO[None, common_params.blk_coord[3], None, None, None],
                 cta_pv_tiler_mn,
@@ -4258,6 +4269,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         else:
             epi_scale = cute.arch.rcp_approx(safe_row_sum)
             store_dtype = self.partial_dtype
+        # Work list: a request with a single split stores its final output (with
+        # output_scale) instead of a partial, and the reduction skips it.
+        direct_final = False
+        if cutlass.const_expr(self.use_work_list and common_params.mAccO is not None):
+            direct_final = common_params.local_split_kv == 1
+        final_scale = epilogue_params.output_scale * cute.arch.rcp_approx(safe_row_sum)
 
         # mma_o pipeline consumer wait
         for iter_n in cutlass.range_constexpr(self.iterations_pv_n):
@@ -4294,37 +4311,24 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                             tTR_gO[None, None, d_sub],
                             l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
                         )
-            else:
-                # Subtiled elementwise + STG: elementwise of subtile N+1 overlaps
-                # with STG of subtile N via instruction-level parallelism.
-                # tTR_rAcc shape: ((V, 1), 1, rest_tiles) where rest_tiles = 4.
-                # Split along rest_tiles (mode 2) for subtiling.
-                num_epi_subtiles = tTR_rAcc.shape[2]
-                vec_size = cute.size(cute.select(tTR_rAcc.shape, mode=[0]))
-
-                # Prepare output fragment for type conversion
-                tR2G_rO_src = cute.make_fragment_like(tTR_gO, store_dtype)
-                tR2G_rO_dst = tTR_gO
-
-                for d_sub in cutlass.range_constexpr(num_epi_subtiles):
-                    # Elementwise: scale and normalize (using pre-computed epi_scale)
-                    for i in cutlass.range(vec_size, vectorize=True, unroll_full=True):
-                        tTR_rAcc[i, 0, d_sub] = tTR_rAcc[i, 0, d_sub] * epi_scale
-
-                    # Type convert per subtile using vectorized load/to/store
-                    # (scalar f32→fp8 cvt is not supported by hardware)
-                    tR2G_rO_src[None, None, d_sub].store(
-                        tTR_rAcc[None, None, d_sub].load().to(store_dtype)
+            elif cutlass.const_expr(
+                self.use_work_list and common_params.mAccO is not None
+            ):
+                if direct_final:
+                    _, _, _, tTR_gF, tTR_cF, _ = self._tmem_load_partition(
+                        common_params, common_params.tiled_mma_pv, iter_n, final=True
                     )
-
-                    # Store this subtile to global memory using autovec_copy
-                    # for vectorized stores (STG.128).
-                    if cute.elem_less(tTR_cO[0][0], common_params.H):
-                        cute.autovec_copy(
-                            tR2G_rO_src[None, None, d_sub],
-                            tR2G_rO_dst[None, None, d_sub],
-                            l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
-                        )
+                    self._store_rows(
+                        tTR_rAcc, tTR_gF, tTR_cF, final_scale, self.o_dtype, common_params.H
+                    )
+                else:
+                    self._store_rows(
+                        tTR_rAcc, tTR_gO, tTR_cO, epi_scale, store_dtype, common_params.H
+                    )
+            else:
+                self._store_rows(
+                    tTR_rAcc, tTR_gO, tTR_cO, epi_scale, store_dtype, common_params.H
+                )
 
             # store the lse to global memory
             cta_pv_tiler = (
@@ -4365,48 +4369,74 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         if cute.elem_less(cLSE[tidx][0], common_params.H):
                             gLSE[tidx] = lse
             else:
-                lse = (
-                    cute.math.log2(row_sum, fastmath=True)
-                    + epilogue_params.softmax_scale_log2 * row_max
-                )
-                gLSE = cute.local_tile(
-                    epilogue_params.mAccLSE[
-                        None, common_params.blk_coord[3], None, None
-                    ],
-                    (cta_pv_tiler[0], 1, 1),
-                    (
-                        common_params.blk_coord[0],
-                        common_params.blk_coord[1],
-                        common_params.blk_coord[2],
-                    ),
-                    (1, 1, 1),
-                )
-                cLSE = cute.local_tile(
-                    cute.make_identity_tensor(
+                if not direct_final:
+                    lse = (
+                        cute.math.log2(row_sum, fastmath=True)
+                        + epilogue_params.softmax_scale_log2 * row_max
+                    )
+                    gLSE = cute.local_tile(
                         epilogue_params.mAccLSE[
                             None, common_params.blk_coord[3], None, None
-                        ].shape
-                    ),
-                    (cta_pv_tiler[0], 1, 1),
-                    (
-                        common_params.blk_coord[0],
-                        common_params.blk_coord[1],
-                        common_params.blk_coord[2],
-                    ),
-                    (1, 1, 1),
-                )
-                if cutlass.const_expr(self.use_m64_ws):
-                    if cute.elem_less(cLSE[tidx][0], common_params.H):
-                        gLSE[tidx] = lse
-                elif cutlass.const_expr(self.warps_in_n == 2):
-                    if cute.elem_less(cLSE[tidx][0], common_params.H):
-                        gLSE[tidx] = lse
+                        ],
+                        (cta_pv_tiler[0], 1, 1),
+                        (
+                            common_params.blk_coord[0],
+                            common_params.blk_coord[1],
+                            common_params.blk_coord[2],
+                        ),
+                        (1, 1, 1),
+                    )
+                    cLSE = cute.local_tile(
+                        cute.make_identity_tensor(
+                            epilogue_params.mAccLSE[
+                                None, common_params.blk_coord[3], None, None
+                            ].shape
+                        ),
+                        (cta_pv_tiler[0], 1, 1),
+                        (
+                            common_params.blk_coord[0],
+                            common_params.blk_coord[1],
+                            common_params.blk_coord[2],
+                        ),
+                        (1, 1, 1),
+                    )
+                    if cutlass.const_expr(self.use_m64_ws):
+                        if cute.elem_less(cLSE[tidx][0], common_params.H):
+                            gLSE[tidx] = lse
+                    elif cutlass.const_expr(self.warps_in_n == 2):
+                        if cute.elem_less(cLSE[tidx][0], common_params.H):
+                            gLSE[tidx] = lse
 
             cute.arch.fence_view_async_tmem_load()
             common_params.mma_o_pipeline.consumer_release(mma_o_consumer_state)
             mma_o_consumer_state.advance()
 
         return mma_o_consumer_state
+
+    @cute.jit
+    def _store_rows(self, tTR_rAcc, tTR_gO, tTR_cO, scale, store_dtype, H):
+        """Scale the accumulator rows, convert and store them (rows < ``H``).
+
+        Subtiled elementwise + STG: elementwise of subtile N+1 overlaps with STG
+        of subtile N via instruction-level parallelism. tTR_rAcc shape:
+        ((V, 1), 1, rest_tiles) where rest_tiles = 4, split along mode 2."""
+        num_epi_subtiles = tTR_rAcc.shape[2]
+        vec_size = cute.size(cute.select(tTR_rAcc.shape, mode=[0]))
+        tR2G_rO_src = cute.make_fragment_like(tTR_gO, store_dtype)
+        for d_sub in cutlass.range_constexpr(num_epi_subtiles):
+            for i in cutlass.range(vec_size, vectorize=True, unroll_full=True):
+                tTR_rAcc[i, 0, d_sub] = tTR_rAcc[i, 0, d_sub] * scale
+            # vectorized load/to/store (scalar f32->fp8 cvt is not supported)
+            tR2G_rO_src[None, None, d_sub].store(
+                tTR_rAcc[None, None, d_sub].load().to(store_dtype)
+            )
+            # vectorized stores (STG.128)
+            if cute.elem_less(tTR_cO[0][0], H):
+                cute.autovec_copy(
+                    tR2G_rO_src[None, None, d_sub],
+                    tTR_gO[None, None, d_sub],
+                    l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
+                )
 
     def make_and_init_load_qkv_pipeline(
         self, load_qkv_mbar_ptr, cta_layout_vmnk, load_stages, tx_count

@@ -218,6 +218,8 @@ class WorkListMla:
         self.use_pdl = use_pdl
         self.arch = torch.cuda.get_device_capability(device)
         max_requests = -(-max_tokens // q)
+        # HardwareInfo queries the current CUDA context: make sure there is one.
+        torch.empty(0, device=device)
         # Query rows are packed into 128-row tiles, one 2-CTA cluster each.
         self.q_tiles = -(-heads * q // 128)
         self.clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(2)
