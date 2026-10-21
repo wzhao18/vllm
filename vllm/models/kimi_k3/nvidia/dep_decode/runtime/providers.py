@@ -56,9 +56,10 @@ class KdaAttention:
         weight = module.conv1d.weight
         self.conv_weight = weight.view(weight.size(0), weight.size(2))
         self.out_proj = KdaOutProj(module)
-        # The verify kernel fuses the short convolution (SiLU, no bias) for a
-        # token-major conv state; a dim-major state keeps the stock convolution.
-        self.fused_conv = not is_conv_state_dim_first() and module.conv1d.bias is None
+        # The verify kernel fuses the short convolution (SiLU, no bias), for either
+        # conv-state layout (token major, or dim first: VLLM_SSM_CONV_STATE_LAYOUT=DS).
+        self.fused_conv = module.conv1d.bias is None
+        self.conv_dim_first = is_conv_state_dim_first()
         # The fused q/k/v/gate/f_a/beta projection on the MXFP8 layer input.
         self.in_proj = fp8_rows(module.in_proj_qkvgfab)
 
@@ -113,7 +114,7 @@ class KdaAttention:
         starts = md.spec_query_start_loc[: requests + 1]
         core = x.new_empty((x.shape[0], m.local_num_heads * m.head_dim))
         if self.fused_conv:
-            # The verify kernel applies the short convolution (token-major state).
+            # The verify kernel applies the short convolution to the stored state.
             kda_cute_verify(
                 mixed[:tokens],
                 gate[:tokens],
@@ -129,6 +130,7 @@ class KdaAttention:
                 q,
                 core[:tokens],
                 conv=(m.kv_cache[0], self.conv_weight, md.num_accepted_tokens),
+                conv_dim_first=self.conv_dim_first,
             )
             return self.out_proj(core, g_proj)
         convolved = torch.empty_like(mixed[:tokens])

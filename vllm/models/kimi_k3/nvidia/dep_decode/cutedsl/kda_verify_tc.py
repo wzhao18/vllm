@@ -149,13 +149,22 @@ class KdaTcVerify:
     """Args: qkv [T, 3HK], raw_g [T, HK], raw_beta [T, H], a_log [H], dt_bias [HK],
     state [slots, H, V, K], corr [slots, H, Q, V], kg [slots, H, Q, 2K], out [T, HV],
     query_start [B + 1], request slots [B], (conv state [slots, Q + 2, 3HK] token
-    major, conv weight [3HK, 4], accepted tokens [B] when ``conv``; qkv is then the
-    raw projection), lower_bound, null slot, stream. ``ctas``: the persistent grid
-    bound (CTAs resident per SM x SMs)."""
+    major, or [slots, 3HK, Q + 2] with ``conv_dim_first``, conv weight [3HK, 4],
+    accepted tokens [B] when ``conv``; qkv is then the raw projection),
+    lower_bound, null slot, stream. ``ctas``: the persistent grid bound (CTAs
+    resident per SM x SMs)."""
 
-    def __init__(self, heads: int, window: int, conv: bool = False, ctas: int = 740):
+    def __init__(
+        self,
+        heads: int,
+        window: int,
+        conv: bool = False,
+        ctas: int = 740,
+        conv_dim_first: bool = False,
+    ):
         assert 1 <= window <= 8
         self.heads, self.window, self.conv, self.ctas = heads, window, conv, ctas
+        self.conv_dim_first = conv_dim_first
 
     @cute.jit
     def __call__(self, *args):
@@ -272,7 +281,10 @@ class KdaTcVerify:
                     for x in cutlass.range_constexpr(3):
                         channel = x * H * K + head * K + c
                         for i in cutlass.range_constexpr(3):
-                            hist[x, i] = conv_state[slot, first + i, channel]
+                            if cutlass.const_expr(self.conv_dim_first):
+                                hist[x, i] = conv_state[slot, channel, first + i]
+                            else:
+                                hist[x, i] = conv_state[slot, first + i, channel]
                         w2 = load_words(at(conv_w, channel, 0), count=2)
                         taps[x, 0], taps[x, 1] = w2[0], w2[1]
                 raw = cute.make_rmem_tensor((3, Q), cutlass.BFloat16)
@@ -287,10 +299,16 @@ class KdaTcVerify:
                     for x in cutlass.range_constexpr(3):
                         channel = x * H * K + head * K + c
                         for i in cutlass.range_constexpr(2):
-                            conv_state[slot, i, channel] = hist[x, i + 1]
+                            if cutlass.const_expr(self.conv_dim_first):
+                                conv_state[slot, channel, i] = hist[x, i + 1]
+                            else:
+                                conv_state[slot, i, channel] = hist[x, i + 1]
                         for t in cutlass.range_constexpr(Q):
                             if t < qlen:
-                                conv_state[slot, 2 + t, channel] = raw[x, t]
+                                if cutlass.const_expr(self.conv_dim_first):
+                                    conv_state[slot, channel, 2 + t] = raw[x, t]
+                                else:
+                                    conv_state[slot, 2 + t, channel] = raw[x, t]
                     # Width-4 convolution and SiLU; products and output round to BF16
                     # (the stock kernel's order).
                     for x in cutlass.range_constexpr(3):

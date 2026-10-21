@@ -93,14 +93,17 @@ class KdaChunkedVerify:
         conv: bool = False,
         norm: bool = False,
         warps: int = DEFAULT_WARPS,
+        conv_dim_first: bool = False,
     ):
         assert 1 <= window <= 8 and heads % warps == 0
         self.warps = warps
         self.heads, self.window, self.stages = heads, window, stages
         # Fused short convolution: qkv is the raw projection, and three more
         # tensors follow the request slots: conv state [slots, Q + 2, 3HK] (token
-        # major), conv weight [3HK, 4] and accepted tokens [B].
+        # major, or [slots, 3HK, Q + 2] with ``conv_dim_first``), conv weight
+        # [3HK, 4] and accepted tokens [B].
         self.conv = conv
+        self.conv_dim_first = conv_dim_first
         # Fused output epilogue: KDA's gated RMSNorm (sigmoid gate) and MXFP8
         # quantization of the result, written instead of ``out``. Four more tensors
         # follow (after the conv tensors): g_proj [T, HK], norm weight [K], E4M3
@@ -217,12 +220,21 @@ class KdaChunkedVerify:
                 for x in cutlass.range_constexpr(3):
                     channel = x * H * K + head * K + c0
                     for i in cutlass.range_constexpr(3):
-                        w2 = load_words(
-                            at(conv_state, slot, first + i, channel),
-                            count=2,
-                            mutable=True,
-                        )
-                        hist[x, i, 0], hist[x, i, 1] = w2[0], w2[1]
+                        if cutlass.const_expr(self.conv_dim_first):
+                            # Channel-major state: 4 scalar loads, repacked.
+                            v4 = [
+                                conv_state[slot, channel + e, first + i].to(Float32)
+                                for e in range(4)
+                            ]
+                            hist[x, i, 0] = bf16x2(v4[0], v4[1])
+                            hist[x, i, 1] = bf16x2(v4[2], v4[3])
+                        else:
+                            w2 = load_words(
+                                at(conv_state, slot, first + i, channel),
+                                count=2,
+                                mutable=True,
+                            )
+                            hist[x, i, 0], hist[x, i, 1] = w2[0], w2[1]
                     for e in cutlass.range_constexpr(4):
                         w2 = load_words(at(conv_w, channel + e, 0), count=2)
                         taps[x, e, 0], taps[x, e, 1] = w2[0], w2[1]
@@ -249,17 +261,29 @@ class KdaChunkedVerify:
                 # tokens (causal_conv1d_update's speculative layout).
                 for x in cutlass.range_constexpr(3):
                     channel = x * H * K + head * K + c0
-                    for i in cutlass.range_constexpr(2):
-                        store_words(
-                            at(conv_state, slot, i, channel),
-                            (hist[x, i + 1, 0], hist[x, i + 1, 1]),
-                        )
-                    for t in cutlass.range_constexpr(Q):
-                        if t < qlen:
+                    if cutlass.const_expr(self.conv_dim_first):
+                        for e in cutlass.range_constexpr(4):
+                            for i in cutlass.range_constexpr(2):
+                                conv_state[slot, channel + e, i] = bf16(
+                                    hist[x, i + 1, e // 2], e % 2
+                                ).to(cutlass.BFloat16)
+                            for t in cutlass.range_constexpr(Q):
+                                if t < qlen:
+                                    conv_state[slot, channel + e, 2 + t] = bf16(
+                                        act[t, x, e // 2], e % 2
+                                    ).to(cutlass.BFloat16)
+                    else:
+                        for i in cutlass.range_constexpr(2):
                             store_words(
-                                at(conv_state, slot, 2 + t, channel),
-                                (act[t, x, 0], act[t, x, 1]),
+                                at(conv_state, slot, i, channel),
+                                (hist[x, i + 1, 0], hist[x, i + 1, 1]),
                             )
+                        for t in cutlass.range_constexpr(Q):
+                            if t < qlen:
+                                store_words(
+                                    at(conv_state, slot, 2 + t, channel),
+                                    (act[t, x, 0], act[t, x, 1]),
+                                )
                 # Width-4 convolution and SiLU; products round to BF16 and the
                 # output to BF16, as the stock kernel's.
                 for x in cutlass.range_constexpr(3):

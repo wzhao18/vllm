@@ -30,9 +30,16 @@ def _compile_variant(
     conv: bool = False,
     norm_dtype: torch.dtype | None = None,
     warps: int = DEFAULT_WARPS,
+    conv_dim_first: bool = False,
 ):
     kernel = KdaChunkedVerify(
-        heads, window, stages, conv, norm=norm_dtype is not None, warps=warps
+        heads,
+        window,
+        stages,
+        conv,
+        norm=norm_dtype is not None,
+        warps=warps,
+        conv_dim_first=conv_dim_first,
     )
     bf16, f32, i32 = torch.bfloat16, torch.float32, torch.int32
     fakes = (
@@ -50,7 +57,9 @@ def _compile_variant(
     )
     if conv:
         fakes += (
-            dynamic_fake(3, bf16),  # conv state [slots, Q + 2, 3HK]
+            dynamic_fake(
+                3, bf16
+            ),  # conv state [slots, Q + 2, 3HK] or [slots, 3HK, Q + 2]
             dynamic_fake(2, bf16),  # conv weight [3HK, 4]
             dynamic_fake(1, i32),  # accepted tokens
         )
@@ -74,8 +83,12 @@ def _compile_variant(
 
 def _compile(heads: int, window: int, arch: str):
     """Compile the verify variants a decode step launches (plain, and the tcgen05 one
-    with the fused convolution), outside graph capture; returns the plain one."""
-    _compile_tc(heads, window, arch, _tc_ctas(torch.cuda.current_device()))
+    with the fused convolution for the deployment's conv-state layout), outside graph
+    capture; returns the plain one."""
+    from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+
+    ctas = _tc_ctas(torch.cuda.current_device())
+    _compile_tc(heads, window, arch, ctas, is_conv_state_dim_first())
     return _compile_variant(heads, window, arch)
 
 
@@ -96,11 +109,13 @@ def kda_cute_verify(
     conv: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     norm: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]
     | None = None,
+    conv_dim_first: bool = False,
 ) -> torch.Tensor:
     """``kda_recoverssm_verify`` on 2-D views: ``mixed_qkv`` [T, 3 * H * 128] (the
     convolution output), ``raw_g`` [T, H * 128], ``raw_beta`` [T, H], ``out``
     [T, H * 128]. With ``conv`` = (conv state [slots, Q + 2, 3 * H * 128] token
-    major, conv weight [3 * H * 128, 4], accepted tokens [B]), ``mixed_qkv`` is the
+    major, or [slots, 3 * H * 128, Q + 2] with ``conv_dim_first``, conv weight
+    [3 * H * 128, 4], accepted tokens [B]), ``mixed_qkv`` is the
     projection and the kernel applies ``causal_conv1d_update`` (SiLU, no bias,
     speculative rolling) first. With ``norm`` = (g_proj [T, H * 128], norm weight
     [128], E4M3 values [T, H * 128], swizzled scales, eps), the output is KDA's
@@ -112,7 +127,11 @@ def kda_cute_verify(
     if conv is not None and norm is None:
         # The fused convolution runs on the tcgen05 verify (faster at every batch).
         code = _compile_tc(
-            heads, spec_query_len, architecture(device), _tc_ctas(device)
+            heads,
+            spec_query_len,
+            architecture(device),
+            _tc_ctas(device),
+            conv_dim_first,
         )
         tensors = (
             mixed_qkv,
@@ -140,6 +159,7 @@ def kda_cute_verify(
         architecture(mixed_qkv.device),
         conv=conv is not None,
         norm_dtype=None if norm is None else norm[1].dtype,
+        conv_dim_first=conv_dim_first,
     )
     tensors = (
         mixed_qkv,
@@ -321,7 +341,9 @@ class MlaOutProj:
 
 
 @cache
-def _compile_tc(heads: int, window: int, arch: str, ctas: int):
+def _compile_tc(
+    heads: int, window: int, arch: str, ctas: int, conv_dim_first: bool = False
+):
     """The tcgen05 verify with the fused convolution (``cutedsl/kda_verify_tc.py``)."""
     from .cutedsl.kda_verify_tc import KdaTcVerify
 
@@ -338,12 +360,12 @@ def _compile_tc(heads: int, window: int, arch: str, ctas: int):
         dynamic_fake(2, bf16),  # out
         dynamic_fake(1, i32),  # query_start
         dynamic_fake(1, i32),  # slots
-        dynamic_fake(3, bf16),  # conv state [slots, Q + 2, 3HK]
+        dynamic_fake(3, bf16),  # conv state [slots, Q + 2, 3HK] or [slots, 3HK, Q + 2]
         dynamic_fake(2, bf16),  # conv weight [3HK, 4]
         dynamic_fake(1, i32),  # accepted tokens
     )
     return cute.compile(
-        KdaTcVerify(heads, window, conv=True, ctas=ctas),
+        KdaTcVerify(heads, window, conv=True, ctas=ctas, conv_dim_first=conv_dim_first),
         *fakes,
         cutlass.Float32(0),
         cutlass.Int32(0),
