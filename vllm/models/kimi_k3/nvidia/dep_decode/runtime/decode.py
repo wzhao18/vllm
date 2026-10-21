@@ -119,23 +119,20 @@ class DepDecode:
         )
 
         from ...specialized_decode.cutedsl.common.host import architecture
-        from ..cutedsl.streamk_gemm import SUPPORTED_TILE_N
         from ..elementwise import (
             gated_rms_norm_mxfp8,
             rms_norm_mxfp8,
             sigmoid_gate_mxfp8,
             situ_and_mul_mxfp8,
         )
-        from ..gemm import StreamKScratch, _compile
+        from ..gemm import StreamKScratch, compile_all
         from ..kda_verify import _compile as compile_verify
         from ..kda_verify import compile_state_commit
 
         embed = self.backbone.embed_tokens.weight
         device, dtype = embed.device, embed.dtype
         StreamKScratch.get(device)
-        for tile_n in SUPPORTED_TILE_N:
-            for residual in (False, True):
-                _compile(tile_n, residual, 4)
+        compile_all()
         kda = [a for a in self.attention.values() if isinstance(a, KdaAttention)]
         mla = [a for a in self.attention.values() if isinstance(a, MlaAttention)]
         moe = [f for f in self.feed_forward.values() if isinstance(f, DepMoE)]

@@ -32,10 +32,14 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
-from cutlass import Float32, Int32
+from cutlass import Float32, Int32, Uint32
 from cutlass.cute.arch import griddepcontrol_launch_dependents, griddepcontrol_wait
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.pipeline import PipelineTmaUmma, PipelineUmmaAsync
+from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.primitives import (
+    asm,
+)
+
 from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm100 import (
     Sm100BlockScaledPersistentDenseGemmKernel,
     _l2_cache_policy,
@@ -54,6 +58,56 @@ def _cta_of(block: Int32, total: Int32, grid: Int32) -> Int32:
 @cute.jit
 def _cta_start(cta: Int32, total: Int32, grid: Int32) -> Int32:
     return cta * total // grid
+
+
+@asm(Uint32, pure=True)
+def _mapa(address, rank):
+    """The shared::cluster address of ``address`` (shared::cta) in CTA ``rank``."""
+    return (
+        "mapa.shared::cluster.u32 $0, $1, $2;",
+        "=r,r,r",
+        (Uint32(address), Int32(rank)),
+    )
+
+
+@asm()
+def _remote_arrive(address):
+    """Release-arrive on the cluster mbarrier at shared::cluster ``address``."""
+    code = "mbarrier.arrive.release.cluster.shared::cluster.b64 _, [$0];"
+    return code, "r,~{memory}", (Uint32(address),)
+
+
+@asm()
+def _wait_cluster(address, phase):
+    """Wait (acquire, cluster scope) for the local mbarrier phase ``phase``."""
+    code = (
+        "{ .reg .pred p; WAIT_${:uid}: "
+        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [$0], $1; "
+        "@!p bra WAIT_${:uid}; }"
+    )
+    return code, "r,r,~{memory}", (Uint32(address), Int32(phase))
+
+
+@asm()
+def _store_cluster4(address, a, b, c, d):
+    code = "st.shared::cluster.v4.f32 [$0], {$1, $2, $3, $4};"
+    return code, "r,f,f,f,f,~{memory}", (Uint32(address), a, b, c, d)
+
+
+@asm((Float32,) * 4)
+def _load_shared4(address):
+    code = "ld.shared.v4.f32 {$0, $1, $2, $3}, [$4];"
+    return code, "=f,=f,=f,=f,r,~{memory}", (Uint32(address),)
+
+
+@asm()
+def _cluster_arrive():
+    return "barrier.cluster.arrive.release;", "~{memory}", ()
+
+
+@asm()
+def _cluster_wait():
+    return "barrier.cluster.wait.acquire;", "~{memory}", ()
 
 
 @cute.jit
@@ -96,6 +150,8 @@ class DepMxfp8StreamKGemm(Sm100BlockScaledPersistentDenseGemmKernel):
         b_stages: int = 4,
         ablate: int = 0,
         k_tile: int = 128,
+        ksplit: int = 1,
+        peer_deficit: int = 0,
     ):
         if tile_n not in SUPPORTED_TILE_N:
             raise ValueError(f"tile_n must be one of {SUPPORTED_TILE_N}, got {tile_n}")
@@ -119,6 +175,20 @@ class DepMxfp8StreamKGemm(Sm100BlockScaledPersistentDenseGemmKernel):
         self.threads_per_cta = 32 * 7
         # Profiling only: 1 skips split-tile reduction, 2 also skips stores.
         self.ablate = ablate
+        # Cluster split-K: ``ksplit`` CTAs (one cluster) share each row tile, each
+        # streaming 1 / ksplit of its K range; the peers hand their FP32
+        # accumulators to the leader (rank 0) through distributed shared memory.
+        assert ksplit in (1, 2, 4)
+        self.ksplit = ksplit
+        # K blocks each peer hands to the leader, so the peers finish (and hand
+        # over their accumulators) while the leader still streams.
+        self.peer_deficit = peer_deficit
+        if ksplit > 1:
+            # The peers' FP32 accumulators land in a buffer of the leader's (written
+            # while the leader still streams); it fits next to the weight stages
+            # for tiles of up to 96 tokens.
+            assert tile_n <= 96, "cluster split-K needs tiles of at most 96 tokens"
+            self.smem_capacity -= (ksplit - 1) * ROW_TILE * tile_n * 4 + 1024
         if residual:
             # The residual tile is prefetched whole into shared memory.
             self.smem_capacity -= ROW_TILE * tile_n * 2 + 1024
@@ -256,6 +326,7 @@ class DepMxfp8StreamKGemm(Sm100BlockScaledPersistentDenseGemmKernel):
         )
         self.r_epi_tile_bytes = cute.size_in_bytes(self.c_dtype, epi_smem_layout)
         r_elems = cute.cosize(self.r_smem_layout_staged.outer) if self.residual else 128
+        peer_elems = max(4, (self.ksplit - 1) * ROW_TILE * self.cta_tile_shape_mnk[1])
 
         self.buffer_align_bytes = 1024
 
@@ -269,6 +340,8 @@ class DepMxfp8StreamKGemm(Sm100BlockScaledPersistentDenseGemmKernel):
             acc_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage]
             tmem_holding_buf: cutlass.Int32
             r_full_mbar_ptr: cutlass.Int64
+            ksplit_full: cutlass.Int64
+            sP: cute.struct.Align[cute.struct.MemRange[Float32, peer_elems], 16]
             sC: cute.struct.Align[
                 cute.struct.MemRange[
                     self.c_dtype, cute.cosize(self.c_smem_layout_staged.outer)
@@ -337,7 +410,7 @@ class DepMxfp8StreamKGemm(Sm100BlockScaledPersistentDenseGemmKernel):
         ).launch(
             grid=[grid_ctas, 1, 1],
             block=[self.threads_per_cta, 1, 1],
-            cluster=(1, 1, 1),
+            cluster=(self.ksplit, 1, 1),
             smem=self.shared_storage.size_in_bytes(),
             min_blocks_per_mp=1,
             stream=stream,
@@ -417,7 +490,19 @@ class DepMxfp8StreamKGemm(Sm100BlockScaledPersistentDenseGemmKernel):
             ),
             cta_layout_vmnk=cluster_layout_vmnk,
         )
+        ksplit_full = storage.ksplit_full.ptr
+        if cutlass.const_expr(self.ksplit > 1):
+            if warp_idx == 0:
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_init(
+                        ksplit_full, (self.ksplit - 1) * 32 * len(self.epilog_warp_id)
+                    )
         cute.arch.mbarrier_init_fence()
+        if cutlass.const_expr(self.ksplit > 1):
+            # Peers arrive on each other's barriers, which must be initialized:
+            # every thread arrives here, the epilogue waits before its first
+            # remote access (the main loop hides the round trip).
+            _cluster_arrive()
 
         sA = storage.sA.get_tensor(
             a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner
@@ -453,6 +538,28 @@ class DepMxfp8StreamKGemm(Sm100BlockScaledPersistentDenseGemmKernel):
         total = row_tiles * k_blocks
         seg_begin = _cta_start(cta, total, grid)
         seg_end = _cta_start(cta + 1, total, grid)
+        rank = Int32(0)
+        if cutlass.const_expr(self.ksplit > 1):
+            # One row tile per cluster; rank r streams its r-th share of the K range.
+            rank = cta % self.ksplit
+            tile0 = cta // self.ksplit
+            shift = self.peer_deficit * (self.ksplit - 1)
+            seg_begin = tile0 * k_blocks
+            if rank > 0:
+                seg_begin = (
+                    seg_begin
+                    + rank * k_blocks // self.ksplit
+                    + shift
+                    - (rank - 1) * self.peer_deficit
+                )
+            seg_end = tile0 * k_blocks + k_blocks
+            if rank + 1 < self.ksplit:
+                seg_end = (
+                    tile0 * k_blocks
+                    + (rank + 1) * k_blocks // self.ksplit
+                    + shift
+                    - rank * self.peer_deficit
+                )
 
         thr_mma = tiled_mma.get_slice(0)
         thr_mma_sfb = tiled_mma_sfb.get_slice(0)
@@ -748,6 +855,8 @@ class DepMxfp8StreamKGemm(Sm100BlockScaledPersistentDenseGemmKernel):
             )
             slot_elems = num_epi * frag * len(self.epilog_warp_id) * 32
             epi_threads = 32 * len(self.epilog_warp_id)
+            shared_peers = Uint32(storage.sP.data_ptr().toint())
+            shared_full = Uint32(ksplit_full.toint())
 
             acc_consumer = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_acc_stage
@@ -758,7 +867,12 @@ class DepMxfp8StreamKGemm(Sm100BlockScaledPersistentDenseGemmKernel):
                 tile = block // k_blocks
                 tile_first = tile * k_blocks
                 seg_stop = cutlass.min(seg_end, tile_first + k_blocks)
-                partial = (block != tile_first) | (seg_stop != tile_first + k_blocks)
+                if cutlass.const_expr(self.ksplit == 1):
+                    partial = (block != tile_first) | (
+                        seg_stop != tile_first + k_blocks
+                    )
+                else:
+                    partial = False
                 tTR_tAcc = tTR_tAcc_base[
                     (None, None, None, None, None, acc_consumer.index)
                 ]
@@ -813,6 +927,31 @@ class DepMxfp8StreamKGemm(Sm100BlockScaledPersistentDenseGemmKernel):
                             number_of_threads=epi_threads,
                         )
                         cute.arch.fence_acq_rel_gpu()
+                if cutlass.const_expr(self.ksplit > 1):
+                    # Cluster split-K: the peers (their K shares end early) hand their
+                    # accumulators to the leader; release / acquire at cluster scope.
+                    _cluster_wait()
+                    if rank == 0:
+                        _wait_cluster(shared_full, 0)
+                    else:
+                        remote = _mapa(shared_peers, 0) + (rank - 1) * slot_elems * 4
+                        for e in cutlass.range_constexpr(num_epi):
+                            cute.copy(
+                                tiled_copy_t2r,
+                                tTR_tAcc[(None, None, None, e)],
+                                tTR_rAcc,
+                            )
+                            for v in cutlass.range_constexpr(frag // 4):
+                                _store_cluster4(
+                                    remote
+                                    + ((e * (frag // 4) + v) * epi_threads + tidx) * 16,
+                                    tTR_rAcc[4 * v],
+                                    tTR_rAcc[4 * v + 1],
+                                    tTR_rAcc[4 * v + 2],
+                                    tTR_rAcc[4 * v + 3],
+                                )
+                        _remote_arrive(_mapa(shared_full, 0))
+                        is_last = Int32(0)
                 if (is_last == 1) & (self.ablate < 2):
                     if cutlass.const_expr(self.residual):
                         cute.arch.barrier(
@@ -878,6 +1017,20 @@ class DepMxfp8StreamKGemm(Sm100BlockScaledPersistentDenseGemmKernel):
                             tTR_tAcc[(None, None, None, e)],
                             tTR_rAcc,
                         )
+                        if cutlass.const_expr(self.ksplit > 1):
+                            # Leader plus the peers in rank order (deterministic).
+                            for r in cutlass.range_constexpr(1, self.ksplit):
+                                for v in cutlass.range_constexpr(frag // 4):
+                                    peer = _load_shared4(
+                                        shared_peers
+                                        + (r - 1) * slot_elems * 4
+                                        + ((e * (frag // 4) + v) * epi_threads + tidx)
+                                        * 16
+                                    )
+                                    for w in cutlass.range_constexpr(4):
+                                        tTR_rAcc[4 * v + w] = (
+                                            tTR_rAcc[4 * v + w] + peer[w]
+                                        )
                         if partial:
                             # Owner plus the helpers in CTA order: split tiles are
                             # bitwise reproducible.

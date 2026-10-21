@@ -16,6 +16,9 @@ from .cutedsl.streamk_gemm import ROW_TILE, SUPPORTED_TILE_N
 MAX_TILE_N = max(SUPPORTED_TILE_N)
 # Fewer K blocks per CTA than this and the per-CTA fixed cost dominates.
 MIN_BLOCKS_PER_CTA = 4
+# K blocks each cluster split-K peer leaves to the leader so that its hand-over
+# overlaps the leader's last blocks.
+PEER_DEFICIT = 5
 K_BLOCK = 128
 
 
@@ -33,6 +36,15 @@ def default_num_ctas(row_tiles: int, k_blocks: int, sms: int) -> int:
     )
 
 
+def default_ksplit(row_tiles: int, k_blocks: int, sms: int, tile_n: int) -> int:
+    """CTAs per row tile in a cluster split-K: two when whole tiles would leave
+    about half the SMs idle, the tile has at most 96 tokens (the peer buffer fits)
+    and K is long enough for the hand-over to hide (40+ blocks)."""
+    if 2 * row_tiles > sms or 4 * row_tiles < sms:
+        return 1
+    return 2 if tile_n <= 96 and k_blocks >= 40 else 1
+
+
 def tile_n_for(tokens: int) -> int:
     for tile_n in SUPPORTED_TILE_N:
         if tokens <= tile_n:
@@ -47,13 +59,30 @@ def _num_sms(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
-@cache
 def _compile(
     tile_n: int,
     residual: bool,
-    b_stages: int,
+    b_stages: int = 4,
     ablate: int = 0,
     k_tile: int = 128,
+    ksplit: int = 1,
+    peer_deficit: int = 0,
+):
+    """The compiled kernel of a variant (one cache entry however it is named)."""
+    return _compile_variant(
+        tile_n, residual, b_stages, ablate, k_tile, ksplit, peer_deficit
+    )
+
+
+@cache
+def _compile_variant(
+    tile_n: int,
+    residual: bool,
+    b_stages: int,
+    ablate: int,
+    k_tile: int,
+    ksplit: int,
+    peer_deficit: int,
 ):
     import cutlass
     import cutlass.cute as cute
@@ -61,7 +90,9 @@ def _compile(
 
     from .cutedsl.streamk_gemm import DepMxfp8StreamKGemm
 
-    kernel = DepMxfp8StreamKGemm(tile_n, residual, b_stages, ablate, k_tile)
+    kernel = DepMxfp8StreamKGemm(
+        tile_n, residual, b_stages, ablate, k_tile, ksplit, peer_deficit
+    )
     sym_n, sym_k, sym_m = cute.sym_int(), cute.sym_int(), cute.sym_int()
     fp8 = cutlass.Float8E4M3FN
 
@@ -92,6 +123,17 @@ def _compile(
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--opt-level 2 --enable-tvm-ffi",
     )
+
+
+def compile_all() -> None:
+    """Compile every variant ``streamk_mxfp8_gemm`` launches by default (call
+    before CUDA graph capture): each token tile, with and without a residual,
+    plus the cluster split-K variants of tiles up to 96 tokens."""
+    for tile_n in SUPPORTED_TILE_N:
+        for residual in (False, True):
+            _compile(tile_n, residual)
+            if tile_n <= 96:
+                _compile(tile_n, residual, ksplit=2, peer_deficit=PEER_DEFICIT)
 
 
 class StreamKScratch:
@@ -135,6 +177,8 @@ def streamk_mxfp8_gemm(
     b_stages: int = 4,
     ablate: int = 0,
     k_tile: int = 128,
+    ksplit: int | None = None,
+    peer_deficit: int | None = None,
 ) -> torch.Tensor:
     """``out[M, N] = x[M, K] @ W[N, K]^T (+ residual)`` in BF16.
 
@@ -147,12 +191,31 @@ def streamk_mxfp8_gemm(
     if out is None:
         out = torch.empty(m, n, dtype=torch.bfloat16, device=x_fp8.device)
     row_tiles = (n + ROW_TILE - 1) // ROW_TILE
+    sms = _num_sms(x_fp8.device.index)
+    if ksplit is None:
+        ksplit = (
+            1
+            if num_ctas is not None
+            else default_ksplit(row_tiles, k // k_tile, sms, tile_n_for(m))
+        )
+    if ksplit > 1:
+        num_ctas = row_tiles * ksplit
     if num_ctas is None:
         num_ctas = default_num_ctas(
             row_tiles, k // k_tile, _num_sms(x_fp8.device.index)
         )
     scratch = StreamKScratch.get(x_fp8.device)
-    compiled = _compile(tile_n_for(m), residual is not None, b_stages, ablate, k_tile)
+    compiled = _compile(
+        tile_n_for(m),
+        residual is not None,
+        b_stages,
+        ablate,
+        k_tile,
+        ksplit,
+        (min(PEER_DEFICIT, k // k_tile // 4) if peer_deficit is None else peer_deficit)
+        if ksplit > 1
+        else 0,
+    )
     compiled(
         weight_fp8,
         x_fp8,
