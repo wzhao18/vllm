@@ -30,6 +30,7 @@ from . import megamoe
 from .elementwise import rms_norm_mxfp8, situ_and_mul_mxfp8
 from .gemm import MAX_TILE_N, streamk_mxfp8_gemm
 from .linear import fp8_rows
+from .router import ExactGate
 
 
 def _fp8_rows(linear: nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
@@ -76,6 +77,9 @@ class DepMoE:
         norm = moe.routed_expert_norm
         self.norm_weight, self.norm_eps = norm.weight, norm.variance_epsilon
         self.events = (torch.cuda.Event(), torch.cuda.Event())
+        # Router gate logits on a few CTAs (bitwise equal to the stock gate at the
+        # verified token counts), so the router leaves the chain it overlaps its SMs.
+        self.gate = ExactGate(moe.gate, MAX_TILE_N)
         # The DEP MegaMoE kernel (dep_decode/megamoe): installed before the first
         # MegaMoE launch compiles.
         from vllm.utils.deep_gemm import _import_deep_gemm
@@ -93,7 +97,9 @@ class DepMoE:
             fused_grouped_topk,
         )
 
-        logits, _ = moe.gate(x)
+        logits = self.gate(x)
+        if logits is None:
+            logits, _ = moe.gate(x)
         return fused_grouped_topk(
             hidden_states=x,
             gating_output=logits,
