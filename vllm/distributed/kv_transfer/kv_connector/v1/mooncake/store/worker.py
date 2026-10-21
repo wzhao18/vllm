@@ -1256,6 +1256,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 tiers_by_key: dict[str, str] | None = None
                 if envs.VLLM_MOONCAKE_STORE_TIER_LOG:
                     tiers_by_key = _get_replica_tiers_by_key(self.store, batch_keys)
+                if req_meta.load_event is not None:
+                    req_meta.load_event.synchronize()
+                    req_meta.load_event = None
                 # Reset so the recorded RPC duration excludes tier lookup.
                 load_get_start = time.perf_counter()
                 res = self.store.batch_get_into_multi_buffers(
@@ -1944,11 +1947,19 @@ class MooncakeStoreWorker:
         if self._capacity_only:
             return
 
+        load_event = None
         for request in metadata.requests:
             load_spec = request.load_spec
             if load_spec is None or not load_spec.can_load:
                 continue
 
+            if load_event is None and envs.VLLM_KV_LOAD_START_BEFORE_FORWARD:
+                # Submitted before the forward launch: earlier GPU work (the
+                # previous step's tail, block zeroing) may still touch these
+                # blocks, so the transfer waits for it.
+                load_event = torch.cuda.Event()
+                load_event.record()
+            request.load_event = load_event
             load_spec.token_len = load_spec.kvpool_cached_tokens
             self.recv_request_queue.put(request)
 

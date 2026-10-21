@@ -761,6 +761,9 @@ class ReqMeta:
     can_save: bool | None = None
     load_spec: LoadSpec | None = None
     current_event: torch.cuda.Event | None = None
+    # Set on loads submitted before the forward launch: GPU work enqueued
+    # before the load must finish before the load writes the KV blocks.
+    load_event: torch.cuda.Event | None = None
 
     token_ids: list[int] | None = None
     # Absolute request offset represented by token_ids[0].

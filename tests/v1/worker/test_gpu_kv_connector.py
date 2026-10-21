@@ -119,3 +119,23 @@ def test_deferred_finalize_collects_results_before_saving(
 
     connector.finalize_step()
     assert events == ["handle", "bind", "start", "results", "wait", "clear"]
+
+
+def test_async_load_starts_before_forward_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """VLLM_KV_LOAD_START_BEFORE_FORWARD submits async loads in pre_forward,
+    so they finish within the step and post_forward does not resubmit."""
+    monkeypatch.setenv("VLLM_KV_LOAD_START_BEFORE_FORWARD", "1")
+    events: list[str] = []
+    connector = _make_connector(monkeypatch, events)
+    input_batch = SimpleNamespace(
+        idx_mapping=torch.tensor([0]), req_ids=["r"], num_tokens=1
+    )
+
+    connector.pre_forward(_scheduler_output(False), input_batch)
+    assert events == ["handle", "bind", "start"]
+
+    connector.post_forward(set())
+    assert events == ["handle", "bind", "start", "wait", "results", "clear"]
+    assert connector.kv_connector.start_load_kv.call_count == 1

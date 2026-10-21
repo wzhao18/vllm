@@ -239,6 +239,7 @@ if TYPE_CHECKING:
     VLLM_MOONCAKE_BOOTSTRAP_PORT: int = 8998
     VLLM_MOONCAKE_STORE_TIER_LOG: bool = False
     VLLM_MOONCAKE_LOAD_RECV_THREADS: int = 1
+    VLLM_KV_LOAD_START_BEFORE_FORWARD: bool = False
     VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO: float = 0.9
     MOONCAKE_PREFERRED_SEGMENT: str | None = None
     MOONCAKE_REQUESTER_LOCAL_HOSTNAME: str | None = None
@@ -1773,6 +1774,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per-request batches are too small to saturate the link on their own.
     "VLLM_MOONCAKE_LOAD_RECV_THREADS": lambda: int(
         os.getenv("VLLM_MOONCAKE_LOAD_RECV_THREADS", "1")
+    ),
+    # Submit async KV loads before the step's forward launch instead of after
+    # it. A load submitted after the launch is reported finished only in the
+    # next step's output, so each async load holds its KV blocks for one more
+    # step than the transfer needs. Connectors that write device memory
+    # outside the compute stream (Mooncake store) fence the early load on an
+    # event recorded before the launch, so it never races earlier GPU work.
+    "VLLM_KV_LOAD_START_BEFORE_FORWARD": lambda: bool(
+        int(os.getenv("VLLM_KV_LOAD_START_BEFORE_FORWARD", "0"))
     ),
     # Fraction of the owner's DirectIO staging buffer to fill per GET batch.
     "VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO": lambda: float(

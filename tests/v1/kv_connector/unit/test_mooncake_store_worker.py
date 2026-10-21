@@ -5192,3 +5192,74 @@ def test_blob_block_hashes_empty():
     view = BlobBlockHashes(memoryview(b""), 0)
     assert len(view) == 0
     assert list(view) == []
+
+
+class _FakeLoadEvent:
+    """Stands in for torch.cuda.Event on CPU-only test hosts."""
+
+    instances: list["_FakeLoadEvent"] = []
+
+    def __init__(self, log: list[str] | None = None):
+        self.log = log if log is not None else []
+        self.num_records = 0
+        _FakeLoadEvent.instances.append(self)
+
+    def record(self) -> None:
+        self.num_records += 1
+
+    def synchronize(self) -> None:
+        self.log.append("sync")
+
+
+@pytest.mark.parametrize("early", [False, True])
+def test_start_load_kv_fences_early_loads(monkeypatch, early):
+    """Loads submitted before the forward launch carry one shared event
+    recorded at submission; default (post-forward) loads carry none."""
+    if early:
+        monkeypatch.setenv("VLLM_KV_LOAD_START_BEFORE_FORWARD", "1")
+    else:
+        monkeypatch.delenv("VLLM_KV_LOAD_START_BEFORE_FORWARD", raising=False)
+    _FakeLoadEvent.instances = []
+    monkeypatch.setattr(mooncake_store_worker.torch.cuda, "Event", _FakeLoadEvent)
+
+    w = _make_bare_worker()
+    metadata = mooncake_store_worker.MooncakeStoreConnectorMetadata(set(), set())
+    loads = [_make_load_req(f"req-{i}", [b"a0"], token_len=16) for i in range(2)]
+    no_load = _make_load_req("req-skip", [b"b0"], token_len=16)
+    assert no_load.load_spec is not None
+    no_load.load_spec.can_load = False
+    metadata.requests = [loads[0], no_load, loads[1]]
+
+    w.start_load_kv(metadata)
+
+    queued = [w.recv_request_queue.get_nowait() for _ in range(2)]
+    assert w.recv_request_queue.empty()
+    assert [r.req_id for r in queued] == ["req-0", "req-1"]
+    if early:
+        assert len(_FakeLoadEvent.instances) == 1
+        assert _FakeLoadEvent.instances[0].num_records == 1
+        assert all(r.load_event is _FakeLoadEvent.instances[0] for r in queued)
+    else:
+        assert _FakeLoadEvent.instances == []
+        assert all(r.load_event is None for r in queued)
+    assert no_load.load_event is None
+
+
+def test_store_recving_thread_waits_for_load_event_before_get():
+    log: list[str] = []
+    store = MagicMock()
+
+    def batch_get(keys, addrs, sizes):
+        log.append("get")
+        return [256] * len(keys)
+
+    store.batch_get_into_multi_buffers.side_effect = batch_get
+    thread = _make_store_recving_thread(store)
+    req = _make_load_req("req-a", [b"a0", b"a1"], token_len=32)
+    req.load_event = _FakeLoadEvent(log)
+
+    thread._handle_request(req)
+
+    assert log == ["sync", "get"]
+    assert req.load_event is None
+    assert thread.get_and_clear_finished_requests() == {"req-a"}

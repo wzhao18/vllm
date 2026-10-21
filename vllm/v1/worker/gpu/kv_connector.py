@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer import (
     get_kv_transfer_group,
@@ -71,6 +72,7 @@ class ActiveKVConnector(KVConnector):
 
         self._pending_load_kwargs: dict[str, Any] | None = None
         self._disabled = False
+        self._start_load_before_forward = envs.VLLM_KV_LOAD_START_BEFORE_FORWARD
 
     def pre_forward(
         self,
@@ -89,8 +91,10 @@ class ActiveKVConnector(KVConnector):
             scheduler_output, input_batch, attn_metadata
         )
 
-        if scheduler_output.has_sync_kv_loads:
-            # Sync loads need to run before this step's forward.
+        if scheduler_output.has_sync_kv_loads or self._start_load_before_forward:
+            # Sync loads need to run before this step's forward. Async loads
+            # started here finish within this step and are reported in its
+            # output, one step earlier than when started after the forward.
             self._start_load_kv()
         # Otherwise start the async load after forward to keep submission
         # off the critical path.
