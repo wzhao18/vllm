@@ -1699,6 +1699,14 @@ class DPAsyncMPClient(AsyncMPClient):
         )
 
 
+def _num_prompt_tokens(request: EngineCoreRequest) -> int:
+    if request.prompt_token_ids is not None:
+        return len(request.prompt_token_ids)
+    if request.prompt_embeds is not None:
+        return len(request.prompt_embeds)
+    return 0
+
+
 class DPLBAsyncMPClient(DPAsyncMPClient):
     """Asyncio-compatible client for multi-proc, multi-engine (data parallel)
     EngineCore. Load-balances between multiple engine processes."""
@@ -1722,6 +1730,20 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
 
         # Exact per-engine count of this client's unfinished requests.
         self.engine_inflight: Counter[EngineIdentity] = Counter()
+        # Prompt tokens of this client's unfinished requests, per engine and per
+        # request, for the "context_tokens" DP load-balancing policy.
+        lb_policy = vllm_config.parallel_config.data_parallel_lb_policy
+        self.balance_context_tokens = lb_policy == "context_tokens"
+        if self.balance_context_tokens and client_count > 1:
+            # Each API server sees only its own requests.
+            logger.warning_once(
+                "data_parallel_lb_policy='context_tokens' requires a single API "
+                "server process; using 'requests' with %d.",
+                client_count,
+            )
+            self.balance_context_tokens = False
+        self.engine_context_tokens: Counter[EngineIdentity] = Counter()
+        self.request_context_tokens: dict[str, int] = {}
 
         super().__init__(
             vllm_config,
@@ -1758,35 +1780,11 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             )
         ) is None:
             current_counts = self.lb_engines
-            # TODO use P2C alg for larger DP sizes
             num_engines = len(current_counts)
-            min_score: float = sys.maxsize
-            eng_index = 0
-            for i in range(num_engines):
-                # Start from client_index to help with balancing when engines
-                # are empty.
-                idx = (self.eng_start_index + i) % num_engines
-                waiting, running, kv_cache_usage = current_counts[idx]
-                # Estimate engine load as the greater of the coordinator's
-                # latest (waiting + running) snapshot and this client's own
-                # in-flight count (scaled by the number of clients). The
-                # in-flight floor is exact and can't be erased by a snapshot
-                # rebind, so a burst spreads round-robin even when snapshots
-                # race with routing decisions; the snapshot raises the score
-                # when other clients or stale requests load the engine.
-                inflight = self.engine_inflight[self.core_engines[idx]]
-                score: float = max(self.client_count * inflight, waiting + running)
-                if waiting:
-                    # Waiting requests are penalized in proportion to KV cache
-                    # pressure: a queue on a KV-bound engine drains slowly, so
-                    # new requests should strongly prefer other engines. With
-                    # low KV usage the queue is transient (e.g. mid-burst) and
-                    # the penalty stays off, preserving exact round-robin.
-                    # Ramps from 0 at <=50% usage to 3x waiting at 100%.
-                    score += waiting * 6.0 * max(0.0, kv_cache_usage - 0.5)
-                if score < min_score:
-                    min_score = score
-                    eng_index = idx
+            if self.balance_context_tokens:
+                eng_index = self._least_context_engine_index(num_engines)
+            else:
+                eng_index = self._least_loaded_engine_index(current_counts)
             # Increment local waiting count for better balancing between stats
             # updates from the coordinator (which happen every 100ms).
             current_counts[eng_index][0] += self.client_count
@@ -1801,7 +1799,65 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         # Record which engine is chosen for this request, to handle aborts.
         self.reqs_in_flight[request.request_id] = chosen_engine
         self.engine_inflight[chosen_engine] += 1
+        if self.balance_context_tokens:
+            context_tokens = _num_prompt_tokens(request)
+            self.request_context_tokens[request.request_id] = context_tokens
+            self.engine_context_tokens[chosen_engine] += context_tokens
         return chosen_engine
+
+    def _least_loaded_engine_index(self, current_counts: list[list]) -> int:
+        """Index of the engine with the fewest waiting and running requests."""
+        # TODO use P2C alg for larger DP sizes
+        num_engines = len(current_counts)
+        min_score: float = sys.maxsize
+        eng_index = 0
+        for i in range(num_engines):
+            # Start from client_index to help with balancing when engines
+            # are empty.
+            idx = (self.eng_start_index + i) % num_engines
+            waiting, running, kv_cache_usage = current_counts[idx]
+            # Estimate engine load as the greater of the coordinator's
+            # latest (waiting + running) snapshot and this client's own
+            # in-flight count (scaled by the number of clients). The
+            # in-flight floor is exact and can't be erased by a snapshot
+            # rebind, so a burst spreads round-robin even when snapshots
+            # race with routing decisions; the snapshot raises the score
+            # when other clients or stale requests load the engine.
+            inflight = self.engine_inflight[self.core_engines[idx]]
+            score: float = max(self.client_count * inflight, waiting + running)
+            if waiting:
+                # Waiting requests are penalized in proportion to KV cache
+                # pressure: a queue on a KV-bound engine drains slowly, so
+                # new requests should strongly prefer other engines. With
+                # low KV usage the queue is transient (e.g. mid-burst) and
+                # the penalty stays off, preserving exact round-robin.
+                # Ramps from 0 at <=50% usage to 3x waiting at 100%.
+                score += waiting * 6.0 * max(0.0, kv_cache_usage - 0.5)
+            if score < min_score:
+                min_score = score
+                eng_index = idx
+        return eng_index
+
+    def _least_context_engine_index(self, num_engines: int) -> int:
+        """Index of the engine with the fewest prompt tokens among this
+        client's unfinished requests, breaking ties by request count.
+
+        With DP attention, an engine's decode step time grows with its context
+        and the engines step in lockstep through the expert-parallel
+        collectives, so the step runs at the pace of the engine with the most
+        context.
+        """
+        min_load = (sys.maxsize, sys.maxsize)
+        eng_index = 0
+        for i in range(num_engines):
+            # Start from the rotating index so that ties spread round-robin.
+            idx = (self.eng_start_index + i) % num_engines
+            engine = self.core_engines[idx]
+            load = (self.engine_context_tokens[engine], self.engine_inflight[engine])
+            if load < min_load:
+                min_load = load
+                eng_index = idx
+        return eng_index
 
     async def call_utility_async(self, method: str, *args) -> Any:
         # Only the result from the first engine is returned.
@@ -1815,6 +1871,9 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             for req_id in outputs.finished_requests:
                 if (engine := self.reqs_in_flight.pop(req_id, None)) is not None:
                     self.engine_inflight[engine] -= 1
+                    self.engine_context_tokens[engine] -= (
+                        self.request_context_tokens.pop(req_id, 0)
+                    )
 
     @staticmethod
     async def eep_process_engine_core_notification(

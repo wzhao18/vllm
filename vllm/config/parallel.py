@@ -37,6 +37,7 @@ _NUMACTL_CPUSET_PATTERN = re.compile(r"^\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*$")
 ExpertPlacementStrategy = Literal["linear", "round_robin"]
 DistributedExecutorBackend = Literal["ray", "mp", "uni", "external_launcher"]
 DataParallelBackend = Literal["ray", "mp"]
+DataParallelLBPolicy = Literal["requests", "context_tokens"]
 EPLBPolicyOption = Literal["default"]
 DCPCommBackend = Literal["ag_rs", "a2a"]
 EPLBCommunicatorBackend = Literal[
@@ -180,6 +181,18 @@ class ParallelConfig:
     between local data parallel ranks, but an external LB balances
     between vLLM nodes/replicas. Set explicitly in conjunction with
     --data-parallel-start-rank."""
+    data_parallel_lb_policy: DataParallelLBPolicy = "requests"
+    """How vLLM balances requests across data parallel engines (not used with
+    external DP load balancing). Available options:
+
+    - "requests": Route to the engine with the fewest waiting and running
+      requests.
+    - "context_tokens": Route to the engine with the fewest prompt tokens among
+      the API server's unfinished requests, breaking ties by request count.
+      With data parallel attention, an engine's decode step time grows with
+      its context, and the engines wait on each other in expert parallel
+      collectives, so this helps when context lengths vary widely. Requires a
+      single API server process; with more, "requests" is used."""
     is_moe_model: bool | None = None
     """Whether the deployed model is MoE (if known)."""
     enable_hc_sp: bool = False
@@ -923,6 +936,7 @@ class ParallelConfig:
             "data_parallel_backend",
             "data_parallel_external_lb",
             "data_parallel_hybrid_lb",
+            "data_parallel_lb_policy",
             "data_parallel_master_ip",
             "data_parallel_master_port",
             "_data_parallel_master_port_list",
