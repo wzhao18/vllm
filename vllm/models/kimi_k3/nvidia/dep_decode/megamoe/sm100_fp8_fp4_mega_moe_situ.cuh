@@ -2,7 +2,8 @@
 // deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe_situ.cuh, for the Kimi K3 DEP decode.
 // Changes (marked "DEP"): the combine issues every top-k chunk load of a token chunk at once (7 chunks per
 // token), routed tasks use decode-shaped scheduling (every L1 task before L2 when the ring never wraps), and
-// the kernel waits for its producer grid / releases its dependents under programmatic dependent launch.
+// the kernel waits for its producer grid / releases its dependents under programmatic dependent launch, and
+// SM 0 forwards the expert token counts with fire-and-forget reductions instead of returning atomics.
 #pragma once
 
 #include <cstdint>
@@ -443,9 +444,10 @@ sm100_fp8_fp4_mega_moe_situ_impl(void* y,
                 *sym_buffer.map(
                     workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
                     dst_rank_idx) = expert_status & 0xffffffff;
-                ptx::atomic_add_sys(
-                    sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
-                    expert_status);
+                // DEP: fire-and-forget (the old sum is unused); the barrier's release signal below orders it
+                asm volatile("red.sys.global.add.u64 [%0], %1;" ::
+                             "l"(sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx)),
+                             "l"(expert_status) : "memory");
             }
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);

@@ -69,10 +69,64 @@ def install(deep_gemm) -> None:
 
 def mega_moe(experts, deep_gemm, hidden_states: torch.Tensor, topk_weights, topk_ids):
     """``experts(hidden_states, topk_weights, topk_ids)`` with the MegaMoE kernel
-    launched under PDL."""
+    launched under PDL. For the layers the DEP decode serves (MXFP8 inputs, no fused
+    shared expert, EPLB or routing capture) the inputs are staged by a PDL copy of the
+    stock staging kernel (``prepare.py``), so the kernel's launch and prologue overlap
+    it; other layers run the stock layer call."""
+    fmt = experts.weight_format
+    direct = (
+        not fmt.uses_nvfp4_api
+        and fmt.hidden_quant is not None
+        and not experts.has_fused_shared_experts
+        and (experts.shared_spec is None or not experts.shared_spec.scale_group_k)
+        and experts.capture_fn is None
+        and experts.eplb_state.logical_to_physical_map is None
+        and hidden_states.stride(-1) == 1
+        and hidden_states.shape[0] <= experts.max_num_tokens
+    )
     previous = deep_gemm.get_pdl()
     deep_gemm.set_pdl(True)
     try:
-        return experts(hidden_states, topk_weights, topk_ids)
+        if not direct:
+            return experts(hidden_states, topk_weights, topk_ids)
+        return _direct(experts, deep_gemm, fmt, hidden_states, topk_weights, topk_ids)
     finally:
         deep_gemm.set_pdl(previous)
+
+
+def _direct(experts, deep_gemm, fmt, hidden_states, topk_weights, topk_ids):
+    """``DeepGemmMegaMoEExperts.forward`` for the ``direct`` case of ``mega_moe``."""
+    from vllm import envs
+    from vllm.forward_context import get_forward_context, is_forward_context_available
+
+    from .prepare import prepare_megamoe_inputs_pdl
+
+    num_tokens = hidden_states.shape[0]
+    experts._synchronize_first_launch()
+    is_padding = None
+    if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
+        is_padding = get_forward_context().is_padding
+        if is_padding is not None:
+            is_padding = is_padding[:num_tokens]
+    buffer = experts.get_symm_buffer()
+    prepare_megamoe_inputs_pdl(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        buffer.x[:num_tokens],
+        buffer.x_sf[:num_tokens],
+        buffer.topk_idx[:num_tokens],
+        buffer.topk_weights[:num_tokens],
+        is_padding,
+        fmt.hidden_quant,
+    )
+    y = torch.empty_like(hidden_states, dtype=torch.bfloat16)
+    getattr(deep_gemm, fmt.kernel)(
+        y,
+        experts.l1_weights,
+        experts.l2_weights,
+        buffer,
+        fast_math=experts.fast_math,
+        **experts._kernel_kwargs,
+    )
+    return y
