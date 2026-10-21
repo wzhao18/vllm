@@ -86,6 +86,7 @@ from vllm.models.kimi_k3.nvidia.ops.fused_mla_key_concat_kv_cache import (
     fused_mla_kv_concat_quant_fp8,
     fused_mla_qkv_quant_kv_cache_fp8_insert,
 )
+from vllm.models.kimi_k3.nvidia.tep_prefill import tep_prefill_config
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
@@ -474,6 +475,12 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         self.register_buffer(
             "_k_scale_inv", self._k_scale.reciprocal().reshape(1), persistent=False
         )
+        # prefill_backend=tep_fused: the TEP prefill MLA paths (tep_prefill/).
+        self.tep_prefill = None
+        if tep_prefill_config(get_current_vllm_config()) is not None:
+            from .tep_prefill.mla import TepMla
+
+            self.tep_prefill = TepMla()
 
     def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor) -> None:
         """Project latent attention output back to ``v`` via ``W_UV`` (bmm)."""
@@ -802,6 +809,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         self,
         q: torch.Tensor,
         attn_metadata: "MLACommonMetadata",
+        chunked_context=None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Chunked-context prefill, K3-fused. Replaces the impl's version.
 
@@ -834,7 +842,8 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         assert prefill is not None
         prefill_backend = prefill.prefill_backend
         assert prefill_backend is not None
-        chunked_context = prefill.chunked_context
+        if chunked_context is None:
+            chunked_context = prefill.chunked_context
         assert chunked_context is not None
         assert q.dtype == prefill.q_data_type, (
             "Kimi-K3 chunked context expects the new-token epilogue to have "
@@ -849,20 +858,28 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         def run_chunk(
             chunk, out: torch.Tensor | None = None
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            self._gather_context_latent(chunk, kv_cache, prefill, fp8_prefill)
-            gathered = workspace[: chunk.num_context_tokens]
-            kv_c_normed = gathered[..., : self.kv_lora_rank]
-            if kv_b_proj_input_dtype is not None:
-                kv_c_normed = kv_c_normed.to(kv_b_proj_input_dtype)
-            kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
-                -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
-            )
-            k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-            k_pe = gathered[..., self.kv_lora_rank :]
-            if fp8_prefill:
-                k, v = fused_mla_kv_concat_quant_fp8(k_nope, k_pe, v)
+            tep = self.tep_prefill
+            context_kv = tep.context_kv(self) if tep is not None else None
+            if context_kv is not None and fp8_prefill:
+                block_table = prefill.block_table[chunk.request_slice]
+                k, v = context_kv(chunk, kv_cache, block_table)
             else:
-                k = fused_mla_kv_concat(k_nope, k_pe)
+                self._gather_context_latent(chunk, kv_cache, prefill, fp8_prefill)
+                gathered = workspace[: chunk.num_context_tokens]
+                kv_c_normed = gathered[..., : self.kv_lora_rank]
+                if kv_b_proj_input_dtype is not None:
+                    kv_c_normed = kv_c_normed.to(kv_b_proj_input_dtype)
+                kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
+                    -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
+                )
+                k_nope, v = kv_nope.split(
+                    [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+                )
+                k_pe = gathered[..., self.kv_lora_rank :]
+                if fp8_prefill:
+                    k, v = fused_mla_kv_concat_quant_fp8(k_nope, k_pe, v)
+                else:
+                    k = fused_mla_kv_concat(k_nope, k_pe)
             attn_output, attn_lse = prefill_backend.run_prefill_context_chunk(
                 chunk=chunk, q=q[chunk.token_slice], k=k, v=v, out=out
             )
@@ -999,6 +1016,30 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         prefill = attn_metadata.prefill
         has_context = prefill.chunked_context is not None
         fp8_prefill = prefill.q_data_type == current_platform.fp8_dtype()
+        tep = self.tep_prefill
+        hybrid = None
+        if tep is not None and self.kv_cache_dtype in ("fp8", "fp8_e4m3"):
+            # Short continuations attend over the latent cache directly.
+            absorbed = tep.absorbed(self)
+            if absorbed.eligible(prefill, fp8_prefill):
+                absorbed.run(
+                    self,
+                    q,
+                    kv_c_normed,
+                    k_pe,
+                    positions,
+                    cos_sin_cache,
+                    slot_mapping,
+                    prefill,
+                    out,
+                )
+                return
+            # A mixed step: the short ones' context chunks are skipped here and
+            # their rows recomputed after the merge.
+            hybrid = absorbed.hybrid(prefill, fp8_prefill)
+            if hybrid is not None:
+                has_context = hybrid.chunked_context is not None
+                hybrid_inputs = (q, out)
 
         kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
             -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
@@ -1092,7 +1133,9 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 )
             else:
                 context_output, context_lse = self._compute_prefill_context(
-                    q, attn_metadata
+                    q,
+                    attn_metadata,
+                    hybrid.chunked_context if hybrid is not None else None,
                 )
             suffix_output, suffix_lse = output_prefill
             out = out.view(-1, self.num_local_heads, self.v_head_dim)
@@ -1105,3 +1148,17 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             )
         elif not writes_out:
             out.copy_(output_prefill[..., : self.v_head_dim].flatten(start_dim=-2))
+        if hybrid is not None:
+            q, out = hybrid_inputs
+            absorbed.run(
+                self,
+                q,
+                kv_c_normed,
+                k_pe,
+                positions,
+                cos_sin_cache,
+                slot_mapping,
+                prefill,
+                out,
+                requests=hybrid.requests,
+            )
