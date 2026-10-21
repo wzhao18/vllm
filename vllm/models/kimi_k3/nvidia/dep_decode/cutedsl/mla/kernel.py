@@ -208,6 +208,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         reducer_max_splits: int,
         partial_fp16: bool,
         work_list: bool = False,
+        reg_split: Optional[Tuple[int, int, int]] = None,
     ):
         """Initializes the shared SM100/SM103/SM107 MLA kernel configuration.
 
@@ -372,6 +373,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.softmax_reg_num = 208
         self.correction_reg_num = 240 if self.use_m64_ws else 256
         self.other_reg_num = 56 if self.use_m64_ws else 40
+        if reg_split is not None:
+            # (softmax, correction, MMA / load) registers per thread, one value per
+            # warpgroup: the three must fit the register file (504 per thread).
+            assert sum(reg_split) <= 504 and all(r % 8 == 0 for r in reg_split)
+            self.softmax_reg_num, self.correction_reg_num, self.other_reg_num = reg_split
         # Named barriers
         self.tmem_ptr_sync_bar = pipeline.NamedBarrier(
             barrier_id=1,

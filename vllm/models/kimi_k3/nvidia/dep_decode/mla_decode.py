@@ -30,6 +30,10 @@ from .cutedsl.mla.kernel import BlackwellMultiHeadLatentAttentionForwardFP8
 LATENT, ROPE = 512, 64
 KV_TILE = 128  # KV tokens per MMA tile
 CAPACITY = 8  # most splits of one request (sizes the partial workspace)
+# Registers per thread of the softmax, correction and MMA / load warpgroups. The
+# kernel's (208, 256, 40) spills in the MMA warp, whose descriptor arithmetic then
+# throttles the tensor core; the correction warps mostly wait and can give some up.
+REG_SPLIT = (200, 240, 64)
 
 
 @triton.jit
@@ -105,7 +109,7 @@ def _plan_work_list_kernel(
 
 
 @cache
-def _compile(heads, q, page_size, capacity, arch_cc, use_pdl):
+def _compile(heads, q, page_size, capacity, arch_cc, use_pdl, reg_split=None):
     """The FP8 split-KV MLA decode with a work list (packed query rows, causal
     among the q verify rows, FP16 partials, BF16 latent output)."""
     qk_tiler, pv_tiler = select_mla_decode_tilers(
@@ -138,6 +142,7 @@ def _compile(heads, q, page_size, capacity, arch_cc, use_pdl):
         reducer_max_splits=max(4, 1 << (capacity - 1).bit_length()),
         partial_fp16=True,
         work_list=True,
+        reg_split=reg_split,
     )
     fp8, sym = cutlass.Float8E4M3FN, cute.sym_int
     make, compact = cute.runtime.make_fake_tensor, cute.runtime.make_fake_compact_tensor
@@ -208,6 +213,7 @@ class WorkListMla:
         capacity: int = CAPACITY,
         page_size: int = 64,
         use_pdl: bool = False,
+        reg_split: tuple[int, int, int] | None = REG_SPLIT,
     ):
         self.heads, self.q, self.capacity, self.page_size = (
             heads,
@@ -215,7 +221,7 @@ class WorkListMla:
             capacity,
             page_size,
         )
-        self.use_pdl = use_pdl
+        self.use_pdl, self.reg_split = use_pdl, reg_split
         self.arch = torch.cuda.get_device_capability(device)
         max_requests = -(-max_tokens // q)
         # HardwareInfo queries the current CUDA context: make sure there is one.
@@ -283,7 +289,13 @@ class WorkListMla:
             out = out.view(requests, self.q, self.heads, LATENT)
         cache = cache.view(torch.float8_e4m3fn)
         kernel = _compile(
-            self.heads, self.q, self.page_size, self.capacity, self.arch, self.use_pdl
+            self.heads,
+            self.q,
+            self.page_size,
+            self.capacity,
+            self.arch,
+            self.use_pdl,
+            self.reg_split,
         )
         with tvm_ffi.use_torch_stream():
             kernel(
