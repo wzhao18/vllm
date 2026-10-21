@@ -3502,6 +3502,9 @@ class VllmConfig:
         if (
             self.kv_transfer_config is not None
             and self.kv_transfer_config.is_kv_transfer_instance
+            # KDA RecoverSSM keeps its records in the Mamba page beside the conv
+            # and SSM state, which the connectors transfer as usual.
+            and not self.cache_config.use_kda_recoverssm
         ):
             raise ValueError(
                 "--use-replayssm is incompatible with KV connectors "
