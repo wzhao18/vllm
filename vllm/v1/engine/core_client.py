@@ -1704,7 +1704,22 @@ def _num_prompt_tokens(request: EngineCoreRequest) -> int:
         return len(request.prompt_token_ids)
     if request.prompt_embeds is not None:
         return len(request.prompt_embeds)
+    # E.g. the end-of-stream request of a streaming-input session.
     return 0
+
+
+def _use_context_token_lb(vllm_config: VllmConfig, client_count: int) -> bool:
+    if vllm_config.parallel_config.data_parallel_lb_policy != "context_tokens":
+        return False
+    if client_count > 1:
+        # Each API server sees only its own requests.
+        logger.warning_once(
+            "data_parallel_lb_policy='context_tokens' requires a single API "
+            "server process; using 'requests' with %d.",
+            client_count,
+        )
+        return False
+    return True
 
 
 class DPLBAsyncMPClient(DPAsyncMPClient):
@@ -1730,18 +1745,9 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
 
         # Exact per-engine count of this client's unfinished requests.
         self.engine_inflight: Counter[EngineIdentity] = Counter()
-        # Prompt tokens of this client's unfinished requests, per engine and per
-        # request, for the "context_tokens" DP load-balancing policy.
-        lb_policy = vllm_config.parallel_config.data_parallel_lb_policy
-        self.balance_context_tokens = lb_policy == "context_tokens"
-        if self.balance_context_tokens and client_count > 1:
-            # Each API server sees only its own requests.
-            logger.warning_once(
-                "data_parallel_lb_policy='context_tokens' requires a single API "
-                "server process; using 'requests' with %d.",
-                client_count,
-            )
-            self.balance_context_tokens = False
+        # Context tokens (prompt plus generated) of this client's unfinished
+        # requests, for the "context_tokens" DP load-balancing policy.
+        self.balance_context_tokens = _use_context_token_lb(vllm_config, client_count)
         self.engine_context_tokens: Counter[EngineIdentity] = Counter()
         self.request_context_tokens: dict[str, int] = {}
 
@@ -1771,6 +1777,10 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
 
         if (engine := self.reqs_in_flight.get(request.request_id)) is not None:
             # This is for streaming-input session affinity.
+            if self.balance_context_tokens:
+                self._add_context_tokens(
+                    request.request_id, engine, _num_prompt_tokens(request)
+                )
             return engine
 
         # Engines are in rank order.
@@ -1779,15 +1789,16 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 request.pooling_params, len(self.core_engines)
             )
         ) is None:
-            current_counts = self.lb_engines
-            num_engines = len(current_counts)
             if self.balance_context_tokens:
-                eng_index = self._least_context_engine_index(num_engines)
+                num_engines = len(self.core_engines)
+                eng_index = self._least_context_engine_index()
             else:
+                current_counts = self.lb_engines
+                num_engines = len(current_counts)
                 eng_index = self._least_loaded_engine_index(current_counts)
-            # Increment local waiting count for better balancing between stats
-            # updates from the coordinator (which happen every 100ms).
-            current_counts[eng_index][0] += self.client_count
+                # Increment local waiting count for better balancing between
+                # stats updates from the coordinator (which happen every 100ms).
+                current_counts[eng_index][0] += self.client_count
             # Rotate the scan start so that ties (equal scores, e.g. right
             # after a coordinator stats reset when engines look equally loaded)
             # don't systematically favor the same engine. This removes the
@@ -1800,12 +1811,22 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         self.reqs_in_flight[request.request_id] = chosen_engine
         self.engine_inflight[chosen_engine] += 1
         if self.balance_context_tokens:
-            context_tokens = _num_prompt_tokens(request)
-            self.request_context_tokens[request.request_id] = context_tokens
-            self.engine_context_tokens[chosen_engine] += context_tokens
+            self._add_context_tokens(
+                request.request_id, chosen_engine, _num_prompt_tokens(request)
+            )
         return chosen_engine
 
-    def _least_loaded_engine_index(self, current_counts: list[list]) -> int:
+    def _add_context_tokens(
+        self, req_id: str, engine: EngineIdentity, num_tokens: int
+    ) -> None:
+        self.request_context_tokens[req_id] = (
+            self.request_context_tokens.get(req_id, 0) + num_tokens
+        )
+        self.engine_context_tokens[engine] += num_tokens
+
+    def _least_loaded_engine_index(
+        self, current_counts: list[list[int | float]]
+    ) -> int:
         """Index of the engine with the fewest waiting and running requests."""
         # TODO use P2C alg for larger DP sizes
         num_engines = len(current_counts)
@@ -1838,15 +1859,10 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 eng_index = idx
         return eng_index
 
-    def _least_context_engine_index(self, num_engines: int) -> int:
-        """Index of the engine with the fewest prompt tokens among this
-        client's unfinished requests, breaking ties by request count.
-
-        With DP attention, an engine's decode step time grows with its context
-        and the engines step in lockstep through the expert-parallel
-        collectives, so the step runs at the pace of the engine with the most
-        context.
-        """
+    def _least_context_engine_index(self) -> int:
+        """Index of the engine with the fewest context tokens among this
+        client's unfinished requests, breaking ties by request count."""
+        num_engines = len(self.core_engines)
         min_load = (sys.maxsize, sys.maxsize)
         eng_index = 0
         for i in range(num_engines):
@@ -1859,6 +1875,16 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 eng_index = idx
         return eng_index
 
+    def _drop_context_tokens(self, engines: list[EngineIdentity]) -> None:
+        """Forget the context of requests on engines being removed, so that
+        their late finish events can't skew a reused engine identity."""
+        removed = set(engines)
+        for req_id, engine in self.reqs_in_flight.items():
+            if engine in removed:
+                self.request_context_tokens.pop(req_id, None)
+        for engine in removed:
+            self.engine_context_tokens.pop(engine, None)
+
     async def call_utility_async(self, method: str, *args) -> Any:
         # Only the result from the first engine is returned.
         return (await self.call_utility_all_async(method, *args))[0]
@@ -1867,13 +1893,23 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
     async def process_engine_outputs(
         self: "DPLBAsyncMPClient", outputs: EngineCoreOutputs
     ):
+        if self.balance_context_tokens:
+            # Generated tokens extend the context the engine attends over.
+            for output in outputs.outputs:
+                if output.new_token_ids and (
+                    engine := self.reqs_in_flight.get(output.request_id)
+                ):
+                    self._add_context_tokens(
+                        output.request_id, engine, len(output.new_token_ids)
+                    )
         if outputs.finished_requests and self.reqs_in_flight:
             for req_id in outputs.finished_requests:
                 if (engine := self.reqs_in_flight.pop(req_id, None)) is not None:
                     self.engine_inflight[engine] -= 1
-                    self.engine_context_tokens[engine] -= (
-                        self.request_context_tokens.pop(req_id, 0)
-                    )
+                    if self.balance_context_tokens:
+                        self.engine_context_tokens[engine] -= (
+                            self.request_context_tokens.pop(req_id, 0)
+                        )
 
     @staticmethod
     async def eep_process_engine_core_notification(
@@ -2119,6 +2155,8 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             raise
 
         self.core_engines.extend(new_core_engines)
+        for engine in new_core_engines:
+            self.engine_context_tokens.pop(engine, None)
         # Update the parallel config
         parallel_config = self.vllm_config.parallel_config
         parallel_config.data_parallel_size = new_data_parallel_size
@@ -2169,6 +2207,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         # NOTE(yongji): Immediately stop sending requests to the removing engines.
         self.core_engines = old_core_engines[:new_data_parallel_size]
         self.lb_engines = self.lb_engines[:new_data_parallel_size]
+        self._drop_context_tokens(old_core_engines[new_data_parallel_size:])
         # Pending coordinator snapshots must use the surviving ranks too.
         self.engine_ranks_managed = self.engine_ranks_managed[:new_data_parallel_size]
         for rank in range(new_data_parallel_size, cur_data_parallel_size):

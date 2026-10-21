@@ -182,17 +182,15 @@ class ParallelConfig:
     between vLLM nodes/replicas. Set explicitly in conjunction with
     --data-parallel-start-rank."""
     data_parallel_lb_policy: DataParallelLBPolicy = "requests"
-    """How vLLM balances requests across data parallel engines (not used with
-    external DP load balancing). Available options:
+    """How the API server balances requests across data parallel engines, with
+    internal or hybrid DP load balancing. Available options:
 
     - "requests": Route to the engine with the fewest waiting and running
       requests.
-    - "context_tokens": Route to the engine with the fewest prompt tokens among
-      the API server's unfinished requests, breaking ties by request count.
-      With data parallel attention, an engine's decode step time grows with
-      its context, and the engines wait on each other in expert parallel
-      collectives, so this helps when context lengths vary widely. Requires a
-      single API server process; with more, "requests" is used."""
+    - "context_tokens": Route to the engine with the fewest context tokens
+      (prompt plus generated) among unfinished requests, breaking ties by
+      request count. Suits DP attention with widely varying context lengths.
+      Requires a single API server process."""
     is_moe_model: bool | None = None
     """Whether the deployed model is MoE (if known)."""
     enable_hc_sp: bool = False
@@ -564,6 +562,15 @@ class ParallelConfig:
         if self.data_parallel_size <= 1 and self.data_parallel_external_lb:
             raise ValueError(
                 "data_parallel_external_lb can only be set when data_parallel_size > 1"
+            )
+
+        if (
+            self.data_parallel_lb_policy != "requests"
+            and self.data_parallel_external_lb
+        ):
+            raise ValueError(
+                f"data_parallel_lb_policy={self.data_parallel_lb_policy!r} is not "
+                "supported with external DP load balancing."
             )
 
         if not self.numa_bind and (

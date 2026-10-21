@@ -29,6 +29,7 @@ from vllm.pooling_params import LateInteractionParams, PoolingParams
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.torch_utils import set_default_torch_num_threads
 from vllm.v1.engine import (
+    EngineCoreOutput,
     EngineCoreOutputs,
     EngineCoreReadyResponse,
     EngineCoreRequest,
@@ -36,11 +37,11 @@ from vllm.v1.engine import (
 from vllm.v1.engine.core import EngineCore
 from vllm.v1.engine.core_client import (
     AsyncMPClient,
-    DPAsyncMPClient,
     DPLBAsyncMPClient,
     EngineCoreClient,
     MPClient,
     SyncMPClient,
+    _use_context_token_lb,
 )
 from vllm.v1.engine.utils import CoreEngineProcManager
 from vllm.v1.executor.abstract import Executor
@@ -426,6 +427,11 @@ def _route(client: DPLBAsyncMPClient, num_prompt_tokens: int) -> int:
     return client.core_engines.index(client.get_core_engine_for_request(request))
 
 
+def _finish(client: DPLBAsyncMPClient, *req_ids: str) -> None:
+    outputs = EngineCoreOutputs(finished_requests=set(req_ids))
+    asyncio.run(DPLBAsyncMPClient.process_engine_outputs(client, outputs))
+
+
 def test_dplb_context_tokens_routes_to_least_context():
     """Long-context requests are spread by context, not by request count."""
     client = _make_dplb_client(num_engines=2, balance_context_tokens=True)
@@ -451,6 +457,7 @@ def test_dplb_context_tokens_ignores_request_count_snapshot():
     client.engine_context_tokens[client.core_engines[1]] = 100
 
     assert _route(client, 10) == 0
+    assert client.lb_engines == [[0, 10, 0.0], [0, 0, 0.0]]
 
 
 def test_dplb_context_tokens_breaks_ties_by_request_count():
@@ -459,29 +466,131 @@ def test_dplb_context_tokens_breaks_ties_by_request_count():
     client.engine_inflight.update({engines[0]: 2, engines[1]: 1, engines[2]: 3})
 
     assert _route(client, 10) == 1
-    # Equal loads rotate the starting engine instead of favoring one.
+
+
+def test_dplb_context_tokens_rotates_on_ties():
+    """Equal loads rotate the starting engine instead of favoring one."""
     client = _make_dplb_client(num_engines=3, balance_context_tokens=True)
-    assert [_route(client, 0) for _ in range(3)] == [0, 1, 2]
+    chosen = []
+    for _ in range(4):
+        request = make_request(SamplingParams(max_tokens=1))
+        engine = client.get_core_engine_for_request(request)
+        chosen.append(client.core_engines.index(engine))
+        _finish(client, request.request_id)
+
+    assert chosen == [0, 1, 2, 0]
 
 
-def test_dplb_context_tokens_released_on_finish():
+def test_dplb_context_tokens_counts_prompt_embeds():
     client = _make_dplb_client(num_engines=2, balance_context_tokens=True)
+    request = make_request(SamplingParams(max_tokens=1))
+    request.prompt_token_ids = None
+    request.prompt_embeds = torch.zeros(48, 8)
+
+    engine = client.get_core_engine_for_request(request)
+
+    assert client.engine_context_tokens[engine] == 48
+
+
+def test_dplb_context_tokens_counts_generated_tokens():
+    client = _make_dplb_client(num_engines=2, balance_context_tokens=True)
+    request = make_request(SamplingParams(max_tokens=8), prompt_tokens_ids=[1] * 64)
+    engine = client.get_core_engine_for_request(request)
+
+    outputs = EngineCoreOutputs(
+        outputs=[
+            EngineCoreOutput(request_id=request.request_id, new_token_ids=[1, 2, 3]),
+            EngineCoreOutput(request_id="other-client", new_token_ids=[1]),
+        ]
+    )
+    asyncio.run(DPLBAsyncMPClient.process_engine_outputs(client, outputs))
+    assert client.engine_context_tokens[engine] == 67
+
+    _finish(client, request.request_id)
+    assert client.engine_context_tokens[engine] == 0
+    assert not client.request_context_tokens
+
+
+def test_dplb_context_tokens_counts_streaming_input_chunks():
+    """Later chunks of a streaming-input session stay on its engine and add
+    their tokens to its context."""
+    client = _make_dplb_client(num_engines=2, balance_context_tokens=True)
+    chunk = make_request(SamplingParams(max_tokens=1), prompt_tokens_ids=[1] * 10)
+    chunk.resumable = True
+    engine = client.get_core_engine_for_request(chunk)
+    chunk.prompt_token_ids = [1] * 5
+    assert client.get_core_engine_for_request(chunk) == engine
+
+    assert client.engine_context_tokens[engine] == 15
+    _finish(client, chunk.request_id)
+    assert client.engine_context_tokens[engine] == 0
+
+
+def test_dplb_context_tokens_released_after_abort():
+    """An abort releases the context when the engine reports the request
+    finished, like any other finish."""
+    client = _make_dplb_client(num_engines=2, balance_context_tokens=True)
+    client.resources = SimpleNamespace(engine_dead=False)
+    sent = []
+
+    async def abort_requests(request_ids, engine):
+        sent.append((request_ids, engine))
+
+    client._abort_requests = abort_requests
     request = make_request(SamplingParams(max_tokens=1), prompt_tokens_ids=[1] * 64)
     engine = client.get_core_engine_for_request(request)
-    assert client.engine_context_tokens[engine] == 64
 
-    outputs = EngineCoreOutputs(finished_requests={request.request_id})
-    asyncio.run(DPLBAsyncMPClient.process_engine_outputs(client, outputs))
+    asyncio.run(client.abort_requests_async([request.request_id]))
+    assert sent == [([request.request_id], engine)]
+    _finish(client, request.request_id)
 
     assert client.engine_context_tokens[engine] == 0
-    assert request.request_id not in client.request_context_tokens
+    assert not client.request_context_tokens
 
 
 def test_dplb_requests_policy_does_not_track_context():
     client = _make_dplb_client(num_engines=2)
-    client.get_core_engine_for_request(make_request(SamplingParams(max_tokens=1)))
+    request = make_request(SamplingParams(max_tokens=1))
+    client.get_core_engine_for_request(request)
+    outputs = EngineCoreOutputs(
+        outputs=[EngineCoreOutput(request_id=request.request_id, new_token_ids=[1])]
+    )
+    asyncio.run(DPLBAsyncMPClient.process_engine_outputs(client, outputs))
 
     assert not client.engine_context_tokens
+    assert not client.request_context_tokens
+
+
+@pytest.mark.asyncio
+async def test_dplb_context_tokens_scale_down_drops_removed_engines():
+    """Scale-down forgets the context on removed engines, so a late finish
+    can't skew the counter of an engine identity reused by a scale-up."""
+    client = _make_dplb_client(num_engines=4, balance_context_tokens=True)
+    client.engine_ranks_managed = list(range(4))
+    pause_started = asyncio.Event()
+
+    async def pause_scheduler(*args, **kwargs):
+        pause_started.set()
+        await asyncio.Future()
+
+    client._call_utility_async = pause_scheduler
+    req_ids = []
+    for _ in range(4):
+        request = make_request(SamplingParams(max_tokens=1), prompt_tokens_ids=[1] * 8)
+        client.get_core_engine_for_request(request)
+        req_ids.append(request.request_id)
+
+    scale_task = asyncio.create_task(client._commit_scale_down_elastic_ep(2))
+    try:
+        await asyncio.wait_for(pause_started.wait(), timeout=5)
+    finally:
+        scale_task.cancel()
+        await asyncio.gather(scale_task, return_exceptions=True)
+    await DPLBAsyncMPClient.process_engine_outputs(
+        client, EngineCoreOutputs(finished_requests=set(req_ids))
+    )
+
+    assert all(tokens == 0 for tokens in client.engine_context_tokens.values())
     assert not client.request_context_tokens
 
 
@@ -494,21 +603,13 @@ def test_dplb_requests_policy_does_not_track_context():
     ],
 )
 def test_dplb_context_tokens_policy_requires_single_client(
-    monkeypatch, lb_policy, client_count, expected
+    lb_policy, client_count, expected
 ):
-    def init_engines(self, *args, **kwargs):
-        self.client_index = 0
-        self.core_engines = [bytes([i, 0]) for i in range(2)]
-
-    monkeypatch.setattr(DPAsyncMPClient, "__init__", init_engines)
     vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(data_parallel_lb_policy=lb_policy)
     )
-    client = DPLBAsyncMPClient(
-        vllm_config, Executor, log_stats=False, client_count=client_count
-    )
 
-    assert client.balance_context_tokens == expected
+    assert _use_context_token_lb(vllm_config, client_count) == expected
 
 
 @pytest.mark.parametrize("final_sent", [False, True])

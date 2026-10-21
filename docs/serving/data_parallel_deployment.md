@@ -76,6 +76,15 @@ There are several notable differences when using Ray:
 
 Currently, the internal DP load balancing is done within the API server process(es) and is based on the running and waiting queues in each of the engines. This could be made more sophisticated in future by incorporating KV cache aware logic.
 
+`--data-parallel-lb-policy context_tokens` instead routes each request to the engine with the fewest context tokens (prompt plus generated tokens) among unfinished requests. With DP attention, as in wide expert parallel deployments, every engine runs each forward step together with the others, so each step takes as long as the slowest engine. That engine's attention time grows with the total context of its requests. When context lengths vary widely, for example with long agentic sessions or on the decode instances of a disaggregated prefill deployment, balancing request counts can leave the context very uneven.
+
+The policy counts tokens exactly inside the API server, so it requires a single API server process: it defaults `--api-server-count` to 1 and rejects larger values. At high request rates that single process can become the bottleneck. It applies to internal and hybrid load balancing (where each node balances its local ranks), not to external load balancing, and it is not yet supported by the Rust frontend.
+
+```bash
+vllm serve $MODEL --data-parallel-size 16 --enable-expert-parallel \
+                  --data-parallel-lb-policy context_tokens
+```
+
 When deploying large DP sizes using this method, the API server process can become a bottleneck. In this case, the orthogonal `--api-server-count` command line option can be used to scale this out (for example `--api-server-count=4`). This is transparent to users - a single HTTP endpoint / port is still exposed. Note that this API server scale-out is "internal" and still confined to the "head" node.
 
 <figure markdown="1">

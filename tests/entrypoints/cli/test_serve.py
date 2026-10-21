@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from vllm.entrypoints.cli.serve import run_headless
+from vllm.entrypoints.cli.serve import ServeSubcommand, run_headless
 
 
 class _StopAfterEngineConfig(Exception):
@@ -40,3 +40,49 @@ def test_headless_imports_reasoning_parser_plugin_before_engine_config():
 
         with pytest.raises(_StopAfterEngineConfig):
             run_headless(args)
+
+
+def _serve_args(**overrides) -> argparse.Namespace:
+    args = argparse.Namespace(
+        model_tag=None,
+        headless=False,
+        api_server_count=None,
+        data_parallel_size=4,
+        data_parallel_size_local=None,
+        data_parallel_rank=None,
+        data_parallel_start_rank=None,
+        data_parallel_external_lb=False,
+        data_parallel_hybrid_lb=False,
+        data_parallel_multi_port_external_lb=False,
+        data_parallel_lb_policy="context_tokens",
+    )
+    for name, value in overrides.items():
+        setattr(args, name, value)
+    return args
+
+
+@pytest.mark.parametrize("hybrid_lb", [False, True])
+def test_context_tokens_lb_policy_defaults_to_one_api_server(monkeypatch, hybrid_lb):
+    """The policy needs every request to pass through one API server, so it
+    overrides the default of one API server per (local) DP rank."""
+    args = _serve_args(
+        data_parallel_hybrid_lb=hybrid_lb,
+        data_parallel_size_local=2 if hybrid_lb else None,
+        data_parallel_start_rank=0 if hybrid_lb else None,
+    )
+    monkeypatch.delenv("VLLM_USE_RUST_FRONTEND", raising=False)
+    with (
+        patch("vllm.entrypoints.cli.serve.run_multi_api_server") as multi_server,
+        patch("vllm.entrypoints.cli.serve.uvloop.run") as single_server,
+        patch("vllm.entrypoints.cli.serve.run_server", MagicMock()),
+    ):
+        ServeSubcommand.cmd(args)
+
+    multi_server.assert_not_called()
+    single_server.assert_called_once()
+
+
+def test_context_tokens_lb_policy_rejects_multiple_api_servers(monkeypatch):
+    monkeypatch.delenv("VLLM_USE_RUST_FRONTEND", raising=False)
+    with pytest.raises(ValueError, match="--api-server-count=1"):
+        ServeSubcommand.cmd(_serve_args(api_server_count=2))
