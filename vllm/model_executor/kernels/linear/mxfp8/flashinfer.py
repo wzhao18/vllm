@@ -9,6 +9,7 @@ from vllm.model_executor.layers.fusion.quant_activation import (
 )
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
+    eager_direct_call_ok,
     mxfp8_e4m3_quantize,
     swizzle_mxfp8_scale,
 )
@@ -36,6 +37,23 @@ def _check_mm_mxfp8_shape(weight_shape: tuple[int, int]) -> tuple[bool, str | No
     if N < 128:
         return False, f"mm_mxfp8 requires N >= 128, got N={N}."
     return True, None
+
+
+def _mm_mxfp8(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+    backend: str,
+) -> torch.Tensor:
+    if eager_direct_call_ok(a):
+        return vllm_flashinfer.flashinfer_mm_mxfp8(
+            a, b, a_scale, b_scale, out_dtype=out_dtype, backend=backend
+        )
+    return vllm_flashinfer.mm_mxfp8(
+        a, b, a_scale, b_scale, out_dtype=out_dtype, backend=backend
+    )
 
 
 class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
@@ -107,7 +125,7 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
         if not weight.is_contiguous():
             weight = weight.contiguous()
 
-        output = vllm_flashinfer.mm_mxfp8(
+        output = _mm_mxfp8(
             input_mxfp8,
             weight.t(),
             input_scale,
@@ -182,7 +200,7 @@ class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
                 x.view(-1, K), is_sf_swizzled_layout=True
             )
 
-        output = vllm_flashinfer.mm_mxfp8(
+        output = _mm_mxfp8(
             input_mxfp8,
             weight,
             input_scale,

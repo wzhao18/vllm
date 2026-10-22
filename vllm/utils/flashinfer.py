@@ -297,6 +297,7 @@ flashinfer_prepare_bf16_fp4_weights = _lazy_import_wrapper(
     "flashinfer.gemm", "prepare_bf16_fp4_weights"
 )
 flashinfer_fp4_quantize = _lazy_import_wrapper("flashinfer", "fp4_quantize")
+flashinfer_mm_mxfp8 = _lazy_import_wrapper("flashinfer", "mm_mxfp8")
 flashinfer_mxfp4_quantize = _lazy_import_wrapper("flashinfer", "mxfp4_quantize")
 nvfp4_batched_quantize = _lazy_import_wrapper("flashinfer", "nvfp4_batched_quantize")
 silu_and_mul_scaled_nvfp4_experts_quantize = _lazy_import_wrapper(

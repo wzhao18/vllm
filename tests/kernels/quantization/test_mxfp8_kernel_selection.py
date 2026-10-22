@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from unittest.mock import patch
 
 import pytest
+import torch
 
 from vllm.model_executor.kernels.linear import (
     FlashInferCutedslMxfp8LinearKernel,
@@ -133,3 +134,21 @@ def test_init_mxfp8_linear_kernel(capability, weight_shape, expected_kernel_cls)
 
     assert isinstance(kernel, expected_kernel_cls)
     assert kernel.config == Mxfp8LinearLayerConfig(weight_shape=weight_shape)
+
+
+def test_eager_direct_call_keeps_custom_op_for_non_cuda_and_traced_inputs():
+    """MXFP8 quantize/GEMM skip their custom ops only for eager calls on plain
+    CUDA tensors; meta and fake tensors and torch.compile tracing must still
+    reach the registered fake implementations."""
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+        eager_direct_call_ok,
+    )
+
+    assert not eager_direct_call_ok(torch.empty(4, 32))
+    assert not eager_direct_call_ok(torch.empty(4, 32, device="meta"))
+    with FakeTensorMode():
+        assert not eager_direct_call_ok(torch.empty(4, 32))
+    with patch("torch.compiler.is_compiling", return_value=True):
+        assert not eager_direct_call_ok(torch.empty(4, 32))
