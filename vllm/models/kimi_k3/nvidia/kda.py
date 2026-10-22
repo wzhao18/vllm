@@ -50,6 +50,15 @@ from vllm.models.kimi_k3.nvidia.kda_metadata import (
     KimiK3KDAAttentionBackend,
     KimiK3KDAMetadata,
 )
+from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
+    KDARecoverSSMRecords,
+    kda_recoverssm_verify,
+)
+from vllm.models.kimi_k3.nvidia.recoverssm.kernels import (
+    CuteRecoverSSMVerify,
+    compile_state_commit,
+    cute_recoverssm_unsupported_reason,
+)
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
@@ -281,6 +290,51 @@ def resolve_kda_spec_decode_backend(
         logger.info_once("Using FlashInfer packed fused KDA speculative decode.")
         return "flashinfer"
     return "native"
+
+
+def resolve_kda_recoverssm_backend(
+    backend: str,
+    *,
+    num_heads: int,
+    head_dim: int,
+    window: int,
+    conv_width: int,
+    has_conv_bias: bool,
+    activation_dtype: torch.dtype,
+    conv_state_dtype: torch.dtype,
+    state_dtype: torch.dtype,
+    conv_weight_dtype: torch.dtype,
+    lower_bound: float | None,
+) -> str:
+    """The KDA RecoverSSM verify and commit kernels: "cute" (SM10x tensor
+    cores, with the short convolution fused into the verify) or "triton"."""
+    if backend not in ("auto", "cute", "triton"):
+        raise ValueError(f"Unsupported KDA RecoverSSM backend: {backend}")
+    if backend == "triton":
+        return "triton"
+    reason = cute_recoverssm_unsupported_reason(
+        num_heads=num_heads,
+        head_dim=head_dim,
+        window=window,
+        conv_width=conv_width,
+        has_conv_bias=has_conv_bias,
+        activation_dtype=activation_dtype,
+        conv_state_dtype=conv_state_dtype,
+        state_dtype=state_dtype,
+        conv_weight_dtype=conv_weight_dtype,
+        lower_bound=lower_bound,
+    )
+    if reason is None:
+        logger.info_once("Using the CuTe KDA RecoverSSM verify and commit.")
+        return "cute"
+    if backend == "cute":
+        raise RuntimeError(f"The CuTe KDA RecoverSSM kernels cannot run: {reason}")
+    logger.info_once(
+        "Using the Triton KDA RecoverSSM verify and commit: the CuTe kernels "
+        "cannot run (%s).",
+        reason,
+    )
+    return "triton"
 
 
 def resolve_kda_decode_backend(
@@ -551,36 +605,34 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
     ) -> tuple[torch.dtype, ...]:
         if self.model_config is None or self.cache_config is None:
             raise ValueError("model_config and cache_config must be set")
-        base_dtypes = MambaStateDtypeCalculator.kda_state_dtype(
+        return MambaStateDtypeCalculator.kda_state_dtype(
             self.model_config.dtype,
             self.cache_config.mamba_cache_dtype,
             self.cache_config.mamba_ssm_cache_dtype,
         )
-        if self.cache_config.use_kda_recoverssm:
-            return MambaStateDtypeCalculator.append_kda_recoverssm_record(
-                base_dtypes, self.model_config.dtype
-            )
-        return base_dtypes
 
     def get_state_shape(
         self,
     ) -> tuple[tuple[int, ...], ...]:
-        base_shapes = MambaStateShapeCalculator.kda_state_shape(
+        return MambaStateShapeCalculator.kda_state_shape(
             self.tp_size,
             self.num_heads,
             self.head_dim,
             conv_kernel_size=self.conv_size,
             num_spec=self.num_spec,
         )
-        if self.cache_config.use_kda_recoverssm:
-            return MambaStateShapeCalculator.append_kda_recoverssm_record(
-                base_shapes,
-                self.num_heads,
-                self.head_dim,
-                tp_world_size=self.tp_size,
-                spec_query_len=1 + self.num_spec,
+
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        super().bind_kv_cache(kv_cache)
+        if self.recoverssm_verify is not None:
+            # Compile before CUDA graph capture (shared by all KDA layers).
+            self.recoverssm_verify.compile()
+            compile_state_commit(
+                self.local_num_heads,
+                self.spec_query_len,
+                self.A_log.device,
+                align=self.cache_config.mamba_cache_mode == "align",
             )
-        return base_shapes
 
     def __init__(
         self,
@@ -712,6 +764,43 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             self.gate_lower_bound,
             self.use_recoverssm,
         )
+        # RecoverSSM: this layer's verify records of a speculative step, and the
+        # CuTe verify (short convolution fused in) where it runs, else the Triton
+        # convolution and verify.
+        self.recoverssm_records: KDARecoverSSMRecords | None = None
+        self.recoverssm_verify: CuteRecoverSSMVerify | None = None
+        if self.use_recoverssm:
+            self.recoverssm_records = KDARecoverSSMRecords.allocate(
+                vllm_config.scheduler_config.max_num_seqs,
+                self.local_num_heads,
+                self.spec_query_len,
+                self.head_dim,
+                vllm_config.model_config.dtype,
+                self.conv1d.weight.device,
+            )
+            backend = resolve_kda_recoverssm_backend(
+                additional_config.get("kda_recoverssm_backend", "auto")
+                if isinstance(additional_config, dict)
+                else "auto",
+                num_heads=self.local_num_heads,
+                head_dim=self.head_dim,
+                window=self.spec_query_len,
+                conv_width=self.conv_size,
+                has_conv_bias=self.conv1d.bias is not None,
+                activation_dtype=vllm_config.model_config.dtype,
+                conv_state_dtype=conv_state_dtype,
+                state_dtype=recurrent_state_dtype,
+                conv_weight_dtype=self.conv1d.weight.dtype,
+                lower_bound=self.gate_lower_bound,
+            )
+            if backend == "cute":
+                self.recoverssm_verify = CuteRecoverSSMVerify(
+                    num_heads=self.local_num_heads,
+                    window=self.spec_query_len,
+                    conv_dim_first=is_conv_state_dim_first(),
+                    conv_weight_dtype=self.conv1d.weight.dtype,
+                    device=self.conv1d.weight.device,
+                )
         decode_conv1d_weight = None
         if (
             self.kda_decode_backend != "triton"
@@ -901,6 +990,89 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             return self.gemm_rs_ar.apply(core_attn_out, self.o_proj)
         return self.o_proj(core_attn_out)[0]
 
+    def _recoverssm_verify(
+        self,
+        m: KimiK3KDAMetadata,
+        mixed_qkv: torch.Tensor,
+        raw_g: torch.Tensor,
+        raw_beta: torch.Tensor,
+        conv_weight: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        out: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """RecoverSSM verify of the speculative requests: the short convolution
+        and the KDA recurrence from each request's checkpoint, which is left
+        unchanged. The verify records it writes let the commit after sampling
+        fold the accepted tokens in (KimiK3KDAMetadata.commit_recoverssm_state).
+        """
+        num_tokens = mixed_qkv.shape[0]
+        if out is None:
+            out = mixed_qkv.new_empty(
+                (1, num_tokens, self.local_num_heads, self.head_dim)
+            )
+        assert m.spec_state_indices_tensor is not None
+        assert m.num_accepted_tokens is not None
+        state_indices = m.spec_state_indices_tensor[: m.num_spec_decodes, 0]
+        records = self.recoverssm_records
+        assert records is not None
+        conv_state, state = self.kv_cache[:2]
+        verify = self.recoverssm_verify
+        if verify is not None:
+            assert self.gate_lower_bound is not None
+            if verify(
+                mixed_qkv=mixed_qkv,
+                raw_gate=raw_g[0].flatten(-2),
+                raw_beta=raw_beta[0],
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                lower_bound=self.gate_lower_bound,
+                state=state,
+                records=records,
+                query_start_loc=query_start_loc,
+                state_indices=state_indices,
+                num_accepted_tokens=m.num_accepted_tokens,
+                conv_state=conv_state,
+                conv_weight=conv_weight,
+                out=out[0].flatten(-2),
+            ):
+                return out
+
+        if not is_conv_state_dim_first():
+            conv_state = conv_state.transpose(-1, -2)
+        mixed_qkv = causal_conv1d_update(
+            mixed_qkv,
+            conv_state,
+            conv_weight,
+            self.conv1d.bias,
+            activation="silu",
+            conv_state_indices=state_indices,
+            num_accepted_tokens=m.num_accepted_tokens,
+            query_start_loc=query_start_loc,
+            max_query_len=self.spec_query_len,
+            validate_data=False,
+            out=torch.empty_like(mixed_qkv),
+        )
+        q, k, v = (
+            rearrange(x, "n (h d) -> 1 n h d", d=self.head_dim)
+            for x in mixed_qkv.split(self.local_projection_size, dim=-1)
+        )
+        return kda_recoverssm_verify(
+            q=q,
+            k=k,
+            v=v,
+            raw_g=raw_g,
+            raw_beta=raw_beta,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            lower_bound=self.gate_lower_bound,
+            checkpoint_state=state,
+            records=records,
+            query_start_loc=query_start_loc,
+            state_indices=state_indices,
+            spec_query_len=self.spec_query_len,
+            out=out,
+        )
+
     @eager_break_during_capture
     def _forward(
         self,
@@ -944,7 +1116,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         g1 = g1[:, :num_actual_tokens]
         beta = beta[:, :num_actual_tokens]
 
-        conv_state, recurrent_state, *recoverssm_records = self.kv_cache
+        conv_state, recurrent_state = self.kv_cache[:2]
         # The convolution kernels consume (..., dim, width - 1).
         if not is_conv_state_dim_first():
             conv_state = conv_state.transpose(-1, -2)
@@ -1075,65 +1247,44 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         if has_spec_decode:
             assert spec_state_indices_tensor is not None
             assert spec_query_start_loc is not None
-            spec_conv_indices = spec_state_indices_tensor[:, 0][: m.num_spec_decodes]
-            spec_max_query_len = (
-                self.spec_query_len
-                if self.use_recoverssm
-                else spec_state_indices_tensor.size(-1)
-            )
-            spec_conv_out = torch.empty_like(mixed_qkv_spec)
-            mixed_qkv_spec = causal_conv1d_update(
-                mixed_qkv_spec,
-                conv_state,
-                conv_weights,
-                self.conv1d.bias,
-                activation="silu",
-                conv_state_indices=spec_conv_indices,
-                num_accepted_tokens=num_accepted_tokens,
-                query_start_loc=spec_query_start_loc,
-                max_query_len=spec_max_query_len,
-                validate_data=False,
-                out=spec_conv_out,
-            )
-            q_spec, k_spec, v_spec = (
-                rearrange(x, "n (h d) -> 1 n h d", d=self.head_dim)
-                for x in mixed_qkv_spec.split(self.local_projection_size, dim=-1)
-            )
             spec_cu_seqlens = spec_query_start_loc[: m.num_spec_decodes + 1]
             spec_out = (
-                core_attn_out[:, : q_spec.shape[1]]
+                core_attn_out[:, : mixed_qkv_spec.shape[0]]
                 if m.num_prefills == 0 and m.num_decodes == 0
                 else None
             )
             if spec_token_start is not None:
                 spec_out = core_attn_out[:, spec_slice]
             if self.use_recoverssm:
-                from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
-                    kda_recoverssm_verify,
-                )
-
-                if len(recoverssm_records) != 2:
-                    raise ValueError(
-                        "KDA RecoverSSM requires correction and key/gate buffers"
-                    )
-                core_attn_out_spec = kda_recoverssm_verify(
-                    q=q_spec,
-                    k=k_spec,
-                    v=v_spec,
-                    raw_g=g1_spec,
-                    raw_beta=beta_spec,
-                    A_log=self.A_log,
-                    dt_bias=self.dt_bias,
-                    lower_bound=self.gate_lower_bound,
-                    checkpoint_state=recurrent_state,
-                    correction_cache=recoverssm_records[0],
-                    kg_cache=recoverssm_records[1],
-                    query_start_loc=spec_cu_seqlens,
-                    state_indices=spec_state_indices_tensor[: m.num_spec_decodes, 0],
-                    spec_query_len=self.spec_query_len,
-                    out=spec_out,
+                core_attn_out_spec = self._recoverssm_verify(
+                    m,
+                    mixed_qkv_spec,
+                    g1_spec,
+                    beta_spec,
+                    conv_weights,
+                    spec_cu_seqlens,
+                    spec_out,
                 )
             else:
+                mixed_qkv_spec = causal_conv1d_update(
+                    mixed_qkv_spec,
+                    conv_state,
+                    conv_weights,
+                    self.conv1d.bias,
+                    activation="silu",
+                    conv_state_indices=spec_state_indices_tensor[:, 0][
+                        : m.num_spec_decodes
+                    ],
+                    num_accepted_tokens=num_accepted_tokens,
+                    query_start_loc=spec_query_start_loc,
+                    max_query_len=spec_state_indices_tensor.size(-1),
+                    validate_data=False,
+                    out=torch.empty_like(mixed_qkv_spec),
+                )
+                q_spec, k_spec, v_spec = (
+                    rearrange(x, "n (h d) -> 1 n h d", d=self.head_dim)
+                    for x in mixed_qkv_spec.split(self.local_projection_size, dim=-1)
+                )
                 core_attn_out_spec, _ = fused_recurrent_kda(
                     q=q_spec,
                     k=k_spec,

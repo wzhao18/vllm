@@ -337,20 +337,25 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
             )
 
     def _get_recoverssm_context(self) -> "KDARecoverSSMCommitContext":
+        forward_context = self.vllm_config.compilation_config.static_forward_context
+        layers = [forward_context[layer_name] for layer_name in self.layer_names]
         context = self.recoverssm_context
-        if context is not None:
+        # The context holds the layers' page addresses: rebuild it when the KV
+        # cache is re-bound (e.g. reinitialized for elastic EP).
+        if context is not None and (
+            context.checkpoints[0].data_ptr() == layers[0].kv_cache[1].data_ptr()
+        ):
             return context
 
         from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
             KDARecoverSSMCommitContext,
         )
 
-        forward_context = self.vllm_config.compilation_config.static_forward_context
-        layers = [forward_context[layer_name] for layer_name in self.layer_names]
         context = KDARecoverSSMCommitContext.create(
             layers,
             spec_query_len=1 + self.vllm_config.num_speculative_tokens,
             max_num_reqs=self.vllm_config.scheduler_config.max_num_seqs,
+            cute_state_commit=layers[0].recoverssm_verify is not None,
         )
         self.recoverssm_context = context
         return context

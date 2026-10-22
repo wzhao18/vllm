@@ -3449,17 +3449,18 @@ class VllmConfig:
                     "SSM state caches, not --enable-mamba-cache-stochastic-"
                     "rounding, which requires an explicit float16 cache"
                 )
-            if (
-                self.cache_config.mamba_cache_mode == "align"
-                and not self.use_v2_model_runner
-            ):
-                raise ValueError(
-                    "RecoverSSM with prefix caching requires VLLM_USE_V2_MODEL_RUNNER=1"
-                )
+            if not self.use_v2_model_runner:
+                # Only Model Runner V2 folds the accepted tokens into the state
+                # after sampling (commit_recoverssm_state).
+                raise ValueError("RecoverSSM requires VLLM_USE_V2_MODEL_RUNNER=1")
             if self.parallel_config.pipeline_parallel_size > 1:
                 raise ValueError(
                     "RecoverSSM currently requires pipeline_parallel_size=1"
                 )
+            if self.parallel_config.enable_dbo:
+                # Micro-batches would run a layer's verifies concurrently, on
+                # the same verify record rows.
+                raise ValueError("RecoverSSM does not support --enable-dbo")
             if self.mamba_config.backend != MambaBackendEnum.TRITON:
                 raise ValueError("RecoverSSM requires --mamba-backend triton")
         elif use_mamba_replayssm_spec:
@@ -3499,6 +3500,10 @@ class VllmConfig:
         if (
             self.kv_transfer_config is not None
             and self.kv_transfer_config.is_kv_transfer_instance
+            # A KDA RecoverSSM request's state is its conv and SSM state in the
+            # stock Mamba page (the verify records are kept outside the KV
+            # cache), so KV connectors transfer it as usual.
+            and not self.cache_config.use_kda_recoverssm
         ):
             raise ValueError(
                 "--use-replayssm is incompatible with KV connectors "
