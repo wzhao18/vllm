@@ -562,9 +562,11 @@ def test_dplb_requests_policy_does_not_track_context():
 
 
 @pytest.mark.asyncio
-async def test_dplb_context_tokens_scale_down_drops_removed_engines():
-    """Scale-down forgets the context on removed engines, so a late finish
-    can't skew the counter of an engine identity reused by a scale-up."""
+@pytest.mark.parametrize("late_finish", [False, True])
+async def test_dplb_context_tokens_scale_down_then_reuse(late_finish: bool):
+    """Outputs and finishes that arrive after elastic EP scale-down for requests
+    on a removed engine must not leave load on that engine identity, which a
+    later scale-up reuses."""
     client = _make_dplb_client(num_engines=4, balance_context_tokens=True)
     client.engine_ranks_managed = list(range(4))
     pause_started = asyncio.Event()
@@ -574,11 +576,15 @@ async def test_dplb_context_tokens_scale_down_drops_removed_engines():
         await asyncio.Future()
 
     client._call_utility_async = pause_scheduler
-    req_ids = []
+    requests = []
     for _ in range(4):
-        request = make_request(SamplingParams(max_tokens=1), prompt_tokens_ids=[1] * 8)
+        request = make_request(SamplingParams(max_tokens=8), prompt_tokens_ids=[1] * 8)
         client.get_core_engine_for_request(request)
-        req_ids.append(request.request_id)
+        requests.append(request)
+    removed = client.core_engines[3]
+    removed_req_id = next(
+        r.request_id for r in requests if client.reqs_in_flight[r.request_id] == removed
+    )
 
     scale_task = asyncio.create_task(client._commit_scale_down_elastic_ep(2))
     try:
@@ -586,30 +592,48 @@ async def test_dplb_context_tokens_scale_down_drops_removed_engines():
     finally:
         scale_task.cancel()
         await asyncio.gather(scale_task, return_exceptions=True)
+    # The removed engine still emits a step before it is paused.
     await DPLBAsyncMPClient.process_engine_outputs(
-        client, EngineCoreOutputs(finished_requests=set(req_ids))
+        client,
+        EngineCoreOutputs(
+            outputs=[EngineCoreOutput(request_id=removed_req_id, new_token_ids=[1, 2])]
+        ),
     )
+    # A scale-up reuses the removed engine identities.
+    client.core_engines.extend([bytes([2, 0]), removed])
+    if late_finish:
+        await DPLBAsyncMPClient.process_engine_outputs(
+            client, EngineCoreOutputs(finished_requests={removed_req_id})
+        )
 
-    assert all(tokens == 0 for tokens in client.engine_context_tokens.values())
-    assert not client.request_context_tokens
+    assert client.engine_context_tokens[removed] == 0
+    assert all(tokens >= 0 for tokens in client.engine_context_tokens.values())
 
 
 @pytest.mark.parametrize(
     "lb_policy,client_count,expected",
     [
         ("requests", 1, False),
+        ("requests", 2, False),
         ("context_tokens", 1, True),
-        ("context_tokens", 2, False),
     ],
 )
-def test_dplb_context_tokens_policy_requires_single_client(
-    lb_policy, client_count, expected
-):
+def test_dplb_context_tokens_policy_selection(lb_policy, client_count, expected):
     vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(data_parallel_lb_policy=lb_policy)
     )
 
     assert _use_context_token_lb(vllm_config, client_count) == expected
+
+
+def test_dplb_context_tokens_policy_rejects_multiple_clients():
+    """Each API server sees only its own requests."""
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_lb_policy="context_tokens")
+    )
+
+    with pytest.raises(ValueError, match="single API server"):
+        _use_context_token_lb(vllm_config, 2)
 
 
 @pytest.mark.parametrize("final_sent", [False, True])

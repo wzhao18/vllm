@@ -105,19 +105,23 @@ class ServeSubcommand(CLISubcommand):
             )
 
         if args.data_parallel_lb_policy == "context_tokens":
-            # The policy needs one API server that sees every request.
             if rust_frontend_path:
                 raise ValueError(
                     "--data-parallel-lb-policy=context_tokens is not supported "
                     "by the Rust frontend."
                 )
-            if args.api_server_count is None:
-                args.api_server_count = 1
-            elif args.api_server_count > 1:
+            if is_multi_port or is_external_lb:
                 raise ValueError(
-                    "--data-parallel-lb-policy=context_tokens requires "
-                    f"--api-server-count=1, got {args.api_server_count}."
+                    "--data-parallel-lb-policy=context_tokens is not supported "
+                    "with external DP load balancing."
                 )
+            if args.api_server_count is None:
+                # The policy needs one API server that sees every request.
+                logger.info(
+                    "Defaulting api_server_count to 1 for "
+                    "--data-parallel-lb-policy=context_tokens."
+                )
+                args.api_server_count = 1
 
         # Default api_server_count if not explicitly set.
         # - Multi-port: 1 (supervisor spawns one server per local DP rank)

@@ -82,7 +82,22 @@ def test_context_tokens_lb_policy_defaults_to_one_api_server(monkeypatch, hybrid
     single_server.assert_called_once()
 
 
-def test_context_tokens_lb_policy_rejects_multiple_api_servers(monkeypatch):
+@pytest.mark.parametrize(
+    "overrides,match",
+    [
+        ({"data_parallel_external_lb": True}, "external DP load balancing"),
+        ({"data_parallel_rank": 0}, "external DP load balancing"),
+    ],
+)
+def test_context_tokens_lb_policy_rejects_external_lb(monkeypatch, overrides, match):
     monkeypatch.delenv("VLLM_USE_RUST_FRONTEND", raising=False)
-    with pytest.raises(ValueError, match="--api-server-count=1"):
-        ServeSubcommand.cmd(_serve_args(api_server_count=2))
+    with pytest.raises(ValueError, match=match):
+        ServeSubcommand.cmd(_serve_args(**overrides))
+
+
+def test_context_tokens_lb_policy_rejects_rust_frontend(monkeypatch):
+    """The Rust frontend routes between DP ranks itself."""
+    monkeypatch.setenv("VLLM_USE_RUST_FRONTEND", "1")
+    monkeypatch.setenv("VLLM_RUST_FRONTEND_PATH", "/bin/true")
+    with pytest.raises(ValueError, match="Rust frontend"):
+        ServeSubcommand.cmd(_serve_args())

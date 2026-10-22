@@ -545,6 +545,19 @@ class ParallelConfig:
                 "The FT system assumes one AsyncMPClient manages all engines."
             )
 
+        if self.data_parallel_lb_policy == "context_tokens":
+            if self._api_process_count > 1:
+                raise ValueError(
+                    "data_parallel_lb_policy='context_tokens' requires a single API "
+                    "server process (--api-server-count=1), but got "
+                    f"{self._api_process_count}."
+                )
+            if self.data_parallel_size == 1:
+                logger.warning_once(
+                    "data_parallel_lb_policy='context_tokens' has no effect "
+                    "with data_parallel_size=1."
+                )
+
         if self.all2all_backend in ["pplx", "naive"]:
             logger.warning(
                 "The '%s' all2all backend has been removed. "
@@ -570,7 +583,8 @@ class ParallelConfig:
         ):
             raise ValueError(
                 f"data_parallel_lb_policy={self.data_parallel_lb_policy!r} is not "
-                "supported with external DP load balancing."
+                "supported with external DP load balancing (also used for hybrid "
+                "load balancing with data_parallel_size_local=1)."
             )
 
         if not self.numa_bind and (

@@ -3525,6 +3525,26 @@ def test_fault_tolerance_requires_single_api_server():
     ParallelConfig(enable_fault_tolerance=True, _api_process_count=1)
 
 
+def test_context_tokens_lb_policy_requires_single_api_server():
+    """The policy counts tokens in the API server, so one process must see
+    every request."""
+    with pytest.raises(ValueError, match="single API server"):
+        ParallelConfig(data_parallel_lb_policy="context_tokens", _api_process_count=2)
+
+    ParallelConfig(data_parallel_lb_policy="context_tokens", _api_process_count=1)
+    ParallelConfig(data_parallel_lb_policy="requests", _api_process_count=2)
+
+
+def test_context_tokens_lb_policy_rejects_external_lb():
+    """With external load balancing vLLM does not route between DP ranks."""
+    with pytest.raises(ValueError, match="external DP load balancing"):
+        ParallelConfig(
+            data_parallel_size=2,
+            data_parallel_external_lb=True,
+            data_parallel_lb_policy="context_tokens",
+        )
+
+
 def test_renderer_num_workers_with_mm_cache():
     """Disallow renderer_num_workers > 1 with the mm processor cache only for
     pooling models, whose preprocessing runs on the renderer workers."""

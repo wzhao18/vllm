@@ -35,10 +35,12 @@ steps:
   - tests/entrypoints/unit_tests
   - tests/entrypoints/launchers
   - tests/entrypoints/common
+  - tests/entrypoints/cli
   commands:
   - pytest -v -s entrypoints/unit_tests
   - pytest -v -s entrypoints/launchers
   - pytest -v -s entrypoints/common
+  - pytest -v -s entrypoints/cli
   mirror:
     amd:
       label: ":amd: (MI355 DPX) Entrypoints Unit"

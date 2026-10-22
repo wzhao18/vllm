@@ -1704,7 +1704,6 @@ def _num_prompt_tokens(request: EngineCoreRequest) -> int:
         return len(request.prompt_token_ids)
     if request.prompt_embeds is not None:
         return len(request.prompt_embeds)
-    # E.g. the end-of-stream request of a streaming-input session.
     return 0
 
 
@@ -1712,13 +1711,11 @@ def _use_context_token_lb(vllm_config: VllmConfig, client_count: int) -> bool:
     if vllm_config.parallel_config.data_parallel_lb_policy != "context_tokens":
         return False
     if client_count > 1:
-        # Each API server sees only its own requests.
-        logger.warning_once(
+        # ParallelConfig rejects this for vllm serve; guard other entry points.
+        raise ValueError(
             "data_parallel_lb_policy='context_tokens' requires a single API "
-            "server process; using 'requests' with %d.",
-            client_count,
+            f"server process, but got {client_count}."
         )
-        return False
     return True
 
 
@@ -1779,7 +1776,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             # This is for streaming-input session affinity.
             if self.balance_context_tokens:
                 self._add_context_tokens(
-                    request.request_id, engine, _num_prompt_tokens(request)
+                    request.request_id, _num_prompt_tokens(request)
                 )
             return engine
 
@@ -1811,18 +1808,16 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         self.reqs_in_flight[request.request_id] = chosen_engine
         self.engine_inflight[chosen_engine] += 1
         if self.balance_context_tokens:
-            self._add_context_tokens(
-                request.request_id, chosen_engine, _num_prompt_tokens(request)
-            )
+            self.request_context_tokens[request.request_id] = 0
+            self._add_context_tokens(request.request_id, _num_prompt_tokens(request))
         return chosen_engine
 
-    def _add_context_tokens(
-        self, req_id: str, engine: EngineIdentity, num_tokens: int
-    ) -> None:
-        self.request_context_tokens[req_id] = (
-            self.request_context_tokens.get(req_id, 0) + num_tokens
-        )
-        self.engine_context_tokens[engine] += num_tokens
+    def _add_context_tokens(self, req_id: str, num_tokens: int) -> None:
+        # Only requests still tracked: those on engines removed by elastic EP
+        # scale-down were dropped and must not re-create their engine's count.
+        if (tokens := self.request_context_tokens.get(req_id)) is not None:
+            self.request_context_tokens[req_id] = tokens + num_tokens
+            self.engine_context_tokens[self.reqs_in_flight[req_id]] += num_tokens
 
     def _least_loaded_engine_index(
         self, current_counts: list[list[int | float]]
@@ -1877,7 +1872,9 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
 
     def _drop_context_tokens(self, engines: list[EngineIdentity]) -> None:
         """Forget the context of requests on engines being removed, so that
-        their late finish events can't skew a reused engine identity."""
+        their late outputs can't skew a reused engine identity. (Their
+        engine_inflight entries are left to the finish events, as for the
+        "requests" policy.)"""
         removed = set(engines)
         for req_id, engine in self.reqs_in_flight.items():
             if engine in removed:
@@ -1895,13 +1892,16 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
     ):
         if self.balance_context_tokens:
             # Generated tokens extend the context the engine attends over.
+            request_tokens = self.request_context_tokens
+            engine_tokens = self.engine_context_tokens
+            reqs_in_flight = self.reqs_in_flight
             for output in outputs.outputs:
-                if output.new_token_ids and (
-                    engine := self.reqs_in_flight.get(output.request_id)
-                ):
-                    self._add_context_tokens(
-                        output.request_id, engine, len(output.new_token_ids)
-                    )
+                req_id = output.request_id
+                if (n := len(output.new_token_ids)) and (
+                    tokens := request_tokens.get(req_id)
+                ) is not None:
+                    request_tokens[req_id] = tokens + n
+                    engine_tokens[reqs_in_flight[req_id]] += n
         if outputs.finished_requests and self.reqs_in_flight:
             for req_id in outputs.finished_requests:
                 if (engine := self.reqs_in_flight.pop(req_id, None)) is not None:
@@ -2155,8 +2155,6 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             raise
 
         self.core_engines.extend(new_core_engines)
-        for engine in new_core_engines:
-            self.engine_context_tokens.pop(engine, None)
         # Update the parallel config
         parallel_config = self.vllm_config.parallel_config
         parallel_config.data_parallel_size = new_data_parallel_size
