@@ -215,6 +215,8 @@ def _make_dplb_client(num_engines: int = 3, client_count: int = 1) -> DPLBAsyncM
     client.reqs_in_flight = {}
     client.streaming_reqs = set()
     client.engine_inflight = Counter()
+    client.balance_kv_cache_usage = False
+    client.avg_prompt_tokens = 0.0
     client.core_engines = [bytes([i, 0]) for i in range(num_engines)]
     client.lb_engines = [[0, 0, 0.0] for _ in range(num_engines)]
     client.eng_start_index = 0
@@ -395,6 +397,71 @@ def test_dplb_kv_pressure_amplifies_waiting_penalty():
         make_request(SamplingParams(max_tokens=1))
     )
     assert chosen == client.core_engines[0]
+
+
+def _make_kv_usage_dplb_client(
+    num_engines: int, tokens_per_engine: int = 100_000
+) -> DPLBAsyncMPClient:
+    """A DPLB client with the "kv_cache_usage" policy and the given KV cache
+    capacity per engine (16-token blocks)."""
+    client = _make_dplb_client(num_engines=num_engines)
+    client.balance_kv_cache_usage = True
+    client.vllm_config.cache_config = SimpleNamespace(
+        num_gpu_blocks=num_engines * tokens_per_engine // 16, block_size=16
+    )
+    return client
+
+
+def test_dplb_kv_cache_usage_routes_to_lowest_usage():
+    """The engine with the least KV cache in use wins, even with more requests."""
+    client = _make_kv_usage_dplb_client(num_engines=3)
+    client.lb_engines = [[0, 10, 0.6], [0, 30, 0.2], [0, 5, 0.4]]
+
+    chosen = client.get_core_engine_for_request(
+        make_request(SamplingParams(max_tokens=1))
+    )
+
+    assert chosen == client.core_engines[1]
+
+
+def test_dplb_kv_cache_usage_counts_waiting_requests():
+    """Waiting requests hold no KV cache yet; each counts at the average prompt
+    length (here 2,000 of 100,000 tokens, so 2% of an engine's cache)."""
+    client = _make_kv_usage_dplb_client(num_engines=2)
+    # Engine 0 uses less KV cache but has five requests queued: 30% + 5 * 2%.
+    client.lb_engines = [[5, 10, 0.30], [0, 10, 0.35]]
+
+    chosen = client.get_core_engine_for_request(
+        make_request(SamplingParams(max_tokens=1), list(range(2000)))
+    )
+
+    assert chosen == client.core_engines[1]
+
+
+def test_dplb_kv_cache_usage_burst_spreads_between_snapshots():
+    """Each routed request counts as waiting until the next snapshot, so a burst
+    on equally loaded engines spreads across them."""
+    client = _make_kv_usage_dplb_client(num_engines=3)
+
+    chosen = {
+        client.get_core_engine_for_request(
+            make_request(SamplingParams(max_tokens=1), list(range(1000)))
+        )
+        for _ in range(3)
+    }
+
+    assert chosen == set(client.core_engines)
+
+
+def test_dplb_kv_cache_usage_ties_fall_back_to_request_count():
+    client = _make_kv_usage_dplb_client(num_engines=2)
+    client.lb_engines = [[0, 8, 0.25], [0, 3, 0.25]]
+
+    chosen = client.get_core_engine_for_request(
+        make_request(SamplingParams(max_tokens=1))
+    )
+
+    assert chosen == client.core_engines[1]
 
 
 def test_dplb_finished_requests_release_inflight():

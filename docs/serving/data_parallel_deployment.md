@@ -74,7 +74,7 @@ There are several notable differences when using Ray:
 - When a single DP group requires multiple nodes, *e.g.* in case a single model replica needs to run on at least two nodes, make sure to set `VLLM_RAY_DP_PACK_STRATEGY="span"` in which case `--data-parallel-size-local` is ignored and will be automatically determined
 - Remote DP ranks will be allocated based on node resources of the Ray cluster
 
-Currently, the internal DP load balancing is done within the API server process(es) and is based on the running and waiting queues in each of the engines. This could be made more sophisticated in future by incorporating KV cache aware logic.
+Currently, the internal DP load balancing is done within the API server process(es) and is based on the running and waiting queues in each of the engines. With `--data-parallel-lb-policy kv_cache_usage` it instead routes each request to the engine with the lowest KV cache usage, counting each waiting request at the average prompt length. This suits DP attention, as in wide expert parallel deployments, where every engine runs each forward step together with the others and the engine holding the most context sets the step time.
 
 When deploying large DP sizes using this method, the API server process can become a bottleneck. In this case, the orthogonal `--api-server-count` command line option can be used to scale this out (for example `--api-server-count=4`). This is transparent to users - a single HTTP endpoint / port is still exposed. Note that this API server scale-out is "internal" and still confined to the "head" node.
 

@@ -1722,6 +1722,12 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
 
         # Exact per-engine count of this client's unfinished requests.
         self.engine_inflight: Counter[EngineIdentity] = Counter()
+        # "kv_cache_usage" DP load-balancing policy: route by KV cache usage,
+        # counting each waiting request at the running average prompt length.
+        self.balance_kv_cache_usage = (
+            vllm_config.parallel_config.data_parallel_lb_policy == "kv_cache_usage"
+        )
+        self.avg_prompt_tokens = 0.0
 
         super().__init__(
             vllm_config,
@@ -1760,7 +1766,8 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             current_counts = self.lb_engines
             # TODO use P2C alg for larger DP sizes
             num_engines = len(current_counts)
-            min_score: float = sys.maxsize
+            waiting_kv_usage = self._waiting_request_kv_usage(request)
+            min_load: tuple[float, ...] = (sys.maxsize,)
             eng_index = 0
             for i in range(num_engines):
                 # Start from client_index to help with balancing when engines
@@ -1784,8 +1791,15 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                     # the penalty stays off, preserving exact round-robin.
                     # Ramps from 0 at <=50% usage to 3x waiting at 100%.
                     score += waiting * 6.0 * max(0.0, kv_cache_usage - 0.5)
-                if score < min_score:
-                    min_score = score
+                # With the "kv_cache_usage" policy the engine's KV load decides
+                # and the request score only breaks ties.
+                load = (
+                    (kv_cache_usage + waiting * waiting_kv_usage, score)
+                    if self.balance_kv_cache_usage
+                    else (score,)
+                )
+                if load < min_load:
+                    min_load = load
                     eng_index = idx
             # Increment local waiting count for better balancing between stats
             # updates from the coordinator (which happen every 100ms).
@@ -1802,6 +1816,29 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         self.reqs_in_flight[request.request_id] = chosen_engine
         self.engine_inflight[chosen_engine] += 1
         return chosen_engine
+
+    def _waiting_request_kv_usage(self, request: EngineCoreRequest) -> float:
+        """Estimated KV cache usage of one waiting request on an engine, for the
+        "kv_cache_usage" policy: the running average prompt length over an
+        engine's KV cache capacity. Waiting requests hold no KV cache yet."""
+        if not self.balance_kv_cache_usage:
+            return 0.0
+        if request.prompt_token_ids is not None:
+            num_tokens = len(request.prompt_token_ids)
+        elif request.prompt_embeds is not None:
+            num_tokens = len(request.prompt_embeds)
+        else:
+            num_tokens = 0
+        if self.avg_prompt_tokens:
+            self.avg_prompt_tokens += 0.1 * (num_tokens - self.avg_prompt_tokens)
+        else:
+            self.avg_prompt_tokens = float(num_tokens)
+        cache_config = self.vllm_config.cache_config
+        # num_gpu_blocks sums the engines' blocks (see the engine handshake).
+        capacity = (cache_config.num_gpu_blocks or 0) * cache_config.block_size
+        if not capacity:
+            return 0.0
+        return self.avg_prompt_tokens * len(self.core_engines) / capacity
 
     async def call_utility_async(self, method: str, *args) -> Any:
         # Only the result from the first engine is returned.
