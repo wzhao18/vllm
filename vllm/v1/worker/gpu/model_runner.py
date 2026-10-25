@@ -1582,6 +1582,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 if adaptive_verification is not None
                 else None
             ),
+            mamba_checkpoints_np=np.array(
+                [scheduler_output.mamba_checkpoints.get(r, (0, 0)) for r in req_ids],
+                dtype=np.int64,
+            )
+            if scheduler_output.mamba_checkpoints
+            else None,
         )
         if self.pcp_manager is not None:
             input_batch = self.pcp_manager.partition_batch(input_batch, batch_desc)

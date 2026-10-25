@@ -4,6 +4,7 @@
 
 from dataclasses import dataclass
 
+import numpy as np
 import pytest
 import torch
 
@@ -18,6 +19,7 @@ from vllm.config import (
     VllmConfig,
 )
 from vllm.config.model import ModelDType
+from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (
     AttentionImplBase,
     AttentionMetadataBuilder,
@@ -39,6 +41,8 @@ from vllm.v1.kv_cache_interface import (
     compute_layout_strides,
     create_kv_cache_views,
     get_kv_quant_mode,
+    get_mamba_prefill_checkpoint_position,
+    is_mamba_prefill_checkpoint_valid,
 )
 
 
@@ -60,6 +64,37 @@ class BatchSpec:
 
     def compute_num_tokens(self):
         return sum(self.query_lens)
+
+
+def reserve_mamba_checkpoints(
+    common: CommonAttentionMetadata, builder
+) -> CommonAttentionMetadata:
+    """Reserve each row's Mamba prefill checkpoint where the KV cache manager
+    keys it without planned checkpoints: the last reusable boundary below the
+    row's end, in the column below its state column, when exportable."""
+    cache_config = builder.vllm_config.cache_config
+    speculative_config = builder.vllm_config.speculative_config
+    spec = builder.kv_cache_spec
+    drop_eagle_block = (
+        speculative_config is not None and speculative_config.use_eagle_block_drop()
+    )
+    seq_lens = common.seq_lens_cpu_upper_bound.tolist()
+    query_lens = common.query_start_loc_cpu.diff().tolist()
+    checkpoints = np.zeros((len(seq_lens), 2), dtype=np.int64)
+    for row, (seq_len, query_len) in enumerate(zip(seq_lens, query_lens)):
+        position = get_mamba_prefill_checkpoint_position(
+            seq_len, cache_config.cache_hit_alignment_tokens, drop_eagle_block
+        )
+        if is_mamba_prefill_checkpoint_valid(
+            seq_len - query_len,
+            seq_len,
+            position,
+            cache_config.hash_block_size,
+            spec.block_size,
+            spec.prefill_checkpoint_alignment,
+        ):
+            checkpoints[row] = (position, cdiv(seq_len, spec.block_size) - 2)
+    return common.replace(mamba_checkpoints=checkpoints)
 
 
 def create_common_attn_metadata(

@@ -1445,6 +1445,9 @@ class MambaManager(SingleTypeKVCacheManager):
         )
         # Mamba checkpoints follow Eagle's global replay boundary.
         self.drop_eagle_checkpoint_block = False
+        # Set by ``KVCacheManager`` when the scheduler places each chunk's
+        # checkpoint (``plan_checkpoint``) instead of keying it on the chunk end.
+        self.planned_checkpoints = False
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
         if self.mamba_cache_mode == "align":
             # Mapping from request ID to the index of the block
@@ -1690,6 +1693,61 @@ class MambaManager(SingleTypeKVCacheManager):
             )
         )
 
+    def checkpoint_column(
+        self,
+        request_id: str,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        query_start: int,
+        query_end: int,
+        first_compute: bool,
+    ) -> int | None:
+        """The block column a checkpoint of the chunk over ``[query_start,
+        query_end)`` can be written to, or None.
+
+        Preferably ``cdiv(query_end, B) - 2``, just below the column the chunk
+        leaves its state in: a column appended this step, or a block the request
+        owns privately and no longer reads (its initial-state block, which the
+        model runner copies out before the forward). On a request's first
+        compute the worker receives its whole block table, so a null column at
+        or below it can take a new block instead.
+        """
+        col = cdiv(query_end, self.block_size) - 2
+        if col < 0:
+            return None
+        blocks = [*self.req_to_blocks.get(request_id, ()), *new_computed_blocks]
+        if col >= len(blocks):
+            # Columns up to the start's are filled by this step's external hit.
+            return col if col >= cdiv(query_start, self.block_size) else None
+        # A fresh partial hit's block is replaced by a private copy-on-write one.
+        cow = first_compute and new_computed_blocks and col == len(blocks) - 1
+        if cow and query_start % self.block_size != 0:
+            return col
+        if self.block_pool.is_block_writable(blocks[col]):
+            return col
+        if first_compute:
+            return next((i for i in range(col, -1, -1) if blocks[i].is_null), None)
+        return None
+
+    def plan_checkpoint(
+        self, request_id: str, checkpoint: tuple[int, int] | None
+    ) -> None:
+        """Set the (position, column) the next allocation's chunk exports."""
+        if checkpoint is None:
+            self._checkpoints.pop(request_id, None)
+        else:
+            self._checkpoints[request_id] = checkpoint
+
+    def _fills_null_column(
+        self,
+        request_id: str,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        col: int,
+    ) -> bool:
+        """Whether the checkpoint column is a null one of the request's blocks,
+        which allocation replaces with a new block."""
+        blocks = [*self.req_to_blocks[request_id], *new_computed_blocks]
+        return col < len(blocks) and blocks[col].is_null
+
     def get_num_blocks_to_allocate(
         self,
         request_id: str,
@@ -1759,29 +1817,36 @@ class MambaManager(SingleTypeKVCacheManager):
             # The helper returns a boundary strictly below its input, so every
             # chunk has one; under sparse retention only the prefill-end chunk's
             # is kept, so `prefill_end` skips reserving blocks for the others.
-            checkpoint_position = get_mamba_prefill_checkpoint_position(
-                num_tokens,
-                self.cache_hit_alignment_tokens,
-                self.drop_eagle_checkpoint_block,
-            )
-            if not self._needs_internal_checkpoint(
-                request_id,
-                total_computed_tokens,
-                num_tokens,
-                checkpoint_position,
-                prefill_end,
-            ):
-                checkpoint_position = 0
+            if self.planned_checkpoints:
+                planned = self._checkpoints.get(request_id)
+                checkpoint_position = planned[0] if planned else 0
+                if planned and self._fills_null_column(
+                    request_id, new_computed_blocks, planned[1]
+                ):
+                    num_new_blocks = max(num_new_blocks, 0) + 1
+            else:
+                checkpoint_position = get_mamba_prefill_checkpoint_position(
+                    num_tokens,
+                    self.cache_hit_alignment_tokens,
+                    self.drop_eagle_checkpoint_block,
+                )
+                if not self._needs_internal_checkpoint(
+                    request_id,
+                    total_computed_tokens,
+                    num_tokens,
+                    checkpoint_position,
+                    prefill_end,
+                ):
+                    checkpoint_position = 0
             checkpoint_block = int(checkpoint_position > 0)
             if not apply_admission_cap:
-                if checkpoint_position > 0:
-                    checkpoint_idx = cdiv(num_tokens, self.block_size) - 2
-                    self._checkpoints[request_id] = (
-                        checkpoint_position,
-                        checkpoint_idx,
+                if not self.planned_checkpoints:
+                    self.plan_checkpoint(
+                        request_id,
+                        (checkpoint_position, cdiv(num_tokens, self.block_size) - 2)
+                        if checkpoint_position > 0
+                        else None,
                     )
-                else:
-                    self._checkpoints.pop(request_id, None)
                 start_col = total_computed_tokens // self.block_size
                 if (
                     total_computed_tokens % self.block_size != 0
@@ -1883,6 +1948,12 @@ class MambaManager(SingleTypeKVCacheManager):
                 num_new_blocks = max(num_required_blocks - len(req_blocks), 0)
                 if has_partial_hit:
                     num_new_blocks = max(num_new_blocks, 0) + 1
+                fill_col = None
+                if self.planned_checkpoints and checkpoint_block:
+                    col = self._checkpoints[request_id][1]
+                    if self._fills_null_column(request_id, (), col):
+                        fill_col = col
+                        num_new_blocks += 1
                 max_new_blocks = 1 + int(has_partial_hit) + checkpoint_block
                 if not blocks_allocated:
                     max_new_blocks += self.num_speculative_blocks
@@ -1927,6 +1998,11 @@ class MambaManager(SingleTypeKVCacheManager):
                     else:
                         self._apply_cow(request_id, block_idx, source_block, cow_block)
                         returned_blocks = [cow_block] + returned_blocks
+                if fill_col is not None:
+                    # Only on a first compute, whose whole block table the
+                    # worker receives: the checkpoint takes a null column.
+                    req_blocks[fill_col] = new_blocks.pop()
+                    returned_blocks.append(req_blocks[fill_col])
                 req_blocks.extend(new_blocks)
                 self._allocated_block_reqs.add(request_id)
                 self._partial_hit_reqs.pop(request_id, None)
@@ -1996,6 +2072,15 @@ class MambaManager(SingleTypeKVCacheManager):
         replay_boundaries: Sequence[int],
     ) -> None:
         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
+        if self.planned_checkpoints:
+            # A replay boundary inside a block is kept exactly (checkpoint or
+            # partial tail); the block below it is not kept too.
+            alignment = self.cache_hit_alignment_tokens
+            replay_boundaries = [
+                boundary
+                for boundary in replay_boundaries
+                if boundary // alignment * alignment % self.block_size == 0
+            ]
         super().cache_blocks(
             request,
             num_tokens,
@@ -2004,11 +2089,13 @@ class MambaManager(SingleTypeKVCacheManager):
         )
         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
         if self.mamba_cache_mode == "align":
-            partial_hash = self._cache_partial_tail_block(
-                request, num_tokens, retention_interval=retention_interval
-            )
-            if partial_hash is not None:
-                self.cached_blocks_this_step.add(partial_hash)
+            # A chunk can both export a checkpoint and end on a retained state.
+            for partial_hash in (
+                self._cache_checkpoint_block(request, retention_interval),
+                self._cache_partial_tail_block(request, num_tokens),
+            ):
+                if partial_hash is not None:
+                    self.cached_blocks_this_step.add(partial_hash)
             self._unpublish_mid_block_start(
                 request, num_cached_blocks_before, num_cached_blocks_after
             )
@@ -2073,14 +2160,10 @@ class MambaManager(SingleTypeKVCacheManager):
     def new_step_starts(self) -> None:
         self.cached_blocks_this_step.clear()
 
-    def _cache_partial_tail_block(
-        self,
-        request: Request,
-        num_tokens: int,
-        retention_interval: int | None,
+    def _cache_checkpoint_block(
+        self, request: Request, retention_interval: int | None
     ) -> BlockHashWithGroupId | None:
-        hash_block_size = self.block_pool.hash_block_size
-        # Re-key the reserved block at its exported checkpoint boundary.
+        """Re-key the reserved block at its exported checkpoint boundary."""
         checkpoint = self._checkpoints.get(request.request_id)
         if checkpoint is not None:
             checkpoint_position, checkpoint_idx = checkpoint
@@ -2108,6 +2191,7 @@ class MambaManager(SingleTypeKVCacheManager):
                     self.kv_cache_spec,
                     self.drop_eagle_checkpoint_block,
                     retention_interval=retention_interval,
+                    reachable_boundaries=(request.shared_prefix_boundary,),
                 )
                 is_retained_checkpoint = retained is None or retained[0]
             if (
@@ -2129,6 +2213,14 @@ class MambaManager(SingleTypeKVCacheManager):
                 block_size=self.block_size,
                 replace_existing_hashes=True,
             )
+        return None
+
+    def _cache_partial_tail_block(
+        self, request: Request, num_tokens: int
+    ) -> BlockHashWithGroupId | None:
+        """Key the state a chunk ends with at the prompt's last hash boundary
+        (or the shared-prefix junction), when it ends there."""
+        hash_block_size = self.block_pool.hash_block_size
         if num_tokens <= 0 or num_tokens % hash_block_size != 0:
             return None
         latest_prompt_hash_boundary = get_mamba_prefill_checkpoint_position(

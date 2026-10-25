@@ -14,6 +14,7 @@ from tests.v1.attention.utils import (
     BatchSpec,
     create_common_attn_metadata,
     create_vllm_config,
+    reserve_mamba_checkpoints,
 )
 from vllm.config import SpeculativeConfig
 from vllm.config.compilation import CUDAGraphMode
@@ -423,7 +424,9 @@ def _create_checkpoint_builder_and_batch(
     table = common.block_table_tensor + 1
     if num_spec:
         table = torch.cat([table, torch.zeros(3, num_spec, dtype=table.dtype)], dim=1)
-    common = common.replace(block_table_tensor=table)
+    common = reserve_mamba_checkpoints(
+        common.replace(block_table_tensor=table), builder
+    )
     kwargs = {}
     if num_spec:
         kwargs = dict(

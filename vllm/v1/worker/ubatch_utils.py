@@ -337,6 +337,9 @@ def _make_metadata_with_slice(
         slot_mapping=slot_mapping,
         positions=positions,
         seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+        mamba_checkpoints=attn_metadata.mamba_checkpoints[request_slice]
+        if attn_metadata.mamba_checkpoints is not None
+        else None,
     )
 
 

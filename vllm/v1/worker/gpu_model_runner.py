@@ -2264,6 +2264,7 @@ class GPUModelRunner(
         for_cudagraph_capture: bool = False,
         num_scheduled_tokens: dict[str, int] | None = None,
         slot_mappings: dict[int, torch.Tensor] | None = None,
+        mamba_checkpoints: dict[str, tuple[int, int]] | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """Returns:
         tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -2378,6 +2379,12 @@ class GPUModelRunner(
             mm_req_doc_ranges=req_doc_ranges,
             rswa_prefix_lens=rswa_prefix_lens,
         )
+
+        if mamba_checkpoints:
+            cm_base.mamba_checkpoints = np.zeros((num_reqs_padded, 2), np.int64)
+            for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+                if checkpoint := mamba_checkpoints.get(req_id):
+                    cm_base.mamba_checkpoints[i] = checkpoint
 
         if self.dcp_world_size > 1:
             self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
@@ -4117,6 +4124,7 @@ class GPUModelRunner(
                     use_spec_decode=use_spec_decode,
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                     slot_mappings=slot_mappings_by_group,
+                    mamba_checkpoints=scheduler_output.mamba_checkpoints,
                 )
             )
 

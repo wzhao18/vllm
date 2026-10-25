@@ -127,6 +127,10 @@ class InputBatch:
     # None if there are no prefills.
     prefill_runs_as_decode_np: np.ndarray | None = None
 
+    # [num_reqs, 2] Mamba "align" prefill checkpoint per request: token position
+    # and block-table column, position 0 for none. None if there are none.
+    mamba_checkpoints_np: np.ndarray | None = None
+
     # [num_reqs] admitted draft counts in flight to the host. Set only under
     # adaptive verification with batch-sharded sampling, when the budget binds.
     num_admitted_draft_tokens: "AdmittedDraftCounts | None" = None

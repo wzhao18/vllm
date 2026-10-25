@@ -8,6 +8,7 @@ from tests.v1.attention.utils import (
     BatchSpec,
     create_common_attn_metadata,
     create_vllm_config,
+    reserve_mamba_checkpoints,
 )
 from vllm.v1.attention.backends.mamba2_attn import (
     Mamba2AttentionMetadataBuilder,
@@ -112,6 +113,7 @@ def _build(builder, seq_lens, query_lens):
     # create_common_attn_metadata leaves is_prefilling unset; the builder
     # asserts on it. Every row here is a full prefill.
     common = common.replace(is_prefilling=torch.ones(len(seq_lens), dtype=torch.bool))
+    common = reserve_mamba_checkpoints(common, builder)
     return builder.build(common_prefix_len=0, common_attn_metadata=common)
 
 

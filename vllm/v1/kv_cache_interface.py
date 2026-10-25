@@ -1174,18 +1174,36 @@ def is_mamba_prefill_checkpoint_valid(
     mamba_block_size: int,
     checkpoint_alignment: int | None,
 ) -> bool:
-    """Whether a backend can export the checkpoint in this query."""
+    """Whether a backend can export the checkpoint in this query, into block
+    column ``cdiv(query_end, B) - 2`` past the column of its initial state."""
+    initial_state_col = (query_start - 1) // mamba_block_size
+    checkpoint_col = cdiv(query_end, mamba_block_size) - 2
+    return checkpoint_col > initial_state_col and is_mamba_checkpoint_position_valid(
+        query_start,
+        query_end,
+        checkpoint_position,
+        hash_block_size,
+        checkpoint_alignment,
+    )
+
+
+def is_mamba_checkpoint_position_valid(
+    query_start: int,
+    query_end: int,
+    checkpoint_position: int,
+    hash_block_size: int,
+    checkpoint_alignment: int | None,
+) -> bool:
+    """Whether a backend can export the state after ``checkpoint_position``
+    tokens from a query over ``[query_start, query_end)``: it lies on the
+    backend's grid from a hash-aligned start, and the conv window before it
+    lies within the query."""
     if checkpoint_alignment is None:
         return False
     assert checkpoint_alignment > 0
-
-    initial_state_col = (query_start - 1) // mamba_block_size
-    checkpoint_col = cdiv(query_end, mamba_block_size) - 2
     return (
         query_start % hash_block_size == 0
-        and checkpoint_col > initial_state_col
-        and query_start + hash_block_size <= checkpoint_position
-        and query_start < checkpoint_position < query_end
+        and query_start + hash_block_size <= checkpoint_position < query_end
         and (checkpoint_position - query_start) % checkpoint_alignment == 0
     )
 

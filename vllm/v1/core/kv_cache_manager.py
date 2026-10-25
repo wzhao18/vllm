@@ -24,6 +24,8 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,
+    get_mamba_prefill_checkpoint_position,
+    is_mamba_checkpoint_position_valid,
 )
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
@@ -193,6 +195,34 @@ class KVCacheManager:
             for manager in self.coordinator.single_type_managers:
                 if isinstance(manager, MambaManager):
                     manager.shared_prefix_checkpoint = True
+        self._mamba_managers = [
+            manager
+            for manager in self.coordinator.single_type_managers
+            if isinstance(manager, MambaManager)
+        ]
+        # Prefill chunks run up to the token budget and every retained Mamba
+        # state is exported as an internal checkpoint (``mamba_checkpoint``),
+        # instead of chunks ending on block boundaries. Needs sparse retention
+        # (dense keeps a state per block) and a backend that exports checkpoints
+        # on the hash grid in every Mamba group.
+        self.mamba_planned_checkpoints = (
+            bool(self._mamba_managers)
+            and self.coordinator.retention_interval is not None
+            and self.coordinator.num_reprefillable_tokens == 0
+            and all(
+                manager.has_prefill_checkpoint_blocks
+                and (alignment := manager.kv_cache_spec.prefill_checkpoint_alignment)
+                and hash_block_size % alignment == 0
+                for manager in self._mamba_managers
+            )
+        )
+        for manager in self._mamba_managers:
+            manager.planned_checkpoints = self.mamba_planned_checkpoints
+        if self.mamba_planned_checkpoints:
+            logger.info(
+                "Mamba prefill chunks are split only to keep retained states, "
+                "which are exported as internal checkpoints."
+            )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.retained_hit_group_ids = tuple(
@@ -389,6 +419,7 @@ class KVCacheManager:
         reserved_blocks: int = 0,
         has_scheduled_reqs: bool = True,
         skip_zeroing_group_ids: tuple[int, ...] = (),
+        first_compute: bool = False,
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -423,6 +454,8 @@ class KVCacheManager:
                 this step, controls whether watermark is applied.
             skip_zeroing_group_ids: Groups whose external-token blocks will be
                 written by an async load and must not be zeroed concurrently.
+            first_compute: Whether this is the request's first step on the
+                worker, which then receives its whole block table.
 
         Blocks layout:
         ```
@@ -525,6 +558,17 @@ class KVCacheManager:
         # Matches the scheduler's own prefill boundary: `num_tokens - 1`
         # extends it to resumed requests replaying their output tokens.
         prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+
+        if self.mamba_planned_checkpoints:
+            checkpoint = self.mamba_checkpoint(
+                request,
+                new_computed_block_list,
+                total_computed_tokens,
+                total_computed_tokens + num_new_tokens,
+                first_compute,
+            )
+            for manager in self._mamba_managers:
+                manager.plan_checkpoint(request.request_id, checkpoint)
 
         if full_sequence_must_fit:
             # First check and fail if the full request sequence won't fit.
@@ -874,6 +918,84 @@ class KVCacheManager:
         ]
         retained_blocks = [block for pair in pending_copies for block in pair]
         return copies, retained_blocks
+
+    def mamba_checkpoint_positions(self, request: Request) -> list[int]:
+        """Positions, in ascending order, whose Mamba state a prefill of
+        ``request`` leaves in the prefix cache: the prompt's replay boundary,
+        a detected shared-prefix junction, and the multiples of the retention
+        interval."""
+        manager = self._mamba_managers[0]
+        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+        positions = {
+            get_mamba_prefill_checkpoint_position(
+                request.num_prompt_tokens,
+                manager.cache_hit_alignment_tokens,
+                manager.drop_eagle_checkpoint_block,
+            )
+        }
+        if junction := request.shared_prefix_boundary:
+            if not manager.shared_prefix_checkpoint:
+                junction = junction // manager.block_size * manager.block_size
+            positions.add(junction)
+        if interval := self.coordinator.retention_interval:
+            positions.update(range(interval, prefill_end, interval))
+        return sorted(p for p in positions if 0 < p < prefill_end)
+
+    def mamba_checkpoint(
+        self,
+        request: Request,
+        new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
+        query_start: int,
+        query_end: int,
+        first_compute: bool,
+    ) -> tuple[int, int] | None:
+        """The (position, block column) a prefill chunk over ``[query_start,
+        query_end)`` exports as its internal checkpoint: the first retained
+        position inside it, if every Mamba group can write it there."""
+        position = next(
+            (
+                p
+                for p in self.mamba_checkpoint_positions(request)
+                if query_start < p < query_end
+            ),
+            None,
+        )
+        if position is None or not all(
+            is_mamba_checkpoint_position_valid(
+                query_start,
+                query_end,
+                position,
+                self.block_pool.hash_block_size,
+                manager.kv_cache_spec.prefill_checkpoint_alignment,
+            )
+            for manager in self._mamba_managers
+        ):
+            return None
+        columns = {
+            manager.checkpoint_column(
+                request.request_id,
+                new_computed_blocks[manager.kv_cache_group_id],
+                query_start,
+                query_end,
+                first_compute,
+            )
+            for manager in self._mamba_managers
+        }
+        column = columns.pop() if len(columns) == 1 else None
+        return None if column is None else (position, column)
+
+    def mamba_checkpoint_plan(self, request_id: str) -> tuple[int, int] | None:
+        """The (position, block column) the request's last allocation reserved
+        for its internal Mamba checkpoint, which the worker exports in every
+        Mamba group (a group that reserved none has a null block there)."""
+        return next(
+            (
+                checkpoint
+                for manager in self._mamba_managers
+                if (checkpoint := manager._checkpoints.get(request_id))
+            ),
+            None,
+        )
 
     def take_boundary_state_offloads(
         self,

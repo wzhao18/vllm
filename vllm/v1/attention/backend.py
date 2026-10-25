@@ -473,6 +473,11 @@ class CommonAttentionMetadata:
     at the current decode run's last full-state write. write_pos counts from
     here, so a preemption-resumed request re-anchors past the prompt boundary."""
 
+    mamba_checkpoints: np.ndarray | None = None
+    """(batch_size, 2) Mamba "align" prefill checkpoint per request, as the KV
+    cache manager reserved it: the token position whose state to export and
+    the block-table column to write it to. Position 0 means none."""
+
     _num_computed_tokens_cache: torch.Tensor | None = None
     _token_to_req_indices_cache: torch.Tensor | None = None
 
@@ -548,6 +553,7 @@ class CommonAttentionMetadata:
             req_idx=maybe_slice_reqs(self.req_idx),
             rswa_prefix_lens=maybe_slice_reqs(self.rswa_prefix_lens),
             replayssm_decode_base_cpu=maybe_slice_reqs(self.replayssm_decode_base_cpu),
+            mamba_checkpoints=maybe_slice_reqs(self.mamba_checkpoints),
         )
 
 

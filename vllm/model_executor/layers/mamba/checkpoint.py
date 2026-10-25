@@ -7,56 +7,10 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.triton_utils import tl, triton
-from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
-from vllm.v1.kv_cache_interface import (
-    MambaSpec,
-    get_mamba_prefill_checkpoint_position,
-    is_mamba_prefill_checkpoint_valid,
-)
-
-
-def compute_mamba_prefill_checkpoints(
-    seq_lens: list[int],
-    query_lens: list[int],
-    hash_block_size: int,
-    mamba_block_size: int,
-    checkpoint_alignment: int | None,
-    drop_eagle_block: bool,
-    cache_hit_alignment_tokens: int,
-) -> tuple[list[int], list[int]]:
-    """Per-row internal prefill checkpoint offsets and cache block columns.
-
-    Backends call this instead of re-deriving the rules, so they decline in
-    lockstep with the scheduler and ``MambaManager``: allocating a checkpoint
-    block without writing it leaves the prefix cache serving uninitialized
-    state.
-
-    Returns:
-        ``(offsets, cols)``: the checkpoint's offset into each row's query and
-        its block-table column. ``0`` and ``-1`` mean the row has none.
-
-    """
-    offsets: list[int] = []
-    cols: list[int] = []
-    for seq_len, query_len in zip(seq_lens, query_lens):
-        query_start = seq_len - query_len
-        position = get_mamba_prefill_checkpoint_position(
-            seq_len, cache_hit_alignment_tokens, drop_eagle_block=drop_eagle_block
-        )
-        valid = is_mamba_prefill_checkpoint_valid(
-            query_start=query_start,
-            query_end=seq_len,
-            checkpoint_position=position,
-            hash_block_size=hash_block_size,
-            mamba_block_size=mamba_block_size,
-            checkpoint_alignment=checkpoint_alignment,
-        )
-        offsets.append(position - query_start if valid else 0)
-        cols.append(cdiv(seq_len, mamba_block_size) - 2 if valid else -1)
-    return offsets, cols
+from vllm.v1.kv_cache_interface import MambaSpec
 
 
 def _gather_checkpoint_state_indices(
@@ -109,30 +63,22 @@ class MambaPrefillCheckpointBuilder:
             return None
         if self.kv_cache_spec.num_prefill_checkpoint_blocks == 0:
             return None
-        cache_config = self.vllm_config.cache_config
-        hash_block_size = cache_config.hash_block_size
-        cache_hit_alignment_tokens = cache_config.cache_hit_alignment_tokens
-        if hash_block_size is None or cache_hit_alignment_tokens is None:
-            # Unresolved only for the minimal KV cache built for profiling.
+        if m.mamba_checkpoints is None:
             return None
         assert m.seq_lens_cpu_upper_bound is not None
         all_query_lens = m.query_start_loc_cpu.diff().tolist()
         query_lens = [all_query_lens[row] for row in request_rows]
         seq_lens = m.seq_lens_cpu_upper_bound.tolist()
-        block_size = self.kv_cache_spec.block_size
-        speculative_config = self.vllm_config.speculative_config
-        drop_eagle_block = (
-            speculative_config is not None and speculative_config.use_eagle_block_drop()
-        )
-        checkpoint_offsets, checkpoint_cols = compute_mamba_prefill_checkpoints(
-            [seq_lens[row] for row in request_rows],
-            query_lens,
-            hash_block_size=hash_block_size,
-            mamba_block_size=block_size,
-            checkpoint_alignment=self.kv_cache_spec.prefill_checkpoint_alignment,
-            drop_eagle_block=drop_eagle_block,
-            cache_hit_alignment_tokens=cache_hit_alignment_tokens,
-        )
+        # Export exactly what the scheduler's KV cache manager reserved: a
+        # reserved block that is not written would serve uninitialized state.
+        checkpoint_offsets: list[int] = []
+        checkpoint_cols: list[int] = []
+        for row, query_len in zip(request_rows, query_lens):
+            position, col = (int(x) for x in m.mamba_checkpoints[row])
+            query_start = seq_lens[row] - query_len
+            exported = query_start < position < seq_lens[row]
+            checkpoint_offsets.append(position - query_start if exported else 0)
+            checkpoint_cols.append(col if exported else -1)
         if not any(checkpoint_offsets):
             return None
         checkpoint_offsets_tensor = async_tensor_h2d(

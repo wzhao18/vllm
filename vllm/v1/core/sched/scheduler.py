@@ -639,6 +639,82 @@ class Scheduler(SchedulerInterface):
         end = min((s for s in stops if start < s < end), default=end)
         return max(end - start, 0)
 
+    def _mamba_checkpoint_split(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        num_new_local_computed_tokens: int = 0,
+        num_external_computed_tokens: int = 0,
+        new_computed_blocks: KVCacheBlocks | None = None,
+        first_compute: bool = False,
+    ) -> int:
+        """Clip a prefill chunk so every retained Mamba state is kept.
+
+        A chunk keeps up to two of the request's retained positions
+        (``KVCacheManager.mamba_checkpoint_positions``): one as its internal
+        checkpoint, and one as the state it ends with. So it ends early only
+        at a second retained position inside it, or at the first one when that
+        cannot be checkpointed. Otherwise it runs to the token budget, ending
+        on the hash grid when the next one may lie in the next chunk, so that
+        chunk can checkpoint it.
+        """
+        kv_cache_manager = self.kv_cache_manager
+        start = (
+            request.num_computed_tokens
+            + num_new_local_computed_tokens
+            + num_external_computed_tokens
+        )
+        end = start + num_new_tokens
+        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+        if start >= prefill_end:
+            return num_new_tokens
+        ahead = [
+            p for p in kv_cache_manager.mamba_checkpoint_positions(request) if p > start
+        ]
+        inside = [p for p in ahead if p < end]
+        if len(inside) > 1:
+            end = inside[1]
+        elif end < prefill_end and len(ahead) > len(inside):
+            end = self._mamba_grid_chunk_end(
+                start, end, prefill_end, ahead[len(inside)]
+            )
+        if new_computed_blocks is None:
+            new_computed_blocks = kv_cache_manager.empty_kv_cache_blocks
+        if (
+            inside
+            and inside[0] < end
+            and kv_cache_manager.mamba_checkpoint(
+                request, new_computed_blocks.blocks, start, end, first_compute
+            )
+            is None
+        ):
+            end = inside[0]
+        return end - start
+
+    def _mamba_grid_chunk_end(
+        self, start: int, end: int, prefill_end: int, next_position: int
+    ) -> int:
+        """End a chunk cut short of ``prefill_end`` on the hash grid when the
+        next chunk may hold ``next_position``, the next retained position, so
+        that chunk starts where its checkpoint offsets are exportable.
+
+        If ``next_position`` is left for a final chunk that would lie within a
+        single block, end at that block's start instead: a running request's
+        chunk within one block has no column for a checkpoint
+        (``MambaManager.checkpoint_column``).
+        """
+        max_chunk_tokens = self.max_num_scheduled_tokens
+        if (threshold := self.scheduler_config.long_prefill_token_threshold) > 0:
+            max_chunk_tokens = min(max_chunk_tokens, threshold)
+        if next_position >= end + max_chunk_tokens:
+            return end
+        grid_end = end // self.hash_block_size * self.hash_block_size
+        block_size = self.cache_config.block_size
+        last_block_start = (prefill_end - 1) // block_size * block_size
+        if start < last_block_start < grid_end < next_position:
+            grid_end = last_block_start
+        return grid_end if grid_end > start else end
+
     def _get_local_prefix_cache_hit(
         self, request: Request, max_cache_hit_length: int | None = None
     ) -> tuple[KVCacheBlocks, int, int, bool]:
@@ -836,8 +912,10 @@ class Scheduler(SchedulerInterface):
 
             # Apply Mamba alignment before encoder caps.
             if self.need_mamba_block_aligned_split:
-                num_new_tokens = self._mamba_block_aligned_split(
-                    request, num_new_tokens
+                num_new_tokens = (
+                    self._mamba_checkpoint_split(request, num_new_tokens)
+                    if self.kv_cache_manager.mamba_planned_checkpoints
+                    else self._mamba_block_aligned_split(request, num_new_tokens)
                 )
 
             # Schedule encoder inputs.
@@ -1235,6 +1313,9 @@ class Scheduler(SchedulerInterface):
                         skip_request(request_queue)
                         continue
 
+                # The worker receives this request's whole block table, unless
+                # it is a streaming session resuming on blocks it already holds.
+                first_compute = did_prefix_cache_lookup or not request.resumable
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
                 duplicate_encoder_inputs = []
@@ -1311,11 +1392,22 @@ class Scheduler(SchedulerInterface):
 
                     # Apply Mamba alignment before encoder caps.
                     if self.need_mamba_block_aligned_split:
-                        num_new_tokens = self._mamba_block_aligned_split(
-                            request,
-                            num_new_tokens,
-                            num_new_local_computed_tokens,
-                            num_external_computed_tokens,
+                        num_new_tokens = (
+                            self._mamba_checkpoint_split(
+                                request,
+                                num_new_tokens,
+                                num_new_local_computed_tokens,
+                                num_external_computed_tokens,
+                                new_computed_blocks,
+                                first_compute,
+                            )
+                            if self.kv_cache_manager.mamba_planned_checkpoints
+                            else self._mamba_block_aligned_split(
+                                request,
+                                num_new_tokens,
+                                num_new_local_computed_tokens,
+                                num_external_computed_tokens,
+                            )
                         )
                         if num_new_tokens == 0:
                             break
@@ -1400,6 +1492,7 @@ class Scheduler(SchedulerInterface):
                     num_tokens_past_hit,
                     num_new_computed_tokens=num_new_local_computed_tokens,
                     new_computed_blocks=new_computed_blocks,
+                    first_compute=first_compute,
                     num_lookahead_tokens=effective_lookahead_tokens,
                     num_external_computed_tokens=num_external_computed_tokens,
                     delay_cache_blocks=load_kv_async,
@@ -1692,6 +1785,11 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             skip_drafts=not drafts_needed,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
+            mamba_checkpoints={
+                req_id: checkpoint
+                for req_id in num_scheduled_tokens
+                if (checkpoint := self.kv_cache_manager.mamba_checkpoint_plan(req_id))
+            },
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:

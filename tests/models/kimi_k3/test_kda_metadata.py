@@ -12,6 +12,7 @@ from tests.v1.attention.utils import (
     BatchSpec,
     create_common_attn_metadata,
     create_vllm_config,
+    reserve_mamba_checkpoints,
 )
 from vllm.config import SpeculativeConfig
 from vllm.config.compilation import CUDAGraphMode
@@ -250,7 +251,7 @@ def test_kda_recoverssm_startup_metadata_flow_without_model(monkeypatch):
     )
     prefill_metadata = builder.build(
         0,
-        prefill_common,
+        reserve_mamba_checkpoints(prefill_common, builder),
         num_decode_draft_tokens_cpu=torch.tensor([-1], dtype=torch.int32),
         num_accepted_tokens=torch.ones(1, dtype=torch.int32),
     )
@@ -349,7 +350,7 @@ def test_internal_checkpoint_metadata_targets_last_aligned_boundary(
         builder.kv_cache_spec,
         "align",
     )
-    actual = builder.build(0, common_attn_metadata)
+    actual = builder.build(0, reserve_mamba_checkpoints(common_attn_metadata, builder))
 
     assert actual.checkpoint is not None
     torch.testing.assert_close(
@@ -407,7 +408,7 @@ def test_spec_internal_checkpoint_metadata_targets_replay_boundary(
         builder.kv_cache_spec,
         "align",
     )
-    actual = builder.build(0, common_attn_metadata)
+    actual = builder.build(0, reserve_mamba_checkpoints(common_attn_metadata, builder))
 
     if expected_offset is None:
         assert actual.checkpoint is None
