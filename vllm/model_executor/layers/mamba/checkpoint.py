@@ -53,6 +53,11 @@ def compute_mamba_prefill_checkpoints(
             hash_block_size=hash_block_size,
             mamba_block_size=mamba_block_size,
             checkpoint_alignment=checkpoint_alignment,
+            # The scheduler ends every mid-block query it did not approve for
+            # this (its initial-state block is not private, or the chunk does
+            # not finish the prefill) at the next block boundary, where the
+            # relaxed rule cannot match.
+            allow_first_partial_block=True,
         )
         offsets.append(position - query_start if valid else 0)
         cols.append(cdiv(seq_len, mamba_block_size) - 2 if valid else -1)

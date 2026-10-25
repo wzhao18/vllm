@@ -1173,8 +1173,20 @@ def is_mamba_prefill_checkpoint_valid(
     hash_block_size: int,
     mamba_block_size: int,
     checkpoint_alignment: int | None,
+    allow_first_partial_block: bool = False,
 ) -> bool:
-    """Whether a backend can export the checkpoint in this query."""
+    """Whether a backend can export the checkpoint in this query.
+
+    The checkpoint goes to block column ``cdiv(query_end, B) - 2``, which must
+    not be the column holding the query's initial state, except with
+    ``allow_first_partial_block``, for a query that starts mid-block in a
+    column the request owns privately (a local partial hit's copy-on-write
+    block, or the block an external load filled). The model runner copies the
+    initial state from that column into the running column before the forward
+    and no layer reads it, so the checkpoint export may overwrite it. The
+    scheduler ends every mid-block query it does not approve at the next block
+    boundary, where this case cannot match, so the worker allows it always.
+    """
     if checkpoint_alignment is None:
         return False
     assert checkpoint_alignment > 0
@@ -1183,7 +1195,14 @@ def is_mamba_prefill_checkpoint_valid(
     checkpoint_col = cdiv(query_end, mamba_block_size) - 2
     return (
         query_start % hash_block_size == 0
-        and checkpoint_col > initial_state_col
+        and (
+            checkpoint_col > initial_state_col
+            or (
+                allow_first_partial_block
+                and checkpoint_col == initial_state_col
+                and query_start % mamba_block_size != 0
+            )
+        )
         and query_start + hash_block_size <= checkpoint_position
         and query_start < checkpoint_position < query_end
         and (checkpoint_position - query_start) % checkpoint_alignment == 0

@@ -530,6 +530,7 @@ class Scheduler(SchedulerInterface):
         num_new_tokens: int,
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
+        allow_first_partial_block: bool = False,
     ) -> int:
         """Clip a prefill chunk so it ends where Mamba state must be cached.
 
@@ -538,6 +539,11 @@ class Scheduler(SchedulerInterface):
         boundary, a detected shared-prefix junction). If a block is larger
         than the configured prefill chunk limit, intermediate chunks keep
         private running state until they reach the next cacheable position.
+
+        ``allow_first_partial_block``: the caller vouches that the block holding
+        the chunk's mid-block initial state is private to the request (see
+        ``_mamba_initial_state_block_private``), so the prompt checkpoint may be
+        exported into it and a short continuation can finish in one chunk.
         """
         start = (
             request.num_computed_tokens
@@ -579,6 +585,7 @@ class Scheduler(SchedulerInterface):
                 hash_block_size=self.hash_block_size,
                 mamba_block_size=block_size,
                 checkpoint_alignment=self.mamba_prefill_checkpoint_alignment,
+                allow_first_partial_block=allow_first_partial_block,
             )
         )
         if use_internal_checkpoint:
@@ -637,7 +644,39 @@ class Scheduler(SchedulerInterface):
         )
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)
+        if start % block_size != 0 and end < prefill_end:
+            # A chunk that starts mid-block and does not finish the prefill
+            # has no internal checkpoint (it is only exported by the final
+            # chunk), so it must not run past the next block boundary: the
+            # block it starts in would be cached as that boundary's state.
+            end = min(end, next_block_boundary)
         return max(end - start, 0)
+
+    def _mamba_initial_state_block_private(
+        self, request: Request, num_computed_tokens: int, fresh_admission: bool
+    ) -> bool:
+        """Whether a waiting request's first chunk may export its prompt
+        checkpoint into the block holding its mid-block initial state.
+
+        That block must be private to the request: the copy-on-write block of
+        a fresh local partial hit, or the unhashed block an external load
+        filled. The model runner copies the initial state out of it before the
+        forward, and no layer reads it during the forward, so the checkpoint
+        can overwrite it. Declined when the chunk may still be shortened after
+        the split (encoder inputs, multi-token prefill lookahead), for streaming
+        sessions resuming with their running state elsewhere, and for requests
+        with output tokens (the split keys on ``num_tokens - 1`` but the manager
+        and the worker on ``num_tokens``).
+        """
+        return (
+            (fresh_admission or not request.resumable)
+            and request.num_output_tokens == 0
+            and not request.has_encoder_inputs
+            and self.num_prefill_lookahead <= 1
+            and self.kv_cache_manager.mamba_initial_state_blocks_writable(
+                request.request_id, num_computed_tokens
+            )
+        )
 
     def _get_local_prefix_cache_hit(
         self, request: Request, max_cache_hit_length: int | None = None
@@ -1316,6 +1355,16 @@ class Scheduler(SchedulerInterface):
                             num_new_tokens,
                             num_new_local_computed_tokens,
                             num_external_computed_tokens,
+                            allow_first_partial_block=(
+                                num_replay_tokens == 0
+                                and self._mamba_initial_state_block_private(
+                                    request,
+                                    request.num_computed_tokens
+                                    + num_new_local_computed_tokens
+                                    + num_external_computed_tokens,
+                                    fresh_admission=did_prefix_cache_lookup,
+                                )
+                            ),
                         )
                         if num_new_tokens == 0:
                             break

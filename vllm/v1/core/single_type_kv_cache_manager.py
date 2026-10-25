@@ -1657,6 +1657,16 @@ class MambaManager(SingleTypeKVCacheManager):
                     self.block_pool.free_blocks([blocks[last_state_block_idx]])
                     blocks[last_state_block_idx] = self._null_block
 
+    def initial_state_block_writable(self, request_id: str, num_tokens: int) -> bool:
+        """See ``KVCacheManager.mamba_initial_state_blocks_writable``."""
+        if self.mamba_cache_mode != "align" or num_tokens <= 0:
+            return True
+        blocks = self.req_to_blocks.get(request_id)
+        if not blocks:
+            return True
+        col = (num_tokens - 1) // self.block_size
+        return col < len(blocks) and self.block_pool.is_block_writable(blocks[col])
+
     def _needs_internal_checkpoint(
         self,
         request_id: str,
@@ -1668,6 +1678,7 @@ class MambaManager(SingleTypeKVCacheManager):
         assert isinstance(self.kv_cache_spec, MambaSpec)
         checkpoint_idx = cdiv(query_end, self.block_size) - 2
         blocks = self.req_to_blocks[request_id]
+        first_partial_ok = self.initial_state_block_writable(request_id, query_start)
         return (
             self.has_prefill_checkpoint_blocks
             and query_end >= prefill_end
@@ -1678,11 +1689,20 @@ class MambaManager(SingleTypeKVCacheManager):
                 hash_block_size=self.block_pool.hash_block_size,
                 mamba_block_size=self.block_size,
                 checkpoint_alignment=(self.kv_cache_spec.prefill_checkpoint_alignment),
+                # The scheduler's rule: the mid-block initial-state column must
+                # be private (a fresh local hit's CoW block, or the unhashed
+                # block an external load filled).
+                allow_first_partial_block=first_partial_ok,
             )
             and checkpoint_idx >= 0
             and (
                 checkpoint_idx >= len(blocks)
                 or blocks[checkpoint_idx].is_null
+                or (
+                    first_partial_ok
+                    and checkpoint_idx == (query_start - 1) // self.block_size
+                    and self.block_pool.is_block_writable(blocks[checkpoint_idx])
+                )
                 or (
                     request_id in self._allocated_block_reqs
                     and checkpoint_idx >= len(blocks) - self.num_speculative_blocks

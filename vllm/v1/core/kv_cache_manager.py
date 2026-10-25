@@ -875,6 +875,21 @@ class KVCacheManager:
         retained_blocks = [block for pair in pending_copies for block in pair]
         return copies, retained_blocks
 
+    def mamba_initial_state_blocks_writable(
+        self, request_id: str, num_tokens: int
+    ) -> bool:
+        """Whether every align-mode Mamba group holds the state after
+        ``num_tokens`` tokens of an allocated request in a block it owns
+        exclusively and that is not in the prefix cache (so a prefill may
+        overwrite it with its prompt checkpoint). True when the request has no
+        blocks yet: a fresh local hit's mid-block state goes to a private CoW
+        block."""
+        return all(
+            manager.initial_state_block_writable(request_id, num_tokens)
+            for manager in self.coordinator.single_type_managers
+            if isinstance(manager, MambaManager)
+        )
+
     def take_boundary_state_offloads(
         self,
     ) -> dict[str, list[tuple[int, int, int]]]:
