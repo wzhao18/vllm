@@ -1456,6 +1456,11 @@ class MambaManager(SingleTypeKVCacheManager):
             # checkpoint position and reserved block index for the current
             # allocation.
             self._checkpoints: dict[str, tuple[int, int]] = {}
+            # (column, start) of a step that starts mid-block and runs past
+            # that block's end. For a prefill chunk the column still holds the
+            # chunk's initial state, never the state at the block's end, so it
+            # must not be published as a full block (see `cache_blocks`).
+            self._mid_block_starts: dict[str, tuple[int, int]] = {}
             # Requests that registered their own last-prompt-boundary partial
             # tail (producers). A later CoW hands its private copy to the
             # connector; a request that finishes first hands off this table
@@ -1777,6 +1782,17 @@ class MambaManager(SingleTypeKVCacheManager):
                     )
                 else:
                     self._checkpoints.pop(request_id, None)
+                start_col = total_computed_tokens // self.block_size
+                if (
+                    total_computed_tokens % self.block_size != 0
+                    and num_tokens > (start_col + 1) * self.block_size
+                ):
+                    self._mid_block_starts[request_id] = (
+                        start_col,
+                        total_computed_tokens,
+                    )
+                else:
+                    self._mid_block_starts.pop(request_id, None)
             if num_new_blocks > 0:
                 blocks_allocated = request_id in self._allocated_block_reqs
                 physical_block_cap = 1 + int(has_partial_hit) + checkpoint_block
@@ -1950,6 +1966,7 @@ class MambaManager(SingleTypeKVCacheManager):
             self.last_state_block_idx.pop(request_id, None)
             self._num_retired_blocks.pop(request_id, None)
             self._checkpoints.pop(request_id, None)
+            self._mid_block_starts.pop(request_id, None)
             self._producer_partial_tail_reqs.pop(request_id, None)
             # An offer is only guaranteed to hold committed bytes until the end
             # of the pass that made it. This request's blocks are going back to
@@ -1992,6 +2009,9 @@ class MambaManager(SingleTypeKVCacheManager):
             )
             if partial_hash is not None:
                 self.cached_blocks_this_step.add(partial_hash)
+            self._unpublish_mid_block_start(
+                request, num_cached_blocks_before, num_cached_blocks_after
+            )
         if num_cached_blocks_after > num_cached_blocks_before:
             blocks = self.req_to_blocks[request.request_id]
             for idx in range(num_cached_blocks_before, num_cached_blocks_after):
@@ -2016,6 +2036,39 @@ class MambaManager(SingleTypeKVCacheManager):
                             block.block_hash_num_tokens,
                         )
                     )
+
+    def _unpublish_mid_block_start(
+        self, request: Request, num_cached_before: int, num_cached_after: int
+    ) -> None:
+        """Drop the full-block hash a prefill chunk that started mid-block just
+        gave its starting column.
+
+        A prefill chunk writes its state only at its end (and its checkpoint),
+        so the column it started in still holds its initial state, not the
+        state at that block's end. Caching it under the block's full hash would
+        serve (and offer to connectors) the wrong Mamba state at that boundary.
+        When the checkpoint is exported into that column it is re-keyed at the
+        checkpoint position instead and kept. Decode steps are left alone.
+        """
+        request_id = request.request_id
+        start = self._mid_block_starts.pop(request_id, None)
+        if start is None:
+            return
+        col, start_token = start
+        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+        if start_token >= prefill_end or not (
+            num_cached_before <= col < num_cached_after
+        ):
+            return
+        checkpoint = self._checkpoints.get(request_id)
+        if checkpoint is not None and checkpoint[1] == col:
+            return
+        block = self.req_to_blocks[request_id][col]
+        if (
+            not block.is_null
+            and block.block_hash_num_tokens == (col + 1) * self.block_size
+        ):
+            self.block_pool._maybe_evict_cached_block(block)
 
     def new_step_starts(self) -> None:
         self.cached_blocks_this_step.clear()
