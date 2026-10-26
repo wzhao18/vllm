@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import sys
 from abc import ABC, abstractmethod
 from bisect import bisect_left
@@ -21,6 +22,26 @@ logger = init_logger(__name__)
 
 # Error string from https://github.com/huggingface/tokenizers/blob/909fdde2a4ffedd9295206f705eb612be2a91b12/tokenizers/src/tokenizer/mod.rs#L1042
 INVALID_PREFIX_ERR_MSG = "Invalid prefix encountered"
+
+# VLLM_K3_BYTE_DETOK=1 (default off): detokenize Kimi K3 (tiktoken) outputs
+# byte-level, the way Dynamo's Rust detokenizer does, so a frontend on vLLM's
+# chat processor streams the same text as one on Dynamo's Rust processor. K3's
+# XTML markers (<|open|>, <|close|>, <|sep|>, ...) are added tokens outside
+# all_special_ids: the slow detokenizer prints them under skip_special_tokens
+# and pads every added-token boundary (prompt context included) with a space.
+# Here every tiktoken special id is dropped under skip_special_tokens and
+# nothing is inserted.
+_K3_BYTE_DETOK = os.environ.get("VLLM_K3_BYTE_DETOK", "0") not in ("", "0")
+
+
+def _k3_tiktoken_specials(tokenizer: TokenizerLike) -> frozenset[int] | None:
+    """Special ids of a Kimi K3 TikTokenTokenizer (tiktoken model and a
+    special_tokens map), else None."""
+    model = getattr(tokenizer, "model", None)
+    special = getattr(tokenizer, "special_tokens", None)
+    if not isinstance(special, dict) or not hasattr(model, "decode_single_token_bytes"):
+        return None
+    return frozenset(special.values())
 
 
 def uses_fast_detokenizer(tokenizer: TokenizerLike) -> bool:
@@ -57,6 +78,9 @@ class IncrementalDetokenizer:
         if tokenizer is None:
             # No tokenizer => skipping detokenization.
             return IncrementalDetokenizer()
+
+        if _K3_BYTE_DETOK and _k3_tiktoken_specials(tokenizer) is not None:
+            return K3ByteIncrementalDetokenizer(tokenizer, request)
 
         if uses_fast_detokenizer(tokenizer):
             # Fast tokenizer => use tokenizers library DecodeStream.
@@ -257,6 +281,43 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
             )
             token = self.stream.step(self.tokenizer, next_token_id)
         return token
+
+
+class K3ByteIncrementalDetokenizer(BaseIncrementalDetokenizer):
+    """Kimi K3: output token bytes decoded as UTF-8 a token at a time, the way
+    Dynamo's Rust detokenizer does: while the pending bytes end inside a
+    character, the whole pending run is held (none of it is emitted, and a run
+    still incomplete when the stream ends is dropped); invalid bytes become
+    U+FFFD. Special ids dropped under skip_special_tokens, no prompt context.
+    See VLLM_K3_BYTE_DETOK above."""
+
+    def __init__(self, tokenizer: TokenizerLike, request: EngineCoreRequest):
+        super().__init__(request)
+        params = request.sampling_params
+        assert params is not None
+        specials = _k3_tiktoken_specials(tokenizer)
+        assert specials is not None
+        self._specials = specials
+        self._token_bytes = tokenizer.model.decode_single_token_bytes  # type: ignore[attr-defined]
+        self._skip_special = params.skip_special_tokens
+        self._pending = b""
+
+    def decode_next(self, next_token_id: int) -> str:
+        if next_token_id in self._specials and self._skip_special:
+            return ""
+        try:
+            data = self._token_bytes(next_token_id)
+        except KeyError:
+            return ""  # outside the tiktoken vocabulary (e.g. padded embedding rows)
+        self._pending += data
+        try:
+            text = self._pending.decode("utf-8")
+        except UnicodeDecodeError as e:
+            if e.reason == "unexpected end of data" and e.end == len(self._pending):
+                return ""  # ends inside a character: hold the whole run
+            text = self._pending.decode("utf-8", errors="replace")
+        self._pending = b""
+        return text
 
 
 class SlowIncrementalDetokenizer(BaseIncrementalDetokenizer):
