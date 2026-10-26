@@ -54,6 +54,12 @@ class NewRequestData:
     prefill_token_ids: list[int] | None = None
     # DeepSeek-V4.1 only: SWA bounded replay; see Request.replay_start.
     replay_start: int = 0
+    # Only used for v2 model runner: `prefill_token_ids` holds the request's
+    # token ids from this position on. The scheduler trims the positions the
+    # workers never read (see `trim_new_request_data`); 0 ships all of them.
+    prefill_token_start: int = 0
+    # The prompt length, set when `prompt_token_ids` is not shipped.
+    num_prompt_tokens: int | None = None
 
     @classmethod
     def from_request(
@@ -84,11 +90,19 @@ class NewRequestData:
 
     @property
     def prompt_len(self) -> int:
+        if self.num_prompt_tokens is not None:
+            return self.num_prompt_tokens
         if self.prompt_token_ids is not None:
             return len(self.prompt_token_ids)
         if self.prompt_embeds is not None:
             return self.prompt_embeds.shape[0]
         return 0
+
+    @property
+    def prefill_len(self) -> int:
+        """Number of token ids the v2 model runner prefills (prompt + replay)."""
+        assert self.prefill_token_ids is not None
+        return self.prefill_token_start + len(self.prefill_token_ids)
 
     def __repr__(self) -> str:
         prompt_embeds_shape = (
@@ -99,6 +113,7 @@ class NewRequestData:
             f"req_id={self.req_id},"
             f"prompt_token_ids={self.prompt_token_ids},"
             f"prefill_token_ids={self.prefill_token_ids},"
+            f"prefill_token_start={self.prefill_token_start},"
             f"mm_features={self.mm_features},"
             f"sampling_params={self.sampling_params},"
             f"block_ids={self.block_ids},"
@@ -124,6 +139,7 @@ class NewRequestData:
             f"req_id={self.req_id},"
             f"prompt_token_ids_len={prompt_token_ids_len},"
             f"prefill_token_ids_len={prefill_token_ids_len},"
+            f"prefill_token_start={self.prefill_token_start},"
             f"mm_features={self.mm_features},"
             f"sampling_params={self.sampling_params},"
             f"block_ids={self.block_ids},"
@@ -132,6 +148,62 @@ class NewRequestData:
             f"prompt_embeds_shape={prompt_embeds_shape}"
             ")"
         )
+
+
+def needs_full_token_ids(sampling_params: "SamplingParams") -> bool:
+    """Whether a v2 worker reads a request's token ids before its first
+    uncomputed position: the prompt bincount of the penalties, prompt
+    logprobs, the thinking-budget scan from position 0, and the bad-words
+    lookback. Every other worker-side reader starts at `num_computed_tokens`.
+    """
+    return (
+        sampling_params.repetition_penalty != 1.0
+        or sampling_params.frequency_penalty != 0.0
+        or sampling_params.presence_penalty != 0.0
+        or sampling_params.prompt_logprobs is not None
+        or sampling_params.thinking_token_budget is not None
+        or bool(sampling_params.bad_words_token_ids)
+    )
+
+
+def trim_new_request_data(new_req: NewRequestData, request: "Request") -> bool:
+    """Drop the token ids a v2 worker never reads from a new request's data.
+
+    The worker reads a new request's ids from `num_computed_tokens` on (prefill
+    inputs, the prefill lookahead, sampled-token writes) unless a reader of
+    earlier positions is active, so a request admitted after a prefix-cache hit
+    or a KV transfer only needs its uncomputed tail; the full prompt list is
+    shipped only for pooling, multimodal and prompt-embeds requests. Engine-wide
+    readers (M-RoPE, n-gram drafting, watermarking, custom logits processors)
+    are excluded by the caller. Call this after every engine-side consumer
+    (KV connectors) has seen the full data: it replaces the lists, never
+    mutates them. Returns whether the token ids were trimmed.
+    """
+    sampling_params = request.sampling_params
+    if (
+        sampling_params is None
+        or request.pooling_params is not None
+        or request.mm_features
+        or request.prompt_embeds is not None
+        or request.resumable
+    ):
+        return False
+    if new_req.prompt_token_ids is not None:
+        new_req.num_prompt_tokens = len(new_req.prompt_token_ids)
+        new_req.prompt_token_ids = None
+    start = new_req.num_computed_tokens
+    token_ids = new_req.prefill_token_ids
+    if (
+        start <= 0
+        or token_ids is None
+        or new_req.prefill_token_start != 0
+        or start >= len(token_ids)
+        or needs_full_token_ids(sampling_params)
+    ):
+        return False
+    new_req.prefill_token_ids = token_ids[start:]
+    new_req.prefill_token_start = start
+    return True
 
 
 @dataclass

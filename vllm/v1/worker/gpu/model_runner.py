@@ -71,7 +71,11 @@ from vllm.tasks import SupportedTask
 from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, async_tensor_h2d
-from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+from vllm.v1.core.sched.output import (
+    GrammarOutput,
+    SchedulerOutput,
+    needs_full_token_ids,
+)
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     MambaSpec,
@@ -1294,12 +1298,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             prompt_len = new_req_data.prompt_len
             sampling_params = new_req_data.sampling_params
+            if new_req_data.prefill_token_start:
+                # The scheduler ships only the uncomputed tail when no reader of
+                # earlier positions is active (trim_new_request_data).
+                assert sampling_params is not None and not needs_full_token_ids(
+                    sampling_params
+                )
             self.req_states.add_request(
                 req_id=req_id,
                 prompt_len=prompt_len,
                 all_token_ids=new_req_data.prefill_token_ids,
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
+                start=new_req_data.prefill_token_start,
             )
             req_index = self.req_states.req_id_to_index[req_id]
             if self.adaptive_verification is not None:

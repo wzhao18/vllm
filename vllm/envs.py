@@ -279,6 +279,7 @@ if TYPE_CHECKING:
     VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT: int = 480
     VLLM_MOONCAKE_CONNECTOR_TIMEOUT: float = 30.0
     VLLM_ENABLE_CUDAGRAPH_GC: bool = False
+    VLLM_MM_EMBEDS_ON_CONSUMERS: bool = True
     VLLM_LOOPBACK_IP: str = ""
     VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE: bool = True
     VLLM_ENABLE_RESPONSES_API_STORE: bool = False
@@ -322,6 +323,7 @@ if TYPE_CHECKING:
     VLLM_COHERE2_ATTN_MOE_DUAL_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
+    VLLM_TRIM_NEW_REQUEST_TOKEN_IDS: bool = True
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -1998,6 +2000,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ENABLE_CUDAGRAPH_GC": lambda: bool(
         int(os.getenv("VLLM_ENABLE_CUDAGRAPH_GC", "0"))
     ),
+    # Whether EC/KV consumers automatically accept pre-computed-embedding inputs
+    # (the default). Set 0 on a consumer that never receives multimodal requests
+    # (e.g. text-only disaggregated serving of a multimodal checkpoint): the model
+    # runner then keeps the input embedding inside its CUDA graphs instead of
+    # running it, with its tensor-parallel all-reduce, before every replay.
+    "VLLM_MM_EMBEDS_ON_CONSUMERS": lambda: bool(
+        int(os.getenv("VLLM_MM_EMBEDS_ON_CONSUMERS", "1"))
+    ),
     # Used to force set up loopback IP
     "VLLM_LOOPBACK_IP": lambda: os.getenv("VLLM_LOOPBACK_IP", ""),
     # Used to set the process name prefix for vLLM processes.
@@ -2249,6 +2259,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_V2_MODEL_RUNNER": lambda: maybe_convert_bool(
         os.getenv("VLLM_USE_V2_MODEL_RUNNER", None)
     ),
+    # v2 model runner: send a new request's token ids to the workers only from
+    # its first uncomputed position, when no worker-side reader of earlier
+    # positions is active (see vllm.v1.core.sched.output.trim_new_request_data).
+    "VLLM_TRIM_NEW_REQUEST_TOKEN_IDS": lambda: bool(
+        int(os.getenv("VLLM_TRIM_NEW_REQUEST_TOKEN_IDS", "1"))
+    ),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model
     # with quantization methods and attention backends.
@@ -2457,6 +2473,7 @@ def compile_factors() -> dict[str, object]:
     hash everything else. This keeps the cache key aligned across workers."""
     ignored_factors: set[str] = {
         "MAX_JOBS",
+        "VLLM_TRIM_NEW_REQUEST_TOKEN_IDS",
         "VLLM_TRITON_JIT_WARMUP_NUM_THREADS",
         "VLLM_RPC_BASE_PATH",
         "VLLM_USE_MODELSCOPE",

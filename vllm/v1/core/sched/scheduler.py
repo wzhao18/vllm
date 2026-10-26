@@ -5,8 +5,10 @@ import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import replace
+from importlib.metadata import entry_points
 from typing import Any
 
+from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.aux_output_connector.connector import AuxOutputSchedulerConnector
@@ -48,6 +50,7 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     ScheduledEncoderInputStats,
     SchedulerOutput,
+    trim_new_request_data,
 )
 from vllm.v1.core.sched.request_queue import (
     RequestQueue,
@@ -76,6 +79,7 @@ from vllm.v1.metrics.stats import (
 )
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+from vllm.v1.sample.logits_processor import LOGITSPROCS_GROUP
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
@@ -83,6 +87,34 @@ from vllm.v1.structured_output.utils import strip_speculative_padding
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+def new_req_token_trim_supported(vllm_config: VllmConfig) -> bool:
+    """Whether new requests may ship only the token ids v2 workers read.
+
+    False when an engine-wide worker-side reader of a request's earlier token
+    ids may be active: M-RoPE position setup, n-gram drafting, watermarking and
+    custom logits processors (configured or installed as plugins). The
+    per-request readers are checked by `trim_new_request_data`.
+    """
+    if not envs.VLLM_TRIM_NEW_REQUEST_TOKEN_IDS:
+        return False
+    model_config = vllm_config.model_config
+    speculative_config = vllm_config.speculative_config
+    return not (
+        model_config.uses_mrope
+        or getattr(vllm_config, "watermark_config", None) is not None
+        or (
+            speculative_config is not None
+            and speculative_config.method in ("ngram", "ngram_gpu")
+        )
+        or bool(model_config.logits_processors)
+        or len(entry_points(group=LOGITSPROCS_GROUP)) > 0
+    )
+
+
+def _log_bucket(n: int) -> int:
+    return n.bit_length() if n < 1024 else 10 + n // 1024
 
 
 class Scheduler(SchedulerInterface):
@@ -418,6 +450,11 @@ class Scheduler(SchedulerInterface):
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
         self._pending_encoder_input_ids: dict[str, set[int]] = {}
+        # v2 model runner: a new request ships its token ids to the workers
+        # only from the first position they read (`trim_new_request_data`).
+        self.trim_new_req_token_ids = new_req_token_trim_supported(vllm_config)
+        self.num_new_reqs_trimmed = 0
+        self.num_new_reqs_untrimmed = 0
         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
         # cadence (`next_decode_eligible_step`).
         self.current_step = 0
@@ -1935,6 +1972,11 @@ class Scheduler(SchedulerInterface):
         # Connector-only block state must not be dispatched to workers.
         scheduler_output.kv_connector_block_state = None
 
+        # After every engine-side consumer of the full new-request data. The
+        # V1 model runner reads the prompt list; only v2 workers are trimmed.
+        if self.use_v2_model_runner and self.trim_new_req_token_ids and new_reqs_data:
+            self._trim_new_reqs_for_workers(new_reqs_data, scheduled_new_reqs)
+
         # Advance the fence only for non-empty steps (those that actually
         # write KV and have their output processed later in update_from_output).
         if self.defer_block_free and total_num_scheduled_tokens > 0:
@@ -1943,6 +1985,28 @@ class Scheduler(SchedulerInterface):
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
+
+    def _trim_new_reqs_for_workers(
+        self, new_reqs_data: list[NewRequestData], requests: list[Request]
+    ) -> None:
+        """Ship new requests' token ids to the workers from the first position
+        they read on: the engine pickles and every worker unpickles and stages
+        whatever the step's data holds, in the step's critical path."""
+        num_before = self.num_new_reqs_trimmed + self.num_new_reqs_untrimmed
+        for new_req, request in zip(new_reqs_data, requests, strict=True):
+            if trim_new_request_data(new_req, request):
+                self.num_new_reqs_trimmed += 1
+            else:
+                self.num_new_reqs_untrimmed += 1
+        num_after = self.num_new_reqs_trimmed + self.num_new_reqs_untrimmed
+        # Log at 1, 2, 4, ..., 1024 new requests, then every 1024.
+        if _log_bucket(num_before) != _log_bucket(num_after):
+            logger.info(
+                "New requests sent to the workers: %d with only their uncomputed "
+                "token ids, %d with all of them.",
+                self.num_new_reqs_trimmed,
+                self.num_new_reqs_untrimmed,
+            )
 
     def _build_kv_connector_meta(
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput

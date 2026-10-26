@@ -2890,6 +2890,16 @@ class VllmConfig:
         )
         if not mm_config.allow_missing_mm_embeddings:
             return
+        if not envs.VLLM_MM_EMBEDS_ON_CONSUMERS and not mm_config.enable_mm_embeds:
+            # Opted out: a text-only consumer must not turn on embedding inputs,
+            # which would move the input embedding (and its TP all-reduce) out of
+            # the model runner's CUDA graphs into every step's eager prep.
+            logger.info_once(
+                "EC/KV consumer: VLLM_MM_EMBEDS_ON_CONSUMERS=0, not enabling "
+                "pre-computed-embedding inputs; multimodal requests without "
+                "their tensors are rejected."
+            )
+            return
 
         if not mm_config.enable_mm_embeds:
             # Allowing missing tensors still requires enabling embedding inputs
