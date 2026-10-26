@@ -118,8 +118,12 @@ class Sm100GemmRsAr:
         cta_group: int = 1,
         all_reduce: bool = False,
         dtype: str = "bf16",
+        residual: bool = False,
     ) -> None:
         assert dtype in ("bf16", "mxfp8")
+        # residual: add a BF16 [R, N] tensor to GEMM rows [row0, row0 + R) in the
+        # epilogue (FP32, before the BF16 partial is written and reduced).
+        self.residual = residual
         self.rank = rank
         self.num_ranks = num_ranks
         BM = 128
@@ -189,6 +193,8 @@ class Sm100GemmRsAr:
         flags_uc: cute.Tensor,
         flags_mc_ptr: cute.Pointer,
         peer_flag_ptr: cute.Pointer,
+        residual: cute.Tensor,
+        residual_row0: Int32,
         grid_size: Int32,
         stream: CUstream,
     ) -> None:
@@ -227,6 +233,8 @@ class Sm100GemmRsAr:
             flags_uc.iterator,
             flags_mc_ptr,
             peer_flags,
+            residual,
+            residual_row0,
         ).launch(grid=grid, block=block, cluster=cluster, stream=stream)
 
     @cute.kernel
@@ -242,6 +250,8 @@ class Sm100GemmRsAr:
         flags_uc_ptr: cute.Pointer,
         flags_mc_ptr: cute.Pointer,
         peer_flags: cute.Tensor,
+        residual: cute.Tensor,
+        residual_row0: Int32,
     ) -> None:
         tid, _, _ = cute.arch.thread_idx()
         raw_bid, _, _ = cute.arch.block_idx()
@@ -706,6 +716,13 @@ class Sm100GemmRsAr:
                 l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
             )
 
+            if cutlass.const_expr(self.residual):
+                residual_vecs = cute.zipped_divide(residual, (1, WIDTH))
+                residual_row1 = residual_row0 + residual.shape[0]
+                bf16x16_ld_atom = cute.make_copy_atom(
+                    cute.nvgpu.CopyUniversalOp(), BFloat16, num_bits_per_copy=256
+                )
+
             tmem_stage = 0
             parity = 0
 
@@ -732,10 +749,25 @@ class Sm100GemmRsAr:
                         _tcgen05.fence_before_thread_sync()
                         mbarrier.arrive(tmem_empty_mbar_ + tmem_stage, "cluster")
 
+                    global_row = bid_m * BM + tid_
                     tmp = cute.make_rmem_tensor(WIDTH, BFloat16)
+                    if cutlass.const_expr(self.residual):  # noqa: SIM102 (compile-time)
+                        if global_row >= residual_row0 and global_row < residual_row1:
+                            res = cute.make_rmem_tensor(WIDTH, BFloat16)
+                            cute.copy(
+                                bf16x16_ld_atom,
+                                residual_vecs[
+                                    None,
+                                    (
+                                        global_row - residual_row0,
+                                        bid_n * (BN // WIDTH) + i,
+                                    ),
+                                ],
+                                res,
+                            )
+                            regs = regs + res.load().to(cutlass.Float32)
                     tmp.store(regs.to(BFloat16))
 
-                    global_row = bid_m * BM + tid_
                     if global_row < M:
                         coord = (global_row, bid_n * (BN // WIDTH) + i)
                         cute.copy(bf16x16_atom, tmp, partial_vecs[None, coord])
@@ -784,6 +816,7 @@ class Sm100GemmRsAr:
         cta_group: int,
         all_reduce: bool = False,
         dtype: str = "bf16",
+        residual: bool = False,
     ):
         M = cute.sym_int()
         padded_M = cute.sym_int()
@@ -844,9 +877,25 @@ class Sm100GemmRsAr:
         flags_mc_ptr = nullptr(Int32, cute.AddressSpace.gmem, assumed_align=16)
         peer_flag_ptr = nullptr(Int64, cute.AddressSpace.gmem, assumed_align=8)
 
+        residual_t = (
+            make_fake_tensor(
+                BFloat16,
+                (cute.sym_int(), N),
+                (cute.sym_int64(divisibility=16), 1),
+                assumed_align=32,
+            )
+            if residual
+            else None
+        )
+
         stream = make_fake_stream(use_tvm_ffi_env_stream=True)
         kernel = Sm100GemmRsAr(
-            rank, num_ranks, cta_group, all_reduce=all_reduce, dtype=dtype
+            rank,
+            num_ranks,
+            cta_group,
+            all_reduce=all_reduce,
+            dtype=dtype,
+            residual=residual,
         )
         return cute.compile(
             kernel,
@@ -860,6 +909,8 @@ class Sm100GemmRsAr:
             flags,
             flags_mc_ptr,
             peer_flag_ptr,
+            residual_t,
+            0,
             128,
             stream,
             options="--enable-tvm-ffi",
@@ -898,6 +949,7 @@ class GemmRsAr:
         self.device = device
         self.all_reduce = all_reduce
         self.dtypes: set[str] = set()
+        self.residual_used = False
 
         self.partial = symm_mem.empty((max_M, N), dtype=torch.bfloat16, device=device)
         self.partial_handle = symm_mem.rendezvous(self.partial, group)
@@ -972,6 +1024,11 @@ class GemmRsAr:
         self.dtypes.add(dtype)
         return True
 
+    def enable_residual(self) -> None:
+        """Declare that some caller passes ``residual`` to :meth:`apply`, so the
+        startup warmup also compiles the residual-epilogue variants."""
+        self.residual_used = True
+
     def warn_incompatible_projection(self) -> None:
         logger.warning_once(
             "Some projections are incompatible with GEMM-RS/AR; using the "
@@ -979,12 +1036,39 @@ class GemmRsAr:
             scope="global",
         )
 
+    def owns(self, t: torch.Tensor) -> bool:
+        """Whether ``t`` is a view of this op's output workspace (see
+        ``apply(copy_out=False)``)."""
+        return (
+            t.device == self.partial.device
+            and t.untyped_storage().data_ptr()
+            == self.partial.untyped_storage().data_ptr()
+        )
+
     def should_run(self, x: torch.Tensor) -> bool:
         # Use the same threshold for RS and AR for now. Small-M shapes are
         # supported but faster on the existing LL path.
         return x.shape[0] >= 128
 
-    def apply(self, x: torch.Tensor, linear: LinearBase) -> torch.Tensor:
+    def apply(
+        self,
+        x: torch.Tensor,
+        linear: LinearBase,
+        residual: torch.Tensor | None = None,
+        residual_row0: int = 0,
+        copy_out: bool = True,
+    ) -> torch.Tensor:
+        """``x @ linear.weight.T``, reduce-scattered or all-reduced over TP.
+
+        ``copy_out=False`` (AR only): return a view of the shared workspace
+        instead of a copy. The caller must finish reading it before the next
+        GEMM-RS/AR launch on this stream (the next launch rewrites it), and copy
+        anything it keeps longer; ``owns()`` tells whether a tensor is such a view.
+
+        ``residual`` (optional, BF16 ``[R, N]``, contiguous): added in the GEMM
+        epilogue to rows ``[residual_row0, residual_row0 + R)`` of this rank's
+        partial before the reduction, i.e. contributed exactly once to the sum.
+        """
         from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
             FlashInferCutedslMxfp8LinearKernel,
         )
@@ -1054,12 +1138,18 @@ class GemmRsAr:
             valid_rows = min(max(M - self.rank * local_M, 0), local_M)
             if valid_rows < local_M:
                 output[valid_rows:].zero_()
+        if residual is not None:
+            assert residual.dtype == torch.bfloat16 and residual.is_contiguous()
+            assert residual.ndim == 2 and residual.shape[1] == N
+            assert residual.device == self.device
+            assert residual_row0 >= 0 and residual_row0 + residual.shape[0] <= M
         compiled = Sm100GemmRsAr.compile(
             self.rank,
             self.world_size,
             cta_group,
             self.all_reduce,
             dtype=dtype,
+            residual=residual is not None,
         )
         compiled(
             x,
@@ -1072,9 +1162,13 @@ class GemmRsAr:
             self.flags,
             self.flags_mc_ptr,
             self.peer_flag_ptr,
+            residual,
+            residual_row0,
             num_ctas,
         )
         if self.all_reduce:
+            if not copy_out:
+                return self.partial[:M]
             # AttnRes may retain output past the next workspace reuse.
             # A future kernel could overlap this copy using an extra warp or
             # the communication warp.
@@ -1160,16 +1254,19 @@ def warmup_gemm_rs_ar() -> int:
     if _gemm_rs_ar is None:
         return 0
 
+    variants = (False, True) if _gemm_rs_ar.residual_used else (False,)
     for dtype in sorted(_gemm_rs_ar.dtypes):
         for cta_group in (1, 2):
-            Sm100GemmRsAr.compile(
-                _gemm_rs_ar.rank,
-                _gemm_rs_ar.world_size,
-                cta_group,
-                _gemm_rs_ar.all_reduce,
-                dtype=dtype,
-            )
-    return 2 * len(_gemm_rs_ar.dtypes)
+            for residual in variants:
+                Sm100GemmRsAr.compile(
+                    _gemm_rs_ar.rank,
+                    _gemm_rs_ar.world_size,
+                    cta_group,
+                    _gemm_rs_ar.all_reduce,
+                    dtype=dtype,
+                    residual=residual,
+                )
+    return 2 * len(_gemm_rs_ar.dtypes) * len(variants)
 
 
 def get_gemm_rs_ar() -> GemmRsAr:

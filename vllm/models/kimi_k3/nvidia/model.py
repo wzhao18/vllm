@@ -14,7 +14,9 @@ from vllm.config import VllmConfig
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
@@ -176,6 +178,26 @@ def can_shard_sequence_parallel_shared_expert(vllm_config: VllmConfig) -> bool:
     )
 
 
+def use_moe_token_shard(vllm_config: VllmConfig) -> bool:
+    """Whether the routed MoE runs on token shards over a replicated stream.
+
+    Opt-in via ``VLLM_KIMI_K3_MOE_TOKEN_SHARD`` with EP + MegaMoE at TP > 1 and
+    DP 1. It replaces full sequence parallelism: attention, AttnRes and the
+    shared experts stay as under plain TP (shared weights TP-sharded), and only
+    the routed experts see one 1/TP token slice per rank (see
+    :meth:`KimiMoE._token_shard_forward`).
+    """
+    parallel_config = vllm_config.parallel_config
+    return (
+        envs.VLLM_KIMI_K3_MOE_TOKEN_SHARD
+        and vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+        and parallel_config.enable_expert_parallel
+        and parallel_config.pipeline_parallel_size == 1
+        and parallel_config.data_parallel_size == 1
+        and parallel_config.tensor_parallel_size > 1
+    )
+
+
 def maybe_init_gemm_rs_ar(vllm_config: VllmConfig, use_sequence_parallel: bool) -> bool:
     # Both feature flags may be enabled; the worker's static SP topology binds
     # its singleton to exactly one mode.
@@ -199,6 +221,46 @@ def maybe_init_gemm_rs_ar(vllm_config: VllmConfig, use_sequence_parallel: bool) 
     flag = "VLLM_KIMI_K3_GEMM_AR" if all_reduce else "VLLM_ENABLE_GEMM_RS"
     logger.info_once("To disable %s, set %s=0.", mode, flag)
     return True
+
+
+def _gemm_ar_owns(t: torch.Tensor) -> bool:
+    if not envs.VLLM_KIMI_K3_GEMM_AR_ALIAS:
+        return False
+    from vllm.model_executor.kernels.linear.cute_dsl import gemm_rs_ar
+
+    op = gemm_rs_ar._gemm_rs_ar
+    return op is not None and op.all_reduce and op.owns(t)
+
+
+class KimiVecSituAndMul(nn.Module):
+    """SituAndMul through the vectorized kernel in ops/situ_and_mul.py (bitwise
+    equal to the CUDA op for every input). Opt-in via ``VLLM_KIMI_K3_VEC_SITU``.
+
+    For small inputs (up to 2048 rows of the TP8 shared expert's 768 columns,
+    the CUDA-graph range) the CUDA op's one-block-per-row layout keeps more
+    threads busy and wins (128-token steps: +7 us per call with the vectorized
+    kernel); larger ones (eager token-shard steps, and hybrid-SP steps' ~2k
+    rows x 6144 columns of the replicated shared expert: 34.3 -> 24.7 us) take
+    the vectorized kernel. Both are bitwise equal, so dispatching on the size
+    changes no numerics."""
+
+    _VEC_MIN_OUT_ELEMS = 2048 * 768 + 1
+
+    def __init__(self, beta: float, linear_beta: float | None):
+        super().__init__()
+        self.beta = float(beta)
+        self.linear_beta = None if linear_beta is None else float(linear_beta)
+        self.small = SituAndMul(beta=self.beta, linear_beta=self.linear_beta)
+        from vllm.models.kimi_k3.nvidia.ops.situ_and_mul import warmup
+
+        warmup()  # build / load the JIT extension at model init, not mid-step
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.numel() // 2 < self._VEC_MIN_OUT_ELEMS:
+            return self.small(x)
+        from vllm.models.kimi_k3.nvidia.ops.situ_and_mul import situ_and_mul
+
+        return situ_and_mul(x, self.beta, self.linear_beta)
 
 
 class KimiMLP(nn.Module):
@@ -277,6 +339,11 @@ class KimiMLP(nn.Module):
                 gemm_rs_ar.warn_incompatible_projection()
         if hidden_act == "silu":
             self.act_fn = SiluAndMul()
+        elif hidden_act == "situ" and envs.VLLM_KIMI_K3_VEC_SITU:
+            self.act_fn = KimiVecSituAndMul(
+                beta=activation_situ_beta or 1.0,
+                linear_beta=activation_situ_linear_beta,
+            )
         elif hidden_act == "situ":
             self.act_fn = SituAndMul(
                 beta=activation_situ_beta or 1.0,
@@ -404,6 +471,10 @@ class KimiMoE(nn.Module):
         self.use_mega_moe = (
             vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
         )
+        # Routed MoE on 1/TP token shards over a replicated stream (prefill
+        # workers); exclusive with sequence parallelism.
+        self.moe_token_shard = self.use_mega_moe and use_moe_token_shard(vllm_config)
+        assert not (self.moe_token_shard and use_sequence_parallel)
         if self.use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:
             raise NotImplementedError(
                 "Kimi K3 MegaMoE requires expert parallel. Enable it with "
@@ -471,6 +542,29 @@ class KimiMoE(nn.Module):
             )
         else:
             self.shared_experts = None
+
+        # MoE token shard: the shared down-projection's GEMM-AR kernel adds this
+        # rank's routed rows in its epilogue, so the one reduction per MoE layer
+        # runs on the fused multimem path instead of a separate all-reduce.
+        self._token_shard_gemm_ar = None
+        if (
+            self.moe_token_shard
+            and run_gemm_rs_ar
+            and self.shared_experts is not None
+            and envs.VLLM_KIMI_K3_MOE_TOKEN_SHARD_GEMM_AR
+        ):
+            from vllm.model_executor.kernels.linear.cute_dsl.gemm_rs_ar import (
+                get_gemm_rs_ar,
+            )
+
+            gemm_rs_ar = get_gemm_rs_ar()
+            if gemm_rs_ar.all_reduce and gemm_rs_ar.can_run(
+                self.shared_experts.down_proj
+            ):
+                gemm_rs_ar.enable_residual()
+                self._token_shard_gemm_ar = gemm_rs_ar
+            else:
+                gemm_rs_ar.warn_incompatible_projection()
 
         self.routed_expert_down_proj: ReplicatedLinear | None
         self.routed_expert_norm: RMSNorm | None
@@ -547,6 +641,16 @@ class KimiMoE(nn.Module):
                 weight_format=MEGA_MOE_MXFP4,
                 prefix=f"{prefix}.experts",
             )
+            if use_sequence_parallel or self.moe_token_shard:
+                # Under sequence parallelism (or the MoE token shard) each rank's
+                # MoE sees only its token shard (sp_shard pads to a multiple of
+                # the TP size), so the symmetric dispatch / combine buffer needs
+                # ceil(MNBT / TP) tokens per rank, not MNBT. Its combine slots
+                # alone are top_k x tokens x latent x 2 B (1.9 GB per rank at
+                # MNBT 16384).
+                self.experts.max_num_tokens = cdiv(
+                    self.experts.max_num_tokens, self.tp_size
+                )
         else:
             self.experts = FusedMoEFactory(
                 shared_experts=self.shared_experts,
@@ -649,9 +753,83 @@ class KimiMoE(nn.Module):
         )
         return routed_hidden_states, router_output, topk_ids
 
+    def _token_shard_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """MegaMoE on this rank's 1/TP token slice; ``hidden_states`` replicated.
+
+        The routed path (router, latent down-projection, MegaMoE dispatch / L1 /
+        L2 / combine, latent norm + up-projection) runs on rows
+        ``[rank * chunk, rank * chunk + chunk)`` only, while the TP-sharded
+        shared experts produce their partial for every row. The routed output is
+        accumulated into this rank's rows of that partial, so a single
+        all-reduce sums the shared partials and places every rank's routed rows:
+        one collective per MoE layer instead of the plain TP path's latent and
+        hidden all-reduces, and no replicated routed-side work.
+        """
+        assert self.routed_output_transform is not None
+        assert self.shared_experts is not None
+        num_tokens = hidden_states.shape[0]
+        local = sp_shard(hidden_states)
+        chunk = local.shape[0]
+        is_padding = None
+        if envs.VLLM_MOE_SKIP_PADDING:
+            ctx_padding = (
+                get_forward_context().is_padding
+                if is_forward_context_available()
+                else None
+            )
+            if ctx_padding is not None:
+                ctx_padding = ctx_padding[:num_tokens]
+            is_padding = sp_padding_mask(ctx_padding, hidden_states)
+        routed_hidden_states, router_output, topk_ids = (
+            self._maybe_overlap_router_and_down_proj(local)
+        )
+        assert topk_ids is not None
+        routed = self.experts(
+            routed_hidden_states, router_output, topk_ids, is_padding=is_padding
+        )
+        start = get_tensor_model_parallel_rank() * chunk
+        rows = max(0, min(chunk, num_tokens - start))
+        gemm_ar = self._token_shard_gemm_ar
+        if (
+            gemm_ar is not None
+            and num_tokens >= envs.VLLM_KIMI_K3_MOE_TOKEN_SHARD_GEMM_AR_MIN_TOKENS
+            and gemm_ar.should_run(hidden_states)
+        ):
+            # Shared gate/up + activation, then the shared down-projection's
+            # GEMM-AR adds this rank's routed rows (latent norm + up-projection)
+            # in its epilogue and all-reduces in the same kernel.
+            shared = self.shared_experts
+            gate_up, _ = shared.gate_up_proj(hidden_states)
+            act = shared.act_fn(gate_up)
+            routed_rows = (
+                self.routed_output_transform(routed[:rows]) if rows > 0 else None
+            )
+            # The layer output is consumed by the next layer's AttnRes before
+            # its o_proj GEMM-AR, so a workspace view is safe when aliasing.
+            return gemm_ar.apply(
+                act,
+                shared.down_proj,
+                residual=routed_rows,
+                residual_row0=start,
+                copy_out=not envs.VLLM_KIMI_K3_GEMM_AR_ALIAS,
+            )
+        # TP-sharded shared experts (reduce_results=False): this rank's partial.
+        output = self.shared_experts(hidden_states)
+        if rows > 0:
+            # Latent norm + up-projection accumulated into this rank's rows in
+            # the GEMM's beta-add epilogue.
+            self.routed_output_transform(
+                routed[:rows], residual=output[start : start + rows]
+            )
+        return tensor_model_parallel_all_reduce(output)
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
+        if self.moe_token_shard:
+            return self._token_shard_forward(hidden_states).view(
+                num_tokens, hidden_size
+            )
         # Overlap the gate with the routed down projection; the returned hidden
         # states are already down-projected. Keep the original ``hidden_states``
         # for the shared experts.
@@ -720,6 +898,7 @@ class KimiDecoderLayer(nn.Module):
             and parallel_config.enable_expert_parallel
             and parallel_config.tensor_parallel_size > 1
             and (use_mega_moe or parallel_config.data_parallel_size > 1)
+            and not use_moe_token_shard(vllm_config)
         )
         if config.is_kda_layer(layer_idx):
             kda_config = config.linear_attn_config
@@ -901,6 +1080,10 @@ class KimiDecoderLayer(nn.Module):
 
         assert prefix_sum is not None
         if self.is_block_write_layer:
+            # The prefix sum lives across later layers' GEMM-ARs: never keep a
+            # view of the GEMM-AR workspace (VLLM_KIMI_K3_GEMM_AR_ALIAS).
+            if _gemm_ar_owns(hidden_states):
+                hidden_states = hidden_states.clone()
             prefix_sum = hidden_states
             prefix_delta = None
         else:
@@ -998,6 +1181,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             and parallel_config.enable_expert_parallel
             and parallel_config.tensor_parallel_size > 1
             and (use_mega_moe or parallel_config.data_parallel_size > 1)
+            and not use_moe_token_shard(vllm_config)
         )
 
         self.vocab_size = config.vocab_size

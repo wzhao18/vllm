@@ -220,6 +220,11 @@ if TYPE_CHECKING:
     VLLM_MOE_SKIP_PADDING: bool = True
     VLLM_STEP5_SHARD_SP_SHARED_EXPERT: bool = False
     VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT: bool = False
+    VLLM_KIMI_K3_MOE_TOKEN_SHARD: bool = False
+    VLLM_KIMI_K3_MOE_TOKEN_SHARD_GEMM_AR: bool = False
+    VLLM_KIMI_K3_MOE_TOKEN_SHARD_GEMM_AR_MIN_TOKENS: int = 288
+    VLLM_KIMI_K3_VEC_SITU: bool = False
+    VLLM_KIMI_K3_GEMM_AR_ALIAS: bool = False
     VLLM_KIMI_K3_AUX_ATTN_RES_STREAM: bool = False
     VLLM_KIMI_K3_GEMM_AR: bool = True
     VLLM_ENABLE_GEMM_RS: bool = False
@@ -1713,6 +1718,41 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # serving.
     "VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT": lambda: bool(
         int(os.getenv("VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT", "0"))
+    ),
+    # Kimi-K3 only, with --enable-expert-parallel and the deep_gemm_mega_moe MoE
+    # backend at TP > 1 (DP 1). Instead of full sequence parallelism, keep the
+    # residual stream, AttnRes and attention replicated as under plain TP and
+    # shard only the routed MoE by token: each rank routes, down-projects and
+    # dispatches its 1/TP slice of the tokens through MegaMoE (EP over the TP
+    # ranks), up-projects it into its rows of the TP-sharded shared-expert
+    # partial, and one all-reduce finishes the layer. Keeps the shared experts
+    # TP-sharded (no replicated weights) for prefill workers.
+    "VLLM_KIMI_K3_MOE_TOKEN_SHARD": lambda: bool(
+        int(os.getenv("VLLM_KIMI_K3_MOE_TOKEN_SHARD", "0"))
+    ),
+    # With VLLM_KIMI_K3_MOE_TOKEN_SHARD: finish each MoE layer with the SM100
+    # GEMM-AR kernel on the shared down-projection, adding this rank's routed
+    # rows in its epilogue, instead of a separate all-reduce. Needs
+    # VLLM_KIMI_K3_GEMM_AR (the GEMM-AR workspace).
+    "VLLM_KIMI_K3_MOE_TOKEN_SHARD_GEMM_AR": lambda: bool(
+        int(os.getenv("VLLM_KIMI_K3_MOE_TOKEN_SHARD_GEMM_AR", "0"))
+    ),
+    # Smallest step (tokens, after CUDA-graph padding) that takes the fused
+    # GEMM-AR path above. Smaller steps keep the separate all-reduce, which is
+    # faster there: on a TP8 prefill worker the fused path cost ~+2 ms per
+    # 128-token step and saved ~1 ms per 384-token step.
+    "VLLM_KIMI_K3_MOE_TOKEN_SHARD_GEMM_AR_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_KIMI_K3_MOE_TOKEN_SHARD_GEMM_AR_MIN_TOKENS", "288")
+    ),
+    # Kimi K3 dense / shared-expert MLPs: SiTU-and-mul through the vectorized
+    # kernel (ops/situ_and_mul.py; bitwise equal to the CUDA op for every input,
+    # ~2x faster at prefill sizes).
+    "VLLM_KIMI_K3_VEC_SITU": lambda: bool(int(os.getenv("VLLM_KIMI_K3_VEC_SITU", "0"))),
+    # Kimi K3 GEMM-AR (o_proj and the token-shard MoE): return the reduced
+    # output as a view of the GEMM-AR workspace instead of copying it out; the
+    # AttnRes block-write layers copy what they keep. Bitwise (aliasing only).
+    "VLLM_KIMI_K3_GEMM_AR_ALIAS": lambda: bool(
+        int(os.getenv("VLLM_KIMI_K3_GEMM_AR_ALIAS", "0"))
     ),
     # Kimi K3 only, and unrelated to the MoE flags above. Tap the pre-norm
     # AttnRes mixture, rather than the post-mixture sum, as the auxiliary

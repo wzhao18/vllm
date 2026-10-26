@@ -10,6 +10,7 @@ from einops import rearrange
 from torch import nn
 from torch.nn.parameter import Parameter
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
@@ -996,7 +997,12 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         )
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
         if self.gemm_rs_ar is not None and self.gemm_rs_ar.should_run(core_attn_out):
-            return self.gemm_rs_ar.apply(core_attn_out, self.o_proj)
+            # VLLM_KIMI_K3_GEMM_AR_ALIAS: hand back the workspace view; the
+            # decoder layer consumes it before the next GEMM-AR, and copies it
+            # only where it keeps it (AttnRes block-write layers).
+            return self.gemm_rs_ar.apply(
+                core_attn_out, self.o_proj, copy_out=not envs.VLLM_KIMI_K3_GEMM_AR_ALIAS
+            )
         return self.o_proj(core_attn_out)[0]
 
     def _recoverssm_verify(

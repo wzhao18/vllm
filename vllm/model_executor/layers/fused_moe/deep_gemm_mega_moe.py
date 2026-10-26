@@ -734,6 +734,7 @@ class DeepGemmMegaMoEExperts(nn.Module):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         shared_experts: nn.Module | None = None,
+        is_padding: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run the routed and shared experts on this rank's tokens.
 
@@ -744,6 +745,9 @@ class DeepGemmMegaMoEExperts(nn.Module):
             shared_experts: Unfused shared MLP, run on ``hidden_states`` and
                 added to the output. Must be ``None`` when this layer fused the
                 shared expert at construction.
+            is_padding: Per-token padding mask of ``hidden_states``; defaults to
+                the forward context's (pass it for a token shard the context's
+                mask does not describe).
 
         Returns:
             BF16 ``[num_tokens, hidden_size]`` routed plus shared expert output.
@@ -762,11 +766,14 @@ class DeepGemmMegaMoEExperts(nn.Module):
             )
         self._synchronize_first_launch()
 
-        is_padding = None
-        if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
+        if (
+            is_padding is None
+            and envs.VLLM_MOE_SKIP_PADDING
+            and is_forward_context_available()
+        ):
             is_padding = get_forward_context().is_padding
-            if is_padding is not None:
-                is_padding = is_padding[:num_tokens]
+        if is_padding is not None:
+            is_padding = is_padding[:num_tokens]
 
         if self.capture_fn is not None:
             self.capture_fn(topk_ids)
