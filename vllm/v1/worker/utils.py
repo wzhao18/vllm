@@ -19,6 +19,7 @@ from vllm.model_executor.models.interfaces import MultiModalEmbeddings
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import MemorySnapshot, format_gib
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
@@ -966,36 +967,278 @@ def clear_layer_kv_caches(layers: Iterable[Any]) -> None:
                 layer.impl._v_scale_cache = None
 
 
+@dataclass(frozen=True)
+class KVBlockCopyGroups:
+    """Per-KV-cache-group views and token geometry for group-scoped copies.
+
+    ``views[g]`` holds the device views of group ``g``'s layers, and
+    ``block_sizes[g]`` the tokens one rank holds per scheduler block.
+    """
+
+    views: Sequence[Sequence[torch.Tensor]]
+    block_sizes: Sequence[int]
+    dcp_sharded: Sequence[bool]
+    cp_size: int = 1
+    cp_rank: int = 0
+    cp_interleave: int = 1
+    # group -> fused-copy segment table, or None for the indexing fallback.
+    _segments: dict[int, "_CopySegments | None"] = field(
+        default_factory=dict, compare=False, repr=False
+    )
+
+    def local_tokens(self, group: int, num_tokens: int) -> int:
+        """This rank's valid slots in a block whose first ``num_tokens``
+        positions (scheduler units, all DCP ranks) are valid."""
+        block_size = self.block_sizes[group]
+        if num_tokens <= 0:
+            return block_size
+        if self.cp_size == 1 or not self.dcp_sharded[group]:
+            return min(num_tokens, block_size)
+        interleave = self.cp_interleave
+        if block_size % interleave:
+            return block_size  # unexpected geometry: copy the whole block
+        # Same mapping as the slot mapping: offset o of the block lives on rank
+        # (o // interleave) % cp_size, which holds whole interleave chunks.
+        rounds, rem = divmod(num_tokens, interleave * self.cp_size)
+        partial = min(max(rem - self.cp_rank * interleave, 0), interleave)
+        return min(rounds * interleave + partial, block_size)
+
+
+def _widest_views(
+    kv_caches: Iterable[torch.Tensor], num_blocks: int
+) -> list[torch.Tensor]:
+    def bytes_per_block(cache: torch.Tensor) -> int:
+        per_kernel_block = cache[0].numel() * cache.element_size() if len(cache) else 0
+        return per_kernel_block * (cache.shape[0] // num_blocks)
+
+    # Layers sharing KV (cross-layer sharing) alias the same view; copy it
+    # once. data_ptr distinguishes per-layer views of a shared allocation, but
+    # hybrid models overlay views of different extents on one layer page: a
+    # Mamba layer's conv-state view and an attention layer's full-page view
+    # start at the same address. Keep the widest view per start address so the
+    # whole page is copied, not just the narrower view's prefix.
+    widest: dict[tuple[torch.device, int], torch.Tensor] = {}
+    for cache in kv_caches:
+        key = (cache.device, cache.data_ptr())
+        best = widest.get(key)
+        if best is None or bytes_per_block(cache) > bytes_per_block(best):
+            widest[key] = cache
+    return list(widest.values())
+
+
+@dataclass(frozen=True)
+class _CopySegments:
+    """One group's views as int32 segments for ``_copy_kv_blocks_kernel``."""
+
+    addrs: torch.Tensor  # absolute byte address of each segment
+    block_strides: torch.Tensor  # per scheduler block, int32 elements
+    kernel_block_els: torch.Tensor  # per kernel block, int32 elements
+    ratio: int  # kernel blocks per scheduler block, shared by the views
+    max_chunks: int
+    chunk: int
+
+
+def _build_copy_segments(
+    views: Iterable[torch.Tensor], num_blocks: int
+) -> _CopySegments | None:
+    """Segments that copy a scheduler block's leading kernel blocks per view.
+
+    A view's scheduler block is ``ratio`` kernel blocks at a fixed stride, so its
+    first ``k`` kernel blocks are one byte range of ``k`` kernel strides (any
+    padding between kernel pages belongs to the same block). Dims laid out
+    outside the kernel stride get a segment each. None (use the indexing
+    fallback) for views off CUDA, unaligned, or with differing ratios.
+    """
+    addrs: list[int] = []
+    strides: list[int] = []
+    kernel_els: list[int] = []
+    ratios: set[int] = set()
+    device = None
+    for view in _widest_views(views, num_blocks):
+        if view.device.type != "cuda" or view.ndim < 2:
+            return None
+        device = view.device
+        ratio = view.shape[0] // num_blocks
+        ratios.add(ratio)
+        el = view.element_size()
+        kstride = view.stride(0) * el
+        outer = [d for d in range(1, view.ndim) if view.stride(d) * el > kstride]
+        inner = [d for d in range(1, view.ndim) if d not in outer]
+        page = el + sum((view.shape[d] - 1) * view.stride(d) * el for d in inner)
+        if page > kstride or kstride % 4:
+            return None
+        for index in iprod(*(range(view.shape[d]) for d in outer)):
+            addr = view.data_ptr() + sum(
+                i * view.stride(d) * el for i, d in zip(index, outer)
+            )
+            if addr % 4:
+                return None
+            addrs.append(addr)
+            strides.append(kstride * ratio // 4)
+            kernel_els.append(kstride // 4)
+    if device is None or len(ratios) != 1:
+        return None
+    (ratio,) = ratios
+    max_els = max(kernel_els) * ratio
+    chunk = min(1 << (max_els - 1).bit_length(), 1024)
+    return _CopySegments(
+        addrs=torch.tensor(addrs, dtype=torch.uint64, device=device),
+        block_strides=torch.tensor(strides, dtype=torch.int64, device=device),
+        kernel_block_els=torch.tensor(kernel_els, dtype=torch.int64, device=device),
+        ratio=ratio,
+        max_chunks=cdiv(max_els, chunk),
+        chunk=chunk,
+    )
+
+
+@triton.jit
+def _copy_kv_blocks_kernel(
+    seg_addrs_ptr,
+    seg_block_strides_ptr,
+    seg_kernel_block_els_ptr,
+    copies_ptr,  # [n, 3]: src block, dst block, leading kernel blocks to copy
+    BLOCK_SIZE: tl.constexpr,
+):
+    copy_index = tl.program_id(0)
+    seg_index = tl.program_id(1)
+    chunk_index = tl.program_id(2)
+    num_kernel_blocks = tl.load(copies_ptr + copy_index * 3 + 2)
+    num_els = num_kernel_blocks * tl.load(seg_kernel_block_els_ptr + seg_index)
+    offset = chunk_index.to(tl.int64) * BLOCK_SIZE
+    if offset >= num_els:
+        return
+    src = tl.load(copies_ptr + copy_index * 3).to(tl.int64)
+    dst = tl.load(copies_ptr + copy_index * 3 + 1).to(tl.int64)
+    stride = tl.load(seg_block_strides_ptr + seg_index).to(tl.int64)
+    base = tl.cast(tl.load(seg_addrs_ptr + seg_index), tl.pointer_type(tl.int32))
+    cols = offset + tl.arange(0, BLOCK_SIZE).to(tl.int64)
+    mask = cols < num_els
+    vals = tl.load(base + src * stride + cols, mask=mask)
+    tl.store(base + dst * stride + cols, vals, mask=mask)
+
+
+def _copy_group_blocks(
+    groups: KVBlockCopyGroups,
+    group: int,
+    num_blocks: int,
+    copies: Sequence[KVCacheBlockCopy],
+) -> None:
+    """Copy blocks through one group's views, each bounded to its valid prefix.
+
+    A view splits a scheduler block into ``ratio`` kernel blocks. A copy moves
+    the kernel blocks that hold any of this rank's valid positions; later
+    kernel blocks keep the destination's alloc-time zeros. On CUDA every copy
+    and view of the group is one kernel launch.
+    """
+    block_size = groups.block_sizes[group]
+    local = [groups.local_tokens(group, c.num_tokens) for c in copies]
+
+    def prefix(num_local: int, ratio: int) -> int:
+        if block_size % ratio:
+            return ratio  # kernel blocks do not split the block evenly
+        return min(cdiv(num_local * ratio, block_size), ratio)
+
+    if group not in groups._segments:
+        groups._segments[group] = _build_copy_segments(groups.views[group], num_blocks)
+    segs = groups._segments[group]
+    if segs is not None:
+        rows = [
+            (c.src_block_id, c.dst_block_id, prefix(n, segs.ratio))
+            for c, n in zip(copies, local)
+        ]
+        rows = [r for r in rows if r[2] > 0]
+        if rows:
+            table = async_tensor_h2d(
+                np.array(rows, dtype=np.int64), device=segs.addrs.device
+            )
+            grid = (len(rows), len(segs.addrs), segs.max_chunks)
+            _copy_kv_blocks_kernel[grid](
+                segs.addrs,
+                segs.block_strides,
+                segs.kernel_block_els,
+                table,
+                BLOCK_SIZE=segs.chunk,
+            )
+        return
+
+    # Index tensors depend only on the prefix and ratio: upload each once.
+    index_cache: dict[tuple[int, int, torch.device], tuple[torch.Tensor, ...]] = {}
+    for cache in _widest_views(groups.views[group], num_blocks):
+        ratio, remainder = divmod(cache.shape[0], num_blocks)
+        assert remainder == 0, (
+            f"{cache.shape[0]} kernel blocks not divisible by "
+            f"{num_blocks} scheduler blocks"
+        )
+        by_prefix: dict[int, list[tuple[int, int]]] = {}
+        for copy, num_local in zip(copies, local):
+            if (k := prefix(num_local, ratio)) > 0:
+                by_prefix.setdefault(k, []).append(
+                    (copy.src_block_id, copy.dst_block_id)
+                )
+        blocks = cache.unflatten(0, (num_blocks, ratio))
+        for k, pairs in by_prefix.items():
+            key = (k, ratio, cache.device)
+            if key not in index_cache:
+                index_cache[key] = async_tensor_h2d(
+                    np.array(pairs, dtype=np.int64), device=cache.device
+                ).unbind(dim=1)
+            src, dst = index_cache[key]
+            if k == ratio:
+                blocks[dst] = blocks[src]
+            else:
+                blocks[dst, :k] = blocks[src, :k]
+
+
+def warmup_kv_block_copies(groups: KVBlockCopyGroups | None, num_blocks: int) -> None:
+    """Compile each group's ``_copy_kv_blocks_kernel`` variant before serving.
+
+    The kernel is specialized per group (``BLOCK_SIZE``), so the first
+    copy-on-write of a partial prefix hit would otherwise JIT-compile it during
+    inference. A whole-block self-copy of the null block (id 0) launches every
+    variant without changing any data.
+    """
+    if groups is None:
+        return
+    for group, views in enumerate(groups.views):
+        if views:
+            null_self_copy = KVCacheBlockCopy(0, 0, group)
+            _copy_group_blocks(groups, group, num_blocks, [null_self_copy])
+
+
 def copy_kv_cache_blocks_inplace(
     kv_caches: Iterable[torch.Tensor],
     num_blocks: int,
     kv_cache_block_copies: Sequence[KVCacheBlockCopy],
+    groups: KVBlockCopyGroups | None = None,
 ) -> None:
+    """Apply block copies (prefix-hit copy-on-write, host block copies).
+
+    With ``groups``, a copy that names its owning group moves only that group's
+    views and only the valid prefix (see ``KVCacheBlockCopy``). Every other
+    copy moves the block's whole page through the widest view at each address.
+    """
     if not kv_cache_block_copies:
         return
 
-    indices_np = np.array(kv_cache_block_copies, dtype=np.int64)
-    indices: torch.Tensor | None = None
-    seen: set[tuple[Any, ...]] = set()
-    copied_storages: set[tuple[torch.device, int]] = set()
-    for cache in kv_caches:
-        # Layers sharing KV (cross-layer sharing) alias the same view; copy it
-        # once. Hybrid models overlay layers of different kinds on one tensor,
-        # so views at the same address can differ in geometry (a Mamba state
-        # view spans only the leading bytes of a block that an attention view
-        # spans in full); each geometry must be copied, so the key covers the
-        # view's shape and strides and not just its address.
-        key = (
-            cache.device,
-            cache.data_ptr(),
-            tuple(cache.shape),
-            tuple(cache.stride()),
-            cache.element_size(),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
+    whole: list[KVCacheBlockCopy] = []
+    by_group: dict[int, list[KVCacheBlockCopy]] = {}
+    for copy in kv_cache_block_copies:
+        copy = KVCacheBlockCopy(*copy)
+        if groups is not None and 0 <= copy.group_id < len(groups.views):
+            by_group.setdefault(copy.group_id, []).append(copy)
+        else:
+            whole.append(copy)
+    for group, copies in by_group.items():
+        assert groups is not None
+        _copy_group_blocks(groups, group, num_blocks, copies)
+    if not whole:
+        return
 
+    indices_np = np.array([c[:2] for c in whole], dtype=np.int64)
+    indices: torch.Tensor | None = None
+
+    copied_storages: set[tuple[torch.device, int]] = set()
+    for cache in _widest_views(kv_caches, num_blocks):
         if indices is None:
             indices = async_tensor_h2d(indices_np, device=cache.device)
         assert cache.device == indices.device

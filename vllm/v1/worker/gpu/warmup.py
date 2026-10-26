@@ -211,7 +211,21 @@ def run_mixed_prefill_decode_warmup(
         worker_execute_model(cleanup_output)
     finally:
         model_runner.kv_connector.set_disabled(False)
+    _zero_warmup_blocks(model_runner, next_block_id)
     return True
+
+
+def _zero_warmup_blocks(model_runner: GPUModelRunner, num_used_blocks: int) -> None:
+    """Re-zero every block a warmup wrote (ids 0 .. num_used_blocks - 1).
+
+    Warmup steps bypass the scheduler, so the blocks they fill are never
+    recorded for zeroing. Normal allocations zero them on reuse, but a block
+    an async KV load fills skips that zeroing, and the pages the load does not
+    write would keep the dummy KV and Mamba states (BF16 bytes that read as
+    FP8 NaN in attention).
+    """
+    if model_runner.kv_block_zeroer is not None and num_used_blocks > 0:
+        model_runner.kv_block_zeroer.zero_block_ids(list(range(num_used_blocks)))
 
 
 @torch.inference_mode()
@@ -479,6 +493,6 @@ def _warmup_kernels(
     cleanup_output.finished_req_ids = set(req_ids)
     worker_execute_model(cleanup_output)
     model_runner.kv_connector.set_disabled(False)
-    if model_runner.kv_block_zeroer is not None:
-        model_runner.kv_block_zeroer.zero_block_ids([0])
+    # Block 0 (the null block) included.
+    _zero_warmup_blocks(model_runner, max(next_block_id, 1))
     torch.accelerator.synchronize()

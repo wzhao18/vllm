@@ -251,8 +251,21 @@ def trim_null_head(blocks: _BlockSeq) -> _BlockSeq:
 
 
 class KVCacheBlockCopy(NamedTuple):
+    """Copy one KV cache block's contents into another before the forward.
+
+    ``group_id`` is the KV cache group that owns the block. The worker then
+    copies only that group's views, so other groups' views overlaid on the same
+    page cannot clip or widen the copy. -1 copies the block's page in every
+    view. ``num_tokens`` > 0 bounds the copy to the block's leading positions
+    that hold valid KV, in scheduler units (all DCP ranks together). The rest
+    of the destination keeps its alloc-time zeros, not the source's later KV.
+    0 copies the whole block.
+    """
+
     src_block_id: int
     dst_block_id: int
+    group_id: int = -1
+    num_tokens: int = 0
 
 
 class FreeKVCacheBlockQueue:

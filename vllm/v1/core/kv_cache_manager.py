@@ -863,17 +863,19 @@ class KVCacheManager:
         self,
     ) -> tuple[list[KVCacheBlockCopy], list[KVCacheBlock]]:
         """Drain pending copies and return their retained endpoints."""
-        pending_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
+        copies: list[KVCacheBlockCopy] = []
+        retained_blocks: list[KVCacheBlock] = []
         for mgr in self.coordinator.single_type_managers:
-            pending_copies.extend(mgr.take_pending_cow_copies())
-        copies = [
-            KVCacheBlockCopy(
-                src_block_id=source_block.block_id,
-                dst_block_id=cow_block.block_id,
-            )
-            for source_block, cow_block in pending_copies
-        ]
-        retained_blocks = [block for pair in pending_copies for block in pair]
+            for source_block, cow_block in mgr.take_pending_cow_copies():
+                copies.append(
+                    KVCacheBlockCopy(
+                        src_block_id=source_block.block_id,
+                        dst_block_id=cow_block.block_id,
+                        group_id=mgr.kv_cache_group_id,
+                        num_tokens=mgr.take_cow_num_tokens(cow_block.block_id),
+                    )
+                )
+                retained_blocks += (source_block, cow_block)
         return copies, retained_blocks
 
     def take_boundary_state_offloads(

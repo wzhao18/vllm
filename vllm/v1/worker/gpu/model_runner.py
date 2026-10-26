@@ -188,10 +188,12 @@ from vllm.v1.worker.gpu.ubatch_utils import (
 )
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.utils import (
+    KVBlockCopyGroups,
     KVBlockZeroer,
     clear_layer_kv_caches,
     copy_kv_cache_blocks_inplace,
     get_uniform_decode_token_count,
+    warmup_kv_block_copies,
 )
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
@@ -227,6 +229,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Lazily initialized in _init_kv_zero_meta() when the KV cache needs
         # zeroing (e.g. hybrid models with fp8 KV cache).
         self.kv_block_zeroer: KVBlockZeroer | None = None
+        self.kv_block_copy_groups: KVBlockCopyGroups | None = None
 
         self.vocab_size = self.model_config.get_vocab_size()
         self.max_model_len = self.model_config.max_model_len
@@ -836,6 +839,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.kv_caches = [
             cache for cache in kv_caches_dict.values() if cache.device == self.device
         ]
+        self.kv_block_copy_groups = self._build_kv_block_copy_groups(kv_caches_dict)
+        warmup_kv_block_copies(
+            self.kv_block_copy_groups, self.kv_cache_config.num_blocks
+        )
         self.model_state.initialize_kv_cache(self.kv_cache_config, self.block_tables)
         if is_profiling:
             self.kv_connector = NO_OP_KV_CONNECTOR
@@ -849,6 +856,35 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         self.model, self.vllm_config
                     )
                 self.aux_output_connector.initialize_output_storage(kv_cache_config)
+
+    def _build_kv_block_copy_groups(
+        self, kv_caches_dict: dict[str, Any]
+    ) -> KVBlockCopyGroups | None:
+        """Per-group views for copy-on-write copies bounded to the hit prefix."""
+        if self.pcp_manager is not None:
+            # PCP's token placement is not modeled: copy whole pages.
+            return None
+        groups = self.kv_cache_config.kv_cache_groups
+        views: list[list[torch.Tensor]] = []
+        for group in groups:
+            group_views: list[torch.Tensor] = []
+            for name in group.layer_names:
+                cache = kv_caches_dict.get(name)
+                caches = cache if isinstance(cache, (list, tuple)) else [cache]
+                group_views += [
+                    c
+                    for c in caches
+                    if isinstance(c, torch.Tensor) and c.device == self.device
+                ]
+            views.append(group_views)
+        return KVBlockCopyGroups(
+            views=views,
+            block_sizes=[g.kv_cache_spec.block_size for g in groups],
+            dcp_sharded=[g.kv_cache_spec.dcp_sharded for g in groups],
+            cp_size=self.dcp_size,
+            cp_rank=self.dcp_rank,
+            cp_interleave=self.cp_interleave,
+        )
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""
@@ -1335,6 +1371,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_caches,
                 self.kv_cache_config.num_blocks,
                 scheduler_output.kv_cache_block_copies,
+                self.kv_block_copy_groups,
             )
 
     def gather_batch_req_state(
@@ -2454,6 +2491,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.pooling_runner = None
         if hasattr(self, "kv_caches"):
             self.kv_caches.clear()
+        self.kv_block_copy_groups = None
         if hasattr(self, "attn_groups"):
             self.attn_groups.clear()
         if hasattr(self, "kv_cache_config"):

@@ -1519,3 +1519,162 @@ def test_request_memory_charges_external_weights():
         request_memory(
             _memory_snapshot(total_gib=100, free_gib=10), cache_config, 70 * GiB_bytes
         )
+
+
+def test_copy_kv_cache_blocks_inplace_copies_widest_overlaid_view():
+    """Hybrid pages: per layer slot (one backing buffer, layer-major), Mamba
+    conv + SSM views cover a page prefix and an attention view covers the whole
+    page from the same address. A CoW copy must move whole pages whichever view
+    is listed first (it used to copy only the Mamba views' extent)."""
+    from vllm.v1.worker.utils import copy_kv_cache_blocks_inplace
+
+    num_blocks, page, slots = 4, 64, 2
+    buf = (torch.arange(slots * num_blocks * page) % 251 + 1).to(torch.uint8)
+    views, fulls = [], []
+    for s in range(slots):
+        full = buf[s * num_blocks * page : (s + 1) * num_blocks * page]
+        full = full.view(num_blocks, page)
+        views += [full[:, :40], full[:, 40:56], full]
+        full[3].zero_()
+        fulls.append(full)
+    copy_kv_cache_blocks_inplace(views, num_blocks, [(1, 3)])
+    for full in fulls:
+        assert torch.equal(full[3], full[1])
+
+
+def _hybrid_slot_views(num_blocks: int, page: int, slots: int, ratio: int):
+    """Per layer slot: Mamba conv + SSM views over a page prefix, and an
+    attention view over the whole page split into ``ratio`` kernel blocks."""
+    buf = (torch.arange(slots * num_blocks * page) % 251 + 1).to(torch.uint8)
+    attn, mamba, fulls = [], [], []
+    for s in range(slots):
+        full = buf[s * num_blocks * page : (s + 1) * num_blocks * page]
+        full = full.view(num_blocks, page)
+        mamba += [full[:, :40], full[:, 40:56]]
+        attn.append(full.view(num_blocks * ratio, page // ratio))
+        full[3].zero_()  # the CoW destination is a freshly zeroed block
+        fulls.append(full)
+    return attn, mamba, fulls
+
+
+@pytest.mark.parametrize(
+    "num_tokens,copied_bytes",
+    [
+        (0, 64),  # whole block
+        (8, 64),  # every position valid
+        (4, 32),  # 4 of 8 positions: 2 of 4 kernel blocks
+        (3, 32),  # a partly valid kernel block is copied whole
+        (1, 16),
+    ],
+)
+def test_copy_kv_cache_blocks_inplace_bounds_attention_cow_to_hit(
+    num_tokens, copied_bytes
+):
+    """A group-scoped attention copy moves only the hit prefix's kernel blocks,
+    through that group's views only; the rest keeps its alloc-time zeros."""
+    from vllm.v1.worker.utils import KVBlockCopyGroups
+
+    num_blocks, page, slots, ratio = 4, 64, 2, 4
+    attn, mamba, fulls = _hybrid_slot_views(num_blocks, page, slots, ratio)
+    groups = KVBlockCopyGroups(
+        views=[attn, mamba], block_sizes=[8, 8], dcp_sharded=[True, False]
+    )
+    copy = KVCacheBlockCopy(1, 3, group_id=0, num_tokens=num_tokens)
+    copy_kv_cache_blocks_inplace(attn + mamba, num_blocks, [copy], groups)
+    for full in fulls:
+        assert torch.equal(full[3, :copied_bytes], full[1, :copied_bytes])
+        assert not full[3, copied_bytes:].any()
+
+
+def test_copy_kv_cache_blocks_inplace_mamba_group_copies_its_state_only():
+    from vllm.v1.worker.utils import KVBlockCopyGroups
+
+    num_blocks, page, slots, ratio = 4, 64, 2, 4
+    attn, mamba, fulls = _hybrid_slot_views(num_blocks, page, slots, ratio)
+    groups = KVBlockCopyGroups(
+        views=[attn, mamba], block_sizes=[8, 8], dcp_sharded=[True, False]
+    )
+    copy = KVCacheBlockCopy(1, 3, group_id=1)
+    # Listed attention-first: the group decides the views, not the order.
+    copy_kv_cache_blocks_inplace(attn + mamba, num_blocks, [copy], groups)
+    for full in fulls:
+        assert torch.equal(full[3, :56], full[1, :56])
+        assert not full[3, 56:].any()
+
+
+def test_warmup_kv_block_copies_runs_each_group_without_changing_data(monkeypatch):
+    """The startup warmup launches one null-block self-copy per non-empty
+    group (compiling each fused-kernel variant) and leaves every page as is."""
+    from vllm.v1.worker import utils
+    from vllm.v1.worker.utils import KVBlockCopyGroups, warmup_kv_block_copies
+
+    num_blocks, page, slots, ratio = 4, 64, 2, 4
+    attn, mamba, fulls = _hybrid_slot_views(num_blocks, page, slots, ratio)
+    for full in fulls:
+        full.copy_(torch.randint_like(full, 1, 100))
+    before = [full.clone() for full in fulls]
+    groups = KVBlockCopyGroups(
+        views=[attn, [], mamba], block_sizes=[8, 8, 8], dcp_sharded=[True, False, False]
+    )
+    calls = []
+    real = utils._copy_group_blocks
+
+    def spy(groups, group, num_blocks, copies):
+        calls.append((group, list(copies)))
+        real(groups, group, num_blocks, copies)
+
+    monkeypatch.setattr(utils, "_copy_group_blocks", spy)
+    warmup_kv_block_copies(groups, num_blocks)
+    warmup_kv_block_copies(None, num_blocks)
+    assert calls == [
+        (0, [KVCacheBlockCopy(0, 0, 0)]),
+        (2, [KVCacheBlockCopy(0, 0, 2)]),
+    ]
+    for full, old in zip(fulls, before):
+        assert torch.equal(full, old)
+
+
+def test_copy_kv_cache_blocks_inplace_without_groups_copies_whole_pages():
+    num_blocks, page, slots, ratio = 4, 64, 2, 4
+    attn, mamba, fulls = _hybrid_slot_views(num_blocks, page, slots, ratio)
+    copy = KVCacheBlockCopy(1, 3, group_id=0, num_tokens=2)
+    copy_kv_cache_blocks_inplace(mamba + attn, num_blocks, [copy])
+    for full in fulls:
+        assert torch.equal(full[3], full[1])
+
+
+@pytest.mark.parametrize(
+    "cp_size,interleave,block_size,num_tokens,expected",
+    [
+        # Interleave 1: positions alternate ranks.
+        (2, 1, 4, 3, [2, 1]),
+        (2, 1, 4, 8, [4, 4]),
+        # Kimi K3 decode: TP16/DCP16, per-rank block 896 = interleave. A
+        # 4855-token hit fills ranks 0-4, 375 tokens of rank 5, none after.
+        (16, 896, 896, 4855, [896] * 5 + [375] + [0] * 10),
+        # Interleave 128 over a 512-token per-rank block, 2 ranks.
+        (2, 128, 512, 300, [172, 128]),
+        (2, 128, 512, 640, [384, 256]),
+    ],
+)
+def test_kv_block_copy_groups_local_tokens_follow_dcp_slot_mapping(
+    cp_size, interleave, block_size, num_tokens, expected
+):
+    from vllm.v1.worker.utils import KVBlockCopyGroups
+
+    got = [
+        KVBlockCopyGroups(
+            views=[[]],
+            block_sizes=[block_size],
+            dcp_sharded=[True],
+            cp_size=cp_size,
+            cp_rank=rank,
+            cp_interleave=interleave,
+        ).local_tokens(0, num_tokens)
+        for rank in range(cp_size)
+    ]
+    assert got == expected
+    # Brute force against the slot mapping's position -> rank rule.
+    for rank in range(cp_size):
+        owned = sum((p // interleave) % cp_size == rank for p in range(num_tokens))
+        assert got[rank] == min(owned, block_size)

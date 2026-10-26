@@ -145,7 +145,12 @@ class SingleTypeKVCacheManager(ABC):
         # Partial-hit copy-on-write bookkeeping. Populated only by fine-grained
         # managers (full attention, mamba "align"); harmlessly empty elsewhere.
         self._partial_hit_reqs: dict[str, tuple[int, KVCacheBlock]] = {}
+        # Valid tokens of a local partial hit's shared tail block, so its CoW
+        # copies only the hit prefix (token-addressed managers only).
+        self._partial_hit_tokens: dict[str, int] = {}
         self._pending_cow_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
+        # CoW destination block id -> valid tokens to copy (absent: whole).
+        self._cow_num_tokens: dict[int, int] = {}
         # Boundary-state offload hand-off for external KV connectors. A mamba
         # "align" block table is not append-only (interior states are
         # nulled/freed and speculative blocks relocate in place), so a
@@ -322,6 +327,9 @@ class SingleTypeKVCacheManager(ABC):
             # cache_blocks() re-caches the private copy once full.
             block_idx = num_local_computed_tokens // self.block_size
             self._partial_hit_reqs[request_id] = (block_idx, new_computed_blocks[-1])
+            self._partial_hit_tokens[request_id] = (
+                num_local_computed_tokens - block_idx * self.block_size
+            )
             self.num_cached_block[request_id] = block_idx
 
     def allocate_external_computed_blocks(
@@ -393,7 +401,15 @@ class SingleTypeKVCacheManager(ABC):
             # get_num_blocks_to_allocate.
             block_idx, source_block = self._partial_hit_reqs.pop(request_id)
             cow_block = self.block_pool.get_new_blocks(1)[0]
-            self._apply_cow(request_id, block_idx, source_block, cow_block)
+            # Copy only the hit prefix: past it, the source holds another
+            # request's KV (or stale bytes), and the zeroed copy stays clean.
+            self._apply_cow(
+                request_id,
+                block_idx,
+                source_block,
+                cow_block,
+                num_tokens=self._partial_hit_tokens.pop(request_id, 0),
+            )
             self.new_block_ids.append(cow_block.block_id)
             cow_blocks.append(cow_block)
 
@@ -428,6 +444,10 @@ class SingleTypeKVCacheManager(ABC):
         self._pending_cow_copies = []
         return pending_copies
 
+    def take_cow_num_tokens(self, cow_block_id: int) -> int:
+        """Valid tokens a drained CoW copies into ``cow_block_id``; 0: all."""
+        return self._cow_num_tokens.pop(cow_block_id, 0)
+
     def take_pending_boundary_state_offloads(
         self,
     ) -> list[tuple[str, int, KVCacheBlock, int]]:
@@ -458,13 +478,15 @@ class SingleTypeKVCacheManager(ABC):
         block_idx: int,
         source_block: KVCacheBlock,
         cow_block: KVCacheBlock,
+        num_tokens: int = 0,
     ) -> None:
         """Redirect a partial prefix-cache hit to a private CoW block.
 
         Both copy endpoints stay retained until the copy has run on the worker,
         so a same-step free cannot recycle them: ``source_block`` keeps its
         hit-ref, ``cow_block`` takes an extra ref beyond the one handed to the
-        request.
+        request. ``num_tokens`` > 0 limits the copy to the block's first
+        ``num_tokens`` positions.
         """
         req_blocks = self.req_to_blocks[request_id]
         assert block_idx < len(req_blocks)
@@ -472,6 +494,8 @@ class SingleTypeKVCacheManager(ABC):
         assert not source_block.is_null and source_block.ref_cnt > 0
         req_blocks[block_idx] = cow_block
         self._pending_cow_copies.append((source_block, cow_block))
+        if num_tokens > 0:
+            self._cow_num_tokens[cow_block.block_id] = num_tokens
         cow_block.ref_cnt += 1
 
     def cache_blocks(
@@ -586,6 +610,7 @@ class SingleTypeKVCacheManager(ABC):
         req_blocks = self.req_to_blocks.pop(request_id, [])
         self.num_cached_block.pop(request_id, None)
         self._partial_hit_reqs.pop(request_id, None)
+        self._partial_hit_tokens.pop(request_id, None)
         return trim_null_head(req_blocks)
 
     def free(self, request_id: str) -> None:
@@ -1465,6 +1490,9 @@ class MambaManager(SingleTypeKVCacheManager):
             # connector; a request that finishes first hands off this table
             # source directly.
             self._producer_partial_tail_reqs: dict[str, tuple[KVCacheBlock, int]] = {}
+            # Request -> start of the chunk being allocated (computed tokens),
+            # consumed by the next cache_blocks.
+            self._chunk_starts: dict[str, int] = {}
 
     @classmethod
     def find_longest_cache_hit(
@@ -1774,6 +1802,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 checkpoint_position = 0
             checkpoint_block = int(checkpoint_position > 0)
             if not apply_admission_cap:
+                self._chunk_starts[request_id] = total_computed_tokens
                 if checkpoint_position > 0:
                     checkpoint_idx = cdiv(num_tokens, self.block_size) - 2
                     self._checkpoints[request_id] = (
@@ -1919,6 +1948,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 req_blocks.extend(new_blocks)
                 self._allocated_block_reqs.add(request_id)
                 self._partial_hit_reqs.pop(request_id, None)
+                self._partial_hit_tokens.pop(request_id, None)
                 returned_blocks.extend(new_blocks)
                 return returned_blocks
 
@@ -1955,6 +1985,7 @@ class MambaManager(SingleTypeKVCacheManager):
             self.last_state_block_idx.pop(request_id, None)
             self._num_retired_blocks.pop(request_id, None)
             self._checkpoints.pop(request_id, None)
+            self._chunk_starts.pop(request_id, None)
             self._producer_partial_tail_reqs.pop(request_id, None)
             # An offer is only guaranteed to hold committed bytes until the end
             # of the pass that made it. This request's blocks are going back to
@@ -1983,6 +2014,8 @@ class MambaManager(SingleTypeKVCacheManager):
         *,
         replay_boundaries: Sequence[int],
     ) -> None:
+        if self.mamba_cache_mode == "align":
+            self._skip_stale_initial_state(request, num_tokens)
         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
         super().cache_blocks(
             request,
@@ -2021,6 +2054,27 @@ class MambaManager(SingleTypeKVCacheManager):
                             block.block_hash_num_tokens,
                         )
                     )
+
+    def _skip_stale_initial_state(self, request: Request, num_tokens: int) -> None:
+        """Never publish the initial-state block of a prefill chunk that started
+        mid-block and ran past that block's end.
+
+        The scheduler lets such a chunk cross the boundary when the backend
+        exports the prompt checkpoint internally. The worker then pre-copies the
+        resumed state into the running column, so this block keeps the state
+        at the chunk start, not the state at the block end its full-block hash
+        would claim.
+        """
+        start = self._chunk_starts.pop(request.request_id, None)
+        if start is None or start % self.block_size == 0:
+            return
+        if start >= max(request.num_prompt_tokens, request.num_tokens - 1):
+            return
+        initial_state_col = start // self.block_size
+        if num_tokens <= (initial_state_col + 1) * self.block_size:
+            return
+        if self.num_cached_block.get(request.request_id, 0) <= initial_state_col:
+            self.num_cached_block[request.request_id] = initial_state_col + 1
 
     def new_step_starts(self) -> None:
         self.cached_blocks_this_step.clear()
@@ -2265,6 +2319,9 @@ class HiSparseSourceManager(FullAttentionManager):
         """Drain host copies for the coordinator to hand to the connector."""
         copies = self._pending_cow_copies
         self._pending_cow_copies = []
+        # Host copies move whole blocks.
+        for _, cow_block in copies:
+            self._cow_num_tokens.pop(cow_block.block_id, None)
         return copies
 
     def get_num_blocks_to_allocate(

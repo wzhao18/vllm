@@ -235,6 +235,61 @@ def test_warmup_reserves_mamba_speculative_blocks(mamba_cache_mode):
         )
 
 
+class _ZeroRecorder:
+    def __init__(self) -> None:
+        self.zeroed: set[int] = set()
+
+    def zero_block_ids(self, block_ids: list[int]) -> None:
+        self.zeroed.update(block_ids)
+
+    def warmup(self, num_kv_blocks: int) -> None:
+        pass
+
+
+def _written_block_ids(recorder: "_BlockIdRecorder") -> set[int]:
+    return {0} | recorder.block_ids
+
+
+class _BlockIdRecorder(_StepRecorder):
+    """Also collects every block id the warmup steps hand to the model."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.block_ids: set[int] = set()
+
+    def execute_model(self, scheduler_output) -> None:
+        for new_req in scheduler_output.scheduled_new_reqs:
+            for ids in new_req.block_ids:
+                self.block_ids.update(ids)
+        for new_block_ids in scheduler_output.scheduled_cached_reqs.new_block_ids:
+            for ids in new_block_ids or ():
+                self.block_ids.update(ids)
+        super().execute_model(scheduler_output)
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_warmup_rezeroes_every_block_it_wrote(mixed):
+    """Warmup fills blocks behind the scheduler's back, so it must zero them all.
+
+    A block reallocated for an async KV load skips alloc-time zeroing, and the
+    pages the load does not write would keep the dummy KV or Mamba states.
+    """
+    recorder = _BlockIdRecorder()
+    runner = _make_runner([_attention_group(), _mamba_group("none")], NUM_SPEC_STEPS)
+    runner.kv_block_zeroer = _ZeroRecorder()
+    if mixed:
+        assert run_mixed_prefill_decode_warmup(
+            runner,
+            worker_execute_model=recorder.execute_model,
+            worker_sample_tokens=recorder.sample_tokens,
+            num_tokens=128,
+        )
+    else:
+        warmup_kernels(runner, recorder.execute_model, recorder.sample_tokens)
+    assert len(recorder.block_ids) > 1
+    assert _written_block_ids(recorder) <= runner.kv_block_zeroer.zeroed
+
+
 def _hybrid_kv_cache_config(num_blocks: int) -> KVCacheConfig:
     """Attention, circular, and Mamba groups exercise every reservation branch."""
     return KVCacheConfig(
