@@ -219,6 +219,109 @@ def _warm_gluon_chunk_kda(layer, input_dtype: torch.dtype) -> None:
         )
 
 
+def _warm_prefill_glue(worker: Worker, layer: KimiK3DeltaAttention) -> None:
+    """Prefill-only kernels that dummy runs never reach (KDA's _forward returns
+    without attention metadata), once each at the serving strides, so no
+    Triton kernel JIT-compiles during inference:
+    - KDA: short conv (generic and tile), output gate norm (every TILES
+      variant, prefill and projection-overlap gate strides), initial-state
+      gather, checkpoint export, segment-scan chain;
+    Cache line 0 is the null block: the state kernels skip it (no writes)."""
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_fn
+    from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
+        gather_initial_states,
+    )
+    from vllm.models.kimi_k3.nvidia.ops import (
+        kda_conv,
+        kda_norm,
+        kda_segscan,
+    )
+    from vllm.v1.attention.backends.utils import (
+        NULL_BLOCK_ID,
+        compute_causal_conv1d_metadata,
+    )
+
+    kv_cache = layer.kv_cache
+    if not isinstance(kv_cache, (list, tuple)) or len(kv_cache) < 2:
+        return
+    conv_state, rec_state = kv_cache[0], kv_cache[1]
+    if not isinstance(conv_state, torch.Tensor) or not conv_state.numel():
+        return
+    device = conv_state.device
+    dtype = worker.model_config.dtype
+    P = int(layer.local_projection_size)
+    H = int(layer.local_num_heads)
+    D = int(layer.head_dim)
+    # Row stride of the prefill projection output (KDA forward's split sizes).
+    width = 4 * P + D + H + int(getattr(layer, "in_proj_padding", 0) or 0)
+    logger.info("Warming up Kimi-K3 prefill glue kernels.")
+
+    # KDA short conv: q / k / v column slices of the projection (row stride
+    # width), the layer's conv cache views, one 16-token sequence.
+    T = 16
+    proj = torch.zeros((T, width), dtype=dtype, device=device)
+    qsl_cpu = torch.tensor([0, T], dtype=torch.int32)
+    nums_dict, batch_ptr, offs = compute_causal_conv1d_metadata(qsl_cpu, device=device)
+    md = SimpleNamespace(
+        nums_dict=nums_dict, batch_ptr=batch_ptr, token_chunk_offset_ptr=offs
+    )
+    qsl = qsl_cpu.to(device)
+    null = torch.full((1,), NULL_BLOCK_ID, dtype=torch.int32, device=device)
+    no_init = torch.zeros(1, dtype=torch.bool, device=device)
+    w = layer.conv1d.weight.view(
+        layer.conv1d.weight.size(0), layer.conv1d.weight.size(2)
+    )
+    for x, wp, st in zip(
+        proj[:, : 3 * P].split(P, dim=-1),
+        w.split(P, dim=0),
+        conv_state.split(P, dim=-2),
+    ):
+        xt = x.transpose(0, 1)
+        causal_conv1d_fn(
+            xt,
+            wp,
+            None,
+            activation="silu",
+            conv_states=st,
+            has_initial_state=no_init,
+            cache_indices=null,
+            query_start_loc=qsl,
+            metadata=md,
+        )
+        if kda_conv.supported(xt, wp, st, md):
+            kda_conv.kda_prefill_conv(xt, wp, st, qsl, null, no_init, md)
+
+    # Output gate norm: the gate is a view of the prefill projection (row
+    # stride width) or of the decode projection-overlap output (4 P).
+    for stride in sorted({width, 4 * P}):
+        kda_norm.warmup(H, stride, layer.o_norm.weight, float(layer.o_norm.eps))
+
+    gather_initial_states(rec_state, null, no_init)
+    exporter = getattr(layer, "_checkpoint_exporter", None)
+    if exporter is not None:
+        ck = torch.empty((1, H, D, D), dtype=rec_state.dtype, device=device)
+        exporter.export(
+            SimpleNamespace(
+                checkpoint_offsets=torch.zeros(1, dtype=torch.int32, device=device),
+                state_indices=null,
+            ),
+            raw_qkv=proj[:, : 3 * P],
+            conv_state=conv_state,
+            recurrent_checkpoint=ck,
+            recurrent_state=rec_state,
+            cu_seqlens=qsl,
+        )
+    bufs = getattr(layer, "_segscan_bufs", None)
+    if bufs is not None:
+        init = torch.zeros((1, H, D, D), dtype=rec_state.dtype, device=device)
+        plan = SimpleNamespace(first=null * 0, count=null * 0 + 1, num_seqs=1)
+        kda_segscan.chain_scan(init, bufs.M, bufs.C, bufs.X, plan)  # type: ignore[arg-type]
+
+    torch.accelerator.synchronize()
+
+
 @torch.inference_mode()
 def kimi_k3_triton_warmup(worker: Worker) -> None:
     """Warm Kimi-K3 Triton kernels reachable by this server."""
@@ -236,3 +339,7 @@ def kimi_k3_triton_warmup(worker: Worker) -> None:
 
     _warm_attn_res(worker)
     _warm_recurrent_kda(layer, worker.model_config.dtype)
+    try:
+        _warm_prefill_glue(worker, layer)
+    except Exception:  # never block startup; the JIT monitor will flag misses
+        logger.warning("Kimi-K3 prefill warmup failed.", exc_info=True)

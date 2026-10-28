@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Callable
 from dataclasses import replace
 from typing import Literal
@@ -52,6 +53,7 @@ from vllm.models.kimi_k3.nvidia.kda_metadata import (
     KimiK3KDAAttentionBackend,
     KimiK3KDAMetadata,
 )
+from vllm.models.kimi_k3.nvidia.ops import kda_conv, kda_norm, kda_segscan
 from vllm.models.kimi_k3.nvidia.ops.kda_conv import (
     packed_causal_conv1d_fn,
     packed_causal_conv1d_supported,
@@ -65,7 +67,6 @@ from vllm.models.kimi_k3.nvidia.recoverssm.kernels import (
     can_use_cute_recoverssm,
     compile_state_commit,
 )
-from vllm.models.kimi_k3.nvidia.ops import kda_segscan
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
@@ -85,6 +86,13 @@ from vllm.v1.worker.workspace import (
 )
 
 logger = init_logger(__name__)
+
+# VLLM_K3_KDA_CONV_TILE=0: the generic causal_conv1d_fn for the prefill short
+# convolutions (ops/kda_conv.py is bitwise equal to it).
+_CONV_TILE = os.environ.get("VLLM_K3_KDA_CONV_TILE", "1") == "1"
+# VLLM_K3_KDA_NORM_TILES=0: FLA's rms_norm_gated for the output gate norm
+# (ops/kda_norm.py is bitwise equal to it).
+_NORM_TILES = os.environ.get("VLLM_K3_KDA_NORM_TILES", "1") == "1"
 
 _KDA_GATE_LOGBOUND_MIN = -5.0
 
@@ -1355,6 +1363,19 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                     state: torch.Tensor,
                     weight: torch.Tensor,
                 ) -> torch.Tensor:
+                    xt = x.transpose(0, 1)
+                    if _CONV_TILE and kda_conv.supported(xt, weight, state, m):
+                        assert non_spec_state_indices_tensor is not None
+                        assert has_initial_state is not None
+                        return kda_conv.kda_prefill_conv(
+                            xt,
+                            weight,
+                            state,
+                            non_spec_query_start_loc,
+                            non_spec_state_indices_tensor,
+                            has_initial_state,
+                            m,
+                        ).transpose(0, 1)
                     return causal_conv1d_fn(
                         x.transpose(0, 1),
                         weight,
@@ -1630,4 +1651,9 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             assert core_attn_out_spec is not None
         # Triton normalizes in place, so this is a self-copy with no device
         # work. Keep it for the out-of-place native implementation.
-        core_attn_out.copy_(self.o_norm(core_attn_out, g2))
+        if _NORM_TILES and kda_norm.supported(core_attn_out, g2, self.o_norm):
+            kda_norm.rmsnorm_gated_(
+                core_attn_out, g2, self.o_norm.weight, self.o_norm.eps
+            )
+        else:
+            core_attn_out.copy_(self.o_norm(core_attn_out, g2))
