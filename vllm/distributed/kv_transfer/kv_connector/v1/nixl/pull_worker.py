@@ -79,6 +79,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         # Start transfers for requests whose handshakes have now finished.
         while not self._ready_requests.empty():
             self._read_blocks_for_req(*self._ready_requests.get_nowait())
+        # One zeroing launch for every pull posted above.
+        self._flush_unwritten_zeroing()
 
         if self.pcp_rank > 0 and not self.pcp_dcp_sharded:
             # Replicated-KV PCP: only PCP rank 0 serves the KV, so this rank
@@ -187,6 +189,9 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         local_block_ids = meta.local_physical_block_ids
         remote_region_groups = self.dst_region_group_ids[engine_id]
         local_region_groups = self.region_group_ids or remote_region_groups
+        # Units each group's posted reads write. Region-mapped pulls keep
+        # their own plan (region_blocks_to_zero).
+        written: list[set[int]] | None = None
         if not local_block_ids:
             # Region expansion cannot index empty groups. Pass empty specs to
             # _read_blocks so its existing cache-hit notification path runs.
@@ -261,6 +266,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 for r, blocks in enumerate(local_by_region)
             ]
         else:
+            written = [set() for _ in local_block_ids]
             remote_logical_block_ids = meta.remote.block_ids
             meta.remote.block_ids = self._logical_to_kernel_block_ids(
                 remote_logical_block_ids,
@@ -369,21 +375,33 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 local_xfer_side_handle=local_xfer_side_handle,
                 local_dram_handle=local_dram_handle,
                 remote_xfer_side_handle=remote_xfer_side_handle,
-                expected_consumers=plan.local_consumers,
+                expected_consumers=plan.consumers_for(spec.remote_rank),
                 awaiting_kvs=meta.awaiting_kvs,
                 num_tokens=meta.remote.num_tokens,
+                written=written,
             ):
                 return
+
+        if written is not None:
+            self._queue_unwritten_zeroing(
+                req_id,
+                meta,
+                written,
+                self.transfer_topo.block_size_ratio(remote_info.remote_block_size),
+            )
 
         if self.use_mla and tp_ratio < 0 and len(read_specs) == 1:
             # ..but we still need to notify the other remote ranks that we
             # have the blocks we need so they can update the request state.
             # Same thing for DCP (tp_size == dcp_size), so the raw tp_ratio already
             # reflects whether any remote replica is left unchosen.
-            notif_id = f"{meta.remote.request_id}:{plan.local_consumers}".encode()
             remote_agents = self._remote_agents[meta.remote.engine_id]
             for rank_to_notify, agent in remote_agents.items():
                 if rank_to_notify != (0, read_specs[0].remote_rank):
+                    notif_id = (
+                        f"{meta.remote.request_id}:"
+                        f"{plan.consumers_for(rank_to_notify[1])}"
+                    ).encode()
                     try:
                         self.nixl_wrapper.send_notif(agent, notif_msg=notif_id)
                     except Exception as e:
@@ -411,13 +429,16 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         expected_consumers: int,
         awaiting_kvs: bool,
         num_tokens: int | None = None,
+        written: list[set[int]] | None = None,
     ) -> bool:
         """Post a READ point-to-point xfer request from a single local worker to
         a single remote worker.
 
         Returns True when the read was posted (or was unnecessary), False
         when the request was routed to failure reporting — the caller must
-        not post further transfers for it.
+        not post further transfers for it. ``written`` collects, per group, the
+        local units the read writes: kernel blocks, or remote-sized sub-blocks
+        when the remote block is smaller.
         """
         assert self.transfer_topo is not None
         remote_rank = read_spec.remote_rank
@@ -494,6 +515,10 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                         remote_info.remote_physical_blocks_per_logical
                     ),
                 )
+
+        if written is not None and not read_spec.block_ids_by_region:
+            for group_written, group_ids in zip(written, local_block_ids):
+                group_written.update(group_ids)
 
         # NOTE (nicolo) With homogeneous TP, each TP worker loads KV from
         # corresponding rank. With heterogeneous TP, fixing D>P, the D tp

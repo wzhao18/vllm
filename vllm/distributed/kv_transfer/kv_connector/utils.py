@@ -581,16 +581,24 @@ class TransferTopology:
         """Whether the local engine's KV cache is replicated."""
         return self.is_mla or self.tp_size > self.total_num_kv_heads
 
-    def dcp_source_ranks(self, remote_tp_size: int, remote_dcp_size: int) -> list[int]:
+    def dcp_source_ranks(
+        self,
+        remote_tp_size: int,
+        remote_dcp_size: int,
+        local_dcp_rank: int | None = None,
+    ) -> list[int]:
         """Remote ranks whose DCP slice overlaps mine (MLA, ``remote_dcp_size > 1``).
 
         Shared by ``handshake_target_ranks`` (who to query metadata from) and
         ``compute_tp_mapping`` (who to actually read from) — for MLA the two
         questions have the identical answer, since DCP sharding is the only
         thing keeping a remote rank from being interchangeable with any other.
+        ``local_dcp_rank`` overrides this rank's DCP rank (to evaluate the
+        mapping of another local rank).
         """
         local_dcp_size = self.dcp_size
-        local_dcp_rank = self.dcp_rank
+        if local_dcp_rank is None:
+            local_dcp_rank = self.dcp_rank
         if local_dcp_size <= remote_dcp_size:
             # Keep every remote rank whose slice sits inside mine. When
             # local_dcp_size == 1 (replicated locally), local_dcp_rank == 0 reduces to
@@ -618,13 +626,36 @@ class TransferTopology:
         already has ``tp_size == dcp_size``.
         """
         if remote_dcp_size > 1:
-            return self.dcp_source_ranks(remote_tp_size, remote_dcp_size)
+            ranks = self.dcp_source_ranks(remote_tp_size, remote_dcp_size)
+            if self.is_mamba:
+                # Mamba/SSM state is head-sharded over TP whatever the DCP
+                # sharding of the attention KV, so with different DCP sizes its
+                # source rank(s) can differ from the attention ones.
+                ranks = sorted(set(ranks) | set(self.ssm_source_ranks(remote_tp_size)))
+            return ranks
 
         tp_ratio = self.tp_ratio(remote_tp_size)
         if tp_ratio > 0:
             return [self.tp_rank // tp_ratio]
         abs_ratio = -tp_ratio
         return [self.tp_rank * abs_ratio + i for i in range(abs_ratio)]
+
+    def ssm_source_ranks(
+        self, remote_tp_size: int, tp_rank: int | None = None
+    ) -> list[int]:
+        """Remote TP ranks holding this rank's Mamba/SSM heads.
+
+        SSM state (temporal and conv) is always sharded by heads over TP and is
+        never DCP-sharded: D_TP >= P_TP reads one remote rank, D_TP < P_TP reads
+        ``P_TP // D_TP`` consecutive ones. ``tp_rank`` overrides this rank (to
+        evaluate the mapping of another local rank).
+        """
+        if tp_rank is None:
+            tp_rank = self.tp_rank
+        if self.tp_size < remote_tp_size:
+            abs_tp = remote_tp_size // self.tp_size
+            return list(range(tp_rank * abs_tp, (tp_rank + 1) * abs_tp))
+        return [tp_rank * remote_tp_size // self.tp_size]
 
     def dcp_consumer_count(self, remote_tp_size: int, remote_dcp_size: int) -> int:
         """How many local ranks (in aggregate) read from a given remote rank.

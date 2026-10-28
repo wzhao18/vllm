@@ -48,6 +48,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     TransferHandle,
     compute_nixl_compatibility_hash,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.page_zeroer import (
+    PageZeroer,
+    unwritten_blocks,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.stats import (
     NixlKVConnectorStats,
 )
@@ -138,6 +142,10 @@ class NixlBaseConnectorWorker:
     # Layer-name routing is supported only by NixlPushConnector for HMA or
     # packed KV caches under PP.
     _supports_pp_hma = False
+
+    # Set by register_kv_caches. The class default keeps workers that never
+    # register caches (and the zeroing bookkeeping behind it) inert.
+    _page_zeroer: PageZeroer | None = None
 
     def _compute_desc_ids(
         self,
@@ -698,6 +706,7 @@ class NixlBaseConnectorWorker:
         # The transfer requires DS (dim, state_len) conv layout so that
         # conv sub-projections are contiguous in memory.
         self._conv_decomp: MambaConvSplitInfo | None = None
+        self._mamba_state_geometry: tuple[int, list[list[int]], list[str]] | None = None
         self._has_mamba = any(
             isinstance(spec, MambaSpec) for spec in self._layer_specs.values()
         )
@@ -745,6 +754,11 @@ class NixlBaseConnectorWorker:
                 vllm_config.parallel_config.tensor_parallel_size,
             )
             mamba_ssm_size = self._conv_decomp.ssm_sizes
+            self._mamba_state_geometry = (
+                vllm_config.parallel_config.tensor_parallel_size,
+                [list(shape) for shape in mamba_spec.shapes],
+                [str(dtype) for dtype in mamba_spec.dtypes],
+            )
         self._mamba_ssm_size = mamba_ssm_size
 
         # Agent.
@@ -844,6 +858,11 @@ class NixlBaseConnectorWorker:
                 "is not supported."
             )
         self.device_kv_caches: dict[str, torch.Tensor] = {}
+        # Group -> attention blocks a pull leaves unwritten (see page_zeroer),
+        # gathered over one start_load_kv.
+        self._unwritten_batch: dict[int, list[int]] = {}
+        # Requests whose zeroing was queued in the current step.
+        self._fresh_zeroed_reqs: set[str] = set()
 
         # cpu kv buffer for xfer
         # used when device memory can not be registered under nixl
@@ -1937,6 +1956,8 @@ class NixlBaseConnectorWorker:
             self._registered_descs.append(descs)
 
         self.device_kv_caches = kv_caches
+        if self._TRANSFER_MODE == "pull":
+            self._page_zeroer = self._build_page_zeroer()
         self.dst_num_blocks[self.engine_id] = self.num_blocks
         self.dst_region_num_blocks[self.engine_id] = xfer_region_num_blocks
         self.dst_region_group_ids[self.engine_id] = self.region_group_ids
@@ -1989,8 +2010,12 @@ class NixlBaseConnectorWorker:
             region_mem_types=self.region_mem_types,
             dcp_size=self.dcp_size,
             pcp_size=self.pcp_size,
+            cp_kv_cache_interleave_size=int(
+                self.vllm_config.parallel_config.cp_kv_cache_interleave_size
+            ),
             region_members=self.region_members,
             packed_member_layouts=self._packed_member_layouts,
+            mamba_state_geometry=self._mamba_state_geometry,
         )
         # Wrap metadata in payload with hash for defensive decoding
         assert self.compat_hash is not None
@@ -2767,6 +2792,107 @@ class NixlBaseConnectorWorker:
 
         return remote_agent_name
 
+    def _validate_hybrid_hetero_dcp(
+        self,
+        nixl_agent_meta: NixlAgentMetadata,
+        remote_tp_size: int,
+        remote_dcp_size: int,
+    ) -> None:
+        """Hybrid MLA+Mamba peers with different DCP sizes (e.g. a TP8/DCP8
+        prefiller feeding a TP16/DCP16 decoder).
+
+        MLA KV is matched block by block by global DCP position
+        (``_apply_dcp_prefix_caching``), which is exact only when each per-rank
+        block holds exactly one interleave chunk: both sides fully DCP-sharded
+        (DCP == TP), the same per-rank logical block size, and an interleave
+        equal to it. Mamba state is not DCP-sharded and is read from the rank
+        owning this rank's heads (``TPMapping`` SSM sources).
+        """
+        local_block = self.block_size * self._physical_blocks_per_logical_kv_block
+        remote_block = (
+            nixl_agent_meta.block_size
+            * nixl_agent_meta.physical_blocks_per_logical_kv_block
+        )
+        local_interleave = self.vllm_config.parallel_config.cp_kv_cache_interleave_size
+        remote_interleave = nixl_agent_meta.cp_kv_cache_interleave_size
+        problems = []
+        if not self.use_mla:
+            problems.append("the attention layers must be MLA")
+        if self.world_size < remote_tp_size:
+            problems.append(
+                f"local TP {self.world_size} must be >= remote TP {remote_tp_size}"
+            )
+        if self.dcp_size != self.world_size or remote_dcp_size != remote_tp_size:
+            problems.append(
+                "DCP must span TP on both sides "
+                f"(local TP/DCP {self.world_size}/{self.dcp_size}, "
+                f"remote {remote_tp_size}/{remote_dcp_size})"
+            )
+        if self.pcp_size > 1 or nixl_agent_meta.pcp_size > 1:
+            problems.append("PCP is not supported")
+        if local_block != remote_block:
+            problems.append(
+                f"per-rank block sizes differ (local {local_block}, remote "
+                f"{remote_block}); set the same --block-size on both"
+            )
+        if local_interleave != local_block or remote_interleave != remote_block:
+            problems.append(
+                "cp_kv_cache_interleave_size must equal the per-rank block size "
+                f"(local {local_interleave} vs {local_block}, remote "
+                f"{remote_interleave} vs {remote_block})"
+            )
+        if problems:
+            raise RuntimeError(
+                "Hybrid MLA+Mamba NIXL transfers with different DCP sizes "
+                f"(local={self.dcp_size}, remote={remote_dcp_size}): "
+                + "; ".join(problems)
+                + "."
+            )
+        logger.info_once(
+            "Hybrid MLA+Mamba NIXL transfer with heterogeneous DCP: local "
+            "TP/DCP %d/%d, remote %d/%d, per-rank block %d, interleave %d.",
+            self.world_size,
+            self.dcp_size,
+            remote_tp_size,
+            remote_dcp_size,
+            local_block,
+            local_interleave,
+        )
+
+    def _validate_mamba_state_geometry(self, nixl_agent_meta: NixlAgentMetadata):
+        """Fail the handshake when the peers' Mamba state pages differ.
+
+        The state is sharded over TP on dim 0, so dim 0 is compared as a global
+        size and every other dim must match. Conv rows count the speculative
+        columns, so e.g. a DL3 prefiller paired with a DL7 decoder is rejected
+        here instead of transferring misaligned conv state.
+        """
+        local = self._mamba_state_geometry
+        remote = nixl_agent_meta.mamba_state_geometry
+        if local is None:
+            return
+        if remote is None:
+            logger.warning(
+                "Remote engine %s does not advertise its Mamba state geometry; "
+                "skipping the check.",
+                nixl_agent_meta.engine_id,
+            )
+            return
+        local_tp, local_shapes, local_dtypes = local
+        remote_tp, remote_shapes, remote_dtypes = remote
+        local_global = [[s[0] * local_tp, *s[1:]] for s in local_shapes]
+        remote_global = [[s[0] * remote_tp, *s[1:]] for s in remote_shapes]
+        if local_global != remote_global or list(local_dtypes) != list(remote_dtypes):
+            raise RuntimeError(
+                "NIXL handshake with engine "
+                f"{nixl_agent_meta.engine_id} rejected: Mamba state geometry "
+                f"differs (global shapes local {local_global} vs remote "
+                f"{remote_global}; dtypes local {list(local_dtypes)} vs remote "
+                f"{list(remote_dtypes)}). Conv rows include the speculative "
+                "columns: check that both sides use the same "
+                "num_speculative_tokens and mamba_ssm_cache_dtype."
+            )
+
     def _validate_remote_agent_handshake(
         self,
         nixl_agent_meta: NixlAgentMetadata,
@@ -2791,10 +2917,11 @@ class NixlBaseConnectorWorker:
             f"remote={remote_dcp_size} (engine {remote_engine_id})."
         )
         if self._has_mamba and self.dcp_size != remote_dcp_size:
-            raise RuntimeError(
-                "Hybrid MLA+Mamba NIXL transfers require matching DCP sizes, "
-                f"got local={self.dcp_size}, remote={remote_dcp_size}."
+            self._validate_hybrid_hetero_dcp(
+                nixl_agent_meta, remote_tp_size, remote_dcp_size
             )
+        if self._has_mamba:
+            self._validate_mamba_state_geometry(nixl_agent_meta)
 
         tp_ratio = self.transfer_topo.tp_ratio(remote_tp_size)
         block_size_ratio = self.transfer_topo.block_size_ratio(
@@ -3255,6 +3382,86 @@ class NixlBaseConnectorWorker:
         )
         return skip
 
+    def _build_page_zeroer(self) -> PageZeroer | None:
+        """Segment table over the device views of every attention group."""
+        caches_by_group: dict[int, list[torch.Tensor]] = {}
+        flat_page_bytes: dict[int, int | None] = {}
+        for g, group in enumerate(self.kv_cache_config.transfer_groups):
+            spec = group.kv_cache_spec
+            if (
+                not _is_attention_spec(get_representative_spec_type(spec))
+                or group.host_resident
+            ):
+                continue
+            caches = [
+                self.device_kv_caches[name]
+                for name in group.layer_names
+                if name in self.device_kv_caches
+                and self.device_kv_caches[name].device.type != "cpu"
+            ]
+            if not caches:
+                continue
+            caches_by_group[g] = caches
+            # Only a flat 1-D view needs it, as registration does.
+            flat_page_bytes[g] = (
+                spec.page_size_bytes // self._physical_blocks_per_logical_kv_block
+            )
+        if not caches_by_group:
+            return None
+        return PageZeroer(caches_by_group, flat_page_bytes)
+
+    def _queue_unwritten_zeroing(
+        self,
+        req_id: str,
+        meta: ReqMeta,
+        written: list[set[int]],
+        block_size_ratio: int,
+    ) -> None:
+        """Queue the attention blocks the posted reads of a pull leave unwritten.
+
+        The scheduler skipped their alloc-time zeroing, since the pull was to
+        fill them. The reads never touch them, so they can be zeroed now, while
+        the transfer is in flight. With a host buffer they are deferred: the
+        h2d sync at completion would copy the stale host pages back.
+        """
+        if self._page_zeroer is None:
+            return
+        local = meta.local_physical_block_ids
+        ids = {
+            g: blocks
+            for g in self._page_zeroer.groups
+            if g < len(local)
+            and (blocks := unwritten_blocks(local[g], written[g], block_size_ratio))
+        }
+        if not ids:
+            return
+        if self.use_host_buffer:
+            meta.unwritten_blocks = ids
+            return
+        for g, blocks in ids.items():
+            self._unwritten_batch.setdefault(g, []).extend(blocks)
+        self._fresh_zeroed_reqs.add(req_id)
+
+    def _flush_unwritten_zeroing(self) -> None:
+        """Zero the queued blocks in one launch per group, off the main stream."""
+        if self._page_zeroer is None or not self._unwritten_batch:
+            return
+        batch, self._unwritten_batch = self._unwritten_batch, {}
+        logger.info_once(
+            "NIXL pull: zeroing local attention blocks the pull leaves unwritten "
+            "(first batch: %d kernel blocks)",
+            sum(len(ids) for ids in batch.values()),
+        )
+        self._page_zeroer.zero_async(batch)
+
+    def _zero_attention_blocks(self, block_ids: BlockIds) -> None:
+        """Zero every attention block of a request (failed pull)."""
+        if self._page_zeroer is None or not block_ids:
+            return
+        self._page_zeroer.zero(
+            {g: block_ids[g] for g in self._page_zeroer.groups if g < len(block_ids)}
+        )
+
     def _zero_region_blocks(self, block_ids: BlockIds) -> None:
         """Clear clipped physical pages in their owning region only."""
         if not any(block_ids):
@@ -3336,6 +3543,10 @@ class NixlBaseConnectorWorker:
             # Skip KV sync and post-processing for failed requests
             if req_id in failed_recv_reqs:
                 self._pending_recv_notifs.pop(req_id, None)
+                # Every page may be partly written or not written at all. The
+                # scheduler recomputes them; zero them so no stale byte
+                # survives into a block it keeps or reallocates for a load.
+                self._zero_attention_blocks(meta.local_physical_block_ids)
                 # TODO (NickLucche) handle failed transfer for HMA.
                 if not self._is_hma_required:
                     self._invalid_block_ids.put(set(meta.local_block_ids[0]))
@@ -3358,21 +3569,19 @@ class NixlBaseConnectorWorker:
                 self._zero_region_blocks(meta.region_blocks_to_zero)
                 continue
 
-            # Post processing for heteroblocksize/layout, and for blocks the
-            # transfer clipped. The latter happens either at remote-block
-            # granularity (block_size_ratio > 1) or at kernel-block
-            # granularity, when equal kernel pages meet differing logical
-            # block sizes and _apply_prefix_caching front-trims to the
-            # minimum count (hybrid heterogeneous TP).
+            if meta.unwritten_blocks and self._page_zeroer is not None:
+                # Host buffer: the sync above restored the stale pages.
+                self._page_zeroer.zero(meta.unwritten_blocks)
+
+            # Post processing for heteroblocksize/layout. Whole blocks the
+            # transfer left unwritten were zeroed when its reads were posted;
+            # this also zeroes the token tail of a block the remote-sized
+            # sub-blocks (block_size_ratio > 1) cover only in part.
             remote_info = self.transfer_topo.get_engine_info(meta.remote.engine_id)
             block_size_ratio = self.transfer_topo.block_size_ratio(
                 remote_info.remote_block_size
             )
-            hetero_ppl = (
-                remote_info.remote_physical_blocks_per_logical
-                != self._physical_blocks_per_logical_kv_block
-            )
-            if block_size_ratio > 1 or self.enable_permute_local_kv or hetero_ppl:
+            if block_size_ratio > 1 or self.enable_permute_local_kv:
                 for g, local_group in enumerate(meta.local_physical_block_ids):
                     if not local_group or _is_ssm_spec(self._group_spec_types[g]):
                         continue
@@ -3436,6 +3645,16 @@ class NixlBaseConnectorWorker:
             self.post_process_device_kv_on_receive_heterogeneous_attn(block_ids)
 
         self._sync_device_after_direct_recv(direct_device_recving)
+
+        if self._page_zeroer is not None:
+            # Order the next forward after the zeroing queued in earlier steps;
+            # it ran beside this step's forward, so the wait is free. Zeroing
+            # queued this step is waited on only for a pull that also finished
+            # this step, the one case where the next forward may read it.
+            self._page_zeroer.step_fence(
+                include_fresh=not self._fresh_zeroed_reqs.isdisjoint(done_recving)
+            )
+            self._fresh_zeroed_reqs.clear()
 
         # Handle timeout to avoid stranding blocks on remote.
         self._reap_expired_send_leases(done_sending)

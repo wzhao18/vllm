@@ -445,6 +445,7 @@ def _register_overlaid_mla_worker(
     worker.src_xfer_handles_by_block_size = {}
     worker.kv_caches_base_addr = defaultdict(dict)
     worker._mamba_ssm_size = (0, 0)
+    worker._mamba_state_geometry = None
     worker.kv_cache_layout = "LBNHC"
     worker.host_buffer_kv_cache_layout = "LBNHC"
     worker._physical_blocks_per_logical_kv_block = 1

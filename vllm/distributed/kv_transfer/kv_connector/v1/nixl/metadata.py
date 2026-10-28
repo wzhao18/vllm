@@ -75,12 +75,20 @@ class NixlAgentMetadata:
     region_mem_types: list[str] | None = None
     dcp_size: int = 1
     pcp_size: int = 1
+    # DCP token interleave of the attention KV (cp_kv_cache_interleave_size).
+    # Peers with different DCP sizes match blocks by global position, which
+    # needs block-sized interleave on both sides.
+    cp_kv_cache_interleave_size: int = 1
     # Page length of the PLE short-conv state (None when the model has none).
     ple_block_len: int | None = None
     # Layer names sharing each advertised region, in region order.
     region_members: list[list[str]] = field(default_factory=list)
     # Packed member -> (byte offset in its region's block, bytes per page).
     packed_member_layouts: dict[str, tuple[int, int]] = field(default_factory=dict)
+    # Per-rank Mamba state page geometry: (TP size, state shapes, state dtypes).
+    # Dim 0 of each shape is the TP-sharded one; peers must agree on the rest
+    # (e.g. conv rows = conv width - 1 + num_speculative_tokens). None: no Mamba.
+    mamba_state_geometry: tuple[int, list[list[int]], list[str]] | None = None
 
 
 @dataclass
@@ -266,6 +274,11 @@ class ReqMeta:
     # Worker-only, per-region physical pages to zero after a successful pull.
     # None selects group-based completion; empty lists mean no zeroing.
     region_blocks_to_zero: BlockIds | None = None
+    # Worker-only, group -> local attention kernel blocks the pull leaves
+    # unwritten. Set only with a host buffer, whose h2d sync would restore the
+    # stale bytes: zeroed on the device after that sync. Device pulls zero them
+    # when the reads are posted.
+    unwritten_blocks: dict[int, list[int]] | None = None
 
 
 class NixlConnectorMetadata(KVConnectorMetadata):
