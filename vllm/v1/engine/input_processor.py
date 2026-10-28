@@ -4,7 +4,7 @@
 import time
 from collections.abc import Callable, Mapping
 from functools import partial
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
@@ -658,8 +658,9 @@ class InputProcessor:
                             f"by setting --limit-mm-per-prompt at startup."
                         )
 
-        # Shared by generate, embedding and pooling requests.
-        if prompt_ids:
+        # Shared by generate, embedding and pooling requests. Ids the server's own
+        # tokenizer produced (marked by the renderer) are in vocabulary already.
+        if prompt_ids and not cast(dict, prompt_input).get("server_tokenized"):
             self.renderer.validate_token_ids(prompt_ids)
 
     def _validate_model_inputs(

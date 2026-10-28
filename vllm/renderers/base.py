@@ -10,7 +10,7 @@ from contextlib import ExitStack
 from dataclasses import replace
 from functools import cached_property
 from threading import Lock
-from typing import TYPE_CHECKING, Any, Generic, overload
+from typing import TYPE_CHECKING, Any, Generic, cast, overload
 
 from typing_extensions import TypeVar
 
@@ -1012,6 +1012,8 @@ class BaseRenderer(ABC, Generic[_T]):
             engine_input["prompt"] = prompt_text
         if cache_salt := prompt.get("cache_salt"):
             engine_input["cache_salt"] = cache_salt
+        if cast(dict, prompt).get("server_tokenized"):
+            cast(dict, engine_input)["server_tokenized"] = True
         # Narrow the union — `prompt_token_offsets` is only on TokensInput.
         if engine_input["type"] == "token" and (
             (offsets := prompt.get("prompt_token_offsets")) is not None
@@ -1079,6 +1081,8 @@ class BaseRenderer(ABC, Generic[_T]):
             engine_input["prompt"] = prompt_text
         if cache_salt := prompt.get("cache_salt"):
             engine_input["cache_salt"] = cache_salt
+        if cast(dict, prompt).get("server_tokenized"):
+            cast(dict, engine_input)["server_tokenized"] = True
         # Narrow the union — `prompt_token_offsets` is only on TokensInput.
         if engine_input["type"] == "token" and (
             (offsets := prompt.get("prompt_token_offsets")) is not None

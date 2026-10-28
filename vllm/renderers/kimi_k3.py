@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from typing import Any, cast
 
 from vllm.config import VllmConfig
@@ -17,6 +18,7 @@ from vllm.utils.async_utils import make_async
 from .base import BaseRenderer
 from .inputs import DictPrompt
 from .inputs.preprocess import parse_dec_only_prompt
+from .kimi_k3_tokcache import maybe_install as _maybe_install_tokcache
 from .params import ChatParams
 
 # Keep the original image mode (including the alpha channel) for K3 instead of
@@ -25,6 +27,13 @@ from .params import ChatParams
 _K3_MEDIA_IO_DEFAULTS: dict[str, dict[str, Any]] = {"image": {"image_mode": None}}
 _K3_THINKING_EFFORTS = ("low", "high", "max")
 _K31_THINKING_EFFORTS = ("low", "medium", "high", "max")
+# VLLM_K3_SKIP_ID_VALIDATION=1: mark prompts whose ids this renderer produced with
+# the server's tokenizer, so the input processor skips its O(prompt) out-of-vocab
+# scan for them (user-supplied token ids are still checked).
+_MARK_SERVER_TOKENIZED = os.environ.get("VLLM_K3_SKIP_ID_VALIDATION", "0") not in (
+    "",
+    "0",
+)
 
 
 def _merge_k3_media_io_kwargs(
@@ -159,6 +168,9 @@ class KimiK3Renderer(BaseRenderer[HfTokenizer]):
             if self.model_config.hf_config.model_type == "kimi_k31"
             else _K3_THINKING_EFFORTS
         )
+        # Exact tokenizer speedups (VLLM_K3_FAST_SPLIT, VLLM_K3_TOKCACHE_BYTES).
+        if tokenizer is not None:
+            _maybe_install_tokcache(tokenizer)
         self._apply_chat_template_async = make_async(
             self._apply_chat_template, executor=self._executor
         )
@@ -197,6 +209,8 @@ class KimiK3Renderer(BaseRenderer[HfTokenizer]):
         prompt = parse_dec_only_prompt(
             self._apply_chat_template(rendered_conversation, params)
         )
+        if _MARK_SERVER_TOKENIZED:
+            cast(dict, prompt)["server_tokenized"] = True
         if mm_data is not None:
             prompt["multi_modal_data"] = mm_data
         if mm_uuids is not None:
@@ -220,6 +234,8 @@ class KimiK3Renderer(BaseRenderer[HfTokenizer]):
         rendered_conversation = _normalize_k3_tool_messages(conversation)
         token_ids = await self._apply_chat_template_async(rendered_conversation, params)
         prompt = parse_dec_only_prompt(token_ids)
+        if _MARK_SERVER_TOKENIZED:
+            cast(dict, prompt)["server_tokenized"] = True
         if mm_data is not None:
             prompt["multi_modal_data"] = mm_data
         if mm_uuids is not None:
