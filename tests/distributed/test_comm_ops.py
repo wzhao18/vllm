@@ -24,6 +24,7 @@ from vllm.distributed import (
 from vllm.distributed.device_communicators import flashinfer_all_reduce
 from vllm.distributed.device_communicators.cuda_communicator import CudaCommunicator
 from vllm.distributed.parallel_state import GroupCoordinator, TensorMetadata
+from vllm.platforms.interface import DeviceCapability
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
 
 from ..utils import (
@@ -432,6 +433,41 @@ def test_flashinfer_standalone_size_tuning(
         )
         == expected
     )
+
+
+@pytest.mark.parametrize(
+    ("capability", "expected"),
+    [
+        (100, 64 * flashinfer_all_reduce.MiB),
+        (103, 8 * flashinfer_all_reduce.MiB - 1),
+        (107, 64 * flashinfer_all_reduce.MiB),
+    ],
+)
+def test_flashinfer_all_reduce_enabled_for_mnnvl_world_size_16(
+    monkeypatch: pytest.MonkeyPatch, capability: int, expected: int
+) -> None:
+    """TP16 over four MNNVL-connected nodes must not fall back to NCCL."""
+    platform = flashinfer_all_reduce.current_platform
+    monkeypatch.setattr(platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        platform,
+        "get_device_capability",
+        lambda device_id=0: DeviceCapability(*divmod(capability, 10)),
+    )
+    monkeypatch.setattr(flashinfer_all_reduce, "fi_ar_available", True)
+    monkeypatch.setattr(flashinfer_all_reduce.dist, "get_world_size", lambda _: 16)
+    monkeypatch.setattr(flashinfer_all_reduce.dist, "get_rank", lambda _: 0)
+    monkeypatch.setattr(flashinfer_all_reduce, "_node_count", lambda _: 4)
+    monkeypatch.setattr(
+        flashinfer_all_reduce,
+        "_resolve_fi_ar_backend",
+        Mock(return_value=("mnnvl", False)),
+    )
+
+    comm = flashinfer_all_reduce.FlashInferAllReduce(Mock(), "cuda:0")
+
+    assert not comm.disabled
+    assert comm.max_workspace_size == expected
 
 
 @pytest.mark.parametrize(
