@@ -3606,8 +3606,8 @@ class TestPeerReplacement:
             {"old-req": [10, 11], "healthy-req": [12]}
         )
         self.nixl.invalid_remote_agents.add("old")
-        self.transport.check_xfer_state.side_effect = (
-            lambda h: "ERR" if h == 10 else "PROC"
+        self.transport.check_xfer_state.side_effect = lambda h: (
+            "ERR" if h == 10 else "PROC"
         )
         old_handle = self.worker.dst_xfer_side_handles["old"][0]
 
@@ -3617,8 +3617,8 @@ class TestPeerReplacement:
         self.worker.start_load_kv(self._request("old", req_id="blocked"))
         self.transport.make_prepped_xfer.assert_not_called()
 
-        self.transport.check_xfer_state.side_effect = (
-            lambda h: "DONE" if h == 11 else "PROC"
+        self.transport.check_xfer_state.side_effect = lambda h: (
+            "DONE" if h == 11 else "PROC"
         )
         result = self.worker.get_transfer_results()
         assert (
@@ -3695,8 +3695,8 @@ class TestPeerReplacement:
     def test_invalid_peer_empty_recv_is_reported_only_when_awaited(self, awaiting_kvs):
         self._fail_old_peer()
         self.worker._recving_transfers["old-req"].append(11)
-        self.transport.check_xfer_state.side_effect = (
-            lambda h: "PROC" if h == 11 else "ERR"
+        self.transport.check_xfer_state.side_effect = lambda h: (
+            "PROC" if h == 11 else "ERR"
         )
         self.worker.get_transfer_results()
         self.transport.make_prepped_xfer.reset_mock()
@@ -3729,6 +3729,349 @@ class TestPeerReplacement:
         self.transport.make_prepped_xfer.assert_not_called()
         self.transport.remove_remote_agent.assert_called_once_with("old")
         assert "old" in self.worker._handshake_futures
+
+    @pytest.mark.parametrize("where", ["status", "post"])
+    def test_remote_disconnect_invalidates_peer_with_intact_metadata(self, where):
+        # NIXL_ERR_REMOTE_DISCONNECT leaves the peer's metadata loaded, so the
+        # local probe passes, but every later read on its dead endpoints fails:
+        # the peer must be released and re-handshaken anyway.
+        if where == "post":
+            self.transport.transfer.side_effect = _remote_disconnect()
+        self.worker.start_load_kv(self._request("old"))
+        if where == "status":
+            self.transport.check_xfer_state.side_effect = _remote_disconnect()
+
+        result = self.worker.get_transfer_results()
+        assert result.finished_recving == result.failed_recving == {"old-req"}
+        self.transport.check_remote_metadata.assert_not_called()
+        self.transport.remove_remote_agent.assert_called_once_with("old")
+        assert "old" not in self.worker._remote_agents
+
+        # The next request to the peer re-handshakes and reads with fresh state.
+        self.transport.transfer.side_effect = None
+        self.transport.check_xfer_state.side_effect = None
+        self.transport.make_prepped_xfer.reset_mock()
+        self.worker.start_load_kv(self._request("old", req_id="next"))
+        self.transport.make_prepped_xfer.assert_not_called()
+        assert "old" in self.worker._handshake_futures
+        self._connect("old")
+        self.transport.check_xfer_state.return_value = "DONE"
+        self.worker.start_load_kv(NixlConnectorMetadata())
+        self.transport.make_prepped_xfer.assert_called_once()
+        result = self.worker.get_transfer_results()
+        assert result.finished_recving == {"next"} and not result.failed_recving
+        assert not self.worker._disconnected_remote_engines
+
+    def test_remote_disconnect_drains_inflight_reads_before_release(self):
+        self.worker._recving_metadata.update(self._request("old").reqs_to_recv)
+        self.worker._recving_transfers["old-req"] = [10, 11]
+        disconnect = _remote_disconnect()
+
+        def state(handle):
+            if handle == 10:
+                raise disconnect
+            return "PROC"
+
+        self.transport.check_xfer_state.side_effect = state
+        old_handle = self.worker.dst_xfer_side_handles["old"][0]
+
+        # The peer is invalid (new reads are rejected) but its descriptors stay
+        # until handle 11 completes.
+        result = self.worker.get_transfer_results()
+        assert not result.finished_recving and not result.failed_recving
+        assert "old" in self.worker._invalid_remote_engines
+        self.transport.release_dlist_handle.assert_not_called()
+        self.transport.remove_remote_agent.assert_not_called()
+        self.worker.start_load_kv(self._request("old", req_id="blocked"))
+        self.transport.make_prepped_xfer.assert_not_called()
+
+        self.transport.check_xfer_state.side_effect = lambda h: (
+            "DONE" if h == 11 else "PROC"
+        )
+        result = self.worker.get_transfer_results()
+        assert (
+            result.finished_recving == result.failed_recving == {"old-req", "blocked"}
+        )
+        self.transport.remove_remote_agent.assert_called_once_with("old")
+        calls = self.transport.mock_calls
+        assert calls.index(call.release_xfer_handle(11)) < calls.index(
+            call.release_dlist_handle(old_handle)
+        )
+        self.transport.check_remote_metadata.assert_not_called()
+
+    def test_other_transfer_errors_still_probe_metadata(self):
+        # A failure that is not a disconnect keeps a peer whose metadata is intact.
+        self.worker.start_load_kv(self._request("old"))
+        self.transport.check_xfer_state.side_effect = RuntimeError("NIXL_ERR_BACKEND")
+        result = self.worker.get_transfer_results()
+        assert result.finished_recving == result.failed_recving == {"old-req"}
+        self.transport.check_remote_metadata.assert_called()
+        self.transport.remove_remote_agent.assert_not_called()
+        assert "old" in self.worker._remote_agents
+        assert not self.worker._invalid_remote_engines
+
+
+class nixlRemoteDisconnectError(Exception):  # noqa: N801 (nixl's binding name)
+    """Stand-in for nixl's ``_bindings.nixlRemoteDisconnectError``."""
+
+
+def _remote_disconnect() -> Exception:
+    return nixlRemoteDisconnectError("NIXL_ERR_REMOTE_DISCONNECT")
+
+
+class TestPullRetryAndChunking:
+    """Pull mode: retry-once after a remote disconnect, and the per-transfer
+    block cap. Both defer the P-side notification until every read of the
+    request has finished, so P never frees blocks a read still needs."""
+
+    @pytest.fixture
+    def extra(self, request):
+        return getattr(request, "param", {})
+
+    @pytest.fixture(autouse=True)
+    def setup(self, monkeypatch, extra):
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl import base_worker as bw
+        from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
+
+        extra = {"engine_ttl": 0, **extra}
+        config = create_vllm_config(
+            kv_connector_extra_config=extra, block_size=maybe_update_block_size(16)
+        )
+        config.kv_transfer_config.kv_buffer_device = "cpu"
+        platform = SimpleNamespace(
+            device_type="cpu",
+            discover_numa_topology=lambda: [],
+            get_nixl_memory_type=lambda: "DRAM",
+            is_rocm=lambda: False,
+        )
+        with (
+            patch.object(bw, "NixlWrapper", FakeNixlWrapper),
+            patch.object(bw, "current_platform", platform),
+            patch.object(bw, "get_tensor_model_parallel_rank", return_value=0),
+            patch.object(bw, "get_tensor_model_parallel_world_size", return_value=1),
+            patch.object(
+                bw, "get_current_attn_backends", return_value=[FlashAttentionBackend]
+            ),
+        ):
+            self.worker = FakeNixlConnectorWorker(config, "local", hand_shake_latency=0)
+            self.nixl = self.worker.nixl_wrapper
+            self.transport = MagicMock(wraps=self.nixl)
+            self.worker.nixl_wrapper = self.transport
+            monkeypatch.setattr(
+                self.worker._handshake_initiation_executor,
+                "submit",
+                lambda *args: Future(),
+            )
+            self._connect("old")
+            yield
+            self.worker.shutdown()
+
+    def _connect(self, engine_id="new", host="localhost", port=1234):
+        future = self.worker._ensure_handshake(engine_id, host, port, 1)
+        self.worker.REMOTE_ENGINE_ID = engine_id
+        self.nixl.REMOTE_AGENT_NAME = engine_id
+        future.set_result(self.worker._nixl_handshake(host, port, 1, engine_id))
+
+    def _request(self, engine_id="old", blocks=(1,), req_id=None, remote=None):
+        metadata = NixlConnectorMetadata()
+        metadata.reqs_to_recv[req_id or f"{engine_id}-req"] = ReqMeta(
+            local_block_ids=(list(blocks),),
+            local_physical_block_ids=(list(blocks),),
+            tp_size=1,
+            remote=RemoteMeta(
+                (list(remote or [b + 1 for b in blocks]),),
+                "localhost",
+                1234,
+                engine_id,
+                f"{engine_id}-prefill",
+            ),
+            awaiting_kvs=True,
+        )
+        return metadata
+
+    def _notif_calls(self):
+        """Notification payloads sent to P (positional or keyword)."""
+        return [
+            c.kwargs["notif_msg"] if "notif_msg" in c.kwargs else c.args[1]
+            for c in self.transport.mock_calls
+            if c[0] == "send_notif"
+        ]
+
+    def _xfer_notifs(self):
+        return [
+            c.kwargs.get("notif_msg")
+            for c in self.transport.make_prepped_xfer.call_args_list
+        ]
+
+    @pytest.mark.parametrize(
+        "extra", [{"pull_retry_remote_disconnect": True}], indirect=True
+    )
+    @pytest.mark.parametrize("where", ["status", "post"])
+    def test_disconnect_is_retried_once_and_succeeds(self, where):
+        if where == "post":
+            self.transport.transfer.side_effect = _remote_disconnect()
+        self.worker.start_load_kv(self._request())
+        if where == "status":
+            self.transport.check_xfer_state.side_effect = _remote_disconnect()
+
+        # Not reported: parked, and the dead peer is released.
+        result = self.worker.get_transfer_results()
+        assert not result.finished_recving and not result.failed_recving
+        assert "old-req" in self.worker._pull_retry_pending
+        self.transport.remove_remote_agent.assert_called_once_with("old")
+        assert not self._notif_calls()
+        # The notification is deferred: no read carries it.
+        assert self._xfer_notifs() == [None]
+
+        # The retry re-handshakes, then re-posts the read.
+        self.transport.transfer.side_effect = None
+        self.transport.check_xfer_state.side_effect = None
+        self.transport.check_xfer_state.return_value = "DONE"
+        self.transport.make_prepped_xfer.reset_mock()
+        self.worker.start_load_kv(NixlConnectorMetadata())
+        assert "old" in self.worker._handshake_futures
+        self.transport.make_prepped_xfer.assert_not_called()
+        self._connect("old")
+        self.worker.start_load_kv(NixlConnectorMetadata())
+        self.transport.make_prepped_xfer.assert_called_once()
+        result = self.worker.get_transfer_results()
+        assert result.finished_recving == {"old-req"} and not result.failed_recving
+        # Exactly one notification to P, after the successful retry.
+        notifs = self._notif_calls()
+        assert notifs == [b"old-prefill:1"]
+        assert not self.worker._pull_retry_pending
+        assert not self.worker._pull_retry_attempted
+        assert not self.worker._pending_recv_notifs
+
+    @pytest.mark.parametrize(
+        "extra", [{"pull_retry_remote_disconnect": True}], indirect=True
+    )
+    def test_second_disconnect_fails_without_notifying(self):
+        self.transport.transfer.side_effect = _remote_disconnect()
+        self.worker.start_load_kv(self._request())
+        self.worker.get_transfer_results()
+        self.worker.start_load_kv(NixlConnectorMetadata())
+        self._connect("old")
+        self.worker.start_load_kv(NixlConnectorMetadata())
+        assert self.transport.make_prepped_xfer.call_count == 2
+        result = self.worker.get_transfer_results()
+        assert result.finished_recving == result.failed_recving == {"old-req"}
+        # P frees its blocks on lease expiry, as for any failed pull.
+        assert not self._notif_calls()
+        assert not self.worker._pending_recv_notifs
+        assert not self.worker._pull_retry_pending
+        assert not self.worker._pull_retry_attempted
+
+    @pytest.mark.parametrize(
+        "extra",
+        [{"pull_retry_remote_disconnect": True, "pull_retry_window_s": 0}],
+        indirect=True,
+    )
+    def test_retry_gives_up_while_peer_cannot_be_released(self):
+        # Another read keeps the invalid peer's descriptors alive.
+        self.worker._recving_metadata.update(self._request(req_id="slow").reqs_to_recv)
+        self.worker._recving_transfers["slow"] = [11]
+        self.transport.check_xfer_state.side_effect = lambda h: (
+            "PROC" if h == 11 else "DONE"
+        )
+        self.transport.transfer.side_effect = _remote_disconnect()
+        self.worker.start_load_kv(self._request())
+        result = self.worker.get_transfer_results()
+        assert not result.finished_recving and not result.failed_recving
+        assert "old" in self.worker._invalid_remote_engines
+        self.worker.start_load_kv(NixlConnectorMetadata())
+        result = self.worker.get_transfer_results()
+        assert result.finished_recving == result.failed_recving == {"old-req"}
+        self.transport.remove_remote_agent.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "extra", [{"pull_retry_remote_disconnect": True}], indirect=True
+    )
+    def test_request_arriving_at_invalid_peer_is_parked_then_read(self):
+        self.worker._recving_metadata.update(self._request(req_id="slow").reqs_to_recv)
+        self.worker._recving_transfers["slow"] = [11]
+        self.transport.check_xfer_state.side_effect = lambda h: (
+            "PROC" if h == 11 else "DONE"
+        )
+        self.transport.transfer.side_effect = _remote_disconnect()
+        self.worker.start_load_kv(self._request())
+        self.worker.get_transfer_results()
+        assert "old" in self.worker._invalid_remote_engines
+        self.transport.transfer.side_effect = None
+        self.transport.make_prepped_xfer.reset_mock()
+
+        # Fails fast today; with the retry it waits for the re-handshake.
+        self.worker.start_load_kv(self._request(req_id="late"))
+        self.transport.make_prepped_xfer.assert_not_called()
+        assert {"old-req", "late"} <= set(self.worker._pull_retry_pending)
+
+        self.transport.check_xfer_state.side_effect = None
+        self.transport.check_xfer_state.return_value = "DONE"
+        result = self.worker.get_transfer_results()  # "slow" drains; peer released
+        assert result.finished_recving == {"slow"}
+        self.transport.remove_remote_agent.assert_called_once_with("old")
+        self.worker.start_load_kv(NixlConnectorMetadata())
+        self._connect("old")
+        self.worker.start_load_kv(NixlConnectorMetadata())
+        assert self.transport.make_prepped_xfer.call_count == 2
+        result = self.worker.get_transfer_results()
+        assert result.finished_recving == {"old-req", "late"}
+        assert not result.failed_recving
+
+    def test_retry_disabled_by_default(self):
+        self.transport.transfer.side_effect = _remote_disconnect()
+        self.worker.start_load_kv(self._request())
+        result = self.worker.get_transfer_results()
+        assert result.finished_recving == result.failed_recving == {"old-req"}
+        assert not self.worker._pull_retry_pending
+        # Unchanged single read: the notification rides on the transfer.
+        assert self._xfer_notifs() == [b"old-prefill:1"]
+
+    @pytest.mark.parametrize("extra", [{"pull_max_blocks_per_xfer": 2}], indirect=True)
+    def test_large_read_is_split_and_notifies_once(self):
+        self.transport.check_xfer_state.return_value = "DONE"
+        self.worker.start_load_kv(self._request(blocks=(1, 2, 3, 4, 5)))
+        calls = self.transport.make_prepped_xfer.call_args_list
+        assert len(calls) == 3
+        assert [len(c.args[2]) for c in calls] == [2, 2, 1]
+        assert self._xfer_notifs() == [None, None, None]
+        # The chunks cover every descriptor exactly once, in pairs.
+        local = np.concatenate([np.asarray(c.args[2]) for c in calls])
+        remote = np.concatenate([np.asarray(c.args[4]) for c in calls])
+        assert len(local) == len(remote) == 5 and len(set(local.tolist())) == 5
+        assert not self._notif_calls()
+        result = self.worker.get_transfer_results()
+        assert result.finished_recving == {"old-req"} and not result.failed_recving
+        notifs = self._notif_calls()
+        assert notifs == [b"old-prefill:1"]
+
+    @pytest.mark.parametrize("extra", [{"pull_max_blocks_per_xfer": 2}], indirect=True)
+    def test_small_read_keeps_a_single_notifying_transfer(self):
+        self.worker.start_load_kv(self._request(blocks=(1, 2)))
+        assert self._xfer_notifs() == [b"old-prefill:1"]
+
+    @pytest.mark.parametrize("extra", [{"pull_max_blocks_per_xfer": 2}], indirect=True)
+    def test_failed_chunk_fails_request_after_others_drain(self):
+        posted = [0]
+
+        def transfer(handle):
+            if posted[0] == 1:
+                raise RuntimeError("NIXL_ERR_BACKEND")
+            posted[0] += 1
+            return "PROC"
+
+        self.transport.transfer.side_effect = transfer
+        self.transport.check_xfer_state.return_value = "PROC"
+        self.worker.start_load_kv(self._request(blocks=(1, 2, 3, 4, 5)))
+        # The first chunk is in flight; the failed one stops further posts.
+        assert self.transport.make_prepped_xfer.call_count == 2
+        result = self.worker.get_transfer_results()
+        assert not result.finished_recving
+        self.transport.check_xfer_state.return_value = "DONE"
+        result = self.worker.get_transfer_results()
+        assert result.finished_recving == result.failed_recving == {"old-req"}
+        assert not self._notif_calls()
+        assert not self.worker._pending_recv_notifs
 
 
 def test_transfer_topology_unregister():

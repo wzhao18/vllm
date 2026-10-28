@@ -15,7 +15,7 @@ from collections import defaultdict
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, TypeGuard, cast
 
 import msgspec
 import numpy as np
@@ -40,6 +40,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     GET_META_MSG,
+    LEASE_QUERY_MSG,
     NixlAgentMetadata,
     NixlConnectorMetadata,
     NixlHandshakePayload,
@@ -116,6 +117,16 @@ _INVALID_PEER_MAX_BACKOFF_S = 60.0
 _MAX_HYBRID_BLOCK_SPLIT = 128
 
 
+def _is_remote_disconnect(error: BaseException | None) -> bool:
+    """Whether NIXL reported that the peer's connection is gone
+    (``nixlRemoteDisconnectError``, NIXL_ERR_REMOTE_DISCONNECT). The peer's
+    metadata stays loaded locally, but its endpoints are dead."""
+    return error is not None and (
+        type(error).__name__ == "nixlRemoteDisconnectError"
+        or "NIXL_ERR_REMOTE_DISCONNECT" in str(error)
+    )
+
+
 def _region_sort_key(layer_name: str) -> tuple[tuple[int, int | str], ...]:
     """Sort transfer regions in model-layer order, then by cache name."""
     return tuple(
@@ -131,6 +142,31 @@ def _share_storage_and_block_stride(caches: list[torch.Tensor]) -> bool:
     return len(block_strides) == len(storage_ptrs) == 1
 
 
+# Clock-offset error allowance for the lease fast path (handshake RTT / 2 plus
+# drift); the slow path covers anything closer to the deadline.
+_LEASE_CHECK_CLOCK_MARGIN_S = 5.0
+
+
+def query_remote_leases(
+    host: str, port: int, req_ids: list[str], timeout_s: float
+) -> list[bool]:
+    """Ask a P engine's side channel whether it still holds the blocks of
+    ``req_ids`` (P request ids). Raises TimeoutError without an answer."""
+    path = make_zmq_path("tcp", host, port)
+    with zmq_ctx(zmq.REQ, path) as sock:
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.setsockopt(zmq.RCVTIMEO, max(1, int(timeout_s * 1000)))
+        sock.send(msgspec.msgpack.encode((LEASE_QUERY_MSG, req_ids)))
+        try:
+            reply = sock.recv()
+        except zmq.Again as e:
+            raise TimeoutError(f"no lease answer from {path}") from e
+    held = msgspec.msgpack.decode(reply)
+    if not isinstance(held, list) or len(held) != len(req_ids):
+        raise ValueError(f"malformed lease answer from {path}: {held!r}")
+    return [h is True for h in held]
+
+
 class NixlBaseConnectorWorker:
     """Base implementation of Worker side methods shared by pull and push."""
 
@@ -143,9 +179,21 @@ class NixlBaseConnectorWorker:
     # packed KV caches under PP.
     _supports_pp_hma = False
 
+    # Failed pull peers that reported a remote disconnect: invalidated without
+    # the local metadata probe (see _cleanup_remote_engines). Immutable and
+    # rebound on update, so the class default is never shared mutable state.
+    _disconnected_remote_engines: frozenset[EngineId] = frozenset()
+
     # Set by register_kv_caches. The class default keeps workers that never
     # register caches (and the zeroing bookkeeping behind it) inert.
     _page_zeroer: PageZeroer | None = None
+
+    # Pull cap / disconnect retry (set from the KV transfer config in __init__).
+    # The class defaults keep workers built without __init__ (unit tests) on the
+    # uncapped, no-retry path; the retry bookkeeping is touched only with retry on.
+    _pull_max_blocks_per_xfer: int = 0
+    _pull_retry_disconnect: bool = False
+    _pull_retry_window_s: float = 10.0
 
     def _compute_desc_ids(
         self,
@@ -831,6 +879,40 @@ class NixlBaseConnectorWorker:
         self._invalid_engine_backoff: dict[EngineId, tuple[float, float]] = {}
         # Map of engine_id -> clock offset.
         self._engine_clock_offset: dict[EngineId, float] = {}
+        # Successful handshakes per engine. A pull retry waits for a handshake
+        # newer than the one whose endpoints failed (or for the release).
+        self._engine_generation: dict[EngineId, int] = {}
+
+        # Pull mode: cap on local kernel blocks per NIXL read. A larger read is
+        # split into several transfers whose P-side notification is deferred
+        # until all of them finish (0 = one transfer per remote rank).
+        self._pull_max_blocks_per_xfer: int = int(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "pull_max_blocks_per_xfer", 0
+            )
+        )
+        # Pull mode: re-post a request's reads once after its peer reported a
+        # remote disconnect (re-handshaking first), instead of failing it. Reads
+        # then defer their P-side notification until the request completes, so P
+        # keeps its blocks (under the lease) until the retry is done.
+        self._pull_retry_disconnect: bool = bool(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "pull_retry_remote_disconnect", False
+            )
+        )
+        # A pending retry that cannot re-post within this window fails as before.
+        self._pull_retry_window_s: float = float(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "pull_retry_window_s", 10.0
+            )
+        )
+        # Requests whose read failed with a remote disconnect (retry candidates)
+        # -> the generation of the peer's handshake whose endpoints failed.
+        self._disconnect_failed_reqs: dict[ReqId, int] = {}
+        # Requests that already used their retry.
+        self._pull_retry_attempted: set[ReqId] = set()
+        # Request -> (scheduled at, engine generation at the failure).
+        self._pull_retry_pending: dict[ReqId, tuple[float, int]] = {}
 
         # Metadata.
         self.engine_id: EngineId = engine_id
@@ -1003,6 +1085,19 @@ class NixlBaseConnectorWorker:
         self._failed_recv_reqs: queue.Queue[ReqId] = queue.Queue()
         self._recv_failures: set[ReqId] = set()
         self._pending_recv_notifs: dict[ReqId, list[tuple[str, bytes]]] = {}
+        # P->D pull lease check (see _gate_on_remote_lease).
+        self._lease_check_enabled = bool(
+            self.kv_transfer_config.get_from_extra_config("kv_lease_check", True)
+        )
+        self._lease_check_timeout_s = float(
+            self.kv_transfer_config.get_from_extra_config(
+                "kv_lease_check_timeout_s", 30.0
+            )
+        )
+        self._lease_checks: dict[ReqId, tuple[Future[bool], float]] = {}
+        self._lease_check_executor = ThreadPoolExecutor(
+            max_workers=4, thread_name_prefix="vllm-nixl-lease-check"
+        )
 
         # Handshake metadata of this worker for NIXL transfers.
         self.xfer_handshake_metadata: NixlHandshakePayload | None = None
@@ -1500,6 +1595,10 @@ class NixlBaseConnectorWorker:
                     try:
                         remote_agents, clock_offset = f.result()
                         self._remote_agents[eid] = remote_agents
+                        if self._pull_retry_disconnect:
+                            self._engine_generation[eid] = (
+                                self._engine_generation.get(eid, 0) + 1
+                            )
                         self._engine_clock_offset[eid] = clock_offset
                         self._engine_last_active[eid] = time.perf_counter()
                         self._track_remote_engine_replacement(eid, host, port)
@@ -3548,10 +3647,26 @@ class NixlBaseConnectorWorker:
             for req_id in tuple(self._recv_failures):
                 if req_id not in self._recving_metadata:
                     self._recv_failures.remove(req_id)
+                    if self._pull_retry_disconnect:
+                        self._disconnect_failed_reqs.pop(req_id, None)
+                        self._pull_retry_attempted.discard(req_id)
                 elif req_id not in self._recving_transfers:
                     self._recv_failures.remove(req_id)
+                    # All of its reads have drained: retry a remote disconnect
+                    # once instead of reporting the failure.
+                    if self._should_retry_pull(req_id):
+                        self._schedule_pull_retry(req_id)
+                        # Drained, so _pop_done_transfers listed it as done.
+                        done_recving.discard(req_id)
+                        continue
+                    if self._pull_retry_disconnect:
+                        self._disconnect_failed_reqs.pop(req_id, None)
                     failed_recv_reqs.add(req_id)
             done_recving.update(failed_recv_reqs)
+        if done_recving and self._pull_retry_disconnect:
+            self._pull_retry_attempted.difference_update(done_recving)
+
+        self._gate_on_remote_lease(done_recving, failed_recv_reqs)
 
         if len(done_sending) > 0 or len(done_recving) > 0:
             logger.debug(
@@ -3717,6 +3832,105 @@ class NixlBaseConnectorWorker:
         """
         raise NotImplementedError
 
+    def _needs_lease_check(self, meta: "ReqMeta | None") -> TypeGuard["ReqMeta"]:
+        return (
+            getattr(self, "_lease_check_enabled", False)
+            and meta is not None
+            and meta.remote is not None
+            and meta.remote.lease_check is True
+        )
+
+    def _read_within_lease(self, meta: ReqMeta, now: float) -> bool:
+        """Whether a read seen complete at ``now`` finished before P's initial
+        lease deadline (heartbeats only extend it), with a clock margin."""
+        assert meta.remote is not None
+        deadline = meta.remote.lease_deadline
+        offset = self._engine_clock_offset.get(meta.remote.engine_id)
+        if deadline is None or offset is None:
+            return False
+        return now + _LEASE_CHECK_CLOCK_MARGIN_S < deadline - offset
+
+    def _submit_lease_check(self, meta: ReqMeta) -> Future[bool]:
+        assert meta.remote is not None
+        remote = meta.remote
+        timeout = self._lease_check_timeout_s
+
+        def _query() -> bool:
+            return query_remote_leases(
+                remote.host, remote.port, [remote.request_id], timeout
+            )[0]
+
+        return self._lease_check_executor.submit(_query)
+
+    def _gate_on_remote_lease(
+        self, done_recving: set[ReqId], failed_recv_reqs: set[ReqId]
+    ) -> None:
+        """Hold back pulled requests until their read is shown to be in-lease.
+
+        P frees its blocks when the lease expires, and the one-sided READ gives
+        P no way to see a read in flight. A read that may have finished after
+        that point may hold another request's KV, so it is never used:
+
+        * finished before P's exported deadline -> used now (no round trip);
+        * otherwise P's scheduler is asked (side channel) whether the blocks
+          are still held. The completion notification, which releases them, is
+          held back until then. Held -> used; released, error or no answer
+          within ``kv_lease_check_timeout_s`` -> the load fails (recompute or
+          abort per kv_load_failure_policy).
+        """
+        if not getattr(self, "_lease_check_enabled", False):
+            return
+        now = time.perf_counter()
+        for req_id in tuple(done_recving):
+            if req_id in failed_recv_reqs or req_id in self._lease_checks:
+                continue
+            meta = self._recving_metadata.get(req_id)
+            if not self._needs_lease_check(meta) or self._read_within_lease(meta, now):
+                continue
+            assert meta is not None and meta.remote is not None
+            done_recving.discard(req_id)
+            try:
+                fut = self._submit_lease_check(meta)
+            except Exception as e:  # e.g. executor shut down
+                fut = Future()
+                fut.set_exception(e)
+            self._lease_checks[req_id] = (fut, now)
+            logger.info(
+                "NIXL read for request %s finished past the KV lease deadline "
+                "of remote engine %s; checking the lease before using it.",
+                req_id,
+                meta.remote.engine_id,
+            )
+
+        for req_id, (fut, started) in tuple(self._lease_checks.items()):
+            if fut.done():
+                try:
+                    held, reason = fut.result(), "released"
+                except Exception as e:
+                    held, reason = False, f"query failed: {e!r}"
+            elif now - started >= self._lease_check_timeout_s:
+                fut.cancel()
+                held, reason = False, "no answer"
+            else:
+                continue
+            del self._lease_checks[req_id]
+            done_recving.add(req_id)
+            if held:
+                continue
+            self.xfer_stats.record_kv_lease_lost()
+            meta = self._recving_metadata.get(req_id)
+            logger.warning(
+                "KV lease lost for request %s (remote engine %s, %s): its pulled "
+                "KV may have been overwritten and is discarded.",
+                req_id,
+                meta.remote.engine_id if meta and meta.remote else None,
+                reason,
+            )
+            if reason != "released":
+                # P may still hold the blocks: release them now, not at expiry.
+                self._send_pending_recv_notifs(req_id)
+            failed_recv_reqs.add(req_id)
+
     def _reap_expired_send_leases(self, done_sending: set[str]) -> None:
         """Reclaim expired send-side KV leases into ``done_sending``.
 
@@ -3809,7 +4023,9 @@ class NixlBaseConnectorWorker:
                         req_id=req_id,
                         error=e,
                     )
-                    if not self._handle_failed_transfer(req_id, handle, failed_req_ids):
+                    if not self._handle_failed_transfer(
+                        req_id, handle, failed_req_ids, error=e
+                    ):
                         in_progress.append(handle)
 
             if not in_progress:
@@ -3840,6 +4056,7 @@ class NixlBaseConnectorWorker:
         handle: int | None,
         failed_req_ids: set[str] | None = None,
         record_failed_transfer: bool = True,
+        error: BaseException | None = None,
     ) -> bool:
         """Record a failure and release its handle, returning False to retain it.
 
@@ -3852,6 +4069,9 @@ class NixlBaseConnectorWorker:
                 transport-failure metric. Callers that already recorded a more
                 specific metric (eg KV expiry, reported separately from
                 transport failures) pass False.
+            error: The exception the transfer raised, if any. A remote
+                disconnect invalidates the peer even though its local
+                metadata survives (see ``_cleanup_remote_engines``).
 
         """
         if record_failed_transfer:
@@ -3862,9 +4082,85 @@ class NixlBaseConnectorWorker:
                 and meta.remote is not None
             ):
                 self._failed_remote_engines.add(meta.remote.engine_id)
+                if _is_remote_disconnect(error):
+                    self._disconnected_remote_engines |= {meta.remote.engine_id}
+                    if self._pull_retry_disconnect:
+                        self._disconnect_failed_reqs.setdefault(
+                            req_id,
+                            self._engine_generation.get(meta.remote.engine_id, 0),
+                        )
         if failed_req_ids is not None:
             failed_req_ids.add(req_id)
         return handle is None or self._try_release_xfer_handle(req_id, handle)
+
+    def _should_retry_pull(self, req_id: ReqId) -> bool:
+        """Whether a drained failed pull gets its one retry: its peer reported
+        a remote disconnect and the request has not been retried yet."""
+        meta = self._recving_metadata.get(req_id)
+        return (
+            self._TRANSFER_MODE == "pull"
+            and self._pull_retry_disconnect
+            and req_id in self._disconnect_failed_reqs
+            and req_id not in self._pull_retry_attempted
+            and meta is not None
+            and meta.remote is not None
+        )
+
+    def _schedule_pull_retry(
+        self, req_id: ReqId, generation: int | None = None
+    ) -> None:
+        """Park a request for one re-post of its reads.
+
+        Its reads have drained (or were never posted). The P-side notifications
+        were deferred, so P still holds the blocks; the re-posted reads queue
+        them again. The request's local blocks stay allocated (it is still
+        waiting for remote KV) and are overwritten by the re-posted reads.
+        """
+        meta = self._recving_metadata[req_id]
+        assert meta.remote is not None
+        failed_generation = self._disconnect_failed_reqs.pop(req_id, None)
+        if generation is None:
+            generation = (
+                failed_generation
+                if failed_generation is not None
+                else self._engine_generation.get(meta.remote.engine_id, 0)
+            )
+        self._pull_retry_attempted.add(req_id)
+        self._pending_recv_notifs.pop(req_id, None)
+        self._pull_retry_pending[req_id] = (time.perf_counter(), generation)
+        logger.warning(
+            "NIXL pull for request %s from remote engine %s failed after a "
+            "remote disconnect; re-posting its reads once the peer is "
+            "re-handshaken.",
+            req_id,
+            meta.remote.engine_id,
+        )
+
+    def _pull_retry_ready(self, engine_id: EngineId, generation: int) -> bool:
+        """The peer's failed endpoints are gone: released (the next read
+        re-handshakes) or replaced by a newer handshake, and not invalid."""
+        if engine_id in self._invalid_remote_engines:
+            return False
+        return (
+            engine_id not in self._remote_agents
+            or self._engine_generation.get(engine_id, 0) > generation
+        )
+
+    def _chunk_read_descs(
+        self, local_ids: Any, remote_ids: Any, num_blocks: int
+    ) -> list[tuple[Any, Any]]:
+        """Split one read's paired descriptor lists so that each NIXL transfer
+        covers at most ``pull_max_blocks_per_xfer`` local blocks per region."""
+        cap = self._pull_max_blocks_per_xfer
+        if cap <= 0 or num_blocks <= cap or len(local_ids) <= 1:
+            return [(local_ids, remote_ids)]
+        n = min(cdiv(num_blocks, cap), len(local_ids))
+        return list(
+            zip(
+                np.array_split(np.asarray(local_ids), n),
+                np.array_split(np.asarray(remote_ids), n),
+            )
+        )
 
     def _send_pending_recv_notifs(self, req_id: str) -> None:
         """Send notifications deferred by split DRAM/VRAM reads."""
@@ -4351,6 +4647,14 @@ class NixlBaseConnectorWorker:
             replaced = self._remote_agents.keys() - self._engine_by_address.values()
         now = time.perf_counter()
         for engine_id in self._failed_remote_engines - self._invalid_remote_engines:
+            if engine_id in self._disconnected_remote_engines:
+                # NIXL_ERR_REMOTE_DISCONNECT: the metadata is still loaded, so the
+                # probe below would pass, but the endpoints are dead and every
+                # later read on them fails. Re-handshake after the reads drain.
+                self._mark_remote_engine_invalid(
+                    engine_id, now, reason="reported a remote disconnect"
+                )
+                continue
             agents = self._remote_agents.get(engine_id, {}).values()
             try:
                 # No descriptors: query local existence, not peer health.
@@ -4363,6 +4667,7 @@ class NixlBaseConnectorWorker:
                     exc_info=True,
                 )
         self._failed_remote_engines.clear()
+        self._disconnected_remote_engines = frozenset()
         # Invalid peers keep rejecting new reads until their backoff has elapsed.
         invalid = {
             engine_id
@@ -4387,8 +4692,14 @@ class NixlBaseConnectorWorker:
                 engine_id,
             )
 
-    def _mark_remote_engine_invalid(self, engine_id: EngineId, now: float) -> None:
-        """Schedule release of an engine whose local NIXL metadata is gone.
+    def _mark_remote_engine_invalid(
+        self,
+        engine_id: EngineId,
+        now: float,
+        reason: str = "local NIXL metadata was invalidated",
+    ) -> None:
+        """Schedule release of an engine whose local NIXL metadata is gone, or
+        whose connection the peer reported lost.
 
         The first invalidation is released as soon as reads drain. Repeats
         before the peer has stayed healthy for the max backoff double the
@@ -4408,9 +4719,9 @@ class NixlBaseConnectorWorker:
         self._invalid_engine_backoff[engine_id] = (backoff, now + backoff)
         self._invalid_remote_engines.add(engine_id)
         logger.warning(
-            "Local NIXL metadata for remote engine %s was invalidated; "
-            "re-handshaking after reads drain%s.",
+            "Remote engine %s %s; re-handshaking after reads drain%s.",
             engine_id,
+            reason,
             f" and a {backoff:.0f}s backoff" if backoff else "",
         )
 
@@ -4439,6 +4750,7 @@ class NixlBaseConnectorWorker:
 
         self._failed_remote_engines.discard(engine_id)
         self._invalid_remote_engines.discard(engine_id)
+        self._disconnected_remote_engines -= {engine_id}
 
         self.kv_caches_base_addr.pop(engine_id, None)
         self.dst_num_blocks.pop(engine_id, None)
@@ -4515,6 +4827,8 @@ class NixlBaseConnectorWorker:
             # error happens during init, no need to shutdown
             return
         self._handshake_initiation_executor.shutdown(wait=False)
+        if hasattr(self, "_lease_check_executor"):
+            self._lease_check_executor.shutdown(wait=False, cancel_futures=True)
         for handles in self._recving_transfers.values():
             for handle in handles:
                 self.nixl_wrapper.release_xfer_handle(handle)

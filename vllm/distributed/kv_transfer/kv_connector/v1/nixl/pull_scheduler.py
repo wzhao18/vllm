@@ -248,6 +248,7 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
         delay_free_blocks = any(len(group) > 0 for group in block_ids)
         remote_num_tokens = 0
         blocks_expiry_time = None
+        lease_deadline = None
         if delay_free_blocks:
             # Prefill request on remote. It will be read from D upon completion
             request_kv_blocks_ttl = self._kv_lease_duration
@@ -267,6 +268,12 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             if is_d_node:
                 # D blocks expiry time exported for the turn-2 readback.
                 blocks_expiry_time = self._reqs_need_send[request.request_id]
+            else:
+                # P->D pull: export the initial lease deadline (D's no-RTT
+                # fast path) and answer lease queries until the blocks are
+                # released.
+                lease_deadline = self._reqs_need_send[request.request_id]
+                self._hold_send_lease(request.request_id)
             # NOTE HMA will "mark" empty/null blocks in groups with 0s (eg SWA ones),
             # trimming down after allocating for the whole sequence length. Empty
             # blocks are always at the start of the list.
@@ -290,5 +297,7 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             remote_num_tokens=remote_num_tokens,
             remote_blocks_expiry_time=blocks_expiry_time,
             remote_registration_generation=self._registration_generation,
+            remote_lease_deadline=lease_deadline,
+            remote_lease_check=lease_deadline is not None,
             transfer_mode=self._TRANSFER_MODE,
         )

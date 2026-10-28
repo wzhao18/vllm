@@ -42,6 +42,7 @@ class NixlKVConnectorStats(KVConnectorStats):
             "num_failed_handshakes": [],
             "num_kv_expired_reqs": [],
             "num_notifications_after_expiry": [],
+            "num_kv_lease_lost": [],
         }
 
     def record_transfer(self, res: "nixlXferTelemetry | None"):
@@ -69,6 +70,11 @@ class NixlKVConnectorStats(KVConnectorStats):
         """Record a request that had its KV blocks expire."""
         self.data["num_kv_expired_reqs"].append(1)
 
+    def record_kv_lease_lost(self):
+        """Record a pulled request whose read could not be shown to finish
+        within the remote KV lease; its KV is discarded and reloaded."""
+        self.data["num_kv_lease_lost"].append(1)
+
     def record_notification_after_expiry(self):
         """Record a completion notification that arrived after its request expired."""
         self.data["num_notifications_after_expiry"].append(1)
@@ -87,6 +93,7 @@ class NixlKVConnectorStats(KVConnectorStats):
             and len(self.data["num_failed_handshakes"]) == 0
             and len(self.data["num_kv_expired_reqs"]) == 0
             and len(self.data["num_notifications_after_expiry"]) == 0
+            and len(self.data["num_kv_lease_lost"]) == 0
         )
 
     def aggregate(self, other: KVConnectorStats) -> KVConnectorStats:
@@ -111,6 +118,7 @@ class NixlKVConnectorStats(KVConnectorStats):
             + len(self.data["num_failed_notifications"]),
             "Num KV expired reqs": len(self.data["num_kv_expired_reqs"]),
             "Num notifs after expiry": len(self.data["num_notifications_after_expiry"]),
+            "Num KV lease lost": len(self.data["num_kv_lease_lost"]),
         }
         if self.num_successful_transfers == 0:
             # Timing / throughput stats only cover successful transfers. If
@@ -284,6 +292,17 @@ class NixlPromMetrics(KVConnectorPromMetrics):
             counter_nixl_num_notifications_after_expiry, self.per_engine_labelvalues
         )
 
+        counter_nixl_num_kv_lease_lost = self._counter_cls(
+            name="vllm:nixl_num_kv_lease_lost",
+            documentation="Number of pulled requests whose read could not be "
+            "shown to finish while the remote held the KV lease. Their KV is "
+            "discarded (recompute or abort per kv_load_failure_policy).",
+            labelnames=labelnames,
+        )
+        self.counter_nixl_num_kv_lease_lost = create_metric_per_engine(
+            counter_nixl_num_kv_lease_lost, self.per_engine_labelvalues
+        )
+
     def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0):
         for prom_obj, list_item_key in zip(
             [
@@ -307,6 +326,7 @@ class NixlPromMetrics(KVConnectorPromMetrics):
                 self.counter_nixl_num_failed_notifications,
                 self.counter_nixl_num_kv_expired_reqs,
                 self.counter_nixl_num_notifications_after_expiry,
+                self.counter_nixl_num_kv_lease_lost,
             ],
             [
                 # Transfer, handshake and notification failures are grouped:
@@ -321,6 +341,7 @@ class NixlPromMetrics(KVConnectorPromMetrics):
                 ("num_failed_notifications",),
                 ("num_kv_expired_reqs",),
                 ("num_notifications_after_expiry",),
+                ("num_kv_lease_lost",),
             ],
         ):
             for counter_item_key in counter_item_keys:

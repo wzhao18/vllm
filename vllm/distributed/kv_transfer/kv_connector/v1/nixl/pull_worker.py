@@ -76,6 +76,9 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 self._recving_metadata[req_id] = meta
             self._read_blocks_for_req(req_id, meta)
 
+        # Re-post the reads of requests parked after a remote disconnect, once
+        # their peer has been released or re-handshaken.
+        self._dispatch_pull_retries()
         # Start transfers for requests whose handshakes have now finished.
         while not self._ready_requests.empty():
             self._read_blocks_for_req(*self._ready_requests.get_nowait())
@@ -125,6 +128,9 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         # Send heartbeats to P-side engines to keep KV blocks alive while
         # requests sit in the D scheduler WAITING queue.
         self._send_heartbeats(metadata)
+        # P side: lease renewals that arrived on the side channel.
+        if lease_renewals := getattr(metadata, "lease_renewals", None):
+            self._handle_heartbeat(",".join(lease_renewals))
 
     def _is_turn2_read_expired(self, meta: ReqMeta) -> bool:
         """Whether D's cached blocks for this turn-2 readback have (nearly) expired."""
@@ -141,6 +147,17 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         assert meta.remote is not None and self.transfer_topo is not None
         engine_id = meta.remote.engine_id
         if engine_id in self._invalid_remote_engines:
+            if (
+                self._pull_retry_disconnect
+                and req_id not in self._pull_retry_attempted
+                and req_id in self._recving_metadata
+            ):
+                # Nothing was posted: wait for the peer's release and re-handshake
+                # instead of failing the request (one retry).
+                self._schedule_pull_retry(
+                    req_id, generation=self._engine_generation.get(engine_id, 0)
+                )
+                return
             self._handle_failed_transfer(
                 req_id, None, self._recv_failures, record_failed_transfer=False
             )
@@ -578,20 +595,49 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     notif_id=notif_id,
                 )
                 return True
-            handle = self.nixl_wrapper.make_prepped_xfer(
-                "READ",
-                local_xfer_side_handle,
+            chunks = self._chunk_read_descs(
                 local_block_descs_ids,
-                remote_xfer_side_handle,
                 remote_block_descs_ids,
-                notif_msg=notif_id,
+                max((len(group) for group in local_block_ids), default=0),
             )
+            # Several transfers (or a possible retry) must not each notify P:
+            # P frees its blocks on the notification. Send it once every read of
+            # the request has finished (get_transfer_results).
+            # A lease check must run before P is told the read finished.
+            defer_notif = (
+                len(chunks) > 1
+                or self._pull_retry_disconnect
+                or self._needs_lease_check(self._recving_metadata.get(request_id))
+            )
+            for local_ids, remote_ids in chunks:
+                if defer_notif:
+                    handle = self.nixl_wrapper.make_prepped_xfer(
+                        "READ",
+                        local_xfer_side_handle,
+                        local_ids,
+                        remote_xfer_side_handle,
+                        remote_ids,
+                    )
+                else:
+                    handle = self.nixl_wrapper.make_prepped_xfer(
+                        "READ",
+                        local_xfer_side_handle,
+                        local_ids,
+                        remote_xfer_side_handle,
+                        remote_ids,
+                        notif_msg=notif_id,
+                    )
 
-            # Begin async xfer.
-            self.nixl_wrapper.transfer(handle)
+                # Begin async xfer.
+                self.nixl_wrapper.transfer(handle)
 
-            # Use handle to check completion in future step().
-            self._recving_transfers[request_id].append(handle)
+                # Use handle to check completion in future step().
+                self._recving_transfers[request_id].append(handle)
+                handle = None
+            if defer_notif:
+                self._pending_recv_notifs.setdefault(request_id, []).append(
+                    (self._remote_agents[dst_engine_id][(0, remote_rank)], notif_id)
+                )
             return True
         except Exception as e:
             self._log_failure(
@@ -603,11 +649,48 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 remote_rank=remote_rank,
             )
             if not self._handle_failed_transfer(
-                request_id, handle, self._recv_failures
+                request_id, handle, self._recv_failures, error=e
             ):
                 assert handle is not None
                 self._recving_transfers[request_id].append(handle)
             return False
+
+    def _dispatch_pull_retries(self) -> None:
+        """Re-post parked requests whose peer is fresh again; fail those that
+        could not re-post within ``pull_retry_window_s``."""
+        if not self._pull_retry_disconnect or not self._pull_retry_pending:
+            return
+        now = time.perf_counter()
+        for req_id, (scheduled_at, generation) in list(
+            self._pull_retry_pending.items()
+        ):
+            meta = self._recving_metadata.get(req_id)
+            if meta is None or meta.remote is None:
+                # Aborted while parked.
+                del self._pull_retry_pending[req_id]
+                self._pull_retry_attempted.discard(req_id)
+                continue
+            engine_id = meta.remote.engine_id
+            if self._pull_retry_ready(engine_id, generation):
+                del self._pull_retry_pending[req_id]
+                logger.info(
+                    "Re-posting NIXL reads for request %s from remote engine %s.",
+                    req_id,
+                    engine_id,
+                )
+                self._read_blocks_for_req(req_id, meta)
+            elif now - scheduled_at > self._pull_retry_window_s:
+                del self._pull_retry_pending[req_id]
+                logger.warning(
+                    "NIXL pull retry for request %s gave up: remote engine %s was "
+                    "not re-handshaken within %.0fs.",
+                    req_id,
+                    engine_id,
+                    self._pull_retry_window_s,
+                )
+                self._handle_failed_transfer(
+                    req_id, None, self._recv_failures, record_failed_transfer=False
+                )
 
     def _read_blocks_mixed(
         self,

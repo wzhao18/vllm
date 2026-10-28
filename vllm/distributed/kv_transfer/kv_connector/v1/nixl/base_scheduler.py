@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Base scheduler-side logic for the NIXL connector."""
 
+import contextlib
 import threading
 import time
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import msgspec
@@ -22,6 +24,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     GET_META_MSG,
+    LEASE_HEARTBEAT_MSG,
+    LEASE_QUERY_MSG,
     HeartbeatInfo,
     NixlConnectorMetadata,
     NixlHandshakePayload,
@@ -47,6 +51,25 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+_SIDE_HB_TIMEOUT_S = 2.0
+
+
+def send_lease_heartbeat(
+    host: str, port: int, req_ids: list[str], timeout_s: float
+) -> list[bool]:
+    """Renew P-side leases of ``req_ids`` over P's side channel."""
+    path = make_zmq_path("tcp", host, port)
+    with zmq_ctx(zmq.REQ, path) as sock:
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.setsockopt(zmq.RCVTIMEO, max(1, int(timeout_s * 1000)))
+        sock.send(msgspec.msgpack.encode((LEASE_HEARTBEAT_MSG, req_ids)))
+        try:
+            reply = sock.recv()
+        except zmq.Again as e:
+            raise TimeoutError(f"no heartbeat answer from {path}") from e
+    return [r is True for r in msgspec.msgpack.decode(reply)]
 
 
 class NixlBaseConnectorScheduler:
@@ -127,6 +150,13 @@ class NixlBaseConnectorScheduler:
         # Reqs to send and their expiration time
         self._reqs_need_send: dict[ReqId, float] = {}
         self._reqs_in_batch: set[ReqId] = set()
+        # P side, pull mode: requests whose blocks are held for a remote READ.
+        # Dropped when the workers report the send finished, before the
+        # blocks are freed; read by the side-channel listener thread.
+        self._held_send_leases: set[ReqId] = set()
+        self._held_send_leases_lock = threading.Lock()
+        # P side: renewals received on the side channel, for the next step.
+        self._pending_lease_renewals: set[ReqId] = set()
         # Reqs to remove from processed set because they're not to send after
         # remote prefill or aborted.
         self._reqs_not_processed: set[ReqId] = set()
@@ -137,6 +167,17 @@ class NixlBaseConnectorScheduler:
         # Reverse lookup: local req_id -> (engine_id, remote_req_id) for O(1) removal
         self._heartbeat_req_engine: dict[ReqId, tuple[EngineId, ReqId]] = {}
         self._last_heartbeat_time: float = 0.0
+        # D side: remote request ids whose P answers side-channel heartbeats
+        # (P advertised remote_lease_check). Guarded with the heartbeat maps
+        # by _heartbeat_lock: the side-channel heartbeat thread reads them.
+        self._side_hb_req_ids: set[ReqId] = set()
+        self._heartbeat_lock = threading.Lock()
+        self._side_hb_thread: threading.Thread | None = None
+        self._side_hb_enabled = bool(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "kv_side_channel_heartbeat", True
+            )
+        )
 
         # Gather Sliding Window sizes for each kv cache group (if any) in number of
         # blocks per KV cache group. This is used to clip the local attention window.
@@ -225,30 +266,95 @@ class NixlBaseConnectorScheduler:
             or tp_size is None
         ):
             return
-        if remote_engine_id not in self._heartbeat_by_engine:
-            self._heartbeat_by_engine[remote_engine_id] = HeartbeatInfo(
-                req_ids=set(),
-                host=host,
-                port=port,
-                tp_size=tp_size,
-                dcp_size=dcp_size,
-                pp_size=pp_size,
+        with self._heartbeat_lock_ctx():
+            if remote_engine_id not in self._heartbeat_by_engine:
+                self._heartbeat_by_engine[remote_engine_id] = HeartbeatInfo(
+                    req_ids=set(),
+                    host=host,
+                    port=port,
+                    tp_size=tp_size,
+                    dcp_size=dcp_size,
+                    pp_size=pp_size,
+                )
+            self._heartbeat_by_engine[remote_engine_id].req_ids.add(remote_request_id)
+            self._heartbeat_req_engine[request.request_id] = (
+                remote_engine_id,
+                remote_request_id,
             )
-        self._heartbeat_by_engine[remote_engine_id].req_ids.add(remote_request_id)
-        self._heartbeat_req_engine[request.request_id] = (
-            remote_engine_id,
-            remote_request_id,
-        )
+            if params.get("remote_lease_check") is True and getattr(
+                self, "_side_hb_enabled", False
+            ):
+                self._side_hb_req_ids.add(remote_request_id)
+                self._ensure_side_heartbeat_thread()
+
+    def _heartbeat_lock_ctx(self):
+        lock = getattr(self, "_heartbeat_lock", None)
+        return lock if lock is not None else contextlib.nullcontext()
 
     def _stop_heartbeat(self, req_id: ReqId) -> None:
         """Remove *req_id* from heartbeat tracking (if tracked)."""
-        if key := self._heartbeat_req_engine.pop(req_id, None):
-            engine_id, remote_id = key
-            if info := self._heartbeat_by_engine.get(engine_id):
-                info.req_ids.discard(remote_id)
-                if not info.req_ids:
-                    # Clean up empty engines so we don't leak a key when remote dies.
-                    del self._heartbeat_by_engine[engine_id]
+        with self._heartbeat_lock_ctx():
+            if key := self._heartbeat_req_engine.pop(req_id, None):
+                engine_id, remote_id = key
+                if hasattr(self, "_side_hb_req_ids"):
+                    self._side_hb_req_ids.discard(remote_id)
+                if info := self._heartbeat_by_engine.get(engine_id):
+                    info.req_ids.discard(remote_id)
+                    if not info.req_ids:
+                        # Clean up empty engines so we don't leak a key when
+                        # remote dies.
+                        del self._heartbeat_by_engine[engine_id]
+
+    def _ensure_side_heartbeat_thread(self) -> None:
+        if self._side_hb_thread is not None:
+            return
+        self._side_hb_thread = threading.Thread(
+            target=self._side_heartbeat_loop,
+            daemon=True,
+            name="nixl_lease_heartbeat",
+        )
+        self._side_hb_thread.start()
+
+    def _side_heartbeat_targets(self) -> list[tuple[str, int, list[ReqId]]]:
+        targets = []
+        with self._heartbeat_lock:
+            for info in self._heartbeat_by_engine.values():
+                ids = [r for r in info.req_ids if r in self._side_hb_req_ids]
+                if ids:
+                    targets.append((info.host, info.port, ids))
+        return targets
+
+    def _send_side_heartbeats(self) -> None:
+        """One round of lease heartbeats over P's side channel."""
+        for host, port, ids in self._side_heartbeat_targets():
+            try:
+                send_lease_heartbeat(host, port, ids, _SIDE_HB_TIMEOUT_S)
+            except Exception as e:
+                logger.debug(
+                    "Side-channel lease heartbeat to %s:%s failed: %r",
+                    host,
+                    port,
+                    e,
+                )
+
+    def _side_heartbeat_loop(self) -> None:
+        """Renew P leases while requests wait for their KV, off the step loop.
+
+        The NIXL heartbeat is built in D's step loop and rides the NIXL/UCX
+        endpoint of the reads it protects, so a stalled step loop (DP
+        lockstep) or a stalled endpoint lets leases expire mid-pull.
+        """
+        interval = max(1.0, min(float(self._heartbeat_interval), 5.0))
+        while not self._stop_event.wait(interval):
+            self._send_side_heartbeats()
+
+    def _queue_lease_renewals(self, req_ids: list[str]) -> list[bool]:
+        """P side (listener thread): renew leases still held; the workers
+        apply it with the next step's metadata."""
+        with self._held_send_leases_lock:
+            held = [r in self._held_send_leases for r in req_ids]
+            self._pending_lease_renewals.update(r for r, h in zip(req_ids, held) if h)
+        return held
 
     def get_exchange_clipped_blocks(
         self,
@@ -343,6 +449,10 @@ class NixlBaseConnectorScheduler:
                     self.side_channel_host,
                     self.side_channel_port,
                 ),
+                kwargs={
+                    "lease_query": self._query_send_leases,
+                    "lease_renew": self._queue_lease_renewals,
+                },
                 daemon=True,
                 name="nixl_handshake_listener",
             )
@@ -356,6 +466,8 @@ class NixlBaseConnectorScheduler:
         stop_event: threading.Event,
         host: str,
         port: int,
+        lease_query: Callable[[list[str]], list[bool]] | None = None,
+        lease_renew: Callable[[list[str]], list[bool]] | None = None,
     ):
         """Background thread for getting new NIXL handshakes."""
         # NOTE(rob): this is a simple implementation. We will move
@@ -374,8 +486,31 @@ class NixlBaseConnectorScheduler:
                     if stop_event.is_set():
                         break
                     continue
+                decoded = msgspec.msgpack.decode(msg)
+                if decoded and decoded[0] == LEASE_HEARTBEAT_MSG:
+                    # (LEASE_HEARTBEAT_MSG, [req_ids]) -> [renewed].
+                    req_ids = list(decoded[1])
+                    renewed = (
+                        lease_renew(req_ids)
+                        if lease_renew is not None
+                        else [False] * len(req_ids)
+                    )
+                    sock.send_multipart(
+                        (identity, b"", msgspec.msgpack.encode(renewed))
+                    )
+                    continue
+                if decoded and decoded[0] == LEASE_QUERY_MSG:
+                    # (LEASE_QUERY_MSG, [req_ids]) -> [held].
+                    req_ids = list(decoded[1])
+                    held = (
+                        lease_query(req_ids)
+                        if lease_query is not None
+                        else [False] * len(req_ids)
+                    )
+                    sock.send_multipart((identity, b"", msgspec.msgpack.encode(held)))
+                    continue
                 # Decode (GET_META_MSG, pp_rank, tp_rank).
-                msg, target_pp_rank, target_tp_rank = msgspec.msgpack.decode(msg)
+                msg, target_pp_rank, target_tp_rank = decoded
                 logger.debug(
                     "Received message for pp rank %s, tp rank %s",
                     target_pp_rank,
@@ -520,6 +655,11 @@ class NixlBaseConnectorScheduler:
         meta.reqs_in_batch = self._reqs_in_batch
         meta.reqs_not_processed = self._reqs_not_processed
 
+        if getattr(self, "_pending_lease_renewals", None):
+            with self._held_send_leases_lock:
+                meta.lease_renewals = self._pending_lease_renewals
+                self._pending_lease_renewals = set()
+
         # Package heartbeats, throttled by heartbeat_interval.
         if self._heartbeat_by_engine:
             now = time.perf_counter()
@@ -535,10 +675,31 @@ class NixlBaseConnectorScheduler:
 
         return meta
 
+    def _hold_send_lease(self, req_id: ReqId) -> None:
+        with self._held_send_leases_lock:
+            self._held_send_leases.add(req_id)
+
+    def _query_send_leases(self, req_ids: list[str]) -> list[bool]:
+        """Whether each request's blocks are still held for a remote READ.
+
+        Runs on the side-channel listener thread. A request leaves the set
+        (update_connector_output) before the scheduler frees its blocks, so
+        True means none of them has been freed, let alone reallocated.
+        """
+        with self._held_send_leases_lock:
+            return [r in self._held_send_leases for r in req_ids]
+
     def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:
         """Stop heartbeating for requests whose KV transfer completed."""
         for req_id in connector_output.finished_recving or ():
             self._stop_heartbeat(req_id)
+        # Called before the scheduler frees finished_sending blocks.
+        lock = getattr(self, "_held_send_leases_lock", None)
+        if connector_output.finished_sending and lock is not None:
+            with lock:
+                self._held_send_leases.difference_update(
+                    connector_output.finished_sending
+                )
 
     def has_pending_push_work(self) -> bool:
         return False

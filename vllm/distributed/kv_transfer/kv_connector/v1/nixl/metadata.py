@@ -19,6 +19,13 @@ TransferHandle = int
 ReqId = str
 
 GET_META_MSG = b"get_meta_msg"
+# Side-channel query, D worker -> P scheduler: (LEASE_QUERY_MSG, [req_ids])
+# -> [bool]: whether P still holds each request's KV blocks for the pull.
+LEASE_QUERY_MSG = b"lease_query_msg"
+# Side-channel lease heartbeat, D scheduler -> P scheduler:
+# (LEASE_HEARTBEAT_MSG, [req_ids]) -> [renewed]. Sent from a background
+# thread, independent of D's step loop and of the NIXL/UCX data path.
+LEASE_HEARTBEAT_MSG = b"lease_heartbeat_msg"
 
 # Push-mode (WRITE-based) registration notification.
 # Sent worker-to-worker over NIXL: D worker -> P worker, encoded as
@@ -249,6 +256,10 @@ class RemoteMeta:
     num_tokens: int | None = None
     # Bumped each time the remote publishes a changed KV cache registration.
     registration_generation: int = 0
+    # P->D pull lease: P's initial release deadline (P scheduler clock) and
+    # whether P answers lease queries on its side channel.
+    lease_deadline: float | None = None
+    lease_check: bool = False
 
 
 @dataclass
@@ -296,6 +307,8 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         self.reqs_not_processed: set[ReqId] = set()
         # Heartbeat data grouped by remote engine, sent by D worker to P.
         self.heartbeat_by_engine: dict[EngineId, HeartbeatInfo] = {}
+        # P side: requests whose lease a D renewed over the side channel.
+        self.lease_renewals: set[ReqId] = set()
         # Push mode (D side): registration data the D worker should send to
         # P workers via NIXL notification on this step.
         self.push_registrations: dict[ReqId, dict[str, Any]] = {}
@@ -357,5 +370,7 @@ class NixlConnectorMetadata(KVConnectorMetadata):
             registration_generation=kv_transfer_params.get(
                 "remote_registration_generation", 0
             ),
+            lease_deadline=kv_transfer_params.get("remote_lease_deadline"),
+            lease_check=kv_transfer_params.get("remote_lease_check") is True,
         )
         self.reqs_to_recv[request_id] = req
