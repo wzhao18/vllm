@@ -176,6 +176,8 @@ MambaDType = Literal["auto", "float32", "float16", "bfloat16"]
 MambaCacheMode = Literal["align", "none"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
 KVOffloadingBackend = Literal["native", "lmcache"]
+PrefixCachePolicy = Literal["legacy", "v2"]
+TurnRetireMode = Literal["drop", "demote"]
 
 
 @config
@@ -315,6 +317,62 @@ class CacheConfig:
     prompt tail. Off by default; only takes effect with prefix caching enabled,
     EAGLE on the Mamba group, and a prefix match unit smaller than the Mamba
     block size."""
+    mamba_extra_tail_checkpoint_tokens: int = Field(default=0, ge=0)
+    """Also checkpoint the Mamba "align" state about this many tokens before the
+    prompt-tail checkpoint (block-floored to the Mamba block size), so a later
+    request that diverges a little before the previous prompt's end -- a client
+    re-rendering the end of the prior prompt -- can resume close to its
+    divergence instead of at the previous resume point. 0 (default) disables
+    it; only takes effect with prefix caching in "align" mode. Costs one extra
+    prefill step on the requests it applies to (see
+    ``mamba_extra_tail_checkpoint_min_span``)."""
+    mamba_extra_tail_checkpoint_min_span: int = Field(default=16384, ge=0)
+    """Apply ``mamba_extra_tail_checkpoint_tokens`` only to prefills that
+    compute at least this many tokens past their prefix-cache hit, where the
+    extra step is a small share of the prefill and a re-prefill would cost
+    the most."""
+    mamba_internal_snapshot: bool = False
+    """Let a request's first prefill chunk that crosses at most one Mamba block
+    boundary export its prompt-tail checkpoint from inside the step, into a
+    fresh block one column below its initial state, instead of ending a chunk
+    at the checkpoint (and at the block boundary). Small turns then prefill in
+    one step. Requires the V2 model runner and a backend whose cache spec
+    declares ``MambaSpec.prefill_snapshot`` (FlashKDA); otherwise it is
+    ignored. Only takes effect with prefix caching in "align" mode."""
+    mamba_low_priority_snapshot_prompt_len: int = Field(default=0, ge=0)
+    """Mamba states (live state and checkpoints) cached by requests whose prompt
+    is shorter than this many tokens are evicted before every other cached
+    block once freed (TensorRT-LLM ``TLLM_V2_LOW_PRIORITY_SNAPSHOT_PROMPT_LEN``):
+    a state is reusable only at its exact boundary and takes a full state slot
+    whatever the prompt length, while a short prompt is cheap to recompute.
+    Attention blocks keep the default order. 0 (default) disables it."""
+    mamba_conversation_max_turns: int = Field(default=0, ge=0)
+    """Keep the Mamba prefix-cache states of only the last N completed turns
+    of a conversation; older turns' states are dropped from the prefix cache
+    when a newer turn finishes (TensorRT-LLM ``block_reuse_config.policy:
+    per_conversation``, ``max_num_turns``). The conversation id is the
+    request's ``session_id``, else ``SamplingParams.extra_args
+    ["conversation_id"]``; requests without one are unaffected. Attention
+    blocks are not affected. 0 (default) disables it."""
+    prefix_cache_policy: PrefixCachePolicy = "legacy"
+    """Prefix-cache eviction policy.
+
+    - "legacy": stale-block demotion only under cache pressure (the oldest
+      evictable cached block joined the LRU less than 300 s ago); a turn's
+      superseded prompt checkpoint is demoted.
+    - "v2": one eviction order. Demotion has no pressure gate, so the
+      copy-on-write source of a partial-tail hit and generated blocks past a
+      prompt's divergence always go evict-first (behind the uncached free
+      blocks, ahead of every LRU block; a later hit cancels it). A turn's
+      superseded prompt checkpoint stays in plain LRU (it still serves
+      rewinds and divergences). Short-prompt Mamba states are low priority
+      (``mamba_low_priority_snapshot_prompt_len``, 16384 unless set), and
+      ``mamba_conversation_max_turns`` defaults to "demote" mode."""
+    mamba_conversation_max_turns_mode: TurnRetireMode | None = None
+    """How ``mamba_conversation_max_turns`` retires old turns' states:
+    "drop" evicts them; "demote" sends them evict-first, still hit-able until
+    reused (a hit cancels it). None: "demote" under ``prefix_cache_policy``
+    "v2", else "drop"."""
     replayssm_buffer_len: int = Field(default=16, gt=0)
     """ReplaySSM logical history length B for Mamba2. Triton uses B physical
     rows and FlashInfer uses B+T, where T is the target verification length.
@@ -414,6 +472,13 @@ class CacheConfig:
             # Prefix-caching implementation detail (doesn't affect compiled graph).
             "prefix_match_unit",
             "enable_mamba_shared_prefix_checkpoint",
+            "mamba_extra_tail_checkpoint_tokens",
+            "mamba_extra_tail_checkpoint_min_span",
+            "mamba_internal_snapshot",
+            "mamba_low_priority_snapshot_prompt_len",
+            "prefix_cache_policy",
+            "mamba_conversation_max_turns_mode",
+            "mamba_conversation_max_turns",
             "mamba_page_size_padded",
             "skip_page_size_padded",
             "user_specified_block_size",

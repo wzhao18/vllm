@@ -15,6 +15,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from tests.v1.core.test_prefix_caching import (
     _make_hybrid_kv_cache_config,
@@ -385,3 +386,94 @@ def test_disabled_by_default():
     request = make_request("r", PREFIX[:10000], hash_block_size, sha256)
     request.shared_prefix_boundary = 2000
     assert Scheduler._mamba_block_aligned_split(stub, request, 8192) == 1536
+
+
+# --------------------------------------------------------------------------
+# The extra pre-tail checkpoint and retention-interval checkpoints sit on the
+# Mamba block boundary
+
+
+def _tail_setup(*, extra_tail=0, grid=0):
+    block_size, hash_block_size = 512, 32
+    manager = _manager(block_size, hash_block_size, shared_prefix_checkpoint=False)
+    manager.coordinator.retention_interval = grid
+    stub = _stub(manager, block_size, hash_block_size)
+    stub.mamba_extra_tail_checkpoint_tokens = extra_tail
+    stub.cache_config.mamba_extra_tail_checkpoint_min_span = 0
+    return manager, stub, block_size, hash_block_size
+
+
+def test_extra_tail_checkpoint_on_the_block_boundary():
+    manager, stub, block_size, hash_block_size = _tail_setup(extra_tail=1024)
+    owner = make_request("owner", PREFIX[:3000], hash_block_size, sha256)
+    ends = _prefill(manager, stub, owner)
+    # Tail checkpoint 2944; 1024 before it floors to 1536.
+    point = 3 * block_size
+    assert owner.mamba_extra_checkpoint == point
+    assert point in ends
+    # A sibling sharing 1700 tokens: attention hits 3 full blocks, EAGLE drops
+    # one hash unit, so the boundary state is out of its reach.
+    hit = _sibling_hit(manager, 1700, [-2] * 600, hash_block_size)
+    assert hit < 3 * block_size - hash_block_size
+
+
+def test_retention_grid_on_the_block_boundary():
+    grid = 1024
+    manager, stub, block_size, hash_block_size = _tail_setup(grid=grid)
+    owner = make_request("owner", PREFIX[:3000], hash_block_size, sha256)
+    _prefill(manager, stub, owner)
+    # Shares 2100 tokens: attention covers 2048, resumes at most at 2016. On
+    # the boundary the 2048 state needs attention through 2560.
+    hit = _sibling_hit(manager, 2100, [-2] * 600, hash_block_size)
+    assert hit < 2 * grid - hash_block_size
+
+
+# The real nvfp4_k3_mla CTX geometry at --block-size 1152 (TP1, DL5): FP4 MLA
+# groups 6144 tokens per block, FP8 MLA / KDA 6912, hash 128.
+REAL_FP4, REAL_FP8, REAL_HASH = 6144, 6912, 128
+
+
+def test_real_mixed_geometry_chunks_align_to_the_mamba_block():
+    """Align mode ends chunks on the Mamba block (6912), not the 55296
+    scheduler block: a 16384-token budget chunk from 0 ends at 13824."""
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        MambaSpec,
+    )
+
+    init_none_hash(sha256)
+
+    def full(block):
+        return FullAttentionSpec(
+            block_size=block, num_kv_heads=1, head_size=1, dtype=torch.float32
+        )
+
+    config = KVCacheConfig(
+        num_blocks=2048,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["fp4"], full(REAL_FP4)),
+            KVCacheGroupSpec(["fp8"], full(REAL_FP8)),
+            KVCacheGroupSpec(
+                ["kda"],
+                MambaSpec(
+                    block_size=REAL_FP8,
+                    shapes=((1, 1),),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=config,
+        max_model_len=1 << 21,
+        enable_caching=True,
+        hash_block_size=REAL_HASH,
+        use_eagle=True,
+    )
+    stub = _stub(manager, REAL_FP8, REAL_HASH)
+    request = make_request("r", list(range(1, 100_000)), REAL_HASH, sha256)
+    assert Scheduler._mamba_block_aligned_split(stub, request, 16384) == 2 * REAL_FP8

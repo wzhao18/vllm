@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
 import torch
@@ -14,6 +15,7 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.kv_cache_interface import (
     MambaSpec,
     get_mamba_prefill_checkpoint_position,
+    get_mamba_prefill_snapshot_col,
     is_mamba_prefill_checkpoint_valid,
 )
 
@@ -27,6 +29,7 @@ def compute_mamba_prefill_checkpoints(
     drop_eagle_block: bool,
     cache_hit_alignment_tokens: int,
     num_hash_lookahead_tokens: int = 0,
+    first_chunk: list[bool] | None = None,
 ) -> tuple[list[int], list[int]]:
     """Per-row internal prefill checkpoint offsets and cache block columns.
 
@@ -35,6 +38,12 @@ def compute_mamba_prefill_checkpoints(
     block without writing it leaves the prefix cache serving uninitialized
     state.
 
+    ``first_chunk`` marks rows on their request's first scheduled chunk (the
+    worker received the request's whole block table this step). Only those
+    rows may use the first-chunk snapshot column
+    (CacheConfig.mamba_internal_snapshot): a running request's append-only
+    table can hold a stale block id there.
+
     Returns:
         ``(offsets, cols)``: the checkpoint's offset into each row's query and
         its block-table column. ``0`` and ``-1`` mean the row has none.
@@ -42,7 +51,7 @@ def compute_mamba_prefill_checkpoints(
     """
     offsets: list[int] = []
     cols: list[int] = []
-    for seq_len, query_len in zip(seq_lens, query_lens):
+    for i, (seq_len, query_len) in enumerate(zip(seq_lens, query_lens)):
         query_start = seq_len - query_len
         position = get_mamba_prefill_checkpoint_position(
             seq_len,
@@ -58,8 +67,19 @@ def compute_mamba_prefill_checkpoints(
             mamba_block_size=mamba_block_size,
             checkpoint_alignment=checkpoint_alignment,
         )
+        col = cdiv(seq_len, mamba_block_size) - 2 if valid else -1
+        if not valid and first_chunk is not None and first_chunk[i]:
+            col = get_mamba_prefill_snapshot_col(
+                query_start=query_start,
+                query_end=seq_len,
+                checkpoint_position=position,
+                hash_block_size=hash_block_size,
+                mamba_block_size=mamba_block_size,
+                checkpoint_alignment=checkpoint_alignment,
+            )
+            valid = col >= 0
         offsets.append(position - query_start if valid else 0)
-        cols.append(cdiv(seq_len, mamba_block_size) - 2 if valid else -1)
+        cols.append(col)
     return offsets, cols
 
 
@@ -114,7 +134,11 @@ class MambaPrefillCheckpointBuilder:
         self,
         m: CommonAttentionMetadata,
         request_rows: list[int],
+        first_chunk_rows: Sequence[bool] | None = None,
     ) -> MambaPrefillCheckpointMetadata | None:
+        """``first_chunk_rows``: per batch row, whether the row is its
+        request's first scheduled chunk (V2 runner, only consulted when the
+        spec declares ``prefill_snapshot``)."""
         if self.vllm_config.cache_config.mamba_cache_mode != "align":
             return None
         if self.kv_cache_spec.num_prefill_checkpoint_blocks == 0:
@@ -139,6 +163,11 @@ class MambaPrefillCheckpointBuilder:
             drop_eagle_block=self.drop_eagle_block,
             cache_hit_alignment_tokens=cache_hit_alignment_tokens,
             num_hash_lookahead_tokens=self.vllm_config.num_hash_lookahead_tokens,
+            first_chunk=(
+                [bool(first_chunk_rows[row]) for row in request_rows]
+                if self.kv_cache_spec.prefill_snapshot and first_chunk_rows is not None
+                else None
+            ),
         )
         if not any(checkpoint_offsets):
             return None

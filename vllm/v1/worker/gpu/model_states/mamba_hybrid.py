@@ -105,6 +105,12 @@ class MambaHybridModelState(DefaultModelState):
                 self.max_num_reqs, dtype=torch.int32, device=self.device
             )
             self._mamba_ctx: MambaSpecDecodeGPUContext | None = None
+            # CacheConfig.mamba_internal_snapshot: each request slot's computed
+            # tokens when it was added (-1: none). A batch row whose chunk starts
+            # there is its request's first scheduled chunk, the only kind whose
+            # block table the worker holds in full.
+            self._snapshot = self.cache_config.mamba_internal_snapshot
+            self._first_chunk_start = np.full(self.max_num_reqs, -1, dtype=np.int64)
             self._mamba_group_ids: list[int] = []
             self._mamba_spec: MambaSpec | None = None
             self._mamba_state_copy_funcs: MambaStateCopyFuncsByType | None = None
@@ -123,6 +129,7 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_state_idx_gpu[req_index].fill_(
                 (new_req_data.num_computed_tokens - 1) // mamba_block_size
             )
+            self._first_chunk_start[req_index] = new_req_data.num_computed_tokens
 
     def _get_mamba_group_info(
         self, kv_cache_config: KVCacheConfig
@@ -316,6 +323,19 @@ class MambaHybridModelState(DefaultModelState):
                 )
                 for group_idx, builder in aligned_index_builders:
                     builder.mamba_aligned_state_indices = all_group_indices[group_idx]
+            first_chunk = None
+            if self._snapshot and not for_capture:
+                n = input_batch.num_reqs
+                starts = np.asarray(seq_lens_cpu_upper_bound[:n]) - np.asarray(
+                    input_batch.num_scheduled_tokens[:n]
+                )
+                first_chunk = np.zeros(num_reqs, dtype=bool)
+                first_chunk[:n] = (
+                    self._first_chunk_start[input_batch.idx_mapping_np[:n]] == starts
+                )
+            for _, builder in aligned_index_builders:
+                if hasattr(builder, "mamba_snapshot_first_chunk"):
+                    builder.mamba_snapshot_first_chunk = first_chunk
 
         mamba_attn_metadata = MambaHybridAttnMetadata(
             is_prefilling=is_prefilling,

@@ -77,7 +77,9 @@ from vllm.config.cache import (
     KVOffloadingBackend,
     MambaCacheMode,
     MambaDType,
+    PrefixCachePolicy,
     PrefixCachingHashAlgo,
+    TurnRetireMode,
 )
 from vllm.config.device import Device
 from vllm.config.kernel import (
@@ -822,6 +824,21 @@ class EngineArgs:
     enable_mamba_shared_prefix_checkpoint: bool = (
         CacheConfig.enable_mamba_shared_prefix_checkpoint
     )
+    mamba_extra_tail_checkpoint_tokens: int = (
+        CacheConfig.mamba_extra_tail_checkpoint_tokens
+    )
+    mamba_extra_tail_checkpoint_min_span: int = (
+        CacheConfig.mamba_extra_tail_checkpoint_min_span
+    )
+    mamba_internal_snapshot: bool = CacheConfig.mamba_internal_snapshot
+    mamba_low_priority_snapshot_prompt_len: int = (
+        CacheConfig.mamba_low_priority_snapshot_prompt_len
+    )
+    prefix_cache_policy: PrefixCachePolicy = CacheConfig.prefix_cache_policy
+    mamba_conversation_max_turns_mode: TurnRetireMode | None = (
+        CacheConfig.mamba_conversation_max_turns_mode
+    )
+    mamba_conversation_max_turns: int = CacheConfig.mamba_conversation_max_turns
     replayssm_buffer_len: int = CacheConfig.replayssm_buffer_len
     use_replayssm: bool = CacheConfig.use_replayssm
 
@@ -1449,6 +1466,33 @@ class EngineArgs:
         cache_group.add_argument(
             "--enable-mamba-shared-prefix-checkpoint",
             **cache_kwargs["enable_mamba_shared_prefix_checkpoint"],
+        )
+        cache_group.add_argument(
+            "--mamba-extra-tail-checkpoint-tokens",
+            **cache_kwargs["mamba_extra_tail_checkpoint_tokens"],
+        )
+        cache_group.add_argument(
+            "--mamba-extra-tail-checkpoint-min-span",
+            **cache_kwargs["mamba_extra_tail_checkpoint_min_span"],
+        )
+        cache_group.add_argument(
+            "--mamba-internal-snapshot",
+            **cache_kwargs["mamba_internal_snapshot"],
+        )
+        cache_group.add_argument(
+            "--mamba-low-priority-snapshot-prompt-len",
+            **cache_kwargs["mamba_low_priority_snapshot_prompt_len"],
+        )
+        cache_group.add_argument(
+            "--prefix-cache-policy", **cache_kwargs["prefix_cache_policy"]
+        )
+        cache_group.add_argument(
+            "--mamba-conversation-max-turns-mode",
+            **cache_kwargs["mamba_conversation_max_turns_mode"],
+        )
+        cache_group.add_argument(
+            "--mamba-conversation-max-turns",
+            **cache_kwargs["mamba_conversation_max_turns"],
         )
         cache_group.add_argument(
             "--replayssm-buffer-len", **cache_kwargs["replayssm_buffer_len"]
@@ -2331,6 +2375,17 @@ class EngineArgs:
             enable_mamba_shared_prefix_checkpoint=(
                 self.enable_mamba_shared_prefix_checkpoint
             ),
+            mamba_extra_tail_checkpoint_tokens=self.mamba_extra_tail_checkpoint_tokens,
+            mamba_extra_tail_checkpoint_min_span=(
+                self.mamba_extra_tail_checkpoint_min_span
+            ),
+            mamba_internal_snapshot=self.mamba_internal_snapshot,
+            mamba_low_priority_snapshot_prompt_len=(
+                self.mamba_low_priority_snapshot_prompt_len
+            ),
+            prefix_cache_policy=self.prefix_cache_policy,
+            mamba_conversation_max_turns_mode=self.mamba_conversation_max_turns_mode,
+            mamba_conversation_max_turns=self.mamba_conversation_max_turns,
             replayssm_buffer_len=self.replayssm_buffer_len,
             use_replayssm=self.use_replayssm,
             kv_offloading_size=self.kv_offloading_size,

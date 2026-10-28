@@ -25,6 +25,8 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     MambaSpec,
+    get_mamba_extra_tail_checkpoint_position,
+    get_mamba_prefill_snapshot_col,
     is_mamba_prefill_checkpoint_valid,
 )
 from vllm.v1.request import Request
@@ -88,8 +90,10 @@ def test_mamba_prefill_checkpoint_valid(
 def _make_hybrid_kv_cache_manager(
     num_prefill_checkpoint_blocks: int = 0,
     num_hash_lookahead_tokens: int = 0,
+    retention_interval: int | None = None,
 ) -> KVCacheManager:
     config = KVCacheConfig(
+        prefix_cache_retention_interval=retention_interval,
         num_blocks=10000,
         kv_cache_tensors=[],
         kv_cache_groups=[
@@ -139,13 +143,26 @@ def _split(
     num_prefill_checkpoint_blocks: int = 0,
     max_num_scheduled_tokens: int = 16384,
     num_hash_lookahead_tokens: int = 0,
+    extra_tail_tokens: int = 0,
+    extra_tail_min_span: int = 0,
+    snapshot: bool = False,
+    first_chunk: bool = False,
 ) -> int:
     """Call the real `Scheduler._mamba_block_aligned_split` on a stub self."""
     if use_eagle_block_drop is None:
         use_eagle_block_drop = use_eagle
+    extra = (
+        {"mamba_extra_tail_checkpoint_tokens": extra_tail_tokens}
+        if extra_tail_tokens
+        else {}
+    )
     stub = SimpleNamespace(
+        **extra,
         block_size=MAMBA_BLOCK_SIZE,
-        cache_config=SimpleNamespace(block_size=MAMBA_BLOCK_SIZE),
+        cache_config=SimpleNamespace(
+            block_size=MAMBA_BLOCK_SIZE,
+            mamba_extra_tail_checkpoint_min_span=extra_tail_min_span,
+        ),
         use_eagle_block_drop=use_eagle_block_drop,
         num_hash_lookahead_tokens=num_hash_lookahead_tokens,
         max_num_scheduled_tokens=max_num_scheduled_tokens,
@@ -158,8 +175,11 @@ def _split(
         mamba_prefill_checkpoint_alignment=(
             16 if num_prefill_checkpoint_blocks > 0 else None
         ),
+        mamba_internal_snapshot=snapshot,
     )
-    return Scheduler._mamba_block_aligned_split(stub, request, num_new_tokens)
+    return Scheduler._mamba_block_aligned_split(
+        stub, request, num_new_tokens, first_chunk=first_chunk
+    )
 
 
 @pytest.mark.parametrize(
@@ -232,7 +252,10 @@ def test_disabling_eagle_block_drop_keeps_the_trailing_cache_boundary() -> None:
 
 
 def _run_chunked_prefill(
-    manager: KVCacheManager, request: Request, budgets: list[int], **split_kwargs
+    manager: KVCacheManager,
+    request: Request,
+    budgets: list[int],
+    **split_kwargs,
 ) -> dict[int, int]:
     """Prefill `request`, one step per entry in `budgets`.
 
@@ -438,3 +461,192 @@ def test_unaligned_resume_never_runs_past_its_block(
             f"intermediate chunk end {end} is neither block-aligned nor the "
             f"partial-tail stop ({tail_stop})"
         )
+
+
+@pytest.mark.parametrize(
+    ("prompt_len", "resume", "offset", "min_span", "eagle", "expected"),
+    [
+        (9000, 0, 0, 0, True, 0),
+        (9000, 0, 1024, 0, True, 6400),
+        (9000, 0, 1024, 0, False, 6400),
+        (9000, 0, 1024, 9000, True, 0),
+        (9000, 6400, 1024, 0, True, 0),
+        (9000, 4800, 1024, 0, True, 6400),
+        (3602, 0, 1024, 0, True, 1600),
+    ],
+)
+def test_extra_tail_checkpoint_position(
+    prompt_len: int, resume: int, offset: int, min_span: int, eagle: bool, expected
+) -> None:
+    """Block-floored `offset` before the prompt-tail checkpoint, past the resume
+    point, only for prefills computing at least `min_span` tokens."""
+    assert (
+        get_mamba_extra_tail_checkpoint_position(
+            prompt_len,
+            resume,
+            ATTN_BLOCK_SIZE,
+            MAMBA_BLOCK_SIZE,
+            eagle,
+            offset,
+            min_span,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize("partial_hit", [False, True])
+@pytest.mark.parametrize("num_prefill_checkpoint_blocks", [0, 1])
+@pytest.mark.parametrize("use_eagle", [False, True])
+@pytest.mark.parametrize("resume_at", [0, 331, 1600, 2531, 4800])
+@pytest.mark.parametrize("budget", [512, 1700, 4000, 9000])
+def test_extra_tail_checkpoint_off_leaves_split_unchanged(
+    partial_hit: bool,
+    num_prefill_checkpoint_blocks: int,
+    use_eagle: bool,
+    resume_at: int,
+    budget: int,
+) -> None:
+    """With the offset at 0 the split and the request are what they were."""
+    kwargs = dict(
+        use_eagle=use_eagle,
+        partial_hit=partial_hit,
+        num_prefill_checkpoint_blocks=num_prefill_checkpoint_blocks,
+    )
+    (request,) = create_requests(1, num_tokens=9000, block_size=ATTN_BLOCK_SIZE)
+    request.num_computed_tokens = resume_at
+    num_new = min(budget, 9000 - resume_at)
+    base = _split(request, num_new, **kwargs)
+    assert _split(request, num_new, extra_tail_min_span=1, **kwargs) == base
+    assert request.mamba_extra_checkpoint is None
+
+
+@pytest.mark.parametrize("num_prefill_checkpoint_blocks", [0, 1])
+def test_extra_tail_checkpoint_ends_a_chunk(num_prefill_checkpoint_blocks: int) -> None:
+    """A full-prompt chunk stops at the extra checkpoint; the rest finishes in
+    one more chunk (still eligible for the internal tail checkpoint)."""
+    kwargs = dict(
+        num_prefill_checkpoint_blocks=num_prefill_checkpoint_blocks,
+        extra_tail_tokens=1024,
+    )
+    (request,) = create_requests(1, num_tokens=9000, block_size=ATTN_BLOCK_SIZE)
+    assert _split(request, 9000, **kwargs) == 6400
+    assert request.mamba_extra_checkpoint == 6400
+    request.num_computed_tokens = 6400
+    assert _split(request, 2600, **kwargs) == 2600
+
+
+def test_extra_tail_checkpoint_respects_min_span() -> None:
+    (request,) = create_requests(1, num_tokens=9000, block_size=ATTN_BLOCK_SIZE)
+    request.num_computed_tokens = 4800
+    kwargs = dict(
+        num_prefill_checkpoint_blocks=1,
+        extra_tail_tokens=1024,
+        extra_tail_min_span=8192,
+    )
+    assert _split(request, 4200, **kwargs) == 4200
+    assert request.mamba_extra_checkpoint == 0
+
+
+@pytest.mark.parametrize("extra_tail_tokens", [0, 3200])
+def test_extra_tail_checkpoint_state_is_retained_and_exact(
+    extra_tail_tokens: int,
+) -> None:
+    """Under semantic-only retention the extra checkpoint (4800, below the
+    replay boundary at 6400) stays cached after its slot is retired, and every
+    cached state is the one its hash claims."""
+    manager = _make_hybrid_kv_cache_manager(retention_interval=0)
+    (request,) = create_requests(1, num_tokens=9000, block_size=ATTN_BLOCK_SIZE)
+    state_at = _run_chunked_prefill(
+        manager, request, [9000], extra_tail_tokens=extra_tail_tokens
+    )
+    assert request.num_computed_tokens == 9000
+    pool = manager.coordinator.single_type_managers[MAMBA_GROUP_ID].block_pool
+    cached = {
+        block.block_id: block.block_hash_num_tokens
+        for block in pool.blocks
+        if block.block_hash is not None and block.block_id in state_at
+    }
+    assert all(state_at[block_id] == pos for block_id, pos in cached.items())
+    assert (4800 in cached.values()) is bool(extra_tail_tokens)
+
+
+@pytest.mark.parametrize(
+    ("query_start", "query_end", "checkpoint_position", "expected"),
+    [
+        # Inside one block (the initial state's): the snapshot sits one below.
+        (1984, 2600, 2560, 0),
+        (3584, 4400, 4352, 1),
+        # Crossing one boundary: the regular column would alias the initial one.
+        (1984, 3602, 3584, 0),
+        # Block-aligned start, crossing one boundary.
+        (3200, 4700, 4672, 0),
+        # Crossing two boundaries: the regular internal checkpoint applies.
+        (1984, 5000, 4976, -1),
+        # No column below the initial state.
+        (0, 1500, 1488, -1),
+        (1584, 2000, 1984, -1),
+        # Hash-misaligned start, checkpoint at or before the start, misalignment.
+        (1990, 2600, 2560, -1),
+        (1984, 2000, 1984, -1),
+        (1984, 2600, 2568, -1),
+    ],
+)
+def test_mamba_prefill_snapshot_col(
+    query_start: int, query_end: int, checkpoint_position: int, expected: int
+) -> None:
+    assert (
+        get_mamba_prefill_snapshot_col(
+            query_start=query_start,
+            query_end=query_end,
+            checkpoint_position=checkpoint_position,
+            hash_block_size=ATTN_BLOCK_SIZE,
+            mamba_block_size=MAMBA_BLOCK_SIZE,
+            checkpoint_alignment=16,
+        )
+        == expected
+    )
+    assert (
+        get_mamba_prefill_snapshot_col(
+            query_start,
+            query_end,
+            checkpoint_position,
+            ATTN_BLOCK_SIZE,
+            MAMBA_BLOCK_SIZE,
+            None,
+        )
+        == -1
+    )
+
+
+@pytest.mark.parametrize("resume_at", [1984, 2400, 3200, 4000])
+@pytest.mark.parametrize("new_tokens", [300, 900, 1500])
+@pytest.mark.parametrize("use_eagle", [False, True])
+def test_first_chunk_snapshot_runs_a_small_turn_in_one_step(
+    resume_at: int, new_tokens: int, use_eagle: bool
+) -> None:
+    """With the snapshot, a small turn's first chunk covers the whole remainder;
+    a running request (not its first chunk) and the flag off keep today's
+    split."""
+    prompt_len = resume_at + new_tokens
+    (request,) = create_requests(1, num_tokens=prompt_len, block_size=ATTN_BLOCK_SIZE)
+    request.num_computed_tokens = resume_at
+    kwargs = dict(
+        use_eagle=use_eagle, partial_hit=True, num_prefill_checkpoint_blocks=1
+    )
+    base = _split(request, new_tokens, **kwargs)
+    assert _split(request, new_tokens, snapshot=True, **kwargs) == base
+    assert _split(request, new_tokens, first_chunk=True, **kwargs) == base
+    snap = _split(request, new_tokens, snapshot=True, first_chunk=True, **kwargs)
+    checkpoint = (prompt_len if use_eagle else prompt_len - 1) // 16 * 16 - (
+        16 if use_eagle else 0
+    )
+    end = resume_at + new_tokens
+    regular = is_mamba_prefill_checkpoint_valid(
+        resume_at, end, checkpoint, ATTN_BLOCK_SIZE, MAMBA_BLOCK_SIZE, 16
+    )
+    col = get_mamba_prefill_snapshot_col(
+        resume_at, end, checkpoint, ATTN_BLOCK_SIZE, MAMBA_BLOCK_SIZE, 16
+    )
+    assert snap == (new_tokens if regular or col >= 0 else base)
+    if col >= 0:
+        assert base < new_tokens

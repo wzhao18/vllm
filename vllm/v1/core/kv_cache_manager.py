@@ -4,17 +4,23 @@
 import itertools
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal, overload
+from typing import Literal, cast, overload
 
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
+from vllm.v1.core.conversation_state import ConversationStateTracker
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
     get_kv_cache_coordinator,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy, trim_null_head
+from vllm.v1.core.kv_cache_utils import (
+    BlockHashWithGroupId,
+    KVCacheBlock,
+    KVCacheBlockCopy,
+    trim_null_head,
+)
 from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -29,6 +35,10 @@ from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
+
+# CacheConfig.prefix_cache_policy "v2": the low-priority short-prompt
+# threshold when none is set (TensorRT-LLM's value).
+V2_LOW_PRIORITY_SNAPSHOT_PROMPT_LEN = 16384
 
 
 @dataclass
@@ -147,6 +157,10 @@ class KVCacheManager:
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
         enable_mamba_shared_prefix_checkpoint: bool = False,
+        mamba_low_priority_snapshot_prompt_len: int = 0,
+        mamba_conversation_max_turns: int = 0,
+        prefix_cache_policy: str = "legacy",
+        mamba_conversation_max_turns_mode: str | None = None,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -195,6 +209,50 @@ class KVCacheManager:
             for manager in self.coordinator.single_type_managers:
                 if isinstance(manager, MambaManager):
                     manager.shared_prefix_checkpoint = True
+        assert prefix_cache_policy in ("legacy", "v2"), prefix_cache_policy
+        self.prefix_cache_policy = prefix_cache_policy
+        if prefix_cache_policy == "v2":
+            # One eviction order: superseded CoW tail sources and diverged
+            # generated chains go evict-first whatever the pressure; a turn's
+            # superseded prompt checkpoint stays in plain LRU; short prompts'
+            # states are low priority (16384 unless set).
+            self.coordinator.block_pool.demotion_gate = False
+            for manager in self.coordinator.single_type_managers:
+                if isinstance(manager, MambaManager):
+                    manager.demote_superseded_checkpoints = False
+            if not mamba_low_priority_snapshot_prompt_len:
+                mamba_low_priority_snapshot_prompt_len = (
+                    V2_LOW_PRIORITY_SNAPSHOT_PROMPT_LEN
+                )
+        if mamba_conversation_max_turns_mode is None:
+            mamba_conversation_max_turns_mode = (
+                "demote" if prefix_cache_policy == "v2" else "drop"
+            )
+        assert mamba_conversation_max_turns_mode in ("drop", "demote")
+        for manager in self.coordinator.single_type_managers:
+            manager.turn_drop_mode = mamba_conversation_max_turns_mode
+        if mamba_low_priority_snapshot_prompt_len and enable_caching:
+            for manager in self.coordinator.single_type_managers:
+                if isinstance(manager, MambaManager):
+                    manager.low_priority_prompt_len = (
+                        mamba_low_priority_snapshot_prompt_len
+                    )
+        self.mamba_state_managers = [
+            manager
+            for manager in self.coordinator.single_type_managers
+            if isinstance(manager, MambaManager)
+        ]
+        self.conversation_tracker: ConversationStateTracker | None = None
+        if (
+            mamba_conversation_max_turns
+            and enable_caching
+            and self.mamba_state_managers
+        ):
+            self.conversation_tracker = ConversationStateTracker(
+                mamba_conversation_max_turns
+            )
+            for manager in self.mamba_state_managers:
+                manager.record_state_hashes = True
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.retained_hit_group_ids = tuple(
@@ -526,6 +584,17 @@ class KVCacheManager:
         # Matches the scheduler's own prefill boundary: `num_tokens - 1`
         # extends it to resumed requests replaying their output tokens.
         prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+        # CacheConfig.mamba_internal_snapshot: a waiting / preempted request is
+        # scheduled as a new request, so the worker receives its whole block
+        # table this step; only then may a Mamba group place a first-chunk
+        # snapshot block below the initial state.
+        first_chunk = request.status in (
+            RequestStatus.WAITING,
+            RequestStatus.PREEMPTED,
+        )
+        for manager in self.coordinator.single_type_managers:
+            if isinstance(manager, MambaManager) and manager.prefill_snapshot:
+                manager.set_first_chunk(request.request_id, first_chunk)
 
         if full_sequence_must_fit:
             # First check and fail if the full request sequence won't fit.
@@ -625,6 +694,31 @@ class KVCacheManager:
 
         return self.create_kv_cache_blocks(new_blocks)
 
+    def prepare_conversation_turn(self, request: Request) -> None:
+        """Track ``request`` as its conversation's current turn
+        (``CacheConfig.mamba_conversation_max_turns``)."""
+        if self.conversation_tracker is not None:
+            self.conversation_tracker.prepare(request)
+
+    def finish_conversation_turn(self, request: Request) -> int:
+        """Record a finished request's Mamba states as a turn of its
+        conversation and drop the states of turns past the retained ones.
+        Returns the number of blocks dropped or marked."""
+        if self.conversation_tracker is None:
+            return 0
+        states: set[BlockHashWithGroupId] = set()
+        for manager in self.mamba_state_managers:
+            states |= manager.take_state_hashes(request.request_id)
+        completed = request.num_computed_tokens >= request.num_prompt_tokens
+        dropped = cast(
+            set[BlockHashWithGroupId],
+            self.conversation_tracker.finish(request, set(states), completed),
+        )
+        num_dropped = 0
+        for manager in self.mamba_state_managers:
+            num_dropped += manager.drop_states(dropped)
+        return num_dropped
+
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.
         We free the blocks in reverse order so that the tail blocks are evicted
@@ -691,6 +785,9 @@ class KVCacheManager:
         """
         if not self.coordinator.reset_prefix_cache():
             return False
+        if self.conversation_tracker is not None:
+            # The recorded states no longer exist.
+            self.conversation_tracker.clear()
         if self.log_stats:
             assert self.prefix_cache_stats is not None
             self.prefix_cache_stats.reset = True

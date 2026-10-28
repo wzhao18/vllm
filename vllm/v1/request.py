@@ -204,6 +204,10 @@ class Request:
         # in the (sparse) prefix cache; 0 means none. Set at admission for
         # hybrid/Mamba models when a shared prefix is detected (Marconi-style).
         self.shared_prefix_boundary = 0
+        # Extra Mamba "align" checkpoint position before the prompt tail
+        # (``CacheConfig.mamba_extra_tail_checkpoint_tokens``): None until the
+        # scheduler decides at the first prefill chunk, then 0 for none.
+        self.mamba_extra_checkpoint: int | None = None
         # DeepSeek-V4.1 only: SWA bounded replay. The request holds no
         # sliding-window KV below this position; 0 when nothing replays.
         self.replay_start = 0
@@ -286,6 +290,11 @@ class Request:
         """Compute block hashes for any new full blocks and append them."""
         if self._block_hasher is not None:
             self.block_hashes.extend(self._block_hasher(self))
+
+    def is_mamba_junction(self, num_tokens: int) -> bool:
+        """Whether a Mamba state at ``num_tokens`` is the shared-prefix
+        junction checkpoint."""
+        return num_tokens > 0 and num_tokens == self.shared_prefix_boundary
 
     @property
     def use_structured_output(self) -> bool:

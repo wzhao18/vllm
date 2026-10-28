@@ -1104,6 +1104,9 @@ class MambaSpec(KVCacheSpec):
     num_speculative_blocks: int = 0
     num_prefill_checkpoint_blocks: int = 0
     prefill_checkpoint_alignment: int | None = None
+    # The backend exports a first-chunk prefill snapshot at the column from
+    # ``get_mamba_prefill_snapshot_col`` (CacheConfig.mamba_internal_snapshot).
+    prefill_snapshot: bool = False
     num_heads: int = 1
     tokens_per_state: int = -1
     # False: the state is sharded across TP ranks (e.g. GDN). True: every TP
@@ -1190,6 +1193,35 @@ def get_mamba_prefill_checkpoint_position(
     return max(checkpoint_position, 0)
 
 
+def get_mamba_extra_tail_checkpoint_position(
+    num_prompt_tokens: int,
+    resume_tokens: int,
+    hash_block_size: int,
+    mamba_block_size: int,
+    drop_eagle_block: bool,
+    offset_tokens: int,
+    min_span_tokens: int,
+) -> int:
+    """Return an extra Mamba checkpoint ``offset_tokens`` before the prompt
+    tail, or 0 for none.
+
+    The position is floored to ``mamba_block_size`` so its state is an
+    ordinary committed "align" snapshot (the slot holds the state after exactly
+    that many tokens). It applies only to prefills that compute at least
+    ``min_span_tokens`` past ``resume_tokens`` (their prefix-cache hit) and only
+    when it lies past that hit.
+    """
+    if offset_tokens <= 0:
+        return 0
+    tail = get_mamba_prefill_checkpoint_position(
+        num_prompt_tokens, hash_block_size, drop_eagle_block
+    )
+    if tail - resume_tokens < min_span_tokens:
+        return 0
+    position = (tail - offset_tokens) // mamba_block_size * mamba_block_size
+    return position if position > resume_tokens else 0
+
+
 def is_mamba_prefill_checkpoint_valid(
     query_start: int,
     query_end: int,
@@ -1212,6 +1244,49 @@ def is_mamba_prefill_checkpoint_valid(
         and query_start < checkpoint_position < query_end
         and (checkpoint_position - query_start) % checkpoint_alignment == 0
     )
+
+
+def get_mamba_prefill_snapshot_col(
+    query_start: int,
+    query_end: int,
+    checkpoint_position: int,
+    hash_block_size: int,
+    mamba_block_size: int,
+    checkpoint_alignment: int | None,
+) -> int:
+    """Block-table column of a request's first-chunk prefill snapshot, or -1.
+
+    Extends ``is_mamba_prefill_checkpoint_valid`` to a query that crosses at
+    most one mamba block boundary (CacheConfig.mamba_internal_snapshot). There
+    the regular checkpoint column, ``cdiv(query_end, mamba_block_size) - 2``,
+    aliases or precedes the initial-state column, so the snapshot goes one
+    column below the initial state instead. On a request's first scheduled
+    chunk every column below the initial state is a null placeholder in both
+    the scheduler's and the worker's block table, so the KV cache manager can
+    place a fresh block there. Running requests must never use this column:
+    their worker block table is append-only and may hold a stale id there.
+    """
+    if checkpoint_alignment is None:
+        return -1
+    if is_mamba_prefill_checkpoint_valid(
+        query_start=query_start,
+        query_end=query_end,
+        checkpoint_position=checkpoint_position,
+        hash_block_size=hash_block_size,
+        mamba_block_size=mamba_block_size,
+        checkpoint_alignment=checkpoint_alignment,
+    ):
+        return -1
+    initial_state_col = (query_start - 1) // mamba_block_size
+    if (
+        query_start % hash_block_size == 0
+        and initial_state_col >= 1
+        and query_start + hash_block_size <= checkpoint_position
+        and query_start < checkpoint_position < query_end
+        and (checkpoint_position - query_start) % checkpoint_alignment == 0
+    ):
+        return initial_state_col - 1
+    return -1
 
 
 @dataclass(frozen=True)

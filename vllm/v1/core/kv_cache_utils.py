@@ -469,6 +469,22 @@ class FreeKVCacheBlockQueue:
 
         self.num_free_blocks += len(blocks)
 
+    def insert_n_after(self, anchor: KVCacheBlock, blocks: list[KVCacheBlock]) -> None:
+        """Insert blocks, in order, right after ``anchor``: the fake head or a
+        block in the free list."""
+        if not blocks:
+            return
+        after = anchor.next_free_block
+        assert after is not None, "anchor must be the fake head or a free block"
+        prev_block = anchor
+        for block in blocks:
+            block.prev_free_block = prev_block
+            prev_block.next_free_block = block
+            prev_block = block
+        prev_block.next_free_block = after
+        after.prev_free_block = prev_block
+        self.num_free_blocks += len(blocks)
+
     def append_n(self, blocks: list[KVCacheBlock]) -> None:
         """Put a list of blocks back into the free list
 

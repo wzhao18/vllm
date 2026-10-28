@@ -921,10 +921,18 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         spec = super().get_kv_cache_spec(vllm_config)
         assert isinstance(spec, MambaSpec)
         alignment = kda_prefill_checkpoint_alignment(self.kda_prefill_backend)
+        cache_config = vllm_config.cache_config
         return replace(
             spec,
             num_prefill_checkpoint_blocks=int(alignment is not None),
             prefill_checkpoint_alignment=alignment,
+            # The first-chunk mask comes from the V2 runner's model state.
+            prefill_snapshot=(
+                alignment is not None
+                and cache_config.mamba_internal_snapshot
+                and cache_config.mamba_cache_mode == "align"
+                and vllm_config.use_v2_model_runner
+            ),
         )
 
     def forward(

@@ -59,7 +59,9 @@ from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutp
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     MambaSpec,
+    get_mamba_extra_tail_checkpoint_position,
     get_mamba_prefill_checkpoint_position,
+    get_mamba_prefill_snapshot_col,
     is_mamba_prefill_checkpoint_valid,
 )
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
@@ -387,6 +389,16 @@ class Scheduler(SchedulerInterface):
             enable_mamba_shared_prefix_checkpoint=(
                 self.cache_config.enable_mamba_shared_prefix_checkpoint
             ),
+            mamba_low_priority_snapshot_prompt_len=(
+                self.cache_config.mamba_low_priority_snapshot_prompt_len
+            ),
+            mamba_conversation_max_turns=(
+                self.cache_config.mamba_conversation_max_turns
+            ),
+            prefix_cache_policy=self.cache_config.prefix_cache_policy,
+            mamba_conversation_max_turns_mode=(
+                self.cache_config.mamba_conversation_max_turns_mode
+            ),
         )
         # Mamba managers already account for their speculative state blocks.
         num_spec_decode_tokens = (
@@ -467,6 +479,30 @@ class Scheduler(SchedulerInterface):
             or group.kv_cache_spec.num_prefill_checkpoint_blocks > 0
             for group in kv_cache_config.kv_cache_groups
         )
+        # CacheConfig.mamba_internal_snapshot: a request's first chunk may also
+        # export its prompt checkpoint when it crosses at most one mamba block
+        # boundary, into a fresh block below its initial state. Every mamba
+        # group's backend must declare the snapshot column.
+        self.mamba_internal_snapshot = (
+            self.cache_config.mamba_internal_snapshot
+            and self.has_mamba_layers
+            and self.cache_config.mamba_cache_mode == "align"
+            and self.mamba_has_prefill_checkpoint_blocks
+            and all(
+                not isinstance(group.kv_cache_spec, MambaSpec)
+                or group.kv_cache_spec.prefill_snapshot
+                for group in kv_cache_config.kv_cache_groups
+            )
+        )
+        if (
+            self.cache_config.mamba_internal_snapshot
+            and not self.mamba_internal_snapshot
+        ):
+            logger.warning_once(
+                "mamba_internal_snapshot is ignored: it needs Mamba prefix caching "
+                "in align mode, the V2 model runner and a backend that declares the "
+                "prefill snapshot (FlashKDA)."
+            )
         # Fine-grained hits reuse the prompt's hash-aligned Mamba checkpoint.
         # Split there only if the backend cannot save it within the final chunk.
         self.mamba_partial_cache_hit = (
@@ -481,6 +517,15 @@ class Scheduler(SchedulerInterface):
         self.mamba_shared_prefix_checkpoint = (
             self.mamba_partial_cache_hit
             and self.kv_cache_manager.mamba_shared_prefix_checkpoint
+        )
+        # Opt-in: also end a chunk at a block-aligned checkpoint shortly before
+        # the prompt tail (0 = off), for requests that later diverge a little
+        # before this prompt's end.
+        self.mamba_extra_tail_checkpoint_tokens = (
+            self.cache_config.mamba_extra_tail_checkpoint_tokens
+            if self.need_mamba_block_aligned_split
+            and self.cache_config.enable_prefix_caching
+            else 0
         )
 
         # Counts of non-empty steps scheduled / processed. update_from_output
@@ -569,8 +614,13 @@ class Scheduler(SchedulerInterface):
         num_new_tokens: int,
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
+        first_chunk: bool = False,
     ) -> int:
         """Clip a prefill chunk so it ends where Mamba state must be cached.
+
+        ``first_chunk``: the request is scheduled from the waiting queue, so
+        the worker receives its whole block table this step (the only case the
+        first-chunk snapshot may serve, CacheConfig.mamba_internal_snapshot).
 
         In "align" cache mode reusable SSM states are materialized at block
         boundaries, plus mandatory early stops (the prompt's partial-tail hash
@@ -604,6 +654,26 @@ class Scheduler(SchedulerInterface):
         )
 
         end = start + num_new_tokens
+        extra_tail_tokens = getattr(self, "mamba_extra_tail_checkpoint_tokens", 0)
+        if extra_tail_tokens:
+            if request.mamba_extra_checkpoint is None:
+                # Decided once, at the first prefill chunk, from its resume point.
+                request.mamba_extra_checkpoint = (
+                    get_mamba_extra_tail_checkpoint_position(
+                        request.num_prompt_tokens,
+                        start,
+                        self.hash_block_size,
+                        block_size,
+                        self.use_eagle_block_drop,
+                        extra_tail_tokens,
+                        self.cache_config.mamba_extra_tail_checkpoint_min_span,
+                    )
+                )
+            if start < request.mamba_extra_checkpoint < end:
+                # Never run past the extra checkpoint. The chunk is then not the
+                # prompt's last, so the rules below treat it as an intermediate
+                # chunk (block-aligned end, no internal tail checkpoint).
+                end = request.mamba_extra_checkpoint
         checkpoint_position = get_mamba_prefill_checkpoint_position(
             prefill_end,
             ckpt_block_size,
@@ -622,6 +692,25 @@ class Scheduler(SchedulerInterface):
                 checkpoint_alignment=self.mamba_prefill_checkpoint_alignment,
             )
         )
+        if (
+            not use_internal_checkpoint
+            and first_chunk
+            and getattr(self, "mamba_internal_snapshot", False)
+            and end >= prefill_end
+        ):
+            # A small turn: the chunk crosses at most one block boundary, so the
+            # checkpoint goes to the snapshot column below the initial state.
+            use_internal_checkpoint = (
+                get_mamba_prefill_snapshot_col(
+                    query_start=start,
+                    query_end=end,
+                    checkpoint_position=checkpoint_position,
+                    hash_block_size=self.hash_block_size,
+                    mamba_block_size=block_size,
+                    checkpoint_alignment=self.mamba_prefill_checkpoint_alignment,
+                )
+                >= 0
+            )
         if use_internal_checkpoint:
             last_cache_position = 0
         # Invariant: slot p holds the state after exactly (p + 1) * block_size
@@ -1403,6 +1492,13 @@ class Scheduler(SchedulerInterface):
                             num_new_tokens,
                             num_new_local_computed_tokens,
                             num_external_computed_tokens,
+                            # Only the snapshot reads it; flag off, the call is
+                            # unchanged.
+                            **(
+                                {"first_chunk": True}
+                                if self.mamba_internal_snapshot
+                                else {}
+                            ),
                         )
                         if num_new_tokens == 0:
                             break
@@ -3010,6 +3106,7 @@ class Scheduler(SchedulerInterface):
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
+            self.kv_cache_manager.prepare_conversation_turn(request)
             if self.spec_decode_metrics_level != "none":
                 request.spec_decode_metrics = RequestSpecDecodeMetrics.new(
                     self.num_spec_tokens
@@ -3099,6 +3196,7 @@ class Scheduler(SchedulerInterface):
         if self.aux_output_connector is not None:
             self.aux_output_connector.request_finished(request)
         self._inflight_prefills.discard(request)
+        self.kv_cache_manager.finish_conversation_turn(request)
         self._set_kv_fetch_stage(request, None)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 

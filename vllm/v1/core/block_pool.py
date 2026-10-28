@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Callable, Iterable, Sequence
+import time
+from collections import OrderedDict
+from collections.abc import Callable, Container, Iterable, Sequence
 from typing import Any
 
 from vllm.distributed.kv_events import (
@@ -198,6 +200,24 @@ class BlockPool:
         # Callbacks for blocks released with ``unpin_blocks`` whose contents
         # are still being read until the pool reuses them.
         self._reuse_watchers: dict[int, Callable[[KVCacheBlock], None]] = {}
+        # Referenced cached blocks marked stale by ``demote``: they go to the
+        # evict-first end when their last reference is freed.
+        self._demote_on_free: set[int] = set()
+        # Referenced cached blocks marked by ``mark_low_priority``: when their
+        # last reference is freed they go behind the uncached free blocks and
+        # ahead of every other cached block, whatever the cache pressure.
+        self._low_priority_on_free: set[int] = set()
+        # Referenced cached blocks marked by ``evict_cached``: they leave the
+        # prefix cache when their last reference is freed.
+        self._evict_on_free: set[int] = set()
+        # ``CacheConfig.prefix_cache_policy``: False under "v2", where demoted
+        # blocks always go evict-first (no cache-pressure horizon).
+        self.demotion_gate = True
+        # The cached blocks in the LRU part of the free queue, oldest first,
+        # with when each joined it: locates the LRU head and its age, which
+        # place and gate demotion.
+        self._clock: Callable[[], float] = time.monotonic
+        self._lru_since: OrderedDict[int, float] = OrderedDict()
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -702,6 +722,10 @@ class BlockPool:
         for block_hash in self._remove_cached_block_hashes(src_block):
             # `num_tokens` only applies to the first (primary) insertion.
             self._insert_block_hash(block_hash, dst_block, num_tokens=num_tokens)
+        if src_block.block_id in self._low_priority_on_free:
+            # The eviction priority belongs to the cached content.
+            self._low_priority_on_free.discard(src_block.block_id)
+            self._low_priority_on_free.add(dst_block.block_id)
 
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
@@ -722,6 +746,20 @@ class BlockPool:
 
         if self._reuse_watchers:
             self._notify_reuse(ret)
+        if self._demote_on_free:
+            # A mark from a block's previous life (e.g. released by
+            # unpin_blocks) must not follow it into its next one.
+            for block in ret:
+                self._demote_on_free.discard(block.block_id)
+        if self._low_priority_on_free:
+            for block in ret:
+                self._low_priority_on_free.discard(block.block_id)
+        if self._evict_on_free:
+            for block in ret:
+                self._evict_on_free.discard(block.block_id)
+        if self._lru_since:
+            for block in ret:
+                self._lru_since.pop(block.block_id, None)
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
@@ -764,6 +802,11 @@ class BlockPool:
             self._reuse_watchers[block.block_id] = on_reuse
             if block.ref_cnt == 0:
                 released.append(block)
+        if self.enable_caching:
+            now = self._clock()
+            for block in released:
+                if block.block_hash is not None:
+                    self._lru_since[block.block_id] = now
         self.free_block_queue.append_n(released)
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
@@ -789,6 +832,170 @@ class BlockPool:
         self._emit_block_removed_events(evicted_hashes)
         return True
 
+    def demote(self, blocks: Iterable[KVCacheBlock]) -> None:
+        """Mark cached blocks as stale: evict them before other cached blocks.
+
+        Only the eviction order changes. A demoted block keeps its hashes and can
+        still be hit until the pool reuses it, and a hit (``touch``) cancels the
+        demotion. A free block moves to the front of the free queue now; a
+        referenced one goes there when its last reference is freed.
+        """
+        if not self.enable_caching:
+            return
+        to_front: list[KVCacheBlock] = []
+        seen: set[int] = set()
+        for block in blocks:
+            if block.is_null or block.block_hash is None:
+                continue
+            if block.pool is not None and block.pool is not self:
+                continue
+            if block.block_id in seen:
+                continue
+            seen.add(block.block_id)
+            if block.ref_cnt > 0:
+                self._demote_on_free.add(block.block_id)
+            elif block.prev_free_block is not None:
+                to_front.append(block)
+        if not to_front:
+            return
+        if self._demotion_anchor() is None:
+            return  # no pressure: LRU keeps them
+        for block in to_front:
+            self._lru_since.pop(block.block_id, None)
+            self.free_block_queue.remove(block)
+        # Locate the anchor only after unlinking: the most recently demoted
+        # block sits right before the LRU head, so demoting it again (e.g. two
+        # requests that resumed from the same checkpoint) must not use it as
+        # its own anchor.
+        anchor = self._demotion_anchor(gate=False)
+        assert anchor is not None
+        self.free_block_queue.insert_n_after(anchor, to_front)
+
+    # Pressure gate. Demotion applies only while the oldest evictable cached
+    # block joined the LRU less than this many seconds ago, i.e. while the
+    # cache cannot hold that much history. With more history the oldest
+    # blocks are cheaper to lose than a recently stale one a sibling may still
+    # hit, so LRU order is kept.
+    _DEMOTE_HORIZON_S = 300.0
+
+    def _demotion_anchor(self, gate: bool = True) -> KVCacheBlock | None:
+        """The block demoted blocks go right after: the one before the LRU
+        head (the last uncached free block, or the fake head), so they are
+        evicted after the uncached blocks and before every LRU block. None
+        when there is no pressure (only when ``gate``)."""
+        while self._lru_since:
+            head_id, since = next(iter(self._lru_since.items()))
+            head = self.blocks[head_id]
+            if head.prev_free_block is None:  # left the queue unrecorded
+                del self._lru_since[head_id]
+                continue
+            if (
+                gate
+                and self.demotion_gate
+                and self._clock() - since > self._DEMOTE_HORIZON_S
+            ):
+                return None  # the cache still holds a full horizon
+            return head.prev_free_block
+        # No LRU blocks: behind every uncached free block.
+        return self.free_block_queue.fake_free_list_tail.prev_free_block
+
+    def evict_cached(
+        self,
+        blocks: Iterable[KVCacheBlock],
+        exclude_block_ids: Container[int] = (),
+    ) -> int:
+        """Drop cached blocks from the prefix cache.
+
+        A free block loses its hashes now and moves to the evict-first end of
+        the free queue; a referenced one when its last reference is freed (a
+        later hit does not cancel that). Blocks in ``exclude_block_ids`` (e.g.
+        a pending connector hand-off) and blocks with a reuse watcher (their
+        contents are still being read) are left alone. Returns the number of
+        blocks evicted or marked.
+        """
+        if not self.enable_caching:
+            return 0
+        to_front: list[KVCacheBlock] = []
+        seen: set[int] = set()
+        count = 0
+        for block in blocks:
+            block_id = block.block_id
+            if (
+                block.is_null
+                or block.block_hash is None
+                or block_id in seen
+                or block_id in exclude_block_ids
+                or block_id in self._reuse_watchers
+                or (block.pool is not None and block.pool is not self)
+            ):
+                continue
+            seen.add(block_id)
+            count += 1
+            if block.ref_cnt > 0:
+                self._evict_on_free.add(block_id)
+                continue
+            self._forget_eviction_marks(block)
+            self._maybe_evict_cached_block(block)
+            if block.prev_free_block is not None:
+                # Unlink before placing: no anchor is involved, the block
+                # simply joins the uncached blocks at the front.
+                self.free_block_queue.remove(block)
+                to_front.append(block)
+        self.free_block_queue.prepend_n(to_front)
+        return count
+
+    def demote_cached_hashes(
+        self,
+        keys: Iterable[BlockHashWithGroupId],
+        exclude_block_ids: Container[int] = (),
+    ) -> int:
+        """``demote`` the blocks that currently hold these keys, except
+        excluded ones and ones with a reuse watcher. Returns how many."""
+        blocks = []
+        for key in keys:
+            block = self.cached_block_hash_to_block.get_one_block(key)
+            if (
+                block is not None
+                and block.block_id not in exclude_block_ids
+                and block.block_id not in self._reuse_watchers
+            ):
+                blocks.append(block)
+        self.demote(blocks)
+        return len(blocks)
+
+    def evict_cached_hashes(
+        self,
+        keys: Iterable[BlockHashWithGroupId],
+        exclude_block_ids: Container[int] = (),
+    ) -> int:
+        """``evict_cached`` for the blocks that currently hold these keys."""
+        blocks = []
+        for key in keys:
+            block = self.cached_block_hash_to_block.get_one_block(key)
+            if block is not None:
+                blocks.append(block)
+        return self.evict_cached(blocks, exclude_block_ids)
+
+    def _forget_eviction_marks(self, block: KVCacheBlock) -> None:
+        block_id = block.block_id
+        self._demote_on_free.discard(block_id)
+        self._low_priority_on_free.discard(block_id)
+        self._evict_on_free.discard(block_id)
+        self._lru_since.pop(block_id, None)
+
+    def mark_low_priority(self, blocks: Iterable[KVCacheBlock]) -> None:
+        """Evict these cached blocks first once their last reference is freed.
+
+        The lowest eviction priority (TensorRT-LLM ``PAGE_PRIORITY_MIN``):
+        unlike ``demote``, it applies whatever the cache pressure. Only
+        referenced cached blocks are marked; the mark is consumed by the free.
+        """
+        if not self.enable_caching:
+            return
+        for block in blocks:
+            if not block.is_null and block.block_hash is not None and block.ref_cnt > 0:
+                self._low_priority_on_free.add(block.block_id)
+
     def touch(self, blocks: Sequence[KVCacheBlock]) -> None:
         """Touch a block increases its reference count by 1, and may remove
         the block from the free queue. This is used when a block is hit by
@@ -798,6 +1005,14 @@ class BlockPool:
             blocks: A list of blocks to touch.
 
         """
+        if self._demote_on_free:
+            # A new hit means the block is not stale after all.
+            for block in blocks:
+                self._demote_on_free.discard(block.block_id)
+        if self._lru_since:
+            for block in blocks:
+                if block.ref_cnt == 0:
+                    self._lru_since.pop(block.block_id, None)
         for block in blocks:
             if block.is_null:
                 continue
@@ -825,6 +1040,8 @@ class BlockPool:
         # Identify blocks with hash (LRU cache) and without it (never match APC)
         blocks_to_evict_last = []
         blocks_to_evict_first = []
+        demoted = []
+        low_priority = []
         other_pools: dict[BlockPool, list[KVCacheBlock]] = {}
         for block in ordered_blocks:
             if block.is_null:  # never pooled; its ref_cnt is not maintained
@@ -834,15 +1051,47 @@ class BlockPool:
                 continue
             block.ref_cnt -= 1
             if block.ref_cnt == 0:
+                if self._evict_on_free and block.block_id in self._evict_on_free:
+                    self._forget_eviction_marks(block)
+                    self._maybe_evict_cached_block(block)
+                stale = False
+                if self._demote_on_free:
+                    stale = block.block_id in self._demote_on_free
+                    self._demote_on_free.discard(block.block_id)
+                low = False
+                if self._low_priority_on_free:
+                    low = block.block_id in self._low_priority_on_free
+                    self._low_priority_on_free.discard(block.block_id)
                 if block.block_hash is None or not self.enable_caching:
                     # LIFO reuse of non-cached blocks for better GPU locality.
                     blocks_to_evict_first.append(block)
+                elif low:
+                    # Lowest priority: evicted before every other cached block.
+                    low_priority.append(block)
+                elif stale:
+                    # Demoted: evicted before other cached blocks.
+                    demoted.append(block)
                 else:
                     # FIFO reuse of cached blocks for LRU eviction behavior.
                     blocks_to_evict_last.append(block)
 
-        # Blocks to reuse first are prepended to the front of the free queue.
+        if blocks_to_evict_last:
+            now = self._clock()
+            for block in blocks_to_evict_last:
+                self._lru_since[block.block_id] = now
+        # Blocks to reuse first are prepended to the front of the free queue,
+        # then demoted cached blocks go right behind the uncached ones.
         self.free_block_queue.prepend_n(blocks_to_evict_first)
+        if low_priority:
+            anchor = self._demotion_anchor(gate=False)
+            assert anchor is not None
+            self.free_block_queue.insert_n_after(anchor, low_priority)
+        if demoted:
+            anchor = self._demotion_anchor()
+            if anchor is None:
+                blocks_to_evict_last = demoted + blocks_to_evict_last
+            else:
+                self.free_block_queue.insert_n_after(anchor, demoted)
         # Blocks to reuse last are appended to the end of the free queue.
         self.free_block_queue.append_n(blocks_to_evict_last)
         for pool, blocks in other_pools.items():
@@ -890,6 +1139,10 @@ class BlockPool:
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = BlockHashToBlockMap()
         self.cached_block_hashes_by_block.clear()
+        self._demote_on_free.clear()
+        self._low_priority_on_free.clear()
+        self._evict_on_free.clear()
+        self._lru_since.clear()
         if self._reuse_watchers:
             self._notify_reuse(
                 [self.blocks[block_id] for block_id in list(self._reuse_watchers)]

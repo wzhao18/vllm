@@ -11,6 +11,7 @@ For Kimi-K3 speculative decoding, ``--use-replayssm`` selects the simplified
 RecoverSSM path implemented here instead of the Mamba2 ReplaySSM kernel.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from functools import cache
 from typing import TYPE_CHECKING
@@ -321,6 +322,9 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
         )
         self.use_recoverssm = vllm_config.cache_config.use_kda_recoverssm
         self.spec_state_slots = 1 if self.use_recoverssm else self.num_spec + 1
+        # Per batch row of the next build: the row is its request's first
+        # scheduled chunk (V2 runner model state; mamba_internal_snapshot).
+        self.mamba_snapshot_first_chunk: Sequence[bool] | None = None
         self.recoverssm_num_accepted_tokens: torch.Tensor | None = None
         self.recoverssm_context: KDARecoverSSMCommitContext | None = None
         if self.use_recoverssm:
@@ -699,12 +703,18 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
                     flashinfer_prefill_query_start_loc.diff(), descending=True
                 ).to(torch.int32)
 
+        # Per batch row: first scheduled chunk of its request, set for this step
+        # by the V2 runner's model state (CacheConfig.mamba_internal_snapshot).
+        first_chunk_rows = self.mamba_snapshot_first_chunk
+        self.mamba_snapshot_first_chunk = None
         checkpoint = None
         if num_prefills > 0:
             request_rows = list(range(m.num_reqs))
             if active_non_spec_mask_cpu is not None:
                 request_rows = active_non_spec_mask_cpu.nonzero().flatten().tolist()
-            checkpoint = self.checkpoint_builder.build(m, request_rows)
+            checkpoint = self.checkpoint_builder.build(
+                m, request_rows, first_chunk_rows
+            )
 
         return KimiK3KDAMetadata(
             num_prefills=num_prefills,
