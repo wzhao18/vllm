@@ -324,3 +324,42 @@ def test_agent_metadata_carries_mamba_geometry():
         msgspec.msgpack.encode(NixlAgentMetadata(**fields)), type=NixlAgentMetadata
     )
     assert old.mamba_state_geometry is None
+
+
+@pytest.mark.parametrize(
+    "gpu,expected",
+    [
+        (0, "mlx5_0:1,mlx5_1:1"),
+        (1, "mlx5_0:1,mlx5_1:1"),
+        (2, "mlx5_6:1"),
+        (3, "mlx5_6:1"),
+        (4, "inherited"),
+    ],
+)
+def test_select_ucx_net_devices(monkeypatch, gpu, expected):
+    """Per-GPU UCX_NET_DEVICES from the connector's ucx_net_devices_by_gpu table."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
+        NixlConnectorWorker,
+    )
+
+    monkeypatch.setenv("UCX_NET_DEVICES", "inherited")
+    NixlConnectorWorker._select_ucx_net_devices(
+        "0-1=mlx5_0:1,mlx5_1:1; 2-3=mlx5_6:1", gpu=gpu
+    )
+    import os
+
+    assert os.environ["UCX_NET_DEVICES"] == expected
+    NixlConnectorWorker._select_ucx_net_devices(None, gpu=gpu)
+    assert os.environ["UCX_NET_DEVICES"] == expected
+
+
+def test_select_ucx_net_devices_plus_separator(monkeypatch):
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
+        NixlConnectorWorker,
+    )
+
+    monkeypatch.setenv("UCX_NET_DEVICES", "inherited")
+    NixlConnectorWorker._select_ucx_net_devices("0-1=a:1+b:1;2-3=c:1+d:1", gpu=3)
+    import os
+
+    assert os.environ["UCX_NET_DEVICES"] == "c:1,d:1"

@@ -772,6 +772,13 @@ class NixlBaseConnectorWorker:
         num_threads = vllm_config.kv_transfer_config.get_from_extra_config(
             "num_threads", 4
         )
+        # Multi-NIC nodes: UCX reads UCX_NET_DEVICES when the agent's UCX backend
+        # is created, so pin each rank to the NICs local to its GPU here.
+        self._select_ucx_net_devices(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "ucx_net_devices_by_gpu", None
+            )
+        )
         if nixl_agent_config is None:
             config = None
         else:
@@ -2791,6 +2798,30 @@ class NixlBaseConnectorWorker:
         )
 
         return remote_agent_name
+
+    @staticmethod
+    def _select_ucx_net_devices(spec: str | None, gpu: int | None = None) -> None:
+        """Set UCX_NET_DEVICES for this rank from ``spec``: ``;``-separated
+        ``<gpus>=<devices>`` entries, ``<gpus>`` a local CUDA device index or an
+        inclusive range, e.g. ``"0-1=mlx5_0:1,mlx5_1:1;2-3=mlx5_6:1,mlx5_7:1"``;
+        ``+`` also separates devices (for comma-split CLI lists). Ranks that no
+        entry covers keep the inherited UCX_NET_DEVICES. ``<gpus>`` are node
+        (physical) indices: a rank whose visible devices are masked, e.g. one
+        process per attention-DP rank, still maps to its own NUMA-local NICs."""
+        if not spec:
+            return
+        if gpu is None:
+            gpu = torch.accelerator.current_device_index()
+            with contextlib.suppress(Exception):
+                gpu = current_platform.visible_device_id_to_physical_device_id(gpu)
+        for entry in spec.split(";"):
+            gpus, _, devices = entry.strip().partition("=")
+            lo, _, hi = gpus.partition("-")
+            devices = devices.replace("+", ",")
+            if devices and int(lo) <= gpu <= int(hi or lo):
+                os.environ["UCX_NET_DEVICES"] = devices
+                logger.info("NIXL: UCX_NET_DEVICES=%s for local GPU %d", devices, gpu)
+                return
 
     def _validate_hybrid_hetero_dcp(
         self,
