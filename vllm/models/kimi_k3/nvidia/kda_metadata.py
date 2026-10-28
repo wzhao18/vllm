@@ -264,6 +264,9 @@ class KimiK3KDAMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
     non_spec_token_start: int | None = None
     flashinfer_prefill_query_start_loc: torch.Tensor | None = None
     flashinfer_prefill_seq_order: torch.Tensor | None = None
+    # Host copy of non_spec_query_start_loc (prefill steps), for host-side
+    # planning of the segment-parallel FlashKDA prefill.
+    non_spec_query_start_loc_cpu: torch.Tensor | None = None
     recoverssm_commit: KDARecoverSSMCommitMetadata | None = None
     recoverssm_context: "KDARecoverSSMCommitContext | None" = field(
         default=None, repr=False, compare=False
@@ -747,6 +750,9 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
             checkpoint=checkpoint,
+            non_spec_query_start_loc_cpu=(
+                non_spec_query_start_loc_cpu if num_prefills > 0 else None
+            ),
         )
 
 

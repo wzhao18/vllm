@@ -1209,3 +1209,54 @@ def test_recoverssm_layer_keeps_records_outside_kv_cache(
     assert records.correction.dtype == torch.float32
     assert records.key_gate.shape == (5, 4, 3, 64)
     assert records.key_gate.dtype == torch.bfloat16
+
+
+_EXPORT_LAYOUT_PROBE = """
+import torch
+from vllm.model_executor.layers.mamba.checkpoint import MambaPrefillCheckpointMetadata
+from vllm.models.kimi_k3.nvidia import kda as nvidia_kda
+
+layer = object.__new__(nvidia_kda.KimiK3DeltaAttention)
+object.__setattr__(layer, "conv_size", 4)
+exporter = layer._make_checkpoint_exporter()
+dim, num_tokens, offset = 8, 32, 16
+x = torch.arange(num_tokens * dim, dtype=torch.float32).view(num_tokens, dim)
+for num_spec in (0, 3, 7):
+    conv_state = torch.zeros(2, dim, 3 + num_spec)
+    exporter.export(
+        MambaPrefillCheckpointMetadata(
+            torch.tensor([offset], dtype=torch.int32),
+            torch.tensor([1], dtype=torch.int32),
+        ),
+        raw_qkv=x,
+        conv_state=conv_state,
+        recurrent_checkpoint=torch.zeros(1, 4),
+        recurrent_state=torch.zeros(2, 4),
+        cu_seqlens=torch.tensor([0, num_tokens], dtype=torch.int32),
+    )
+    # causal_conv1d keeps the last conv_size - 1 inputs in columns 0..2.
+    torch.testing.assert_close(conv_state[1, :, :3], x[offset - 3 : offset].T)
+print("ok")
+"""
+
+
+def test_kda_checkpoint_export_keeps_the_prefill_conv_window():
+    """The exported checkpoint's conv state must hold what a prefill leaves:
+    the last conv_size - 1 inputs in columns 0..2, also when speculative
+    decoding widens the cached conv state. Runs the real Triton exporter on CPU
+    (interpreter, separate process)."""
+    import os
+    import subprocess
+    import sys
+
+    env = dict(os.environ, TRITON_INTERPRET="1", VLLM_TARGET_DEVICE="cpu")
+    proc = subprocess.run(
+        [sys.executable, "-c", _EXPORT_LAYOUT_PROBE],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert proc.returncode == 0 and proc.stdout.strip().endswith("ok"), (
+        proc.stdout[-2000:] + proc.stderr[-4000:]
+    )
