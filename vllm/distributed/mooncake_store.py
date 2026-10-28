@@ -9,6 +9,10 @@ from typing import Any, Literal
 
 import regex as re
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 DEFAULT_GLOBAL_SEGMENT_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
 DEFAULT_LOCAL_BUFFER_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
 DEFAULT_TENANT_ID = "default"
@@ -123,6 +127,69 @@ def _parse_size(value: Any) -> int:
     return int(numeric_value * multiplier)
 
 
+NUMA_DEVICE_NAME_PREFIX = "numa:"
+
+
+def parse_numa_device_names(device_name: str) -> dict[int, str] | None:
+    """Parse ``numa:<node>=<devices>;<node>=<devices>`` into a node table.
+
+    Returns None when ``device_name`` is a plain device list.
+    """
+    spec = device_name.strip()
+    if not spec.startswith(NUMA_DEVICE_NAME_PREFIX):
+        return None
+    table: dict[int, str] = {}
+    for entry in spec[len(NUMA_DEVICE_NAME_PREFIX) :].split(";"):
+        entry = entry.strip()
+        if not entry:
+            continue
+        node, sep, devices = entry.partition("=")
+        if not sep or not node.strip().isdigit() or not devices.strip():
+            raise ValueError(
+                f"Invalid NUMA device_name entry {entry!r}; expected "
+                "'numa:<node>=<dev>[,<dev>...];<node>=...'"
+            )
+        table[int(node)] = devices.strip()
+    if not table:
+        raise ValueError(f"Empty NUMA device_name {device_name!r}")
+    return table
+
+
+def resolve_device_name(device_name: str, numa_node: int | None = None) -> str:
+    """Return the RDMA device list for this process.
+
+    A ``numa:`` table selects the list for the NUMA node of the current CUDA
+    device. On hosts with several NUMA nodes and NICs per node (e.g. Vera
+    Rubin), listing every NIC lets the transfer engine pair a GPU with NICs
+    on the other socket, which can cut GPU <-> host-segment bandwidth several
+    times; the per-node list keeps each rank on its own socket's NICs.
+    """
+    table = parse_numa_device_names(device_name)
+    if table is None:
+        return device_name
+    if numa_node is None:
+        import torch
+
+        from vllm.platforms import current_platform
+
+        nodes = current_platform.get_all_device_numa_nodes()
+        if not nodes:
+            raise RuntimeError(
+                "Mooncake NUMA device_name needs the GPU NUMA node, which "
+                "could not be detected"
+            )
+        numa_node = nodes[torch.accelerator.current_device_index()]
+    if numa_node not in table:
+        raise ValueError(
+            f"Mooncake NUMA device_name has no entry for NUMA node {numa_node}: "
+            f"{device_name!r}"
+        )
+    logger.info(
+        "Mooncake RDMA devices for NUMA node %d: %s", numa_node, table[numa_node]
+    )
+    return table[numa_node]
+
+
 def setup_mooncake_store(
     store: Any, config: MooncakeStoreConfig, local_hostname: str
 ) -> None:
@@ -136,7 +203,7 @@ def setup_mooncake_store(
         config.global_segment_size,
         config.local_buffer_size,
         config.protocol,
-        config.device_name,
+        resolve_device_name(config.device_name),
         config.master_server_address,
         **setup_kwargs,
     )

@@ -16,6 +16,9 @@ Wire format (REQ/REP over IPC):
                    fixed-size block hash (0 when there are no hashes)
           frame 3: raw block hashes concatenated back-to-back (each hash_len
                    bytes); the server splits on hash_len
+          frame 4 (optional): known_prefix_tokens (u32 big-endian) — tokens
+                   already cached on the GPU; the server probes only from the
+                   scheduler block containing that boundary
         Response: hit_length (u32 big-endian, first 4 bytes), followed by zero
                   or more 8-byte tail-key boundaries. Each entry is group_id
                   (u32), then boundary_tokens (u32).

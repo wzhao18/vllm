@@ -11,14 +11,18 @@ and MooncakeDistributedStore integration.
 """
 
 import dataclasses
+import heapq
+import itertools
 import math
 import os
 import queue
 import socket
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import AbstractContextManager
 from typing import Any, TypeVar
 
@@ -38,6 +42,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorTransferResults,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import rdma_utils
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.bounded import (
+    DEFAULT_STORE_OP_TIMEOUT_S,
+    StoreCallGuard,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator import (  # noqa: E501
     ExternalCachedBlockPool,
     MooncakeStoreCoordinator,
@@ -93,6 +101,13 @@ from .metrics import MooncakeStoreConnectorStats
 logger = init_logger(__name__)
 
 MOONCAKE_NO_AVAILABLE_HANDLE = -200
+MOONCAKE_OBJECT_NOT_FOUND = -704
+MOONCAKE_OBJECT_HAS_LEASE = -706
+# Superseded-checkpoint keys are removed after the master's read lease (granted
+# by gets and by exists checks, default 60 s) has run out. A session whose
+# lookups keep probing its old keys keeps re-leasing them, so retry a while.
+DEFAULT_PRUNE_DELAY_S = 65.0
+DEFAULT_PRUNE_MAX_ATTEMPTS = 10
 _T = TypeVar("_T")
 
 
@@ -330,6 +345,17 @@ class KVTransferThread(threading.Thread):
         self.finished_requests: set[str] = set()
         self.kv_event_lock = threading.Lock()
         self.kv_events: list[BlockStored] = []
+        # Bounded store calls (store_op_failover); None = direct calls.
+        self.store_guard: StoreCallGuard | None = None
+
+    def _store_call(
+        self, op: str, fn: Callable[..., _T], *args: Any, keys: Sequence[str] = ()
+    ) -> _T:
+        """Run one RDMA store call, bounded by ``store_guard`` when set: a
+        timeout raises, which the callers treat as a failed get / put."""
+        if self.store_guard is None:
+            return fn(*args)
+        return self.store_guard.call(op, fn, *args, keys=keys)
 
     def add_request(self, request: ReqMeta) -> None:
         self.request_queue.put(request)
@@ -432,6 +458,16 @@ class KVCacheStoreSendingThread(KVTransferThread):
             if group_participates is not None
             else [True] * len(token_databases)
         )
+        # Superseded-checkpoint removals waiting for their read leases to end:
+        # (due time, keys, attempts so far).
+        self.prune_delay_s = DEFAULT_PRUNE_DELAY_S
+        self.prune_max_attempts = DEFAULT_PRUNE_MAX_ATTEMPTS
+        self._prune_queue: deque[tuple[float, list[str], int]] = deque()
+        # Removals with their own delays (``prune_policy``, idle-tail TTL), by
+        # due time: (due time, tie-break, keys, attempts so far).
+        self.prune_idle_tail_ttl_s = 0.0
+        self._prune_heap: list[tuple[float, int, list[str], int]] = []
+        self._prune_seq = itertools.count()
         # req_id -> ids of its store jobs that are still queued or running.
         # Keying by store_job_id, which never repeats for the engine's lifetime,
         # rather than counting jobs per request id makes the ledger immune to id
@@ -612,6 +648,128 @@ class KVCacheStoreSendingThread(KVTransferThread):
             )
         return puts
 
+    def _prune_superseded(self, req_meta: ReqMeta) -> None:
+        """Remove this rank's keys of the state the request resumed from.
+
+        Called after the request's newer boundary state is stored, so the
+        session always keeps a resume point. Removes, at the resume boundary,
+        every state group's key and the non-state groups' sub-block keys
+        (partial tails, also one hash unit later for the speculative margin);
+        block-aligned non-state keys are chain blocks and are kept. Keys under
+        a lease (being loaded) are not removed.
+        """
+        keys = self._resume_state_keys(
+            req_meta.prune_resume_tokens, req_meta.block_hashes
+        )
+        if keys:
+            # The lookup that found this resume point leased its keys; remove
+            # them once that lease has run out.
+            self._prune_queue.append((time.monotonic() + self.prune_delay_s, keys, 0))
+
+    def _resume_state_keys(
+        self, resume: int, hashes: Sequence[BlockHash]
+    ) -> list[str] | None:
+        """This rank's keys of the resume state at ``resume`` tokens."""
+        hash_block_size = self.coord.hash_block_size
+        if resume <= 0 or resume % hash_block_size or not hashes:
+            return None
+        keys: list[str] = []
+        try:
+            for group_id, db in enumerate(self.token_databases):
+                if not self.group_participates[group_id]:
+                    continue
+                spec = self.coord.kv_cache_groups[group_id].kv_cache_spec
+                if _has_state_spec(spec):
+                    bounds: tuple[int, ...] = (resume,)
+                else:
+                    bounds = tuple(
+                        t
+                        for t in (resume, resume + hash_block_size)
+                        if t % db.block_size
+                    )
+                for t in bounds:
+                    idx = t // hash_block_size - 1
+                    if 0 <= idx < len(hashes):
+                        keys.append(db.key_for(hashes[idx]))
+        except RuntimeError:
+            # Non rank-local (TP-sharded) layouts have no single key per hash.
+            return None
+        return keys
+
+    def _queue_prune(self, keys: list[str], delay_s: float, attempts: int = 0) -> None:
+        heapq.heappush(
+            self._prune_heap,
+            (time.monotonic() + delay_s, next(self._prune_seq), keys, attempts),
+        )
+
+    def _prune_policy_targets(self, req_meta: ReqMeta) -> None:
+        """Queue the resume states named by ``req_meta.prune_targets``."""
+        for resume, delay_s in req_meta.prune_targets:
+            keys = self._resume_state_keys(resume, req_meta.block_hashes)
+            if keys:
+                self._queue_prune(keys, delay_s)
+
+    def _queue_idle_tail_expiry(self, req_meta: ReqMeta) -> None:
+        """Expire this job's boundary states ``prune_idle_tail_ttl_s`` after
+        they are stored: a live chain supersedes its state well before then, so
+        what is left belongs to chains that stopped."""
+        keys = [key for key, _, _, _ in self._boundary_puts(req_meta)]
+        if keys:
+            self._queue_prune(keys, self.prune_idle_tail_ttl_s)
+
+    def _drain_prune_queue(self) -> None:
+        """Remove queued superseded keys whose read leases have run out.
+
+        Keys still leased (read or probed again) are retried later, up to
+        ``prune_max_attempts`` times; keys already gone count as removed.
+        """
+        now = time.monotonic()
+        due: list[tuple[list[str], int]] = []
+        while self._prune_queue and self._prune_queue[0][0] <= now:
+            _, keys, attempts = self._prune_queue.popleft()
+            due.append((keys, attempts))
+        num_fifo = len(due)
+        while self._prune_heap and self._prune_heap[0][0] <= now:
+            _, _, keys, attempts = heapq.heappop(self._prune_heap)
+            due.append((keys, attempts))
+        if not due:
+            return
+        keys = [key for batch, _ in due for key in batch]
+        start = time.perf_counter()
+        try:
+            res = self.store.batch_remove(keys)
+        except Exception as e:
+            self._record_operation(
+                "prune_remove",
+                start,
+                len(keys),
+                status="error",
+                num_failed_keys=len(keys),
+            )
+            logger.debug("Mooncake prune of %d keys failed: %s", len(keys), e)
+            return
+        codes = dict(zip(keys, res))
+        failed = 0
+        for i, (batch, attempts) in enumerate(due):
+            leased = [k for k in batch if codes[k] == MOONCAKE_OBJECT_HAS_LEASE]
+            if leased and attempts + 1 < self.prune_max_attempts:
+                if i >= num_fifo:
+                    self._queue_prune(leased, self.prune_delay_s, attempts + 1)
+                    continue
+                self._prune_queue.append(
+                    (time.monotonic() + self.prune_delay_s, leased, attempts + 1)
+                )
+            failed += sum(
+                1 for k in batch if codes[k] not in (0, MOONCAKE_OBJECT_NOT_FOUND)
+            )
+        self._record_operation(
+            "prune_remove",
+            start,
+            len(keys),
+            status="partial_failure" if failed else "ok",
+            num_failed_keys=failed,
+        )
+
     def _maybe_offload_boundary_states(self, req_meta: ReqMeta) -> bool:
         """Persist this job's boundary puts, deduped against the store.
 
@@ -675,8 +833,14 @@ class KVCacheStoreSendingThread(KVTransferThread):
         batch_bytes = _sum_batch_bytes(sizes)
         put_start = time.perf_counter()
         try:
-            res = self.store.batch_put_from_multi_buffers(
-                keys, addrs, sizes, self.replicate_config
+            res = self._store_call(
+                "save_put",
+                self.store.batch_put_from_multi_buffers,
+                keys,
+                addrs,
+                sizes,
+                self.replicate_config,
+                keys=keys,
             )
         except Exception as e:
             self._record_operation(
@@ -725,6 +889,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
         return True
 
     def _handle_request(self, req_meta: ReqMeta):
+        if self._prune_queue or self._prune_heap:
+            self._drain_prune_queue()
         # The single `finally` is the only way out, so the scheduler releases
         # this job's GPU block references however the job ends.
         save_completed = False
@@ -763,6 +929,12 @@ class KVCacheStoreSendingThread(KVTransferThread):
             # normal positional save, which may be skipped this step).
             if not self._maybe_offload_boundary_states(req_meta):
                 return
+            if req_meta.prune_resume_tokens:
+                self._prune_superseded(req_meta)
+            if req_meta.prune_targets:
+                self._prune_policy_targets(req_meta)
+            if self.prune_idle_tail_ttl_s > 0 and req_meta.boundary_puts:
+                self._queue_idle_tail_expiry(req_meta)
 
             if token_len == 0:
                 return
@@ -924,11 +1096,14 @@ class KVCacheStoreSendingThread(KVTransferThread):
             batch_bytes = _sum_batch_bytes(sizes)
             put_start = time.perf_counter()
             try:
-                res = self.store.batch_put_from_multi_buffers(
+                res = self._store_call(
+                    "save_put",
+                    self.store.batch_put_from_multi_buffers,
                     keys,
                     addrs,
                     sizes,
                     self.replicate_config,
+                    keys=keys,
                 )
             except Exception as e:
                 self._record_operation(
@@ -1121,6 +1296,21 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         return invalid_block_ids
 
     def _handle_request(self, req_meta: ReqMeta):
+        # Every load must report back: a load that raises before reporting
+        # would leave its request in WAITING_FOR_REMOTE_KVS forever.
+        try:
+            self._handle_load(req_meta)
+        except Exception:
+            logger.exception(
+                "Mooncake load for request %s failed; recomputing", req_meta.req_id
+            )
+            self._report_load_error(
+                req_meta.req_id, [b for group in req_meta.block_ids for b in group]
+            )
+            self.set_finished_request(req_meta.req_id)
+            self.request_queue.task_done()
+
+    def _handle_load(self, req_meta: ReqMeta):
         token_len = req_meta.load_spec.token_len  # type: ignore[union-attr]
         req_id = req_meta.req_id
         mask_num = (
@@ -1175,6 +1365,11 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             size_list.extend(g_sizes)
             block_id_list.extend(g_block_ids)
 
+        if not key_list:
+            # The lookup reported a hit this rank has no keys for.
+            raise RuntimeError(
+                f"no store keys for {token_len - mask_num} hit tokens of {req_id}"
+            )
         # Rotate aligned lists by tp_rank for load balancing.
         rotation = self.tp_rank % len(key_list)
         key_list_c = _rotate_list(key_list, rotation)
@@ -1258,8 +1453,13 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     tiers_by_key = _get_replica_tiers_by_key(self.store, batch_keys)
                 # Reset so the recorded RPC duration excludes tier lookup.
                 load_get_start = time.perf_counter()
-                res = self.store.batch_get_into_multi_buffers(
-                    batch_keys, batch_addrs, batch_sizes
+                res = self._store_call(
+                    "load_get",
+                    self.store.batch_get_into_multi_buffers,
+                    batch_keys,
+                    batch_addrs,
+                    batch_sizes,
+                    keys=batch_keys,
                 )
                 if tiers_by_key is not None:
                     _log_mooncake_load_tier_summary(
@@ -1395,6 +1595,34 @@ class MooncakeStoreWorker:
             extra_config.get("save_decode_cache", False)
         )
         self.load_async = extra_config.get("load_async", True)
+        # Store failover: bound every RDMA get / put; a failed or timed-out get
+        # is a cache miss (recompute), a failed or timed-out put is dropped.
+        self._store_op_failover = str(
+            extra_config.get("store_op_failover", "False")
+        ).strip().lower() in ("1", "true", "yes", "on")
+        self._store_op_timeout_s = float(
+            extra_config.get("store_op_timeout_s", DEFAULT_STORE_OP_TIMEOUT_S)
+        )
+        if self._store_op_failover:
+            logger.info(
+                "Mooncake store failover on: store get / put bounded at %.1f s "
+                "(timeout = cache miss / dropped put)",
+                self._store_op_timeout_s,
+            )
+        self._prune_delay_s = float(
+            extra_config.get("prune_delay_s", DEFAULT_PRUNE_DELAY_S)
+        )
+        self._prune_max_attempts = int(
+            extra_config.get("prune_max_attempts", DEFAULT_PRUNE_MAX_ATTEMPTS)
+        )
+        self._prune_idle_tail_ttl_s = float(
+            extra_config.get("prune_idle_tail_ttl_s", 0.0)
+        )
+        if self._prune_idle_tail_ttl_s > 0:
+            logger.info(
+                "Mooncake boundary states expire %.0f s after they are stored",
+                self._prune_idle_tail_ttl_s,
+            )
         # Mirrors MooncakeStoreConnector._capacity_only.
         self._capacity_only = (
             self.kv_role == "kv_consumer"
@@ -1934,6 +2162,18 @@ class MooncakeStoreWorker:
                     for group in self._kv_cache_groups
                 ],
             )
+            self.kv_send_thread.prune_delay_s = getattr(
+                self, "_prune_delay_s", DEFAULT_PRUNE_DELAY_S
+            )
+            self.kv_send_thread.prune_max_attempts = getattr(
+                self, "_prune_max_attempts", DEFAULT_PRUNE_MAX_ATTEMPTS
+            )
+            self.kv_send_thread.prune_idle_tail_ttl_s = getattr(
+                self, "_prune_idle_tail_ttl_s", 0.0
+            )
+            self.kv_send_thread.store_guard = self._make_store_guard(
+                "KVCacheStoreSendingThread", self.kv_send_thread
+            )
             self.kv_send_thread.start()
 
         self.kv_recv_threads = []
@@ -1957,6 +2197,9 @@ class MooncakeStoreWorker:
                 is_hma_required=self._is_hma_required,
             )
             recv_thread.name = f"KVCacheStoreRecvingThread-{i}"
+            recv_thread.store_guard = self._make_store_guard(
+                recv_thread.name, recv_thread
+            )
             recv_thread.start()
             self.kv_recv_threads.append(recv_thread)
             ready_events_recving.append(ready_event_recving)
@@ -1979,6 +2222,31 @@ class MooncakeStoreWorker:
             if self.store.register_buffer(addr, self._device_regions[addr]) != 0:
                 raise RuntimeError(f"Mooncake register_buffer failed for {addr:#x}")
             self._released_regions.discard(addr)
+
+    def _make_store_guard(
+        self, name: str, thread: KVTransferThread
+    ) -> StoreCallGuard | None:
+        if not getattr(self, "_store_op_failover", False):
+            return None
+
+        def on_late(op: str, keys: Sequence[str], error: BaseException | None):
+            # A late put may have read blocks that were reused meanwhile:
+            # drop whatever it committed rather than serve it later.
+            if op == "save_put" and keys and thread.store is not None:
+                thread.store.batch_remove(list(keys))
+
+        return StoreCallGuard(name, self._store_op_timeout_s, on_late=on_late)
+
+    def store_failover_counters(self) -> dict[str, int]:
+        """Summed failover counters of this worker's transfer threads."""
+        totals = {"timeouts": 0, "degraded_skips": 0, "late_completions": 0}
+        totals["late_gets"] = 0
+        for thread in (self.kv_send_thread, *self.kv_recv_threads):
+            guard = getattr(thread, "store_guard", None) if thread else None
+            if guard is not None:
+                for key in totals:
+                    totals[key] += getattr(guard.counters, key)
+        return totals
 
     def start_load_kv(self, metadata: MooncakeStoreConnectorMetadata):
         """Issue async loads.
@@ -2139,13 +2407,22 @@ class MooncakeStoreWorker:
         return MooncakeStoreWorkerMetadata(completed_saves=completed_saves)
 
     def lookup(
-        self, num_tokens: int, block_hashes: Sequence[BlockHash]
+        self,
+        num_tokens: int,
+        block_hashes: Sequence[BlockHash],
+        known_prefix_tokens: int = 0,
     ) -> MooncakeLookupResult:
         """Check how many prefix tokens exist in the store.
 
         Checks across all rank-specific key namespaces that may be loaded. A
         hit covering all ``num_tokens`` is re-derived below the request end so
         the last token is recomputed for sampling.
+
+        ``known_prefix_tokens`` (fine-grained lookups only) is the local GPU
+        hit. An external hit is only useful beyond it, and loads start at the
+        scheduler block containing it, so units below that block are not
+        probed: attention units there count as present (never loaded from the
+        store) and state (Mamba) units as absent (they cannot extend the hit).
         """
         if self._capacity_only:
             return MooncakeLookupResult(0)
@@ -2160,15 +2437,27 @@ class MooncakeStoreWorker:
         candidate_meta: list[tuple[int, bytes]] = []
         fine_grained = self.coord.enable_partial_hash_hits
         lookup_masks = None if fine_grained else self.coord.lookup_mask(token_len)
+        start_unit = 0
+        if fine_grained and known_prefix_tokens > 0:
+            start_unit = (
+                known_prefix_tokens // self.block_size * self.block_size
+            ) // self.hash_block_size
+        trusted: set[tuple[int, bytes]] = set()
         for g_idx, db in enumerate(self.token_dbs):
-            if not self._kv_cache_groups[g_idx].kv_cache_spec.prefix_cacheable:
+            group_spec = self._kv_cache_groups[g_idx].kv_cache_spec
+            if not group_spec.prefix_cacheable:
                 continue
             spec_block_size = db.block_size
             key_prefixes = self._lookup_key_prefixes[g_idx]
             if fine_grained:
                 max_units = min(len(block_hashes), token_len // self.hash_block_size)
-                unit_ids: range | list[int] = range(max_units)
+                first_unit = min(start_unit, max_units)
+                unit_ids: range | list[int] = range(first_unit, max_units)
                 group_hashes: Sequence[BlockHash] = block_hashes
+                if first_unit and not _has_state_spec(group_spec):
+                    trusted.update(
+                        (g_idx, bytes(block_hashes[u])) for u in range(first_unit)
+                    )
             else:
                 lookup_mask = lookup_masks[g_idx]  # type: ignore[index]
                 group_hashes = self.coord.block_hashes_for_spec(
@@ -2195,7 +2484,7 @@ class MooncakeStoreWorker:
                 candidate_meta.append((g_idx, bytes(h)))
 
         if not candidate_keys:
-            return MooncakeLookupResult(0)
+            return MooncakeLookupResult(0, known_prefix_tokens=known_prefix_tokens)
 
         lookup_start = time.perf_counter()
         try:
@@ -2219,7 +2508,7 @@ class MooncakeStoreWorker:
         # A (group, hash) is "present" only when every namespace that will be
         # loaded has it (per-group count: sharded groups need every rank's
         # shard, replicated groups one namespace per unique KV head).
-        exists_set = set()
+        exists_set = trusted
         pos = 0
         for g_idx, hash_bytes in candidate_meta:
             count = len(self._lookup_key_prefixes[g_idx])
@@ -2252,6 +2541,7 @@ class MooncakeStoreWorker:
                 hit_length,
                 cached_block_pool,
             ),
+            known_prefix_tokens=known_prefix_tokens,
         )
 
     def _tail_key_boundaries(
@@ -2333,10 +2623,24 @@ class MooncakeStoreWorker:
                     thread.name,
                     thread.request_queue.unfinished_tasks,
                 )
+        for thread in (self.kv_send_thread, *self.kv_recv_threads):
+            guard = getattr(thread, "store_guard", None) if thread else None
+            if guard is not None:
+                guard.shutdown()
         try:
             store.close()
         except Exception as e:
             logger.warning("Error closing MooncakeDistributedStore: %s", e)
+
+
+def _has_state_spec(spec: Any) -> bool:
+    """Whether a (possibly packed) group spec holds per-request state."""
+    inner_specs = (
+        tuple(spec.kv_cache_specs.values())
+        if isinstance(spec, UniformTypeKVCacheSpecs)
+        else (spec,)
+    )
+    return any(isinstance(inner, MambaSpec) for inner in inner_specs)
 
 
 # ============================================================
@@ -2384,7 +2688,19 @@ class LookupKeyServer:
                     hash_len = int.from_bytes(all_frames[2], byteorder="big")
                     blob = all_frames[3].buffer
                     block_hashes = BlobBlockHashes(blob, hash_len)
-                    result = self.store_worker.lookup(num_tokens, block_hashes)
+                    known_prefix_tokens = (
+                        int.from_bytes(all_frames[4], byteorder="big")
+                        if len(all_frames) > 4
+                        else 0
+                    )
+                    try:
+                        result = self.store_worker.lookup(
+                            num_tokens, block_hashes, known_prefix_tokens
+                        )
+                    except Exception:
+                        # Always answer: the REQ client blocks until we do.
+                        logger.exception("Mooncake lookup failed; reporting a miss")
+                        result = MooncakeLookupResult(0)
                     self.socket.send(encode_lookup_response(result))
 
                 elif msg_type == RESET_MSG:
@@ -2445,21 +2761,41 @@ class LookupKeyClient:
         self.executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="MooncakeLookupClient"
         )
+        # req_id -> its lookup. A finished lookup's result is kept until
+        # ``discard`` (the request is admitted or finishes), so every query of
+        # one admission attempt, including the scheduler re-queueing a demoted
+        # request within the same step, sees one result instead of starting a
+        # new lookup each time.
         self.futures: dict[str, Future[MooncakeLookupResult]] = {}
+        extra_config = (
+            vllm_config.kv_transfer_config.kv_connector_extra_config
+            if vllm_config.kv_transfer_config is not None
+            else {}
+        )
+        # Bound on a blocking (lookup_async=False) lookup; past it the lookup
+        # counts as a miss and the request recomputes.
+        self.lookup_timeout_s = float(extra_config.get("lookup_timeout_s", 10.0))
 
     def _lookup(
-        self, num_tokens: int, block_hashes: list[BlockHash]
+        self,
+        num_tokens: int,
+        block_hashes: list[BlockHash],
+        known_prefix_tokens: int = 0,
     ) -> MooncakeLookupResult:
         hash_len = len(block_hashes[0]) if block_hashes else 0
-        all_frames = (
+        all_frames: tuple[bytes, ...] = (
             LOOKUP_MSG,
             num_tokens.to_bytes(4, byteorder="big"),
             hash_len.to_bytes(2, byteorder="big"),
             b"".join(block_hashes),
         )
+        if known_prefix_tokens > 0:
+            all_frames += (known_prefix_tokens.to_bytes(4, byteorder="big"),)
         self.socket.send_multipart(all_frames, copy=False)
         resp = self.socket.recv()
-        return decode_lookup_response(resp)
+        result = decode_lookup_response(resp)
+        result.known_prefix_tokens = known_prefix_tokens
+        return result
 
     def lookup(
         self,
@@ -2467,22 +2803,35 @@ class LookupKeyClient:
         num_tokens: int,
         block_hashes: list[BlockHash],
         non_block: bool = False,
+        known_prefix_tokens: int = 0,
     ) -> MooncakeLookupResult | None:
         """If non_block is True, will return None until the result is ready,
-        so the caller retries on a later step."""
+        so the caller retries on a later step. ``known_prefix_tokens`` (the
+        local GPU hit) lets the server skip probing below it; the result
+        records the value used."""
         future = self.futures.get(req_id)
         if future is None:
-            future = self.executor.submit(self._lookup, num_tokens, list(block_hashes))
+            future = self.executor.submit(
+                self._lookup, num_tokens, list(block_hashes), known_prefix_tokens
+            )
             self.futures[req_id] = future
         if non_block and not future.done():
             return None
         try:
-            return future.result()
+            return future.result(timeout=self.lookup_timeout_s)
+        except FutureTimeoutError:
+            logger.warning(
+                "Mooncake lookup for %s did not return within %.1f s; "
+                "treating it as a miss.",
+                req_id,
+                self.lookup_timeout_s,
+            )
+            del self.futures[req_id]
+            return MooncakeLookupResult(0)
         except Exception as e:
             logger.error("Async Mooncake lookup failed for %s: %s", req_id, e)
-            return MooncakeLookupResult(0)
-        finally:
             del self.futures[req_id]
+            return MooncakeLookupResult(0)
 
     def discard(self, req_id: str) -> None:
         """Drop any cached/in-flight lookup for ``req_id`` (e.g. on abort)."""

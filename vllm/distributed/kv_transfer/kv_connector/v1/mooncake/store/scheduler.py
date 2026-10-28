@@ -5,6 +5,7 @@
 # (vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/).
 """Scheduler-side logic for MooncakeStoreConnector."""
 
+from collections import OrderedDict
 from collections.abc import Sequence
 
 from vllm.config import VllmConfig
@@ -23,6 +24,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  
     RequestTracker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker import (  # noqa: E501
+    DEFAULT_PRUNE_DELAY_S,
     LookupKeyClient,
 )
 from vllm.logger import init_logger
@@ -43,6 +45,9 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+# lag1 origin entries kept (one per stored boundary state, oldest dropped first).
+_STATE_ORIGIN_CAPACITY = 1 << 18
 
 
 def _new_req_prefill_tokens(request: NewRequestData) -> list[int]:
@@ -145,6 +150,38 @@ class MooncakeStoreScheduler:
         kvc_extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
         self.load_async = kvc_extra_config.get("load_async", True)
         self.lookup_async = kvc_extra_config.get("lookup_async", False)
+        # Probe the store only above the local GPU hit (fine-grained lookups).
+        self.lookup_from_local_hit = bool(
+            kvc_extra_config.get("lookup_from_local_hit", False)
+        )
+        # Remove a request's resume-point state once its next one is stored.
+        self.prune_superseded_checkpoints = bool(
+            kvc_extra_config.get("prune_superseded_checkpoints", False)
+        )
+        # req_id -> prefix length it resumed from (pruned once superseded).
+        self._resume_tokens: dict[str, int] = {}
+        # Which resume state to prune once a request stores a newer one:
+        # "resume" (the one it resumed from) or "lag1" (the one that state's
+        # producer resumed from, keeping each chain's previous resume point for
+        # ``prune_lag_ttl_s``, so a request diverging a little before the
+        # previous prompt's end still finds a state at or before its divergence).
+        self.prune_policy = kvc_extra_config.get("prune_policy", "resume")
+        if self.prune_policy not in ("resume", "lag1"):
+            raise ValueError(f"Unknown prune_policy {self.prune_policy!r}")
+        self._prune_delay_s = float(
+            kvc_extra_config.get("prune_delay_s", DEFAULT_PRUNE_DELAY_S)
+        )
+        self._prune_lag_ttl_s = float(kvc_extra_config.get("prune_lag_ttl_s", 330.0))
+        # lag1: hash of the prefix ending at a stored boundary state -> the
+        # resume point of the request that produced it (bounded, oldest first).
+        self._state_origin: OrderedDict[bytes, int] = OrderedDict()
+        self._req_origin_tokens: dict[str, int] = {}
+        if self.prune_superseded_checkpoints and self.prune_policy != "resume":
+            logger.info(
+                "Mooncake prune policy %s (lag TTL %.0f s)",
+                self.prune_policy,
+                self._prune_lag_ttl_s,
+            )
         # Skips lookup CPU cost on instances that never load KV from the store.
         self.enable_lookup = kvc_extra_config.get("enable_lookup", True)
         self.save_decode_cache = kvc_extra_config.get("save_decode_cache", False)
@@ -228,15 +265,23 @@ class MooncakeStoreScheduler:
         if request.num_tokens < align:
             return 0, False
 
+        lookup_kwargs = {}
+        if self.lookup_from_local_hit and num_computed_tokens > 0:
+            lookup_kwargs["known_prefix_tokens"] = num_computed_tokens
         lookup_result = self.client.lookup(
             request.request_id,
             request.num_tokens,
             request.block_hashes,
             non_block=self.lookup_async,
+            **lookup_kwargs,
         )
         if lookup_result is None:
             # Lookup not ready yet; scheduler will retry on a later step.
             return None, False
+        if lookup_result.known_prefix_tokens > num_computed_tokens:
+            # The local hit shrank (eviction) after an async lookup trusted it,
+            # so the store was not probed between the two: recompute instead.
+            return 0, False
         num_external_hit_tokens = lookup_result.hit_length
 
         if num_external_hit_tokens < num_computed_tokens:
@@ -271,6 +316,9 @@ class MooncakeStoreScheduler:
         num_external_tokens: int,
     ):
         """Update state after block allocation."""
+        # Admitted: its lookup result is used up (the next admission, e.g.
+        # after preemption, looks up again).
+        self.client.discard(request.request_id)
         local_block_ids: tuple[list[int], ...] = ()
         if num_external_tokens > 0:
             local_block_ids = blocks.get_block_ids(
@@ -310,6 +358,8 @@ class MooncakeStoreScheduler:
 
         for finished_req_id in scheduler_output.finished_req_ids:
             self.client.discard(finished_req_id)
+            self._resume_tokens.pop(finished_req_id, None)
+            self._req_origin_tokens.pop(finished_req_id, None)
             self.load_specs.pop(finished_req_id, None)
             self._request_trackers.pop(finished_req_id, None)
             self._unfinished_requests.pop(finished_req_id, None)
@@ -317,6 +367,8 @@ class MooncakeStoreScheduler:
 
         preempted_ids = scheduler_output.preempted_req_ids or set()
         for req_id in preempted_ids:
+            self._resume_tokens.pop(req_id, None)
+            self._req_origin_tokens.pop(req_id, None)
             self.load_specs.pop(req_id, None)
             if request_tracker := self._request_trackers.get(req_id):
                 request_tracker.reset()
@@ -341,6 +393,17 @@ class MooncakeStoreScheduler:
             unfolded_block_ids = tuple(
                 request.block_ids[group_id].copy() for group_id in self._store_group_ids
             )
+
+            if (
+                self.prune_superseded_checkpoints
+                and request.num_computed_tokens > 0
+                and request.num_computed_tokens % self._hash_block_size == 0
+            ):
+                self._resume_tokens[request.req_id] = request.num_computed_tokens
+                if self.prune_policy == "lag1":
+                    self._req_origin_tokens[request.req_id] = (
+                        request.num_computed_tokens
+                    )
 
             prefill_tokens = _new_req_prefill_tokens(request)
             request_tracker = RequestTracker(
@@ -664,6 +727,7 @@ class MooncakeStoreScheduler:
         pool.touch([pool.blocks[block_id] for block_id in pinned_block_ids])
 
         req_meta.store_job_id = store_job_id
+        self._record_state_origins(request.request_id, request.block_hashes, mamba_puts)
         self._finished_partial_tail_metas[request.request_id] = req_meta
         tracker.has_pending_offload = True
         # The store job owns exact block refs, so request cleanup need not wait.
@@ -709,8 +773,18 @@ class MooncakeStoreScheduler:
             if not accepted:
                 continue
             tracker.has_pending_offload = True
+            prune_resume_tokens = self._take_prune_resume_tokens(req_id, accepted)
+            prune_targets: tuple[tuple[int, float], ...] = ()
+            if prune_resume_tokens and self.prune_policy == "lag1":
+                prune_targets = self._lag1_prune_targets(
+                    prune_resume_tokens, req_tuple[0].block_hashes
+                )
+                prune_resume_tokens = 0
+            self._record_state_origins(req_id, req_tuple[0].block_hashes, accepted)
             if (req_meta := save_metas.get(req_id)) is not None:
                 req_meta.boundary_puts = accepted
+                req_meta.prune_resume_tokens = prune_resume_tokens
+                req_meta.prune_targets = prune_targets
                 continue
             meta.add_request(
                 ReqMeta(
@@ -723,8 +797,59 @@ class MooncakeStoreScheduler:
                     prefill_end_tokens=tracker.prefill_end_tokens,
                     boundary_puts=accepted,
                     completed_token_len=tracker.token_len,
+                    prune_resume_tokens=prune_resume_tokens,
+                    prune_targets=prune_targets,
                 )
             )
+
+    def _record_state_origins(
+        self, req_id: str, block_hashes: Sequence[bytes], puts: Sequence[BoundaryPut]
+    ) -> None:
+        """lag1: remember the resume point of the request that stored each state."""
+        origin = self._req_origin_tokens.get(req_id)
+        if not origin:
+            return
+        for put in puts:
+            idx = put.num_tokens // self._hash_block_size - 1
+            if 0 <= idx < len(block_hashes):
+                key = bytes(block_hashes[idx])
+                self._state_origin[key] = origin
+                self._state_origin.move_to_end(key)
+        while len(self._state_origin) > _STATE_ORIGIN_CAPACITY:
+            self._state_origin.popitem(last=False)
+
+    def _lag1_prune_targets(
+        self, resume_tokens: int, block_hashes: Sequence[bytes]
+    ) -> tuple[tuple[int, float], ...]:
+        """lag1: prune the state this resume point's producer resumed from now,
+        and the resume point itself only after ``prune_lag_ttl_s``."""
+        targets: list[tuple[int, float]] = []
+        idx = resume_tokens // self._hash_block_size - 1
+        if 0 <= idx < len(block_hashes):
+            origin = self._state_origin.get(bytes(block_hashes[idx]))
+            if origin and origin < resume_tokens:
+                targets.append((origin, self._prune_delay_s))
+        if self._prune_lag_ttl_s > 0:
+            targets.append(
+                (resume_tokens, max(self._prune_lag_ttl_s, self._prune_delay_s))
+            )
+        return tuple(targets)
+
+    def _take_prune_resume_tokens(
+        self, req_id: str, accepted: list[BoundaryPut]
+    ) -> int:
+        """The resume point to prune once ``accepted`` (boundary states) land.
+
+        Only the request's first boundary state beyond the point it resumed
+        from supersedes it; returns 0 when nothing is to be pruned.
+        """
+        resume_tokens = self._resume_tokens.get(req_id)
+        if not resume_tokens or not any(
+            put.num_tokens > resume_tokens for put in accepted
+        ):
+            return 0
+        del self._resume_tokens[req_id]
+        return resume_tokens
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
         """Drop the block references of store jobs every rank has finished."""

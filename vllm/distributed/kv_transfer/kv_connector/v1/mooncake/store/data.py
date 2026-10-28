@@ -737,11 +737,15 @@ class MooncakeLookupResult:
         tail_key_boundaries: Hash boundary used to store each cache group's
             tail block when ``hit_length`` does not identify its store key.
             There is one entry per group for every nonzero hit.
+        known_prefix_tokens: Local (GPU) hit the lookup trusted instead of
+            probing the store (0 = the whole prefix was probed). Not on the
+            wire; the client fills it in.
 
     """
 
     hit_length: int
     tail_key_boundaries: tuple[TailKeyBoundary, ...] = ()
+    known_prefix_tokens: int = 0
 
 
 @dataclass
@@ -841,6 +845,14 @@ class ReqMeta:
     # Set on the save that first covers the whole prompt, so the scheduler
     # publishes the prompt's partial tail once rather than on every save.
     publish_partial_tail: bool = False
+    # Prefix length this request resumed from (its first-step cache hit). Set,
+    # with prune_superseded_checkpoints, on the job that stores the request's
+    # first boundary state beyond it: once that put succeeds, the superseded
+    # resume-point state and partial-tail keys are removed from the store.
+    prune_resume_tokens: int = 0
+    # Other resume states to remove, as (prefix length, delay in seconds), for
+    # policies other than the default (``prune_policy``).
+    prune_targets: tuple[tuple[int, float], ...] = ()
 
     @staticmethod
     def from_request_tracker(

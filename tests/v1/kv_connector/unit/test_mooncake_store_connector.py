@@ -827,7 +827,13 @@ def test_lookup_key_client_non_block_lookup_async():
     # Release the executor; a later poll returns the hit length.
     gate.set()
     assert _poll_lookup(client, "req1") == 7
-    # Future is consumed (popped) on read.
+    # The result is kept for the rest of the admission attempt: a repeated
+    # query (e.g. a demoted request re-queued in the same step) reuses it
+    # instead of starting a new lookup.
+    assert client.lookup("req1", 128, [], non_block=True).hit_length == 7
+    assert fake_socket.send_multipart.call_count == 1
+    # Admission or finish drops it.
+    client.discard("req1")
     assert "req1" not in client.futures
 
 

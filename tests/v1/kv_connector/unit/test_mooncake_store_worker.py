@@ -4247,6 +4247,78 @@ def test_lookup_partial_tail_uses_hash_alignment():
     assert worker.lookup(13, [b"h0", b"h1", b"h2"]).hit_length == 12
 
 
+def _hybrid_partial_worker():
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheGroupSpec,
+        MambaSpec,
+    )
+
+    worker = _make_bare_worker(block_size=16)
+    full = FullAttentionSpec(block_size=16, num_kv_heads=8, head_size=64, dtype=None)
+    mamba = MambaSpec(
+        block_size=16,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+    worker._kv_cache_groups = [
+        KVCacheGroupSpec(["full"], full),
+        KVCacheGroupSpec(["mamba"], mamba),
+    ]
+    worker.hash_block_size = 4
+    worker.token_dbs = [
+        ChunkedTokenDatabase(
+            KeyMetadata("test-model", 0, 0, 0, 0, group_id=group_id),
+            block_size=16,
+            hash_block_size=4,
+        )
+        for group_id in range(2)
+    ]
+    worker.coord = mooncake_store_worker.MooncakeStoreCoordinator(
+        worker._kv_cache_groups,
+        scheduler_block_size=16,
+        hash_block_size=4,
+        enable_partial_hash_hits=True,
+    )
+    _refresh_group_tp_replication_factors(worker)
+    return worker
+
+
+def test_lookup_known_prefix_probes_only_above_local_hit():
+    """With a 16-token local hit, units below it are not probed: attention
+    units count as present, state units as absent."""
+    worker = _hybrid_partial_worker()
+    hashes = [f"h{i}".encode() for i in range(9)]  # 36 tokens, hash unit 4
+    # The store holds only what the GPU did not: full units 4..7, mamba at 32.
+    stored = {(0, h.hex()) for h in hashes[4:8]} | {(1, hashes[7].hex())}
+
+    def exists(keys):
+        return [
+            1 if (int(k.split("@group:")[1][0]), k.rsplit("@", 1)[1]) in stored else 0
+            for k in keys
+        ]
+
+    worker.store.batch_is_exist.side_effect = exists
+    assert worker.lookup(37, hashes).hit_length == 0  # units 0..3 are not stored
+
+    result = worker.lookup(37, hashes, known_prefix_tokens=16)
+    assert result.hit_length == 32
+    assert result.known_prefix_tokens == 16
+    probed = worker.store.batch_is_exist.call_args.args[0]
+    assert len(probed) == 2 * 5  # units 4..8, two groups, one namespace
+    assert not any(k.endswith(tuple(h.hex() for h in hashes[:4])) for k in probed)
+
+
+def test_lookup_known_prefix_rounds_down_to_scheduler_block():
+    worker = _hybrid_partial_worker()
+    hashes = [f"h{i}".encode() for i in range(9)]
+    worker.store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    worker.lookup(37, hashes, known_prefix_tokens=20)  # block 16..32 holds 20
+    probed = worker.store.batch_is_exist.call_args.args[0]
+    assert len(probed) == 2 * 5  # still from unit 4 (token 16)
+
+
 def test_lookup_full_hit_reuses_existing_boundary():
     """A full hit is re-derived below the request end without another RPC."""
     worker = _make_bare_worker(block_size=16)
@@ -5336,3 +5408,234 @@ def test_blob_block_hashes_empty():
     view = BlobBlockHashes(memoryview(b""), 0)
     assert len(view) == 0
     assert list(view) == []
+
+
+def test_resolve_device_name_plain_list_unchanged():
+    assert mooncake_store.parse_numa_device_names("mlx5_0,mlx5_1") is None
+    assert mooncake_store.resolve_device_name("mlx5_0,mlx5_1") == "mlx5_0,mlx5_1"
+    assert mooncake_store.resolve_device_name("") == ""
+
+
+def test_resolve_device_name_numa_table():
+    spec = "numa:0=mlx5_0,mlx5_1;1=mlx5_6,mlx5_7"
+    assert mooncake_store.parse_numa_device_names(spec) == {
+        0: "mlx5_0,mlx5_1",
+        1: "mlx5_6,mlx5_7",
+    }
+    assert mooncake_store.resolve_device_name(spec, numa_node=0) == "mlx5_0,mlx5_1"
+    assert mooncake_store.resolve_device_name(spec, numa_node=1) == "mlx5_6,mlx5_7"
+    with pytest.raises(ValueError, match="no entry for NUMA node 2"):
+        mooncake_store.resolve_device_name(spec, numa_node=2)
+
+
+def test_resolve_device_name_uses_current_device_numa_node(monkeypatch):
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(
+        type(current_platform),
+        "get_all_device_numa_nodes",
+        classmethod(lambda cls: [0, 0, 1, 1]),
+    )
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 2)
+    assert mooncake_store.resolve_device_name("numa:0=mlx5_0;1=mlx5_6") == "mlx5_6"
+
+
+@pytest.mark.parametrize("spec", ["numa:", "numa:0", "numa:x=mlx5_0", "numa:0="])
+def test_resolve_device_name_rejects_malformed_tables(spec):
+    with pytest.raises(ValueError):
+        mooncake_store.parse_numa_device_names(spec)
+
+
+def _make_prune_send_thread(store):
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheGroupSpec,
+        MambaSpec,
+    )
+
+    full = FullAttentionSpec(block_size=16, num_kv_heads=8, head_size=64, dtype=None)
+    mamba = MambaSpec(
+        block_size=16,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+    coord = mooncake_store_worker.MooncakeStoreCoordinator(
+        [KVCacheGroupSpec(["full"], full), KVCacheGroupSpec(["mamba"], mamba)],
+        scheduler_block_size=16,
+        hash_block_size=4,
+        enable_partial_hash_hits=True,
+    )
+    dbs = []
+    for group_id in range(2):
+        db = ChunkedTokenDatabase(
+            KeyMetadata("test-model", 0, 0, 0, 0, group_id=group_id),
+            block_size=16,
+            hash_block_size=4,
+        )
+        db.set_kv_caches_base_addr([0x1000 * (group_id + 1)])
+        db.set_block_len([256])
+        dbs.append(db)
+    return _make_store_sending_thread(store, coord=coord, token_databases=dbs)
+
+
+@pytest.mark.parametrize(
+    ("resume", "full_units", "state_unit"),
+    [
+        # Sub-block resume point: the partial-tail keys at the resume point
+        # and one hash unit later (speculative margin) plus the state key.
+        (20, [4, 5], 4),
+        # Block-aligned resume point: the aligned attention key is a chain
+        # block and is kept; only the one-unit-later tail key goes.
+        (32, [8], 7),
+    ],
+)
+def test_prune_superseded_removes_resume_point_keys(resume, full_units, state_unit):
+    store = MagicMock()
+    store.batch_remove.side_effect = lambda keys: [0] * len(keys)
+    thread = _make_prune_send_thread(store)
+    hs = [bytes([i + 1]) * 4 for i in range(12)]
+    req = ReqMeta(
+        req_id="req-a",
+        token_len_chunk=0,
+        block_ids=([1, 2, 3], [5]),
+        block_hashes=hs,
+        can_save=True,
+        prune_resume_tokens=resume,
+    )
+
+    thread.prune_delay_s = 0.0
+    thread._prune_superseded(req)
+    store.batch_remove.assert_not_called()  # queued until the lease runs out
+    thread._drain_prune_queue()
+
+    db_full, db_mamba = thread.token_databases
+    assert store.batch_remove.call_args.args[0] == [
+        *[db_full.key_for(BlockHash(hs[u])) for u in full_units],
+        db_mamba.key_for(BlockHash(hs[state_unit])),
+    ]
+
+
+def test_prune_superseded_runs_only_after_boundary_puts_succeed():
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_remove.side_effect = lambda keys: [0] * len(keys)
+    thread = _make_prune_send_thread(store)
+    hs = [bytes([i + 1]) * 4 for i in range(12)]
+
+    def req(job):
+        return ReqMeta(
+            req_id=f"req-{job}",
+            token_len_chunk=0,
+            block_ids=([1, 2, 3], [5]),
+            block_hashes=hs,
+            can_save=True,
+            boundary_puts=[(1, 7, 44)],
+            prune_resume_tokens=20,
+        )
+
+    thread.prune_delay_s = 0.0
+    store.batch_put_from_multi_buffers.side_effect = lambda keys, *a: [-1] * len(keys)
+    _run_store_req(thread, req(0))
+    _run_store_req(thread, req(1))  # drains the queue first: nothing queued
+    store.batch_remove.assert_not_called()
+
+    store.batch_put_from_multi_buffers.side_effect = lambda keys, *a: [256] * len(keys)
+    _run_store_req(thread, req(2))
+    thread._drain_prune_queue()
+    store.batch_remove.assert_called_once()
+
+
+def test_prune_retries_leased_keys_then_gives_up():
+    store = MagicMock()
+    thread = _make_prune_send_thread(store)
+    thread.prune_delay_s = 0.0
+    thread._prune_queue.append((0.0, ["k-leased", "k-gone", "k-ok"], 0))
+    codes = {
+        "k-leased": mooncake_store_worker.MOONCAKE_OBJECT_HAS_LEASE,
+        "k-gone": mooncake_store_worker.MOONCAKE_OBJECT_NOT_FOUND,
+        "k-ok": 0,
+    }
+    store.batch_remove.side_effect = lambda keys: [codes[k] for k in keys]
+
+    thread.prune_max_attempts = 3
+    thread._drain_prune_queue()
+    assert [entry[1:] for entry in thread._prune_queue] == [(["k-leased"], 1)]
+    for _ in range(3):
+        thread._drain_prune_queue()
+    assert not thread._prune_queue
+    assert store.batch_remove.call_count == 3
+
+
+def test_prune_policy_targets_use_their_own_delays():
+    store = MagicMock()
+    store.batch_remove.side_effect = lambda keys: [0] * len(keys)
+    thread = _make_prune_send_thread(store)
+    hs = [bytes([i + 1]) * 4 for i in range(12)]
+    req = ReqMeta(
+        req_id="req-a",
+        token_len_chunk=0,
+        block_ids=([1, 2, 3], [5]),
+        block_hashes=hs,
+        can_save=True,
+        prune_targets=((20, 0.0), (32, 3600.0)),
+    )
+
+    thread._prune_policy_targets(req)
+    thread._drain_prune_queue()
+
+    db_full, db_mamba = thread.token_databases
+    assert store.batch_remove.call_args.args[0] == [
+        *[db_full.key_for(BlockHash(hs[u])) for u in (4, 5)],
+        db_mamba.key_for(BlockHash(hs[4])),
+    ]
+    assert [entry[2] for entry in thread._prune_heap] == [
+        [db_full.key_for(BlockHash(hs[8])), db_mamba.key_for(BlockHash(hs[7]))]
+    ]
+
+
+def test_prune_heap_retries_leased_keys_on_the_heap():
+    store = MagicMock()
+    thread = _make_prune_send_thread(store)
+    thread.prune_delay_s = 0.0
+    thread._queue_prune(["k-leased", "k-ok"], 0.0)
+    store.batch_remove.side_effect = lambda keys: [
+        mooncake_store_worker.MOONCAKE_OBJECT_HAS_LEASE if k == "k-leased" else 0
+        for k in keys
+    ]
+
+    thread._drain_prune_queue()
+
+    assert not thread._prune_queue
+    assert [entry[2:] for entry in thread._prune_heap] == [(["k-leased"], 1)]
+
+
+@pytest.mark.parametrize("ttl_s", [0.0, 1e-9])
+def test_idle_tail_expiry_removes_the_jobs_boundary_states(ttl_s):
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_remove.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.side_effect = lambda keys, *a: [256] * len(keys)
+    thread = _make_prune_send_thread(store)
+    thread.prune_idle_tail_ttl_s = ttl_s
+    hs = [bytes([i + 1]) * 4 for i in range(12)]
+    req = ReqMeta(
+        req_id="req-0",
+        token_len_chunk=0,
+        block_ids=([1, 2, 3], [5]),
+        block_hashes=hs,
+        can_save=True,
+        boundary_puts=[(1, 7, 44)],
+    )
+
+    _run_store_req(thread, req)
+    thread._drain_prune_queue()
+
+    if not ttl_s:
+        assert not thread._prune_heap
+        store.batch_remove.assert_not_called()
+        return
+    _, db_mamba = thread.token_databases
+    store.batch_remove.assert_called_once_with(
+        [db_mamba.key_for(BlockHash(hs[44 // 4 - 1]))]
+    )

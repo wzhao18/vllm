@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -87,6 +88,16 @@ from vllm.v1.structured_output.utils import strip_speculative_padding
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+# A waiting request whose KV connector lookup stays pending this long is
+# admitted without the external hit (recomputed), so a stalled lookup can never
+# hold it forever.
+KV_CONNECTOR_LOOKUP_TIMEOUT_S = float(
+    os.getenv("VLLM_KV_CONNECTOR_LOOKUP_TIMEOUT_S", "10")
+)
+# WAITING_FOR_REMOTE_KVS for this long logs a warning (the load cannot be
+# abandoned: a late transfer may still write the request's blocks).
+KV_CONNECTOR_LOAD_WARN_S = 60.0
 
 
 def new_req_token_trim_supported(vllm_config: VllmConfig) -> bool:
@@ -178,6 +189,11 @@ class Scheduler(SchedulerInterface):
         self.adaptive_long_prefill_threshold = (
             self.scheduler_config.long_prefill_token_threshold_adaptive
         )
+        # request id -> time its KV connector lookup was first found pending.
+        self._connector_lookup_pending_since: dict[str, float] = {}
+        self._connector_lookup_timed_out: set[str] = set()
+        # request id -> time it entered WAITING_FOR_REMOTE_KVS (warn once).
+        self._remote_kv_wait_since: dict[str, float] = {}
         self.max_model_len = vllm_config.model_config.max_model_len
         # DCP ShardQ (sparse MLA) gathers each step's prefill rows' context
         # into a fixed workspace: keep the rows' context pages within it so
@@ -1320,11 +1336,34 @@ class Scheduler(SchedulerInterface):
                             ext_tokens, load_kv_async = 0, False
 
                         if ext_tokens is None:
-                            # The request cannot be scheduled because
-                            # the KVConnector couldn't determine
-                            # the number of matched tokens.
-                            skip_request(request_queue)
-                            continue
+                            pending_since = (
+                                self._connector_lookup_pending_since.setdefault(
+                                    request_id, time.monotonic()
+                                )
+                            )
+                            waited = time.monotonic() - pending_since
+                            if waited < KV_CONNECTOR_LOOKUP_TIMEOUT_S:
+                                # The request cannot be scheduled because
+                                # the KVConnector couldn't determine
+                                # the number of matched tokens.
+                                skip_request(request_queue)
+                                continue
+                            # Bounded wait: admit without the external hit.
+                            if request_id not in self._connector_lookup_timed_out:
+                                self._connector_lookup_timed_out.add(request_id)
+                                logger.warning(
+                                    "KV connector lookup for request %s pending "
+                                    "for %.1f s; recomputing without the "
+                                    "external hit.",
+                                    request_id,
+                                    waited,
+                                )
+                            # Keep the mark: until the lookup resolves, later
+                            # admission attempts fall back at once.
+                            ext_tokens, load_kv_async = 0, False
+                        else:
+                            self._connector_lookup_pending_since.pop(request_id, None)
+                            self._connector_lookup_timed_out.discard(request_id)
 
                         if self.prefix_replay_tokens and not (
                             ext_tokens and self._load_restores_replay_window(request)
@@ -3261,6 +3300,9 @@ class Scheduler(SchedulerInterface):
             self.aux_output_connector.request_finished(request)
         self._inflight_prefills.discard(request)
         self.kv_cache_manager.finish_conversation_turn(request)
+        self._connector_lookup_pending_since.pop(request.request_id, None)
+        self._connector_lookup_timed_out.discard(request.request_id)
+        self._remote_kv_wait_since.pop(request.request_id, None)
         self._set_kv_fetch_stage(request, None)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
@@ -3749,7 +3791,19 @@ class Scheduler(SchedulerInterface):
             request_id = request.request_id
             if request_id not in self.finished_recving_kv_req_ids:
                 logger.debug("%s is still in WAITING_FOR_REMOTE_KVS state.", request_id)
+                now = time.monotonic()
+                since = self._remote_kv_wait_since.setdefault(request_id, now)
+                if since > 0 and now - since > KV_CONNECTOR_LOAD_WARN_S:
+                    # Warn once (a negative mark): no silent wait.
+                    self._remote_kv_wait_since[request_id] = -1.0
+                    logger.warning(
+                        "Request %s has waited %.0f s for its KV connector load "
+                        "(no finished/failed report yet).",
+                        request_id,
+                        now - since,
+                    )
                 return False
+            self._remote_kv_wait_since.pop(request_id, None)
             # Promote request to waiting or preempted.
             self._update_waiting_for_remote_kv(request)
             if request.num_preemptions:

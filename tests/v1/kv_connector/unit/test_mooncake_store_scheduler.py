@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections import OrderedDict
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -48,6 +49,15 @@ def _make_bare_scheduler(
     scheduler.save_decode_cache = save_decode_cache
     scheduler.enable_kv_events = False
     scheduler.lookup_async = False
+    scheduler.lookup_from_local_hit = False
+    scheduler.client = MagicMock()
+    scheduler.prune_superseded_checkpoints = False
+    scheduler._resume_tokens = {}
+    scheduler.prune_policy = "resume"
+    scheduler._prune_delay_s = 65.0
+    scheduler._prune_lag_ttl_s = 330.0
+    scheduler._state_origin = OrderedDict()
+    scheduler._req_origin_tokens = {}
     scheduler.enable_lookup = True
     scheduler._capacity_only = False
     scheduler._block_size = 16
@@ -1083,6 +1093,62 @@ def test_sub_block_prompt_not_looked_up_without_fine_grained():
     assert "req-0" not in scheduler.load_specs
 
 
+class _KnownPrefixLookupClient:
+    """Records the known prefix it was given; reports it like the real client."""
+
+    def __init__(self, hit_tokens: int, known_prefix_tokens: int | None = None):
+        self._hit_tokens = hit_tokens
+        self._known = known_prefix_tokens
+        self.calls: list[dict] = []
+
+    def lookup(self, req_id, num_tokens, block_hashes, non_block=False, **kwargs):
+        self.calls.append(kwargs)
+        known = (
+            self._known
+            if self._known is not None
+            else kwargs.get("known_prefix_tokens", 0)
+        )
+        return MooncakeLookupResult(self._hit_tokens, known_prefix_tokens=known)
+
+
+def test_lookup_from_local_hit_passes_local_hit_only_when_enabled():
+    request = SimpleNamespace(
+        request_id="req-0", num_tokens=48, block_hashes=[b"h0", b"h1", b"h2"]
+    )
+    scheduler = _make_bare_scheduler()
+    scheduler.load_async = True
+    scheduler.client = _KnownPrefixLookupClient(hit_tokens=32)
+    assert (
+        scheduler.get_num_new_matched_tokens(request, num_computed_tokens=16)[0] == 16
+    )
+    assert scheduler.client.calls == [{}]
+
+    scheduler = _make_bare_scheduler()
+    scheduler.load_async = True
+    scheduler.lookup_from_local_hit = True
+    scheduler.client = _KnownPrefixLookupClient(hit_tokens=32)
+    assert (
+        scheduler.get_num_new_matched_tokens(request, num_computed_tokens=16)[0] == 16
+    )
+    assert scheduler.client.calls == [{"known_prefix_tokens": 16}]
+
+
+def test_lookup_from_local_hit_drops_hit_when_local_hit_shrank():
+    # An async lookup trusted a 32-token local hit; on the retry the local hit is
+    # 16 (evicted), so tokens 16..32 were never probed in the store: recompute.
+    request = SimpleNamespace(
+        request_id="req-0", num_tokens=48, block_hashes=[b"h0", b"h1", b"h2"]
+    )
+    scheduler = _make_bare_scheduler()
+    scheduler.lookup_from_local_hit = True
+    scheduler.client = _KnownPrefixLookupClient(hit_tokens=32, known_prefix_tokens=32)
+    assert scheduler.get_num_new_matched_tokens(request, num_computed_tokens=16) == (
+        0,
+        False,
+    )
+    assert "req-0" not in scheduler.load_specs
+
+
 def test_disabled_lookup_reports_no_hit_without_querying_client():
     # With enable_lookup=False the connector reports no external hit without
     # consulting the lookup client, so admission is never deferred on a store
@@ -1765,3 +1831,75 @@ def test_worker_metadata_aggregates_completions_across_ranks():
         MooncakeStoreWorkerMetadata(completed_saves={1: 1, 2: 1})
     )
     assert merged.completed_saves == {1: 2, 2: 1}
+
+
+def test_prune_resume_tokens_taken_once_by_a_later_boundary_state():
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+        BoundaryPut,
+    )
+
+    scheduler = _make_bare_scheduler()
+    scheduler._resume_tokens["req-0"] = 32
+    # A state at or below the resume point does not supersede it.
+    assert scheduler._take_prune_resume_tokens("req-0", [BoundaryPut(1, 7, 32)]) == 0
+    assert scheduler._resume_tokens == {"req-0": 32}
+    assert scheduler._take_prune_resume_tokens("req-0", [BoundaryPut(1, 7, 48)]) == 32
+    assert scheduler._resume_tokens == {}
+    assert scheduler._take_prune_resume_tokens("req-0", [BoundaryPut(1, 7, 64)]) == 0
+
+
+def _lag1_scheduler(lag_ttl_s: float = 330.0):
+    scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
+    scheduler.prune_superseded_checkpoints = True
+    scheduler.prune_policy = "lag1"
+    scheduler._prune_delay_s = 6.0
+    scheduler._prune_lag_ttl_s = lag_ttl_s
+    _register_offload_request(scheduler, prefill_end_tokens=64, num_prompt_tokens=64)
+    scheduler._resume_tokens["req-0"] = 32
+    scheduler._req_origin_tokens["req-0"] = 32
+    return scheduler, scheduler._unfinished_requests["req-0"][0].block_hashes
+
+
+def _store_state_at_48(scheduler):
+    out = _make_offload_only_output([(1, 7, 48)], block_ids=([7],))
+    return scheduler.build_connector_meta(out).requests[0]
+
+
+@pytest.mark.parametrize(
+    ("producer_resume", "lag_ttl_s", "expected"),
+    [
+        # The state resumed from (32) was produced by a request that resumed
+        # from 16: prune 16 now, keep 32 for the lag TTL.
+        (16, 330.0, ((16, 6.0), (32, 330.0))),
+        # Unknown producer: only the delayed removal of the resume point.
+        (None, 330.0, ((32, 330.0),)),
+        # TTL 0: the resume point stays until its successor's prune.
+        (16, 0.0, ((16, 6.0),)),
+    ],
+)
+def test_lag1_prunes_the_resume_point_of_the_state_resumed_from(
+    producer_resume, lag_ttl_s, expected
+):
+    scheduler, hashes = _lag1_scheduler(lag_ttl_s)
+    if producer_resume is not None:
+        scheduler._req_origin_tokens["prev"] = producer_resume
+        scheduler._record_state_origins("prev", hashes, [BoundaryPut(1, 5, 32)])
+
+    req_meta = _store_state_at_48(scheduler)
+
+    assert req_meta.prune_resume_tokens == 0
+    assert req_meta.prune_targets == expected
+    # The new state remembers that its producer resumed from 32.
+    assert scheduler._state_origin[bytes(hashes[48 // 4 - 1])] == 32
+
+
+def test_resume_policy_keeps_the_legacy_prune():
+    scheduler, _ = _lag1_scheduler()
+    scheduler.prune_policy = "resume"
+    scheduler._req_origin_tokens.clear()
+
+    req_meta = _store_state_at_48(scheduler)
+
+    assert req_meta.prune_resume_tokens == 32
+    assert req_meta.prune_targets == ()
+    assert not scheduler._state_origin
