@@ -194,7 +194,10 @@ class SpecializedDecode:
         # sequence parallelism).
         self.captured = config.captured
         seams = not getattr(backbone, "use_sequence_parallel", False)
-        wide = cc == (10, 7) and q > 1 and seams
+        # K3.1 DSA layers have no wide (> PREPARED_MAX rows) provider: those captured
+        # graphs run the stock forward.
+        dsa = getattr(backbone.config, "dsa_config", None) is not None
+        wide = cc == (10, 7) and q > 1 and seams and not dsa
         rows = [m for m in self.captured if m > PREPARED_MAX and wide]
         self.wide = tuple(m for m in rows if rows_policy(WIDE_ROWS, Shape(m, q), 0))
         self.batches = tuple(sorted({*self.tuned, *self.wide}))
