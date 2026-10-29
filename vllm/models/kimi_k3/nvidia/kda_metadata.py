@@ -328,6 +328,9 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
         # Per batch row of the next build: the row is its request's first
         # scheduled chunk (V2 runner model state; mamba_internal_snapshot).
         self.mamba_snapshot_first_chunk: Sequence[bool] | None = None
+        # (batch_size, num_spec_decodes) of a step whose graph buffers the model
+        # state's fused step prep (step_prep.py) already staged; consumed by build().
+        self.prestaged: tuple[int, int] | None = None
         self.recoverssm_num_accepted_tokens: torch.Tensor | None = None
         self.recoverssm_context: KDARecoverSSMCommitContext | None = None
         if self.use_recoverssm:
@@ -375,6 +378,7 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
         query_start_loc = m.query_start_loc
         query_start_loc_cpu = m.query_start_loc_cpu
         assert isinstance(self.kv_cache_spec, MambaSpec)
+        prestaged, self.prestaged = self.prestaged, None
         # Equivalent PyTorch "align" path:
         #   start = ((seq_lens - 1) // block_size).clamp_(min=0)
         #   offsets = torch.arange(1 + num_speculative_blocks, dtype=torch.int32)
@@ -644,15 +648,16 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
             #   state[:N].copy_(state_src); state[N:].fill_(NULL_BLOCK_ID)
             #   qsl[:N + 1].copy_(qsl_src); qsl[N + 1:].fill_(qsl_src[-1])
             #   accepted[:N].copy_(accepted_src); accepted[N:].fill_(1)
-            stage_spec_decode_metadata(
-                state_indices=spec_state_indices_tensor,
-                query_start_loc=spec_query_start_loc,
-                num_accepted_tokens=num_accepted_tokens,
-                staged_state_indices=self.spec_state_indices_tensor[:batch_size],
-                staged_query_start_loc=self.spec_query_start_loc[: batch_size + 1],
-                staged_num_accepted_tokens=self.num_accepted_tokens[:batch_size],
-                num_spec_decodes=num_spec_decodes,
-            )
+            if prestaged != (batch_size, num_spec_decodes):
+                stage_spec_decode_metadata(
+                    state_indices=spec_state_indices_tensor,
+                    query_start_loc=spec_query_start_loc,
+                    num_accepted_tokens=num_accepted_tokens,
+                    staged_state_indices=self.spec_state_indices_tensor[:batch_size],
+                    staged_query_start_loc=self.spec_query_start_loc[: batch_size + 1],
+                    staged_num_accepted_tokens=self.num_accepted_tokens[:batch_size],
+                    num_spec_decodes=num_spec_decodes,
+                )
 
             spec_state_indices_tensor = self.spec_state_indices_tensor[:batch_size]
             spec_query_start_loc = self.spec_query_start_loc[: batch_size + 1]

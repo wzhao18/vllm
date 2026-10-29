@@ -50,7 +50,12 @@ class RequestState:
         # is crucial, as certain features such as prompt logprobs or frequency penalties
         # must treat prompt and output tokens separately.
         self.prompt_len = UvaBackedTensor(self.max_num_reqs, dtype=torch.int32)
-        self.prefill_len = UvaBackedTensor(self.max_num_reqs, dtype=torch.int32)
+        # Device-resident (copied when a request is added): the step's input and
+        # verification kernels read it from every CTA, and a UVA read of pinned host
+        # memory on a remote NUMA node holds the step up at the next collective.
+        self.prefill_len = UvaBackedTensor(
+            self.max_num_reqs, dtype=torch.int32, device=device
+        )
         # total_len = prompt_len + output_len. It grows as the request progresses.
         self.total_len = StagedWriteTensor(
             self.max_num_reqs, dtype=torch.int32, device=device

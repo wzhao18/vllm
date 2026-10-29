@@ -200,15 +200,14 @@ class DSparkSpeculator(DFlashSpeculator):
         )
         torch.accelerator.synchronize()
 
-    def _fused_sampled_markov(self, num_reqs: int, head_hidden: torch.Tensor) -> bool:
-        """Let the draft model run every Markov position of probabilistic drafting in
-        one fused call (``sampled_markov_draft``: the stock draws of
-        ``_sample_logits``, and the draft logits cached as it caches them). Only plain
-        anchor-as-first drafting qualifies; anything else, or a False from the model,
-        keeps the loop below."""
+    def _fused_greedy_markov(self, num_reqs: int, head_hidden: torch.Tensor) -> bool:
+        """Let the draft model run every Markov position in one fused call:
+        ``greedy_markov_draft`` for greedy drafting, ``sampled_markov_draft`` for
+        probabilistic drafting (the stock draws of ``_sample_logits``, and the draft
+        logits cached as it caches them). Only plain anchor-as-first drafting
+        qualifies; anything else, or a False from the model, keeps the loop below."""
         if (
-            self.draft_logits is None
-            or self._draft_topk is not None
+            self._draft_topk is not None
             or self.use_confidence_head
             or self.acceptance_estimator is not None
             or self.draft_watermarker is not None
@@ -222,6 +221,9 @@ class DSparkSpeculator(DFlashSpeculator):
         step = self.num_query_per_req
         anchors = self.input_buffers.input_ids[: num_reqs * step : step]
         draft = self.draft_tokens[:num_reqs]
+        if self.draft_logits is None:
+            fused = getattr(self.model, "greedy_markov_draft", None)
+            return fused is not None and fused(head_hidden[:num_sample], anchors, draft)
         fused = getattr(self.model, "sampled_markov_draft", None)
         if fused is None or self.use_fp64_gumbel or self._d2t_scatter_index is not None:
             return False
@@ -246,7 +248,7 @@ class DSparkSpeculator(DFlashSpeculator):
             self.model.gather_draft_logits(self.draft_logits, idx_mapping)
 
     def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
-        if self._fused_sampled_markov(num_reqs, head_hidden):
+        if self._fused_greedy_markov(num_reqs, head_hidden):
             return
         if self._draft_topk is not None:
             self._sample_sequential_topk(num_reqs, head_hidden)

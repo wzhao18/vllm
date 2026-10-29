@@ -610,6 +610,8 @@ class ModelCudaGraphManager(CudaGraphManager):
         self.hidden_states: torch.Tensor | None = None
         self.aux_hidden_states: list[torch.Tensor] = []
         self.use_aux_hidden_state_outputs = False
+        # A FULL graph's own output tensors (last PP rank), returned as they are.
+        self.graph_outputs: dict[BatchExecutionDescriptor, Any] = {}
         self.intermediate_tensors: IntermediateTensors | None = None
 
     def capture(
@@ -783,6 +785,14 @@ class ModelCudaGraphManager(CudaGraphManager):
                     # model outputs. No need to keep track of the hidden states.
                     return None
 
+                if desc.cg_mode == CUDAGraphMode.FULL and self.is_last_pp_rank:
+                    # The captured outputs live in the graph pool and keep their
+                    # addresses across replays: return them as they are instead of
+                    # copying them into shared buffers at the end of every replay.
+                    if torch.cuda.is_current_stream_capturing():
+                        self.graph_outputs[desc] = model_output
+                    return None
+
                 store_capture_output(num_tokens, model_output)
 
             return forward_fn
@@ -794,6 +804,8 @@ class ModelCudaGraphManager(CudaGraphManager):
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]] | IntermediateTensors:
         """Replay a captured FULL cudagraph and return hidden states."""
         super().run_fullgraph(desc)
+        if desc in self.graph_outputs:
+            return self.graph_outputs[desc]
         if not self.is_last_pp_rank:
             assert self.intermediate_tensors is not None
             return self.intermediate_tensors[: desc.num_tokens]

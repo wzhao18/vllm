@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
-from typing import Any, ClassVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import torch
 import torch.nn as nn
@@ -23,6 +23,11 @@ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.encoder_runner import EncoderRunner
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.buffer_utils import DirectH2D, PrefetchedH2D
+    from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+    from vllm.v1.worker.gpu.model_runner import BatchReqState
 
 
 class ModelSpecificAttnMetadata:
@@ -172,6 +177,30 @@ class ModelState(ABC):
         num_sampled: torch.Tensor,
         num_computed_tokens: torch.Tensor | None = None,
     ) -> None:
+        return None
+
+    def defers_step_prep(
+        self,
+        batch_req_state: "BatchReqState",
+        batch_desc: "BatchExecutionDescriptor",
+        input_buffers: InputBuffers,
+        req_states: RequestState,
+    ) -> bool:
+        """Asked before the runner prepares a step's inputs (without PCP, fast
+        prefill or adaptive verification): whether this state's ``prepare_attn``
+        fills what the runner would launch kernels for (``is_padding``,
+        ``input_ids``, ``positions``, ``seq_lens``, ``expanded_idx_mapping``,
+        ``expanded_local_pos``, ``logits_indices``, the gathered block tables, the
+        slot mappings and the DCP local lengths), so the runner launches none of
+        them. False by default."""
+        return False
+
+    def stage_step_inputs(self, h2d: "DirectH2D | PrefetchedH2D") -> None:
+        """Called in ``prepare_inputs`` when ``defers_step_prep`` returned True,
+        before the step's host-to-device copy is flushed: the state may ``stage``
+        host arrays its deferred step prep reads, so that kernel reads device
+        copies (sent with the step's other inputs) instead of host memory. None by
+        default."""
         return None
 
     @abstractmethod

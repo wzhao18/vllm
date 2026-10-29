@@ -10,7 +10,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
-from vllm.utils.platform_utils import is_uva_available
+from vllm.utils.platform_utils import is_pin_memory_available, is_uva_available
 from vllm.utils.torch_utils import (
     TORCH_DTYPE_TO_ARRAY_TYPECODE,
     get_accelerator_view_from_cpu_tensor,
@@ -130,6 +130,7 @@ class UvaBackedTensor:
         size: int | Sequence[int],
         dtype: torch.dtype,
         max_concurrency: int | None = None,
+        device: torch.device | None = None,
     ):
         self.dtype = dtype
 
@@ -139,12 +140,134 @@ class UvaBackedTensor:
 
         # Buffers for concurrency
         self.pool = UvaBufferPool(size, dtype, max_concurrency)
-        self.gpu = self.pool.copy_to_uva(self.np)
+        # With a device, `gpu` is a device-memory copy of the values, refreshed
+        # by an async host-to-device copy in copy_to_uva(). Use it for values
+        # that kernels read from many CTAs: every UVA read goes to host memory,
+        # which costs ~100 us per kernel when the pinned buffer sits on a
+        # remote NUMA node. Round-robin like the pool, so readers of the
+        # previous copy are never overwritten.
+        self._device_bufs: list[torch.Tensor] = []
+        if device is not None:
+            self._device_bufs = [
+                torch.zeros(size, dtype=dtype, device=device)
+                for _ in range(self.pool.max_concurrency)
+            ]
+        self._device_idx = 0
+        self.copy_to_uva()
 
     def copy_to_uva(self, n: int | None = None) -> torch.Tensor:
-        # CPU-to-CPU copy
-        self.gpu = self.pool.copy_to_uva(self.np[:n] if n is not None else self.np)
+        x = self.np[:n] if n is not None else self.np
+        if not self._device_bufs:
+            # CPU-to-CPU copy
+            self.gpu = self.pool.copy_to_uva(x)
+        else:
+            # CPU-to-CPU copy, then an async CPU-to-GPU copy
+            self._device_idx = (self._device_idx + 1) % len(self._device_bufs)
+            out = self._device_bufs[self._device_idx][: len(x)]
+            self.gpu = self.pool.copy_to_gpu(x, out=out)
         return self.gpu
+
+
+class DirectH2D:
+    """Copies a step's small input arrays to the GPU on the current stream as
+    they are staged (the default; see PrefetchedH2D for the protocol)."""
+
+    def __init__(self, device: torch.device):
+        self.device = device
+
+    def begin_step(self) -> None:
+        pass
+
+    def stage(
+        self, x: np.ndarray, dtype: torch.dtype, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        return async_tensor_h2d(x, device=self.device, dtype=dtype, out=out)
+
+    def flush(self) -> None:
+        pass
+
+
+class PrefetchedH2D:
+    """Host-to-device copy of a step's small input arrays, issued on a side
+    stream as soon as the host has prepared them. Opt-in (the model sets
+    `prefetch_step_inputs`).
+
+    A tiny cudaMemcpyAsync between two kernels of the main stream costs
+    ~5-25 us of GPU time (a copy-engine round trip; more when the pinned
+    staging memory sits on the GPU's remote NUMA node), while the host usually
+    prepares a step while the GPU still runs the previous ones. Here the arrays
+    are packed into one pinned buffer and copied in one go on a side stream;
+    the main stream only waits on the copy's event, which has usually
+    completed by then.
+
+    Per step: begin_step(), stage() each array, then flush() before the main
+    stream reads any of them. stage() returns a view of a device staging
+    buffer, or with `out` copies into `out` (D2D, on the main stream) at
+    flush().
+
+    Ordering invariant: staging buffers rotate over `depth` steps, and the
+    copy of step n waits until the main stream has started step
+    n - depth + 1. So every reader of a staged view must run on the main
+    stream (or be joined back to it) within its step, and begin_step() must
+    be called on the main stream once per step, before the step's GPU work.
+    """
+
+    _NP_DTYPES = {torch.int32: np.int32, torch.int64: np.int64}
+
+    def __init__(self, nbytes: int, device: torch.device, depth: int = 3):
+        self.depth = depth
+        self.nbytes = nbytes
+        pin = is_pin_memory_available()
+        self.pinned = [
+            torch.empty(nbytes, dtype=torch.uint8, pin_memory=pin) for _ in range(depth)
+        ]
+        self.pinned_np = [buf.numpy() for buf in self.pinned]
+        self.gpu = [
+            torch.empty(nbytes, dtype=torch.uint8, device=device) for _ in range(depth)
+        ]
+        self.stream = torch.cuda.Stream(device)
+        # Per slot: a main-stream event at the start of its step, and the
+        # event of its copy.
+        self.started = [torch.cuda.Event() for _ in range(depth)]
+        self.copied = [torch.cuda.Event() for _ in range(depth)]
+        self.slot = 0
+        self.offset = 0
+        self.outs: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def begin_step(self) -> None:
+        self.slot = (self.slot + 1) % self.depth
+        self.offset = 0
+        self.outs.clear()
+        # The pinned slot must no longer be read by its previous copy.
+        self.copied[self.slot].synchronize()
+        self.started[self.slot].record()
+
+    def stage(
+        self, x: np.ndarray, dtype: torch.dtype, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        x = np.ascontiguousarray(x, dtype=self._NP_DTYPES[dtype])
+        start, n = self.offset, x.nbytes
+        self.offset = start + (n + 15) // 16 * 16
+        assert self.offset <= self.nbytes, "PrefetchedH2D buffer too small"
+        self.pinned_np[self.slot][start : start + n] = x.reshape(-1).view(np.uint8)
+        view = self.gpu[self.slot][start : start + n].view(dtype).view(x.shape)
+        if out is None:
+            return view
+        self.outs.append((out, view))
+        return out
+
+    def flush(self) -> None:
+        slot, n = self.slot, self.offset
+        main = torch.cuda.current_stream()
+        # The slot was last read by step n - depth, which has ended once the
+        # main stream starts step n - depth + 1.
+        self.stream.wait_event(self.started[(slot + 1) % self.depth])
+        with torch.cuda.stream(self.stream):
+            self.gpu[slot][:n].copy_(self.pinned[slot][:n], non_blocking=True)
+            self.copied[slot].record()
+        main.wait_event(self.copied[slot])
+        for out, view in self.outs:
+            out.copy_(view)
 
 
 class StagedWriteTensor:

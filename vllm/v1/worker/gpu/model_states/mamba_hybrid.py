@@ -10,6 +10,7 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncsByType
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
@@ -225,6 +226,7 @@ class MambaHybridModelState(DefaultModelState):
             num_reqs,
             BLOCK_SIZE=block,
             MAMBA_BLOCK_SIZE=mamba_spec.block_size,
+            launch_pdl=current_platform.is_arch_support_pdl(),
         )
         ctx.run_fused_precopy(
             num_reqs,
@@ -280,10 +282,7 @@ class MambaHybridModelState(DefaultModelState):
         num_accepted_tokens = None
         num_decode_draft_tokens_cpu = None
         if not for_capture and self.vllm_config.num_speculative_tokens > 0:
-            num_accepted_tokens = self.num_accepted_tokens_gpu.new_ones(num_reqs)
-            num_accepted_tokens[: input_batch.num_reqs] = self.num_accepted_tokens_gpu[
-                input_batch.idx_mapping
-            ]
+            num_accepted_tokens = self.gather_num_accepted_tokens(input_batch, num_reqs)
 
             # GDN uses >= 0 to select spec-decode rows, so non-decode rows
             # need the -1 sentinel. Decode rows without drafts stay spec rows:
@@ -317,9 +316,8 @@ class MambaHybridModelState(DefaultModelState):
                     if hasattr(builder, "mamba_aligned_state_indices"):
                         aligned_index_builders.append((group_idx, builder))
             if aligned_index_builders:
-                assert self._mamba_ctx is not None
-                all_group_indices = self._mamba_ctx.compute_aligned_state_indices(
-                    input_batch.seq_lens, num_reqs
+                all_group_indices = self.compute_aligned_state_indices(
+                    input_batch, num_reqs
                 )
                 for group_idx, builder in aligned_index_builders:
                     builder.mamba_aligned_state_indices = all_group_indices[group_idx]
@@ -367,6 +365,27 @@ class MambaHybridModelState(DefaultModelState):
             )
         return attn_metadata
 
+    def gather_num_accepted_tokens(
+        self, input_batch: InputBatch, num_reqs: int
+    ) -> torch.Tensor:
+        """Each batch row's accepted-token count from the last step (1 on
+        CUDA-graph padding rows)."""
+        num_accepted_tokens = self.num_accepted_tokens_gpu[input_batch.idx_mapping]
+        if num_reqs > input_batch.num_reqs:
+            # CUDA-graph padding rows: 1 (the neutral non-spec value).
+            padding = num_accepted_tokens.new_ones(num_reqs - input_batch.num_reqs)
+            num_accepted_tokens = torch.cat([num_accepted_tokens, padding])
+        return num_accepted_tokens
+
+    def compute_aligned_state_indices(
+        self, input_batch: InputBatch, num_reqs: int
+    ) -> torch.Tensor:
+        """Every Mamba group's aligned state indices [groups, num_reqs, slots]."""
+        assert self._mamba_ctx is not None
+        return self._mamba_ctx.compute_aligned_state_indices(
+            input_batch.seq_lens, num_reqs
+        )
+
     def postprocess_state(
         self,
         idx_mapping: torch.Tensor,
@@ -376,7 +395,16 @@ class MambaHybridModelState(DefaultModelState):
         # Chunked prefill does not sample a token, so num_sampled can be 0.
         # Mamba treats num_accepted_tokens=1 as the neutral non-spec value.
         num_reqs = idx_mapping.shape[0]
-        if num_reqs:
+        # The align postprocess kernel can derive and write the accepted counts.
+        fold = (
+            not isinstance(num_sampled, int)
+            and self.recoverssm is None
+            and self._align_mode
+            and num_computed_tokens is not None
+            and self._mamba_ctx is not None
+            and self._mamba_ctx.is_initialized
+        )
+        if num_reqs and not fold:
             if not isinstance(num_sampled, int):
                 # idx_mapping may contain -1 sentinels (filtered rows) under PP; the
                 # kernel skips them rather than scattering with a host-side gather.
@@ -384,6 +412,7 @@ class MambaHybridModelState(DefaultModelState):
                     idx_mapping,
                     num_sampled,
                     self.num_accepted_tokens_gpu,
+                    launch_pdl=current_platform.is_arch_support_pdl(),
                 )
             else:
                 # Fill with single value.
@@ -419,6 +448,7 @@ class MambaHybridModelState(DefaultModelState):
                 self._mamba_state_idx_gpu,
                 num_computed_tokens,
                 idx_mapping,
+                num_sampled if fold else None,
             )
 
 
@@ -427,7 +457,10 @@ def _scatter_num_accepted_kernel(
     idx_mapping_ptr,  # [num_reqs] batch_idx -> req_state_idx (-1 to skip)
     num_sampled_ptr,  # [num_reqs]
     num_accepted_ptr,  # [max_num_reqs]
+    launch_pdl: tl.constexpr = False,
 ):
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
     row = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + row)
     if req_state_idx < 0:

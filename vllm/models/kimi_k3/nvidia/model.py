@@ -1840,6 +1840,29 @@ class KimiLinearForCausalLM(
             hidden_states = self.model.norm(hidden_states, None)
         return self.logits_processor(self.lm_head, hidden_states)
 
+    @property
+    def prefetch_step_inputs(self) -> bool:
+        """Opt-in for the runner's PrefetchedH2D (the step's small input arrays copied
+        on a side stream ahead of the GPU): Rubin with the specialized decode only, so
+        GB300 keeps the stock copies."""
+        return (
+            self.specialized_decode is not None
+            and torch.cuda.get_device_capability() == (10, 7)
+        )
+
+    def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        """``compute_logits(hidden_states).argmax(-1)`` exactly (the lowest index among
+        equal maxima) without gathering the full-vocabulary logits, for greedy
+        spec-decode verification; every TP rank calls it together. None: no fast path
+        for this call, the runner keeps the stock sampler."""
+        if self.verify_logits is None:
+            return None
+        if self.needs_norm_in_logits:
+            hidden_states = self.model.norm(hidden_states, None)
+        return self.verify_logits.top_tokens(
+            self.logits_processor, self.lm_head, hidden_states
+        )
+
     def verify_sampled(
         self,
         hidden_states: torch.Tensor,
@@ -2271,6 +2294,13 @@ class KimiK3ForConditionalGeneration(
 
     def compute_logits(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
         return self.language_model.compute_logits(hidden_states)
+
+    @property
+    def prefetch_step_inputs(self) -> bool:
+        return self.language_model.prefetch_step_inputs
+
+    def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        return self.language_model.get_top_tokens(hidden_states)
 
     def verify_sampled(
         self, hidden_states: torch.Tensor, steps: int, **kwargs

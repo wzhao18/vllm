@@ -4,6 +4,7 @@ from collections.abc import Iterable
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.buffer_utils import (
@@ -207,6 +208,7 @@ class BlockTables:
             self.block_sizes_tensor,
             MASK_SLIDING_WINDOW=mask_sliding_window,
             BLOCK_SIZE=1024,  # type: ignore
+            launch_pdl=current_platform.is_arch_support_pdl(),
         )
         return tuple(bt[:num_reqs_padded] for bt in out)
 
@@ -239,8 +241,13 @@ class BlockTables:
         num_reqs = idx_mapping.shape[0]
         num_groups = self.num_kv_cache_groups
         slot_mappings = self.slot_mappings if out is None else out
-        _compute_slot_mappings_kernel[(num_groups, num_reqs + 1)](
-            slot_mappings.shape[1],
+        max_num_tokens = slot_mappings.shape[1]
+        # One program per request, then one per pad_block slots of padding.
+        pad_block = 1024
+        num_pad_programs = triton.cdiv(max_num_tokens, pad_block)
+        _compute_slot_mappings_kernel[(num_groups, num_reqs + num_pad_programs)](
+            max_num_tokens,
+            num_reqs,
             idx_mapping,
             query_start_loc,
             positions,
@@ -255,7 +262,11 @@ class BlockTables:
             CP_SIZE=self.cp_size,
             CP_INTERLEAVE=self.cp_interleave,
             PAD_ID=PAD_SLOT_ID,
-            TRITON_BLOCK_SIZE=1024,  # type: ignore
+            # A request's tokens in 128-wide blocks: the slot math is int64, and
+            # 1024-wide blocks cost ~5 us for a decode request's few tokens.
+            TRITON_BLOCK_SIZE=128,  # type: ignore
+            PAD_BLOCK_SIZE=pad_block,  # type: ignore
+            launch_pdl=current_platform.is_arch_support_pdl(),
         )
         return slot_mappings[:, :num_tokens_padded]
 
@@ -285,7 +296,10 @@ def _gather_block_tables_kernel(
     block_sizes_ptr,  # [num_kv_cache_groups]
     MASK_SLIDING_WINDOW: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    launch_pdl: tl.constexpr = False,
 ):
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
     # kv cache group id
     group_id = tl.program_id(0)
     batch_idx = tl.program_id(1)
@@ -330,9 +344,10 @@ def _gather_block_tables_kernel(
         tl.store(dst_row_ptr + offset, block_ids, mask=offset < num_blocks)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_reqs"])
 def _compute_slot_mappings_kernel(
     max_num_tokens,
+    num_reqs,
     idx_mapping,  # [num_reqs]
     query_start_loc,  # [num_reqs + 1]
     pos,  # [num_tokens]
@@ -348,21 +363,26 @@ def _compute_slot_mappings_kernel(
     CP_INTERLEAVE: tl.constexpr,
     PAD_ID: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
+    PAD_BLOCK_SIZE: tl.constexpr,
+    launch_pdl: tl.constexpr = False,
 ):
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
     # kv cache group id
     group_id = tl.program_id(0)
     batch_idx = tl.program_id(1)
     slot_mapping_ptr = slot_mappings_ptr + group_id * slot_mappings_stride
 
-    if batch_idx == tl.num_programs(1) - 1:
+    if batch_idx >= num_reqs:
         # Pad remaining slots to -1. This is needed for CUDA graphs.
         # Start from actual token count (not padded) to cover the gap
         # between actual tokens and padded tokens that can contain stale
         # valid slot IDs from previous chunks during chunked prefill.
-        actual_num_tokens = tl.load(query_start_loc + batch_idx)
-        for i in range(actual_num_tokens, max_num_tokens, TRITON_BLOCK_SIZE):
-            offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
-            tl.store(slot_mapping_ptr + offset, PAD_ID, mask=offset < max_num_tokens)
+        # Each padding program covers one PAD_BLOCK_SIZE chunk.
+        actual_num_tokens = tl.load(query_start_loc + num_reqs)
+        offset = (batch_idx - num_reqs) * PAD_BLOCK_SIZE + tl.arange(0, PAD_BLOCK_SIZE)
+        mask = (offset >= actual_num_tokens) & (offset < max_num_tokens)
+        tl.store(slot_mapping_ptr + offset, PAD_ID, mask=mask)
         return
 
     block_table_ptr = _load_ptr(block_table_ptrs + group_id, tl.int32)

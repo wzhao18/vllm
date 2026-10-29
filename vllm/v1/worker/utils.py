@@ -290,6 +290,14 @@ class AttentionGroup:
     # (map_to_kernel_slot_mapping), which lets packed token caches split.
     maps_slot_mapping: bool = False
     kernel_slot_mapping: torch.Tensor | None = None
+    # Set while a model state's own kernel has already mapped this step's block
+    # table into kernel_block_table: map_to_kernel_block_table then only returns it.
+    # Such a kernel may write only the entries the real rows' blocks reach (the
+    # Kimi K3 step prep does): the rest of each row and the padded rows keep stale
+    # values, so while this is set nothing may read kernel block table entries past
+    # a real row's blocks or in padded rows (attention kernels read only the blocks
+    # of each row's sequence length).
+    kernel_block_table_prestaged: bool = False
     # When ubatching is enabled we will have a metadata builder for each ubatch
     # so that if they use internal persistent buffers for cudagraphs, and they
     # won't have to worry about conflicting with the other ubatches.
@@ -412,6 +420,8 @@ class AttentionGroup:
         blocks_per_kv_block = self.kv_cache_spec.block_size // self.kernel_block_size
         rows, cols = block_table.shape
         out = self.kernel_block_table[ubatch_idx, :rows, : cols * blocks_per_kv_block]
+        if self.kernel_block_table_prestaged:
+            return out
         torch.add(
             self.kernel_block_offsets,
             block_table.unsqueeze(-1),

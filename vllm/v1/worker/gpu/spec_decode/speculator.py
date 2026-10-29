@@ -117,6 +117,11 @@ class DraftModelSpeculator(BaseSpeculator):
     # forward's attention metadata. Otherwise the drafter rebuilds it.
     can_reuse_target_attn_metadata: bool = True
 
+    # Whether proposing reads the target step's attention metadata for the draft
+    # layers (e.g. a first draft step that reuses it). If not, the target step
+    # does not build it.
+    reads_target_draft_attn_metadata: bool = True
+
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
         self.device = device

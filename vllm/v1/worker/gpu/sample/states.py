@@ -15,15 +15,26 @@ _NP_INT64_MAX = np.iinfo(np.int64).max
 
 
 class SamplingStates:
-    def __init__(self, max_num_reqs: int, vocab_size: int):
+    def __init__(
+        self,
+        max_num_reqs: int,
+        vocab_size: int,
+        device: torch.device | None = None,
+    ):
         self.max_num_reqs = max_num_reqs
         self.vocab_size = vocab_size
 
-        self.temperature = UvaBackedTensor(max_num_reqs, dtype=torch.float32)
-        self.top_k = UvaBackedTensor(max_num_reqs, dtype=torch.int32)
-        self.top_p = UvaBackedTensor(max_num_reqs, dtype=torch.float32)
-        self.min_p = UvaBackedTensor(max_num_reqs, dtype=torch.float32)
-        self.seeds = UvaBackedTensor(max_num_reqs, dtype=torch.int64)
+        # Device-resident: the sampling kernels read these from every CTA.
+        def new_tensor(dtype: torch.dtype) -> UvaBackedTensor:
+            return UvaBackedTensor(max_num_reqs, dtype=dtype, device=device)
+
+        self.temperature = new_tensor(torch.float32)
+        self.top_k = new_tensor(torch.int32)
+        self.top_p = new_tensor(torch.float32)
+        self.min_p = new_tensor(torch.float32)
+        self.seeds = new_tensor(torch.int64)
+        # Whether add_request() changed any value since apply_staged_writes().
+        self._dirty = False
         # Tracks whether `seed` was set explicitly by the user, so callers
         # can fall back from RNG paths that don't honor per-request seeds.
         self.seeds_set = np.zeros(max_num_reqs, dtype=bool)
@@ -63,6 +74,7 @@ class SamplingStates:
         elif num_logprobs == -1:
             num_logprobs = self.vocab_size
         self.num_logprobs[req_idx] = num_logprobs
+        self._dirty = True
 
         return temperature != 0.0 and (
             temperature != 1.0
@@ -72,6 +84,9 @@ class SamplingStates:
         )
 
     def apply_staged_writes(self) -> None:
+        if not self._dirty:
+            return
+        self._dirty = False
         self.temperature.copy_to_uva()
         self.top_p.copy_to_uva()
         self.top_k.copy_to_uva()

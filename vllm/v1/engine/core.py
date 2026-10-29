@@ -104,6 +104,8 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_kind,
     is_full_attention_spec,
 )
+from vllm.v1.metrics import felog
+from vllm.v1.metrics.iterlog import EngineIterLog
 from vllm.v1.metrics.stats import SchedulerIterationDetails, SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
@@ -239,6 +241,10 @@ class EngineCore:
         self.step_fn = (
             self.step if self.batch_queue is None else self.step_with_batch_queue
         )
+        # Per-iteration log (VLLM_ITERLOG_DIR); None when off.
+        self.iterlog = EngineIterLog.maybe_create(vllm_config)
+        if felog.ON:  # GC / RSS log of this process (VLLM_FELOG_DIR)
+            felog.install_process_hooks("engine")
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
 
         self.aborts_queue = queue.Queue[list[str]]()
@@ -563,6 +569,8 @@ class EngineCore:
             )
 
         self.scheduler.add_request(request)
+        if self.iterlog is not None:
+            self.iterlog.add_request(request)
         if request.abort_immediately:
             # Immediately abort so the connector's request_finished hook runs
             # to free any pre-admission KV-transfer resources.
@@ -574,6 +582,8 @@ class EngineCore:
         # specific finish reason, TBD whether we propagate that
         # (i.e. client-aborted vs stop criteria met).
         self.scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
+        if self.iterlog is not None:
+            self.iterlog.abort(request_ids)
 
     @contextmanager
     def log_error_detail(self, scheduler_output: SchedulerOutput):
@@ -681,8 +691,17 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        iterlog = self.iterlog
+        if iterlog is not None:
+            t0 = time.perf_counter()
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+        if iterlog is not None:
+            t1 = time.perf_counter()
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        if iterlog is not None:
+            iterlog.on_schedule(
+                scheduler_output, t0, t1, time.perf_counter(), self.scheduler
+            )
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
@@ -692,12 +711,18 @@ class EngineCore:
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
 
+        if iterlog is not None:
+            t3 = time.perf_counter()
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        if iterlog is not None:
+            iterlog.on_update(
+                scheduler_output, t3, time.perf_counter(), engine_core_outputs
+            )
         self._attach_iteration_details(engine_core_outputs, iteration_details)
         self._attach_weight_version(engine_core_outputs)
 
@@ -738,8 +763,13 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
+        iterlog = self.iterlog
         if self.scheduler.has_requests():
+            if iterlog is not None:
+                t0 = time.perf_counter()
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            if iterlog is not None:
+                t1 = time.perf_counter()
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
@@ -764,6 +794,10 @@ class EngineCore:
                     # We need to defer sampling until we have processed the model output
                     # from the prior step.
                     deferred_scheduler_output = scheduler_output
+            if iterlog is not None:
+                iterlog.on_schedule(
+                    scheduler_output, t0, t1, time.perf_counter(), self.scheduler
+                )
 
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
@@ -794,12 +828,18 @@ class EngineCore:
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
 
+        if iterlog is not None:
+            t3 = time.perf_counter()
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        if iterlog is not None:
+            iterlog.on_update(
+                scheduler_output, t3, time.perf_counter(), engine_core_outputs
+            )
         self._attach_iteration_details(engine_core_outputs, iteration_details)
         self._attach_weight_version(engine_core_outputs)
 
@@ -1695,6 +1735,11 @@ class EngineCoreProc(EngineCore):
     def _process_input_queue(self):
         """Exits when an engine step needs to be performed."""
         waited = False
+        idle_t0 = (
+            time.perf_counter()
+            if self.iterlog is not None and not self.has_work()
+            else None
+        )
         while not self.has_work() and self.is_running():
             # Notify callbacks waiting for engine to become idle.
             self._notify_idle_state_callbacks()
@@ -1717,6 +1762,8 @@ class EngineCoreProc(EngineCore):
 
         if waited:
             logger.debug("EngineCore loop active.")
+        if idle_t0 is not None:
+            self.iterlog.idle(idle_t0, time.perf_counter())
 
         # Handle any more client requests.
         while not self.input_queue.empty():

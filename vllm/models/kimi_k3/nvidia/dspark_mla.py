@@ -552,6 +552,18 @@ class K3DSparkForCausalLM(nn.Module):
             context_states, context_positions, context_slot_mapping
         )
 
+    def context_overlap(self, num_reqs: int) -> bool:
+        """Whether a captured draft of ``num_reqs`` requests may run its context
+        step (combine + context K/V) on a side stream, joined by the first draft
+        layer before its attention core (``defer_context_join``)."""
+        fast = self._fast_path
+        return fast is not None and fast.context_overlap(self, num_reqs)
+
+    def defer_context_join(self, ready: torch.cuda.Event) -> None:
+        """The context step's work is recorded in ``ready`` (on a side stream): the
+        first draft layer's attention waits for it before any core."""
+        self._fast_path.defer_context_join(self, ready)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -597,6 +609,16 @@ class K3DSparkForCausalLM(nn.Module):
 
         self._fast_path = DraftFastPath.build(self._vllm_config, self)
 
+    def greedy_markov_draft(
+        self, hidden: torch.Tensor, anchors: torch.Tensor, draft: torch.Tensor
+    ) -> bool:
+        """Greedy sequential Markov drafting of every position in one fused call:
+        ``hidden`` [num_reqs * steps, H] backbone rows (request-major), ``anchors``
+        [num_reqs] the anchor token ids, ``draft`` [num_reqs, steps] (written). False
+        when the fused path does not cover this call (nothing launched)."""
+        fast = self._fast_path
+        return fast is not None and fast.greedy_markov(self, hidden, anchors, draft)
+
     def sampled_markov_draft(
         self,
         hidden: torch.Tensor,
@@ -609,18 +631,15 @@ class K3DSparkForCausalLM(nn.Module):
         draft_logits: torch.Tensor,
     ) -> bool:
         """Probabilistic sequential Markov drafting of every position in one fused
-        call, drawing as the stock loop's ``gumbel_sample``: ``hidden``
-        [num_reqs * steps, H] backbone rows (request-major), ``anchors`` [num_reqs]
-        the anchor token ids, ``draft`` [num_reqs, steps] (written), ``slots`` /
-        ``positions`` [num_reqs * steps] (the sample rows' request-state index and
-        predicted-token position), ``temperature`` / ``seeds`` [max_num_reqs] and the
-        draft-logits cache [max_num_reqs, steps, V], of which this rank writes its
-        vocabulary columns (``gather_draft_logits`` completes rows for the stock
-        rejection sampler). False when the fused path does not cover this call
-        (nothing launched)."""
+        call, drawing as the stock loop's ``gumbel_sample``: as
+        ``greedy_markov_draft`` plus ``slots`` / ``positions`` [num_reqs * steps] (the
+        sample rows' request-state index and predicted-token position),
+        ``temperature`` / ``seeds`` [max_num_reqs] and the draft-logits cache
+        [max_num_reqs, steps, V], of which this rank writes its vocabulary columns
+        (``gather_draft_logits`` completes rows for the stock rejection sampler)."""
         fast = self._fast_path
         sampling = (temperature, seeds, slots, positions, draft_logits)
-        return fast is not None and fast.sampled_markov(
+        return fast is not None and fast.greedy_markov(
             self, hidden, anchors, draft, sampling
         )
 
@@ -636,4 +655,4 @@ class K3DSparkForCausalLM(nn.Module):
         """Whether probabilistic drafting may leave only this rank's columns of the
         draft-logits cache rows (``sampled_markov_draft``)."""
         fast = self._fast_path
-        return fast is not None and bool(fast.batches)
+        return fast is not None and fast.sampled and bool(fast.batches)

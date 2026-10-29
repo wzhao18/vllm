@@ -15,6 +15,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     get_temporal_copy_spec,
     is_conv_state_dim_first,
 )
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.math_utils import cdiv
@@ -33,6 +34,19 @@ logger = init_logger(__name__)
 # 16 saturates HBM on H100/GB200 across the reqs=8..128 range in
 # microbenchmarks
 _TEMPORAL_TILES = 16
+# The V2 align kernels run every step, and on most steps no request crosses a
+# block boundary: every CTA checks its request and exits, so the launch costs
+# about one wave per ~1024 CTAs (~1.5 us vs ~9.4 us for 17664 CTAs on Rubin).
+_MAX_ALIGN_CTAS = 1024
+
+
+def _align_temporal_tiles(num_reqs: int, num_states: int) -> int:
+    """Temporal tiles for the V2 align kernels: 16, halved until the grid has
+    at most _MAX_ALIGN_CTAS CTAs."""
+    tiles = _TEMPORAL_TILES
+    while tiles > 1 and num_reqs * num_states * tiles > _MAX_ALIGN_CTAS:
+        tiles //= 2
+    return tiles
 
 
 @triton.jit(do_not_specialize=["num_requests"])
@@ -52,7 +66,10 @@ def get_aligned_state_indices_multi_group_kernel(
     NUM_STATE_SLOTS: tl.constexpr,
     BLOCK_STATE_SLOTS: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
+    launch_pdl: tl.constexpr = False,
 ):
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
     rows = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
     valid_row = rows < num_requests
 
@@ -414,6 +431,12 @@ def postprocess_mamba_fused_kernel(
     # 3D grid (num_reqs, total_states, TEMPORAL_TILES). Default 1 preserves
     # the existing 2D-grid contract.
     TEMPORAL_TILES: tl.constexpr = 1,
+    launch_pdl: tl.constexpr = False,
+    # FROM_NUM_SAMPLED: the accepted count is max(num_sampled[batch_idx], 1), and
+    # this kernel writes it (or the reset 1) to num_accepted_tokens_out itself, so
+    # the caller neither scatters it nor snapshots the buffer (needs idx_mapping).
+    num_sampled_ptr=None,
+    FROM_NUM_SAMPLED: tl.constexpr = False,
 ):
     """Fused GPU kernel for postprocess_mamba that computes decisions AND performs
     mamba state copies without any CPU-GPU synchronization.
@@ -426,6 +449,8 @@ def postprocess_mamba_fused_kernel(
     The kernel indexes directly into pre-flattened metadata arrays using
     program_id(1). The grid dimensions encode the total state count.
     """
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
     batch_idx = tl.program_id(0)
     state_idx = tl.program_id(1)
     tile_idx = tl.program_id(2)
@@ -442,7 +467,10 @@ def postprocess_mamba_fused_kernel(
         req_idx = batch_idx
 
     # Compute decision logic (mirrors postprocess_mamba Python reference)
-    num_accepted = tl.load(num_accepted_tokens_ptr + req_idx)
+    if FROM_NUM_SAMPLED:
+        num_accepted = tl.maximum(tl.load(num_sampled_ptr + batch_idx), 1)
+    else:
+        num_accepted = tl.load(num_accepted_tokens_ptr + req_idx)
     src_block_idx = tl.load(mamba_state_idx_ptr + req_idx)
 
     if PRECOMPUTED_NEW_COMPUTED:
@@ -458,18 +486,29 @@ def postprocess_mamba_fused_kernel(
     aligned_new_computed = (new_num_computed // block_size) * block_size
 
     needs_copy = aligned_new_computed >= num_tokens_running_state
+    dest_block_idx = aligned_new_computed // block_size - 1
+
+    if FROM_NUM_SAMPLED and state_idx == 0 and tile_idx == 0:
+        reset = needs_copy & (src_block_idx == dest_block_idx)
+        tl.store(
+            num_accepted_tokens_out_ptr + req_idx, tl.where(reset, 1, num_accepted)
+        )
 
     if not needs_copy:
         return
 
     # Compute copy parameters
     accept_token_bias = aligned_new_computed - num_tokens_running_state
-    dest_block_idx = aligned_new_computed // block_size - 1
 
     # Update accepted-token count before early exits (per-request, so only
     # state_idx == 0 writes). Also guard on tile_idx == 0 so tiles > 0
     # (when TEMPORAL_TILES > 1) do not duplicate the store.
-    if src_block_idx == dest_block_idx and state_idx == 0 and tile_idx == 0:
+    if (
+        not FROM_NUM_SAMPLED
+        and src_block_idx == dest_block_idx
+        and state_idx == 0
+        and tile_idx == 0
+    ):
         tl.store(num_accepted_tokens_out_ptr + req_idx, 1)
 
     # Skip no-op self-copy.
@@ -511,6 +550,7 @@ def preprocess_mamba_align_fused_kernel(
     num_reqs,
     BLOCK_SIZE: tl.constexpr,
     MAMBA_BLOCK_SIZE: tl.constexpr,
+    launch_pdl: tl.constexpr = False,
 ):
     """Fused align preprocess: emit the pre-copy src column/offset AND advance
     state_idx (with accepted-token reset) in a single launch (V2 align).
@@ -524,6 +564,8 @@ def preprocess_mamba_align_fused_kernel(
          when a block boundary is crossed (so the migrated state, now at the
          start of the new block, is read with the neutral bias).
     """
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
     offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < num_reqs
     req_indices = tl.load(idx_mapping_ptr + offsets, mask=mask, other=0)
@@ -571,6 +613,7 @@ def precopy_mamba_align_fused_kernel(
     # TEMPORAL_TILES: see postprocess_mamba_fused_kernel. Default 1 preserves
     # the 2D-grid contract; > 1 requires a 3D grid.
     TEMPORAL_TILES: tl.constexpr = 1,
+    launch_pdl: tl.constexpr = False,
 ):
     """Pre-copy mamba "align" state across block boundaries.
 
@@ -586,6 +629,8 @@ def precopy_mamba_align_fused_kernel(
     batch-to-state idx_mapping; V1 already stores the staged arrays in batch
     order and uses HAS_IDX_MAPPING=False.
     """
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
     batch_idx = tl.program_id(0)
     state_idx = tl.program_id(1)
     tile_idx = tl.program_id(2)
@@ -1137,6 +1182,7 @@ class MambaSpecDecodeGPUContext:
             BLOCK_STATE_SLOTS=triton.next_power_of_2(num_state_slots),
             BLOCK_ROWS=block_rows,
             num_warps=1,
+            launch_pdl=current_platform.is_arch_support_pdl(),
         )
         return self.aligned_state_indices[:, :num_reqs]
 
@@ -1222,7 +1268,8 @@ class MambaSpecDecodeGPUContext:
         if num_reqs == 0 or not self.is_initialized:
             return
         total_states = self.num_states
-        grid = (num_reqs, total_states, _TEMPORAL_TILES)
+        tiles = _align_temporal_tiles(num_reqs, total_states)
+        grid = (num_reqs, total_states, tiles)
         precopy_mamba_align_fused_kernel[grid](
             state_idx_gpu,
             src_col_gpu,
@@ -1242,7 +1289,8 @@ class MambaSpecDecodeGPUContext:
             COPY_BLOCK_SIZE=1024,
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
             HAS_IDX_MAPPING=idx_mapping is not None,
-            TEMPORAL_TILES=_TEMPORAL_TILES,
+            TEMPORAL_TILES=tiles,
+            launch_pdl=current_platform.is_arch_support_pdl(),
         )
 
     def run_fused_postprocess_align(
@@ -1252,6 +1300,7 @@ class MambaSpecDecodeGPUContext:
         state_idx_gpu: torch.Tensor,
         new_num_computed_tokens_gpu: torch.Tensor,
         idx_mapping: torch.Tensor,
+        num_sampled: torch.Tensor | None = None,
     ) -> None:
         """V2 align postprocess: save the running state to the block-aligned
         position after spec-decode acceptance leaves the sequence non-aligned.
@@ -1262,17 +1311,22 @@ class MambaSpecDecodeGPUContext:
         ``new_num_computed_tokens`` already holds the post-step computed count
         (PRECOMPUTED_NEW_COMPUTED).
         ``idx_mapping`` maps batch row -> req-state slot (HAS_IDX_MAPPING).
+        ``num_sampled`` (per batch row): the kernel derives each accepted count
+        from it and writes ``num_accepted_tokens_gpu`` itself (no snapshot).
         """
         if num_reqs == 0 or not self.is_initialized:
             return
 
-        # V2 reads non-contiguous idx_mapping positions, so snapshot the whole
-        # decision buffer rather than only [:num_reqs].
-        num_accepted_tokens_snapshot = self.num_accepted_tokens_out
-        num_accepted_tokens_snapshot.copy_(num_accepted_tokens_gpu)
+        num_accepted_tokens_snapshot = num_accepted_tokens_gpu
+        if num_sampled is None:
+            # V2 reads non-contiguous idx_mapping positions, so snapshot the whole
+            # decision buffer rather than only [:num_reqs].
+            num_accepted_tokens_snapshot = self.num_accepted_tokens_out
+            num_accepted_tokens_snapshot.copy_(num_accepted_tokens_gpu)
 
         total_states = self.num_states
-        grid = (num_reqs, total_states, _TEMPORAL_TILES)
+        tiles = _align_temporal_tiles(num_reqs, total_states)
+        grid = (num_reqs, total_states, tiles)
         postprocess_mamba_fused_kernel[grid](
             num_accepted_tokens_snapshot,
             state_idx_gpu,
@@ -1297,7 +1351,10 @@ class MambaSpecDecodeGPUContext:
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
             HAS_IDX_MAPPING=True,
             PRECOMPUTED_NEW_COMPUTED=True,
-            TEMPORAL_TILES=_TEMPORAL_TILES,
+            TEMPORAL_TILES=tiles,
+            launch_pdl=current_platform.is_arch_support_pdl(),
+            num_sampled_ptr=num_sampled,
+            FROM_NUM_SAMPLED=num_sampled is not None,
         )
 
 

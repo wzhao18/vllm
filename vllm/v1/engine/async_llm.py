@@ -67,6 +67,7 @@ from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.executor import Executor
 from vllm.v1.fault_tolerance.utils import FaultToleranceRequest, FaultToleranceResult
 from vllm.v1.kv_hints import KvHintsEnvelope
+from vllm.v1.metrics import felog
 from vllm.v1.metrics.loggers import (
     StatLoggerFactory,
     StatLoggerManager,
@@ -415,6 +416,8 @@ class AsyncLLM(EngineClient):
         kv_hints: KvHintsEnvelope | None = None,
     ) -> RequestOutputCollector:
         """Add new request to the AsyncLLM."""
+        if felog.ON:
+            felog.stamp("t_add0")
         if self.errored:
             raise EngineDeadError()
 
@@ -519,6 +522,8 @@ class AsyncLLM(EngineClient):
             request.reasoning_parser_kwargs = reasoning_parser_kwargs
 
         self.input_processor.assign_request_id(request)
+        if felog.ON:
+            felog.stamp("t_inproc1")
 
         # We start the output_handler on the first call to add_request() so
         # we can call __init__ before the event loop, which enables us
@@ -579,9 +584,13 @@ class AsyncLLM(EngineClient):
 
         # Register locally before the first await so concurrent tasks see this request.
         self.output_processor.add_request(request, prompt, parent_req, index, queue)
+        if felog.ON:
+            felog.stamp("t_outproc1")
 
         # Add the EngineCoreRequest to EngineCore (separate process).
         await self.engine_core.add_request_async(request)
+        if felog.ON:
+            felog.emit(request.request_id, request.prompt_token_ids)
 
         if self.log_requests:
             logger.info("Added request %s.", request.request_id)

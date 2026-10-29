@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import contextlib
 import copy
 from types import SimpleNamespace
 from typing import Any
@@ -12,6 +13,7 @@ from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
@@ -40,6 +42,8 @@ logger = init_logger(__name__)
 class DFlashSpeculator(DraftModelSpeculator):
     _speculator_name = "DFlash"  # For logging, so we can share methods with subclasses
     maps_slot_mapping = True
+    # Every draft step builds (or updates in its graph) its own attention metadata.
+    reads_target_draft_attn_metadata = False
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         parallel_config = vllm_config.parallel_config
@@ -100,6 +104,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         # hidden states and, for an anchor that reads them, the rejected counts.
         self._aux_staging: torch.Tensor | None = None
         self._num_rejected: torch.Tensor | None = None
+        # The FULL graph's context step on a side stream (``_context_stream``).
+        self._context_side_stream: torch.cuda.Stream | None = None
         aux_layers = get_eagle3_aux_layers_from_config(speculative_config)
         cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
         if aux_layers and cudagraph_mode.decode_mode() == CUDAGraphMode.FULL:
@@ -196,17 +202,45 @@ class DFlashSpeculator(DraftModelSpeculator):
         """The FULL graph's context step: combine the staged target hidden
         states, publish the context anchor and store the context K/V."""
         num_context = self._num_graph_context_tokens(num_reqs)
-        if self._aux_staging is not None:
-            self.hidden_states[:num_context].copy_(
-                self.model.combine_hidden_states(self._aux_staging[:num_context])
+        side = self._context_stream(num_reqs)
+        with torch.cuda.stream(side) if side is not None else contextlib.nullcontext():
+            if self._aux_staging is not None:
+                self.hidden_states[:num_context].copy_(
+                    self.model.combine_hidden_states(self._aux_staging[:num_context])
+                )
+            self.prepare_context_anchor(
+                num_reqs, self.target_input_buffers.query_start_loc, self._num_rejected
             )
-        self.prepare_context_anchor(
-            num_reqs, self.target_input_buffers.query_start_loc, self._num_rejected
-        )
-        self._precompute_context_kv(0, num_context)
+            self._precompute_context_kv(0, num_context)
+        if side is not None:
+            ready = torch.cuda.Event()
+            ready.record(side)
+            self.model.defer_context_join(ready)
         # Recorded in the FULL graph so replays skip the eager metadata build.
         if attn_metadata is not None and self.supports_decode_metadata_update:
             self._update_draft_decode_metadata(attn_metadata, num_reqs)
+
+    def _context_stream(self, num_reqs: int) -> torch.cuda.Stream | None:
+        """A side stream for the FULL graph's context step, when the model takes
+        the join (``context_overlap``): the draft forward then overlaps it until
+        its first attention core, which waits for the step's event (passed to
+        ``defer_context_join``). Invariant: before that join the forward reads
+        nothing the context step writes (only the attention reads the context
+        K/V), so only speculators whose context anchor publishes nothing (this
+        class's no-op ``prepare_context_anchor``) overlap."""
+        overlap = getattr(self.model, "context_overlap", None)
+        if (
+            overlap is None
+            or type(self).prepare_context_anchor
+            is not DFlashSpeculator.prepare_context_anchor
+            or not torch.cuda.is_current_stream_capturing()
+            or not overlap(num_reqs)
+        ):
+            return None
+        if self._context_side_stream is None:
+            self._context_side_stream = torch.cuda.Stream(device=self.device)
+        self._context_side_stream.wait_stream(torch.cuda.current_stream())
+        return self._context_side_stream
 
     def _prepare_graph_replay(
         self,
@@ -739,7 +773,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         return self.draft_tokens[:num_reqs]
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_reqs"])
 def _prepare_dflash_inputs_kernel(
     # Outputs
     out_input_ids_ptr,
@@ -770,6 +804,7 @@ def _prepare_dflash_inputs_kernel(
     block_table_ptr,
     block_table_stride,
     # Scalars
+    num_reqs,
     parallel_drafting_token_id,
     block_size,
     num_query_per_req,
@@ -783,10 +818,25 @@ def _prepare_dflash_inputs_kernel(
     CP_SIZE: tl.constexpr,
     CP_INTERLEAVE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    PAD_BLOCK_SIZE: tl.constexpr,
+    launch_pdl: tl.constexpr = False,
 ):
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
     req_idx = tl.program_id(0)
     block_idx = tl.program_id(1)
-    num_reqs = tl.num_programs(0)
+    if req_idx >= num_reqs:
+        # Padding programs: query rows past num_reqs * num_query_per_req get PAD
+        # slots (no K/V write) so the captured CG replays sizes larger than the
+        # current request count safely; one PAD_BLOCK_SIZE chunk per program.
+        if block_idx == 0:
+            block = (req_idx - num_reqs) * PAD_BLOCK_SIZE + tl.arange(0, PAD_BLOCK_SIZE)
+            mask = (block >= num_reqs * num_query_per_req) & (block < max_num_tokens)
+            tl.store(out_input_ids_ptr + block, 0, mask=mask)
+            tl.store(out_query_positions_ptr + block, 0, mask=mask)
+            tl.store(out_is_padding_ptr + block, True, mask=mask)
+            tl.store(out_query_slot_mapping_ptr + block, PAD_SLOT_ID, mask=mask)
+        return
     req_state_idx = tl.load(idx_mapping_ptr + req_idx)
 
     ctx_start = tl.load(target_query_start_loc_ptr + req_idx)
@@ -911,12 +961,12 @@ def _prepare_dflash_inputs_kernel(
         if req_idx == num_reqs - 1:
             # Pad per-request buffers to max_num_reqs for CUDA graph safety.
             last_query_end = num_reqs * num_query_per_req
-            for i in range(num_reqs, max_num_reqs + 1, BLOCK_SIZE):
-                block = i + tl.arange(0, BLOCK_SIZE)
+            for i in range(num_reqs, max_num_reqs + 1, PAD_BLOCK_SIZE):
+                block = i + tl.arange(0, PAD_BLOCK_SIZE)
                 mask = block < max_num_reqs + 1
                 tl.store(out_query_start_loc_ptr + block, last_query_end, mask=mask)
-            for i in range(num_reqs, max_num_reqs, BLOCK_SIZE):
-                block = i + tl.arange(0, BLOCK_SIZE)
+            for i in range(num_reqs, max_num_reqs, PAD_BLOCK_SIZE):
+                block = i + tl.arange(0, PAD_BLOCK_SIZE)
                 mask = block < max_num_reqs
                 tl.store(out_seq_lens_ptr + block, 0, mask=mask)
             # Padded sample slots point at query index 0 (a valid row in
@@ -925,23 +975,12 @@ def _prepare_dflash_inputs_kernel(
             # sampling to prevent writing stale values to draft logits.
             pad_start = num_reqs * num_speculative_steps
             pad_end = max_num_reqs * num_speculative_steps
-            for i in range(pad_start, pad_end, BLOCK_SIZE):
-                block = i + tl.arange(0, BLOCK_SIZE)
+            for i in range(pad_start, pad_end, PAD_BLOCK_SIZE):
+                block = i + tl.arange(0, PAD_BLOCK_SIZE)
                 mask = block < pad_end
                 tl.store(out_sample_indices_ptr + block, 0, mask=mask)
                 tl.store(out_sample_pos_ptr + block, 0, mask=mask)
                 tl.store(out_sample_idx_mapping_ptr + block, -1, mask=mask)
-            # Pad query slot mappings past num_query_tokens with PAD so the
-            # captured CG sees PAD slots (no K/V write) for replay sizes
-            # larger than the current request count.
-            q_pad_start = num_reqs * num_query_per_req
-            for i in range(q_pad_start, max_num_tokens, BLOCK_SIZE):
-                block = i + tl.arange(0, BLOCK_SIZE)
-                mask = block < max_num_tokens
-                tl.store(out_input_ids_ptr + block, 0, mask=mask)
-                tl.store(out_query_positions_ptr + block, 0, mask=mask)
-                tl.store(out_is_padding_ptr + block, True, mask=mask)
-                tl.store(out_query_slot_mapping_ptr + block, PAD_SLOT_ID, mask=mask)
 
 
 def prepare_dflash_inputs(
@@ -991,7 +1030,10 @@ def prepare_dflash_inputs(
     max_tokens_per_req = max_target_query_len + num_query_per_req
     BLOCK_SIZE = 128
     num_blocks = triton.cdiv(max_tokens_per_req, BLOCK_SIZE)
-    _prepare_dflash_inputs_kernel[(num_reqs, num_blocks)](
+    # One program per request, then one per PAD_BLOCK_SIZE query rows of padding.
+    PAD_BLOCK_SIZE = 1024
+    num_pad_programs = triton.cdiv(max_num_tokens, PAD_BLOCK_SIZE)
+    _prepare_dflash_inputs_kernel[(num_reqs + num_pad_programs, num_blocks)](
         input_buffers.input_ids,
         input_buffers.positions,
         input_buffers.is_padding,
@@ -1016,6 +1058,7 @@ def prepare_dflash_inputs(
         input_seeds,
         block_table,
         block_table.stride(0),
+        num_reqs,
         parallel_drafting_token_id,
         block_size,
         num_query_per_req,
@@ -1029,4 +1072,6 @@ def prepare_dflash_inputs(
         CP_SIZE=cp_size,
         CP_INTERLEAVE=cp_interleave,
         BLOCK_SIZE=BLOCK_SIZE,
+        PAD_BLOCK_SIZE=PAD_BLOCK_SIZE,
+        launch_pdl=current_platform.is_arch_support_pdl(),
     )

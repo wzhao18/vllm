@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 
@@ -30,6 +31,7 @@ def prepare_dcp_local_seq_lens(
         num_reqs,
         max_num_reqs,
         BLOCK_SIZE,
+        launch_pdl=current_platform.is_arch_support_pdl(),
     )
     return dcp_local_seq_lens[:num_reqs_padded]
 
@@ -44,7 +46,10 @@ def _dcp_local_seq_lens_kernel(
     num_reqs,
     max_num_reqs,
     BLOCK_SIZE: tl.constexpr,
+    launch_pdl: tl.constexpr = False,
 ):
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
     pid = tl.program_id(0)
     block = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
 

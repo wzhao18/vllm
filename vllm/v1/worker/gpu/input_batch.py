@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils import random_uuid
 from vllm.utils.math_utils import cdiv
@@ -362,7 +363,10 @@ def _prepare_pos_seq_lens_kernel(
     num_computed_tokens_ptr,
     max_num_reqs,
     BLOCK_SIZE: tl.constexpr,
+    launch_pdl: tl.constexpr = False,
 ):
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
     req_id = tl.program_id(0)
     num_reqs = tl.num_programs(0) - 1
     if req_id == num_reqs:
@@ -408,6 +412,7 @@ def prepare_pos_seq_lens(
         num_computed_tokens,
         seq_lens.shape[0],
         BLOCK_SIZE=1024,
+        launch_pdl=current_platform.is_arch_support_pdl(),
     )
 
 
@@ -425,7 +430,10 @@ def _combine_sampled_and_draft_tokens_kernel(
     logits_indices_ptr,
     BLOCK_SIZE: tl.constexpr,
     NUM_NEW_SAMPLED_TOKENS: tl.constexpr = 1,
+    launch_pdl: tl.constexpr = False,
 ):
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
     batch_idx = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + batch_idx)
 
@@ -509,6 +517,7 @@ def combine_sampled_and_draft_tokens(
         BLOCK_SIZE=triton.next_power_of_2(
             num_speculative_steps + num_new_sampled_tokens
         ),
+        launch_pdl=current_platform.is_arch_support_pdl(),
     )
     return logits_indices
 
@@ -580,7 +589,11 @@ def _post_update_kernel(
     draft_tokens_ptr,
     draft_tokens_out_ptr,
     num_draft_tokens,
+    BLOCK: tl.constexpr,
+    launch_pdl: tl.constexpr = False,
 ):
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
     req_id = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + req_id)
     if req_state_idx < 0:
@@ -603,21 +616,26 @@ def _post_update_kernel(
         tl.store(last_sampled_tokens_ptr + req_state_idx, token_id)
         tl.store(total_len_ptr + req_state_idx, total_len + num_sampled)
 
-    for i in range(num_sampled):
-        token_id = tl.load(sampled_tokens_ptr + req_id * sampled_tokens_stride + i)
-        tl.store(
-            all_token_ids_ptr + req_state_idx * all_token_ids_stride + total_len + i,
-            token_id,
+    # All sampled tokens at once: independent stores, and the bin counts as
+    # atomic adds (a request may sample the same token twice).
+    i = tl.arange(0, BLOCK)
+    is_sampled = i < num_sampled
+    token_ids = tl.load(
+        sampled_tokens_ptr + req_id * sampled_tokens_stride + i, mask=is_sampled
+    )
+    tl.store(
+        all_token_ids_ptr + req_state_idx * all_token_ids_stride + total_len + i,
+        token_ids,
+        mask=is_sampled,
+    )
+    if output_bin_counts_ptr is not None:
+        tl.atomic_add(
+            output_bin_counts_ptr
+            + req_state_idx * output_bin_counts_stride
+            + token_ids,
+            1,
+            mask=is_sampled,
         )
-
-        if output_bin_counts_ptr is not None:
-            token_ptr = (
-                output_bin_counts_ptr
-                + req_state_idx * output_bin_counts_stride
-                + token_id
-            )
-            count = tl.load(token_ptr)
-            tl.store(token_ptr, count + 1)
 
     if query_start_loc_ptr is None:
         query_len = 0
@@ -682,7 +700,9 @@ def post_update(
         draft_tokens,
         draft_tokens_out,
         draft_tokens.shape[1] if draft_tokens is not None else 0,
+        BLOCK=triton.next_power_of_2(sampled_tokens.shape[1]),
         num_warps=1,
+        launch_pdl=current_platform.is_arch_support_pdl(),
     )
 
 
@@ -725,7 +745,10 @@ def _expand_idx_mapping_kernel(
     expanded_local_pos_ptr,
     cu_num_logits_ptr,
     BLOCK_SIZE: tl.constexpr,
+    launch_pdl: tl.constexpr = False,
 ):
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
     req_idx = tl.program_id(0)
     start_idx = tl.load(cu_num_logits_ptr + req_idx)
     end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
@@ -755,5 +778,6 @@ def expand_idx_mapping(
         expanded_local_pos,
         cu_num_logits,
         BLOCK_SIZE=triton.next_power_of_2(max_expand_len),
+        launch_pdl=current_platform.is_arch_support_pdl(),
     )
     return expanded_idx_mapping, expanded_local_pos
