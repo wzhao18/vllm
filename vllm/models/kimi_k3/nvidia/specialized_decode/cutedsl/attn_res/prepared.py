@@ -276,11 +276,7 @@ SHARDED: dict = {"*": ""}
 # growing with depth (sol4 section 51). Up to 256 rows it wins (1 GPU, cold HBM, comm3
 # arbench.py: M64-128 by 0.7-2.5 us per call at every block count, M256 at four
 # blocks or more), except M192 at six or more blocks (a second wave: +0.9-1.3 us).
-# Empty (axhb2, hb192): above 256 rows the sites after a wide MoE tail are its ring
-# consumer (ClusterAttnRes) anyway, so the stock op served only the head / dense / final
-# sites there (and, before runtime.decode skipped pre-consumed sites, ran a second time
-# on the ring consumer's output).
-STOCK_ROWS: dict = {"*": ""}
+STOCK_ROWS: dict = {"*": "257-512:1"}
 
 
 def choose(shape, ctx):

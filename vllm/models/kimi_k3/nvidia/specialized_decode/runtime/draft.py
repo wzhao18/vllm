@@ -40,7 +40,7 @@ logger = init_logger(__name__)
 # memory once per CTA (``staged``: from B3 the per-warp fragment loads touch a line per
 # request; 16 ranks, us: B4 34.76 -> 30.47, B8 41.26 -> 31.69, drafts identical; B1 /
 # B2 lose ~0.5 / ~1.4 to the extra barrier). GB300 keeps the stock drafter.
-FUSED_MARKOV = {8: "1-8:1", 16: "1-2:2,3-8:3,9-128:1"}
+FUSED_MARKOV = {8: "1-8:1", 16: "1-2:2,3-8:3,9-64:1"}
 # FUSED_MARKOV requests whose kernel waits at a CTA barrier between each position's key
 # poll and its shuffle maxima (cutedsl.draft.markov ``settle``), per TP. 16 ranks, real
 # DSpark weights, us: B1 31.19 -> 30.65 (31.37 -> 30.73), B2 / B8 flat; drafts
@@ -71,14 +71,12 @@ WIDE_LM_HEAD = {16: "10-64:1"}  # (B9's 63 rows: within lmhead.WIDE_ROWS)
 CONTEXT_OVERLAP = {16: "1-63:1"}
 # Query rows whose MLA layers (DCP = TP) exchange queries and partials through the
 # specialized decode's Lamport mailboxes (cutedsl.draft.attention), per TP, on Rubin.
-# (hb192: to 576 query rows, DL3 B192)
-FAST_DCP = {8: "1-64:1", 16: "1-576:1"}
+FAST_DCP = {8: "1-64:1", 16: "1-512:1"}
 # Context rows whose context step runs the sharded context projection + Lamport row
 # gather and the fused context-KV epilogue (cutedsl.draft.context; above 64 rows the
 # shape-dynamic kernels and the stock shard GEMM), per TP, on Rubin. It replaces the
 # replicated context_proj GEMM (514 MB of weights per rank).
-# (hb192: to 768 context rows, DL3 B192)
-FAST_CONTEXT = {8: "1-64:1", 16: "1-768:1"}
+FAST_CONTEXT = {8: "1-64:1", 16: "1-512:1"}
 # Query rows whose forward runs the all-reduce + residual + RMSNorm sites as Lamport
 # kernels (cutedsl.draft.allreduce): 1 one-shot, 2 two-shot (common.twoshot), per TP,
 # on Rubin. 16 ranks, us/site one-shot / two-shot (scripts/dsdraft/ar_test.py, chain
@@ -89,8 +87,7 @@ FAST_CONTEXT = {8: "1-64:1", 16: "1-768:1"}
 # bitwise), on the stock GEMMs' partials. 4 ranks + 12 emulated, us per site with its
 # o_proj / down_proj GEMM (cuBLAS), 112 / 168 / 224 rows: 10.66 / 11.23 / 17.22 (K 512),
 # 11.51 / 11.97 / 17.98 (K 896); serving's stock GEMM + FlashInfer site ~19-25.
-# (hb192: ArNormRows to 576 query rows, DL3 B192)
-FAST_AR = {8: "1-7:1", 16: "1-7:1,8-64:2,65-576:3"}
+FAST_AR = {8: "1-7:1", 16: "1-7:1,8-64:2,65-256:3"}
 # FAST_AR one-shot batches whose sites gate their 16-source poll on one fragment per
 # source (cutedsl.draft.allreduce ``gate``), per TP, on Rubin. 16 ranks, the B1
 # drafter forward (scripts/dsdraft/layer_test.py, in process), us ungated -> gated:

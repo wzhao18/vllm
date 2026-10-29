@@ -90,9 +90,8 @@ def latent_chunk(rows, grid=112):
 # with the experts' last rows instead of after the experts' grid. Same words, same
 # slots, same reduction order: bitwise. 129-256 rows (axhb, 16 ranks, 93 layers, 32k,
 # interpolated unions, us/step vs the same overlay without them): B17 (136 rows) -85,
-# B24 -195, B28 -133, B32 -173. 257-512 rows (axhb2 sx1, DL3 mix, mns 192, 16 ranks, 93
-# layers, same-node A, us/step): B96 (384 rows) -371, B128 (512) -467, B64 bitwise.
-EXPERTS_PUSH = {16: "65-768:1"}
+# B24 -195, B28 -133, B32 -173.
+EXPERTS_PUSH = {16: "65-256:1"}
 
 
 # The up projection [M, 3584] x [448, 3584]^T in FP32: "cublas" (torch.mm) or a
@@ -118,7 +117,7 @@ UP_ROWS = {16: "65-80:1,129-256:1"}
 # 12.66, M128 12.52 -> 13.27, M160 13.60 -> 14.02, M192 14.67 -> 14.64, M224 15.34 ->
 # 14.87, M256 16.45 -> 15.59 (the early CTAs, one per row, contend with LatentRows'
 # owner reduce up to ~192 rows).
-NORM_POLLED = {16: "193-768:1"}
+NORM_POLLED = {16: "193-512:1"}
 
 
 def norm_polled(tp, rows):

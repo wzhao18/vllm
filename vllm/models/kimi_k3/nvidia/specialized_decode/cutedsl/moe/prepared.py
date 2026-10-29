@@ -257,7 +257,7 @@ class PreparedMoE:
         then the wide experts (planned) and the wide tail; the shared expert's partial
         and its RS push on the side stream (``beside``), forked after routing where
         the front kernel also leaves h (``merged_batch``: the down rows alone), else
-        before the front kernel, or after it / after routing (``fork``)."""
+        before."""
         state, b, front = self.state, x.shape[0], self.front_rows
 
         def shared_expert():
@@ -269,17 +269,10 @@ class PreparedMoE:
         merged = front.merged_batch(b)
         if early := front.early.get(b):
             return self.run_shared_early(x, out, consume, early)
-        # Unmerged rows fork the whole shared expert before the front kernel, or later
-        # (``front_rows.SHARED_FORK_ROWS``: 1 after the front kernel, 2 after routing).
-        fork = front.fork.get(b, 0)
-        if merged or fork == 2:
+        if merged:
             ids, weights, latent = front.route(x)
-        elif fork == 1:
-            front.front(x)
         with self.beside(shared_expert) as join:
-            if fork == 1:
-                ids, weights, latent = front.route_only(x)
-            elif not merged and not fork:
+            if not merged:
                 ids, weights, latent = front.route(x)
             partial = self.wide_experts.run(latent, weights, ids)
             self.rows.run(partial, b, join)
@@ -296,12 +289,37 @@ class PreparedMoE:
         state, b, front = self.state, x.shape[0], self.front_rows
         shared = state.shared_partial[:b]
         front.front(x)
+        if early in (3, 4):  # the RS push right behind the down rows (4: experts wait)
+            return self.run_shared_push_early(x, out, consume, shared, early == 4)
         with self.beside(lambda: front.shared_expert(x, shared)) as join:
             ids, weights, latent = front.route_only(x)
             if early == 2:
                 join()
             partial = self.wide_experts.run(latent, weights, ids)
         with self.beside(lambda: self.rows.push(shared)) as join:
+            self.rows.run(partial, b, join)
+        if consume(out) is not out:
+            raise RuntimeError("The wide tail output must be consumed from its ring")
+        return out
+
+    def run_shared_push_early(self, x, out, consume, shared, wait=False):
+        """``run_shared_early`` 3: the shared rows' RS push follows the down rows on
+        the side stream (beside routing and the routed experts) instead of the
+        experts, so its 7168-column rows leave before the latent's reduce-scatter and
+        all-gather; the tail joins it before NormRows as before (bitwise: the same
+        kernels and words). 4 (``wait``): the routed experts also wait for the push."""
+        b, front, experts = x.shape[0], self.front_rows, self.wide_experts
+        assert front is not None and experts is not None
+
+        def shared_expert():
+            front.shared_expert(x, shared)
+            self.rows.push(shared)
+
+        with self.beside(shared_expert) as join:
+            ids, weights, latent = front.route_only(x)
+            if wait:
+                join()
+            partial = experts.run(latent, weights, ids)
             self.rows.run(partial, b, join)
         if consume(out) is not out:
             raise RuntimeError("The wide tail output must be consumed from its ring")
@@ -396,7 +414,7 @@ def deferred_rows(module, batches):
 # up-projection, output ring at the largest graph) behind the stock router,
 # latent-down, shared and routed experts, instead of the whole stock layer (seam S4).
 # Keyed per TP on token rows (``shapes.rows_policy``: every q).
-WIDE_TAIL = {16: "65-768:1"}
+WIDE_TAIL = {16: "65-512:1"}
 # Wide batches' routed experts: v8moe's wide engines (``experts_runtime.WideExperts``)
 # on the stock router's routes, instead of the stock layer's kernel.
 WIDE_EXPERTS = True

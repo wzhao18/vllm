@@ -3,7 +3,6 @@
 """Per-layer attention providers (input projection, KDA/MLA core, o-projection) and
 the helpers ``SpecializedDecode.build_providers`` uses."""
 
-import contextlib
 from typing import Any
 
 import torch
@@ -145,19 +144,6 @@ PROJECTION_GENERIC = {"*": "65-128:64.64.2.6"}
 # The most rows the generic split-K tactics serve (dense layer included); above, the
 # projections run cuBLAS.
 GENERIC_ROWS = 128
-# Rubin TP16 wide rows (token rows, by in-projection rows: KDA 3216, MLA 2880) whose
-# cuBLAS in-projection (``Attention.run_wide``) runs with torch's cuBLASLt preference:
-# cuBLAS's heuristic pick is banded and loses there. Both libraries sum K in the same
-# order at these rows (outputs bitwise equal at every 4th row of 164-768). 1 GPU, 8
-# cold weight copies, graphs of 16 calls, us per call cuBLAS -> cuBLASLt (ABBA): KDA
-# 260-288 10.8 -> 10.4, 292-336 11.9 -> 11.1, 388-448 13.0 -> 12.4, 452-464 13.6 ->
-# 12.5, 468-480 13.0 -> 12.4, 516-576 15.2 -> 13.9; MLA 292-320 11.6 -> 11.0, 324-384
-# 16.3 -> 11.0-12.7, 388-512 12.6 -> 12.1, 516-576 19.9 -> 13.6. cuBLAS wins at KDA
-# 340-384 / 484-512 / 580-704 and MLA 260-288 / 708-768 (left out).
-INPROJ_LT = {
-    3216: "260-336:1,388-480:1,516-576:1",
-    2880: "292-576:1",
-}
 
 
 def projection_policies(tp, rows, batches, sms=152, q=1):
@@ -195,21 +181,6 @@ def projection_policies(tp, rows, batches, sms=152, q=1):
             tactic = (64, n, 4 if n == 8 else 2, stages)
         policies[batch] = tactic
     return policies
-
-
-@contextlib.contextmanager
-def blas_library(name):
-    """Torch's preferred BLAS library ``name`` around the block (None: unchanged),
-    restored after it. Graph captures record the kernel picked at capture."""
-    if name is None:
-        yield
-        return
-    previous = torch.backends.cuda.preferred_blas_library()
-    torch.backends.cuda.preferred_blas_library(name)
-    try:
-        yield
-    finally:
-        torch.backends.cuda.preferred_blas_library(previous)
 
 
 class SkinnyProjection:
@@ -283,9 +254,6 @@ class Attention:
         skinny = WIDE_SKINNY.get(pitch, SKINNY) if sms > 152 else SKINNY
         self.projection = SkinnyProjection(weight, split_k, skinny)
         self.weight = weight
-        # Wide rows whose cuBLAS in-projection prefers cuBLASLt (``INPROJ_LT``)
-        lt = INPROJ_LT.get(pitch, "") if sms > 152 and tp == 16 else ""
-        self.lt_rows = batch_table(lt)
         self.core: Any  # PreparedKda, PreparedMla or PreparedDsa
         self.core_long: Any = None  # MLA: the step switch's body 1 core (SWITCH)
         # MLA decode batches whose o-projection polls DcpValue's output (one of two
@@ -668,8 +636,7 @@ class Attention:
         if b in self.projection.fallback.kernels:
             projected = self.projection.run(x, projected)
         else:  # no generic tactic at these rows: cuBLAS, as the stock layer
-            with blas_library("cublaslt" if self.lt_rows.get(b) else None):
-                torch.mm(x, self.weight.t(), out=projected)
+            torch.mm(x, self.weight.t(), out=projected)
         attention = self.layer.self_attn
         if self.kind == "kda" and b in self.kda_stock:
             self.stock_kda(attention, projected, local)

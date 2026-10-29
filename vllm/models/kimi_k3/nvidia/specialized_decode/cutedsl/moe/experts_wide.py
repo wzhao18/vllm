@@ -1,23 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Rubin (cc 10.7) routed experts for TP16 verify steps of more than 64 token rows
-(``capacity`` 128-``WIDE_MAX``): ``RubinGroupedExpertsKernel``'s engine (units of
-<= 8 tokens per expert, the packed weight stream, die matching, the FC2 pool) with the
-grouping, unit tables, MXFP8 plan, hidden images and staged FC2 rows sized from the
-capacity.
+(``capacity`` 128-512): ``RubinGroupedExpertsKernel``'s engine (units of <= 8 tokens
+per expert, the packed weight stream, die matching, the FC2 pool) with the grouping,
+unit tables, MXFP8 plan, hidden images and staged FC2 rows sized from the capacity.
 
 - Grouping: each expert's token mask spans ``capacity / 32`` words, with each word's
   running count before it (Int16); the masks (57 KiB at 512 rows) and the counts live
   in the weight ring while the CTA groups, so the producer starts streaming once the
   pairs are ranked (the 64-row kernel overlaps the ranking). A pair's rank is its
   word's count plus one popcount (a scan of up to 16 mask words per pair, on 16-way
-  bank conflicts, took 17 us at 512 rows). Above 640 rows (7 stages) the masks and
-  counts outgrow the ring: they, and the grouping's other grouping-only arrays (expert
-  bases, warp totals, the VW owner table), then run on into the scale, activation and
-  hidden slots below the misc block, all idle until the grouping's closing sync
-  (``grouping_spill``). The CTA stays within the default 227 KB: Rubin's oversized
-  shared-memory mode shrinks L1 and costs the wide kernels' epilogue ~25 us per call
-  (M576 / M640 at 240-280 KB, 1 GPU).
+  bank conflicts, took 17 us at 512 rows).
 - Plan: ``capacity / 64`` consecutive 64-row MXFP8 plans (``PLAN_BYTES`` each): token
   t sits at row t % 64 of plan t // 64.
 - Workspace: past everything the 64-row kernels keep across calls (the 64-row
@@ -25,8 +18,7 @@ capacity.
   like it: this
   kernel's own call generation per slot, its last call's image count per parity, the
   staged rows' chunk homes (``finalize``), the hidden images ([2, the unit bound at
-  capacity ``WIDE_MAX``]) and the staged FC2 rows at the same offsets for every
-  capacity:
+  capacity 512]) and the staged FC2 rows at the same offsets for every capacity:
   token t's 16 rows as [28 units][16 slots][128 columns] BF16 at 112 KiB t, one 4 KiB
   page a unit (128 columns of the token's 16 slots). The images
   alternate on that own generation, so calls of other batch sizes in between change
@@ -72,25 +64,16 @@ from .experts_rubin import (
 )
 from .experts_rubin64 import CENSUS_BYTES, RubinGroupedExpertsKernel
 
-# The most token rows a wide engine serves (DL3 q4 B192). Every wide engine's hidden
-# images and staged rows sit at offsets derived from it (``image_units``).
-WIDE_MAX = 768
-# Shared memory a CTA may use: the default opt-in cap (module docstring: not the
-# oversized mode).
-SMEM_DEFAULT = 227 * 1024
-
 
 class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
-    """``RubinGroupedExpertsKernel`` at ``capacity`` (a multiple of 64, at most
-    ``WIDE_MAX``) token rows; ``publish`` False or "local" (module docstring)."""
+    """``RubinGroupedExpertsKernel`` at ``capacity`` (a multiple of 64, at most 512)
+    token rows; ``publish`` False or "local" (module docstring)."""
 
     def __init__(
         self, experts, grid, slots, capacity, publish=False, stages=7, trace=0,
-        pool=(12, 6), dies=(), static_groups=False, tables=True,
+        pool=(12, 6), dies=(), static_groups=False,
     ):  # fmt: skip
-        """``tables`` False: a subclass lays out the shared-memory tables (and sizes
-        the CTA) itself (``RubinVWExpertsKernel``)."""
-        assert capacity % 64 == 0 and 64 < capacity <= WIDE_MAX
+        assert capacity % 64 == 0 and 64 < capacity <= 512
         # "twoshot" (axl wpush): the finalize pushes each token's latent columns into
         # their owners' two-shot receive slots of the wide tail (``tail_rows``'s
         # TailRowsBox at the deployment's capacity), as the 64-row engine's "twoshot"
@@ -109,22 +92,18 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
         # Units of <= 8 tokens: sum ceil(n_e / 8) <= 2 capacity + 7 experts / 8.
         self.units = (2 * capacity + 7 * experts // 8 + 31) // 32 * 32
         self.off_masks = 0  # the weight ring, while grouping
-        self.off_prefix = 4 * self.mask_stride * experts  # the counts, after them
-        if tables:
-            self.off_tables = (self.off_misc + 5120 + 127) // 128 * 128
-            end = self.off_tables + 20 * self.units
-            # without the spill: bases, totals, then the transpose buffers
-            whole = (end + 4 * experts + 64 + 127) // 128 * 128 + 8 * 512
-            if self.grouping_spill(stages, whole):
-                self.off_bases, self.off_totals = self.low_scratch((4 * experts, 64))
-            else:
-                self.off_bases = end
-                self.off_totals = self.off_bases + 4 * experts
-                end = self.off_totals + 64
-            # ``fc2``'s per-warp transpose buffers ([8 tokens, 64 B] per epilogue warp).
-            self.off_fc2s = (end + 127) // 128 * 128
-            end = self.off_fc2s + 8 * 512
-            self.check_smem(end)
+        self.off_prefix = 4 * self.mask_stride * experts
+        counts_end = self.off_prefix + 2 * self.mask_stride * experts
+        assert counts_end <= stages * self.slot_bytes
+        self.off_tables = (self.off_misc + 5120 + 127) // 128 * 128
+        self.off_bases = self.off_tables + 20 * self.units
+        self.off_totals = self.off_bases + 4 * experts
+        end = self.off_totals + 64
+        # ``fc2``'s per-warp transpose buffers ([8 tokens, 64 B] per epilogue warp).
+        self.off_fc2s = (end + 127) // 128 * 128
+        end = self.off_fc2s + 8 * 512
+        assert end <= 227 * 1024
+        self.smem_bytes = max(end, 212096)
         shared = self.ws_steal + 2 * slots * 4  # ``ExpertsGeometry.workspace_bytes``
         # The route mailbox sits inside that workspace, below every region past it.
         assert self.ws_xflag + ROUTE_IDS + 4 * ROUTE_WORDS <= shared
@@ -132,48 +111,20 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
         shared += generation_bytes(slots)  # the M8 kernel's own generation
         self.ws_wgen = (shared + 255) // 256 * 256
         self.ws_wlast = self.ws_wgen + 4 * slots
-        # The home die bit of each 2 MiB chunk under the staged rows (``stage_homes``):
-        # two words (chunks 0-31, 32-63).
+        # The home die bit of each 2 MiB chunk under the staged rows (``stage_homes``).
         self.ws_homes = self.ws_wlast + 8
-        self.ws_images = (self.ws_homes + 8 + 255) // 256 * 256
+        self.ws_images = (self.ws_homes + 4 + 255) // 256 * 256
         # Every wide engine (any capacity or width) shares these regions of the
         # scratch, one call after another: the images' parity stride and the staged
         # rows' offset follow the largest capacity's unit bound, so a call re-arms the
         # images its predecessor used whatever its capacity, and no capacity's staged
         # rows overlap another's images.
-        self.image_units = (2 * WIDE_MAX + 7 * experts // 8 + 31) // 32 * 32
+        self.image_units = (2 * 512 + 7 * experts // 8 + 31) // 32 * 32
         stage = self.ws_images + 2 * self.image_units * self.h_compact_bytes
         # Units 2i and 2i + 1 on one 8 KiB-aligned page pair (``finalize``).
         self.ws_stage = (stage + 8191) // 8192 * 8192
         self.workspace_bytes = self.ws_stage + 16 * capacity * 3584 * 2
         self.plan_bytes = self.blocks * PLAN_BYTES
-
-    def grouping_spill(self, stages, whole):
-        """Whether the masks and their running counts (Int16 words past the masks,
-        ``off_prefix``) outgrow the weight ring (above 640 rows at 7 stages), or the
-        layout with the grouping-only arrays past the tables (ending at ``whole``)
-        passes the default shared memory (width 32 above 384 rows): the counts then
-        run on below ``off_misc``, with the other grouping-only arrays after them
-        (``low_scratch``)."""
-        if whole > SMEM_DEFAULT:
-            return True
-        return 6 * self.mask_stride * self.experts > stages * self.slot_bytes
-
-    def low_scratch(self, sizes):
-        """Offsets of grouping-only arrays of ``sizes`` bytes (128 B-aligned) after the
-        masks and counts, below ``off_misc`` (``grouping_spill``)."""
-        at, out = 6 * self.mask_stride * self.experts, []
-        for n in sizes:
-            at = (at + 127) // 128 * 128
-            out.append(at)
-            at += n
-        assert at <= self.off_misc, (at, self.off_misc)
-        return tuple(out)
-
-    def check_smem(self, end):
-        """The CTA's shared memory (``smem_bytes``) for a layout ending at ``end``."""
-        assert end <= SMEM_DEFAULT, end
-        self.smem_bytes = max(end, 212096)
 
     def image(self, workspace, parity, unit):
         base = workspace.iterator + self.ws_images
@@ -439,7 +390,7 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
         if cutlass.const_expr(len(self.dies) > 0):
             info = view(sm.iterator, self.off_misc + 2688, Int32, 4)
             die, k = (info[0], info[3])
-            homes = view(workspace.iterator, self.ws_homes, Uint32, 2)
+            homes = view(workspace.iterator, self.ws_homes, Uint32, 1)[0]
             half: cutlass.Constexpr = self.grid * 5
             rank = k * 10 + warp - 2
             target, job = (die, rank)
@@ -450,11 +401,7 @@ class RubinWideExpertsKernel(RubinGroupedExpertsKernel):
                 page = address + Int64(i) * 8192
                 bits = Uint32(Int32(page >> 12) & Int32(0x1DB))
                 c = Int32((page >> 21) - (address >> 21))
-                if cutlass.const_expr(self.capacity <= 512):  # 32 chunks at most
-                    word = homes[0] >> Uint32(c)
-                else:  # the staged rows span up to 44 chunks: two words
-                    word = homes[c >> 5] >> Uint32(c & 31)
-                h = (Int32(cute.arch.popc(bits)) ^ Int32(word)) & 1
+                h = (Int32(cute.arch.popc(bits)) ^ Int32(homes >> Uint32(c))) & 1
                 self.unit(stage, weights, box, 2 * i + Int32(h != target), lane)
         else:
             for unit in range(cta * 10 + warp - 2, batch * 28, self.grid * 10):

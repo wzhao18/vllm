@@ -164,25 +164,6 @@ LONG_SPLIT.update({(r, 64): (1, 8, 64, 48) for r in range(119, 225, 7)})
 LONG_SPLIT.update(
     {(r, 64): (1, 8, 64) for r in range(99, 193, 3) if (r, 64) not in LONG_SPLIT}
 )
-# hb192 (DL3 max-num-seqs 192): DL3's verify rows 260-768 (q4, B65-B192) and drafter
-# rows 195-576 (q3, 64 heads) had no rule: tokenspeed's split 1, persistent, so the
-# longest request's whole KV on one CTA pair set the makespan (AgentX contexts reach
-# ~840k). Rule (1, 4, 64, 128) + the work list (WLIST, DRAFT_WLIST): a request past 64
-# local tiles takes min(4, ceil(tiles / 128)) splits. 1 GPU, the core alone, AgentX D
-# mixes (mean 188k), us per layer, today -> this: verify B96 300.7 -> 168.9, B128 338.6
-# -> 219.2, B192 435.3 -> 324.6; drafter B96 260.7 -> 113.8, B128 286.5 -> 157.5,
-# B192 338.2 -> 219.9.
-# Split 1 on the work list (no long splits) stays bound by the longest item (B96 259.5,
-# B192 359.3); (1, 2, 64, 128) is within 2% of this at B96-B192.
-LONG_SPLIT.update({(r, 96): (1, 4, 64, 128) for r in range(260, 769, 4)})
-# B129-B192 (516-768 rows): 2 long splits (fewer FP32 partials for DcpValue's fold).
-# 1 GPU, us per layer, (1, 4, 64, 128) -> this: mix192 324.6 -> 319.6, two i.i.d.
-# AgentX draws at B192 311.9 / 329.4 -> 305.8 / 323.6, mix160 271.5 -> 265.9; at B96-B128
-# within +-2% either way (B48-B64: +12..+25%, so not below B129).
-LONG_SPLIT.update({(r, 96): (1, 2, 64, 128) for r in range(516, 769, 4)})
-LONG_SPLIT.update(
-    {(r, 64): (1, 4, 64, 128) for r in range(195, 577, 3) if (r, 64) not in LONG_SPLIT}
-)
 
 
 def long_split(rows, heads, split, sms):
@@ -726,14 +707,6 @@ class DcpValue:
             pushers = 1 << (min(16, max(1, sms // merge)).bit_length() - 1)
         self.merge_rows = 16 // pushers if self.spread else 16
         self.grid = (heads, (batch + 15) // 16, pushers)
-        # The spread merges spin until every CTA's grid-stride pushes land, so the grid
-        # must be co-resident: one 512-thread CTA per SM (103 registers). Above one wave
-        # (6 heads x 36+ row tiles: DL3 B144+) CTA y merges row tiles y, y + G, ..
-        # (G row-tile CTAs per head) instead: the same rows, sums and MMAs (bitwise).
-        self.tile_stride = 0
-        if self.spread and heads * self.grid[1] * pushers > sms:
-            self.tile_stride = max(1, sms // (heads * pushers))
-            self.grid = (heads, self.tile_stride, pushers)
         # (decode only: spec verify rows, q > 1, keep the per-head merge)
         self.wide = (
             self.lean
@@ -868,12 +841,7 @@ class DcpValue:
         # own wait, relying on the next core starting only after this.
         cute.arch.griddepcontrol_launch_dependents()
         R = self.merge_rows
-        if cutlass.const_expr(self.tile_stride > 0):  # (spread above one wave)
-            for y in range(tile, (self.batch + 15) // 16, self.tile_stride):
-                if 16 * y + R * pusher < self.batch:
-                    self.merge_spread(args, latent, scales, tid, y)
-                    self.rearm_rows(mailbox, 16 * y + R * pusher, R, head, tid)
-        elif self.merges(pusher):
+        if self.merges(pusher):
             if cutlass.const_expr(self.spread):
                 self.merge_spread(args, latent, scales, tid)
                 self.rearm_rows(mailbox, 16 * tile + R * pusher, R, head, tid)
@@ -1308,20 +1276,15 @@ class DcpValue:
                 store_words(at(output, t, col), (bf16x2(lo, hi),))
 
     @cute.jit
-    def merge_spread(self, args, latent, scales, tid, row_tile=None):
+    def merge_spread(self, args, latent, scales, tid):
         """spread: CTA z of (head, row tile y) merges rows 16 y + R z + r (r < R) into
         rows r of its latent tile, then warp w projects output tile w of them: the
         weights, sums and per-tile MMAs of merge() (MMA rows are independent, so the
         same values). R = 16 (one pusher: H x row tiles fill the SMs) also merges and
-        stores the MMA tile's rows 8-15. ``row_tile``: y (``tile_stride``), else the
-        CTA's own. Back-to-back calls need no barrier: the next call writes the
-        scales after the last read (before this call's second barrier) and the
-        latent tile only after its first barrier (every warp's MMA reads done)."""
+        stores the MMA tile's rows 8-15."""
         box, lbox, gate, totals, output = args[3], args[4], args[9], args[10], args[11]
         D, B, R = self.size, self.batch, self.merge_rows
         head, tile, z = cute.arch.block_idx()
-        if cutlass.const_expr(row_tile is not None):
-            tile = row_tile
         lane, warp = tid % 32, tid // 32
         group, quarter = lane // 4, lane % 4
         t0 = 16 * tile + R * z  # this CTA's first row

@@ -145,8 +145,7 @@ DRAFT_CORE_PUSH = batch_table("224:1")
 # Rows whose persistent core runs the per-step work list (mla.wlist) where mla.dcp's
 # LONG_SPLIT launches its long split: the polled fold rows (valid 2) and the wide rows.
 # The first drafter layer builds the lists; the core push (split 1) is off for them.
-# (225-576: DL3 B65-B192 drafter rows, hb192, with mla.dcp's LONG_SPLIT rule)
-DRAFT_WLIST = batch_table("28:1,35:1,42:1,49:1,56:1,63-576:1")
+DRAFT_WLIST = batch_table("28:1,35:1,42:1,49:1,56:1,63-224:1")
 
 THREADS = 256
 POLLS = 8  # 16 B gathered-mailbox chunks polled per thread

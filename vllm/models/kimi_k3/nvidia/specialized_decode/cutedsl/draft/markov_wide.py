@@ -70,10 +70,7 @@ from .markov import (
     shuffle_max,
 )
 
-# requests (keys per mailbox entry), in N tiles of 8. 128 (hb192: DL3 B65-B128): the
-# sampled kernel's shared memory is ~135 KB + ~1.3 KB per request slot, ~304 KB at 128
-# (SM107's oversized opt-in: 334848 B); 192 would not fit.
-MAX_WIDTH = 128
+MAX_WIDTH = 64  # requests (keys per mailbox entry), in N tiles of 8
 # Rank-local u32 words per parity: the maxima, then one 16-byte counter per position.
 LOCAL_WORDS = MAX_STEPS * MAX_WIDTH * 2 + MAX_STEPS * 4
 

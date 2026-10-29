@@ -37,7 +37,7 @@ from .experts_rubin import (
 )
 from .experts_rubin64 import CENSUS_BYTES, RubinGroupedExpertsKernel
 from .experts_vw import RubinVWExpertsKernel
-from .experts_wide import WIDE_MAX, RubinWideExpertsKernel, WidePlanKernel
+from .experts_wide import RubinWideExpertsKernel, WidePlanKernel
 
 logger = init_logger(__name__)
 
@@ -214,23 +214,8 @@ RUBIN64_VERIFY = {16: "9-63:1"}
 # (each expert's weights once per up to 16 / 32 tokens). One GPU, WideExperts with the
 # plan written in front, real verify routes of all 92 MoE layers, us per call, width 8
 # / 16: M72 38.55 / 38.68, M96 44.86 / 44.34, M128 52.62 / 50.54, M160 60.08 / 56.32,
-# M192 66.07 / 60.73, M224 72.25 / 65.69, M256 78.17 / 70.18. 513-768 rows (DL3 q4
-# B129-192; capacity up to ``experts_wide.WIDE_MAX``): width 16, 1 GPU, q4 routes of
-# independent real requests (all 92 layers x 2 draws), us per call: M576 115.0, M640
-# 123.9, M704 131.9, M768 138.6 (M512 106.4).
-WIDE = {16: "65-80:8,81-768:16"}
-
-
-# Wide rows' FC2 tail pool zone (``RubinGroupedExpertsKernel``'s pool = (zone, grain 6):
-# the jobs at the end of every FC2(B) range that go into the pool), by rows; other
-# wide rows keep (12, 6). Pool claims move whole FC2 jobs: bitwise (zone 48 vs 12, 28
-# real calls each at M256 / 512 / 768). Longer FC2 ranges leave larger late-CTA
-# excesses. 1 GPU, W16 front-planned, real q4 routes (92 layers x 2 draws), two
-# allocations per arm, us per call 12 -> 48: M192 66.2 -> 65.7, M256 73.9 / 73.8 ->
-# 73.4 / 73.2, M384 88.7 / 88.2 -> 87.4 / 87.0, M512 106.1 / 107.4 -> 105.0 / 104.9,
-# M640 123.8 -> 121.9, M768 138.6 / 138.6 -> 136.0 / 136.1 (36: equal to 48 at <= 512,
-# +0.8 at 768; M128: -0.1).
-WIDE_POOL = {16: "257-768:48"}
+# M192 66.07 / 60.73, M224 72.25 / 65.69, M256 78.17 / 70.18.
+WIDE = {16: "65-80:8,81-512:16"}
 
 
 def wide_capacity(rows):
@@ -265,7 +250,7 @@ def compile_wide_plan(batch, device):
 @functools.cache
 def compile_wide(
     experts, batch, grid, device, slots, dies=(), static=False, width=8,
-    publish="local", cap=0, pool=(12, 6),
+    publish="local", cap=0,
 ):  # fmt: skip
     """The wide engine (``wide_kernel``) at ``batch`` rows: the plan (64-row blocks),
     ids, the maps, scales, workspace, the routing weights, the SiTU scalars, the
@@ -274,7 +259,7 @@ def compile_wide(
     w13 / w2 addresses."""
     moe = wide_kernel(
         experts, grid, slots, batch, width, publish=publish, dies=dies,
-        static_groups=static, pool=pool,
+        static_groups=static,
     )  # fmt: skip
     flat = lambda n, dtype=c.Uint8, align=16: fake((n,), (1,), dtype, align)
     scales = (flat(experts * n) for n in (moe.w13_scale_bytes, moe.w2_scale_bytes))
@@ -424,28 +409,23 @@ def compile_plan(batch, device):
 
 def stage_homes(workspace, kernel):
     """The home die bit c of each 2 MiB chunk under the wide kernels' staged rows
-    (``dies.page_domains``), into the two workspace words at ``kernel.ws_homes``: bit k
-    for the k-th chunk from the one holding the first staged byte (word k // 32), 0 for
-    a chunk without a clear answer. Only the die-local finalize's locality depends on
-    them. Outside CUDA graph captures (probe launches)."""
+    (``dies.page_domains``), into the workspace word at ``kernel.ws_homes``: bit k for
+    the k-th chunk from the one holding the first staged byte, 0 for a chunk without a
+    clear answer. Only the die-local finalize's locality depends on them. Outside CUDA
+    graph captures (probe launches)."""
     from ..common import dies
 
     bits = 0
     if dies.domain_count(workspace.device.index) > 1:
-        span = 16 * WIDE_MAX * 7168  # the staged rows at the largest capacity
-        stage = workspace[kernel.ws_stage : kernel.ws_stage + span]
+        stage = workspace[kernel.ws_stage : kernel.ws_stage + 16 * 512 * 7168]
         homes = dies.page_domains(stage)  # probes the staged rows' bytes only
-        chunks = -(-(stage.data_ptr() % dies.CHUNK + span) // dies.CHUNK)
-        assert chunks <= 63
+        chunks = -(-(stage.data_ptr() % dies.CHUNK + 16 * 512 * 7168) // dies.CHUNK)
+        assert chunks <= 31
         chunks = min(chunks, homes.numel() * dies.PAGE // dies.CHUNK)
         for k in range(chunks):
             if int(homes[k * (dies.CHUNK // dies.PAGE)]) == 1:  # page 0: parity 0
                 bits |= 1 << k
-    words = [
-        (bits >> s & 0xFFFFFFFF) - ((bits >> s & 0x80000000) << 1) for s in (0, 32)
-    ]
-    homes = workspace[kernel.ws_homes : kernel.ws_homes + 8].view(torch.int32)
-    homes.copy_(torch.tensor(words, dtype=torch.int32))
+    workspace[kernel.ws_homes : kernel.ws_homes + 4].view(torch.int32).fill_(bits)
     return bits
 
 
@@ -517,7 +497,6 @@ class PersistentExperts:
         self.rows64 = batch_table(RUBIN64_VERIFY.get(self.tp, "") if q > 1 else "")
         self.zones = batch_table(POOL_ZONE.get(self.tp, "") if q > 1 else "")
         self.wide = batch_table(WIDE.get(self.tp, "") if q > 1 else "")
-        self.wide_pool = batch_table(WIDE_POOL.get(self.tp, "") if q > 1 else "")
         self.slots = workspace_slots(self.device)
         self.weights = (w13, s13, w2, s2)
         scalars = (beta * linear_beta, 1 / beta, 1 / linear_beta)
@@ -649,10 +628,9 @@ class PersistentExperts:
         grid = self.grid_for(batch)
         static = bool(self.static.get(batch))
         mode, cap = ("twoshot", publish[1].shape[1]) if twoshot else ("local", 0)
-        pool = (self.wide_pool.get(batch, 12), 6)
         code = compile_wide(
             self.experts, batch, grid, self.device.index, self.slots, self.dies, static,
-            self.wide[batch], mode, cap, pool,
+            self.wide[batch], mode, cap,
         )  # fmt: skip
         check_residency(code, self.device.index, grid, 384, "Kimi K3 MoE experts")
         width, slots = (self.wide[batch], self.slots)

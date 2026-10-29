@@ -92,7 +92,7 @@ from .context import div_rn, rsqrt_approx
 HIDDEN = 7168
 CAP = 64  # one-shot rows per step (B8: 56 query rows)
 TWO_CAP = 64  # two-shot rows per step
-WIDE_CAP = 576  # wide (``ArNormRows``) rows per step (hb192: DL3 B192 query rows)
+WIDE_CAP = 256  # wide (``ArNormRows``) rows per step
 CLUSTER = 8  # CTAs per row
 COLUMNS = HIDDEN // CLUSTER  # 896: 112 threads x 8 columns
 # Benchmarks only: one-shot sites write CTA (0, 0)'s %globaltimer at entry, after the

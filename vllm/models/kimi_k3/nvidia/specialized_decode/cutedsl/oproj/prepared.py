@@ -42,7 +42,7 @@ OPROJ_ROWS = 64
 # reduced-gather consumer with its AttnRes; other wide shapes take seam S3 (the stock
 # o-projection + all-reduce, then the unfused AttnRes). Keyed per TP on token rows
 # (``shapes.rows_policy``: every q).
-WIDE_TWOSHOT = {16: "65-768:1"}
+WIDE_TWOSHOT = {16: "65-512:1"}
 # Rubin wide shapes whose ``OprojUmmaRows`` runs one chunk of this many token rows
 # instead of 64-row chunks, per TP on token rows (``shapes.rows_policy``): at 65-80
 # rows a second 64-row chunk (up to 16 real rows) repeats the chunk's MMAs, drain,

@@ -72,7 +72,7 @@ SHARED_DOWN_SMS = {"*": "65-96:4"}
 # 448 rows, 128 above (1 GPU, real weights, us per call, front alone / front +
 # routing: M384 5.1 / 9.0 at 64 against 5.5 / 10.1 at 128; M512 8.7 / 13.3 against
 # 6.4 / 10.7). Both tiles publish bitwise-equal rows.
-FRONT_N_ROWS = {"*": "65-128:64,129-192:96,193-256:128,257-448:64,449-768:128"}
+FRONT_N_ROWS = {"*": "65-128:64,129-192:96,193-256:128,257-448:64,449-512:128"}
 # Rows whose front kernel also runs the shared expert's gate/up + SiTU (``MoeFrontRows``
 # with the gate/up tiles: h for the down rows, as the 64-row merged front); other rows
 # run the whole shared expert beside routing and the routed experts. Their persistent
@@ -93,19 +93,13 @@ MERGED_ROWS = {"*": "65-256:1"}
 # LatentRows at 192-256 rows (it gets SMs only as the experts' grid drains) and gated
 # NormRows. 16 ranks (axhb-sw3, mirrored, 93 layers, 32k), us/step: B17 (136 rows)
 # -249, B24 -228, B28 -171, B32 -182.
-SHARED_EARLY_ROWS = {"*": "129-256:1"}
-# Unmerged rows (not MERGED_ROWS) whose whole shared expert forks to the side stream at
-# a later point than before the front kernel (``PreparedMoE.run_front_rows``): 1 once
-# the front kernel has completed (beside routing), 2 once routing has completed (beside
-# the routed experts). Same kernels and inputs: bitwise. 1 GPU chain (o-projection
-# stand-in, FrontRows, routing, the wide experts on real routes, layer 3), us per layer
-# over the experts alone, before / 1 / 2: M384 20.0 / 22.6 / 23.2, M512 21.5 / 21.5 /
-# 21.8, M768 21.9 / 20.3 / 20.7. Empty until a 16-rank screen pays (the routing kernel
-# shares SMs with the cuBLAS gate/up there).
-SHARED_FORK_ROWS = {"*": ""}
+# ds39 (axhb2-z39b: DL3 AgentX mix, mns 64, 16 ranks, mirrored ABBA, us/step at B32 / 40 / 48 /
+# 64): 97-128 rows value 1 and 129-256 rows value 3 (the shared RS push right behind the
+# early down rows): -175 / -88 / -87 / -183; graph output sha equal.
+SHARED_EARLY_ROWS = {"*": "97-128:1,129-256:3"}
 # Copy CTAs whose warps all hold their chunks before any warp stores (``RouteSitu``'s
 # ``sync_copy``): the plan's shuffles do not queue behind sibling warps' polls.
-COPY_SYNC_ROWS = {"*": "65-768:1"}
+COPY_SYNC_ROWS = {"*": "65-512:1"}
 # Rows whose routing runs the 64-row path's lean sigmoids (``front.ROUTE_RCP_WIDE``:
 # each thread's exact sigmoids share one div.rn fallback branch) and its copy role on
 # two CTAs per token (``front.COPY_HALVES_WIDE``: one 8-column chunk per thread, the
@@ -188,11 +182,6 @@ class FrontRows:
             b: n
             for b, s in shapes.items()
             if b in self.merged and (n := rows_policy(SHARED_EARLY_ROWS, s, 0))
-        }
-        self.fork = {
-            b: n
-            for b, s in shapes.items()
-            if b not in self.merged and (n := rows_policy(SHARED_FORK_ROWS, s, 0))
         }
         gate_rows = {
             b: rows_policy(SHARED_GATE_ROWS, s, None) for b, s in shapes.items()

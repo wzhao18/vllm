@@ -29,8 +29,7 @@ from ..common.policy import batch_table
 
 # Packed verify rows whose core runs the work list where mla.dcp.LONG_SPLIT launches its
 # long split (persistent). Rubin, DCP16.
-# (68: DL3 B17; 260-768: DL3 B65-B192, hb192)
-WLIST = batch_table("24:1,32:1,40:1,48:1,56:1,64:1,68-768:1")
+WLIST = batch_table("24:1,32:1,40:1,48:1,56:1,64:1,68-256:1")  # (68: DL3 B17)
 
 # The empty item: split 0x7FFF of request 0 (no K tiles in any partition).
 WLIST_EMPTY = 0x7FFF << 16
