@@ -89,6 +89,10 @@ class SplitKGemm:
         self.cta_m, self.cta_n, self.cta_k = tactic.mma_m, tactic.mma_n, CTA_K
         self.num_ab_stage, self.split_k = tactic.ab_stages, tactic.split_k
         self.threads_per_cta, self.epilog_threads = 256, 128
+        # ``trigger_after_wait`` (subclasses): the PDL dependents are released by the
+        # activation warp right after its wait, instead of by the weight warp once
+        # every weight tile is requested (possibly before the wait).
+        self.trigger_after_wait = False
         self.mma_tiler_mn = (tactic.mma_m, tactic.mma_n)
         self.cta_group = tcgen05.CtaGroup.ONE
         self.cluster_shape = (1, tactic.split_k, 1)
@@ -231,7 +235,8 @@ class SplitKGemm:
             if stage == stages - 1:
                 empty_phase = empty_phase ^ 1
 
-        cute.arch.griddepcontrol_launch_dependents()
+        if cutlass.const_expr(not self.trigger_after_wait):
+            cute.arch.griddepcontrol_launch_dependents()
         self.drain(bar_empty, empty_phase, k_tile_count)
 
     @cute.experimental.jit
@@ -246,6 +251,8 @@ class SplitKGemm:
             s_tile.element_type, cute.slice_(s_tile.layout, (None, None, None, 0))
         )
         cute.arch.griddepcontrol_wait()
+        if cutlass.const_expr(self.trigger_after_wait):
+            cute.arch.griddepcontrol_launch_dependents()
         empty_phase = cutlass.Int32(1)
         for k_tile in cutlass.range(k_tile_count, unroll=1):
             stage = k_tile % stages

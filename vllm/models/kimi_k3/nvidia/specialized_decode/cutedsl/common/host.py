@@ -116,6 +116,22 @@ def check_residency(compiled, device_index: int, grid: int, threads: int, what: 
         )
 
 
+def kernel_registers(compiled, device) -> int:
+    """Registers per thread of the one kernel in ``compiled`` on ``device``."""
+    _, function = resolve_kernel(compiled, device)
+    count = cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_NUM_REGS
+    (registers,) = _checked(cuda.cuFuncGetAttribute(count, function))
+    return registers
+
+
+def check_registers(compiled, device, limit: int, what: str):
+    """Raise when ``compiled`` uses more than ``limit`` registers per thread (a budget
+    that keeps a kernel's register allocation, and so its co-residency, fixed)."""
+    registers = kernel_registers(compiled, device)
+    if registers > limit:
+        raise RuntimeError(f"{what} uses {registers} registers per thread (> {limit})")
+
+
 def prepare_shared_carveout(compiled, device_index: int, value: int):
     """Restore ``value`` (CuTe's launcher drops preferred_smem_carveout) as a driver
     function attribute; call once before capture."""

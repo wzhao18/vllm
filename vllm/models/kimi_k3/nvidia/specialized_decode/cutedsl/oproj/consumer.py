@@ -8,22 +8,22 @@ receive slots into it (args 11-13: receive view, gather multicast address, rank)
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, Uint32
+from cutlass import Float32, Int32, Int64, Uint32
 
-from ..attn_res.kernel import arm_exchanges
+from ..attn_res.kernel import arm_exchanges, rstd
 from ..common.mailbox import rearm
 from ..common.primitives import (
     add_rn,
     alloc,
     asm,
     at,
-    attn_res_rstd,
     bits_float,
     copy_g2s,
     float_bits,
     fma,
     launch,
     load_vector,
+    multicast_words,
     named_barrier,
     pack_pair,
     publish_hint,
@@ -113,11 +113,31 @@ class OprojConsumer:
         has_delta=True,
         groups=4,
         twoshot=False,
+        batched=False,
+        reduced=False,
+        vote=False,
+        out_mc=False,
     ):
         if not 0 <= nb <= 8:
             raise ValueError("Output-projection AttnRes supports zero to eight blocks")
         self.nb, self.has_delta = nb, has_delta
         self.groups, self.twoshot = groups, twoshot
+        # ``reduced`` (two-shot): the producer's CTAs reduce the owned columns and
+        # multicast the gather (``OprojUmma(reduce=True)``); this kernel only polls it.
+        self.reduced = reduced
+        # ``batched`` (two-shot): the owners poll their receive slots with every load
+        # in flight (``common.twoshot.poll_slots``); same sums, bitwise.
+        self.batched = batched
+        # ``vote`` (Rubin, B<=8): ``poll_sum`` reloads every rank slot each pass and
+        # leaves the loop on a warp vote, instead of re-polling only the pending slots
+        # (predicated temporaries merged a few loads at a time) in per-lane loops that
+        # the named barrier and shuffles after them wait to reconverge. Same sums.
+        self.vote = vote
+        # ``out_mc`` (row-sharded AttnRes, ``attn_res.sharded``; one-shot): the mailbox
+        # is the row owners' receive slots of this rank's rows, and the output rows go
+        # to every rank's all-gather row row0 + token (trailing args: multicast address,
+        # row0; -0 halves made +0) instead of ``output``.
+        self.out_mc = out_mc
         self.kpre = 1 << max(0, (2 * nb - 1).bit_length())
         self.npost = 4 if nb > 0 else 1
 
@@ -209,8 +229,7 @@ class OprojConsumer:
                 blk[tid] = add_rn(*sums)
             named_barrier()
             logits = [
-                mul_rn(blk[self.nb + b], attn_res_rstd(blk[b], eps))
-                for b in range(self.nb)
+                mul_rn(blk[self.nb + b], rstd(blk[b], eps)) for b in range(self.nb)
             ]
             maximum = tree_reduce(logits, max)
             exp = [cute.math.exp(x - maximum, fastmath=True) for x in logits]
@@ -238,6 +257,19 @@ class OprojConsumer:
         for rank in cutlass.range_constexpr(n):
             if rank < count:
                 fetch(raw, rank, at(mailbox, first + rank, token, h))
+        if cutlass.const_expr(self.vote):
+            ready = True
+            for rank in cutlass.range_constexpr(n):
+                if rank < count:
+                    ready &= published(raw[rank, j] for j in range(4))
+            while not cute.arch.vote_all_sync(ready):
+                for rank in cutlass.range_constexpr(n):
+                    if rank < count:
+                        fetch(raw, rank, at(mailbox, first + rank, token, h))
+                ready = True
+                for rank in cutlass.range_constexpr(n):
+                    if rank < count:
+                        ready &= published(raw[rank, j] for j in range(4))
         for rank in cutlass.range_constexpr(n):
             if rank < count:  # noqa: SIM102
                 if not published(raw[rank, j] for j in range(4)):
@@ -262,8 +294,13 @@ class OprojConsumer:
     @cute.jit
     def publish(self, output, xmoe, hints, token, h, values):
         tid, _, _ = cute.arch.thread_idx()
-        words = pack8(values)
-        store_words(at(output, token, h), words)
+        if cutlass.const_expr(self.out_mc):
+            mc, row0 = output
+            offset = Int64((row0 + token) * 7168 + h) * 2
+            multicast_words(mc + offset, pack8(values, "latent"))
+        else:
+            words = pack8(values)
+            store_words(at(output, token, h), words)
         if cutlass.const_expr(xmoe is not None):
             words = pack8(values, "latent")
             for rep in cutlass.range_constexpr(xmoe.shape[0]):
@@ -275,6 +312,8 @@ class OprojConsumer:
     @cute.jit
     def post(self, args, state, block_mix, rank, token):
         mailbox, prefix, _, _, _, _, output, xmoe, hints, eps, out_eps = args[:11]
+        if cutlass.const_expr(self.out_mc):
+            output = args[11:13]
         _, _, _, post, total, bars, parts, pf = state
         mix, maximum, exponent_sum, qpart = block_mix
         thread, _, _ = cute.arch.thread_idx()
@@ -295,10 +334,10 @@ class OprojConsumer:
                 if r < count:
                     rearm(at(mailbox, first + r, token, h))
         else:
-            if cutlass.const_expr(self.twoshot):
+            if cutlass.const_expr(self.twoshot and not self.reduced):
                 recv, gather_mc, me = args[11:14]
                 if h // recv.shape[2] == me:
-                    reduce(recv, mailbox, gather_mc, me, token, h)
+                    reduce(recv, mailbox, gather_mc, me, token, h, self.batched)
             if cutlass.const_expr(self.has_delta):
                 old = self.fragment(pf, 3, tid)
             attn = self.poll_sum(mailbox, token, h, 0, min(S, mailbox.shape[0]))
@@ -348,7 +387,7 @@ class OprojConsumer:
             norm = self.fragment(pf, 2, tid)
             final = cute.make_rmem_tensor(8, Float32)
             if cutlass.const_expr(self.nb > 0):
-                lp = mul_rn(total[3], attn_res_rstd(total[2], eps))
+                lp = mul_rn(total[3], rstd(total[2], eps))
                 mx = max(maximum, lp)
                 alpha = cute.math.exp(maximum - mx, fastmath=True)
                 ep = cute.math.exp(lp - mx, fastmath=True)
@@ -356,11 +395,10 @@ class OprojConsumer:
                 a2, t1 = mul_rn(alpha, alpha), total[1]
                 ae2 = mul_rn(mul_rn(2.0, alpha), ep)
                 quad = fma(a2, t1, fma(ae2, total[0], mul_rn(mul_rn(ep, ep), total[2])))
-                # The stock fused output norm: rsqrt(acc^2 / 7168 + eps * s * s).
-                scale = attn_res_rstd(quad, out_eps, den)
+                scale = rstd(quad, mul_rn(mul_rn(out_eps, den), den))
                 ca, cp = mul_rn(alpha, scale), mul_rn(ep, scale)
             else:
-                cp = attn_res_rstd(total[0], out_eps)
+                cp = rstd(total[0], out_eps)
             for j in cutlass.range_constexpr(4):
                 value = pair_op((cp, cp), two(prefix_value, j), op="mul")
                 if cutlass.const_expr(self.nb > 0):
@@ -390,10 +428,33 @@ class OprojConsumer:
 
 
 class OprojFused:
-    def __init__(self, nb, *, has_delta=True):
-        self.producer = OprojProducer(768, staged_blocks=0)
+    """``x_shared`` (Rubin): the producer copies x to shared memory once per CTA
+    instead of every warp reading its K slice from L2 (the same MMA operands, so
+    bitwise identical). ``polled_x`` (with ``x_shared``; Rubin MLA layers, see
+    mla.dcp.POLLED_OUTPUT): x is DcpValue's Lamport output buffer, polled instead of
+    read after the PDL wait, which moves to the end (completion stays transitive);
+    ``"half"``: x is KdaHead's polled output (kda.head.POLLED_OUT, 0xFFFF elements).
+    ``drain`` (Rubin): a GPU-scope fence after the multicast publish, off the critical
+    path: a grid whose CTAs issued NVLink stores and never fenced them pays ~0.2 us
+    more at its grid-end flush, i.e. its PDL dependents' ``griddepcontrol.wait``
+    returns later, however early the stores were issued. The producer-only CTAs fence
+    right after publishing (they exit next); in the consumer CTAs the publishing
+    threads arrive on a named barrier and the last warp syncs on it and fences once
+    its poll group is done. Only adds ordering; bitwise identical."""
+
+    DRAIN_BARRIER = 5
+
+    def __init__(
+        self, nb, *, has_delta=True, x_shared=False, polled_x=False, drain=False,
+        vote=False,
+    ):  # fmt: skip
+        self.polled_x = polled_x if x_shared else False  # True / "half" (KdaHead x)
+        self.producer = OprojProducer(
+            768, staged_blocks=0, x_shared=x_shared, vote=vote and bool(self.polled_x)
+        )
         # TP16 requires prefix/blocks to be ready at launch.
-        self.consumer = OprojConsumer(nb, has_delta=has_delta)
+        self.consumer = OprojConsumer(nb, has_delta=has_delta, vote=vote)
+        self.drain = drain
 
     @cute.jit
     def __call__(self, *args):
@@ -420,7 +481,23 @@ class OprojFused:
         maximum, exponent_sum, qpart = Float32(0), Float32(0), Float32(0)
         if group0:
             maximum, exponent_sum, qpart = self.consumer.pre(state, rank, rows[9], mix)
-        self.producer.compute(args, smem, weights, cta, False)
+        self.producer.compute(args, smem, weights, cta, False, self.polled_x)
+        # The last publish's threads (``OprojProducer.publish``) and the drain warp.
+        _, gt, ng = self.producer.schedule(x.shape[0])
+        publishers: cutlass.Constexpr = 8 * min(x.shape[0] - (ng - 1) * gt * 8, gt * 8)
+        drainers: cutlass.Constexpr = publishers + 32
+        if cutlass.const_expr(self.drain):  # noqa: SIM102 (compile-time)
+            if tid < publishers:
+                if active:
+                    named_barrier(self.DRAIN_BARRIER, drainers, arrive=True)
+                else:
+                    cute.arch.fence_acq_rel_gpu()
         if active:
             block_mix = (mix, maximum, exponent_sum, qpart)
             self.consumer.post(rows, state, block_mix, rank, cluster)
+            if cutlass.const_expr(self.drain):  # noqa: SIM102 (compile-time)
+                if tid >= 512 - 32:  # the last poll group's last warp
+                    named_barrier(self.DRAIN_BARRIER, drainers)
+                    cute.arch.fence_acq_rel_gpu()
+        if cutlass.const_expr(self.polled_x):
+            cute.arch.griddepcontrol_wait()

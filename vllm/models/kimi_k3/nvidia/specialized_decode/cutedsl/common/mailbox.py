@@ -26,6 +26,26 @@ def fetch(values, i: cutlass.Constexpr[int], pointer):
 
 
 @cute.jit
+def poll_warp(base, stride, count: cutlass.Constexpr[int]):
+    """``poll`` whose loop exit is a warp vote: every lane re-polls its dirty fragments
+    until no lane has one, so the lanes leave together. A warp-collective step after
+    a per-lane poll loop (shuffles, MMA) waits ~1000-1500 cycles for the lanes to
+    reconverge after the last one exits; here the vote is the only join. Every lane
+    of the warp must call it. Same words."""
+    values = cute.make_rmem_tensor((count, 4), Uint32)
+    pending = Uint32(0)
+    for i in cutlass.range_constexpr(count):
+        pending = pending | fetch(values, i, base + i * stride)
+    while not cute.arch.vote_all_sync(pending == 0):
+        again = Uint32(0)
+        for i in cutlass.range_constexpr(count):
+            if (pending >> i) & 1:
+                again = again | fetch(values, i, base + i * stride)
+        pending = again
+    return values
+
+
+@cute.jit
 def poll(base, stride, count: cutlass.Constexpr[int]):
     """Lamport-poll ``count`` 16-byte fragments at base + i*stride (elements); all
     loads issue before any check and only dirty fragments re-poll."""

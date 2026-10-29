@@ -56,6 +56,17 @@ def peer_load(pointer, peer):
     return code + "ld.shared::cluster.f32 $0,[a]; }", "=f,r,r", (pointer, Int32(peer))
 
 
+@asm()
+def weight_words(pointer, live):
+    """``load_words(pointer, count=4, evict_first=True)`` issued only when ``live`` is
+    nonzero (the registers are left undefined otherwise)."""
+    code = "{ .reg .b64 pol; .reg .pred p; setp.ne.b32 p,$5,0; "
+    code += "createpolicy.fractional.L2::evict_first.b64 pol, 1.0; "
+    code += "@p ld.global.nc.L1::no_allocate.L2::cache_hint.v4.b32 "
+    code += "{$0,$1,$2,$3}, [$4], pol; }"
+    return code, "=r,=r,=r,=r,l,r", (pointer, Int32(live)), (Uint32,) * 4, True
+
+
 @asm(Uint32, pure=True)
 def positive_zero32(value):
     """FP32 bits of ``value`` with -0.0 made +0.0, so it never equals the sentinel."""
@@ -65,9 +76,23 @@ def positive_zero32(value):
 
 class WsGemm:
     def __init__(
-        self, n, k, m, rt, kq, staged, split, valid, ks=1, tg=0, ch=0
+        self, n, k, m, rt, kq, staged, split, valid, ks=1, tg=0, ch=0, early=False,
+        tiles=None,
     ):  # fmt: skip
+        # tiles (token groups, one 8-token tile): the 16-row tiles of each CTA group
+        # (cluster) in launch order, at most ``rt``; warps past their group's count
+        # load and push nothing. The groups that the work distributor places last
+        # (behind the o-projection) then stream fewer weight rows after it ends. Every
+        # row keeps its K split and summation order, so the output is bitwise equal.
+        self.tiles = tuple(tiles) if tiles else None
+        if self.tiles:
+            assert tg and m <= 8 and max(self.tiles) <= rt and sum(self.tiles) * 16 == n
         self.n, self.k, self.m, self.rt, self.kq = n, k, m, rt, kq
+        # early (token groups): issue the register weight loads at entry, ahead of the
+        # barrier setup. Issued right before griddepcontrol.wait, ptxas schedules the
+        # wait first and the loads after it; the setup's branch and CTA barrier keep
+        # them in front.
+        self.early = early
         # ks: a cluster of ks CTAs splits K, so each CTA preloads 1/ks of the tile's
         # weights; ch: accumulator chains per 8-token tile (0: 4 / tiles per group).
         self.split, self.valid, self.ks = split, valid, ks
@@ -78,6 +103,8 @@ class WsGemm:
             raise ValueError(f"WsGemm token groups (tg={tg}) need a K-split cluster")
         self.groups, self.chains = -(-self.nt // self.ng), ch or max(1, 4 // self.ng)
         self.grid, self.threads = n // (16 * rt) * ks, 32 * rt * kq
+        if self.tiles:
+            self.grid = len(self.tiles) * ks
         self.blocks, self.parts = self.nt * rt, ks * kq
         self.slots = -(-self.blocks // ks)  # owned blocks s * ks + kpart
         # Bulk x rows: the CTA's K slice plus 64 B, so token pairs hit disjoint banks.
@@ -99,8 +126,16 @@ class WsGemm:
         group, part = lane // 4, lane % 4
         tile, quarter = warp // self.kq, warp % self.kq
         row = (cta * self.rt + tile) * 16 + group
+        here = live = None
+        if cutlass.const_expr(self.tiles):
+            here, first = self.group_tiles(cta)
+            row = (first + tile) * 16 + group
+            live = Int32(tile < here)
         kofs = (kpart * self.kq + quarter) * self.kb * 32 + part * 8
         shape = (self.nt, self.rt, self.kq, 8, 17)
+        wr = {}
+        if cutlass.const_expr(self.early):
+            wr = self.load_weights(w.iterator + row * self.k + kofs, live)
         red = smem.allocate_tensor(Float32, cute.make_layout(shape), 16)
         stage = alloc(smem, Uint32, (self.rt * self.kq, max(self.staged, 1), 2, 32, 4))
         xs = recv = None
@@ -114,8 +149,11 @@ class WsGemm:
             if tid == 0:
                 for g in cutlass.range_constexpr(self.groups):
                     cute.arch.mbarrier_init(bars.iterator + g, 1)
+                blocks = self.blocks
+                if cutlass.const_expr(self.tiles):
+                    blocks = self.nt * here
                 for s in cutlass.range_constexpr(self.slots):
-                    if s * self.ks + kpart < self.blocks:
+                    if s * self.ks + kpart < blocks:
                         cute.arch.mbarrier_init(owned.iterator + s, 1)
                         nbytes = self.parts * 512
                         cute.arch.mbarrier_arrive_and_expect_tx(
@@ -130,11 +168,8 @@ class WsGemm:
                 dst = at(stage, warp, j, h, lane, 0)
                 copy_g2s(dst, wp + h * 8 * self.k + (self.rb + j) * 32)
         cute.arch.cp_async_commit_group()
-        wr = {}
-        for j in cutlass.range_constexpr(self.rb):
-            for h in cutlass.range_constexpr(2):
-                src = wp + h * 8 * self.k + j * 32
-                wr[j, h] = load_words(src, count=4, evict_first=True)
+        if cutlass.const_expr(not self.early):
+            wr = self.load_weights(wp, live)
         cute.arch.griddepcontrol_wait()
         cute.arch.griddepcontrol_launch_dependents()
         if cutlass.const_expr(self.grouped):
@@ -149,30 +184,34 @@ class WsGemm:
             acc.fill(0)
             if cutlass.const_expr(self.grouped):
                 wait(bars.iterator + g)
-            for j in cutlass.range_constexpr(self.kb):
-                if cutlass.const_expr(j < self.rb):
-                    wa, wb = wr[j, 0], wr[j, 1]
-                else:
-                    sa = at(stage, warp, j - self.rb, 0, lane, 0)
-                    wa, wb = smem_words(sa), smem_words(sa + 128)
-                for t in cutlass.range_constexpr(self.tiles(g)):
-                    token = (g * self.ng + t) * 8 + group
-                    xv = (Uint32(0), Uint32(0), Uint32(0), Uint32(0))
-                    if cutlass.const_expr(self.grouped):
-                        col = (quarter * self.kb + j) * 16 + part * 4
-                        xv = smem_words(at(xs, token, col))
+            if cutlass.const_expr(self.tiles):
+                if live != 0:  # warps past the group's row tiles skip their MMAs
+                    self.grouped_mmas(acc, wr, stage, xs, warp, lane, quarter, g)
+            else:
+                for j in cutlass.range_constexpr(self.kb):
+                    if cutlass.const_expr(j < self.rb):
+                        wa, wb = wr[j, 0], wr[j, 1]
                     else:
-                        xg = x.iterator + token * x.stride[0] + kofs + j * 32
-                        if (g * self.ng + t) * 8 + 7 < self.m or token < self.m:
-                            xv = load_words(xg, count=4, mutable=True)
-                    for h in cutlass.range_constexpr(2):
-                        c = (j * 2 + h) % self.chains
-                        a = (wa[2 * h], wb[2 * h], wa[2 * h + 1], wb[2 * h + 1])
-                        b = (xv[2 * h], xv[2 * h + 1])
-                        mma_into(acc[t, c, None], a, b, bf16=True)
+                        sa = at(stage, warp, j - self.rb, 0, lane, 0)
+                        wa, wb = smem_words(sa), smem_words(sa + 128)
+                    for t in cutlass.range_constexpr(self.tiles_of(g)):
+                        token = (g * self.ng + t) * 8 + group
+                        xv = (Uint32(0), Uint32(0), Uint32(0), Uint32(0))
+                        if cutlass.const_expr(self.grouped):
+                            col = (quarter * self.kb + j) * 16 + part * 4
+                            xv = smem_words(at(xs, token, col))
+                        else:
+                            xg = x.iterator + token * x.stride[0] + kofs + j * 32
+                            if (g * self.ng + t) * 8 + 7 < self.m or token < self.m:
+                                xv = load_words(xg, count=4, mutable=True)
+                        for h in cutlass.range_constexpr(2):
+                            c = (j * 2 + h) % self.chains
+                            a = (wa[2 * h], wb[2 * h], wa[2 * h + 1], wb[2 * h + 1])
+                            b = (xv[2 * h], xv[2 * h + 1])
+                            mma_into(acc[t, c, None], a, b, bf16=True)
             if cutlass.const_expr(self.grouped and g == 0):
                 cute.arch.cluster_wait()  # owners' barriers are armed
-            for t in cutlass.range_constexpr(self.tiles(g)):
+            for t in cutlass.range_constexpr(self.tiles_of(g)):
                 values = []
                 for v in cutlass.range_constexpr(4):
                     value = acc[t, 0, v]
@@ -187,11 +226,16 @@ class WsGemm:
                     blk = (g * self.ng + t) * self.rt + tile
                     s, peer = blk // self.ks, blk % self.ks
                     dst = at(recv, s, kpart * self.kq + quarter, lane, 0)
-                    push_float(dst, tuple(values), owned.iterator + s, peer)
+                    if cutlass.const_expr(self.tiles):
+                        when = live
+                        push_float(dst, tuple(values), owned.iterator + s, peer, when)
+                    else:
+                        push_float(dst, tuple(values), owned.iterator + s, peer)
             if cutlass.const_expr(self.grouped and g > 0):
-                self.settle(args, red, recv, owned, cta, kpart, warp, lane, g - 1)
+                self.settle(args, red, recv, owned, cta, kpart, warp, lane, g - 1, here)
         if cutlass.const_expr(self.grouped):
-            self.settle(args, red, recv, owned, cta, kpart, warp, lane, self.groups - 1)
+            last = self.groups - 1
+            self.settle(args, red, recv, owned, cta, kpart, warp, lane, last, here)
         else:
             cute.arch.sync_threads()
             if cutlass.const_expr(self.ks > 1):
@@ -202,7 +246,48 @@ class WsGemm:
                 cute.arch.cluster_arrive()
                 cute.arch.cluster_wait()
 
-    def tiles(self, g):
+    def load_weights(self, wp, live=None):
+        """This warp's register-resident weight fragments (``rb`` K blocks; traced
+        unrolled); with ``tiles``, only when ``live``."""
+        wr = {}
+        for j in range(self.rb):
+            for h in range(2):
+                src = wp + h * 8 * self.k + j * 32
+                if cutlass.const_expr(self.tiles):
+                    wr[j, h] = weight_words(src, live)
+                else:
+                    wr[j, h] = load_words(src, count=4, evict_first=True)
+        return wr
+
+    def grouped_mmas(self, acc, wr, stage, xs, warp, lane, quarter, g):
+        """The token-group MMAs of one warp (``kernel``'s loop; x in shared memory)."""
+        group, part = lane // 4, lane % 4
+        for j in range(self.kb):  # traced unrolled
+            if j < self.rb:
+                wa, wb = wr[j, 0], wr[j, 1]
+            else:
+                sa = at(stage, warp, j - self.rb, 0, lane, 0)
+                wa, wb = smem_words(sa), smem_words(sa + 128)
+            for t in range(self.tiles_of(g)):
+                token = (g * self.ng + t) * 8 + group
+                col = (quarter * self.kb + j) * 16 + part * 4
+                xv = smem_words(at(xs, token, col))
+                for h in range(2):
+                    c = (j * 2 + h) % self.chains
+                    a = (wa[2 * h], wb[2 * h], wa[2 * h + 1], wb[2 * h + 1])
+                    b = (xv[2 * h], xv[2 * h + 1])
+                    mma_into(acc[t, c, None], a, b, bf16=True)
+
+    def group_tiles(self, cta):
+        """(row tiles, first row tile) of CTA group ``cta`` under ``tiles``."""
+        here, first, start = Int32(self.tiles[0]), Int32(0), 0
+        for i in range(1, len(self.tiles)):
+            start += self.tiles[i - 1]
+            here = Int32(cutlass.select_(cta == i, Int32(self.tiles[i]), here))
+            first = Int32(cutlass.select_(cta == i, Int32(start), first))
+        return here, first
+
+    def tiles_of(self, g):
         """8-token tiles in token group ``g``."""
         return min(self.ng, self.nt - g * self.ng)
 
@@ -224,15 +309,31 @@ class WsGemm:
 
     @cute.jit
     def settle(
-        self, args, red, recv, owned, cta, kpart, warp, lane, g: cutlass.Constexpr
+        self,
+        args,
+        red,
+        recv,
+        owned,
+        cta,
+        kpart,
+        warp,
+        lane,
+        g: cutlass.Constexpr,
+        here=None,
     ):
         """Owned blocks of token group ``g``: a warp per block waits for every K part,
         sums them in K order, transposes through ``red`` and publishes."""
-        for t in cutlass.range_constexpr(self.tiles(g)):
+        first = Int32(0)
+        if cutlass.const_expr(self.tiles):
+            _, first = self.group_tiles(cta)
+        for t in cutlass.range_constexpr(self.tiles_of(g)):
             for tile in cutlass.range_constexpr(self.rt):
                 blk = (g * self.ng + t) * self.rt + tile
                 s = blk // self.ks
-                if (kpart == blk % self.ks) & (warp == s % (self.rt * self.kq)):
+                mine = (kpart == blk % self.ks) & (warp == s % (self.rt * self.kq))
+                if cutlass.const_expr(self.tiles):
+                    mine = mine & (tile < here)
+                if mine:
                     wait(owned.iterator + s)
                     total = cute.make_rmem_tensor(4, Float32)
                     for p in cutlass.range_constexpr(self.parts):
@@ -252,6 +353,8 @@ class WsGemm:
                             red[tt, tile, 0, lane // 2, half + j] for j in range(8)
                         ]
                         col = (cta * self.rt + tile) * 16 + half
+                        if cutlass.const_expr(self.tiles):
+                            col = (first + tile) * 16 + half
                         self.epilogue(args, token, col, values)
 
     @cute.jit

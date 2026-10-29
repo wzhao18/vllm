@@ -19,6 +19,7 @@ from ...common.primitives import (
     asm,
     bf16,
     copy_bulk,
+    div_rn,
     early_weights,
     fma,
     gate_bf16_bits,
@@ -31,10 +32,8 @@ from ...common.primitives import (
     multicast_words,
     named_barrier,
     prefetch_bytes,
-    routing_add,
-    routing_sigmoid,
-    routing_weight,
-    situ_and_mul,
+    shared_situ,
+    sigmoid,
     sleep_ns,
     smem_words,
     split,
@@ -72,11 +71,13 @@ def load_arrivals(pointer):
 
 
 class FrontPlacement:
-    """One claiming thread per CTA; every CTA publishes its arrival."""
+    """One claiming thread per CTA; every CTA publishes its arrival. B2 orders the
+    claimants by a CTA bit mask of ``words`` 32-bit words (one bit per CTA)."""
 
-    def __init__(self, batch):
+    def __init__(self, batch, grid):
         self.batch = batch
         self.offset = 8 if batch == 2 else 0
+        self.words = (grid + 31) // 32
 
     @cute.jit
     def claim(self, epoch, designated, par, cta):
@@ -96,7 +97,7 @@ class FrontPlacement:
     @cute.jit
     def rearm(self, epoch, par):
         pointer = epoch.iterator + (2 + (par ^ 1)) * 32 + self.offset
-        for i in cutlass.range_constexpr(8 if self.batch == 2 else 3):
+        for i in cutlass.range_constexpr(3 + self.words if self.batch == 2 else 3):
             mailbox_store(pointer + i, (Uint32(0),))
 
     @cute.jit
@@ -115,7 +116,7 @@ class FrontPlacement:
                 role = claimed | (Int32(first == cta) << 16)
             else:
                 order = Int32(0)
-                for word in cutlass.range_constexpr(5):
+                for word in cutlass.range_constexpr(self.words):
                     bits = mailbox_load(pointer + 3 + word)[0]
                     if word < cta // 32:
                         order += Int32(cute.arch.popc(bits))
@@ -237,12 +238,15 @@ def initialize_designated(table: torch.Tensor):
 
 
 class MoeFrontTP16:
-    def __init__(self, batch: int, *, grid=None, renorm=True):
+    def __init__(self, batch: int, *, grid=None, renorm=True, early_gate=False):
+        """``early_gate``: stage the gate/up rows with the router rows, before the
+        x_moe epoch wait (else after the latent multicast)."""
+        self.early_gate = early_gate
         self.batch = batch
         self.grid = grid if grid is not None else 141 if batch == 1 else 134
         self.renorm = renorm
         self.shared_bytes = 15 * 14336 + (512 * batch + 128) * 4 + 16 + 8
-        self.placement = FrontPlacement(batch)
+        self.placement = FrontPlacement(batch, self.grid)
 
     @cute.jit
     def __call__(self, *args):
@@ -283,6 +287,13 @@ class MoeFrontTP16:
             bits = Uint32(gate_bf16_bits(total))
             pointer = hg.iterator + (par * self.batch + token) * 768 + start + row
             mailbox_store(pointer, ((bits << 16) | Uint32(1),))
+
+    @cute.jit
+    def stage_gate(self, slots, gate_up, gate_first, gate_rows, bars):
+        if gate_rows > 0:
+            cute.arch.mbarrier_arrive_and_expect_tx(bars + 1, gate_rows * 14336)
+            dst, src = slots + 9 * 14336, gate_up.iterator + gate_first * 7168
+            copy_bulk(dst, src, bars + 1, gate_rows * 14336)
 
     @cute.jit
     def poll_flag(self, pointer):
@@ -392,7 +403,7 @@ class MoeFrontTP16:
     def kernel(self, args):
         router, bias, xmoe, epoch, scores, ids, weights, down, latent = args[0:9]
         gate_up, hg, shared_down, output, designated, par, par3, rank = args[9:17]
-        multicast_base, scale, situ = args[17], args[18], args[19:21]
+        multicast_base, scale, situ = args[17], args[18], args[19:23]
         tid, warp, lane, cta = thread()
         router_first, router_rows = split(896, cta, self.grid)
         pair_first, pairs = split(112, cta, self.grid)
@@ -429,6 +440,8 @@ class MoeFrontTP16:
             init_barriers(bars, 2, async_proxy=True)
             claimed = self.placement.claim(epoch, designated, par, cta)
             stage_rows(slots, 14336, 0, router, router_first, router_rows, bars)
+            if cutlass.const_expr(self.early_gate):
+                self.stage_gate(slots, gate_up, gate_first, gate_rows, bars)
             if cta == 0:
                 mailbox_store(epoch.iterator + (par ^ 1) * 32, (Uint32(0),))
                 self.placement.rearm(epoch, par)
@@ -517,10 +530,8 @@ class MoeFrontTP16:
         if warp == 1:
             cute.arch.sync_warp()
         if tid == 0:
-            if gate_rows > 0:
-                cute.arch.mbarrier_arrive_and_expect_tx(bars + 1, gate_rows * 14336)
-                dst, src = slots + 9 * 14336, gate_up.iterator + gate_first * 7168
-                copy_bulk(dst, src, bars + 1, gate_rows * 14336)
+            if cutlass.const_expr(not self.early_gate):
+                self.stage_gate(slots, gate_up, gate_first, gate_rows, bars)
             if shared_resident & (shared_end > shared_first):
                 src = shared_down.iterator + shared_first * 384
                 prefetch_bytes(src, (shared_end - shared_first) * 768)
@@ -532,8 +543,8 @@ class MoeFrontTP16:
             logit = Float32(0)
             for w in cutlass.range_constexpr(16):
                 logit += partials[(w * 16 + row) * self.batch + token]
-            score = routing_sigmoid(logit)
-            record = score_record(score, routing_add(score, my_bias))
+            score = sigmoid(logit)
+            record = score_record(score, score + my_bias)
             index = (par * self.batch + token) * 896 + router_first + row
             mailbox_store(scores.iterator + index * 2, record)
         if (gate_rows > 0) & (~consumer):
@@ -546,8 +557,11 @@ class MoeFrontTP16:
                 score = selected[lane] if lane < 16 else Float32(0)
                 total = warp_sum(score, 16)
                 if lane < 16:
-                    normalized = routing_weight(score, total, scale, renorm=self.renorm)
-                    bits = Uint32(gate_bf16_bits(normalized))
+                    normalized = score
+                    if cutlass.const_expr(self.renorm):
+                        # Like the TP8 front and vLLM's grouped_topk kernels.
+                        normalized = div_rn(score, total + Float32(1e-20))
+                    bits = Uint32(gate_bf16_bits(normalized * scale))
                     if bits == 0x8000:
                         bits = Uint32(0)
                     high = cute.arch.shuffle_sync_down(bits, 1, mask=0xFFFF)
@@ -566,7 +580,7 @@ class MoeFrontTP16:
                 token, column = element // 384, element % 384
                 gp = hg.iterator + (par * self.batch + token) * 768 + column
                 gate, up = self.poll_flag(gp), self.poll_flag(gp + 384)
-                result = situ_and_mul(bf16(gate, True), bf16(up, True), *situ)
+                result = shared_situ(bf16(gate, True), bf16(up, True), *situ)
                 hsm[element] = Float32(BFloat16(result))
             cute.arch.sync_threads()
             self.shared_outputs(

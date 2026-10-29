@@ -32,6 +32,7 @@ from ..common.primitives import (
     multicast_words,
     mx_exponent,
     mx_rescale,
+    no_neg_zero,
     pack_fp8,
     pack_pair,
     release_tmem,
@@ -39,6 +40,7 @@ from ..common.primitives import (
     situ,
     smem_desc,
     smem_words,
+    store_relaxed,
     store_shared_words,
     store_words,
     thread,
@@ -56,10 +58,12 @@ class ExpertsGeometry:
     """Static plain-input geometry. No cluster-local or multicast storage. The workspace
     is capacity-independent; capacity > 8 swaps the batch's SMEM activation image for
     per-slot 8-row images, which frees a sixth weight stage, and keeps per-CTA windows
-    of the unit tables (expert, 8 pair rows) in the misc block."""
+    of the unit tables (expert, 8 pair rows) in the misc block. ``slots``: per-CTA
+    workspace entries (partials, call and claim counters), at least the largest grid
+    that shares the workspace."""
 
-    def __init__(self, tp, capacity=8):
-        self.tp = tp
+    def __init__(self, tp, capacity=8, slots=160):
+        self.tp, self.slots = tp, slots
         self.tiles, self.w13_rows, self.h_chunks, self.fc2_stages = (
             (6, 768, 3, 2) if tp == 8 else (3, 512, 2, 1)
         )
@@ -92,19 +96,19 @@ class ExpertsGeometry:
         # Stealing: FC2 unit queue (producer -> hidden loader) [8], full/empty [8, 8].
         self.off_queue, self.bar_queue = (self.off_misc + 4608, 4640)
         self.ws_partial = 2 * 128 * self.h_compact_bytes
-        self.ws_counter = self.ws_partial + 2 * 160 * 8 * 128 * 4
-        self.ws_xflag = self.ws_counter + 160 * 4
-        self.ws_stage = (self.ws_xflag + 160 * 4 + 255) // 256 * 256
+        self.ws_counter = self.ws_partial + 2 * slots * 8 * 128 * 4
+        self.ws_xflag = self.ws_counter + slots * 4
+        self.ws_stage = (self.ws_xflag + slots * 4 + 255) // 256 * 256
         # Publish stage rows [64 tokens x 16 slots, 3584] BF16, then grouped: call
-        # counters [160] and unit counts [2], hidden images [2, 1024].
+        # counters [slots] and unit counts [2], hidden images [2, 1024].
         self.ws_calls = self.ws_stage + 1024 * 3584 * 2
         self.ws_units = self.ws_calls + 1024
         # Pregrouped unit table (``ExpertsGroupKernel``): header (units, call, grouped
         # call), experts [1024], rows [1024, 8].
         self.ws_group = self.ws_units + 2 * 1024 * self.h_compact_bytes
-        # FC2(B) tail claim counters [2 parities, 160] (``ExpertsKernel.steal``).
+        # FC2(B) tail claim counters [2 parities, slots] (``ExpertsKernel.steal``).
         self.ws_steal = self.ws_group + 16 + 20 * 1024
-        self.workspace_bytes = self.ws_steal + 2 * 160 * 4
+        self.workspace_bytes = self.ws_steal + 2 * slots * 4
 
     def image(self, workspace, parity, unit):
         """Compact hidden image of ``unit`` in the ``parity`` half of the workspace."""
@@ -286,20 +290,28 @@ class ExpertsKernel(ExpertsGeometry):
     ``publish`` stages FC2 rows for ``finalize``: routing weights replace the output
     arg, and (latent multicast, parity, rank) follow the SiTU scalars; ``"twoshot"``:
     (receive slots [3 x TP, 64, 3584/TP], their owners' bases, parity x TP + rank) of
-    ``common.twoshot`` instead. Capacity > 8 (grouped) takes the plan (``PLAN_BYTES``:
-    MXFP8 x) in place of x. ``stream`` runs capacity <= 8 on the incremental producer
-    and CTA-scoped waits (grouped always). ``pregrouped`` (grouped) reads the unit table
-    ``ExpertsGroupKernel`` left in the workspace instead of grouping the routes itself.
+    ``common.twoshot`` instead. ``"push"``: as ``True``, followed by (this rank's
+    shared-expert rows [B, 7168], the TP RS mailbox bases, capacity); the CTAs
+    peer-store those rows into the RS mailboxes before their dependency wait (the
+    caller launches the experts only after the shared expert completed). Capacity > 8
+    (grouped) takes the plan (``PLAN_BYTES``: MXFP8 x) in place of x. ``stream`` runs
+    capacity <= 8 on the incremental producer and CTA-scoped waits (grouped always).
+    ``pregrouped`` (grouped) reads the unit table ``ExpertsGroupKernel`` left in the
+    workspace instead of grouping the routes itself.
     ``steal`` (grouped) balances the end: each CTA's last ``zone`` FC2(B) grains (TP8 a
     tile pair, TP16 three tiles) are claimed by the owner from the front and by the
     ``victims`` CTAs before it from the back, through one counter per CTA re-armed by
     call parity; a stolen grain is computed exactly as by its owner."""
 
+    static_groups = False  # ``group_sync``
+
     def __init__(
         self, tp, capacity, experts, grid, publish=False,
-        stream=True, pregrouped=False, steal=False,
+        stream=True, pregrouped=False, steal=False, slots=160,
     ):  # fmt: skip
-        super().__init__(tp, capacity)
+        super().__init__(tp, capacity, slots)
+        # CTAs past the grid advance the remaining slots' counters (at most one each).
+        assert grid <= slots <= 2 * grid and slots + 2 <= 256
         self.pregrouped = pregrouped and self.grouped
         self.steal = steal and self.grouped
         self.streamed = stream or self.grouped
@@ -457,10 +469,11 @@ class ExpertsKernel(ExpertsGeometry):
             if tid + self.threads * k < batch * 16:
                 mine[k] = ids[tid + self.threads * k]
         if cutlass.const_expr(counted):
+            ws, slots = (workspace.iterator, self.slots)
             if tid == 0:
-                scalars[1] = view(workspace.iterator, self.ws_counter, Int32, 160)[cta]
+                scalars[1] = view(ws, self.ws_counter, Int32, slots)[cta]
             if tid == 1:
-                scalars[2] = view(workspace.iterator, self.ws_calls, Int32, 160)[cta]
+                scalars[2] = view(ws, self.ws_calls, Int32, slots)[cta]
         for i in range(tid, 2 * self.experts, self.threads):
             masks[i] = Uint32(0)
         for i in range(tid, 4 * self.units, self.threads):
@@ -839,7 +852,7 @@ class ExpertsKernel(ExpertsGeometry):
         n, g = (self.jobs, self.grain)
         head = (ranges[0, 4], ranges[0, 5], 0)
         state = self.fc2_jobs(ring, state, maps, experts, ranges, *head)
-        counters = workspace.iterator + self.ws_steal + 640 * parity
+        counters = workspace.iterator + self.ws_steal + 4 * self.slots * parity
         lo, hi = (ranges[1, 4], ranges[1, 5])
         grains = (hi - lo) // g
         if grains > self.zone:
@@ -1225,12 +1238,12 @@ class ExpertsKernel(ExpertsGeometry):
         """Publish non-owner fragments, or reduce the owner's remaining pieces."""
         ws, live = (workspace.iterator, 8 if self.grouped else batch)
         _, warp, lane, cta = thread()
-        row = 32 * (warp & 3) + lane
+        row, slots = (32 * (warp & 3) + lane, self.slots)
         group = Int32(tile >= self.tiles * ranges[1, 0])
         start = (tile - self.tiles * ranges[group, 0]) * 14
         owner = start >= ranges[group, 2]
         if not owner:
-            offset = self.ws_partial + ((Int64(group) * 160 + cta) * 1024 + row) * 4
+            offset = self.ws_partial + ((Int64(group) * slots + cta) * 1024 + row) * 4
             for t in cutlass.range_constexpr(self.width):
                 if t < live:
                     store_words(ws + offset + t * 512, (float_bits(values[t]),))
@@ -1239,7 +1252,7 @@ class ExpertsKernel(ExpertsGeometry):
             while (peer < self.grid) & (peer * size // self.grid < start + 14):
                 if (peer + 1) * size // self.grid != peer * size // self.grid:
                     source = ws + self.ws_partial
-                    source += ((Int64(group) * 160 + peer) * 1024 + row) * 4
+                    source += ((Int64(group) * slots + peer) * 1024 + row) * 4
                     words = cute.make_rmem_tensor(self.width, Uint32)
                     ready = False
                     while not ready:
@@ -1275,11 +1288,11 @@ class ExpertsKernel(ExpertsGeometry):
                 maxima[t] = cute.arch.fmax(maxima[t], other)
             if lane == 0:
                 shared_max[(eg * 4 + ew) * 8 + t] = maxima[t]
-        group_barrier(eg)
+        self.group_sync(eg)
         stage_base, scale_token = (self.off_misc + 3200 + (eg * 4 + ew) * 128, Int32(0))
         for t in cutlass.range_constexpr(self.width):
             peer = shared_max[(eg * 4 + (ew ^ 1)) * 8 + t]
-            scale = mx_exponent(cute.arch.fmax(maxima[t], peer))
+            scale = mx_exponent(cute.arch.fmax(maxima[t], peer), floor=self.tp == 8)
             if lane == t:
                 scale_token = scale
             if up:
@@ -1296,7 +1309,21 @@ class ExpertsKernel(ExpertsGeometry):
                 byte = view(image, 0, Uint8, self.h_compact_bytes)
                 value = Uint8(scale_token)
                 byte[self.h_image_bytes + lane * 16 + 2 * chunk + ew // 2] = value
-        group_barrier(eg)
+        self.group_sync(eg)
+
+    @cute.jit
+    def group_sync(self, eg):
+        """Epilogue group ``eg``'s barrier. ``static_groups``: a constant id per group;
+        with the id computed at run time ptxas reserves all 16 named barriers for the
+        CTA, and then no CTA that uses a barrier (routing's, a shared down GEMM's) can
+        share its SM. Same synchronization."""
+        if cutlass.const_expr(self.static_groups):
+            if eg == 0:
+                group_barrier(0)
+            else:
+                group_barrier(1)
+        else:
+            group_barrier(eg)
 
     def pair(self, t, slot):
         """Expanded row of unit row ``t``: its pair (grouped), or token t's ``slot``."""
@@ -1359,7 +1386,7 @@ class ExpertsKernel(ExpertsGeometry):
                 if cutlass.const_expr(self.publish == "twoshot"):
                     push(*box, token, column + 8 * lane, packed)
                 else:
-                    mc, parity, rank = box
+                    mc, parity, rank = box[0:3]
                     offset = ((parity * self.tp + rank) * 64 + token) * 3584 + column
                     offset += 8 * lane
                     multicast_words(mc + Int64(offset) * 2, packed)
@@ -1392,11 +1419,11 @@ class ExpertsKernel(ExpertsGeometry):
                     phase ^= 1
                 if kind == 0:
                     if self.partials(workspace, values, a, ranges, batch):
-                        self.store_hidden(sm, workspace, values, a, parity, scalars[:4])
+                        self.store_hidden(sm, workspace, values, a, parity, scalars[:3])
                 else:
                     self.fc2(sm, workspace, output, values, a, b, ranges)
         if cutlass.const_expr(self.publish):
-            self.finalize(workspace, output, batch, scalars[4:])
+            self.finalize(workspace, output, batch, scalars[3:])
 
     @cute.jit
     def __call__(self, *args):
@@ -1445,25 +1472,47 @@ class ExpertsKernel(ExpertsGeometry):
             store_shared_words(xsf + (i >> 3) * 128 + (i & 7) * 16, zero)
 
     @cute.jit
+    def push_shared(self, box, batch, tid, cta, threads: cutlass.Constexpr = 0):
+        """``WaveMoeTail.push``'s stores (this rank's shared rows into slot (parity,
+        rank) of every peer's RS mailbox, -0 made +0), one 16-byte chunk per thread of
+        ``threads`` per CTA (default: all).
+
+        Called after ``griddepcontrol_wait``, never before: the experts join the shared
+        expert's stream with an event, and in a captured CUDA graph that join is a
+        programmatic edge, so the experts can start when the down GEMM triggers its
+        dependents, before it has stored the rows; only the wait covers its end."""
+        _, parity, rank, shared, peers, capacity = box
+        shard = 7168 // self.tp
+        n = threads or self.threads
+        for i in range(cta * n + tid, batch * 896, self.grid * n):
+            token, column = i // 896, 8 * (i % 896)
+            row = shared.iterator + token * 7168 + column  # written this step
+            words = load_words(row, count=4, mutable=True)
+            offset = ((parity * self.tp + rank) * capacity + token) * shard
+            offset += column % shard
+            packed = tuple(no_neg_zero(w) for w in words)
+            store_relaxed(peers[column // shard] + Int64(offset) * 2, packed)
+
+    @cute.jit
     def rearm(self, workspace, call_count):
         """Re-arm the other parity's images: all 128, or the last grouped call's."""
         _, _, lane, cta = thread()
         items: cutlass.Constexpr = 128 * self.h_compact_bytes // 16
         lo, hi = (cta * items // self.grid, (cta + 1) * items // self.grid)
         if cutlass.const_expr(self.grouped):
-            last = view(workspace.iterator, self.ws_calls + 640, Int32, 2)
+            last = view(workspace.iterator, self.ws_calls + 4 * self.slots, Int32, 2)
             used = max(last[call_count & 1 ^ 1], 0) * (self.h_compact_bytes // 16)
             lo, hi = (cta * used // self.grid, (cta + 1) * used // self.grid)
         other = self.image(workspace, call_count & 1 ^ 1, 0)
         for i in range(lo + lane, hi, 32):
             store_words(other + i * 16, (Uint32(4294967295),) * 4)
         if cutlass.const_expr(self.steal):
-            # Every one of the 160 counters: grids change with the batch.
-            base = self.ws_steal + 640 * (call_count & 1 ^ 1)
-            counters = view(workspace.iterator, base, Int32, 160)
+            # Every one of the slot counters: grids change with the batch.
+            base = self.ws_steal + 4 * self.slots * (call_count & 1 ^ 1)
+            counters = view(workspace.iterator, base, Int32, self.slots)
             if lane == 0:
                 counters[cta] = Int32(-1)
-                if cta < 160 - self.grid:
+                if cta < self.slots - self.grid:
                     counters[self.grid + cta] = Int32(-1)
 
     @cute.kernel
@@ -1473,7 +1522,7 @@ class ExpertsKernel(ExpertsGeometry):
         sm = alloc(cutlass.utils.SmemAllocator(), Uint8, self.smem_bytes, 1024)
         tmem_base = self.initialize(sm, maps, batch)
         cute.arch.griddepcontrol_wait()
-        counters = view(workspace.iterator, self.ws_counter, Int32, 160)
+        counters = view(workspace.iterator, self.ws_counter, Int32, self.slots)
         if cutlass.const_expr(self.grouped):
             # Images and rearm alternate over grouped calls; ``x`` is the plan.
             routed = view(sm.iterator, self.off_misc + 1140, Int32, 3)
@@ -1521,30 +1570,32 @@ class ExpertsKernel(ExpertsGeometry):
                     self.gather_x(sm, x, ranges, batch)
                 self.rearm(workspace, generation)
             else:
+                if cutlass.const_expr(self.publish == "push"):  # before any accumulator
+                    self.push_shared(scalars[3:9], batch, tid - 128, cta, 256)
                 self.epilogue(
                     sm, workspace, output, tmem, ranges, batch, generation & 1, scalars
                 )
         release_tmem(tmem, 512, warp, 3)
         if tid == 0:
             counters[cta] = call_count + 1
-            if cta < 160 - self.grid:
+            if cta < self.slots - self.grid:
                 counters[self.grid + cta] = call_count + 1
             if cutlass.const_expr(self.grouped):
-                grouped = view(workspace.iterator, self.ws_calls, Int32, 162)
+                grouped = view(workspace.iterator, self.ws_calls, Int32, self.slots + 2)
                 grouped[cta] = generation + 1
-                if cta < 160 - self.grid:
+                if cta < self.slots - self.grid:
                     grouped[self.grid + cta] = generation + 1
                 if cta == 0:
-                    grouped[160 + (generation & 1)] = distinct
+                    grouped[self.slots + (generation & 1)] = distinct
 
 
 class ExpertsGroupKernel(ExpertsKernel):
     """One CTA groups the routes into the workspace unit table that pregrouped
     ``ExpertsKernel`` read (launched after routing, beside the shared expert). Every
-    experts call advances all 160 call counters, so entry 0 stands for each CTA's."""
+    experts call advances all slot call counters, so entry 0 stands for each CTA's."""
 
-    def __init__(self, *args, early=False):
-        super().__init__(*args)
+    def __init__(self, *args, early=False, slots=160):
+        super().__init__(*args, slots=slots)
         self.threads = 1024
         # early: release the experts at entry, so their launch and prologue overlap
         # this kernel's dependency wait and grouping (they still wait for its end).

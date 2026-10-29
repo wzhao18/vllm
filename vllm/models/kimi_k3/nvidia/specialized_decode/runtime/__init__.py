@@ -9,17 +9,17 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class DecodeConfig:
     max_context: int
+    mla_core: str
+    dsa_core: str
     dcp: int
     # Tokens per request in a verify step (1 + draft tokens; 1 without speculation).
     q: int
     capture_sizes: tuple[int, ...]
-    # The FlashInfer sparse MLA kernels the DSA layers pick from per batch.
-    fi_kernels: tuple[str, ...] = ()
-    # The row capacities of the prims_ts plans (a batch runs on the smallest that
-    # holds it: the plan fixes the split-KV schedule and its BF16 partial roundings).
-    prims_ts_rows: tuple[int, ...] = ()
-    # Kimi K3.1 (DSA layers next to the MLA ones).
-    dsa: bool = False
+    # KDA recurrent state in BF16 (--mamba-ssm-cache-dtype bfloat16; Rubin only): the
+    # KdaHead layers need it.
+    bf16_state: bool = False
+    # Token rows of the runner's FULL decode graphs (``shapes.captured_rows``).
+    captured: tuple[int, ...] = ()
 
 
 def specialized_decode_config(vllm_config) -> DecodeConfig | None:
@@ -31,46 +31,30 @@ def specialized_decode_config(vllm_config) -> DecodeConfig | None:
         return None
     if backend != "latency_specialized":
         raise ValueError("Supported decode_backend values are auto/latency_specialized")
+    import torch
+
     reason = unsupported(vllm_config)
     if reason is not None:
         raise ValueError(f"Kimi K3 specialized decode does not support {reason}")
-    spec = vllm_config.speculative_config
+    from ..shapes import captured_rows
+
+    spec, compilation = vllm_config.speculative_config, vllm_config.compilation_config
+    q = 1 + spec.num_speculative_tokens if spec is not None else 1
+    sizes = tuple(compilation.cudagraph_capture_sizes or ())
+    # The runner's uniform decode graphs (cudagraph_utils): at most max_num_seqs
+    # requests and the largest capture size.
+    limit = vllm_config.scheduler_config.max_num_seqs * q
+    limit = min(limit, compilation.max_cudagraph_capture_size or max(sizes, default=0))
     return DecodeConfig(
         max_context=vllm_config.model_config.max_model_len,
+        mla_core=extra.get("mla_core", "auto"),
+        dsa_core=extra.get("dsa_core", "auto"),
         dcp=vllm_config.parallel_config.decode_context_parallel_size,
-        q=1 + spec.num_speculative_tokens if spec is not None else 1,
-        capture_sizes=tuple(
-            vllm_config.compilation_config.cudagraph_capture_sizes or ()
-        ),
-        fi_kernels=dsa_fi_kernels(vllm_config),
-        prims_ts_rows=prims_ts_rows(vllm_config),
-        dsa=getattr(vllm_config.model_config.hf_text_config, "dsa_config", None)
-        is not None,
+        q=q,
+        capture_sizes=sizes,
+        bf16_state=kda_dtypes(vllm_config)[1] == torch.bfloat16,
+        captured=captured_rows(sizes, q, limit),
     )
-
-
-def dsa_fi_kernels(vllm_config) -> tuple[str, ...]:
-    """The FlashInfer sparse MLA kernels of the DSA layers on a per-tensor FP8 or
-    nvfp4_ds_mla cache (none for other models and caches)."""
-    text = vllm_config.model_config.hf_text_config
-    dtype = vllm_config.cache_config.cache_dtype
-    if getattr(text, "dsa_config", None) is None or dtype not in FI_CACHE_DTYPES:
-        return ()
-    from ..cutedsl.dsa.attn_fi import fi_kernels
-
-    return fi_kernels(dtype)
-
-
-def prims_ts_rows(vllm_config) -> tuple[int, ...]:
-    """The prims_ts plans' row capacities: the deployment's CUDA graph sizes and the
-    powers of two up to its widest call (FLASHINFER_MLA_SPARSE's buckets)."""
-    if not dsa_fi_kernels(vllm_config):
-        return ()
-    from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
-        _prims_ts_row_buckets,
-    )
-
-    return _prims_ts_row_buckets(vllm_config)
 
 
 def kda_dtypes(vllm_config):
@@ -109,6 +93,12 @@ def unsupported(vllm_config) -> str | None:
     )
     compilation = vllm_config.compilation_config
     graphs = compilation.cudagraph_mode
+    # KdaSplit's BF16-state variant runs on Rubin (compute capability 10.7, the key of
+    # its schedules, ``kda.prepared.BF16_DEVICE_SCHEDULE``) only; elsewhere the
+    # recurrent state stays FP32.
+    states = [torch.float32]
+    if current_platform.is_device_capability((10, 7)):
+        states.append(torch.bfloat16)
     # Kimi K3.1: sparse (DSA) MLA layers over the packed MLA and indexer caches,
     # fp8_ds_mla on FlashMLA sparse or per-tensor FP8 on FlashInfer sparse.
     dsa = getattr(text, "dsa_config", None) is not None
@@ -127,7 +117,6 @@ def unsupported(vllm_config) -> str | None:
             not in (1, parallel.tensor_parallel_size),
             "decode context parallel other than 1 or TP",
         ),
-        (envs.VLLM_BATCH_INVARIANT, "batch invariance"),
         (vllm_config.model_config.enable_sleep_mode, "sleep mode"),
         (vllm_config.lora_config is not None, "LoRA"),
         # The runner's ModelState hooks build the executor and prepare the KV layouts.
@@ -147,11 +136,18 @@ def unsupported(vllm_config) -> str | None:
             spec is not None and spec.enable_adaptive_verification,
             "adaptive verification",
         ),
-        # KdaSplit keeps a BF16 conv state and an FP32 recurrent state in place.
+        # KdaSplit keeps a BF16 conv state and an FP32 (Rubin: or BF16) recurrent
+        # state in place; it maintains neither other cache dtypes nor ReplaySSM /
+        # RecoverSSM records.
         (
-            kda_dtypes(vllm_config) != (torch.bfloat16, torch.float32),
+            kda_dtypes(vllm_config) not in [(torch.bfloat16, s) for s in states],
             "KDA cache dtypes other than a BF16 conv state and an FP32 recurrent "
-            "state (mamba cache dtype)",
+            "state (mamba cache dtype; a BF16 recurrent state on Rubin only)",
+        ),
+        (
+            vllm_config.cache_config.use_replayssm
+            or vllm_config.cache_config.use_kda_recoverssm,
+            "ReplaySSM / RecoverSSM (--use-replayssm)",
         ),
         # The verify kernels take at most 8 tokens per request (KdaSplit's barriers).
         (
@@ -162,51 +158,12 @@ def unsupported(vllm_config) -> str | None:
             spec is not None and envs.VLLM_KIMI_K3_AUX_ATTN_RES_STREAM,
             "the AttnRes aux stream",
         ),
-        # The MLA cores read a per-tensor FP8 cache.
-        (
-            not dsa and vllm_config.cache_config.cache_dtype not in MLA_CACHE_DTYPES,
-            "MLA layers on KV cache dtypes other than per-tensor fp8",
-        ),
         (
             dsa
             and vllm_config.cache_config.cache_dtype
-            not in ("fp8_ds_mla", "fp8", "fp8_e4m3", "nvfp4_ds_mla"),
-            "DSA layers on KV cache dtypes other than fp8_ds_mla (FlashMLA sparse), "
-            "per-tensor fp8 (FlashInfer sparse) or nvfp4_ds_mla (FlashInfer sparse "
-            "prims_ts)",
+            not in ("fp8_ds_mla", "fp8", "fp8_e4m3"),
+            "DSA layers on KV cache dtypes other than fp8_ds_mla (FlashMLA sparse) "
+            "or per-tensor fp8 (FlashInfer sparse)",
         ),
     )
-    reason = next((reason for failed, reason in checks if failed), None)
-    if reason is None and dsa:
-        reason = dsa_unsupported(vllm_config)
-    return reason
-
-
-def dsa_unsupported(vllm_config) -> str | None:
-    """Why the K3.1 DSA layers' specialized kernels cannot run: the query and index
-    fronts implement the K3.1 indexer (no indexer RoPE, LayerNorm keys; an FP8
-    wq_index is refused when the layer is built), and on a FlashInfer sparse cache
-    the per-batch kernel policy needs FlashInfer's prims_ts kernel."""
-    dsa = vllm_config.model_config.hf_text_config.dsa_config
-    if getattr(dsa, "index_rope_dim", 0) != 0:
-        return "DSA indexer RoPE (index_rope_dim > 0)"
-    if getattr(dsa, "index_k_norm_type", None) != "layernorm":
-        return "DSA indexer keys normalized other than by LayerNorm"
-    dtype = vllm_config.cache_config.cache_dtype
-    if dtype in FI_CACHE_DTYPES:
-        from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
-            _prims_ts_unsupported_reason,
-        )
-
-        reason = _prims_ts_unsupported_reason(vllm_config, dtype)
-        if reason is not None:
-            return (
-                f"DSA layers on a {dtype} cache without FlashInfer prims_ts: {reason}"
-            )
-    return None
-
-
-# The per-tensor FP8 cache dtypes the MLA cores read; the DSA caches the FlashInfer
-# sparse MLA kernels read.
-MLA_CACHE_DTYPES = ("fp8", "fp8_e4m3")
-FI_CACHE_DTYPES = ("fp8", "fp8_e4m3", "nvfp4_ds_mla")
+    return next((reason for failed, reason in checks if failed), None)

@@ -102,10 +102,25 @@ class MoeTail:
     threads = 128
     options: dict = {}
 
-    def __init__(self, tp: int, batch: int, *, mode="front", trigger=2):
+    def __init__(
+        self, tp: int, batch: int, *, mode="front", trigger=2, poll_ns=None, gate=False,
+        reload=False,
+    ):  # fmt: skip
         self.tp, self.batch, self.mode, self.trigger = tp, batch, mode, trigger
+        # ``reload`` (Rubin, ``tail_runtime.RUBIN_TAIL_RELOAD``): the latent poll and
+        # the two-shot settle reload every source each pass instead of only the
+        # pending ones (see ``poll``). Same words in the same order, bitwise.
+        self.reload = reload
+        # ``gate``: one warp waits for one latent (and shared-shard) fragment per source
+        # before the CTA's threads poll their own fragments (fewer concurrent polls on
+        # lines that NVLink writes are landing in; every word is still checked).
+        self.gate = gate
+        if gate and (tp != 16 or mode != "front"):
+            raise ValueError("Gated MoeTail polling is a TP16 front-mode schedule")
         self.cluster, self.tokens = (7 if tp == 8 else 8), min(batch, 2)
         self.poll_ns, self.front_poll_ns = (0, 0) if tp == 8 else (64, 128)
+        if poll_ns is not None:  # latent / shared-shard poll backoff (``tail_runtime``)
+            self.poll_ns = poll_ns
         self.cols, self.shard = 3584 // self.cluster, 7168 // tp
         self.frags, self.nc = self.cols // 8, self.shard // 32
         self.grid = self.cluster * self.nc * ((batch + self.tokens - 1) // self.tokens)
@@ -123,14 +138,29 @@ class MoeTail:
         for source in cutlass.range_constexpr(16):
             if self.tp == 16 or source < 8 or dual:
                 pending |= self.poll_source(values, source, sources)
-        while pending != 0:
-            if cutlass.const_expr(self.poll_ns):
-                sleep_ns(Uint32(self.poll_ns))
-            next_pending = Uint32(0)
-            for source in cutlass.range_constexpr(16):
-                if (pending & (Uint32(1) << source)) != 0:
-                    next_pending |= self.poll_source(values, source, sources)
-            pending = next_pending
+        # Every pass reloads every source straight into its registers (a published
+        # source keeps its words until this lane re-arms it): reloading only the pending
+        # ones went through predicated temporaries that ptxas merged a few loads at a
+        # time, ~10 dependent round trips per 16-source pass (see
+        # ``common.twoshot.poll_slots``). Reloading a published source relies on the
+        # re-arm ordering stated at ``WaveMoeTail.settle``.
+        if cutlass.const_expr(self.reload):
+            while pending != 0:
+                if cutlass.const_expr(self.poll_ns):
+                    sleep_ns(Uint32(self.poll_ns))
+                pending = Uint32(0)
+                for source in cutlass.range_constexpr(16):
+                    if self.tp == 16 or source < 8 or dual:
+                        pending |= self.poll_source(values, source, sources)
+        else:
+            while pending != 0:
+                if cutlass.const_expr(self.poll_ns):
+                    sleep_ns(Uint32(self.poll_ns))
+                next_pending = Uint32(0)
+                for source in cutlass.range_constexpr(16):
+                    if (pending & (Uint32(1) << source)) != 0:
+                        next_pending |= self.poll_source(values, source, sources)
+                pending = next_pending
         return values
 
     @cute.jit
@@ -143,6 +173,26 @@ class MoeTail:
         for k in cutlass.range_constexpr(4):
             values[source, k] = word[k]
         return Uint32(reduce(or_, (v == 0x80000000 for v in word))) << source
+
+    @cute.jit
+    def gate_poll(self, latent, shared, slot, capacity, q, row0):
+        """Warp 0: lane s < TP waits for source s's first latent fragment of this CTA,
+        lane 16 + s (cluster rank 0 only) for its first shared-shard fragment; then
+        the CTA proceeds to the full poll."""
+        tid, _, _ = cute.arch.thread_idx()
+        source = tid % 16
+        row = slot + source * capacity
+        if tid < 16:
+            self.wait_fragment(latent.iterator + row * 3584 + q * self.cols)
+        if (tid >= 16) & (tid < 32) & (q == 0):
+            self.wait_fragment(shared.iterator + row * self.shard + row0)
+        cute.arch.sync_threads()
+
+    @cute.jit
+    def wait_fragment(self, ptr):
+        word = load_volatile(ptr, count=4)
+        while reduce(or_, (v == 0x80000000 for v in word)):
+            word = load_volatile(ptr, count=4)
 
     @cute.jit
     def sum_sources(self, values, start: cutlass.Constexpr[int]):
@@ -289,6 +339,9 @@ class MoeTail:
         cute.arch.cluster_arrive_relaxed()
         io = (latent, shared, gemm2, weights, shared_output, peers)
         self.front(io, latent_mc, par, rank, capacity, block, warp, lane)
+        if cutlass.const_expr(self.gate):
+            slot0 = par * self.tp * capacity + token0
+            self.gate_poll(latent, shared, slot0, capacity, q, row0)
         pt, pk = tid // 64, tid % 64
         lat_thread = (pt < local_tokens) & (pk < self.frags)
         rs_j = tid - 64 if self.tokens == 1 else pk if self.tp == 8 else pk - self.frags
@@ -449,8 +502,43 @@ class WaveMoeTail(MoeTail):
 
     threads, options = 256, dict(min_blocks_per_mp=1)
 
-    def __init__(self, batch, tp=8, twoshot=False, early=False, umma=False):
-        super().__init__(tp, batch, mode="publish")
+    def __init__(
+        self, batch, tp=8, twoshot=False, early=False, umma=False, poll_ns=64,
+        direct=False, late_rms=False, release_polled=False, lean_owner=False,
+        early_rearm=False, owner_squares=False, spread=False, rearm_after=False,
+        reload=False, vote=False,
+    ):  # fmt: skip
+        super().__init__(tp, batch, mode="publish", reload=reload)
+        # ``vote`` (direct, Rubin): the latent / RS poll runs in every lane of the warp
+        # (lanes without a row contribute no pending source) and exits by a warp vote,
+        # so the warp sync and the collectives after it do not wait for per-lane poll
+        # loops to reconverge (``common.mailbox.poll_warp``). Same words.
+        self.vote = vote
+        assert not vote or direct
+        # ``spread`` (two-shot, Rubin): every CTA of a cluster reduces one of the
+        # cluster's tokens of this rank's owned slice (one warp, all TP sources in
+        # flight) instead of the slice's CTA alone reducing every token in two rounds,
+        # and the previous layer's rows are re-armed by every thread of the grid
+        # instead of the first ``batch x 448 / 256`` threads' CTAs. Same sums, bitwise.
+        assert not spread or twoshot
+        self.spread = spread
+        # ``release_polled`` (TP16, one group): release the next AttnRes once this CTA's
+        # latent and RS rows are polled, so its launch and block statistics overlap the
+        # up projection and the output multicast instead of following them (its Lamport
+        # poll of the output rows then starts about when they are written).
+        assert not release_polled or (tp == 16 and batch <= 8 and not early)
+        self.release_polled = release_polled
+        # ``late_rms`` (TP16, one group): the up projection runs on BF16(x * gamma) as
+        # soon as the latent is summed, and each line owner scales its summed partials
+        # by its token's RMS reciprocal (the same sum of squares) before rounding, so
+        # the squares exchange overlaps the MMA instead of preceding it. A stated
+        # reorder: the inverse multiplies after the GEMM, not before x's rounding.
+        # Two-shot ``spread`` grids (TP16, past one group, tcgen05) may run late RMS
+        # too: the squares exchange then overlaps the normalization and the MMA, and
+        # each line owner reads its token's total from the exchanged squares.
+        late_wide = spread and tp == 16 and batch > 8 and umma
+        assert not late_rms or (tp == 16 and batch <= 8 and not umma) or late_wide
+        self.late_rms = late_rms
         assert not twoshot or batch > 8
         assert not umma or batch > 8
         # ``early``: release the next AttnRes at entry, so its block statistics and
@@ -462,16 +550,51 @@ class WaveMoeTail(MoeTail):
         self.twoshot, self.width = twoshot, 3584 // tp if twoshot else 3584
         # Past one group (and at TP16) clusters share reduced latent rows; TP8 B<=8
         # polls its sources directly.
-        self.reduce = self.groups > 1 or tp == 16
-        self.grid, self.poll_ns, self.cluster = 112, 64, 16
+        # ``direct`` (TP16, one group): every CTA polls its slice of all tokens from the
+        # sources itself instead of clusters sharing reduced rows (same sums and order).
+        self.reduce = self.groups > 1 or (tp == 16 and not direct)
+        # Direct TP16: warps 4..7 only poll (tokens 4..7); the MMA of their duplicate
+        # rows is skipped (``mma_group``), so warps 0..3 own the tensor pipes.
+        self.lean_mma = direct and tp == 16 and self.groups == 1
+        # ``lean_owner`` (lean): fewer instructions after the last latent lands. The
+        # direct poll is summed by ``column_sums`` (one BF16 FMA per term, same order
+        # and rounding as ``sum_sources``); owned line s is summed and written by warp
+        # 4 + s, which runs no MMA, so its RMS total overlaps the MMAs and the line
+        # waits only for the slices' partials; every lane multicasts its own BF16x2
+        # word of the line (no gathering shuffles). Same outputs, bitwise.
+        assert not lean_owner or self.lean_mma
+        self.colsum, self.lane_publish = lean_owner, lean_owner
+        self.owner_warp = 4 if lean_owner else 0
+        # ``early_rearm`` (one group): the previous layer's rows are re-armed at entry,
+        # while the latent is in flight, instead of after the output multicast (they
+        # are complete before this launch either way), so the CTAs exit sooner.
+        # Two-shot ``spread`` grids may also re-arm at entry (``rearm_spread``): the
+        # experts launch this grid only after their PDL wait, so the previous MoE
+        # layer's tail (the last reader of those rows) has completed.
+        assert not early_rearm or self.groups == 1 or spread
+        self.early_rearm = early_rearm
+        # ``rearm_after`` (with ``early_rearm``, two-shot past one group): the previous
+        # layer's rows are re-armed after this CTA's owned reduce and RS lines are
+        # issued, while the gathered rows are in flight, instead of before them (the
+        # re-arm's stores then do not delay the owners' polls and multicast).
+        self.rearm_after = rearm_after
+        assert not rearm_after or (early_rearm and self.groups > 1)
+        # ``owner_squares`` (``late_rms``): only the line owners need the RMS squares,
+        # so the other CTAs push them to the owners alone, receive nothing and exit
+        # after their partials, which frees their SMs for the next kernels sooner.
+        assert not owner_squares or late_rms
+        self.owner_squares = owner_squares
+        # ``poll_ns``: the sleep between Lamport re-polls (``tail_runtime``).
+        self.grid, self.poll_ns, self.cluster = 112, poll_ns, 16
         # Shared memory: per group x [8, 224] BF16 and MMA partials [8 warps, 8, 16]
         # (TP16 pads to whole warp sets); gathered squares (one group keeps each
         # slice's 28 lane sums, more one sum); per owned line its partials [16 slices,
         # 64] and RS rows [64]; two barriers.
         n, s = self.groups + self.groups % (2 // self.lines), self.slots
         # Past one group each (warp, slice) row holds the groups' sums, padded to v4.
+        # One group (TP16 B<=8 pads n to 2) gathers [8 tokens, 16 slices, 28] sums.
         self.padded = -(-self.groups // 4) * 4
-        self.squares = 3584 if n == 1 else 128 * max(n, self.padded)
+        self.squares = 3584 if self.groups == 1 else 128 * max(n, self.padded)
         partials = 7680 * n + 4 * self.squares
         self.offsets: tuple = (3584 * n, 7680 * n, partials, partials + 4096 * s)
         self.offsets += (partials + 4352 * s + 32,)
@@ -543,6 +666,8 @@ class WaveMoeTail(MoeTail):
             # One group gathers 28 lane sums per (token, slice), more one sum for
             # every warp's token.
             gathered = 16 * batch * 28 * 4 if n == 1 else 16 * 8 * self.padded * 4
+            if cutlass.const_expr(self.owner_squares):
+                gathered = gathered if owner else 0
             cute.arch.mbarrier_arrive_and_expect_tx(bar, gathered)
             size = 4096 if owns(self.slots - 1) else 0  # earlier lines are all owned
             size = size + 4096 * (self.slots - 1) if self.slots > 1 else size
@@ -562,7 +687,16 @@ class WaveMoeTail(MoeTail):
         base = weight.iterator + (row0 + 16 * rw + gq) * 3584 + 224 * q + 8 * tq
         fetch = lambda p: load_words(p, count=4, evict_first=True, mutable=True)
         a = None
-        if cutlass.const_expr(not self.umma):
+        if cutlass.const_expr(self.lean_mma):  # only warps 0..3 multiply
+            frags = cute.make_rmem_tensor((7, 2, 4), Uint32)
+            if warp < 4:
+                for k in cutlass.range_constexpr(7):
+                    for h in cutlass.range_constexpr(2):
+                        got = fetch(base + h * 8 * 3584 + 32 * k)
+                        for j in cutlass.range_constexpr(4):
+                            frags[k, h, j] = got[j]
+            a = frags  # read at the MMA (``mma_rows``), not at the branch join
+        elif cutlass.const_expr(not self.umma):
             a = [
                 [fetch(base + h * 8 * 3584 + 32 * k) for h in range(2)]
                 for k in range(7)
@@ -570,6 +704,10 @@ class WaveMoeTail(MoeTail):
         xwords = [cute.make_rmem_tensor(4, Uint32) for _ in range(n)]
         reduced = args[17] if self.reduce else None
         ring = (*args[15:17], block, tid, reduced)
+        if cutlass.const_expr(self.early_rearm and n == 1):
+            self.rearm(args[0:2] + args[4:8], capacity, *ring)
+        elif cutlass.const_expr(self.early_rearm and not self.rearm_after):
+            self.rearm_rows(args[0:2], capacity, *ring)
         if cutlass.const_expr(self.reduce):
             s2 = zeros(n, Float32)
             ids: tuple = (q, warp, lane, block // 16)
@@ -577,32 +715,67 @@ class WaveMoeTail(MoeTail):
             gather = (args[9], rank) if self.twoshot else None
             boxes = (latent, reduced, shared)
             self.poll_inputs(boxes, (par, capacity), ids, places, gather)
+            if cutlass.const_expr(self.rearm_after):
+                self.rearm_rows(args[0:2], capacity, *ring)
             if lat:
                 self.read_reduced(reduced, par * capacity, xwords, s2, ids)
         else:
             # Lanes 0..27 of warp t poll token t's latent; owners' lanes 28..31 the RS.
             sq = Float32(0)
-            if lat & (warp < batch) | rs_lane(0):
+            if cutlass.const_expr(self.vote):
+                active = lat & (warp < batch) | rs_lane(0)
                 slot = par * self.tp * capacity
                 rs = (slot + own_token) * self.shard + row0 + 64 * own_line
                 rs += 8 * max(rs_j, 0)
                 ptr = latent.iterator + (slot + warp) * 3584 + 224 * q + 8 * lane
                 ptr = ptr if lat else shared.iterator + rs
                 stride = capacity * (3584 if lat else self.shard)
-                sums = self.sum_sources(self.poll(ptr, stride, ptr, 0, False), 0)
-                if lat:
-                    sq = self.latent_words(sums, xwords[0])
-                else:
-                    self.rs_words(sums, owned[0][1], rs_j)
+                polled = self.poll_vote(ptr, stride, active)
+                if active:
+                    sums = self.lane_sums(polled)
+                    if lat:
+                        sq = self.latent_words(sums, xwords[0])
+                    else:
+                        self.rs_words(sums, owned[0][1], rs_j)
+            else:
+                if lat & (warp < batch) | rs_lane(0):
+                    slot = par * self.tp * capacity
+                    rs = (slot + own_token) * self.shard + row0 + 64 * own_line
+                    rs += 8 * max(rs_j, 0)
+                    ptr = latent.iterator + (slot + warp) * 3584 + 224 * q + 8 * lane
+                    ptr = ptr if lat else shared.iterator + rs
+                    stride = capacity * (3584 if lat else self.shard)
+                    polled = self.poll(ptr, stride, ptr, 0, False)
+                    if cutlass.const_expr(self.colsum):
+                        sums = self.column_sums(polled)
+                    else:
+                        sums = self.sum_sources(polled, 0)
+                    if lat:
+                        sq = self.latent_words(sums, xwords[0])
+                    else:
+                        self.rs_words(sums, owned[0][1], rs_j)
             s2 = [sq]
         cute.arch.sync_warp()
+        if cutlass.const_expr(self.release_polled):
+            cute.arch.griddepcontrol_launch_dependents()
         cute.arch.cluster_wait()
-        if cutlass.const_expr(n == 1):
+        if cutlass.const_expr(n == 1 and self.late_rms):
+            self.push_squares(squares, s2[0], bar, (q, warp, lane))
+            cute.arch.sync_warp()
+            if lat & (warp < batch):
+                self.scale_gamma(xwords[0], gx, groups[0][0], warp, lane)
+        elif cutlass.const_expr(n == 1):
             self.push_squares(squares, s2[0], bar, (q, warp, lane))
             wait(bar)
             cute.arch.sync_warp()
             row = (xwords[0], gx, eps)
             self.normalize(squares, row, groups[0][0], (warp, lane, lat))
+        elif cutlass.const_expr(self.late_rms):  # past one group: x * gamma now
+            self.exchange_squares(squares, s2, bar, (q, warp, lane))
+            cute.arch.sync_warp()
+            outs = [sm + self.m * 512 + 1024 * g for g in range(n)]
+            one = (Float32(1),) * n  # (x * 1) * gamma = x * gamma, exactly
+            self.scale_groups(one, (xwords, gx), outs, (warp, lane, lat))
         else:
             self.exchange_squares(squares, s2, bar, (q, warp, lane))
             wait(bar)
@@ -627,19 +800,48 @@ class WaveMoeTail(MoeTail):
             products = view(sm, self.offsets[0], Float32, size)
             self.mma_groups(a, xs, products, owned, bar, ids)
         line = (lane, rank, row0, own_token, own_line)
+        rms = (squares, bar, eps) if self.late_rms else None
         for s in cutlass.range_constexpr(self.slots):
-            if owns(s) & (warp == s):
-                self.write_line(owned[s], bar, output_mc, line, s)
-        if cutlass.const_expr(not self.early):
+            if owns(s) & (warp == self.owner_warp + s):
+                self.write_line(owned[s], bar, output_mc, line, s, rms)
+        if cutlass.const_expr(self.late_rms):  # peers' squares land before the exit
+            wait(bar)
+        if cutlass.const_expr(not (self.early or self.release_polled)):
             cute.arch.griddepcontrol_launch_dependents()
         # The previous layer's rows, off the output path.
-        if cutlass.const_expr(n == 1):
+        if cutlass.const_expr(self.early_rearm):
+            pass
+        elif cutlass.const_expr(n == 1):
             self.rearm(args[0:2] + args[4:8], capacity, *ring)
         else:
             self.rearm_rows(args[0:2], capacity, *ring)
         if cutlass.const_expr(self.umma):
             release_tmem(tmem, self.columns, warp, 0)
         cute.arch.griddepcontrol_wait()
+
+    @cute.jit
+    def lane_sums(self, values):
+        if cutlass.const_expr(self.colsum):
+            return self.column_sums(values)
+        return self.sum_sources(values, 0)
+
+    @cute.jit
+    def poll_vote(self, ptr, stride, active):
+        """``vote``: every lane of the warp runs the TP-source poll (``MoeTail.poll``'s
+        reload-all passes); inactive lanes load nothing and have no pending source, and
+        the loop ends when a warp vote says no lane has one."""
+        values = cute.make_rmem_tensor((16, 4), Uint32)
+        sources = (ptr, stride, ptr, 0)
+        pending = Uint32(0)
+        if active:
+            for source in cutlass.range_constexpr(self.tp):
+                pending |= self.poll_source(values, source, sources)
+        while not cute.arch.vote_all_sync(pending == 0):
+            if pending != 0:
+                pending = Uint32(0)
+                for source in cutlass.range_constexpr(self.tp):
+                    pending |= self.poll_source(values, source, sources)
+        return values
 
     @cute.jit
     def load_sources(self, values, ptr, stride):
@@ -656,13 +858,27 @@ class WaveMoeTail(MoeTail):
         for source in cutlass.range_constexpr(self.tp):
             words = (values[source, k] for k in range(4))
             pending |= Uint32(reduce(or_, (v == 0x80000000 for v in words))) << source
-        while pending != 0:
-            sleep_ns(Uint32(self.poll_ns))
-            again = Uint32(0)
-            for source in cutlass.range_constexpr(self.tp):
-                if (pending & (Uint32(1) << source)) != 0:
+        # Every source reloads each pass (see ``common.twoshot.poll_slots``). Reloading
+        # a published row is safe only if nothing re-arms it before every lane of this
+        # tail has passed this poll: the next tail's entry re-arm of this parity waits
+        # for the next layer's experts, which routing releases only after this rank's
+        # front GEMM (which needs every rank's output of this tail). ``moe.front``
+        # refuses an entry release (``SharedFront.release_early``).
+        if cutlass.const_expr(self.reload):
+            while pending != 0:
+                sleep_ns(Uint32(self.poll_ns))
+                again = Uint32(0)
+                for source in cutlass.range_constexpr(self.tp):
                     again |= self.poll_row(values, source, ptr + source * stride)
-            pending = again
+                pending = again
+        else:
+            while pending != 0:
+                sleep_ns(Uint32(self.poll_ns))
+                again = Uint32(0)
+                for source in cutlass.range_constexpr(self.tp):
+                    if (pending & (Uint32(1) << source)) != 0:
+                        again |= self.poll_row(values, source, ptr + source * stride)
+                pending = again
 
     @cute.jit
     def column_sums(self, values):
@@ -676,8 +892,11 @@ class WaveMoeTail(MoeTail):
     @cute.jit
     def rearm_rows(self, boxes, capacity, parity, batch, block, tid, reduced):
         """Division-free ``rearm``: each source's latent and RS rows, then the reduced
-        rows, of the previous layer (complete before this launch)."""
-        if parity >= 0:
+        rows, of the previous layer (complete before this launch). ``spread``: one
+        index space over every row, so every thread of the grid stores its share."""
+        if cutlass.const_expr(self.spread):
+            self.rearm_spread(boxes, capacity, parity, batch, block, tid, reduced)
+        elif parity >= 0:
             start, step = block * self.threads + tid, self.grid * self.threads
             fill, widths = (Uint32(0x80000000),) * 4, (self.width, self.shard)
             for s in cutlass.range_constexpr(self.tp):
@@ -692,6 +911,38 @@ class WaveMoeTail(MoeTail):
                     store_words(row + 8 * i, fill)
 
     @cute.jit
+    def rearm_spread(self, boxes, capacity, parity, batch, block, tid, reduced):
+        """``rearm_rows`` over one index space: TP x batch latent chunks, TP x batch
+        RS chunks, then batch x 448 reduced chunks (16 B each), grid-strided."""
+        if parity >= 0:
+            fill = (Uint32(0x80000000),) * 4
+            nl, ns = self.width // 8, self.shard // 8  # 16 B chunks per row
+            latent_n = self.tp * batch * nl
+            shared_n = latent_n + self.tp * batch * ns
+            total = shared_n + batch * 448
+            step = self.grid * self.threads
+            for i in cutlass.range(block * self.threads + tid, total, step, unroll=1):
+                if i < latent_n:
+                    row, chunk = i // nl, i % nl
+                    source, token = row // batch, row % batch
+                    first = (parity * self.tp + source) * capacity + token
+                    store_words(
+                        boxes[0].iterator + first * self.width + 8 * chunk, fill
+                    )
+                elif i < shared_n:
+                    j = i - latent_n
+                    row, chunk = j // ns, j % ns
+                    source, token = row // batch, row % batch
+                    first = (parity * self.tp + source) * capacity + token
+                    store_words(
+                        boxes[1].iterator + first * self.shard + 8 * chunk, fill
+                    )
+                else:
+                    j = i - shared_n
+                    rows = reduced.iterator + parity * capacity * 3584
+                    store_words(rows + 8 * j, fill)
+
+    @cute.jit
     def poll_inputs(self, boxes, ring, ids, places, gather=None):
         """Phase 1 and the RS lines in one convergent pass (every round's loads issued
         first). Lanes 0..27 all-reduce the cluster's tokens tile + 7 j of the CTA's
@@ -704,15 +955,23 @@ class WaveMoeTail(MoeTail):
         lat, width = lane < 28, self.width
         col = 224 * q + 8 * lane
         local = col if gather is None else col - gather[1] * width
+        reduces = q >= 0 if gather is None else q * self.tp // 16 == gather[1]
+        latent_rounds = ((self.batch - 1) // 7 + 8) // 8
+        if cutlass.const_expr(self.spread):
+            # warp 0 of CTA q reduces the cluster's tokens j = q + 16 r of the owned
+            # slice (receive columns 8 lane .., gather columns of slice ``rank``)
+            col, local = gather[1] * width + 8 * lane, 8 * lane
+            reduces = warp == 0
+            latent_rounds = ((self.batch - 1) // 7 + 16) // 16
         src = latent.iterator + (par * self.tp * capacity + tile) * width + local
         dst = reduced.iterator + (par * capacity + tile) * 3584 + col
-        reduces = q >= 0 if gather is None else q * self.tp // 16 == gather[1]
         rs_j = 4 * (warp % 2) + lane - 28
         rs = shared.iterator + par * self.tp * capacity * self.shard + row0 + 8 * rs_j
         stride = capacity * width if lat else capacity * self.shard
-        latent_rounds = ((self.batch - 1) // 7 + 8) // 8
         rounds = max(latent_rounds, (self.slots + 3) // 4)
         tokens = [7 * (warp + 8 * r) for r in range(rounds)]
+        if cutlass.const_expr(self.spread):
+            tokens = [7 * (q + 16 * r) for r in range(rounds)]
         lines = [4 * r + warp // 2 for r in range(rounds)]
         live, ptrs = [], []
         for r in cutlass.range_constexpr(rounds):
@@ -788,19 +1047,37 @@ class WaveMoeTail(MoeTail):
 
     @cute.jit
     def mma_group(self, a, group, owned, bar, g: cutlass.Constexpr[int], ids):
-        """Group g's MMA chains; each 4-row partial goes to its 64-row line's owner."""
+        """Group g's MMA chains; each 4-row partial goes to its 64-row line's owner.
+        TP16 (one 64-row line, ``rw`` = warp mod 4): warps 4..7 repeat the rows of
+        warps 0..3, so only warps 0..3 push (each owner's barrier expects every
+        slice's partials of its line exactly once)."""
+        if cutlass.const_expr(self.lean_mma):
+            if ids[1] < 4:
+                self.mma_rows(a, group, owned, bar, g, ids)
+        else:
+            self.mma_rows(a, group, owned, bar, g, ids)
+
+    @cute.jit
+    def mma_rows(self, a, group, owned, bar, g: cutlass.Constexpr[int], ids):
         (q, warp, lane, rw, gq, tq), (xg, pg) = ids, group
         b = [smem_words(xg + gq * 224 + 8 * tq + 32 * k) for k in range(7)]
         d = e = (Float32(0),) * 4
         for k in cutlass.range_constexpr(7):
-            (w0, w1), x = a[k], b[k]
+            if cutlass.const_expr(self.lean_mma):
+                w0, w1 = (tuple(a[k, h, j] for j in range(4)) for h in range(2))
+            else:
+                w0, w1 = a[k]
+            x = b[k]
             d = mma((w0[0], w1[0], w0[1], w1[1]), x[0:2], d, bf16=True)
             e = mma((w0[2], w1[2], w0[3], w1[3]), x[2:4], e, bf16=True)
         for i in cutlass.range_constexpr(4):  # [warp, token, row] partial products
             pg[warp * 128 + (2 * tq + i % 2) * 16 + gq + 8 * (i // 2)] = d[i] + e[i]
         cute.arch.sync_warp()
         token, row = lane // 4, 16 * rw + 4 * (lane % 4)
-        if token < self.batch - 8 * g:
+        pushes = token < self.batch - 8 * g
+        if cutlass.const_expr(self.lines == 1):
+            pushes = pushes & (warp < 4)
+        if pushes:
             values = load_f32x4(pg.iterator + warp * 128 + 4 * lane, shared=True)
             # Line lines (8 g + token) + row // 64 is owned by CTA (line % 16).
             peer = self.lines * token + row // 64 + 8 * g * self.lines % 16
@@ -841,23 +1118,48 @@ class WaveMoeTail(MoeTail):
                 push_float(cells.iterator + q * 64 + row % 64, values, bar + 1, peer)
 
     @cute.jit
-    def write_line(self, line, bar, output_mc, ids, s: cutlass.Constexpr[int]):
+    def write_line(
+        self, line, bar, output_mc, ids, s: cutlass.Constexpr[int], rms=None
+    ):  # fmt: skip
         """Owned line s: sum the 16 slices' partials, add the RS rows and multicast the
-        64 output rows."""
+        64 output rows. ``rms`` (``late_rms``: squares, barriers, eps): the summed
+        partials are scaled by the token's RMS reciprocal before their rounding."""
         (cells, rs_sum), (lane, rank, row0, own_token, own_line) = line, ids
+        inverse = Float32(1)
+        if cutlass.const_expr(rms is not None and self.groups > 1):
+            squares, squares_bar, eps = rms
+            wait(squares_bar)
+            cute.arch.sync_warp()
+            inverse = self.group_inverse(
+                squares, 16 // self.lines * s + own_token, lane, eps
+            )
+        elif cutlass.const_expr(rms is not None):
+            squares, squares_bar, eps = rms
+            wait(squares_bar)
+            cute.arch.sync_warp()
+            total = self.square_total(squares, own_token, lane)
+            inverse = inv_rms(total, eps, m8=True)
         wait(bar + 1)
         cute.arch.sync_warp()
         out = []
         for h in cutlass.range_constexpr(2):
             parts = (cells[64 * p + 2 * lane + h] for p in range(16))
-            value = Float32(BFloat16(sum(parts, Float32(0))))
+            summed = sum(parts, Float32(0))
+            if cutlass.const_expr(rms is not None):
+                summed = summed * inverse
+            value = Float32(BFloat16(summed))
             out.append(value + rs_sum[2 * lane + h])
         pair = pack_pair(*out, policy="latent")
-        words = tuple(shuffle(pair, (4 * lane + k) & 31) for k in range(4))
-        if lane < 8:
+        if cutlass.const_expr(self.lane_publish):
             t = 16 // self.lines * s + own_token
             offset = t * 7168 + rank * self.shard + row0 + 64 * own_line
-            multicast_words(output_mc + Int64(offset + 8 * lane) * 2, words)
+            multicast_words(output_mc + Int64(offset + 2 * lane) * 2, (pair,))
+        else:
+            words = tuple(shuffle(pair, (4 * lane + k) & 31) for k in range(4))
+            if lane < 8:
+                t = 16 // self.lines * s + own_token
+                offset = t * 7168 + rank * self.shard + row0 + 64 * own_line
+                multicast_words(output_mc + Int64(offset + 8 * lane) * 2, words)
 
     @cute.jit
     def latent_words(self, sums, words):
@@ -893,7 +1195,8 @@ class WaveMoeTail(MoeTail):
             vector = tuple(shuffle(s2, 4 * chunk + i) for i in range(4))
             if first < 4:
                 dst = squares.iterator + warp * 448 + 28 * q + 4 * chunk
-                for peer in cutlass.range(first, 16, 4, unroll=1):
+                last = self.batch if self.owner_squares else 16
+                for peer in cutlass.range(first, last, 4, unroll=1):
                     push_float(dst, vector, bar, peer)
 
     @cute.jit
@@ -914,13 +1217,32 @@ class WaveMoeTail(MoeTail):
     def normalize_groups(self, squares, row, xs, ids):
         """Past one group: every group's RMS (the 16 slices' sums, ``square_total``'s
         order) first, then the scaled latent words (padding tokens too)."""
-        (words, gx, eps), (warp, lane, lat) = row, ids
+        (words, gx, eps), (warp, lane, _) = row, ids
         base = squares.iterator + (warp * 16 + lane % 16) * self.padded
         sums = []
         for c in cutlass.range_constexpr(self.padded // 4):
             sums += list(load_f32x4(base + 4 * c, shared=True))
         inverse = inv_rms(scatter_sums(sums, lane, 16), eps, m8=True)
         inverse = gather_sums(inverse, self.groups, 16, self.padded)
+        self.scale_groups(inverse, (words, gx), xs, ids)
+
+    @cute.jit
+    def group_inverse(self, squares, token, lane, eps):
+        """Late RMS past one group: token's RMS reciprocal from the exchanged squares
+        (its 16 slices' sums, the butterfly order of ``normalize_groups``)."""
+        base = squares.iterator + ((token % 8) * 16 + lane % 16) * self.padded
+        sums = []
+        for c in cutlass.range_constexpr(self.padded // 4):
+            sums += list(load_f32x4(base + 4 * c, shared=True))
+        inverse = inv_rms(scatter_sums(sums, lane, 16), eps, m8=True)
+        shift: cutlass.Constexpr = (16).bit_length() - self.padded.bit_length()
+        return shuffle(inverse, (token // 8) << shift)
+
+    @cute.jit
+    def scale_groups(self, inverse, row, xs, ids):
+        """Every group's scaled latent words (``inverse`` per group), and the umma
+        tiles' K padding."""
+        (words, gx), (warp, lane, lat) = row, ids
         if lat:
             for g in cutlass.range_constexpr(self.groups):
                 self.scale_words(words[g], gx, inverse[g], xs[g], warp, lane)
@@ -953,6 +1275,12 @@ class WaveMoeTail(MoeTail):
         warp, lane, lat = ids
         if lat:
             self.scale_words(words, gx, inverse, xs, warp, lane)
+
+    def scale_gamma(self, words, gx, xs, warp, lane):
+        """``late_rms``: x * gamma per column (packed FP32x2), BF16 into xs."""
+        pair = lambda w: (bf16(w), bf16(w, True))
+        packed = [pack_pair(*mul2(pair(words[k]), pair(gx[k]))) for k in range(4)]
+        store_shared_words(xs + warp * 224 + 8 * lane, packed)
 
     def scale_words(self, words, gx, inverse, xs, warp, lane):
         """(x * inverse) * gamma per column, as packed FP32x2 multiplies."""
