@@ -35,6 +35,7 @@ from vllm.model_executor.layers.indexer_topk import (
     SparseIndexerTopk,
     deep_select_topk,
     get_indexer_topk,
+    is_deep_select_available,
     is_deep_select_supported,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -89,9 +90,11 @@ def _assert_cutedsl_dcp_merge_supported(
         )
     if logits.device.type != "cuda":
         raise RuntimeError("DCP sparse-indexer merge requires CUDA tensors.")
-    if logits.dtype != torch.float32 or topk_indices.dtype != torch.int32:
+    if logits.dtype not in (torch.float32, torch.bfloat16) or (
+        topk_indices.dtype != torch.int32
+    ):
         raise RuntimeError(
-            "DCP sparse-indexer merge requires fp32 logits and int32 indices."
+            "DCP sparse-indexer merge requires fp32 or bf16 logits and int32 indices."
         )
     if k not in (512, 1024, 2048):
         raise RuntimeError(
@@ -411,6 +414,45 @@ def as_fp32_logits(logits: torch.Tensor, row_ends: torch.Tensor) -> torch.Tensor
         logits, out, row_ends.contiguous(), logits.stride(0), BLOCK=block, num_warps=8
     )
     return out
+
+
+def _use_deep_select_prefill(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor | None,
+    topk_tokens: int,
+    topk_backend: str,
+) -> bool:
+    """Whether DeepSelect ranks these prefill logits: SM100's BF16 logits under
+    the "auto" and "deep_select" top-k backends, with or without DCP."""
+    return (
+        topk_backend in ("auto", "deep_select")
+        and logits.dtype == torch.bfloat16
+        and row_starts is None
+        and is_deep_select_available(logits, topk_tokens)
+    )
+
+
+def _prefill_topk(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor | None,
+    row_ends: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_tokens: int,
+    topk_backend: str,
+) -> None:
+    """Write each prefill row's top-k columns into ``topk_indices``.
+
+    DeepSelect reads SM100's BF16 logits directly (``_use_deep_select_prefill``);
+    otherwise the logits are upcast for the selected top-k backend. Both select
+    the exact top-k; only ties at the cutoff may resolve to different columns.
+    """
+    if _use_deep_select_prefill(logits, row_starts, topk_tokens, topk_backend):
+        deep_select_topk(logits, topk_tokens, end=row_ends, output_idx=topk_indices)
+        return
+    logits = as_fp32_logits(logits, row_ends)
+    get_indexer_topk(topk_backend).forward_prefill(
+        logits, row_starts, row_ends, topk_indices, topk_tokens
+    )
 
 
 def _gather_workspace_shapes(
@@ -813,7 +855,6 @@ def sparse_attn_indexer(
             # DeepGEMM returns compressed logits: row i starts at K position
             # cu_seqlen_ks[i]. None means every row starts at column zero.
             row_starts: torch.Tensor | None = None
-            use_deep_select = False
             if chunk.local_total_seq_lens == 0 or q_slice.shape[0] == 0:
                 logits = q_slice.new_empty((q_slice.shape[0], 0), dtype=torch.float32)
                 topk_indices.fill_(-1)
@@ -857,16 +898,11 @@ def sparse_attn_indexer(
                         chunk.max_seqlen_k,
                     )
                     # DeepSelect ranks the bf16 logits in place of their exact fp32
-                    # copy (only ties at the cutoff may resolve differently), so
-                    # "auto" takes it too and skips the upcast; fp32 logits keep
-                    # the per-row top-k.
-                    use_deep_select = (
-                        topk_backend in ("auto", "deep_select")
-                        and logits.dtype == torch.bfloat16
-                        and prefill_dcp_world_size == 1
-                        and is_deep_select_supported(logits, topk_tokens)
-                    )
-                    if not use_deep_select:
+                    # copy, also under DCP (whose merge below reads them as well);
+                    # fp32 logits go to the selected top-k backend.
+                    if not _use_deep_select_prefill(
+                        logits, row_starts, topk_tokens, topk_backend
+                    ):
                         logits = as_fp32_logits(logits, row_ends)
                 if candidate_blocks is not None:
                     # Two-level selection (v4.1): the candidate source
@@ -892,14 +928,15 @@ def sparse_attn_indexer(
                             chunk_candidates,
                             candidate_block_size,
                         )
-                if use_deep_select:
-                    deep_select_topk(
-                        logits, topk_tokens, end=row_ends, output_idx=topk_indices
-                    )
-                else:
-                    get_indexer_topk(topk_backend).forward_prefill(
-                        logits, row_starts, row_ends, topk_indices, topk_tokens
-                    )
+                # The DCP merge below scores from these logits as well.
+                _prefill_topk(
+                    logits,
+                    row_starts,
+                    row_ends,
+                    topk_indices,
+                    topk_tokens,
+                    topk_backend,
+                )
 
             if deinterleave_idx is None:
                 # Under the PCP path the top-k already ran over the whole

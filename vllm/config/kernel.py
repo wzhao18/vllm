@@ -376,6 +376,10 @@ class KernelConfig:
       requires VLLM_ROCM_USE_AITER)
 
     Explicit values raise RuntimeError when their constraints are not met.
+
+    On SM100, "auto" and "deep_select" also run the prefill top-k with
+    DeepSelect on the BF16 logits; the other values keep the FP32 per-row
+    prefill kernel.
     """
 
     flashinfer_sparse_mla_kernel: FlashInferSparseMLAKernel = "auto"

@@ -1095,3 +1095,160 @@ def test_pcp_plan_deinterleave_restores_global_order(
             restored[row_start[row] : row_start[row] + g, 0],
             torch.arange(starts[i], starts[i] + g, dtype=torch.float32),
         )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not has_cutedsl(),
+    reason="This test requires CUDA and CuteDSL",
+)
+@pytest.mark.parametrize("use_row_starts", [False, True])
+def test_cutedsl_dcp_candidate_pack_reads_bf16_logits(use_row_starts: bool):
+    """SM100 MQA logits are BF16: packing them directly must give the same
+    candidates, bit for bit, as packing their FP32 upcast."""
+    from vllm.model_executor.kernels.attention.dsa.dcp_indexer_cutedsl import (
+        pack_dcp_topk_candidates_cutedsl,
+    )
+
+    torch.manual_seed(17)
+    device = torch.device("cuda")
+    rows, width, topk, world, rank = 5, 1536, 512, 4, 3
+    logits = torch.randn((rows, width), device=device).to(torch.bfloat16)
+    row_starts = (
+        torch.tensor([0, 7, 300, 1, 512], device=device, dtype=torch.int32)
+        if use_row_starts
+        else None
+    )
+    topk_indices = torch.stack(
+        [torch.randperm(1024, device=device)[:topk] for _ in range(rows)]
+    ).to(torch.int32)
+    topk_indices[1, 100:] = -1
+
+    packed = {}
+    for dtype in (torch.bfloat16, torch.float32):
+        packed[dtype] = torch.empty((rows, topk, 2), device=device)
+        pack_dcp_topk_candidates_cutedsl(
+            logits.to(dtype), topk_indices, packed[dtype], rank, world, 1, row_starts
+        )
+    assert torch.equal(
+        packed[torch.bfloat16].view(torch.int32),
+        packed[torch.float32].view(torch.int32),
+    )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@pytest.mark.parametrize("interleave", [1, 2])
+def test_dcp_merge_of_bf16_logits_matches_fp32(interleave: int):
+    """The DCP merge scores BF16 logits as their exact FP32 upcast."""
+    torch.manual_seed(19)
+    device = torch.device("cuda")
+    world, topk, rows, width = 4, 512, 3, 1200
+    local_logits = [
+        torch.randn((rows, width), device=device).to(torch.bfloat16)
+        for _ in range(world)
+    ]
+    local_topks = [
+        logits.float().topk(topk, dim=-1).indices.to(torch.int32)
+        for logits in local_logits
+    ]
+    merged = {
+        dtype: _merge_local_topks_global_with_fake_dcp(
+            [logits.to(dtype) for logits in local_logits],
+            local_topks,
+            topk,
+            world,
+            interleave,
+        )
+        for dtype in (torch.bfloat16, torch.float32)
+    }
+    for bf16_topk, fp32_topk in zip(merged[torch.bfloat16], merged[torch.float32]):
+        for row in range(rows):
+            assert set(bf16_topk[row].tolist()) == set(fp32_topk[row].tolist())
+
+
+@pytest.mark.parametrize("sm100", [True, False])
+def test_dcp_candidate_pack_warms_bf16_logits_on_sm100(monkeypatch, sm100: bool):
+    from types import SimpleNamespace
+
+    from vllm.model_executor.kernels.attention.dsa.dcp_indexer_cutedsl import (
+        PackDCPTopkCandidatesKernel,
+    )
+
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_text_config=SimpleNamespace(index_topk=2048)),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=8, cp_kv_cache_interleave_size=1
+        ),
+    )
+    monkeypatch.setattr(
+        current_platform, "is_device_capability_family", lambda family: sm100
+    )
+    keys = PackDCPTopkCandidatesKernel().get_warmup_keys(vllm_config)
+    dtypes = (torch.float32, torch.bfloat16) if sm100 else (torch.float32,)
+    assert {(key.logits_dtype, key.has_row_starts) for key in keys} == {
+        (dtype, has_row_starts) for dtype in dtypes for has_row_starts in (False, True)
+    }
+
+
+def _distinct_bf16_logits(rows: int, width: int, stride: int) -> torch.Tensor:
+    """[rows, width] distinct positive BF16 values (consecutive bit patterns
+    from 1.0, so every top-k set is unique) with the given row stride."""
+    perms = torch.stack(
+        [torch.randperm(stride, device="cuda") for _ in range(rows)]
+    ).to(torch.int32)
+    return (perms + 0x3F80).to(torch.int16).view(torch.bfloat16)[:, :width]
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(100),
+    reason="DeepSelect requires SM100",
+)
+@pytest.mark.parametrize(
+    "width,stride_pad,topk_backend,uses_deep_select",
+    [
+        # DeepGEMM pads the row stride to 1 KiB: DeepSelect on BF16.
+        (3072, 0, "auto", True),
+        (300, 0, "auto", True),
+        (3072, 0, "deep_select", True),
+        # Another top-k backend, or a stride DeepSelect rejects: FP32 upcast
+        # and the per-row kernel.
+        (3072, 0, "persistent", False),
+        (3072, 8, "auto", False),
+    ],
+)
+def test_prefill_topk_on_bf16_logits(
+    monkeypatch, width: int, stride_pad: int, topk_backend: str, uses_deep_select
+):
+    """The SM100 prefill top-k runs DeepSelect on the BF16 logits (no FP32
+    copy) under the auto/deep_select backends and falls back to the upcast +
+    per-row kernel otherwise; both select each row's top-k within its end and
+    -1 pad rows shorter than k."""
+    torch.manual_seed(23)
+    device = torch.device("cuda")
+    topk = 512
+    row_ends_list = [e for e in (0, 1, 300, 512, 513, 1024, 3000) if e <= width]
+    rows = len(row_ends_list)
+    stride = -(-width // 512) * 512 + stride_pad
+    logits = _distinct_bf16_logits(rows, width, stride)
+    row_ends = torch.tensor(row_ends_list, dtype=torch.int32, device=device)
+    topk_indices = torch.full((rows, topk), -7, dtype=torch.int32, device=device)
+
+    calls: list[str] = []
+    for name in ("deep_select_topk", "as_fp32_logits"):
+        fn = getattr(sparse_indexer, name)
+        monkeypatch.setattr(
+            sparse_indexer,
+            name,
+            lambda *args, _fn=fn, _name=name, **kwargs: (
+                calls.append(_name) or _fn(*args, **kwargs)
+            ),
+        )
+    sparse_indexer._prefill_topk(
+        logits, None, row_ends, topk_indices, topk, topk_backend
+    )
+    assert calls == (["deep_select_topk"] if uses_deep_select else ["as_fp32_logits"])
+
+    for row, end in enumerate(row_ends_list):
+        chosen = topk_indices[row]
+        expected = logits[row, :end].float().topk(min(topk, end)).indices
+        assert set(chosen[chosen >= 0].tolist()) == set(expected.tolist())
+        assert (chosen == -1).sum().item() == topk - min(topk, end)

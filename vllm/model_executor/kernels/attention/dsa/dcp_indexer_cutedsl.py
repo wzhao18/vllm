@@ -22,6 +22,7 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     TritonWarmupTensor,
     VllmTritonJitKernel,
 )
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import dcp_local_to_global_index
 
@@ -95,6 +96,7 @@ class PackDCPTopkCandidatesKernel(
 ):
     @dataclass(frozen=True)
     class CompileKey:
+        logits_dtype: torch.dtype
         dcp_rank: int
         dcp_world_size: int
         cp_interleave: int
@@ -174,11 +176,13 @@ class PackDCPTopkCandidatesKernel(
     def dispatch(  # type: ignore[override]
         self,
         *,
+        logits_dtype: torch.dtype,
         has_row_starts: bool,
         **compile_key_fields: int,
     ) -> CompileKey:
         return self.CompileKey(
             **compile_key_fields,
+            logits_dtype=logits_dtype,
             has_row_starts=has_row_starts,
         )
 
@@ -197,7 +201,13 @@ class PackDCPTopkCandidatesKernel(
         except Exception:
             dcp_rank = 0
 
+        # The merge sees FP32 logits everywhere and, on SM100, also the BF16
+        # MQA logits that the top-k keeps.
+        logits_dtypes: tuple[torch.dtype, ...] = (torch.float32,)
+        if current_platform.is_device_capability_family(100):
+            logits_dtypes += (torch.bfloat16,)
         return self._trace_dispatch(self.dispatch)(
+            logits_dtype=logits_dtypes,
             dcp_rank=dcp_rank,
             dcp_world_size=dcp_world_size,
             cp_interleave=cp_interleave,
@@ -210,7 +220,7 @@ class PackDCPTopkCandidatesKernel(
         fp32_ptr = TritonWarmupTensor(torch.float32)
         int32_ptr = TritonWarmupTensor(torch.int32)
         return dict(
-            logits=fp32_ptr,
+            logits=TritonWarmupTensor(compile_key.logits_dtype),
             topk_indices=TritonWarmupTensor(torch.int32, shape=(1, compile_key.topk)),
             packed=fp32_ptr,
             row_starts_arg=int32_ptr,

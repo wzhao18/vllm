@@ -63,6 +63,16 @@ def is_deep_select_supported(input: torch.Tensor, topk: int) -> bool:
     )
 
 
+def is_deep_select_available(input: torch.Tensor, topk: int) -> bool:
+    """Whether DeepSelect is built for this device and accepts the input."""
+    return (
+        _HAS_DEEP_SELECT_C
+        and input.is_cuda
+        and current_platform.is_device_capability_family(100)
+        and is_deep_select_supported(input, topk)
+    )
+
+
 def _get_empty_and_aligned_tensor(
     dim0: int, dim1: int, device: torch.device, dtype: torch.dtype
 ) -> torch.Tensor:
