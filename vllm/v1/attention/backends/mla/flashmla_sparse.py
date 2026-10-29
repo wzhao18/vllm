@@ -405,12 +405,13 @@ class FlashMLASparseMetadataBuilder(
         self.use_hisparse = vllm_config.attention_config.hisparse_config is not None
         if self.use_hisparse:
             threshold = 1
-        # Varlen decodes are safe under DCP: causality comes from the
-        # indexer's top-k indices, not from the kernel metadata.
+        # Varlen decodes are safe under DCP at any interleave: causality comes from
+        # the indexer's top-k indices (its per-token local lengths and the DCP index
+        # filter are interleave-aware), not from the kernel metadata.
         self._init_reorder_batch_threshold(
             threshold,
             supports_spec_as_decode=True,
-            supports_dcp_with_varlen=(parallel_config.cp_kv_cache_interleave_size == 1),
+            supports_dcp_with_varlen=True,
         )
 
         self.num_heads = self.model_config.get_num_attention_heads(parallel_config)
