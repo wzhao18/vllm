@@ -1748,6 +1748,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 grammar_output is None
                 and input_batch.num_draft_tokens > 0
                 and self.rejection_sampler is not None
+                and self.rejection_sampler.can_verify_greedy(self.model, input_batch)
+            ):
+                # Greedy verification needs only the target argmax of each row:
+                # skip materializing (and all-gathering) the full-vocab logits.
+                # None: the model has no fast path for these rows.
+                top_tokens = self.model.get_top_tokens(sample_hidden_states)
+                if top_tokens is not None:
+                    out = self.rejection_sampler.verify_greedy(top_tokens, input_batch)
+                    return out, out.num_sampled, out.num_rejected
+            elif (
+                grammar_output is None
+                and input_batch.num_draft_tokens > 0
+                and self.rejection_sampler is not None
                 and self.speculator is not None
                 and self.rejection_sampler.can_verify_sharded(self.model, input_batch)
             ):

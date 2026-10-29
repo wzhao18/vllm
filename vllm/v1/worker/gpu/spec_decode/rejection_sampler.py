@@ -23,6 +23,7 @@ from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 from vllm.v1.worker.gpu.spec_decode.draft_logits import DraftLogitsCache
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
+    greedy_verify,
     rejection_sample,
 )
 
@@ -418,6 +419,27 @@ class RejectionSampler:
         )
         return sampled, num_sampled, logprobs_tensors, sampling_mask_tensors
 
+    def can_verify_greedy(self, model: Any, input_batch: InputBatch) -> bool:
+        """Whether this batch can be verified from the target argmax of each
+        logits row alone (``verify_greedy``), with the model's vocab-parallel
+        ``get_top_tokens`` instead of full-vocab logits: every request is greedy
+        and nothing else reads or changes the logits. Depends only on host state
+        that every TP rank shares, so all ranks take the same path.
+        ``get_top_tokens`` must return ``compute_logits(...).argmax(-1)`` exactly
+        (the lowest index among equal maxima), or None to keep the stock path."""
+        sampler = self.sampler
+        idx = input_batch.idx_mapping_np
+        return (
+            hasattr(model, "get_top_tokens")
+            and self.watermark_key is None
+            and not self.enable_adaptive_verification
+            and not sampler.compute_nans
+            and not sampler.return_sampling_mask
+            and bool(np.all(sampler.sampling_states.temperature.np[idx] == 0.0))
+            and not np.any(sampler.needs_logits_processing[idx])
+            and sampler.sampling_states.max_num_logprobs(idx) == NO_LOGPROBS
+        )
+
     def can_verify_sharded(self, model: Any, input_batch: InputBatch) -> bool:
         """Whether the model may verify this batch from its vocabulary-sharded logits
         (``verify_sharded``): a decode batch (every request has
@@ -474,6 +496,33 @@ class RejectionSampler:
         if result is None:
             return None
         sampled, num_sampled, num_rejected = result
+        return SamplerOutput(
+            sampled_token_ids=sampled,
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+        )
+
+    def verify_greedy(
+        self, target_argmax: torch.Tensor, input_batch: InputBatch
+    ) -> SamplerOutput:
+        """The same output as ``__call__`` for a batch that passes
+        ``can_verify_greedy``, from the target argmax of each logits row."""
+        sampled, num_sampled, num_rejected = greedy_verify(
+            target_argmax,
+            input_batch.input_ids,
+            input_batch.positions,
+            input_batch.logits_indices,
+            input_batch.expanded_local_pos,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            input_batch.seq_lens,
+            self.sampler.req_states.prefill_len.gpu,
+            self.sampler.sampling_states.seeds.gpu,
+            self.num_speculative_steps,
+            self.synthetic_conditional_rates,
+        )
         return SamplerOutput(
             sampled_token_ids=sampled,
             logprobs_tensors=None,
