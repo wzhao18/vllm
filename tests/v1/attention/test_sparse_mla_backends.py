@@ -4953,34 +4953,76 @@ def test_fp8_dcp_accepts_comm_backend(monkeypatch, comm_backend):
     assert builder.fp8_use_mixed_batch
 
 
-def test_fp8_mixed_batch_dcp_neutralizes_empty_rows(monkeypatch):
-    """A decode row whose top-k shard holds no local candidates (all -1) has
-    undefined kernel out/lse; it must come back as (0, -inf), the identity of
-    the cross-rank LSE merge, or a NaN would survive the merge even at zero
-    weight (0 * NaN = NaN)."""
+@pytest.mark.parametrize("sm100", [True, False])
+@pytest.mark.parametrize("pcp_dcp_kv_gather", [False, True])
+def test_fp8_mixed_batch_dcp_neutralizes_empty_rows(
+    monkeypatch, pcp_dcp_kv_gather, sm100
+):
+    """Under DCP each rank's local top-k slots are compacted to a prefix and
+    FlashMLA reads only ``count`` of them per row (topk_length). A row whose
+    shard holds no local candidate (count 0) gets out = 0, lse = +inf from
+    FlashMLA; it must come back as (0, -inf), the identity of the cross-rank
+    LSE merge. The DCP combines read out through its strides, so out is a
+    view of the kernel's head-padded output; the PCP+DCP all-reduce needs
+    packed heads. The CuTe scheduler writes the SM100 split layout; other
+    GPUs pass FlashMLA's own (uninitialized) metadata and no topk_length,
+    which the SM90 kernel rejects for this cache format."""
     num_tokens, num_heads, head_dim = 3, 2, 3
     q = torch.empty(num_tokens, num_heads, head_dim, device=DEVICE_TYPE)
-    local_indices = torch.tensor(
-        [[0, 1, -1, -1], [-1, -1, -1, -1], [2, -1, 3, -1]],
+    compact_indices = torch.tensor(
+        [[0, 1, -1, -1], [-1, -1, -1, -1], [2, 3, -1, -1]],
         dtype=torch.int32,
         device=DEVICE_TYPE,
     )
+    counts = torch.tensor([2, 0, 2], dtype=torch.int32, device=DEVICE_TYPE)
+
+    def convert(*args, **kwargs):
+        assert kwargs["compact_valid_to_front"]
+        assert kwargs["return_valid_counts"]
+        return compact_indices, counts
 
     monkeypatch.setattr(
         "vllm.v1.attention.backends.mla.flashmla_sparse."
         "triton_filter_and_convert_dcp_index",
-        lambda *args, **kwargs: local_indices,
+        convert,
     )
+    cute_meta, flashmla_meta = object(), object()
+    monkeypatch.setattr(
+        "vllm.v1.attention.ops.flashmla_sched_cutedsl.build_sparse_sched_meta",
+        lambda *args, **kwargs: cute_meta,
+    )
+    monkeypatch.setattr(
+        "vllm.v1.attention.backends.mla.flashmla_sparse.get_mla_metadata",
+        lambda: (flashmla_meta, None),
+    )
+    monkeypatch.setattr(
+        current_platform,
+        "is_device_capability_family",
+        lambda family, device_id=0: sm100 and family == 100,
+    )
+    topk_lengths = []
+    kernel_outs = []
 
-    def run_kernel(**kwargs):
-        out = torch.full(
-            (1, num_tokens, num_heads, 1), float("nan"), device=DEVICE_TYPE
-        )
-        lse = torch.full((1, num_heads, num_tokens), float("nan"), device=DEVICE_TYPE)
+    def flash_mla(**kwargs):
+        sched = kwargs["tile_scheduler_metadata"]
+        assert sched is (cute_meta if sm100 else flashmla_meta)
+        topk_lengths.append(kwargs["topk_length"])
+        nb, s_q, heads, _ = kwargs["q"].shape
+        # FlashMLA writes out = 0 and lse = +inf for topk_length == 0.
+        out = torch.zeros((nb, s_q, heads, 512), device=DEVICE_TYPE)
+        lse = torch.full((nb, heads, s_q), float("inf"), device=DEVICE_TYPE)
         for token_id in (0, 2):  # rows with local candidates get real values
-            out[0, token_id] = float(token_id + 1)
-            lse[0, :, token_id] = float(token_id + 1)
+            # Distinct per head, so a wrong head slice is caught.
+            value = token_id + 1 + 10 * torch.arange(heads, device=DEVICE_TYPE)
+            out[token_id] = value[:, None].float()
+            lse[token_id] = value[:, None].float()
+        kernel_outs.append(out)
         return out, lse
+
+    monkeypatch.setattr(
+        "vllm.v1.attention.backends.mla.flashmla_sparse.flash_mla_with_kvcache",
+        flash_mla,
+    )
 
     metadata = SimpleNamespace(
         fp8_extra_metadata=FlashMLASparseMetadata.FP8KernelMetadata(
@@ -4998,23 +5040,38 @@ def test_fp8_mixed_batch_dcp_neutralizes_empty_rows(monkeypatch):
         index_group_index=0,
         dcp_world_size=2,
         dcp_rank=0,
+        softmax_scale=1.0,
         need_to_return_lse_for_decode=True,
-        _fp8_flash_mla_kernel=run_kernel,
+        pcp_dcp_kv_gather=pcp_dcp_kv_gather,
     )
 
     out, lse = FlashMLASparseImpl._forward_fp8_kv_mixed_batch(
-        impl, q, torch.empty(0, device=DEVICE_TYPE), local_indices, metadata
+        impl, q, torch.empty(0, device=DEVICE_TYPE), compact_indices, metadata
     )
+    (topk_length,) = topk_lengths
+    if sm100:
+        assert topk_length.tolist() == [2, 0, 2]
+    else:
+        assert topk_length is None
     assert lse is not None
-
+    assert out.shape == (num_tokens, num_heads, 512)
     assert torch.equal(out[1], torch.zeros_like(out[1]))
     assert torch.isneginf(lse[1]).all()
     for token_id in (0, 2):
-        assert torch.equal(out[token_id], torch.full_like(out[token_id], token_id + 1))
-        assert torch.equal(lse[token_id], torch.full_like(lse[token_id], token_id + 1))
-    assert out.is_contiguous()
+        value = token_id + 1 + 10 * torch.arange(num_heads, device=DEVICE_TYPE)
+        assert torch.equal(out[token_id], value[:, None].float().expand(-1, 512))
+        assert torch.equal(lse[token_id], value.float())
     assert not out.isnan().any()
     assert not lse.isnan().any()
+    (kernel_out,) = kernel_outs
+    padded_heads = kernel_out.shape[2]
+    assert padded_heads > num_heads
+    if pcp_dcp_kv_gather:
+        assert out.is_contiguous()
+    else:
+        # No copy: a [T, H, 512] view of the [T, 1, padded_heads, 512] output.
+        assert out.data_ptr() == kernel_out.data_ptr()
+        assert out.stride() == (padded_heads * 512, 512, 1)
 
 
 def test_hisparse_prefill_reuses_builder_staging_plan():
