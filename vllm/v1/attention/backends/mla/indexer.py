@@ -1344,7 +1344,17 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
     def _prefill_split_seq_lens(self, seq_lens_cpu: torch.Tensor) -> torch.Tensor:
         """Per-request KV lengths the prefill chunker budgets logits with;
-        subclasses whose logits rows are wider than the context override."""
+        subclasses whose logits rows are wider than the context override.
+
+        Under DCP each rank scores only its KV shard; rank 0 holds the
+        largest, so every rank plans the same chunks."""
+        if self.dcp_world_size > 1:
+            return get_dcp_local_seq_lens(
+                seq_lens_cpu,
+                self.dcp_world_size,
+                0,
+                self.compressed_cp_interleave_size,
+            )
         return seq_lens_cpu
 
     @staticmethod
@@ -1873,6 +1883,7 @@ def build_prefill_chunk_metadata(
     local_cu_seq_lens = cu_seq_lens
     local_total_seq_lens = total_seq_lens
     max_local_total_seq_lens = total_seq_lens
+    max_seqlen_k = int(compressed_seq_lens_cpu[start_idx:end_idx].max())
     if pcp_plan is not None:
         local_cu_seq_lens = pcp_plan.padded_local_cu
         local_total_seq_lens = pcp_plan.padded_local_total
@@ -1901,6 +1912,8 @@ def build_prefill_chunk_metadata(
         )
         local_total_seq_lens = int(local_seq_lens_cpu[:, dcp_rank].sum())
         max_local_total_seq_lens = int(local_seq_lens_cpu.sum(dim=0).max())
+        # This rank's logits rows span only its own shard.
+        max_seqlen_k = int(local_seq_lens_cpu[:, dcp_rank].max())
 
     query_start_loc = (
         query_start_loc[start_idx : end_idx + 1] - query_start_loc[start_idx]
@@ -1990,7 +2003,7 @@ def build_prefill_chunk_metadata(
         cu_seq_lens=cu_seq_lens,
         token_to_seq=token_to_seq,
         total_seq_lens=total_seq_lens,
-        max_seqlen_k=int(compressed_seq_lens_cpu[start_idx:end_idx].max()),
+        max_seqlen_k=max_seqlen_k,
         block_table=block_table[start_idx:end_idx],
         token_start=token_start,
         token_end=token_end,

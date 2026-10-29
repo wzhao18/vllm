@@ -679,6 +679,7 @@ def test_sparse_prefill_dcp_metadata_localizes_causal_bounds():
     # cu_seqlen_ks/ke carry the global causal bounds.
     chunk = build(dcp_world_size=1, dcp_rank=0)
     assert chunk.local_cu_seq_lens is chunk.cu_seq_lens
+    assert chunk.max_seqlen_k == seq_len
     torch.testing.assert_close(
         chunk.cu_seqlen_ks.cpu(),
         torch.zeros(seq_len, dtype=torch.int32),
@@ -695,6 +696,8 @@ def test_sparse_prefill_dcp_metadata_localizes_causal_bounds():
         chunk.local_cu_seq_lens.cpu(),
         torch.tensor([0, 2], dtype=torch.int32),
     )
+    # DeepGEMM writes logits only as wide as this rank's shard.
+    assert chunk.max_seqlen_k == 2
     torch.testing.assert_close(
         chunk.cu_seqlen_ks.cpu(),
         torch.zeros(seq_len, dtype=torch.int32),
@@ -718,6 +721,34 @@ def test_sparse_prefill_dcp_metadata_localizes_causal_bounds():
         chunk.cu_seqlen_ke.cpu(),
         torch.tensor([1, 2, 2, 2, 2, 2, 2, 2], dtype=torch.int32),
     )
+
+
+@pytest.mark.parametrize("interleave", [1, 64])
+def test_dcp_prefill_chunks_budget_logits_on_the_local_shard(interleave: int):
+    """Under DCP each rank's logits span only its KV shard, so the prefill
+    chunker budgets the largest shard (rank 0's): a 16K chunk at 128K context
+    takes 3 sub-chunks at DCP8 instead of 19, the same on every rank."""
+    from vllm.v1.attention.backends.mla.indexer import (
+        DeepseekV32IndexerMetadataBuilder,
+    )
+
+    def plan(dcp_world_size: int) -> list[tuple[slice, slice]]:
+        builder = object.__new__(DeepseekV32IndexerMetadataBuilder)
+        builder.dcp_world_size = dcp_world_size
+        builder.compressed_cp_interleave_size = interleave
+        return builder._split_indexer_prefill_chunks(
+            builder._prefill_split_seq_lens(torch.tensor([147_456])),
+            torch.tensor([16_384]),
+            1 << 30,
+            512 << 20,
+        )
+
+    assert len(plan(1)) == 19
+    local = get_dcp_local_seq_lens(torch.tensor([147_456]), 8, 0, interleave)
+    max_rows = (512 << 20) // 4 // int(local[0])
+    assert [q.stop - q.start for _, q in plan(8)] == [max_rows] * 2 + [
+        16_384 - 2 * max_rows
+    ]
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
