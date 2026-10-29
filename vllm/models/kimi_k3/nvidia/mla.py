@@ -156,6 +156,9 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         self.kv_lora_rank = kv_lora_rank
         self.use_output_gate = use_output_gate
         self.non_causal_multi_token_decode = non_causal_multi_token_decode
+        # DSpark drafter layers under the specialized decode: the fast DCP attention
+        # (specialized_decode.cutedsl.draft.attention), set after the weights load.
+        self.draft_dcp = None
         # Latent "head" seen by the attention kernel / KV cache.
         self.head_size = kv_lora_rank + qk_rope_head_dim
         self.scale = self.qk_head_dim**-0.5
@@ -414,6 +417,8 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         # [B, H=1, N, C] -> [B, N, C]
         self.kv_cache = kv_cache.squeeze(1)
+        if self.draft_dcp is not None:  # the DSpark drafter's fast DCP attention
+            self.draft_dcp.bind(self._attn_read_kv_cache())
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.attn_backend
@@ -516,6 +521,12 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         """Expand q-LoRA output and run attention."""
         q_lora_rank = self.q_lora_rank
         assert q_lora_rank is not None
+        if self.draft_dcp is not None:
+            # DSpark drafter layers under the specialized decode: the fused query
+            # kernel from the in-projection rows (None: not covered).
+            attn_out = self.draft_dcp.attend_projected(self, positions, qkv_lora)
+            if attn_out is not None:
+                return attn_out
         q_c, kv_c, k_pe = qkv_lora.split(
             [q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
@@ -711,6 +722,10 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 cos_sin_cache,
                 slot_mapping[:num_mqa_tokens],
             )
+            if self.draft_dcp is not None and self.draft_dcp.attend(
+                self, mqa_q, attn_metadata, attn_out[:num_mqa_tokens]
+            ):
+                return
             if self.dcp_world_size > 1:
                 assert self.dcp_manager is not None
                 assert self.dcp_manager.query_gather is not None

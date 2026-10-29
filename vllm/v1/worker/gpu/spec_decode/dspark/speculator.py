@@ -166,7 +166,88 @@ class DSparkSpeculator(DFlashSpeculator):
             logits_cache_row_mapping=self.draft_logits.row_mapping,
         )
 
+    @torch.inference_mode()
+    def warmup_inputs(
+        self,
+        last_sampled: torch.Tensor,
+        next_prefill_tokens: torch.Tensor,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+    ) -> None:
+        """DFlash's input preparation, then the stock probabilistic draft sample
+        (``_sample_logits``' gumbel_sample: drafting, temperature, the draft-logits
+        cache) once, so neither compiles during inference. The one sampled row writes
+        request slot 0's cached logits, which its own first draft rewrites."""
+        super().warmup_inputs(last_sampled, next_prefill_tokens, temperature, seeds)
+        if self.draft_logits is None:
+            return
+        logits = torch.zeros(
+            1, self.vocab_size, dtype=self.draft_logits.dtype, device=self.device
+        )
+        idx = torch.zeros(1, dtype=self.sample_idx_mapping.dtype, device=self.device)
+        pos = torch.zeros(1, dtype=self.sample_pos.dtype, device=self.device)
+        gumbel_sample(
+            logits,
+            idx,
+            self.temperature,
+            self.seeds,
+            pos,
+            apply_temperature=True,
+            is_drafting=True,
+            logits_cache=self.draft_logits,
+            logits_cache_col=self._step_cols[0],
+            use_fp64=self.use_fp64_gumbel,
+        )
+        torch.accelerator.synchronize()
+
+    def _fused_sampled_markov(self, num_reqs: int, head_hidden: torch.Tensor) -> bool:
+        """Let the draft model run every Markov position of probabilistic drafting in
+        one fused call (``sampled_markov_draft``: the stock draws of
+        ``_sample_logits``, and the draft logits cached as it caches them). Only plain
+        anchor-as-first drafting qualifies; anything else, or a False from the model,
+        keeps the loop below."""
+        if (
+            self.draft_logits is None
+            or self._draft_topk is not None
+            or self.use_confidence_head
+            or self.acceptance_estimator is not None
+            or self.draft_watermarker is not None
+            or not self.sample_from_anchor
+            or self.num_query_per_req != self.num_speculative_steps
+        ):
+            return False
+        num_sample = num_reqs * self.num_speculative_steps
+        # Anchor-as-first: sample row k is query row k (sample_indices is the identity
+        # on the live rows), and each request's anchor is its first query token.
+        step = self.num_query_per_req
+        anchors = self.input_buffers.input_ids[: num_reqs * step : step]
+        draft = self.draft_tokens[:num_reqs]
+        fused = getattr(self.model, "sampled_markov_draft", None)
+        if fused is None or self.use_fp64_gumbel or self._d2t_scatter_index is not None:
+            return False
+        return fused(
+            head_hidden[:num_sample],
+            anchors,
+            draft,
+            self.sample_idx_mapping[:num_sample],
+            self.sample_pos[:num_sample],
+            self.temperature,
+            self.seeds,
+            self.draft_logits,
+        )
+
+    def prepare_draft_logits(self, idx_mapping: torch.Tensor) -> None:
+        """Before the stock rejection sampler reads the draft logits of the requests
+        in ``idx_mapping``: a draft model whose fused probabilistic drafting writes
+        only this rank's vocabulary columns completes those rows."""
+        if self.draft_logits is not None and getattr(
+            self.model, "shards_draft_logits", False
+        ):
+            self.model.gather_draft_logits(self.draft_logits, idx_mapping)
+
     def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
+        if self._fused_sampled_markov(num_reqs, head_hidden):
+            return
         if self._draft_topk is not None:
             self._sample_sequential_topk(num_reqs, head_hidden)
             return

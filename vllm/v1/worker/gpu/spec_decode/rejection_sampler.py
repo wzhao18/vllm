@@ -418,6 +418,70 @@ class RejectionSampler:
         )
         return sampled, num_sampled, logprobs_tensors, sampling_mask_tensors
 
+    def can_verify_sharded(self, model: Any, input_batch: InputBatch) -> bool:
+        """Whether the model may verify this batch from its vocabulary-sharded logits
+        (``verify_sharded``): a decode batch (every request has
+        ``num_speculative_steps`` drafts), every request greedy or at temperature 1
+        with no other logits processing, no logprobs, no watermark, no adaptive
+        verification, no NaN counting or sampling mask, FP32 draws. Depends only on
+        host state that every TP rank shares, so all ranks take the same path."""
+        sampler = self.sampler
+        idx = input_batch.idx_mapping_np
+        num_reqs = input_batch.num_reqs
+        return (
+            hasattr(model, "verify_sampled")
+            and num_reqs > 0
+            and self.watermark_key is None
+            and not self.enable_adaptive_verification
+            and not sampler.compute_nans
+            and not sampler.return_sampling_mask
+            and not sampler.use_fp64_gumbel
+            and not np.any(sampler.needs_logits_processing[idx])
+            and sampler.sampling_states.max_num_logprobs(idx) == NO_LOGPROBS
+            and np.array_equal(
+                input_batch.cu_num_logits_np,
+                np.arange(num_reqs + 1) * (self.num_speculative_steps + 1),
+            )
+        )
+
+    def verify_sharded(
+        self,
+        model: Any,
+        hidden_states: torch.Tensor,
+        input_batch: InputBatch,
+        draft_logits: torch.Tensor | None,
+    ) -> SamplerOutput | None:
+        """The same output as ``__call__`` for a batch that passes
+        ``can_verify_sharded``, by the model's ``verify_sampled`` (None: the model has
+        no fast path for these rows; nothing was launched)."""
+        sampler = self.sampler
+        result = model.verify_sampled(
+            hidden_states,
+            self.num_speculative_steps,
+            input_ids=input_batch.input_ids,
+            positions=input_batch.positions,
+            logits_indices=input_batch.logits_indices,
+            expanded_local_pos=input_batch.expanded_local_pos,
+            idx_mapping=input_batch.idx_mapping,
+            seq_lens=input_batch.seq_lens,
+            prefill_len=sampler.req_states.prefill_len.gpu,
+            temperature=sampler.sampling_states.temperature.gpu,
+            seeds=sampler.sampling_states.seeds.gpu,
+            draft_logits=draft_logits,
+            synthetic_rates=self.synthetic_conditional_rates,
+            block_verification=self.use_block_verification,
+        )
+        if result is None:
+            return None
+        sampled, num_sampled, num_rejected = result
+        return SamplerOutput(
+            sampled_token_ids=sampled,
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+        )
+
     def __call__(
         self,
         logits: torch.Tensor,

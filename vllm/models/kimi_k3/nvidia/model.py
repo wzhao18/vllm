@@ -1717,6 +1717,10 @@ class KimiLinearForCausalLM(
         # self.model, built by the model state once the weights are loaded.
         self.specialized_decode_config = specialized_decode_config(vllm_config)
         self.specialized_decode: SpecializedDecode | None = None
+        # The vocabulary-sharded logits and sampled verification of verify_sampled
+        # (built with the specialized decode on Rubin when speculating).
+        self.verify_logits = None
+        self.sampled_verify = None
         # The final norm is applied in compute_logits unless the specialized decode
         # applies it in forward.
         self.needs_norm_in_logits = True
@@ -1739,6 +1743,17 @@ class KimiLinearForCausalLM(
         # to each step that falls back to the stock forward (prefills, larger batches,
         # PIECEWISE steps).
         self.needs_norm_in_logits = False
+        from .specialized_decode.runtime.verify import VerifyArgmax as VerifyLogits
+
+        self.verify_logits = VerifyLogits.build(self.vllm_config, self)
+        if self.verify_logits is not None:  # Rubin, speculating
+            from .specialized_decode.runtime.sampled_verify import SampledVerify
+            from .specialized_decode.runtime.warmup import warm_sampling
+
+            self.sampled_verify = SampledVerify.build(self.vllm_config, self)
+            # Compile the verification kernels now (every rank together), not at
+            # the first decode step.
+            warm_sampling(self.vllm_config, self)
 
     def get_model_state_cls(self) -> "type[ModelState]":
         from .model_state import KimiK3ModelState
@@ -1824,6 +1839,30 @@ class KimiLinearForCausalLM(
         if self.needs_norm_in_logits:
             hidden_states = self.model.norm(hidden_states, None)
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def verify_sampled(
+        self,
+        hidden_states: torch.Tensor,
+        steps: int,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """``RejectionSampler.rejection_sample``'s result for a decode batch of greedy
+        and temperature-1 requests with ``steps`` drafts each, from this rank's shard of
+        the target logits (``runtime.sampled_verify``); every TP rank calls it together.
+        None: no fast path for this call (nothing launched)."""
+        verify = self.sampled_verify
+        if (
+            verify is None
+            or self.verify_logits is None
+            or not verify.takes(hidden_states.shape[0])
+        ):
+            return None
+        if self.needs_norm_in_logits:
+            hidden_states = self.model.norm(hidden_states, None)
+        logits = self.verify_logits.shard_logits(
+            self.logits_processor, self.lm_head, hidden_states
+        )
+        return verify.run(logits, steps, **kwargs)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
@@ -2232,6 +2271,11 @@ class KimiK3ForConditionalGeneration(
 
     def compute_logits(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
         return self.language_model.compute_logits(hidden_states)
+
+    def verify_sampled(
+        self, hidden_states: torch.Tensor, steps: int, **kwargs
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        return self.language_model.verify_sampled(hidden_states, steps, **kwargs)
 
     def get_model_state_cls(self) -> "type[ModelState]":
         return self.language_model.get_model_state_cls()

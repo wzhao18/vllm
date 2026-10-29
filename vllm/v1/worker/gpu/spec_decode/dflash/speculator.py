@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -450,6 +452,106 @@ class DFlashSpeculator(DraftModelSpeculator):
         return True
 
     @torch.inference_mode()
+    def _prepare_inputs(
+        self,
+        input_batch: Any,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        last_sampled: torch.Tensor,
+        next_prefill_tokens: torch.Tensor,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+        num_reqs_override: int | None = None,
+    ) -> None:
+        # Support multiple draft KV cache groups by preparing inputs once for each
+        for i, gid in enumerate(self.draft_kv_cache_group_ids):
+            prepare_dflash_inputs(
+                self.input_buffers,
+                self.block_tables.slot_mappings[gid],
+                self.context_positions,
+                self._context_slot_mappings[i],
+                self.sample_indices,
+                self.sample_pos,
+                self.sample_idx_mapping,
+                self.temperature,
+                self.seeds,
+                input_batch,
+                num_sampled,
+                num_rejected,
+                last_sampled,
+                next_prefill_tokens,
+                temperature,
+                seeds,
+                self.block_tables.input_block_tables[gid],
+                self.block_tables.block_sizes[gid],
+                self.block_tables.cp_rank,
+                self.dcp_size,
+                self.block_tables.cp_interleave,
+                self.parallel_drafting_token_id,
+                self.num_query_per_req,
+                self.num_speculative_steps,
+                self.max_num_reqs,
+                self.max_num_tokens,
+                self.max_model_len,
+                self.sample_from_anchor,
+                num_reqs_override,
+            )
+
+    @torch.inference_mode()
+    def warmup_inputs(
+        self,
+        last_sampled: torch.Tensor,
+        next_prefill_tokens: torch.Tensor,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+    ) -> None:
+        """Compile the step's input preparation (``_prepare_dflash_inputs_kernel``)
+        before serving, so no request triggers its JIT: every BLOCK_SIZE a step can
+        pick (the longest per-request query plus the draft rows, a power of two up to
+        256), at 1, 2 and 16 requests (Triton specializes integer arguments equal to
+        1 or divisible by 16). It writes only this speculator's own buffers, which
+        every step rewrites before reading them."""
+        device = self.device
+        nq = self.num_query_per_req
+        block = triton.next_power_of_2(1 + nq)
+        while True:
+            block = min(block, 256)
+            query = max(1, block - nq)  # max query + nq == block
+            for num_reqs in (1, 2, 16):
+                if (
+                    num_reqs > self.max_num_reqs
+                    or num_reqs * query > self.max_num_tokens
+                ):
+                    continue
+                batch = SimpleNamespace(
+                    num_reqs=num_reqs,
+                    num_scheduled_tokens=np.full(num_reqs, query, dtype=np.int32),
+                    positions=torch.zeros(
+                        num_reqs * query, dtype=torch.int64, device=device
+                    ),
+                    query_start_loc=torch.arange(
+                        0,
+                        (num_reqs + 1) * query,
+                        query,
+                        dtype=torch.int32,
+                        device=device,
+                    ),
+                    idx_mapping=torch.zeros(num_reqs, dtype=torch.int64, device=device),
+                )
+                self._prepare_inputs(
+                    batch,
+                    torch.ones(num_reqs, dtype=torch.int32, device=device),
+                    torch.zeros(num_reqs, dtype=torch.int32, device=device),
+                    last_sampled,
+                    next_prefill_tokens,
+                    temperature,
+                    seeds,
+                )
+            if block >= 256:
+                break
+            block *= 2
+        torch.accelerator.synchronize()
+
     def propose(
         self,
         input_batch: InputBatch,
@@ -527,39 +629,16 @@ class DFlashSpeculator(DraftModelSpeculator):
         # The query slot mapping is written into the shared BlockTables slot_mappings.
         # That buffer's address is what the captured CUDA graph reads from at replay.
         assert self.draft_kv_cache_group_id >= 0
-        # Support multiple draft KV cache groups by preparing inputs once for each
-        for i, gid in enumerate(self.draft_kv_cache_group_ids):
-            prepare_dflash_inputs(
-                self.input_buffers,
-                self.block_tables.slot_mappings[gid],
-                self.context_positions,
-                self._context_slot_mappings[i],
-                self.sample_indices,
-                self.sample_pos,
-                self.sample_idx_mapping,
-                self.temperature,
-                self.seeds,
-                input_batch,
-                num_sampled,
-                num_rejected,
-                last_sampled,
-                next_prefill_tokens,
-                temperature,
-                seeds,
-                self.block_tables.input_block_tables[gid],
-                self.block_tables.block_sizes[gid],
-                self.block_tables.cp_rank,
-                self.dcp_size,
-                self.block_tables.cp_interleave,
-                self.parallel_drafting_token_id,
-                self.num_query_per_req,
-                self.num_speculative_steps,
-                self.max_num_reqs,
-                self.max_num_tokens,
-                self.max_model_len,
-                self.sample_from_anchor,
-                num_reqs,
-            )
+        self._prepare_inputs(
+            input_batch,
+            num_sampled,
+            num_rejected,
+            last_sampled,
+            next_prefill_tokens,
+            temperature,
+            seeds,
+            num_reqs_override=num_reqs,
+        )
 
         if num_speculative_tokens == 0:
             # No drafts are needed: store the context K/V to keep the drafter in

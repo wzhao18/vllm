@@ -212,6 +212,11 @@ class K3DSparkModel(nn.Module):
         return self.embed_tokens(input_ids)
 
     def combine_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        fast = getattr(self, "_fast_context", None)
+        if fast is not None:
+            combined = fast.combine(hidden_states)
+            if combined is not None:
+                return combined
         return self.context_norm(self.context_proj(hidden_states))
 
     @torch.inference_mode()
@@ -272,6 +277,8 @@ class K3DSparkModel(nn.Module):
         # One KV-only GEMM replaces five full Q+KV GEMMs. For K3 this projects
         # 5*576 rows rather than 5*2112 rows (72.7% fewer A-projection FLOPs).
         all_kv = self.context_kv_proj(context_states)
+        if self._fused_context_kv(all_kv, context_positions, context_slot_mapping):
+            return
         all_kv = all_kv.view(num_ctx, num_layers, self._context_kv_width)
         all_kv_c = all_kv[..., : self._context_kv_lora_rank]
         all_k_pe = all_kv[..., self._context_kv_lora_rank :]
@@ -372,6 +379,46 @@ class K3DSparkModel(nn.Module):
                 attn._k_scale,
             )
 
+    def _fused_context_kv(self, all_kv, positions, slot_mapping) -> bool:
+        """The specialized decode's fused context-KV epilogue (per-layer RMSNorm,
+        RoPE, FP8 insert of the owned slots) when it covers this call."""
+        fast = getattr(self, "_fast_context", None)
+        if (
+            fast is None
+            or slot_mapping is None
+            or not torch.cuda.is_current_stream_capturing()
+            or self._context_kv_scales is None
+        ):
+            return False
+        if isinstance(slot_mapping, (list, tuple)):
+            if any(s is None for s in slot_mapping):
+                return False
+            if len({s.data_ptr() for s in slot_mapping}) != 1:
+                return False
+            slot_mapping = slot_mapping[0]
+        cache_layers = [layer.self_attn for layer in self.layers]
+        cache_dtype = cache_layers[0].kv_cache_dtype
+        if (
+            cache_dtype not in ("fp8", "fp8_e4m3")
+            or any(cl.kv_cache_dtype != cache_dtype for cl in cache_layers)
+            or not self._has_uniform_block_layout(cache_layers)
+            or not all_kv.is_contiguous()
+            or positions.dtype != torch.int64
+            or slot_mapping.dtype != torch.int64
+        ):
+            return False
+        ref = cache_layers[0].kv_cache
+        return fast.store_kv(
+            self,
+            all_kv,
+            positions,
+            slot_mapping,
+            self._get_context_kv_cache_ptrs(cache_layers),
+            self._context_kv_scales,
+            ref.size(1),
+            ref.stride(0) * ref.element_size(),
+        )
+
     def _has_uniform_block_layout(
         self,
         cache_layers: list[MultiHeadLatentAttention],
@@ -413,6 +460,12 @@ class K3DSparkModel(nn.Module):
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        fast = getattr(self, "_fast_ar", None)
+        if fast is not None and inputs_embeds is None:
+            # The specialized decode's Lamport all-reduce + norm sites (B1).
+            out = fast.run(self, input_ids, positions)
+            if out is not None:
+                return out
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
 
@@ -472,6 +525,9 @@ class K3DSparkForCausalLM(nn.Module):
         # Assigned by load_dspark_model from the target. Keeping no placeholder
         # avoids a transient full-vocabulary allocation for this 163k-vocab model.
         self.lm_head: nn.Module | None = None
+        # The specialized decode's drafter pieces (built after the weights load).
+        self._vllm_config = vllm_config
+        self._fast_path = None
         logit_scale = getattr(self.config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(
             self.config.draft_vocab_size, scale=logit_scale
@@ -535,3 +591,49 @@ class K3DSparkForCausalLM(nn.Module):
 
     def process_weights_after_loading(self) -> None:
         self.model._build_fused_context_kv_metadata()
+        from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.draft import (
+            DraftFastPath,
+        )
+
+        self._fast_path = DraftFastPath.build(self._vllm_config, self)
+
+    def sampled_markov_draft(
+        self,
+        hidden: torch.Tensor,
+        anchors: torch.Tensor,
+        draft: torch.Tensor,
+        slots: torch.Tensor,
+        positions: torch.Tensor,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+        draft_logits: torch.Tensor,
+    ) -> bool:
+        """Probabilistic sequential Markov drafting of every position in one fused
+        call, drawing as the stock loop's ``gumbel_sample``: ``hidden``
+        [num_reqs * steps, H] backbone rows (request-major), ``anchors`` [num_reqs]
+        the anchor token ids, ``draft`` [num_reqs, steps] (written), ``slots`` /
+        ``positions`` [num_reqs * steps] (the sample rows' request-state index and
+        predicted-token position), ``temperature`` / ``seeds`` [max_num_reqs] and the
+        draft-logits cache [max_num_reqs, steps, V], of which this rank writes its
+        vocabulary columns (``gather_draft_logits`` completes rows for the stock
+        rejection sampler). False when the fused path does not cover this call
+        (nothing launched)."""
+        fast = self._fast_path
+        sampling = (temperature, seeds, slots, positions, draft_logits)
+        return fast is not None and fast.sampled_markov(
+            self, hidden, anchors, draft, sampling
+        )
+
+    def gather_draft_logits(self, draft_logits: torch.Tensor, slots: torch.Tensor):
+        """Complete ``draft_logits`` rows of ``slots`` written by
+        ``sampled_markov_draft`` (each rank's columns) on every rank."""
+        fast = self._fast_path
+        if fast is not None:
+            fast.gather_draft_logits(draft_logits, slots)
+
+    @property
+    def shards_draft_logits(self) -> bool:
+        """Whether probabilistic drafting may leave only this rank's columns of the
+        draft-logits cache rows (``sampled_markov_draft``)."""
+        fast = self._fast_path
+        return fast is not None and bool(fast.batches)

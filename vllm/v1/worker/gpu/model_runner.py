@@ -1208,6 +1208,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     if self.speculator is not None:
                         with use_workspace_lane(self._draft_workspace_lane):
                             self.speculator.capture()
+                            # compile the speculator's eager per-step kernels too
+                            warmup = getattr(self.speculator, "warmup_inputs", None)
+                            if warmup is not None and self.sampler is not None:
+                                warmup(
+                                    self.req_states.last_sampled_tokens,
+                                    self.req_states.next_prefill_tokens,
+                                    self.sampler.sampling_states.temperature.gpu,
+                                    self.sampler.sampling_states.seeds.gpu,
+                                )
                     if self.adaptive_verification is not None and not profile_only:
                         with self.step_timing.collect() as timings:
                             for batch in self.adaptive_verification.batches_to_profile(
@@ -1735,7 +1744,35 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             logits = logits[:, : self.vocab_size]
         else:
             sample_hidden_states = hidden_states[input_batch.logits_indices]
+            if (
+                grammar_output is None
+                and input_batch.num_draft_tokens > 0
+                and self.rejection_sampler is not None
+                and self.speculator is not None
+                and self.rejection_sampler.can_verify_sharded(self.model, input_batch)
+            ):
+                # Greedy and temperature-1 requests: the model verifies them from
+                # its vocabulary-sharded logits, without the full-vocab logits.
+                out = self.rejection_sampler.verify_sharded(
+                    self.model,
+                    sample_hidden_states,
+                    input_batch,
+                    self.speculator.draft_logits,
+                )
+                if out is not None:
+                    return out, out.num_sampled, out.num_rejected
             logits = self.model.compute_logits(sample_hidden_states)
+
+        if (
+            global_input_batch.num_draft_tokens > 0
+            and self.rejection_sampler is not None
+            and self.speculator is not None
+        ):
+            # Draft logits the drafter left sharded across TP ranks are completed
+            # before the rejection sampler reads them (every rank, the whole batch).
+            prepare = getattr(self.speculator, "prepare_draft_logits", None)
+            if prepare is not None:
+                prepare(global_input_batch.idx_mapping)
 
         invalid_drafts = None
         # A diffusion prefill has no logit rows even when a bitmask row
