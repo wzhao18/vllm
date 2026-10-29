@@ -663,12 +663,17 @@ def triton_filter_and_convert_dcp_index(
     """
     assert dcp_size >= 1
     assert 0 <= dcp_rank < dcp_size
-    # Interleave groups must align to KV blocks (globally enforced by
-    # VllmConfig: block_size % cp_kv_cache_interleave_size == 0); assert the
-    # local invariant so local_idx // BLOCK_SIZE never straddles a group.
-    assert BLOCK_SIZE % cp_kv_cache_interleave_size == 0, (
-        f"BLOCK_SIZE ({BLOCK_SIZE}) must be divisible by "
-        f"cp_kv_cache_interleave_size ({cp_kv_cache_interleave_size})."
+    # Interleave groups and kernel blocks must nest either way. VllmConfig
+    # enforces block_size % cp_kv_cache_interleave_size == 0 on the logical
+    # block, which the slot mapping uses; a kernel block smaller than the
+    # interleave (e.g. 64 under a 896-token block and interleave) still holds
+    # contiguous local positions, so local_idx // BLOCK_SIZE stays exact.
+    assert (
+        BLOCK_SIZE % cp_kv_cache_interleave_size == 0
+        or cp_kv_cache_interleave_size % BLOCK_SIZE == 0
+    ), (
+        f"BLOCK_SIZE ({BLOCK_SIZE}) and cp_kv_cache_interleave_size "
+        f"({cp_kv_cache_interleave_size}) must divide one another."
     )
     assert req_id.dtype == torch.int32
     assert block_table.dtype == torch.int32
