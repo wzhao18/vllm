@@ -298,6 +298,24 @@ def _merge_dcp_topk_global(
     )
 
 
+def _uses_dcp_prefill_hist_merge(
+    tie_words: int,
+    dcp_world_size: int,
+    cp_interleave: int,
+    row_starts: torch.Tensor | None,
+) -> bool:
+    """Whether a prefill chunk merges its DCP top-k by histogram exchange
+    (Kimi K3.1 opts in with a nonzero tie-bitmap width) instead of all-gathering
+    every candidate. The exchange needs interleave 1 and rows that start at
+    column zero."""
+    return (
+        tie_words > 0
+        and dcp_world_size > 1
+        and cp_interleave == 1
+        and row_starts is None
+    )
+
+
 def dcp_gather_kv_rows(
     local_padded: torch.Tensor,
     deinterleave_idx: torch.Tensor,
@@ -594,6 +612,7 @@ def sparse_attn_indexer(
     topk_backend: str = "auto",
     shardq_layer_name: str = "",
     dcp_local_topk: int = 0,
+    dcp_prefill_merge_tie_words: int = 0,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     forward_context = get_forward_context()
@@ -922,6 +941,9 @@ def sparse_attn_indexer(
             # DeepGEMM returns compressed logits: row i starts at K position
             # cu_seqlen_ks[i]. None means every row starts at column zero.
             row_starts: torch.Tensor | None = None
+            # The histogram merge reads the bf16 logits, also when the top-k
+            # reads their fp32 copy (its path must be the same on every rank).
+            bf16_logits: torch.Tensor | None = None
             # Empty chunks have no logits; match the other ranks and the warm-up.
             score_bits = 16 if mqa_logits_use_mx_scales() else 32
             if chunk.local_total_seq_lens == 0 or q_slice.shape[0] == 0:
@@ -967,6 +989,8 @@ def sparse_attn_indexer(
                         chunk.max_seqlen_k,
                     )
                     score_bits = 16 if logits.dtype == torch.bfloat16 else 32
+                    if dcp_prefill_merge_tie_words:
+                        bf16_logits = logits
                     # DeepSelect ranks the bf16 logits in place of their exact fp32
                     # copy, also under DCP (whose merge below reads them as well);
                     # fp32 logits go to the selected top-k backend.
@@ -1011,21 +1035,37 @@ def sparse_attn_indexer(
             if deinterleave_idx is None:
                 # Under the PCP path the top-k already ran over the whole
                 # context.
-                _merge_dcp_topk_global(
-                    logits,
-                    topk_indices,
-                    topk_tokens,
-                    dcp_rank,
+                if _uses_dcp_prefill_hist_merge(
+                    dcp_prefill_merge_tie_words,
                     prefill_dcp_world_size,
                     cp_kv_cache_interleave_size,
-                    row_starts=row_starts,
-                    score_bits=score_bits,
-                    num_positions=max_model_len,
-                )
+                    row_starts,
+                ):
+                    from vllm.models.kimi_k3.nvidia.dsa_kernels.dcp_prefill_topk_merge.hist_merge import (  # noqa: E501
+                        dcp_prefill_topk_merge,
+                    )
+
+                    dcp_prefill_topk_merge(
+                        logits if bf16_logits is None else bf16_logits,
+                        topk_indices,
+                        dcp_prefill_merge_tie_words,
+                    )
+                else:
+                    _merge_dcp_topk_global(
+                        logits,
+                        topk_indices,
+                        topk_tokens,
+                        dcp_rank,
+                        prefill_dcp_world_size,
+                        cp_kv_cache_interleave_size,
+                        row_starts=row_starts,
+                        score_bits=score_bits,
+                        num_positions=max_model_len,
+                    )
             # Free this chunk's logits before the next chunk allocates its own:
             # the profile run has one chunk, so two live chunks would exceed
             # the logits budget it reserved.
-            del logits
+            del logits, bf16_logits
 
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
@@ -1278,6 +1318,7 @@ def sparse_attn_indexer_fake(
     topk_backend: str = "auto",
     shardq_layer_name: str = "",
     dcp_local_topk: int = 0,
+    dcp_prefill_merge_tie_words: int = 0,
 ) -> torch.Tensor:
     return topk_indices_buffer
 

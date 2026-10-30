@@ -12,7 +12,9 @@ that plan (with the builder code it runs against) on real DeepGEMM logits
 - ``current``: FP32 upcast + ``top_k_per_row_prefill``, then (DCP) the FP32
   ``(score, id)`` pack, one all-gather and the stable select;
 - ``bf16``: DeepSelect on the BF16 logits, then (DCP) the BF16 pack and the
-  same all-gather and select.
+  same all-gather and select;
+- ``hist``: DeepSelect, then the Kimi K3.1 histogram-exchange merge (four
+  small all-gathers).
 
 Sections:
 
@@ -20,8 +22,8 @@ Sections:
 - ``dcp``: one GPU plays rank 0 of ``--dcp`` ranks; the other ranks' logits
   come from their own keys. Local work is measured (CUDA events after an L2
   flush, median); the all-gathers are pre-built, and their time is an
-  estimate from bytes and call count. Also checks that both paths merge
-  the same global top-k set on every row.
+  estimate from bytes and call count. Also checks that ``hist`` keeps rank
+  0's share of the generic merge on every row.
 - ``dist``: launched with ``WORLD_SIZE == --dcp`` (one process per GPU, e.g.
   ``torchrun --nproc-per-node 8``): every rank runs its real local top-k and
   merge, NCCL all-gathers included; the max over ranks of the median is
@@ -45,6 +47,12 @@ from vllm.model_executor.kernels.attention.dsa.dcp_indexer_cutedsl import (
     stable_topk_from_gathered_candidates_cutedsl,
 )
 from vllm.model_executor.layers.indexer_topk import deep_select_topk
+from vllm.models.kimi_k3.nvidia.dsa_kernels.dcp_prefill_topk_merge.hist_merge import (  # noqa: E501
+    _DCP_PREFILL_MERGE_KERNEL as HIST,
+)
+from vllm.models.kimi_k3.nvidia.dsa_kernels.dcp_prefill_topk_merge.hist_merge import (  # noqa: E501
+    dcp_prefill_topk_merge,
+)
 from vllm.utils.deep_gemm import fp8_fp4_mqa_logits, mqa_logits_mx_inputs
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadataBuilder
 
@@ -211,6 +219,12 @@ def new_idx(rows: int) -> torch.Tensor:
     return torch.empty((rows, TOPK), dtype=torch.int32, device="cuda")
 
 
+def tie_words_for(world: int) -> int:
+    """Tie bitmap words covering the longest local row at MAX_MODEL_LEN."""
+    max_local_len = -(-MAX_MODEL_LEN // world)
+    return -(-max_local_len // (256 * 32))
+
+
 def tp_subchunk(sub, inputs, iters: int) -> np.ndarray:
     """[current us, bf16 us, rows, rows with equal top-k values, rows with
     equal column sets]."""
@@ -244,6 +258,36 @@ def bench_tp(name, requests, inputs, args):
     )
 
 
+def hist_rounds(bf16, topks, tie_words):
+    """Run every rank's histogram merge in one process; returns each rank's
+    output, rank 0's buffers and the four gathered rounds."""
+    world, rows = len(topks), topks[0].shape[0]
+    outs = [t.clone() for t in topks]
+    keys = [new_idx(rows) for _ in range(world)]
+    meta = [torch.empty((rows, 8), dtype=torch.int32, device="cuda") for _ in keys]
+    hist = [torch.empty((rows, 256), dtype=torch.int16, device="cuda") for _ in keys]
+    bits = [
+        torch.empty((rows, tie_words), dtype=torch.int32, device="cuda") for _ in keys
+    ]
+    for r in range(world):
+        HIST.keys(
+            bf16[r], outs[r], keys[r], hist[r], world_size=world, tie_words=tie_words
+        )
+    g1 = torch.stack(hist)
+    for r in range(world):
+        HIST.refine(g1, keys[r], meta[r], hist[r], tie_words=tie_words)
+    g2 = torch.stack(hist)
+    for r in range(world):
+        HIST.tie_hist(g2, meta[r], keys[r], outs[r], hist[r], tie_words=tie_words)
+    g3 = torch.stack(hist)
+    for r in range(world):
+        HIST.tie_bits(g3, meta[r], keys[r], outs[r], bits[r])
+    g4 = torch.stack(bits)
+    for r in range(world):
+        HIST.select(g4, meta[r], keys[r], outs[r], r)
+    return outs, (keys[0], meta[0], hist[0], bits[0]), (g1, g2, g3, g4)
+
+
 DCP_FIELDS = (
     "cur_topk",
     "pack",
@@ -251,7 +295,9 @@ DCP_FIELDS = (
     "select",
     "dsel",
     "pack16",
+    "hist",
     "rows",
+    "exact",
     "same_set",
 )
 
@@ -259,6 +305,7 @@ DCP_FIELDS = (
 def dcp_subchunk(sub, inputs, world: int, iters: int) -> np.ndarray:
     """Rank 0's local times of one sub-chunk (see ``DCP_FIELDS``)."""
     m = sub[2]
+    tie_words = tie_words_for(world)
     rank_logits, rank_ends = zip(*(inputs.logits(sub, world, r) for r in range(world)))
     topks = {"current": [], "bf16": []}
     pairs = {"current": [], "bf16": []}
@@ -277,18 +324,37 @@ def dcp_subchunk(sub, inputs, world: int, iters: int) -> np.ndarray:
             pairs[path].append(packed)
     gathered = {path: torch.cat(pairs[path], dim=1) for path in pairs}
     del pairs
-    merged = {
-        path: stable_topk_from_gathered_candidates_cutedsl(gathered[path], TOPK)
-        .sort(dim=1)
-        .values
-        for path in gathered
-    }
-    same_set = int((merged["current"] == merged["bf16"]).all(dim=1).sum())
+    bf16 = [
+        x if x.dtype == torch.bfloat16 else x.new_empty((m, 0), dtype=torch.bfloat16)
+        for x in rank_logits
+    ]
+    outs, (k0, m0, h0, b0), (g1, g2, g3, g4) = hist_rounds(
+        bf16, topks["bf16"], tie_words
+    )
+
+    # Rank 0 keeps its share of the generic merge over the same candidates;
+    # the bf16 path merges the same set as the current one.
+    merged = stable_topk_from_gathered_candidates_cutedsl(gathered["bf16"], TOPK)
+    share = torch.where(merged % world == 0, merged, -1).sort(dim=1).values
+    exact = int((outs[0].sort(dim=1).values == share).all(dim=1).sum())
+    merged_cur = stable_topk_from_gathered_candidates_cutedsl(gathered["current"], TOPK)
+    same_set = int(
+        (merged_cur.sort(dim=1).values == merged.sort(dim=1).values).all(1).sum()
+    )
 
     logits, ends = rank_logits[0], rank_ends[0]
     topk0, packed = new_idx(m), torch.empty((m, TOPK, 2), device="cuda")
     flat = torch.empty((world, m, TOPK, 2), device="cuda")
     logits32 = sparse_indexer.as_fp32_logits(logits, ends)
+
+    def hist_chain():
+        topk0.copy_(topks["bf16"][0])
+        HIST.keys(bf16[0], topk0, k0, h0, world_size=world, tie_words=tie_words)
+        HIST.refine(g1, k0, m0, h0, tie_words=tie_words)
+        HIST.tie_hist(g2, m0, k0, topk0, h0, tie_words=tie_words)
+        HIST.tie_bits(g3, m0, k0, topk0, b0)
+        HIST.select(g4, m0, k0, topk0, 0)
+
     fns = {
         "cur_topk": lambda: topk_current(logits, ends, topk0),
         "pack": lambda: pack_dcp_topk_candidates_cutedsl(
@@ -303,35 +369,43 @@ def dcp_subchunk(sub, inputs, world: int, iters: int) -> np.ndarray:
         "pack16": lambda: pack_dcp_topk_candidates_cutedsl(
             logits, topks["bf16"][0], packed, 0, world, 1, None
         ),
+        "hist": hist_chain,
     }
-    times = [timed(fns[f], iters) for f in DCP_FIELDS[:6]]
-    return np.array([*times, m, same_set])
+    times = [timed(fns[f], iters) for f in DCP_FIELDS[:7]]
+    return np.array([*times, m, exact, same_set])
 
 
 def bench_dcp(name, requests, inputs, args):
     world = args.dcp
     subs = plan(requests, args.max_logits_mb, world)
     t = dict(
-        zip(
-            DCP_FIELDS,
-            sum(dcp_subchunk(s, inputs, world, args.iters) for s in subs),
-        )
+        zip(DCP_FIELDS, sum(dcp_subchunk(s, inputs, world, args.iters) for s in subs))
     )
     torch.cuda.empty_cache()
-    n, rows = len(subs), int(t["rows"])
-    mb_pairs = (world - 1) * rows * TOPK * 8 / 1e6
-    comm = ag_estimate_us(mb_pairs, n) + t["reorg"]
+    n, rows, peers = len(subs), int(t["rows"]), world - 1
+    mb_pairs = peers * rows * TOPK * 8 / 1e6
+    mb_hist = peers * rows * (3 * 512 + 4 * tie_words_for(world)) / 1e6
+    comm_cur = ag_estimate_us(mb_pairs, n) + t["reorg"]
+    comm_hist = ag_estimate_us(mb_hist, 4 * n)
     local = {
         "current": t["cur_topk"] + t["pack"] + t["select"],
         "bf16": t["dsel"] + t["pack16"] + t["select"],
+        "hist": t["dsel"] + t["hist"],
+    }
+    total = {
+        "current": local["current"] + comm_cur,
+        "bf16": local["bf16"] + comm_cur,
+        "hist": local["hist"] + comm_hist,
     }
     print(
         f"| {name} | {n} | {local['current']:.0f} | {local['bf16']:.0f} "
-        f"| {local['current'] / local['bf16']:.2f}x | {mb_pairs:.0f} "
-        f"| {comm:.0f} | {local['current'] + comm:.0f} "
-        f"| {local['bf16'] + comm:.0f} "
-        f"| {(local['current'] + comm) / (local['bf16'] + comm):.2f}x "
-        f"| {t['same_set']:.0f}/{rows} |",
+        f"| {local['hist']:.0f} | {t['hist']:.0f} "
+        f"| {local['current'] / local['hist']:.2f}x "
+        f"| {mb_pairs:.0f} -> {mb_hist:.0f} | {n} -> {4 * n} "
+        f"| {comm_cur:.0f} -> {comm_hist:.0f} "
+        f"| {total['current']:.0f} | {total['bf16']:.0f} | {total['hist']:.0f} "
+        f"| {total['current'] / total['hist']:.2f}x "
+        f"| {t['exact']:.0f}/{rows} | {t['same_set']:.0f}/{rows} |",
         flush=True,
     )
 
@@ -353,8 +427,8 @@ class NcclGroup:
 
 
 def dist_subchunk(sub, inputs, group, iters: int) -> np.ndarray:
-    """This rank's [current, bf16] us of one sub-chunk, its rows and the rows
-    where both paths merge the same global top-k set."""
+    """This rank's [current, bf16, hist] us of one sub-chunk, its rows and
+    the rows where hist keeps exactly its share of the generic merge."""
     world, rank, m = group.world_size, group.rank_in_group, sub[2]
     logits, ends = inputs.logits(sub, world, rank)
     topk = new_idx(m)
@@ -365,14 +439,20 @@ def dist_subchunk(sub, inputs, group, iters: int) -> np.ndarray:
             # No local keys: the op hands the merge empty FP32 logits.
             scored = torch.empty((m, 0), device="cuda")
         sparse_indexer._merge_dcp_topk_global(scored, topk, TOPK, rank, world, 1)
-        return topk.sort(dim=1).values
+
+    def hist():
+        local_topk("bf16", logits, ends, topk)
+        dcp_prefill_topk_merge(logits, topk, tie_words_for(world), group=group)
 
     times = [
         timed(fn, iters, barrier=True)
-        for fn in (lambda: generic("current"), lambda: generic("bf16"))
+        for fn in (lambda: generic("current"), lambda: generic("bf16"), hist)
     ]
-    same = int((generic("current") == generic("bf16")).all(dim=1).sum())
-    return np.array([*times, m, same])
+    generic("bf16")
+    share = torch.where(topk % world == rank, topk, -1).sort(dim=1).values
+    hist()
+    exact = int((topk.sort(dim=1).values == share).all(dim=1).sum())
+    return np.array([*times, m, exact])
 
 
 def bench_dist(name, requests, inputs, args):
@@ -381,16 +461,16 @@ def bench_dist(name, requests, inputs, args):
     subs = plan(requests, args.max_logits_mb, group.world_size)
     stats = sum(dist_subchunk(sub, inputs, group, args.iters) for sub in subs)
     torch.cuda.empty_cache()
-    times = torch.tensor(stats[:2], device="cuda")
+    times = torch.tensor(stats[:3], device="cuda")
     dist.all_reduce(times, op=dist.ReduceOp.MAX)
-    counts = torch.tensor(stats[2:], device="cuda")
+    counts = torch.tensor(stats[3:], device="cuda")
     dist.all_reduce(counts)
     if group.rank_in_group == 0:
-        cur, b16 = times.tolist()
-        rows, same = counts.tolist()
+        cur, b16, hst = times.tolist()
+        rows, exact = counts.tolist()
         print(
-            f"| {name} | {len(subs)} | {cur:.0f} | {b16:.0f} | {cur / b16:.2f}x "
-            f"| {same:.0f}/{rows:.0f} |",
+            f"| {name} | {len(subs)} | {cur:.0f} | {b16:.0f} | {hst:.0f} "
+            f"| {cur / b16:.2f}x | {cur / hst:.2f}x | {exact:.0f}/{rows:.0f} |",
             flush=True,
         )
 
@@ -432,11 +512,12 @@ def main():
     if "dcp" in sections:
         print(f"\n## DCP{args.dcp} rank 0: local top-k + merge (us per 16K chunk)\n")
         print(
-            "| scenario | sub-chunks | current local | bf16 local | local speedup "
-            "| comm MB/rank | comm us (e) | current | bf16 | speedup "
-            "| bf16 == current rows |"
+            "| scenario | sub-chunks | current local | bf16 local | hist local "
+            "| hist merge | local current/hist | comm MB/rank | all-gathers "
+            "| comm us (e) | current | bf16 | hist | current/hist "
+            "| hist exact rows | bf16 == current rows |"
         )
-        print("|" + "---|" * 11)
+        print("|" + "---|" * 16)
         for name, requests in cases:
             bench_dcp(name, requests, inputs, args)
 
@@ -447,10 +528,10 @@ def main():
                 "NCCL (us per 16K chunk, max over ranks)\n"
             )
             print(
-                "| scenario | sub-chunks | current | bf16 | speedup "
-                "| bf16 == current rows (all ranks) |"
+                "| scenario | sub-chunks | current | bf16 | hist | current/bf16 "
+                "| current/hist | hist exact rows (all ranks) |"
             )
-            print("|" + "---|" * 6)
+            print("|" + "---|" * 8)
         for name, requests in cases:
             bench_dist(name, requests, inputs, args)
         dist.destroy_process_group()
