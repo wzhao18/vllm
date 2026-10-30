@@ -50,7 +50,7 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_filter_and_convert_dcp_index,
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
-from vllm.v1.attention.ops.dcp import MLADCPManager
+from vllm.v1.attention.ops.dcp import MLADCPManager, cp_kv_cache_interleave_one
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.ops.shardq import (
     PUSH_ROWS_KERNEL,
@@ -329,6 +329,12 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
             register_warmup,
         )
 
+        # The layers decided at construction (cp_kv_cache_interleave_one);
+        # the interleave is final now.
+        interleave = vllm_config.parallel_config.cp_kv_cache_interleave_size
+        assert interleave == 1, (
+            f"DCP ShardQ needs cp_kv_cache_interleave_size 1, got {interleave}"
+        )
         layout = ContextLayout.from_layer(
             kv_cache_spec, getattr(attention_layer, "indexer", None)
         )
@@ -907,7 +913,7 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
                     and dcp_size == parallel_config.tensor_parallel_size
                     # The gathered context is laid out for interleave 1, in
                     # one workspace that micro-batches would share.
-                    and parallel_config.cp_kv_cache_interleave_size == 1
+                    and cp_kv_cache_interleave_one(vllm_config)
                     and not parallel_config.use_ubatching
                     and current_platform.is_device_capability_family(100)
                 )

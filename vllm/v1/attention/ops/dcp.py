@@ -1031,6 +1031,33 @@ def get_dcp_workspace_max_num_tokens(vllm_config: VllmConfig) -> int:
     )
 
 
+def cp_kv_cache_interleave_one(vllm_config: Any) -> bool:
+    """Whether DCP shards the KV cache token by token (interleave 1) for good.
+
+    Model construction runs before ``VllmConfig.adjust_dcp_kv_cache_interleave_size``
+    finalizes a P/D instance's interleave: the deprecated
+    ``dcp_kv_cache_interleave_size`` still overrides it, and NIXL raises an
+    interleave that was not set explicitly to the block size. Construction-time
+    gates of interleave-1 paths read this instead of the current value.
+    """
+    parallel_config = vllm_config.parallel_config
+    if parallel_config.cp_kv_cache_interleave_size != 1:
+        return False
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    if (
+        parallel_config.decode_context_parallel_size <= 1
+        or kv_transfer_config is None
+        or not kv_transfer_config.is_kv_transfer_instance
+    ):
+        return True
+    if getattr(parallel_config, "dcp_kv_cache_interleave_size", 1) > 1:
+        return False
+    return not (
+        getattr(parallel_config, "_allow_auto_resolve_cp_interleave_size", False)
+        and kv_transfer_config.has_connector("NixlConnector")
+    )
+
+
 def reserve_query_head_storage(
     query: torch.Tensor, padded_num_heads: int
 ) -> torch.Tensor:

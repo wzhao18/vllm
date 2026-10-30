@@ -1029,7 +1029,8 @@ def _layer_worker(rank, world, init_file, cache_dtype, kernel):
     path. Steps with too few prefill tokens or beyond the workspace keep the
     DCP path, the builder counts each path, steps without prefill rows are not
     counted, and a replicated query is ignored. Interleave-64 DCP and
-    disaggregated decode instances keep DCP ShardQ off.
+    disaggregated decode instances keep DCP ShardQ off, as do NIXL prefill
+    instances whose interleave is not set explicitly.
     """
     from tests.v1.attention.utils import create_vllm_config
     from vllm.config import CUDAGraphMode, KVTransferConfig, set_current_vllm_config
@@ -1306,6 +1307,17 @@ def _layer_worker(rank, world, init_file, cache_dtype, kernel):
             )
             decode_attn = _dsa_layer(config, topk_buffer, layer_index=2)
             assert not decode_attn.mla_attn.mla_attn.use_shardq
+            # A NIXL prefill instance raises an interleave left unset to the
+            # block size after construction (cp_kv_cache_interleave_one).
+            config.kv_transfer_config = KVTransferConfig(
+                kv_connector="NixlConnector", kv_role="kv_producer"
+            )
+            config.parallel_config._allow_auto_resolve_cp_interleave_size = True
+            unset_attn = _dsa_layer(config, topk_buffer, layer_index=3)
+            assert not unset_attn.mla_attn.mla_attn.use_shardq
+            config.parallel_config._allow_auto_resolve_cp_interleave_size = False
+            prefill_attn = _dsa_layer(config, topk_buffer, layer_index=4)
+            assert prefill_attn.mla_attn.mla_attn.use_shardq
         finally:
             cleanup_dist_env_and_memory()
 

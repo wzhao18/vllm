@@ -441,12 +441,14 @@ def test_indexer_warmup_includes_pcp_normalized_dcp_key(monkeypatch):
     } == {(False, False), (False, True), (True, False), (True, True)}
 
 
+@pytest.mark.parametrize("interleave", [1, 1024])
 @pytest.mark.parametrize("sparse_mla_shard_q", [False, True])
 def test_indexer_warmup_includes_dcp_shardq_normalized_key(
-    monkeypatch, sparse_mla_shard_q
+    monkeypatch, sparse_mla_shard_q, interleave
 ):
     """DCP ShardQ steps plan their indexer chunks over a gathered, non-DCP
-    context, so they launch the rank 0 / world 1 key."""
+    context, so they launch the rank 0 / world 1 key. DCP ShardQ needs
+    interleave 1; other interleaves compile the DCP key only."""
     monkeypatch.setattr(
         "vllm.v1.attention.backends.mla.indexer.get_dcp_group",
         lambda: SimpleNamespace(rank_in_group=3),
@@ -457,14 +459,15 @@ def test_indexer_warmup_includes_dcp_shardq_normalized_key(
         parallel_config=SimpleNamespace(
             decode_context_parallel_size=8,
             prefill_context_parallel_size=1,
-            cp_kv_cache_interleave_size=1,
+            cp_kv_cache_interleave_size=interleave,
         ),
         attention_config=SimpleNamespace(sparse_mla_shard_q=sparse_mla_shard_q),
     )
 
     keys = BuildPrefillChunkMetadataKernel().get_warmup_keys(config)
 
-    expected = {(2, 2)} | ({(16, 1)} if sparse_mla_shard_q else set())
+    shardq = sparse_mla_shard_q and interleave == 1
+    expected = {(2, 2)} | ({(16, 1)} if shardq else set())
     assert {(key.dcp_rank, key.dcp_world) for key in keys} == expected
 
 

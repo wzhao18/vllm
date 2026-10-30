@@ -275,6 +275,59 @@ def test_get_dcp_local_seq_lens_matches_naive(world: int, interleave: int):
         torch.testing.assert_close(actual, expected)
 
 
+_NIXL_P = {
+    "kv_connector": "MultiConnector",
+    "kv_role": "kv_producer",
+    "kv_connector_extra_config": {
+        "connectors": [{"kv_connector": "NixlConnector", "kv_role": "kv_producer"}]
+    },
+}
+_NIXL_D = {"kv_connector": "NixlConnector", "kv_role": "kv_consumer"}
+_NCCL_PD = {"kv_connector": "P2pNcclConnector", "kv_role": "kv_both"}
+
+
+@pytest.mark.parametrize(
+    ("interleave", "dcp", "kv_transfer", "explicit", "dcp_interleave", "expected"),
+    [
+        (1, 16, None, False, 1, True),
+        (1024, 16, None, True, 1, False),
+        (1, 1, _NIXL_D, False, 1, True),  # no DCP: nothing resolves it
+        (1, 16, _NIXL_D, True, 1, True),
+        (1024, 16, _NIXL_D, True, 1, False),
+        # NIXL raises an interleave left unset to the block size.
+        (1, 16, _NIXL_D, False, 1, False),
+        (1, 8, _NIXL_P, False, 1, False),
+        (1, 8, _NIXL_P, True, 1, True),
+        # The deprecated DCP interleave overrides it on a P/D instance.
+        (1, 8, _NCCL_PD, False, 1, True),
+        (1, 8, _NCCL_PD, True, 64, False),
+    ],
+)
+def test_cp_kv_cache_interleave_one_is_final(
+    interleave, dcp, kv_transfer, explicit, dcp_interleave, expected
+):
+    """Model construction gates interleave-1 paths on the interleave that
+    VllmConfig.adjust_dcp_kv_cache_interleave_size will leave, not on the
+    current value."""
+    from types import SimpleNamespace
+
+    from vllm.config import KVTransferConfig
+    from vllm.v1.attention.ops.dcp import cp_kv_cache_interleave_one
+
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            cp_kv_cache_interleave_size=interleave,
+            decode_context_parallel_size=dcp,
+            dcp_kv_cache_interleave_size=dcp_interleave,
+            _allow_auto_resolve_cp_interleave_size=not explicit,
+        ),
+        kv_transfer_config=(
+            KVTransferConfig(**kv_transfer) if kv_transfer is not None else None
+        ),
+    )
+    assert cp_kv_cache_interleave_one(config) is expected
+
+
 def test_get_dcp_local_seq_lens_can_localize_per_token_bounds():
     seq_lens = torch.tensor([0, 1, 2, 3, 4, 7, 8, 17], dtype=torch.int32)
     world = 4
