@@ -403,7 +403,12 @@ class _StampEcho:
 def test_warm_up_stops_on_a_partner_that_does_not_pair(edits, problem, monkeypatch):
     """The stamp check runs before any geometry-sized message, names both
     sides, and is symmetric: the partner raises too instead of waiting."""
-    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (1, 1))
+    monkeypatch.setattr(
+        torch.accelerator,
+        "get_memory_info",
+        lambda device=None: (1, 1),
+        raising=False,  # CPU-only torch builds lack it
+    )
     table = _Rank(_k31_dsa_specs(64, 2, 1), 2).table
     exchanger = DcpPairExchanger(
         table,

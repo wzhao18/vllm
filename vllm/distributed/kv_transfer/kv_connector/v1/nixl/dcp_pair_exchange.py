@@ -1017,7 +1017,7 @@ class DcpPairExchanger:
                 comes back wrong, or less than 1 GiB of device memory is free.
 
         """
-        free_before = torch.cuda.mem_get_info(self.device)[0]
+        free_before = torch.accelerator.get_memory_info(self.device)[0]
         stamp = self._stamp()
         peer = self._swap_stamps(stamp)
         if problem := _pair_problem(stamp, peer):
@@ -1042,7 +1042,7 @@ class DcpPairExchanger:
         swap_ms = self._time_swaps()
         self._check_scratch(scratch[offset:].cpu().numpy())
         del scratch
-        free_after = torch.cuda.mem_get_info(self.device)[0]
+        free_after = torch.accelerator.get_memory_info(self.device)[0]
 
         pynccl = getattr(self._communicator, "pynccl_comm", None)
         available = getattr(pynccl, "available", False)
