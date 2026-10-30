@@ -3,7 +3,7 @@
 """Metadata dataclasses and helpers for the NIXL connector."""
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds, EngineId
@@ -12,6 +12,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
 )
 from vllm.logger import init_logger
+
+if TYPE_CHECKING:
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.dcp_pair_exchange import (
+        PairUnit,
+    )
 
 logger = init_logger(__name__)
 
@@ -314,6 +319,9 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         # Push mode (P side): newly finished request blocks to be matched
         # against pending D registrations on the P worker.
         self.push_finished_blocks: dict[ReqId, BlockIds] = {}
+        # DCP pair mode (D side): the blocks each finished pull exchanges with
+        # the partner rank, run by finalize_loaded_kv before the next forward.
+        self.reqs_to_pair_exchange: dict[ReqId, list[PairUnit]] = {}
 
     def _add_new_req(
         self,
