@@ -701,6 +701,7 @@ def run_worker(
                 ),
                 # The longest context whose local ids fit the packed words.
                 model_config=SimpleNamespace(max_model_len=world << 17),
+                kv_transfer_config=None,
                 scheduler_config=config.scheduler_config,
                 compilation_config=config.compilation_config,
                 speculative_config=None,

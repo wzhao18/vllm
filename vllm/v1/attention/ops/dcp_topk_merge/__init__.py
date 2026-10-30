@@ -167,8 +167,16 @@ def _init_rescue(vllm_config: Any, topk: int, local_topk: int) -> int:
     _MERGE_MAX_ROWS[(topk, local_topk)] = max_rows
     import vllm.envs as envs
 
-    mailbox = envs.VLLM_DSA_BPRIME_MAILBOX and init_dcp_topk_mailbox(
-        topk, local_topk, group
+    kv_transfer = vllm_config.kv_transfer_config
+    # A prefill-only instance never decodes.
+    mailbox = (
+        envs.VLLM_DSA_BPRIME_MAILBOX
+        and not (
+            kv_transfer is not None
+            and kv_transfer.is_kv_producer
+            and not kv_transfer.is_kv_consumer
+        )
+        and init_dcp_topk_mailbox(topk, local_topk, group)
     )
     if envs.VLLM_DSA_BPRIME_CHECK:
         from vllm.v1.attention.ops.dcp_topk_merge.check import (
