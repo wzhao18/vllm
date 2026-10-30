@@ -3,6 +3,7 @@
 """Base worker-side logic for the NIXL connector."""
 
 import contextlib
+import functools
 import itertools
 import logging
 import math
@@ -11,8 +12,8 @@ import queue
 import threading
 import time
 import uuid
-from collections import defaultdict
-from collections.abc import Iterator
+from collections import Counter, defaultdict, deque
+from collections.abc import Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, TypeGuard, cast
@@ -38,9 +39,17 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorTransferResults,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.kv_fingerprint import (
+    FingerprintGrid,
+    KVFingerprintLog,
+    LayerView,
+    fingerprint_dir,
+    layer_views,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     GET_META_MSG,
     LEASE_QUERY_MSG,
+    KVFingerprintReq,
     NixlAgentMetadata,
     NixlConnectorMetadata,
     NixlHandshakePayload,
@@ -101,6 +110,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
     iter_layer_specs,
 )
+from vllm.v1.metrics import iterlog
 from vllm.v1.worker.utils import select_common_block_size
 
 if TYPE_CHECKING:
@@ -182,6 +192,63 @@ def query_remote_leases(
     return [h is True for h in held]
 
 
+class _PairExchangeTimes:
+    """GPU time of the DCP pair exchange per step, in ``VLLM_ITERLOG_DIR``.
+
+    Writes ``nixl-pair-dcp<rank>-<host>-<pid>.jsonl`` with the iterlog writer
+    (its ``H`` and ``A`` lines, a deque on the hot path): one ``X`` record per
+    step with units. ``k`` counts those steps, ``t_host`` is ``perf_counter``
+    before the exchange, and ``g_exchange`` the GPU milliseconds between events
+    recorded around it (-1 when untimed). A record is written once its end
+    event has completed, polled every step; nothing waits on the events.
+    """
+
+    FIELDS = {"X": "k t_host n_reqs n_units g_exchange"}
+    RING = 64
+
+    def __init__(
+        self,
+        dcp_rank: int,
+        meta: dict[str, Any],
+        new_event: Callable[[], Any] | None = None,
+    ):
+        if new_event is None:
+            new_event = functools.partial(torch.cuda.Event, enable_timing=True)
+        self._writer = iterlog._Writer(f"nixl-pair-dcp{dcp_rank}", self.FIELDS, meta)
+        self._ring = [(new_event(), new_event()) for _ in range(self.RING)]
+        self._pos = 0
+        self._k = 0
+        self._inflight: deque[tuple[list, tuple[Any, Any]]] = deque()
+        self._current: tuple[float, tuple[Any, Any] | None] | None = None
+
+    def begin(self) -> None:
+        self.poll()
+        events = None
+        if len(self._inflight) < self.RING - 1:
+            events = self._ring[self._pos]
+            self._pos = (self._pos + 1) % self.RING
+            events[0].record()
+        self._current = (time.perf_counter(), events)
+
+    def end(self, num_reqs: int, num_units: int) -> None:
+        assert self._current is not None
+        (t_host, events), self._current = self._current, None
+        record = [self._k, t_host, num_reqs, num_units]
+        self._k += 1
+        if events is None:
+            self._writer.put(("X", *record, -1.0))
+            return
+        events[1].record()
+        self._inflight.append((record, events))
+
+    def poll(self) -> None:
+        """Write the records whose exchange has completed on the GPU."""
+        inflight = self._inflight
+        while inflight and inflight[0][1][1].query():
+            record, (start, end) = inflight.popleft()
+            self._writer.put(("X", *record, start.elapsed_time(end)))
+
+
 class NixlBaseConnectorWorker:
     """Base implementation of Worker side methods shared by pull and push."""
 
@@ -222,6 +289,18 @@ class NixlBaseConnectorWorker:
     _pair_group: int | None = None
     _pair_consumed: NixlConnectorMetadata | None = None
     _pair_events: tuple[tuple[NixlConnectorMetadata, torch.cuda.Event], ...] = ()
+    # Pair mode with VLLM_ITERLOG_DIR: each step's exchange GPU time.
+    _pair_times: _PairExchangeTimes | None = None
+
+    # KV fingerprints (VLLM_NIXL_KV_FINGERPRINT, see kv_fingerprint.py): this
+    # rank's log, whose side is P on a producer and D in pair mode, and its
+    # fingerprinted layers per KV cache group. Set by register_kv_caches.
+    _fingerprint_log: KVFingerprintLog | None = None
+    _fingerprint_views: tuple[tuple[int, tuple[LayerView, ...]], ...] = ()
+    # P: requests whose send this rank was told about, so whose fingerprint is
+    # written, and requests D read before that, whose send is held back.
+    _fingerprint_decided: set[ReqId]
+    _fingerprint_held: set[ReqId]
 
     def _compute_desc_ids(
         self,
@@ -940,6 +1019,14 @@ class NixlBaseConnectorWorker:
         self._dcp_pair_exchange = vllm_config.kv_transfer_config.get_from_extra_config(
             "dcp_pair_exchange", False
         )
+        if self._dcp_pair_exchange and self.kv_transfer_config.is_kv_producer:
+            # Its scheduler ignores the flag too, so it emits no pair units.
+            logger.warning(
+                "NIXL dcp_pair_exchange is a decoder (kv_consumer) option: this "
+                "%s instance ignores it and builds no pair exchanger.",
+                self.kv_transfer_config.kv_role,
+            )
+            self._dcp_pair_exchange = False
         # Requests whose read failed with a remote disconnect (retry candidates)
         # -> the generation of the peer's handshake whose endpoints failed.
         self._disconnect_failed_reqs: dict[ReqId, int] = {}
@@ -2242,6 +2329,76 @@ class NixlBaseConnectorWorker:
         )
         if self._dcp_pair_exchange:
             self._build_dcp_pair_exchanger(kv_caches)
+        self._init_kv_fingerprint(kv_caches)
+
+    def _init_kv_fingerprint(self, kv_caches: dict[str, torch.Tensor]) -> None:
+        """With VLLM_NIXL_KV_FINGERPRINT on, open this rank's log: a pull
+        producer logs the KV of each request a decoder pulls from it, a
+        pair-mode decoder each pull's KV after its exchange."""
+        out_dir = fingerprint_dir()
+        if out_dir is None:
+            return
+        if self._pair_exchanger is not None:
+            side, p_dcp_size = "D", self.dcp_size // 2
+        elif self._TRANSFER_MODE == "pull" and self.kv_transfer_config.is_kv_producer:
+            side, p_dcp_size = "P", self.dcp_size
+        else:
+            return
+        draft = self._draft_layer_names()
+        views = layer_views(
+            kv_caches,
+            self._layer_specs,
+            self.vllm_config.compilation_config.static_forward_context,
+            draft,
+        )
+        if not views:
+            logger.warning(
+                "NIXL KV fingerprint: no DCP-sharded attention layer to log."
+            )
+            return
+        block_sizes = {self._layer_specs[view.name].block_size for view in views}
+        if len(block_sizes) != 1:
+            raise ValueError(
+                f"NIXL KV fingerprint: layers of block sizes {sorted(block_sizes)}"
+            )
+        group_of = {
+            name: g
+            for g, group in enumerate(self.kv_cache_config.kv_cache_groups)
+            for name in group.layer_names
+        }
+        by_group: dict[int, list[LayerView]] = defaultdict(list)
+        for view in views:
+            by_group[group_of[view.name]].append(view)
+        self._fingerprint_views = tuple(
+            (g, tuple(group_views)) for g, group_views in sorted(by_group.items())
+        )
+        grid = FingerprintGrid(p_dcp_size, 2 * p_dcp_size, block_sizes.pop())
+        self._fingerprint_log = KVFingerprintLog(
+            out_dir, side, self.dcp_rank, grid, self.engine_id
+        )
+        if side == "P":
+            self._fingerprint_decided = set()
+            self._fingerprint_held = set()
+        logger.info(
+            "NIXL KV fingerprint: %s DCP rank %d logs %d layers (%d of the "
+            "drafter) of KV cache groups %s to %s.",
+            side,
+            self.dcp_rank,
+            len(views),
+            sum(view.draft for view in views),
+            sorted(by_group),
+            self._fingerprint_log.path,
+        )
+
+    def _draft_layer_names(self) -> set[str]:
+        """The drafter's layers, as the model runner marks them: on their KV
+        cache specs, or on the layers themselves."""
+        layers = self.vllm_config.compilation_config.static_forward_context
+        return {
+            name
+            for name, spec in self._layer_specs.items()
+            if spec.is_draft or getattr(layers.get(name), "is_draft_layer", False)
+        }
 
     def _build_dcp_pair_exchanger(self, kv_caches: dict[str, torch.Tensor]) -> None:
         """Check pair mode's geometry on the registered caches, then build the
@@ -2260,6 +2417,7 @@ class NixlBaseConnectorWorker:
                 "NIXL dcp_pair_exchange_chunk_units must be a positive integer, "
                 f"got {chunk_units!r}."
             )
+        device = kv_caches[regions[0].layer_name].device
         exchanger = dcp_pair_exchange.build_dcp_pair_exchanger(
             regions,
             index_kernel_rows=index_kernel_rows,
@@ -2271,13 +2429,46 @@ class NixlBaseConnectorWorker:
                 regions[0].spec.block_size,
                 self.vllm_config.parallel_config.cp_kv_cache_interleave_size,
             ),
-            device=kv_caches[regions[0].layer_name].device,
+            device=device,
             chunk_units=chunk_units,
+        )
+        table = exchanger.table
+        arrays = Counter((array.kind.value, array.width) for array in table.arrays)
+        draft = self._draft_layer_names()
+        # What a deployment exchanges, to check against the model: the regions
+        # per transfer group and the drafter's pages among them.
+        logger.info(
+            "NIXL DCP pair exchange, DCP rank %d: %d NIXL regions (per transfer "
+            "group, -1 shared: %s); %d drafter layers; group %d exchanges %d "
+            "layer pages (%d of the drafter); row table: %d-row blocks %d B "
+            "apart, arrays %s, %d B per unit half, %d units per NCCL round.",
+            self.dcp_rank,
+            self.num_regions,
+            dict(sorted(Counter(self.region_group_ids).items())),
+            len(draft),
+            group,
+            len(regions),
+            sum(region.layer_name in draft for region in regions),
+            table.block_size,
+            table.block_stride,
+            ", ".join(f"{n} x {kind} {width} B" for (kind, width), n in arrays.items()),
+            table.half_bytes,
+            chunk_units,
         )
         # On every rank: checks the partner and logs the buffers and memory.
         exchanger.warm_up()
         self._pair_exchanger = exchanger
         self._pair_group = group
+        if iterlog.ITERLOG_DIR is not None and device.type == "cuda":
+            self._pair_times = _PairExchangeTimes(
+                self.dcp_rank,
+                {
+                    "dcp_rank": self.dcp_rank,
+                    "partner": exchanger.layout.partner,
+                    "half_bytes": table.half_bytes,
+                    "chunk_units": chunk_units,
+                },
+            )
 
     def _dcp_pair_regions(
         self, kv_caches: dict[str, torch.Tensor]
@@ -4144,6 +4335,10 @@ class NixlBaseConnectorWorker:
 
         # Handle timeout to avoid stranding blocks on remote.
         self._reap_expired_send_leases(done_sending)
+        if self._fingerprint_log is not None and self._fingerprint_log.side == "P":
+            done_sending = self._release_logged_sends(done_sending)
+        if self._pair_times is not None:
+            self._pair_times.poll()
 
         self._cleanup_remote_engines()
         return KVConnectorTransferResults(
@@ -4160,10 +4355,77 @@ class NixlBaseConnectorWorker:
 
     def finalize_loaded_kv(self, metadata: NixlConnectorMetadata) -> None:
         """Run this step's DCP pair exchanges, before the model runner zeroes
-        new blocks, applies copy-on-write copies and runs the forward."""
+        new blocks, applies copy-on-write copies and runs the forward. With KV
+        fingerprints on, log the pulls that ended right after them."""
         if metadata.reqs_to_pair_exchange:
             self.run_pair_exchanges(metadata)
             self._pair_consumed = metadata
+        if metadata.fingerprint_pulls and self._fingerprint_log is not None:
+            self._log_fingerprints(metadata.fingerprint_pulls)
+
+    def log_send_fingerprints(self, metadata: NixlConnectorMetadata) -> None:
+        """P with KV fingerprints on: log the requests whose KV D will pull,
+        in the step after request_finished, and let this step report their
+        sends (see _release_logged_sends)."""
+        log = self._fingerprint_log
+        if log is None or log.side != "P":
+            return
+        if metadata.fingerprint_sends:
+            self._log_fingerprints(metadata.fingerprint_sends)
+        # The scheduler sends a request's fingerprint with its reqs_to_send.
+        self._fingerprint_decided.update(metadata.reqs_to_send)
+
+    def _log_fingerprints(self, reqs: dict[ReqId, KVFingerprintReq]) -> None:
+        """Log each request's KV per KV cache group: its block table from its
+        prefix hit ``m`` on, holding tokens ``[m * B * DCP, L)`` on this
+        rank. A failed record is reported, never raised: the comparator then
+        finds the request's cells missing."""
+        log = self._fingerprint_log
+        assert log is not None
+        # The sums are read back to the host: a sync, debug runs only.
+        with gpu_sync_allowed():
+            for local_id, req in reqs.items():
+                try:
+                    if not req.exchanged:
+                        log.log_unexchanged(
+                            req.req_id,
+                            req.num_tokens,
+                            req.first_block,
+                            "no exchange plan emitted",
+                            extra={"local_req": local_id},
+                        )
+                        continue
+                    for group, views in self._fingerprint_views:
+                        log.log_request(
+                            req.req_id,
+                            views,
+                            req.block_ids[group][req.first_block :],
+                            req.num_tokens,
+                            first_block=req.first_block,
+                            extra={"group": group, "local_req": local_id},
+                        )
+                except Exception:
+                    logger.exception(
+                        "NIXL KV fingerprint of request %s (%s) failed.",
+                        local_id,
+                        req.req_id,
+                    )
+
+    def _release_logged_sends(self, done_sending: set[str]) -> set[str]:
+        """P with KV fingerprints on: report a send only once this rank
+        processed the metadata announcing it, so after its fingerprint.
+
+        D can read and notify first, since async scheduling lets P lag, and
+        reporting the send then would free the blocks the fingerprint reads.
+        Holding it only delays that free: the scheduler answers D's lease
+        queries as held until the send is reported, and the lease timer and
+        heartbeats only extend requests whose reads have not all ended.
+        """
+        pending = self._fingerprint_held | done_sending
+        done = pending & self._fingerprint_decided
+        self._fingerprint_held = pending - done
+        self._fingerprint_decided -= done
+        return done
 
     def check_pair_exchanges_ran(self, metadata: NixlConnectorMetadata) -> None:
         """Stop before the forward if this step's DCP pair exchanges did not
@@ -4198,7 +4460,12 @@ class NixlBaseConnectorWorker:
                 f"{self._pair_group}."
             )
         if units:
+            times = self._pair_times
+            if times is not None:
+                times.begin()
             exchanger.exchange(units)
+            if times is not None:
+                times.end(len(metadata.reqs_to_pair_exchange), len(units))
             self._pair_events += ((metadata, exchanger.record_event()),)
 
     def _drain_pair_events(self, metadata: NixlConnectorMetadata) -> None:

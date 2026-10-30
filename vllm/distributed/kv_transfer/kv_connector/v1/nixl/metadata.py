@@ -296,6 +296,28 @@ class ReqMeta:
     unwritten_blocks: dict[int, list[int]] | None = None
 
 
+@dataclass
+class KVFingerprintReq:
+    """One request's KV to fingerprint; sent only with VLLM_NIXL_KV_FINGERPRINT
+    on (see kv_fingerprint.py)."""
+
+    # P's request id, which joins P's and D's records.
+    req_id: ReqId
+    # The request's own blocks per KV cache group: on D its block table from
+    # the KV cache manager, never the pair plan's units; on P the blocks
+    # request_finished receives.
+    block_ids: BlockIds
+    # L: the tokens P computed (P) or D loads (D).
+    num_tokens: int
+    # D: its prefix-cache hit in blocks, from its hit in tokens; the record
+    # starts at that block.
+    first_block: int = 0
+    # D: False for a pull that ended without its plan being emitted. Logged
+    # without cells, so the comparator reports the request's cells missing on
+    # D rather than listing it as P only.
+    exchanged: bool = True
+
+
 class NixlConnectorMetadata(KVConnectorMetadata):
     def __init__(self):
         self.reqs_to_recv: dict[ReqId, ReqMeta] = {}
@@ -322,6 +344,12 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         # DCP pair mode (D side): the blocks each finished pull exchanges with
         # the partner rank, run by finalize_loaded_kv before the next forward.
         self.reqs_to_pair_exchange: dict[ReqId, list[PairUnit]] = {}
+        # KV fingerprints (VLLM_NIXL_KV_FINGERPRINT only). P side: requests
+        # whose KV D will pull, logged before they are reported sent.
+        self.fingerprint_sends: dict[ReqId, KVFingerprintReq] = {}
+        # D side, pair mode: pulls that ended, logged after this step's
+        # exchanges.
+        self.fingerprint_pulls: dict[ReqId, KVFingerprintReq] = {}
 
     def _add_new_req(
         self,

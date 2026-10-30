@@ -385,6 +385,8 @@ class NixlPullConnector(NixlBaseConnector):
         assert self.connector_worker is not None
         assert isinstance(self.connector_worker, NixlPullConnectorWorker)
         assert isinstance(self._connector_metadata, NixlConnectorMetadata)
+        # Before this step's get_transfer_results may report the sends.
+        self.connector_worker.log_send_fingerprints(self._connector_metadata)
         self.connector_worker.start_load_kv(self._connector_metadata)
 
     def finalize_loaded_kv(self, metadata: KVConnectorMetadata) -> None:

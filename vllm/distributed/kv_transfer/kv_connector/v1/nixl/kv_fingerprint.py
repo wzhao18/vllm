@@ -24,22 +24,25 @@ exchanger's row tables: one row per token for MLA and drafter pages, and the
 indexer's 64-row kernel pages, which hold the rows' fp8 values, then one
 4-byte scale per row.
 
-Call sites (wired by the scheduler and exchanger stages), with views from
-``layer_views`` built once the caches are registered, and the grid
-``FingerprintGrid(dcp_p, dcp_d, block_size)`` (P passes ``dcp_d = 2 * dcp_p``):
+Call sites: the scheduler sends ``KVFingerprintReq``s (metadata.py) and each
+rank logs them with views from ``layer_views``, built when its caches are
+registered, and the grid ``FingerprintGrid(dcp_p, dcp_d, block_size)`` (P
+passes ``dcp_d = 2 * dcp_p``):
 
-- D, pair mode: in ``run_pair_exchanges``, right after the exchange, for each
-  request of ``reqs_to_pair_exchange`` and each KV cache group ``g``:
-  ``log_request(remote_request_id, views of g, table[m:], num_tokens=L,
-  first_block=m)``. ``table`` is the request's block table of ``g`` as the
-  attention kernels read it, and ``m`` its local prefix hit in tokens divided
-  by ``block_size * dcp_d``. Neither may come from the pair plan: its units and
+- D, pair mode: in ``finalize_loaded_kv``, right after the step's exchanges,
+  for each pull that ended (``fingerprint_pulls``) and each KV cache group
+  ``g``: ``log_request(remote_request_id, views of g, table[m:], num_tokens=L,
+  first_block=m)``. ``table`` is the request's block table of ``g`` from the KV
+  cache manager, and ``m`` its local prefix hit in tokens divided by
+  ``block_size * dcp_d``. Neither may come from the pair plan: its units and
   ``m_g`` also place the reads, so a wrong ``2m`` offset or unit list would
-  label the rows it misplaced with their own tokens and pass.
-- P: in the worker step after ``request_finished``, from a list the scheduler
-  emits, before the blocks can be reported in ``finished_sending``:
-  ``log_request(request_id, views of g, block ids of g, num_tokens=
-  remote_num_tokens)``, with the block ids ``request_finished`` receives.
+  label the rows it misplaced with their own tokens and pass. A pull that ended
+  without its plan being emitted is logged by ``log_unexchanged``.
+- P: in ``start_load_kv`` of the step after ``request_finished``
+  (``fingerprint_sends``): ``log_request(request_id, views of g, block ids of
+  g, num_tokens=remote_num_tokens)``, with the block ids ``request_finished``
+  receives. The worker holds such a request's ``finished_sending`` until that
+  step, so its blocks cannot be freed first.
 
 Logging synchronizes with the device to read the sums back. On D that also
 completes the exchange before the step posts its READs, so a fingerprinted run
@@ -416,6 +419,47 @@ class KVFingerprintLog:
             self.dcp_rank,
             first_block,
         )
+        fp = [
+            {
+                "layer": view.name,
+                "field": field,
+                "draft": view.draft,
+                "f": [f"{v:016x}" for v in fingerprints[view.name, field]],
+            }
+            for view in views
+            for field in view.fields
+        ]
+        return self._append(
+            req_id, num_tokens, first_block, block_ids, cells, fp, extra
+        )
+
+    def log_unexchanged(
+        self,
+        req_id: str,
+        num_tokens: int,
+        first_block: int,
+        reason: str,
+        extra: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Appends the record of a pull that ended without its exchange.
+
+        It has no cells: the comparator then reports every cell of the request
+        missing on D, rather than listing the request as P only (aborted, or
+        recomputed after a failed pull), which logs nothing on D.
+        """
+        extra = {"exchanged": False, "reason": reason, **(extra or {})}
+        return self._append(req_id, num_tokens, first_block, [], [], [], extra)
+
+    def _append(
+        self,
+        req_id: str,
+        num_tokens: int,
+        first_block: int,
+        block_ids: Sequence[int],
+        cells: list[tuple[int, int, int]],
+        fp: list[dict[str, Any]],
+        extra: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
         record = {
             "v": RECORD_VERSION,
             "side": self.side,
@@ -427,16 +471,7 @@ class KVFingerprintLog:
             "first_block": int(first_block),
             "block_ids": [int(b) for b in block_ids],
             "cells": cells,
-            "fp": [
-                {
-                    "layer": view.name,
-                    "field": field,
-                    "draft": view.draft,
-                    "f": [f"{v:016x}" for v in fingerprints[view.name, field]],
-                }
-                for view in views
-                for field in view.fields
-            ],
+            "fp": fp,
             "time": time.time(),
             **({"extra": dict(extra)} if extra else {}),
         }

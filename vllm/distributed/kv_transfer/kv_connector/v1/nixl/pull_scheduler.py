@@ -14,6 +14,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.dcp_pair_exchange import 
     check_pair_coverage,
     pair_units,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    KVFingerprintReq,
+)
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
@@ -175,7 +178,11 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
                         and num_external_tokens > 0
                     ):
                         self._plan_pair_exchange(
-                            request, local_block_ids, local_num_computed_blocks
+                            request,
+                            blocks,
+                            local_block_ids,
+                            local_num_computed_blocks,
+                            num_external_tokens,
                         )
 
                     # Get unhashed blocks to pull from remote. Mind that a full prefix
@@ -204,8 +211,10 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
     def _plan_pair_exchange(
         self,
         request: "Request",
+        blocks: "KVCacheBlocks",
         local_block_ids: BlockIds,
         local_num_computed_blocks: tuple[int, ...],
+        num_external_tokens: int,
     ) -> None:
         """DCP pair mode: record the blocks partner ranks exchange once every
         rank has pulled ``request`` from a prefiller with half this DCP size.
@@ -232,8 +241,11 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             # An equal DCP size needs no exchange; the handshake rejects others.
             return
         remote_block_ids = params["remote_block_ids"]
+        num_tokens = self._get_remote_prefill_token_count(
+            len(request.prompt_token_ids or [])
+        )
         check_pair_coverage(
-            self._get_remote_prefill_token_count(len(request.prompt_token_ids or [])),
+            num_tokens,
             params.get("remote_num_tokens"),
             remote_block_ids,
             self._pair_groups,
@@ -246,6 +258,16 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             self._pair_groups,
         ):
             self._pair_plans[request.request_id] = units
+        if self._fingerprint:
+            # The request's own blocks, and its hit from the token counts: a
+            # plan with a wrong 2m offset must not shift the logged tokens too.
+            self._fingerprint_pulls[request.request_id] = KVFingerprintReq(
+                req_id=params["remote_request_id"],
+                block_ids=blocks.get_block_ids(),
+                num_tokens=num_tokens,
+                first_block=(num_tokens - num_external_tokens)
+                // (self.block_size * dcp_size),
+            )
 
     def request_finished(
         self,
@@ -262,6 +284,9 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             # when its pull ends, or at once, so its exchange must not run.
             self._pair_plans.pop(request.request_id, None)
             self._pair_ready.pop(request.request_id, None)
+            if self._fingerprint:
+                self._fingerprint_pulls.pop(request.request_id, None)
+                self._fingerprint_pulls_ready.pop(request.request_id, None)
 
         params = request.kv_transfer_params
         logger.debug(
@@ -339,6 +364,14 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
                 # released.
                 lease_deadline = self._reqs_need_send[request.request_id]
                 self._hold_send_lease(request.request_id)
+                if self._fingerprint:
+                    # Sent with reqs_to_send; the workers log it before they
+                    # report it sent.
+                    self._fingerprint_sends[request.request_id] = KVFingerprintReq(
+                        req_id=request.request_id,
+                        block_ids=tuple(list(group) for group in block_ids),
+                        num_tokens=request.num_computed_tokens,
+                    )
             # NOTE HMA will "mark" empty/null blocks in groups with 0s (eg SWA ones),
             # trimming down after allocating for the whole sequence length. Empty
             # blocks are always at the start of the list.
