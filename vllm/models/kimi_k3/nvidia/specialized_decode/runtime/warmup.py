@@ -68,6 +68,7 @@ def warm_sampling(vllm_config, model) -> None:
     from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected
     from vllm.v1.worker.gpu.sample.gumbel import apply_temperature
     from vllm.v1.worker.gpu.spec_decode.rejection_sampler import gather_draft_sampled
+    from vllm.v1.worker.gpu.spec_decode.draft_logits import DraftLogitsCache
     from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
         greedy_verify,
         rejection_sample,
@@ -80,9 +81,13 @@ def warm_sampling(vllm_config, model) -> None:
     rates = _rates(spec, device)
     block = spec.rejection_sample_method == "block"
     use_fp64 = vllm_config.model_config.use_fp64_gumbel
-    draft_logits = None
+    # The stock rejection sampler takes the cache; the sampled verifier its tensor.
+    draft_cache = draft_logits = None
     if spec.draft_sample_method == "probabilistic":
-        draft_logits = torch.zeros((1, steps, vocab), dtype=dtype, device=device)
+        draft_cache = DraftLogitsCache(
+            1, steps, vocab, dtype=dtype, fill=0.0, device=device
+        )
+        draft_logits = draft_cache.values
     temperature = torch.ones(1, dtype=torch.float32, device=device)
     seeds = torch.full((1,), 17, dtype=torch.int64, device=device)
     prefill_len = torch.zeros(1, dtype=torch.int32, device=device)
@@ -107,7 +112,7 @@ def warm_sampling(vllm_config, model) -> None:
             )
             _, num_sampled = rejection_sample(
                 logits,
-                draft_logits,
+                draft_cache,
                 drafts,
                 b["cu_num_logits"],
                 pos,
