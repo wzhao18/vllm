@@ -21,19 +21,32 @@ A unit without a partner (no P block ``2j + 1``) zero-fills rows ``[B/2, B)``
 on both ranks.
 
 This module holds the plan shared by the scheduler, the worker and the tests;
-the row tables addressing every exchanged row of a packed KV block; and a torch
-reference of the exchange, the oracle of the tests.
+the row tables addressing every exchanged row of a packed KV block; a torch
+reference of the exchange, the oracle of the tests; and the D rank's exchanger,
+which runs it with Triton kernels and one NCCL round per chunk of units.
 """
 
 import enum
+import hashlib
+import os
+import socket
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
+import torch.distributed
 
+from vllm.distributed.parallel_state import get_dcp_group
+from vllm.logger import init_logger
+from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
+from vllm.utils.torch_utils import async_tensor_h2d, current_stream
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec, SparseCacheRole
+
+logger = init_logger(__name__)
 
 # KV cache dtypes whose MLA pages are token-major rows of w bytes.
 _ROW_KV_CACHE_DTYPES = ("fp8", "fp8_e4m3", "fp8_ds_mla")
@@ -599,3 +612,651 @@ def reference_zero_pages(
     for array in table.arrays:
         view = _array_view(buf, table, array, max(block_ids) + 1)
         view[torch.as_tensor(block_ids, device=buf.device)] = 0
+
+
+# ----------------------------------------------------------------------------
+# Exchanger: Triton pack/unpack and one NCCL round with the partner per chunk
+# ----------------------------------------------------------------------------
+
+# Vectors one program moves for one array of one unit, and its warps.
+_TILE_VECTORS = 512
+_NUM_WARPS = 4
+# Warm-up fails startup below this much free device memory.
+_MIN_FREE_BYTES = 1 << 30
+# One-unit NCCL swaps timed at warm-up; the fastest is logged.
+_TIMED_SWAPS = 3
+_STAMP_MAGIC = int.from_bytes(b"NIXLPAIR", "big")
+# Settings that decide NCCL's transport between the partners.
+_NCCL_TRANSPORT_ENV = (
+    "NCCL_MNNVL_ENABLE",
+    "NCCL_P2P_DISABLE",
+    "NCCL_P2P_LEVEL",
+    "NCCL_NET",
+    "NCCL_IB_DISABLE",
+    "NCCL_SHM_DISABLE",
+    "NCCL_CUMEM_ENABLE",
+    "NCCL_NVLS_ENABLE",
+)
+
+
+@triton.jit
+def _pair_row_offsets(
+    block_offset,
+    subpage_stride,
+    row,
+    column,
+    WIDTH: tl.constexpr,
+    ROWS_PER_SUBPAGE: tl.constexpr,
+):
+    """int64 offsets, from the array page of block 0, of byte ``column`` of
+    ``row`` in the block ``block_offset`` bytes further."""
+    subpage = (row // ROWS_PER_SUBPAGE).to(tl.int64)
+    within = (row % ROWS_PER_SUBPAGE) * WIDTH + column
+    return block_offset + subpage * subpage_stride + within.to(tl.int64)
+
+
+@triton.jit
+def _pair_rows_kernel(
+    units_ptr,  # [n, 2] int64: block id, has partner
+    arrays_ptr,  # [num_arrays, 3] int64: page address, sub-page stride, H offset
+    keep_ptr,  # [K, H] uint8
+    other_ptr,  # [K, H] uint8: send when packing, recv when unpacking
+    block_stride,
+    half_bytes,
+    PACK: tl.constexpr,
+    PARITY: tl.constexpr,
+    WIDTH: tl.constexpr,
+    VEC: tl.constexpr,
+    ROWS_PER_SUBPAGE: tl.constexpr,
+    HALF: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    """Pack or unpack ``TILE`` vectors of ``VEC`` bytes of one array of one
+    unit's block. Packing gathers rows ``2y + c`` into ``keep`` and ``2y + 1 -
+    c`` into ``send``; unpacking writes ``keep`` to rows ``HALF * c + y``,
+    ``recv`` to rows ``HALF * (1 - c) + y``, and zeros to rows ``[HALF, 2 *
+    HALF)`` of a unit without partner. Page addresses are absolute int64, as in
+    ``_zero_kv_blocks_kernel``."""
+    unit = tl.program_id(0)
+    array = tl.program_id(1)
+    VECTORS_PER_ROW: tl.constexpr = WIDTH // VEC
+    NUM_VECTORS: tl.constexpr = HALF * VECTORS_PER_ROW
+    vector = tl.program_id(2) * TILE + tl.arange(0, TILE)
+    mask = (vector < NUM_VECTORS)[:, None]
+    y = vector // VECTORS_PER_ROW
+    column = (vector % VECTORS_PER_ROW) * VEC
+    lanes = tl.arange(0, VEC)[None, :]
+
+    page = tl.load(arrays_ptr + array * 3)
+    page = tl.multiple_of(tl.cast(page, tl.pointer_type(tl.uint8)), VEC)
+    subpage_stride = tl.load(arrays_ptr + array * 3 + 1)
+    block_offset = tl.load(units_ptr + unit * 2) * block_stride
+    buffer = unit.to(tl.int64) * half_bytes + tl.load(arrays_ptr + array * 3 + 2)
+    buffer = tl.multiple_of(buffer + vector.to(tl.int64) * VEC, VEC)[:, None] + lanes
+    if PACK:
+        keep_row = 2 * y + PARITY
+        other_row = 2 * y + 1 - PARITY
+    else:
+        keep_row = HALF * PARITY + y
+        other_row = HALF * (1 - PARITY) + y
+    keep_rows = _pair_row_offsets(
+        block_offset, subpage_stride, keep_row, column, WIDTH, ROWS_PER_SUBPAGE
+    )
+    keep_rows = page + tl.multiple_of(keep_rows, VEC)[:, None] + lanes
+    other_rows = _pair_row_offsets(
+        block_offset, subpage_stride, other_row, column, WIDTH, ROWS_PER_SUBPAGE
+    )
+    other_rows = page + tl.multiple_of(other_rows, VEC)[:, None] + lanes
+
+    if PACK:
+        tl.store(keep_ptr + buffer, tl.load(keep_rows, mask=mask), mask=mask)
+        tl.store(other_ptr + buffer, tl.load(other_rows, mask=mask), mask=mask)
+    else:
+        # Half 1 comes from P block 2j + 1, which a unit without partner lacks.
+        has_partner = tl.load(units_ptr + unit * 2 + 1)
+        half_1 = (vector < has_partner * NUM_VECTORS)[:, None]
+        if PARITY == 0:
+            keep_mask = mask
+            other_mask = half_1
+        else:
+            keep_mask = half_1
+            other_mask = mask
+        keep = tl.load(keep_ptr + buffer, mask=keep_mask, other=0)
+        tl.store(keep_rows, keep, mask=mask)
+        other = tl.load(other_ptr + buffer, mask=other_mask, other=0)
+        tl.store(other_rows, other, mask=mask)
+
+
+@dataclass(frozen=True)
+class _RowClass:
+    """Arrays of one row width and sub-page height, moved by one launch per
+    chunk."""
+
+    width: int
+    rows_per_subpage: int
+    vector_bytes: int
+    tile: int
+    num_tiles: int
+    arrays: torch.Tensor
+    """``[num_arrays, 3]`` int64: address of the array in block 0, sub-page
+    stride, and offset of the array's half rows in a unit's ``H`` bytes."""
+
+    @property
+    def num_arrays(self) -> int:
+        return self.arrays.shape[0]
+
+    def rebased(self, delta: int) -> "_RowClass":
+        """The class with its arrays ``delta`` bytes further."""
+        arrays = self.arrays.clone()
+        arrays[:, 0] += delta
+        return replace(self, arrays=arrays)
+
+
+def _vector_bytes(*values: int) -> int:
+    """The widest copy, of 16, 8 or 4 bytes, that every value is a multiple
+    of; 0 if none."""
+    return next((v for v in (16, 8, 4) if all(x % v == 0 for x in values)), 0)
+
+
+def _row_classes(table: PairRowTable, device: torch.device) -> list[_RowClass]:
+    """The table's arrays grouped by row width and sub-page height."""
+    members: dict[tuple[int, int], list[tuple[PairRowArray, int]]] = {}
+    for array, (start, _) in zip(table.arrays, table.segments()):
+        key = (array.width, array.rows_per_subpage)
+        members.setdefault(key, []).append((array, start))
+    classes = []
+    for (width, rows), arrays in members.items():
+        entries = [
+            (table.base_addr + a.page_offset + a.offset, a.subpage_stride, start)
+            for a, start in arrays
+        ]
+        vector_bytes = _vector_bytes(
+            table.block_stride,
+            table.half_bytes,
+            width,
+            *(value for entry in entries for value in entry),
+        )
+        if not vector_bytes:
+            raise NixlPairModeError(
+                f"DCP pair exchange: the {width}-byte rows of layers "
+                f"{sorted({a.layer_name for a, _ in arrays})} are not 4-byte aligned"
+            )
+        vectors = table.block_size // 2 * width // vector_bytes
+        tile = min(_TILE_VECTORS, 1 << (vectors - 1).bit_length())
+        classes.append(
+            _RowClass(
+                width=width,
+                rows_per_subpage=rows,
+                vector_bytes=vector_bytes,
+                tile=tile,
+                num_tiles=cdiv(vectors, tile),
+                arrays=torch.tensor(entries, dtype=torch.int64, device=device),
+            )
+        )
+    return classes
+
+
+def _unit_rows(units: Sequence[PairUnit]) -> np.ndarray:
+    """``[n, 2]`` int64 (block id, has partner) of each unit, for the kernels."""
+    rows = [(u.block_id, u.has_partner) for u in units]
+    return np.array(rows, dtype=np.int64).reshape(-1, 2)
+
+
+def _p2p_op(op: Any, tensor: torch.Tensor, peer: int) -> torch.distributed.P2POp:
+    """A P2P op for a device communicator. As in elastic_execute.py, it skips
+    ``P2POp.__init__``, which needs a torch process group: PyNccl reads only
+    the op, the tensor and the group peer."""
+    p2p = object.__new__(torch.distributed.P2POp)
+    p2p.op, p2p.tensor, p2p.group_peer = op, tensor, peer
+    p2p.peer, p2p.group, p2p.tag = peer, None, 0
+    return p2p
+
+
+def _dcp_communicator(layout: PairLayout) -> Any:
+    """The DCP group's device communicator, which must send through PyNccl
+    between the layout's ranks: raw PyNccl returns silently when disabled,
+    while the device communicator raises."""
+    try:
+        group = get_dcp_group()
+    except AssertionError as e:
+        raise NixlPairModeError(
+            "DCP pair exchange: the DCP group is not initialized"
+        ) from e
+    communicator = group.device_communicator
+    pynccl = getattr(communicator, "pynccl_comm", None)
+    if pynccl is None or pynccl.disabled:
+        state = "missing" if pynccl is None else "disabled"
+        raise NixlPairModeError(
+            "DCP pair exchange needs the DCP group's PyNccl communicator, which "
+            f"is {state} (device communicator: {type(communicator).__name__})"
+        )
+    dcp_size = 2 * abs(layout.partner - layout.dcp_rank)
+    if (group.rank_in_group, group.world_size) != (layout.dcp_rank, dcp_size):
+        raise NixlPairModeError(
+            f"DCP pair exchange: DCP rank {layout.dcp_rank} of {dcp_size} is rank "
+            f"{group.rank_in_group} of {group.world_size} in the DCP group"
+        )
+    return communicator
+
+
+def _digest(text: str) -> int:
+    """A 63-bit hash of ``text``, the same in every process."""
+    return int.from_bytes(hashlib.sha256(text.encode()).digest()[:8], "big") >> 1
+
+
+def _fill_byte(dcp_rank: int) -> int:
+    """The non-zero byte a rank fills its warm-up scratch block with."""
+    return dcp_rank % 255 + 1
+
+
+class _Stamp(NamedTuple):
+    """What a rank tells its partner at warm-up, as int64 words."""
+
+    magic: int
+    dcp_rank: int
+    partner: int
+    parity: int
+    block_size: int
+    block_stride: int
+    half_bytes: int
+    chunk_units: int
+    num_arrays: int
+    signature: int
+    host: int
+
+    @property
+    def geometry(self) -> tuple[int, ...]:
+        """The fields partners must share."""
+        return (
+            self.block_size,
+            self.block_stride,
+            self.half_bytes,
+            self.chunk_units,
+            self.num_arrays,
+            self.signature,
+        )
+
+    def describe(self) -> str:
+        return (
+            f"DCP rank {self.dcp_rank} (partner {self.partner}, parity "
+            f"{self.parity}; {self.block_size}-row blocks {self.block_stride} B "
+            f"apart, {self.num_arrays} arrays of {self.half_bytes} B per half "
+            f"block, {self.chunk_units} units per round, signature "
+            f"{self.signature:016x})"
+        )
+
+
+def _pair_problem(ours: _Stamp, theirs: _Stamp) -> str | None:
+    """Why two warm-up stamps do not pair, or None. Symmetric, so partners
+    raise together instead of one of them waiting in NCCL."""
+    if ours.magic != _STAMP_MAGIC or theirs.magic != _STAMP_MAGIC:
+        return "a stamp does not come from a DCP pair exchange warm-up"
+    if (ours.partner, theirs.partner) != (theirs.dcp_rank, ours.dcp_rank):
+        return "the ranks are not each other's partner"
+    if ours.parity + theirs.parity != 1:
+        return "both ranks keep the same half"
+    if ours.geometry != theirs.geometry:
+        return "their row tables or chunking differ"
+    return None
+
+
+class DcpPairExchanger:
+    """The DCP pair exchange of one D rank.
+
+    Built once the KV caches are registered. ``warm_up`` then runs once on
+    every rank, and ``exchange`` in every step with units, on all ranks of the
+    DCP group with the same units. Each chunk of units is packed (the rows this
+    rank keeps and sends), swapped with the partner in one NCCL round, and
+    unpacked (the blocks rewritten in interleave-1 order), all on the current
+    stream. Packing reads a chunk's every row before unpacking writes any, so
+    the blocks are rewritten in place.
+
+    Args:
+        table: Row table of the rank's DCP-sharded attention group.
+        layout: The rank's row maps; its partner is the NCCL peer.
+        device: The KV cache device.
+        chunk_units: Units per NCCL round, ``K``: ``keep``, ``send`` and
+            ``recv`` are ``[K, H]`` uint8.
+        communicator: Anything with ``batch_isend_irecv(list[P2POp])``. By
+            default the DCP group's device communicator, which raises if its
+            PyNccl is unavailable.
+
+    """
+
+    def __init__(
+        self,
+        table: PairRowTable,
+        layout: PairLayout,
+        device: torch.device,
+        *,
+        chunk_units: int = 4,
+        communicator: Any | None = None,
+    ):
+        if table.block_size != layout.block_size:
+            raise NixlPairModeError(
+                f"DCP pair exchange: {table.block_size}-row blocks, but a layout "
+                f"for {layout.block_size}-row blocks"
+            )
+        if chunk_units < 1:
+            raise ValueError(f"chunk_units must be positive, got {chunk_units}")
+        self.table = table
+        self.layout = layout
+        self.device = torch.device(device)
+        self.chunk_units = chunk_units
+        self._communicator = (
+            _dcp_communicator(layout) if communicator is None else communicator
+        )
+        self._classes = _row_classes(table, self.device)
+        shape = (chunk_units, table.half_bytes)
+        self.keep = torch.empty(shape, dtype=torch.uint8, device=self.device)
+        self.send = torch.empty_like(self.keep)
+        self.recv = torch.empty_like(self.keep)
+
+    @property
+    def signature(self) -> tuple:
+        """What partners must share: the row geometry, in table order (the
+        buffers' layout), and the chunking. Never addresses."""
+        table = self.table
+        arrays = tuple(
+            (
+                a.layer_name,
+                a.kind.value,
+                a.page_offset,
+                a.page_len,
+                a.width,
+                a.rows_per_subpage,
+                a.subpage_stride,
+                a.offset,
+            )
+            for a in table.arrays
+        )
+        return (
+            table.block_size,
+            table.block_stride,
+            table.half_bytes,
+            self.chunk_units,
+            arrays,
+        )
+
+    def exchange(self, units: Sequence[PairUnit]) -> None:
+        """Swap the units' rows with the partner and rewrite their blocks in
+        interleave-1 order, queued on the current stream without a host sync.
+
+        Args:
+            units: The step's units of this rank's group, distinct blocks in
+                metadata order. Every rank of the DCP group passes the same
+                units: each chunk of ``chunk_units`` is one NCCL round with the
+                partner.
+
+        """
+        if units:
+            rows = async_tensor_h2d(_unit_rows(units), self.device, torch.int64)
+            self._run(units, rows, self._classes)
+
+    def record_event(self) -> torch.cuda.Event:
+        """An event on the current stream, after every exchange queued so
+        far."""
+        event = torch.cuda.Event()
+        event.record(current_stream())
+        return event
+
+    def warm_up(self) -> None:
+        """Compile the kernels and check the partner, once on every rank.
+
+        Partners first swap fixed-size stamps of their DCP ranks and
+        signatures, so skewed partners both fail here, naming both sides,
+        before any message whose size depends on the geometry. A scratch block
+        filled with this rank's byte then goes through pack, NCCL and unpack,
+        which compiles every row-width kernel; half ``c`` of each array must
+        come back with this rank's byte and the other half with the partner's.
+        Logs what decides the NCCL transport, the buffer bytes and the free
+        device memory before and after.
+
+        Raises:
+            NixlPairModeError: If the partner does not pair, the scratch block
+                comes back wrong, or less than 1 GiB of device memory is free.
+
+        """
+        free_before = torch.cuda.mem_get_info(self.device)[0]
+        stamp = self._stamp()
+        peer = self._swap_stamps(stamp)
+        if problem := _pair_problem(stamp, peer):
+            raise NixlPairModeError(
+                f"DCP pair exchange: {stamp.describe()} cannot pair with its NCCL "
+                f"peer, {peer.describe()}: {problem}"
+            )
+
+        # The scratch block starts at the table base's offset from 16-byte
+        # alignment, so every row keeps its copy width.
+        offset = self.table.base_addr % 16
+        scratch = torch.full(
+            (offset + self.table.block_stride,),
+            _fill_byte(self.layout.dcp_rank),
+            dtype=torch.uint8,
+            device=self.device,
+        )
+        delta = scratch.data_ptr() + offset - self.table.base_addr
+        unit = [PairUnit(0, 0, True)]
+        rows = async_tensor_h2d(_unit_rows(unit), self.device, torch.int64)
+        self._run(unit, rows, [c.rebased(delta) for c in self._classes])
+        swap_ms = self._time_swaps()
+        self._check_scratch(scratch[offset:].cpu().numpy())
+        del scratch
+        free_after = torch.cuda.mem_get_info(self.device)[0]
+
+        pynccl = getattr(self._communicator, "pynccl_comm", None)
+        available = getattr(pynccl, "available", False)
+        nccl = pynccl.nccl.ncclGetVersion() if available else "unknown"
+        settings = [
+            f"{k}={os.environ[k]}" for k in _NCCL_TRANSPORT_ENV if k in os.environ
+        ]
+        half_mb = self.table.half_bytes / 1e6
+        logger.info(
+            "NIXL DCP pair exchange: DCP rank %d pairs with %d on %s over NCCL %s "
+            "(%s). One unit, %.2f MB each way, swaps in %.3f ms (%.0f GB/s); "
+            "NCCL_DEBUG=INFO shows the transport, which should be P2P over "
+            "multi-node NVLink, not NET/IB. Buffers: 3 x %d units x %.2f MB = "
+            "%.1f MB. Kernels: %s. Free device memory: %.2f GiB before warm-up, "
+            "%.2f GiB after.",
+            stamp.dcp_rank,
+            peer.dcp_rank,
+            "this host" if peer.host == stamp.host else "another host",
+            nccl,
+            ", ".join(settings) or "no NCCL transport settings",
+            half_mb,
+            swap_ms,
+            half_mb / max(swap_ms, 1e-6),
+            self.chunk_units,
+            half_mb,
+            3 * self.chunk_units * half_mb,
+            ", ".join(
+                f"{c.num_arrays} x {c.width} B rows in {c.vector_bytes} B copies"
+                for c in self._classes
+            ),
+            free_before / (1 << 30),
+            free_after / (1 << 30),
+        )
+        if free_after < _MIN_FREE_BYTES:
+            raise NixlPairModeError(
+                f"DCP pair exchange: {free_after / (1 << 30):.2f} GiB of device "
+                "memory is free after warm-up, under 1 GiB"
+            )
+
+    def _run(
+        self,
+        units: Sequence[PairUnit],
+        rows: torch.Tensor,
+        classes: Sequence[_RowClass],
+    ) -> None:
+        """Pack, swap and unpack the units chunk by chunk, ``rows`` being
+        their ``_unit_rows`` on the device."""
+        for start in range(0, len(units), self.chunk_units):
+            chunk = units[start : start + self.chunk_units]
+            chunk_rows = rows[start : start + len(chunk)]
+            self._pack(chunk, chunk_rows, classes)
+            self._communicate(len(chunk))
+            self._unpack(chunk, chunk_rows, classes)
+
+    def _pack(
+        self,
+        units: Sequence[PairUnit],
+        rows: torch.Tensor,
+        classes: Sequence[_RowClass],
+    ) -> None:
+        """Fill ``keep`` and ``send`` for one chunk."""
+        self._launch(True, rows, len(units), self.send, classes)
+
+    def _unpack(
+        self,
+        units: Sequence[PairUnit],
+        rows: torch.Tensor,
+        classes: Sequence[_RowClass],
+    ) -> None:
+        """Rewrite one chunk's blocks from ``keep`` and ``recv``."""
+        self._launch(False, rows, len(units), self.recv, classes)
+
+    def _launch(
+        self,
+        pack: bool,
+        rows: torch.Tensor,
+        num_units: int,
+        other: torch.Tensor,
+        classes: Sequence[_RowClass],
+    ) -> None:
+        for row_class in classes:
+            grid = (num_units, row_class.num_arrays, row_class.num_tiles)
+            _pair_rows_kernel[grid](
+                rows,
+                row_class.arrays,
+                self.keep,
+                other,
+                self.table.block_stride,
+                self.table.half_bytes,
+                PACK=pack,
+                PARITY=self.layout.parity,
+                WIDTH=row_class.width,
+                VEC=row_class.vector_bytes,
+                ROWS_PER_SUBPAGE=row_class.rows_per_subpage,
+                HALF=self.layout.half,
+                TILE=row_class.tile,
+                num_warps=_NUM_WARPS,
+            )
+
+    def _communicate(self, num_units: int) -> None:
+        """Swap the first ``num_units`` rows of ``send`` and ``recv`` with the
+        partner."""
+        peer = self.layout.partner
+        self._communicator.batch_isend_irecv(
+            [
+                _p2p_op(torch.distributed.isend, self.send[:num_units], peer),
+                _p2p_op(torch.distributed.irecv, self.recv[:num_units], peer),
+            ]
+        )
+
+    def _stamp(self) -> _Stamp:
+        return _Stamp(
+            magic=_STAMP_MAGIC,
+            dcp_rank=self.layout.dcp_rank,
+            partner=self.layout.partner,
+            parity=self.layout.parity,
+            block_size=self.table.block_size,
+            block_stride=self.table.block_stride,
+            half_bytes=self.table.half_bytes,
+            chunk_units=self.chunk_units,
+            num_arrays=len(self.table.arrays),
+            signature=_digest(repr(self.signature)),
+            host=_digest(socket.gethostname()),
+        )
+
+    def _swap_stamps(self, stamp: _Stamp) -> _Stamp:
+        send = torch.tensor(stamp, dtype=torch.int64, device=self.device)
+        recv = torch.empty_like(send)
+        peer = self.layout.partner
+        self._communicator.batch_isend_irecv(
+            [
+                _p2p_op(torch.distributed.isend, send, peer),
+                _p2p_op(torch.distributed.irecv, recv, peer),
+            ]
+        )
+        return _Stamp(*recv.tolist())
+
+    def _time_swaps(self) -> float:
+        """Milliseconds of the fastest of a few one-unit NCCL swaps."""
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        best = float("inf")
+        for _ in range(_TIMED_SWAPS):
+            start.record(current_stream())
+            self._communicate(1)
+            end.record(current_stream())
+            end.synchronize()
+            best = min(best, start.elapsed_time(end))
+        return best
+
+    def _check_scratch(self, scratch: np.ndarray) -> None:
+        """Raise unless the exchanged scratch block holds the partner's byte
+        exactly in the rows ``recv`` fills, and this rank's byte elsewhere."""
+        expected = np.full_like(scratch, _fill_byte(self.layout.dcp_rank))
+        _, recv_rows = self.layout.unpack_rows()
+        for array in self.table.arrays:
+            starts = self.table.row_offsets(array, [0], recv_rows)[0]
+            expected[starts[:, None] + np.arange(array.width)] = _fill_byte(
+                self.layout.partner
+            )
+        wrong = np.flatnonzero(scratch != expected)
+        if wrong.size:
+            raise NixlPairModeError(
+                f"DCP pair exchange: the warm-up block of DCP rank "
+                f"{self.layout.dcp_rank} came back with {wrong.size} wrong bytes, "
+                f"the first at offset {wrong[0]}: {scratch[wrong[0]]} instead of "
+                f"{expected[wrong[0]]}"
+            )
+
+
+def build_dcp_pair_exchanger(
+    regions: Sequence[PairRegion],
+    *,
+    index_kernel_rows: int,
+    index_value_bytes: int,
+    layout: PairLayout,
+    device: torch.device,
+    chunk_units: int = 4,
+) -> DcpPairExchanger:
+    """The exchanger of a D rank's DCP-sharded attention group, from its NIXL
+    regions. Not warmed up: every rank calls ``warm_up`` next.
+
+    Indexer pages must have the CUDA fp8 layout: kernel pages of
+    ``index_kernel_rows`` rows that hold their fp8 values, a multiple of 16
+    bytes per row, then one 4-byte scale per row.
+
+    Args:
+        regions: The group's regions, in NIXL region order.
+        index_kernel_rows: Rows per kernel page of the indexer cache.
+        index_value_bytes: fp8 value bytes of an indexer row.
+        layout: The rank's row maps.
+        device: The KV cache device.
+        chunk_units: Units per NCCL round.
+
+    Returns:
+        The exchanger, its communicator the DCP group's.
+
+    """
+    if current_platform.is_rocm():
+        raise NixlPairModeError(
+            "DCP pair exchange supports only the CUDA indexer cache layout"
+        )
+    table = build_pair_row_table(
+        regions,
+        index_kernel_rows=index_kernel_rows,
+        index_value_bytes=index_value_bytes,
+    )
+    for array in table.arrays:
+        if (array.kind is PairArrayKind.INDEX_VALUE and array.width % 16) or (
+            array.kind is PairArrayKind.INDEX_SCALE and array.width != 4
+        ):
+            raise NixlPairModeError(
+                f"DCP pair exchange cannot exchange layer {array.layer_name}: "
+                f"{array.width}-byte {array.kind.value} rows are not the CUDA fp8 "
+                "indexer layout"
+            )
+    return DcpPairExchanger(table, layout, device, chunk_units=chunk_units)
