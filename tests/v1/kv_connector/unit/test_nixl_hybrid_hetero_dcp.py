@@ -5,19 +5,40 @@ e.g. a TP8/DCP8 prefiller feeding a TP16/DCP16 decoder.
 
 MLA KV is DCP-sharded in interleave-sized chunks and matched by global position;
 the Mamba state is TP-sharded by heads and never DCP-sharded, so a decoder rank can
-read its MLA blocks and its Mamba state from different prefiller ranks.
+read its MLA blocks and its Mamba state from different prefiller ranks. The
+handshake accepts block-sized interleaves, or interleave 1 with the decoder's DCP
+pair exchange; any other interleave stops the decoder.
 No GPU or NIXL required.
 """
 
 from __future__ import annotations
 
+import contextlib
+import operator
+import queue
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
+import msgspec
 import numpy as np
 import pytest
 import torch
 
 from vllm.distributed.kv_transfer.kv_connector.utils import TransferTopology
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl import base_worker
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
+    NixlPeerConfigMismatch,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    NixlAgentMetadata,
+    NixlHandshakePayload,
+    RemoteMeta,
+    ReqMeta,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
     compute_tp_mapping,
 )
@@ -195,7 +216,10 @@ def test_kda_state_slices_tp8_to_tp16(ds_conv_layout, d_rank):
     assert np.array_equal(got[-1], ssm_ids(16, d_rank))
 
 
-def _worker_stub(block=896, phys=14, interleave=896, tp=16, dcp=16):
+def _worker_stub(
+    block=1024, phys=1, interleave=1024, tp=16, dcp=16, pair=False, mode="pull"
+):
+    """Decoder worker (TP16/DCP16 by default) for the handshake validators."""
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
         NixlConnectorWorker,
     )
@@ -208,39 +232,319 @@ def _worker_stub(block=896, phys=14, interleave=896, tp=16, dcp=16):
     )
     w.use_mla = True
     w.world_size, w.dcp_size, w.pcp_size = tp, dcp, 1
+    w._dcp_pair_exchange = pair
+    w._TRANSFER_MODE = mode
     return w
 
 
-def _meta(block=896, phys=14, interleave=896):
+def _meta(block=1024, phys=1, interleave=1024, dcp=8, pcp=1):
+    """Prefiller handshake metadata (DCP8 by default); TP equals DCP."""
     return SimpleNamespace(
+        engine_id="P",
         block_size=block // phys,
         physical_blocks_per_logical_kv_block=phys,
         cp_kv_cache_interleave_size=interleave,
-        pcp_size=1,
+        dcp_size=dcp,
+        pcp_size=pcp,
     )
 
 
-def test_validate_hybrid_hetero_dcp_accepts_block_interleave():
-    _worker_stub()._validate_hybrid_hetero_dcp(_meta(), 8, 8)
+def _validate_hybrid(worker_kwargs, meta_kwargs):
+    meta = _meta(**meta_kwargs)
+    _worker_stub(**worker_kwargs)._validate_hybrid_hetero_dcp(
+        meta, meta.dcp_size, meta.dcp_size
+    )
+
+
+# Decoder at interleave 1 with the DCP pair exchange on.
+PAIR = {"interleave": 1, "pair": True}
 
 
 @pytest.mark.parametrize(
-    "worker_kwargs,meta_kwargs,remote_tp,match",
+    "worker_kwargs,meta_kwargs",
+    [({}, {}), (PAIR, {"interleave": 1})],
+    ids=["block-mode", "pair-mode"],
+)
+def test_validate_hybrid_hetero_dcp_accepts(worker_kwargs, meta_kwargs):
+    _validate_hybrid(worker_kwargs, meta_kwargs)
+
+
+@pytest.mark.parametrize(
+    "worker_kwargs,meta_kwargs",
     [
-        ({"interleave": 1}, {}, 8, "interleave"),
-        ({}, {"interleave": 1}, 8, "interleave"),
-        ({"block": 512, "phys": 8, "interleave": 512}, {}, 8, "block sizes differ"),
-        ({"dcp": 8}, {}, 8, "DCP must span TP"),
-        ({"tp": 8, "dcp": 8}, {}, 16, "must be >="),
+        ({"interleave": 1}, {"interleave": 1}),
+        (PAIR, {"interleave": 1024}),
+        ({"pair": True}, {"interleave": 1}),
+        (PAIR, {"interleave": None}),
+        ({**PAIR, "mode": "push"}, {"interleave": 1}),
+        (PAIR, {"interleave": 1, "dcp": 4}),
+        ({"interleave": 16, "pair": True}, {"interleave": 16}),
+        ({"block": 512, "phys": 8, "interleave": 1}, {}),
+        # Pair mode moves half-blocks of equal per-rank blocks, without PCP.
+        (PAIR, {"interleave": 1, "block": 512}),
+        (PAIR, {"interleave": 1, "pcp": 2}),
+    ],
+    ids=[
+        "no-opt-in",
+        "peer-at-block-interleave",
+        "decoder-at-block-interleave",
+        "peer-without-interleave",
+        "push-mode",
+        "dcp-ratio-not-2",
+        "interleave-neither-1-nor-block",
+        "with-block-size-mismatch",
+        "pair-with-block-size-mismatch",
+        "pair-with-peer-pcp",
     ],
 )
-def test_validate_hybrid_hetero_dcp_rejects(
-    worker_kwargs, meta_kwargs, remote_tp, match
+def test_validate_hybrid_hetero_dcp_interleave_mismatch_is_fatal(
+    worker_kwargs, meta_kwargs
 ):
-    with pytest.raises(RuntimeError, match=match):
-        _worker_stub(**worker_kwargs)._validate_hybrid_hetero_dcp(
-            _meta(**meta_kwargs), remote_tp, remote_tp
-        )
+    """Any other interleave combination needs a different mapping, so it stops
+    the decoder (NixlPeerConfigMismatch) even alongside non-fatal problems."""
+    with pytest.raises(NixlPeerConfigMismatch, match="cp_kv_cache_interleave_size"):
+        _validate_hybrid(worker_kwargs, meta_kwargs)
+
+
+@pytest.mark.parametrize(
+    "worker_kwargs,meta_kwargs,match",
+    [
+        ({"block": 512, "phys": 8, "interleave": 512}, {}, "block sizes differ"),
+        ({"dcp": 8}, {}, "DCP must span TP"),
+        ({"tp": 8, "dcp": 8}, {"dcp": 16}, "must be >="),
+    ],
+)
+def test_validate_hybrid_hetero_dcp_rejects(worker_kwargs, meta_kwargs, match):
+    """With block-sized interleaves the other problems still only fail the
+    handshake, as before."""
+    with pytest.raises(RuntimeError, match=match) as exc_info:
+        _validate_hybrid(worker_kwargs, meta_kwargs)
+    assert not isinstance(exc_info.value, NixlPeerConfigMismatch)
+
+
+@pytest.mark.parametrize(
+    "remote_tp,use_mla,match",
+    [(16, True, "DCP must span TP"), (8, False, "must be MLA")],
+)
+def test_validate_hybrid_hetero_dcp_pair_mode_problems_are_fatal(
+    remote_tp, use_mla, match
+):
+    """Pair mode keeps no per-request fallback: any problem stops the decoder."""
+    w = _worker_stub(**PAIR)
+    w.use_mla = use_mla
+    with pytest.raises(NixlPeerConfigMismatch, match=match):
+        w._validate_hybrid_hetero_dcp(_meta(interleave=1), remote_tp, 8)
+
+
+@pytest.mark.parametrize(
+    "local_dcp,local_interleave,remote_dcp,remote_interleave,fatal",
+    [
+        (16, 1, 8, 1, False),
+        (16, 1024, 8, 1024, False),
+        (16, 1, 8, 1024, True),
+        (16, 1024, 8, 1, True),
+        (16, 1, 8, None, True),
+        (16, 1024, 8, None, True),
+        # A side with DCP 1 never resolves its interleave and does not use it.
+        (16, 1, 1, 1024, False),
+        (16, 1024, 1, None, False),
+        (1, 1, 8, 1024, False),
+    ],
+)
+def test_validate_remote_parallel_config_interleave(
+    local_dcp, local_interleave, remote_dcp, remote_interleave, fatal
+):
+    """DCP peers must use the same interleave (vllm#60484); a DCP peer that does
+    not advertise one predates the field and is rejected too."""
+    w = _worker_stub(interleave=local_interleave, dcp=local_dcp)
+    meta = _meta(interleave=remote_interleave, dcp=remote_dcp)
+    if not fatal:
+        w._validate_remote_parallel_config(meta)
+        return
+    with pytest.raises(NixlPeerConfigMismatch, match="same cp_kv_cache_interleave"):
+        w._validate_remote_parallel_config(meta)
+
+
+@pytest.mark.parametrize(
+    "worker_kwargs,meta_kwargs,ok",
+    [
+        ({}, {}, True),
+        (PAIR, {"interleave": 1}, True),
+        ({"interleave": 1}, {"interleave": 1}, False),
+        (PAIR, {"interleave": 1, "block": 512}, False),
+        (PAIR, {"interleave": 1, "pcp": 2}, False),
+        # DCP 1 <-> DCP n: only the DCP-sharded side's interleave matters.
+        ({"tp": 4, "dcp": 4}, {"dcp": 1, "interleave": 1}, True),
+        ({"tp": 4, "dcp": 4, "interleave": 1}, {"dcp": 1, "interleave": 1}, False),
+        ({"tp": 4, "dcp": 1, "interleave": 1}, {"dcp": 4}, True),
+        ({"tp": 4, "dcp": 1}, {"dcp": 4, "interleave": 1}, False),
+        ({"tp": 4, "dcp": 1}, {"dcp": 4, "interleave": None}, False),
+    ],
+)
+def test_pure_mla_hetero_dcp_interleave(worker_kwargs, meta_kwargs, ok):
+    """Pure MLA across DCP sizes needs block-sized interleaves (vllm#60483),
+    with pair mode as the one exception; a mismatch used to mis-pair silently
+    and now stops the decoder."""
+    w = _worker_stub(**worker_kwargs)
+    meta = _meta(**meta_kwargs)
+    if ok:
+        assert w._hetero_dcp_interleave_problem(meta, meta.dcp_size) is None
+        return
+    w._has_mamba = False
+    w.transfer_topo = MagicMock()
+    w.transfer_topo.get_engine_info.return_value = SimpleNamespace(
+        remote_tp_size=meta.dcp_size, remote_dcp_size=meta.dcp_size
+    )
+    with pytest.raises(NixlPeerConfigMismatch, match="different DCP sizes"):
+        w._validate_remote_agent_handshake(meta, meta.dcp_size, meta.dcp_size)
+
+
+_AGENT_FIELDS = dict(
+    engine_id="e",
+    agent_metadata=b"",
+    kv_caches_base_addr=[0],
+    device_id=0,
+    num_blocks=1,
+    block_lens=[1],
+    block_strides=[1],
+    kv_cache_layout="HND",
+    block_size=16,
+    ssm_sizes=(0, 0),
+    attn_backend_name="x",
+    physical_blocks_per_logical_kv_block=1,
+)
+
+
+def _handshake_worker(monkeypatch, worker_kwargs, peer_interleave):
+    """Decoder rank whose real handshake thread talks to a mocked TP8/DCP8
+    prefiller; ``add_remote_agent`` runs only the hybrid hetero-DCP check."""
+    peer = {**_AGENT_FIELDS, "engine_id": "P", "block_size": 1024, "dcp_size": 8}
+    if peer_interleave is not None:
+        peer["cp_kv_cache_interleave_size"] = peer_interleave
+    payload = NixlHandshakePayload("hash", msgspec.msgpack.encode(peer))
+    sock = MagicMock()
+    sock.recv_multipart.return_value = [
+        msgspec.msgpack.encode(payload),
+        msgspec.msgpack.encode(time.perf_counter()),
+    ]
+    monkeypatch.setattr(base_worker, "zmq_ctx", lambda *_: contextlib.nullcontext(sock))
+    monkeypatch.setattr(
+        base_worker, "current_platform", SimpleNamespace(set_device=lambda _: None)
+    )
+
+    w = _worker_stub(**worker_kwargs)
+    w.engine_id, w.device_id, w._is_csa_linear, w.use_host_buffer = "D", 0, False, False
+    w.compat_hash, w.enforce_compat_hash = "hash", True
+    w.transfer_topo = MagicMock()
+    w.transfer_topo.handshake_target_ranks.return_value = [0]
+    w.add_remote_agent = lambda meta, rank, tp, dcp: w._validate_hybrid_hetero_dcp(
+        meta, tp, dcp
+    )
+    w._engine_ttl = 0
+    w._handshake_lock = threading.RLock()
+    w._handshake_initiation_executor = ThreadPoolExecutor(max_workers=1)
+    w._handshake_futures, w._remote_agents, w._recving_metadata = {}, {}, {}
+    w._engine_clock_offset, w._engine_last_active, w._engine_by_address = {}, {}, {}
+    w._ready_requests, w._failed_recv_reqs = queue.Queue(), queue.Queue()
+    w.xfer_stats = MagicMock()
+    return w
+
+
+def _pull_from_peer(w) -> None:
+    meta = ReqMeta(
+        local_block_ids=([1],),
+        local_physical_block_ids=([1],),
+        tp_size=8,
+        dcp_size=8,
+        remote=RemoteMeta(([2],), "p", 1, "P", "p-req"),
+    )
+    w._background_nixl_handshake("req", "P", meta)
+    # Joins the handshake thread, after its done callbacks.
+    w._handshake_initiation_executor.shutdown(wait=True)
+
+
+@pytest.mark.parametrize(
+    "worker_kwargs,peer_interleave",
+    [(PAIR, None), (PAIR, 1024), ({"interleave": 1}, 1)],
+    ids=["peer-without-interleave", "peer-at-block-interleave", "no-opt-in"],
+)
+def test_handshake_interleave_mismatch_stops_the_decoder(
+    monkeypatch, worker_kwargs, peer_interleave
+):
+    """A mismatch found in the handshake thread never fails the request into a
+    recompute: the main thread's next completion poll raises, and keeps
+    raising."""
+    w = _handshake_worker(monkeypatch, worker_kwargs, peer_interleave)
+    _pull_from_peer(w)
+    assert w._ready_requests.empty() and w._failed_recv_reqs.empty()
+    for poll in (w.get_transfer_results, w.get_finished):
+        with pytest.raises(NixlPeerConfigMismatch, match="cp_kv_cache_interleave"):
+            poll()
+
+
+def test_handshake_accepts_pair_mode(monkeypatch):
+    w = _handshake_worker(monkeypatch, PAIR, 1)
+    _pull_from_peer(w)
+    assert w._ready_requests.get_nowait()[0] == "req"
+    assert "P" in w._remote_agents and w._peer_config_mismatch is None
+
+
+def test_handshake_other_failures_still_fail_the_request(monkeypatch):
+    w = _handshake_worker(monkeypatch, PAIR, 1)
+    w.add_remote_agent = MagicMock(side_effect=RuntimeError("NIXL error"))
+    _pull_from_peer(w)
+    assert w._failed_recv_reqs.get_nowait() == "req"
+    assert w._peer_config_mismatch is None
+
+
+_MLA_SPEC = MLAAttentionSpec(
+    block_size=1024, num_kv_heads=1, head_size=576, dtype=torch.uint8
+)
+
+
+def _pair_startup_worker():
+    """A K3.1 decoder rank: TP16/DCP16, interleave 1, V2 runner, pull."""
+    w = _worker_stub(**PAIR)
+    w.vllm_config.use_v2_model_runner = True
+    w.vllm_config.model_config = SimpleNamespace(enable_sleep_mode=False)
+    w.pp_size, w.use_host_buffer = 1, False
+    w.kv_cache_config = SimpleNamespace(
+        transfer_group_ids=(0, 1), kv_cache_groups=[None, None]
+    )
+    w._layer_specs = {"layers.0.mla": _MLA_SPEC, "layers.1.kda": _kda_spec(16)}
+    return w
+
+
+@pytest.mark.parametrize(
+    "path,attr,value,match",
+    [
+        ("", "_dcp_pair_exchange", "false", "JSON boolean"),
+        ("vllm_config.parallel_config", "cp_kv_cache_interleave_size", 1024, "size 1"),
+        ("", "dcp_size", 8, "DCP must equal TP"),
+        ("", "pp_size", 2, "PP 1"),
+        ("vllm_config", "use_v2_model_runner", False, "V2 model runner"),
+        ("", "_TRANSFER_MODE", "push", "NixlPullConnector"),
+        ("", "use_host_buffer", True, "host transfer buffers"),
+        ("vllm_config.model_config", "enable_sleep_mode", True, "sleep mode"),
+        ("", "_physical_blocks_per_logical_kv_block", 2, "kernel block"),
+        ("kv_cache_config", "transfer_group_ids", (0,), "transfer group"),
+        (
+            "",
+            "_layer_specs",
+            {
+                "layers.0.mla": _MLA_SPEC,
+                "draft.mla": replace(_MLA_SPEC, dcp_sharded=False),
+            },
+            "DCP-sharded.*draft.mla",
+        ),
+    ],
+)
+def test_dcp_pair_exchange_startup_checks(path, attr, value, match):
+    w = _pair_startup_worker()
+    w._validate_dcp_pair_exchange_config()
+    setattr(operator.attrgetter(path)(w) if path else w, attr, value)
+    with pytest.raises(ValueError, match=match):
+        w._validate_dcp_pair_exchange_config()
 
 
 def _geometry(tp: int, num_spec: int = 7, dtype: torch.dtype = torch.bfloat16):
@@ -296,34 +600,27 @@ def test_mamba_state_geometry_rejects(local, remote):
 def test_agent_metadata_carries_mamba_geometry():
     """The geometry survives the msgpack handshake encoding; a peer built
     before the field existed decodes as None (check skipped)."""
-    import msgspec
-
-    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
-        NixlAgentMetadata,
-    )
-
-    fields = dict(
-        engine_id="e",
-        agent_metadata=b"",
-        kv_caches_base_addr=[0],
-        device_id=0,
-        num_blocks=1,
-        block_lens=[1],
-        block_strides=[1],
-        kv_cache_layout="HND",
-        block_size=16,
-        ssm_sizes=(0, 0),
-        attn_backend_name="x",
-        physical_blocks_per_logical_kv_block=1,
-    )
     geometry = _geometry(8)
-    sent = NixlAgentMetadata(**fields, mamba_state_geometry=geometry)
+    sent = NixlAgentMetadata(**_AGENT_FIELDS, mamba_state_geometry=geometry)
     got = msgspec.msgpack.decode(msgspec.msgpack.encode(sent), type=NixlAgentMetadata)
     assert tuple(got.mamba_state_geometry) == tuple(geometry)
     old = msgspec.msgpack.decode(
-        msgspec.msgpack.encode(NixlAgentMetadata(**fields)), type=NixlAgentMetadata
+        msgspec.msgpack.encode(NixlAgentMetadata(**_AGENT_FIELDS)),
+        type=NixlAgentMetadata,
     )
     assert old.mamba_state_geometry is None
+
+
+def test_agent_metadata_carries_interleave():
+    """The interleave survives the handshake encoding; a peer built before the
+    field existed decodes as None, which the DCP checks treat as unknown."""
+    sent = NixlAgentMetadata(**_AGENT_FIELDS, cp_kv_cache_interleave_size=1)
+    got = msgspec.msgpack.decode(msgspec.msgpack.encode(sent), type=NixlAgentMetadata)
+    assert got.cp_kv_cache_interleave_size == 1
+    older = msgspec.msgpack.decode(
+        msgspec.msgpack.encode(_AGENT_FIELDS), type=NixlAgentMetadata
+    )
+    assert older.cp_kv_cache_interleave_size is None
 
 
 @pytest.mark.parametrize(

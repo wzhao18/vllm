@@ -117,6 +117,16 @@ _INVALID_PEER_MAX_BACKOFF_S = 60.0
 _MAX_HYBRID_BLOCK_SPLIT = 128
 
 
+class NixlPeerConfigMismatch(RuntimeError):
+    """A peer whose configuration needs a different KV mapping, e.g. another
+    DCP interleave. Fatal: the handshake records it and the worker's main thread
+    re-raises it, instead of failing requests into a silent recompute."""
+
+
+def _describe_interleave(interleave: int | None) -> str:
+    return "not advertised (older peer)" if interleave is None else str(interleave)
+
+
 def _is_remote_disconnect(error: BaseException | None) -> bool:
     """Whether NIXL reported that the peer's connection is gone
     (``nixlRemoteDisconnectError``, NIXL_ERR_REMOTE_DISCONNECT). The peer's
@@ -194,6 +204,11 @@ class NixlBaseConnectorWorker:
     _pull_max_blocks_per_xfer: int = 0
     _pull_retry_disconnect: bool = False
     _pull_retry_window_s: float = 10.0
+
+    # DCP pair exchange opt-in (see _is_dcp_pair_peer), and the first peer
+    # mismatch a handshake found (see _raise_peer_config_mismatch).
+    _dcp_pair_exchange: bool = False
+    _peer_config_mismatch: NixlPeerConfigMismatch | None = None
 
     def _compute_desc_ids(
         self,
@@ -906,6 +921,12 @@ class NixlBaseConnectorWorker:
                 "pull_retry_window_s", 10.0
             )
         )
+        # Decoder opt-in: pull at DCP interleave 1 from peers with half this
+        # DCP size, partner ranks swapping half-blocks after the reads. Kept
+        # raw so that a truthy non-boolean fails the startup checks.
+        self._dcp_pair_exchange = vllm_config.kv_transfer_config.get_from_extra_config(
+            "dcp_pair_exchange", False
+        )
         # Requests whose read failed with a remote disconnect (retry candidates)
         # -> the generation of the peer's handshake whose endpoints failed.
         self._disconnect_failed_reqs: dict[ReqId, int] = {}
@@ -1205,6 +1226,53 @@ class NixlBaseConnectorWorker:
         self.enforce_compat_hash = self.kv_transfer_config.get_from_extra_config(
             "enforce_handshake_compat", True
         )
+        if self._dcp_pair_exchange:
+            self._validate_dcp_pair_exchange_config()
+
+    def _validate_dcp_pair_exchange_config(self) -> None:
+        """Startup checks for the decoder side of the DCP pair exchange."""
+        interleave = self.vllm_config.parallel_config.cp_kv_cache_interleave_size
+        problems = []
+        if self._dcp_pair_exchange is not True:
+            problems.append(
+                f"the flag must be a JSON boolean, got {self._dcp_pair_exchange!r}"
+            )
+        if interleave != 1:
+            problems.append(
+                f"cp_kv_cache_interleave_size is {interleave}; pass "
+                "--cp-kv-cache-interleave-size 1 explicitly"
+            )
+        if (self.dcp_size, self.pcp_size, self.pp_size) != (self.world_size, 1, 1):
+            problems.append(
+                f"DCP must equal TP with PCP 1 and PP 1 (TP {self.world_size}, "
+                f"DCP {self.dcp_size}, PCP {self.pcp_size}, PP {self.pp_size})"
+            )
+        if not self.vllm_config.use_v2_model_runner:
+            problems.append("the V2 model runner is required")
+        if self._TRANSFER_MODE != "pull":
+            problems.append("NixlPullConnector is required")
+        if self.use_host_buffer or self.vllm_config.model_config.enable_sleep_mode:
+            problems.append("host transfer buffers and sleep mode are unsupported")
+        if self._physical_blocks_per_logical_kv_block != 1:
+            problems.append(
+                "the kernel block must equal the KV cache block ("
+                f"{self._physical_blocks_per_logical_kv_block} kernel blocks per block)"
+            )
+        config = self.kv_cache_config
+        if config.transfer_group_ids != tuple(range(len(config.kv_cache_groups))):
+            problems.append("every KV cache group must be a transfer group")
+        replicated = [
+            name
+            for name, spec in self._layer_specs.items()
+            if isinstance(spec, AttentionSpec) and not spec.dcp_sharded
+        ]
+        if replicated:
+            problems.append(
+                f"every attention layer must be DCP-sharded ({len(replicated)} "
+                f"are not, e.g. {replicated[0]})"
+            )
+        if problems:
+            raise ValueError("NIXL dcp_pair_exchange: " + "; ".join(problems) + ".")
 
     def _validate_remote_parallel_config(
         self, agent_metadata: NixlAgentMetadata
@@ -1225,6 +1293,22 @@ class NixlBaseConnectorWorker:
                 "Replicated PCP cannot be paired with a DCP-sharded NIXL peer. "
                 f"Local PCP/DCP={local_pcp_size}/{local_dcp_size}; "
                 f"remote PCP/DCP={remote_pcp_size}/{remote_dcp_size}."
+            )
+        # A side with DCP 1 never resolves its interleave, nor depends on it.
+        local_interleave = self.vllm_config.parallel_config.cp_kv_cache_interleave_size
+        remote_interleave = agent_metadata.cp_kv_cache_interleave_size
+        if (
+            local_dcp_size > 1
+            and remote_dcp_size > 1
+            and remote_interleave != local_interleave
+        ):
+            raise NixlPeerConfigMismatch(
+                "NIXL DCP peers must use the same cp_kv_cache_interleave_size, "
+                "as it determines how tokens are laid out in transferred blocks. "
+                f"Local: DCP {local_dcp_size}, interleave {local_interleave}; "
+                f"remote engine {agent_metadata.engine_id}: DCP {remote_dcp_size}, "
+                f"interleave {_describe_interleave(remote_interleave)}. Set the "
+                "same --cp-kv-cache-interleave-size on both instances."
             )
 
     def _sync_block_size_with_kernel(self) -> None:
@@ -1603,6 +1687,11 @@ class NixlBaseConnectorWorker:
                         self._engine_last_active[eid] = time.perf_counter()
                         self._track_remote_engine_replacement(eid, host, port)
                     except Exception as e:
+                        if (
+                            isinstance(e, NixlPeerConfigMismatch)
+                            and self._peer_config_mismatch is None
+                        ):
+                            self._peer_config_mismatch = e
                         self._log_failure(
                             failure_type="handshake_setup_failed",
                             req_id=None,
@@ -1638,6 +1727,10 @@ class NixlBaseConnectorWorker:
             try:
                 f.result()
                 self._ready_requests.put(entry)
+            except NixlPeerConfigMismatch:
+                # _ensure_handshake's callback records it (possibly after this
+                # one runs); the main thread raises it instead of recomputing.
+                pass
             except Exception as e:
                 self._log_failure(
                     failure_type="handshake_failed",
@@ -2045,6 +2138,10 @@ class NixlBaseConnectorWorker:
                 "Mixed-device KV registration is only supported for MLA "
                 "models without Mamba layers."
             )
+            if self._dcp_pair_exchange:
+                raise ValueError(
+                    "NIXL dcp_pair_exchange does not support mixed-memory KV caches."
+                )
         for mem_type in sorted(set(region_mem_types)):
             if mem_type == "DRAM" and self._skip_dram_xfer:
                 continue
@@ -2932,10 +3029,12 @@ class NixlBaseConnectorWorker:
         prefiller feeding a TP16/DCP16 decoder).
 
         MLA KV is matched block by block by global DCP position
-        (``_apply_dcp_prefix_caching``), which is exact only when each per-rank
-        block holds exactly one interleave chunk: both sides fully DCP-sharded
-        (DCP == TP), the same per-rank logical block size, and an interleave
-        equal to it. Mamba state is not DCP-sharded and is read from the rank
+        (``_apply_dcp_prefix_caching``), which needs both sides fully DCP-sharded
+        (DCP == TP), the same per-rank logical block size, and one of the
+        interleave modes of ``_hetero_dcp_interleave_problem``. An interleave or
+        mode mismatch, or any problem in pair mode, raises
+        ``NixlPeerConfigMismatch``; in block mode the other problems only fail
+        the handshake. Mamba state is not DCP-sharded and is read from the rank
         owning this rank's heads (``TPMapping`` SSM sources).
         """
         local_block = self.block_size * self._physical_blocks_per_logical_kv_block
@@ -2944,7 +3043,6 @@ class NixlBaseConnectorWorker:
             * nixl_agent_meta.physical_blocks_per_logical_kv_block
         )
         local_interleave = self.vllm_config.parallel_config.cp_kv_cache_interleave_size
-        remote_interleave = nixl_agent_meta.cp_kv_cache_interleave_size
         problems = []
         if not self.use_mla:
             problems.append("the attention layers must be MLA")
@@ -2965,14 +3063,16 @@ class NixlBaseConnectorWorker:
                 f"per-rank block sizes differ (local {local_block}, remote "
                 f"{remote_block}); set the same --block-size on both"
             )
-        if local_interleave != local_block or remote_interleave != remote_block:
-            problems.append(
-                "cp_kv_cache_interleave_size must equal the per-rank block size "
-                f"(local {local_interleave} vs {local_block}, remote "
-                f"{remote_interleave} vs {remote_block})"
-            )
+        pair_mode = self._is_dcp_pair_peer(nixl_agent_meta, remote_dcp_size)
+        interleave_problem = self._hetero_dcp_interleave_problem(
+            nixl_agent_meta, remote_dcp_size
+        )
+        if interleave_problem is not None:
+            problems.append(interleave_problem)
         if problems:
-            raise RuntimeError(
+            fatal = pair_mode or interleave_problem is not None
+            error = NixlPeerConfigMismatch if fatal else RuntimeError
+            raise error(
                 "Hybrid MLA+Mamba NIXL transfers with different DCP sizes "
                 f"(local={self.dcp_size}, remote={remote_dcp_size}): "
                 + "; ".join(problems)
@@ -2980,13 +3080,71 @@ class NixlBaseConnectorWorker:
             )
         logger.info_once(
             "Hybrid MLA+Mamba NIXL transfer with heterogeneous DCP: local "
-            "TP/DCP %d/%d, remote %d/%d, per-rank block %d, interleave %d.",
+            "TP/DCP %d/%d, remote %d/%d, per-rank block %d, interleave %d (%s "
+            "mode).",
             self.world_size,
             self.dcp_size,
             remote_tp_size,
             remote_dcp_size,
             local_block,
             local_interleave,
+            "pair" if pair_mode else "block",
+        )
+
+    def _is_dcp_pair_peer(
+        self, nixl_agent_meta: NixlAgentMetadata, remote_dcp_size: int
+    ) -> bool:
+        """Whether this decoder pulls from the peer in DCP pair mode: interleave
+        1 on both sides, the same per-rank block, no PCP, local DCP = 2 x remote
+        DCP, and pull mode with ``dcp_pair_exchange`` on. Partner decoder ranks
+        then swap half-blocks after the reads."""
+        local_block = self.block_size * self._physical_blocks_per_logical_kv_block
+        remote_block = (
+            nixl_agent_meta.block_size
+            * nixl_agent_meta.physical_blocks_per_logical_kv_block
+        )
+        local_interleave = self.vllm_config.parallel_config.cp_kv_cache_interleave_size
+        return (
+            self._dcp_pair_exchange is True
+            and self._TRANSFER_MODE == "pull"
+            and local_interleave == nixl_agent_meta.cp_kv_cache_interleave_size == 1
+            and self.dcp_size == 2 * remote_dcp_size
+            and local_block == remote_block
+            and self.pcp_size == nixl_agent_meta.pcp_size == 1
+        )
+
+    def _hetero_dcp_interleave_problem(
+        self, nixl_agent_meta: NixlAgentMetadata, remote_dcp_size: int
+    ) -> str | None:
+        """Why peers with different DCP sizes cannot pair their attention
+        blocks, or None when one of two modes applies.
+
+        Block mode: each DCP-sharded side's interleave equals its per-rank
+        block, so a block holds one interleave chunk and blocks match by global
+        position. Pair mode: see ``_is_dcp_pair_peer``.
+        """
+        local_block = self.block_size * self._physical_blocks_per_logical_kv_block
+        remote_block = (
+            nixl_agent_meta.block_size
+            * nixl_agent_meta.physical_blocks_per_logical_kv_block
+        )
+        local_interleave = self.vllm_config.parallel_config.cp_kv_cache_interleave_size
+        remote_interleave = nixl_agent_meta.cp_kv_cache_interleave_size
+        block_mode = (self.dcp_size == 1 or local_interleave == local_block) and (
+            remote_dcp_size == 1 or remote_interleave == remote_block
+        )
+        if block_mode or self._is_dcp_pair_peer(nixl_agent_meta, remote_dcp_size):
+            return None
+        return (
+            "cp_kv_cache_interleave_size must equal the per-rank block size on "
+            "each DCP-sharded side, or be 1 on both sides with the same per-rank "
+            "block, no PCP, local DCP = 2 x remote DCP, pull mode and "
+            f"dcp_pair_exchange on (local: DCP {self.dcp_size}, PCP "
+            f"{self.pcp_size}, interleave {local_interleave}, block {local_block}, "
+            f"{self._TRANSFER_MODE} mode, dcp_pair_exchange "
+            f"{'on' if self._dcp_pair_exchange else 'off'}; remote: DCP "
+            f"{remote_dcp_size}, PCP {nixl_agent_meta.pcp_size}, interleave "
+            f"{_describe_interleave(remote_interleave)}, block {remote_block})"
         )
 
     def _validate_mamba_state_geometry(self, nixl_agent_meta: NixlAgentMetadata):
@@ -3046,10 +3204,18 @@ class NixlBaseConnectorWorker:
             f"DCP sizes must divide one another: local={self.dcp_size}, "
             f"remote={remote_dcp_size} (engine {remote_engine_id})."
         )
-        if self._has_mamba and self.dcp_size != remote_dcp_size:
-            self._validate_hybrid_hetero_dcp(
-                nixl_agent_meta, remote_tp_size, remote_dcp_size
-            )
+        if self.dcp_size != remote_dcp_size:
+            if self._has_mamba:
+                self._validate_hybrid_hetero_dcp(
+                    nixl_agent_meta, remote_tp_size, remote_dcp_size
+                )
+            elif problem := self._hetero_dcp_interleave_problem(
+                nixl_agent_meta, remote_dcp_size
+            ):
+                raise NixlPeerConfigMismatch(
+                    "NIXL transfers with different DCP sizes (local="
+                    f"{self.dcp_size}, remote={remote_dcp_size}): {problem}."
+                )
         if self._has_mamba:
             self._validate_mamba_state_geometry(nixl_agent_meta)
 
@@ -3635,6 +3801,7 @@ class NixlBaseConnectorWorker:
         The scheduler process (via the MultiprocExecutor) will use this output
         to track which workers are done.
         """
+        self._raise_peer_config_mismatch()
         assert self.transfer_topo is not None
         done_sending = self._get_new_notifs()
         done_recving, newly_failed = self._pop_done_transfers(self._recving_transfers)
@@ -3826,6 +3993,12 @@ class NixlBaseConnectorWorker:
             finished_recving=done_recving,
             failed_recving=failed_recv_reqs,
         )
+
+    def _raise_peer_config_mismatch(self) -> None:
+        """Re-raise on the main thread the peer mismatch a handshake found, so
+        the engine stops instead of recomputing that peer's requests."""
+        if self._peer_config_mismatch is not None:
+            raise self._peer_config_mismatch
 
     def get_finished(self) -> tuple[set[str], set[str]]:
         """Compatibility wrapper for the legacy completion API."""

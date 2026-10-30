@@ -83,9 +83,8 @@ class NixlAgentMetadata:
     dcp_size: int = 1
     pcp_size: int = 1
     # DCP token interleave of the attention KV (cp_kv_cache_interleave_size).
-    # Peers with different DCP sizes match blocks by global position, which
-    # needs block-sized interleave on both sides.
-    cp_kv_cache_interleave_size: int = 1
+    # None: the peer predates the field, so its token layout is unknown.
+    cp_kv_cache_interleave_size: int | None = None
     # Page length of the PLE short-conv state (None when the model has none).
     ple_block_len: int | None = None
     # Layer names sharing each advertised region, in region order.
