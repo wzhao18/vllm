@@ -227,6 +227,8 @@ if TYPE_CHECKING:
     VLLM_KIMI_K3_GEMM_AR_ALIAS: bool = False
     VLLM_KIMI_K3_AUX_ATTN_RES_STREAM: bool = False
     VLLM_KIMI_K3_GEMM_AR: bool = True
+    VLLM_KIMI_K3_DS_T2P: bool = False
+    VLLM_KIMI_K3_DS_LPC: bool = False
     VLLM_ENABLE_GEMM_RS: bool = False
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
@@ -1764,6 +1766,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use the SM100 BF16 GEMM-AR kernel for eligible Kimi-K3 row-parallel
     # attention projections. All TP ranks must belong to one NVLink domain.
     "VLLM_KIMI_K3_GEMM_AR": lambda: bool(int(os.getenv("VLLM_KIMI_K3_GEMM_AR", "1"))),
+    # Kimi-K3 on Rubin: the wide spec-verify MLA rows 128-256 (q 8) whose packed core
+    # runs the work list (LONG_SPLIT + WLIST) use the persistent 2-CTA DS-T2P core
+    # (mla.core_p2) instead of core_q's polled core (DL7 B16-B32 only: q 8 rows 128-256;
+    # DL3's q 4 rows stay on core_q). Off by default: correctness hold (10-19) on a
+    # latent race in its three-softmax-group pipeline under frequent O rescales.
+    "VLLM_KIMI_K3_DS_T2P": lambda: bool(int(os.getenv("VLLM_KIMI_K3_DS_T2P", "0"))),
+    # Kimi-K3 on Rubin, with VLLM_KIMI_K3_DS_T2P: DS-T2P runs lockstep page-range chunks
+    # (LPC, mla.dcp.lpc_table) at the q 8 verify rows LPC_ROWS (64: B8) instead of the
+    # LONG_SPLIT work list; DcpValue folds each request's chunk count. Off by default
+    # (correctness hold with DS-T2P, 10-19).
+    "VLLM_KIMI_K3_DS_LPC": lambda: bool(int(os.getenv("VLLM_KIMI_K3_DS_LPC", "0"))),
     # Fuse eligible sequence-parallel row-parallel projections with their TP
     # reduce-scatter using the SM100 BF16/MXFP8 GEMM-RS kernel (Kimi-K3
     # attention/shared-expert projections, DeepSeek-V4.1 ``wo_b``). All TP
