@@ -275,13 +275,26 @@ class MooncakeStoreScheduler:
             non_block=self.lookup_async,
             **lookup_kwargs,
         )
+        if (
+            lookup_result is not None
+            and lookup_result.known_prefix_tokens > num_computed_tokens
+        ):
+            # The local hit shrank (eviction) after the lookup trusted it, so
+            # the store was not probed between the two: probe again from the
+            # current local hit. Block on it, since deferring the request would
+            # trip the core's pending-lookup timeout (counted from the first
+            # lookup) and recompute the whole prefix.
+            self.client.discard(request.request_id)
+            lookup_result = self.client.lookup(
+                request.request_id,
+                request.num_tokens,
+                request.block_hashes,
+                non_block=False,
+                **lookup_kwargs,
+            )
         if lookup_result is None:
             # Lookup not ready yet; scheduler will retry on a later step.
             return None, False
-        if lookup_result.known_prefix_tokens > num_computed_tokens:
-            # The local hit shrank (eviction) after an async lookup trusted it,
-            # so the store was not probed between the two: recompute instead.
-            return 0, False
         num_external_hit_tokens = lookup_result.hit_length
 
         if num_external_hit_tokens < num_computed_tokens:

@@ -1094,21 +1094,25 @@ def test_sub_block_prompt_not_looked_up_without_fine_grained():
 
 
 class _KnownPrefixLookupClient:
-    """Records the known prefix it was given; reports it like the real client."""
+    """Mirrors LookupKeyClient: a lookup records the known prefix it trusted and
+    is kept until ``discard``; a non-blocking one is not ready when submitted."""
 
-    def __init__(self, hit_tokens: int, known_prefix_tokens: int | None = None):
+    def __init__(self, hit_tokens: int):
         self._hit_tokens = hit_tokens
-        self._known = known_prefix_tokens
         self.calls: list[dict] = []
+        self._results: dict[str, MooncakeLookupResult] = {}
 
     def lookup(self, req_id, num_tokens, block_hashes, non_block=False, **kwargs):
+        if req_id in self._results:
+            return self._results[req_id]
         self.calls.append(kwargs)
-        known = (
-            self._known
-            if self._known is not None
-            else kwargs.get("known_prefix_tokens", 0)
+        self._results[req_id] = MooncakeLookupResult(
+            self._hit_tokens, known_prefix_tokens=kwargs.get("known_prefix_tokens", 0)
         )
-        return MooncakeLookupResult(self._hit_tokens, known_prefix_tokens=known)
+        return None if non_block else self._results[req_id]
+
+    def discard(self, req_id):
+        self._results.pop(req_id, None)
 
 
 def test_lookup_from_local_hit_passes_local_hit_only_when_enabled():
@@ -1133,20 +1137,36 @@ def test_lookup_from_local_hit_passes_local_hit_only_when_enabled():
     assert scheduler.client.calls == [{"known_prefix_tokens": 16}]
 
 
-def test_lookup_from_local_hit_drops_hit_when_local_hit_shrank():
-    # An async lookup trusted a 32-token local hit; on the retry the local hit is
-    # 16 (evicted), so tokens 16..32 were never probed in the store: recompute.
+@pytest.mark.parametrize("local_hit", [16, 0])
+def test_lookup_from_local_hit_reprobes_when_local_hit_shrank(local_hit):
+    # An async lookup trusted a 32-token local hit that was evicted before
+    # admission, so the store was never probed below 32. The admission query
+    # probes again from the current local hit and loads the store hit at once
+    # (deferring would trip the core's pending-lookup timeout) instead of
+    # recomputing the prefix.
     request = SimpleNamespace(
         request_id="req-0", num_tokens=48, block_hashes=[b"h0", b"h1", b"h2"]
     )
     scheduler = _make_bare_scheduler()
+    scheduler.load_async = True
+    scheduler.lookup_async = True
     scheduler.lookup_from_local_hit = True
-    scheduler.client = _KnownPrefixLookupClient(hit_tokens=32, known_prefix_tokens=32)
-    assert scheduler.get_num_new_matched_tokens(request, num_computed_tokens=16) == (
-        0,
+    scheduler.client = _KnownPrefixLookupClient(hit_tokens=32)
+    assert scheduler.get_num_new_matched_tokens(request, num_computed_tokens=32) == (
+        None,
         False,
     )
-    assert "req-0" not in scheduler.load_specs
+
+    assert scheduler.get_num_new_matched_tokens(
+        request, num_computed_tokens=local_hit
+    ) == (32 - local_hit, True)
+    reprobe = {"known_prefix_tokens": local_hit} if local_hit else {}
+    assert scheduler.client.calls == [{"known_prefix_tokens": 32}, reprobe]
+    load_spec = scheduler.load_specs["req-0"]
+    assert (load_spec.vllm_cached_tokens, load_spec.kvpool_cached_tokens) == (
+        local_hit,
+        32,
+    )
 
 
 def test_disabled_lookup_reports_no_hit_without_querying_client():
