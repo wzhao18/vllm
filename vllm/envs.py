@@ -229,6 +229,7 @@ if TYPE_CHECKING:
     VLLM_KIMI_K3_GEMM_AR: bool = True
     VLLM_KIMI_K3_DS_T2P: bool = False
     VLLM_KIMI_K3_DS_LPC: bool = False
+    VLLM_PACKED_KV_STATE_GROUPS: int = 0
     VLLM_ENABLE_GEMM_RS: bool = False
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
@@ -1777,6 +1778,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # LONG_SPLIT work list; DcpValue folds each request's chunk count. Off by default
     # (correctness hold with DS-T2P, 10-19).
     "VLLM_KIMI_K3_DS_LPC": lambda: bool(int(os.getenv("VLLM_KIMI_K3_DS_LPC", "0"))),
+    # Block-outermost (packed) KV caches: split every state (Mamba-type) bucket into
+    # exactly this many KV cache groups instead of the fewest that fit a block
+    # (0: the fewest). The fewest depends on TP, since state pages scale with 1/TP;
+    # a P/D pair with different TP must set the same count on both sides.
+    "VLLM_PACKED_KV_STATE_GROUPS": lambda: int(
+        os.getenv("VLLM_PACKED_KV_STATE_GROUPS", "0")
+    ),
     # Fuse eligible sequence-parallel row-parallel projections with their TP
     # reduce-scatter using the SM100 BF16/MXFP8 GEMM-RS kernel (Kimi-K3
     # attention/shared-expert projections, DeepSeek-V4.1 ``wo_b``). All TP

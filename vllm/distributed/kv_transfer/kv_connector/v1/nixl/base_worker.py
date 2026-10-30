@@ -3235,12 +3235,27 @@ class NixlBaseConnectorWorker:
             # heterogeneous TP (remote kernel blocks may be smaller).
             # SSM geometry is validated via ssm_sizes/conv offsets instead.
             # A head-sharded draft's blocks also scale with its heads per rank.
-            assert self.block_len_per_layer == [
+            local_lens = self.block_len_per_layer
+            remote_lens = [
                 block_len * block_size_ratio * draft_local_heads // draft_remote_heads
                 if i in self._head_sharded_draft_regions
                 else block_len * block_size_ratio
                 for i, block_len in enumerate(nixl_agent_meta.block_lens)
-            ], (
+            ]
+            if self._has_packed_cache:
+                # Block-outermost pages: an SSM region is the per-rank state, which
+                # scales with 1/TP. With the same KV cache groups (see
+                # VLLM_PACKED_KV_STATE_GROUPS) both sides register the same
+                # regions in the same order; compare the attention ones.
+                assert len(local_lens) == len(remote_lens), (
+                    "Hybrid packed KV caches must register the same regions on P "
+                    "and D (VLLM_PACKED_KV_STATE_GROUPS must match): "
+                    f"local={local_lens}, remote={nixl_agent_meta.block_lens}."
+                )
+                ssm = set(self._ssm_region_indices)
+                local_lens = [n for i, n in enumerate(local_lens) if i not in ssm]
+                remote_lens = [n for i, n in enumerate(remote_lens) if i not in ssm]
+            assert local_lens == remote_lens, (
                 "Hybrid MLA kernel-granularity block lengths must match "
                 f"between P and D (block_size_ratio={block_size_ratio}): "
                 f"local={self.block_len_per_layer}, "
