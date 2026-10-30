@@ -1388,3 +1388,133 @@ def test_prefill_topk_on_bf16_logits(
         expected = logits[row, :end].float().topk(min(topk, end)).indices
         assert set(chosen[chosen >= 0].tolist()) == set(expected.tolist())
         assert (chosen == -1).sum().item() == topk - min(topk, end)
+
+
+def _merge_gate_config(dcp: int, interleave: int, kv_transfer=None, explicit=True):
+    from types import SimpleNamespace
+
+    from vllm.config import KVTransferConfig
+
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=dcp,
+            prefill_context_parallel_size=1,
+            cp_kv_cache_interleave_size=interleave,
+            dcp_kv_cache_interleave_size=1,
+            _allow_auto_resolve_cp_interleave_size=not explicit,
+            use_ubatching=False,
+        ),
+        kv_transfer_config=(
+            KVTransferConfig(**kv_transfer) if kv_transfer is not None else None
+        ),
+        kernel_config=SimpleNamespace(
+            sparse_indexer_topk_backend="deep_select", enable_jit_warmup=False
+        ),
+        model_config=SimpleNamespace(max_model_len=1 << 20),
+    )
+
+
+@pytest.mark.parametrize(
+    ("dcp", "interleave", "kv_transfer", "explicit", "expected"),
+    [
+        (16, 1, None, False, 192),
+        (8, 1, None, False, 384),
+        (16, 1024, None, True, 0),
+        (8, 1024, _NIXL_P, True, 0),
+        (16, 1, _NIXL_D, True, 192),
+        (16, 1, _NIXL_D, False, 0),  # NIXL raises it to the block size later
+    ],
+)
+def test_dcp_topk_merge_construction_gate_follows_interleave(
+    monkeypatch, dcp, interleave, kv_transfer, explicit, expected
+):
+    """The one-round decode merge (Inferact/mum#63) is set up only for an
+    interleave that stays 1. Otherwise nothing is set up: no collective, no
+    rescue workspace, no JIT registration."""
+    import sys
+    import types
+
+    import vllm.v1.attention.ops.dcp_topk_merge as gate
+
+    monkeypatch.setattr(
+        gate,
+        "current_platform",
+        types.SimpleNamespace(
+            is_cuda=lambda: True, is_device_capability_family=lambda cap: cap == 100
+        ),
+    )
+    monkeypatch.setattr(gate, "has_cutedsl", lambda: True)
+    monkeypatch.setitem(
+        sys.modules, "vllm._deepselect_C", types.ModuleType("vllm._deepselect_C")
+    )
+    monkeypatch.setattr(gate, "_MERGE_INIT", {})
+    monkeypatch.setattr(gate, "_MERGE_MAX_ROWS", {})
+    config = _merge_gate_config(dcp, interleave, kv_transfer, explicit)
+    assert gate.dcp_topk_merge_local_topk(config, 2048) == expected
+    if not expected:
+
+        def collective(*args, **kwargs):
+            raise AssertionError("set up a merge that no step takes")
+
+        monkeypatch.setattr(gate, "_init_rescue", collective)
+        assert gate.init_dcp_topk_merge(config, 2048) == 0
+        assert gate.dcp_topk_merge_max_rows(2048, 192) == 0
+
+
+def test_dcp16_topk_merge_sizes():
+    """DCP16 (the D instance): N = 192 candidates per rank in 198-word rows
+    (12.7 KB per row from 16 ranks against 256 KB for the generic merge's
+    (score, id) pairs), at most 10 saturated ranks per row, 1M-token contexts
+    within the 17-bit local index."""
+    from vllm.v1.attention.ops.dcp_topk_merge import (
+        LOCAL_INDEX_BITS,
+        MAX_WORLD_SIZE,
+        dcp_merge_local_topk,
+        packed_row_words,
+        rescue_slots,
+    )
+
+    topk, world = 2048, 16
+    local_topk = dcp_merge_local_topk(topk, world)
+    assert local_topk == 192
+    assert packed_row_words(local_topk) == 198
+    assert world * packed_row_words(local_topk) * 4 == 12_672
+    assert world * topk * 8 == 262_144
+    assert rescue_slots(topk, local_topk) == 10
+    assert world <= MAX_WORLD_SIZE
+    assert -(-(1 << 20) // world) <= 1 << LOCAL_INDEX_BITS
+    assert dcp_merge_local_topk(topk, 8) == 384
+    assert rescue_slots(topk, 384) == 5
+
+
+@pytest.mark.parametrize("interleave", [1, 1024])
+@pytest.mark.parametrize("num_rows", [8, 256, 257])
+def test_dcp_decode_step_takes_merge_at_interleave_one(
+    monkeypatch, interleave, num_rows
+):
+    """A decode step takes the one-round merge only at interleave 1 and when
+    its rows fit the rescue workspace (256 rows here); the others keep the
+    generic merge."""
+    import vllm.v1.attention.ops.dcp_topk_merge as gate
+
+    monkeypatch.setattr(gate, "_MERGE_MAX_ROWS", {(2048, 192): 256})
+    got = sparse_indexer._use_dcp_decode_topk_merge(
+        192, True, interleave, False, num_rows, 2048
+    )
+    assert got is (interleave == 1 and num_rows <= 256)
+
+
+@pytest.mark.parametrize("fp32_decode_logits", [False, True])
+@pytest.mark.parametrize("logits_dtype", [torch.bfloat16, torch.float32])
+def test_decode_logits_profile_bytes_without_merge(fp32_decode_logits, logits_dtype):
+    """Without the one-round merge (interleave 1024) the memory profile
+    reserves what it did before: the logits plus their FP32 copy when the
+    top-k reads one."""
+    rows, max_model_len, row_align = 128 * 8, 1 << 20, 384
+    stride = -(-max_model_len // row_align) * row_align
+    copy = 4 if fp32_decode_logits and logits_dtype != torch.float32 else 0
+    old = rows * stride * (logits_dtype.itemsize + copy)
+    got = sparse_indexer._decode_logits_profile_bytes(
+        rows, max_model_len, logits_dtype, row_align, fp32_decode_logits, 0, 16
+    )
+    assert got == old

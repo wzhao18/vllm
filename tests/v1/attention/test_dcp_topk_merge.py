@@ -72,19 +72,23 @@ def test_local_topk_sizing():
 
 
 @pytest.mark.parametrize(
-    ("dcp", "pcp", "backend", "max_model_len", "expected"),
+    ("dcp", "pcp", "backend", "max_model_len", "interleave", "expected"),
     [
-        (8, 1, "auto", 262_144, 384),
-        (8, 1, "deep_select", 1 << 20, 384),
-        (1, 1, "auto", 262_144, 0),  # no DCP
-        (8, 2, "auto", 262_144, 0),  # PCP keeps the generic merge
-        (8, 1, "persistent", 262_144, 0),  # explicit top-k backend
-        (8, 1, "auto", (1 << 20) + 8, 0),  # local index past 17 bits
-        (16, 1, "auto", 1 << 20, 192),
-        (32, 1, "auto", 1 << 20, 0),  # the saturation mask holds 16 ranks
+        (8, 1, "auto", 262_144, 1, 384),
+        (8, 1, "deep_select", 1 << 20, 1, 384),
+        (1, 1, "auto", 262_144, 1, 0),  # no DCP
+        (8, 2, "auto", 262_144, 1, 0),  # PCP keeps the generic merge
+        (8, 1, "persistent", 262_144, 1, 0),  # explicit top-k backend
+        (8, 1, "auto", (1 << 20) + 8, 1, 0),  # local index past 17 bits
+        (16, 1, "auto", 1 << 20, 1, 192),
+        (16, 1, "auto", 1 << 20, 1024, 0),  # ids decode as local * W + rank
+        (8, 1, "deep_select", 1 << 20, 64, 0),
+        (32, 1, "auto", 1 << 20, 1, 0),  # the saturation mask holds 16 ranks
     ],
 )
-def test_local_topk_config_gating(dcp, pcp, backend, max_model_len, expected):
+def test_local_topk_config_gating(
+    dcp, pcp, backend, max_model_len, interleave, expected
+):
     from types import SimpleNamespace
 
     from vllm.v1.attention.ops.dcp_topk_merge import (
@@ -93,7 +97,9 @@ def test_local_topk_config_gating(dcp, pcp, backend, max_model_len, expected):
 
     config = SimpleNamespace(
         parallel_config=SimpleNamespace(
-            decode_context_parallel_size=dcp, prefill_context_parallel_size=pcp
+            decode_context_parallel_size=dcp,
+            prefill_context_parallel_size=pcp,
+            cp_kv_cache_interleave_size=interleave,
         ),
         kernel_config=SimpleNamespace(sparse_indexer_topk_backend=backend),
         model_config=SimpleNamespace(max_model_len=max_model_len),
@@ -138,10 +144,11 @@ def test_decode_step_gating(
 
 def test_init_fails_closed(monkeypatch):
     """Without symmetric memory over the DCP group (on any rank), under
-    ubatching or past 16 DCP ranks the construction gate keeps the generic
-    merge (N = 0) instead of a lossy one-round merge. The ranks agree (MIN)
-    before the collective allocation, which then never starts; the result is
-    computed once per top-k (later layers run no collectives)."""
+    ubatching, past 16 DCP ranks or at an interleave other than 1 the
+    construction gate keeps the generic merge (N = 0) instead of a lossy
+    one-round merge. The ranks agree (MIN) before the collective allocation,
+    which then never starts; the result is computed once per top-k (later
+    layers run no collectives)."""
     from types import SimpleNamespace
 
     import vllm.distributed as distributed
@@ -150,11 +157,14 @@ def test_init_fails_closed(monkeypatch):
     from vllm.v1.attention.ops import dcp_topk_merge as gate
     from vllm.v1.attention.ops.dcp_topk_merge import kernels
 
-    def config(ubatching: bool = False, dcp_size: int = 8) -> SimpleNamespace:
+    def config(
+        ubatching: bool = False, dcp_size: int = 8, interleave: int = 1
+    ) -> SimpleNamespace:
         return SimpleNamespace(
             parallel_config=SimpleNamespace(
                 decode_context_parallel_size=dcp_size,
                 prefill_context_parallel_size=1,
+                cp_kv_cache_interleave_size=interleave,
                 use_ubatching=ubatching,
             ),
             kernel_config=SimpleNamespace(
@@ -187,6 +197,9 @@ def test_init_fails_closed(monkeypatch):
     assert collectives == []
     gate._MERGE_INIT.clear()
     assert gate.init_dcp_topk_merge(config(dcp_size=32), TOPK) == 0
+    assert collectives == []
+    gate._MERGE_INIT.clear()
+    assert gate.init_dcp_topk_merge(config(dcp_size=16, interleave=1024), TOPK) == 0
     assert collectives == []
     gate._MERGE_INIT.clear()
     assert gate.init_dcp_topk_merge(config(), TOPK) == 0

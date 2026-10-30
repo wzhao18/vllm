@@ -47,9 +47,12 @@ def packed_row_words(local_topk: int) -> int:
 
 def dcp_topk_merge_local_topk(vllm_config: Any, topk: int) -> int:
     """N for the one-round DCP decode top-k merge, or 0 when it is unavailable
-    (no DCP, more than ``MAX_WORLD_SIZE`` DCP ranks, PCP, a top-k backend
-    other than auto / deep_select, not SM100, no CuTe DSL / DeepSelect, or
-    local token indices that do not fit ``LOCAL_INDEX_BITS``)."""
+    (no DCP, more than ``MAX_WORLD_SIZE`` DCP ranks, PCP, a KV cache
+    interleave other than 1, a top-k backend other than auto / deep_select,
+    not SM100, no CuTe DSL / DeepSelect, or local token indices that do not
+    fit ``LOCAL_INDEX_BITS``)."""
+    from vllm.v1.attention.ops.dcp import cp_kv_cache_interleave_one
+
     parallel_config = vllm_config.parallel_config
     world_size = parallel_config.decode_context_parallel_size
     max_local_len = -(-vllm_config.model_config.max_model_len // world_size)
@@ -57,6 +60,9 @@ def dcp_topk_merge_local_topk(vllm_config: Any, topk: int) -> int:
         world_size <= 1
         or world_size > MAX_WORLD_SIZE
         or parallel_config.prefill_context_parallel_size > 1
+        # The packed ids decode as local * W + rank; at another interleave
+        # no step takes the merge, so it sets up nothing.
+        or not cp_kv_cache_interleave_one(vllm_config)
         or vllm_config.kernel_config.sparse_indexer_topk_backend
         not in ("auto", "deep_select")
         or not current_platform.is_cuda()
