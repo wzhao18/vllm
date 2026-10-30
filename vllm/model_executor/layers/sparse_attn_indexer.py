@@ -187,8 +187,8 @@ def _merge_dcp_topk_global(
     score row. Overwrites ``topk_indices`` with global token ids (``-1`` for
     padding); the attention backend localizes them back to physical slots per
     rank.
-    The selector ranks only the high ``score_bits`` of the scores (16 when the
-    logits are upcast BF16) and the id bits that positions below
+    The selector ranks only the high ``score_bits`` of the scores (16 for BF16
+    logits, upcast or not) and the id bits that positions below
     ``num_positions`` use.
     """
     if dcp_world_size <= 1:
@@ -552,9 +552,9 @@ def sparse_attn_indexer(
         )
         assert candidate_block_size > 0
 
-    # DeepSelect ranks SM100's BF16 decode logits directly; other top-k
-    # backends and the DCP merge read an FP32 copy.
-    fp32_decode_logits = topk_backend != "deep_select" or dcp_world_size != 1
+    # DeepSelect ranks SM100's BF16 decode logits directly, also under DCP
+    # (whose merge reads them as well); other top-k backends read an FP32 copy.
+    fp32_decode_logits = topk_backend != "deep_select"
 
     # assert isinstance(attn_metadata, dict)
     # kv_cache is an empty placeholder until bind_kv_cache runs after memory
