@@ -6,7 +6,9 @@ Packs and unpacks ``--units`` units of Kimi-K3.1's packed DSA block (24 DSA
 layers of fp8 latent and indexer pages plus ``--num-draft`` DSpark latent
 pages, laid out by the real KV cache planner) in rounds of ``--chunk-units``,
 on one GPU. Pack and unpack each read and write every exchanged byte once, so
-each moves 4 x H bytes per unit, H being half of a block's exchanged bytes.
+each moves 4 x H bytes per unit, H being half of a block's exchanged bytes;
+unpacking the last unit, which has no partner, zero-fills its half 1 without
+reading it, so moves 3 x H.
 Stage 4 of the design asks for at least 70% of the roofline.
 
 ``exchange`` times the whole step as the worker runs it, eagerly: unit-table
@@ -195,7 +197,7 @@ def main(args) -> None:
             chunk_units=chunk_units,
             communicator=Loopback(),
         )
-        classes = exchanger._classes
+        plan = exchanger._plan
         for num_units in args.units:
             block_ids = (rng.permutation(max_units) + 1)[:num_units].tolist()
             units = [PairUnit(0, b, True) for b in block_ids]
@@ -208,20 +210,20 @@ def main(args) -> None:
                 for i in range(0, num_units, chunk_units)
             ]
 
-            def pack(chunks=chunks, exchanger=exchanger, classes=classes):
+            def pack(chunks=chunks, exchanger=exchanger, plan=plan):
                 for chunk, chunk_rows in chunks:
-                    exchanger._pack(chunk, chunk_rows, classes)
+                    exchanger._pack(chunk, chunk_rows, plan)
 
-            def unpack(chunks=chunks, exchanger=exchanger, classes=classes):
+            def unpack(chunks=chunks, exchanger=exchanger, plan=plan):
                 for chunk, chunk_rows in chunks:
-                    exchanger._unpack(chunk, chunk_rows, classes)
+                    exchanger._unpack(chunk, chunk_rows, plan)
 
             def exchange(units=units, exchanger=exchanger):
                 exchanger.exchange(units)
 
             # The kernels must match the reference before they are timed.
             first, first_rows = chunks[0]
-            exchanger._pack(first, first_rows, classes)
+            exchanger._pack(first, first_rows, plan)
             keep, send = reference_pack(buf, table, layout, [u.block_id for u in first])
             n = len(first)
             assert torch.equal(exchanger.keep[:n], keep)
@@ -230,7 +232,8 @@ def main(args) -> None:
                 fn()
             torch.accelerator.synchronize()
 
-            moved = 4 * half_bytes * num_units
+            pack_bytes = 4 * half_bytes * num_units
+            unpack_bytes = pack_bytes - half_bytes
             pack_us = gpu_us(pack, graph=True, iters=args.iters)
             unpack_us = gpu_us(unpack, graph=True, iters=args.iters)
             rows.append(
@@ -239,11 +242,11 @@ def main(args) -> None:
                     chunk_units,
                     len(chunks),
                     f"{pack_us:.1f}",
-                    f"{moved / pack_us / 1e3:.0f}",
-                    f"{moved / pack_us / 1e6 / hbm_tbps:.0%}",
+                    f"{pack_bytes / pack_us / 1e3:.0f}",
+                    f"{pack_bytes / pack_us / 1e6 / hbm_tbps:.0%}",
                     f"{unpack_us:.1f}",
-                    f"{moved / unpack_us / 1e3:.0f}",
-                    f"{moved / unpack_us / 1e6 / hbm_tbps:.0%}",
+                    f"{unpack_bytes / unpack_us / 1e3:.0f}",
+                    f"{unpack_bytes / unpack_us / 1e6 / hbm_tbps:.0%}",
                     f"{gpu_us(exchange, graph=False, iters=args.iters):.1f}",
                     f"{host_us(exchange, iters=args.iters):.1f}",
                 ]

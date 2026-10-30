@@ -234,7 +234,8 @@ _PAIR = [pair_layout(c, 2, 1, 1024, 1) for c in (0, 1)]
 def test_buffers_and_kernel_classes_on_k31_geometry(num_draft: int):
     """Design §3.5: H is 8,699,904 B plus 294,912 B per drafter layer, so the
     three [4, H] buffers take 104.4 MB without drafter pages and 122.1 MB with
-    five. One launch per row width moves 16-byte vectors, 4-byte for scales."""
+    five. Each chunk's one launch moves every row width: 16-byte vectors,
+    4-byte for scales."""
     rank = _Rank(_k31_dsa_specs(1024, 24, num_draft), num_blocks=1)
     exchanger = DcpPairExchanger(
         rank.table, pair_layout(3, 16, 8, 1024, 1), "cpu", communicator=_Recording()
@@ -585,6 +586,44 @@ def test_triton_exchange_matches_torch_reference(latent: str, far: bool):
             ids = [u.block_id for u in _UNITS[start : start + 2]]
             _, want = reference_pack(initial[r], table, _PAIR[r], ids)
             assert torch.equal(send, want), f"rank {r} round {start // 2}"
+
+
+@requires_gpu
+@pytest.mark.parametrize(
+    "width,lead,vector_bytes", [(576, 0, 16), (24, 0, 8), (24, 4, 4)]
+)
+def test_triton_exchange_with_tile_tails_and_narrow_copies(
+    width: int, lead: int, vector_bytes: int
+):
+    """A6 where 1024-row blocks never go: 8-row blocks leave every tile a
+    masked tail, and their rows move in 16-, 8- or 4-byte copies."""
+    device = torch.device("cuda")
+    stride = 8 * width + 16
+    bufs = [
+        torch.randint(
+            0,
+            256,
+            (lead + 7 * stride,),
+            dtype=torch.uint8,
+            generator=torch.Generator().manual_seed(seed),
+        ).to(device)
+        for seed in range(2)
+    ]
+    tables = [_token_table(buf.data_ptr() + lead, width, stride) for buf in bufs]
+    layouts = [pair_layout(c, 2, 1, 8, 1) for c in (0, 1)]
+    expected = [buf.clone() for buf in bufs]
+    reference_pair_exchange(
+        expected,
+        [{0: _rebased(t, b, e)} for t, b, e in zip(tables, bufs, expected)],
+        _UNITS,
+    )
+
+    exchanger = _triton_exchanger(bufs[0], tables[0], layouts[0], _Recording(), 2)
+    assert [c.vector_bytes for c in exchanger._classes] == [vector_bytes]
+    _exchange_pair(_triton_exchanger, bufs, tables, layouts, _UNITS, 2)
+    torch.accelerator.synchronize()
+    for r in range(2):
+        assert torch.equal(bufs[r], expected[r]), f"rank {r}"
 
 
 # ----------------------------------------------------------------------------

@@ -31,7 +31,7 @@ import hashlib
 import os
 import socket
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -618,15 +618,15 @@ def reference_zero_pages(
 # Exchanger: Triton pack/unpack and one NCCL round with the partner per chunk
 # ----------------------------------------------------------------------------
 
-# Vectors one program moves for one array of one unit, and its warps.
-_TILE_VECTORS = 512
+# Vectors one program moves into or out of each buffer, and its warps.
+_TILE_VECTORS = 256
 _NUM_WARPS = 4
 # Warm-up fails startup below this much free device memory.
 _MIN_FREE_BYTES = 1 << 30
 # One-unit NCCL swaps timed at warm-up; the fastest is logged.
 _TIMED_SWAPS = 3
 _STAMP_MAGIC = int.from_bytes(b"NIXLPAIR", "big")
-# Settings that decide NCCL's transport between the partners.
+# Settings that decide NCCL's transport and P2P channels between the partners.
 _NCCL_TRANSPORT_ENV = (
     "NCCL_MNNVL_ENABLE",
     "NCCL_P2P_DISABLE",
@@ -636,120 +636,219 @@ _NCCL_TRANSPORT_ENV = (
     "NCCL_SHM_DISABLE",
     "NCCL_CUMEM_ENABLE",
     "NCCL_NVLS_ENABLE",
+    "NCCL_MIN_P2P_NCHANNELS",
+    "NCCL_MAX_P2P_NCHANNELS",
 )
 
 
 @triton.jit
-def _pair_row_offsets(
-    block_offset,
-    subpage_stride,
+def _row_words(
     row,
     column,
-    WIDTH: tl.constexpr,
+    subpage_words,
+    ROW_WORDS: tl.constexpr,
     ROWS_PER_SUBPAGE: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
 ):
-    """int64 offsets, from the array page of block 0, of byte ``column`` of
-    ``row`` in the block ``block_offset`` bytes further."""
-    subpage = (row // ROWS_PER_SUBPAGE).to(tl.int64)
-    within = (row % ROWS_PER_SUBPAGE) * WIDTH + column
-    return block_offset + subpage * subpage_stride + within.to(tl.int64)
+    """int32 offsets in words, from the array's page, of word ``column`` of
+    ``row``."""
+    if ROWS_PER_SUBPAGE >= BLOCK_ROWS:
+        words = row * ROW_WORDS + column
+    else:
+        subpage = row // ROWS_PER_SUBPAGE
+        within = row % ROWS_PER_SUBPAGE
+        words = subpage * subpage_words + within * ROW_WORDS + column
+    return words
 
 
 @triton.jit
-def _pair_rows_kernel(
-    units_ptr,  # [n, 2] int64: block id, has partner
-    arrays_ptr,  # [num_arrays, 3] int64: page address, sub-page stride, H offset
-    keep_ptr,  # [K, H] uint8
-    other_ptr,  # [K, H] uint8: send when packing, recv when unpacking
-    block_stride,
-    half_bytes,
+def _pair_rows(
+    units_ptr,
+    arrays_ptr,
+    keep_ptr,
+    other_ptr,
+    unit,
+    array,
+    tile,
     PACK: tl.constexpr,
     PARITY: tl.constexpr,
+    HALF: tl.constexpr,
+    BLOCK_STRIDE: tl.constexpr,
+    HALF_WORDS: tl.constexpr,
     WIDTH: tl.constexpr,
     VEC: tl.constexpr,
     ROWS_PER_SUBPAGE: tl.constexpr,
-    HALF: tl.constexpr,
     TILE: tl.constexpr,
 ):
     """Pack or unpack ``TILE`` vectors of ``VEC`` bytes of one array of one
     unit's block. Packing gathers rows ``2y + c`` into ``keep`` and ``2y + 1 -
     c`` into ``send``; unpacking writes ``keep`` to rows ``HALF * c + y``,
     ``recv`` to rows ``HALF * (1 - c) + y``, and zeros to rows ``[HALF, 2 *
-    HALF)`` of a unit without partner. Page addresses are absolute int64, as in
-    ``_zero_kv_blocks_kernel``."""
-    unit = tl.program_id(0)
-    array = tl.program_id(1)
+    HALF)`` of a unit without partner. Both rows are loaded before either is
+    stored. Page addresses are absolute int64, offsets within a page int32."""
+    LANES: tl.constexpr = VEC // 4
     VECTORS_PER_ROW: tl.constexpr = WIDTH // VEC
     NUM_VECTORS: tl.constexpr = HALF * VECTORS_PER_ROW
-    vector = tl.program_id(2) * TILE + tl.arange(0, TILE)
-    mask = (vector < NUM_VECTORS)[:, None]
-    y = vector // VECTORS_PER_ROW
-    column = (vector % VECTORS_PER_ROW) * VEC
-    lanes = tl.arange(0, VEC)[None, :]
 
-    page = tl.load(arrays_ptr + array * 3)
-    page = tl.multiple_of(tl.cast(page, tl.pointer_type(tl.uint8)), VEC)
-    subpage_stride = tl.load(arrays_ptr + array * 3 + 1)
-    block_offset = tl.load(units_ptr + unit * 2) * block_stride
-    buffer = unit.to(tl.int64) * half_bytes + tl.load(arrays_ptr + array * 3 + 2)
-    buffer = tl.multiple_of(buffer + vector.to(tl.int64) * VEC, VEC)[:, None] + lanes
+    block = tl.load(units_ptr + unit * 2)
+    page = tl.load(arrays_ptr + array * 3) + block * BLOCK_STRIDE
+    page = tl.multiple_of(tl.cast(page, tl.pointer_type(tl.int32)), VEC)
+    subpage_words = tl.load(arrays_ptr + array * 3 + 1).to(tl.int32)
+    buffer = unit.to(tl.int64) * HALF_WORDS + tl.load(arrays_ptr + array * 3 + 2)
+    keep_buffer = tl.multiple_of(keep_ptr + buffer, VEC)
+    other_buffer = tl.multiple_of(other_ptr + buffer, VEC)
+
+    vector = tile * TILE + tl.arange(0, TILE)
+    y = vector // VECTORS_PER_ROW
+    column = (vector - y * VECTORS_PER_ROW) * LANES
     if PACK:
         keep_row = 2 * y + PARITY
         other_row = 2 * y + 1 - PARITY
     else:
         keep_row = HALF * PARITY + y
         other_row = HALF * (1 - PARITY) + y
-    keep_rows = _pair_row_offsets(
-        block_offset, subpage_stride, keep_row, column, WIDTH, ROWS_PER_SUBPAGE
+    lanes = tl.arange(0, LANES)[None, :]
+    keep_words = _row_words(
+        keep_row, column, subpage_words, WIDTH // 4, ROWS_PER_SUBPAGE, 2 * HALF
     )
-    keep_rows = page + tl.multiple_of(keep_rows, VEC)[:, None] + lanes
-    other_rows = _pair_row_offsets(
-        block_offset, subpage_stride, other_row, column, WIDTH, ROWS_PER_SUBPAGE
+    other_words = _row_words(
+        other_row, column, subpage_words, WIDTH // 4, ROWS_PER_SUBPAGE, 2 * HALF
     )
-    other_rows = page + tl.multiple_of(other_rows, VEC)[:, None] + lanes
+    keep_rows = page + tl.multiple_of(keep_words, LANES)[:, None] + lanes
+    other_rows = page + tl.multiple_of(other_words, LANES)[:, None] + lanes
+    words = tl.multiple_of(vector * LANES, LANES)[:, None] + lanes
+    mask = None if NUM_VECTORS % TILE == 0 else (vector < NUM_VECTORS)[:, None]
 
     if PACK:
-        tl.store(keep_ptr + buffer, tl.load(keep_rows, mask=mask), mask=mask)
-        tl.store(other_ptr + buffer, tl.load(other_rows, mask=mask), mask=mask)
+        keep = tl.load(keep_rows, mask=mask)
+        other = tl.load(other_rows, mask=mask)
+        tl.store(keep_buffer + words, keep, mask=mask)
+        tl.store(other_buffer + words, other, mask=mask)
     else:
         # Half 1 comes from P block 2j + 1, which a unit without partner lacks.
-        has_partner = tl.load(units_ptr + unit * 2 + 1)
+        has_partner = tl.load(units_ptr + unit * 2 + 1).to(tl.int32)
         half_1 = (vector < has_partner * NUM_VECTORS)[:, None]
         if PARITY == 0:
-            keep_mask = mask
-            other_mask = half_1
+            keep = tl.load(keep_buffer + words, mask=mask)
+            other = tl.load(other_buffer + words, mask=half_1, other=0)
         else:
-            keep_mask = half_1
-            other_mask = mask
-        keep = tl.load(keep_ptr + buffer, mask=keep_mask, other=0)
+            keep = tl.load(keep_buffer + words, mask=half_1, other=0)
+            other = tl.load(other_buffer + words, mask=mask)
         tl.store(keep_rows, keep, mask=mask)
-        other = tl.load(other_ptr + buffer, mask=other_mask, other=0)
         tl.store(other_rows, other, mask=mask)
+
+
+@triton.jit
+def _pair_row_class(
+    units_ptr,
+    arrays_ptr,
+    keep_ptr,
+    other_ptr,
+    unit,
+    program,
+    PACK: tl.constexpr,
+    PARITY: tl.constexpr,
+    HALF: tl.constexpr,
+    BLOCK_STRIDE: tl.constexpr,
+    HALF_WORDS: tl.constexpr,
+    ROW_CLASS: tl.constexpr,
+):
+    """Move the tile of ``program`` if it is one of ``ROW_CLASS``'s; see
+    ``_LaunchPlan.constants``."""
+    WIDTH: tl.constexpr = ROW_CLASS[0]
+    VEC: tl.constexpr = ROW_CLASS[1]
+    ROWS_PER_SUBPAGE: tl.constexpr = ROW_CLASS[2]
+    TILE: tl.constexpr = ROW_CLASS[3]
+    TILES: tl.constexpr = ROW_CLASS[4]
+    FIRST_ARRAY: tl.constexpr = ROW_CLASS[5]
+    FIRST_PROGRAM: tl.constexpr = ROW_CLASS[6]
+    END_PROGRAM: tl.constexpr = ROW_CLASS[7]
+    if (program >= FIRST_PROGRAM) & (program < END_PROGRAM):
+        _pair_rows(
+            units_ptr,
+            arrays_ptr,
+            keep_ptr,
+            other_ptr,
+            unit,
+            FIRST_ARRAY + (program - FIRST_PROGRAM) // TILES,
+            (program - FIRST_PROGRAM) % TILES,
+            PACK,
+            PARITY,
+            HALF,
+            BLOCK_STRIDE,
+            HALF_WORDS,
+            WIDTH,
+            VEC,
+            ROWS_PER_SUBPAGE,
+            TILE,
+        )
+
+
+@triton.jit
+def _pair_rows_kernel(
+    units_ptr,  # [n, 2] int64: block id, has partner
+    arrays_ptr,  # [num_arrays, 3] int64: see _LaunchPlan.arrays
+    keep_ptr,  # [K, H / 4] int32
+    other_ptr,  # [K, H / 4] int32: send when packing, recv when unpacking
+    PACK: tl.constexpr,
+    PARITY: tl.constexpr,
+    HALF: tl.constexpr,
+    BLOCK_STRIDE: tl.constexpr,
+    HALF_WORDS: tl.constexpr,
+    CLASSES: tl.constexpr,
+):
+    """Pack or unpack every array of one chunk. Grid: (programs per unit,
+    units); a unit's programs take each row class's arrays tile by tile."""
+    unit = tl.program_id(1)
+    program = tl.program_id(0)
+    for i in tl.static_range(len(CLASSES)):
+        _pair_row_class(
+            units_ptr,
+            arrays_ptr,
+            keep_ptr,
+            other_ptr,
+            unit,
+            program,
+            PACK,
+            PARITY,
+            HALF,
+            BLOCK_STRIDE,
+            HALF_WORDS,
+            CLASSES[i],
+        )
 
 
 @dataclass(frozen=True)
 class _RowClass:
-    """Arrays of one row width and sub-page height, moved by one launch per
-    chunk."""
+    """Arrays of one row width and sub-page height."""
 
     width: int
     rows_per_subpage: int
     vector_bytes: int
     tile: int
     num_tiles: int
+    num_arrays: int
+
+
+class _LaunchPlan(NamedTuple):
+    """The launch that packs or unpacks a chunk: every row class in one."""
+
     arrays: torch.Tensor
-    """``[num_arrays, 3]`` int64: address of the array in block 0, sub-page
-    stride, and offset of the array's half rows in a unit's ``H`` bytes."""
+    """``[num_arrays, 3]`` int64, class by class: address of the array in
+    block 0, its sub-page stride in words, and the offset of its half rows in
+    a unit's ``H`` bytes in words."""
+    num_programs: int
+    """Programs per unit."""
+    constants: dict[str, Any]
+    """The kernel's constants. ``CLASSES`` holds each row class's width, copy
+    bytes, rows per sub-page, tile, tiles per array, first array, and first
+    and end program."""
 
-    @property
-    def num_arrays(self) -> int:
-        return self.arrays.shape[0]
-
-    def rebased(self, delta: int) -> "_RowClass":
-        """The class with its arrays ``delta`` bytes further."""
+    def rebased(self, delta: int) -> "_LaunchPlan":
+        """The plan with its arrays ``delta`` bytes further."""
         arrays = self.arrays.clone()
         arrays[:, 0] += delta
-        return replace(self, arrays=arrays)
+        return self._replace(arrays=arrays)
 
 
 def _vector_bytes(*values: int) -> int:
@@ -758,8 +857,11 @@ def _vector_bytes(*values: int) -> int:
     return next((v for v in (16, 8, 4) if all(x % v == 0 for x in values)), 0)
 
 
-def _row_classes(table: PairRowTable, device: torch.device) -> list[_RowClass]:
-    """The table's arrays grouped by row width and sub-page height."""
+def _row_classes(
+    table: PairRowTable,
+) -> list[tuple[_RowClass, list[tuple[int, int, int]]]]:
+    """The table's arrays grouped by row width and sub-page height, each with
+    its arrays' address in block 0, sub-page stride and offset in ``H``."""
     members: dict[tuple[int, int], list[tuple[PairRowArray, int]]] = {}
     for array, (start, _) in zip(table.arrays, table.segments()):
         key = (array.width, array.rows_per_subpage)
@@ -783,23 +885,69 @@ def _row_classes(table: PairRowTable, device: torch.device) -> list[_RowClass]:
             )
         vectors = table.block_size // 2 * width // vector_bytes
         tile = min(_TILE_VECTORS, 1 << (vectors - 1).bit_length())
-        classes.append(
-            _RowClass(
-                width=width,
-                rows_per_subpage=rows,
-                vector_bytes=vector_bytes,
-                tile=tile,
-                num_tiles=cdiv(vectors, tile),
-                arrays=torch.tensor(entries, dtype=torch.int64, device=device),
-            )
+        row_class = _RowClass(
+            width=width,
+            rows_per_subpage=rows,
+            vector_bytes=vector_bytes,
+            tile=tile,
+            num_tiles=cdiv(vectors, tile),
+            num_arrays=len(entries),
         )
+        classes.append((row_class, entries))
     return classes
 
 
-def _unit_rows(units: Sequence[PairUnit]) -> np.ndarray:
-    """``[n, 2]`` int64 (block id, has partner) of each unit, for the kernels."""
-    rows = [(u.block_id, u.has_partner) for u in units]
-    return np.array(rows, dtype=np.int64).reshape(-1, 2)
+def _launch_plan(
+    table: PairRowTable,
+    classes: Sequence[tuple[_RowClass, list[tuple[int, int, int]]]],
+    parity: int,
+    device: torch.device,
+) -> _LaunchPlan:
+    """One launch per chunk for all the row classes."""
+    arrays = torch.tensor(
+        [
+            (addr, stride // 4, start // 4)
+            for _, entries in classes
+            for addr, stride, start in entries
+        ],
+        dtype=torch.int64,
+        device=device,
+    )
+    constants = []
+    first_array = first_program = 0
+    for row_class, _ in classes:
+        end_program = first_program + row_class.num_arrays * row_class.num_tiles
+        constants.append(
+            (
+                row_class.width,
+                row_class.vector_bytes,
+                row_class.rows_per_subpage,
+                row_class.tile,
+                row_class.num_tiles,
+                first_array,
+                first_program,
+                end_program,
+            )
+        )
+        first_array += row_class.num_arrays
+        first_program = end_program
+    return _LaunchPlan(
+        arrays=arrays,
+        num_programs=first_program,
+        constants=dict(
+            PARITY=parity,
+            HALF=table.block_size // 2,
+            BLOCK_STRIDE=table.block_stride,
+            HALF_WORDS=table.half_bytes // 4,
+            CLASSES=tuple(constants),
+        ),
+    )
+
+
+def _unit_rows(units: Sequence[PairUnit]) -> list[list[int]]:
+    """(block id, has partner) of each unit, for the kernels. A list: it
+    stages straight into pinned memory."""
+    return [[u.block_id, int(u.has_partner)] for u in units]
 
 
 def _p2p_op(op: Any, tensor: torch.Tensor, peer: int) -> torch.distributed.P2POp:
@@ -946,11 +1094,26 @@ class DcpPairExchanger:
         self._communicator = (
             _dcp_communicator(layout) if communicator is None else communicator
         )
-        self._classes = _row_classes(table, self.device)
+        classes = _row_classes(table)
+        self._classes = [row_class for row_class, _ in classes]
+        self._plan = _launch_plan(table, classes, layout.parity, self.device)
         shape = (chunk_units, table.half_bytes)
         self.keep = torch.empty(shape, dtype=torch.uint8, device=self.device)
         self.send = torch.empty_like(self.keep)
         self.recv = torch.empty_like(self.keep)
+        # The kernels move 4-byte words, which every row width is made of.
+        self._words = {
+            name: getattr(self, name).view(torch.int32)
+            for name in ("keep", "send", "recv")
+        }
+        # The NCCL round of n units, n <= K.
+        self._swaps = [
+            (
+                _p2p_op(torch.distributed.isend, self.send[:n], layout.partner),
+                _p2p_op(torch.distributed.irecv, self.recv[:n], layout.partner),
+            )
+            for n in range(chunk_units + 1)
+        ]
 
     @property
     def signature(self) -> tuple:
@@ -991,7 +1154,7 @@ class DcpPairExchanger:
         """
         if units:
             rows = async_tensor_h2d(_unit_rows(units), self.device, torch.int64)
-            self._run(units, rows, self._classes)
+            self._run(units, rows, self._plan)
 
     def record_event(self) -> torch.cuda.Event:
         """An event on the current stream, after every exchange queued so
@@ -1007,7 +1170,7 @@ class DcpPairExchanger:
         signatures, so skewed partners both fail here, naming both sides,
         before any message whose size depends on the geometry. A scratch block
         filled with this rank's byte then goes through pack, NCCL and unpack,
-        which compiles every row-width kernel; half ``c`` of each array must
+        which compiles the pack and unpack kernels; half ``c`` of each array must
         come back with this rank's byte and the other half with the partner's.
         Logs what decides the NCCL transport, the buffer bytes and the free
         device memory before and after.
@@ -1038,7 +1201,7 @@ class DcpPairExchanger:
         delta = scratch.data_ptr() + offset - self.table.base_addr
         unit = [PairUnit(0, 0, True)]
         rows = async_tensor_h2d(_unit_rows(unit), self.device, torch.int64)
-        self._run(unit, rows, [c.rebased(delta) for c in self._classes])
+        self._run(unit, rows, self._plan.rebased(delta))
         swap_ms = self._time_swaps()
         self._check_scratch(scratch[offset:].cpu().numpy())
         del scratch
@@ -1086,34 +1249,34 @@ class DcpPairExchanger:
         self,
         units: Sequence[PairUnit],
         rows: torch.Tensor,
-        classes: Sequence[_RowClass],
+        plan: _LaunchPlan,
     ) -> None:
         """Pack, swap and unpack the units chunk by chunk, ``rows`` being
         their ``_unit_rows`` on the device."""
         for start in range(0, len(units), self.chunk_units):
             chunk = units[start : start + self.chunk_units]
             chunk_rows = rows[start : start + len(chunk)]
-            self._pack(chunk, chunk_rows, classes)
+            self._pack(chunk, chunk_rows, plan)
             self._communicate(len(chunk))
-            self._unpack(chunk, chunk_rows, classes)
+            self._unpack(chunk, chunk_rows, plan)
 
     def _pack(
         self,
         units: Sequence[PairUnit],
         rows: torch.Tensor,
-        classes: Sequence[_RowClass],
+        plan: _LaunchPlan,
     ) -> None:
         """Fill ``keep`` and ``send`` for one chunk."""
-        self._launch(True, rows, len(units), self.send, classes)
+        self._launch(True, rows, len(units), self._words["send"], plan)
 
     def _unpack(
         self,
         units: Sequence[PairUnit],
         rows: torch.Tensor,
-        classes: Sequence[_RowClass],
+        plan: _LaunchPlan,
     ) -> None:
         """Rewrite one chunk's blocks from ``keep`` and ``recv``."""
-        self._launch(False, rows, len(units), self.recv, classes)
+        self._launch(False, rows, len(units), self._words["recv"], plan)
 
     def _launch(
         self,
@@ -1121,37 +1284,22 @@ class DcpPairExchanger:
         rows: torch.Tensor,
         num_units: int,
         other: torch.Tensor,
-        classes: Sequence[_RowClass],
+        plan: _LaunchPlan,
     ) -> None:
-        for row_class in classes:
-            grid = (num_units, row_class.num_arrays, row_class.num_tiles)
-            _pair_rows_kernel[grid](
-                rows,
-                row_class.arrays,
-                self.keep,
-                other,
-                self.table.block_stride,
-                self.table.half_bytes,
-                PACK=pack,
-                PARITY=self.layout.parity,
-                WIDTH=row_class.width,
-                VEC=row_class.vector_bytes,
-                ROWS_PER_SUBPAGE=row_class.rows_per_subpage,
-                HALF=self.layout.half,
-                TILE=row_class.tile,
-                num_warps=_NUM_WARPS,
-            )
+        _pair_rows_kernel[(plan.num_programs, num_units)](
+            rows,
+            plan.arrays,
+            self._words["keep"],
+            other,
+            PACK=pack,
+            **plan.constants,
+            num_warps=_NUM_WARPS,
+        )
 
     def _communicate(self, num_units: int) -> None:
         """Swap the first ``num_units`` rows of ``send`` and ``recv`` with the
         partner."""
-        peer = self.layout.partner
-        self._communicator.batch_isend_irecv(
-            [
-                _p2p_op(torch.distributed.isend, self.send[:num_units], peer),
-                _p2p_op(torch.distributed.irecv, self.recv[:num_units], peer),
-            ]
-        )
+        self._communicator.batch_isend_irecv(list(self._swaps[num_units]))
 
     def _stamp(self) -> _Stamp:
         return _Stamp(
