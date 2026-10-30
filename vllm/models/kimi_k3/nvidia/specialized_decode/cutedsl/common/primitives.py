@@ -352,6 +352,17 @@ def pack_fp8(values):
     return code, "=r,f,f,f,f", values
 
 
+@asm(Uint32, pure=True)
+def pack_e2m1(values):
+    """E2M1 (round to nearest, satfinite) of 8 values, element 0 in the low nibble
+    (cvt's first source is the high nibble)."""
+    code = "{ .reg .b8 b0,b1,b2,b3; cvt.rn.satfinite.e2m1x2.f32 b0,$2,$1; "
+    code += "cvt.rn.satfinite.e2m1x2.f32 b1,$4,$3; "
+    code += "cvt.rn.satfinite.e2m1x2.f32 b2,$6,$5; "
+    code += "cvt.rn.satfinite.e2m1x2.f32 b3,$8,$7; mov.b32 $0,{b0,b1,b2,b3}; }"
+    return code, "=r,f,f,f,f,f,f,f,f", values
+
+
 @cute.jit
 def mx_exponent(amax: Float32, floor: cutlass.Constexpr[bool] = False):
     bits = Uint32(float_bits(amax))
