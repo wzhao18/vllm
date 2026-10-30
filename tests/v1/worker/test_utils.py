@@ -1602,6 +1602,29 @@ def test_copy_kv_cache_blocks_inplace_mamba_group_copies_its_state_only():
         assert not full[3, 56:].any()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused copy is CUDA-only")
+def test_copy_kv_cache_blocks_inplace_packed_rows_do_not_spill():
+    """Block-outer (BLHNC) rows pack every layer's page into one block: the
+    fused copy moves each layer's page, not a block stride from the layer's
+    offset (which overwrote the next block with the source's neighbour)."""
+    from vllm.v1.worker.utils import KVBlockCopyGroups
+
+    num_blocks, layers, page = 6, 3, 64
+    row = layers * page
+    raw = torch.arange(1, num_blocks + 1, dtype=torch.int8, device="cuda")
+    raw = raw.repeat_interleave(row)
+    views = [
+        torch.as_strided(raw, (num_blocks, 1, 4, 16), (row, 64, 16, 1), layer * page)
+        for layer in range(layers)
+    ]
+    groups = KVBlockCopyGroups(views=[views], block_sizes=[16], dcp_sharded=[False])
+    copy = KVCacheBlockCopy(1, 3, group_id=0)
+    copy_kv_cache_blocks_inplace(views, num_blocks, [copy], groups)
+    blocks = raw.view(num_blocks, row).cpu()
+    assert (blocks[3] == 2).all()
+    assert (blocks[4] == 5).all()
+
+
 def test_warmup_kv_block_copies_runs_each_group_without_changing_data(monkeypatch):
     """The startup warmup launches one null-block self-copy per non-empty
     group (compiling each fused-kernel variant) and leaves every page as is."""

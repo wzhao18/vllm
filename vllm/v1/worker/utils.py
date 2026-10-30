@@ -1054,10 +1054,12 @@ def _build_copy_segments(
     """Segments that copy a scheduler block's leading kernel blocks per view.
 
     A view's scheduler block is ``ratio`` kernel blocks at a fixed stride, so its
-    first ``k`` kernel blocks are one byte range of ``k`` kernel strides (any
-    padding between kernel pages belongs to the same block). Dims laid out
-    outside the kernel stride get a segment each. None (use the indexing
-    fallback) for views off CUDA, unaligned, or with differing ratios.
+    first ``k`` kernel blocks are one byte range of ``k`` pages. A segment copies
+    its page, never its stride: block-outer layouts (BLHNC) pack every layer's
+    page into one block row, so a stride-long copy from a layer's offset would
+    overwrite the next block. Dims laid out outside the kernel stride get a
+    segment each. None (use the indexing fallback) for views off CUDA,
+    unaligned, with padded kernel pages, or with differing ratios.
     """
     addrs: list[int] = []
     strides: list[int] = []
@@ -1075,7 +1077,9 @@ def _build_copy_segments(
         outer = [d for d in range(1, view.ndim) if view.stride(d) * el > kstride]
         inner = [d for d in range(1, view.ndim) if d not in outer]
         page = el + sum((view.shape[d] - 1) * view.stride(d) * el for d in inner)
-        if page > kstride or kstride % 4:
+        if page > kstride or kstride % 4 or page % 4:
+            return None
+        if ratio > 1 and page != kstride:
             return None
         for index in iprod(*(range(view.shape[d]) for d in outer)):
             addr = view.data_ptr() + sum(
@@ -1085,7 +1089,7 @@ def _build_copy_segments(
                 return None
             addrs.append(addr)
             strides.append(kstride * ratio // 4)
-            kernel_els.append(kstride // 4)
+            kernel_els.append(page // 4)
     if device is None or len(ratios) != 1:
         return None
     (ratio,) = ratios
