@@ -438,9 +438,103 @@ def _check_deterministic(group, ws, n: int, repeats: int = 8) -> None:
         assert torch.equal(runs[0][4], runs[0][1])
 
 
-def run_worker(rank: int, world: int, local_rank: int, init_method: str) -> None:
-    """One DCP rank. Also callable from a multi-node launcher."""
+def _check_hook(group, n: int) -> None:
+    """VLLM_DSA_BPRIME_CHECK over a real DCP group: the stock indexer's
+    reference merge next to the one-round merge, eager and inside a CUDA
+    graph, finds no miss on clean, tie-heavy and saturated rows, counts the
+    saturated ones, and flags a lost token with its (layer, step, row)."""
+    from vllm.model_executor.layers.sparse_attn_indexer import (
+        _check_dcp_decode_topk_merge,
+    )
+    from vllm.v1.attention.ops.dcp_topk_merge import check
+    from vllm.v1.attention.ops.dcp_topk_merge.kernels import dcp_topk_merge
+
+    world, rank = group.world_size, group.rank_in_group
+    state = check.get_dcp_topk_merge_check()
+    assert state is not None, "VLLM_DSA_BPRIME_CHECK did not turn the check on"
+    lengths = [100_000, 40_000, 9_000, 70_123, 150_000, 6_000, 3_000, 220_000]
+    num_rows = len(lengths)
+    base, ends = _make_case(lengths, seed=31)
+    tied, _ = _make_case(lengths, seed=37, levels=16)
+    variants = [
+        base,
+        tied,
+        _boost(base, [0], slice(7, 8), world),
+        _boost(base, list(range((TOPK - 1) // n)), slice(None), world),
+    ]
+    shards = [_shard(v, ends, world, rank) for v in variants]
+    static = shards[0][0].clone()
+    local_end = shards[0][1]
+    seq_lens = local_end.view(-1, 1)
+    max_seq_len = int(local_end.max())
+    max_model_len = world << 17
+    ids = torch.empty((num_rows, TOPK), dtype=torch.int32, device="cuda")
+
+    def step(layer: str, merged: torch.Tensor | None = None) -> None:
+        dcp_topk_merge(static, local_end, ids, n)
+        _check_dcp_decode_topk_merge(
+            layer,
+            static,
+            local_end,
+            seq_lens,
+            1,
+            ids if merged is None else merged,
+            n,
+            "deep_select",
+            False,
+            max_seq_len,
+            max_model_len,
+            rank,
+            world,
+            16,
+        )
+
+    step("eager")
+    torch.accelerator.synchronize()
+    totals = state.snapshot()["totals"]
+    assert totals[check.MISS_ROWS] == 0 and totals[check.ROWS] == num_rows, totals
+    graph = torch.cuda.CUDAGraph()
+    with group.graph_capture() as ctx, torch.cuda.graph(graph, stream=ctx.stream):
+        step("graph")
+    for i in range(2 * len(variants)):
+        static.copy_(shards[i % len(variants)][0])
+        graph.replay()
+        torch.accelerator.synchronize()
+        _assert_exact(ids, variants[i % len(variants)], ends)
+    snap = state.snapshot()
+    totals = snap["totals"]
+    assert totals[check.CALLS] == 1 + 2 * len(variants), totals
+    assert totals[check.MISS_ROWS] == 0 and not snap["misses"], snap
+    assert totals[check.NAN_ROWS] == 0, totals
+    # The bound variant saturates (K - 1) // N ranks of each long row.
+    assert totals[check.SAT_ROWS] > 0, totals
+    assert totals[check.MAX_SAT_RANKS] == (TOPK - 1) // n, totals
+
+    static.copy_(shards[0][0])
+    dcp_topk_merge(static, local_end, ids, n)
+    lost = ids.clone()
+    row0 = set(lost[0].tolist())
+    top = int(variants[0][0, : lengths[0]].float().argmax())
+    assert top in row0
+    lost[0][lost[0] == top] = next(g for g in range(lengths[0]) if g not in row0)
+    step("lost", lost)
+    torch.accelerator.synchronize()
+    snap = state.snapshot()
+    assert snap["totals"][check.MISS_ROWS] == 1, snap
+    assert snap["misses"] == [("lost", 1, 0, 0, 1)], snap
+    state.log(final=True)
+
+
+def run_worker(
+    rank: int, world: int, local_rank: int, init_method: str, check_hook: bool = False
+) -> None:
+    """One DCP rank. Also callable from a multi-node launcher. ``check_hook``
+    runs the VLLM_DSA_BPRIME_CHECK case instead of the merge's own."""
+    import os
     from types import SimpleNamespace
+
+    if check_hook:
+        os.environ["VLLM_DSA_BPRIME_CHECK"] = "1"
 
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.distributed import (
@@ -491,6 +585,9 @@ def run_worker(rank: int, world: int, local_rank: int, init_method: str) -> None
             ws = get_dcp_topk_rescue_workspace(TOPK, n)
             assert ws is not None and ws.max_rows >= 8
             assert dcp_topk_merge_max_rows(TOPK, n) == ws.max_rows
+            if check_hook:
+                _check_hook(group, n)
+                return
             _check_cases(group, ws, n)
             _check_deterministic(group, ws, n)
             _check_nonfinite(group, n)
@@ -500,27 +597,37 @@ def run_worker(rank: int, world: int, local_rank: int, init_method: str) -> None
             cleanup_dist_env_and_memory()
 
 
-def _spawned(rank: int, world: int, init_method: str) -> None:
-    run_worker(rank, world, rank, init_method)
+def _spawned(rank: int, world: int, init_method: str, check_hook: bool) -> None:
+    run_worker(rank, world, rank, init_method, check_hook)
 
 
-@pytest.mark.parametrize(
-    "world",
-    [
-        pytest.param(
-            w,
-            marks=pytest.mark.skipif(
-                torch.accelerator.device_count() < w, reason=f"Need {w} GPUs."
-            ),
-        )
-        for w in (2, 4, 8)
-    ],
-)
+_WORLDS = [
+    pytest.param(
+        w,
+        marks=pytest.mark.skipif(
+            torch.accelerator.device_count() < w, reason=f"Need {w} GPUs."
+        ),
+    )
+    for w in (2, 4, 8)
+]
+
+
+@pytest.mark.parametrize("world", _WORLDS)
 def test_dcp_topk_merge_exact(world: int):
+    _run_group(world, check_hook=False)
+
+
+@pytest.mark.parametrize("world", _WORLDS)
+def test_dcp_topk_merge_check_hook(world: int):
+    _run_group(world, check_hook=True)
+
+
+def _run_group(world: int, check_hook: bool) -> None:
     init_method = f"tcp://127.0.0.1:{get_open_port()}"
     ctx = mp.get_context("spawn")
     procs = [
-        ctx.Process(target=_spawned, args=(r, world, init_method)) for r in range(world)
+        ctx.Process(target=_spawned, args=(r, world, init_method, check_hook))
+        for r in range(world)
     ]
     for p in procs:
         p.start()

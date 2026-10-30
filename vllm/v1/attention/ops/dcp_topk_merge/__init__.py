@@ -164,6 +164,17 @@ def _init_rescue(vllm_config: Any, topk: int, local_topk: int) -> int:
 
     init_dcp_topk_rescue_workspace(max_rows, topk, local_topk, group)
     _MERGE_MAX_ROWS[(topk, local_topk)] = max_rows
+    import vllm.envs as envs
+
+    if envs.VLLM_DSA_BPRIME_CHECK:
+        from vllm.v1.attention.ops.dcp_topk_merge.check import (
+            init_dcp_topk_merge_check,
+        )
+
+        init_dcp_topk_merge_check(
+            torch.device("cuda", torch.accelerator.current_device_index()),
+            group.rank_in_group,
+        )
     if vllm_config.kernel_config.enable_jit_warmup:
         register_dcp_topk_merge_warmup(
             topk, local_topk, parallel_config.decode_context_parallel_size

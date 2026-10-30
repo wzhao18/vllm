@@ -134,6 +134,63 @@ def _dcp_topk_merge_reads_logits(logits: torch.Tensor, dcp_local_topk: int) -> b
     )
 
 
+def _check_dcp_decode_topk_merge(
+    layer_name: str,
+    logits: torch.Tensor,
+    row_ends: torch.Tensor,
+    seq_lens: torch.Tensor,
+    next_n: int,
+    merged: torch.Tensor,
+    dcp_local_topk: int,
+    topk_backend: str,
+    fp32_decode_logits: bool,
+    max_seq_len: int,
+    max_model_len: int,
+    dcp_rank: int,
+    dcp_world_size: int,
+    score_bits: int,
+) -> None:
+    """VLLM_DSA_BPRIME_CHECK: the generic merge of the same decode logits next
+    to the one-round merge's ``merged`` ids, compared on the device
+    (vllm.v1.attention.ops.dcp_topk_merge.check). Collective over the DCP
+    group."""
+    from vllm.v1.attention.ops.dcp_topk_merge.check import check_dcp_topk_merge
+    from vllm.v1.attention.ops.dcp_topk_merge.kernels import (
+        get_dcp_topk_rescue_workspace,
+    )
+
+    topk_tokens = merged.shape[1]
+    reference = torch.full_like(merged, -1)
+    reference_logits = (
+        as_fp32_logits(logits, seq_lens.view(-1)) if fp32_decode_logits else logits
+    )
+    get_indexer_topk(topk_backend)(
+        reference_logits, seq_lens, next_n, reference, topk_tokens, max_seq_len
+    )
+    _merge_dcp_topk_global(
+        reference_logits,
+        reference,
+        topk_tokens,
+        dcp_rank,
+        dcp_world_size,
+        1,
+        score_bits=score_bits,
+        num_positions=max_model_len,
+    )
+    workspace = get_dcp_topk_rescue_workspace(topk_tokens, dcp_local_topk)
+    assert workspace is not None
+    check_dcp_topk_merge(
+        layer_name,
+        logits[:, : cdiv(max_model_len, dcp_world_size)],
+        row_ends,
+        merged,
+        reference,
+        workspace.sat_word,
+        dcp_rank,
+        dcp_world_size,
+    )
+
+
 def _decode_logits_profile_bytes(
     num_rows: int,
     max_model_len: int,
@@ -1119,18 +1176,41 @@ def sparse_attn_indexer(
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
         if use_dcp_topk_merge:
+            from vllm.v1.attention.ops.dcp_topk_merge.check import (
+                dcp_topk_merge_check_enabled,
+            )
             from vllm.v1.attention.ops.dcp_topk_merge.kernels import (
                 dcp_topk_merge,
             )
 
+            decode_row_ends = SparseIndexerTopk._row_ends(
+                seq_lens, next_n, num_rows
+            ).contiguous()
             # Interleave 1: local lengths are at most cdiv(max_model_len, W).
             dcp_topk_merge(
                 logits,
-                SparseIndexerTopk._row_ends(seq_lens, next_n, num_rows).contiguous(),
+                decode_row_ends,
                 topk_indices,
                 dcp_local_topk,
                 max_local_len=cdiv(max_model_len, dcp_world_size),
             )
+            if dcp_topk_merge_check_enabled():
+                _check_dcp_decode_topk_merge(
+                    k_cache_prefix,
+                    logits,
+                    decode_row_ends,
+                    seq_lens,
+                    next_n,
+                    topk_indices,
+                    dcp_local_topk,
+                    topk_backend,
+                    fp32_decode_logits,
+                    attn_metadata_narrowed.max_seq_len,
+                    max_model_len,
+                    dcp_rank,
+                    dcp_world_size,
+                    score_bits,
+                )
         else:
             # The backend comes from the layer (config is only readable at
             # model construction); dispatchers are cached per backend.

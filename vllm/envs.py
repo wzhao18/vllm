@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
+    VLLM_DSA_BPRIME_CHECK: bool = False
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_XPU_PP_MICROBATCH: bool = True
     VLLM_DISTRIBUTED_USE_SPLIT_GROUP: bool = False
@@ -1117,6 +1118,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": lambda: int(
         os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
     ),
+    # Debug: next to every one-round DCP decode top-k merge of the DSA indexer
+    # (interleave 1), also run the generic merge and compare them on device;
+    # DCP rank 0 logs the rows that differ beyond ties at the K-th score
+    # (vllm/v1/attention/ops/dcp_topk_merge/check.py). Slows decode.
+    "VLLM_DSA_BPRIME_CHECK": lambda: bool(int(os.getenv("VLLM_DSA_BPRIME_CHECK", "0"))),
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.
     # Raise it for long-context deployments, where step cost is dominated by

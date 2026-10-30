@@ -1518,3 +1518,166 @@ def test_decode_logits_profile_bytes_without_merge(fp32_decode_logits, logits_dt
         rows, max_model_len, logits_dtype, row_align, fp32_decode_logits, 0, 16
     )
     assert got == old
+
+
+class _ThreadedDCP:
+    """Simulated DCP ranks as threads; all_gather stacks every rank's input."""
+
+    def __init__(self, world: int) -> None:
+        import threading
+
+        self.world = world
+        self.barrier = threading.Barrier(world)
+        self.inputs: list[torch.Tensor | None] = [None] * world
+
+    def all_gather(self, rank: int):
+        def gather(tensor: torch.Tensor) -> torch.Tensor:
+            self.inputs[rank] = tensor.clone()
+            self.barrier.wait()
+            out = torch.stack(self.inputs)  # type: ignore[arg-type]
+            self.barrier.wait()
+            return out
+
+        return gather
+
+    def run(self, fn) -> list:
+        import threading
+
+        results: list = [None] * self.world
+        errors: list[BaseException] = []
+
+        def target(rank: int) -> None:
+            try:
+                results[rank] = fn(rank)
+            except BaseException as error:
+                errors.append(error)
+                self.barrier.abort()
+
+        threads = [
+            threading.Thread(target=target, args=(r,)) for r in range(self.world)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        if errors:
+            raise errors[0]
+        return results
+
+
+def _check_case(world: int = 4, topk: int = 64, width: int = 256):
+    """Global bf16 scores with many ties, per-rank logits at interleave 1 and
+    the exact top-K ids (score desc, id asc) of each row; rows:
+    0 exact, 1 swaps a tie at tau, 2 loses a token above tau, 3 drops an id,
+    4 repeats an id, 5 holds a NaN, 6 is empty (a padded row)."""
+    gen = torch.Generator().manual_seed(0)
+    lengths = [world * width, 1000, 900, 777, 1024, 500, 0]
+    scores = (
+        torch.randint(-40, 40, (len(lengths), world * width), generator=gen) / 8
+    ).to(torch.bfloat16)
+    reference = torch.full((len(lengths), topk), -1, dtype=torch.int32)
+    for row, length in enumerate(lengths):
+        values = scores[row, :length].float().tolist()
+        order = sorted(range(length), key=lambda g: (-values[g], g))[:topk]
+        reference[row, : len(order)] = torch.tensor(order, dtype=torch.int32)
+    merged = reference.flip(1).clone()  # any order
+    value = scores.float()
+
+    def tau(row: int) -> float:
+        return value[row, reference[row][reference[row] >= 0].long()].min().item()
+
+    chosen = set(reference[1].tolist())
+    tie_in = next(
+        g for g in range(lengths[1]) if value[1, g] == tau(1) and g not in chosen
+    )
+    tie_out = int(reference[1][value[1, reference[1].long()] == tau(1)][0])
+    merged[1][merged[1] == tie_out] = tie_in
+    chosen = set(reference[2].tolist())
+    low = next(g for g in range(lengths[2]) if value[2, g] < tau(2))
+    high = int(reference[2][value[2, reference[2].long()] > tau(2)][0])
+    merged[2][merged[2] == high] = low
+    merged[3][0] = -1
+    merged[4][0] = merged[4][1]
+    scores[5, 3] = float("nan")
+    logits = [scores[:, rank::world].contiguous() for rank in range(world)]
+    row_ends = [
+        torch.tensor(
+            [max(length - rank + world - 1, 0) // world for length in lengths],
+            dtype=torch.int32,
+        )
+        for rank in range(world)
+    ]
+    return logits, row_ends, merged, reference
+
+
+def test_dcp_topk_merge_check_classifies_rows():
+    """VLLM_DSA_BPRIME_CHECK passes rows whose ids match the reference merge's
+    or differ only among tokens scoring exactly tau, and flags every other
+    difference on all ranks; NaN and empty rows are counted apart."""
+    from vllm.v1.attention.ops.dcp_topk_merge.check import compare_dcp_topk_merge
+
+    world = 4
+    logits, row_ends, merged, reference = _check_case(world)
+    dcp = _ThreadedDCP(world)
+    results = dcp.run(
+        lambda rank: compare_dcp_topk_merge(
+            logits[rank],
+            row_ends[rank],
+            merged,
+            reference,
+            rank,
+            world,
+            dcp.all_gather(rank),
+        )
+    )
+    for got in results:
+        assert got["miss"].tolist() == [False, False, True, True, True, False, False]
+        assert got["tie"].tolist() == [False, True, False, False, False, False, False]
+        assert got["nan"].tolist() == [False] * 5 + [True, False]
+        assert got["valid"].tolist() == [True] * 6 + [False]
+        assert got["missing"].tolist()[:4] == [0, 1, 1, 1]
+
+
+def test_dcp_topk_merge_check_records_misses(monkeypatch):
+    """The check's counters and its record of misses (layer, step, row), as
+    DCP rank 0 logs them; only the first layer counts the passes."""
+    from vllm.v1.attention.ops.dcp_topk_merge import check
+
+    state = check.DcpTopkMergeCheck(torch.device("cpu"))
+    monkeypatch.setattr(check, "_STATE", state)
+    assert check.dcp_topk_merge_check_enabled()
+    world = 4
+    logits, row_ends, merged, reference = _check_case(world)
+    sat_word = torch.zeros(merged.shape[0], dtype=torch.int32)
+    sat_word[2] = (0b1001 << 16) | 0x3F80
+    sat_word[0] = -(1 << 31) | (1 << 16)  # ranks 15 and 0
+    dcp = _ThreadedDCP(world)
+    for layer in ("layers.1.indexer", "layers.5.indexer", "layers.1.indexer"):
+        lock = __import__("threading").Lock()
+
+        def one_rank(rank: int, layer=layer, lock=lock) -> None:
+            gather = dcp.all_gather(rank)
+            rows = check.compare_dcp_topk_merge(
+                logits[rank], row_ends[rank], merged, reference, rank, world, gather
+            )
+            if rank == 0:  # one recorder, as on each real rank
+                with lock:
+                    state.record(
+                        state.layer_id(layer), rows, check.saturated_ranks(sat_word)
+                    )
+
+        dcp.run(one_rank)
+    snap = state.snapshot()
+    totals = snap["totals"]
+    assert snap["steps"] == 2 and snap["layers"] == 2
+    assert totals[check.CALLS] == 3 and totals[check.ROWS] == 18
+    assert totals[check.MISS_ROWS] == 9 and totals[check.TIE_ROWS] == 3
+    assert totals[check.NAN_ROWS] == 3 and totals[check.SAT_ROWS] == 6
+    assert totals[check.MAX_SAT_RANKS] == 2 and totals[check.MAX_MISSING] == 1
+    assert snap["misses"][:3] == [
+        ("layers.1.indexer", 1, 2, 2, 1),
+        ("layers.1.indexer", 1, 3, 0, 1),
+        ("layers.1.indexer", 1, 4, 0, 1),
+    ]
+    assert snap["misses"][-1] == ("layers.1.indexer", 2, 4, 0, 1)
+    state.log(final=True)
