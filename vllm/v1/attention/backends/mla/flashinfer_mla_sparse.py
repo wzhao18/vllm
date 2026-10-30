@@ -802,6 +802,9 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
 
     can_return_lse_for_decode: bool = True
     supports_dcp: bool = True
+    # Spec-decode rows attend to their own top-k slots, which the shared DCP index
+    # filter localizes at any interleave (as for FlashMLA sparse).
+    supports_mtp_with_cp_non_trivial_interleave_size: bool = True
     lse_base_on_e: bool = False
     supports_shardq: ClassVar[bool] = True
     supports_dcp_shardq: ClassVar[bool] = True
