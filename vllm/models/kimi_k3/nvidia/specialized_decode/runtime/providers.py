@@ -230,6 +230,36 @@ def pack_dsa_projection(attention):
     return packed
 
 
+def dsa_seam_columns(attention, pitch):
+    """The widths of a K3.1 DSA layer's packed projection columns [q_c | kv_c + k_pe
+    | gate | wk | wv] as seam S2-DSA splits them (``Attention.stock_dsa``). Raises
+    unless the layer's stock forward is the one the seam reproduces: the wrapper
+    forward with q-LoRA, separate q / kv RMSNorms, no RoPE (MLA or indexer), the
+    output gate, local query heads and its own top-k."""
+    wrapper, indexer = attention.mla_attn, attention.dsa_indexer
+    columns = (
+        wrapper.q_lora_rank or 0,
+        wrapper.kv_lora_rank + wrapper.qk_rope_head_dim,
+        wrapper.num_heads * wrapper.v_head_dim,
+        indexer.index_head_dim,
+        indexer.index_num_heads,
+    )
+    checks = (
+        (wrapper.q_lora_rank is None, "MLA without q-LoRA"),
+        (wrapper.fuse_qkv_rmsnorm, "fused q / kv RMSNorms"),
+        (wrapper.rotary_emb is not None, "MLA RoPE"),
+        (indexer.index_rope_dim != 0, "indexer RoPE"),
+        (wrapper.g_proj is None, "MLA without the output gate"),
+        (wrapper.dcp_q_replicate, "DCP-replicated query heads"),
+        (wrapper.skip_topk, "a top-k shared with another layer"),
+        (sum(columns) != pitch, f"{pitch}-column rows ({sum(columns)} split)"),
+    )
+    reason = next((reason for failed, reason in checks if failed), None)
+    if reason is not None:
+        raise ValueError(f"Kimi K3.1 DSA wide decode steps do not support {reason}")
+    return columns
+
+
 def attention_kind(attention):
     if hasattr(attention, "in_proj_qkvgfab"):
         return "kda"
@@ -279,9 +309,12 @@ class Attention:
         # Wide batches whose KDA core runs the stock KDA forward (seam S1,
         # ``kda.prepared.choose``); the others run KdaSplit.
         self.kda_stock: frozenset[int] = frozenset()
+        # A DSA layer's packed projection columns, as seam S2-DSA splits them at the
+        # wide batches (``run_wide``); PreparedDsa serves the tuned ones.
+        self.dsa_columns: tuple[int, ...] = ()
         if kind == "dsa":
-            if runtime.wide:  # PreparedDsa and its stock seam cover <= 64 rows only
-                raise ValueError("DSA layers with batches above the prepared rows")
+            if runtime.wide:
+                self.dsa_columns = dsa_seam_columns(attention, pitch)
             pitches = {b: pitch for b in runtime.tuned}
             rows = dsa_scratch(runtime)
             policy = dict(queries=runtime.queries, core=runtime.dsa_core)
@@ -627,10 +660,11 @@ class Attention:
         self, x, out, prefix, blocks, caches, metadata, slot_mapping, q, positions
     ):  # fmt: skip
         """A verify step above the tuned providers: the generic in-projection, then the
-        KDA core (KdaSplit, any requests) or the stock MLA attention from the
-        in-projection rows (seam S2: W_UK, cache insert, DCP exchanges, core, W_UV;
-        the output gate as stock applies it), then the stock o-projection with its
-        all-reduce and the unfused AttnRes (seam S3)."""
+        KDA core (KdaSplit, any requests), PreparedMla, or the stock MLA / DSA
+        attention from the in-projection rows (seam S2 / S2-DSA: the stock layer's ops
+        after its input GEMMs, the output gate as stock applies it), then the fused
+        o-projection, or the stock one with its all-reduce and the unfused AttnRes
+        (seam S3)."""
         b = x.shape[0]
         projected, local = self.storage[b]
         if b in self.projection.fallback.kernels:
@@ -646,6 +680,8 @@ class Attention:
             self.core.run(
                 projected, local, caches=caches, slots=slots, accepted=accepted
             )
+        elif self.kind == "dsa":
+            self.stock_dsa(attention, x, projected, local, self.dsa_columns)
         elif b in self.mla_wide:  # PreparedMla into the plain local rows
             decode = metadata.decode
             tables, lengths = decode.block_table, decode.seq_lens
@@ -668,8 +704,9 @@ class Attention:
         if b in self.oproj_wide:
             return self.output.run(local, prefix, blocks, out)[0]
         # The stock o-projection, reduced over the TP ranks: GEMM-AR where the stock
-        # layer runs it (VLLM_KIMI_K3_GEMM_AR, from 128 rows), else GEMM + all-reduce.
-        fused = attention.gemm_rs_ar
+        # layer runs it (VLLM_KIMI_K3_GEMM_AR, from 128 rows; DSA layers have none),
+        # else GEMM + all-reduce.
+        fused = getattr(attention, "gemm_rs_ar", None)
         if fused is not None and fused.should_run(local):
             delta = fused.apply(local, attention.o_proj)
         else:
@@ -697,6 +734,34 @@ class Attention:
             beta=beta.unsqueeze(0),
             core_attn_out=local.view(1, b, heads, dim),
         )
+
+    @staticmethod
+    def stock_dsa(attention, x, projected, local, columns):
+        """Seam S2-DSA: the stock K3.1 DSA attention from the packed in-projection
+        rows (split by ``columns``) into ``local``, as the stock layer runs it
+        (``MultiHeadLatentAttentionWrapper.forward``, the same ops in the same order)
+        without its input GEMMs and o-projection: the q / kv RMSNorms, q_b, the
+        indexer (query projection, key insert, scoring, top-k and its DCP merge), the
+        sparse MLA attention and the output gate."""
+        wrapper, indexer = attention.mla_attn, attention.dsa_indexer
+        q_c, kv, gate, index_k, index_weights = projected.split(columns, dim=-1)
+        q_c = wrapper.q_a_layernorm(q_c)
+        kv_c, k_pe = kv.split([wrapper.kv_lora_rank, wrapper.qk_rope_head_dim], dim=-1)
+        kv_c = wrapper.kv_a_layernorm(kv_c)
+        q = wrapper.q_b_proj(q_c)[0].view(-1, wrapper.num_heads, wrapper.qk_head_dim)
+        heads, dim = indexer.index_num_heads, indexer.index_head_dim
+        index_q = indexer.wq_index(q_c)[0].view(-1, heads, dim)
+        if indexer.use_fused_k_insert:
+            indexer._fused_k_insert(index_k, x.shape[0])
+            index_k = None
+        else:
+            index_k = indexer.k_index_norm(index_k)
+        indexer.score(x, index_q, index_weights, index_k)
+        wrapper.mla_attn.impl.record_logical_topk_ready()
+        shape = (x.shape[0], wrapper.num_heads * wrapper.v_head_dim)
+        core = wrapper.mla_attn(q, kv_c, k_pe.unsqueeze(1), output_shape=shape)
+        # The wrapper's eager gate: two kernels, each rounding to BF16.
+        torch.mul(core, gate.sigmoid(), out=local)
 
 
 def polled_buffers(runtime, heads, sms, tp, parity):

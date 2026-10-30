@@ -111,6 +111,18 @@ def ring_batches(table, tp, device, batches):
     return frozenset(b for b in batches if on.get(b))
 
 
+def wide_rows(captured, q, *, rubin, seams, dsa, tp, dcp):
+    """The captured verify rows above the tuned providers whose steps run the
+    specialized decode (``WIDE_ROWS``): on Rubin at q > 1 without sequence
+    parallelism (the o-projection seam needs every rank's full rows). With K3.1 DSA
+    layers (seam S2-DSA) only at TP16 = DCP16, where the fused wide o-projection
+    serves every such row; elsewhere they would run untested fallback seams."""
+    if not (rubin and q > 1 and seams) or (dsa and (tp, dcp) != (16, 16)):
+        return ()
+    shapes = (Shape(m, q) for m in captured if m > PREPARED_MAX)
+    return tuple(s.rows for s in shapes if rows_policy(WIDE_ROWS, s, 0))
+
+
 class Step(NamedTuple):
     q: int  # tokens per request
     metadata: list  # per layer
@@ -189,17 +201,20 @@ class SpecializedDecode:
         cc = (properties.major, properties.minor)
         # The runner's FULL decode graphs. On Rubin, those of verify steps above the
         # tuned rows (``wide``) run the generic kernels and stock seams instead of the
-        # stock forward: ``Attention.run_wide`` (S2 MLA, S3 o-projection) and the stock
-        # MoE layer (S4); the o-projection seam needs every rank's full rows (no
-        # sequence parallelism).
+        # stock forward: ``Attention.run_wide`` (S2 MLA, S2-DSA, S3 o-projection) and
+        # the stock MoE layer (S4).
         self.captured = config.captured
         seams = not getattr(backbone, "use_sequence_parallel", False)
-        # K3.1 DSA layers have no wide (> PREPARED_MAX rows) provider: those captured
-        # graphs run the stock forward.
         dsa = getattr(backbone.config, "dsa_config", None) is not None
-        wide = cc == (10, 7) and q > 1 and seams and not dsa
-        rows = [m for m in self.captured if m > PREPARED_MAX and wide]
-        self.wide = tuple(m for m in rows if rows_policy(WIDE_ROWS, Shape(m, q), 0))
+        self.wide = wide_rows(
+            self.captured,
+            q,
+            rubin=cc == (10, 7),
+            seams=seams,
+            dsa=dsa,
+            tp=self.tp,
+            dcp=self.dcp,
+        )
         self.batches = tuple(sorted({*self.tuned, *self.wide}))
         self.capacity = self.batches[-1]  # rows of every decode buffer
         self.context = Context(
@@ -520,6 +535,8 @@ class SpecializedDecode:
             choices["mla"] = mla_choose(Shape(b, q), self.context)
         elif mla is not None:
             choices["mla"] = Choice(stock, note=f"{gemm} + S2")
+        if "dsa" in kinds:
+            choices["dsa"] = Choice(stock, note=f"{gemm} + S2")
         attention = next(iter(self.attention.values()), None)
         if attention is not None and b in attention.oproj_wide:
             choices["oproj"] = oproj_choose(Shape(b, q), self.context)

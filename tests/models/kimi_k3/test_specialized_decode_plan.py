@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Kimi K3 specialized decode on CPU: the routing of its wide verify steps (above
-the tuned rows) between the specialized providers and the stock seams."""
+the tuned rows) between the specialized providers and the stock seams, K3.1's DSA
+seam (S2-DSA) included."""
 
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -12,6 +14,10 @@ import torch
 pytest.importorskip("cutlass")
 pytest.importorskip("flashinfer")
 
+from vllm.model_executor.layers.mla import (  # noqa: E402
+    MultiHeadLatentAttentionWrapper,
+)
+from vllm.models.kimi_k3.nvidia.dsa import KimiK3DSAIndexer  # noqa: E402
 from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe.dense import (  # noqa: E402
     PreparedDenseMLP,
 )
@@ -21,9 +27,276 @@ from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe.prepared import (
 from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.decode import (  # noqa: E402
     SpecializedDecode,
     Step,
+    wide_rows,
+)
+from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.providers import (  # noqa: E402
+    Attention,
+    dsa_seam_columns,
+    pack_dsa_projection,
+    projection_policies,
+)
+from vllm.models.kimi_k3.nvidia.specialized_decode.shapes import (  # noqa: E402
+    Choice,
+    Context,
+    Path,
+    captured_rows,
 )
 
-HIDDEN = 16  # the steps below never read hidden values: any width
+HIDDEN = 16  # hidden width (7168 in the model): no test below depends on it
+# K3.1 attention at TP16 (6 of 96 heads per rank): packed projection rows of
+# [q_c 1536 | kv_c 512 + k_pe 64 | gate 768 | wk 128 | wv 32] = 3040 columns.
+Q_LORA, KV_LORA, ROPE, NOPE, V_DIM, HEADS = 1536, 512, 64, 128, 128, 6
+INDEX_DIM, INDEX_HEADS, PITCH = 128, 32, 3040
+COLUMNS = (Q_LORA, KV_LORA + ROPE, HEADS * V_DIM, INDEX_DIM, INDEX_HEADS)
+# Decode capture sizes of the AgentX recipes (disagg-p8-d16-variants-pr1524-k31):
+# DL7 (DSpark q8, max-num-seqs 32) and DL3 cap-128 (q4, max-num-seqs 128).
+DL7 = (7, 8, 14, 16, 21, 24, 28, 32, 35, 40, 42, 48, 49, 56, 63, 64, 70, 72, 77, 80,
+       84, 88, 91, 96, 98, 104, 105, 112, 119, 120, 126, 128, 133, 136, 140, 144, 147,
+       152, 154, 160, 161, 168, 175, 176, 182, 184, 189, 192, 196, 200, 203, 208, 210,
+       216, 217, 224, 232, 240, 248, 256)  # fmt: skip
+DL3 = (6, 8, 15, 16, 18, 20, 21, 24, 30, 32, 39, 40, 45, 48, 54, 56, 63, 64, 66, 68,
+       69, 72, 75, 76, 78, 80, 81, 84, 87, 88, 90, 92, 93, 96, 100, 102, 104, 108, 112,
+       114, 116, 120, 124, 126, 128, 132, 136, 138, 144, 150, 152, 156, 160, 162, 168,
+       174, 176, 180, 184, 186, 192, 200, 204, 208, 216, 224, 228, 232, 240, 248, 252,
+       256, 264, 272, 276, 288, 300, 304, 312, 320, 324, 336, 348, 352, 360, 368, 372,
+       384, 400, 416, 432, 448, 464, 480, 496, 512)  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    "dsa,tp,dcp,q,rubin,seams,wide",
+    [
+        (True, 16, 16, 8, True, True, True),  # K3.1's decode role
+        (True, 16, 1, 8, True, True, False),
+        (True, 8, 8, 8, True, True, False),
+        (True, 8, 1, 8, True, True, False),
+        (True, 16, 16, 1, True, True, False),
+        (True, 16, 16, 8, False, True, False),
+        (True, 16, 16, 8, True, False, False),
+        (False, 16, 16, 8, True, True, True),  # K3 (dense MLA): as before
+        (False, 16, 1, 8, True, True, True),
+        (False, 8, 8, 8, True, True, True),
+        (False, 16, 16, 1, True, True, False),
+        (False, 16, 16, 8, False, True, False),
+        (False, 16, 16, 8, True, False, False),
+    ],
+)
+def test_wide_rows_gate(dsa, tp, dcp, q, rubin, seams, wide):
+    """Verify graphs above 64 rows run the specialized decode on Rubin without
+    sequence parallelism; with K3.1's DSA layers only at TP16 = DCP16."""
+    captured = captured_rows(DL7, q, 256)
+    rows = wide_rows(captured, q, rubin=rubin, seams=seams, dsa=dsa, tp=tp, dcp=dcp)
+    assert rows == (tuple(m for m in captured if m > 64) if wide else ())
+
+
+def test_wide_rows_of_the_recipes():
+    """K3.1's decode role takes every captured verify graph above 64 rows: DL7's 24
+    (72-256 rows) and DL3 cap-128's 65 (68-512 rows, 24 of them above 256)."""
+    k31 = dict(rubin=True, seams=True, dsa=True, tp=16, dcp=16)
+    assert wide_rows(captured_rows(DL7, 8, 256), 8, **k31) == tuple(range(72, 257, 8))
+    dl3 = wide_rows(captured_rows(DL3, 4, 512), 4, **k31)
+    assert (len(dl3), dl3[0], dl3[-1], sum(m > 256 for m in dl3)) == (65, 68, 512, 24)
+
+
+class Linear(torch.nn.Module):
+    """A stock linear's call (``(x @ weight.T, None)``), BF16 like the model's, on
+    small-integer weights: the input projections' outputs are exact, so the packed
+    GEMM and the stock ones give the same columns."""
+
+    def __init__(self, rows, cols=HIDDEN, trace=None, name=""):
+        super().__init__()
+        weight = torch.randint(-1, 2, (rows, cols), dtype=torch.bfloat16)
+        self.weight = torch.nn.Parameter(weight, requires_grad=False)
+        self.trace, self.name = trace, name
+
+    def forward(self, x):
+        if self.trace is not None:
+            self.trace.append((self.name, x))
+        return x @ self.weight.T, None
+
+
+class SparseMla:
+    """The sparse MLA attention layer (cache insert, DCP exchanges, core, W_UV)."""
+
+    def __init__(self, trace):
+        self.trace = trace
+        ready = lambda: trace.append(("topk_ready",))  # noqa: E731
+        self.impl = SimpleNamespace(record_logical_topk_ready=ready)
+
+    def __call__(self, q, kv_c, k_pe, output_shape=None, q_dcp_replicated=None):
+        assert q_dcp_replicated is None
+        self.trace.append(("mla_attn", q, kv_c, k_pe, output_shape))
+        return q.flatten(1)[:, : output_shape[1]] + kv_c[:, :1] + k_pe[:, 0, :1]
+
+
+class Indexer(SimpleNamespace):
+    __call__ = KimiK3DSAIndexer.forward
+
+
+def dsa_layer(fused_insert):
+    """A K3.1 DSA attention module whose ops after its input GEMMs record their calls
+    in ``trace``; its stock forward is the real wrapper and indexer forward."""
+    trace: list = []
+
+    def op(name, result=lambda *args: None):
+        def call(*args):
+            trace.append((name, *args))
+            return result(*args)
+
+        return call
+
+    indexer = Indexer(
+        index_head_dim=INDEX_DIM,
+        index_num_heads=INDEX_HEADS,
+        index_rope_dim=0,
+        use_fused_k_insert=fused_insert,
+        wq_index=Linear(INDEX_HEADS * INDEX_DIM, Q_LORA, trace, "wq_index"),
+        wkv_index=Linear(INDEX_DIM + INDEX_HEADS),
+        _fused_k_insert=op("k_insert"),
+        k_index_norm=op("k_norm", lambda k: k + 3),
+        score=op("score"),
+    )
+    wrapper = SimpleNamespace(
+        q_lora_rank=Q_LORA,
+        kv_lora_rank=KV_LORA,
+        qk_rope_head_dim=ROPE,
+        qk_nope_head_dim=NOPE,
+        qk_head_dim=NOPE + ROPE,
+        v_head_dim=V_DIM,
+        num_heads=HEADS,
+        fuse_qkv_rmsnorm=False,
+        dcp_q_replicate=False,
+        skip_topk=False,
+        is_sparse=True,
+        rotary_emb=None,
+        indexer=indexer,
+        indexer_rope_emb=None,
+        fused_qkv_a_proj=Linear(Q_LORA + KV_LORA + ROPE),
+        q_a_layernorm=op("q_a_norm", lambda q_c: q_c + 1),
+        kv_a_layernorm=op("kv_a_norm", lambda kv_c: kv_c + 2),
+        q_b_proj=Linear(HEADS * (NOPE + ROPE), Q_LORA, trace, "q_b"),
+        mla_attn=SparseMla(trace),
+        g_proj=Linear(HEADS * V_DIM),
+        o_proj=lambda rows: (rows, None),
+    )
+    attention = SimpleNamespace(
+        mla_attn=wrapper,
+        dsa_indexer=indexer,
+        fused_qkv_a_proj=wrapper.fused_qkv_a_proj,
+        g_proj=wrapper.g_proj,
+    )
+    return attention, trace
+
+
+def same(a, b):
+    if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
+        return torch.equal(a, b)
+    return type(a) is type(b) and a == b
+
+
+@pytest.mark.parametrize("fused_insert", [True, False], ids=["fused-insert", "k-norm"])
+def test_stock_dsa_is_the_stock_layer(fused_insert):
+    """Seam S2-DSA on the packed in-projection rows runs the stock DSA layer's ops
+    after its input GEMMs, in its order, on the same operands (each column block is
+    one stock linear's output), and writes the stock gated output."""
+    torch.manual_seed(0)
+    attention, trace = dsa_layer(fused_insert)
+    packed = pack_dsa_projection(attention)  # the stock linears become its views
+    x = torch.randint(-2, 3, (72, HIDDEN), dtype=torch.bfloat16)  # 9 requests x q8
+    want = MultiHeadLatentAttentionWrapper.forward(attention.mla_attn, None, x)
+    stock = list(trace)
+    insert = ["k_insert"] if fused_insert else ["k_norm"]
+    ops = ["q_a_norm", "kv_a_norm", "q_b", "wq_index", *insert, "score"]
+    assert [op[0] for op in stock] == [*ops, "topk_ready", "mla_attn"]
+    trace.clear()
+    columns = dsa_seam_columns(attention, packed.shape[0])
+    assert packed.shape[0] == PITCH and columns == COLUMNS
+    local = torch.full((72, HEADS * V_DIM), torch.nan, dtype=torch.bfloat16)
+    Attention.stock_dsa(attention, x, x @ packed.T, local, columns)
+    assert [op[0] for op in trace] == [op[0] for op in stock]
+    for seam_op, stock_op in zip(trace, stock):
+        assert len(seam_op) == len(stock_op)
+        assert all(map(same, seam_op, stock_op)), seam_op[0]
+    assert torch.equal(local, want)
+
+
+@pytest.mark.parametrize(
+    "target,name,value,pitch,reason",
+    [
+        ("mla_attn", "q_lora_rank", None, PITCH, "without q-LoRA"),
+        ("mla_attn", "fuse_qkv_rmsnorm", True, PITCH, "fused q / kv RMSNorms"),
+        ("mla_attn", "rotary_emb", torch.nn.Identity(), PITCH, "MLA RoPE"),
+        ("dsa_indexer", "index_rope_dim", 64, PITCH, "indexer RoPE"),
+        ("mla_attn", "g_proj", None, PITCH, "without the output gate"),
+        ("mla_attn", "dcp_q_replicate", True, PITCH, "DCP-replicated"),
+        ("mla_attn", "skip_topk", True, PITCH, "top-k shared"),
+        (None, None, None, 2880, "2880-column rows"),
+    ],
+)
+def test_dsa_seam_refuses_other_layers(target, name, value, pitch, reason):
+    """A DSA layer whose stock forward the seam does not reproduce, or whose packed
+    rows it would split wrongly, fails at startup instead of at a wide step."""
+    attention, _ = dsa_layer(fused_insert=True)
+    if target is not None:
+        setattr(getattr(attention, target), name, value)
+    with pytest.raises(ValueError, match=reason):
+        dsa_seam_columns(attention, pitch)
+
+
+@pytest.mark.parametrize("fused_oproj", [True, False], ids=["two-shot", "stock-oproj"])
+def test_run_wide_runs_dsa_layers_through_the_seam(monkeypatch, fused_oproj):
+    """A DSA layer's wide step: the in-projection into the packed rows, seam S2-DSA
+    into the o-projection's input rows, then the fused o-projection, or the stock one
+    (seam S3: DSA layers have no GEMM-AR) and the unfused AttnRes."""
+    b = 72
+    seam = MagicMock()
+    monkeypatch.setattr(Attention, "stock_dsa", seam)
+    module = SimpleNamespace(o_proj=lambda rows: (rows + 1, None))
+    provider: Any = object.__new__(Attention)
+    projected, local = torch.zeros(b, PITCH), torch.zeros(b, HEADS * V_DIM)
+    provider.kind, provider.layer = "dsa", SimpleNamespace(self_attn=module)
+    provider.runtime = SimpleNamespace(stock_attn_res=frozenset())
+    provider.storage = {b: (projected, local)}
+    provider.projection = MagicMock()
+    provider.projection.fallback.kernels = {b: None}
+    provider.projection.run.side_effect = lambda x, out: out
+    provider.kda_stock = provider.mla_wide = frozenset()
+    provider.dsa_columns = COLUMNS
+    provider.oproj_wide = frozenset({b} if fused_oproj else ())
+    provider.output, provider.post = MagicMock(), MagicMock()
+    x, out = torch.zeros(b, HIDDEN), torch.zeros(b, HIDDEN)
+    rows = provider.run_wide(x, out, None, None, [], None, {}, 8, None)
+    seam.assert_called_once_with(module, x, projected, local, COLUMNS)
+    if fused_oproj:
+        provider.output.run.assert_called_once_with(local, None, None, out)
+        assert rows is provider.output.run.return_value[0]
+    else:
+        assert rows is provider.post.run.return_value
+        assert torch.equal(provider.post.run.call_args.args[0], local + 1)
+
+
+def test_wide_choices_name_the_dsa_seam():
+    """The coverage log of a K3.1 wide step names the DSA seam and its in-projection:
+    split-K up to 128 rows, cuBLAS above, as ``run_wide`` runs it (by the rows the
+    projection prepares)."""
+    rows = (72, 128, 136, 256, 512)
+    decode: Any = object.__new__(SpecializedDecode)
+    decode.attention = {
+        0: SimpleNamespace(kind="kda", oproj_wide=frozenset(rows)),
+        1: SimpleNamespace(kind="dsa", oproj_wide=frozenset(rows)),
+    }
+    decode.stock_attn_res = decode.sharded = frozenset()
+    decode.feed_forward = {}
+    decode.context = Context(
+        arch="rubin", tp=16, rank=0, dcp=16, sms=212, q=8, max_rows=512,
+        max_context=1 << 20, bf16_state=True,
+    )  # fmt: skip
+    split_k = projection_policies(16, PITCH, rows, sms=212, q=8)
+    assert set(split_k) == {72, 128}
+    for b in rows:
+        choices = decode.wide_choices(b, 8)
+        gemm = "splitk" if b in split_k else "cublas"
+        assert choices["dsa"] == Choice(Path.STOCK, note=f"{gemm} + S2")
+        assert "mla" not in choices
 
 
 def wide_step(b, *, wide_moe):
@@ -31,7 +304,7 @@ def wide_step(b, *, wide_moe):
     sites run the stock op (``stock_attn_res``), on mocked providers. ``wide_moe``:
     the MoE providers serve the rows (each tail's ring consumer runs the next
     AttnRes site), else the stock MoE layer does (seam S4)."""
-    decode = object.__new__(SpecializedDecode)
+    decode: Any = object.__new__(SpecializedDecode)
     layers = [
         SimpleNamespace(layer_idx=i, self_attn=SimpleNamespace(), mlp=MagicMock())
         for i in range(3)
