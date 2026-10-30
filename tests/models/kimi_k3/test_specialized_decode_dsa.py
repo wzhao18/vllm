@@ -2431,6 +2431,28 @@ def test_prepared_dsa_run_matches_stock(
     check_layer_step(run_layer_step(core, batch, q, overlap=overlap), q)
 
 
+def test_nvfp4_runtime_gate():
+    """The specialized decode takes nvfp4_ds_mla DSA layers only on FLASHINFER_MLA_
+    SPARSE's prims_ts kernel (the cache insert it writes): trtllm-gen and FlashMLA
+    sparse are rejected with a reason."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.runtime import (
+        nvfp4_unsupported,
+    )
+    from vllm.utils.flashinfer import has_flashinfer_prims_ts_sparse_mla
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    config = layer_config("fi-nvfp4", 1)
+    if has_flashinfer_prims_ts_sparse_mla():
+        assert nvfp4_unsupported(config) is None
+    else:
+        assert "prims_ts" in nvfp4_unsupported(config)
+    config.kernel_config.flashinfer_sparse_mla_kernel = "trtllm"
+    assert "trtllm-gen" in nvfp4_unsupported(config)
+    config = layer_config("fi-nvfp4", 1)
+    config.attention_config.backend = AttentionBackendEnum.FLASHMLA_SPARSE
+    assert "FLASHINFER_MLA_SPARSE" in nvfp4_unsupported(config)
+
+
 @pytest.mark.parametrize("overlap", list(TP_OVERLAPS))
 @pytest.mark.parametrize("batch,q", [(8, 8), (64, 8), (16, 4), (64, 4)])
 @pytest.mark.parametrize("heads", [12, 6])

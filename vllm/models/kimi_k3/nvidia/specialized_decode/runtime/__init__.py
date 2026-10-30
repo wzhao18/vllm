@@ -161,9 +161,39 @@ def unsupported(vllm_config) -> str | None:
         (
             dsa
             and vllm_config.cache_config.cache_dtype
-            not in ("fp8_ds_mla", "fp8", "fp8_e4m3"),
-            "DSA layers on KV cache dtypes other than fp8_ds_mla (FlashMLA sparse) "
-            "or per-tensor fp8 (FlashInfer sparse)",
+            not in ("fp8_ds_mla", "fp8", "fp8_e4m3", "nvfp4_ds_mla"),
+            "DSA layers on KV cache dtypes other than fp8_ds_mla (FlashMLA sparse), "
+            "per-tensor fp8 (FlashInfer sparse) or nvfp4_ds_mla (FlashInfer sparse "
+            "prims_ts)",
         ),
     )
-    return next((reason for failed, reason in checks if failed), None)
+    reason = next((reason for failed, reason in checks if failed), None)
+    if (
+        reason is None
+        and dsa
+        and vllm_config.cache_config.cache_dtype == "nvfp4_ds_mla"
+    ):
+        reason = nvfp4_unsupported(vllm_config)
+    return reason
+
+
+def nvfp4_unsupported(vllm_config) -> str | None:
+    """Why the DSA layers cannot run on an nvfp4_ds_mla cache: the specialized
+    decode writes it only for FlashInfer sparse's prims_ts kernel."""
+    from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
+        _prims_ts_unsupported_reason,
+    )
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    backend = vllm_config.attention_config.backend
+    if backend != AttentionBackendEnum.FLASHINFER_MLA_SPARSE:
+        return (
+            "nvfp4_ds_mla DSA layers on attention backends but "
+            "FLASHINFER_MLA_SPARSE (prims_ts)"
+        )
+    if vllm_config.kernel_config.flashinfer_sparse_mla_kernel == "trtllm":
+        return "nvfp4_ds_mla DSA layers on the trtllm-gen sparse MLA kernel"
+    reason = _prims_ts_unsupported_reason(vllm_config, "nvfp4_ds_mla")
+    if reason is not None:
+        return f"nvfp4_ds_mla DSA layers without FlashInfer prims_ts: {reason}"
+    return None
