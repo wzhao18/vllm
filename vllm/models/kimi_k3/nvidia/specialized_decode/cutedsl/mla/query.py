@@ -6,7 +6,8 @@ Static weights load before the PDL wait; current-token data is consumed after it
 DSA (``dsa=True``, Kimi K3.1): the normalized q_c rows are also stored for the indexer
 query projection. On FlashMLA sparse the query rows are BF16 and the KV row is written
 in the fp8_ds_mla layout (per 128-column power-of-two scales, BF16 k_pe); with ``fp8``
-(FlashInfer sparse) both are per-tensor FP8 as for dense MLA."""
+(FlashInfer sparse) both are per-tensor FP8 as for dense MLA, or (``nvfp4``, prims_ts)
+the query is per-tensor FP8 and the KV row is written in the nvfp4_ds_mla layout."""
 
 import cutlass
 import cutlass.cute as cute
@@ -35,6 +36,8 @@ from ..common.primitives import (
     mma_into,
     mul2,
     multicast_words,
+    nvfp4_scale,
+    pack_e2m1,
     pack_fp8,
     prefetch_l2,
     published,
@@ -147,6 +150,9 @@ def x_ready(chunks):
 
 # fp8_ds_mla row: 512 FP8 latent bytes, 4 FP32 tile scales, 64 BF16 k_pe.
 DS_SCALES, DS_ROPE = 512, 528
+# nvfp4_ds_mla row (352 B): 512 E2M1 latent values, 64 unscaled E4M3 k_pe, then the
+# E4M3 scales of the 32 16-value blocks (block s at byte 8 * (s % 4) + s // 4).
+NVFP4_ROPE, NVFP4_SCALES = 256, 320
 
 
 @cute.jit
@@ -206,12 +212,14 @@ class MlaQuery:
         x_uniform: bool = False,
         dsa: bool = False,
         fp8: bool = False,
+        nvfp4: bool = False,
         q_heads: int = 0,
         store_qc: bool = True,
         late: bool = False,
         release: bool = True,
         tile_poll: bool = False,
     ):
+        assert not nvfp4 or (dsa and fp8), "nvfp4_ds_mla takes the FP8 DSA query"
         # ``rope``: GPT-J RoPE of the query and key rope columns at the rows'
         # positions (args then end with positions [B] int64 and the FP32 cos/sin
         # cache [max position, 64]), as the stock fused query concat + cache insert:
@@ -233,6 +241,7 @@ class MlaQuery:
         self.release = release
         # fp8_ds_mla cache with a BF16 query (FlashMLA sparse), else per-tensor FP8.
         self.ds = dsa and not fp8
+        self.nvfp4 = nvfp4  # nvfp4_ds_mla KV rows (FlashInfer prims_ts)
         # q mailbox geometry: rows per token, element bytes, args index of the box.
         self.q_heads = q_heads or dcp * heads
         self.q_bytes, self.box_arg = 2 if self.ds else 1, 12 if dsa else 11
@@ -707,6 +716,56 @@ class MlaQuery:
                     at(qkv, tok0 + j, 2048 + c * 8), count=4, mutable=True
                 )
                 store_words(at(cache, page, offset, DS_ROPE + c * 16), words)
+
+    @cute.jit
+    def insert_nvfp4(self, args, ss, tok0, j, valid, tid):
+        """``insert`` in the nvfp4_ds_mla layout (byte-exact with vLLM's writer): each
+        16-value block of the RMSNormed BF16 latent (two lanes) gets the E4M3 scale
+        sf = max(amax / 6, 2^-9) and is stored as E2M1 of x * (1 / sf); k_pe is
+        stored as unscaled E4M3."""
+        qkv, w_kva, (cache, slots), eps = args[0], args[2], args[5:7], args[9]
+        lane, warp = tid % 32, tid // 32
+        slot = cutlass.Int64(-1)
+        if valid:
+            slot = slots[tok0 + j]
+        if slot >= 0:
+            xx = cute.make_rmem_tensor(8, Float32)
+            total = Float32(0)
+            if tid < 64:
+                values = load_bf16x8(at(qkv, tok0 + j, 1536 + tid * 8), mutable=True)
+                for i in cutlass.range_constexpr(8):
+                    xx[i] = values[i]
+                    total = fma(values[i], values[i], total)
+            total = warp_sum(total)
+            cute.arch.sync_threads()
+            if (lane == 0) & (warp < 2):
+                ss[warp, 0] = total
+            cute.arch.sync_threads()
+            page, offset = slot // cache.shape[1], slot % cache.shape[1]
+            if tid < 64:
+                mean = fma(ss[0, 0] + ss[1, 0], Float32(1 / 512), eps)
+                rr = cute.math.rsqrt(mean, fastmath=True)
+                weights = load_bf16x8(w_kva.iterator + tid * 8)
+                amax = Float32(0)
+                for i in cutlass.range_constexpr(8):
+                    xx[i] = Float32(BFloat16(xx[i] * rr * weights[i]))
+                    amax = cute.arch.fmax(amax, abs(xx[i]))
+                amax = cute.arch.fmax(amax, cute.arch.shuffle_sync_bfly(amax, 1))
+                code, inverse = nvfp4_scale(amax)
+                word = pack_e2m1(tuple(xx[i] * inverse for i in range(8)))
+                store_words(at(cache, page, offset, tid * 4), (word,))
+                if lane % 2 == 0:
+                    s = tid // 2
+                    byte = NVFP4_SCALES + 8 * (s % 4) + s // 4
+                    cache[page, offset, byte] = cutlass.Uint8(code)
+            elif tid < 72:
+                c = tid - 64
+                values = load_bf16x8(at(qkv, tok0 + j, 2048 + c * 8), mutable=True)
+                words = tuple(
+                    pack_fp8(tuple(values[4 * w + i] for i in range(4)))
+                    for w in range(2)
+                )
+                store_words(at(cache, page, offset, NVFP4_ROPE + c * 8), words)
 
     @cute.jit
     def store_qc(self, args, rows, pitch, tok0, tokens, block, tid):

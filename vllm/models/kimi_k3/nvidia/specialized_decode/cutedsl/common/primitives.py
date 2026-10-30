@@ -363,6 +363,18 @@ def pack_e2m1(values):
     return code, "=r,f,f,f,f,f,f,f,f", values
 
 
+@asm((Uint32, Float32), pure=True)
+def nvfp4_scale(amax: Float32):
+    """The E4M3 scale code of a 16-value NVFP4 block, sf = e4m3(max(amax / 6, 2^-9)),
+    and 1 / float(sf), with IEEE divisions (vLLM's nvfp4_ds_mla writer)."""
+    code = "{ .reg .f32 s; .reg .b16 p; .reg .b32 h; .reg .f16 lo,hi; "
+    code += "div.rn.f32 s,$2,0f40C00000; max.f32 s,s,0f3B000000; "
+    code += "cvt.rn.satfinite.e4m3x2.f32 p,0f00000000,s; cvt.u32.u16 $0,p; "
+    code += "cvt.rn.f16x2.e4m3x2 h,p; mov.b32 {lo,hi},h; cvt.f32.f16 s,lo; "
+    code += "div.rn.f32 $1,0f3F800000,s; }"
+    return code, "=r,=f,f", (amax,)
+
+
 @cute.jit
 def mx_exponent(amax: Float32, floor: cutlass.Constexpr[bool] = False):
     bits = Uint32(float_bits(amax))
