@@ -741,7 +741,9 @@ class SpecializedDecode:
             attn_in = first  # the attention's input rows
             if not pre_ready and head_ring and layer is self.layers[0]:
                 self.before[index].run_ring(prefix, blocks, first, aux.get(index))
-            elif stock_res:
+            elif stock_res and not pre_ready:
+                # (A site the previous MoE tail's ring consumer already ran is done:
+                # running the stock op on its output would apply the site twice.)
                 stock = self.before_stock[index]
                 attn_in = stock.run(hidden, prefix, blocks, aux.get(index))
             elif not pre_ready:
@@ -771,7 +773,7 @@ class SpecializedDecode:
             else:
                 hidden = self.feed_forward[index].run(moe_in, first)
                 first, second = second, first
-        if stock_res:  # the stock final AttnRes, then the backbone norm as stock
+        if stock_res and not pre_ready:  # the stock final AttnRes + the stock norm
             final = self.final_stock.run(hidden, prefix, blocks, aux.get(index + 1))
             out = self.normalize(final)
         elif not pre_ready:
