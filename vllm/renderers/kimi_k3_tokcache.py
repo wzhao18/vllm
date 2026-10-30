@@ -53,18 +53,20 @@ logger = logging.getLogger(__name__)
 
 END_OF_MSG = "<|end_of_msg|>"
 
-# sha256 of textwrap.dedent(inspect.getsource(method)) for the checkpoint's
-# tokenization_kimi.py (moonshotai/Kimi-K3, tokenization_kimi.py sha256
-# f28ea66e2d862a2a5814970b2ce40c2f7d8296ff09aed90a7e7def689b906944).
+# sha256 of textwrap.dedent(inspect.getsource(method)) for the checkpoints'
+# tokenization_kimi.py: moonshotai/Kimi-K3 (file sha256 f28ea66e2d86...) and
+# Kimi K3.1 (file sha256 204ee39fbf13...; only its _encode_text_piece differs,
+# still a function of the text and allow_special_tokens alone).
 _PINNED_SOURCES = {
     "_encode_chat_segments": (
-        "46ab075f05531cffc00555ac428179378f71a5c9de03aafc06f55e1cfaddb2b2"
+        "46ab075f05531cffc00555ac428179378f71a5c9de03aafc06f55e1cfaddb2b2",
     ),
     "_encode_text_piece": (
-        "0d77618e639452f3c9c1a810f3d3d072e2a6f47e6ab293f0dd39e6bcfe50e115"
+        "0d77618e639452f3c9c1a810f3d3d072e2a6f47e6ab293f0dd39e6bcfe50e115",
+        "9e77ff746d2babda36f13643cb1956a1572da92795ca932895f66decf402828c",
     ),
     "_split_whitespaces_or_nonwhitespaces": (
-        "b8f5acb3521037a488896765515d2569bc658ae7129ba1f202d5104565a9ad08"
+        "b8f5acb3521037a488896765515d2569bc658ae7129ba1f202d5104565a9ad08",
     ),
 }
 
@@ -295,7 +297,7 @@ def maybe_install(tokenizer) -> K3TokenizerAccel | None:
         return None
     for m in needed:
         got = _source_digest(getattr(cls, m))
-        if got != _PINNED_SOURCES[m]:
+        if got not in _PINNED_SOURCES[m]:
             logger.warning(
                 "K3 tokenizer speedups requested but %s.%s differs from the "
                 "pinned source (sha256 %s); leaving the tokenizer as is",
