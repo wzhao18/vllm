@@ -754,7 +754,7 @@ class MlaQuery:
         j = head * self.cluster + part
         if cutlass.const_expr(self.ds):
             self.insert_ds(args, ss, tok0, j, (j < T) & self.live(tok0 + j), tid)
-        if cutlass.const_expr(not self.late_insert and not self.dsa):
+        if cutlass.const_expr(not self.late_insert and not self.ds):
             self.insert(args, ss, tok0, j, (j < T) & self.live(tok0 + j), tid)
         cute.arch.cp_async_wait_group(0)
         cute.arch.sync_threads()
