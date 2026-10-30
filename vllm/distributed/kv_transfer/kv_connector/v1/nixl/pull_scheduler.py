@@ -9,6 +9,11 @@ from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
     NixlBaseConnectorScheduler,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.dcp_pair_exchange import (
+    NixlPairModeError,
+    check_pair_coverage,
+    pair_units,
+)
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
@@ -164,6 +169,14 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
                         )
                         for group in blocks.blocks
                     )
+                    if (
+                        self._pair_mode
+                        and params.get("do_remote_prefill")
+                        and num_external_tokens > 0
+                    ):
+                        self._plan_pair_exchange(
+                            request, local_block_ids, local_num_computed_blocks
+                        )
 
                     # Get unhashed blocks to pull from remote. Mind that a full prefix
                     # cache hit is indicated with an empty list.
@@ -188,6 +201,52 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             params["do_remote_prefill"] = False
             params["_remote_blocks_processed"] = True
 
+    def _plan_pair_exchange(
+        self,
+        request: "Request",
+        local_block_ids: BlockIds,
+        local_num_computed_blocks: tuple[int, ...],
+    ) -> None:
+        """DCP pair mode: record the blocks partner ranks exchange once every
+        rank has pulled ``request`` from a prefiller with half this DCP size.
+
+        Raises:
+            NixlPairModeError: The prefiller did not advertise its DCP size, or
+                computed fewer tokens or blocks than this decoder loads. That
+                is P/D configuration skew, so it stops the engine instead of
+                leaving rows unexchanged or zero-filling the tail.
+
+        """
+        params = request.kv_transfer_params
+        assert params is not None
+        remote_dcp_size = params.get("dcp_size")
+        if remote_dcp_size is None:
+            # The workers pair by the handshake's DCP size; without this one,
+            # a pair-mode pull would go unexchanged.
+            raise NixlPairModeError(
+                "DCP pair exchange: the prefiller of request "
+                f"{request.request_id} did not advertise its DCP size"
+            )
+        dcp_size = self.vllm_config.parallel_config.decode_context_parallel_size
+        if remote_dcp_size * 2 != dcp_size:
+            # An equal DCP size needs no exchange; the handshake rejects others.
+            return
+        remote_block_ids = params["remote_block_ids"]
+        check_pair_coverage(
+            self._get_remote_prefill_token_count(len(request.prompt_token_ids or [])),
+            params.get("remote_num_tokens"),
+            remote_block_ids,
+            self._pair_groups,
+            remote_block_tokens=self.block_size * remote_dcp_size,
+        )
+        if units := pair_units(
+            local_block_ids,
+            local_num_computed_blocks,
+            remote_block_ids,
+            self._pair_groups,
+        ):
+            self._pair_plans[request.request_id] = units
+
     def request_finished(
         self,
         request: "Request",
@@ -197,6 +256,12 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
         should be freed now or will be sent asynchronously and freed later.
         """
         from vllm.v1.request import RequestStatus
+
+        if self._pair_mode:
+            # Before any early return: a finished request's blocks are freed
+            # when its pull ends, or at once, so its exchange must not run.
+            self._pair_plans.pop(request.request_id, None)
+            self._pair_ready.pop(request.request_id, None)
 
         params = request.kv_transfer_params
         logger.debug(

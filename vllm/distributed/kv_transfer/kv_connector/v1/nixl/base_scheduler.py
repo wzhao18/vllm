@@ -31,13 +31,17 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlHandshakePayload,
     ReqId,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import zmq_ctx
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
+    get_representative_spec_type,
+    zmq_ctx,
+)
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 from vllm.utils.network_utils import make_zmq_path
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     FullAttentionSpec,
     MambaSpec,
     SlidingWindowSpec,
@@ -45,6 +49,9 @@ from vllm.v1.kv_cache_interface import (
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.dcp_pair_exchange import (
+        PairUnit,
+    )
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.outputs import KVConnectorOutput
@@ -79,6 +86,10 @@ class NixlBaseConnectorScheduler:
     # pull (READ) producer from a push (WRITE) one. Overridden by the push
     # scheduler.
     _TRANSFER_MODE: str = "pull"
+
+    # DCP pair mode (decoder, pull; see dcp_pair_exchange.py). The class default
+    # keeps schedulers built without __init__ (unit tests) off it.
+    _pair_mode: bool = False
 
     def __init__(
         self,
@@ -160,6 +171,43 @@ class NixlBaseConnectorScheduler:
         # Reqs to remove from processed set because they're not to send after
         # remote prefill or aborted.
         self._reqs_not_processed: set[ReqId] = set()
+
+        # DCP pair mode (decoder, pull): partner DCP ranks swap half-blocks after
+        # each pull at interleave 1. Only a JSON true enables it, as in the
+        # worker, whose startup checks reject any other truthy value.
+        self._pair_mode = (
+            self._TRANSFER_MODE == "pull"
+            and vllm_config.kv_transfer_config.get_from_extra_config(
+                "dcp_pair_exchange", False
+            )
+            is True
+        )
+        # The exchanged groups: the DCP-sharded attention groups, whose blocks
+        # the pull matches by DCP position. Transfer-group indices, as in the
+        # worker's read path.
+        self._pair_groups = (
+            tuple(
+                i
+                for i, g in enumerate(kv_cache_config.transfer_groups)
+                if g.kv_cache_spec.dcp_sharded
+                and issubclass(
+                    get_representative_spec_type(g.kv_cache_spec), AttentionSpec
+                )
+            )
+            if self._pair_mode
+            else ()
+        )
+        # Exchange plans, built at allocation. Ready once every rank finished
+        # the pull, then emitted with the next step's connector metadata.
+        self._pair_plans: dict[ReqId, list[PairUnit]] = {}
+        self._pair_ready: dict[ReqId, list[PairUnit]] = {}
+        if self._pair_mode:
+            logger.info(
+                "NIXL DCP pair mode: partner ranks exchange the blocks of "
+                "transfer groups %s after each pull from a prefiller with half "
+                "this DCP size.",
+                self._pair_groups,
+            )
 
         # Heartbeat tracking: requests needing periodic lease-renewal heartbeats to
         # remote P-side, stored as ready-to-send HeartbeatInfo grouped by remote engine
@@ -660,6 +708,11 @@ class NixlBaseConnectorScheduler:
                 meta.lease_renewals = self._pending_lease_renewals
                 self._pending_lease_renewals = set()
 
+        if self._pair_mode and self._pair_ready:
+            # This step is the first that can promote these requests, so every
+            # rank exchanges their blocks before any forward reads them.
+            meta.reqs_to_pair_exchange, self._pair_ready = self._pair_ready, {}
+
         # Package heartbeats, throttled by heartbeat_interval.
         if self._heartbeat_by_engine:
             now = time.perf_counter()
@@ -693,6 +746,15 @@ class NixlBaseConnectorScheduler:
         """Stop heartbeating for requests whose KV transfer completed."""
         for req_id in connector_output.finished_recving or ():
             self._stop_heartbeat(req_id)
+            # A pull completes once, on every rank (a retry after a remote
+            # disconnect reports nothing until it ends). A failed pull drops its
+            # plan: the request recomputes from token 0 or fails.
+            if (
+                self._pair_mode
+                and (units := self._pair_plans.pop(req_id, None))
+                and req_id not in connector_output.failed_recving
+            ):
+                self._pair_ready[req_id] = units
         # Called before the scheduler frees finished_sending blocks.
         lock = getattr(self, "_held_send_leases_lock", None)
         if connector_output.finished_sending and lock is not None:
