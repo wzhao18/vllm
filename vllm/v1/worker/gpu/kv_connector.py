@@ -30,6 +30,9 @@ if TYPE_CHECKING:
 class KVConnector:
     """KVConnector interface used by GPUModelRunner."""
 
+    def finalize_loaded_kv(self, scheduler_output: "SchedulerOutput") -> None:
+        pass
+
     def pre_forward(
         self,
         scheduler_output: "SchedulerOutput",
@@ -71,6 +74,11 @@ class ActiveKVConnector(KVConnector):
 
         self._pending_load_kwargs: dict[str, Any] | None = None
         self._disabled = False
+
+    def finalize_loaded_kv(self, scheduler_output: "SchedulerOutput") -> None:
+        if self._disabled or scheduler_output.kv_connector_metadata is None:
+            return
+        self.kv_connector.finalize_loaded_kv(scheduler_output.kv_connector_metadata)
 
     def pre_forward(
         self,

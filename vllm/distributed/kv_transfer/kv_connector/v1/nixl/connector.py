@@ -387,6 +387,20 @@ class NixlPullConnector(NixlBaseConnector):
         assert isinstance(self._connector_metadata, NixlConnectorMetadata)
         self.connector_worker.start_load_kv(self._connector_metadata)
 
+    def finalize_loaded_kv(self, metadata: KVConnectorMetadata) -> None:
+        assert self.connector_worker is not None
+        assert isinstance(metadata, NixlConnectorMetadata)
+        self.connector_worker.finalize_loaded_kv(metadata)
+
+    def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
+        # The model runner binds right before the forward: stop it if this
+        # step's DCP pair exchanges did not run (see finalize_loaded_kv).
+        if self.connector_worker is not None and isinstance(
+            connector_metadata, NixlConnectorMetadata
+        ):
+            self.connector_worker.check_pair_exchanges_ran(connector_metadata)
+        super().bind_connector_metadata(connector_metadata)
+
 
 class NixlPushConnector(NixlBaseConnector):
     """Push-based (WRITE) NIXL KV transfer connector."""

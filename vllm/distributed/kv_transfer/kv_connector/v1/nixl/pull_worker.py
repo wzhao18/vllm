@@ -50,6 +50,10 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         """Start loading by triggering non-blocking nixl_xfer.
         We check for these trnxs to complete in each step().
         """
+        self._raise_peer_config_mismatch()
+        # Before any READ: earlier steps' pair exchanges may still be writing
+        # blocks that an abort freed and this step's pulls reuse.
+        self._drain_pair_events(metadata)
         for req_id, meta in metadata.reqs_to_recv.items():
             meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
                 meta.local_block_ids, self._physical_blocks_per_logical_kv_block

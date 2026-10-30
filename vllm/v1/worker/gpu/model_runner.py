@@ -1970,6 +1970,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if iterlog is not None:
             h_entry = time.perf_counter()
         if not dummy_run:
+            # Before update_requests zeroes new blocks and applies CoW copies.
+            self.kv_connector.finalize_loaded_kv(scheduler_output)
             # Update the request states.
             self.update_pp_decode_requests()
             self.finish_requests(scheduler_output)
