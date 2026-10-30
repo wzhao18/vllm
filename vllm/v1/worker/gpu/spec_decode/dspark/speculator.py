@@ -181,9 +181,8 @@ class DSparkSpeculator(DFlashSpeculator):
         super().warmup_inputs(last_sampled, next_prefill_tokens, temperature, seeds)
         if self.draft_logits is None:
             return
-        logits = torch.zeros(
-            1, self.vocab_size, dtype=self.draft_logits.dtype, device=self.device
-        )
+        cache = self.draft_logits.values
+        logits = torch.zeros(1, cache.shape[-1], dtype=cache.dtype, device=self.device)
         idx = torch.zeros(1, dtype=self.sample_idx_mapping.dtype, device=self.device)
         pos = torch.zeros(1, dtype=self.sample_pos.dtype, device=self.device)
         gumbel_sample(
@@ -194,9 +193,10 @@ class DSparkSpeculator(DFlashSpeculator):
             pos,
             apply_temperature=True,
             is_drafting=True,
-            logits_cache=self.draft_logits,
+            logits_cache=cache,
             logits_cache_col=self._step_cols[0],
             use_fp64=self.use_fp64_gumbel,
+            logits_cache_row_mapping=self.draft_logits.row_mapping,
         )
         torch.accelerator.synchronize()
 
@@ -225,7 +225,13 @@ class DSparkSpeculator(DFlashSpeculator):
             fused = getattr(self.model, "greedy_markov_draft", None)
             return fused is not None and fused(head_hidden[:num_sample], anchors, draft)
         fused = getattr(self.model, "sampled_markov_draft", None)
-        if fused is None or self.use_fp64_gumbel or self._d2t_scatter_index is not None:
+        if (
+            fused is None
+            or self.use_fp64_gumbel
+            or self._d2t_scatter_index is not None
+            # The fused drafting writes rows by request state index.
+            or self.draft_logits.row_mapping is not None
+        ):
             return False
         return fused(
             head_hidden[:num_sample],
@@ -235,17 +241,19 @@ class DSparkSpeculator(DFlashSpeculator):
             self.sample_pos[:num_sample],
             self.temperature,
             self.seeds,
-            self.draft_logits,
+            self.draft_logits.values,
         )
 
     def prepare_draft_logits(self, idx_mapping: torch.Tensor) -> None:
         """Before the stock rejection sampler reads the draft logits of the requests
         in ``idx_mapping``: a draft model whose fused probabilistic drafting writes
         only this rank's vocabulary columns completes those rows."""
-        if self.draft_logits is not None and getattr(
-            self.model, "shards_draft_logits", False
+        if (
+            self.draft_logits is not None
+            and self.draft_logits.row_mapping is None
+            and getattr(self.model, "shards_draft_logits", False)
         ):
-            self.model.gather_draft_logits(self.draft_logits, idx_mapping)
+            self.model.gather_draft_logits(self.draft_logits.values, idx_mapping)
 
     def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
         if self._fused_greedy_markov(num_reqs, head_hidden):

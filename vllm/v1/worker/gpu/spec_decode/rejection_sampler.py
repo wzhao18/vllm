@@ -471,11 +471,14 @@ class RejectionSampler:
         model: Any,
         hidden_states: torch.Tensor,
         input_batch: InputBatch,
-        draft_logits: torch.Tensor | None,
+        draft_logits: DraftLogitsCache | None,
     ) -> SamplerOutput | None:
         """The same output as ``__call__`` for a batch that passes
         ``can_verify_sharded``, by the model's ``verify_sampled`` (None: the model has
         no fast path for these rows; nothing was launched)."""
+        if draft_logits is not None and draft_logits.row_mapping is not None:
+            # The model reads draft logits by request state index.
+            return None
         sampler = self.sampler
         result = model.verify_sampled(
             hidden_states,
@@ -489,7 +492,7 @@ class RejectionSampler:
             prefill_len=sampler.req_states.prefill_len.gpu,
             temperature=sampler.sampling_states.temperature.gpu,
             seeds=sampler.sampling_states.seeds.gpu,
-            draft_logits=draft_logits,
+            draft_logits=None if draft_logits is None else draft_logits.values,
             synthetic_rates=self.synthetic_conditional_rates,
             block_verification=self.use_block_verification,
         )
