@@ -75,7 +75,7 @@ class DsacDecode:
 
         self.dcpx = dcpx
         self.rows = min(int(os.environ.get(ROWS_ENV, "64")), dcpx.cap)
-        spec = os.environ.get(VARIANT_ENV, VARIANT)
+        spec = os.environ.get(VARIANT_ENV, VARIANT).replace(";", ",")  # (";": shells)
         self.variant = {b: parse_variant(v) for b, v in batch_table(spec).items()}
         max_splits = max([1, *(v[0] for v in self.variant.values())])
         self.core = DsaCore(device, cap=self.rows, heads=heads, max_splits=max_splits)
