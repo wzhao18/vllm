@@ -40,11 +40,11 @@ ENV = "VLLM_K31_DSA_CORE"
 ROWS_ENV = ENV + "_ROWS"
 # KV splits per (row, 32 heads) by rows: spread a small batch's local chunks over
 # more CTAs (the last one LSE-merges them). DCP16 layer bench (kernel RESULTS).
-# Most rows the core serves by default: at 64 rows (B8 q8) it gains ~1 us per layer on
-# balanced selections at DCP16 (73.7 vs 74.8) but loses ~25 us when one rank holds a
-# row's whole selection (the trtllm-gen kernel splits a long local list), so 33-64
-# rows keep the FlashInfer path unless VLLM_K31_DSA_CORE_ROWS=64.
-ROWS = 32
+# Most rows the core serves by default (the DcpBox cap). 16-rank step ABBA (dummy
+# weights, AgentX, indexer fill), us/step trtllm chain -> core: B8 q8 11913 -> 11724.
+# Caveat: a row whose selection sits on one rank (a ~100K-way tie at the cut, e.g. all
+# index keys zero) walks its chunks serially: DCP4 skew bench B8 q8 97 -> 122 us/layer.
+ROWS = 64
 VARIANT_ENV = ENV + "_VARIANT"
 # Core variant by rows: "u" = the tcgen05 core (CTA per (row, latent half), all 96
 # gathered heads as M = 128), "<S>x<HG>" = the mma.sync core with S KV splits (one
@@ -63,8 +63,8 @@ SPREAD_ENV = ENV + "_SPREAD"
 # Rows whose pushed DcpValue spreads every row's merge over its CTAs (Rubin schedule,
 # LSE box [CAP, H, DCP]; spec verify rows only) instead of one merge CTA per (head, 16
 # rows). DCP16 with 1x16: B8 q4 59.0 -> 55.9, B8 q8 76.8 -> 73.7, B1 q8 51.0 -> 50.5,
-# B1 q4 48.7 -> 49.2 us.
-SPREAD = "17-64:1"
+# B1 q4 48.7 -> 49.2 us; at step level neutral (B8 q4 8904 vs 8902 us/step), so off.
+SPREAD = ""
 
 
 def parse_variant(name: str) -> tuple[int, int]:
