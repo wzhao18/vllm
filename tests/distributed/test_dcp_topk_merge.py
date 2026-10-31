@@ -691,6 +691,72 @@ def _check_graph_stress(group, ws, n: int, replays: int) -> None:
     assert bool((mailbox.box == -1).all()), "a mailbox slot is not empty"
 
 
+def _check_error_after_publish(group, n: int) -> None:
+    """A host check of the merge that fails once round 1 is under way
+    (packed rows with fewer logits rows) raises, and the next merges, one rank
+    late each, still equal the all-gather's: a failed call must not leave an
+    unconsumed round-1 publish behind. Clean rows (no saturated rank), so a
+    stale round-1 row shows as a wrong selection, not as a rescue wait."""
+    from vllm.v1.attention.ops.dcp_topk_merge.kernels import (
+        dcp_topk_merge,
+        dcp_topk_merge_rows,
+        dcp_topk_pack,
+        set_dcp_topk_merge_exchange,
+    )
+
+    world, rank = group.world_size, group.rank_in_group
+    lengths = [150_000, 100_000, 70_123, 40_000, 120_000, 60_000, 90_000, 30_000]
+    num_rows = len(lengths)
+    a, ends = _make_case(lengths, seed=101)
+    b, _ = _make_case(lengths, seed=103)
+    local_a, local_end = _shard(a, ends, world, rank)
+    local_b, _ = _shard(b, ends, world, rank)
+    # A warm merge first: the select is compiled, so the next merge polls as
+    # soon as its own pack has published (a cold select's JIT compile would
+    # give every peer time to overwrite a stale row).
+    warm = torch.full((num_rows, TOPK), -7, dtype=torch.int32, device="cuda")
+    dcp_topk_merge(local_a, local_end, warm, n)
+    packed = dcp_topk_pack(local_a, local_end, n)
+    with pytest.raises(ValueError):
+        dcp_topk_merge_rows(
+            logits=local_a[: num_rows // 2],
+            row_ends=local_end,
+            packed=packed,
+            local_topk=n,
+            topk=TOPK,
+            req_id=torch.arange(num_rows, dtype=torch.int32, device="cuda"),
+            block_table=_block_table(num_rows, int(local_end.max())),
+            block_size=_BLOCK,
+            stride_rows=_BLOCK,
+            dcp_rank=rank,
+            rows_out=torch.empty((num_rows, TOPK), dtype=torch.int32, device="cuda"),
+            valid_out=torch.empty(num_rows, dtype=torch.int32, device="cuda"),
+        )
+    torch.accelerator.synchronize()
+    torch.distributed.barrier(group=group.cpu_group)
+    same = []
+    for k in range(4):
+        local = local_b if k % 2 == 0 else local_a
+        ids = torch.full((num_rows, TOPK), -7, dtype=torch.int32, device="cuda")
+        if rank == (world - 1 - k) % world:
+            torch.cuda._sleep(100_000_000)
+        dcp_topk_merge(local, local_end, ids, n)
+        ref = torch.full_like(ids, -7)
+        set_dcp_topk_merge_exchange("all_gather")
+        try:
+            dcp_topk_merge(local, local_end, ref, n)
+        finally:
+            set_dcp_topk_merge_exchange("auto")
+        torch.accelerator.synchronize()
+        same.append(torch.equal(ids, ref))
+    every = group.all_gather(
+        torch.tensor([same], dtype=torch.int32, device="cuda"), dim=0
+    )
+    assert bool(every.all()), (
+        f"merges after the error equal (rank x merge): {every.tolist()}"
+    )
+
+
 def _check_hook(group, n: int) -> None:
     """VLLM_DSA_BPRIME_CHECK over a real DCP group: the stock indexer's
     reference merge next to the one-round merge, eager and inside a CUDA
@@ -786,6 +852,7 @@ def run_worker(
     check_hook: bool = False,
     mailbox: bool = False,
     stress_replays: int = 300,
+    error_path: bool = False,
 ) -> None:
     """One DCP rank. Also callable from a multi-node launcher. ``check_hook``
     runs the VLLM_DSA_BPRIME_CHECK case instead of the merge's own;
@@ -853,6 +920,9 @@ def run_worker(
             if check_hook:
                 _check_hook(group, n)
                 return
+            if error_path:
+                _check_error_after_publish(group, n)
+                return
             if mailbox:
                 _check_exchange_ab(group, ws, n)
                 _check_late_publisher(group, n)
@@ -867,9 +937,16 @@ def run_worker(
 
 
 def _spawned(
-    rank: int, world: int, init_method: str, check_hook: bool, mailbox: bool
+    rank: int,
+    world: int,
+    init_method: str,
+    check_hook: bool,
+    mailbox: bool,
+    error_path: bool = False,
 ) -> None:
-    run_worker(rank, world, rank, init_method, check_hook, mailbox)
+    run_worker(
+        rank, world, rank, init_method, check_hook, mailbox, error_path=error_path
+    )
 
 
 _WORLDS = [
@@ -895,11 +972,22 @@ def test_dcp_topk_merge_check_hook(world: int, mailbox: bool):
     _run_group(world, check_hook=True, mailbox=mailbox)
 
 
-def _run_group(world: int, check_hook: bool, mailbox: bool) -> None:
+@pytest.mark.parametrize("mailbox", [False, True])
+@pytest.mark.parametrize("world", _WORLDS)
+def test_dcp_topk_merge_error_after_publish(world: int, mailbox: bool):
+    _run_group(world, check_hook=False, mailbox=mailbox, error_path=True)
+
+
+def _run_group(
+    world: int, check_hook: bool, mailbox: bool, error_path: bool = False
+) -> None:
     init_method = f"tcp://127.0.0.1:{get_open_port()}"
     ctx = mp.get_context("spawn")
     procs = [
-        ctx.Process(target=_spawned, args=(r, world, init_method, check_hook, mailbox))
+        ctx.Process(
+            target=_spawned,
+            args=(r, world, init_method, check_hook, mailbox, error_path),
+        )
         for r in range(world)
     ]
     for p in procs:
