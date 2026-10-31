@@ -3,6 +3,8 @@
 """Online MXFP8 for the Kimi K3.1 BF16 projections: target preset, kernels vs
 references, the packed fused-DSA GEMM and the specialized-decode guards."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -16,7 +18,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
     swizzle_mxfp8_scale,
 )
-from vllm.models.kimi_k3.nvidia.mxfp8_pack import unswizzle_mxfp8_scale
+from vllm.models.kimi_k3.nvidia.mxfp8 import unswizzle_mxfp8_scale
 from vllm.models.kimi_k3.quant_presets import K31_DEP_MXFP8_TARGETS
 from vllm.platforms import current_platform
 
@@ -122,8 +124,10 @@ def _mxfp8_kernels():
     from vllm.model_executor.kernels.linear.mxfp8.pytorch import (
         TorchMxFp8LinearKernel,
     )
+    from vllm.models.kimi_k3.nvidia.mxfp8 import KimiK3Mxfp8Kernel
 
     return [
+        KimiK3Mxfp8Kernel,
         FlashInferCutedslMxfp8LinearKernel,
         FlashInferCutlassMxfp8LinearKernel,
         FlashInferTrtllmMxfp8LinearKernel,
@@ -132,7 +136,14 @@ def _mxfp8_kernels():
 
 
 def _linear(prefix, n, k, quant_config, weight, kernel_cls=None):
+    from vllm.config import get_current_vllm_config
     from vllm.model_executor.layers.linear import ReplicatedLinear
+
+    config = get_current_vllm_config()
+    if config.model_config is None:  # the online methods read the model dtype
+        config.model_config = SimpleNamespace(
+            dtype=torch.bfloat16, quantization_config=None
+        )
 
     layer = ReplicatedLinear(
         k,
@@ -176,8 +187,8 @@ SHAPES = [
 
 @needs_mxfp8_gpu
 @pytest.mark.parametrize("n,k", SHAPES)
-@pytest.mark.parametrize("m", [1, 7, 64, 160, 1000])
-@pytest.mark.parametrize("kernel_idx", range(4))
+@pytest.mark.parametrize("m", [1, 7, 16, 17, 64, 160, 1000])
+@pytest.mark.parametrize("kernel_idx", range(5))
 def test_online_mxfp8_linear_matches_references(
     default_vllm_config, dist_init, n, k, m, kernel_idx
 ):
@@ -222,7 +233,7 @@ def test_packed_mxfp8_matches_per_linear(default_vllm_config, dist_init, m):
     """The packed [q_a | kv_a | wk | weights_proj] and [q_b | wq_index] MXFP8
     GEMMs equal the per-linear MXFP8 GEMMs exactly; the linears keep working on
     their views."""
-    from vllm.models.kimi_k3.nvidia.mxfp8_pack import PackedMxfp8Linear, can_pack_mxfp8
+    from vllm.models.kimi_k3.nvidia.mxfp8 import PackedMxfp8Linear, can_pack_mxfp8
 
     torch.manual_seed(m)
     online = _online()

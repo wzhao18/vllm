@@ -61,10 +61,12 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
         if not can_implement:
             return False, reason
         N, _ = c.weight_shape
-        if current_platform.is_device_capability_family(120) and N % 32 != 0:
+        # The CUTLASS runner checks N % 32 on SM10x too (e.g. Kimi K3's padded
+        # TP16 KDA in_proj, N = 3216, fails at the first GEMM otherwise).
+        if N % 32 != 0:
             return (
                 False,
-                f"mm_mxfp8 on SM12x requires N to be divisible by 32, got N={N}.",
+                f"mm_mxfp8 (CUTLASS) requires N to be divisible by 32, got N={N}.",
             )
         return True, None
 

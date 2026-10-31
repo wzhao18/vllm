@@ -1733,6 +1733,14 @@ class KimiLinearForCausalLM(
         self.needs_norm_in_logits = True
 
     def process_weights_after_loading(self) -> None:
+        from .mxfp8 import enable_kimi_k3_mxfp8_dispatch
+
+        if switched := enable_kimi_k3_mxfp8_dispatch(self):
+            logger.info_once(
+                "Kimi K3: %d online MXFP8 linears use the CuTe DSL (<= 16 rows) / "
+                "cuBLASLt MXFP8 dispatch.",
+                switched,
+            )
         # The specialized decode packs the DSA projections its own way.
         if self.specialized_decode_config is None:
             for module in self.model.modules():

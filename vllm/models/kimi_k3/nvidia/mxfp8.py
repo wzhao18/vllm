@@ -1,6 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Row packing of online-MXFP8 linears that read the same input.
+"""Online-MXFP8 projections of Kimi K3 / K3.1 on SM10x.
+
+Kernel choice on SM107 (Rubin): FlashInfer's CuTe DSL MXFP8 GEMM (vLLM's first
+choice on SM10x) is the fastest at <= 16 rows but loses to cuBLASLt's MXFP8
+``_scaled_mm`` above that for most K3.1 projection shapes (measured over
+M = 1..16384 at TP1 / TP8 / TP16, k31vr W4); both read the same weight
+layout ([N, K] FP8 rows, F8_128x4-swizzled E8M0 scales), so
+:class:`KimiK3Mxfp8Kernel` dispatches per call without a second copy.
+
+Row packing of online-MXFP8 linears that read the same input:
 
 MXFP8 weights are quantized per row in blocks of 32 along K, so stacking the
 rows of several MXFP8 linears (and their E8M0 scale rows) gives exactly the
@@ -13,9 +22,77 @@ Kimi K3.1's fused DSA forward packs ``[q_a | kv_a | wk | weights_proj]`` and
 import torch
 from torch import nn
 
+from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
+    FlashInferCutedslMxfp8LinearKernel,
+)
+from vllm.model_executor.layers.fusion.quant_activation import (
+    as_quantized_activation,
+)
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
+    mxfp8_e4m3_quantize,
 )
+from vllm.platforms import current_platform
+
+# Above this many rows the cuBLASLt MXFP8 GEMM beats the CuTe DSL one on SM107.
+CUTE_DSL_MAX_ROWS = 16
+
+
+class KimiK3Mxfp8Kernel(FlashInferCutedslMxfp8LinearKernel):
+    """CuTe DSL MXFP8 GEMM at <= ``CUTE_DSL_MAX_ROWS`` rows, cuBLASLt above;
+    the weight stays in the CuTe DSL layout ([K, N] column-major view)."""
+
+    def apply_weights(
+        self,
+        layer: nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        qa = as_quantized_activation(x, self.input_quant_key())
+        rows = qa.data.shape[0] if qa is not None else x.numel() // x.shape[-1]
+        if rows <= CUTE_DSL_MAX_ROWS:
+            return super().apply_weights(layer, x, bias)
+        weight = layer.weight  # [K, N], column-major
+        k, n = weight.shape
+        if qa is not None:
+            x_fp8, x_scale = qa.data, qa.scale
+            out_dtype, input_shape = qa.orig_dtype, qa.orig_shape
+        else:
+            out_dtype, input_shape = layer.params_dtype, x.shape
+            x_fp8, x_scale = mxfp8_e4m3_quantize(
+                x.reshape(-1, k), is_sf_swizzled_layout=True
+            )
+        out = torch._scaled_mm(
+            x_fp8,
+            weight,
+            scale_a=x_scale.view(torch.float8_e8m0fnu),
+            scale_b=layer.weight_scale.view(torch.float8_e8m0fnu),
+            bias=bias,
+            out_dtype=out_dtype,
+        )
+        return out.view(*input_shape[:-1], n)
+
+
+def _use_dispatch_kernel() -> bool:
+    return current_platform.is_device_capability((10, 7))
+
+
+def enable_kimi_k3_mxfp8_dispatch(model: nn.Module) -> int:
+    """On SM107, switch every online-MXFP8 linear on the CuTe DSL kernel to
+    :class:`KimiK3Mxfp8Kernel` (same weights). Returns the number switched."""
+    if not _use_dispatch_kernel():
+        return 0
+    switched = 0
+    for module in model.modules():
+        if not is_online_mxfp8(module):
+            continue
+        method = module.quant_method
+        if type(method.kernel) is FlashInferCutedslMxfp8LinearKernel:
+            dispatch = object.__new__(KimiK3Mxfp8Kernel)
+            dispatch.__dict__.update(method.kernel.__dict__)
+            method.kernel = dispatch
+            switched += 1
+    return switched
 
 
 def unswizzle_mxfp8_scale(sf: torch.Tensor, n: int, k: int) -> torch.Tensor:
@@ -32,16 +109,14 @@ def _kernel_layout(linear: nn.Module) -> str | None:
     "kn" (its transpose view), or None (a repacked layout this module can't
     unpack)."""
     from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
-        FlashInferCutedslMxfp8LinearKernel,
         FlashInferCutlassMxfp8LinearKernel,
     )
     from vllm.model_executor.kernels.linear.mxfp8.pytorch import (
         TorchMxFp8LinearKernel,
     )
-    from vllm.platforms import current_platform
 
     kernel = getattr(linear.quant_method, "kernel", None)
-    if type(kernel) is FlashInferCutedslMxfp8LinearKernel:
+    if type(kernel) in (FlashInferCutedslMxfp8LinearKernel, KimiK3Mxfp8Kernel):
         return "kn"
     if type(kernel) is FlashInferCutlassMxfp8LinearKernel or (
         type(kernel) is TorchMxFp8LinearKernel and current_platform.is_cuda()
@@ -95,6 +170,10 @@ class PackedMxfp8Linear:
         scale = torch.cat([s for _, s in parts])
         n, k = weight.shape
         self.kernel = init_mxfp8_linear_kernel(weight_shape=(n, k))
+        if _use_dispatch_kernel() and type(self.kernel) is (
+            FlashInferCutedslMxfp8LinearKernel
+        ):
+            self.kernel = KimiK3Mxfp8Kernel(self.kernel.config)
         holder = _PackedHolder()
         holder.register_parameter("weight", nn.Parameter(weight, requires_grad=False))
         holder.register_parameter(

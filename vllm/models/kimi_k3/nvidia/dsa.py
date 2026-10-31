@@ -56,7 +56,7 @@ from vllm.models.kimi_k3.nvidia.mla import (
     _GATE_MULTI_STREAM_TOKEN_THRESHOLD,
     _gate_sigmoid_mul,
 )
-from vllm.models.kimi_k3.nvidia.mxfp8_pack import PackedMxfp8Linear, can_pack_mxfp8
+from vllm.models.kimi_k3.nvidia.mxfp8 import PackedMxfp8Linear, can_pack_mxfp8
 from vllm.models.kimi_k3.nvidia.ops.dsa_indexer import (
     dsa_fused_prologue,
     indexer_k_norm_quant_insert,
