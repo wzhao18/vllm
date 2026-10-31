@@ -7,6 +7,7 @@ attention reference."""
 import gc
 import math
 import os
+import sys
 from functools import partial
 from types import SimpleNamespace
 
@@ -19,6 +20,20 @@ pytestmark = pytest.mark.skipif(
     not current_platform.is_device_capability_family(100),
     reason="the specialized decode kernels need SM100/SM103",
 )
+# Round 1 ports #108's DSA block only: its runtime (F5's wide steps, Ben's providers
+# and gates), MLA, MoE and AttnRes stay round 1's.
+NOT_PORTED = pytest.mark.skip(reason="round 1 keeps its own runtime / MLA / AttnRes")
+# nvfp4_ds_mla (MlaQuery's insert, prims_ts): not ported.
+NO_NVFP4 = pytest.mark.skip(reason="round 1's MlaQuery writes no nvfp4_ds_mla rows")
+
+
+def no_prims_ts():
+    """Why FlashInfer's prims_ts sparse MLA cannot run here, else None (SM107:
+    FlashInfer 0.7.2 has none, 0.7.3 accepts SM100 / SM103 only)."""
+    from vllm.utils.flashinfer import prims_ts_sparse_mla_format_error
+
+    return prims_ts_sparse_mla_format_error("native")
+
 
 UNIT, MLA_ROW, INDEX_ROW = 64, 656, 132  # indexer page tokens; cache row bytes
 FP8_ROW = 576  # per-tensor FP8 MLA row (FlashInfer sparse)
@@ -229,6 +244,7 @@ def test_fp8_query_and_cache_insert(batch, gap):
 @pytest.mark.parametrize(
     "block,gap", [(64, GAP), (1024, GAP), (64, FAR)], ids=["64", "1024", "far"]
 )
+@NO_NVFP4
 @pytest.mark.parametrize("batch", [1, 5, 16, 60, 64])
 def test_nvfp4_cache_insert(batch, block, gap):
     """FlashInfer prims_ts on nvfp4_ds_mla: the FP8 query rows as on a per-tensor
@@ -304,6 +320,7 @@ def test_nvfp4_cache_insert(batch, block, gap):
     assert torch.equal(mla, stock)  # every byte: padded rows wrote nothing
 
 
+@NO_NVFP4
 @pytest.mark.parametrize("gap", [GAP, FAR])
 @pytest.mark.parametrize("batch", [1, 5, 64])
 def test_nvfp4_cache_insert_random(batch, gap):
@@ -1078,13 +1095,12 @@ def test_flashinfer_dcp_core_merges_to_full_attention(
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.prepared import (
         PreparedDsa,
     )
-    from vllm.utils.flashinfer import has_flashinfer_prims_ts_sparse_mla
     from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
         FlashInferMLASparseImpl,
     )
 
-    if kernel != "trtllm" and not has_flashinfer_prims_ts_sparse_mla():
-        pytest.skip("FlashInfer has no prims_ts sparse MLA")
+    if kernel != "trtllm" and no_prims_ts():
+        pytest.skip("FlashInfer prims_ts sparse MLA cannot run here")
     nvfp4 = kernel == "nvfp4"
     kernel = "prims_ts" if nvfp4 else kernel
     default_vllm_config.kernel_config.flashinfer_sparse_mla_kernel = kernel
@@ -1297,10 +1313,9 @@ def test_flashinfer_sparse_core_tp(
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.attn_fi import (
         FlashInferCore,
     )
-    from vllm.utils.flashinfer import has_flashinfer_prims_ts_sparse_mla
 
-    if kernel != "trtllm" and not has_flashinfer_prims_ts_sparse_mla():
-        pytest.skip("FlashInfer has no prims_ts sparse MLA")
+    if kernel != "trtllm" and no_prims_ts():
+        pytest.skip("FlashInfer prims_ts sparse MLA cannot run here")
     nvfp4 = kernel == "nvfp4"
     kv_dtype = "nvfp4_ds_mla" if nvfp4 else "fp8_e4m3"
     kernel = "prims_ts" if nvfp4 else kernel
@@ -1443,10 +1458,9 @@ def test_flashinfer_kernels_share_precision(
         FlashInferCore,
         kernel_for,
     )
-    from vllm.utils.flashinfer import has_flashinfer_prims_ts_sparse_mla
 
-    if not has_flashinfer_prims_ts_sparse_mla():
-        pytest.skip("FlashInfer has no prims_ts sparse MLA")
+    if no_prims_ts():
+        pytest.skip("FlashInfer prims_ts sparse MLA cannot run here")
     dcp = 8 if heads == 128 else 1
     # The policy runs prims_ts on this batch (the stock decode: trtllm-gen).
     assert kernel_for(rows, dcp > 1, KERNELS) == "prims_ts"
@@ -1764,6 +1778,7 @@ def run_layer_step(
     graph=False,
     poison="rows",
     offset=0,
+    replays=5,
 ):
     """One decode step of a real DSA layer (``q`` rows per request, contexts on
     both sides of the top-k, written by the stock writers) through the stock
@@ -1776,7 +1791,11 @@ def run_layer_step(
     replay the step in a CUDA graph with the fused indexer's outputs poisoned
     before every layer (``poison`` "rows": every row full, pointing at slot 0;
     "counts": only the valid counts, set to 1); ``offset``: added to every
-    context (past 2048: no row takes the select's short-context bypass)."""
+    context (past 2048: no row takes the select's short-context bypass). Under
+    DCP ``graph`` captures this layer and a second one on the other q mailbox
+    parity (consecutive layers alternate), each with the merge's rows and counts
+    and FlashInfer's latent and LSE poisoned before it, ``replays`` times; both
+    must give the eager step's rows bit for bit."""
     from vllm import _custom_ops as ops
     from vllm.config import set_current_vllm_config
     from vllm.distributed import get_dcp_group
@@ -1899,32 +1918,35 @@ def run_layer_step(
         ours_mla, ours_index = mla.clone(), index.clone()
         md, index_md, context = step(ours_mla, ours_index)
         cap = max(64, batch)  # the scratch rows of the step's widest batch
+        # Round 1's providers.dsa_scratch: the last item is a BF16 latent, so
+        # PreparedDsa takes FlashInfer's buffers from dsa.r1.fi_buffers.
         scratch_rows = (
             torch.zeros(cap, 64, 576, device=dev, dtype=bf),
             torch.empty(cap, 1536, device=dev, dtype=bf),
             torch.empty(cap, 32 * 128, device=dev, dtype=bf),
             torch.empty(cap, 32, 128, device=dev, dtype=torch.uint8),
             torch.empty(cap, 32, device=dev, dtype=bf),
-            fi_buffers(cap, 128),
+            torch.empty(cap, 64, 512, device=dev, dtype=bf),
         )
-        policy: dict = dict(queries=(q,), overlap=overlap)
+        policy: dict = dict(queries=(q,), overlap=overlap, core="auto")
         policy.update(fi_policy(attn, kernel, cache_dtype))
         if world > 1:
+            # Round 1's DSA DcpBox exchanges BF16 latent partials only (#108's
+            # "proj" starts at 160 rows, past the box's 64).
+            assert partials == "bf16", partials
             runtime = SimpleNamespace(
-                dcp=world,
-                tp=world,
-                device=dev,
-                dcp_box=None,
-                dsa_dcp_box=None,
-                batches=(batch,),
-                wide_batches=lambda kind: (),
+                dcp=world, tp=world, device=dev, dcp_box=None, dsa_dcp_box=None
             )
-            box = dcp_box(
-                runtime, HEADS, dsa=True, flashinfer=flashinfer, partials=partials
-            )
+            box = dcp_box(runtime, HEADS, dsa=True, flashinfer=flashinfer)
             policy.update(dcp=box)
         prepared = PreparedDsa(attn, {batch: packed.shape[0]}, scratch_rows, **policy)
         prepared.prepare_cache(ours_mla)
+        layers = [prepared]
+        if graph and world > 1:
+            second = PreparedDsa(
+                attn, {batch: packed.shape[0]}, scratch_rows, **policy, parity=1
+            )
+            layers.append(second.prepare_cache(ours_mla))
         # prims_ts' plans share one workspace (attn_fi._Plans): each decode runs
         # on the stream the layer runs on, never on a query overlap side stream.
         layer_streams: list = []
@@ -1949,24 +1971,26 @@ def run_layer_step(
             assert merge.local_topk == indexer.dcp_local_topk > 0
             merge.dcp_ids = topk_buffer
             # The fused indexer's scorer and local top-N select feed it (past one
-            # row per SM, wide steps: its scorer, and the merge's own select).
-            assert merge.fused is not None
-            assert merge.fused.packs(batch) == (
-                merge.fused.packed and batch <= merge.fused.ctas
-            )
-            merge.fused.valid.fill_(-5)
+            # row per SM, wide steps: its scorer, and the merge's own select);
+            # on Rubin DeepGEMM's logits and DeepSelect do (RUBIN_DCP_FUSED_INDEXER).
+            assert (merge.fused is not None) == prepared.dcp_fused
+            if merge.fused is not None:
+                assert merge.fused.packs(batch) == (
+                    merge.fused.packed and batch <= merge.fused.ctas
+                )
+                merge.fused.valid.fill_(-5)
         topk_buffer.fill_(-1)
-        if overlap in ("fork", "front") and rank == 0:
+        if prepared.overlaps[batch, q] in ("fork", "front") and rank == 0:
             # Hold back the forked query (and under DCP rank 0's publish): the
             # core must wait for it (the join), and for every rank's (QueryWait).
             with torch.cuda.stream(side_stream(dev.index)):
                 torch.cuda._sleep(40_000_000)
 
-        def run():
+        def run(layer=prepared, rows=out):
             layer_streams.append(torch.cuda.current_stream())
-            prepared.run(
+            layer.run(
                 projected,
-                out,
+                rows,
                 cache=ours_mla,
                 slots=new_mla,
                 index_slots=index_md.slot_mapping,
@@ -1976,7 +2000,30 @@ def run_layer_step(
 
         with context:
             run()
-            if graph:
+            if graph and world > 1:
+                from vllm.distributed.parallel_state import graph_capture
+
+                torch.accelerator.synchronize()
+                eager = out.clone()
+                outs = [torch.full_like(out, float("nan")) for _ in layers]
+                g = torch.cuda.CUDAGraph()
+                with graph_capture(dev) as ctx, torch.cuda.graph(g, stream=ctx.stream):
+                    for layer, rows in zip(layers, outs):
+                        # A kernel reading these before its producer finished (a
+                        # premature PDL launch, an early read across the side
+                        # stream's join) sees all K keys at slot 0, or NaN.
+                        stage = layer.indexer_stage
+                        stage.dcp_rows.fill_(0)
+                        stage.dcp_valid.fill_(stage.topk)
+                        layer.fi.latent.fill_(float("nan"))
+                        layer.fi.lse.fill_(float("nan"))
+                        run(layer, rows)
+                for _ in range(replays):
+                    g.replay()
+                torch.accelerator.synchronize()
+                for i, rows in enumerate(outs):
+                    assert torch.equal(rows, eager), (i, (rows - eager).abs().max())
+            elif graph:
                 # Replayed back to back with the fused indexer's rows poisoned
                 # first: every kernel after the select must wait for it (PDL).
                 fused = prepared.fused
@@ -2016,7 +2063,7 @@ def run_layer_step(
             ]
             merged = merge.dcp_rows[:batch], merge.dcp_valid[:batch]
             owned = (merged, *filtered)
-            if merge.fused.packs(batch):
+            if merge.fused is not None and merge.fused.packs(batch):
                 counts = merge.fused.valid[:batch]  # the fused select ran
                 assert bool((counts >= 0).all() & (counts <= merge.local_topk).all())
         # The fused indexer's top-k (TP) or the merge of its scores (DCP) against
@@ -2025,7 +2072,7 @@ def run_layer_step(
         # its width carries the two paths' query rounding differences (printed
         # only).
         width = stock_width = None
-        if prepared.fused is not None or merge.fused is not None:
+        if prepared.fused is not None or merge.local_topk:
             stage = prepared.query_stage
             args = index_table, contexts, q
             q_fp8, head_w = stage.q_fp8[:batch], stage.head_w[:batch]
@@ -2239,11 +2286,144 @@ def test_prepared_dsa_run_matches_stock(
     top-k, the MLA rows and the indexer keys (and their SM100 MX scales) the step
     inserts, and every other cache byte left as it was; serially and with the
     query forked off the indexer path (QueryNorm, then MlaQuery on a side stream)."""
-    from vllm.utils.flashinfer import has_flashinfer_prims_ts_sparse_mla
-
-    if LAYER_CORES[core][2] == "prims_ts" and not has_flashinfer_prims_ts_sparse_mla():
-        pytest.skip("FlashInfer has no prims_ts sparse MLA")
+    if LAYER_CORES[core][2] == "prims_ts" and no_prims_ts():
+        pytest.skip("FlashInfer prims_ts sparse MLA cannot run here")
     check_layer_step(run_layer_step(core, batch, q, overlap=overlap), q)
+
+
+@pytest.mark.parametrize("overlap", list(TP_OVERLAPS))
+@pytest.mark.parametrize("batch,q", [(8, 8), (64, 8), (16, 4), (64, 4)])
+@pytest.mark.parametrize("heads", [12, 6])
+def test_prepared_dsa_run_matches_stock_dl(
+    workspace_init, dist_init, monkeypatch, heads, batch, q, overlap
+):
+    """test_prepared_dsa_run_matches_stock at DSpark DL7 (q8: M8 = C1, M64 = C8)
+    and DL3 (q4) rows, with TP8's 12 and TP16's 6 local heads, on the default
+    FlashInfer policy."""
+    monkeypatch.setattr(sys.modules[__name__], "HEADS", heads)
+    check_layer_step(run_layer_step("fi-auto", batch, q, overlap=overlap), q)
+
+
+def test_rubin_dcp_policy():
+    """Rubin (more SMs than GB300; GR100 SM107): trtllm-gen alone on a per-tensor
+    FP8 cache where FlashInfer cannot plan prims_ts; under DCP the query overlap is
+    the cluster IndexFront ("front") up to 16 rows and the fork from 17; the
+    #63 merge reads DeepGEMM's logits (no fused DCP indexer). GB300 keeps #108's
+    policies."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa import prepared
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.attn_fi import (
+        KERNELS,
+        fi_kernels,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.overlap import (
+        overlap_for,
+    )
+
+    reason = no_prims_ts()
+    assert fi_kernels("fp8") == (KERNELS if reason is None else ("trtllm",))
+    assert fi_kernels("nvfp4_ds_mla") == ("prims_ts",)
+    if torch.cuda.get_device_capability() == (10, 7):
+        assert reason is not None
+    rows = (1, 8, 16, 17, 24, 32, 64, 320)
+    modes = [overlap_for(b, None, True, True) for b in rows]
+    assert modes == ["front"] * 3 + ["fork"] * 5, modes
+    assert all(overlap_for(b, None, True, False) == "front" for b in rows)
+    assert overlap_for(64, "serial", True, True) == "serial"
+    assert not prepared.RUBIN_DCP_FUSED_INDEXER
+
+
+# One DCP16 rank's local contexts (interleave 1: ~1/16 of each request's), q8.
+DCP16_INDEXER_CASES = {
+    "c1": [11200],  # C1: one request at ~178K
+    "c8": [10000 + 997 * r for r in range(8)],  # C8: eight requests at ~160-270K
+    "short": [100, 150],  # every row within N (the bypass)
+    "boundary": [182, 183, 184, 185, 186, 190, 191, 192],  # rows around N
+    "ties": [6000, 4000, 500],
+    "far": [65000, 30000],  # near the 1M / 16 pitch
+    "padded": [5000, 400, 0],  # a CUDA-graph padding request
+}
+
+
+@pytest.mark.parametrize("mode", ["packed", "logits"])
+@pytest.mark.parametrize("case", list(DCP16_INDEXER_CASES))
+def test_fused_indexer_dcp16_q8(case, mode):
+    """test_fused_indexer_dcp at DCP16 (N = 192, pitch 65536) and q8 (the fused DCP
+    indexer, off on Rubin by policy, stays exact there)."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.indexer import (
+        FusedIndexer,
+    )
+    from vllm.v1.attention.ops.dcp_topk_merge.kernels import (
+        dcp_topk_pack,
+        dcp_topk_pack_indices,
+    )
+
+    contexts, q = DCP16_INDEXER_CASES[case], 8
+    x = fused_indexer_inputs(contexts, q, GAP, case == "ties", len(contexts) * 7 + q)
+    rows, n = len(contexts) * q, 192
+    ends, table = x.ends, x.table
+    if case == "padded":
+        ends[-q:] = 0
+    real = rows - q if case == "padded" else rows
+    decode = SimpleNamespace(
+        seq_lens=ends[:real].view(real, 1),
+        block_table=table.repeat_interleave(q, 0)[:real],
+    )
+    indexer = SimpleNamespace(
+        k_cache=SimpleNamespace(kv_cache=x.index),
+        topk_tokens=2048,
+        max_model_len=1 << 20,
+        dcp_world_size=16,
+    )
+    fused = FusedIndexer(
+        indexer,
+        [(rows, q)],
+        torch.device("cuda"),
+        max(64, rows),
+        local_topk=n,
+        packed=mode == "packed",
+    )
+    assert fused.pitch == 65536
+    query = x.query.view(torch.uint8)
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    assert fused.packs(rows) == (mode == "packed" and rows <= sms), (rows, sms)
+    packed, out_logits, aux = fused.run_dcp(query, x.weights, decode, rows, q)
+    assert (packed is not None) == (mode == "packed")
+    assert torch.equal(aux, ends[:rows])
+    torch.accelerator.synchronize()
+    logits = fused.logits[: rows * fused.pitch].view(rows, fused.pitch)
+    assert out_logits.data_ptr() == logits.data_ptr()
+    for t in range(rows):
+        length = int(ends[t])
+        check_fused_logits(logits[t, :length], x, t, t // q, length)
+    bf16 = logits.view(torch.bfloat16)
+    if mode == "logits":
+        packed = dcp_topk_pack(out_logits, aux, n, max_local_len=fused.max_local_len)
+        torch.accelerator.synchronize()
+        words = packed[:, :n]
+        for t in range(rows):
+            length = int(ends[t])
+            want = order16(logits[t, exact_topk(logits[t, :length], n)].long())
+            got = (words[t][words[t] != 0].long() & 0xFFFFFFFF) >> 16
+            assert torch.equal(got.sort().values, want.sort().values), (case, t)
+        return
+    out, counts = packed, fused.valid[:rows]
+    local = torch.full((rows, n), -1, dtype=torch.int32, device="cuda")
+    for t in range(rows):
+        length = int(ends[t])
+        c = min(length, n)
+        assert int(counts[t]) == c, (case, t)
+        words = out[t, :n].long() & 0xFFFFFFFF
+        plane = out[t, n:].long() & 0xFFFFFFFF
+        assert bool((words[c:] == 0).all()) and bool((words[:c] != 0).all())
+        j = torch.arange(c, device="cuda")
+        high = (plane[j // 32] >> (j % 32)) & 1
+        ids = (0xFFFF - (words[:c] & 0xFFFF)) | (high << 16)
+        assert torch.equal(ids.sort().values, exact_topk(logits[t, :length], n))
+        local[t, :c] = ids.int()
+    ref = torch.full_like(out, 7)
+    dcp_topk_pack_indices(bf16, local, ref)
+    torch.accelerator.synchronize()
+    assert torch.equal(out, ref), case
 
 
 # Past the step's 64 rows: the rows a K3.1 DSA layer's specialized projection and
@@ -2252,6 +2432,7 @@ def test_prepared_dsa_run_matches_stock(
 WIDE_LAYER_SHAPES = [(80, 5), (130, 5), (160, 5), (240, 5), (320, 5)]
 
 
+@NOT_PORTED
 @pytest.mark.parametrize("overlap", ["serial", "fork", "front"])
 @pytest.mark.parametrize("batch,q", WIDE_LAYER_SHAPES)
 @pytest.mark.parametrize("core", ["fi-trtllm", "fi-prims_ts", "fi-auto"])
@@ -2261,10 +2442,8 @@ def test_prepared_dsa_run_wide_matches_stock(
     """test_prepared_dsa_run_matches_stock at 80-320 rows (a wide step's DSA
     core): the specialized and the stock layer each against FP32 attention over
     its own top-k; the top-k exact up to its BF16 logits (the width check)."""
-    from vllm.utils.flashinfer import has_flashinfer_prims_ts_sparse_mla
-
-    if LAYER_CORES[core][2] == "prims_ts" and not has_flashinfer_prims_ts_sparse_mla():
-        pytest.skip("FlashInfer has no prims_ts sparse MLA")
+    if LAYER_CORES[core][2] == "prims_ts" and no_prims_ts():
+        pytest.skip("FlashInfer prims_ts sparse MLA cannot run here")
     check_layer_step(run_layer_step(core, batch, q, overlap=overlap), q)
 
 
@@ -2283,10 +2462,8 @@ def test_prepared_dsa_graph_waits_for_rows(
     the select's short-context bypass), or only the counts at short contexts
     (rows below 2048 keys count fewer than 2048). Zero-count rows in a graph:
     test_flashinfer_sparse_core_tp."""
-    from vllm.utils.flashinfer import has_flashinfer_prims_ts_sparse_mla
-
-    if LAYER_CORES[core][2] == "prims_ts" and not has_flashinfer_prims_ts_sparse_mla():
-        pytest.skip("FlashInfer has no prims_ts sparse MLA")
+    if LAYER_CORES[core][2] == "prims_ts" and no_prims_ts():
+        pytest.skip("FlashInfer prims_ts sparse MLA cannot run here")
     args = dict(overlap=overlap, graph=True, poison=poison, offset=offset)
     step = run_layer_step(core, batch, q, **args)
     check_layer_step(step, q)
@@ -2302,10 +2479,8 @@ def test_prims_ts_runs_on_the_layer_stream(
     while the decodes are stream ordered: PreparedDsa runs each on the stream the
     layer runs on (eager and captured), under every query overlap mode, never on
     the overlap side stream (run_layer_step checks each call)."""
-    from vllm.utils.flashinfer import has_flashinfer_prims_ts_sparse_mla
-
-    if not has_flashinfer_prims_ts_sparse_mla():
-        pytest.skip("FlashInfer has no prims_ts sparse MLA")
+    if no_prims_ts():
+        pytest.skip("FlashInfer prims_ts sparse MLA cannot run here")
     step = run_layer_step(core, batch, q, overlap=overlap, graph=True)
     # "auto": the policy's prims_ts batches (FI_KERNEL) run it.
     assert step.prims_ts_calls > 0
@@ -2330,11 +2505,10 @@ def check_prepare_allocates_nothing(core, world=1):
         dcp_box,
         pack_dsa_projection,
     )
-    from vllm.utils.flashinfer import has_flashinfer_prims_ts_sparse_mla
 
     cache_dtype, _, kernel = LAYER_CORES[core]
-    if kernel != "trtllm" and not has_flashinfer_prims_ts_sparse_mla():
-        pytest.skip("FlashInfer has no prims_ts sparse MLA")
+    if kernel != "trtllm" and no_prims_ts():
+        pytest.skip("FlashInfer prims_ts sparse MLA cannot run here")
     q, batches = 5, (5, 10, 15, 20, 40, 60, 64)
     config = layer_config(core, q, world)
     dev = torch.device("cuda", torch.accelerator.current_device_index())
@@ -2404,8 +2578,11 @@ def test_prepare_cache_allocates_nothing(default_vllm_config, dist_init, core):
 
 
 # An 8-rank launch (2 nodes x 4 GPUs: srun -n8, one pytest per rank) sets the
-# rendezvous file; the ranks then run the DCP8 layer steps together.
-DCP_INIT = os.environ.get("KIMI_K3_SD_DCP_INIT")
+# rendezvous file; the ranks then run the DCP8 layer steps together. A 16-rank
+# launch (4 nodes, KIMI_K3_SD_DCP16_INIT) runs them at TP = DCP = 16 with 6 local
+# heads (96 gathered, padded to 128): Kimi K3.1's decode on Rubin.
+DCP16_INIT = os.environ.get("KIMI_K3_SD_DCP16_INIT")
+DCP_INIT = os.environ.get("KIMI_K3_SD_DCP_INIT") or DCP16_INIT
 
 
 # DCP8 layer cases: every FlashInfer core under every query overlap mode with BF16
@@ -2418,13 +2595,21 @@ DCP8_CASES = [
     ),
     # W_UV-projected value rows ("proj": BF16, so checked as the lossless rows)
     *((core, None, "proj") for core in ("fi-trtllm", "fi-auto", "fi-nvfp4")),
+    # The per-batch overlap policy (overlap.QUERY_OVERLAP: on Rubin "dcp_rubin").
+    *((core, None, "bf16") for core in ("fi-trtllm", "fi-auto")),
 ]
+# DCP layer shapes (rows, q): #108's DSpark k=4 rows and decode batches, and
+# Rubin's DL7 (q8: C1 = M8 .. C8 = M64) and DL3 (q4) rows.
+DCP_LAYER_SHAPES = [(1, 1), (8, 1), (5, 5), (40, 5), (60, 5)]
+DCP_LAYER_SHAPES += [(8, 8), (16, 8), (24, 8), (32, 8), (64, 8), (16, 4), (64, 4)]
 
 
 @pytest.fixture(scope="module")
 def dcp8_group():
-    """TP = DCP = 8 over the launch's ranks (SLURM task ids), with real
-    cross-node mailboxes for the specialized decode."""
+    """TP = DCP = 8 (or 16, KIMI_K3_SD_DCP16_INIT: HEADS 6 meanwhile) over the
+    launch's ranks (SLURM task ids), with real cross-node mailboxes for the
+    specialized decode."""
+    global HEADS
     from vllm.config import set_current_vllm_config
     from vllm.distributed import (
         cleanup_dist_env_and_memory,
@@ -2435,8 +2620,11 @@ def dcp8_group():
 
     rank, world = int(os.environ["SLURM_PROCID"]), int(os.environ["SLURM_NTASKS"])
     local = int(os.environ["SLURM_LOCALID"])
-    assert world == 8, "the DCP8 layer test runs on 8 ranks"
+    assert world == (16 if DCP16_INIT else 8), world
     torch.accelerator.set_device_index(local)
+    heads = HEADS
+    if world == 16:
+        HEADS = 6
     with set_current_vllm_config(layer_config("fi-trtllm", 1, world)):
         init_distributed_environment(
             world_size=world,
@@ -2459,15 +2647,16 @@ def dcp8_group():
         wide = layer_config("fi-trtllm", 5, world)
         with set_current_vllm_config(wide):
             n = init_dcp_topk_merge(wide, 2048)
-        assert n and dcp_topk_merge_max_rows(2048, n) >= 320
+        assert n and dcp_topk_merge_max_rows(2048, n) >= (320 if world == 8 else 64)
         yield world
         reset_workspace_manager()
+    HEADS = heads
     cleanup_dist_env_and_memory()
 
 
 @pytest.mark.skipif(DCP_INIT is None, reason="needs an 8-rank launch (DCP8)")
 @pytest.mark.skip_global_cleanup  # the DCP8 group outlives each case
-@pytest.mark.parametrize("batch,q", [(1, 1), (8, 1), (5, 5), (40, 5), (60, 5)])
+@pytest.mark.parametrize("batch,q", DCP_LAYER_SHAPES)
 @pytest.mark.parametrize("core,overlap,partials", DCP8_CASES)
 def test_prepared_dsa_run_dcp_matches_stock(
     dcp8_group, core, overlap, partials, batch, q
@@ -2483,10 +2672,10 @@ def test_prepared_dsa_run_dcp_matches_stock(
     mailbox polled by MlaQuery ("serial"), or by QueryWait after the indexer
     ("wait") or on the forked query ("fork"). ``partials``: DcpValue's exchange
     (BF16 latent rows or "proj" value rows; both exact up to BF16 rounding)."""
-    from vllm.utils.flashinfer import has_flashinfer_prims_ts_sparse_mla
-
-    if LAYER_CORES[core][2] == "prims_ts" and not has_flashinfer_prims_ts_sparse_mla():
-        pytest.skip("FlashInfer has no prims_ts sparse MLA")
+    if LAYER_CORES[core][2] == "prims_ts" and no_prims_ts():
+        pytest.skip("FlashInfer prims_ts sparse MLA cannot run here")
+    if partials != "bf16":
+        pytest.skip("round 1's DSA DcpBox exchanges BF16 partials only")
     step = run_layer_step(core, batch, q, dcp8_group, overlap, partials)
     check_layer_step(step, q, reference=False)
     # The merge's rows of this rank: those of its global ids, as the stock filter
@@ -2502,6 +2691,24 @@ def test_prepared_dsa_run_dcp_matches_stock(
 
 @pytest.mark.skipif(DCP_INIT is None, reason="needs an 8-rank launch (DCP8)")
 @pytest.mark.skip_global_cleanup  # the DCP8 group outlives each case
+@pytest.mark.parametrize("overlap", [None, "serial", "fork", "front"])
+@pytest.mark.parametrize("batch", [8, 16, 32, 64])
+def test_prepared_dsa_dcp_graph_poisoned(dcp8_group, batch, overlap):
+    """Two DCP layers on alternating q mailbox parities in one CUDA graph at q8 (the
+    DL7 rows of C1 .. C8), the merge's rows and counts and FlashInfer's latent and
+    LSE poisoned before each layer, replayed 200 times: every replay finishes (no
+    hang across the ranks' mailboxes) with the eager step's rows bit for bit, so
+    no kernel reads them early (PDL, the query side stream's join), and the step
+    matches the stock one (run_layer_step(graph=True))."""
+    step = run_layer_step(
+        "fi-auto", batch, 8, dcp8_group, overlap, "bf16", graph=True, replays=200
+    )
+    check_layer_step(step, 8, reference=False)
+
+
+@NOT_PORTED
+@pytest.mark.skipif(DCP_INIT is None, reason="needs an 8-rank launch (DCP8)")
+@pytest.mark.skip_global_cleanup  # the DCP8 group outlives each case
 @pytest.mark.parametrize("overlap", ["serial", "fork", "wait", "front"])
 @pytest.mark.parametrize("batch,q", WIDE_LAYER_SHAPES)
 @pytest.mark.parametrize("core", ["fi-trtllm", "fi-prims_ts"])
@@ -2509,10 +2716,8 @@ def test_prepared_dsa_run_dcp_wide_matches_stock(dcp8_group, core, batch, q, ove
     """test_prepared_dsa_run_dcp_matches_stock at 80-320 rows (a wide DCP8 step's
     DSA core; past one row per SM the fused scorer feeds the merge's own local
     top-N; from 160 rows "proj" partials), every query overlap mode."""
-    from vllm.utils.flashinfer import has_flashinfer_prims_ts_sparse_mla
-
-    if LAYER_CORES[core][2] == "prims_ts" and not has_flashinfer_prims_ts_sparse_mla():
-        pytest.skip("FlashInfer has no prims_ts sparse MLA")
+    if LAYER_CORES[core][2] == "prims_ts" and no_prims_ts():
+        pytest.skip("FlashInfer prims_ts sparse MLA cannot run here")
     step = run_layer_step(core, batch, q, dcp8_group, overlap, "default")
     check_layer_step(step, q, reference=False)
     merged, ours, stock = (
@@ -2539,10 +2744,8 @@ def test_prepare_cache_allocates_nothing_dcp(dcp8_group, core):
 @pytest.mark.parametrize("batch,q", [(15, 5), (60, 5)])
 def test_prims_ts_runs_on_the_layer_stream_dcp(dcp8_group, batch, q, overlap):
     """DCP8 (every batch on prims_ts): see test_prims_ts_runs_on_the_layer_stream."""
-    from vllm.utils.flashinfer import has_flashinfer_prims_ts_sparse_mla
-
-    if not has_flashinfer_prims_ts_sparse_mla():
-        pytest.skip("FlashInfer has no prims_ts sparse MLA")
+    if no_prims_ts():
+        pytest.skip("FlashInfer prims_ts sparse MLA cannot run here")
     step = run_layer_step("fi-prims_ts", batch, q, dcp8_group, overlap)
     assert step.prims_ts_calls > 0
 
@@ -2665,7 +2868,7 @@ def test_dcp_partials_policy():
     """The DcpValue partials policy: a format for every batch ("bf16" or "proj"), a
     batch table of them or "default" (per layer kind: BF16, then "proj" from 65
     rows for MLA, from 160 rows for DSA); no lossy 8-bit partials."""
-    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.mla.dcp import (
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.dcp_value import (  # noqa: E501
         partials_for,
         resolve_partials,
     )
@@ -2754,22 +2957,23 @@ def check_dcp_value(policy, layout, batch, q, lse_base_e):
         publish_args,
         run_value,
     )
-    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.mla.dcp import (
-        DcpBox,
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.dcp_value import (  # noqa: E501
         compile_value,
         partials_for,
     )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.r1 import DsaBox
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.mla.dcp import DcpBox
 
     partials = partials_for(policy, batch)
+    if layout != "dsa" or partials != "bf16" or policy not in ("bf16", None):
+        pytest.skip("round 1: #108's DcpValue serves DSA with BF16 partials only")
     group = get_dcp_group()
     world, rank = group.world_size, group.rank_in_group
     dev = torch.device("cuda", torch.accelerator.current_device_index())
     dsa, heads, reqs = layout == "dsa", HEADS, batch // q
     gathered = heads * world
     padded = 128 if dsa else gathered
-    box = DcpBox(
-        group.device_group, dev, world, rank, heads, q_heads=padded, partials=policy
-    )
+    box = DsaBox(DcpBox(group.device_group, dev, world, rank, heads, q_heads=padded))
     sms = torch.cuda.get_device_properties(dev).multi_processor_count
     common = torch.Generator(device=dev).manual_seed(11)
     # W_UV [H, 512, 128] latent-contiguous, as MLA's processed weights.
@@ -2949,6 +3153,7 @@ def layer_inputs(batch, fp8, seed):
     return randn(batch, PITCH), weights, mla, index, slots
 
 
+@NOT_PORTED
 @pytest.mark.parametrize("fp8", [False, True], ids=["fp8_ds_mla", "fp8"])
 @pytest.mark.parametrize("batch", [80, 160, 320])
 def test_wide_batches_match_64_row_kernels(batch, fp8):
@@ -3170,6 +3375,7 @@ def _dcp_mailbox_worker(rank, size, port, batch, q, dsa, partials="bf16"):
     dist.destroy_process_group()
 
 
+@NOT_PORTED
 @pytest.mark.skipif(torch.accelerator.device_count() < 4, reason="needs 4 GPUs")
 @pytest.mark.parametrize("dsa", [False, True], ids=["mla", "dsa_flashinfer"])
 @pytest.mark.parametrize("batch", [40, 80, 160, 320])
@@ -3186,6 +3392,7 @@ def test_dcp_mailboxes_wide_batches(batch, dsa, partials):
     mp.spawn(_dcp_mailbox_worker, args=args, nprocs=4)
 
 
+@NOT_PORTED
 def test_step_caps():
     """The specialized step takes batches up to the measured specialized-vs-stock
     crossover of every attention layer kind of the model, within what the step's
@@ -3206,6 +3413,7 @@ def test_step_caps():
         assert step_cap(True, dcp) == min(PREPARED_MAX, dsa)
 
 
+@NOT_PORTED
 def test_wide_caps():
     """Wide steps: each layer kind's projection and core run specialized up to its
     own crossover (DSA: the attention layer's, SPECIALIZED_ROWS), within the cores'
@@ -3226,6 +3434,7 @@ def test_wide_caps():
         assert caps == {k: WIDE_ROWS[k, dcp] for k in kinds}
 
 
+@NOT_PORTED
 @pytest.mark.parametrize("pitch", [PITCH, 6288 // 8 * 8])
 @pytest.mark.parametrize("batch", [80, 160, 240, 320])
 def test_projection_wide_batches(pitch, batch):
@@ -3415,6 +3624,7 @@ def tile_scales(amax):
     return out[: amax.numel()].view(amax.shape)
 
 
+@NOT_PORTED
 def test_ds_tile_scale_matches_stock_writers():
     """ATTN-9: the fp8_ds_mla tile scale is the stock writer's exp2f(ceilf(log2f(
     max(amax / 448, 1e-4)))): concat_and_cache_ds_mla (IEEE divide) over every
@@ -3531,6 +3741,7 @@ def final_attn_res_inputs(tokens, nb, gen):
     return tuple(t.to(bf) for t in (blocks, prefix, delta, norm_w, query_w, out_w))
 
 
+@NOT_PORTED
 @pytest.mark.parametrize("nb", [1, 3])
 def test_final_attn_res_matches_stock(nb):
     """NA-7: the last AttnRes and the backbone norm (applied in the specialized
@@ -3582,10 +3793,9 @@ def test_prims_ts_plan_matches_stock(default_vllm_config, dist_init, heads, batc
         FlashInferCore,
         plan_rows_for,
     )
-    from vllm.utils.flashinfer import has_flashinfer_prims_ts_sparse_mla
 
-    if not has_flashinfer_prims_ts_sparse_mla():
-        pytest.skip("FlashInfer has no prims_ts sparse MLA")
+    if no_prims_ts():
+        pytest.skip("FlashInfer prims_ts sparse MLA cannot run here")
     # The stock capacities with DSpark k=4 graph sizes 5..60 (as the recipes).
     capacities = tuple(sorted({1 << i for i in range(13)} | set(range(5, 61, 5))))
     assert plan_rows_for(batch, capacities) == batch
@@ -3617,6 +3827,7 @@ def test_prims_ts_plan_matches_stock(default_vllm_config, dist_init, heads, batc
         assert torch.equal(lse.view(torch.int32), stock_lse.view(torch.int32))
 
 
+@NOT_PORTED
 def test_dsa_capability_gates():
     """IDX-3: the query and index fronts implement the K3.1 indexer: indexer RoPE or
     RMSNorm keys are refused with a reason (fp8_ds_mla: no FlashInfer kernel)."""
@@ -3663,19 +3874,22 @@ def check_dcp_value_merge_stock(layout, batch, q):
         publish_args,
         run_value,
     )
-    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.mla.dcp import (
-        DcpBox,
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.dcp_value import (  # noqa: E501
         compile_value,
     )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.r1 import DsaBox
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.mla.dcp import DcpBox
     from vllm.v1.attention.ops.dcp import DirectDCPA2AWorkspace
 
+    if layout != "dsa":
+        pytest.skip("round 1: #108's DcpValue serves DSA only (MLA keeps Ben's)")
     group = get_dcp_group()
     world, rank = group.world_size, group.rank_in_group
     dev = torch.device("cuda", torch.accelerator.current_device_index())
     dsa, heads, reqs = layout == "dsa", HEADS, batch // q
     gathered = heads * world
     padded = 128 if dsa else gathered
-    box = DcpBox(group.device_group, dev, world, rank, heads, q_heads=padded)
+    box = DsaBox(DcpBox(group.device_group, dev, world, rank, heads, q_heads=padded))
     sms = torch.cuda.get_device_properties(dev).multi_processor_count
     pick = torch.zeros(gathered, 128, 512, device=dev)
     pick[:, torch.arange(128), 4 * torch.arange(128)] = 1
@@ -3762,23 +3976,17 @@ def test_prepared_dsa_compiles_once_per_kernel(
     import cutlass.cute as cute
 
     from vllm.config import set_current_vllm_config
-    from vllm.models.kimi_k3.nvidia.model_state import KimiK3ModelState
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa import (
         indexer,
         prepared,
         query_stage,
     )
-    from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.decode import (
-        SpecializedDecode,
-    )
     from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.providers import (
         pack_dsa_projection,
     )
-    from vllm.utils.flashinfer import has_flashinfer_prims_ts_sparse_mla
-    from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 
-    if LAYER_CORES[core][2] == "prims_ts" and not has_flashinfer_prims_ts_sparse_mla():
-        pytest.skip("FlashInfer has no prims_ts sparse MLA")
+    if LAYER_CORES[core][2] == "prims_ts" and no_prims_ts():
+        pytest.skip("FlashInfer prims_ts sparse MLA cannot run here")
     for memo in (
         prepared.compile_core,
         query_stage.compile_norm,
@@ -3836,26 +4044,9 @@ def test_prepared_dsa_compiles_once_per_kernel(
                 dsa.prepare_cache(packed_cache(blocks, UNIT, FP8_ROW))
                 per_layer.append(len(compiles))
 
-        # prepare_kv prepares only the real cache (the worker records its block
-        # count first); the profiling cache is bound unprepared.
-        monkeypatch.setattr(
-            MambaHybridModelState, "initialize_kv_cache", lambda *a: None
-        )
-        bound: list = []
-        prepare_layout = lambda caches: (bound.append("prepared"), prepare(16))
-        cache_config = SimpleNamespace(num_gpu_blocks=None)
-        decode = SpecializedDecode.__new__(SpecializedDecode)
-        decode.cache_config, decode.kv_prepared = cache_config, True
-        decode.layers = (SimpleNamespace(layer_idx=0, self_attn=None),)
-        decode.attention = {0: SimpleNamespace(prepare_layout=prepare_layout)}
-        state = KimiK3ModelState.__new__(KimiK3ModelState)
-        state.language_model = SimpleNamespace(specialized_decode=decode)
-        initialize = KimiK3ModelState.initialize_kv_cache
-        initialize(state, SimpleNamespace(num_blocks=4), None)  # profiling
-        assert not bound and not decode.kv_prepared and not compiles
-        cache_config.num_gpu_blocks = 16  # gpu_worker.initialize_from_config
-        initialize(state, SimpleNamespace(num_blocks=16), None)
-        assert bound == ["prepared"] and decode.kv_prepared
+        # (Round 1 prepares every cache it binds: #108's profiling-cache skip in
+        # SpecializedDecode.prepare_kv is not ported.)
+        prepare(16)
         # The second layer compiles nothing: no kernel compiled twice.
         first = per_layer[0]
         assert first > 0 and per_layer == [first, first], (per_layer, compiles)
