@@ -2531,15 +2531,9 @@ def check_prepare_allocates_nothing(core, world=1):
         policy.update(fi_policy(attn, kernel, cache_dtype))
         if world > 1:
             runtime = SimpleNamespace(
-                dcp=world,
-                tp=world,
-                device=dev,
-                dcp_box=None,
-                dsa_dcp_box=None,
-                batches=batches,
-                wide_batches=lambda kind: (),
+                dcp=world, tp=world, device=dev, dcp_box=None, dsa_dcp_box=None
             )
-            box = dcp_box(runtime, HEADS, dsa=True, flashinfer=True, partials="bf16")
+            box = dcp_box(runtime, HEADS, dsa=True, flashinfer=True)
             policy.update(dcp=box)
         # A fresh process: no layer has reserved the shared buffers yet.
         indexer._SCRATCH.clear()
@@ -2566,7 +2560,8 @@ def check_prepare_allocates_nothing(core, world=1):
             torch.accelerator.synchronize()
             gc.collect()
             fused = prepared.fused if world == 1 else prepared.indexer_stage.fused
-            assert fused is not None
+            # (Under DCP on Rubin the merge reads DeepGEMM's logits: no fused one.)
+            assert (fused is not None) == (world == 1 or prepared.dcp_fused)
             grown = torch.cuda.memory_allocated(dev) - bound
             assert grown == 0, f"prepare_cache allocated {grown} bytes"
 
@@ -4062,3 +4057,31 @@ def test_prepared_dsa_compiles_once_per_kernel(
         assert all(x is y for x, y in zip(kernels, b.kernels[shape])), shape
     for shape, kernels in a.overlap_kernels.items():
         assert all(x is y for x, y in zip(kernels, b.overlap_kernels[shape])), shape
+
+
+@pytest.mark.skipif(DCP_INIT is None, reason="needs an 8-rank launch (DCP8)")
+@pytest.mark.skip_global_cleanup  # the DCP8 group outlives each case
+@pytest.mark.parametrize("batch,q", [(8, 8), (64, 8)])
+def test_prepared_dsa_dcp_bprime_check(dcp8_group, batch, q):
+    """VLLM_DSA_BPRIME_CHECK on the specialized merge (IndexerStage.check): the
+    generic merge of the same logits agrees with the one-round merge on every row
+    (no miss), as for the stock op. Last in the file: the check stays on for the
+    process once initialized."""
+    from vllm.distributed import get_dcp_group
+    from vllm.v1.attention.ops.dcp_topk_merge.check import (
+        MISS_ROWS,
+        ROWS,
+        get_dcp_topk_merge_check,
+        init_dcp_topk_merge_check,
+    )
+
+    dev = torch.device("cuda", torch.accelerator.current_device_index())
+    init_dcp_topk_merge_check(dev, get_dcp_group().rank_in_group)
+    state = get_dcp_topk_merge_check()
+    before = state.snapshot()["totals"]
+    step = run_layer_step("fi-auto", batch, q, dcp8_group, None, "bf16")
+    check_layer_step(step, q, reference=False)
+    torch.accelerator.synchronize()
+    after = state.snapshot()["totals"]
+    assert after[ROWS] - before[ROWS] > 0, (before, after)
+    assert after[MISS_ROWS] == before[MISS_ROWS], (before, after)
