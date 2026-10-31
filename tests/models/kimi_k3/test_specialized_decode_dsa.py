@@ -2090,6 +2090,7 @@ def run_layer_step(
                 stock_index, *args, q_fp8, head_w, stock_topk, world
             )
     return SimpleNamespace(
+        world=world,
         width=width,
         stock_width=stock_width,
         attn=attn,
@@ -2213,8 +2214,10 @@ def check_layer_step(step, q, reference=True):
         a, b = set(step.stock_topk[t].tolist()), set(step.topk[t].tolist())
         # Fused vs DeepGEMM at 160-320 rows: >= 98.7% measured (both sum heads in
         # BF16; the paths' query rounding and BF16 near-ties at the K-th logit
-        # differ; the width check above bounds ours).
-        bound = 0.99 if step.width is None or step.topk.shape[0] <= 64 else 0.98
+        # differ; the width check above bounds ours). DCP16 q8 M64 on SM107 (one
+        # row, 4580 keys: 2027 of 2048, as #108's fused indexer there) as well.
+        wide = step.topk.shape[0] > 64 or step.world == 16
+        bound = 0.99 if step.width is None or not wide else 0.98
         assert len(a & b) / len(a) > bound, (t, len(a), len(a & b))
         same.append(a == b)
     out, stock = step.out, step.stock
@@ -2781,7 +2784,8 @@ def dcp_merge_vs_exact(world, saturate, repeats=1):
     dev = torch.device("cuda", torch.accelerator.current_device_index())
     config = layer_config("fi-trtllm", 1, world)
     n = merge_pkg.dcp_merge_local_topk(topk, world)
-    assert n == 384, n  # DCP8: 1.5x the fair share, warp-aligned
+    # 1.5x the fair share, warp-aligned: DCP8 384, DCP16 192.
+    assert n == {8: 384, 16: 192}[world], n
     with set_current_vllm_config(config):  # the rescue workspace (collective)
         assert merge_pkg.init_dcp_topk_merge(config, topk) == n
     assert merge_pkg.dcp_topk_merge_fits(rows, topk, n)
