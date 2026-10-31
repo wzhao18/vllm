@@ -18,8 +18,8 @@ by
     -> DcpValue(pushed=True) (merge, W_UV, gate)
 
 Switch: ``VLLM_K31_DSA_CORE`` = 1 (default: per-tensor FP8 KV under DCP wherever
-DcpExchange's top-k is) | 0; ``VLLM_K31_DSA_CORE_ROWS`` = most rows (default 64, the
-DcpBox cap); ``VLLM_K31_DSA_CORE_VARIANT`` = the core variant by rows
+DcpExchange's top-k is) | 0; ``VLLM_K31_DSA_CORE_ROWS`` = most rows (default 32, see
+ROWS; at most the DcpBox cap of 64); ``VLLM_K31_DSA_CORE_VARIANT`` = the core variant by rows
 (``batch_table`` syntax, see VARIANT); ``VLLM_K31_DSA_CORE_SPREAD`` = rows whose
 pushed DcpValue spreads its merge (see SPREAD). ``VLLM_K31_DSA_CORE_STATS=1`` logs the kernel's error word
 at exit.
@@ -40,6 +40,11 @@ ENV = "VLLM_K31_DSA_CORE"
 ROWS_ENV = ENV + "_ROWS"
 # KV splits per (row, 32 heads) by rows: spread a small batch's local chunks over
 # more CTAs (the last one LSE-merges them). DCP16 layer bench (kernel RESULTS).
+# Most rows the core serves by default: at 64 rows (B8 q8) it gains ~1 us per layer on
+# balanced selections at DCP16 (73.7 vs 74.8) but loses ~25 us when one rank holds a
+# row's whole selection (the trtllm-gen kernel splits a long local list), so 33-64
+# rows keep the FlashInfer path unless VLLM_K31_DSA_CORE_ROWS=64.
+ROWS = 32
 VARIANT_ENV = ENV + "_VARIANT"
 # Core variant by rows: "u" = the tcgen05 core (CTA per (row, latent half), all 96
 # gathered heads as M = 128), "<S>x<HG>" = the mma.sync core with S KV splits (one
@@ -88,7 +93,7 @@ class DsacDecode:
         from .ops import DsaCore
 
         self.dcpx = dcpx
-        self.rows = min(int(os.environ.get(ROWS_ENV, "64")), dcpx.cap)
+        self.rows = min(int(os.environ.get(ROWS_ENV, str(ROWS))), dcpx.cap)
         spec = os.environ.get(VARIANT_ENV, VARIANT).replace(";", ",")  # (";": shells)
         self.variant = {b: parse_variant(v) for b, v in batch_table(spec).items()}
         spread = os.environ.get(SPREAD_ENV, SPREAD).replace(";", ",")
