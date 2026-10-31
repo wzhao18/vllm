@@ -23,6 +23,11 @@ K31_BAR_ALL_CTAS    pre-pull NVLink barrier: every SM acquires the local signal 
                     instead of SM 0 polling it and a grid sync broadcasting it. The
                     barrier phase is read at dispatch entry, before the dispatch grid
                     sync that precedes SM 0's counter update.
+K31_DECODE_SHAPED   scheduler: DeepGEMM's decode-shaped task order (claim every L1 task
+                    before any L2 task while each pool block has its own ring slot,
+                    BLOCK_M <= 64), so no L1 task waits behind an L2 consumer and the
+                    tail is short, nearly-ready L2 tasks. Applied only when the installed
+                    scheduler has the ``kDecodeShaped`` parameter.
 
 ``PatchError`` is raised when the stock header does not have the expected text
 (another DeepGEMM version): the caller keeps the stock kernel.
@@ -30,8 +35,10 @@ K31_BAR_ALL_CTAS    pre-pull NVLink barrier: every SM acquires the local signal 
 
 from __future__ import annotations
 
-FLAGS = ("K31_COMBINE_V2", "K31_PUSH_RED", "K31_SKIP_ZERO_SEND", "K31_BAR_ALL_CTAS")
+FLAGS = ("K31_COMBINE_V2", "K31_PUSH_RED", "K31_SKIP_ZERO_SEND", "K31_BAR_ALL_CTAS",
+         "K31_DECODE_SHAPED")
 STOCK_HEADER = "deep_gemm/impls/sm100_fp8_fp4_mega_moe_situ.cuh"
+SCHEDULER_HEADER = "deep_gemm/scheduler/mega_moe.cuh"
 MARKER = "Kimi K3.1 wide-EP MegaMoE"
 
 
@@ -228,6 +235,15 @@ _COMBINE_V2 = """#if K31_COMBINE_V2
 """
 
 
+def _decode_shaped(p: _Patcher) -> None:
+    p.sub(
+        """        kNumRingBlocks, kNumLocalityDomains,
+        kNumSharedExperts>(""",
+        """        kNumRingBlocks, kNumLocalityDomains,
+        kNumSharedExperts, static_cast<bool>(K31_DECODE_SHAPED)>(""",
+    )
+
+
 def _combine_v2(p: _Patcher) -> None:
     s = p.s
     start_anchor = "        // Combine: reduce top-k results and write back"
@@ -247,9 +263,13 @@ def _combine_v2(p: _Patcher) -> None:
     p.s = s[:mid] + _COMBINE_V2 + s[mid:end] + "#endif\n" + s[end:]
 
 
-def patch_situ_header(text: str, flags: dict[str, int] | None = None) -> str:
+def patch_situ_header(
+    text: str, flags: dict[str, int] | None = None, scheduler_text: str | None = None
+) -> str:
     """The Kimi K3.1 header derived from the stock ``text`` (see module doc).
-    ``flags`` overrides the macro defaults (all 1)."""
+    ``flags`` overrides the macro defaults (all 1). ``scheduler_text`` is the
+    installed ``SCHEDULER_HEADER``; without ``kDecodeShaped`` in it (or without it)
+    the scheduler order stays stock."""
     if MARKER in text:
         raise PatchError("header is already patched")
     vals = {k: 1 for k in FLAGS}
@@ -262,6 +282,10 @@ def patch_situ_header(text: str, flags: dict[str, int] | None = None) -> str:
     _skip_zero_send(p)
     _bar_all_ctas(p)
     _combine_v2(p)
+    if scheduler_text is not None and "bool kDecodeShaped" in scheduler_text:
+        _decode_shaped(p)
+    else:
+        vals["K31_DECODE_SHAPED"] = 0
     defs = "".join(f"#ifndef {k}\n#define {k} {v}\n#endif\n" for k, v in vals.items())
     p.sub(
         "\nnamespace deep_gemm {\n",

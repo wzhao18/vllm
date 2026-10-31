@@ -49,10 +49,15 @@ def test_patch_applies_to_installed_header():
     if stock is None:
         pytest.skip("DeepGEMM with the SiTU MegaMoE header is not installed")
     text = stock.read_text()
-    out = patch_situ_header(text)
+    sched = stock.parents[1] / "scheduler" / "mega_moe.cuh"
+    out = patch_situ_header(text, scheduler_text=sched.read_text())
     assert MARKER in out
     for flag in FLAGS:
+        if flag == "K31_DECODE_SHAPED" and "bool kDecodeShaped" not in sched.read_text():
+            assert f"#define {flag} 0" in out
+            continue
         assert f"#define {flag} 1" in out
+    assert "#define K31_DECODE_SHAPED 0" in patch_situ_header(text)  # no scheduler text
     # Every stock path is kept under #else
     assert out.count("ptx::atomic_add_sys(") == text.count("ptx::atomic_add_sys(")
     assert "kBeforeDispatchPullBarrierTag" in out
@@ -203,6 +208,7 @@ def _worker(rank: int, nranks: int, port: int, cache: str, out: dict):
         xq = xq[0].float() * xq[1].repeat_interleave(32, dim=-1)
         ref = _reference(xq, idx, tw, w1_ref, w2_ref)
         err = (patched[t].float() - ref).norm() / ref.norm()
+        print(f"rank {rank} tokens {t}: patched == stock bitwise, rel. L2 error vs reference {float(err):.2e}")
         assert err < 2e-2, (rank, t, float(err))
         out[(rank, t)] = float(err)
     buf.destroy()

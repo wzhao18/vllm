@@ -251,12 +251,16 @@ def run_case(dg, group, rank, nranks, args, epr: int, tokens: int, mode: str, bu
     return out
 
 
-def worker(local_rank: int, nprocs: int, args):
+def worker(local_rank: int, nprocs: int, args, rank: int | None = None):
+    """``rank`` is the global rank under ``--srun`` (``local_rank`` = GPU index); the
+    per-rank files keep the ``rank<i>`` name."""
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", str(args.port))
     torch.cuda.set_device(local_rank)
+    gpu = local_rank
+    local_rank = gpu if rank is None else rank
     dist.init_process_group("nccl", rank=local_rank, world_size=nprocs,
-                            device_id=torch.device(f"cuda:{local_rank}"))
+                            device_id=torch.device(f"cuda:{gpu}"))
     group = dist.new_group(list(range(nprocs)))
     dg = import_dg()
     if args.header:
@@ -359,7 +363,21 @@ def main():
                    help="localize expert weights into the device locality domains")
     p.add_argument("--port", type=int, default=29517)
     p.add_argument("--json", default="")
+    p.add_argument("--srun", type=int, default=0,
+                   help="one process per GPU launched by srun (multi-node EP16): rank / world / GPU from "
+                        "SLURM_PROCID / SLURM_NTASKS / SLURM_LOCALID, MASTER_ADDR = first node of the step")
     args = p.parse_args()
+    if args.srun:
+        rank, world = int(os.environ["SLURM_PROCID"]), int(os.environ["SLURM_NTASKS"])
+        if "MASTER_ADDR" not in os.environ:
+            import subprocess
+
+            nodes = subprocess.check_output(["scontrol", "show", "hostnames",
+                                             os.environ["SLURM_STEP_NODELIST"]], text=True).split()
+            os.environ["MASTER_ADDR"] = nodes[0]
+        args.nprocs = world
+        worker(int(os.environ["SLURM_LOCALID"]), world, args, rank=rank)
+        return
     torch.multiprocessing.spawn(worker, args=(args.nprocs, args), nprocs=args.nprocs)
 
 

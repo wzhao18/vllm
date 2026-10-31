@@ -7,7 +7,7 @@ the DeepGEMM warmup compiles the kernels:
 
 - ``VLLM_K3_MEGAMOE_PATCH`` (default 1): JIT-compile MegaMoE from the header that
   ``situ_patch`` derives from the installed stock header (bitwise-identical output,
-  -1.5..-8 us per launch). Falls back to the stock kernel, with a warning, when the
+  -5..-12% per launch at EP16/EP32 per-rank shapes). Falls back to the stock kernel, with a warning, when the
   installed DeepGEMM's header does not have the expected text.
 - ``VLLM_K3_MEGAMOE_LOCALIZE`` (default 0): place each rank's routed expert weights
   in the GPU's two locality domains (MLOPart), so every die streams its half of N
@@ -36,11 +36,15 @@ def install_patched_header(deep_gemm, cache_root: Path | None = None) -> Path | 
     header (derived from the installed stock one). Returns the overlay root, or
     ``None`` when the stock header cannot be patched (the stock kernel stays)."""
     from .overlay import install
-    from .situ_patch import STOCK_HEADER, PatchError, patch_situ_header
+    from .situ_patch import SCHEDULER_HEADER, STOCK_HEADER, PatchError, patch_situ_header
 
-    stock = Path(deep_gemm.__file__).resolve().parent / "include" / STOCK_HEADER
+    include = Path(deep_gemm.__file__).resolve().parent / "include"
+    stock = include / STOCK_HEADER
     try:
-        text = patch_situ_header(stock.read_text())
+        sched = include / SCHEDULER_HEADER
+        text = patch_situ_header(
+            stock.read_text(), scheduler_text=sched.read_text() if sched.is_file() else None
+        )
     except (OSError, PatchError) as e:
         logger.warning("Kimi K3 MegaMoE: stock kernel kept, cannot patch %s: %s", stock, e)
         return None
