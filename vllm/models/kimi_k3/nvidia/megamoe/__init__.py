@@ -11,11 +11,15 @@ the DeepGEMM warmup compiles the kernels:
   installed DeepGEMM's header does not have the expected text.
 - ``VLLM_K3_MEGAMOE_LOCALIZE`` (default 1): place each rank's routed expert weights
   in the GPU's two locality domains (MLOPart), so every die streams its half of N
-  from its own HBM (bitwise-identical output). Full K3.1 DEP16 on VR: -0.58..-0.66 ms
-  per step (MegaMoE 119.7 -> 113.7 us/launch at 128 rows), 5 of 5 processes clean,
-  KV pool 0.1-0.4% smaller (the MLOPart weights live outside the PyTorch
-  allocator; vLLM's profile sees them as non-torch memory). Falls back to the plain
-  placement without MLOPart or under EPLB (the weights change shape to
+  from its own HBM (bitwise-identical output). Full K3.1 DEP16 on VR: -0.57..-0.65 ms
+  per step on one 4-node block (MegaMoE 119.7 -> 113.7 us/launch at 128 rows), 5 of
+  5 processes clean. The gain depends on the node: DEP4 8-layer B/C repeats on three
+  dedicated nodes saved -334..-381 us per step on two and -179..-211 us on the third.
+  The KV pool is 0.1-3% smaller per GPU and varies from one start to the next (full
+  DEP16: 102.34 -> 101.96-102.21 GiB; DEP4 8-layer: 202.54 -> 196.1-201.5 GiB). The
+  MLOPart weights live outside the PyTorch allocator and vLLM's profile counts
+  them, plus a start-dependent MLOPart overhead, as non-torch memory. Falls back
+  to the plain placement without MLOPart or under EPLB (the weights change shape to
   ``(2, E, N / 2, K)``, which EPLB cannot move). Caveat: on a shared DEP4 node
   (224 experts/rank) 4 of 8 localized processes had cases 17-25% slower (one rank's
   drafter MLA decode ~1.4x slower) while other jobs used the same GPUs.
