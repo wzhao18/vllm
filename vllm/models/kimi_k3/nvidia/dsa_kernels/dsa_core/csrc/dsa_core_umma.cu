@@ -78,6 +78,7 @@ struct Params {
   float s2scale, vscale;
   const uint64_t* part_peers;
   const uint64_t* lse_peers;
+  int lse_wide;  // DcpBox.lse as [2, CAP, H, W] (DcpValue's wide / spread merge)
   int box_cap, hpr, parity, rank, W, T, heads;
   int* err;
   long long spin_ns;
@@ -233,6 +234,12 @@ __device__ __forceinline__ float ex2(float x) {  // 2^x (approx, -inf -> 0)
 }
 __device__ __forceinline__ bool armed(uint4 v) {
   return v.x == kSent || v.y == kSent || v.z == kSent || v.w == kSent;
+}
+// index of (row t, gathered head gh) from this rank in the owner's DcpBox.lse
+__device__ __forceinline__ int64_t lse_slot(const Params& p, int t, int gh) {
+  const int H = p.hpr;
+  if (p.lse_wide) return (((int64_t)p.parity * p.box_cap + t) * H + gh % H) * p.W + p.rank;
+  return (((int64_t)p.parity * p.W + p.rank) * p.box_cap + t) * H + gh % H;
 }
 __device__ __forceinline__ uint32_t no_neg_zero(uint32_t w) {
   if ((w & 0xFFFFu) == 0x8000u) w &= 0xFFFF0000u;
@@ -498,7 +505,7 @@ __global__ void __launch_bounds__(kThreads, 1) dsau_kernel(const __grid_constant
         lse = m_run + log2f(l_run) - 8.f;
         if (!(lse > kEmptyLse) || !(lse < -kEmptyLse)) lse = kEmptyLse;
       }
-      st_u32(reinterpret_cast<uint32_t*>(p.lse_peers[gh / H]) + slot, __float_as_uint(lse));
+      st_u32(reinterpret_cast<uint32_t*>(p.lse_peers[gh / H]) + lse_slot(p, t, gh), __float_as_uint(lse));
     }
   }
   fence_async_smem();  // (the staged rows, for the bulk copies)
@@ -529,7 +536,7 @@ __global__ void __launch_bounds__(kThreads, 1) dsau_kernel(const __grid_constant
 // ------------------------------------------------------------------ host
 void run(torch::Tensor q, torch::Tensor sel, torch::Tensor cnt, torch::Tensor kv, double s2scale,
          double vscale, torch::Tensor part_peers, torch::Tensor lse_peers, int64_t box_cap,
-         int64_t hpr, int64_t parity, int64_t rank, int64_t T, torch::Tensor err, int64_t spin_ns,
+         int64_t hpr, int64_t parity, int64_t rank, int64_t T, int64_t lse_wide, torch::Tensor err, int64_t spin_ns,
          int64_t pdl, c10::optional<torch::Tensor> dbg) {
   if (T == 0) return;
   const int W = (int)part_peers.numel();
@@ -553,6 +560,7 @@ void run(torch::Tensor q, torch::Tensor sel, torch::Tensor cnt, torch::Tensor kv
   p.part_peers = reinterpret_cast<const uint64_t*>(part_peers.data_ptr<int64_t>());
   p.lse_peers = reinterpret_cast<const uint64_t*>(lse_peers.data_ptr<int64_t>());
   p.box_cap = (int)box_cap;
+  p.lse_wide = (int)lse_wide;
   p.hpr = (int)hpr;
   p.parity = (int)parity;
   p.rank = (int)rank;

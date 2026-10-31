@@ -88,6 +88,7 @@ struct Params {
   float vscale;           // k scale (V dequant)
   const uint64_t* part_peers;  // [W] DcpBox.partial bases
   const uint64_t* lse_peers;   // [W] DcpBox.lse bases
+  int lse_wide;  // DcpBox.lse as [2, CAP, H, W] (DcpValue's wide / spread merge)
   int box_cap, hpr, parity, rank, W, T, splits;
   int* err;
   long long spin_ns;
@@ -208,6 +209,12 @@ __device__ __forceinline__ float4 ld_dsmem_v4(const float* p, int rank) {
 }
 __device__ __forceinline__ uint32_t bits(__nv_bfloat162 v) {
   return *reinterpret_cast<uint32_t*>(&v);
+}
+// index of (row t, gathered head gh) from this rank in the owner's DcpBox.lse
+__device__ __forceinline__ int64_t lse_slot(const Params& p, int t, int gh) {
+  const int H = p.hpr;
+  if (p.lse_wide) return (((int64_t)p.parity * p.box_cap + t) * H + gh % H) * p.W + p.rank;
+  return (((int64_t)p.parity * p.W + p.rank) * p.box_cap + t) * H + gh % H;
 }
 // a bf16 pair without negative zeros (0x8000 halves: DcpBox.partial's sentinel)
 __device__ __forceinline__ uint32_t no_neg_zero(uint32_t w) {
@@ -567,7 +574,7 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
     if (sp == 0 && tid < kGroupHeads) {
       const int gh = h0 + tid;
       const int64_t slot = (((int64_t)p.parity * p.W + p.rank) * p.box_cap + t) * H + gh % H;
-      st_u32(reinterpret_cast<uint32_t*>(p.lse_peers[gh / H]) + slot, __float_as_uint(s_lse[tid]));
+      st_u32(reinterpret_cast<uint32_t*>(p.lse_peers[gh / H]) + lse_slot(p, t, gh), __float_as_uint(s_lse[tid]));
     }
     cluster_sync();  // (no CTA exits while a peer may still read its shared memory)
     if (dbg && tid == 0) dbg[4] = now_ns();
@@ -611,7 +618,7 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
       if (!(lse > kEmptyLse) || !(lse < -kEmptyLse)) lse = kEmptyLse;  // NaN / inf
     }
     const int64_t slot = (((int64_t)p.parity * p.W + p.rank) * p.box_cap + t) * H + gh % H;
-    st_u32(reinterpret_cast<uint32_t*>(p.lse_peers[gh / H]) + slot, __float_as_uint(lse));
+    st_u32(reinterpret_cast<uint32_t*>(p.lse_peers[gh / H]) + lse_slot(p, t, gh), __float_as_uint(lse));
   }
   if (dbg && tid == 0) dbg[4] = now_ns();
 }
@@ -620,7 +627,7 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
 
 void run(torch::Tensor q, torch::Tensor sel, torch::Tensor cnt, torch::Tensor kv,
          double s2scale, double vscale, torch::Tensor part_peers, torch::Tensor lse_peers,
-         int64_t box_cap, int64_t hpr, int64_t parity, int64_t rank, int64_t T,
+         int64_t box_cap, int64_t hpr, int64_t parity, int64_t rank, int64_t T, int64_t lse_wide,
          int64_t splits, int64_t heads_per_cta, torch::Tensor err, int64_t spin_ns, int64_t pdl,
          c10::optional<torch::Tensor> dbg) {
   if (T == 0) return;
@@ -647,6 +654,7 @@ void run(torch::Tensor q, torch::Tensor sel, torch::Tensor cnt, torch::Tensor kv
   p.part_peers = reinterpret_cast<const uint64_t*>(part_peers.data_ptr<int64_t>());
   p.lse_peers = reinterpret_cast<const uint64_t*>(lse_peers.data_ptr<int64_t>());
   p.box_cap = (int)box_cap;
+  p.lse_wide = (int)lse_wide;
   p.hpr = (int)hpr;
   p.parity = (int)parity;
   p.rank = (int)rank;
@@ -694,7 +702,7 @@ int64_t smem_bytes(int64_t heads_per_cta) {
 namespace k31dsau {
 void run(torch::Tensor q, torch::Tensor sel, torch::Tensor cnt, torch::Tensor kv, double s2scale,
          double vscale, torch::Tensor part_peers, torch::Tensor lse_peers, int64_t box_cap,
-         int64_t hpr, int64_t parity, int64_t rank, int64_t T, torch::Tensor err, int64_t spin_ns,
+         int64_t hpr, int64_t parity, int64_t rank, int64_t T, int64_t lse_wide, torch::Tensor err, int64_t spin_ns,
          int64_t pdl, c10::optional<torch::Tensor> dbg);
 }  // namespace k31dsau
 

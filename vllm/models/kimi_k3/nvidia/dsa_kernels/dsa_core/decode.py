@@ -20,7 +20,8 @@ by
 Switch: ``VLLM_K31_DSA_CORE`` = 1 (default: per-tensor FP8 KV under DCP wherever
 DcpExchange's top-k is) | 0; ``VLLM_K31_DSA_CORE_ROWS`` = most rows (default 64, the
 DcpBox cap); ``VLLM_K31_DSA_CORE_VARIANT`` = the core variant by rows
-(``batch_table`` syntax, see VARIANT). ``VLLM_K31_DSA_CORE_STATS=1`` logs the kernel's error word
+(``batch_table`` syntax, see VARIANT); ``VLLM_K31_DSA_CORE_SPREAD`` = rows whose
+pushed DcpValue spreads its merge (see SPREAD). ``VLLM_K31_DSA_CORE_STATS=1`` logs the kernel's error word
 at exit.
 """
 
@@ -47,6 +48,11 @@ VARIANT_ENV = ENV + "_VARIANT"
 # 72.2 / 71.2 / 90.0 / 109.2, u 64.7 / 63.2 / 81.8 / 97.8, trtllm chain 64.1 / 59.7 /
 # 82.5 / 87.7 (kernel RESULTS); DCP16 sets the defaults below.
 VARIANT = "1-16:2x16,17-64:u"
+SPREAD_ENV = ENV + "_SPREAD"
+# Rows whose pushed DcpValue spreads every row's merge over its CTAs (Rubin schedule,
+# LSE box [CAP, H, DCP]; spec verify rows only) instead of one merge CTA per (head, 16
+# rows). DCP4: no difference (4 sources); DCP16 sets the default.
+SPREAD = ""
 
 def parse_variant(name: str) -> tuple[int, int]:
     """(splits, heads per CTA; 0 = the tcgen05 core) of a variant name."""
@@ -77,6 +83,8 @@ class DsacDecode:
         self.rows = min(int(os.environ.get(ROWS_ENV, "64")), dcpx.cap)
         spec = os.environ.get(VARIANT_ENV, VARIANT).replace(";", ",")  # (";": shells)
         self.variant = {b: parse_variant(v) for b, v in batch_table(spec).items()}
+        spread = os.environ.get(SPREAD_ENV, SPREAD).replace(";", ",")
+        self.spread = {b for b, v in batch_table(spread).items() if v}
         max_splits = max([1, *(v[0] for v in self.variant.values())])
         self.core = DsaCore(device, cap=self.rows, heads=heads, max_splits=max_splits)
         logger.info(
@@ -101,7 +109,8 @@ class DsacDecode:
             return None
         return self.dcpx.counts_for(prefix, rows)
 
-    def run(self, prepared, batch, sel, counts, cache, box, parity) -> None:
+    def run(self, prepared, batch, sel, counts, cache, box, parity, lse_wide=False):
+        """``lse_wide``: the pushed DcpValue spreads its merge (LSE box [CAP, H, DCP])."""
         from vllm.forward_context import get_forward_context
         from vllm.v1.attention.backends.mla.sparse_utils import flat_kv_row_view
 
@@ -122,6 +131,7 @@ class DsacDecode:
             parity=parity,
             rank=box.rank,
             rows=batch,
+            lse_wide=lse_wide,
             **self.launch(batch),
         )
 

@@ -103,6 +103,7 @@ class DsaCore:
         splits: int = 1,
         heads_per_cta: int = 32,
         umma: bool = False,
+        lse_wide: bool = False,
         pdl: bool = True,
         dbg: torch.Tensor | None = None,
     ) -> None:
@@ -111,7 +112,8 @@ class DsaCore:
         selected flat KV rows and their counts (DcpExchange.topk_merge); ``kv``: the
         flat per-tensor FP8 KV rows [N, 576]; ``bmm1_scale`` = softmax scale x q scale x
         k scale, ``bmm2_scale`` = k scale; ``part_peers`` / ``lse_peers``: DcpBox.peers
-        / lse_peers; ``parity``: the DcpBox parity of this layer."""
+        / lse_peers; ``parity``: the DcpBox parity of this layer; ``lse_wide``: the LSE
+        box in the [2, CAP, H, W] layout of DcpValue's wide / spread merge."""
         if rows > self.cap:
             raise ValueError(f"DsaCore: {rows} rows > cap {self.cap}")
         if splits not in (1, 2, 4, 8) or splits > self.max_splits:
@@ -121,7 +123,8 @@ class DsaCore:
         if umma:  # tcgen05 variant: CTA (latent half, row), every gathered head
             self.ext.run_umma(
                 q_box, sel, cnt, kv, bmm1_scale * LOG2E, bmm2_scale, part_peers,
-                lse_peers, box_cap, hpr, parity, rank, rows, self.err, self.spin_ns,
+                lse_peers, box_cap, hpr, parity, rank, rows, int(lse_wide), self.err,
+                self.spin_ns,
                 1 if pdl else 0, dbg,
             )  # fmt: skip
             return
@@ -139,6 +142,7 @@ class DsaCore:
             parity,
             rank,
             rows,
+            int(lse_wide),
             splits,
             heads_per_cta,
             self.err,

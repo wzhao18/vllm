@@ -643,6 +643,7 @@ class DcpValue:
         q_chunks=36,
         q_heads=0,
         lse_scale=1.0,
+        spread=False,
     ):
         """``q_chunks``: 16 B chunks per q mailbox head row (36 FP8, 72 BF16);
         ``q_heads``: q mailbox rows per token (default DCP * H); ``lse_scale``: to
@@ -704,7 +705,9 @@ class DcpValue:
         self.lean = sms > GB300_SMS
         # spec verify rows (SPREAD_MERGE): one wave of CTAs (one per SM: the merges
         # wait for every CTA's pushes), a power of two per (head, tile) up to 16
-        self.spread = self.lean and q > 1 and (batch in SPREAD_MERGE or batch > 64)
+        # (``spread``: every q > 1 batch, the DSA sparse core's pushed rows)
+        spread = spread or batch in SPREAD_MERGE or batch > 64
+        self.spread = self.lean and q > 1 and spread
         if self.spread:
             pushers = 1 << (min(16, max(1, sms // merge)).bit_length() - 1)
         self.merge_rows = 16 // pushers if self.spread else 16
@@ -869,11 +872,14 @@ class DcpValue:
             D, H, B = self.size, self.heads, self.batch
             armed = tuple(map(Uint32, ARMED if self.valid_box else (Q_SENT,) * 4))
             cute.arch.sync_threads()  # (every thread's polls of the merge first)
-            per: cutlass.Constexpr = D * 36  # 16 B chunks of this head's share of a row
+            # 16 B chunks of this head's share of a row (rows of q_heads x q_chunks: the
+            # DSA mailbox pads its heads; the padding is never written, never re-armed)
+            C: cutlass.Constexpr = self.q_chunks
+            per: cutlass.Constexpr = D * C
             for i in range(tid, rows * per, 512):
                 b = first + i // per
                 if b < B:
-                    c = (b * D * H + head * D) * 36 + i % per
+                    c = (b * self.q_heads + head * D) * C + i % per
                     store_words(mailbox.iterator + c * 16, armed)
 
     @cute.jit
@@ -1555,6 +1561,7 @@ def compile_value(
     dsa_heads=0,
     dsa_bf16=True,
     lse_base_e=True,
+    spread=False,
 ):
     """DcpValue of one batch (``q`` rows per request); ``uv``: the (shape, stride,
     dtype) of W_UV, ``pitch``: the projected rows' (the gate follows the 2112 query /
@@ -1594,7 +1601,10 @@ def compile_value(
         mailbox = fake((cap, dsa_heads, row_bytes), None, torch.uint8)
         scale = math.log2(math.e) if lse_base_e else 1.0
         dsa = dict(q_chunks=row_bytes // 16, q_heads=dsa_heads, lse_scale=scale)
-        sms = min(sms, GB300_SMS)
+        if not (spread and pushed and not dsa_bf16):
+            sms = min(sms, GB300_SMS)
+    # ``spread`` (DSA, FP8 mailbox, rows pushed by the sparse core, q > 1): the Rubin
+    # schedule with every row's merge spread over the CTAs (LSE box [CAP, H, DCP])
     output = fake((batch, heads * 128), (heads * 128, 1))
     args: tuple = (rows, rows_lse, lens, box, lbox, peers, peers, mailbox, w_uv)
     args += (gate, lens, output, Int32(0), Int32(0))
@@ -1613,6 +1623,7 @@ def compile_value(
         lse_uniform,
         pushed,
         lpc=lpc,
+        spread=spread,
         **dsa,
     )
     if value.polled_out:
