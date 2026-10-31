@@ -2294,15 +2294,21 @@ def _publish_round1(
     row_ends: torch.Tensor,
     local_topk: int,
     packed: torch.Tensor | None = None,
+    *,
+    exact: _ExactArgs,
+    rows: _RowsOutput | None = None,
 ) -> torch.Tensor:
     """Round 1 through the mailbox: this rank's local top-N (DeepSelect, or
-    ``packed``) published to every rank; returns the select's ``gathered``."""
+    ``packed``) published to every rank; returns the select's ``gathered``.
+    The select's host checks run first: a call that failed after publishing
+    would leave a round in the mailbox that no select consumed."""
     num_rows = logits.shape[0] if packed is None else packed.shape[0]
     if num_rows > mailbox.max_rows:
         raise ValueError(
             f"DCP top-k merge of {num_rows} rows exceeds its mailbox "
             f"({mailbox.max_rows} rows)"
         )
+    _check_exact(mailbox.gathered[:, :num_rows], exact.topk, local_topk, rows, exact)
     if packed is None:
         from vllm.model_executor.layers.indexer_topk import deep_select_topk
 
@@ -2366,7 +2372,7 @@ def dcp_topk_merge(
     if mailbox is not None:
         exact = _exact_args_for(topk, local_topk, logits, row_ends)
         dcp_topk_select(
-            _publish_round1(mailbox, logits, row_ends, local_topk),
+            _publish_round1(mailbox, logits, row_ends, local_topk, exact=exact),
             local_topk,
             topk_indices,
             exact=exact,
@@ -2467,7 +2473,9 @@ def dcp_topk_merge_rows(
     )
     if mailbox is not None:
         dcp_topk_select(
-            _publish_round1(mailbox, logits, row_ends, local_topk, packed),
+            _publish_round1(
+                mailbox, logits, row_ends, local_topk, packed, exact=exact, rows=rows
+            ),
             local_topk,
             ids_out,
             topk=topk,
