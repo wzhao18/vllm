@@ -23,7 +23,7 @@ import torch
 
 _EXT = None
 LOG2E = math.log2(math.e)
-_ERR = {1: "q mailbox poll timeout"}
+_ERR = {1: "q mailbox poll timeout", 2: "QK MMA wait timeout", 3: "PV MMA wait timeout"}
 GROUP_HEADS = 32
 # Test only (fault-sensitivity of whole-step checks): K31_DSAC_FAULT=1 runs the core
 # with a quarter of its softmax scale.
@@ -36,17 +36,18 @@ def load_ext():
         return _EXT
     from torch.utils.cpp_extension import load
 
-    src = Path(__file__).parent / "csrc" / "dsa_core.cu"
+    csrc = Path(__file__).parent / "csrc"
+    srcs = [csrc / "dsa_core.cu", csrc / "dsa_core_umma.cu"]
     major, minor = torch.cuda.get_device_capability()
     arch = f"{major}{minor}" + ("a" if major >= 9 else "")
-    digest = hashlib.sha1(src.read_bytes()).hexdigest()[:10]
+    digest = hashlib.sha1(b"".join(s.read_bytes() for s in srcs)).hexdigest()[:10]
     build = os.environ.get("K31_DSAC_BUILD_DIR")
     if build:
         build = str(Path(build) / digest)
         Path(build).mkdir(parents=True, exist_ok=True)
     _EXT = load(
         name=f"k31_dsa_core_sm{arch}_{digest}",
-        sources=[str(src)],
+        sources=[str(s) for s in srcs],
         extra_cuda_cflags=[
             "-O3",
             f"-gencode=arch=compute_{arch},code=sm_{arch}",
@@ -101,6 +102,7 @@ class DsaCore:
         rows: int,
         splits: int = 1,
         heads_per_cta: int = 32,
+        umma: bool = False,
         pdl: bool = True,
         dbg: torch.Tensor | None = None,
     ) -> None:
@@ -116,6 +118,13 @@ class DsaCore:
             raise ValueError(f"DsaCore: splits {splits} not 1, 2, 4 or 8 (<= max)")
         if FAULT:  # test only: a wrong softmax scale (whole-step checks must see it)
             bmm1_scale *= 0.25
+        if umma:  # tcgen05 variant: CTA (latent half, row), every gathered head
+            self.ext.run_umma(
+                q_box, sel, cnt, kv, bmm1_scale * LOG2E, bmm2_scale, part_peers,
+                lse_peers, box_cap, hpr, parity, rank, rows, self.err, self.spin_ns,
+                1 if pdl else 0, dbg,
+            )  # fmt: skip
+            return
         self.ext.run(
             q_box,
             sel,

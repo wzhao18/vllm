@@ -19,9 +19,8 @@ by
 
 Switch: ``VLLM_K31_DSA_CORE`` = 1 (default: per-tensor FP8 KV under DCP wherever
 DcpExchange's top-k is) | 0; ``VLLM_K31_DSA_CORE_ROWS`` = most rows (default 64, the
-DcpBox cap); ``VLLM_K31_DSA_CORE_SPLITS`` = KV splits per (row, 32 heads) by rows
-(``batch_table`` syntax); ``VLLM_K31_DSA_CORE_HEADS`` = query heads per CTA (16 or
-32) by rows. ``VLLM_K31_DSA_CORE_STATS=1`` logs the kernel's error word
+DcpBox cap); ``VLLM_K31_DSA_CORE_VARIANT`` = the core variant by rows
+(``batch_table`` syntax, see VARIANT). ``VLLM_K31_DSA_CORE_STATS=1`` logs the kernel's error word
 at exit.
 """
 
@@ -38,13 +37,25 @@ logger = init_logger(__name__)
 
 ENV = "VLLM_K31_DSA_CORE"
 ROWS_ENV = ENV + "_ROWS"
-SPLITS_ENV = ENV + "_SPLITS"
 # KV splits per (row, 32 heads) by rows: spread a small batch's local chunks over
 # more CTAs (the last one LSE-merges them). DCP16 layer bench (kernel RESULTS).
-SPLITS = "1-64:1"
-HEADS_ENV = ENV + "_HEADS"
-# Query heads per CTA (16 or 32) by rows: 16 doubles the CTAs of a small batch.
-HEADS = "1-16:16,17-64:32"
+VARIANT_ENV = ENV + "_VARIANT"
+# Core variant by rows: "u" = the tcgen05 core (CTA per (row, latent half), all 96
+# gathered heads as M = 128), "<S>x<HG>" = the mma.sync core with S KV splits (one
+# cluster) per (row, HG = 16 / 32 gathered heads). DCP4 layer bench (B1 q8 / B1 q4 /
+# B8 q4 / B8 q8, us incl. logits + top-k): 2x16 55.9 / 55.0 / 89.7 / 132.9, 1x32
+# 72.2 / 71.2 / 90.0 / 109.2, u 64.7 / 63.2 / 81.8 / 97.8, trtllm chain 64.1 / 59.7 /
+# 82.5 / 87.7 (kernel RESULTS); DCP16 sets the defaults below.
+VARIANT = "1-16:2x16,17-64:u"
+
+def parse_variant(name: str) -> tuple[int, int]:
+    """(splits, heads per CTA; 0 = the tcgen05 core) of a variant name."""
+    if name == "u":
+        return 1, 0
+    splits, _, heads = name.partition("x")
+    if int(splits) not in (1, 2, 4, 8) or int(heads) not in (16, 32):
+        raise ValueError(f"{VARIANT_ENV}: bad variant {name!r}")
+    return int(splits), int(heads)
 
 
 def wanted(dcpx) -> bool:
@@ -64,14 +75,14 @@ class DsacDecode:
 
         self.dcpx = dcpx
         self.rows = min(int(os.environ.get(ROWS_ENV, "64")), dcpx.cap)
-        self.splits = batch_table(os.environ.get(SPLITS_ENV, SPLITS))
-        self.heads = batch_table(os.environ.get(HEADS_ENV, HEADS))
-        max_splits = max([1, *self.splits.values()])
+        spec = os.environ.get(VARIANT_ENV, VARIANT)
+        self.variant = {b: parse_variant(v) for b, v in batch_table(spec).items()}
+        max_splits = max([1, *(v[0] for v in self.variant.values())])
         self.core = DsaCore(device, cap=self.rows, heads=heads, max_splits=max_splits)
         logger.info(
-            "Kimi K3.1 DSA decode: sparse core on (rows <= %d, splits %s)",
+            "Kimi K3.1 DSA decode: sparse core on (rows <= %d, variants %s)",
             self.rows,
-            os.environ.get(SPLITS_ENV, SPLITS),
+            spec,
         )
         if os.environ.get(ENV + "_STATS") == "1":
             atexit.register(self._report)
@@ -111,9 +122,12 @@ class DsacDecode:
             parity=parity,
             rank=box.rank,
             rows=batch,
-            splits=self.splits.get(batch, 1),
-            heads_per_cta=self.heads.get(batch, 32),
+            **self.launch(batch),
         )
+
+    def launch(self, batch: int) -> dict:
+        splits, heads = self.variant.get(batch, (1, 32))
+        return dict(splits=splits, heads_per_cta=heads or 32, umma=heads == 0)
 
 
 def build(model, dcpx) -> DsacDecode | None:

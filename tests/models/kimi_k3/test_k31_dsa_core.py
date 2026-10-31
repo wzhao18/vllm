@@ -56,8 +56,10 @@ def _reference(q8, kv8, sel, counts, q_scale, k_scale, sm_scale):
     return torch.stack(out), torch.stack(lse)
 
 
-@pytest.mark.parametrize("splits", [1, 2, 4, 8])
-@pytest.mark.parametrize("heads_per_cta", [16, 32])
+@pytest.mark.parametrize(
+    "splits,heads_per_cta",
+    [(s, h) for h in (16, 32) for s in (1, 2, 4, 8)] + [(1, 0)],  # 0: tcgen05 variant
+)
 def test_dsa_core_push(splits, heads_per_cta):
     from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core.ops import DsaCore
 
@@ -78,7 +80,7 @@ def test_dsa_core_push(splits, heads_per_cta):
         core.run(box, sel, cnt, kv8.view(torch.uint8), bmm1_scale=sm_scale * q_scale * k_scale,
                  bmm2_scale=k_scale, part_peers=peers, lse_peers=lpeers, box_cap=cap,
                  hpr=H, parity=parity, rank=0, rows=rows, splits=splits,
-                 heads_per_cta=heads_per_cta)
+                 heads_per_cta=heads_per_cta or 32, umma=heads_per_cta == 0)
         torch.cuda.synchronize()
         core.check()
         o = part[parity, 0, :rows].float()
@@ -92,7 +94,8 @@ def test_dsa_core_push(splits, heads_per_cta):
                 assert bool((o[r] == 0).all()) and bool((lv[r] == EMPTY).all())
                 continue
             err = (o[r] - ref_o[r]).abs().max() / ref_o[r].abs().max()
-            assert err < 1.5e-2, (r, n, float(err))
+            # (tcgen05: P in E4M3, as the stock FP8 MLA decode)
+            assert err < (4e-2 if heads_per_cta == 0 else 1.5e-2), (r, n, float(err))
             assert torch.allclose(lv[r], ref_l[r], rtol=1e-3, atol=2e-3), (r, n)
         # the other parity is never written
         other = part[1 - parity].view(torch.int32)

@@ -691,7 +691,15 @@ int64_t smem_bytes(int64_t heads_per_cta) {
 
 }  // namespace k31dsac
 
+namespace k31dsau {
+void run(torch::Tensor q, torch::Tensor sel, torch::Tensor cnt, torch::Tensor kv, double s2scale,
+         double vscale, torch::Tensor part_peers, torch::Tensor lse_peers, int64_t box_cap,
+         int64_t hpr, int64_t parity, int64_t rank, int64_t T, torch::Tensor err, int64_t spin_ns,
+         int64_t pdl, c10::optional<torch::Tensor> dbg);
+}  // namespace k31dsau
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("run", &k31dsac::run);
+  m.def("run_umma", &k31dsau::run);
   m.def("smem_bytes", &k31dsac::smem_bytes);
 }
