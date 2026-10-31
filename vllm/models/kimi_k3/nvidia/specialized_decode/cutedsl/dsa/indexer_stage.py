@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Indexer stage of a K3.1 DSA layer: the stock decode scoring and top-k
 (sparse_attn_indexer, its key insert skipped: DsaIndex inserted the key) of the FP8
-indexer query and head weights into the model's shared top-k buffer. Under DCP the
-op merges the ranks' local top-k into global token ids.
+or MXFP4 (index.py) indexer query and head weights into the model's shared top-k
+buffer. Under DCP the op merges the ranks' local top-k into global token ids.
 
 Under DCP on the FlashInfer core, when the layer's indexer has the one-round DCP
 top-k merge (``dcp_local_topk``, Inferact/mum#63), ``merge_rows`` replaces the op
@@ -24,7 +24,7 @@ import torch
 
 from vllm.utils.torch_utils import _encode_layer_name
 
-from .index import DIM
+from .index import DIM, fp4_query_views, is_fp4_cache
 
 
 class IndexerStage:
@@ -39,6 +39,8 @@ class IndexerStage:
         self.max_model_len = indexer.max_model_len
         self.max_total = indexer.max_total_seq_len
         self.topk = indexer.topk_tokens
+        # MXFP4 keys and query (indexer_kv_dtype="mxfp4", kimi_k3_indexer_uses_fp4).
+        self.fp4 = indexer.use_fp4_cache
         # --- DCP top-k merge (#63): its caller-owned outputs -------------------
         # N, this rank's candidate count; 0 runs the op and the local-slot filter.
         self.local_topk = indexer.dcp_local_topk if rows else 0
@@ -62,15 +64,27 @@ class IndexerStage:
         self.fused = None
         # -----------------------------------------------------------------------
 
+    def query(self, q_fp8, rows):
+        """The stock op's (query, its scales or None) of the first ``rows`` rows:
+        FP8 [rows, 32, 128] (scales folded into the head weights), or MXFP4 E2M1
+        [rows, 32, 64] and UE8M0 x4 [rows, 32] (contiguous copies of the views in
+        the query rows, index.py)."""
+        if not self.fp4:
+            return q_fp8[:rows].view(torch.float8_e4m3fn), None
+        packed, scales = fp4_query_views(q_fp8, rows)
+        return packed.contiguous(), scales.contiguous()
+
     def run(self, projected, q_fp8, head_w):
         """Top-k of the current rows into the shared buffer (stock decode scoring)."""
         indexer, batch = self.indexer, projected.shape[0]
+        assert is_fp4_cache(indexer.k_cache.kv_cache) == self.fp4
+        query, q_scale = self.query(q_fp8, batch)
         return torch.ops.vllm.sparse_attn_indexer(
             projected,
             self.k_cache_name,
             indexer.k_cache.kv_cache,
-            q_fp8[:batch].view(torch.float8_e4m3fn),
-            None,
+            query,
+            q_scale,
             None,
             head_w[:batch],
             DIM,
@@ -84,7 +98,7 @@ class IndexerStage:
             False,
             False,
             _encode_layer_name(""),
-            False,
+            self.fp4,
             indexer.dcp_rank,
             indexer.dcp_world_size,
             indexer.cp_kv_cache_interleave_size,
@@ -221,7 +235,7 @@ class IndexerStage:
 
     def decode_logits(self, q_fp8, head_w, decode, rows):
         """The bf16 paged MQA logits of the first ``rows`` rows, as the stock op's
-        decode branch computes them (uniform rows, FP8 cache and query)."""
+        decode branch computes them (uniform rows; FP8 or MXFP4 cache and query)."""
         from vllm.model_executor.layers.sparse_attn_indexer import (
             kv_cache_as_quant_view,
         )
@@ -231,12 +245,14 @@ class IndexerStage:
         )
 
         reqs = decode.decode_lens.shape[0]
-        query = q_fp8[:rows].view(torch.float8_e4m3fn)
+        query, q_scale = self.query(q_fp8, rows)
         query = query.view(reqs, rows // reqs, *query.shape[1:])
-        q_scale, weights = mqa_logits_mx_inputs(query, None, head_w[:rows])
+        if q_scale is not None:
+            q_scale = q_scale.view(reqs, rows // reqs, -1)
+        q_scale, weights = mqa_logits_mx_inputs(query, q_scale, head_w[:rows])
         return fp8_fp4_paged_mqa_logits(
             (query, q_scale),
-            kv_cache_as_quant_view(self.indexer.k_cache.kv_cache, DIM, False),
+            kv_cache_as_quant_view(self.indexer.k_cache.kv_cache, DIM, self.fp4),
             weights,
             decode.seq_lens[:reqs],
             decode.block_table,
