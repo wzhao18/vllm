@@ -563,6 +563,57 @@ def test_compressed_slot_mapping_dcp_uses_rank_local_state_positions():
         assert compressed.tolist() == expected.tolist()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("compress_ratio", [1, 4])
+@pytest.mark.parametrize(("dcp", "interleave"), [(1, 1), (16, 1024)])
+@pytest.mark.parametrize("use_out", [False, True])
+def test_compressed_slot_mapping_pads_as_a_fill_did(
+    compress_ratio, dcp, interleave, use_out
+):
+    """The kernel's PAD programs leave the output, over its whole length, as
+    a -1 fill followed by the request programs left it: graph padding (empty
+    requests and tokens past the last one) and PAD own slots included."""
+    from vllm.v1.attention.backends.mla import compressor_utils
+
+    device = torch.device("cuda")
+    gen = torch.Generator().manual_seed(compress_ratio + dcp)
+    query_lens = [8, 3, 0, 8, 1500, 1, 0]
+    qsl = torch.zeros(len(query_lens) + 1, dtype=torch.int32)
+    qsl[1:] = torch.tensor(query_lens).cumsum(0)
+    num_tokens = int(qsl[-1]) + 5
+    seq_lens = torch.tensor([8, 70000, 0, 9, 1500, 70400, 0], dtype=torch.int32)
+    block_table = torch.randint(
+        0, 1 << 20, (len(query_lens), 1100), generator=gen, dtype=torch.int32
+    ).to(device)
+    slot_mapping = torch.randint(0, 1 << 30, (num_tokens,), generator=gen)
+    slot_mapping[::7] = -1
+    args = (
+        slot_mapping.to(device),
+        qsl.to(device),
+        seq_lens.to(device),
+        block_table,
+        64,
+        compress_ratio,
+    )
+    junk = torch.randint(-(1 << 40), 1 << 40, (num_tokens + 2100,), generator=gen)
+    out = junk.to(device) if use_out else None
+
+    got = get_compressed_slot_mapping(
+        num_tokens,
+        *args,
+        out=out,
+        dcp_world_size=dcp,
+        cp_interleave=interleave,
+    )
+
+    want = torch.full_like(junk if use_out else slot_mapping, -1).to(device)
+    compressor_utils._COMPRESSED_SLOT_MAPPING_KERNEL(want, *args, dcp, interleave, 0)
+    assert torch.equal(got, want[:num_tokens])
+    if use_out:
+        assert got.data_ptr() == out.data_ptr()
+        assert torch.equal(out, want)
+
+
 def test_index_conversion_warmup_uses_physical_block_stride():
     config = SimpleNamespace(
         attention_config=SimpleNamespace(hisparse_config=None),
