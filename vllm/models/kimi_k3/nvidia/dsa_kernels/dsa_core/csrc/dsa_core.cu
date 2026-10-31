@@ -347,6 +347,9 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
     __syncthreads();
     if (dbg && tid == 0 && c < 2) dbg[10 + 4 * c] = clock64();
     const uint8_t* buf = sKV + (c & 1) * kChunk * kRowS;
+    // keys of this chunk below the count (a partial last chunk skips its empty key
+    // tiles in QK, the V cast and PV; the softmax masks them)
+    const int valid = min(kChunk, n - (c * Se + sp) * kChunk);
     // ---- S = Q K^T (FP8, FP32 accumulation, 3 chains; fragments loaded 2 steps ahead);
     // HG = 32: warp (m-tile w >> 3, n-tile w & 7); HG = 16: (n-tile w & 7, k-half w >> 3)
     {
@@ -354,6 +357,7 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
       const int mt = HG == 32 ? (warp >> 3) : 0;
       const int kh = HG == 32 ? 0 : (warp >> 3);
       constexpr int KS = HG == 32 ? kRowB / 32 : kRowB / 64;  // m16n8k32 steps
+      if (8 * nt < valid) {
       float sacc[3][4] = {};
       const uint8_t* qa = sQ + (mt * 16 + (lane & 15)) * kRowS + (lane >> 4) * 16 + kh * KS * 32;
       const uint8_t* kb =
@@ -379,6 +383,7 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
         const int r = 8 * nt + 2 * q4 + (i & 1);
         sS[(g8 + 8 * (i >> 1)) * kSStr + r] = (sacc[0][i] + sacc[1][i]) + sacc[2][i];
       }
+      }  // (8 nt < valid)
     }
     if (p.dbg) {  // (timing diagnostics only: QK apart from the V cast)
       __syncthreads();
@@ -387,15 +392,17 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
     // ---- V -> FP16 (exact) for the PV fragments: 64 rows x 512 dims, 16 B per item
     {
       constexpr int kItems = kChunk * 32 / kThreads;  // 4
+      const int vrows = (valid + 15) & ~15;  // (PV's 16-key steps)
       uint4 w[kItems];
 #pragma unroll
       for (int j = 0; j < kItems; ++j) {
         const int i = tid + j * kThreads, r = i >> 5, c16 = i & 31;
-        w[j] = *reinterpret_cast<const uint4*>(buf + r * kRowS + 16 * c16);
+        if (r < vrows) w[j] = *reinterpret_cast<const uint4*>(buf + r * kRowS + 16 * c16);
       }
 #pragma unroll
       for (int j = 0; j < kItems; ++j) {
         const int i = tid + j * kThreads, r = i >> 5, c16 = i & 31;
+        if (r >= vrows) continue;
         const uint32_t ws[4] = {w[j].x, w[j].y, w[j].z, w[j].w};
         uint32_t h[8];
 #pragma unroll
@@ -465,6 +472,7 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
                          (lane >> 4) * 8;
 #pragma unroll
       for (int ks = 0; ks < kChunk / 16; ++ks) {
+        if (16 * ks >= valid) break;  // (empty key steps of a partial chunk)
         uint32_t b[8];
         ldsm_x4_t(b[0], b[1], b[2], b[3], vb + 16 * ks * kVStr);
         ldsm_x4_t(b[4], b[5], b[6], b[7], vb + 16 * ks * kVStr + 16);
