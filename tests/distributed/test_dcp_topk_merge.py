@@ -555,6 +555,142 @@ def _check_late_publisher(group, n: int) -> None:
         assert start.elapsed_time(stop) > 20, "the select did not wait"
 
 
+def _check_graph_stress(group, ws, n: int, replays: int) -> None:
+    """The mailbox under CUDA-graph replay: graphs of 24 merges at 64 and 8
+    rows and of 3 merges at 5 rows, replayed in a seeded order shared by all
+    ranks over clean and saturated (1 rank on every third row, the bound on
+    every row) inputs. Before each replay the ids, saturation words and the
+    rescue's round-1 rows are poisoned and a random rank starts up to ~2 ms
+    late; every 10th replay is followed by an eager merge of 7 rows. Every
+    merge is bit-identical to the all-gather's (cached, and rerun eagerly
+    every 25th replay); afterwards every rank counted the same merges per
+    row and every mailbox slot is empty again."""
+    import random
+
+    from vllm.v1.attention.ops.dcp_topk_merge.kernels import (
+        dcp_topk_merge,
+        set_dcp_topk_merge_exchange,
+    )
+
+    world, rank = group.world_size, group.rank_in_group
+    mailbox = ws.mailbox
+    layers, max_rows = 24, 64
+    gen = torch.Generator(device="cuda").manual_seed(83)
+    glen = torch.randint(9_000, 178_001, (max_rows,), generator=gen, device="cuda")
+    # Local ids past 2**16 (the bit plane), a short, an empty and a 1-token row.
+    glen[0], glen[2], glen[3], glen[4] = world * 70_000, 2_049, 0, 1
+    local_end = ((glen - rank + world - 1) // world).clamp_min(0).int()
+    width = -(-(world * 70_000) // world // _ROW_ALIGN) * _ROW_ALIGN
+    gen.manual_seed(89 + rank)
+    clean = [
+        torch.randn((layers, max_rows, width), generator=gen, device="cuda").to(
+            torch.bfloat16
+        )
+        for _ in range(2)
+    ]
+    patterns = {
+        None: ([], None),
+        "third": ([world - 1], slice(0, None, 3)),
+        "bound": (list(range((TOPK - 1) // n)), slice(None)),
+    }
+    variants = [(s, p) for s in range(2) for p in patterns]
+    static = torch.empty_like(clean[0])
+
+    def fill(v: int) -> None:
+        s, pattern = variants[v]
+        static.copy_(clean[s])
+        ranks, rows = patterns[pattern]
+        if rank in ranks:
+            static[:, rows] = (static[:, rows].float() + 8.0).to(torch.bfloat16)
+
+    ids = torch.empty((layers, max_rows, TOPK), dtype=torch.int32, device="cuda")
+    sats = torch.empty((layers, max_rows), dtype=torch.int32, device="cuda")
+    ids7 = torch.empty((7, TOPK), dtype=torch.int32, device="cuda")
+    shapes = [(layers, 64), (layers, 8), (3, 5)]
+
+    def run(g: int) -> None:
+        count, t = shapes[g]
+        for j in range(count):
+            dcp_topk_merge(static[j, :t], local_end[:t], ids[j, :t], n)
+            sats[j, :t].copy_(ws.sat_word[:t])
+
+    def merge7() -> None:
+        dcp_topk_merge(static[0, :7], local_end[:7], ids7, n)
+
+    refs: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+    refs7: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    set_dcp_topk_merge_exchange("all_gather")
+    try:
+        for v in range(len(variants)):
+            fill(v)
+            for g, (count, t) in enumerate(shapes):
+                run(g)
+                refs[g, v] = ids[:count, :t].clone(), sats[:count, :t].clone()
+            merge7()
+            refs7[v] = ids7.clone(), ws.sat_word[:7].clone()
+    finally:
+        set_dcp_topk_merge_exchange("auto")
+    torch.accelerator.synchronize()
+    assert any(bool((refs[0, v][1] >> 16).any()) for v in range(len(variants)))
+
+    graphs = []
+    for g in range(len(shapes)):
+        fill(0)
+        run(g)
+        torch.accelerator.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with group.graph_capture() as ctx, torch.cuda.graph(graph, stream=ctx.stream):
+            run(g)
+        graphs.append(graph)
+    torch.accelerator.synchronize()
+
+    # bad[i]: mismatching ids, saturation words and eager 7-row outputs of
+    # replay i (counted on the device, so ranks may drift between replays).
+    bad = torch.zeros((replays, 3), dtype=torch.int32, device="cuda")
+    schedule = random.Random(97)
+    for i in range(replays):
+        g = schedule.randrange(len(shapes))
+        pattern = schedule.randrange(1, 3) if schedule.random() < 1 / 3 else 0
+        v = len(patterns) * schedule.randrange(2) + pattern
+        late, cycles = schedule.randrange(world), schedule.randrange(4_000_000)
+        count, t = shapes[g]
+        fill(v)
+        ids.fill_(-7)
+        sats.fill_(-7)
+        ws.sat_word.fill_(0x5A5A5A5A)
+        mailbox.gathered.fill_(0x5A5A5A5A)
+        if rank == late:
+            torch.cuda._sleep(cycles)
+        graphs[g].replay()
+        want_ids, want_sats = refs[g, v]
+        bad[i, 0] = (ids[:count, :t] != want_ids).sum()
+        bad[i, 1] = (sats[:count, :t] != want_sats).sum()
+        if i % 10 == 9:
+            ids7.fill_(-7)
+            merge7()
+            want7, want7_sat = refs7[v]
+            bad[i, 2] = (ids7 != want7).sum() + (ws.sat_word[:7] != want7_sat).sum()
+        if i % 25 == 24:
+            got_ids, got_sats = ids[:count, :t].clone(), sats[:count, :t].clone()
+            set_dcp_topk_merge_exchange("all_gather")
+            try:
+                run(g)
+            finally:
+                set_dcp_topk_merge_exchange("auto")
+            assert torch.equal(ids[:count, :t], got_ids), f"replay {i}: ids"
+            assert torch.equal(sats[:count, :t], got_sats), f"replay {i}: sat"
+
+    torch.accelerator.synchronize()
+    torch.distributed.barrier(group=group.cpu_group)
+    failed = group.all_reduce(bad.clone())
+    first = int(failed.any(1).int().argmax())
+    assert not bool(failed.any()), f"replay {first}: {failed[first].tolist()}"
+    every = group.all_gather(mailbox.ordinals.unsqueeze(0), dim=0)
+    for r in range(world):
+        assert torch.equal(every[r], every[0]), f"ordinals of rank {r} differ"
+    assert bool((mailbox.box == -1).all()), "a mailbox slot is not empty"
+
+
 def _check_hook(group, n: int) -> None:
     """VLLM_DSA_BPRIME_CHECK over a real DCP group: the stock indexer's
     reference merge next to the one-round merge, eager and inside a CUDA
@@ -649,11 +785,13 @@ def run_worker(
     init_method: str,
     check_hook: bool = False,
     mailbox: bool = False,
+    stress_replays: int = 300,
 ) -> None:
     """One DCP rank. Also callable from a multi-node launcher. ``check_hook``
     runs the VLLM_DSA_BPRIME_CHECK case instead of the merge's own;
     ``mailbox`` takes round 1 through the multicast mailbox
-    (VLLM_DSA_BPRIME_MAILBOX) and adds its checks."""
+    (VLLM_DSA_BPRIME_MAILBOX) and adds its checks, including
+    ``stress_replays`` graph replays."""
     import os
     from types import SimpleNamespace
 
@@ -718,6 +856,7 @@ def run_worker(
             if mailbox:
                 _check_exchange_ab(group, ws, n)
                 _check_late_publisher(group, n)
+                _check_graph_stress(group, ws, n, stress_replays)
             _check_cases(group, ws, n)
             _check_deterministic(group, ws, n)
             _check_nonfinite(group, n)
