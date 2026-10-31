@@ -57,7 +57,7 @@ constexpr int kIdx = kP + (kM / 8) * 4 * 128;      // [kMaxK] slots
 constexpr int kRed = kIdx + kMaxK * 4;             // [2][128] f32 row max / sum halves
 constexpr int kBar = kRed + 2 * kM * 4;            // mbarriers (MMA done) + TMEM address
 constexpr int kSmem = kBar + 32;
-constexpr int kOStr = 264;  // bf16 O staging stride (halves)
+constexpr int kOStr = 264;  // bf16 O staging stride (halves; 16 B aligned rows)
 static_assert(kM * kOStr * 2 <= 2 * (kChunk / 8) * kGrp, "O staging over the KV buffers");
 // QK in the 2x FP8 mode (K = 64 per instruction; idesc bit 29, 1-CTA M = 128)
 #ifndef K31_DSAU_QK1X
@@ -277,31 +277,37 @@ __global__ void __launch_bounds__(kThreads, 1) dsau_kernel(const __grid_constant
     mbar_init(barO, 1);
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   }
-  // ---- query tile [128, 576] FP8 (rows >= heads zero) from the q mailbox (polled)
+  // ---- query tile [128, 576] FP8 (rows >= heads zero) from the q mailbox: one async
+  // copy of the whole tile (L2), then each thread re-polls (sys scope) the chunks it
+  // copied that still hold an armed word
   {
     const uint8_t* qrow = p.q + (int64_t)t * p.q_row_stride;
     const int nq = p.heads * kKc;
-    for (int i0 = tid; i0 < kM * kKc; i0 += 8 * kThreads) {
-      uint4 v[8];
-#pragma unroll
-      for (int j = 0; j < 8; ++j) {
-        const int i = i0 + j * kThreads;
-        v[j] = i < nq ? ld_sys_v4(qrow + 16 * i) : make_uint4(0, 0, 0, 0);
+    const uint32_t q0 = smem_u32(sQ);
+    // (j walks the tile in shared-memory order: 8 lanes per 128 B core matrix, so the
+    // 16 B shared writes are conflict-free; chunk (row, c) of row-major global Q)
+    for (int j = tid; j < kM * kKc; j += kThreads) {
+      const int r = 8 * (j / (8 * kKc)) + j % 8, c = (j % (8 * kKc)) / 8;
+      if (r < p.heads) {
+        cp_async16(q0 + 16 * j, qrow + r * kRowB + 16 * c);
+      } else {
+        *reinterpret_cast<uint4*>(sQ + 16 * j) = make_uint4(0, 0, 0, 0);
       }
-#pragma unroll
-      for (int j = 0; j < 8; ++j) {
-        const int i = i0 + j * kThreads;
-        if (i < kM * kKc) {
-          if (i < nq && armed(v[j])) {
-            const long long ts = now_ns();
-            do {
-              __nanosleep(32);
-              if (now_ns() - ts > p.spin_ns) fail(p.err, 1);
-              v[j] = ld_sys_v4(qrow + 16 * i);
-            } while (armed(v[j]));
-          }
-          *reinterpret_cast<uint4*>(sQ + cm_off(i / kKc, i % kKc, kKc)) = v[j];
-        }
+    }
+    cp_commit();
+    cp_wait<0>();
+    for (int j = tid; j < nq; j += kThreads) {
+      const int r = 8 * (j / (8 * kKc)) + j % 8, c = (j % (8 * kKc)) / 8;
+      uint4* dst = reinterpret_cast<uint4*>(sQ + 16 * j);
+      uint4 v = *dst;
+      if (armed(v)) {
+        const long long ts = now_ns();
+        do {
+          __nanosleep(32);
+          if (now_ns() - ts > p.spin_ns) fail(p.err, 1);
+          v = ld_sys_v4(qrow + r * kRowB + 16 * c);
+        } while (armed(v));
+        *dst = v;
       }
     }
   }
@@ -338,14 +344,13 @@ __global__ void __launch_bounds__(kThreads, 1) dsau_kernel(const __grid_constant
   auto issue = [&](int c) {  // chunk c -> KV buffer c & 1, K-major core matrices
     uint8_t* buf = sKV + (c & 1) * (kChunk / 8) * kGrp;
     const uint32_t b0 = smem_u32(buf);
-    for (int i = tid; i < kChunk * kKc; i += kThreads) {
-      const int r = i / kKc, pc = i % kKc;
+    for (int j = tid; j < kChunk * kKc; j += kThreads) {  // (shared-memory order)
+      const int r = 8 * (j / (8 * kKc)) + j % 8, pc = (j % (8 * kKc)) / 8;
       const int slot = sIdx[c * kChunk + r];
-      const int off = cm_off(r, pc, kKc);
       if (slot >= 0) {
-        cp_async16(b0 + off, p.kv + (int64_t)slot * kRowB + 16 * pc);
+        cp_async16(b0 + 16 * j, p.kv + (int64_t)slot * kRowB + 16 * pc);
       } else {
-        *reinterpret_cast<uint4*>(buf + off) = make_uint4(0, 0, 0, 0);
+        *reinterpret_cast<uint4*>(buf + 16 * j) = make_uint4(0, 0, 0, 0);
       }
     }
     cp_commit();
@@ -496,17 +501,21 @@ __global__ void __launch_bounds__(kThreads, 1) dsau_kernel(const __grid_constant
       st_u32(reinterpret_cast<uint32_t*>(p.lse_peers[gh / H]) + slot, __float_as_uint(lse));
     }
   }
+  fence_async_smem();  // (the staged rows, for the bulk copies)
   tc_fence_before();
   __syncthreads();
-  {
+  // one bulk copy (512 B: this half's 256 latent dims) per head row to its owner
+  if (warp == 5) {
     const int H = p.hpr;
-    for (int i = tid; i < p.heads * (kHalf / 8); i += kThreads) {
-      const int gh = i / (kHalf / 8), c8 = i % (kHalf / 8);
+    for (int gh = lane; gh < p.heads; gh += 32) {
       const int64_t slot = (((int64_t)p.parity * p.W + p.rank) * p.box_cap + t) * H + gh % H;
-      uint32_t* dst = reinterpret_cast<uint32_t*>(p.part_peers[gh / H]) + slot * 256 +
-                      half * (kHalf / 2) + 4 * c8;
-      st_v4(dst, *reinterpret_cast<const uint4*>(sO + gh * kOStr + 8 * c8));
+      uint32_t* dst = reinterpret_cast<uint32_t*>(p.part_peers[gh / H]) + slot * 256 + half * (kHalf / 2);
+      asm volatile("cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;" ::"l"(dst),
+                   "r"(smem_u32(sO + gh * kOStr)), "n"(kHalf * 2)
+                   : "memory");
     }
+    asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+    asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");  // (complete before exit)
   }
   if (warp == 4) {
     tc_fence_after();
