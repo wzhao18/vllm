@@ -59,7 +59,9 @@ _NO_KEY = 1 << 16
 
 def _bf16_keys(bits: torch.Tensor) -> torch.Tensor:
     """bf16 bit patterns (int32 in [0, 0xFFFF]) as order-preserving keys, as
-    the merge's packed words hold them."""
+    the merge's packed words hold them, except that -0.0 keys as +0.0: the
+    top-k producers order the two as equal, so they tie."""
+    bits = torch.where(bits == 0x8000, 0, bits)
     return torch.where(bits >= 0x8000, ~bits & 0xFFFF, bits | 0x8000)
 
 

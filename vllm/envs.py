@@ -2638,6 +2638,9 @@ def compile_factors() -> dict[str, object]:
         "VLLM_SKIP_VERSION_SUFFIX",
         "FORCE_COLOR",
         "VLLM_REQUEST_BODY_LOG_LEVEL",
+        # Read when the DSA indexer's (splitting) op sets up its merges.
+        "VLLM_DSA_BPRIME_CHECK",
+        "VLLM_DSA_DCP_PREFILL_HIST_MERGE",
     }
 
     from vllm.config.utils import normalize_value

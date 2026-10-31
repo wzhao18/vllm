@@ -1679,6 +1679,46 @@ def test_dcp_topk_merge_check_classifies_rows():
         assert got["missing"].tolist()[:4] == [0, 1, 1, 1]
 
 
+def test_dcp_topk_merge_check_ties_signed_zeros():
+    """bf16 -0.0 and +0.0 tie at tau: DeepSelect orders them as equal, so a
+    merge that keeps -0.0 tokens where the reference keeps +0.0 ones differs
+    only at ties (row 0), while losing a token above tau is still a miss
+    (row 1)."""
+    from vllm.v1.attention.ops.dcp_topk_merge.check import compare_dcp_topk_merge
+
+    world, width = 2, 32
+    scores = torch.full((2, world * width), -0.0, dtype=torch.bfloat16)
+    scores[:, :4] = 1.0
+    scores[:, 4:12] = 0.0
+    reference = torch.arange(8, dtype=torch.int32).repeat(2, 1)
+    merged = torch.tensor(
+        [[0, 1, 2, 3, 20, 21, 22, 23], [0, 1, 2, 20, 4, 5, 6, 7]], dtype=torch.int32
+    )
+    logits = [scores[:, rank::world].contiguous() for rank in range(world)]
+    row_ends = torch.full((2,), width, dtype=torch.int32)
+    dcp = _ThreadedDCP(world)
+    results = dcp.run(
+        lambda rank: compare_dcp_topk_merge(
+            logits[rank], row_ends, merged, reference, rank, world, dcp.all_gather(rank)
+        )
+    )
+    for got in results:
+        assert got["miss"].tolist() == [False, True]
+        assert got["tie"].tolist() == [True, False]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="pinned host counters")
+def test_dcp_topk_merge_check_host_counters_under_cuda_default_device():
+    """Model construction runs under a CUDA default-device context; the
+    check's counters still live in pinned host memory."""
+    from vllm.v1.attention.ops.dcp_topk_merge import check
+
+    with torch.device("cuda"):
+        state = check.DcpTopkMergeCheck(torch.device("cuda"))
+    assert state.host.device.type == "cpu" and state.host.is_pinned()
+    assert state.stats.device.type == "cuda"
+
+
 def test_dcp_topk_merge_check_records_misses(monkeypatch):
     """The check's counters and its record of misses (layer, step, row), as
     DCP rank 0 logs them; only the first layer counts the passes."""
