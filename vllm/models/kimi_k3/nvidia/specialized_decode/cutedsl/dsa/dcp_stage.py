@@ -12,18 +12,31 @@ context):
                    "proj": BF16 value rows through W_UV) and LSE of the gathered
                    heads to their owners (only the LSE of a row whose local
                    valid count is 0), merges this rank's heads, W_UV and the
-                   gate
+                   gate. Under "proj" the value rows come from one batched GEMM
+                   over the gathered heads (the stock W_UV bmm) ahead of
+                   DcpValue, whose projecting CTAs only push them: in-kernel
+                   they ran W_UV on mma.sync, one CTA per gathered head walking
+                   the batch (GB300 DCP8, CUPTI 47-51 us at 320 rows).
   DcpValue(pushed) the DSA sparse core's tail (dsa_kernels.dsa_core): the core
                    pushed every rank's partial rows and base-2 LSEs into the
                    owners' DcpBox itself, so this DcpValue (mla.dcp, pushed=True)
                    only re-arms the q mailbox and merges this rank's heads, W_UV
                    and the gate"""
 
+from functools import cache
+
 import cutlass
 import torch
 
 from ..common.host import stream, to_cute
-from .dcp_value import compile_value
+from .dcp_value import PROJECTED, compile_value
+
+
+@cache
+def projected_rows(device, rows, gathered):
+    """The "proj" value rows [DCP * H * rows * 128] BF16 of the W_UV bmm, shared by
+    every DSA layer of a device (allocated before the KV cache is sized)."""
+    return torch.empty(gathered * rows * 128, dtype=torch.bfloat16, device=device)
 
 
 def compile_dcp_value(
@@ -57,6 +70,7 @@ def compile_dcp_value(
         dsa_bf16=not fp8,
         lse_base_e=lse_base_e,
         partials=partials,
+        preprojected=partials == PROJECTED,
     )
 
 
@@ -115,10 +129,13 @@ def local_slots(metadata, topk, dcp, rank, interleave, stride_rows):
     )
 
 
-def run_value(kernel, box, parity, publish, heads, core, lengths, uv, projected, out):
+def run_value(
+    kernel, box, parity, publish, heads, core, lengths, uv, projected, out, w_uv=None
+):
     """DcpValue over the sparse decode's ``core`` output: its padded-head latent
     rows, LSE and per-row valid counts (``lengths``: the requests' global lengths)
-    -> ``out`` [B, H * 128]."""
+    -> ``out`` [B, H * 128]. Under "proj" ``w_uv`` is the gathered W_UV [DCP * H,
+    512, 128] the bmm projects the rows through first."""
     latent, lse, valid = core
     batch = projected.shape[0]
     lens, counts = to_cute(lengths, 4), to_cute(valid[:batch], 4)
@@ -131,6 +148,12 @@ def run_value(kernel, box, parity, publish, heads, core, lengths, uv, projected,
     latent = latent.as_strided((batch, 1, gathered, 512), (padded * 512, 0, 512, 1))
     lse = lse.as_strided((batch, 1, gathered), (padded, 0, 1))
     mailbox, _, rank = publish
+    if mail.format == PROJECTED:
+        assert w_uv is not None
+        rows = projected_rows(out.device, box.cap, gathered)
+        values = rows[: gathered * batch * 128].view(gathered, batch, 128)
+        torch.bmm(latent[:, 0].transpose(0, 1), w_uv, out=values)
+        uv = to_cute(values)
     v_args = (to_cute(latent), to_cute(lse, 4), counts, *boxes, *peers, mailbox, uv)
     s = stream(out.device)
     kernel(*v_args, gate, lens, to_cute(out), cutlass.Int32(parity), rank, s)

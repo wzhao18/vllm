@@ -52,6 +52,7 @@ from .dcp_stage import (
     compile_core_value,
     compile_dcp_value,
     local_slots,
+    projected_rows,
     publish_args,
     run_core_value,
     run_value,
@@ -340,8 +341,11 @@ class PreparedDsa:
             # aside, the same checks).
             args = self.indexer, self.device, max(pitches), local_topk
             reserve_fused_indexer(*args, blocks=kv_cache_blocks())
-        # DCP "proj" partials: every gathered head's W_UV (collective).
+        # DCP "proj" partials: every gathered head's W_UV (collective), and the
+        # rows of its bmm (dcp_stage.projected_rows).
         self.uv_gathered = dcp.value_weights(layer.W_UV) if dcp else None
+        if self.uv_gathered is not None:
+            projected_rows(self.device, dcp.cap, dcp.size * self.heads)
         # The DSA sparse core (dsa_kernels.dsa_core.decode.build, VLLM_K31_DSA_CORE=1)
         # under DCP on FlashInfer with the #63 merge: on the shapes of its variant
         # table (this DSA layer not skipped), the steps merge_rows serves (the #63
@@ -707,10 +711,11 @@ class PreparedDsa:
             args = sparse[1], box, p, publish, self.heads, buffers, lengths[:reqs], uv
             return run_core_value(*args, projected, out)
         core = self.dcp_core(cache, None, metadata, batch, projected, join, q)
+        w_uv = None
         if box.mailbox(batch).format == PROJECTED:
-            uv = self.uv_gathered[1]
+            uv, w_uv = self.uv_gathered[1], self.uv_gathered[0]
         args = value, box, p, publish, self.heads, core, lengths[:reqs], uv
-        return run_value(*args, projected, out)
+        return run_value(*args, projected, out, w_uv)
 
     def run(self, projected, out, *, cache, slots, index_slots, metadata, q=1):
         """``projected``: the packed projection rows; ``out`` [B, H * 128] gets the
