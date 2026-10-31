@@ -427,18 +427,25 @@ class WideDsa:
             _, stride_rows = flat_kv_row_view(cache, md.block_size)
         else:
             pages, stride_rows = _fp8_kv_pages(cache, md.block_size)
-        slots, valid = triton_filter_and_convert_dcp_index(
-            md.req_id_per_token[:batch],
-            md.block_table,
-            topk[:batch],
-            dcp_size=self.dcp,
-            dcp_rank=indexer.dcp_rank,
-            cp_kv_cache_interleave_size=indexer.cp_kv_cache_interleave_size,
-            BLOCK_SIZE=md.block_size,
-            BLOCK_STRIDE_ROWS=stride_rows,
-            NUM_TOPK_TOKENS=topk.shape[1],
-            return_valid_counts=True,
-        )
+        # The DcpExchange top-k (dsa_kernels.dcp_exchange.decode) already left this
+        # rank's slots and their counts in the buffer.
+        counts = self.impl.dcp_local_topk_counts
+        valid = counts(batch) if counts is not None else None
+        if valid is not None:
+            slots = topk[:batch]
+        else:
+            slots, valid = triton_filter_and_convert_dcp_index(
+                md.req_id_per_token[:batch],
+                md.block_table,
+                topk[:batch],
+                dcp_size=self.dcp,
+                dcp_rank=indexer.dcp_rank,
+                cp_kv_cache_interleave_size=indexer.cp_kv_cache_interleave_size,
+                BLOCK_SIZE=md.block_size,
+                BLOCK_STRIDE_ROWS=stride_rows,
+                NUM_TOPK_TOKENS=topk.shape[1],
+                return_valid_counts=True,
+            )
         if self.fp8:
             self.impl.record_logical_topk_ready()
             rows, lse = self.impl._forward_mqa_kernel(
