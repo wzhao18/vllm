@@ -43,17 +43,19 @@ ROWS_ENV = ENV + "_ROWS"
 VARIANT_ENV = ENV + "_VARIANT"
 # Core variant by rows: "u" = the tcgen05 core (CTA per (row, latent half), all 96
 # gathered heads as M = 128), "<S>x<HG>" = the mma.sync core with S KV splits (one
-# cluster) per (row, HG = 16 / 32 gathered heads). DCP4 layer bench with each rank-row
-# capped at 128 local slots (the DCP16 per-rank load; us of the tail after logits +
-# top-k, B1 q8 / B1 q4 / B8 q4 / B8 q8): trtllm chain 27.3 / 24.7 / 29.5 / 24.0; 1x16
-# 11.9 / 12.0 / 15.0 / 22.2; 2x16 11.7 / 11.6 / 21.4 / 36.0; 1x32 14.4 / 14.5 / 17.1 /
-# 19.8; u 17.0 / 16.9 / 18.8 / 20.8 (kernel RESULTS).
-VARIANT = "1-32:1x16,33-64:1x32"
+# cluster; rows of <= 4 chunks still on one CTA) per (row, HG = 16 / 32 gathered
+# heads). DCP16 layer bench (16 x VR200, AgentX, us per layer incl. logits + top-k,
+# max rank; B1 q8 / B1 q4 / B8 q4 / B8 q8): trtllm chain 65.5 / 61.3 / 71.2 / 74.8;
+# 1x16 51.0 / 48.7 / 59.0 / 76.8; 1x32 54.9 / 52.4 / 63.7 / 82.8; u 55.4 / 53.2 / 63.0
+# / 78.0; 2x16 50.4 / 48.4 / 66.2 / 91.7 (kernel RESULTS).
+VARIANT = "1-64:1x16"
 SPREAD_ENV = ENV + "_SPREAD"
 # Rows whose pushed DcpValue spreads every row's merge over its CTAs (Rubin schedule,
 # LSE box [CAP, H, DCP]; spec verify rows only) instead of one merge CTA per (head, 16
-# rows). DCP4: no difference (4 sources); DCP16 sets the default.
-SPREAD = ""
+# rows). DCP16 with 1x16: B8 q4 59.0 -> 55.9, B8 q8 76.8 -> 73.7, B1 q8 51.0 -> 50.5,
+# B1 q4 48.7 -> 49.2 us.
+SPREAD = "17-64:1"
+
 
 def parse_variant(name: str) -> tuple[int, int]:
     """(splits, heads per CTA; 0 = the tcgen05 core) of a variant name."""
