@@ -532,7 +532,7 @@ def test_dsa_layer_preloads_beside_its_attn_res(monkeypatch, sms):
     """A DSA layer whose in-projection stages its weights in tensor memory asks the
     AttnRes before it for carve-out 100 and lists those batches (``tmem_batches``:
     the previous MoE tail releases that AttnRes at entry, no next-attention prefetch),
-    as an MLA layer does."""
+    as an MLA layer does; on the decode ring's codes only (``before_ring_only``)."""
     attention, _ = dsa_layer(fused_insert=True)
     device = SimpleNamespace(multi_processor_count=sms)
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda index: device)
@@ -551,7 +551,44 @@ def test_dsa_layer_preloads_beside_its_attn_res(monkeypatch, sms):
     tmem = tuple(m for m in DL7_TUNED if not 16 < m <= 32)
     assert provider.kind == "dsa"
     assert provider.before_carveout == (100 if rubin else None)
+    assert provider.before_ring_only == rubin
     assert provider.tmem_batches == (tmem if rubin else ())
+
+
+@pytest.mark.parametrize("ring_only", [False, True])
+def test_attn_res_carveout_on_the_decode_ring_only(monkeypatch, ring_only):
+    """``ring_only`` (the AttnRes before a DSA layer): the decode ring's codes (with
+    and without aux) take the carve-out; the plain-input, wide-ring and token-batched
+    codes keep the default, as before D1. Without it every code takes the carve-out
+    (KDA / MLA)."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.attn_res import (
+        prepared,
+    )
+
+    device = SimpleNamespace(multi_processor_count=212)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda index: device)
+    monkeypatch.setattr(prepared, "architecture", lambda device: "sm_107a")
+    monkeypatch.setattr(prepared, "to_cute", lambda tensor, *args: tensor)
+    monkeypatch.setattr(prepared, "kernel_registers", lambda code, index: 0)
+    monkeypatch.setattr(prepared, "compile_consumer", lambda *key: key)
+    carved = lambda code, index, value: ("carved", value, code)  # noqa: E731
+    monkeypatch.setattr(prepared, "prepare_shared_carveout", carved)
+    weights = [torch.zeros(4)] * 3
+    attn_res = prepared.PreparedAttnRes(weights, (2, True, -1, False), (1e-6,) * 2,
+                                        carveout=100, ring_only=ring_only)  # fmt: skip
+    attn_res.bind_ring(torch.zeros(1, 64, 4))
+    attn_res.bind_ring_rows(torch.zeros(1, 256, 4))
+    attn_res.bind_aux()
+    ring = (attn_res.ring[0], attn_res.aux[1])
+    rest = (attn_res.code, attn_res.ring_rows[0], attn_res.aux[0], attn_res.aux[2])
+    rest += tuple(c for codes in attn_res.rows_codes.values() for c in codes)
+    for code in ring:
+        assert code[:2] == ("carved", 100)
+    for code in rest:
+        if ring_only:
+            assert code[0] != "carved"
+        else:
+            assert code[:2] == ("carved", 100)
 
 
 def bf16_ulp(values):

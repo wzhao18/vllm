@@ -90,14 +90,16 @@ class PreparedAttnRes:
     """Ordinary-input code plus the Lamport variant of its bound mailbox ring.
     ``carveout``: a preferred shared-memory carve-out (percent) for its launches; 100
     lets a big-smem PDL successor become resident on this kernel's SMs while it runs
-    (the default carve-out of this small-smem kernel blocks it)."""
+    (the default carve-out of this small-smem kernel blocks it). ``ring_only``: only
+    the decode ring's codes (``bind_ring``) take it, the others (plain, wide rows,
+    row-sharded) keep the default."""
 
-    def __init__(self, weights, key, eps, carveout=None):
+    def __init__(self, weights, key, eps, carveout=None, ring_only=False):
         self.device = weights[0].device
         self.views = tuple(to_cute(w.reshape(-1)) for w in weights)
         self.key, self.eps = key, tuple(map(cutlass.Float32, eps))
         self.sanitize = False
-        self.carveout = carveout
+        self.carveout, self.ring_only = carveout, ring_only
         sms = torch.cuda.get_device_properties(self.device).multi_processor_count
         self.stores_first = self.spread_push = sms > STORES_FIRST_SMS
         # Rubin: the Lamport delta poll exits by a warp vote (``ClusterAttnRes``).
@@ -109,12 +111,13 @@ class PreparedAttnRes:
         self.aux: Any = None
         self.shard: Any = None  # row-sharded batches (``bind_sharded``)
 
-    def _compile(self, slots, cap, aux=False, out_mc=False, tokens=1):
+    def _compile(self, slots, cap, aux=False, out_mc=False, tokens=1, ring=False):
         arch = architecture(self.device)
         sanitize = self.sanitize and slots > 1
         first, spread = self.stores_first, self.spread_push
         vote = self.poll_warp and slots > 0
-        shape = (*self.key, slots, cap, arch, aux, sanitize, self.carveout)
+        carveout = None if self.ring_only and not ring else self.carveout
+        shape = (*self.key, slots, cap, arch, aux, sanitize, carveout)
         shape += (first, spread)
         code = compile_consumer(*shape, vote, 0, out_mc, tokens)
         # The register budget keeps one-token CTAs resident beside the in-projection;
@@ -124,12 +127,14 @@ class PreparedAttnRes:
             code = compile_consumer(*shape, vote, 64 * 1024 // (128 * budget), out_mc)
             what = f"AttnRes ({self.key[0]} blocks, vote poll)"
             check_registers(code, self.device.index, budget, what)
-        if self.carveout is None:
+        if carveout is None:
             return code
-        return prepare_shared_carveout(code, self.device.index, self.carveout)
+        return prepare_shared_carveout(code, self.device.index, carveout)
 
     @classmethod
-    def for_target(cls, target, *, final=False, has_delta=True, carveout=None):
+    def for_target(
+        cls, target, *, final=False, has_delta=True, carveout=None, ring_only=False
+    ):
         if final:
             norm, query = target.output_attn_res_norm, target.output_attn_res_proj
             output, nb, write = target.norm, target.num_attn_res_blocks, -1
@@ -140,7 +145,7 @@ class PreparedAttnRes:
             write = target.block_write_idx if target.is_block_write_layer else -1
         weights = (norm.weight, query.weight, output.weight)
         eps = (norm.variance_epsilon, output.variance_epsilon)
-        return cls(weights, (nb, has_delta, write, final), eps, carveout)
+        return cls(weights, (nb, has_delta, write, final), eps, carveout, ring_only)
 
     @classmethod
     def for_post(cls, decoder):
@@ -161,7 +166,7 @@ class PreparedAttnRes:
         ``sanitize``: the sum maps -0 to +0 (``ClusterAttnRes``)."""
         shape = tuple(mailbox.shape[:2])
         self.sanitize = sanitize
-        self.ring = self._compile(*shape), to_cute(mailbox), shape
+        self.ring = self._compile(*shape, ring=True), to_cute(mailbox), shape
 
     def bind_ring_rows(self, mailbox):
         """The wide batches' Lamport input ring [slots, cap > 64, 7168] (the wide MoE
@@ -178,7 +183,7 @@ class PreparedAttnRes:
         ring = rows = None
         if self.ring is not None:
             slots, cap = self.ring[2]
-            ring = self._compile(slots, cap, True)
+            ring = self._compile(slots, cap, True, ring=True)
         if self.ring_rows is not None:
             slots, cap = self.ring_rows[2]
             rows = self._compile(slots, cap, True)

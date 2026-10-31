@@ -317,10 +317,15 @@ class Attention:
         self.head_index = -1  # this layer's KdaHead index (its polled output buffer)
         # The preceding AttnRes's preferred shared-memory carve-out (None: default).
         self.before_carveout = None
+        # Whether only that AttnRes's decode-ring codes take it (``PreparedAttnRes``
+        # ring_only): no DSA tactic above 64 rows stages weights in tensor memory, and
+        # at 384-768 rows carve-out 100 slows the AttnRes and the cuBLAS in-projection.
+        self.before_ring_only = False
         # MLA / DSA batches whose in-projection stages its weights in tensor memory.
         self.tmem_batches = ()
         if kind in ("mla", "dsa") and any(len(t) > 4 for t in policies.values()):
             self.before_carveout = MLA_BEFORE_CARVEOUT
+            self.before_ring_only = kind == "dsa"
             self.tmem_batches = tuple(b for b, t in policies.items() if len(t) > 4)
         if kind == "kda" and any(len(t) > 4 for t in policies.values()):
             # SplitKTmemGemm64's CTAs are resident beside the preceding AttnRes
