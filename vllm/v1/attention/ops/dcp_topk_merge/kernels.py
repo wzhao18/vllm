@@ -2028,14 +2028,17 @@ def register_dcp_topk_merge_warmup(
     emit_ids: bool = True,
     block_size: int = 0,
     exact: bool = True,
-    mailbox: bool = False,
+    mailbox: bool | None = None,
 ) -> None:
     """Compile the pack kernel and one select (+ rescue) variant at JIT
     warmup.
 
     The stock indexer uses the defaults (global ids); a caller of
     ``dcp_topk_merge_rows`` passes its ``block_size`` and whether it also
-    wants the global ids. ``mailbox``: the round-1 mailbox variants."""
+    wants the global ids. ``mailbox``: the round-1 mailbox variants (by
+    default when the merge of (K, N) has a mailbox)."""
+    if mailbox is None:
+        mailbox = _mailbox_for(topk, local_topk) is not None
     if mailbox:
         for from_packed in (False, True):
             _DCP_TOPK_PACK_KERNEL.register_warmup(

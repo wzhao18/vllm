@@ -169,13 +169,14 @@ def _init_rescue(vllm_config: Any, topk: int, local_topk: int) -> int:
 
     kv_transfer = vllm_config.kv_transfer_config
     # A prefill-only instance never decodes.
+    prefill_only = (
+        kv_transfer is not None
+        and kv_transfer.is_kv_producer
+        and not kv_transfer.is_kv_consumer
+    )
     mailbox = (
         envs.VLLM_DSA_BPRIME_MAILBOX
-        and not (
-            kv_transfer is not None
-            and kv_transfer.is_kv_producer
-            and not kv_transfer.is_kv_consumer
-        )
+        and not prefill_only
         and init_dcp_topk_mailbox(topk, local_topk, group)
     )
     if envs.VLLM_DSA_BPRIME_CHECK:
@@ -202,4 +203,12 @@ def _init_rescue(vllm_config: Any, topk: int, local_topk: int) -> int:
     )
     if mailbox:
         logger.info_once("DSA DCP top-k merge: round 1 by multicast mailbox.")
+    elif envs.VLLM_DSA_BPRIME_MAILBOX:
+        logger.warning_once(
+            "DSA DCP top-k merge: VLLM_DSA_BPRIME_MAILBOX is set, but round 1 "
+            "stays on the all-gather (%s).",
+            "prefill-only instance"
+            if prefill_only
+            else "no multicast memory over the DCP group",
+        )
     return local_topk
