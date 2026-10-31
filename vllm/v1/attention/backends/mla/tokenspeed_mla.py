@@ -460,7 +460,7 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
         if (
             self._sm107_split
             and self.dcp_world_size == 1
-            and q.shape[1] == self._query_len
+            and q.shape[1] <= self._query_len  # DSpark drafts with query_len - 1
             and q.shape[0] <= self._max_decode_requests
             and q.stride(1) == q.shape[2] * q.stride(2)
             and not self.need_to_return_lse_for_decode

@@ -444,6 +444,7 @@ def run(mod, logits, seq, q, out, topk, ctas_per_sm):
     counters, thresh, ties = scratch.split([2 * num_rows, num_rows, num_rows * tie_cap])
     sms = torch.cuda.get_device_properties(dev).multi_processor_count
     mod.balanced_topk_cuda(logits, seq, q, out, topk, thresh, counters, cand, ties, ctas_per_sm * sms)
+    return counters.view(torch.int64)
 
 
 def main():
@@ -487,6 +488,12 @@ def main():
             uniq = all(out[i].unique().numel() == out.shape[1] for i in range(0, rows, 17))
             same = bool(torch.equal(outv, refv)) and uniq
             row = dict(case=c["name"], variant=v, rows=rows, us=t, same_values_as_stock=same)
+            ctr = run(mod, logits, seq, q, out, TOPK, cps)
+            torch.cuda.synchronize()
+            ngt = (ctr & 0xFFFFFFFF).float(); neq = (ctr >> 32).float()
+            row["cand_per_row"] = dict(mean=ngt.mean().item(), max=ngt.max().item(), min=ngt.min().item(),
+                                       ties_mean=neq.mean().item(), over_cap=int((ngt > B.CAP).sum().item()),
+                                       below_topk=int((ngt < TOPK).sum().item()))
             if a.kernels:
                 from torch.profiler import ProfilerActivity, profile
                 with profile(activities=[ProfilerActivity.CUDA]) as prof:
