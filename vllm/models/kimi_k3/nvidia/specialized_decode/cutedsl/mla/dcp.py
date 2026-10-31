@@ -39,6 +39,7 @@ from ..common.primitives import (
     mma_into,
     no_neg_zero,
     pack_pair,
+    prefetch_bytes,
     published,
     sigmoid,
     store_relaxed,
@@ -644,6 +645,7 @@ class DcpValue:
         q_heads=0,
         lse_scale=1.0,
         spread=False,
+        prefetch_uv=True,
     ):
         """``q_chunks``: 16 B chunks per q mailbox head row (36 FP8, 72 BF16);
         ``q_heads``: q mailbox rows per token (default DCP * H); ``lse_scale``: to
@@ -708,6 +710,7 @@ class DcpValue:
         # (``spread``: every q > 1 batch, the DSA sparse core's pushed rows)
         spread = spread or batch in SPREAD_MERGE or batch > 64
         self.spread = self.lean and q > 1 and spread
+        self.prefetch_uv = prefetch_uv
         if self.spread:
             pushers = 1 << (min(16, max(1, sms // merge)).bit_length() - 1)
         self.merge_rows = 16 // pushers if self.spread else 16
@@ -781,6 +784,12 @@ class DcpValue:
                 load_words(at(w_uv, head, 32 * c + 8 * quarter, v), count=4)
                 for c in range(16)
             ]
+        if cutlass.const_expr(self.spread and self.pushed and self.prefetch_uv):
+            # (pushed DSA rows: this grid launches at the sparse core's PDL release, long
+            # before its rows land; its head's W_UV rows -> L2 meanwhile, so the spread
+            # merge's post-poll fragment loads hit L2)
+            if tid < 128:
+                prefetch_bytes(at(w_uv, head, 0, tid), 1024)
         if cutlass.const_expr(not self.polled_split):
             cute.arch.griddepcontrol_wait()
         if cutlass.const_expr(self.lpc is not None):
