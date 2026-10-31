@@ -641,13 +641,16 @@ class KimiMoE(nn.Module):
                 weight_format=MEGA_MOE_MXFP4,
                 prefix=f"{prefix}.experts",
             )
-            if use_sequence_parallel or self.moe_token_shard:
-                # Under sequence parallelism (or the MoE token shard) each rank's
-                # MoE sees only its token shard (sp_shard pads to a multiple of
-                # the TP size), so the symmetric dispatch / combine buffer needs
+            if self.moe_token_shard and not use_sequence_parallel:
+                # Under the MoE token shard (as under sequence parallelism,
+                # already applied to max_num_tokens above) each rank's MoE sees
+                # only its token shard (sp_shard pads to a multiple of the TP
+                # size), so the symmetric dispatch / combine buffer needs
                 # ceil(MNBT / TP) tokens per rank, not MNBT. Its combine slots
                 # alone are top_k x tokens x latent x 2 B (1.9 GB per rank at
-                # MNBT 16384).
+                # MNBT 16384). Dividing again under sequence parallelism sized
+                # the buffer for ceil(MNBT / TP^2) and rejected full batches
+                # (DCP8xDEP2: 128 slots for a 1024-token shard).
                 self.experts.max_num_tokens = cdiv(
                     self.experts.max_num_tokens, self.tp_size
                 )
