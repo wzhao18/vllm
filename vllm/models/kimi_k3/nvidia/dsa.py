@@ -56,7 +56,13 @@ from vllm.models.kimi_k3.nvidia.mla import (
     _GATE_MULTI_STREAM_TOKEN_THRESHOLD,
     _gate_sigmoid_mul,
 )
-from vllm.models.kimi_k3.nvidia.mxfp8 import PackedMxfp8Linear, can_pack_mxfp8
+from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
+from vllm.models.kimi_k3.nvidia.mxfp8 import (
+    PackedMxfp8Linear,
+    can_pack_mxfp8,
+    takes_mxfp8_activation,
+)
+from vllm.models.kimi_k3.nvidia.ops import mxfp8_act
 from vllm.models.kimi_k3.nvidia.ops.dsa_indexer import (
     dsa_fused_prologue,
     indexer_k_norm_quant_insert,
@@ -728,6 +734,8 @@ class KimiK3DSAAttention(nn.Module):
         self._gate_events: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
         # Set by pack_projections(): the packed input and query projections.
         self._packed: list[Callable[[torch.Tensor], torch.Tensor]] | None = None
+        # (input shared by the packed projection and g_proj, fused output gate)
+        self._mxfp8_acts: tuple[bool, bool] | None = None
 
     def pack_projections(self) -> None:
         """Enable the fused forward (as DeepseekV32Attention): pack
@@ -797,6 +805,17 @@ class KimiK3DSAAttention(nn.Module):
     ) -> torch.Tensor:
         if self._packed is None:
             return self.mla_attn(positions, hidden_states)
+        # Online MXFP8: the packed input projection and g_proj share one
+        # quantization of the layer input, and the output gate writes o_proj's
+        # MXFP8 input (mxfp8_act).
+        if self._mxfp8_acts is None:
+            self._mxfp8_acts = (
+                isinstance(self._packed[0], PackedMxfp8Linear)
+                and takes_mxfp8_activation(self.g_proj),
+                takes_mxfp8_activation(self.o_proj),
+            )
+        shared_input, fused_gate = self._mxfp8_acts
+        x = mxfp8_act.quantize(hidden_states) if shared_input else hidden_states
         # As in the dense Kimi-K3 MLA: the output-gate GEMM overlaps the
         # attention front-end on the aux stream for small batches.
         if (
@@ -804,22 +823,32 @@ class KimiK3DSAAttention(nn.Module):
             and hidden_states.shape[0] < _GATE_MULTI_STREAM_TOKEN_THRESHOLD
         ):
             attn_out, gate = maybe_execute_in_parallel(
-                lambda: self._fused_attention(hidden_states),
-                lambda: self.g_proj(hidden_states)[0],
+                lambda: self._fused_attention(hidden_states, x),
+                lambda: self.g_proj(x)[0],
                 *self._gate_events,
                 self.aux_stream,
             )
         else:
-            attn_out = self._fused_attention(hidden_states)
-            gate = self.g_proj(hidden_states)[0]
+            attn_out = self._fused_attention(hidden_states, x)
+            gate = self.g_proj(x)[0]
+        if fused_gate:
+            return self.o_proj(mxfp8_act.gate_sigmoid_mul_quantize(attn_out, gate))[0]
         return self.o_proj(_gate_sigmoid_mul(attn_out, gate))[0]
 
-    def _fused_attention(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _fused_attention(
+        self,
+        hidden_states: torch.Tensor,
+        projection_input: "torch.Tensor | QuantizedActivation | None" = None,
+    ) -> torch.Tensor:
         assert self.q_lora_rank is not None and self._packed is not None
         indexer = self.dsa_indexer
         attn = cast(Any, self.mla_attn.mla_attn)
         input_projection, query_projection = self._packed
-        q_c, kv_c, k_pe, index_k, index_weights = input_projection(hidden_states).split(
+        if projection_input is None:
+            projection_input = hidden_states
+        q_c, kv_c, k_pe, index_k, index_weights = input_projection(
+            projection_input
+        ).split(
             [
                 self.q_lora_rank,
                 self.kv_lora_rank,

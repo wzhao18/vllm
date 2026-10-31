@@ -19,6 +19,8 @@ Kimi K3.1's fused DSA forward packs ``[q_a | kv_a | wk | weights_proj]`` and
 ``[q_b | wq_index]`` this way when they are online MXFP8.
 """
 
+import os
+
 import torch
 from torch import nn
 
@@ -209,3 +211,35 @@ class PackedMxfp8Linear:
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         return self.kernel.apply_weights(self.holder, x)
+
+
+# VLLM_K3_MXFP8_FUSED_ACT=0: every online-MXFP8 linear quantizes its own BF16
+# input (one FlashInfer mxfp8_quantize launch per call), as before.
+_FUSED_ACT = os.environ.get("VLLM_K3_MXFP8_FUSED_ACT", "1") == "1"
+
+
+def takes_mxfp8_activation(*linears: nn.Module | None) -> bool:
+    """True when every linear is online MXFP8 on a kernel that consumes a
+    pre-quantized MXFP8 activation (FlashInfer F8_128x4 scales), so the
+    producer of their shared input may hand them a QuantizedActivation from
+    ``ops/mxfp8_act.py`` instead of BF16."""
+    if not (_FUSED_ACT and current_platform.is_device_capability_family(100)):
+        return False
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kMxfp8Dynamic,
+    )
+
+    for linear in linears:
+        if linear is None or not is_online_mxfp8(linear):
+            return False
+        kernel = getattr(linear.quant_method, "kernel", None)
+        if kernel is None or kernel.input_quant_key() != kMxfp8Dynamic:
+            return False
+        if getattr(linear, "requires_unquantized_input", False):
+            return False
+        # The producers write whole 128-column groups of scales (every K3.1
+        # projection input: 768 / 1536 / 3072 / 3584 / 6144 / 7168 / 12288).
+        k = getattr(linear, "input_size_per_partition", None)
+        if k is None or k % (4 * MXFP8_BLOCK_SIZE) != 0:
+            return False
+    return True

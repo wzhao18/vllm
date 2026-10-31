@@ -142,3 +142,132 @@ def warmup(heads: int, g_row_stride: int, weight: torch.Tensor, eps: float) -> N
         while tiles <= _TILES:
             _launch(x, gv, weight, eps, n * heads, heads, tiles)
             tiles *= 2
+
+
+# ---------------------------------------------------------------------------
+# MXFP8 output: the gate norm writes o_proj's input as MXFP8 (FP8 values +
+# F8_128x4-swizzled E8M0 scales, FlashInfer mxfp8_quantize semantics) instead
+# of BF16 in place, so an online-MXFP8 o_proj skips its own quantization.
+# The tile body is the BF16 kernel's; the value is rounded to BF16 exactly as
+# the in-place store would, then quantized in 32-wide blocks (4 per head).
+
+
+@triton.jit
+def _ue8m0_and_inv(amax):
+    """FlashInfer float_to_ue8m0_fast(amax * fp32(1/448)) and its inverse
+    2^(127 - e) (0 for e == 0)."""
+    nm = amax * 0.002232142857142857
+    bits = nm.to(tl.uint32, bitcast=True)
+    exp = (bits >> 23) & 255
+    mant = bits & 0x7FFFFF
+    bump = tl.where(mant != 0, 1, 0).to(tl.uint32)
+    bump = tl.where((exp == 0) & (mant <= 0x400000), 0, bump).to(tl.uint32)
+    e = tl.minimum(exp + bump, 254)
+    e = tl.where(nm <= 0.0, 0, e).to(tl.uint32)
+    inv = ((254 - e) << 23).to(tl.float32, bitcast=True)
+    inv = tl.where(e == 0, 0.0, inv)
+    return e, inv
+
+
+@triton.jit(do_not_specialize=["T"])
+def _kda_rmsnorm_gated_mxfp8_kernel(
+    x,
+    g,
+    q,
+    sf,
+    w,
+    eps,
+    T,
+    q_stride,
+    H: tl.constexpr,
+    g_stride_n: tl.constexpr,
+    D: tl.constexpr,
+    BT: tl.constexpr,
+    SF_COLS: tl.constexpr,
+):
+    i_t = tl.program_id(0).to(tl.int64)
+    o_t = i_t * BT + tl.arange(0, BT)
+    o_d = tl.arange(0, D)
+    m_t = o_t < T
+
+    b_x = tl.load(x + o_t[:, None] * D + o_d[None, :], mask=m_t[:, None], other=0.0)
+    b_x = b_x.to(tl.float32)
+    b_var = tl.sum(b_x * b_x, axis=1) / D
+    b_rstd = 1 / tl.sqrt(b_var + eps)
+    b_w = tl.load(w + o_d).to(tl.float32)
+    b_y = b_x * b_rstd[:, None] * b_w[None, :]
+    o_g = (o_t // H) * g_stride_n + (o_t % H) * D
+    b_g = tl.load(g + o_g[:, None] + o_d[None, :], mask=m_t[:, None], other=0.0)
+    b_y = b_y * tl.sigmoid(b_g.to(tl.float32))
+    # The BF16 value the in-place kernel stores.
+    b_y = b_y.to(tl.bfloat16).to(tl.float32)
+
+    b_y3 = tl.reshape(b_y, (BT, D // 32, 32))
+    amax = tl.max(tl.abs(b_y3), axis=2)
+    e, inv = _ue8m0_and_inv(amax)
+    b_q = (b_y3 * inv[:, :, None]).to(tl.float8e4nv)
+    b_q = tl.reshape(b_q, (BT, D))
+
+    tok = o_t // H
+    head = o_t % H
+    tl.store(
+        q + tok[:, None] * q_stride + head[:, None] * D + o_d[None, :],
+        b_q,
+        mask=m_t[:, None],
+    )
+    # Scale column of block j of this head, in the swizzled layout.
+    col = head[:, None] * (D // 32) + tl.arange(0, D // 32)[None, :]
+    off = (
+        (col % 4)
+        + (col // 4) * 512
+        + (tok[:, None] % 32) * 16
+        + ((tok[:, None] % 128) // 32) * 4
+        + (tok[:, None] // 128) * (128 * SF_COLS)
+    )
+    tl.store(sf + off, e.to(tl.uint8), mask=m_t[:, None])
+
+
+def rmsnorm_gated_mxfp8(
+    x: torch.Tensor,
+    g: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    out=None,
+):
+    """``rmsnorm_gated_(x, g, ...)`` (D = 128) written as the MXFP8 activation
+    ``[tokens, heads * 128]`` of the following o_proj instead of in place.
+    ``out``: a preallocated ``mxfp8_act.Mxfp8Buffer`` (needed under CUDA-graph
+    capture across an eager break); returns its QuantizedActivation. Unlike
+    the mxfp8_act producers, the padding rows' scales are left unwritten."""
+    from vllm.models.kimi_k3.nvidia.ops.mxfp8_act import Mxfp8Buffer
+
+    D = x.shape[-1]
+    assert D == 128
+    x2 = x.reshape(-1, D)
+    H = 1 if g.ndim == 2 else g.shape[-2]
+    gv = g.view(-1, H, D)
+    T = x2.shape[0]
+    tokens = T // H
+    if out is None:
+        out = Mxfp8Buffer(tokens, H * D, x.device, x.dtype)
+    assert out.rows == tokens and out.k == H * D
+    if tokens:
+        # The scales of the padding rows of the last 128-row tile stay
+        # unwritten: the GEMM's rows are independent and drops those rows.
+        _kda_rmsnorm_gated_mxfp8_kernel[(triton.cdiv(T, _BT),)](
+            x2,
+            gv,
+            out.data,
+            out.scale,
+            weight,
+            eps,
+            T,
+            out.data.stride(0),
+            H=H,
+            g_stride_n=gv.stride(0),
+            D=D,
+            BT=_BT,
+            SF_COLS=out.padded_cols,
+            num_warps=8,
+        )
+    return out.activation()

@@ -58,6 +58,7 @@ from vllm.models.kimi_k3.nvidia.ops.kda_conv import (
     packed_causal_conv1d_fn,
     packed_causal_conv1d_supported,
 )
+from vllm.models.kimi_k3.nvidia.ops.mxfp8_act import Mxfp8Buffer
 from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
     KDARecoverSSMRecords,
     kda_recoverssm_verify,
@@ -894,6 +895,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 )
 
         self.o_norm = FusedRMSNormGated(self.head_dim, activation="sigmoid")
+        self._o_norm_mxfp8_ok: bool | None = None
         decode_norm_weight = None
         if decode_conv1d_weight is not None:
             decode_norm_weight = torch.empty(
@@ -1011,13 +1013,26 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
+        # Online-MXFP8 o_proj: the output gate norm writes o_proj's MXFP8 input
+        # (preallocated here: _forward breaks the CUDA graph capture).
+        o_mxfp8 = None
+        if self._o_norm_mxfp8(core_attn_out, g2):
+            o_mxfp8 = Mxfp8Buffer(
+                num_tokens,
+                self.local_num_heads * self.head_dim,
+                hidden_states.device,
+                hidden_states.dtype,
+            )
         self._forward(
             mixed_qkv=mixed_qkv,
             g1=g1,
             g2=g2,
             beta=beta,
             core_attn_out=core_attn_out,
+            o_mxfp8=o_mxfp8,
         )
+        if o_mxfp8 is not None:
+            return self.o_proj(o_mxfp8.activation())[0]
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
         if self.gemm_rs_ar is not None and self.gemm_rs_ar.should_run(core_attn_out):
             # VLLM_KIMI_K3_GEMM_AR_ALIAS: hand back the workspace view; the
@@ -1117,6 +1132,21 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         )
 
     @eager_break_during_capture
+    def _o_norm_mxfp8(self, core_attn_out: torch.Tensor, g2: torch.Tensor) -> bool:
+        if self._o_norm_mxfp8_ok is None:
+            from vllm.models.kimi_k3.nvidia.mxfp8 import takes_mxfp8_activation
+
+            self._o_norm_mxfp8_ok = (
+                self.gemm_rs_ar is None
+                and _NORM_TILES
+                and takes_mxfp8_activation(self.o_proj)
+            )
+        return (
+            self._o_norm_mxfp8_ok
+            and core_attn_out.is_contiguous()
+            and kda_norm.supported(core_attn_out, g2, self.o_norm)
+        )
+
     def _forward(
         self,
         mixed_qkv: torch.Tensor,
@@ -1124,6 +1154,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         g2: torch.Tensor,
         beta: torch.Tensor,
         core_attn_out: torch.Tensor,
+        o_mxfp8: Mxfp8Buffer | None = None,
     ) -> None:
         forward_context = get_forward_context()
         attn_metadata_raw = forward_context.attn_metadata
@@ -1651,7 +1682,12 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             assert core_attn_out_spec is not None
         # Triton normalizes in place, so this is a self-copy with no device
         # work. Keep it for the out-of-place native implementation.
-        if _NORM_TILES and kda_norm.supported(core_attn_out, g2, self.o_norm):
+        if o_mxfp8 is not None:
+            # forward() checked kda_norm.supported for these tensors.
+            kda_norm.rmsnorm_gated_mxfp8(
+                core_attn_out, g2, self.o_norm.weight, self.o_norm.eps, out=o_mxfp8
+            )
+        elif _NORM_TILES and kda_norm.supported(core_attn_out, g2, self.o_norm):
             kda_norm.rmsnorm_gated_(
                 core_attn_out, g2, self.o_norm.weight, self.o_norm.eps
             )

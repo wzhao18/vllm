@@ -37,11 +37,13 @@ from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
 from vllm.model_executor.layers.fusion.mm_input_norm import build_mm_input_norm
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
+    LinearBase,
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
     UnquantizedLinearMethod,
 )
+from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
     KimiGatedDeltaNetAttention as KimiLinearGatedDeltaNetAttention,
@@ -111,7 +113,8 @@ from vllm.models.kimi_k3.nvidia.low_latency_gemm import (
     enable_kimi_k3_low_latency_gemm,
 )
 from vllm.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
-from vllm.models.kimi_k3.nvidia.ops import attn_res
+from vllm.models.kimi_k3.nvidia.mxfp8 import takes_mxfp8_activation
+from vllm.models.kimi_k3.nvidia.ops import attn_res, mxfp8_act
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import NestedTensors
 from vllm.platforms import current_platform
@@ -372,6 +375,31 @@ class KimiMLP(nn.Module):
                 "Only silu and situ are supported."
             )
 
+    def mxfp8_input(self) -> bool:
+        """gate_up_proj takes an MXFP8 activation (QuantizedActivation)."""
+        return not self.shard_sequence_parallel and takes_mxfp8_activation(
+            self.gate_up_proj
+        )
+
+    def _act_mxfp8(self, gate_up: torch.Tensor):
+        """The activation written as down_proj's MXFP8 input, or None."""
+        fused = getattr(self, "_fused_act_quant", None)
+        if fused is None:
+            fused = (
+                self.gemm_rs_ar is None
+                and not self.shard_sequence_parallel
+                and isinstance(self.act_fn, (SiluAndMul, SituAndMul, KimiVecSituAndMul))
+                and takes_mxfp8_activation(self.down_proj)
+            )
+            self._fused_act_quant = fused
+        if not fused:
+            return None
+        if isinstance(self.act_fn, SiluAndMul):
+            return mxfp8_act.silu_and_mul_quantize(gate_up)
+        return mxfp8_act.situ_and_mul_quantize(
+            gate_up, self.act_fn.beta, self.act_fn.linear_beta
+        )
+
     def forward(self, x):
         if self.shard_sequence_parallel:
             # Each rank holds a weight shard but only its own tokens, so it
@@ -380,6 +408,10 @@ class KimiMLP(nn.Module):
             # which sums across TP and restores the sequence sharding.
             x = sp_all_gather(x)
         gate_up, _ = self.gate_up_proj(x)
+        # Online-MXFP8 down_proj: the activation kernel writes its MXFP8 input.
+        qa = self._act_mxfp8(gate_up)
+        if qa is not None:
+            return self.down_proj(qa)[0]
         x = self.act_fn(gate_up)
 
         if self.gemm_rs_ar is not None and self.gemm_rs_ar.should_run(x):
@@ -400,6 +432,20 @@ class KimiRoutedOutputTransform(nn.Module):
         super().__init__()
         self.norm = norm
         self.up_proj = up_proj
+        self._fused_norm_quant: bool | None = None
+
+    def _norm_mxfp8(self) -> bool:
+        if self._fused_norm_quant is None:
+            norm = self.norm
+            self._fused_norm_quant = (
+                norm is not None
+                and getattr(norm, "has_weight", True)
+                and norm.variance_size_override is None
+                and norm.weight.shape[0] % 256 == 0
+                and norm.weight.shape[0] <= 8192
+                and takes_mxfp8_activation(self.up_proj)
+            )
+        return self._fused_norm_quant
 
     def forward(
         self,
@@ -416,6 +462,13 @@ class KimiRoutedOutputTransform(nn.Module):
 
         """
         if self.norm is not None:
+            if self._norm_mxfp8():
+                # Online-MXFP8 up_proj: the latent norm writes its MXFP8 input.
+                qa = mxfp8_act.rms_norm_quantize(
+                    hidden_states, self.norm.weight, self.norm.variance_epsilon
+                )
+                out, _ = self.up_proj(qa)
+                return out if residual is None else residual.add_(out)
             hidden_states = self.norm(hidden_states)
         if residual is not None and isinstance(
             self.up_proj.quant_method, UnquantizedLinearMethod
@@ -702,8 +755,27 @@ class KimiMoE(nn.Module):
                 moe_intermediate_size // self.tp_size
             )
 
+    def _shared_mxfp8_input(self) -> bool:
+        """The latent down_proj and the shared experts' gate_up_proj both read
+        the layer input as online MXFP8: quantize it once for both."""
+        fused = getattr(self, "_fused_input_quant", None)
+        if fused is None:
+            shared = self.shared_experts
+            fused = (
+                not self.moe_token_shard
+                and self.use_mega_moe
+                and self.routed_expert_down_proj is not None
+                and isinstance(shared, KimiMLP)
+                and shared.mxfp8_input()
+                and takes_mxfp8_activation(self.routed_expert_down_proj)
+            )
+            self._fused_input_quant = fused
+        return fused
+
     def _maybe_overlap_router_and_down_proj(
-        self, hidden_states: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        down_proj_input: "torch.Tensor | QuantizedActivation | None" = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Compute the routed-expert down projection alongside the router,
         overlapping them on separate CUDA streams when latent MoE is enabled.
@@ -747,10 +819,12 @@ class KimiMoE(nn.Module):
             router_output, topk_ids = _router(hidden_states)
             return hidden_states, router_output, topk_ids
         num_tokens = hidden_states.shape[0]
+        if down_proj_input is None:
+            down_proj_input = hidden_states
         (router_output, topk_ids), (routed_hidden_states, _) = (
             maybe_execute_in_parallel(
                 lambda: _router(hidden_states),
-                lambda: down_proj(hidden_states),
+                lambda: down_proj(down_proj_input),
                 self._down_proj_events[0],
                 self._down_proj_events[1],
                 self._down_proj_stream
@@ -837,11 +911,16 @@ class KimiMoE(nn.Module):
             return self._token_shard_forward(hidden_states).view(
                 num_tokens, hidden_size
             )
+        # Online MXFP8: one quantization of the layer input for the latent
+        # down_proj and the shared gate_up_proj (each would quantize its own).
+        mxfp8_input = (
+            mxfp8_act.quantize(hidden_states) if self._shared_mxfp8_input() else None
+        )
         # Overlap the gate with the routed down projection; the returned hidden
         # states are already down-projected. Keep the original ``hidden_states``
         # for the shared experts.
         routed_hidden_states, router_output, topk_ids = (
-            self._maybe_overlap_router_and_down_proj(hidden_states)
+            self._maybe_overlap_router_and_down_proj(hidden_states, mxfp8_input)
         )
         if self.use_mega_moe:
             assert self.routed_output_transform is not None
@@ -854,7 +933,9 @@ class KimiMoE(nn.Module):
             # The shared output is folded into the up-projection GEMM's beta-add
             # epilogue, so combining the two branches costs no extra kernel.
             shared_output = (
-                self.shared_experts(hidden_states)
+                self.shared_experts(
+                    hidden_states if mxfp8_input is None else mxfp8_input
+                )
                 if self.shared_experts is not None
                 else None
             )
@@ -1740,6 +1821,17 @@ class KimiLinearForCausalLM(
                 "Kimi K3: %d online MXFP8 linears use the CuTe DSL (<= 16 rows) / "
                 "cuBLASLt MXFP8 dispatch.",
                 switched,
+            )
+        if any(
+            takes_mxfp8_activation(m)
+            for m in self.modules()
+            if isinstance(m, LinearBase)
+        ):
+            # Build the fused MXFP8 activation producers at load, not mid-step.
+            mxfp8_act.warmup()
+            logger.info_once(
+                "Kimi K3: online-MXFP8 projections take fused MXFP8 activations "
+                "(VLLM_K3_MXFP8_FUSED_ACT=0 to quantize per linear)."
             )
         # The specialized decode packs the DSA projections its own way.
         if self.specialized_decode_config is None:
