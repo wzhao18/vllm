@@ -111,14 +111,24 @@ def ring_batches(table, tp, device, batches):
     return frozenset(b for b in batches if on.get(b))
 
 
-def wide_rows(captured, q, *, rubin, seams, dsa, tp, dcp):
-    """The captured verify rows above the tuned providers whose steps run the
-    specialized decode (``WIDE_ROWS``): on Rubin at q > 1 without sequence
-    parallelism (the o-projection seam needs every rank's full rows). With K3.1 DSA
-    layers (seam S2-DSA) only at TP16 = DCP16, where the fused wide o-projection
-    serves every such row; elsewhere they would run untested fallback seams."""
-    if not (rubin and q > 1 and seams) or (dsa and (tp, dcp) != (16, 16)):
-        return ()
+def wide_gate(q, *, rubin, seams, dsa, tp, dcp):
+    """Why the captured verify rows above the tuned providers run the stock forward
+    (None: those in ``WIDE_ROWS`` run the specialized decode). Wide steps need Rubin,
+    q > 1 and every rank's full rows (no sequence parallelism: the o-projection seam),
+    and with K3.1 DSA layers (seam S2-DSA) TP16 = DCP16, where the fused wide
+    o-projection serves every such row: elsewhere they would run untested fallback
+    seams."""
+    if not (rubin and q > 1):
+        return f"no prepared providers above {PREPARED_MAX} rows"
+    if not seams:
+        return "sequence parallelism"
+    if dsa and (tp, dcp) != (16, 16):
+        return "DSA wide steps need TP16 = DCP16"
+    return None
+
+
+def wide_rows(captured, q):
+    """The captured verify rows above the tuned providers that ``WIDE_ROWS`` lists."""
     shapes = (Shape(m, q) for m in captured if m > PREPARED_MAX)
     return tuple(s.rows for s in shapes if rows_policy(WIDE_ROWS, s, 0))
 
@@ -206,15 +216,10 @@ class SpecializedDecode:
         self.captured = config.captured
         seams = not getattr(backbone, "use_sequence_parallel", False)
         dsa = getattr(backbone.config, "dsa_config", None) is not None
-        self.wide = wide_rows(
-            self.captured,
-            q,
-            rubin=cc == (10, 7),
-            seams=seams,
-            dsa=dsa,
-            tp=self.tp,
-            dcp=self.dcp,
+        self.wide_off = wide_gate(
+            q, rubin=cc == (10, 7), seams=seams, dsa=dsa, tp=self.tp, dcp=self.dcp
         )
+        self.wide = () if self.wide_off else wide_rows(self.captured, q)
         self.batches = tuple(sorted({*self.tuned, *self.wide}))
         self.capacity = self.batches[-1]  # rows of every decode buffer
         self.context = Context(
@@ -504,11 +509,9 @@ class SpecializedDecode:
         rows = self.captured or tuple(b for b in self.batches if b % q == 0)
         for b in rows:
             if b not in self.batches or b % q:
-                why = (
-                    "not in WIDE_ROWS"
-                    if b > PREPARED_MAX and self.context.arch == "rubin" and q > 1
-                    else f"no prepared providers above {PREPARED_MAX} rows"
-                )
+                why = f"no prepared providers above {PREPARED_MAX} rows"
+                if b > PREPARED_MAX:
+                    why = self.wide_off or "not in WIDE_ROWS"
                 coverage.stock(b, why)
             elif b in self.wide:
                 coverage.specialize(b, self.wide_choices(b, q))

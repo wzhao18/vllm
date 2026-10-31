@@ -24,12 +24,23 @@ from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe.dense import (  #
 from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe.prepared import (  # noqa: E402
     PreparedMoE,
 )
+from vllm.models.kimi_k3.nvidia.specialized_decode.runtime import (  # noqa: E402
+    DecodeConfig,
+)
+from vllm.models.kimi_k3.nvidia.specialized_decode.runtime import (  # noqa: E402
+    decode as decode_module,
+)
+from vllm.models.kimi_k3.nvidia.specialized_decode.runtime import (  # noqa: E402
+    providers as providers_module,
+)
 from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.decode import (  # noqa: E402
     SpecializedDecode,
     Step,
+    wide_gate,
     wide_rows,
 )
 from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.providers import (  # noqa: E402
+    BATCHES,
     Attention,
     dsa_seam_columns,
     pack_dsa_projection,
@@ -60,41 +71,101 @@ DL3 = (6, 8, 15, 16, 18, 20, 21, 24, 30, 32, 39, 40, 45, 48, 54, 56, 63, 64, 66,
        174, 176, 180, 184, 186, 192, 200, 204, 208, 216, 224, 228, 232, 240, 248, 252,
        256, 264, 272, 276, 288, 300, 304, 312, 320, 324, 336, 348, 352, 360, 368, 372,
        384, 400, 416, 432, 448, 464, 480, 496, 512)  # fmt: skip
+# C48's decode role (override_2p1d_dl3_cap64_mc): q4 on the base tree, max-num-seqs 64.
+DL3_CAP64 = tuple(m for m in DL3 if m <= 256 and m not in (204, 228, 252))
 
 
 @pytest.mark.parametrize(
-    "dsa,tp,dcp,q,rubin,seams,wide",
+    "dsa,tp,dcp,q,rubin,seams,why",
     [
-        (True, 16, 16, 8, True, True, True),  # K3.1's decode role
-        (True, 16, 1, 8, True, True, False),
-        (True, 8, 8, 8, True, True, False),
-        (True, 8, 1, 8, True, True, False),
-        (True, 16, 16, 1, True, True, False),
-        (True, 16, 16, 8, False, True, False),
-        (True, 16, 16, 8, True, False, False),
-        (False, 16, 16, 8, True, True, True),  # K3 (dense MLA): as before
-        (False, 16, 1, 8, True, True, True),
-        (False, 8, 8, 8, True, True, True),
-        (False, 16, 16, 1, True, True, False),
-        (False, 16, 16, 8, False, True, False),
-        (False, 16, 16, 8, True, False, False),
+        (True, 16, 16, 8, True, True, None),  # K3.1's decode role
+        (True, 16, 8, 8, True, True, "DSA wide steps need TP16 = DCP16"),
+        (True, 16, 2, 8, True, True, "DSA wide steps need TP16 = DCP16"),
+        (True, 16, 1, 8, True, True, "DSA wide steps need TP16 = DCP16"),
+        (True, 8, 8, 8, True, True, "DSA wide steps need TP16 = DCP16"),
+        (True, 8, 1, 8, True, True, "DSA wide steps need TP16 = DCP16"),
+        (True, 16, 16, 1, True, True, "no prepared providers above 64 rows"),
+        (True, 16, 16, 8, False, True, "no prepared providers above 64 rows"),
+        (True, 16, 16, 8, True, False, "sequence parallelism"),
+        (False, 16, 16, 8, True, True, None),  # K3 (dense MLA): as before
+        (False, 16, 1, 8, True, True, None),
+        (False, 8, 8, 8, True, True, None),
+        (False, 16, 16, 1, True, True, "no prepared providers above 64 rows"),
+        (False, 16, 16, 8, False, True, "no prepared providers above 64 rows"),
+        (False, 16, 16, 8, True, False, "sequence parallelism"),
     ],
 )
-def test_wide_rows_gate(dsa, tp, dcp, q, rubin, seams, wide):
+def test_wide_gate(dsa, tp, dcp, q, rubin, seams, why):
     """Verify graphs above 64 rows run the specialized decode on Rubin without
-    sequence parallelism; with K3.1's DSA layers only at TP16 = DCP16."""
-    captured = captured_rows(DL7, q, 256)
-    rows = wide_rows(captured, q, rubin=rubin, seams=seams, dsa=dsa, tp=tp, dcp=dcp)
-    assert rows == (tuple(m for m in captured if m > 64) if wide else ())
+    sequence parallelism; with K3.1's DSA layers only at TP16 = DCP16. Otherwise the
+    gate names the reason the coverage log prints."""
+    assert wide_gate(q, rubin=rubin, seams=seams, dsa=dsa, tp=tp, dcp=dcp) == why
 
 
 def test_wide_rows_of_the_recipes():
     """K3.1's decode role takes every captured verify graph above 64 rows: DL7's 24
-    (72-256 rows) and DL3 cap-128's 65 (68-512 rows, 24 of them above 256)."""
-    k31 = dict(rubin=True, seams=True, dsa=True, tp=16, dcp=16)
-    assert wide_rows(captured_rows(DL7, 8, 256), 8, **k31) == tuple(range(72, 257, 8))
-    dl3 = wide_rows(captured_rows(DL3, 4, 512), 4, **k31)
+    (72-256 rows), C48's 38 (q4 on the base tree, 68-256) and DL3 cap-128's 65
+    (68-512 rows, 24 of them above 256)."""
+    assert wide_rows(captured_rows(DL7, 8, 256), 8) == tuple(range(72, 257, 8))
+    c48 = wide_rows(captured_rows(DL3_CAP64, 4, 256), 4)
+    assert (len(c48), c48[0], c48[-1]) == (38, 68, 256)
+    dl3 = wide_rows(captured_rows(DL3, 4, 512), 4)
     assert (len(dl3), dl3[0], dl3[-1], sum(m > 256 for m in dl3)) == (65, 68, 512, 24)
+
+
+class Built(Exception):
+    """Stops a constructor under test once the part the test checks has run."""
+
+
+@pytest.mark.parametrize(
+    "cc,sp,dsa,tp,dcp,wide",
+    [
+        ((10, 7), False, True, 16, 16, True),  # K3.1's decode role
+        ((10, 7), False, True, 16, 1, False),
+        ((10, 7), False, True, 8, 8, False),
+        ((10, 3), False, True, 16, 16, False),  # GB300
+        ((10, 7), True, True, 16, 16, False),
+        ((10, 7), False, False, 8, 8, True),  # K3
+    ],
+)
+def test_decode_reads_the_gate_from_the_deployment(
+    monkeypatch, cc, sp, dsa, tp, dcp, wide
+):
+    """SpecializedDecode gates its wide rows on the device, the backbone's sequence
+    parallelism and DSA layers, the TP group and the deployment's DCP; every decode
+    buffer then holds the largest wide row (64 without)."""
+    group = SimpleNamespace(world_size=tp, rank_in_group=0, device_group=None)
+    platform = SimpleNamespace(current_device=lambda: "cuda:0")
+    device = SimpleNamespace(major=cc[0], minor=cc[1], multi_processor_count=212)
+    monkeypatch.setattr(decode_module, "get_tp_group", lambda: group)
+    monkeypatch.setattr(decode_module, "current_platform", platform)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda index: device)
+    monkeypatch.setattr(decode_module, "Context", MagicMock(side_effect=Built))
+    text = SimpleNamespace(dsa_config=SimpleNamespace() if dsa else None)
+    backbone = SimpleNamespace(config=text, use_sequence_parallel=sp)
+    config = DecodeConfig(
+        max_context=1 << 20, mla_core="auto", dsa_core="auto", dcp=dcp, q=8,
+        capture_sizes=DL7, captured=captured_rows(DL7, 8, 256),
+    )  # fmt: skip
+    decode: Any = object.__new__(SpecializedDecode)
+    with pytest.raises(Built):
+        SpecializedDecode.__init__(decode, backbone, config)
+    assert decode.wide == (tuple(range(72, 257, 8)) if wide else ())
+    assert (decode.wide_off is None) == wide
+    assert decode.capacity == (256 if wide else 64)
+
+
+@pytest.mark.parametrize("dsa", [True, False], ids=["k31-tp8", "k3-table-miss"])
+def test_coverage_names_why_wide_rows_run_stock(dsa):
+    """Captured rows above 64 that run the stock forward name the cause: K3.1's TP16 =
+    DCP16 gate, or a WIDE_ROWS miss."""
+    decode: Any = object.__new__(SpecializedDecode)
+    decode.q, decode.captured = 8, (64, 72, 256)
+    decode.batches, decode.wide = (64,), ()
+    decode.choices = lambda b, q: {}
+    decode.wide_off = wide_gate(8, rubin=True, seams=True, dsa=dsa, tp=8, dcp=8)
+    why = "DSA wide steps need TP16 = DCP16" if dsa else "not in WIDE_ROWS"
+    assert decode.plan_coverage().reasons == {72: why, 256: why}
 
 
 class Linear(torch.nn.Module):
@@ -240,6 +311,34 @@ def test_dsa_seam_refuses_other_layers(target, name, value, pitch, reason):
         setattr(getattr(attention, target), name, value)
     with pytest.raises(ValueError, match=reason):
         dsa_seam_columns(attention, pitch)
+
+
+@pytest.mark.parametrize("wide", [(72, 256), ()], ids=["wide", "tuned-only"])
+@pytest.mark.parametrize("skip_topk", [False, True], ids=["k31", "shared-topk"])
+def test_attention_checks_the_dsa_seam_at_startup(monkeypatch, wide, skip_topk):
+    """A DSA layer's provider takes seam S2-DSA's column split when it is built with
+    wide rows, so a layer the seam does not reproduce fails at startup; without wide
+    rows (K3.1 off TP16 = DCP16) it needs no seam and builds as before."""
+    attention, _ = dsa_layer(fused_insert=True)
+    attention.mla_attn.skip_topk = skip_topk
+    device = SimpleNamespace(multi_processor_count=212)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda index: device)
+    for name in ("PreparedProjection", "SkinnyProjection", "dsa_scratch"):
+        monkeypatch.setattr(providers_module, name, MagicMock())
+    monkeypatch.setattr(providers_module, "PreparedDsa", MagicMock(side_effect=Built))
+    runtime = SimpleNamespace(
+        tp=16, dcp=1, q=8, tuned=BATCHES, batches=(*BATCHES, *wide), wide=wide,
+        queries=(1, 8), dsa_core="auto", dsa_layers=0,
+    )  # fmt: skip
+    provider: Any = object.__new__(Attention)
+    decoder = SimpleNamespace(self_attn=attention)
+    if wide and skip_topk:
+        with pytest.raises(ValueError, match="top-k shared"):
+            Attention.__init__(provider, decoder, runtime, None, None, None)
+        return
+    with pytest.raises(Built):  # past the DSA branch's checks, at PreparedDsa
+        Attention.__init__(provider, decoder, runtime, None, None, None)
+    assert provider.dsa_columns == (COLUMNS if wide else ())
 
 
 @pytest.mark.parametrize("fused_oproj", [True, False], ids=["two-shot", "stock-oproj"])
