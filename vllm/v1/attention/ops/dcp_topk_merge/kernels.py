@@ -2306,7 +2306,7 @@ def _publish_round1(
         local_idx = deep_select_topk(logits, local_topk, end=row_ends)
         _DCP_TOPK_PACK_KERNEL(logits, local_idx, None, row_ends, mailbox)
     else:
-        _DCP_TOPK_PACK_KERNEL(logits, None, packed, row_ends, mailbox)
+        _DCP_TOPK_PACK_KERNEL(logits, None, packed.contiguous(), row_ends, mailbox)
     return mailbox.gathered[:, :num_rows]
 
 

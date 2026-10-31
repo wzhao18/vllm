@@ -196,9 +196,10 @@ def _init_rescue(vllm_config: Any, topk: int, local_topk: int) -> int:
         )
     logger.info_once(
         "DSA DCP top-k merge: exact one-round merge of each rank's local "
-        "top-%d (rescue workspace for %d rows; round 1 by %s).",
+        "top-%d (rescue workspace for %d rows).",
         local_topk,
         max_rows,
-        "multicast mailbox" if mailbox else "all-gather",
     )
+    if mailbox:
+        logger.info_once("DSA DCP top-k merge: round 1 by multicast mailbox.")
     return local_topk
