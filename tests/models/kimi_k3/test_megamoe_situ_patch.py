@@ -6,7 +6,10 @@ CPU: the patch applies to the installed DeepGEMM header and the overlay mirrors
 the include tree. GPU (>= 2 SM100-family GPUs, DeepGEMM): the patched kernel is
 bitwise identical to the stock kernel and matches a PyTorch reference of the
 K3.1 routed experts (MXFP8 x MXFP4, SiTU alpha 4 / beta 25, FP8 L1 output) on
-EP-sharded problems with random top-16 routing.
+EP-sharded problems with random top-16 routing. Two shapes: 4 experts per rank
+at 1/7/64 tokens per rank (every expert is hit), and 28 experts per rank (the EP32
+per-rank work) at 4/128/224 tokens per rank: at 4 tokens most experts receive no
+token (the K31_SKIP_ZERO_SEND path), and 128/224 tokens select BLOCK_M > 64.
 """
 
 import importlib
@@ -137,7 +140,7 @@ def _reference(xq, idx, tw, w1, w2):
     return y
 
 
-def _worker(rank: int, nranks: int, port: int, cache: str, out: dict):
+def _worker(rank: int, nranks: int, port: int, cache: str, epr: int, cases: tuple, out: dict):
     import torch.distributed as dist
 
     from vllm.models.kimi_k3.nvidia.megamoe import install_patched_header
@@ -150,7 +153,6 @@ def _worker(rank: int, nranks: int, port: int, cache: str, out: dict):
     group = dist.new_group(list(range(nranks)))
     dg = _deep_gemm()
     utils = importlib.import_module(dg.__name__ + ".utils")
-    epr = 4
     num_experts = epr * nranks
     g = torch.Generator(device="cuda").manual_seed(1234)  # same weights on every rank
 
@@ -170,7 +172,6 @@ def _worker(rank: int, nranks: int, port: int, cache: str, out: dict):
     l2, w2_ref = cast(HIDDEN, INTER)
     l1, l2 = dg.transform_weights_for_mega_moe(l1, l2, activation="situ")
 
-    cases = (1, 7, 64)
     buf = dg.get_symm_buffer_for_mega_moe(group, num_experts, max(cases), TOPK, HIDDEN, INTER,
                                           mma_type="fp8xfp4", activation="situ")
     data = {}
@@ -181,6 +182,16 @@ def _worker(rank: int, nranks: int, port: int, cache: str, out: dict):
         tw = torch.rand((t, TOPK), device="cuda", generator=gr) + 0.1
         tw = tw / tw.sum(-1, keepdim=True)
         data[t] = (x, idx, tw)
+    # Coverage of the shapes this test claims: experts with no token (skip-zero send) and BLOCK_M.
+    zero_experts = {}
+    for t in cases:
+        allidx = [torch.empty_like(data[t][1]) for _ in range(nranks)]
+        dist.all_gather(allidx, data[t][1], group=group)
+        hits = torch.bincount(torch.cat(allidx).flatten(), minlength=num_experts)
+        zero_experts[t] = int((hits == 0).sum())
+    block_m = {t: (dg.get_block_m_for_mega_moe(nranks, num_experts, buf.num_max_tokens_per_rank, t, TOPK,
+                                               "fp8xfp4") if hasattr(dg, "get_block_m_for_mega_moe") else None)
+               for t in cases}
 
     def run(t):
         x, idx, tw = data[t]
@@ -208,15 +219,18 @@ def _worker(rank: int, nranks: int, port: int, cache: str, out: dict):
         xq = xq[0].float() * xq[1].repeat_interleave(32, dim=-1)
         ref = _reference(xq, idx, tw, w1_ref, w2_ref)
         err = (patched[t].float() - ref).norm() / ref.norm()
-        print(f"rank {rank} tokens {t}: patched == stock bitwise, rel. L2 error vs reference {float(err):.2e}")
+        print(f"rank {rank} experts/rank {epr} tokens {t} block_m {block_m[t]} zero-token experts "
+              f"{zero_experts[t]}/{num_experts}: patched == stock bitwise, rel. L2 error vs reference "
+              f"{float(err):.2e}")
         assert err < 2e-2, (rank, t, float(err))
-        out[(rank, t)] = float(err)
+        out[(rank, t)] = (float(err), zero_experts[t], block_m[t])
     buf.destroy()
     dist.destroy_process_group()
 
 
 @pytest.mark.skipif(not _gpu_ok(), reason="needs >= 2 SM100-family GPUs and DeepGEMM")
-def test_patched_kernel_bitwise_and_reference(tmp_path):
+@pytest.mark.parametrize("epr,cases", [(4, (1, 7, 64)), (28, (4, 128, 224))], ids=["e4", "e28"])
+def test_patched_kernel_bitwise_and_reference(tmp_path, epr, cases):
     nranks = min(4, torch.cuda.device_count())
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -224,6 +238,11 @@ def test_patched_kernel_bitwise_and_reference(tmp_path):
     os.environ.setdefault("VLLM_CACHE_ROOT", str(tmp_path / "vllm_cache"))
     mgr = torch.multiprocessing.Manager()
     out = mgr.dict()
-    torch.multiprocessing.spawn(_worker, args=(nranks, port, str(tmp_path / "cache"), out),
+    torch.multiprocessing.spawn(_worker, args=(nranks, port, str(tmp_path / "cache"), epr, cases, out),
                                 nprocs=nranks)
-    assert len(out) == nranks * 3
+    assert len(out) == nranks * len(cases)
+    if epr == 28:
+        # the small case leaves experts without tokens; the large ones run BLOCK_M > 64
+        assert out[(0, cases[0])][1] > 0
+        bms = [out[(0, t)][2] for t in cases[1:]]
+        assert None in bms or max(bms) > 64, bms
