@@ -1661,11 +1661,22 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 )
 
             decode_indices = None
+            # The varlen kernel localizes the expanded bounds itself (and writes
+            # the global ones it localizes) when no compression follows.
+            localize_in_kernel = (
+                self.supports_varlen
+                and dcp_local_seq_lens is not None
+                and self.dcp_world_size > 1
+                and self.compress_ratio == 1
+            )
             if self.supports_varlen:
                 from vllm.v1.attention.ops.metadata import (
                     _indexer_decode_metadata_kernel,
                 )
 
+                write_global = (
+                    global_seq_lens_for_decode is not None and max_decode_len > 1
+                )
                 capacity = self.decode_seq_lens_buffer.numel()
                 grid = max(
                     num_decodes,
@@ -1680,11 +1691,16 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     self.decode_lens_buffer,
                     self.decode_indices_buffer,
                     self.per_req_decode_lens_buffer,
+                    self.global_decode_seq_lens_buffer,
                     num_decodes,
                     num_decode_tokens,
                     capacity,
                     block_table.stride(0),
                     self.expanded_block_table_buffer.stride(0),
+                    self.dcp_world_size if localize_in_kernel else 1,
+                    self.dcp_rank,
+                    self.cp_kv_cache_interleave_size,
+                    int(write_global and localize_in_kernel),
                     BLOCK_COLS=block_table.shape[1],
                     num_warps=4,
                 )
@@ -1693,10 +1709,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 decode_lens = self.decode_lens_buffer[:num_decode_tokens]
                 decode_indices = self.decode_indices_buffer[:num_decode_tokens]
                 requires_padding = False
-                if global_seq_lens_for_decode is not None and max_decode_len > 1:
-                    self.global_decode_seq_lens_buffer[:num_decode_tokens].copy_(
-                        seq_lens
-                    )
+                if write_global:
+                    if not localize_in_kernel:
+                        self.global_decode_seq_lens_buffer[:num_decode_tokens].copy_(
+                            seq_lens
+                        )
                     global_seq_lens_for_decode = self.global_decode_seq_lens_buffer[
                         :num_decode_tokens
                     ]
@@ -1725,7 +1742,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             # DCP: localize the now-expanded per-token global bounds to this
             # rank's owned KV. Done here (after expansion) so each token's global
             # causal length is localized individually; see the comment above.
-            if dcp_local_seq_lens is not None:
+            if dcp_local_seq_lens is not None and not localize_in_kernel:
                 seq_lens = self._dcp_localize_decode_seq_lens(
                     seq_lens, num_decodes, seq_lens_is_buffer_view
                 )

@@ -51,6 +51,21 @@ def compute_token_to_req_indices(
     return out[:num_tokens]
 
 
+@triton.jit
+def _floor_div(a, b):
+    """Python (and torch) floor division by a positive ``b``."""
+    q = a // b
+    return tl.where((q * b != a) & (a < 0), q - 1, q)
+
+
+@triton.jit
+def _dcp_local_seq_len(length, dcp_size, dcp_rank, interleave):
+    """get_dcp_local_seq_lens of one length, op for op."""
+    base = _floor_div(_floor_div(length, interleave), dcp_size) * interleave
+    rem = length - base * dcp_size - dcp_rank * interleave
+    return base + tl.minimum(tl.maximum(rem, 0), interleave)
+
+
 @triton.jit(
     do_not_specialize=[
         "num_reqs",
@@ -58,6 +73,10 @@ def compute_token_to_req_indices(
         "capacity",
         "input_stride",
         "output_stride",
+        "dcp_size",
+        "dcp_rank",
+        "interleave",
+        "write_global",
     ]
 )
 def _indexer_decode_metadata_kernel(
@@ -69,13 +88,21 @@ def _indexer_decode_metadata_kernel(
     decode_lens,
     indices,
     per_req_lens,
+    global_seq_lens,
     num_reqs,
     num_tokens,
     capacity,
     input_stride,
     output_stride,
+    dcp_size,
+    dcp_rank,
+    interleave,
+    write_global,
     BLOCK_COLS: tl.constexpr,
 ):
+    """With ``dcp_size > 1``, ``output_seq_lens`` holds each token's causal
+    length localized to this DCP rank and, when ``write_global`` is set,
+    ``global_seq_lens`` the global one."""
     token = tl.program_id(0)
     cols = tl.arange(0, triton.next_power_of_2(BLOCK_COLS))
     actual_tokens = tl.load(query_start_loc + num_reqs)
@@ -87,6 +114,10 @@ def _indexer_decode_metadata_kernel(
         end = tl.load(query_start_loc + req + 1)
         seq = tl.load(seq_lens + req)
         length = tl.where(valid, seq - (end - start) + token - start + 1, 0)
+        if write_global:
+            tl.store(global_seq_lens + token, length)
+        if dcp_size > 1:
+            length = _dcp_local_seq_len(length, dcp_size, dcp_rank, interleave)
         tl.store(output_seq_lens + token, length)
         tl.store(decode_lens + token, 1)
         tl.store(

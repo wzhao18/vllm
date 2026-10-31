@@ -128,9 +128,9 @@ def test_fused_indexer_decode_metadata(query_lens, padding):
     ]
     out_bt = torch.full((capacity, 69), -99, device=device, dtype=torch.int32)
     outputs = [
-        torch.full((capacity,), -99, device=device, dtype=torch.int32) for _ in range(4)
+        torch.full((capacity,), -99, device=device, dtype=torch.int32) for _ in range(5)
     ]
-    out_seq, out_lens, indices, per_req = outputs
+    out_seq, out_lens, indices, per_req, global_seq = outputs
     grid = max(reqs, tokens + (capacity - tokens + 255) // 256)
     _indexer_decode_metadata_kernel[(grid,)](
         qsl,
@@ -141,11 +141,16 @@ def test_fused_indexer_decode_metadata(query_lens, padding):
         out_lens,
         indices,
         per_req,
+        global_seq,
         reqs,
         tokens,
         capacity,
         bt.stride(0),
         out_bt.stride(0),
+        1,
+        0,
+        1,
+        0,
         BLOCK_COLS=bt.shape[1],
         num_warps=4,
     )
@@ -164,6 +169,7 @@ def test_fused_indexer_decode_metadata(query_lens, padding):
     )
     assert torch.all(out_lens[:tokens] == 1)
     torch.testing.assert_close(per_req[:reqs], lengths)
+    assert torch.all(global_seq == -99)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

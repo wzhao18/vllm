@@ -443,6 +443,274 @@ def test_get_dcp_local_seq_lens_must_run_after_decode_expansion():
     )
 
 
+def _run_decode_metadata_kernel(
+    outputs, qsl, seq_lens, block_table, num_tokens, dcp=(1, 0, 1), write_global=0
+):
+    from vllm.v1.attention.ops.metadata import _indexer_decode_metadata_kernel
+
+    out_seq, out_bt, out_lens, indices, per_req, global_seq = outputs
+    num_reqs = block_table.shape[0]
+    capacity = out_seq.numel()
+    _indexer_decode_metadata_kernel[
+        (max(num_reqs, num_tokens + (capacity - num_tokens + 255) // 256),)
+    ](
+        qsl,
+        seq_lens,
+        block_table,
+        out_seq,
+        out_bt,
+        out_lens,
+        indices,
+        per_req,
+        global_seq,
+        num_reqs,
+        num_tokens,
+        capacity,
+        block_table.stride(0),
+        out_bt.stride(0),
+        *dcp,
+        write_global,
+        BLOCK_COLS=block_table.shape[1],
+        num_warps=4,
+    )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@pytest.mark.parametrize("world", [8, 16])
+@pytest.mark.parametrize("interleave", [1, 1024])
+def test_indexer_decode_metadata_kernel_localizes_like_torch(world, interleave):
+    """The decode metadata kernel's DCP localization equals the unlocalized
+    kernel followed by get_dcp_local_seq_lens, bit for bit and on every rank:
+    graph padding and negative bounds (a sequence shorter than its query)
+    included; the global bounds land where the old copy put them."""
+    device = torch.device("cuda")
+    gen = torch.Generator().manual_seed(world + interleave)
+    query_lens = [8, 8, 3, 8, 1, 8, 8, 0, 0]
+    seq_lens = [1_100_000, 1, 7, 1024 * world + 5, 1, 9, 65536, 0, 0]
+    qsl = torch.zeros(len(query_lens) + 1, dtype=torch.int32)
+    qsl[1:] = torch.tensor(query_lens).cumsum(0)
+    num_tokens = int(qsl[-1]) + 5
+    qsl = qsl.to(device)
+    seq = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+    block_table = torch.randint(
+        0, 1 << 20, (len(query_lens), 72), generator=gen, dtype=torch.int32
+    ).to(device)[:, :65]
+    capacity = 600
+
+    def outputs():
+        torch.manual_seed(0)
+        return [
+            torch.randint(-(1 << 30), 1 << 30, shape, dtype=torch.int32, device=device)
+            for shape in [
+                (capacity,),
+                (num_tokens, 69),
+                (capacity,),
+                (capacity,),
+                (capacity,),
+                (capacity,),
+            ]
+        ]
+
+    for rank in range(world):
+        for write_global in (0, 1):
+            fused, ref = outputs(), outputs()
+            _run_decode_metadata_kernel(
+                fused,
+                qsl,
+                seq,
+                block_table,
+                num_tokens,
+                (world, rank, interleave),
+                write_global,
+            )
+            _run_decode_metadata_kernel(ref, qsl, seq, block_table, num_tokens)
+            ref_seq = ref[0][:num_tokens]
+            assert (ref_seq < 0).any()
+            if write_global:
+                ref[5][:num_tokens].copy_(ref_seq)
+            ref_seq.copy_(
+                get_dcp_local_seq_lens(
+                    ref_seq,
+                    world,
+                    torch.tensor(rank, dtype=torch.int32, device=device),
+                    interleave,
+                )
+            )
+            for got, want in zip(fused, ref):
+                assert torch.equal(got, want)
+
+
+def _varlen_dcp_indexer_builder(monkeypatch, world: int, rank: int, interleave: int):
+    from types import SimpleNamespace
+
+    from vllm.v1.attention.backends.mla import indexer as indexer_module
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+    monkeypatch.setattr(
+        indexer_module, "get_dcp_group", lambda: SimpleNamespace(rank_in_group=rank)
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=1 << 20),
+        scheduler_config=SimpleNamespace(max_num_seqs=32, max_num_batched_tokens=8192),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=world,
+            prefill_context_parallel_size=1,
+            cp_kv_cache_interleave_size=interleave,
+        ),
+        attention_config=SimpleNamespace(
+            sparse_mla_prefill_workspace_factor=5,
+            resolve_indexer_kv_dtype=lambda default: default,
+        ),
+        speculative_config=SimpleNamespace(
+            num_speculative_tokens=7, enable_adaptive_verification=False
+        ),
+        num_speculative_tokens=7,
+    )
+    spec = MLAAttentionSpec(
+        block_size=64, num_kv_heads=1, head_size=132, dtype=torch.uint8
+    )
+    builder = indexer_module.DeepseekV32IndexerMetadataBuilder(
+        spec, ["indexer"], config, torch.device("cuda"), block_table_width=1040
+    )
+    assert builder.supports_varlen and builder.dcp_rank == rank
+    builder.scheduler_metadata_buffer.fill_(-7)
+    return builder
+
+
+def _unfused_varlen_dcp_decode(builder, common) -> int:
+    """The varlen DCP decode metadata as built before the kernel localized it:
+    the global bounds, their copy, get_dcp_local_seq_lens over the expanded
+    bounds and the schedule copied into its buffer. Returns its rows."""
+    from vllm.v1.attention.backends.mla.indexer import get_paged_mqa_logits_metadata
+
+    num_decodes, num_tokens = common.num_reqs, common.num_actual_tokens
+    outputs = [
+        builder.decode_seq_lens_buffer,
+        builder.expanded_block_table_buffer,
+        builder.decode_lens_buffer,
+        builder.decode_indices_buffer,
+        builder.per_req_decode_lens_buffer,
+        builder.global_decode_seq_lens_buffer,
+    ]
+    _run_decode_metadata_kernel(
+        outputs,
+        common.query_start_loc,
+        common.seq_lens[:num_decodes],
+        common.block_table_tensor[:num_decodes],
+        num_tokens,
+    )
+    seq_lens = builder.decode_seq_lens_buffer[:num_tokens]
+    if int(torch.diff(common.query_start_loc_cpu).max()) > 1:
+        builder.global_decode_seq_lens_buffer[:num_tokens].copy_(seq_lens)
+    seq_lens = builder._dcp_localize_decode_seq_lens(seq_lens, num_decodes, True)
+    metadata = get_paged_mqa_logits_metadata(
+        seq_lens.unsqueeze(-1),
+        builder.kv_cache_spec.num_states,
+        builder.num_sms,
+        indices=builder.decode_indices_buffer[:num_tokens],
+    )
+    builder.scheduler_metadata_buffer[: metadata.shape[0]] = metadata
+    return metadata.shape[0]
+
+
+def _decode_steps(world: int, gen: torch.Generator):
+    """(query lens, seq lens, padded requests, padded tokens) of decode steps:
+    q8 batches of 1-8 requests (M8-M64), graph padding, mixed and q1 rows."""
+    long = [1_100_000, 1 << 20, 65536 * world + 1, 1024 * world, 1024 * world - 1]
+    short = [8, 9, 15, 16, 17, 1023, 1024, 1025]
+    for num_reqs in range(1, 9):
+        seqs = torch.randint(8, 1_100_001, (num_reqs,), generator=gen).tolist()
+        yield [8] * num_reqs, seqs, 0, 0
+    yield [8] * 5, long, 0, 0
+    yield [8] * 8, short, 0, 0
+    yield [8] * 3, long[:3], 1, 0
+    yield [8] * 6, short[:6], 2, 8
+    yield [8, 3, 8, 1, 8], [40, 3, 1 << 20, 1, 65537], 3, 5
+    yield [1] * 4, [1, 2, 1024, 1_100_000], 0, 4
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@pytest.mark.parametrize("world", [8, 16])
+@pytest.mark.parametrize("interleave", [1, 1024])
+def test_varlen_dcp_decode_build_matches_unfused_metadata(
+    monkeypatch, world, interleave
+):
+    """Folding the DCP localization (and the global bounds' copy) into the
+    varlen decode metadata kernel leaves every decode buffer of the build bit
+    for bit as the unfused ops left it, over the buffers' whole capacity and
+    across steps, on every rank, and the metadata views the same addresses."""
+    from vllm.v1.attention.backend import CommonAttentionMetadata
+    from vllm.v1.attention.backends.mla import indexer as indexer_module
+
+    if not indexer_module._supports_varlen_paged_mqa_logits():
+        pytest.skip("requires DeepGEMM's varlen paged MQA logits (SM100 family)")
+
+    device = torch.device("cuda")
+    names = [
+        "decode_seq_lens_buffer",
+        "global_decode_seq_lens_buffer",
+        "expanded_block_table_buffer",
+        "decode_lens_buffer",
+        "decode_indices_buffer",
+        "per_req_decode_lens_buffer",
+        "scheduler_metadata_buffer",
+    ]
+    for rank in range(world):
+        fused = _varlen_dcp_indexer_builder(monkeypatch, world, rank, interleave)
+        ref = _varlen_dcp_indexer_builder(monkeypatch, world, rank, interleave)
+        gen = torch.Generator().manual_seed(rank)
+        for query_lens, seq_lens, pad_reqs, pad_tokens in _decode_steps(world, gen):
+            query_lens = query_lens + [0] * pad_reqs
+            qsl = torch.zeros(len(query_lens) + 1, dtype=torch.int32)
+            qsl[1:] = torch.tensor(query_lens).cumsum(0)
+            seq = torch.tensor(seq_lens + [0] * pad_reqs, dtype=torch.int32)
+            num_reqs, num_tokens = len(query_lens), int(qsl[-1]) + pad_tokens
+            common = CommonAttentionMetadata(
+                query_start_loc=qsl.to(device),
+                query_start_loc_cpu=qsl,
+                seq_lens=seq.to(device),
+                seq_lens_cpu_upper_bound=seq,
+                num_reqs=num_reqs,
+                num_actual_tokens=num_tokens,
+                max_query_len=max(query_lens),
+                max_seq_len=max(seq_lens),
+                block_table_tensor=torch.randint(
+                    0, 1 << 24, (num_reqs, 1040), generator=gen, dtype=torch.int32
+                ).to(device),
+                slot_mapping=torch.arange(num_tokens, device=device),
+                dcp_local_seq_lens=get_dcp_local_seq_lens(
+                    seq.to(device), world, rank, interleave
+                ),
+            )
+            decode = fused.build(0, common).decode
+            rows = _unfused_varlen_dcp_decode(ref, common)
+            for name in names:
+                assert torch.equal(getattr(fused, name), getattr(ref, name)), name
+            assert decode is not None
+            assert decode.seq_lens.shape == (num_tokens, 1)
+            assert decode.seq_lens.data_ptr() == fused.decode_seq_lens_buffer.data_ptr()
+            assert decode.schedule_metadata.shape == (rows, 2)
+            assert (
+                decode.schedule_metadata.data_ptr()
+                == fused.scheduler_metadata_buffer.data_ptr()
+            )
+            assert decode.global_seq_lens is not None
+            if max(query_lens) > 1:
+                assert decode.global_seq_lens.shape == (num_tokens,)
+                global_ptr = fused.global_decode_seq_lens_buffer.data_ptr()
+            else:
+                assert decode.global_seq_lens.shape == (num_reqs,)
+                global_ptr = common.seq_lens.data_ptr()
+            assert decode.global_seq_lens.data_ptr() == global_ptr
+            for view, buffer in [
+                (decode.block_table, fused.expanded_block_table_buffer),
+                (decode.decode_lens, fused.decode_lens_buffer),
+                (decode.indices, fused.decode_indices_buffer),
+                (decode.per_req_decode_lens, fused.per_req_decode_lens_buffer),
+            ]:
+                assert view is not None and view.data_ptr() == buffer.data_ptr()
+
+
 @pytest.mark.parametrize("interleave", [1, 2])
 def test_sparse_dcp_attention_matches_global_topk_attention(interleave: int):
     torch.manual_seed(0)
