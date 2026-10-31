@@ -66,10 +66,20 @@ HEAD_MULTI = {8: "16:1", 4: "8:1"}
 # (64, 8, 4, 12): -0.8 cold, -0.66 warm (without the carve-out: +1.0). Split 7 sums the
 # FP32 partials over K/7 in rank order (an accumulation reorder of split 4). Skinny
 # B1/B2 tactics by rows on those devices: 8 outputs per CTA at B1; the KDA rows run B2
-# on split-K.
-WIDE_B8 = {3216: (64, 8, 2, 12), 2880: (128, 8, 7, 12, 15, None, 4)}
-# Preferred shared-memory carve-out of the AttnRes before an MLA layer whose input
-# projection runs SplitKTmemGemm (its ~220 KB CTAs then fit beside the AttnRes CTAs).
+# on split-K. The K3.1 DSA rows (3040: 24 M tiles) split K by 4 (96 CTAs, 11 ring
+# stages): split 7's 168 CTAs fill all 24 clusters of 7 Rubin co-schedules, and behind
+# the MoE tail some become resident late. 1-GPU DSA chain (MoE-tail stand-in releasing
+# at entry -> carve-out-100 AttnRes -> in-projection -> consumer, cold weights), us per
+# layer at B8 (p10-p90): split 4 12.00 (11.96-12.05), split 7 12.56 (12.24-12.89),
+# (64, 8, 4, 8) 15.87, with the B8 next-attention prefetch 17.37.
+WIDE_B8 = {
+    3216: (64, 8, 2, 12),
+    2880: (128, 8, 7, 12, 15, None, 4),
+    3040: (128, 8, 4, 11, 15, None, 4),
+}
+# Preferred shared-memory carve-out of the AttnRes before an MLA or DSA layer whose
+# input projection runs SplitKTmemGemm (its ~220 KB CTAs then fit beside the AttnRes
+# CTAs).
 MLA_BEFORE_CARVEOUT = 100
 # Preferred shared-memory carve-out of the AttnRes before a KdaHead layer: at the
 # driver default its small-smem CTAs leave their ~56 SMs in a 32 KB configuration,
@@ -106,15 +116,26 @@ KDA_FOLD64: dict[int, str] = {16: "32:1,64:1"}
 # per call at 16 / 24 / 32 rows vs today's (64, 16, 2, 10) / (64, 32, 2, 8)): KDA 3.84 /
 # 3.88 / 3.97 vs 4.86 / 5.68 / 5.71, MLA 3.69 / 3.71 / 3.82 vs 4.64 / 5.64 / 5.72; the
 # 8-row bin keeps its tactics (KDA 4.44 vs 6.34, MLA 2.24 vs 5.47). Sums the split
-# partials in rank order (an FP32 accumulation reorder of split 2).
-WIDE_B64 = {3216: (128, 64, 6, 14, 14), 2880: (128, 64, 7, 16, 14)}
+# partials in rank order (an FP32 accumulation reorder of split 2). The DSA rows (24
+# tiles) take KDA's split 6 (144 CTAs; the DSA chain of WIDE_B8, us per layer at
+# M40 / M48 / M64: 18.10 / 18.14 / 18.83, split 7 18.27 / 18.33 / 19.62 with a slow
+# mode, (64, 64, 2, 6) 20.22 / 20.17 / 20.86).
+WIDE_B64 = {
+    3216: (128, 64, 6, 14, 14),
+    2880: (128, 64, 7, 16, 14),
+    3040: (128, 64, 6, 14, 14),
+}
 # Devices with more SMs than GB300's 152 (Rubin), TP16 MLA rows, 9-32 verify rows: the
 # WIDE_B8 kernel (SplitKTmemGemm: 15 tensor-memory tiles, a dedicated owner mailbox, no
 # cluster barrier before the reduce-scatter) with 16 / 32 token columns instead of the
 # 64-column WIDE_B64 kernel, with the ring stages that fit beside three AttnRes CTAs
 # (217 / 207 KB, carve-out 100). Same split-7 K slices and rank-order sums as WIDE_B64.
+# The DSA rows (the DSA chain of WIDE_B8, us per layer): split 4 at 9-16 rows (M16
+# 15.19, split 7 15.80, (64, 16, 2, 10) 16.34); 17-32 rows keep split-K (M24 / M32 18.00
+# / 18.17; split 7 18.41 / 16.98 with a slow mode, KDA's WIDE_B64 18.16 / 18.07).
 WIDE_B16_32 = {
-    2880: {16: (128, 16, 7, 10, 15, None, 4), 32: (128, 32, 7, 6, 15, None, 4)}
+    2880: {16: (128, 16, 7, 10, 15, None, 4), 32: (128, 32, 7, 6, 15, None, 4)},
+    3040: {16: (128, 16, 4, 8, 15, None, 4), 32: (64, 32, 2, 8)},
 }
 # Devices with more SMs than GB300's 152 (Rubin), TP16 verify rows above the 64-row
 # bin, by in-projection rows (KDA 3216, MLA 2880): SplitKTmemGemm64 with one N tile of
@@ -296,9 +317,9 @@ class Attention:
         self.head_index = -1  # this layer's KdaHead index (its polled output buffer)
         # The preceding AttnRes's preferred shared-memory carve-out (None: default).
         self.before_carveout = None
-        # MLA batches whose in-projection stages its weights in tensor memory.
+        # MLA / DSA batches whose in-projection stages its weights in tensor memory.
         self.tmem_batches = ()
-        if kind == "mla" and any(len(t) > 4 for t in policies.values()):
+        if kind in ("mla", "dsa") and any(len(t) > 4 for t in policies.values()):
             self.before_carveout = MLA_BEFORE_CARVEOUT
             self.tmem_batches = tuple(b for b, t in policies.items() if len(t) > 4)
         if kind == "kda" and any(len(t) > 4 for t in policies.values()):

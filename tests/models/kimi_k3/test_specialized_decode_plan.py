@@ -479,6 +479,157 @@ def test_wide_choices_name_the_dsa_seam():
         assert "mla" not in choices
 
 
+# Rubin TP16 in-projection tactics by row bin (WIDE_B8, WIDE_B16_32, WIDE_B64): the
+# DSA rows' and MLA's, and the split-K ones the DSA rows ran before.
+DSA = {
+    8: (128, 8, 4, 11, 15, None, 4),
+    16: (128, 16, 4, 8, 15, None, 4),
+    32: (64, 32, 2, 8),
+    64: (128, 64, 6, 14, 14),
+}
+MLA = {
+    8: (128, 8, 7, 12, 15, None, 4),
+    16: (128, 16, 7, 10, 15, None, 4),
+    32: (128, 32, 7, 6, 15, None, 4),
+    64: (128, 64, 7, 16, 14),
+}
+SPLIT_K = {
+    8: (64, 8, 4, 8),
+    16: (64, 16, 2, 10),
+    32: (64, 32, 2, 8),
+    64: (64, 64, 2, 6),
+}
+DL7_TUNED = (*range(1, 9), 16, 24, 32, 40, 48, 56, 64)  # DL7's tuned decode rows
+
+
+def row_bin(rows):
+    return next(b for b in DSA if rows <= b)
+
+
+def test_dsa_in_projection_takes_the_tensor_memory_tactics():
+    """Rubin TP16: the DSA in-projection (3040 rows, 24 M tiles) stages its weights in
+    tensor memory at up to 16 rows (split 4) and 33-64 rows (split 6), and keeps split-K
+    at 17-32 rows, above 64 (F5) and on GB300; the KDA and MLA rows keep their
+    tactics."""
+    dsa = projection_policies(16, PITCH, DL7_TUNED, sms=212, q=8)
+    assert dsa == {m: DSA[row_bin(m)] for m in DL7_TUNED}
+    assert dsa[24] == dsa[32] == SPLIT_K[32]
+    mla = projection_policies(16, 2880, DL7_TUNED, sms=212, q=8)
+    polled = {8: (1,)}  # canonical NaNs where MlaQuery polls x (MLA only)
+    assert mla == {m: MLA[row_bin(m)] + polled.get(m, ()) for m in DL7_TUNED}
+    kda = projection_policies(16, 3216, DL7_TUNED, sms=212, q=8)
+    wide_kda = (128, 64, 6, 14, 14)
+    assert kda == {m: (64, 8, 2, 12) if m <= 8 else wide_kda for m in DL7_TUNED}
+    wide = projection_policies(16, PITCH, (72, 96, 128), sms=212, q=8)
+    assert wide == dict.fromkeys((72, 96, 128), (64, 64, 2, 6))
+    gb300 = projection_policies(16, PITCH, DL7_TUNED, sms=152, q=8)
+    five = {64: (64, 64, 2, 5)}  # GB300's B64 stages
+    assert gb300 == {m: five.get(row_bin(m), SPLIT_K[row_bin(m)]) for m in DL7_TUNED}
+
+
+@pytest.mark.parametrize("sms", [212, 152], ids=["rubin", "gb300"])
+def test_dsa_layer_preloads_beside_its_attn_res(monkeypatch, sms):
+    """A DSA layer whose in-projection stages its weights in tensor memory asks the
+    AttnRes before it for carve-out 100 and lists those batches (``tmem_batches``:
+    the previous MoE tail releases that AttnRes at entry, no next-attention prefetch),
+    as an MLA layer does."""
+    attention, _ = dsa_layer(fused_insert=True)
+    device = SimpleNamespace(multi_processor_count=sms)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda index: device)
+    for name in ("PreparedProjection", "SkinnyProjection", "dsa_scratch"):
+        monkeypatch.setattr(providers_module, name, MagicMock())
+    monkeypatch.setattr(providers_module, "PreparedDsa", MagicMock(side_effect=Built))
+    runtime = SimpleNamespace(
+        tp=16, dcp=1, q=8, tuned=DL7_TUNED, batches=DL7_TUNED, wide=(),
+        queries=(1, 8), dsa_core="auto", dsa_layers=0,
+    )  # fmt: skip
+    provider: Any = object.__new__(Attention)
+    decoder = SimpleNamespace(self_attn=attention)
+    with pytest.raises(Built):  # past the carve-out, at PreparedDsa
+        Attention.__init__(provider, decoder, runtime, None, None, None)
+    rubin = sms > 152
+    tmem = tuple(m for m in DL7_TUNED if not 16 < m <= 32)
+    assert provider.kind == "dsa"
+    assert provider.before_carveout == (100 if rubin else None)
+    assert provider.tmem_batches == (tmem if rubin else ())
+
+
+def bf16_ulp(values):
+    exponent = torch.floor(torch.log2(values.abs().clamp_min(2.0**-126)))
+    return torch.exp2(exponent - 7)
+
+
+def rank_order(weight, x, split):
+    """The split's partials summed in rank order and rounded once: rank r's K slice
+    (64-wide tiles, the first ``tiles % split`` ranks one more) as one in-order MMA
+    chain in FP32 (an unsplit SplitKTmemGemm on that slice)."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.projection import (
+        PreparedProjection,
+    )
+
+    m, total, first = x.shape[0], None, 0
+    tiles, extra = divmod(x.shape[1] // 64, split)
+    for rank in range(split):
+        count = tiles + (rank < extra)
+        k = slice(64 * first, 64 * (first + count))
+        first += count
+        policy = {m: (128, 32, 1, 4, min(count, 15))}
+        part = PreparedProjection(weight[:, k], policy, output_dtype=torch.float32)
+        out = torch.empty(m, weight.shape[0], device=x.device)
+        part.prepare().run(x[:, k], out)
+        total = out if total is None else total + out
+    return total.bfloat16()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
+    reason="Rubin (SM107) tensor-memory GEMMs",
+)
+def test_dsa_in_projection_tensor_memory_numerics():
+    """The DSA in-projection on its tensor-memory tactics writes every output element
+    (the 96-row last M tile too, nothing past its 3040 columns) as the rank-order sum of
+    its split's K-slice partials, bit for bit (and as the plain SplitKGemm of the same
+    split where that divides K); against an FP64 reference its max and mean errors stay
+    within one BF16 ulp of the split-K tactics it replaces (a stated FP32 accumulation
+    reorder)."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.projection import (
+        PreparedProjection,
+    )
+
+    torch.manual_seed(0)
+    weight = (0.02 * torch.randn(PITCH, 7168, device="cuda")).bfloat16()
+    x = torch.randn(64, 7168, device="cuda").bfloat16()
+    tmem = projection_policies(16, PITCH, DL7_TUNED, sms=212, q=8)
+
+    def run(tactic, m, pitch=PITCH):
+        projection = PreparedProjection(weight, {m: tactic}).prepare()
+        out = torch.full((m, pitch), -1, dtype=torch.int16, device="cuda")  # 0xFFFF
+        projection.run(x[:m], out.view(torch.bfloat16)[:, :PITCH])
+        torch.cuda.synchronize()
+        return out
+
+    for m in (m for m in DL7_TUNED if len(tmem[m]) > 4):
+        padded = run(tmem[m], m, pitch=PITCH + 64)
+        assert not (padded[:, :PITCH] == -1).any(), m
+        assert (padded[:, PITCH:] == -1).all(), m
+        new, split = padded[:, :PITCH], tmem[m][2]
+        assert torch.equal(new, rank_order(weight, x[:m], split).view(torch.int16)), m
+        if 7168 % (128 * split) == 0:
+            plain = (128, min(tmem[m][1], 32), split, 4)
+            assert torch.equal(new, run(plain, m)), m
+        old = run(SPLIT_K[row_bin(m)], m)
+        ref = x[:m].double() @ weight.double().T
+        err = [(t.view(torch.bfloat16).double() - ref).abs() for t in (new, old)]
+        ulp = bf16_ulp(ref)
+        assert err[0].max() <= err[1].max() + ulp.max(), m
+        assert err[0].mean() <= err[1].mean() + ulp.mean(), m
+        print(
+            f"M{m} split {split}: max err {err[0].max():.3e} (split-K "
+            f"{err[1].max():.3e}), mean {err[0].mean():.3e} ({err[1].mean():.3e}), "
+            f"differs from split-K {(new != old).float().mean().item():.2%}"
+        )
+
+
 def wide_step(b, *, wide_moe):
     """A three-layer wide step (a dense layer, then two MoE layers) whose AttnRes
     sites run the stock op (``stock_attn_res``), on mocked providers. ``wide_moe``:
