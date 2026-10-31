@@ -103,6 +103,14 @@ def _assert_cutedsl_dcp_merge_supported(
         )
 
 
+# Model-provided DCP decode top-k, per indexer layer (k_cache prefix):
+# ``(active(rows) -> bool, run(logits, decode_metadata, out) -> bool)``. ``run`` writes
+# this rank's selected KV *slots* (not global ids) and their counts, which the sparse
+# MLA layer then reads through ``dcp_local_topk_counts``; ``active`` decides from the
+# step metadata alone, so the indexer and the attention agree (Kimi K3.1 DcpExchange).
+DCP_DECODE_TOPK_HOOKS: dict[str, tuple] = {}
+
+
 def _use_dcp_decode_topk_merge(
     dcp_local_topk: int,
     has_global_seq_lens: bool,
@@ -1138,6 +1146,15 @@ def sparse_attn_indexer(
             else padded_q_quant_decode_tokens
         )
         score_bits = 32
+        dcp_hook = DCP_DECODE_TOPK_HOOKS.get(k_cache_prefix)
+        if dcp_hook is not None and not dcp_hook[0](num_padded_tokens):
+            dcp_hook = None
+        # ``active`` is the one predicate both sides use (the attention layer reads
+        # slots whenever it holds); it must exclude these steps itself.
+        if dcp_hook is not None and (needs_padded_path or candidate_blocks is not None):
+            raise RuntimeError(
+                "DCP decode top-k hook admitted a padded or candidate-block step"
+            )
         use_dcp_topk_merge = _use_dcp_decode_topk_merge(
             dcp_local_topk,
             decode_metadata.global_seq_lens is not None,
@@ -1182,7 +1199,7 @@ def sparse_attn_indexer(
             )
             # Keeping bf16 halves top-k/candidate reads. SM100 decode is varlen:
             # one context length per row.
-            if fp32_decode_logits and not use_dcp_topk_merge:
+            if fp32_decode_logits and not use_dcp_topk_merge and dcp_hook is None:
                 logits = as_fp32_logits(logits, seq_lens.view(-1))
         num_rows = logits.shape[0]
         if candidate_blocks is not None:
@@ -1215,7 +1232,11 @@ def sparse_attn_indexer(
                 )
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
-        if use_dcp_topk_merge:
+        if dcp_hook is not None and dcp_hook[1](
+            logits, decode_metadata, topk_indices_buffer[:num_padded_tokens]
+        ):
+            pass
+        elif use_dcp_topk_merge:
             from vllm.v1.attention.ops.dcp_topk_merge.check import (
                 dcp_topk_merge_check_enabled,
             )

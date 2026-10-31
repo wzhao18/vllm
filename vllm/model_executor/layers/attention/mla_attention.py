@@ -480,6 +480,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.kv_b_proj = kv_b_proj
         self.dcp_q_replicate = dcp_q_replicate
         self.W_UK_T_dcp_qrep: torch.Tensor | None = None
+        # Set by a model's DCP decode exchange: (attn_out, lse, out, rows) -> True
+        # when it wrote ``out`` (the gathered heads' W_UV + O exchange), on pure
+        # decode steps; else the stock LSE combine + W_UV run.
+        self.dcp_decode_o_exchange: Callable | None = None
         self.head_size = kv_lora_rank + qk_rope_head_dim
         self.layer_name = prefix
         self.indexer = indexer
@@ -1260,8 +1264,21 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                         mqa_q, kv_cache, attn_metadata, self
                     )
 
+                # A model's DCP decode exchange: W_UV on every head, then the
+                # partial outputs to their head owners (replaces combine + W_UV).
+                if (
+                    self.dcp_decode_o_exchange is not None
+                    and shardq is None
+                    and gathered_context is None
+                    and num_mqa_tokens == q.size(0)
+                    and attn_metadata.num_prefills == 0
+                    and self.dcp_decode_o_exchange(
+                        attn_out, lse, mqa_output_slice, num_mqa_tokens
+                    )
+                ):
+                    pass
                 # correct dcp attn_out with lse.
-                if self.impl.dcp_world_size > 1 and gathered_context is None:
+                elif self.impl.dcp_world_size > 1 and gathered_context is None:
                     assert lse is not None
                     assert self.dcp_manager is not None
                     decode_metadata = getattr(attn_metadata, "decode", None)
@@ -1288,8 +1305,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     if self.use_pcp:
                         attn_out = finalize_mla_pcp_decode(attn_out, self.num_heads)
 
-                # v_up projection
-                self._v_up_proj(attn_out, out=mqa_output_slice)
+                    # v_up projection
+                    self._v_up_proj(attn_out, out=mqa_output_slice)
+                else:
+                    # v_up projection
+                    self._v_up_proj(attn_out, out=mqa_output_slice)
 
         if quant_key is not None:
             quant_idx = num_mqa_tokens if mha_use_quant_output else num_actual_toks

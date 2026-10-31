@@ -3,6 +3,7 @@
 """Shared MHA implementation and metadata builder for sparse MLA backends."""
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from shutil import which
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar
@@ -808,6 +809,10 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
     # Whether forward_mqa_shardq is implemented and validated for DCP steps,
     # over their gathered context (SparseMLAShardQ.gathered_context).
     supports_dcp_shardq: ClassVar[bool] = False
+    # Set by a model whose DCP decode exchange selects this rank's KV slots itself:
+    # rows -> their counts on such a step, else None (sparse_attn_indexer
+    # DCP_DECODE_TOPK_HOOKS).
+    dcp_local_topk_counts: Callable[[int], torch.Tensor | None] | None = None
 
     def __init__(
         self,
@@ -967,7 +972,16 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
         index_group = self.index_group
         if not isinstance(index_group, HiSparseMLAIndexGroup):
             _, block_stride_rows = flat_kv_row_view(kv_c_and_k_pe_cache, block_size)
-            if self.dcp_world_size > 1:
+            # A model's DCP decode exchange (sparse_attn_indexer.DCP_DECODE_TOPK_HOOKS)
+            # left this rank's KV slots and their counts: nothing to convert.
+            dcp_counts = (
+                self.dcp_local_topk_counts(num_tokens)
+                if self.dcp_world_size > 1 and self.dcp_local_topk_counts is not None
+                else None
+            )
+            if dcp_counts is not None:
+                physical_topk, valid_counts = topk, dcp_counts
+            elif self.dcp_world_size > 1:
                 physical_topk, valid_counts = triton_filter_and_convert_dcp_index(
                     attn_metadata.req_id_per_token[:num_tokens],
                     attn_metadata.block_table,
