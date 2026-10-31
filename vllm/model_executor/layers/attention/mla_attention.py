@@ -1195,9 +1195,20 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             if fp8_attention and self.impl.supports_quant_query_input:
                 assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
                 assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
-                mqa_q = self._decode_concat_quant_fp8_op(
-                    mqa_ql_nope, mqa_q_pe, self._q_scale
+                # A backend may write the decode kernel's query (concat, quant
+                # and its head padding) in one kernel.
+                quantize_query = getattr(self.impl, "quantize_decode_query", None)
+                mqa_q = (
+                    quantize_query(mqa_ql_nope, mqa_q_pe, self._q_scale)
+                    if quantize_query is not None
+                    and q_dcp_replicated is None
+                    and mqa_q_pe.shape[-1] > 0
+                    else None
                 )
+                if mqa_q is None:
+                    mqa_q = self._decode_concat_quant_fp8_op(
+                        mqa_ql_nope, mqa_q_pe, self._q_scale
+                    )
             else:
                 mqa_q = (mqa_ql_nope, mqa_q_pe)
             kvgather_rows = 0

@@ -638,3 +638,138 @@ def test_dcp_partials_in_padded_buffers(monkeypatch, kv_cache_dtype, kernel, cas
     graph.replay()
     torch.accelerator.synchronize()
     check(out, lse)
+
+
+def _decode_query_parts(tokens, heads, dtype, seed, magnitude=4.0):
+    """The layer's decode query parts: ``ql_nope`` [T, H, 512] token-major (the
+    W_UK bmm output) and ``q_pe`` [T, H, 64], a column view of the projected
+    [T, H, 192] query."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    ql_nope = torch.randn(tokens, heads, KV_LORA_RANK, generator=g, device="cuda")
+    q = torch.randn(tokens, heads, 128 + ROPE, generator=g, device="cuda")
+    ql_nope = (ql_nope * magnitude).to(dtype)
+    q_pe = (q * magnitude).to(dtype)[..., 128:]
+    return ql_nope, q_pe
+
+
+def _unfused_decode_query(ql_nope, q_pe, q_scale, padded_heads):
+    """cat + scaled_fp8_quant (the layer) + the kernel's zero head pad."""
+    tokens, heads, _ = ql_nope.shape
+    q = torch.cat((ql_nope, q_pe), dim=-1)
+    if tokens == 0:
+        return q.new_empty((0, padded_heads, q.shape[-1]), dtype=E4M3)
+    q8, _ = ops.scaled_fp8_quant(q.reshape(tokens, -1), q_scale)
+    return fims._pad_query_heads(q8.view(tokens, heads, -1), padded_heads)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("heads,padded_heads", [(96, 128), (64, 64), (16, 64)])
+@pytest.mark.parametrize("tokens", [0, 1, 7, 224, 333])
+@pytest.mark.parametrize("q_scale", [1.0, 0.37, 2.5])
+def test_decode_query_quant_pad(dtype, heads, padded_heads, tokens, q_scale):
+    """The one-kernel decode query (concat + static E4M3 quant + head pad) is
+    bitwise the layer's cat + scaled_fp8_quant followed by the zero head pad,
+    including saturated values (|x| / scale > 448)."""
+    magnitude = 600.0 if tokens == 7 else 4.0
+    ql_nope, q_pe = _decode_query_parts(tokens, heads, dtype, tokens, magnitude)
+    scale = torch.tensor([q_scale], dtype=torch.float32, device="cuda")
+    out = fims.decode_query_quant_pad(ql_nope, q_pe, scale, padded_heads)
+    assert out is not None and out.dtype == E4M3
+    assert out.shape == (tokens, padded_heads, KV_LORA_RANK + ROPE)
+    ref = _unfused_decode_query(ql_nope, q_pe, scale, padded_heads)
+    assert torch.equal(out.view(torch.uint8), ref.view(torch.uint8))
+    if tokens == 7:
+        assert (out.float().abs() == 448).any(), "no saturated value tested"
+
+
+def test_decode_query_quant_pad_unsupported_shapes():
+    """Shapes outside the kernel's fall back to the layer's quant (None)."""
+    ql_nope, q_pe = _decode_query_parts(4, 96, torch.bfloat16, 0)
+    scale = torch.ones(1, dtype=torch.float32, device="cuda")
+    assert fims.decode_query_quant_pad(ql_nope, q_pe[..., :0], scale, 128) is None
+    assert fims.decode_query_quant_pad(ql_nope[..., :320], q_pe, scale, 128) is None
+    assert fims.decode_query_quant_pad(ql_nope.float(), q_pe, scale, 128) is None
+    assert fims.decode_query_quant_pad(ql_nope, q_pe, scale, 64) is None
+    assert (
+        fims.decode_query_quant_pad(ql_nope.transpose(1, 2), q_pe, scale, 128) is None
+    )
+
+
+def _fused_impl(kv_cache_dtype, **kw):
+    impl = _impl(kv_cache_dtype, **kw)
+    impl.dcp_world_size = 1
+    impl.use_shardq = False
+    return impl
+
+
+@pytest.mark.parametrize("kv_cache_dtype", ["fp8", "nvfp4_ds_mla"])
+@pytest.mark.parametrize("heads", [96, 64])
+@pytest.mark.parametrize("rows,buckets", [(13, BUCKETS), (130, (1, 2, 4, 8, 48))])
+def test_prims_ts_fused_decode_query(
+    monkeypatch, kv_cache_dtype, heads, rows, buckets
+):
+    """The fused decode query runs prims_ts with no head-pad kernel and gives
+    bitwise the output and LSE of the layer's quant + pad, also when the rows
+    run in chunks (130 rows over a 48-row largest capacity)."""
+    k_scale = 0.5 if kv_cache_dtype == "fp8" else 1.0
+    q_scale = 2.0
+    counts = [(i * 151) % 2049 for i in range(rows)]
+    cache, _, indices, lengths = _problem(
+        kv_cache_dtype, counts, heads, k_scale, q_scale, 3
+    )
+    layer = SimpleNamespace(_q_scale_float=q_scale, _k_scale_float=k_scale)
+    ql_nope, q_pe = _decode_query_parts(rows, heads, torch.bfloat16, 5)
+    scale = torch.tensor([q_scale], dtype=torch.float32, device="cuda")
+
+    ref_impl = _impl(kv_cache_dtype, buckets=buckets)
+    q8 = _unfused_decode_query(ql_nope, q_pe, scale, heads)
+    ref_out, ref_lse = ref_impl._forward_prims_ts(
+        q8, cache, indices, lengths, layer, BLOCK_SIZE
+    )
+
+    impl = _fused_impl(kv_cache_dtype, buckets=buckets)
+    q_fused = impl.quantize_decode_query(ql_nope, q_pe, scale)
+    assert q_fused.shape == (rows, heads, KV_LORA_RANK + ROPE)
+    assert torch.equal(q_fused.view(torch.uint8), q8.view(torch.uint8))
+
+    def no_pad(*args, **kwargs):
+        raise AssertionError("the fused query was padded again")
+
+    monkeypatch.setattr(fims, "_pad_query_heads", no_pad)
+    out, lse = impl._forward_prims_ts(
+        q_fused, cache, indices, lengths, layer, BLOCK_SIZE
+    )
+    assert impl._fused_query is None
+    assert torch.equal(out, ref_out) and torch.equal(lse, ref_lse)
+    kv = _dequant_rows(cache, kv_cache_dtype, k_scale)
+    _check(out, lse, *_reference(q8, q_scale, kv, indices, lengths), kv_cache_dtype)
+
+
+def test_padded_query_reuses_only_the_fused_buffer():
+    """``_padded_query`` returns row slices of the fused buffer (no copy) and
+    pads any other query, including one with the same strides elsewhere."""
+    impl = _fused_impl("fp8")
+    ql_nope, q_pe = _decode_query_parts(20, 96, torch.bfloat16, 1)
+    scale = torch.ones(1, dtype=torch.float32, device="cuda")
+    q = impl.quantize_decode_query(ql_nope, q_pe, scale)
+    fused = impl._fused_query
+    sliced = impl._padded_query(q[5:12], 128)
+    assert sliced.data_ptr() == fused[5].data_ptr() and sliced.shape[0] == 7
+    other = torch.zeros_like(fused)
+    other[:, :96] = fused[:, :96]
+    other[:, 96:] = torch.ones_like(other[:, 96:])
+    copy = impl._padded_query(other[:, :96], 128)
+    assert copy.data_ptr() != other.data_ptr()
+    assert torch.equal(copy.view(torch.uint8), fused.view(torch.uint8))
+
+
+def test_quantize_decode_query_only_without_query_exchange():
+    """DCP (query gather) and ShardQ steps keep the layer's quant."""
+    ql_nope, q_pe = _decode_query_parts(4, 96, torch.bfloat16, 2)
+    scale = torch.ones(1, dtype=torch.float32, device="cuda")
+    impl = _fused_impl("fp8")
+    impl.dcp_world_size = 8
+    assert impl.quantize_decode_query(ql_nope, q_pe, scale) is None
+    impl = _fused_impl("fp8")
+    impl.use_shardq = True
+    assert impl.quantize_decode_query(ql_nope, q_pe, scale) is None

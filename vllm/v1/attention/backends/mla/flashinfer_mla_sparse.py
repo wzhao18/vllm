@@ -739,6 +739,106 @@ def _pad_query_heads(query: torch.Tensor, heads: int) -> torch.Tensor:
 
 
 @triton.jit
+def _decode_query_quant_pad_kernel(
+    nope_ptr,
+    pe_ptr,
+    scale_ptr,
+    out_ptr,
+    nope_stride0,
+    nope_stride1,
+    pe_stride0,
+    pe_stride1,
+    num_heads,
+    padded_heads,
+    NOPE: tl.constexpr,
+    ROPE: tl.constexpr,
+    HEADS_PER_PROGRAM: tl.constexpr,
+):
+    """One token's ``HEADS_PER_PROGRAM`` heads of cat(ql_nope, q_pe) quantized
+    to FP8 with a static per-tensor scale (``scaled_fp8_quant``'s arithmetic:
+    x * (1 / scale), clamped, round-to-nearest) into a [T, padded_heads,
+    NOPE + ROPE] buffer; heads past ``num_heads`` are written as zeros."""
+    token = tl.program_id(0).to(tl.int64)
+    heads = tl.program_id(1) * HEADS_PER_PROGRAM + tl.arange(0, HEADS_PER_PROGRAM)
+    live = (heads < num_heads)[:, None]
+    stored = (heads < padded_heads)[:, None]
+    inv_scale = tl.fdiv(1.0, tl.load(scale_ptr).to(tl.float32), ieee_rounding=True)
+    fp8_max: tl.constexpr = 448.0
+    out_row = out_ptr + (token * padded_heads + heads[:, None]) * (NOPE + ROPE)
+
+    cols = tl.arange(0, NOPE)[None, :]
+    x = tl.load(
+        nope_ptr + token * nope_stride0 + heads[:, None] * nope_stride1 + cols,
+        mask=live,
+        other=0.0,
+    ).to(tl.float32)
+    x = tl.minimum(tl.maximum(x * inv_scale, -fp8_max), fp8_max)
+    tl.store(out_row + cols, x.to(out_ptr.dtype.element_ty), mask=stored)
+
+    cols = tl.arange(0, ROPE)[None, :]
+    x = tl.load(
+        pe_ptr + token * pe_stride0 + heads[:, None] * pe_stride1 + cols,
+        mask=live,
+        other=0.0,
+    ).to(tl.float32)
+    x = tl.minimum(tl.maximum(x * inv_scale, -fp8_max), fp8_max)
+    tl.store(out_row + NOPE + cols, x.to(out_ptr.dtype.element_ty), mask=stored)
+
+
+def decode_query_quant_pad(
+    ql_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    scale: torch.Tensor,
+    padded_heads: int,
+) -> torch.Tensor | None:
+    """cat(``ql_nope`` [T, H, L], ``q_pe`` [T, H, R]) quantized to E4M3 with the
+    static per-tensor ``scale`` in one kernel, into a new [T, ``padded_heads``,
+    L + R] buffer whose extra heads are zero. Bitwise equal to the decode
+    query's cat + ``scaled_fp8_quant`` + head pad (three kernels); None when the
+    shapes are outside the kernel's (power-of-two L and R, unit inner stride)."""
+    num_tokens, num_heads, nope = ql_nope.shape
+    rope = q_pe.shape[-1]
+    if (
+        ql_nope.dtype not in (torch.bfloat16, torch.float16)
+        or q_pe.dtype != ql_nope.dtype
+        or q_pe.shape[:2] != ql_nope.shape[:2]
+        or ql_nope.stride(2) != 1
+        or q_pe.stride(2) != 1
+        or nope & (nope - 1)
+        or rope <= 0
+        or rope & (rope - 1)
+        or padded_heads < num_heads
+        or scale.numel() != 1
+        or current_platform.fp8_dtype() != torch.float8_e4m3fn
+    ):
+        return None
+    out = ql_nope.new_empty(
+        (num_tokens, padded_heads, nope + rope), dtype=torch.float8_e4m3fn
+    )
+    if num_tokens:
+        heads_per_program = 4
+        _decode_query_quant_pad_kernel[
+            (num_tokens, triton.cdiv(padded_heads, heads_per_program))
+        ](
+            ql_nope,
+            q_pe,
+            scale,
+            out,
+            ql_nope.stride(0),
+            ql_nope.stride(1),
+            q_pe.stride(0),
+            q_pe.stride(1),
+            num_heads,
+            padded_heads,
+            NOPE=nope,
+            ROPE=rope,
+            HEADS_PER_PROGRAM=heads_per_program,
+            num_warps=4,
+        )
+    return out
+
+
+@triton.jit
 def _finish_dcp_partials_kernel(
     out_ptr,
     lse_ptr,
@@ -863,6 +963,9 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         )
 
         self._workspace_buffer: torch.Tensor | None = None
+        # The last head-padded decode query quantize_decode_query wrote; held
+        # (so no other tensor can take its address) until the kernel reads it.
+        self._fused_query: torch.Tensor | None = None
         self.bmm1_scale: float | None = None
         self.bmm2_scale: float | None = None
 
@@ -906,6 +1009,53 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
             self.bmm2_scale = 1.0
             if is_quantized_kv_cache(self.kv_cache_dtype):
                 self.bmm2_scale *= layer._k_scale_float
+
+    def _decode_query_heads(self, num_heads: int) -> int:
+        """Query heads the decode kernel runs for ``num_heads`` real heads."""
+        if self.use_prims_ts:
+            return self._prims_ts_query_heads(num_heads)
+        return trtllm_gen_query_heads(num_heads)
+
+    def quantize_decode_query(
+        self, ql_nope: torch.Tensor, q_pe: torch.Tensor, q_scale: torch.Tensor
+    ) -> torch.Tensor | None:
+        """The FP8 decode query [T, H, L + R] in one kernel (concat, static
+        quant and the decode kernel's head padding), or None to let the layer
+        concat and quantize it. The result is the real-head view of a
+        head-padded buffer that ``_padded_query`` hands to the kernel as is.
+
+        Only where the query goes to this rank's kernel unchanged: no DCP
+        query gather, no ShardQ exchange."""
+        if self.dcp_world_size > 1 or self.use_shardq:
+            return None
+        num_heads = ql_nope.shape[1]
+        padded = decode_query_quant_pad(
+            ql_nope, q_pe, q_scale, self._decode_query_heads(num_heads)
+        )
+        if padded is None:
+            return None
+        self._fused_query = padded
+        return padded[:, :num_heads]
+
+    def _padded_query(self, query: torch.Tensor, heads: int) -> torch.Tensor:
+        """``query`` [T, H, D] with ``heads`` heads (extra heads zero): a row
+        slice of the buffer ``quantize_decode_query`` wrote when ``query`` is
+        one of its views (no copy), else a padded copy."""
+        fused = getattr(self, "_fused_query", None)
+        if (
+            fused is not None
+            and fused.shape[1] == heads
+            and query.dtype == fused.dtype
+            and query.stride() == fused.stride()
+            and query.shape[2] == fused.shape[2]
+        ):
+            row_bytes = fused.stride(0) * fused.element_size()
+            offset = query.data_ptr() - fused.data_ptr()
+            if offset >= 0 and offset % row_bytes == 0:
+                start = offset // row_bytes
+                if start + query.shape[0] <= fused.shape[0]:
+                    return fused[start : start + query.shape[0]]
+        return _pad_query_heads(query, heads)
 
     def _prims_ts_query_heads(self, num_heads: int) -> int:
         from vllm.utils.flashinfer import prims_ts_sparse_mla_schedules_native_heads
@@ -1018,7 +1168,7 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
             )
             if padded != heads:
                 # Zero query heads: computed, then dropped.
-                query = _pad_query_heads(query, padded)
+                query = self._padded_query(query, padded)
             if out_heads != padded:
                 chunk_out = out.new_empty((n, padded, self.kv_lora_rank))
                 if lse is not None:
@@ -1043,6 +1193,7 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
                 if lse is not None:
                     assert chunk_lse is not None
                     lse[start:end] = chunk_lse[:, :heads]
+        self._fused_query = None
         return out[:, :heads], None if lse is None else lse[:, :heads]
 
     def autotune_hisparse_decode(self, layer: AttentionLayer) -> None:
@@ -1144,7 +1295,8 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         num_heads = q.shape[1]
         padded_heads = trtllm_gen_query_heads(num_heads)
         if padded_heads != num_heads:
-            q = _pad_query_heads(q, padded_heads)
+            q = self._padded_query(q, padded_heads)
+        self._fused_query = None
 
         # Single-token sparse decode. trtllm-gen requires the q_len_per_request
         # dim, but the sparse attention mask is fully per-token (each query token
