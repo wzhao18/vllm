@@ -272,3 +272,57 @@ def test_bf16_weight_refuses_quantized_linear(default_vllm_config, dist_init):
     plain = _linear("model.layers.4.self_attn.kv_b_proj", 256, 7168, _online(),
                     weight)  # fmt: skip
     assert bf16_weight(plain) is plain.weight
+
+
+@needs_mxfp8_gpu
+def test_dispatch_switches_cute_dsl_linears(default_vllm_config, dist_init):
+    """On SM107 every online-MXFP8 linear on the CuTe DSL kernel moves to the
+    dispatch kernel over the same weights (exact at <= 16 rows, where it calls
+    the same kernel); elsewhere nothing changes."""
+    from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
+        FlashInferCutedslMxfp8LinearKernel,
+    )
+    from vllm.models.kimi_k3.nvidia.mxfp8 import (
+        KimiK3Mxfp8Kernel,
+        enable_kimi_k3_mxfp8_dispatch,
+    )
+
+    torch.manual_seed(0)
+    weight = torch.randn(7168, 3584, device="cuda", dtype=torch.bfloat16) * 0.02
+    model = torch.nn.ModuleList(
+        _linear(p, 7168, 3584, _online(), weight, FlashInferCutedslMxfp8LinearKernel)
+        for p in (
+            "model.layers.4.block_sparse_moe.routed_expert_up_proj",
+            "model.layers.5.block_sparse_moe.routed_expert_up_proj",
+        )
+    )
+    x = torch.randn(16, 3584, device="cuda", dtype=torch.bfloat16)
+    before = model[0](x)[0]
+    switched = enable_kimi_k3_mxfp8_dispatch(model)
+    if not current_platform.is_device_capability((10, 7)):
+        assert switched == 0
+        return
+    assert switched == 2
+    assert all(type(m.quant_method.kernel) is KimiK3Mxfp8Kernel for m in model)
+    assert torch.equal(model[0](x)[0], before)
+    assert enable_kimi_k3_mxfp8_dispatch(model) == 0  # idempotent
+
+
+def test_dspark_drafter_installs_mxfp8_dispatch(monkeypatch):
+    """The K3 DSpark drafter's post-load hook switches its own online-MXFP8
+    linears (an MXFP8 drafter is quantized separately from the target)."""
+    import vllm.models.kimi_k3.nvidia.mxfp8 as mxfp8
+    from vllm.models.kimi_k3.nvidia.dspark_mla import K3DSparkForCausalLM
+    from vllm.models.kimi_k3.nvidia.specialized_decode.runtime import draft
+
+    seen = []
+    monkeypatch.setattr(
+        mxfp8, "enable_kimi_k3_mxfp8_dispatch", lambda m: seen.append(m) or 0
+    )
+    monkeypatch.setattr(draft.DraftFastPath, "build", staticmethod(lambda *a: None))
+    drafter = SimpleNamespace(
+        model=SimpleNamespace(_build_fused_context_kv_metadata=lambda: None),
+        _vllm_config=None,
+    )
+    K3DSparkForCausalLM.process_weights_after_loading(drafter)
+    assert seen == [drafter]

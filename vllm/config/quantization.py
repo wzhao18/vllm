@@ -130,7 +130,9 @@ class QuantizationConfigArgs:
     regex patterns with a `re:`, or fnmatch-style patterns for online
     quantization, mapping to an online shorthand name (see
     `_ONLINE_SHORTHANDS`). A layer that matches no pattern is left unquantized.
-    Mutually exclusive with `linear` and `moe`.
+    Mutually exclusive with `linear` and `moe` weight specs; composes with
+    activation-only `linear` / `moe` overrides (e.g. MXFP8 activations for an
+    MXFP4 MoE checkpoint).
     """
 
     @field_validator("linear", "moe", mode="before")

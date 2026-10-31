@@ -79,7 +79,10 @@ def _use_dispatch_kernel() -> bool:
 
 def enable_kimi_k3_mxfp8_dispatch(model: nn.Module) -> int:
     """On SM107, switch every online-MXFP8 linear on the CuTe DSL kernel to
-    :class:`KimiK3Mxfp8Kernel` (same weights). Returns the number switched."""
+    :class:`KimiK3Mxfp8Kernel` (same weights). Returns the number switched.
+
+    Called from the post-load hook of both the K3 target and the K3 DSpark
+    drafter (an online-MXFP8 drafter has its own linears)."""
     if not _use_dispatch_kernel():
         return 0
     switched = 0

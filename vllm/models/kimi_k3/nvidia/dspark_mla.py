@@ -9,6 +9,7 @@ import torch.nn as nn
 
 import vllm._custom_ops as ops
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -30,6 +31,8 @@ from vllm.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
 from vllm.models.kimi_k3.nvidia.model import KimiMLP
 from vllm.v1.kv_cache_interface import is_quantized_kv_cache
 from vllm.v1.worker.workspace import current_workspace_manager
+
+logger = init_logger(__name__)
 
 _GROUPED_KV_CACHE_DTYPES = frozenset(
     {"auto", "bfloat16", "fp8", "fp8_e4m3", "fp8_e5m2"}
@@ -602,6 +605,14 @@ class K3DSparkForCausalLM(nn.Module):
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def process_weights_after_loading(self) -> None:
+        from vllm.models.kimi_k3.nvidia.mxfp8 import enable_kimi_k3_mxfp8_dispatch
+
+        if switched := enable_kimi_k3_mxfp8_dispatch(self):
+            logger.info_once(
+                "Kimi K3 DSpark drafter: %d online MXFP8 linears use the CuTe DSL "
+                "(<= 16 rows) / cuBLASLt MXFP8 dispatch.",
+                switched,
+            )
         self.model._build_fused_context_kv_metadata()
         from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.draft import (
             DraftFastPath,
