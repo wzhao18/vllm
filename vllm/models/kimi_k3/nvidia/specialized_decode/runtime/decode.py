@@ -27,6 +27,7 @@ from ..cutedsl.common.host import dynamic_view, to_cute
 from ..cutedsl.common.host import stream as current_stream
 from ..cutedsl.common.policy import batch_table
 from ..cutedsl.common.twoshot import TwoShot
+from ..cutedsl.dsa.prepared import choose as dsa_choose
 from ..cutedsl.kda.head import KdaSide
 from ..cutedsl.kda.prepared import choose as kda_choose
 from ..cutedsl.kda.prepared import verify_kernel
@@ -538,7 +539,10 @@ class SpecializedDecode:
             choices["mla"] = mla_choose(Shape(b, q), self.context)
         elif mla is not None:
             choices["mla"] = Choice(stock, note=f"{gemm} + S2")
-        if "dsa" in kinds:
+        dsa = next((a for a in self.attention.values() if a.kind == "dsa"), None)
+        if dsa is not None and b in dsa.dsa_wide:
+            choices["dsa"] = dsa_choose(Shape(b, q), self.context)
+        elif dsa is not None:
             choices["dsa"] = Choice(stock, note=f"{gemm} + S2")
         attention = next(iter(self.attention.values()), None)
         if attention is not None and b in attention.oproj_wide:

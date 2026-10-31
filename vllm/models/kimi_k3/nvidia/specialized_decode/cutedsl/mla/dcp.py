@@ -541,6 +541,7 @@ class DcpBox:
     ):
         self.size, self.rank, self.heads, self.cap = size, rank, heads, cap
         self.interleave, self.group = interleave, group
+        self.layout = dict(q_heads=q_heads, q_bf16=q_bf16)  # (``widened`` keeps it)
         self.wide: dict[int, DcpBox] = {}  # ``widened``
         empty = symm_mem.empty
         # DSA: q_heads query rows per token (the sparse decode's head padding), BF16
@@ -591,11 +592,12 @@ class DcpBox:
     def widened(self, cap):
         """The model's mailboxes for verify shapes above this box's rows: one more box
         set of ``cap`` rows over the same group (every MLA layer shares it; created
-        collectively, at the first layer that prepares such a shape)."""
+        collectively, at the first layer that prepares such a shape). A DSA box's
+        widened box keeps its q mailbox layout (padded heads, BF16 / FP8)."""
         if cap not in self.wide:
             device = self.q.device
             args = self.group, device, self.size, self.rank, self.heads, cap
-            self.wide[cap] = DcpBox(*args, interleave=self.interleave)
+            self.wide[cap] = DcpBox(*args, interleave=self.interleave, **self.layout)
         return self.wide[cap]
 
     def mc(self, parity, valid=False):
