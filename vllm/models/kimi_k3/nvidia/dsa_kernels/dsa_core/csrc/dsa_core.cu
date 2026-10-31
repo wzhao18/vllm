@@ -89,6 +89,7 @@ struct Params {
   const uint64_t* part_peers;  // [W] DcpBox.partial bases
   const uint64_t* lse_peers;   // [W] DcpBox.lse bases
   int lse_wide;  // DcpBox.lse as [2, CAP, H, W] (DcpValue's wide / spread merge)
+  int split_min;  // S > 1: rows of at most this many 64-key chunks run on split 0 alone
   int box_cap, hpr, parity, rank, W, T, splits;
   int* err;
   long long spin_ns;
@@ -286,29 +287,31 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
   // DcpValue(pushed) only stages W_UV before its own wait: let it become resident
   pdl_launch();
   if (dbg && tid == 0) dbg[5] = now_ns();
-  // the count and this split's slots in one round trip (slots past the count masked)
+  // the count and the row's whole slot list in one round trip (past the count: -1)
   const int* selrow = p.sel + (int64_t)t * p.sel_stride;
   int v[kMaxK / kThreads];
 #pragma unroll
   for (int b = 0; b < kMaxK / kThreads; ++b) {
-    const int k = b * kThreads + tid;  // local index k -> chunk k / 64, row k % 64
-    const int gk = ((k / kChunk) * S + sp) * kChunk + k % kChunk;
-    v[b] = gk < p.width ? ld_cg(selrow + gk) : -1;
+    const int k = b * kThreads + tid;
+    v[b] = k < p.width ? ld_cg(selrow + k) : -1;
   }
   if (tid == 0) s_n = ld_cg(p.cnt + t);
   __syncthreads();
   const int n = min(s_n, p.width);
   const int nall = (n + kChunk - 1) / kChunk;
-  const int nchunks = nall > sp ? (nall - sp + S - 1) / S : 0;  // chunks sp, sp + S, ..
-  {
-    const int nmine = nchunks * kChunk;
+  // rows of at most split_min chunks run on split 0 alone (no merge across the cluster;
+  // the other splits leave), longer ones on every split: chunks sp, sp + S, ..
+  const bool solo = S > 1 && nall <= p.split_min;
+  if (solo && sp > 0) return;
+  const int Se = solo ? 1 : S;
+  const int nchunks = nall > sp ? (nall - sp + Se - 1) / Se : 0;
 #pragma unroll
-    for (int b = 0; b < kMaxK / kThreads; ++b) {
-      const int k = b * kThreads + tid;
-      const int gk = ((k / kChunk) * S + sp) * kChunk + k % kChunk;
-      if (k < nmine) sIdx[k] = gk < n ? v[b] : -1;
-    }
+  for (int b = 0; b < kMaxK / kThreads; ++b) {
+    const int k = b * kThreads + tid;
+    sIdx[k] = k < n ? v[b] : -1;
   }
+  // slot of row r of this CTA's chunk c
+  auto slot_of = [&](int c, int r) { return sIdx[(c * Se + sp) * kChunk + r]; };
   __syncthreads();
   if (dbg && tid == 0) {
     dbg[2] = now_ns();
@@ -324,7 +327,7 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
     uint8_t* buf = sKV + (c & 1) * kChunk * kRowS;
     for (int i = tid; i < kChunk * (kRowB / 16); i += kThreads) {
       const int r = i / (kRowB / 16), pc = i % (kRowB / 16);
-      const int slot = sIdx[c * kChunk + r];
+      const int slot = slot_of(c, r);
       if (slot >= 0) {
         cp_async16(buf + r * kRowS + 16 * pc, p.kv + (int64_t)slot * kRowB + 16 * pc);
       } else {
@@ -419,8 +422,8 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
       }
       v0 *= p.s2scale;
       v1 *= p.s2scale;
-      if (sIdx[c * kChunk + lane] < 0) v0 = -INFINITY;
-      if (sIdx[c * kChunk + 32 + lane] < 0) v1 = -INFINITY;
+      if (slot_of(c, lane) < 0) v0 = -INFINITY;
+      if (slot_of(c, 32 + lane) < 0) v1 = -INFINITY;
       float mx = fmaxf(v0, v1);
 #pragma unroll
       for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
@@ -484,7 +487,7 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
   if (dbg && tid == 0) dbg[3] = now_ns();
   constexpr int kGroupHeads = HG;
   const int H = p.hpr;
-  if (S > 1) {
+  if (S > 1 && !solo) {
     // ---- the S splits of (t, grp) are one cluster: each leaves its unnormalized FP32
     // O (shared [32, 512], the KV buffers' space) and (max, sum); after one cluster
     // barrier split s merges latent dims [512 s / S, +512 / S) of all of them through
@@ -628,7 +631,7 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
 void run(torch::Tensor q, torch::Tensor sel, torch::Tensor cnt, torch::Tensor kv,
          double s2scale, double vscale, torch::Tensor part_peers, torch::Tensor lse_peers,
          int64_t box_cap, int64_t hpr, int64_t parity, int64_t rank, int64_t T, int64_t lse_wide,
-         int64_t splits, int64_t heads_per_cta, torch::Tensor err, int64_t spin_ns, int64_t pdl,
+         int64_t splits, int64_t split_min, int64_t heads_per_cta, torch::Tensor err, int64_t spin_ns, int64_t pdl,
          c10::optional<torch::Tensor> dbg) {
   if (T == 0) return;
   const int W = (int)part_peers.numel();
@@ -655,6 +658,7 @@ void run(torch::Tensor q, torch::Tensor sel, torch::Tensor cnt, torch::Tensor kv
   p.lse_peers = reinterpret_cast<const uint64_t*>(lse_peers.data_ptr<int64_t>());
   p.box_cap = (int)box_cap;
   p.lse_wide = (int)lse_wide;
+  p.split_min = (int)split_min;
   p.hpr = (int)hpr;
   p.parity = (int)parity;
   p.rank = (int)rank;

@@ -103,6 +103,7 @@ class DsaCore:
         rank: int,
         rows: int,
         splits: int = 1,
+        split_min: int = 4,
         heads_per_cta: int = 32,
         umma: bool = False,
         lse_wide: bool = False,
@@ -115,7 +116,9 @@ class DsaCore:
         flat per-tensor FP8 KV rows [N, 576]; ``bmm1_scale`` = softmax scale x q scale x
         k scale, ``bmm2_scale`` = k scale; ``part_peers`` / ``lse_peers``: DcpBox.peers
         / lse_peers; ``parity``: the DcpBox parity of this layer; ``lse_wide``: the LSE
-        box in the [2, CAP, H, W] layout of DcpValue's wide / spread merge."""
+        box in the [2, CAP, H, W] layout of DcpValue's wide / spread merge.
+        ``splits`` > 1: rows of at most ``split_min`` 64-key chunks still run on one CTA
+        (no cluster merge), longer ones over the ``splits`` CTAs of their cluster."""
         if rows > self.cap:
             raise ValueError(f"DsaCore: {rows} rows > cap {self.cap}")
         if splits not in (1, 2, 4, 8) or splits > self.max_splits:
@@ -146,6 +149,7 @@ class DsaCore:
             rows,
             int(lse_wide),
             splits,
+            split_min,
             heads_per_cta,
             self.err,
             self.spin_ns,
