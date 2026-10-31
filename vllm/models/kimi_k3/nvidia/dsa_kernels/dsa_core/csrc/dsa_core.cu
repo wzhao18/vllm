@@ -251,8 +251,9 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
   long long* dbg = p.dbg ? p.dbg + ((int64_t)(t * G + grp) * S + sp) * 24 : nullptr;
   if (dbg && tid == 0) dbg[0] = now_ns();
 
-  // ---- query tile [HG, 576] FP8 from the q mailbox (polled: no PDL dependency)
-  {
+  // ---- query tile [HG, 576] FP8 from the q mailbox (polled: no PDL dependency). Split
+  // 0 loads it before its PDL wait; the other splits only once their row needs them.
+  auto load_q = [&]() {
     const uint8_t* qrow = p.q + (int64_t)t * p.q_row_stride + (int64_t)h0 * kRowB;
     uint4 v[PL::kQPer];
 #pragma unroll
@@ -276,7 +277,8 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
         *reinterpret_cast<uint4*>(sQ + h * kRowS + 16 * c) = v[j];
       }
     }
-  }
+  };
+  if (sp == 0) load_q();
   if (tid < HG) {
     sM[tid] = -INFINITY;
     sL[tid] = 0.f;
@@ -303,6 +305,10 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
   // the other splits leave), longer ones on every split: chunks sp, sp + S, ..
   const bool solo = S > 1 && nall <= p.split_min;
   if (solo && sp > 0) return;
+  if (sp > 0) {
+    load_q();
+    __syncthreads();
+  }
   const int Se = solo ? 1 : S;
   const int nchunks = nall > sp ? (nall - sp + Se - 1) / Se : 0;
 #pragma unroll
