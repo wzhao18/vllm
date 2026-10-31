@@ -119,7 +119,7 @@ def check_residency(compiled, device_index: int, grid: int, threads: int, what: 
 def max_active_clusters(
     compiled, device_index: int, grid, threads: int, cluster: int, carveout=None
 ) -> int:
-    """cuOccupancyMaxActiveClusters of the one kernel in ``compiled``: how many
+    """The cuOccupancyMaxActiveClusters of the one kernel in ``compiled``: how many
     ``cluster``-CTA clusters of ``threads`` per CTA (its dynamic shared memory, and the
     preferred shared memory ``carveout`` if given) the device holds at once."""
     _, function = resolve_kernel(compiled, device_index)
