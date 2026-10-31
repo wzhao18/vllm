@@ -129,14 +129,85 @@ def _get_workspace(
     return current_workspace_manager().get_simultaneous(((needed,), torch.int8))[0]
 
 
-# SM107 (VR200) M256 FP8 decode: TokenSpeed's 4-CTA-cluster kernel (mla_decode_fp8_sm107.py,
-# cluster launch control) written with a BF16 output. The public entry point only takes it for FP8
-# outputs; on SM107 it is 13-14% faster than the SM100 FP8 kernel + length-proportional split for the
-# K3.1 DSpark drafter (64 heads x q8, AgentX contexts, benchmarks/kernels/k31_vr/wtp1/bench_draft_attn.py)
-# at the same error against an FP32 reference. VLLM_TOKENSPEED_SM107_SPLIT = its split-KV floor
-# (0 disables the path).
+# SM107 (VR200) M256 FP8 decode: TokenSpeed's 4-CTA-cluster kernel
+# (mla_decode_fp8_sm107.py, cluster launch control) written with a BF16 output. The
+# public entry point only takes it for FP8 outputs. For the K3.1 DSpark drafter (64
+# heads x q8, TP1 DEP ranks, AgentX contexts) it cuts the drafter's CUPTI kernel time
+# per step from 3.04 to 2.71 ms (r16) and 5.21 to 4.47 ms (r28) vs the SM100 FP8 kernel
+# + length-proportional split (DEP4 8-layer bench, 2 nodes), at the same error against
+# an FP32 reference. VLLM_TOKENSPEED_SM107_SPLIT = its split-KV floor (0 disables the
+# path). Only shapes that fill at least one 256-row tile (num_heads * q_len >= 256) take
+# it: at 4 / 16 heads the tile is mostly padding and it is 18-32% slower than the SM100
+# path.
 _SM107_M_TILE = 256
 _SM107_MAX_TILES = 4
+
+# The private TokenSpeed helpers this path calls, with the parameters it passes.
+# Releases differ: tokenspeed-mla 2.0.2 adds a required ``enable_packed_q`` (True =
+# always pack rows into 256-row tiles, the behaviour of the later builds that dropped
+# the flag). Any other signature disables the path instead of failing at the first
+# decode.
+_SM107_DECODE_KWARGS = frozenset(
+    (
+        "q_latent", "q_rope", "c_latent", "c_rope", "block_tables", "seq_lens",
+        "workspace_buffer", "out", "page_size", "max_seq_len", "softmax_scale",
+        "output_scale", "is_var_seq", "causal_mask", "window_left", "enable_pdl",
+        "return_lse", "causal_seqs", "cp_world", "cp_rank", "local_visible_lens",
+        "min_split_kv", "compute_capability",
+    )
+)  # fmt: skip
+_SM107_COMPILE_KWARGS = frozenset(
+    (
+        "page_size", "num_heads", "seq_len_q", "is_var_seq", "causal_mask",
+        "is_workspace_size_zero", "use_pdl", "use_fp16_softmax", "reducer_max_splits",
+        "output_dtype",
+    )
+)  # fmt: skip
+
+
+@functools.cache
+def _sm107_decode_extra_kwargs() -> "dict[str, bool] | None":
+    """Extra keyword arguments ``_sm107_fp8_out_decode`` needs in the installed
+    TokenSpeed ({} or {"enable_packed_q": True}), or None when its SM107 helpers
+    are missing or have a signature this path does not know."""
+    import inspect
+
+    try:
+        from tokenspeed_mla import mla_decode as md
+    except ImportError:
+        return None
+    names = (
+        "_sm107_fp8_out_decode", "_get_compiled_sm107_mla_kernel",
+        "_get_sm107_split_kv_and_workspace_size", "_get_reducer_max_splits",
+        "get_max_active_clusters", "_SM107_FP16_SOFTMAX",
+    )  # fmt: skip
+    if not all(hasattr(md, n) for n in names):
+        return None
+
+    def required(params) -> set[str]:
+        return {n for n, p in params.items() if p.default is inspect.Parameter.empty}
+
+    try:
+        dec = inspect.signature(md._sm107_fp8_out_decode).parameters
+        comp = inspect.signature(md._get_compiled_sm107_mla_kernel).parameters
+        split = inspect.signature(md._get_sm107_split_kv_and_workspace_size).parameters
+    except (TypeError, ValueError):
+        return None
+    extra: dict[str, bool] = {}
+    if "enable_packed_q" in dec:
+        extra["enable_packed_q"] = True
+    if (
+        not set(dec) >= _SM107_DECODE_KWARGS
+        or not required(dec) <= _SM107_DECODE_KWARGS | set(extra)
+        or set(comp) != _SM107_COMPILE_KWARGS
+        or len(split) != 7
+    ):
+        logger.info_once(
+            "TokenSpeed MLA decode: the installed tokenspeed_mla SM107 helpers "
+            "have an unknown signature; SM107 M256 decode disabled."
+        )
+        return None
+    return extra
 
 
 def _sm107_split_floor() -> int:
@@ -186,11 +257,16 @@ def sm107_warmup(
     clusters = md.get_max_active_clusters(4) * 4
     max_tiles = -(-max_seq_len // 128)
     tile_counts = sorted(
-        {t for t in range(1, 257)} | {1 << i for i in range(max_tiles.bit_length() + 1)} | {max_tiles}
+        {t for t in range(1, 257)}
+        | {1 << i for i in range(max_tiles.bit_length() + 1)}
+        | {max_tiles}
     )
     keys = set()
     for q_len in sorted(q_lens):
-        if not 0 < q_len <= impl._query_len or heads * q_len > _SM107_M_TILE * _SM107_MAX_TILES:
+        if (
+            not 0 < q_len <= impl._query_len
+            or not _SM107_M_TILE <= heads * q_len <= _SM107_M_TILE * _SM107_MAX_TILES
+        ):
             continue
         tiles = -(-heads * q_len // _SM107_M_TILE)
         for b in range(1, max_requests + 1):
@@ -199,13 +275,20 @@ def sm107_warmup(
                     continue
                 try:
                     split, size = md._get_sm107_split_kv_and_workspace_size(
-                        b, tiles, _SM107_M_TILE, impl.kv_lora_rank, clusters, 128 * t,
+                        b,
+                        tiles,
+                        _SM107_M_TILE,
+                        impl.kv_lora_rank,
+                        clusters,
+                        128 * t,
                         impl._sm107_split,
                     )
                 except ValueError:
                     continue
                 for causal in causal_modes:
-                    keys.add((q_len, causal, size == 0, md._get_reducer_max_splits(split)))
+                    keys.add(
+                        (q_len, causal, size == 0, md._get_reducer_max_splits(split))
+                    )
     for q_len, causal, ws_zero, reducer in sorted(keys):
         md._get_compiled_sm107_mla_kernel(
             page_size=page_size,
@@ -417,27 +500,27 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
             torch.cuda.is_available()
             and torch.cuda.get_device_capability() == (10, 7)
             and _sm107_split_floor() > 0
-            and num_heads * self._query_len <= _SM107_M_TILE * _SM107_MAX_TILES
+            and _SM107_M_TILE
+            <= num_heads * self._query_len
+            <= _SM107_M_TILE * _SM107_MAX_TILES
+            and _sm107_decode_extra_kwargs() is not None
         ):
-            from tokenspeed_mla import mla_decode as md
-
-            if hasattr(md, "_sm107_fp8_out_decode"):
-                bound = _sm107_workspace_bound(
-                    self._max_decode_requests,
-                    -(-num_heads * self._query_len // _SM107_M_TILE),
-                    self.kv_lora_rank,
-                    config.model_config.max_model_len,
-                    _sm107_split_floor(),
+            bound = _sm107_workspace_bound(
+                self._max_decode_requests,
+                -(-num_heads * self._query_len // _SM107_M_TILE),
+                self.kv_lora_rank,
+                config.model_config.max_model_len,
+                _sm107_split_floor(),
+            )
+            if bound >= 0:
+                self._sm107_split = _sm107_split_floor()
+                self._sm107_workspace = max(bound, 1)
+                logger.info_once(
+                    "TokenSpeed MLA decode: SM107 M256 kernel (BF16 out, split "
+                    "floor %d, workspace %.2f GiB)",
+                    self._sm107_split,
+                    bound / (1 << 30),
                 )
-                if bound >= 0:
-                    self._sm107_split = _sm107_split_floor()
-                    self._sm107_workspace = max(bound, 1)
-                    logger.info_once(
-                        "TokenSpeed MLA decode: SM107 M256 kernel (BF16 out, split "
-                        "floor %d, workspace %.2f GiB)",
-                        self._sm107_split,
-                        bound / (1 << 30),
-                    )
 
         self.softmax_scale: float | None = None
         self.output_scale: float | None = None
@@ -517,6 +600,7 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
             self._sm107_split
             and self.dcp_world_size == 1
             and q.shape[1] <= self._query_len  # DSpark drafts with query_len - 1
+            and q.shape[1] * q.shape[2] >= _SM107_M_TILE  # one full M tile
             and q.shape[0] <= self._max_decode_requests
             and q.stride(1) == q.shape[2] * q.stride(2)
             and not self.need_to_return_lse_for_decode
@@ -655,6 +739,7 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
             local_visible_lens=None,
             min_split_kv=self._sm107_split,
             compute_capability=(10, 7),
+            **_sm107_decode_extra_kwargs(),
         )
         return out.view(-1, H, L)
 

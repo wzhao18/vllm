@@ -3,12 +3,15 @@ min_split_kv + W6 M5 length-proportional splits) vs the SM107 M256 kernel (4-CTA
 
 usage: python3 bench_draft_attn.py --shapes <bench shapes.json> [--cases q8_r16_agx,...] [--qlen 8] [--heads 64]
 Timing: CUDA graph of N back-to-back launches, median of samples (KV is GBs, so no L2 reuse across launches)."""
-import argparse, json, math, statistics
+import argparse, inspect, json, math, statistics
 import torch
 import tokenspeed_mla
 from tokenspeed_mla import mla_decode as md
 
 D_LAT, D_ROPE, PAGE = 512, 64, 64
+# tokenspeed-mla 2.0.2 (image) needs enable_packed_q=True; the W6 overlay build always packs
+_SM107_EXTRA = ({"enable_packed_q": True}
+                if "enable_packed_q" in inspect.signature(md._sm107_fp8_out_decode).parameters else {})
 
 
 def rand_fp8(shape, dev, g):
@@ -57,7 +60,7 @@ def sm107(q, kv, bt, seq, maxlen, ws, min_split, out):
         block_tables=bt, seq_lens=seq, workspace_buffer=ws, out=out, page_size=PAGE, max_seq_len=maxlen,
         softmax_scale=0.05, output_scale=1.0, is_var_seq=True, causal_mask=False, window_left=-1, enable_pdl=False,
         return_lse=False, causal_seqs=None, cp_world=1, cp_rank=0, local_visible_lens=None, min_split_kv=min_split,
-        compute_capability=torch.cuda.get_device_capability(q.device))
+        compute_capability=torch.cuda.get_device_capability(q.device), **_SM107_EXTRA)
 
 
 def reference(q, kv, bt, seq, i, out_scale=1.0, sm_scale=0.05):
