@@ -43,11 +43,12 @@ ROWS_ENV = ENV + "_ROWS"
 VARIANT_ENV = ENV + "_VARIANT"
 # Core variant by rows: "u" = the tcgen05 core (CTA per (row, latent half), all 96
 # gathered heads as M = 128), "<S>x<HG>" = the mma.sync core with S KV splits (one
-# cluster) per (row, HG = 16 / 32 gathered heads). DCP4 layer bench (B1 q8 / B1 q4 /
-# B8 q4 / B8 q8, us incl. logits + top-k): 2x16 55.9 / 55.0 / 89.7 / 132.9, 1x32
-# 72.2 / 71.2 / 90.0 / 109.2, u 64.7 / 63.2 / 81.8 / 97.8, trtllm chain 64.1 / 59.7 /
-# 82.5 / 87.7 (kernel RESULTS); DCP16 sets the defaults below.
-VARIANT = "1-16:2x16,17-64:u"
+# cluster) per (row, HG = 16 / 32 gathered heads). DCP4 layer bench with each rank-row
+# capped at 128 local slots (the DCP16 per-rank load; us of the tail after logits +
+# top-k, B1 q8 / B1 q4 / B8 q4 / B8 q8): trtllm chain 27.3 / 24.7 / 29.5 / 24.0; 1x16
+# 11.9 / 12.0 / 15.0 / 22.2; 2x16 11.7 / 11.6 / 21.4 / 36.0; 1x32 14.4 / 14.5 / 17.1 /
+# 19.8; u 17.0 / 16.9 / 18.8 / 20.8 (kernel RESULTS).
+VARIANT = "1-32:1x16,33-64:1x32"
 SPREAD_ENV = ENV + "_SPREAD"
 # Rows whose pushed DcpValue spreads every row's merge over its CTAs (Rubin schedule,
 # LSE box [CAP, H, DCP]; spec verify rows only) instead of one merge CTA per (head, 16
