@@ -166,6 +166,62 @@ def _sm107_workspace_bound(
     return worst
 
 
+def sm107_warmup(
+    impl: "TokenspeedMLAImpl",
+    page_size: int,
+    q_lens: "set[int]",
+    causal_modes: "tuple[bool, ...]",
+    max_requests: int,
+    max_seq_len: int,
+) -> int:
+    """Compile every SM107 decode kernel key (``_get_compiled_sm107_mla_kernel``)
+    that ``impl._forward_sm107`` can reach: the key depends on the batch and
+    max_seq_len only through the split count (no workspace at 1 split, else the
+    reducer's power-of-two capacity). Returns the number of keys compiled."""
+    from tokenspeed_mla import mla_decode as md
+
+    if not impl._sm107_split:
+        return 0
+    heads = impl.num_heads
+    clusters = md.get_max_active_clusters(4) * 4
+    max_tiles = -(-max_seq_len // 128)
+    tile_counts = sorted(
+        {t for t in range(1, 257)} | {1 << i for i in range(max_tiles.bit_length() + 1)} | {max_tiles}
+    )
+    keys = set()
+    for q_len in sorted(q_lens):
+        if not 0 < q_len <= impl._query_len or heads * q_len > _SM107_M_TILE * _SM107_MAX_TILES:
+            continue
+        tiles = -(-heads * q_len // _SM107_M_TILE)
+        for b in range(1, max_requests + 1):
+            for t in tile_counts:
+                if t > max_tiles:
+                    continue
+                try:
+                    split, size = md._get_sm107_split_kv_and_workspace_size(
+                        b, tiles, _SM107_M_TILE, impl.kv_lora_rank, clusters, 128 * t,
+                        impl._sm107_split,
+                    )
+                except ValueError:
+                    continue
+                for causal in causal_modes:
+                    keys.add((q_len, causal, size == 0, md._get_reducer_max_splits(split)))
+    for q_len, causal, ws_zero, reducer in sorted(keys):
+        md._get_compiled_sm107_mla_kernel(
+            page_size=page_size,
+            num_heads=heads,
+            seq_len_q=q_len,
+            is_var_seq=True,
+            causal_mask=causal,
+            is_workspace_size_zero=ws_zero,
+            use_pdl=False,
+            use_fp16_softmax=md._SM107_FP16_SOFTMAX,
+            reducer_max_splits=reducer,
+            output_dtype=torch.bfloat16,
+        )
+    return len(keys)
+
+
 class TokenspeedMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.UNIFORM

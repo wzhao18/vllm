@@ -103,3 +103,32 @@ def test_workspace_bound_covers_batches():
                 b, 2, 256, D_LAT, clusters, n, 32
             )
             assert size <= bound
+
+
+def test_warmup_covers_reachable_keys():
+    """After sm107_warmup, decodes within its batch / length bounds compile nothing."""
+    from types import SimpleNamespace
+
+    from tokenspeed_mla import mla_decode as md
+
+    from vllm.v1.attention.backends.mla.tokenspeed_mla import sm107_warmup
+
+    impl = SimpleNamespace(_sm107_split=32, num_heads=64, kv_lora_rank=D_LAT, _query_len=8)
+    n = sm107_warmup(impl, PAGE, {7, 8}, (False,), 4, 9000)
+    assert n > 0
+    misses = md._get_compiled_sm107_mla_kernel.cache_info().misses
+    ws = torch.empty(1 << 30, dtype=torch.int8, device="cuda")
+    for ctxs in ([5], [300, 9000], [8191, 1, 4096, 129]):
+        for qlen in (7, 8):
+            q, kv, bt, seq = _inputs(ctxs, qlen, 64, seed=len(ctxs))
+            out = torch.empty(len(ctxs), qlen, 64, D_LAT, dtype=torch.bfloat16, device="cuda")
+            md._sm107_fp8_out_decode(
+                q_latent=q[..., :D_LAT], q_rope=q[..., D_LAT:], c_latent=kv[..., :D_LAT],
+                c_rope=kv[..., D_LAT:], block_tables=bt, seq_lens=seq, workspace_buffer=ws,
+                out=out, page_size=PAGE, max_seq_len=max(ctxs), softmax_scale=0.05,
+                output_scale=1.0, is_var_seq=True, causal_mask=False, window_left=-1,
+                enable_pdl=False, return_lse=False, causal_seqs=None, cp_world=1, cp_rank=0,
+                local_visible_lens=None, min_split_kv=32, compute_capability=(10, 7),
+            )
+    torch.cuda.synchronize()
+    assert md._get_compiled_sm107_mla_kernel.cache_info().misses == misses

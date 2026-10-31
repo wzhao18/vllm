@@ -342,6 +342,7 @@ def _warm_stock_mla_decode(worker: Worker) -> None:
     from vllm.v1.attention.backends.mla.tokenspeed_mla import (
         TokenspeedMLAImpl,
         _get_workspace,
+        sm107_warmup,
     )
 
     config = worker.vllm_config
@@ -452,6 +453,15 @@ def _warm_stock_mla_decode(worker: Worker) -> None:
             len(keys),
             len(shapes),
         )
+    # SM107 M256 decode keys (TokenspeedMLAImpl._forward_sm107), per layer shape
+    sm107 = 0
+    for (heads, page, causal, lse, cp, _, _), (qlens, impl, cache) in shapes.items():
+        if not lse and cp == 1:
+            sm107 += sm107_warmup(
+                impl, page, set(qlens), causal, max_reqs, config.model_config.max_model_len
+            )
+    if sm107:
+        logger.info("Kimi-K3: compiled %d tokenspeed SM107 MLA decode keys.", sm107)
 
 
 @torch.inference_mode()
