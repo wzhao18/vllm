@@ -78,6 +78,8 @@ class DsaCore:
             raise ValueError(f"DsaCore: {heads} gathered heads, not a multiple of 32")
         # (heads per CTA: 32, or 16 for more CTAs on a small batch)
         self.ext = load_ext()
+        with torch.cuda.device(device):
+            self.ext.prepare()  # (shared-memory opt-ins, never inside a capture)
         self.device, self.cap, self.heads = device, cap, heads
         self.groups = heads // GROUP_HEADS
         self.max_splits = max_splits

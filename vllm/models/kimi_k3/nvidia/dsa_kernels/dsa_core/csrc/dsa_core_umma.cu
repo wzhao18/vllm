@@ -534,6 +534,11 @@ __global__ void __launch_bounds__(kThreads, 1) dsau_kernel(const __grid_constant
 }
 
 // ------------------------------------------------------------------ host
+void prepare() {
+  C10_CUDA_CHECK(
+      cudaFuncSetAttribute(dsau_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+}
+
 void run(torch::Tensor q, torch::Tensor sel, torch::Tensor cnt, torch::Tensor kv, double s2scale,
          double vscale, torch::Tensor part_peers, torch::Tensor lse_peers, int64_t box_cap,
          int64_t hpr, int64_t parity, int64_t rank, int64_t T, int64_t lse_wide, torch::Tensor err, int64_t spin_ns,

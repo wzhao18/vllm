@@ -693,6 +693,14 @@ void run(torch::Tensor q, torch::Tensor sel, torch::Tensor cnt, torch::Tensor kv
   C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, p));
 }
 
+// Shared-memory opt-ins of every variant, outside any CUDA graph capture.
+void prepare() {
+  C10_CUDA_CHECK(cudaFuncSetAttribute(dsac_kernel<16>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                      Plan<16>::kSmem));
+  C10_CUDA_CHECK(cudaFuncSetAttribute(dsac_kernel<32>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                      Plan<32>::kSmem));
+}
+
 int64_t smem_bytes(int64_t heads_per_cta) {
   return heads_per_cta == 16 ? Plan<16>::kSmem : Plan<32>::kSmem;
 }
@@ -700,6 +708,7 @@ int64_t smem_bytes(int64_t heads_per_cta) {
 }  // namespace k31dsac
 
 namespace k31dsau {
+void prepare();
 void run(torch::Tensor q, torch::Tensor sel, torch::Tensor cnt, torch::Tensor kv, double s2scale,
          double vscale, torch::Tensor part_peers, torch::Tensor lse_peers, int64_t box_cap,
          int64_t hpr, int64_t parity, int64_t rank, int64_t T, int64_t lse_wide, torch::Tensor err, int64_t spin_ns,
@@ -710,4 +719,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("run", &k31dsac::run);
   m.def("run_umma", &k31dsau::run);
   m.def("smem_bytes", &k31dsac::smem_bytes);
+  m.def("prepare", [] {
+    k31dsac::prepare();
+    k31dsau::prepare();
+  });
 }
