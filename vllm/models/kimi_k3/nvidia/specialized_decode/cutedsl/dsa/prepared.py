@@ -39,6 +39,7 @@ from vllm.logger import init_logger
 
 from ..common.host import fake, layout, stream, to_cute
 from ..mla.prepared import pad_requests
+from ..mla.query import GB300_SMS
 from ..mla.value import MlaValue
 from .attn_ds import flashmla_core, flashmla_dcp_core
 from .attn_fi import FlashInferCore, dsa_on_flashinfer, fi_kernels, kernel_for
@@ -99,6 +100,13 @@ HELD_KERNELS = ("prims_ts", "trtllm")
 # many rows (0: never). Under fork it measured no gain (QueryNorm stays a launch);
 # under DCP8 wait it lost 1-8 us (it would wait on MlaQuery's q mailbox poll).
 FUSED_INDEX = 64
+# Rubin-class devices (more SMs than GB300) under DCP: the #63 merge reads DeepGEMM's
+# logits and DeepSelect's local top-N, not the fused DCP indexer's. GR100 DCP16 q8,
+# one GPU at a DCP16 rank's shapes, exchanges stubbed, us per layer at 75K, block with
+# the fused DCP indexer vs without (front overlap): M8 61.6 vs 60.8, M16 79.1 vs
+# 64.2, M32 85.4 vs 69.8, M64 98.9 vs 70.5 (IndexerScore + IndexerLocalTopk 26-62 us
+# at 16-64 rows, against DeepGEMM 6.0-6.6 + DeepSelect 4.0-4.3 + pack 1.4-1.7).
+RUBIN_DCP_FUSED_INDEXER = False
 
 
 @cache
@@ -255,8 +263,11 @@ class PreparedDsa:
         self.indexer_stage = IndexerStage(self.indexer, merge_rows)
         self.shapes = [(b, q) for b in pitches for q in queries if b % q == 0]
         self.fi = None
+        sms = torch.cuda.get_device_properties(self.device).multi_processor_count
+        self.rubin = sms > GB300_SMS
         self.overlaps = {
-            (b, q): overlap_for(b, overlap, self.dcp > 1) for b, q in self.shapes
+            (b, q): overlap_for(b, overlap, self.dcp > 1, self.rubin)
+            for b, q in self.shapes
         }
         if self.fp8:
             if kernels is None:
@@ -294,10 +305,13 @@ class PreparedDsa:
             )
         self.kernels, self.overlap_kernels = {}, {}
         local_topk = self.indexer_stage.local_topk
+        # The fused DCP indexer feeds the #63 merge (RUBIN_DCP_FUSED_INDEXER).
+        rubin_fused = not self.rubin or RUBIN_DCP_FUSED_INDEXER
+        self.dcp_fused = bool(local_topk) and rubin_fused
         static = (
             fused_indexer_static_unsupported(self.indexer, *s) for s in self.shapes
         )
-        if self.fp8 and (self.dcp == 1 or local_topk) and not any(static):
+        if self.fp8 and (self.dcp == 1 or self.dcp_fused) and not any(static):
             # The fused indexer's buffers (prepare_cache), shared by every layer,
             # sized for the longest context the KV cache can hold: reserved now, as
             # the specialized decode is built before vLLM profiles its memory for
@@ -364,7 +378,7 @@ class PreparedDsa:
             args = self.indexer, self.shapes, self.device, rows
             self.fused = FusedIndexer(*args, hold=hold, page=kv.shape[1])
         stage = self.indexer_stage
-        if stage.local_topk and not any(unsupported):
+        if self.dcp_fused and not any(unsupported):
             stage.fused = FusedIndexer(
                 self.indexer,
                 self.shapes,

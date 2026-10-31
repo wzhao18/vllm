@@ -95,9 +95,17 @@ def dsa_on_flashinfer(attention) -> bool:
 
 def fi_kernels(kv_cache_dtype) -> tuple[str, ...]:
     """The sparse MLA kernels the specialized decode picks from per batch (FI_KERNEL):
-    trtllm-gen and prims_ts on a per-tensor FP8 cache, prims_ts alone on an
-    nvfp4_ds_mla one (no trtllm-gen kernel reads it)."""
-    return ("prims_ts",) if kv_cache_dtype == "nvfp4_ds_mla" else KERNELS
+    trtllm-gen and prims_ts on a per-tensor FP8 cache (trtllm-gen alone where
+    FlashInfer cannot plan prims_ts: SM107, where FlashInfer 0.7.2 has no prims_ts
+    sparse MLA and 0.7.3 accepts SM100 / SM103 only, as the stock decode there),
+    prims_ts alone on an nvfp4_ds_mla one (no trtllm-gen kernel reads it)."""
+    if kv_cache_dtype == "nvfp4_ds_mla":
+        return ("prims_ts",)
+    from vllm.utils.flashinfer import prims_ts_sparse_mla_format_error
+
+    if prims_ts_sparse_mla_format_error("native") is not None:
+        return ("trtllm",)
+    return KERNELS
 
 
 def kernel_for(rows, dcp, kernels):

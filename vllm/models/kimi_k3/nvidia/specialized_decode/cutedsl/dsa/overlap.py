@@ -67,9 +67,15 @@ from ..mla.query import Q_SENT, TILED_FROM
 #   wins at 128K / AgentX (R64 -10.2 / -0.4, R48 -7.5 / -5.0, R32 -3.4 / -2.6 us)
 #   and loses at 8K / 32K (R26 +6.3 / +4.4, R48 +4.3 / +1.6 us); front everywhere
 #   (the long-context AgentX workload). wait with IndexFrontMma lost 1-8 us.
+# - Rubin DCP16 (GR100, 212 SMs, q8, the #63 merge with DeepGEMM logits; one GPU at
+#   a DCP16 rank's shapes, exchanges stubbed, us per layer at 75K / AgentX): front
+#   (the cluster IndexFront to 40 rows, IndexFrontMma from 41) vs fork: M8 60.8 /
+#   61.6 vs 62.6 / 62.5, M16 64.2 / 64.8 vs 65.8 / 67.1, M32 69.8 / 71.5 vs 69.6 /
+#   70.5, M64 70.5 / 70.3 vs 66.7 / 67.3: front up to 16 rows, then fork.
 QUERY_OVERLAP = {
     "tp": "1-20:late_front,21-320:fork",
     "dcp": "1-320:front",
+    "dcp_rubin": "1-16:front,17-320:fork",
 }
 # TP without the fused indexer (the late modes follow its select): the TP table the
 # stack ran before them.
@@ -80,10 +86,12 @@ NORM = ("fork", "late")  # QueryNorm writes the q_c rows
 FRONT = ("front", "late_front")  # IndexFront
 
 
-def overlap_for(batch, policy=None, dcp=False):
+def overlap_for(batch, policy=None, dcp=False, rubin=False):
     """The query overlap mode of ``batch`` rows: ``policy`` is a mode or a
-    "rows:mode,..." table (default QUERY_OVERLAP of the topology, ``dcp``)."""
-    policy = policy or QUERY_OVERLAP["dcp" if dcp else "tp"]
+    "rows:mode,..." table (default QUERY_OVERLAP of the topology: ``dcp``, on a
+    Rubin-class device ``rubin``)."""
+    if not policy:
+        policy = QUERY_OVERLAP["tp" if not dcp else "dcp_rubin" if rubin else "dcp"]
     mode = policy if policy in MODES else batch_table(policy).get(batch, "fork")
     if mode not in MODES:
         raise ValueError(f"Kimi K3.1 DSA query overlap {mode!r}: expected {MODES}")
