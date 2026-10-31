@@ -27,9 +27,10 @@ def _ref(q, kv, block_table, seq_lens, scale):
     return torch.stack(out)
 
 
+@pytest.mark.parametrize("total_splits", [0, 96])
 @pytest.mark.parametrize("max_split", [16, 64])
 @pytest.mark.parametrize("q_len", [4, 8])
-def test_var_split_matches_reference(max_split, q_len):
+def test_var_split_matches_reference(max_split, q_len, total_splits):
     torch.manual_seed(0)
     heads = 64
     lens = [4096, 37888, 131072, 3000, 659456, 129]
@@ -65,15 +66,18 @@ def test_var_split_matches_reference(max_split, q_len):
     )
     base = tokenspeed_mla.tokenspeed_mla_decode(**common, min_split_kv=16)
     counts = tokenspeed_mla.tokenspeed_mla_var_split_counts(
-        seq_lens, max_split, heads, q_len
+        seq_lens, max_split, heads, q_len, total_splits=total_splits
     )
     assert counts.dtype == torch.int32 and int(counts.max()) <= max_split
-    assert int(counts[lens.index(max(lens))]) == max_split
+    assert int(counts.min()) >= 1
+    # No empty split: ceil(t / ceil(t / s)) == s for t KV tiles of 128.
+    t = (seq_lens + 127) // 128
+    assert torch.equal(-(-t // -(-t // counts)), counts.long())
+    if total_splits:
+        assert int(counts.sum()) <= total_splits + len(lens)
     var = tokenspeed_mla.tokenspeed_mla_decode(
         **common, max_split_kv=max_split, block_split_kvs=counts
     )
-    var_self = tokenspeed_mla.tokenspeed_mla_decode(**common, max_split_kv=max_split)
     ref = _ref(q, kv, block_table, seq_lens, scale)
     torch.testing.assert_close(var.float(), ref, atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(var.float(), base.float(), atol=2e-2, rtol=2e-2)
-    torch.testing.assert_close(var, var_self, atol=0, rtol=0)

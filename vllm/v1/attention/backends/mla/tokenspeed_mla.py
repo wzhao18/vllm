@@ -414,8 +414,12 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
             return cached[1]
         from tokenspeed_mla import tokenspeed_mla_var_split_counts
 
+        # With a split floor, the batch keeps the uniform floor's total
+        # (min_split_kv per request) and moves splits to its long requests.
+        seq_lens = decode.seq_lens
+        total = self._min_split_kv * seq_lens.numel() if self._min_split_kv > 1 else 0
         counts = tokenspeed_mla_var_split_counts(
-            decode.seq_lens, self._max_split_kv, q.shape[-2], q.shape[1], q.dtype
+            seq_lens, self._max_split_kv, q.shape[-2], q.shape[1], q.dtype, total
         )
         decode._tokenspeed_block_split_kvs = (self._max_split_kv, counts)
         return counts

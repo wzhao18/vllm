@@ -1,6 +1,6 @@
 --- a/tokenspeed_mla/mla_decode.py
 +++ b/tokenspeed_mla/mla_decode.py
-@@ -732,6 +732,37 @@
+@@ -732,6 +732,46 @@
      return out
  
  
@@ -10,27 +10,36 @@
 +    num_heads: int,
 +    q_len: int,
 +    dtype: torch.dtype = torch.float8_e4m3fn,
++    total_splits: int = 0,
 +) -> torch.Tensor:
 +    """Per-request split counts for ``tokenspeed_mla_decode(max_split_kv=...)``
-+    (int32 [B], on the device, CUDA-graph safe): proportional to each
-+    request's KV tiles, the longest request getting ``max_split_kv``, with no
-+    empty split. Compute once and pass as ``block_split_kvs`` to every layer
-+    of a step."""
++    (int32 [B], on the device, CUDA-graph safe), with no empty split. Every
++    split walks about the same number P of KV tiles: P is the smallest that
++    keeps every request within ``max_split_kv`` splits and, when
++    ``total_splits`` > 0, the batch within about ``total_splits`` splits
++    (e.g. ``min_split_kv * B``: uniform batches keep the uniform floor,
++    skewed ones move splits to their long requests). Compute once and pass
++    as ``block_split_kvs`` to every layer of a step."""
 +    mma_qk_tiler_mn, _ = select_mla_decode_tilers(
 +        num_heads,
 +        q_len,
 +        is_fp8=dtype == torch.float8_e4m3fn,
 +        compute_capability=torch.cuda.get_device_capability(seq_lens.device),
 +    )
-+    return _var_split_counts(seq_lens.to(torch.int32), max_split_kv, mma_qk_tiler_mn[1])
++    return _var_split_counts(
++        seq_lens.to(torch.int32), max_split_kv, mma_qk_tiler_mn[1], total_splits
++    )
 +
 +
-+def _var_split_counts(cache_seqs: torch.Tensor, max_split_kv: int, tile_n: int) -> torch.Tensor:
-+    # ceil(tiles / ceil(tiles / s)) == s for the returned s: no empty split.
++def _var_split_counts(
++    cache_seqs: torch.Tensor, max_split_kv: int, tile_n: int, total_splits: int = 0
++) -> torch.Tensor:
 +    k_tiles = ((cache_seqs + (tile_n - 1)) // tile_n).clamp_(min=1)
-+    max_tiles = k_tiles.amax()
-+    s = (k_tiles * max_split_kv + max_tiles - 1) // max_tiles
-+    s = torch.minimum(s.clamp_(1, max_split_kv), k_tiles)
++    per = (k_tiles.amax() + max_split_kv - 1) // max_split_kv
++    if total_splits > 0:
++        per = torch.maximum(per, (k_tiles.sum() + total_splits - 1) // total_splits)
++    s = (k_tiles + per - 1) // per
++    # ceil(tiles / ceil(tiles / s)) == s: no empty split.
 +    per = (k_tiles + s - 1) // s
 +    return ((k_tiles + per - 1) // per).to(torch.int32)
 +
@@ -38,7 +47,7 @@
  def tokenspeed_mla_decode(
      query: torch.Tensor,
      kv_cache: torch.Tensor,
-@@ -758,6 +789,8 @@
+@@ -758,6 +798,8 @@
      *,
      min_split_kv: int = 1,
      local_visible_lens: Optional[torch.Tensor] = None,
@@ -47,7 +56,7 @@
  ) -> torch.Tensor:
      """CuTe DSL MLA decode kernel for SM100, SM103 and SM107.
  
-@@ -854,6 +887,23 @@
+@@ -854,6 +896,23 @@
          The effective value is capped to avoid creating empty partitions.
          Defaults to 1, which enables automatic split selection.
  
@@ -71,7 +80,7 @@
      local_visible_lens : torch.Tensor, optional
          Contiguous int32 [B, q_len] tensor on the query device, supported with
          BF16 or FP8 E4M3 Q/KV.
-@@ -1002,17 +1052,40 @@
+@@ -1002,17 +1061,40 @@
  
      # Cached split_kv and workspace_size computation
      max_active_blocks = get_num_sm(query.device)
@@ -122,7 +131,7 @@
  
      # Prepare workspace: slice of contiguous 1D buffer is already contiguous
      assert (
-@@ -1083,8 +1156,11 @@
+@@ -1083,8 +1165,11 @@
              else causal_seqs.to(torch.int32)
          )
  
@@ -136,3 +145,30 @@
      # FP8: keep the row max while it grows by <= 8 log2 units (P <= 256 < 448).
      skip_correction_threshold = 8.0 if is_fp8 else 0.0
  
+6
+--- a/tokenspeed_mla/__init__.py
++++ b/tokenspeed_mla/__init__.py
+@@ -23,6 +23,7 @@
+ try:
+     from tokenspeed_mla.mla_decode import (
+         tokenspeed_mla_decode,
++        tokenspeed_mla_var_split_counts,
+     )
+     from tokenspeed_mla.mla_kv_pack_quantize_fp8 import (
+         mla_kv_pack_quantize_fp8,
+@@ -42,6 +43,7 @@
+         ) from _IMPORT_ERROR
+ 
+     tokenspeed_mla_decode = _unavailable
++    tokenspeed_mla_var_split_counts = _unavailable
+     tokenspeed_mla_prefill = _unavailable
+     mla_kv_pack_quantize_fp8 = _unavailable
+     get_num_sm = _unavailable
+@@ -49,6 +51,7 @@
+ 
+ __all__ = [
+     "tokenspeed_mla_decode",
++    "tokenspeed_mla_var_split_counts",
+     "tokenspeed_mla_prefill",
+     "mla_kv_pack_quantize_fp8",
+     "get_num_sm",

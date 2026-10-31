@@ -20,3 +20,6 @@ ARM[bal]="${W6_TAG:-w6-dev} balanced {\"tokenspeed_mla_min_split_kv\":16}"
 # M5: length-proportional drafter split-KV (needs the patched tokenspeed in the env)
 ARM[m5s32]="${W6_M5_TAG:-w6-m5} balanced {\"tokenspeed_mla_max_split_kv\":32}"
 ARM[m5s64]="${W6_M5_TAG:-w6-m5} balanced {\"tokenspeed_mla_max_split_kv\":64}"
+# M5 with the split budget of the uniform floor (16 x requests), at most 64 per request
+ARM[m5b32]="${W6_M5B_TAG:-w6-m5b} balanced {\"tokenspeed_mla_min_split_kv\":16,\"tokenspeed_mla_max_split_kv\":32}"
+ARM[m5b]="${W6_M5B_TAG:-w6-m5b} balanced {\"tokenspeed_mla_min_split_kv\":16,\"tokenspeed_mla_max_split_kv\":64}"
