@@ -775,16 +775,17 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
                         buf[vi * 4 + 3],
                     )
             cute.arch.sync_threads()
-            if tid == Int32(0):
+            # Lane p of warp 0 releases peer p's flag: the fences and release
+            # stores of the 16 peers issue as one warp instruction each, not 16
+            # in sequence (each st.release.sys orders at system scope).
+            if tid < Int32(world_size):
                 cute.arch.fence_acq_rel_sys()
                 flag = seq2[row] + Int32(1)
                 flag_offset = (Int64(dcp_rank) * Int64(max_rows) + Int64(row)) * Int64(
                     4
                 )
-                for p in cutlass.range_constexpr(world_size):
-                    _st_release_sys(
-                        _ld_i64(peer_flags + Int64(p * 8)) + flag_offset, flag
-                    )
+                peer = _ld_i64(peer_flags + Int64(tid) * Int64(8))
+                _st_release_sys(peer + flag_offset, flag)
 
         @cute.kernel
         def device_kernel(
