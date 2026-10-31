@@ -2875,6 +2875,45 @@ def test_dcp_topk_merge_rows_deterministic(dcp8_group, saturate):
     dcp_merge_vs_exact(dcp8_group, saturate, repeats=8)
 
 
+@pytest.mark.skip_global_cleanup  # no group needed: keep a DCP8 launch's group
+@pytest.mark.parametrize("check", [False, True], ids=["rows", "rows+ids"])
+def test_merge_rows_kernels_compile_at_prepare(monkeypatch, check):
+    """The #63 merge's select and rescue kernels as ``merge_rows`` launches them
+    (physical rows of the MLA blocks; global ids too under VLLM_DSA_BPRIME_CHECK)
+    compile when PreparedDsa prepares its cache (``IndexerStage.warm``), not at
+    their first launch: the specialized decode runs only inside graph captures,
+    where a first compile invalidates the capture (CUDA error 901), and the
+    runner's JIT warmup compiles only the stock indexer's variant."""
+    from unittest.mock import MagicMock
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa import (
+        indexer_stage,
+    )
+    from vllm.v1.attention.ops.dcp_topk_merge import kernels as merge
+
+    stage = indexer_stage.IndexerStage.__new__(indexer_stage.IndexerStage)
+    stage.topk, stage.local_topk, stage.indexer = 2048, 192, SimpleNamespace()
+    stage.indexer.dcp_world_size = 16
+    stage.dcp_ids = torch.empty(1) if check else None
+    # As DCPTopkSelectKernel / DCPTopkRescueKernel.__call__ key merge_rows' launch.
+    key = dict(topk=2048, local_topk=192, world_size=16, emit_ids=check)
+    select = merge._DCP_TOPK_SELECT_KERNEL
+    rescue = merge._DCP_TOPK_RESCUE_KERNEL
+    keys = (
+        select.dispatch(**key, block_size=1024, exact=True),
+        rescue.dispatch(**key, block_size=1024),
+    )
+    stage.warm(1024)
+    assert keys[0] in select._compiled_cache and keys[1] in rescue._compiled_cache
+    warm = MagicMock()
+    monkeypatch.setattr(indexer_stage, "warm_merge_rows", warm)
+    stage.warm(1024)
+    warm.assert_called_once_with(2048, 192, 16, check, 1024)
+    stage.local_topk = 0  # no direct merge (TP, or no #63 merge): nothing
+    stage.warm(1024)
+    warm.assert_called_once()
+
+
 @pytest.mark.skip_global_cleanup  # pure policy check: keep a DCP8 launch's group
 def test_dcp_partials_policy():
     """The DcpValue partials policy: a format for every batch ("bf16" or "proj"), a

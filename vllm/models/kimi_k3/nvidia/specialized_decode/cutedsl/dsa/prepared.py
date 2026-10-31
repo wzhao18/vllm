@@ -387,6 +387,7 @@ class PreparedDsa:
                 local_topk=stage.local_topk,
                 packed=True,
             )
+        stage.warm(kv.shape[1])  # the merge's rows variant, before any capture
         self.log_policy(unsupported)
         return self
 

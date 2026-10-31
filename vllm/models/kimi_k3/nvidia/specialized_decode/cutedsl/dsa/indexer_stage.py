@@ -13,6 +13,8 @@ With the fused DCP indexer (``fused``, indexer.py) the scoring is its scorer (th
 same logits layout) and, packed, its select also takes the local top-N (the
 merge's B' rows), so the merge only all-gathers and selects."""
 
+from functools import cache
+
 import torch
 
 from vllm.utils.torch_utils import _encode_layer_name
@@ -85,6 +87,13 @@ class IndexerStage:
         )
 
     # --- DCP top-k merge (#63) ---------------------------------------------------
+    def warm(self, block_size):
+        """Compile ``merge_rows``' merge kernels for MLA blocks of ``block_size``
+        tokens now (nothing without the direct DCP merge): see warm_merge_rows."""
+        if self.local_topk:
+            args = self.topk, self.local_topk, self.indexer.dcp_world_size
+            warm_merge_rows(*args, self.dcp_ids is not None, block_size)
+
     def merge_rows(self, q_fp8, head_w, metadata, stride_rows, batch, q=1):
         """DCP: this rank's flat KV rows of the merged global top-k of the first
         ``batch`` rows (``q`` per request; compacted to a prefix, at most N per
@@ -225,3 +234,24 @@ class IndexerStage:
         )
 
     # -------------------------------------------------------------------------------
+
+
+@cache
+def warm_merge_rows(topk, local_topk, world_size, emit_ids, block_size):
+    """Compile the #63 merge's kernels as ``merge_rows`` launches them (physical rows
+    of ``block_size``-token blocks; global ids too with ``emit_ids``) now, once per
+    process. The specialized decode runs only inside CUDA graph captures, where a
+    first compile invalidates the capture (CUDA error 901), and it is built after
+    the runner's JIT warmup registry closes, whose warmup compiles only the stock
+    indexer's variant (global ids, no rows)."""
+    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
+    from vllm.v1.attention.ops.dcp_topk_merge.kernels import (
+        register_dcp_topk_merge_warmup,
+    )
+
+    registry = JitWarmupRegistry(None)
+    with registry.activate():
+        register_dcp_topk_merge_warmup(
+            topk, local_topk, world_size, emit_ids=emit_ids, block_size=block_size
+        )
+    registry.warmup()
