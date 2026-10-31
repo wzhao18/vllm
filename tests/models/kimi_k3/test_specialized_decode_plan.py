@@ -329,6 +329,10 @@ def test_attention_checks_the_dsa_seam_at_startup(monkeypatch, wide, skip_topk):
     runtime = SimpleNamespace(
         tp=16, dcp=1, q=8, tuned=BATCHES, batches=(*BATCHES, *wide), wide=wide,
         queries=(1, 8), dsa_core="auto", dsa_layers=0,
+        context=Context(
+            arch="rubin", tp=16, rank=0, dcp=1, sms=212, q=8, max_rows=256,
+            max_context=1 << 20, bf16_state=True,
+        ),
     )  # fmt: skip
     provider: Any = object.__new__(Attention)
     decoder = SimpleNamespace(self_attn=attention)
@@ -341,8 +345,9 @@ def test_attention_checks_the_dsa_seam_at_startup(monkeypatch, wide, skip_topk):
     assert provider.dsa_columns == (COLUMNS if wide else ())
 
 
+@pytest.mark.parametrize("prepared", [False, True], ids=["seam", "prepared"])
 @pytest.mark.parametrize("fused_oproj", [True, False], ids=["two-shot", "stock-oproj"])
-def test_run_wide_runs_dsa_layers_through_the_seam(monkeypatch, fused_oproj):
+def test_run_wide_runs_dsa_layers_through_the_seam(monkeypatch, fused_oproj, prepared):
     """A DSA layer's wide step: the in-projection into the packed rows, seam S2-DSA
     into the o-projection's input rows, then the fused o-projection, or the stock one
     (seam S3: DSA layers have no GEMM-AR) and the unfused AttnRes."""
@@ -360,11 +365,18 @@ def test_run_wide_runs_dsa_layers_through_the_seam(monkeypatch, fused_oproj):
     provider.projection.run.side_effect = lambda x, out: out
     provider.kda_stock = provider.mla_wide = frozenset()
     provider.dsa_columns = COLUMNS
+    provider.dsa_wide = frozenset({b} if prepared else ())
+    provider.run_dsa = MagicMock()
     provider.oproj_wide = frozenset({b} if fused_oproj else ())
     provider.output, provider.post = MagicMock(), MagicMock()
     x, out = torch.zeros(b, HIDDEN), torch.zeros(b, HIDDEN)
     rows = provider.run_wide(x, out, None, None, [], None, {}, 8, None)
-    seam.assert_called_once_with(module, x, projected, local, COLUMNS)
+    if prepared:  # PreparedDsa on the widened box (dabb1639b6)
+        seam.assert_not_called()
+        provider.run_dsa.assert_called_once_with(projected, local, [], None, {}, 8)
+    else:
+        provider.run_dsa.assert_not_called()
+        seam.assert_called_once_with(module, x, projected, local, COLUMNS)
     if fused_oproj:
         provider.output.run.assert_called_once_with(local, None, None, out)
         assert rows is provider.output.run.return_value[0]
@@ -381,7 +393,9 @@ def test_wide_choices_name_the_dsa_seam():
     decode: Any = object.__new__(SpecializedDecode)
     decode.attention = {
         0: SimpleNamespace(kind="kda", oproj_wide=frozenset(rows)),
-        1: SimpleNamespace(kind="dsa", oproj_wide=frozenset(rows)),
+        1: SimpleNamespace(
+            kind="dsa", oproj_wide=frozenset(rows), dsa_wide=frozenset({72})
+        ),
     }
     decode.stock_attn_res = decode.sharded = frozenset()
     decode.feed_forward = {}
@@ -394,7 +408,10 @@ def test_wide_choices_name_the_dsa_seam():
     for b in rows:
         choices = decode.wide_choices(b, 8)
         gemm = "splitk" if b in split_k else "cublas"
-        assert choices["dsa"] == Choice(Path.STOCK, note=f"{gemm} + S2")
+        if b == 72:  # PreparedDsa (DSA_WIDE, dabb1639b6)
+            assert choices["dsa"] == Choice(Path.GENERIC, "wide", "prepared")
+        else:
+            assert choices["dsa"] == Choice(Path.STOCK, note=f"{gemm} + S2")
         assert "mla" not in choices
 
 
