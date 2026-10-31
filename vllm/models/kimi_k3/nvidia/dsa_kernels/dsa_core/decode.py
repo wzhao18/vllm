@@ -18,7 +18,7 @@ by
     -> DcpValue(pushed=True) (merge, W_UV, gate)
 
 Switch: ``VLLM_K31_DSA_CORE`` = 1 (default: per-tensor FP8 KV under DCP wherever
-DcpExchange's top-k is) | 0; ``VLLM_K31_DSA_CORE_ROWS`` = most rows (default 32, see
+DcpExchange's top-k is) | 0; ``VLLM_K31_DSA_CORE_ROWS`` = most rows (default 64, see
 ROWS; at most the DcpBox cap of 64); ``VLLM_K31_DSA_CORE_VARIANT`` = the core variant by rows
 (``batch_table`` syntax, see VARIANT); ``VLLM_K31_DSA_CORE_SPREAD`` = rows whose
 pushed DcpValue spreads its merge (see SPREAD). ``VLLM_K31_DSA_CORE_STATS=1`` logs the kernel's error word
