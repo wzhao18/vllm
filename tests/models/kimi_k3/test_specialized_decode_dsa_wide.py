@@ -248,12 +248,14 @@ def test_query_and_cache_insert(batch, block, gap):
     assert (ours[:, :512] != ref[:, :512]).float().mean() < 0.01
 
 
+@pytest.mark.parametrize("k_scale", [2.0, 0.875])
 @pytest.mark.parametrize("gap", [GAP, FAR])
 @pytest.mark.parametrize("batch", [72, 96])
-def test_fp8_query_and_cache_insert(batch, gap):
+def test_fp8_query_and_cache_insert(batch, gap, k_scale):
     """FlashInfer core: the per-tensor FP8 query rows [B, H, 576] and the FP8 KV row
     in the packed MLA blocks, as the stock FlashInfer path quantizes and writes them
-    (concat_and_cache_mla "fp8"), with non-unit scales."""
+    (concat_and_cache_mla "fp8"), with non-unit scales (0.875: dividing by k_scale
+    and multiplying by its FP32 inverse round some k_pe values apart)."""
     import cutlass
 
     from vllm import _custom_ops as ops
@@ -282,9 +284,11 @@ def test_fp8_query_and_cache_insert(batch, gap):
     query = torch.zeros(batch, HEADS, 576, device=dev, dtype=torch.uint8)
     q_c = torch.zeros(batch, 1536, device=dev, dtype=bf)
     q_scale = torch.full((1,), 0.5, device=dev)
-    k_scale = torch.full((1,), 2.0, device=dev)
+    k_scale = torch.full((1,), k_scale, device=dev)
     args = (to_cute(projected), *(to_cute(w) for w in weights[:4]), to_cute(mla))
-    args += (to_cute(slots, 8), to_cute(1 / q_scale, 4), to_cute(1 / k_scale, 4))
+    # The query multiplies by 1 / q_scale; the KV row is divided by k_scale (as
+    # WideDsa passes them).
+    args += (to_cute(slots, 8), to_cute(1 / q_scale, 4), to_cute(k_scale, 4))
     query_kernel(*args, cutlass.Float32(EPS), to_cute(query), to_cute(q_c), stream(dev))
 
     ref_q_c = rms_norm(projected[:, :1536], q_norm)

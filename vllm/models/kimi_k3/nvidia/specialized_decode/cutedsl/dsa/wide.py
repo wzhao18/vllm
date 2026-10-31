@@ -266,13 +266,14 @@ class WideDsa:
         self.unit = torch.ones(1, dtype=torch.float32, device=self.device)
         self.query, self.qc, self.iq, self.q_fp8, self.head_w, _ = scratch
         self.shapes = [(b, q) for b in pitches for q in queries if b % q == 0]
-        # Inverse per-tensor scales of the FP8 query and KV row (FlashMLA: unused).
-        self.scales_inv = self.unit, self.unit
+        # The FP8 query's inverse per-tensor scale and the KV row's scale: MlaQuery
+        # divides the row by k_scale under DSA, as concat_and_cache_mla (FlashMLA:
+        # unused).
+        self.scales = self.unit, self.unit
         if self.fp8:
-            self.scales_inv = tuple(
-                (1 / scale.float()).reshape(1).to(self.device)
-                for scale in (layer._q_scale, layer._k_scale)
-            )
+            q_scale_inv = (1 / layer._q_scale.float()).reshape(1).to(self.device)
+            k_scale = layer._k_scale.float().reshape(1).to(self.device)
+            self.scales = q_scale_inv, k_scale
             shape = (max(pitches), self.heads, 576)
             self.query = torch.zeros(shape, dtype=torch.uint8, device=self.device)
         # Batches above the box's rows publish into its widened box (one per model,
@@ -423,9 +424,9 @@ class WideDsa:
         qnorm, kvnorm, qb, uk, uv = self.views
         x, q_slots = to_cute(projected), to_cute(slots[:batch], 8)
         kv = to_cute(cache.view(torch.uint8))
-        q_scale_inv, k_scale_inv = (to_cute(t, 4) for t in self.scales_inv)
+        q_scale_inv, k_scale = (to_cute(t, 4) for t in self.scales)
         mailbox = to_cute(box.q[p].view(torch.uint8))
-        scales = q_scale_inv, k_scale_inv, self.eps
+        scales = q_scale_inv, k_scale, self.eps
         q_args = (x, qnorm, kvnorm, qb, uk, kv, q_slots, *scales)
         publish = (mailbox, box.mc(p), cutlass.Int32(box.rank))
         mq(*q_args, to_cute(self.query[:batch]), to_cute(self.qc[:batch]), *publish, s)
