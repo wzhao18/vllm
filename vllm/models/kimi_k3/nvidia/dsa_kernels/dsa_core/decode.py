@@ -48,7 +48,12 @@ VARIANT_ENV = ENV + "_VARIANT"
 # max rank; B1 q8 / B1 q4 / B8 q4 / B8 q8): trtllm chain 65.5 / 61.3 / 71.2 / 74.8;
 # 1x16 51.0 / 48.7 / 59.0 / 76.8; 1x32 54.9 / 52.4 / 63.7 / 82.8; u 55.4 / 53.2 / 63.0
 # / 78.0; 2x16 50.4 / 48.4 / 66.2 / 91.7 (kernel RESULTS).
-VARIANT = "1-64:1x16"
+# Up to 16 rows two splits per (row, 16 heads): free on balanced rows (rows of <= 4
+# chunks run unsplit) and half the serial chunks when one rank holds most of a row's
+# entries (ties at the cut go to ranks in rank order: zero index keys put ~2040 of 2048
+# on rank 0; the 9-layer real-weight bench without the index fill, us/step 1x16 vs the
+# trtllm chain: B1 956 vs 844, B8 1655 vs 1496).
+VARIANT = "1-16:2x16,17-64:1x16"
 SPREAD_ENV = ENV + "_SPREAD"
 # Rows whose pushed DcpValue spreads every row's merge over its CTAs (Rubin schedule,
 # LSE box [CAP, H, DCP]; spec verify rows only) instead of one merge CTA per (head, 16
