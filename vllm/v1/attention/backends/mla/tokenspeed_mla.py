@@ -136,7 +136,7 @@ def _get_workspace(
 # per step from 3.04 to 2.71 ms (r16) and 5.21 to 4.47 ms (r28) vs the SM100 FP8 kernel
 # + length-proportional split (DEP4 8-layer bench, 2 nodes), at the same error against
 # an FP32 reference. VLLM_TOKENSPEED_SM107_SPLIT = its split-KV floor (0 disables the
-# path). Only shapes that fill at least one 256-row tile (num_heads * q_len >= 256) take
+# path; 24 vs 32: drafter 4.46 -> 4.36 ms per step at r28, neutral at r16, step ABBA). Only shapes that fill at least one 256-row tile (num_heads * q_len >= 256) take
 # it: at 4 / 16 heads the tile is mostly padding and it is 18-32% slower than the SM100
 # path.
 _SM107_M_TILE = 256
@@ -211,7 +211,7 @@ def _sm107_decode_extra_kwargs() -> "dict[str, bool] | None":
 
 
 def _sm107_split_floor() -> int:
-    return int(os.environ.get("VLLM_TOKENSPEED_SM107_SPLIT", "32"))
+    return int(os.environ.get("VLLM_TOKENSPEED_SM107_SPLIT", "24"))
 
 
 @functools.cache

@@ -7,7 +7,8 @@ Same algorithm and output contract as ``balanced_topk`` (see
 
 1. ``sample_kernel`` (one CTA per row): candidate threshold ``t0`` on the
    order-preserving 16-bit key from a strided sample (exact for rows of at
-   most ``SAMPLES`` keys), by two 8-bit radix passes over shared histograms.
+   most ``SAMPLES`` keys), by two 8-bit radix passes over shared histograms;
+   ``t0`` aims at ``2 * topk`` keys above it (at most ``TARGET``).
 2. ``filter_kernel`` (persistent grid over the flattened (row, 4096-key
    block) list of the rows longer than ``CAP``): 16-byte loads; each warp
    compacts its keys above ``t0`` (and equal to ``t0``) with a shuffle scan
@@ -40,7 +41,6 @@ _CUDA_SRC = r"""
 namespace {
 
 constexpr int CAP = 16384;
-constexpr int TARGET = 8192;
 constexpr int SAMPLES = 4096;
 constexpr int BLOCK = 4096;          // keys per filter work item
 constexpr int FILTER_THREADS = 256;  // 16 keys per thread
@@ -128,7 +128,7 @@ __device__ uint32_t kth_key(const uint32_t (&k)[PER], int need, int* hist,
 
 __global__ void sample_kernel(const uint16_t* __restrict__ logits, int64_t stride,
                               const int* __restrict__ seq_lens, int next_n,
-                              int width, int topk, bool per_row,
+                              int width, int topk, int target, bool per_row,
                               int* __restrict__ thresh,
                               unsigned long long* __restrict__ counters) {
   __shared__ int hist[256];
@@ -154,7 +154,7 @@ __global__ void sample_kernel(const uint16_t* __restrict__ logits, int64_t strid
       const int64_t j = threadIdx.x + i * SAMPLE_THREADS;
       k[i] = key16(row[(2 * j + 1) * n / (2 * SAMPLES)]);
     }
-    need = min(max((int)(((int64_t)TARGET * SAMPLES + n - 1) / n), 1), SAMPLES);
+    need = min(max((int)(((int64_t)target * SAMPLES + n - 1) / n), 1), SAMPLES);
   }
   int above;
   const uint32_t t = kth_key<PER>(k, need, hist, sh, &above);
@@ -403,7 +403,8 @@ select_kernel(const uint16_t* __restrict__ logits, int64_t stride,
 }  // namespace
 
 void balanced_topk_cuda(torch::Tensor logits, torch::Tensor seq_lens, int64_t next_n,
-                        torch::Tensor out, int64_t topk, torch::Tensor thresh,
+                        torch::Tensor out, int64_t topk, int64_t target,
+                        torch::Tensor thresh,
                         torch::Tensor counters, torch::Tensor cand,
                         torch::Tensor ties, int64_t filter_ctas) {
   const int num_rows = logits.size(0);
@@ -418,8 +419,8 @@ void balanced_topk_cuda(torch::Tensor logits, torch::Tensor seq_lens, int64_t ne
   auto* ctr = reinterpret_cast<unsigned long long*>(counters.data_ptr());
   auto* cnd = reinterpret_cast<unsigned long long*>(cand.data_ptr());
   sample_kernel<<<num_rows, SAMPLE_THREADS, 0, stream>>>(
-      lp, stride, seq_lens.data_ptr<int>(), (int)next_n, width, (int)topk, per_row,
-      thresh.data_ptr<int>(), ctr);
+      lp, stride, seq_lens.data_ptr<int>(), (int)next_n, width, (int)topk,
+      (int)target, per_row, thresh.data_ptr<int>(), ctr);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   filter_kernel<<<(int)filter_ctas, FILTER_THREADS, (num_rows + 1) * sizeof(int), stream>>>(
       lp, stride, seq_lens.data_ptr<int>(), (int)next_n, width, num_rows, per_row,
@@ -501,6 +502,12 @@ def balanced_topk_cuda(
         next_n,
         topk_indices,
         topk,
+        # Twice top-k expected keys above t0: the sample's estimate misses
+        # top-k (the exact streamed fallback) only many standard deviations
+        # out, and the filter and select handle half the candidates of
+        # TARGET (DEP16 q8 owner points, DEP4 8-layer step ABBA on VR200:
+        # -2.3 / -4.0 us per call at 128 / 224 rows of ~105K / ~190K keys).
+        min(2 * topk, TARGET),
         thresh,
         counters,
         cand,
