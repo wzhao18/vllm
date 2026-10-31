@@ -1017,6 +1017,146 @@ def test_kernel_slot_mapping_cuda_matches_torch():
     assert torch.equal(mapped.cpu(), expected)
 
 
+def _slot_mapped_groups(monkeypatch, num_groups: int):
+    """Packed token-cache groups with mapped slots, and the list that records
+    every group a slot mapping is mapped for."""
+    groups = []
+    for _ in range(num_groups):
+        group = _packed_group(1, 8, [64])
+        group.maps_slot_mapping = True
+        group.create_metadata_builders(_VLLM_CONFIG, "cpu", kernel_block_size=1024)
+        manager = torch.zeros(3, 1, 1280 + 64 * len(groups), 8)[:, :, :1024]
+        map_kv_caches_to_kernel_blocks({"layer.0": manager}, [group])
+        groups.append(group)
+    mapped: list[AttentionGroup] = []
+    map_slots = AttentionGroup.map_to_kernel_slot_mapping
+
+    def record(self, *args, **kwargs):
+        mapped.append(self)
+        return map_slots(self, *args, **kwargs)
+
+    monkeypatch.setattr(AttentionGroup, "map_to_kernel_slot_mapping", record)
+    return groups, mapped, map_slots
+
+
+@pytest.mark.parametrize("layer_groups", [[0] * 5, [0, 1, 0, 1, 1]])
+def test_dflash_context_slots_map_once_per_group(monkeypatch, layer_groups):
+    """The draft layers' context slots are mapped once per KV cache group, not
+    once per layer; each layer still gets its group's slots at the same address
+    with the same values."""
+    from types import MethodType
+
+    from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+
+    num_groups = max(layer_groups) + 1
+    groups, mapped, map_slots = _slot_mapped_groups(monkeypatch, num_groups)
+    context = torch.randint(-1, 3 * 1024, (num_groups, 16))
+    stored = []
+    draft = SimpleNamespace(
+        _layer_group_idx=layer_groups,
+        _context_slot_mappings=context,
+        _kernel_context_slot_mappings=torch.zeros_like(context),
+        draft_kv_cache_group_ids=list(range(num_groups)),
+        attn_groups=[[group] for group in groups],
+        hidden_states=torch.zeros(16, 1),
+        context_positions=torch.zeros(16, dtype=torch.int64),
+        model=SimpleNamespace(
+            precompute_and_store_context_kv=lambda *args: stored.append(args[2])
+        ),
+    )
+    draft._kernel_context_slots = MethodType(
+        DFlashSpeculator._kernel_context_slots, draft
+    )
+
+    DFlashSpeculator._precompute_context_kv(draft, 2, 13)
+
+    (slots,) = stored
+    assert mapped == groups
+    assert len(slots) == len(layer_groups)
+    for layer_slots, gidx in zip(slots, layer_groups):
+        out = draft._kernel_context_slot_mappings[gidx, 2:13]
+        expected = map_slots(groups[gidx], context[gidx, 2:13], out=out.clone())
+        assert layer_slots.data_ptr() == out.data_ptr()
+        assert torch.equal(layer_slots, expected)
+
+
+@pytest.mark.parametrize("supports_update", [False, True])
+def test_dflash_full_graph_maps_query_slots_once(monkeypatch, supports_update):
+    """A FULL draft replay reads each packed group's query slots mapped into
+    its persistent buffer, mapped once per step: by the metadata build when it
+    runs, else before it."""
+    from types import MethodType
+    from unittest.mock import patch
+
+    from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+
+    groups, mapped, map_slots = _slot_mapped_groups(monkeypatch, 2)
+    num_reqs, query_len = 2, 4
+    num_tokens = num_reqs * query_len
+    slot_mappings = torch.randint(-1, 3 * 1024, (2, 16))
+    replayed = []
+    draft = SimpleNamespace(
+        num_query_per_req=query_len,
+        max_model_len=8192,
+        pcp_manager=None,
+        draft_kv_cache_group_id=0,
+        draft_kv_cache_group_ids=[0, 1],
+        attn_groups=[[group] for group in groups],
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[None, None]),
+        block_tables=SimpleNamespace(
+            slot_mappings=slot_mappings,
+            input_block_tables=[torch.zeros(4, 8, dtype=torch.int32)] * 2,
+        ),
+        input_buffers=SimpleNamespace(
+            query_start_loc=torch.arange(
+                0, 5 * query_len, query_len, dtype=torch.int32
+            ),
+            seq_lens=torch.full((4,), 100, dtype=torch.int32),
+            positions=torch.zeros(16, dtype=torch.int64),
+        ),
+        draft_is_prefilling=torch.zeros(4, dtype=torch.bool),
+        arange_np=np.arange(5),
+        dcp_size=1,
+        dp_size=1,
+        dp_rank=0,
+        _group_causal=True,
+        supports_decode_metadata_update=supports_update,
+        query_cudagraph_manager=SimpleNamespace(
+            run_fullgraph=lambda desc: replayed.append(
+                [group.kernel_slot_mapping.clone() for group in groups]
+            )
+        ),
+        draft_tokens=torch.zeros(4, query_len - 1, dtype=torch.int64),
+        _prepare_inputs=lambda *args, **kwargs: None,
+        _prepare_graph_replay=lambda *args: None,
+        _prepare_eplb_forward=lambda num_tokens: None,
+    )
+    for name in ("_build_uniform_attn_metadata", "_build_attn_metadata"):
+        setattr(draft, name, MethodType(getattr(DFlashSpeculator, name), draft))
+    before = [group.kernel_slot_mapping.clone() for group in groups]
+    batch_desc = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.FULL, num_tokens=num_tokens, num_reqs=num_reqs
+    )
+    input_batch = SimpleNamespace(
+        num_reqs=num_reqs,
+        num_tokens=num_tokens,
+        seq_lens_cpu_upper_bound=torch.tensor([96, 96], dtype=torch.int32),
+    )
+    with patch(
+        "vllm.v1.worker.gpu.spec_decode.dflash.speculator.dispatch_cg_and_sync_dp",
+        return_value=(batch_desc, None),
+    ):
+        DFlashSpeculator.propose(draft, input_batch, {}, {}, None, None, *([None] * 6))
+
+    assert mapped == groups
+    (at_replay,) = replayed
+    for gid, group in enumerate(groups):
+        expected = before[gid].clone()
+        slots = slot_mappings[gid, :num_tokens]
+        expected[0, :num_tokens] = map_slots(group, slots, out=slots.clone())
+        assert torch.equal(at_replay[gid], expected)
+
+
 def test_copy_kv_cache_blocks_overlaid_views_copy_whole_block():
     """Hybrid overlays: a Mamba state view and an attention view of one tensor
     share a base address but span different bytes per block, and several such

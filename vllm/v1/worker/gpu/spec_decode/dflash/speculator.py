@@ -422,10 +422,12 @@ class DFlashSpeculator(DraftModelSpeculator):
         if dummy_run:
             context_slots: torch.Tensor | list[torch.Tensor | None] | None = None
         elif self._layer_group_idx is not None:
-            context_slots = [
-                self._kernel_context_slots(gidx, start, end)
-                for gidx in self._layer_group_idx
-            ]
+            # Layers of one group share its slots: map them once per group.
+            group_slots = {
+                gidx: self._kernel_context_slots(gidx, start, end)
+                for gidx in dict.fromkeys(self._layer_group_idx)
+            }
+            context_slots = [group_slots[gidx] for gidx in self._layer_group_idx]
         else:
             context_slots = self._kernel_context_slots(0, start, end)
         self.model.precompute_and_store_context_kv(
@@ -704,18 +706,27 @@ class DFlashSpeculator(DraftModelSpeculator):
             dp_sync_state=batch_sync,
         )
         num_tokens_padded = batch_desc.num_tokens
-        # Packed token caches split into kernel blocks: the query slots the FULL
-        # graph reads live in each group's persistent mapped buffer.
-        for gid in self.draft_kv_cache_group_ids:
-            for group in self.attn_groups[gid]:
-                group.map_to_kernel_slot_mapping(
-                    self.block_tables.slot_mappings[gid, :num_tokens_padded]
-                )
+        is_full_cudagraph = batch_desc.cg_mode == CUDAGraphMode.FULL
+        # During FULL cudagraph with a model that supports decode metadata updates,
+        # the metadata update is captured in the graph, and we can skip the full
+        # build below.
+        rebuild_metadata = not (
+            is_full_cudagraph and self.supports_decode_metadata_update
+        )
+        if not rebuild_metadata:
+            # Packed token caches split into kernel blocks: the query slots the
+            # FULL graph reads live in each group's persistent mapped buffer (the
+            # metadata build maps them otherwise).
+            for gid in self.draft_kv_cache_group_ids:
+                for group in self.attn_groups[gid]:
+                    group.map_to_kernel_slot_mapping(
+                        self.block_tables.slot_mappings[gid, :num_tokens_padded]
+                    )
         num_tokens_across_dp = (
             batch_sync.num_tokens_across_dp if batch_sync is not None else None
         )
 
-        if batch_desc.cg_mode == CUDAGraphMode.FULL:
+        if is_full_cudagraph:
             assert batch_desc.num_reqs is not None
             self._prepare_graph_replay(
                 input_batch,
@@ -734,11 +745,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             )
             self._precompute_context_kv(0, num_target_tokens, dummy_run)
 
-        is_full_cudagraph = batch_desc.cg_mode == CUDAGraphMode.FULL
-        # During FULL cudagraph with a model that supports decode metadata updates,
-        # the metadata update is captured in the graph, and we can skip the full
-        # build below.
-        if not (is_full_cudagraph and self.supports_decode_metadata_update):
+        if rebuild_metadata:
             draft_attn_metadata = self._build_uniform_attn_metadata(
                 num_reqs=num_reqs,
                 batch_desc=batch_desc,
