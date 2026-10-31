@@ -136,7 +136,9 @@ class DcpTopkMergeCheck:
     def __init__(self, device: torch.device) -> None:
         size = _HEADER + MAX_LAYERS * _NUM_STATS + (MAX_MISSES + 1) * _MISS_FIELDS
         pinned = device.type == "cuda"
-        self.host = torch.zeros(size, dtype=torch.int64, pin_memory=pinned)
+        self.host = torch.zeros(
+            size, dtype=torch.int64, device="cpu", pin_memory=pinned
+        )
         self.host[_HEADER + MAX_LAYERS * _NUM_STATS :] = -1
         view = self.host
         if pinned:
