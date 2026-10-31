@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """TokenSpeed CuTe DSL MLA decode backend (Blackwell, FP8 KV cache only)."""
 
+import functools
+import os
 from typing import TYPE_CHECKING, ClassVar
 
 import torch
@@ -125,6 +127,43 @@ def _get_workspace(
             needed / (1 << 30),
         )
     return current_workspace_manager().get_simultaneous(((needed,), torch.int8))[0]
+
+
+# SM107 (VR200) M256 FP8 decode: TokenSpeed's 4-CTA-cluster kernel (mla_decode_fp8_sm107.py,
+# cluster launch control) written with a BF16 output. The public entry point only takes it for FP8
+# outputs; on SM107 it is 13-14% faster than the SM100 FP8 kernel + length-proportional split for the
+# K3.1 DSpark drafter (64 heads x q8, AgentX contexts, benchmarks/kernels/k31_vr/wtp1/bench_draft_attn.py)
+# at the same error against an FP32 reference. VLLM_TOKENSPEED_SM107_SPLIT = its split-KV floor
+# (0 disables the path).
+_SM107_M_TILE = 256
+_SM107_MAX_TILES = 4
+
+
+def _sm107_split_floor() -> int:
+    return int(os.environ.get("VLLM_TOKENSPEED_SM107_SPLIT", "32"))
+
+
+@functools.cache
+def _sm107_workspace_bound(
+    max_requests: int, tiles: int, kv_lora_rank: int, max_seq_len: int, min_split: int
+) -> int:
+    """Largest SM107 split-KV workspace (bytes) of any batch of at most
+    ``max_requests`` requests and ``max_seq_len`` tokens (the planner's split
+    count is non-decreasing in the sequence length), or -1 when one exceeds
+    the kernel's Int32 offsets."""
+    from tokenspeed_mla import mla_decode as md
+
+    clusters = md.get_max_active_clusters(4) * 4
+    worst = 0
+    for b in range(1, max_requests + 1):
+        try:
+            _, size = md._get_sm107_split_kv_and_workspace_size(
+                b, tiles, _SM107_M_TILE, kv_lora_rank, clusters, max_seq_len, min_split
+            )
+        except ValueError:
+            return -1
+        worst = max(worst, size)
+    return worst
 
 
 class TokenspeedMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
@@ -314,6 +353,36 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
                 config.compilation_config.max_cudagraph_capture_size or 0,
             )
 
+        # SM107 M256 decode (see _sm107_split_floor): enabled per call when the
+        # shape fits; the workspace is sized once for the largest batch.
+        self._sm107_split = 0
+        self._sm107_workspace = 0
+        if (
+            torch.cuda.is_available()
+            and torch.cuda.get_device_capability() == (10, 7)
+            and _sm107_split_floor() > 0
+            and num_heads * self._query_len <= _SM107_M_TILE * _SM107_MAX_TILES
+        ):
+            from tokenspeed_mla import mla_decode as md
+
+            if hasattr(md, "_sm107_fp8_out_decode"):
+                bound = _sm107_workspace_bound(
+                    self._max_decode_requests,
+                    -(-num_heads * self._query_len // _SM107_M_TILE),
+                    self.kv_lora_rank,
+                    config.model_config.max_model_len,
+                    _sm107_split_floor(),
+                )
+                if bound >= 0:
+                    self._sm107_split = _sm107_split_floor()
+                    self._sm107_workspace = max(bound, 1)
+                    logger.info_once(
+                        "TokenSpeed MLA decode: SM107 M256 kernel (BF16 out, split "
+                        "floor %d, workspace %.2f GiB)",
+                        self._sm107_split,
+                        bound / (1 << 30),
+                    )
+
         self.softmax_scale: float | None = None
         self.output_scale: float | None = None
         # NIXL resolves interleaving after model construction; retain the config
@@ -387,6 +456,16 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
                 self.scale * layer._q_scale_float * layer._k_scale_float
             )
             self.output_scale = layer._k_scale_float
+
+        if (
+            self._sm107_split
+            and self.dcp_world_size == 1
+            and q.shape[1] == self._query_len
+            and q.shape[0] <= self._max_decode_requests
+            and q.stride(1) == q.shape[2] * q.stride(2)
+            and not self.need_to_return_lse_for_decode
+        ):
+            return self._forward_sm107(q, kv_c_and_k_pe_cache, attn_metadata), None
 
         var_split_cfg = self._max_split_kv > 1 and self.dcp_world_size == 1
         var_split = False
@@ -477,6 +556,51 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
 
         o = o.view(-1, o.shape[-2], o.shape[-1])
         return o, lse
+
+    def _forward_sm107(
+        self,
+        q: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: MLACommonMetadata,
+    ) -> torch.Tensor:
+        """The SM107 M256 FP8 decode with a BF16 output (see _sm107_split_floor)."""
+        from tokenspeed_mla import mla_decode as md
+
+        assert attn_metadata.decode is not None
+        decode = attn_metadata.decode
+        B, q_len, H, _ = q.shape
+        L = self.kv_lora_rank
+        (workspace,) = current_workspace_manager().get_simultaneous(
+            ((self._sm107_workspace,), torch.int8)
+        )
+        out = torch.empty((B, q_len, H, L), dtype=torch.bfloat16, device=q.device)
+        kv = kv_c_and_k_pe_cache
+        md._sm107_fp8_out_decode(
+            q_latent=q[..., :L],
+            q_rope=q[..., L:],
+            c_latent=kv[..., :L],
+            c_rope=kv[..., L:],
+            block_tables=decode.block_table,
+            seq_lens=decode.seq_lens,
+            workspace_buffer=workspace,
+            out=out,
+            page_size=kv.shape[-2],
+            max_seq_len=attn_metadata.max_seq_len,
+            softmax_scale=self.softmax_scale,
+            output_scale=self.output_scale,
+            is_var_seq=True,
+            causal_mask=attn_metadata.causal,
+            window_left=-1,
+            enable_pdl=False,
+            return_lse=False,
+            causal_seqs=None,
+            cp_world=1,
+            cp_rank=0,
+            local_visible_lens=None,
+            min_split_kv=self._sm107_split,
+            compute_capability=(10, 7),
+        )
+        return out.view(-1, H, L)
 
     def _block_split_kvs(
         self, attn_metadata: MLACommonMetadata, q: torch.Tensor, max_split_kv: int
