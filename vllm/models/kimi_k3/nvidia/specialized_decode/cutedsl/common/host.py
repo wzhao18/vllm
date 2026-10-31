@@ -116,6 +116,36 @@ def check_residency(compiled, device_index: int, grid: int, threads: int, what: 
         )
 
 
+def max_active_clusters(
+    compiled, device_index: int, grid, threads: int, cluster: int, carveout=None
+) -> int:
+    """cuOccupancyMaxActiveClusters of the one kernel in ``compiled``: how many
+    ``cluster``-CTA clusters of ``threads`` per CTA (its dynamic shared memory, and the
+    preferred shared memory ``carveout`` if given) the device holds at once."""
+    _, function = resolve_kernel(compiled, device_index)
+    attribute = cuda.CUfunction_attribute
+    max_dynamic = attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
+    (smem,) = _checked(cuda.cuFuncGetAttribute(max_dynamic, function))
+    if carveout is not None:
+        preferred = attribute.CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT
+        _checked(cuda.cuFuncSetAttribute(function, preferred, carveout))
+    ids = cuda.CUlaunchAttributeID
+    dims = cuda.CUlaunchAttribute()
+    dims.id = ids.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
+    dims.value.clusterDim.x, dims.value.clusterDim.y = cluster, 1
+    dims.value.clusterDim.z = 1
+    config = cuda.CUlaunchConfig()
+    config.gridDimX, config.gridDimY, config.gridDimZ = grid
+    config.blockDimX, config.blockDimY, config.blockDimZ = threads, 1, 1
+    config.sharedMemBytes, config.attrs, config.numAttrs = smem, [dims], 1
+    with torch.accelerator.device_index(device_index):
+        (count,) = _checked(
+            cuda.cuOccupancyMaxActiveClusters(function, config),
+            "cuOccupancyMaxActiveClusters",
+        )
+    return count
+
+
 def kernel_registers(compiled, device) -> int:
     """Registers per thread of the one kernel in ``compiled`` on ``device``."""
     _, function = resolve_kernel(compiled, device)
