@@ -806,7 +806,8 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
     # filter localizes at any interleave (as for FlashMLA sparse).
     supports_mtp_with_cp_non_trivial_interleave_size: bool = True
     lse_base_on_e: bool = False
-    supports_shardq: ClassVar[bool] = True
+    # ShardQ under DCP only: TP-only steps keep the head-sharded path
+    # (Inferact/mum#66 also turns TP ShardQ on for this backend).
     supports_dcp_shardq: ClassVar[bool] = True
     # fp8 query quantization is required when using fp8 kv_cache,
     # as the TRTLLM-GEN sparse MLA kernel requires matching dtypes

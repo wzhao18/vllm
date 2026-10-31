@@ -50,7 +50,7 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_filter_and_convert_dcp_index,
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
-from vllm.v1.attention.ops.dcp import MLADCPManager, cp_kv_cache_interleave_one
+from vllm.v1.attention.ops.dcp import MLADCPManager, dcp_shardq_configured
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.ops.shardq import (
     PUSH_ROWS_KERNEL,
@@ -329,7 +329,7 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
             register_warmup,
         )
 
-        # The layers decided at construction (cp_kv_cache_interleave_one);
+        # The layers decided at construction (dcp_shardq_configured);
         # the interleave is final now.
         interleave = vllm_config.parallel_config.cp_kv_cache_interleave_size
         assert interleave == 1, (
@@ -803,10 +803,10 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
     # Reuse the index group's top-k conversion only for uniform decode batches
     # of multi-layer groups; other batches convert per layer.
     group_conversion_decode_only: ClassVar[bool] = False
-    # Whether forward_mqa_shardq is implemented and validated.
+    # Whether forward_mqa_shardq is implemented and validated without DCP.
     supports_shardq: ClassVar[bool] = False
-    # Whether forward_mqa_shardq also attends a DCP step's gathered context
-    # (SparseMLAShardQ.gathered_context).
+    # Whether forward_mqa_shardq is implemented and validated for DCP steps,
+    # over their gathered context (SparseMLAShardQ.gathered_context).
     supports_dcp_shardq: ClassVar[bool] = False
 
     def __init__(
@@ -892,35 +892,21 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
         )
         # The attention layer decides whether to use ShardQ.
         attention_config = vllm_config.attention_config
-        dcp_size = parallel_config.decode_context_parallel_size
-        kv_transfer_config = vllm_config.kv_transfer_config
-        # A disaggregated decode instance receives its prefills' KV, so it
-        # would hold the gathered-context workspace for nothing.
-        decode_instance = (
-            kv_transfer_config is not None
-            and kv_transfer_config.kv_role == "kv_consumer"
-        )
-        self.use_shardq = (
-            self.supports_shardq
-            and attention_config.sparse_mla_shard_q
-            and attention_config.hisparse_config is None
-            and parallel_config.tensor_parallel_size > 1
-            and (
-                dcp_size == 1
-                or (
-                    self.supports_dcp_shardq
-                    and not decode_instance
-                    and dcp_size == parallel_config.tensor_parallel_size
-                    # The gathered context is laid out for interleave 1, in
-                    # one workspace that micro-batches would share.
-                    and cp_kv_cache_interleave_one(vllm_config)
-                    and not parallel_config.use_ubatching
-                    and current_platform.is_device_capability_family(100)
-                )
+        if parallel_config.decode_context_parallel_size == 1:
+            self.use_shardq = (
+                self.supports_shardq
+                and attention_config.sparse_mla_shard_q
+                and attention_config.hisparse_config is None
+                and parallel_config.tensor_parallel_size > 1
+                and parallel_config.prefill_context_parallel_size == 1
+                and cudagraph_mode.mixed_mode() != CUDAGraphMode.FULL
             )
-            and parallel_config.prefill_context_parallel_size == 1
-            and cudagraph_mode.mixed_mode() != CUDAGraphMode.FULL
-        )
+        else:
+            self.use_shardq = (
+                self.supports_dcp_shardq
+                and dcp_shardq_configured(vllm_config)
+                and current_platform.is_device_capability_family(100)
+            )
         if self.use_shardq:
             # ShardQ's exchanges of the MQA query and output (the dtypes of
             # MLAAttention's reservation, reserve_shardq_buffers).

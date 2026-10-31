@@ -13,7 +13,7 @@ import torch
 import torch.distributed as dist
 
 import vllm.envs as envs
-from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed import get_dcp_group
 from vllm.logger import init_logger
 from vllm.model_executor.warmup.jit_warmup import (
@@ -1055,6 +1055,33 @@ def cp_kv_cache_interleave_one(vllm_config: Any) -> bool:
     return not (
         getattr(parallel_config, "_allow_auto_resolve_cp_interleave_size", False)
         and kv_transfer_config.has_connector("NixlConnector")
+    )
+
+
+def dcp_shardq_configured(vllm_config: Any) -> bool:
+    """Whether the configuration lets prefill steps run as DCP ShardQ over a
+    gathered context (vllm.v1.attention.ops.dcp_shardq): sparse_mla_shard_q
+    under TP = DCP > 1 at interleave 1, without PCP, HiSparse, micro-batching
+    or FULL mixed-batch CUDA graphs, on an instance that prefills (not a
+    disaggregated kv_consumer). The attention backend and the platform decide
+    the rest. Valid before and after the interleave is finalized."""
+    parallel_config = vllm_config.parallel_config
+    attention_config = vllm_config.attention_config
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    cudagraph_mode = vllm_config.compilation_config.cudagraph_mode or CUDAGraphMode.NONE
+    dcp_size = parallel_config.decode_context_parallel_size
+    return bool(
+        attention_config.sparse_mla_shard_q
+        and attention_config.hisparse_config is None
+        and 1 < dcp_size == parallel_config.tensor_parallel_size
+        and parallel_config.prefill_context_parallel_size == 1
+        and not parallel_config.use_ubatching
+        and cudagraph_mode.mixed_mode() != CUDAGraphMode.FULL
+        and not (
+            kv_transfer_config is not None
+            and kv_transfer_config.kv_role == "kv_consumer"
+        )
+        and cp_kv_cache_interleave_one(vllm_config)
     )
 
 

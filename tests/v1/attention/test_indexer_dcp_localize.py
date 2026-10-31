@@ -328,6 +328,47 @@ def test_cp_kv_cache_interleave_one_is_final(
     assert cp_kv_cache_interleave_one(config) is expected
 
 
+_MOONCAKE = {"kv_connector": "MooncakeStoreConnector", "kv_role": "kv_both"}
+
+
+@pytest.mark.parametrize("kv_transfer", [None, _NIXL_P, _NIXL_D, _NCCL_PD, _MOONCAKE])
+@pytest.mark.parametrize("block_size", [64, 1024])
+def test_cp_kv_cache_interleave_one_matches_adjust(kv_transfer, block_size):
+    """The construction-time prediction agrees with the interleave that
+    VllmConfig.adjust_dcp_kv_cache_interleave_size actually leaves, so a
+    change to the adjust cannot silently leave the interleave-1 gates
+    (ShardQ, the one-round top-k merge, #61) on the wrong side."""
+    import copy
+    import itertools
+    from types import SimpleNamespace
+
+    from vllm.config import KVTransferConfig
+    from vllm.config.vllm import VllmConfig
+    from vllm.v1.attention.ops.dcp import cp_kv_cache_interleave_one
+
+    groups = [SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=block_size))]
+    for interleave, dcp, explicit, dcp_interleave in itertools.product(
+        (1, 64, 1024), (2, 8, 16), (False, True), (1, 64)
+    ):
+        config = SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                cp_kv_cache_interleave_size=interleave,
+                decode_context_parallel_size=dcp,
+                dcp_kv_cache_interleave_size=dcp_interleave,
+                _allow_auto_resolve_cp_interleave_size=not explicit,
+            ),
+            kv_transfer_config=(
+                KVTransferConfig(**copy.deepcopy(kv_transfer))
+                if kv_transfer is not None
+                else None
+            ),
+        )
+        predicted = cp_kv_cache_interleave_one(config)
+        VllmConfig.adjust_dcp_kv_cache_interleave_size(config, groups)
+        final = config.parallel_config.cp_kv_cache_interleave_size
+        assert predicted is (final == 1), (interleave, dcp, explicit, dcp_interleave)
+
+
 def test_get_dcp_local_seq_lens_can_localize_per_token_bounds():
     seq_lens = torch.tensor([0, 1, 2, 3, 4, 7, 8, 17], dtype=torch.int32)
     world = 4

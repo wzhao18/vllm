@@ -548,6 +548,8 @@ class BuildPrefillChunkMetadataKernel(
         )
 
     def get_warmup_keys(self, vllm_config: VllmConfig) -> list[CompileKey]:
+        from vllm.v1.attention.ops.dcp import dcp_shardq_configured
+
         max_tokens = max(1, min(vllm_config.scheduler_config.max_num_batched_tokens, 8))
         hf_text_config = vllm_config.model_config.hf_text_config
         parallel_config = vllm_config.parallel_config
@@ -557,10 +559,7 @@ class BuildPrefillChunkMetadataKernel(
         dcp_cases = [dict(DCP_RANK=dcp_rank, DCP_WORLD=dcp_world)]
         if dcp_world > 1 and (
             parallel_config.prefill_context_parallel_size > 1
-            or (
-                getattr(vllm_config.attention_config, "sparse_mla_shard_q", False)
-                and dcp_interleave == 1
-            )
+            or dcp_shardq_configured(vllm_config)
         ):
             # PCP+DCP prefill constructs a global PCP chunk plan and therefore
             # dispatches this kernel with already-localized row starts, and a

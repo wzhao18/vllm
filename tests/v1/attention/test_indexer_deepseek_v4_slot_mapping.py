@@ -441,14 +441,18 @@ def test_indexer_warmup_includes_pcp_normalized_dcp_key(monkeypatch):
     } == {(False, False), (False, True), (True, False), (True, True)}
 
 
+@pytest.mark.parametrize("kv_role", [None, "kv_both", "kv_consumer"])
 @pytest.mark.parametrize("interleave", [1, 1024])
 @pytest.mark.parametrize("sparse_mla_shard_q", [False, True])
 def test_indexer_warmup_includes_dcp_shardq_normalized_key(
-    monkeypatch, sparse_mla_shard_q, interleave
+    monkeypatch, sparse_mla_shard_q, interleave, kv_role
 ):
     """DCP ShardQ steps plan their indexer chunks over a gathered, non-DCP
     context, so they launch the rank 0 / world 1 key. DCP ShardQ needs
-    interleave 1; other interleaves compile the DCP key only."""
+    interleave 1 and an instance that prefills; otherwise only the DCP key
+    compiles."""
+    from vllm.config import KVTransferConfig
+
     monkeypatch.setattr(
         "vllm.v1.attention.backends.mla.indexer.get_dcp_group",
         lambda: SimpleNamespace(rank_in_group=3),
@@ -457,16 +461,28 @@ def test_indexer_warmup_includes_dcp_shardq_normalized_key(
         scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
         model_config=SimpleNamespace(hf_text_config=SimpleNamespace()),
         parallel_config=SimpleNamespace(
+            tensor_parallel_size=8,
             decode_context_parallel_size=8,
             prefill_context_parallel_size=1,
             cp_kv_cache_interleave_size=interleave,
+            dcp_kv_cache_interleave_size=1,
+            _allow_auto_resolve_cp_interleave_size=False,
+            use_ubatching=False,
         ),
-        attention_config=SimpleNamespace(sparse_mla_shard_q=sparse_mla_shard_q),
+        attention_config=SimpleNamespace(
+            sparse_mla_shard_q=sparse_mla_shard_q, hisparse_config=None
+        ),
+        compilation_config=SimpleNamespace(cudagraph_mode=None),
+        kv_transfer_config=(
+            None
+            if kv_role is None
+            else KVTransferConfig(kv_connector="NixlConnector", kv_role=kv_role)
+        ),
     )
 
     keys = BuildPrefillChunkMetadataKernel().get_warmup_keys(config)
 
-    shardq = sparse_mla_shard_q and interleave == 1
+    shardq = sparse_mla_shard_q and interleave == 1 and kv_role != "kv_consumer"
     expected = {(2, 2)} | ({(16, 1)} if shardq else set())
     assert {(key.dcp_rank, key.dcp_world) for key in keys} == expected
 

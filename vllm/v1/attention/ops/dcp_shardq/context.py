@@ -53,7 +53,7 @@ from vllm.v1.attention.backends.mla.indexer import (
 from vllm.v1.attention.backends.mla.sparse_utils import (
     ConvertReqIndexToGlobalIndexKernel,
 )
-from vllm.v1.attention.ops.dcp import dcp_a2a_lse_reduce
+from vllm.v1.attention.ops.dcp import dcp_a2a_lse_reduce, dcp_shardq_configured
 from vllm.v1.attention.ops.dcp_shardq import PAGE_TOKENS
 from vllm.v1.attention.ops.shardq import (
     ShardQSplit,
@@ -146,26 +146,14 @@ def scheduler_context_pages(vllm_config: "VllmConfig") -> int | None:
     a step's leading decode rows and steps of fewer than
     ``sparse_mla_shard_q_min_tokens`` prefill tokens, and the memory profile
     reserves those (``dcp_fallback_max_tokens``) instead of a whole
-    ``max_num_batched_tokens`` step. These are the configuration-level and
-    platform conditions of SparseMLAShardQ's DCP ShardQ; when its layer-level
-    ones fail the cap merely keeps a step's prefill context within
+    ``max_num_batched_tokens`` step. The conditions are the configuration's
+    (``dcp_shardq_configured``) and the platform's (SM10x); where the backend
+    has no DCP ShardQ, the cap merely keeps a step's prefill context within
     ``max_model_len``.
     """
-    parallel_config = vllm_config.parallel_config
-    kv_transfer_config = vllm_config.kv_transfer_config
-    dcp = parallel_config.decode_context_parallel_size
-    if (
-        not vllm_config.attention_config.sparse_mla_shard_q
-        or dcp <= 1
-        or dcp != parallel_config.tensor_parallel_size
-        or parallel_config.cp_kv_cache_interleave_size != 1
-        or parallel_config.use_ubatching
-        or not current_platform.is_device_capability_family(100)
-        or parallel_config.prefill_context_parallel_size != 1
-        or (
-            kv_transfer_config is not None
-            and kv_transfer_config.kv_role == "kv_consumer"
-        )
+    if not (
+        dcp_shardq_configured(vllm_config)
+        and current_platform.is_device_capability_family(100)
     ):
         return None
     return capacity_pages(
