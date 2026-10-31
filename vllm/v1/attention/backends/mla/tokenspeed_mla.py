@@ -415,10 +415,15 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
                 )
             # No request has more than ceil(max_seq_len / 128) KV tiles, so
             # more split slots would only add empty CTAs (the variable-split
-            # grid holds max_split_kv slots per request); at or below the
-            # uniform floor the uniform split is the same work.
-            max_split_kv = min(max_split_kv, -(-attn_metadata.max_seq_len // 128))
-            var_split = max_split_kv > max(self._min_split_kv, 1)
+            # grid holds max_split_kv slots per request). Batches whose
+            # longest request has at most 2 x min_split_kv tiles (4K tokens
+            # at the floor 16) have no skew worth the extra slots (+2.5% step
+            # at 128 x 2K, n1): keep the uniform split there.
+            max_tiles = -(-attn_metadata.max_seq_len // 128)
+            max_split_kv = min(max_split_kv, max_tiles)
+            var_split = max_split_kv > 1 and max_tiles > 2 * max(
+                self._min_split_kv, 1
+            )
         workspace = _get_workspace(
             q.device,
             q.shape[-2],

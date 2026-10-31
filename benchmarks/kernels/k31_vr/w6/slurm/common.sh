@@ -24,3 +24,7 @@ ARM[m5s64]="${W6_M5_TAG:-w6-m5} balanced {\"tokenspeed_mla_max_split_kv\":64}"
 ARM[m5b32]="${W6_M5B_TAG:-w6-m5b} balanced {\"tokenspeed_mla_min_split_kv\":16,\"tokenspeed_mla_max_split_kv\":32}"
 ARM[m5c32]="${W6_M5C_TAG:-w6-m5c} balanced {\"tokenspeed_mla_min_split_kv\":16,\"tokenspeed_mla_max_split_kv\":32}"
 ARM[m5b]="${W6_M5B_TAG:-w6-m5b} balanced {\"tokenspeed_mla_min_split_kv\":16,\"tokenspeed_mla_max_split_kv\":64}"
+# Review fixes (aeb5f5ed8): m5c32 + per-batch cap of the drafter splits at the Int32 workspace limit
+ARM[m5rf]="${W6_RF_TAG:-w6-rf} balanced {\"tokenspeed_mla_min_split_kv\":16,\"tokenspeed_mla_max_split_kv\":32}"
+# + uniform split when the longest request has <= 2 x min_split_kv KV tiles (no slots for short batches)
+ARM[m5rf2]="${W6_RF2_TAG:-w6-rf2} balanced {\"tokenspeed_mla_min_split_kv\":16,\"tokenspeed_mla_max_split_kv\":32}"
