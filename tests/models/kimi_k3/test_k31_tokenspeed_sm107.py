@@ -188,6 +188,32 @@ def test_workspace_bound_covers_batches():
             assert size <= bound
 
 
+def test_split_floor_per_batch(monkeypatch):
+    """Floor 32 below _SM107_LARGE_BATCH requests, 24 from there up; the
+    workspace bound covers both; the env override sets one floor."""
+    from tokenspeed_mla import mla_decode as md
+
+    from vllm.v1.attention.backends.mla import tokenspeed_mla as ts
+
+    monkeypatch.delenv("VLLM_TOKENSPEED_SM107_SPLIT", raising=False)
+    small, large = ts._sm107_split_floors()
+    assert (small, large) == (32, 24)
+    nb = ts._SM107_LARGE_BATCH
+    assert ts._sm107_batch_split(small, large, nb - 1) == 32
+    assert ts._sm107_batch_split(small, large, nb) == 24
+    assert ts._sm107_batch_split(small, None, nb) == 32
+    monkeypatch.setenv("VLLM_TOKENSPEED_SM107_SPLIT", "16")
+    assert ts._sm107_split_floors() == (16, 16)
+    bound = ts._sm107_workspace_bound(32, 2, D_LAT, 1 << 20, small, large)
+    clusters = md.get_max_active_clusters(4) * 4
+    for b in (1, nb - 1, nb, 32):
+        for n in (100, 70000, 1 << 20):
+            _, size = md._get_sm107_split_kv_and_workspace_size(
+                b, 2, 256, D_LAT, clusters, n, ts._sm107_batch_split(small, large, b)
+            )
+            assert size <= bound
+
+
 def test_warmup_covers_reachable_keys(sm107_workspace):
     """After sm107_warmup, decodes within its batch / length bounds compile nothing."""
     from types import SimpleNamespace

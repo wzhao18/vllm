@@ -135,12 +135,18 @@ def _get_workspace(
 # heads x q8, TP1 DEP ranks, AgentX contexts) it cuts the drafter's CUPTI kernel time
 # per step from 3.04 to 2.71 ms (r16) and 5.21 to 4.47 ms (r28) vs the SM100 FP8 kernel
 # + length-proportional split (DEP4 8-layer bench, 2 nodes), at the same error against
-# an FP32 reference. VLLM_TOKENSPEED_SM107_SPLIT = its split-KV floor (0 disables the
-# path; 24 vs 32: drafter 4.46 -> 4.36 ms per step at r28, neutral at r16, step ABBA). Only shapes that fill at least one 256-row tile (num_heads * q_len >= 256) take
+# an FP32 reference. Split-KV floor per batch (_sm107_split_floors): 32, and 24 from
+# _SM107_LARGE_BATCH requests up (r28 q8 step ABBA: drafter 4.46 -> 4.36 ms per step;
+# at 1-6 and 16 requests 24 is neutral to 4-7% slower in the kernel microbench).
+# VLLM_TOKENSPEED_SM107_SPLIT sets one floor for every batch (0 disables the path).
+# Only shapes that fill at least one 256-row tile (num_heads * q_len >= 256) take
 # it: at 4 / 16 heads the tile is mostly padding and it is 18-32% slower than the SM100
 # path.
 _SM107_M_TILE = 256
 _SM107_MAX_TILES = 4
+_SM107_SPLIT = 32
+_SM107_SPLIT_LARGE_BATCH = 24
+_SM107_LARGE_BATCH = 24
 
 # The private TokenSpeed helpers this path calls, with the parameters it passes.
 # Releases differ: tokenspeed-mla 2.0.2 adds a required ``enable_packed_q`` (True =
@@ -210,13 +216,28 @@ def _sm107_decode_extra_kwargs() -> "dict[str, bool] | None":
     return extra
 
 
-def _sm107_split_floor() -> int:
-    return int(os.environ.get("VLLM_TOKENSPEED_SM107_SPLIT", "24"))
+def _sm107_split_floors() -> tuple[int, int]:
+    """(split-KV floor below _SM107_LARGE_BATCH requests, floor from there up)."""
+    env = os.environ.get("VLLM_TOKENSPEED_SM107_SPLIT")
+    if env is not None:
+        return int(env), int(env)
+    return _SM107_SPLIT, _SM107_SPLIT_LARGE_BATCH
+
+
+def _sm107_batch_split(min_split: int, min_split_large: int | None, b: int) -> int:
+    if min_split_large is not None and b >= _SM107_LARGE_BATCH:
+        return min_split_large
+    return min_split
 
 
 @functools.cache
 def _sm107_workspace_bound(
-    max_requests: int, tiles: int, kv_lora_rank: int, max_seq_len: int, min_split: int
+    max_requests: int,
+    tiles: int,
+    kv_lora_rank: int,
+    max_seq_len: int,
+    min_split: int,
+    min_split_large: int | None = None,
 ) -> int:
     """Largest SM107 split-KV workspace (bytes) of any batch of at most
     ``max_requests`` requests and ``max_seq_len`` tokens (the planner's split
@@ -229,7 +250,13 @@ def _sm107_workspace_bound(
     for b in range(1, max_requests + 1):
         try:
             _, size = md._get_sm107_split_kv_and_workspace_size(
-                b, tiles, _SM107_M_TILE, kv_lora_rank, clusters, max_seq_len, min_split
+                b,
+                tiles,
+                _SM107_M_TILE,
+                kv_lora_rank,
+                clusters,
+                max_seq_len,
+                _sm107_batch_split(min_split, min_split_large, b),
             )
         except ValueError:
             return -1
@@ -281,7 +308,11 @@ def sm107_warmup(
                         impl.kv_lora_rank,
                         clusters,
                         128 * t,
-                        impl._sm107_split,
+                        _sm107_batch_split(
+                            impl._sm107_split,
+                            getattr(impl, "_sm107_split_large", None),
+                            b,
+                        ),
                     )
                 except ValueError:
                     continue
@@ -492,14 +523,17 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
                 config.compilation_config.max_cudagraph_capture_size or 0,
             )
 
-        # SM107 M256 decode (see _sm107_split_floor): enabled per call when the
+        # SM107 M256 decode (see _sm107_split_floors): enabled per call when the
         # shape fits; the workspace is sized once for the largest batch.
         self._sm107_split = 0
+        self._sm107_split_large: int | None = None
         self._sm107_workspace = 0
+        split, split_large = _sm107_split_floors()
         if (
             torch.cuda.is_available()
             and torch.cuda.get_device_capability() == (10, 7)
-            and _sm107_split_floor() > 0
+            and split > 0
+            and split_large > 0
             and _SM107_M_TILE
             <= num_heads * self._query_len
             <= _SM107_M_TILE * _SM107_MAX_TILES
@@ -510,15 +544,19 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
                 -(-num_heads * self._query_len // _SM107_M_TILE),
                 self.kv_lora_rank,
                 config.model_config.max_model_len,
-                _sm107_split_floor(),
+                split,
+                split_large,
             )
             if bound >= 0:
-                self._sm107_split = _sm107_split_floor()
+                self._sm107_split = split
+                self._sm107_split_large = split_large
                 self._sm107_workspace = max(bound, 1)
                 logger.info_once(
                     "TokenSpeed MLA decode: SM107 M256 kernel (BF16 out, split "
-                    "floor %d, workspace %.2f GiB)",
-                    self._sm107_split,
+                    "floor %d, %d from %d requests, workspace %.2f GiB)",
+                    split,
+                    split_large,
+                    _SM107_LARGE_BATCH,
                     bound / (1 << 30),
                 )
 
@@ -703,7 +741,7 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: MLACommonMetadata,
     ) -> torch.Tensor:
-        """The SM107 M256 FP8 decode with a BF16 output (see _sm107_split_floor)."""
+        """The SM107 M256 FP8 decode with a BF16 output (see _sm107_split_floors)."""
         from tokenspeed_mla import mla_decode as md
 
         assert attn_metadata.decode is not None
@@ -737,7 +775,9 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
             cp_world=1,
             cp_rank=0,
             local_visible_lens=None,
-            min_split_kv=self._sm107_split,
+            min_split_kv=_sm107_batch_split(
+                self._sm107_split, getattr(self, "_sm107_split_large", None), B
+            ),
             compute_capability=(10, 7),
             **_sm107_decode_extra_kwargs(),
         )

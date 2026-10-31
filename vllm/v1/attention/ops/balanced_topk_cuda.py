@@ -8,7 +8,8 @@ Same algorithm and output contract as ``balanced_topk`` (see
 1. ``sample_kernel`` (one CTA per row): candidate threshold ``t0`` on the
    order-preserving 16-bit key from a strided sample (exact for rows of at
    most ``SAMPLES`` keys), by two 8-bit radix passes over shared histograms;
-   ``t0`` aims at ``2 * topk`` keys above it (at most ``TARGET``).
+   ``t0`` aims at ``2 * topk`` keys above it, raised on long rows so that at
+   least ``MIN_NEED`` sampled keys sit above it (at most ``TARGET`` keys).
 2. ``filter_kernel`` (persistent grid over the flattened (row, 4096-key
    block) list of the rows longer than ``CAP``): 16-byte loads; each warp
    compacts its keys above ``t0`` (and equal to ``t0``) with a shuffle scan
@@ -41,6 +42,8 @@ _CUDA_SRC = r"""
 namespace {
 
 constexpr int CAP = 16384;
+constexpr int TARGET = 8192;         // most expected keys above t0
+constexpr int MIN_NEED = 64;         // fewest sampled keys above t0 (long rows)
 constexpr int SAMPLES = 4096;
 constexpr int BLOCK = 4096;          // keys per filter work item
 constexpr int FILTER_THREADS = 256;  // 16 keys per thread
@@ -154,7 +157,14 @@ __global__ void sample_kernel(const uint16_t* __restrict__ logits, int64_t strid
       const int64_t j = threadIdx.x + i * SAMPLE_THREADS;
       k[i] = key16(row[(2 * j + 1) * n / (2 * SAMPLES)]);
     }
-    need = min(max((int)(((int64_t)target * SAMPLES + n - 1) / n), 1), SAMPLES);
+    // At least MIN_NEED sampled keys above t0 (fewer only where TARGET caps
+    // it): a 2 * topk target on a ~1M-key row would rest t0 on ~16 samples,
+    // and the row would take the streamed fallback ~1e-2 of the time (iid
+    // keys) instead of ~1e-10.
+    const int64_t need_t = ((int64_t)target * SAMPLES + n - 1) / n;
+    const int64_t need_cap = ((int64_t)TARGET * SAMPLES + n - 1) / n;
+    need = (int)min(max(max(need_t, min((int64_t)MIN_NEED, need_cap)), (int64_t)1),
+                    (int64_t)SAMPLES);
   }
   int above;
   const uint32_t t = kth_key<PER>(k, need, hist, sh, &above);
@@ -502,11 +512,13 @@ def balanced_topk_cuda(
         next_n,
         topk_indices,
         topk,
-        # Twice top-k expected keys above t0: the sample's estimate misses
-        # top-k (the exact streamed fallback) only many standard deviations
-        # out, and the filter and select handle half the candidates of
-        # TARGET (DEP16 q8 owner points, DEP4 8-layer step ABBA on VR200:
-        # -2.3 / -4.0 us per call at 128 / 224 rows of ~105K / ~190K keys).
+        # Twice top-k expected keys above t0, so the filter and select handle
+        # half the candidates of TARGET. Rows longer than SAMPLES * 2 * topk /
+        # MIN_NEED (256K keys at top-k 2048) keep MIN_NEED sampled keys above
+        # t0 instead (the kernel raises the target, capped at TARGET). For a
+        # row of iid keys the sample then misses top-k (the exact streamed
+        # fallback) with probability <= ~4e-7 (at 256K keys; < 1e-8 below
+        # 200K, < 1e-13 above 400K, 1e-10 at 1M as with TARGET alone).
         min(2 * topk, TARGET),
         thresh,
         counters,
