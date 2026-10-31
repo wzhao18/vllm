@@ -1738,6 +1738,10 @@ class KimiLinearForCausalLM(
             for module in self.model.modules():
                 if isinstance(module, KimiK3DSAAttention):
                     module.pack_projections()
+        # MegaMoE wide-EP kernel header / expert weight placement (env-selected).
+        from .megamoe import prepare_megamoe
+
+        prepare_megamoe(self.model, self.vllm_config)
         # K3.1 DSA decode under DCP: NCCL-free top-k / Q / O exchanges.
         from .dsa_kernels.dcp_exchange.decode import build as build_dcpx
 
