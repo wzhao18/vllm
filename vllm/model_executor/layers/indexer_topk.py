@@ -211,6 +211,17 @@ class SparseIndexerTopk(torch.nn.Module):
         value)."""
         if self._backend == "auto":
             return self._resolve_auto(logits, topk_tokens, num_rows)
+        if self._backend == "balanced":
+            from vllm.v1.attention.ops.balanced_topk import balanced_topk_supported
+
+            if balanced_topk_supported(logits, topk_tokens):
+                return "balanced"
+            logger.info_once(
+                "sparse_indexer_topk_backend='balanced' needs BF16 decode logits "
+                "(got %s); using the auto chain",
+                logits.dtype,
+            )
+            return self._resolve_auto(logits, topk_tokens, num_rows)
 
         failures: list[str] = []
         if self._backend == "cooperative":
@@ -490,6 +501,10 @@ class SparseIndexerTopk(torch.nn.Module):
         if backend == "deep_select":
             row_ends = self._row_ends(seq_lens, next_n, logits.shape[0])
             deep_select_topk(logits, topk_tokens, end=row_ends, output_idx=topk_indices)
+        elif backend == "balanced":
+            from vllm.v1.attention.ops.balanced_topk import balanced_topk
+
+            balanced_topk(logits, seq_lens, next_n, topk_indices, topk_tokens)
         elif backend == "cooperative":
             (topk_workspace,) = current_workspace_manager().get_simultaneous(
                 ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),

@@ -640,9 +640,10 @@ def sparse_attn_indexer(
         )
         assert candidate_block_size > 0
 
-    # DeepSelect ranks SM100's BF16 decode logits directly, also under DCP
-    # (whose merge reads them as well); other top-k backends read an FP32 copy.
-    fp32_decode_logits = topk_backend != "deep_select"
+    # DeepSelect and the balanced top-k rank SM100's BF16 decode logits
+    # directly (DeepSelect also under DCP, whose merge reads them as well);
+    # the other top-k backends read an FP32 copy.
+    fp32_decode_logits = topk_backend not in ("deep_select", "balanced")
 
     # assert isinstance(attn_metadata, dict)
     # kv_cache is an empty placeholder until bind_kv_cache runs after memory
