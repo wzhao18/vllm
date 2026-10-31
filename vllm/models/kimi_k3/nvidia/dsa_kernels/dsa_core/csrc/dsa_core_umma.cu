@@ -36,7 +36,7 @@
 
 namespace k31dsau {
 
-constexpr int kThreads = 256;
+constexpr int kThreads = 512;  // (16 warps: 4 x 4 (TMEM lane quarter, column quarter))
 constexpr uint32_t kSent = 0xFFFFFFFFu;
 constexpr int kMaxK = 2048;
 constexpr int kM = 128;        // MMA rows (gathered heads, zero padded)
@@ -54,8 +54,8 @@ constexpr int kQ = 0;                              // [16 groups][36][128] Q, K-
 constexpr int kKV = kQ + (kM / 8) * kGrp;          // 2 x [8 groups][36][128] KV rows
 constexpr int kP = kKV + 2 * (kChunk / 8) * kGrp;  // [16 groups][4][128] P, K-major
 constexpr int kIdx = kP + (kM / 8) * 4 * 128;      // [kMaxK] slots
-constexpr int kRed = kIdx + kMaxK * 4;             // [2][128] f32 row max / sum halves
-constexpr int kBar = kRed + 2 * kM * 4;            // mbarriers (MMA done) + TMEM address
+constexpr int kRed = kIdx + kMaxK * 4;             // [4][128] f32 row max / sum quarters
+constexpr int kBar = kRed + 4 * kM * 4;            // mbarriers (MMA done) + TMEM address
 constexpr int kSmem = kBar + 32;
 constexpr int kOStr = 264;  // bf16 O staging stride (halves; 16 B aligned rows)
 static_assert(kM * kOStr * 2 <= 2 * (kChunk / 8) * kGrp, "O staging over the KV buffers");
@@ -209,6 +209,19 @@ __device__ __forceinline__ void tmem_ld32(uint32_t taddr, float* v) {
 #pragma unroll
   for (int i = 0; i < 32; ++i) v[i] = __uint_as_float(r[i]);
 }
+__device__ __forceinline__ void tmem_ld16(uint32_t taddr, float* v) {
+  uint32_t r[16];
+  asm volatile(
+      "tcgen05.ld.sync.aligned.32x32b.x16.b32 {%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,"
+      "%14,%15}, [%16];"
+      : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]), "=r"(r[4]), "=r"(r[5]), "=r"(r[6]),
+        "=r"(r[7]), "=r"(r[8]), "=r"(r[9]), "=r"(r[10]), "=r"(r[11]), "=r"(r[12]), "=r"(r[13]),
+        "=r"(r[14]), "=r"(r[15])
+      : "r"(taddr));
+  asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+#pragma unroll
+  for (int i = 0; i < 16; ++i) v[i] = __uint_as_float(r[i]);
+}
 __device__ __forceinline__ void tmem_st32(uint32_t taddr, const float* v) {
   asm volatile(
       "tcgen05.st.sync.aligned.32x32b.x32.b32 [%0], {%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,"
@@ -293,6 +306,7 @@ __global__ void __launch_bounds__(kThreads, 1) dsau_kernel(const __grid_constant
     const uint32_t q0 = smem_u32(sQ);
     // (j walks the tile in shared-memory order: 8 lanes per 128 B core matrix, so the
     // 16 B shared writes are conflict-free; chunk (row, c) of row-major global Q)
+    if (dbg && tid == 0) dbg[20] = clock64();
     for (int j = tid; j < kM * kKc; j += kThreads) {
       const int r = 8 * (j / (8 * kKc)) + j % 8, c = (j % (8 * kKc)) / 8;
       if (r < p.heads) {
@@ -302,7 +316,9 @@ __global__ void __launch_bounds__(kThreads, 1) dsau_kernel(const __grid_constant
       }
     }
     cp_commit();
+    if (dbg && tid == 0) dbg[21] = clock64();
     cp_wait<0>();
+    if (dbg && tid == 0) dbg[22] = clock64();
     for (int j = tid; j < nq; j += kThreads) {
       const int r = 8 * (j / (8 * kKc)) + j % 8, c = (j % (8 * kKc)) / 8;
       uint4* dst = reinterpret_cast<uint4*>(sQ + 16 * j);
@@ -365,10 +381,10 @@ __global__ void __launch_bounds__(kThreads, 1) dsau_kernel(const __grid_constant
   // softmax: warp w owns TMEM lanes 32 (w & 3) .. (head rows) and S columns
   // 32 (w >> 2) .., and O columns 128 (w >> 2) .. of the CTA's half; each pair of warps
   // (w, w + 4) combines its row max / sum through shared memory
-  const int row = 32 * (warp & 3) + lane, ch = warp >> 2;
+  const int row = 32 * (warp & 3) + lane, ch = warp >> 2;  // (ch: column quarter)
   float m_run = -INFINITY, l_run = 0.f;
   const uint32_t lane_base = (uint32_t)((warp & 3) * 32) << 16;
-  float* sRed = reinterpret_cast<float*>(smem + kRed);  // [2][128] max, then sum
+  float* sRed = reinterpret_cast<float*>(smem + kRed);  // [4][128] max, then sum
   constexpr uint32_t kIdQK = idesc(kM, kChunk, false) | (QK2X ? (1u << 29) : 0u);
   constexpr uint32_t kIdPV = idesc(kM, kHalf, true);
   constexpr int kQkStep = QK2X ? 512 : 256;  // bytes of K per QK instruction
@@ -403,40 +419,40 @@ __global__ void __launch_bounds__(kThreads, 1) dsau_kernel(const __grid_constant
     if (dbg && tid == 0 && c < 2) dbg[11 + 4 * c] = clock64();
     if (c >= 1 && c + 1 < nchunks) issue(c + 1);  // (buffer of chunk c - 1)
     const int valid = min(kChunk, n - c * kChunk);
-    float sv[32];
-    tmem_ld32(tmem + lane_base + kSCol + 32 * ch, sv);
+    float sv[16];
+    tmem_ld16(tmem + lane_base + kSCol + 16 * ch, sv);
     float mx4[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY};
 #pragma unroll
-    for (int j = 0; j < 32; ++j) {
-      if (32 * ch + j >= valid) sv[j] = -INFINITY;
+    for (int j = 0; j < 16; ++j) {
+      if (16 * ch + j >= valid) sv[j] = -INFINITY;
       mx4[j & 3] = fmaxf(mx4[j & 3], sv[j]);
     }
     sRed[ch * 128 + row] = fmaxf(fmaxf(mx4[0], mx4[1]), fmaxf(mx4[2], mx4[3]));
     __syncthreads();
-    const float mx = fmaxf(sRed[row], sRed[128 + row]) * p.s2scale;  // (s2scale > 0)
+    const float mx = fmaxf(fmaxf(sRed[row], sRed[128 + row]),
+                           fmaxf(sRed[256 + row], sRed[384 + row])) * p.s2scale;  // (s2scale > 0)
     const float m_new = fmaxf(m_run, mx);  // finite: valid >= 1
     const float alpha = m_run == -INFINITY ? 0.f : ex2(m_run - m_new);
     const float bias = 8.f - m_new;  // P = 2^(s * scale - m + 8) <= 256
     float sum4[4] = {0.f, 0.f, 0.f, 0.f};
-    uint32_t pw[8];
+    uint32_t pw[4];
 #pragma unroll
-    for (int j = 0; j < 32; j += 4) {
+    for (int j = 0; j < 16; j += 4) {
       const float p0 = ex2(fmaf(sv[j], p.s2scale, bias)), p1 = ex2(fmaf(sv[j + 1], p.s2scale, bias));
       const float p2 = ex2(fmaf(sv[j + 2], p.s2scale, bias)), p3 = ex2(fmaf(sv[j + 3], p.s2scale, bias));
-      sum4[(j >> 2) & 3] += (p0 + p1) + (p2 + p3);
+      sum4[j >> 2] = (p0 + p1) + (p2 + p3);
       const __nv_fp8x4_e4m3 q4(make_float4(p0, p1, p2, p3));
       pw[j / 4] = *reinterpret_cast<const uint32_t*>(&q4);
     }
-    // P row, keys 32 ch .. 32 ch + 31 -> K-major core matrices 2 ch, 2 ch + 1
-    *reinterpret_cast<uint4*>(sP + cm_off(row, 2 * ch, 4)) = make_uint4(pw[0], pw[1], pw[2], pw[3]);
-    *reinterpret_cast<uint4*>(sP + cm_off(row, 2 * ch + 1, 4)) = make_uint4(pw[4], pw[5], pw[6], pw[7]);
-    // rescale the running O of the warp's rows / columns (PV(c - 1) is done); tcgen05.ld
+    // P row, keys 16 ch .. 16 ch + 15 -> K-major core matrix ch
+    *reinterpret_cast<uint4*>(sP + cm_off(row, ch, 4)) = make_uint4(pw[0], pw[1], pw[2], pw[3]);
+    // rescale the running O of the warp's rows / 64 columns (PV(c - 1) is done); tcgen05.ld
     // and st are warp-collective, so the whole warp takes the branch
     if (c > 0 && __any_sync(0xffffffffu, alpha < 1.f)) {
 #pragma unroll 1
-      for (int k = 0; k < kHalf / 64; ++k) {
+      for (int k = 0; k < kHalf / 128; ++k) {
         float o[32];
-        const uint32_t col = tmem + lane_base + kOCol + 128 * ch + 32 * k;
+        const uint32_t col = tmem + lane_base + kOCol + 64 * ch + 32 * k;
         tmem_ld32(col, o);
 #pragma unroll
         for (int j = 0; j < 32; ++j) o[j] *= alpha;
@@ -444,12 +460,12 @@ __global__ void __launch_bounds__(kThreads, 1) dsau_kernel(const __grid_constant
       }
     }
     const float part = (sum4[0] + sum4[1]) + (sum4[2] + sum4[3]);
-    __syncthreads();  // (both halves read the max before the sums overwrite it)
+    __syncthreads();  // (every quarter read the max before the sums overwrite it)
     sRed[ch * 128 + row] = part;
     fence_async_smem();
     tc_fence_before();
     __syncthreads();
-    l_run = l_run * alpha + (sRed[row] + sRed[128 + row]);
+    l_run = l_run * alpha + ((sRed[row] + sRed[128 + row]) + (sRed[256 + row] + sRed[384 + row]));
     m_run = m_new;
     if (dbg && tid == 0 && c < 2) dbg[12 + 4 * c] = clock64();
     // ---- PV: O[128, 256] += P[128, 64] V[64, 256] (2 K-steps of 32 keys)
@@ -480,9 +496,9 @@ __global__ void __launch_bounds__(kThreads, 1) dsau_kernel(const __grid_constant
     const bool live = n > 0 && l_run > 0.f;
     const float r = live ? p.vscale / l_run : 0.f;
 #pragma unroll 1
-    for (int k = 0; k < kHalf / 64; ++k) {
+    for (int k = 0; k < kHalf / 128; ++k) {
       float o[32];
-      const int c0 = 128 * ch + 32 * k;
+      const int c0 = 64 * ch + 32 * k;
       if (nchunks > 0) {
         tmem_ld32(tmem + lane_base + kOCol + c0, o);
       } else {
