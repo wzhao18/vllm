@@ -136,3 +136,19 @@ def test_balanced_topk_cuda_graph(balanced_topk):
         seq_lens.copy_(torch.tensor(lens, dtype=torch.int32).view(-1, 1))
         g.replay()
         _check(logits, seq_lens, next_n, out, topk)
+
+
+def test_balanced_backend_routing(monkeypatch):
+    """'balanced' falls back to 'auto' under DCP > 1 (untested DCP merge) and
+    leaves prefill on the same top-k as 'auto' (DeepSelect where available)."""
+    from vllm.model_executor.layers import sparse_attn_indexer as sai
+
+    assert sai._decode_topk_backend("balanced", 1) == "balanced"
+    assert sai._decode_topk_backend("balanced", 2) == "auto"
+    assert sai._decode_topk_backend("balanced", 8) == "auto"
+    assert sai._decode_topk_backend("cooperative", 8) == "cooperative"
+    monkeypatch.setattr(sai, "is_deep_select_available", lambda *a: True)
+    logits = torch.empty(4, 4096, dtype=torch.bfloat16)
+    for backend in ("auto", "deep_select", "balanced"):
+        assert sai._use_deep_select_prefill(logits, None, 2048, backend)
+    assert not sai._use_deep_select_prefill(logits, None, 2048, "cooperative")

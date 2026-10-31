@@ -40,6 +40,37 @@ logger = init_logger(__name__)
 _TOKENSPEED_MAX_Q_LEN = 8
 
 
+# TokenSpeed MLA decode addresses its split-KV scratch with Int32 byte offsets
+# (the LSE partials start at B * rows * splits * D * 4 bytes) and refuses a
+# workspace of 2^31 bytes or more.
+_TOKENSPEED_WORKSPACE_LIMIT = 1 << 31
+
+
+def _var_split_rows(num_heads: int, query_len: int) -> int:
+    """Query rows per request in the split-KV scratch (an upper bound: packed
+    128-row tiles or folded heads)."""
+    return max(128 * -(-num_heads * query_len // 128), num_heads * query_len)
+
+
+def _var_split_cap(
+    num_requests: int,
+    num_heads: int,
+    query_len: int,
+    kv_lora_rank: int,
+    max_split_kv: int,
+) -> int:
+    """``max_split_kv`` lowered, if needed, so that ``num_requests`` requests
+    with that many splits each stay below the kernel's Int32 workspace
+    limit: B x rows x splits x (D + 1) x 4 bytes < 2^31."""
+    per_split = (
+        max(num_requests, 1)
+        * _var_split_rows(num_heads, query_len)
+        * (kv_lora_rank + 1)
+        * 4
+    )
+    return min(max_split_kv, (_TOKENSPEED_WORKSPACE_LIMIT - 1) // per_split)
+
+
 def _get_workspace(
     device: torch.device,
     num_heads: int,
@@ -75,11 +106,19 @@ def _get_workspace(
         )
     if max_split_kv > 1:
         # Length-proportional splits: the grid holds max_split_kv splits of
-        # every request's query rows (packed 128-row tiles or folded heads).
-        rows = max(128 * -(-num_heads * query_len // 128), num_heads * query_len)
+        # every request's query rows. _var_split_cap lowers the split count
+        # of large batches so that no batch needs more than the kernel's
+        # Int32 byte-offset limit.
         needed = max(
             needed,
-            max_decode_requests * rows * max_split_kv * (kv_lora_rank + 1) * 4,
+            min(
+                max_decode_requests
+                * _var_split_rows(num_heads, query_len)
+                * max_split_kv
+                * (kv_lora_rank + 1)
+                * 4,
+                _TOKENSPEED_WORKSPACE_LIMIT - 1,
+            ),
         )
         logger.info_once(
             "TokenSpeed MLA length-proportional split-KV workspace: %.2f GiB",
@@ -349,22 +388,49 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
             )
             self.output_scale = layer._k_scale_float
 
-        var_split = self._max_split_kv > 1 and self.dcp_world_size == 1
+        var_split_cfg = self._max_split_kv > 1 and self.dcp_world_size == 1
+        var_split = False
+        max_split_kv = 0
+        if var_split_cfg:
+            # Large batches (e.g. 128 requests x 4 tokens or 64 x 8 at 64
+            # heads) get fewer splits per request so that the workspace stays
+            # within the kernel's Int32 offsets; below 2 splits the uniform
+            # path takes over (it has the same limit at its own split count).
+            max_split_kv = _var_split_cap(
+                q.shape[0],
+                q.shape[-2],
+                q.shape[1],
+                self.kv_lora_rank,
+                self._max_split_kv,
+            )
+            if max_split_kv < self._max_split_kv:
+                logger.info_once(
+                    "TokenSpeed MLA length-proportional split-KV: %d requests "
+                    "x %d tokens use at most %d splits per request (Int32 "
+                    "workspace limit; configured %d)",
+                    q.shape[0],
+                    q.shape[1],
+                    max_split_kv,
+                    self._max_split_kv,
+                )
+            var_split = max_split_kv > 1
         workspace = _get_workspace(
             q.device,
             q.shape[-2],
             self.kv_lora_rank,
             self._min_split_kv,
             self._max_decode_tokens,
-            self._max_split_kv if var_split else 0,
+            self._max_split_kv if var_split_cfg else 0,
             self._max_decode_requests,
             self._query_len,
         )
         split_kwargs: dict = {"min_split_kv": self._min_split_kv}
         if var_split:
             split_kwargs = {
-                "max_split_kv": self._max_split_kv,
-                "block_split_kvs": self._block_split_kvs(attn_metadata, q),
+                "max_split_kv": max_split_kv,
+                "block_split_kvs": self._block_split_kvs(
+                    attn_metadata, q, max_split_kv
+                ),
             }
 
         # vLLM kv_c_and_k_pe_cache is already (num_blocks, block_size, head_size).
@@ -403,14 +469,14 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
         return o, lse
 
     def _block_split_kvs(
-        self, attn_metadata: MLACommonMetadata, q: torch.Tensor
+        self, attn_metadata: MLACommonMetadata, q: torch.Tensor, max_split_kv: int
     ) -> torch.Tensor:
         """Per-request split counts, computed once per step (the layers of a
         step share the decode metadata) and cached on it."""
         decode = attn_metadata.decode
         assert decode is not None
         cached = getattr(decode, "_tokenspeed_block_split_kvs", None)
-        if cached is not None and cached[0] == self._max_split_kv:
+        if cached is not None and cached[0] == max_split_kv:
             return cached[1]
         from tokenspeed_mla import tokenspeed_mla_var_split_counts
 
@@ -419,7 +485,7 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
         seq_lens = decode.seq_lens
         total = self._min_split_kv * seq_lens.numel() if self._min_split_kv > 1 else 0
         counts = tokenspeed_mla_var_split_counts(
-            seq_lens, self._max_split_kv, q.shape[-2], q.shape[1], q.dtype, total
+            seq_lens, max_split_kv, q.shape[-2], q.shape[1], q.dtype, total
         )
-        decode._tokenspeed_block_split_kvs = (self._max_split_kv, counts)
+        decode._tokenspeed_block_split_kvs = (max_split_kv, counts)
         return counts

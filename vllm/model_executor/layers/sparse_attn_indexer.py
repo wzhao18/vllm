@@ -513,6 +513,20 @@ def as_fp32_logits(logits: torch.Tensor, row_ends: torch.Tensor) -> torch.Tensor
     return out
 
 
+def _decode_topk_backend(topk_backend: str, dcp_world_size: int) -> str:
+    """The configured top-k backend, or "auto" for "balanced" under DCP > 1:
+    the balanced top-k is validated at DCP1 only, and its BF16 local logits
+    would feed the DCP top-k merge untested."""
+    if topk_backend == "balanced" and dcp_world_size > 1:
+        logger.warning_once(
+            "sparse_indexer_topk_backend='balanced' is not supported with "
+            "decode context parallelism (DCP=%d); using 'auto'",
+            dcp_world_size,
+        )
+        return "auto"
+    return topk_backend
+
+
 def _use_deep_select_prefill(
     logits: torch.Tensor,
     row_starts: torch.Tensor | None,
@@ -522,7 +536,8 @@ def _use_deep_select_prefill(
     """Whether DeepSelect ranks these prefill logits: SM100's BF16 logits under
     the "auto" and "deep_select" top-k backends, with or without DCP."""
     return (
-        topk_backend in ("auto", "deep_select")
+        # "balanced" is a decode-only top-k; its prefill follows "auto".
+        topk_backend in ("auto", "deep_select", "balanced")
         and logits.dtype == torch.bfloat16
         and row_starts is None
         and is_deep_select_available(logits, topk_tokens)
@@ -639,6 +654,8 @@ def sparse_attn_indexer(
             "v4.1 two-level candidate filtering is not supported with DCP."
         )
         assert candidate_block_size > 0
+
+    topk_backend = _decode_topk_backend(topk_backend, dcp_world_size)
 
     # DeepSelect and the balanced top-k rank SM100's BF16 decode logits
     # directly (DeepSelect also under DCP, whose merge reads them as well);
