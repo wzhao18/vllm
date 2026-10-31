@@ -67,6 +67,8 @@ def compile_query(
     mailbox poll to QueryWait.
     ``release``: launch the next kernel early (PDL)."""
     qnorm, kvnorm, qb, uk, kv = fakes
+    # Ben's MlaQuery (round 1) writes no nvfp4_ds_mla rows; its gather is the poll.
+    assert not nvfp4, "Kimi K3.1 specialized DSA: no nvfp4_ds_mla KV insert"
     scalar = fake((1,), (1,), torch.float32, 4)
     if fp8:
         query = fake((batch, heads, 576), (heads * 576, 576, 1), torch.uint8)
@@ -81,11 +83,10 @@ def compile_query(
         q_b_cp_async=heads == 12 and batch == 1,
         dsa=True,
         fp8=fp8,
-        nvfp4=nvfp4,
         dcp=dcp,
         q_heads=q_heads,
         store_qc=overlap in ("serial", "wait"),
-        poll=overlap == "serial",
+        gather=overlap == "serial",
         late=overlap in ("late", "late_front"),
         release=release,
     )

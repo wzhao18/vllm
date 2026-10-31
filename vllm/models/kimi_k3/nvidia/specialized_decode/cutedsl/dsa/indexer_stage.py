@@ -33,15 +33,22 @@ class IndexerStage:
         # --- DCP top-k merge (#63): its caller-owned outputs -------------------
         # N, this rank's candidate count; 0 runs the op and the local-slot filter.
         self.local_topk = indexer.dcp_local_topk if rows else 0
+        # Optional [>= rows, K] int32: the merge also writes the global ids (tests,
+        # VLLM_DSA_BPRIME_CHECK).
+        self.dcp_ids: torch.Tensor | None = None
         if self.local_topk:
+            from vllm.v1.attention.ops.dcp_topk_merge.check import (
+                dcp_topk_merge_check_enabled,
+            )
+
             device = indexer.topk_indices_buffer.device
             # K wide: the exact merge gives a rank up to K of a row's keys (a
             # saturated row: more than its N local candidates).
             shape = (rows, self.topk)
             self.dcp_rows = torch.full(shape, -1, dtype=torch.int32, device=device)
             self.dcp_valid = torch.zeros(rows, dtype=torch.int32, device=device)
-        # Optional [>= rows, K] int32: the merge also writes the global ids (tests).
-        self.dcp_ids: torch.Tensor | None = None
+            if dcp_topk_merge_check_enabled():
+                self.dcp_ids = torch.full(shape, -1, dtype=torch.int32, device=device)
         # The fused DCP indexer (PreparedDsa.prepare_cache; None: DeepGEMM).
         self.fused = None
         # -----------------------------------------------------------------------
@@ -73,6 +80,8 @@ class IndexerStage:
             indexer.dcp_world_size,
             indexer.cp_kv_cache_interleave_size,
             topk_backend=indexer.topk_backend,
+            # Interleave 1: the exact one-round DCP merge (gated in the op).
+            dcp_local_topk=indexer.dcp_local_topk,
         )
 
     # --- DCP top-k merge (#63) ---------------------------------------------------
@@ -146,6 +155,7 @@ class IndexerStage:
                 max_local_len=max_local_len,
                 **merge,
             )
+            self.check(logits[:rows], ends[:rows], index_md, ids)
             if rows < batch:  # rows past the requests attend nothing
                 slots[rows:].fill_(-1)
                 valid[rows:].zero_()
@@ -169,15 +179,49 @@ class IndexerStage:
         )
         # SM100 DeepGEMM emits bf16 at a 1 KiB row stride (DeepSelect's input).
         assert logits.dtype == torch.bfloat16 and is_deep_select_supported(logits, n)
+        row_ends = SparseIndexerTopk._row_ends(seq_lens, next_n, rows)
         dcp_topk_merge_rows(
             logits=logits,
-            row_ends=SparseIndexerTopk._row_ends(seq_lens, next_n, rows),
+            row_ends=row_ends,
             max_local_len=max_local_len,
             **merge,
         )
+        self.check(logits, row_ends, index_md, ids)
         if rows < batch:  # rows past the requests attend nothing
             slots[rows:].fill_(-1)
             valid[rows:].zero_()
         return slots, valid
+
+    def check(self, logits, row_ends, index_md, ids):
+        """VLLM_DSA_BPRIME_CHECK: the generic merge of the same bf16 logits next to
+        the merge's global ids ``ids``, as the stock op's decode branch runs it
+        (collective over the DCP group; only where the check allocated dcp_ids)."""
+        from vllm.model_executor.layers.sparse_attn_indexer import (
+            _check_dcp_decode_topk_merge,
+        )
+        from vllm.v1.attention.ops.dcp_topk_merge.check import (
+            dcp_topk_merge_check_enabled,
+        )
+
+        if ids is None or not dcp_topk_merge_check_enabled():
+            return
+        indexer, decode = self.indexer, index_md.decode
+        reqs = decode.decode_lens.shape[0]
+        _check_dcp_decode_topk_merge(
+            indexer.k_cache.prefix,
+            logits,
+            row_ends,
+            decode.seq_lens[:reqs],
+            ids.shape[0] // reqs,
+            ids,
+            self.local_topk,
+            indexer.topk_backend,
+            indexer.topk_backend != "deep_select",
+            index_md.max_seq_len,
+            self.max_model_len,
+            indexer.dcp_rank,
+            indexer.dcp_world_size,
+            16,  # bf16 logits
+        )
 
     # -------------------------------------------------------------------------------

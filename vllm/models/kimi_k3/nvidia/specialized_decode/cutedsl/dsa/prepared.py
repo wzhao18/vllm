@@ -35,13 +35,15 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import make_fake_stream
 
+from vllm.logger import init_logger
+
 from ..common.host import fake, layout, stream, to_cute
-from .dcp_value import PROJECTED
 from ..mla.prepared import pad_requests
 from ..mla.value import MlaValue
 from .attn_ds import flashmla_core, flashmla_dcp_core
 from .attn_fi import FlashInferCore, dsa_on_flashinfer, fi_kernels, kernel_for
 from .dcp_stage import compile_dcp_value, local_slots, publish_args, run_value
+from .dcp_value import PROJECTED
 from .indexer import PAGE as INDEX_PAGE
 from .indexer import FusedIndexer
 from .indexer import reserve as reserve_fused_indexer
@@ -65,8 +67,12 @@ from .query_stage import (
     compile_norm,
     compile_query,
     compile_wait,
+    front_kernel,
     gate_columns,
 )
+from .r1 import DsaBox, fi_buffers
+
+logger = init_logger(__name__)
 
 __all__ = [
     "QUERY_HEADS",
@@ -186,6 +192,9 @@ class PreparedDsa:
     attn_fi.fi_kernels); ``prims_ts_rows``: the prims_ts plans' row capacities
     (default: every batch on its own plan);
     ``overlap``: a query overlap mode or "rows:mode" table (overlap.QUERY_OVERLAP).
+    The round-1 runtime's arguments are taken too (r1.py): ``core`` "auto", its
+    scratch (the last item a BF16 latent: FlashInfer's buffers are r1.fi_buffers)
+    and its DSA DcpBox (wrapped in r1.DsaBox).
     """
 
     def __init__(
@@ -200,6 +209,7 @@ class PreparedDsa:
         kernels=None,
         overlap=None,
         prims_ts_rows=None,
+        core="auto",
     ):
         from vllm.model_executor.layers.linear import UnquantizedLinearMethod
         from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseImpl
@@ -222,6 +232,10 @@ class PreparedDsa:
             raise ValueError(
                 "Kimi K3.1 specialized decode needs an unquantized (BF16) wq_index"
             )
+        if core != "auto":
+            raise ValueError(f"Kimi K3.1 DSA core {core!r}: only auto is served")
+        if dcp is not None and not hasattr(dcp, "mailboxes"):
+            dcp = DsaBox(dcp)
         self.box, self.parity = dcp, parity
         # The DcpBox mailboxes hold cap rows: a wider batch would store past them.
         assert dcp is None or max(pitches) <= dcp.cap, (max(pitches), dcp.cap)
@@ -230,7 +244,11 @@ class PreparedDsa:
             assert self.impl.fp8_decode_padded_heads == QUERY_HEADS
         self.heads = layer.W_UK_T.shape[0]
         self.device, self.pitches = layer.W_UK_T.device, pitches
-        *shared, fi_buffers = scratch
+        *shared, fi = scratch
+        if isinstance(fi, torch.Tensor):  # the round-1 scratch
+            heads = dcp.q_heads if dcp is not None else self.heads
+            topk = self.indexer.topk_tokens
+            fi = fi_buffers(self.device, max(pitches), topk, heads)
         self.query_stage = QueryStage(attention, pitches, shared, self.fp8, self.nvfp4)
         # Under DCP on FlashInfer: the #63 merge's owned-row outputs (indexer_stage).
         merge_rows = max(pitches) if self.dcp > 1 and self.fp8 else 0
@@ -255,7 +273,7 @@ class PreparedDsa:
                 self.impl,
                 layer,
                 heads,
-                fi_buffers,
+                fi,
                 rows,
                 *sharding,
                 widths=widths,
@@ -355,7 +373,35 @@ class PreparedDsa:
                 local_topk=stage.local_topk,
                 packed=True,
             )
+        self.log_policy(unsupported)
         return self
+
+    def log_policy(self, unsupported):
+        """The per-batch policy at startup (once, global rank 0): per rows x q the
+        query overlap, the index front and the sparse core; the DCP merge and the
+        fused indexers; the indexer cache and the FP8 scales."""
+        stage, shapes = self.indexer_stage, []
+        for batch, q in self.shapes:
+            mode = self.overlaps[batch, q]
+            front = front_kernel(batch) if mode in FRONT else "none"
+            shapes.append(f"{batch}x{q}:{mode}/{front}/{self.cores[batch, q]}")
+        reasons = sorted({r for r in unsupported if r})
+        logger.info_once(
+            "Kimi K3.1 specialized DSA (DCP %d, %d SMs): rows x q:overlap/front/core "
+            "%s; DCP merge rows N=%d; fused DCP indexer %s; fused TP indexer %s "
+            "(unsupported: %s); indexer cache %s; k_scale %s, q_scale %s",
+            self.dcp,
+            torch.cuda.get_device_properties(self.device).multi_processor_count,
+            " ".join(shapes),
+            stage.local_topk,
+            "on" if stage.fused is not None else "off",
+            "on" if self.fused is not None else "off",
+            "; ".join(reasons) or "none",
+            tuple(self.indexer.k_cache.kv_cache.shape),
+            getattr(self.layer, "_k_scale_float", None),
+            getattr(self.layer, "_q_scale_float", None),
+            scope="global",
+        )
 
     def held(self, modes):
         """The shapes on a FlashInfer kernel (HELD_KERNELS) whose overlap mode is
