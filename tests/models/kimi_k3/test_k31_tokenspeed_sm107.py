@@ -17,6 +17,17 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.fixture
+def sm107_workspace():
+    """The vLLM workspace manager ``TokenspeedMLAImpl._forward_sm107`` takes its
+    split-KV workspace from."""
+    from vllm.v1.worker.workspace import init_workspace_manager, reset_workspace_manager
+
+    init_workspace_manager(torch.device("cuda"))
+    yield
+    reset_workspace_manager()
+
+
 def _rand_fp8(shape, g):
     b = torch.randint(0x18, 0x38, shape, dtype=torch.uint8, device="cuda", generator=g)
     b |= torch.randint(0, 2, shape, dtype=torch.uint8, device="cuda", generator=g) << 7
@@ -115,7 +126,7 @@ CTXS = [37, 129, 4096 + 5, 70001, 200003]
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("min_split", [1, 32])
 def test_sm107_bf16_out_matches_reference(
-    workspace_init, heads, qlen, causal, min_split
+    sm107_workspace, heads, qlen, causal, min_split
 ):
     """q_len 7 = the DSpark drafter's query_len - 1 blocks (query_len 8)."""
     _check(heads, qlen, causal, min_split, 0.05, 1.0, CTXS, seed=heads + qlen)
@@ -124,7 +135,7 @@ def test_sm107_bf16_out_matches_reference(
 @pytest.mark.parametrize("out_scale", [0.37, 2.5])
 @pytest.mark.parametrize("scale", [0.05, 0.8 / math.sqrt(192)])
 @pytest.mark.parametrize("qlen", [7, 8])
-def test_sm107_output_and_softmax_scale(workspace_init, out_scale, scale, qlen):
+def test_sm107_output_and_softmax_scale(sm107_workspace, out_scale, scale, qlen):
     """Production passes output_scale = k_scale (both kernels apply it in the
     split-KV partial epilogue)."""
     _check(64, qlen, True, 32, scale, out_scale, CTXS, seed=7 + qlen)
@@ -177,7 +188,7 @@ def test_workspace_bound_covers_batches():
             assert size <= bound
 
 
-def test_warmup_covers_reachable_keys(workspace_init):
+def test_warmup_covers_reachable_keys(sm107_workspace):
     """After sm107_warmup, decodes within its batch / length bounds compile nothing."""
     from types import SimpleNamespace
 
