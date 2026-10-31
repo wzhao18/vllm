@@ -152,6 +152,26 @@ def deep_select_topk(
 
 
 @functools.cache
+def balanced_topk_impl():
+    """The CUDA balanced top-k (JIT-built on first use), or its Triton twin
+    when the extension cannot be built (no nvcc)."""
+    from vllm.v1.attention.ops import balanced_topk_cuda
+
+    try:
+        balanced_topk_cuda.warmup()
+        return balanced_topk_cuda.balanced_topk_cuda
+    except Exception as e:  # noqa: BLE001 - any build failure falls back
+        from vllm.v1.attention.ops.balanced_topk import balanced_topk
+
+        logger.warning(
+            "Balanced top-k CUDA extension unavailable (%s); using the Triton "
+            "implementation.",
+            e,
+        )
+        return balanced_topk
+
+
+@functools.cache
 def get_indexer_topk(backend: str) -> "SparseIndexerTopk":
     return SparseIndexerTopk(backend)
 
@@ -502,9 +522,7 @@ class SparseIndexerTopk(torch.nn.Module):
             row_ends = self._row_ends(seq_lens, next_n, logits.shape[0])
             deep_select_topk(logits, topk_tokens, end=row_ends, output_idx=topk_indices)
         elif backend == "balanced":
-            from vllm.v1.attention.ops.balanced_topk import balanced_topk
-
-            balanced_topk(logits, seq_lens, next_n, topk_indices, topk_tokens)
+            balanced_topk_impl()(logits, seq_lens, next_n, topk_indices, topk_tokens)
         elif backend == "cooperative":
             (topk_workspace,) = current_workspace_manager().get_simultaneous(
                 ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),

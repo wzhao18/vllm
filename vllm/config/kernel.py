@@ -382,11 +382,11 @@ class KernelConfig:
     DeepSelect on the BF16 logits; the other values keep the FP32 per-row
     prefill kernel.
     - "balanced": Length-balanced exact top-k over the BF16 decode logits
-      (vllm/v1/attention/ops/balanced_topk.py): long rows are split over a
-      persistent grid, so the time follows the step's total context, not its
-      longest row (data-parallel ranks with skewed contexts), and the BF16
-      logits are read without the FP32 upcast copy. Falls back to "auto" for
-      FP32 logits.
+      (vllm/v1/attention/ops/balanced_topk_cuda.py, JIT-built; Triton twin in
+      balanced_topk.py): long rows are split over a persistent grid, so the
+      time follows the step's total context, not its longest row
+      (data-parallel ranks with skewed contexts), and the BF16 logits are read
+      without the FP32 upcast copy. Falls back to "auto" for FP32 logits.
     """
 
     flashinfer_sparse_mla_kernel: FlashInferSparseMLAKernel = "auto"

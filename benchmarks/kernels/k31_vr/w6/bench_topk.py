@@ -22,6 +22,7 @@ import torch
 from vllm.model_executor.layers.indexer_topk import RADIX_TOPK_WORKSPACE_SIZE
 from vllm.model_executor.layers.sparse_attn_indexer import as_fp32_logits
 from vllm.v1.attention.ops.balanced_topk import balanced_topk
+from vllm.v1.attention.ops.balanced_topk_cuda import balanced_topk_cuda
 
 AGX = {
     "r4_agx": [48128, 114688, 187392, 346112],
@@ -33,6 +34,23 @@ AGX["r16_agx70"] = [int(x * 0.7) // 1024 * 1024 for x in AGX["r16_agx"]]
 UNI = {"r1_u128k": [131072], "r8_u32k": [32768] * 8, "r8_u128k": [131072] * 8,
        "r16_u64k": [65536] * 16, "r16_u128k": [131072] * 16, "r8_u256k": [262144] * 8,
        "r8_tail800k": [65536] * 7 + [819200]}
+
+
+def indexer_logits(req, next_n, stride, dev, heads=64, dim=128):
+    """Logits shaped like the DSA indexer's: sum_h w_h * relu(q_h . k_t)
+    over random FP8 keys (the W0 bench fill: N(0, 0.5) in E4M3), random
+    per-row queries and head weights, rounded to BF16 like DeepGEMM's."""
+    rows = sum(1 for _ in req) * next_n
+    out = torch.zeros(rows, stride, dtype=torch.bfloat16, device=dev)
+    for b, L in enumerate(req):
+        k = (torch.randn(L, dim, device=dev) * 0.5).to(torch.float8_e4m3fn).float()
+        for j in range(next_n):
+            q = torch.randn(heads, dim, device=dev) / dim**0.5
+            w = torch.randn(heads, device=dev) / heads**0.5
+            for s in range(0, L, 1 << 17):
+                e = min(L, s + (1 << 17))
+                out[b * next_n + j, s:e] = (torch.relu(k[s:e] @ q.T) @ w).to(torch.bfloat16)
+    return out
 
 
 def row_lens(req, next_n):
@@ -63,8 +81,9 @@ def main():
     p.add_argument("--topk", type=int, default=2048)
     p.add_argument("--reps", type=int, default=20)
     p.add_argument("--iters", type=int, default=15)
-    p.add_argument("--programs-per-sm", type=int, nargs="+", default=[4])
+    p.add_argument("--programs-per-sm", type=int, nargs="+", default=[8])
     p.add_argument("--out", default=None)
+    p.add_argument("--dist", choices=["randn", "indexer"], default="indexer")
     a = p.parse_args()
     cases = {**AGX, **UNI}
     if a.cases:
@@ -80,7 +99,10 @@ def main():
             width = (max(req) + 1023) // 1024 * 1024
             # DeepGEMM's padded row stride (1024 B aligned + a split's slack).
             stride = width + 512
-            buf = torch.randn(rows, stride, device=dev).mul_(4).to(torch.bfloat16)
+            if a.dist == "indexer":
+                buf = indexer_logits(req, next_n, stride, dev)
+            else:
+                buf = torch.randn(rows, stride, device=dev).mul_(4).to(torch.bfloat16)
             logits = buf[:, :width]
             seq_lens = torch.tensor(lens, dtype=torch.int32, device=dev).view(-1, next_n)
             row_ends = seq_lens.view(-1).contiguous()
@@ -101,6 +123,30 @@ def main():
                     r[arm] = time_graph(stock("cooperative_topk"), a.reps, a.iters)
                 elif arm == "persistent":
                     r[arm] = time_graph(stock("persistent_topk"), a.reps, a.iters)
+                elif arm == "gvr2":
+                    from flashinfer.topk_varlen.kernels.gvr2_topk_host import run_varlen, warmup_varlen
+                    f32 = as_fp32_logits(logits, row_ends)
+                    warmup_varlen(top_k=a.topk, max_seq_len=f32.shape[1], compress_ratio=1, next_n=1,
+                                  num_rows_list=[rows], row_stride=f32.stride(0))
+                    def g():
+                        f = as_fp32_logits(logits, row_ends)
+                        run_varlen(f, None, row_ends, out, next_n=1, compress_ratio=1,
+                                   max_seq_len=f.shape[1], top_k=a.topk)
+                    g(); torch.cuda.synchronize()
+                    ts = []
+                    for _ in range(a.iters):
+                        s0, e0 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                        s0.record()
+                        for _ in range(a.reps):
+                            g()
+                        e0.record(); e0.synchronize()
+                        ts.append(s0.elapsed_time(e0) * 1000 / a.reps)
+                    r[arm + "_eager"] = sorted(ts)[len(ts) // 2]
+                elif arm == "bcuda":
+                    for pps in a.programs_per_sm:
+                        r[f"bcuda_c{pps}"] = time_graph(
+                            lambda: balanced_topk_cuda(logits, seq_lens, next_n, out, a.topk, pps),
+                            a.reps, a.iters)
                 elif arm == "upcast":
                     r[arm] = time_graph(lambda: as_fp32_logits(logits, row_ends), a.reps, a.iters)
                 elif arm == "balanced":
@@ -110,7 +156,8 @@ def main():
                             a.reps, a.iters)
             # correctness of the balanced output on this case
             out.fill_(-5)
-            balanced_topk(logits, seq_lens, next_n, out, a.topk)
+            (balanced_topk_cuda if "bcuda" in a.arms else balanced_topk)(
+                logits, seq_lens, next_n, out, a.topk)
             ok = True
             for i in range(rows):
                 n = lens[i]

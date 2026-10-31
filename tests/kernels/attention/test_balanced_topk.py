@@ -6,11 +6,19 @@ import pytest
 import torch
 
 from vllm.platforms import current_platform
-from vllm.v1.attention.ops.balanced_topk import CHUNK, balanced_topk
+from vllm.v1.attention.ops.balanced_topk import balanced_topk as balanced_topk_triton
+from vllm.v1.attention.ops.balanced_topk_cuda import balanced_topk_cuda
+
+CHUNK = 8192
 
 pytestmark = pytest.mark.skipif(
-    not current_platform.is_cuda(), reason="balanced_topk is a CUDA (Triton) op"
+    not current_platform.is_cuda(), reason="balanced_topk is a CUDA op"
 )
+
+
+@pytest.fixture(params=["triton", "cuda"])
+def balanced_topk(request):
+    return balanced_topk_triton if request.param == "triton" else balanced_topk_cuda
 
 
 def _row_lens(seq_lens: torch.Tensor, next_n: int, num_rows: int) -> torch.Tensor:
@@ -42,7 +50,7 @@ def _check(logits, seq_lens, next_n, out, topk):
 @pytest.mark.parametrize("next_n", [1, 4, 8])
 @pytest.mark.parametrize("per_row_lens", [False, True])
 @pytest.mark.parametrize("topk", [2048, 512])
-def test_balanced_topk_skewed(next_n, per_row_lens, topk):
+def test_balanced_topk_skewed(balanced_topk, next_n, per_row_lens, topk):
     torch.manual_seed(0)
     # AgentX-like skew: short, mid, one long row, a row shorter than topk,
     # an empty one, and one spanning a chunk boundary exactly.
@@ -60,9 +68,10 @@ def test_balanced_topk_skewed(next_n, per_row_lens, topk):
 
 
 @pytest.mark.parametrize(
-    "pattern", ["ties", "neg", "inf", "const", "adversarial", "far", "short_ties"]
+    "pattern",
+    ["ties", "neg", "inf", "const", "adversarial", "far", "short_ties", "spike"],
 )
-def test_balanced_topk_value_patterns(pattern):
+def test_balanced_topk_value_patterns(balanced_topk, pattern):
     """Heavy ties at the threshold, all-negative rows, -inf padding, a
     constant row (one tie spanning the whole row), and a row whose sample
     misjudges the threshold. Ties and const overflow the candidate list."""
@@ -83,6 +92,11 @@ def test_balanced_topk_value_patterns(pattern):
         x = -torch.ones(rows, n, device="cuda")
         x[:, torch.randperm(n, device="cuda")[:6000]] = 1.0
         x[:, torch.randperm(n, device="cuda")[: topk + 100]] = 1e6
+    elif pattern == "spike":
+        # A huge tie on the sampled threshold (ReLU-like zeros) with fewer
+        # than topk keys above it: the selection takes ties from the filter.
+        x = torch.zeros(rows, n, device="cuda")
+        x[:, torch.randperm(n, device="cuda")[:1000]] = torch.rand(1000, device="cuda") + 1
     elif pattern == "short_ties":
         # Rows shorter than the candidate capacity, all ties.
         n = 9000
@@ -104,7 +118,7 @@ def test_balanced_topk_value_patterns(pattern):
     _check(logits, seq_lens, 1, out, topk)
 
 
-def test_balanced_topk_cuda_graph():
+def test_balanced_topk_cuda_graph(balanced_topk):
     """Replays with new lengths and values (device-side work list)."""
     torch.manual_seed(2)
     topk, width, next_n = 2048, 400_000, 4

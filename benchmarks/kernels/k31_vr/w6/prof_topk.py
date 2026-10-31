@@ -9,7 +9,7 @@ from torch.profiler import ProfilerActivity, profile
 from vllm.v1.attention.ops.balanced_topk import balanced_topk
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
-from bench_topk import AGX, UNI, row_lens  # noqa: E402
+from bench_topk import AGX, UNI, indexer_logits, row_lens  # noqa: E402
 
 cases = {**AGX, **UNI}
 for name in sys.argv[1:] or ["r1_u128k", "r16_u128k", "r16_agx"]:
@@ -17,7 +17,7 @@ for name in sys.argv[1:] or ["r1_u128k", "r16_u128k", "r16_agx"]:
     next_n = 4
     lens = row_lens(req, next_n)
     width = (max(req) + 1023) // 1024 * 1024
-    logits = torch.randn(len(lens), width + 512, device="cuda").mul_(4).to(torch.bfloat16)[:, :width]
+    logits = indexer_logits(req, next_n, width + 512, "cuda")[:, :width]
     seq = torch.tensor(lens, dtype=torch.int32, device="cuda").view(-1, next_n)
     out = torch.empty(len(lens), 2048, dtype=torch.int32, device="cuda")
     for _ in range(3):
