@@ -4,7 +4,8 @@
 
 CPU: the patch applies to the installed DeepGEMM header and the overlay mirrors
 the include tree. GPU (>= 2 SM100-family GPUs, DeepGEMM): the patched kernel is
-bitwise identical to the stock kernel and matches a PyTorch reference of the
+bitwise identical to the stock kernel (also with the routed weights localized
+across the two dies, when MLOPart is available) and matches a PyTorch reference of the
 K3.1 routed experts (MXFP8 x MXFP4, SiTU alpha 4 / beta 25, FP8 L1 output) on
 EP-sharded problems with random top-16 routing. Two shapes: 4 experts per rank
 at 1/7/64 tokens per rank (every expert is hit), and 28 experts per rank (the EP32
@@ -193,7 +194,7 @@ def _worker(rank: int, nranks: int, port: int, cache: str, epr: int, cases: tupl
                                                "fp8xfp4") if hasattr(dg, "get_block_m_for_mega_moe") else None)
                for t in cases}
 
-    def run(t):
+    def run(t, w1=None, w2=None):
         x, idx, tw = data[t]
         xf, xs = utils.per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
         buf.x[:t].copy_(xf)
@@ -201,7 +202,7 @@ def _worker(rank: int, nranks: int, port: int, cache: str, epr: int, cases: tupl
         buf.topk_idx[:t].copy_(idx)
         buf.topk_weights[:t].copy_(tw)
         y = torch.empty((t, HIDDEN), device="cuda", dtype=torch.bfloat16)
-        dg.fp8_fp4_mega_moe(y, l1, l2, buf, activation="situ", activation_clamp=None,
+        dg.fp8_fp4_mega_moe(y, w1 or l1, w2 or l2, buf, activation="situ", activation_clamp=None,
                             fast_math=True, activation_alpha=ALPHA, activation_beta=BETA)
         torch.cuda.synchronize()
         dist.barrier(group)
@@ -213,6 +214,16 @@ def _worker(rank: int, nranks: int, port: int, cache: str, epr: int, cases: tupl
         patched = {t: run(t) for t in cases}
         for t in cases:
             assert torch.equal(patched[t], stock[t]), (rank, t)
+    # Expert localization (VLLM_K3_MEGAMOE_LOCALIZE=1, MLOPart): each N half in its die's HBM.
+    localized = hasattr(dg, "is_localization_available") and dg.is_localization_available()
+    if localized:
+        w1 = (dg.localize(l1[0]), l1[1])
+        w2 = (dg.localize(l2[0]), l2[1])
+        dg.destroy_localizer()
+        assert dg.is_localized(w1[0]) and dg.is_localized(w2[0])
+        for _ in range(2):
+            for t in cases:
+                assert torch.equal(run(t, w1, w2), stock[t]), ("localized", rank, t)
     for t in cases:
         x, idx, tw = data[t]
         xq = utils.per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32)
@@ -220,7 +231,8 @@ def _worker(rank: int, nranks: int, port: int, cache: str, epr: int, cases: tupl
         ref = _reference(xq, idx, tw, w1_ref, w2_ref)
         err = (patched[t].float() - ref).norm() / ref.norm()
         print(f"rank {rank} experts/rank {epr} tokens {t} block_m {block_m[t]} zero-token experts "
-              f"{zero_experts[t]}/{num_experts}: patched == stock bitwise, rel. L2 error vs reference "
+              f"{zero_experts[t]}/{num_experts}: patched{' == localized' if localized else ''} == stock "
+              f"bitwise, rel. L2 error vs reference "
               f"{float(err):.2e}")
         assert err < 2e-2, (rank, t, float(err))
         out[(rank, t)] = (float(err), zero_experts[t], block_m[t])

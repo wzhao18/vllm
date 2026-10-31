@@ -11,8 +11,13 @@ the DeepGEMM warmup compiles the kernels:
   installed DeepGEMM's header does not have the expected text.
 - ``VLLM_K3_MEGAMOE_LOCALIZE`` (default 0): place each rank's routed expert weights
   in the GPU's two locality domains (MLOPart), so every die streams its half of N
-  from its own HBM (-1..-6 us per launch at 28-56 experts per rank). Needs MLOPart
-  and no EPLB (the weights change shape to ``(2, E, N / 2, K)``).
+  from its own HBM (bitwise-identical output; -10..-13 us per launch at real EP16,
+  56 experts per rank). Needs MLOPart and no EPLB (the weights change shape to
+  ``(2, E, N / 2, K)``). Not default: on VR the localized weights live outside the
+  PyTorch allocator (1-2 GiB per GPU less KV cache in a DEP4 8-layer model), and
+  2 of 4 localized DEP4 step runs were 17-20% slower for a whole process (one
+  rank's drafter MLA decode ran ~1.4x slower, the other ranks waited in MegaMoE);
+  0 of 6 plain runs were.
 """
 
 from __future__ import annotations
