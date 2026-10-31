@@ -2895,12 +2895,14 @@ def test_merge_rows_kernels_compile_at_prepare(monkeypatch, check):
     stage.topk, stage.local_topk, stage.indexer = 2048, 192, SimpleNamespace()
     stage.indexer.dcp_world_size = 16
     stage.dcp_ids = torch.empty(1) if check else None
-    # As DCPTopkSelectKernel / DCPTopkRescueKernel.__call__ key merge_rows' launch.
+    # As DCPTopkSelectKernel / DCPTopkRescueKernel.__call__ key merge_rows' launch
+    # (the select's round-1 mailbox variant where the merge has a mailbox).
     key = dict(topk=2048, local_topk=192, world_size=16, emit_ids=check)
     select = merge._DCP_TOPK_SELECT_KERNEL
     rescue = merge._DCP_TOPK_RESCUE_KERNEL
+    mailbox = merge._mailbox_for(2048, 192) is not None
     keys = (
-        select.dispatch(**key, block_size=1024, exact=True),
+        select.dispatch(**key, block_size=1024, exact=True, mailbox=mailbox),
         rescue.dispatch(**key, block_size=1024),
     )
     stage.warm(1024)
