@@ -69,6 +69,17 @@ def kda_dtypes(vllm_config):
     )
 
 
+def online_linear_quantization(quant_args) -> bool:
+    """Whether ``quantization_config`` quantizes linear layers online (a linear
+    weight spec or per-layer targets): the decode reads the BF16 projection
+    weights directly. An activation-only override (``moe.activation`` for the
+    MXFP4 experts) is fine."""
+    linear = getattr(quant_args, "linear", None)
+    return bool(getattr(quant_args, "targets", None)) or (
+        getattr(linear, "weight", None) is not None
+    )
+
+
 def unsupported(vllm_config) -> str | None:
     import torch
 
@@ -109,6 +120,11 @@ def unsupported(vllm_config) -> str | None:
             "MoE configs but the one-group sigmoid top-16 SiTU MoE of Kimi K3",
         ),
         (parallel.tensor_parallel_size not in (8, 16), "TP other than 8/16"),
+        (
+            online_linear_quantization(vllm_config.model_config.quantization_config),
+            "online quantization of linear layers (quantization_config.targets or "
+            "a linear weight spec; its projections read BF16 weights)",
+        ),
         (parallel.pipeline_parallel_size != 1, "pipeline parallelism"),
         (parallel.enable_expert_parallel, "expert parallelism"),
         (parallel.use_ubatching, "DBO"),

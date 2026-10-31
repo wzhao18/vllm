@@ -180,7 +180,12 @@ class QuantizationConfigArgs:
     def _validate_targets_exclusivity(self) -> "QuantizationConfigArgs":
         if self.targets is None:
             return self
-        if self.linear is not None or self.moe is not None:
+        # Activation-only `linear`/`moe` specs are overrides for the checkpoint
+        # quant method (e.g. MXFP8 activations for an MXFP4 MoE checkpoint) and
+        # compose with per-layer online `targets`; weight specs do not.
+        if (self.linear is not None and self.linear.weight is not None) or (
+            self.moe is not None and self.moe.weight is not None
+        ):
             raise ValueError(
                 "quantization_config.targets is mutually exclusive with "
                 f"quantization_config.linear/moe, got "

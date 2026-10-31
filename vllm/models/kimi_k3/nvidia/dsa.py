@@ -12,6 +12,8 @@ and ``weights_proj`` into the merged ``wkv_index``.
 """
 
 import math
+from collections.abc import Callable
+from functools import partial
 from typing import Any, cast
 
 import torch
@@ -54,6 +56,7 @@ from vllm.models.kimi_k3.nvidia.mla import (
     _GATE_MULTI_STREAM_TOKEN_THRESHOLD,
     _gate_sigmoid_mul,
 )
+from vllm.models.kimi_k3.nvidia.mxfp8_pack import PackedMxfp8Linear, can_pack_mxfp8
 from vllm.models.kimi_k3.nvidia.ops.dsa_indexer import (
     dsa_fused_prologue,
     indexer_k_norm_quant_insert,
@@ -72,6 +75,23 @@ from vllm.v1.attention.backends.mla import indexer as v32_indexer
 from vllm.v1.attention.ops.dcp_topk_merge import init_dcp_topk_merge
 
 logger = init_logger(__name__)
+
+
+def online_quant_config_only(
+    quant_config: QuantizationConfig | None,
+) -> QuantizationConfig | None:
+    """The online part of ``quant_config``: for layers that are BF16 in every
+    checkpoint but may be quantized online (``quantization_config.targets``)."""
+    from vllm.model_executor.layers.quantization.online.base import (
+        OnlineQuantizationConfig,
+    )
+
+    if quant_config is None or isinstance(quant_config, OnlineQuantizationConfig):
+        return quant_config
+    online = quant_config.online_quantization_config
+    if online is not None:
+        online.packed_modules_mapping = quant_config.packed_modules_mapping
+    return online
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
@@ -158,12 +178,13 @@ class KimiK3DSAIndexer(nn.Module):
             prefix=f"{prefix}.wq_index",
         )
         # The indexer query projection (wq_index) may be quantized in fp8
-        # checkpoints; wk and weights_proj are bf16 and share one GEMM.
+        # checkpoints; wk and weights_proj are bf16 and share one GEMM, which
+        # only online quantization (quantization_config.targets) may quantize.
         self.wkv_index = MergedColumnParallelLinear(
             hidden_size,
             [self.index_head_dim, self.index_num_heads],
             bias=False,
-            quant_config=None,
+            quant_config=online_quant_config_only(quant_config),
             disable_tp=True,
             prefix=f"{prefix}.wkv_index",
         )
@@ -705,8 +726,8 @@ class KimiK3DSAAttention(nn.Module):
         )
         self.aux_stream = aux_stream
         self._gate_events: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
-        # Set by pack_projections(): the packed input and query weights.
-        self._packed: list[torch.Tensor] | None = None
+        # Set by pack_projections(): the packed input and query projections.
+        self._packed: list[Callable[[torch.Tensor], torch.Tensor]] | None = None
 
     def pack_projections(self) -> None:
         """Enable the fused forward (as DeepseekV32Attention): pack
@@ -735,23 +756,39 @@ class KimiK3DSAAttention(nn.Module):
             (self.fused_qkv_a_proj, indexer.wkv_index),
             (self.q_b_proj, indexer.wq_index),
         )
-        if not all(
+        unquantized = all(
             isinstance(linear.quant_method, UnquantizedLinearMethod)
             for linears in groups
             for linear in linears
-        ):
+        )
+        # Online MXFP8 projections (quantization_config.targets) pack their FP8
+        # rows and E8M0 scale rows into one MXFP8 GEMM per group.
+        mxfp8 = not unquantized and all(can_pack_mxfp8(group) for group in groups)
+        if not (unquantized or mxfp8):
+            logger.warning_once(
+                "Kimi K3.1 DSA: the packed projections %s are not all BF16 or all "
+                "online MXFP8 (FlashInfer CUTLASS/CuTe DSL or cuBLASLt kernels); "
+                "using the unfused forward.",
+                [type(linear.quant_method).__name__ for g in groups for linear in g],
+            )
             return
         self._packed = []
         for linears in groups:
+            if mxfp8:
+                self._packed.append(PackedMxfp8Linear(linears))
+                continue
             packed = torch.cat([linear.weight.data for linear in linears])
             rows = [linear.weight.shape[0] for linear in linears]
             for linear, view in zip(linears, packed.split(rows)):
                 linear.weight.data = view
             request_low_latency_warmup(packed)
-            self._packed.append(packed)
+            self._packed.append(partial(low_latency_linear, weight=packed))
         if self.aux_stream is not None:
             self._gate_events = (torch.cuda.Event(), torch.cuda.Event())
-        logger.info_once("Kimi K3.1 DSA layers use the fused forward.")
+        logger.info_once(
+            "Kimi K3.1 DSA layers use the fused forward (%s projections).",
+            "MXFP8" if mxfp8 else "BF16",
+        )
 
     def forward(
         self,
@@ -781,10 +818,8 @@ class KimiK3DSAAttention(nn.Module):
         assert self.q_lora_rank is not None and self._packed is not None
         indexer = self.dsa_indexer
         attn = cast(Any, self.mla_attn.mla_attn)
-        input_weight, query_weight = self._packed
-        q_c, kv_c, k_pe, index_k, index_weights = low_latency_linear(
-            hidden_states, input_weight
-        ).split(
+        input_projection, query_projection = self._packed
+        q_c, kv_c, k_pe, index_k, index_weights = input_projection(hidden_states).split(
             [
                 self.q_lora_rank,
                 self.kv_lora_rank,
@@ -831,7 +866,7 @@ class KimiK3DSAAttention(nn.Module):
             *caches,
         )
 
-        q, index_q = low_latency_linear(q_c, query_weight).split(
+        q, index_q = query_projection(q_c).split(
             [
                 self.num_local_heads * self.qk_head_dim,
                 indexer.index_num_heads * indexer.index_head_dim,

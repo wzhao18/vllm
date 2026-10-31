@@ -232,6 +232,24 @@ def scratch(runtime, name, shape, dtype=torch.bfloat16):
     return runtime.buffers[name]
 
 
+def bf16_weight(linear):
+    """A linear's weight, which the specialized decode reads as a BF16 [N, K]
+    matrix; refuses (never silently misreads) a quantized layer."""
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    weight = linear.weight
+    if (
+        not isinstance(linear.quant_method, UnquantizedLinearMethod)
+        or weight.dtype != torch.bfloat16
+    ):
+        raise ValueError(
+            f"Kimi K3 specialized decode needs BF16 projections, got "
+            f"{type(linear.quant_method).__name__} ({weight.dtype}) in "
+            f"{getattr(linear, 'prefix', type(linear).__name__)}"
+        )
+    return weight
+
+
 def pack_dsa_projection(attention):
     """One [q_a | kv_a | gate | wk | wv] weight for a K3.1 DSA layer; the stock
     projections become views of it."""
@@ -243,7 +261,7 @@ def pack_dsa_projection(attention):
         attention.g_proj,
         attention.dsa_indexer.wkv_index,
     )
-    packed = torch.cat([linear.weight.data for linear in linears])
+    packed = torch.cat([bf16_weight(linear).data for linear in linears])
     row = 0
     for linear in linears:
         rows = linear.weight.shape[0]
@@ -299,7 +317,7 @@ class Attention:
             weight = pack_dsa_projection(attention)
         else:
             name = "in_proj_qkvgfab" if kind == "kda" else "fused_qkv_a_g_proj"
-            weight = getattr(attention, name).weight
+            weight = bf16_weight(getattr(attention, name))
         pitch = weight.shape[0]
         sms = torch.cuda.get_device_properties(weight.device).multi_processor_count
         policies = projection_policies(tp, pitch, runtime.batches, sms, runtime.q)
@@ -889,7 +907,7 @@ def dcp_box(runtime, heads, dsa=False, flashinfer=False):
 
 def pack_front(moe, rank, tp):
     """[this rank's router rows (padded to 16); this rank's latent down shard]."""
-    router, down = moe.gate.weight, moe.routed_expert_down_proj.weight
+    router, down = moe.gate.weight, bf16_weight(moe.routed_expert_down_proj)
     rows, shard = 896 // tp, 3584 // tp
     router = router[rank * rows : (rank + 1) * rows]
     down = down[rank * shard : (rank + 1) * shard]
