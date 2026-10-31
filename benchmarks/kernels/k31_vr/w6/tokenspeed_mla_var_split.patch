@@ -1,0 +1,138 @@
+--- a/tokenspeed_mla/mla_decode.py
++++ b/tokenspeed_mla/mla_decode.py
+@@ -732,6 +732,37 @@
+     return out
+ 
+ 
++def tokenspeed_mla_var_split_counts(
++    seq_lens: torch.Tensor,
++    max_split_kv: int,
++    num_heads: int,
++    q_len: int,
++    dtype: torch.dtype = torch.float8_e4m3fn,
++) -> torch.Tensor:
++    """Per-request split counts for ``tokenspeed_mla_decode(max_split_kv=...)``
++    (int32 [B], on the device, CUDA-graph safe): proportional to each
++    request's KV tiles, the longest request getting ``max_split_kv``, with no
++    empty split. Compute once and pass as ``block_split_kvs`` to every layer
++    of a step."""
++    mma_qk_tiler_mn, _ = select_mla_decode_tilers(
++        num_heads,
++        q_len,
++        is_fp8=dtype == torch.float8_e4m3fn,
++        compute_capability=torch.cuda.get_device_capability(seq_lens.device),
++    )
++    return _var_split_counts(seq_lens.to(torch.int32), max_split_kv, mma_qk_tiler_mn[1])
++
++
++def _var_split_counts(cache_seqs: torch.Tensor, max_split_kv: int, tile_n: int) -> torch.Tensor:
++    # ceil(tiles / ceil(tiles / s)) == s for the returned s: no empty split.
++    k_tiles = ((cache_seqs + (tile_n - 1)) // tile_n).clamp_(min=1)
++    max_tiles = k_tiles.amax()
++    s = (k_tiles * max_split_kv + max_tiles - 1) // max_tiles
++    s = torch.minimum(s.clamp_(1, max_split_kv), k_tiles)
++    per = (k_tiles + s - 1) // s
++    return ((k_tiles + per - 1) // per).to(torch.int32)
++
++
+ def tokenspeed_mla_decode(
+     query: torch.Tensor,
+     kv_cache: torch.Tensor,
+@@ -758,6 +789,8 @@
+     *,
+     min_split_kv: int = 1,
+     local_visible_lens: Optional[torch.Tensor] = None,
++    max_split_kv: int = 0,
++    block_split_kvs: Optional[torch.Tensor] = None,
+ ) -> torch.Tensor:
+     """CuTe DSL MLA decode kernel for SM100, SM103 and SM107.
+ 
+@@ -854,6 +887,23 @@
+         The effective value is capped to avoid creating empty partitions.
+         Defaults to 1, which enables automatic split selection.
+ 
++    max_split_kv : int
++        0 (default) keeps one split count for the whole batch. A value in
++        [2, 256] (FP8 BF16-output decode without DCP, sliding windows or
++        local_visible_lens) splits each request's KV in proportion to its
++        length instead: the longest request of the batch gets
++        ``max_split_kv`` splits, a request of length L about
++        ``max_split_kv * L / max_len`` (at least 1), so every CTA walks about
++        the same number of KV tiles however skewed the lengths. The split
++        counts are computed on the device (CUDA-graph safe); the workspace
++        is sized for ``max_split_kv`` splits of every request.
++
++    block_split_kvs : torch.Tensor, optional
++        With ``max_split_kv``: precomputed contiguous int32 [B] split counts
++        (each in [1, max_split_kv], no empty split: ``ceil(t / ceil(t / s))
++        == s`` for the request's ``t`` KV tiles of ``tile_n`` = 128), e.g.
++        shared by the layers of one step. None computes them as above.
++
+     local_visible_lens : torch.Tensor, optional
+         Contiguous int32 [B, q_len] tensor on the query device, supported with
+         BF16 or FP8 E4M3 Q/KV.
+@@ -1002,17 +1052,40 @@
+ 
+     # Cached split_kv and workspace_size computation
+     max_active_blocks = get_num_sm(query.device)
+-    split_kv, workspace_size = _get_split_kv_and_workspace_size(
+-        B,
+-        q_len_eff,
+-        H_eff,
+-        kv_lora_rank,
+-        max_active_blocks,
+-        max_seq_len,
+-        q_dtype,
+-        mma_qk_tiler_mn,
+-        min_split_kv,
++    var_split = (
++        max_split_kv > 1
++        and is_fp8
++        and cp_world == 1
++        and causal_seqs is None
++        and window_left == -1
++        and local_visible_lens is None
+     )
++    if max_split_kv and not var_split and max_split_kv != 1:
++        raise ValueError(
++            "max_split_kv needs FP8 decode without DCP, sliding windows or "
++            "local_visible_lens"
++        )
++    if var_split:
++        if max_split_kv > MAX_SPLITS:
++            raise ValueError(f"max_split_kv={max_split_kv} exceeds MAX_SPLITS={MAX_SPLITS}")
++        split_kv = max_split_kv
++        workspace_size = BlackwellMultiHeadLatentAttentionForwardFP16.get_workspace_size(
++            H_eff, q_len_eff, kv_lora_rank, B, split_kv, cutlass.Float32
++        )
++        if workspace_size >= 1 << 31:
++            raise ValueError("max_split_kv requires workspace beyond the Int32 offset limit")
++    else:
++        split_kv, workspace_size = _get_split_kv_and_workspace_size(
++            B,
++            q_len_eff,
++            H_eff,
++            kv_lora_rank,
++            max_active_blocks,
++            max_seq_len,
++            q_dtype,
++            mma_qk_tiler_mn,
++            min_split_kv,
++        )
+ 
+     # Prepare workspace: slice of contiguous 1D buffer is already contiguous
+     assert (
+@@ -1083,8 +1156,11 @@
+             else causal_seqs.to(torch.int32)
+         )
+ 
+-    is_var_split_kv = False
+-    block_split_kvs = None
++    is_var_split_kv = var_split
++    if not var_split:
++        block_split_kvs = None
++    elif block_split_kvs is None:
++        block_split_kvs = _var_split_counts(cache_seqs, max_split_kv, mma_qk_tiler_mn[1])
+     # FP8: keep the row max while it grows by <= 8 log2 units (P <= 256 < 448).
+     skip_correction_threshold = 8.0 if is_fp8 else 0.0
+ 

@@ -6,6 +6,12 @@ J=$1; NN=$2; Q=$3; A=$4; B=$5; SH=$6; R=$7; shift 7
 mkdir -p $R
 if [ $NN = 1 ]; then export K31W0_LAYERS=8; DP=4; else DP=16; fi
 K=$((Q-1)); i=0
+# Create the container once per node before the multi-rank sruns (parallel
+# first-time creation races in pyxis; slow imports miss the rendezvous).
+K3=/lustre/fsw/coreai_comparch_inferencex/weizha/k3vr
+srun --overlap --jobid $J -N $NN --ntasks-per-node=1 ${W6_NODELIST:+-w $W6_NODELIST} \
+  --container-image=$K3/images/vllm-openai-cu134-nightly-3f1bcfd82b-aarch64.sqsh --container-name=${W6_CNAME:-k31w6} \
+  --no-container-mount-home true
 for arm in $A $B $B $A; do
   i=$((i+1)); read tag topk acfg <<< "${ARM[$arm]}"
   prof=(); [ $i -le 2 ] && prof=(--profile-dir $R/prof_${arm})

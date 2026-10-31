@@ -46,6 +46,9 @@ def _get_workspace(
     kv_lora_rank: int,
     min_split_kv: int,
     max_decode_tokens: int,
+    max_split_kv: int = 0,
+    max_decode_requests: int = 0,
+    query_len: int = 1,
 ) -> torch.Tensor:
     from tokenspeed_mla import get_num_sm
 
@@ -69,6 +72,18 @@ def _get_workspace(
         )
         logger.info_once(
             "TokenSpeed MLA decode workspace: %.2f GiB", needed / (1 << 30)
+        )
+    if max_split_kv > 1:
+        # Length-proportional splits: the grid holds max_split_kv splits of
+        # every request's query rows (packed 128-row tiles or folded heads).
+        rows = max(128 * -(-num_heads * query_len // 128), num_heads * query_len)
+        needed = max(
+            needed,
+            max_decode_requests * rows * max_split_kv * (kv_lora_rank + 1) * 4,
+        )
+        logger.info_once(
+            "TokenSpeed MLA length-proportional split-KV workspace: %.2f GiB",
+            needed / (1 << 30),
         )
     return current_workspace_manager().get_simultaneous(((needed,), torch.int8))[0]
 
@@ -232,10 +247,26 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
 
         config = get_current_vllm_config()
         self._min_split_kv = config.attention_config.tokenspeed_mla_min_split_kv
+        self._max_split_kv = config.attention_config.tokenspeed_mla_max_split_kv
+        spec = config.speculative_config
+        self._query_len = 1 + (spec.num_speculative_tokens if spec else 0)
+        self._max_decode_requests = max(
+            config.scheduler_config.max_num_seqs,
+            -(-(config.compilation_config.max_cudagraph_capture_size or 0)
+              // self._query_len),
+        )
+        if self._max_split_kv > 1:
+            import tokenspeed_mla
+
+            if not hasattr(tokenspeed_mla, "tokenspeed_mla_var_split_counts"):
+                raise ValueError(
+                    "attention_config.tokenspeed_mla_max_split_kv needs a "
+                    "tokenspeed_mla with length-proportional split-KV "
+                    "(tokenspeed_mla_var_split_counts)"
+                )
         self._max_decode_tokens = 0
         if self._min_split_kv > 1:
-            spec = config.speculative_config
-            query_len = 1 + (spec.num_speculative_tokens if spec else 0)
+            query_len = self._query_len
             self._max_decode_tokens = max(
                 min(
                     config.scheduler_config.max_num_batched_tokens,
@@ -318,13 +349,23 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
             )
             self.output_scale = layer._k_scale_float
 
+        var_split = self._max_split_kv > 1 and self.dcp_world_size == 1
         workspace = _get_workspace(
             q.device,
             q.shape[-2],
             self.kv_lora_rank,
             self._min_split_kv,
             self._max_decode_tokens,
+            self._max_split_kv if var_split else 0,
+            self._max_decode_requests,
+            self._query_len,
         )
+        split_kwargs: dict = {"min_split_kv": self._min_split_kv}
+        if var_split:
+            split_kwargs = {
+                "max_split_kv": self._max_split_kv,
+                "block_split_kvs": self._block_split_kvs(attn_metadata, q),
+            }
 
         # vLLM kv_c_and_k_pe_cache is already (num_blocks, block_size, head_size).
         # tokenspeed_mla_decode wants 3D — pass as-is (no unsqueeze, unlike trtllm).
@@ -347,7 +388,7 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
             cp_world=self.dcp_world_size,
             cp_rank=self.dcp_rank,
             cp_interleave_size=self._parallel_config.cp_kv_cache_interleave_size,
-            min_split_kv=self._min_split_kv,
+            **split_kwargs,
         )
         if return_lse:
             o, lse = kernel_out
@@ -360,3 +401,21 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
 
         o = o.view(-1, o.shape[-2], o.shape[-1])
         return o, lse
+
+    def _block_split_kvs(
+        self, attn_metadata: MLACommonMetadata, q: torch.Tensor
+    ) -> torch.Tensor:
+        """Per-request split counts, computed once per step (the layers of a
+        step share the decode metadata) and cached on it."""
+        decode = attn_metadata.decode
+        assert decode is not None
+        cached = getattr(decode, "_tokenspeed_block_split_kvs", None)
+        if cached is not None and cached[0] == self._max_split_kv:
+            return cached[1]
+        from tokenspeed_mla import tokenspeed_mla_var_split_counts
+
+        counts = tokenspeed_mla_var_split_counts(
+            decode.seq_lens, self._max_split_kv, q.shape[-2], q.shape[1], q.dtype
+        )
+        decode._tokenspeed_block_split_kvs = (self._max_split_kv, counts)
+        return counts

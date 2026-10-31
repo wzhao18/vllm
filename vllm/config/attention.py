@@ -71,6 +71,14 @@ class AttentionConfig:
     automatic scheduling. Larger values request a split floor and may increase
     workspace memory. Only applies to the TokenSpeed MLA backend."""
 
+    tokenspeed_mla_max_split_kv: int = Field(default=0, ge=0, le=256)
+    """Length-proportional KV splits for TokenSpeed MLA decode (0 = off): the
+    longest request of a step gets this many splits and every other request
+    proportionally fewer, so each CTA walks about the same number of KV tiles
+    however skewed the context lengths (data-parallel decode ranks). Needs a
+    tokenspeed_mla with ``tokenspeed_mla_var_split_counts``; supersedes
+    ``tokenspeed_mla_min_split_kv`` for decode without DCP."""
+
     tq_max_kv_splits_for_cuda_graph: int = 32
     """TurboQuant max NUM_KV_SPLITS for cuda graph decode.
     Fixes the split count so grid dimensions are constant across captures,

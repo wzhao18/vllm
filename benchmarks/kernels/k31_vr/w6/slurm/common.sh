@@ -17,3 +17,6 @@ declare -A ARM
 ARM[stock]="w0dep-a050f29 auto {\"tokenspeed_mla_min_split_kv\":16}"
 ARM[auto]="${W6_TAG:-w6-dev} auto {\"tokenspeed_mla_min_split_kv\":16}"
 ARM[bal]="${W6_TAG:-w6-dev} balanced {\"tokenspeed_mla_min_split_kv\":16}"
+# M5: length-proportional drafter split-KV (needs the patched tokenspeed in the env)
+ARM[m5s32]="${W6_M5_TAG:-w6-m5} balanced {\"tokenspeed_mla_max_split_kv\":32}"
+ARM[m5s64]="${W6_M5_TAG:-w6-m5} balanced {\"tokenspeed_mla_max_split_kv\":64}"
