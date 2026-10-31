@@ -438,6 +438,123 @@ def _check_deterministic(group, ws, n: int, repeats: int = 8) -> None:
         assert torch.equal(runs[0][4], runs[0][1])
 
 
+def _check_exchange_ab(group, ws, n: int) -> None:
+    """Round 1 through the mailbox against the all-gather on the same inputs:
+    ids, rows, counts and saturation words are bit-identical (order
+    included) on clean, tie-heavy, saturated (1 rank on every third row, and
+    the bound on every row) and non-finite rows, for row counts that change
+    between merges (each row's mailbox parity advances on its own), through
+    both entry points (rows from the logits and from packed input)."""
+    from vllm.v1.attention.ops.dcp_topk_merge.kernels import (
+        dcp_topk_merge,
+        dcp_topk_merge_rows,
+        dcp_topk_pack,
+        set_dcp_topk_merge_exchange,
+    )
+
+    world, rank = group.world_size, group.rank_in_group
+    lengths = [150_000, 100_000, 70_123, 40_000, 220_000, 9_000, 2_049, 1, 0]
+    lengths += [world * 66_000]
+    base, ends = _make_case(lengths, seed=61)
+    tied, _ = _make_case(lengths, seed=67, levels=16)
+    # Words that are NaN or denormal as FP32 (+inf scores, the bit plane's
+    # marked half-words) must cross the multicast store unchanged.
+    nonfinite = base.clone()
+    nonfinite[0, ::7] = float("inf")
+    nonfinite[1] = float("-inf")
+    nonfinite[2] = float("inf")
+    nonfinite[3, ::5] = float("nan")
+    nonfinite[4, 0::world] = float("inf")
+    variants = [
+        base,
+        tied,
+        _boost(base, [world - 1], slice(0, None, 3), world),
+        _boost(base, list(range((TOPK - 1) // n)), slice(None), world),
+        nonfinite,
+    ]
+
+    def merge(exchange: str, local, local_end, packed) -> list[torch.Tensor]:
+        num_rows = local.shape[0]
+        req_id = torch.arange(num_rows, dtype=torch.int32, device="cuda")
+        block_table = _block_table(num_rows, int(local_end.max()))
+        set_dcp_topk_merge_exchange(exchange)
+        try:
+            ids = torch.full((num_rows, TOPK), -7, dtype=torch.int32, device="cuda")
+            dcp_topk_merge(local, local_end, ids, n)
+            outs = [ids, ws.sat_word[:num_rows].clone()]
+            for mode in ("logits", "packed"):
+                rows_out = torch.full_like(ids, -7)
+                valid_out = torch.full(
+                    (num_rows,), -7, dtype=torch.int32, device="cuda"
+                )
+                ids2 = torch.full_like(ids, -7)
+                dcp_topk_merge_rows(
+                    logits=local,
+                    row_ends=local_end,
+                    packed=packed if mode == "packed" else None,
+                    local_topk=n,
+                    topk=TOPK,
+                    req_id=req_id,
+                    block_table=block_table,
+                    block_size=_BLOCK,
+                    stride_rows=_BLOCK,
+                    dcp_rank=rank,
+                    rows_out=rows_out,
+                    valid_out=valid_out,
+                    ids_out=ids2,
+                )
+                outs += [rows_out, valid_out, ids2, ws.sat_word[:num_rows].clone()]
+        finally:
+            set_dcp_topk_merge_exchange("auto")
+        torch.accelerator.synchronize()
+        return outs
+
+    what = ["ids", "sat", "rows", "valid", "rows ids", "rows sat"]
+    what += ["packed rows", "packed valid", "packed ids", "packed sat"]
+    for v, logits in enumerate(variants):
+        local, local_end = _shard(logits, ends, world, rank)
+        for num_rows in (len(lengths), 5, 1, 8, 3):
+            args = local[:num_rows], local_end[:num_rows]
+            packed = dcp_topk_pack(*args, n)
+            ref = merge("all_gather", *args, packed)
+            got = merge("auto", *args, packed)
+            for name, a, b in zip(what, ref, got):
+                # DeepSelect's ids on a NaN row are arbitrary: there only the
+                # merges of the same packed rows compare.
+                if logits is not nonfinite or name.startswith("packed"):
+                    assert torch.equal(a, b), f"variant {v} rows {num_rows}: {name}"
+            if logits is not nonfinite:
+                _assert_exact(got[0], logits[:num_rows], ends[:num_rows])
+            _assert_same_on_every_rank(group, got[0], f"mailbox {v}/{num_rows}")
+        if v in (2, 3):
+            assert bool((ws.sat_word[: len(lengths)] >> 16).any()), v
+
+
+def _check_late_publisher(group, n: int) -> None:
+    """One rank publishes its round-1 rows ~100 ms late: the other ranks wait
+    in the select's poll (and take that long), and the result is exact."""
+    from vllm.v1.attention.ops.dcp_topk_merge.kernels import dcp_topk_merge
+
+    world, rank = group.world_size, group.rank_in_group
+    late = world - 1
+    lengths = [150_000, 100_000, 70_123]
+    logits, ends = _make_case(lengths, seed=71)
+    local, local_end = _shard(logits, ends, world, rank)
+    ids = torch.full((len(lengths), TOPK), -7, dtype=torch.int32, device="cuda")
+    start = torch.cuda.Event(enable_timing=True)
+    stop = torch.cuda.Event(enable_timing=True)
+    start.record()
+    if rank == late:
+        torch.cuda._sleep(200_000_000)
+    dcp_topk_merge(local, local_end, ids, n)
+    stop.record()
+    torch.accelerator.synchronize()
+    _assert_exact(ids, logits, ends)
+    _assert_same_on_every_rank(group, ids, "late publisher")
+    if rank != late:
+        assert start.elapsed_time(stop) > 20, "the select did not wait"
+
+
 def _check_hook(group, n: int) -> None:
     """VLLM_DSA_BPRIME_CHECK over a real DCP group: the stock indexer's
     reference merge next to the one-round merge, eager and inside a CUDA
@@ -526,15 +643,23 @@ def _check_hook(group, n: int) -> None:
 
 
 def run_worker(
-    rank: int, world: int, local_rank: int, init_method: str, check_hook: bool = False
+    rank: int,
+    world: int,
+    local_rank: int,
+    init_method: str,
+    check_hook: bool = False,
+    mailbox: bool = False,
 ) -> None:
     """One DCP rank. Also callable from a multi-node launcher. ``check_hook``
-    runs the VLLM_DSA_BPRIME_CHECK case instead of the merge's own."""
+    runs the VLLM_DSA_BPRIME_CHECK case instead of the merge's own;
+    ``mailbox`` takes round 1 through the multicast mailbox
+    (VLLM_DSA_BPRIME_MAILBOX) and adds its checks."""
     import os
     from types import SimpleNamespace
 
     if check_hook:
         os.environ["VLLM_DSA_BPRIME_CHECK"] = "1"
+    os.environ["VLLM_DSA_BPRIME_MAILBOX"] = str(int(mailbox))
 
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.distributed import (
@@ -585,9 +710,13 @@ def run_worker(
             ws = get_dcp_topk_rescue_workspace(TOPK, n)
             assert ws is not None and ws.max_rows >= 8
             assert dcp_topk_merge_max_rows(TOPK, n) == ws.max_rows
+            assert (ws.mailbox is not None) == mailbox
             if check_hook:
                 _check_hook(group, n)
                 return
+            if mailbox:
+                _check_exchange_ab(group, ws, n)
+                _check_late_publisher(group, n)
             _check_cases(group, ws, n)
             _check_deterministic(group, ws, n)
             _check_nonfinite(group, n)
@@ -597,8 +726,10 @@ def run_worker(
             cleanup_dist_env_and_memory()
 
 
-def _spawned(rank: int, world: int, init_method: str, check_hook: bool) -> None:
-    run_worker(rank, world, rank, init_method, check_hook)
+def _spawned(
+    rank: int, world: int, init_method: str, check_hook: bool, mailbox: bool
+) -> None:
+    run_worker(rank, world, rank, init_method, check_hook, mailbox)
 
 
 _WORLDS = [
@@ -612,21 +743,23 @@ _WORLDS = [
 ]
 
 
+@pytest.mark.parametrize("mailbox", [False, True])
 @pytest.mark.parametrize("world", _WORLDS)
-def test_dcp_topk_merge_exact(world: int):
-    _run_group(world, check_hook=False)
+def test_dcp_topk_merge_exact(world: int, mailbox: bool):
+    _run_group(world, check_hook=False, mailbox=mailbox)
 
 
+@pytest.mark.parametrize("mailbox", [False, True])
 @pytest.mark.parametrize("world", _WORLDS)
-def test_dcp_topk_merge_check_hook(world: int):
-    _run_group(world, check_hook=True)
+def test_dcp_topk_merge_check_hook(world: int, mailbox: bool):
+    _run_group(world, check_hook=True, mailbox=mailbox)
 
 
-def _run_group(world: int, check_hook: bool) -> None:
+def _run_group(world: int, check_hook: bool, mailbox: bool) -> None:
     init_method = f"tcp://127.0.0.1:{get_open_port()}"
     ctx = mp.get_context("spawn")
     procs = [
-        ctx.Process(target=_spawned, args=(r, world, init_method, check_hook))
+        ctx.Process(target=_spawned, args=(r, world, init_method, check_hook, mailbox))
         for r in range(world)
     ]
     for p in procs:

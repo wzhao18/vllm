@@ -158,6 +158,7 @@ def _init_rescue(vllm_config: Any, topk: int, local_topk: int) -> int:
         )
         return 0
     from vllm.v1.attention.ops.dcp_topk_merge.kernels import (
+        init_dcp_topk_mailbox,
         init_dcp_topk_rescue_workspace,
         register_dcp_topk_merge_warmup,
     )
@@ -166,6 +167,9 @@ def _init_rescue(vllm_config: Any, topk: int, local_topk: int) -> int:
     _MERGE_MAX_ROWS[(topk, local_topk)] = max_rows
     import vllm.envs as envs
 
+    mailbox = envs.VLLM_DSA_BPRIME_MAILBOX and init_dcp_topk_mailbox(
+        topk, local_topk, group
+    )
     if envs.VLLM_DSA_BPRIME_CHECK:
         from vllm.v1.attention.ops.dcp_topk_merge.check import (
             init_dcp_topk_merge_check,
@@ -177,12 +181,16 @@ def _init_rescue(vllm_config: Any, topk: int, local_topk: int) -> int:
         )
     if vllm_config.kernel_config.enable_jit_warmup:
         register_dcp_topk_merge_warmup(
-            topk, local_topk, parallel_config.decode_context_parallel_size
+            topk,
+            local_topk,
+            parallel_config.decode_context_parallel_size,
+            mailbox=mailbox,
         )
     logger.info_once(
         "DSA DCP top-k merge: exact one-round merge of each rank's local "
-        "top-%d (rescue workspace for %d rows).",
+        "top-%d (rescue workspace for %d rows; round 1 by %s).",
         local_topk,
         max_rows,
+        "multicast mailbox" if mailbox else "all-gather",
     )
     return local_topk

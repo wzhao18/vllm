@@ -38,6 +38,19 @@ rank must call every merge, the merges of a step must be stream-ordered, and
 no rank may start the round-1 exchange of call ``n + 1`` before its rescue of
 call ``n`` has finished (true for the all-gather here).
 
+With a round-1 mailbox (``VLLM_DSA_BPRIME_MAILBOX``, ``init_dcp_topk_mailbox``)
+the all-gather goes away: the pack multicasts its row into slot ``[parity,
+row, rank]`` of every rank's symmetric mailbox, and the select polls its
+row's ``W`` slots, copies them to shared memory and re-arms them (Lamport:
+``0xFFFFFFFF`` marks an empty word; no candidate word takes that value, and
+the bit plane travels as half-words ``0x1xxxx``). A row's ``n``-th merge uses
+parity ``n % 2`` (``ordinals``: read by the pack, bumped by the select). A
+peer writes that parity again two merges later, after this rank's next merge
+has published, so after the kernel boundary that retired the re-arm; the same
+publish orders this rank's rescue of call ``n`` before any rank's select of
+call ``n + 1``. The select keeps the rows of a saturated row in ``gathered``
+for the rescue. It is a byte copy: the merge is bit-identical.
+
 Non-finite logits never cause an out-of-bounds access: the pack drops local
 ids outside ``[0, min(row_end, S, 2**17))`` (DeepSelect returns arbitrary ids
 for a row holding a NaN) and candidates with a NaN score, and the select
@@ -54,7 +67,7 @@ from typing import Any
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import BFloat16, Int32, Int64, Uint16, Uint32, Uint64
+from cutlass import BFloat16, Float32, Int32, Int64, Uint16, Uint32, Uint64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 from quack.compile_utils import make_fake_tensor
@@ -72,6 +85,16 @@ from vllm.v1.attention.ops.dcp_topk_merge import (
 )
 
 _WARP = 32
+# Round-1 mailbox words: an empty word, and the mark of a bit-plane half-word.
+_EMPTY = -1
+_PLANE_MARK = 0x10000
+
+
+def _box_words(local_topk: int) -> int:
+    """u32 words of one mailbox slot: N candidate words, then the bit plane as
+    2 * N/32 marked half-words, padded to 16-byte chunks."""
+    words = local_topk + 2 * (local_topk // _WARP)
+    return -(-words // 4) * 4
 
 
 @cute.jit
@@ -105,7 +128,13 @@ class DCPTopkPackKernel(VllmCuTeDSLJitKernel["DCPTopkPackKernel.CompileKey"]):
     """Local top-N indices (-1 padded) + bf16 logits -> packed candidate rows.
 
     An index outside ``[0, min(row_end, S, 2**17))`` (``row_end`` from
-    ``row_ends`` when given) or a NaN score packs as an empty slot."""
+    ``row_ends`` when given) or a NaN score packs as an empty slot.
+
+    ``publish_world`` > 0: instead of ``packed``, multicast each row into this
+    rank's slot of the round-1 mailbox of a DCP group of that size (the
+    ``_box_words`` layout); ``from_packed``: publish rows packed elsewhere
+    (``packed`` is then the input). PDL: the inputs are read after
+    ``griddepcontrol.wait``; dependents launch once the row is published."""
 
     max_tb_size = 512
 
@@ -113,14 +142,29 @@ class DCPTopkPackKernel(VllmCuTeDSLJitKernel["DCPTopkPackKernel.CompileKey"]):
     class CompileKey:
         local_topk: int
         has_row_ends: bool = False
+        publish_world: int = 0
+        from_packed: bool = False
 
     @staticmethod
     def kernel(compile_key: CompileKey) -> Any:
         local_topk = compile_key.local_topk
         has_row_ends = compile_key.has_row_ends
+        publish_world = compile_key.publish_world
+        publish = publish_world > 0
+        from_packed = compile_key.from_packed
         assert local_topk % _WARP == 0
+        assert publish or not from_packed
         tb_size = min(local_topk, DCPTopkPackKernel.max_tb_size)
         num_chunks = -(-local_topk // tb_size)
+        row_words = packed_row_words(local_topk)
+        box_words = _box_words(local_topk)
+        plane_end = local_topk + 2 * (local_topk // _WARP)
+
+        @cute.struct
+        class SharedStorage:
+            stage: cute.struct.Align[
+                cute.struct.MemRange[Int32, box_words if publish else 4], 16
+            ]
 
         @cute.kernel
         def device_kernel(
@@ -128,42 +172,102 @@ class DCPTopkPackKernel(VllmCuTeDSLJitKernel["DCPTopkPackKernel.CompileKey"]):
             local_idx: cute.Tensor,
             packed: cute.Tensor,
             row_ends: cute.Tensor,
+            ordinals: cute.Tensor,
+            box_mc: Int64,
+            dcp_rank: Int32,
+            max_rows: Int32,
         ):
             row, _, _ = cute.arch.block_idx()
             tid, _, _ = cute.arch.thread_idx()
-            # Ids past the row (DeepSelect's output for a NaN row) are dropped.
-            end = Int32(logits.shape[1])
-            if end > Int32(1 << LOCAL_INDEX_BITS):
-                end = Int32(1 << LOCAL_INDEX_BITS)
-            if cutlass.const_expr(has_row_ends):
-                row_end = row_ends[row]
-                if row_end < end:
-                    end = row_end
-            for c in cutlass.range_constexpr(num_chunks):
-                # local_topk is warp-aligned, so whole warps take this branch.
-                j = tid + Int32(c * tb_size)
-                if j < Int32(local_topk):
-                    local = local_idx[row, j]
-                    word = Uint32(0)
-                    high = False
-                    if local >= Int32(0) and local < end:
-                        bits = Uint32(recast_val(logits[row, local], Uint16))
-                        # NaN scores are dropped (no order).
-                        if (bits & Uint32(0x7FFF)) <= Uint32(0x7F80):
-                            # Order-preserving bf16 key: flip negatives, set
-                            # the sign bit of non-negatives.
-                            ordered = bits | Uint32(0x8000)
-                            if (bits & Uint32(0x8000)) != Uint32(0):
-                                ordered = ~bits & Uint32(0xFFFF)
-                            local_u = recast_val(local, Uint32)
-                            word = (ordered << Uint32(16)) | (
-                                Uint32(0xFFFF) - (local_u & Uint32(0xFFFF))
-                            )
-                            high = (local_u >> Uint32(16)) != Uint32(0)
-                    packed[row, j] = recast_val(word, Int32)
-                    high_bits = cute.arch.vote_ballot_sync(high)
-                    if j % Int32(_WARP) == Int32(0):
-                        packed[row, Int32(local_topk) + j // Int32(_WARP)] = high_bits
+            if cutlass.const_expr(publish):
+                cute.arch.griddepcontrol_wait()
+                smem = cutlass.memory.SmemAllocator()
+                storage = smem.allocate(SharedStorage, 16)
+                stage = storage.stage.get_tensor(cute.make_layout((box_words,)))
+            if cutlass.const_expr(from_packed):
+                for i in cutlass.range(tid, row_words, tb_size, unroll=1):
+                    w = recast_val(packed[row, i], Uint32)
+                    if i < Int32(local_topk):
+                        stage[i] = recast_val(w, Int32)
+                    else:
+                        at = Int32(local_topk) + Int32(2) * (i - Int32(local_topk))
+                        stage[at] = recast_val(
+                            Uint32(_PLANE_MARK) | (w & Uint32(0xFFFF)), Int32
+                        )
+                        stage[at + Int32(1)] = recast_val(
+                            Uint32(_PLANE_MARK) | (w >> Uint32(16)), Int32
+                        )
+            else:
+                # Ids past the row (DeepSelect's output for a NaN row) are
+                # dropped.
+                end = Int32(logits.shape[1])
+                if end > Int32(1 << LOCAL_INDEX_BITS):
+                    end = Int32(1 << LOCAL_INDEX_BITS)
+                if cutlass.const_expr(has_row_ends):
+                    row_end = row_ends[row]
+                    if row_end < end:
+                        end = row_end
+                for c in cutlass.range_constexpr(num_chunks):
+                    # local_topk is warp-aligned, so whole warps take this
+                    # branch.
+                    j = tid + Int32(c * tb_size)
+                    if j < Int32(local_topk):
+                        local = local_idx[row, j]
+                        word = Uint32(0)
+                        high = False
+                        if local >= Int32(0) and local < end:
+                            bits = Uint32(recast_val(logits[row, local], Uint16))
+                            # NaN scores are dropped (no order).
+                            if (bits & Uint32(0x7FFF)) <= Uint32(0x7F80):
+                                # Order-preserving bf16 key: flip negatives,
+                                # set the sign bit of non-negatives.
+                                ordered = bits | Uint32(0x8000)
+                                if (bits & Uint32(0x8000)) != Uint32(0):
+                                    ordered = ~bits & Uint32(0xFFFF)
+                                local_u = recast_val(local, Uint32)
+                                word = (ordered << Uint32(16)) | (
+                                    Uint32(0xFFFF) - (local_u & Uint32(0xFFFF))
+                                )
+                                high = (local_u >> Uint32(16)) != Uint32(0)
+                        high_bits = cute.arch.vote_ballot_sync(high)
+                        if cutlass.const_expr(publish):
+                            stage[j] = recast_val(word, Int32)
+                            if j % Int32(_WARP) == Int32(0):
+                                bits_u = recast_val(Int32(high_bits), Uint32)
+                                at = Int32(local_topk) + Int32(2) * (j // Int32(_WARP))
+                                stage[at] = recast_val(
+                                    Uint32(_PLANE_MARK) | (bits_u & Uint32(0xFFFF)),
+                                    Int32,
+                                )
+                                stage[at + Int32(1)] = recast_val(
+                                    Uint32(_PLANE_MARK) | (bits_u >> Uint32(16)),
+                                    Int32,
+                                )
+                        else:
+                            packed[row, j] = recast_val(word, Int32)
+                            if j % Int32(_WARP) == Int32(0):
+                                packed[row, Int32(local_topk) + j // Int32(_WARP)] = (
+                                    high_bits
+                                )
+            if cutlass.const_expr(publish):
+                for i in cutlass.range(plane_end + tid, box_words, tb_size, unroll=1):
+                    stage[i] = Int32(_PLANE_MARK)
+                cute.arch.sync_threads()
+                parity = ordinals[row] & Int32(1)
+                slot = (
+                    (Int64(parity) * Int64(max_rows) + Int64(row))
+                    * Int64(publish_world)
+                    + Int64(dcp_rank)
+                ) * Int64(box_words * 4)
+                for c in cutlass.range(tid, box_words // 4, tb_size, unroll=1):
+                    _multimem_st_v4(
+                        box_mc + slot + Int64(c) * Int64(16),
+                        stage[c * Int32(4)],
+                        stage[c * Int32(4) + Int32(1)],
+                        stage[c * Int32(4) + Int32(2)],
+                        stage[c * Int32(4) + Int32(3)],
+                    )
+                cute.arch.griddepcontrol_launch_dependents()
 
         @cute.jit
         def host_entrypoint(
@@ -171,63 +275,134 @@ class DCPTopkPackKernel(VllmCuTeDSLJitKernel["DCPTopkPackKernel.CompileKey"]):
             local_idx: cute.Tensor,
             packed: cute.Tensor,
             row_ends: cute.Tensor,
+            ordinals: cute.Tensor,
+            box_mc: Int64,
+            dcp_rank: Int32,
+            max_rows: Int32,
             stream,
         ):
-            # Without has_row_ends ``row_ends`` is a placeholder.
-            device_kernel(logits, local_idx, packed, row_ends).launch(
-                grid=(packed.shape[0], 1, 1),
+            # Without has_row_ends ``row_ends`` is a placeholder; so are the
+            # mailbox arguments without publish_world, and ``packed`` with it
+            # unless from_packed (``local_idx`` then).
+            num_rows = packed.shape[0]
+            if cutlass.const_expr(publish and not from_packed):
+                num_rows = local_idx.shape[0]
+            device_kernel(
+                logits,
+                local_idx,
+                packed,
+                row_ends,
+                ordinals,
+                box_mc,
+                dcp_rank,
+                max_rows,
+            ).launch(
+                grid=(num_rows, 1, 1),
                 block=(tb_size, 1, 1),
                 stream=stream,
+                use_pdl=publish,
             )
 
         return host_entrypoint
 
     def dispatch(  # type: ignore[override]
-        self, *, local_topk: int, has_row_ends: bool = False
+        self,
+        *,
+        local_topk: int,
+        has_row_ends: bool = False,
+        publish_world: int = 0,
+        from_packed: bool = False,
     ) -> CompileKey:
-        return self.CompileKey(local_topk=local_topk, has_row_ends=has_row_ends)
-
-    def get_warmup_keys(
-        self, *, local_topk: int, has_row_ends: bool = False
-    ) -> list[CompileKey]:
-        return self._trace_dispatch(self.dispatch)(
-            local_topk=local_topk, has_row_ends=has_row_ends
+        return self.CompileKey(
+            local_topk=local_topk,
+            has_row_ends=has_row_ends,
+            publish_world=publish_world,
+            from_packed=from_packed,
         )
+
+    def get_warmup_keys(self, **kwargs) -> list[CompileKey]:
+        return self._trace_dispatch(self.dispatch)(**kwargs)
 
     def warmup_inputs(self, compile_key: CompileKey) -> tuple[Any, ...]:
+        local_topk = compile_key.local_topk
+        publish = compile_key.publish_world > 0
         num_rows = cute.sym_int()
-        local_idx = make_fake_tensor(
-            Int32, (num_rows, compile_key.local_topk), divisibility=1
+        row_words = packed_row_words(local_topk)
+        logits_rows = cute.sym_int() if compile_key.from_packed else num_rows
+        logits = make_fake_tensor(
+            BFloat16, (logits_rows, cute.sym_int()), divisibility=1
         )
-        return (
-            make_fake_tensor(BFloat16, (num_rows, cute.sym_int()), divisibility=1),
-            local_idx,
-            make_fake_tensor(
+        if compile_key.from_packed:
+            local_idx = make_fake_tensor(
+                Int32, (cute.sym_int(), cute.sym_int()), divisibility=1
+            )
+            packed = make_fake_tensor(Int32, (num_rows, row_words), divisibility=1)
+        else:
+            local_idx = make_fake_tensor(Int32, (num_rows, local_topk), divisibility=1)
+            packed = make_fake_tensor(
                 Int32,
-                (num_rows, packed_row_words(compile_key.local_topk)),
+                (cute.sym_int() if publish else num_rows, row_words),
                 divisibility=1,
-            ),
+            )
+        row_ends = (
             make_fake_tensor(Int32, (cute.sym_int(),))
             if compile_key.has_row_ends
-            else local_idx,
+            else local_idx
+        )
+        ordinals = make_fake_tensor(Int32, (cute.sym_int(),))
+        return (
+            logits,
+            local_idx,
+            packed,
+            row_ends,
+            ordinals,
+            Int64(0),
+            Int32(0),
+            Int32(1),
         )
 
     @kernel_launcher
     def __call__(
         self,
         logits: torch.Tensor,
-        local_idx: torch.Tensor,
-        packed: torch.Tensor,
+        local_idx: torch.Tensor | None,
+        packed: torch.Tensor | None,
         row_ends: torch.Tensor | None = None,
+        mailbox: "_Mailbox | None" = None,
     ) -> CuTeDSLLaunchSpec[CompileKey]:
+        """``mailbox``: publish (``packed`` unused; or, without ``local_idx``,
+        publish ``packed``) instead of writing ``packed``."""
+        from_packed = local_idx is None
+        assert packed is not None or not from_packed
+        assert mailbox is not None or (packed is not None and not from_packed)
         compile_key = self.dispatch(
-            local_topk=local_idx.shape[1], has_row_ends=row_ends is not None
+            local_topk=(packed.shape[1] * _WARP) // (_WARP + 1)
+            if from_packed
+            else local_idx.shape[1],
+            has_row_ends=row_ends is not None,
+            publish_world=0 if mailbox is None else mailbox.world_size,
+            from_packed=from_packed,
         )
+        idx = packed if from_packed else local_idx
+        device = logits.device
+        if packed is None:
+            shape = (1, packed_row_words(idx.shape[1]))
+            packed = _dummy(device, "packed", shape, torch.int32)
+        if mailbox is None:
+            publish_args = (_dummy_i32(device), 0, 0, 1)
+        else:
+            publish_args = (
+                mailbox.ordinals,
+                mailbox.box_mc,
+                mailbox.rank,
+                mailbox.max_rows,
+            )
         return compile_key, (
             logits,
-            local_idx,
+            idx,
             packed,
-            local_idx if row_ends is None else row_ends,
+            idx if row_ends is None else row_ends,
+            *publish_args,
         )
 
 
@@ -280,6 +455,51 @@ def _st_v4(addr: Int64, v0, v1, v2, v3, *, loc=None, ip=None) -> None:
         [Int64(addr), *(Int32(v) for v in (v0, v1, v2, v3))],
         "st.global.v4.u32 [$1], {$2, $3, $4, $5};",
         "l,r,r,r,r",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _ld_volatile_v4(addr: Int64, *, loc=None, ip=None) -> tuple:
+    i32 = T.i32()
+    value = llvm.inline_asm(
+        llvm.StructType.get_literal([i32] * 4),
+        [Int64(addr).ir_value(loc=loc, ip=ip)],
+        "ld.volatile.global.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(
+        Int32(llvm.extractvalue(i32, value, [k], loc=loc, ip=ip)) for k in range(4)
+    )
+
+
+@dsl_user_op
+def _st_relaxed_sys_v4(addr: Int64, v0, v1, v2, v3, *, loc=None, ip=None) -> None:
+    _asm_void(
+        [Int64(addr), *(Int32(v) for v in (v0, v1, v2, v3))],
+        "st.relaxed.sys.global.v4.u32 [$1], {$2, $3, $4, $5};",
+        "l,r,r,r,r",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _multimem_st_v4(addr: Int64, v0, v1, v2, v3, *, loc=None, ip=None) -> None:
+    # A bit-exact store to every rank's replica (multimem.st vectors need a
+    # float type).
+    _asm_void(
+        [
+            Int64(addr),
+            *(recast_val(Int32(v), Float32, loc=loc, ip=ip) for v in (v0, v1, v2, v3)),
+        ],
+        "multimem.st.relaxed.sys.global.v4.f32 [$1], {$2, $3, $4, $5};",
+        "l,f,f,f,f",
         loc=loc,
         ip=ip,
     )
@@ -354,6 +574,20 @@ def _ord16(bits: Uint32) -> Uint32:
     if (bits & Uint32(0x8000)) != Uint32(0):
         ordered = ~bits & Uint32(0xFFFF)
     return ordered
+
+
+@cute.jit
+def _fetch_chunk(vals: cute.Tensor, i: cutlass.Constexpr[int], addr: Int64) -> Int32:
+    """Load mailbox chunk ``i`` into ``vals[i]``; its dirty flag at bit ``i``
+    (a word is still empty)."""
+    v0, v1, v2, v3 = _ld_volatile_v4(addr)
+    vals[i, 0] = v0
+    vals[i, 1] = v1
+    vals[i, 2] = v2
+    vals[i, 3] = v3
+    empty = Int32(_EMPTY)
+    clean = (v0 != empty) & (v1 != empty) & (v2 != empty) & (v3 != empty)
+    return Int32(not clean) << Int32(i)
 
 
 def _make_radix_select(
@@ -577,6 +811,11 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
     ord16 > tau16) and, when this rank's bit is set, push its local top-K
     (from ``logits``) to every rank's rescue slot ``popc(mask & ((1 << rank)
     - 1))`` and release ``flags[rank][t] = seq2[t] + 1``. Never waits.
+
+    ``mailbox`` (exact only): the round-1 rows come from the mailbox instead
+    of ``gathered``. The CTA polls its row's slots (PDL: before
+    ``griddepcontrol.wait``), re-arms them, and writes a saturated row's
+    rows to ``gathered`` for the rescue; it then bumps ``ordinals[t]``.
     """
 
     tb_size = _TB_SIZE
@@ -592,13 +831,16 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
         # Physical-row output; block_size 0 disables it.
         block_size: int = 0
         exact: bool = False
+        mailbox: bool = False
 
     @staticmethod
     def kernel(compile_key: CompileKey) -> Any:
         emit_ids = compile_key.emit_ids
         block_size = compile_key.block_size
         exact = compile_key.exact
+        mailbox = compile_key.mailbox
         assert emit_ids or block_size > 0
+        assert exact or not mailbox
         tb_size = _TB_SIZE
         num_bins = _NUM_BINS
         num_warps = tb_size // _WARP
@@ -611,6 +853,10 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
         gid_bits = _gid_bits(world_size)
         num_slots = rescue_slots(topk, local_topk)
         recv_words = packed_row_words(topk)
+        row_words = packed_row_words(local_topk)
+        box_words = _box_words(local_topk)
+        row_chunks = world_size * box_words // 4
+        polls = -(-row_chunks // tb_size)
         radix_select = _make_radix_select(
             topk=topk,
             world_size=world_size,
@@ -629,6 +875,59 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             push: cute.struct.Align[
                 cute.struct.MemRange[Int32, recv_words if exact else 4], 16
             ]
+            stage: cute.struct.Align[
+                cute.struct.MemRange[Int32, world_size * box_words if mailbox else 4],
+                16,
+            ]
+
+        @cute.jit
+        def poll_row(
+            stage: cute.Tensor,
+            box: Int64,
+            ordinal: Int32,
+            row: Int32,
+            max_rows: Int32,
+            tid: Int32,
+        ):
+            """This row's ``W`` mailbox slots -> ``stage`` once no word is
+            empty; each 16-byte chunk is re-armed by the thread that read it.
+            The lanes leave the poll together (a warp vote)."""
+            empty = Int32(_EMPTY)
+            base = box + (
+                Int64(ordinal & Int32(1)) * Int64(max_rows) + Int64(row)
+            ) * Int64(row_chunks * 16)
+            vals = cute.make_rmem_tensor((polls, 4), Int32)
+            pending = Int32(0)
+            for i in cutlass.range_constexpr(polls):
+                c = tid + Int32(i * tb_size)
+                if c < Int32(row_chunks):
+                    pending = pending | _fetch_chunk(
+                        vals, i, base + Int64(c) * Int64(16)
+                    )
+            start = _globaltimer()
+            while not cute.arch.vote_all_sync(pending == Int32(0)):
+                again = Int32(0)
+                for i in cutlass.range_constexpr(polls):
+                    if ((pending >> Int32(i)) & Int32(1)) != Int32(0):
+                        again = again | _fetch_chunk(
+                            vals,
+                            i,
+                            base + Int64(tid + Int32(i * tb_size)) * Int64(16),
+                        )
+                pending = again
+                if _globaltimer() - start > Int64(_SPIN_TIMEOUT_NS):
+                    cute.printf(
+                        "DCP top-k mailbox timeout row=%d ordinal=%d\n", row, ordinal
+                    )
+                    _trap()
+            for i in cutlass.range_constexpr(polls):
+                c = tid + Int32(i * tb_size)
+                if c < Int32(row_chunks):
+                    for k in cutlass.range_constexpr(4):
+                        stage[c * Int32(4) + Int32(k)] = vals[i, k]
+                    _st_relaxed_sys_v4(
+                        base + Int64(c) * Int64(16), empty, empty, empty, empty
+                    )
 
         @cute.jit
         def push_local_topk(
@@ -804,6 +1103,8 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             peer_recv: Int64,
             peer_flags: Int64,
             max_rows: Int32,
+            box: Int64,
+            ordinals: cute.Tensor,
         ):
             row, _, _ = cute.arch.block_idx()
             tid, _, _ = cute.arch.thread_idx()
@@ -818,24 +1119,55 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             prefix_ptr = storage.prefix.data_ptr()
 
             keys = cute.make_rmem_tensor((keys_per_thread,), Uint64)
-            for i in cutlass.range_constexpr(keys_per_thread):
-                flat = tid + Int32(i * tb_size)
-                key = Uint64(0)
-                if flat < Int32(num_keys):
-                    rank = flat // Int32(local_topk)
-                    j = flat - rank * Int32(local_topk)
-                    key = _decode_key(
-                        recast_val(gathered[rank, row, j], Uint32),
-                        recast_val(
-                            gathered[rank, row, Int32(local_topk) + (j >> Int32(5))],
-                            Uint32,
-                        ),
-                        j,
-                        recast_val(rank, Uint32),
-                        world_size,
-                        gid_bits,
-                    )
-                keys[i] = key
+            if cutlass.const_expr(mailbox):
+                stage = storage.stage.get_tensor(
+                    cute.make_layout((world_size * box_words,))
+                )
+                ordinal = ordinals[row]
+                poll_row(stage, box, ordinal, row, max_rows, tid)
+                cute.arch.sync_threads()
+                cute.arch.griddepcontrol_wait()
+                for i in cutlass.range_constexpr(keys_per_thread):
+                    flat = tid + Int32(i * tb_size)
+                    key = Uint64(0)
+                    if flat < Int32(num_keys):
+                        rank = flat // Int32(local_topk)
+                        j = flat - rank * Int32(local_topk)
+                        at = rank * Int32(box_words)
+                        plane = at + Int32(local_topk) + Int32(2) * (j >> Int32(5))
+                        high = (recast_val(stage[plane], Uint32) & Uint32(0xFFFF)) | (
+                            recast_val(stage[plane + Int32(1)], Uint32) << Uint32(16)
+                        )
+                        key = _decode_key(
+                            recast_val(stage[at + j], Uint32),
+                            high,
+                            j,
+                            recast_val(rank, Uint32),
+                            world_size,
+                            gid_bits,
+                        )
+                    keys[i] = key
+            else:
+                for i in cutlass.range_constexpr(keys_per_thread):
+                    flat = tid + Int32(i * tb_size)
+                    key = Uint64(0)
+                    if flat < Int32(num_keys):
+                        rank = flat // Int32(local_topk)
+                        j = flat - rank * Int32(local_topk)
+                        key = _decode_key(
+                            recast_val(gathered[rank, row, j], Uint32),
+                            recast_val(
+                                gathered[
+                                    rank, row, Int32(local_topk) + (j >> Int32(5))
+                                ],
+                                Uint32,
+                            ),
+                            j,
+                            recast_val(rank, Uint32),
+                            world_size,
+                            gid_bits,
+                        )
+                    keys[i] = key
             if cutlass.const_expr(exact):  # noqa: SIM102
                 if tid < Int32(16):
                     notsat[tid] = Int32(0)
@@ -899,6 +1231,31 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
                     mask = Int32(0)
                 if tid == Int32(0):
                     sat_word[row] = (mask << Int32(16)) | tau
+                if cutlass.const_expr(mailbox):  # noqa: SIM102
+                    if mask != Int32(0):
+                        # The rescue re-reads the other ranks' round-1 words.
+                        for i in cutlass.range(
+                            tid, world_size * row_words, tb_size, unroll=1
+                        ):
+                            src_rank = i // Int32(row_words)
+                            word_at = i - src_rank * Int32(row_words)
+                            slot_at = src_rank * Int32(box_words)
+                            v = stage[slot_at + word_at]
+                            if word_at >= Int32(local_topk):
+                                half = (
+                                    slot_at
+                                    + Int32(local_topk)
+                                    + Int32(2) * (word_at - Int32(local_topk))
+                                )
+                                v = recast_val(
+                                    (recast_val(stage[half], Uint32) & Uint32(0xFFFF))
+                                    | (
+                                        recast_val(stage[half + Int32(1)], Uint32)
+                                        << Uint32(16)
+                                    ),
+                                    Int32,
+                                )
+                            gathered[src_rank, row, word_at] = v
                 if ((mask >> dcp_rank) & Int32(1)) != Int32(0):
                     slot = recast_val(
                         cute.arch.popc(
@@ -927,6 +1284,9 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
                         peer_flags,
                         max_rows,
                     )
+            if cutlass.const_expr(mailbox):  # noqa: SIM102
+                if tid == Int32(0):
+                    ordinals[row] = ordinal + Int32(1)
 
         @cute.jit
         def host_entrypoint(
@@ -945,9 +1305,11 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             peer_recv: Int64,
             peer_flags: Int64,
             max_rows: Int32,
+            box: Int64,
+            ordinals: cute.Tensor,
             stream,
         ):
-            # Unused outputs / exact-only inputs are placeholders.
+            # Unused outputs / exact-only and mailbox inputs are placeholders.
             device_kernel(
                 gathered,
                 out,
@@ -964,10 +1326,13 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
                 peer_recv,
                 peer_flags,
                 max_rows,
+                box,
+                ordinals,
             ).launch(
                 grid=(gathered.shape[1], 1, 1),
                 block=(tb_size, 1, 1),
                 stream=stream,
+                use_pdl=mailbox,
             )
 
         return host_entrypoint
@@ -981,6 +1346,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
         emit_ids: bool = True,
         block_size: int = 0,
         exact: bool = False,
+        mailbox: bool = False,
     ) -> CompileKey:
         return self.CompileKey(
             topk=topk,
@@ -989,17 +1355,22 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             emit_ids=emit_ids,
             block_size=block_size,
             exact=exact,
+            mailbox=mailbox,
         )
 
     def get_warmup_keys(self, **kwargs) -> list[CompileKey]:
         return self._trace_dispatch(self.dispatch)(**kwargs)
 
     def warmup_inputs(self, compile_key: CompileKey) -> tuple[Any, ...]:
-        return _select_fake_inputs(
-            compile_key.world_size,
-            compile_key.local_topk,
-            compile_key.topk,
-            compile_key.block_size,
+        return (
+            *_select_fake_inputs(
+                compile_key.world_size,
+                compile_key.local_topk,
+                compile_key.topk,
+                compile_key.block_size,
+            ),
+            Int64(0),
+            make_fake_tensor(Int32, (cute.sym_int(),)),
         )
 
     @kernel_launcher
@@ -1012,6 +1383,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
         topk: int,
         rows: "_RowsOutput | None" = None,
         exact: "_ExactArgs | None" = None,
+        mailbox: "_Mailbox | None" = None,
     ) -> CuTeDSLLaunchSpec[CompileKey]:
         compile_key = self.dispatch(
             topk=topk,
@@ -1020,10 +1392,16 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
             emit_ids=out is not None,
             block_size=0 if rows is None else rows.block_size,
             exact=exact is not None,
+            mailbox=mailbox is not None,
         )
+        if mailbox is None:
+            mailbox_args = (0, _dummy_i32(gathered.device))
+        else:
+            mailbox_args = (mailbox.box.data_ptr(), mailbox.ordinals)
         return compile_key, (
             *_select_args(gathered, out, rows, 0 if exact is None else exact.rank),
             *_exact_args(exact, gathered.device),
+            *mailbox_args,
         )
 
 
@@ -1467,6 +1845,19 @@ class _RowsOutput:
     stride_rows: int
 
 
+@dataclass(frozen=True)
+class _Mailbox:
+    """Round-1 mailbox of the exact merge (see the module docstring)."""
+
+    box: torch.Tensor  # symmetric int32 [2, max_rows, W, _box_words(N)]
+    box_mc: int  # its multicast address
+    ordinals: torch.Tensor  # int32 [max_rows]: merges per row so far
+    gathered: torch.Tensor  # int32 [W, max_rows, N + N/32]: the rescue's rows
+    rank: int
+    world_size: int
+    max_rows: int
+
+
 _DCP_TOPK_PACK_KERNEL = DCPTopkPackKernel()
 _DCP_TOPK_SELECT_KERNEL = DCPTopkSelectKernel()
 _DCP_TOPK_RESCUE_KERNEL = DCPTopkRescueKernel()
@@ -1522,6 +1913,7 @@ class DCPTopkRescueWorkspace:
         device = recv.device
         self.seq2 = torch.zeros(max_rows, dtype=torch.int32, device=device)
         self.sat_word = torch.zeros(max_rows, dtype=torch.int32, device=device)
+        self.mailbox: _Mailbox | None = None
 
     def args(self, logits: torch.Tensor, row_ends: torch.Tensor) -> _ExactArgs:
         return _ExactArgs(
@@ -1573,6 +1965,61 @@ def get_dcp_topk_rescue_workspace(
     return _RESCUE_WORKSPACES.get((topk, local_topk))
 
 
+def init_dcp_topk_mailbox(topk: int, local_topk: int, group: Any) -> bool:
+    """Allocate (once) the round-1 mailbox next to the rescue workspace of
+    (K, N); False (on every rank) when the DCP group has no multicast memory.
+    Collective over the DCP group (a ``GroupCoordinator``), outside CUDA-graph
+    capture."""
+    ws = _RESCUE_WORKSPACES[(topk, local_topk)]
+    if ws.mailbox is not None:
+        return True
+    words = 2 * ws.max_rows * ws.world_size * _box_words(local_topk)
+    storage, _ = ws._base._allocate((1, words), torch.int32)
+    box_mc = ws._base._multicast_ptrs(storage)[0]
+    agree = torch.tensor([int(box_mc != 0)], dtype=torch.int32)
+    torch.distributed.all_reduce(
+        agree, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
+    )
+    if not agree.item():
+        return False
+    storage.fill_(_EMPTY)
+    device = storage.device
+    ws.mailbox = _Mailbox(
+        box=storage[0],
+        box_mc=box_mc,
+        ordinals=torch.zeros(ws.max_rows, dtype=torch.int32, device=device),
+        gathered=torch.zeros(
+            (ws.world_size, ws.max_rows, packed_row_words(local_topk)),
+            dtype=torch.int32,
+            device=device,
+        ),
+        rank=ws.rank,
+        world_size=ws.world_size,
+        max_rows=ws.max_rows,
+    )
+    # No rank publishes before every box is armed.
+    torch.accelerator.synchronize()
+    torch.distributed.barrier(group=group.cpu_group)
+    return True
+
+
+# Tests and benchmarks: "all_gather" keeps round 1 on the all-gather although
+# a mailbox exists (set it on every rank alike).
+_EXCHANGE: list[str] = ["auto"]
+
+
+def set_dcp_topk_merge_exchange(exchange: str) -> None:
+    assert exchange in ("auto", "all_gather"), exchange
+    _EXCHANGE[0] = exchange
+
+
+def _mailbox_for(topk: int, local_topk: int) -> _Mailbox | None:
+    ws = _RESCUE_WORKSPACES.get((topk, local_topk))
+    if ws is None or _EXCHANGE[0] == "all_gather":
+        return None
+    return ws.mailbox
+
+
 def register_dcp_topk_merge_warmup(
     topk: int,
     local_topk: int,
@@ -1581,13 +2028,22 @@ def register_dcp_topk_merge_warmup(
     emit_ids: bool = True,
     block_size: int = 0,
     exact: bool = True,
+    mailbox: bool = False,
 ) -> None:
     """Compile the pack kernel and one select (+ rescue) variant at JIT
     warmup.
 
     The stock indexer uses the defaults (global ids); a caller of
     ``dcp_topk_merge_rows`` passes its ``block_size`` and whether it also
-    wants the global ids."""
+    wants the global ids. ``mailbox``: the round-1 mailbox variants."""
+    if mailbox:
+        for from_packed in (False, True):
+            _DCP_TOPK_PACK_KERNEL.register_warmup(
+                local_topk=local_topk,
+                has_row_ends=True,
+                publish_world=world_size,
+                from_packed=from_packed,
+            )
     _DCP_TOPK_PACK_KERNEL.register_warmup(local_topk=local_topk, has_row_ends=True)
     _DCP_TOPK_SELECT_KERNEL.register_warmup(
         topk=topk,
@@ -1596,6 +2052,7 @@ def register_dcp_topk_merge_warmup(
         emit_ids=emit_ids,
         block_size=block_size,
         exact=exact,
+        mailbox=mailbox and exact,
     )
     if exact:
         _DCP_TOPK_RESCUE_KERNEL.register_warmup(
@@ -1715,9 +2172,12 @@ def dcp_topk_select(
     topk: int | None = None,
     rows: _RowsOutput | None = None,
     exact: _ExactArgs | None = None,
+    mailbox: _Mailbox | None = None,
 ) -> None:
     """Exact global top-K of the gathered ``[W, T, N + N/32]`` rows: the
-    select, then the rescue (second round) of saturated rows."""
+    select, then the rescue (second round) of saturated rows. With
+    ``mailbox`` the select reads round 1 from it (``gathered`` is then the
+    mailbox's own, which the select fills for the rescue)."""
     if topk is None:
         assert topk_indices is not None
         topk = topk_indices.shape[1]
@@ -1725,6 +2185,14 @@ def dcp_topk_select(
         raise ValueError("the DCP top-k select needs its rescue state (exact)")
     if exact is not None:
         _check_exact(gathered, topk, local_topk, rows, exact)
+    if mailbox is not None and (
+        exact is None
+        or gathered.data_ptr() != mailbox.gathered.data_ptr()
+        or gathered.shape[0] != mailbox.world_size
+    ):
+        raise ValueError(
+            "the round-1 mailbox needs the exact merge and its own gathered rows"
+        )
     _DCP_TOPK_SELECT_KERNEL(
         gathered,
         topk_indices,
@@ -1732,6 +2200,7 @@ def dcp_topk_select(
         topk=topk,
         rows=rows,
         exact=exact,
+        mailbox=mailbox,
     )
     if exact is not None:
         _DCP_TOPK_RESCUE_KERNEL(
@@ -1816,6 +2285,31 @@ def _all_gather_packed(packed: torch.Tensor, group: Any) -> torch.Tensor:
     return group.all_gather(packed, dim=0).view(group.world_size, *packed.shape)
 
 
+def _publish_round1(
+    mailbox: _Mailbox,
+    logits: torch.Tensor,
+    row_ends: torch.Tensor,
+    local_topk: int,
+    packed: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Round 1 through the mailbox: this rank's local top-N (DeepSelect, or
+    ``packed``) published to every rank; returns the select's ``gathered``."""
+    num_rows = logits.shape[0] if packed is None else packed.shape[0]
+    if num_rows > mailbox.max_rows:
+        raise ValueError(
+            f"DCP top-k merge of {num_rows} rows exceeds its mailbox "
+            f"({mailbox.max_rows} rows)"
+        )
+    if packed is None:
+        from vllm.model_executor.layers.indexer_topk import deep_select_topk
+
+        local_idx = deep_select_topk(logits, local_topk, end=row_ends)
+        _DCP_TOPK_PACK_KERNEL(logits, local_idx, None, row_ends, mailbox)
+    else:
+        _DCP_TOPK_PACK_KERNEL(logits, None, packed, row_ends, mailbox)
+    return mailbox.gathered[:, :num_rows]
+
+
 def _exact_args_for(
     topk: int,
     local_topk: int,
@@ -1864,8 +2358,19 @@ def dcp_topk_merge(
     ``[T, K]`` int32 output (global token ids, -1 padded).
     """
     logits = _bound_logits(logits, max_local_len)
-    packed = dcp_topk_pack(logits, row_ends, local_topk)
     topk = topk_indices.shape[1]
+    mailbox = _mailbox_for(topk, local_topk)
+    if mailbox is not None:
+        exact = _exact_args_for(topk, local_topk, logits, row_ends)
+        dcp_topk_select(
+            _publish_round1(mailbox, logits, row_ends, local_topk),
+            local_topk,
+            topk_indices,
+            exact=exact,
+            mailbox=mailbox,
+        )
+        return
+    packed = dcp_topk_pack(logits, row_ends, local_topk)
     dcp_topk_select(
         _all_gather_packed(packed, None),
         local_topk,
@@ -1920,8 +2425,11 @@ def dcp_topk_merge_rows(
             "dcp_topk_merge_rows needs logits= and row_ends= (also with packed=)"
         )
     logits = _bound_logits(logits, max_local_len)
+    mailbox = _mailbox_for(topk, local_topk)
     if packed is None:
-        packed = dcp_topk_pack(logits, row_ends, local_topk)
+        num_rows = logits.shape[0]
+        if mailbox is None:
+            packed = dcp_topk_pack(logits, row_ends, local_topk)
     else:
         if (
             packed.dtype != torch.int32
@@ -1932,7 +2440,7 @@ def dcp_topk_merge_rows(
                 f"packed must be int32 [T, {packed_row_words(local_topk)}], got "
                 f"{packed.dtype} {tuple(packed.shape)}"
             )
-    num_rows = packed.shape[0]
+        num_rows = packed.shape[0]
     exact = _exact_args_for(topk, local_topk, logits, row_ends, group)
     if rows_out.shape[0] != num_rows or rows_out.shape[1] < topk:
         # A rank may own up to K entries of a saturated row.
@@ -1954,6 +2462,17 @@ def dcp_topk_merge_rows(
         block_size=block_size,
         stride_rows=stride_rows,
     )
+    if mailbox is not None:
+        dcp_topk_select(
+            _publish_round1(mailbox, logits, row_ends, local_topk, packed),
+            local_topk,
+            ids_out,
+            topk=topk,
+            rows=rows,
+            exact=exact,
+            mailbox=mailbox,
+        )
+        return
     dcp_topk_select(
         _all_gather_packed(packed, group),
         local_topk,
