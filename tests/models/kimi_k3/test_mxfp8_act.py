@@ -248,3 +248,90 @@ def test_kda_gated_norm_mxfp8_matches_inplace(tokens, heads):
     kda_norm.rmsnorm_gated_(ref, g, w, 1e-5)
     qa = kda_norm.rmsnorm_gated_mxfp8(x, g, w, 1e-5)
     _assert_same_quant(qa, ref.view(tokens, heads * D), check_pad=False)
+
+
+def test_dispatch_table_lookup():
+    from vllm.models.kimi_k3.nvidia import mxfp8
+
+    assert mxfp8.use_cute_dsl(12288, 7168, 200)  # g_proj: CuTe DSL to 256 rows
+    assert not mxfp8.use_cute_dsl(12288, 7168, 257)  # above the grid: threshold
+    assert not mxfp8.use_cute_dsl(3584, 7168, 128)  # latent down: cuBLASLt
+    assert mxfp8.use_cute_dsl(3584, 7168, 64)
+    assert mxfp8.use_cute_dsl(1000, 1024, 16)  # unlisted: CUTE_DSL_MAX_ROWS
+    assert not mxfp8.use_cute_dsl(1000, 1024, 17)
+    for winners in mxfp8._TP1_WINNER.values():
+        assert len(winners) == len(mxfp8._ROW_GRID) and set(winners) <= {"C", "L"}
+
+
+@pytest.mark.parametrize("rows", [48, 128, 224])
+def test_dispatch_backends_agree(default_vllm_config, dist_init, rows):
+    """Both MXFP8 GEMM backends of the dispatch give the BF16-dequantized
+    reference within accumulation-order tolerance on a table shape."""
+    from unittest import mock
+
+    from vllm.models.kimi_k3.nvidia import mxfp8
+    from vllm.models.kimi_k3.nvidia.ops import mxfp8_act
+
+    n, k = 7168, 6144
+    torch.manual_seed(rows)
+    weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.02
+    layer = _online_linear(n, k, weight)
+    x = torch.randn(rows, k, device="cuda", dtype=torch.bfloat16)
+    qa = mxfp8_act.quantize(x)
+    outs = []
+    for cute in (True, False):
+        with mock.patch.object(mxfp8, "use_cute_dsl", lambda *a, c=cute: c):
+            outs.append(layer(qa)[0].float())
+    # reference: dequantized operands in FP32
+    from vllm.models.kimi_k3.nvidia.mxfp8 import unswizzle_mxfp8_scale
+
+    xs = unswizzle_mxfp8_scale(qa.scale, rows, k).float()
+    xd = qa.data.float() * torch.exp2(xs - 127).repeat_interleave(32, dim=1)
+    w = layer.weight.data.t()  # [N, K] FP8
+    ws = unswizzle_mxfp8_scale(layer.weight_scale.data, n, k).float()
+    wd = w.float() * torch.exp2(ws - 127).repeat_interleave(32, dim=1)
+    ref = xd @ wd.t()
+    for out in outs:
+        torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(outs[0], outs[1], rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("rows", [16, 128, 224])
+def test_packed_moe_gemms_match_separate(default_vllm_config, dist_init, rows):
+    """The packed MoE GEMMs of KimiMoE.pack_projections: [latent down ; shared
+    gate_up] along N equals the two GEMMs; [shared down | latent up] along K on
+    [act | norm(routed)] equals shared down + latent up (one FP32 sum)."""
+    from vllm.models.kimi_k3.nvidia.mxfp8 import PackedMxfp8Linear, can_pack_mxfp8
+    from vllm.models.kimi_k3.nvidia.ops import mxfp8_act
+
+    torch.manual_seed(rows)
+    h, lat, inter = 1024, 512, 768
+    w = lambda n, k: torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.02  # noqa: E731
+    down = _online_linear(lat, h, w(lat, h))
+    gate_up = _online_linear(2 * inter, h, w(2 * inter, h))
+    sdown = _online_linear(h, inter, w(h, inter))
+    up = _online_linear(h, lat, w(h, lat))
+    x = torch.randn(rows, h, device="cuda", dtype=torch.bfloat16)
+    qa = mxfp8_act.quantize(x)
+    ref_n = torch.cat([down(qa)[0], gate_up(qa)[0]], dim=1).float()
+    act_in = torch.randn(rows, 2 * inter, device="cuda", dtype=torch.bfloat16)
+    routed = torch.randn(rows, lat, device="cuda", dtype=torch.bfloat16)
+    nw = torch.rand(lat, device="cuda", dtype=torch.bfloat16) + 0.5
+    act = mxfp8_act.situ_and_mul_quantize(act_in, 1.0, None)
+    nrm = mxfp8_act.rms_norm_quantize(routed, nw, 1e-6)
+    ref_k = (sdown(act)[0].float() + up(nrm)[0].float())
+
+    assert can_pack_mxfp8([down, gate_up]) and not can_pack_mxfp8([down, up])
+    assert can_pack_mxfp8([sdown, up], along_k=True)
+    pack_n = PackedMxfp8Linear([down, gate_up])
+    pack_k = PackedMxfp8Linear([sdown, up], along_k=True)
+    got_n = pack_n(qa).float()
+    torch.testing.assert_close(got_n, ref_n, rtol=1e-2, atol=1e-2)
+    buf = mxfp8_act.Mxfp8Buffer(rows, inter + lat, "cuda")
+    # the shared activation reads a column window of the packed output, as in
+    # KimiMoE._packed_forward
+    y = torch.cat([torch.randn_like(routed), act_in], dim=1)
+    mxfp8_act.situ_and_mul_quantize(y[:, lat:], 1.0, None, out=buf, col=0)
+    mxfp8_act.rms_norm_quantize(routed, nw, 1e-6, out=buf, col=inter)
+    got_k = pack_k(buf.activation()).float()
+    torch.testing.assert_close(got_k, ref_k, rtol=2e-2, atol=2e-2)

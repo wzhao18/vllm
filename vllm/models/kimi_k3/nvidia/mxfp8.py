@@ -36,8 +36,41 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
 )
 from vllm.platforms import current_platform
 
-# Above this many rows the cuBLASLt MXFP8 GEMM beats the CuTe DSL one on SM107.
+# Above this many rows the cuBLASLt MXFP8 GEMM beats the CuTe DSL one on SM107
+# for most shapes (the default for shapes not in the table below).
 CUTE_DSL_MAX_ROWS = 16
+
+# Measured winner (C = CuTe DSL, L = cuBLASLt) per K3.1 TP1 (wide-EP DEP)
+# projection [N, K] at rows <= 16 / 32 / 48 / 64 / 96 / 128 / 160 / 224 / 256
+# (VR SM107, pre-quantized input, weight streamed from HBM; wep-proj-gemm-p2
+# bench_proj_gemm.py). A call takes the winner of the first grid point >= its
+# rows; above 256 rows, or for shapes not listed, CUTE_DSL_MAX_ROWS applies.
+_ROW_GRID = (16, 32, 48, 64, 96, 128, 160, 224, 256)
+# VLLM_K3_MXFP8_DISPATCH_TABLE=0: the plain CUTE_DSL_MAX_ROWS threshold.
+_DISPATCH_TABLE = os.environ.get("VLLM_K3_MXFP8_DISPATCH_TABLE", "1") == "1"
+_TP1_WINNER = {
+    (12288, 7168): "CCCCCCCCC",  # DSA g_proj, shared-expert gate_up
+    (7168, 6144): "CCLCLLCCC",  # shared-expert down
+    (3584, 7168): "CCCCLLLLL",  # latent-MoE down
+    (7168, 3584): "CLLLLLCCC",  # latent-MoE up
+    (49376, 7168): "CLLLCLLLL",  # KDA in_proj
+    (7168, 12288): "CCCCCCLLL",  # KDA / DSA o_proj
+    (2272, 7168): "CCCCLLLLL",  # DSA packed [q_a | kv_a | wk | weights_proj]
+    (22528, 1536): "CLLCLLLLL",  # DSA packed [q_b | wq_index]
+    (67584, 7168): "CCCCCCCLL",  # dense MLP gate_up
+    (7168, 33792): "CCCCCCLLL",  # dense MLP down
+}
+
+
+def use_cute_dsl(n: int, k: int, rows: int) -> bool:
+    """CuTe DSL (True) or cuBLASLt (False) for an [N, K] MXFP8 GEMM."""
+    winners = _TP1_WINNER.get((n, k)) if _DISPATCH_TABLE else None
+    if winners is None or rows > _ROW_GRID[-1]:
+        return rows <= CUTE_DSL_MAX_ROWS
+    for grid_rows, winner in zip(_ROW_GRID, winners):
+        if rows <= grid_rows:
+            return winner == "C"
+    return False
 
 
 class KimiK3Mxfp8Kernel(FlashInferCutedslMxfp8LinearKernel):
@@ -52,10 +85,10 @@ class KimiK3Mxfp8Kernel(FlashInferCutedslMxfp8LinearKernel):
     ) -> torch.Tensor:
         qa = as_quantized_activation(x, self.input_quant_key())
         rows = qa.data.shape[0] if qa is not None else x.numel() // x.shape[-1]
-        if rows <= CUTE_DSL_MAX_ROWS:
-            return super().apply_weights(layer, x, bias)
         weight = layer.weight  # [K, N], column-major
         k, n = weight.shape
+        if use_cute_dsl(n, k, rows):
+            return super().apply_weights(layer, x, bias)
         if qa is not None:
             x_fp8, x_scale = qa.data, qa.scale
             out_dtype, input_shape = qa.orig_dtype, qa.orig_shape
@@ -138,13 +171,23 @@ def is_online_mxfp8(linear: nn.Module) -> bool:
     return isinstance(getattr(linear, "quant_method", None), Mxfp8OnlineLinearMethod)
 
 
-def can_pack_mxfp8(linears) -> bool:
+def can_pack_mxfp8(linears, along_k: bool = False) -> bool:
+    """The linears can share one MXFP8 GEMM: same K (stacked along N), or with
+    ``along_k`` the same N and every K a multiple of 128 (stacked along K)."""
     if not all(is_online_mxfp8(linear) for linear in linears):
         return False
     if any(_kernel_layout(linear) is None for linear in linears):
         return False
-    return len({linear.weight.shape[0 if _kernel_layout(linear) == "kn" else 1]
-                for linear in linears}) == 1  # fmt: skip
+
+    def nk(linear):
+        w = linear.weight
+        return (w.shape[1], w.shape[0]) if _kernel_layout(linear) == "kn" else w.shape
+
+    if along_k:
+        return len({nk(lin)[0] for lin in linears}) == 1 and all(
+            nk(lin)[1] % (4 * MXFP8_BLOCK_SIZE) == 0 for lin in linears
+        )
+    return len({nk(lin)[1] for lin in linears}) == 1
 
 
 def _rows(linear: nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
@@ -164,15 +207,24 @@ class _PackedHolder(nn.Module):
 class PackedMxfp8Linear:
     """One MXFP8 GEMM over the stacked rows of ``linears`` (all online MXFP8 on
     the same input). The linears' weights become views of the packed weight;
-    their own (small) scale tensors stay so they keep working on their own."""
+    their own (small) scale tensors stay so they keep working on their own.
 
-    def __init__(self, linears) -> None:
+    ``along_k=True`` stacks the linears along K instead (all with the same N):
+    the GEMM of the K-concatenated input ``[x_0 | x_1 | ...]`` is
+    ``sum_i linear_i(x_i)`` (FP32 accumulation, one BF16 rounding). Each
+    ``x_i`` starts at a 128-aligned column, so its 32-wide MXFP8 blocks and
+    F8_128x4 scale groups are exactly those of its own quantization (see
+    ``ops/mxfp8_act.Mxfp8Buffer``). The linears' weights become strided views
+    of the packed one: they are only used through the packed GEMM."""
+
+    def __init__(self, linears, along_k: bool = False) -> None:
         from vllm.model_executor.kernels.linear import init_mxfp8_linear_kernel
 
-        assert can_pack_mxfp8(linears)
+        assert can_pack_mxfp8(linears, along_k)
         parts = [_rows(linear) for linear in linears]
-        weight = torch.cat([w for w, _ in parts])
-        scale = torch.cat([s for _, s in parts])
+        dim = 1 if along_k else 0
+        weight = torch.cat([w for w, _ in parts], dim=dim)
+        scale = torch.cat([s for _, s in parts], dim=dim)
         n, k = weight.shape
         self.kernel = init_mxfp8_linear_kernel(weight_shape=(n, k))
         if _use_dispatch_kernel() and type(self.kernel) is (
@@ -188,7 +240,7 @@ class PackedMxfp8Linear:
         holder.params_dtype = linears[0].params_dtype
         self.kernel.process_weights_after_loading(holder)
         self.holder = holder
-        self.rows = [w.shape[0] for w, _ in parts]
+        self.rows = [w.shape[dim] for w, _ in parts]
         # Share the weight storage when the packed and the per-linear layouts
         # agree (same kernel class, row-major or transposed rows).
         packed_rows = holder.weight.data
@@ -205,7 +257,11 @@ class PackedMxfp8Linear:
             row = 0
             for linear, rows in zip(linears, self.rows):
                 if _kernel_layout(linear) == layout:
-                    view = packed_rows[row : row + rows]
+                    view = (
+                        packed_rows[:, row : row + rows]
+                        if along_k
+                        else packed_rows[row : row + rows]
+                    )
                     linear.weight.data = view.t() if layout == "kn" else view
                 row += rows
 

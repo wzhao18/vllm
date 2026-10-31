@@ -3,6 +3,7 @@
 """Kimi-K3 multimodal model implementation for vLLM."""
 
 import math
+import os
 from collections.abc import Hashable, Iterable
 from typing import TYPE_CHECKING, Any, cast
 
@@ -113,7 +114,11 @@ from vllm.models.kimi_k3.nvidia.low_latency_gemm import (
     enable_kimi_k3_low_latency_gemm,
 )
 from vllm.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
-from vllm.models.kimi_k3.nvidia.mxfp8 import takes_mxfp8_activation
+from vllm.models.kimi_k3.nvidia.mxfp8 import (
+    PackedMxfp8Linear,
+    can_pack_mxfp8,
+    takes_mxfp8_activation,
+)
 from vllm.models.kimi_k3.nvidia.ops import attn_res, mxfp8_act
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import NestedTensors
@@ -381,8 +386,8 @@ class KimiMLP(nn.Module):
             self.gate_up_proj
         )
 
-    def _act_mxfp8(self, gate_up: torch.Tensor):
-        """The activation written as down_proj's MXFP8 input, or None."""
+    def _act_mxfp8_ok(self) -> bool:
+        """The activation kernel can write down_proj's MXFP8 input."""
         fused = getattr(self, "_fused_act_quant", None)
         if fused is None:
             fused = (
@@ -392,7 +397,21 @@ class KimiMLP(nn.Module):
                 and takes_mxfp8_activation(self.down_proj)
             )
             self._fused_act_quant = fused
-        if not fused:
+        return fused
+
+    def act_mxfp8_into(self, gate_up: torch.Tensor, out, col: int = 0) -> None:
+        """Write ``act_fn(gate_up)`` as MXFP8 into columns ``[col, col + d)``
+        of ``out`` (an ``mxfp8_act.Mxfp8Buffer``)."""
+        if isinstance(self.act_fn, SiluAndMul):
+            mxfp8_act.silu_and_mul_quantize(gate_up, out=out, col=col)
+        else:
+            mxfp8_act.situ_and_mul_quantize(
+                gate_up, self.act_fn.beta, self.act_fn.linear_beta, out=out, col=col
+            )
+
+    def _act_mxfp8(self, gate_up: torch.Tensor):
+        """The activation written as down_proj's MXFP8 input, or None."""
+        if not self._act_mxfp8_ok():
             return None
         if isinstance(self.act_fn, SiluAndMul):
             return mxfp8_act.silu_and_mul_quantize(gate_up)
@@ -772,6 +791,97 @@ class KimiMoE(nn.Module):
             self._fused_input_quant = fused
         return fused
 
+    def pack_projections(self) -> None:
+        """TP1 latent MegaMoE with online-MXFP8 shared experts (wide-EP DEP):
+        pack the four dense MoE GEMMs into two (wep-proj-gemm-p2).
+
+        * along N: ``[routed latent down ; shared gate_up]`` on the layer
+          input (one MXFP8 quantization, one weight stream);
+        * along K: ``[shared down | routed latent up]`` on
+          ``[act(shared gate_up) | norm(MegaMoE output)]``, which is the layer
+          output ``shared + routed`` in one GEMM (FP32 accumulation; replaces
+          the up projection's BF16 beta-add of the shared output).
+
+        VLLM_K3_MXFP8_PACK_MOE=0 keeps the four GEMMs."""
+        self._packed_moe = None
+        if os.environ.get("VLLM_K3_MXFP8_PACK_MOE", "1") != "1":
+            return
+        shared = self.shared_experts
+        transform = self.routed_output_transform
+        if (
+            self.moe_token_shard
+            or not self.use_mega_moe
+            or self.tp_size != 1
+            or transform is None
+            or self.routed_expert_down_proj is None
+            or not isinstance(shared, KimiMLP)
+            or not shared.mxfp8_input()
+            or shared._act_mxfp8_ok() is False
+            or not transform._norm_mxfp8()
+            or not takes_mxfp8_activation(
+                self.routed_expert_down_proj, shared.down_proj
+            )
+        ):
+            return
+        down, gate_up = self.routed_expert_down_proj, shared.gate_up_proj
+        if not (can_pack_mxfp8([down, gate_up])
+                and can_pack_mxfp8([shared.down_proj, transform.up_proj],
+                                   along_k=True)):  # fmt: skip
+            return
+        latent = down.output_size_per_partition
+        inter = shared.down_proj.input_size_per_partition
+        self._packed_moe = (
+            PackedMxfp8Linear([down, gate_up]),
+            PackedMxfp8Linear([shared.down_proj, transform.up_proj], along_k=True),
+            latent,
+            inter,
+        )
+
+    def _router(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        router_logits, _ = self.gate(hidden_states)
+        if not self.use_mega_moe:
+            return router_logits, None
+        return fused_grouped_topk(
+            hidden_states=hidden_states,
+            gating_output=router_logits,
+            topk=self.experts.top_k,
+            renormalize=self.moe_renormalize,
+            e_score_correction_bias=self.gate.e_score_correction_bias.data,
+            num_expert_group=self.num_expert_group,
+            topk_group=self.topk_group,
+            scoring_func=self.moe_router_activation_func,
+            routed_scaling_factor=self.routed_scaling_factor,
+        )
+
+    def _packed_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """MoE layer on the packed GEMMs of pack_projections()."""
+        pack_n, pack_k, latent, inter = self._packed_moe
+        num_tokens = hidden_states.shape[0]
+        x = mxfp8_act.quantize(hidden_states)
+        (router_output, topk_ids), y = maybe_execute_in_parallel(
+            lambda: self._router(hidden_states),
+            lambda: pack_n(x),
+            self._down_proj_events[0],
+            self._down_proj_events[1],
+            self._down_proj_stream
+            if num_tokens <= _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD
+            else None,
+        )
+        # [act(shared gate_up) | norm(routed latent out)]: the packed down/up
+        # GEMM input; the shared half is written before MegaMoE runs.
+        act = mxfp8_act.Mxfp8Buffer(
+            num_tokens, inter + latent, hidden_states.device, hidden_states.dtype
+        )
+        self.shared_experts.act_mxfp8_into(y[:, latent:], act, 0)
+        routed = self.experts(y[:, :latent], router_output, topk_ids)
+        norm = self.routed_output_transform.norm
+        mxfp8_act.rms_norm_quantize(
+            routed, norm.weight, norm.variance_epsilon, out=act, col=inter
+        )
+        return pack_k(act.activation())
+
     def _maybe_overlap_router_and_down_proj(
         self,
         hidden_states: torch.Tensor,
@@ -911,6 +1021,8 @@ class KimiMoE(nn.Module):
             return self._token_shard_forward(hidden_states).view(
                 num_tokens, hidden_size
             )
+        if getattr(self, "_packed_moe", None) is not None:
+            return self._packed_forward(hidden_states).view(num_tokens, hidden_size)
         # Online MXFP8: one quantization of the layer input for the latent
         # down_proj and the shared gate_up_proj (each would quantize its own).
         mxfp8_input = (
@@ -1842,6 +1954,17 @@ class KimiLinearForCausalLM(
         from .megamoe import prepare_megamoe
 
         prepare_megamoe(self.model, self.vllm_config)
+        packed_moe = 0
+        for module in self.model.modules():
+            if isinstance(module, KimiMoE):
+                module.pack_projections()
+                packed_moe += module._packed_moe is not None
+        if packed_moe:
+            logger.info_once(
+                "Kimi K3: %d MoE layers run the packed MXFP8 shared/latent GEMMs "
+                "(VLLM_K3_MXFP8_PACK_MOE=0 to disable).",
+                packed_moe,
+            )
         # K3.1 DSA decode under DCP: NCCL-free top-k / Q / O exchanges.
         from .dsa_kernels.dcp_exchange.decode import build as build_dcpx
 

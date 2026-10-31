@@ -1131,7 +1131,6 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             out=out,
         )
 
-    @eager_break_during_capture
     def _o_norm_mxfp8(self, core_attn_out: torch.Tensor, g2: torch.Tensor) -> bool:
         if self._o_norm_mxfp8_ok is None:
             from vllm.models.kimi_k3.nvidia.mxfp8 import takes_mxfp8_activation
@@ -1147,6 +1146,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             and kda_norm.supported(core_attn_out, g2, self.o_norm)
         )
 
+    @eager_break_during_capture
     def _forward(
         self,
         mixed_qkv: torch.Tensor,
