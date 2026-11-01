@@ -349,6 +349,20 @@ def test_dsa_core_graph_replay_alternates_parities(variant):
     assert torch.equal(lse.view(torch.int32), eager[1].view(torch.int32))
 
 
+def test_dsa_core_serving_spin(monkeypatch):
+    """The served core's q mailbox poll deadline (build()): 600 s by default, as
+    DcpExchange's serving one, so a peer stalled on the host does not trap it; 0: no
+    deadline."""
+    from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core import decode
+
+    monkeypatch.delenv(decode.SPIN_ENV, raising=False)
+    assert decode.serving_spin_ns() == 600 * 10**9
+    monkeypatch.setenv(decode.SPIN_ENV, "2.5")
+    assert decode.serving_spin_ns() == 2_500_000_000
+    monkeypatch.setenv(decode.SPIN_ENV, "0")
+    assert decode.serving_spin_ns() >= 1 << 62
+
+
 def test_dsa_core_policy(monkeypatch):
     """VLLM_K31_DSA_CORE's table: by q, then rows (a q without a table and rows past
     ROWS keep FlashInfer), split_min in the variant name, skipped DSA layers, an

@@ -23,6 +23,8 @@ rows (default ROWS; at most the DcpBox cap of 64); ``VLLM_K31_DSA_CORE_VARIANT``
 core variant by rows (``batch_table`` syntax) of every q (default VARIANT[q]: rows of
 a q without a table keep FlashInfer); ``VLLM_K31_DSA_CORE_SKIP_LAYERS`` = DSA layers
 (ordinals 0 .. 23, ';' or ',' separated) that keep FlashInfer;
+``VLLM_K31_DSA_CORE_SPIN_S`` = how long a served core's q mailbox poll waits for a
+peer before it traps (default 600 s; 0: forever; see DEFAULT_SPIN_S);
 ``VLLM_K31_DSA_CORE_SPREAD`` = rows whose pushed DcpValue spreads its merge (see
 SPREAD). ``VLLM_K31_DSA_CORE_STATS=1`` logs the kernel's error word at exit, and (with
 the core on or off) per DSA layer and rows the histogram of each step's largest local
@@ -106,6 +108,19 @@ SPREAD_ENV = ENV + "_SPREAD"
 # than 152 SMs (PreparedDsa.run_dcp). 9-layer real-weight R.1 check with it on passes
 # (rel rms as off) and still flags an injected softmax-scale fault.
 SPREAD = "17-64:1"
+SPIN_ENV = ENV + "_SPIN_S"
+# The served core's q mailbox poll deadline (s; ``build``): a peer stalled on the host
+# (cold JIT, GC, a P/D handshake) then only delays this rank, as with DcpExchange's
+# serving deadline (VLLM_K31_DCP_EXCHANGE_SPIN_S, 600 s) and DcpBox's polls (none).
+# DsaCore's own 5 s stays for tests.
+DEFAULT_SPIN_S = 600.0
+
+
+def serving_spin_ns() -> int:
+    """The served core's q mailbox poll deadline in ns (``SPIN_ENV``; 0 or less: a
+    deadline no poll reaches)."""
+    seconds = float(os.environ.get(SPIN_ENV, str(DEFAULT_SPIN_S)))
+    return int(seconds * 1e9) if seconds > 0 else 1 << 62
 
 
 def parse_variant(name: str) -> tuple[int, int, int]:
@@ -347,4 +362,5 @@ def build(model) -> DsacDecode | None:
     dsac = DsacDecode(device, heads, pdl_rows=pdl_rows)
     for layer in layers:
         layer.dsa_indexer.dsac = dsac
+    dsac.core.spin_ns = serving_spin_ns()
     return dsac
