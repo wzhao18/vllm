@@ -161,7 +161,7 @@ def test_index_policies_wide_rows():
 def test_dsa_wide_query_grid_resident():
     """Hazard H1: at wide rows the MlaQuery CTAs poll the gathered q mailbox that
     other ranks' CTAs fill, so every CTA that polls with them must be resident. The
-    compiled DSA query (DCP16, 6 heads, FP8, 512-row box) fits whole at 72 / 96 rows
+    compiled DSA query (DCP16, 6 heads, FP8) fits whole at 72 / 96 rows
     (cuOccupancyMaxActiveClusters, checked by compile_core); a 128-row grid would not
     (the check refuses it without the tile poll), so above WIDE_MAX_ROWS each row
     tile polls its own tokens and one tile's 6 clusters must fit (104-512 rows);
@@ -218,7 +218,7 @@ def test_dsa_wide_query_grid_resident():
         assert wide.check_query_residency(query.compiled, tiled, device) >= heads
         grid = wide.check_value_residency(value, heads, 16, rows, 4, sms, device)
         assert grid[0] * grid[1] * grid[2] <= sms
-    # 576 rows (past WIDE_LIMIT): 6 x 36 merge CTAs, more than one per SM fits.
+    # 576 rows (past WIDE_LIMIT): 6 x 36 = 216 merge CTAs, one per SM: more than 212.
     with pytest.raises(RuntimeError, match="cannot be co-resident"):
         value = compile_value(
             heads, 16, 576, 576, specs[4], pitch, device, sms, 4, dsa_heads=128,

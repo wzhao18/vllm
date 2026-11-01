@@ -75,9 +75,9 @@ DSA_WIDE: dict = {"*": "65-512:1"}
 # dispatched in order, so every rank's lowest unfinished tile is resident.
 WIDE_MAX_ROWS = 96
 # The most rows VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS admits (DL3's 128 requests x q4).
-# DcpValue's merge CTAs (one per head and 16-row tile; from 401 rows every CTA, 192 at
-# 512) poll the partials every CTA pushes, so its whole grid must be co-resident
-# (``check_value_residency``: one 512-thread CTA per SM, 212 SMs).
+# DcpValue's merge CTAs (one per head and 16-row tile, the only CTAs from 193 rows:
+# 192 at 512, 216 past 560) poll the partials every CTA pushes, so its whole grid must
+# be co-resident (``check_value_residency``: one 512-thread CTA per SM, 212 SMs).
 WIDE_LIMIT = 512
 
 
