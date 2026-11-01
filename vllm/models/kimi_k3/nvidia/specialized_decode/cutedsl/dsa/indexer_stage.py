@@ -101,6 +101,46 @@ class IndexerStage:
             args = self.topk, self.local_topk, self.indexer.dcp_world_size
             warm_merge_rows(*args, self.dcp_ids is not None, block_size)
 
+    def merge_source(self, batch):
+        """Which top-k ``merge_rows`` gives this step of ``batch`` rows, decided from
+        the step metadata alone (the same on every rank): ("exchange", rows) where
+        DcpExchange's top-k admits the step, ("merge", rows) where the #63 merge fits
+        it (pure decode, uniform rows, interleave 1), else (None, 0): the caller
+        runs the op and the filter."""
+        from vllm.forward_context import get_forward_context
+        from vllm.model_executor.layers.sparse_attn_indexer import (
+            DCP_DECODE_TOPK_HOOKS,
+        )
+        from vllm.v1.attention.ops.dcp_topk_merge import dcp_topk_merge_fits
+
+        if not self.local_topk:
+            return None, 0
+        indexer = self.indexer
+        index_md = get_forward_context().attn_metadata[indexer.k_cache.prefix]
+        decode, rows = index_md.decode, index_md.num_decode_tokens
+        if (
+            decode is None
+            or decode.global_seq_lens is None
+            or index_md.num_prefills
+            or not 0 < rows <= batch
+            or decode.requires_padding
+            or rows % decode.decode_lens.shape[0]
+        ):
+            return None, 0
+        hook = DCP_DECODE_TOPK_HOOKS.get(indexer.k_cache.prefix)
+        if hook is not None and self.impl is not None and hook[0](rows):
+            return "exchange", rows
+        if indexer.cp_kv_cache_interleave_size == 1 and dcp_topk_merge_fits(
+            rows, self.topk, self.local_topk
+        ):
+            return "merge", rows
+        return None, 0
+
+    def merge_fits(self, batch):
+        """Whether ``merge_rows`` serves this step of ``batch`` rows with the #63
+        merge (``merge_source``; the same on every rank)."""
+        return self.merge_source(batch)[0] == "merge"
+
     def merge_rows(self, q_fp8, head_w, metadata, stride_rows, batch, q=1):
         """DCP: this rank's flat KV rows of the merged global top-k of the first
         ``batch`` rows (``q`` per request; compacted to a prefix, at most N per
@@ -120,31 +160,19 @@ class IndexerStage:
             DCP_DECODE_TOPK_HOOKS,
         )
         from vllm.utils.math_utils import cdiv
-        from vllm.v1.attention.ops.dcp_topk_merge import dcp_topk_merge_fits
         from vllm.v1.attention.ops.dcp_topk_merge.kernels import (
             dcp_topk_merge_rows,
         )
 
+        source, rows = self.merge_source(batch)
+        if source is None:
+            return None
         indexer, n = self.indexer, self.local_topk
         index_md = get_forward_context().attn_metadata[indexer.k_cache.prefix]
-        decode, rows = index_md.decode, index_md.num_decode_tokens
-        if (
-            decode is None
-            or decode.global_seq_lens is None
-            or index_md.num_prefills
-            or not 0 < rows <= batch
-            or decode.requires_padding
-            or rows % decode.decode_lens.shape[0]
-        ):
-            return None
-        # DcpExchange decides from the step metadata alone (every rank alike).
-        hook = DCP_DECODE_TOPK_HOOKS.get(indexer.k_cache.prefix)
-        if hook is not None and self.impl is not None and hook[0](rows):
-            return self.exchange_rows(hook[1], q_fp8, head_w, decode, rows, batch)
-        if indexer.cp_kv_cache_interleave_size != 1 or not dcp_topk_merge_fits(
-            rows, self.topk, n
-        ):
-            return None
+        decode = index_md.decode
+        if source == "exchange":
+            run = DCP_DECODE_TOPK_HOOKS[indexer.k_cache.prefix][1]
+            return self.exchange_rows(run, q_fp8, head_w, decode, rows, batch)
         slots, valid = self.dcp_rows[:batch], self.dcp_valid[:batch]
         ids = None if self.dcp_ids is None else self.dcp_ids[:rows, : self.topk]
         # As the stock hook: interleave 1 bounds the local lengths.

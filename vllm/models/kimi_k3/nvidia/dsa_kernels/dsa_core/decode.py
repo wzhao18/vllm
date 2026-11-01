@@ -2,27 +2,26 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The DSA sparse core (``DsaCore``) in ``PreparedDsa``'s DCP decode.
 
-On pure-decode steps whose top-k DcpExchange serves (``DcpxDecode.counts_for``: the
-same step predicate as the indexer op, so every rank and the MLA layer agree), at
-most ``rows`` rows, ``PreparedDsa.run_dcp`` replaces
+On DCP decode steps whose top-k the #63 merge serves (``MergeRows``: this rank's
+compacted flat KV rows and their counts, ``IndexerStage.merge_rows``, whose step
+predicate every rank shares), at most ``rows`` rows, ``PreparedDsa.run_dcp`` replaces
 
-    MlaQuery (q publish + gathered-q poll) .. DcpExchange.topk_merge
-    -> FlashInfer sparse decode over the gathered q mailbox (trtllm-gen + its
-       reduction / LSE glue)
+    MlaQuery (q publish) + QueryWait (gathered-q poll) .. merge_rows
+    -> FlashInfer's trtllm-gen sparse decode over the gathered q mailbox (+ its
+       reduction / LSE kernels)
     -> DcpValue (push, merge, W_UV, gate)
 
 by
 
-    MlaQuery (q publish only) .. DcpExchange.topk_merge
+    MlaQuery (q publish) .. merge_rows
     -> DsaCore (polls its q tiles, sparse MLA, O + LSE pushed to the head owners)
     -> DcpValue(pushed=True) (merge, W_UV, gate)
 
-Switch: ``VLLM_K31_DSA_CORE`` = 1 (default: per-tensor FP8 KV under DCP wherever
-DcpExchange's top-k is) | 0; ``VLLM_K31_DSA_CORE_ROWS`` = most rows (default 64, see
-ROWS; at most the DcpBox cap of 64); ``VLLM_K31_DSA_CORE_VARIANT`` = the core variant by rows
-(``batch_table`` syntax, see VARIANT); ``VLLM_K31_DSA_CORE_SPREAD`` = rows whose
-pushed DcpValue spreads its merge (see SPREAD). ``VLLM_K31_DSA_CORE_STATS=1`` logs the kernel's error word
-at exit.
+Switch: ``VLLM_K31_DSA_CORE`` = 0 (default) | 1; ``VLLM_K31_DSA_CORE_ROWS`` = most
+rows (default ROWS; at most the DcpBox cap of 64); ``VLLM_K31_DSA_CORE_VARIANT`` = the
+core variant by rows (``batch_table`` syntax, see VARIANT); ``VLLM_K31_DSA_CORE_SPREAD``
+= rows whose pushed DcpValue spreads its merge (see SPREAD).
+``VLLM_K31_DSA_CORE_STATS=1`` logs the kernel's error word at exit.
 """
 
 from __future__ import annotations
@@ -86,23 +85,42 @@ def parse_variant(name: str) -> tuple[int, int]:
     return int(splits), int(heads)
 
 
-def wanted(dcpx) -> bool:
-    mode = os.environ.get(ENV, "1").strip().lower()
-    if mode in ("0", "off", "false") or dcpx is None:
-        return False
-    return "topk" in dcpx.parts
+def wanted() -> bool:
+    return os.environ.get(ENV, "0").strip().lower() in ("1", "on", "true")
+
+
+class MergeRows:
+    """The core's (sel, cnt) source on PreparedDsa's DCP steps: the #63 merge of the
+    layer's ``stage`` (IndexerStage.merge_rows: this rank's flat KV rows [rows, K], a
+    compacted prefix, and their counts [rows]). Another source (e.g. a DcpExchange
+    top-k) provides the same two calls."""
+
+    def __init__(self, stage):
+        self.stage = stage
+
+    def fits(self, batch: int) -> bool:
+        """Whether the step's ``batch`` rows get their rows from the merge (its own
+        predicate: every rank takes the same branch)."""
+        return self.stage.merge_fits(batch)
+
+    def rows(self, *args, q: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
+        """(sel, cnt) of the step: ``merge_rows(*args, q)``, on a step ``fits``
+        accepted."""
+        merged = self.stage.merge_rows(*args, q)
+        assert merged is not None, "merge_rows declined a step merge_fits accepted"
+        return merged
 
 
 class DsacDecode:
-    def __init__(self, dcpx, device: torch.device, heads: int):
-        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.policy import (
-            batch_table,
-        )
+    """The core of one device, shared by every DSA layer (stream-ordered launches):
+    ``heads`` gathered query heads (DCP x local heads), at most ``cap`` rows (the
+    DcpBox's)."""
 
+    def __init__(self, device: torch.device, heads: int, cap: int = 64):
+        from ...specialized_decode.cutedsl.common.policy import batch_table
         from .ops import DsaCore
 
-        self.dcpx = dcpx
-        self.rows = min(int(os.environ.get(ROWS_ENV, str(ROWS))), dcpx.cap)
+        self.rows = min(int(os.environ.get(ROWS_ENV, str(ROWS))), cap)
         spec = os.environ.get(VARIANT_ENV, VARIANT).replace(";", ",")  # (";": shells)
         self.variant = {b: parse_variant(v) for b, v in batch_table(spec).items()}
         spread = os.environ.get(SPREAD_ENV, SPREAD).replace(";", ",")
@@ -125,31 +143,28 @@ class DsacDecode:
             return
         print(f"K31 DSAC stats: err {err}", flush=True)
 
-    def counts(self, prefix: str, rows: int) -> torch.Tensor | None:
-        """This step's local top-k counts if the core serves it, else None."""
-        if rows > self.rows:
-            return None
-        return self.dcpx.counts_for(prefix, rows)
+    def serves(self, batch: int) -> bool:
+        return batch <= self.rows
 
-    def run(self, prepared, batch, sel, counts, cache, box, parity, lse_wide=False):
-        """``lse_wide``: the pushed DcpValue spreads its merge (LSE box [CAP, H, DCP])."""
-        from vllm.forward_context import get_forward_context
-        from vllm.v1.attention.backends.mla.sparse_utils import flat_kv_row_view
-
-        md = get_forward_context().attn_metadata[prepared.layer.layer_name]
-        kv, _ = flat_kv_row_view(cache.view(torch.uint8), md.block_size)
-        prepared.impl.record_logical_topk_ready()
+    def run(
+        self, q_box, sel, counts, kv, scales, box, hpr, parity, batch, lse_wide=False
+    ):
+        """``q_box``: this parity's q mailbox; ``sel`` / ``counts``: MergeRows.rows;
+        ``kv``: the flat FP8 KV rows; ``scales``: FlashInfer's (bmm1, bmm2) of the
+        layer; ``box``: the DSA DcpBox (``hpr`` heads per rank); ``lse_wide``: the
+        pushed DcpValue spreads its merge (LSE box [CAP, H, DCP])."""
+        bmm1, bmm2 = scales
         self.core.run(
-            box.q[parity],
+            q_box,
             sel,
             counts,
             kv,
-            bmm1_scale=prepared.core_bmm1,
-            bmm2_scale=prepared.core_bmm2,
+            bmm1_scale=bmm1,
+            bmm2_scale=bmm2,
             part_peers=box.peers,
             lse_peers=box.lse_peers,
             box_cap=box.cap,
-            hpr=box.heads,
+            hpr=hpr,
             parity=parity,
             rank=box.rank,
             rows=batch,
@@ -162,18 +177,21 @@ class DsacDecode:
         return dict(splits=splits, heads_per_cta=heads or 32, umma=heads == 0)
 
 
-def build(model, dcpx) -> DsacDecode | None:
-    """Build the core and attach it to every DSA indexer (``PreparedDsa`` picks it up
-    on a per-tensor FP8 cache)."""
-    if not wanted(dcpx):
+def build(model) -> DsacDecode | None:
+    """Build the core (``VLLM_K31_DSA_CORE=1``, DCP) and attach it to every DSA
+    indexer (``PreparedDsa`` picks it up on a per-tensor FP8 cache with the #63
+    merge)."""
+    if not wanted():
         return None
     from vllm.models.kimi_k3.nvidia.dsa import KimiK3DSAAttention
 
     layers = [m for m in model.modules() if isinstance(m, KimiK3DSAAttention)]
-    if not layers:
+    if not layers or layers[0].dsa_indexer.dcp_world_size < 2:
         return None
-    device = layers[0].mla_attn.mla_attn.W_UK_T.device
-    dsac = DsacDecode(dcpx, device, dcpx.heads)
+    first = layers[0]
+    device = first.mla_attn.mla_attn.W_UK_T.device
+    heads = first.num_local_heads * first.dsa_indexer.dcp_world_size
+    dsac = DsacDecode(device, heads)
     for layer in layers:
         layer.dsa_indexer.dsac = dsac
     return dsac
