@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kimi K3.1 DSA layers at the Rubin wide verify rows ``DSA_WIDE`` admits (65-96
-rows under DCP): round 1's prepared DSA core as Wei's DSA_WIDE extended it, kept as
-it was while #108's ``dsa.prepared.PreparedDsa`` serves the steps up to 64 rows.
+"""Kimi K3.1 DSA layers at the Rubin wide verify rows ``DSA_WIDE`` admits (under DCP,
+65 rows up to ``wide_max_rows``: 96 by default): round 1's prepared DSA core as Wei's
+DSA_WIDE extended it, kept as it was while #108's ``dsa.prepared.PreparedDsa`` serves
+the steps up to 64 rows.
 
   MlaQuery (dsa)   the query rows (per-tensor FP8 [B, H, 576] on FlashInfer, BF16
                    [B, 64 (padded heads), 576] on fp8_ds_mla), the KV insert of this
@@ -27,11 +28,14 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import make_fake_stream
 
+import vllm.envs as envs
+from vllm.logger import init_logger
 from vllm.utils.deep_gemm import mqa_logits_use_mx_scales
 from vllm.utils.torch_utils import _encode_layer_name
 
 from ...shapes import Choice, Path, rows_policy
 from ..common.host import (
+    check_residency,
     fake,
     layout,
     max_active_clusters,
@@ -40,11 +44,13 @@ from ..common.host import (
     to_cute,
 )
 from ..gemm.projection import PreparedProjection
-from ..mla.dcp import compile_value
+from ..mla.dcp import GB300_SMS, DcpValue, compile_value
 from ..mla.prepared import pad_requests
 from ..mla.query import MlaQuery
 from ..mla.value import MlaValue
 from .index import DIM, HEADS, DsaIndex
+
+logger = init_logger(__name__)
 
 QUERY_HEADS = 64  # FlashMLA sparse FP8 decode reads 64 or 128 query heads
 
@@ -58,18 +64,37 @@ QUERY_HEADS = 64  # FlashMLA sparse FP8 decode reads 64 or 128 query heads
 # 192K: q4 M72 18.07 -> 17.49 / 16.79 -> 16.18, M96 19.85 -> 19.23 / 18.58 -> 18.02;
 # q8 M72 18.22 -> 17.62 / 17.13 -> 16.53, M96 20.45 -> 19.84 / 19.25 -> 18.68; real
 # (test) weights q4 M72 16.13 -> 15.58, M96 17.53 -> 16.96.
-DSA_WIDE: dict = {"*": "65-96:1"}
-# The most rows a prepared DSA step serves: MlaQuery's gather polls the whole gathered
-# mailbox from every CTA, so its grid (8-CTA clusters x 6 heads x 32-row tiles at DCP16)
-# must be co-resident: Rubin holds 22 such clusters (cuOccupancyMaxActiveClusters,
-# checked at compile by ``check_query_residency``), i.e. 3 row tiles (96 rows: 18).
-# DcpValue's grid (6 heads x 16-row tiles) is far below one wave there.
+DSA_WIDE: dict = {"*": "65-512:1"}
+# The most rows a prepared DSA step serves by default (VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS,
+# ``wide_max_rows``), and the most whose MlaQuery polls the whole gathered mailbox from
+# every CTA: that grid (8-CTA clusters x 6 heads x 32-row tiles at DCP16) must be
+# co-resident, and Rubin holds 22 such clusters (cuOccupancyMaxActiveClusters, checked
+# at compile by ``check_query_residency``), i.e. 3 row tiles (96 rows: 18). Above it
+# each row tile polls only its own tokens (``MlaQuery(tile_poll=True)``, Wei's
+# d6347e7603): one tile's 6 clusters must be resident at once, and the tiles are
+# dispatched in order, so every rank's lowest unfinished tile is resident.
 WIDE_MAX_ROWS = 96
+# The most rows VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS admits (DL3's 128 requests x q4).
+# DcpValue's merge CTAs (one per head and 16-row tile; from 401 rows every CTA, 192 at
+# 512) poll the partials every CTA pushes, so its whole grid must be co-resident
+# (``check_value_residency``: one 512-thread CTA per SM, 212 SMs).
+WIDE_LIMIT = 512
+
+
+def wide_max_rows() -> int:
+    """VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS: the most wide rows WideDsa serves (64: none),
+    read when the providers are built."""
+    rows = envs.VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS
+    if not 64 <= rows <= WIDE_LIMIT:
+        raise ValueError(
+            f"VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS={rows}: expected 64 to {WIDE_LIMIT}"
+        )
+    return rows
 
 
 def choose(shape, ctx):
     """Prepared DSA core at a decode shape: GENERIC at the tuned rows, GENERIC "wide"
-    where ``DSA_WIDE`` admits a Rubin DCP verify shape of at most ``WIDE_MAX_ROWS``,
+    where ``DSA_WIDE`` admits a Rubin DCP verify shape of at most ``wide_max_rows``,
     else None (seam S2-DSA)."""
     if shape.rows <= 64:
         return Choice(Path.GENERIC)
@@ -77,7 +102,7 @@ def choose(shape, ctx):
         ctx.arch == "rubin"
         and ctx.dcp > 1
         and shape.q > 1
-        and shape.rows <= WIDE_MAX_ROWS
+        and shape.rows <= wide_max_rows()
         and rows_policy(DSA_WIDE, shape, 0)
     )
     return Choice(Path.GENERIC, tactic="wide", note="prepared") if admitted else None
@@ -133,6 +158,7 @@ def compile_core(
         fp8=fp8,
         dcp=dcp,
         q_heads=q_heads,
+        tile_poll=bool(dcp) and batch > WIDE_MAX_ROWS,
     )
     q_args = (projected, qnorm, kvnorm, qb, uk, kv, slots, scalar, scalar, f32(1e-6))
     publish: tuple = ()
@@ -153,8 +179,8 @@ def compile_core(
     with torch.accelerator.device_index(device):
         query_kernel = cute.compile(mla_query, *q_args, query, qc, *publish, s)
         if dcp and batch > 64:
-            # Wide rows: every CTA polls the gathered mailbox, which other ranks' CTAs
-            # fill, so the whole grid must be resident at once (hazard H1).
+            # Wide rows: the CTAs poll the gathered mailbox, which other ranks' CTAs
+            # fill, so every CTA that polls with them must be resident (hazard H1).
             check_query_residency(query_kernel, mla_query, device)
         if batch > 1:
             query_kernel = prepare_shared_carveout(query_kernel, device, 100)
@@ -174,6 +200,8 @@ def compile_core(
                 dsa_bf16=not fp8,
                 lse_base_e=lse_base_e,
             )
+            if batch > 64:
+                check_value_residency(value_kernel, heads, dcp, batch, q, sms, device)
         else:
             value = MlaValue(heads, batch, q)
             value_kernel = cute.compile(value, latent, uv, gate, lengths, output, s)
@@ -181,14 +209,16 @@ def compile_core(
 
 
 def check_query_residency(compiled, mla_query, device):
-    """Raise unless the device holds every cluster of ``mla_query``'s grid at once
-    (cuOccupancyMaxActiveClusters at its shared memory and carve-out); returns the
+    """Raise unless the device holds at once every cluster of ``mla_query``'s grid
+    that polls together (cuOccupancyMaxActiveClusters at its shared memory and
+    carve-out): the whole grid, or under ``tile_poll`` one row tile's; returns the
     measured clusters. Rubin (VR200, 212 SMs), DCP16, FP8, 6 heads: one CTA per SM
     (227 KB shared, 208 registers), 22 clusters of 8 CTAs at once; 65-96 rows need
-    18 (3 tiles of 32 rows x 6 heads), 97-128 rows 24 (hence WIDE_MAX_ROWS)."""
+    18 (3 tiles of 32 rows x 6 heads), 97-128 rows would need 24 (hence the tile
+    poll above WIDE_MAX_ROWS: 6)."""
     grid, cluster = mla_query.grid, mla_query.cluster
     resident = max_active_clusters(compiled, device, grid, 256, cluster, 100)
-    need = grid[1] * grid[2]
+    need = grid[1] * (1 if mla_query.tile_poll else grid[2])
     if resident < need:
         raise RuntimeError(
             f"Kimi K3.1 DSA wide rows: MlaQuery's {need} clusters of {cluster} CTAs "
@@ -196,6 +226,18 @@ def check_query_residency(compiled, mla_query, device):
             "its gathered-q poll could deadlock across ranks. Narrow DSA_WIDE."
         )
     return resident
+
+
+def check_value_residency(compiled, heads, dcp, batch, q, sms, device):
+    """Raise unless the device holds DcpValue's whole grid at once (its merge CTAs
+    poll the partials that every CTA pushes first); returns the grid. The DSA value
+    runs the GB300 schedule (``compile_value``: SMs capped at GB300_SMS): DCP16, 6
+    heads, 6 x 16-row tiles x pushers, e.g. 144 CTAs at 96 rows, 96 at 256, 192 at
+    512, against one 512-thread CTA per SM on Rubin."""
+    grid = DcpValue(heads, dcp, batch, min(sms, GB300_SMS), q).grid
+    what = f"Kimi K3.1 DSA wide rows: DcpValue (batch {batch})"
+    check_residency(compiled, device, grid[0] * grid[1] * grid[2], 512, what)
+    return grid
 
 
 def index_policies(batches):
@@ -265,7 +307,8 @@ class WideDsa:
         )
         self.unit = torch.ones(1, dtype=torch.float32, device=self.device)
         self.query, self.qc, self.iq, self.q_fp8, self.head_w, _ = scratch
-        self.shapes = [(b, q) for b in pitches for q in queries if b % q == 0]
+        # Wide rows run verify steps only (SpecializedDecode.plan): q > 1.
+        self.shapes = [(b, q) for b in pitches for q in queries if q > 1 and b % q == 0]
         # The FP8 query's inverse per-tensor scale and the KV row's scale: MlaQuery
         # divides the row by k_scale under DSA, as concat_and_cache_mla (FlashMLA:
         # unused).
@@ -316,6 +359,17 @@ class WideDsa:
             self.kernels[batch, q] = compile_core(
                 *args, fp8=self.fp8, lse_base_e=lse_base_e, cap=cap
             )
+        rows = sorted(b for b, _ in self.shapes)
+        logger.info_once(
+            "Kimi K3.1 WideDsa (DCP %d): rows %s, widened DSA box %d rows, MlaQuery "
+            "tile poll above %d rows (VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS=%d)",
+            self.dcp,
+            " ".join(map(str, rows)),
+            max(box.cap for box in self.boxes.values()),
+            WIDE_MAX_ROWS,
+            wide_max_rows(),
+            scope="global",
+        )
         return self
 
     def indexer_core(self, projected, batch):

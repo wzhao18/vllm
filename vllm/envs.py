@@ -232,6 +232,7 @@ if TYPE_CHECKING:
     VLLM_KIMI_K3_GEMM_AR: bool = True
     VLLM_KIMI_K3_DS_T2P: bool = False
     VLLM_KIMI_K3_DS_LPC: bool = False
+    VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS: int = 96
     VLLM_PACKED_KV_STATE_GROUPS: int = 0
     VLLM_ENABLE_GEMM_RS: bool = False
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
@@ -1798,6 +1799,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # LONG_SPLIT work list; DcpValue folds each request's chunk count. Off by default
     # (correctness hold with DS-T2P, 10-19).
     "VLLM_KIMI_K3_DS_LPC": lambda: bool(int(os.getenv("VLLM_KIMI_K3_DS_LPC", "0"))),
+    # Kimi K3.1 on Rubin under DCP: the most verify rows of a wide step whose DSA
+    # layers run the prepared core WideDsa (dsa.wide) instead of the stock seam
+    # S2-DSA; 65 up to this many (64: none; at most dsa.wide.WIDE_LIMIT). Above 96
+    # rows WideDsa's MlaQuery polls the gathered q mailbox per row tile.
+    "VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS": lambda: int(
+        os.getenv("VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS", "96")
+    ),
     # Block-outermost (packed) KV caches: split every state (Mamba-type) bucket into
     # exactly this many KV cache groups instead of the fewest that fit a block
     # (0: the fewest). The fewest depends on TP, since state pages scale with 1/TP;
@@ -2649,6 +2657,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_DSA_BPRIME_CHECK",
         "VLLM_DSA_BPRIME_MAILBOX",
         "VLLM_DSA_DCP_PREFILL_HIST_MERGE",
+        # Read when the specialized decode builds its providers (CUDA graphs only).
+        "VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS",
     }
 
     from vllm.config.utils import normalize_value

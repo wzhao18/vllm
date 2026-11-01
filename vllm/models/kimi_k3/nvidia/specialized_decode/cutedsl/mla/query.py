@@ -177,9 +177,10 @@ class MlaQuery:
     bytes it wrote into head block ``rank`` of every rank's Lamport q mailbox
     (mla.dcp.DcpBox), then polls its share of the gathered mailbox until no word is
     the sentinel, so the next kernel reads the gathered query. DSA publishes BF16
-    rows into a mailbox of ``q_heads`` (FlashMLA's padding) rows per token. Above 64
-    rows (several tiles per head, more CTAs than one wave) each tile polls only its
-    own tokens, so a resident tile never waits for one that is not yet scheduled.
+    rows into a mailbox of ``q_heads`` (FlashMLA's padding) rows per token.
+    ``tile_poll`` (tiled, above 64 rows: several tiles per head, more CTAs than one
+    wave): each tile polls only its own tokens, so a resident tile never waits for
+    one that is not yet scheduled.
 
     DSA query overlap (dsa.overlap): ``store_qc=False`` leaves the q_c rows to
     QueryNorm and ``gather=False`` leaves the mailbox poll to QueryWait.
@@ -209,6 +210,7 @@ class MlaQuery:
         store_qc: bool = True,
         late: bool = False,
         release: bool = True,
+        tile_poll: bool = False,
     ):
         # ``rope``: GPT-J RoPE of the query and key rope columns at the rows'
         # positions (args then end with positions [B] int64 and the FP32 cos/sin
@@ -292,7 +294,9 @@ class MlaQuery:
             assert self.tokens <= 8 * heads  # (the wide cluster is 8)
             assert self.tokens % 16 == 0  # (16-row MMA tiles)
         self.grid = (self.cluster, heads, (batch + self.tokens - 1) // self.tokens)
-        self.tile_poll = self.wide and batch > 64
+        self.tile_poll = bool(tile_poll) and self.wide and batch > 64
+        # (the gate waits for the batch's last token: the whole-grid poll's)
+        assert not (self.tile_poll and self.gate), "MlaQuery: tile_poll is ungated"
         carveout = 100 if batch > 1 else None
         self.options = dict(cluster=self.cluster, preferred_smem_carveout=carveout)
         self.q_b_cp_async = q_b_cp_async
