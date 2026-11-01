@@ -505,6 +505,15 @@ class DcpxDecode:
         topk = (
             "topk" in self.parts and getattr(indexer, "candidate_blocks", None) is None
         )
+        if topk and not _reads_counts(layer.impl):
+            # FlashMLA sparse (fp8_ds_mla) filters the DCP ids in its own
+            # forward_mqa: slots would be read as global ids there.
+            logger.warning_once(
+                "DcpExchange top-k: %s converts the DCP top-k itself; its layers "
+                "keep the stock top-k",
+                type(layer.impl).__name__,
+            )
+            topk = False
         if topk:
             self.layers[prefix] = layer
             self.indexers[prefix] = indexer
@@ -559,6 +568,16 @@ class DcpxDecode:
         self.ex.set_spin_timeout(self.spin_s)
         limit = f"{self.spin_s:g} s" if self.spin_s > 0 else "none"
         logger.info("DcpExchange peer wait limit: %s", limit)
+
+
+def _reads_counts(impl) -> bool:
+    """Whether the sparse MLA impl's decode reads ``dcp_local_topk_counts`` (the
+    shared ``SparseMLACommonImpl.forward_mqa``)."""
+    from vllm.model_executor.layers.attention.sparse_mla_attention import (
+        SparseMLACommonImpl,
+    )
+
+    return type(impl).forward_mqa is SparseMLACommonImpl.forward_mqa
 
 
 def build(model, vllm_config) -> DcpxDecode | None:
