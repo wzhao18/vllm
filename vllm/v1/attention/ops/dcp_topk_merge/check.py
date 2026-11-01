@@ -350,3 +350,54 @@ def check_dcp_topk_merge(
     state.record(
         state.layer_id(layer_name), rows, saturated_ranks(sat_word[: merged.shape[0]])
     )
+
+
+def exchange_slot_ids(
+    slots: torch.Tensor,
+    counts: torch.Tensor,
+    block_table: torch.Tensor,
+    req_of_row: torch.Tensor,
+    block_size: int,
+    block_stride: int,
+    row_ends: torch.Tensor,
+    rank: int,
+    world_size: int,
+) -> torch.Tensor:
+    """A top-k given as this rank's KV slots (Kimi K3.1 DcpExchange: ``slots``
+    [T, K], the first ``counts`` [T] of a row valid, slot = block_table[req,
+    pos // block_size] * block_stride + pos % block_size) back as global ids
+    (interleave 1: ``pos * W + rank``). Returns int32 [T, K + 1]: the ids, -1
+    padded, and a last column set on rows with a slot that maps to no position
+    of the row below ``row_ends`` (``merge_exchange_ids`` then fails the row).
+    No host syncs."""
+    num_rows, topk = slots.shape
+    device = slots.device
+    taken = torch.arange(topk, device=device)[None, :] < counts[:num_rows, None]
+    sel = slots.long()
+    block = torch.div(sel, block_stride, rounding_mode="floor")
+    offset = sel - block * block_stride
+    ends = row_ends[:num_rows].long()[:, None]
+    table = block_table[req_of_row[:num_rows].long()].long()
+    first = torch.arange(table.shape[1], device=device)[None, :] * block_size
+    # A row's blocks in use, sorted: the table's tail may hold stale ids.
+    keys = torch.where(first < ends, table, torch.iinfo(torch.int64).max)
+    keys, order = torch.sort(keys, dim=1)
+    at = torch.searchsorted(keys, block.contiguous()).clamp_(max=keys.shape[1] - 1)
+    local = torch.gather(order, 1, at) * block_size + offset
+    ok = (torch.gather(keys, 1, at) == block) & (offset < block_size) & (local < ends)
+    ids = torch.where(taken & ok, local * world_size + rank, -1)
+    bad = (taken & ~ok).any(1, keepdim=True)
+    return torch.cat([ids, bad.long()], 1).int()
+
+
+def merge_exchange_ids(every: torch.Tensor) -> torch.Tensor:
+    """Every rank's ``exchange_slot_ids`` ([W, T, K + 1]) as the merged global ids
+    [T, K] for ``compare_dcp_topk_merge`` (the same on every rank). A row with a
+    flagged slot or more than K ids in all comes out empty, so the comparison
+    counts it as missed."""
+    world_size, num_rows, width = every.shape
+    topk = width - 1
+    ids = every[..., :topk].permute(1, 0, 2).reshape(num_rows, world_size * topk)
+    ids = torch.sort(ids, dim=1, descending=True).values
+    broken = (every[..., topk] > 0).any(0) | (ids[:, topk:] >= 0).any(1)
+    return torch.where(broken[:, None], -1, ids[:, :topk])

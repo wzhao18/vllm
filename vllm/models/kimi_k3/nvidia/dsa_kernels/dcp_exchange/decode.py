@@ -217,6 +217,21 @@ class DcpxDecode:
         self.offsets = torch.arange(64, dtype=torch.int32, device=device)
         self.heads, self.hpr = heads, heads // self.W
         self.layers: dict[str, Any] = {}  # indexer prefix -> MLA layer
+        self.indexers: dict[str, Any] = {}  # indexer prefix -> indexer
+        # VLLM_DSA_BPRIME_CHECK (interleave 1): every exchanged top-k also against
+        # the generic merge of the same logits, as the one-round DCP merge's.
+        from vllm.v1.attention.ops.dcp_topk_merge.check import (
+            dcp_topk_merge_check_enabled,
+        )
+
+        self.check_sat = None
+        checked = "topk" in self.parts and self.interleave == 1
+        if checked and dcp_topk_merge_check_enabled():
+            self.check_sat = torch.zeros(self.cap, dtype=torch.int32, device=device)
+            logger.warning_once(
+                "DSA DCP top-k merge check: the DcpExchange top-k is checked too "
+                "(its slots as global ids through the MLA block table)"
+            )
         logger.info(
             "Kimi K3.1 DSA decode: DcpExchange on (DCP%d, interleave %d, rows <= %d, "
             "parts %s)",
@@ -350,12 +365,61 @@ class DcpxDecode:
             tie_order=self.tie_order,
             small_ctx=self.small_ctx,
         )
+        if self.check_sat is not None:
+            self.check_topk(prefix, logits, decode, out, rows, md, stride)
         if self.verify and not torch.cuda.is_current_stream_capturing():
             from .verify import verify_topk
 
             verify_topk(self, logits, local, glob, out, rows, md, stride, max_local)
             self.flush_verify()
         return True
+
+    def check_topk(self, prefix, logits, decode, out, rows, md, stride) -> None:
+        """VLLM_DSA_BPRIME_CHECK: this step's exchanged slots as global ids against
+        the generic merge of the same logits (dcp_topk_merge.check: collective, no
+        host syncs, so captured graphs keep it)."""
+        from vllm.distributed import get_dcp_group
+        from vllm.forward_context import get_forward_context
+        from vllm.model_executor.layers.sparse_attn_indexer import (
+            _check_dcp_decode_topk_merge,
+        )
+        from vllm.v1.attention.ops.dcp_topk_merge.check import (
+            exchange_slot_ids,
+            merge_exchange_ids,
+        )
+
+        indexer = self.indexers[prefix]
+        local = decode.seq_lens.reshape(-1)[:rows]
+        mine = exchange_slot_ids(
+            out[:rows, : self.K],
+            self.counts[:rows],
+            md.block_table,
+            md.req_id_per_token[:rows],
+            md.block_size,
+            stride,
+            local,
+            self.rank,
+            self.W,
+        )
+        every = get_dcp_group().all_gather(mine, dim=0).view(self.W, *mine.shape)
+        reqs = decode.decode_lens.shape[0]
+        _check_dcp_decode_topk_merge(
+            prefix,
+            logits,
+            local,
+            decode.seq_lens[:reqs],
+            rows // reqs,
+            merge_exchange_ids(every),
+            0,
+            indexer.topk_backend,
+            indexer.topk_backend != "deep_select",
+            get_forward_context().attn_metadata[prefix].max_seq_len,
+            indexer.max_model_len,
+            self.rank,
+            self.W,
+            16,  # bf16 logits
+            sat_word=self.check_sat[:rows],
+        )
 
     def launch_params(self, rows: int, max_local: int) -> tuple[int, int]:
         """(CTAs per row, shared-memory keys per CTA or 0) of a top-k launch."""
@@ -443,6 +507,7 @@ class DcpxDecode:
         )
         if topk:
             self.layers[prefix] = layer
+            self.indexers[prefix] = indexer
             op.DCP_DECODE_TOPK_HOOKS[prefix] = (
                 lambda rows, p=prefix: self.topk_active(p, rows),
                 lambda logits, decode, out, p=prefix: self.decode_topk(

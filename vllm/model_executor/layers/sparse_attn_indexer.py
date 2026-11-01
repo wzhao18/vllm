@@ -157,11 +157,13 @@ def _check_dcp_decode_topk_merge(
     dcp_rank: int,
     dcp_world_size: int,
     score_bits: int,
+    sat_word: torch.Tensor | None = None,
 ) -> None:
     """VLLM_DSA_BPRIME_CHECK: the generic merge of the same decode logits next
     to the one-round merge's ``merged`` ids, compared on the device
-    (vllm.v1.attention.ops.dcp_topk_merge.check). Collective over the DCP
-    group."""
+    (vllm.v1.attention.ops.dcp_topk_merge.check). ``sat_word``: the merge's
+    saturation words per row (default: its rescue workspace's). Collective over
+    the DCP group."""
     from vllm.v1.attention.ops.dcp_topk_merge.check import check_dcp_topk_merge
     from vllm.v1.attention.ops.dcp_topk_merge.kernels import (
         get_dcp_topk_rescue_workspace,
@@ -185,15 +187,17 @@ def _check_dcp_decode_topk_merge(
         score_bits=score_bits,
         num_positions=max_model_len,
     )
-    workspace = get_dcp_topk_rescue_workspace(topk_tokens, dcp_local_topk)
-    assert workspace is not None
+    if sat_word is None:
+        workspace = get_dcp_topk_rescue_workspace(topk_tokens, dcp_local_topk)
+        assert workspace is not None
+        sat_word = workspace.sat_word
     check_dcp_topk_merge(
         layer_name,
         logits[:, : cdiv(max_model_len, dcp_world_size)],
         row_ends,
         merged,
         reference,
-        workspace.sat_word,
+        sat_word,
         dcp_rank,
         dcp_world_size,
     )

@@ -2030,3 +2030,55 @@ def test_dcp_topk_merge_check_records_misses(monkeypatch):
     ]
     assert snap["misses"][-1] == ("layers.1.indexer", 2, 4, 0, 1)
     state.log(final=True)
+
+
+@pytest.mark.parametrize("world", [1, 4])
+def test_dcp_topk_merge_check_maps_exchange_slots_to_global_ids(world: int):
+    """VLLM_DSA_BPRIME_CHECK on Kimi K3.1's DcpExchange, whose top-k comes as each
+    rank's KV slots: through the block table (block stride above the block size,
+    stale tail entries) they map back to the selected global ids, the same on
+    every rank. A slot past its row's end or in a block of no position of the row
+    fails that row only."""
+    from vllm.v1.attention.ops.dcp_topk_merge.check import (
+        exchange_slot_ids,
+        merge_exchange_ids,
+    )
+
+    gen = torch.Generator().manual_seed(0)
+    topk, block, stride = 16, 4, 6
+    lengths = [40, 7, 64]  # global context per row (one request per row)
+    rows = len(lengths)
+    req_of_row = torch.arange(rows, dtype=torch.int32)
+    expected = torch.full((rows, topk), -1, dtype=torch.int32)
+    picks = []
+    for row, length in enumerate(lengths):
+        pick = torch.randperm(length, generator=gen)[:topk]
+        picks.append(pick)
+        expected[row, : pick.numel()] = pick.sort(descending=True).values.int()
+    nblk = -(-max(lengths) // world // block) + 2
+    every: list[torch.Tensor] = []
+    for rank in range(world):
+        ends = torch.tensor([max(0, -(-(n - rank) // world)) for n in lengths])
+        table = torch.randperm(rows * nblk, generator=gen).view(rows, nblk).int()
+        table[:, -1] = table[:, 0]  # a stale tail entry repeating a block in use
+        slots = torch.full((rows, topk), -1, dtype=torch.int32)
+        counts = torch.zeros(rows, dtype=torch.int32)
+        for row, pick in enumerate(picks):
+            pos = pick[pick % world == rank] // world
+            slots[row, : pos.numel()] = table[row, pos // block] * stride + pos % block
+            counts[row] = pos.numel()
+        if counts[1] and not any(m[1, -1] for m in every):
+            end = int(ends[1])  # past the row's end, in a block in use
+            assert end % block
+            slots[1, 0] = table[1, end // block] * stride + end % block
+        if counts[2] and not any(m[2, -1] for m in every):
+            used = table[2, : -(-int(ends[2]) // block)].tolist()
+            # Not one of row 2's blocks in use, but sorted among them.
+            foreign = min(set(range(max(used))) - set(used))
+            slots[2, 0] = foreign * stride
+        args = (slots, counts, table, req_of_row, block, stride, ends.int())
+        every.append(exchange_slot_ids(*args, rank, world))
+    merged = merge_exchange_ids(torch.stack(every))
+    assert merged.dtype == torch.int32
+    torch.testing.assert_close(merged[0], expected[0])
+    assert (merged[1:] == -1).all()
