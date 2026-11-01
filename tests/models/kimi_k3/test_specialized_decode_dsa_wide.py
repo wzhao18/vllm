@@ -597,3 +597,176 @@ def test_flashinfer_dcp_core_merges_to_full_attention(
         probs = torch.softmax(qf[t] @ keys.T * impl.scale, dim=-1)
         ref = probs @ keys[:, :512]
         torch.testing.assert_close(merged[t], ref, atol=3e-2, rtol=3e-2)
+
+
+# Rubin DCP16's per-rank geometry on one node's 4 GPUs: 6 heads per rank (TP16), the
+# FP8 q mailbox padded to 128 heads (trtllm-gen), the widened box of DL3's widest step.
+WIDE_HEADS, WIDE_Q_HEADS, WIDE_CAP = 6, 128, 512
+WIDE_GATE = WIDE_HEADS * V
+WIDE_PITCH = 2112 + WIDE_GATE + INDEX_DIM + INDEX_HEADS
+# (rows, q): DL7 (q8, 32 requests at most) and DL3 (q4, 128) wide rows, one at 96 on
+# the whole-grid poll, the others above it on the tile poll.
+WIDE_MAILBOX_CASES = [(96, 8), (104, 8), (184, 8), (256, 8), (128, 4), (256, 4)]
+WIDE_MAILBOX_CASES += [(512, 4)]
+
+
+def wide_layer_inputs(batch, seed):
+    """Random packed projection rows, layer weights (W_UV outputs of unit scale) and
+    per-tensor FP8 caches of one DSA layer at 6 heads per rank."""
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    bf, dev = torch.bfloat16, "cuda"
+
+    def randn(*shape, scale=1.0):
+        return (torch.randn(*shape, generator=gen, device=dev) * scale).to(bf)
+
+    weights = (
+        (torch.rand(1536, generator=gen, device=dev) + 0.5).to(bf),
+        (torch.rand(512, generator=gen, device=dev) + 0.5).to(bf),
+        randn(WIDE_HEADS * 192, 1536, scale=1 / 40),
+        randn(WIDE_HEADS, 128, 512, scale=1 / 12),
+        randn(WIDE_HEADS, 128, 512, scale=1 / 16).transpose(1, 2),
+    )
+    blocks = -(-(batch + 1) // UNIT) + 1
+    mla = packed_cache(blocks, UNIT, FP8_ROW)
+    index = packed_cache(blocks, UNIT, INDEX_ROW)
+    slots = torch.randperm(blocks * UNIT, generator=gen, device=dev)[:batch]
+    slots[1::7] = -1  # padded rows (or other ranks' tokens) write nothing
+    return randn(batch, WIDE_PITCH), weights, mla, index, slots
+
+
+def _wide_mailbox_case(box, size, rank, batch, q):
+    """One (rows, q) case on this DCP rank: MlaQuery publishes this rank's query
+    heads into every rank's q mailbox, then DcpValue merges every rank's partial rows
+    of this rank's heads, checked against the all-gathered tensors."""
+    import cutlass
+    import torch.distributed as dist
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
+        layout,
+        stream,
+        to_cute,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa import wide
+
+    dev, bf = box.q.device, torch.bfloat16
+    heads, q_heads = WIDE_HEADS, WIDE_Q_HEADS
+    unit = torch.ones(1, device=dev, dtype=torch.float32)
+    sms = torch.cuda.get_device_properties(dev).multi_processor_count
+    parity, s = 0, stream(dev)
+    mailbox, mc = to_cute(box.q[parity]), box.mc(parity)
+    ids = cutlass.Int32(parity), cutlass.Int32(rank)
+    projected, weights, mla, index, slots = wide_layer_inputs(batch, 100 + rank)
+    assert weights[4].stride() == (128 * 512, 1, 512)
+    specs = tuple(layout(w) for w in (*weights, mla, index))
+
+    def kernels(rows):
+        args = (rows, heads, WIDE_PITCH, specs, rank, q, size, q_heads, sms)
+        return wide.compile_core(*args, fp8=True, cap=box.cap)
+
+    # The query: every rank's box holds every rank's query rows (bit-identical).
+    mq, _, value = kernels(batch)
+    query = torch.zeros(batch, heads, 576, device=dev, dtype=torch.uint8)
+    q_c = torch.zeros(batch, 1536, device=dev, dtype=bf)
+    args = (to_cute(projected), *(to_cute(w) for w in weights[:4]), to_cute(mla))
+    args += (to_cute(slots, 8), to_cute(unit, 4), to_cute(unit, 4))
+    args += (cutlass.Float32(EPS), to_cute(query), to_cute(q_c))
+    mq(*args, mailbox, mc, ids[1], s)
+    queries = [torch.empty_like(query) for _ in range(size)]
+    dist.all_gather(queries, query)
+    gathered = box.q[parity, :batch]
+    assert torch.equal(gathered[:, : size * heads], torch.cat(queries, 1))
+    assert (gathered[:, size * heads :] == 0).all()
+
+    # The value: partial rows / LSEs of every rank's heads over the local shard.
+    gen = torch.Generator(device=dev).manual_seed(rank)
+    reqs = batch // q
+    rows = torch.randn(batch, q_heads, 512, generator=gen, device=dev).to(bf)
+    lse = torch.randn(batch, q_heads, generator=gen, device=dev) * 3
+    lse[torch.rand(batch, q_heads, generator=gen, device=dev) < 0.05] = float("-inf")
+    lens = torch.randint(0, 4, (reqs,), generator=gen, device=dev).int()
+    shared = torch.Generator(device=dev).manual_seed(7)  # the same on every rank
+    totals = torch.randint(0, 3, (reqs,), generator=shared, device=dev).int()
+    w_uv = weights[4]
+
+    def merged(kernel, start, n):
+        out = torch.zeros(n, WIDE_GATE, device=dev, dtype=bf)
+        gh = size * heads
+        view = rows[start : start + n].as_strided(
+            (n, 1, gh, 512), (q_heads * 512, 0, 512, 1)
+        )
+        lse_view = lse[start : start + n].as_strided((n, 1, gh), (q_heads, 0, 1))
+        r0, r1 = start // q, (start + n) // q
+        v_args = (to_cute(view), to_cute(lse_view, 4), to_cute(lens[r0:r1], 4))
+        v_args += (to_cute(box.partial[parity]), to_cute(box.lse[parity], 4))
+        v_args += (to_cute(box.peers, 8), to_cute(box.lse_peers, 8), mailbox)
+        gate = to_cute(projected[start : start + n, 2112 : 2112 + WIDE_GATE])
+        v_args += (to_cute(w_uv), gate, to_cute(totals[r0:r1], 4), to_cute(out))
+        kernel(*v_args, *ids, s)
+        torch.accelerator.synchronize()
+        dist.barrier()
+        return out
+
+    out = merged(value, 0, batch)
+    assert (box.q[parity, :batch, : size * heads].view(torch.int32) == -1).all()
+
+    everything = [torch.empty_like(t) for t in (rows, lse, lens) for _ in range(size)]
+    for i, t in enumerate((rows, lse, lens)):
+        dist.all_gather(everything[i * size : (i + 1) * size], t)
+    mine = slice(rank * heads, (rank + 1) * heads)
+    all_rows = torch.stack(everything[:size])[:, :, mine]
+    all_lse = torch.stack(everything[size : 2 * size])[:, :, mine]
+    all_lens = torch.stack(everything[2 * size :]).repeat_interleave(q, 1)
+    live = (all_lens > 0).unsqueeze(-1) & torch.isfinite(all_lse)
+    lse2 = all_lse * 1.4426950408889634  # FlashInfer's base-e LSE in base 2
+    lse2 = torch.where(live, lse2, torch.full_like(all_lse, -3.0e38))
+    weight = torch.exp2(lse2 - lse2.amax(0))
+    weight = torch.where(live, weight, torch.zeros_like(weight))
+    weight = weight / weight.sum(0).clamp_min(1e-30)
+    latent = (weight.unsqueeze(-1) * all_rows.float()).sum(0).to(bf)
+    value_ref = torch.einsum("bhk,hkv->bhv", latent.float(), w_uv.float()).to(bf)
+    gate = projected[:, 2112 : 2112 + WIDE_GATE].float().view(batch, heads, 128)
+    ref = (value_ref.float() * torch.sigmoid(gate)).reshape(batch, WIDE_GATE)
+    ref[(totals.repeat_interleave(q) == 0)] = 0
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+
+    # Every row as narrower kernels compute it, bit for bit.
+    rows_n = next(n for n in (64, 32, 16, 8, q) if batch % n == 0 and n % q == 0)
+    _, _, chunk_value = kernels(rows_n)
+    chunks = [merged(chunk_value, b, rows_n) for b in range(0, batch, rows_n)]
+    assert torch.equal(out, torch.cat(chunks))
+
+
+def _wide_mailbox_worker(rank, size, port, cases):
+    """One DCP rank of WideDsa's DCP kernels over every (rows, q) case."""
+    import torch.distributed as dist
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.mla.dcp import DcpBox
+
+    torch.accelerator.set_device_index(rank)
+    dev = torch.device("cuda", rank)
+    dist.init_process_group(
+        "nccl",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=size,
+        device_id=dev,
+    )
+    group = dist.group.WORLD
+    box = DcpBox(group, dev, size, rank, WIDE_HEADS, cap=WIDE_CAP, q_heads=WIDE_Q_HEADS)
+    for batch, q in cases:
+        _wide_mailbox_case(box, size, rank, batch, q)
+    dist.destroy_process_group()
+
+
+@pytest.mark.skipif(torch.accelerator.device_count() < 4, reason="needs 4 GPUs")
+def test_wide_dcp_mailboxes():
+    """DCP4 over one node's NVLink multicast at the wide rows of DL7 / DL3 (up to
+    512), with WideDsa's per-rank geometry (6 heads, 128-head FP8 q mailbox, a
+    512-row box): the gathered q mailbox, DcpValue's LSE merge, W_UV and gate, and
+    the q mailbox re-armed for the next layer."""
+    import torch.multiprocessing as mp
+
+    from vllm.utils.network_utils import get_open_port
+
+    args = (4, get_open_port(), WIDE_MAILBOX_CASES)
+    mp.spawn(_wide_mailbox_worker, args=args, nprocs=4)
