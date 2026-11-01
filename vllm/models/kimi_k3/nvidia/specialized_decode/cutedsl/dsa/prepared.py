@@ -192,6 +192,15 @@ def kv_cache_blocks():
     return -(-blocks * cache.block_size // INDEX_PAGE)
 
 
+def exchanged(impl, topk, batch):
+    """(slots, counts) when the stock op's DcpExchange hook (dsa_kernels.dcp_exchange,
+    the predicate the indexer and the MLA impl share) served this step: ``topk``
+    then holds this rank's KV slots, not global ids. None: global ids to filter."""
+    counts = getattr(impl, "dcp_local_topk_counts", None)
+    valid = counts(batch) if counts is not None else None
+    return None if valid is None else (topk[:batch], valid)
+
+
 class PreparedDsa:
     """One K3.1 DSA layer. ``attention``: the KimiK3DSAAttention; ``pitches``: the
     packed projection pitch per batch; ``queries``: the query lengths q (1 + the
@@ -260,7 +269,7 @@ class PreparedDsa:
         self.query_stage = QueryStage(attention, pitches, shared, self.fp8, self.nvfp4)
         # Under DCP on FlashInfer: the #63 merge's owned-row outputs (indexer_stage).
         merge_rows = max(pitches) if self.dcp > 1 and self.fp8 else 0
-        self.indexer_stage = IndexerStage(self.indexer, merge_rows)
+        self.indexer_stage = IndexerStage(self.indexer, merge_rows, self.impl)
         self.shapes = [(b, q) for b in pitches for q in queries if b % q == 0]
         self.fi = None
         sms = torch.cuda.get_device_properties(self.device).multi_processor_count
@@ -557,6 +566,8 @@ class PreparedDsa:
             if merged is None:
                 if topk is None:
                     topk = self.indexer_core(projected, batch)
+                merged = exchanged(self.impl, topk, batch)
+            if merged is None:
                 interleave = indexer.cp_kv_cache_interleave_size
                 args = topk, md, batch, stride_rows, interleave
                 merged = self.fi.convert(*args)
@@ -567,7 +578,7 @@ class PreparedDsa:
         if topk is None:
             topk = self.indexer_core(projected, batch)
         pages, stride_rows = _fp8_kv_pages(cache, md.block_size)
-        slots, valid = local_slots(
+        slots, valid = exchanged(self.impl, topk, batch) or local_slots(
             md,
             topk[:batch],
             self.dcp,

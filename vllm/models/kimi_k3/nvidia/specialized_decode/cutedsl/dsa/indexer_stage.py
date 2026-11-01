@@ -11,7 +11,12 @@ and the local-slot filter: it scores the rows (DeepGEMM paged MQA logits, bf16)
 and merges them straight into this rank's compacted physical KV rows and counts.
 With the fused DCP indexer (``fused``, indexer.py) the scoring is its scorer (the
 same logits layout) and, packed, its select also takes the local top-N (the
-merge's B' rows), so the merge only all-gathers and selects."""
+merge's B' rows), so the merge only all-gathers and selects.
+
+With Wei's DcpExchange on (``VLLM_K31_DCP_EXCHANGE``, dsa_kernels.dcp_exchange),
+``merge_rows`` gives the steps it admits to its exact top-k instead: the same
+DeepGEMM logits, its KV slots and counts in place of the merge's (no DeepSelect,
+pack or all-gather). The merge stays built for the steps it declines."""
 
 from functools import cache
 
@@ -24,10 +29,12 @@ from .index import DIM
 
 class IndexerStage:
     """``indexer``: the layer's KimiK3DSAIndexer; ``rows``: the most decode rows
-    of a step (sizes the DCP merge's outputs; 0: no direct DCP merge)."""
+    of a step (sizes the DCP merge's outputs; 0: no direct DCP merge); ``impl``:
+    the MLA layer's, whose ``dcp_local_topk_counts`` DcpExchange sets."""
 
-    def __init__(self, indexer, rows=0):
+    def __init__(self, indexer, rows=0, impl=None):
         self.indexer = indexer
+        self.impl = impl
         self.k_cache_name = _encode_layer_name(indexer.k_cache.prefix)
         self.max_model_len = indexer.max_model_len
         self.max_total = indexer.max_total_seq_len
@@ -110,11 +117,7 @@ class IndexerStage:
             is_deep_select_supported,
         )
         from vllm.model_executor.layers.sparse_attn_indexer import (
-            kv_cache_as_quant_view,
-        )
-        from vllm.utils.deep_gemm import (
-            fp8_fp4_paged_mqa_logits,
-            mqa_logits_mx_inputs,
+            DCP_DECODE_TOPK_HOOKS,
         )
         from vllm.utils.math_utils import cdiv
         from vllm.v1.attention.ops.dcp_topk_merge import dcp_topk_merge_fits
@@ -132,8 +135,14 @@ class IndexerStage:
             or not 0 < rows <= batch
             or decode.requires_padding
             or rows % decode.decode_lens.shape[0]
-            or indexer.cp_kv_cache_interleave_size != 1
-            or not dcp_topk_merge_fits(rows, self.topk, n)
+        ):
+            return None
+        # DcpExchange decides from the step metadata alone (every rank alike).
+        hook = DCP_DECODE_TOPK_HOOKS.get(indexer.k_cache.prefix)
+        if hook is not None and self.impl is not None and hook[0](rows):
+            return self.exchange_rows(hook[1], q_fp8, head_w, decode, rows, batch)
+        if indexer.cp_kv_cache_interleave_size != 1 or not dcp_topk_merge_fits(
+            rows, self.topk, n
         ):
             return None
         slots, valid = self.dcp_rows[:batch], self.dcp_valid[:batch]
@@ -169,26 +178,12 @@ class IndexerStage:
                 slots[rows:].fill_(-1)
                 valid[rows:].zero_()
             return slots, valid
-        # As the stock op's decode branch (uniform rows, FP8 cache and query).
-        reqs = decode.decode_lens.shape[0]
-        next_n = rows // reqs
-        query = q_fp8[:rows].view(torch.float8_e4m3fn)
-        query = query.view(reqs, next_n, *query.shape[1:])
-        q_scale, weights = mqa_logits_mx_inputs(query, None, head_w[:rows])
-        seq_lens = decode.seq_lens[:reqs]
-        logits = fp8_fp4_paged_mqa_logits(
-            (query, q_scale),
-            kv_cache_as_quant_view(indexer.k_cache.kv_cache, DIM, False),
-            weights,
-            seq_lens,
-            decode.block_table,
-            decode.schedule_metadata,
-            max_model_len=self.max_model_len,
-            indices=decode.indices,
-        )
+        logits = self.decode_logits(q_fp8, head_w, decode, rows)
         # SM100 DeepGEMM emits bf16 at a 1 KiB row stride (DeepSelect's input).
         assert logits.dtype == torch.bfloat16 and is_deep_select_supported(logits, n)
-        row_ends = SparseIndexerTopk._row_ends(seq_lens, next_n, rows)
+        reqs = decode.decode_lens.shape[0]
+        seq_lens = decode.seq_lens[:reqs]
+        row_ends = SparseIndexerTopk._row_ends(seq_lens, rows // reqs, rows)
         dcp_topk_merge_rows(
             logits=logits,
             row_ends=row_ends,
@@ -199,6 +194,48 @@ class IndexerStage:
         if rows < batch:  # rows past the requests attend nothing
             slots[rows:].fill_(-1)
             valid[rows:].zero_()
+        return slots, valid
+
+    def decode_logits(self, q_fp8, head_w, decode, rows):
+        """The bf16 paged MQA logits of the first ``rows`` rows, as the stock op's
+        decode branch computes them (uniform rows, FP8 cache and query)."""
+        from vllm.model_executor.layers.sparse_attn_indexer import (
+            kv_cache_as_quant_view,
+        )
+        from vllm.utils.deep_gemm import (
+            fp8_fp4_paged_mqa_logits,
+            mqa_logits_mx_inputs,
+        )
+
+        reqs = decode.decode_lens.shape[0]
+        query = q_fp8[:rows].view(torch.float8_e4m3fn)
+        query = query.view(reqs, rows // reqs, *query.shape[1:])
+        q_scale, weights = mqa_logits_mx_inputs(query, None, head_w[:rows])
+        return fp8_fp4_paged_mqa_logits(
+            (query, q_scale),
+            kv_cache_as_quant_view(self.indexer.k_cache.kv_cache, DIM, False),
+            weights,
+            decode.seq_lens[:reqs],
+            decode.block_table,
+            decode.schedule_metadata,
+            max_model_len=self.max_model_len,
+            indices=decode.indices,
+        )
+
+    def exchange_rows(self, run, q_fp8, head_w, decode, rows, batch):
+        """``merge_rows`` of a DcpExchange step: ``run`` (its indexer hook) writes
+        this rank's KV slots of the exact global top-k of the same logits and the
+        MLA impl's ``dcp_local_topk_counts`` gives their counts."""
+        slots, valid = self.dcp_rows[:batch], self.dcp_valid[:batch]
+        logits = self.decode_logits(q_fp8, head_w, decode, rows)
+        run(logits, decode, slots[:rows])
+        counts = self.impl.dcp_local_topk_counts(rows)
+        assert counts is not None, "DcpExchange admitted a step it did not serve"
+        if rows == batch:
+            return slots, counts
+        valid[:rows].copy_(counts)
+        slots[rows:].fill_(-1)  # rows past the requests attend nothing
+        valid[rows:].zero_()
         return slots, valid
 
     def check(self, logits, row_ends, index_md, ids):

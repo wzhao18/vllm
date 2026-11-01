@@ -1190,6 +1190,7 @@ def test_flashinfer_dcp_core_merges_to_full_attention(
         fi = FlashInferCore(impl, layer, 128, buffers, {rows_n: kernel}, dcp, rank)
         core = SimpleNamespace(
             fi=fi,
+            impl=impl,
             indexer=SimpleNamespace(cp_kv_cache_interleave_size=1),
             parity=0,
             box=SimpleNamespace(q=box),
