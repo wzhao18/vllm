@@ -121,3 +121,33 @@ def test_experts_kernel_rows_beside_rubin_rows_one_scratch_bitwise(
         seen[rows] += 1
         bad = (got[k].view(torch.int16) != ref.view(torch.int16)).any(1).sum()
         assert bad.item() == 0, (k, rows, bad.item())
+
+
+@pytest.mark.parametrize("q", [4, 8])
+def test_decode_prepare_loop_one_scratch(layer, q, monkeypatch):
+    """``SpecializedDecode`` prepares every tuned row count (``BATCHES``) of a verify
+    instance on one ``PersistentExperts`` and one ``scratch`` (``moe.prepared``):
+    ``ExpertsKernel`` rows take their own workspace, the Rubin kernels the shared
+    one."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe import (
+        experts_runtime as er,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.providers import (
+        BATCHES,
+    )
+
+    weights, dev = layer
+    experts = er.PersistentExperts(*weights, q=q)
+    buffers = er.scratch(16, dev)
+    shared = buffers["workspace"].data_ptr()
+    monkeypatch.setattr(er, "tensor", lambda t: t)  # prepared[b][2]: the torch view
+    for b in BATCHES:
+        out = torch.empty(b * 16, 3584, dtype=torch.bfloat16, device=dev)
+        experts.prepare(b, buffers, out, (), planned=True)
+    assert experts.fast_rubin and 8 in experts.rubin
+    kernel = buffers["kernel_workspace"].data_ptr()
+    assert kernel != shared
+    for b in BATCHES:
+        on_kernel = b not in experts.rubin and not experts.grouped64(b)
+        ws = experts.prepared[b][2]
+        assert ws.data_ptr() == (kernel if on_kernel else shared), b
