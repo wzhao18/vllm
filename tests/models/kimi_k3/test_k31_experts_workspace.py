@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Routed experts on one scratch, as one decode instance serving changing batch sizes:
-``ExpertsKernel`` rows (B1-7, e.g. one q4 request) and the fast-exchange
-``RubinExpertsKernel`` (M8, two q4 requests) must not read each other's stale hidden
-images (``PersistentExperts.kernel_workspace``). Adapted from Wei Zhao's
+``ExpertsKernel`` rows (B1-7, e.g. one q4 request) must not read stale hidden images
+left by the fast-exchange ``RubinExpertsKernel`` (M8, two q4 requests) or
+``RubinGroupedExpertsKernel`` (M12-M64), nor leave stale images to the fast-exchange
+M8 (``PersistentExperts.kernel_workspace``). Adapted from Wei Zhao's
 test_k31_experts_rubin.py mixed-batch tests (44b752867f) for a tree without
 ``RUBIN_ROWS``.
 
@@ -84,8 +85,12 @@ def calls(weights, dev, q, sequence, inputs):
     return results
 
 
-@pytest.mark.parametrize("others", [(4,), (2, 6), (4, 16, 64)])
-def test_experts_kernel_rows_and_fast_rubin_one_scratch_bitwise(layer, others):
+@pytest.mark.parametrize(
+    "anchor, others", [(8, (4,)), (8, (2, 6)), (8, (4, 16, 64)), (4, (12, 16))]
+)
+def test_experts_kernel_rows_beside_rubin_rows_one_scratch_bitwise(
+    layer, anchor, others
+):
     weights, dev = layer
     torch.manual_seed(5)
     inputs = {
@@ -97,12 +102,13 @@ def test_experts_kernel_rows_and_fast_rubin_one_scratch_bitwise(layer, others):
             )
             for i in range(3)
         ]
-        for rows in (8, *others)
+        for rows in (anchor, *others)
     }  # fmt: skip
-    sequence = [8, 8]
+    sequence = [anchor, anchor]
     for run in (1, 2, 3, 1):
-        sequence += [others[i % len(others)] for i in range(run)] + [8]
-    sequence += [others[0], 8, others[0], 8, 8, others[-1], others[-1], 8]
+        sequence += [others[i % len(others)] for i in range(run)] + [anchor]
+    sequence += [others[0], anchor, others[0], anchor, anchor]
+    sequence += [others[-1], others[-1], anchor]
     fresh = {
         (rows, i): calls(weights, dev, 4, [rows], {rows: [inputs[rows][i]]})[0]
         for rows in inputs
