@@ -345,6 +345,70 @@ def test_attention_checks_the_dsa_seam_at_startup(monkeypatch, wide, skip_topk):
     assert provider.dsa_columns == (COLUMNS if wide else ())
 
 
+def test_dsa_rows_split_between_two_cores(monkeypatch):
+    """K3.1 at TP16 = DCP16: a DSA layer builds #108's PreparedDsa on the tuned rows
+    (up to 64) and WideDsa on the wide rows DSA_WIDE admits (65-96), on one shared
+    scratch (sized for the widest), DcpBox and parity; ``run_dsa`` runs each step on
+    the core of its rows."""
+    from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
+
+    attention, _ = dsa_layer(fused_insert=True)
+    attention.num_local_heads = HEADS
+    device = SimpleNamespace(multi_processor_count=212)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda index: device)
+    for name in ("PreparedProjection", "SkinnyProjection"):
+        monkeypatch.setattr(providers_module, name, MagicMock())
+    scratch, box = MagicMock(name="scratch"), MagicMock(name="box")
+    monkeypatch.setattr(
+        providers_module, "dsa_scratch", MagicMock(return_value=scratch)
+    )
+    monkeypatch.setattr(providers_module, "dcp_box", MagicMock(return_value=box))
+    monkeypatch.setattr(providers_module, "dsa_on_flashinfer", lambda attention: True)
+    tuned = MagicMock(name="PreparedDsa")
+    monkeypatch.setattr(providers_module, "PreparedDsa", tuned)
+    monkeypatch.setattr(providers_module, "WideDsa", MagicMock(side_effect=Built))
+    wide = (72, 80, 88, 96, 104, 128, 256)
+    runtime = SimpleNamespace(
+        tp=16, dcp=16, q=8, tuned=BATCHES, batches=(*BATCHES, *wide), wide=wide,
+        queries=(1, 8), dsa_core="auto", dsa_layers=0,
+        context=Context(
+            arch="rubin", tp=16, rank=0, dcp=16, sms=212, q=8, max_rows=256,
+            max_context=1 << 20, bf16_state=True,
+        ),
+    )  # fmt: skip
+    provider: Any = object.__new__(Attention)
+    with pytest.raises(Built):  # at WideDsa, after PreparedDsa
+        Attention.__init__(
+            provider, SimpleNamespace(self_attn=attention), runtime, None, None, None
+        )
+    assert provider.dsa_wide == {72, 80, 88, 96}
+    providers_module.dsa_scratch.assert_called_once_with(runtime, 96)
+    policy = dict(queries=(1, 8), core="auto", dcp=box, parity=0)
+    tuned.assert_called_once_with(
+        attention, dict.fromkeys(BATCHES, PITCH), scratch, **policy
+    )
+    providers_module.WideDsa.assert_called_once_with(
+        attention, dict.fromkeys((72, 80, 88, 96), PITCH), scratch, **policy
+    )
+
+    core, core_wide = provider.core, provider.core_wide = MagicMock(), MagicMock()
+    indexer = MagicMock(spec=DeepseekV32IndexerMetadata)
+    indexer.slot_mapping = torch.zeros(96, dtype=torch.long)
+    attention.mla_attn.mla_attn.layer_name = "attn"
+    attention.dsa_indexer.k_cache = SimpleNamespace(prefix="index")
+    context = SimpleNamespace(attn_metadata={"index": indexer})
+    monkeypatch.setattr("vllm.forward_context.get_forward_context", lambda: context)
+    provider.layer = SimpleNamespace(self_attn=attention, layer_idx=3)
+    provider.prefetch = MagicMock()
+    for b, ran, idle in ((72, core_wide, core), (64, core, core_wide)):
+        ran.reset_mock()
+        idle.reset_mock()
+        projected = torch.zeros(b, PITCH)
+        provider.run_dsa(projected, None, [None], None, {"attn": None}, 8)
+        assert ran.run.call_count == 1 and ran.run.call_args.args[0] is projected
+        idle.run.assert_not_called()
+
+
 @pytest.mark.parametrize("prepared", [False, True], ids=["seam", "prepared"])
 @pytest.mark.parametrize("fused_oproj", [True, False], ids=["two-shot", "stock-oproj"])
 def test_run_wide_runs_dsa_layers_through_the_seam(monkeypatch, fused_oproj, prepared):
@@ -371,7 +435,7 @@ def test_run_wide_runs_dsa_layers_through_the_seam(monkeypatch, fused_oproj, pre
     provider.output, provider.post = MagicMock(), MagicMock()
     x, out = torch.zeros(b, HIDDEN), torch.zeros(b, HIDDEN)
     rows = provider.run_wide(x, out, None, None, [], None, {}, 8, None)
-    if prepared:  # PreparedDsa on the widened box (dabb1639b6)
+    if prepared:  # WideDsa on the widened box (dabb1639b6)
         seam.assert_not_called()
         provider.run_dsa.assert_called_once_with(projected, local, [], None, {}, 8)
     else:
@@ -408,7 +472,7 @@ def test_wide_choices_name_the_dsa_seam():
     for b in rows:
         choices = decode.wide_choices(b, 8)
         gemm = "splitk" if b in split_k else "cublas"
-        if b == 72:  # PreparedDsa (DSA_WIDE, dabb1639b6)
+        if b == 72:  # WideDsa (DSA_WIDE, dabb1639b6)
             assert choices["dsa"] == Choice(Path.GENERIC, "wide", "prepared")
         else:
             assert choices["dsa"] == Choice(Path.STOCK, note=f"{gemm} + S2")

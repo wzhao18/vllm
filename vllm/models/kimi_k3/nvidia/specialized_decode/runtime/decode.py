@@ -27,7 +27,7 @@ from ..cutedsl.common.host import dynamic_view, to_cute
 from ..cutedsl.common.host import stream as current_stream
 from ..cutedsl.common.policy import batch_table
 from ..cutedsl.common.twoshot import TwoShot
-from ..cutedsl.dsa.prepared import choose as dsa_choose
+from ..cutedsl.dsa.wide import choose as dsa_choose
 from ..cutedsl.kda.head import KdaSide
 from ..cutedsl.kda.prepared import choose as kda_choose
 from ..cutedsl.kda.prepared import verify_kernel

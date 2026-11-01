@@ -17,7 +17,8 @@ from ..cutedsl.attn_res.prepared import PreparedAttnRes
 from ..cutedsl.common.policy import batch_table
 from ..cutedsl.dsa.index import DIM, HEADS
 from ..cutedsl.dsa.prepared import QUERY_HEADS, PreparedDsa, dsa_on_flashinfer
-from ..cutedsl.dsa.prepared import choose as dsa_choose
+from ..cutedsl.dsa.wide import WideDsa
+from ..cutedsl.dsa.wide import choose as dsa_choose
 from ..cutedsl.gemm.projection import PreparedProjection
 from ..cutedsl.kda.head import PreparedKdaHead, polled_out_batches
 from ..cutedsl.kda.inproj64 import PREPARED_PITCH, PreparedKdaInProj64
@@ -313,9 +314,11 @@ class Attention:
         # A DSA layer's packed projection columns, as seam S2-DSA splits them at the
         # wide batches (``run_wide``); PreparedDsa serves the tuned ones.
         self.dsa_columns: tuple[int, ...] = ()
-        # Wide batches whose DSA layers run PreparedDsa (``dsa.prepared.choose``); the
-        # others run the stock DSA attention (seam S2-DSA, ``run_wide``).
+        # Wide batches whose DSA layers run WideDsa (``dsa.wide.choose``, its own core
+        # ``core_wide``); the others run the stock DSA attention (seam S2-DSA,
+        # ``run_wide``).
         self.dsa_wide: frozenset[int] = frozenset()
+        self.core_wide: Any = None
         if kind == "dsa":
             if runtime.wide:
                 self.dsa_columns = dsa_seam_columns(attention, pitch)
@@ -323,8 +326,8 @@ class Attention:
             self.dsa_wide = frozenset(
                 s.rows for s in shapes if dsa_choose(s, runtime.context)
             )
-            pitches = {b: pitch for b in (*runtime.tuned, *self.dsa_wide)}
-            rows = dsa_scratch(runtime, max(pitches))
+            pitches = {b: pitch for b in runtime.tuned}
+            rows = dsa_scratch(runtime, max((*pitches, *self.dsa_wide)))
             policy = dict(queries=runtime.queries, core=runtime.dsa_core)
             if runtime.dcp > 1:
                 heads = attention.num_local_heads
@@ -339,6 +342,9 @@ class Attention:
                 )
             runtime.dsa_layers += 1
             self.core = PreparedDsa(attention, pitches, rows, **policy)
+            if self.dsa_wide:  # the same scratch, DcpBox and parity
+                wide = {b: pitch for b in self.dsa_wide}
+                self.core_wide = WideDsa(attention, wide, rows, **policy)
         elif kind == "kda":
             tactics = policies
             mode = lambda b: (1 if b == 1 else 2 if b <= 8 else 0) if tp == 8 else 0
@@ -526,7 +532,8 @@ class Attention:
             else:
                 self.head = None
         else:
-            cores = [c for c in (self.core, self.core_long) if c is not None]
+            cores = (self.core, self.core_long, self.core_wide)
+            cores = [c for c in cores if c is not None]
             if self.runtime.mla_layers % 2:  # the re-arm needs alternating parities
                 self.polled_out.clear()
                 for core in cores:
@@ -548,7 +555,8 @@ class Attention:
         ]
         assert isinstance(indexer, DeepseekV32IndexerMetadata)
         index_slots = indexer.slot_mapping
-        self.core.run(
+        core = self.core_wide if projected.shape[0] in self.dsa_wide else self.core
+        core.run(
             projected,
             local,
             cache=caches[0],
@@ -688,7 +696,7 @@ class Attention:
             self.core.run(
                 projected, local, caches=caches, slots=slots, accepted=accepted
             )
-        elif self.kind == "dsa" and b in self.dsa_wide:  # PreparedDsa (widened box)
+        elif self.kind == "dsa" and b in self.dsa_wide:  # WideDsa (widened box)
             self.run_dsa(projected, local, caches, metadata, slot_mapping, q)
         elif self.kind == "dsa":
             self.stock_dsa(attention, x, projected, local, self.dsa_columns)
@@ -799,9 +807,9 @@ def polled_buffers(runtime, heads, sms, tp, parity):
 
 
 def dsa_scratch(runtime, rows=PREPARED_MAX):
-    """The DSA layers' shared rows (``rows``: the largest PreparedDsa batch): the
-    BF16 query (heads past the local ones stay zero), the normalized q_c, the indexer
-    projection, FP8 query and head weights, and the sparse core's latent."""
+    """The DSA layers' shared rows (``rows``: the largest PreparedDsa or WideDsa
+    batch): the BF16 query (heads past the local ones stay zero), the normalized q_c,
+    the indexer projection, FP8 query and head weights, and the sparse core's latent."""
     if "dsa.query" not in runtime.buffers:
         shape = (rows, QUERY_HEADS, 576)
         runtime.buffers["dsa.query"] = torch.zeros(
