@@ -2966,9 +2966,10 @@ def test_prepared_dsa_dcp_sparse_core_exchange(
 
 
 # DcpExchange's top-k feeding WideDsa above 96 rows at DCP16: DL7's C64 band (q8 at
-# 128 and 256 rows, a widened DSA box of 256) and DL3's widest step (q4 at 512 rows,
-# a box of 512: the cap-128 tree's).
-WIDE_EXCHANGE_CASES = [(128, 8), (256, 8), (512, 4)]
+# 128 and 256 rows, a widened DSA box of 256) and DL3's (q4 at 128 and 256 rows, the
+# exchange's one-round top-k, and its widest step at 512 rows; a box of 512: the
+# cap-128 tree's).
+WIDE_EXCHANGE_CASES = [(128, 8), (256, 8), (128, 4), (256, 4), (512, 4)]
 WIDE_EXCHANGE_BOX = {8: 256, 4: 512}
 WIDE_DSA_BOX: dict = {}  # the DSA DcpBox: one per process, as one per model
 
@@ -3242,8 +3243,8 @@ def run_wide_exchange_step(batch, q, world, replays):
 def test_wide_dsa_dcp_exchange(dcp8_group, monkeypatch, batch, q):
     """WideDsa above 96 rows fed by DcpExchange's top-k (VLLM_K31_DCP_EXCHANGE,
     PARTS=topk) at DCP16: C64's combination (q8, VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS 256)
-    and DL3's widest (q4 at 512 rows; run on the cap-128 tree). The indexer op gives
-    the step to the exchange, whose slots and counts WideDsa's sparse decode reads
+    and DL3's (q4 at 128, 256 and 512 rows; run on the cap-128 tree). The indexer op
+    gives the step to the exchange, whose slots and counts WideDsa's sparse decode reads
     (``dcp_local_topk_counts``). The exchanged top-k, as global ids, holds min(K,
     length) keys a row over the ranks (balanced keys: no rank's count twice
     another's), is exact, and is the stock one up to near-ties (every row that
