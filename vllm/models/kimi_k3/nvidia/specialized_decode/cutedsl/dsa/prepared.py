@@ -29,8 +29,8 @@ ids, which are filtered to this rank's slots (on FlashInfer with the #63 merge: 
 this rank's slots directly) for the sparse decode of every rank's gathered heads, and
 DcpValue merges this rank's heads by LSE. On the DSA sparse core's steps the core
 polls the q mailbox itself (no QueryWait), decodes every rank's gathered heads over
-this rank's rows of the merge and pushes the partial rows and LSEs to their owners,
-and DcpValue(pushed) only merges.
+this rank's rows of the merge (or of DcpExchange's top-k) and pushes the partial rows
+and LSEs to their owners, and DcpValue(pushed) only merges.
 
 The packed projection row is [q_a 1536 | kv_a 576 | gate H*128 | wk 128 | wv 32]."""
 
@@ -344,8 +344,9 @@ class PreparedDsa:
         self.uv_gathered = dcp.value_weights(layer.W_UV) if dcp else None
         # The DSA sparse core (dsa_kernels.dsa_core.decode.build, VLLM_K31_DSA_CORE=1)
         # under DCP on FlashInfer with the #63 merge: on the shapes of its variant
-        # table (this DSA layer not skipped), the steps the merge serves run DsaCore
-        # and DcpValue(pushed) instead of QueryWait, FlashInfer's decode and
+        # table (this DSA layer not skipped), the steps merge_rows serves (the #63
+        # merge, or DcpExchange's top-k above the rows it launches with PDL) run
+        # DsaCore and DcpValue(pushed) instead of QueryWait, FlashInfer's decode and
         # DcpValue's push: (batch, q) -> (variant, DcpValue(pushed), spread).
         self.dsac = self.dsac_rows = None
         self.dsa_layer = getattr(self.indexer, "dsac_layer", -1)
@@ -354,7 +355,8 @@ class PreparedDsa:
         if dsac is not None and self.fi is not None and local_topk and self.dcp > 1:
             from ....dsa_kernels.dsa_core.decode import MergeRows
 
-            self.dsac, self.dsac_rows = dsac, MergeRows(self.indexer_stage)
+            self.dsac = dsac
+            self.dsac_rows = MergeRows(self.indexer_stage, dsac.pdl_rows)
         # VLLM_K31_DSA_CORE_STATS=1: each step's largest local count of the merge
         # (dsa_core.decode.CountStats), with the core on or off.
         self.count_stats = None
@@ -483,18 +485,18 @@ class PreparedDsa:
 
     def core_step(self, batch, q):
         """The DSA sparse core's (variant, DcpValue(pushed), spread) of this step, or
-        None: its shape is not served, or the #63 merge does not serve the step
-        (MergeRows.fits: the same on every rank)."""
+        None: its shape is not served, or merge_rows does not give the core this
+        step's rows (MergeRows.fits: the same on every rank)."""
         core = self.core_kernels.get((batch, q))
         if core is None or not self.dsac_rows.fits(batch):
             return None
         return core
 
     def sparse_dcp_core(self, core, cache, metadata, batch, q, join):
-        """The DSA sparse core of a DCP step: this rank's rows of the #63 merge, the
-        query's join (its KV insert; the core polls every rank's q itself), then
-        DsaCore over this rank's rows for every rank's gathered heads, its partial
-        rows and LSEs pushed to their owners' DcpBox."""
+        """The DSA sparse core of a DCP step: this rank's rows of the #63 merge (or of
+        DcpExchange's top-k), the query's join (its KV insert; the core polls every
+        rank's q itself), then DsaCore over this rank's rows for every rank's
+        gathered heads, its partial rows and LSEs pushed to their owners' DcpBox."""
         variant, _, spread = core
         md, box, p = metadata, self.box, self.parity
         kv, stride_rows = self.fi.rows(cache, md.block_size)

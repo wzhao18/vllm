@@ -371,3 +371,40 @@ def test_dsa_core_policy(monkeypatch):
     assert dsac.variant(8, 8, 2) is dsac.variant(16, 8, 5) is None  # skipped
     every = decode.DsacDecode(torch.device("cuda"), H, rows=64, spec="1-8:1x16;9-64:u")
     assert every.variant(8, 4, 0) == (1, 16, 4) and every.variant(64, 8, 3) == (1, 0, 4)
+
+
+def test_dsa_core_rows_source(monkeypatch):
+    """The core's rows (MergeRows): the #63 merge's steps, and DcpExchange's steps
+    above the rows its top-k launches with PDL (K31_DCPX_PDL, as the extension
+    parses it): the core polls its q tiles before its PDL wait."""
+    from vllm.models.kimi_k3.nvidia.dsa_kernels.dcp_exchange import decode as dcpx
+    from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core import decode
+
+    monkeypatch.delenv(dcpx.PDL_ENV, raising=False)
+    assert dcpx.topk_pdl_rows() == dcpx.DEFAULT_PDL_ROWS == 16
+    for value, rows in (("0", 0), ("8", 8), (" 32x", 32), ("", 0), ("off", 0)):
+        monkeypatch.setenv(dcpx.PDL_ENV, value)
+        assert dcpx.topk_pdl_rows() == rows, value
+
+    class Stage:  # IndexerStage's step predicate and rows
+        source: tuple = (None, 0)
+
+        def merge_source(self, batch):
+            return self.source
+
+        def merge_rows(self, *args):
+            return None if self.source[0] is None else ("sel", "cnt")
+
+    stage = Stage()
+    source = decode.MergeRows(stage, pdl_rows=16)
+    for step, fits in (
+        ((None, 0), False),
+        (("merge", 8), True),
+        (("exchange", 16), False),  # its top-k launched with PDL
+        (("exchange", 17), True),
+    ):
+        stage.source = step
+        assert source.fits(64) is fits, step
+    assert source.rows(None, None, None, None, 64, q=8) == ("sel", "cnt")
+    stage.source = "exchange", 8
+    assert decode.MergeRows(stage).fits(64)  # K31_DCPX_PDL=0: every exchange step

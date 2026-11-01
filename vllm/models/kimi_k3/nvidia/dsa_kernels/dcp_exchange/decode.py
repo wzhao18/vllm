@@ -31,6 +31,8 @@ the one-round top-k (window centred at each rank's local estimate of the K-th ke
 ``VLLM_K31_DCP_EXCHANGE_SPIN_S``: how long a kernel waits for a peer rank before it
 traps (default 600 s, the NCCL watchdog's order; 0 = forever, like DcpBox). The
 kernels' own 5 s default applies to tests and the build-time warmup only.
+``K31_DCPX_PDL``: the most rows whose top-k kernel launches with PDL (default 16; 0:
+never; ``topk_pdl_rows``).
 ``VLLM_K31_DCP_EXCHANGE_VERIFY=1`` (validation, eager steps only): check every
 exchanged top-k against an exact reference over the all-gathered logits and every
 O exchange against an FP32 reference; counts are logged at exit.
@@ -40,6 +42,7 @@ from __future__ import annotations
 
 import atexit
 import os
+import re
 from typing import Any
 
 import torch
@@ -76,6 +79,20 @@ TOPK_CTAS_PER_SM = 4
 # above the co-resident count; ``DcpxDecode.launch_params``). Benchmarks set False to
 # time the former cluster-by-batch rule.
 FIT_WAVE = True
+# The top-k kernel launches with PDL (releasing its dependents after its row loop) at
+# most this many rows: csrc topk_merge reads PDL_ENV once, as C atoi (unset: 16).
+PDL_ENV = "K31_DCPX_PDL"
+DEFAULT_PDL_ROWS = 16
+
+
+def topk_pdl_rows() -> int:
+    """The most rows whose top-k kernel launches with PDL (``PDL_ENV`` as the
+    extension parses it; 0 or less: none)."""
+    value = os.environ.get(PDL_ENV)
+    if value is None:
+        return DEFAULT_PDL_ROWS
+    digits = re.match(r"\s*[+-]?\d+", value)
+    return int(digits.group()) if digits else 0
 
 
 def _parse_parts(spec: str) -> dict[str, tuple[int, int]]:

@@ -136,11 +136,6 @@ class IndexerStage:
             return "merge", rows
         return None, 0
 
-    def merge_fits(self, batch):
-        """Whether ``merge_rows`` serves this step of ``batch`` rows with the #63
-        merge (``merge_source``; the same on every rank)."""
-        return self.merge_source(batch)[0] == "merge"
-
     def merge_rows(self, q_fp8, head_w, metadata, stride_rows, batch, q=1):
         """DCP: this rank's flat KV rows of the merged global top-k of the first
         ``batch`` rows (``q`` per request; compacted to a prefix, at most N per
