@@ -19,9 +19,11 @@ by
 
 Switch: ``VLLM_K31_DSA_CORE`` = 0 (default) | 1; ``VLLM_K31_DSA_CORE_ROWS`` = most
 rows (default ROWS; at most the DcpBox cap of 64); ``VLLM_K31_DSA_CORE_VARIANT`` = the
-core variant by rows (``batch_table`` syntax, see VARIANT); ``VLLM_K31_DSA_CORE_SPREAD``
-= rows whose pushed DcpValue spreads its merge (see SPREAD).
-``VLLM_K31_DSA_CORE_STATS=1`` logs the kernel's error word at exit.
+core variant by rows (``batch_table`` syntax) of every q (default VARIANT[q]: rows of
+a q without a table keep FlashInfer); ``VLLM_K31_DSA_CORE_SKIP_LAYERS`` = DSA layers
+(ordinals 0 .. 23, ';' or ',' separated) that keep FlashInfer;
+``VLLM_K31_DSA_CORE_SPREAD`` = rows whose pushed DcpValue spreads its merge (see
+SPREAD). ``VLLM_K31_DSA_CORE_STATS=1`` logs the kernel's error word at exit.
 """
 
 from __future__ import annotations
@@ -45,7 +47,9 @@ ROWS_ENV = ENV + "_ROWS"
 # 5705 -> 5416, B8 q8 11664 -> 11447, B1 q4 5852 -> 5601, B8 q4 9449 -> 8825.
 # Caveat: a row whose selection sits on one rank (a ~100K-way tie at the cut, e.g. all
 # index keys zero) walks its chunks serially: DCP4 skew bench B8 q8 97 -> 122 us/layer.
-ROWS = 64
+# Here 16 (DL7 M8 / M16, see VARIANT): from 24 rows no variant holds up where one rank
+# holds 600 or more of a request's entries.
+ROWS = 16
 VARIANT_ENV = ENV + "_VARIANT"
 # Core variant by rows: "u" = the tcgen05 core (CTA per (row, latent half), all 96
 # gathered heads as M = 128), "<S>x<HG>" = the mma.sync core with S KV splits (one
@@ -63,7 +67,24 @@ VARIANT_ENV = ENV + "_VARIANT"
 # per rank-row at DCP16), where 1x16 at 64 rows wins (step ABBA under ROWS); set
 # VLLM_K31_DSA_CORE_ROWS=32 to keep 33-64 rows on the trtllm chain if skewed
 # selections matter. Open: a split that adapts to the row length without idle CTAs.
-VARIANT = "1-16:2x16,17-64:1x16"
+# "<S>x<HG>s<M>": rows of at most M chunks run on one CTA (default 4).
+# Here by q (the rows of q-row requests). Round 3 Step 0a, one SM107 GPU, DCP16 rank
+# shapes (96 gathered heads, q8, slots over 1M FP8 KV rows), CUPTI us per call, the
+# trtllm-gen chain (+ reduction + LSE) / 1x16 / 2x16s2 / 4x16s2 / 8x16s4, where the
+# 8 rows of one request hold X local entries and the other rows 96-155 ("bal"):
+#   M8   bal 13.47 / 9.48 / 9.45 / 8.73 / 10.43; X 256: 13.54 / 12.75 / 10.59 / 15.84
+#        / 14.18; 384: 13.61 / 17.47 / 12.98 / 20.45 / 25.50; 600: 14.74 / 26.13 /
+#        17.69 / 25.20 / 32.30; 2048: 17.17 / 78.56 / 43.72 / 49.28 / 47.25
+#   M16  bal 14.34 / 9.65 / 9.71 / 16.25 / 17.66; 256: 14.44 / 12.85 / 10.69 / 17.70 /
+#        21.10; 384: 14.65 / 17.56 / 13.07 / 21.21 / 29.72; 600: 15.71 / 26.22 / 17.78 /
+#        25.34 / 34.05
+#   M24  bal 14.98 / 9.83 / 16.19 (2 waves); 384: 15.25 / 17.64 / 16.99; 600: 15.91 /
+#        26.30 / 17.89
+# and DcpValue (push + merge) 8.96 / 11.82 us at M8 / M16 against DcpValue(pushed)
+# 7.00 / 9.59, QueryWait 1.84 (side stream). 2x16s2 at 1-16 rows: -6.0 / -6.9 us per
+# layer balanced, -2.6 / -3.8 at 384 entries, +1.0 / -0.2 at 600, +24 at 2048.
+VARIANT = {8: "1-16:2x16s2"}
+SKIP_ENV = ENV + "_SKIP_LAYERS"
 SPREAD_ENV = ENV + "_SPREAD"
 # Rows whose pushed DcpValue spreads every row's merge over its CTAs (Rubin schedule,
 # LSE box [CAP, H, DCP]; spec verify rows only) instead of one merge CTA per (head, 16
@@ -75,14 +96,26 @@ SPREAD_ENV = ENV + "_SPREAD"
 SPREAD = "17-64:1"
 
 
-def parse_variant(name: str) -> tuple[int, int]:
-    """(splits, heads per CTA; 0 = the tcgen05 core) of a variant name."""
+def parse_variant(name: str) -> tuple[int, int, int]:
+    """(splits, heads per CTA; 0 = the tcgen05 core, split_min) of a variant name."""
     if name == "u":
-        return 1, 0
+        return 1, 0, 4
+    name, _, split_min = name.partition("s")
     splits, _, heads = name.partition("x")
     if int(splits) not in (1, 2, 4, 8) or int(heads) not in (16, 32):
         raise ValueError(f"{VARIANT_ENV}: bad variant {name!r}")
-    return int(splits), int(heads)
+    return int(splits), int(heads), int(split_min or 4)
+
+
+def rows_table(spec: str) -> dict:
+    from ...specialized_decode.cutedsl.common.policy import batch_table
+
+    return batch_table(spec)
+
+
+def layer_list(spec: str) -> frozenset[int]:
+    """DSA layer ordinals of a ';' / ',' separated list."""
+    return frozenset(int(x) for x in spec.replace(";", ",").split(",") if x.strip())
 
 
 def wanted() -> bool:
@@ -117,20 +150,21 @@ class DsacDecode:
     DcpBox's)."""
 
     def __init__(self, device: torch.device, heads: int, cap: int = 64):
-        from ...specialized_decode.cutedsl.common.policy import batch_table
         from .ops import DsaCore
 
         self.rows = min(int(os.environ.get(ROWS_ENV, str(ROWS))), cap)
-        spec = os.environ.get(VARIANT_ENV, VARIANT).replace(";", ",")  # (";": shells)
-        self.variant = {b: parse_variant(v) for b, v in batch_table(spec).items()}
+        self.spec = os.environ.get(VARIANT_ENV)  # every q's table, else VARIANT[q]
+        self.tables: dict[int, dict] = {}
+        self.skip = layer_list(os.environ.get(SKIP_ENV, ""))
         spread = os.environ.get(SPREAD_ENV, SPREAD).replace(";", ",")
-        self.spread = {b for b, v in batch_table(spread).items() if v}
-        max_splits = max([1, *(v[0] for v in self.variant.values())])
-        self.core = DsaCore(device, cap=self.rows, heads=heads, max_splits=max_splits)
+        self.spread = {b for b, v in rows_table(spread).items() if v}
+        self.core = DsaCore(device, cap=self.rows, heads=heads, max_splits=8)
         logger.info(
-            "Kimi K3.1 DSA decode: sparse core on (rows <= %d, variants %s)",
+            "Kimi K3.1 DSA decode: sparse core on (rows <= %d, variants %s, skipped "
+            "DSA layers %s)",
             self.rows,
-            spec,
+            VARIANT if self.spec is None else f"{self.spec} at every q",
+            sorted(self.skip) or "none",
         )
         if os.environ.get(ENV + "_STATS") == "1":
             atexit.register(self._report)
@@ -143,17 +177,38 @@ class DsacDecode:
             return
         print(f"K31 DSAC stats: err {err}", flush=True)
 
-    def serves(self, batch: int) -> bool:
-        return batch <= self.rows
+    def variant(self, batch: int, q: int, layer: int) -> tuple[int, int, int] | None:
+        """The core variant (``parse_variant``) of DSA layer ``layer`` (ordinal) at
+        ``batch`` rows of q-row requests, or None: FlashInfer's chain."""
+        if batch > self.rows or layer in self.skip:
+            return None
+        if q not in self.tables:
+            spec = self.spec if self.spec is not None else VARIANT.get(q, "")
+            table = rows_table(spec.replace(";", ","))
+            self.tables[q] = {b: parse_variant(n) for b, n in table.items()}
+        return self.tables[q].get(batch)
 
     def run(
-        self, q_box, sel, counts, kv, scales, box, hpr, parity, batch, lse_wide=False
+        self,
+        variant,
+        q_box,
+        sel,
+        counts,
+        kv,
+        scales,
+        box,
+        hpr,
+        parity,
+        batch,
+        lse_wide=False,
     ):
-        """``q_box``: this parity's q mailbox; ``sel`` / ``counts``: MergeRows.rows;
-        ``kv``: the flat FP8 KV rows; ``scales``: FlashInfer's (bmm1, bmm2) of the
-        layer; ``box``: the DSA DcpBox (``hpr`` heads per rank); ``lse_wide``: the
-        pushed DcpValue spreads its merge (LSE box [CAP, H, DCP])."""
+        """``variant``: ``self.variant``'s; ``q_box``: this parity's q mailbox;
+        ``sel`` / ``counts``: MergeRows.rows; ``kv``: the flat FP8 KV rows;
+        ``scales``: FlashInfer's (bmm1, bmm2) of the layer; ``box``: the DSA DcpBox
+        (``hpr`` heads per rank); ``lse_wide``: the pushed DcpValue spreads its
+        merge (LSE box [CAP, H, DCP])."""
         bmm1, bmm2 = scales
+        splits, heads, split_min = variant
         self.core.run(
             q_box,
             sel,
@@ -168,25 +223,24 @@ class DsacDecode:
             parity=parity,
             rank=box.rank,
             rows=batch,
+            splits=splits,
+            split_min=split_min,
+            heads_per_cta=heads or 32,
+            umma=heads == 0,
             lse_wide=lse_wide,
-            **self.launch(batch),
         )
-
-    def launch(self, batch: int) -> dict:
-        splits, heads = self.variant.get(batch, (1, 32))
-        return dict(splits=splits, heads_per_cta=heads or 32, umma=heads == 0)
 
 
 def build(model) -> DsacDecode | None:
     """Build the core (``VLLM_K31_DSA_CORE=1``, DCP) and attach it to every DSA
     indexer (``PreparedDsa`` picks it up on a per-tensor FP8 cache with the #63
     merge)."""
-    if not wanted():
-        return None
     from vllm.models.kimi_k3.nvidia.dsa import KimiK3DSAAttention
 
     layers = [m for m in model.modules() if isinstance(m, KimiK3DSAAttention)]
-    if not layers or layers[0].dsa_indexer.dcp_world_size < 2:
+    for ordinal, layer in enumerate(layers):  # (SKIP_LAYERS)
+        layer.dsa_indexer.dsac_layer = ordinal
+    if not wanted() or not layers or layers[0].dsa_indexer.dcp_world_size < 2:
         return None
     first = layers[0]
     device = first.mla_attn.mla_attn.W_UK_T.device
