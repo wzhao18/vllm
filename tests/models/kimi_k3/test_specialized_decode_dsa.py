@@ -2965,6 +2965,337 @@ def test_prepared_dsa_dcp_sparse_core_exchange(
     assert len(step.core_calls) == 3 * (batch > pdl_rows), step.core_calls
 
 
+# DcpExchange's top-k feeding WideDsa above 96 rows at DCP16: DL7's C64 band (q8 at
+# 128 and 256 rows, a widened DSA box of 256) and DL3's widest step (q4 at 512 rows,
+# a box of 512: the cap-128 tree's).
+WIDE_EXCHANGE_CASES = [(128, 8), (256, 8), (512, 4)]
+WIDE_EXCHANGE_BOX = {8: 256, 4: 512}
+WIDE_DSA_BOX: dict = {}  # the DSA DcpBox: one per process, as one per model
+
+
+def run_wide_exchange_step(batch, q, world, replays):
+    """One decode step of a real DSA layer at ``batch`` rows (``q`` per request, the
+    layer tests' contexts: rows of two requests in five select every key) under DCP
+    (``world`` ranks, interleave 1) through the stock forward (the #63 or the
+    generic merge) and then, DcpExchange's top-k (DcpxDecode, PARTS=topk) attached
+    as the model's process_weights_after_loading attaches it, through
+    dsa.wide.WideDsa built as the providers build it (on the case's rows and the
+    DL's widest, whose widened box serves both) over copies of the same caches. The
+    step's top-k is the exchange's slots as global ids; ``chain_out`` is a second
+    WideDsa's step (the other parity) whose sparse decode takes those ids through
+    the stock DCP filter (FlashInfer over the same keys); the two layers in a CUDA
+    graph, the exchange's slots and counts poisoned before each, replay
+    ``replays`` times."""
+    from vllm import _custom_ops as ops
+    from vllm.config import set_current_vllm_config
+    from vllm.distributed import get_dcp_group
+    from vllm.distributed.parallel_state import graph_capture
+    from vllm.forward_context import create_forward_context, override_forward_context
+    from vllm.models.kimi_k3.nvidia.dsa_kernels.dcp_exchange.decode import DcpxDecode
+    from vllm.models.kimi_k3.nvidia.ops.dsa_indexer import (
+        indexer_k_norm_quant_insert,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.dcp_stage import (  # noqa: E501
+        local_slots,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.wide import WideDsa
+    from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.providers import (
+        dcp_box,
+        pack_dsa_projection,
+    )
+    from vllm.v1.attention.backends.mla.indexer import (
+        DeepseekV32IndexerMetadataBuilder,
+    )
+    from vllm.v1.attention.backends.mla.sparse_utils import flat_kv_row_view
+    from vllm.v1.worker.block_table import get_block_table_width
+
+    cache_dtype = LAYER_CORES["fi-trtllm"][0]
+    config = layer_config("fi-trtllm", q, world)
+    # The indexer builder's decode buffers and DcpExchange's rows take
+    # max_num_seqs x q: DL3's 128 requests x q4 = 512 rows need 128.
+    config.scheduler_config.max_num_seqs = max(64, 512 // q)
+    group = get_dcp_group()
+    rank = group.rank_in_group
+    dev = torch.device("cuda", torch.accelerator.current_device_index())
+    bf = torch.bfloat16
+    with set_current_vllm_config(config):
+        topk_buffer = torch.full((LAYER_LEN, 2048), -1, dtype=torch.int32, device=dev)
+        attn = dsa_layer(config, topk_buffer, HEADS * world)
+        layer, indexer = attn.mla_attn.mla_attn, attn.dsa_indexer
+        packed = pack_dsa_projection(attn)
+        spec = layer.get_kv_cache_spec(config)
+        builder = layer.attn_backend.get_builder_cls()(
+            spec, [layer.layer_name], config, dev
+        )
+        index_spec = indexer.k_cache.get_kv_cache_spec(config)
+        index_builder = DeepseekV32IndexerMetadataBuilder(
+            index_spec,
+            [indexer.k_cache.prefix],
+            config,
+            dev,
+            block_table_width=get_block_table_width(
+                index_spec.max_num_blocks_per_req(config, LAYER_LEN), UNIT
+            ),
+        )
+        reqs = batch // q
+        gen = torch.Generator(device=dev).manual_seed(batch + q)
+        contexts = [(600, 2050, 4321, 3000, 1100)[r % 5] + 37 * r for r in range(reqs)]
+        contexts = [min(c, LAYER_LEN - 2 * q) for c in contexts]
+        local = [(c + q - rank + world - 1) // world for c in contexts]
+        mla, mla_table = paged_rows(local, UNIT, FP8_ROW, UNIT, gen)
+        index, index_table = paged_rows(local, UNIT, INDEX_ROW, GAP, gen)
+        old = [range(c) for c in contexts]
+        old_mla = owned_slots(mla_table, old, world, rank)
+        old_index = owned_slots(index_table, old, world, rank)
+        n = old_mla.numel()
+        unit = torch.ones(1, dtype=torch.float32, device=dev)
+        kv_c = torch.randn(n, 512, device=dev, dtype=bf, generator=gen)
+        k_pe = torch.randn(n, 64, device=dev, dtype=bf, generator=gen)
+        ops.concat_and_cache_mla(kv_c, k_pe, mla, old_mla, cache_dtype, unit)
+        keys = torch.randn(n, 128, device=dev, dtype=bf, generator=gen)
+        scratch = torch.empty(n, 2048, dtype=torch.int32, device=dev)
+        norm = torch.ones(128, dtype=bf, device=dev)
+        args = (norm, torch.zeros_like(norm), EPS, old_index, index, scratch, n)
+        indexer_k_norm_quant_insert(keys, *args)
+        assert_index_nan_free(index)
+        new = [range(c, c + q) for c in contexts]
+        new_mla = owned_slots(mla_table, new, world, rank)
+        new_index = owned_slots(index_table, new, world, rank)
+        hidden = torch.randn(batch, LAYER_HIDDEN, device=dev, dtype=bf, generator=gen)
+        positions = torch.tensor([p for pos in new for p in pos], device=dev)
+        names = layer.layer_name, indexer.k_cache.prefix
+
+        def step(mla_cache, index_cache):
+            layer.kv_cache, indexer.k_cache.kv_cache = mla_cache, index_cache
+            mla_common = common_metadata(contexts, q, mla_table, new_mla, world, rank)
+            index_common = common_metadata(
+                contexts, q, index_table, new_index, world, rank
+            )
+            md = builder.build(0, mla_common)
+            index_md = index_builder.build(0, index_common)
+            context = create_forward_context(
+                dict(zip(names, (md, index_md))),
+                config,
+                slot_mapping=dict(zip(names, (new_mla, index_md.slot_mapping))),
+            )
+            return md, index_md, override_forward_context(context)
+
+        # The stock forward (no exchange yet): the rows entering o_proj.
+        stock_mla, stock_index = mla.clone(), index.clone()
+        entering = []
+        hook = attn.o_proj.register_forward_pre_hook(
+            lambda _, args: entering.append(args[0].clone())
+        )
+        _, _, context = step(stock_mla, stock_index)
+        with context:
+            attn(positions, hidden)
+        hook.remove()
+        stock_topk = topk_buffer[:batch].clone()
+
+        dcpx = DcpxDecode(config, dev, HEADS * world, indexer.topk_tokens)
+        assert "topk" in dcpx.parts and dcpx.topk_cap >= batch, (dcpx.parts, dcpx.cap)
+        dcpx.attach(attn)
+        dcpx.warm()
+        dcpx.serve()  # peer waits of VLLM_K31_DCP_EXCHANGE_SPIN_S
+        topk_calls: list = []
+        run_topk = dcpx.decode_topk
+
+        def counted_topk(*args, **kwargs):
+            topk_calls.append(args[1].shape[0])
+            return run_topk(*args, **kwargs)
+
+        dcpx.decode_topk = counted_topk  # (the hook's late lookup)
+
+        projected = torch.cat(
+            [
+                attn.fused_qkv_a_proj(hidden)[0],
+                attn.g_proj(hidden)[0],
+                indexer.wkv_index(hidden)[0],
+            ],
+            dim=-1,
+        )
+        ours_mla, ours_index = mla.clone(), index.clone()
+        md, index_md, context = step(ours_mla, ours_index)
+        cap = WIDE_EXCHANGE_BOX[q]
+        scratch_rows = (
+            torch.zeros(cap, 64, 576, device=dev, dtype=bf),
+            torch.empty(cap, 1536, device=dev, dtype=bf),
+            torch.empty(cap, 32 * 128, device=dev, dtype=bf),
+            torch.empty(cap, 32, 128, device=dev, dtype=torch.uint8),
+            torch.empty(cap, 32, device=dev, dtype=bf),
+            torch.empty(cap, 64, 512, device=dev, dtype=bf),
+        )
+        if "box" not in WIDE_DSA_BOX:
+            runtime = SimpleNamespace(
+                dcp=world, tp=world, device=dev, dcp_box=None, dsa_dcp_box=None
+            )
+            WIDE_DSA_BOX["box"] = dcp_box(runtime, HEADS, dsa=True, flashinfer=True)
+        # As providers.Attention: the case's rows and the DL's widest.
+        pitches = dict.fromkeys(sorted({batch, cap}), packed.shape[0])
+        policy = dict(queries=(q,), dcp=WIDE_DSA_BOX["box"], core="auto")
+        layers = [
+            WideDsa(attn, pitches, scratch_rows, **policy, parity=p) for p in (0, 1)
+        ]
+        for core in layers:
+            core.prepare_cache(ours_mla)
+        assert layers[0].boxes[batch].cap >= batch, layers[0].boxes[batch].cap
+        out = torch.full((batch, HEADS * 128), float("nan"), device=dev, dtype=bf)
+
+        def run(core, rows):
+            core.run(
+                projected,
+                rows,
+                cache=ours_mla,
+                slots=new_mla,
+                index_slots=index_md.slot_mapping,
+                metadata=md,
+                q=q,
+            )
+
+        # Every rank compiled its kernels: no exchange peer wait spans a compile.
+        torch.accelerator.synchronize()
+        group.barrier()
+        with context:
+            # The indexer op gives the step to the exchange (and the MLA layer its
+            # counts).
+            assert dcpx.topk_active(indexer.k_cache.prefix, batch)
+            run(layers[0], out)
+            torch.accelerator.synchronize()
+            eager = out.clone()
+            # This rank's slots and counts; as every rank's global ids for the checks
+            # below, and every rank's counts.
+            slots, counts = topk_buffer[:batch].clone(), dcpx.counts[:batch].clone()
+            ids = exchange_ids(slots, counts, md, index_md, ours_mla)
+            rank_counts = group.all_gather(counts, dim=0).view(world, batch)
+            # FlashInfer over the same keys: the second layer takes the ids through
+            # the stock DCP filter (no exchange counts) instead of the indexer.
+            chain, impl = layers[1], layer.impl
+            exchange_counts = impl.dcp_local_topk_counts
+            impl.dcp_local_topk_counts = None
+            chain.indexer_core = lambda *_: topk_buffer
+            topk_buffer[:batch] = ids
+            chain_out = torch.full_like(out, float("nan"))
+            run(chain, chain_out)
+            del chain.indexer_core
+            impl.dcp_local_topk_counts = exchange_counts
+            torch.accelerator.synchronize()
+            outs = [torch.full_like(out, float("nan")) for _ in layers]
+            g = torch.cuda.CUDAGraph()
+            with graph_capture(dev) as ctx, torch.cuda.graph(g, stream=ctx.stream):
+                for core, rows in zip(layers, outs):
+                    # A read of the top-k before the exchange wrote it (a premature
+                    # launch) sees all K keys at slot 0.
+                    topk_buffer[:batch].fill_(0)
+                    dcpx.counts.fill_(indexer.topk_tokens)
+                    run(core, rows)
+            for _ in range(replays):
+                for rows in outs:
+                    rows.fill_(float("nan"))
+                g.replay()
+            torch.accelerator.synchronize()
+            for i, rows in enumerate(outs):
+                assert torch.equal(rows, eager), (i, float((rows - eager).abs().max()))
+            # The last layer's exchange: the eager slots and counts.
+            assert torch.equal(dcpx.counts[:batch], counts)
+            taken = torch.arange(slots.shape[1], device=dev) < counts.view(-1, 1)
+            assert torch.equal(topk_buffer[:batch][taken], slots[taken])
+        dcpx.ex.check()  # no peer wait timed out, every row's K-th key found
+        # This rank's rows of the exchange's ids and of the stock top-k, as the stock
+        # DCP filter gives them.
+        _, stride_rows = flat_kv_row_view(ours_mla, md.block_size)
+        filtered = [
+            local_slots(md, ids_[:batch], world, rank, 1, stride_rows)
+            for ids_ in (ids, stock_topk)
+        ]
+        # Both top-k against the exact top-k of WideDsa's indexer query
+        # (collective).
+        query = layers[0].q_fp8[:batch], layers[0].head_w[:batch]
+        args = index_table, contexts, q, *query
+        width = exact_topk_widths(ours_index, *args, ids, world)
+        stock_width = exact_topk_widths(stock_index, *args, stock_topk, world)
+    return SimpleNamespace(
+        world=world,
+        width=width,
+        stock_width=stock_width,
+        attn=attn,
+        projected=projected,
+        out=eager,
+        stock=entering[0],
+        topk=ids,
+        stock_topk=stock_topk,
+        caches=(ours_mla, ours_index),
+        stock_caches=(stock_mla, stock_index),
+        new_slots=(new_mla, new_index),
+        mla_table=mla_table,
+        kv=cache_dtype,
+        owned=((slots, counts), *filtered),
+        rank_counts=rank_counts,
+        chain_out=chain_out,
+        topk_calls=topk_calls,
+        lengths=torch.tensor([c + j + 1 for c in contexts for j in range(q)]),
+    )
+
+
+@pytest.mark.skipif(DCP16_INIT is None, reason="needs a 16-rank launch (DCP16)")
+@pytest.mark.skip_global_cleanup  # the DCP16 group outlives each case
+@pytest.mark.parametrize("batch,q", WIDE_EXCHANGE_CASES)
+def test_wide_dsa_dcp_exchange(dcp8_group, monkeypatch, batch, q):
+    """WideDsa above 96 rows fed by DcpExchange's top-k (VLLM_K31_DCP_EXCHANGE,
+    PARTS=topk) at DCP16: C64's combination (q8, VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS 256)
+    and DL3's widest (q4 at 512 rows; run on the cap-128 tree). The indexer op gives
+    the step to the exchange, whose slots and counts WideDsa's sparse decode reads
+    (``dcp_local_topk_counts``). The exchanged top-k, as global ids, holds min(K,
+    length) keys a row over the ranks (balanced keys: no rank's count twice
+    another's), is exact, and is the stock one up to near-ties (every row that
+    selects every key); this rank's slots are those of its ids. The rows entering
+    o_proj are, on every row, those of FlashInfer over the same keys through the
+    stock DCP filter (a second WideDsa) and, where the top-k is the same, the stock
+    forward's (check_layer_step); in a CUDA graph of two layers on alternating
+    parities, the exchange's slots and counts poisoned before each, 200 replays
+    give the eager rows bit for bit."""
+    from vllm.model_executor.layers import sparse_attn_indexer
+    from vllm.models.kimi_k3.nvidia.dsa_kernels.dcp_exchange import decode as dcpx
+
+    # This case's layer alone takes the exchange (the other tests: the #63 merge).
+    monkeypatch.setattr(sparse_attn_indexer, "DCP_DECODE_TOPK_HOOKS", {})
+    monkeypatch.setenv(dcpx.PARTS_ENV, "topk")
+    monkeypatch.setenv(dcpx.ENV + "_ONE_ROUND_ROWS", "256")
+    monkeypatch.delenv(dcpx.ENV + "_TIES", raising=False)  # (rank, position)
+    monkeypatch.delenv(dcpx.GRAPH_ONLY_ENV, raising=False)
+    monkeypatch.setenv(dcpx.SPIN_ENV, "120")
+    step = run_wide_exchange_step(batch, q, dcp8_group, replays=200)
+    check_layer_step(step, q, reference=False)
+    same = [
+        set(step.topk[t].tolist()) == set(step.stock_topk[t].tolist())
+        for t in range(batch)
+    ]
+    every_key = (step.lengths <= 2048).tolist()
+    print(f"rows of the stock top-k: {sum(same)} of {batch} ({sum(every_key)} short)")
+    assert all(s for s, e in zip(same, every_key) if e), same
+    merged, ours, stock = (
+        [set(s[t, : v[t]].tolist()) for t in range(batch)] for s, v in step.owned
+    )
+    for t in range(batch):
+        assert -1 not in merged[t] and merged[t] == ours[t], t
+        if same[t]:
+            assert merged[t] == stock[t], t
+    core_rows, chain_rows = step.out.float(), step.chain_out.float()
+    error = float((core_rows - chain_rows).norm() / chain_rows.norm())
+    print(f"relative error vs FlashInfer over the same keys: {error:.4f}")
+    torch.testing.assert_close(step.out, step.chain_out, atol=2e-2, rtol=2e-2)
+    counts = step.rank_counts  # [ranks, rows]
+    low, high = counts.amin(0), counts.amax(0)
+    print(
+        f"ranks' counts by row: min {int(low.min())}-{int(low.max())}, "
+        f"max {int(high.min())}-{int(high.max())}"
+    )
+    keys = step.lengths.to(counts.device).clamp(max=2048)
+    assert bool((counts.sum(0) == keys).all()), (counts.sum(0), keys)
+    assert not bool((high >= 2 * low.clamp(min=1)).any()), (low, high)
+    # the eager step and the two captured layers (the chain bypasses the indexer)
+    assert step.topk_calls == [batch] * 3, step.topk_calls
+
+
 @NOT_PORTED
 @pytest.mark.skipif(DCP_INIT is None, reason="needs an 8-rank launch (DCP8)")
 @pytest.mark.skip_global_cleanup  # the DCP8 group outlives each case
