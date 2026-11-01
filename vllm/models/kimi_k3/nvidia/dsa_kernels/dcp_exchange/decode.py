@@ -21,10 +21,11 @@ on pure-decode steps of at most ``cap`` rows:
 * O (``o``): the LSE combine + W_UV of the local heads by W_UV on all heads and
   ``DcpExchange.o_exchange`` (``MLAAttention.dcp_decode_o_exchange``).
 
-Switch: ``VLLM_K31_DCP_EXCHANGE`` = auto (default: on for SM107 under 1 < DCP == TP;
-other layouts keep the stock path) | 0 | 1 (DCP must equal TP);
-``VLLM_K31_DCP_EXCHANGE_PARTS`` = a comma list of topk, q, o (default topk,o) and
-optionally ``part=lo-hi`` row ranges (e.g. ``topk,q=97-4096,o``);
+Switch: ``VLLM_K31_DCP_EXCHANGE`` = 0 (default: off, the stock path and the one-round
+DCP top-k merge) | auto (on for SM107 under 1 < DCP == TP; other layouts keep the
+stock path) | 1 (DCP must equal TP); a prefill-only instance never builds it;
+``VLLM_K31_DCP_EXCHANGE_PARTS`` = a comma (or semicolon) list of topk, q, o (default
+topk,o) and optionally ``part=lo-hi`` row ranges (e.g. ``topk,q=97-4096,o``);
 ``VLLM_K31_DCP_EXCHANGE_ONE_ROUND_ROWS`` (default 256, 0: off) = the rows that take
 the one-round top-k (window centred at each rank's local estimate of the K-th key).
 ``VLLM_K31_DCP_EXCHANGE_SPIN_S``: how long a kernel waits for a peer rank before it
@@ -49,6 +50,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 ENV = "VLLM_K31_DCP_EXCHANGE"
+DEFAULT_MODE = "0"
 PARTS_ENV = "VLLM_K31_DCP_EXCHANGE_PARTS"
 GRAPH_ONLY_ENV = "VLLM_K31_DCP_EXCHANGE_GRAPH_ONLY"
 SPIN_ENV = "VLLM_K31_DCP_EXCHANGE_SPIN_S"
@@ -74,7 +76,7 @@ TOPK_CTAS_PER_SM = 4
 
 def _parse_parts(spec: str) -> dict[str, tuple[int, int]]:
     parts: dict[str, tuple[int, int]] = {}
-    for item in filter(None, (s.strip() for s in spec.split(","))):
+    for item in filter(None, (s.strip() for s in spec.replace(";", ",").split(","))):
         name, _, rows = item.partition("=")
         lo, hi = 1, 1 << 30
         if rows:
@@ -87,16 +89,23 @@ def _parse_parts(spec: str) -> dict[str, tuple[int, int]]:
 
 
 def wanted(vllm_config) -> bool:
-    """Whether the model should build a DcpxDecode (DCP > 1, the switch). ``auto``
-    only takes layouts the exchange supports (DCP == TP: head owner = rank) and leaves
-    the rest to the stock path; ``1`` forces it (``DcpxDecode`` then rejects an
-    unsupported layout)."""
+    """Whether the model should build a DcpxDecode (DCP > 1, the switch; off unless
+    set). ``auto`` only takes layouts the exchange supports (DCP == TP: head owner =
+    rank) and leaves the rest to the stock path; ``1`` forces it (``DcpxDecode`` then
+    rejects an unsupported layout). A prefill-only instance never decodes."""
     parallel = vllm_config.parallel_config
     dcp = parallel.decode_context_parallel_size
     if dcp <= 1:
         return False
-    mode = os.environ.get(ENV, "auto").strip().lower()
+    mode = os.environ.get(ENV, DEFAULT_MODE).strip().lower()
     if mode in ("0", "off", "false"):
+        return False
+    kv_transfer = getattr(vllm_config, "kv_transfer_config", None)
+    if (
+        kv_transfer is not None
+        and kv_transfer.is_kv_producer
+        and not kv_transfer.is_kv_consumer
+    ):
         return False
     if mode in ("1", "on", "true"):
         return True
