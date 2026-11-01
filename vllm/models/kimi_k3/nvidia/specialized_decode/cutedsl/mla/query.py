@@ -177,7 +177,9 @@ class MlaQuery:
     bytes it wrote into head block ``rank`` of every rank's Lamport q mailbox
     (mla.dcp.DcpBox), then polls its share of the gathered mailbox until no word is
     the sentinel, so the next kernel reads the gathered query. DSA publishes BF16
-    rows into a mailbox of ``q_heads`` (FlashMLA's padding) rows per token.
+    rows into a mailbox of ``q_heads`` (FlashMLA's padding) rows per token. Above 64
+    rows (several tiles per head, more CTAs than one wave) each tile polls only its
+    own tokens, so a resident tile never waits for one that is not yet scheduled.
 
     DSA query overlap (dsa.overlap): ``store_qc=False`` leaves the q_c rows to
     QueryNorm and ``gather=False`` leaves the mailbox poll to QueryWait.
@@ -290,6 +292,7 @@ class MlaQuery:
             assert self.tokens <= 8 * heads  # (the wide cluster is 8)
             assert self.tokens % 16 == 0  # (16-row MMA tiles)
         self.grid = (self.cluster, heads, (batch + self.tokens - 1) // self.tokens)
+        self.tile_poll = self.wide and batch > 64
         carveout = 100 if batch > 1 else None
         self.options = dict(cluster=self.cluster, preferred_smem_carveout=carveout)
         self.q_b_cp_async = q_b_cp_async
@@ -389,9 +392,10 @@ class MlaQuery:
                         multicast_words(at_r, rope16)
 
     @cute.jit
-    def gathered(self, args, tid):
+    def gathered(self, args, tid, tok0=0):
         """DCP: poll this CTA's share of the gathered mailbox (16 B chunks of the
-        B x DCP*H x 576 bytes) until every rank's bytes have landed."""
+        B x DCP*H x 576 bytes) until every rank's bytes have landed (``tile_poll``:
+        the share of this tile's tokens from ``tok0``)."""
         mailbox = args[self.box_arg]
         part, head, tile = cute.arch.block_idx()
         if cutlass.const_expr(self.gate):
@@ -402,12 +406,18 @@ class MlaQuery:
                 while not published(words, sentinel=Q_SENT):
                     words = load_volatile(ptr, count=4)
             cute.arch.sync_threads()
-        threads: cutlass.Constexpr = self.grid[0] * self.grid[1] * self.grid[2] * 256
         per_head: cutlass.Constexpr = 36 * self.q_bytes  # 16 B chunks per head row
         token: cutlass.Constexpr = self.dcp * self.heads * per_head  # per token
-        chunks: cutlass.Constexpr = self.batch * token
-        first = ((tile * self.heads + head) * self.cluster + part) * 256 + tid
-        last = chunks - 1  # threads past the end re-poll it
+        tiles: cutlass.Constexpr = 1 if self.tile_poll else self.grid[2]
+        threads: cutlass.Constexpr = self.grid[0] * self.grid[1] * tiles * 256
+        polled: cutlass.Constexpr = self.tokens if self.tile_poll else self.batch
+        chunks: cutlass.Constexpr = polled * token
+        if cutlass.const_expr(self.tile_poll):
+            first = tok0 * token + (head * self.cluster + part) * 256 + tid
+            last = (tok0 + min(self.tokens, self.batch - tok0)) * token - 1
+        else:
+            first = ((tile * self.heads + head) * self.cluster + part) * 256 + tid
+            last = chunks - 1  # threads past the end re-poll it
         for i0 in cutlass.range_constexpr(0, -(-chunks // threads), 8):
             n: cutlass.Constexpr = min(8, -(-chunks // threads) - i0)
             picks = [min(first + (i0 + i) * threads, last) for i in range(n)]
@@ -951,7 +961,7 @@ class MlaQuery:
             self.insert(args, ss, tok0, j, (j < T) & self.live(tok0 + j), tid)
         cute.arch.cluster_wait()
         if cutlass.const_expr(self.dcp and self.gather):
-            self.gathered(args, tid)
+            self.gathered(args, tid, tok0)
         if cutlass.const_expr(self.late):
             cute.arch.griddepcontrol_wait()
 
