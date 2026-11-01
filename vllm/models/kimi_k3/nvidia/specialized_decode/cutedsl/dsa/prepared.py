@@ -11,7 +11,9 @@ stages over the packed MLA cache and the indexer cache (64-entry pages):
                    scoring and top-k (indexer_stage.py)
   sparse core      FlashInfer sparse MLA on a per-tensor FP8 cache (attn_fi.py:
                    trtllm-gen or prims_ts per batch, called directly into the value
-                   stage's rows), else FlashMLA sparse on fp8_ds_mla (attn_ds.py)
+                   stage's rows), else FlashMLA sparse on fp8_ds_mla (attn_ds.py);
+                   under DCP with the #63 merge, on the rows of its table, the DSA
+                   sparse core (dsa_kernels.dsa_core, VLLM_K31_DSA_CORE=1)
   MlaValue         W_UV and the sigmoid gate of the BF16 latent
 
 Query overlap (overlap.py, per batch of rows): the indexer path needs only q_c, so
@@ -25,7 +27,10 @@ query and DsaIndex insert only the owned slots, the query publishes its heads in
 every rank's q mailbox, the indexer merges the ranks' local top-k into global token
 ids, which are filtered to this rank's slots (on FlashInfer with the #63 merge: into
 this rank's slots directly) for the sparse decode of every rank's gathered heads, and
-DcpValue merges this rank's heads by LSE.
+DcpValue merges this rank's heads by LSE. On the DSA sparse core's steps the core
+polls the q mailbox itself (no QueryWait), decodes every rank's gathered heads over
+this rank's rows of the merge and pushes the partial rows and LSEs to their owners,
+and DcpValue(pushed) only merges.
 
 The packed projection row is [q_a 1536 | kv_a 576 | gate H*128 | wk 128 | wv 32]."""
 
@@ -43,7 +48,14 @@ from ..mla.query import GB300_SMS
 from ..mla.value import MlaValue
 from .attn_ds import flashmla_core, flashmla_dcp_core
 from .attn_fi import FlashInferCore, dsa_on_flashinfer, fi_kernels, kernel_for
-from .dcp_stage import compile_dcp_value, local_slots, publish_args, run_value
+from .dcp_stage import (
+    compile_core_value,
+    compile_dcp_value,
+    local_slots,
+    publish_args,
+    run_core_value,
+    run_value,
+)
 from .dcp_value import PROJECTED
 from .indexer import PAGE as INDEX_PAGE
 from .indexer import FusedIndexer
@@ -330,6 +342,19 @@ class PreparedDsa:
             reserve_fused_indexer(*args, blocks=kv_cache_blocks())
         # DCP "proj" partials: every gathered head's W_UV (collective).
         self.uv_gathered = dcp.value_weights(layer.W_UV) if dcp else None
+        # The DSA sparse core (dsa_kernels.dsa_core.decode.build, VLLM_K31_DSA_CORE=1)
+        # under DCP on FlashInfer with the #63 merge: on the shapes of its variant
+        # table (this DSA layer not skipped), the steps the merge serves run DsaCore
+        # and DcpValue(pushed) instead of QueryWait, FlashInfer's decode and
+        # DcpValue's push: (batch, q) -> (variant, DcpValue(pushed), spread).
+        self.dsac = self.dsac_rows = None
+        self.dsa_layer = getattr(self.indexer, "dsac_layer", -1)
+        self.core_kernels: dict = {}
+        dsac = getattr(self.indexer, "dsac", None)
+        if dsac is not None and self.fi is not None and local_topk and self.dcp > 1:
+            from ....dsa_kernels.dsa_core.decode import MergeRows
+
+            self.dsac, self.dsac_rows = dsac, MergeRows(self.indexer_stage)
         # TP on FlashInfer: the fused decode indexer (prepare_cache; None: stock).
         self.fused: FusedIndexer | None = None
 
@@ -377,6 +402,8 @@ class PreparedDsa:
                 self.overlap_kernels[batch, q] = self.compile_overlap(
                     batch, q, specs[6]
                 )
+            if self.dsac is not None and partials == "bf16":
+                self.prepare_core(batch, q, specs[4], sms)
         rows = max(self.pitches)
         if fused:
             # Every mode but the late ones has the select right before the decode
@@ -426,6 +453,52 @@ class PreparedDsa:
             getattr(self.layer, "_q_scale_float", None),
             scope="global",
         )
+        if self.core_kernels:
+            logger.info_once(
+                "Kimi K3.1 specialized DSA: sparse core at rows x q %s (DSA layer %d)",
+                " ".join(f"{b}x{q}" for b, q in sorted(self.core_kernels)),
+                self.dsa_layer,
+                scope="global",
+            )
+
+    def prepare_core(self, batch, q, uv, sms):
+        """DcpValue(pushed) of a shape the DSA sparse core's table serves here."""
+        variant = self.dsac.variant(batch, q, self.dsa_layer)
+        if variant is None or self.overlaps[batch, q] in LATE:
+            return
+        spread = q > 1 and batch in self.dsac.spread and sms > GB300_SMS
+        box = self.box
+        args = self.heads, self.dcp, batch, uv, self.pitches[batch], self.device.index
+        value = compile_core_value(*args, sms, q, box.q_heads, box.cap, spread)
+        self.core_kernels[batch, q] = variant, value, spread
+
+    def core_step(self, batch, q):
+        """The DSA sparse core's (variant, DcpValue(pushed), spread) of this step, or
+        None: its shape is not served, or the #63 merge does not serve the step
+        (MergeRows.fits: the same on every rank)."""
+        core = self.core_kernels.get((batch, q))
+        if core is None or not self.dsac_rows.fits(batch):
+            return None
+        return core
+
+    def sparse_dcp_core(self, core, cache, metadata, batch, q, join):
+        """The DSA sparse core of a DCP step: this rank's rows of the #63 merge, the
+        query's join (its KV insert; the core polls every rank's q itself), then
+        DsaCore over this rank's rows for every rank's gathered heads, its partial
+        rows and LSEs pushed to their owners' DcpBox."""
+        variant, _, spread = core
+        md, box, p = metadata, self.box, self.parity
+        kv, stride_rows = self.fi.rows(cache, md.block_size)
+        stage = self.query_stage
+        args = stage.q_fp8, stage.head_w, md, stride_rows, batch
+        sel, counts = self.dsac_rows.rows(*args, q=q)
+        if join is not None:
+            join()
+        impl = self.impl  # FlashInfer's scales of this layer (attn_fi.trtllm)
+        impl._prepare_mqa_kernel(self.layer, self.device)
+        scales = impl.bmm1_scale, impl.bmm2_scale
+        args = box.q[p], sel, counts, kv, scales, box, self.heads, p, batch
+        self.dsac.run(variant, *args, lse_wide=spread)
 
     def held(self, modes):
         """The shapes on a FlashInfer kernel (HELD_KERNELS) whose overlap mode is
@@ -502,15 +575,19 @@ class PreparedDsa:
                 first = compile_front(*args)
         return first, wait, norm
 
-    def run_query(self, projected, cache, slots, q, publish=()):
+    def run_query(self, projected, cache, slots, q, publish=(), poll=True):
         """MlaQuery and the q_c rows per the overlap mode. Returns what makes the
-        sparse core wait for the query (None: it is already in stream order)."""
+        sparse core wait for the query (None: it is already in stream order).
+        ``poll``: QueryWait polls the q mailbox (DCP; not before the DSA sparse
+        core, which polls it itself)."""
         stage, batch = self.query_stage, projected.shape[0]
         query, mode = self.kernels[batch, q][0], self.overlaps[batch, q]
         if mode == "serial":
             stage.run_query(query, projected, cache, slots, publish)
             return None
         first, wait, norm = self.overlap_kernels[batch, q]
+        if not poll:
+            wait = None
         if mode in LATE:  # MlaQuery inside the fused indexer's chain (fused_core)
             if mode in NORM:
                 stage.run_norm(norm, projected)
@@ -604,10 +681,17 @@ class PreparedDsa:
         _, index, value = self.kernels[batch, q]
         stage = self.query_stage
         publish = publish_args(box, p)
-        join = self.run_query(projected, cache, slots, q, publish)
+        sparse = self.core_step(batch, q) if self.dsac is not None else None
+        join = self.run_query(projected, cache, slots, q, publish, sparse is None)
         self.run_index(index, projected, index_slots, q)
-        core = self.dcp_core(cache, None, metadata, batch, projected, join, q)
         uv = stage.views[4]
+        if sparse is not None:  # the DSA sparse core, then DcpValue(pushed)
+            self.sparse_dcp_core(sparse, cache, metadata, batch, q, join)
+            assert box.mailbox(batch).format == "bf16"
+            buffers = self.fi.latent, self.fi.lse
+            args = sparse[1], box, p, publish, self.heads, buffers, lengths[:reqs], uv
+            return run_core_value(*args, projected, out)
+        core = self.dcp_core(cache, None, metadata, batch, projected, join, q)
         if box.mailbox(batch).format == PROJECTED:
             uv = self.uv_gathered[1]
         args = value, box, p, publish, self.heads, core, lengths[:reqs], uv

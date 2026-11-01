@@ -12,7 +12,12 @@ context):
                    "proj": BF16 value rows through W_UV) and LSE of the gathered
                    heads to their owners (only the LSE of a row whose local
                    valid count is 0), merges this rank's heads, W_UV and the
-                   gate"""
+                   gate
+  DcpValue(pushed) the DSA sparse core's tail (dsa_kernels.dsa_core): the core
+                   pushed every rank's partial rows and base-2 LSEs into the
+                   owners' DcpBox itself, so this DcpValue (mla.dcp, pushed=True)
+                   only re-arms the q mailbox and merges this rank's heads, W_UV
+                   and the gate"""
 
 import cutlass
 import torch
@@ -52,6 +57,32 @@ def compile_dcp_value(
         dsa_bf16=not fp8,
         lse_base_e=lse_base_e,
         partials=partials,
+    )
+
+
+def compile_core_value(
+    heads, dcp, batch, uv, pitch, device, sms, q, q_heads, cap=64, spread=False
+):
+    """DcpValue(pushed=True) of one batch after the DSA sparse core (mla.dcp: BF16
+    partials, an FP8 q mailbox of ``q_heads`` padded heads, base-2 LSEs; ``spread``:
+    the Rubin schedule's spread merge)."""
+    from ..mla.dcp import compile_value as compile_merge
+
+    return compile_merge(
+        heads,
+        dcp,
+        batch,
+        cap,
+        uv,
+        pitch,
+        device,
+        sms,
+        q,
+        pushed=True,
+        dsa_heads=q_heads,
+        dsa_bf16=False,
+        lse_base_e=False,
+        spread=spread,
     )
 
 
@@ -101,6 +132,32 @@ def run_value(kernel, box, parity, publish, heads, core, lengths, uv, projected,
     lse = lse.as_strided((batch, 1, gathered), (padded, 0, 1))
     mailbox, _, rank = publish
     v_args = (to_cute(latent), to_cute(lse, 4), counts, *boxes, *peers, mailbox, uv)
+    s = stream(out.device)
+    kernel(*v_args, gate, lens, to_cute(out), cutlass.Int32(parity), rank, s)
+    return out
+
+
+def run_core_value(
+    kernel, box, parity, publish, heads, buffers, lengths, uv, projected, out
+):
+    """DcpValue(pushed) after the DSA sparse core -> ``out`` [B, H * 128]
+    (``lengths``: the requests' global lengths). Its rows and LSE arguments are
+    never read (the core pushed them): ``buffers`` (FlashInfer's latent and LSE)
+    stand in for them."""
+    batch = projected.shape[0]
+    padded, gathered = box.q_heads, heads * box.size
+    latent, lse = buffers
+    latent = latent[: batch * padded * 512].view(batch, padded, 512)
+    latent = latent.as_strided((batch, 1, gathered, 512), (padded * 512, 0, 512, 1))
+    lse = lse[: batch * padded].view(batch, padded)
+    lse = lse.as_strided((batch, 1, gathered), (padded, 0, 1))
+    lens = to_cute(lengths, 4)
+    mail = box.mailbox(batch)
+    boxes = to_cute(mail.partial[parity]), to_cute(mail.lse[parity], 4)
+    peers = to_cute(mail.peers, 8), to_cute(mail.lse_peers, 8)
+    gate = to_cute(projected[:, 2112:])
+    mailbox, _, rank = publish
+    v_args = (to_cute(latent), to_cute(lse, 4), lens, *boxes, *peers, mailbox, uv)
     s = stream(out.device)
     kernel(*v_args, gate, lens, to_cute(out), cutlass.Int32(parity), rank, s)
     return out

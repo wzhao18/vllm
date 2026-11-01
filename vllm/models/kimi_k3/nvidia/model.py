@@ -1737,8 +1737,12 @@ class KimiLinearForCausalLM(
         self.dcpx = build_dcpx(self.model, self.vllm_config)
 
     def build_specialized_decode(self) -> None:
+        from .dsa_kernels.dsa_core.decode import build as build_dsa_core
         from .specialized_decode.runtime.decode import SpecializedDecode
 
+        # The DSA sparse core (VLLM_K31_DSA_CORE=1), which the DSA layers' PreparedDsa
+        # picks up from their indexers.
+        build_dsa_core(self.model)
         self.specialized_decode = SpecializedDecode(
             self.model, self.specialized_decode_config
         )
