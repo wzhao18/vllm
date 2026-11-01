@@ -349,12 +349,14 @@ def test_dsa_core_graph_replay_alternates_parities(variant):
     assert torch.equal(lse.view(torch.int32), eager[1].view(torch.int32))
 
 
-def test_dsa_core_policy():
+def test_dsa_core_policy(monkeypatch):
     """VLLM_K31_DSA_CORE's table: by q, then rows (a q without a table and rows past
     ROWS keep FlashInfer), split_min in the variant name, skipped DSA layers, an
-    environment table for every q; off by default."""
+    environment table for every q; off by default (whatever the caller exported)."""
     from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core import decode
 
+    for suffix in ("", "_ROWS", "_VARIANT", "_SKIP_LAYERS", "_SPREAD", "_STATS"):
+        monkeypatch.delenv(decode.ENV + suffix, raising=False)
     assert not decode.wanted()
     assert decode.parse_variant("2x16s2") == (2, 16, 2)
     assert decode.parse_variant("1x32") == (1, 32, 4)
