@@ -72,6 +72,10 @@ STATIC_SMEM = 20 * 1024
 # 256-thread top-k CTAs per SM (Rubin: 1024 threads per SM): the exchange serves at
 # most one wave of single-CTA rows (the persistent grid would walk more in turns).
 TOPK_CTAS_PER_SM = 4
+# Keep a step's top-k rows within one wave of co-resident clusters (smaller clusters
+# above the co-resident count; ``DcpxDecode.launch_params``). Benchmarks set False to
+# time the former cluster-by-batch rule.
+FIT_WAVE = True
 
 
 def _parse_parts(spec: str) -> dict[str, tuple[int, int]]:
@@ -161,6 +165,7 @@ class DcpxDecode:
         # falls outside the windows take one refine round over the K-th key's bin,
         # so the selection is exact either way. 0: off.
         self.one_round_rows = int(os.environ.get(ENV + "_ONE_ROUND_ROWS", "256"))
+        self.fit_wave = bool(FIT_WAVE)
         if self.tie_order not in ("rank", "global"):
             raise ValueError(f"{ENV}_TIES: rank or global, got {self.tie_order!r}")
         self.stats = None
@@ -422,10 +427,30 @@ class DcpxDecode:
         )
 
     def launch_params(self, rows: int, max_local: int) -> tuple[int, int]:
-        """(CTAs per row, shared-memory keys per CTA or 0) of a top-k launch."""
+        """(CTAs per row, shared-memory keys per CTA or 0) of a top-k launch.
+
+        Small batches split each row over a cluster of CTAs (``rows x cluster`` up to
+        ~400 CTA pairs). A step's rows must also fit in one wave of co-resident
+        clusters: rows beyond it run in a second persistent turn, every NVLink round
+        included, which made the TP4/DCP4 top-k jump from 66 to 100 us per call
+        between 160 and 192 rows (cluster 4: fewer co-resident clusters than rows).
+        So the cluster halves until the rows fit, down to the smallest cluster whose
+        CTA segment fits the WRITE bitmap (``topk_merge``)."""
         cluster = 1  # as DcpExchange.topk_merge: CTAs per row by batch
         while cluster < 8 and rows * cluster * 2 <= 800:
             cluster *= 2
+        floor = 1  # topk_merge raises the cluster to this for long contexts
+        while floor < 16 and -(-max_local // floor) > 131072:
+            floor *= 2
+        cluster = max(cluster, floor)
+        segmax = self._segmax(rows, cluster, max_local)
+        if self.fit_wave:
+            while cluster > floor and rows > self.ex.resident_clusters(cluster, segmax):
+                cluster //= 2
+                segmax = self._segmax(rows, cluster, max_local)
+        return cluster, segmax
+
+    def _segmax(self, rows: int, cluster: int, max_local: int) -> int:
         # Stage a row segment's keys in shared memory when the longest possible one
         # (the bound is the model length, not this step's contexts) fits with every
         # row's CTAs resident at once (else the persistent grid walks rows in turns).
@@ -433,8 +458,8 @@ class DcpxDecode:
         per_sm = -(-rows * cluster // self.sms)
         fits = (self.smem // per_sm - STATIC_SMEM) // 2
         if self.segmax_override >= 0:  # tuning: fixed staging (0 = global re-reads)
-            return cluster, self.segmax_override if seg <= self.segmax_override else 0
-        return cluster, (max(seg, 8192) if seg <= min(SMEM_KEYS, fits) else 0)
+            return self.segmax_override if seg <= self.segmax_override else 0
+        return max(seg, 8192) if seg <= min(SMEM_KEYS, fits) else 0
 
     def counts_for(self, prefix: str, rows: int) -> torch.Tensor | None:
         """The slot counts of this step's exchanged top-k (the indexer's decode rows,

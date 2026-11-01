@@ -297,6 +297,11 @@ class DcpExchange:
             stats,
         )
 
+    def resident_clusters(self, cluster: int, segmax: int) -> int:
+        """Top-k clusters of ``cluster`` CTAs (``segmax`` staged keys each) that fit
+        on the GPU at once; a launch walks rows beyond it in turns."""
+        return int(self.ext.topk_resident_clusters(cluster, segmax))
+
     def set_spin_timeout(self, seconds: float) -> None:
         """Cross-rank spin deadline of the kernels launched (or captured) from now
         on; past it a kernel records an error code and traps. ``<= 0``: wait

@@ -2330,6 +2330,41 @@ static long long g_spin_ns = kSpinNsDefault;
 void set_spin_ns(int64_t ns) { g_spin_ns = (long long)ns; }
 int64_t get_spin_ns() { return (int64_t)g_spin_ns; }
 
+// Co-resident top-k clusters of ``cluster`` CTAs with ``segmax`` staged keys each
+// (cudaOccupancyMaxActiveClusters; cached per shape). A launch walks rows beyond it in
+// turns, so the decode policy (``DcpxDecode.launch_params``) keeps a step's rows within
+// it: cluster packing per GPC makes it smaller than SMs x CTAs per SM / cluster.
+int64_t topk_resident_clusters(int64_t cluster, int64_t segmax) {
+  TORCH_CHECK(cluster >= 1 && cluster <= 16 && segmax >= 0);
+  static std::map<std::pair<int64_t, int64_t>, int> resident;
+  auto key = std::make_pair(cluster, segmax);
+  auto itr = resident.find(key);
+  if (itr != resident.end()) return itr->second;
+  auto kern = topk_merge_kernel<16>;
+  static bool configured = false;
+  if (!configured) {
+    cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024);
+    cudaFuncSetAttribute(kern, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+    configured = true;
+  }
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = dim3((unsigned)cluster, 1, 1);
+  cfg.blockDim = dim3(kThreads, 1, 1);
+  cfg.dynamicSmemBytes = (size_t)segmax * 2;
+  cudaLaunchAttribute attr[1];
+  attr[0].id = cudaLaunchAttributeClusterDimension;
+  attr[0].val.clusterDim.x = (unsigned)cluster;
+  attr[0].val.clusterDim.y = 1;
+  attr[0].val.clusterDim.z = 1;
+  cfg.attrs = attr;
+  cfg.numAttrs = 1;
+  int nres = 0;
+  C10_CUDA_CHECK(cudaOccupancyMaxActiveClusters(&nres, (void*)kern, &cfg));
+  TORCH_CHECK(nres >= 1, "topk_merge: no co-resident cluster");
+  resident[key] = nres;
+  return nres;
+}
+
 void topk_merge(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global_len,
                 torch::Tensor out, torch::Tensor out_count,
                 c10::optional<torch::Tensor> block_table, int64_t block_size, int64_t next_n,
@@ -2407,25 +2442,9 @@ void topk_merge(torch::Tensor logits, torch::Tensor local_len, torch::Tensor glo
   cfg.attrs = attr;
   cfg.numAttrs = 1;
   auto kern = topk_merge_kernel<16>;
-  static bool configured = false;
-  if (!configured) {
-    cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024);
-    cudaFuncSetAttribute(kern, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
-    configured = true;
-  }
   // Persistent rows: at most the co-resident cluster count (identical on every
   // rank, so all ranks walk the rows in the same order).
-  static std::map<std::pair<int64_t, int64_t>, int> resident;
-  auto key = std::make_pair(cluster, segmax);
-  auto itr = resident.find(key);
-  int nres;
-  if (itr == resident.end()) {
-    C10_CUDA_CHECK(cudaOccupancyMaxActiveClusters(&nres, (void*)kern, &cfg));
-    TORCH_CHECK(nres >= 1, "topk_merge: no co-resident cluster");
-    resident[key] = nres;
-  } else {
-    nres = itr->second;
-  }
+  const int nres = (int)topk_resident_clusters(cluster, segmax);
   cfg.gridDim = dim3((unsigned)cluster, (unsigned)std::min(T, nres), 1);
   cfg.numAttrs = s_pdl ? 2 : 1;
   p.pdl = s_pdl ? 1 : 0;
@@ -2485,6 +2504,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("topk_merge", &topk_merge);
   m.def("o_exchange", &o_exchange);
   m.def("max_coresident_ox", &max_coresident_ox);
+  m.def("topk_resident_clusters", &topk_resident_clusters);
   m.def("set_spin_ns", &set_spin_ns);
   m.def("get_spin_ns", &get_spin_ns);
 }
