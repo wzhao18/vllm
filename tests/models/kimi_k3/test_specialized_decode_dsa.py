@@ -1191,6 +1191,7 @@ def test_flashinfer_dcp_core_merges_to_full_attention(
         core = SimpleNamespace(
             fi=fi,
             impl=impl,
+            count_stats=None,
             indexer=SimpleNamespace(cp_kv_cache_interleave_size=1),
             parity=0,
             box=SimpleNamespace(q=box),
