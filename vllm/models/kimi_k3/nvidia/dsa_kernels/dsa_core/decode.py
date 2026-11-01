@@ -40,8 +40,10 @@ ENV = "VLLM_K31_DSA_CORE"
 ROWS_ENV = ENV + "_ROWS"
 # KV splits per (row, 32 heads) by rows: spread a small batch's local chunks over
 # more CTAs (the last one LSE-merges them). DCP16 layer bench (kernel RESULTS).
-# Most rows the core serves by default (the DcpBox cap). 16-rank step ABBA (dummy
-# weights, AgentX, indexer fill), us/step trtllm chain -> core: B8 q8 11913 -> 11724.
+# Most rows the core serves by default (the DcpBox cap). 16-rank step A H S S H A on
+# one allocation (dummy weights, AgentX, indexer fill; A = trtllm chain, H = these
+# defaults without the spread merge, S = with it, as shipped), us/step A -> S: B1 q8
+# 5705 -> 5416, B8 q8 11664 -> 11447, B1 q4 5852 -> 5601, B8 q4 9449 -> 8825.
 # Caveat: a row whose selection sits on one rank (a ~100K-way tie at the cut, e.g. all
 # index keys zero) walks its chunks serially: DCP4 skew bench B8 q8 97 -> 122 us/layer.
 ROWS = 64
@@ -56,15 +58,22 @@ VARIANT_ENV = ENV + "_VARIANT"
 # Up to 16 rows two splits per (row, 16 heads): free on balanced rows (rows of <= 4
 # chunks run unsplit) and half the serial chunks when one rank holds most of a row's
 # entries (ties at the cut go to ranks in rank order: zero index keys put ~2040 of 2048
-# on rank 0; the 9-layer real-weight bench without the index fill, us/step 1x16 vs the
-# trtllm chain: B1 956 vs 844, B8 1655 vs 1496).
+# on rank 0). 9-layer real-weight bench without the index fill (that skewed case), us
+# per 9-layer step, these defaults vs the trtllm chain: B1 884 vs 844, B8 agentx 1738
+# vs 1496 (+16 %), mix 1638 vs 1416. Real indexer logits are balanced (96-155 entries
+# per rank-row at DCP16), where 1x16 at 64 rows wins (step ABBA under ROWS); set
+# VLLM_K31_DSA_CORE_ROWS=32 to keep 33-64 rows on the trtllm chain if skewed
+# selections matter. Open: a split that adapts to the row length without idle CTAs.
 VARIANT = "1-16:2x16,17-64:1x16"
 SPREAD_ENV = ENV + "_SPREAD"
 # Rows whose pushed DcpValue spreads every row's merge over its CTAs (Rubin schedule,
 # LSE box [CAP, H, DCP]; spec verify rows only) instead of one merge CTA per (head, 16
-# rows). DCP16 with 1x16: B8 q4 59.0 -> 55.9, B8 q8 76.8 -> 73.7, B1 q8 51.0 -> 50.5,
-# B1 q4 48.7 -> 49.2 us; at step level neutral (B8 q4 8904 vs 8902 us/step), so off.
-SPREAD = ""
+# rows). DCP16 layer bench with 1x16: B8 q4 59.0 -> 55.9, B8 q8 76.8 -> 73.7 us. Step
+# A H S S H A (see ROWS), us/step H -> S: B8 q8 11511 -> 11447 (-64), B8 q4 8889 ->
+# 8825 (-64); B1 rows (<= 16) do not spread. Applies only where the device has more
+# than 152 SMs (PreparedDsa.run_dcp). 9-layer real-weight R.1 check with it on passes
+# (rel rms as off) and still flags an injected softmax-scale fault.
+SPREAD = "17-64:1"
 
 
 def parse_variant(name: str) -> tuple[int, int]:
