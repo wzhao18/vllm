@@ -26,7 +26,7 @@ EMPTY = -3.0e38
 
 def _case(rows, counts, seed=0, nkv=40000):
     g = torch.Generator(device="cuda").manual_seed(seed)
-    kv = (torch.randn(nkv, D, generator=g, device="cuda") * 0.5)
+    kv = torch.randn(nkv, D, generator=g, device="cuda") * 0.5
     k_scale = float(kv.abs().max()) / 448.0
     kv8 = (kv / k_scale).to(torch.float8_e4m3fn)
     q = torch.randn(rows, H, D, generator=g, device="cuda")
@@ -77,10 +77,24 @@ def test_dsa_core_push(splits, heads_per_cta):
     for parity in (0, 1, 0):  # (repeat: no state survives a launch)
         part.view(torch.int32).fill_(-0x80000000)
         lse.view(torch.int32).fill_(-1)
-        core.run(box, sel, cnt, kv8.view(torch.uint8), bmm1_scale=sm_scale * q_scale * k_scale,
-                 bmm2_scale=k_scale, part_peers=peers, lse_peers=lpeers, box_cap=cap,
-                 hpr=H, parity=parity, rank=0, rows=rows, splits=splits,
-                 heads_per_cta=heads_per_cta or 32, umma=heads_per_cta == 0)
+        core.run(
+            box,
+            sel,
+            cnt,
+            kv8.view(torch.uint8),
+            bmm1_scale=sm_scale * q_scale * k_scale,
+            bmm2_scale=k_scale,
+            part_peers=peers,
+            lse_peers=lpeers,
+            box_cap=cap,
+            hpr=H,
+            parity=parity,
+            rank=0,
+            rows=rows,
+            splits=splits,
+            heads_per_cta=heads_per_cta or 32,
+            umma=heads_per_cta == 0,
+        )
         torch.cuda.synchronize()
         core.check()
         o = part[parity, 0, :rows].float()

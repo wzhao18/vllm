@@ -784,10 +784,10 @@ class DcpValue:
                 load_words(at(w_uv, head, 32 * c + 8 * quarter, v), count=4)
                 for c in range(16)
             ]
-        if cutlass.const_expr(self.spread and self.pushed and self.prefetch_uv):
-            # (pushed DSA rows: this grid launches at the sparse core's PDL release, long
-            # before its rows land; its head's W_UV rows -> L2 meanwhile, so the spread
-            # merge's post-poll fragment loads hit L2)
+        if cutlass.const_expr(self.spread and self.pushed and self.prefetch_uv):  # noqa: SIM102
+            # (pushed DSA rows: this grid launches at the sparse core's PDL release,
+            # long before its rows land; its head's W_UV rows -> L2 meanwhile, so the
+            # spread merge's post-poll fragment loads hit L2)
             if tid < 128:
                 prefetch_bytes(at(w_uv, head, 0, tid), 1024)
         if cutlass.const_expr(not self.polled_split):
@@ -878,7 +878,7 @@ class DcpValue:
         passes as published q in the parity's next layer.) Each row is merged by one
         CTA per head, so the heads' shares cover the batch's rows."""
         if cutlass.const_expr(self.lean):
-            D, H, B = self.size, self.heads, self.batch
+            D, B = self.size, self.batch
             armed = tuple(map(Uint32, ARMED if self.valid_box else (Q_SENT,) * 4))
             cute.arch.sync_threads()  # (every thread's polls of the merge first)
             # 16 B chunks of this head's share of a row (rows of q_heads x q_chunks: the
