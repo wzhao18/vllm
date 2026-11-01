@@ -115,7 +115,8 @@ def test_topk_cluster_fits_one_wave(rows, expected):
     launch = _launcher({8: 88, 4: 176, 2: 400, 1: 800})
     cluster, segmax = launch(rows, LOCAL_1M_DCP4)
     assert cluster == expected
-    assert segmax == 0  # 1M-token rows never fit shared memory
+    # 8 rows of 8 CTAs stage their 32768-key segments; longer steps re-read from L2
+    assert segmax == (32768 if rows == 8 else 0)
 
 
 def test_topk_cluster_rule_without_wave_fit():
@@ -129,3 +130,40 @@ def test_topk_cluster_short_model_can_reach_one():
     """Below 128K local keys the cluster may drop to one CTA per row."""
     launch = _launcher({8: 88, 4: 176, 2: 300, 1: 800})
     assert launch(384, 100_000)[0] == 1
+
+
+# GR100 (212 SMs, 228 KiB shared memory per SM): co-resident top-k clusters per
+# (CTAs per row, staged keys), from topk_resident_clusters.
+GR100 = {
+    (8, 0): 92, (8, 8192): 68, (8, 16384): 46, (8, 32768): 46,
+    (4, 0): 184, (4, 8192): 138, (4, 16384): 92, (4, 32768): 92,
+    (2, 0): 424, (2, 8192): 318, (2, 16384): 212, (2, 32768): 212,
+    (1, 0): 848, (1, 8192): 636, (1, 16384): 424, (1, 32768): 424,
+}  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    "rows,expected",
+    [
+        (64, (8, 8192)),  # 64 rows fit the 68 co-resident 8-CTA clusters
+        (72, (4, 16384)),  # the rule's 8-CTA clusters would take two turns
+        (88, (4, 16384)),
+        (96, (2, 32768)),  # past the 92 co-resident 4-CTA clusters
+        (128, (2, 32768)),
+        (256, (2, 0)),  # the rule's clusters already fit one wave
+        (512, (1, 0)),
+    ],
+)
+def test_topk_cluster_dcp16_one_wave(rows, expected):
+    """DCP16 at max_model_len 1M (65536 local keys, staged up to 200 rows): the rule
+    ran 72-128 rows in two turns (W16, 39-42 us per layer against 23-26 us at the
+    clusters that fit one wave)."""
+    ns = SimpleNamespace(
+        ex=SimpleNamespace(resident_clusters=lambda c, segmax: GR100[c, segmax]),
+        sms=212,
+        smem=228 * 1024,
+        segmax_override=-1,
+        fit_wave=True,
+    )
+    ns._segmax = lambda r, c, ml: decode.DcpxDecode._segmax(ns, r, c, ml)
+    assert decode.DcpxDecode.launch_params(ns, rows, 1 << 16) == expected
