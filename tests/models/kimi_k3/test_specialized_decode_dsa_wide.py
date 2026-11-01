@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Kimi K3.1 specialized decode, wide verify rows (> 64 token rows, Rubin):
-WideDsa at the rows ``dsa.wide.DSA_WIDE`` admits (65-96): its admission, index
-policies, MlaQuery grid residency and kernels at those rows, its DCP core; and the
-fused indexer key insert from the packed in-projection rows that seam S2-DSA feeds."""
+WideDsa at the rows ``dsa.wide.DSA_WIDE`` admits (65 up to
+VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS: 96 by default, at most 512): its admission, index
+policies, MlaQuery / DcpValue grid residency and kernels at those rows, its DCP core
+and DCP4 mailboxes; and the fused indexer key insert from the packed in-projection
+rows that seam S2-DSA feeds."""
+
+import time
 
 import pytest
 import torch
@@ -103,8 +107,9 @@ def test_fused_k_insert_from_packed_rows(rows):
 
 def test_prepared_dsa_wide_admission(monkeypatch):
     """``dsa.wide.choose``: GENERIC at the tuned rows; above them only Rubin DCP
-    verify shapes that ``DSA_WIDE`` lists, at most ``WIDE_MAX_ROWS`` (MlaQuery's
-    gathered-q poll needs a co-resident grid); else None (S2-DSA)."""
+    verify shapes that ``DSA_WIDE`` lists, at most VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS
+    (``wide_max_rows``: WIDE_MAX_ROWS by default, 64 none, at most WIDE_LIMIT); else
+    None (S2-DSA)."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa import wide
     from vllm.models.kimi_k3.nvidia.specialized_decode.shapes import (
         Context,
@@ -123,6 +128,17 @@ def test_prepared_dsa_wide_admission(monkeypatch):
     for m in (72, 96):
         assert wide.choose(Shape(m, 4), ctx).tactic == "wide"
     assert wide.choose(Shape(128, 4), ctx) is None  # above WIDE_MAX_ROWS
+    monkeypatch.setenv("VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS", "256")
+    for m in (72, 128, 256):
+        assert wide.choose(Shape(m, 4), ctx).tactic == "wide"
+    assert wide.choose(Shape(260, 4), ctx) is None
+    monkeypatch.setenv("VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS", "64")
+    assert wide.choose(Shape(72, 4), ctx) is None
+    for rows in ("63", str(wide.WIDE_LIMIT + 1)):
+        monkeypatch.setenv("VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS", rows)
+        with pytest.raises(ValueError, match="VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS"):
+            wide.choose(Shape(72, 4), ctx)
+    monkeypatch.delenv("VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS")
     gb300 = Context(**{**ctx.__dict__, "arch": "gb300"})
     assert wide.choose(Shape(72, 4), gb300) is None
     tp_only = Context(**{**ctx.__dict__, "dcp": 1})
@@ -143,15 +159,20 @@ def test_index_policies_wide_rows():
 
 
 def test_dsa_wide_query_grid_resident():
-    """Hazard H1: at wide rows every MlaQuery CTA polls the gathered q mailbox that
-    other ranks' CTAs fill, so the whole grid must be resident at once. The compiled
-    DSA query (DCP16, 6 heads, FP8, 96-row box) fits at 72 / 96 rows
-    (cuOccupancyMaxActiveClusters, checked by compile_core), and the check refuses
-    the 128-row grid that WIDE_MAX_ROWS keeps on S2-DSA."""
+    """Hazard H1: at wide rows the MlaQuery CTAs poll the gathered q mailbox that
+    other ranks' CTAs fill, so every CTA that polls with them must be resident. The
+    compiled DSA query (DCP16, 6 heads, FP8, 512-row box) fits whole at 72 / 96 rows
+    (cuOccupancyMaxActiveClusters, checked by compile_core); a 128-row grid would not
+    (the check refuses it without the tile poll), so above WIDE_MAX_ROWS each row
+    tile polls its own tokens and one tile's 6 clusters must fit (104-512 rows);
+    DcpValue's whole grid fits at every one of these rows (check_value_residency)."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
         layout,
     )
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa import wide
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.mla.dcp import (
+        compile_value,
+    )
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.mla.query import (
         MlaQuery,
     )
@@ -186,6 +207,24 @@ def test_dsa_wide_query_grid_resident():
     assert wider.grid[1] * wider.grid[2] > resident
     with pytest.raises(RuntimeError, match="cannot all be resident"):
         wide.check_query_residency(query.compiled, wider, device)
+    for rows in (104, 128, 256, 512):
+        query, _, value = wide.compile_core(
+            rows, heads, pitch, specs, device, 4, 16, 128, sms, fp8=True, cap=512
+        )
+        tiled = MlaQuery(
+            heads, rows, dsa=True, fp8=True, dcp=16, q_heads=128, tile_poll=True
+        )
+        assert tiled.tile_poll and tiled.grid[1] * tiled.grid[2] > resident
+        assert wide.check_query_residency(query.compiled, tiled, device) >= heads
+        grid = wide.check_value_residency(value, heads, 16, rows, 4, sms, device)
+        assert grid[0] * grid[1] * grid[2] <= sms
+    # 576 rows (past WIDE_LIMIT): 6 x 36 merge CTAs, more than one per SM fits.
+    with pytest.raises(RuntimeError, match="cannot be co-resident"):
+        value = compile_value(
+            heads, 16, 576, 576, specs[4], pitch, device, sms, 4, dsa_heads=128,
+            dsa_bf16=False,
+        )  # fmt: skip
+        wide.check_value_residency(value, heads, 16, 576, 4, sms, device)
 
 
 @pytest.mark.parametrize(
@@ -634,10 +673,12 @@ def wide_layer_inputs(batch, seed):
     return randn(batch, WIDE_PITCH), weights, mla, index, slots
 
 
-def _wide_mailbox_case(box, size, rank, batch, q):
+def _wide_mailbox_case(box, size, rank, batch, q, skew=0):
     """One (rows, q) case on this DCP rank: MlaQuery publishes this rank's query
     heads into every rank's q mailbox, then DcpValue merges every rank's partial rows
-    of this rank's heads, checked against the all-gathered tensors."""
+    of this rank's heads, checked against the all-gathered tensors. ``skew``: rank 1
+    starts its query this many clock cycles late (the other ranks' resident tiles
+    poll for its tiles meanwhile)."""
     import cutlass
     import torch.distributed as dist
 
@@ -659,18 +700,33 @@ def _wide_mailbox_case(box, size, rank, batch, q):
     assert weights[4].stride() == (128 * 512, 1, 512)
     specs = tuple(layout(w) for w in (*weights, mla, index))
 
-    def kernels(rows):
-        args = (rows, heads, WIDE_PITCH, specs, rank, q, size, q_heads, sms)
-        return wide.compile_core(*args, fp8=True, cap=box.cap)
+    def kernels(rows, dcp=size):
+        args = (rows, heads, WIDE_PITCH, specs, rank, q, dcp, q_heads if dcp else 0)
+        return wide.compile_core(*args, sms, fp8=True, cap=box.cap)
+
+    def query_args(cache, query, q_c):
+        args = (to_cute(projected), *(to_cute(w) for w in weights[:4]))
+        args += (to_cute(cache), to_cute(slots, 8), to_cute(unit, 4), to_cute(unit, 4))
+        return (*args, cutlass.Float32(EPS), to_cute(query), to_cute(q_c))
 
     # The query: every rank's box holds every rank's query rows (bit-identical).
     mq, _, value = kernels(batch)
     query = torch.zeros(batch, heads, 576, device=dev, dtype=torch.uint8)
     q_c = torch.zeros(batch, 1536, device=dev, dtype=bf)
-    args = (to_cute(projected), *(to_cute(w) for w in weights[:4]), to_cute(mla))
-    args += (to_cute(slots, 8), to_cute(unit, 4), to_cute(unit, 4))
-    args += (cutlass.Float32(EPS), to_cute(query), to_cute(q_c))
-    mq(*args, mailbox, mc, ids[1], s)
+    tp_mla = packed_cache(mla.shape[0], UNIT, FP8_ROW)  # mla's layout (the specs')
+    assert tp_mla.stride() == mla.stride()
+    tp_mla.copy_(mla)
+    torch.accelerator.synchronize()
+    dist.barrier()
+    if skew and rank == 1:
+        torch.cuda._sleep(skew)
+    mq(*query_args(mla, query, q_c), mailbox, mc, ids[1], s)
+    # The publish and its poll leave the query rows, q_c and KV rows as the
+    # query without DCP computes them (bitwise).
+    tp_query, tp_q_c = torch.zeros_like(query), torch.zeros_like(q_c)
+    kernels(batch, 0)[0](*query_args(tp_mla, tp_query, tp_q_c), s)
+    assert torch.equal(query, tp_query) and torch.equal(q_c, tp_q_c)
+    assert torch.equal(mla, tp_mla)
     queries = [torch.empty_like(query) for _ in range(size)]
     dist.all_gather(queries, query)
     gathered = box.q[parity, :batch]
@@ -736,7 +792,7 @@ def _wide_mailbox_case(box, size, rank, batch, q):
     assert torch.equal(out, torch.cat(chunks))
 
 
-def _wide_mailbox_worker(rank, size, port, cases):
+def _wide_mailbox_worker(rank, size, port, cases, skew=0):
     """One DCP rank of WideDsa's DCP kernels over every (rows, q) case."""
     import torch.distributed as dist
 
@@ -754,19 +810,30 @@ def _wide_mailbox_worker(rank, size, port, cases):
     group = dist.group.WORLD
     box = DcpBox(group, dev, size, rank, WIDE_HEADS, cap=WIDE_CAP, q_heads=WIDE_Q_HEADS)
     for batch, q in cases:
-        _wide_mailbox_case(box, size, rank, batch, q)
+        _wide_mailbox_case(box, size, rank, batch, q, skew)
     dist.destroy_process_group()
 
 
 @pytest.mark.skipif(torch.accelerator.device_count() < 4, reason="needs 4 GPUs")
-def test_wide_dcp_mailboxes():
+@pytest.mark.parametrize("skew", [0, 200_000_000], ids=["aligned", "rank1_late"])
+def test_wide_dcp_mailboxes(skew):
     """DCP4 over one node's NVLink multicast at the wide rows of DL7 / DL3 (up to
     512), with WideDsa's per-rank geometry (6 heads, 128-head FP8 q mailbox, a
     512-row box): the gathered q mailbox, DcpValue's LSE merge, W_UV and gate, and
-    the q mailbox re-armed for the next layer."""
+    the q mailbox re-armed for the next layer. ``rank1_late``: rank 1's query starts
+    ~0.1 s late, so the other ranks' first tiles poll while its later tiles are not
+    yet scheduled anywhere (the tile poll's progress, hazard H1); a hang fails."""
     import torch.multiprocessing as mp
 
     from vllm.utils.network_utils import get_open_port
 
-    args = (4, get_open_port(), WIDE_MAILBOX_CASES)
-    mp.spawn(_wide_mailbox_worker, args=args, nprocs=4)
+    args = (4, get_open_port(), WIDE_MAILBOX_CASES, skew)
+    context = mp.start_processes(
+        _wide_mailbox_worker, args=args, nprocs=4, join=False, start_method="spawn"
+    )
+    deadline = time.monotonic() + 1800
+    while not context.join(timeout=10):
+        if time.monotonic() > deadline:
+            for process in context.processes:
+                process.kill()
+            pytest.fail("DCP4 wide mailboxes: no progress in 30 min (a hang?)")

@@ -345,12 +345,17 @@ def test_attention_checks_the_dsa_seam_at_startup(monkeypatch, wide, skip_topk):
     assert provider.dsa_columns == (COLUMNS if wide else ())
 
 
-def test_dsa_rows_split_between_two_cores(monkeypatch):
+@pytest.mark.parametrize("cap", [None, 256])
+def test_dsa_rows_split_between_two_cores(monkeypatch, cap):
     """K3.1 at TP16 = DCP16: a DSA layer builds #108's PreparedDsa on the tuned rows
-    (up to 64) and WideDsa on the wide rows DSA_WIDE admits (65-96), on one shared
-    scratch (sized for the widest), DcpBox and parity; ``run_dsa`` runs each step on
-    the core of its rows."""
+    (up to 64) and WideDsa on the wide rows DSA_WIDE admits (65 up to
+    VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS: 96 by default), on one shared scratch (sized for
+    the widest), DcpBox and parity; ``run_dsa`` runs each step on the core of its
+    rows."""
     from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
+
+    if cap is not None:
+        monkeypatch.setenv("VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS", str(cap))
 
     attention, _ = dsa_layer(fused_insert=True)
     attention.num_local_heads = HEADS
@@ -381,14 +386,15 @@ def test_dsa_rows_split_between_two_cores(monkeypatch):
         Attention.__init__(
             provider, SimpleNamespace(self_attn=attention), runtime, None, None, None
         )
-    assert provider.dsa_wide == {72, 80, 88, 96}
-    providers_module.dsa_scratch.assert_called_once_with(runtime, 96)
+    rows = {b for b in wide if b <= (cap or 96)}
+    assert provider.dsa_wide == rows
+    providers_module.dsa_scratch.assert_called_once_with(runtime, max(rows))
     policy = dict(queries=(1, 8), core="auto", dcp=box, parity=0)
     tuned.assert_called_once_with(
         attention, dict.fromkeys(BATCHES, PITCH), scratch, **policy
     )
     providers_module.WideDsa.assert_called_once_with(
-        attention, dict.fromkeys((72, 80, 88, 96), PITCH), scratch, **policy
+        attention, dict.fromkeys(sorted(rows), PITCH), scratch, **policy
     )
 
     core, core_wide = provider.core, provider.core_wide = MagicMock(), MagicMock()
