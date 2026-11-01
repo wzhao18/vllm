@@ -527,6 +527,22 @@ class PersistentExperts:
         self.rubin: set[int] = set()  # batches on RubinExpertsKernel
         self.addresses: dict[int, tuple] = {}  # their w13 / w2 descriptor sources
         self.prepared = {}
+        # Verify steps with fast-exchange ``RubinExpertsKernel`` batches
+        # (``FAST_EXCHANGE``)
+        self.fast_rubin = any(rubin(self.tp, b, self.device) for b in self.fast)
+
+    def kernel_workspace(self, buffers):
+        """The workspace of ``ExpertsKernel`` batches. ``ExpertsKernel`` keys its hidden
+        images on the call counter's parity, the fast-exchange ``RubinExpertsKernel`` on
+        its own generation: on one workspace, a call of either between two of the other
+        leaves stale images (Rubin TP16 verify: M8 and B1-7 rows wrong). With fast
+        Rubin batches, ``ExpertsKernel`` batches take a second workspace (one per
+        ``scratch``, shared by the layers like the first); else the shared one."""
+        if not self.fast_rubin:
+            return buffers["workspace"]
+        if "kernel_workspace" not in buffers:
+            buffers["kernel_workspace"] = scratch(self.tp, self.device)["workspace"]
+        return buffers["kernel_workspace"]
 
     def prepare(
         self, batch, buffers, out, publish=(), planned=False, twoshot=False, early=False
@@ -580,7 +596,7 @@ class PersistentExperts:
         code = compile_experts(self.tp, self.experts, *args, slots=self.slots)
         # CTAs wait on other clusters' partials: the whole grid must be resident.
         check_residency(code, self.device.index, args[1], 384, "Kimi K3 MoE experts")
-        ws, maps = tensor(buffers["workspace"]), self.views[0]
+        ws, maps = tensor(self.kernel_workspace(buffers)), self.views[0]
         plan: tuple | None = None
         capacity = 1 << (batch - 1).bit_length()
         if fc2_pairs(self.tp, capacity, batch > 8 or streamed(batch)):
