@@ -1787,6 +1787,7 @@ def run_layer_step(
     poison="rows",
     offset=0,
     replays=5,
+    sparse_core=None,
 ):
     """One decode step of a real DSA layer (``q`` rows per request, contexts on
     both sides of the top-k, written by the stock writers) through the stock
@@ -1803,7 +1804,10 @@ def run_layer_step(
     DCP ``graph`` captures this layer and a second one on the other q mailbox
     parity (consecutive layers alternate), each with the merge's rows and counts
     and FlashInfer's latent and LSE poisoned before it, ``replays`` times; both
-    must give the eager step's rows bit for bit."""
+    must give the eager step's rows bit for bit. ``sparse_core``: under DCP, the DSA
+    sparse core's variant (dsa_core.decode.parse_variant) at every row, as
+    VLLM_K31_DSA_CORE=1 serves it (its own pushes and DcpValue(pushed); with
+    ``graph`` the merge's rows and counts are still poisoned before each layer)."""
     from vllm import _custom_ops as ops
     from vllm.config import set_current_vllm_config
     from vllm.distributed import get_dcp_group
@@ -1938,6 +1942,11 @@ def run_layer_step(
         )
         policy: dict = dict(queries=(q,), overlap=overlap, core="auto")
         policy.update(fi_policy(attn, kernel, cache_dtype))
+        core_calls: list = []
+        if sparse_core is not None:
+            assert world > 1
+            indexer.dsac = sparse_dsa_core(dev, HEADS * world, sparse_core)
+            indexer.dsac_layer = 0
         if world > 1:
             # Round 1's DSA DcpBox exchanges BF16 latent partials only (#108's
             # "proj" starts at 160 rows, past the box's 64).
@@ -1969,6 +1978,15 @@ def run_layer_step(
                 return decode(*args, **kwargs)
 
             prepared.fi.prims_ts = on_stream
+        if sparse_core is not None:
+            assert prepared.core_kernels.keys() == {(batch, q)}, prepared.core_kernels
+            run_core = prepared.dsac.run
+
+            def counted(*args, **kwargs):
+                core_calls.append(args[0])
+                return run_core(*args, **kwargs)
+
+            prepared.dsac.run = counted  # (every layer's: the indexer's core)
         if prepared.fused is not None:
             prepared.fused.write_ids(topk_buffer)  # the fused indexer's top-k
         out = torch.empty(batch, HEADS * 128, device=dev, dtype=bf)
@@ -2107,7 +2125,16 @@ def run_layer_step(
         kv=cache_dtype,
         owned=owned,
         prims_ts_calls=len(prims_ts_streams),
+        core_calls=core_calls,
     )
+
+
+def sparse_dsa_core(device, heads, variant):
+    """The DSA sparse core (dsa_core.decode.DsacDecode) serving ``variant`` at every
+    row up to 64."""
+    from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core.decode import DsacDecode
+
+    return DsacDecode(device, heads, rows=64, spec=f"1-64:{variant}", skip="")
 
 
 def exact_topk_widths(index, table, contexts, q, query, weights, ids, world=1):
@@ -2716,6 +2743,37 @@ def test_prepared_dsa_dcp_graph_poisoned(dcp8_group, batch, overlap):
         "fi-auto", batch, 8, dcp8_group, overlap, "bf16", graph=True, replays=200
     )
     check_layer_step(step, 8, reference=False)
+
+
+@pytest.mark.skipif(DCP_INIT is None, reason="needs an 8-rank launch (DCP8)")
+@pytest.mark.skip_global_cleanup  # the DCP8 group outlives each case
+@pytest.mark.parametrize("overlap", [None, "fork", "wait"])
+@pytest.mark.parametrize("variant", ["2x16s2", "1x16", "8x16s4"])
+@pytest.mark.parametrize("batch", [8, 16])
+def test_prepared_dsa_dcp_sparse_core(dcp8_group, batch, variant, overlap):
+    """The DSA sparse core (VLLM_K31_DSA_CORE) on PreparedDsa's DCP steps at q8 (the
+    DL7 rows of C1 and C8; under the KIMI_K3_SD_DCP16_INIT launch DCP16): every
+    rank's core polls the q mailbox (rank 0's forked publish held back), decodes
+    the 96 gathered heads over its rows of the #63 merge and pushes them to their
+    owners, whose DcpValue(pushed) merges, as the stock DCP forward of the step
+    (check_layer_step); in a CUDA graph of two layers on alternating parities with
+    the merge's rows and counts poisoned before each, 200 replays finish with the
+    eager step's rows bit for bit (no core reads its rows before the merge, nor a
+    stale q)."""
+    step = run_layer_step(
+        "fi-trtllm",
+        batch,
+        8,
+        dcp8_group,
+        overlap,
+        "bf16",
+        graph=True,
+        replays=200,
+        sparse_core=variant,
+    )
+    check_layer_step(step, 8, reference=False)
+    # the eager step and the two captured layers
+    assert len(step.core_calls) == 3, step.core_calls
 
 
 @NOT_PORTED

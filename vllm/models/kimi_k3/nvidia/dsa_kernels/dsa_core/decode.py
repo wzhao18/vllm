@@ -153,15 +153,26 @@ class MergeRows:
 class DsacDecode:
     """The core of one device, shared by every DSA layer (stream-ordered launches):
     ``heads`` gathered query heads (DCP x local heads), at most ``cap`` rows (the
-    DcpBox's)."""
+    DcpBox's). ``rows``, ``spec`` (every q's variant table) and ``skip`` (DSA
+    layers) override their environment switches (tests)."""
 
-    def __init__(self, device: torch.device, heads: int, cap: int = 64):
+    def __init__(
+        self,
+        device: torch.device,
+        heads: int,
+        cap: int = 64,
+        rows: int | None = None,
+        spec: str | None = None,
+        skip: str | None = None,
+    ):
         from .ops import DsaCore
 
-        self.rows = min(int(os.environ.get(ROWS_ENV, str(ROWS))), cap)
-        self.spec = os.environ.get(VARIANT_ENV)  # every q's table, else VARIANT[q]
+        rows = int(os.environ.get(ROWS_ENV, str(ROWS))) if rows is None else rows
+        self.rows = min(rows, cap)
+        # every q's variant table, else VARIANT[q]
+        self.spec = os.environ.get(VARIANT_ENV) if spec is None else spec
         self.tables: dict[int, dict] = {}
-        self.skip = layer_list(os.environ.get(SKIP_ENV, ""))
+        self.skip = layer_list(os.environ.get(SKIP_ENV, "") if skip is None else skip)
         spread = os.environ.get(SPREAD_ENV, SPREAD).replace(";", ",")
         self.spread = {b for b, v in rows_table(spread).items() if v}
         self.core = DsaCore(device, cap=self.rows, heads=heads, max_splits=8)
