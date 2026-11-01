@@ -23,7 +23,9 @@ core variant by rows (``batch_table`` syntax) of every q (default VARIANT[q]: ro
 a q without a table keep FlashInfer); ``VLLM_K31_DSA_CORE_SKIP_LAYERS`` = DSA layers
 (ordinals 0 .. 23, ';' or ',' separated) that keep FlashInfer;
 ``VLLM_K31_DSA_CORE_SPREAD`` = rows whose pushed DcpValue spreads its merge (see
-SPREAD). ``VLLM_K31_DSA_CORE_STATS=1`` logs the kernel's error word at exit.
+SPREAD). ``VLLM_K31_DSA_CORE_STATS=1`` logs the kernel's error word at exit, and (with
+the core on or off) per DSA layer and rows the histogram of each step's largest local
+count (``CountStats``).
 """
 
 from __future__ import annotations
@@ -85,6 +87,10 @@ VARIANT_ENV = ENV + "_VARIANT"
 # layer balanced, -2.6 / -3.8 at 384 entries, +1.0 / -0.2 at 600, +24 at 2048.
 VARIANT = {8: "1-16:2x16s2"}
 SKIP_ENV = ENV + "_SKIP_LAYERS"
+STATS_ENV = ENV + "_STATS"
+# CountStats' bins of a step's largest local count (the core walks its longest row's
+# 64-key chunks serially): up to each of these, and above the last.
+COUNT_BINS = (64, 128, 192, 256, 384, 640, 1024)
 SPREAD_ENV = ENV + "_SPREAD"
 # Rows whose pushed DcpValue spreads every row's merge over its CTAs (Rubin schedule,
 # LSE box [CAP, H, DCP]; spec verify rows only) instead of one merge CTA per (head, 16
@@ -166,7 +172,7 @@ class DsacDecode:
             VARIANT if self.spec is None else f"{self.spec} at every q",
             sorted(self.skip) or "none",
         )
-        if os.environ.get(ENV + "_STATS") == "1":
+        if os.environ.get(STATS_ENV) == "1":
             atexit.register(self._report)
 
     def _report(self) -> None:
@@ -229,6 +235,58 @@ class DsacDecode:
             umma=heads == 0,
             lse_wide=lse_wide,
         )
+
+
+class CountStats:
+    """``VLLM_K31_DSA_CORE_STATS=1`` (the core on or off): per (DSA layer, rows) the
+    histogram over steps of the largest local count of the step's rows (the #63
+    merge's counts on this rank; COUNT_BINS), accumulated on the device inside the
+    captured graphs and printed at exit. The core's time follows its longest row."""
+
+    def __init__(self, device: torch.device):
+        self.edges = torch.tensor(COUNT_BINS, dtype=torch.int32, device=device)
+        self.one = torch.ones(1, dtype=torch.int64, device=device)
+        self.hist: dict[tuple[int, int], torch.Tensor] = {}
+        atexit.register(self.report)
+
+    def reserve(self, layer: int, rows: int) -> None:
+        """The histogram of (layer, rows), allocated before any capture."""
+        if (layer, rows) not in self.hist:
+            bins = len(COUNT_BINS) + 1
+            self.hist[layer, rows] = self.one.new_zeros(bins)
+
+    def record(self, layer: int, rows: int, counts: torch.Tensor) -> None:
+        hist = self.hist.get((layer, rows))
+        if hist is not None:
+            top = counts[:rows].amax().view(1)
+            hist.index_add_(0, torch.bucketize(top, self.edges), self.one)
+
+    def report(self) -> None:
+        import torch.distributed as dist
+
+        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        names = [f"<={b}" for b in COUNT_BINS] + [f">{COUNT_BINS[-1]}"]
+        try:
+            hists = {k: v.tolist() for k, v in sorted(self.hist.items())}
+        except Exception as e:  # (CUDA already torn down)
+            logger.warning("Kimi K3.1 DSA count stats unavailable: %s", e)
+            return
+        for (layer, rows), counts in hists.items():
+            if any(counts):
+                bins = " ".join(f"{n}:{c}" for n, c in zip(names, counts) if c)
+                print(f"K31 DSAC counts rank {rank} layer {layer} rows {rows}: {bins}")
+
+
+_STATS: dict = {}
+
+
+def count_stats(device: torch.device) -> CountStats | None:
+    """The device's CountStats under VLLM_K31_DSA_CORE_STATS=1, else None."""
+    if os.environ.get(STATS_ENV) != "1":
+        return None
+    if device not in _STATS:
+        _STATS[device] = CountStats(device)
+    return _STATS[device]
 
 
 def build(model) -> DsacDecode | None:

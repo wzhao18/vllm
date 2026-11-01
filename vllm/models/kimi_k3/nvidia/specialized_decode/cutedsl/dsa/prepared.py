@@ -355,6 +355,13 @@ class PreparedDsa:
             from ....dsa_kernels.dsa_core.decode import MergeRows
 
             self.dsac, self.dsac_rows = dsac, MergeRows(self.indexer_stage)
+        # VLLM_K31_DSA_CORE_STATS=1: each step's largest local count of the merge
+        # (dsa_core.decode.CountStats), with the core on or off.
+        self.count_stats = None
+        if self.fi is not None and self.dcp > 1:
+            from ....dsa_kernels.dsa_core.decode import count_stats
+
+            self.count_stats = count_stats(self.device)
         # TP on FlashInfer: the fused decode indexer (prepare_cache; None: stock).
         self.fused: FusedIndexer | None = None
 
@@ -404,6 +411,8 @@ class PreparedDsa:
                 )
             if self.dsac is not None and partials == "bf16":
                 self.prepare_core(batch, q, specs[4], sms)
+            if self.count_stats is not None:
+                self.count_stats.reserve(self.dsa_layer, batch)
         rows = max(self.pitches)
         if fused:
             # Every mode but the late ones has the select right before the decode
@@ -492,6 +501,8 @@ class PreparedDsa:
         stage = self.query_stage
         args = stage.q_fp8, stage.head_w, md, stride_rows, batch
         sel, counts = self.dsac_rows.rows(*args, q=q)
+        if self.count_stats is not None:
+            self.count_stats.record(self.dsa_layer, batch, counts)
         if join is not None:
             join()
         impl = self.impl  # FlashInfer's scales of this layer (attn_fi.trtllm)
@@ -648,6 +659,8 @@ class PreparedDsa:
                 interleave = indexer.cp_kv_cache_interleave_size
                 args = topk, md, batch, stride_rows, interleave
                 merged = self.fi.convert(*args)
+            if self.count_stats is not None:
+                self.count_stats.record(self.dsa_layer, batch, merged[1])
             if join is not None:
                 join()
             latent, lse = self.fi.decode(query, cache, *merged, md.block_size)
