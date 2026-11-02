@@ -280,11 +280,12 @@ def _check_workspace(
 
 
 # (MLA cache dtype, indexer key format): MXFP4 keys (the K3.1 default on SM100)
-# with the per-tensor fp8 MLA cache they are deployed with.
+# with the per-tensor fp8 MLA cache they are deployed with, or nvfp4_ds_mla.
 LAYOUT_CASES = [
     pytest.param("fp8", "fp8", id="fp8"),
     pytest.param("nvfp4_ds_mla", "fp8", id="nvfp4_ds_mla"),
     pytest.param("fp8", "mxfp4", id="fp8-mxfp4_index"),
+    pytest.param("nvfp4_ds_mla", "mxfp4", id="nvfp4_ds_mla-mxfp4_index"),
 ]
 
 
@@ -513,13 +514,25 @@ def _fp8_query(num_tokens: int, num_heads: int) -> torch.Tensor:
     return q.to(torch.float8_e4m3fn)
 
 
+def _key_insert(layout):
+    """The stock indexer key writer of ``layout``'s key format (fp8 or MXFP4)."""
+    if layout.index_row_bytes == INDEX_ROW["mxfp4"]:
+        from vllm.models.kimi_k3.nvidia.ops.dsa_indexer_mxfp4 import (
+            mxfp4_k_norm_quant_insert,
+        )
+
+        return mxfp4_k_norm_quant_insert
+    from vllm.models.kimi_k3.nvidia.ops.dsa_indexer import (
+        indexer_k_norm_quant_insert,
+    )
+
+    return indexer_k_norm_quant_insert
+
+
 def _real_rows(rep: Replicated, cache_dtype: str):
     """Write real MLA and indexer rows of every token into ``rep``; returns
     the new tokens' latents (to write them as forward_impl does)."""
     from vllm import _custom_ops as ops
-    from vllm.models.kimi_k3.nvidia.ops.dsa_indexer import (
-        indexer_k_norm_quant_insert,
-    )
 
     seq_lens = [c + n for c, n in rep.lens]
     slots = torch.from_numpy(
@@ -535,7 +548,7 @@ def _real_rows(rep: Replicated, cache_dtype: str):
     norm = torch.ones(INDEX_HEAD_DIM, dtype=torch.bfloat16, device="cuda")
     # The insert also clears that many top-k rows.
     scratch = torch.empty(len(slots), TOPK, dtype=torch.int32, device="cuda")
-    indexer_k_norm_quant_insert(
+    _key_insert(rep.layout)(
         torch.randn(len(slots), INDEX_HEAD_DIM, device="cuda").bfloat16(),
         norm,
         torch.zeros_like(norm),
@@ -557,10 +570,6 @@ def _separable_decode_keys(rep: Replicated, num_decodes: int) -> torch.Tensor:
     get the key +v and the others -v, so a query along v scores TOPK keys
     positive and the rest zero (after the ReLU), with no tie at the cut-off.
     Returns the sorted top-k positions, [num_decodes, TOPK]."""
-    from vllm.models.kimi_k3.nvidia.ops.dsa_indexer import (
-        indexer_k_norm_quant_insert,
-    )
-
     gen = torch.Generator().manual_seed(3)
     v = _decode_query_direction()
     expected = []
@@ -573,7 +582,7 @@ def _separable_decode_keys(rep: Replicated, num_decodes: int) -> torch.Tensor:
         slots = page * PAGE + torch.arange(seq_len, device="cuda")
         norm = torch.ones(INDEX_HEAD_DIM, dtype=torch.bfloat16, device="cuda")
         scratch = torch.empty(seq_len, TOPK, dtype=torch.int32, device="cuda")
-        indexer_k_norm_quant_insert(
+        _key_insert(rep.layout)(
             (sign * v).bfloat16(),
             norm,
             torch.zeros_like(norm),
@@ -1014,8 +1023,9 @@ def _indexer_topk(
         indexer.score(hidden, index_q, index_weights, index_k=None)
 
 
-def _layer_worker(rank, world, init_file, cache_dtype, kernel):
-    """One rank of a DCP = TP group running a real K3.1 DSA layer.
+def _layer_worker(rank, world, init_file, cache_dtype, kernel, index_format="fp8"):
+    """One rank of a DCP = TP group running a real K3.1 DSA layer (its indexer
+    keys in ``index_format``).
 
     The model and its metadata builders register their JIT kernels with a
     warmup registry, which warms them through the runner's path. The MLA
@@ -1067,6 +1077,8 @@ def _layer_worker(rank, world, init_file, cache_dtype, kernel):
     )
     config.parallel_config.decode_context_parallel_size = world
     config.cache_config.cache_dtype = cache_dtype
+    if index_format == "mxfp4":
+        config.attention_config.indexer_kv_dtype = "mxfp4"
     config.attention_config.backend = AttentionBackendEnum.FLASHINFER_MLA_SPARSE
     config.kernel_config.flashinfer_sparse_mla_kernel = kernel
     config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
@@ -1136,7 +1148,8 @@ def _layer_worker(rank, world, init_file, cache_dtype, kernel):
                 spec, [layer.layer_name], config, device
             )
             for name, lens in LAYER_STEPS.items():
-                rep = Replicated(lens, _layout(cache_dtype), fill_random=False)
+                layout = _layout(cache_dtype, index_format)
+                rep = Replicated(lens, layout, fill_random=False)
                 kv_c, k_pe, _ = _real_rows(rep, cache_dtype)
                 num_decodes = _leading(lens, 1)
                 num_decode_tokens = sum(n for _, n in lens[:num_decodes])
@@ -1277,7 +1290,8 @@ def _layer_worker(rank, world, init_file, cache_dtype, kernel):
                 ([(100, 1), (3000, 600), (2900, 300)], dcp.FEW_TOKENS),
                 ([(100, 1), (3000, 1)], None),
             ):
-                rep = Replicated(lens, _layout(cache_dtype), fill_random=False)
+                layout = _layout(cache_dtype, index_format)
+                rep = Replicated(lens, layout, fill_random=False)
                 shard = _shard(rep, world, rank, seed=rank, mla_block=LAYER_BLOCK)
                 before = dict(builder.dcp_shardq.stats.total)
                 assert (
@@ -1335,9 +1349,10 @@ def test_dsa_layer_runs_dcp_prefill_as_shardq(cache_dtype, kernel, tmp_path):
     )
 
 
-def _profile_worker(rank, world, init_file, cache_dtype, kernel):
+def _profile_worker(rank, world, init_file, cache_dtype, kernel, index_format="fp8"):
     """One rank of a DCP = TP prefill instance with DCP ShardQ on the a2a DCP
-    backend, whose steps rarely keep the DCP path.
+    backend, whose steps rarely keep the DCP path (its indexer keys in
+    ``index_format``).
 
     Its memory profile run (the layer without attention metadata) runs the DCP
     path's collectives at the profile's size, beyond the direct workspace, so
@@ -1380,6 +1395,8 @@ def _profile_worker(rank, world, init_file, cache_dtype, kernel):
     config.parallel_config.decode_context_parallel_size = world
     config.parallel_config.dcp_comm_backend = "a2a"
     config.cache_config.cache_dtype = cache_dtype
+    if index_format == "mxfp4":
+        config.attention_config.indexer_kv_dtype = "mxfp4"
     config.attention_config.backend = AttentionBackendEnum.FLASHINFER_MLA_SPARSE
     config.kernel_config.flashinfer_sparse_mla_kernel = kernel
     config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
@@ -1485,7 +1502,8 @@ def _profile_worker(rank, world, init_file, cache_dtype, kernel):
             jit_monitor._handle_jit_event = record
             jit_monitor.activate()
 
-            rep = Replicated(lens, _layout(cache_dtype), fill_random=False)
+            layout = _layout(cache_dtype, index_format)
+            rep = Replicated(lens, layout, fill_random=False)
             kv_c, k_pe, _ = _real_rows(rep, cache_dtype)
             shard = _shard(rep, world, rank, seed=rank, mla_block=LAYER_BLOCK)
             q = torch.randn(
@@ -1586,3 +1604,34 @@ def test_context_layout_of_the_indexer_cache_format(fp4, entry, split):
     assert layout is not None
     assert (layout.index_row_bytes, layout.index_scale_bytes) == split
     assert layout.index_page_bytes == 64 * entry
+
+
+# P's MXFP4 indexer keys (#56: indexer_kv_dtype="mxfp4"): the DSA layer under DCP
+# ShardQ prefill and the profile run on 64 + 4 B key rows written by the stock MXFP4
+# writer. The layer test takes 4 ranks: LAYER_STEPS' short pieces are MLA decodes at
+# 4 local heads (decode threshold 1024 tokens), prefills at 8 (128).
+
+
+@pytest.mark.skipif(torch.accelerator.device_count() < 4, reason="needs 4 GPUs")
+@pytest.mark.parametrize(("cache_dtype", "kernel"), KERNEL_CASES)
+def test_dsa_layer_runs_dcp_prefill_as_shardq_on_mxfp4_keys(
+    cache_dtype, kernel, tmp_path
+):
+    import torch.multiprocessing as mp
+
+    init = str(tmp_path / "dist_init")
+    mp.spawn(_layer_worker, args=(4, init, cache_dtype, kernel, "mxfp4"), nprocs=4)
+
+
+@pytest.mark.skipif(torch.accelerator.device_count() < 2, reason="needs 2 GPUs")
+@pytest.mark.parametrize(("cache_dtype", "kernel"), KERNEL_CASES)
+def test_profile_run_warms_the_dcp_path_on_mxfp4_keys(cache_dtype, kernel, tmp_path):
+    import torch.multiprocessing as mp
+
+    world = min(torch.accelerator.device_count(), 4)
+    init = str(tmp_path / "dist_init")
+    mp.spawn(
+        _profile_worker,
+        args=(world, init, cache_dtype, kernel, "mxfp4"),
+        nprocs=world,
+    )
