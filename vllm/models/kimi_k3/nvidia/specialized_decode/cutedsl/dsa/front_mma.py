@@ -60,10 +60,10 @@ from ..common.primitives import (
 from ..mla.query import pow2_ceil
 from .index import (
     DIM,
-    FP4_SCALES,
     FP4_WEIGHT,
     HEADS,
     e2m1x2,
+    fp4_query_rows,
     insert_key,
     is_fp4_cache,
     mxfp4_scale,
@@ -455,13 +455,13 @@ class IndexFrontMma:
                         inverse, byte = mxfp4_scale(amax)
                         value = values[j] * inverse
                         pair = cute.arch.shuffle_sync_bfly(value, 1)
-                        row = at(q_out, row0 + column, 0, 0)
+                        row, scales = fp4_query_rows(q_out, row0 + column)
                         if tid % 2 == 0:
                             store_b8(
                                 row + head * (DIM // 2) + tid // 2, e2m1x2(value, pair)
                             )
                         if lane == 0:
-                            store_b8(row + FP4_SCALES + head * 4 + warp, byte)
+                            store_b8(scales + head * 4 + warp, byte)
                         if tid == 0:
                             weight = wv_s[c] * Float32(FP4_WEIGHT)
                             w_out[row0 + column, head] = BFloat16(weight)

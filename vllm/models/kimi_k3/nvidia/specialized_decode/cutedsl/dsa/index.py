@@ -19,9 +19,10 @@ indexer_kv_dtype='mxfp4', kimi_k3_indexer_uses_fp4): the query and the key are M
 as the writers of nvidia/ops/dsa_indexer_mxfp4.py make them (_mxfp4_quant: one
 UE8M0 scale per 32 values, E2M1 round to nearest even with saturation), the head
 weights only take the indexer weight scale (the MX scales stay in the logits MMA),
-and the cache block is [64 x 64 B E2M1 | 64 x 4 UE8M0]. The FP4 query lives in the
-FP8 query's rows (FP4_QUERY_ROW bytes per row): [32 heads x 64 B E2M1 | 32 heads x
-4 UE8M0] (fp4_query_views).
+and the cache block is [64 x 64 B E2M1 | 64 x 4 UE8M0]. The FP4 query of a step of
+B rows lives in the FP8 query buffer as DeepGEMM reads it (fp4_query_views): the
+rows' E2M1 [B, 32 heads, 64 B] from its start, then their UE8M0 x4 [B, 32 heads]
+(four bytes per head) at B x FP4_ROW bytes.
 """
 
 import cutlass
@@ -43,7 +44,7 @@ from ..mla.query import half_warp_max, pow2_ceil
 
 HEADS, DIM = 32, 128
 FP4_ENTRY = DIM // 2 + DIM // 32  # MXFP4 indexer cache bytes per token
-FP4_SCALES = HEADS * DIM // 2  # byte offset of an FP4 query row's scales
+FP4_ROW = HEADS * DIM // 2  # E2M1 query bytes per row
 FP4_WEIGHT = (HEADS * DIM) ** -0.5  # stock's weight scale (exact power of two)
 
 
@@ -52,20 +53,22 @@ def is_fp4_cache(cache) -> bool:
     return cache.shape[-1] == FP4_ENTRY
 
 
-def fp4_query_views(q_rows: torch.Tensor, rows: int):
-    """The MXFP4 query in the FP8 query buffer ``q_rows`` [>= rows, 32, 128] uint8:
-    (E2M1 [rows, 32, 64] uint8, UE8M0 x4 [rows, 32] int32), row stride 4 KiB."""
-    pitch = HEADS * DIM
-    base = q_rows.reshape(-1)
-    packed = torch.as_strided(base, (rows, HEADS, DIM // 2), (pitch, DIM // 2, 1))
-    words = base.view(torch.int32)
-    scales = torch.as_strided(
-        words,
-        (rows, HEADS),
-        (pitch // 4, 1),
-        storage_offset=words.storage_offset() + FP4_SCALES // 4,
-    )
-    return packed, scales
+def fp4_query_views(q_rows: torch.Tensor, batch: int, rows: int):
+    """The MXFP4 query of the first ``rows`` rows of a ``batch``-row step in the
+    FP8 query buffer ``q_rows`` [>= batch, 32, 128] uint8 (contiguous): (E2M1
+    [rows, 32, 64] uint8, UE8M0 x4 [rows, 32] int32), both contiguous views."""
+    assert rows <= batch <= q_rows.shape[0], (rows, batch, q_rows.shape)
+    flat = q_rows.view(-1)
+    packed = flat[: rows * FP4_ROW].view(rows, HEADS, DIM // 2)
+    scales = flat[batch * FP4_ROW :][: rows * HEADS * 4].view(torch.int32)
+    return packed, scales.view(rows, HEADS)
+
+
+def fp4_query_rows(q_out, b):
+    """Pointers to row ``b``'s E2M1 query and its heads' UE8M0 x4 in the FP8 query
+    buffer ``q_out`` [batch, 32, 128] of a kernel (fp4_query_views)."""
+    base = at(q_out, 0, 0, 0)
+    return base + b * FP4_ROW, base + q_out.shape[0] * FP4_ROW + b * (HEADS * 4)
 
 
 @asm((Float32, Uint32), pure=True)
@@ -166,11 +169,11 @@ class DsaIndex:
         cute.arch.griddepcontrol_wait()
         cute.arch.griddepcontrol_launch_dependents()
         if cutlass.const_expr(is_fp4_cache(cache)):
-            row = at(q_out, token, 0, 0)
+            row, scales = fp4_query_rows(q_out, token)
             for p in cutlass.range_constexpr(2):
                 head = p * 16 + warp * 2 + half
                 values = load_bf16x8(at(iq, token, head * DIM + column), mutable=True)
-                quantize_fp4_query(values, 8, row, head, lane % 16, lane)
+                quantize_fp4_query(values, 8, row, scales, head, lane % 16, lane)
                 if lane % 16 == 0:
                     wv = Float32(projected[token, self.weight + head])
                     w_out[token, head] = BFloat16(wv * Float32(FP4_WEIGHT))
@@ -203,11 +206,14 @@ class DsaIndex:
 
 
 @cute.jit
-def quantize_fp4_query(values, per_lane: cutlass.Constexpr[int], row, head, part, lane):
+def quantize_fp4_query(
+    values, per_lane: cutlass.Constexpr[int], row, scales, head, part, lane
+):
     """MXFP4 of ``per_lane`` (4 or 8) consecutive columns of one head, columns
-    ``part * per_lane`` on, into the FP4 query row at pointer ``row``: E2M1 at
-    head * 64, the head's four UE8M0 bytes at FP4_SCALES + head * 4 (written by
-    the lane of part 0; the head's parts are consecutive aligned lanes)."""
+    ``part * per_lane`` on, into an FP4 query row (fp4_query_rows): E2M1 at
+    ``row`` + head * 64, the head's four UE8M0 bytes at ``scales`` + head * 4
+    (written by the lane of part 0; the head's parts are consecutive aligned
+    lanes)."""
     group = 32 // per_lane  # lanes of one 32-value block
     amax = Float32(0)
     for i in cutlass.range_constexpr(per_lane):
@@ -224,7 +230,7 @@ def quantize_fp4_query(values, per_lane: cutlass.Constexpr[int], row, head, part
         store_b16(data, word)
     word = gather_bytes(byte, lane, group)
     if part == 0:
-        store_words(row + FP4_SCALES + head * 4, (word,))
+        store_words(scales + head * 4, (word,))
 
 
 @cute.jit

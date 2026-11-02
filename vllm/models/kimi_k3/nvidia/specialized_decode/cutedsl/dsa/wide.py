@@ -431,7 +431,7 @@ class WideDsa:
         indexer, fp4 = self.indexer, self.indexer.use_fp4_cache
         query = self.q_fp8[:batch].view(torch.float8_e4m3fn), None
         if fp4:
-            query = tuple(t.contiguous() for t in fp4_query_views(self.q_fp8, batch))
+            query = fp4_query_views(self.q_fp8, batch, batch)
         return torch.ops.vllm.sparse_attn_indexer(
             projected,
             self.k_cache_name,

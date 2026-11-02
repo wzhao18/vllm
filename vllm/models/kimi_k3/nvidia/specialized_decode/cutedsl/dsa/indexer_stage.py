@@ -64,21 +64,20 @@ class IndexerStage:
         self.fused = None
         # -----------------------------------------------------------------------
 
-    def query(self, q_fp8, rows):
-        """The stock op's (query, its scales or None) of the first ``rows`` rows:
-        FP8 [rows, 32, 128] (scales folded into the head weights), or MXFP4 E2M1
-        [rows, 32, 64] and UE8M0 x4 [rows, 32] (contiguous copies of the views in
-        the query rows, index.py)."""
+    def query(self, q_fp8, rows, batch):
+        """The stock op's (query, its scales or None) of the first ``rows`` rows of a
+        ``batch``-row step: FP8 [rows, 32, 128] (scales folded into the head
+        weights), or MXFP4 E2M1 [rows, 32, 64] and UE8M0 x4 [rows, 32] (contiguous
+        views of the query DsaIndex wrote, index.fp4_query_views)."""
         if not self.fp4:
             return q_fp8[:rows].view(torch.float8_e4m3fn), None
-        packed, scales = fp4_query_views(q_fp8, rows)
-        return packed.contiguous(), scales.contiguous()
+        return fp4_query_views(q_fp8, batch, rows)
 
     def run(self, projected, q_fp8, head_w):
         """Top-k of the current rows into the shared buffer (stock decode scoring)."""
         indexer, batch = self.indexer, projected.shape[0]
         assert is_fp4_cache(indexer.k_cache.kv_cache) == self.fp4
-        query, q_scale = self.query(q_fp8, batch)
+        query, q_scale = self.query(q_fp8, batch, batch)
         return torch.ops.vllm.sparse_attn_indexer(
             projected,
             self.k_cache_name,
@@ -215,7 +214,7 @@ class IndexerStage:
                 slots[rows:].fill_(-1)
                 valid[rows:].zero_()
             return slots, valid
-        logits = self.decode_logits(q_fp8, head_w, decode, rows)
+        logits = self.decode_logits(q_fp8, head_w, decode, rows, batch)
         # SM100 DeepGEMM emits bf16 at a 1 KiB row stride (DeepSelect's input).
         assert logits.dtype == torch.bfloat16 and is_deep_select_supported(logits, n)
         reqs = decode.decode_lens.shape[0]
@@ -233,9 +232,10 @@ class IndexerStage:
             valid[rows:].zero_()
         return slots, valid
 
-    def decode_logits(self, q_fp8, head_w, decode, rows):
-        """The bf16 paged MQA logits of the first ``rows`` rows, as the stock op's
-        decode branch computes them (uniform rows; FP8 or MXFP4 cache and query)."""
+    def decode_logits(self, q_fp8, head_w, decode, rows, batch):
+        """The bf16 paged MQA logits of the first ``rows`` rows of a ``batch``-row
+        step, as the stock op's decode branch computes them (uniform rows; FP8 or
+        MXFP4 cache and query)."""
         from vllm.model_executor.layers.sparse_attn_indexer import (
             kv_cache_as_quant_view,
         )
@@ -245,9 +245,10 @@ class IndexerStage:
         )
 
         reqs = decode.decode_lens.shape[0]
-        query, q_scale = self.query(q_fp8, rows)
+        query, q_scale = self.query(q_fp8, rows, batch)
         query = query.view(reqs, rows // reqs, *query.shape[1:])
-        if q_scale is not None:
+        if q_scale is not None:  # DeepGEMM tags packed FP4 as int8 (kPackedFP4)
+            query = query.view(torch.int8)
             q_scale = q_scale.view(reqs, rows // reqs, -1)
         q_scale, weights = mqa_logits_mx_inputs(query, q_scale, head_w[:rows])
         return fp8_fp4_paged_mqa_logits(
@@ -266,7 +267,7 @@ class IndexerStage:
         this rank's KV slots of the exact global top-k of the same logits and the
         MLA impl's ``dcp_local_topk_counts`` gives their counts."""
         slots, valid = self.dcp_rows[:batch], self.dcp_valid[:batch]
-        logits = self.decode_logits(q_fp8, head_w, decode, rows)
+        logits = self.decode_logits(q_fp8, head_w, decode, rows, batch)
         run(logits, decode, slots[:rows])
         counts = self.impl.dcp_local_topk_counts(rows)
         assert counts is not None, "DcpExchange admitted a step it did not serve"

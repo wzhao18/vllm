@@ -50,6 +50,7 @@ from .index import (
     DIM,
     FP4_WEIGHT,
     HEADS,
+    fp4_query_rows,
     insert_key,
     is_fp4_cache,
     quantize_fp4_query,
@@ -219,7 +220,8 @@ class IndexFront:
                 for i in range(4)
             ]
             if cutlass.const_expr(is_fp4_cache(cache)):  # MXFP4 (index.py)
-                quantize_fp4_query(values, 4, at(q_out, b, 0, 0), head, lane, lane)
+                codes, scales = fp4_query_rows(q_out, b)
+                quantize_fp4_query(values, 4, codes, scales, head, lane, lane)
                 if lane == 0:
                     wv = Float32(projected[b, self.weight + head])
                     w_out[b, head] = BFloat16(wv * Float32(FP4_WEIGHT))
