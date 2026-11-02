@@ -120,6 +120,14 @@ def load_i32(address):
     return "ld.global.b32 $0, [$1];", "=r,l,~{memory}", (Int64(address),)
 
 
+@asm(Int32)
+def load_shared_acquire(pointer):
+    """A shared word read before any later memory operation of this thread, e.g.
+    the mbarrier arrive that frees its buffer (ptxas issues that arrive without
+    waiting for a plain ld.shared)."""
+    return "ld.acquire.cta.shared::cta.b32 $0, [$1];", "=r,r,~{memory}", (pointer,)
+
+
 @cute.jit
 def stride_pages(page, tensor):
     """The element offset of page ``page`` of ``tensor`` (mode 0), in 64 bits."""
@@ -793,7 +801,10 @@ class IndexerScore:
                         stage = it % STAGES
                         key = k0 + t * TILE + lt
                         cute.arch.mbarrier_wait(kv_full + stage, (it // STAGES) & 1)
-                        scale_bits = sSc[lt, stage]
+                        # Read before the arrive frees the stage: else the next
+                        # tile's scale copy can land under it (wrong key scales).
+                        scale_at = sSc.iterator + stage * TILE + lt
+                        scale_bits = load_shared_acquire(scale_at)
                         cute.arch.mbarrier_arrive(sc_empty + stage)
                         # UE8M0: the low byte is the biased exponent.
                         kscale = cute.math.exp2(Float32((scale_bits & 0xFF) - 127))
