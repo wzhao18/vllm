@@ -22,6 +22,7 @@ from ..common.primitives import (
     copy_evict,
     copy_g2s,
     copy_s2cluster,
+    div_rn,
     float_bits,
     fma,
     fma2,
@@ -176,7 +177,14 @@ class MlaQuery:
     bytes it wrote into head block ``rank`` of every rank's Lamport q mailbox
     (mla.dcp.DcpBox), then polls its share of the gathered mailbox until no word is
     the sentinel, so the next kernel reads the gathered query. DSA publishes BF16
-    rows into a mailbox of ``q_heads`` (FlashMLA's padding) rows per token."""
+    rows into a mailbox of ``q_heads`` (FlashMLA's padding) rows per token.
+
+    DSA query overlap (dsa.overlap): ``store_qc=False`` leaves the q_c rows to
+    QueryNorm and ``gather=False`` leaves the mailbox poll to QueryWait.
+
+    A per-tensor FP8 KV row is divided by k_scale (``args[8]``) as
+    concat_and_cache_mla does under DSA, and multiplied by its inverse (``args[8]``)
+    as K3 MLA's fused insert does."""
 
     def __init__(
         self,
@@ -196,6 +204,9 @@ class MlaQuery:
         dsa: bool = False,
         fp8: bool = False,
         q_heads: int = 0,
+        store_qc: bool = True,
+        late: bool = False,
+        release: bool = True,
     ):
         # ``rope``: GPT-J RoPE of the query and key rope columns at the rows'
         # positions (args then end with positions [B] int64 and the FP32 cos/sin
@@ -206,6 +217,16 @@ class MlaQuery:
         tiled = (DRAFT_TILED_FROM if rope else TILED_FROM)[heads]
         self.heads, self.batch, self.wide = heads, batch, batch >= tiled
         self.dcp, self.dsa = dcp, dsa
+        self.qc_rows = dsa and store_qc
+        # DSA "late" query overlap (TP): launched after the indexer's last kernel,
+        # whose inputs it does not read, it runs beside it and waits for it (the
+        # PDL dependency) only at its end, so the sparse core still waits for both.
+        assert not late or (dsa and not dcp), "late: the TP DSA query only"
+        self.late = late
+        # release: launch the next kernel early (PDL); off when it reads this
+        # kernel's outputs before its own PDL wait (FlashInfer prims_ts' split-KV
+        # decode after a late query).
+        self.release = release
         # fp8_ds_mla cache with a BF16 query (FlashMLA sparse), else per-tensor FP8.
         self.ds = dsa and not fp8
         # q mailbox geometry: rows per token, element bytes, args index of the box.
@@ -462,8 +483,7 @@ class MlaQuery:
                 src = w_qb.iterator + (head * 192 + part * R) * 1536 + c * 8
                 copy_evict(dst, src)
             cute.arch.cp_async_commit_group()
-        cute.arch.griddepcontrol_wait()
-        cute.arch.griddepcontrol_launch_dependents()
+        self.pdl_start()
         qsi = q_scale_inv[0]
         xv = cute.make_rmem_tensor((B, 8), Float32)
         for b in cutlass.range_constexpr(B):
@@ -488,7 +508,7 @@ class MlaQuery:
                 for i in cutlass.range_constexpr(8):
                     xq[b, tid * 8 + i] = BFloat16(xv[b, i] * rr * weights[i])
         cute.arch.sync_threads()
-        if cutlass.const_expr(self.dsa):
+        if cutlass.const_expr(self.qc_rows):
             self.store_qc(args, xq.iterator, 1536, tok0, B, (part, head), tid)
         if cutlass.const_expr(self.q_b_cp_async):
             cute.arch.cp_async_wait_group(0)
@@ -556,6 +576,27 @@ class MlaQuery:
             self.insert(args, ss, tok0, part, valid, tid)
         if cutlass.const_expr(self.dcp and self.gather):
             self.gathered(args, tid)
+        if cutlass.const_expr(self.late):
+            cute.arch.griddepcontrol_wait()
+
+    @cute.jit
+    def pdl_start(self):
+        """The PDL wait for the kernel before (late: none, see __init__) and the
+        early launch of the next one."""
+        if cutlass.const_expr(not self.late):
+            cute.arch.griddepcontrol_wait()
+        if cutlass.const_expr(self.release):
+            cute.arch.griddepcontrol_launch_dependents()
+
+    @cute.jit
+    def kv_fp8(self, value, scale):
+        """The pre-FP8 value of a per-tensor FP8 KV element: under DSA divided by
+        k_scale (concat_and_cache_mla), else times its inverse (K3 MLA's insert)."""
+        if cutlass.const_expr(self.dsa):  # noqa: SIM108 (compile time)
+            value = div_rn(value, scale)
+        else:
+            value = value * scale
+        return value
 
     @cute.jit
     def insert(self, args, ss, tok0, j, valid, tid):
@@ -572,7 +613,7 @@ class MlaQuery:
         if valid:
             slot = slots[tok0 + j]
         if slot >= 0:
-            ksi = k_scale_inv[0]
+            ks = k_scale_inv[0]  # k_scale under DSA, else its inverse
             xx = cute.make_rmem_tensor(8, Float32)
             total = Float32(0)
             if tid < 64:
@@ -592,7 +633,7 @@ class MlaQuery:
                 weights = load_bf16x8(w_kva.iterator + tid * 8)
                 for i in cutlass.range_constexpr(8):
                     normed = Float32(BFloat16(xx[i] * rr * weights[i]))
-                    cache[page, offset, tid * 8 + i] = fp8_bits(normed * ksi)
+                    cache[page, offset, tid * 8 + i] = fp8_bits(self.kv_fp8(normed, ks))
             elif tid < 72:
                 c = tid - 64
                 values = load_bf16x8(at(qkv, tok0 + j, 2048 + c * 8), mutable=True)
@@ -600,7 +641,8 @@ class MlaQuery:
                 if cutlass.const_expr(self.rope):
                     pe = rotate(pe, args[14][tok0 + j], args[15], c * 4)
                 for i in cutlass.range_constexpr(8):
-                    cache[page, offset, 512 + c * 8 + i] = fp8_bits(pe[i] * ksi)
+                    value = self.kv_fp8(pe[i], ks)
+                    cache[page, offset, 512 + c * 8 + i] = fp8_bits(value)
 
     @cute.jit
     def insert_ds(self, args, ss, tok0, j, valid, tid):
@@ -741,8 +783,7 @@ class MlaQuery:
         if tid < 192:
             copy_evict(qa.iterator + tid * 8, w_qa.iterator + tid * 8)
         cute.arch.cp_async_commit_group()
-        cute.arch.griddepcontrol_wait()
-        cute.arch.griddepcontrol_launch_dependents()
+        self.pdl_start()
         for c in range(tid, T * 192, 256):
             t, j = c // 192, c % 192
             if self.live(tok0 + t):
@@ -808,7 +849,7 @@ class MlaQuery:
         else:
             qbr = [[load_words(a, count=4) for a in chunk] for chunk in qb_at]
         cute.arch.sync_threads()
-        if cutlass.const_expr(self.dsa):
+        if cutlass.const_expr(self.qc_rows):
             self.store_qc(args, xq.iterator, KP, tok0, T, (part, head), tid)
         acc = zeros((MT * 3, 4), Float32)
         for cc in cutlass.range_constexpr(6):
@@ -911,6 +952,8 @@ class MlaQuery:
         cute.arch.cluster_wait()
         if cutlass.const_expr(self.dcp and self.gather):
             self.gathered(args, tid)
+        if cutlass.const_expr(self.late):
+            cute.arch.griddepcontrol_wait()
 
     @cute.jit
     def rope_rows(self, args, red, qblk, qo, tok0, tid, qsi):

@@ -36,7 +36,7 @@ import torch
 from cutlass.cute.runtime import make_fake_stream
 
 from ..common.host import fake, layout, stream, to_cute
-from ..mla.dcp import PROJECTED
+from .dcp_value import PROJECTED
 from ..mla.prepared import pad_requests
 from ..mla.value import MlaValue
 from .attn_ds import flashmla_core, flashmla_dcp_core

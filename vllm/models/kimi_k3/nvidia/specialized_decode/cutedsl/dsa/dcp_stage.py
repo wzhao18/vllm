@@ -18,7 +18,7 @@ import cutlass
 import torch
 
 from ..common.host import stream, to_cute
-from ..mla.dcp import compile_value
+from .dcp_value import compile_value
 
 
 def compile_dcp_value(
