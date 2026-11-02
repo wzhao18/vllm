@@ -365,8 +365,6 @@ class IndexFrontMma:
             if tid < owned:
                 wv_s[tid] = wv
             wait(bar_acc, 0)
-            # tcgen05.ld is .sync.aligned: reconverge after the per-thread wait.
-            cute.arch.sync_warp()
             fence_tmem()
             self.epilogue(args, tmem, mailbox, amax_s, wv_s, bar_red, row0, valid)
         release_tmem(tmem, self.columns, warp, 4)

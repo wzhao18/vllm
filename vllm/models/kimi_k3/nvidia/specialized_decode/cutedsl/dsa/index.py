@@ -175,14 +175,13 @@ class DsaIndex:
                     wv = Float32(projected[token, self.weight + head])
                     w_out[token, head] = BFloat16(wv * Float32(FP4_WEIGHT))
         else:
-            self.fp8_query(projected, iq, q_out, w_out, token, warp, lane)
+            self.fp8_query(projected, iq, q_out, w_out, token, warp, lane, half, column)
         if warp == 0:
             key = projected, self.key, norm_w, norm_b, cache, slots, token, eps
             insert_key(*key, self.mx, lane)
 
     @cute.jit
-    def fp8_query(self, projected, iq, q_out, w_out, token, warp, lane):
-        half, column = lane // 16, (lane % 16) * 8
+    def fp8_query(self, projected, iq, q_out, w_out, token, warp, lane, half, column):
         for p in cutlass.range_constexpr(2):
             head = p * 16 + warp * 2 + half
             values = load_bf16x8(at(iq, token, head * DIM + column), mutable=True)
