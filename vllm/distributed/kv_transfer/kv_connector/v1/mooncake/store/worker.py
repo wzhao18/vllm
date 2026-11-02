@@ -77,6 +77,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.protocol import
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.selective_lease import (  # noqa: E501
     SelectiveLookupLease,
+    lookup_store_timeout,
 )
 from vllm.distributed.mooncake_store import MooncakeStoreConfig, setup_mooncake_store
 from vllm.logger import init_logger
@@ -1785,6 +1786,7 @@ class MooncakeStoreWorker:
         self.token_dbs = self._build_token_databases(metadata, store_layout_cls)
         self._init_lookup_key_prefixes()
         if envs.VLLM_MOONCAKE_STORE_SELECTIVE_LEASE:
+            lookup_store_timeout_s = lookup_store_timeout(extra_config)
             self._selective_lease = SelectiveLookupLease(
                 self.store,
                 self.coord,
@@ -1792,7 +1794,16 @@ class MooncakeStoreWorker:
                 self._kv_cache_groups,
                 self._lookup_key_prefixes,
                 self._record_kv_connector_operation,
+                timeout_s=lookup_store_timeout_s,
             )
+            if self.lookup_server is not None:
+                self._selective_lease.check_master()
+                logger.info(
+                    "Mooncake selective lease on: the master serves "
+                    "batch_probe_key; a lookup's probe and leases bounded at "
+                    "%.1f s in total",
+                    lookup_store_timeout_s,
+                )
 
     def _supports_tp_sharded_store_layout(
         self,
@@ -2672,6 +2683,9 @@ class MooncakeStoreWorker:
             guard = getattr(thread, "store_guard", None) if thread else None
             if guard is not None:
                 guard.shutdown()
+        lease = getattr(self, "_selective_lease", None)
+        if lease is not None:
+            lease.close()
         try:
             store.close()
         except Exception as e:

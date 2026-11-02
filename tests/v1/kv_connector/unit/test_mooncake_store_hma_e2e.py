@@ -6,6 +6,7 @@
 import ctypes
 import sys
 import threading
+import time
 import types
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -1219,7 +1220,7 @@ class _LeaseTrackingStore(_DictStore):
         return super().batch_is_exist(keys)
 
 
-def _full_plus_mamba_worker(store, *, partial_hash_hits=False):
+def _full_plus_mamba_worker(store, *, partial_hash_hits=False, extra_config=None):
     """Full-attention + align-mode Mamba worker on ``store``."""
     full = FullAttentionSpec(block_size=16, num_kv_heads=8, head_size=64, dtype=None)
     mamba = MambaSpec(
@@ -1252,6 +1253,7 @@ def _full_plus_mamba_worker(store, *, partial_hash_hits=False):
         **({"cache_hit_alignment_tokens": 4} if partial_hash_hits else {}),
     )
     vllm_config = _minimal_vllm_config(cache_block_size=16)
+    vllm_config.kv_transfer_config.kv_connector_extra_config = dict(extra_config or {})
     if partial_hash_hits:
         # Hash unit 4 < Mamba block 16 enables partial hash hits.
         vllm_config.cache_config.prefix_match_unit = 4
@@ -1525,3 +1527,136 @@ def test_selective_lease_skips_units_below_local_hit(monkeypatch):
     assert [sorted(keys) for keys in store.lease_calls] == [
         sorted(_store_keys(worker, 0, hs[7]) + _store_keys(worker, 1, hs[7]))
     ]
+
+
+@pytest.mark.parametrize("stuck_call", ["batch_probe_key", "batch_is_exist"])
+def test_selective_lease_stuck_store_call_is_a_miss(monkeypatch, stuck_call):
+    """A probe or lease that does not return within lookup_store_timeout_s is a
+    miss; while it is out, lookups miss at once instead of queueing behind it,
+    and they hit again once it returns."""
+    monkeypatch.setenv("VLLM_MOONCAKE_STORE_SELECTIVE_LEASE", "1")
+    store = _LeaseTrackingStore()
+    worker = _full_plus_mamba_worker(
+        store, extra_config={"lookup_store_timeout_s": 0.2}
+    )
+    hs = _store_full_history(worker, store)
+    call = getattr(store, stuck_call)
+    release = threading.Event()
+    calls = 0
+
+    def stuck(keys):
+        nonlocal calls
+        calls += 1
+        assert release.wait(10), "test never released the stuck call"
+        return call(keys)
+
+    monkeypatch.setattr(store, stuck_call, stuck)
+
+    start = time.monotonic()
+    assert worker.lookup(num_tokens=65, block_hashes=hs).hit_length == 0
+    assert time.monotonic() - start < 1.0
+    assert worker.lookup(num_tokens=65, block_hashes=hs).hit_length == 0
+    assert calls == 1  # the second lookup never reached the store
+
+    release.set()
+    lease = worker._selective_lease
+    assert lease is not None and lease._guard is not None
+    deadline = time.monotonic() + 5
+    while lease._guard.degraded:
+        assert time.monotonic() < deadline, "the stuck call never returned"
+        time.sleep(0.01)
+    assert worker.lookup(num_tokens=65, block_hashes=hs).hit_length == 64
+
+
+def test_selective_lease_lookup_store_calls_share_the_bound(monkeypatch):
+    """lookup_store_timeout_s bounds the probe and the lease of one lookup
+    together: the lease waits only for what the probe left."""
+    monkeypatch.setenv("VLLM_MOONCAKE_STORE_SELECTIVE_LEASE", "1")
+    store = _LeaseTrackingStore()
+    worker = _full_plus_mamba_worker(store, extra_config={"lookup_store_timeout_s": 1})
+    hs = _store_full_history(worker, store)
+    probe = store.batch_probe_key
+    release = threading.Event()
+
+    def slow_probe(keys):
+        time.sleep(0.4)
+        return probe(keys)
+
+    def stuck_lease(keys):
+        assert release.wait(10), "test never released the stuck lease"
+        return [1] * len(keys)
+
+    monkeypatch.setattr(store, "batch_probe_key", slow_probe)
+    monkeypatch.setattr(store, "batch_is_exist", stuck_lease)
+    lease = worker._selective_lease
+    assert lease is not None and lease._guard is not None
+    guard_call = lease._guard.call
+    waits = []
+
+    def recording_call(op, fn, *args, keys=(), timeout_s=None):
+        waits.append((op, timeout_s))
+        return guard_call(op, fn, *args, keys=keys, timeout_s=timeout_s)
+
+    monkeypatch.setattr(lease._guard, "call", recording_call)
+    try:
+        assert worker.lookup(num_tokens=65, block_hashes=hs).hit_length == 0
+    finally:
+        release.set()
+
+    assert [op for op, _ in waits] == ["lookup_probe", "lookup_lease"]
+    assert all(wait is not None and 0 < wait <= 1 for _, wait in waits)
+    assert waits[1][1] <= 1 - 0.4
+
+
+@pytest.mark.parametrize(
+    "extra_config",
+    [
+        {"lookup_store_timeout_s": 10},
+        {"lookup_store_timeout_s": 3, "lookup_timeout_s": 2},
+    ],
+)
+def test_selective_lease_bound_stays_below_the_lookup_fallbacks(
+    monkeypatch, extra_config
+):
+    """lookup_store_timeout_s must end a lookup before it is a miss anyway: the
+    core's 10 s pending-lookup fallback and LookupKeyClient's lookup_timeout_s."""
+    monkeypatch.setenv("VLLM_MOONCAKE_STORE_SELECTIVE_LEASE", "1")
+    with pytest.raises(ValueError, match="lookup_store_timeout_s"):
+        _full_plus_mamba_worker(_LeaseTrackingStore(), extra_config=extra_config)
+
+
+def test_selective_lease_lookup_after_close_is_a_miss(monkeypatch):
+    """close() also shuts the lookup's store-call guard down: a late lookup is a
+    miss and reaches no store."""
+    monkeypatch.setenv("VLLM_MOONCAKE_STORE_SELECTIVE_LEASE", "1")
+    store = _LeaseTrackingStore()
+    worker = _full_plus_mamba_worker(store)
+    hs = _store_full_history(worker, store)
+    store.probed.clear()
+
+    worker.close()
+
+    assert worker.lookup(num_tokens=65, block_hashes=hs).hit_length == 0
+    assert not store.probed and not store.lease_calls
+
+
+@pytest.mark.parametrize("answer", ["error", "stuck"])
+def test_selective_lease_startup_check_fails_closed(monkeypatch, answer):
+    """The lookup rank probes the master once at startup and fails when it
+    answers with an error code, as a master older than the client does, or
+    not within lookup_store_timeout_s."""
+    monkeypatch.setenv("VLLM_MOONCAKE_STORE_SELECTIVE_LEASE", "1")
+    store = _LeaseTrackingStore()
+    release = threading.Event()
+
+    def probe(keys):
+        if answer == "stuck":
+            release.wait(10)
+        return [-1] * len(keys)
+
+    monkeypatch.setattr(store, "batch_probe_key", probe)
+    try:
+        with pytest.raises(RuntimeError, match="master"):
+            _full_plus_mamba_worker(store, extra_config={"lookup_store_timeout_s": 0.2})
+    finally:
+        release.set()

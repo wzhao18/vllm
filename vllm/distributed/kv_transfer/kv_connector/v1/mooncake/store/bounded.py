@@ -84,7 +84,9 @@ class StoreCallGuard:
         fn: Callable[..., _T],
         *args: Any,
         keys: Sequence[str] = (),
+        timeout_s: float | None = None,
     ) -> _T:
+        timeout = self.timeout_s if timeout_s is None else timeout_s
         with self._lock:
             if self._stuck is not None and not self._stuck.done():
                 self.counters.degraded_skips += 1
@@ -94,7 +96,7 @@ class StoreCallGuard:
                 )
             future = self._executor.submit(fn, *args)
         try:
-            return future.result(timeout=self.timeout_s)
+            return future.result(timeout=timeout)
         except FutureTimeoutError:
             pass
         with self._lock:
@@ -108,16 +110,14 @@ class StoreCallGuard:
             self.name,
             op,
             len(keys),
-            self.timeout_s,
-            "a cache miss" if "get" in op else "a dropped put",
+            timeout,
+            "a dropped put" if "put" in op else "a cache miss",
             counters.timeouts,
         )
         future.add_done_callback(
             lambda f, op=op, keys=list(keys): self._late(op, keys, f)  # type: ignore[misc]
         )
-        raise StoreCallTimeout(
-            f"{self.name}: {op} timed out after {self.timeout_s:.1f} s"
-        )
+        raise StoreCallTimeout(f"{self.name}: {op} timed out after {timeout:.1f} s")
 
     def _late(self, op: str, keys: list[str], future: Future[Any]) -> None:
         error = future.exception()
