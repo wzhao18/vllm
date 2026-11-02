@@ -537,18 +537,13 @@ def test_flashinfer_dcp_core_merges_to_full_attention(
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.wide import (
         WideDsa,
     )
-    from vllm.utils.flashinfer import has_flashinfer_prims_ts_sparse_mla
+    from vllm.utils.flashinfer import prims_ts_sparse_mla_format_error
     from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
         FlashInferMLASparseImpl,
     )
 
-    if kernel == "prims_ts" and not has_flashinfer_prims_ts_sparse_mla():
-        pytest.skip("FlashInfer has no prims_ts sparse MLA")
-    if kernel == "prims_ts" and not (
-        current_platform.is_device_capability(100)
-        or current_platform.is_device_capability(103)
-    ):
-        pytest.skip("FlashInfer's prims_ts sparse MLA runs on SM100 / SM103 only")
+    if kernel == "prims_ts" and (reason := prims_ts_sparse_mla_format_error("native")):
+        pytest.skip(reason)
     dcp, rows, q, interleave, context, cap = DCP_CORE_CASES[case]
     default_vllm_config.kernel_config.flashinfer_sparse_mla_kernel = kernel
     text = SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64)
