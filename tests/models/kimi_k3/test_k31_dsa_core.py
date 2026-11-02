@@ -9,6 +9,7 @@ path (DcpValue(pushed) merge, W_UV, gate) is benchmarks/kernels/k31_vr/dcp_dsa_c
 """
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -385,6 +386,27 @@ def test_dsa_core_policy(monkeypatch):
     assert dsac.variant(8, 8, 2) is dsac.variant(16, 8, 5) is None  # skipped
     every = decode.DsacDecode(torch.device("cuda"), H, rows=64, spec="1-8:1x16;9-64:u")
     assert every.variant(8, 4, 0) == (1, 16, 4) and every.variant(64, 8, 3) == (1, 0, 4)
+
+
+def test_dsa_core_refuses_nvfp4(monkeypatch):
+    """The core reads 576-byte per-tensor FP8 KV rows: under DCP with
+    VLLM_K31_DSA_CORE=1, build() refuses an nvfp4_ds_mla cache at startup, naming
+    the switch; with the core off it builds nothing."""
+    from vllm.models.kimi_k3.nvidia.dsa import KimiK3DSAAttention
+    from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core import decode
+
+    layer = KimiK3DSAAttention.__new__(KimiK3DSAAttention)
+    torch.nn.Module.__init__(layer)
+    layer.dsa_indexer = SimpleNamespace(dcp_world_size=16)
+    layer.mla_attn = SimpleNamespace(
+        mla_attn=SimpleNamespace(kv_cache_dtype="nvfp4_ds_mla")
+    )
+    model = torch.nn.ModuleList([layer])
+    monkeypatch.delenv(decode.ENV, raising=False)
+    assert decode.build(model) is None
+    monkeypatch.setenv(decode.ENV, "1")
+    with pytest.raises(ValueError, match=f"nvfp4_ds_mla cache: set {decode.ENV}=0"):
+        decode.build(model)
 
 
 def test_dsa_core_rows_source(monkeypatch):

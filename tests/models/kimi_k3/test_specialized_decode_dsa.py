@@ -23,8 +23,6 @@ pytestmark = pytest.mark.skipif(
 # Round 1 ports #108's DSA block only: its runtime (F5's wide steps, Ben's providers
 # and gates), MLA, MoE and AttnRes stay round 1's.
 NOT_PORTED = pytest.mark.skip(reason="round 1 keeps its own runtime / MLA / AttnRes")
-# nvfp4_ds_mla (MlaQuery's insert, prims_ts): not ported.
-NO_NVFP4 = pytest.mark.skip(reason="round 1's MlaQuery writes no nvfp4_ds_mla rows")
 
 
 def no_prims_ts():
@@ -251,7 +249,6 @@ def test_fp8_query_and_cache_insert(batch, gap):
 @pytest.mark.parametrize(
     "block,gap", [(64, GAP), (1024, GAP), (64, FAR)], ids=["64", "1024", "far"]
 )
-@NO_NVFP4
 @pytest.mark.parametrize("batch", [1, 5, 16, 60, 64])
 def test_nvfp4_cache_insert(batch, block, gap):
     """FlashInfer prims_ts on nvfp4_ds_mla: the FP8 query rows as on a per-tensor
@@ -327,7 +324,6 @@ def test_nvfp4_cache_insert(batch, block, gap):
     assert torch.equal(mla, stock)  # every byte: padded rows wrote nothing
 
 
-@NO_NVFP4
 @pytest.mark.parametrize("gap", [GAP, FAR])
 @pytest.mark.parametrize("batch", [1, 5, 64])
 def test_nvfp4_cache_insert_random(batch, gap):
@@ -375,6 +371,117 @@ def test_nvfp4_cache_insert_random(batch, gap):
     dequant = nvfp4_rows(ours)
     error = (dequant[:, :512] - kv.float()).norm() / kv.float().norm()
     assert error < 0.12, error
+
+
+# Latent magnitudes whose squares sum to 512: a row of them, permuted and signed, has
+# an RMS of exactly 1 in any summation order (multiples of 1/2), so with no epsilon
+# both RMSNorms are exact and both inserts quantize the same BF16 latent.
+EXACT_RMS = [3.0] * 16 + [2.5] * 16 + [2.0] * 32 + [1.5] * 32 + [1.0] * 48
+EXACT_RMS += [0.5] * 80 + [0.0] * 288
+
+
+def exact_rms_rows(batch, gen):
+    """Random latent rows [batch, 512] of RMS exactly 1: EXACT_RMS permuted and
+    signed (row 0 sorted: zero blocks first, the 3s its last block)."""
+    magnitudes = torch.tensor(EXACT_RMS, device="cuda")
+    rows = []
+    for t in range(batch):
+        order = torch.randperm(512, device="cuda", generator=gen)
+        row = magnitudes.sort().values if t == 0 else magnitudes[order]
+        sign = torch.randint(0, 2, (512,), device="cuda", generator=gen) * 2 - 1
+        rows.append(row * sign)
+    return torch.stack(rows)
+
+
+def insert_slots(batch, rows, gen):
+    """Distinct cache slots of ``batch`` requests: the cache's last row, adjacent
+    rows of its first page, padded requests (-1) and random rows."""
+    slots = torch.randperm(rows - 9, device="cuda", generator=gen)[:batch] + 8
+    slots[0] = rows - 1
+    run = max(min(batch, 6) - 2, 0)
+    slots[2 : 2 + run] = torch.arange(run, device="cuda")
+    slots[1::5] = -1
+    return slots
+
+
+@pytest.mark.parametrize("block,gap", [(512, GAP), (64, FAR)], ids=["512", "far"])
+@pytest.mark.parametrize(
+    "path,heads,batch",
+    [
+        *(("prepared", 12, b) for b in (1, 2, 3, 16, 64)),
+        *(("prepared", 6, b) for b in (5, 32)),
+        ("wide", 12, 72),
+        *(("wide", 6, b) for b in (96, 128)),
+    ],
+)
+def test_nvfp4_insert_matches_writer(path, heads, batch, block, gap):
+    """MlaQuery's nvfp4_ds_mla KV insert as PreparedDsa and WideDsa compile it,
+    on its untiled kernel (12 heads up to 3 rows, 6 up to 5) and its tiled one (16-
+    to 64-row tiles, several tiles), byte for byte the stock writer's
+    (concat_and_cache_mla "nvfp4_ds_mla"), every byte of the packed cache, the other
+    layers' rows between its blocks included: random latent rows whose RMSNorm is
+    exact (EXACT_RMS), norm weights spanning the block scales' range (the 2^-9
+    floor, E4M3 subnormals, saturation) and random k_pe (E4M3 subnormals,
+    saturation), at the cache's last row, adjacent rows and random rows, with
+    padded requests (slot -1) writing nothing."""
+    import cutlass
+
+    from vllm import _custom_ops as ops
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
+        layout,
+        stream,
+        to_cute,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa import (
+        prepared,
+        wide,
+    )
+
+    bf, dev = torch.bfloat16, "cuda"
+    gen = torch.Generator(device=dev).manual_seed(batch + block)
+    pitch = 2112 + heads * 128 + 128 + 32
+    projected = torch.randn(batch, pitch, device=dev, dtype=bf, generator=gen)
+    projected[:, 1536:2048] = exact_rms_rows(batch, gen).to(bf)
+    scale = 2.0 ** torch.randint(-12, 10, (batch, 64), device=dev, generator=gen)
+    rope = torch.randn(batch, 64, device=dev, generator=gen) * scale
+    projected[:, 2048:2112] = rope.to(bf)
+    exponents = torch.randint(-16, 12, (32,), device=dev, generator=gen)
+    exponents[-1] = 12  # row 0's 3s: their block's scale saturates
+    weight = torch.rand(512, device=dev, generator=gen) + 0.5
+    kv_norm = (weight * 2.0 ** exponents.repeat_interleave(16)).to(bf)
+    q_norm = torch.rand(1536, device=dev, dtype=bf, generator=gen) + 0.5
+    q_b = torch.randn(heads * 192, 1536, device=dev, dtype=bf, generator=gen) / 40
+    w_uk = torch.randn(heads, 128, 512, device=dev, dtype=bf, generator=gen) / 12
+    w_uv = torch.randn(heads, 128, 512, device=dev, dtype=bf, generator=gen)
+    weights = q_norm, kv_norm, q_b, w_uk, w_uv.transpose(1, 2)
+    blocks = 4 if gap == FAR else 2
+    mla = packed_cache(blocks, block, NVFP4_ROW, gap)
+    index = packed_cache(8, UNIT, INDEX_ROW)
+    slots = insert_slots(batch, blocks * block, gen)
+    specs = tuple(layout(w) for w in (*weights, mla, index))
+    device = torch.accelerator.current_device_index()
+    compile_core = (prepared if path == "prepared" else wide).compile_core
+    kernels = compile_core(batch, heads, pitch, specs, device, 1, fp8=True, nvfp4=True)
+    query = torch.zeros(batch, heads, 576, device=dev, dtype=torch.uint8)
+    q_c = torch.zeros(batch, 1536, device=dev, dtype=bf)
+    unit = torch.ones(1, device=dev)
+    args = (to_cute(projected), *(to_cute(w) for w in weights[:4]), to_cute(mla))
+    args += (to_cute(slots, 8), to_cute(unit, 4), to_cute(unit, 4))
+    eps = cutlass.Float32(0)
+    kernels[0](*args, eps, to_cute(query), to_cute(q_c), stream(dev))
+
+    stock = packed_cache(blocks, block, NVFP4_ROW, gap)
+    kv = (projected[:, 1536:2048] * kv_norm).to(bf)  # exact: the norm is the identity
+    ops.concat_and_cache_mla(
+        kv, projected[:, 2048:2112], stock, slots, "nvfp4_ds_mla", unit
+    )
+    scales = stock.reshape(-1, NVFP4_ROW)[slots[slots >= 0]][:, 320:]
+    assert (scales == 0x01).any() and (scales == 0x7E).any()  # the floor, saturation
+    raw = (
+        torch.empty(0, dtype=torch.uint8, device=dev).set_(c.untyped_storage())
+        for c in (mla, stock)
+    )
+    assert torch.equal(*raw)
 
 
 @pytest.mark.parametrize("gap", [0, GAP, FAR])
@@ -2738,6 +2845,61 @@ def test_prepare_cache_allocates_nothing(default_vllm_config, dist_init, core):
     check_prepare_allocates_nothing(core)
 
 
+def test_nvfp4_prims_ts_planned_before_capture(default_vllm_config, dist_init):
+    """On nvfp4_ds_mla every sparse decode runs prims_ts. The profile run's
+    reserve_workspace plans, in the nvfp4.fp8rope format, the layer's own heads (96:
+    DCP16's gathered heads) and those other callers register (prims_ts_extra_heads:
+    WideDsa's q mailbox, padded to 128): a decode at either plans nothing more and
+    replays in a CUDA graph."""
+    from vllm.config import set_current_vllm_config
+    from vllm.v1.attention.backends.mla import flashinfer_mla_sparse as fims
+
+    if no_prims_ts():
+        pytest.skip("FlashInfer prims_ts sparse MLA cannot run here")
+    config = layer_config("fi-nvfp4", 1)
+    dev = torch.device("cuda", torch.accelerator.current_device_index())
+    gen = torch.Generator(device=dev).manual_seed(0)
+    with set_current_vllm_config(config):
+        topk_buffer = torch.full((LAYER_LEN, 2048), -1, dtype=torch.int32, device=dev)
+        layer = dsa_layer(config, topk_buffer, 96).mla_attn.mla_attn
+        impl = layer.impl
+        assert impl.use_prims_ts and impl.prims_ts_format == "nvfp4.fp8rope"
+        impl.prims_ts_extra_heads.add(128)  # as WideDsa registers its q mailbox
+        fims._prims_ts_plans._plans.clear()  # a fresh process: nothing planned
+        impl.reserve_workspace()
+        planned = set(fims._prims_ts_plans._plans)
+        geometries = {key[2] for key in planned}
+        assert geometries == {impl._prims_ts_query_heads(96), 128}, geometries
+        assert {key[3] for key in planned} == {"nvfp4.fp8rope"}
+        cache = packed_cache(4, UNIT, NVFP4_ROW)
+        cache.copy_(random_nvfp4(4, UNIT, gen=gen))
+        rows, keys = 5, 300
+        ids = torch.randint(0, 4 * UNIT, (rows, 2048), device=dev, generator=gen)
+        slots = (ids // UNIT * (UNIT + GAP) + ids % UNIT).int()
+        slots[:, keys:] = -1
+        valid = torch.full((rows,), keys, dtype=torch.int32, device=dev)
+        for heads in (96, 128):
+            query = torch.randn(rows, heads, 576, device=dev, generator=gen) / 4
+            decode = partial(
+                impl._forward_mqa_kernel,
+                query.to(torch.float8_e4m3fn),
+                cache,
+                slots,
+                valid,
+                layer=layer,
+                block_size=UNIT,
+                is_decode=True,
+            )
+            eager = decode()[0].clone()  # (compiles the planned schedule)
+            assert set(fims._prims_ts_plans._plans) == planned, heads
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                out = decode()[0]
+            graph.replay()
+            torch.accelerator.synchronize()
+            assert torch.equal(out, eager), heads
+
+
 # An 8-rank launch (2 nodes x 4 GPUs: srun -n8, one pytest per rank) sets the
 # rendezvous file; the ranks then run the DCP8 layer steps together. A 16-rank
 # launch (4 nodes, KIMI_K3_SD_DCP16_INIT) runs them at TP = DCP = 16 with 6 local
@@ -3073,7 +3235,7 @@ WIDE_EXCHANGE_BOX = {8: 256, 4: 512}
 WIDE_DSA_BOX: dict = {}  # the DSA DcpBox: one per process, as one per model
 
 
-def run_wide_exchange_step(batch, q, world, replays):
+def run_wide_exchange_step(batch, q, world, replays, core="fi-trtllm"):
     """One decode step of a real DSA layer at ``batch`` rows (``q`` per request, the
     layer tests' contexts: rows of two requests in five select every key) under DCP
     (``world`` ranks, interleave 1) through the stock forward (the #63 or the
@@ -3085,7 +3247,7 @@ def run_wide_exchange_step(batch, q, world, replays):
     WideDsa's step (the other parity) whose sparse decode takes those ids through
     the stock DCP filter (FlashInfer over the same keys); the two layers in a CUDA
     graph, the exchange's slots and counts poisoned before each, replay
-    ``replays`` times."""
+    ``replays`` times. ``core``: the cache and FlashInfer kernel (LAYER_CORES)."""
     from vllm import _custom_ops as ops
     from vllm.config import set_current_vllm_config
     from vllm.distributed import get_dcp_group
@@ -3109,8 +3271,8 @@ def run_wide_exchange_step(batch, q, world, replays):
     from vllm.v1.attention.backends.mla.sparse_utils import flat_kv_row_view
     from vllm.v1.worker.block_table import get_block_table_width
 
-    cache_dtype = LAYER_CORES["fi-trtllm"][0]
-    config = layer_config("fi-trtllm", q, world)
+    cache_dtype = LAYER_CORES[core][0]
+    config = layer_config(core, q, world)
     # The indexer builder's decode buffers and DcpExchange's rows take
     # max_num_seqs x q: DL3's 128 requests x q4 = 512 rows need 128.
     config.scheduler_config.max_num_seqs = max(64, 512 // q)
@@ -3142,7 +3304,8 @@ def run_wide_exchange_step(batch, q, world, replays):
         contexts = [(600, 2050, 4321, 3000, 1100)[r % 5] + 37 * r for r in range(reqs)]
         contexts = [min(c, LAYER_LEN - 2 * q) for c in contexts]
         local = [(c + q - rank + world - 1) // world for c in contexts]
-        mla, mla_table = paged_rows(local, UNIT, FP8_ROW, UNIT, gen)
+        row = NVFP4_ROW if cache_dtype == "nvfp4_ds_mla" else FP8_ROW
+        mla, mla_table = paged_rows(local, UNIT, row, UNIT, gen)
         index, index_table = paged_rows(local, UNIT, INDEX_ROW, GAP, gen)
         old = [range(c) for c in contexts]
         old_mla = owned_slots(mla_table, old, world, rank)
@@ -3339,7 +3502,8 @@ def run_wide_exchange_step(batch, q, world, replays):
 @pytest.mark.skipif(DCP16_INIT is None, reason="needs a 16-rank launch (DCP16)")
 @pytest.mark.skip_global_cleanup  # the DCP16 group outlives each case
 @pytest.mark.parametrize("batch,q", WIDE_EXCHANGE_CASES)
-def test_wide_dsa_dcp_exchange(dcp8_group, monkeypatch, batch, q):
+@pytest.mark.parametrize("core", ["fi-trtllm", "fi-nvfp4"])
+def test_wide_dsa_dcp_exchange(dcp8_group, monkeypatch, core, batch, q):
     """WideDsa above 96 rows fed by DcpExchange's top-k (VLLM_K31_DCP_EXCHANGE,
     PARTS=topk) at DCP16: C64's combination (q8, VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS 256)
     and DL3's (q4 at 128, 256 and 512 rows; run on the cap-128 tree). The indexer op
@@ -3352,10 +3516,13 @@ def test_wide_dsa_dcp_exchange(dcp8_group, monkeypatch, batch, q):
     stock DCP filter (a second WideDsa) and, where the top-k is the same, the stock
     forward's (check_layer_step); in a CUDA graph of two layers on alternating
     parities, the exchange's slots and counts poisoned before each, 200 replays
-    give the eager rows bit for bit."""
+    give the eager rows bit for bit. ``core`` "fi-nvfp4": an nvfp4_ds_mla cache
+    (WideDsa's MlaQuery inserts its rows; FlashInfer prims_ts everywhere)."""
     from vllm.model_executor.layers import sparse_attn_indexer
     from vllm.models.kimi_k3.nvidia.dsa_kernels.dcp_exchange import decode as dcpx
 
+    if LAYER_CORES[core][2] == "prims_ts" and no_prims_ts():
+        pytest.skip("FlashInfer prims_ts sparse MLA cannot run here")
     # This case's layer alone takes the exchange (the other tests: the #63 merge).
     monkeypatch.setattr(sparse_attn_indexer, "DCP_DECODE_TOPK_HOOKS", {})
     monkeypatch.setenv(dcpx.PARTS_ENV, "topk")
@@ -3363,7 +3530,7 @@ def test_wide_dsa_dcp_exchange(dcp8_group, monkeypatch, batch, q):
     monkeypatch.delenv(dcpx.ENV + "_TIES", raising=False)  # (rank, position)
     monkeypatch.delenv(dcpx.GRAPH_ONLY_ENV, raising=False)
     monkeypatch.setenv(dcpx.SPIN_ENV, "120")
-    step = run_wide_exchange_step(batch, q, dcp8_group, replays=200)
+    step = run_wide_exchange_step(batch, q, dcp8_group, replays=200, core=core)
     check_layer_step(step, q, reference=False)
     same = [
         set(step.topk[t].tolist()) == set(step.stock_topk[t].tolist())
