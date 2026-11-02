@@ -1927,6 +1927,7 @@ def run_layer_step(
     exchange's rows (``chain_out``). ``skew``: the first half of the ranks score
     their old keys 2^SKEW_EXP higher."""
     from vllm import _custom_ops as ops
+    from vllm import ir
     from vllm.config import set_current_vllm_config
     from vllm.distributed import get_dcp_group
     from vllm.forward_context import create_forward_context, override_forward_context
@@ -1947,6 +1948,9 @@ def run_layer_step(
         DeepseekV32IndexerMetadataBuilder,
     )
     from vllm.v1.worker.block_table import get_block_table_width
+
+    current_platform.import_kernels()
+    import vllm.kernels.vllm_c  # noqa: F401  (registers the vllm_c provider)
 
     cache_dtype, _, kernel = LAYER_CORES[core]
     config = layer_config(core, q, world)
@@ -2028,14 +2032,16 @@ def run_layer_step(
             )
             return md, index_md, override_forward_context(context)
 
-        # The stock forward: the rows entering o_proj.
+        # The stock forward: the rows entering o_proj. Its RMSNorms run as a worker
+        # without inductor runs them (vllm_c: one rounding, as ours); unset, the IR
+        # op runs "native", which rounds x * r to BF16 before the weight.
         stock_mla, stock_index = mla.clone(), index.clone()
         entering = []
         hook = attn.o_proj.register_forward_pre_hook(
             lambda _, args: entering.append(args[0].clone())
         )
         _, _, context = step(stock_mla, stock_index)
-        with context:
+        with context, ir.ops.rms_norm.set_priority(["vllm_c", "native"]):
             attn(positions, hidden)
         hook.remove()
         stock_topk = topk_buffer[:batch].clone()
@@ -2493,6 +2499,11 @@ def check_layer_step(step, q, reference=True):
         differ = (ours[:, :256] != theirs[:, :256]).sum()
         assert differ <= 0.05 * ours[:, :256].numel()
         a, b = nvfp4_rows(ours)[:, :512], nvfp4_rows(theirs)[:, :512]
+        print(
+            f"nvfp4 new rows {ours.shape[0]}: {int(differ)} code bytes and "
+            f"{int((scales > 0).sum())} scales differ, latent "
+            f"{float((a - b).norm() / b.norm().clamp(min=1e-30)):.4f} of stock's"
+        )
         assert (a - b).norm() <= 0.05 * b.norm() + 1e-6
     else:
         assert torch.equal(ours[:, 512:], theirs[:, 512:])
@@ -3249,6 +3260,7 @@ def run_wide_exchange_step(batch, q, world, replays, core="fi-trtllm"):
     graph, the exchange's slots and counts poisoned before each, replay
     ``replays`` times. ``core``: the cache and FlashInfer kernel (LAYER_CORES)."""
     from vllm import _custom_ops as ops
+    from vllm import ir
     from vllm.config import set_current_vllm_config
     from vllm.distributed import get_dcp_group
     from vllm.distributed.parallel_state import graph_capture
@@ -3270,6 +3282,9 @@ def run_wide_exchange_step(batch, q, world, replays, core="fi-trtllm"):
     )
     from vllm.v1.attention.backends.mla.sparse_utils import flat_kv_row_view
     from vllm.v1.worker.block_table import get_block_table_width
+
+    current_platform.import_kernels()
+    import vllm.kernels.vllm_c  # noqa: F401  (registers the vllm_c provider)
 
     cache_dtype = LAYER_CORES[core][0]
     config = layer_config(core, q, world)
@@ -3343,14 +3358,15 @@ def run_wide_exchange_step(batch, q, world, replays, core="fi-trtllm"):
             )
             return md, index_md, override_forward_context(context)
 
-        # The stock forward (no exchange yet): the rows entering o_proj.
+        # The stock forward (no exchange yet): the rows entering o_proj, its RMSNorms
+        # on vllm_c (run_layer_step).
         stock_mla, stock_index = mla.clone(), index.clone()
         entering = []
         hook = attn.o_proj.register_forward_pre_hook(
             lambda _, args: entering.append(args[0].clone())
         )
         _, _, context = step(stock_mla, stock_index)
-        with context:
+        with context, ir.ops.rms_norm.set_priority(["vllm_c", "native"]):
             attn(positions, hidden)
         hook.remove()
         stock_topk = topk_buffer[:batch].clone()
