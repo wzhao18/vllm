@@ -313,6 +313,25 @@ class IndexerStage:
     # -------------------------------------------------------------------------------
 
 
+def check_index_cache(indexer, fused_unsupported=()):
+    """At bind time: whether a DSA layer's indexer cache holds MXFP4 keys; raises
+    unless every writer and reader of it takes the bound cache's format. DsaIndex
+    and the index fronts compile for the bound cache, while IndexerStage, WideDsa's
+    indexer core and the stock op read ``use_fp4_cache``'s format and the fused
+    decode indexer FP8 keys only: on MXFP4 it must refuse every shape
+    (``fused_unsupported``: its reasons per shape, None where it would run)."""
+    cache = indexer.k_cache.kv_cache
+    fp4 = is_fp4_cache(cache)
+    if fp4 != indexer.use_fp4_cache or (fp4 and not all(fused_unsupported)):
+        raise ValueError(
+            f"Kimi K3.1 specialized DSA: the indexer cache {tuple(cache.shape)} holds "
+            f"{'MXFP4' if fp4 else 'FP8'} keys, the indexer reads use_fp4_cache="
+            f"{indexer.use_fp4_cache} and the fused decode indexer (FP8 keys) takes "
+            f"{list(fused_unsupported).count(None)} of its shapes"
+        )
+    return fp4
+
+
 @cache
 def warm_merge_rows(topk, local_topk, world_size, emit_ids, block_size):
     """Compile the #63 merge's kernels as ``merge_rows`` launches them (physical rows

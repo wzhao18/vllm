@@ -391,6 +391,9 @@ class WideDsa:
         self.topk = self.indexer.topk_tokens
 
     def prepare_cache(self, kv):
+        from .indexer_stage import check_index_cache
+
+        check_index_cache(self.indexer)
         caches = kv.view(torch.uint8), self.indexer.k_cache.kv_cache
         specs = tuple(layout(w) for w in (*self.weights, *caches))
         sms = torch.cuda.get_device_properties(self.device).multi_processor_count

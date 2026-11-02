@@ -63,7 +63,7 @@ from .indexer import FusedIndexer
 from .indexer import reserve as reserve_fused_indexer
 from .indexer import static_unsupported as fused_indexer_static_unsupported
 from .indexer import supports as fused_indexer_unsupported
-from .indexer_stage import IndexerStage
+from .indexer_stage import IndexerStage, check_index_cache
 from .overlap import (
     FRONT,
     LATE,
@@ -340,7 +340,9 @@ class PreparedDsa:
         static = (
             fused_indexer_static_unsupported(self.indexer, *s) for s in self.shapes
         )
-        if self.fp8 and (self.dcp == 1 or self.dcp_fused) and not any(static):
+        # The fused indexer reads FP8 keys only (check_index_cache).
+        fused = self.fp8 and not self.indexer.use_fp4_cache
+        if fused and (self.dcp == 1 or self.dcp_fused) and not any(static):
             # The fused indexer's buffers (prepare_cache), shared by every layer,
             # sized for the longest context the KV cache can hold: reserved now, as
             # the specialized decode is built before vLLM profiles its memory for
@@ -389,6 +391,7 @@ class PreparedDsa:
         specs = tuple(layout(w) for w in (*weights, *caches))
         sms = torch.cuda.get_device_properties(self.device).multi_processor_count
         unsupported = [fused_indexer_unsupported(self.indexer, *s) for s in self.shapes]
+        check_index_cache(self.indexer, unsupported)
         fused = self.box is None and self.fp8
         fused = fused and not any(unsupported)
         if not fused:  # the late query follows the fused indexer's select
