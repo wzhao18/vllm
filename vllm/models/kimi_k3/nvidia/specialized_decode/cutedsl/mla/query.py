@@ -593,10 +593,7 @@ class MlaQuery:
         if cutlass.const_expr(self.dcp):
             self.publish(args, tok0, tid)
         valid = (head == 0) & (part < B) & self.live(tok0 + part)
-        if cutlass.const_expr(self.ds):
-            self.insert_ds(args, ss, tok0, part, valid, tid)
-        else:
-            self.insert(args, ss, tok0, part, valid, tid)
+        self.insert_row(args, ss, tok0, part, valid, tid)
         if cutlass.const_expr(self.dcp and self.gather):
             self.gathered(args, tid)
         if cutlass.const_expr(self.late):
@@ -620,6 +617,17 @@ class MlaQuery:
         else:
             value = value * scale
         return value
+
+    @cute.jit
+    def insert_row(self, args, ss, tok0, j, valid, tid):
+        """The KV insert in the cache's layout: fp8_ds_mla, nvfp4_ds_mla or
+        per-tensor FP8."""
+        if cutlass.const_expr(self.ds):
+            self.insert_ds(args, ss, tok0, j, valid, tid)
+        elif cutlass.const_expr(self.nvfp4):
+            self.insert_nvfp4(args, ss, tok0, j, valid, tid)
+        else:
+            self.insert(args, ss, tok0, j, valid, tid)
 
     @cute.jit
     def insert(self, args, ss, tok0, j, valid, tid):
@@ -866,10 +874,8 @@ class MlaQuery:
         # The KV insert overlaps the staging of x (CTA j of the tile owns request j;
         # Rubin under DCP: after the publish).
         j = head * self.cluster + part
-        if cutlass.const_expr(self.ds):
-            self.insert_ds(args, ss, tok0, j, (j < T) & self.live(tok0 + j), tid)
-        if cutlass.const_expr(not self.late_insert and not self.ds):
-            self.insert(args, ss, tok0, j, (j < T) & self.live(tok0 + j), tid)
+        if cutlass.const_expr(not self.late_insert):  # (DSA: never late)
+            self.insert_row(args, ss, tok0, j, (j < T) & self.live(tok0 + j), tid)
         cute.arch.cp_async_wait_group(0)
         cute.arch.sync_threads()
         # Packed FP32 pairs: the same IEEE ops in the same order as the scalar form.
@@ -1021,7 +1027,7 @@ class MlaQuery:
         elif cutlass.const_expr(self.dcp):
             self.publish(args, tok0, tid, qo)
         if cutlass.const_expr(self.late_insert):
-            self.insert(args, ss, tok0, j, (j < T) & self.live(tok0 + j), tid)
+            self.insert_row(args, ss, tok0, j, (j < T) & self.live(tok0 + j), tid)
         cute.arch.cluster_wait()
         if cutlass.const_expr(self.dcp and self.gather):
             self.gathered(args, tid, tok0)
@@ -1377,7 +1383,7 @@ class MlaQuery:
         j = head * self.cluster + part
         if cutlass.const_expr(self.poll_x):
             cute.arch.griddepcontrol_wait()  # the KV columns of x's rows, the slots
-        self.insert(args, ss, 0, j, (j < self.tokens) & self.live(j), tid)
+        self.insert_row(args, ss, 0, j, (j < self.tokens) & self.live(j), tid)
         cute.arch.cluster_wait()
         if cutlass.const_expr(self.gather):
             self.gathered(args, tid)

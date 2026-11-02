@@ -340,8 +340,9 @@ def count_stats(device: torch.device) -> CountStats | None:
 def build(model) -> DsacDecode | None:
     """Build the core (``VLLM_K31_DSA_CORE=1``, DCP) and attach it to every DSA
     indexer (``PreparedDsa`` picks it up on a per-tensor FP8 cache with the #63
-    merge). DcpExchange (built at weight load) has registered its top-k hooks by
-    now: on layers that have one, the core also takes the exchange's steps."""
+    merge; an nvfp4_ds_mla cache is refused). DcpExchange (built at weight load) has
+    registered its top-k hooks by now: on layers that have one, the core also takes
+    the exchange's steps."""
     from vllm.model_executor.layers.sparse_attn_indexer import DCP_DECODE_TOPK_HOOKS
     from vllm.models.kimi_k3.nvidia.dsa import KimiK3DSAAttention
 
@@ -351,6 +352,11 @@ def build(model) -> DsacDecode | None:
     if not wanted() or not layers or layers[0].dsa_indexer.dcp_world_size < 2:
         return None
     first = layers[0]
+    if first.mla_attn.mla_attn.kv_cache_dtype == "nvfp4_ds_mla":
+        raise ValueError(
+            f"Kimi K3.1 DSA sparse core ({ENV}=1) reads per-tensor FP8 KV rows "
+            f"(576 B), not an nvfp4_ds_mla cache: set {ENV}=0"
+        )
     device = first.mla_attn.mla_attn.W_UK_T.device
     heads = first.num_local_heads * first.dsa_indexer.dcp_world_size
     pdl_rows = 0

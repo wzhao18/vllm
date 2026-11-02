@@ -133,6 +133,7 @@ def compile_core(
     fp8=False,
     lse_base_e=True,
     cap=64,
+    nvfp4=False,
 ):
     """CuTe kernels (query, index, value) of one batch of rows (``q`` per request).
     ``specs``: the layouts of the weights, the MLA cache and the indexer cache.
@@ -142,7 +143,8 @@ def compile_core(
     per-tensor FP8 query [B, H, 576] and cache, and the value reads FlashInfer's
     [B, H, 512] latent (under DCP: an FP8 q mailbox, and an LSE in base e if
     ``lse_base_e``, else base 2). ``cap``: the DCP mailboxes' rows (64, or a widened
-    box's)."""
+    box's). ``nvfp4``: that FP8 query over an nvfp4_ds_mla cache (FlashInfer
+    prims_ts)."""
     qnorm, kvnorm, qb, uk, uv, kv, index_kv = (
         fake(shape, stride, dtype, 4 if dtype == torch.float32 else 16)
         for shape, stride, dtype in specs
@@ -164,6 +166,7 @@ def compile_core(
         q_b_cp_async=heads == 12 and batch == 1,
         dsa=True,
         fp8=fp8,
+        nvfp4=nvfp4,
         dcp=dcp,
         q_heads=q_heads,
         tile_poll=bool(dcp) and batch > WIDE_MAX_ROWS,
@@ -312,6 +315,7 @@ class WideDsa:
         self.layer = layer = wrapper.mla_attn
         self.impl, self.indexer = layer.impl, attention.dsa_indexer
         self.fp8 = dsa_on_flashinfer(attention)
+        self.nvfp4 = layer.kv_cache_dtype == "nvfp4_ds_mla"
         if not (self.fp8 or isinstance(self.impl, FlashMLASparseImpl)):
             raise ValueError(
                 "Kimi K3.1 specialized decode needs the FLASHMLA_SPARSE or "
@@ -343,7 +347,8 @@ class WideDsa:
         if self.fp8:
             q_scale_inv = (1 / layer._q_scale.float()).reshape(1).to(self.device)
             k_scale = layer._k_scale.float().reshape(1).to(self.device)
-            self.scales = q_scale_inv, k_scale
+            # nvfp4_ds_mla: the KV row is unscaled (prims_ts: kv_descale 1)
+            self.scales = q_scale_inv, self.unit if self.nvfp4 else k_scale
             shape = (max(pitches), self.heads, 576)
             self.query = torch.zeros(shape, dtype=torch.uint8, device=self.device)
         # Batches above the box's rows publish into its widened box (one per model,
@@ -405,7 +410,7 @@ class WideDsa:
             cap = box.cap
             lse_base_e = not self.fp8 or self.impl.lse_base_on_e
             self.kernels[batch, q] = compile_core(
-                *args, fp8=self.fp8, lse_base_e=lse_base_e, cap=cap
+                *args, fp8=self.fp8, lse_base_e=lse_base_e, cap=cap, nvfp4=self.nvfp4
             )
         rows = sorted(b for b, _ in self.shapes)
         proj = [b for b in rows if self.dsa_box.mailbox(b).format == PROJECTED]
