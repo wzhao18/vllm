@@ -2549,6 +2549,7 @@ class MooncakeStoreWorker:
                 block_hashes,
                 known_prefix_tokens,
             ),
+            mask_num=start_unit * self.hash_block_size,
         )
 
     def _longest_hit(

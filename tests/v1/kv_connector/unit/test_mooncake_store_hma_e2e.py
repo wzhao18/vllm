@@ -1465,3 +1465,63 @@ def test_selective_lease_requires_probe_support(monkeypatch):
     monkeypatch.setenv("VLLM_MOONCAKE_STORE_SELECTIVE_LEASE", "1")
     with pytest.raises(RuntimeError, match="batch_probe_key"):
         _full_plus_mamba_worker(_DictStore())
+
+
+def _keys_the_load_reads(worker, block_hashes, hit, vllm_cached_tokens):
+    """Keys KVCacheStoreRecvingThread reads to load ``hit`` above
+    ``vllm_cached_tokens``."""
+    read_keys: list[str] = []
+
+    class _CapturingStore:
+        def batch_get_into_multi_buffers(self, keys, addrs, sizes):
+            read_keys.extend(keys)
+            return [0] * len(keys)
+
+    recv = KVCacheStoreRecvingThread(
+        store=_CapturingStore(),
+        token_databases=worker.token_dbs,
+        block_size=worker.block_size,
+        tp_rank=0,
+        ready_event=threading.Event(),
+        coord=worker.coord,
+    )
+    recv.request_queue.put(
+        ReqMeta(
+            req_id="r0",
+            token_len_chunk=hit.hit_length,
+            block_ids=([0, 1, 2, 3], [0, 1, 2, 3]),
+            block_hashes=block_hashes,
+            load_spec=LoadSpec(
+                vllm_cached_tokens=vllm_cached_tokens,
+                kvpool_cached_tokens=hit.hit_length,
+                can_load=True,
+                token_len=hit.hit_length,
+                tail_key_boundaries=hit.tail_key_boundaries,
+            ),
+        )
+    )
+    recv._handle_request(recv.request_queue.get())
+    return read_keys
+
+
+def test_selective_lease_skips_units_below_local_hit(monkeypatch):
+    """Like the load, the lease starts at the local hit's block: the units below
+    it are on the GPU and need not be in the store, so leasing them would count
+    them as evicted and drop the hit below the local hit."""
+    monkeypatch.setenv("VLLM_MOONCAKE_STORE_SELECTIVE_LEASE", "1")
+    store = _LeaseTrackingStore()
+    worker = _full_plus_mamba_worker(store, partial_hash_hits=True)
+    hs = [BlockHash(bytes([i + 1]) * 4) for i in range(9)]  # 36 tokens
+    # The store holds only what the GPU did not: full units 4..7, mamba at 32.
+    stored = [k for h in hs[4:8] for k in _store_keys(worker, 0, h)]
+    for key in stored + _store_keys(worker, 1, hs[7]):
+        store._data[key] = b"x"
+
+    hit = worker.lookup(num_tokens=37, block_hashes=hs, known_prefix_tokens=16)
+
+    assert hit.hit_length == 32
+    leased = store.lease_calls[0]
+    assert sorted(_keys_the_load_reads(worker, hs, hit, 16)) == sorted(leased)
+    assert [sorted(keys) for keys in store.lease_calls] == [
+        sorted(_store_keys(worker, 0, hs[7]) + _store_keys(worker, 1, hs[7]))
+    ]

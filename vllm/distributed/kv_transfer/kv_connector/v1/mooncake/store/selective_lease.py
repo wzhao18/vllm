@@ -92,22 +92,24 @@ class SelectiveLookupLease:
         hit: MooncakeLookupResult,
         exists_set: set[tuple[int, bytes]],
         longest_hit: Callable[[set[tuple[int, bytes]]], MooncakeLookupResult],
+        mask_num: int = 0,
     ) -> MooncakeLookupResult:
         """Lease the keys a load of ``hit`` reads and return the hit to load.
 
         ``exists_set`` holds the probed ``(group, hash)`` pairs and
         ``longest_hit`` recomputes the hit from them. The lease covers only the
         keys this hit loads, e.g. the state at its tail boundary but not states
-        at earlier boundaries. If a key was evicted since the probe, the shorter
-        hit can end at one of those unleased keys, so it is leased in another
-        round. Returns an empty hit if the lease fails or the hit keeps
-        shrinking.
+        at earlier boundaries, nor the first ``mask_num`` tokens, which the load
+        skips (the local hit the lookup trusted). If a key was evicted since the
+        probe, the shorter hit can end at one of those unleased keys, so it is
+        leased in another round. Returns an empty hit if the lease fails or the
+        hit keeps shrinking.
         """
         try:
             for _ in range(_LEASE_ROUNDS):
                 if hit.hit_length <= 0:
                     return hit
-                evicted = self._lease(block_hashes, hit)
+                evicted = self._lease(block_hashes, hit, mask_num)
                 if not evicted:
                     return hit
                 exists_set = exists_set - evicted
@@ -124,12 +126,14 @@ class SelectiveLookupLease:
         self,
         block_hashes: Sequence[BlockHash],
         hit: MooncakeLookupResult,
+        mask_num: int = 0,
     ) -> tuple[list[str], list[tuple[int, bytes]]]:
         """Keys a load of ``hit`` reads, in every rank namespace, and their
         ``(group, hash)`` pairs.
 
-        Mirrors ``KVCacheStoreRecvingThread._handle_request``: each group's
-        load mask, with the tail chunk keyed by the hit's tail boundary.
+        Mirrors ``KVCacheStoreRecvingThread._handle_load``: chunks from
+        ``mask_num``, each group's load mask, with the tail chunk keyed by the
+        hit's tail boundary.
         """
         hit_length = hit.hit_length
         load_masks = self.coord.load_mask(block_hashes, hit_length)
@@ -141,7 +145,9 @@ class SelectiveLookupLease:
                 continue
             mask = load_masks[g_idx]
             key_prefixes = self.lookup_key_prefixes[g_idx]
-            for start, end, block_hash in db.process_tokens(hit_length, block_hashes):
+            for start, end, block_hash in db.process_tokens(
+                hit_length, block_hashes, mask_num
+            ):
                 chunk_idx = start // db.block_size
                 if chunk_idx >= len(mask) or not mask[chunk_idx]:
                     continue
@@ -160,6 +166,7 @@ class SelectiveLookupLease:
         self,
         block_hashes: Sequence[BlockHash],
         hit: MooncakeLookupResult,
+        mask_num: int,
     ) -> set[tuple[int, bytes]]:
         """Lease the keys a load of ``hit`` reads.
 
@@ -167,7 +174,7 @@ class SelectiveLookupLease:
         ``_LeaseFailedError`` when the lease RPC fails, including per-key error
         results.
         """
-        keys, key_meta = self.loaded_keys(block_hashes, hit)
+        keys, key_meta = self.loaded_keys(block_hashes, hit, mask_num)
         if not keys:
             return set()
         start = time.perf_counter()
