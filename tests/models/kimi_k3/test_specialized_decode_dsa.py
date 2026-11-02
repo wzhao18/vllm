@@ -2586,11 +2586,12 @@ def test_prepared_dsa_run_matches_stock_dl(
 
 
 def test_rubin_dcp_policy():
-    """Rubin (more SMs than GB300; GR100 SM107): trtllm-gen alone on a per-tensor
-    FP8 cache where FlashInfer cannot plan prims_ts; under DCP the query overlap is
-    the cluster IndexFront ("front") up to 16 rows and the fork from 17; the
-    #63 merge reads DeepGEMM's logits (no fused DCP indexer). GB300 keeps #108's
-    policies."""
+    """Rubin (more SMs than GB300; GR100 SM107): on a per-tensor FP8 cache both
+    FlashInfer kernels where FlashInfer plans prims_ts (SM107 too since
+    flashinfer#8186), else trtllm-gen alone, and prims_ts alone on nvfp4_ds_mla;
+    under DCP the query overlap is the cluster IndexFront ("front") up to 16 rows
+    and the fork from 17; the #63 merge reads DeepGEMM's logits (no fused DCP
+    indexer). GB300 keeps #108's policies."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa import prepared
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.attn_fi import (
         KERNELS,
@@ -2603,8 +2604,6 @@ def test_rubin_dcp_policy():
     reason = no_prims_ts()
     assert fi_kernels("fp8") == (KERNELS if reason is None else ("trtllm",))
     assert fi_kernels("nvfp4_ds_mla") == ("prims_ts",)
-    if torch.cuda.get_device_capability() == (10, 7):
-        assert reason is not None
     rows = (1, 8, 16, 17, 24, 32, 64, 320)
     modes = [overlap_for(b, None, True, True) for b in rows]
     assert modes == ["front"] * 3 + ["fork"] * 5, modes
