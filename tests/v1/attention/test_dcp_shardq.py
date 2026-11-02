@@ -887,8 +887,8 @@ def test_gathered_context_step_matches_tp_shardq(cache_dtype, kernel, tmp_path):
 LAYER_MODEL = "deepseek-ai/DeepSeek-V2-Lite-Chat"
 LAYER_HEADS = 16
 LAYER_BLOCK = 4 * PAGE
-# Requests above the decode threshold of 4-8 local heads (1024 query tokens),
-# longer than the top-k so the dense-MHA prefill never applies.
+# Requests above the decode threshold of 4 local heads (1024 query tokens; 128
+# at 8), longer than the top-k so the dense-MHA prefill never applies.
 LAYER_LENS = [(3000, 1100), (0, 2200), (700, 1500)]
 # Prefill steps that run as DCP ShardQ steps. A reordered batch starts with
 # its pieces of at most 1024 tokens, the leading ones of which the sparse MLA
@@ -1336,12 +1336,14 @@ def _layer_worker(rank, world, init_file, cache_dtype, kernel, index_format="fp8
             cleanup_dist_env_and_memory()
 
 
-@pytest.mark.skipif(torch.accelerator.device_count() < 2, reason="needs 2 GPUs")
+@pytest.mark.skipif(torch.accelerator.device_count() < 4, reason="needs 4 GPUs")
 @pytest.mark.parametrize(("cache_dtype", "kernel"), KERNEL_CASES)
 def test_dsa_layer_runs_dcp_prefill_as_shardq(cache_dtype, kernel, tmp_path):
     import torch.multiprocessing as mp
 
-    world = min(torch.accelerator.device_count(), 4)
+    # 4 local heads: LAYER_STEPS' short pieces (up to 1024 tokens) are MLA
+    # decodes; at 2 ranks (8 heads, threshold 128) they would be prefills.
+    world = 4
     mp.spawn(
         _layer_worker,
         args=(world, str(tmp_path / "dist_init"), cache_dtype, kernel),
