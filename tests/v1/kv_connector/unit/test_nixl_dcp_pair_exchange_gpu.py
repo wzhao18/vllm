@@ -29,6 +29,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.dcp_pair_exchange import 
     reference_pair_exchange,
     reference_unpack,
 )
+from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils import torch_utils
 from vllm.utils.math_utils import cdiv
@@ -50,6 +51,7 @@ from .test_nixl_dcp_pair_exchange import (
     P_DCP,
     _block_tables,
     _k31_dsa_specs,
+    _k31_nvfp4_specs,
     _pull_as_today,
 )
 
@@ -545,7 +547,7 @@ def _ds_mla_specs(block_size: int, num_dsa: int, num_draft: int) -> dict:
 
 @requires_gpu
 @pytest.mark.parametrize("far", [False, True], ids=["near", "far"])
-@pytest.mark.parametrize("latent", ["fp8", "fp8_ds_mla"])
+@pytest.mark.parametrize("latent", ["fp8", "fp8_ds_mla", "nvfp4_ds_mla"])
 def test_triton_exchange_matches_torch_reference(latent: str, far: bool):
     """A6 on the real K3.1 geometry: every byte of both partners' caches,
     padding included, equals the reference exchange, and each round's send
@@ -553,9 +555,11 @@ def test_triton_exchange_matches_torch_reference(latent: str, far: bool):
     b * S passes 2**31 by shifting the table base down, so the int64 address
     math runs without 2 GiB of cache."""
     device = torch.device("cuda")
-    specs = (
-        _k31_dsa_specs(1024, 24, 5) if latent == "fp8" else _ds_mla_specs(1024, 4, 1)
-    )
+    if latent == "fp8_ds_mla":
+        specs = _ds_mla_specs(1024, 4, 1)
+    else:
+        make = _k31_nvfp4_specs if latent == "nvfp4_ds_mla" else _k31_dsa_specs
+        specs = make(1024, 24, 5)
     ranks = [_Rank(specs, 7, device) for _ in range(2)]
     for seed, rank in enumerate(ranks):
         rank.fill_random(seed)
@@ -671,17 +675,17 @@ def _slot_mapping(rank, dcp_size, block_ids, num_tokens, device) -> torch.Tensor
 
 def _write_tokens(ops, rank: _Rank, inputs: dict, slots: torch.Tensor) -> None:
     """Write each layer's rows of the slotted tokens through the real cache
-    writers: latent and drafter pages by concat_and_cache_mla, indexer pages
-    by indexer_k_quant_and_cache into their kernel pages, as the runner binds
-    them."""
+    writers: latent and drafter pages by concat_and_cache_mla (in their spec's
+    cache dtype), indexer pages by indexer_k_quant_and_cache into their kernel
+    pages, as the runner binds them."""
     num_tokens = slots.shape[0]
     scale = torch.ones(1, dtype=torch.float32, device=slots.device)
     for name, spec in rank.specs.items():
         view = rank.views[name]
         if spec.cache_role != SparseCacheRole.INDEXER:
-            kv_c, k_pe = inputs[name]
+            kv_c, k_pe = (t[:num_tokens] for t in inputs[name])
             ops.concat_and_cache_mla(
-                kv_c[:num_tokens], k_pe[:num_tokens], view[:, 0], slots, "fp8", scale
+                kv_c, k_pe, view[:, 0], slots, spec.cache_dtype_str, scale
             )
             continue
         group = AttentionGroup(
@@ -701,22 +705,27 @@ def _write_tokens(ops, rank: _Rank, inputs: dict, slots: torch.Tensor) -> None:
 
 
 @requires_gpu
+@pytest.mark.parametrize("latent", ["fp8", "nvfp4_ds_mla"])
 @pytest.mark.parametrize(
     "num_tokens,num_cached",
     [(3 * 16384 + 5, 0), (3 * 16384 + 5, 1), (5 * 8192 + 1, 0)],
     ids=["odd_p_blocks", "d_prefix_hit", "even_p_blocks"],
 )
 def test_real_writers_place_and_exchange_like_direct_writes(
-    num_tokens: int, num_cached: int
+    num_tokens: int, num_cached: int, latent: str
 ):
     """A7: KV, indexer keys and drafter rows written by the real writers at the
     interleave-1 slot mappings of 8 P ranks, then pulled as today and exchanged
     by the Triton exchanger, equal what the same writers put in 16 D ranks
     directly: the whole caches, byte for byte. The only test whose ground truth
-    does not come from this design's own tables."""
+    does not come from this design's own tables. ``latent``: the DSA layers'
+    cache dtype (nvfp4_ds_mla: its writer's 352-byte rows; the drafter's fp8)."""
     ops = _cache_ops()
+    nvfp4 = latent == "nvfp4_ds_mla"
+    if nvfp4 and not current_platform.is_device_capability_family(100):
+        pytest.skip("the nvfp4_ds_mla cache writer needs SM10x")
     device = torch.device("cuda")
-    specs = _k31_dsa_specs(1024, 2, 1)
+    specs = (_k31_nvfp4_specs if nvfp4 else _k31_dsa_specs)(1024, 2, 1)
     gen = torch.Generator(device=device).manual_seed(num_tokens)
     inputs = {}
     for name, spec in specs.items():

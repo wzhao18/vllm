@@ -524,6 +524,28 @@ def _k31_dsa_specs(block_size: int, num_dsa: int, num_draft: int) -> dict:
     return specs
 
 
+def _k31_nvfp4_specs(block_size: int, num_dsa: int, num_draft: int) -> dict:
+    """``_k31_dsa_specs`` on an nvfp4_ds_mla cache: the DSA layers' latent rows
+    are 352 bytes (512 e2m1 values, 64 e4m3 rope values, 32 e4m3 block scales);
+    the drafter's stay fp8."""
+    specs = _k31_dsa_specs(block_size, num_dsa, num_draft)
+    latent = customize_attention_spec(
+        AttentionBackendEnum.FLASHINFER_MLA_SPARSE.get_class(),
+        replace(
+            next(iter(specs.values())),
+            cache_dtype_str="nvfp4_ds_mla",
+            kv_quant_mode=get_kv_quant_mode("nvfp4_ds_mla"),
+            state_content_bytes=352,
+        ),
+    )
+    return {
+        name: spec
+        if spec.cache_role == SparseCacheRole.INDEXER or spec.is_draft
+        else latent
+        for name, spec in specs.items()
+    }
+
+
 class _PlannedRank:
     """A rank's packed KV cache as the real planner lays it out and the worker
     allocates it, with the NIXL regions the worker registers for it and the
@@ -640,15 +662,20 @@ class _PlannedRank:
         return mask
 
 
+@pytest.mark.parametrize("nvfp4", [False, True], ids=["fp8", "nvfp4_ds_mla"])
 @pytest.mark.parametrize("num_draft", [0, 5])
-def test_row_table_matches_k31_planner_geometry(num_draft: int):
+def test_row_table_matches_k31_planner_geometry(num_draft: int, nvfp4: bool):
     """Every row the table addresses is the row the backends' views read, and a
-    block's arrays tile its attention pages exactly."""
-    rank = _PlannedRank(_k31_dsa_specs(1024, 24, num_draft), num_blocks=2)
+    block's arrays tile its attention pages exactly (``nvfp4``: 352-byte DSA latent
+    rows, the drafter's fp8)."""
+    specs = (_k31_nvfp4_specs if nvfp4 else _k31_dsa_specs)(1024, 24, num_draft)
+    rank = _PlannedRank(specs, num_blocks=2)
     table = rank.table
     assert table.block_stride == rank.kv_cache_config.kv_cache_tensors[0].block_stride
-    # Design §3.5: H is 8,699,904 B for 24 DSA layers plus 294,912 B per draft.
-    assert table.half_bytes == 8_699_904 + num_draft * 294_912
+    # Design §3.5: H is 8,699,904 B for 24 DSA layers plus 294,912 B per draft
+    # (nvfp4_ds_mla: 5,947,392 B).
+    dsa_bytes = 5_947_392 if nvfp4 else 8_699_904
+    assert table.half_bytes == dsa_bytes + num_draft * 294_912
     assert Counter(a.kind for a in table.arrays) == {
         PairArrayKind.ROW: 24 + num_draft,
         PairArrayKind.INDEX_VALUE: 24,
@@ -757,19 +784,22 @@ def _region(name: str, spec, base: int = 0, stride: int = 1 << 20) -> PairRegion
     return PairRegion(name, spec, base, spec.page_size_bytes, stride)
 
 
-def test_row_table_accepts_fp8_ds_mla_rows():
+@pytest.mark.parametrize(
+    "cache_dtype,row", [("fp8_ds_mla", 656), ("nvfp4_ds_mla", 352)]
+)
+def test_row_table_accepts_ds_mla_rows(cache_dtype: str, row: int):
     spec = MLAAttentionSpec(
         block_size=64,
         num_kv_heads=1,
         head_size=576,
         dtype=torch.uint8,
-        cache_dtype_str="fp8_ds_mla",
-        state_content_bytes=656,
+        cache_dtype_str=cache_dtype,
+        state_content_bytes=row,
     )
     (array,) = build_pair_row_table([_region("L0", spec)]).arrays
     assert (array.kind, array.width, array.rows_per_subpage) == (
         PairArrayKind.ROW,
-        656,
+        row,
         64,
     )
 

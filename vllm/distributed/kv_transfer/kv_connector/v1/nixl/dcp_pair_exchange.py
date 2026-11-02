@@ -49,7 +49,7 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec, SparseCach
 logger = init_logger(__name__)
 
 # KV cache dtypes whose MLA pages are token-major rows of w bytes.
-_ROW_KV_CACHE_DTYPES = ("fp8", "fp8_e4m3", "fp8_ds_mla")
+_ROW_KV_CACHE_DTYPES = ("fp8", "fp8_e4m3", "fp8_ds_mla", "nvfp4_ds_mla")
 
 
 class NixlPairModeError(RuntimeError):
@@ -374,8 +374,8 @@ def build_pair_row_table(
 
     Only these pages are exchanged; any other raises naming the layer:
     - MLA pages (latent or drafter): a DCP-sharded ``MLAAttentionSpec`` with one
-      KV head and one token per state, an fp8 or fp8_ds_mla KV cache, and rows
-      of ``w`` bytes filling the page (``page_len == B * w``).
+      KV head and one token per state, an fp8, fp8_ds_mla or nvfp4_ds_mla KV
+      cache, and rows of ``w`` bytes filling the page (``page_len == B * w``).
     - Indexer pages: ``cache_role == INDEXER`` uint8 rows filling the page,
       stored as kernel pages of ``index_kernel_rows`` rows that hold the rows'
       ``index_value_bytes`` values, then their scales.
