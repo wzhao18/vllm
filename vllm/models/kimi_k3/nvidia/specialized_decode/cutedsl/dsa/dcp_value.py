@@ -14,9 +14,11 @@ from functools import cache
 import cutlass
 import cutlass.cute as cute
 import torch
+import torch.distributed._symmetric_memory as symm_mem
 from cutlass import BFloat16, Float32, Int32, Int64, Uint32
 from cutlass.cute.runtime import make_fake_stream
 
+from ...symm import peer_rendezvous
 from ..common.host import fake
 from ..common.policy import batch_table
 from ..common.primitives import (
@@ -85,6 +87,38 @@ def partials_for(spec, batch):
     fmt = table.get(batch, "bf16")
     assert fmt in FORMATS, (spec, fmt)
     return fmt
+
+
+class DcpMailbox:
+    """One partials format's peer-store mailboxes: partial rows [2, DCP, CAP, H, 512]
+    BF16 ("proj": BF16 value rows [..., 128]) and LSE [2, DCP, CAP, H] FP32,
+    sentinel-filled, and their peers' addresses."""
+
+    def __init__(self, group, device, size, cap, heads, fmt):
+        assert fmt in FORMATS, fmt
+        shape, empty = (2, size, cap, heads), symm_mem.empty
+        self.format = fmt
+        width = 128 if fmt == PROJECTED else 512
+        self.partial = empty((*shape, width), dtype=torch.bfloat16, device=device)
+        self.lse = empty(shape, dtype=torch.float32, device=device)
+        # Peer stores only: no multicast object.
+        handles = [peer_rendezvous(t, group) for t in (self.partial, self.lse)]
+        i64 = dict(dtype=torch.int64, device=device)
+        self.peers = torch.tensor(handles[0].buffer_ptrs, **i64)
+        self.lse_peers = torch.tensor(handles[1].buffer_ptrs, **i64)
+        self.partial.view(torch.int32).fill_(PAIR_SENT - (1 << 32))
+        self.lse.view(torch.int32).fill_(-1)
+
+
+def gather_heads(w_uv, size, group):
+    """Every rank's W_UV [H, 512, 128] (latent-contiguous) -> [DCP * H, 512, 128] in
+    the same layout, gathered head block d = rank d's heads ("proj" sources project
+    the rows of every gathered head). Collective: call on every rank of ``group``
+    (``size`` ranks)."""
+    heads = w_uv.transpose(1, 2).contiguous()  # [H, 128, 512]
+    gathered = heads.new_empty((size * heads.shape[0], *heads.shape[1:]))
+    torch.distributed.all_gather_into_tensor(gathered, heads, group=group)
+    return gathered.transpose(1, 2)
 
 
 class DcpValue:
