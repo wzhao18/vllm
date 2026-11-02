@@ -326,6 +326,12 @@ class WideDsa:
         wide = rows > dcp.cap
         widened = dcp.widened(rows) if wide else dcp
         self.boxes = {b: widened if b > dcp.cap else dcp for b in pitches}
+        if self.fp8 and self.impl.use_prims_ts:
+            # dcp_core runs the stock prims_ts decode on the padded q mailbox; the
+            # profile run's reserve_workspace plans the native heads only.
+            self.impl.prims_ts_extra_heads.update(
+                b.q_heads for b in self.boxes.values()
+            )
         # FlashMLA sparse's output rows (FlashInfer returns its own).
         self.rows = None
         if not self.fp8:

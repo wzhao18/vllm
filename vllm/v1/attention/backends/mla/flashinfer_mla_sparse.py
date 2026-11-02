@@ -875,6 +875,10 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         # CUDA graph) before the DCP query all-gather.
         vllm_config = get_current_vllm_config()
         self.use_prims_ts = use_prims_ts(vllm_config, kv_cache_dtype)
+        # Query heads that callers besides this layer's decode run prims_ts at
+        # (e.g. a q mailbox padded to the 2-CTA heads); reserve_workspace plans
+        # them with the layer's own.
+        self.prims_ts_extra_heads: set[int] = set()
         if self.use_prims_ts:
             # prims_ts returns natural-log LSE; (0, -inf) for rows without
             # entries, the DCP merge identity.
@@ -930,7 +934,8 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         shardq_heads = self.num_heads * get_tensor_model_parallel_world_size()
         # Plan (and compile) every row capacity before serving starts.
         if self.topk_indices_buffer is not None:
-            for num_heads in {heads, shardq_heads} if self.use_shardq else {heads}:
+            planned = {heads, shardq_heads} if self.use_shardq else {heads}
+            for num_heads in planned | self.prims_ts_extra_heads:
                 self._get_prims_ts_plans(
                     torch.device(
                         current_platform.device_type,
