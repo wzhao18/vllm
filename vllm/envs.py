@@ -2675,6 +2675,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_DSA_DCP_PREFILL_HIST_MERGE",
         # Read when the specialized decode builds its providers (CUDA graphs only).
         "VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS",
+        # Read by the Mooncake store's prefix lookups only, outside the model.
+        "VLLM_MOONCAKE_STORE_SELECTIVE_LEASE",
     }
 
     from vllm.config.utils import normalize_value

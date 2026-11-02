@@ -63,6 +63,16 @@ def test_chat_template_fuel_is_not_compile_factor(monkeypatch: pytest.MonkeyPatc
     assert "VLLM_CHAT_TEMPLATE_FUEL" not in envs.compile_factors()
 
 
+def test_mooncake_selective_lease_is_not_compile_factor(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # Only the Mooncake store's prefix lookups read it: either setting, or none,
+    # must reuse the compile cache.
+    monkeypatch.setenv("VLLM_MOONCAKE_STORE_SELECTIVE_LEASE", "1")
+
+    assert "VLLM_MOONCAKE_STORE_SELECTIVE_LEASE" not in envs.compile_factors()
+
+
 def test_p2p_side_channel_defaults_and_override(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("VLLM_P2P_SIDE_CHANNEL_HOST", raising=False)
     monkeypatch.delenv("VLLM_P2P_SIDE_CHANNEL_PORT", raising=False)

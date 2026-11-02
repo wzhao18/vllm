@@ -2500,14 +2500,12 @@ class MooncakeStoreWorker:
         if not candidate_keys:
             return MooncakeLookupResult(0, known_prefix_tokens=known_prefix_tokens)
 
-        exists_fn = (
-            self.store.batch_is_exist
-            if self._selective_lease is None
-            else self._selective_lease.probe
-        )
         lookup_start = time.perf_counter()
         try:
-            res = exists_fn(candidate_keys)
+            if self._selective_lease is None:
+                res = self.store.batch_is_exist(candidate_keys)
+            else:
+                res = self._selective_lease.probe(candidate_keys)
             self._record_kv_connector_operation(
                 "lookup_exists",
                 time.perf_counter() - lookup_start,

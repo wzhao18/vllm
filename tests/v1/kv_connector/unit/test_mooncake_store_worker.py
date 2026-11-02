@@ -5350,6 +5350,18 @@ def test_lookup_records_mooncake_metrics():
     assert stats.data["lookup_exists"][0]["num_keys"] == 2
 
 
+def test_lookup_after_close_is_a_recorded_miss():
+    """A lookup that reaches a closed worker (store released) is a miss and a
+    lookup_exists error, as any failed existence check."""
+    worker = _make_bare_worker()
+    worker.close()
+
+    assert worker.lookup(33, [b"a0", b"a1"]).hit_length == 0
+    stats = worker.get_kv_connector_stats()
+    assert stats is not None
+    assert [r["status"] for r in stats.data["lookup_exists"]] == ["error"]
+
+
 def test_store_worker_close_releases_store():
     worker = _make_bare_worker()
     store = worker.store
