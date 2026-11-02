@@ -23,6 +23,10 @@ Q:
                  VLLM_USE_DIRECT_DCP_Q_GATHER=1 path), padded to 128 heads; the
                  NCCL all_gather variant is also timed
   local_q        q_b GEMM (all 96 heads) + W_UK bmm + fp8 cast (no exchange)
+value (the DSA DcpValue stage, bench_dcp_value.py; VLLM_K31_DSA_PARTIALS):
+  value_prod     as served: run_value "bf16" up to 64 rows, MR !8's DcpValue above
+  value_proj     W_UV bmm over the 96 gathered heads + DcpValue(preprojected)
+                 through the "proj" DcpMailbox (_contig: a contiguous W_UV)
 
 Writes one JSON line per (shape, path) with per-rank times to --out.
 """
@@ -31,6 +35,7 @@ import argparse
 import json
 import os
 import statistics
+import sys
 import time
 
 import torch
@@ -118,6 +123,15 @@ def main():
     hpr = HEADS // W
     vecs = ctx_vectors(args.vecs)
     paths = set(args.paths.split(","))
+    value = None
+    if "value" in paths:  # bench_dcp_value.py, next to this script
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import bench_dcp_value
+
+        rows = [int(b) * int(q) for q in args.qs.split(",")
+                for b in args.batches.split(",")]
+        value = bench_dcp_value.ValueBench(dist.group.WORLD, dev, W, rank, hpr,
+                                           INTERLEAVE, bench_dcp_value.wide_cap(rows))
     flush_buf = torch.empty(512 * 1024 * 1024, dtype=torch.uint8, device=dev)
 
     def flush():
@@ -349,6 +363,11 @@ def main():
                           own_heads_compute_us=graph_time(own_q, args.inner, args.reps)))
                 emit(shape, "q_stock_nccl_allgather", graph_time(stock_q_nccl, args.inner, args.reps))
                 emit(shape, "q_local_rebuild", graph_time(local_q, args.inner, args.reps))
+            if value is not None:
+                # per-row valid counts: this rank's share of a balanced top-k
+                valid = torch.minimum(Lr, (G.clamp(max=K) // W).clamp(min=1))
+                timer = graph_time, emit, shape, (args.inner, args.reps)
+                bench_dcp_value.run_value_paths(value, T, q, ctxs, valid, *timer)
             del logits
             torch.cuda.empty_cache()
     dist.barrier()

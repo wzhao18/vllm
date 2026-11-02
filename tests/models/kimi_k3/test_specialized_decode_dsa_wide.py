@@ -158,29 +158,13 @@ def test_index_policies_wide_rows():
     assert 256 not in policies and 768 not in policies
 
 
-def test_dsa_wide_query_grid_resident():
-    """Hazard H1: at wide rows the MlaQuery CTAs poll the gathered q mailbox that
-    other ranks' CTAs fill, so every CTA that polls with them must be resident. The
-    compiled DSA query (DCP16, 6 heads, FP8) fits whole at 72 / 96 rows
-    (cuOccupancyMaxActiveClusters, checked by compile_core); a 128-row grid would not
-    (the check refuses it without the tile poll), so above WIDE_MAX_ROWS each row
-    tile polls its own tokens and one tile's 6 clusters must fit (104-512 rows);
-    DcpValue's whole grid fits at every one of these rows (check_value_residency)."""
+def dcp16_core_specs(heads=6):
+    """compile_core's layouts of a DCP16 rank's DSA layer (FP8 caches) and pitch."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
         layout,
     )
-    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa import wide
-    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.mla.dcp import (
-        compile_value,
-    )
-    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.mla.query import (
-        MlaQuery,
-    )
 
-    sms = torch.cuda.get_device_properties(0).multi_processor_count
-    if sms <= 152:
-        pytest.skip("Rubin-class wide rows")
-    bf, dev, heads = torch.bfloat16, "cuda", 6
+    bf, dev = torch.bfloat16, "cuda"
     weights = (
         torch.ones(Q_LORA, device=dev, dtype=bf),
         torch.ones(KV_LORA, device=dev, dtype=bf),
@@ -192,8 +176,30 @@ def test_dsa_wide_query_grid_resident():
         torch.zeros(8, 64, 576, dtype=torch.uint8, device=dev),
         torch.zeros(8, 64, 132, dtype=torch.uint8, device=dev),
     )
-    specs = tuple(layout(t) for t in (*weights, *caches))
-    pitch = 2112 + heads * V + 160
+    return tuple(layout(t) for t in (*weights, *caches)), 2112 + heads * V + 160
+
+
+def test_dsa_wide_query_grid_resident():
+    """Hazard H1: at wide rows the MlaQuery CTAs poll the gathered q mailbox that
+    other ranks' CTAs fill, so every CTA that polls with them must be resident. The
+    compiled DSA query (DCP16, 6 heads, FP8) fits whole at 72 / 96 rows
+    (cuOccupancyMaxActiveClusters, checked by compile_core); a 128-row grid would not
+    (the check refuses it without the tile poll), so above WIDE_MAX_ROWS each row
+    tile polls its own tokens and one tile's 6 clusters must fit (104-512 rows);
+    DcpValue's whole grid fits at every one of these rows (check_value_residency)."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa import wide
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.mla.dcp import (
+        compile_value,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.mla.query import (
+        MlaQuery,
+    )
+
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    if sms <= 152:
+        pytest.skip("Rubin-class wide rows")
+    heads = 6
+    specs, pitch = dcp16_core_specs(heads)
     device = torch.accelerator.current_device_index()
     for rows in (72, 96):
         assert rows <= wide.WIDE_MAX_ROWS
@@ -225,6 +231,30 @@ def test_dsa_wide_query_grid_resident():
             dsa_bf16=False,
         )  # fmt: skip
         wide.check_value_residency(value, heads, 16, 576, 4, sms, device)
+
+
+def test_dsa_wide_proj_grid_resident():
+    """WideDsa's "proj" partials (VLLM_K31_DSA_PARTIALS): compile_core builds #108's
+    DcpValue over the W_UV bmm's value rows (dcp_stage, preprojected) on the real
+    SM count: at DCP16 96 projecting CTAs, then 6 x min(tiles, (SMs - 96) // 6)
+    merging ones (19 on 212 SMs: 210 CTAs from 304 rows), whose whole grid fits at
+    one 512-thread CTA per SM (check_proj_residency) at DL7's (q8, 128 / 256 rows)
+    and DL3's (q4, 128 to 512 rows) wide rows."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa import wide
+
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    if sms <= 152:
+        pytest.skip("Rubin-class wide rows")
+    heads = 6
+    specs, pitch = dcp16_core_specs(heads)
+    device = torch.accelerator.current_device_index()
+    rows_q = [(128, 8), (256, 8), (128, 4), (256, 4), (304, 4), (384, 4), (512, 4)]
+    for rows, q in rows_q:
+        args = rows, heads, pitch, specs, device, q, 16, 128, sms, "proj"
+        *_, value = wide.compile_core(*args, fp8=True, cap=512)
+        grid = wide.check_proj_residency(value, heads, 16, rows, sms, device)
+        merge = min(-(-rows // 16), (sms - 16 * heads) // heads)
+        assert grid == (heads, 16 + merge, 1) and heads * grid[1] <= sms, grid
 
 
 @pytest.mark.parametrize(
