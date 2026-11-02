@@ -3582,7 +3582,8 @@ def test_wide_dsa_dcp_exchange(dcp8_group, monkeypatch, core, batch, q):
 @pytest.mark.skipif(DCP16_INIT is None, reason="needs a 16-rank launch (DCP16)")
 @pytest.mark.skip_global_cleanup  # the DCP16 group outlives each case
 @pytest.mark.parametrize("batch,q", WIDE_EXCHANGE_CASES)
-def test_wide_dsa_dcp_exchange_proj(dcp8_group, monkeypatch, batch, q):
+@pytest.mark.parametrize("core", ["fi-trtllm", "fi-nvfp4"])
+def test_wide_dsa_dcp_exchange_proj(dcp8_group, monkeypatch, core, batch, q):
     """test_wide_dsa_dcp_exchange with "proj" partials (VLLM_K31_DSA_PARTIALS=proj,
     which both WideDsa layers read): the W_UV bmm's value rows of every gathered
     head go through the widened box's "proj" DcpMailbox and #108's DcpValue merges
@@ -3590,7 +3591,8 @@ def test_wide_dsa_dcp_exchange_proj(dcp8_group, monkeypatch, batch, q):
     the same keys through the stock DCP filter) and, where the top-k is the same,
     the stock forward's; 200 graph replays of the two layers on alternating
     parities give the eager rows bit for bit; afterwards the "proj" mailbox and
-    the q mailbox rows of the step are re-armed on both parities."""
+    the q mailbox rows of the step are re-armed on both parities. ``core``
+    "fi-nvfp4": an nvfp4_ds_mla cache (prims_ts everywhere), agentx-local's."""
     import torch.distributed as dist
 
     from vllm.distributed import get_dcp_group
@@ -3600,6 +3602,8 @@ def test_wide_dsa_dcp_exchange_proj(dcp8_group, monkeypatch, batch, q):
         PARTIALS_ENV,
     )
 
+    if LAYER_CORES[core][2] == "prims_ts" and no_prims_ts():
+        pytest.skip("FlashInfer prims_ts sparse MLA cannot run here")
     monkeypatch.setattr(sparse_attn_indexer, "DCP_DECODE_TOPK_HOOKS", {})
     monkeypatch.setenv(dcpx.PARTS_ENV, "topk")
     monkeypatch.setenv(dcpx.ENV + "_ONE_ROUND_ROWS", "256")
@@ -3607,7 +3611,7 @@ def test_wide_dsa_dcp_exchange_proj(dcp8_group, monkeypatch, batch, q):
     monkeypatch.delenv(dcpx.GRAPH_ONLY_ENV, raising=False)
     monkeypatch.setenv(dcpx.SPIN_ENV, "120")
     monkeypatch.setenv(PARTIALS_ENV, "proj")
-    step = run_wide_exchange_step(batch, q, dcp8_group, replays=200)
+    step = run_wide_exchange_step(batch, q, dcp8_group, replays=200, core=core)
     check_layer_step(step, q, reference=False)
     core_rows, chain_rows = step.out.float(), step.chain_out.float()
     error = float((core_rows - chain_rows).norm() / chain_rows.norm())
