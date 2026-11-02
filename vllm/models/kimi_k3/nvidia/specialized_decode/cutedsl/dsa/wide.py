@@ -423,14 +423,20 @@ class WideDsa:
         return self
 
     def indexer_core(self, projected, batch):
-        """Top-k of the current rows into the shared buffer (stock decode scoring)."""
-        indexer = self.indexer
+        """Top-k of the current rows into the shared buffer (stock decode scoring of
+        DsaIndex's FP8 query, or on an MXFP4 indexer cache its MXFP4 query and
+        scales)."""
+        from .index import fp4_query_views
+
+        indexer, fp4 = self.indexer, self.indexer.use_fp4_cache
+        query = self.q_fp8[:batch].view(torch.float8_e4m3fn), None
+        if fp4:
+            query = tuple(t.contiguous() for t in fp4_query_views(self.q_fp8, batch))
         return torch.ops.vllm.sparse_attn_indexer(
             projected,
             self.k_cache_name,
             indexer.k_cache.kv_cache,
-            self.q_fp8[:batch].view(torch.float8_e4m3fn),
-            None,
+            *query,
             None,
             self.head_w[:batch],
             DIM,
@@ -444,7 +450,7 @@ class WideDsa:
             False,
             False,
             _encode_layer_name(""),
-            False,
+            fp4,
             indexer.dcp_rank,
             indexer.dcp_world_size,
             indexer.cp_kv_cache_interleave_size,
