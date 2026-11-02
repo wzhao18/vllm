@@ -1220,8 +1220,11 @@ class _LeaseTrackingStore(_DictStore):
         return super().batch_is_exist(keys)
 
 
-def _full_plus_mamba_worker(store, *, partial_hash_hits=False, extra_config=None):
-    """Full-attention + align-mode Mamba worker on ``store``."""
+def _full_plus_mamba_worker(
+    store, *, partial_hash_hits=False, extra_config=None, num_state_groups=1
+):
+    """Full-attention + align-mode Mamba worker on ``store``, its Mamba layers
+    in ``num_state_groups`` groups."""
     full = FullAttentionSpec(block_size=16, num_kv_heads=8, head_size=64, dtype=None)
     mamba = MambaSpec(
         block_size=16,
@@ -1229,25 +1232,20 @@ def _full_plus_mamba_worker(store, *, partial_hash_hits=False, extra_config=None
         dtypes=(torch.float32,),
         mamba_cache_mode="align",
     )
+    specs = {"L0": full} | {f"L{g}": mamba for g in range(1, num_state_groups + 1)}
     cfg = KVCacheConfig(
         num_blocks=8,
         kv_cache_tensors=[
             KVCacheTensor(
-                size=8 * full.page_size_bytes,
-                layers=["L0"],
-                layer_stride=8 * full.page_size_bytes,
-                block_stride=full.page_size_bytes,
-            ),
-            KVCacheTensor(
-                size=8 * mamba.page_size_bytes,
-                layers=["L1"],
-                layer_stride=8 * mamba.page_size_bytes,
-                block_stride=mamba.page_size_bytes,
-            ),
+                size=8 * spec.page_size_bytes,
+                layers=[layer],
+                layer_stride=8 * spec.page_size_bytes,
+                block_stride=spec.page_size_bytes,
+            )
+            for layer, spec in specs.items()
         ],
         kv_cache_groups=[
-            KVCacheGroupSpec(["L0"], full),
-            KVCacheGroupSpec(["L1"], mamba),
+            KVCacheGroupSpec([layer], spec) for layer, spec in specs.items()
         ],
         # The hit alignment the engine core resolves for 4-token hash units.
         **({"cache_hit_alignment_tokens": 4} if partial_hash_hits else {}),
@@ -1275,7 +1273,7 @@ def _store_full_history(worker, store):
     """Store every block and every block-boundary Mamba state of a 64-token
     prefix, as earlier turns of a conversation would."""
     hs = [BlockHash(bytes([i + 1]) * 4) for i in range(4)]
-    for g_idx in range(2):
+    for g_idx in range(len(worker.token_dbs)):
         for h in hs:
             for key in _store_keys(worker, g_idx, h):
                 store._data[key] = b"x"
@@ -1491,7 +1489,7 @@ def _keys_the_load_reads(worker, block_hashes, hit, vllm_cached_tokens):
         ReqMeta(
             req_id="r0",
             token_len_chunk=hit.hit_length,
-            block_ids=([0, 1, 2, 3], [0, 1, 2, 3]),
+            block_ids=tuple([0, 1, 2, 3] for _ in worker.token_dbs),
             block_hashes=block_hashes,
             load_spec=LoadSpec(
                 vllm_cached_tokens=vllm_cached_tokens,
@@ -1506,17 +1504,24 @@ def _keys_the_load_reads(worker, block_hashes, hit, vllm_cached_tokens):
     return read_keys
 
 
-def test_selective_lease_skips_units_below_local_hit(monkeypatch):
+# C64's lookup (fine-grained, from the local hit), with agentx-sa's four groups.
+@pytest.mark.parametrize("num_state_groups", [1, 4])
+def test_selective_lease_skips_units_below_local_hit(monkeypatch, num_state_groups):
     """Like the load, the lease starts at the local hit's block: the units below
     it are on the GPU and need not be in the store, so leasing them would count
     them as evicted and drop the hit below the local hit."""
     monkeypatch.setenv("VLLM_MOONCAKE_STORE_SELECTIVE_LEASE", "1")
     store = _LeaseTrackingStore()
-    worker = _full_plus_mamba_worker(store, partial_hash_hits=True)
+    worker = _full_plus_mamba_worker(
+        store, partial_hash_hits=True, num_state_groups=num_state_groups
+    )
     hs = [BlockHash(bytes([i + 1]) * 4) for i in range(9)]  # 36 tokens
-    # The store holds only what the GPU did not: full units 4..7, mamba at 32.
+    # The store holds only what the GPU did not: full units 4..7, states at 32.
+    states = [
+        k for g in range(1, num_state_groups + 1) for k in _store_keys(worker, g, hs[7])
+    ]
     stored = [k for h in hs[4:8] for k in _store_keys(worker, 0, h)]
-    for key in stored + _store_keys(worker, 1, hs[7]):
+    for key in stored + states:
         store._data[key] = b"x"
 
     hit = worker.lookup(num_tokens=37, block_hashes=hs, known_prefix_tokens=16)
@@ -1525,7 +1530,7 @@ def test_selective_lease_skips_units_below_local_hit(monkeypatch):
     leased = store.lease_calls[0]
     assert sorted(_keys_the_load_reads(worker, hs, hit, 16)) == sorted(leased)
     assert [sorted(keys) for keys in store.lease_calls] == [
-        sorted(_store_keys(worker, 0, hs[7]) + _store_keys(worker, 1, hs[7]))
+        sorted(_store_keys(worker, 0, hs[7]) + states)
     ]
 
 
@@ -1660,3 +1665,25 @@ def test_selective_lease_startup_check_fails_closed(monkeypatch, answer):
             _full_plus_mamba_worker(store, extra_config={"lookup_store_timeout_s": 0.2})
     finally:
         release.set()
+
+
+def test_selective_lease_with_four_state_groups(monkeypatch):
+    """With the state in four groups (agentx-sa), the lease holds each group's
+    state at the hit's tail and no earlier one, and one group's tail state
+    evicted between probe and lease shortens the hit of every group."""
+    monkeypatch.setenv("VLLM_MOONCAKE_STORE_SELECTIVE_LEASE", "1")
+    store = _LeaseTrackingStore()
+    worker = _full_plus_mamba_worker(store, num_state_groups=4)
+    hs = _store_full_history(worker, store)
+    store.evictions = [set(_store_keys(worker, 3, hs[3]))]
+
+    assert worker.lookup(num_tokens=65, block_hashes=hs).hit_length == 48
+
+    def loaded(num_blocks):
+        full = [k for h in hs[:num_blocks] for k in _store_keys(worker, 0, h)]
+        tail = hs[num_blocks - 1]
+        return sorted(
+            full + [k for g in range(1, 5) for k in _store_keys(worker, g, tail)]
+        )
+
+    assert [sorted(keys) for keys in store.lease_calls] == [loaded(4), loaded(3)]

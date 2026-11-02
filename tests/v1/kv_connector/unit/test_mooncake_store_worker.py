@@ -5459,7 +5459,7 @@ def test_resolve_device_name_rejects_malformed_tables(spec):
         mooncake_store.parse_numa_device_names(spec)
 
 
-def _make_prune_send_thread(store):
+def _make_prune_send_thread(store, num_state_groups=1):
     from vllm.v1.kv_cache_interface import (
         FullAttentionSpec,
         KVCacheGroupSpec,
@@ -5474,13 +5474,14 @@ def _make_prune_send_thread(store):
         mamba_cache_mode="align",
     )
     coord = mooncake_store_worker.MooncakeStoreCoordinator(
-        [KVCacheGroupSpec(["full"], full), KVCacheGroupSpec(["mamba"], mamba)],
+        [KVCacheGroupSpec(["full"], full)]
+        + [KVCacheGroupSpec([f"mamba{g}"], mamba) for g in range(num_state_groups)],
         scheduler_block_size=16,
         hash_block_size=4,
         enable_partial_hash_hits=True,
     )
     dbs = []
-    for group_id in range(2):
+    for group_id in range(1 + num_state_groups):
         db = ChunkedTokenDatabase(
             KeyMetadata("test-model", 0, 0, 0, 0, group_id=group_id),
             block_size=16,
@@ -5492,6 +5493,8 @@ def _make_prune_send_thread(store):
     return _make_store_sending_thread(store, coord=coord, token_databases=dbs)
 
 
+# Four state groups: agentx-sa's KDA states (VLLM_PACKED_KV_STATE_GROUPS=4).
+@pytest.mark.parametrize("num_state_groups", [1, 4])
 @pytest.mark.parametrize(
     ("resume", "full_units", "state_unit"),
     [
@@ -5503,10 +5506,12 @@ def _make_prune_send_thread(store):
         (32, [8], 7),
     ],
 )
-def test_prune_superseded_removes_resume_point_keys(resume, full_units, state_unit):
+def test_prune_superseded_removes_resume_point_keys(
+    resume, full_units, state_unit, num_state_groups
+):
     store = MagicMock()
     store.batch_remove.side_effect = lambda keys: [0] * len(keys)
-    thread = _make_prune_send_thread(store)
+    thread = _make_prune_send_thread(store, num_state_groups)
     hs = [bytes([i + 1]) * 4 for i in range(12)]
     req = ReqMeta(
         req_id="req-a",
@@ -5522,10 +5527,10 @@ def test_prune_superseded_removes_resume_point_keys(resume, full_units, state_un
     store.batch_remove.assert_not_called()  # queued until the lease runs out
     thread._drain_prune_queue()
 
-    db_full, db_mamba = thread.token_databases
+    db_full, *db_states = thread.token_databases
     assert store.batch_remove.call_args.args[0] == [
         *[db_full.key_for(BlockHash(hs[u])) for u in full_units],
-        db_mamba.key_for(BlockHash(hs[state_unit])),
+        *[db.key_for(BlockHash(hs[state_unit])) for db in db_states],
     ]
 
 
