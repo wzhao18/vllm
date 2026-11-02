@@ -2539,13 +2539,15 @@ class NixlBaseConnectorWorker:
     def _dcp_pair_index_format(self, regions: list["PairRegion"]) -> tuple[int, int]:
         """Rows per kernel page of the indexer caches, from the kernel block
         views bound to their layers, and the value bytes of an indexer row (the
-        rest are its scales). Zeros without indexer caches."""
+        rest are its scales), from its width: index_head_dim fp8 values and a
+        4-byte scale, or index_head_dim / 2 MXFP4 (E2M1) bytes and a UE8M0 byte
+        per 32 values. Zeros without indexer caches."""
         from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
             dcp_pair_exchange,
         )
 
         layers = self.vllm_config.compilation_config.static_forward_context
-        kernel_rows = set()
+        kernel_rows, widths = set(), set()
         for region in regions:
             if getattr(region.spec, "cache_role", None) != SparseCacheRole.INDEXER:
                 continue
@@ -2563,19 +2565,29 @@ class NixlBaseConnectorWorker:
                     "bound to a view of its registered KV cache"
                 )
             kernel_rows.add(view.shape[-2])
+            widths.add(region.spec.state_content_size_bytes)
         if not kernel_rows:
             return 0, 0
         text_config = self.vllm_config.model_config.hf_text_config
-        value_bytes = getattr(
+        head_dim = getattr(
             getattr(text_config, "dsa_config", None), "index_head_dim", None
         )
-        if len(kernel_rows) != 1 or not isinstance(value_bytes, int):
+        if len(kernel_rows) != 1 or len(widths) != 1 or not isinstance(head_dim, int):
             raise dcp_pair_exchange.NixlPairModeError(
                 "DCP pair exchange: the indexer caches need one kernel page size "
-                f"(got {sorted(kernel_rows)} rows) and dsa_config.index_head_dim "
-                f"(got {value_bytes!r})"
+                f"(got {sorted(kernel_rows)} rows), one row width (got "
+                f"{sorted(widths)} bytes) and dsa_config.index_head_dim (got "
+                f"{head_dim!r})"
             )
-        return kernel_rows.pop(), value_bytes
+        width = widths.pop()
+        values = {head_dim + 4: head_dim, head_dim // 2 + head_dim // 32: head_dim // 2}
+        if width not in values:
+            raise dcp_pair_exchange.NixlPairModeError(
+                f"DCP pair exchange: {width}-byte indexer rows are neither fp8 "
+                f"({head_dim} + 4 bytes) nor MXFP4 ({head_dim // 2} + "
+                f"{head_dim // 32} bytes) rows of index_head_dim {head_dim}"
+            )
+        return kernel_rows.pop(), values[width]
 
     def _ple_page_len(self) -> int:
         """Transfer length of one PLE state page.

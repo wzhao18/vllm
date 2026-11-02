@@ -1373,14 +1373,14 @@ def build_dcp_pair_exchanger(
     """The exchanger of a D rank's DCP-sharded attention group, from its NIXL
     regions. Not warmed up: every rank calls ``warm_up`` next.
 
-    Indexer pages must have the CUDA fp8 layout: kernel pages of
-    ``index_kernel_rows`` rows that hold their fp8 values, a multiple of 16
-    bytes per row, then one 4-byte scale per row.
+    Indexer pages must have the CUDA fp8 or MXFP4 layout: kernel pages of
+    ``index_kernel_rows`` rows that hold their fp8 or E2M1 values, a multiple
+    of 16 bytes per row, then their 4 scale bytes per row.
 
     Args:
         regions: The group's regions, in NIXL region order.
         index_kernel_rows: Rows per kernel page of the indexer cache.
-        index_value_bytes: fp8 value bytes of an indexer row.
+        index_value_bytes: fp8 or E2M1 value bytes of an indexer row.
         layout: The rank's row maps.
         device: The KV cache device.
         chunk_units: Units per NCCL round.
@@ -1405,6 +1405,6 @@ def build_dcp_pair_exchanger(
             raise NixlPairModeError(
                 f"DCP pair exchange cannot exchange layer {array.layer_name}: "
                 f"{array.width}-byte {array.kind.value} rows are not the CUDA fp8 "
-                "indexer layout"
+                "or MXFP4 indexer layout"
             )
     return DcpPairExchanger(table, layout, device, chunk_units=chunk_units)
