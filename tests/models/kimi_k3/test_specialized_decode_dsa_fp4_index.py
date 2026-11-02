@@ -491,6 +491,20 @@ def check_readers_logits(step, logits):
         assert torch.equal(logits[i, :n], step.ref[i, :n]), i
 
 
+def check_readers_topk(step, name):
+    """A reader's top-k against the stock scoring's. cooperative_topk and
+    persistent_topk place the ids, and pick among logits tied at the k-th, by
+    atomics, so the stock op does not repeat its own order: per row, as many
+    distinct ids below the row's length as stock selects, and the same logits."""
+    for i, n in enumerate(step.lens):
+        got, want = (t[i][t[i] >= 0].long() for t in (step.topk, step.stock))
+        assert got.numel() == want.numel() == min(n, TOPK), (name, i)
+        assert got.unique().numel() == got.numel() and int(got.max()) < n, (name, i)
+        logits = step.ref[i]
+        same = torch.equal(logits[got].sort().values, logits[want].sort().values)
+        assert same, (name, i)
+
+
 @DEEPGEMM
 @pytest.mark.parametrize("batch,rows", [(1, 1), (8, 6), (64, 64), (130, 128)])
 @torch.inference_mode()
@@ -506,7 +520,7 @@ def test_mxfp4_readers_match_stock(monkeypatch, workspace_init, batch, rows):
     for name, select in step.selects.items():
         step.topk.fill_(-1)
         select()
-        assert torch.equal(step.topk[:rows], step.stock), name
+        check_readers_topk(step, name)
     check_readers_logits(step, step.logits())
 
 
@@ -532,7 +546,7 @@ def test_mxfp4_readers_capture_after_stock(monkeypatch, workspace_init, batch, r
         step.topk.fill_(-1)
         graphs[name].replay()
         torch.accelerator.synchronize()
-        assert torch.equal(step.topk[:rows], step.stock), name
+        check_readers_topk(step, name)
     graphs["decode_logits"].replay()
     torch.accelerator.synchronize()
     check_readers_logits(step, outs["decode_logits"])
