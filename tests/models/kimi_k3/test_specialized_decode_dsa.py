@@ -1566,9 +1566,10 @@ def test_flashinfer_kernels_share_precision(
     """trtllm-gen and prims_ts (the kernels FI_KERNEL mixes per batch) on identical
     FP8 inputs: on one KV tile both equal (to the BF16 ulp) the same emulation of
     their rounding (E4M3 P at 448, FP32 sum and accumulation, BF16 output), and on
-    longer rows (online softmax, split-KV with BF16 partials) their errors against
-    exact FP64 attention have the same size and no systematic difference (scale
-    bias); under DCP8 also their LSEs."""
+    longer rows (online softmax, split-KV with BF16 partials) prims_ts errs against
+    exact FP64 attention at most 1.25x as much as trtllm-gen (on SM107 it can err
+    less) and the two have no systematic difference (scale bias); under DCP8 also
+    their LSEs."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.attn_fi import (
         KERNELS,
         FlashInferCore,
@@ -1665,7 +1666,7 @@ def test_flashinfer_kernels_share_precision(
         # approximation aside), and neither is the BF16-P or exact one.
         for s in (trt, pts):
             assert s["within"]["e4m3"] >= 0.995, stats
-    assert 0.8 <= pts["rel"] / trt["rel"] <= 1.25, stats
+    assert pts["rel"] <= 1.25 * trt["rel"], stats
     assert abs(pts["bias"] - trt["bias"]) <= 0.1 * max(pts["rel"], trt["rel"]), stats
     if lses:
         assert abs(pts["lse"][1] - trt["lse"][1]) <= 1e-3, stats
