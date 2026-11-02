@@ -17,7 +17,9 @@ the steps up to 64 rows.
   sparse core      the global ids filtered to this rank's slots, then the sparse
                    decode of every rank's gathered heads over the local shard:
                    FlashInfer's (as the stock decode) or FlashMLA sparse
-  DcpValue         the LSE merge of this rank's heads, W_UV and the sigmoid gate
+  DcpValue         the LSE merge of this rank's heads, W_UV and the sigmoid gate;
+                   on "proj" rows (VLLM_K31_DSA_PARTIALS) the W_UV bmm of every
+                   gathered head, then #108's DcpValue over its value rows
 
 The packed projection row is [q_a 1536 | kv_a 576 | gate H*128 | wk 128 | wv 32]."""
 
@@ -48,7 +50,11 @@ from ..mla.dcp import GB300_SMS, DcpValue, compile_value
 from ..mla.prepared import pad_requests
 from ..mla.query import MlaQuery
 from ..mla.value import MlaValue
+from . import dcp_value
+from .dcp_stage import compile_dcp_value, projected_rows, run_value
+from .dcp_value import PROJECTED
 from .index import DIM, HEADS, DsaIndex
+from .r1 import PARTIALS_ENV, DsaBox
 
 logger = init_logger(__name__)
 
@@ -123,6 +129,7 @@ def compile_core(
     dcp=0,
     q_heads=0,
     sms=148,
+    partials="bf16",
     fp8=False,
     lse_base_e=True,
     cap=64,
@@ -130,7 +137,8 @@ def compile_core(
     """CuTe kernels (query, index, value) of one batch of rows (``q`` per request).
     ``specs``: the layouts of the weights, the MLA cache and the indexer cache.
     Under DCP (``dcp``: its size, ``q_heads``: the gathered query's padded heads) the
-    query also publishes into the q mailbox and the value is DcpValue. ``fp8``: a
+    query also publishes into the q mailbox and the value is DcpValue (``partials``
+    "proj": #108's, over the W_UV bmm's value rows, dcp_stage). ``fp8``: a
     per-tensor FP8 query [B, H, 576] and cache, and the value reads FlashInfer's
     [B, H, 512] latent (under DCP: an FP8 q mailbox, and an LSE in base e if
     ``lse_base_e``, else base 2). ``cap``: the DCP mailboxes' rows (64, or a widened
@@ -185,7 +193,12 @@ def compile_core(
         if batch > 1:
             query_kernel = prepare_shared_carveout(query_kernel, device, 100)
         index_kernel = cute.compile(index, *i_args, s)
-        if dcp:
+        if dcp and partials == PROJECTED:
+            args = heads, dcp, batch, specs[4], pitch, device, sms, q, q_heads
+            value_kernel = compile_dcp_value(*args, fp8, lse_base_e, partials, cap)
+            if batch > 64:
+                check_proj_residency(value_kernel, heads, dcp, batch, sms, device)
+        elif dcp:
             value_kernel = compile_value(
                 heads,
                 dcp,
@@ -240,6 +253,18 @@ def check_value_residency(compiled, heads, dcp, batch, q, sms, device):
     return grid
 
 
+def check_proj_residency(compiled, heads, dcp, batch, sms, device):
+    """Raise unless the device holds the "proj" DcpValue's whole grid at once (its
+    merging CTAs poll the value rows every rank's projecting CTAs push); returns the
+    grid. dsa.dcp_value's schedule on the real SM count: DCP x H projecting CTAs,
+    then H x min(tiles, (SMs - DCP x H) // H) merging ones; DCP16, 6 heads, Rubin:
+    96 + 6 x 19 = 210 CTAs from 304 rows, against one 512-thread CTA per SM."""
+    grid = dcp_value.DcpValue(heads, dcp, batch, sms, partials=PROJECTED).grid
+    what = f"Kimi K3.1 DSA wide rows: DcpValue proj (batch {batch})"
+    check_residency(compiled, device, grid[0] * grid[1] * grid[2], 512, what)
+    return grid
+
+
 def index_policies(batches):
     """Split-K tactics of the replicated wq_b projection (N 4096, K 1536) per padded
     batch (GB300 us, previous / these: B1-8 4.9/2.9, B32 3.7/3.4, B64 4.9/3.9); wide
@@ -266,7 +291,8 @@ class WideDsa:
     ``queries``: the query lengths q (1 + the draft length under DSpark verify)
     prepared for every batch divisible by q; ``dcp``: the model's DSA DcpBox, whose
     widened box (``DcpBox.widened``) serves the batches above its rows; ``core``: the
-    TP sparse core of the shared provider policy (unused: DCP only)."""
+    TP sparse core of the shared provider policy (unused: DCP only); ``partials``:
+    the DcpValue partials of its batches (r1.DsaBox; None: VLLM_K31_DSA_PARTIALS)."""
 
     def __init__(
         self,
@@ -278,6 +304,7 @@ class WideDsa:
         core="auto",
         dcp=None,
         parity=0,
+        partials=None,
     ):
         from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseImpl
 
@@ -326,6 +353,18 @@ class WideDsa:
         wide = rows > dcp.cap
         widened = dcp.widened(rows) if wide else dcp
         self.boxes = {b: widened if b > dcp.cap else dcp for b in pitches}
+        # "proj" batches exchange #108's value rows through the widened box's
+        # DcpMailbox (collective, in layer order), from the layer's gathered W_UV
+        # (PreparedDsa's, if it took it) and the bmm's rows.
+        self.dsa_box = DsaBox(widened, pitches, partials)
+        if self.dsa_box.projected and not self.fp8:
+            raise ValueError(
+                f'Kimi K3.1 WideDsa: "proj" partials ({PARTIALS_ENV}) need the '
+                "FLASHINFER_MLA_SPARSE backend"
+            )
+        self.uv_gathered = self.dsa_box.value_weights(layer)
+        if self.uv_gathered is not None:
+            projected_rows(device, widened.cap, self.dcp * self.heads)
         if self.fp8 and self.impl.use_prims_ts:
             # dcp_core runs the stock prims_ts decode on the padded q mailbox; the
             # profile run's reserve_workspace plans the native heads only.
@@ -359,21 +398,26 @@ class WideDsa:
             args: tuple = (batch, self.heads, self.pitches[batch], specs)
             args += (self.device.index, q)
             box = self.boxes[batch]
-            args += (self.dcp, box.q_heads, sms)
+            args += (self.dcp, box.q_heads, sms, self.dsa_box.mailbox(batch).format)
             cap = box.cap
             lse_base_e = not self.fp8 or self.impl.lse_base_on_e
             self.kernels[batch, q] = compile_core(
                 *args, fp8=self.fp8, lse_base_e=lse_base_e, cap=cap
             )
         rows = sorted(b for b, _ in self.shapes)
+        proj = [b for b in rows if self.dsa_box.mailbox(b).format == PROJECTED]
         logger.info_once(
             "Kimi K3.1 WideDsa (DCP %d): rows %s, widened DSA box %d rows, MlaQuery "
-            "tile poll above %d rows (VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS=%d)",
+            "tile poll above %d rows (VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS=%d), DcpValue "
+            'partials %s=%s ("proj" at rows %s)',
             self.dcp,
             " ".join(map(str, rows)),
             max(box.cap for box in self.boxes.values()),
             WIDE_MAX_ROWS,
             wide_max_rows(),
+            PARTIALS_ENV,
+            self.dsa_box.partials,
+            " ".join(map(str, proj)) or "none",
             scope="global",
         )
         return self
@@ -411,11 +455,12 @@ class WideDsa:
 
     def dcp_core(self, cache, topk, metadata, batch, box=None):
         """Sparse decode of every rank's query heads (the gathered q mailbox) over the
-        local shard into the DcpValue rows and LSE. The global top-k ids are filtered
-        to this rank's slots and compacted to a prefix whose length bounds the work
-        (about 1 / DCP of the top-k). FlashMLA (natural-log LSE; a fresh scheduler
-        metadata per call follows those lengths) or, on a per-tensor FP8 cache,
-        FlashInfer's sparse decode over the flat rows, as the stock decode."""
+        local shard into the DcpValue rows, LSE and per-row valid counts. The global
+        top-k ids are filtered to this rank's slots and compacted to a prefix whose
+        length bounds the work (about 1 / DCP of the top-k). FlashMLA (natural-log
+        LSE; a fresh scheduler metadata per call follows those lengths) or, on a
+        per-tensor FP8 cache, FlashInfer's sparse decode over the flat rows, as the
+        stock decode."""
         from vllm.v1.attention.backends.mla.flashmla_sparse import _fp8_kv_pages
         from vllm.v1.attention.backends.mla.sparse_utils import (
             flat_kv_row_view,
@@ -464,7 +509,8 @@ class WideDsa:
                 is_decode=True,
             )
             assert lse is not None
-            return rows, lse.masked_fill((valid == 0).view(-1, 1), float("-inf"))
+            lse = lse.masked_fill((valid == 0).view(-1, 1), float("-inf"))
+            return rows, lse, valid
         rows, lse = flash_mla_with_kvcache(
             q=box.q[self.parity, :batch].unsqueeze(1),
             k_cache=pages.view(torch.uint8).unsqueeze(-2),
@@ -479,7 +525,8 @@ class WideDsa:
             out=self.rows[:batch],
         )
         # A rank owning none of a row's entries: DcpValue drops it (LSE -inf).
-        return rows, lse.masked_fill((valid == 0).view(-1, 1, 1), float("-inf"))
+        lse = lse.masked_fill((valid == 0).view(-1, 1, 1), float("-inf"))
+        return rows, lse, valid
 
     def run_dcp(self, projected, out, cache, slots, index_slots, metadata, q):
         """``run`` under DCP: the query publishes into the q mailbox and DcpValue
@@ -499,7 +546,11 @@ class WideDsa:
         mq(*q_args, to_cute(self.query[:batch]), to_cute(self.qc[:batch]), *publish, s)
         self.run_index(x, index_slots, batch, index)
         topk = self.indexer_core(projected, batch)
-        latent, lse = self.dcp_core(cache, topk, metadata, batch, box)
+        latent, lse, valid = self.dcp_core(cache, topk, metadata, batch, box)
+        if self.dsa_box.mailbox(batch).format == PROJECTED:
+            core, (w_uv, uv_view) = (latent, lse, valid), self.uv_gathered
+            args = value, self.dsa_box, p, publish, self.heads, core, lengths[:reqs]
+            return run_value(*args, uv_view, projected, out, w_uv)
         lens = to_cute(lengths[:reqs], 4)
         boxes = to_cute(box.partial[p]), to_cute(box.lse[p], 4)
         peers = to_cute(box.peers, 8), to_cute(box.lse_peers, 8)

@@ -613,11 +613,14 @@ def test_flashinfer_dcp_core_merges_to_full_attention(
             # box (here: garbage).
             own = torch.full_like(box[:, :64], 0x7F)
             core.box = SimpleNamespace(q=own)
-            row, lse = WideDsa.dcp_core(
+            row, lse, valid = WideDsa.dcp_core(
                 core, cache, tokens, md, rows, SimpleNamespace(q=box)
             )
         else:
-            row, lse = WideDsa.dcp_core(core, cache, tokens, md, rows)
+            row, lse, valid = WideDsa.dcp_core(core, cache, tokens, md, rows)
+        # Per-row counts of this rank's top-k entries (DcpValue "proj" reads them).
+        owned = (owner[tokens.long().clamp(min=0)] == rank) & (tokens >= 0)
+        assert torch.equal(valid.view(-1).long(), owned.sum(1)), rank
         outs.append(row.view(rows, -1, 512)[:, :heads].float())
         lses.append(lse.view(rows, -1)[:, :heads].float())
         if rank:
