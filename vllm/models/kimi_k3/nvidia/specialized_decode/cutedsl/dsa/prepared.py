@@ -84,7 +84,7 @@ from .query_stage import (
     front_kernel,
     gate_columns,
 )
-from .r1 import DsaBox, fi_buffers
+from .r1 import PARTIALS_ENV, DsaBox, fi_buffers
 
 logger = init_logger(__name__)
 
@@ -224,7 +224,8 @@ class PreparedDsa:
     ``overlap``: a query overlap mode or "rows:mode" table (overlap.QUERY_OVERLAP).
     The round-1 runtime's arguments are taken too (r1.py): ``core`` "auto", its
     scratch (the last item a BF16 latent: FlashInfer's buffers are r1.fi_buffers)
-    and its DSA DcpBox (wrapped in r1.DsaBox).
+    and its DSA DcpBox (wrapped in r1.DsaBox, whose DcpValue partials are
+    ``partials``; None: VLLM_K31_DSA_PARTIALS).
     """
 
     def __init__(
@@ -240,6 +241,7 @@ class PreparedDsa:
         overlap=None,
         prims_ts_rows=None,
         core="auto",
+        partials=None,
     ):
         from vllm.model_executor.layers.linear import UnquantizedLinearMethod
         from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseImpl
@@ -265,7 +267,12 @@ class PreparedDsa:
         if core != "auto":
             raise ValueError(f"Kimi K3.1 DSA core {core!r}: only auto is served")
         if dcp is not None and not hasattr(dcp, "mailboxes"):
-            dcp = DsaBox(dcp)
+            dcp = DsaBox(dcp, pitches, partials)
+        if dcp is not None and PROJECTED in dcp.mailboxes and not self.fp8:
+            raise ValueError(
+                f'Kimi K3.1 specialized DSA: "proj" partials ({PARTIALS_ENV}) need '
+                "the FLASHINFER_MLA_SPARSE backend"
+            )
         self.box, self.parity = dcp, parity
         # The DcpBox mailboxes hold cap rows: a wider batch would store past them.
         assert dcp is None or max(pitches) <= dcp.cap, (max(pitches), dcp.cap)
@@ -343,7 +350,7 @@ class PreparedDsa:
             reserve_fused_indexer(*args, blocks=kv_cache_blocks())
         # DCP "proj" partials: every gathered head's W_UV (collective), and the
         # rows of its bmm (dcp_stage.projected_rows).
-        self.uv_gathered = dcp.value_weights(layer.W_UV) if dcp else None
+        self.uv_gathered = dcp.value_weights(layer) if dcp else None
         if self.uv_gathered is not None:
             projected_rows(self.device, dcp.cap, dcp.size * self.heads)
         # The DSA sparse core (dsa_kernels.dsa_core.decode.build, VLLM_K31_DSA_CORE=1)
@@ -391,6 +398,7 @@ class PreparedDsa:
                 if mode in LATE:
                     mode = overlap_for(batch, QUERY_OVERLAP_UNFUSED)
                 self.overlaps[batch, q] = mode
+        unserved = []  # DSA sparse core shapes whose rows exchange "proj" partials
         for batch, q in self.shapes:
             args: tuple = (batch, self.heads, self.pitches[batch], specs)
             args += (self.device.index, q)
@@ -417,6 +425,8 @@ class PreparedDsa:
                 )
             if self.dsac is not None and partials == "bf16":
                 self.prepare_core(batch, q, specs[4], sms)
+            elif self.dsac is not None and self.dsac.variant(batch, q, self.dsa_layer):
+                unserved.append(f"{batch}x{q}")
             if self.count_stats is not None:
                 self.count_stats.reserve(self.dsa_layer, batch)
         rows = max(self.pitches)
@@ -440,6 +450,16 @@ class PreparedDsa:
             )
         stage.warm(kv.shape[1])  # the merge's rows variant, before any capture
         self.log_policy(unsupported)
+        if unserved:
+            logger.warning_once(
+                "Kimi K3.1 DSA sparse core (VLLM_K31_DSA_CORE): rows x q %s exchange "
+                '"proj" partials (%s=%s), which the core does not push: they run '
+                "FlashInfer's decode",
+                " ".join(unserved),
+                PARTIALS_ENV,
+                self.box.partials,
+                scope="global",
+            )
         return self
 
     def log_policy(self, unsupported):
@@ -473,6 +493,27 @@ class PreparedDsa:
                 "Kimi K3.1 specialized DSA: sparse core at rows x q %s (DSA layer %d)",
                 " ".join(f"{b}x{q}" for b, q in sorted(self.core_kernels)),
                 self.dsa_layer,
+                scope="global",
+            )
+        if self.box is not None:
+            box = self.box
+            proj = [b for b in sorted(self.pitches) if box.mailbox(b).format != "bf16"]
+            memory = ""
+            if proj:
+                assert self.uv_gathered is not None
+                mail = box.mailbox(proj[0])
+                mailbox = (mail.partial.nbytes + mail.lse.nbytes) / 2**20
+                weights = self.uv_gathered[0].nbytes / 2**20
+                memory = (
+                    f" (mailbox {mailbox:.1f} MiB, W_UV {weights:.1f} MiB per layer)"
+                )
+            logger.info_once(
+                "Kimi K3.1 specialized DSA: DcpValue partials %s=%s, "
+                '"proj" at rows %s%s',
+                PARTIALS_ENV,
+                box.partials,
+                " ".join(map(str, proj)) or "none",
+                memory,
                 scope="global",
             )
 

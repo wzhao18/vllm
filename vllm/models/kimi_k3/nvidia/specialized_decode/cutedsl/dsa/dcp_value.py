@@ -6,7 +6,8 @@ q mailbox, pushes this rank's partial rows (BF16 latent rows, or "proj": BF16 va
 rows through W_UV) and LSE of the gathered heads to their owner's Lamport mailbox
 (peer stores; a source with nothing to merge sends only its LSE); the owner
 LSE-merges its H heads over the DCP sources, then W_UV and the gate (padding from the
-global lengths). The mailboxes are the model's DSA DcpBox (mla.dcp)."""
+global lengths). The mailboxes are the model's DSA DcpBox (mla.dcp) and, for "proj"
+rows, a DcpMailbox beside it (r1.DsaBox)."""
 
 import math
 from functools import cache
