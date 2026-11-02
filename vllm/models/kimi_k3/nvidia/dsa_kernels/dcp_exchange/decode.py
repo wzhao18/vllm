@@ -151,7 +151,7 @@ class DcpxDecode:
         from vllm.distributed import get_dcp_group, get_tp_group
         from vllm.platforms import current_platform
 
-        from .ops import DcpExchange
+        from .ops import DcpExchange, _load_ext
 
         group = get_dcp_group()
         self.W, self.rank = group.world_size, group.rank_in_group
@@ -214,6 +214,12 @@ class DcpxDecode:
         self.max_local_len = -(-model_len // span) * self.interleave
         self.K = topk
         cap1 = min(self.cap, self.one_round_rows)
+        # Every rank's extension before any rank enters the first rendezvous: torch's
+        # JIT load builds one rank at a time on the build directory's lock, and a
+        # rendezvous wait past the store timeout (a FileStore's: 300 s a key) leaves
+        # the group's symmetric-memory sequence offset for every later rendezvous.
+        _load_ext()
+        group.barrier()
         self.ex = DcpExchange(
             group.device_group,
             device,
