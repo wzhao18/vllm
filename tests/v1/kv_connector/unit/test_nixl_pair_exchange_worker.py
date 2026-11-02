@@ -621,36 +621,46 @@ def _facade(worker) -> NixlPullConnector:
 
 
 @pytest.mark.parametrize(
-    "num_tokens,num_cached,num_draft,extra_d",
-    [(2500, 0, 0, 1), (3000, 1, 5, 0), (2100, 1, 0, 1)],
+    "num_tokens,num_cached,num_draft,extra_d,groups",
+    [
+        (2500, 0, 0, 1, 2),
+        (3000, 1, 5, 0, 2),
+        (2100, 1, 0, 1, 2),
+        (3000, 1, 5, 0, 3),
+        (3000, 1, 5, 0, 4),
+    ],
     ids=[
         "odd-P-blocks,D-lookahead",
         "even-P-blocks,D-prefix-hit,drafter",
         "odd-P-blocks,D-prefix-hit,D-lookahead",
+        "even-P-blocks,D-prefix-hit,drafter,3-state-groups",
+        "even-P-blocks,D-prefix-hit,drafter,4-state-groups",
     ],
 )
 def test_pull_then_exchange_on_k31_geometry(
-    k31_env, fabric, num_tokens, num_cached, num_draft, extra_d
+    k31_env, fabric, monkeypatch, num_tokens, num_cached, num_draft, extra_d, groups
 ):
     """A3: every D rank's real read path pulls whole pages (attention from P
     rank r % 8, KDA state from r // 2) into the real planner's packed K3.1
     blocks, zeroing what it leaves unwritten; after the exchange every DSA row
     (latent, indexer values and scales, drafter) holds its interleave-1 token,
     the prefix-cache hit is kept, and the KDA state, row padding and every
-    other block are untouched."""
+    other block are untouched. Also with the 3 and 4 KDA state groups of the
+    nvfp4_ds_mla and FP32-state recipes."""
+    monkeypatch.setenv("VLLM_PACKED_KV_STATE_GROUPS", str(groups))
     block_size = 64
     num_d = cdiv(num_tokens, D_DCP * block_size) + extra_d
     num_p = cdiv(num_tokens, P_DCP * block_size)
     rng = np.random.default_rng(num_tokens)
     # Per rank pool: the request's DSA blocks, a KDA block per group, a spare.
-    d_pool = rng.permutation(num_d + 3).tolist()
-    p_pool = rng.permutation(num_p + 3).tolist()
-    d_ids, d_kda = d_pool[:num_d], d_pool[num_d : num_d + 2]
-    p_ids, p_kda = p_pool[:num_p], p_pool[num_p : num_p + 2]
+    d_pool = rng.permutation(num_d + groups + 1).tolist()
+    p_pool = rng.permutation(num_p + groups + 1).tolist()
+    d_ids, d_kda = d_pool[:num_d], d_pool[num_d : num_d + groups]
+    p_ids, p_kda = p_pool[:num_p], p_pool[num_p : num_p + groups]
 
     geometry = dict(block_size=block_size, num_draft=num_draft)
     prefillers = {
-        p: _Rank(fabric, P_DCP, p, num_p + 3, **geometry) for p in range(P_DCP)
+        p: _Rank(fabric, P_DCP, p, num_p + groups + 1, **geometry) for p in range(P_DCP)
     }
     arrays = prefillers[0].arrays()
     num_arrays = len(arrays)
@@ -667,7 +677,7 @@ def test_pull_then_exchange_on_k31_geometry(
 
     pair = {"dcp_pair_exchange": True}
     decoders = [
-        _Rank(fabric, D_DCP, r, num_d + 3, extra_config=pair, **geometry)
+        _Rank(fabric, D_DCP, r, num_d + groups + 1, extra_config=pair, **geometry)
         for r in range(D_DCP)
     ]
     for r, rank in enumerate(decoders):
@@ -683,8 +693,9 @@ def test_pull_then_exchange_on_k31_geometry(
         _handshake(rank, prefillers)
 
     rank0 = decoders[0]
+    assert len(rank0.kda_groups()) == groups
     local = _per_group(rank0, d_ids[num_cached:], [[b] for b in d_kda])
-    computed = _per_group(rank0, num_cached, [0, 0])
+    computed = _per_group(rank0, num_cached, [0] * groups)
     remote = _per_group(rank0, p_ids, [[b] for b in p_kda])
     for rank in decoders:
         rank.worker.start_load_kv(
