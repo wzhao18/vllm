@@ -9,7 +9,7 @@ the DeepGEMM warmup compiles the kernels:
   ``situ_patch`` derives from the installed stock header (bitwise-identical output,
   -5..-12% per launch at EP16/EP32 per-rank shapes). Falls back to the stock kernel, with a warning, when the
   installed DeepGEMM's header does not have the expected text.
-- ``VLLM_K3_MEGAMOE_LOCALIZE`` (default 1): place each rank's routed expert weights
+- ``VLLM_K3_MEGAMOE_LOCALIZE`` (default 0; set 1 to opt in): place each rank's routed expert weights
   in the GPU's two locality domains (MLOPart), so every die streams its half of N
   from its own HBM (bitwise-identical output). Full K3.1 DEP16 on VR: -0.57..-0.65 ms
   per step on one 4-node block (MegaMoE 119.7 -> 113.7 us/launch at 128 rows), 5 of
@@ -38,7 +38,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 _PATCH = os.environ.get("VLLM_K3_MEGAMOE_PATCH", "1") == "1"
-_LOCALIZE = os.environ.get("VLLM_K3_MEGAMOE_LOCALIZE", "1") == "1"
+_LOCALIZE = os.environ.get("VLLM_K3_MEGAMOE_LOCALIZE", "0") == "1"
 
 
 def install_patched_header(deep_gemm, cache_root: Path | None = None) -> Path | None:
