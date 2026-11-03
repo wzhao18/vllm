@@ -87,6 +87,12 @@ class KimiK3Mxfp8Kernel(FlashInferCutedslMxfp8LinearKernel):
         rows = qa.data.shape[0] if qa is not None else x.numel() // x.shape[-1]
         weight = layer.weight  # [K, N], column-major
         k, n = weight.shape
+        if rows == 0:
+            # No rows (a ShardQ indexer step that scores none on this rank):
+            # FlashInfer's MXFP8 quantize cannot launch an empty grid.
+            shape = qa.orig_shape if qa is not None else x.shape
+            dtype = qa.orig_dtype if qa is not None else layer.params_dtype
+            return weight.new_empty((*shape[:-1], n), dtype=dtype)
         if use_cute_dsl(n, k, rows):
             return super().apply_weights(layer, x, bias)
         if qa is not None:

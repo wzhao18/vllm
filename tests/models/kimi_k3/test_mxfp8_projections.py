@@ -308,6 +308,45 @@ def test_dispatch_switches_cute_dsl_linears(default_vllm_config, dist_init):
     assert enable_kimi_k3_mxfp8_dispatch(model) == 0  # idempotent
 
 
+def test_dispatch_returns_empty_output_for_zero_rows(monkeypatch):
+    """A rank with no rows (a ShardQ indexer step) gets an empty output without
+    an MXFP8 quantize or GEMM: FlashInfer's quantize cannot launch an empty
+    grid."""
+    import vllm.model_executor.kernels.linear.mxfp8.flashinfer as fi_mxfp8
+    import vllm.models.kimi_k3.nvidia.mxfp8 as mxfp8
+    from vllm.model_executor.layers.fusion.quant_activation import (
+        QuantizedActivation,
+    )
+
+    def launch(*args, **kwargs):
+        raise AssertionError("MXFP8 kernel launched on 0 rows")
+
+    monkeypatch.setattr(mxfp8, "mxfp8_e4m3_quantize", launch)
+    monkeypatch.setattr(fi_mxfp8, "mxfp8_e4m3_quantize", launch)
+    monkeypatch.setattr(fi_mxfp8.vllm_flashinfer, "mm_mxfp8", launch, raising=False)
+    monkeypatch.setattr(torch, "_scaled_mm", launch)
+    n, k = 4096, 1536  # wq_index
+    kernel = object.__new__(mxfp8.KimiK3Mxfp8Kernel)
+    layer = SimpleNamespace(
+        weight=torch.empty(n, k, dtype=torch.float8_e4m3fn).t(),
+        weight_scale=torch.empty(0, dtype=torch.uint8),
+        params_dtype=torch.bfloat16,
+    )
+    quantized = QuantizedActivation(
+        torch.empty(0, k, dtype=torch.float8_e4m3fn),
+        torch.empty(0, dtype=torch.uint8),
+        torch.float16,
+        torch.Size((0, k)),
+        kernel.input_quant_key(),
+    )
+    for x, shape, dtype in (
+        (torch.empty(2, 0, k, dtype=torch.bfloat16), (2, 0, n), torch.bfloat16),
+        (quantized, (0, n), torch.float16),
+    ):
+        out = kernel.apply_weights(layer, x)
+        assert out.shape == shape and out.dtype == dtype
+
+
 def test_dspark_drafter_installs_mxfp8_dispatch(monkeypatch):
     """The K3 DSpark drafter's post-load hook switches its own online-MXFP8
     linears (an MXFP8 drafter is quantized separately from the target)."""
