@@ -383,9 +383,17 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 and self.kv_cache_dtype != "fp8_ds_mla"
                 else dtype
             )
+            device = next(self.kv_b_proj.parameters()).device
+            if device.type == "meta":
+                # Online quantization creates the weights on meta; the DCP
+                # symmetric-memory buffers need the real device.
+                device = torch.device(
+                    current_platform.device_type,
+                    torch.accelerator.current_device_index(),
+                )
             self.dcp_manager = MLADCPManager(
                 vllm_config=vllm_config,
-                device=next(self.kv_b_proj.parameters()).device,
+                device=device,
                 num_heads=self.num_local_heads,
                 query_head_dim=self.head_size,
                 output_head_dim=self.kv_lora_rank,
