@@ -37,7 +37,7 @@ from .experts_rubin import (
 )
 from .experts_rubin64 import CENSUS_BYTES, RubinGroupedExpertsKernel
 from .experts_vw import RubinVWExpertsKernel
-from .experts_wide import RubinWideExpertsKernel, WidePlanKernel
+from .experts_wide import WIDE_MAX, RubinWideExpertsKernel, WidePlanKernel
 
 logger = init_logger(__name__)
 
@@ -214,12 +214,43 @@ RUBIN64_VERIFY = {16: "9-63:1"}
 # (each expert's weights once per up to 16 / 32 tokens). One GPU, WideExperts with the
 # plan written in front, real verify routes of all 92 MoE layers, us per call, width 8
 # / 16: M72 38.55 / 38.68, M96 44.86 / 44.34, M128 52.62 / 50.54, M160 60.08 / 56.32,
-# M192 66.07 / 60.73, M224 72.25 / 65.69, M256 78.17 / 70.18.
-WIDE = {16: "65-80:8,81-512:16"}
+# M192 66.07 / 60.73, M224 72.25 / 65.69, M256 78.17 / 70.18. 513-768 rows (DL3 q4
+# B129-192; capacity up to ``experts_wide.WIDE_MAX``): width 16, 1 GPU, q4 routes of
+# independent real requests (all 92 layers x 2 draws), us per call: M576 115.0, M640
+# 123.9, M704 131.9, M768 138.6 (M512 106.4). Open-ended: rows above WIDE_MAX run
+# ``wide_chunks`` launches of at most WIDE_MAX rows (width 16 each).
+WIDE = {16: "65-80:8,81-:16"}
+
+
+# Wide rows' FC2 tail pool zone (``RubinGroupedExpertsKernel``'s pool = (zone, grain 6):
+# the jobs at the end of every FC2(B) range that go into the pool), by rows; other
+# wide rows keep (12, 6). Pool claims move whole FC2 jobs: bitwise (zone 48 vs 12, 28
+# real calls each at M256 / 512 / 768). Longer FC2 ranges leave larger late-CTA
+# excesses. 1 GPU, W16 front-planned, real q4 routes (92 layers x 2 draws), two
+# allocations per arm, us per call 12 -> 48: M192 66.2 -> 65.7, M256 73.9 / 73.8 ->
+# 73.4 / 73.2, M384 88.7 / 88.2 -> 87.4 / 87.0, M512 106.1 / 107.4 -> 105.0 / 104.9,
+# M640 123.8 -> 121.9, M768 138.6 / 138.6 -> 136.0 / 136.1 (36: equal to 48 at <= 512,
+# +0.8 at 768; M128: -0.1).
+WIDE_POOL = {16: "257-:48"}
 
 
 def wide_capacity(rows):
     return (rows + 63) // 64 * 64
+
+
+def wide_chunks(rows):
+    """The launches (first row, rows) a wide batch runs in: one up to WIDE_MAX rows,
+    above it as few as hold WIDE_MAX rows each, equal up to whole 64-row plan blocks
+    (each launch starts on a block of the plan routing wrote for the whole batch).
+    Every token's work (its plan rows, units of its experts, finalize FMA chain in
+    slot order) is the token's own: the launches give the one launch's rows bitwise.
+    NQ-TUNE: equal chunks vs WIDE_MAX + remainder at 832-2048 rows (1 GPU, real q4 /
+    q8 routes, us per call)."""
+    if rows <= WIDE_MAX:
+        return ((0, rows),)
+    count = -(-rows // WIDE_MAX)
+    size = (-(-rows // count) + 63) // 64 * 64  # <= WIDE_MAX (a multiple of 64)
+    return tuple((start, min(size, rows - start)) for start in range(0, rows, size))
 
 
 def wide_kernel(experts, grid, slots, rows, width, **kwargs):
@@ -234,6 +265,7 @@ def wide_bytes(slots, rows, tp=16):
     """The wide kernels' workspace bytes for up to ``rows`` (``scratch``): the largest
     over ``WIDE``'s widths."""
     widths = set(batch_table(WIDE.get(tp, "")).values()) | {8}
+    rows = min(rows, WIDE_MAX)  # (above: launches of at most WIDE_MAX rows)
     return max(wide_kernel(896, slots, slots, rows, w).workspace_bytes for w in widths)
 
 
@@ -250,7 +282,7 @@ def compile_wide_plan(batch, device):
 @functools.cache
 def compile_wide(
     experts, batch, grid, device, slots, dies=(), static=False, width=8,
-    publish="local", cap=0,
+    publish="local", cap=0, pool=(12, 6),
 ):  # fmt: skip
     """The wide engine (``wide_kernel``) at ``batch`` rows: the plan (64-row blocks),
     ids, the maps, scales, workspace, the routing weights, the SiTU scalars, the
@@ -259,7 +291,7 @@ def compile_wide(
     w13 / w2 addresses."""
     moe = wide_kernel(
         experts, grid, slots, batch, width, publish=publish, dies=dies,
-        static_groups=static,
+        static_groups=static, pool=pool,
     )  # fmt: skip
     flat = lambda n, dtype=c.Uint8, align=16: fake((n,), (1,), dtype, align)
     scales = (flat(experts * n) for n in (moe.w13_scale_bytes, moe.w2_scale_bytes))
@@ -409,23 +441,28 @@ def compile_plan(batch, device):
 
 def stage_homes(workspace, kernel):
     """The home die bit c of each 2 MiB chunk under the wide kernels' staged rows
-    (``dies.page_domains``), into the workspace word at ``kernel.ws_homes``: bit k for
-    the k-th chunk from the one holding the first staged byte, 0 for a chunk without a
-    clear answer. Only the die-local finalize's locality depends on them. Outside CUDA
-    graph captures (probe launches)."""
+    (``dies.page_domains``), into the two workspace words at ``kernel.ws_homes``: bit k
+    for the k-th chunk from the one holding the first staged byte (word k // 32), 0 for
+    a chunk without a clear answer. Only the die-local finalize's locality depends on
+    them. Outside CUDA graph captures (probe launches)."""
     from ..common import dies
 
     bits = 0
     if dies.domain_count(workspace.device.index) > 1:
-        stage = workspace[kernel.ws_stage : kernel.ws_stage + 16 * 512 * 7168]
+        span = 16 * WIDE_MAX * 7168  # the staged rows at the largest capacity
+        stage = workspace[kernel.ws_stage : kernel.ws_stage + span]
         homes = dies.page_domains(stage)  # probes the staged rows' bytes only
-        chunks = -(-(stage.data_ptr() % dies.CHUNK + 16 * 512 * 7168) // dies.CHUNK)
-        assert chunks <= 31
+        chunks = -(-(stage.data_ptr() % dies.CHUNK + span) // dies.CHUNK)
+        assert chunks <= 63
         chunks = min(chunks, homes.numel() * dies.PAGE // dies.CHUNK)
         for k in range(chunks):
             if int(homes[k * (dies.CHUNK // dies.PAGE)]) == 1:  # page 0: parity 0
                 bits |= 1 << k
-    workspace[kernel.ws_homes : kernel.ws_homes + 4].view(torch.int32).fill_(bits)
+    words = [
+        (bits >> s & 0xFFFFFFFF) - ((bits >> s & 0x80000000) << 1) for s in (0, 32)
+    ]
+    homes = workspace[kernel.ws_homes : kernel.ws_homes + 8].view(torch.int32)
+    homes.copy_(torch.tensor(words, dtype=torch.int32))
     return bits
 
 
@@ -497,6 +534,7 @@ class PersistentExperts:
         self.rows64 = batch_table(RUBIN64_VERIFY.get(self.tp, "") if q > 1 else "")
         self.zones = batch_table(POOL_ZONE.get(self.tp, "") if q > 1 else "")
         self.wide = batch_table(WIDE.get(self.tp, "") if q > 1 else "")
+        self.wide_pool = batch_table(WIDE_POOL.get(self.tp, "") if q > 1 else "")
         self.slots = workspace_slots(self.device)
         self.weights = (w13, s13, w2, s2)
         scalars = (beta * linear_beta, 1 / beta, 1 / linear_beta)
@@ -525,8 +563,11 @@ class PersistentExperts:
         self.views = (to_cute(self.maps[:256], 64), *scales)
         self.all_maps = to_cute(self.maps, 64)  # TP8 FC2 pairs: maps 0-5
         self.rubin: set[int] = set()  # batches on RubinExpertsKernel
-        self.addresses: dict[int, tuple] = {}  # their w13 / w2 descriptor sources
-        self.prepared = {}
+        self.addresses: dict = {}  # their w13 / w2 descriptor sources
+        self.prepared: dict = {}
+        # Wide batches above WIDE_MAX rows: their launches ((first row, rows), keyed
+        # (batch, first row) in ``prepared``) and the whole partial
+        self.chunks: dict[int, tuple] = {}  # batch -> (launches, partial[:batch])
         # Verify steps with fast-exchange ``RubinExpertsKernel`` batches
         # (``FAST_EXCHANGE``)
         self.fast_rubin = any(rubin(self.tp, b, self.device) for b in self.fast)
@@ -633,7 +674,9 @@ class PersistentExperts:
         [>= batch, 3584]; ``run`` returns it), the routing weights passed to ``run``;
         the plan (64-row blocks) as the routing kernel wrote it (``planned``) or
         written by ``run`` from x first. ``publish`` (): the pair rows into ``out`` is
-        not offered (16 x the bytes)."""
+        not offered (16 x the bytes). Above WIDE_MAX rows: the ``wide_chunks``
+        launches, each into its rows of the local partial (a "twoshot" push needs one
+        launch: ``tail_rows.EXPERTS_PUSH`` stops at WIDE_MAX)."""
         if not (self.wide.get(batch) and rubin64(self.tp, 64, self.device)):
             raise ValueError(f"B{batch}: the routed experts take at most 64 tokens")
         twoshot = len(publish) == 4 and publish[0] == "twoshot"
@@ -641,12 +684,42 @@ class PersistentExperts:
             raise ValueError(f"B{batch}: wide experts publish into a local box")
         partial = out if twoshot else publish[1]
         assert partial.shape[0] >= batch and partial.shape[1] == 3584
+        plan = buffers["plan"]
+        assert plan.numel() >= wide_capacity(batch) // 64 * PLAN_BYTES
+        chunks = wide_chunks(batch)
+        if len(chunks) == 1:
+            self.prepared[batch] = self.wide_work(
+                batch, batch, buffers, out, publish, planned, plan
+            )
+            return
+        if twoshot:
+            raise ValueError(f"B{batch}: wide experts push from one launch only")
+        for start, rows in chunks:
+            part = ("local", partial[start : start + rows])
+            blocks = plan[start // 64 * PLAN_BYTES :]
+            key = (batch, start)
+            self.prepared[key] = self.wide_work(
+                key, rows, buffers, part[1], part, planned, blocks
+            )
+        self.chunks[batch] = chunks, partial[:batch]
+        logger.info_once(
+            "Kimi K3 MoE wide experts: %d rows in %d launches of %s rows",
+            batch, len(chunks), "/".join(str(n) for _, n in chunks), scope="global",
+        )  # fmt: skip
+
+    def wide_work(self, key, batch, buffers, out, publish, planned, plan):
+        """One wide engine launch of ``batch`` rows (at most WIDE_MAX): its
+        ``prepared`` entry (and ``addresses`` under ``key``); ``plan``: the plan
+        bytes from its first row's 64-row block."""
+        twoshot = publish[0] == "twoshot"
+        partial = out if twoshot else publish[1]
         grid = self.grid_for(batch)
         static = bool(self.static.get(batch))
         mode, cap = ("twoshot", publish[1].shape[1]) if twoshot else ("local", 0)
+        pool = (self.wide_pool.get(batch, 12), 6)
         code = compile_wide(
             self.experts, batch, grid, self.device.index, self.slots, self.dies, static,
-            self.wide[batch], mode, cap,
+            self.wide[batch], mode, cap, pool,
         )  # fmt: skip
         check_residency(code, self.device.index, grid, 384, "Kimi K3 MoE experts")
         width, slots = (self.wide[batch], self.slots)
@@ -656,8 +729,6 @@ class PersistentExperts:
         )
         if self.dies and "homes" not in buffers:  # once per scratch (every capacity)
             buffers["homes"] = stage_homes(buffers["workspace"], kernel)
-        plan = buffers["plan"]
-        assert plan.numel() >= wide_capacity(batch) // 64 * PLAN_BYTES
         ws = tensor(buffers["workspace"])
         box: tuple = (c.Int64(partial.data_ptr()),)
         if twoshot:  # ("twoshot", receive slots, owners' bases, this rank's slot)
@@ -665,9 +736,9 @@ class PersistentExperts:
             box = (to_cute(recv), to_cute(peers, 16), c.Int32(rslot))
         writer = () if planned else (compile_wide_plan(batch, self.device.index),)
         work = (code, box, (tensor(plan), *writer), self.views[0], None)
-        self.prepared[batch] = (partial[:batch], tensor(out), ws, *work)
         weights = (self.weights[0], self.weights[2])
-        self.addresses[batch] = tuple(c.Int64(w.data_ptr()) for w in weights)
+        self.addresses[key] = tuple(c.Int64(w.data_ptr()) for w in weights)
+        return (partial[:batch], tensor(out), ws, *work)
 
     def grouped64(self, batch):
         """Rows on ``RubinGroupedExpertsKernel`` (``RUBIN64``, ``RUBIN64_VERIFY``)."""
@@ -677,7 +748,18 @@ class PersistentExperts:
 
     def run(self, x, ids, weights=None):
         batch = x.shape[0]
-        out, output, workspace, code, box, plan, maps, group = self.prepared[batch]
+        if batch not in self.chunks:
+            return self.launch(batch, x, ids, weights)
+        chunks, partial = self.chunks[batch]
+        for start, rows in chunks:  # (wide rows above WIDE_MAX: ``wide_chunks``)
+            end = start + rows
+            flat = weights[16 * start : 16 * end]  # (``WideExperts``: [M * 16])
+            self.launch((batch, start), x[start:end], ids[start:end], flat)
+        return partial
+
+    def launch(self, key, x, ids, weights=None):
+        batch = x.shape[0]
+        out, output, workspace, code, box, plan, maps, group = self.prepared[key]
         output = tensor(weights) if box else output
         source = to_cute(x, 16)
         if plan is not None:
@@ -687,7 +769,7 @@ class PersistentExperts:
         if group is not None and not group[2]:
             self.launch_group(ids, group)
         args = (source, tensor(ids), maps, *self.views[1:], workspace, output)
-        extra = self.addresses.get(batch, ())
+        extra = self.addresses.get(key, ())
         code(*args, c.Int32(batch), *self.scalars, *box, *extra, stream(self.device))
         return out
 

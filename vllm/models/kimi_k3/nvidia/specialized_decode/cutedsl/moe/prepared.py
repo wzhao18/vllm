@@ -13,6 +13,7 @@ from ...shapes import Choice, Path, rows_policy
 from ..common.policy import batch_table
 from ..oproj.prepared import OprojMailbox
 from .experts_runtime import scratch as expert_scratch
+from .experts_runtime import wide_chunks
 from .shared import scratch as shared_scratch
 from .tail_rows import TailRowsBox
 from .tail_runtime import CAP, experts_push, flat
@@ -34,7 +35,8 @@ class MoEScratch:
             self.front: tuple = (empty((cap, 896), f32), empty((cap, 2 * h), f32))
             self.front += (empty((cap, 16), i32), empty((cap, 16)), empty((cap, h)))
             self.front += (empty((cap, 7168)), self.latent)
-            self.expanded = empty((cap * 16, 3584))
+            # (the tuned experts' expanded rows only: wide rows publish a partial)
+            self.expanded = empty((min(cap, CAP) * 16, 3584))
             # Wide batches: the wide experts' workspace and ceil(cap / 64) plan blocks.
             rows = dict(rows=cap) if cap > CAP else {}
             self.experts = expert_scratch(tp, self.device, **rows)
@@ -257,7 +259,7 @@ class PreparedMoE:
         then the wide experts (planned) and the wide tail; the shared expert's partial
         and its RS push on the side stream (``beside``), forked after routing where
         the front kernel also leaves h (``merged_batch``: the down rows alone), else
-        before."""
+        before the front kernel, or after it / after routing (``fork``)."""
         state, b, front = self.state, x.shape[0], self.front_rows
 
         def shared_expert():
@@ -269,10 +271,17 @@ class PreparedMoE:
         merged = front.merged_batch(b)
         if early := front.early.get(b):
             return self.run_shared_early(x, out, consume, early)
-        if merged:
+        # Unmerged rows fork the whole shared expert before the front kernel, or later
+        # (``front_rows.SHARED_FORK_ROWS``: 1 after the front kernel, 2 after routing).
+        fork = front.fork.get(b, 0)
+        if merged or fork == 2:
             ids, weights, latent = front.route(x)
+        elif fork == 1:
+            front.front(x)
         with self.beside(shared_expert) as join:
-            if not merged:
+            if fork == 1:
+                ids, weights, latent = front.route_only(x)
+            elif not merged and not fork:
                 ids, weights, latent = front.route(x)
             partial = self.wide_experts.run(latent, weights, ids)
             self.rows.run(partial, b, join)
@@ -413,8 +422,12 @@ def deferred_rows(module, batches):
 # layer runs the wide tail (``tail_rows``: two-shot latent, RS shared rows, RMS +
 # up-projection, output ring at the largest graph) behind the stock router,
 # latent-down, shared and routed experts, instead of the whole stock layer (seam S4).
-# Keyed per TP on token rows (``shapes.rows_policy``: every q).
-WIDE_TAIL = {16: "65-512:1"}
+# Keyed per TP on token rows (``shapes.rows_policy``: every q). Open-ended: the tail's
+# kernels hold fixed grids (LatentRows 112 CTAs over its row items) or poll only
+# earlier kernels' rows (NormRows, OutRows), its boxes are the largest graph's, and the
+# wide experts run in launches of at most ``experts_wide.WIDE_MAX`` rows above it
+# (``experts_runtime.PersistentExperts.prepare_wide``). 65-768 measured (hb192).
+WIDE_TAIL = {16: "65-:1"}
 # Wide batches' routed experts: v8moe's wide engines (``experts_runtime.WideExperts``)
 # on the stock router's routes, instead of the stock layer's kernel.
 WIDE_EXPERTS = True
@@ -444,6 +457,9 @@ def choose(shape, ctx):
     # WIDE_FRONT, else the stock router + latent-down and shared expert).
     front = "FrontRows front" if WIDE_EXPERTS and WIDE_FRONT else "stock front"
     experts = "wide experts" if WIDE_EXPERTS else "stock experts"
+    launches = len(wide_chunks(shape.rows))  # (above experts_wide.WIDE_MAX rows)
+    if WIDE_EXPERTS and launches > 1:
+        experts = f"wide experts x{launches} launches"
     return Choice(
         Path.GENERIC, ("rows", "stock-front"), f"{front}, {experts}, wide tail"
     )

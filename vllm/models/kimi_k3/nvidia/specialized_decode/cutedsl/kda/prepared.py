@@ -110,21 +110,50 @@ VERIFY_WIDE: dict[tuple[int, int], str] = {(10, 7): "16-32:1,33-48:2,49-64:1"}
 # 33-34 requests on KdaVerifyWide instead of VERIFY_WIDE's Halves (graph us per layer,
 # cuBLAS in-projection: 30.00 -> 28.90, 30.13 -> 29.03); Halves stays at 36-48 (Wide
 # +0.1..+0.5) and Wide at 50-64 (Halves +0.1..+2.0).
-# 36-256 requests on KdaVerifyStream3 (4: the chunked verify with tensor-core row dots;
+# 65-256 requests on KdaVerifyStream3 (4: the chunked verify with tensor-core row dots;
 # not bitwise: u_t / o_t from dots against the step's base state, FP64-band checked)
 # instead of Wide / Halves / the default-geometry KdaSplit (no row above 64). 1-GPU
 # verify alone, 69 layers, own cold BF16 slots, us per layer, Wide / Halves / Stream3:
 # B33 6.27 / 7.08 / 6.70 (Wide: one wave of 198 CTAs), B36 10.92 / 11.21 / 8.94, B48
 # 11.66 / 12.38 / 9.27, B64 12.28 / 13.88 / 10.29, B96 18.65 / - / 16.26, B128 25.03 /
 # - / 19.44, B192 37.22 / - / 28.51, B256 49.13 / - / 37.25 (KdaSplit default at B96 /
-# 128 / 192: 36.38 / 47.60 / 69.85).
+# 128 / 192: 36.38 / 47.60 / 69.85). 35-64 requests stay on VERIFY_WIDE's Halves /
+# Wide, as the cap-128 serving overlay (ov-cap128-bca26213) runs them (its numbers are
+# not recorded in the tree).
+# NQ-TUNE (BF16 state only; the FP32 state never runs Stream3): by the verify-alone
+# numbers above, the overlay's 35-64 rows cost a BF16 state +2.27 / +3.11 / +1.99 us
+# per KDA layer at B36 / B48 / B64 (Halves 11.21, Halves 12.38, Wide 12.28 vs Stream3
+# 8.94 / 9.27 / 10.29). Kept because the overlay is what serving measured; measure
+# Stream3 vs Halves / Wide at B35-64 in the BF16 serving chain (AttnRes, in-projection,
+# verify, o-projection) and restore "36-256:4" if Stream3 wins there too.
+# Stream3 (and Stream) need a BF16 state (``BF16_ONLY``): with an FP32 state these
+# rows run ``FP32_WIDE`` instead.
 DEVICE_SPEC_SCHEDULE_Q: dict = {(10, 7): {4: {6: "6:1.8.2.8,14:1.8.2.4"}}}
 VERIFY_Q: dict = {
     "rows": {},
     "cols": {},
-    "wide": {(10, 7): {4: "12:1,33-35:1,36-256:4"}},
+    "wide": {(10, 7): {4: "12:1,33-34:1,65-256:4"}},
     "load_norm": {},
 }
+# Plain verify kernels by VERIFY_WIDE / VERIFY_Q "wide" value (0: KdaSplit).
+WIDE_KINDS = (KdaVerifyWide, KdaVerifyHalves, KdaVerifyStream, KdaVerifyStream3)
+WIDE_NAMES = ("kdasplit", "wide", "halves", "stream", "stream3")
+# Values whose kernel holds the base state as BF16 (KdaVerifyStream / Stream3: S0
+# staged as BF16 pairs and, in Stream3, fed exactly to BF16 tensor-core MMAs; their
+# constructor asserts a BF16 state). An FP32 state (--mamba-ssm-cache-dtype float32)
+# runs FP32_WIDE at those rows instead: KdaVerifyWide, bitwise KdaSplit's verify, which
+# reads and stores the state through ``load_state`` / ``store_state`` (FP32 rows) and
+# scales with the requests (grid (1, heads, B)); with a BF16 state it led Halves and
+# the default-geometry KdaSplit at every measured row above 48 (numbers above: B64
+# 12.28 / 13.88, B96 18.65 vs KdaSplit 36.38). An FP32 chunked verify (S0 staged as
+# FP32, three-term BF16 splits of S0 into the row-dot MMAs) is not written.
+# NQ-TUNE: FP32 state, 1-GPU verify alone and the serving chain: q4 Wide vs Halves vs
+# KdaSplit (1.8.3.4) at B36-64 and Wide vs KdaSplit at B65-512 (rows 260-2048); q8
+# Wide vs KdaSplit (1.8.3.4) at B65-128 (open-ended Wide, BF16 state too); and every
+# table above swept with a BF16 state (SPEC_SCHEDULE / DEVICE_SPEC_SCHEDULE(_Q), the
+# VERIFY_WIDE crossovers at B16-64, VERIFY_ROWS / COLS at B8): the state bytes per
+# verify double, so the crossovers may move; the stock S1 crossover (STOCK_ROWS) too.
+BF16_ONLY, FP32_WIDE = (3, 4), 1
 _VERIFY = {
     "rows": VERIFY_ROWS, "cols": VERIFY_COLS, "wide": VERIFY_WIDE,
     "load_norm": VERIFY_LOAD_NORM,
@@ -139,13 +168,34 @@ def verify_table(name, capability, tokens):
     return batch_table(",".join(filter(None, (base, extra))))
 
 
-@cache
-def executable(specs, heads, gate_mode, has_bias, device, tokens=1, prepared=False):
-    args = tuple(fake(shape, stride, dtype) for shape, stride, dtype in specs)
-    batch = specs[0][0][0]
+def wide_kind(requests, tokens, capability, bf16_state=False, gate_mode=0, heads=6):
+    """The plain (not prepared) verify kernel at ``requests`` x ``tokens``: 0 KdaSplit,
+    else the VERIFY_WIDE / VERIFY_Q "wide" value (``WIDE_KINDS[value - 1]``).
+
+    Open-ended: requests above the table's last row take that row's kernel (each
+    wide kernel's grid is (CTAs per head, heads, B): no request cap), so any captured
+    batch runs the kernel that scales instead of the default-geometry KdaSplit (~1.9x
+    Wide's time at q4 B96-192, see above). ``BF16_ONLY`` values need a BF16 state and
+    q <= 4; otherwise ``FP32_WIDE`` runs. The wide kernels run gate mode 0 without
+    fast math (their asserts): other layers (TP8: gate mode 1, 12 heads) keep
+    KdaSplit."""
+    if tokens == 1 or gate_mode != 0 or heads == 12:
+        return 0
+    table = verify_table("wide", capability, tokens)
+    kind = table.get(requests)
+    if kind is None and table and requests > max(table):
+        kind = table[max(table)]
+    if kind in BF16_ONLY and (not bf16_state or tokens > 4):
+        kind = FP32_WIDE
+    return kind or 0
+
+
+def schedule_of(heads, requests, gate_mode, tokens, capability, bf16_state, rows=True):
+    """KdaSplit's schedule at ``requests`` x ``tokens`` (SCHEDULE / SPEC_SCHEDULE and
+    the device tables on top); ``rows``: the state's rows are whole and contiguous
+    (staging copies them)."""
     table = SCHEDULE if tokens == 1 else SPEC_SCHEDULE
-    spec, bf16_state = table.get(heads, ""), specs[9][2] == torch.bfloat16
-    capability = torch.cuda.get_device_capability(device)
+    spec = table.get(heads, "")
     if tokens == 1:
         tables = (DEVICE_SCHEDULE, BF16_DEVICE_SCHEDULE)[: 1 + bf16_state]
         overrides = (t.get(capability, {}).get(heads, "") for t in tables)
@@ -155,31 +205,23 @@ def executable(specs, heads, gate_mode, has_bias, device, tokens=1, prepared=Fal
         by_q = DEVICE_SPEC_SCHEDULE_Q.get(capability, {}).get(tokens, {})
         spec = ",".join(filter(None, (spec, override, by_q.get(heads, ""))))
     schedule = batch_table(spec)
-    schedule = schedule.get(batch // tokens, (0, 0, 0)) if gate_mode != 2 else (0,) * 3
-    if schedule[0] >= 2 and specs[9][1][-2:] != (128, 1):  # staging needs whole rows
+    schedule = schedule.get(requests, (0, 0, 0)) if gate_mode != 2 else (0,) * 3
+    if schedule[0] >= 2 and not rows:  # staging needs whole rows
         schedule = (1, *schedule[1:4])  # no evict hint without staging
-    requests = batch // tokens
+    return schedule
+
+
+@cache
+def executable(specs, heads, gate_mode, has_bias, device, tokens=1, prepared=False):
+    args = tuple(fake(shape, stride, dtype) for shape, stride, dtype in specs)
+    requests, bf16_state = specs[0][0][0] // tokens, specs[9][2] == torch.bfloat16
+    capability = torch.cuda.get_device_capability(device)
+    rows = specs[9][1][-2:] == (128, 1)
+    schedule = schedule_of(
+        heads, requests, gate_mode, tokens, capability, bf16_state, rows
+    )
     options = (heads, requests, gate_mode, has_bias, schedule, tokens, bf16_state)
-    kernel: KdaSplit
-    rows = verify_table("rows", capability, tokens).get(requests, 1)
-    rows = rows if isinstance(rows, tuple) else (rows,)
-    cols = verify_table("cols", capability, tokens).get(requests)
-    wide = verify_table("wide", capability, tokens).get(requests)
-    if prepared and cols is not None:  # the transposed recurrence
-        kernel = KdaVerifyCols(*options, cols)
-    elif (
-        prepared and rows[0] > 1
-    ):  # several state rows per thread, operands loaded once
-        kernel = KdaVerifyRows(*options, *rows)
-    elif prepared:  # the gates and betas arrive activated (the in-projection epilogue)
-        kernel = KdaVerifyPrepared(*options)
-    elif tokens > 1 and wide is not None:  # one or two CTAs per (request, head)
-        kinds = (KdaVerifyWide, KdaVerifyHalves, KdaVerifyStream, KdaVerifyStream3)
-        kernel = kinds[wide - 1](*options)
-    else:
-        lean = tokens > 1 and capability in LEAN_VERIFY
-        norm = verify_table("load_norm", capability, tokens).get(requests)
-        kernel = KdaSplit(*options, lean, bool(norm))
+    kernel = make_kernel(options, capability, prepared)
     scalars = (cutlass.Float32(v) for v in (-5, 128**-0.5, 1e-6))
     with torch.accelerator.device_index(device):
         compiled = cute.compile(
@@ -189,6 +231,28 @@ def executable(specs, heads, gate_mode, has_bias, device, tokens=1, prepared=Fal
     if carveout is not None:
         compiled = prepare_shared_carveout(compiled, device, carveout)
     return compiled
+
+
+def make_kernel(options, capability, prepared=False) -> KdaSplit:
+    """The kernel object ``executable`` compiles for ``options`` = (heads, requests,
+    gate_mode, has_bias, schedule, tokens, bf16_state) (no GPU work: the constructors'
+    shape / dtype asserts run here)."""
+    heads, requests, gate_mode, _, _, tokens, bf16_state = options
+    rows = verify_table("rows", capability, tokens).get(requests, 1)
+    rows = rows if isinstance(rows, tuple) else (rows,)
+    cols = verify_table("cols", capability, tokens).get(requests)
+    wide = wide_kind(requests, tokens, capability, bf16_state, gate_mode, heads)
+    if prepared and cols is not None:  # the transposed recurrence
+        return KdaVerifyCols(*options, cols)
+    if prepared and rows[0] > 1:  # several state rows per thread, operands loaded once
+        return KdaVerifyRows(*options, *rows)
+    if prepared:  # the gates and betas arrive activated (the in-projection epilogue)
+        return KdaVerifyPrepared(*options)
+    if wide:  # one or two CTAs per (request, head), or the chunked verify
+        return WIDE_KINDS[wide - 1](*options)
+    lean = tokens > 1 and capability in LEAN_VERIFY
+    norm = verify_table("load_norm", capability, tokens).get(requests)
+    return KdaSplit(*options, lean, bool(norm))
 
 
 def decode_conv_weight(weight):
@@ -282,20 +346,26 @@ class PreparedKda:
 STOCK_ROWS: dict = {"*": ""}
 
 
-def verify_kernel(requests, tokens, capability):
+def verify_kernel(requests, tokens, capability, bf16_state=False, gate_mode=0):
     """The plain (not prepared) verify kernel ``executable`` builds for ``requests`` x
-    ``tokens`` (coverage notes): "wide", "halves" (VERIFY_WIDE) or "kdasplit"."""
-    wide = verify_table("wide", capability, tokens).get(requests)
-    kinds = ("kdasplit", "wide", "halves", "stream", "stream3")
-    return kinds[wide if tokens > 1 and wide else 0]
+    ``tokens`` (coverage notes): "wide", "halves", "stream3" (``wide_kind``: by the
+    state dtype) or "kdasplit". ``gate_mode`` as the KDA policies (TP8 verify: 1)."""
+    heads = 12 if gate_mode else 6
+    return WIDE_NAMES[
+        wide_kind(requests, tokens, capability, bf16_state, gate_mode, heads)
+    ]
 
 
 def choose(shape, ctx):
     """The KDA core of a wide decode shape (the runtime's family hook): KdaSplit (or
-    VERIFY_WIDE's KdaVerifyWide / Halves) at any requests and q (GENERIC), or the
-    stock KDA core (STOCK, seam S1)."""
+    the wide verify kernels, ``wide_kind``, by the deployment's state dtype) at any
+    requests and q (GENERIC), or the stock KDA core (STOCK, seam S1)."""
     if rows_policy(STOCK_ROWS, shape, default=0):
         return Choice(Path.STOCK, note="S1")
     capability = (10, 7) if ctx.arch == "rubin" else None
-    kernel = verify_kernel(shape.requests, shape.q, capability)
-    return Choice(Path.GENERIC, note=f"{kernel} {shape.requests}x{shape.q}")
+    gate_mode = int(ctx.tp == 8)  # the verify policies' gate mode (providers)
+    kernel = verify_kernel(
+        shape.requests, shape.q, capability, ctx.bf16_state, gate_mode
+    )
+    state = "bf16" if ctx.bf16_state else "fp32"
+    return Choice(Path.GENERIC, note=f"{kernel} {shape.requests}x{shape.q} {state}")

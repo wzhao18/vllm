@@ -42,6 +42,8 @@ from cutlass.cute import experimental as cute_ext
 from cutlass.cute.arch import store_async_dsmem
 from cutlass.cute.nvgpu import tcgen05
 
+from vllm.logger import init_logger
+
 from ..attn_res.kernel import BESIDE_SMEM
 from ..common.host import architecture, layout, stream, to_cute
 from ..common.policy import batch_table
@@ -75,6 +77,8 @@ from ..gemm.splitk import (
     _wait_cluster,
 )
 from .kernel import KdaSplit, load_activation_bf16x4, load_bf16x4
+
+logger = init_logger(__name__)
 
 CLUSTER = 16  # 8 M tiles x split-K 2 = 8 tokens x 2 value partitions
 # KdaHeadWide: warps issuing x's K tiles after the PDL wait (warp 1 and the four main
@@ -1370,6 +1374,175 @@ def polled_out_batches(tp, device):
     return tuple(b for b, on in table.items() if on)
 
 
+# Recurrent-state dtypes the KdaHead kernels read and write: through their KdaSplit's
+# ``load_state`` / ``store_state`` (BF16 rows rounded once at the store, as the stock
+# decode rounds a BF16 state, or FP32 rows stored as computed). The state stays in
+# registers (no staged copy: schedules (1, 16, 0, 2) and (1, 8, 0, 8) do not stage), so
+# the dtype changes neither the shared memory the kernels size (``BESIDE_SMEM``) nor
+# the registers per thread; an FP32 state doubles only each KDA CTA's early state
+# loads and checkpoint stores.
+STATE_DTYPES = (torch.bfloat16, torch.float32)
+
+
+def head_supported(
+    heads, state_dtype, has_bias, hidden, batch, q=1, tile=HEAD_TILE, *, core=None,
+    fa_width=0, cache_tokens=1, tp=16,
+):  # fmt: skip
+    """Whether a KdaHead kernel serves ``batch`` token rows at verify length ``q``
+    (q = 1: ``KdaHead`` / ``KdaHeadWide``; batch == q: ``KdaHeadVerify``; else
+    ``KdaHeadMulti``) with this state dtype; a shape without one keeps the
+    in-projection -> KdaSplit pair. Decided before the layer sets anything up for
+    the head.
+
+    Its constructor's shape and shared-memory asserts (beside an AttnRes CTA) must
+    pass (``head_constructs``, no GPU work). A state dtype other than BF16 (the
+    measured serving dtype) must also compile on this device when CUDA is there
+    and ``core`` (the layer's ``PreparedKda``) is given: ``head_compiles`` compiles
+    the kernels ``PreparedKdaHead.prepare_caches`` builds for the shape (the polled
+    variant too where ``POLLED_OUT`` puts one) on meta caches of the deployment's
+    layout (``cache_tokens``: its verify length, the conv window's q + 2 taps;
+    ``fa_width``: the F_A / beta rows of the packed projection), so a failed
+    compile falls back here instead of stopping startup after the carve-out and
+    the MoE tail's early release were set up for the head."""
+    if not head_constructs(heads, state_dtype, has_bias, hidden, batch, q, tile):
+        return False
+    if core is None or state_dtype == torch.bfloat16 or not torch.cuda.is_available():
+        return True
+    device = core.device
+    polled = tile is not None and batch in polled_out_batches(tp, device)
+    specs = probe_specs(core, state_dtype, fa_width, batch, q, cache_tokens)
+    return head_compiles(
+        heads, state_dtype, has_bias, hidden, batch, q, tile, specs,
+        architecture(device), device.index, polled,
+    )  # fmt: skip
+
+
+@cache
+def head_constructs(heads, state_dtype, has_bias, hidden, batch, q=1, tile=HEAD_TILE):
+    """``head_supported``'s constructor check: the kernel object builds (its shape /
+    dtype / shared-memory asserts pass). Runs no GPU code. (The asserts are its
+    checks: under ``python -O`` only ``head_compiles`` still checks a non-BF16
+    state.)"""
+    if state_dtype not in STATE_DTYPES:
+        return False
+    options = dict(bf16_state=state_dtype == torch.bfloat16, has_bias=has_bias)
+    try:
+        if q == 1 and tile is None:
+            KdaHead(heads, stages=HEAD_STAGES, **options)
+        elif q == 1:
+            stages, cta_k, tmem_tiles, early = (*tile, None)[:4]
+            KdaHeadWide(
+                heads, stages=stages, cta_k=cta_k, tmem_tiles=tmem_tiles,
+                early_loads=early, hidden=hidden, **options,
+            )  # fmt: skip
+        elif tile is None:  # the verify heads are KdaHeadWide's
+            return False
+        elif batch == q:
+            from .head_verify import (
+                VERIFY_EARLY_LOADS,
+                VERIFY_STAGES,
+                VERIFY_TMEM_TILES,
+                KdaHeadVerify,
+            )
+
+            KdaHeadVerify(
+                heads, tokens=q, stages=VERIFY_STAGES, cta_k=tile[1],
+                tmem_tiles=VERIFY_TMEM_TILES, early_loads=VERIFY_EARLY_LOADS,
+                hidden=hidden, **options,
+            )  # fmt: skip
+        else:
+            from .head_multi import MULTI_TILE, KdaHeadMulti
+
+            if batch % q or (batch // q, q) not in MULTI_TILE:
+                return False
+            stages, tmem_tiles, early = MULTI_TILE[batch // q, q]
+            KdaHeadMulti(
+                heads, requests=batch // q, tokens=q, stages=stages,
+                tmem_tiles=tmem_tiles, early_loads=early, hidden=hidden, **options,
+            )  # fmt: skip
+    except (AssertionError, ValueError):
+        return False
+    return True
+
+
+def head_tensors(core, fa, caches, slots, out):
+    """A KdaHead kernel's tensor arguments in launch order (``fa``: the F_A / beta
+    rows of the batch); ``PreparedKdaHead._tensors`` and the compile probe."""
+    conv, state = caches[:2]
+    conv = conv if core.conv_dim_first else conv.transpose(-1, -2)
+    w, bias, fb, a_log, dt, norm = core.weights
+    return (w, bias, conv, fa, a_log, dt, slots, state, out, norm, fb)
+
+
+def probe_specs(core, state_dtype, fa_width, batch, q=1, cache_tokens=1, slots=16):
+    """The ``layout`` specs ``PreparedKdaHead.prepare_caches`` compiles ``batch`` x
+    ``q`` with, on meta caches of ``slots`` slots: the BF16 conv state ([slot, 3 dim,
+    cache_tokens + 2] in the DS layout, else its transpose) and the recurrent state
+    [slot, heads, 128, 128] of ``state_dtype``."""
+    meta, taps = dict(device="meta"), cache_tokens + 2
+    conv_shape = (slots, 3 * core.dim, taps)
+    if not core.conv_dim_first:
+        conv_shape = (slots, taps, 3 * core.dim)
+    conv = torch.empty(conv_shape, dtype=torch.bfloat16, **meta)
+    state = torch.empty((slots, core.heads, 128, 128), dtype=state_dtype, **meta)
+    fa = torch.empty((batch, fa_width), dtype=torch.bfloat16, **meta)
+    out = torch.empty((batch, core.dim), dtype=torch.bfloat16, **meta)
+    shape = (batch,) if q == 1 else (batch // q, q)
+    index = torch.empty(shape, dtype=torch.int32, **meta)
+    tensors = head_tensors(core, fa, (conv, state), index, out)
+    if q > 1:
+        tensors += (torch.empty((batch // q,), dtype=torch.int32, **meta),)
+    return tuple(map(layout, tensors))
+
+
+@cache
+def head_compiles(
+    heads, state_dtype, has_bias, hidden, batch, q, tile, specs, arch, device, polled,
+):  # fmt: skip
+    """``head_supported``'s compile check: the KdaHead kernel(s) of the shape compile
+    for ``arch`` (``compile_head`` / ``compile_head_verify`` / ``compile_head_multi``,
+    whose caches keep the code). A failure is logged and keeps the pair."""
+    bf16_state = state_dtype == torch.bfloat16
+    variants = (False, True) if polled else (False,)
+    try:
+        with torch.accelerator.device_index(device):
+            for polled_out in variants:
+                if q == 1:
+                    compile_head(
+                        heads, HEAD_STAGES, bf16_state, has_bias, specs, arch, tile,
+                        hidden, polled_out,
+                    )  # fmt: skip
+                elif batch == q:
+                    from .head_verify import compile_head_verify
+
+                    compile_head_verify(
+                        heads, bf16_state, has_bias, specs, arch, tile, hidden,
+                        polled_out,
+                    )  # fmt: skip
+                else:
+                    from .head_multi import compile_head_multi
+
+                    compile_head_multi(
+                        heads, bf16_state, has_bias, specs, arch, batch // q, hidden,
+                        polled_out, tokens=q,
+                    )  # fmt: skip
+    except Exception as error:  # noqa: BLE001 - any compile failure keeps the pair
+        logger.warning(
+            "Kimi K3 KdaHead (%d rows x q%d, %s recurrent state%s) did not compile "
+            "for %s (%s: %s): those KDA rows run the in-projection -> KdaSplit pair",
+            batch, q, str(state_dtype).removeprefix("torch."),
+            ", polled output" if polled else "", arch, type(error).__name__, error,
+        )  # fmt: skip
+        return False
+    logger.info(
+        "Kimi K3 KdaHead (%d rows x q%d, %s recurrent state%s) compiled for %s: those "
+        "KDA rows run the head (its speed with this state dtype is untuned)",
+        batch, q, str(state_dtype).removeprefix("torch."),
+        ", polled output too" if polled else "", arch,
+    )  # fmt: skip
+    return True
+
+
 class KdaSide:
     """The step's side stream for F_A / beta: forked per layer after the attention
     input is launched, joined once at the end of the step (as the L2 prefetch)."""
@@ -1427,11 +1600,8 @@ class PreparedKdaHead:
         return (q == 1 and batch in self.batches) or (batch, q) in self.verify
 
     def _tensors(self, caches, slots, out):
-        conv, state = caches[:2]
-        conv = conv if self.core.conv_dim_first else conv.transpose(-1, -2)
-        w, bias, fb, a_log, dt, norm = self.core.weights
         fa = self.fa_out[: out.shape[0]]
-        return (w, bias, conv, fa, a_log, dt, slots, state, out, norm, fb)
+        return head_tensors(self.core, fa, caches, slots, out)
 
     def prepare_caches(self, caches):
         arch = architecture(self.device)

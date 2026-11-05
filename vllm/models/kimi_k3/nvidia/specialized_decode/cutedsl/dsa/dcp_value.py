@@ -61,16 +61,22 @@ PROJECTED = "proj"
 PROJ_ROWS = 32
 # Both formats are exact up to BF16 rounding (no lossy 8-bit partials).
 FORMATS = ("bf16", PROJECTED)
-# The default exchange per layer kind, from where "proj" wins on the
-# DCP8 GB300 attention layer (q5, slowest rank): K3.1 DSA from 160 rows (-6 to -7 us
-# at 160, -17 to -19 at 320; it ties BF16 at 5-80 rows, where its serial per-head
-# projection costs what the 4x fewer NVLink bytes save); MLA from 40 rows (-1 at
-# 40, -2 to -3 at 60-80, -9 at 160, -17 to -23 at 320; +1 to +3.5 at 5-20 rows).
-# MLA starts at 65 rows for now: the step serves at most 64 rows today, so K3's
-# served numerics stay those of the BF16 exchange until a gsm8k run gates "proj"
-# (then lower it to 40). The DcpBox allocates the "proj" mailbox and the layers
-# gather W_UV only when a batch up to its cap uses "proj".
-PARTIALS_DEFAULT = {"mla": "1-64:bf16,65-320:proj", "dsa": "1-159:bf16,160-320:proj"}
+# The default exchange per layer kind. K3.1 DSA: the one automatic policy
+# (``DSA_PARTIALS``, also r1.AUTO_PARTIALS on FlashInfer sparse): "bf16" at 1-16 rows
+# (the DSA sparse core pushes BF16 partials there; "proj" ties BF16 at few rows) and
+# "proj" from 17 rows on, open-ended. "proj" numerics are what production already
+# served: the serving configs set VLLM_K31_DSA_PARTIALS "proj" (C48-C256) and
+# "1-16:bf16,17-512:proj" (C1 / C8). DCP8 GB300 attention layer (q5, slowest rank)
+# measured "proj" from 160 rows (-6 to -7 us at 160, -17 to -19 at 320, a tie with
+# BF16 at 5-80 rows, where its serial per-head projection costs what the 4x fewer
+# NVLink bytes save). MLA ("proj" from 40 rows: -1 at 40, -2 to -3 at 60-80, -9 at
+# 160, -17 to -23 at 320; +1 to +3.5 at 5-20 rows) starts at 65 rows for now: the
+# step serves at most 64 rows today, so K3's served numerics stay those of the BF16
+# exchange until a gsm8k run gates "proj" (then lower it to 40). The DcpBox allocates
+# the "proj" mailbox and the layers gather W_UV only when a batch up to its cap uses
+# "proj".
+DSA_PARTIALS = "1-16:bf16,17-:proj"
+PARTIALS_DEFAULT = {"mla": "1-64:bf16,65-320:proj", "dsa": DSA_PARTIALS}
 
 
 def resolve_partials(spec, kind):

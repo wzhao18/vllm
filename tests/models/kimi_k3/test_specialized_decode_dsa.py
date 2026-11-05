@@ -3080,8 +3080,8 @@ def test_prepared_dsa_dcp_sparse_core(dcp8_group, batch, variant, overlap):
     [(8, "1-16:bf16,17-64:proj"), (16, "1-16:bf16,17-64:proj"), (8, "proj")],
 )
 def test_prepared_dsa_dcp_sparse_core_partials(dcp8_group, batch, partials):
-    """The DSA sparse core (VLLM_K31_DSA_CORE, 2x16s2 at q8) under
-    VLLM_K31_DSA_PARTIALS: on the "bf16" rows of a mixed table (a DL7 render's
+    """The DSA sparse core (VLLM_K31_DSA_CORE, 2x16s2 at q8) under a partials
+    policy (r1.DsaBox's argument): on the "bf16" rows of a mixed table (a DL7 render's
     "1-16:bf16,17-64:proj") it still serves M8 / M16; on "proj" rows it stands
     aside (it pushes BF16 latent rows only) for FlashInfer's decode, the W_UV bmm
     and DcpValue("proj"). Either way the step is the stock one's
@@ -3203,7 +3203,7 @@ def test_prepared_dsa_dcp_sparse_core_exchange(
 @pytest.mark.parametrize("batch", [8, 64])
 @pytest.mark.parametrize("core", ["fi-trtllm", "fi-nvfp4"])
 def test_prepared_dsa_dcp_exchange_proj(dcp8_group, monkeypatch, core, batch):
-    """PreparedDsa's "proj" rows (VLLM_K31_DSA_PARTIALS=proj) fed by DcpExchange's
+    """PreparedDsa's "proj" rows (partials "proj") fed by DcpExchange's
     top-k (VLLM_K31_DCP_EXCHANGE, PARTS=topk, as served) at q8, DL7's C1 and C8
     rows (at most K31_DCPX_PDL rows the top-k launches with PDL): FlashInfer
     decodes the exchange's rows, the W_UV bmm projects them and DcpValue("proj")
@@ -3246,7 +3246,7 @@ WIDE_EXCHANGE_BOX = {8: 256, 4: 512}
 WIDE_DSA_BOX: dict = {}  # the DSA DcpBox: one per process, as one per model
 
 
-def run_wide_exchange_step(batch, q, world, replays, core="fi-trtllm"):
+def run_wide_exchange_step(batch, q, world, replays, core="fi-trtllm", partials="bf16"):
     """One decode step of a real DSA layer at ``batch`` rows (``q`` per request, the
     layer tests' contexts: rows of two requests in five select every key) under DCP
     (``world`` ranks, interleave 1) through the stock forward (the #63 or the
@@ -3258,7 +3258,9 @@ def run_wide_exchange_step(batch, q, world, replays, core="fi-trtllm"):
     WideDsa's step (the other parity) whose sparse decode takes those ids through
     the stock DCP filter (FlashInfer over the same keys); the two layers in a CUDA
     graph, the exchange's slots and counts poisoned before each, replay
-    ``replays`` times. ``core``: the cache and FlashInfer kernel (LAYER_CORES)."""
+    ``replays`` times. ``core``: the cache and FlashInfer kernel (LAYER_CORES);
+    ``partials``: both WideDsa layers' DcpValue partials (r1.dsa_partials; the
+    automatic policy would exchange "proj" at every wide row)."""
     from vllm import _custom_ops as ops
     from vllm import ir
     from vllm.config import set_current_vllm_config
@@ -3412,6 +3414,7 @@ def run_wide_exchange_step(batch, q, world, replays, core="fi-trtllm"):
         # As providers.Attention: the case's rows and the DL's widest.
         pitches = dict.fromkeys(sorted({batch, cap}), packed.shape[0])
         policy = dict(queries=(q,), dcp=WIDE_DSA_BOX["box"], core="auto")
+        policy.update(partials=partials)
         layers = [
             WideDsa(attn, pitches, scratch_rows, **policy, parity=p) for p in (0, 1)
         ]
@@ -3521,19 +3524,19 @@ def run_wide_exchange_step(batch, q, world, replays, core="fi-trtllm"):
 @pytest.mark.parametrize("core", ["fi-trtllm", "fi-nvfp4"])
 def test_wide_dsa_dcp_exchange(dcp8_group, monkeypatch, core, batch, q):
     """WideDsa above 96 rows fed by DcpExchange's top-k (VLLM_K31_DCP_EXCHANGE,
-    PARTS=topk) at DCP16: C64's combination (q8, VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS 256)
+    PARTS=topk) at DCP16, with BF16 latent partials: C64's combination (q8, 256 rows)
     and DL3's (q4 at 128, 256 and 512 rows; run on the cap-128 tree). The indexer op
     gives the step to the exchange, whose slots and counts WideDsa's sparse decode reads
     (``dcp_local_topk_counts``). The exchanged top-k, as global ids, holds min(K,
-    length) keys a row over the ranks (balanced keys: no rank's count twice
-    another's), is exact, and is the stock one up to near-ties (every row that
-    selects every key); this rank's slots are those of its ids. The rows entering
-    o_proj are, on every row, those of FlashInfer over the same keys through the
-    stock DCP filter (a second WideDsa) and, where the top-k is the same, the stock
-    forward's (check_layer_step); in a CUDA graph of two layers on alternating
-    parities, the exchange's slots and counts poisoned before each, 200 replays
-    give the eager rows bit for bit. ``core`` "fi-nvfp4": an nvfp4_ds_mla cache
-    (WideDsa's MlaQuery inserts its rows; FlashInfer prims_ts everywhere)."""
+    length) keys a row over the ranks (balanced keys: no rank's count twice another's),
+    is exact, and is the stock one up to near-ties (every row that selects every key);
+    this rank's slots are those of its ids. The rows entering o_proj are, on every row,
+    those of FlashInfer over the same keys through the stock DCP filter (a second
+    WideDsa) and, where the top-k is the same, the stock forward's (check_layer_step);
+    in a CUDA graph of two layers on alternating parities, the exchange's slots and
+    counts poisoned before each, 200 replays give the eager rows bit for bit. ``core``
+    "fi-nvfp4": an nvfp4_ds_mla cache (WideDsa's MlaQuery inserts its rows; FlashInfer
+    prims_ts everywhere)."""
     from vllm.model_executor.layers import sparse_attn_indexer
     from vllm.models.kimi_k3.nvidia.dsa_kernels.dcp_exchange import decode as dcpx
 
@@ -3584,23 +3587,20 @@ def test_wide_dsa_dcp_exchange(dcp8_group, monkeypatch, core, batch, q):
 @pytest.mark.parametrize("batch,q", WIDE_EXCHANGE_CASES)
 @pytest.mark.parametrize("core", ["fi-trtllm", "fi-nvfp4"])
 def test_wide_dsa_dcp_exchange_proj(dcp8_group, monkeypatch, core, batch, q):
-    """test_wide_dsa_dcp_exchange with "proj" partials (VLLM_K31_DSA_PARTIALS=proj,
-    which both WideDsa layers read): the W_UV bmm's value rows of every gathered
-    head go through the widened box's "proj" DcpMailbox and #108's DcpValue merges
-    them. The rows entering o_proj are, on every row, the chain's (FlashInfer over
-    the same keys through the stock DCP filter) and, where the top-k is the same,
-    the stock forward's; 200 graph replays of the two layers on alternating
-    parities give the eager rows bit for bit; afterwards the "proj" mailbox and
-    the q mailbox rows of the step are re-armed on both parities. ``core``
-    "fi-nvfp4": an nvfp4_ds_mla cache (prims_ts everywhere), agentx-local's."""
+    """test_wide_dsa_dcp_exchange with "proj" partials (the automatic policy's at every
+    wide row, r1.AUTO_PARTIALS; given to both WideDsa layers): the W_UV bmm's value rows
+    of every gathered head go through the widened box's "proj" DcpMailbox and #108's
+    DcpValue merges them. The rows entering o_proj are, on every row, the chain's
+    (FlashInfer over the same keys through the stock DCP filter) and, where the top-k is
+    the same, the stock forward's; 200 graph replays of the two layers on alternating
+    parities give the eager rows bit for bit; afterwards the "proj" mailbox and the q
+    mailbox rows of the step are re-armed on both parities. ``core`` "fi-nvfp4": an
+    nvfp4_ds_mla cache (prims_ts everywhere), agentx-local's."""
     import torch.distributed as dist
 
     from vllm.distributed import get_dcp_group
     from vllm.model_executor.layers import sparse_attn_indexer
     from vllm.models.kimi_k3.nvidia.dsa_kernels.dcp_exchange import decode as dcpx
-    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.r1 import (
-        PARTIALS_ENV,
-    )
 
     if LAYER_CORES[core][2] == "prims_ts" and no_prims_ts():
         pytest.skip("FlashInfer prims_ts sparse MLA cannot run here")
@@ -3610,8 +3610,9 @@ def test_wide_dsa_dcp_exchange_proj(dcp8_group, monkeypatch, core, batch, q):
     monkeypatch.delenv(dcpx.ENV + "_TIES", raising=False)  # (rank, position)
     monkeypatch.delenv(dcpx.GRAPH_ONLY_ENV, raising=False)
     monkeypatch.setenv(dcpx.SPIN_ENV, "120")
-    monkeypatch.setenv(PARTIALS_ENV, "proj")
-    step = run_wide_exchange_step(batch, q, dcp8_group, replays=200, core=core)
+    step = run_wide_exchange_step(
+        batch, q, dcp8_group, replays=200, core=core, partials="proj"
+    )
     check_layer_step(step, q, reference=False)
     core_rows, chain_rows = step.out.float(), step.chain_out.float()
     error = float((core_rows - chain_rows).norm() / chain_rows.norm())
@@ -3838,7 +3839,9 @@ def test_merge_rows_kernels_compile_at_prepare(monkeypatch, check):
 def test_dcp_partials_policy():
     """The DcpValue partials policy: a format for every batch ("bf16" or "proj"), a
     batch table of them or "default" (per layer kind: BF16, then "proj" from 65
-    rows for MLA, from 160 rows for DSA); no lossy 8-bit partials."""
+    rows for MLA, from 17 rows on for DSA: the one automatic DSA policy, also
+    r1.AUTO_PARTIALS); no lossy 8-bit partials."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa import r1
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.dcp_value import (  # noqa: E501
         partials_for,
         resolve_partials,
@@ -3857,9 +3860,10 @@ def test_dcp_partials_policy():
         *("bf16",) * 3,
         *("proj",) * 2,
     ]
-    assert [partials_for(dsa, b) for b in (1, 64, 159, 160, 320)] == [
-        *("bf16",) * 3,
-        *("proj",) * 2,
+    assert dsa == r1.AUTO_PARTIALS == "1-16:bf16,17-:proj"
+    assert [partials_for(dsa, b) for b in (1, 16, 17, 64, 320, 2048)] == [
+        *("bf16",) * 2,
+        *("proj",) * 4,
     ]
     assert resolve_partials(None, "dsa") == dsa
     assert resolve_partials("proj", "dsa") == "proj"
@@ -3870,15 +3874,18 @@ def test_dcp_partials_policy():
 
 @pytest.mark.skip_global_cleanup  # pure policy check: keep a DCP8 launch's group
 def test_dsa_partials_switch(monkeypatch):
-    """VLLM_K31_DSA_PARTIALS (r1.DsaBox, read when the providers are built). Unset
-    or empty (the default) every batch keeps MR !8's BF16 latent box, and no "proj"
-    DcpMailbox, W_UV all-gather or rendezvous happens. "proj" or a batch table of
-    the two puts the "proj" batches of the rows a box serves on one DcpMailbox per
-    box, a layer's W_UV is gathered once and kept on it, an argument overrides the
-    env, and anything else raises at build."""
+    """r1.DsaBox's partials policy, chosen in code (no environment switch): the
+    automatic one is "bf16" at every batch on FlashMLA sparse and r1.AUTO_PARTIALS
+    ("1-16:bf16,17-:proj") on FlashInfer sparse (``fp8``); an argument overrides it.
+    A box whose served batches are all "bf16" keeps MR !8's BF16 latent box, and no
+    "proj" DcpMailbox, W_UV all-gather or rendezvous happens. "proj" or a batch
+    table of the two puts the "proj" batches of the rows a box serves on one
+    DcpMailbox per box, and a layer's W_UV is gathered once and kept on it. A box
+    without BF16 partial mailboxes (WideDsa's widened box) gets them only when a
+    served batch is "bf16". Anything else raises at build."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa import r1
 
-    made, gathered = [], []
+    made, gathered, added = [], [], []
 
     def mailbox(group, device, size, cap, heads, fmt):
         made.append((cap, fmt))
@@ -3894,49 +3901,65 @@ def test_dsa_partials_switch(monkeypatch):
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda device=None: None)
     monkeypatch.setattr(torch.distributed, "barrier", lambda group=None: None)
 
-    def mr8_box(cap=64):  # an MR !8 DcpBox's attributes (DCP16, 6 heads)
-        q = torch.zeros(2, cap, 128, 576, dtype=torch.uint8)
-        names = ("partial", "lse", "peers", "lse_peers", "group")
-        return SimpleNamespace(size=16, rank=0, cap=cap, heads=6, q=q, q_heads=128,
-                               **dict.fromkeys(names))  # fmt: skip
+    def mr8_box(cap=64, partials=True):  # an MR !8 DcpBox's (DCP16, 6 heads)
+        q = torch.zeros(2, 1, 128, 576, dtype=torch.uint8)  # (only passed through)
+        names = ("lse", "peers", "lse_peers", "group")
+        box = SimpleNamespace(size=16, rank=0, cap=cap, heads=6, q=q, q_heads=128,
+                              **dict.fromkeys(names))  # fmt: skip
+        box.partial = object() if partials else None
+
+        def add_partials():
+            added.append(cap)
+            box.partial = object()
+            return box
+
+        box.add_partials = add_partials
+        return box
 
     layer = SimpleNamespace(W_UV=torch.zeros(6, 512, 128))
-    for value in (None, "", "bf16"):
-        if value is None:
-            monkeypatch.delenv(r1.PARTIALS_ENV, raising=False)
-        else:
-            monkeypatch.setenv(r1.PARTIALS_ENV, value)
-        box = r1.DsaBox(mr8_box(), batches=(8, 16, 64))
+    for kwargs in ({}, {"partials": "bf16"}, {"partials": "bf16", "fp8": True}):
+        box = r1.DsaBox(mr8_box(), batches=(8, 16, 64), **kwargs)
         assert box.partials == "bf16" and list(box.mailboxes) == ["bf16"]
         assert all(box.mailbox(b) is box for b in range(1, 65))
         assert box.mailbox(64).format == "bf16" and not box.projected
         assert box.value_weights(layer) is None
     assert made == [] and gathered == [] and not hasattr(layer, "W_UV_dcp_gathered")
 
-    monkeypatch.setenv(r1.PARTIALS_ENV, "1-16:bf16,17-64:proj")
     narrow = mr8_box()
-    box = r1.DsaBox(narrow, batches=(8, 16))  # served rows all "bf16"
+    box = r1.DsaBox(narrow, batches=(8, 16), fp8=True)  # served rows all "bf16"
+    assert box.partials == r1.AUTO_PARTIALS == "1-16:bf16,17-:proj"
     assert list(box.mailboxes) == ["bf16"] and made == []
-    box = r1.DsaBox(narrow, batches=(8, 64))
+    box = r1.DsaBox(narrow, batches=(8, 64), fp8=True)
     assert made == [(64, "proj")] and box.projected
     assert box.mailbox(8) is box and box.mailbox(16) is box
     assert box.mailbox(17) is box.mailbox(64) and box.mailbox(64).format == "proj"
-    again = r1.DsaBox(narrow, batches=(24,))  # one DcpMailbox per MR !8 box
+    again = r1.DsaBox(narrow, batches=(24,), fp8=True)  # one DcpMailbox per box
     assert again.mailbox(24) is box.mailbox(64) and len(made) == 1
     weights = box.value_weights(layer)
     assert weights[1] == "view" and again.value_weights(layer) is weights
     assert gathered == [16] and layer.W_UV_dcp_gathered is weights
-    plain = r1.DsaBox(narrow, batches=(8, 64), partials="bf16")  # the argument wins
+    plain = r1.DsaBox(narrow, batches=(8, 64), partials="bf16", fp8=True)
     assert list(plain.mailboxes) == ["bf16"] and plain.value_weights(layer) is None
     wide = r1.DsaBox(mr8_box(512), batches=(128, 512), partials="65-512:proj")
     assert made[-1] == (512, "proj") and wide.mailbox(128).format == "proj"
     assert wide.mailbox(64) is wide
+    assert added == []
+
+    # A widened box without BF16 partials: "proj" at every served row adds none.
+    lean = mr8_box(2048, partials=False)
+    proj = r1.DsaBox(lean, batches=(128, 2048), fp8=True)
+    assert added == [] and lean.partial is None and proj.mailbox(2048).format == "proj"
+    mixed = r1.DsaBox(lean, batches=(128, 2048), partials="65-127:bf16,128-:proj")
+    assert added == [] and mixed.mailbox(128).format == "proj"
+    bf16 = r1.DsaBox(lean, batches=(96, 2048), partials="65-127:bf16,128-:proj")
+    assert added == [2048] and bf16.partial is lean.partial is not None
+    r1.DsaBox(lean, batches=(96,), partials="bf16")  # (already added)
+    assert added == [2048]
 
     bad = ("fp8", "int8", "default", "1-64:int8", "proj:1-64", "1-x:proj", "64-1:proj")
-    for spec in (*bad, "1-64"):
-        monkeypatch.setenv(r1.PARTIALS_ENV, spec)
-        with pytest.raises(ValueError, match=r1.PARTIALS_ENV):
-            r1.DsaBox(mr8_box())
+    for spec in (*bad, "1-64", ""):
+        with pytest.raises(ValueError, match="DSA DcpValue partials"):
+            r1.DsaBox(mr8_box(), partials=spec)
 
 
 def dcp_value_reference(rows, lse, live, w_uv, gate, partials):
@@ -5048,6 +5071,119 @@ def test_dcp_value_merge_matches_stock(dcp8_group, layout, batch, q):
     """ATTN-5 / MLA-DCP-MERGE-WEIGHT: DcpValue's merge weights are the stock
     combine's weight * (1 / sum) (check_dcp_value_merge_stock)."""
     check_dcp_value_merge_stock(layout, batch, q)
+
+
+def run_strided_values(layout, batch, q, residents):
+    """mla.dcp.DcpValue (``layout`` "dsa": the DSA FP8 mailbox on the GB300 schedule,
+    per-head merges; "mla": K3's layout, spread merges on Rubin) of one ``batch`` on
+    every rank of the DCP group, the same inputs compiled once per ``residents``
+    (compile_value's ``resident_sms``: the wave its row tiles stride over; 0 the
+    device's own), each launched on both parities; returns the outputs and grids."""
+    import cutlass
+    import torch.distributed as dist
+
+    from vllm.distributed import get_dcp_group
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
+        layout as spec,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
+        stream,
+        to_cute,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.mla.dcp import (
+        GB300_SMS,
+        DcpBox,
+        DcpValue,
+        compile_value,
+    )
+
+    group = get_dcp_group()
+    world, rank = group.world_size, group.rank_in_group
+    dev = torch.device("cuda", torch.accelerator.current_device_index())
+    dsa, heads, reqs = layout == "dsa", HEADS, batch // q
+    gathered = heads * world
+    padded = 128 if dsa else gathered
+    q_heads = padded if dsa else None
+    box = DcpBox(group.device_group, dev, world, rank, heads, batch, q_heads=q_heads)
+    sms = torch.cuda.get_device_properties(dev).multi_processor_count
+    common = torch.Generator(device=dev).manual_seed(17)
+    w_uv_all = torch.randn(gathered, 128, 512, device=dev, generator=common) / 23
+    w_uv = w_uv_all.bfloat16().transpose(1, 2)[rank * heads : (rank + 1) * heads]
+    projected = torch.randn(batch, PITCH, device=dev, generator=common).bfloat16()
+    gen = torch.Generator(device=dev).manual_seed(300 + rank)
+    lengths = torch.randint(1, 200, (reqs,), device=dev, generator=gen).int()
+    totals = lengths * world  # (every rank holds keys of every request)
+    rows = torch.randn(batch, padded, 512, device=dev, generator=gen)
+    rows = (rows * torch.rand(batch, padded, 1, device=dev, generator=gen)).bfloat16()
+    lse = 4 * torch.rand(batch, padded, device=dev, generator=gen) + rank % 3
+    if dsa:  # FlashInfer's padded-head rows and natural-log LSE, global lengths
+        latent = rows.as_strided((batch, 1, gathered, 512), (padded * 512, 0, 512, 1))
+        lse_in = lse.as_strided((batch, 1, gathered), (padded, 0, 1))
+        local = totals
+    else:  # tokenspeed's rows (base 2) in the box, local lengths
+        box.rows[:batch, 0].copy_(rows)
+        box.rows_lse[:batch, 0].copy_(lse)
+        latent, lse_in, local = box.rows[:batch], box.rows_lse[:batch], lengths
+    outs, grids = [], []
+    for resident in residents:
+        extra = dict(dsa_heads=padded, dsa_bf16=False) if dsa else {}
+        kernel = compile_value(
+            heads, world, batch, box.cap, spec(w_uv), PITCH, dev.index, sms, q,
+            resident_sms=resident, **extra,
+        )  # fmt: skip
+        schedule = min(sms, GB300_SMS) if dsa else sms
+        grids.append(
+            DcpValue(heads, world, batch, schedule, q, resident_sms=resident or sms)
+        )
+        out = torch.empty(batch, heads * 128, device=dev).bfloat16()
+        for parity in (0, 1):
+            box.q[parity].view(torch.uint8)[:batch, :gathered] = 7  # the core read it
+            v_args = (to_cute(latent), to_cute(lse_in, 4), to_cute(local, 4))
+            v_args += (to_cute(box.partial[parity]), to_cute(box.lse[parity], 4))
+            v_args += (to_cute(box.peers, 8), to_cute(box.lse_peers, 8))
+            v_args += (to_cute(box.q[parity].view(torch.uint8)), to_cute(w_uv))
+            v_args += (to_cute(projected[:, 2112:]), to_cute(totals, 4))
+            v_args += (to_cute(out), cutlass.Int32(parity), cutlass.Int32(rank))
+            kernel(*v_args, stream(dev))
+            torch.accelerator.synchronize()
+            dist.barrier(group.cpu_group)
+            outs.append(out.clone())
+    return outs, [value.grid for value in grids], [v.tile_stride for v in grids]
+
+
+@pytest.mark.skipif(DCP_INIT is None, reason="needs an 8-rank launch (DCP8)")
+@pytest.mark.skip_global_cleanup  # the DCP group outlives each case
+@pytest.mark.parametrize("layout", ["dsa", "mla"])
+@pytest.mark.parametrize("rows", ["fit", 576, 1024])
+def test_dcp_value_tile_stride_bitwise(dcp8_group, layout, rows):
+    """DcpValue's row-tile stride (``tile_stride``, past one wave of the device's
+    real SMs) merges the same rows with the same sums: at the most rows whose grid
+    fits one wave ("fit": unstrided) a forced stride over 8 row tiles gives the
+    unstrided output bit for bit, and at 576 / 1024 rows (strided on the device:
+    unstrided they would not be co-resident) the device's stride and the forced one
+    agree bit for bit; the per-head merges (the DSA mailbox on the GB300 schedule)
+    and the spread ones (K3's layout, Rubin), on both parities."""
+    import torch.distributed as dist
+
+    from vllm.distributed import get_dcp_group
+
+    q, heads = 4, HEADS
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    batch = (sms // heads) * 16 if rows == "fit" else rows
+    batch -= batch % q
+    outs, grids, strides = run_strided_values(layout, batch, q, (0, 8 * heads))
+    assert all(g[0] * g[1] * g[2] <= sms for g in grids), grids
+    assert strides[1] == 8 and (strides[0] == 0) == (rows == "fit"), strides
+    first = outs[0].view(torch.int16)
+    differ = [int((o.view(torch.int16) != first).sum()) for o in outs]
+    error = None if not any(differ) else f"values differ from the first: {differ}"
+    group = get_dcp_group()
+    dev = outs[0].device
+    failed = torch.tensor([error is not None], device=dev, dtype=torch.int32)
+    dist.all_reduce(failed, group=group.device_group)
+    assert error is None, error
+    assert not failed.item(), "another rank failed"
+    assert all(torch.isfinite(o.float()).all() for o in outs)
 
 
 @pytest.mark.parametrize("overlap", ["fork", "front"])

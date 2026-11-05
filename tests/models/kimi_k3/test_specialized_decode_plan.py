@@ -4,6 +4,7 @@
 the tuned rows) between the specialized providers and the stock seams, K3.1's DSA
 seam (S2-DSA) included."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -50,6 +51,7 @@ from vllm.models.kimi_k3.nvidia.specialized_decode.shapes import (  # noqa: E402
     Choice,
     Context,
     Path,
+    Shape,
     captured_rows,
 )
 
@@ -345,17 +347,12 @@ def test_attention_checks_the_dsa_seam_at_startup(monkeypatch, wide, skip_topk):
     assert provider.dsa_columns == (COLUMNS if wide else ())
 
 
-@pytest.mark.parametrize("cap", [None, 256])
-def test_dsa_rows_split_between_two_cores(monkeypatch, cap):
+def test_dsa_rows_split_between_two_cores(monkeypatch):
     """K3.1 at TP16 = DCP16: a DSA layer builds #108's PreparedDsa on the tuned rows
-    (up to 64) and WideDsa on the wide rows DSA_WIDE admits (65 up to
-    VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS: 96 by default), on one shared scratch (sized for
-    the widest), DcpBox and parity; ``run_dsa`` runs each step on the core of its
-    rows."""
+    (up to 64) and WideDsa on every wide row (DSA_WIDE's automatic, open-ended policy:
+    no row cap and no environment switch), on one shared scratch (sized for the
+    widest), DcpBox and parity; ``run_dsa`` runs each step on the core of its rows."""
     from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
-
-    if cap is not None:
-        monkeypatch.setenv("VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS", str(cap))
 
     attention, _ = dsa_layer(fused_insert=True)
     attention.num_local_heads = HEADS
@@ -386,7 +383,7 @@ def test_dsa_rows_split_between_two_cores(monkeypatch, cap):
         Attention.__init__(
             provider, SimpleNamespace(self_attn=attention), runtime, None, None, None
         )
-    rows = {b for b in wide if b <= (cap or 96)}
+    rows = set(wide)  # 72-256: all admitted, above WIDE_MAX_ROWS (96) too
     assert provider.dsa_wide == rows
     providers_module.dsa_scratch.assert_called_once_with(runtime, max(rows))
     policy = dict(queries=(1, 8), core="auto", dcp=box, parity=0)
@@ -731,3 +728,247 @@ def test_stock_attn_res_sites_run_once(wide_moe):
         assert out is decode.feed_forward[2].run.call_args.args[1]
     else:
         assert ran == [1, 1, 1] and decode.final_stock.run.call_count == 1
+
+
+# FP32 KDA recurrent state (--mamba-ssm-cache-dtype float32). The tests below build
+# the KDA kernel objects without a GPU (their constructors' shape / dtype /
+# shared-memory asserts, which ``prepare_kv`` hits at startup; no compile; they need
+# cutlass and flashinfer only). The compiles and the numerics (head and wide verify
+# vs KdaSplit, bitwise) are test_specialized_decode_kda_fp32_gpu.py's (Rubin).
+RUBIN = (10, 7)
+KDA_HEADS = 6  # TP16 (96 KDA heads)
+
+
+def kda_kernel(requests, q, bf16_state, gate_mode=0, heads=KDA_HEADS):
+    """The plain verify kernel ``kda.prepared.executable`` builds (Rubin, whole state
+    rows), constructed but not compiled."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import prepared
+
+    schedule = prepared.schedule_of(heads, requests, gate_mode, q, RUBIN, bf16_state)
+    options = (heads, requests, gate_mode, False, schedule, q, bf16_state)
+    return prepared.make_kernel(options, RUBIN)
+
+
+def kda_context(bf16_state, q, tp=16):
+    return Context(
+        arch="rubin", tp=tp, rank=0, dcp=tp, sms=212, q=q, max_rows=512 * q,
+        max_context=1 << 20, bf16_state=bf16_state,
+    )  # fmt: skip
+
+
+@pytest.mark.parametrize("bf16_state", [False, True], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("q,requests", [(4, 512), (8, 128)], ids=["q4", "q8"])
+def test_kda_verify_kernels_take_the_state_dtype(q, requests, bf16_state):
+    """Every request count up to 512 (q4) / 128 (q8) builds its verify kernel with
+    either state dtype: the BF16-only chunked verify (Stream3, which asserts a BF16
+    state) never serves an FP32 state, and the coverage note names the kernel that
+    runs."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import prepared
+
+    names = {
+        prepared.KdaVerifyWide: "wide",
+        prepared.KdaVerifyHalves: "halves",
+        prepared.KdaVerifyStream: "stream",
+        prepared.KdaVerifyStream3: "stream3",
+    }
+    for b in range(1, requests + 1):
+        kernel = kda_kernel(b, q, bf16_state)  # raises on an unsupported dtype
+        assert kernel.bf16_state == bf16_state
+        name = names.get(type(kernel), "kdasplit")
+        note = prepared.choose(Shape(b * q, q), kda_context(bf16_state, q)).note
+        assert note.split()[0] == name, (b, note)
+        assert prepared.verify_kernel(b, q, RUBIN, bf16_state) == name
+        if not bf16_state:
+            assert name not in ("stream", "stream3"), b
+
+
+def test_kda_q4_wide_policy():
+    """q4 rows (cap-128 overlay): Halves at 35-48 and Wide at 49-64 with either state;
+    Stream3 from 65 requests with a BF16 state, open-ended (no request cap); with an
+    FP32 state those rows run KdaVerifyWide, as do q8 rows above VERIFY_WIDE's 64."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import prepared
+
+    kind = prepared.verify_kernel
+    for state in (False, True):
+        assert kind(12, 4, RUBIN, state) == "wide"
+        assert [kind(b, 4, RUBIN, state) for b in (33, 34)] == ["wide"] * 2
+        assert {kind(b, 4, RUBIN, state) for b in range(35, 49)} == {"halves"}
+        assert {kind(b, 4, RUBIN, state) for b in range(49, 65)} == {"wide"}
+        assert {kind(b, 8, RUBIN, state) for b in range(65, 1025)} == {"wide"}
+    bf16 = {kind(b, 4, RUBIN, True) for b in range(65, 1025)}
+    fp32 = {kind(b, 4, RUBIN, False) for b in range(65, 1025)}
+    assert bf16 == {"stream3"} and fp32 == {"wide"}
+
+
+@pytest.mark.parametrize("bf16_state", [False, True], ids=["fp32", "bf16"])
+def test_kda_tp8_verify_keeps_kdasplit(bf16_state):
+    """TP8 verify layers (12 heads, gate mode 1, fast math) are outside the wide
+    kernels' asserts: they keep KdaSplit at every request count, and say so."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import prepared
+
+    for b in (16, 36, 64, 65, 256):
+        kernel = kda_kernel(b, 4, bf16_state, gate_mode=1, heads=12)
+        assert type(kernel) is prepared.KdaSplit
+        note = prepared.choose(Shape(4 * b, 4), kda_context(bf16_state, 4, 8)).note
+        assert note.startswith("kdasplit")
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+def test_kda_heads_take_an_fp32_state(dtype):
+    """KdaHead (q1 B8), KdaHeadVerify (B1 x q8) and KdaHeadMulti (2 x q8, 2 x q4)
+    keep the state in registers through KdaSplit's load_state / store_state: an FP32
+    state fits the same shared-memory budget, so the head serves it too; other
+    dtypes and shapes without a kernel keep the in-projection -> KdaSplit pair."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda.head import (
+        head_supported,
+    )
+
+    for batch, q in ((8, 1), (8, 8), (16, 8), (8, 4)):
+        assert head_supported(KDA_HEADS, dtype, False, 7168, batch, q), (batch, q)
+    assert not head_supported(KDA_HEADS, dtype, False, 7168, 32, 8)  # 4 requests
+    assert not head_supported(KDA_HEADS, dtype, False, 7168, 4, 4)  # B1 x q4
+    assert not head_supported(KDA_HEADS, torch.float16, False, 7168, 8, 8)
+
+
+@pytest.fixture
+def head_probe(monkeypatch):
+    """``kda.head`` with CUDA reported present, its compile functions recorded (and
+    failing when ``fail`` holds their name), and its admission caches cleared."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import head
+
+    calls: list = []
+    fail: set = set()
+
+    def compiler(name):
+        def compile_(*args, **kwargs):
+            calls.append((name, args, kwargs))
+            if name in fail:
+                raise RuntimeError("ptxas: out of registers")
+
+        return compile_
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(head, "architecture", lambda device: "sm_107a")
+    monkeypatch.setattr(head, "polled_out_batches", lambda tp, device: (8,))
+    monkeypatch.setattr(head, "compile_head", compiler("head"))
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import (
+        head_multi,
+        head_verify,
+    )
+
+    monkeypatch.setattr(head_verify, "compile_head_verify", compiler("verify"))
+    monkeypatch.setattr(head_multi, "compile_head_multi", compiler("multi"))
+    monkeypatch.setattr(torch.accelerator, "device_index", lambda index: nullcontext())
+    for cached in (head.head_constructs, head.head_compiles):
+        cached.cache_clear()
+    yield head, calls, fail
+    for cached in (head.head_constructs, head.head_compiles):
+        cached.cache_clear()
+
+
+def kda_core_stub(conv_dim_first=True):
+    """The ``PreparedKda`` fields a KdaHead's tensors read (TP16: 6 heads)."""
+    meta = dict(device="meta")
+    weights = (
+        torch.empty((3, 4, 768), dtype=torch.float32, **meta),  # conv (decode layout)
+        torch.empty(768, dtype=torch.float32, **meta),  # bias (dt: no conv bias)
+        torch.empty((768, 128), dtype=torch.bfloat16, **meta),  # F_B
+        torch.empty(6, dtype=torch.float32, **meta),  # A_log
+        torch.empty(768, dtype=torch.float32, **meta),  # dt bias
+        torch.empty(128, dtype=torch.float32, **meta),  # o_norm
+    )
+    return SimpleNamespace(
+        heads=KDA_HEADS, dim=768, has_bias=False, weights=weights,
+        conv_dim_first=conv_dim_first, device=torch.device("cuda", 0),
+    )  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    "batch,q,name",
+    [(8, 1, "head"), (8, 8, "verify"), (16, 8, "multi"), (8, 4, "multi")],
+)
+def test_kda_fp32_head_compile_probe(head_probe, batch, q, name):
+    """An FP32 state admits a KdaHead shape only once its kernels compile on the
+    device (the polled variant too where POLLED_OUT puts one), on meta caches of the
+    deployment's layout; a failed compile keeps the pair (no startup failure), and
+    the BF16 state (the measured serving dtype) is not probed."""
+    head, calls, fail = head_probe
+    core = kda_core_stub()
+    probe = dict(core=core, fa_width=144, cache_tokens=q if q > 1 else 8, tp=16)
+    args = (KDA_HEADS, torch.float32, False, 7168, batch, q)
+    assert head.head_supported(*args, **probe)
+    polled = batch == 8  # POLLED_OUT's batch (stubbed: 8)
+    assert [c[0] for c in calls] == [name] * (1 + polled)
+    specs = calls[0][1][4 if name == "head" else 3]
+    conv, state = specs[2], specs[7]
+    assert conv[0] == (16, 3 * 768, probe["cache_tokens"] + 2)
+    assert conv[2] == torch.bfloat16
+    assert state[0] == (16, KDA_HEADS, 128, 128) and state[2] == torch.float32
+    assert specs[3][0] == (batch, 144) and specs[8][0] == (batch, 768)
+    assert specs[6][0] == ((batch,) if q == 1 else (batch // q, q))
+    assert len(specs) == (11 if q == 1 else 12)
+
+    calls.clear()  # cached: one probe per shape and layout, not per layer
+    assert head.head_supported(*args, **probe)
+    assert not calls
+
+    head.head_compiles.cache_clear()
+    fail.add(name)
+    assert not head.head_supported(*args, **probe)
+
+    calls.clear()
+    bf16 = (KDA_HEADS, torch.bfloat16, False, 7168, batch, q)
+    assert head.head_supported(*bf16, **probe) and not calls
+
+
+@pytest.mark.parametrize("compiles", [True, False], ids=["compiles", "fails"])
+def test_kda_fp32_head_probe_decides_in_the_provider(monkeypatch, head_probe, compiles):
+    """A Rubin TP16 KDA layer (q8) with an FP32 state builds its KdaHead (q1 B8, B1 x
+    q8, 2 x q8) only when the kernels compile; when they fail it builds none, before
+    anything is set up for the head (no KdaHead index or F_A buffer, which the MoE
+    tail's early release and the AttnRes carve-out follow), and keeps the pair."""
+    head, calls, fail = head_probe
+    if not compiles:
+        fail.update({"head", "verify", "multi"})
+    batches = (*range(1, 9), 16)
+    weight = torch.empty((3216, 7168), dtype=torch.bfloat16, device="meta")
+    monkeypatch.setattr(providers_module, "bf16_weight", lambda linear: weight)
+    monkeypatch.setattr(providers_module, "head_supported", head.head_supported)
+    stub = kda_core_stub()
+    monkeypatch.setattr(providers_module, "PreparedKda", lambda *a, **k: stub)
+    monkeypatch.setattr(providers_module, "is_conv_state_dim_first", lambda: True)
+    monkeypatch.setattr(providers_module, "polled_out_batches", lambda tp, d: (8,))
+    for name in ("PreparedProjection", "SkinnyProjection"):
+        monkeypatch.setattr(providers_module, name, MagicMock())
+    built = MagicMock(name="PreparedKdaHead")
+    monkeypatch.setattr(providers_module, "PreparedKdaHead", built)
+    monkeypatch.setattr(providers_module, "PreparedOproj", MagicMock(side_effect=Built))
+    device = SimpleNamespace(multi_processor_count=212)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda index: device)
+    runtime = SimpleNamespace(
+        tp=16, q=8, tuned=batches, batches=batches, wide=(), bf16_state=False,
+        buffers={}, device="cpu", kda_heads=0, kda_side=None, capacity=16,
+        context=kda_context(False, 8),
+    )  # fmt: skip
+    decoder = SimpleNamespace(
+        self_attn=SimpleNamespace(in_proj_qkvgfab=None), layer_idx=0,
+        is_moe_layer=False,
+    )  # fmt: skip
+    provider: Any = object.__new__(Attention)
+    with pytest.raises(Built):  # past the KDA branch, at the o-projection
+        Attention.__init__(provider, decoder, runtime, None, None, None)
+    assert provider.kind == "kda"
+    if compiles:
+        assert sorted({c[0] for c in calls}) == ["head", "multi", "verify"]
+        built.assert_called_once()
+        args, kwargs = built.call_args
+        assert args[2] == [8] and kwargs["verify"] == [(8, 8), (16, 8)]
+        assert kwargs["polled"] == [8] and runtime.kda_heads == 1
+        assert provider.head is built.return_value
+        assert provider.head_state == torch.float32
+        assert runtime.buffers["kda.head.fa"].shape == (128, 64, 144)
+    else:  # the verify head is only probed for an admitted q1 batch
+        assert sorted({c[0] for c in calls}) == ["head", "multi"]
+        built.assert_not_called()
+        assert provider.head is None and provider.head_state is None
+        assert runtime.kda_heads == 0 and "kda.head.fa" not in runtime.buffers

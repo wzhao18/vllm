@@ -8,7 +8,7 @@ Per layer, after the stock fused query concat (RoPE, FP8, KV insert):
   QGather      this rank's FP8 query rows [R, H, 576] -> every rank's q mailbox
                [R, DCP*H, 576] (multicast), then the grid polls the gathered mailbox
   tokenspeed   the stock decode over the local KV shard for every rank's heads
-               (non-causal draft rows) -> BF16 rows + LSE (log2); for FAST_CORE
+               (draft rows, masked as stock) -> BF16 rows + LSE (log2); for FAST_CORE
                rows without its reducer (mla.dcp split_partials_q): FP32 split
                partials + LSEs (packed rows t * DCP * H + g)
   DcpValue     (mla.dcp) re-arms the q mailbox, pushes the rows (FAST_CORE: LSE-folds
@@ -17,6 +17,33 @@ Per layer, after the stock fused query concat (RoPE, FP8, KV insert):
                the drafter has no output gate), so the output is W_UV's BF16 rows
 Parity alternates by drafter layer, as the target's MLA layers. Without the gather
 (FORK_ROWS, POLLED_CORE) the core polls the q rows it reads instead.
+
+Causality (``DraftDcp.causal``): stock resolves the drafter's from its config
+(DFlashSpeculator: causal unless qwen3_dflash.dflash_has_any_non_causal; the
+64-head kimi-k3-dspark is non-causal, kimi-k3.1-pro-dspark-preview sets
+dflash_config.causal) into the attention metadata, which tokenspeed's causal_mask
+reads; the cores here compile with the same flag (causal: the target verify's
+global-position mask, rows mode's per-row lengths from VerifyRows) and refuse a call
+whose metadata says otherwise (the stock path runs it). The "non-causal" notes below
+describe the 64-head drafter the tables were measured on.
+
+The drafter's row-keyed tables here (FAST_CORE .. DRAFT_WLIST) are its own (drafter
+rows: multiples of the draft length). mla.dcp's split tables (LONG_SPLIT,
+VERIFY_FOLD_SPLITS) are keyed by (rows, gathered heads), not by role or q, and shared
+with the target's MLA verify: the (rows, 64) keys are the 64-head drafter's (measured
+on it, q 3 / 7), but at 96 gathered heads (kimi-k3.1-pro-dspark-preview, 6 per rank at
+DCP16) they are the K3 target's, measured at its verify q (4 / 8: other packed tiles
+and requests at the same rows). The drafter's split (``draft_fold_splits``) therefore
+takes those tables only at the gathered head counts measured on a drafter
+(DRAFT_RULE_HEADS), else tokenspeed's own split (the stock drafter's). A rule the
+cores and DcpValue still read where that split equals a rule's long split keeps the
+partition consistent (both read it), and a gathered fold row it fires on moves to the
+polled core (``long_polled``: the gathered fold core has no long partition). Rows mode
+(q = 1) keeps the (padded rows, heads) q = 1 rules: the same shape whichever role
+measured them. NQ-TUNE: a drafter key in mla.dcp's split tables (rows, heads, role)
+and the 96-head drafter's LONG_SPLIT / VERIFY_FOLD_SPLITS / POLLED_CORE / VALID_CORE /
+DRAFT_WLIST / QUERY_TOKENS / DRAFT_CORE_PUSH, DL3 B1-B166 and DL7 B1-B36 graphs
+(scripts/dsdraft/layer_test.py at 6 heads x DCP16).
 """
 
 from functools import cache
@@ -66,6 +93,7 @@ from ..mla.dcp import (
     compile_split_partials,
     compile_split_partials_q,
     compile_value,
+    fill_splits,
     fork_partials,
     fork_table,
     local_max,
@@ -145,7 +173,12 @@ DRAFT_CORE_PUSH = batch_table("224:1")
 # Rows whose persistent core runs the per-step work list (mla.wlist) where mla.dcp's
 # LONG_SPLIT launches its long split: the polled fold rows (valid 2) and the wide rows.
 # The first drafter layer builds the lists; the core push (split 1) is off for them.
-DRAFT_WLIST = batch_table("28:1,35:1,42:1,49:1,56:1,63-224:1")
+# (225-576: DL3 B65-B192 drafter rows, hb192, with mla.dcp's LONG_SPLIT rule)
+DRAFT_WLIST = batch_table("28:1,35:1,42:1,49:1,56:1,63-576:1")
+# Gathered head counts (DCP x heads per rank) whose (rows, heads) keys in mla.dcp's
+# split tables were measured on the drafter (the 64-head kimi-k3-dspark at DCP16; the
+# K3 target verifies 96). See the module notes and ``draft_fold_splits``.
+DRAFT_RULE_HEADS = frozenset({64})
 
 THREADS = 256
 POLLS = 8  # 16 B gathered-mailbox chunks polled per thread
@@ -212,6 +245,47 @@ def compile_gather(rows, heads, size, cap, device):
         return cute.compile(kernel, *args, make_fake_stream())
 
 
+def query_heads(heads):
+    """Whether MlaQuery(rope) has a drafter tile for ``heads`` heads per rank
+    (mla.query DRAFT_TILED_FROM): the fast DCP attention needs it."""
+    from ..mla.query import DRAFT_TILED_FROM
+
+    return heads in DRAFT_TILED_FROM
+
+
+def uncovered_rows(rows, steps, cap, size, sms):
+    """The drafter ``rows`` DraftDcp cannot serve by shape alone -> why (the wide rows
+    whose DcpValue is not co-resident are found when it compiles)."""
+    dropped = {}
+    for r in rows:
+        if r % steps:
+            dropped[r] = "not a whole draft length"
+        elif r > cap and size == 1:
+            dropped[r] = f"above the {cap}-row box without DCP"
+        elif r > cap and sms <= GB300_SMS:
+            dropped[r] = f"above the {cap}-row box without the Rubin wide path"
+    return dropped
+
+
+def draft_fold_splits(rows, steps, heads, max_seq, device):
+    """(split, packed rows) of the drafter's packed (q = ``steps``) tokenspeed core for
+    ``rows`` drafter rows of ``heads`` gathered heads: mla.dcp.verify_fold_splits
+    (its Rubin tables VERIFY_FOLD_SPLITS / LONG_SPLIT) at DRAFT_RULE_HEADS, else its
+    tokenspeed rule alone (the target's (rows, heads) keys were measured at another
+    q). The cores and DcpValue read LONG_SPLIT with the split this returns."""
+    if heads in DRAFT_RULE_HEADS:
+        return verify_fold_splits(rows, steps, heads, max_seq, device)
+    from tokenspeed_mla import mla_decode as md
+
+    # (verify_fold_splits without its Rubin tables)
+    tiles = md.compute_q_tile_layout(heads, steps, 128)[1]
+    sms = md.get_num_sm(device)
+    args = rows // steps, tiles, 128, 512, sms, max_seq, torch.float8_e4m3fn
+    args += ((128, 128),)
+    split = md._get_split_kv_and_workspace_size(*args, fill_splits(rows, device))[0]
+    return split, tiles * 128
+
+
 @cache
 def compile_query(
     rows,
@@ -271,9 +345,13 @@ class DraftDcp:
     interleave."""
 
     def __init__(
-        self, attentions, group, size, rank, rows, steps, max_context=None, interleave=1
-    ):
+        self, attentions, group, size, rank, rows, steps, max_context=None,
+        interleave=1, causal=False,
+    ):  # fmt: skip
         first = attentions[0]
+        # The drafter's attention mask, as stock resolves it from the drafter config
+        # (False: every draft row sees its request's whole context and draft block).
+        self.causal = bool(causal)
         self.heads = first.num_local_heads
         self.size, self.rank, self.steps = size, rank, steps
         self.device = first.W_UV.device
@@ -286,10 +364,13 @@ class DraftDcp:
         # Rows above the box (Rubin): the target's wide path (mla.prepared.choose) on
         # this box widened to the largest of them (DcpBox.widened, its own allocation):
         # MlaQuery publishes q under the validity contract without gathering it, the
-        # polled packed core (non-causal, validity Q TMA, tokenspeed's split; persistent
+        # polled packed core (the drafter's mask, validity Q TMA, its split; persistent
         # by core_q.wide_persistent) and DcpValue (fold when split > 1, spread merge).
-        wide = sms > GB300_SMS and size > 1
-        self.wide = tuple(r for r in rows if r > self.cap and r % steps == 0 and wide)
+        # Rows whose compiled DcpValue cannot be co-resident (mla.dcp.compile_value's
+        # check_residency) stay on the stock path. ``dropped``: rows -> why they stay
+        # on the stock path (logged per cause by runtime.draft).
+        self.dropped = uncovered_rows(rows, steps, self.cap, size, sms)
+        self.wide = tuple(r for r in rows if r > self.cap and r not in self.dropped)
         self.wide_box = self.box.widened(max(self.wide)) if self.wide else None
         # Constant gate rows: sigmoid(+inf) = 1 exactly (the drafter has no gate).
         width = self.heads * 128
@@ -323,6 +404,8 @@ class DraftDcp:
         # The cores compile once the cache (its page size) is bound (``bind``).
         self.folds, self.fold_values, self.fold_cores = {}, {}, set()
         self.max_seq = local_max(max_context or 1 << 17, size, interleave)
+        # Packed rows (tiles x 128) of the folded and wide rows (``draft_fold_splits``).
+        self.packed: dict[int, int] = {}
         self.scales = (
             first.scale * first._q_scale_float * first._k_scale_float,
             first._k_scale_float,
@@ -339,13 +422,14 @@ class DraftDcp:
             if r not in FAST_CORE:
                 self.valid.pop(r, None)
                 continue
-            split, packed = verify_fold_splits(
+            split, packed = draft_fold_splits(
                 r, steps, heads, self.max_seq, self.device
             )
             if split <= 1:
                 self.valid.pop(r, None)
                 continue
             self.folds[r] = split
+            self.packed[r] = packed
             self.fold_values[r] = compile_value(
                 self.heads, size, r, self.cap, uv, width, index, sms, steps, split,
                 lse_split=True, out_scale=self.scales[1], valid_box=r in self.valid,
@@ -362,7 +446,9 @@ class DraftDcp:
             if not padded or padded > self.cap or padded < r:
                 continue
             split = LSE_FOLD.get(padded, 8)
-            rule = LONG_SPLIT.get((padded, heads))  # (mla.dcp: length-keyed splits)
+            # (mla.dcp: length-keyed splits; a q = 1 rule: the same shape whichever
+            # role measured it)
+            rule = LONG_SPLIT.get((padded, heads))
             if rule and sms > GB300_SMS and split == rule[0]:
                 split = rule[1]
             valid = 0  # the fork's FORK_VALID mode (Rubin: DcpBox.qv exists)
@@ -375,7 +461,7 @@ class DraftDcp:
                 lse_split=True, out_scale=self.scales[1], valid_box=bool(valid),
             )  # fmt: skip
             split_workspace_ts(self.device, heads, padded, split)
-            meta = compile_rows(steps, padded, size, rank, interleave, False)
+            meta = compile_rows(steps, padded, size, rank, interleave, self.causal)
             self.row_modes[r] = (padded, split, value, meta)
             if r in self.fork_rows:  # per parity: the fork's q mailbox / x table
                 qbox = self.box.mailbox(bool(valid))
@@ -394,9 +480,10 @@ class DraftDcp:
         self.wide_flags: dict = {}  # (the core push's per-parity block ready flags)
         # Rows on the per-step work list (DRAFT_WLIST): rows -> mla.wlist.WorkList.
         self.wlists: dict = {}
+        kept = []
         for r in self.wide:
             reqs, cap = r // steps, self.wide_box.cap
-            split, packed = verify_fold_splits(
+            split, packed = draft_fold_splits(
                 r, steps, heads, self.max_seq, self.device
             )
             persistent = wide_persistent(reqs, packed // 128, split, sms)
@@ -406,11 +493,19 @@ class DraftDcp:
             push = None
             if r in DRAFT_CORE_PUSH and split == 1 and persistent and work is None:
                 push = DRAFT_CORE_PUSH[r]
-            value = compile_value(
-                self.heads, size, r, cap, uv, width, index, sms, steps, fold,
-                lse_split=fold > 0, out_scale=self.scales[1] if fold else 1.0,
-                valid_box=True, pushed=push is not None,
-            )  # fmt: skip
+            try:
+                value = compile_value(
+                    self.heads, size, r, cap, uv, width, index, sms, steps, fold,
+                    lse_split=fold > 0, out_scale=self.scales[1] if fold else 1.0,
+                    valid_box=True, pushed=push is not None,
+                )  # fmt: skip
+            except RuntimeError as error:  # (check_residency: not co-resident)
+                if "co-resident" not in str(error):
+                    raise
+                self.dropped[r] = "DcpValue grid not co-resident"
+                continue
+            kept.append(r)
+            self.packed[r] = packed
             if fold:
                 split_workspace_ts(self.device, packed, reqs, split)
             qbox = self.wide_box.mailbox(True)
@@ -429,14 +524,27 @@ class DraftDcp:
                     tables = [work.table(t) for t in tables]
                     self.wlists[r] = work
             self.wide_cores[r] = (split, persistent, value, tables, push)
+        self.wide = tuple(kept)
         # The context step's KV, when the caller runs it on a side stream: the event
         # the first layer's attention waits for before any core (``join_context``).
         self.context_ready = None
         # Folded rows whose core polls its q rows (POLLED_CORE): per parity, the core's
-        # table of the q mailbox.
+        # table of the q mailbox. Also the gathered fold rows where a LONG_SPLIT rule
+        # launches its long split (``long_polled``: the gathered fold core has no long
+        # partition, the polled one has; at gathered heads outside DRAFT_RULE_HEADS
+        # only where tokenspeed's own split equals a rule's long split).
+        self.long_polled = {
+            r
+            for r, split in self.folds.items()
+            if not POLLED_CORE.get(r)
+            and r not in self.row_modes
+            and r not in self.forks
+            and long_split(r, heads, split, sms)
+        }
         self.polled = {}
         for r in self.folds:
-            if POLLED_CORE.get(r) and r not in self.row_modes:
+            polled = POLLED_CORE.get(r) or r in self.long_polled
+            if polled and r not in self.row_modes:
                 reqs = r // steps
                 qbox = self.box.mailbox(r in self.valid)
                 tables = [verify_table(qbox[p], reqs, self.device) for p in (0, 1)]
@@ -506,6 +614,7 @@ class DraftDcp:
         long = long_split(rows, heads, split, sms)
         if rows not in DRAFT_WLIST or long is None:
             return None
+        # (None past mla.wlist.fits: the long split without the list)
         return shared_list(
             rows // self.steps, tiles, split, long, sms // 2, self.device
         )
@@ -532,7 +641,8 @@ class DraftDcp:
             if (rows, page) in self.fold_cores:
                 continue
             reqs, index = rows // self.steps, self.device.index
-            args = heads, page, split, reqs, self.steps, self.cp(), index, False
+            args = heads, page, split, reqs, self.steps, self.cp(), index
+            args += (self.causal,)
             if rows in self.polled:
                 wl = rows in self.wlists
                 valid = self.valid.get(rows, 0)
@@ -543,7 +653,8 @@ class DraftDcp:
         for rows, (split, persistent, _, _, push) in self.wide_cores.items():
             if ("wide", rows, page) not in self.fold_cores:
                 reqs, index = rows // self.steps, self.device.index
-                args = heads, page, split, reqs, self.steps, self.cp(), index, False
+                args = heads, page, split, reqs, self.steps, self.cp(), index
+                args += (self.causal,)
                 wl = rows in self.wlists
                 compile_polled_q(
                     *args, valid=2, persistent=persistent, push=push, wlist=wl
@@ -626,6 +737,7 @@ class DraftLayerDcp:
         decode = getattr(metadata, "decode", None)
         if (
             decode is None
+            or bool(getattr(metadata, "causal", True)) != shared.causal
             or metadata.num_decode_tokens != rows
             or metadata.num_prefills
             or decode.seq_lens.shape[0] * shared.steps != rows
@@ -729,13 +841,13 @@ class DraftLayerDcp:
                 work.build(tables[1])
             polled_partials_q(
                 query, cache, *tables, shared.scales, out, lse, split, shared.cp(),
-                shared.polled[rows][p], causal=False, valid=valid,
+                shared.polled[rows][p], causal=shared.causal, valid=valid,
                 persistent=work is not None, wlist=work is not None,
             )  # fmt: skip
         else:
             split_partials_q(
                 query, cache, *tables, shared.scales, out, lse, split, shared.cp(),
-                False,
+                shared.causal,
             )  # fmt: skip
         return True
 
@@ -767,13 +879,11 @@ class DraftLayerDcp:
             work.build(meta[1])
         polled_partials_q(
             query, cache, *meta, shared.scales, out_rows, lse, split, shared.cp(),
-            tables[p], causal=False, valid=2, persistent=persistent, push=push,
+            tables[p], causal=shared.causal, valid=2, persistent=persistent, push=push,
             wlist=work is not None,
         )  # fmt: skip
         if split > 1:  # DcpValue folds the split partials
-            _, packed = verify_fold_splits(
-                rows, steps, heads, shared.max_seq, shared.device
-            )
+            packed = shared.packed[rows]
             _, part, stats = split_workspace_ts(shared.device, packed, reqs, split)
             rows_in = to_cute(part), to_cute(stats, 4)
         else:
@@ -874,10 +984,7 @@ class DraftLayerDcp:
             self.wide_merge(attention, metadata, rows, out)
             return
         if self.fold_core(attention, metadata, rows):
-            heads = shared.size * shared.heads
-            _, packed = verify_fold_splits(
-                rows, shared.steps, heads, shared.max_seq, shared.device
-            )
+            packed = shared.packed[rows]
             split = shared.folds[rows]
             _, part, stats = split_workspace_ts(
                 shared.device, packed, rows // shared.steps, split
@@ -930,6 +1037,7 @@ class DraftLayerDcp:
             not torch.cuda.is_current_stream_capturing()
             or rows not in shared.gathers
             or decode is None
+            or bool(getattr(metadata, "causal", True)) != shared.causal
             or mqa_q.dtype != torch.float8_e4m3fn
             or not mqa_q.is_contiguous()
             or out.shape != (rows, shared.heads * 128)

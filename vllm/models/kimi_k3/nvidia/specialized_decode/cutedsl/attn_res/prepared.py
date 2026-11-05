@@ -48,7 +48,9 @@ RUBIN_VOTE_REGISTERS = {6: 80}
 # delta landed. Per token the same arithmetic, sums and roundings: bitwise. 16 ranks
 # (axhb-sw3, mirrored, 93 layers, 32k), us/step: B28 (224 rows) -138, B32 -165; the
 # AttnRes after the up projection 7.7 -> 5.9 us at B32 (nsys). On one GPU it is equal
-# or slower (the second wave there costs ~1 us), and at 129-192 rows ~0.
+# or slower (the second wave there costs ~1 us), and at 129-192 rows ~0. Above 256
+# rows one token per cluster (several waves, correct at any rows). NQ-TUNE: 16 ranks,
+# 2 / 3 / 4 tokens per cluster at 384-2048 rows (ceil(rows / 181)).
 ROWS_TOKENS: dict = {"*": "193-256:2"}
 
 
@@ -281,7 +283,14 @@ SHARDED: dict = {"*": ""}
 # growing with depth (sol4 section 51). Up to 256 rows it wins (1 GPU, cold HBM, comm3
 # arbench.py: M64-128 by 0.7-2.5 us per call at every block count, M256 at four
 # blocks or more), except M192 at six or more blocks (a second wave: +0.9-1.3 us).
-STOCK_ROWS: dict = {"*": "257-512:1"}
+# Empty (axhb2, hb192): above 256 rows the sites after a wide MoE tail are its ring
+# consumer (ClusterAttnRes) anyway, so the stock op served only the head / dense / final
+# sites there (and, before runtime.decode skipped pre-consumed sites, ran a second time
+# on the ring consumer's output). ClusterAttnRes serves any rows: its clusters poll only
+# rows earlier kernels publish (the tail's output ring, the fused o-projection's
+# gather), so later waves never block a producer. NQ-TUNE: 16 ranks, "257-:1" vs empty
+# at 384 / 512 / 1024 / 2048 rows (the head / dense / final sites only, us/step).
+STOCK_ROWS: dict = {"*": ""}
 
 
 def choose(shape, ctx):

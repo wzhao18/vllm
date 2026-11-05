@@ -1,0 +1,23 @@
+# nq step A/B, block 1 (12 nodes, 3:30 h): new precision (fp8 MLA KV, FP32 KDA state, mxfp4 index keys, BF16 linears,
+# mxfp8 MoE activations), production decode env/args per point (cfg2bench.py), AgentX contexts unless noted.
+# <slot> <point> <drafter> <rows (B*q)> <order> <ctx> [extra bench args; @R = slot results dir]   |   <slot> gputest
+# Slots run their lines in order; a run that cannot finish before the block's end (10 min margin) is skipped
+# (nq_ab.sh NQ_RUN_EST) and listed under SKIPPED. A line whose rows straddle the point's production limit (c256 512,
+# c64 / c48-2p1d / c1 / c8 256) runs as two processes per arm (rows <= limit under the production max-num-seqs /
+# capture cap; rows above it raised: XCAP). Budget: ~25 min per process (6-9 min startup incl. prepare of every
+# captured row, 15-40 s per case; NQ-TUNE), (210 - 10 margin - 5 setup) min -> at most 7 processes per slot; plans
+# use 6 for A / B so a slow first build (extension + CuTe compile under one lock) does not cut a pair.
+#
+# slot A: q4 (K=3) high-throughput profile = c256 (c160 has the identical decode role)
+A c256 new 8,16,32,64,128,192,256,384,512,768,1024 ls,stock agentx
+A c256 old 8,16,32,64,128,192,256,384,512 ls,stock agentx
+# slot B: q8 (K=7) high profile = c64 (c48-1p1d has the identical decode role)
+B c64 new 8,16,32,64,128,256,512,1024 ls,stock agentx
+B c64 old 8,16,32,64,128,256 ls,stock agentx
+# slot C: first the GPU correctness stage (node 1: 4-GPU pytest + torchrun on the new / existing specialized decode GPU
+# tests; node 2: tests/distributed at 2 GPUs; at most 75 min), then the low / mid profiles inside their production
+# caps (c1 DSA core + no DCP exchange, c8 DSA core + DCP exchange, c48-2p1d wide DSA / mns 64), ~15 min a process
+C gputest
+C c1 new 8,16,32,64,128,256 ls,stock agentx
+C c48-2p1d new 8,16,32,64,128,192,256 ls,stock agentx
+C c8 new 8,16,32,64,128,256 ls,stock agentx

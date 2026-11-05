@@ -70,6 +70,7 @@ from ..common.primitives import (
 )
 from ..common.twoshot import TwoShot, push, reduce
 from ..oproj.prepared import OprojMailbox
+from .experts_wide import WIDE_MAX
 
 H, LATENT = 7168, 3584
 
@@ -90,8 +91,12 @@ def latent_chunk(rows, grid=112):
 # with the experts' last rows instead of after the experts' grid. Same words, same
 # slots, same reduction order: bitwise. 129-256 rows (axhb, 16 ranks, 93 layers, 32k,
 # interpolated unions, us/step vs the same overlay without them): B17 (136 rows) -85,
-# B24 -195, B28 -133, B32 -173.
-EXPERTS_PUSH = {16: "65-256:1"}
+# B24 -195, B28 -133, B32 -173. 257-512 rows (axhb2 sx1, DL3 mix, mns 192, 16 ranks, 93
+# layers, same-node A, us/step): B96 (384 rows) -371, B128 (512) -467, B64 bitwise.
+# Open-ended, but only rows the experts serve in one launch (``experts_wide.WIDE_MAX``:
+# a token's receive slot is its row in the launch) push; rows above run chunked
+# launches into the local partial, which LatentRows reduce-scatters itself.
+EXPERTS_PUSH = {16: "65-:1"}
 
 
 # The up projection [M, 3584] x [448, 3584]^T in FP32: "cublas" (torch.mm) or a
@@ -116,8 +121,11 @@ UP_ROWS = {16: "65-80:1,129-256:1"}
 # tail call (max over ranks, two passes, outputs bitwise): wait -> polled M96 12.37 ->
 # 12.66, M128 12.52 -> 13.27, M160 13.60 -> 14.02, M192 14.67 -> 14.64, M224 15.34 ->
 # 14.87, M256 16.45 -> 15.59 (the early CTAs, one per row, contend with LatentRows'
-# owner reduce up to ~192 rows).
-NORM_POLLED = {16: "193-512:1"}
+# owner reduce up to ~192 rows). Open-ended: NormRows' CTAs (one per row, any number of
+# waves) poll only rows earlier kernels publish (LatentRows' gather, PushShared's RS
+# slots; both run fixed resident grids that wait on nothing NormRows holds), so a
+# later wave never blocks a producer.
+NORM_POLLED = {16: "193-:1"}
 
 
 def norm_polled(tp, rows):
@@ -457,7 +465,11 @@ class PreparedTailRows:
         # kept where EXPERTS_PUSH lists them; their LatentRows only reduces and the
         # experts take ``experts_box``.
         table = batch_table(EXPERTS_PUSH.get(tp, ""))
-        self.experts_push = {b for b in experts_push if table.get(b) and b in batches}
+        self.experts_push = {
+            b
+            for b in experts_push
+            if table.get(b) and b in batches and b <= WIDE_MAX  # (one launch)
+        }
         self.codes = {
             b: tuple(
                 compile_rows(

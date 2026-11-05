@@ -1,0 +1,13 @@
+# nq step A/B, block 2 (12 nodes, 3:30 h): the main lines again in the opposite arm order (block 1 + this = ABBA over
+# two node sets), per-kernel profiles at the rows that block 1 flags (edit the rows before staging: worst ls/stock
+# first, rows <= the production limit), and the old drafter at c1. Budget as block1.plan (6 processes in A / B; slot C
+# runs short ~15 min processes, its last line is the first to be skipped).
+# <slot> <point> <drafter> <rows (B*q)> <order> <ctx> [extra bench args; @R = slot results dir]
+A c256 new 8,16,32,64,128,192,256,384,512,768,1024 stock,ls agentx
+A c256 new 64,256,512 ls,stock agentx --profile-dir @R/prof --iters 5 --samples 2
+B c64 new 8,16,32,64,128,256,512,1024 stock,ls agentx
+B c64 new 8,64,256 ls,stock agentx --profile-dir @R/prof --iters 5 --samples 2
+C c1 new 8,16,32,64,128,256 stock,ls agentx
+C c48-2p1d new 8,16,32,64,128,192,256 stock,ls agentx
+C c8 new 8,16,32,64,128,256 stock,ls agentx
+C c1 old 8,16,32,64,128,256 ls,stock agentx

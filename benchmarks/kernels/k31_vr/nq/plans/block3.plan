@@ -1,0 +1,11 @@
+# nq step A/B, block 3 (12 nodes, 3:30 h): the target / drafter split (--exclude-drafter), uniform 192K and mixed
+# 3K / 150K contexts, and the remaining old-drafter points. Budget as block1.plan.
+# <slot> <point> <drafter> <rows (B*q)> <order> <ctx> [extra bench args; @R = slot results dir]
+A c256 new 8,32,128,256,512,768,1024 ls,stock agentx --exclude-drafter
+A c256 new 64,256,512 ls,stock u192k
+B c64 new 8,32,128,256,512,1024 ls,stock agentx --exclude-drafter
+B c64 new 64,256 ls,stock u192k
+C c256 new 64,256 ls,stock mix
+C c64 new 64,256 ls,stock mix
+C c8 old 8,16,32,64,128,256 ls,stock agentx
+C c48-2p1d old 8,16,32,64,128,192,256 ls,stock agentx

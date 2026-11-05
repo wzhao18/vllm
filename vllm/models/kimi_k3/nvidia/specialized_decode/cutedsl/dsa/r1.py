@@ -2,31 +2,44 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """PreparedDsa on the round-1 runtime (runtime/providers.py, a cap-128 overlay file
 that stays as is): its DSA DcpBox (mla.dcp: one q mailbox and one BF16 partials
-mailbox), with #108's "proj" partials in a DcpMailbox beside it where
-VLLM_K31_DSA_PARTIALS asks for them, and its shared scratch, whose last item is the
-BF16 latent of the removed CuTe sparse core instead of FlashInfer's buffers."""
+mailbox), with #108's "proj" partials in a DcpMailbox beside it on the rows
+``AUTO_PARTIALS`` gives them, and its shared scratch, whose last item is the BF16
+latent of the removed CuTe sparse core instead of FlashInfer's buffers."""
 
-import os
 from functools import cache
 
 import torch
 
 from ..common.host import to_cute
 from ..common.policy import batch_table
-from .dcp_value import FORMATS, PROJECTED, DcpMailbox, gather_heads
+from .dcp_value import DSA_PARTIALS, FORMATS, PROJECTED, DcpMailbox, gather_heads
 
-# The DSA layers' DcpValue partials per batch of rows (partials_for): "bf16" (MR !8's
-# BF16 latent mailbox; the default), "proj" (#108's value rows through W_UV, 4x fewer
-# NVLink bytes for a gathered W_UV per layer) or a batch table of both, e.g.
-# "1-64:bf16,65-512:proj". Read when the providers are built.
-PARTIALS_ENV = "VLLM_K31_DSA_PARTIALS"
+# The DSA layers' DcpValue partials per batch of rows (partials_for), chosen in code
+# per shape and backend: "bf16" (MR !8's BF16 latent mailbox) or "proj" (#108's value
+# rows through W_UV, 4x fewer NVLink bytes for a gathered W_UV per layer). Both round
+# the partials to BF16 once (the merge is linear: only the rounding point moves, as an
+# order change). On FLASHINFER_MLA_SPARSE (per-tensor FP8: the only backend "proj"
+# serves) the one automatic policy, dcp_value.DSA_PARTIALS (PARTIALS_DEFAULT["dsa"]):
+# rows 1-16 keep BF16 (the DSA sparse core, dsa_kernels.dsa_core, pushes BF16
+# partials there, and "proj" ties BF16 at few rows) and every row from 17 on exchanges
+# "proj", open-ended ("proj"'s merging CTAs stride the row tiles over at most one
+# wave, ``dcp_value.DcpValue``, so it serves any rows). "proj" numerics are what
+# production already ran: the serving configs set VLLM_K31_DSA_PARTIALS "proj"
+# (C48-C256) and "1-16:bf16,17-512:proj" (C1 / C8). FlashMLA sparse (fp8_ds_mla):
+# "bf16" at every row (its DcpValue strides its row tiles above one wave too:
+# ``mla.dcp.DcpValue.tile_stride``).
+# NQ-TUNE: the bf16 / proj crossover at DCP16 on VR200 (16 ranks, fp8 KV, q4 / q8,
+# rows 8-64; DCP8 GB300 put it at 160 rows), and proj vs bf16 at 1-16 rows with the
+# sparse core off.
+AUTO_PARTIALS = DSA_PARTIALS
 
 
-def dsa_partials(spec=None):
-    """The checked partials policy ``spec`` (None: VLLM_K31_DSA_PARTIALS, unset or
-    empty "bf16"): "bf16", "proj" or a batch table of them."""
+def dsa_partials(spec=None, fp8=False):
+    """The checked partials policy ``spec`` (None: the automatic one, AUTO_PARTIALS on
+    FLASHINFER_MLA_SPARSE (``fp8``), else "bf16"): "bf16", "proj" or a batch table of
+    them."""
     if spec is None:
-        spec = os.environ.get(PARTIALS_ENV) or "bf16"
+        spec = AUTO_PARTIALS if fp8 else "bf16"
     if spec in FORMATS:
         return spec
     try:
@@ -35,8 +48,8 @@ def dsa_partials(spec=None):
         table = {}
     if not table or any(fmt not in FORMATS for fmt in table.values()):
         raise ValueError(
-            f"{PARTIALS_ENV}={spec!r}: expected bf16, proj or a batch table of them "
-            "(e.g. 1-64:bf16,65-512:proj)"
+            f"DSA DcpValue partials {spec!r}: expected bf16, proj or a batch table of "
+            "them (e.g. 1-16:bf16,17-:proj)"
         )
     return spec
 
@@ -59,20 +72,21 @@ def projected_mailbox(box):
 class DsaBox:
     """``box`` (mla.dcp.DcpBox) as PreparedDsa and WideDsa read a DcpBox, for the
     ``batches`` it serves (default: every row up to its cap) under the ``partials``
-    policy (dsa_partials; None: VLLM_K31_DSA_PARTIALS). ``mailbox(batch)`` of a
+    policy (dsa_partials; None: the automatic one of the backend, ``fp8``: FlashInfer
+    sparse's per-tensor FP8). ``mailbox(batch)`` of a
     "bf16" batch is the box itself: MR !8's BF16 latent partials [2, DCP, CAP, H, 512]
     and LSE [2, DCP, CAP, H] (the same shapes and sentinels) and their peers'
-    addresses; of a "proj" batch the box's projected_mailbox."""
+    addresses; of a "proj" batch the box's projected_mailbox. A box created without
+    the BF16 mailboxes (``DcpBox(partials=False)``: WideDsa's widened box) gets them
+    (collectively) only when a served batch is "bf16"."""
 
     format = "bf16"
 
-    def __init__(self, box, batches=None, partials=None):
+    def __init__(self, box, batches=None, partials=None, fp8=False):
         self.box = box
         self.size, self.rank, self.cap = box.size, box.rank, box.cap
         self.q, self.q_heads = box.q, box.q_heads
-        self.partial, self.lse = box.partial, box.lse
-        self.peers, self.lse_peers = box.peers, box.lse_peers
-        self.partials = spec = dsa_partials(partials)
+        self.partials = spec = dsa_partials(partials, fp8)
         rows = range(1, self.cap + 1)
         # partials_for at every row, the table parsed once
         table = {} if spec in FORMATS else batch_table(spec)
@@ -80,13 +94,19 @@ class DsaBox:
         self.formats = {b: table.get(b, default) for b in rows}
         served = sorted(batches) if batches else rows
         assert served[-1] <= self.cap, (served[-1], self.cap)
+        if box.partial is None and any(self.formats[b] == self.format for b in served):
+            box.add_partials()  # (collective: every rank serves the same batches)
+        self.partial, self.lse = box.partial, box.lse
+        self.peers, self.lse_peers = box.peers, box.lse_peers
         self.mailboxes = {self.format: self}
         if any(self.formats[b] == PROJECTED for b in served):
             self.mailboxes[PROJECTED] = projected_mailbox(box)
 
     def mailbox(self, batch):
         assert batch <= self.cap, (batch, self.cap)
-        return self.mailboxes[self.formats[batch]]
+        fmt = self.formats[batch]
+        assert fmt != self.format or self.partial is not None, (batch, fmt)
+        return self.mailboxes[fmt]
 
     @property
     def projected(self):

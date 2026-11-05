@@ -28,8 +28,16 @@ import triton.language as tl
 from ..common.policy import batch_table
 
 # Packed verify rows whose core runs the work list where mla.dcp.LONG_SPLIT launches its
-# long split (persistent). Rubin, DCP16.
-WLIST = batch_table("24:1,32:1,40:1,48:1,56:1,64:1,68-256:1")  # (68: DL3 B17)
+# long split (persistent). Rubin, DCP16. (68: DL3 B17; 260-768: DL3 B65-B192, hb192;
+# open-ended past them with LONG_SPLIT's open rows, where the list ``fits``: other
+# shapes run the static order, the same items and partials.)
+WLIST = batch_table("24:1,32:1,40:1,48:1,56:1,64:1,68-:1")
+
+# The list word's fields: q tile (bits 0-7), request (bits 8-15), split (bits 16-30;
+# ``core_ts.ts_item`` decodes them); the sort key packs the slot in 12 bits.
+WORD_REQUESTS = 1 << 8
+WORD_TILES = 1 << 8
+MAX_SLOTS = 4096
 
 # The empty item: split 0x7FFF of request 0 (no K tiles in any partition).
 WLIST_EMPTY = 0x7FFF << 16
@@ -107,8 +115,18 @@ def _wlist_kernel(
 _LISTS: dict = {}
 
 
+def fits(reqs, tiles, split):
+    """Whether a shape's items pack into the list's words and sort keys: at most 256
+    requests (DL3 q4 1024 rows, q8 2048) and 256 q tiles, at most MAX_SLOTS items."""
+    small = reqs <= WORD_REQUESTS and tiles <= WORD_TILES
+    return small and tiles * reqs * split <= MAX_SLOTS
+
+
 def shared_list(reqs, tiles, split, long, pairs, device):
-    """The WorkList of this shape, one per device and shape for every layer."""
+    """The WorkList of this shape, one per device and shape for every layer; None where
+    its items do not ``fit`` the list (the caller's core runs the static order)."""
+    if not fits(reqs, tiles, split):
+        return None
     key = reqs, tiles, split, long, pairs, device
     if key not in _LISTS:
         _LISTS[key] = WorkList(reqs, tiles, split, long, pairs, device)
@@ -123,7 +141,7 @@ class WorkList:
 
     def __init__(self, reqs, tiles, split, long, pairs, device):
         self.slots = tiles * reqs * split
-        assert self.slots <= 4096, "the work list packs slots in 12 bits"
+        assert fits(reqs, tiles, split), (reqs, tiles, split)  # (``shared_list``)
         self.block = triton.next_power_of_2(self.slots)
         self.shape = dict(
             NT=tiles,

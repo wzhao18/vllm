@@ -30,7 +30,9 @@ from cutlass.cute.runtime import make_fake_stream
 from ..common.host import architecture, fake
 from ..common.primitives import launch, load_words, multicast_words, store_relaxed
 
-MAX_ROWS = 512  # logits rows per launch (the widest verify graph)
+# Logits rows per launch (the mailbox's row slots); ``PreparedExchange.run`` covers
+# more rows in launches of at most MAX_ROWS (as ``argmax``'s wide rows).
+MAX_ROWS = 512
 
 
 def box_words(tp, words):
@@ -144,10 +146,12 @@ class PreparedExchange:
 
     def run(self, entries, gathered=None):
         """``entries`` [rows, words] u32 (no zero word). Returns every rank's entries
-        [rows, tp, words] u32 (rank order)."""
+        [rows, tp, words] u32 (rank order). More than MAX_ROWS rows: launches of at
+        most MAX_ROWS rows in row order (each advances its row slots' parities, as
+        consecutive steps do; every rank runs the same launches), the same words."""
         rows = entries.shape[0]
         if (
-            not 0 < rows <= MAX_ROWS
+            rows <= 0
             or entries.shape[1] != self.words
             or entries.dtype != torch.uint32
             or not entries.is_contiguous()
@@ -157,6 +161,13 @@ class PreparedExchange:
             gathered = torch.empty(
                 (rows, self.tp, self.words), dtype=torch.uint32, device=entries.device
             )
+        for start in range(0, rows, MAX_ROWS):
+            end = min(start + MAX_ROWS, rows)
+            self.launch(entries[start:end], gathered[start:end])
+        return gathered
+
+    def launch(self, entries, gathered):
+        """One launch: ``entries`` [rows <= MAX_ROWS, words] into ``gathered``."""
         box = self.box
         self.kernel(
             entries,
@@ -166,4 +177,3 @@ class PreparedExchange:
             box.mc,
             self.rank,
         )
-        return gathered

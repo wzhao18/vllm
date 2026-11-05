@@ -63,6 +63,7 @@ from .dcp import (
     local_max,
     long_split,
     lse_fold_splits,
+    reserve_split_workspace,
     rubin_decode,
     split_partials,
     split_partials_q,
@@ -430,6 +431,10 @@ class PreparedMla:
 
     def prepare_cache(self, kv):
         specs = tuple(layout(w) for w in (*self.weights, kv.view(torch.uint8)))
+        # Shapes whose DcpValue reads split_workspace_ts: their arguments are prepared
+        # again after every shape has sized the shared (heads, split) buffer, so they
+        # keep the final buffer's address (mla.dcp.split_workspace_ts).
+        folded = []
         for batch, q in self.cores:
             device = self.device.index
             dcp = self.dcp.size if self.dcp is not None else 0
@@ -602,7 +607,9 @@ class PreparedMla:
                     **extra,
                 )
             if self.dcp is not None:
-                self.prepare_dcp(batch, fold, psplit, q)
+                self.prepare_dcp(batch, fold, psplit, q, keep=False)
+                if self.ts_folded(batch, q):
+                    folded.append((batch, fold, psplit, q))
             # compile before graph capture (DcpCore is compiled; its q poll needs a
             # published q, so it is not run here)
             if q == 1 and batch in self.ts_fork:  # compiled only (its q poll needs a
@@ -612,7 +619,7 @@ class PreparedMla:
                 options += (batch in self.ts_cluster, self.ts_valid.get(batch, 0))
                 options += (FORK_VALID_DELAY.get(batch, 0),)
                 compile_fork(heads, kv.shape[1], fold, batch, device, *options)
-                split_workspace_ts(self.device, heads, batch, fold)
+                reserve_split_workspace(self.device, heads, batch, fold)
             elif (batch, q) in self.verify_poll:  # compiled only (as the fork)
                 heads, reqs = self.dcp.size * self.heads, batch // q
                 where = (self.dcp.size, self.dcp.rank, self.dcp.interleave)
@@ -635,12 +642,18 @@ class PreparedMla:
                         persistent=persistent, push=self.verify_push.get((batch, q)),
                     )  # fmt: skip
                 rows = verify_fold_splits(batch, q, heads, self.max_seq, self.device)[1]
-                split_workspace_ts(self.device, rows, reqs, fold)
+                reserve_split_workspace(self.device, rows, reqs, fold)
             elif kv.is_cuda and not policy:
                 table = torch.zeros(batch, 1, dtype=torch.int32, device=kv.device)
                 ones = torch.full((batch,), q, dtype=torch.int32, device=kv.device)
                 self.stock_core(kv, table, ones, batch, q, ones)
+        for args in folded:  # (the shared buffers at their final size)
+            self.prepare_dcp(*args)
         return self
+
+    def ts_folded(self, batch, q):
+        """Whether the (batch, q) shape's DcpValue LSE-folds split_workspace_ts."""
+        return (q == 1 and batch in self.lse_fold) or (batch, q) in self.verify_fold
 
     def box_for(self, batch):
         """The DCP mailboxes of a batch: the model's box, or above its rows the box set
@@ -649,12 +662,14 @@ class PreparedMla:
             return self.dcp
         return self.dcp.widened(max(self.pitches))
 
-    def prepare_dcp(self, batch, fold=0, psplit=False, q=1):
+    def prepare_dcp(self, batch, fold=0, psplit=False, q=1, keep=True):
         """(MlaQuery's publish arguments, DcpValue's mailbox arguments, parity and
         rank) of one (batch, q) shape; ``fold``: DcpCore's split partials replace the
         rows; ``psplit``: DcpValue polls them (this parity's armed workspace). Keyed by
         (batch, q): a verify shape of B1 x q 8 has the rows of the q = 1 batch 8, whose
-        DcpValue may LSE-fold tokenspeed's split partials (``lse_fold``) instead."""
+        DcpValue may LSE-fold tokenspeed's split partials (``lse_fold``) instead.
+        ``keep``: these arguments keep split_workspace_ts's address (False: prepared
+        again once every shape has sized the shared buffer, ``prepare_cache``)."""
         box, p = self.box_for(batch), self.parity
         valid = self.valid_box(batch, q)  # DcpBox.qv: validity-polled readers
         mailbox = to_cute(box.mailbox(valid)[p])
@@ -662,12 +677,16 @@ class PreparedMla:
         rows = to_cute(box.rows[:batch]), to_cute(box.rows_lse[:batch], 4)
         if q == 1 and batch in self.lse_fold:  # tokenspeed's split partials, LSEs
             heads = box.size * self.heads
-            _, part, stats = split_workspace_ts(self.device, heads, batch, fold)
+            _, part, stats = split_workspace_ts(
+                self.device, heads, batch, fold, keep=keep
+            )
             rows = to_cute(part), to_cute(stats, 4)
         elif (batch, q) in self.verify_fold:  # the packed verify core's partials
             heads = box.size * self.heads
             _, packed = verify_fold_splits(batch, q, heads, self.max_seq, self.device)
-            _, part, stats = split_workspace_ts(self.device, packed, batch // q, fold)
+            _, part, stats = split_workspace_ts(
+                self.device, packed, batch // q, fold, keep=keep
+            )
             rows = to_cute(part), to_cute(stats, 4)
         elif fold and psplit:
             heads = box.size * self.heads

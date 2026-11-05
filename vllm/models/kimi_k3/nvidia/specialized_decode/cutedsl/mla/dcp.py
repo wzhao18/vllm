@@ -23,7 +23,9 @@ import torch.distributed._symmetric_memory as symm_mem
 from cutlass import BFloat16, Float32, Int32, Int64, Uint32
 from cutlass.cute.runtime import make_fake_stream
 
-from ..common.host import fake
+from vllm.logger import init_logger
+
+from ..common.host import check_residency, fake
 from ..common.policy import batch_table
 from ..common.primitives import (
     alloc,
@@ -51,6 +53,8 @@ from ..common.primitives import (
     zeros,
 )
 from .qvalid import ARMED
+
+logger = init_logger(__name__)
 
 # Rubin-class devices (more SMs than GB300's 152): DcpValue push CTAs per head and
 # 16-request tile (more peer-store issue; GB300 keeps >= 4 16 B chunks per thread), and
@@ -165,6 +169,68 @@ LONG_SPLIT.update({(r, 64): (1, 8, 64, 48) for r in range(119, 225, 7)})
 LONG_SPLIT.update(
     {(r, 64): (1, 8, 64) for r in range(99, 193, 3) if (r, 64) not in LONG_SPLIT}
 )
+# hb192 (DL3 max-num-seqs 192): DL3's verify rows 260-768 (q4, B65-B192) and drafter
+# rows 195-576 (q3, 64 heads) had no rule: tokenspeed's split 1, persistent, so the
+# longest request's whole KV on one CTA pair set the makespan (AgentX contexts reach
+# ~840k). Rule (1, 4, 64, 128) + the work list (WLIST, DRAFT_WLIST): a request past 64
+# local tiles takes min(4, ceil(tiles / 128)) splits. 1 GPU, the core alone, AgentX D
+# mixes (mean 188k), us per layer, today -> this: verify B96 300.7 -> 168.9, B128 338.6
+# -> 219.2, B192 435.3 -> 324.6; drafter B96 260.7 -> 113.8, B128 286.5 -> 157.5,
+# B192 338.2 -> 219.9.
+# Split 1 on the work list (no long splits) stays bound by the longest item (B96 259.5,
+# B192 359.3); (1, 2, 64, 128) is within 2% of this at B96-B192.
+LONG_SPLIT.update({(r, 96): (1, 4, 64, 128) for r in range(260, 769, 4)})
+# B129-B192 (516-768 rows): 2 long splits (fewer FP32 partials for DcpValue's fold).
+# 1 GPU, us per layer, (1, 4, 64, 128) -> this: mix192 324.6 -> 319.6, two i.i.d.
+# AgentX draws at B192 311.9 / 329.4 -> 305.8 / 323.6, mix160 271.5 -> 265.9; at
+# B96-B128 within +-2% either way (B48-B64: +12..+25%, so not below B129).
+LONG_SPLIT.update({(r, 96): (1, 2, 64, 128) for r in range(516, 769, 4)})
+LONG_SPLIT.update(
+    {(r, 64): (1, 4, 64, 128) for r in range(195, 577, 3) if (r, 64) not in LONG_SPLIT}
+)
+
+
+class OpenRules(dict):
+    """LONG_SPLIT: the measured (rows, gathered heads) rules, and past the largest
+    measured rows of a head count (``OPEN``: (last rows, row step, rule)) that count's
+    last rule at every row on its step (the verify rows of every q the step divides).
+    Lookups (``get``, ``[]``, ``in``) see the open rows; iteration does not."""
+
+    def _open(self, key):
+        if not (isinstance(key, tuple) and len(key) == 2 and key[1] in LONG_OPEN):
+            return None
+        rows, heads = key
+        last, step, rule = LONG_OPEN[heads]
+        return rule if rows > last and rows % step == 0 else None
+
+    def __missing__(self, key):
+        rule = self._open(key)
+        if rule is None:
+            raise KeyError(key)
+        return rule
+
+    def __contains__(self, key):
+        return super().__contains__(key) or self._open(key) is not None
+
+    def get(self, key, default=None):
+        if super().__contains__(key):
+            return super().__getitem__(key)
+        rule = self._open(key)
+        return default if rule is None else rule
+
+
+# Rows past the measured ones (any captured verify row, unbounded): the largest measured
+# rows' rule, per gathered head count (last measured rows, row step, rule): the K3
+# target's (and the 96-head drafter's) q4 / q8 rows past 768, the 64-head drafter's q3
+# rows past 576. The rule's partition (``long_per``) is exact at any rows; the core
+# runs the work list where it fits (``mla.wlist.fits``), else the static order with the
+# same partials. The open rows' FP32 split partials share one split_workspace_ts
+# buffer per (heads, split), sized for the largest captured shape (e.g. q4 512
+# requests x 384 packed rows x split 2: ~0.8 GB), not one per shape. NQ-TUNE: per-layer
+# core time at 1024 / 1536 / 2048 rows (AgentX mixes, 1 GPU) of (1, 2, 64, 128) vs
+# (1, 4, 64, 128) vs no rule, and that workspace against the KV cache it displaces.
+LONG_OPEN = {96: (768, 4, (1, 2, 64, 128)), 64: (576, 3, (1, 4, 64, 128))}
+LONG_SPLIT = OpenRules(LONG_SPLIT)
 
 
 def long_split(rows, heads, split, sms):
@@ -526,7 +592,9 @@ class DcpBox:
     re-armed by their reader): q [2, CAP, DCP*H, 576] FP8 bytes (multicast stores),
     partials [2, DCP, CAP, H, 512] BF16 and LSE [2, DCP, CAP, H] FP32 (peer stores),
     and the local tokenspeed rows / LSE. Parity alternates by layer. ``interleave``:
-    the KV cache's DCP interleave (global masking of spec verify rows)."""
+    the KV cache's DCP interleave (global masking of spec verify rows). ``partials``
+    False: no BF16 partial / LSE mailboxes and no local rows (a DSA widened box whose
+    batches all exchange "proj" value rows); ``add_partials`` adds them later."""
 
     def __init__(
         self,
@@ -539,6 +607,7 @@ class DcpBox:
         interleave=1,
         q_heads=None,
         q_bf16=False,
+        partials=True,
     ):
         self.size, self.rank, self.heads, self.cap = size, rank, heads, cap
         self.interleave, self.group = interleave, group
@@ -550,10 +619,7 @@ class DcpBox:
         self.q_heads = q_heads or size * heads
         q_dtype = torch.bfloat16 if q_bf16 else torch.uint8
         self.q = empty((2, cap, self.q_heads, 576), dtype=q_dtype, device=device)
-        shape = (2, size, cap, heads)
-        self.partial = empty((*shape, 512), dtype=torch.bfloat16, device=device)
-        self.lse = empty(shape, dtype=torch.float32, device=device)
-        tensors = [self.q, self.partial, self.lse]
+        tensors = [self.q]
         # Rubin: a second q mailbox for validity-polled readers (mla.qvalid), armed with
         # (0x80000000, Q_SENT x 3) chunks. Kept apart from ``q`` (armed with Q_SENT
         # words, LSU-polled): an LSU reader of a chunk written by separate 4 B stores
@@ -567,38 +633,75 @@ class DcpBox:
             tensors.append(self.qv)
         handles = [symm_mem.rendezvous(t, group) for t in tensors]
         self.q_mc = int(handles[0].multicast_ptr or 0)
-        self.qv_mc = int(handles[3].multicast_ptr or 0) if self.qv is not None else 0
+        self.qv_mc = int(handles[1].multicast_ptr or 0) if self.qv is not None else 0
         if not self.q_mc or (self.qv is not None and not self.qv_mc):
             raise RuntimeError("Kimi K3 specialized MLA DCP needs multicast memory")
-        i64 = dict(dtype=torch.int64, device=device)
-        self.peers = torch.tensor(handles[1].buffer_ptrs, **i64)
-        self.lse_peers = torch.tensor(handles[2].buffer_ptrs, **i64)
-        # (host copies: core_q.push_table)
-        self.peer_ptrs = list(handles[1].buffer_ptrs)
-        self.lse_peer_ptrs = list(handles[2].buffer_ptrs)
         self.q.zero_()  # padded heads stay zero
         self.q[:, :, : size * heads].view(torch.uint8).fill_(0xFF)
         if self.qv is not None:
             chunks = self.qv.view(torch.int32).view(-1, 4)
             chunks[:, 0].fill_(-0x80000000)
             chunks[:, 1:].fill_(-1)
-        self.partial.view(torch.int32).fill_(-0x80000000)
-        self.lse.view(torch.int32).fill_(-1)
-        rows = (cap, 1, size * heads)
-        self.rows = torch.empty((*rows, 512), dtype=torch.bfloat16, device=device)
-        self.rows_lse = torch.empty(rows, dtype=torch.float32, device=device)
+        self.partial = self.lse = self.peers = self.lse_peers = None
+        self.rows = self.rows_lse = None
+        self.peer_ptrs: list = []
+        self.lse_peer_ptrs: list = []
+        if partials:
+            self.add_partials(sync=False)
         torch.accelerator.synchronize(device)
         torch.distributed.barrier(group=group)
 
-    def widened(self, cap):
+    def add_partials(self, sync=True):
+        """The BF16 partial [2, DCP, CAP, H, 512] / LSE [2, DCP, CAP, H] mailboxes
+        (peer stores, sentinel-filled) and the local rows / LSE, if the box has none
+        yet. Collective over the box's group (every rank, in the same order)."""
+        if self.partial is not None:
+            return self
+        device, size, cap, heads = self.q.device, self.size, self.cap, self.heads
+        empty = symm_mem.empty
+        shape = (2, size, cap, heads)
+        partial = empty((*shape, 512), dtype=torch.bfloat16, device=device)
+        lse = empty(shape, dtype=torch.float32, device=device)
+        handles = [symm_mem.rendezvous(t, self.group) for t in (partial, lse)]
+        i64 = dict(dtype=torch.int64, device=device)
+        self.peers = torch.tensor(handles[0].buffer_ptrs, **i64)
+        self.lse_peers = torch.tensor(handles[1].buffer_ptrs, **i64)
+        # (host copies: core_q.push_table)
+        self.peer_ptrs = list(handles[0].buffer_ptrs)
+        self.lse_peer_ptrs = list(handles[1].buffer_ptrs)
+        partial.view(torch.int32).fill_(-0x80000000)
+        lse.view(torch.int32).fill_(-1)
+        self.partial, self.lse = partial, lse
+        rows = (cap, 1, size * heads)
+        self.rows = torch.empty((*rows, 512), dtype=torch.bfloat16, device=device)
+        self.rows_lse = torch.empty(rows, dtype=torch.float32, device=device)
+        if sync:
+            torch.accelerator.synchronize(device)
+            torch.distributed.barrier(group=self.group)
+        return self
+
+    def nbytes(self):
+        """(symmetric, local) bytes of the box's own buffers."""
+        symmetric = (self.q, self.qv, self.partial, self.lse)
+        local = (self.rows, self.rows_lse)
+        count = lambda ts: sum(t.nbytes for t in ts if t is not None)  # noqa: E731
+        return count(symmetric), count(local)
+
+    def widened(self, cap, partials=True):
         """The model's mailboxes for verify shapes above this box's rows: one more box
         set of ``cap`` rows over the same group (every MLA layer shares it; created
         collectively, at the first layer that prepares such a shape). A DSA box's
-        widened box keeps its q mailbox layout (padded heads, BF16 / FP8)."""
+        widened box keeps its q mailbox layout (padded heads, BF16 / FP8).
+        ``partials`` False: without the BF16 partial mailboxes until a caller needs
+        them (``add_partials``, collective)."""
         if cap not in self.wide:
             device = self.q.device
             args = self.group, device, self.size, self.rank, self.heads, cap
-            self.wide[cap] = DcpBox(*args, interleave=self.interleave, **self.layout)
+            self.wide[cap] = DcpBox(
+                *args, interleave=self.interleave, partials=partials, **self.layout
+            )
+        elif partials:
+            self.wide[cap].add_partials()
         return self.wide[cap]
 
     def mc(self, parity, valid=False):
@@ -646,11 +749,14 @@ class DcpValue:
         lse_scale=1.0,
         spread=False,
         prefetch_uv=True,
+        resident_sms=0,
     ):
         """``q_chunks``: 16 B chunks per q mailbox head row (36 FP8, 72 BF16);
         ``q_heads``: q mailbox rows per token (default DCP * H); ``lse_scale``: to
         base 2 (LOG2E for a natural-log LSE). Rubin's ``lean`` re-arm assumes the
-        FP8 layout: the DSA (BF16) mailbox compiles with ``sms`` <= GB300_SMS."""
+        FP8 layout: the DSA (BF16) mailbox compiles with ``sms`` <= GB300_SMS.
+        ``resident_sms``: the device's real SM count (0: ``sms``), which bounds the
+        co-resident grid (``tile_stride``) when ``sms`` is the capped GB300 schedule."""
         self.heads, self.size, self.batch = heads, size, batch
         self.q_chunks, self.q_heads = q_chunks, q_heads or size * heads
         self.lse_scale = lse_scale
@@ -715,6 +821,23 @@ class DcpValue:
             pushers = 1 << (min(16, max(1, sms // merge)).bit_length() - 1)
         self.merge_rows = 16 // pushers if self.spread else 16
         self.grid = (heads, (batch + 15) // 16, pushers)
+        # The spread merges spin until every CTA's grid-stride pushes land, so the grid
+        # must be co-resident: one 512-thread CTA per SM (103 registers). Above one wave
+        # (6 heads x 36+ row tiles: DL3 B144+) CTA y merges row tiles y, y + G, ..
+        # (G row-tile CTAs per head) instead: the same rows, sums and MMAs (bitwise).
+        # The per-head merge (GB300 schedule: the DSA BF16 mailbox, ``sms`` capped at
+        # GB300_SMS) the same past ``sms`` merge CTAs: its pushes are grid-stride and
+        # only z = 0 merges (pushers is 1 there), so CTA (h, y, 0) merges tiles y, y +
+        # G, .. one after another (``check_residency`` at compile: ``compile_value``).
+        # The wave is the device's real SM count (``resident_sms``), not the capped
+        # schedule's: on Rubin the GB300-schedule DSA BF16 grids up to 210 CTAs (560
+        # rows) stay unstrided, as before the stride. NQ-TUNE: strided vs unstrided at
+        # 401-560 rows if the stride ever wins below one real wave.
+        self.tile_stride = 0
+        resident = resident_sms or sms
+        if heads * self.grid[1] * pushers > resident and batch > 8:  # (not ``wide``)
+            self.tile_stride = max(1, resident // (heads * pushers))
+            self.grid = (heads, self.tile_stride, pushers)
         # (decode only: spec verify rows, q > 1, keep the per-head merge)
         self.wide = (
             self.lean
@@ -855,7 +978,17 @@ class DcpValue:
         # own wait, relying on the next core starting only after this.
         cute.arch.griddepcontrol_launch_dependents()
         R = self.merge_rows
-        if self.merges(pusher):
+        if cutlass.const_expr(self.tile_stride > 0 and self.spread):  # above one wave
+            for y in range(tile, (self.batch + 15) // 16, self.tile_stride):
+                if 16 * y + R * pusher < self.batch:
+                    self.merge_spread(args, latent, scales, tid, y)
+                    self.rearm_rows(mailbox, 16 * y + R * pusher, R, head, tid)
+        elif cutlass.const_expr(self.tile_stride > 0):  # the per-head merge, strided
+            if pusher == 0:
+                for y in range(tile, (self.batch + 15) // 16, self.tile_stride):
+                    self.merge(args, latent, scales, wb, tid, y)
+                    self.rearm_rows(mailbox, 16 * y, 16, head, tid)
+        elif self.merges(pusher):
             if cutlass.const_expr(self.spread):
                 self.merge_spread(args, latent, scales, tid)
                 self.rearm_rows(mailbox, 16 * tile + R * pusher, R, head, tid)
@@ -1191,11 +1324,17 @@ class DcpValue:
         return value
 
     @cute.jit
-    def merge(self, args, latent, scales, wb, tid):
-        """The owner's merge of request rows t0.. of this head, then W_UV + gate."""
+    def merge(self, args, latent, scales, wb, tid, row_tile=None):
+        """The owner's merge of request rows t0.. of this head, then W_UV + gate.
+        ``row_tile``: the 16-row tile (``tile_stride``), else the CTA's own.
+        Back-to-back calls need no barrier: the next call writes the scales after
+        this one's last read (before its second barrier) and the latent tile only
+        after its own first barrier (every warp's MMA reads of this one done)."""
         box, lbox, gate, totals, output = args[3], args[4], args[9], args[10], args[11]
         D, B = self.size, self.batch
         head, tile, _ = cute.arch.block_idx()
+        if cutlass.const_expr(row_tile is not None):
+            tile = row_tile
         lane, warp = tid % 32, tid // 32
         group, quarter = lane // 4, lane % 4
         t0 = tile * 16
@@ -1293,15 +1432,20 @@ class DcpValue:
                 store_words(at(output, t, col), (bf16x2(lo, hi),))
 
     @cute.jit
-    def merge_spread(self, args, latent, scales, tid):
+    def merge_spread(self, args, latent, scales, tid, row_tile=None):
         """spread: CTA z of (head, row tile y) merges rows 16 y + R z + r (r < R) into
         rows r of its latent tile, then warp w projects output tile w of them: the
         weights, sums and per-tile MMAs of merge() (MMA rows are independent, so the
         same values). R = 16 (one pusher: H x row tiles fill the SMs) also merges and
-        stores the MMA tile's rows 8-15."""
+        stores the MMA tile's rows 8-15. ``row_tile``: y (``tile_stride``), else the
+        CTA's own. Back-to-back calls need no barrier: the next call writes the
+        scales after the last read (before this call's second barrier) and the
+        latent tile only after its first barrier (every warp's MMA reads done)."""
         box, lbox, gate, totals, output = args[3], args[4], args[9], args[10], args[11]
         D, B, R = self.size, self.batch, self.merge_rows
         head, tile, z = cute.arch.block_idx()
+        if cutlass.const_expr(row_tile is not None):
+            tile = row_tile
         lane, warp = tid % 32, tid // 32
         group, quarter = lane // 4, lane % 4
         t0 = 16 * tile + R * z  # this CTA's first row
@@ -1571,6 +1715,7 @@ def compile_value(
     dsa_bf16=True,
     lse_base_e=True,
     spread=False,
+    resident_sms=0,
 ):
     """DcpValue of one batch (``q`` rows per request); ``uv``: the (shape, stride,
     dtype) of W_UV, ``pitch``: the projected rows' (the gate follows the 2112 query /
@@ -1583,7 +1728,9 @@ def compile_value(
     partition (DcpValue's ``lpc``); ``dsa_heads``: DSA layout, its padded head count:
     q mailbox rows (BF16 for FlashMLA sparse, else FP8), rows / LSE as the sparse
     decode returns them (``lse_base_e``: natural-log, else base 2), on the GB300
-    schedule."""
+    schedule. ``resident_sms``: the wave the merging CTAs' grid must fit in
+    (``DcpValue.tile_stride``; 0: ``sms``, the caller's real SM count; the tests
+    give a smaller one to compare row-tile strides)."""
     f32, i32 = torch.float32, torch.int32
     w_uv, gate = fake(*uv), fake((batch, heads * 128), (pitch, 1))
     rows = fake((batch, 1, size * heads, 512))
@@ -1603,6 +1750,7 @@ def compile_value(
     peers = fake((size,), None, torch.int64, 8)
     mailbox = fake((cap, size * heads, 576), None, torch.uint8)
     dsa: dict = {}
+    resident = resident_sms or sms  # (the caller's real SM count: one wave)
     if dsa_heads:
         rows = fake((batch, 1, size * heads, 512), (dsa_heads * 512, 0, 512, 1))
         rows_lse = fake((batch, 1, size * heads), (dsa_heads, 0, 1), f32, 4)
@@ -1611,7 +1759,7 @@ def compile_value(
         scale = math.log2(math.e) if lse_base_e else 1.0
         dsa = dict(q_chunks=row_bytes // 16, q_heads=dsa_heads, lse_scale=scale)
         if not (spread and pushed and not dsa_bf16):
-            sms = min(sms, GB300_SMS)
+            sms = min(sms, GB300_SMS)  # (the stride: the real count, ``resident``)
     # ``spread`` (DSA, FP8 mailbox, rows pushed by the sparse core, q > 1): the Rubin
     # schedule with every row's merge spread over the CTAs (LSE box [CAP, H, DCP])
     output = fake((batch, heads * 128), (heads * 128, 1))
@@ -1633,12 +1781,20 @@ def compile_value(
         pushed,
         lpc=lpc,
         spread=spread,
+        resident_sms=resident,
         **dsa,
     )
     if value.polled_out:
         args += (fake((batch, heads * 128), (heads * 128, 1)),)
     with torch.accelerator.device_index(device):
-        return cute.compile(value, *args, make_fake_stream())
+        compiled = cute.compile(value, *args, make_fake_stream())
+    # The merging CTAs poll what every CTA (of every rank) pushes: the whole grid must
+    # be co-resident (one wave: ``tile_stride`` above it), or the step could hang
+    # across ranks. Checked here for every caller (K3 MLA, the drafter, K3.1 DSA).
+    grid = value.grid[0] * value.grid[1] * value.grid[2]
+    what = f"Kimi K3 MLA DcpValue ({heads} heads, batch {batch}, q {q})"
+    check_residency(compiled, device, grid, 512, what)
+    return compiled
 
 
 _WORKSPACE: dict[tuple[torch.device, int], torch.Tensor] = {}
@@ -1906,21 +2062,74 @@ def lse_fold_splits(batch, heads, max_seq, device):
     return split
 
 
+# split_workspace_ts: one FP32 buffer per (device, heads, split), sized for the largest
+# batch reserved or requested so far, shared by every batch (the captured shapes never
+# run concurrently) and every MLA layer (stream ordered): an open LONG_SPLIT row range
+# costs one buffer, not one per captured shape. ``_SPLIT_PINNED``: keys whose buffer's
+# address was kept (``keep``: a prepared shape's DcpValue arguments, or handed out
+# during a graph capture); a buffer outgrown after that stays alive in
+# ``_SPLIT_RETIRED`` (its holders' addresses stay valid), else it is freed.
 _PARTIALS: dict[tuple, torch.Tensor] = {}
+_SPLIT_RESERVED: dict[tuple, int] = {}
+_SPLIT_PINNED: set[tuple] = set()
+_SPLIT_RETIRED: list[torch.Tensor] = []
+_SPLIT_VIEWS: dict[tuple, tuple] = {}
 
 
-def split_workspace_ts(device, heads, batch, split):
+def reserve_split_workspace(device, heads, batch, split):
+    """Size ``split_workspace_ts``'s (device, heads, split) buffer for ``batch`` (no
+    allocation): reserving every shape before any address is kept allocates the
+    shared buffer once, at its final size."""
+    key = device, heads, split
+    size = batch * heads * split * 513
+    _SPLIT_RESERVED[key] = max(_SPLIT_RESERVED.get(key, 0), size)
+
+
+def split_workspace_ts(device, heads, batch, split, keep=False):
     """(workspace, partials [B, heads, split, 512], LSEs [B, heads, split]) of the
-    LSE-folded tokenspeed core of one batch: tokenspeed's split-KV workspace layout,
-    one per (device, heads, batch, split), shared by every MLA layer (stream ordered;
-    as the shared rows of the stock path)."""
-    key = device, heads, batch, split
-    if key not in _PARTIALS:
-        size = batch * heads * split * 513
-        _PARTIALS[key] = torch.empty(size, dtype=torch.float32, device=device)
-    buf, cut = _PARTIALS[key], batch * heads * split * 512
+    LSE-folded tokenspeed core of one batch: tokenspeed's split-KV workspace layout
+    (the exact-size prefix of the shared (device, heads, split) buffer: partials, then
+    LSEs), shared by every batch and every MLA layer (stream ordered; as the shared
+    rows of the stock path). ``keep``: the caller keeps these addresses (also implied
+    during a graph capture)."""
+    key = device, heads, split
+    keep = keep or torch.cuda.is_current_stream_capturing()
+    # A batch whose addresses were kept gets the same views on every later lookup,
+    # even after its key's buffer grew: its cores and its DcpValue then always share
+    # one buffer (the retired one stays alive in _SPLIT_RETIRED).
+    kept = _SPLIT_VIEWS.get((key, batch))
+    if kept is not None:
+        return kept
+    reserve_split_workspace(device, heads, batch, split)
+    need = _SPLIT_RESERVED[key]
+    buf = _PARTIALS.get(key)
+    if buf is None or buf.numel() < need:
+        if buf is not None and key in _SPLIT_PINNED:
+            # (a shape not reserved before an earlier one's addresses were kept)
+            logger.warning(
+                "split workspace %s grows past kept addresses (%d -> %d floats); "
+                "the kept batches keep the old buffer",
+                key[1:],
+                buf.numel(),
+                need,
+            )
+            _SPLIT_RETIRED.append(buf)
+        _SPLIT_PINNED.discard(key)
+        buf = _PARTIALS[key] = torch.empty(need, dtype=torch.float32, device=device)
+    cut = batch * heads * split * 512
     part = buf[:cut].view(batch, heads, split, 512)
-    return buf.view(torch.int8), part, buf[cut:].view(batch, heads, split)
+    stats = buf[cut : cut + batch * heads * split].view(batch, heads, split)
+    views = buf[: cut + batch * heads * split].view(torch.int8), part, stats
+    if keep:
+        _SPLIT_PINNED.add(key)
+        _SPLIT_VIEWS[key, batch] = views
+    return views
+
+
+def split_workspace_bytes():
+    """Bytes held by ``split_workspace_ts`` (live and retired buffers)."""
+    held = [*_PARTIALS.values(), *_SPLIT_RETIRED]
+    return sum(t.numel() * t.element_size() for t in held)
 
 
 # Rubin-class devices, DCP spec verify fold: (token rows, gathered heads) whose packed

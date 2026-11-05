@@ -46,7 +46,11 @@ GPU moves ~2 x the rows instead of TP x. The same sums and rounding points as
 ``ArNormRows`` (wide rows, above 64: one 8-CTA cluster per row would take ~10 waves at
 224 rows): one CTA of 8 x 128 threads per row (the cluster's CTAs as thread groups),
 the same push, owner reduce, residual add, warp sums, group sums and cross-group order
-as ``ArNormTwoShot`` / ``ArNorm.finish``: bitwise their outputs, in one wave.
+as ``ArNormTwoShot`` / ``ArNorm.finish``: bitwise their outputs, in one wave while
+every row's CTA is resident. Above that a row's CTA waits only on the same row's CTAs
+of the other ranks (owner sums of pushes those CTAs issue before any wait), so with
+in-order block dispatch the lowest unfinished rows are resident on every rank and
+progress; the wide box is sized from the deployment's largest rows (no static cap).
 """
 
 from functools import cache
@@ -92,7 +96,9 @@ from .context import div_rn, rsqrt_approx
 HIDDEN = 7168
 CAP = 64  # one-shot rows per step (B8: 56 query rows)
 TWO_CAP = 64  # two-shot rows per step
-WIDE_CAP = 256  # wide (``ArNormRows``) rows per step
+# Wide (``ArNormRows``) rows per step: the deployment's largest (``PreparedDraftAr``
+# sizes the wide box in 64-row tiles; hb192 measured to 576).
+WIDE_CAP = None
 CLUSTER = 8  # CTAs per row
 COLUMNS = HIDDEN // CLUSTER  # 896: 112 threads x 8 columns
 # Benchmarks only: one-shot sites write CTA (0, 0)'s %globaltimer at entry, after the
@@ -635,15 +641,16 @@ class PreparedDraftAr:
     (``polled`` sites). ``early``: two-shot rows whose sites release their PDL
     dependents right after their wait (``trigger``). ``valid``: one-shot rows whose
     polled sites land the slots with validity-reporting copies (Rubin). ``wide``:
-    rows above 64 (at most WIDE_CAP) on ``ArNormRows`` sites (push) over their own
-    two-shot box."""
+    rows above 64 (at most WIDE_CAP when set) on ``ArNormRows`` sites (push) over
+    their own two-shot box."""
 
     def __init__(
         self, group, device, tp, rank, rows, vocab, two_shot=(), gated=(), early=(),
         valid=(), wide=(),
     ):  # fmt: skip
         self.tp, self.rank, self.device = tp, rank, device
-        self.wide_rows = frozenset(r for r in rows if r in wide and 64 < r <= WIDE_CAP)
+        cap = WIDE_CAP or max(rows, default=0)
+        self.wide_rows = frozenset(r for r in rows if r in wide and 64 < r <= cap)
         self.rows = tuple(
             r for r in rows if r <= min(CAP, TWO_CAP) or r in self.wide_rows
         )

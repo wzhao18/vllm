@@ -548,10 +548,12 @@ class SampledVerify:
             self.candidates[segs].prepare()
 
     def takes(self, rows):
-        """Whether one launch of each exchange covers ``rows`` logits rows."""
-        from ..cutedsl.verify.exchange import MAX_ROWS
-
-        return 0 < rows <= MAX_ROWS
+        """Whether this verification covers ``rows`` logits rows: any (above the
+        exchange's ``MAX_ROWS`` its rounds run in launches of at most MAX_ROWS rows,
+        ``PreparedExchange.run``; the kernels around them take any rows). NQ-TUNE: the
+        sharded verification vs the stock sampler's full-vocabulary all-gather at 516-
+        2048 logits rows (16 ranks, us per step)."""
+        return rows > 0
 
     def run(
         self,

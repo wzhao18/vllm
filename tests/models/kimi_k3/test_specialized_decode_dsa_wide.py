@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Kimi K3.1 specialized decode, wide verify rows (> 64 token rows, Rubin):
-WideDsa at the rows ``dsa.wide.DSA_WIDE`` admits (65 up to
-VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS: 96 by default, at most 512): its admission, index
+WideDsa at the rows ``dsa.wide.DSA_WIDE`` admits (every row from 65 on, no
+environment cap): its admission, index
 policies, MlaQuery / DcpValue grid residency and kernels at those rows, its DCP core
 and DCP4 mailboxes; and the fused indexer key insert from the packed in-projection
 rows that seam S2-DSA feeds."""
@@ -106,10 +106,9 @@ def test_fused_k_insert_from_packed_rows(rows):
 
 
 def test_prepared_dsa_wide_admission(monkeypatch):
-    """``dsa.wide.choose``: GENERIC at the tuned rows; above them only Rubin DCP
-    verify shapes that ``DSA_WIDE`` lists, at most VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS
-    (``wide_max_rows``: WIDE_MAX_ROWS by default, 64 none, at most WIDE_LIMIT); else
-    None (S2-DSA)."""
+    """``dsa.wide.choose``: GENERIC at the tuned rows; above them every Rubin DCP verify
+    shape that ``DSA_WIDE`` lists (open-ended: no row cap, no environment switch);
+    else None (S2-DSA)."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa import wide
     from vllm.models.kimi_k3.nvidia.specialized_decode.shapes import (
         Context,
@@ -118,31 +117,20 @@ def test_prepared_dsa_wide_admission(monkeypatch):
     )
 
     ctx = Context(
-        arch="rubin", tp=16, rank=0, dcp=16, sms=212, q=4, max_rows=768,
+        arch="rubin", tp=16, rank=0, dcp=16, sms=212, q=4, max_rows=2048,
         max_context=1 << 20, bf16_state=True,
     )  # fmt: skip
     assert wide.choose(Shape(64, 4), ctx).path is Path.GENERIC
+    for m in (72, 96, 128, 256, 260, 512, 516, 768, 1024, 2048):
+        assert wide.choose(Shape(m, 4), ctx).tactic == "wide"
     monkeypatch.setattr(wide, "DSA_WIDE", {"*": ""})
     assert all(wide.choose(Shape(m, 4), ctx) is None for m in (72, 96, 512))
-    monkeypatch.setattr(wide, "DSA_WIDE", {"*": "65-768:1"})
-    for m in (72, 96):
-        assert wide.choose(Shape(m, 4), ctx).tactic == "wide"
-    assert wide.choose(Shape(128, 4), ctx) is None  # above WIDE_MAX_ROWS
-    monkeypatch.setenv("VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS", "256")
-    for m in (72, 128, 256):
-        assert wide.choose(Shape(m, 4), ctx).tactic == "wide"
-    assert wide.choose(Shape(260, 4), ctx) is None
-    monkeypatch.setenv("VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS", "64")
-    assert wide.choose(Shape(72, 4), ctx) is None
-    for rows in ("63", str(wide.WIDE_LIMIT + 1)):
-        monkeypatch.setenv("VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS", rows)
-        with pytest.raises(ValueError, match="VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS"):
-            wide.choose(Shape(72, 4), ctx)
-    monkeypatch.delenv("VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS")
+    monkeypatch.setattr(wide, "DSA_WIDE", {"*": "65-:1"})
     gb300 = Context(**{**ctx.__dict__, "arch": "gb300"})
     assert wide.choose(Shape(72, 4), gb300) is None
     tp_only = Context(**{**ctx.__dict__, "dcp": 1})
     assert wide.choose(Shape(72, 4), tp_only) is None
+    assert wide.choose(Shape(72, 1), ctx) is None
 
 
 def test_index_policies_wide_rows():
@@ -224,17 +212,24 @@ def test_dsa_wide_query_grid_resident():
         assert wide.check_query_residency(query.compiled, tiled, device) >= heads
         grid = wide.check_value_residency(value, heads, 16, rows, 4, sms, device)
         assert grid[0] * grid[1] * grid[2] <= sms
-    # 576 rows (past WIDE_LIMIT): 6 x 36 = 216 merge CTAs, one per SM: more than 212.
-    with pytest.raises(RuntimeError, match="cannot be co-resident"):
+    # 576+ rows: 6 x 36+ row tiles would be 216+ merge CTAs, one per SM; the merging
+    # CTAs stride the row tiles instead (``tile_stride``: 6 x (SMs // 6) past the
+    # device's real SM count, on the GB300 schedule), so the grid stays one wave at
+    # any rows (compile_value checks it); up to 560 rows (6 x 35 tiles) unstrided.
+    for rows in (560, 576, 1024, 2048):
         value = compile_value(
-            heads, 16, 576, 576, specs[4], pitch, device, sms, 4, dsa_heads=128,
+            heads, 16, rows, rows, specs[4], pitch, device, sms, 4, dsa_heads=128,
             dsa_bf16=False,
         )  # fmt: skip
-        wide.check_value_residency(value, heads, 16, 576, 4, sms, device)
+        grid = wide.check_value_residency(value, heads, 16, rows, 4, sms, device)
+        tiles = -(-rows // 16)
+        stride = sms // heads if heads * tiles > sms else tiles
+        assert grid == (heads, stride, 1), grid
 
 
 def test_dsa_wide_proj_grid_resident():
-    """WideDsa's "proj" partials (VLLM_K31_DSA_PARTIALS): compile_core builds #108's
+    """WideDsa's "proj" partials (r1.AUTO_PARTIALS from 17 rows on FlashInfer sparse):
+    compile_core builds #108's
     DcpValue over the W_UV bmm's value rows (dcp_stage, preprojected) on the real
     SM count: at DCP16 96 projecting CTAs, then 6 x min(tiles, (SMs - 96) // 6)
     merging ones (19 on 212 SMs: 210 CTAs from 304 rows), whose whole grid fits at
@@ -865,3 +860,37 @@ def test_wide_dcp_mailboxes(skew):
             for process in context.processes:
                 process.kill()
             pytest.fail("DCP4 wide mailboxes: no progress in 30 min (a hang?)")
+
+
+@pytest.mark.parametrize("q", [4, 8])
+def test_dsa_wide_kernels_resident_past_512(q):
+    """No row cap (DSA_WIDE open-ended): compile_core at rows past the old 512 limit
+    (q4 / q8 up to 2048, DCP16, 6 heads, FP8) builds MlaQuery's tile-polled query,
+    and both DcpValue formats ("proj" and the BF16 latent merge) within one wave: the
+    compile-time residency checks pass at every one of them."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa import wide
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.mla.query import (
+        MlaQuery,
+    )
+
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    if sms <= 152:
+        pytest.skip("Rubin-class wide rows")
+    heads = 6
+    specs, pitch = dcp16_core_specs(heads)
+    device = torch.accelerator.current_device_index()
+    for rows in (520, 768, 1024, 1536, 2048):
+        rows = -(-rows // q) * q
+        for partials in ("proj", "bf16"):
+            args = rows, heads, pitch, specs, device, q, 16, 128, sms, partials
+            query, _, value = wide.compile_core(*args, fp8=True, cap=2048)
+            tiled = MlaQuery(
+                heads, rows, dsa=True, fp8=True, dcp=16, q_heads=128, tile_poll=True
+            )
+            assert wide.check_query_residency(query.compiled, tiled, device) >= heads
+            if partials == "proj":
+                grid = wide.check_proj_residency(value, heads, 16, rows, sms, device)
+            else:
+                args = value, heads, 16, rows, q, sms, device
+                grid = wide.check_value_residency(*args)
+            assert grid[0] * grid[1] * grid[2] <= sms, (rows, partials, grid)

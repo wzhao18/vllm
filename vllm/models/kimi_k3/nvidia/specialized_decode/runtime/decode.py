@@ -85,8 +85,14 @@ RING_HEAD = {16: "1-256:1"}
 # Rubin verify graphs above the tuned rows (token rows by q, "*": any) that run the
 # specialized decode (generic kernels and stock seams, ``wide``); others run the stock
 # forward. A point leaves this table when its in-graph step measures slower than the
-# stock forward.
-WIDE_ROWS = {"*": "65-512:1"}
+# stock forward. Open-ended (every captured FULL graph from 65 rows on, q4 and q8):
+# each family decides per shape between its generic kernel and its stock seam (the
+# wide MoE experts run in launches of at most ``experts_wide.WIDE_MAX`` rows, DSA
+# DcpValue and the MLA spread merge stride their row tiles over one wave), so no
+# captured row runs the whole-step stock forward. 65-768 was measured (hb192: DL3 q4
+# B17-B192); NQ-TUNE: the 16-rank in-graph step vs the stock forward at q4 M1024 /
+# M1536 / M2048 and q8 M1024 / M2048 (a point that loses leaves this table).
+WIDE_ROWS = {"*": "65-:1"}
 RING_DENSE = {16: "1-8:1"}
 
 
@@ -577,7 +583,10 @@ class SpecializedDecode:
                 note = f"fold {b // q}x{q}"
             else:
                 capability = torch.cuda.get_device_capability(self.device)
-                note = f"{verify_kernel(b // q, q, capability)} {b // q}x{q}"
+                kernel = verify_kernel(
+                    b // q, q, capability, self.bf16_state, int(self.tp == 8)
+                )  # (the state dtype and gate mode the KDA policies run)
+                note = f"{kernel} {b // q}x{q}"
             choices["kda"] = Choice(path, note=note)
         if mla is not None:
             rows = q > 1 and b in mla.rows

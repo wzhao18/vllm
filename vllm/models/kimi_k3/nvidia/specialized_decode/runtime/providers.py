@@ -3,6 +3,7 @@
 """Per-layer attention providers (input projection, KDA/MLA core, o-projection) and
 the helpers ``SpecializedDecode.build_providers`` uses."""
 
+import contextlib
 from typing import Any
 
 import torch
@@ -20,7 +21,11 @@ from ..cutedsl.dsa.prepared import QUERY_HEADS, PreparedDsa, dsa_on_flashinfer
 from ..cutedsl.dsa.wide import WideDsa
 from ..cutedsl.dsa.wide import choose as dsa_choose
 from ..cutedsl.gemm.projection import PreparedProjection
-from ..cutedsl.kda.head import PreparedKdaHead, polled_out_batches
+from ..cutedsl.kda.head import (
+    PreparedKdaHead,
+    head_supported,
+    polled_out_batches,
+)
 from ..cutedsl.kda.inproj64 import PREPARED_PITCH, PreparedKdaInProj64
 from ..cutedsl.kda.prepared import PreparedKda
 from ..cutedsl.kda.prepared import choose as kda_choose
@@ -41,8 +46,14 @@ PREPARED_MAX = BATCHES[-1]
 
 
 # Devices with more SMs than GB300's 152 (Rubin: 212), TP16: KDA batches whose input
-# projection and recurrence run as one kernel (``KdaHead``, BF16 recurrent state).
-# Single-GPU chain behind an AttnRes-like predecessor, B8: -0.36 us per KDA layer.
+# projection and recurrence run as one kernel (``KdaHead``; BF16 or FP32 recurrent
+# state, ``kda.head.head_supported``). Single-GPU chain behind an AttnRes-like
+# predecessor, B8, BF16 state: -0.36 us per KDA layer.
+# NQ-TUNE: FP32 state (no FP32 number exists for any KdaHead kernel): the same KDA
+# chain, KdaHead(Wide) vs the in-projection -> KdaSplit pair at q1 B8, KdaHeadVerify
+# vs the pair at q8 M8 (B1), KdaHeadMulti vs the pair at q8 M16 and q4 M8; also
+# re-sweep HEAD_TILE / VERIFY_EARLY_LOADS / MULTI_TILE early tiles (the FP32 state
+# doubles each KDA CTA's early state loads: 16 rows x 512 B).
 HEAD_BATCHES = (8,)
 # Rubin TP16 (BF16 state) verify rows per q whose KDA layers run the in-projection and
 # the verify recurrence of several requests in one kernel (``KdaHeadMulti``: the M8
@@ -55,7 +66,7 @@ HEAD_BATCHES = (8,)
 # (the B1 x q8 head leaves eight idle), so DL3 B2 takes DL7 B1's KDA layer (head ->
 # polled fused o-projection); its projection sums K in four split-K partials instead
 # of the 8-row bin's two (the same stated FP32 reorder).
-HEAD_MULTI = {8: "16:1", 4: "8:1"}
+HEAD_MULTI = {8: "16:1", 4: "8:1"}  # (BF16 state; FP32: see HEAD_BATCHES' NQ-TUNE)
 # Devices with more SMs than GB300's 152 (Rubin: 212), TP16 B<=8, by rows. KDA: 102 CTAs
 # (split 2) instead of 204, so every CTA starts and preloads its weights beside the
 # 56-CTA AttnRes. MLA: SplitKTmemGemm, M128 tiles split over K by 7 (161 CTAs in
@@ -167,6 +178,22 @@ PROJECTION_GENERIC = {"*": "65-128:64.64.2.6"}
 # The most rows the generic split-K tactics serve (dense layer included); above, the
 # projections run cuBLAS.
 GENERIC_ROWS = 128
+# Rubin TP16 wide rows (token rows, by in-projection rows: KDA 3216, MLA 2880) whose
+# cuBLAS in-projection (``Attention.run_wide``) runs with torch's cuBLASLt preference:
+# cuBLAS's heuristic pick is banded and loses there. Both libraries sum K in the same
+# order at these rows (outputs bitwise equal at every 4th row of 164-768). 1 GPU, 8
+# cold weight copies, graphs of 16 calls, us per call cuBLAS -> cuBLASLt (ABBA): KDA
+# 260-288 10.8 -> 10.4, 292-336 11.9 -> 11.1, 388-448 13.0 -> 12.4, 452-464 13.6 ->
+# 12.5, 468-480 13.0 -> 12.4, 516-576 15.2 -> 13.9; MLA 292-320 11.6 -> 11.0, 324-384
+# 16.3 -> 11.0-12.7, 388-512 12.6 -> 12.1, 516-576 19.9 -> 13.6. cuBLAS wins at KDA
+# 340-384 / 484-512 / 580-704 and MLA 260-288 / 708-768 (left out). Rows outside the
+# table (above 768 too) keep torch's default library, the stock layer's GEMM.
+# NQ-TUNE: re-check the bitwise claim and the per-band winner above 768 rows (q4
+# M772-2048, q8 M776-1024) and on the K3.1 DSA rows (3040, no entry: cuBLAS).
+INPROJ_LT = {
+    3216: "260-336:1,388-480:1,516-576:1",
+    2880: "292-576:1",
+}
 
 
 def projection_policies(tp, rows, batches, sms=152, q=1):
@@ -204,6 +231,21 @@ def projection_policies(tp, rows, batches, sms=152, q=1):
             tactic = (64, n, 4 if n == 8 else 2, stages)
         policies[batch] = tactic
     return policies
+
+
+@contextlib.contextmanager
+def blas_library(name):
+    """Torch's preferred BLAS library ``name`` around the block (None: unchanged),
+    restored after it. Graph captures record the kernel picked at capture."""
+    if name is None:
+        yield
+        return
+    previous = torch.backends.cuda.preferred_blas_library()
+    torch.backends.cuda.preferred_blas_library(name)
+    try:
+        yield
+    finally:
+        torch.backends.cuda.preferred_blas_library(previous)
 
 
 class SkinnyProjection:
@@ -325,6 +367,9 @@ class Attention:
         skinny = WIDE_SKINNY.get(pitch, SKINNY) if sms > 152 else SKINNY
         self.projection = SkinnyProjection(weight, split_k, skinny)
         self.weight = weight
+        # Wide rows whose cuBLAS in-projection prefers cuBLASLt (``INPROJ_LT``)
+        lt = INPROJ_LT.get(pitch, "") if sms > 152 and tp == 16 else ""
+        self.lt_rows = batch_table(lt)
         self.core: Any  # PreparedKda, PreparedMla or PreparedDsa
         self.core_long: Any = None  # MLA: the step switch's body 1 core (SWITCH)
         # MLA decode batches whose o-projection polls DcpValue's output (one of two
@@ -333,6 +378,7 @@ class Attention:
         self.runtime = runtime
         self.head: Any = None  # PreparedKdaHead (Rubin TP16 KDA batches)
         self.head_index = -1  # this layer's KdaHead index (its polled output buffer)
+        self.head_state: Any = None  # the recurrent-state dtype the head serves
         # The preceding AttnRes's preferred shared-memory carve-out (None: default).
         self.before_carveout = None
         # Whether only that AttnRes's decode-ring codes take it (``PreparedAttnRes``
@@ -429,14 +475,25 @@ class Attention:
                     rows = scratch(runtime, name, (64, pitch))
                     rows[:, fa : fa + 128].view(torch.int16).fill_(-1)  # FA_SENT
                 self.fold_projected = runtime.buffers[name]
-            # KdaHead batches, only with a BF16 state (``prepare_layout`` would drop the
-            # head after the MoE tail before this layer, ``use_heads``, and its
-            # AttnRes's carve-out were set up for it).
-            batches = [b for b in HEAD_BATCHES if b in runtime.batches]
-            batches = batches if runtime.bf16_state else []
-            multi = batch_table(HEAD_MULTI.get(q, "")) if runtime.bf16_state else {}
-            multi = [b for b in runtime.batches if multi.get(b) and b % q == 0]
-            if sms > 152 and tp == 16 and pitch == 3216 and (batches or multi):
+            # KdaHead batches (Rubin TP16 KDA rows): the shapes whose kernel takes this
+            # state dtype, fits its shared-memory budget and (a state other than the
+            # measured BF16) compiles here (``head_supported``); the others keep the
+            # in-projection -> KdaSplit pair. Decided here, not in ``prepare_layout``:
+            # the MoE tail before this layer (``use_heads``) and its AttnRes's
+            # carve-out are set up for the head.
+            state = torch.bfloat16 if runtime.bf16_state else torch.float32
+            eligible = sms > 152 and tp == 16 and pitch == 3216
+            kda_core, fa_width = self.core, pitch - 4 * self.core.dim
+            fits = lambda b, t: eligible and head_supported(
+                kda_core.heads, state, kda_core.has_bias, weight.shape[1], b, t,
+                core=kda_core, fa_width=fa_width, cache_tokens=runtime.q, tp=tp,
+            )  # fmt: skip
+            batches = [b for b in HEAD_BATCHES if b in runtime.batches and fits(b, 1)]
+            multi = batch_table(HEAD_MULTI.get(q, ""))
+            multi = [
+                b for b in runtime.batches if multi.get(b) and b % q == 0 and fits(b, q)
+            ]
+            if batches or multi:
                 index = runtime.kda_heads
                 runtime.kda_heads += 1
                 counters = runtime.buffers.setdefault(
@@ -444,7 +501,7 @@ class Attention:
                     torch.zeros((128, 2), dtype=torch.int32, device=runtime.device),
                 )
                 # one F_A buffer per layer: KdaHeadWide polls its rows (sentinel)
-                fa_out = scratch(runtime, "kda.head.fa", (128, 64, pitch - 4 * 768))
+                fa_out = scratch(runtime, "kda.head.fa", (128, 64, fa_width))
                 fa_out = fa_out[index]
                 # KdaHead batches whose fused o-projection polls the output: one
                 # buffer per KdaHead layer, armed here once (kda.head.POLLED_OUT)
@@ -459,13 +516,18 @@ class Attention:
                         runtime.buffers[name] = out
                     self.head_index = index
                 # B1 x q verify rows (q = 8: the KdaHead batch): KdaHeadVerify
-                verify = [(b, runtime.q) for b in batches if b == runtime.q == 8]
+                verify = [
+                    (b, runtime.q)
+                    for b in batches
+                    if b == runtime.q == 8 and fits(b, runtime.q)
+                ]
                 verify += [(b, q) for b in multi]  # KdaHeadMulti
                 self.head = PreparedKdaHead(
                     weight, self.core, batches, runtime.kda_side, counters[index],
                     fa_out, polled=polled, verify=verify,
                 )  # fmt: skip
                 self.before_carveout = HEAD_BEFORE_CARVEOUT
+                self.head_state = state
         else:
             heads = attention.num_local_heads
             shape = (runtime.capacity, heads, 576)
@@ -571,7 +633,7 @@ class Attention:
                 if self.fold64.tokens < 8:  # x's tensor maps, before any capture
                     for hidden in self.runtime.hidden:
                         self.fold64.x_map(hidden[: 8 * self.fold64.tokens])
-            if self.head is not None and caches[1].dtype == torch.bfloat16:
+            if self.head is not None and caches[1].dtype == self.head_state:
                 self.head.prepare_caches(caches)
             else:
                 self.head = None
@@ -730,7 +792,8 @@ class Attention:
         if b in self.projection.fallback.kernels:
             projected = self.projection.run(x, projected)
         else:  # no generic tactic at these rows: cuBLAS, as the stock layer
-            torch.mm(x, self.weight.t(), out=projected)
+            with blas_library("cublaslt" if self.lt_rows.get(b) else None):
+                torch.mm(x, self.weight.t(), out=projected)
         attention = self.layer.self_attn
         if self.kind == "kda" and b in self.kda_stock:
             self.stock_kda(attention, projected, local)

@@ -22,7 +22,10 @@ rows; ``CtxGather(polled=True)`` then only polls, normalizes and re-arms, releas
 PDL dependents (the context_kv_proj GEMM's weight loads) right after its wait.
 
 Above CAP rows CtxGather and CtxKV take the row count from their inputs (one kernel
-each for every wider row count; the mailbox holds the largest).
+each for every wider row count; the mailbox holds the largest). A wide row count whose
+CtxGather CTAs (one per row, each polling rows the other ranks' same-row CTAs
+publish) the device cannot hold at once stays on the stock context step
+(``PreparedContext.dropped``).
 """
 
 from functools import cache
@@ -36,6 +39,7 @@ from cutlass.cute.runtime import make_fake_stream
 
 from ..common.host import (
     architecture,
+    check_residency,
     dynamic_fake,
     dynamic_view,
     fake,
@@ -337,8 +341,14 @@ class PreparedContext:
         self.gamma = model.context_norm.weight.detach()
         self.eps = Float32(model.context_norm.variance_epsilon)
         self.device = weight.device
+        index = self.device.index
         self.rows = tuple(r for r in rows if r <= CAP)
-        self.wide = tuple(r for r in rows if r > CAP)
+        wide = [r for r in rows if r > CAP]
+        # Wide rows: their CtxGather CTAs co-resident (checked on the shape-dynamic
+        # kernel; the static ones are at most CAP CTAs).
+        dynamic = compile_gather(None, shard, index) if wide else None
+        self.wide = tuple(r for r in wide if self.resident(dynamic, r))
+        self.dropped = tuple(r for r in wide if r not in self.wide)
         self.buffer = symm_mem.empty(
             (max((CAP, *self.wide)) * HIDDEN,), dtype=torch.bfloat16, device=self.device
         )
@@ -349,7 +359,6 @@ class PreparedContext:
         self.buffer.view(torch.int32).fill_(-0x80000000)
         torch.accelerator.synchronize(self.device)
         torch.distributed.barrier(group=group)
-        index = self.device.index
         self.gathers = {r: compile_gather(r, shard, index) for r in self.rows}
         for r in self.wide:
             self.gathers[r] = compile_gather(None, shard, index)
@@ -371,6 +380,15 @@ class PreparedContext:
         self.kv = {}
         self.view = to_cute(self.buffer)
         self.dynamic = dynamic_view(self.buffer)
+
+    def resident(self, compiled, rows):
+        """Whether ``rows`` CtxGather CTAs (256 threads) of ``compiled`` fit at once."""
+        try:
+            what = f"Kimi K3 DSpark context gather ({rows} rows)"
+            check_residency(compiled, self.device.index, rows, 256, what)
+        except RuntimeError:
+            return False
+        return True
 
     def combine(self, hidden):
         """context_norm(context_proj(hidden)) [rows, 7168], or None when not covered."""

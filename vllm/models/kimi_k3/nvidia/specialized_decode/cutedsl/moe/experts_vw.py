@@ -117,7 +117,7 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
         self.fc2_base = fc2_base
         super().__init__(
             experts, grid, slots, capacity, publish, stages, trace, pool, dies,
-            static_groups,
+            static_groups, tables=False,
         )  # fmt: skip
         self.wide, self.subs = (width, width // 8)
         # Accumulator big slots of ``width`` columns (one barrier pair each), then the
@@ -148,25 +148,34 @@ class RubinVWExpertsKernel(RubinWideExpertsKernel):
         self.off_tables = (self.off_misc + 5120 + 127) // 128 * 128
         self.off_sub0 = self.off_tables + 4 * self.streams
         self.off_rows = (self.off_sub0 + 4 * self.streams + 4 + 15) // 16 * 16
-        self.off_bases = self.off_rows + 16 * units
-        self.off_sbases = self.off_bases + 4 * experts
-        self.off_totals = self.off_sbases + 4 * experts
         # ``fc2_bounds``' owner table (Int16) in the activation slots while grouping.
         self.owners = fc2_base * self.streams + units
-        self.off_owner = self.off_x
-        assert 2 * self.owners <= stages * self.xslot
+        end = self.off_rows + 16 * units
+        # without the spill: bases, sbases, totals, bounds, then the transpose buffers
+        whole = end + 8 * experts + 64 + 8 * (grid + 1)
+        whole = (whole + 127) // 128 * 128 + 8 * 512
+        if self.grouping_spill(stages, whole):  # grouping-only arrays below off_misc
+            low = (2 * self.owners, 4 * experts, 4 * experts, 64)
+            self.off_owner, self.off_bases, self.off_sbases, self.off_totals = (
+                self.low_scratch(low)
+            )
+        else:
+            self.off_bases = end
+            self.off_sbases = self.off_bases + 4 * experts
+            self.off_totals = self.off_sbases + 4 * experts
+            self.off_owner = self.off_x
+            assert 2 * self.owners <= stages * self.xslot
+            end = self.off_totals + 64
         # FC2(A) / FC2(B) rank boundaries (``fc2_bounds``): [2, grid + 1] jobs.
-        self.off_bounds = self.off_totals + 64
+        self.off_bounds = end
         end = self.off_bounds + 8 * (grid + 1)
         self.off_fc2s = (end + 127) // 128 * 128  # ``fc2``'s transpose buffers
         end = self.off_fc2s + 8 * 512
-        # The token masks, then their running counts, in the weight ring while grouping.
+        # The token masks, then their running counts, in the weight ring while grouping
+        # (below off_misc past the ring: ``grouping_spill``).
         self.off_masks = 0
         self.off_prefix = 4 * self.mask_stride * experts
-        counts_end = self.off_prefix + 2 * self.mask_stride * experts
-        assert counts_end <= stages * self.slot_bytes
-        assert end <= 227 * 1024
-        self.smem_bytes = max(end, 212096)
+        self.check_smem(end)
         # FC1 partials: one plane per sub-unit of a stream (plane 0: ``ws_partial``).
         self.plane_bytes = 2 * slots * 1024 * 4
         self.ws_planes = (self.workspace_bytes + 255) // 256 * 256

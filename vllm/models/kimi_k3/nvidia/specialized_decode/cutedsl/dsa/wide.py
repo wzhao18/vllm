@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Kimi K3.1 DSA layers at the Rubin wide verify rows ``DSA_WIDE`` admits (under DCP,
-65 rows up to ``wide_max_rows``: 96 by default): round 1's prepared DSA core as Wei's
-DSA_WIDE extended it, kept as it was while #108's ``dsa.prepared.PreparedDsa`` serves
-the steps up to 64 rows.
+every row from 65 on): round 1's prepared DSA core as Wei's DSA_WIDE extended it, kept
+as it was while #108's ``dsa.prepared.PreparedDsa`` serves the steps up to 64 rows.
 
   MlaQuery (dsa)   the query rows (per-tensor FP8 [B, H, 576] on FlashInfer, BF16
                    [B, 64 (padded heads), 576] on fp8_ds_mla), the KV insert of this
@@ -18,7 +17,7 @@ the steps up to 64 rows.
                    decode of every rank's gathered heads over the local shard:
                    FlashInfer's (as the stock decode) or FlashMLA sparse
   DcpValue         the LSE merge of this rank's heads, W_UV and the sigmoid gate;
-                   on "proj" rows (VLLM_K31_DSA_PARTIALS) the W_UV bmm of every
+                   on "proj" rows (r1.AUTO_PARTIALS) the W_UV bmm of every
                    gathered head, then #108's DcpValue over its value rows
 
 The packed projection row is [q_a 1536 | kv_a 576 | gate H*128 | wk 128 | wv 32]."""
@@ -30,7 +29,6 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import make_fake_stream
 
-import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.utils.deep_gemm import mqa_logits_use_mx_scales
 from vllm.utils.torch_utils import _encode_layer_name
@@ -54,7 +52,7 @@ from . import dcp_value
 from .dcp_stage import compile_dcp_value, projected_rows, run_value
 from .dcp_value import PROJECTED
 from .index import DIM, HEADS, DsaIndex
-from .r1 import PARTIALS_ENV, DsaBox
+from .r1 import DsaBox
 
 logger = init_logger(__name__)
 
@@ -69,46 +67,33 @@ QUERY_HEADS = 64  # FlashMLA sparse FP8 decode reads 64 or 128 query heads
 # DSpark drafter included), ms/step S2-DSA -> prepared, AgentX contexts / uniform
 # 192K: q4 M72 18.07 -> 17.49 / 16.79 -> 16.18, M96 19.85 -> 19.23 / 18.58 -> 18.02;
 # q8 M72 18.22 -> 17.62 / 17.13 -> 16.53, M96 20.45 -> 19.84 / 19.25 -> 18.68; real
-# (test) weights q4 M72 16.13 -> 15.58, M96 17.53 -> 16.96.
-DSA_WIDE: dict = {"*": "65-512:1"}
-# The most rows a prepared DSA step serves by default (VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS,
-# ``wide_max_rows``), and the most whose MlaQuery polls the whole gathered mailbox from
-# every CTA: that grid (8-CTA clusters x 6 heads x 32-row tiles at DCP16) must be
-# co-resident, and Rubin holds 22 such clusters (cuOccupancyMaxActiveClusters, checked
-# at compile by ``check_query_residency``), i.e. 3 row tiles (96 rows: 18). Above it
-# each row tile polls only its own tokens (``MlaQuery(tile_poll=True)``, Wei's
-# d6347e7603): one tile's 6 clusters must be resident at once, and the tiles are
-# dispatched in order, so every rank's lowest unfinished tile is resident.
+# (test) weights q4 M72 16.13 -> 15.58, M96 17.53 -> 16.96. The serving configs ran
+# it up to 256 (C48 / C64) and 512 rows (C160 / C256, "proj" partials). Open-ended:
+# every kernel of the core serves any rows (MlaQuery's tile poll above
+# ``WIDE_MAX_ROWS``; "proj" DcpValue's merging CTAs and the BF16 one's row tiles
+# stride over at most one wave), each checked co-resident at compile; the widened box
+# holds the largest captured row. NQ-TUNE: 16-rank step vs S2-DSA above 512 rows (q4
+# M768 / M1024 / M2048, q8 M1024 / M2048, fp8 KV, AgentX contexts).
+DSA_WIDE: dict = {"*": "65-:1"}
+# The most rows whose MlaQuery polls the whole gathered mailbox from every CTA: that
+# grid (8-CTA clusters x 6 heads x 32-row tiles at DCP16) must be co-resident, and Rubin
+# holds 22 such clusters (cuOccupancyMaxActiveClusters, checked at compile by
+# ``check_query_residency``), i.e. 3 row tiles (96 rows: 18). Above it each row tile
+# polls only its own tokens (``MlaQuery(tile_poll=True)``, Wei's d6347e7603): one
+# tile's 6 clusters must be resident at once, and the tiles are dispatched in order,
+# so every rank's lowest unfinished tile is resident (any rows).
 WIDE_MAX_ROWS = 96
-# The most rows VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS admits (DL3's 128 requests x q4).
-# DcpValue's merge CTAs (one per head and 16-row tile, the only CTAs from 193 rows:
-# 192 at 512, 216 past 560) poll the partials every CTA pushes, so its whole grid must
-# be co-resident (``check_value_residency``: one 512-thread CTA per SM, 212 SMs).
-WIDE_LIMIT = 512
-
-
-def wide_max_rows() -> int:
-    """VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS: the most wide rows WideDsa serves (64: none),
-    read when the providers are built."""
-    rows = envs.VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS
-    if not 64 <= rows <= WIDE_LIMIT:
-        raise ValueError(
-            f"VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS={rows}: expected 64 to {WIDE_LIMIT}"
-        )
-    return rows
 
 
 def choose(shape, ctx):
     """Prepared DSA core at a decode shape: GENERIC at the tuned rows, GENERIC "wide"
-    where ``DSA_WIDE`` admits a Rubin DCP verify shape of at most ``wide_max_rows``,
-    else None (seam S2-DSA)."""
+    where ``DSA_WIDE`` admits a Rubin DCP verify shape, else None (seam S2-DSA)."""
     if shape.rows <= 64:
         return Choice(Path.GENERIC)
     admitted = (
         ctx.arch == "rubin"
         and ctx.dcp > 1
         and shape.q > 1
-        and shape.rows <= wide_max_rows()
         and rows_policy(DSA_WIDE, shape, 0)
     )
     return Choice(Path.GENERIC, tactic="wide", note="prepared") if admitted else None
@@ -249,8 +234,11 @@ def check_value_residency(compiled, heads, dcp, batch, q, sms, device):
     poll the partials that every CTA pushes first); returns the grid. The DSA value
     runs the GB300 schedule (``compile_value``: SMs capped at GB300_SMS): DCP16, 6
     heads, 6 x 16-row tiles x pushers, e.g. 144 CTAs at 96 rows, 96 at 256, 192 at
-    512, against one 512-thread CTA per SM on Rubin."""
-    grid = DcpValue(heads, dcp, batch, min(sms, GB300_SMS), q).grid
+    512; above one wave of the device's real SMs (Rubin: 6 x 36 tiles = 216 > 212,
+    from 561 rows) each merging CTA strides over the row tiles
+    (``mla.dcp.DcpValue.tile_stride``: 6 x 35 = 210 CTAs at any rows), against one
+    512-thread CTA per SM on Rubin."""
+    grid = DcpValue(heads, dcp, batch, min(sms, GB300_SMS), q, resident_sms=sms).grid
     what = f"Kimi K3.1 DSA wide rows: DcpValue (batch {batch})"
     check_residency(compiled, device, grid[0] * grid[1] * grid[2], 512, what)
     return grid
@@ -295,7 +283,8 @@ class WideDsa:
     prepared for every batch divisible by q; ``dcp``: the model's DSA DcpBox, whose
     widened box (``DcpBox.widened``) serves the batches above its rows; ``core``: the
     TP sparse core of the shared provider policy (unused: DCP only); ``partials``:
-    the DcpValue partials of its batches (r1.DsaBox; None: VLLM_K31_DSA_PARTIALS)."""
+    the DcpValue partials of its batches (r1.DsaBox; None: r1.AUTO_PARTIALS on
+    FlashInfer sparse, else "bf16")."""
 
     def __init__(
         self,
@@ -356,16 +345,18 @@ class WideDsa:
         rows, device = max(pitches), self.device
         padded = dcp.q_heads
         wide = rows > dcp.cap
-        widened = dcp.widened(rows) if wide else dcp
+        # (the widened box's BF16 partial mailboxes only if a batch exchanges BF16
+        # latent partials: DsaBox adds them)
+        widened = dcp.widened(rows, partials=False) if wide else dcp
         self.boxes = {b: widened if b > dcp.cap else dcp for b in pitches}
         # "proj" batches exchange #108's value rows through the widened box's
         # DcpMailbox (collective, in layer order), from the layer's gathered W_UV
         # (PreparedDsa's, if it took it) and the bmm's rows.
-        self.dsa_box = DsaBox(widened, pitches, partials)
+        self.dsa_box = DsaBox(widened, pitches, partials, fp8=self.fp8)
         if self.dsa_box.projected and not self.fp8:
             raise ValueError(
-                f'Kimi K3.1 WideDsa: "proj" partials ({PARTIALS_ENV}) need the '
-                "FLASHINFER_MLA_SPARSE backend"
+                f'Kimi K3.1 WideDsa: "proj" partials ({self.dsa_box.partials}) need '
+                "the FLASHINFER_MLA_SPARSE backend"
             )
         self.uv_gathered = self.dsa_box.value_weights(layer)
         if self.uv_gathered is not None:
@@ -415,20 +406,38 @@ class WideDsa:
         rows = sorted(b for b, _ in self.shapes)
         proj = [b for b in rows if self.dsa_box.mailbox(b).format == PROJECTED]
         logger.info_once(
-            "Kimi K3.1 WideDsa (DCP %d): rows %s, widened DSA box %d rows, MlaQuery "
-            "tile poll above %d rows (VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS=%d), DcpValue "
-            'partials %s=%s ("proj" at rows %s)',
+            "Kimi K3.1 WideDsa (DCP %d): rows %s, widened DSA box %d rows (%s), "
+            'MlaQuery tile poll above %d rows, DcpValue partials %s ("proj" at rows '
+            "%s)",
             self.dcp,
             " ".join(map(str, rows)),
             max(box.cap for box in self.boxes.values()),
+            self.memory(),
             WIDE_MAX_ROWS,
-            wide_max_rows(),
-            PARTIALS_ENV,
             self.dsa_box.partials,
             " ".join(map(str, proj)) or "none",
             scope="global",
         )
         return self
+
+    def memory(self):
+        """The widened box's memory per GPU, shared by every DSA layer: its q (and,
+        for "bf16" batches, BF16 partial / LSE) mailboxes, the "proj" mailbox and the
+        W_UV bmm's value rows; MiB."""
+        box = max(self.boxes.values(), key=lambda b: b.cap)
+        symmetric, local = box.nbytes()
+        parts = [f"q + BF16 partials {symmetric / 2**20:.0f} MiB symmetric"]
+        if box.partial is None:
+            parts[0] = f"q mailbox {symmetric / 2**20:.0f} MiB symmetric"
+        if local:
+            parts.append(f"rows {local / 2**20:.0f} MiB")
+        if self.dsa_box.projected:
+            mail = self.dsa_box.mailboxes[PROJECTED]
+            proj = (mail.partial.nbytes + mail.lse.nbytes) / 2**20
+            rows = projected_rows(self.device, box.cap, self.dcp * self.heads)
+            parts.append(f'"proj" mailbox {proj:.0f} MiB symmetric')
+            parts.append(f"value rows {rows.nbytes / 2**20:.0f} MiB")
+        return ", ".join(parts)
 
     def indexer_core(self, projected, batch):
         """Top-k of the current rows into the shared buffer (stock decode scoring of

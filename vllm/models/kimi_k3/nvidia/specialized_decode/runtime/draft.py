@@ -18,7 +18,11 @@ The policy tables are keyed by rows (``shapes.rows_policy`` at Shape(rows, draft
 length)): query rows R = requests x draft length for the backbone, the LM head and the
 all-reduce sites, context rows C = requests x (1 + draft length) for the context step;
 the Markov tables by requests (the kernel's width). Every decision is a pure function
-of the deployment, the same on every rank.
+of the deployment, the same on every rank. A range written "lo-" (no upper end) is
+open: it covers every larger count the deployment captures (``closed``), where the
+kernels are shape-generic and size their buffers from the captured rows; what a
+kernel cannot hold (shared memory, co-residency) is dropped at build and logged, and
+stays on the stock path.
 """
 
 import torch
@@ -40,7 +44,12 @@ logger = init_logger(__name__)
 # memory once per CTA (``staged``: from B3 the per-warp fragment loads touch a line per
 # request; 16 ranks, us: B4 34.76 -> 30.47, B8 41.26 -> 31.69, drafts identical; B1 /
 # B2 lose ~0.5 / ~1.4 to the extra barrier). GB300 keeps the stock drafter.
-FUSED_MARKOV = {8: "1-8:1", 16: "1-2:2,3-8:3,9-64:1"}
+# (hb192: 9-128, MarkovWide's 128 slots; above them, and above the device's
+# per-launch slots (markov_wide.launch_width), consecutive launches over request
+# slices: the same drafts.) Markov rank 512 (128 rows per CTA, markov.CTA_ROWS) takes
+# the rank-256 choices. NQ-TUNE: rank 512 gate / staged / settle per batch
+# (scripts/dsdraft/markov_test.py at B1-B8) and B65-B192 launches vs the stock loop.
+FUSED_MARKOV = {8: "1-8:1", 16: "1-2:2,3-8:3,9-:1"}
 # FUSED_MARKOV requests whose kernel waits at a CTA barrier between each position's key
 # poll and its shuffle maxima (cutedsl.draft.markov ``settle``), per TP. 16 ranks, real
 # DSpark weights, us: B1 31.19 -> 30.65 (31.37 -> 30.73), B2 / B8 flat; drafts
@@ -71,12 +80,18 @@ WIDE_LM_HEAD = {16: "10-64:1"}  # (B9's 63 rows: within lmhead.WIDE_ROWS)
 CONTEXT_OVERLAP = {16: "1-63:1"}
 # Query rows whose MLA layers (DCP = TP) exchange queries and partials through the
 # specialized decode's Lamport mailboxes (cutedsl.draft.attention), per TP, on Rubin.
-FAST_DCP = {8: "1-64:1", 16: "1-512:1"}
+# (hb192: to 576 query rows, DL3 B192; open above: cutedsl.draft.attention DraftDcp
+# keeps the wide rows whose DcpValue grid is co-resident, with the work list where it
+# fits mla.wlist's packing.)
+# NQ-TUNE: drafter wide rows above 576 (DL7 B83+, DL3 B193+) vs the stock DCP path.
+FAST_DCP = {8: "1-64:1", 16: "1-:1"}
 # Context rows whose context step runs the sharded context projection + Lamport row
 # gather and the fused context-KV epilogue (cutedsl.draft.context; above 64 rows the
 # shape-dynamic kernels and the stock shard GEMM), per TP, on Rubin. It replaces the
 # replicated context_proj GEMM (514 MB of weights per rank).
-FAST_CONTEXT = {8: "1-64:1", 16: "1-512:1"}
+# (hb192: to 768 context rows, DL3 B192; open above: cutedsl.draft.context keeps the
+# rows its per-row gather CTAs can hold at once.) NQ-TUNE: above 768 context rows.
+FAST_CONTEXT = {8: "1-64:1", 16: "1-:1"}
 # Query rows whose forward runs the all-reduce + residual + RMSNorm sites as Lamport
 # kernels (cutedsl.draft.allreduce): 1 one-shot, 2 two-shot (common.twoshot), per TP,
 # on Rubin. 16 ranks, us/site one-shot / two-shot (scripts/dsdraft/ar_test.py, chain
@@ -87,7 +102,11 @@ FAST_CONTEXT = {8: "1-64:1", 16: "1-512:1"}
 # bitwise), on the stock GEMMs' partials. 4 ranks + 12 emulated, us per site with its
 # o_proj / down_proj GEMM (cuBLAS), 112 / 168 / 224 rows: 10.66 / 11.23 / 17.22 (K 512),
 # 11.51 / 11.97 / 17.98 (K 896); serving's stock GEMM + FlashInfer site ~19-25.
-FAST_AR = {8: "1-7:1", 16: "1-7:1,8-64:2,65-256:3"}
+# (hb192: ArNormRows to 576 query rows, DL3 B192; open above, its two-shot box sized
+# from the deployment's rows. Beyond one wave of 1024-thread CTAs a row's CTA waits
+# only on the same row's CTAs of the other ranks, which push before they wait.)
+# NQ-TUNE: ArNormRows above 576 rows (DL7 B83+) vs the stock site.
+FAST_AR = {8: "1-7:1", 16: "1-7:1,8-64:2,65-:3"}
 # FAST_AR one-shot batches whose sites gate their 16-source poll on one fragment per
 # source (cutedsl.draft.allreduce ``gate``), per TP, on Rubin. 16 ranks, the B1
 # drafter forward (scripts/dsdraft/layer_test.py, in process), us ungated -> gated:
@@ -116,6 +135,11 @@ VALID_AR = {16: "1-7:1"}
 # context shard at split 14 (clusters of 14 CTAs): 16 ranks, sharded projection +
 # CtxGather 10.13 -> 8.62 us, + the context-KV GEMM 14.89 -> 13.77 vs split 8
 # (scripts/dsdraft/ctx_test.py); the same distance to stock (max rel 3.3e-3).
+# kimi-k3.1-pro-dspark-preview (96 heads: 6 per rank) has q_b (1152, 1536) and o_proj
+# (7168, 768) (``DRAFT_96``): q_b at the 64-head q_b's split (K 1536 = 4 x 3 tiles of
+# 128, 18 M tiles instead of 12), o_proj as the K 512 / 896 neighbours (split 1, all
+# 6 K tiles staged). NQ-TUNE: sweep both (scripts/dsdraft/gemm_sweep.py) at <= 8 rows.
+DRAFT_96 = {(1152, 1536): (64, 8, 4, 4), (7168, 768): (64, 8, 1, 6)}
 PROJECTIONS = {
     16: {
         (2112, 7168): (64, 8, 4, 10),
@@ -125,6 +149,7 @@ PROJECTIONS = {
         (7168, 896): (64, 8, 1, 8),
         (2880, 7168): (64, 8, 4, 8),
         (448, 35840): (64, 8, 14, 10),
+        **DRAFT_96,
     }
 }
 PROJECTION_ROWS = 8
@@ -154,6 +179,9 @@ PROJECTIONS_WIDE = {
                 (768, 1536): (64, 16, 4, 6),
                 (7168, 512): (64, 16, 1, 8),
                 (7168, 896): (64, 16, 1, 8),
+                # (96 heads; NQ-TUNE: 9-16 rows)
+                (1152, 1536): (64, 16, 4, 6),
+                (7168, 768): (64, 16, 1, 8),
             },
         ),
         (
@@ -163,6 +191,7 @@ PROJECTIONS_WIDE = {
                 (1792, 7168): (64, 32, 4, 6),
                 (2880, 7168): (64, 32, 4, 6),
                 (7168, 512): (64, 32, 1, 4),
+                (7168, 768): (64, 32, 1, 6),  # (96 heads; NQ-TUNE: 17-32 rows)
             },
         ),
         (
@@ -189,11 +218,14 @@ PROJECTIONS_WIDE = {
 # 4 ranks, B1, the drafter forward with the qkv_a GEMM and a stand-in attention (5
 # layers, scripts/dsdraft/chain_test.py): 138.3 -> 126.7 (rings) -> 110.6 (+ fused
 # SiLU) -> 100.9 (+ early release) -> 99.1 us (10 stages; 11-12: same, split 7: +8).
+# 96 heads: o_proj (7168, 768) with every one of its 6 K tiles staged (NQ-TUNE: the
+# B1 chain at 6 heads per rank, scripts/dsdraft/chain_test.py).
 RING_PROJECTIONS = {
     16: {
         (7168, 512): (64, 8, 1, 4),
         (7168, 896): (64, 8, 1, 7),
         (1792, 7168): (64, 8, 4, 10),
+        (7168, 768): (64, 8, 1, 6),
     }
 }
 # Query rows with two-shot sites (FAST_AR 2) whose o_proj / down_proj run as
@@ -243,6 +275,14 @@ class DraftProjectionMethod:
         return getattr(self.base, name)
 
 
+def tabled_shapes(tp):
+    """Every (N, K) some split-K table of ``tp`` lists (any row bin)."""
+    shapes = set(PROJECTIONS.get(tp, {}))
+    for _, table in PROJECTIONS_WIDE.get(tp, ()):
+        shapes |= set(table)
+    return shapes
+
+
 def projection(weight, tp, rows):
     """The prepared split-K projection of ``weight`` for ``rows`` (or None)."""
     shape = tuple(weight.shape)
@@ -274,6 +314,24 @@ def install_projections(model, tp, query_rows, context_rows):
         linears += [(mlp.down_proj, query_rows)]
     linears.append((model.model.context_kv_proj, context_rows))
     installed = 0
+    # Shapes no table lists (a new drafter geometry): their rows stay on cuBLAS.
+    tabled = tabled_shapes(tp)
+    missing = sorted(
+        {
+            tuple(linear.weight.shape)
+            for linear, _ in linears
+            if linear is not None
+            and getattr(linear, "bias", None) is None
+            and tuple(linear.weight.shape) not in tabled
+        }
+    )
+    if tabled and missing:
+        logger.warning_once(
+            "Kimi K3 DSpark drafter: no split-K tactic for linear shapes (N, K) %s at "
+            "TP%d: they run cuBLAS",
+            tuple(missing),
+            tp,
+        )
     for linear, rows in linears:
         if linear is None or getattr(linear, "bias", None) is not None:
             continue
@@ -288,6 +346,21 @@ def covered(entry, rows, steps):
     """A rows-keyed drafter table's value at ``rows`` of a draft length ``steps``
     deployment (None: not covered)."""
     return rows_policy(entry, Shape(rows, steps), default=None)
+
+
+def closed(spec, top):
+    """``spec`` with its open ranges ("lo-:value": every count from lo) closed at
+    ``top``, the deployment's largest count (a ``batch_table`` spec)."""
+    items = []
+    for item in filter(None, spec.split(",")):
+        span, value = item.split(":")
+        if span.endswith("-"):
+            lo = int(span[:-1])
+            if lo > top:
+                continue
+            span = f"{lo}-{top}"
+        items.append(f"{span}:{value}")
+    return ",".join(items)
 
 
 def draft_batches(vllm_config, steps):
@@ -363,7 +436,9 @@ class DraftFastPath:
         tp, rank = group.world_size, group.rank_in_group
         steps = spec.num_speculative_tokens
         all_batches = draft_batches(vllm_config, steps)
-        table = batch_table(FUSED_MARKOV.get(tp, ""))
+        # The open tables' ranges end at the deployment's largest drafter graph.
+        top = max(all_batches, default=0)
+        table = batch_table(closed(FUSED_MARKOV.get(tp, ""), top))
         settle = batch_table(SETTLED_MARKOV.get(tp, ""))
         head = model.model.markov_head
         processor = model.logits_processor
@@ -371,10 +446,11 @@ class DraftFastPath:
         # draws FP64 noise or watermarks drafts (the stock loop keeps those).
         sampled = spec.draft_sample_method == "probabilistic"
         batches = []
+        shapes = tuple(head.markov_w1.weight.shape), tuple(head.markov_w2.weight.shape)
         if (
             processor.scale == 1.0
             and processor.soft_cap is None
-            and head.markov_w1.weight.shape == head.markov_w2.weight.shape
+            and shapes[0] == shapes[1]
             and model.config.draft_vocab_size == model.config.vocab_size
             and not (
                 sampled
@@ -385,6 +461,19 @@ class DraftFastPath:
             )
         ):
             batches = [b for b in all_batches if table.get(b)]
+        if batches:
+            # Markov heads the fused kernels do not cover (rank, vocabulary split,
+            # co-residency) keep the stock Markov loop instead of failing the load.
+            from ..cutedsl.draft.markov import device_limits, supports
+
+            if not supports(*shapes, tp, device_limits(device)):
+                logger.warning_once(
+                    "Kimi K3 DSpark drafter: Markov head %s at TP%d is not covered by "
+                    "the fused Markov kernels; the stock Markov loop drafts",
+                    shapes[1],
+                    tp,
+                )
+                batches = []
         markov = None
         if batches:
             from ..cutedsl.draft.markov import MAX_WIDTH, PreparedMarkov
@@ -401,12 +490,29 @@ class DraftFastPath:
                 settled=[b for b in batches if settle.get(b)],
                 wide=max(batches) > MAX_WIDTH,
             )
+            # (wide batches need one launch of at least 8 slots: the device's shared
+            # memory at this Markov rank; markov_wide.launch_width)
+            uncovered = [b for b in batches if not markov.covers(b, sampled)]
+            if uncovered:
+                logger.warning_once(
+                    "Kimi K3 DSpark drafter: draft batches %s keep the stock Markov "
+                    "loop (no MarkovWide launch fits this device at Markov rank %d)",
+                    tuple(uncovered),
+                    markov.markov_rank,
+                )
+                batches = [b for b in batches if b not in uncovered]
             for batch in batches:
                 markov.prepare(batch, steps, steps, sampled)
+            if not batches:
+                markov = None
         context = [
             b * (steps + 1)
             for b in all_batches
-            if covered(FAST_CONTEXT.get(tp, ""), b * (steps + 1), steps)
+            if covered(
+                closed(FAST_CONTEXT.get(tp, ""), top * (steps + 1)),
+                b * (steps + 1),
+                steps,
+            )
         ]
         if context and model.model.context_proj.weight.shape[0] % tp == 0:
             from ..cutedsl.draft.context import PreparedContext
@@ -419,8 +525,14 @@ class DraftFastPath:
             model.model._fast_context = prepared
             logger.info_once(
                 "Kimi K3 DSpark drafter: sharded context step for %s rows",
-                tuple(context),
+                (*prepared.rows, *prepared.wide),
             )
+            if prepared.dropped:
+                logger.warning_once(
+                    "Kimi K3 DSpark drafter: context rows %s keep the stock context "
+                    "step (their row-gather CTAs are not co-resident)",
+                    prepared.dropped,
+                )
         query_rows = [b * steps for b in all_batches]
         context_rows = [b * (steps + 1) for b in all_batches]
         installed = install_projections(model, tp, query_rows, context_rows)
@@ -428,7 +540,8 @@ class DraftFastPath:
             logger.info_once(
                 "Kimi K3 DSpark drafter: split-K projections on %d linears", installed
             )
-        policy = lambda table, r: covered(table.get(tp, ""), r, steps)
+        top_rows = top * steps  # (the open query-row ranges end here)
+        policy = lambda table, r: covered(closed(table.get(tp, ""), top_rows), r, steps)
         ar_rows = [r for r in query_rows if policy(FAST_AR, r)]
         two_shot = {r for r in ar_rows if policy(FAST_AR, r) == 2}
         gated = {r for r in ar_rows if policy(GATED_AR, r)}
@@ -456,6 +569,20 @@ class DraftFastPath:
                 rings = RING_PROJECTIONS.get(tp, {})
                 tactics = {r: rings for r in prepared_ar.rows if r <= PROJECTION_ROWS}
                 layers = model.model.layers
+                # The one-shot rows' ring producers need both o_proj's and down_proj's
+                # shapes in RING_PROJECTIONS (else their sites keep stored partials).
+                ring_shapes = {
+                    tuple(layers[0].self_attn.o_proj.weight.shape),
+                    tuple(layers[0].mlp.down_proj.weight.shape),
+                }
+                if tactics and not ring_shapes <= set(rings):
+                    logger.warning_once(
+                        "Kimi K3 DSpark drafter: no ring projection for %s at TP%d: "
+                        "rows %s keep stored partials (no polled sites)",
+                        tuple(sorted(ring_shapes - set(rings))),
+                        tp,
+                        tuple(sorted(tactics)),
+                    )
                 deferred = {r for r in prepared_ar.valid_ar if policy(SITE_DEFERRED, r)}
                 prepared_ar.prepare_producers(layers, tactics, deferred, trigger=True)
                 from ..cutedsl.draft.producer import ROWS, TwoShotProducer
@@ -504,17 +631,51 @@ class DraftFastPath:
         dcp = vllm_config.parallel_config.decode_context_parallel_size
         rows = [r for r in query_rows if policy(FAST_DCP, r)]
         if dcp == tp > 1 and rows and all(a.dcp_world_size == tp for a in attentions):
-            from ..cutedsl.draft.attention import DraftDcp
+            from ..cutedsl.draft.attention import DraftDcp, query_heads
 
-            DraftDcp(
-                attentions, group.device_group, tp, rank, rows, steps,
-                vllm_config.model_config.max_model_len,
-                vllm_config.parallel_config.cp_kv_cache_interleave_size,
-            )  # fmt: skip
-            logger.info_once(
-                "Kimi K3 DSpark drafter: Lamport DCP attention for %s rows",
-                tuple(rows),
-            )
+            heads = attentions[0].num_local_heads
+            if not query_heads(heads):
+                # (MlaQuery's drafter tile is keyed by heads per rank: mla.query
+                # DRAFT_TILED_FROM)
+                logger.warning_once(
+                    "Kimi K3 DSpark drafter: no fused drafter query for %d heads per "
+                    "rank; the drafter's MLA layers keep the stock DCP attention",
+                    heads,
+                )
+            else:
+                from vllm.model_executor.models.qwen3_dflash import (
+                    dflash_has_any_non_causal,
+                )
+
+                # The drafter's mask as stock resolves it (DFlashSpeculator: causal
+                # unless some layer is non-causal; the 64-head kimi-k3-dspark is not,
+                # kimi-k3.1-pro-dspark-preview's dflash_config.causal is).
+                causal = not dflash_has_any_non_causal(model.config)
+                prepared_dcp = DraftDcp(
+                    attentions, group.device_group, tp, rank, rows, steps,
+                    vllm_config.model_config.max_model_len,
+                    vllm_config.parallel_config.cp_kv_cache_interleave_size,
+                    causal,
+                )  # fmt: skip
+                served = (*prepared_dcp.rows, *prepared_dcp.wide)
+                logger.info_once(
+                    "Kimi K3 DSpark drafter: Lamport DCP attention (%s) for %s rows",
+                    "causal" if causal else "non-causal",
+                    tuple(served),
+                )
+                # (per cause: DraftDcp.dropped)
+                reasons: dict[str, list[int]] = {}
+                for r in rows:
+                    if r not in served:
+                        reason = prepared_dcp.dropped.get(r, "not covered")
+                        reasons.setdefault(reason, []).append(r)
+                for reason, dropped in reasons.items():
+                    logger.warning_once(
+                        "Kimi K3 DSpark drafter: rows %s keep the stock DCP attention "
+                        "(%s)",
+                        tuple(dropped),
+                        reason,
+                    )
         logger.info_once(
             "Kimi K3 DSpark drafter: fused %s Markov sampling for draft batches %s",
             "probabilistic" if sampled else "greedy",

@@ -84,7 +84,7 @@ from .query_stage import (
     front_kernel,
     gate_columns,
 )
-from .r1 import PARTIALS_ENV, DsaBox, fi_buffers
+from .r1 import DsaBox, fi_buffers
 
 logger = init_logger(__name__)
 
@@ -225,7 +225,7 @@ class PreparedDsa:
     The round-1 runtime's arguments are taken too (r1.py): ``core`` "auto", its
     scratch (the last item a BF16 latent: FlashInfer's buffers are r1.fi_buffers)
     and its DSA DcpBox (wrapped in r1.DsaBox, whose DcpValue partials are
-    ``partials``; None: VLLM_K31_DSA_PARTIALS).
+    ``partials``; None: r1.AUTO_PARTIALS on FlashInfer sparse, else "bf16").
     """
 
     def __init__(
@@ -267,10 +267,10 @@ class PreparedDsa:
         if core != "auto":
             raise ValueError(f"Kimi K3.1 DSA core {core!r}: only auto is served")
         if dcp is not None and not hasattr(dcp, "mailboxes"):
-            dcp = DsaBox(dcp, pitches, partials)
+            dcp = DsaBox(dcp, pitches, partials, fp8=self.fp8)
         if dcp is not None and PROJECTED in dcp.mailboxes and not self.fp8:
             raise ValueError(
-                f'Kimi K3.1 specialized DSA: "proj" partials ({PARTIALS_ENV}) need '
+                f'Kimi K3.1 specialized DSA: "proj" partials ({dcp.partials}) need '
                 "the FLASHINFER_MLA_SPARSE backend"
             )
         self.box, self.parity = dcp, parity
@@ -456,10 +456,9 @@ class PreparedDsa:
         if unserved:
             logger.warning_once(
                 "Kimi K3.1 DSA sparse core (VLLM_K31_DSA_CORE): rows x q %s exchange "
-                '"proj" partials (%s=%s), which the core does not push: they run '
+                '"proj" partials (%s), which the core does not push: they run '
                 "FlashInfer's decode",
                 " ".join(unserved),
-                PARTIALS_ENV,
                 self.box.partials,
                 scope="global",
             )
@@ -511,9 +510,8 @@ class PreparedDsa:
                     f" (mailbox {mailbox:.1f} MiB, W_UV {weights:.1f} MiB per layer)"
                 )
             logger.info_once(
-                "Kimi K3.1 specialized DSA: DcpValue partials %s=%s, "
+                "Kimi K3.1 specialized DSA: DcpValue partials %s, "
                 '"proj" at rows %s%s',
-                PARTIALS_ENV,
                 box.partials,
                 " ".join(map(str, proj)) or "none",
                 memory,

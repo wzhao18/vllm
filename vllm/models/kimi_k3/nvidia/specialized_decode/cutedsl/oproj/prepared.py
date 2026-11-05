@@ -41,8 +41,12 @@ OPROJ_ROWS = 64
 # into a ``TwoShot.rows_box`` sized to the deployment's largest graph, and the
 # reduced-gather consumer with its AttnRes; other wide shapes take seam S3 (the stock
 # o-projection + all-reduce, then the unfused AttnRes). Keyed per TP on token rows
-# (``shapes.rows_policy``: every q).
-WIDE_TWOSHOT = {16: "65-512:1"}
+# (``shapes.rows_policy``: every q). Open-ended: ``OprojUmmaRows`` keeps its fixed
+# 112-CTA grid at any rows (one mbarrier per chunk, chunks looped), the consumer's
+# per-token clusters poll only the producer's gather (the producer is resident before
+# the PDL launch), and the box is the deployment's largest graph. 65-768 measured as
+# the overlay's (hb192).
+WIDE_TWOSHOT = {16: "65-:1"}
 # Rubin wide shapes whose ``OprojUmmaRows`` runs one chunk of this many token rows
 # instead of 64-row chunks, per TP on token rows (``shapes.rows_policy``): at 65-80
 # rows a second 64-row chunk (up to 16 real rows) repeats the chunk's MMAs, drain,
@@ -50,7 +54,8 @@ WIDE_TWOSHOT = {16: "65-512:1"}
 # same K blocks and the same rounding: bitwise. 192-256 rows (DL7 B24-32, DL3 B48-64):
 # 96-row chunks, two at 192 rows and three at 200-256 instead of three / four 64-row
 # ones (axhb, 16 ranks, 93 layers, 32k, us/step: B24 -16, B28 -54, B32 -79; B17 at
-# 136 rows +13, so no row below 192).
+# 136 rows +13, so no row below 192). Above 256 rows: 64-row chunks (NQ-TUNE: 96-row
+# chunks at 288-2048 rows, 16 ranks, us/step; 96 divides 288 / 384 / 576 / 768 / 1152).
 WIDE_CHUNK = {16: "65-80:80,192-256:96"}
 
 
