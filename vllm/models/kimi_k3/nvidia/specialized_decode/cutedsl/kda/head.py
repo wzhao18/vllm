@@ -1386,7 +1386,7 @@ STATE_DTYPES = (torch.bfloat16, torch.float32)
 
 def head_supported(
     heads, state_dtype, has_bias, hidden, batch, q=1, tile=HEAD_TILE, *, core=None,
-    fa_width=0, cache_tokens=1, tp=16,
+    fa_width=0, cache_tokens=1, tp=16, strict=False,
 ):  # fmt: skip
     """Whether a KdaHead kernel serves ``batch`` token rows at verify length ``q``
     (q = 1: ``KdaHead`` / ``KdaHeadWide``; batch == q: ``KdaHeadVerify``; else
@@ -1413,7 +1413,7 @@ def head_supported(
     specs = probe_specs(core, state_dtype, fa_width, batch, q, cache_tokens)
     return head_compiles(
         heads, state_dtype, has_bias, hidden, batch, q, tile, specs,
-        architecture(device), device.index, polled,
+        architecture(device), device.index, polled, strict=strict,
     )  # fmt: skip
 
 
@@ -1498,10 +1498,12 @@ def probe_specs(core, state_dtype, fa_width, batch, q=1, cache_tokens=1, slots=1
 @cache
 def head_compiles(
     heads, state_dtype, has_bias, hidden, batch, q, tile, specs, arch, device, polled,
+    strict=False,
 ):  # fmt: skip
     """``head_supported``'s compile check: the KdaHead kernel(s) of the shape compile
     for ``arch`` (``compile_head`` / ``compile_head_verify`` / ``compile_head_multi``,
-    whose caches keep the code). A failure is logged and keeps the pair."""
+    whose caches keep the code). A failure is logged and keeps the pair (``strict``,
+    the no-fallback target topology, with a BF16 state: raises)."""
     bf16_state = state_dtype == torch.bfloat16
     variants = (False, True) if polled else (False,)
     try:
@@ -1527,6 +1529,16 @@ def head_compiles(
                         polled_out, tokens=q,
                     )  # fmt: skip
     except Exception as error:  # noqa: BLE001 - any compile failure keeps the pair
+        if bf16_state and strict:
+            # NQ-NOFALLBACK (target topology only): with the measured BF16 state the
+            # head is meant to cover the shape (HEAD_BATCHES / HEAD_MULTI, shared
+            # memory checked): a compile failure is a bug, not a policy. (FP32
+            # state: the head is untuned there and the pair below is the specialized
+            # path, logged in the coverage. Elsewhere: logged, as before.)
+            raise RuntimeError(
+                f"Kimi K3 KdaHead ({batch} rows x q{q}, BF16 recurrent state) did "
+                f"not compile for {arch} (NQ-NOFALLBACK): {error}"
+            ) from error
         logger.warning(
             "Kimi K3 KdaHead (%d rows x q%d, %s recurrent state%s) did not compile "
             "for %s (%s: %s): those KDA rows run the in-projection -> KdaSplit pair",

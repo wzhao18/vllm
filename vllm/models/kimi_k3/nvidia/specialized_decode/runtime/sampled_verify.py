@@ -39,12 +39,15 @@ and lets its dependent launch early (the exchanges wait before theirs).
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, tldevice, triton
 from vllm.v1.worker.gpu.sample.gumbel import (
     gumbel_noised_argmax,
     spec_step_seed,
     tl_rand32,
 )
+
+logger = init_logger(__name__)
 
 STATS_WORDS = 8  # round 1 entry: t_max t_sum q_max q_sum t_tok q_tok key_lo key_hi
 CAND_WORDS = 4  # round 2 entry: key_lo key_hi mass one
@@ -527,11 +530,19 @@ class SampledVerify:
     def build(cls, vllm_config, model):
         """None unless the draws are FP32 (no fp64 Gumbel). The caller checked
         ``VerifyArgmax.build``'s conditions (Rubin, TP group, plain sharded LM head)."""
-        if vllm_config.model_config.use_fp64_gumbel:
-            return None
         from vllm.distributed import get_tp_group
 
         group = get_tp_group()
+        if vllm_config.model_config.use_fp64_gumbel:
+            # NQ-NOFALLBACK: the stock sampler would verify every sampled step:
+            # refused on the target topology; elsewhere kept (stock), logged.
+            from ..shapes import config_target, refuse
+
+            cause = "FP64 Gumbel draws (use_fp64_gumbel)"
+            if config_target(vllm_config, group.world_size):
+                refuse("sampled verification", cause)
+            logger.info_once("Kimi K3 sampled verification: stock sampler (%s)", cause)
+            return None
         shard = model.lm_head.shard_indices
         vocab_rank = shard.org_vocab_end_index - shard.org_vocab_start_index
         device = torch.device(torch.cuda.current_device())

@@ -62,6 +62,7 @@ import torch.distributed._symmetric_memory as symm_mem
 from cutlass import Float32, Int32, Int64, Uint32, Uint64
 from cutlass.cute.runtime import make_fake_stream
 
+from ...shapes import Shape, full_capture, refuse
 from ..common.embedding import compile_ring_gather
 from ..common.host import (
     architecture,
@@ -649,6 +650,9 @@ class PreparedDraftAr:
         valid=(), wide=(),
     ):  # fmt: skip
         self.tp, self.rank, self.device = tp, rank, device
+        # NQ-NOFALLBACK: set by runtime.draft on the target topology: a captured
+        # drafter graph of a prepared row runs these sites or raises.
+        self.strict = False
         cap = WIDE_CAP or max(rows, default=0)
         self.wide_rows = frozenset(r for r in rows if r in wide and 64 < r <= cap)
         self.rows = tuple(
@@ -875,16 +879,26 @@ class PreparedDraftAr:
     def run(self, model, input_ids, positions):
         rows = input_ids.shape[0]
         self.stamp_index = 0
-        if (
-            rows not in self.reduce
-            or not torch.cuda.is_current_stream_capturing()
-            or input_ids.dtype != torch.int32
-            or not input_ids.is_contiguous()
-            or model.embed_tokens is None
-        ):
-            return None
-        weight = model.embed_tokens.weight
-        if weight.shape[0] != self.shard or not weight.is_contiguous():
+        if not torch.cuda.is_current_stream_capturing():
+            return None  # eager: no graph, the stock layers and all-reduce
+        weight = getattr(model.embed_tokens, "weight", None)
+        checks = (
+            (rows not in self.reduce, "rows without prepared sites"),
+            (input_ids.dtype != torch.int32, f"input ids {input_ids.dtype}"),
+            (not input_ids.is_contiguous(), "strided input ids"),
+            (weight is None, "no embedding"),
+            (
+                weight is not None and weight.shape[0] != self.shard,
+                "an embedding shard other than the vocabulary / TP rows",
+            ),
+            (weight is not None and not weight.is_contiguous(), "a strided embedding"),
+        )
+        reason = next((why for failed, why in checks if failed), None)
+        if reason is not None:
+            # NQ-NOFALLBACK: a captured drafter graph never captures the stock layers
+            # + FlashInfer all-reduce (``strict``: the target topology).
+            if self.strict and full_capture():
+                refuse("DSpark drafter all-reduce sites", reason, Shape(rows))
             return None
         empty = lambda: torch.empty(  # noqa: E731
             (rows, HIDDEN), dtype=weight.dtype, device=weight.device

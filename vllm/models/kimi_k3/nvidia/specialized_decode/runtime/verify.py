@@ -16,6 +16,7 @@ import torch
 from vllm.logger import init_logger
 
 from ..cutedsl.verify.argmax import MAX_ROWS, THREADS, VECTOR
+from ..shapes import config_target, log_coverage, refuse
 
 logger = init_logger(__name__)
 
@@ -51,17 +52,34 @@ class VerifyArgmax:
         tp, rank = group.world_size, group.rank_in_group
         lm_head, processor = model.lm_head, model.logits_processor
         shard = getattr(lm_head, "shard_indices", None)
-        if (
-            tp not in FAST_ARGMAX_TP
-            or shard is None
-            or shard.num_org_vocab_padding != 0
-            or processor.scale != 1.0
-            or processor.soft_cap is not None
-            or processor.logits_as_input
-            or processor.head_dtype not in (None, torch.bfloat16)
-            or vllm_config.model_config.dtype != torch.bfloat16
-            or shard.num_added_elements != 0
-        ):
+        # NQ-NOFALLBACK: on Rubin with speculation, a deployment these kernels do not
+        # cover would verify every step on the stock full-vocabulary sampler: on the
+        # target topology refuse it at load, naming the cause.
+        checks = (
+            (tp not in FAST_ARGMAX_TP, f"TP{tp}"),
+            (shard is None, "an LM head without vocabulary shards"),
+            (shard is not None and shard.num_org_vocab_padding != 0, "vocab padding"),
+            (processor.scale != 1.0, "a logit scale"),
+            (processor.soft_cap is not None, "a logit soft cap"),
+            (processor.logits_as_input, "logits as input"),
+            (processor.head_dtype not in (None, torch.bfloat16), "a non-BF16 head"),
+            (vllm_config.model_config.dtype != torch.bfloat16, "a non-BF16 model"),
+            (shard is not None and shard.num_added_elements != 0, "added vocabulary"),
+        )
+        # NQ-NOFALLBACK: refused on the target topology only; elsewhere the stock
+        # sampler keeps verifying, as before, logged.
+        strict = config_target(vllm_config, tp)
+
+        def decline(cause):
+            if strict:
+                refuse("target verification (VerifyArgmax)", cause)
+            logger.info_once(
+                "Kimi K3 verification: stock full-vocabulary sampler (%s)", cause
+            )
+
+        reason = next((why for failed, why in checks if failed), None)
+        if reason is not None:
+            decline(reason)
             return None
         vocab_rank = shard.org_vocab_end_index - shard.org_vocab_start_index
         if (
@@ -69,6 +87,10 @@ class VerifyArgmax:
             or shard.org_vocab_start_index != rank * vocab_rank
             or processor.org_vocab_size != tp * vocab_rank
         ):
+            decline(
+                f"vocabulary shard of {vocab_rank} columns at rank {rank} is not "
+                f"{THREADS * VECTOR}-aligned and rank-contiguous"
+            )
             return None
         from vllm.model_executor.layers.vocab_parallel_embedding import (
             UnquantizedEmbeddingMethod,
@@ -94,6 +116,19 @@ class VerifyArgmax:
             "rows, fused LM head up to %d, evict-first LM head GEMM above)",
             MAX_ROWS,
             lmhead.TOKENS if fused is not None else 0,
+        )
+        # NQ-NOFALLBACK: the logits shard GEMM's stock rows, with their reason.
+        log_coverage(
+            rank,
+            "verify",
+            f"LM-head shard: 1-{lmhead.TOKENS} rows fused GEMV, "
+            f"{lmhead.WIDE_ROWS[0]}-{lmhead.WIDE_ROWS[-1]} rows evict-first GEMM, "
+            f"above {lmhead.WIDE_ROWS[-1]} rows stock cuBLAS shard GEMM (bitwise "
+            "compute_logits; the evict-first GEMM is not tuned there: NQ-TUNE); "
+            "argmax / sampled verification vocabulary-sharded at every row"
+            if fused is not None
+            else "LM-head shard: stock cuBLAS shard GEMM at every row (the LM-head "
+            "weight is not the plain BF16 shard the fused kernels read)",
         )
         return cls(prepared, fused, wide, logits)
 

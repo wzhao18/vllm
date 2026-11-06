@@ -174,6 +174,13 @@ def unsupported(vllm_config) -> str | None:
             spec is not None and envs.VLLM_KIMI_K3_AUX_ATTN_RES_STREAM,
             "the AttnRes aux stream",
         ),
+        # NQ-NOFALLBACK: batch-sharded sampling bypasses both fast verifications
+        # (greedy argmax and sampled), so every verify step would run stock.
+        (
+            spec is not None
+            and getattr(parallel, "enable_batch_sharded_sampling", False),
+            "batch-sharded sampling (--enable-batch-sharded-sampling)",
+        ),
         (
             dsa
             and vllm_config.cache_config.cache_dtype

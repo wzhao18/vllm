@@ -441,6 +441,20 @@ class WideDsa:
             parts.append(f"value rows {rows.nbytes / 2**20:.0f} MiB")
         return ", ".join(parts)
 
+    def stock_pieces(self, batch):
+        """NQ-NOFALLBACK: the stock kernels inside this core at ``batch`` rows, for the
+        coverage log. As a whole the core was measured against seam S2-DSA (DSA_WIDE);
+        the pieces were not measured against PreparedDsa's #63 merge / DcpExchange
+        rows path (NQ-TUNE)."""
+        pieces = [
+            "sparse_attn_indexer op (its DCP merge, or DcpExchange's top-k)",
+            "Triton slot filter where DcpExchange does not serve the step",
+            "FlashInfer _forward_mqa_kernel" if self.fp8 else "FlashMLA sparse",
+        ]
+        if batch not in self.index_projection.kernels:
+            pieces.append("wq_index cuBLAS (no split-K tactic)")
+        return "; ".join(pieces) + " (vs the merge-rows path unmeasured: NQ-TUNE)"
+
     def indexer_core(self, projected, batch):
         """Top-k of the current rows into the shared buffer (stock decode scoring of
         DsaIndex's FP8 query, or on an MXFP4 indexer cache its MXFP4 query and

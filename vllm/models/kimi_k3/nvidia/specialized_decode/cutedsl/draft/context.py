@@ -37,6 +37,7 @@ import torch.distributed._symmetric_memory as symm_mem
 from cutlass import BFloat16, Float32, Int32, Int64, Uint32
 from cutlass.cute.runtime import make_fake_stream
 
+from ...shapes import Shape, full_capture, refuse
 from ..common.host import (
     architecture,
     check_residency,
@@ -335,6 +336,9 @@ class PreparedContext:
 
     def __init__(self, model, group, tp, rank, rows):
         self.tp, self.rank = tp, rank
+        # NQ-NOFALLBACK: set by runtime.draft on the target topology: a captured
+        # context step of a served row runs these kernels or raises.
+        self.strict = False
         weight = model.context_proj.weight
         shard = weight.shape[0] // tp
         self.shard = weight.detach()[rank * shard : (rank + 1) * shard]
@@ -393,7 +397,11 @@ class PreparedContext:
     def combine(self, hidden):
         """context_norm(context_proj(hidden)) [rows, 7168], or None when not covered."""
         rows = hidden.shape[0]
-        if not torch.cuda.is_current_stream_capturing() or rows not in self.gathers:
+        if not torch.cuda.is_current_stream_capturing():
+            return None  # eager: no graph, the stock context projection
+        if rows not in self.gathers:
+            if self.strict and full_capture():  # NQ-NOFALLBACK
+                refuse("DSpark drafter context step", "no row gather", Shape(rows))
             return None
         out = torch.empty((rows, HIDDEN), dtype=hidden.dtype, device=hidden.device)
         if rows in self.polled:
@@ -440,6 +448,8 @@ class PreparedContext:
         rows = kv.shape[0]
         kernel = self.kv.get(rows)
         if kernel is None:
+            if self.strict and full_capture():  # NQ-NOFALLBACK
+                refuse("DSpark drafter context KV", "no fused epilogue", Shape(rows))
             return False
         rotary = model.layers[0].self_attn.rotary_emb
         view = dynamic_view if rows in self.wide else to_cute

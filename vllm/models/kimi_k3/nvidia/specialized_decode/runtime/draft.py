@@ -30,7 +30,15 @@ import torch
 from vllm.logger import init_logger
 
 from ..cutedsl.common.policy import batch_table
-from ..shapes import Shape, rows_policy
+from ..shapes import (
+    Shape,
+    StockSteps,
+    full_capture,
+    log_coverage,
+    refuse,
+    rows_policy,
+    target_topology,
+)
 
 logger = init_logger(__name__)
 
@@ -63,6 +71,12 @@ FAST_LM_HEAD = {16: "1-7:1"}
 # Query rows whose LM-head shard GEMM runs with evict-first weight
 # loads (cutedsl.verify.lmhead.PreparedWideLmHead: the projection core without a K
 # split, BF16 logits bitwise equal to cuBLAS's unsplit kernels), per TP, on Rubin.
+# NQ-NOFALLBACK: 9 query rows (q4 B3) stay on the stock cuBLAS shard GEMM by choice:
+# the measurement note on lmhead.WIDE_ROWS ends "(9 rows: 35 us)" and starts the
+# evict-first kernel at 10 rows; it does not show the kernel winning at 9 (it is no
+# faster than torch.mm at 16 / 56 / 64 rows either), so 9 rows are not moved without
+# a 9-row measurement (NQ-TUNE). Above 64 rows (q8 B10+, q4 B22+) the stock cuBLAS
+# shard GEMM stays too, logged in the coverage (unmeasured: NQ-TUNE).
 WIDE_LM_HEAD = {16: "10-64:1"}  # (B9's 63 rows: within lmhead.WIDE_ROWS)
 # Query rows whose context step (sharded projection + row gather, context-KV GEMM
 # and insert) the caller may run on a side stream, joined by the first MLA layer
@@ -303,7 +317,7 @@ def projection(weight, tp, rows):
     return PreparedProjection(weight, policies).prepare()
 
 
-def install_projections(model, tp, query_rows, context_rows):
+def install_projections(model, tp, query_rows, context_rows, rank=0):
     """Split-K projections for the drafter's per-layer linears (``query_rows``) and
     its context KV projection (``context_rows``); returns how many were installed."""
     linears = []
@@ -332,13 +346,30 @@ def install_projections(model, tp, query_rows, context_rows):
             tuple(missing),
             tp,
         )
+    stock: dict[tuple, list[int]] = {}
     for linear, rows in linears:
         if linear is None or getattr(linear, "bias", None) is not None:
             continue
         prepared = projection(linear.weight, tp, rows)
+        served = set(prepared.kernels) if prepared is not None else set()
+        shape = tuple(linear.weight.shape)
+        for r in rows:
+            if r not in served and r not in stock.setdefault(shape, []):
+                stock[shape].append(r)
         if prepared is not None:
             linear.quant_method = DraftProjectionMethod(linear.quant_method, prepared)
             installed += 1
+    # NQ-NOFALLBACK: the drafter linears' stock cuBLAS rows (a measured choice for
+    # the 64-head drafter: cuBLAS wins at 56-64 and 112 / 224 rows, see
+    # PROJECTIONS_WIDE; the 96-head shapes DRAFT_96 are unmeasured: NQ-TUNE).
+    for shape, rows in sorted(stock.items()):
+        if rows:
+            measured = "unmeasured, NQ-TUNE" if shape in DRAFT_96 else "measured"
+            log_coverage(
+                rank,
+                "draft linear",
+                f"(N, K) {shape}: stock cuBLAS at rows {sorted(rows)} ({measured})",
+            )
     return installed
 
 
@@ -365,12 +396,15 @@ def closed(spec, top):
 
 def draft_batches(vllm_config, steps):
     """Requests per drafter FULL graph: round_up(s, steps) / steps for each capture
-    size whose rounded size fits the largest capture size (Model Runner V2)."""
+    size whose rounded size fits the largest capture size and whose requests fit
+    max_num_seqs (Model Runner V2 captures no graph above either). NQ-NOFALLBACK:
+    capped at max_num_seqs, so the build refuses only batches the runner captures."""
     compilation = vllm_config.compilation_config
     sizes = compilation.cudagraph_capture_sizes or ()
     cap = compilation.max_cudagraph_capture_size or max(sizes, default=0)
+    seqs = vllm_config.scheduler_config.max_num_seqs
     rounded = {-(-s // steps) * steps for s in sizes}
-    return sorted(r // steps for r in rounded if r <= cap)
+    return sorted(r // steps for r in rounded if r <= cap and r // steps <= seqs)
 
 
 def enabled(vllm_config):
@@ -383,9 +417,13 @@ class DraftFastPath:
     """Per-rank prepared kernels of the drafter; built after the draft weights load."""
 
     def __init__(
-        self, markov=None, batches=(), steps=7, tp=1, all_batches=(), sampled=False
-    ):
+        self, markov=None, batches=(), steps=7, tp=1, all_batches=(), sampled=False,
+        strict=False, rank=0,
+    ):  # fmt: skip
         self.markov, self.batches, self.steps = markov, frozenset(batches), steps
+        # NQ-NOFALLBACK: the target topology (``shapes.target_topology``) refuses
+        # instead of drafting a captured graph on the stock loop.
+        self.strict = strict
         # Probabilistic drafting: the prepared kernels are the ``sampled`` ones.
         self.sampled = sampled
         # The LM-head GEMV with BF16 logits (cutedsl.verify.lmhead) for FAST_LM_HEAD
@@ -398,6 +436,9 @@ class DraftFastPath:
         self.wide_batches = rows(WIDE_LM_HEAD) & self.batches
         self.lm_wide = None
         self.overlap_batches = rows(CONTEXT_OVERLAP)
+        # NQ-NOFALLBACK: eager drafter calls (no captured graph) on the stock Markov
+        # loop, counted per cause.
+        self.stock_steps = StockSteps("DSpark drafter", rank)
 
     def context_overlap(self, model, num_reqs):
         """CONTEXT_OVERLAP: ``num_reqs`` requests' context step may run on a side
@@ -436,6 +477,19 @@ class DraftFastPath:
         tp, rank = group.world_size, group.rank_in_group
         steps = spec.num_speculative_tokens
         all_batches = draft_batches(vllm_config, steps)
+        dcp = vllm_config.parallel_config.decode_context_parallel_size
+        # NQ-NOFALLBACK: on the target topology (Rubin TP16 = DCP16) every drafter
+        # piece a captured graph runs is covered or the load is refused; elsewhere
+        # (out of scope) uncovered pieces keep the stock drafter path, logged.
+        strict = target_topology(True, tp, dcp, steps + 1)
+
+        def fail(site, cause):
+            if strict:
+                refuse(site, cause)
+            logger.warning_once(
+                "Kimi K3 DSpark drafter: %s keeps stock (%s)", site, cause
+            )
+
         # The open tables' ranges end at the deployment's largest drafter graph.
         top = max(all_batches, default=0)
         table = batch_table(closed(FUSED_MARKOV.get(tp, ""), top))
@@ -447,31 +501,41 @@ class DraftFastPath:
         sampled = spec.draft_sample_method == "probabilistic"
         batches = []
         shapes = tuple(head.markov_w1.weight.shape), tuple(head.markov_w2.weight.shape)
-        if (
-            processor.scale == 1.0
-            and processor.soft_cap is None
-            and shapes[0] == shapes[1]
-            and model.config.draft_vocab_size == model.config.vocab_size
-            and not (
-                sampled
-                and (
-                    vllm_config.model_config.use_fp64_gumbel
-                    or getattr(vllm_config, "watermark_config", None) is not None
-                )
-            )
-        ):
-            batches = [b for b in all_batches if table.get(b)]
+        # NQ-NOFALLBACK: a drafter the fused Markov kernels do not cover would draft
+        # every captured batch on the stock Markov loop: refuse it at load.
+        checks = (
+            (processor.scale != 1.0, "a logit scale"),
+            (processor.soft_cap is not None, "a logit soft cap"),
+            (shapes[0] != shapes[1], f"markov_w1 {shapes[0]} != markov_w2 {shapes[1]}"),
+            (
+                model.config.draft_vocab_size != model.config.vocab_size,
+                "a draft vocabulary other than the target's",
+            ),
+            (
+                sampled and vllm_config.model_config.use_fp64_gumbel,
+                "FP64 Gumbel draws",
+            ),
+            (
+                sampled and getattr(vllm_config, "watermark_config", None) is not None,
+                "watermarked drafts",
+            ),
+        )
+        reason = next((why for failed, why in checks if failed), None)
+        batches = [b for b in all_batches if table.get(b)]
+        if reason is not None:
+            fail("DSpark drafter Markov sampling", reason)
+            batches = []
+        missing = [b for b in all_batches if b not in batches]
+        if missing and reason is None:
+            fail("DSpark drafter Markov sampling", f"FUSED_MARKOV misses {missing}")
         if batches:
-            # Markov heads the fused kernels do not cover (rank, vocabulary split,
-            # co-residency) keep the stock Markov loop instead of failing the load.
             from ..cutedsl.draft.markov import device_limits, supports
 
             if not supports(*shapes, tp, device_limits(device)):
-                logger.warning_once(
-                    "Kimi K3 DSpark drafter: Markov head %s at TP%d is not covered by "
-                    "the fused Markov kernels; the stock Markov loop drafts",
-                    shapes[1],
-                    tp,
+                fail(
+                    "DSpark drafter Markov sampling",
+                    f"Markov head {shapes[1]} at TP{tp} (rank, vocabulary split or "
+                    "co-residency of the fused kernels)",
                 )
                 batches = []
         markov = None
@@ -493,12 +557,11 @@ class DraftFastPath:
             # (wide batches need one launch of at least 8 slots: the device's shared
             # memory at this Markov rank; markov_wide.launch_width)
             uncovered = [b for b in batches if not markov.covers(b, sampled)]
-            if uncovered:
-                logger.warning_once(
-                    "Kimi K3 DSpark drafter: draft batches %s keep the stock Markov "
-                    "loop (no MarkovWide launch fits this device at Markov rank %d)",
-                    tuple(uncovered),
-                    markov.markov_rank,
+            if uncovered:  # NQ-NOFALLBACK
+                fail(
+                    "DSpark drafter Markov sampling",
+                    f"no MarkovWide launch fits this device at Markov rank "
+                    f"{markov.markov_rank} for draft batches {tuple(uncovered)}",
                 )
                 batches = [b for b in batches if b not in uncovered]
             for batch in batches:
@@ -514,7 +577,15 @@ class DraftFastPath:
                 steps,
             )
         ]
-        if context and model.model.context_proj.weight.shape[0] % tp == 0:
+        if context and model.model.context_proj.weight.shape[0] % tp:
+            # NQ-NOFALLBACK: the stock replicated context step for every row.
+            fail(
+                "DSpark drafter context step",
+                f"context_proj rows {model.model.context_proj.weight.shape[0]} not "
+                f"divisible by TP{tp}",
+            )
+            context = []
+        if context:
             from ..cutedsl.draft.context import PreparedContext
 
             prepared = PreparedContext(
@@ -523,19 +594,27 @@ class DraftFastPath:
             rotary = model.model.layers[0].self_attn.rotary_emb
             prepared.prepare_kv(model.model, rotary.cos_sin_cache.shape[0])
             model.model._fast_context = prepared
+            prepared.strict = strict  # NQ-NOFALLBACK
             logger.info_once(
                 "Kimi K3 DSpark drafter: sharded context step for %s rows",
                 (*prepared.rows, *prepared.wide),
             )
-            if prepared.dropped:
-                logger.warning_once(
-                    "Kimi K3 DSpark drafter: context rows %s keep the stock context "
-                    "step (their row-gather CTAs are not co-resident)",
-                    prepared.dropped,
+            if prepared.dropped:  # NQ-NOFALLBACK
+                fail(
+                    "DSpark drafter context step",
+                    f"context rows {prepared.dropped}: their row-gather CTAs are not "
+                    "co-resident",
                 )
+            log_coverage(
+                rank,
+                "draft context",
+                f"sharded context step at {len(context)} row counts; context shard "
+                "GEMM stock cuBLAS above 64 rows (no split-K tactic; split-K loses at "
+                "56-64 rows, scripts/dsdraft/gemm_sweep.py)",
+            )
         query_rows = [b * steps for b in all_batches]
         context_rows = [b * (steps + 1) for b in all_batches]
-        installed = install_projections(model, tp, query_rows, context_rows)
+        installed = install_projections(model, tp, query_rows, context_rows, rank)
         if installed:
             logger.info_once(
                 "Kimi K3 DSpark drafter: split-K projections on %d linears", installed
@@ -548,6 +627,8 @@ class DraftFastPath:
         early = {r for r in ar_rows if policy(TWO_SHOT_EARLY, r)}
         valid = {r for r in ar_rows if policy(VALID_AR, r)}
         wide = {r for r in ar_rows if policy(FAST_AR, r) == 3}
+        if strict and query_rows and not ar_rows:  # NQ-NOFALLBACK
+            fail("DSpark drafter all-reduce sites", "FAST_AR lists no query rows")
         if ar_rows:
             from ..cutedsl.draft.allreduce import PreparedDraftAr, plain_layer
 
@@ -565,6 +646,13 @@ class DraftFastPath:
                 valid,
                 wide,
             )
+            prepared_ar.strict = strict  # NQ-NOFALLBACK
+            unserved = sorted(set(query_rows) - set(prepared_ar.rows))
+            if strict and unserved:
+                fail(
+                    "DSpark drafter all-reduce sites",
+                    f"query rows {unserved} have no Lamport sites (FAST_AR / CAP)",
+                )
             if prepared_ar.rows:
                 rings = RING_PROJECTIONS.get(tp, {})
                 tactics = {r: rings for r in prepared_ar.rows if r <= PROJECTION_ROWS}
@@ -628,19 +716,27 @@ class DraftFastPath:
                     tuple(sorted(r for r in deferred if r in prepared_ar.polled)),
                 )
         attentions = [layer.self_attn for layer in model.model.layers]
-        dcp = vllm_config.parallel_config.decode_context_parallel_size
         rows = [r for r in query_rows if policy(FAST_DCP, r)]
+        if strict and rows != query_rows:
+            fail("DSpark drafter attention", "FAST_DCP misses query rows")
+        if dcp == tp > 1 and rows and any(a.dcp_world_size != tp for a in attentions):
+            # NQ-NOFALLBACK: the drafter's MLA layers would keep the stock DCP
+            # attention at every row.
+            fail(
+                "DSpark drafter attention",
+                f"drafter MLA layers with DCP sizes "
+                f"{sorted({a.dcp_world_size for a in attentions})} under DCP{dcp}",
+            )
         if dcp == tp > 1 and rows and all(a.dcp_world_size == tp for a in attentions):
             from ..cutedsl.draft.attention import DraftDcp, query_heads
 
             heads = attentions[0].num_local_heads
             if not query_heads(heads):
                 # (MlaQuery's drafter tile is keyed by heads per rank: mla.query
-                # DRAFT_TILED_FROM)
-                logger.warning_once(
-                    "Kimi K3 DSpark drafter: no fused drafter query for %d heads per "
-                    "rank; the drafter's MLA layers keep the stock DCP attention",
-                    heads,
+                # DRAFT_TILED_FROM) NQ-NOFALLBACK
+                fail(
+                    "DSpark drafter attention",
+                    f"no fused drafter query for {heads} heads per rank",
                 )
             else:
                 # The drafter's mask as its MLA layers run it: the K3 DSpark layers
@@ -658,31 +754,50 @@ class DraftFastPath:
                     vllm_config.parallel_config.cp_kv_cache_interleave_size,
                     causal,
                 )  # fmt: skip
+                prepared_dcp.strict = strict  # NQ-NOFALLBACK
                 served = (*prepared_dcp.rows, *prepared_dcp.wide)
                 logger.info_once(
                     "Kimi K3 DSpark drafter: Lamport DCP attention (%s) for %s rows",
                     "causal" if causal else "non-causal",
                     tuple(served),
                 )
-                # (per cause: DraftDcp.dropped)
+                # (per cause: DraftDcp.dropped) NQ-NOFALLBACK: every drafter row the
+                # deployment captures (capped at max_num_seqs) is served or refused.
                 reasons: dict[str, list[int]] = {}
                 for r in rows:
                     if r not in served:
                         reason = prepared_dcp.dropped.get(r, "not covered")
                         reasons.setdefault(reason, []).append(r)
                 for reason, dropped in reasons.items():
-                    logger.warning_once(
-                        "Kimi K3 DSpark drafter: rows %s keep the stock DCP attention "
-                        "(%s)",
-                        tuple(dropped),
-                        reason,
+                    fail(
+                        "DSpark drafter attention",
+                        f"rows {tuple(dropped)} would keep the stock DCP attention "
+                        f"({reason})",
                     )
+                log_coverage(rank, "draft attention", prepared_dcp.coverage(rows))
         logger.info_once(
             "Kimi K3 DSpark drafter: fused %s Markov sampling for draft batches %s",
             "probabilistic" if sampled else "greedy",
             tuple(batches),  # info_once keys on its (hashable) arguments
         )
-        return cls(markov, batches, steps, tp, all_batches, sampled)
+        fast = cls(markov, batches, steps, tp, all_batches, sampled, strict, rank)
+        lm = sorted(b * steps for b in fast.lm_batches)
+        wide_lm = sorted(b * steps for b in fast.wide_batches)
+        stock_lm = sorted(
+            b * steps
+            for b in batches
+            if b not in fast.lm_batches and b not in fast.wide_batches
+        )
+        log_coverage(
+            rank,
+            "draft LM head",
+            f"GEMV rows {lm}, evict-first GEMM rows {wide_lm}, stock cuBLAS shard "
+            f"GEMM rows {stock_lm} (deliberate: rows between the 1-7 GEMV and the "
+            "evict-first 10-64 kernel (q4 B3: 9), whose lmhead.WIDE_ROWS note reads "
+            "'9 rows: 35 us' and shows no 9-row win; above 64 rows unmeasured vs "
+            "the evict-first GEMM; NQ-TUNE)",
+        )
+        return fast
 
     def greedy_markov(self, model, hidden, anchors, draft, sampling=None):
         """Draft tokens of every position into ``draft`` [batch, steps] from the
@@ -695,23 +810,37 @@ class DraftFastPath:
         sampled = sampling is not None
         if not torch.cuda.is_current_stream_capturing():
             self.prepare_lm_head(model)
-        if (
-            markov is None
-            or sampled != self.sampled
-            or not torch.cuda.is_current_stream_capturing()
-            or batch not in self.batches
-            or hidden.shape[0] != batch * self.steps
-            or draft.shape != (batch, self.steps)
-            or anchors.dtype != torch.int32
-            or draft.dtype != torch.int64
-            or draft.stride(1) != 1
-            or not markov.ready(batch, anchors.stride(0), draft.stride(0), sampled)
+            # An eager drafter call (no captured graph: warmup, a step above the
+            # captured sizes): the stock Markov loop, a run-time property counted
+            # per cause (NQ-NOFALLBACK).
+            self.stock_steps.count("eager drafter call", batch)
+            return False
+        checks = (
+            (markov is None, "no fused Markov kernels"),
+            (sampled != self.sampled, f"a {'sampled' if sampled else 'greedy'} call"),
+            (batch not in self.batches, "a batch without prepared Markov kernels"),
+            (hidden.shape[0] != batch * self.steps, f"{hidden.shape[0]} hidden rows"),
+            (draft.shape != (batch, self.steps), f"draft {tuple(draft.shape)}"),
+            (anchors.dtype != torch.int32, f"anchors {anchors.dtype}"),
+            (draft.dtype != torch.int64, f"draft {draft.dtype}"),
+            (draft.stride(1) != 1, "a strided draft row"),
+        )
+        reason = next((why for failed, why in checks if failed), None)
+        if reason is None and not markov.ready(
+            batch, anchors.stride(0), draft.stride(0), sampled
         ):
+            reason = "Markov kernels not ready for these strides"
+        if reason is not None:
+            # NQ-NOFALLBACK: a captured drafter graph never captures the stock loop.
+            if self.strict and full_capture():
+                refuse("DSpark drafter Markov sampling", reason, Shape(batch))
             return False
         if sampled:
             try:
                 sampling = markov.sampling_args(*sampling)
-            except ValueError:
+            except ValueError as error:  # NQ-NOFALLBACK: no swallowed fallback
+                if self.strict:
+                    refuse("DSpark drafter Markov sampling", str(error), Shape(batch))
                 return False
         processor, lm_head = model.logits_processor, model.lm_head
         lm = self.lm_logits
@@ -721,6 +850,13 @@ class DraftFastPath:
             base = lm.run(rows)
         elif wide is not None and batch in self.wide_batches and wide.takes(rows):
             base = wide.run(rows)
+        elif self.strict and (batch in self.lm_batches or batch in self.wide_batches):
+            # NQ-NOFALLBACK: a batch a fast LM head is listed for, not prepared.
+            refuse(
+                "DSpark drafter LM head",
+                "its fast LM-head kernel is not prepared or does not take the rows",
+                Shape(batch * self.steps, self.steps),
+            )
         else:
             # The stock LM-head GEMM of the drafter, without its all-gather: this
             # rank's vocabulary shard of the base logits, bitwise as stock.
@@ -761,7 +897,13 @@ class DraftFastPath:
         from ..cutedsl.verify import lmhead
 
         weight = weight[: self.markov.vocab_rank]
-        if not lmhead.supports(weight):
+        if not lmhead.supports(weight):  # NQ-NOFALLBACK
+            if self.strict:
+                refuse(
+                    "DSpark drafter LM head",
+                    f"shard {tuple(weight.shape)} {weight.dtype} is not the BF16, "
+                    "16-row-aligned contiguous shard the LM-head kernels read",
+                )
             self.lm_batches = self.wide_batches = frozenset()
             return
         if self.lm_batches:

@@ -14,7 +14,11 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from vllm.logger import init_logger
+
 from .cutedsl.common.policy import batch_table
+
+logger = init_logger(__name__)
 
 # Rows covered by the tuned tables and the 64-row mailboxes (B8 x q8 verify steps).
 TUNED_ROWS = 64
@@ -68,6 +72,109 @@ class Context:
     max_context: int
     bf16_state: bool
 
+    @property
+    def target(self) -> bool:
+        """The deployments the no-fallback rule covers (NQ-NOFALLBACK): Rubin, TP16 =
+        DCP16, DSpark verify (q > 1). There every captured shape runs the specialized
+        step or the process refuses to start; elsewhere (GB300, TP8, no DCP) a family's
+        stock seam stays a logged coverage choice."""
+        return target_topology(self.arch == "rubin", self.tp, self.dcp, self.q)
+
+
+def target_topology(rubin: bool, tp: int, dcp: int, q: int) -> bool:
+    """``Context.target`` from its parts (callers without a ``Context``)."""
+    return rubin and tp == 16 and dcp == 16 and q > 1
+
+
+def config_target(vllm_config: Any, tp: int, rubin: bool = True) -> bool:
+    """``target_topology`` of a deployment's config (callers built outside the
+    decode's ``Context``: verification). q = the speculative tokens + 1."""
+    spec = vllm_config.speculative_config
+    q = (getattr(spec, "num_speculative_tokens", 0) or 0) + 1 if spec else 1
+    dcp = vllm_config.parallel_config.decode_context_parallel_size
+    return target_topology(rubin, tp, dcp, q)
+
+
+class Uncovered(RuntimeError):
+    """NQ-NOFALLBACK: a shape the deployment can hit that the specialized decode does
+    not cover. Raised at startup (build, prepare or capture) instead of letting the
+    shape run the stock path."""
+
+
+def refuse(site: str, cause: str, shape: Any = None) -> None:
+    """Raise ``Uncovered`` naming the site, the shape and the cause."""
+    at = f" at {shape}" if shape is not None else ""
+    raise Uncovered(
+        f"Kimi K3 specialized decode: {site}{at} is not covered ({cause}); it would "
+        "run the stock path, which the specialized decode never does silently "
+        "(NQ-NOFALLBACK). Cover the shape, or drop it from the deployment's captured "
+        "sizes."
+    )
+
+
+def full_capture() -> bool:
+    """Whether the current stream captures a FULL CUDA graph (the runner captures
+    FULL graphs under ``CUDAGraphMode.NONE`` inside ``torch.cuda.graph``; PIECEWISE
+    captures set PIECEWISE): the steps the specialized decode must serve."""
+    import torch
+
+    if not torch.cuda.is_current_stream_capturing():
+        return False
+    from vllm.config import CUDAGraphMode
+    from vllm.forward_context import get_forward_context, is_forward_context_available
+
+    if not is_forward_context_available():
+        return True
+    mode = get_forward_context().cudagraph_runtime_mode
+    return mode != CUDAGraphMode.PIECEWISE
+
+
+def log_coverage(rank: int, family: str, text: str) -> None:
+    """One coverage line outside the target step's plan (drafter, verification),
+    with the same prefix as ``SpecializedDecode``'s (global rank 0 only)."""
+    if rank == 0:
+        logger.info("Kimi K3 decode coverage %s: %s", family, text)
+
+
+class StockSteps:
+    """NQ-NOFALLBACK: steps that run a whole stock forward at run time because no
+    captured FULL graph covers them (mixed prefill + decode steps, partial drafts,
+    eager steps). A run-time property of the schedule, not of a captured shape: each
+    is counted per cause and logged at powers of two, so the exclusion is visible.
+
+    Only serving steps count: the startup forwards (profile run, kernel warmup,
+    PIECEWISE captures, the capture warmups and the post-capture profiling dummy
+    runs) all come before the runner locks its workspace at the end of
+    ``capture_model``, the runner's marker that capture is finished."""
+
+    def __init__(self, name: str, rank: int):
+        self.name, self.rank = name, rank
+        self.counts: dict[str, int] = {}
+
+    @staticmethod
+    def serving() -> bool:
+        """Whether the runner finished its (non-profiling) capture: it locks the
+        workspace right after ``capture_model`` and never before."""
+        from vllm.v1.worker.workspace import (
+            current_workspace_manager,
+            is_workspace_manager_initialized,
+        )
+
+        return (
+            is_workspace_manager_initialized()
+            and current_workspace_manager().is_locked()
+        )
+
+    def count(self, cause: str, rows: int) -> None:
+        if not self.serving():
+            return
+        n = self.counts[cause] = self.counts.get(cause, 0) + 1
+        if self.rank == 0 and n & (n - 1) == 0:
+            logger.info(
+                "Kimi K3 %s: stock step (%s), %d such steps so far (this one %d rows)",
+                self.name, cause, n, rows,
+            )  # fmt: skip
+
 
 _MISSING = object()
 
@@ -111,6 +218,10 @@ class Coverage:
 
     def stock(self, rows: int, reason: str) -> None:
         self.plan[rows], self.reasons[rows] = None, reason
+
+    def stock_rows(self) -> dict[int, str]:
+        """Captured rows whose whole step runs the stock forward -> why."""
+        return {rows: self.reasons[rows] for rows, c in self.plan.items() if c is None}
 
     def lines(self) -> list[str]:
         out = []
