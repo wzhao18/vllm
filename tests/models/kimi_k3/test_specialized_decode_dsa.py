@@ -2544,6 +2544,12 @@ def test_prepared_dsa_run_matches_stock(
     query forked off the indexer path (QueryNorm, then MlaQuery on a side stream)."""
     if LAYER_CORES[core][2] == "prims_ts" and no_prims_ts():
         pytest.skip("FlashInfer prims_ts sparse MLA cannot run here")
+    if core == "flashmla" and torch.cuda.get_device_capability() == (10, 7):
+        # The stock FlashMLA sparse decode's combine kernel faults on SM107 (the
+        # unmodified 242fb49cd4 too: combine.cu:241 unspecified launch failure), and the
+        # fault poisons every later CUDA / NCCL call of the process; VR serves the
+        # FlashInfer sparse cores.
+        pytest.skip("SM107: stock FlashMLA sparse decode faults (combine.cu)")
     if core == "flashmla" and batch >= 40:
         why = "fp8_ds_mla tile scale / k_pe bytes of the new rows differ from stock's"
         sm107_known(request, why)
