@@ -744,15 +744,18 @@ class DraftFastPath:
                     f"no fused drafter query for {heads} heads per rank",
                 )
             else:
-                # The drafter's mask as its MLA layers run it: the K3 DSpark layers
-                # are built non_causal_multi_token_decode (dspark_mla), which the
-                # stock MLA metadata builder reads (any layer non-causal: the batch
-                # is), whatever the checkpoint's dflash_config says (both
-                # kimi-k3-dspark and kimi-k3.1-pro-dspark-preview run non-causal).
-                causal = not any(
-                    getattr(a, "non_causal_multi_token_decode", False)
-                    for a in attentions
+                # The drafter's mask exactly as stock decides it: the DSpark speculator
+                # builds its metadata causal unless the checkpoint asks for non-causal
+                # (dflash_has_any_non_causal over the draft hf config: is_causal /
+                # dflash_config.causal / layer_types). The layers' own
+                # non_causal_multi_token_decode flag only permits a non-causal batch,
+                # it does not make one (kimi-k3.1-pro-dspark-preview: causal true).
+                from vllm.model_executor.models.qwen3_dflash import (
+                    dflash_has_any_non_causal,
                 )
+
+                draft_cfg = vllm_config.speculative_config.draft_model_config
+                causal = not dflash_has_any_non_causal(draft_cfg.hf_config)
                 prepared_dcp = DraftDcp(
                     attentions, group.device_group, tp, rank, rows, steps,
                     vllm_config.model_config.max_model_len,

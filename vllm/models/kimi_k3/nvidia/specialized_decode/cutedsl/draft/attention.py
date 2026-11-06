@@ -18,13 +18,14 @@ Per layer, after the stock fused query concat (RoPE, FP8, KV insert):
 Parity alternates by drafter layer, as the target's MLA layers. Without the gather
 (FORK_ROWS, POLLED_CORE) the core polls the q rows it reads instead.
 
-Causality (``DraftDcp.causal``): the drafter's MLA layers' own flag (the K3 DSpark
-layers are built non_causal_multi_token_decode, so both kimi-k3-dspark and
-kimi-k3.1-pro-dspark-preview run non-causal, whatever dflash_config says), which
-stock's MLA metadata builder puts in the attention metadata that tokenspeed's
-causal_mask reads; the cores here compile with the same flag (causal: the target
-verify's global-position mask, rows mode's per-row lengths from VerifyRows). A
-captured call whose metadata says otherwise raises on the target topology
+Causality (``DraftDcp.causal``): as stock decides it, from the draft checkpoint
+(``not dflash_has_any_non_causal(hf_config)``: is_causal / dflash_config.causal /
+layer_types), which the DSpark speculator puts in the attention metadata that
+tokenspeed's causal_mask reads (kimi-k3.1-pro-dspark-preview: causal; the layers'
+non_causal_multi_token_decode only permits a non-causal batch). The cores here
+compile with the same flag (causal: the target verify's global-position mask, rows
+mode's per-row lengths from VerifyRows). A captured call whose metadata says
+otherwise raises on the target topology
 (NQ-NOFALLBACK; elsewhere the stock path runs it). The "non-causal" notes below
 describe the 64-head drafter the tables were measured on.
 
