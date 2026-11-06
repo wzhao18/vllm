@@ -352,7 +352,9 @@ class WideDsa:
         # "proj" batches exchange #108's value rows through the widened box's
         # DcpMailbox (collective, in layer order), from the layer's gathered W_UV
         # (PreparedDsa's, if it took it) and the bmm's rows.
-        self.dsa_box = DsaBox(widened, pitches, partials, fp8=self.fp8)
+        self.dsa_box = DsaBox(
+            widened, pitches, partials, fp8=self.fp8, verify_q=max(queries)
+        )
         if self.dsa_box.projected and not self.fp8:
             raise ValueError(
                 f'Kimi K3.1 WideDsa: "proj" partials ({self.dsa_box.partials}) need '

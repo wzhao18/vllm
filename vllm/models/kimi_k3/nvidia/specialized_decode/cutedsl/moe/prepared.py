@@ -90,11 +90,12 @@ class PreparedMoE:
         self.prefetch, self.layer_idx = prefetch, layer_idx
         self.rows, self.module = rows, module
         self.front_rows = front_rows if rows is not None else None
-        self.wide_experts = None
-        if rows is not None and WIDE_EXPERTS:
+        self.wide_experts, self.wide_batches = None, frozenset()
+        wide = [b for b in state.batches if b > CAP and wide_experts_batch(b)]
+        if rows is not None and wide:
             from .experts_runtime import WideExperts
 
-            wide = [b for b in state.batches if b > CAP]
+            self.wide_batches = frozenset(wide)
             partials = {b: state.latent_partial for b in wide}  # one base, every call
             planned = self.front_rows is not None  # FrontRows' routing writes the plan
             if self.front_rows is not None:
@@ -225,7 +226,7 @@ class PreparedMoE:
         the join (before the tail returns) orders the push (4 ranks: M128 15.9 ->
         13.7 us per tail, M512 28.8 -> 25.4)."""
         b = x.shape[0]
-        if self.wide_experts is not None:
+        if b in self.wide_batches:
             return self.run_wide_experts(x, out, consume)
         shared, partial = stock_partials(self.module, x)
         with self.beside(lambda: self.rows.push(shared)) as join:
@@ -440,6 +441,18 @@ WIDE_EXPERTS = True
 WIDE_FRONT = True
 
 
+def wide_experts_batch(rows):
+    """Whether a wide batch's routed experts run on the wide engines (``WIDE_EXPERTS``,
+    in one launch: at most ``experts_wide.WIDE_MAX`` rows), else the stock layer's
+    routed experts behind the stock front, into the same wide tail. Above WIDE_MAX the
+    engines run a launch per WIDE_MAX rows and each launch streams every routed
+    expert's weights again, while the stock kernel's time stays nearly flat (VR200, 1
+    GPU, real q4 routes, us wide vs stock FlashInfer: M512 98 vs 154, M768 127 vs 159,
+    M832 177 vs 162, M1024 196 vs 168, M1536 257 vs 195, M2048 358 vs 197; nqbench
+    kern-moe experts)."""
+    return WIDE_EXPERTS and len(wide_chunks(rows)) == 1
+
+
 def choose(shape, ctx):
     """The MoE layer's specialized providers for a captured decode shape (the
     runtime's family hook), or None: the step runs the stock MoE layer (seam S4) and
@@ -448,18 +461,16 @@ def choose(shape, ctx):
     ``ctx.max_rows``) and bind the next AttnRes to the tail's ring there. Today: the
     tail ring, the front box and the experts' capacity hold 64 rows; wide shapes on
     Rubin TP16 (``WIDE_TAIL``) run ``PreparedMoE.run_rows`` (the routed experts on
-    the wide engines with ``WIDE_EXPERTS``, else the stock layer's)."""
+    the wide engines where ``wide_experts_batch``, else the stock layer's)."""
     if shape.rows <= CAP:
         return Choice(Path.GENERIC)
     if ctx.arch != "rubin" or not rows_policy(WIDE_TAIL.get(ctx.tp, ""), shape, 0):
         return None
     # As the runtime selects them (runtime.decode: FrontRows with WIDE_EXPERTS and
     # WIDE_FRONT, else the stock router + latent-down and shared expert).
-    front = "FrontRows front" if WIDE_EXPERTS and WIDE_FRONT else "stock front"
-    experts = "wide experts" if WIDE_EXPERTS else "stock experts"
-    launches = len(wide_chunks(shape.rows))  # (above experts_wide.WIDE_MAX rows)
-    if WIDE_EXPERTS and launches > 1:
-        experts = f"wide experts x{launches} launches"
+    wide = wide_experts_batch(shape.rows)
+    front = "FrontRows front" if wide and WIDE_FRONT else "stock front"
+    experts = "wide experts" if wide else "stock experts"
     return Choice(
         Path.GENERIC, ("rows", "stock-front"), f"{front}, {experts}, wide tail"
     )

@@ -267,7 +267,9 @@ class PreparedDsa:
         if core != "auto":
             raise ValueError(f"Kimi K3.1 DSA core {core!r}: only auto is served")
         if dcp is not None and not hasattr(dcp, "mailboxes"):
-            dcp = DsaBox(dcp, pitches, partials, fp8=self.fp8)
+            dcp = DsaBox(
+                dcp, pitches, partials, fp8=self.fp8, verify_q=max(queries)
+            )
         if dcp is not None and PROJECTED in dcp.mailboxes and not self.fp8:
             raise ValueError(
                 f'Kimi K3.1 specialized DSA: "proj" partials ({dcp.partials}) need '

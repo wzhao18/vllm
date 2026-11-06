@@ -288,9 +288,14 @@ SHARDED: dict = {"*": ""}
 # sites there (and, before runtime.decode skipped pre-consumed sites, ran a second time
 # on the ring consumer's output). ClusterAttnRes serves any rows: its clusters poll only
 # rows earlier kernels publish (the tail's output ring, the fused o-projection's
-# gather), so later waves never block a producer. NQ-TUNE: 16 ranks, "257-:1" vs empty
-# at 384 / 512 / 1024 / 2048 rows (the head / dense / final sites only, us/step).
-STOCK_ROWS: dict = {"*": ""}
+# gather), so later waves never block a producer. From 384 rows the stock op serves the
+# head / dense / final sites again: there ClusterAttnRes loses at every block count
+# (VR200, 1 GPU, full rows, us ClusterAttnRes vs stock: nb 2 384 9.5 vs 8.9, 1024 17.2
+# vs 12.8, 2048 34.2 vs 20.5; nb 4 768 16.0 vs 13.9, 2048 38.2 vs 26.1; nb 8 384 13.0
+# vs 12.0, 2048 57.7 vs 37.4; nqbench kern-moe attnres) and up to 256 rows it wins
+# (0.79-0.96x). NQ-TUNE: 16 ranks, the head / dense / final sites in the step at
+# 384-2048 rows (stock vs SHARDED from 384 rows).
+STOCK_ROWS: dict = {"*": "384-:1"}
 
 
 def choose(shape, ctx):

@@ -44,12 +44,12 @@ from ..cutedsl.moe.experts_runtime import (
 from ..cutedsl.moe.front import SharedFront
 from ..cutedsl.moe.front_rows import FrontRows
 from ..cutedsl.moe.prepared import (
-    WIDE_EXPERTS,
     WIDE_FRONT,
     MoEScratch,
     PreparedMoE,
     deferred_rows,
     stock_partials_ok,
+    wide_experts_batch,
 )
 from ..cutedsl.moe.prepared import choose as moe_choose
 from ..cutedsl.moe.small_batch import chain as small_batch_chain
@@ -364,6 +364,9 @@ class SpecializedDecode:
         # Wide MoE batches run ``PreparedMoE.run_rows`` (the tuned providers below).
         tuned_moe = tuple(b for b in moe_batches if b <= PREPARED_MAX)
         wide_moe = tuple(b for b in moe_batches if b > PREPARED_MAX)
+        # (the wide batches whose routed experts run on the wide engines, behind
+        # FrontRows; the others run the stock router and experts into the wide tail)
+        wide_engines = tuple(b for b in wide_moe if wide_experts_batch(b))
         mailbox, tail_box, moe_layers = (
             OprojMailbox(*owner),
             MoeTailBox(*owner),
@@ -435,12 +438,12 @@ class SpecializedDecode:
                     tp, rank, up, norm, eps, wide_moe, state.rows, ordinal,
                     sharded=(self.sharded, self.shard_box),
                     deferred=deferred_rows(module, wide_moe),
-                    experts_push=wide_moe if WIDE_EXPERTS else (),
+                    experts_push=wide_engines,
                 )  # fmt: skip
             front_rows = None
-            if wide_moe and WIDE_EXPERTS and WIDE_FRONT:
+            if wide_engines and WIDE_FRONT:
                 front_rows = FrontRows(
-                    module, packed[index], state.front_rows, state.front, wide_moe,
+                    module, packed[index], state.front_rows, state.front, wide_engines,
                     beta, linear_beta, plan=state.plan, q=self.q,
                 )  # fmt: skip
             moe = PreparedMoE(

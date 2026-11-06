@@ -113,8 +113,8 @@ def test_every_captured_row_is_wide(q):
 def test_families_choose_every_wide_row(q):
     """Each family's ``choose`` at every wide row up to 2048 (TP16 = DCP16, Rubin,
     FP32 KDA state): DSA, o-projection and MoE take their specialized wide paths (no
-    S2-DSA / S3 / S4 seam), AttnRes runs ClusterAttnRes, KDA picks a path; nothing
-    raises."""
+    S2-DSA / S3 / S4 seam), AttnRes runs ClusterAttnRes up to 383 rows and the stock op
+    from 384 (STOCK_ROWS), KDA picks a path; nothing raises."""
     pytest.importorskip("cutlass")
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.attn_res.prepared import (  # noqa: E501
         choose as attn_res_choose,
@@ -141,7 +141,9 @@ def test_families_choose_every_wide_row(q):
             assert dsa is not None and dsa.tactic == "wide", m
             assert oproj_choose(shape, ctx).path is Path.GENERIC, m
             assert moe_choose(shape, ctx).path is Path.GENERIC, m
-            assert attn_res_choose(shape, ctx).path is Path.GENERIC, m
+            # (the head / dense / final AttnRes sites: stock from 384 rows)
+            expect = Path.STOCK if m >= 384 else Path.GENERIC
+            assert attn_res_choose(shape, ctx).path is expect, m
             assert kda_choose(shape, ctx) is not None, m
 
 
@@ -318,6 +320,14 @@ def test_dsa_partials_automatic():
     assert all(table[b] == "proj" for b in range(17, 4097))
     assert partials_for(spec, 2048) == "proj" and partials_for(spec, 8) == "bf16"
     assert r1.dsa_partials(None, fp8=False) == "bf16"
+    # by verify length: BF16 only on the rows the DSA sparse core serves at that q
+    from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core.decode import ROWS, VARIANT
+
+    for q in (1, 4, 8):
+        expect = f"1-{ROWS}:bf16,{ROWS + 1}-:proj" if q in VARIANT else "proj"
+        assert r1.dsa_partials(None, fp8=True, q=q) == expect
+    assert r1.dsa_partials(None, fp8=True, q=4) == "proj"
+    assert r1.dsa_partials(None, fp8=False, q=4) == "bf16"
     assert r1.dsa_partials("proj") == "proj"
     for bad in ("fp8", "1-64:int8", "1-64"):
         with pytest.raises(ValueError):
@@ -633,3 +643,24 @@ def test_sampled_verify_takes_every_row():
     verify: Any = object.__new__(SampledVerify)
     assert all(verify.takes(rows) for rows in (1, 512, 513, 1024, 2048, 4096))
     assert not verify.takes(0)
+
+
+def test_wide_experts_single_launch_only():
+    """Wide routed experts run on the wide engines only where one launch holds the
+    batch (at most experts_wide.WIDE_MAX rows); above it the stock routed experts run
+    behind the stock front, into the wide tail (moe.prepared.wide_experts_batch)."""
+    pytest.importorskip("cutlass")
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe import prepared
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe.experts_wide import (  # noqa: E501
+        WIDE_MAX,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.shapes import Shape
+
+    ctx = context(4)
+    for rows in (68, 256, 512, WIDE_MAX):
+        assert prepared.wide_experts_batch(rows), rows
+        assert "wide experts" in prepared.choose(Shape(rows, 4), ctx).note, rows
+    for rows in (WIDE_MAX + 4, 1024, 2048):
+        assert not prepared.wide_experts_batch(rows), rows
+        note = prepared.choose(Shape(rows, 4), ctx).note
+        assert "stock experts" in note and "stock front" in note, (rows, note)

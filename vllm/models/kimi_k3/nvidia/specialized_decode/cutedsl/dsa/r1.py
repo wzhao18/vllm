@@ -28,18 +28,32 @@ from .dcp_value import DSA_PARTIALS, FORMATS, PROJECTED, DcpMailbox, gather_head
 # (C48-C256) and "1-16:bf16,17-512:proj" (C1 / C8). FlashMLA sparse (fp8_ds_mla):
 # "bf16" at every row (its DcpValue strides its row tiles above one wave too:
 # ``mla.dcp.DcpValue.tile_stride``).
-# NQ-TUNE: the bf16 / proj crossover at DCP16 on VR200 (16 ranks, fp8 KV, q4 / q8,
-# rows 8-64; DCP8 GB300 put it at 160 rows), and proj vs bf16 at 1-16 rows with the
-# sparse core off.
+# The BF16 rows follow the sparse core's coverage of the deployment's verify length
+# (``auto_partials``): at a q the core never serves, "proj" wins from the first row
+# (VR200, 1 GPU, fp8 KV, DcpValue + partials, agentx contexts, us bf16 -> proj: q4 M4
+# 10.71 -> 9.32, M8 11.47 -> 9.43, M12 13.53 -> 9.94, M16 14.52 -> 10.42; nqbench
+# kern-dsa value). NQ-TUNE: the bf16 / proj crossover in the 16-rank step at the core's
+# rows with the core on.
 AUTO_PARTIALS = DSA_PARTIALS
 
 
-def dsa_partials(spec=None, fp8=False):
-    """The checked partials policy ``spec`` (None: the automatic one, AUTO_PARTIALS on
-    FLASHINFER_MLA_SPARSE (``fp8``), else "bf16"): "bf16", "proj" or a batch table of
-    them."""
+def auto_partials(q=None):
+    """The automatic FlashInfer-sparse partials of verify length ``q``: "bf16" on the
+    rows the DSA sparse core serves at that q (it pushes BF16 partials), "proj" on
+    every other row; AUTO_PARTIALS when q is unknown."""
+    from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core.decode import ROWS, VARIANT
+
+    if q is None:
+        return AUTO_PARTIALS
+    return f"1-{ROWS}:bf16,{ROWS + 1}-:proj" if q in VARIANT else PROJECTED
+
+
+def dsa_partials(spec=None, fp8=False, q=None):
+    """The checked partials policy ``spec`` (None: the automatic one, auto_partials(q)
+    on FLASHINFER_MLA_SPARSE (``fp8``), else "bf16"): "bf16", "proj" or a batch table
+    of them."""
     if spec is None:
-        spec = AUTO_PARTIALS if fp8 else "bf16"
+        spec = auto_partials(q) if fp8 else "bf16"
     if spec in FORMATS:
         return spec
     try:
@@ -73,7 +87,7 @@ class DsaBox:
     """``box`` (mla.dcp.DcpBox) as PreparedDsa and WideDsa read a DcpBox, for the
     ``batches`` it serves (default: every row up to its cap) under the ``partials``
     policy (dsa_partials; None: the automatic one of the backend, ``fp8``: FlashInfer
-    sparse's per-tensor FP8). ``mailbox(batch)`` of a
+    sparse's per-tensor FP8, at verify length ``verify_q``). ``mailbox(batch)`` of a
     "bf16" batch is the box itself: MR !8's BF16 latent partials [2, DCP, CAP, H, 512]
     and LSE [2, DCP, CAP, H] (the same shapes and sentinels) and their peers'
     addresses; of a "proj" batch the box's projected_mailbox. A box created without
@@ -82,11 +96,11 @@ class DsaBox:
 
     format = "bf16"
 
-    def __init__(self, box, batches=None, partials=None, fp8=False):
+    def __init__(self, box, batches=None, partials=None, fp8=False, verify_q=None):
         self.box = box
         self.size, self.rank, self.cap = box.size, box.rank, box.cap
         self.q, self.q_heads = box.q, box.q_heads
-        self.partials = spec = dsa_partials(partials, fp8)
+        self.partials = spec = dsa_partials(partials, fp8, verify_q)
         rows = range(1, self.cap + 1)
         # partials_for at every row, the table parsed once
         table = {} if spec in FORMATS else batch_table(spec)
