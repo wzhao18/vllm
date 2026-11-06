@@ -1,8 +1,12 @@
 """Pure-Python checks of the nq bench harness (no torch / GPU): python3 test_nq_harness.py
 
-* cfg2bench.build on a synthetic decode role: arg classification, capture extension, arms, env rewrites
+* cfg2bench.build on a synthetic decode role: arg classification, capture list (measured rows only, or
+  --full-capture), arms, env rewrites
+* cfg2bench.measured_capture on the c64 / c256 production lists: exact lists, coverage, capacity anchors, minimal
+  size count; its rounding replicas against shapes.captured_rows / draft.draft_batches from the checkout's source
 * nq_step.patch_specialized_decode with stand-in vllm modules: the real functions see the production
-  compilation fields only for the duration of the call, the stock arm is untouched
+  compilation fields only for the duration of the call, the stock arm is untouched, and the measured-rows list
+  is checked against the full one (check_capture)
 * nq_step.apply_overlay on a temp package tree: vllm / kimi_k3 resolve from the whole-tree overlay
 * nq_shapes.py / nq_summary.py / nq_junit.py end to end on synthetic files
 """
@@ -47,9 +51,19 @@ def test_cfg2bench():
     ls = cfg2bench.build(doc(), "ls", "new", [8, 16, 1024])
     st = cfg2bench.build(doc(), "stock", "new", [8, 16, 1024])
     assert ls["q"] == 4 and ls["mns"] == 256 and ls["max_capture"] == 1024
-    # measured rows and their drafter rows (B*K) are captured: 16 -> 12, 1024 -> 768
-    for s in (8, 6, 16, 12, 1024, 768):
-        assert s in ls["capture_sizes"], s
+    # default: only what the run measures. Rows 8 / 16 / 1024 are captured verify rows and B = 2 / 4 / 256 drafter
+    # batches (B=2 < q: one size, 6 = B*K, serves both); the capacity anchors are the measured top here
+    assert ls["captured_rows"] == [8, 12, 16, 768, 1024] and ls["draft_batches"] == [2, 4, 6, 256], ls
+    assert ls["capture_sizes"] == [6, 12, 16, 768, 1024] and not ls["full_capture"]
+    assert st["capture_sizes"] == ls["capture_sizes"]  # same list in both arms
+    comp = json.loads(ls["argv"][ls["argv"].index("--compilation-config") + 1])
+    assert comp["cudagraph_capture_sizes"] == ls["capture_sizes"]
+    # --full-capture: the production list plus measured rows and their drafter rows (B*K): 16 -> 12, 1024 -> 768
+    full = cfg2bench.build(doc(), "ls", "new", [8, 16, 1024], full_capture=True)
+    for s in (8, 6, 16, 12, 1024, 768, 15, 384):
+        assert s in full["capture_sizes"], s
+    assert full["capture_sizes"] == ls["full_capture_sizes"] and full["full_capture"]
+    assert full["mns"] == ls["mns"] and full["max_capture"] == ls["max_capture"]
     a = ls["argv"]
     assert a[a.index("--additional-config") + 1] == '{"decode_backend": "latency_specialized"}'
     b = st["argv"]
@@ -94,6 +108,123 @@ def test_cfg2bench():
     sh = cfg2bench.as_sh(ls, "x")
     assert "export K31_DCPX_BUILD_DIR=${NQ_BUILD}/dcpx" in sh and "NQ_CAP=" in sh and "NQ_PRODLIMIT=512" in sh
     assert "# dropped env UCX_TLS:" in sh
+    assert "\nNQ_CAP=6,12,16,768,1024\n" in sh and "\nNQ_ROWS=8,16,1024\n" in sh
+    assert "\nNQ_FULLCAP=" + ",".join(map(str, full["capture_sizes"])) + "\n" in sh
+    assert "# capture: measured rows only" in sh
+
+
+# Production decode capture lists (jh/noquant/cfg nq-c64-xdr sha 6b272c47dcc6, nq-c256-xdr sha ba526d846f5e)
+C64 = [7, 8, 14, 16, 21, 24, 28, 32, 35, 40, 42, 48, 49, 56, 63, 64, 70, 72, 77, 80, 84, 88, 91, 96, 98, 104, 105, 112,
+       119, 120, 126, 128, 133, 136, 140, 144, 147, 152, 154, 160, 161, 168, 175, 176, 182, 184, 189, 192, 196, 200, 203,
+       208, 210, 216, 217, 224, 232, 240, 248, 256]
+C256 = [6, 8, 15, 16, 18, 20, 21, 24, 30, 32, 39, 40, 45, 48, 54, 56, 63, 64, 66, 68, 69, 72, 75, 76, 78, 80, 81, 84, 87,
+        88, 90, 92, 93, 96, 100, 102, 104, 108, 112, 114, 116, 120, 124, 126, 128, 132, 136, 138, 144, 150, 152, 156, 160,
+        162, 168, 174, 176, 180, 184, 186, 192, 200, 204, 208, 216, 224, 228, 232, 240, 248, 252, 256, 264, 272, 276,
+        288, 300, 304, 312, 320, 324, 336, 348, 352, 360, 368, 372, 384, 400, 416, 432, 448, 464, 480, 496, 512]
+
+
+def prod_doc(sizes, mns, cap, k):
+    d = doc(rows_cap=cap, mns=mns, k=k)
+    args = d["roles"]["decode"]["args"]
+    args["compilation-config"] = json.dumps({"cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": sizes})
+    return d
+
+
+def test_measured_capture():
+    """The measured-rows capture list for the block-1 production lines: every measured row captured, every B a drafter
+    batch, every by-product one the --full-capture list also captures, its capacity (largest verify row and drafter
+    batch), and the fewest sizes that do it."""
+    import cfg2bench
+
+    cases = [
+        # point, sizes, mns, cap, K, rows, expected sizes, expected verify rows, expected drafter batches
+        ("c64", C64, 32, 256, 7, [8, 16, 32, 64, 128, 192, 256],
+         [7, 14, 28, 56, 64, 112, 128, 168, 192, 224, 256],
+         [8, 16, 32, 56, 64, 112, 128, 168, 192, 224, 256],
+         [1, 2, 4, 8, 10, 16, 19, 24, 28, 32]),
+        ("c256", C256, 128, 512, 3, [8, 16, 32, 64, 128, 256, 384, 512],
+         [6, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 288, 384, 512],
+         [8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 288, 384, 512],
+         [2, 4, 6, 8, 11, 16, 22, 32, 43, 64, 86, 96, 128]),
+    ]
+    for point, sizes, mns, cap, k, rows, want_sizes, want_rows, want_batches in cases:
+        q = k + 1
+        out = cfg2bench.build(prod_doc(sizes, mns, cap, k), "ls", "new", rows)
+        assert out["mns"] == mns and out["max_capture"] == cap and out["production_limit"] == min(mns * q, cap)
+        assert out["capture_sizes"] == want_sizes, (point, out["capture_sizes"])
+        assert out["captured_rows"] == want_rows, (point, out["captured_rows"])
+        assert out["draft_batches"] == want_batches, (point, out["draft_batches"])
+        # the --full-capture list (production + measured rows and their B*K): c256 production has no size giving
+        # drafter batch 4 (row 16), so the full list adds 12 as well
+        prod_rows, prod_batches = cfg2bench.captured(out["full_capture_sizes"], q, k, mns, cap)
+        assert set(want_rows) <= set(prod_rows) and set(want_batches) <= set(prod_batches), point
+        assert (max(want_rows), max(want_batches)) == (max(prod_rows), max(prod_batches)), point
+        # the full capture prepares ~3-5x the rows
+        assert len(prod_rows) + len(prod_batches) >= 3 * (len(want_rows) + len(want_batches)), point
+        # minimal size count: a size gives one verify row and one drafter batch, so the fewest sizes are
+        # |rows| + |batches| - (a maximum matching of the (row, batch) pairs one size gives together)
+        limit = min(mns * q, cap)
+        need_v = set(rows) | {max(prod_rows)}
+        need_d = {m // q for m in rows} | {max(prod_batches)}
+        pairs = {(cfg2bench.verify_row(s, q, limit), cfg2bench.draft_batch(s, k, cap, mns)) for s in range(1, cap + 1)}
+        edges = {v: [d for vv, d in pairs if vv == v and d in need_d] for v in need_v}
+        match = {}
+
+        def augment(v, seen):
+            for d in edges[v]:
+                if d not in seen:
+                    seen.add(d)
+                    if d not in match or augment(match[d], seen):
+                        match[d] = v
+                        return True
+            return False
+
+        matched = sum(augment(v, set()) for v in sorted(need_v))
+        assert len(want_sizes) == len(need_v) + len(need_d) - matched, (point, matched)
+    # small rows only: the capacity anchors (production top row 256, drafter batch 32) are still captured
+    out = cfg2bench.build(prod_doc(C64, 32, 256, 7), "ls", "old", [8, 64])
+    assert out["capture_sizes"] == [7, 56, 64, 224, 256], out["capture_sizes"]
+    assert max(out["captured_rows"]) == 256 and max(out["draft_batches"]) == 32
+    # above the production limit: the raised limits' top (the largest measured row) is the anchor
+    hi = cfg2bench.build(prod_doc(C256, 128, 512, 3), "ls", "new", [768, 1024])
+    assert hi["capture_sizes"] == [576, 768, 1024] and hi["mns"] == 256 and hi["max_capture"] == 1024, hi
+    assert hi["draft_batches"] == [192, 256]
+
+
+def test_capture_rounding_matches_code():
+    """cfg2bench's rounding replicas against the code under test's own functions (shapes.captured_rows,
+    runtime/draft.draft_batches), extracted from the source without importing torch. Skipped outside a checkout."""
+    import ast
+
+    import cfg2bench
+
+    root = os.path.normpath(os.path.join(HERE, "..", "..", "..", ".."))
+    sd = os.path.join(root, "vllm", "models", "kimi_k3", "nvidia", "specialized_decode")
+    if not os.path.isdir(sd):
+        print("skip test_capture_rounding_matches_code: no vllm checkout next to the tools")
+        return
+
+    def function(path, name):
+        tree = ast.parse(open(path).read())
+        node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name)
+        node.returns = None
+        for a in node.args.args:
+            a.annotation = None
+        scope = {}
+        exec(compile(ast.Module(body=[node], type_ignores=[]), path, "exec"), scope)
+        return scope[name]
+
+    captured_rows = function(os.path.join(sd, "shapes.py"), "captured_rows")
+    draft_batches = function(os.path.join(sd, "runtime", "draft.py"), "draft_batches")
+    for sizes, mns, cap, k in ((C64, 32, 256, 7), (C256, 128, 512, 3), (C64 + [512, 896, 1024], 128, 1024, 7),
+                               ([7, 56, 64, 224, 256], 32, 256, 7)):
+        q = k + 1
+        cc = types.SimpleNamespace(cudagraph_capture_sizes=sizes, max_cudagraph_capture_size=cap)
+        config = types.SimpleNamespace(compilation_config=cc,
+                                       scheduler_config=types.SimpleNamespace(max_num_seqs=mns))
+        rows, batches = cfg2bench.captured(sizes, q, k, mns, cap)
+        assert rows == list(captured_rows(sizes, q, min(mns * q, cap))), (sizes, rows)
+        assert batches == list(draft_batches(config, k)), (sizes, batches)
 
 
 def fake_vllm(tmp):
@@ -207,6 +338,23 @@ def test_patch_and_overlay():
         n = len(runtime.SEEN)
         assert model.specialized_decode_config(s) is None and len(runtime.SEEN) == n
         assert draft.draft_batches(s, 3) == []
+        # measured-rows list checked against the full one through the (stand-in) code under test
+        full = (6, 8, 12, 15, 16, 768, 1024)
+        for trimmed, measured, error in (((6, 12, 16, 768, 1024), (8, 16, 1024), None),
+                                         ((6, 12, 16, 768), (8, 16), "capacity"),
+                                         ((6, 16, 768, 1024), (8, 16), "drafter batches [4]")):
+            for mod in [m for m in sys.modules if m == "vllm" or m.startswith("vllm.")]:
+                del sys.modules[mod]
+            import vllm.models.kimi_k3.nvidia.model as model
+
+            nq_step.patch_specialized_decode(trimmed, 1024, full, measured)
+            try:
+                out = model.specialized_decode_config(config("latency_specialized"))
+            except RuntimeError as e:
+                assert error and error in str(e) and "nq capture list" in str(e), e
+            else:
+                assert error is None and out.captured == (8, 12, 16, 768, 1024), (trimmed, out)
+            assert model.specialized_decode_config(config("auto")) is None  # stock arm: no check
         sys.path.remove(base)
         sys.path.remove(ov)
     for mod in [m for m in sys.modules if m == "vllm" or m.startswith("vllm.")]:

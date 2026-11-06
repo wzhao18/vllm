@@ -36,6 +36,7 @@ if [ "$SLURM_LOCALID" = 0 ]; then
   echo "NQ node $(hostname) gpus: $(nvidia-smi --query-gpu=index,memory.used,clocks.mem --format=csv,noheader | tr '\n' ' ')"
 fi
 cd /tmp
-exec python3 $D/nq_step.py --init-file $OUT.rdv --capture-sizes "$NQ_CAP" --max-capture $NQ_MAXCAP --overlay "$NQ_OV" -- \
+exec python3 $D/nq_step.py --init-file $OUT.rdv --capture-sizes "$NQ_CAP" --max-capture $NQ_MAXCAP \
+  --full-capture-sizes "$NQ_FULLCAP" --measured-rows "$NQ_ROWS" --overlay "$NQ_OV" -- \
   "${NQ_ARGS[@]}" --shapes $OUT.shapes.json --kv-len-jitter 0 --routing balanced --seed 0 \
   --iters ${NQ_ITERS:-20} --samples ${NQ_SAMPLES:-5} --output-json $OUT.json "$@"

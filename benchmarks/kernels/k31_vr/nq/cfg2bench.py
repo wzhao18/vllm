@@ -1,7 +1,7 @@
 """cfg2bench.py: a production no-quant decode config -> the step bench's engine args and env.
 
     cfg2bench.py <point|cfg.yaml|cfg.json> --arm stock|ls [--drafter old|new|<dir>] [--rows 8,16,...]
-                 [--format sh|json]
+                 [--full-capture] [--format sh|json]
     cfg2bench.py <point> --split --rows 8,...,1024   # '<rows <= production limit> <rows above>' 
     cfg2bench.py --snapshot <dir>        # JSON copies of every nq-*-xdr.yaml (login node, PyYAML)
 
@@ -18,10 +18,23 @@ Bench-only changes (printed as comments in the output):
   * --load-format dummy (both arms), target = the e2e model view (dummy weights, real
     config), drafter path = the Lustre checkpoint behind /raid/common-models (old) or the
     new kimi-k3.1-pro-dspark-preview (--drafter new);
-  * capture sizes: the production list plus every measured row B*q and its drafter rows
-    B*K (so each measured shape is a captured FULL graph in production terms: the verify
-    graph runs it unpadded and draft_batches() contains B); max-cudagraph-capture-size and
-    max-num-seqs grow to the largest measured row when --rows exceeds the production
+  * capture sizes (``measured_capture``): only what the process measures, not the
+    production list (96 sizes at c256, 60 at c64: the specialized decode prepares and
+    compiles every captured row and drafter batch, 20-30+ min of startup for the ~8-10
+    rows a run times). Each measured row M = B*q must be a captured verify row (the
+    runner rounds a size s up to whole requests: round_up(s, q), shapes.captured_rows)
+    and B a drafter batch (round_up(s, K) / K, runtime/draft.draft_batches); one size
+    serves both when B < q (s = B*K), else two sizes, and their by-products (the other
+    rounding of each size) are captured too, exactly as production captures them. Plus
+    the two capacity anchors: the largest verify row and the largest drafter batch the
+    full list captures under the run's limits, because the decode buffers, mailboxes
+    and some compiled kernels are sized by those maxima (runtime/decode.py capacity;
+    oproj wide tile, MoE tail rows box, drafter wide all-reduce cap): with them each
+    measured row's kernels are the ones the production capture builds. A greedy cover
+    picks the sizes with the fewest by-products. --full-capture restores the production
+    list plus every measured row and its drafter row B*K (the old behaviour). Both arms
+    get the same list; max-num-seqs and max-cudagraph-capture-size stay the production
+    values. They grow to the largest measured row when --rows exceeds the production
     limit min(max-num-seqs * q, max capture) (the arbitrary-batch goal: rows the
     production config never captured). nq_ab.sh runs the rows <= that limit and the
     rows above it as separate processes (--part lo|hi), so the rows inside the limit
@@ -216,7 +229,70 @@ def production_limit(doc):
     return min(int(args["max-num-seqs"]) * (k + 1), maxcap)
 
 
-def build(doc, arm, drafter, rows):
+def verify_row(size, q, limit):
+    """The verify graph a capture size gives (shapes.captured_rows: rounded up to whole
+    q-token requests, dropped above min(max-num-seqs * q, max capture)); None: none."""
+    m = -(-size // q) * q
+    return m if m <= limit else None
+
+
+def draft_batch(size, k, maxcap, mns):
+    """The drafter batch a capture size gives (runtime/draft.draft_batches: round_up(s, K)
+    / K, dropped when the rounded size exceeds the max capture or the batch max-num-seqs);
+    None: none."""
+    r = -(-size // k) * k
+    return r // k if r <= maxcap and r // k <= mns else None
+
+
+def captured(sizes, q, k, mns, maxcap):
+    """(verify rows, drafter batches) a capture list gives the specialized decode."""
+    limit = min(mns * q, maxcap)
+    rows = {verify_row(s, q, limit) for s in sizes} - {None}
+    batches = {draft_batch(s, k, maxcap, mns) for s in sizes} - {None}
+    return sorted(rows), sorted(batches)
+
+
+def measured_capture(rows, q, k, mns, maxcap, full):
+    """The fewest capture sizes whose verify rows hold every measured row M = B*q and
+    whose drafter batches hold every B, plus the capacity anchors: the largest verify
+    row and drafter batch of ``full`` (the list --full-capture passes) under the same
+    limits, so every capacity-sized buffer, mailbox and compiled kernel matches the full
+    capture's. Greedy: each step takes the size covering the most missing targets, then
+    the fewest by-products (rows / batches nothing asked for), then the natural size
+    (M or B*K), then the largest. Returns (sizes, anchors)."""
+    limit = min(mns * q, maxcap)
+    full_rows, full_batches = captured(full, q, k, mns, maxcap)
+    anchors = (max(full_rows, default=0), max(full_batches, default=0))
+    need_v = set(rows) | ({anchors[0]} if anchors[0] else set())
+    need_d = {m // q for m in rows} | ({anchors[1]} if anchors[1] else set())
+    natural = need_v | {b * k for b in need_d}
+    have_v, have_d, sizes = set(), set(), []
+    while need_v - have_v or need_d - have_d:
+        cands = set()
+        for m in need_v - have_v:
+            cands.update(range(max(1, m - q + 1), m + 1))
+        for b in need_d - have_d:
+            cands.update(range(max(1, b * k - k + 1), b * k + 1))
+
+        def score(s):
+            v, d = verify_row(s, q, limit), draft_batch(s, k, maxcap, mns)
+            new = (v in need_v and v not in have_v) + (d in need_d and d not in have_d)
+            extra = (v is not None and v not in need_v and v not in have_v) + (
+                d is not None and d not in need_d and d not in have_d
+            )
+            return new, -extra, s in natural, s
+
+        s = max(cands, key=score)
+        if score(s)[0] == 0:
+            sys.exit(f"cfg2bench: no capture size covers rows {sorted(need_v - have_v)} / "
+                     f"drafter batches {sorted(need_d - have_d)}")
+        sizes.append(s)
+        have_v.add(verify_row(s, q, limit))
+        have_d.add(draft_batch(s, k, maxcap, mns))
+    return sorted(sizes), anchors
+
+
+def build(doc, arm, drafter, rows, full_capture=False):
     dec = doc["roles"]["decode"]
     args, renv = dict(dec["args"]), dict(dec.get("env") or {})
     unknown = sorted(set(args) - KEEP - REWRITE - set(DROP))
@@ -259,9 +335,40 @@ def build(doc, arm, drafter, rows):
         )
         maxcap = max(maxcap, top)
         mns = max(mns, -(-top // q))
-    sizes = [s for s in sizes if s <= maxcap]
-    if added:
-        notes.append(f"capture sizes added for measured rows: {sorted(added)}")
+    full = [s for s in sizes if s <= maxcap]  # --full-capture: production + measured rows
+    full_rows, full_batches = captured(full, q, k, mns, maxcap)
+    if full_capture:
+        sizes = full
+        if added:
+            notes.append(f"capture sizes added for measured rows: {sorted(added)}")
+        notes.append(
+            f"capture: FULL ({len(full)} sizes: {len(full_rows)} verify rows, "
+            f"{len(full_batches)} drafter batches)"
+        )
+    else:
+        sizes, anchors = measured_capture(rows, q, k, mns, maxcap, full)
+    cap_rows, cap_batches = captured(sizes, q, k, mns, maxcap)
+    if not full_capture:
+        want_d = {m // q for m in rows}
+        notes.append(
+            f"capture: measured rows only ({len(sizes)} sizes, full list {len(full)}; "
+            f"--full-capture for the production list): sizes {sizes}"
+        )
+        notes.append(
+            f"capture: verify rows {cap_rows} (by-products "
+            f"{sorted(set(cap_rows) - set(rows) - {anchors[0]})}), drafter batches "
+            f"{cap_batches} (by-products {sorted(set(cap_batches) - want_d - {anchors[1]})}); "
+            f"capacity anchors: largest verify row {anchors[0]}, largest drafter batch "
+            f"{anchors[1]} (= the full list's)"
+        )
+    # what the specialized decode will see: every measured row captured, every B a
+    # drafter batch, the maxima of the full list (nq_step.py rechecks with the real code)
+    missing = [m for m in rows if m not in cap_rows or m // q not in cap_batches]
+    if missing or (max(cap_rows, default=0), max(cap_batches, default=0)) != (
+        max(full_rows, default=0), max(full_batches, default=0)
+    ):
+        sys.exit(f"cfg2bench: capture list {sizes} misses rows {missing} or the capacity "
+                 f"anchors {max(full_rows, default=0)}/{max(full_batches, default=0)}")
     comp["cudagraph_capture_sizes"] = sizes
     extra = json.loads(args.get("additional-config") or "{}")
     extra["decode_backend"] = "latency_specialized" if arm == "ls" else "auto"
@@ -299,6 +406,11 @@ def build(doc, arm, drafter, rows):
         "max_capture": maxcap,
         "production_limit": limit,
         "capture_sizes": sizes,
+        "full_capture": bool(full_capture),
+        "full_capture_sizes": full,
+        "captured_rows": cap_rows,
+        "draft_batches": cap_batches,
+        "rows": list(rows),
         "argv": argv,
         "env": env,
         "dropped_env": dropped,
@@ -323,6 +435,9 @@ def as_sh(out, src):
     lines.append(f"NQ_MAXCAP={out['max_capture']}")
     lines.append(f"NQ_PRODLIMIT={out['production_limit']}")
     lines.append("NQ_CAP=" + ",".join(map(str, out["capture_sizes"])))
+    # nq_step.py: the real captured rows / drafter batches of NQ_CAP vs NQ_FULLCAP
+    lines.append("NQ_FULLCAP=" + ",".join(map(str, out["full_capture_sizes"])))
+    lines.append("NQ_ROWS=" + ",".join(map(str, out["rows"])))
     lines.append("NQ_ARGS=(" + " ".join(shlex.quote(a) for a in out["argv"]) + ")")
     return "\n".join(lines)
 
@@ -334,6 +449,11 @@ def main():
     ap.add_argument("--drafter", default="old")
     ap.add_argument("--rows", default="", help="measured verify rows (B*q), e.g. 8,16,32")
     ap.add_argument("--format", choices=["sh", "json"], default="sh")
+    ap.add_argument(
+        "--full-capture", action="store_true",
+        help="capture the production list plus the measured rows (default: only the measured rows, "
+             "their drafter batches and the capacity anchors)",
+    )  # fmt: skip
     ap.add_argument(
         "--split", action="store_true",
         help="print '<rows <= production limit> <rows above it>' (comma lists, '-' = none)",
@@ -351,7 +471,7 @@ def main():
     if not a.cfg or not a.arm:
         ap.error("cfg and --arm are required")
     src = resolve(a.cfg)
-    out = build(load(src), a.arm, a.drafter, parse_sizes(a.rows) if a.rows else [])
+    out = build(load(src), a.arm, a.drafter, parse_sizes(a.rows) if a.rows else [], a.full_capture)
     print(json.dumps(out, indent=1) if a.format == "json" else as_sh(out, src))
 
 

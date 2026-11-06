@@ -6,6 +6,8 @@
 # env: NQ_OV (overlay root, '' = base kimi_k3), NQ_BUILD (default $NB/cache/build/<overlay basename|base>),
 #      NQ_IMG (default: the nq e2e image), NQ_TIMEOUT (s, default 2700), NQ_CNAME (pyxis container name),
 #      NQ_MAX_KV_TOKENS (nq_shapes.py --max-kv-tokens: cap each case's summed context, both arms; default off).
+#      NQ_FULL_CAPTURE (non-empty: cfg2bench --full-capture, the production capture list plus the measured rows; default:
+#      only the measured rows, their drafter batches and the capacity anchors, which prepares ~10 rows instead of ~100).
 W=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr; K=/lustre/fsw/coreai_comparch_inferencex/weizha/k3vr
 M=/lustre/fsw/coreai_comparch_inferencex/weizha/models; NB=$W/nqbench
 D=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -21,9 +23,10 @@ export NQ_OV NQ_BUILD=${NQ_BUILD:-$NB/cache/build/$OVTAG}
 # runner tasks inherit the block's 12-node geometry (oracle/tools/step_run.sh:20)
 unset SLURM_NTASKS SLURM_NPROCS SLURM_NTASKS_PER_NODE SLURM_TASKS_PER_NODE SLURM_NNODES SLURM_JOB_NUM_NODES SLURM_NODELIST
 mkdir -p $(dirname $OUT); rm -f $OUT.rdv $OUT.json
-python3 $D/cfg2bench.py $POINT --arm $ARM --drafter $DRAFT --rows $ROWS > $OUT.cfg.sh || { echo "cfg2bench failed"; exit 2; }
+python3 $D/cfg2bench.py $POINT --arm $ARM --drafter $DRAFT --rows $ROWS ${NQ_FULL_CAPTURE:+--full-capture} > $OUT.cfg.sh || { echo "cfg2bench failed"; exit 2; }
 Q=$(sed -n 's/^NQ_Q=//p' $OUT.cfg.sh)
-CAPS="prodlimit=$(sed -n 's/^NQ_PRODLIMIT=//p' $OUT.cfg.sh) maxcap=$(sed -n 's/^NQ_MAXCAP=//p' $OUT.cfg.sh) mns=$(sed -n 's/^NQ_MNS=//p' $OUT.cfg.sh)"
+CAPMODE=measured; [ -n "$NQ_FULL_CAPTURE" ] && CAPMODE=full
+CAPS="capture=$CAPMODE prodlimit=$(sed -n 's/^NQ_PRODLIMIT=//p' $OUT.cfg.sh) maxcap=$(sed -n 's/^NQ_MAXCAP=//p' $OUT.cfg.sh) mns=$(sed -n 's/^NQ_MNS=//p' $OUT.cfg.sh)"
 python3 $D/nq_shapes.py $Q $OUT.shapes.json --rows $ROWS --ctx $CTX --point $POINT \
   --max-kv-tokens ${NQ_MAX_KV_TOKENS:-0} > $OUT.shapes.txt || exit 2
 export ENROOT_CACHE_PATH=$K/enroot-cache
@@ -37,5 +40,5 @@ timeout ${NQ_TIMEOUT:-2700} srun --overlap --jobid $J -N4 -w $NL --ntasks-per-no
 rc=$?
 echo "NQEND rc=$rc end=$(date +%FT%T)" >> $OUT.log
 echo "$(basename $OUT) rc=$rc"
-grep -a "^\[forward\].*median\|^NQ: KV\|^NQ: specialized\|^NQ: drafter\|Traceback\|Error:" $OUT.log | sed 's/, sample spread.*//' | head -40
+grep -a "^\[forward\].*median\|^NQ: KV\|^NQ: capture\|^NQ: specialized\|^NQ: drafter\|Traceback\|Error:" $OUT.log | sed 's/, sample spread.*//' | head -40
 exit $rc

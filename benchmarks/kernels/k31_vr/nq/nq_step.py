@@ -18,6 +18,11 @@ fault hooks, plus:
   config's capture sizes and max capture size) set on the config for the duration of the
   call: limit = min(max_num_seqs * q, max capture) and round_up(s, K) / K come from the
   code under test, whatever it becomes. The stock arm (decode_backend auto) is untouched.
+  The sizes are cfg2bench's NQ_CAP: by default only the measured rows, their drafter
+  batches and the capacity anchors (cfg2bench.measured_capture). With --full-capture-sizes
+  (NQ_FULLCAP) the real functions also run on the full list and the ls process refuses to
+  start unless every measured row is captured, every B is a drafter batch and the largest
+  verify row / drafter batch equal the full list's (check_capture).
 * --overlay DIR: the code under test. DIR is a whole vllm tree (stage_overlay.sh: the base
   env vllm-jh-242fb49cd4, hard-linked, with every file of the checkout that differs from
   242fb49cd4 under vllm/ shipped over it, listed in DIR/SOURCE_REV); nq_inner.sh puts DIR
@@ -123,9 +128,36 @@ def apply_overlay(root):
     log(f"overlay: {len(shipped)} files differ from the base under vllm/: {shipped}")
 
 
-def patch_specialized_decode(sizes, max_capture):
+def check_capture(measured, q, rows, batches, full_rows, full_batches):
+    """The measured-rows capture list (cfg2bench.measured_capture) against the full one,
+    both through the code under test: every measured row M a captured verify row and
+    M // q a drafter batch, nothing outside the full capture, and the same largest
+    verify row and drafter batch (the capacity every decode buffer, mailbox and
+    capacity-sized kernel is built for), so each measured row is prepared as the full
+    capture prepares it. Returns the problems (empty: consistent)."""
+    problems = []
+    miss = [m for m in measured if m not in rows]
+    if miss:
+        problems.append(f"measured rows {miss} not captured (captured {list(rows)})")
+    miss = [m // q for m in measured if m // q not in batches]
+    if miss and full_batches:  # (no drafter: no drafter batches either way)
+        problems.append(f"drafter batches {miss} not in draft_batches {list(batches)}")
+    extra = sorted(set(rows) - set(full_rows)) + sorted(set(batches) - set(full_batches))
+    if extra:
+        problems.append(f"rows / drafter batches {extra} outside the full capture")
+    top = max(rows, default=0), max(batches, default=0)
+    full_top = max(full_rows, default=0), max(full_batches, default=0)
+    if top != full_top:
+        problems.append(f"capacity (largest verify row, drafter batch) {top} != the full "
+                        f"capture's {full_top}")
+    return problems
+
+
+def patch_specialized_decode(sizes, max_capture, full_sizes=None, measured=()):
     """Run the real specialized_decode_config / draft_batches with the production
-    compilation fields (see the module docstring)."""
+    compilation fields (see the module docstring). ``full_sizes`` (cfg2bench NQ_FULLCAP,
+    the --full-capture list): the decode config also derives its rows and drafter
+    batches from it, and the process refuses to start unless ``check_capture`` passes."""
     import vllm.models.kimi_k3.nvidia.model as model
     import vllm.models.kimi_k3.nvidia.specialized_decode.runtime as runtime
     from vllm.config import CUDAGraphMode
@@ -135,7 +167,7 @@ def patch_specialized_decode(sizes, max_capture):
         extra = vllm_config.additional_config
         return isinstance(extra, dict) and extra.get("decode_backend", "auto") != "auto"
 
-    def production(fn):
+    def production(fn, sizes=sizes):
         def call(vllm_config, *args):
             if not specialized(vllm_config):
                 return fn(vllm_config, *args)
@@ -153,6 +185,11 @@ def patch_specialized_decode(sizes, max_capture):
         return call
 
     build = production(runtime.specialized_decode_config)
+    batches = production(draft.draft_batches)
+    full = full_sizes is not None and tuple(full_sizes) != tuple(sizes)
+    if full:
+        build_full = production(runtime.specialized_decode_config, full_sizes)
+        batches_full = production(draft.draft_batches, full_sizes)
 
     def specialized_decode_config(vllm_config):
         config = build(vllm_config)
@@ -163,11 +200,23 @@ def patch_specialized_decode(sizes, max_capture):
                 f"{config.bf16_state} captured {len(rows)} rows "
                 f"{rows[:1]}..{rows[-1:]} (capture sizes {len(sizes)}, max {max_capture})"
             )
+            if full:
+                steps = config.q - 1
+                drafts = batches(vllm_config, steps) if steps else ()
+                full_rows = build_full(vllm_config).captured
+                full_drafts = batches_full(vllm_config, steps) if steps else ()
+                problems = check_capture(measured, config.q, rows, drafts, full_rows,
+                                         full_drafts)
+                if problems:
+                    raise RuntimeError("nq capture list: " + "; ".join(problems))
+                log(f"capture: measured rows only: verify rows {list(rows)}, drafter batches "
+                    f"{list(drafts)} of the full capture's {len(full_rows)} rows / "
+                    f"{len(full_drafts)} batches (same capacity {rows[-1:]} / "
+                    f"{list(drafts)[-1:]}; --full-capture for the production list)")
         return config
 
     runtime.specialized_decode_config = specialized_decode_config
     model.specialized_decode_config = specialized_decode_config
-    batches = production(draft.draft_batches)
 
     def draft_batches(vllm_config, steps):
         out = batches(vllm_config, steps)
@@ -410,8 +459,13 @@ def report_cases():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--init-file", default="")
-    ap.add_argument("--capture-sizes", required=True, help="production list (+ measured rows)")
+    ap.add_argument("--capture-sizes", required=True,
+                    help="cfg2bench NQ_CAP: measured rows (+ drafter batches, capacity anchors) or the "
+                         "--full-capture list")
     ap.add_argument("--max-capture", type=int, required=True)
+    ap.add_argument("--full-capture-sizes", default="",
+                    help="the --full-capture list (production + measured rows): checked against")
+    ap.add_argument("--measured-rows", default="", help="the verify rows the cases measure")
     ap.add_argument("--overlay", default="")
     ap.add_argument("--no-fill-index", action="store_true")
     ap.add_argument("--fill-mla", action="store_true")
@@ -423,7 +477,8 @@ def main():
     rendezvous(args.init_file)
     apply_overlay(args.overlay)
     sizes = parse_sizes(args.capture_sizes)
-    patch_specialized_decode(sizes, args.max_capture)
+    full = parse_sizes(args.full_capture_sizes) if args.full_capture_sizes else None
+    patch_specialized_decode(sizes, args.max_capture, full, parse_sizes(args.measured_rows))
     patch_fill(not args.no_fill_index, args.fill_mla)
     if "--shapes" in rest:
         patch_kv_pool(rest[rest.index("--shapes") + 1], "--exclude-drafter" not in rest,

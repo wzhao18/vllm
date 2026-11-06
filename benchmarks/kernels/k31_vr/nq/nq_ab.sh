@@ -12,8 +12,10 @@
 #   config, same failure); other lines (other ctx / extra args / part) still run. The summary reports the error.
 # env: as nq_run1.sh (NQ_OV, NQ_BUILD, NQ_IMG, NQ_TIMEOUT); NQ_DEADLINE (epoch s): skip runs that cannot finish
 # (NQ_RUN_EST s each, default 1500) before it.
-# NQ-TUNE: NQ_RUN_EST / NQ_TIMEOUT come from the bf16-state runs (6-9 min startup, 15-40 s per case); measure the first
-# fp32-state ls run with the extended capture list (~100 captured rows to prepare at c256) and the 1024-row cases.
+# NQ-TUNE: NQ_RUN_EST / NQ_TIMEOUT come from the bf16-state runs (6-9 min startup, 15-40 s per case) and the full
+# capture list (~100 rows to prepare at c256, 20-30+ min startup at fp32 state). Each process now captures only its
+# measured rows, their drafter batches and the capacity anchors (cfg2bench.py measured_capture: 9-14 sizes); remeasure
+# the startup on the first block and lower NQ_RUN_EST. NQ_FULL_CAPTURE=1 (nq_run1.sh) restores the production list.
 D=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 J=$1; NL=$2; R=$3; POINT=$4; DRAFT=$5; ROWS=$6; shift 6
 ORDER=ls,stock,stock,ls; CTX=agentx

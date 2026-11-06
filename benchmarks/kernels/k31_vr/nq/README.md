@@ -8,7 +8,9 @@ activations. It runs with the old drafter (kimi-k3-dspark: 64 heads, Markov rank
 The harness is new and kept separate from `wtp1/`, which stays untouched. It fixes the bench blockers from the audit:
 - **ReplaySSM refusal:** the flag is not passed.
 - **FULL-graph refusal under `vllm bench forward`:** handled in the `nq_step.py` wrapper.
-- **Empty drafter batches:** the wrapper runs the real `draft_batches` on the production capture list.
+- **Empty drafter batches:** the wrapper runs the real `draft_batches` on the run's capture list.
+- **20-30+ min startup per arm:** each process captures only the rows it measures (see "Capture list" below),
+  not the production list (96 sizes at c256, 60 at c64), which the specialized decode prepares row by row.
 - **Hard-coded bf16 state and old drafter:** everything comes from the production config.
 - **Unrepresentative layout, attention and kernel config:** replaced by the `cfg2bench.py` output.
 
@@ -32,8 +34,8 @@ weights. It is not a correctness signal; correctness needs real-weight runs.
 
 | file | role |
 |---|---|
-| `cfg2bench.py` | Reads `jh/noquant/cfg/nq-<point>-xdr.yaml`, decode role plus global env. Writes the exact bench engine args and env as sourceable sh: TP16 DCP16, fp8 KV, float32 SSM state, mxfp4 indexer, attention and kernel flags, block size, max-num-seqs, capture sizes, speculative config with the drafter override, and `decode_backend` per arm. Each production arg is kept, dropped with a reason, or rewritten; an unknown arg is an error. `--snapshot` writes JSON copies so batch hosts need no PyYAML; a stale snapshot is refused. |
-| `nq_step.py` | Wrapper around `vllm bench forward`. Handles the rendezvous and checks the code-under-test overlay (`--overlay`: vllm and kimi_k3 must resolve inside it; logs its revision and shipped files). Runs the real `specialized_decode_config` / `draft_batches` under the production compilation fields (FULL_AND_PIECEWISE, capture sizes, max capture). Fills the indexer with MX-aware random keys. Sizes the bench KV pool to the largest case (same pool in both arms) instead of gpu-memory-utilization, so the bench-only per-case state snapshot (~158 MiB per request at q4) and graph/eager transients fit; refuses a case that needs more KV blocks than the server's capacity at that utilization; logs per case the context set, KV blocks vs pool and capacity, snapshot GiB and peak memory (`NQ: KV:`, `NQ: case`). |
+| `cfg2bench.py` | Reads `jh/noquant/cfg/nq-<point>-xdr.yaml`, decode role plus global env. Writes the exact bench engine args and env as sourceable sh: TP16 DCP16, fp8 KV, float32 SSM state, mxfp4 indexer, attention and kernel flags, block size, max-num-seqs, capture sizes, speculative config with the drafter override, and `decode_backend` per arm. The capture list holds only the measured rows, their drafter batches and the capacity anchors (`--full-capture`: the production list). Each production arg is kept, dropped with a reason, or rewritten; an unknown arg is an error. `--snapshot` writes JSON copies so batch hosts need no PyYAML; a stale snapshot is refused. |
+| `nq_step.py` | Wrapper around `vllm bench forward`. Handles the rendezvous and checks the code-under-test overlay (`--overlay`: vllm and kimi_k3 must resolve inside it; logs its revision and shipped files). Runs the real `specialized_decode_config` / `draft_batches` under the production compilation fields (FULL_AND_PIECEWISE, capture sizes, max capture). On the ls arm it also runs them on the full list and refuses to start unless every measured row is captured, every B is a drafter batch and the largest verify row / drafter batch equal the full list's (`NQ: capture:`). Fills the indexer with MX-aware random keys. Sizes the bench KV pool to the largest case (same pool in both arms) instead of gpu-memory-utilization, so the bench-only per-case state snapshot (~158 MiB per request at q4) and graph/eager transients fit; refuses a case that needs more KV blocks than the server's capacity at that utilization; logs per case the context set, KV blocks vs pool and capacity, snapshot GiB and peak memory (`NQ: KV:`, `NQ: case`). |
 | `nq_shapes.py` | Cases for a list of verify rows M = B*q, in ascending rows. Prints and stores (`"ctx"`) each case's context summary; `--max-kv-tokens N` (`NQ_MAX_KV_TOKENS`) scales a case whose contexts sum above N. Context options: AgentX vectors (`q8_C1_C8` for c1/c8, `q8_C64`, `q4_C48_C160_C256`), `uNk`, `mix`. |
 | `nq_inner.sh` | One rank inside the e2e image. Sets PYTHONPATH to the overlay tree (or `env/vllm-jh-242fb49cd4` without one), FlashInfer 0.7.3.dev20261031 and the e2e pydeps, like `mk_nq.py`'s decode role but without dynamo and pinhook. Also sets the cache layout and the per-overlay extension build dir (`$NQ_BUILD`). |
 | `nq_run1.sh` | One arm process: `srun --overlap --jobid J -N4 -w <4 hosts> --ntasks-per-node=4` in image `vllm-openai-cu134-nightly-3f1bcfd82b-aarch64.sqsh`. That is the image the nq e2e configs' container key resolves to (`jh/srtslurm-jh.yaml`, `e2e/k31r/srtslurm.yaml`); the DEP configs use `internal-vr-mum-92ccd9647f` instead, which `NQ_IMG` can select. |
@@ -45,7 +47,7 @@ weights. It is not a correctness signal; correctness needs real-weight runs.
 | `tasks/4{0,1,2}-mx12-nq-blk{1,2,3}.sh` | Queue task templates for `holds/runner.sbatch POOL=mx12`, one per block (`__OVTAG__` is filled in by `stage_overlay.sh`). |
 | `plans/block{1,2,3}.plan` | The measurement matrix, in slot order. |
 | `push_tools.sh`, `stage_overlay.sh` | Copy the tools to `$NB/tools` and refresh `$NB/cfg`. Stage a checkout as `$NB/ov/<tag>` and render the tasks into `$NB/tasks` (see below). |
-| `test_nq_harness.py` | Pure-Python checks (no torch) of cfg2bench, the wrapper patches, overlay resolution, shapes and summary. |
+| `test_nq_harness.py` | Pure-Python checks (no torch) of cfg2bench (including the c64 / c256 measured capture lists and their rounding against the checkout's `captured_rows` / `draft_batches`), the wrapper patches, overlay resolution, shapes and summary. |
 
 Here `$W=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr` and `$NB=$W/nqbench`.
 
@@ -67,8 +69,49 @@ NQ_OV=$NB/ov/<ovtag> bash $NB/tools/nq_ab.sh <jobid> h1,h2,h3,h4 $NB/results/man
 python3 $NB/tools/cfg2bench.py c256 --arm ls --drafter new --rows 8,1024   # inspect exactly what a run gets
 ```
 
-Rows not in the production capture list are added, together with their drafter rows B*K. Each measured shape is
-then a captured FULL graph: unpadded verify, B in `draft_batches()`. The production limit is
+### Capture list
+
+The specialized decode prepares (and compiles kernels for) every captured verify row and every drafter batch at
+startup, so the production list (96 sizes at c256, 60 at c64) cost 20-30+ min per process for ~8-10 measured rows.
+`cfg2bench.py` now passes only what the process measures, identically in both arms, with max-num-seqs and
+max-cudagraph-capture-size unchanged:
+- every measured row M = B*q as a captured verify row (the runner rounds a size s up to whole requests,
+  `shapes.captured_rows`) and B as a drafter batch (round_up(s, K) / K, `runtime/draft.draft_batches`). For B < q one
+  size, B*K, gives both; otherwise two sizes, and each also gives its other rounding (a by-product the full list
+  captures too);
+- the two capacity anchors: the largest verify row and the largest drafter batch the full list captures under the
+  run's limits. The decode buffers, mailboxes and several compiled kernels are sized by those maxima (below), so with
+  them a measured row gets the kernels the production capture builds;
+- the fewest sizes that do this (a greedy cover; the test checks it against the matching bound).
+
+| point, rows | sizes | captured verify rows | drafter batches |
+|---|---|---|---|
+| c64 (q8, mns 32, cap 256): 8,16,32,64,128,192,256 | 7,14,28,56,64,112,128,168,192,224,256 (60 in production) | 8,16,32,64,128,192,256 + 56,112,168,224 | 1,2,4,8,16,24,32 + 10,19,28 |
+| c256 (q4, mns 128, cap 512): 8,16,32,64,128,256,384,512 | 6,12,16,24,32,48,64,96,128,192,256,288,384,512 (96) | 8,16,32,64,128,256,384,512 + 12,24,48,96,192,288 | 2,4,8,16,32,64,96,128 + 6,11,22,43,86 |
+
+`<run>.cfg.sh` lists the sizes, rows, batches, by-products and anchors as `# capture:` comments; rank 0 logs the
+`NQ: capture:` check. `--full-capture` (`NQ_FULL_CAPTURE=1` for `nq_run1.sh` / `nq_ab.sh`) restores the old list:
+the production sizes plus every measured row and its drafter row B*K (the NQRUN line says `capture=full`).
+
+What depends on the other captured sizes (runtime/decode.py, providers and the cutedsl families, read 2026-11-06):
+- not the per-shape choices: every family's `choose` and the coverage plan are functions of the shape and the
+  `Context` (the one capture-derived field, `max_rows`, is read by no `choose`); the drafter tables are closed at the
+  largest drafter batch (`closed`), which leaves every batch at or below it unchanged; `wide_rows`, the tuned set
+  (`BATCHES` plus captured rows <= 64) and the drafter's Markov / context / all-reduce sets are per-row filters;
+- but the capacity does: `SpecializedDecode.capacity` (the largest captured row) sizes the hidden / MLA query /
+  projection / indexer buffers, the ShardBox and the o-projection's wide two-shot box, and `PreparedOproj` compiles the
+  largest wide row's x tile as `min(round_up(b, chunk), cap)` (a partial last tile when cap = b); `MoEScratch` sizes the
+  wide tail's `TailRowsBox` by the largest MoE batch and `tail_rows` compiles its kernels with `box.cap`; the dense MLP
+  buffers take `min(capacity, 128)`; on the drafter side `PreparedDraftAr` compiles every wide all-reduce site with
+  `wide_cap` = the largest wide query row, the draft DCP attention widens its box to the largest wide row, and
+  `PreparedMarkov` gets its wide mailbox when the largest batch exceeds 8. The anchors make all of these equal to the
+  full capture's (on the target topology every wide row is admitted by the MoE / o-projection tables, `check_wide`,
+  so their maxima are the capacity); nq_step.py refuses a list whose maxima differ. Not anchored: maxima over rows a
+  table admits only in part, e.g. the head ring mailbox (`RING_HEAD`, <= 256 rows; its row stride does not depend on
+  it) and the draft attention's widened box when residency drops the largest drafter row (`uncovered_rows`).
+
+Either way each measured shape is a captured FULL graph: unpadded verify, B in `draft_batches()`. The production
+limit is
 `min(max-num-seqs * q, capture cap)`. Rows above it run in their own process (`<tag>-hi`), which raises
 max-cudagraph-capture-size and max-num-seqs to the largest measured row (a `NOT PRODUCTION` note; the summary marks
 those rows XCAP). All of this is printed as comments in `<run>.cfg.sh` and at the top of the log; every dropped
@@ -98,7 +141,8 @@ The shipped files are checked by md5 against the checkout. An existing tag is re
 
 Rows above a point's production cap (q4-hi above 512, q8-hi above 256) measure the arbitrary-batch goal.
 
-Budget per slot: about 25 min a process and a 10 min end margin, so at most 7 processes. Slots A and B use 6, so a slow
+Budget per slot: about 25 min a process and a 10 min end margin, so at most 7 processes (set with the full capture
+list; remeasure with the measured-rows list and lower `NQ_RUN_EST`). Slots A and B use 6, so a slow
 first build (extension and CuTe compile under one lock) does not cut an A/B pair. A line that straddles the production
 limit costs two processes per arm.
 
