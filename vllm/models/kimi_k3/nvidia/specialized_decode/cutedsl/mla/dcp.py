@@ -1691,6 +1691,27 @@ def polled_output(heads, size, batch, sms):
     return DcpValue(heads, size, batch, sms, 1, 0, polled_out=True).polled_out
 
 
+def uv_layout_error(uv):
+    """Why DcpValue cannot read W_UV of layout ``uv`` = (shape, stride, dtype), or
+    None. Its MMA B fragments are 16 B loads of 8 consecutive latent values (W_UV at
+    (head, latent 8 j, output column v), any v): W_UV [H, 512, 128] BF16 must be
+    latent-contiguous with 16 B aligned head and output-column strides, as the
+    model's (split_kv_b_proj's kv_b_proj.T view, (L, N, V) -> (N, L, V): strides
+    (512 x 256, 1, 512)). An output-contiguous W_UV ([L, N, V] contiguous, then
+    transposed: strides (128, N x 128, 1)) puts lane group g's fragment at byte 2 g
+    mod 16: a misaligned ld.global.v4 (CUDA_ERROR_MISALIGNED_ADDRESS)."""
+    shape, stride, dtype = uv
+    if len(shape) != 3 or tuple(shape[1:]) != (512, 128) or dtype != torch.bfloat16:
+        return f"W_UV {tuple(shape)} {dtype}: DcpValue reads [H, 512, 128] BF16"
+    if stride[1] != 1 or stride[0] % 8 or stride[2] % 8:
+        return (
+            f"W_UV strides {tuple(stride)}: DcpValue's 16 B fragment loads need it "
+            "latent-contiguous (stride 1 over the 512 latent columns, 16 B aligned "
+            "head / output-column strides), as the model's W_UV"
+        )
+    return None
+
+
 @cache
 def compile_value(
     heads,
@@ -1731,6 +1752,9 @@ def compile_value(
     schedule. ``resident_sms``: the wave the merging CTAs' grid must fit in
     (``DcpValue.tile_stride``; 0: ``sms``, the caller's real SM count; the tests
     give a smaller one to compare row-tile strides)."""
+    error = uv_layout_error(uv)  # (the fragment loads assume it: no GPU-side check)
+    if error:
+        raise ValueError(f"Kimi K3 MLA DcpValue: {error}")
     f32, i32 = torch.float32, torch.int32
     w_uv, gate = fake(*uv), fake((batch, heads * 128), (pitch, 1))
     rows = fake((batch, 1, size * heads, 512))

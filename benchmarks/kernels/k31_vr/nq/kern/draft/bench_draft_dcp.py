@@ -161,8 +161,10 @@ class DraftAttention:
 
     def __init__(self, torch, heads, device, cache, world, rank, gen):
         self.num_local_heads = heads
-        w_uv = torch.randn((512, heads, 128), generator=gen) * 0.05
-        self.W_UV = w_uv.bfloat16().to(device).transpose(0, 1)
+        # W_UV [H, 512, 128] latent-contiguous, as the model's (split_kv_b_proj's .T
+        # view, transposed): DcpValue's 16 B W_UV loads need it (mla.dcp compile_value)
+        w = torch.randn((heads * 128, 512), generator=gen) * 0.05
+        self.W_UV = w.bfloat16().to(device).T.view(512, heads, 128).transpose(0, 1)
         self.scale = SOFTMAX_SCALE
         self._q_scale_float, self._k_scale_float = Q_SCALE, K_SCALE
         self.rotary_emb = None

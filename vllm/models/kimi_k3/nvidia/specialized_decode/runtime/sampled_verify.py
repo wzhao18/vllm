@@ -40,7 +40,11 @@ and lets its dependent launch early (the exchanges wait before theirs).
 import torch
 
 from vllm.triton_utils import tl, tldevice, triton
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax, tl_rand32
+from vllm.v1.worker.gpu.sample.gumbel import (
+    gumbel_noised_argmax,
+    spec_step_seed,
+    tl_rand32,
+)
 
 STATS_WORDS = 8  # round 1 entry: t_max t_sum q_max q_sum t_tok q_tok key_lo key_hi
 CAND_WORDS = 4  # round 2 entry: key_lo key_hi mass one
@@ -304,7 +308,12 @@ def _candidate_kernel(
     target_logprob = t_tok - t_lse
     # One-hot drafts: q(token) = 1, log_q = 0.
     draft_logprob = q_tok - q_lse if HAS_DRAFT_LOGITS else tl.zeros_like(t_tok)
-    u = tl_rand32(seed, positions, includes_zero=False)
+    # Block verification draws row i's uniform under the step-mixed seed, as the stock
+    # _rejection_kernel does (spec_step_seed(seed, i)); the other modes the raw seed.
+    if BLOCK_VERIFY:
+        u = tl_rand32(spec_step_seed(seed, rows), positions, includes_zero=False)
+    else:
+        u = tl_rand32(seed, positions, includes_zero=False)
     if SYNTHETIC:
         rate = tl.load(rates_ptr + rows, mask=is_draft, other=0.0)
     is_greedy = temp == 0.0
@@ -468,7 +477,7 @@ def _finalize_kernel(
             cum = tl.load(cum_ptr + req * QP + rows)
             positions = tl.load(row_pos_ptr + base_row + rows, mask=row_mask, other=0)
             seed = tl.load(seed_ptr + slot)
-            u = tl_rand32(seed, positions, includes_zero=False)
+            u = tl_rand32(spec_step_seed(seed, rows), positions, includes_zero=False)
             accepted = tl.zeros((), tl.int64)
             verifying = tl.full((), 1, tl.int1)
             for i in tl.static_range(K):

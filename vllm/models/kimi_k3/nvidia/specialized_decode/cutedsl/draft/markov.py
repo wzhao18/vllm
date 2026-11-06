@@ -36,14 +36,16 @@ shuffles queue behind those loads).
 
 ``sampled`` (probabilistic drafting, ``draft_sample_method="probabilistic"``): the
 stock loop's ``gumbel_sample`` instead of the argmax. Each logit (bitwise the stock
-BF16 one) becomes ``logit / T + noise`` with the stock Gumbel noise of (request seed,
-position + the draft salt, vocabulary index) (``common.gumbel``, bitwise the Triton
-code), or stays the logit at temperature 0 / for padding requests; the keys carry the
-FP32 score (``gumbel.sampled_key``), so every rank takes the stock draw. Each CTA also
-stores its rows of every live request's pre-temperature logits into the draft-logits
-cache ``[slot, position, V]`` (this rank's columns only; staged in shared memory and
-written as 16-byte chunks while the keys travel), as ``gumbel_sample``'s
-``logits_cache`` does for the whole vocabulary.
+BF16 one) becomes ``logit / T + noise`` with the stock Gumbel noise of (request seed
+with the draft position mixed into its high word, ``spec_step_seed(seed, i)`` as
+``gumbel_sample`` does for cache column ``i``; position + the draft salt; vocabulary
+index) (``common.gumbel``, bitwise the Triton code), or stays the logit at
+temperature 0 / for padding requests; the keys carry the FP32 score
+(``gumbel.sampled_key``), so every rank takes the stock draw. Each CTA also stores its
+rows of every live request's pre-temperature logits into the draft-logits cache
+``[slot, position, V]`` (this rank's columns only; staged in shared memory and written
+as 16-byte chunks while the keys travel), as ``gumbel_sample``'s ``logits_cache`` does
+for the whole vocabulary.
 
 Markov rank (``CTA_ROWS``): at rank 256 a CTA owns 256 vocabulary rows (16 warps x one
 16-row MMA tile, 16 k-steps). At rank 512 (kimi-k3.1-pro-dspark-preview) 256 staged
@@ -418,7 +420,10 @@ class MarkovGreedy:
                 if cutlass.const_expr(self.sampled):
                     prefixes = cute.make_rmem_tensor(2, Uint32)
                     for n in cutlass.range_constexpr(2):
-                        prefixes[n] = request_prefix(seeds_r[n], positions_r[i, n])
+                        # spec_step_seed(seed, i): gumbel_sample's seed for cache
+                        # column i (the draft position).
+                        step_seed = seeds_r[n] ^ Int64(i << 32)
+                        prefixes[n] = request_prefix(step_seed, positions_r[i, n])
                 for r in cutlass.range_constexpr(2):
                     bias = bf16x2(acc[2 * r], acc[2 * r + 1])
                     for n in cutlass.range_constexpr(2):

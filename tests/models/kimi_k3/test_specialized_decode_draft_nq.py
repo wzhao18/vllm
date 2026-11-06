@@ -327,6 +327,30 @@ def test_draft_fold_splits_role(monkeypatch):
     assert 64 in attention.DRAFT_RULE_HEADS and 96 not in attention.DRAFT_RULE_HEADS
 
 
+def test_dcp_value_uv_layout():
+    """DcpValue's W_UV fragments are 16 B loads of latent runs: compile_value refuses
+    an output-contiguous W_UV (lane group g's load at byte 2 g mod 16: the DCP check's
+    CUDA_ERROR_MISALIGNED_ADDRESS) and takes the model's layout, which the DCP check's
+    layers now use."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
+        layout,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.mla.dcp import (
+        uv_layout_error,
+    )
+
+    bf16 = torch.bfloat16
+    weight = torch.zeros((DCP_HEADS * 256, 512), dtype=bf16)  # kv_b_proj [N(P+V), L]
+    model = weight.T.view(512, DCP_HEADS, 256).split([128, 128], dim=-1)[1]
+    assert uv_layout_error(layout(model.transpose(0, 1))) is None
+    gen = torch.Generator().manual_seed(0)
+    check = _DraftAttention(gen, "cpu", None, 4, 0, 1).W_UV
+    assert check.stride(1) == 1 and uv_layout_error(layout(check)) is None
+    output_contiguous = torch.zeros((512, DCP_HEADS, 128), dtype=bf16).transpose(0, 1)
+    assert "latent-contiguous" in uv_layout_error(layout(output_contiguous))
+    assert uv_layout_error(layout(torch.zeros((DCP_HEADS, 512, 128)))) is not None
+
+
 # ------------------------------------------------------------- GPU (torchrun)
 
 
@@ -652,8 +676,13 @@ class _DraftAttention:
 
     def __init__(self, gen, device, cache, world, rank, interleave):
         self.num_local_heads = DCP_HEADS
-        w_uv = torch.randn((512, DCP_HEADS, 128), generator=gen, device="cpu") * 0.05
-        self.W_UV = w_uv.bfloat16().to(device).transpose(0, 1)  # (as _v_up_proj's)
+        # W_UV [H, 512, 128] latent-contiguous, as the model's (split_kv_b_proj: the
+        # kv_b_proj weight's .T view [L, N, V], then (L, N, V) -> (N, L, V)): DcpValue
+        # loads its MMA fragments as 16 B runs of latent values (mla.dcp
+        # uv_layout_error). (As many draws from ``gen`` as before.)
+        w_uv = torch.randn((DCP_HEADS * 128, 512), generator=gen, device="cpu") * 0.05
+        w_uv = w_uv.bfloat16().to(device).T.view(512, DCP_HEADS, 128)
+        self.W_UV = w_uv.transpose(0, 1)
         self.scale = SOFTMAX_SCALE
         self._q_scale_float, self._k_scale_float = Q_SCALE, K_SCALE
         self.rotary_emb = None

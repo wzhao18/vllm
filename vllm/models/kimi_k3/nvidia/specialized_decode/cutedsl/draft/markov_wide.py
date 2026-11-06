@@ -286,7 +286,10 @@ class MarkovWide:
                         position = Int64(args[14][tid * self.steps + i])
                     # gumbel_sample's position: the predicted token's - 1, salted.
                     position = position - Int64(1) + Int64(DRAFT_NOISE_SALT)
-                    prefixes_s[tid] = request_prefix(seeds_s[tid], position)
+                    # spec_step_seed(seed, i): gumbel_sample's seed for cache
+                    # column i (the draft position).
+                    step_seed = seeds_s[tid] ^ (Int64(i) << 32)
+                    prefixes_s[tid] = request_prefix(step_seed, position)
             # This position's base logits: rows (group, group + 8) of the warp tile,
             # requests 8 t + 2 quarter + (0, 1) of every N tile t.
             logits0 = cute.make_rmem_tensor((self.tiles, 4), Uint16)
