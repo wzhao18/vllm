@@ -526,6 +526,87 @@ def test_ctx_cap_and_case_blocks():
                 sys.modules[m] = mod
 
 
+# nq-c512-xdr decode role (snapshot sha 2a062e79ebb8): TP4 x DCP4 x DP4, EP16 MegaMoE, q4, mns 128, cap 512
+C512 = list(range(4, 513, 4))
+C512_ROWS = [4, 8, 16, 32, 64, 128, 256, 384, 512]
+
+
+def c512_doc():
+    d = prod_doc(C512, 128, 512, 3)
+    args = d["roles"]["decode"]["args"]
+    args.update({"tensor-parallel-size": 4, "decode-context-parallel-size": 4, "data-parallel-size": 4,
+                 "data-parallel-rpc-port": 13345, "enable-expert-parallel": True, "enable-ep-weight-filter": True,
+                 "moe-backend": "deep_gemm_mega_moe", "use-replayssm": True, "gpu-memory-utilization": 0.93})
+    return d
+
+
+def test_c512_dp():
+    """The C512 point: DP is per DP rank (vllm bench forward runs every case on every DP rank), the world is the 16
+    ranks nq_run1.sh launches, every row is inside the production limit (one process per arm), and the measured
+    capture list holds every row, its drafter batch and the 512 / 128 capacity anchors."""
+    import cfg2bench
+    import nq_step
+
+    d = c512_doc()
+    ls = cfg2bench.build(d, "ls", "new", C512_ROWS)
+    st = cfg2bench.build(d, "stock", "new", C512_ROWS)
+    assert (ls["tp"], ls["dcp"], ls["dp"], ls["ep"], ls["world"]) == (4, 4, 4, 16, 16)
+    assert ls["production_limit"] == 512 and ls["mns"] == 128 and ls["max_capture"] == 512
+    assert cfg2bench.split_rows(d, C512_ROWS + [768]) == (C512_ROWS, [768])
+    assert ls["capture_sizes"] == [3, 6, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 288, 384, 512], ls["capture_sizes"]
+    assert ls["captured_rows"] == [4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 288, 384, 512]
+    assert ls["draft_batches"] == [1, 2, 4, 6, 8, 11, 16, 22, 32, 43, 64, 86, 96, 128]
+    assert st["capture_sizes"] == ls["capture_sizes"]
+    a = ls["argv"]
+    assert a[a.index("--data-parallel-size") + 1] == "4" and a[a.index("--tensor-parallel-size") + 1] == "4"
+    assert "--enable-expert-parallel" in a and "--use-replayssm" in a and "--data-parallel-rpc-port" not in a
+    assert a[a.index("--additional-config") + 1] == '{"decode_backend": "latency_specialized"}'
+    assert any(n.startswith("layout: TP4 x DCP4 x DP4, EP16") for n in ls["notes"]), ls["notes"]
+    assert not any(n.startswith("WARNING") for n in ls["notes"]), ls["notes"]
+    sh = cfg2bench.as_sh(ls, "x")
+    assert "\nNQ_TP=4\nNQ_DP=4\nNQ_WORLD=16\n" in sh, sh
+    # TP16 stays a 16-rank DP1 layout; a layout nq_run1.sh cannot launch is refused
+    tp16 = cfg2bench.build(doc(), "ls", "new", [8])
+    assert (tp16["tp"], tp16["dp"], tp16["world"]) == (16, 1, 16) and "\nNQ_DP=1\n" in cfg2bench.as_sh(tp16, "x")
+    d8 = c512_doc()
+    d8["roles"]["decode"]["args"]["data-parallel-size"] = 8
+    try:
+        cfg2bench.build(d8, "ls", "new", [8])
+    except SystemExit as e:
+        assert "32 ranks" in str(e), e
+    else:
+        raise AssertionError("32-rank layout accepted")
+    # where a case's rows go (rank 0 logs it per case)
+    par = types.SimpleNamespace(tensor_parallel_size=4, data_parallel_size=4, enable_expert_parallel=True)
+    line = nq_step.dp_line(par, 128, 512)
+    assert line.startswith("per DP rank: B 128, 512 rows (TP4 group), requests per GPU 32") and \
+        "2048 rows into the EP16 MoE" in line, line
+    par16 = types.SimpleNamespace(tensor_parallel_size=16, data_parallel_size=1, enable_expert_parallel=False)
+    assert nq_step.dp_line(par16, 2, 8) == "per DP rank: B 2, 8 rows (TP16 group), requests per GPU 0.125"
+    # summary: the SP coverage line counts as coverage; req/GPU = B / tp; the DP note
+    with tempfile.TemporaryDirectory() as tmp:
+        cov = ("INFO [sp_attention.py:279] Kimi K3 SP decode coverage M{m}(q4): ag=tuned(x) "
+               "moe=declared(stock MegaMoE)\n")
+        for i, arm, us in ((1, "ls", 30000.0), (2, "stock", 33000.0)):
+            with open(os.path.join(tmp, f"c512-new-agentx-{i}{arm}.log"), "w") as f:
+                f.write(f"NQRUN point=c512 arm={arm} drafter=new q=4 tp=4 dp=4 ctx=agentx rows=512 prodlimit=512 "
+                        "extra= ov=x\n")
+                if arm == "ls":
+                    f.write(cov.format(m=512))
+                f.write(f"[forward] q4_B128_M512_agentx: 128 reqs, 512 tokens, median {us} us, sample spread 0.01%\n")
+                f.write("NQEND rc=0\n")
+        text = subprocess.check_output([sys.executable, os.path.join(HERE, "nq_summary.py"), tmp, "--tag",
+                                        "c512-new-agentx", "--csv", os.path.join(tmp, "o.csv")], text=True)
+        assert "rows / B are per DP rank (TP4 group); all 4 DP ranks" in text, text
+        m512 = next(x for x in text.splitlines() if x.strip().startswith("M512 "))
+        assert "   128      32 " in m512 and "0.909" in m512 and "UNCOVERED" not in m512, m512
+        assert "family stock seams in ls: none" in text, text
+        with open(os.path.join(tmp, "o.csv")) as f:
+            rows = f.read().splitlines()
+        assert rows[0].startswith("tag,point,q,tp,dp,drafter,ctx,extra,rows,B,req_per_gpu,") and \
+            ",4,4,new,agentx,,512,128,32.0," in rows[1], rows
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

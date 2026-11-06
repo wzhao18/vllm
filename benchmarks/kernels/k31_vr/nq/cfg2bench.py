@@ -43,6 +43,14 @@ Bench-only changes (printed as comments in the output):
     bench's per-overlay build root ($NQ_BUILD, set by nq_inner.sh) or to the inner
     script's cache layout.
 
+Data parallel (the C512 decode role: TP4 x DCP4 x DP4, EP16 MegaMoE): ``vllm bench forward``
+runs under the external launcher, which makes the world tp * dp ranks and each DP rank
+RANK // tp (config/parallel.py); every DP rank builds the same case (the case is per DP
+rank; the context draw is seeded by --seed only) and the DP sync inside execute_model
+then sees equal token counts, so no DP rank idles or pads. Rows, B, max-num-seqs and the
+capture list are therefore per DP rank (per TP group), as in serving; the MoE (EP across
+all DP ranks) sees rows x dp. The world must be the 16 ranks nq_run1.sh launches.
+
 Reads only json/yaml/argparse: runs on the login node or a batch host (PyYAML optional
 when a --snapshot JSON copy exists).
 """
@@ -62,7 +70,7 @@ NB = f"{W}/nqbench"
 TARGET = f"{W}/e2e/model-view/kimi-k3.1-k3type"
 DRAFTERS = {
     "old": f"{M}/kimi-k3-dspark",  # 64 heads, markov_rank 256 (all nq configs today)
-    "new": f"{M}/kimi-k3.1-pro-dspark-preview",  # 96 heads (6/rank at TP16), markov_rank 512
+    "new": f"{M}/kimi-k3.1-pro-dspark-preview",  # 96 heads (6/rank at TP16, 24 at TP4), markov_rank 512
 }
 # The configs mount the old drafter here (mk_nq.py extra_mount).
 DRAFT_MOUNT = "/raid/common-models/kimi-k3-dspark"
@@ -213,6 +221,18 @@ def env_drop_reason(key):
     return "not read by the engine (serving / transport / host infra)"
 
 
+WORLD = 16  # nq_run1.sh: 4 nodes x 4 GPUs, one rank per GPU
+
+
+def layout(args):
+    """(tp, dcp, dp, ep) of a decode role's args: ep = tp * dp with expert parallel, else 1."""
+    tp = int(args["tensor-parallel-size"])
+    dcp = int(args.get("decode-context-parallel-size", 1))
+    dp = int(args.get("data-parallel-size", 1))
+    ep = tp * dp if args.get("enable-expert-parallel") else 1
+    return tp, dcp, dp, ep
+
+
 def split_rows(doc, rows):
     """(rows <= the production limit, rows above it): limit = min(max-num-seqs * q,
     max capture size), the largest verify row the production config captures."""
@@ -299,10 +319,21 @@ def build(doc, arm, drafter, rows, full_capture=False):
     if unknown:
         sys.exit(f"cfg2bench: unclassified decode args {unknown}: add them to KEEP/DROP")
     notes = []
-    tp = int(args["tensor-parallel-size"])
-    dcp = int(args.get("decode-context-parallel-size", 1))
-    if (tp, dcp) != (16, 16):
-        notes.append(f"WARNING: decode is TP{tp}/DCP{dcp}, not the TP16=DCP16 A/B layout")
+    tp, dcp, dp, ep = layout(args)
+    world = tp * dp
+    if world != WORLD:
+        sys.exit(f"cfg2bench: decode is TP{tp} x DP{dp} = {world} ranks; nq_run1.sh runs "
+                 f"{WORLD} (4 nodes x 4 GPUs)")
+    if (tp, dcp) != (16, 16) and (tp, dcp, dp, ep) != (4, 4, 4, 16):
+        notes.append(f"WARNING: decode is TP{tp}/DCP{dcp}/DP{dp}/EP{ep}, neither TP16=DCP16 nor "
+                     "the C512 TP4 x DCP4 x DP4 EP16 layout")
+    if dp > 1:
+        notes.append(
+            f"layout: TP{tp} x DCP{dcp} x DP{dp}, EP{ep}: {dp} DP groups of {tp} GPUs; vllm bench "
+            f"forward (external launcher, DP rank = RANK // {tp}) runs every case on every DP "
+            "rank (same requests and context draw), so --rows / max-num-seqs / capture sizes are "
+            f"per DP rank; the step's MoE sees rows x {dp}; requests per GPU = B / {tp}"
+        )
     spec = json.loads(args["speculative-config"])
     k = int(spec["num_speculative_tokens"])
     q = k + 1
@@ -402,6 +433,11 @@ def build(doc, arm, drafter, rows, full_capture=False):
     return {
         "q": q,
         "k": k,
+        "tp": tp,
+        "dcp": dcp,
+        "dp": dp,
+        "ep": ep,
+        "world": world,
         "mns": mns,
         "max_capture": maxcap,
         "production_limit": limit,
@@ -431,6 +467,10 @@ def as_sh(out, src):
         val = value if value.startswith("${NQ_BUILD}") else shlex.quote(value)
         lines.append(f"export {key}={val}")
     lines.append(f"NQ_Q={out['q']}")
+    # per DP rank: rows, B and max-num-seqs; requests per GPU = B / NQ_TP
+    lines.append(f"NQ_TP={out['tp']}")
+    lines.append(f"NQ_DP={out['dp']}")
+    lines.append(f"NQ_WORLD={out['world']}")
     lines.append(f"NQ_MNS={out['mns']}")
     lines.append(f"NQ_MAXCAP={out['max_capture']}")
     lines.append(f"NQ_PRODLIMIT={out['production_limit']}")

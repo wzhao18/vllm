@@ -1,5 +1,5 @@
 """Whole Kimi K3.1 decode step (target verify + DSpark drafter) under `vllm bench forward`, for
-the nq stock-vs-specialized A/B: 16 ranks under srun (--init-file rendezvous), one process
+the nq stock-vs-specialized A/B: 16 ranks (TP16, or TP4 x DP4) under srun (--init-file rendezvous), one process
 per arm. A wrapper only: vllm/benchmarks is untouched.
 
 Derived from $W/c1/dsacore/tools/bench_b1_step.py (= b1/r2x/tools/bench_b1_step.py, the
@@ -35,6 +35,14 @@ fault hooks, plus:
   the nq configs (68 B/token: 64 B of e2m1 pairs + 4 UE8M0 scales) take random bytes as
   e2m1 pairs, as the C256 recipe did (merge/tools/t10/mt_n4_m10.sh). The MLA cache stays
   zero unless --fill-mla (the sparse core's cost does not depend on its values).
+* Data parallel (C512: TP4 x DCP4 x DP4, EP16): nothing to patch. vllm bench forward runs
+  the external launcher, so the world is tp * dp ranks and each DP rank is RANK // tp
+  (config/parallel.py: ranks 0-3, one node, are DP rank 0); every rank builds the same
+  per-DP-rank case, so the DP sync in execute_model sees equal counts on every DP rank
+  (no idle DP rank, no dummy batch, no DP padding: a padded case is logged). Each replay
+  is the max over all 16 ranks. Rows / B are per DP rank; rank 0 logs per case where the
+  rows go (``NQ:   per DP rank``). Unequal DP batches (the padding-mask path) are not
+  measured here.
 * Bench KV pool sized to the case set (patch_kv_pool), not to gpu-memory-utilization: the
   bench's per-case state snapshot (~158 MiB per request at q4) and graph/eager transients
   need the memory the server's KV would take; both arms get the same pool. Cases the server
@@ -380,10 +388,12 @@ def patch_kv_pool(shapes, include_drafter, floor_gib):
             f"({available[0] / GIB:.2f} GiB/rank; upper bound, no CUDA graph memory reserved)")
         over = {k: v for k, v in need.items() if v > n0}
         if over:
+            ctx = {c.name: sum(r.prefix_len for r in c.requests) for c in cases}
+            fit = min(int(ctx[k] * n0 / v * 0.95) for k, v in over.items())
             raise RuntimeError(
                 f"cases need more KV blocks than the server holds ({n0}): {over}. The scheduler "
                 "would not admit them; scale their contexts (nq_shapes.py --max-kv-tokens, "
-                "NQ_MAX_KV_TOKENS in nq_run1.sh)"
+                f"NQ_MAX_KV_TOKENS in nq_run1.sh; ~{fit} fits every case, both arms)"
             )
         target = max(max(need.values()), floor) + 8
         per_block = available[0] / n0
@@ -421,6 +431,20 @@ def patch_kv_pool(shapes, include_drafter, floor_gib):
     core.get_kv_cache_configs = get_kv_cache_configs
 
 
+def dp_line(parallel, b, rows):
+    """Where a case's rows go: the case is per DP rank (vllm bench forward builds it on
+    every rank, the external launcher makes DP rank = RANK // (tp * pp)), so each of the
+    dp groups of tp GPUs runs B requests / ``rows`` verify rows and the MoE (EP across
+    the DP ranks with expert parallel) sees rows x dp."""
+    tp, dp = parallel.tensor_parallel_size, parallel.data_parallel_size
+    ep = tp * dp if parallel.enable_expert_parallel else 1
+    line = f"per DP rank: B {b}, {rows} rows (TP{tp} group), requests per GPU {b / tp:g}"
+    if dp > 1:
+        line += (f"; DP{dp}: every DP rank runs this case (no idle DP rank, no dummy batch), "
+                 f"{rows * dp} rows into the EP{ep} MoE per step")
+    return line
+
+
 def report_cases():
     """Per case, rank 0: the context set (identical in both arms: same shapes file), its KV
     blocks vs the bench pool and the production capacity, then what the step used."""
@@ -444,7 +468,11 @@ def report_cases():
         kv = (f"KV {need} blocks = {need / n0:.0%} of production capacity {n0}, pool {pool}"
               if need else "KV blocks: ?")
         log(f"case {case.name}: {ctx_stats(case)} | {kv}")
+        log("  " + dp_line(runner.parallel_config, len(case.requests), case.num_tokens))
         result = run(runner, case, args)
+        if result.get("num_tokens_after_padding") not in (None, result["num_tokens"]):
+            log(f"  WARNING: {result['num_tokens']} rows padded to "
+                f"{result['num_tokens_after_padding']} (DP / graph padding)")
         check = "" if need in (None, result["kv_blocks"]) else f" MISMATCH(predicted {need})"
         log(f"  done {case.name}: kv_blocks {result['kv_blocks']}{check} state_reset "
             f"{result.get('state_reset_bytes', 0) / GIB:.2f} GiB, peak allocated "
