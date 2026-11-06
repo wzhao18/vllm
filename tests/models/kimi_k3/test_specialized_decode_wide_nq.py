@@ -276,9 +276,10 @@ def test_mla_dcp_value_grid_one_wave(sms, heads):
 def test_dsa_value_grids_one_wave(q):
     """K3.1 WideDsa's DcpValue at every wide row up to 2048 (DCP16, 6 heads): "proj"
     (dsa.dcp_value, merging CTAs over the row tiles) on Rubin's 212 SMs and the BF16
-    latent merge (mla.dcp on the GB300 schedule, 152) both within one wave of the
-    device's real SMs; the BF16 merge strides its row tiles only past that wave (from
-    561 rows on Rubin), not past the capped schedule's 152."""
+    latent merge (mla.dcp on the GB300 schedule, 152: 6 heads x row tiles x push-only
+    CTAs) both within one wave of the device's real SMs; the BF16 merge strides its
+    row tiles only past that wave (from 561 rows on Rubin), not past the capped
+    schedule's 152."""
     pytest.importorskip("cutlass")
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa import dcp_value
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.mla.dcp import (
@@ -295,7 +296,11 @@ def test_dsa_value_grids_one_wave(q):
         assert latent[0] * latent[1] * latent[2] <= 212, (batch, latent)
         assert bool(value.tile_stride) == (6 * tiles > 212), (batch, latent)
         if batch <= 560:  # (as before the stride: 6 x 35 tiles unstrided)
-            assert latent == (6, tiles, 1), (batch, latent)
+            # z: the push-only CTAs (``pushers``) the capped schedule adds while the
+            # merge grid leaves room in its 152 SMs (e.g. 6 x 5 x 5 at 68 rows)
+            assert latent[:2] == (6, tiles), (batch, latent)
+            pushers = latent[2]
+            assert pushers == 1 or 6 * tiles * pushers <= GB300_SMS, (batch, latent)
         # (on a 152-SM device the same schedule strides past 152)
         gb300 = DcpValue(6, 16, batch, GB300_SMS, q).grid
         assert gb300[0] * gb300[1] * gb300[2] <= GB300_SMS, (batch, gb300)
@@ -487,105 +492,84 @@ def test_wide_experts_chunked_run():
                      ((rows, 576), 576.0, 452, 452, 452 * 16)]  # fmt: skip
 
 
-def rubin_gpu():
-    """Whether a Rubin GPU (SM107, 212+ SMs) runs the wide kernels here."""
+def test_wide_experts_planned_single_launch(monkeypatch):
+    """PreparedMoE prepares the wide engines (``WideExperts``) only for the wide batches
+    one launch holds (``wide_experts_batch``: at most experts_wide.WIDE_MAX rows, one
+    ``wide_chunks`` launch); the wider ones stay off ``wide_batches`` (``run_rows``:
+    the stock routed experts). No multi-launch wide experts batch is ever planned."""
+    pytest.importorskip("cutlass")
     import torch
 
-    return (
-        torch.cuda.is_available()
-        and torch.cuda.get_device_capability() == (10, 7)
-        and torch.cuda.get_device_properties(0).multi_processor_count >= 212
-    )
-
-
-def run_wide_experts(weights, dev, batches, inputs, planned):
-    """``WideExperts`` (TP16, q4) on one ``PersistentExperts`` and one scratch sized
-    for the largest batch: each of ``batches`` (row counts) on its slice of
-    ``inputs`` (latent, BF16 top-k weights, ids), in order; the partials [rows, 3584]
-    concatenated. ``planned``: the routing's plan written first for the whole batch
-    (WidePlanKernel), else ``run`` writes it per launch."""
-    import torch
-
-    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
-        stream,
-        to_cute,
-    )
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe import (
-        experts_runtime as er,
-    )
-
-    buffers = er.scratch(16, dev, rows=max(batches))
-    experts = er.PersistentExperts(*weights, q=4)
-    bf = torch.bfloat16
-    partials = {b: torch.empty(b, 3584, dtype=bf, device=dev) for b in set(batches)}
-    wide = er.WideExperts(experts, buffers, partials, planned=planned)
-    latent, topk_weights, ids = inputs
-    outs, start = [], 0
-    for rows in batches:
-        end = start + rows
-        x = latent[start:end]
-        if planned:
-            writer = er.compile_wide_plan(rows, dev.index)
-            writer(to_cute(x, 16), er.tensor(buffers["plan"]), stream(dev))
-        out = wide.run(x, topk_weights[start:end], ids[start:end])
-        torch.cuda.synchronize()
-        outs.append(out[:rows].clone())
-        start = end
-    return torch.cat(outs)
-
-
-@pytest.mark.parametrize("planned", [True, False], ids=["planned", "plan-writer"])
-@pytest.mark.parametrize("rows", [1024, 2048])
-def test_wide_experts_chunked_bitwise(rows, planned):
-    """The wide experts above WIDE_MAX rows (``wide_chunks``: 1024 = 512 + 512, 2048 =
-    704 + 704 + 640 launches on one plan, workspace and partial) give, row for row,
-    the same bits as the same tokens in single launches of other sizes (768 + 256;
-    768 + 768 + 512) and as one launch per 256 rows: every token's work (its plan
-    rows, MXFP8 blocks, expert tiles, finalize FMA chain in slot order) is its own.
-    One TP16 MoE layer of random MXFP4 shards (896 experts), routes drawn per token
-    without replacement, the routing's plan written for the whole batch or by each
-    launch's plan writer. Rubin only."""
-    if not rubin_gpu():
-        pytest.skip("Rubin (SM107, 212 SMs) wide experts")
-    import numpy as np
-    import torch
-
-    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe.experts_runtime import (  # noqa: E501
-        wide_chunks,
+        experts_runtime,
+        prepared,
     )
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe.experts_wide import (  # noqa: E501
         WIDE_MAX,
     )
 
-    experts, dev = 896, torch.device("cuda", 0)
-    gen = torch.Generator(device=dev).manual_seed(11)
-    u8 = torch.uint8
+    planned = {}
 
-    def bytes_(shape, low=0, high=256):
-        return torch.randint(low, high, shape, dtype=u8, device=dev, generator=gen)
+    class Wide:
+        def __init__(self, experts, buffers, partials, *, planned, pushed=None):
+            planned.update(partials=dict(partials), pushed=dict(pushed or {}))
 
-    weights = (
-        bytes_((experts, 512, 1792)),
-        bytes_((experts, 512, 112), 118, 127),
-        bytes_((experts, 3584, 128)),
-        bytes_((experts, 3584, 8), 118, 127),
+    monkeypatch.setattr(experts_runtime, "WideExperts", Wide)
+    monkeypatch.setattr(prepared, "stock_router", lambda router: None)
+    props = SimpleNamespace(multi_processor_count=212)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: props)
+    batches = (68, 256, 512, WIDE_MAX, WIDE_MAX + 4, 1024, 2048)
+    state = SimpleNamespace(batches=batches, tp=16, device=0, latent_partial=None,
+                            experts={})  # fmt: skip
+    front = SimpleNamespace(split={}, release_early=lambda bs: list(bs))
+    experts = SimpleNamespace(grids={}, grid_for=lambda b: 212)
+    rows = SimpleNamespace(experts_push=batches, experts_box=None)
+    module = SimpleNamespace(experts=SimpleNamespace(router=None))
+    front_rows = SimpleNamespace(down_sms={})
+    moe = prepared.PreparedMoE(
+        front, experts, None, state, rows=rows, module=module, front_rows=front_rows
     )
-    rng = np.random.default_rng(rows)
-    routes = np.stack([rng.choice(experts, 16, replace=False) for _ in range(rows)])
-    ids = torch.tensor(routes, dtype=torch.int32, device=dev)
-    latent = torch.randn(rows, 3584, device=dev, generator=gen).bfloat16()
-    topk = torch.rand(rows, 16, device=dev, generator=gen)
-    topk_weights = (topk / topk.sum(1, keepdim=True)).bfloat16()
-    inputs = latent, topk_weights, ids
-    assert len(wide_chunks(rows)) > 1 and rows > WIDE_MAX
-    chunked = run_wide_experts(weights, dev, [rows], inputs, planned)
-    others = [768, 256] if rows == 1024 else [768, 768, 512]
-    single = run_wide_experts(weights, dev, others, inputs, planned)
-    quarter = run_wide_experts(weights, dev, [256] * (rows // 256), inputs, planned)
-    assert torch.isfinite(chunked.float()).all()
-    for name, ref in (("768-row launches", single), ("256-row launches", quarter)):
-        differ = (chunked.view(torch.int16) != ref.view(torch.int16)).any(1)
-        assert not differ.any(), (name, differ.nonzero().flatten()[:8].tolist())
+    single = {68, 256, 512, WIDE_MAX}
+    assert moe.wide_batches == single
+    assert set(planned["partials"]) == set(planned["pushed"]) == single
+    assert all(len(experts_runtime.wide_chunks(b)) == 1 for b in planned["partials"])
+    for b in range(65, 4097):
+        if prepared.wide_experts_batch(b):
+            assert len(experts_runtime.wide_chunks(b)) == 1 and b <= WIDE_MAX, b
+
+
+def test_decode_feeds_front_rows_single_launch_batches():
+    """runtime.decode hands FrontRows and the wide tail's experts push
+    (``PreparedTailRows(experts_push=)``) only the wide batches the wide engines serve
+    in one launch (``wide_engines``: ``wide_experts_batch``), not every wide MoE
+    batch. (Source check: SpecializedDecode needs the model and its ranks.)"""
+    import ast
+
+    tree = ast.parse((SD / "runtime/decode.py").read_text())
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
+
+    def named(name):
+        return [c for c in calls if getattr(c.func, "id", None) == name]
+
+    (front_rows,) = named("FrontRows")
+    assert ast.unparse(front_rows.args[4]) == "wide_engines"
+    (tail_rows,) = named("PreparedTailRows")
+    push = {k.arg: ast.unparse(k.value) for k in tail_rows.keywords}["experts_push"]
+    assert push == "wide_engines"
+    (engines,) = [
+        n.value
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Assign) and ast.unparse(n.targets[0]) == "wide_engines"
+    ]
+    assert ast.unparse(engines) == (
+        "tuple((b for b in wide_moe if wide_experts_batch(b)))"
+    )
+    guards = [
+        ast.unparse(n.test)
+        for n in ast.walk(tree)
+        if isinstance(n, ast.If) and front_rows in ast.walk(n)
+    ]
+    assert any("wide_engines" in guard for guard in guards), guards
 
 
 def test_tail_pushes_only_single_launch_rows():

@@ -15,6 +15,7 @@ import torch
 pytest.importorskip("cutlass")
 pytest.importorskip("flashinfer")
 
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod  # noqa: E402
 from vllm.model_executor.layers.mla import (  # noqa: E402
     MultiHeadLatentAttentionWrapper,
 )
@@ -171,14 +172,16 @@ def test_coverage_names_why_wide_rows_run_stock(dsa):
 
 
 class Linear(torch.nn.Module):
-    """A stock linear's call (``(x @ weight.T, None)``), BF16 like the model's, on
-    small-integer weights: the input projections' outputs are exact, so the packed
-    GEMM and the stock ones give the same columns."""
+    """A stock linear's call (``(x @ weight.T, None)``), BF16 and unquantized like
+    the model's (``providers.bf16_weight`` reads its quant method), on small-integer
+    weights: the input projections' outputs are exact, so the packed GEMM and the
+    stock ones give the same columns."""
 
     def __init__(self, rows, cols=HIDDEN, trace=None, name=""):
         super().__init__()
         weight = torch.randint(-1, 2, (rows, cols), dtype=torch.bfloat16)
         self.weight = torch.nn.Parameter(weight, requires_grad=False)
+        self.quant_method = UnquantizedLinearMethod()
         self.trace, self.name = trace, name
 
     def forward(self, x):
@@ -948,7 +951,7 @@ def test_kda_fp32_head_probe_decides_in_the_provider(monkeypatch, head_probe, co
     runtime = SimpleNamespace(
         tp=16, q=8, tuned=batches, batches=batches, wide=(), bf16_state=False,
         buffers={}, device="cpu", kda_heads=0, kda_side=None, capacity=16,
-        context=kda_context(False, 8),
+        sharded=frozenset(), shard_box=None, context=kda_context(False, 8),
     )  # fmt: skip
     decoder = SimpleNamespace(
         self_attn=SimpleNamespace(in_proj_qkvgfab=None), layer_idx=0,

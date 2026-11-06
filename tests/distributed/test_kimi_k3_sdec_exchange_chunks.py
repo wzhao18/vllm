@@ -8,15 +8,15 @@ few rows) leave different rows on different parities, and a graph-captured step
 replays across them. Every rank must gather every rank's entries, bit for bit, at
 every row of every step."""
 
-import multiprocess as mp
+import time
+
 import pytest
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from vllm.utils.network_utils import get_open_port
 from vllm.utils.system_utils import update_environment_variables
-
-mp.set_start_method("spawn", force=True)
 
 WORDS = 8
 # Row counts per step: chunked steps (> MAX_ROWS) between single launches, so the
@@ -115,7 +115,8 @@ def _worker(env: dict[str, str]) -> None:
 
 def _distributed_run(fn, world_size: int) -> None:
     port = str(get_open_port())
-    processes: list[mp.Process] = []
+    ctx = mp.get_context("spawn")
+    processes = []
     for rank in range(world_size):
         env = {
             "RANK": str(rank),
@@ -125,16 +126,18 @@ def _distributed_run(fn, world_size: int) -> None:
             "MASTER_ADDR": "localhost",
             "MASTER_PORT": port,
         }
-        process = mp.Process(target=fn, args=(env,))
+        process = ctx.Process(target=fn, args=(env,))
         processes.append(process)
         process.start()
+    # One deadline for the group: a hung rank fails the test, never CI.
+    deadline = time.monotonic() + 300
     for process in processes:
-        process.join(timeout=300)
+        process.join(timeout=max(0.0, deadline - time.monotonic()))
     for process in processes:
         if process.is_alive():
             process.kill()
             process.join()
-        assert process.exitcode == 0
+    assert [process.exitcode for process in processes] == [0] * world_size
 
 
 @pytest.mark.skipif(
