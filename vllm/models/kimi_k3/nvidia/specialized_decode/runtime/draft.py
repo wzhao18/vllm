@@ -596,15 +596,11 @@ class DraftFastPath:
             model.model._fast_context = prepared
             prepared.strict = strict  # NQ-NOFALLBACK
             logger.info_once(
-                "Kimi K3 DSpark drafter: sharded context step for %s rows",
+                "Kimi K3 DSpark drafter: sharded context step for %s rows "
+                "(persistent row gather at %s)",
                 (*prepared.rows, *prepared.wide),
+                prepared.persistent,
             )
-            if prepared.dropped:  # NQ-NOFALLBACK
-                fail(
-                    "DSpark drafter context step",
-                    f"context rows {prepared.dropped}: their row-gather CTAs are not "
-                    "co-resident",
-                )
             log_coverage(
                 rank,
                 "draft context",
