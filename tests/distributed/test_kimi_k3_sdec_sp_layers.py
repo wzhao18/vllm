@@ -18,23 +18,25 @@ with an FP32 state and RecoverSSM records, ``--use-replayssm``), random weights
 
 on the same input rows, the same metadata and each on its own copy of the caches:
 
-* ``test_sp_dsa_block_matches_stock_layer``: the gated attention rows entering
-  o_proj and this rank's output shard (all rows: ours vs stock within the distance
-  the two paths' query rounding reaches through trtllm-gen's E4M3 query and P, plus
-  exact top-k near-ties, ``DSA_DIRECT``; rows whose global length fits the 2048-key
-  top-k select every key on both paths: elementwise, and each path against FP64
-  attention over its own cached keys, the two within 1.5x of each other either
-  way, ``_check_dsa_reference``), decomposed: our FP8 query codes vs stock's (one
-  step apart at most), our decode kernel call on stock's inputs vs stock's, the
-  same flat KV rows, the kernel on stock's inputs but one factor of ours each (the
-  FP8 query, the new MLA rows, the flat row order), and our merge + gate on stock's
-  partials and valid counts (``DSA_CROSS`` reported, ``DSA_DIRECT`` held), the
-  new MLA rows (FP8 codes one step apart where the RMSNorm rounds differently, the
-  rope part exact), the new indexer keys (few codes different) and every other cache
-  byte as it was; then the block replayed in a CUDA graph bit for bit as its eager
-  run. Contexts per request cycle through short (all keys) and long ones, one of
-  128K tokens. The top-k runs the #63 merge or, as C512 deploys it (VLLM_K31_DCP_
-  EXCHANGE=1, parts topk, one round to 256 rows), DcpExchange on both paths.
+* ``test_sp_dsa_block_matches_stock_layer``: the gated attention rows entering o_proj
+  and this rank's output shard (``_check_dsa_rows``: rows whose global top-k set is the
+  same on both paths, every row whose length fits the 2048-key top-k among them,
+  elementwise within the distance the two paths' query rounding reaches through
+  trtllm-gen's E4M3 query and P, ``DSA_DIRECT``; every row, after taking out the FP64
+  effect of near-tie top-k swaps (each path's FP64 reference over the keys it selected),
+  within stock's own error against FP64; each path against FP64 attention over its
+  selected cached keys, the two within 1.5x of each other either way,
+  ``_check_dsa_reference``), decomposed: our FP8 query codes vs stock's (one step apart
+  at most), our decode kernel call on stock's inputs vs stock's, the same flat KV rows,
+  the kernel on stock's inputs but one factor of ours each (the FP8 query, the new MLA
+  rows, the flat row order), and our merge + gate on stock's partials and valid counts
+  (``DSA_CROSS`` reported, ``DSA_DIRECT`` held), the new MLA rows (FP8 codes one step
+  apart where the RMSNorm rounds differently, the rope part exact), the new indexer keys
+  (few codes different) and every other cache byte as it was; then the block replayed in
+  a CUDA graph bit for bit as its eager run. Contexts per request cycle through short
+  (all keys) and long ones, one of 128K tokens. The top-k runs the #63 merge or, as C512
+  deploys it (VLLM_K31_DCP_EXCHANGE=1, parts topk, one round to 256 rows), DcpExchange
+  on both paths.
 * ``test_sp_kda_block_matches_stock_layer`` (two steps) and
   ``test_sp_kda_recoverssm_multistep`` (``CHAIN_STEPS`` steps, the specialized block
   replayed in one CUDA graph): RecoverSSM over consecutive steps of the same
@@ -148,22 +150,13 @@ def _keep_input(kept):
     return hook
 
 
-def _check_rows(name, got, want, exact=None, median=1e-2, tail=3e-2, worst=0.15):
-    """The median and 98th percentile of the per-row error, and no row far off; with
-    ``exact`` (rows over the same keys on both paths, ``DSA_EXACT``) those rows
-    elementwise and per row."""
+def _check_rows(name, got, want, median=1e-2, tail=3e-2, worst=0.15):
+    """The median and 98th percentile of the per-row error, and no row far off."""
     errors = _rows_error(got, want)
-    if exact is not None and exact.any():
-        torch.testing.assert_close(
-            got[exact].float(), want[exact].float(), **DSA_EXACT["close"],
-            msg=_msg(f"{name} (rows over the same keys)"),
-        )  # fmt: skip
-        assert float(errors[exact].max()) <= DSA_EXACT["row"], (name, errors[exact])
     quantiles = torch.quantile(errors.float(), torch.tensor([0.5, 0.98]).cuda())
-    count = "" if exact is None else f" ({int(exact.sum())} of {exact.numel()} exact)"
     print(
         f"{name}: per-row error median {quantiles[0]:.2e} p98 {quantiles[1]:.2e} max "
-        f"{errors.max():.2e}{count}"
+        f"{errors.max():.2e}"
     )
     assert quantiles[0] <= median and quantiles[1] <= tail, (name, quantiles)
     assert float(errors.max()) <= worst, (name, errors.max())
@@ -175,13 +168,31 @@ def _check_rows(name, got, want, exact=None, median=1e-2, tail=3e-2, worst=0.15)
 # turns those into P code flips: rows over the same keys differ by ~0.5-2% (C512
 # SP layer test at 0da2d21, R4, 4 exact rows per rank: per-row median 0.50-1.00e-2,
 # p98 1.85e-2, max 1.87e-2, elementwise within 2e-2; the shard's single exact row
-# 1.21-1.25e-2). Only the median failed there (1e-2): it rises to 1.6e-2 (1.3x the
-# worst measured 1.25e-2); p98 3e-2 and the exact rows' 2e-2 (elementwise and per
-# row) passed and stay; no row past 0.15 (a near-tie top-k swap moves a row by one
-# key's weight; a wrong head, scale, LSE base, W_UV or gate moves rows by 10-100%).
-# R >= 8 (non-exact rows, the 128K request) is unmeasured at these bounds.
+# 1.21-1.25e-2; at 45a6a74 R8 / R16 the same exact rows reach 2.09e-2 and 2.23e-2,
+# stock's own error against FP64 being 3.3-3.6e-2 there). The indexer queries round
+# differently too, so where a row's global top-k is a subset (contexts past 2048
+# keys) both paths take an exact top-k of logits that differ by rounding and may
+# swap near-tie keys: such a row moves by the swapped keys' attention weight (one of
+# 2048 near-uniform keys: ~1/sqrt(2048) = 2.2% relative per key), not by rounding.
+# So (``_check_dsa_rows``):
+# * rows whose global top-k set is the same on both paths (every exact row): median
+#   1.6e-2, p98 3e-2 and elementwise 2e-2 (``DSA_DIRECT``, ``DSA_SAME``);
+# * every row, the paths' distance less the FP64 effect of their selections (each
+#   path's FP64 reference over the keys it selected, ``_dsa_selected_reference``)
+#   within stock's own per-row error against FP64 over its keys (``DSA_BAND``: the
+#   paths disagree by no more than stock deviates from exact math; measured 0.15-
+#   0.65 of it on exact rows), each path's aggregate error within 1.5x of the other's
+#   (``_check_dsa_reference``), the same global top-k length (min(length, 2048)) on
+#   both and at most ``DSA_SWAP`` of the keys a row can swap (min(2048, length -
+#   2048): the keys outside its top-k bound the swaps) swapped (a near-tie swap moves
+#   a few keys; a lost chunk, round or rank share, or a top-k that ignores the
+#   logits, moves most of them; a 2125-token row has 77 keys to swap, so a fixed
+#   share of the 2048 selected would pass any selection there);
+# * no row past 0.15 (a wrong head, scale, LSE base, W_UV or gate moves rows by
+#   10-100%).
 DSA_DIRECT = dict(median=1.6e-2, tail=3e-2, worst=0.15)
-DSA_EXACT = dict(close=dict(atol=2e-2, rtol=2e-2), row=2e-2)
+DSA_SAME = dict(atol=2e-2, rtol=2e-2)
+DSA_BAND, DSA_SWAP = 1.0, 0.1
 # Our merge + gate on stock's partials and counts against stock: only BF16 rounding
 # points differ. Stock rounds each corrected partial, its NCCL reduce-scatter sums
 # BF16 partials (2-3 roundings), then W_UV and the gate round; ours ("proj") rounds
@@ -288,7 +299,8 @@ def _check_q_codes(name, ours, stock, scales):
         )
         assert int(steps.max()) <= 2, (name, int(steps.max()))
         assert int(far.sum()) <= 1e-3 * steps.numel(), (name, int(far.sum()))
-        assert float(mags.max()) <= 0.125 * float(b.abs().max()), (name, float(mags.max()))
+        biggest = float(mags.max())
+        assert biggest <= 0.125 * float(b.abs().max()), (name, biggest)
     assert differ <= 0.05 * steps.numel(), (name, differ)
     assert relative(a, b) <= 5e-3, (name, relative(a, b))
 
@@ -299,18 +311,20 @@ class _TapQuery:
     mailbox rows ``box.q[parity, :batch]`` after the query's join (every rank's
     heads published), the latest point they hold the query: the DcpValue kernel
     after the decode re-arms them with Q_SENT. ``heads``: the real heads (the
-    mailbox pads to trtllm-gen's query heads)."""
+    mailbox pads to trtllm-gen's query heads). ``rows``: the same call's flat KV
+    rows and counts (this rank's share of our global top-k)."""
 
     def __init__(self, fi, heads):
-        self.fi, self.heads, self.q = fi, heads, None
+        self.fi, self.heads, self.q, self.rows = fi, heads, None, None
 
     def __enter__(self):
         original = self.fi.decode
 
-        def decode(query, *args):
+        def decode(query, cache, slots, valid, block_size):
             if self.q is None:
                 self.q = query.view(torch.uint8)[:, : self.heads].clone()
-            return original(query, *args)
+                self.rows = slots.clone(), valid.clone()
+            return original(query, cache, slots, valid, block_size)
 
         self.fi.decode = decode
         return self
@@ -338,14 +352,14 @@ def _check_core_replay(name, replay, stock, counts):
     assert float(errors.max()) <= 1e-3 and shift <= 1e-3, (name, errors.max(), shift)
 
 
-def _check_slots(name, ours, stock, exact):
-    """This rank's flat KV rows and counts per row, ours vs stock's (``ours``,
-    ``stock``: (rows, counts)): over every key (``exact``) the same set; reports
-    how many rows list them in the same order (trtllm-gen's E4M3 P is quantized
-    against the running row max, so the order is a numerical input) and the other
-    rows' overlap. -> the rows with the same set."""
+def _slot_sets(ours, stock, batch):
+    """This rank's flat KV rows per row, ours vs stock's (``ours``, ``stock``:
+    (rows, counts), a compacted prefix of ``counts`` per row) over the first
+    ``batch`` rows -> (the same set, the same order, the rows both list, our count,
+    stock's count) per row (int64; every key is on one rank: the counts sum to the
+    global ones over the DCP group)."""
     (rows, counts), (want, want_counts) = ours, stock
-    batch = want_counts.shape[0]
+    assert min(counts.shape[0], want_counts.shape[0]) >= batch, (counts.shape, batch)
     width = max(rows.shape[1], want.shape[1])
     pad = torch.iinfo(torch.int64).max
 
@@ -361,8 +375,37 @@ def _check_slots(name, ours, stock, exact):
     same_set = (a == b).all(1)
     at = torch.searchsorted(b, a).clamp_max(width - 1)
     common = ((b.gather(1, at) == a) & (a != pad)).sum(1)
-    most = torch.maximum(counts[:batch], want_counts[:batch]).clamp_min(1)
-    overlap = common.double() / most
+    return (
+        same_set,
+        same_order,
+        common,
+        counts[:batch].long(),
+        want_counts[:batch].long(),
+    )
+
+
+def _global_sets(local, group):
+    """The DCP group's view of ``_slot_sets`` (collective): per row whether every
+    rank has the same set, the global overlap (keys both selected over the larger
+    count) and the global counts (ours, stock's)."""
+    import torch.distributed as dist
+
+    same_set, _, common, counts, want_counts = local
+    tally = torch.stack([(~same_set).long(), common, counts, want_counts])
+    dist.all_reduce(tally, group=group)
+    differ, common, counts, want_counts = tally
+    overlap = common.double() / torch.maximum(counts, want_counts).clamp_min(1)
+    return differ == 0, overlap, counts, want_counts
+
+
+def _check_slots(name, local, exact):
+    """This rank's flat KV rows (``local``: ``_slot_sets``): over every key
+    (``exact``) the same set; reports how many rows list them in the same order
+    (trtllm-gen's E4M3 P is quantized against the running row max, so the order is
+    a numerical input) and the other rows' overlap. -> the rows with the same set."""
+    same_set, same_order, common, counts, want_counts = local
+    batch = same_set.shape[0]
+    overlap = common.double() / torch.maximum(counts, want_counts).clamp_min(1)
     other = ~same_set
     print(
         f"{name} flat rows: {int(same_set.sum())} of {batch} rows the same set, "
@@ -372,6 +415,91 @@ def _check_slots(name, ours, stock, exact):
     wrong = exact[:batch] & ~same_set
     assert not bool(wrong.any()), (name, "exact rows", wrong.nonzero().flatten())
     return same_set
+
+
+def _check_selection(name, same, overlap, counts, lengths):
+    """The global top-k of every row on both paths (``same``, ``overlap``,
+    ``counts``: ``_global_sets``): min(length, TOPK) keys each, the same set where
+    the length fits the top-k, elsewhere at most ``DSA_SWAP`` of the keys the row
+    can swap (min(TOPK, length - TOPK)) swapped (exact top-k of logits that round
+    differently: near-tie swaps only)."""
+    want = lengths.clamp_max(TOPK).long()
+    room = (lengths.long() - want).clamp_max(TOPK)
+    ours, stock = counts
+    differ = ~same
+    swapped = ((1 - overlap) * torch.maximum(ours, stock).double()).round().long()
+    print(
+        f"{name} global top-k: {int(same.sum())} of {same.numel()} rows the same set "
+        f"({int((lengths <= TOPK).sum())} over every key); differing rows "
+        f"{differ.nonzero().flatten().tolist()}, overlap min "
+        f"{float(overlap[differ].min()) if differ.any() else 1.0:.4f}, keys swapped "
+        f"{swapped[differ].tolist()} of {room[differ].tolist()}"
+    )
+    assert torch.equal(ours, want) and torch.equal(stock, want), (
+        name, "top-k length", ours.tolist(), stock.tolist(), want.tolist(),
+    )  # fmt: skip
+    assert bool(same[lengths <= TOPK].all()), (name, "rows over every key")
+    beyond = swapped > DSA_SWAP * room
+    assert not bool(beyond.any()), (
+        name, "keys swapped", beyond.nonzero().flatten().tolist(),
+        swapped[beyond].tolist(), room[beyond].tolist(),
+    )  # fmt: skip
+
+
+def _check_dsa_rows(name, got, want, refs, same):
+    """Ours vs stock per row (``got``, ``want``) with each path's FP64 reference over
+    the keys it selected (``refs``: ours', stock's; ``_dsa_selected_reference``)
+    and whether the row's global top-k set is the same on both (``same``):
+    ``DSA_DIRECT`` (median, p98) and ``DSA_SAME`` (elementwise) on the same-set
+    rows; on every row the distance less the selections' FP64 effect within
+    ``DSA_BAND`` of stock's own error, and no row past ``DSA_DIRECT``'s worst.
+    Printed: the rows past the p98 bound by kind, and each differing row's
+    distance, swap effect, residual and stock's error."""
+    ours_ref, stock_ref = refs
+    got, want = got.double(), want.double()
+    norm = want.norm(dim=-1).clamp_min(1e-30)
+    errors = (got - want).norm(dim=-1) / norm
+    swap = (ours_ref - stock_ref).norm(dim=-1) / norm
+    residual = ((got - want) - (ours_ref - stock_ref)).norm(dim=-1) / norm
+    band = _rows_error(want, stock_ref)
+    tail = DSA_DIRECT["tail"]
+    differ = ~same
+    print(
+        f"{name}: {int(same.sum())} of {same.numel()} rows the same top-k set; past "
+        f"{tail:.0e}: {int((errors[same] > tail).sum())} same-set rows, "
+        f"{int((errors[differ] > tail).sum())} of {int(differ.sum())} differing rows; "
+        f"residual / stock's FP64 error max {float((residual / band).max()):.3f}"
+    )
+    if differ.any():
+        worst = differ.nonzero().flatten()
+        worst = worst[errors[worst].argsort(descending=True)][:8].tolist()
+        print(
+            f"{name} differing rows (row: distance, FP64 swap effect, residual, stock "
+            "vs FP64): "
+            + ", ".join(
+                f"{t}: {errors[t]:.2e} {swap[t]:.2e} {residual[t]:.2e} {band[t]:.2e}"
+                for t in worst
+            )
+        )
+    if same.any():
+        torch.testing.assert_close(
+            got[same].float(), want[same].float(), **DSA_SAME,
+            msg=_msg(f"{name} (rows over the same keys)"),
+        )  # fmt: skip
+        levels = torch.tensor([0.5, 0.98], dtype=torch.float64, device=errors.device)
+        quantiles = torch.quantile(errors[same], levels)
+        print(
+            f"{name} same-set rows: per-row error median {quantiles[0]:.2e} p98 "
+            f"{quantiles[1]:.2e} max {errors[same].max():.2e}"
+        )
+        assert quantiles[0] <= DSA_DIRECT["median"], (name, quantiles)
+        assert quantiles[1] <= DSA_DIRECT["tail"], (name, quantiles)
+    beyond = residual > DSA_BAND * band
+    assert not bool(beyond.any()), (
+        name, "residual past stock's error", beyond.nonzero().flatten().tolist(),
+        residual[beyond].tolist(), band[beyond].tolist(),
+    )  # fmt: skip
+    assert float(errors.max()) <= DSA_DIRECT["worst"], (name, errors.max())
 
 
 def _report_rows(name, got, want, median, tail, worst):
@@ -409,9 +537,10 @@ def _report_core(name, factor, got, stock, rows):
 
 
 def _check_dsa_reference(name, got, want, refs):
-    """Rows over every key of their request (both paths' top-k select all of them):
-    ours and stock each against FP64 attention over the keys as that path cached
-    them, from the unquantized query of the same input rows (``refs``: ours', stock's).
+    """Ours and stock each against FP64 attention over the keys that path selected
+    as it cached them (every key of the request on the rows whose length fits the
+    top-k), from the unquantized query of the same input rows (``refs``: ours',
+    stock's; ``_dsa_selected_reference``).
     Held: the aggregate errors within 1.5x of each other both ways (a wrong head,
     scale, LSE base or gate is a 10-100% error; the two paths' rounding-only
     distance, <= 2e-2 per exact row, against stock's ~3% error moves the ratio by
@@ -526,25 +655,18 @@ def _cached_keys(cache, table, request, length, scale, rank, group):
     return torch.stack(parts, 1).reshape(-1, FP8_ROW)[:length].double()
 
 
-def _dsa_reference(attn, x, lengths, exact, caches, table, rank, n):
-    """FP64 references of the rows over every key (``exact``), each path over its own
-    MLA cache (``caches``: ours, stock): this rank's gated o_proj input rows and the
-    exact rows of its output shard (o_proj of every rank's reference rows, summed).
-    The query is unquantized from the layer's packed in-projection of ``x``.
-    Collective over the TP group."""
-    import torch.distributed as dist
-
-    from vllm.distributed import get_tp_group
+def _reference_query(attn, x):
+    """The unquantized FP64 query [rows, heads, 576] (NoPE through W_UK, then RoPE)
+    and output gate [rows, heads x 128] of this rank's heads from the layer's packed
+    in-projection of the input rows ``x``."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.providers import (
         pack_dsa_projection,
     )
 
-    group = get_tp_group().device_group
     wrapper = attn.mla_attn
     layer = wrapper.mla_attn
     heads = layer.W_UK_T.shape[0]
-    rows = exact.nonzero().flatten()
-    proj = x[rows].double() @ pack_dsa_projection(attn).double().T
+    proj = x.double() @ pack_dsa_projection(attn).double().T
     q_a = proj[:, :1536]
     eps = wrapper.q_a_layernorm.variance_epsilon
     q_c = q_a * torch.rsqrt(q_a.pow(2).mean(-1, keepdim=True) + eps)
@@ -553,7 +675,32 @@ def _dsa_reference(attn, x, lengths, exact, caches, table, rank, n):
     nope = torch.einsum("thd,hdl->thl", query[..., :128], layer.W_UK_T.double())
     query = torch.cat([nope, query[..., 128:]], -1)
     gate = torch.sigmoid(proj[:, 2112 : 2112 + heads * 128])
-    w_uv, w_o = layer.W_UV.double(), attn.o_proj.weight.double()
+    return query, gate
+
+
+def _gated_rows(attn, latent, gate):
+    """FP64 latent [rows, heads, 512] -> the gated o_proj input rows."""
+    layer = attn.mla_attn.mla_attn
+    out = torch.einsum("thl,hlv->thv", latent, layer.W_UV.double())
+    return out.reshape(latent.shape[0], -1) * gate
+
+
+def _dsa_reference(attn, x, lengths, exact, caches, table, rank, n):
+    """FP64 references of the rows over every key (``exact``), each path over its own
+    MLA cache (``caches``: ours, stock): this rank's gated o_proj input rows and the
+    exact rows of its output shard (o_proj of every rank's reference rows, summed).
+    The query is unquantized from the layer's packed in-projection of ``x``.
+    Collective over the TP group. (Cross-checks ``_dsa_selected_reference``.)"""
+    import torch.distributed as dist
+
+    from vllm.distributed import get_tp_group
+
+    group = get_tp_group().device_group
+    layer = attn.mla_attn.mla_attn
+    rows = exact.nonzero().flatten()
+    query, gate = _reference_query(attn, x[rows])
+    heads = query.shape[1]
+    w_o = attn.o_proj.weight.double()
     requests = (rows // Q).tolist()
     spans = {req: int(lengths[req * Q + Q - 1]) for req in sorted(set(requests))}
     scale = layer._k_scale_float
@@ -568,11 +715,65 @@ def _dsa_reference(attn, x, lengths, exact, caches, table, rank, n):
             k = keys[req][: int(lengths[row])]
             probs = torch.softmax(query[i] @ k.T * layer.impl.scale, -1)
             latent[i] = probs @ k[:, :512]
-        out = torch.einsum("thl,hlv->thv", latent, w_uv).reshape(rows.numel(), -1)
-        outs.append(out * gate)
+        outs.append(_gated_rows(attn, latent, gate))
     shards = torch.stack([out @ w_o.T for out in outs])  # [2, E, 7168]
     dist.all_reduce(shards, group=group)
     mine = (rows >= rank * n) & (rows < (rank + 1) * n)
+    return tuple(outs), (shards[0][mine], shards[1][mine])
+
+
+def _dsa_selected_reference(attn, x, selections, caches, rank, n, chunk=16):
+    """FP64 references of every row, each path over the keys its global top-k
+    selected as it cached them (``selections``: this rank's flat KV rows and counts,
+    ours and stock's, a compacted prefix per row; ``caches``: the MLA caches, ours
+    and stock's): this rank's gated o_proj input rows and its output shard rows (as
+    ``_dsa_reference``). Every rank gathers each row's selected key rows of every
+    rank (``chunk`` rows at a time). Collective over the TP group."""
+    import torch.distributed as dist
+
+    from vllm.distributed import get_tp_group
+    from vllm.v1.attention.backends.mla.sparse_utils import flat_kv_row_view
+
+    group = get_tp_group().device_group
+    layer = attn.mla_attn.mla_attn
+    rows = x.shape[0]
+    query, gate = _reference_query(attn, x)
+    heads = query.shape[1]
+    w_o = attn.o_proj.weight.double()
+    scale, softmax_scale = layer._k_scale_float, layer.impl.scale
+    outs = []
+    for (slots, counts), cache in zip(selections, caches):
+        flat = flat_kv_row_view(cache.view(torch.float8_e4m3fn), UNIT)[0]
+        latent = query.new_empty(rows, heads, 512)
+        for start in range(0, rows, chunk):
+            stop = min(start + chunk, rows)
+            here = counts[start:stop].long()
+            width = here.max().view(1).clone()
+            dist.all_reduce(width, op=dist.ReduceOp.MAX, group=group)
+            width = max(int(width), 1)
+            index = slots[start:stop].long()
+            index = torch.nn.functional.pad(
+                index, (0, max(0, width - index.shape[1])), value=-1
+            )[:, :width]
+            span = torch.arange(width, device=index.device)
+            keep = span < here.view(-1, 1)
+            keys = flat[torch.where(keep, index, 0)].float() * scale
+            keys = torch.where(keep.unsqueeze(-1), keys, 0.0).contiguous()
+            parts = [torch.empty_like(keys) for _ in range(WORLD)]
+            dist.all_gather(parts, keys, group=group)
+            every = [torch.empty_like(here) for _ in range(WORLD)]
+            dist.all_gather(every, here.contiguous(), group=group)
+            keys = torch.cat(parts, 1).double()  # [rows, WORLD x width, 576]
+            valid = torch.cat([span < c.view(-1, 1) for c in every], 1)
+            scores = torch.einsum("thd,tkd->thk", query[start:stop], keys)
+            scores = scores * softmax_scale
+            scores = scores.masked_fill(~valid.unsqueeze(1), float("-inf"))
+            probs = torch.softmax(scores, -1)
+            latent[start:stop] = torch.einsum("thk,tkl->thl", probs, keys[..., :512])
+        outs.append(_gated_rows(attn, latent, gate))
+    shards = torch.stack([out @ w_o.T for out in outs])  # [2, R, 7168]
+    dist.all_reduce(shards, group=group)
+    mine = slice(rank * n, (rank + 1) * n)
     return tuple(outs), (shards[0][mine], shards[1][mine])
 
 
@@ -1020,14 +1221,26 @@ def _dsa_case(config, rank, device, indexer, topk_mode, rows, refusals):
         a, b = ours_mla[at].clone(), stock_mla[at].clone()
 
         # Every collective before any check (a failing rank must not strand the
-        # others): the FP64 references (every rank has the same exact rows, request
-        # 0's 600 tokens at least), then one block run whose decode kernel runs on
-        # stock's inputs with one factor of ours at a time (on this rank alone) and
-        # whose merge and gate take stock's partials and counts.
-        ref_in, ref_shard = _dsa_reference(
-            attn, x, lengths, exact, (caches["ours"][0], caches["stock"][0]),
-            mla_table, rank, n,
-        )  # fmt: skip
+        # others): the global top-k sets of the two paths, the FP64 references
+        # (every rank has the same rows: the exact rows, request 0's 600 tokens at
+        # least, over every key; every row over each path's selected keys), then one
+        # block run whose decode kernel runs on stock's inputs with one factor of
+        # ours at a time (on this rank alone) and whose merge and gate take stock's
+        # partials and counts.
+        assert tap.rows is not None, "our sparse decode's flat rows"
+        flat = {
+            "ours": tuple(t[:r] for t in tap.rows),
+            "stock": (stock["rows"][:r], stock["counts"][:r]),
+        }
+        local_sets = _slot_sets(flat["ours"], flat["stock"], r)
+        same, overlap, *counts = _global_sets(local_sets, group)
+        mla_caches = caches["ours"][0], caches["stock"][0]
+        ref_in, _ = _dsa_reference(
+            attn, x, lengths, exact, mla_caches, mla_table, rank, n
+        )
+        sel_in, sel_shard = _dsa_selected_reference(
+            attn, x, (flat["ours"], flat["stock"]), mla_caches, rank, n
+        )
         feed = _FeedCore(prepared.fi, stock, (ours_mla, at, b))
         _barrier()
         with override_forward_context(forward), feed:
@@ -1036,12 +1249,14 @@ def _dsa_case(config, rank, device, indexer, topk_mode, rows, refusals):
         merged_in = block.attn_out[:r].clone()
         _barrier()
 
-        # Ours vs stock: the whole path.
-        _check_rows(f"{where} o_proj input", attn_in, entering[0], exact, **DSA_DIRECT)
-        mine = exact[rank * n : (rank + 1) * n]
-        _check_rows(f"{where} shard", got, want, mine, **DSA_DIRECT)
-        # Decomposed: the query (our FP8 codes vs stock's), the decode kernel call
-        # (stock's inputs through ours), the flat rows (same sets), the kernel on
+        # The selected-key reference over every key is the all-keys one (it reads
+        # the flat rows as the decode kernels do).
+        for path, sel, full in zip(("ours", "stock"), sel_in, ref_in):
+            apart = _rows_error(sel[exact], full)
+            assert float(apart.max()) <= 1e-9, (where, path, "reference", apart)
+        # Decomposed first (printed even where the whole path fails): the query (our
+        # FP8 codes vs stock's), the decode kernel call (stock's inputs through
+        # ours), the flat rows (same sets), the global top-k sets, the kernel on
         # stock's inputs with one factor of ours (query, new KV rows, row order:
         # printed), the merge and gate on stock's partials and counts.
         seen = feed.seen
@@ -1049,10 +1264,9 @@ def _dsa_case(config, rank, device, indexer, topk_mode, rows, refusals):
         _check_q_codes(where, ours_q, stock["q"], q_scales)
         stock_core = stock["latent"], stock["lse"]
         _check_core_replay(where, seen["replay"], stock_core, stock["counts"])
-        same_set = _check_slots(
-            where, seen["rows"], (stock["rows"], stock["counts"]), exact
-        )
-        keyed = stock["counts"] > 0
+        same_set = _check_slots(where, local_sets, exact)
+        _check_selection(where, same, overlap, counts, lengths)
+        keyed = stock["counts"][:r] > 0
         _report_core(where, "our FP8 query", seen["query"], stock_core, keyed)
         _report_core(where, "our new MLA rows", seen["kv"], stock_core, keyed)
         _report_core(
@@ -1066,12 +1280,14 @@ def _dsa_case(config, rank, device, indexer, topk_mode, rows, refusals):
             label = f"{where} {label}, our merge + gate on stock's partials"
             _report_rows(label, ours_rows, theirs, **DSA_CROSS)
             _check_rows(label, ours_rows, theirs, **DSA_DIRECT)
-        # Accuracy: each path against FP64 attention over its own keys.
-        _check_dsa_reference(
-            f"{where} o_proj input", attn_in[exact], entering[0][exact], ref_in
-        )
-        if mine.any():
-            _check_dsa_reference(f"{where} shard", got[mine], want[mine], ref_shard)
+        # Ours vs stock: the whole path, same-set rows as exact ones, every row
+        # within stock's error once the selections' FP64 effect is taken out.
+        mine = slice(rank * n, (rank + 1) * n)
+        _check_dsa_rows(f"{where} o_proj input", attn_in, entering[0], sel_in, same)
+        _check_dsa_rows(f"{where} shard", got, want, sel_shard, same[mine])
+        # Accuracy: each path against FP64 attention over the keys it selected.
+        _check_dsa_reference(f"{where} o_proj input", attn_in, entering[0], sel_in)
+        _check_dsa_reference(f"{where} shard", got, want, sel_shard)
 
         # The step's cache writes: this rank's new MLA rows and indexer keys (the
         # arms wrote stock's new rows into ours: ``a`` holds ours as written).
