@@ -799,8 +799,8 @@ def _close(out, expected):
 
 def _dcp_main(rank, world, device, group, interleave=1):
     """DraftDcp (the drafter's fast DCP attention, 6 heads per rank) against the stock
-    tokenspeed + cp_lse_ag_out_rs + W_UV, causal (kimi-k3.1-pro-dspark-preview) and
-    non-causal (kimi-k3-dspark), at DL3 and DL7 rows covering every core: the polled
+    tokenspeed + cp_lse_ag_out_rs + W_UV, non-causal (what both K3 DSpark drafters run)
+    and causal, at DL3 and DL7 rows covering every core: the polled
     fork (rows mode, FORK_ROWS), rows mode on the gathered q = 1 core (FORK_ROWS off),
     the gathered fold core, the polled core (LSU / validity), the polled core of a
     gathered fold row with a long split (``long_polled``; a LONG_SPLIT rule installed

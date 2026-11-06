@@ -643,14 +643,15 @@ class DraftFastPath:
                     heads,
                 )
             else:
-                from vllm.model_executor.models.qwen3_dflash import (
-                    dflash_has_any_non_causal,
+                # The drafter's mask as its MLA layers run it: the K3 DSpark layers
+                # are built non_causal_multi_token_decode (dspark_mla), which the
+                # stock MLA metadata builder reads (any layer non-causal: the batch
+                # is), whatever the checkpoint's dflash_config says (both
+                # kimi-k3-dspark and kimi-k3.1-pro-dspark-preview run non-causal).
+                causal = not any(
+                    getattr(a.mla_attn, "non_causal_multi_token_decode", False)
+                    for a in attentions
                 )
-
-                # The drafter's mask as stock resolves it (DFlashSpeculator: causal
-                # unless some layer is non-causal; the 64-head kimi-k3-dspark is not,
-                # kimi-k3.1-pro-dspark-preview's dflash_config.causal is).
-                causal = not dflash_has_any_non_causal(model.config)
                 prepared_dcp = DraftDcp(
                     attentions, group.device_group, tp, rank, rows, steps,
                     vllm_config.model_config.max_model_len,
