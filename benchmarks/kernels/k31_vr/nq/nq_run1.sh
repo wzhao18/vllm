@@ -4,7 +4,8 @@
 # decode role of jh/noquant/cfg/nq-<point>-xdr.yaml (cfg2bench.py), verify rows <rows> (B*q, comma list) at contexts
 # [ctx] (default agentx; nq_shapes.py). Writes <out>.log / .json / .cfg.sh / .shapes.json; prints the [forward] lines.
 # env: NQ_OV (overlay root, '' = base kimi_k3), NQ_BUILD (default $NB/cache/build/<overlay basename|base>),
-#      NQ_IMG (default: the nq e2e image), NQ_TIMEOUT (s, default 2700), NQ_CNAME (pyxis container name).
+#      NQ_IMG (default: the nq e2e image), NQ_TIMEOUT (s, default 2700), NQ_CNAME (pyxis container name),
+#      NQ_MAX_KV_TOKENS (nq_shapes.py --max-kv-tokens: cap each case's summed context, both arms; default off).
 W=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr; K=/lustre/fsw/coreai_comparch_inferencex/weizha/k3vr
 M=/lustre/fsw/coreai_comparch_inferencex/weizha/models; NB=$W/nqbench
 D=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -23,7 +24,8 @@ mkdir -p $(dirname $OUT); rm -f $OUT.rdv $OUT.json
 python3 $D/cfg2bench.py $POINT --arm $ARM --drafter $DRAFT --rows $ROWS > $OUT.cfg.sh || { echo "cfg2bench failed"; exit 2; }
 Q=$(sed -n 's/^NQ_Q=//p' $OUT.cfg.sh)
 CAPS="prodlimit=$(sed -n 's/^NQ_PRODLIMIT=//p' $OUT.cfg.sh) maxcap=$(sed -n 's/^NQ_MAXCAP=//p' $OUT.cfg.sh) mns=$(sed -n 's/^NQ_MNS=//p' $OUT.cfg.sh)"
-python3 $D/nq_shapes.py $Q $OUT.shapes.json --rows $ROWS --ctx $CTX --point $POINT > $OUT.shapes.txt || exit 2
+python3 $D/nq_shapes.py $Q $OUT.shapes.json --rows $ROWS --ctx $CTX --point $POINT \
+  --max-kv-tokens ${NQ_MAX_KV_TOKENS:-0} > $OUT.shapes.txt || exit 2
 export ENROOT_CACHE_PATH=$K/enroot-cache
 {
   echo "NQRUN point=$POINT arm=$ARM drafter=$DRAFT q=$Q ctx=$CTX rows=$ROWS $CAPS extra=$(echo "$*" | tr ' ' '_') ov=${NQ_OV:-base} img=$(basename $IMG) job=$J nodes=$NL start=$(date +%FT%T)"
@@ -35,5 +37,5 @@ timeout ${NQ_TIMEOUT:-2700} srun --overlap --jobid $J -N4 -w $NL --ntasks-per-no
 rc=$?
 echo "NQEND rc=$rc end=$(date +%FT%T)" >> $OUT.log
 echo "$(basename $OUT) rc=$rc"
-grep -a "^\[forward\].*median\|^NQ: specialized\|^NQ: drafter\|Traceback\|Error:" $OUT.log | sed 's/, sample spread.*//' | head -40
+grep -a "^\[forward\].*median\|^NQ: KV\|^NQ: specialized\|^NQ: drafter\|Traceback\|Error:" $OUT.log | sed 's/, sample spread.*//' | head -40
 exit $rc

@@ -341,6 +341,43 @@ def test_ab_split_and_dead_marker():
         assert "MISSING(ls)" in text and "c64-new-agentx-hi" in text and "exclude" not in text, text
 
 
+def test_ctx_cap_and_case_blocks():
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, "s.json")
+        args = [sys.executable, os.path.join(HERE, "nq_shapes.py"), "4", out, "--rows", "8,1024"]
+        subprocess.check_call(args, stdout=subprocess.DEVNULL)
+        full = json.load(open(out))["cases"]
+        txt = subprocess.check_output(args + ["--max-kv-tokens", "30000000"], text=True)
+        capped = json.load(open(out))["cases"]
+        assert "ctx q4_B256_M1024_agentx: B 256" in txt, txt
+        # B=2 is below the cap and unchanged; B=256 is scaled to fit, with the distribution's shape kept
+        assert capped[0] == full[0] and full[0]["ctx"]["scale"] == 1.0
+        big = capped[1]
+        assert big["ctx"]["scale"] < 1 and big["ctx"]["sum"] <= 30000000
+        assert sum(r["kv_len"] - r["query_len"] for r in big["requests"]) == big["ctx"]["sum"]
+        assert big["ctx"]["max"] < full[1]["ctx"]["max"] and big["ctx"]["min"] >= 8
+    # case_blocks mirrors build_batch's cursor: 1 + every group's live blocks per request
+    import nq_step
+
+    fake = types.ModuleType("vllm.benchmarks.forward.batch")
+    fake._num_blocks = lambda spec, computed, kv_len, dcp: (0, 4 if spec == "mamba" else -(-kv_len // (1024 * dcp)))
+    saved = {m: sys.modules.get(m) for m in ("vllm", "vllm.benchmarks", "vllm.benchmarks.forward",
+                                             "vllm.benchmarks.forward.batch")}
+    for m in saved:
+        sys.modules[m] = fake if m.endswith("batch") else types.ModuleType(m)
+    try:
+        req = types.SimpleNamespace(prefix_len=40000, kv_len=40004)
+        case = types.SimpleNamespace(requests=(req, req))
+        groups = [types.SimpleNamespace(kv_cache_spec=s) for s in ("mla", "mla", "mamba")]
+        assert nq_step.case_blocks(case, groups, 16, 4) == 1 + 2 * (3 + 3 + 4)
+    finally:
+        for m, mod in saved.items():
+            if mod is None:
+                sys.modules.pop(m, None)
+            else:
+                sys.modules[m] = mod
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

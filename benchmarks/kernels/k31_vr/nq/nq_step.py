@@ -30,6 +30,11 @@ fault hooks, plus:
   the nq configs (68 B/token: 64 B of e2m1 pairs + 4 UE8M0 scales) take random bytes as
   e2m1 pairs, as the C256 recipe did (merge/tools/t10/mt_n4_m10.sh). The MLA cache stays
   zero unless --fill-mla (the sparse core's cost does not depend on its values).
+* Bench KV pool sized to the case set (patch_kv_pool), not to gpu-memory-utilization: the
+  bench's per-case state snapshot (~158 MiB per request at q4) and graph/eager transients
+  need the memory the server's KV would take; both arms get the same pool. Cases the server
+  would not admit (more blocks than its KV capacity) are refused. Per case, rank 0 logs the
+  context set, its KV blocks vs pool and production capacity, the snapshot size and peak memory.
 
 What the median is: one CUDA graph per case of the target forward plus the drafter's K-step
 propose with every draft accepted, rank-max per replay, median of iters x samples
@@ -255,6 +260,153 @@ def patch_fill(fill_index, fill_mla):
     log(f"indexer fill: random keys per 64-key page{' + MLA rows' if fill_mla else ''}")
 
 
+GIB = 1 << 30
+POOL = {}  # patch_kv_pool -> report_cases: production capacity, bench pool, per-case KV blocks
+
+
+def case_blocks(case, groups, dcp, lookahead):
+    """KV blocks build_batch allocates for ``case`` (its ``cursor``: null block + every group's
+    live blocks per request), from the same ``_num_blocks`` it calls."""
+    from vllm.benchmarks.forward.batch import _num_blocks
+
+    total = 1
+    for r in case.requests:
+        for g in groups:
+            total += _num_blocks(g.kv_cache_spec, r.prefix_len, r.kv_len + lookahead, dcp)[1]
+    return total
+
+
+def ctx_stats(case):
+    """Per-request context (prefix = kv_len - query_len) summary of one case."""
+    lens = sorted(r.prefix_len for r in case.requests)
+    n = len(lens)
+    return (f"B {n} ctx sum {sum(lens)} min {lens[0]} p50 {lens[n // 2]} mean {sum(lens) // n} "
+            f"max {lens[-1]}")
+
+
+def patch_kv_pool(shapes, include_drafter, floor_gib):
+    """Bench KV pool = the blocks the case set needs, identical in both arms; production KV
+    capacity is checked, not used as the pool.
+
+    Why (n4-nq-f5b39b1 c256 stock, 2026-11-06): the bench sizes KV like the server
+    (gpu-memory-utilization 0.9, 100.2 GiB = 4.9M tokens/rank) but profiles with cudagraph
+    NONE, and every case then clones every KV / state block its step writes
+    (ForwardBench._capture_and_time snapshots = state_reset_bytes, ~158 MiB per request at q4:
+    20 GiB at B=128, 30 GiB at B=192, 40 GiB at B=256, independent of context length) and
+    captures a graph next to the eager pass. That bench-only memory does not fit in the 10%
+    the server leaves: M512 OOM'd on the 1 GiB [512, max_model_len] indexer logits, M768
+    in the snapshot clone itself. The cases' KV (agentx B=128: 24.3M of 79M tokens) was not
+    the problem; the pool only needs to hold the largest case, so the rest of the memory
+    goes to the bench's snapshot / graph / eager transients.
+
+    The pool is sized from the case set and the KV config (block counts are deterministic
+    and do not depend on the arm), so both arms get the same pool. A case that needs more
+    blocks than the server would have at the configured gpu-memory-utilization (``N0``,
+    an upper bound: no CUDA graph memory reserved) is refused at startup: the scheduler
+    would never run it. Scale its contexts with nq_shapes.py --max-kv-tokens."""
+    import torch
+
+    import vllm.v1.engine.core as core
+    from vllm.benchmarks.forward.shapes import BenchCase, BenchRequest, load_cases
+
+    cases = load_cases(shapes)
+    get_configs = core.get_kv_cache_configs
+
+    def get_kv_cache_configs(vllm_config, kv_cache_specs, available, *args, **kwargs):
+        configs = get_configs(vllm_config, kv_cache_specs, available, *args, **kwargs)
+        n0 = min(c.num_blocks for c in configs)
+        groups = configs[0].kv_cache_groups
+        dcp = vllm_config.parallel_config.decode_context_parallel_size
+        lookahead = (
+            vllm_config.num_speculative_tokens + 1
+            if include_drafter and vllm_config.speculative_config is not None
+            else 0
+        )
+        need = {c.name: case_blocks(c, groups, dcp, lookahead) for c in cases}
+        max_len = vllm_config.model_config.max_model_len
+        one = BenchCase("max_model_len", (BenchRequest(1, max_len - lookahead),))
+        floor = case_blocks(one, groups, dcp, lookahead)
+        log(f"KV: production capacity at gpu-memory-utilization "
+            f"{vllm_config.cache_config.gpu_memory_utilization}: {n0} blocks "
+            f"({available[0] / GIB:.2f} GiB/rank; upper bound, no CUDA graph memory reserved)")
+        over = {k: v for k, v in need.items() if v > n0}
+        if over:
+            raise RuntimeError(
+                f"cases need more KV blocks than the server holds ({n0}): {over}. The scheduler "
+                "would not admit them; scale their contexts (nq_shapes.py --max-kv-tokens, "
+                "NQ_MAX_KV_TOKENS in nq_run1.sh)"
+            )
+        target = max(max(need.values()), floor) + 8
+        per_block = available[0] / n0
+        size = int(per_block * target) + 1
+        for _ in range(4):
+            before = vllm_config.model_config.max_model_len
+            configs = get_configs(vllm_config, kv_cache_specs, [size] * len(available), *args,
+                                  **kwargs)
+            assert vllm_config.model_config.max_model_len == before == max_len, (
+                "bench KV pool changed max_model_len", before, max_len)
+            got = min(c.num_blocks for c in configs)
+            if got >= target:
+                break
+            size = int(size * target / got) + int(per_block) + 1
+        else:
+            raise RuntimeError(f"bench KV pool: {got} blocks < {target} needed")
+        free = torch.tensor([torch.cuda.mem_get_info()[0]], dtype=torch.int64)
+        from vllm.distributed.parallel_state import get_world_group
+
+        torch.distributed.all_reduce(free, op=torch.distributed.ReduceOp.MIN,
+                                     group=get_world_group().cpu_group)
+        free = int(free.item())
+        if free - size < floor_gib * GIB:
+            raise RuntimeError(
+                f"bench KV pool {size / GIB:.2f} GiB leaves {(free - size) / GIB:.2f} GiB "
+                f"(< {floor_gib} GiB) for the snapshot / graph / eager transients"
+            )
+        POOL.update(n0=n0, pool=got, need=need)
+        log(f"KV: bench pool {got} blocks ({size / GIB:.2f} GiB/rank, largest case "
+            f"{max(need.values())} blocks + 8, identical in both arms); "
+            f"{(free - size) / GIB:.2f} GiB/rank left for the bench's snapshot, graph and "
+            f"eager transients (min over ranks)")
+        return configs
+
+    core.get_kv_cache_configs = get_kv_cache_configs
+
+
+def report_cases():
+    """Per case, rank 0: the context set (identical in both arms: same shapes file), its KV
+    blocks vs the bench pool and the production capacity, then what the step used."""
+    import torch
+
+    import vllm.benchmarks.forward.kv_init as kv_init
+    import vllm.benchmarks.forward.main as fmain
+
+    run = fmain.run_case
+    touched = kv_init.touched_kv_views
+
+    def touched_kv_views(*args, **kwargs):
+        views = touched(*args, **kwargs)
+        snap = sum(v.numel() * v.element_size() for v in views)
+        log(f"  state snapshot {snap / GIB:.2f} GiB (bench-only clone), "
+            f"free {torch.cuda.mem_get_info()[0] / GIB:.2f} GiB before it")
+        return views
+
+    def run_case(runner, case, args):
+        need, n0, pool = POOL.get("need", {}).get(case.name), POOL.get("n0"), POOL.get("pool")
+        kv = (f"KV {need} blocks = {need / n0:.0%} of production capacity {n0}, pool {pool}"
+              if need else "KV blocks: ?")
+        log(f"case {case.name}: {ctx_stats(case)} | {kv}")
+        result = run(runner, case, args)
+        check = "" if need in (None, result["kv_blocks"]) else f" MISMATCH(predicted {need})"
+        log(f"  done {case.name}: kv_blocks {result['kv_blocks']}{check} state_reset "
+            f"{result.get('state_reset_bytes', 0) / GIB:.2f} GiB, peak allocated "
+            f"{torch.cuda.max_memory_allocated() / GIB:.2f} GiB")
+        torch.cuda.reset_peak_memory_stats()
+        return result
+
+    kv_init.touched_kv_views = touched_kv_views
+    fmain.run_case = run_case
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--init-file", default="")
@@ -263,6 +415,8 @@ def main():
     ap.add_argument("--overlay", default="")
     ap.add_argument("--no-fill-index", action="store_true")
     ap.add_argument("--fill-mla", action="store_true")
+    ap.add_argument("--free-floor-gib", type=float, default=16.0,
+                    help="memory the bench KV pool must leave for snapshot / graph / transients")
     args, rest = ap.parse_known_args()
     if rest and rest[0] == "--":
         rest = rest[1:]
@@ -271,6 +425,12 @@ def main():
     sizes = parse_sizes(args.capture_sizes)
     patch_specialized_decode(sizes, args.max_capture)
     patch_fill(not args.no_fill_index, args.fill_mla)
+    if "--shapes" in rest:
+        patch_kv_pool(rest[rest.index("--shapes") + 1], "--exclude-drafter" not in rest,
+                      args.free_floor_gib)
+    else:
+        log("KV: no --shapes: bench pool = production gpu-memory-utilization sizing")
+    report_cases()
     import torch
 
     import vllm
