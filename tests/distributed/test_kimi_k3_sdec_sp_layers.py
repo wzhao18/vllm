@@ -31,7 +31,8 @@ on the same input rows, the same metadata and each on its own copy of the caches
   the kernel on stock's inputs but one factor of ours each (the FP8 query, the new MLA
   rows, the flat row order), and our merge + gate on stock's partials and valid counts
   (``DSA_CROSS`` reported, ``DSA_DIRECT`` held), the new MLA rows (FP8 codes one step
-  apart where the RMSNorm rounds differently, the rope part exact), the new indexer keys
+  apart where the RMSNorm or the in-projection rounds differently; the rope part
+  exact against our own k_pe, ``_check_rope_part``), the new indexer keys
   (few codes different) and every other cache byte as it was; then the block replayed in
   a CUDA graph bit for bit as its eager run. Contexts per request cycle through short
   (all keys) and long ones, one of 128K tokens. The top-k runs the #63 merge or, as C512
@@ -1040,6 +1041,35 @@ def _index_token_bytes(cache, slots, row, key_bytes):
     return page, torch.cat([keys, scales], 1)
 
 
+KPE = slice(2048, 2112)  # k_pe in the packed DSA projection (after q_a | kv_c)
+
+
+def _check_rope_part(where, ours, theirs, ours_pe, k_scale):
+    """The rope part (64 FP8 codes of the un-rotated k_pe: K3.1 DSA is NoPE) of this
+    rank's new MLA rows. Ours inserts it exactly as stock's writer does
+    (concat_and_cache_mla: BF16 / k_scale, E4M3 round-to-nearest) from our own
+    in-projection row, so it must equal that bit for bit. k_pe is a raw projection
+    output: our DecodeProjection (warp / cluster split-K, or cuBLAS) and stock's
+    fused_qkv_a_proj (cuBLAS) sum K = 7168 in different FP32 orders, so a rare k_pe
+    element rounds to the neighbouring BF16 value and, where that crosses an E4M3
+    rounding boundary, lands one code step from stock's (C512 at 075259e: R16, rank 1
+    only, in every variant; its kernel effect alone, ours rows on stock's inputs:
+    LSE 3.8e-6, the size of one code step on one key). So against stock: each code
+    within one BF16 step of our k_pe, and few of them different."""
+    want = (ours_pe.float() / k_scale).to(torch.float8_e4m3fn).view(torch.uint8)
+    assert torch.equal(ours, want), f"{where}: rope part vs our k_pe"
+    bits = ours_pe.view(torch.int16)
+    reach = torch.zeros_like(theirs, dtype=torch.bool)
+    for step in (-1, 0, 1):  # (a magnitude step either way, same sign)
+        near = (bits + step).view(torch.bfloat16).float() / k_scale
+        reach |= near.to(torch.float8_e4m3fn).view(torch.uint8) == theirs
+    differ = int((ours != theirs).sum())
+    if differ:
+        print(f"{where} rope part: {differ} of {ours.numel()} codes one BF16 step off")
+    assert bool(reach.all()), f"{where}: rope part beyond one BF16 step of our k_pe"
+    assert differ <= 0.05 * ours.numel(), (where, "rope part", differ)
+
+
 def _dsa_case(config, rank, device, indexer, topk_mode, rows, refusals):
     from tests.models.kimi_k3 import test_specialized_decode_dsa as dsa
     from vllm import _custom_ops as ops
@@ -1205,6 +1235,8 @@ def _dsa_case(config, rank, device, indexer, topk_mode, rows, refusals):
             got = block.run(x_shard, [caches["ours"][0]], md, run).clone()
         torch.accelerator.synchronize()
         attn_in = block.attn_out[:r].clone()
+        # (our in-projection's k_pe of this rank's new rows: the rope part's source)
+        ours_pe = block.projected[:r][new_mla >= 0, KPE].clone()
         assert tap.q is not None and tap.q.shape[0] == r, "our sparse decode's query"
         ours_q = tap.q
         # (dequant scales: ours multiplies by 1 / _q_scale, stock divides by it)
@@ -1291,7 +1323,7 @@ def _dsa_case(config, rank, device, indexer, topk_mode, rows, refusals):
 
         # The step's cache writes: this rank's new MLA rows and indexer keys (the
         # arms wrote stock's new rows into ours: ``a`` holds ours as written).
-        assert torch.equal(a[:, 512:], b[:, 512:]), f"{where}: rope part"
+        _check_rope_part(where, a[:, 512:], b[:, 512:], ours_pe, layer._k_scale_float)
         assert dsa.fp8_codes_adjacent(a[:, :512], b[:, :512]), where
         assert (a[:, :512] != b[:, :512]).sum() <= 0.05 * a[:, :512].numel(), where
         ours_mla[at], stock_mla[at] = 0, 0
