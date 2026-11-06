@@ -190,10 +190,12 @@ def situ(gate, up):
     return g * (LINEAR_BETA * torch.tanh(up / LINEAR_BETA))
 
 
-def reference(logical, latent, topk_w, ids):
+def reference(logical, latent, topk_w, ids, gate_scale=1.0, swap=False):
     """Per-token FP64 routed partial [M, 3584]: MXFP8 x (kernel rule), dequantized
     MXFP4 w13 / w2, SiTU, the hidden MXFP8 per token (kernel rule), the top-k sum with
-    the BF16 routing weights; no BF16 staging."""
+    the BF16 routing weights; no BF16 staging. ``gate_scale`` / ``swap`` (contract
+    probes only, ``contract_probe``): the gate pre-activation scaled, gate and up
+    exchanged."""
     import torch
 
     w13, s13, w2, s2 = logical
@@ -207,7 +209,10 @@ def reference(logical, latent, topk_w, ids):
         pick = (flat == e).nonzero().flatten()
         tokens = token[pick]
         a = x[tokens] @ dequant_mxfp4(w13[e], s13[e]).T  # [n, 2I]
-        h = situ(a[:, :INTER], a[:, INTER:]).float()  # FP32 into the quantizer
+        gate, up = a[:, :INTER], a[:, INTER:]
+        if swap:
+            gate, up = up, gate
+        h = situ(gate_scale * gate, up).float()  # FP32 into the quantizer
         y = mxfp8_kernel_rule(h) @ dequant_mxfp4(w2[e], s2[e]).T  # [n, H]
         out.index_add_(0, tokens, y * weight[pick, None])
     return out
@@ -322,6 +327,56 @@ def errors(out, ref):
     )  # fmt: skip
 
 
+# Contract probes (``contract_probe``): FP64 references under other output contracts,
+# on the first PROBE_ROWS rows.
+PROBE_ROWS = 72
+PROBES = {
+    "gate/up swapped": dict(swap=True),
+    "gate x2": dict(gate_scale=2.0),
+    "gate x0.5": dict(gate_scale=0.5),
+}
+
+
+def contract_probe(case, spec):
+    """Why the specialized rows miss the reference: lines with (1) the per-row
+    least-squares scale spec ~ alpha x ref and the residual after it (a pure scale
+    = an output-contract factor: routing-weight scaling, finalize, a TP / MX scale);
+    (2) the spec error vs FP64 references under other FC1 / SiTU contracts (the one
+    near the stock error names the engine's actual contract); (3) the row-relative
+    error by column within the FC2 shuffle's 32-row blocks and by 128-column FC2
+    tile (an uneven split names a layout)."""
+    rows = min(PROBE_ROWS, spec.shape[0])
+    out, ref = spec[:rows].double(), case["ref"][:rows]
+    alpha = (out * ref).sum(1) / (ref * ref).sum(1).clamp_min(1e-30)
+    scaled = alpha[:, None] * ref
+    residual = (out - scaled).norm(dim=1) / scaled.norm(dim=1).clamp_min(1e-30)
+    lines = [
+        f"probe M{rows}: alpha {alpha.mean().item():.4f} +- {alpha.std().item():.4f}"
+        f", residual rel after alpha {residual.mean().item():.3e} (max "
+        f"{residual.max().item():.3e})"
+    ]
+    latent, topk_w, ids = (t[:rows] for t in case["inputs"])
+    for name, kwargs in PROBES.items():
+        key = ("probe", name)
+        if key not in case["cache"]:
+            case["cache"][key] = reference(
+                case["logical"], latent, topk_w, ids, **kwargs
+            )
+        lines.append(f"  spec vs ref[{name}]: {fmt(errors(out, case['cache'][key]))}")
+    err, norm = (out - ref).pow(2), ref.pow(2)
+    by32 = err.view(rows, -1, 32).sum((0, 1)) / norm.view(rows, -1, 32).sum((0, 1))
+    by_tile = err.view(rows, 28, 128).sum((0, 2)) / norm.view(rows, 28, 128).sum((0, 2))
+    by32, by_tile = by32.sqrt(), by_tile.sqrt()
+    lines.append(
+        "  rel by column % 32: " + " ".join(f"{v:.2f}" for v in by32.tolist())
+    )
+    lines.append(
+        f"  rel by FC2 tile: min {by_tile.min().item():.3f} max "
+        f"{by_tile.max().item():.3f}"
+    )
+    return lines
+
+
 def fmt(e):
     return (
         f"max_abs {e['max_abs']:.3e} mean_abs {e['mean_abs']:.3e} "
@@ -387,7 +442,7 @@ def case():
     ids, topk_w, latent = verify_routes(FULL, dev)
     ref = reference(logical, latent, topk_w, ids)
     return dict(dev=dev, weights=weights, dies=dies, inputs=(latent, topk_w, ids),
-                ref=ref, cache={})  # fmt: skip
+                ref=ref, logical=logical, cache={})  # fmt: skip
 
 
 def stock_out(case, rows):
@@ -428,8 +483,15 @@ def test_wide_experts_reference_band(case, rows):
     stock = stock_out(case, rows)
     es, ek = errors(spec, ref), errors(stock, ref)
     print(f"\nM{rows} spec  vs ref: {fmt(es)}\nM{rows} stock vs ref: {fmt(ek)}")
-    for metric in ("max_abs", "mean_abs", "max_rel", "mean_rel"):
-        assert es[metric] <= BAND * ek[metric], (rows, metric, fmt(es), fmt(ek))
+    metrics = ("max_abs", "mean_abs", "max_rel", "mean_rel")
+    failed = [m for m in metrics if es[m] > BAND * ek[m]]
+    if failed:
+        probe = "\n".join(contract_probe(case, spec))
+        print(probe)
+        raise AssertionError(
+            f"M{rows}: {failed} outside {BAND} x stock\nspec  vs ref: {fmt(es)}\n"
+            f"stock vs ref: {fmt(ek)}\n{probe}"
+        )
 
 
 class GroupingNotBitwise(AssertionError):
@@ -501,6 +563,10 @@ def test_wide_experts_grouping_variance(case):
     print("\n" + summary)
     again = pairs["768 again"]["rows"]
     assert not again, "768-row launch not deterministic\n" + summary
-    assert not outside, f"rows outside the reference band: {outside}\n{summary}"
+    if outside:
+        probe = "\n".join(contract_probe(case, one))
+        raise AssertionError(
+            f"rows outside the reference band: {outside}\n{summary}\n{probe}"
+        )
     if any(c["rows"] for c in pairs.values()):
         raise GroupingNotBitwise(summary)

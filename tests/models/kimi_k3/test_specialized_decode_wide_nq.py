@@ -193,8 +193,13 @@ def test_decode_capacity_holds_every_captured_row(monkeypatch, q):
 def test_coverage_has_no_stock_step(q):
     """The coverage plan of every captured row up to 2048 (K3.1: KDA + DSA layers,
     MoE) names a specialized step at every row: the DSA, o-projection and MoE families
-    on their wide paths, never seam S2-DSA / S3 / S4 or a whole-step stock forward."""
+    on their wide paths, never seam S2-DSA / S3 / S4 or a whole-step stock forward.
+    AttnRes runs the stock op exactly at the rows ``attn_res.prepared.STOCK_ROWS``
+    names (a measured choice: ClusterAttnRes loses there), its wide path elsewhere."""
     pytest.importorskip("cutlass")
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.attn_res.prepared import (  # noqa: E501
+        STOCK_ROWS,
+    )
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.attn_res.prepared import (  # noqa: E501
         choose as attn_res_choose,
     )
@@ -214,7 +219,11 @@ def test_coverage_has_no_stock_step(q):
     from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.providers import (
         BATCHES,
     )
-    from vllm.models.kimi_k3.nvidia.specialized_decode.shapes import Path, Shape
+    from vllm.models.kimi_k3.nvidia.specialized_decode.shapes import (
+        Path,
+        Shape,
+        rows_policy,
+    )
 
     rows, ctx = captured(q), context(q)
     wide = wide_rows(rows, q)
@@ -241,8 +250,13 @@ def test_coverage_has_no_stock_step(q):
     for m in wide:
         plan = coverage.plan[m]
         assert plan is not None, m
-        for family in ("dsa", "oproj", "moe", "attn_res"):
+        for family in ("dsa", "oproj", "moe"):
             assert plan[family].path is Path.GENERIC, (m, family, plan[family])
+        # AttnRes: STOCK only where STOCK_ROWS asks for it, GENERIC everywhere else
+        stock = bool(rows_policy(STOCK_ROWS, Shape(m, q), default=0))
+        want = Path.STOCK if stock else Path.GENERIC
+        assert plan["attn_res"].path is want, (m, "attn_res", plan["attn_res"])
+        assert (m in decode.stock_attn_res) == stock, m
 
 
 @pytest.mark.parametrize("sms", [212, 152])
@@ -508,11 +522,11 @@ def test_wide_experts_planned_single_launch(monkeypatch):
         WIDE_MAX,
     )
 
-    planned = {}
+    seen: dict = {}
 
     class Wide:
         def __init__(self, experts, buffers, partials, *, planned, pushed=None):
-            planned.update(partials=dict(partials), pushed=dict(pushed or {}))
+            seen.update(partials=dict(partials), pushed=dict(pushed or {}))
 
     monkeypatch.setattr(experts_runtime, "WideExperts", Wide)
     monkeypatch.setattr(prepared, "stock_router", lambda router: None)
@@ -531,8 +545,8 @@ def test_wide_experts_planned_single_launch(monkeypatch):
     )
     single = {68, 256, 512, WIDE_MAX}
     assert moe.wide_batches == single
-    assert set(planned["partials"]) == set(planned["pushed"]) == single
-    assert all(len(experts_runtime.wide_chunks(b)) == 1 for b in planned["partials"])
+    assert set(seen["partials"]) == set(seen["pushed"]) == single
+    assert all(len(experts_runtime.wide_chunks(b)) == 1 for b in seen["partials"])
     for b in range(65, 4097):
         if prepared.wide_experts_batch(b):
             assert len(experts_runtime.wide_chunks(b)) == 1 and b <= WIDE_MAX, b

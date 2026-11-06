@@ -206,6 +206,8 @@ class SparseMla:
 
 class Indexer(SimpleNamespace):
     __call__ = KimiK3DSAIndexer.forward
+    # The stock ShardQ row hook: None outside ShardQ steps (no ShardQ layer name).
+    _shardq_indexer_rows = KimiK3DSAIndexer._shardq_indexer_rows
 
 
 def dsa_layer(fused_insert):
@@ -225,6 +227,7 @@ def dsa_layer(fused_insert):
         index_num_heads=INDEX_HEADS,
         index_rope_dim=0,
         use_fused_k_insert=fused_insert,
+        shardq_layer_name="",  # the stock default: no ShardQ layer
         wq_index=Linear(INDEX_HEADS * INDEX_DIM, Q_LORA, trace, "wq_index"),
         wkv_index=Linear(INDEX_DIM + INDEX_HEADS),
         _fused_k_insert=op("k_insert"),
