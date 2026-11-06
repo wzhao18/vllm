@@ -1,4 +1,4 @@
-# nq: stock vs specialized decode step A/B (TP16 = DCP16, Rubin / VR200)
+# nq: stock vs specialized decode step A/B (TP16 = DCP16 and C512 TP4 x DCP4 x DP4, Rubin / VR200)
 
 The whole Kimi K3.1 decode step, stock (`decode_backend` auto) against `latency_specialized`. It uses the
 no-quant serving precision: fp8 MLA KV, FP32 KDA recurrent state, mxfp4 indexer keys, BF16 linears and mxfp8 MoE
@@ -20,7 +20,8 @@ The harness is new and kept separate from `wtp1/`, which stays untouched. It fix
 - the target forward over all 93 layers, with dummy weights;
 - the drafter's K-step propose, with every draft accepted.
 
-Each replay is the maximum over the 16 ranks, and the reported value is the median of iters x samples.
+Each replay is the maximum over the 16 ranks (all DP ranks at C512), and the reported value is the median of iters x
+samples.
 
 Not included in either arm:
 - target logits and LM head;
@@ -37,6 +38,7 @@ weights. It is not a correctness signal; correctness needs real-weight runs.
 | `cfg2bench.py` | Reads `jh/noquant/cfg/nq-<point>-xdr.yaml`, decode role plus global env. Writes the exact bench engine args and env as sourceable sh: TP16 DCP16, fp8 KV, float32 SSM state, mxfp4 indexer, attention and kernel flags, block size, max-num-seqs, capture sizes, speculative config with the drafter override, and `decode_backend` per arm. The capture list holds only the measured rows, their drafter batches and the capacity anchors (`--full-capture`: the production list). Each production arg is kept, dropped with a reason, or rewritten; an unknown arg is an error. `--snapshot` writes JSON copies so batch hosts need no PyYAML; a stale snapshot is refused. |
 | `nq_step.py` | Wrapper around `vllm bench forward`. Handles the rendezvous and checks the code-under-test overlay (`--overlay`: vllm and kimi_k3 must resolve inside it; logs its revision and shipped files). Runs the real `specialized_decode_config` / `draft_batches` under the production compilation fields (FULL_AND_PIECEWISE, capture sizes, max capture). On the ls arm it also runs them on the full list and refuses to start unless every measured row is captured, every B is a drafter batch and the largest verify row / drafter batch equal the full list's (`NQ: capture:`). Fills the indexer with MX-aware random keys. Sizes the bench KV pool to the largest case (same pool in both arms) instead of gpu-memory-utilization, so the bench-only per-case state snapshot (~158 MiB per request at q4) and graph/eager transients fit; refuses a case that needs more KV blocks than the server's capacity at that utilization; logs per case the context set, KV blocks vs pool and capacity, snapshot GiB and peak memory (`NQ: KV:`, `NQ: case`). |
 | `nq_shapes.py` | Cases for a list of verify rows M = B*q, in ascending rows. Prints and stores (`"ctx"`) each case's context summary; `--max-kv-tokens N` (`NQ_MAX_KV_TOKENS`) scales a case whose contexts sum above N. Context options: AgentX vectors (`q8_C1_C8` for c1/c8, `q8_C64`, `q4_C48_C160_C256`), `uNk`, `mix`. |
+| (DP) | C512's decode role is TP4 x DCP4 x DP4 with EP16 MegaMoE; see "C512 point" below. `cfg2bench.py` derives the layout (`NQ_TP`, `NQ_DP`, `NQ_WORLD`; a world other than 16 is refused), `nq_step.py` logs per case where the rows go, `nq_summary.py` reads the SP coverage line and prints requests per GPU. |
 | `nq_inner.sh` | One rank inside the e2e image. Sets PYTHONPATH to the overlay tree (or `env/vllm-jh-242fb49cd4` without one), FlashInfer 0.7.3.dev20261031 and the e2e pydeps, like `mk_nq.py`'s decode role but without dynamo and pinhook. Also sets the cache layout and the per-overlay extension build dir (`$NQ_BUILD`). |
 | `nq_run1.sh` | One arm process: `srun --overlap --jobid J -N4 -w <4 hosts> --ntasks-per-node=4` in image `vllm-openai-cu134-nightly-3f1bcfd82b-aarch64.sqsh`. That is the image the nq e2e configs' container key resolves to (`jh/srtslurm-jh.yaml`, `e2e/k31r/srtslurm.yaml`); the DEP configs use `internal-vr-mum-92ccd9647f` instead, which `NQ_IMG` can select. |
 | `nq_ab.sh` | One A/B point: arms in a given order on the same 4 nodes, then the summary. Rows at or below the point's production limit (`min(max-num-seqs * q, capture cap)`) and rows above it run as separate processes (`<tag>` and `<tag>-hi`), so the rows inside the limit always run under the production `max-num-seqs` and capture cap. After an arm dies at startup, its later runs with the same process tag are skipped (same point, drafter, ctx, extra args and part); other lines still run. Also skips any run that cannot finish before the block deadline (listed in `SKIPPED`). |
@@ -128,6 +130,63 @@ also gets the checkout's `tests/` and `pyproject.toml`. `SOURCE_REV` records the
 
 The shipped files are checked by md5 against the checkout. An existing tag is refused; the tree is staged under
 `.<tag>.partial` and renamed when complete.
+
+## C512 point (TP4 x DCP4 x DP4, EP16 MegaMoE)
+
+`nq-c512-xdr`'s decode role has 16 GPUs: 4 DP groups of TP4 = DCP4, with MoE expert-parallel over all 16 ranks
+(`deep_gemm_mega_moe`, mxfp8 activations), `--use-replayssm`, q4 (3 drafts), max-num-seqs 128 per DP rank and capture
+sizes 4..512. The specialized arm is the sequence-parallel decode from `wzhao/k31-c512-hybrid` (phase 1: the drafter
+and the MoE are declared stock modules, coverage lines `Kimi K3 SP decode coverage M<R>(q4)`). Stage that checkout as
+the overlay: both arms run it, so the stock arm is the same tree's stock code.
+
+Sparse MLA kernel: the config leaves `flashinfer_sparse_mla_kernel` at `auto`, which resolves to prims_ts under DCP4
+with the per-tensor fp8 cache on VR200, and the SP decode refuses that (`runtime.sp_unsupported`; it runs trtllm-gen
+only, `c512_contract.md`: no prims_ts). `cfg2bench.py` therefore sets `--kernel-config
+{"flashinfer_sparse_mla_kernel": "trtllm"}` on **both** arms for this layout (a `C512:` note in the log) and refuses an
+explicit prims_ts. The production C512 config needs the same setting before the specialized decode can serve it.
+
+GPU tests: the 4-GPU stage of `nq_gputest_inner.sh` also runs `tests/distributed/test_kimi_k3_sdec_sp_*.py` (TP4 =
+DCP4 needs 4 GPUs; the 2-GPU stage skips them) plus the torch-importing CPU tests `test_specialized_decode_sp_*.py`
+and `test_specialized_decode_coverage_preflight.py`.
+
+How DP runs in the bench (nothing to patch): `vllm bench forward` uses the external launcher, so the world is
+tp x dp = 16 ranks and each rank's DP rank is `RANK // 4` (`config/parallel.py`). Ranks 0-3 (one node) form DP rank 0,
+and so on. Every rank builds the same case: cases are per DP rank, and the context draw is seeded by `--seed` only.
+The DP sync inside `execute_model` therefore sees equal token counts on every DP rank: no DP rank idles, there is no
+dummy batch and no DP padding (a padded case would be logged as `WARNING: ... padded`). Synthetic routing builds the
+whole fixture for rows x dp and gives each DP rank its slice (`routing.py`). The SP path still calls the stock MoE
+gate, so both arms get the same routing. Because of all this:
+- `--rows`, B, max-num-seqs and the capture list are **per DP rank**, as in serving. Rank 0 logs, per case,
+  `NQ:   per DP rank: B <B>, <rows> rows (TP4 group), requests per GPU <B/4>; DP4: ... <rows x 4> rows into the EP16
+  MoE per step`.
+- The summary prints `req/GPU` = B / tp (B / 16 at TP16), and the CSV also has `tp`, `dp` and `req_per_gpu`.
+- Not measured: unequal DP batches (the SP padding-mask path) and DP ranks with no work.
+
+Rows (per DP rank; production limit min(128 x 4, 512) = 512, so every row runs in one process per arm):
+
+| rows M | 4 | 8 | 16 | 32 | 64 | 128 | 256 | 384 | 512 |
+|---|---|---|---|---|---|---|---|---|---|
+| B per DP rank | 1 | 2 | 4 | 8 | 16 | 32 | 64 | 96 | 128 |
+| requests per GPU | 0.25 | 0.5 | 1 | 2 | 4 | 8 | 16 | 24 | 32 |
+
+M512 (B = 128 per DP rank, 512 in flight in all) is the C512 operating point. M4 is the n = 1 point the hybrid plan
+lists as a stock baseline gap. The measured capture list is 15 sizes (3,6,12,16,24,32,48,64,96,128,192,256,288,384,512)
+instead of the production 128. Captured verify rows: 4,8,12,16,24,32,48,64,96,128,192,256,288,384,512. Drafter
+batches: 1,2,4,6,8,11,16,22,32,43,64,86,96,128. The capacity anchors are 512 / 128, as in production.
+
+```
+bash stage_overlay.sh <k31c512 checkout> <c512tag>
+NQ_OV=$NB/ov/<c512tag> bash $NB/tools/nq_ab.sh <jobid> h1,h2,h3,h4 $NB/results/c512-<c512tag> c512 new \
+  4,8,16,32,64,128,256,384,512 ls,stock,stock,ls agentx
+```
+
+Before the first C512 run, check:
+- **KV capacity.** The AgentX q4 vectors (from c256 in-flight contexts) at B = 128 sum to about 24M tokens. A DCP4
+  group holds a quarter of TP16's capacity, so M512 may exceed the server's capacity. `nq_step.py` then refuses at
+  startup and prints `~N fits every case`. Rerun with `NQ_MAX_KV_TOKENS=N`; both arms get the same scaled contexts.
+- **Bench-only snapshot memory.** This is the per-case state clone. At TP16 q4 it was ~158 MiB per request. At TP4 it
+  is roughly 4x that per rank (4x the KDA heads per rank), so tens of GiB at B = 128. A case that OOMs only costs
+  the larger rows, because cases run in ascending order. Check `NQ:   state snapshot` on the first run.
 
 ## Measurement matrix (3 blocks: 12 nodes x 3:30 h, 3 slots of 4 nodes)
 

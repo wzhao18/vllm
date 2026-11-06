@@ -17,7 +17,9 @@ import re
 import statistics
 
 FWD = re.compile(r"^\[forward\] q(\d+)_B(\d+)_M(\d+)_(\S+): .*median ([0-9.]+) us")
-COV = re.compile(r"Kimi K3 decode coverage M(\d+)\(q(\d+)\): (.*)$")
+# TP16: runtime/decode.py 'Kimi K3 decode coverage'; c512 (TP4 = DCP4 SP, runtime/sp_attention.py):
+# 'Kimi K3 SP decode coverage' (rows per DP rank / TP group)
+COV = re.compile(r"Kimi K3 (?:SP )?decode coverage M(\d+)\(q(\d+)\): (.*)$")
 DRAFT = {
     "markov": re.compile(r"fused \w+ Markov sampling for draft batches \(([^)]*)\)"),
     # 'Lamport DCP attention (causal|non-causal) for (rows) rows' (any annotation between)
@@ -97,6 +99,7 @@ def main():
         meta = runs[0][2]["meta"]
         q = int(meta.get("q", "0") or 0)
         k = q - 1
+        tp, dp = int(meta.get("tp") or 16), int(meta.get("dp") or 1)
         print(f"== {tag}: point {meta.get('point')} q{q} drafter {meta.get('drafter')} ctx {meta.get('ctx')} "
               f"extra {meta.get('extra') or '-'} overlay {meta.get('ov')}")
         for i, arm, r in runs:
@@ -114,7 +117,11 @@ def main():
         ls_runs = [r for _, arm, r in runs if arm == "ls"]
         cov = next((r["cov"] for r in ls_runs if r["cov"]), {})
         draft_run = next((r for r in ls_runs if r["draft"]), None)
-        print(f"   {'rows':>6} {'B':>4} {'ctx':>7} {'stock us':>19} {'ls us':>19} {'ls/st':>6}  ls coverage | drafter")
+        if dp > 1:
+            print(f"   rows / B are per DP rank (TP{tp} group); all {dp} DP ranks run the same case "
+                  f"(step MoE rows = rows x {dp}); req/GPU = B / {tp}")
+        print(f"   {'rows':>6} {'B':>4} {'req/GPU':>7} {'ctx':>7} {'stock us':>19} {'ls us':>19} {'ls/st':>6}  "
+              "ls coverage | drafter")
         worse, stock_rows, seam_rows, missing, uncovered = [], [], [], [], []
         for rows, ctx in keys:
             med = {"stock": [], "ls": []}
@@ -149,9 +156,11 @@ def main():
             if (s := seams(body)) and (seam := f"M{rows}: {' '.join(s)}") not in seam_rows:
                 seam_rows.append(seam)
             fmt = lambda v: "/".join(f"{x:.0f}" for x in v) or "-"
-            print(f"   M{rows:<5} {b or 0:>4} {ctx:>7} {fmt(med['stock']):>19} {fmt(med['ls']):>19} "
+            print(f"   M{rows:<5} {b or 0:>4} {(b or 0) / tp:>7g} {ctx:>7} {fmt(med['stock']):>19} "
+                  f"{fmt(med['ls']):>19} "
                   f"{(f'{ratio:.3f}' if ratio else '-'):>6}{flag}  {body} | {dflag}")
-            rows_out.append([tag, meta.get("point"), q, meta.get("drafter"), ctx, meta.get("extra"), rows, b,
+            rows_out.append([tag, meta.get("point"), q, tp, dp, meta.get("drafter"), ctx, meta.get("extra"), rows,
+                             b, b and b / tp,
                              st and round(st, 1), ls and round(ls, 1), ratio and round(ratio, 4), body, dflag])
         print(f"   WORSE (ls >= stock): {worse or 'none'}")
         print(f"   MISSING (requested, not measured): {missing or 'none'}")
@@ -163,7 +172,8 @@ def main():
     if a.csv:
         with open(a.csv, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["tag", "point", "q", "drafter", "ctx", "extra", "rows", "B", "stock_us", "ls_us",
+            w.writerow(["tag", "point", "q", "tp", "dp", "drafter", "ctx", "extra", "rows", "B", "req_per_gpu",
+                        "stock_us", "ls_us",
                         "ls_over_stock", "ls_coverage", "ls_drafter"])
             w.writerows(rows_out)
 
