@@ -9,14 +9,25 @@ RubinVWExpertsKernel`` width 16 above) run one TP16 MoE layer's routed experts: 
 weights x MXFP8 activations (per-token 32-element blocks, ``experts.plan_chunk``), SiTU
 (beta 4, linear beta 25), the hidden re-quantized to MXFP8 per token and 32-block
 (``experts.ExpertsKernel.store_hidden``), FC2 rows staged in BF16, the top-k weighted
-sum as an FP32 FMA chain in slot order. The stock arm is FlashInfer TRT-LLM-Gen
-``trtllm_fp4_block_scale_routed_moe`` (as ``stock_experts.StockExperts`` and the
-kern-moe bench call it) on the same weight bytes.
+sum as an FP32 FMA chain in slot order.
 
-Logical MXFP4 weights (E2M1 nibbles, E8M0 scales) are converted to the stock layer's
-TRT-LLM layout with ``convert_weight_to_mxfp4_moe_kernel_format`` (the bytes both
-kernels read in production) and ``place``d like production; the reference reads the
-logical weights:
+The weights are what production hands the specialized decode: the stock routed-experts
+layer (``FusedMoEFactory`` with Kimi K3's MoE arguments: SiTU, sigmoid grouped top-k,
+TP16 per-rank intermediate 3072 / 16 = 192 padded to 256 as ``KimiMoE`` pads it) under
+``Mxfp4Config`` (``KimiK3ForConditionalGenerationConfig`` rewrites the
+compressed-tensors ``mxfp4-pack-quantized`` checkpoint to ``mxfp4``, hence
+``Mxfp4MoEMethod``) and
+moe-backend auto, which resolves to ``FLASHINFER_TRTLLM_MXFP4_MXFP8``
+(``select_deepseek_v4_mxfp4_moe_backend``, as the production logs show). Random
+logical MXFP4 weights (E2M1 nibbles, E8M0 scales) are this rank's checkpoint slice
+(w1 / w3 [192, 3584 / 2], w2 [3584, 192 / 2]), loaded through the layer's
+``weight_loader`` per expert as the checkpoint loader does (rows 192-255 of w1 / w3 and
+columns 192-255 of w2 stay zero), converted by ``process_weights_after_loading``, then
+``place``d and handed to ``PersistentExperts`` exactly as ``runtime.decode`` does. The
+stock arm is that layer's own TRT-LLM-Gen experts (its prepare's MXFP8 input
+quantization and its ``fused_experts`` with the layer's weights and quant config; the
+routed-ids entry ``trtllm_fp4_block_scale_routed_moe`` since the production monolithic
+kernel routes from logits). The reference reads the logical (checkpoint) weights:
 
 - ``test_wide_experts_reference_band``: single launches of 72 / 128 / 256 / 512 / 768
   rows (the first rows of one 768-row set of q4 verify-like routes); the specialized
@@ -62,7 +73,14 @@ Rubin (cc 10.7) with CuTe DSL only."""
 
 import pytest
 
-H_LATENT, EXPERTS, TOPK, INTER = 3584, 896, 16, 256
+H_LATENT, EXPERTS, TOPK = 3584, 896, 16
+# Per-rank routed intermediate at TP16: the checkpoint's 3072 / 16 = 192 rows
+# (INTER_CKPT) padded with zeros to 256 (INTER, ``KimiMoE``'s
+# min_moe_intermediate_per_partition).
+MOE_INTER, TP, INTER = 3072, 16, 256
+INTER_CKPT = MOE_INTER // TP
+# The layer's name (one decoder layer index, as ``make_expert_substitution`` expects).
+PREFIX = "model.layers.1.block_sparse_moe.experts"
 BETA, LINEAR_BETA = 4.0, 25.0
 ROWS = (72, 128, 256, 512, 768)
 # The small-batch control (``test_narrow_experts_reference_band``): rows <= 64.
@@ -90,10 +108,11 @@ def require_rubin():
 
 
 def logical_weights(dev, seed=11):
-    """One TP16 layer's routed experts as loaded (before the backend's conversion):
-    w13 [E, 2I, K/2] (rows [0, I) gate w1, [I, 2I) up w3; E2M1 pairs, low nibble
-    first), s13 [E, 2I, K/32] E8M0, w2 [E, H, I/2], s2 [E, H, I/32]. Scales 2^-8..2^-4
-    keep FC1 / FC2 outputs O(1) at these K."""
+    """This TP16 rank's slice of one layer's routed experts as the compressed-tensors
+    checkpoint stores them (``mxfp4-pack-quantized``, group 32, uint8 E8M0 scales):
+    w13 [E, 2 INTER_CKPT, K/2] (rows [0, INTER_CKPT) gate w1, then up w3; E2M1 pairs,
+    low nibble first), s13 [E, 2 INTER_CKPT, K/32], w2 [E, H, INTER_CKPT/2], s2 [E, H,
+    INTER_CKPT/32]. Scales 2^-8..2^-4 keep FC1 / FC2 outputs O(1) at these K."""
     import torch
 
     gen = torch.Generator(device=dev).manual_seed(seed)
@@ -103,39 +122,120 @@ def logical_weights(dev, seed=11):
         return torch.randint(lo, hi, shape, dtype=u8, device=dev, generator=gen)
 
     return (
-        b((EXPERTS, 2 * INTER, H_LATENT // 2)),
-        b((EXPERTS, 2 * INTER, H_LATENT // 32), 119, 124),
-        b((EXPERTS, H_LATENT, INTER // 2)),
-        b((EXPERTS, H_LATENT, INTER // 32), 119, 124),
+        b((EXPERTS, 2 * INTER_CKPT, H_LATENT // 2)),
+        b((EXPERTS, 2 * INTER_CKPT, H_LATENT // 32), 119, 124),
+        b((EXPERTS, H_LATENT, INTER_CKPT // 2)),
+        b((EXPERTS, H_LATENT, INTER_CKPT // 32), 119, 124),
     )
 
 
-def kernel_weights(logical):
-    """The stock layer's FlashInfer TRT-LLM MXFP4 x MXFP8 layout (what both the stock
-    experts and ``PersistentExperts`` read in production), ``place``d on the dies as
-    ``runtime.decode`` does; returns ((w13, s13, w2, s2), dies)."""
-    from types import SimpleNamespace
+def load_checkpoint(layer, logical):
+    """Load ``logical`` into the layer's parameters through their ``weight_loader``s,
+    per expert and shard, as the model's ``load_weights`` feeds the checkpoint tensors
+    (``Mxfp4MoEMethod``'s scale loader keeps uint8 E8M0 as is): w1 / w3 land in rows
+    [0, INTER_CKPT) / [INTER, INTER + INTER_CKPT) of w13, w2 in columns [0,
+    INTER_CKPT); the padding keeps ``create_weights``' zeros."""
+    w13, s13, w2, s2 = logical
+    inter = w13.shape[1] // 2
+    shards = (("w1", slice(0, inter)), ("w3", slice(inter, 2 * inter)))
+    for e in range(EXPERTS):
+        for shard, rows in shards:
+            for name, src in (("w13_weight", w13), ("w13_weight_scale", s13)):
+                param = getattr(layer, name)
+                param.weight_loader(param, src[e, rows], f"{PREFIX}.{name}",
+                                    shard_id=shard, expert_id=e)  # fmt: skip
+        for name, src in (("w2_weight", w2), ("w2_weight_scale", s2)):
+            param = getattr(layer, name)
+            param.weight_loader(param, src[e], f"{PREFIX}.{name}", shard_id="w2",
+                                expert_id=e)  # fmt: skip
+
+
+def production_experts(logical, dev):
+    """The stock routed-experts layer production builds for one TP16 MoE layer, on one
+    GPU (tp 1 with the per-rank padded intermediate: loading the per-rank checkpoint
+    slice gives the bytes TP16 rank r gets from rows [192 r, 192 r + 192)), loaded with
+    ``logical``, processed, and its routed weights ``place``d and taken as
+    ``runtime.decode`` takes them. Returns dict(layer, config, weights=(w13, s13, w2,
+    s2), dies)."""
+    import os
+    import tempfile
 
     import torch
 
-    from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
-        Mxfp4MoeBackend,
-        convert_weight_to_mxfp4_moe_kernel_format,
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.distributed import (
+        cleanup_dist_env_and_memory,
+        init_distributed_environment,
+        initialize_model_parallel,
     )
+    from vllm.model_executor.layers.fused_moe import FusedMoEFactory
+    from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import Mxfp4MoeBackend
+    from vllm.model_executor.layers.quantization.mxfp4 import (
+        Mxfp4Config,
+        Mxfp4MoEMethod,
+    )
+    from vllm.model_executor.layers.quantization.utils import flashinfer_utils as fu
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe import (
         experts_runtime as er,
     )
 
-    w13, s13, w2, s2 = (t.clone() for t in logical)
-    w13, w2, s13, s2, _, _ = convert_weight_to_mxfp4_moe_kernel_format(
-        Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8, None, w13, w2, s13, s2,
-        _cache_permute_indices={},
-    )  # fmt: skip
-    routed = SimpleNamespace(
-        w13_weight=w13.view(torch.uint8), w2_weight=w2.view(torch.uint8)
-    )
-    dies = er.place(routed)
-    return (routed.w13_weight, s13, routed.w2_weight, s2), tuple(dies)
+    pytest.importorskip("flashinfer")
+    if not fu.has_flashinfer_situ_activation():
+        pytest.skip("FlashInfer without the SiTU activation: not the production MoE")
+    trtllm = Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8
+    config = VllmConfig()
+    config.kernel_config.moe_backend = "auto"  # production: moe-backend auto
+    fd, store = tempfile.mkstemp()
+    os.close(fd)
+    try:
+        with set_current_vllm_config(config), torch.device(dev):
+            init_distributed_environment(
+                world_size=1, rank=0, local_rank=dev.index,
+                distributed_init_method=f"file://{store}", backend="nccl",
+            )  # fmt: skip
+            initialize_model_parallel(1, 1)
+            # ``KimiMoE``'s FusedMoEFactory arguments (the gate's correction bias is
+            # FP32 [E]; the shared experts and the latent transforms do not touch the
+            # routed weights)
+            runner = FusedMoEFactory(
+                num_experts=EXPERTS, top_k=TOPK, hidden_size=H_LATENT,
+                intermediate_size=INTER, params_dtype=torch.bfloat16,
+                activation="situ", activation_situ_beta=BETA,
+                activation_situ_linear_beta=LINEAR_BETA, renormalize=True,
+                quant_config=Mxfp4Config(), use_grouped_topk=True,
+                num_expert_group=1, topk_group=1, prefix=PREFIX,
+                scoring_func="sigmoid",
+                e_score_correction_bias=torch.zeros(EXPERTS, dtype=torch.float32),
+                routed_scaling_factor=1.0, tp_size=1, dp_size=1, pcp_size=1,
+                skip_padding=True,
+            )  # fmt: skip
+            layer = runner.routed_experts
+            method = layer.quant_method
+            assert isinstance(method, Mxfp4MoEMethod), type(method)
+            assert layer.w13_weight.shape == (EXPERTS, 2 * INTER, H_LATENT // 2)
+            # ``KimiMoE``: zeroed padded weights, the unpadded per-rank size
+            layer.w13_weight.data.zero_()
+            layer.w2_weight.data.zero_()
+            layer.moe_config.intermediate_size_per_partition_unpadded = INTER_CKPT
+            load_checkpoint(layer, logical)
+            pad = (
+                layer.w13_weight[:, INTER_CKPT:INTER],
+                layer.w13_weight[:, INTER + INTER_CKPT :],
+                layer.w2_weight[..., INTER_CKPT // 2 :],
+            )
+            assert not any(bool(t.any()) for t in pad), "checkpoint padding not zero"
+            method.process_weights_after_loading(layer)
+            backend = method.mxfp4_backend
+            assert backend == trtllm, f"not the production backend: {backend}"
+            assert method.moe_kernel is not None
+            # runtime.decode: place, then the routed weights as PersistentExperts reads
+            dies = er.place(layer)
+            w13, w2 = (w.view(torch.uint8) for w in (layer.w13_weight, layer.w2_weight))
+            weights = w13, layer.w13_weight_scale, w2, layer.w2_weight_scale
+    finally:
+        cleanup_dist_env_and_memory()
+        os.unlink(store)
+    return dict(layer=layer, config=config, weights=weights, dies=tuple(dies))
 
 
 def verify_routes(rows, dev, seed=1007, q=4):
@@ -211,14 +311,15 @@ def situ(gate, up):
 
 def reference(logical, latent, topk_w, ids, gate_scale=1.0, swap=False):
     """Per-token FP64 routed partial [M, 3584]: MXFP8 x (kernel rule), dequantized
-    MXFP4 w13 / w2, SiTU, the hidden MXFP8 per token (kernel rule), the top-k sum with
+    MXFP4 w13 / w2 (the checkpoint slice: intermediate INTER_CKPT, no padding), SiTU,
+    the hidden MXFP8 per token (kernel rule), the top-k sum with
     the BF16 routing weights; no BF16 staging. ``gate_scale`` / ``swap`` (contract
     probes only, ``contract_probe``): the gate pre-activation scaled, gate and up
     exchanged."""
     import torch
 
     w13, s13, w2, s2 = logical
-    rows = latent.shape[0]
+    rows, inter = latent.shape[0], w13.shape[1] // 2
     x = mxfp8_kernel_rule(latent.float())
     out = torch.zeros(rows, H_LATENT, dtype=torch.float64, device=latent.device)
     flat = ids.flatten().long()
@@ -228,7 +329,7 @@ def reference(logical, latent, topk_w, ids, gate_scale=1.0, swap=False):
         pick = (flat == e).nonzero().flatten()
         tokens = token[pick]
         a = x[tokens] @ dequant_mxfp4(w13[e], s13[e]).T  # [n, 2I]
-        gate, up = a[:, :INTER], a[:, INTER:]
+        gate, up = a[:, :inter], a[:, inter:]
         if swap:
             gate, up = up, gate
         h = situ(gate_scale * gate, up).float()  # FP32 into the quantizer
@@ -244,14 +345,14 @@ def reference_slots(logical, latent, ids):
     import torch
 
     w13, s13, w2, s2 = logical
-    rows = latent.shape[0]
+    rows, inter = latent.shape[0], w13.shape[1] // 2
     x = mxfp8_kernel_rule(latent.float())
     out = torch.zeros(rows * TOPK, H_LATENT, dtype=torch.float64, device=latent.device)
     flat = ids.flatten().long()
     for e in torch.unique(flat).tolist():
         pick = (flat == e).nonzero().flatten()
         a = x[pick // TOPK] @ dequant_mxfp4(w13[e], s13[e]).T
-        h = situ(a[:, :INTER], a[:, INTER:]).float()
+        h = situ(a[:, :inter], a[:, inter:]).float()
         out.index_copy_(0, pick, mxfp8_kernel_rule(h) @ dequant_mxfp4(w2[e], s2[e]).T)
     return out.view(rows, TOPK, H_LATENT)
 
@@ -365,52 +466,51 @@ def finalize(slots, topk_w):
 
 
 class Stock:
-    """FlashInfer TRT-LLM-Gen MXFP4 x MXFP8 routed experts with SiTU, finalized (the
-    kern-moe bench's ``StockExpertsFI.routed``; MXFP8 input via
-    ``mxfp8_e4m3_quantize``); no autotune."""
+    """The production stock routed experts of ``layer`` (``production_experts``): its
+    ``Mxfp4MoEMethod`` kernel's prepare (MXFP8 input, linear UE8M0 scales) and its
+    TRT-LLM-Gen ``fused_experts`` on the layer's weights and quant config (SiTU alpha /
+    beta, scales, padded intermediate), finalized. The production kernel is monolithic
+    (it routes from router logits); the test's routes go through the routed-ids entry
+    of the same experts (``TrtLlmMxfp4ExpertsModular._invoke_kernel`` on the monolithic
+    experts object: ``trtllm_fp4_block_scale_routed_moe``). A modular kernel runs the
+    method's own ``apply``."""
 
-    def __init__(self, weights, dev):
-        import torch
+    def __init__(self, layer, config):
+        from vllm.model_executor.layers.fused_moe.experts.trtllm_mxfp4_moe import (
+            TrtLlmMxfp4ExpertsModular,
+        )
 
-        from vllm.model_executor.layers.quantization.utils import flashinfer_utils as fu
-
-        pytest.importorskip("flashinfer")
-        if not fu.has_flashinfer_situ_activation():
-            pytest.skip("FlashInfer without the SiTU activation: no stock arm")
-        from vllm.model_executor.layers.fused_moe.activation import MoEActivation
-
-        self.w13, s13, self.w2, s2 = weights
-        self.s13, self.s2 = (s.view(torch.float8_e4m3fn) for s in (s13, s2))
-        self.act = fu.activation_to_flashinfer_int(MoEActivation.SITU)
-        f32 = dict(dtype=torch.float32, device=dev)
-        self.alpha = torch.full((EXPERTS,), BETA, **f32)
-        self.beta = torch.full((EXPERTS,), LINEAR_BETA, **f32)
-        self.dev = dev
+        self.layer, self.config = layer, config
+        self.kernel = layer.quant_method.moe_kernel
+        self.invoke = TrtLlmMxfp4ExpertsModular._invoke_kernel
 
     def __call__(self, latent, topk_w, ids):
         import torch
-        from flashinfer import trtllm_fp4_block_scale_routed_moe
 
-        from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
-            mxfp8_e4m3_quantize,
-        )
+        from vllm.config import set_current_vllm_config
 
-        x, s = mxfp8_e4m3_quantize(latent)
-        out = torch.empty(latent.shape[0], H_LATENT, dtype=torch.bfloat16,
-                          device=self.dev)  # fmt: skip
-        trtllm_fp4_block_scale_routed_moe(
-            topk_ids=(ids, topk_w), routing_bias=None, hidden_states=x,
-            hidden_states_scale=s.view(torch.float8_e4m3fn), n_group=None,
-            topk_group=None, routed_scaling_factor=None, routing_method_type=1,
-            do_finalize=True, enable_pdl=True, output=out,
-            gemm1_weights=self.w13, gemm1_weights_scale=self.s13, gemm1_bias=None,
-            gemm1_alpha=self.alpha, gemm1_beta=self.beta, gemm1_clamp_limit=None,
-            gemm2_weights=self.w2, gemm2_weights_scale=self.s2, gemm2_bias=None,
-            output1_scale_scalar=None, output1_scale_gate_scalar=None,
-            output2_scale_scalar=None, num_experts=EXPERTS, top_k=TOPK,
-            intermediate_size=INTER, local_expert_offset=0, local_num_experts=EXPERTS,
-            activation_type=self.act, tune_max_num_tokens=8192,
-        )  # fmt: skip
+        layer, kernel = self.layer, self.kernel
+        ids = ids.to(torch.int32)
+        with set_current_vllm_config(self.config):
+            if not kernel.is_monolithic:
+                out = layer.quant_method.apply(layer, latent, topk_w, ids, None, None)
+                torch.cuda.synchronize()
+                return out
+            experts = kernel.fused_experts
+            x, scale, _ = kernel.prepare_finalize.prepare(
+                latent, router_logits=None, quant_config=experts.quant_config,
+                defer_input_quant=experts.expects_unquantized_inputs,
+            )  # fmt: skip
+            if scale is not None:
+                scale = scale.view(torch.float8_e4m3fn)
+            out = torch.empty(latent.shape[0], experts.hidden_dim_unpadded,
+                              dtype=torch.bfloat16, device=latent.device)  # fmt: skip
+            local = layer.local_num_experts
+            self.invoke(
+                experts, out, x, scale, ids, topk_w, layer.w13_weight,
+                layer.w2_weight, layer.activation, layer.global_num_experts, local,
+                experts.ep_rank * local, TOPK,
+            )  # fmt: skip
         torch.cuda.synchronize()
         return out
 
@@ -644,11 +744,11 @@ def case():
     torch.accelerator.set_device_index(dev)
     torch.backends.cuda.matmul.allow_tf32 = False
     logical = logical_weights(dev)
-    weights, dies = kernel_weights(logical)
+    built = production_experts(logical, dev)
     ids, topk_w, latent = verify_routes(FULL, dev)
     ref = reference(logical, latent, topk_w, ids)
-    return dict(dev=dev, weights=weights, dies=dies, inputs=(latent, topk_w, ids),
-                ref=ref, logical=logical, cache={})  # fmt: skip
+    return dict(dev=dev, inputs=(latent, topk_w, ids), ref=ref, logical=logical,
+                cache={}, **built)  # fmt: skip
 
 
 def stock_out(case, rows):
@@ -656,7 +756,7 @@ def stock_out(case, rows):
     key = ("stock", rows)
     if key not in case["cache"]:
         if "stock_arm" not in case["cache"]:
-            case["cache"]["stock_arm"] = Stock(case["weights"], case["dev"])
+            case["cache"]["stock_arm"] = Stock(case["layer"], case["config"])
         stock = case["cache"]["stock_arm"]
         latent, topk_w, ids = (t[:rows].contiguous() for t in case["inputs"])
         case["cache"][key] = stock(latent, topk_w, ids)
