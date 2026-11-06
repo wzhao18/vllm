@@ -16,8 +16,8 @@ from vllm.config import CompilationMode, CUDAGraphMode
 from vllm.models.kimi_k3.nvidia.specialized_decode import runtime
 from vllm.models.kimi_k3.nvidia.specialized_decode.runtime import (
     DecodeConfig,
-    specialized_decode_config,
     sp_topology,
+    specialized_decode_config,
     unsupported,
 )
 from vllm.models.kimi_k3.nvidia.specialized_decode.shapes import (
@@ -27,6 +27,7 @@ from vllm.models.kimi_k3.nvidia.specialized_decode.shapes import (
     Coverage,
     Path,
     Shape,
+    Uncovered,
     Unsupported,
     shard_rows,
 )
@@ -241,8 +242,8 @@ def test_sp_refuses_without_dsa_or_speculation():
 
 
 def test_sp_refuses_auto_prims_ts(monkeypatch):
-    """"auto" resolving to prims_ts (under DCP where it runs) is refused: the SP DSA
-    core runs trtllm-gen, so stock must too."""
+    """The "auto" kernel resolving to prims_ts (under DCP where it runs) is refused:
+    the SP DSA core runs trtllm-gen, so stock must too."""
     from vllm.v1.attention.backends.mla import flashinfer_mla_sparse
 
     monkeypatch.setattr(flashinfer_mla_sparse, "use_prims_ts", lambda c, d: True)
@@ -359,19 +360,29 @@ def test_declare_keeps_a_stock_shape():
     assert coverage.plan[4] is None
 
 
-@pytest.fixture
-def lm_head_rank(monkeypatch):
-    """A Rubin TP4 rank without a sharded LM head (rank 0)."""
+def tp_group(monkeypatch, world_size):
+    """Rank 0 of a ``world_size`` TP group (``vllm.distributed.get_tp_group``)."""
     import vllm.distributed
 
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (10, 7))
     monkeypatch.setattr(
         vllm.distributed,
         "get_tp_group",
-        lambda: SimpleNamespace(world_size=4, rank_in_group=0, device_group=None),
+        lambda: SimpleNamespace(
+            world_size=world_size, rank_in_group=0, device_group=None
+        ),
     )
-    processor = SimpleNamespace()
+
+
+@pytest.fixture
+def lm_head_rank(monkeypatch):
+    """A Rubin TP4 rank without a sharded LM head (rank 0) behind a plain logits
+    processor (LogitsProcessor's defaults: no scale, soft cap or head dtype)."""
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (10, 7))
+    tp_group(monkeypatch, 4)
+    processor = SimpleNamespace(
+        scale=1.0, soft_cap=None, logits_as_input=False, head_dtype=None
+    )
     return SimpleNamespace(lm_head=SimpleNamespace(), logits_processor=processor)
 
 
@@ -384,18 +395,28 @@ def test_verify_declared_stock_under_synthetic(lm_head_rank):
     assert VerifyArgmax.build(deployment(), lm_head_rank) is None
 
 
-def test_verify_raises_when_not_covered_under_sp(lm_head_rank):
-    """Real rejection under SP: an uncovered build raises (TP16 keeps returning None
-    there, the stock sampler)."""
+def test_verify_raises_when_not_covered_under_sp(lm_head_rank, monkeypatch):
+    """Real rejection under SP: an uncovered build raises ``Unsupported``. TP16 = DCP16
+    with speculation (the NQ-NOFALLBACK target) refuses it (``Uncovered``); other
+    topologies keep the stock sampler (None)."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.verify import (
         VerifyArgmax,
     )
 
     config = deployment(**{"speculative_config.rejection_sample_method": "standard"})
-    with pytest.raises(Unsupported, match="verify at every shape: TP4"):
+    with pytest.raises(
+        Unsupported, match="verify at every shape: an LM head without vocabulary"
+    ):
         VerifyArgmax.build(config, lm_head_rank)
-    config = tp16(**{"speculative_config.rejection_sample_method": "standard"})
+    config = deployment(
+        tp=8, dcp=8, dp=1, **{"speculative_config.rejection_sample_method": "standard"}
+    )
+    tp_group(monkeypatch, 8)
     assert VerifyArgmax.build(config, lm_head_rank) is None
+    config = tp16(**{"speculative_config.rejection_sample_method": "standard"})
+    tp_group(monkeypatch, 16)
+    with pytest.raises(Uncovered, match="an LM head without vocabulary shards"):
+        VerifyArgmax.build(config, lm_head_rank)
 
 
 def test_verify_raises_off_rubin_under_sp(lm_head_rank, monkeypatch):
@@ -410,7 +431,10 @@ def test_verify_raises_off_rubin_under_sp(lm_head_rank, monkeypatch):
     assert VerifyArgmax.build(tp16(), lm_head_rank) is None
 
 
-def test_sampled_verify_fp64_gumbel_raises_under_sp():
+def test_sampled_verify_fp64_gumbel_raises_under_sp(monkeypatch):
+    """FP64 Gumbel draws: under SP ``Unsupported`` (before the TP group is read); at
+    TP16 = DCP16 with speculation refused (``Uncovered``); elsewhere the stock
+    sampler (None)."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.sampled_verify import (
         SampledVerify,
     )
@@ -418,5 +442,10 @@ def test_sampled_verify_fp64_gumbel_raises_under_sp():
     config = deployment(**{"model_config.use_fp64_gumbel": True})
     with pytest.raises(Unsupported, match="fp64 Gumbel"):
         SampledVerify.build(config, None)
-    config = tp16(**{"model_config.use_fp64_gumbel": True})
+    config = deployment(tp=8, dcp=8, dp=1, **{"model_config.use_fp64_gumbel": True})
+    tp_group(monkeypatch, 8)
     assert SampledVerify.build(config, None) is None
+    config = tp16(**{"model_config.use_fp64_gumbel": True})
+    tp_group(monkeypatch, 16)
+    with pytest.raises(Uncovered, match="FP64 Gumbel"):
+        SampledVerify.build(config, None)
