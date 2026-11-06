@@ -1056,13 +1056,16 @@ def _check_rope_part(where, ours, theirs, ours_pe, k_scale):
     only, in every variant; its kernel effect alone, ours rows on stock's inputs:
     LSE 3.8e-6, the size of one code step on one key). So against stock: each code
     within one BF16 step of our k_pe, and few of them different."""
-    want = (ours_pe.float() / k_scale).to(torch.float8_e4m3fn).view(torch.uint8)
+
+    def e4m3(values):  # both writers convert RN with saturation (cvt satfinite)
+        return values.clamp(-448, 448).to(torch.float8_e4m3fn).view(torch.uint8)
+
+    want = e4m3(ours_pe.float() / k_scale)
     assert torch.equal(ours, want), f"{where}: rope part vs our k_pe"
     bits = ours_pe.view(torch.int16)
     reach = torch.zeros_like(theirs, dtype=torch.bool)
     for step in (-1, 0, 1):  # (a magnitude step either way, same sign)
-        near = (bits + step).view(torch.bfloat16).float() / k_scale
-        reach |= near.to(torch.float8_e4m3fn).view(torch.uint8) == theirs
+        reach |= e4m3((bits + step).view(torch.bfloat16).float() / k_scale) == theirs
     differ = int((ours != theirs).sum())
     if differ:
         print(f"{where} rope part: {differ} of {ours.numel()} codes one BF16 step off")
