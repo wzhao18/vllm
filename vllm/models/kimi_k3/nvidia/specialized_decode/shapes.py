@@ -7,6 +7,12 @@ speculation) and captures one FULL decode graph per token-row count M (``Shape``
 Each kernel family decides per shape whether it runs a tuned kernel, a generic one,
 or a stock seam (``Choice``); the coverage plan records those decisions for every
 captured shape, and a shape that some family cannot run stays on the stock forward.
+
+Under sequence parallelism (``Context.sequence_parallel``: C512's TP4 = DCP4 decode
+role) nothing stays stock silently: every captured shape is specialized, a family that
+cannot serve a shape raises ``Unsupported`` at build, and the stock modules the design
+keeps (embedding, AttnRes, MegaMoE, ...) are ``Path.DECLARED`` choices from
+``DECLARED_STOCK`` (``Coverage.assert_complete``).
 """
 
 from collections.abc import Iterable
@@ -39,6 +45,7 @@ class Path(Enum):
     TUNED = "tuned"  # a measured table row
     GENERIC = "generic"  # a specialized kernel, correct for the shape, untuned
     STOCK = "stock"  # the family's stock seam inside the specialized graph
+    DECLARED = "declared"  # a stock module the SP design keeps (not a fallback)
 
 
 @dataclass(frozen=True)
@@ -67,6 +74,32 @@ class Context:
     max_rows: int  # the largest captured decode graph: capacity above TUNED_ROWS
     max_context: int
     bf16_state: bool
+    # Sequence parallelism (C512): the DP size, the expert-parallel ranks (TP x DP)
+    # and the attention heads per TP rank (24 at C512; 0 = not set).
+    dp: int = 1
+    ep: int = 1
+    sequence_parallel: bool = False
+    heads_per_rank: int = 0
+
+
+class Unsupported(ValueError):
+    """A family cannot serve a captured shape of the SP decode: raised at build (never
+    a fallback to stock), naming the family, the shape and the cause."""
+
+    def __init__(self, family: str, shape: "Shape | int | None", cause: str):
+        self.family, self.shape, self.cause = family, shape, cause
+        where = "every shape" if shape is None else str(shape)
+        super().__init__(f"Kimi K3 SP decode: {family} at {where}: {cause}")
+
+
+def shard_rows(shape: Shape, ctx: Context) -> int:
+    """Rows of one rank's SP shard of ``shape`` (rank r owns global rows [r n, (r+1)
+    n), ``sp_shard`` order): the captured rows are whole multiples of the TP size."""
+    if ctx.tp <= 0 or shape.rows % ctx.tp:
+        raise Unsupported(
+            "sp_shard", shape, f"{shape.rows} rows do not split over TP{ctx.tp}"
+        )
+    return shape.rows // ctx.tp
 
 
 _MISSING = object()
@@ -97,6 +130,25 @@ def captured_rows(capture_sizes: Iterable[int], q: int, limit: int) -> tuple[int
     return tuple(sorted(m for m in rows if m <= limit))
 
 
+# Families the SP decode keeps as the stock module (``Path.DECLARED``): embedding,
+# AttnRes, the MegaMoE / dense MLPs on the shard, the final row all-gather, the LM
+# head, the sampler, verification under synthetic rejection and the DSpark drafter
+# (phase 1).
+DECLARED_STOCK = frozenset(
+    {
+        "embed",
+        "attn_res",
+        "moe",
+        "dense",
+        "final_gather",
+        "lm_head",
+        "sampler",
+        "verify",
+        "drafter",
+    }
+)
+
+
 class Coverage:
     """Per captured shape, each family's ``Choice`` (``None`` for the whole shape: the
     step runs the stock forward, with the reason)."""
@@ -111,6 +163,43 @@ class Coverage:
 
     def stock(self, rows: int, reason: str) -> None:
         self.plan[rows], self.reasons[rows] = None, reason
+
+    def declare(self, rows: int, family: str, note: str) -> None:
+        """``family`` runs its stock module at ``rows`` by design (a ``Path.DECLARED``
+        choice). A shape planned stock as a whole (``stock``) stays so:
+        ``assert_complete`` reports it."""
+        choices = self.plan.setdefault(rows, {})
+        if choices is not None:
+            choices[family] = Choice(Path.DECLARED, note=note)
+
+    def assert_complete(
+        self, captured: Iterable[int], declared: frozenset[str] = DECLARED_STOCK
+    ) -> None:
+        """Raises unless every captured shape is specialized: no shape missing or
+        planned stock as a whole, no family on ``Path.STOCK``, and every
+        ``Path.DECLARED`` family one of ``declared``."""
+        problems = []
+        for rows in sorted(set(captured)):
+            shape = Shape(rows, self.q)
+            if rows not in self.plan:
+                problems.append(f"{shape}: not planned")
+                continue
+            choices = self.plan[rows]
+            if choices is None:
+                problems.append(f"{shape}: stock ({self.reasons.get(rows, '?')})")
+                continue
+            if not choices:
+                problems.append(f"{shape}: no family planned")
+            for name, choice in choices.items():
+                if choice.path is Path.STOCK:
+                    problems.append(f"{shape}: {name}={choice}")
+                elif choice.path is Path.DECLARED and name not in declared:
+                    problems.append(f"{shape}: {name}={choice} is not a declared stock")
+        if problems:
+            raise RuntimeError(
+                "Kimi K3 SP decode: captured shapes not fully specialized:\n  "
+                + "\n  ".join(problems)
+            )
 
     def lines(self) -> list[str]:
         out = []

@@ -346,11 +346,16 @@ class PreparedKda:
 STOCK_ROWS: dict = {"*": ""}
 
 
-def verify_kernel(requests, tokens, capability, bf16_state=False, gate_mode=0):
+def verify_kernel(
+    requests, tokens, capability, bf16_state=False, gate_mode=0, heads=None
+):
     """The plain (not prepared) verify kernel ``executable`` builds for ``requests`` x
     ``tokens`` (coverage notes): "wide", "halves", "stream3" (``wide_kind``: by the
-    state dtype) or "kdasplit". ``gate_mode`` as the KDA policies (TP8 verify: 1)."""
-    heads = 12 if gate_mode else 6
+    state dtype) or "kdasplit". ``gate_mode`` as the KDA policies (TP8 verify: 1);
+    ``heads`` per rank (default: TP8's 12 with gate mode 1, else TP16's 6; the SP
+    decode passes its 24)."""
+    if heads is None:
+        heads = 12 if gate_mode else 6
     return WIDE_NAMES[
         wide_kind(requests, tokens, capability, bf16_state, gate_mode, heads)
     ]

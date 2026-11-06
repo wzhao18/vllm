@@ -60,7 +60,18 @@ from .qvalid import off_sentinel, push_words
 KP = 1536 + 32  # padded Q_B / x row (elements): 3136 B, conflict-free 16 B fragments
 # The smallest batch on the tiled kernel (per head count):
 # its 16-request tiles beat FP32 FMAs from B4 at 12 heads and from B6 at 6 heads.
-TILED_FROM = {12: 4, 6: 6}
+# 24 heads (K3.1 DSA under sequence parallelism, C512: TP4 = DCP4, dsa.sp): the
+# tiled kernel from B4, the 12-head crossover; its rows R = 4 n (n requests per DP
+# group, q 4) are all tiled. NQ-TUNE: the lean / tiled crossover at 24 heads (the
+# SP step never runs fewer than 4 rows).
+TILED_FROM = {12: 4, 6: 6, 24: 4}
+# Head counts whose gathered-q poll (``gather``, under DCP) is refused: one row tile
+# of 24 heads is 24 clusters of 8 CTAs, more than Rubin holds at once (22 at the DSA
+# query's shared memory, ``dsa.wide.check_query_residency``), so a whole-grid or
+# tile poll could deadlock across ranks. Those layers publish only and poll with
+# QueryWait (``dsa.overlap``: the fork / front / wait modes), whose CTAs wait on
+# nothing that waits on them (dsa.sp).
+UNGATHERED_HEADS = frozenset({24})
 # The DSpark drafter's MLA layers (``rope``): the lean tile from one row
 # (MlaQuery(rope=True) needs the lean kernel). kimi-k3-dspark (64 heads): 4 per rank at
 # TP16, 8 at TP8; kimi-k3.1-pro-dspark-preview (96 heads): 6 at TP16, 12 at TP8 (the
@@ -258,6 +269,10 @@ class MlaQuery:
         # ``gather`` False: the core polls the gathered q rows it reads (Rubin DcpCore),
         # so the query kernel ends after its publish (and KV insert).
         self.gather = gather
+        assert not (dcp and gather and heads in UNGATHERED_HEADS), (
+            f"MlaQuery at {heads} heads under DCP publishes only (gather=False: "
+            "QueryWait polls); its gathered-q poll cannot be co-resident"
+        )
         # Rubin-class devices (more SMs than GB300's 152): the tiled kernel stages its
         # Q_B rows in shared memory before the PDL wait (bulk copies; L2 prefetches can
         # be dropped while the input projection streams) and, under DCP, runs the KV

@@ -9,6 +9,11 @@ sampler kernels. Up to 8 rows (B1) take the fused LM-head argmax instead, and 10
 rows the shard GEMM with evict-first weight loads (cutedsl.verify.lmhead; FP32
 accumulation orders stated there). Above 64 rows the stock shard GEMM feeds the argmax
 kernel in launches of ``argmax.MAX_ROWS`` rows: one per verify step.
+
+Under sequence parallelism (C512's TP4 = DCP4 decode role, ``runtime.sp_topology``)
+synthetic rejection keeps the stock sampler, a declared stock module (``verify`` in
+``shapes.DECLARED_STOCK``); otherwise the build either covers TP4 at every row count or
+raises ``shapes.Unsupported`` naming the cause: never the silent stock path.
 """
 
 import torch
@@ -22,6 +27,16 @@ logger = init_logger(__name__)
 # Tensor-parallel sizes served by the vocabulary-sharded argmax on Rubin (compute
 # capability 10.7). GB300 keeps the gathered logits.
 FAST_ARGMAX_TP = (4, 8, 16)
+
+
+def _uncovered(sp: bool, cause: str):
+    """The uncovered build: None (the stock sampler) without sequence parallelism;
+    under it a raise (``verify`` is declared stock only under synthetic rejection)."""
+    if not sp:
+        return None
+    from ..shapes import Unsupported
+
+    raise Unsupported("verify", None, cause)
 
 
 class VerifyArgmax:
@@ -39,12 +54,23 @@ class VerifyArgmax:
     @classmethod
     def build(cls, vllm_config, model):
         """None unless this deployment speculates and this device and TP size are
-        covered. ``model``: the KimiLinearForCausalLM (weights loaded)."""
+        covered. ``model``: the KimiLinearForCausalLM (weights loaded). Under
+        sequence parallelism: None (declared stock) with synthetic rejection, else
+        the argmax or ``shapes.Unsupported``."""
         if vllm_config.speculative_config is None:
+            return None
+        from . import sp_topology
+
+        sp = sp_topology(vllm_config)
+        method = vllm_config.speculative_config.rejection_sample_method
+        if sp and method == "synthetic":
+            logger.info_once(
+                "Kimi K3 SP decode: verify: declared stock (synthetic rejection)"
+            )
             return None
         device = torch.device(torch.cuda.current_device())
         if torch.cuda.get_device_capability(device) != (10, 7):
-            return None
+            return _uncovered(sp, "this GPU (Rubin SM107 only)")
         from vllm.distributed import get_tp_group
 
         group = get_tp_group()
@@ -62,14 +88,24 @@ class VerifyArgmax:
             or vllm_config.model_config.dtype != torch.bfloat16
             or shard.num_added_elements != 0
         ):
-            return None
+            return _uncovered(
+                sp,
+                f"TP{tp} or the LM head / logits processor (a padded, extended or "
+                "unsharded vocabulary, a logits scale or soft cap, logits as input, "
+                "a non-BF16 head)",
+            )
         vocab_rank = shard.org_vocab_end_index - shard.org_vocab_start_index
         if (
             vocab_rank % (THREADS * VECTOR)
             or shard.org_vocab_start_index != rank * vocab_rank
             or processor.org_vocab_size != tp * vocab_rank
         ):
-            return None
+            return _uncovered(
+                sp,
+                f"the vocabulary shard ({vocab_rank} columns per rank at rank {rank}, "
+                f"vocabulary {processor.org_vocab_size}): not {THREADS * VECTOR}-"
+                "aligned contiguous rank-order shards",
+            )
         from vllm.model_executor.layers.vocab_parallel_embedding import (
             UnquantizedEmbeddingMethod,
         )

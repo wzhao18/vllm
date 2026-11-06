@@ -26,6 +26,11 @@ import os
 import threading
 
 import torch
+import torch.distributed as dist
+
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 _DISABLE_MULTICAST = "TORCH_SYMM_MEM_DISABLE_MULTICAST"
 _LOCK = threading.Lock()
@@ -44,3 +49,33 @@ def peer_rendezvous(tensor: torch.Tensor, group):
             return symm_mem.rendezvous(tensor, group)
         finally:
             os.environ[_DISABLE_MULTICAST] = "0" if previous is None else previous
+
+
+def _process_group(group) -> dist.ProcessGroup:
+    if isinstance(group, str):
+        from torch.distributed.distributed_c10d import _resolve_process_group
+
+        return _resolve_process_group(group)
+    return group
+
+
+def multicast_rendezvous(tensor: torch.Tensor, group, what: str):
+    """``(handle, multicast address)`` of ``symm_mem.rendezvous(tensor, group)``, the
+    address 0 on every rank of ``group`` when the multicast binding failed on any
+    of them (torch then skips it on that rank only), so every rank takes the same
+    path. Collective over ``group``. Callers that cannot run without multicast (the
+    SP all-gather, ``cutedsl.common.sp_comm``) raise on 0; none falls back."""
+    import torch.distributed._symmetric_memory as symm_mem
+
+    handle = symm_mem.rendezvous(tensor, group)
+    mc = int(handle.multicast_ptr or 0)
+    flag = torch.tensor([1 if mc else 0], dtype=torch.int32, device=tensor.device)
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=_process_group(group))
+    if not flag.item():
+        logger.warning_once(
+            "%s: no NVLink multicast object on some rank of its group (the rack's "
+            "multicast pool is exhausted or the platform has none).",
+            what,
+        )
+        return handle, 0
+    return handle, mc

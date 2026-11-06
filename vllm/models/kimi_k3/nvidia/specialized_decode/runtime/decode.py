@@ -57,7 +57,7 @@ from ..cutedsl.moe.tail_rows import PreparedTailRows
 from ..cutedsl.moe.tail_runtime import MoeTailBox, PreparedTail
 from ..cutedsl.oproj.prepared import OprojMailbox
 from ..cutedsl.oproj.prepared import choose as oproj_choose
-from ..shapes import Choice, Context, Coverage, Path, Shape, rows_policy
+from ..shapes import Choice, Context, Coverage, Path, Shape, Unsupported, rows_policy
 from .prefetch import BEFORE_HEAD, BEFORE_TMEM_MLA, PrefetchController
 from .providers import (
     BATCHES,
@@ -191,10 +191,19 @@ def caches_of(attention):
 
 class SpecializedDecode:
     """Built once the weights are loaded; owns every prepared provider, the
-    mailboxes and the decode buffers. Reads the backbone, never modifies it."""
+    mailboxes and the decode buffers. Reads the backbone, never modifies it.
+
+    Under sequence parallelism (``config.sequence_parallel``: C512's TP4 = DCP4
+    decode role) it builds only ``sp_attention.SpStep`` and delegates every hook to
+    it; none of the TP8 / TP16 providers below is built."""
+
+    sp = None  # the SP step (sp_attention.SpStep) under sequence parallelism
 
     def __init__(self, backbone, config):
         self.backbone, self.buffers = backbone, {}
+        if config.sequence_parallel:
+            self.init_sequence_parallel(config)
+            return
         q = config.q
         # Verify steps decode q tokens per request at M = requests * q tokens; FULL
         # verify graphs round each capture size up to whole requests.
@@ -338,10 +347,56 @@ class SpecializedDecode:
         self.prefix = empty((rows, 7168))
         self.blocks = empty((rows, backbone.num_attn_res_blocks, 7168))
 
+    def init_sequence_parallel(self, config):
+        """The SP decode (``sp_attention``): the deployment facts, then the SP step,
+        which builds its blocks and checks that every captured R is covered."""
+        from .sp_attention import SpStep
+
+        group = get_tp_group()
+        self.tp, self.rank = group.world_size, group.rank_in_group
+        self.group = group.device_group
+        self.device = torch.device(current_platform.current_device())
+        properties = torch.cuda.get_device_properties(self.device)
+        cc = (properties.major, properties.minor)
+        self.q, self.dcp = config.q, config.dcp
+        self.queries = (config.q,)
+        self.captured = config.captured
+        # (no tuned / wide TP8 / TP16 batches, step switch or MLA rows here)
+        self.tuned, self.wide, self.wide_off = (), (), None
+        self.batches = tuple(sorted(set(config.captured)))
+        self.switched, self.switch = {}, None
+        self.max_context, self.bf16_state = config.max_context, config.bf16_state
+        backbone = self.backbone
+        layers = backbone.layers[backbone.start_layer : backbone.end_layer]
+        self.layers = tuple(layers)
+        self.aux_layers = tuple(backbone.aux_hidden_state_layers)
+        heads = backbone.config.num_attention_heads
+        if heads % self.tp:
+            raise Unsupported("sp_step", None, f"{heads} heads over TP{self.tp}")
+        self.context = Context(
+            arch="rubin" if cc == (10, 7) else "gb300",
+            tp=self.tp,
+            rank=self.rank,
+            dcp=self.dcp,
+            sms=properties.multi_processor_count,
+            q=config.q,
+            max_rows=max(self.batches, default=0),
+            max_context=config.max_context,
+            bf16_state=config.bf16_state,
+            dp=config.dp,
+            ep=config.ep,
+            sequence_parallel=True,
+            heads_per_rank=heads // self.tp,
+        )
+        self.sp = SpStep(self)
+        self.coverage = self.sp.coverage()
+
     def build_providers(self):
         """Every layer's attention and feed-forward providers, the model's mailboxes
         and the prefetch side stream. All collective allocations, weight packing and
         kernel compiles finish here, before KV binding and CUDA graph capture."""
+        if self.context.sequence_parallel:  # (expert parallel: no TP-reduce providers)
+            raise RuntimeError("Kimi K3 SP decode: TP providers built under SP")
         config, layers = self.backbone.config, self.layers
         beta = config.activation_situ_beta
         linear_beta = config.activation_situ_linear_beta
@@ -478,6 +533,9 @@ class SpecializedDecode:
     def prepare_kv(self):
         """Compile each layer's cores for its bound KV cache layout (the profiling
         cache, then the real one)."""
+        if self.sp is not None:
+            self.sp.prepare_kv()
+            return
         for layer in self.layers:
             caches = caches_of(layer.self_attn)
             self.attention[layer.layer_idx].prepare_layout(caches)
@@ -615,6 +673,8 @@ class SpecializedDecode:
         return choices
 
     def embed_input_ids(self, ids):
+        if self.sp is not None:  # the stock embedding (declared)
+            return self.backbone.embed_input_ids(ids)
         rows = ids.shape[0] if ids.ndim == 1 and ids.is_contiguous() else 0
         if not 1 <= rows <= PREPARED_MAX:
             return self.backbone.embed_input_ids(ids)
@@ -637,6 +697,8 @@ class SpecializedDecode:
         Every predicate is the same on all TP ranks: the mailboxes of the specialized
         decode need every rank to take the same path.
         """
+        if self.sp is not None:  # raises for a FULL capture it cannot serve
+            return self.sp.plan(positions, intermediate_tensors)
         b = positions.shape[0]
         if intermediate_tensors is not None or b not in self.batches:
             return None
@@ -662,6 +724,8 @@ class SpecializedDecode:
         ``switched`` (captured steps only) capture the step twice under an IF/ELSE
         node: body 0 with the custom MLA cores while every request's local length is
         within the bound, body 1 with the long-context cores (mla.prepared.SWITCH)."""
+        if self.sp is not None:
+            return self.sp.run(step, input_ids, inputs_embeds)
         x = inputs_embeds if inputs_embeds is not None else input_ids
         bound = self.switched.get(x.shape[0]) if step.q == 1 else None
         if bound is None or not torch.cuda.is_current_stream_capturing():
@@ -818,6 +882,15 @@ class SpecializedDecode:
         self.prefetch.join()
         self.kda_side.join()
         return (out, aux_out) if aux_out else out
+
+    def process_weights_after_loading(self):
+        """After a weight reload: the SP blocks re-derive their weight copies (the
+        TP8 / TP16 providers have no reload hook)."""
+        if self.sp is None:
+            raise NotImplementedError(
+                "Kimi K3 specialized decode: weight reload outside sequence parallelism"
+            )
+        self.sp.process_weights_after_loading()
 
     def normalize(self, output):
         """A stock step's output with the backbone's final norm applied, as the

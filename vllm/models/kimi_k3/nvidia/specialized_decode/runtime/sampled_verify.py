@@ -525,9 +525,17 @@ class SampledVerify:
 
     @classmethod
     def build(cls, vllm_config, model):
-        """None unless the draws are FP32 (no fp64 Gumbel). The caller checked
+        """None unless the draws are FP32 (no fp64 Gumbel); under sequence parallelism
+        (built only without synthetic rejection: ``VerifyArgmax.build``) the fp64
+        Gumbel raises ``shapes.Unsupported`` instead. The caller checked
         ``VerifyArgmax.build``'s conditions (Rubin, TP group, plain sharded LM head)."""
         if vllm_config.model_config.use_fp64_gumbel:
+            from . import sp_topology
+
+            if sp_topology(vllm_config):
+                from ..shapes import Unsupported
+
+                raise Unsupported("verify", None, "fp64 Gumbel draws (use_fp64_gumbel)")
             return None
         from vllm.distributed import get_tp_group
 
