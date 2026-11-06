@@ -208,21 +208,101 @@ def _e4m3_steps(a, b):
     return ((twice_ordinal(a) - twice_ordinal(b)).abs() + 1) // 2
 
 
-def _check_q_codes(name, ours, stock):
-    """Our gathered FP8 q mailbox rows against the stock decode's FP8 query
-    ([R, DCP x H, 576]): the same per-tensor scale and E4M3 rounding of BF16 rows
-    that differ only where the two sums round differently, so at most one code step
-    apart and few codes different (as the new MLA rows, ``fp8_codes_adjacent``)."""
+def _check_q_codes(name, ours, stock, scales):
+    """Our gathered FP8 query against the stock decode's ([R, DCP x H, 576] E4M3
+    bytes each). ``ours`` is what our sparse decode read (``_TapQuery``), not the
+    mailbox after the step: DcpValue re-arms the q mailbox with Q_SENT (0xFF bytes,
+    dsa/dcp_value.py ``rearm``) once the decode has read it. The layouts are the
+    same: token-major rows; head block d = DCP rank d's heads (ours: MlaQuery's
+    publish row ``tok * q_heads + rank * heads + head``, mla/query.py; stock: the
+    DCP query gather, an all_gather over dim 1, v1/attention/ops/dcp.py); per head
+    512 NoPE (q_nope W_UK) then 64 RoPE; each side divided by the layer's per-tensor
+    ``_q_scale`` (``scales``: (ours, stock) dequant scales; trtllm-gen's bmm1_scale
+    multiplies it back on both). So BF16 rows that differ only where the two sums
+    round differently: at most one code step apart and few codes different (as the
+    new MLA rows, ``fp8_codes_adjacent``). On a mismatch the head / row probe
+    names the stock (row, head) each of a few of ours is closest to."""
+    ours, stock = ours.view(torch.uint8), stock.view(torch.uint8)
+    assert ours.shape == stock.shape, (name, ours.shape, stock.shape)
+    sentinel = int((ours.reshape(-1, 16) == 0xFF).all(1).sum())
+    ours_scale, stock_scale = (float(s) for s in scales)
+
+    def dequant(codes, scale):
+        return codes.view(torch.float8_e4m3fn).float() * scale
+
+    a, b = dequant(ours, ours_scale), dequant(stock, stock_scale)
+    finite = torch.isfinite(a)
+    a = torch.where(finite, a, 0.0)
+
+    def relative(x, y):
+        return float((x - y).norm() / y.norm().clamp_min(1e-30))
+
     steps = _e4m3_steps(ours, stock)
     differ = int((steps > 0).sum())
     rows = int((steps > 0).flatten(1).any(1).sum())
     print(
         f"{name} FP8 query: {differ} of {steps.numel()} codes differ "
         f"({differ / steps.numel():.2e}), in {rows} of {steps.shape[0]} rows, max "
-        f"{int(steps.max())} step(s)"
+        f"{int(steps.max())} step(s); dequantized relative error {relative(a, b):.2e} "
+        f"(NoPE {relative(a[..., :512], b[..., :512]):.2e}, RoPE "
+        f"{relative(a[..., 512:], b[..., 512:]):.2e}); scales ours {ours_scale:.6g} "
+        f"stock {stock_scale:.6g}; ours non-finite {int((~finite).sum())}, Q_SENT "
+        f"chunks {sentinel}"
     )
+    if int(steps.max()) > 1:
+        # Which stock (row, head) is each of a few of ours closest to: an offset
+        # head (a rank-block or head-major order), another row, or none (garbage).
+        r, h = ours.shape[:2]
+        flat_a, flat_b = a.flatten(0, 1), b.flatten(0, 1)
+        picks = sorted(
+            {(t, g) for t in (0, r - 1) for g in (0, 1, HEADS - 1, HEADS, h - 1)}
+        )
+        index = torch.tensor([t * h + g for t, g in picks], device=a.device)
+        distance = torch.cdist(flat_a[index], flat_b) / flat_b.norm(dim=1).clamp_min(
+            1e-30
+        )
+        best = distance.argmin(1).tolist()
+        probe = ", ".join(
+            f"({t},{g})->({j // h},{j % h}) {float(distance[i, j]):.2e}"
+            for i, ((t, g), j) in enumerate(zip(picks, best))
+        )
+        # The NoPE / RoPE halves swapped, or the scale off by a constant factor.
+        swapped = relative(a[..., :64], b[..., 512:])
+        ratio = float((a * b).sum() / (b * b).sum().clamp_min(1e-30))
+        print(
+            f"{name} FP8 query probe (ours (row,head) -> best stock (row,head) rel): "
+            f"{probe}; ours RoPE-first vs stock RoPE {swapped:.2e}; least-squares "
+            f"ours/stock factor {ratio:.4g}"
+        )
+    assert sentinel == 0, (name, "the q mailbox read after its re-arm", sentinel)
     assert int(steps.max()) <= 1, (name, int(steps.max()))
     assert differ <= 0.05 * steps.numel(), (name, differ)
+
+
+class _TapQuery:
+    """Records the FP8 query our sparse decode reads (``fi``: FlashInferCore; its
+    first ``decode`` call of the block run): PreparedDsa.dcp_core passes the q
+    mailbox rows ``box.q[parity, :batch]`` after the query's join (every rank's
+    heads published), the latest point they hold the query: the DcpValue kernel
+    after the decode re-arms them with Q_SENT. ``heads``: the real heads (the
+    mailbox pads to trtllm-gen's query heads)."""
+
+    def __init__(self, fi, heads):
+        self.fi, self.heads, self.q = fi, heads, None
+
+    def __enter__(self):
+        original = self.fi.decode
+
+        def decode(query, *args):
+            if self.q is None:
+                self.q = query.view(torch.uint8)[:, : self.heads].clone()
+            return original(query, *args)
+
+        self.fi.decode = decode
+        return self
+
+    def __exit__(self, *exc):
+        del self.fi.decode
 
 
 def _check_core_replay(name, replay, stock, counts):
@@ -904,13 +984,16 @@ def _dsa_case(config, rank, device, indexer, topk_mode, rows, refusals):
         # Ours: the SP block on the same rows, metadata and its own caches.
         bind("ours")
         prepared = block.core.prepared
-        mailbox = prepared.box.q[prepared.parity]
         run = SimpleNamespace(slot_mapping={layer.layer_name: new_mla}, q=Q)
-        with override_forward_context(forward):
+        tap = _TapQuery(prepared.fi, WORLD * HEADS)
+        with override_forward_context(forward), tap:
             got = block.run(x_shard, [caches["ours"][0]], md, run).clone()
         torch.accelerator.synchronize()
         attn_in = block.attn_out[:r].clone()
-        ours_q = mailbox[:r, : WORLD * HEADS].clone()
+        assert tap.q is not None and tap.q.shape[0] == r, "our sparse decode's query"
+        ours_q = tap.q
+        # (dequant scales: ours multiplies by 1 / _q_scale, stock divides by it)
+        q_scales = 1 / prepared.query_stage.scales[0], layer._q_scale
         where = f"DSA R{r} ({indexer}, {topk_mode}) rank {rank}"
 
         # The step's new MLA rows of this rank as each path wrote them.
@@ -949,7 +1032,7 @@ def _dsa_case(config, rank, device, indexer, topk_mode, rows, refusals):
         # printed), the merge and gate on stock's partials and counts.
         seen = feed.seen
         assert set(seen) == {"rows", "replay", "query", "kv", "order"}, set(seen)
-        _check_q_codes(where, ours_q, stock["q"])
+        _check_q_codes(where, ours_q, stock["q"], q_scales)
         stock_core = stock["latent"], stock["lse"]
         _check_core_replay(where, seen["replay"], stock_core, stock["counts"])
         same_set = _check_slots(
