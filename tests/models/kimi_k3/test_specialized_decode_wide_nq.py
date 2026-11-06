@@ -203,6 +203,9 @@ def test_coverage_has_no_stock_step(q):
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.attn_res.prepared import (  # noqa: E501
         choose as attn_res_choose,
     )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.policy import (  # noqa: E501
+        batch_table,
+    )
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.wide import (
         choose as dsa_choose,
     )
@@ -213,11 +216,13 @@ def test_coverage_has_no_stock_step(q):
         choose as oproj_choose,
     )
     from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.decode import (
+        RING_HEAD,
         SpecializedDecode,
         wide_rows,
     )
     from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.providers import (
         BATCHES,
+        projection_policies,
     )
     from vllm.models.kimi_k3.nvidia.specialized_decode.shapes import (
         Path,
@@ -239,9 +244,26 @@ def test_coverage_has_no_stock_step(q):
     # As runtime.providers builds them from the same hooks
     dsa_wide = frozenset(s.rows for s in shapes if dsa_choose(s, ctx))
     oproj_wide = frozenset(s.rows for s in shapes if oproj_choose(s, ctx))
-    kda = SimpleNamespace(kind="kda", oproj_wide=oproj_wide)
-    dsa = SimpleNamespace(kind="dsa", oproj_wide=oproj_wide, dsa_wide=dsa_wide)
+    # The coverage notes' inputs (providers.inproj_note, WideDsa.stock_pieces): the
+    # in-projection's split-K rows as Attention builds them (pitch 3040: K3.1 DSA)
+    split_k = projection_policies(16, 3040, decode.batches, sms=212, q=q)
+    inproj = dict(
+        projection=SimpleNamespace(fallback=SimpleNamespace(kernels=split_k)),
+        lt_rows={},
+        weight=SimpleNamespace(shape=(3040, 0)),
+    )
+    kda = SimpleNamespace(kind="kda", oproj_wide=oproj_wide, **inproj)
+    dsa = SimpleNamespace(
+        kind="dsa",
+        oproj_wide=oproj_wide,
+        dsa_wide=dsa_wide,
+        core_wide=SimpleNamespace(stock_pieces=lambda b: "stock pieces"),
+        **inproj,
+    )
     decode.attention = {0: kda, 1: dsa}
+    # As SpecializedDecode builds it on Rubin (ring_batches)
+    ring = batch_table(RING_HEAD.get(16, ""))
+    decode.head_batches = frozenset(b for b in decode.batches if ring.get(b))
     decode.feed_forward = {0: object.__new__(PreparedMoE)}
     decode.moe_batches = (*BATCHES, *wide)
     coverage = decode.plan_coverage()
@@ -661,4 +683,8 @@ def test_wide_experts_single_launch_only():
     for rows in (WIDE_MAX + 4, 1024, 2048):
         assert not prepared.wide_experts_batch(rows), rows
         note = prepared.choose(Shape(rows, 4), ctx).note
-        assert "stock experts" in note and "stock front" in note, (rows, note)
+        assert "stock FlashInfer experts" in note and "stock front" in note, (
+            rows,
+            note,
+        )
+        assert "wide engines lose above one launch" in note, (rows, note)

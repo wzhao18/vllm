@@ -27,6 +27,21 @@ logical weights:
   the 768 in reversed row order; per pair the differing rows, columns, FC2 tiles and
   BF16 ulps. Determinism and the reference band are hard asserts; cross-grouping
   bitwise equality is xfail (strict=False) with the measured difference.
+- ``test_narrow_experts_reference_band``: control. The small-batch routed experts
+  production runs at <= 64 rows (``PersistentExperts.prepare`` as ``moe.prepared.
+  PreparedMoE`` calls it: q4, planned; M8 ``RubinExpertsKernel`` behind the image plan
+  and route mailbox, M32 / M64 ``RubinGroupedExpertsKernel`` behind the 64-row plan)
+  on the same weights, routes and reference, its expanded per-slot rows finalized on
+  the host (FP32, slot order, as the tail sums them). Passing while the wide launches
+  fail: the harness (weights, layout, routes, reference) is right and the wide engines
+  are wrong; failing the same way: the harness drives the kernels wrongly.
+
+On a reference-band failure the wide test also prints ``expert_breakdown``: the error
+of tokens by how many of their 16 experts lie at id >= ``EXPERT_SPLIT``, and per
+(token, slot) from 16 launches with one-hot routing weights (slot s alone): per slot,
+per expert-id range, the worst experts, the one-hot sum vs the full launch, and which
+reference slot each one-hot output matches best (dropped: alpha ~0, doubled: ~2,
+swapped: another slot).
 
 Batch-dependence hypothesis (code reading, see the grouping test's summary for the
 measured signature): the FC1 K-split. ``experts.ExpertsKernel.partition``
@@ -50,6 +65,10 @@ import pytest
 H_LATENT, EXPERTS, TOPK, INTER = 3584, 896, 16, 256
 BETA, LINEAR_BETA = 4.0, 25.0
 ROWS = (72, 128, 256, 512, 768)
+# The small-batch control (``test_narrow_experts_reference_band``): rows <= 64.
+NARROW_ROWS = (8, 32, 64)
+# ``expert_breakdown``: expert ids below / from this split, and per range of RANGE ids.
+EXPERT_SPLIT, EXPERT_RANGE = 448, 112
 FULL = 768
 # "Same band": the specialized error metric may be at most BAND x the stock one.
 BAND = 2.0
@@ -218,6 +237,25 @@ def reference(logical, latent, topk_w, ids, gate_scale=1.0, swap=False):
     return out
 
 
+def reference_slots(logical, latent, ids):
+    """``reference``'s per-slot FC2 rows before the routing weights: FP64 [M, 16,
+    3584], slot s = expert ids[:, s]'s output alone (the reference with weights one-hot
+    on slot s)."""
+    import torch
+
+    w13, s13, w2, s2 = logical
+    rows = latent.shape[0]
+    x = mxfp8_kernel_rule(latent.float())
+    out = torch.zeros(rows * TOPK, H_LATENT, dtype=torch.float64, device=latent.device)
+    flat = ids.flatten().long()
+    for e in torch.unique(flat).tolist():
+        pick = (flat == e).nonzero().flatten()
+        a = x[pick // TOPK] @ dequant_mxfp4(w13[e], s13[e]).T
+        h = situ(a[:, :INTER], a[:, INTER:]).float()
+        out.index_copy_(0, pick, mxfp8_kernel_rule(h) @ dequant_mxfp4(w2[e], s2[e]).T)
+    return out.view(rows, TOPK, H_LATENT)
+
+
 # --------------------------------------------------------------------------------------
 # The two arms
 
@@ -259,6 +297,71 @@ def run_wide(weights, dies, dev, latent, topk_w, ids, batches, order=None):
         outs.append(out[:rows].clone())
         start = end
     return torch.cat(outs)
+
+
+def run_narrow(weights, dies, dev, latent, ids):
+    """The small-batch routed experts (rows <= 64) on a fresh ``PersistentExperts``
+    (q4) and ``scratch``, prepared as ``moe.prepared.PreparedMoE`` prepares them
+    (``prepare(b, buffers, expanded, publish, planned=True, twoshot)``) but without a
+    tail to publish into (publish (), twoshot False): the kernel writes the expanded
+    rows [M * 16, 3584] BF16 (slot s of token t at row 16 t + s, before the routing
+    weights), which production's tail sums. The plan the routing kernel would write:
+    M8 on ``RubinExpertsKernel`` the image plan (``compile_image_plan``) and, polled,
+    the route mailbox (ids + the copy CTAs' completion), as
+    test_k31_experts_workspace.py drives it; M9-64 the 64-row plan
+    (``compile_plan``, the routing kernel's ``plan_chunk`` rows). Returns (per-slot
+    rows [M, 16, 3584] BF16, the kernel's name)."""
+    import torch
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
+        stream,
+        to_cute,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe import (
+        experts_runtime as er,
+    )
+
+    rows = latent.shape[0]
+    assert rows <= 64
+    latent, ids = latent.contiguous(), ids.contiguous()
+    buffers = er.scratch(16, dev)
+    experts = er.PersistentExperts(
+        *weights, beta=BETA, linear_beta=LINEAR_BETA, dies=dies, q=4
+    )
+    out = torch.empty(rows * TOPK, H_LATENT, dtype=torch.bfloat16, device=dev)
+    experts.prepare(rows, buffers, out, (), True, False, False)
+    writer = None
+    if rows in experts.rubin:
+        kernel = "RubinExpertsKernel"
+        writer = er.compile_image_plan(rows, dev.index)
+    elif rows > 8:
+        grouped = experts.grouped64(rows)
+        kernel = "RubinGroupedExpertsKernel" if grouped else "ExpertsKernel (grouped)"
+        writer = er.compile_plan(rows, dev.index)
+    else:
+        kernel = "ExpertsKernel"
+    if writer is not None:
+        writer(to_cute(latent, 16), to_cute(buffers["plan"], 16), stream(dev))
+    if rows in experts.rubin and er.polled(16, rows, dev):  # the routing's mailbox
+        box = torch.full((er.ROUTE_WORDS,), -1, dtype=torch.int32, device=dev)
+        box[: rows * TOPK] = ids.reshape(-1)
+        box[rows * TOPK] = 2 * rows - 1  # every copy CTA's image part written
+        er.route_mailbox(buffers["workspace"]).copy_(box)
+    experts.run(latent, ids)
+    torch.cuda.synchronize()
+    return out.view(rows, TOPK, H_LATENT).clone(), kernel
+
+
+def finalize(slots, topk_w):
+    """The top-k weighted sum of per-slot rows [M, 16, 3584] as the tail sums the
+    expanded rows: FP32, slot order, BF16 weights; BF16 out."""
+    import torch
+
+    acc = torch.zeros(slots.shape[0], H_LATENT, dtype=torch.float32,
+                      device=slots.device)  # fmt: skip
+    for s in range(TOPK):
+        acc += topk_w[:, s, None].float() * slots[:, s].float()
+    return acc.bfloat16()
 
 
 class Stock:
@@ -357,7 +460,7 @@ def contract_probe(case, spec):
     ]
     latent, topk_w, ids = (t[:rows] for t in case["inputs"])
     for name, kwargs in PROBES.items():
-        key = ("probe", name)
+        key = ("probe", name, rows)
         if key not in case["cache"]:
             case["cache"][key] = reference(
                 case["logical"], latent, topk_w, ids, **kwargs
@@ -374,6 +477,109 @@ def contract_probe(case, spec):
         f"  rel by FC2 tile: min {by_tile.min().item():.3f} max "
         f"{by_tile.max().item():.3f}"
     )
+    return lines
+
+
+def wide_slot_outs(case, rows):
+    """The wide engine's per-slot rows [M, 16, 3584] BF16 of the first ``rows`` rows:
+    16 single launches of ``rows`` rows (the same engine and width as the failing
+    launch) with the routing weights one-hot on slot s (1.0 is exact in BF16)."""
+    import torch
+
+    key = ("wide slots", rows)
+    if key not in case["cache"]:
+        latent, topk_w, ids = (t[:rows].contiguous() for t in case["inputs"])
+        outs = []
+        for s in range(TOPK):
+            onehot = torch.zeros_like(topk_w)
+            onehot[:, s] = 1
+            outs.append(run_wide(case["weights"], case["dies"], case["dev"], latent,
+                                 onehot, ids, [rows]))  # fmt: skip
+        case["cache"][key] = torch.stack(outs, 1)
+    return case["cache"][key]
+
+
+def expert_breakdown(case, spec, slots=None):
+    """Where the error of ``spec`` (the first M rows, [M, 3584]) sits, as lines:
+    (1) rows grouped by how many of their 16 experts have id >= EXPERT_SPLIT (one
+    expert half dropped / doubled moves the error with that count); with ``slots``
+    (per-slot rows [M, 16, 3584], slot s alone at weight 1): (2) ``spec`` vs
+    ``finalize(slots)`` (linearity: a mismatch names the finalize / weight indexing,
+    not the expert math); (3) per (token, slot) the row-relative error and the
+    least-squares scale alpha vs ``reference_slots`` (dropped ~0, doubled ~2), by slot
+    index and by expert-id range, and the worst experts; (4) for each slot the
+    reference slot its one-hot output matches best (another slot: slots permuted)."""
+    import torch
+
+    rows = spec.shape[0]
+    latent, topk_w, ids = (t[:rows] for t in case["inputs"])
+    rel = errors(spec, case["ref"][:rows])["rows"]
+    high = (ids >= EXPERT_SPLIT).sum(1)
+    head = f"rows by experts with id >= {EXPERT_SPLIT} (of {TOPK}): rows, row rel"
+    lines = [head + " mean / max"]
+    for n in torch.unique(high).tolist():
+        r = rel[high == n]
+        lines.append(f"  {n:2d}: {r.numel():4d} rows {r.mean().item():.3e} / "
+                     f"{r.max().item():.3e}")  # fmt: skip
+    if slots is None:
+        return lines
+    key = ("ref slots", rows)
+    if key not in case["cache"]:
+        case["cache"][key] = reference_slots(case["logical"], latent, ids)
+    ref = case["cache"][key]
+    lin = errors(spec, finalize(slots, topk_w).double())
+    lines.append(f"full launch vs one-hot slots finalized: {fmt(lin)}")
+    alpha = torch.empty(rows, TOPK, dtype=torch.float64, device=spec.device)
+    pair = torch.empty_like(alpha)
+    for s in range(TOPK):  # one slot at a time (M x 3584 FP64 temporaries)
+        out, r = slots[:, s].double(), ref[:, s]
+        den = (r * r).sum(1).clamp_min(1e-30)
+        alpha[:, s] = (out * r).sum(1) / den
+        pair[:, s] = (out - r).norm(dim=1) / den.sqrt()
+    bad = pair > 0.5
+
+    def stats(mask):
+        n = int(mask.sum())
+        if not n:
+            return "     0 pairs"
+        a, p = alpha[mask], pair[mask]
+        return (f"{n:6d} pairs rel {p.mean().item():.3e} (max {p.max().item():.3e}) "
+                f"alpha {a.mean().item():.3f} +- {a.std().item() if n > 1 else 0:.3f} "
+                f"rel>0.5 {int(bad[mask].sum())}")  # fmt: skip
+
+    lines.append("per (token, slot), one-hot launches vs reference_slots, by slot:")
+    for s in range(TOPK):
+        mask = torch.zeros_like(bad)
+        mask[:, s] = True
+        lines.append(f"  slot {s:2d}: {stats(mask)}")
+    lines.append(f"by expert id (split {EXPERT_SPLIT}, ranges of {EXPERT_RANGE}):")
+    lines.append(f"  id <  {EXPERT_SPLIT}: {stats(ids < EXPERT_SPLIT)}")
+    lines.append(f"  id >= {EXPERT_SPLIT}: {stats(ids >= EXPERT_SPLIT)}")
+    for lo in range(0, EXPERT_RANGE * -(-EXPERTS // EXPERT_RANGE), EXPERT_RANGE):
+        mask = (ids >= lo) & (ids < lo + EXPERT_RANGE)
+        lines.append(f"  [{lo:3d}, {lo + EXPERT_RANGE:3d}): {stats(mask)}")
+    per_expert = torch.zeros(EXPERTS, dtype=torch.float64, device=spec.device)
+    count = torch.zeros_like(per_expert)
+    flat = ids.flatten().long()
+    per_expert.index_add_(0, flat, pair.flatten())
+    count.index_add_(0, flat, torch.ones_like(pair.flatten()))
+    mean = per_expert / count.clamp_min(1)
+    worst = mean.argsort(descending=True)[:12].tolist()
+    lines.append(
+        f"worst experts (mean pair rel, pairs; {int((mean > 0.5).sum())} of "
+        f"{int((count > 0).sum())} routed experts above 0.5): "
+        + ", ".join(f"{e}: {mean[e].item():.2f} x{int(count[e])}" for e in worst)
+    )
+    m = min(PROBE_ROWS, rows)
+    match = []
+    for s in range(TOPK):  # [m, 16] row rel of slot s's output vs every ref slot
+        out = slots[:m, s].double()[:, None]
+        cross = (out - ref[:m]).norm(dim=2) / ref[:m].norm(dim=2).clamp_min(1e-30)
+        cross = cross.mean(0)
+        best, own = int(cross.argmin()), cross[s].item()
+        note = "" if best == s else f"({cross[best].item():.2f} vs own {own:.2f})"
+        match.append(f"{s}->{best}{note}")
+    lines.append(f"best-matching reference slot (first {m} rows): " + " ".join(match))
     return lines
 
 
@@ -486,12 +692,42 @@ def test_wide_experts_reference_band(case, rows):
     metrics = ("max_abs", "mean_abs", "max_rel", "mean_rel")
     failed = [m for m in metrics if es[m] > BAND * ek[m]]
     if failed:
-        probe = "\n".join(contract_probe(case, spec))
+        lines = contract_probe(case, spec)
+        lines += expert_breakdown(case, spec, wide_slot_outs(case, rows))
+        probe = "\n".join(lines)
         print(probe)
         raise AssertionError(
             f"M{rows}: {failed} outside {BAND} x stock\nspec  vs ref: {fmt(es)}\n"
             f"stock vs ref: {fmt(ek)}\n{probe}"
         )
+
+
+@pytest.mark.parametrize("rows", NARROW_ROWS)
+def test_narrow_experts_reference_band(case, rows):
+    """Control for ``test_wide_experts_reference_band``: the small-batch routed experts
+    production runs at <= 64 rows (``run_narrow``), the first ``rows`` rows of the same
+    routes on the same weights, finalized on the host; the same metrics, probes and
+    band vs stock. Passing (while the wide launches fail): the harness is right and
+    the wide engines are wrong; failing alike: the harness drives the kernels wrongly
+    (weights / layout / routes / reference)."""
+    import torch
+
+    ref = case["ref"][:rows]
+    latent, topk_w, ids = (t[:rows].contiguous() for t in case["inputs"])
+    slots, kernel = run_narrow(case["weights"], case["dies"], case["dev"], latent, ids)
+    assert torch.isfinite(slots.float()).all()
+    spec = finalize(slots, topk_w)
+    stock = stock_out(case, rows)
+    es, ek = errors(spec, ref), errors(stock, ref)
+    lines = [f"M{rows} narrow ({kernel}) vs ref: {fmt(es)}",
+             f"M{rows} stock vs ref: {fmt(ek)}"]  # fmt: skip
+    lines += contract_probe(case, spec)
+    lines += expert_breakdown(case, spec, slots)
+    summary = "\n".join(lines)
+    print("\n" + summary)
+    metrics = ("max_abs", "mean_abs", "max_rel", "mean_rel")
+    failed = [m for m in metrics if es[m] > BAND * ek[m]]
+    assert not failed, f"M{rows}: {failed} outside {BAND} x stock\n{summary}"
 
 
 class GroupingNotBitwise(AssertionError):

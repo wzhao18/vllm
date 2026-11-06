@@ -4,6 +4,7 @@
 the tuned rows) between the specialized providers and the stock seams, K3.1's DSA
 seam (S2-DSA) included."""
 
+import dataclasses
 from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
@@ -49,10 +50,10 @@ from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.providers import (  #
     projection_policies,
 )
 from vllm.models.kimi_k3.nvidia.specialized_decode.shapes import (  # noqa: E402
-    Choice,
     Context,
     Path,
     Shape,
+    Uncovered,
     captured_rows,
 )
 
@@ -161,14 +162,22 @@ def test_decode_reads_the_gate_from_the_deployment(
 @pytest.mark.parametrize("dsa", [True, False], ids=["k31-tp8", "k3-table-miss"])
 def test_coverage_names_why_wide_rows_run_stock(dsa):
     """Captured rows above 64 that run the stock forward name the cause: K3.1's TP16 =
-    DCP16 gate, or a WIDE_ROWS miss."""
+    DCP16 gate, or a WIDE_ROWS miss. On the no-fallback target topology (Rubin TP16 =
+    DCP16, q > 1) the same uncovered rows refuse to start instead (NQ-NOFALLBACK)."""
     decode: Any = object.__new__(SpecializedDecode)
     decode.q, decode.captured = 8, (64, 72, 256)
     decode.batches, decode.wide = (64,), ()
     decode.choices = lambda b, q: {}
     decode.wide_off = wide_gate(8, rubin=True, seams=True, dsa=dsa, tp=8, dcp=8)
+    decode.context = Context(
+        arch="rubin", tp=8, rank=0, dcp=8, sms=212, q=8, max_rows=256,
+        max_context=1 << 20, bf16_state=True,
+    )  # fmt: skip
     why = "DSA wide steps need TP16 = DCP16" if dsa else "not in WIDE_ROWS"
     assert decode.plan_coverage().reasons == {72: why, 256: why}
+    decode.context = dataclasses.replace(decode.context, tp=16, dcp=16)
+    with pytest.raises(Uncovered, match=rf"M72\(q8\).*whole stock forward: {why}"):
+        decode.plan_coverage()
 
 
 class Linear(torch.nn.Module):
@@ -463,28 +472,46 @@ def test_wide_choices_name_the_dsa_seam():
     split-K up to 128 rows, cuBLAS above, as ``run_wide`` runs it (by the rows the
     projection prepares)."""
     rows = (72, 128, 136, 256, 512)
+    split_k = projection_policies(16, PITCH, rows, sms=212, q=8)
+    assert set(split_k) == {72, 128}
+    # The in-projection as Attention builds it: split-K at its policies' rows, the
+    # cuBLAS GEMM elsewhere (no cuBLASLt rows at pitch 3040, INPROJ_LT)
+    inproj = dict(
+        projection=SimpleNamespace(fallback=SimpleNamespace(kernels=split_k)),
+        lt_rows={},
+        weight=torch.empty(PITCH, 0),
+    )
     decode: Any = object.__new__(SpecializedDecode)
     decode.attention = {
-        0: SimpleNamespace(kind="kda", oproj_wide=frozenset(rows)),
+        0: SimpleNamespace(kind="kda", oproj_wide=frozenset(rows), **inproj),
         1: SimpleNamespace(
-            kind="dsa", oproj_wide=frozenset(rows), dsa_wide=frozenset({72})
+            kind="dsa",
+            oproj_wide=frozenset(rows),
+            dsa_wide=frozenset({72}),
+            core_wide=SimpleNamespace(stock_pieces=lambda b: f"pieces {b}"),
+            **inproj,
         ),
     }
-    decode.stock_attn_res = decode.sharded = frozenset()
+    decode.stock_attn_res = decode.sharded = decode.head_batches = frozenset()
     decode.feed_forward = {}
     decode.context = Context(
         arch="rubin", tp=16, rank=0, dcp=16, sms=212, q=8, max_rows=512,
         max_context=1 << 20, bf16_state=True,
     )  # fmt: skip
-    split_k = projection_policies(16, PITCH, rows, sms=212, q=8)
-    assert set(split_k) == {72, 128}
     for b in rows:
         choices = decode.wide_choices(b, 8)
-        gemm = "splitk" if b in split_k else "cublas"
-        if b == 72:  # WideDsa (DSA_WIDE, dabb1639b6)
-            assert choices["dsa"] == Choice(Path.GENERIC, "wide", "prepared")
+        if b in split_k:
+            gemm = "inproj splitk"
         else:
-            assert choices["dsa"] == Choice(Path.STOCK, note=f"{gemm} + S2")
+            gemm = "inproj stock cuBLAS (3040-row projection unmeasured vs split-K"
+        if b == 72:  # WideDsa (DSA_WIDE, dabb1639b6), with its stock pieces named
+            dsa = choices["dsa"]
+            assert (dsa.path, dsa.tactic) == (Path.GENERIC, "wide"), dsa
+            assert dsa.note == f"{gemm} + WideDsa prepared; stock pieces: pieces 72"
+        else:
+            dsa = choices["dsa"]
+            assert dsa.path is Path.STOCK, dsa
+            assert dsa.note.startswith(gemm) and dsa.note.endswith(" + S2-DSA"), dsa
         assert "mla" not in choices
 
 
