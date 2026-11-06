@@ -70,14 +70,23 @@ SETTLED_MARKOV = {16: "1:1"}
 FAST_LM_HEAD = {16: "1-7:1"}
 # Query rows whose LM-head shard GEMM runs with evict-first weight
 # loads (cutedsl.verify.lmhead.PreparedWideLmHead: the projection core without a K
-# split, BF16 logits bitwise equal to cuBLAS's unsplit kernels), per TP, on Rubin.
-# NQ-NOFALLBACK: 9 query rows (q4 B3) stay on the stock cuBLAS shard GEMM by choice:
-# the measurement note on lmhead.WIDE_ROWS ends "(9 rows: 35 us)" and starts the
-# evict-first kernel at 10 rows; it does not show the kernel winning at 9 (it is no
-# faster than torch.mm at 16 / 56 / 64 rows either), so 9 rows are not moved without
-# a 9-row measurement (NQ-TUNE). Above 64 rows (q8 B10+, q4 B22+) the stock cuBLAS
-# shard GEMM stays too, logged in the coverage (unmeasured: NQ-TUNE).
-WIDE_LM_HEAD = {16: "10-64:1"}  # (B9's 63 rows: within lmhead.WIDE_ROWS)
+# split, BF16 logits bitwise equal to cuBLAS's unsplit kernels), per TP, on Rubin:
+# 17-32 rows, where cuBLAS splits K (lmhead.WIDE_ROWS' note). Every other row count
+# above FAST_LM_HEAD's runs the stock cuBLAS shard GEMM, chosen per shape here and
+# logged in the drafter's coverage (``DraftFastPath.build``), from the VR200 kernel
+# bench (nqbench kern-draft gemm/lm_head, 1 GPU, [vocab / 16, 7168] shard, us,
+# evict-first kernel vs cuBLAS):
+#   9-16 rows: 12 / 14 / 15 rows (q4 B4, q8 B2, q4 B5) 14.84 / 14.90 / 14.91 vs 14.60 /
+#     14.59 / 14.60 (1.016-1.021x; was the evict-first kernel at 10-16); 9 rows (q4 B3)
+#     cuBLAS 14.55 as before;
+#   17-32 rows: 18-30 rows 14.52-14.92 vs 16.12-16.37 (0.887-0.916x; kept);
+#   33-64 rows: 35-63 rows (q8 B5-B9, q4 B12 / B16 / B20) 14.93-15.21 vs 13.51-13.70
+#     (1.099-1.115x: cuBLAS stops splitting K above 32 rows; was the evict-first
+#     kernel); the split-K sweep's best there (64.64.1.7, 15.04-15.31) loses too.
+# Above 64 rows cuBLAS as before. NQ-TUNE: 9-16 rows, the sweep's split-K 64.16.1.8 is
+# 14.23-14.30 us vs cuBLAS 14.55-14.60 (-2%, an FP32 K-order reorder: no K split): a
+# drafter LM head on that projection tactic is not wired.
+WIDE_LM_HEAD = {16: "17-32:1"}
 # Query rows whose context step (sharded projection + row gather, context-KV GEMM
 # and insert) the caller may run on a side stream, joined by the first MLA layer
 # right before its attention core (cutedsl.draft.attention ``join_context``): the
@@ -788,10 +797,10 @@ class DraftFastPath:
             rank,
             "draft LM head",
             f"GEMV rows {lm}, evict-first GEMM rows {wide_lm}, stock cuBLAS shard "
-            f"GEMM rows {stock_lm} (deliberate: rows between the 1-7 GEMV and the "
-            "evict-first 10-64 kernel (q4 B3: 9), whose lmhead.WIDE_ROWS note reads "
-            "'9 rows: 35 us' and shows no 9-row win; above 64 rows unmeasured vs "
-            "the evict-first GEMM; NQ-TUNE)",
+            f"GEMM rows {stock_lm} (policy WIDE_LM_HEAD: cuBLAS is measured faster "
+            "than the evict-first GEMM at 9-16 rows (1.016-1.021x) and 33-64 rows "
+            "(1.099-1.115x, no K split there); the evict-first GEMM only at 17-32 "
+            "rows, where cuBLAS splits K; above 64 rows cuBLAS)",
         )
         return fast
 

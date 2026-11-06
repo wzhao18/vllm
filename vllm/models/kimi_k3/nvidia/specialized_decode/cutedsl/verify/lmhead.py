@@ -402,19 +402,26 @@ class PreparedLmHeadLogits:
         return out
 
 
-# The LM-head shard GEMM of 10-64 rows (verify B2-B8, the drafter's 14-56 rows): the
+# The LM-head shard GEMM (verify and drafter rows, WIDE_ROWS below): the
 # split-K projection core (cutedsl.gemm.projection, TMA weight loads with the L2
 # evict_first policy, so the 147 MB stream leaves the L2 to the step) without a K
 # split: the FP32 accumulation runs in K order, as cuBLAS's unsplit kernels do. 1 GPU,
 # [10240, 7168], cold L2, us vs torch.mm: 64 rows 17.2 vs 16.9, 56 rows 17.4 vs 16.8,
 # 16 rows 16.7 vs 16.3, 32 rows 16.8 vs 19.1 (cuBLAS splits K at 17-32 rows). BF16
 # logits bitwise equal to cuBLAS wherever cuBLAS does not split K (9 rows: 35 us).
+# Served at 17-32 rows only (was 10-64), the rows where cuBLAS splits K: the VR200
+# kernel bench (nqbench kern-draft gemm/lm_head, 1 GPU, [vocab / 16, 7168] shard, us,
+# this kernel vs cuBLAS) 18-30 rows 14.52-14.92 vs 16.12-16.37 (0.887-0.916x); 12-15
+# rows 14.84-14.91 vs 14.59-14.60 (1.016-1.021x) and 35-63 rows 14.93-15.21 vs
+# 13.51-13.70 (1.099-1.115x) are slower, so those rows run the stock cuBLAS shard GEMM
+# (bitwise the same logits there: cuBLAS does not split K), by this policy, in the
+# drafter (runtime.draft.WIDE_LM_HEAD) and in target verification (runtime.verify).
 WIDE_TACTIC = (64, 64, 1, 7)
-WIDE_ROWS = range(10, 65)
+WIDE_ROWS = range(17, 33)
 
 
 class PreparedWideLmHead:
-    """BF16 logits [rows, vocab_rank] of this rank's LM-head shard for 10-64 rows,
+    """BF16 logits [rows, vocab_rank] of this rank's LM-head shard for 17-32 rows,
     into a persistent buffer (so a capture records fixed addresses). ``weight``: the
     shard [vocab_rank, hidden] BF16, read in place. Prepare outside captures."""
 

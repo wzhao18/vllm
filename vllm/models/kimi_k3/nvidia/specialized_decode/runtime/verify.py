@@ -123,8 +123,9 @@ class VerifyArgmax:
             "verify",
             f"LM-head shard: 1-{lmhead.TOKENS} rows fused GEMV, "
             f"{lmhead.WIDE_ROWS[0]}-{lmhead.WIDE_ROWS[-1]} rows evict-first GEMM, "
-            f"above {lmhead.WIDE_ROWS[-1]} rows stock cuBLAS shard GEMM (bitwise "
-            "compute_logits; the evict-first GEMM is not tuned there: NQ-TUNE); "
+            f"other rows stock cuBLAS shard GEMM (bitwise compute_logits; policy "
+            "lmhead.WIDE_ROWS: cuBLAS measured faster at 9-16 and 33-64 rows, "
+            "where it does not split K; above 64 rows cuBLAS); "
             "argmax / sampled verification vocabulary-sharded at every row"
             if fused is not None
             else "LM-head shard: stock cuBLAS shard GEMM at every row (the LM-head "
@@ -135,9 +136,9 @@ class VerifyArgmax:
     def shard_logits(self, processor, lm_head, hidden_states):
         """This rank's vocabulary shard of the logits rows [rows, vocab_rank] BF16, as
         the argmax path computes them: up to 8 rows the fused LM head's GEMV (its FP32
-        accumulation order, as greedy verification's argmax), 10-64 rows the evict-first
-        shard GEMM, else the stock LM-head GEMM without its all-gather (bitwise
-        compute_logits')."""
+        accumulation order, as greedy verification's argmax), lmhead.WIDE_ROWS (17-32)
+        the evict-first shard GEMM, else the stock LM-head GEMM without its all-gather
+        (bitwise compute_logits')."""
         if self.logits is not None and self.logits.takes(hidden_states):
             return self.logits.run(hidden_states)
         if self.wide is not None and self.wide.takes(hidden_states):
@@ -155,7 +156,7 @@ class VerifyArgmax:
         if self.fused is not None and self.fused.takes(hidden_states):
             return self.fused.run(hidden_states)
         if self.wide is not None and self.wide.takes(hidden_states):
-            # 10-64 rows: the shard GEMM with evict-first weight loads.
+            # lmhead.WIDE_ROWS (17-32): the shard GEMM with evict-first weight loads.
             local = self.wide.run(hidden_states)
         else:
             # The stock LM-head GEMM without its all-gather: this rank's vocabulary

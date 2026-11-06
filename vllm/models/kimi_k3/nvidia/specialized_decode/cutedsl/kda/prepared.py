@@ -120,20 +120,66 @@ VERIFY_WIDE: dict[tuple[int, int], str] = {(10, 7): "16-32:1,33-48:2,49-64:1"}
 # 128 / 192: 36.38 / 47.60 / 69.85). 35-64 requests stay on VERIFY_WIDE's Halves /
 # Wide, as the cap-128 serving overlay (ov-cap128-bca26213) runs them (its numbers are
 # not recorded in the tree).
-# NQ-TUNE (BF16 state only; the FP32 state never runs Stream3): by the verify-alone
-# numbers above, the overlay's 35-64 rows cost a BF16 state +2.27 / +3.11 / +1.99 us
-# per KDA layer at B36 / B48 / B64 (Halves 11.21, Halves 12.38, Wide 12.28 vs Stream3
-# 8.94 / 9.27 / 10.29). Kept because the overlay is what serving measured; measure
-# Stream3 vs Halves / Wide at B35-64 in the BF16 serving chain (AttnRes, in-projection,
-# verify, o-projection) and restore "36-256:4" if Stream3 wins there too.
-# Stream3 (and Stream) need a BF16 state (``BF16_ONLY``): with an FP32 state these
-# rows run ``FP32_WIDE`` instead.
+# BF16 state, 36-64 requests at q4 on Stream3 too ("36-256:4", was "65-256:4" with
+# the cap-128 overlay's Halves / Wide at 35-64): the VR200 kernel bench (nqbench
+# kern-kda, section b, 1-GPU verify alone, 69 layers, own cold slots, us per layer)
+# Halves or Wide / Stream3: B36 11.23 / 9.06, B40 11.51 / 9.27, B48 12.34 / 9.65,
+# B56 11.98 (Wide) / 9.79, B64 12.45 (Wide) / 10.57: -15..-22%, the margin the
+# verify-alone numbers above showed (B36 / B48 / B64 +2.27 / +3.11 / +1.99 us). B33-35
+# stay on Wide (B33 / B34 Wide 6.29 / 6.34 vs Stream3 6.52 / 6.60; 35 requests are
+# still one wave of 210 Wide CTAs on 212 SMs, Halves' 420 CTAs two).
+# q8 B12 on KdaVerifyWide (it ran the 1.8.3.8 KdaSplit, the only q8 row between B8 and
+# B16 off the wide kernels): same bench, KdaSplit / Wide 13.51 / 8.83 us (-35%; Halves
+# 7.34 alone, but Halves trails Wide in the serving chain at B16-32, see VERIFY_WIDE).
+# The bench's other BF16 retune hints stay unapplied: Halves at q4 B8 / B12 / B14 / B16
+# and q8 B8 / B16 lead by 0.31-0.38 us (q4) / 0.52-1.48 us (q8) verify alone, less
+# than the serving-chain shift against Halves at B16 (VERIFY_WIDE's numbers, q4 / q8:
+# Halves 0.83 / 1.69 us ahead of Wide alone, 0.89 / 1.09 us behind in the chain;
+# 0.70 / 0.67 ahead of KdaSplit alone, 0.48 / 0.87 behind in the chain).
+# Stream3 (and Stream) need a BF16 state (``BF16_ONLY``): an FP32 state reads
+# FP32_VERIFY_WIDE below instead.
 DEVICE_SPEC_SCHEDULE_Q: dict = {(10, 7): {4: {6: "6:1.8.2.8,14:1.8.2.4"}}}
 VERIFY_Q: dict = {
     "rows": {},
     "cols": {},
-    "wide": {(10, 7): {4: "12:1,33-34:1,65-256:4"}},
+    "wide": {(10, 7): {4: "12:1,33-35:1,36-256:4", 8: "12:1"}},
     "load_norm": {},
+}
+# FP32 recurrent state (--mamba-ssm-cache-dtype float32, the production precision):
+# the plain verify kernel by request count per q, in place of VERIFY_WIDE and VERIFY_Q
+# "wide" (whose crossovers were tuned with a BF16 state; an FP32 state doubles the
+# state bytes per verify, which moves them). Values as VERIFY_WIDE's (0 KdaSplit at
+# its SPEC_SCHEDULE / DEVICE_SPEC_SCHEDULE(_Q) geometry, 1 Wide, 2 Halves; never the
+# BF16-only 3 / 4); requests below the first row and between rows run KdaSplit, above
+# the last row the last row's kernel (``wide_kind``). From the VR200 kernel bench
+# (nqbench kern-kda, section b: 1-GPU verify alone, 69 layers, own cold FP32 slots,
+# us per layer, KdaSplit / Wide / Halves):
+#   q4 B1-8   2.90 / 6.73 / 5.23 .. 4.67 / 7.08 / 5.42  KdaSplit (unchanged)
+#      B12    7.71 / 7.33 / 6.25   Wide (unchanged; Halves' lead 1.08 is below its
+#                                  serving-chain shift vs Wide at B16, 1.72)
+#      B14    5.60 / 7.20 / 6.15   KdaSplit at 1.8.2.4 (unchanged)
+#      B16-34 Wide: B16 6.83 / 7.15 / 6.22, B24 11.90 / 7.98 / 9.01, B32 12.83 / 8.64 /
+#             9.65, B34 12.97 / 8.75 / 9.93 (unchanged; at B16 KdaSplit's / Halves'
+#             leads, 0.32 / 0.93, are below their serving-chain shifts vs Wide, 0.54
+#             / 1.72; B35: one Wide wave of 210 CTAs, was Halves)
+#      B36-40 KdaSplit 1.8.3.4: B36 13.05 / 14.28 / 14.59, B40 13.40 / 14.69 / 16.12
+#             (was Halves: -10.5% / -16.9%)
+#      B41-48 Wide: B48 19.03 / 15.48 / 18.30 (was Halves: -15.4%); KdaSplit's step
+#             between B40 and B48 is unmeasured, so B41-47 take Wide, which runs two
+#             even waves from B36 to B70 (B36 14.28, B65 17.13)
+#      B49+   Wide: B64 20.75 / 16.95 / 19.23 .. B512 148.81 / 127.19 / 142.02 (the
+#             others, Halves and KdaSplit at the default geometry or 1.8.3.4,
+#             trail by 10-15%; unchanged: FP32_WIDE)
+#   q8 B1-8   KdaSplit: 4.70 / 11.04 / 7.91 .. 7.49 / 11.85 / 8.24 (unchanged)
+#      B12    Wide: 13.40 / 12.09 / 9.31 (was KdaSplit: -9.8%; Halves as at q4 B12)
+#      B16-32 Wide: B16 11.52 / 11.77 / 9.60, B32 21.93 / 13.81 / 15.07 (unchanged)
+#      B33-48 Wide: B48 31.96 / 25.24 / 27.98 (was Halves: -9.8%)
+#      B49+   Wide: B64 34.19 / 27.09 / 29.34 .. B256 161.85 / 106.08 / 109.03
+#             (Halves trails by 3-8%; unchanged)
+# q values without a row here keep VERIFY_WIDE / VERIFY_Q with ``FP32_WIDE`` in place
+# of the BF16-only kernels.
+FP32_VERIFY_WIDE: dict = {
+    (10, 7): {4: "12:1,16-35:1,36-40:0,41-512:1", 8: "12:1,16-256:1"},
 }
 # Plain verify kernels by VERIFY_WIDE / VERIFY_Q "wide" value (0: KdaSplit).
 WIDE_KINDS = (KdaVerifyWide, KdaVerifyHalves, KdaVerifyStream, KdaVerifyStream3)
@@ -147,12 +193,12 @@ WIDE_NAMES = ("kdasplit", "wide", "halves", "stream", "stream3")
 # the default-geometry KdaSplit at every measured row above 48 (numbers above: B64
 # 12.28 / 13.88, B96 18.65 vs KdaSplit 36.38). An FP32 chunked verify (S0 staged as
 # FP32, three-term BF16 splits of S0 into the row-dot MMAs) is not written.
-# NQ-TUNE: FP32 state, 1-GPU verify alone and the serving chain: q4 Wide vs Halves vs
-# KdaSplit (1.8.3.4) at B36-64 and Wide vs KdaSplit at B65-512 (rows 260-2048); q8
-# Wide vs KdaSplit (1.8.3.4) at B65-128 (open-ended Wide, BF16 state too); and every
-# table above swept with a BF16 state (SPEC_SCHEDULE / DEVICE_SPEC_SCHEDULE(_Q), the
-# VERIFY_WIDE crossovers at B16-64, VERIFY_ROWS / COLS at B8): the state bytes per
-# verify double, so the crossovers may move; the stock S1 crossover (STOCK_ROWS) too.
+# The FP32 crossovers are FP32_VERIFY_WIDE's (measured verify alone).
+# NQ-TUNE: FP32 state in the serving chain (AttnRes, in-projection, verify,
+# o-projection) at the FP32_VERIFY_WIDE crossovers (q4 B12 / B16 Halves vs Wide, B36-48
+# KdaSplit vs Wide, q8 B12 Halves vs Wide); q4 B9-11 / B13 / B15 and q8 B9-11 / B13-15
+# (KdaSplit, unmeasured); SPEC_SCHEDULE / DEVICE_SPEC_SCHEDULE(_Q) and VERIFY_ROWS /
+# COLS at B8 swept with an FP32 state; the stock S1 crossover (STOCK_ROWS) too.
 BF16_ONLY, FP32_WIDE = (3, 4), 1
 _VERIFY = {
     "rows": VERIFY_ROWS, "cols": VERIFY_COLS, "wide": VERIFY_WIDE,
@@ -168,9 +214,20 @@ def verify_table(name, capability, tokens):
     return batch_table(",".join(filter(None, (base, extra))))
 
 
+def wide_table(capability, tokens, bf16_state):
+    """The request-keyed plain verify kernel table at verify length ``tokens`` for
+    the state dtype: FP32_VERIFY_WIDE's row for an FP32 state where it has one, else
+    VERIFY_WIDE with VERIFY_Q's "wide" rows on top."""
+    fp32 = None if bf16_state else FP32_VERIFY_WIDE.get(capability, {}).get(tokens)
+    if fp32 is not None:
+        return batch_table(fp32)
+    return verify_table("wide", capability, tokens)
+
+
 def wide_kind(requests, tokens, capability, bf16_state=False, gate_mode=0, heads=6):
     """The plain (not prepared) verify kernel at ``requests`` x ``tokens``: 0 KdaSplit,
-    else the VERIFY_WIDE / VERIFY_Q "wide" value (``WIDE_KINDS[value - 1]``).
+    else the ``wide_table`` value (``WIDE_KINDS[value - 1]``): FP32_VERIFY_WIDE for an
+    FP32 state, VERIFY_WIDE / VERIFY_Q "wide" for a BF16 one.
 
     Open-ended: requests above the table's last row take that row's kernel (each
     wide kernel's grid is (CTAs per head, heads, B): no request cap), so any captured
@@ -181,7 +238,7 @@ def wide_kind(requests, tokens, capability, bf16_state=False, gate_mode=0, heads
     KdaSplit."""
     if tokens == 1 or gate_mode != 0 or heads == 12:
         return 0
-    table = verify_table("wide", capability, tokens)
+    table = wide_table(capability, tokens, bf16_state)
     kind = table.get(requests)
     if kind is None and table and requests > max(table):
         kind = table[max(table)]

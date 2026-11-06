@@ -89,6 +89,48 @@ def test_overlay_ranges_kept():
     assert draft.covered(draft.closed(draft.FAST_DCP[16], 576), 576, 3)
 
 
+# VR200 kernel bench (nqbench kern-draft gemm/lm_head) rows where the evict-first
+# LM-head GEMM was slower than the stock cuBLAS shard GEMM (rows: steps).
+LM_HEAD_CUBLAS_ROWS = {
+    12: 3, 14: 7, 15: 3, 35: 7, 36: 3, 42: 7, 48: 3, 49: 7, 56: 7, 60: 3, 63: 7
+}  # fmt: skip
+
+
+@pytest.mark.parametrize("steps", [3, 7])
+def test_tp16_lm_head_policy(steps):
+    """The drafter's LM-head shard GEMM per query rows (DL3 / DL7, B1-256): the BF16
+    GEMV to 7 rows, the evict-first GEMM only at 17-32 rows (cuBLAS splits K there;
+    bench 0.887-0.916x), the stock cuBLAS shard GEMM elsewhere, by choice."""
+    for b in range(1, 257):
+        rows = b * steps
+        gemv = draft.covered(draft.FAST_LM_HEAD[16], rows, steps)
+        wide = draft.covered(draft.WIDE_LM_HEAD[16], rows, steps)
+        assert bool(gemv) == (rows <= 7), rows
+        assert bool(wide) == (17 <= rows <= 32), rows
+
+
+def test_tp16_lm_head_slower_rows_run_cublas():
+    """Every row count the bench measured the evict-first GEMM slower than cuBLAS at
+    (12-15 rows 1.016-1.021x, 35-63 rows 1.099-1.115x) runs the stock cuBLAS GEMM."""
+    for rows, steps in LM_HEAD_CUBLAS_ROWS.items():
+        assert not draft.covered(draft.WIDE_LM_HEAD[16], rows, steps), rows
+        assert not draft.covered(draft.FAST_LM_HEAD[16], rows, steps), rows
+
+
+def test_wide_lm_head_rows_shared_with_verify():
+    """Target verification (runtime.verify) runs the evict-first LM-head GEMM at
+    lmhead.WIDE_ROWS, the same shard GEMM the bench measured: 17-32 rows only, the
+    drafter's WIDE_LM_HEAD rows, cuBLAS at the measured-slower rows."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.verify import lmhead
+
+    assert (lmhead.WIDE_ROWS.start, lmhead.WIDE_ROWS.stop) == (17, 33)
+    for steps in (3, 7):
+        table = draft.WIDE_LM_HEAD[16]
+        wide = {r for r in range(1, 257 * steps) if draft.covered(table, r, steps)}
+        assert wide <= set(lmhead.WIDE_ROWS), steps
+    assert not set(LM_HEAD_CUBLAS_ROWS) & set(lmhead.WIDE_ROWS)
+
+
 # ---------------------------------------------------------------------- projections
 
 

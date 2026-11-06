@@ -1330,7 +1330,14 @@ HEAD_STAGES = 11
 # tiles loaded before the PDL wait), from the 1-GPU KDA chain (TP16 B8, 69 layers, one
 # arm per process; notes/kdahead3.md). Loading more before the wait slows the AttnRes
 # (its post-arrival reads share the memory system with the weight stream).
-HEAD_TILE = (11, 64, 12, 17)
+# 21 early A tiles (was 17), from the VR200 kernel bench (nqbench kern-kda, section a,
+# q1 B8 KDA chain behind tail / AttnRes stand-ins, early 9 / 13 / 17 / 21, us per
+# layer, the polled head as served): FP32 state chain 7.10 / 6.50 / 5.95 / 5.79, graph
+# per layer incl. stand-ins 15.13 / 14.54 / 14.05 / 13.81 (-2.7% / -1.7%); BF16 state
+# chain 6.82 / 6.21 / 5.73 / 5.54, graph 14.79 / 14.19 / 13.72 / 13.46 (-3.4% /
+# -1.9%). Only the A tiles loaded before the wait move: same MMAs in the same order.
+# NQ-TUNE: early above 21 (the sweep's largest; the AttnRes slowdown above bounds it).
+HEAD_TILE = (11, 64, 12, 21)
 # Rubin (compute capability 10.7) KdaHead batches per TP whose output is polled by the
 # fused o-projection (``OprojFused(polled_x="half")``) instead of read after its PDL
 # wait. Each of the model's n >= 2 KdaHead layers owns a [8, dim] buffer (per layer:

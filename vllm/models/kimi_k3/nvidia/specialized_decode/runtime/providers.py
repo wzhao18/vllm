@@ -49,11 +49,12 @@ PREPARED_MAX = BATCHES[-1]
 # projection and recurrence run as one kernel (``KdaHead``; BF16 or FP32 recurrent
 # state, ``kda.head.head_supported``). Single-GPU chain behind an AttnRes-like
 # predecessor, B8, BF16 state: -0.36 us per KDA layer.
-# NQ-TUNE: FP32 state (no FP32 number exists for any KdaHead kernel): the same KDA
-# chain, KdaHead(Wide) vs the in-projection -> KdaSplit pair at q1 B8, KdaHeadVerify
-# vs the pair at q8 M8 (B1), KdaHeadMulti vs the pair at q8 M16 and q4 M8; also
-# re-sweep HEAD_TILE / VERIFY_EARLY_LOADS / MULTI_TILE early tiles (the FP32 state
-# doubles each KDA CTA's early state loads: 16 rows x 512 B).
+# FP32 state, VR200 kernel bench (nqbench kern-kda, section a: 1-GPU KDA chain behind
+# tail / AttnRes stand-ins, graph us per layer incl. stand-ins), head vs the
+# in-projection -> KdaSplit pair: q1 B8 14.05 vs 16.31, q8 M8 (KdaHeadVerify) 14.92 vs
+# 17.82, q8 M16 (KdaHeadMulti) 16.38 vs 20.67, q4 M8 14.24 vs 16.89. The early-tile
+# re-sweep moved HEAD_TILE to 21 (kda.head); VERIFY_EARLY_LOADS / MULTI_TILE keep 21
+# (their 15 / 18 / 24 arms within 1.6% or slower; multi 24 does not fit TMEM at M16).
 HEAD_BATCHES = (8,)
 # Rubin TP16 (BF16 state) verify rows per q whose KDA layers run the in-projection and
 # the verify recurrence of several requests in one kernel (``KdaHeadMulti``: the M8
