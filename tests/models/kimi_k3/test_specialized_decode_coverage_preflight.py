@@ -35,7 +35,22 @@ from unittest.mock import MagicMock
 import pytest
 
 ROOT = FilePath(__file__).resolve().parents[3]
-CFG2BENCH = ROOT / "benchmarks/kernels/k31_vr/nq/cfg2bench.py"
+# The checkout's harness, else the copy the cluster runs (a staged overlay ships only
+# vllm/ and tests/).
+CFG2BENCH = next(
+    (
+        path
+        for path in (
+            ROOT / "benchmarks/kernels/k31_vr/nq/cfg2bench.py",
+            FilePath(
+                "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/nqbench/tools/"
+                "cfg2bench.py"
+            ),
+        )
+        if path.exists()
+    ),
+    ROOT / "benchmarks/kernels/k31_vr/nq/cfg2bench.py",
+)
 
 # ---------------------------------------------------------------- the faked VR200
 
@@ -143,6 +158,12 @@ def deployments():
 
 DEPLOYMENTS = deployments() if CFG2BENCH.exists() else []
 IDS = [d[0] for d in DEPLOYMENTS]
+
+
+def test_deployments_found():
+    """The preflight must not pass by covering nothing: without the harness the
+    deployment-parametrized checks would all be skipped."""
+    assert DEPLOYMENTS, f"no deployments: {CFG2BENCH} not found"
 
 
 def test_points_match_the_snapshots():

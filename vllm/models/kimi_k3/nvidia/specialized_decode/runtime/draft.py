@@ -741,7 +741,7 @@ class DraftFastPath:
                 # is), whatever the checkpoint's dflash_config says (both
                 # kimi-k3-dspark and kimi-k3.1-pro-dspark-preview run non-causal).
                 causal = not any(
-                    getattr(a.mla_attn, "non_causal_multi_token_decode", False)
+                    getattr(a, "non_causal_multi_token_decode", False)
                     for a in attentions
                 )
                 prepared_dcp = DraftDcp(
