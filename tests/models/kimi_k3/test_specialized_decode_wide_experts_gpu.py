@@ -185,8 +185,10 @@ def production_experts(logical, dev):
     trtllm = Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8
     config = VllmConfig()
     config.kernel_config.moe_backend = "auto"  # production: moe-backend auto
-    fd, store = tempfile.mkstemp()
-    os.close(fd)
+    # c10d's FileStore deletes its file when the last store using it closes
+    # (cleanup_dist_env_and_memory): own a directory, not the file.
+    tmp = tempfile.TemporaryDirectory()
+    store = os.path.join(tmp.name, "store")
     try:
         with set_current_vllm_config(config), torch.device(dev):
             init_distributed_environment(
@@ -234,7 +236,7 @@ def production_experts(logical, dev):
             weights = w13, layer.w13_weight_scale, w2, layer.w2_weight_scale
     finally:
         cleanup_dist_env_and_memory()
-        os.unlink(store)
+        tmp.cleanup()
     return dict(layer=layer, config=config, weights=weights, dies=tuple(dies))
 
 
@@ -520,7 +522,7 @@ class Stock:
 
 
 def errors(out, ref):
-    """max / mean abs error and max / mean row-relative L2 error of ``out`` vs
+    """Max / mean abs error and max / mean row-relative L2 error of ``out`` vs
     ``ref``, plus the per-row relative errors."""
     err = out.double() - ref
     rel = err.norm(dim=1) / ref.norm(dim=1).clamp_min(1e-30)
@@ -570,9 +572,7 @@ def contract_probe(case, spec):
     by32 = err.view(rows, -1, 32).sum((0, 1)) / norm.view(rows, -1, 32).sum((0, 1))
     by_tile = err.view(rows, 28, 128).sum((0, 2)) / norm.view(rows, 28, 128).sum((0, 2))
     by32, by_tile = by32.sqrt(), by_tile.sqrt()
-    lines.append(
-        "  rel by column % 32: " + " ".join(f"{v:.2f}" for v in by32.tolist())
-    )
+    lines.append("  rel by column % 32: " + " ".join(f"{v:.2f}" for v in by32.tolist()))
     lines.append(
         f"  rel by FC2 tile: min {by_tile.min().item():.3f} max "
         f"{by_tile.max().item():.3f}"
