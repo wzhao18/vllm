@@ -755,7 +755,10 @@ def _dcp_case(steps, rows_list, causal, world, rank, group, device, interleave,
                        interleave, group)
             for layer in layers
         ]  # fmt: skip
-        if rows == largest:  # the check sees the mask: the other one differs
+        # The check sees the mask: the other one differs. (Not in rows mode, whose
+        # metadata carries the mask as each row's own length, so the stock call with
+        # the other flag computes the same rows.)
+        if rows == largest and "rows mode" not in label:
             other = _stock_dcp(q, cache, metadata, not causal, layers[0].W_UV, world,
                                rank, interleave, group)  # fmt: skip
             if _close(other, expected[0]):
