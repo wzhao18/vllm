@@ -275,8 +275,22 @@ def _check_q_codes(name, ours, stock, scales):
             f"ours/stock factor {ratio:.4g}"
         )
     assert sentinel == 0, (name, "the q mailbox read after its re-arm", sentinel)
-    assert int(steps.max()) <= 1, (name, int(steps.max()))
+    # One BF16 rounding apart (summation order) moves a normal E4M3 code by at most one
+    # step; two steps only where the W_UK dot product cancels to a small value (a BF16
+    # ulp of the inputs is then several ulps of the result), so codes more than one
+    # step apart must be small and rare, and the dequantized rows within BF16 rounding.
+    far = steps > 1
+    if bool(far.any()):
+        mags = torch.stack([a[far].abs(), b[far].abs()]).max(0).values
+        print(
+            f"{name} FP8 query: {int(far.sum())} codes > 1 step apart, max |q| there "
+            f"{float(mags.max()):.3g} (row max |q| {float(b.abs().max()):.3g})"
+        )
+        assert int(steps.max()) <= 2, (name, int(steps.max()))
+        assert int(far.sum()) <= 1e-3 * steps.numel(), (name, int(far.sum()))
+        assert float(mags.max()) <= 0.125 * float(b.abs().max()), (name, float(mags.max()))
     assert differ <= 0.05 * steps.numel(), (name, differ)
+    assert relative(a, b) <= 5e-3, (name, relative(a, b))
 
 
 class _TapQuery:
