@@ -212,7 +212,8 @@ class SpDsaCore:
             raise Unsupported("dsa", None, cause)
         if parity not in (0, 1):
             raise Unsupported("dsa", None, f"parity {parity}")
-        self.q, self.ctx = q = ctx.q, ctx
+        self.q, self.ctx = ctx.q, ctx
+        q = ctx.q
         self.rows = rows = tuple(sorted(set(rows)))
         if not rows:
             raise Unsupported("dsa", None, "no captured row counts")

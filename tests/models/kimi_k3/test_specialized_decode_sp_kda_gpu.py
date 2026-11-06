@@ -31,6 +31,7 @@ if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7
 
 os.environ.setdefault("VLLM_SSM_CONV_STATE_LAYOUT", "DS")  # C512's conv layout
 
+from vllm.config import VllmConfig, set_current_vllm_config  # noqa: E402
 from vllm.model_executor.layers.mamba.mamba_utils import (  # noqa: E402
     is_conv_state_dim_first,
 )
@@ -83,7 +84,11 @@ def layer(seed=0):
     def randn(*shape, dtype=torch.float32, scale=1.0):
         return (torch.randn(*shape, generator=g, device=DEVICE) * scale).to(dtype)
 
-    norm = FusedRMSNormGated(128, eps=1e-5, activation="sigmoid").to(DEVICE)
+    # o_norm is a CustomOp: it picks its forward from the current config's
+    # compilation config at construction (stock default config, as the
+    # default_vllm_config fixture; the GPU runner loads no tests/conftest.py).
+    with set_current_vllm_config(VllmConfig()):
+        norm = FusedRMSNormGated(128, eps=1e-5, activation="sigmoid").to(DEVICE)
     with torch.no_grad():
         norm.weight.copy_(1 + randn(128, scale=0.1))
     return Module(

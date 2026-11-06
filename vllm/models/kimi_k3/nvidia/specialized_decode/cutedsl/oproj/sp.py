@@ -168,11 +168,13 @@ class SpOprojWarp:
                 for h in cutlass.range_constexpr(2):
                     address = shared_address(at(red, token, chunk * 8 + h * 4))
                     sums = load_cluster_f32x4(address, 0)
-                    for src in cutlass.range_constexpr(1, S):
-                        more = load_cluster_f32x4(address, src)
+                    # (fresh names: a name bound before this dynamic ``if`` -- the
+                    # weight loop's ``src`` pointer -- must keep its type through it)
+                    for peer in cutlass.range_constexpr(1, S):
+                        more = load_cluster_f32x4(address, peer)
                         sums = tuple(add_rn(s, m) for s, m in zip(sums, more))
-                    for v in cutlass.range_constexpr(4):
-                        values[h * 4 + v] = sums[v]
+                    for e in cutlass.range_constexpr(4):
+                        values[h * 4 + e] = sums[e]
                 words = tuple(
                     positive_zero32(
                         pack_pair(values[2 * j], values[2 * j + 1], policy=None)
