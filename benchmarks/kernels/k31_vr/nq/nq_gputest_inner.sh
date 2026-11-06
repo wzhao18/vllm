@@ -15,15 +15,18 @@ mkdir -p $OUT $K31_DCPX_BUILD_DIR $K31_DSAC_BUILD_DIR; : > $OUT/status.txt
 cd $NQ_OV
 echo "NQTEST host $(hostname) gpus $CUDA_VISIBLE_DEVICES: $(nvidia-smi --query-gpu=index,name,memory.used --format=csv,noheader | tr '\n' ' ')"
 python3 -c "import vllm, os; print('NQTEST vllm from', os.path.dirname(vllm.__file__))"
+SP4='test_kimi_k3_sdec_sp_*.py'  # run on the 4-GPU node only
 if [ $N = 4 ]; then
   T=tests/models/kimi_k3
+  # (+ the C512 SP decode's distributed tests: TP4 = DCP4 needs 4 GPUs; on 2 they skip)
   FILES=$(ls $T/test_specialized_decode_*gpu*.py $T/test_specialized_decode_draft_nq.py $T/test_specialized_decode_wide_nq.py \
-    $T/test_specialized_decode_plan.py $T/test_specialized_decode_dsa*.py 2>/dev/null | sort -u)
+    $T/test_specialized_decode_plan.py $T/test_specialized_decode_dsa*.py $T/test_specialized_decode_sp_*.py \
+    $T/test_specialized_decode_coverage_preflight.py tests/distributed/$SP4 2>/dev/null | sort -u)
 else
   FILES=$( { ls tests/distributed/test_*specialized_decode*.py tests/distributed/test_*kimi_k3*.py \
       tests/distributed/test_*k31*.py tests/distributed/test_*dcp_exchange*.py 2>/dev/null
     sed -n 's/^T \(tests\/distributed\/.*test_[^/]*\.py\)$/\1/p' SOURCE_REV | while read -r f; do [ -f $f ] && echo $f; done
-  } | sort -u)
+  } | grep -v "/test_kimi_k3_sdec_sp_" | sort -u)
 fi
 [ -n "$FILES" ] || { echo "NQTEST none - rc=NONE secs=0 (no test files of this stage in the overlay)" | tee -a $OUT/status.txt; exit 0; }
 # The planned runs, before any starts: a run with a plan line and no result line did not finish (nq_junit: NOT RUN).

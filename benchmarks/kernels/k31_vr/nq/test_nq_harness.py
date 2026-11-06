@@ -561,6 +561,20 @@ def test_c512_dp():
     assert a[a.index("--data-parallel-size") + 1] == "4" and a[a.index("--tensor-parallel-size") + 1] == "4"
     assert "--enable-expert-parallel" in a and "--use-replayssm" in a and "--data-parallel-rpc-port" not in a
     assert a[a.index("--additional-config") + 1] == '{"decode_backend": "latency_specialized"}'
+    # trtllm-gen sparse MLA on both arms (the SP decode refuses 'auto' -> prims_ts under DCP4)
+    for arm in (ls, st):
+        kc = json.loads(arm["argv"][arm["argv"].index("--kernel-config") + 1])
+        assert kc == {"flashinfer_sparse_mla_kernel": "trtllm"}, kc
+    assert any(n.startswith("C512: kernel-config flashinfer_sparse_mla_kernel auto -> trtllm") for n in ls["notes"])
+    assert "--kernel-config" not in cfg2bench.build(doc(), "ls", "new", [8])["argv"]  # TP16 unchanged
+    pt = c512_doc()
+    pt["roles"]["decode"]["args"]["kernel-config"] = '{"flashinfer_sparse_mla_kernel": "prims_ts"}'
+    try:
+        cfg2bench.build(pt, "ls", "new", [8])
+    except SystemExit as e:
+        assert "trtllm-gen only" in str(e), e
+    else:
+        raise AssertionError("C512 prims_ts accepted")
     assert any(n.startswith("layout: TP4 x DCP4 x DP4, EP16") for n in ls["notes"]), ls["notes"]
     assert not any(n.startswith("WARNING") for n in ls["notes"]), ls["notes"]
     sh = cfg2bench.as_sh(ls, "x")

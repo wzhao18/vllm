@@ -233,6 +233,32 @@ def layout(args):
     return tp, dcp, dp, ep
 
 
+C512_LAYOUT = (4, 4, 4, 16)  # (tp, dcp, dp, ep) of the C512 decode role
+
+
+def c512_kernel_config(args, notes):
+    """The C512 decode role's kernel-config with FlashInfer sparse MLA on trtllm-gen, both arms.
+
+    The SP decode runs trtllm-gen only and refuses a deployment whose stock sparse MLA would resolve
+    to prims_ts (runtime.sp_unsupported: "auto" picks prims_ts under DCP where it can run, i.e. this
+    DCP4 per-tensor fp8 role on VR200), so with the config's "auto" the ls arm would refuse at load.
+    Both arms get "trtllm" (c512_contract.md: no prims_ts anywhere), so stock is the trtllm-gen stock
+    the SP decode matches. An explicit prims_ts is refused here (the ls arm cannot run it)."""
+    kc = json.loads(args.get("kernel-config") or "{}")
+    kernel = kc.get("flashinfer_sparse_mla_kernel", "auto")
+    if kernel not in ("auto", "trtllm"):
+        sys.exit(f"cfg2bench: C512 kernel-config flashinfer_sparse_mla_kernel={kernel!r}: the SP decode "
+                 "runs trtllm-gen only")
+    if kernel != "trtllm":
+        notes.append(
+            f"C512: kernel-config flashinfer_sparse_mla_kernel {kernel} -> trtllm on both arms (the SP "
+            "decode refuses 'auto' resolving to prims_ts under DCP4: runtime.sp_unsupported); the "
+            "production C512 config needs the same setting for the specialized decode"
+        )
+        kc["flashinfer_sparse_mla_kernel"] = "trtllm"
+    return json.dumps(kc)
+
+
 def split_rows(doc, rows):
     """(rows <= the production limit, rows above it): limit = min(max-num-seqs * q,
     max capture size), the largest verify row the production config captures."""
@@ -403,6 +429,8 @@ def build(doc, arm, drafter, rows, full_capture=False):
     comp["cudagraph_capture_sizes"] = sizes
     extra = json.loads(args.get("additional-config") or "{}")
     extra["decode_backend"] = "latency_specialized" if arm == "ls" else "auto"
+    if (tp, dcp, dp, ep) == C512_LAYOUT:
+        args = {**args, "kernel-config": c512_kernel_config(args, notes)}
     argv = ["--model", TARGET, "--load-format", "dummy"]
     for key in sorted(KEEP & set(args)):
         argv += flag(key, args[key])

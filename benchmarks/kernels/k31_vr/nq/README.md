@@ -139,6 +139,16 @@ sizes 4..512. The specialized arm is the sequence-parallel decode from `wzhao/k3
 and the MoE are declared stock modules, coverage lines `Kimi K3 SP decode coverage M<R>(q4)`). Stage that checkout as
 the overlay: both arms run it, so the stock arm is the same tree's stock code.
 
+Sparse MLA kernel: the config leaves `flashinfer_sparse_mla_kernel` at `auto`, which resolves to prims_ts under DCP4
+with the per-tensor fp8 cache on VR200, and the SP decode refuses that (`runtime.sp_unsupported`; it runs trtllm-gen
+only, `c512_contract.md`: no prims_ts). `cfg2bench.py` therefore sets `--kernel-config
+{"flashinfer_sparse_mla_kernel": "trtllm"}` on **both** arms for this layout (a `C512:` note in the log) and refuses an
+explicit prims_ts. The production C512 config needs the same setting before the specialized decode can serve it.
+
+GPU tests: the 4-GPU stage of `nq_gputest_inner.sh` also runs `tests/distributed/test_kimi_k3_sdec_sp_*.py` (TP4 =
+DCP4 needs 4 GPUs; the 2-GPU stage skips them) plus the torch-importing CPU tests `test_specialized_decode_sp_*.py`
+and `test_specialized_decode_coverage_preflight.py`.
+
 How DP runs in the bench (nothing to patch): `vllm bench forward` uses the external launcher, so the world is
 tp x dp = 16 ranks and each rank's DP rank is `RANK // 4` (`config/parallel.py`). Ranks 0-3 (one node) form DP rank 0,
 and so on. Every rank builds the same case: cases are per DP rank, and the context draw is seeded by `--seed` only.
