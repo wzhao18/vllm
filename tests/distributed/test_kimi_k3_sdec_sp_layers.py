@@ -59,6 +59,7 @@ variants sweep all 128 captured R. Tolerances are BF16 / FP32 reduction-order bo
 Needs 4 Rubin (SM107) GPUs with NVLink multicast; CuTe compiles dominate a cold
 cache."""
 
+import math
 import os
 import time
 import zlib
@@ -193,6 +194,19 @@ def _check_rows(name, got, want, median=1e-2, tail=3e-2, worst=0.15):
 # * no same-set row past 0.15 (a wrong head, scale, LSE base, W_UV or gate moves
 #   rows by 10-100%; on differing rows the residual bound above catches it).
 DSA_DIRECT = dict(median=1.6e-2, tail=3e-2, worst=0.15)
+# The same-set median follows the paths' query distance (``_check_q_codes``: the
+# dequantized relative error of our FP8 query codes against stock's), which moves
+# with the R-dependent flip share: at 6e67e34, R256-R512 (0.04% codes flipped, query
+# 0.8e-3, the core on our query median 0 per (row, head)) 4.96-5.08e-3: the floor of
+# the other rounding points (P codes, merge, W_UV, gate); R20-R64 (1.0-1.25%, query
+# 3.9-4.4e-3) and R68 / R128 (1.83%, 5.29-5.30e-3; the core on our query alone
+# 1.27-1.35e-2 per (row, head) there against 0.23-0.79e-2 at R20-R64) up to 1.74e-2.
+# In quadrature over the floor that is at most 3.2 x the query distance (every rank
+# and arm); R68's rows keep their residual within 0.62-0.69 of stock's own FP64
+# error (our error against FP64 0.998 of stock's). So the median is held to the
+# larger of ``DSA_DIRECT``'s and hypot(``DSA_FLOOR``, ``DSA_Q_GAIN`` x query
+# distance): the fixed 1.6e-2 below query 3.8e-3, 2.2e-2 at R68's 5.29e-3.
+DSA_FLOOR, DSA_Q_GAIN = 5e-3, 4.0
 DSA_SAME = dict(atol=2e-2, rtol=2e-2)
 DSA_BAND, DSA_SWAP = 1.0, 0.1
 # Fewest same-set rows whose median is held to ``DSA_DIRECT``'s (R24 rank 0's shard:
@@ -292,20 +306,30 @@ def _check_q_codes(name, ours, stock, scales):
         )
     assert sentinel == 0, (name, "the q mailbox read after its re-arm", sentinel)
     # One BF16 rounding apart (summation order) moves a normal E4M3 code by at most one
-    # step; two steps only where the W_UK dot product cancels to a small value (a BF16
-    # ulp of the inputs is then several ulps of the result), so codes more than one
-    # step apart must be small and rare, and the dequantized rows within BF16 rounding.
+    # step; more only where the W_UK dot product cancels to a small value: the inputs'
+    # BF16 flips move it by an absolute amount on the scale of its terms, several
+    # E4M3 steps of a small result. So codes more than one step apart must be small
+    # and rare, each at most one BF16 ulp of the largest |q| apart (the rounding
+    # scale of the terms; a step count is no bound there: at 6e67e34 R72 had 92 of
+    # 3981312 codes past one step, max 3 steps at |q| <= 0.0625 of a 5.5 row max, so
+    # at most 3 x 2^-8 = 1.2e-2 apart, under the ulp 2^-5 = 3.1e-2; the former
+    # two-step cap allowed 2 x 2^-4 = 0.125 at the 1/8 row max), and the dequantized
+    # rows within BF16 rounding (below).
     far = steps > 1
     if bool(far.any()):
         mags = torch.stack([a[far].abs(), b[far].abs()]).max(0).values
+        apart = float((a[far] - b[far]).abs().max())
+        top = float(b.abs().max())
+        ulp = 2.0 ** (math.floor(math.log2(top)) - 7)
         print(
-            f"{name} FP8 query: {int(far.sum())} codes > 1 step apart, max |q| there "
-            f"{float(mags.max()):.3g} (row max |q| {float(b.abs().max()):.3g})"
+            f"{name} FP8 query: {int(far.sum())} codes > 1 step apart (max "
+            f"{int(steps.max())}), max |q| there {float(mags.max()):.3g}, max apart "
+            f"{apart:.3g} (row max |q| {top:.3g}, its BF16 ulp {ulp:.3g})"
         )
-        assert int(steps.max()) <= 2, (name, int(steps.max()))
+        assert apart <= ulp, (name, "far codes apart", apart, ulp)
         assert int(far.sum()) <= 1e-3 * steps.numel(), (name, int(far.sum()))
         biggest = float(mags.max())
-        assert biggest <= 0.125 * float(b.abs().max()), (name, biggest)
+        assert biggest <= 0.125 * top, (name, biggest)
     assert differ <= 0.05 * steps.numel(), (name, differ)
     # One-step flips spread over codes of every magnitude: the dequantized distance
     # is sqrt(flipped share) x the RMS step relative to the RMS code. A step is 2^-4
@@ -315,6 +339,7 @@ def _check_q_codes(name, ours, stock, scales):
     # step ones, approach 2^-3.
     share = differ / steps.numel()
     assert relative(a, b) <= 2**-4 * share**0.5, (name, relative(a, b), share)
+    return relative(a, b)
 
 
 class _TapQuery:
@@ -458,11 +483,13 @@ def _check_selection(name, same, overlap, counts, lengths):
     )  # fmt: skip
 
 
-def _check_dsa_rows(name, got, want, refs, same):
+def _check_dsa_rows(name, got, want, refs, same, query):
     """Ours vs stock per row (``got``, ``want``) with each path's FP64 reference over
     the keys it selected (``refs``: ours', stock's; ``_dsa_selected_reference``)
     and whether the row's global top-k set is the same on both (``same``):
-    ``DSA_DIRECT`` (median, p98) and ``DSA_SAME`` (elementwise) on the same-set
+    ``DSA_DIRECT`` (median, p98; the median bound raised to hypot(``DSA_FLOOR``,
+    ``DSA_Q_GAIN`` x ``query``) where larger, ``query`` the FP8 query's dequantized
+    distance from ``_check_q_codes``) and ``DSA_SAME`` (elementwise) on the same-set
     rows; on every row the distance less the selections' FP64 effect within
     ``DSA_BAND`` of stock's own error, and no same-set row past ``DSA_DIRECT``'s
     worst.
@@ -509,8 +536,9 @@ def _check_dsa_rows(name, got, want, refs, same):
         # of the per-row spread (exact rows measured 0.5-2.23e-2): there every row
         # is held to the tail bound instead.
         worst = float(errors[same].max())
+        median = max(DSA_DIRECT["median"], math.hypot(DSA_FLOOR, DSA_Q_GAIN * query))
         if int(same.sum()) >= DSA_MEDIAN_ROWS:
-            assert quantiles[0] <= DSA_DIRECT["median"], (name, quantiles)
+            assert quantiles[0] <= median, (name, quantiles, median)
         else:
             assert worst <= DSA_DIRECT["tail"], (name, "few same-set rows", worst)
         assert quantiles[1] <= DSA_DIRECT["tail"], (name, quantiles)
@@ -1319,7 +1347,7 @@ def _dsa_case(config, rank, device, indexer, topk_mode, rows, refusals):
         # printed), the merge and gate on stock's partials and counts.
         seen = feed.seen
         assert set(seen) == {"rows", "replay", "query", "kv", "order"}, set(seen)
-        _check_q_codes(where, ours_q, stock["q"], q_scales)
+        query = _check_q_codes(where, ours_q, stock["q"], q_scales)
         stock_core = stock["latent"], stock["lse"]
         _check_core_replay(where, seen["replay"], stock_core, stock["counts"])
         same_set = _check_slots(where, local_sets, exact)
@@ -1341,8 +1369,10 @@ def _dsa_case(config, rank, device, indexer, topk_mode, rows, refusals):
         # Ours vs stock: the whole path, same-set rows as exact ones, every row
         # within stock's error once the selections' FP64 effect is taken out.
         mine = slice(rank * n, (rank + 1) * n)
-        _check_dsa_rows(f"{where} o_proj input", attn_in, entering[0], sel_in, same)
-        _check_dsa_rows(f"{where} shard", got, want, sel_shard, same[mine])
+        _check_dsa_rows(
+            f"{where} o_proj input", attn_in, entering[0], sel_in, same, query
+        )
+        _check_dsa_rows(f"{where} shard", got, want, sel_shard, same[mine], query)
         # Accuracy: each path against FP64 attention over the keys it selected.
         _check_dsa_reference(f"{where} o_proj input", attn_in, entering[0], sel_in)
         _check_dsa_reference(f"{where} shard", got, want, sel_shard)
@@ -1395,7 +1425,10 @@ def _dsa_refusals(attn, block, step, rank, device):
     from vllm.models.kimi_k3.nvidia.specialized_decode.shapes import Unsupported
 
     group = get_tp_group().device_group
-    with pytest.raises(Unsupported, match="192 gathered query heads"):
+    size = torch.distributed.get_world_size(group)
+    # sp.sp_dsa_box names the factors: "<TP> x <local heads> gathered query heads".
+    refused = f"{size} x 48 gathered query heads: trtllm-gen sparse MLA reads at most"
+    with pytest.raises(Unsupported, match=refused):
         sp_dsa_box(group, device, rank, heads=48, cap=CAP, interleave=1)
     dcp2 = _context(rank, device, dcp=2)
     with pytest.raises(Unsupported, match=r"DCP4 box under TP4 / DCP2"):
