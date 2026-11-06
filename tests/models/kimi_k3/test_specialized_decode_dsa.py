@@ -1209,6 +1209,7 @@ def test_flashinfer_dcp_core_merges_to_full_attention(
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.prepared import (
         PreparedDsa,
     )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.shapes import target_topology
     from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
         FlashInferMLASparseImpl,
     )
@@ -1302,6 +1303,8 @@ def test_flashinfer_dcp_core_merges_to_full_attention(
             indexer=SimpleNamespace(cp_kv_cache_interleave_size=1),
             parity=0,
             box=SimpleNamespace(q=box),
+            # PreparedDsa's: NQ-NOFALLBACK applies on TP16 = DCP16 only (DCP8 here)
+            strict=target_topology(True, dcp, dcp, q),
         )
         # Stale rows and LSEs of an earlier layer must not leak into empty rows.
         buffers[2].fill_(float("nan"))
@@ -2544,6 +2547,12 @@ def test_prepared_dsa_run_matches_stock(
     query forked off the indexer path (QueryNorm, then MlaQuery on a side stream)."""
     if LAYER_CORES[core][2] == "prims_ts" and no_prims_ts():
         pytest.skip("FlashInfer prims_ts sparse MLA cannot run here")
+    if core == "flashmla" and torch.cuda.get_device_capability() == (10, 7):
+        # The stock FlashMLA sparse decode's combine kernel faults on SM107 (the
+        # unmodified 242fb49cd4 too: combine.cu:241 unspecified launch failure), and the
+        # fault poisons every later CUDA / NCCL call of the process; VR serves the
+        # FlashInfer sparse cores.
+        pytest.skip("SM107: stock FlashMLA sparse decode faults (combine.cu)")
     if core == "flashmla" and batch >= 40:
         why = "fp8_ds_mla tile scale / k_pe bytes of the new rows differ from stock's"
         sm107_known(request, why)
@@ -2557,14 +2566,26 @@ def test_nvfp4_runtime_gate():
     from vllm.models.kimi_k3.nvidia.specialized_decode.runtime import (
         nvfp4_unsupported,
     )
-    from vllm.utils.flashinfer import has_flashinfer_prims_ts_sparse_mla
+    from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
+        _prims_ts_unsupported_reason,
+    )
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
     config = layer_config("fi-nvfp4", 1)
-    if has_flashinfer_prims_ts_sparse_mla():
-        assert nvfp4_unsupported(config) is None
+    # Whether FLASHINFER_MLA_SPARSE plans prims_ts over nvfp4_ds_mla on this GPU
+    # (SM107 with FlashInfer 0.7.3: "sparse TS MLA requires SM100 or SM103"):
+    # taken there, rejected with that reason elsewhere (never a silent fallback).
+    planner = _prims_ts_unsupported_reason(config, "nvfp4_ds_mla")
+    reason = nvfp4_unsupported(config)
+    if planner is None:
+        assert reason is None
     else:
-        assert "prims_ts" in nvfp4_unsupported(config)
+        assert reason is not None and "without FlashInfer prims_ts" in reason
+        assert planner in reason
+    if torch.cuda.get_device_capability() == (10, 7):
+        # Independent of the planner: no prims_ts on SM107 (GR100), so nvfp4_ds_mla
+        # DSA layers there must be refused, not served.
+        assert reason is not None, "nvfp4_ds_mla accepted on SM107"
     config.kernel_config.flashinfer_sparse_mla_kernel = "trtllm"
     assert "trtllm-gen" in nvfp4_unsupported(config)
     config = layer_config("fi-nvfp4", 1)

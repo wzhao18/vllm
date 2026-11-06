@@ -36,7 +36,7 @@ from ..cutedsl.mla.query import POLLED_X
 from ..cutedsl.mla.rows import VERIFY_ROWS
 from ..cutedsl.oproj.prepared import PreparedOproj, fused_schedule, shared_x
 from ..cutedsl.oproj.prepared import choose as oproj_choose
-from ..shapes import Path, Shape, rows_policy
+from ..shapes import Path, Shape, refuse, rows_policy
 from .seams import StockAttnRes, gate_sigmoid_mul, warm_gate
 
 # Decode batches (tokens) served by the prepared providers: every batch up to 8, the
@@ -49,11 +49,12 @@ PREPARED_MAX = BATCHES[-1]
 # projection and recurrence run as one kernel (``KdaHead``; BF16 or FP32 recurrent
 # state, ``kda.head.head_supported``). Single-GPU chain behind an AttnRes-like
 # predecessor, B8, BF16 state: -0.36 us per KDA layer.
-# NQ-TUNE: FP32 state (no FP32 number exists for any KdaHead kernel): the same KDA
-# chain, KdaHead(Wide) vs the in-projection -> KdaSplit pair at q1 B8, KdaHeadVerify
-# vs the pair at q8 M8 (B1), KdaHeadMulti vs the pair at q8 M16 and q4 M8; also
-# re-sweep HEAD_TILE / VERIFY_EARLY_LOADS / MULTI_TILE early tiles (the FP32 state
-# doubles each KDA CTA's early state loads: 16 rows x 512 B).
+# FP32 state, VR200 kernel bench (nqbench kern-kda, section a: 1-GPU KDA chain behind
+# tail / AttnRes stand-ins, graph us per layer incl. stand-ins), head vs the
+# in-projection -> KdaSplit pair: q1 B8 14.05 vs 16.31, q8 M8 (KdaHeadVerify) 14.92 vs
+# 17.82, q8 M16 (KdaHeadMulti) 16.38 vs 20.67, q4 M8 14.24 vs 16.89. The early-tile
+# re-sweep moved HEAD_TILE to 21 (kda.head); VERIFY_EARLY_LOADS / MULTI_TILE keep 21
+# (their 15 / 18 / 24 arms within 1.6% or slower; multi 24 does not fit TMEM at M16).
 HEAD_BATCHES = (8,)
 # Rubin TP16 (BF16 state) verify rows per q whose KDA layers run the in-projection and
 # the verify recurrence of several requests in one kernel (``KdaHeadMulti``: the M8
@@ -194,6 +195,21 @@ INPROJ_LT = {
     3216: "260-336:1,388-480:1,516-576:1",
     2880: "292-576:1",
 }
+
+
+def inproj_note(attention, b):
+    """NQ-NOFALLBACK: the coverage note of an attention's in-projection at a wide
+    batch: the specialized GEMM, or the stock cuBLAS GEMM with its measured reason
+    (``PROJECTION_GENERIC`` / ``INPROJ_LT``; NQ-TUNE where none exists)."""
+    if b in attention.projection.fallback.kernels:
+        return "inproj splitk"
+    library = "cuBLASLt" if attention.lt_rows.get(b) else "cuBLAS"
+    pitch = attention.weight.shape[0]
+    if pitch in INPROJ_LT:
+        why = "split-K loses above 128 rows: M256 17.1 vs 9.8 us"
+    else:  # the K3.1 DSA rows (3040): no measurement of either choice
+        why = f"{pitch}-row projection unmeasured vs split-K / cuBLASLt: NQ-TUNE"
+    return f"inproj stock {library} ({why})"
 
 
 def projection_policies(tp, rows, batches, sms=152, q=1):
@@ -487,6 +503,7 @@ class Attention:
             fits = lambda b, t: eligible and head_supported(
                 kda_core.heads, state, kda_core.has_bias, weight.shape[1], b, t,
                 core=kda_core, fa_width=fa_width, cache_tokens=runtime.q, tp=tp,
+                strict=runtime.context.target,
             )  # fmt: skip
             batches = [b for b in HEAD_BATCHES if b in runtime.batches and fits(b, 1)]
             multi = batch_table(HEAD_MULTI.get(q, ""))
@@ -633,10 +650,18 @@ class Attention:
                 if self.fold64.tokens < 8:  # x's tensor maps, before any capture
                     for hidden in self.runtime.hidden:
                         self.fold64.x_map(hidden[: 8 * self.fold64.tokens])
-            if self.head is not None and caches[1].dtype == self.head_state:
+            if self.head is not None and caches[1].dtype != self.head_state:
+                # NQ-NOFALLBACK: the MoE tail before this layer and its AttnRes were
+                # set up for the head (``use_heads``, the carve-out); dropping it here
+                # would quietly change the step. The state dtype comes from the same
+                # cache config, so a mismatch is a bug: refuse it.
+                refuse(
+                    "KdaHead",
+                    f"bound recurrent state {caches[1].dtype} is not the "
+                    f"{self.head_state} the head was built for",
+                )
+            if self.head is not None:
                 self.head.prepare_caches(caches)
-            else:
-                self.head = None
         else:
             cores = (self.core, self.core_long, self.core_wide)
             cores = [c for c in cores if c is not None]

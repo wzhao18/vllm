@@ -18,13 +18,15 @@ Per layer, after the stock fused query concat (RoPE, FP8, KV insert):
 Parity alternates by drafter layer, as the target's MLA layers. Without the gather
 (FORK_ROWS, POLLED_CORE) the core polls the q rows it reads instead.
 
-Causality (``DraftDcp.causal``): the drafter's MLA layers' own flag (the K3 DSpark
-layers are built non_causal_multi_token_decode, so both kimi-k3-dspark and
-kimi-k3.1-pro-dspark-preview run non-causal, whatever dflash_config says), which
-stock's MLA metadata builder puts in the attention metadata that tokenspeed's
-causal_mask reads; the cores here compile with the same flag (causal: the target verify's
-global-position mask, rows mode's per-row lengths from VerifyRows) and refuse a call
-whose metadata says otherwise (the stock path runs it). The "non-causal" notes below
+Causality (``DraftDcp.causal``): as stock decides it, from the draft checkpoint
+(``not dflash_has_any_non_causal(hf_config)``: is_causal / dflash_config.causal /
+layer_types), which the DSpark speculator puts in the attention metadata that
+tokenspeed's causal_mask reads (kimi-k3.1-pro-dspark-preview: causal; the layers'
+non_causal_multi_token_decode only permits a non-causal batch). The cores here
+compile with the same flag (causal: the target verify's global-position mask, rows
+mode's per-row lengths from VerifyRows). A captured call whose metadata says
+otherwise raises on the target topology
+(NQ-NOFALLBACK; elsewhere the stock path runs it). The "non-causal" notes below
 describe the 64-head drafter the tables were measured on.
 
 The drafter's row-keyed tables here (FAST_CORE .. DRAFT_WLIST) are its own (drafter
@@ -63,6 +65,7 @@ from ..common.host import (
     stream,
     to_cute,
 )
+from ...shapes import Shape, full_capture, refuse
 from ..common.policy import batch_table
 from ..common.primitives import (
     launch,
@@ -349,6 +352,9 @@ class DraftDcp:
         interleave=1, causal=False,
     ):  # fmt: skip
         first = attentions[0]
+        # NQ-NOFALLBACK: set by runtime.draft on the target topology: a captured
+        # drafter graph of a served row raises instead of running stock attention.
+        self.strict = False
         # The drafter's attention mask, as stock resolves it from the drafter config
         # (False: every draft row sees its request's whole context and draft block).
         self.causal = bool(causal)
@@ -403,6 +409,8 @@ class DraftDcp:
         # split partials (mla.dcp split_partials_q, non-causal): rows -> split count.
         # The cores compile once the cache (its page size) is bound (``bind``).
         self.folds, self.fold_values, self.fold_cores = {}, {}, set()
+        # NQ-NOFALLBACK: rows left unfolded -> why (the coverage log's ``core_of``).
+        self.unfolded: dict[int, str] = {}
         self.max_seq = local_max(max_context or 1 << 17, size, interleave)
         # Packed rows (tiles x 128) of the folded and wide rows (``draft_fold_splits``).
         self.packed: dict[int, int] = {}
@@ -421,12 +429,14 @@ class DraftDcp:
         for r in self.rows:
             if r not in FAST_CORE:
                 self.valid.pop(r, None)
+                self.unfolded[r] = "not in FAST_CORE"
                 continue
             split, packed = draft_fold_splits(
                 r, steps, heads, self.max_seq, self.device
             )
             if split <= 1:
                 self.valid.pop(r, None)
+                self.unfolded[r] = f"draft_fold_splits split {split}"
                 continue
             self.folds[r] = split
             self.packed[r] = packed
@@ -608,6 +618,31 @@ class DraftDcp:
         for index, attention in enumerate(attentions):
             attention.draft_dcp = DraftLayerDcp(self, attention, index % 2, index == 0)
 
+    def core_of(self, rows):
+        """NQ-NOFALLBACK: the attention core a served drafter row runs, for the
+        coverage log."""
+        if rows in self.wide_cores:
+            return f"wide polled core split {self.wide_cores[rows][0]}"
+        if rows in self.row_modes:
+            return "rows mode" + (" fork" if rows in self.forks else "")
+        if rows in self.folds:
+            kind = "polled" if rows in self.polled else "gathered"
+            return f"fold split {self.folds[rows]} {kind}"
+        # (``merge``: the stock tokenspeed forward_mqa inside the fast path)
+        why = self.unfolded.get(rows, "not prepared as a fold, wide or rows-mode row")
+        return f"stock tokenspeed forward_mqa + DcpValue ({why}; NQ-TUNE)"
+
+    def coverage(self, rows):
+        """Served rows grouped by their attention core (the coverage log line)."""
+        kinds: dict[str, list[int]] = {}
+        for r in rows:
+            kinds.setdefault(self.core_of(r), []).append(r)
+        return "; ".join(f"{kind}: {r}" for kind, r in kinds.items())
+
+    def served(self, rows):
+        """Whether a captured drafter graph of ``rows`` must run this fast path."""
+        return rows in self.rows or rows in self.wide
+
     def work_list(self, rows, heads, tiles, split, sms):
         """The shared per-step work list (mla.wlist) of DRAFT_WLIST ``rows`` launched
         at their LONG_SPLIT split, or None."""
@@ -718,42 +753,64 @@ class DraftLayerDcp:
                 decode = getattr(metadata.get(attention.layer_name), "decode", None)
                 if decode is not None:
                     self.rows_tables(rows, decode.block_table.shape[1])
-        if (
-            self.query_weights is None
-            or rows not in shared.queries
-            or not capturing
-            or qkv.shape[1] != 2112
-            or not qkv.is_contiguous()
-            or positions.dtype != torch.int64
-        ):
+        # NQ-NOFALLBACK: a captured graph of a row the fused query serves either runs
+        # it or raises (``decline``); eager calls take the stock path (no graph).
+        strict = shared.strict and rows in shared.queries and full_capture()
+
+        def decline(cause):
+            if strict:
+                refuse("DSpark drafter attention (fused query)", cause, Shape(rows))
             return self.join_context()
+
+        if self.query_weights is None or rows not in shared.queries or not capturing:
+            return self.join_context()
+        if qkv.shape[1] != 2112 or not qkv.is_contiguous():
+            return decline(f"in-projection rows {tuple(qkv.shape)} {qkv.stride()}")
+        if positions.dtype != torch.int64:
+            return decline(f"positions {positions.dtype}")
         context = get_forward_context()
         metadata = context.attn_metadata
         slots = context.slot_mapping
         if not isinstance(metadata, dict) or not isinstance(slots, dict):
-            return self.join_context()
+            return decline("no per-layer metadata / slot mapping")
         metadata = metadata.get(attention.layer_name)
         slots = slots.get(attention.layer_name)
         decode = getattr(metadata, "decode", None)
-        if (
-            decode is None
-            or bool(getattr(metadata, "causal", True)) != shared.causal
-            or metadata.num_decode_tokens != rows
-            or metadata.num_prefills
-            or decode.seq_lens.shape[0] * shared.steps != rows
-            or getattr(decode, "dcp_tot_seq_lens", None) is None
-            or slots is None
-            or slots.dtype != torch.int64
-        ):
-            return self.join_context()
+        checks = (
+            (decode is None, "no decode metadata"),
+            (
+                decode is not None
+                and bool(getattr(metadata, "causal", True)) != shared.causal,
+                f"metadata mask is not the layers' (causal={shared.causal})",
+            ),
+            (
+                decode is not None and metadata.num_decode_tokens != rows,
+                "decode tokens != rows",
+            ),
+            (decode is not None and metadata.num_prefills, "prefill rows"),
+            (
+                decode is not None and decode.seq_lens.shape[0] * shared.steps != rows,
+                "requests x draft length != rows",
+            ),
+            (
+                getattr(decode, "dcp_tot_seq_lens", None) is None,
+                "no DCP total lengths",
+            ),
+            (slots is None or slots.dtype != torch.int64, "no int64 slot mapping"),
+        )
+        reason = next((why for failed, why in checks if failed), None)
+        if reason is not None:
+            return decline(reason)
         s = stream(shared.device)
         if rows in shared.forks and not self.rows_ready(attention, rows):
             # The fork rows' MlaQuery does not gather: no other core.
-            return self.join_context()
+            return decline("fork core not compiled for the bound cache page")
         if rows in shared.polled and not self.fold_ready(attention, rows):
-            return self.join_context()  # nor does the polled core rows' MlaQuery
+            # nor does the polled core rows' MlaQuery
+            return decline("polled core not compiled for the bound cache page")
         if rows in shared.wide_cores and not self.wide_ready(attention, rows):
-            return self.join_context()  # nor does the wide rows' MlaQuery
+            # nor does the wide rows' MlaQuery
+            return decline("wide core not compiled for the bound cache page")
         cache = attention.kv_cache
         qnorm, kvnorm, qb, uk, qinv, kinv = self.query_weights
         shared.queries[rows](
@@ -1033,19 +1090,36 @@ class DraftLayerDcp:
         rows = mqa_q.shape[0]
         decode = metadata.decode
         self.join_context()
-        if (
-            not torch.cuda.is_current_stream_capturing()
-            or rows not in shared.gathers
-            or decode is None
-            or bool(getattr(metadata, "causal", True)) != shared.causal
-            or mqa_q.dtype != torch.float8_e4m3fn
-            or not mqa_q.is_contiguous()
-            or out.shape != (rows, shared.heads * 128)
-            or not out.is_contiguous()
-            or decode.seq_lens.shape[0] * shared.steps != rows
-            or getattr(decode, "dcp_tot_seq_lens", None) is None
-            or rows in shared.valid  # (QGather publishes into DcpBox.q)
-        ):
+        if not torch.cuda.is_current_stream_capturing():
+            return False  # eager: no graph, the stock attention
+        checks = (
+            (rows not in shared.gathers, "no QGather for the rows"),
+            (decode is None, "no decode metadata"),
+            (
+                bool(getattr(metadata, "causal", True)) != shared.causal,
+                f"metadata mask is not the layers' (causal={shared.causal})",
+            ),
+            (mqa_q.dtype != torch.float8_e4m3fn, f"query {mqa_q.dtype}"),
+            (not mqa_q.is_contiguous(), "a strided query"),
+            (out.shape != (rows, shared.heads * 128), f"out {tuple(out.shape)}"),
+            (not out.is_contiguous(), "a strided output"),
+            (
+                decode is not None and decode.seq_lens.shape[0] * shared.steps != rows,
+                "requests x draft length != rows",
+            ),
+            (
+                getattr(decode, "dcp_tot_seq_lens", None) is None,
+                "no DCP total lengths",
+            ),
+            # (QGather publishes into DcpBox.q)
+            (rows in shared.valid, "validity rows without a fused query"),
+        )
+        reason = next((why for failed, why in checks if failed), None)
+        if reason is not None:
+            # NQ-NOFALLBACK: a captured drafter graph never captures the stock query
+            # gather + forward_mqa + combine.
+            if shared.strict and full_capture():
+                refuse("DSpark drafter attention", reason, Shape(rows))
             return False
         box, s = shared.box, stream(shared.device)
         shared.gathers[rows](

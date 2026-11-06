@@ -12,8 +12,9 @@
   state must match bit for bit. The BF16 state (the measured serving dtype) runs the
   same comparison as a control: a mismatch in both dtypes points at the reference
   pair, one in FP32 only at the FP32 head.
-* the wide verify kernels an FP32 state runs above the tuned rows (``KdaVerifyWide``,
-  ``KdaVerifyHalves``: ``kda.prepared.wide_kind``) vs KdaSplit at the same shape.
+* the wide verify kernel an FP32 state runs at q4 / q8 (``KdaVerifyWide``:
+  ``kda.prepared.FP32_VERIFY_WIDE``; ``KdaVerifyHalves`` only at other q) vs KdaSplit
+  at the same shape.
 
 One GPU; a few minutes of CuTe compiles on a cold cache."""
 
@@ -206,7 +207,9 @@ def test_kda_head_matches_the_pair(rows, q, polled, state_dtype):
 
 
 WIDE_SHAPES = [
-    pytest.param(36, 4, "halves", id="q4-B36"),
+    pytest.param(35, 4, "wide", id="q4-B35"),
+    pytest.param(41, 4, "wide", id="q4-B41"),
+    pytest.param(12, 8, "wide", id="q8-B12"),
     pytest.param(64, 4, "wide", id="q4-B64"),
     pytest.param(128, 4, "wide", id="q4-B128"),
     pytest.param(512, 4, "wide", id="q4-B512"),

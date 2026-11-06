@@ -652,7 +652,7 @@ def compile_head_verify(heads, bf16_state, has_bias, specs, arch, tile, hidden, 
 
 
 # ``KdaHeadVerify``'s ring stages, tensor-memory K tiles and A tiles loaded before the
-# PDL wait (KdaHeadWide's HEAD_TILE: 11 / 12 / 17). The verify buffers need the shared
+# PDL wait (KdaHeadWide's HEAD_TILE: 11 / 12 / 21). The verify buffers need the shared
 # memory of one ring stage. TMEM holds 15 of the 28 K tiles (480 + 8 of 512 columns).
 # In serving (B1) the head is resident ~6 us before the AttnRes ends, beside the
 # AttnRes's CTAs, so its pre-wait weight stream delays the AttnRes's latency-bound

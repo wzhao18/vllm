@@ -98,10 +98,10 @@ def resolve_kernel(compiled, device):
     return executor, function
 
 
-def check_residency(compiled, device_index: int, grid: int, threads: int, what: str):
-    """Persistent grids whose CTAs wait on one another (not only within a cluster) must
-    all be resident at once: raise when the device cannot hold ``grid`` CTAs of
-    ``compiled`` (``threads`` per CTA, its dynamic shared memory) at the same time."""
+def occupancy(compiled, device_index: int, threads: int) -> tuple[int, int]:
+    """(CTAs per SM, SMs): cuOccupancyMaxActiveBlocksPerMultiprocessor of the one
+    kernel in ``compiled`` (``threads`` per CTA, its dynamic shared memory) and the
+    device's SM count."""
     _, function = resolve_kernel(compiled, device_index)
     attribute = cuda.CUfunction_attribute
     max_dynamic = attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
@@ -110,6 +110,20 @@ def check_residency(compiled, device_index: int, grid: int, threads: int, what: 
         cuda.cuOccupancyMaxActiveBlocksPerMultiprocessor(function, threads, smem)
     )
     sms = torch.cuda.get_device_properties(device_index).multi_processor_count
+    return per_sm, sms
+
+
+def resident_ctas(compiled, device_index: int, threads: int) -> int:
+    """How many CTAs of ``compiled`` (``threads`` each) the device holds at once."""
+    per_sm, sms = occupancy(compiled, device_index, threads)
+    return per_sm * sms
+
+
+def check_residency(compiled, device_index: int, grid: int, threads: int, what: str):
+    """Persistent grids whose CTAs wait on one another (not only within a cluster) must
+    all be resident at once: raise when the device cannot hold ``grid`` CTAs of
+    ``compiled`` (``threads`` per CTA, its dynamic shared memory) at the same time."""
+    per_sm, sms = occupancy(compiled, device_index, threads)
     if grid > per_sm * sms:
         raise RuntimeError(
             f"{what}: {grid} CTAs cannot be co-resident ({per_sm} per SM x {sms} SMs)"

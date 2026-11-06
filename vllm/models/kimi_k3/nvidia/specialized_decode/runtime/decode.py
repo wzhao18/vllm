@@ -57,7 +57,18 @@ from ..cutedsl.moe.tail_rows import PreparedTailRows
 from ..cutedsl.moe.tail_runtime import MoeTailBox, PreparedTail
 from ..cutedsl.oproj.prepared import OprojMailbox
 from ..cutedsl.oproj.prepared import choose as oproj_choose
-from ..shapes import Choice, Context, Coverage, Path, Shape, Unsupported, rows_policy
+from ..shapes import (
+    Choice,
+    Context,
+    Coverage,
+    Path,
+    Shape,
+    StockSteps,
+    Unsupported,
+    full_capture,
+    refuse,
+    rows_policy,
+)
 from .prefetch import BEFORE_HEAD, BEFORE_TMEM_MLA, PrefetchController
 from .providers import (
     BATCHES,
@@ -65,6 +76,7 @@ from .providers import (
     PREPARED_MAX,
     Attention,
     attention_kind,
+    inproj_note,
     pack_dsa_projection,
     pack_front,
 )
@@ -250,6 +262,9 @@ class SpecializedDecode:
             bf16_state=self.bf16_state,
         )
         self.coverage: Coverage | None = None
+        # NQ-NOFALLBACK: run-time steps without a captured FULL graph (mixed prefill +
+        # decode, partial drafts, eager), counted per cause (``plan``).
+        self.stock_steps = StockSteps("decode", self.rank)
         # Wide batches whose AttnRes state is row-sharded (``attn_res.prepared
         # .choose``): only where the fused wide o-projection and the wide MoE tail also
         # serve the shape, since they publish into and read from the row owners.
@@ -281,6 +296,7 @@ class SpecializedDecode:
         self.switched: dict[int, int] = {}
         self.switch: GraphSwitch | None = None
         self.build_providers()
+        self.check_wide()
         # Verify batches whose MLA layers run as single-query rows (mla.rows): their
         # per-row (tables, local lengths, totals), written by verify_rows each step.
         self.rows_batches = frozenset(
@@ -530,6 +546,32 @@ class SpecializedDecode:
             if heads and isinstance(moe, PreparedMoE):
                 moe.tail.tail_weights.use_heads(heads)
 
+    def check_wide(self):
+        """NQ-NOFALLBACK: on a target deployment (``Context.target``: Rubin, TP16 =
+        DCP16, q > 1) no wide batch may reach a family's whole stock seam (S1 stock KDA
+        core, S2 stock MLA, S2-DSA stock DSA attention, S3 stock o-projection +
+        all-reduce + unfused AttnRes, S4 stock MoE layer): each family's ``choose``
+        admits every wide row there today, and a table edit that stops admitting one
+        fails the startup instead of rerouting the shape. Elsewhere (out of scope)
+        the seams stay logged coverage choices."""
+        if not self.context.target:
+            return
+        moe = any(isinstance(m, PreparedMoE) for m in self.feed_forward.values())
+        for m in self.wide:
+            shape = Shape(m, self.q)
+            for attention in self.attention.values():
+                kind = attention.kind
+                if kind == "kda" and m in attention.kda_stock:
+                    refuse("KDA core", "seam S1, kda.prepared.STOCK_ROWS", shape)
+                if kind == "dsa" and m not in attention.dsa_wide:
+                    refuse("DSA attention", "seam S2-DSA, dsa.wide.DSA_WIDE", shape)
+                if kind == "mla" and m not in attention.mla_wide:
+                    refuse("MLA attention", "seam S2, mla.prepared.choose", shape)
+                if m not in attention.oproj_wide:
+                    refuse("o-projection", "seam S3, oproj WIDE_TWOSHOT", shape)
+            if moe and m not in self.moe_batches:
+                refuse("MoE layer", "seam S4, moe.prepared.WIDE_TAIL", shape)
+
     def prepare_kv(self):
         """Compile each layer's cores for its bound KV cache layout (the profiling
         cache, then the real one)."""
@@ -570,6 +612,14 @@ class SpecializedDecode:
             self.coverage = self.plan_coverage()
             for line in self.coverage.lines() if self.rank == 0 else ():
                 logger.info("Kimi K3 decode coverage %s", line)
+            if self.rank == 0:
+                # NQ-NOFALLBACK: the one stock exclusion, a run-time property of the
+                # schedule (no captured shape has it): counted per step (``plan``).
+                logger.info(
+                    "Kimi K3 decode coverage steps without a FULL graph (mixed prefill"
+                    " + decode, partial drafts, eager): stock forward, counted per "
+                    "cause"
+                )
 
     def plan_coverage(self):
         """Each captured decode graph's path: the families' choices where the step runs
@@ -581,6 +631,10 @@ class SpecializedDecode:
                 why = f"no prepared providers above {PREPARED_MAX} rows"
                 if b > PREPARED_MAX:
                     why = self.wide_off or "not in WIDE_ROWS"
+                if self.context.target:
+                    # NQ-NOFALLBACK: a target deployment's captured row never runs
+                    # the whole-step stock forward.
+                    refuse("decode step", f"whole stock forward: {why}", Shape(b, q))
                 coverage.stock(b, why)
             elif b in self.wide:
                 coverage.specialize(b, self.wide_choices(b, q))
@@ -592,26 +646,44 @@ class SpecializedDecode:
         """The families' choices at a wide batch (``Attention.run_wide``, S4)."""
         generic, stock = Path.GENERIC, Path.STOCK
         kinds = {a.kind for a in self.attention.values()}
+        # NQ-NOFALLBACK: every stock kernel inside the step names its measured
+        # reason (or NQ-TUNE where none exists).
         if b in self.stock_attn_res:
-            attn_res = Choice(stock, note="stock")
+            attn_res = Choice(
+                stock,
+                note="stock op at head / dense / final sites: ClusterAttnRes loses "
+                "from 384 rows, VR200 nb2 M384 9.5 vs 8.9 us (attn_res STOCK_ROWS)",
+            )
         else:
             mode = "sharded" if b in self.sharded else "plain"
             attn_res = Choice(generic, note=mode)
-        choices = {"embed": Choice(stock), "attn_res": attn_res}
-        gemm = "splitk" if b <= GENERIC_ROWS else "cublas"
+        if b in self.head_batches:
+            embed = Choice(generic, note="ring")
+        else:
+            embed = Choice(
+                stock,
+                note=f"stock embedding + all-reduce above RING_HEAD "
+                f"{max(self.head_batches, default=0)} rows (unmeasured: NQ-TUNE)",
+            )
+        choices = {"embed": embed, "attn_res": attn_res}
+        notes = {a.kind: inproj_note(a, b) for a in self.attention.values()}
         if "kda" in kinds:
             core = kda_choose(Shape(b, q), self.context)
-            choices["kda"] = Choice(core.path, note=f"{gemm} + {core.note}")
+            choices["kda"] = Choice(core.path, note=f"{notes['kda']} + {core.note}")
         mla = next((a for a in self.attention.values() if a.kind == "mla"), None)
         if mla is not None and b in mla.mla_wide:
-            choices["mla"] = mla_choose(Shape(b, q), self.context)
+            core = mla_choose(Shape(b, q), self.context)
+            choices["mla"] = Choice(core.path, core.tactic, f"{notes['mla']} + {core}")
         elif mla is not None:
-            choices["mla"] = Choice(stock, note=f"{gemm} + S2")
+            choices["mla"] = Choice(stock, note=f"{notes['mla']} + S2")
         dsa = next((a for a in self.attention.values() if a.kind == "dsa"), None)
         if dsa is not None and b in dsa.dsa_wide:
-            choices["dsa"] = dsa_choose(Shape(b, q), self.context)
+            core = dsa_choose(Shape(b, q), self.context)
+            pieces = dsa.core_wide.stock_pieces(b)
+            note = f"{notes['dsa']} + WideDsa {core.note}; stock pieces: {pieces}"
+            choices["dsa"] = Choice(core.path, core.tactic, note)
         elif dsa is not None:
-            choices["dsa"] = Choice(stock, note=f"{gemm} + S2")
+            choices["dsa"] = Choice(stock, note=f"{notes['dsa']} + S2-DSA")
         attention = next(iter(self.attention.values()), None)
         if attention is not None and b in attention.oproj_wide:
             choices["oproj"] = oproj_choose(Shape(b, q), self.context)
@@ -624,7 +696,12 @@ class SpecializedDecode:
                 choices["moe"] = Choice(stock, note="S4")
         if any(isinstance(m, PreparedDenseMLP) for m in self.feed_forward.values()):
             dense = Choice(generic, note="splitk") if b <= GENERIC_ROWS else None
-            choices["dense"] = dense or Choice(stock, note="cublas")
+            choices["dense"] = dense or Choice(
+                stock,
+                note=f"stock dense MLP, cuBLAS above {GENERIC_ROWS} rows (the "
+                "in-projections' cutoff; dense split-K vs cuBLAS unmeasured there: "
+                "NQ-TUNE)",
+            )
         return choices
 
     def choices(self, b, q):
@@ -652,7 +729,10 @@ class SpecializedDecode:
         if mla is not None:
             rows = q > 1 and b in mla.rows
             choices["mla"] = Choice(path, note="rows" if rows else "")
-        attention = kda or mla
+        dsa = next((a for a in self.attention.values() if a.kind == "dsa"), None)
+        if dsa is not None:  # NQ-NOFALLBACK: the sparse core or FlashInfer, and why
+            choices["dsa"] = Choice(path, note=dsa.core.coverage_note(b, q))
+        attention = kda or mla or dsa
         if attention is not None:
             output = attention.output
             codes = output.codes.get(b, ())
@@ -700,24 +780,61 @@ class SpecializedDecode:
         if self.sp is not None:  # raises for a FULL capture it cannot serve
             return self.sp.plan(positions, intermediate_tensors)
         b = positions.shape[0]
-        if intermediate_tensors is not None or b not in self.batches:
-            return None
-        if not torch.cuda.is_current_stream_capturing():
-            return None
+        step, why = self.plan_step(positions, intermediate_tensors)
+        if step is not None:
+            return step
+        # NQ-NOFALLBACK: on the target topology every FULL graph must run the
+        # specialized step, whatever its row count (the captured shapes are covered or
+        # the startup refused them): any reason it would not is a bug, raised at
+        # capture instead of capturing the stock forward. Elsewhere (GB300, TP8, no
+        # DCP) a FULL graph outside ``batches`` keeps the stock forward, as before,
+        # and is logged once per row count.
+        if full_capture():
+            if self.context.target:
+                refuse("decode step (FULL graph capture)", why, Shape(b, self.q))
+            logger.info_once(
+                "Kimi K3 decode: B%d FULL graph captured on the stock forward (%s; "
+                "not the no-fallback target topology)",
+                b,
+                why,
+            )
+        elif not torch.cuda.is_current_stream_capturing():
+            # A run-time step without a captured FULL graph (mixed prefill + decode,
+            # partial drafts, eager): a property of the schedule, not of a captured
+            # shape, so it cannot be refused at startup; counted and logged per cause.
+            self.stock_steps.count(why, b)
+        return None
+
+    def plan_step(self, positions, intermediate_tensors):
+        """(the step's plan, None) or (None, why the step runs the stock forward)."""
+        b = positions.shape[0]
+        if intermediate_tensors is not None:
+            return None, "pipeline-parallel stage inputs"
         if not is_forward_context_available():
-            return None
+            return None, "no forward context"
         context = get_forward_context()
-        if context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
-            return None
         by_layer = context.attn_metadata
         rows: list[Any] = list(by_layer.values()) if isinstance(by_layer, dict) else []
+        if any(getattr(md, "num_prefills", 0) for md in rows):
+            return None, "prompt rows (mixed prefill + decode)"
+        # PIECEWISE first: PIECEWISE steps run with no capture on the current stream
+        # (each piece captures inside the compiled backend), so the "not capturing"
+        # check would otherwise count them as eager steps.
+        if context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
+            return None, "PIECEWISE graph"
+        if not torch.cuda.is_current_stream_capturing():
+            return None, "eager step (outside a FULL graph capture)"
+        if b not in self.batches:
+            return None, f"{b} rows without prepared providers"
         q = self.q if any(getattr(md, "num_spec_decodes", 0) for md in rows) else 1
-        if b % q or (b in self.wide and q == 1):  # wide batches: verify steps only
-            return None
+        if b % q:
+            return None, f"{b} rows not whole {q}-token requests"
+        if b in self.wide and q == 1:  # wide batches: verify steps only
+            return None, "a plain decode step (q = 1) at a wide row"
         metadata = [decode_metadata(d.self_attn, context, q, b) for d in self.layers]
         if any(md is None for md in metadata):
-            return None
-        return Step(q, metadata, context.slot_mapping, positions)
+            return None, f"a layer without uniform {q}-token verify metadata"
+        return Step(q, metadata, context.slot_mapping, positions), None
 
     def run(self, step, input_ids, inputs_embeds):
         """Normalized hidden states (and the aux streams) of a planned step. Batches of

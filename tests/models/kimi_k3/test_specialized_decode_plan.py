@@ -4,6 +4,7 @@
 the tuned rows) between the specialized providers and the stock seams, K3.1's DSA
 seam (S2-DSA) included."""
 
+import dataclasses
 from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
@@ -49,10 +50,10 @@ from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.providers import (  #
     projection_policies,
 )
 from vllm.models.kimi_k3.nvidia.specialized_decode.shapes import (  # noqa: E402
-    Choice,
     Context,
     Path,
     Shape,
+    Uncovered,
     captured_rows,
 )
 
@@ -161,14 +162,22 @@ def test_decode_reads_the_gate_from_the_deployment(
 @pytest.mark.parametrize("dsa", [True, False], ids=["k31-tp8", "k3-table-miss"])
 def test_coverage_names_why_wide_rows_run_stock(dsa):
     """Captured rows above 64 that run the stock forward name the cause: K3.1's TP16 =
-    DCP16 gate, or a WIDE_ROWS miss."""
+    DCP16 gate, or a WIDE_ROWS miss. On the no-fallback target topology (Rubin TP16 =
+    DCP16, q > 1) the same uncovered rows refuse to start instead (NQ-NOFALLBACK)."""
     decode: Any = object.__new__(SpecializedDecode)
     decode.q, decode.captured = 8, (64, 72, 256)
     decode.batches, decode.wide = (64,), ()
     decode.choices = lambda b, q: {}
     decode.wide_off = wide_gate(8, rubin=True, seams=True, dsa=dsa, tp=8, dcp=8)
+    decode.context = Context(
+        arch="rubin", tp=8, rank=0, dcp=8, sms=212, q=8, max_rows=256,
+        max_context=1 << 20, bf16_state=True,
+    )  # fmt: skip
     why = "DSA wide steps need TP16 = DCP16" if dsa else "not in WIDE_ROWS"
     assert decode.plan_coverage().reasons == {72: why, 256: why}
+    decode.context = dataclasses.replace(decode.context, tp=16, dcp=16)
+    with pytest.raises(Uncovered, match=rf"M72\(q8\).*whole stock forward: {why}"):
+        decode.plan_coverage()
 
 
 class Linear(torch.nn.Module):
@@ -206,6 +215,8 @@ class SparseMla:
 
 class Indexer(SimpleNamespace):
     __call__ = KimiK3DSAIndexer.forward
+    # The stock ShardQ row hook: None outside ShardQ steps (no ShardQ layer name).
+    _shardq_indexer_rows = KimiK3DSAIndexer._shardq_indexer_rows
 
 
 def dsa_layer(fused_insert):
@@ -225,6 +236,7 @@ def dsa_layer(fused_insert):
         index_num_heads=INDEX_HEADS,
         index_rope_dim=0,
         use_fused_k_insert=fused_insert,
+        shardq_layer_name="",  # the stock default: no ShardQ layer
         wq_index=Linear(INDEX_HEADS * INDEX_DIM, Q_LORA, trace, "wq_index"),
         wkv_index=Linear(INDEX_DIM + INDEX_HEADS),
         _fused_k_insert=op("k_insert"),
@@ -460,28 +472,46 @@ def test_wide_choices_name_the_dsa_seam():
     split-K up to 128 rows, cuBLAS above, as ``run_wide`` runs it (by the rows the
     projection prepares)."""
     rows = (72, 128, 136, 256, 512)
+    split_k = projection_policies(16, PITCH, rows, sms=212, q=8)
+    assert set(split_k) == {72, 128}
+    # The in-projection as Attention builds it: split-K at its policies' rows, the
+    # cuBLAS GEMM elsewhere (no cuBLASLt rows at pitch 3040, INPROJ_LT)
+    inproj = dict(
+        projection=SimpleNamespace(fallback=SimpleNamespace(kernels=split_k)),
+        lt_rows={},
+        weight=torch.empty(PITCH, 0),
+    )
     decode: Any = object.__new__(SpecializedDecode)
     decode.attention = {
-        0: SimpleNamespace(kind="kda", oproj_wide=frozenset(rows)),
+        0: SimpleNamespace(kind="kda", oproj_wide=frozenset(rows), **inproj),
         1: SimpleNamespace(
-            kind="dsa", oproj_wide=frozenset(rows), dsa_wide=frozenset({72})
+            kind="dsa",
+            oproj_wide=frozenset(rows),
+            dsa_wide=frozenset({72}),
+            core_wide=SimpleNamespace(stock_pieces=lambda b: f"pieces {b}"),
+            **inproj,
         ),
     }
-    decode.stock_attn_res = decode.sharded = frozenset()
+    decode.stock_attn_res = decode.sharded = decode.head_batches = frozenset()
     decode.feed_forward = {}
     decode.context = Context(
         arch="rubin", tp=16, rank=0, dcp=16, sms=212, q=8, max_rows=512,
         max_context=1 << 20, bf16_state=True,
     )  # fmt: skip
-    split_k = projection_policies(16, PITCH, rows, sms=212, q=8)
-    assert set(split_k) == {72, 128}
     for b in rows:
         choices = decode.wide_choices(b, 8)
-        gemm = "splitk" if b in split_k else "cublas"
-        if b == 72:  # WideDsa (DSA_WIDE, dabb1639b6)
-            assert choices["dsa"] == Choice(Path.GENERIC, "wide", "prepared")
+        if b in split_k:
+            gemm = "inproj splitk"
         else:
-            assert choices["dsa"] == Choice(Path.STOCK, note=f"{gemm} + S2")
+            gemm = "inproj stock cuBLAS (3040-row projection unmeasured vs split-K"
+        if b == 72:  # WideDsa (DSA_WIDE, dabb1639b6), with its stock pieces named
+            dsa = choices["dsa"]
+            assert (dsa.path, dsa.tactic) == (Path.GENERIC, "wide"), dsa
+            assert dsa.note == f"{gemm} + WideDsa prepared; stock pieces: pieces 72"
+        else:
+            dsa = choices["dsa"]
+            assert dsa.path is Path.STOCK, dsa
+            assert dsa.note.startswith(gemm) and dsa.note.endswith(" + S2-DSA"), dsa
         assert "mla" not in choices
 
 
@@ -785,22 +815,91 @@ def test_kda_verify_kernels_take_the_state_dtype(q, requests, bf16_state):
             assert name not in ("stream", "stream3"), b
 
 
-def test_kda_q4_wide_policy():
-    """q4 rows (cap-128 overlay): Halves at 35-48 and Wide at 49-64 with either state;
-    Stream3 from 65 requests with a BF16 state, open-ended (no request cap); with an
-    FP32 state those rows run KdaVerifyWide, as do q8 rows above VERIFY_WIDE's 64."""
+def kda_kinds(q, bf16_state, requests):
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import prepared
+
+    return {b: prepared.verify_kernel(b, q, RUBIN, bf16_state) for b in requests}
+
+
+def kda_runs(kinds):
+    """``kinds`` {requests: name} as sorted (first, last, name) runs."""
+    runs = []
+    for b in sorted(kinds):
+        if runs and runs[-1][2] == kinds[b] and runs[-1][1] == b - 1:
+            runs[-1] = (runs[-1][0], b, kinds[b])
+        else:
+            runs.append((b, b, kinds[b]))
+    return runs
+
+
+# FP32 state (production): FP32_VERIFY_WIDE, the VR200 kernel bench's measured-best
+# kernel per (q, requests) (kda.prepared's table notes), open-ended above the last row.
+FP32_Q4_RUNS = [
+    (1, 11, "kdasplit"), (12, 12, "wide"), (13, 15, "kdasplit"), (16, 35, "wide"),
+    (36, 40, "kdasplit"), (41, 1024, "wide"),
+]  # fmt: skip
+FP32_Q8_RUNS = [
+    (1, 11, "kdasplit"), (12, 12, "wide"), (13, 15, "kdasplit"), (16, 1024, "wide"),
+]  # fmt: skip
+# BF16 state: VERIFY_WIDE with VERIFY_Q's rows on top (Stream3 from 36 requests at q4).
+BF16_Q4_RUNS = [
+    (1, 11, "kdasplit"), (12, 12, "wide"), (13, 15, "kdasplit"), (16, 35, "wide"),
+    (36, 1024, "stream3"),
+]  # fmt: skip
+BF16_Q8_RUNS = [
+    (1, 11, "kdasplit"), (12, 12, "wide"), (13, 15, "kdasplit"), (16, 32, "wide"),
+    (33, 48, "halves"), (49, 1024, "wide"),
+]  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    "q,bf16_state,runs",
+    [
+        (4, False, FP32_Q4_RUNS),
+        (8, False, FP32_Q8_RUNS),
+        (4, True, BF16_Q4_RUNS),
+        (8, True, BF16_Q8_RUNS),
+    ],
+    ids=["fp32-q4", "fp32-q8", "bf16-q4", "bf16-q8"],
+)
+def test_kda_verify_policy_by_state_dtype(q, bf16_state, runs):
+    """The plain verify kernel per request count, by state dtype, at every request
+    count up to 1024 (open-ended past the tables' last rows)."""
+    assert kda_runs(kda_kinds(q, bf16_state, range(1, 1025))) == runs
+
+
+def test_kda_fp32_policy_picks_the_measured_best():
+    """FP32 state at the bench's measured shapes whose pick changed (VR200 kern-kda
+    section b, us per layer, verify alone): q4 B35 Wide (one wave; Halves before), B36
+    / B40 KdaSplit 13.05 / 13.40 (Halves 14.59 / 16.12), B48 Wide 15.48 (Halves 18.30);
+    q8 B12 Wide 12.09 (KdaSplit 13.40), B48 Wide 25.24 (Halves 27.98). The BF16
+    state keeps Halves at q8 B33-48 and runs Stream3 from q4 B36."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import prepared
 
     kind = prepared.verify_kernel
-    for state in (False, True):
-        assert kind(12, 4, RUBIN, state) == "wide"
-        assert [kind(b, 4, RUBIN, state) for b in (33, 34)] == ["wide"] * 2
-        assert {kind(b, 4, RUBIN, state) for b in range(35, 49)} == {"halves"}
-        assert {kind(b, 4, RUBIN, state) for b in range(49, 65)} == {"wide"}
-        assert {kind(b, 8, RUBIN, state) for b in range(65, 1025)} == {"wide"}
-    bf16 = {kind(b, 4, RUBIN, True) for b in range(65, 1025)}
-    fp32 = {kind(b, 4, RUBIN, False) for b in range(65, 1025)}
-    assert bf16 == {"stream3"} and fp32 == {"wide"}
+    picks = {(4, 35): "wide", (4, 36): "kdasplit", (4, 40): "kdasplit"}
+    picks.update({(4, 41): "wide", (4, 48): "wide", (8, 12): "wide", (8, 48): "wide"})
+    for (q, b), name in picks.items():
+        assert kind(b, q, RUBIN, False) == name, (q, b)
+    assert {kind(b, 4, RUBIN, False) for b in range(1, 1025)} <= {"kdasplit", "wide"}
+    assert {kind(b, 8, RUBIN, False) for b in range(1, 1025)} <= {"kdasplit", "wide"}
+    assert kind(48, 8, RUBIN, True) == "halves"
+    assert [kind(b, 4, RUBIN, True) for b in (35, 36, 64, 65)] == ["wide"] + [
+        "stream3"
+    ] * 3
+
+
+def test_kda_fp32_table_falls_back_per_q():
+    """A verify length without an FP32_VERIFY_WIDE row keeps VERIFY_WIDE / VERIFY_Q
+    with KdaVerifyWide in place of the BF16-only kernels (q2: Halves at 33-48)."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import prepared
+
+    assert 2 not in prepared.FP32_VERIFY_WIDE[RUBIN]
+    kinds = kda_kinds(2, False, range(1, 129))
+    assert kda_runs(kinds) == [
+        (1, 15, "kdasplit"), (16, 32, "wide"), (33, 48, "halves"), (49, 128, "wide"),
+    ]  # fmt: skip
+    assert prepared.wide_table(RUBIN, 2, False) == prepared.wide_table(RUBIN, 2, True)
 
 
 @pytest.mark.parametrize("bf16_state", [False, True], ids=["fp32", "bf16"])

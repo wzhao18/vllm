@@ -42,6 +42,7 @@ from cutlass.cute.runtime import make_fake_stream
 
 from vllm.logger import init_logger
 
+from ...shapes import Shape, full_capture, refuse, target_topology
 from ..common.host import fake, layout, stream, to_cute
 from ..mla.prepared import pad_requests
 from ..mla.query import GB300_SMS
@@ -336,6 +337,16 @@ class PreparedDsa:
             )
         self.kernels, self.overlap_kernels = {}, {}
         local_topk = self.indexer_stage.local_topk
+        # NQ-NOFALLBACK: a target deployment (Rubin TP16 = DCP16, verify) never runs
+        # the stock indexer op + filter or FlashInfer's chain on a shape the sparse
+        # core serves (``strict``).
+        self.strict = target_topology(self.rubin, self.dcp, self.dcp, max(queries))
+        if self.strict and self.fp8 and not local_topk:
+            refuse(
+                "DSA indexer (PreparedDsa)",
+                "dcp_local_topk is 0 under DCP16: no #63 merge, every step would run "
+                "the stock sparse_attn_indexer op and the Triton slot filter",
+            )
         # The fused DCP indexer feeds the #63 merge (RUBIN_DCP_FUSED_INDEXER).
         rubin_fused = not self.rubin or RUBIN_DCP_FUSED_INDEXER
         self.dcp_fused = bool(local_topk) and rubin_fused
@@ -366,6 +377,9 @@ class PreparedDsa:
         self.dsac = self.dsac_rows = None
         self.dsa_layer = getattr(self.indexer, "dsac_layer", -1)
         self.core_kernels: dict = {}
+        # NQ-NOFALLBACK: core shapes left on FlashInfer by design, decided at build
+        # (prepare_core): (batch, q) -> why.
+        self.core_excluded: dict = {}
         dsac = getattr(self.indexer, "dsac", None)
         if dsac is not None and self.fi is not None and local_topk and self.dcp > 1:
             from ....dsa_kernels.dsa_core.decode import MergeRows
@@ -455,6 +469,14 @@ class PreparedDsa:
             )
         stage.warm(kv.shape[1])  # the merge's rows variant, before any capture
         self.log_policy(unsupported)
+        if unserved and self.strict:
+            # NQ-NOFALLBACK: a shape the core's variant table lists but whose rows
+            # exchange "proj" partials would quietly run FlashInfer's chain.
+            refuse(
+                "DSA sparse core",
+                f'rows x q {" ".join(unserved)} exchange "proj" partials '
+                f"({self.box.partials}), which the core does not push",
+            )
         if unserved:
             logger.warning_once(
                 "Kimi K3.1 DSA sparse core (VLLM_K31_DSA_CORE): rows x q %s exchange "
@@ -525,20 +547,89 @@ class PreparedDsa:
         variant = self.dsac.variant(batch, q, self.dsa_layer)
         if variant is None or self.overlaps[batch, q] in LATE:
             return
+        if self.exchange_pdl(batch):
+            # NQ-NOFALLBACK: a documented design exclusion, not a fallback. The core
+            # polls its q tiles before its PDL wait, unsafe behind DcpExchange's top-k
+            # launched with PDL (at most K31_DCPX_PDL rows: MergeRows.fits declines
+            # those steps). Decided here, per shape, at build: the shape keeps
+            # FlashInfer's chain and the coverage log says so.
+            self.core_excluded[batch, q] = (
+                f"DcpExchange top-k launches with PDL at <= {self.dsac.pdl_rows} "
+                "rows (K31_DCPX_PDL; 0 gives the core every row)"
+            )
+            logger.info_once(
+                "Kimi K3.1 DSA sparse core: rows x q %dx%d keep FlashInfer's chain by "
+                "design: %s",
+                batch,
+                q,
+                self.core_excluded[batch, q],
+                scope="global",
+            )
+            return
         spread = q > 1 and batch in self.dsac.spread and sms > GB300_SMS
         box = self.box
         args = self.heads, self.dcp, batch, uv, self.pitches[batch], self.device.index
         value = compile_core_value(*args, sms, q, box.q_heads, box.cap, spread)
         self.core_kernels[batch, q] = variant, value, spread
 
+    def exchange_pdl(self, batch):
+        """Whether this layer's DcpExchange top-k (VLLM_K31_DCP_EXCHANGE) is wired
+        and launches with PDL at ``batch`` rows (``K31_DCPX_PDL``): the steps
+        ``MergeRows.fits`` refuses the core. Static, at build: the hook's run-time
+        admission (step metadata, its parts' rows) is not known here, so a shape the
+        exchange could leave to the #63 merge stays on FlashInfer too (conservative;
+        K31_DCPX_PDL=0 is the lever)."""
+        from vllm.model_executor.layers.sparse_attn_indexer import (
+            DCP_DECODE_TOPK_HOOKS,
+        )
+
+        rows = self.dsac_rows.pdl_rows if self.dsac_rows is not None else 0
+        hooked = self.indexer.k_cache.prefix in DCP_DECODE_TOPK_HOOKS
+        return hooked and self.indexer_stage.impl is not None and batch <= rows
+
     def core_step(self, batch, q):
         """The DSA sparse core's (variant, DcpValue(pushed), spread) of this step, or
         None: its shape is not served, or merge_rows does not give the core this
         step's rows (MergeRows.fits: the same on every rank)."""
         core = self.core_kernels.get((batch, q))
-        if core is None or not self.dsac_rows.fits(batch):
+        if core is None:
+            return None
+        if not self.dsac_rows.fits(batch):
+            if self.strict and full_capture():
+                # NQ-NOFALLBACK: a captured core shape whose merge rows do not fit
+                # would capture FlashInfer's chain instead. (The PDL exclusion of
+                # DcpExchange's steps is decided at build, prepare_core: such shapes
+                # never reach here.)
+                source = self.indexer_stage.merge_source(batch)
+                refuse(
+                    "DSA sparse core",
+                    f"merge_rows does not give the core this step's rows ({source})",
+                    Shape(batch, q),
+                )
             return None
         return core
+
+    def coverage_note(self, batch, q):
+        """NQ-NOFALLBACK: the coverage log's note for this layer's attention at
+        ``batch`` rows: the sparse core, or FlashInfer's chain and why."""
+        kernel = self.cores.get((batch, q), "")
+        if (batch, q) in self.core_kernels:
+            return f"DSA sparse core {self.core_kernels[batch, q][0]}"
+        if (batch, q) in self.core_excluded:
+            return (
+                f"FlashInfer {kernel} (deliberate per-shape choice: "
+                f"{self.core_excluded[batch, q]})"
+            )
+        if self.dsac is None:
+            return f"FlashInfer {kernel} (sparse core off)"
+        if self.dsac.variant(batch, q, self.dsa_layer) is None:
+            return (
+                f"FlashInfer {kernel} (no sparse core variant: its table stops at "
+                f"{self.dsac.rows} rows)"
+            )
+        if self.overlaps.get((batch, q)) in LATE:
+            return f"FlashInfer {kernel} (late query overlap: the core is not built)"
+        return f"FlashInfer {kernel} (\"proj\" partials: the core does not push them)"
 
     def sparse_dcp_core(self, core, cache, metadata, batch, q, join):
         """The DSA sparse core of a DCP step: this rank's rows of the #63 merge (or of
@@ -701,6 +792,15 @@ class PreparedDsa:
                 stage = self.query_stage
                 args = stage.q_fp8, stage.head_w, md, stride_rows, batch
                 merged = self.indexer_stage.merge_rows(*args, q)
+            if merged is None and self.strict and full_capture():
+                # NQ-NOFALLBACK: a captured step the #63 merge / DcpExchange decline
+                # would capture the stock indexer op and the slot filter.
+                source = self.indexer_stage.merge_source(batch)
+                refuse(
+                    "DSA indexer (PreparedDsa)",
+                    f"merge_rows declined the step ({source})",
+                    Shape(batch, q),
+                )
             if merged is None:
                 if topk is None:
                     topk = self.indexer_core(projected, batch)

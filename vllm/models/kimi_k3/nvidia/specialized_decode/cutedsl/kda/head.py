@@ -1330,7 +1330,14 @@ HEAD_STAGES = 11
 # tiles loaded before the PDL wait), from the 1-GPU KDA chain (TP16 B8, 69 layers, one
 # arm per process; notes/kdahead3.md). Loading more before the wait slows the AttnRes
 # (its post-arrival reads share the memory system with the weight stream).
-HEAD_TILE = (11, 64, 12, 17)
+# 21 early A tiles (was 17), from the VR200 kernel bench (nqbench kern-kda, section a,
+# q1 B8 KDA chain behind tail / AttnRes stand-ins, early 9 / 13 / 17 / 21, us per
+# layer, the polled head as served): FP32 state chain 7.10 / 6.50 / 5.95 / 5.79, graph
+# per layer incl. stand-ins 15.13 / 14.54 / 14.05 / 13.81 (-2.7% / -1.7%); BF16 state
+# chain 6.82 / 6.21 / 5.73 / 5.54, graph 14.79 / 14.19 / 13.72 / 13.46 (-3.4% /
+# -1.9%). Only the A tiles loaded before the wait move: same MMAs in the same order.
+# NQ-TUNE: early above 21 (the sweep's largest; the AttnRes slowdown above bounds it).
+HEAD_TILE = (11, 64, 12, 21)
 # Rubin (compute capability 10.7) KdaHead batches per TP whose output is polled by the
 # fused o-projection (``OprojFused(polled_x="half")``) instead of read after its PDL
 # wait. Each of the model's n >= 2 KdaHead layers owns a [8, dim] buffer (per layer:
@@ -1386,7 +1393,7 @@ STATE_DTYPES = (torch.bfloat16, torch.float32)
 
 def head_supported(
     heads, state_dtype, has_bias, hidden, batch, q=1, tile=HEAD_TILE, *, core=None,
-    fa_width=0, cache_tokens=1, tp=16,
+    fa_width=0, cache_tokens=1, tp=16, strict=False,
 ):  # fmt: skip
     """Whether a KdaHead kernel serves ``batch`` token rows at verify length ``q``
     (q = 1: ``KdaHead`` / ``KdaHeadWide``; batch == q: ``KdaHeadVerify``; else
@@ -1413,7 +1420,7 @@ def head_supported(
     specs = probe_specs(core, state_dtype, fa_width, batch, q, cache_tokens)
     return head_compiles(
         heads, state_dtype, has_bias, hidden, batch, q, tile, specs,
-        architecture(device), device.index, polled,
+        architecture(device), device.index, polled, strict=strict,
     )  # fmt: skip
 
 
@@ -1498,10 +1505,12 @@ def probe_specs(core, state_dtype, fa_width, batch, q=1, cache_tokens=1, slots=1
 @cache
 def head_compiles(
     heads, state_dtype, has_bias, hidden, batch, q, tile, specs, arch, device, polled,
+    strict=False,
 ):  # fmt: skip
     """``head_supported``'s compile check: the KdaHead kernel(s) of the shape compile
     for ``arch`` (``compile_head`` / ``compile_head_verify`` / ``compile_head_multi``,
-    whose caches keep the code). A failure is logged and keeps the pair."""
+    whose caches keep the code). A failure is logged and keeps the pair (``strict``,
+    the no-fallback target topology, with a BF16 state: raises)."""
     bf16_state = state_dtype == torch.bfloat16
     variants = (False, True) if polled else (False,)
     try:
@@ -1527,6 +1536,16 @@ def head_compiles(
                         polled_out, tokens=q,
                     )  # fmt: skip
     except Exception as error:  # noqa: BLE001 - any compile failure keeps the pair
+        if bf16_state and strict:
+            # NQ-NOFALLBACK (target topology only): with the measured BF16 state the
+            # head is meant to cover the shape (HEAD_BATCHES / HEAD_MULTI, shared
+            # memory checked): a compile failure is a bug, not a policy. (FP32
+            # state: the head is untuned there and the pair below is the specialized
+            # path, logged in the coverage. Elsewhere: logged, as before.)
+            raise RuntimeError(
+                f"Kimi K3 KdaHead ({batch} rows x q{q}, BF16 recurrent state) did "
+                f"not compile for {arch} (NQ-NOFALLBACK): {error}"
+            ) from error
         logger.warning(
             "Kimi K3 KdaHead (%d rows x q%d, %s recurrent state%s) did not compile "
             "for %s (%s: %s): those KDA rows run the in-projection -> KdaSplit pair",

@@ -89,6 +89,48 @@ def test_overlay_ranges_kept():
     assert draft.covered(draft.closed(draft.FAST_DCP[16], 576), 576, 3)
 
 
+# VR200 kernel bench (nqbench kern-draft gemm/lm_head) rows where the evict-first
+# LM-head GEMM was slower than the stock cuBLAS shard GEMM (rows: steps).
+LM_HEAD_CUBLAS_ROWS = {
+    12: 3, 14: 7, 15: 3, 35: 7, 36: 3, 42: 7, 48: 3, 49: 7, 56: 7, 60: 3, 63: 7
+}  # fmt: skip
+
+
+@pytest.mark.parametrize("steps", [3, 7])
+def test_tp16_lm_head_policy(steps):
+    """The drafter's LM-head shard GEMM per query rows (DL3 / DL7, B1-256): the BF16
+    GEMV to 7 rows, the evict-first GEMM only at 17-32 rows (cuBLAS splits K there;
+    bench 0.887-0.916x), the stock cuBLAS shard GEMM elsewhere, by choice."""
+    for b in range(1, 257):
+        rows = b * steps
+        gemv = draft.covered(draft.FAST_LM_HEAD[16], rows, steps)
+        wide = draft.covered(draft.WIDE_LM_HEAD[16], rows, steps)
+        assert bool(gemv) == (rows <= 7), rows
+        assert bool(wide) == (17 <= rows <= 32), rows
+
+
+def test_tp16_lm_head_slower_rows_run_cublas():
+    """Every row count the bench measured the evict-first GEMM slower than cuBLAS at
+    (12-15 rows 1.016-1.021x, 35-63 rows 1.099-1.115x) runs the stock cuBLAS GEMM."""
+    for rows, steps in LM_HEAD_CUBLAS_ROWS.items():
+        assert not draft.covered(draft.WIDE_LM_HEAD[16], rows, steps), rows
+        assert not draft.covered(draft.FAST_LM_HEAD[16], rows, steps), rows
+
+
+def test_wide_lm_head_rows_shared_with_verify():
+    """Target verification (runtime.verify) runs the evict-first LM-head GEMM at
+    lmhead.WIDE_ROWS, the same shard GEMM the bench measured: 17-32 rows only, the
+    drafter's WIDE_LM_HEAD rows, cuBLAS at the measured-slower rows."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.verify import lmhead
+
+    assert (lmhead.WIDE_ROWS.start, lmhead.WIDE_ROWS.stop) == (17, 33)
+    for steps in (3, 7):
+        table = draft.WIDE_LM_HEAD[16]
+        wide = {r for r in range(1, 257 * steps) if draft.covered(table, r, steps)}
+        assert wide <= set(lmhead.WIDE_ROWS), steps
+    assert not set(LM_HEAD_CUBLAS_ROWS) & set(lmhead.WIDE_ROWS)
+
+
 # ---------------------------------------------------------------------- projections
 
 
@@ -364,11 +406,13 @@ def _rubin_world():
     return torch.cuda.device_count()
 
 
-@pytest.mark.parametrize("part", ["markov", "dcp"])
+@pytest.mark.parametrize("part", ["markov", "dcp", "context", "arnorm"])
 def test_gpu_torchrun(part):
     """The torchrun checks below on every local GPU (skipped without 2+ Rubin-class
     GPUs). The DCP check runs at DCP = the local GPU count (6 heads per rank: 96
-    gathered heads only at 16 GPUs, ``torchrun --nnodes 4``)."""
+    gathered heads only at 16 GPUs, ``torchrun --nnodes 4``). ``context`` / ``arnorm``:
+    the drafter's wide context row gather and wide all-reduce sites at row counts
+    above one wave (the persistent kernels)."""
     import subprocess
 
     world = _rubin_world()
@@ -858,6 +902,224 @@ def _dcp_main(rank, world, device, group, interleave=1):
     return failures
 
 
+# Context rows (requests x q) through and past one wave of CtxGather's 256-thread CTAs
+# (VR200: 212 resident): the q8 / q4 production rows 216..512 and arbitrary ones.
+CONTEXT_ROWS = (72, 128, 208, 212, 216, 224, 256, 424, 512, 768, 1024, 1032)
+# Query rows (requests x draft length) of the wide ArNormRows push sites, through and
+# past one wave of their 1024-thread CTAs.
+AR_ROWS = (72, 128, 217, 224, 384, 427, 512, 1024)
+CTX_EPS = 1e-6
+
+
+def _bits_equal(a, b):
+    return torch.equal(a.view(torch.int16), b.view(torch.int16))
+
+
+def _norm_close(out, x, gamma, eps):
+    """RMSNorm reference (FP32, exact rsqrt): within 1 BF16 ulp of the kernel's
+    rsqrt.approx / summation order."""
+    x = x.float()
+    variance = (x * x).sum(-1, keepdim=True) / x.shape[-1]
+    ref = (x * torch.rsqrt(variance + eps) * gamma.float()).bfloat16().float()
+    error = (out.float() - ref).abs()
+    return bool((error <= ref.abs() * 2.0**-7 + 1e-30).all())
+
+
+def _barrier(device):
+    torch.accelerator.synchronize(device)
+    torch.distributed.barrier()
+
+
+def _context_main(rank, world, device, group):
+    """PreparedContext's wide row gather (CtxGather; the persistent one-wave gather
+    above the resident rows) at CONTEXT_ROWS: bitwise the one-CTA-per-row kernel run
+    over row chunks of at most 128 rows (each chunk one wave), the persistent kernel
+    with forced small grids (1 and 37 CTAs: many rows per CTA) bitwise too, and the
+    FP32 RMSNorm of the gathered sanitized rows within one ulp."""
+    from cutlass import Int32, Int64
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
+        dynamic_view,
+        stream,
+        to_cute,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.draft import context
+
+    hidden = context.HIDDEN
+    if hidden % world or hidden // world // 8 > 256:
+        print(f"rank {rank}: context gather needs TP 4, 8 or 16 (not {world})")
+        return 0
+    bf16 = torch.bfloat16
+    gen = torch.Generator(device=device).manual_seed(77)
+    gamma = (torch.rand(hidden, generator=gen, device=device) + 0.5).to(bf16)
+    # A contiguous [7168, 5 x 7168] weight (514 MB): PreparedContext prepares its
+    # shard's split-K projection where a tactic covers the rows (never run here; a
+    # stride-0 expand would hand that preparation an out-of-bounds view).
+    weight = torch.zeros((hidden, 5 * hidden), dtype=bf16, device=device)
+    model = SimpleNamespace(
+        context_proj=SimpleNamespace(weight=weight),
+        context_norm=SimpleNamespace(weight=gamma, variance_epsilon=CTX_EPS),
+    )
+    prepared = context.PreparedContext(model, group, world, rank, CONTEXT_ROWS)
+    shard = hidden // world
+    if rank == 0:
+        print(f"CtxGather persistent rows: {prepared.persistent}")
+    failures = 0 if prepared.persistent else 1
+    index = device.index
+    per_row = context.compile_gather(None, shard, index)
+    common = (Int32(rank), to_cute(gamma), prepared.eps)
+
+    def chunked(local, out):
+        rows = local.shape[0]
+        for start in range(0, rows, 128):
+            stop = min(rows, start + 128)
+            per_row(
+                dynamic_view(local[start:stop]),
+                dynamic_view(prepared.buffer[start * hidden :]),
+                Int64(prepared.mc + start * hidden * 2),
+                *common,
+                dynamic_view(out[start:stop]),
+                stream(device),
+            )
+        _barrier(device)
+
+    def forced(local, out, ctas):
+        kernel = context.compile_gather(None, shard, index, ctas=ctas)
+        kernel(
+            dynamic_view(local),
+            prepared.dynamic,
+            Int64(prepared.mc),
+            *common,
+            dynamic_view(out),
+            stream(device),
+        )
+        _barrier(device)
+
+    for rows in CONTEXT_ROWS:
+        g = torch.Generator(device=device).manual_seed(1000 * rows + rank)
+        local = torch.randn((rows, shard), generator=g, device=device).to(bf16)
+        local[::7, ::5] = -0.0  # sanitized to +0.0 by the publish
+        out, ref = (
+            torch.empty((rows, hidden), dtype=bf16, device=device) for _ in "ab"
+        )
+        prepared.gather(local, out)
+        _barrier(device)
+        chunked(local, ref)
+        path = "persistent" if rows in prepared.persistent else "per row"
+        label = f"context rows {rows} ({path})"
+        if not _bits_equal(out, ref):
+            print(f"rank {rank}: {label}: not bitwise the per-row gather")
+            failures += 1
+        shards = [torch.empty_like(local) for _ in range(world)]
+        torch.distributed.all_gather(shards, local + 0.0)  # (-0.0 + 0.0 = +0.0)
+        if not _norm_close(out, torch.cat(shards, dim=1), gamma, CTX_EPS):
+            print(f"rank {rank}: {label}: RMSNorm off by more than one ulp")
+            failures += 1
+        if rows in (216, 1032):
+            for ctas in (1, 37):
+                forced_out = torch.empty_like(out)
+                forced(local, forced_out, ctas)
+                if not _bits_equal(forced_out, ref):
+                    print(f"rank {rank}: {label}: persistent {ctas} CTAs differ")
+                    failures += 1
+    return failures
+
+
+def _arnorm_main(rank, world, device, group):
+    """The wide drafter all-reduce push sites (ArNormRows over the wide two-shot box;
+    the persistent one-wave site above the resident rows, as PreparedDraftAr picks):
+    the new residual bitwise the FP32 rank-order sum rounded once plus the residual,
+    the normed rows bitwise the one-CTA-per-row site where that grid is one wave and
+    the persistent site with forced small grids (1 and 37 CTAs), within one ulp of the
+    FP32 RMSNorm everywhere; ``trigger`` (early) sites too."""
+    from cutlass import Float32, Int32, Int64
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
+        resident_ctas,
+        stream,
+        to_cute,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.twoshot import (
+        TwoShot,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.draft import (
+        allreduce,
+    )
+
+    hidden = allreduce.HIDDEN
+    if hidden % world or (hidden // world) % 8:
+        print(f"rank {rank}: two-shot all-reduce needs TP dividing 7168 / 8")
+        return 0
+    bf16, index = torch.bfloat16, device.index
+    cap = -(-max(AR_ROWS) // 64) * 64
+    box = TwoShot(group, device, world, rank, hidden, cap, 2)
+    gen = torch.Generator(device=device).manual_seed(99)
+    gamma = (torch.rand(hidden, generator=gen, device=device) + 0.5).to(bf16)
+    owner = SimpleNamespace(device=device, tp=world, persistent={})
+    parity = [0]
+
+    def run(kernel, partial, residual):
+        partial, out = partial.clone(), torch.empty_like(partial)
+        recv, peers, gather, mc = box.views(parity[0])
+        parity[0] ^= 1
+        kernel(
+            to_cute(partial), to_cute(residual), to_cute(gamma), Float32(CTX_EPS),
+            to_cute(out), to_cute(recv), to_cute(peers, 8), to_cute(gather),
+            Int64(mc), Int32(rank), stream(device),
+        )  # fmt: skip
+        _barrier(device)
+        return partial, out  # (the new residual is written in place of the partial)
+
+    def site(rows, trigger=False, ctas=None):
+        return allreduce.compile_rows_site(
+            rows, world, world, cap, index, trigger, True, ctas
+        )
+
+    auto = lambda rows: allreduce.PreparedDraftAr.persistent_site(  # noqa: E731
+        owner, rows, cap, False
+    )
+    failures, persistent = 0, 0
+    for rows in AR_ROWS:
+        per_row = site(rows)
+        resident = resident_ctas(per_row, index, allreduce.CLUSTER * 128)
+        wide = rows > resident
+        chosen = auto(rows) if wide else per_row  # (PreparedDraftAr's choice)
+        persistent += wide
+        g = torch.Generator(device=device).manual_seed(5000 * rows + rank)
+        partial = torch.randn((rows, hidden), generator=g, device=device).to(bf16)
+        partial[::5, ::3] = -0.0
+        g = torch.Generator(device=device).manual_seed(5000 * rows)  # same on all
+        residual = torch.randn((rows, hidden), generator=g, device=device).to(bf16)
+        new_res, out = run(chosen, partial, residual)
+        label = f"ArNormRows rows {rows} ({'persistent' if wide else 'per row'})"
+        partials = [torch.empty_like(partial) for _ in range(world)]
+        torch.distributed.all_gather(partials, partial)
+        total = partials[0].float()
+        for other in partials[1:]:
+            total = total + other.float()
+        expected = (total.bfloat16().float() + residual.float()).bfloat16()
+        if not torch.equal(new_res.float(), expected.float()):
+            print(f"rank {rank}: {label}: new residual not the FP32 rank-order sum")
+            failures += 1
+        if not _norm_close(out, expected, gamma, CTX_EPS):
+            print(f"rank {rank}: {label}: RMSNorm off by more than one ulp")
+            failures += 1
+        reference = out if wide else run(per_row, partial, residual)[1]
+        variants = [(c, site(rows, ctas=c)) for c in (1, 37)]
+        if not wide:
+            variants.append(("auto", auto(rows)))
+        if rows == max(AR_ROWS):
+            variants.append(("trigger", site(rows, trigger=True, ctas=37)))
+        for name, kernel in variants:
+            if not _bits_equal(run(kernel, partial, residual)[1], reference):
+                print(f"rank {rank}: {label}: persistent {name} differs")
+                failures += 1
+    if not persistent:
+        print(f"rank {rank}: no ArNormRows row above one wave")
+        failures += 1
+    return failures
+
+
 def _gpu_main(parts):
     import torch.distributed as dist
 
@@ -871,11 +1133,17 @@ def _gpu_main(parts):
         failures += _markov_main(rank, world, device, group)
     if "dcp" in parts:
         failures += _dcp_main(rank, world, device, group)
+    if "context" in parts:
+        failures += _context_main(rank, world, device, group)
+    if "arnorm" in parts:
+        failures += _arnorm_main(rank, world, device, group)
     dist.barrier()
     dist.destroy_process_group()
     return failures
 
 
 if __name__ == "__main__":
-    # torchrun ... test_specialized_decode_draft_nq.py [markov] [dcp] (default: both)
-    sys.exit(1 if _gpu_main(sys.argv[1:] or ("markov", "dcp")) else 0)
+    # torchrun ... test_specialized_decode_draft_nq.py [markov] [dcp] [context]
+    # [arnorm] (default: all)
+    parts = sys.argv[1:] or ("markov", "dcp", "context", "arnorm")
+    sys.exit(1 if _gpu_main(parts) else 0)

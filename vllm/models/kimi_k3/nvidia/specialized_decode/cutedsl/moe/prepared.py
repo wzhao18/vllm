@@ -470,7 +470,15 @@ def choose(shape, ctx):
     # WIDE_FRONT, else the stock router + latent-down and shared expert).
     wide = wide_experts_batch(shape.rows)
     front = "FrontRows front" if wide and WIDE_FRONT else "stock front"
-    experts = "wide experts" if wide else "stock experts"
+    # NQ-NOFALLBACK: the stock experts above one wide launch are a measured choice
+    # (``wide_experts_batch``: the wide engines lose from M832, VR200 1 GPU 177 vs
+    # 162 us); the coverage log names it.
+    experts = (
+        "wide experts"
+        if wide
+        else "stock FlashInfer experts (wide engines lose above one launch: M832 177 "
+        "vs 162 us)"
+    )
     return Choice(
         Path.GENERIC, ("rows", "stock-front"), f"{front}, {experts}, wide tail"
     )

@@ -9,14 +9,25 @@ RubinVWExpertsKernel`` width 16 above) run one TP16 MoE layer's routed experts: 
 weights x MXFP8 activations (per-token 32-element blocks, ``experts.plan_chunk``), SiTU
 (beta 4, linear beta 25), the hidden re-quantized to MXFP8 per token and 32-block
 (``experts.ExpertsKernel.store_hidden``), FC2 rows staged in BF16, the top-k weighted
-sum as an FP32 FMA chain in slot order. The stock arm is FlashInfer TRT-LLM-Gen
-``trtllm_fp4_block_scale_routed_moe`` (as ``stock_experts.StockExperts`` and the
-kern-moe bench call it) on the same weight bytes.
+sum as an FP32 FMA chain in slot order.
 
-Logical MXFP4 weights (E2M1 nibbles, E8M0 scales) are converted to the stock layer's
-TRT-LLM layout with ``convert_weight_to_mxfp4_moe_kernel_format`` (the bytes both
-kernels read in production) and ``place``d like production; the reference reads the
-logical weights:
+The weights are what production hands the specialized decode: the stock routed-experts
+layer (``FusedMoEFactory`` with Kimi K3's MoE arguments: SiTU, sigmoid grouped top-k,
+TP16 per-rank intermediate 3072 / 16 = 192 padded to 256 as ``KimiMoE`` pads it) under
+``Mxfp4Config`` (``KimiK3ForConditionalGenerationConfig`` rewrites the
+compressed-tensors ``mxfp4-pack-quantized`` checkpoint to ``mxfp4``, hence
+``Mxfp4MoEMethod``) and
+moe-backend auto, which resolves to ``FLASHINFER_TRTLLM_MXFP4_MXFP8``
+(``select_deepseek_v4_mxfp4_moe_backend``, as the production logs show). Random
+logical MXFP4 weights (E2M1 nibbles, E8M0 scales) are this rank's checkpoint slice
+(w1 / w3 [192, 3584 / 2], w2 [3584, 192 / 2]), loaded through the layer's
+``weight_loader`` per expert as the checkpoint loader does (rows 192-255 of w1 / w3 and
+columns 192-255 of w2 stay zero), converted by ``process_weights_after_loading``, then
+``place``d and handed to ``PersistentExperts`` exactly as ``runtime.decode`` does. The
+stock arm is that layer's own TRT-LLM-Gen experts (its prepare's MXFP8 input
+quantization and its ``fused_experts`` with the layer's weights and quant config; the
+routed-ids entry ``trtllm_fp4_block_scale_routed_moe`` since the production monolithic
+kernel routes from logits). The reference reads the logical (checkpoint) weights:
 
 - ``test_wide_experts_reference_band``: single launches of 72 / 128 / 256 / 512 / 768
   rows (the first rows of one 768-row set of q4 verify-like routes); the specialized
@@ -27,6 +38,21 @@ logical weights:
   the 768 in reversed row order; per pair the differing rows, columns, FC2 tiles and
   BF16 ulps. Determinism and the reference band are hard asserts; cross-grouping
   bitwise equality is xfail (strict=False) with the measured difference.
+- ``test_narrow_experts_reference_band``: control. The small-batch routed experts
+  production runs at <= 64 rows (``PersistentExperts.prepare`` as ``moe.prepared.
+  PreparedMoE`` calls it: q4, planned; M8 ``RubinExpertsKernel`` behind the image plan
+  and route mailbox, M32 / M64 ``RubinGroupedExpertsKernel`` behind the 64-row plan)
+  on the same weights, routes and reference, its expanded per-slot rows finalized on
+  the host (FP32, slot order, as the tail sums them). Passing while the wide launches
+  fail: the harness (weights, layout, routes, reference) is right and the wide engines
+  are wrong; failing the same way: the harness drives the kernels wrongly.
+
+On a reference-band failure the wide test also prints ``expert_breakdown``: the error
+of tokens by how many of their 16 experts lie at id >= ``EXPERT_SPLIT``, and per
+(token, slot) from 16 launches with one-hot routing weights (slot s alone): per slot,
+per expert-id range, the worst experts, the one-hot sum vs the full launch, and which
+reference slot each one-hot output matches best (dropped: alpha ~0, doubled: ~2,
+swapped: another slot).
 
 Batch-dependence hypothesis (code reading, see the grouping test's summary for the
 measured signature): the FC1 K-split. ``experts.ExpertsKernel.partition``
@@ -47,9 +73,20 @@ Rubin (cc 10.7) with CuTe DSL only."""
 
 import pytest
 
-H_LATENT, EXPERTS, TOPK, INTER = 3584, 896, 16, 256
+H_LATENT, EXPERTS, TOPK = 3584, 896, 16
+# Per-rank routed intermediate at TP16: the checkpoint's 3072 / 16 = 192 rows
+# (INTER_CKPT) padded with zeros to 256 (INTER, ``KimiMoE``'s
+# min_moe_intermediate_per_partition).
+MOE_INTER, TP, INTER = 3072, 16, 256
+INTER_CKPT = MOE_INTER // TP
+# The layer's name (one decoder layer index, as ``make_expert_substitution`` expects).
+PREFIX = "model.layers.1.block_sparse_moe.experts"
 BETA, LINEAR_BETA = 4.0, 25.0
 ROWS = (72, 128, 256, 512, 768)
+# The small-batch control (``test_narrow_experts_reference_band``): rows <= 64.
+NARROW_ROWS = (8, 32, 64)
+# ``expert_breakdown``: expert ids below / from this split, and per range of RANGE ids.
+EXPERT_SPLIT, EXPERT_RANGE = 448, 112
 FULL = 768
 # "Same band": the specialized error metric may be at most BAND x the stock one.
 BAND = 2.0
@@ -71,10 +108,11 @@ def require_rubin():
 
 
 def logical_weights(dev, seed=11):
-    """One TP16 layer's routed experts as loaded (before the backend's conversion):
-    w13 [E, 2I, K/2] (rows [0, I) gate w1, [I, 2I) up w3; E2M1 pairs, low nibble
-    first), s13 [E, 2I, K/32] E8M0, w2 [E, H, I/2], s2 [E, H, I/32]. Scales 2^-8..2^-4
-    keep FC1 / FC2 outputs O(1) at these K."""
+    """This TP16 rank's slice of one layer's routed experts as the compressed-tensors
+    checkpoint stores them (``mxfp4-pack-quantized``, group 32, uint8 E8M0 scales):
+    w13 [E, 2 INTER_CKPT, K/2] (rows [0, INTER_CKPT) gate w1, then up w3; E2M1 pairs,
+    low nibble first), s13 [E, 2 INTER_CKPT, K/32], w2 [E, H, INTER_CKPT/2], s2 [E, H,
+    INTER_CKPT/32]. Scales 2^-8..2^-4 keep FC1 / FC2 outputs O(1) at these K."""
     import torch
 
     gen = torch.Generator(device=dev).manual_seed(seed)
@@ -84,39 +122,122 @@ def logical_weights(dev, seed=11):
         return torch.randint(lo, hi, shape, dtype=u8, device=dev, generator=gen)
 
     return (
-        b((EXPERTS, 2 * INTER, H_LATENT // 2)),
-        b((EXPERTS, 2 * INTER, H_LATENT // 32), 119, 124),
-        b((EXPERTS, H_LATENT, INTER // 2)),
-        b((EXPERTS, H_LATENT, INTER // 32), 119, 124),
+        b((EXPERTS, 2 * INTER_CKPT, H_LATENT // 2)),
+        b((EXPERTS, 2 * INTER_CKPT, H_LATENT // 32), 119, 124),
+        b((EXPERTS, H_LATENT, INTER_CKPT // 2)),
+        b((EXPERTS, H_LATENT, INTER_CKPT // 32), 119, 124),
     )
 
 
-def kernel_weights(logical):
-    """The stock layer's FlashInfer TRT-LLM MXFP4 x MXFP8 layout (what both the stock
-    experts and ``PersistentExperts`` read in production), ``place``d on the dies as
-    ``runtime.decode`` does; returns ((w13, s13, w2, s2), dies)."""
-    from types import SimpleNamespace
+def load_checkpoint(layer, logical):
+    """Load ``logical`` into the layer's parameters through their ``weight_loader``s,
+    per expert and shard, as the model's ``load_weights`` feeds the checkpoint tensors
+    (``Mxfp4MoEMethod``'s scale loader keeps uint8 E8M0 as is): w1 / w3 land in rows
+    [0, INTER_CKPT) / [INTER, INTER + INTER_CKPT) of w13, w2 in columns [0,
+    INTER_CKPT); the padding keeps ``create_weights``' zeros."""
+    w13, s13, w2, s2 = logical
+    inter = w13.shape[1] // 2
+    shards = (("w1", slice(0, inter)), ("w3", slice(inter, 2 * inter)))
+    for e in range(EXPERTS):
+        for shard, rows in shards:
+            for name, src in (("w13_weight", w13), ("w13_weight_scale", s13)):
+                param = getattr(layer, name)
+                param.weight_loader(param, src[e, rows], f"{PREFIX}.{name}",
+                                    shard_id=shard, expert_id=e)  # fmt: skip
+        for name, src in (("w2_weight", w2), ("w2_weight_scale", s2)):
+            param = getattr(layer, name)
+            param.weight_loader(param, src[e], f"{PREFIX}.{name}", shard_id="w2",
+                                expert_id=e)  # fmt: skip
+
+
+def production_experts(logical, dev):
+    """The stock routed-experts layer production builds for one TP16 MoE layer, on one
+    GPU (tp 1 with the per-rank padded intermediate: loading the per-rank checkpoint
+    slice gives the bytes TP16 rank r gets from rows [192 r, 192 r + 192)), loaded with
+    ``logical``, processed, and its routed weights ``place``d and taken as
+    ``runtime.decode`` takes them. Returns dict(layer, config, weights=(w13, s13, w2,
+    s2), dies)."""
+    import os
+    import tempfile
 
     import torch
 
-    from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
-        Mxfp4MoeBackend,
-        convert_weight_to_mxfp4_moe_kernel_format,
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.distributed import (
+        cleanup_dist_env_and_memory,
+        init_distributed_environment,
+        initialize_model_parallel,
     )
+    from vllm.model_executor.layers.fused_moe import FusedMoEFactory
+    from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import Mxfp4MoeBackend
+    from vllm.model_executor.layers.quantization.mxfp4 import (
+        Mxfp4Config,
+        Mxfp4MoEMethod,
+    )
+    from vllm.model_executor.layers.quantization.utils import flashinfer_utils as fu
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe import (
         experts_runtime as er,
     )
 
-    w13, s13, w2, s2 = (t.clone() for t in logical)
-    w13, w2, s13, s2, _, _ = convert_weight_to_mxfp4_moe_kernel_format(
-        Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8, None, w13, w2, s13, s2,
-        _cache_permute_indices={},
-    )  # fmt: skip
-    routed = SimpleNamespace(
-        w13_weight=w13.view(torch.uint8), w2_weight=w2.view(torch.uint8)
-    )
-    dies = er.place(routed)
-    return (routed.w13_weight, s13, routed.w2_weight, s2), tuple(dies)
+    pytest.importorskip("flashinfer")
+    if not fu.has_flashinfer_situ_activation():
+        pytest.skip("FlashInfer without the SiTU activation: not the production MoE")
+    trtllm = Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8
+    config = VllmConfig()
+    config.kernel_config.moe_backend = "auto"  # production: moe-backend auto
+    # c10d's FileStore deletes its file when the last store using it closes
+    # (cleanup_dist_env_and_memory): own a directory, not the file.
+    tmp = tempfile.TemporaryDirectory()
+    store = os.path.join(tmp.name, "store")
+    try:
+        with set_current_vllm_config(config), torch.device(dev):
+            init_distributed_environment(
+                world_size=1, rank=0, local_rank=dev.index,
+                distributed_init_method=f"file://{store}", backend="nccl",
+            )  # fmt: skip
+            initialize_model_parallel(1, 1)
+            # ``KimiMoE``'s FusedMoEFactory arguments (the gate's correction bias is
+            # FP32 [E]; the shared experts and the latent transforms do not touch the
+            # routed weights)
+            runner = FusedMoEFactory(
+                num_experts=EXPERTS, top_k=TOPK, hidden_size=H_LATENT,
+                intermediate_size=INTER, params_dtype=torch.bfloat16,
+                activation="situ", activation_situ_beta=BETA,
+                activation_situ_linear_beta=LINEAR_BETA, renormalize=True,
+                quant_config=Mxfp4Config(), use_grouped_topk=True,
+                num_expert_group=1, topk_group=1, prefix=PREFIX,
+                scoring_func="sigmoid",
+                e_score_correction_bias=torch.zeros(EXPERTS, dtype=torch.float32),
+                routed_scaling_factor=1.0, tp_size=1, dp_size=1, pcp_size=1,
+                skip_padding=True,
+            )  # fmt: skip
+            layer = runner.routed_experts
+            method = layer.quant_method
+            assert isinstance(method, Mxfp4MoEMethod), type(method)
+            assert layer.w13_weight.shape == (EXPERTS, 2 * INTER, H_LATENT // 2)
+            # ``KimiMoE``: zeroed padded weights, the unpadded per-rank size
+            layer.w13_weight.data.zero_()
+            layer.w2_weight.data.zero_()
+            layer.moe_config.intermediate_size_per_partition_unpadded = INTER_CKPT
+            load_checkpoint(layer, logical)
+            pad = (
+                layer.w13_weight[:, INTER_CKPT:INTER],
+                layer.w13_weight[:, INTER + INTER_CKPT :],
+                layer.w2_weight[..., INTER_CKPT // 2 :],
+            )
+            assert not any(bool(t.any()) for t in pad), "checkpoint padding not zero"
+            method.process_weights_after_loading(layer)
+            backend = method.mxfp4_backend
+            assert backend == trtllm, f"not the production backend: {backend}"
+            assert method.moe_kernel is not None
+            # runtime.decode: place, then the routed weights as PersistentExperts reads
+            dies = er.place(layer)
+            w13, w2 = (w.view(torch.uint8) for w in (layer.w13_weight, layer.w2_weight))
+            weights = w13, layer.w13_weight_scale, w2, layer.w2_weight_scale
+    finally:
+        cleanup_dist_env_and_memory()
+        tmp.cleanup()
+    return dict(layer=layer, config=config, weights=weights, dies=tuple(dies))
 
 
 def verify_routes(rows, dev, seed=1007, q=4):
@@ -190,14 +311,17 @@ def situ(gate, up):
     return g * (LINEAR_BETA * torch.tanh(up / LINEAR_BETA))
 
 
-def reference(logical, latent, topk_w, ids):
+def reference(logical, latent, topk_w, ids, gate_scale=1.0, swap=False):
     """Per-token FP64 routed partial [M, 3584]: MXFP8 x (kernel rule), dequantized
-    MXFP4 w13 / w2, SiTU, the hidden MXFP8 per token (kernel rule), the top-k sum with
-    the BF16 routing weights; no BF16 staging."""
+    MXFP4 w13 / w2 (the checkpoint slice: intermediate INTER_CKPT, no padding), SiTU,
+    the hidden MXFP8 per token (kernel rule), the top-k sum with
+    the BF16 routing weights; no BF16 staging. ``gate_scale`` / ``swap`` (contract
+    probes only, ``contract_probe``): the gate pre-activation scaled, gate and up
+    exchanged."""
     import torch
 
     w13, s13, w2, s2 = logical
-    rows = latent.shape[0]
+    rows, inter = latent.shape[0], w13.shape[1] // 2
     x = mxfp8_kernel_rule(latent.float())
     out = torch.zeros(rows, H_LATENT, dtype=torch.float64, device=latent.device)
     flat = ids.flatten().long()
@@ -207,10 +331,32 @@ def reference(logical, latent, topk_w, ids):
         pick = (flat == e).nonzero().flatten()
         tokens = token[pick]
         a = x[tokens] @ dequant_mxfp4(w13[e], s13[e]).T  # [n, 2I]
-        h = situ(a[:, :INTER], a[:, INTER:]).float()  # FP32 into the quantizer
+        gate, up = a[:, :inter], a[:, inter:]
+        if swap:
+            gate, up = up, gate
+        h = situ(gate_scale * gate, up).float()  # FP32 into the quantizer
         y = mxfp8_kernel_rule(h) @ dequant_mxfp4(w2[e], s2[e]).T  # [n, H]
         out.index_add_(0, tokens, y * weight[pick, None])
     return out
+
+
+def reference_slots(logical, latent, ids):
+    """``reference``'s per-slot FC2 rows before the routing weights: FP64 [M, 16,
+    3584], slot s = expert ids[:, s]'s output alone (the reference with weights one-hot
+    on slot s)."""
+    import torch
+
+    w13, s13, w2, s2 = logical
+    rows, inter = latent.shape[0], w13.shape[1] // 2
+    x = mxfp8_kernel_rule(latent.float())
+    out = torch.zeros(rows * TOPK, H_LATENT, dtype=torch.float64, device=latent.device)
+    flat = ids.flatten().long()
+    for e in torch.unique(flat).tolist():
+        pick = (flat == e).nonzero().flatten()
+        a = x[pick // TOPK] @ dequant_mxfp4(w13[e], s13[e]).T
+        h = situ(a[:, :inter], a[:, inter:]).float()
+        out.index_copy_(0, pick, mxfp8_kernel_rule(h) @ dequant_mxfp4(w2[e], s2[e]).T)
+    return out.view(rows, TOPK, H_LATENT)
 
 
 # --------------------------------------------------------------------------------------
@@ -256,53 +402,117 @@ def run_wide(weights, dies, dev, latent, topk_w, ids, batches, order=None):
     return torch.cat(outs)
 
 
+def run_narrow(weights, dies, dev, latent, ids):
+    """The small-batch routed experts (rows <= 64) on a fresh ``PersistentExperts``
+    (q4) and ``scratch``, prepared as ``moe.prepared.PreparedMoE`` prepares them
+    (``prepare(b, buffers, expanded, publish, planned=True, twoshot)``) but without a
+    tail to publish into (publish (), twoshot False): the kernel writes the expanded
+    rows [M * 16, 3584] BF16 (slot s of token t at row 16 t + s, before the routing
+    weights), which production's tail sums. The plan the routing kernel would write:
+    M8 on ``RubinExpertsKernel`` the image plan (``compile_image_plan``) and, polled,
+    the route mailbox (ids + the copy CTAs' completion), as
+    test_k31_experts_workspace.py drives it; M9-64 the 64-row plan
+    (``compile_plan``, the routing kernel's ``plan_chunk`` rows). Returns (per-slot
+    rows [M, 16, 3584] BF16, the kernel's name)."""
+    import torch
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
+        stream,
+        to_cute,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe import (
+        experts_runtime as er,
+    )
+
+    rows = latent.shape[0]
+    assert rows <= 64
+    latent, ids = latent.contiguous(), ids.contiguous()
+    buffers = er.scratch(16, dev)
+    experts = er.PersistentExperts(
+        *weights, beta=BETA, linear_beta=LINEAR_BETA, dies=dies, q=4
+    )
+    out = torch.empty(rows * TOPK, H_LATENT, dtype=torch.bfloat16, device=dev)
+    experts.prepare(rows, buffers, out, (), True, False, False)
+    writer = None
+    if rows in experts.rubin:
+        kernel = "RubinExpertsKernel"
+        writer = er.compile_image_plan(rows, dev.index)
+    elif rows > 8:
+        grouped = experts.grouped64(rows)
+        kernel = "RubinGroupedExpertsKernel" if grouped else "ExpertsKernel (grouped)"
+        writer = er.compile_plan(rows, dev.index)
+    else:
+        kernel = "ExpertsKernel"
+    if writer is not None:
+        writer(to_cute(latent, 16), to_cute(buffers["plan"], 16), stream(dev))
+    if rows in experts.rubin and er.polled(16, rows, dev):  # the routing's mailbox
+        box = torch.full((er.ROUTE_WORDS,), -1, dtype=torch.int32, device=dev)
+        box[: rows * TOPK] = ids.reshape(-1)
+        box[rows * TOPK] = 2 * rows - 1  # every copy CTA's image part written
+        er.route_mailbox(buffers["workspace"]).copy_(box)
+    experts.run(latent, ids)
+    torch.cuda.synchronize()
+    return out.view(rows, TOPK, H_LATENT).clone(), kernel
+
+
+def finalize(slots, topk_w):
+    """The top-k weighted sum of per-slot rows [M, 16, 3584] as the tail sums the
+    expanded rows: FP32, slot order, BF16 weights; BF16 out."""
+    import torch
+
+    acc = torch.zeros(slots.shape[0], H_LATENT, dtype=torch.float32,
+                      device=slots.device)  # fmt: skip
+    for s in range(TOPK):
+        acc += topk_w[:, s, None].float() * slots[:, s].float()
+    return acc.bfloat16()
+
+
 class Stock:
-    """FlashInfer TRT-LLM-Gen MXFP4 x MXFP8 routed experts with SiTU, finalized (the
-    kern-moe bench's ``StockExpertsFI.routed``; MXFP8 input via
-    ``mxfp8_e4m3_quantize``); no autotune."""
+    """The production stock routed experts of ``layer`` (``production_experts``): its
+    ``Mxfp4MoEMethod`` kernel's prepare (MXFP8 input, linear UE8M0 scales) and its
+    TRT-LLM-Gen ``fused_experts`` on the layer's weights and quant config (SiTU alpha /
+    beta, scales, padded intermediate), finalized. The production kernel is monolithic
+    (it routes from router logits); the test's routes go through the routed-ids entry
+    of the same experts (``TrtLlmMxfp4ExpertsModular._invoke_kernel`` on the monolithic
+    experts object: ``trtllm_fp4_block_scale_routed_moe``). A modular kernel runs the
+    method's own ``apply``."""
 
-    def __init__(self, weights, dev):
-        import torch
+    def __init__(self, layer, config):
+        from vllm.model_executor.layers.fused_moe.experts.trtllm_mxfp4_moe import (
+            TrtLlmMxfp4ExpertsModular,
+        )
 
-        from vllm.model_executor.layers.quantization.utils import flashinfer_utils as fu
-
-        pytest.importorskip("flashinfer")
-        if not fu.has_flashinfer_situ_activation():
-            pytest.skip("FlashInfer without the SiTU activation: no stock arm")
-        from vllm.model_executor.layers.fused_moe.activation import MoEActivation
-
-        self.w13, s13, self.w2, s2 = weights
-        self.s13, self.s2 = (s.view(torch.float8_e4m3fn) for s in (s13, s2))
-        self.act = fu.activation_to_flashinfer_int(MoEActivation.SITU)
-        f32 = dict(dtype=torch.float32, device=dev)
-        self.alpha = torch.full((EXPERTS,), BETA, **f32)
-        self.beta = torch.full((EXPERTS,), LINEAR_BETA, **f32)
-        self.dev = dev
+        self.layer, self.config = layer, config
+        self.kernel = layer.quant_method.moe_kernel
+        self.invoke = TrtLlmMxfp4ExpertsModular._invoke_kernel
 
     def __call__(self, latent, topk_w, ids):
         import torch
-        from flashinfer import trtllm_fp4_block_scale_routed_moe
 
-        from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
-            mxfp8_e4m3_quantize,
-        )
+        from vllm.config import set_current_vllm_config
 
-        x, s = mxfp8_e4m3_quantize(latent)
-        out = torch.empty(latent.shape[0], H_LATENT, dtype=torch.bfloat16,
-                          device=self.dev)  # fmt: skip
-        trtllm_fp4_block_scale_routed_moe(
-            topk_ids=(ids, topk_w), routing_bias=None, hidden_states=x,
-            hidden_states_scale=s.view(torch.float8_e4m3fn), n_group=None,
-            topk_group=None, routed_scaling_factor=None, routing_method_type=1,
-            do_finalize=True, enable_pdl=True, output=out,
-            gemm1_weights=self.w13, gemm1_weights_scale=self.s13, gemm1_bias=None,
-            gemm1_alpha=self.alpha, gemm1_beta=self.beta, gemm1_clamp_limit=None,
-            gemm2_weights=self.w2, gemm2_weights_scale=self.s2, gemm2_bias=None,
-            output1_scale_scalar=None, output1_scale_gate_scalar=None,
-            output2_scale_scalar=None, num_experts=EXPERTS, top_k=TOPK,
-            intermediate_size=INTER, local_expert_offset=0, local_num_experts=EXPERTS,
-            activation_type=self.act, tune_max_num_tokens=8192,
-        )  # fmt: skip
+        layer, kernel = self.layer, self.kernel
+        ids = ids.to(torch.int32)
+        with set_current_vllm_config(self.config):
+            if not kernel.is_monolithic:
+                out = layer.quant_method.apply(layer, latent, topk_w, ids, None, None)
+                torch.cuda.synchronize()
+                return out
+            experts = kernel.fused_experts
+            x, scale, _ = kernel.prepare_finalize.prepare(
+                latent, router_logits=None, quant_config=experts.quant_config,
+                defer_input_quant=experts.expects_unquantized_inputs,
+            )  # fmt: skip
+            if scale is not None:
+                scale = scale.view(torch.float8_e4m3fn)
+            out = torch.empty(latent.shape[0], experts.hidden_dim_unpadded,
+                              dtype=torch.bfloat16, device=latent.device)  # fmt: skip
+            local = layer.local_num_experts
+            self.invoke(
+                experts, out, x, scale, ids, topk_w, layer.w13_weight,
+                layer.w2_weight, layer.activation, layer.global_num_experts, local,
+                experts.ep_rank * local, TOPK,
+            )  # fmt: skip
         torch.cuda.synchronize()
         return out
 
@@ -312,7 +522,7 @@ class Stock:
 
 
 def errors(out, ref):
-    """max / mean abs error and max / mean row-relative L2 error of ``out`` vs
+    """Max / mean abs error and max / mean row-relative L2 error of ``out`` vs
     ``ref``, plus the per-row relative errors."""
     err = out.double() - ref
     rel = err.norm(dim=1) / ref.norm(dim=1).clamp_min(1e-30)
@@ -320,6 +530,157 @@ def errors(out, ref):
         max_abs=err.abs().max().item(), mean_abs=err.abs().mean().item(),
         max_rel=rel.max().item(), mean_rel=rel.mean().item(), rows=rel,
     )  # fmt: skip
+
+
+# Contract probes (``contract_probe``): FP64 references under other output contracts,
+# on the first PROBE_ROWS rows.
+PROBE_ROWS = 72
+PROBES = {
+    "gate/up swapped": dict(swap=True),
+    "gate x2": dict(gate_scale=2.0),
+    "gate x0.5": dict(gate_scale=0.5),
+}
+
+
+def contract_probe(case, spec):
+    """Why the specialized rows miss the reference: lines with (1) the per-row
+    least-squares scale spec ~ alpha x ref and the residual after it (a pure scale
+    = an output-contract factor: routing-weight scaling, finalize, a TP / MX scale);
+    (2) the spec error vs FP64 references under other FC1 / SiTU contracts (the one
+    near the stock error names the engine's actual contract); (3) the row-relative
+    error by column within the FC2 shuffle's 32-row blocks and by 128-column FC2
+    tile (an uneven split names a layout)."""
+    rows = min(PROBE_ROWS, spec.shape[0])
+    out, ref = spec[:rows].double(), case["ref"][:rows]
+    alpha = (out * ref).sum(1) / (ref * ref).sum(1).clamp_min(1e-30)
+    scaled = alpha[:, None] * ref
+    residual = (out - scaled).norm(dim=1) / scaled.norm(dim=1).clamp_min(1e-30)
+    lines = [
+        f"probe M{rows}: alpha {alpha.mean().item():.4f} +- {alpha.std().item():.4f}"
+        f", residual rel after alpha {residual.mean().item():.3e} (max "
+        f"{residual.max().item():.3e})"
+    ]
+    latent, topk_w, ids = (t[:rows] for t in case["inputs"])
+    for name, kwargs in PROBES.items():
+        key = ("probe", name, rows)
+        if key not in case["cache"]:
+            case["cache"][key] = reference(
+                case["logical"], latent, topk_w, ids, **kwargs
+            )
+        lines.append(f"  spec vs ref[{name}]: {fmt(errors(out, case['cache'][key]))}")
+    err, norm = (out - ref).pow(2), ref.pow(2)
+    by32 = err.view(rows, -1, 32).sum((0, 1)) / norm.view(rows, -1, 32).sum((0, 1))
+    by_tile = err.view(rows, 28, 128).sum((0, 2)) / norm.view(rows, 28, 128).sum((0, 2))
+    by32, by_tile = by32.sqrt(), by_tile.sqrt()
+    lines.append("  rel by column % 32: " + " ".join(f"{v:.2f}" for v in by32.tolist()))
+    lines.append(
+        f"  rel by FC2 tile: min {by_tile.min().item():.3f} max "
+        f"{by_tile.max().item():.3f}"
+    )
+    return lines
+
+
+def wide_slot_outs(case, rows):
+    """The wide engine's per-slot rows [M, 16, 3584] BF16 of the first ``rows`` rows:
+    16 single launches of ``rows`` rows (the same engine and width as the failing
+    launch) with the routing weights one-hot on slot s (1.0 is exact in BF16)."""
+    import torch
+
+    key = ("wide slots", rows)
+    if key not in case["cache"]:
+        latent, topk_w, ids = (t[:rows].contiguous() for t in case["inputs"])
+        outs = []
+        for s in range(TOPK):
+            onehot = torch.zeros_like(topk_w)
+            onehot[:, s] = 1
+            outs.append(run_wide(case["weights"], case["dies"], case["dev"], latent,
+                                 onehot, ids, [rows]))  # fmt: skip
+        case["cache"][key] = torch.stack(outs, 1)
+    return case["cache"][key]
+
+
+def expert_breakdown(case, spec, slots=None):
+    """Where the error of ``spec`` (the first M rows, [M, 3584]) sits, as lines:
+    (1) rows grouped by how many of their 16 experts have id >= EXPERT_SPLIT (one
+    expert half dropped / doubled moves the error with that count); with ``slots``
+    (per-slot rows [M, 16, 3584], slot s alone at weight 1): (2) ``spec`` vs
+    ``finalize(slots)`` (linearity: a mismatch names the finalize / weight indexing,
+    not the expert math); (3) per (token, slot) the row-relative error and the
+    least-squares scale alpha vs ``reference_slots`` (dropped ~0, doubled ~2), by slot
+    index and by expert-id range, and the worst experts; (4) for each slot the
+    reference slot its one-hot output matches best (another slot: slots permuted)."""
+    import torch
+
+    rows = spec.shape[0]
+    latent, topk_w, ids = (t[:rows] for t in case["inputs"])
+    rel = errors(spec, case["ref"][:rows])["rows"]
+    high = (ids >= EXPERT_SPLIT).sum(1)
+    head = f"rows by experts with id >= {EXPERT_SPLIT} (of {TOPK}): rows, row rel"
+    lines = [head + " mean / max"]
+    for n in torch.unique(high).tolist():
+        r = rel[high == n]
+        lines.append(f"  {n:2d}: {r.numel():4d} rows {r.mean().item():.3e} / "
+                     f"{r.max().item():.3e}")  # fmt: skip
+    if slots is None:
+        return lines
+    key = ("ref slots", rows)
+    if key not in case["cache"]:
+        case["cache"][key] = reference_slots(case["logical"], latent, ids)
+    ref = case["cache"][key]
+    lin = errors(spec, finalize(slots, topk_w).double())
+    lines.append(f"full launch vs one-hot slots finalized: {fmt(lin)}")
+    alpha = torch.empty(rows, TOPK, dtype=torch.float64, device=spec.device)
+    pair = torch.empty_like(alpha)
+    for s in range(TOPK):  # one slot at a time (M x 3584 FP64 temporaries)
+        out, r = slots[:, s].double(), ref[:, s]
+        den = (r * r).sum(1).clamp_min(1e-30)
+        alpha[:, s] = (out * r).sum(1) / den
+        pair[:, s] = (out - r).norm(dim=1) / den.sqrt()
+    bad = pair > 0.5
+
+    def stats(mask):
+        n = int(mask.sum())
+        if not n:
+            return "     0 pairs"
+        a, p = alpha[mask], pair[mask]
+        return (f"{n:6d} pairs rel {p.mean().item():.3e} (max {p.max().item():.3e}) "
+                f"alpha {a.mean().item():.3f} +- {a.std().item() if n > 1 else 0:.3f} "
+                f"rel>0.5 {int(bad[mask].sum())}")  # fmt: skip
+
+    lines.append("per (token, slot), one-hot launches vs reference_slots, by slot:")
+    for s in range(TOPK):
+        mask = torch.zeros_like(bad)
+        mask[:, s] = True
+        lines.append(f"  slot {s:2d}: {stats(mask)}")
+    lines.append(f"by expert id (split {EXPERT_SPLIT}, ranges of {EXPERT_RANGE}):")
+    lines.append(f"  id <  {EXPERT_SPLIT}: {stats(ids < EXPERT_SPLIT)}")
+    lines.append(f"  id >= {EXPERT_SPLIT}: {stats(ids >= EXPERT_SPLIT)}")
+    for lo in range(0, EXPERT_RANGE * -(-EXPERTS // EXPERT_RANGE), EXPERT_RANGE):
+        mask = (ids >= lo) & (ids < lo + EXPERT_RANGE)
+        lines.append(f"  [{lo:3d}, {lo + EXPERT_RANGE:3d}): {stats(mask)}")
+    per_expert = torch.zeros(EXPERTS, dtype=torch.float64, device=spec.device)
+    count = torch.zeros_like(per_expert)
+    flat = ids.flatten().long()
+    per_expert.index_add_(0, flat, pair.flatten())
+    count.index_add_(0, flat, torch.ones_like(pair.flatten()))
+    mean = per_expert / count.clamp_min(1)
+    worst = mean.argsort(descending=True)[:12].tolist()
+    lines.append(
+        f"worst experts (mean pair rel, pairs; {int((mean > 0.5).sum())} of "
+        f"{int((count > 0).sum())} routed experts above 0.5): "
+        + ", ".join(f"{e}: {mean[e].item():.2f} x{int(count[e])}" for e in worst)
+    )
+    m = min(PROBE_ROWS, rows)
+    match = []
+    for s in range(TOPK):  # [m, 16] row rel of slot s's output vs every ref slot
+        out = slots[:m, s].double()[:, None]
+        cross = (out - ref[:m]).norm(dim=2) / ref[:m].norm(dim=2).clamp_min(1e-30)
+        cross = cross.mean(0)
+        best, own = int(cross.argmin()), cross[s].item()
+        note = "" if best == s else f"({cross[best].item():.2f} vs own {own:.2f})"
+        match.append(f"{s}->{best}{note}")
+    lines.append(f"best-matching reference slot (first {m} rows): " + " ".join(match))
+    return lines
 
 
 def fmt(e):
@@ -383,11 +744,11 @@ def case():
     torch.accelerator.set_device_index(dev)
     torch.backends.cuda.matmul.allow_tf32 = False
     logical = logical_weights(dev)
-    weights, dies = kernel_weights(logical)
+    built = production_experts(logical, dev)
     ids, topk_w, latent = verify_routes(FULL, dev)
     ref = reference(logical, latent, topk_w, ids)
-    return dict(dev=dev, weights=weights, dies=dies, inputs=(latent, topk_w, ids),
-                ref=ref, cache={})  # fmt: skip
+    return dict(dev=dev, inputs=(latent, topk_w, ids), ref=ref, logical=logical,
+                cache={}, **built)  # fmt: skip
 
 
 def stock_out(case, rows):
@@ -395,7 +756,7 @@ def stock_out(case, rows):
     key = ("stock", rows)
     if key not in case["cache"]:
         if "stock_arm" not in case["cache"]:
-            case["cache"]["stock_arm"] = Stock(case["weights"], case["dev"])
+            case["cache"]["stock_arm"] = Stock(case["layer"], case["config"])
         stock = case["cache"]["stock_arm"]
         latent, topk_w, ids = (t[:rows].contiguous() for t in case["inputs"])
         case["cache"][key] = stock(latent, topk_w, ids)
@@ -428,8 +789,45 @@ def test_wide_experts_reference_band(case, rows):
     stock = stock_out(case, rows)
     es, ek = errors(spec, ref), errors(stock, ref)
     print(f"\nM{rows} spec  vs ref: {fmt(es)}\nM{rows} stock vs ref: {fmt(ek)}")
-    for metric in ("max_abs", "mean_abs", "max_rel", "mean_rel"):
-        assert es[metric] <= BAND * ek[metric], (rows, metric, fmt(es), fmt(ek))
+    metrics = ("max_abs", "mean_abs", "max_rel", "mean_rel")
+    failed = [m for m in metrics if es[m] > BAND * ek[m]]
+    if failed:
+        lines = contract_probe(case, spec)
+        lines += expert_breakdown(case, spec, wide_slot_outs(case, rows))
+        probe = "\n".join(lines)
+        print(probe)
+        raise AssertionError(
+            f"M{rows}: {failed} outside {BAND} x stock\nspec  vs ref: {fmt(es)}\n"
+            f"stock vs ref: {fmt(ek)}\n{probe}"
+        )
+
+
+@pytest.mark.parametrize("rows", NARROW_ROWS)
+def test_narrow_experts_reference_band(case, rows):
+    """Control for ``test_wide_experts_reference_band``: the small-batch routed experts
+    production runs at <= 64 rows (``run_narrow``), the first ``rows`` rows of the same
+    routes on the same weights, finalized on the host; the same metrics, probes and
+    band vs stock. Passing (while the wide launches fail): the harness is right and
+    the wide engines are wrong; failing alike: the harness drives the kernels wrongly
+    (weights / layout / routes / reference)."""
+    import torch
+
+    ref = case["ref"][:rows]
+    latent, topk_w, ids = (t[:rows].contiguous() for t in case["inputs"])
+    slots, kernel = run_narrow(case["weights"], case["dies"], case["dev"], latent, ids)
+    assert torch.isfinite(slots.float()).all()
+    spec = finalize(slots, topk_w)
+    stock = stock_out(case, rows)
+    es, ek = errors(spec, ref), errors(stock, ref)
+    lines = [f"M{rows} narrow ({kernel}) vs ref: {fmt(es)}",
+             f"M{rows} stock vs ref: {fmt(ek)}"]  # fmt: skip
+    lines += contract_probe(case, spec)
+    lines += expert_breakdown(case, spec, slots)
+    summary = "\n".join(lines)
+    print("\n" + summary)
+    metrics = ("max_abs", "mean_abs", "max_rel", "mean_rel")
+    failed = [m for m in metrics if es[m] > BAND * ek[m]]
+    assert not failed, f"M{rows}: {failed} outside {BAND} x stock\n{summary}"
 
 
 class GroupingNotBitwise(AssertionError):
@@ -501,6 +899,10 @@ def test_wide_experts_grouping_variance(case):
     print("\n" + summary)
     again = pairs["768 again"]["rows"]
     assert not again, "768-row launch not deterministic\n" + summary
-    assert not outside, f"rows outside the reference band: {outside}\n{summary}"
+    if outside:
+        probe = "\n".join(contract_probe(case, one))
+        raise AssertionError(
+            f"rows outside the reference band: {outside}\n{summary}\n{probe}"
+        )
     if any(c["rows"] for c in pairs.values()):
         raise GroupingNotBitwise(summary)

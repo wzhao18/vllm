@@ -47,10 +47,15 @@ GPU moves ~2 x the rows instead of TP x. The same sums and rounding points as
 224 rows): one CTA of 8 x 128 threads per row (the cluster's CTAs as thread groups),
 the same push, owner reduce, residual add, warp sums, group sums and cross-group order
 as ``ArNormTwoShot`` / ``ArNorm.finish``: bitwise their outputs, in one wave while
-every row's CTA is resident. Above that a row's CTA waits only on the same row's CTAs
-of the other ranks (owner sums of pushes those CTAs issue before any wait), so with
-in-order block dispatch the lowest unfinished rows are resident on every rank and
-progress; the wide box is sized from the deployment's largest rows (no static cap).
+every row's CTA is resident. A push site's CTA waits on the same row's CTAs of the
+other ranks (owner sums of pushes those CTAs issue before any wait), so above the rows
+the device holds at once (``PreparedDraftAr`` asks the kernel's occupancy) the push
+sites run ``ArNormRows(ctas=...)``: one co-resident wave, CTA c on rows c, c + ctas,
+...; it pushes every owned row's chunks, then reduces this rank's owned chunks of
+every owned row, then polls and normalizes the rows one by one. Every wait is on work
+every rank's CTAs issued before their first wait, so any row count completes without
+relying on block dispatch order; per row the same instructions (bitwise the same
+outputs). The wide box is sized from the deployment's largest rows (no static cap).
 """
 
 from functools import cache
@@ -62,11 +67,14 @@ import torch.distributed._symmetric_memory as symm_mem
 from cutlass import Float32, Int32, Int64, Uint32, Uint64
 from cutlass.cute.runtime import make_fake_stream
 
+from ...shapes import Shape, full_capture, refuse
 from ..common.embedding import compile_ring_gather
 from ..common.host import (
     architecture,
+    check_residency,
     fake,
     prepare_shared_carveout,
+    resident_ctas,
     stream,
     to_cute,
 )
@@ -465,48 +473,51 @@ class ArNormRows:
     partial. Without ``push``: sources TP (the gather row was reduced already: the
     residual is added and written in place) or 1 (the embedding ring's rows: the
     gathered row is the residual). ``trigger``: release the PDL dependents right after
-    the wait (as ``ArNorm``'s). Re-arms the gather row it read."""
+    the wait (as ``ArNorm``'s). Re-arms the gather row it read.
 
-    def __init__(self, rows, sources, tp, trigger=False, push=False):
+    ``ctas``: a persistent grid of ``ctas`` co-resident CTAs, CTA c on rows c, c +
+    ctas, ...: the pushes of all its rows, then the owner reduces of all its rows,
+    then each row's poll and norm (as the per-row CTA, in that order)."""
+
+    def __init__(self, rows, sources, tp, trigger=False, push=False, ctas=None):
         self.rows, self.sources, self.tp, self.trigger = rows, sources, tp, trigger
         self.reduce = sources > 1
         self.push = push and self.reduce
         self.owned_chunks = HIDDEN // tp // 8
+        self.ctas = ctas
 
     @cute.jit
     def __call__(self, *args):
-        launch(self.kernel, args, self.rows, CLUSTER * 128)
-
-    @cute.kernel
-    def kernel(self, args):
-        if cutlass.const_expr(self.push):
-            partial, residual, gamma, eps, norm_out = args[:5]
-            recv, peers, gather, mc, rank = args[5:]
+        if cutlass.const_expr(self.ctas is not None):
+            launch(self.kernel, args, self.ctas, CLUSTER * 128)
         else:
-            residual, gamma, eps, norm_out, gather = args
-        tid, _, _ = cute.arch.thread_idx()
-        row, _, _ = cute.arch.block_idx()
-        group, local = tid // 128, tid % 128
+            launch(self.kernel, args, self.rows, CLUSTER * 128)
+
+    @cute.jit
+    def push_row(self, partial, recv, peers, rank, row, live, col):
+        """This rank's partial chunks of ``row`` (no -0.0) to their owners."""
+        if live:
+            words = load_words(
+                partial.iterator + row * HIDDEN + col, count=4, mutable=True
+            )
+            words = tuple(no_neg_zero(w) for w in words)
+            push(recv, peers, rank, row, col, words)
+
+    @cute.jit
+    def reduce_row(self, recv, gather, mc, rank, row, tid):
+        """This rank's owned chunks of ``row``: summed, multicast, slots re-armed."""
+        if tid < self.owned_chunks:
+            column = rank * (HIDDEN // self.tp) + tid * 8
+            two_shot_reduce(recv, gather, mc, rank, row, column, batched=True)
+
+    @cute.jit
+    def finish_row(
+        self, partial, residual, weights, eps, norm_out, gather, sums, row, tid,
+        live, col,
+    ):  # fmt: skip
+        """Poll ``row``'s gather row, add the residual, store the new residual and the
+        normed row; re-arm the gather row."""
         lane, warp = tid % 32, tid // 32
-        smem = cutlass.utils.SmemAllocator()
-        sums = alloc(smem, Float32, 4 * CLUSTER)
-        live = local < COLUMNS // 8
-        col = group * COLUMNS + min(local, COLUMNS // 8 - 1) * 8
-        weights = load_words(gamma.iterator + col, count=4)  # static: before the wait
-        cute.arch.griddepcontrol_wait()
-        if cutlass.const_expr(self.trigger):
-            cute.arch.griddepcontrol_launch_dependents()
-        if cutlass.const_expr(self.push):
-            if live:
-                words = load_words(
-                    partial.iterator + row * HIDDEN + col, count=4, mutable=True
-                )
-                words = tuple(no_neg_zero(w) for w in words)
-                push(recv, peers, rank, row, col, words)
-            if tid < self.owned_chunks:
-                column = rank * (HIDDEN // self.tp) + tid * 8
-                two_shot_reduce(recv, gather, mc, rank, row, column, batched=True)
-            cute.arch.sync_threads()  # the gather row's pollers after the owners
         res = (Uint32(0),) * 4
         if cutlass.const_expr(self.reduce):
             res = load_words(
@@ -553,14 +564,59 @@ class ArNormRows:
                     pair.append(x[2 * k + int(h)] * scale * bf16(weights[k], h))
                 normed.append(bf16x2(pair[0], pair[1]))
             store_words(norm_out.iterator + row * HIDDEN + col, tuple(normed))
+
+    @cute.kernel
+    def kernel(self, args):
+        if cutlass.const_expr(self.push):
+            partial, residual, gamma, eps, norm_out = args[:5]
+            recv, peers, gather, mc, rank = args[5:]
+        else:
+            residual, gamma, eps, norm_out, gather = args
+            partial = residual  # (unused: the new residual is written in place)
+        tid, _, _ = cute.arch.thread_idx()
+        first, _, _ = cute.arch.block_idx()
+        group, local = tid // 128, tid % 128
+        smem = cutlass.utils.SmemAllocator()
+        sums = alloc(smem, Float32, 4 * CLUSTER)
+        live = local < COLUMNS // 8
+        col = group * COLUMNS + min(local, COLUMNS // 8 - 1) * 8
+        weights = load_words(gamma.iterator + col, count=4)  # static: before the wait
+        cute.arch.griddepcontrol_wait()
+        if cutlass.const_expr(self.trigger):
+            cute.arch.griddepcontrol_launch_dependents()
+        out = (eps, norm_out, gather, sums)
+        if cutlass.const_expr(self.ctas is None):  # one CTA per row
+            row = first
+            if cutlass.const_expr(self.push):
+                self.push_row(partial, recv, peers, rank, row, live, col)
+                self.reduce_row(recv, gather, mc, rank, row, tid)
+                cute.arch.sync_threads()  # the gather row's pollers after the owners
+            self.finish_row(partial, residual, weights, *out, row, tid, live, col)
+        else:  # persistent: all pushes, then all owner reduces, then the rows
+            rows = norm_out.shape[0]
+            # The stride from the launch grid (not ``self.ctas``): the probe and the
+            # launched kernel are the same code (the same registers and occupancy).
+            stride, _, _ = cute.arch.grid_dim()
+            if cutlass.const_expr(self.push):
+                for row in cutlass.range(first, rows, stride, unroll=1):
+                    self.push_row(partial, recv, peers, rank, row, live, col)
+                for row in cutlass.range(first, rows, stride, unroll=1):
+                    self.reduce_row(recv, gather, mc, rank, row, tid)
+                cute.arch.sync_threads()  # the gather rows' pollers after the owners
+            # (``finish_row`` opens with a barrier: the previous row's ``sums`` read)
+            for row in cutlass.range(first, rows, stride, unroll=1):
+                self.finish_row(partial, residual, weights, *out, row, tid, live, col)
         if cutlass.const_expr(not self.trigger):
             cute.arch.griddepcontrol_launch_dependents()
 
 
 @cache
-def compile_rows_site(rows, sources, tp, cap, device, trigger=False, push=False):
+def compile_rows_site(
+    rows, sources, tp, cap, device, trigger=False, push=False, ctas=None
+):
     """``ArNormRows`` over a [1, ``cap``, HIDDEN] gather view (``push``: and the
-    [TP, cap, HIDDEN / TP] receive slots, as ``compile_two_shot``)."""
+    [TP, cap, HIDDEN / TP] receive slots, as ``compile_two_shot``); ``ctas``: its
+    persistent grid."""
     args = (
         fake((rows, HIDDEN)),
         fake((HIDDEN,)),
@@ -582,7 +638,7 @@ def compile_rows_site(rows, sources, tp, cap, device, trigger=False, push=False)
             Int32(0),
         )
     with torch.accelerator.device_index(device):
-        kernel = ArNormRows(rows, sources, tp, trigger, push)
+        kernel = ArNormRows(rows, sources, tp, trigger, push, ctas)
         compiled = cute.compile(kernel, *args, make_fake_stream())
         if trigger:  # as ``compile_two_shot``: the released GEMMs place beside it
             compiled = prepare_shared_carveout(compiled, device, 100)
@@ -649,6 +705,9 @@ class PreparedDraftAr:
         valid=(), wide=(),
     ):  # fmt: skip
         self.tp, self.rank, self.device = tp, rank, device
+        # NQ-NOFALLBACK: set by runtime.draft on the target topology: a captured
+        # drafter graph of a prepared row runs these sites or raises.
+        self.strict = False
         cap = WIDE_CAP or max(rows, default=0)
         self.wide_rows = frozenset(r for r in rows if r in wide and 64 < r <= cap)
         self.rows = tuple(
@@ -691,12 +750,17 @@ class PreparedDraftAr:
                 recv, peers, gather, mc = self.two.views(parity)
                 views = to_cute(recv), to_cute(peers, 8), to_cute(gather), Int64(mc)
                 self.two_views.append(views)
+        # Wide push sites above the rows the device holds at once: persistent.
+        self.persistent: dict[int, int] = {}
         for r in self.rows:
             if r in self.wide_rows:
                 wide_cap, trigger = self.wide_cap, r in early
                 self.reduce[r] = compile_rows_site(
                     r, tp, tp, wide_cap, index, trigger, push=True
                 )
+                ctas = resident_ctas(self.reduce[r], index, CLUSTER * 128)
+                if r > ctas:
+                    self.reduce[r] = self.persistent_site(r, wide_cap, trigger)
                 self.embed[r] = compile_rows_site(r, 1, tp, wide_cap, index, trigger)
             elif r in self.two_rows:
                 trigger = r in self.early_two
@@ -728,6 +792,22 @@ class PreparedDraftAr:
         self.shape_rows = torch.empty(
             (CAP, HIDDEN), dtype=torch.bfloat16, device=device
         )
+
+    def persistent_site(self, rows, cap, trigger):
+        """The persistent ``ArNormRows`` push site at ``rows``: one wave of the
+        device's resident CTAs of that kernel (``ctas`` only sets the launch grid;
+        the occupancy is read after ``trigger``'s carve-out), checked."""
+        index, tp = self.device.index, self.tp
+        probe = compile_rows_site(rows, tp, tp, cap, index, trigger, True, ctas=1)
+        ctas = resident_ctas(probe, index, CLUSTER * 128)
+        if ctas < 1:
+            raise RuntimeError("Kimi K3 DSpark drafter all-reduce: no resident CTA")
+        ctas = min(ctas, rows)
+        compiled = compile_rows_site(rows, tp, tp, cap, index, trigger, True, ctas)
+        what = f"Kimi K3 DSpark drafter persistent all-reduce ({ctas} CTAs)"
+        check_residency(compiled, index, ctas, CLUSTER * 128, what)
+        self.persistent[rows] = ctas
+        return compiled
 
     def prepare_producers(self, layers, tactics, early=(), trigger=False):
         """Ring o_proj / down_proj of every layer for ``tactics`` {rows: {(N, K):
@@ -875,16 +955,26 @@ class PreparedDraftAr:
     def run(self, model, input_ids, positions):
         rows = input_ids.shape[0]
         self.stamp_index = 0
-        if (
-            rows not in self.reduce
-            or not torch.cuda.is_current_stream_capturing()
-            or input_ids.dtype != torch.int32
-            or not input_ids.is_contiguous()
-            or model.embed_tokens is None
-        ):
-            return None
-        weight = model.embed_tokens.weight
-        if weight.shape[0] != self.shard or not weight.is_contiguous():
+        if not torch.cuda.is_current_stream_capturing():
+            return None  # eager: no graph, the stock layers and all-reduce
+        weight = getattr(model.embed_tokens, "weight", None)
+        checks = (
+            (rows not in self.reduce, "rows without prepared sites"),
+            (input_ids.dtype != torch.int32, f"input ids {input_ids.dtype}"),
+            (not input_ids.is_contiguous(), "strided input ids"),
+            (weight is None, "no embedding"),
+            (
+                weight is not None and weight.shape[0] != self.shard,
+                "an embedding shard other than the vocabulary / TP rows",
+            ),
+            (weight is not None and not weight.is_contiguous(), "a strided embedding"),
+        )
+        reason = next((why for failed, why in checks if failed), None)
+        if reason is not None:
+            # NQ-NOFALLBACK: a captured drafter graph never captures the stock layers
+            # + FlashInfer all-reduce (``strict``: the target topology).
+            if self.strict and full_capture():
+                refuse("DSpark drafter all-reduce sites", reason, Shape(rows))
             return None
         empty = lambda: torch.empty(  # noqa: E731
             (rows, HIDDEN), dtype=weight.dtype, device=weight.device
