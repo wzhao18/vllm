@@ -104,6 +104,24 @@ def test_overlay_mirrors_and_replaces(tmp_path):
         overlay_root(stock, tmp_path / "cache2", {"deep_gemm/impls/x.cuh": new})
 
 
+def test_overlay_per_stock_install(tmp_path):
+    """Two DeepGEMM installs sharing one cache root (two vLLM trees, one
+    VLLM_CACHE_ROOT) get separate mirrors: each links its own stock headers."""
+    new = tmp_path / "a_new.cuh"
+    new.write_text("patched a")
+    roots = []
+    for name in ("one", "two"):
+        stock = tmp_path / name
+        (stock / "include/deep_gemm/impls").mkdir(parents=True)
+        (stock / "include/deep_gemm/impls/a.cuh").write_text("stock a")
+        (stock / "include/deep_gemm/impls/b.cuh").write_text(f"stock b {name}")
+        roots.append(overlay_root(stock, tmp_path / "cache", {"deep_gemm/impls/a.cuh": new}))
+    assert roots[0] != roots[1]
+    for name, root in zip(("one", "two"), roots):
+        assert (root / "include/deep_gemm/impls/b.cuh").read_text() == f"stock b {name}"
+        assert (root / "include/deep_gemm/impls/a.cuh").read_text() == "patched a"
+
+
 # ---------------------------------------------------------------------------- GPU
 HIDDEN, INTER, TOPK = 3584, 3072, 16
 ALPHA, BETA = 4.0, 25.0
