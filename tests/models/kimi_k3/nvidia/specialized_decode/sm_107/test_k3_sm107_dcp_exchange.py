@@ -126,10 +126,10 @@ def _stock_global_mask(full, G, Lr, local, rank, W, il, T, Gmax, dev):
     pack_dcp_topk_candidates_cutedsl(lg32, loc, packed, rank, W, il, None)
     buf = torch.empty(W, T, K, 2, dtype=torch.float32, device=dev)
     dist.all_gather_into_tensor(buf, packed, group=GROUP[0])
-    gathered = buf.permute(1, 0, 2, 3).reshape(T, W * K, 2).contiguous()
     sel = torch.empty(T, K, dtype=torch.int32, device=dev)
+    # The base reads the rank-major [W, T, K, 2] all-gather in place.
     stable_topk_from_gathered_candidates_cutedsl(
-        gathered, K, out=sel, score_bits=16, id_bits=dcp_topk_id_bits(1 << 22))
+        buf, K, out=sel, score_bits=16, id_bits=dcp_topk_id_bits(1 << 22))
     m = torch.zeros(T, Gmax + 1, dtype=torch.bool, device=dev)
     s = sel.long()
     s = torch.where((s >= 0) & (s < Gmax), s, torch.full_like(s, Gmax))
