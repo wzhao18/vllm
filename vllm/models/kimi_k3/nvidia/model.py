@@ -125,7 +125,9 @@ from ..common.mm_preprocess import (
     KimiK3MultiModalProcessor,
     KimiK3ProcessingInfo,
 )
-from .specialized_decode.runtime import specialized_decode_config
+# On SM107 (Rubin) latency_specialized selects the specialized_decode.sm_107
+# decode; everywhere else this returns specialized_decode.runtime's config.
+from .specialized_decode.sm_107 import specialized_decode_config
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.model_states.interface import ModelState
@@ -1542,6 +1544,10 @@ class KimiLinearForCausalLM(
         self.needs_norm_in_logits = True
 
     def build_specialized_decode(self) -> None:
+        build = getattr(self.specialized_decode_config, "build", None)
+        if build is not None:  # the SM107 decode builds itself
+            build(self)
+            return
         from .specialized_decode.runtime.decode import SpecializedDecode
 
         self.specialized_decode = SpecializedDecode(
@@ -1554,6 +1560,9 @@ class KimiLinearForCausalLM(
         self.needs_norm_in_logits = False
 
     def get_model_state_cls(self) -> "type[ModelState]":
+        state_cls = getattr(self.specialized_decode_config, "model_state_cls", None)
+        if state_cls is not None:  # the SM107 decode's model state
+            return state_cls
         from .model_state import KimiK3ModelState
 
         return KimiK3ModelState
