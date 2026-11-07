@@ -319,7 +319,8 @@ class WideDsa:
                 "Kimi K3.1 specialized decode needs the FLASHMLA_SPARSE or "
                 f"FLASHINFER_MLA_SPARSE backend, got {type(self.impl).__name__}"
             )
-        assert dcp is not None, "Kimi K3.1 DSA wide rows run under DCP only"
+        if dcp is None:
+            raise ValueError("Kimi K3.1 specialized DSA: wide rows run under DCP only")
         self.box, self.parity = dcp, parity
         self.dcp = dcp.size
         self.heads = layer.W_UK_T.shape[0]
@@ -521,7 +522,8 @@ class WideDsa:
                 block_size=md.block_size,
                 is_decode=True,
             )
-            assert lse is not None
+            if lse is None:
+                raise RuntimeError("Kimi K3.1 specialized DSA: no LSE from the decode")
             lse = lse.masked_fill((valid == 0).view(-1, 1), float("-inf"))
             return rows, lse, valid
         rows, lse = flash_mla_with_kvcache(
