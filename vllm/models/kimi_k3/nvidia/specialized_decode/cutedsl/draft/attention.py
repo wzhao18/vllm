@@ -61,6 +61,7 @@ from ..common.host import (
     dynamic_view,
     fake,
     layout,
+    max_active_clusters,
     prepare_shared_carveout,
     stream,
     to_cute,
@@ -128,11 +129,20 @@ FAST_QUERY = batch_table("3-64:1")
 # (scripts/dsdraft/layer_test.py), us ungated -> gated: B1 210.1 -> 208.4, B8 416.1 ->
 # 399.5; outputs bitwise identical.
 GATED_QUERY = batch_table("3-64:1")
-# FAST_QUERY rows -> MlaQuery's tiled request tile (not listed: its rule, 32 above 16
-# rows at 4 heads): 16-request tiles put 2-4x the CTAs on the drafter's B3-B8 rows.
-# 16 ranks, the drafter forward (scripts/dsdraft/layer_test.py), us rule -> 16: B3
-# 327.1 -> 320.8, B4 336.3 -> 328.1, B5 344.6 -> 330.7, B8 397.1 -> 384.3; bitwise.
-QUERY_TOKENS = batch_table("21:16,28:16,35:16,42:16,49:16,56:16,63:16")
+# Heads per rank -> FAST_QUERY rows -> MlaQuery's tiled request tile (not listed: its
+# rule, 32 above 16 rows): 16-request tiles put 2-4x the CTAs on the drafter's B3-B8
+# rows. 16 ranks, 4 heads (kimi-k3-dspark at TP16), the drafter forward
+# (scripts/dsdraft/layer_test.py), us rule -> 16: B3 327.1 -> 320.8, B4 336.3 -> 328.1,
+# B5 344.6 -> 330.7, B8 397.1 -> 384.3; bitwise. The gathered (GATED_QUERY) poll needs
+# the whole grid resident: heads x row tiles clusters of 8 CTAs, and Rubin holds 22
+# (``check_query_clusters``). 6 heads (kimi-k3.1-pro-dspark-preview at TP16): 16-row
+# tiles only up to 42 rows (3 tiles, 18 clusters); 49-63 rows as 16-row tiles are 24
+# clusters, which deadlocked every rank's gathered poll in serving (the last tile never
+# got SMs), so they keep the rule (32: 2 tiles, 12 clusters).
+QUERY_TOKENS = {
+    4: batch_table("21:16,28:16,35:16,42:16,49:16,56:16,63:16"),
+    6: batch_table("21:16,28:16,35:16,42:16"),
+}
 # ROWS_MODE rows whose core is the target's polled tokenspeed fork (mla.core_ts, as
 # dcp.POLLED_TS): MlaQuery publishes q without gathering it, and each fork CTA polls
 # its own q rows of the mailbox before its Q TMA (the K / V loads do not wait for q).
@@ -338,7 +348,28 @@ def compile_query(
         compiled = cute.compile(kernel, *args, make_fake_stream())
         if rows > 1:
             compiled = prepare_shared_carveout(compiled, device, 100)
+        if size > 1 and gather:
+            check_query_clusters(compiled, kernel, device)
     return compiled
+
+
+def check_query_clusters(compiled, kernel, device):
+    """Raise unless the device holds every cluster of the drafter MlaQuery's grid at
+    once: its gathered q poll (``gather``) waits in every CTA for rows that other
+    CTAs, on every rank, publish, so a cluster that cannot be resident until the
+    polling ones exit deadlocks all ranks (cuOccupancyMaxActiveClusters at the
+    kernel's shared memory and carve-out; Rubin, 6 heads: 22 clusters of 8)."""
+    grid, cluster = kernel.grid, kernel.cluster
+    need = grid[0] * grid[1] * grid[2] // cluster
+    resident = max_active_clusters(compiled, device, grid, 256, cluster, 100)
+    if resident < need:
+        raise RuntimeError(
+            f"Kimi K3 drafter MlaQuery ({kernel.heads} heads, {kernel.batch} rows, "
+            f"{kernel.tokens}-row tiles): {need} clusters of {cluster} CTAs cannot all "
+            f"be resident ({resident} at once); its gathered q poll would deadlock "
+            "across ranks. Drop the rows from QUERY_TOKENS or GATED_QUERY."
+        )
+    return resident
 
 
 class DraftDcp:
@@ -593,7 +624,8 @@ class DraftDcp:
                     self.queries[r] = compile_query(
                         r, self.heads, size, self.cap, specs, index, sms, positions,
                         gate=bool(GATED_QUERY.get(r)), gather=r not in ungathered,
-                        tokens=QUERY_TOKENS.get(r, 0), valid=r in self.valid,
+                        tokens=QUERY_TOKENS.get(self.heads, {}).get(r, 0),
+                        valid=r in self.valid,
                     )  # fmt: skip
             for r in self.wide:  # (no gather: the polled core reads its q rows)
                 self.queries[r] = compile_query(
