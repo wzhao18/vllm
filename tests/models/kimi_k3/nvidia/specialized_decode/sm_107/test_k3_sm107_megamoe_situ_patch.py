@@ -4,15 +4,20 @@
 # specialized decode (vllm/models/kimi_k3/nvidia/specialized_decode/sm_107).
 """Kimi K3.1 MegaMoE header patch (vllm/models/kimi_k3/nvidia/specialized_decode/sm_107/megamoe).
 
-CPU: the patch applies to the installed DeepGEMM header and the overlay mirrors
-the include tree. GPU (>= 2 SM100-family GPUs, DeepGEMM): the patched kernel is
-bitwise identical to the stock kernel (also with the routed weights localized
+CPU: the patch applies to the installed DeepGEMM header; the SM107 launcher's
+host-side mirror of DeepGEMM (FP32 BLOCK_M rule, float literals). GPU (>= 2 SM107
+GPUs, DeepGEMM): the SM107 decode's own build of the patched kernel
+(``megamoe.kernel.SituMegaMoE``) is bitwise identical to DeepGEMM's stock kernel (also with the routed weights localized
 across the two dies, when MLOPart is available) and matches a PyTorch reference of the
 K3.1 routed experts (MXFP8 x MXFP4, SiTU alpha 4 / beta 25, FP8 L1 output) on
 EP-sharded problems with random top-16 routing. Two shapes: 4 experts per rank
 at 1/7/64 tokens per rank (every expert is hit), and 28 experts per rank (the EP32
 per-rank work) at 4/128/224 tokens per rank: at 4 tokens most experts receive no
-token (the K31_SKIP_ZERO_SEND path), and 128/224 tokens select BLOCK_M > 64.
+token (the K31_SKIP_ZERO_SEND path), and 128/224 tokens select BLOCK_M > 64. The
+launcher's template arguments equal the ones DeepGEMM's JIT used for the stock
+kernel (its cached kernel sources), the stock header compiled by the launcher gives
+DeepGEMM's SASS, and DeepGEMM keeps compiling its stock kernel after the SM107 build
+(no re-pointed include root).
 """
 
 import importlib
@@ -23,7 +28,10 @@ from pathlib import Path
 import pytest
 import torch
 
-from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.megamoe.overlay import overlay_root
+from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.megamoe.kernel import (
+    block_m_for,
+    float_literal,
+)
 from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.megamoe.situ_patch import (
     FLAGS,
     MARKER,
@@ -84,42 +92,31 @@ def test_patch_applies_to_installed_header():
         patch_situ_header(text.replace("// Count experts' tokens", "// counted"))
 
 
-def test_overlay_mirrors_and_replaces(tmp_path):
-    stock = tmp_path / "stock"
-    (stock / "include/deep_gemm/impls").mkdir(parents=True)
-    (stock / "include/deep_gemm/common").mkdir(parents=True)
-    (stock / "include/deep_gemm/impls/a.cuh").write_text("stock a")
-    (stock / "include/deep_gemm/impls/b.cuh").write_text("stock b")
-    (stock / "include/deep_gemm/common/c.cuh").write_text("stock c")
-    new = tmp_path / "a_new.cuh"
-    new.write_text("patched a")
-    root = overlay_root(stock, tmp_path / "cache", {"deep_gemm/impls/a.cuh": new})
-    inc = root / "include/deep_gemm"
-    assert (inc / "impls/a.cuh").read_text() == "patched a"
-    assert (inc / "impls/b.cuh").read_text() == "stock b"
-    assert (inc / "common/c.cuh").read_text() == "stock c"
-    assert (inc / "common").is_symlink()  # untouched directories are linked whole
-    assert overlay_root(stock, tmp_path / "cache", {"deep_gemm/impls/a.cuh": new}) == root
-    with pytest.raises(FileNotFoundError):
-        overlay_root(stock, tmp_path / "cache2", {"deep_gemm/impls/x.cuh": new})
+def test_float_literal_matches_std_format_a():
+    """DeepGEMM's to_string(float): {sign}0x{:a}f, shortest hex of the FP32 value."""
+    assert float_literal(4.0) == "0x1p+2f"
+    assert float_literal(25.0) == "0x1.9p+4f"
+    assert float_literal(1.0) == "0x1p+0f"
+    assert float_literal(0.0) == "0x0p+0f"
+    assert float_literal(-0.5) == "-0x1p-1f"
+    assert float_literal(1.702) == "0x1.b3b646p+0f"  # FP32-rounded
+    with pytest.raises(ValueError):
+        float_literal(float("inf"))
 
 
-def test_overlay_per_stock_install(tmp_path):
-    """Two DeepGEMM installs sharing one cache root (two vLLM trees, one
-    VLLM_CACHE_ROOT) get separate mirrors: each links its own stock headers."""
-    new = tmp_path / "a_new.cuh"
-    new.write_text("patched a")
-    roots = []
-    for name in ("one", "two"):
-        stock = tmp_path / name
-        (stock / "include/deep_gemm/impls").mkdir(parents=True)
-        (stock / "include/deep_gemm/impls/a.cuh").write_text("stock a")
-        (stock / "include/deep_gemm/impls/b.cuh").write_text(f"stock b {name}")
-        roots.append(overlay_root(stock, tmp_path / "cache", {"deep_gemm/impls/a.cuh": new}))
-    assert roots[0] != roots[1]
-    for name, root in zip(("one", "two"), roots):
-        assert (root / "include/deep_gemm/impls/b.cuh").read_text() == f"stock b {name}"
-        assert (root / "include/deep_gemm/impls/a.cuh").read_text() == "patched a"
+@pytest.mark.parametrize(
+    "ranks,experts,topk,tokens,want",
+    [
+        (16, 896, 16, 1, 16),  # 0.29 expected tokens per expert
+        (16, 896, 16, 64, 32),  # 18.3
+        (16, 896, 16, 128, 64),  # 36.6
+        (16, 896, 16, 512, 192),  # 146: one block, 158 covered
+        (4, 16, 16, 64, 192),  # 256 expected, 272 covered: two blocks of 192
+        (4, 112, 16, 224, 192),  # 128 expected, 139 covered: one block of 192
+    ],
+)
+def test_block_m_rule(ranks, experts, topk, tokens, want):
+    assert block_m_for(ranks, experts, topk, tokens) == want
 
 
 # ---------------------------------------------------------------------------- GPU
@@ -131,7 +128,7 @@ E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 def _gpu_ok() -> bool:
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         return False
-    if torch.cuda.get_device_capability()[0] != 10:
+    if torch.cuda.get_device_capability() != (10, 7):
         return False
     return _stock_header() is not None
 
@@ -170,9 +167,10 @@ def _reference(xq, idx, tw, w1, w2):
 
 
 def _worker(rank: int, nranks: int, port: int, cache: str, epr: int, cases: tuple, out: dict):
+    os.environ["DG_JIT_CACHE_DIR"] = str(Path(cache) / "dg_jit")
     import torch.distributed as dist
 
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.megamoe import install_patched_header
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.megamoe import kernel as mk
 
     torch.cuda.set_device(rank)
     dist.init_process_group(
@@ -222,7 +220,9 @@ def _worker(rank: int, nranks: int, port: int, cache: str, epr: int, cases: tupl
                                                "fp8xfp4") if hasattr(dg, "get_block_m_for_mega_moe") else None)
                for t in cases}
 
-    def run(t, w1=None, w2=None):
+    situ = mk.SituMegaMoE(dg, Path(cache) / "sm107")
+
+    def run(t, w1=None, w2=None, launcher=None):
         x, idx, tw = data[t]
         xf, xs = utils.per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
         buf.x[:t].copy_(xf)
@@ -230,18 +230,43 @@ def _worker(rank: int, nranks: int, port: int, cache: str, epr: int, cases: tupl
         buf.topk_idx[:t].copy_(idx)
         buf.topk_weights[:t].copy_(tw)
         y = torch.empty((t, HIDDEN), device="cuda", dtype=torch.bfloat16)
-        dg.fp8_fp4_mega_moe(y, w1 or l1, w2 or l2, buf, activation="situ", activation_clamp=None,
-                            fast_math=True, activation_alpha=ALPHA, activation_beta=BETA)
+        (launcher or dg.fp8_fp4_mega_moe)(
+            y, w1 or l1, w2 or l2, buf, activation="situ", activation_clamp=None,
+            fast_math=True, activation_alpha=ALPHA, activation_beta=BETA)
         torch.cuda.synchronize()
         dist.barrier(group)
         return y
 
     stock = {t: run(t) for t in cases}
-    assert install_patched_header(dg, Path(cache)) is not None
     for _ in range(3):  # repeated launches exercise the barrier phase / counters across launches
-        patched = {t: run(t) for t in cases}
+        patched = {t: run(t, launcher=situ) for t in cases}
         for t in cases:
             assert torch.equal(patched[t], stock[t]), (rank, t)
+    # DeepGEMM untouched: its stock kernel still runs (and matches) after the SM107 build.
+    for t in cases:
+        assert torch.equal(run(t), stock[t]), ("stock after sm107", rank, t)
+    dg_sources = {p.read_text() for p in (Path(cache) / "dg_jit" / "cache").glob(
+        "sm100_fp8_fp4_mega_moe_situ.*/kernel.cu")}
+    assert dg_sources
+    # The launcher's template arguments are DeepGEMM's (its JIT sources of these shapes).
+    for t in cases:
+        ring, sf_ring = buf.l1_acts.size(0), buf.l1_acts_sf.size(0)
+        cfg = mk.situ_config(nranks, num_experts, t, TOPK, HIDDEN, ring, sf_ring)
+        src = mk.instantiation(cfg, buf.num_max_tokens_per_rank, HIDDEN, INTER, num_experts, 0,
+                               TOPK, dg.get_num_sms(), nranks, ALPHA, BETA, True, l1[0].dtype)
+        assert any(src in s for s in dg_sources), (rank, t, cfg)
+    if rank == 0:
+        # Same NVCC command: the stock header built by the launcher is DeepGEMM's cubin.
+        t = cases[-1]
+        cfg = mk.situ_config(nranks, num_experts, t, TOPK, HIDDEN, buf.l1_acts.size(0),
+                             buf.l1_acts_sf.size(0))
+        src = mk.instantiation(cfg, buf.num_max_tokens_per_rank, HIDDEN, INTER, num_experts, 0,
+                               TOPK, dg.get_num_sms(), nranks, ALPHA, BETA, True, l1[0].dtype)
+        ours = mk.build(src, (mk._dg_include(dg.__file__),), rank, str(Path(cache) / "stock_build"))
+        theirs = next(p.parent / "kernel.cubin" for p in (Path(cache) / "dg_jit" / "cache").glob(
+            "sm100_fp8_fp4_mega_moe_situ.*/kernel.cu") if src in p.read_text())
+        # (cuobjdump cannot dump an sm_100f cubin; the same NVCC command gives the same bytes)
+        assert ours.read_bytes() == theirs.read_bytes()
     # Expert localization (VLLM_K3_MEGAMOE_LOCALIZE=1, MLOPart): each N half in its die's HBM.
     localized = hasattr(dg, "is_localization_available") and dg.is_localization_available()
     if localized:
@@ -251,7 +276,7 @@ def _worker(rank: int, nranks: int, port: int, cache: str, epr: int, cases: tupl
         assert dg.is_localized(w1[0]) and dg.is_localized(w2[0])
         for _ in range(2):
             for t in cases:
-                assert torch.equal(run(t, w1, w2), stock[t]), ("localized", rank, t)
+                assert torch.equal(run(t, w1, w2, situ), stock[t]), ("localized", rank, t)
     for t in cases:
         x, idx, tw = data[t]
         xq = utils.per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32)
@@ -268,7 +293,7 @@ def _worker(rank: int, nranks: int, port: int, cache: str, epr: int, cases: tupl
     dist.destroy_process_group()
 
 
-@pytest.mark.skipif(not _gpu_ok(), reason="needs >= 2 SM100-family GPUs and DeepGEMM")
+@pytest.mark.skipif(not _gpu_ok(), reason="needs >= 2 SM107 GPUs and DeepGEMM")
 @pytest.mark.parametrize("epr,cases", [(4, (1, 7, 64)), (28, (4, 128, 224))], ids=["e4", "e28"])
 def test_patched_kernel_bitwise_and_reference(tmp_path, epr, cases):
     nranks = min(4, torch.cuda.device_count())
