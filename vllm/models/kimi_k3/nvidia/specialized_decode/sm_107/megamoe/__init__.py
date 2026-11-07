@@ -3,13 +3,16 @@
 """Kimi K3.1 MegaMoE (DeepGEMM FP8 x FP4 SiTU) wide-EP decode tuning.
 
 ``prepare_megamoe`` runs once per worker after the weights are loaded, before
-the DeepGEMM warmup compiles the kernels:
+the runner's warmup:
 
-- ``VLLM_K3_MEGAMOE_PATCH`` (default 1): JIT-compile MegaMoE from the header that
-  ``situ_patch`` derives from the installed stock header (bitwise-identical output,
-  -5..-12% per launch at EP16/EP32 per-rank shapes). The SM107 specialized decode
-  raises when the installed DeepGEMM's header does not have the expected text (set
-  ``VLLM_K3_MEGAMOE_PATCH=0`` to run the stock kernel deliberately).
+- The wide-EP kernel: every FP8 x FP4 SiTU ``DeepGemmMegaMoEExperts`` of the model
+  launches the SM107 decode's own MegaMoE kernel (``kernel.SituMegaMoE``: the
+  header ``situ_patch`` derives from the installed stock one; bitwise-identical
+  output, -5..-12% per launch at EP16/EP32 per-rank shapes). DeepGEMM stays as
+  installed: its headers are read-only includes and its JIT, include root and
+  kernels are untouched. The SM107 specialized decode raises when the installed
+  DeepGEMM's header or heuristics do not match (it never falls back to the stock
+  kernel silently).
 - ``VLLM_K3_MEGAMOE_LOCALIZE`` (default 0; set 1 to opt in): place each rank's routed expert weights
   in the GPU's two locality domains (MLOPart), so every die streams its half of N
   from its own HBM (bitwise-identical output). Full K3.1 DEP16 on VR: -0.57..-0.65 ms
@@ -28,9 +31,8 @@ the DeepGEMM warmup compiles the kernels:
 
 from __future__ import annotations
 
-import hashlib
 import os
-from pathlib import Path
+import types
 
 import torch
 
@@ -38,40 +40,7 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-_PATCH = os.environ.get("VLLM_K3_MEGAMOE_PATCH", "1") == "1"
 _LOCALIZE = os.environ.get("VLLM_K3_MEGAMOE_LOCALIZE", "0") == "1"
-
-
-def install_patched_header(deep_gemm, cache_root: Path | None = None) -> Path | None:
-    """Re-initialize ``deep_gemm`` on an include tree with the Kimi K3.1 MegaMoE
-    header (derived from the installed stock one). Returns the overlay root, or
-    ``None`` when the stock header cannot be patched (the stock kernel stays)."""
-    from .overlay import install
-    from .situ_patch import SCHEDULER_HEADER, STOCK_HEADER, PatchError, patch_situ_header
-
-    include = Path(deep_gemm.__file__).resolve().parent / "include"
-    stock = include / STOCK_HEADER
-    try:
-        sched = include / SCHEDULER_HEADER
-        text = patch_situ_header(
-            stock.read_text(), scheduler_text=sched.read_text() if sched.is_file() else None
-        )
-    except (OSError, PatchError) as e:
-        logger.warning("Kimi K3 MegaMoE: stock kernel kept, cannot patch %s: %s", stock, e)
-        return None
-    if cache_root is None:
-        from vllm import envs
-
-        cache_root = Path(envs.VLLM_CACHE_ROOT) / "kimi_k3_megamoe"
-    cache_root.mkdir(parents=True, exist_ok=True)
-    # Content-addressed, so concurrent ranks write identical bytes
-    digest = hashlib.sha256(text.encode()).hexdigest()[:16]
-    header = cache_root / f"sm100_fp8_fp4_mega_moe_situ.k31.{digest}.cuh"
-    if not header.is_file():
-        tmp = header.with_suffix(f".{os.getpid()}.tmp")
-        tmp.write_text(text)
-        tmp.replace(header)
-    return install(deep_gemm, {STOCK_HEADER: header}, cache_root)
 
 
 def _localize_experts(experts, deep_gemm) -> None:
@@ -83,6 +52,68 @@ def _localize_experts(experts, deep_gemm) -> None:
             w.data = deep_gemm.localize(w.data)
 
 
+def _situ_forward(
+    self,
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    shared_experts: torch.nn.Module | None = None,
+) -> torch.Tensor:
+    """``DeepGemmMegaMoEExperts.forward`` (MX path) launching the SM107 decode's
+    wide-EP kernel instead of ``deep_gemm.fp8_fp4_mega_moe``: the same staging,
+    buffer and arguments (stock's helpers), one different kernel."""
+    from vllm.model_executor.layers.fused_moe import deep_gemm_mega_moe as stock
+
+    if shared_experts is not None and self.has_fused_shared_experts:
+        raise ValueError(
+            f"{self.prefix} fuses the shared expert into MegaMoE; pass shared_experts=None."
+        )
+    num_tokens = hidden_states.shape[0]
+    if num_tokens > self.max_num_tokens:
+        raise ValueError(
+            f"MegaMoE got {num_tokens} tokens, but the symmetric buffer was "
+            f"sized for {self.max_num_tokens}."
+        )
+    self._synchronize_first_launch()
+    is_padding = None
+    if stock.envs.VLLM_MOE_SKIP_PADDING and stock.is_forward_context_available():
+        is_padding = stock.get_forward_context().is_padding
+        if is_padding is not None:
+            is_padding = is_padding[:num_tokens]
+    if self.capture_fn is not None:
+        self.capture_fn(topk_ids)
+    fmt = self.weight_format
+    symm_buffer = self.get_symm_buffer()
+    shared_x_sf = shared_block_m = None
+    if self.shared_spec is not None and self.shared_spec.scale_group_k:
+        shared_x_sf = symm_buffer.shared_l1_acts_sf
+        shared_block_m = self.get_block_m(num_tokens)
+    stock.prepare_megamoe_inputs(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        symm_buffer.x[:num_tokens],
+        symm_buffer.x_sf[:num_tokens] if fmt.hidden_quant is not None else None,
+        symm_buffer.topk_idx[:num_tokens],
+        symm_buffer.topk_weights[:num_tokens],
+        is_padding=is_padding,
+        shared_x_sf=shared_x_sf,
+        shared_block_m=shared_block_m,
+        hidden_quant=fmt.hidden_quant,
+        eplb_state=self.eplb_state,
+    )
+    kwargs = dict(self._kernel_kwargs)
+    if self.has_fused_shared_experts:
+        kwargs["shared_l1_weights"] = self._kernel_weights("shared_l1")
+        kwargs["shared_l2_weights"] = self._kernel_weights("shared_l2")
+    y = torch.empty_like(hidden_states, dtype=torch.bfloat16)
+    self._k3_situ(y, self.l1_weights, self.l2_weights, symm_buffer,
+                  fast_math=self.fast_math, **kwargs)  # fmt: skip
+    if shared_experts is not None:
+        y += shared_experts(hidden_states)
+    return y
+
+
 def prepare_megamoe(model: torch.nn.Module, vllm_config) -> None:
     """Apply the env-selected MegaMoE tuning to every ``DeepGemmMegaMoEExperts``."""
     from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import (
@@ -90,7 +121,7 @@ def prepare_megamoe(model: torch.nn.Module, vllm_config) -> None:
     )
 
     experts = [m for m in model.modules() if isinstance(m, DeepGemmMegaMoEExperts)]
-    if not experts or not (_PATCH or _LOCALIZE):
+    if not experts:
         return
     from vllm.utils.deep_gemm import _import_deep_gemm
 
@@ -98,16 +129,22 @@ def prepare_megamoe(model: torch.nn.Module, vllm_config) -> None:
     if deep_gemm is None:
         return
     fmt = experts[0].weight_format
-    if _PATCH and fmt.kernel == "fp8_fp4_mega_moe" and experts[0].activation.name == "situ":
-        root = install_patched_header(deep_gemm)
-        if root is None:
-            # The specialized decode runs fast or raises: no silent stock kernel.
+    if fmt.kernel == "fp8_fp4_mega_moe" and experts[0].activation.name == "situ":
+        if fmt.uses_nvfp4_api or fmt.hidden_quant is None:
             raise RuntimeError(
-                "Kimi K3 specialized decode (SM107): cannot patch the installed "
-                "DeepGEMM MegaMoE header (see the warning above); set "
-                "VLLM_K3_MEGAMOE_PATCH=0 to run the stock MegaMoE kernel"
+                f"Kimi K3 specialized decode (SM107): MegaMoE format {fmt.name} is not "
+                "the MXFP8 x FP4 SiTU the wide-EP kernel serves"
             )
-        logger.info_once("Kimi K3 MegaMoE: K3.1 wide-EP kernel header (%s)", root)
+        from .kernel import SituMegaMoE
+
+        situ = SituMegaMoE(deep_gemm)
+        for e in experts:
+            e._k3_situ = situ
+            e.forward = types.MethodType(_situ_forward, e)
+        logger.info_once(
+            "Kimi K3 MegaMoE: K3.1 wide-EP kernel (SM107 decode build, %s)",
+            situ.include[0],
+        )
     if _LOCALIZE:
         if vllm_config.parallel_config.enable_eplb:
             logger.info_once("Kimi K3 MegaMoE: routed expert weights not localized (EPLB)")
