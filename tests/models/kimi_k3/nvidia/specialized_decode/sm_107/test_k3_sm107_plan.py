@@ -247,6 +247,7 @@ def dsa_layer(fused_insert):
         index_rope_dim=0,
         use_fused_k_insert=fused_insert,
         shardq_layer_name="",  # the stock default: no ShardQ layer
+        k_cache=SimpleNamespace(use_shardq=False),  # the stock default: no ShardQ
         wq_index=Linear(INDEX_HEADS * INDEX_DIM, Q_LORA, trace, "wq_index"),
         wkv_index=Linear(INDEX_DIM + INDEX_HEADS),
         _fused_k_insert=op("k_insert"),

@@ -25,8 +25,11 @@ _SM107_ONLY = pytest.mark.skipif(
 )
 pytestmark = _SM107_ONLY
 
-ROOT = FilePath(__file__).resolve().parents[3]
-SD = ROOT / "vllm/models/kimi_k3/nvidia/specialized_decode/sm_107"
+# The installed vllm package's sm_107 sources (the tests tree may live elsewhere).
+SD = (
+    FilePath(importlib.util.find_spec("vllm").submodule_search_locations[0])
+    / "models/kimi_k3/nvidia/specialized_decode/sm_107"
+)
 
 
 def load_policy():

@@ -111,6 +111,30 @@ def deployment(tp=4, dcp=4, dp=4, ep=True, **overrides):
     for path, value in overrides.items():
         section, name = path.split(".")
         setattr(getattr(config, section), name, value)
+    # VllmConfig.get_decode_cudagraph_query_lens without dynamic speculation.
+    config.get_decode_cudagraph_query_lens = lambda q: {
+        q: config.scheduler_config.max_num_seqs
+    }
+    return resolve_decode_sizes(config)
+
+
+def resolve_decode_sizes(config):
+    """The decode graph request counts VllmConfig resolves from the deprecated
+    ``cudagraph_capture_sizes`` under model runner V2: each token size rounded up
+    to whole requests of the target query length, within the capture cap and
+    max_num_seqs."""
+    compilation = config.compilation_config
+    q = 1 + config.speculative_config.num_speculative_tokens
+    cap = compilation.max_cudagraph_capture_size
+    mns = config.scheduler_config.max_num_seqs
+    compilation.decode_cudagraph_capture_request_sizes = sorted(
+        {
+            min(-(-s // q), mns)
+            for s in compilation.cudagraph_capture_sizes
+            if -(-s // q) * q <= cap
+        }
+    )
+    compilation.max_decode_cudagraph_capture_tokens = None
     return config
 
 
@@ -122,7 +146,7 @@ def tp16(**overrides):
     )
     config.speculative_config.num_speculative_tokens = 7
     config.scheduler_config.max_num_seqs = 32
-    return config
+    return resolve_decode_sizes(config)
 
 
 @pytest.fixture(autouse=True)

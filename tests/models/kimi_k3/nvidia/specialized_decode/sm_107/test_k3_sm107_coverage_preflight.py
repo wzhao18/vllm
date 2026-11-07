@@ -239,9 +239,22 @@ def fake_check_residency(compiled, device_index, grid, threads, what):
         )
 
 
-def draft_config(sizes, cap, mns):
+def legacy_decode_request_sizes(sizes, cap, mns, q):
+    """The decode graph request counts VllmConfig resolves from the deprecated
+    ``cudagraph_capture_sizes`` under model runner V2: each token size rounded up
+    to whole requests of the target query length ``q``, within ``cap`` and
+    max_num_seqs."""
+    return sorted({min(-(-s // q), mns) for s in sizes if -(-s // q) * q <= cap})
+
+
+def draft_config(sizes, cap, mns, q):
     compilation = SimpleNamespace(
-        cudagraph_capture_sizes=list(sizes), max_cudagraph_capture_size=cap
+        cudagraph_capture_sizes=list(sizes),
+        max_cudagraph_capture_size=cap,
+        decode_cudagraph_capture_request_sizes=legacy_decode_request_sizes(
+            sizes, cap, mns, q
+        ),
+        max_decode_cudagraph_capture_tokens=None,
     )
     return SimpleNamespace(
         compilation_config=compilation,
@@ -254,7 +267,7 @@ def drafter_rows(q, mns, cap, sizes):
     from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.runtime import draft
 
     steps = q - 1
-    batches = draft.draft_batches(draft_config(sizes, cap, mns), steps)
+    batches = draft.draft_batches(draft_config(sizes, cap, mns, q), steps)
     return batches, [b * steps for b in batches], [b * q for b in batches]
 
 

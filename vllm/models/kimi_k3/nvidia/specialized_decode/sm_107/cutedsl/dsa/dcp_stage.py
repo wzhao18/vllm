@@ -110,8 +110,8 @@ def publish_args(box, parity):
 def local_slots(metadata, topk, dcp, rank, interleave, stride_rows):
     """This rank's flat rows of the global top-k ids ``topk`` [B, K] (compacted to
     a prefix) and their counts."""
-    from vllm.v1.attention.backends.mla.sparse_utils import (
-        triton_filter_and_convert_dcp_index,
+    from ...compat.dcp_index import (
+        filter_and_convert_dcp_index as triton_filter_and_convert_dcp_index,
     )
 
     batch = topk.shape[0]
