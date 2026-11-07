@@ -1205,6 +1205,24 @@ def get_mamba_prefill_checkpoint_position(
     return max(checkpoint_position, 0)
 
 
+def get_mamba_prefill_checkpoint_col(
+    query_start: int, query_end: int, mamba_block_size: int
+) -> int:
+    """Block-table column a query exports its internal prefill checkpoint to.
+
+    A query that starts mid-block resumes from the state in that block's
+    column. It is not a block-boundary state, so the request owns it privately
+    (a CoW copy of a partial hit, a connector-loaded block, or its own running
+    slot), and the worker copies it into the running slot before the forward.
+    The checkpoint reuses that column. A block-aligned start resumes from a
+    cacheable boundary state, so its checkpoint takes the column before the
+    running slot instead.
+    """
+    if query_start % mamba_block_size != 0:
+        return (query_start - 1) // mamba_block_size
+    return cdiv(query_end, mamba_block_size) - 2
+
+
 def is_mamba_prefill_checkpoint_valid(
     query_start: int,
     query_end: int,
@@ -1218,11 +1236,17 @@ def is_mamba_prefill_checkpoint_valid(
         return False
     assert checkpoint_alignment > 0
 
+    # Only columns at or past the initial state's are this step's on the
+    # worker, whose block table is append-only: earlier ones may be stale.
     initial_state_col = (query_start - 1) // mamba_block_size
-    checkpoint_col = cdiv(query_end, mamba_block_size) - 2
+    running_col = cdiv(query_end, mamba_block_size) - 1
+    checkpoint_col = get_mamba_prefill_checkpoint_col(
+        query_start, query_end, mamba_block_size
+    )
     return (
         query_start % hash_block_size == 0
-        and checkpoint_col > initial_state_col
+        and initial_state_col <= checkpoint_col < running_col
+        and (checkpoint_col > initial_state_col or query_start % mamba_block_size != 0)
         and query_start + hash_block_size <= checkpoint_position
         and query_start < checkpoint_position < query_end
         and (checkpoint_position - query_start) % checkpoint_alignment == 0

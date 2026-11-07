@@ -83,6 +83,19 @@ from vllm.v1.utils import record_function_or_nullcontext
 logger = init_logger(__name__)
 
 
+def _stop_mamba_chunk_at_block_end(
+    request: Request, start: int, num_new_tokens: int, block_size: int
+) -> int:
+    """Only a chunk that finishes the prefill exports its checkpoint into the
+    column of the mid-block state it resumes from. A chunk starting mid-block
+    that a stop or cap ends short of the prefill must stop at the block's end:
+    otherwise that column's full-block hash names the wrong state."""
+    prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+    if start % block_size and start + num_new_tokens < prefill_end:
+        num_new_tokens = min(num_new_tokens, block_size - start % block_size)
+    return num_new_tokens
+
+
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -681,7 +694,9 @@ class Scheduler(SchedulerInterface):
         )
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)
-        return max(end - start, 0)
+        return _stop_mamba_chunk_at_block_end(
+            request, start, max(end - start, 0), block_size
+        )
 
     def _get_local_prefix_cache_hit(
         self, request: Request, max_cache_hit_length: int | None = None
@@ -909,6 +924,14 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = self._reserve_prefill_lookahead(
                 request, request.num_computed_tokens, num_new_tokens
             )
+            if self.need_mamba_block_aligned_split:
+                # The caps above can cut a final chunk short.
+                num_new_tokens = _stop_mamba_chunk_at_block_end(
+                    request,
+                    request.num_computed_tokens,
+                    num_new_tokens,
+                    self.cache_config.block_size,
+                )
 
             if num_new_tokens == 0:
                 # The request cannot be scheduled because one of the following
@@ -1446,6 +1469,14 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens = self._reserve_prefill_lookahead(
                         request, num_computed_tokens, num_new_tokens
                     )
+                    if self.need_mamba_block_aligned_split:
+                        # The caps above can cut a final chunk short.
+                        num_new_tokens = _stop_mamba_chunk_at_block_end(
+                            request,
+                            num_computed_tokens,
+                            num_new_tokens,
+                            self.cache_config.block_size,
+                        )
 
                     if (
                         request.has_encoder_inputs

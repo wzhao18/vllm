@@ -7,12 +7,12 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.triton_utils import tl, triton
-from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.kv_cache_interface import (
     MambaSpec,
+    get_mamba_prefill_checkpoint_col,
     get_mamba_prefill_checkpoint_position,
     is_mamba_prefill_checkpoint_valid,
 )
@@ -59,7 +59,11 @@ def compute_mamba_prefill_checkpoints(
             checkpoint_alignment=checkpoint_alignment,
         )
         offsets.append(position - query_start if valid else 0)
-        cols.append(cdiv(seq_len, mamba_block_size) - 2 if valid else -1)
+        cols.append(
+            get_mamba_prefill_checkpoint_col(query_start, seq_len, mamba_block_size)
+            if valid
+            else -1
+        )
     return offsets, cols
 
 

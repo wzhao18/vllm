@@ -206,9 +206,9 @@ def test_partial_checkpoint_resume_stops_at_mamba_block_boundary() -> None:
         == MAMBA_BLOCK_SIZE - resume_at % MAMBA_BLOCK_SIZE
     )
 
-    # A hash-aligned resume inside a physical Mamba block cannot use the fixed
-    # internal-checkpoint column: it aliases the initial-state column. Enabling
-    # checkpoints must therefore preserve the normal aligned split.
+    # A hash-aligned resume inside a physical Mamba block exports the prompt
+    # checkpoint into the column it resumes from, so the final chunk runs in
+    # one step.
     assert (
         _split(
             request,
@@ -217,7 +217,7 @@ def test_partial_checkpoint_resume_stops_at_mamba_block_boundary() -> None:
             partial_hit=True,
             num_prefill_checkpoint_blocks=1,
         )
-        == MAMBA_BLOCK_SIZE - resume_at % MAMBA_BLOCK_SIZE
+        == prompt_len - resume_at
     )
 
 
