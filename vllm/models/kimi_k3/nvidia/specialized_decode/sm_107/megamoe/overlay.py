@@ -19,8 +19,11 @@ from pathlib import Path
 _installed: dict[str, Path] = {}
 
 
-def _digest(headers: dict[str, Path]) -> str:
-    h = hashlib.sha256()
+def _digest(stock_root: Path, headers: dict[str, Path]) -> str:
+    # The mirror's other entries link into ``stock_root``: two DeepGEMM installs
+    # sharing one cache root must not share a mirror (the second would compile its
+    # stock kernels against the first install's headers).
+    h = hashlib.sha256(str(stock_root.resolve()).encode())
     for rel in sorted(headers):
         h.update(rel.encode())
         h.update(Path(headers[rel]).read_bytes())
@@ -45,7 +48,7 @@ def _mirror(src: Path, dst: Path, replace: dict[str, Path], rel: str) -> None:
 def overlay_root(stock_root: Path, cache_root: Path, headers: dict[str, Path]) -> Path:
     """``<cache_root>/dg_overlay_<hash>`` whose ``include/`` is the stock include
     tree with ``headers`` (paths relative to ``include/``) replaced."""
-    root = cache_root / f"dg_overlay_{_digest(headers)}"
+    root = cache_root / f"dg_overlay_{_digest(stock_root, headers)}"
     if (root / "include").is_dir():
         return root
     stock_include = stock_root / "include"
