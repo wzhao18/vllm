@@ -4,8 +4,8 @@
 
 - the indexer query [32, 128] (the BF16 wq_b projection of the normalized q_c) in FP8
   with one power-of-two scale per head, the scale folded into the head weights
-  wv * scale / sqrt(32 * 128) as indexer_q_quant_fold_weights computes them, in the
-  BF16 SM100's MQA logits take (mqa_logits_mx_inputs);
+  wv * scale / sqrt(32 * 128) as indexer_q_quant_fold_weights computes them, in FP32
+  (stock Kimi K3's: FP32 weights reduce in FP32, mqa_logits_mx_inputs);
 - the shared indexer key: LayerNorm (FP32) of the wk projection, BF16, then FP8 with
   a power-of-two scale into the indexer cache, as indexer_k_norm_quant_insert writes
   it: per block, the FP8 keys of its tokens, then their scales: FP32, or (``mx``: the
@@ -176,7 +176,7 @@ class DsaIndex:
                 quantize_fp4_query(values, 8, row, scales, head, lane % 16, lane)
                 if lane % 16 == 0:
                     wv = Float32(projected[token, self.weight + head])
-                    w_out[token, head] = BFloat16(wv * Float32(FP4_WEIGHT))
+                    w_out[token, head] = wv * Float32(FP4_WEIGHT)
         else:
             self.fp8_query(projected, iq, q_out, w_out, token, warp, lane, half, column)
         if warp == 0:
@@ -202,7 +202,7 @@ class DsaIndex:
             if lane % 16 == 0:
                 wv = Float32(projected[token, self.weight + head])
                 fold = (wv * scale) * Float32((HEADS * DIM) ** -0.5)
-                w_out[token, head] = BFloat16(fold)
+                w_out[token, head] = fold
 
 
 @cute.jit

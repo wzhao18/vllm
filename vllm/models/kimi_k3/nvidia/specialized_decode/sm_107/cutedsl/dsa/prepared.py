@@ -4,15 +4,18 @@
 stages over the packed MLA cache and the indexer cache (64-entry pages):
 
   query stage      MlaQuery (dsa) -> wq_b -> DsaIndex (query_stage.py)
-  indexer stage    TP on FlashInfer: the fused decode indexer (indexer.py: scores,
-                   exact top-k and the physical rows in two PDL-chained kernels);
-                   DCP with the #63 merge: its scorer and local top-N select
-                   feed the merge (indexer_stage.py); else the stock decode
-                   scoring and top-k (indexer_stage.py)
+  indexer stage    stock Kimi K3 precision (FP32 head weights and logits, exact
+                   top-k). TP on FlashInfer: the fused decode indexer (indexer.py:
+                   scores, exact top-k and the physical rows in two PDL-chained
+                   kernels); else DeepGEMM's FP32 logits and IndexerSelect. DCP:
+                   stock's FP32 rule (no one-round #63 merge): the FP32 logits
+                   (the fused scorer, or DeepGEMM), every rank's local top-K, the
+                   all-gather and the exact merge to this rank's rows
+                   (indexer_stage.py, dcp_topk.py)
   sparse core      FlashInfer sparse MLA on a per-tensor FP8 cache (attn_fi.py:
                    trtllm-gen or prims_ts per batch, called directly into the value
                    stage's rows), else FlashMLA sparse on fp8_ds_mla (attn_ds.py);
-                   under DCP with the #63 merge, on the rows of its table, the DSA
+                   under DCP with the DCP top-k, on the rows of its table, the DSA
                    sparse core (dsa_kernels.dsa_core, VLLM_K31_DSA_CORE=1)
   MlaValue         W_UV and the sigmoid gate of the BF16 latent
 
@@ -25,12 +28,12 @@ runs on the main stream right after the fused indexer's select, beside it.
 Under DCP (= TP, dcp_stage.py) each rank's cache holds 1 / DCP of every context: the
 query and DsaIndex insert only the owned slots, the query publishes its heads into
 every rank's q mailbox, the indexer merges the ranks' local top-k into global token
-ids, which are filtered to this rank's slots (on FlashInfer with the #63 merge: into
-this rank's slots directly) for the sparse decode of every rank's gathered heads, and
-DcpValue merges this rank's heads by LSE. On the DSA sparse core's steps the core
-polls the q mailbox itself (no QueryWait), decodes every rank's gathered heads over
-this rank's rows of the merge (or of DcpExchange's top-k) and pushes the partial rows
-and LSEs to their owners, and DcpValue(pushed) only merges.
+ids, which are filtered to this rank's slots (on pure-decode steps the FP32 DCP
+top-k gives this rank's slots directly) for the sparse decode of every rank's
+gathered heads, and DcpValue merges this rank's heads by LSE. On the DSA sparse
+core's steps the core polls the q mailbox itself (no QueryWait), decodes every
+rank's gathered heads over this rank's rows of the DCP top-k and pushes the partial
+rows and LSEs to their owners, and DcpValue(pushed) only merges.
 
 The packed projection row is [q_a 1536 | kv_a 576 | gate H*128 | wk 128 | wv 32]."""
 
@@ -102,25 +105,20 @@ __all__ = [
 # trtllm-gen: the counts) before their PDL wait: the kernel before them is held.
 HELD_KERNELS = ("prims_ts", "trtllm")
 # On FlashInfer with a per-tensor FP8 query the fused decode indexer always runs
-# (where fused_indexer_unsupported allows): at TP instead of the stock op and the
-# conversion; under DCP feeding the #63 merge its scores, plus (up to one row per
-# SM, FusedIndexer.packs) its local top-N select as B' rows. The exact merge
-# re-reads a saturated rank's logits (more than N of a row's global top-k), so it
-# always gets the DeepGEMM-layout logits, unmodified until it returns; the B' rows
-# meet its producer contract (bit-exact #63's pack of the exact local top-N, ties
-# to the lowest key: test_fused_indexer_dcp).
+# (where fused_indexer_unsupported allows): at TP instead of DeepGEMM's logits, the
+# select and the conversion; under DCP its scorer feeds the FP32 DCP top-k (every
+# rank's local top-K, the all-gather and the merge: dcp_topk.py).
 # serial query overlap: the fused index front from MlaQuery's q_c rows
 # (IndexFrontMma, normalized) instead of the split-K wq_b and DsaIndex, up to this
 # many rows (0: never). Under fork it measured no gain (QueryNorm stays a launch);
 # under DCP8 wait it lost 1-8 us (it would wait on MlaQuery's q mailbox poll).
 FUSED_INDEX = 64
-# Rubin-class devices (more SMs than GB300) under DCP: the #63 merge reads DeepGEMM's
-# logits and DeepSelect's local top-N, not the fused DCP indexer's. GR100 DCP16 q8,
-# one GPU at a DCP16 rank's shapes, exchanges stubbed, us per layer at 75K, block with
-# the fused DCP indexer vs without (front overlap): M8 61.6 vs 60.8, M16 79.1 vs
-# 64.2, M32 85.4 vs 69.8, M64 98.9 vs 70.5 (IndexerScore + IndexerLocalTopk 26-62 us
-# at 16-64 rows, against DeepGEMM 6.0-6.6 + DeepSelect 4.0-4.3 + pack 1.4-1.7).
-RUBIN_DCP_FUSED_INDEXER = False
+# Rubin-class devices (more SMs than GB300) under DCP: the DCP top-k reads the fused
+# DCP scorer's FP32 logits (bit-equal to DeepGEMM's), which scores a DCP16 rank's
+# shapes faster than DeepGEMM's FP32 paged MQA logits (VR, one GPU, 131K / 16 local
+# keys, q4: 2.6 vs 3.5 us at 8 rows, 32 vs 45 us at 1024). (The BF16 #63 path kept
+# DeepGEMM here: there its fused DCP indexer also took the local top-N select.)
+RUBIN_DCP_FUSED_INDEXER = True
 
 
 @cache
@@ -270,9 +268,7 @@ class PreparedDsa:
         if core != "auto":
             raise ValueError(f"Kimi K3.1 DSA core {core!r}: only auto is served")
         if dcp is not None and not hasattr(dcp, "mailboxes"):
-            dcp = DsaBox(
-                dcp, pitches, partials, fp8=self.fp8, verify_q=max(queries)
-            )
+            dcp = DsaBox(dcp, pitches, partials, fp8=self.fp8, verify_q=max(queries))
         if dcp is not None and PROJECTED in dcp.mailboxes and not self.fp8:
             raise ValueError(
                 f'Kimi K3.1 specialized DSA: "proj" partials ({dcp.partials}) need '
@@ -296,9 +292,9 @@ class PreparedDsa:
             topk = self.indexer.topk_tokens
             fi = fi_buffers(self.device, max(pitches), topk, heads)
         self.query_stage = QueryStage(attention, pitches, shared, self.fp8, self.nvfp4)
-        # Under DCP on FlashInfer: the #63 merge's owned-row outputs (indexer_stage).
-        merge_rows = max(pitches) if self.dcp > 1 and self.fp8 else 0
-        self.indexer_stage = IndexerStage(self.indexer, merge_rows, self.impl)
+        # The indexer stage's outputs (TP: DeepGEMM's logits selected into the top-k
+        # buffer; DCP: the FP32 DCP top-k's owned rows), sized for the widest step.
+        self.indexer_stage = IndexerStage(self.indexer, max(pitches), self.impl)
         self.shapes = [(b, q) for b in pitches for q in queries if b % q == 0]
         self.fi = None
         sms = torch.cuda.get_device_properties(self.device).multi_processor_count
@@ -347,13 +343,7 @@ class PreparedDsa:
         # the stock indexer op + filter or FlashInfer's chain on a shape the sparse
         # core serves (``strict``).
         self.strict = target_topology(self.rubin, self.dcp, self.dcp, max(queries))
-        if self.strict and self.fp8 and not local_topk:
-            refuse(
-                "DSA indexer (PreparedDsa)",
-                "dcp_local_topk is 0 under DCP16: no #63 merge, every step would run "
-                "the stock sparse_attn_indexer op and the Triton slot filter",
-            )
-        # The fused DCP indexer feeds the #63 merge (RUBIN_DCP_FUSED_INDEXER).
+        # The fused DCP scorer feeds the DCP top-k (RUBIN_DCP_FUSED_INDEXER).
         rubin_fused = not self.rubin or RUBIN_DCP_FUSED_INDEXER
         self.dcp_fused = bool(local_topk) and rubin_fused
         static = (
@@ -367,7 +357,7 @@ class PreparedDsa:
             # the specialized decode is built before vLLM profiles its memory for
             # the KV cache (only where prepare_cache can run it: its cache layout
             # aside, the same checks).
-            args = self.indexer, self.device, max(pitches), local_topk
+            args = self.indexer, self.device, max(pitches), self.dcp > 1
             reserve_fused_indexer(*args, blocks=kv_cache_blocks())
         # DCP "proj" partials: every gathered head's W_UV (collective), and the
         # rows of its bmm (dcp_stage.projected_rows).
@@ -466,14 +456,11 @@ class PreparedDsa:
         stage = self.indexer_stage
         if self.dcp_fused and not any(unsupported):
             stage.fused = FusedIndexer(
-                self.indexer,
-                self.shapes,
-                self.device,
-                rows,
-                local_topk=stage.local_topk,
-                packed=True,
+                self.indexer, self.shapes, self.device, rows, dcp=True
             )
-        stage.warm(kv.shape[1])  # the merge's rows variant, before any capture
+        # The selects and the DCP merge of every batch, before any capture.
+        batches = sorted({batch for batch, _ in self.shapes})
+        stage.warm(kv.shape[1], batches, tp=self.fused is None)
         self.log_policy(unsupported)
         if unserved and self.strict:
             # NQ-NOFALLBACK: a shape the core's variant table lists but whose rows
@@ -506,7 +493,8 @@ class PreparedDsa:
         reasons = sorted({r for r in unsupported if r})
         logger.info_once(
             "Kimi K3.1 specialized DSA (DCP %d, %d SMs): rows x q:overlap/front/core "
-            "%s; DCP merge rows N=%d; fused DCP indexer %s; fused TP indexer %s "
+            "%s; DCP top-k (FP32, local top-K + merge) K=%d; fused DCP scorer %s; "
+            "fused TP indexer %s "
             "(unsupported: %s); indexer cache %s; k_scale %s, q_scale %s",
             self.dcp,
             torch.cuda.get_device_properties(self.device).multi_processor_count,
@@ -540,8 +528,7 @@ class PreparedDsa:
                     f" (mailbox {mailbox:.1f} MiB, W_UV {weights:.1f} MiB per layer)"
                 )
             logger.info_once(
-                "Kimi K3.1 specialized DSA: DcpValue partials %s, "
-                '"proj" at rows %s%s',
+                'Kimi K3.1 specialized DSA: DcpValue partials %s, "proj" at rows %s%s',
                 box.partials,
                 " ".join(map(str, proj)) or "none",
                 memory,
@@ -633,7 +620,7 @@ class PreparedDsa:
             )
         if self.overlaps.get((batch, q)) in LATE:
             return f"FlashInfer {kernel} (late query overlap: the core is not built)"
-        return f"FlashInfer {kernel} (\"proj\" partials: the core does not push them)"
+        return f'FlashInfer {kernel} ("proj" partials: the core does not push them)'
 
     def sparse_dcp_core(self, core, cache, metadata, batch, q, join):
         """The DSA sparse core of a DCP step: this rank's rows of the #63 merge (or of
@@ -797,7 +784,7 @@ class PreparedDsa:
                 args = stage.q_fp8, stage.head_w, md, stride_rows, batch
                 merged = self.indexer_stage.merge_rows(*args, q)
             if merged is None and self.strict and full_capture():
-                # NQ-NOFALLBACK: a captured step the #63 merge / DcpExchange decline
+                # NQ-NOFALLBACK: a captured step the DCP top-k declines
                 # would capture the stock indexer op and the slot filter.
                 source = self.indexer_stage.merge_source(batch)
                 refuse(
@@ -819,16 +806,25 @@ class PreparedDsa:
                 join()
             latent, lse = self.fi.decode(query, cache, *merged, md.block_size)
             return latent, lse, merged[1]
-        if topk is None:
-            topk = self.indexer_core(projected, batch)
         pages, stride_rows = _fp8_kv_pages(cache, md.block_size)
-        slots, valid = exchanged(self.impl, topk, batch) or local_slots(
-            md,
-            topk[:batch],
-            self.dcp,
-            indexer.dcp_rank,
-            indexer.cp_kv_cache_interleave_size,
-            stride_rows,
+        merged = None
+        if topk is None and self.indexer_stage.local_topk:
+            stage = self.query_stage
+            args = stage.q_fp8, stage.head_w, md, stride_rows, batch
+            merged = self.indexer_stage.merge_rows(*args, q)
+        if merged is None and topk is None:
+            topk = self.indexer_core(projected, batch)
+        slots, valid = (
+            merged
+            or exchanged(self.impl, topk, batch)
+            or local_slots(
+                md,
+                topk[:batch],
+                self.dcp,
+                indexer.dcp_rank,
+                indexer.cp_kv_cache_interleave_size,
+                stride_rows,
+            )
         )
         if join is not None:
             join()

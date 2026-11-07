@@ -432,7 +432,7 @@ def test_indexer_inputs(batch, gap):
     )
     _, index_kernel, _ = kernels(batch, mla, index, *weights)
     q_fp8 = torch.zeros(batch, 32, 128, device=dev, dtype=torch.uint8)
-    head_w = torch.zeros(batch, 32, device=dev, dtype=bf)
+    head_w = torch.zeros(batch, 32, device=dev, dtype=torch.float32)
     args = (to_cute(projected), to_cute(iq), to_cute(norm_w, 4), to_cute(norm_b, 4))
     args += (to_cute(index), to_cute(slots, 8), to_cute(q_fp8), to_cute(head_w, 4))
     index_kernel(*args, cutlass.Float32(EPS), stream(dev))
@@ -443,9 +443,9 @@ def test_indexer_inputs(batch, gap):
     assert torch.equal(q_fp8.view(-1, 128), ref_q.view(torch.uint8))
     key = 2112 + GATE
     # Same FP32 fold as indexer_q_quant_fold_weights: wv * scale / sqrt(32 * 128),
-    # rounded to BF16 once.
+    # kept FP32 (stock Kimi K3's head weights).
     wv = projected[:, key + 128 : key + 160].float()
-    ref_w = (wv * ref_scale.view(batch, 32) * (32 * 128) ** -0.5).to(bf)
+    ref_w = wv * ref_scale.view(batch, 32) * (32 * 128) ** -0.5
     torch.testing.assert_close(head_w, ref_w, atol=0, rtol=0)
 
     def entries(cache):
@@ -831,7 +831,9 @@ def _wide_mailbox_worker(rank, size, port, cases, skew=0):
     """One DCP rank of WideDsa's DCP kernels over every (rows, q) case."""
     import torch.distributed as dist
 
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.mla.dcp import DcpBox
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.mla.dcp import (
+        DcpBox,
+    )
 
     torch.accelerator.set_device_index(rank)
     dev = torch.device("cuda", rank)

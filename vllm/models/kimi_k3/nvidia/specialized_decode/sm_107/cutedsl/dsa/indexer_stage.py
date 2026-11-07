@@ -1,45 +1,39 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Indexer stage of a K3.1 DSA layer: the stock decode scoring and top-k
-(sparse_attn_indexer, its key insert skipped: DsaIndex inserted the key) of the FP8
-or MXFP4 (index.py) indexer query and head weights into the model's shared top-k
-buffer. Under DCP the op merges the ranks' local top-k into global token ids.
+"""Indexer stage of a K3.1 DSA layer at stock Kimi K3 precision: the FP32 indexer
+logits (DeepGEMM's paged MQA logits with the FP32 head weights DsaIndex folds, or
+the fused scorer of indexer.py) and the exact top-k on them.
 
-Under DCP on the FlashInfer core, when the layer's indexer has the one-round DCP
-top-k merge (``dcp_local_topk``, Inferact/mum#63), ``merge_rows`` replaces the op
-and the local-slot filter: it scores the rows (DeepGEMM paged MQA logits, bf16)
-and merges them straight into this rank's compacted physical KV rows and counts.
-With the fused DCP indexer (``fused``, indexer.py) the scoring is its scorer (the
-same logits layout) and, packed, its select also takes the local top-N (the
-merge's B' rows), so the merge only all-gathers and selects.
-
-With Wei's DcpExchange on (``VLLM_K31_DCP_EXCHANGE``, dsa_kernels.dcp_exchange),
-``merge_rows`` gives the steps it admits to its exact top-k instead: the same
-DeepGEMM logits, its KV slots and counts in place of the merge's (no DeepSelect,
-pack or all-gather). The merge stays built for the steps it declines."""
-
-from functools import cache
+  TP   ``run``: on a pure-decode step of uniform rows the DeepGEMM FP32 logits and
+       IndexerSelect ("ids") into the model's shared top-k buffer (the fused TP
+       indexer, indexer.FusedIndexer, serves the FlashInfer FP8 steps itself);
+       any other step the stock decode op (its key insert skipped: DsaIndex
+       inserted the key), FP32 as on main.
+  DCP  ``merge_rows``: stock's FP32 rule (no one-round #63 merge: stock gates it
+       on BF16 logits): the FP32 logits of this rank's keys (the fused DCP
+       scorer, or DeepGEMM), every rank's full local top-K, the all-gather and
+       the exact merge straight to this rank's physical KV rows and counts
+       (dcp_topk.DcpTopk). DcpExchange (``VLLM_K31_DCP_EXCHANGE``) selects on
+       BF16 logits only: a layer it is registered for raises."""
 
 import torch
 
 from vllm.utils.torch_utils import _encode_layer_name
 
 from .index import DIM, fp4_query_views, is_fp4_cache
+from .indexer import LOGITS_DTYPE, dcp_interleave
 
 
 def stock_logits_dtype():
-    """The indexer MQA logits dtype of the source branch's DeepGEMM API, which took
-    it implicitly: BF16 from the MX-scaled (SM100-family) kernels, else FP32. This
-    tree's API (and its stock op) take it as a parameter and default to FP32."""
-    from vllm.utils.deep_gemm import mqa_logits_use_mx_scales
-
-    return torch.bfloat16 if mqa_logits_use_mx_scales() else torch.float32
+    """Stock Kimi K3's indexer logits dtype on main: the sparse_attn_indexer op's
+    default (KimiK3DSAIndexer.score passes none), FP32 on every device."""
+    return LOGITS_DTYPE
 
 
 class IndexerStage:
     """``indexer``: the layer's KimiK3DSAIndexer; ``rows``: the most decode rows
-    of a step (sizes the DCP merge's outputs; 0: no direct DCP merge); ``impl``:
-    the MLA layer's, whose ``dcp_local_topk_counts`` DcpExchange sets."""
+    of a step (sizes the DCP top-k's outputs; 0: no DCP top-k); ``impl``: the MLA
+    layer's (DcpExchange's counts)."""
 
     def __init__(self, indexer, rows=0, impl=None):
         self.indexer = indexer
@@ -50,27 +44,36 @@ class IndexerStage:
         self.topk = indexer.topk_tokens
         # MXFP4 keys and query (indexer_kv_dtype="mxfp4", kimi_k3_indexer_uses_fp4).
         self.fp4 = indexer.use_fp4_cache
-        # --- DCP top-k merge (#63): its caller-owned outputs -------------------
-        # N, this rank's candidate count; 0 runs the op and the local-slot filter.
-        self.local_topk = indexer.dcp_local_topk if rows else 0
-        # Optional [>= rows, K] int32: the merge also writes the global ids (tests,
-        # VLLM_DSA_BPRIME_CHECK).
+        device = indexer.topk_indices_buffer.device
+        # --- DCP top-k (FP32: every rank's local top-K, merged) --------------
+        # Each rank's candidates per row: its full local top-K (stock's FP32
+        # rule); 0: no DCP top-k (the caller runs the op and the filter).
+        world = indexer.dcp_world_size
+        self.local_topk = self.topk if rows and world > 1 else 0
+        self.dcp = None
+        # Optional [>= rows, K] int32: the merge also writes the global ids (tests).
         self.dcp_ids: torch.Tensor | None = None
         if self.local_topk:
-            from ...compat.dcp_topk_merge_check import (
-                dcp_topk_merge_check_enabled,
-            )
+            from .dcp_topk import DcpTopk
 
-            device = indexer.topk_indices_buffer.device
-            # K wide: the exact merge gives a rank up to K of a row's keys (a
-            # saturated row: more than its N local candidates).
+            self.dcp = DcpTopk(
+                self.topk,
+                world,
+                indexer.dcp_rank,
+                lambda: dcp_interleave(indexer),
+                device,
+                rows,
+            )
             shape = (rows, self.topk)
             self.dcp_rows = torch.full(shape, -1, dtype=torch.int32, device=device)
             self.dcp_valid = torch.zeros(rows, dtype=torch.int32, device=device)
-            if dcp_topk_merge_check_enabled():
-                self.dcp_ids = torch.full(shape, -1, dtype=torch.int32, device=device)
-        # The fused DCP indexer (PreparedDsa.prepare_cache; None: DeepGEMM).
+        # The fused DCP scorer (PreparedDsa.prepare_cache; None: DeepGEMM).
         self.fused = None
+        # TP: the select of DeepGEMM's logits into the top-k buffer, per rows.
+        self.tp_rows = rows if world == 1 else 0
+        self.dummy = torch.zeros(1, dtype=torch.int32, device=device)
+        self.tp_valid = torch.zeros(max(rows, 1), dtype=torch.int32, device=device)
+        self.ends = torch.zeros(max(rows, 1), dtype=torch.int32, device=device)
         # -----------------------------------------------------------------------
 
     def query(self, q_fp8, rows, batch):
@@ -82,23 +85,42 @@ class IndexerStage:
             return q_fp8[:rows].view(torch.float8_e4m3fn), None
         return fp4_query_views(q_fp8, batch, rows)
 
-    def run(self, projected, q_fp8, head_w):
-        """Top-k of the current rows into the shared buffer (stock decode scoring).
+    def decode_step(self, batch):
+        """(the indexer's decode metadata, rows) of a pure-decode step of uniform
+        rows within ``batch`` (the same on every rank), else (None, 0)."""
+        from vllm.forward_context import get_forward_context
 
-        SM107 port: where the source branch's stock op handed the step to the
-        DcpExchange hook, the exchange runs here on the same bf16 logits (this
-        tree's stock op never consults it); the stock op otherwise, with the logits
-        dtype the source branch's DeepGEMM API took implicitly."""
+        index_md = get_forward_context().attn_metadata[self.indexer.k_cache.prefix]
+        decode, rows = index_md.decode, index_md.num_decode_tokens
+        if (
+            decode is None
+            or index_md.num_prefills
+            or not 0 < rows <= batch
+            or decode.requires_padding
+            or rows % decode.decode_lens.shape[0]
+        ):
+            return None, 0
+        return decode, rows
+
+    def run(self, projected, q_fp8, head_w):
+        """Top-k of the current rows into the shared buffer: TP on a pure-decode
+        step the DeepGEMM FP32 logits and IndexerSelect, else the stock op (FP32,
+        as main)."""
         from ...dsa_kernels.hooks import run_hooked_topk
 
         indexer, batch = self.indexer, projected.shape[0]
         assert is_fp4_cache(indexer.k_cache.kv_cache) == self.fp4
+        assert head_w.dtype == torch.float32, head_w.dtype
+        # DcpExchange's top-k raises on FP32 logits (BF16 only).
         hooked = run_hooked_topk(
             indexer,
             lambda decode, rows: self.decode_logits(q_fp8, head_w, decode, rows, batch),
         )
         if hooked is not None:
             return hooked
+        decode, rows = self.decode_step(batch) if self.tp_rows else (None, 0)
+        if decode is not None and batch <= self.tp_rows:
+            return self.select_ids(q_fp8, head_w, decode, rows, batch)
         query, q_scale = self.query(q_fp8, batch, batch)
         return torch.ops.vllm.sparse_attn_indexer(
             projected,
@@ -124,137 +146,140 @@ class IndexerStage:
             indexer.dcp_world_size,
             indexer.cp_kv_cache_interleave_size,
             topk_backend=indexer.topk_backend,
-            # Interleave 1: the exact one-round DCP merge (gated in the op).
             dcp_local_topk=indexer.dcp_local_topk,
             logits_dtype=stock_logits_dtype(),
         )
 
-    # --- DCP top-k merge (#63) ---------------------------------------------------
-    def warm(self, block_size):
-        """Compile ``merge_rows``' merge kernels for MLA blocks of ``block_size``
-        tokens now (nothing without the direct DCP merge): see warm_merge_rows."""
-        if self.local_topk:
-            args = self.topk, self.local_topk, self.indexer.dcp_world_size
-            warm_merge_rows(*args, self.dcp_ids is not None, block_size)
+    def select_ids(self, q_fp8, head_w, decode, rows, batch):
+        """TP: the exact top-k of the DeepGEMM FP32 logits of the step's ``rows``
+        rows into the top-k buffer (key indices, -1 past each row's count; rows
+        past them attend nothing)."""
+        from vllm.model_executor.layers.indexer_topk import SparseIndexerTopk
+
+        from ..common.host import stream, to_cute
+        from .indexer import compile_select
+
+        buffer = self.indexer.topk_indices_buffer
+        assert buffer.dtype == torch.int32 and buffer.stride(0) == self.topk
+        logits = self.decode_logits(q_fp8, head_w, decode, rows, batch)
+        reqs = decode.decode_lens.shape[0]
+        ends = SparseIndexerTopk._row_ends(decode.seq_lens[:reqs], rows // reqs, rows)
+        row_ends = self.padded_ends(ends, batch)
+        if logits.stride(1) != 1 or logits.stride(0) % 4 or logits.data_ptr() % 16:
+            raise ValueError(f"indexer top-k: 16-byte aligned rows, {logits.stride()}")
+        # Every row of the step (rows past the requests: no keys, -1 rows).
+        select = compile_select(batch, 1, self.topk, "ids", buffer.device.index, 1)
+        out = buffer[:batch]
+        select(
+            _i64(logits.data_ptr()),
+            _i32(logits.stride(0)),
+            to_cute(self.dummy, 4),
+            to_cute(row_ends, 4),
+            _i64(0),
+            _i32(0),
+            _i32(0),
+            _i32(0),
+            to_cute(out, 4),
+            to_cute(self.tp_valid[:batch], 4),
+            to_cute(out, 4),
+            stream(buffer.device),
+        )
+        return buffer
+
+    def padded_ends(self, ends, batch):
+        """``ends`` [rows] extended to ``batch`` rows with zeros (rows past the
+        step's requests: no keys)."""
+        rows = ends.shape[0]
+        if rows == batch:
+            return ends
+        self.ends[:rows].copy_(ends)
+        self.ends[rows:batch].zero_()
+        return self.ends[:batch]
+
+    # --- DCP top-k ---------------------------------------------------------------
+    def warm(self, block_size, rows=(), tp=True):
+        """Compile ``merge_rows``' (DCP) and, ``tp``, ``run``'s (TP: where the fused
+        indexer does not serve the layer) select kernels for steps of ``rows`` rows
+        now, before any CUDA graph capture (a first compile there invalidates it).
+        ``block_size``: unused (any MLA block size)."""
+        from .indexer import compile_select
+
+        for r in rows:
+            if self.dcp is not None:
+                self.dcp.warm(r, self.dcp_ids is not None)
+            if self.tp_rows and tp:
+                device = self.indexer.topk_indices_buffer.device.index
+                compile_select(r, 1, self.topk, "ids", device, 1)
 
     def merge_source(self, batch):
         """Which top-k ``merge_rows`` gives this step of ``batch`` rows, decided from
-        the step metadata alone (the same on every rank): ("exchange", rows) where
-        DcpExchange's top-k admits the step, ("merge", rows) where the #63 merge fits
-        it (pure decode, uniform rows, interleave 1), else (None, 0): the caller
-        runs the op and the filter."""
-        from vllm.forward_context import get_forward_context
-
-        from ...dsa_kernels.dcp_topk_merge import dcp_topk_merge_fits
+        the step metadata alone (the same on every rank): ("merge", rows) on a
+        pure-decode step of uniform rows (the FP32 DCP top-k), else (None, 0): the
+        caller runs the op and the filter. Raises where DcpExchange is registered
+        for the layer: its top-k selects BF16 logits only, stock K3's are FP32."""
         from ...dsa_kernels.hooks import DCP_DECODE_TOPK_HOOKS
 
         if not self.local_topk:
             return None, 0
         indexer = self.indexer
-        index_md = get_forward_context().attn_metadata[indexer.k_cache.prefix]
-        decode, rows = index_md.decode, index_md.num_decode_tokens
-        if (
-            decode is None
-            or decode.global_seq_lens is None
-            or index_md.num_prefills
-            or not 0 < rows <= batch
-            or decode.requires_padding
-            or rows % decode.decode_lens.shape[0]
-        ):
+        if indexer.k_cache.prefix in DCP_DECODE_TOPK_HOOKS:
+            raise RuntimeError(
+                "Kimi K3.1 specialized DSA: DcpExchange (VLLM_K31_DCP_EXCHANGE) "
+                "selects BF16 logits; stock Kimi K3's indexer logits are FP32 "
+                "(unset it)"
+            )
+        decode, rows = self.decode_step(batch)
+        if decode is None or decode.global_seq_lens is None:
             return None, 0
-        hook = DCP_DECODE_TOPK_HOOKS.get(indexer.k_cache.prefix)
-        if hook is not None and self.impl is not None and hook[0](rows):
-            return "exchange", rows
-        if indexer.cp_kv_cache_interleave_size == 1 and dcp_topk_merge_fits(
-            rows, self.topk, self.local_topk
-        ):
-            return "merge", rows
-        return None, 0
+        if rows > self.dcp_rows.shape[0]:
+            return None, 0
+        return "merge", rows
 
     def merge_rows(self, q_fp8, head_w, metadata, stride_rows, batch, q=1):
-        """DCP: this rank's flat KV rows of the merged global top-k of the first
-        ``batch`` rows (``q`` per request; compacted to a prefix, at most N per
-        row) and their counts, as ``dcp_stage.local_slots`` of the op's global
-        ids; ``metadata``: the MLA layer's. None when the step does not fit the
-        merge (the caller then runs the op and the filter). One all-gather over
-        the DCP group, so every rank takes the same branch. The logits must hold
-        no NaN: DeepSelect then returns out-of-range ids, on which the merge's
-        pack faults; no per-step check here (finite query, head weights and
-        cached keys keep them finite)."""
+        """DCP: this rank's flat KV rows of the exact global top-k of the first
+        ``batch`` rows (``q`` per request; compacted to a prefix in its local key
+        order) and their counts, as ``dcp_stage.local_slots`` of the stock op's
+        global ids; ``metadata``: the MLA layer's. None when the step does not fit
+        (the caller then runs the op and the filter). One all-gather over the DCP
+        group, so every rank takes the same branch."""
         from vllm.forward_context import get_forward_context
-        from vllm.model_executor.layers.indexer_topk import (
-            SparseIndexerTopk,
-            is_deep_select_supported,
-        )
-        from vllm.utils.math_utils import cdiv
-
-        from ...dsa_kernels.dcp_topk_merge.kernels import dcp_topk_merge_rows
-        from ...dsa_kernels.hooks import DCP_DECODE_TOPK_HOOKS
+        from vllm.model_executor.layers.indexer_topk import SparseIndexerTopk
 
         source, rows = self.merge_source(batch)
         if source is None:
             return None
-        indexer, n = self.indexer, self.local_topk
-        index_md = get_forward_context().attn_metadata[indexer.k_cache.prefix]
+        assert head_w.dtype == torch.float32, head_w.dtype
+        index_md = get_forward_context().attn_metadata[self.indexer.k_cache.prefix]
         decode = index_md.decode
-        if source == "exchange":
-            run = DCP_DECODE_TOPK_HOOKS[indexer.k_cache.prefix][1]
-            return self.exchange_rows(run, q_fp8, head_w, decode, rows, batch)
         slots, valid = self.dcp_rows[:batch], self.dcp_valid[:batch]
-        ids = None if self.dcp_ids is None else self.dcp_ids[:rows, : self.topk]
-        # As the stock hook: interleave 1 bounds the local lengths.
-        max_local_len = cdiv(self.max_model_len, indexer.dcp_world_size)
-        merge = dict(
-            local_topk=n,
-            topk=self.topk,
-            req_id=metadata.req_id_per_token,
-            block_table=metadata.block_table,
-            block_size=metadata.block_size,
-            stride_rows=stride_rows,
-            dcp_rank=indexer.dcp_rank,
-            rows_out=slots[:rows],
-            valid_out=valid[:rows],
-            ids_out=ids,
-        )
         fused = self.fused
+        # Every row of the step (rows past the requests: no keys, so no rows).
         if fused is not None and decode.seq_lens.numel() == rows:
-            # The logits stay valid until the merge returns (stream order): a
-            # saturated rank re-reads its row in the exact merge's second round.
-            packed, logits, ends = fused.run_dcp(q_fp8, head_w, decode, batch, q)
-            dcp_topk_merge_rows(
-                logits=logits[:rows],
-                row_ends=ends[:rows],
-                packed=None if packed is None else packed[:rows],
-                max_local_len=max_local_len,
-                **merge,
-            )
-            self.check(logits[:rows], ends[:rows], index_md, ids)
-            if rows < batch:  # rows past the requests attend nothing
-                slots[rows:].fill_(-1)
-                valid[rows:].zero_()
-            return slots, valid
-        logits = self.decode_logits(q_fp8, head_w, decode, rows, batch)
-        # SM100 DeepGEMM emits bf16 at a 1 KiB row stride (DeepSelect's input).
-        assert logits.dtype == torch.bfloat16 and is_deep_select_supported(logits, n)
-        reqs = decode.decode_lens.shape[0]
-        seq_lens = decode.seq_lens[:reqs]
-        row_ends = SparseIndexerTopk._row_ends(seq_lens, rows // reqs, rows)
-        dcp_topk_merge_rows(
-            logits=logits,
-            row_ends=row_ends,
-            max_local_len=max_local_len,
-            **merge,
+            logits, ends = fused.run_dcp(q_fp8, head_w, decode, batch, q)
+        else:
+            logits = self.decode_logits(q_fp8, head_w, decode, rows, batch)
+            reqs = decode.decode_lens.shape[0]
+            seq_lens = decode.seq_lens[:reqs]
+            ends = SparseIndexerTopk._row_ends(seq_lens, rows // reqs, rows)
+            ends = self.padded_ends(ends, batch)
+        ids = None if self.dcp_ids is None else self.dcp_ids[:batch]
+        self.dcp.run(
+            logits,
+            ends,
+            metadata.req_id_per_token,
+            metadata.block_table,
+            metadata.block_size,
+            stride_rows,
+            slots,
+            valid,
+            ids,
         )
-        self.check(logits, row_ends, index_md, ids)
-        if rows < batch:  # rows past the requests attend nothing
-            slots[rows:].fill_(-1)
-            valid[rows:].zero_()
         return slots, valid
 
     def decode_logits(self, q_fp8, head_w, decode, rows, batch):
-        """The bf16 paged MQA logits of the first ``rows`` rows of a ``batch``-row
-        step, as the stock op's decode branch computes them (uniform rows; FP8 or
-        MXFP4 cache and query)."""
+        """The FP32 paged MQA logits of the first ``rows`` rows of a ``batch``-row
+        step, as the stock op's decode branch computes them on main (uniform rows;
+        FP8 or MXFP4 cache and query; FP32 head weights reduce in FP32)."""
         from vllm.model_executor.layers.sparse_attn_indexer import (
             kv_cache_as_quant_view,
         )
@@ -263,9 +288,6 @@ class IndexerStage:
             mqa_logits_mx_inputs,
         )
 
-        # The MX-scaled (SM100-family) kernels reduce in and emit BF16, FP32 off
-        # them: the dtype the DeepGEMM API took implicitly before it was a
-        # parameter.
         logits_dtype = stock_logits_dtype()
         reqs = decode.decode_lens.shape[0]
         query, q_scale = self.query(q_fp8, rows, batch)
@@ -288,57 +310,19 @@ class IndexerStage:
             indices=decode.indices,
         )
 
-    def exchange_rows(self, run, q_fp8, head_w, decode, rows, batch):
-        """``merge_rows`` of a DcpExchange step: ``run`` (its indexer hook) writes
-        this rank's KV slots of the exact global top-k of the same logits and the
-        MLA impl's ``dcp_local_topk_counts`` gives their counts."""
-        slots, valid = self.dcp_rows[:batch], self.dcp_valid[:batch]
-        logits = self.decode_logits(q_fp8, head_w, decode, rows, batch)
-        run(logits, decode, slots[:rows])
-        from ...dsa_kernels.hooks import local_topk_counts
-
-        counts = local_topk_counts(self.impl)(rows)
-        assert counts is not None, "DcpExchange admitted a step it did not serve"
-        if rows == batch:
-            return slots, counts
-        valid[:rows].copy_(counts)
-        slots[rows:].fill_(-1)  # rows past the requests attend nothing
-        valid[rows:].zero_()
-        return slots, valid
-
-    def check(self, logits, row_ends, index_md, ids):
-        """VLLM_DSA_BPRIME_CHECK: the generic merge of the same bf16 logits next to
-        the merge's global ids ``ids``, as the stock op's decode branch runs it
-        (collective over the DCP group; only where the check allocated dcp_ids)."""
-        from ...compat.dcp_topk_merge_check import (
-            dcp_topk_merge_check_enabled,
-        )
-
-        if ids is None or not dcp_topk_merge_check_enabled():
-            return
-        # Debug only (VLLM_DSA_BPRIME_CHECK): the stock reference merge.
-        from ...dsa_kernels.dcp_topk_merge.check import _check_dcp_decode_topk_merge
-
-        indexer, decode = self.indexer, index_md.decode
-        reqs = decode.decode_lens.shape[0]
-        _check_dcp_decode_topk_merge(
-            indexer.k_cache.prefix,
-            logits,
-            row_ends,
-            decode.seq_lens[:reqs],
-            ids.shape[0] // reqs,
-            ids,
-            self.local_topk,
-            indexer.topk_backend,
-            indexer.topk_backend != "deep_select",
-            index_md.max_seq_len,
-            self.max_model_len,
-            indexer.dcp_rank,
-            indexer.dcp_world_size,
-            16,  # bf16 logits
-        )
-
     # -------------------------------------------------------------------------------
+
+
+def _i64(value):
+    from cutlass import Int64
+
+    return Int64(value)
+
+
+def _i32(value):
+    from cutlass import Int32
+
+    return Int32(value)
 
 
 def check_index_cache(indexer, fused_unsupported=()):
@@ -358,23 +342,3 @@ def check_index_cache(indexer, fused_unsupported=()):
             f"{list(fused_unsupported).count(None)} of its shapes"
         )
     return fp4
-
-
-@cache
-def warm_merge_rows(topk, local_topk, world_size, emit_ids, block_size):
-    """Compile the #63 merge's kernels as ``merge_rows`` launches them (physical rows
-    of ``block_size``-token blocks; global ids too with ``emit_ids``) now, once per
-    process. The specialized decode runs only inside CUDA graph captures, where a
-    first compile invalidates the capture (CUDA error 901), and it is built after
-    the runner's JIT warmup registry closes, whose warmup compiles only the stock
-    indexer's variant (global ids, no rows)."""
-    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
-
-    from ...dsa_kernels.dcp_topk_merge.kernels import register_dcp_topk_merge_warmup
-
-    registry = JitWarmupRegistry(None)
-    with registry.activate():
-        register_dcp_topk_merge_warmup(
-            topk, local_topk, world_size, emit_ids=emit_ids, block_size=block_size
-        )
-    registry.warmup()

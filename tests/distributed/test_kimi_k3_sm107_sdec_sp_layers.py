@@ -964,7 +964,9 @@ class _Step:
 def _sp_block(layer_idx, attention, step):
     """The SP block of one stock layer (ordinal 0: parity 0), and the shared
     coverage check: every row of the step a specialized (not stock) choice."""
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.runtime import sp_attention
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.runtime import (
+        sp_attention,
+    )
     from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.shapes import Path
 
     decoder = SimpleNamespace(layer_idx=layer_idx, self_attn=attention)
@@ -998,7 +1000,9 @@ def _dsa_config(indexer):
     SPARSE trtllm-gen on per-tensor FP8 KV, the ``indexer`` key cache, q4 verify
     rows; the metadata builders read DeepSeek-V2-Lite's MLA sizes (kv_lora 512, rope
     64) as test_k3_sm107_dsa.py's layer harness does."""
-    from tests.models.kimi_k3.nvidia.specialized_decode.sm_107 import test_k3_sm107_dsa as dsa
+    from tests.models.kimi_k3.nvidia.specialized_decode.sm_107 import (
+        test_k3_sm107_dsa as dsa,
+    )
     from tests.v1.attention.utils import create_vllm_config
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -1141,7 +1145,9 @@ def _check_rope_part(where, ours, theirs, ours_pe, k_scale):
 
 
 def _dsa_case(config, rank, device, indexer, topk_mode, rows, refusals):
-    from tests.models.kimi_k3.nvidia.specialized_decode.sm_107 import test_k3_sm107_dsa as dsa
+    from tests.models.kimi_k3.nvidia.specialized_decode.sm_107 import (
+        test_k3_sm107_dsa as dsa,
+    )
     from vllm import _custom_ops as ops
     from vllm import ir
     from vllm.distributed import get_tp_group
@@ -1460,11 +1466,13 @@ def _dsa_refusals(attn, block, step, rank, device):
         block.core.choice(step.rows[0] + 2)
 
 
-@pytest.mark.parametrize("topk", ["merge", "exchange"])
+# The top-k: the FP32 DCP top-k ("merge"; stock Kimi K3's indexer logits are FP32, so
+# DcpExchange, which selects BF16 logits, is refused).
+@pytest.mark.parametrize("topk", ["merge"])
 @pytest.mark.parametrize("indexer", ["mxfp4", "fp8"])
 def test_sp_dsa_block_matches_stock_layer(indexer, topk):
     """SpAttentionBlock (DSA) vs the stock KimiK3DSAAttention under the SP seam at
-    ``DSA_ROWS`` (module docstring); C512 deploys the MXFP4 indexer with DcpExchange."""
+    ``DSA_ROWS`` (module docstring); C512 deploys the MXFP4 indexer."""
     pytest.importorskip("cutlass")
     _launch("dsa", indexer, topk, DSA_ROWS, True)
 
@@ -1473,7 +1481,7 @@ def test_sp_dsa_block_matches_stock_layer(indexer, topk):
 def test_sp_dsa_block_matches_stock_layer_all_rows():
     """The DSA A/B at every captured R (4..512), as C512 deploys it."""
     pytest.importorskip("cutlass")
-    _launch("dsa", "mxfp4", "exchange", ALL_ROWS, False)
+    _launch("dsa", "mxfp4", "merge", ALL_ROWS, False)
 
 
 # ------------------------------------------------------------------------------ KDA
@@ -1483,7 +1491,9 @@ def _kda_config():
     """The KDA layer's vLLM config: TP4 = DCP4, a BF16 conv / FP32 recurrent state,
     RecoverSSM records (--use-replayssm with q4 DSpark), 128 requests; the stock
     layer's Triton prefill (decode is what is compared)."""
-    from tests.models.kimi_k3.nvidia.specialized_decode.sm_107 import test_k3_sm107_dsa as dsa
+    from tests.models.kimi_k3.nvidia.specialized_decode.sm_107 import (
+        test_k3_sm107_dsa as dsa,
+    )
     from tests.v1.attention.utils import create_vllm_config
 
     config = create_vllm_config(
@@ -1734,8 +1744,12 @@ def _kda_case(config, rank, device, rows, steps, graph, refusals):
 
 def _kda_refusals(attn, block, step, rank, device):
     """Configurations the SP KDA path and the SP o-projection refuse at build."""
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.kda.sp import SpKdaCore
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.oproj.sp import SpOproj
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.kda.sp import (
+        SpKdaCore,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.oproj.sp import (
+        SpOproj,
+    )
     from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.shapes import Unsupported
 
     bf16 = _context(rank, device, bf16_state=True)
