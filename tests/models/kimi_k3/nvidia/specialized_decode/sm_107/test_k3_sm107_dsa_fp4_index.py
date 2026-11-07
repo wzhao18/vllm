@@ -346,6 +346,7 @@ def mxfp4_readers(monkeypatch, batch, rows):
     )
     from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.indexer_stage import (  # noqa: E501
         IndexerStage,
+        stock_logits_dtype,
     )
     from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.query_stage import (  # noqa: E501
         compile_index,
@@ -460,7 +461,8 @@ def mxfp4_readers(monkeypatch, batch, rows):
     stock = topk[:rows].clone()
     assert bool((stock >= 0).any(-1).all())
     ref_q, ref_s, ref_w = mxfp4_q_quant(q, wv, WEIGHT_SCALE, 32)
-    ref_s, ref_w = mqa_logits_mx_inputs(ref_q, ref_s, ref_w)
+    logits_dtype = stock_logits_dtype()
+    ref_s, ref_w = mqa_logits_mx_inputs(ref_q, ref_s, ref_w, logits_dtype)
     ref = fp8_fp4_paged_mqa_logits(
         (ref_q.view(torch.int8).unsqueeze(1), ref_s.unsqueeze(1)),
         kv_cache_as_quant_view(cache, 128, True),
@@ -469,6 +471,7 @@ def mxfp4_readers(monkeypatch, batch, rows):
         block_table,
         decode.schedule_metadata,
         max_model_len=indexer.max_model_len,
+        logits_dtype=logits_dtype,
         indices=indices,
     )
 

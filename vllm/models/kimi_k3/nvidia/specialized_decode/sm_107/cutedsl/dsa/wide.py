@@ -528,9 +528,10 @@ class WideDsa:
         per-tensor FP8 cache, FlashInfer's sparse decode over the flat rows, as the
         stock decode."""
         from vllm.v1.attention.backends.mla.flashmla_sparse import _fp8_kv_pages
-        from vllm.v1.attention.backends.mla.sparse_utils import (
-            flat_kv_row_view,
-            triton_filter_and_convert_dcp_index,
+        from vllm.v1.attention.backends.mla.sparse_utils import flat_kv_row_view
+
+        from ...compat.dcp_index import (
+            filter_and_convert_dcp_index as triton_filter_and_convert_dcp_index,
         )
         from vllm.v1.attention.ops.flashmla import (
             flash_mla_with_kvcache,
