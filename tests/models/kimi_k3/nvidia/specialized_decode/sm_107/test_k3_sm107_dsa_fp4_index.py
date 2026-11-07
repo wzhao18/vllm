@@ -292,19 +292,18 @@ def test_mxfp4_key_insert_from_packed_rows(heads):
 
 
 @pytest.mark.parametrize(
-    "width,use_fp4,unsupported,fp4",
+    "width,use_fp4,fp4",
     [
-        (132, False, [None, None], False),  # FP8: the fused indexer may run
-        (68, True, ["MXFP4 cache"] * 2, True),
-        (68, False, ["MXFP4 cache"] * 2, None),  # FP8 readers on MXFP4 keys
-        (132, True, [None], None),  # MXFP4 readers on FP8 keys
-        (68, True, ["MXFP4 cache", None], None),  # the fused indexer on MXFP4 keys
+        (132, False, False),  # FP8
+        (68, True, True),  # MXFP4
+        (68, False, None),  # FP8 readers on MXFP4 keys
+        (132, True, None),  # MXFP4 readers on FP8 keys
     ],
 )
-def test_check_index_cache(width, use_fp4, unsupported, fp4):
+def test_check_index_cache(width, use_fp4, fp4):
     """The bind-time key format check of PreparedDsa / WideDsa.prepare_cache: the
-    bound cache's width is the format the readers take (use_fp4_cache), and no
-    fused decode indexer (FP8 keys only) runs a shape on an MXFP4 cache."""
+    bound cache's width is the format the readers (the scorer: FP8 or MXFP4 keys)
+    take (use_fp4_cache)."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.indexer_stage import (  # noqa: E501
         check_index_cache,
     )
@@ -315,9 +314,9 @@ def test_check_index_cache(width, use_fp4, unsupported, fp4):
     )
     if fp4 is None:
         with pytest.raises(ValueError, match="indexer cache"):
-            check_index_cache(indexer, unsupported)
+            check_index_cache(indexer)
     else:
-        assert check_index_cache(indexer, unsupported) is fp4
+        assert check_index_cache(indexer) is fp4
 
 
 def mxfp4_readers(monkeypatch, batch, rows):
@@ -326,8 +325,9 @@ def mxfp4_readers(monkeypatch, batch, rows):
     written by DsaIndex, scored by the stock scoring (KimiK3DSAIndexer.score of the
     same projection rows, as the stock forward's warmup run before each capture
     scores it): the shared top-k buffer, the stock top-k, the readers of DsaIndex's
-    MXFP4 query (no copies: index.fp4_query_views) and DeepGEMM's MXFP4 paged
-    logits of the stock writer's query (the logits reference)."""
+    MXFP4 query (no copies: index.fp4_query_views; sm_107's scorer: TP its top-k
+    ids, DCP its logits in DeepGEMM's layout) and DeepGEMM's MXFP4 paged logits of
+    the stock writer's query at FP32 (the logits reference)."""
     import cutlass
 
     import vllm.model_executor.layers.sparse_attn_indexer as sparse_indexer
@@ -346,15 +346,14 @@ def mxfp4_readers(monkeypatch, batch, rows):
         stream,
         to_cute,
     )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.indexer import (  # noqa: E501
+        FusedIndexer,
+    )
     from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.indexer_stage import (  # noqa: E501
         IndexerStage,
-        stock_logits_dtype,
     )
     from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.query_stage import (  # noqa: E501
         compile_index,
-    )
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.wide import (
-        WideDsa,
     )
     from vllm.utils.deep_gemm import (
         fp8_fp4_paged_mqa_logits,
@@ -362,7 +361,6 @@ def mxfp4_readers(monkeypatch, batch, rows):
         get_paged_mqa_logits_metadata,
         mqa_logits_mx_inputs,
     )
-    from vllm.utils.torch_utils import _encode_layer_name
     from vllm.v1.attention.backends.mla.indexer import (
         DeepSeekV32IndexerDecodeMetadata,
         DeepseekV32IndexerMetadata,
@@ -417,7 +415,9 @@ def mxfp4_readers(monkeypatch, batch, rows):
         topk_indices_buffer=topk,
         use_fused_k_insert=True,
         use_pcp=False,
-        _parallel_config=SimpleNamespace(pcp_shard_decode_requests=False),
+        _parallel_config=SimpleNamespace(
+            pcp_shard_decode_requests=False, cp_kv_cache_interleave_size=1
+        ),
         dense_mha_metadata_layer_name="",
         dcp_rank=0,
         dcp_world_size=1,
@@ -463,7 +463,7 @@ def mxfp4_readers(monkeypatch, batch, rows):
     stock = topk[:rows].clone()
     assert bool((stock >= 0).any(-1).all())
     ref_q, ref_s, ref_w = mxfp4_q_quant(q, wv, WEIGHT_SCALE, 32)
-    logits_dtype = stock_logits_dtype()
+    logits_dtype = torch.float32  # stock Kimi K3's indexer logits on main
     ref_s, ref_w = mqa_logits_mx_inputs(ref_q, ref_s, ref_w, logits_dtype)
     ref = fp8_fp4_paged_mqa_logits(
         (ref_q.view(torch.int8).unsqueeze(1), ref_s.unsqueeze(1)),
@@ -477,33 +477,26 @@ def mxfp4_readers(monkeypatch, batch, rows):
         indices=indices,
     )
 
-    stage = IndexerStage(indexer)
-    # TP with the step's rows: DeepGEMM's FP32 logits and IndexerSelect ("ids").
-    selecting = IndexerStage(indexer, batch)
-    wide = SimpleNamespace(
-        stage=stage,
-        indexer=indexer,
-        k_cache_name=_encode_layer_name(prefix),
-        q_fp8=q_rows,
-        head_w=head_w,
-        topk=TOPK,
-        max_model_len=indexer.max_model_len,
-        max_total=indexer.max_total_seq_len,
-    )
-    selects = {
-        "IndexerStage.run": partial(stage.run, projected, q_rows, head_w),
-        "IndexerStage.select_ids": partial(selecting.run, projected, q_rows, head_w),
-        "WideDsa.indexer_core": partial(WideDsa.indexer_core, wide, projected, batch),
-    }
-    logits = partial(stage.decode_logits, q_rows, head_w, decode, rows, batch)
+    # TP: the scorer's FP32 logits and IndexerSelect ("compact_ids") into the
+    # shared top-k buffer.
+    stage = IndexerStage(indexer, batch)
+    device = torch.device(dev)
+    stage.fused = FusedIndexer(indexer, [(batch, 1)], device, batch, ids=True)
+    # DCP's scorer (this rank's keys in DeepGEMM's logits layout; one rank).
+    dcp = FusedIndexer(indexer, [(batch, 1)], device, batch, dcp=True)
+    selects = {"IndexerStage.run": partial(stage.run, q_rows, head_w, batch)}
+
+    def logits():
+        return dcp.run_dcp(q_rows, head_w, decode, batch, 1)[0]
+
     return SimpleNamespace(
         lens=lens, topk=topk, stock=stock, ref=ref, selects=selects, logits=logits
     )
 
 
 def check_readers_logits(step, logits):
-    """IndexerStage.decode_logits (the logits of the DCP top-k and the DSA core's
-    rows) are DeepGEMM's MXFP4 FP32 logits of the stock query, bit for bit."""
+    """The DCP scorer's logits (the FP32 DCP top-k's input) are DeepGEMM's MXFP4
+    FP32 logits of the stock query, bit for bit."""
     assert logits.dtype == step.ref.dtype == torch.float32
     for i, n in enumerate(step.lens):
         assert torch.equal(logits[i, :n], step.ref[i, :n]), i
@@ -529,11 +522,11 @@ def check_readers_topk(step, name):
 def test_mxfp4_readers_match_stock(monkeypatch, workspace_init, batch, rows):
     """The readers of DsaIndex's MXFP4 query (no copies: index.fp4_query_views) in
     a step of ``batch`` rows whose first ``rows`` are requests' (the rest CUDA-graph
-    padding), over keys the stock MXFP4 writer inserted: IndexerStage.run and
-    WideDsa.indexer_core select the stock scoring's top-k (KimiK3DSAIndexer.score
-    of the same projection rows), and IndexerStage.decode_logits (the logits of the
-    #63 merge, DcpExchange and the DSA core's rows) are DeepGEMM's MXFP4 paged
-    logits of the stock writer's query, bit for bit."""
+    padding), over keys the stock MXFP4 writer inserted: IndexerStage.run (sm_107's
+    MXFP4 scorer and exact select) selects the stock scoring's top-k
+    (KimiK3DSAIndexer.score of the same projection rows), and the DCP scorer's
+    logits (the FP32 DCP top-k's) are DeepGEMM's MXFP4 paged logits of the stock
+    writer's query, bit for bit."""
     step = mxfp4_readers(monkeypatch, batch, rows)
     for name, select in step.selects.items():
         step.topk.fill_(-1)
@@ -549,14 +542,13 @@ def test_mxfp4_readers_capture_after_stock(monkeypatch, workspace_init, batch, r
     """The readers as the specialized decode first runs them: captured in CUDA
     graphs right after the stock scoring of the same step, with no eager run of
     their own (runtime.decode plans a step only under capture; the warmup run
-    before each capture is the stock forward). Their DeepGEMM MXFP4 logits are the
-    variant the stock scoring compiled, so nothing compiles under capture (CUDA
-    error 901 there would stop D's startup; unit_mxfp4.sh runs this test first in
-    its own process on an empty DG_JIT_CACHE_DIR), and the replays give the stock
-    top-k and DeepGEMM's MXFP4 logits."""
+    before each capture is the stock forward). Their kernels compiled when they
+    were built (FusedIndexer), so nothing compiles under capture (CUDA error 901
+    there would stop D's startup), and the replays give the stock top-k and
+    DeepGEMM's MXFP4 logits."""
     step = mxfp4_readers(monkeypatch, batch, rows)
     graphs, outs = {}, {}
-    for name, run in (*step.selects.items(), ("decode_logits", step.logits)):
+    for name, run in (*step.selects.items(), ("dcp_logits", step.logits)):
         graphs[name] = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graphs[name]):
             outs[name] = run()
@@ -565,9 +557,9 @@ def test_mxfp4_readers_capture_after_stock(monkeypatch, workspace_init, batch, r
         graphs[name].replay()
         torch.accelerator.synchronize()
         check_readers_topk(step, name)
-    graphs["decode_logits"].replay()
+    graphs["dcp_logits"].replay()
     torch.accelerator.synchronize()
-    check_readers_logits(step, outs["decode_logits"])
+    check_readers_logits(step, outs["dcp_logits"])
 
 
 # ---------------------------------------------------------------------------------
@@ -730,8 +722,8 @@ def check_fp4_layer_step(step, q, reference=True):
 
 @pytest.fixture
 def mxfp4_layers(monkeypatch):
-    """test_k3_sm107_dsa.py's layer harness (run_layer_step,
-    run_wide_exchange_step and the tests built on them) on an MXFP4 indexer cache:
+    """test_k3_sm107_dsa.py's layer harness (run_layer_step, run_wide_step and the
+    tests built on them) on an MXFP4 indexer cache:
     indexer_kv_dtype="mxfp4", 68 B indexer rows written by the stock MXFP4 writer,
     and the MXFP4 NaN check, exact top-k and step check."""
     from vllm.models.kimi_k3.nvidia.ops import dsa_indexer
@@ -776,8 +768,8 @@ def test_prepared_dsa_mxfp4_matches_stock(
     """test_prepared_dsa_run_matches_stock (TP, one GPU) on an MXFP4 indexer cache,
     with the per-tensor FP8 (fi-auto) or nvfp4_ds_mla MLA cache: DsaIndex's,
     IndexFront's or (serial, front past 40 rows) IndexFrontMma's MXFP4 query and
-    keys scored by the stock op through IndexerStage (the fused decode indexer reads
-    FP8 keys only: the late modes take the unfused table)."""
+    keys scored by sm_107's MXFP4 scorer (the fused decode indexer: its physical
+    rows, the late modes too)."""
     mla_cache_ready(core)
     check_fp4_layer_step(dsa.run_layer_step(core, batch, q, overlap=overlap), q)
 
@@ -816,9 +808,9 @@ def test_prepared_dsa_dcp16_mxfp4(
     q,
 ):
     """test_prepared_dsa_run_dcp_matches_stock at DCP16 on an MXFP4 indexer cache:
-    DsaIndex's or the index front's MXFP4 query and keys, the #63 merge over
-    DeepGEMM's MXFP4 logits (decode_logits), against the stock DCP forward of the
-    same step (MXFP4 writers and scoring)."""
+    DsaIndex's or the index front's MXFP4 query and keys, the FP32 DCP top-k over
+    sm_107's MXFP4 scorer's logits, against the stock DCP forward of the same step
+    (MXFP4 writers and scoring)."""
     mla_cache_ready(core)
     run_fp8_test(
         dsa.test_prepared_dsa_run_dcp_matches_stock,
@@ -849,7 +841,8 @@ def test_prepared_dsa_dcp16_mxfp4_graph(dcp8_group, mxfp4_layers, core, batch): 
 @pytest.mark.parametrize("batch", [8, 16])
 def test_prepared_dsa_dcp16_mxfp4_core(dcp8_group, mxfp4_layers, batch):  # noqa: F811
     """test_prepared_dsa_dcp_sparse_core at DL7's rows on an MXFP4 indexer cache:
-    the DSA sparse core (2x16s2) over the #63 merge's rows of the MXFP4 logits."""
+    the DSA sparse core (2x16s2) over the FP32 DCP top-k's rows of the MXFP4
+    logits."""
     test = dsa.test_prepared_dsa_dcp_sparse_core
     args = dict(dcp8_group=dcp8_group, batch=batch, variant="2x16s2", overlap=None)
     run_fp8_test(test, **args)
@@ -859,37 +852,35 @@ def test_prepared_dsa_dcp16_mxfp4_core(dcp8_group, mxfp4_layers, batch):  # noqa
 @pytest.mark.skip_global_cleanup  # the DCP16 group outlives each case
 @pytest.mark.parametrize("rows", ["short", "balanced"])
 @pytest.mark.parametrize("batch", [8, 16])
-def test_prepared_dsa_dcp16_mxfp4_core_exchange(
+def test_prepared_dsa_dcp16_mxfp4_core_rows(
     dcp8_group,  # noqa: F811
     mxfp4_layers,
-    monkeypatch,
     batch,
     rows,
 ):
-    """test_prepared_dsa_dcp_sparse_core_exchange on an MXFP4 indexer cache:
-    DcpExchange's top-k of the MXFP4 logits feeding the DSA core (its skewed case
-    shifts FP8 key scales, so it is not run here)."""
-    args = dict(dcp8_group=dcp8_group, monkeypatch=monkeypatch, overlap=None)
-    test = dsa.test_prepared_dsa_dcp_sparse_core_exchange
+    """test_prepared_dsa_dcp_sparse_core_rows on an MXFP4 indexer cache: the FP32
+    DCP top-k of the MXFP4 logits feeding the DSA core (its skewed case shifts FP8
+    key scales, so it is not run here)."""
+    args = dict(dcp8_group=dcp8_group, overlap=None)
+    test = dsa.test_prepared_dsa_dcp_sparse_core_rows
     run_fp8_test(test, **args, batch=batch, rows=rows)
 
 
 @DCP16
 @pytest.mark.skip_global_cleanup  # the DCP16 group outlives each case
-@pytest.mark.parametrize("batch,q", dsa.WIDE_EXCHANGE_CASES)
+@pytest.mark.parametrize("batch,q", dsa.WIDE_DCP_CASES)
 @pytest.mark.parametrize("core", ["fi-trtllm", "fi-nvfp4"])
-def test_wide_dsa_dcp16_mxfp4_exchange(
+def test_wide_dsa_dcp16_mxfp4(
     dcp8_group,  # noqa: F811
     mxfp4_layers,
-    monkeypatch,
     core,
     batch,
     q,
 ):
-    """test_wide_dsa_dcp_exchange on an MXFP4 indexer cache (FP8 or nvfp4_ds_mla
-    MLA cache): WideDsa's DsaIndex writes the MXFP4 query and keys, its indexer core
-    scores them (the MXFP4 query views and use_fp4_cache) and DcpExchange selects
-    from the MXFP4 logits, at C64's and DL3's wide rows."""
+    """test_wide_dsa_dcp on an MXFP4 indexer cache (FP8 or nvfp4_ds_mla MLA cache):
+    WideDsa's DsaIndex writes the MXFP4 query and keys, sm_107's MXFP4 scorer
+    scores them (the MXFP4 query views and use_fp4_cache) and the FP32 DCP top-k
+    selects, at C64's and DL3's wide rows."""
     mla_cache_ready(core)
-    args = dict(dcp8_group=dcp8_group, monkeypatch=monkeypatch, batch=batch, q=q)
-    run_fp8_test(dsa.test_wide_dsa_dcp_exchange, **args, core=core)
+    args = dict(dcp8_group=dcp8_group, batch=batch, q=q)
+    run_fp8_test(dsa.test_wide_dsa_dcp, **args, core=core)
