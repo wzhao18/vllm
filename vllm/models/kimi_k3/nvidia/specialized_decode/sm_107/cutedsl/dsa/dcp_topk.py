@@ -41,13 +41,10 @@ from .indexer import (
 )
 
 
-@asm(Uint32)
-def shared_fetch_add(pointer, value):
-    return (
-        "atom.shared.add.u32 $0, [$1], $2;",
-        "=r,r,r,~{memory}",
-        (pointer, Uint32(value)),
-    )
+@asm()
+def require_below(value, bound):
+    """Trap unless ``value`` < ``bound`` (signed)."""
+    return "{ .reg .pred p; setp.ge.s32 p,$0,$1; @p trap; }", "r,r", (value, bound)
 
 
 # 32-bit key digits from the top: (shift, width).
@@ -59,22 +56,25 @@ class DcpMerge:
     candidate words [world, rows, topk] (int32 pairs, rank-major) -> this rank's
     physical KV rows ``rows_out`` [rows, >= topk] (compacted, -1 after), their
     counts ``valid_out`` [rows] and, with ``emit_ids``, the selected global ids
-    ``ids_out`` [rows, topk] (-1 past the count; tests).
+    ``ids_out`` [rows, topk] (rank-major, each rank's in its candidate order; -1
+    past the count; tests).
 
     A word's high half is its score's order key (0: empty), its low half
     0xFFFFFFFF - its global id. Each thread keeps the score keys of its W * K /
     1024 words in registers: a radix select (11, 11, 10 bits) finds the K-th
     score and the ties at it to take; only when the ties outnumber them does a
-    second one over those ties' low halves (read again) pick the lowest ids."""
+    second one over those ties' low halves (read again) pick the lowest ids.
 
-    def __init__(self, rows, world, topk, interleave=1, emit_ids=False, release=True):
+    It never launches the next kernel early (PDL): every kernel after it reads its
+    rows or counts before its own PDL wait (FlashInfer's trtllm-gen and prims_ts
+    sparse MLA, prepared.HELD_KERNELS; the DSA sparse core polls first). A selected
+    key past the block table traps (fast or raise: never a silent -1 row)."""
+
+    def __init__(self, rows, world, topk, interleave=1, emit_ids=False):
         if topk % SELECT_THREADS:
             raise ValueError(f"DcpMerge: top-k {topk} not a multiple of 1024")
         self.rows, self.world, self.topk = rows, world, topk
         self.interleave, self.emit_ids = interleave, emit_ids
-        # release: launch the next kernel early (PDL); off before a kernel that
-        # reads before its PDL wait (the DSA sparse core polls its q tiles).
-        self.release = release
 
     @cute.jit
     def __call__(
@@ -165,11 +165,8 @@ class DcpMerge:
         hist = smem.allocate_tensor(Uint32, cute.make_layout(2048), 16)
         scan = smem.allocate_tensor(Uint32, cute.make_layout(SELECT_WARPS), 16)
         info = smem.allocate_tensor(Int32, cute.make_layout(16), 16)
-        fill = smem.allocate_tensor(Uint32, cute.make_layout(1), 16)
         sm = hist, scan, info
-        cute.arch.griddepcontrol_wait()
-        if cutlass.const_expr(self.release):
-            cute.arch.griddepcontrol_launch_dependents()
+        cute.arch.griddepcontrol_wait()  # (no early launch: see the class doc)
         # Item i of this thread: rank i // per_rank, candidate (i % per_rank) x
         # 1024 + tid (coalesced). Its score key only.
         keys = []
@@ -181,8 +178,6 @@ class DcpMerge:
             keys.append(key)
             if key != Uint32(0):
                 mine += Uint32(1)
-        if tid == 0:
-            fill[0] = Uint32(0)
         _, total = block_exclusive(mine, scan, warp, lane)
         # The selection: score key > T, or == T with low half >= L (every nonzero
         # word when at most K are: T = 0, L = 0).
@@ -209,10 +204,9 @@ class DcpMerge:
                 span: cutlass.Constexpr = self.interleave
                 local = (gid // (span * W)) * span + gid % span
                 block = local // block_size
-                slot = Int32(-1)
-                if block < table[2]:
-                    page = table_entry(table, req_id[row], block)
-                    slot = page * stride_rows + local % block_size
+                require_below(block, table[2])  # a key past the block table
+                page = table_entry(table, req_id[row], block)
+                slot = page * stride_rows + local % block_size
                 rows_out[row, Int32(base + pos)] = slot
             base += n
         base = cutlass.min(base, Uint32(K))
@@ -221,17 +215,20 @@ class DcpMerge:
         for e in cutlass.range(Int32(base) + tid, K, SELECT_THREADS, unroll=1):
             rows_out[row, e] = Int32(-1)
         if cutlass.const_expr(self.emit_ids):
+            # Deterministic: rank-major, each rank's candidates in order.
+            filled = Uint32(0)
             for i in cutlass.range_constexpr(count):
                 j = (i % per_rank) * SELECT_THREADS + tid
                 at = self.address(gathered, i // per_rank, row, j)
                 lo = Uint32(load_words(at, count=1)[0])
-                if self.selected(keys[i], lo, threshold, low) != Uint32(0):
-                    pos = shared_fetch_add(fill.iterator, 1)
-                    if pos < Uint32(K):
-                        ids_out[row, Int32(pos)] = Int32(Uint32(0xFFFFFFFF) - lo)
-            cute.arch.sync_threads()
-            filled = cutlass.min(Int32(fill[0]), Int32(K))
-            for e in cutlass.range(filled + tid, K, SELECT_THREADS, unroll=1):
+                take = self.selected(keys[i], lo, threshold, low)
+                pos, n = block_exclusive(take, scan, warp, lane)
+                if take != Uint32(0) and filled + pos < Uint32(K):
+                    gid = Int32(Uint32(0xFFFFFFFF) - lo)
+                    ids_out[row, Int32(filled + pos)] = gid
+                filled += n
+            filled = cutlass.min(filled, Uint32(K))
+            for e in cutlass.range(Int32(filled) + tid, K, SELECT_THREADS, unroll=1):
                 ids_out[row, e] = Int32(-1)
 
     @cute.jit
@@ -247,8 +244,8 @@ class DcpMerge:
 
 
 @functools.cache
-def compile_merge(rows, world, topk, interleave, emit_ids, device, release=True):
-    merge = DcpMerge(rows, world, topk, interleave, emit_ids, release)
+def compile_merge(rows, world, topk, interleave, emit_ids, device):
+    merge = DcpMerge(rows, world, topk, interleave, emit_ids)
     with torch.accelerator.device_index(device):
         req = fake((rows,), (1,), torch.int32, 4)
         out = fake((rows, topk), (topk, 1), torch.int32, 4)
@@ -287,11 +284,11 @@ class DcpTopk:
         self.dummy = torch.zeros(1, dtype=torch.int32, device=device)
         self.candidates = candidate_rows(device, max_rows, topk)
 
-    def warm(self, rows, emit_ids=False, release=True):
+    def warm(self, rows, emit_ids=False):
         """Compile ``run``'s kernels for steps of ``rows`` rows now (a first compile
         inside a CUDA graph capture invalidates it)."""
         self.check_rows(rows)
-        self.kernels(rows, emit_ids, release)
+        self.kernels(rows, emit_ids)
 
     def check_rows(self, rows):
         """The select and merge grids write ``rows`` rows of the shared candidates."""
@@ -306,14 +303,16 @@ class DcpTopk:
         span = self._interleave
         return int(span() if callable(span) else span)
 
-    def kernels(self, rows, emit_ids, release=True):
+    def kernels(self, rows, emit_ids):
         index = self.device.index
         args = self.topk, "candidates", index, 1
+        # The select does not launch the all-gather early either (a collective
+        # kernel need not wait on PDL).
         select = compile_select(
-            rows, 1, *args, world=self.world, interleave=self.interleave
+            rows, 1, *args, release=False, world=self.world, interleave=self.interleave
         )
         merge = compile_merge(
-            rows, self.world, self.topk, self.interleave, emit_ids, index, release
+            rows, self.world, self.topk, self.interleave, emit_ids, index
         )
         return select, merge
 
@@ -336,15 +335,14 @@ class DcpTopk:
         rows_out,
         valid_out,
         ids_out=None,
-        release=True,
     ):
         """``logits`` [>= the rows with keys, >= max(row_ends)] FP32 (16-byte
         aligned rows): this rank's local keys; ``row_ends`` [rows] int32 their
         counts per row (0: a row past the step's requests, its logits unread);
         ``req_id`` / ``block_table`` / ``block_size`` / ``stride_rows``: the MLA
         layer's metadata and flat KV row stride. Writes ``rows_out`` [rows, >= K],
-        ``valid_out`` [rows] and (tests) ``ids_out`` [rows, K]. ``release``: the
-        merge launches the next kernel early (PDL)."""
+        ``valid_out`` [rows] and (tests) ``ids_out`` [rows, K]. Nothing after it
+        starts before it has finished (no early PDL launch)."""
         rows = row_ends.shape[0]
         self.check_rows(rows)
         if rows_out.shape[0] < rows or valid_out.shape[0] < rows:
@@ -357,7 +355,7 @@ class DcpTopk:
             raise ValueError("DCP top-k: contiguous block table rows, K-wide rows_out")
         if ids_out is not None and ids_out.stride(0) != self.topk:
             raise ValueError("DCP top-k: K-wide ids_out")
-        select, merge = self.kernels(rows, ids_out is not None, release)
+        select, merge = self.kernels(rows, ids_out is not None)
         candidates = self.candidates[:rows]
         s = stream(self.device)
         dummy = to_cute(self.dummy, 4)

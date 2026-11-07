@@ -658,17 +658,21 @@ def check_new_mla_rows(ours, theirs, kv):
 
 
 def check_fp4_layer_step(step, q, reference=True):
-    """check_layer_step on an MXFP4 indexer cache: the top-k overlap with stock
-    0.03 looser (a query value the two paths round differently moves by an E2M1
-    step, as #130's MXFP4 DSA layer tests relax it), and the new tokens' indexer
-    keys as MXFP4 rows: the UE8M0 scales exact, the E2M1 codes within one step
-    where the LayerNorm rounds differently, every other byte as it was."""
+    """check_layer_step on an MXFP4 indexer cache: our top-k is the exact top-k of
+    the FP32 logits of the same MXFP4 query and keys (fp4_exact_topk_widths; the
+    scorer is DeepGEMM's FP32 kind::mxf4 MMA and head sum, so only the q . k
+    order differs: far below one BF16 step, as on FP8 keys); the top-k overlap
+    with stock 0.03 looser (stock's query, not ours: a query value the two paths
+    round differently moves by an E2M1 step, as #130's MXFP4 DSA layer tests
+    relax it), and the new tokens' indexer keys as MXFP4 rows: the UE8M0 scales
+    exact, the E2M1 codes within one step where the LayerNorm rounds
+    differently, every other byte as it was."""
     if step.width is not None:
         print(
-            f"top-k vs exact (BF16 steps): ours {step.width:.2f} stock (vs our "
+            f"top-k vs exact (BF16 steps): ours {step.width:.4f} stock (vs our "
             f"query) {step.stock_width:.2f}"
         )
-        assert step.width <= 2.0, step.width
+        assert step.width <= 0.05, step.width
     same = []
     for t in range(step.topk.shape[0]):
         a, b = set(step.stock_topk[t].tolist()), set(step.topk[t].tolist())

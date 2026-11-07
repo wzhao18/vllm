@@ -240,14 +240,22 @@ class PreparedDsa:
             )
         self.box, self.parity = dcp, parity
         # The DcpBox mailboxes hold cap rows: a wider batch would store past them.
-        assert dcp is None or max(pitches) <= dcp.cap, (max(pitches), dcp.cap)
+        if dcp is not None and max(pitches) > dcp.cap:
+            raise ValueError(
+                f"Kimi K3.1 specialized DSA: {max(pitches)} rows past the DcpBox "
+                f"mailboxes' {dcp.cap}"
+            )
         self.dcp = dcp.size if dcp is not None else 1
         if dcp is None and not self.fp8:
             # The base FlashMLASparseImpl derives its padded decode heads per call.
             padded = type(self.impl)._compute_fp8_decode_padded_heads(
                 self.impl.num_heads
             )
-            assert padded == QUERY_HEADS
+            if padded != QUERY_HEADS:
+                raise ValueError(
+                    f"Kimi K3.1 specialized DSA: FlashMLA pads to {padded} decode "
+                    f"heads, the query stage to {QUERY_HEADS}"
+                )
         self.heads = layer.W_UK_T.shape[0]
         self.device, self.pitches = layer.W_UK_T.device, pitches
         *shared, fi = scratch
@@ -339,10 +347,9 @@ class PreparedDsa:
         self.core_excluded: dict = {}
         dsac = getattr(self.indexer, "dsac", None)
         if dsac is not None and self.fi is not None and local_topk and self.dcp > 1:
+            # (The core polls its q tiles before its PDL wait: the DCP merge
+            # before it never launches it early, as for FlashInfer's kernels.)
             self.dsac = dsac
-            # The core polls its q tiles before its PDL wait: the DCP merge before
-            # it does not launch it early.
-            self.indexer_stage.release = False
         # VLLM_K31_DSA_CORE_STATS=1: each step's largest local count of the merge
         # (dsa_core.decode.CountStats), with the core on or off.
         self.count_stats = None
@@ -488,7 +495,8 @@ class PreparedDsa:
             proj = [b for b in sorted(self.pitches) if box.mailbox(b).format != "bf16"]
             memory = ""
             if proj:
-                assert self.uv_gathered is not None
+                if self.uv_gathered is None:
+                    raise RuntimeError("Kimi K3.1 DSA: proj partials without W_UV")
                 mail = box.mailbox(proj[0])
                 mailbox = (mail.partial.nbytes + mail.lse.nbytes) / 2**20
                 weights = self.uv_gathered[0].nbytes / 2**20
@@ -601,7 +609,8 @@ class PreparedDsa:
         check_head_weights(stage.head_w)
         args = stage.q_fp8, stage.head_w, decode.decode, metadata.block_table
         rows, valid = self.fused.run(*args, block_rows, batch, q)
-        assert self.fi is not None
+        if self.fi is None:
+            raise RuntimeError("Kimi K3.1 specialized DSA: the fused TP step on FlashMLA")
         if join is not None:
             join()
         query = self.query[:batch]
@@ -732,7 +741,8 @@ class PreparedDsa:
         uv = stage.views[4]
         if sparse is not None:  # the DSA sparse core, then DcpValue(pushed)
             self.sparse_dcp_core(sparse, cache, metadata, batch, q, join)
-            assert box.mailbox(batch).format == "bf16"
+            if box.mailbox(batch).format != "bf16":
+                raise RuntimeError("Kimi K3.1 DSA sparse core: proj partials")
             buffers = self.fi.latent, self.fi.lse
             args = sparse[1], box, p, publish, self.heads, buffers, lengths[:reqs], uv
             return run_core_value(*args, projected, out)

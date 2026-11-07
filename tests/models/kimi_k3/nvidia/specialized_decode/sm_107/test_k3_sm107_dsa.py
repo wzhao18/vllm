@@ -2366,7 +2366,8 @@ def run_layer_step(
     must give the eager step's rows bit for bit. ``sparse_core``: under DCP, the DSA
     sparse core's variant (dsa_core.decode.parse_variant) at every row, as
     VLLM_K31_DSA_CORE=1 serves it (its own pushes and DcpValue(pushed); with
-    ``graph`` the merge's rows and counts are still poisoned before each layer).
+    ``graph`` the merge's rows and counts are still poisoned before each layer),
+    and the step again on FlashInfer's chain over the same rows (``chain_out``).
     Under DCP the top-k is the FP32 DCP top-k (every rank's local top-K, the
     all-gather and the exact merge), which also writes the global ids for the
     checks. ``skew``: the first half of the ranks score their old keys 2^SKEW_EXP
@@ -2537,6 +2538,15 @@ def run_layer_step(
                 attn, {batch: packed.shape[0]}, scratch_rows, **policy, parity=1
             )
             layers.append(second.prepare_cache(ours_mla))
+        chain = chain_out = None
+        if sparse_core is not None:
+            # The step on FlashInfer's chain (the other parity, as the next layer,
+            # its core off) over the same FP32 DCP top-k's rows: every row of the
+            # core's output is checked against it, not only the stock top-k's.
+            chain = PreparedDsa(
+                attn, {batch: packed.shape[0]}, scratch_rows, **policy, parity=1
+            )
+            chain.prepare_cache(ours_mla).core_step = lambda *_: None
         # prims_ts' plans share one workspace (attn_fi._Plans): each decode runs
         # on the stream the layer runs on, never on a query overlap side stream.
         layer_streams: list = []
@@ -2600,6 +2610,9 @@ def run_layer_step(
                 counts = merge.dcp_valid[:batch].clone()
                 rank_counts = get_dcp_group().all_gather(counts, dim=0)
                 rank_counts = rank_counts.view(world, batch)
+            if chain is not None:
+                chain_out = torch.full_like(out, float("nan"))
+                run(chain, chain_out)
             if graph and world > 1:
                 from vllm.distributed.parallel_state import graph_capture
 
@@ -2698,6 +2711,7 @@ def run_layer_step(
         prims_ts_calls=len(prims_ts_streams),
         core_calls=core_calls,
         rank_counts=rank_counts,
+        chain_out=chain_out,
         lengths=torch.tensor([c + j + 1 for c in contexts for j in range(q)]),
     )
 
@@ -3278,10 +3292,12 @@ def test_prepared_dsa_run_dcp_matches_stock(
 ):
     """PreparedDsa.run under DCP8 (12 local heads of 96, interleave 1) with the
     real mailboxes across two nodes: the query publishes into every rank's q
-    mailbox, the one-round DCP top-k merge (#63) gives this rank's rows of the
-    global top-k, FlashInfer decodes the 96 gathered heads over the local shard
-    and DcpValue merges this rank's heads, as the stock DCP forward of the same
-    step on every rank (whose indexer runs the same merge): the gated attention
+    mailbox, the FP32 DCP top-k (every rank's exact local top-K of the scorer's
+    FP32 logits, the all-gather and DcpMerge; stock's FP32 rule, no one-round #63
+    merge) gives this rank's rows of the global top-k, FlashInfer decodes the 96
+    gathered heads over the local shard and DcpValue merges this rank's heads, as
+    the stock DCP forward of the same step on every rank (whose indexer runs
+    _merge_dcp_topk_global on its FP32 logits): the gated attention
     rows entering o_proj, the global top-k and this rank's rows of it, the
     inserted rows of this rank's tokens and every other cache byte; with the q
     mailbox polled by MlaQuery ("serial"), or by QueryWait after the indexer
@@ -3330,7 +3346,7 @@ def test_prepared_dsa_dcp_sparse_core(dcp8_group, batch, variant, overlap):
     """The DSA sparse core (VLLM_K31_DSA_CORE) on PreparedDsa's DCP steps at q8 (the
     DL7 rows of C1 and C8; under the KIMI_K3_SD_DCP16_INIT launch DCP16): every
     rank's core polls the q mailbox (rank 0's forked publish held back), decodes
-    the 96 gathered heads over its rows of the #63 merge and pushes them to their
+    the 96 gathered heads over its rows of the FP32 DCP top-k and pushes them to their
     owners, whose DcpValue(pushed) merges, as the stock DCP forward of the step
     (check_layer_step); in a CUDA graph of two layers on alternating parities with
     the merge's rows and counts poisoned before each, 200 replays finish with the
@@ -3424,6 +3440,9 @@ def test_prepared_dsa_dcp_sparse_core_rows(dcp8_group, batch, rows, overlap):
         skew=rows == "skewed",
     )
     check_layer_step(step, 8, reference=False)
+    # Every row (the stock top-k's or not): the core's output is FlashInfer's chain
+    # over the same rows.
+    torch.testing.assert_close(step.out, step.chain_out, atol=2e-2, rtol=2e-2)
     same = [
         set(step.topk[t].tolist()) == set(step.stock_topk[t].tolist())
         for t in range(batch)
@@ -3833,7 +3852,10 @@ def stock_dcp_merge(local_logits, ends, rank, world, interleave, topk):
     lengths ``ends[r]``), each rank's local top-K exact (ties to the lowest local
     index), as one GPU sees it: its CuTe DSL packer, the rank-major stack the
     all-gather gives, and its stable selector at 32 score bits (FP32 logits) ->
-    the global ids [rows, K] (-1 padding)."""
+    the global ids [rows, K] (-1 padding). The local top-K is the exact one, not
+    stock's local top-k op: this is evidence for the merge stage; the layer tests
+    (test_prepared_dsa_run_dcp_matches_stock, test_wide_dsa_dcp) compare the whole
+    DCP step with the real stock forward."""
     from vllm.model_executor.kernels.attention.dsa.dcp_indexer_cutedsl import (
         dcp_topk_score_bits,
         pack_dcp_topk_candidates_cutedsl,

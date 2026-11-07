@@ -52,9 +52,6 @@ class IndexerStage:
         self.dcp = None
         # Optional [>= rows, K] int32: the merge also writes the global ids (tests).
         self.dcp_ids: torch.Tensor | None = None
-        # DcpMerge launches the next kernel early (PDL); off before a kernel that
-        # reads before its PDL wait (the DSA sparse core: PreparedDsa).
-        self.release = True
         self.max_rows = rows
         if self.local_topk:
             from .dcp_topk import DcpTopk
@@ -114,7 +111,7 @@ class IndexerStage:
         before any CUDA graph capture (a first compile there invalidates it)."""
         for r in rows:
             if self.dcp is not None:
-                self.dcp.warm(r, self.dcp_ids is not None, self.release)
+                self.dcp.warm(r, self.dcp_ids is not None)
 
     def merge_rows(self, q_fp8, head_w, metadata, stride_rows, batch, q=1):
         """DCP: this rank's flat KV rows of the exact global top-k of the first
@@ -140,7 +137,6 @@ class IndexerStage:
             slots,
             valid,
             ids,
-            release=self.release,
         )
         return slots, valid
 
