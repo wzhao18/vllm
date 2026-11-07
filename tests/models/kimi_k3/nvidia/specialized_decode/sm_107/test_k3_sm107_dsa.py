@@ -37,6 +37,17 @@ pytestmark = [
 NOT_PORTED = pytest.mark.skip(reason="round 1 keeps its own runtime / MLA / AttnRes")
 
 
+def _has_deep_gemm():
+    from vllm.utils.deep_gemm import has_deep_gemm
+
+    return current_platform.is_device_capability_family(100) and has_deep_gemm()
+
+
+DEEPGEMM = pytest.mark.skipif(
+    not _has_deep_gemm(), reason="DeepGEMM MX-scaled MQA logits need SM100"
+)
+
+
 def init_sm107_dcp_topk_merge(config, topk):
     """The DCP top-k merge as the SM107 model build sets it up: the stock indexer's
     N (``KimiK3DSAIndexer.__init__``: stock ``init_dcp_topk_merge``), then the sm_107
@@ -551,7 +562,7 @@ def test_indexer_inputs(batch, gap):
     )
     _, index_kernel, _ = kernels(batch, mla, index, *weights)
     q_fp8 = torch.zeros(batch, 32, 128, device=dev, dtype=torch.uint8)
-    head_w = torch.zeros(batch, 32, device=dev, dtype=bf)
+    head_w = torch.zeros(batch, 32, device=dev, dtype=torch.float32)
     args = (to_cute(projected), to_cute(iq), to_cute(norm_w, 4), to_cute(norm_b, 4))
     args += (to_cute(index), to_cute(slots, 8), to_cute(q_fp8), to_cute(head_w, 4))
     index_kernel(*args, cutlass.Float32(EPS), stream(dev))
@@ -564,8 +575,9 @@ def test_indexer_inputs(batch, gap):
         32,
     )
     assert torch.equal(q_fp8, ref_q.view(torch.uint8))
-    # The stock decode casts the FP32 weights to BF16 for SM100's MQA logits.
-    torch.testing.assert_close(head_w, ref_w.to(bf), atol=0, rtol=0)
+    # Stock Kimi K3 keeps the folded head weights FP32 (its MQA logits are FP32).
+    assert head_w.dtype == ref_w.dtype == torch.float32
+    assert torch.equal(head_w, ref_w)
 
     stock = packed_cache(8, UNIT, INDEX_ROW, gap)
     topk = torch.empty(batch, 2048, device=dev, dtype=torch.int32)
@@ -747,7 +759,7 @@ def test_index_front(batch, kernel_kind):
     finally:
         query_stage.FRONT_KERNEL = saved
     q_fp8 = torch.zeros(batch, 32, 128, device=dev, dtype=torch.uint8)
-    head_w = torch.zeros(batch, 32, device=dev, dtype=bf)
+    head_w = torch.zeros(batch, 32, device=dev, dtype=torch.float32)
     q_c = rms_norm(projected[:, :1536], q_norm)
     args = (to_cute(projected),)
     weights = to_cute(wq)
@@ -775,7 +787,7 @@ def test_index_front(batch, kernel_kind):
     # of two (448 * 2^k) takes the other scale (codes move by a binade, the weight
     # by 2x), and near-zero values move by a few codes where the q_a RMSNorm rounds
     # a q_c element differently from the reference's (rare: hundreds of rows).
-    ref_w = ref_w.to(bf)
+    assert ref_w.dtype == head_w.dtype == torch.float32  # stock K3: FP32 weights
     flipped = (head_w.float() == 2 * ref_w.float()) | (
         2 * head_w.float() == ref_w.float()
     )
@@ -814,15 +826,20 @@ def test_index_front(batch, kernel_kind):
     assert (index_blocks(index) != index_blocks(stock)).float().mean() < 1e-3
 
 
-def order16(bits):
-    """The order-preserving 16-bit key of BF16 bits (int32 tensor)."""
-    bits = bits & 0xFFFF
-    return torch.where(bits & 0x8000 != 0, bits ^ 0xFFFF, bits ^ 0x8000)
+def order32(bits):
+    """The order-preserving 32-bit key of FP32 bits (an int64 tensor of the bits)."""
+    bits = bits & 0xFFFFFFFF
+    return torch.where(bits >= 0x80000000, bits ^ 0xFFFFFFFF, bits ^ 0x80000000)
+
+
+def fp32_keys(logits):
+    """order32 of FP32 ``logits``."""
+    return order32(logits.contiguous().view(torch.int32).long())
 
 
 FUSED_INDEXER_CASES = {
     # (contexts, q): every row within the top-k (the bypass) or not, ragged
-    # batches, rows past 16K vectors, past the shared vector maxima (512K keys),
+    # batches, rows past 16K vectors, past the shared vector maxima (256K keys),
     # and tie-heavy logits (integer queries and keys).
     "short": ([1500, 300], 5),
     "boundary": ([2046, 2047, 2048, 2049], 1),
@@ -843,7 +860,7 @@ FUSED_INDEXER_CASES = {
 def fused_indexer_inputs(contexts, q, gap, ties, seed):
     """A packed indexer cache of random FP8 keys and UE8M0 scales under a random
     block table, the per-row ends (row j of a request sees ``context + 1 + j``
-    keys), the FP8 query and BF16 head weights."""
+    keys), the FP8 query and FP32 head weights (stock Kimi K3's)."""
     gen = torch.Generator(device="cuda").manual_seed(seed)
     pages = [-(-(c + q) // UNIT) for c in contexts]
     blocks = sum(pages) + 3
@@ -866,7 +883,9 @@ def fused_indexer_inputs(contexts, q, gap, ties, seed):
     rows = max(64, len(contexts) * q)
     query = torch.randn(rows, 32, 128, device="cuda", generator=gen)
     query = (query.round() if ties else query * 0.5).to(torch.float8_e4m3fn)
-    weights = (torch.randn(rows, 32, device="cuda", generator=gen) * 0.1).bfloat16()
+    weights = torch.randn(rows, 32, device="cuda", generator=gen) * 0.1
+    if ties:  # exact in few bits: the head sums tie
+        weights = (weights * 64).round() / 64
     return SimpleNamespace(
         index=index,
         keys=keys,
@@ -880,60 +899,94 @@ def fused_indexer_inputs(contexts, q, gap, ties, seed):
 
 
 def deepgemm_head_sum(score, weights):
-    """Stock's (DeepGEMM SM100 paged MQA logits) head sum of ``score`` [H, L] =
-    relu(q . k) in FP32 and the BF16 ``weights`` [H]: each head's value rounded
-    to BF16, four BF16 accumulators (heads h = j mod 4) by BF16 FMAs, then BF16
-    adds (0 + 2, 1 + 3, then the two). Returns FP32 [L] (BF16 values)."""
-    bf = torch.bfloat16
-    v, w = score.to(bf).double(), weights.to(bf).double()
+    """Stock's (DeepGEMM SM100 paged MQA logits, FP32 weights and logits) head sum
+    of ``score`` [H, L] = relu(q . k) in FP32 and the FP32 ``weights`` [H]: four
+    FP32 FMA chains (heads h = j mod 4, in head order) of 2 relu(x) * w, then
+    (s0 + s2) + (s1 + s3), halved (sm100_mqa_logits.cuh, kIsFP32Reduce). Returns
+    FP32 [L]. Each FMA is evaluated in FP64 then rounded (exact but for rare double
+    roundings)."""
+    v, w = score.float(), weights.float()
     acc = [torch.zeros_like(v[0]) for _ in range(4)]
     for h in range(v.shape[0]):
-        acc[h % 4] = (acc[h % 4] + v[h] * w[h]).float().to(bf).double()
-    lo = (acc[0] + acc[2]).float().to(bf).double()
-    hi = (acc[1] + acc[3]).float().to(bf).double()
-    return (lo + hi).float().to(bf).float()
+        term = (2 * v[h]).double() * float(w[h])
+        acc[h % 4] = (term + acc[h % 4].double()).float()
+    return ((acc[0] + acc[2]) + (acc[1] + acc[3])) * 0.5
 
 
 def check_fused_logits(got, x, t, r, length):
-    """Row ``t`` (request ``r``) of the fused scorer's BF16 logits (int16 bits),
-    against stock's precision (deepgemm_head_sum) over the dequantized keys: equal
-    up to the FP32 q . k summation order (a BF16 rounding of a head's value or of
-    an accumulator may flip)."""
+    """Row ``t`` (request ``r``) of the fused scorer's FP32 logits against stock's
+    precision (deepgemm_head_sum) over the dequantized keys: equal up to the FP32
+    q . k summation order of the MMA (no value is rounded to BF16)."""
     if length == 0:  # a padded row: nothing scored
         return
+    got = got.view(torch.float32)
     pos = torch.arange(length, device="cuda")
     blk = x.table[r][pos // UNIT].long()
     k = x.keys[blk, pos % UNIT].float()
     scale = torch.exp2(x.exps[blk, pos % UNIT].float() - 127)
     score = torch.relu(x.query[t].float() @ k.T)
     ref = deepgemm_head_sum(score, x.weights[t]) * scale
-    got_f = ((got.int() & 0xFFFF) << 16).view(torch.float32)
-    # A few BF16 steps of the largest |term| where roundings flip; mostly equal.
-    terms = (score.to(torch.bfloat16).float() * x.weights[t].float()[:, None]).abs()
-    bound = terms.amax(0) * scale * 2**-6 + 1e-30
-    assert bool(((got_f - ref).abs() <= bound).all()), t
-    assert (got_f == ref).float().mean() > 0.95, t
+    terms = (score * x.weights[t].float()[:, None]).abs().sum(0) * scale
+    bound = terms * 2**-18 + 1e-30
+    assert bool(((got - ref).abs() <= bound).all()), t
+    assert (got == ref).float().mean() > 0.9, t
 
 
-def exact_topk(bits, k):
-    """Key indices of the top ``k`` of BF16 ``bits`` (ties to the lowest index),
+def deepgemm_logits(x, ends, q, rows):
+    """Real stock logits (DeepGEMM fp8_fp4_paged_mqa_logits, FP32 weights and
+    logits, as KimiK3DSAIndexer on main) of the first ``rows`` rows of
+    fused_indexer_inputs ``x`` (a contiguous indexer cache), each row its own
+    varlen request."""
+    from vllm.model_executor.layers.sparse_attn_indexer import kv_cache_as_quant_view
+    from vllm.utils.deep_gemm import (
+        fp8_fp4_paged_mqa_logits,
+        get_num_sms,
+        get_paged_mqa_logits_metadata,
+        mqa_logits_mx_inputs,
+    )
+
+    table = x.table.repeat_interleave(q, 0)[:rows].contiguous()
+    context = ends[:rows].view(-1, 1).contiguous()
+    indices = torch.arange(rows, dtype=torch.int32, device="cuda")
+    schedule = get_paged_mqa_logits_metadata(context, UNIT, get_num_sms(), indices)
+    query = x.query[:rows].view(rows, 1, 32, 128)
+    q_scale, weights = mqa_logits_mx_inputs(
+        query, None, x.weights[:rows], torch.float32
+    )
+    assert weights.dtype == torch.float32
+    width = -(-int(ends.max()) // 256) * 256
+    return fp8_fp4_paged_mqa_logits(
+        (query, q_scale),
+        kv_cache_as_quant_view(x.index, 128, False),
+        weights,
+        context,
+        table,
+        schedule,
+        max_model_len=width,
+        logits_dtype=torch.float32,
+        indices=indices,
+    )
+
+
+def exact_topk(logits, k):
+    """Key indices of the top ``k`` of FP32 ``logits`` (ties to the lowest index),
     in key order."""
-    pos = torch.arange(bits.shape[0], device=bits.device)
-    key = order16(bits.int()).long() << 32 | (2**32 - 1 - pos)
-    return torch.topk(key, min(k, bits.shape[0])).indices.sort().values
+    pos = torch.arange(logits.shape[0], device=logits.device)
+    # (order key - 2^31: the int64 key stays signed-ordered)
+    key = (fp32_keys(logits) - 2**31) << 32 | (2**32 - 1 - pos)
+    return torch.topk(key, min(k, logits.shape[0])).indices.sort().values
 
 
 @pytest.mark.parametrize("mla_page", [UNIT, 2048])
 @pytest.mark.parametrize("gap", [GAP, FAR])
 @pytest.mark.parametrize("case", list(FUSED_INDEXER_CASES))
 def test_fused_indexer_selects_exact_topk(case, gap, mla_page):
-    """The fused decode indexer (TP): its BF16 logits at stock's precision
-    (deepgemm_head_sum) over the dequantized keys, up to BF16 rounding flips of the
-    FP32 q . k order, and its selection exactly the
-    top-2048 of its own logits (ties to the lowest key index), as the MLA cache's
-    physical rows in key order, -1 past the count, with the counts. ``mla_page``:
-    the MLA cache's tokens per block (2048: the hybrid model's attention pages,
-    with 64-token indexer pages)."""
+    """The fused decode indexer (TP): its FP32 logits at stock's precision
+    (deepgemm_head_sum) over the dequantized keys, up to the FP32 q . k order, and
+    its selection exactly the top-2048 of its own FP32 logits (ties to the lowest
+    key index), as the MLA cache's physical rows in key order, -1 past the count,
+    with the counts. ``mla_page``: the MLA cache's tokens per block (2048: the
+    hybrid model's attention pages, with 64-token indexer pages)."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.indexer import (
         FusedIndexer,
     )
@@ -975,7 +1028,7 @@ def test_fused_indexer_selects_exact_topk(case, gap, mla_page):
             # This row's logits in the request-compact scratch, against stock's
             # precision (deepgemm_head_sum).
             base = (sum(tiles[:r]) * q + j * tiles[r]) * 128
-            got = fused.logits[base : base + length]
+            got = fused.logits[base : base + length].view(torch.float32)
             check_fused_logits(got, x, t, r, length)
             if length > topk:
                 pos = exact_topk(got, topk)
@@ -988,13 +1041,64 @@ def test_fused_indexer_selects_exact_topk(case, gap, mla_page):
         assert bool((out[t, n:] == -1).all()) and bool((ids[t, n:] == -1).all())
 
 
+@DEEPGEMM
+@pytest.mark.parametrize("case", ["mixed", "long", "ties", "q1_64", "wide240"])
+def test_fused_indexer_logits_match_deepgemm(case):
+    """The fused scorer's FP32 logits against main's stock Kimi K3 logits (DeepGEMM
+    fp8_fp4_paged_mqa_logits, FP32 head weights and logits) of the same FP8 query,
+    head weights and cache: the same per-head FP32 reduction (no BF16 rounding),
+    so bit-equal, and the fused top-k is the exact top-k of DeepGEMM's logits
+    (ties to the lowest key index)."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.indexer import (
+        FusedIndexer,
+    )
+
+    contexts, q = FUSED_INDEXER_CASES[case]
+    x = fused_indexer_inputs(contexts, q, 0, case == "ties", len(contexts) * 13 + q)
+    rows, topk = len(contexts) * q, 2048
+    decode = SimpleNamespace(
+        seq_lens=x.ends.view(rows, 1), block_table=x.table.repeat_interleave(q, 0)
+    )
+    indexer = SimpleNamespace(
+        k_cache=SimpleNamespace(kv_cache=x.index),
+        topk_tokens=topk,
+        max_model_len=1 << 20,
+    )
+    cap = max(64, rows)
+    fused = FusedIndexer(indexer, [(rows, q)], torch.device("cuda"), cap)
+    ids = torch.full((cap, topk), -7, dtype=torch.int32, device="cuda")
+    fused.write_ids(ids)
+    pages = max(contexts) // UNIT + 2  # the MLA cache's (64-token pages)
+    table = torch.arange(len(contexts) * pages, device="cuda", dtype=torch.int32)
+    args = x.query.view(torch.uint8), x.weights, decode, table.view(len(contexts), -1)
+    fused.run(*args, UNIT, rows, q)
+    stock = deepgemm_logits(x, x.ends, q, rows)
+    torch.accelerator.synchronize()
+    tiles = [-(-c // 128) if c > topk else 0 for c in x.ends[q - 1 :: q].tolist()]
+    equal = total = 0
+    for t in range(rows):
+        r, j, length = t // q, t % q, int(x.ends[t])
+        if not tiles[r]:
+            continue
+        base = (sum(tiles[:r]) * q + j * tiles[r]) * 128
+        got = fused.logits[base : base + length].view(torch.float32)
+        ref = stock[t, :length]
+        assert ref.dtype == torch.float32
+        equal += int((got.view(torch.int32) == ref.view(torch.int32)).sum())
+        total += length
+        if length > topk:
+            assert torch.equal(ids[t].long(), exact_topk(ref, topk)), t
+    print(f"{case}: {equal}/{total} logits bit-equal to DeepGEMM's")
+    # Measured on VR: every logit bit-equal (the same FP32 reduction order).
+    assert equal == total
+
+
 DCP_INDEXER_CASES = {
-    # (local contexts of one rank, q) around N = 384 local candidates: every row
-    # within N (the bypass) or not, the dense and the vector-maxima paths (6K
-    # keys), local indices past 2^16 (the B' bit plane), tie-heavy logits,
-    # 64 rows, and a CUDA-graph padding request.
+    # (local contexts of one rank, q): every row within the top-k (the bypass) or
+    # not, the dense and the vector-maxima paths, tie-heavy logits, 64 rows, a
+    # CUDA-graph padding request, and wide rows.
     "short": ([100, 300], 5),
-    "boundary": ([382, 383, 384, 385], 1),
+    "boundary": ([2046, 2047, 2048, 2049], 1),
     "mixed": ([700, 40, 1100, 4100], 5),
     "uniform": ([4000] * 12, 5),
     "long": ([16400, 9000, 400, 6200], 5),
@@ -1002,36 +1106,88 @@ DCP_INDEXER_CASES = {
     "ties": ([6000, 4000, 500], 5),
     "q1_64": ([500 + 97 * r for r in range(64)], 1),
     "padded": ([5000, 400, 0], 5),
-    # Past 64 rows: 145 (the packed select's last width, one CTA per SM) and
-    # 320 rows (the scorer only: the merge's DeepSelect takes the local top-N).
     "wide145": ([1100 + 37 * r for r in range(29)], 5),
     "wide320": ([2000 + 23 * r for r in range(64)], 5),
 }
 
+# One DCP16 rank's local contexts (interleave 1: ~1/16 of each request's), q8.
+DCP16_INDEXER_CASES = {
+    "c1": [11200],  # C1: one request at ~178K
+    "c8": [10000 + 997 * r for r in range(8)],  # C8: eight requests at ~160-270K
+    "short": [100, 150],  # every row within the top-k (the bypass)
+    "boundary": [2040, 2041, 2047, 2048],  # rows around K
+    "ties": [6000, 4000, 500],
+    "far": [65000, 30000],  # near the 1M / 16 pitch
+    "padded": [5000, 400, 0],  # a CUDA-graph padding request
+}
 
-@pytest.mark.parametrize("mode", ["packed", "logits"])
-@pytest.mark.parametrize("case", list(DCP_INDEXER_CASES))
-def test_fused_indexer_dcp(case, mode):
-    """The fused indexer under DCP (one rank's local keys, N = 384):
 
-    - logits: its scorer writes DeepGEMM's paged MQA logits layout (1 KiB rows,
-      key index = column), at stock's precision (deepgemm_head_sum) up to BF16
-      rounding flips, which the #63 merge's
-      own local top-N (DeepSelect) and pack take as they take DeepGEMM's;
-    - packed: its select's B' rows are bit-exact the #63 pack kernel's of the
-      same candidates, which are the exact local top-N of the logits (ties to the
-      lowest key index), zero words past the count, and the counts."""
+def local_candidates(logits, ends, rank, world, interleave=1, topk=2048):
+    """IndexerSelect ("candidates") of FP32 ``logits`` rows -> (words [rows, 2K]
+    int32, counts [rows])."""
+    from cutlass import Int32, Int64
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.common.host import (
+        stream,
+        to_cute,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.indexer import (
+        compile_select,
+    )
+
+    rows = ends.shape[0]
+    words = torch.full((rows, 2 * topk), 7, dtype=torch.int32, device="cuda")
+    counts = torch.full((rows,), -1, dtype=torch.int32, device="cuda")
+    select = compile_select(
+        rows, 1, topk, "candidates", 0, 1, world=world, interleave=interleave
+    )
+    dummy = torch.zeros(1, dtype=torch.int32, device="cuda")
+    select(
+        Int64(logits.data_ptr()),
+        Int32(logits.stride(0)),
+        to_cute(dummy, 4),
+        to_cute(ends, 4),
+        Int64(0),
+        Int32(0),
+        Int32(0),
+        Int32(rank),
+        to_cute(words, 4),
+        to_cute(counts, 4),
+        to_cute(words, 4),
+        stream(torch.device("cuda")),
+    )
+    return words, counts
+
+
+def check_local_candidates(words, counts, logits, ends, rank, world, interleave=1):
+    """The candidates of each row: its exact local top-K (ties to the lowest local
+    index) in key order, each word (0xFFFFFFFF - global id, its FP32 score's order
+    key), zero words past the count."""
+    topk = words.shape[1] // 2
+    for t in range(ends.shape[0]):
+        length = int(ends[t])
+        c = min(length, topk)
+        assert int(counts[t]) == c, t
+        lo = words[t, 0::2].long() & 0xFFFFFFFF
+        hi = words[t, 1::2].long() & 0xFFFFFFFF
+        assert bool((lo[c:] == 0).all() & (hi[c:] == 0).all()), t
+        local = exact_topk(logits[t, :length], topk) if length else lo[:0]
+        span = interleave
+        gid = (local // span) * (world * span) + rank * span + local % span
+        assert torch.equal(0xFFFFFFFF - lo[:c], gid), t
+        assert torch.equal(hi[:c], fp32_keys(logits[t, local])), t
+
+
+def check_fused_dcp(contexts, q, world, case, seed):
+    """The fused indexer under DCP (one rank's local keys): its scorer writes FP32
+    logits in DeepGEMM's layout at stock's precision, and the local top-K select of
+    the FP32 DCP top-k takes them exactly."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.indexer import (
         FusedIndexer,
     )
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels.dcp_topk_merge.kernels import (
-        dcp_topk_pack,
-        dcp_topk_pack_indices,
-    )
 
-    contexts, q = DCP_INDEXER_CASES[case]
-    x = fused_indexer_inputs(contexts, q, GAP, case == "ties", len(contexts) * 7 + q)
-    rows, n = len(contexts) * q, 384
+    x = fused_indexer_inputs(contexts, q, GAP, case == "ties", seed)
+    rows = len(contexts) * q
     ends, table = x.ends, x.table
     if case == "padded":
         ends[-q:] = 0
@@ -1044,69 +1200,124 @@ def test_fused_indexer_dcp(case, mode):
         k_cache=SimpleNamespace(kv_cache=x.index),
         topk_tokens=2048,
         max_model_len=1 << 20,
-        dcp_world_size=8,
+        dcp_world_size=world,
+        cp_kv_cache_interleave_size=1,
     )
-    fused = FusedIndexer(
-        indexer,
-        [(rows, q)],
-        torch.device("cuda"),
-        max(64, rows),
-        local_topk=n,
-        packed=mode == "packed",
-    )
-    assert fused.pitch == 131072
+    device = torch.device("cuda")
+    fused = FusedIndexer(indexer, [(rows, q)], device, max(64, rows), dcp=True)
+    assert fused.pitch == (1 << 20) // world
     query = x.query.view(torch.uint8)
-    sms = torch.cuda.get_device_properties(0).multi_processor_count
-    # The packed select runs one CTA per row on its own SM: exactly up to the SM
-    # count (past it, the scorer only: the "logits" case covers that).
-    assert fused.packs(rows) == (mode == "packed" and rows <= sms), (rows, sms)
-    if mode == "packed" and not fused.packs(rows):
-        pytest.skip(f"{rows} rows exceed the {sms} SMs: no packed select")
-    packed, out_logits, aux = fused.run_dcp(query, x.weights, decode, rows, q)
-    assert (packed is not None) == (mode == "packed")
-    # The exact merge takes the logits and the row ends in both modes.
+    logits, aux = fused.run_dcp(query, x.weights, decode, rows, q)
+    assert logits.dtype == torch.float32 and logits.stride(0) == fused.pitch
     assert torch.equal(aux, ends[:rows])
-    assert out_logits.stride(0) * 2 % 1024 == 0
+    words, counts = local_candidates(logits, aux, 3, world)
     torch.accelerator.synchronize()
-    logits = fused.logits[: rows * fused.pitch].view(rows, fused.pitch)
-    assert out_logits.data_ptr() == logits.data_ptr()
     for t in range(rows):
         length = int(ends[t])
         check_fused_logits(logits[t, :length], x, t, t // q, length)
+    check_local_candidates(words, counts, logits, ends[:rows], 3, world)
 
-    bf16 = logits.view(torch.bfloat16)
-    if mode == "logits":
-        out = out_logits
-        packed = dcp_topk_pack(out, aux, n, max_local_len=fused.max_local_len)
+
+@pytest.mark.parametrize("case", list(DCP_INDEXER_CASES))
+def test_fused_indexer_dcp(case):
+    """DCP8: the fused DCP scorer's FP32 logits and their exact local top-K."""
+    contexts, q = DCP_INDEXER_CASES[case]
+    check_fused_dcp(contexts, q, 8, case, len(contexts) * 7 + q)
+
+
+DCP_MERGE_CASES = {
+    # (global contexts, world, interleave, ties)
+    "short": ([500, 3000, 9000], 4, 1, False),
+    "mixed": ([500, 30000, 90000, 200000], 8, 1, False),
+    "ties": ([30000, 90000, 2100], 8, 1, True),
+    "w16": ([1000, 40000, 300000], 16, 1, False),
+    "w16_ties": ([40000, 2047, 2049], 16, 1, True),
+    "interleave64": ([5000, 40000], 4, 64, False),
+    "empty_rank": ([3, 2], 8, 1, False),  # ranks with no keys of a row
+}
+
+
+@pytest.mark.parametrize("case", list(DCP_MERGE_CASES))
+def test_dcp_topk_merge_exact(case):
+    """The FP32 DCP top-k (dcp_topk.py), every rank simulated on one GPU: each
+    rank's local candidates (IndexerSelect) of its share of every row's FP32
+    logits, the rank-major gather, and each rank's DcpMerge: exactly the global
+    top-K by (FP32 score desc, global id asc) — stock's FP32 merge key
+    (dcp_topk_score_bits(FP32) = 32) — as the global ids, and this rank's
+    physical KV rows of the owned ones in its local key order, -1 after, with
+    their counts."""
+    from cutlass import Int32, Int64
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.common.host import (
+        stream,
+        to_cute,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.dcp_topk import (
+        compile_merge,
+    )
+
+    lengths, world, span, ties = DCP_MERGE_CASES[case]
+    topk, block, stride_rows = 2048, 64, 64 + GAP
+    gen = torch.Generator(device="cuda").manual_seed(len(lengths) * 31 + world)
+    scores = [torch.randn(n, device="cuda", generator=gen) for n in lengths]
+    if ties:
+        scores = [(s * 2).round() for s in scores]
+    rows = len(lengths)
+
+    def owner_local(gid):
+        return (gid // span) % world, (gid // (span * world)) * span + gid % span
+
+    pitch = -(-max(lengths) // 512) * 512
+    pages = -(-pitch // block)
+    perm = torch.randperm(rows * pages * 2, device="cuda", generator=gen)
+    table = perm[: rows * pages].int().view(rows, pages).contiguous()
+    req_id = torch.arange(rows, dtype=torch.int32, device="cuda")
+    shards = []
+    for r in range(world):
+        local = torch.full((rows, pitch), float("nan"), device="cuda")
+        ends = torch.zeros(rows, dtype=torch.int32, device="cuda")
+        for t, n in enumerate(lengths):
+            owner, idx = owner_local(torch.arange(n, device="cuda"))
+            mine = owner == r
+            local[t, idx[mine]] = scores[t][mine]
+            ends[t] = int(idx[mine].max()) + 1 if bool(mine.any()) else 0
+        words, counts = local_candidates(local, ends, r, world, span, topk)
         torch.accelerator.synchronize()
-        words = packed[:, :n]
-        for t in range(rows):
-            # DeepSelect may break ties otherwise: compare the selected scores.
-            length = int(ends[t])
-            want = order16(logits[t, exact_topk(logits[t, :length], n)].long())
-            got = (words[t][words[t] != 0].long() & 0xFFFFFFFF) >> 16
-            assert torch.equal(got.sort().values, want.sort().values), (case, t)
-        return
-
-    out, counts = packed, fused.valid[:rows]
-    local = torch.full((rows, n), -1, dtype=torch.int32, device="cuda")
-    for t in range(rows):
-        length = int(ends[t])
-        c = min(length, n)
-        assert int(counts[t]) == c, (case, t)
-        words = out[t, :n].long() & 0xFFFFFFFF
-        plane = out[t, n:].long() & 0xFFFFFFFF
-        assert bool((words[c:] == 0).all()) and bool((words[:c] != 0).all())
-        j = torch.arange(c, device="cuda")
-        high = (plane[j // 32] >> (j % 32)) & 1
-        ids = (0xFFFF - (words[:c] & 0xFFFF)) | (high << 16)
-        assert torch.equal(ids.sort().values, exact_topk(logits[t, :length], n))
-        local[t, :c] = ids.int()
-    # The same candidates (in our slot order) through #63's pack kernel.
-    ref = torch.full_like(out, 7)
-    dcp_topk_pack_indices(bf16, local, ref)
-    torch.accelerator.synchronize()
-    assert torch.equal(out, ref), case
+        check_local_candidates(words, counts, local, ends, r, world, span)
+        shards.append(words)
+    gathered = torch.cat(shards).contiguous()  # rank-major, as the all-gather
+    merge = compile_merge(rows, world, topk, span, True, 0)
+    for r in range(world):
+        rows_out = torch.full((rows, topk), 9, dtype=torch.int32, device="cuda")
+        valid = torch.full((rows,), -9, dtype=torch.int32, device="cuda")
+        ids = torch.full((rows, topk), 9, dtype=torch.int32, device="cuda")
+        merge(
+            Int64(gathered.data_ptr()),
+            to_cute(req_id, 4),
+            Int64(table.data_ptr()),
+            Int32(table.stride(0)),
+            Int32(table.shape[1]),
+            Int32(block),
+            Int32(stride_rows),
+            Int32(r),
+            to_cute(rows_out, 4),
+            to_cute(valid, 4),
+            to_cute(ids, 4),
+            stream(torch.device("cuda")),
+        )
+        torch.accelerator.synchronize()
+        for t, n in enumerate(lengths):
+            want = exact_topk(scores[t], topk)  # global ids, ties to the lowest
+            k = min(n, topk)
+            assert torch.equal(ids[t, :k].long().sort().values, want), (r, t)
+            assert bool((ids[t, k:] == -1).all()), (r, t)
+            owner, idx = owner_local(want)
+            mine = idx[owner == r].sort().values
+            physical = table[t][mine // block].long() * stride_rows + mine % block
+            c = int(valid[t])
+            assert c == mine.numel(), (r, t)
+            assert torch.equal(rows_out[t, :c].long(), physical), (r, t)
+            assert bool((rows_out[t, c:] == -1).all()), (r, t)
 
 
 # The first indexer page whose scale row lies 2^31 int32 words (8 GiB) past the
@@ -1142,7 +1353,7 @@ def high_page_indexer_inputs(context, q, seed):
         [context + 1 + j for j in range(q)], dtype=torch.int32, device="cuda"
     )
     query = torch.randn(64, 32, 128, device="cuda", generator=gen) * 0.5
-    weights = (torch.randn(64, 32, device="cuda", generator=gen) * 0.1).bfloat16()
+    weights = torch.randn(64, 32, device="cuda", generator=gen) * 0.1
     reference = SimpleNamespace(
         keys=keys,
         exps=exps,
@@ -1153,7 +1364,7 @@ def high_page_indexer_inputs(context, q, seed):
     return reference, index, ids[None], ends
 
 
-@pytest.mark.parametrize("mode", ["tp", "dcp_packed", "dcp_logits"])
+@pytest.mark.parametrize("mode", ["tp", "dcp"])
 def test_fused_indexer_high_pages(mode):
     """The fused indexer's scorer over pages past 2^31 int32 words of its cache
     view (a request whose KV blocks sit high in the hybrid KV pool, as in serving
@@ -1179,6 +1390,7 @@ def test_fused_indexer_high_pages(mode):
         # small, as the request-compact logits scale with it.
         max_model_len=1 << 20 if dcp else 1 << 13,
         dcp_world_size=8,
+        cp_kv_cache_interleave_size=1,
     )
     query = x.query.view(torch.uint8)
     device = torch.device("cuda")
@@ -1190,31 +1402,21 @@ def test_fused_indexer_high_pages(mode):
         tiles = -(-context // 128)
         for t in range(q):
             length = int(ends[t])
-            got = fused.logits[t * tiles * 128 :][:length]
+            got = fused.logits[t * tiles * 128 :][:length].view(torch.float32)
             check_fused_logits(got, x, t, 0, length)
             pos = exact_topk(got, 2048)
             physical = mla_table[0][pos // 2048].long() * (2048 + GAP) + pos % 2048
             assert int(valid[t]) == 2048
             assert torch.equal(out[t].long(), physical), t
         return
-    n = 384
-    packs = mode == "dcp_packed"
-    fused = FusedIndexer(indexer, [(q, q)], device, 64, local_topk=n, packed=packs)
-    packed, _, _ = fused.run_dcp(query, x.weights, decode, q, q)
+    fused = FusedIndexer(indexer, [(q, q)], device, 64, dcp=True)
+    logits, aux = fused.run_dcp(query, x.weights, decode, q, q)
+    words, counts = local_candidates(logits, aux, 0, 8)
     torch.accelerator.synchronize()
-    logits = fused.logits[: q * fused.pitch].view(q, fused.pitch)
     for t in range(q):
         length = int(ends[t])
         check_fused_logits(logits[t, :length], x, t, 0, length)
-        if packs:
-            c = min(length, n)
-            assert int(fused.valid[t]) == c
-            words = packed[t, :n].long() & 0xFFFFFFFF
-            plane = packed[t, n:].long() & 0xFFFFFFFF
-            j = torch.arange(c, device="cuda")
-            high = (plane[j // 32] >> (j % 32)) & 1
-            ids = (0xFFFF - (words[:c] & 0xFFFF)) | (high << 16)
-            assert torch.equal(ids.sort().values, exact_topk(logits[t, :length], n))
+    check_local_candidates(words, counts, logits, ends, 0, 8)
 
 
 @pytest.mark.parametrize("reqs,q", [(4, 1), (8, 5), (12, 5)])
@@ -1236,7 +1438,9 @@ def test_flashinfer_dcp_core_merges_to_full_attention(
     from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.prepared import (
         PreparedDsa,
     )
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.shapes import target_topology
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.shapes import (
+        target_topology,
+    )
     from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
         FlashInferMLASparseImpl,
     )
@@ -2099,7 +2303,7 @@ def run_layer_step(
             torch.empty(cap, 1536, device=dev, dtype=bf),
             torch.empty(cap, 32 * 128, device=dev, dtype=bf),
             torch.empty(cap, 32, 128, device=dev, dtype=torch.uint8),
-            torch.empty(cap, 32, device=dev, dtype=bf),
+            torch.empty(cap, 32, device=dev, dtype=torch.float32),  # head weights
             torch.empty(cap, 64, 512, device=dev, dtype=bf),
         )
         policy: dict = dict(queries=(q,), overlap=overlap, core="auto")
@@ -2185,19 +2389,15 @@ def run_layer_step(
         out = torch.empty(batch, HEADS * 128, device=dev, dtype=bf)
         merge = prepared.indexer_stage
         if world > 1 and flashinfer:
-            # The one-round DCP top-k merge (#63) runs on both paths; ours also
-            # writes the global ids for the top-k check below.
-            assert merge.local_topk == indexer.dcp_local_topk > 0
+            # The FP32 DCP top-k (every rank's local top-K and the merge; stock's
+            # FP32 rule: no one-round #63 merge); ours also writes the global ids
+            # for the top-k check below.
+            assert merge.local_topk == indexer.topk_tokens
             merge.dcp_ids = topk_buffer
-            # The fused indexer's scorer and local top-N select feed it (past one
-            # row per SM, wide steps: its scorer, and the merge's own select);
-            # on Rubin DeepGEMM's logits and DeepSelect do (RUBIN_DCP_FUSED_INDEXER).
+            merge.warm(UNIT, [batch])  # its ids variant, before any capture
+            # The fused DCP scorer feeds it where it serves the layer's cache
+            # (RUBIN_DCP_FUSED_INDEXER on Rubin), else DeepGEMM's FP32 logits.
             assert (merge.fused is not None) == prepared.dcp_fused
-            if merge.fused is not None:
-                assert merge.fused.packs(batch) == (
-                    merge.fused.packed and batch <= merge.fused.ctas
-                )
-                merge.fused.valid.fill_(-5)
         topk_buffer.fill_(-1)
         if prepared.overlaps[batch, q] in ("fork", "front") and rank == 0:
             # Hold back the forked query (and under DCP rank 0's publish): the
@@ -2300,12 +2500,9 @@ def run_layer_step(
             ]
             merged = exchanged or (merge.dcp_rows[:batch], merge.dcp_valid[:batch])
             owned = (merged, *filtered)
-            if merge.fused is not None and merge.fused.packs(batch) and dcpx is None:
-                counts = merge.fused.valid[:batch]  # the fused select ran
-                assert bool((counts >= 0).all() & (counts <= merge.local_topk).all())
         # The fused indexer's top-k (TP) or the merge of its scores (DCP) against
         # the exact top-k of its own query. The stock top-k is measured against the
-        # same (our) query's exact top-k (at stock's BF16 head-sum precision), so
+        # same (our) query's exact top-k (at stock's FP32 head-sum precision), so
         # its width carries the two paths' query rounding differences (printed
         # only).
         width = stock_width = None
@@ -2347,7 +2544,9 @@ def run_layer_step(
 def sparse_dsa_core(device, heads, variant, pdl_rows=0):
     """The DSA sparse core (dsa_core.decode.DsacDecode) serving ``variant`` at every
     row up to 64 (``pdl_rows``: build()'s under DcpExchange's top-k)."""
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels.dsa_core.decode import DsacDecode
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels.dsa_core.decode import (
+        DsacDecode,
+    )
 
     spec = f"1-64:{variant}"
     return DsacDecode(device, heads, rows=64, spec=spec, skip="", pdl_rows=pdl_rows)
@@ -2383,13 +2582,13 @@ def exchange_ids(slots, counts, md, index_md, cache):
 
 def exact_topk_widths(index, table, contexts, q, query, weights, ids, world=1):
     """Each row's ``ids`` (its top-k: logical, or global under DCP) against the
-    exact top-k of indexer logits at stock's precision (deepgemm_head_sum) over
-    the dequantized keys of the same FP8 query and BF16 head weights (``query``
-    [B, 32, 128] bytes, ``weights`` [B, 32]): the largest distance of a swapped
-    key's exact logit from the exact K-th one, in BF16 steps of the K-th (inf: a
-    key far outside the exact top-k). Under DCP every rank scores its keys and
-    the candidates are all-gathered. Exact selection up to the BF16 rounding of
-    the logits keeps it near 1."""
+    exact top-k of indexer logits at stock's precision (deepgemm_head_sum, FP32)
+    over the dequantized keys of the same FP8 query and FP32 head weights
+    (``query`` [B, 32, 128] bytes, ``weights`` [B, 32]): the largest distance of a
+    swapped key's exact logit from the exact K-th one, in BF16 steps of the K-th
+    (inf: a key far outside the exact top-k). Under DCP every rank scores its keys
+    and the candidates are all-gathered. Exact selection on FP32 logits (only the
+    MMA's FP32 q . k order differs) keeps it far below one step."""
     import torch.distributed as dist
 
     from vllm.distributed import get_dcp_group
@@ -2469,24 +2668,22 @@ def check_layer_step(step, q, reference=True):
     step inserts, and every other cache byte as it was."""
     # The top-k: the same keys up to near-ties at the boundary (the indexer queries
     # of the two paths round differently: their normalized q_c rows do).
-    # The fused indexer scores at stock's precision (DeepGEMM's BF16 head sum), so
-    # its top-k is the exact top-k of those logits up to BF16 rounding flips
-    # (width <= 2 steps). The stock top-k differs from ours only by the two paths'
-    # query rounding (and DeepGEMM's FP32 q . k order); the overlap bound below
-    # covers that.
+    # The fused indexer scores at stock's precision (DeepGEMM's FP32 head sum), so
+    # its top-k is the exact top-k of those logits up to the MMA's FP32 q . k
+    # order (width far below one BF16 step). The stock top-k differs from ours only
+    # by the two paths' query rounding; the overlap bound below covers that.
     if step.width is not None:
         print(
-            f"top-k vs exact (BF16 steps): ours {step.width:.2f} stock (vs our "
+            f"top-k vs exact (BF16 steps): ours {step.width:.4f} stock (vs our "
             "query) "
             f"{step.stock_width:.2f}"
         )
-        assert step.width <= 2.0, step.width
+        assert step.width <= 0.05, step.width
     same = []
     for t in range(step.topk.shape[0]):
         a, b = set(step.stock_topk[t].tolist()), set(step.topk[t].tolist())
-        # Fused vs DeepGEMM at 160-320 rows: >= 98.7% measured (both sum heads in
-        # BF16; the paths' query rounding and BF16 near-ties at the K-th logit
-        # differ; the width check above bounds ours). DCP16 q8 M64 on SM107 (one
+        # Fused vs DeepGEMM at 160-320 rows (both sum heads in FP32; the paths'
+        # query rounding differs; the width check above bounds ours). DCP16 q8 M64 on SM107 (one
         # row, 4580 keys: 2027 of 2048, as #108's fused indexer there) as well.
         wide = step.topk.shape[0] > 64 or step.world == 16
         bound = 0.99 if step.width is None or not wide else 0.98
@@ -2641,7 +2838,9 @@ def test_rubin_dcp_policy():
     under DCP the query overlap is the cluster IndexFront ("front") up to 16 rows
     and the fork from 17; the #63 merge reads DeepGEMM's logits (no fused DCP
     indexer). GB300 keeps #108's policies."""
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa import prepared
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa import (
+        prepared,
+    )
     from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.attn_fi import (
         KERNELS,
         fi_kernels,
@@ -2658,101 +2857,15 @@ def test_rubin_dcp_policy():
     assert modes == ["front"] * 3 + ["fork"] * 5, modes
     assert all(overlap_for(b, None, True, False) == "front" for b in rows)
     assert overlap_for(64, "serial", True, True) == "serial"
-    assert not prepared.RUBIN_DCP_FUSED_INDEXER
+    assert prepared.RUBIN_DCP_FUSED_INDEXER  # the FP32 DCP scorer beats DeepGEMM
 
 
-# One DCP16 rank's local contexts (interleave 1: ~1/16 of each request's), q8.
-DCP16_INDEXER_CASES = {
-    "c1": [11200],  # C1: one request at ~178K
-    "c8": [10000 + 997 * r for r in range(8)],  # C8: eight requests at ~160-270K
-    "short": [100, 150],  # every row within N (the bypass)
-    "boundary": [182, 183, 184, 185, 186, 190, 191, 192],  # rows around N
-    "ties": [6000, 4000, 500],
-    "far": [65000, 30000],  # near the 1M / 16 pitch
-    "padded": [5000, 400, 0],  # a CUDA-graph padding request
-}
-
-
-@pytest.mark.parametrize("mode", ["packed", "logits"])
 @pytest.mark.parametrize("case", list(DCP16_INDEXER_CASES))
-def test_fused_indexer_dcp16_q8(case, mode):
-    """test_fused_indexer_dcp at DCP16 (N = 192, pitch 65536) and q8 (the fused DCP
-    indexer, off on Rubin by policy, stays exact there)."""
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.indexer import (
-        FusedIndexer,
-    )
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels.dcp_topk_merge.kernels import (
-        dcp_topk_pack,
-        dcp_topk_pack_indices,
-    )
-
-    contexts, q = DCP16_INDEXER_CASES[case], 8
-    x = fused_indexer_inputs(contexts, q, GAP, case == "ties", len(contexts) * 7 + q)
-    rows, n = len(contexts) * q, 192
-    ends, table = x.ends, x.table
-    if case == "padded":
-        ends[-q:] = 0
-    real = rows - q if case == "padded" else rows
-    decode = SimpleNamespace(
-        seq_lens=ends[:real].view(real, 1),
-        block_table=table.repeat_interleave(q, 0)[:real],
-    )
-    indexer = SimpleNamespace(
-        k_cache=SimpleNamespace(kv_cache=x.index),
-        topk_tokens=2048,
-        max_model_len=1 << 20,
-        dcp_world_size=16,
-    )
-    fused = FusedIndexer(
-        indexer,
-        [(rows, q)],
-        torch.device("cuda"),
-        max(64, rows),
-        local_topk=n,
-        packed=mode == "packed",
-    )
-    assert fused.pitch == 65536
-    query = x.query.view(torch.uint8)
-    sms = torch.cuda.get_device_properties(0).multi_processor_count
-    assert fused.packs(rows) == (mode == "packed" and rows <= sms), (rows, sms)
-    packed, out_logits, aux = fused.run_dcp(query, x.weights, decode, rows, q)
-    assert (packed is not None) == (mode == "packed")
-    assert torch.equal(aux, ends[:rows])
-    torch.accelerator.synchronize()
-    logits = fused.logits[: rows * fused.pitch].view(rows, fused.pitch)
-    assert out_logits.data_ptr() == logits.data_ptr()
-    for t in range(rows):
-        length = int(ends[t])
-        check_fused_logits(logits[t, :length], x, t, t // q, length)
-    bf16 = logits.view(torch.bfloat16)
-    if mode == "logits":
-        packed = dcp_topk_pack(out_logits, aux, n, max_local_len=fused.max_local_len)
-        torch.accelerator.synchronize()
-        words = packed[:, :n]
-        for t in range(rows):
-            length = int(ends[t])
-            want = order16(logits[t, exact_topk(logits[t, :length], n)].long())
-            got = (words[t][words[t] != 0].long() & 0xFFFFFFFF) >> 16
-            assert torch.equal(got.sort().values, want.sort().values), (case, t)
-        return
-    out, counts = packed, fused.valid[:rows]
-    local = torch.full((rows, n), -1, dtype=torch.int32, device="cuda")
-    for t in range(rows):
-        length = int(ends[t])
-        c = min(length, n)
-        assert int(counts[t]) == c, (case, t)
-        words = out[t, :n].long() & 0xFFFFFFFF
-        plane = out[t, n:].long() & 0xFFFFFFFF
-        assert bool((words[c:] == 0).all()) and bool((words[:c] != 0).all())
-        j = torch.arange(c, device="cuda")
-        high = (plane[j // 32] >> (j % 32)) & 1
-        ids = (0xFFFF - (words[:c] & 0xFFFF)) | (high << 16)
-        assert torch.equal(ids.sort().values, exact_topk(logits[t, :length], n))
-        local[t, :c] = ids.int()
-    ref = torch.full_like(out, 7)
-    dcp_topk_pack_indices(bf16, local, ref)
-    torch.accelerator.synchronize()
-    assert torch.equal(out, ref), case
+def test_fused_indexer_dcp16_q8(case):
+    """test_fused_indexer_dcp at DCP16 (pitch 65536) and q8 (the fused DCP scorer,
+    Rubin's DCP scorer, exact there)."""
+    contexts = DCP16_INDEXER_CASES[case]
+    check_fused_dcp(contexts, 8, 16, case, len(contexts) * 7 + 8)
 
 
 # Past the step's 64 rows: the rows a K3.1 DSA layer's specialized projection and
@@ -2857,7 +2970,7 @@ def check_prepare_allocates_nothing(core, world=1, partials="bf16"):
             torch.empty(cap, 1536, device=dev, dtype=bf),
             torch.empty(cap, 32 * 128, device=dev, dtype=bf),
             torch.empty(cap, 32, 128, device=dev, dtype=torch.uint8),
-            torch.empty(cap, 32, device=dev, dtype=bf),
+            torch.empty(cap, 32, device=dev, dtype=torch.float32),  # head weights
             fi_buffers(cap, 128),
         )
         policy: dict = dict(queries=(1, q))
@@ -3189,7 +3302,9 @@ def test_prepared_dsa_dcp_sparse_core_exchange(
     core keeps out (its q poll precedes its PDL wait), FlashInfer decoding the
     exchange's rows: K31_DCPX_PDL=0 gives the core M8 and M16."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels import hooks
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels.dcp_exchange import decode as dcpx
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels.dcp_exchange import (
+        decode as dcpx,
+    )
 
     # This case's layer alone takes the exchange (the other tests: the #63 merge).
     monkeypatch.setattr(hooks, "DCP_DECODE_TOPK_HOOKS", {})
@@ -3262,7 +3377,9 @@ def test_prepared_dsa_dcp_exchange_proj(dcp8_group, monkeypatch, core, batch):
     layers on alternating parities, the exchange's slots and counts poisoned
     before each, 200 replays give the eager rows bit for bit."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels import hooks
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels.dcp_exchange import decode as dcpx
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels.dcp_exchange import (
+        decode as dcpx,
+    )
 
     if LAYER_CORES[core][2] == "prims_ts" and no_prims_ts():
         pytest.skip("FlashInfer prims_ts sparse MLA cannot run here")
@@ -3318,14 +3435,18 @@ def run_wide_exchange_step(batch, q, world, replays, core="fi-trtllm", partials=
     from vllm.distributed import get_dcp_group
     from vllm.distributed.parallel_state import graph_capture
     from vllm.forward_context import create_forward_context, override_forward_context
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels.dcp_exchange.decode import DcpxDecode
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels.dcp_exchange.decode import (
+        DcpxDecode,
+    )
     from vllm.models.kimi_k3.nvidia.ops.dsa_indexer import (
         indexer_k_norm_quant_insert,
     )
     from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.dcp_stage import (  # noqa: E501
         local_slots,
     )
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.wide import WideDsa
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.wide import (
+        WideDsa,
+    )
     from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.runtime.providers import (
         dcp_box,
         pack_dsa_projection,
@@ -3454,7 +3575,7 @@ def run_wide_exchange_step(batch, q, world, replays, core="fi-trtllm", partials=
             torch.empty(cap, 1536, device=dev, dtype=bf),
             torch.empty(cap, 32 * 128, device=dev, dtype=bf),
             torch.empty(cap, 32, 128, device=dev, dtype=torch.uint8),
-            torch.empty(cap, 32, device=dev, dtype=bf),
+            torch.empty(cap, 32, device=dev, dtype=torch.float32),  # head weights
             torch.empty(cap, 64, 512, device=dev, dtype=bf),
         )
         if "box" not in WIDE_DSA_BOX:
@@ -3503,7 +3624,9 @@ def run_wide_exchange_step(batch, q, world, replays, core="fi-trtllm", partials=
             # FlashInfer over the same keys: the second layer takes the ids through
             # the stock DCP filter (no exchange counts) instead of the indexer.
             chain, impl = layers[1], layer.impl
-            from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels import hooks
+            from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels import (
+                hooks,
+            )
 
             exchange_counts = hooks.local_topk_counts(impl)
             hooks._LOCAL_TOPK_COUNTS.pop(id(impl))
@@ -3591,7 +3714,9 @@ def test_wide_dsa_dcp_exchange(dcp8_group, monkeypatch, core, batch, q):
     "fi-nvfp4": an nvfp4_ds_mla cache (WideDsa's MlaQuery inserts its rows; FlashInfer
     prims_ts everywhere)."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels import hooks
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels.dcp_exchange import decode as dcpx
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels.dcp_exchange import (
+        decode as dcpx,
+    )
 
     if LAYER_CORES[core][2] == "prims_ts" and no_prims_ts():
         pytest.skip("FlashInfer prims_ts sparse MLA cannot run here")
@@ -3654,7 +3779,9 @@ def test_wide_dsa_dcp_exchange_proj(dcp8_group, monkeypatch, core, batch, q):
 
     from vllm.distributed import get_dcp_group
     from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels import hooks
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels.dcp_exchange import decode as dcpx
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels.dcp_exchange import (
+        decode as dcpx,
+    )
 
     if LAYER_CORES[core][2] == "prims_ts" and no_prims_ts():
         pytest.skip("FlashInfer prims_ts sparse MLA cannot run here")
@@ -3857,42 +3984,42 @@ def test_dcp_topk_merge_rows_deterministic(dcp8_group, saturate):
 @pytest.mark.skip_global_cleanup  # no group needed: keep a DCP8 launch's group
 @pytest.mark.parametrize("check", [False, True], ids=["rows", "rows+ids"])
 def test_merge_rows_kernels_compile_at_prepare(monkeypatch, check):
-    """The #63 merge's select and rescue kernels as ``merge_rows`` launches them
-    (physical rows of the MLA blocks; global ids too under VLLM_DSA_BPRIME_CHECK)
-    compile when PreparedDsa prepares its cache (``IndexerStage.warm``), not at
-    their first launch: the specialized decode runs only inside graph captures,
-    where a first compile invalidates the capture (CUDA error 901), and the
-    runner's JIT warmup compiles only the stock indexer's variant."""
+    """The FP32 DCP top-k's kernels (each rank's local top-K select and the merge,
+    with the global ids too for tests) and, where the fused TP indexer does not
+    serve the layer, the TP select compile for every batch when PreparedDsa
+    prepares its cache (``IndexerStage.warm``), not at their first launch: the
+    specialized decode runs only inside graph captures, where a first compile
+    invalidates the capture (CUDA error 901)."""
     from unittest.mock import MagicMock
 
     from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa import (
+        dcp_topk,
+        indexer,
         indexer_stage,
     )
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels.dcp_topk_merge import kernels as merge
 
+    dev = torch.device("cuda", torch.accelerator.current_device_index())
     stage = indexer_stage.IndexerStage.__new__(indexer_stage.IndexerStage)
-    stage.topk, stage.local_topk, stage.indexer = 2048, 192, SimpleNamespace()
-    stage.indexer.dcp_world_size = 16
+    stage.topk, stage.local_topk, stage.tp_rows = 2048, 2048, 0
+    stage.dcp = dcp_topk.DcpTopk(2048, 16, 3, 1, dev, 64)
     stage.dcp_ids = torch.empty(1) if check else None
-    # As DCPTopkSelectKernel / DCPTopkRescueKernel.__call__ key merge_rows' launch
-    # (the select's round-1 mailbox variant where the merge has a mailbox).
-    key = dict(topk=2048, local_topk=192, world_size=16, emit_ids=check)
-    select = merge._DCP_TOPK_SELECT_KERNEL
-    rescue = merge._DCP_TOPK_RESCUE_KERNEL
-    mailbox = merge._mailbox_for(2048, 192) is not None
-    keys = (
-        select.dispatch(**key, block_size=1024, exact=True, mailbox=mailbox),
-        rescue.dispatch(**key, block_size=1024),
-    )
-    stage.warm(1024)
-    assert keys[0] in select._compiled_cache and keys[1] in rescue._compiled_cache
+    stage.warm(1024, [8, 64])  # compiles (and is cached per process)
     warm = MagicMock()
-    monkeypatch.setattr(indexer_stage, "warm_merge_rows", warm)
-    stage.warm(1024)
-    warm.assert_called_once_with(2048, 192, 16, check, 1024)
-    stage.local_topk = 0  # no direct merge (TP, or no #63 merge): nothing
-    stage.warm(1024)
-    warm.assert_called_once()
+    monkeypatch.setattr(stage.dcp, "warm", warm)
+    stage.warm(1024, [8, 64])
+    assert warm.call_args_list == [((8, check),), ((64, check),)]
+    # TP: the select of DeepGEMM's logits, unless the fused indexer serves it.
+    compile_select = MagicMock()
+    monkeypatch.setattr(indexer, "compile_select", compile_select)
+    stage.dcp, stage.tp_rows = None, 64
+    stage.indexer = SimpleNamespace(topk_indices_buffer=torch.empty(1, device=dev))
+    stage.warm(1024, [8, 64], tp=False)
+    compile_select.assert_not_called()
+    stage.warm(1024, [8, 64])
+    assert [c.args[:4] for c in compile_select.call_args_list] == [
+        (8, 1, 2048, "ids"),
+        (64, 1, 2048, "ids"),
+    ]
 
 
 @pytest.mark.skip_global_cleanup  # pure policy check: keep a DCP8 launch's group
@@ -4087,8 +4214,12 @@ def check_dcp_value(policy, layout, batch, q, lse_base_e, box=None):
         compile_value,
         partials_for,
     )
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.r1 import DsaBox
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.mla.dcp import DcpBox
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.r1 import (
+        DsaBox,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.mla.dcp import (
+        DcpBox,
+    )
 
     partials = partials_for(policy, batch)
     if layout != "dsa":
@@ -4272,8 +4403,12 @@ def test_dcp_value_mixed_partials(dcp8_group):
     import torch.distributed as dist
 
     from vllm.distributed import get_dcp_group
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.r1 import DsaBox
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.mla.dcp import DcpBox
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.r1 import (
+        DsaBox,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.mla.dcp import (
+        DcpBox,
+    )
 
     policy = "1-16:bf16,17-64:proj"
     group = get_dcp_group()
@@ -4377,7 +4512,7 @@ def test_wide_batches_match_64_row_kernels(batch, fp8):
             *args, cutlass.Float32(EPS), to_cute(query), to_cute(q_c), stream(dev)
         )
         q_fp8 = torch.zeros(rows, 32, 128, device=dev, dtype=torch.uint8)
-        head_w = torch.zeros(rows, 32, device=dev, dtype=bf)
+        head_w = torch.zeros(rows, 32, device=dev, dtype=torch.float32)
         args = (to_cute(x), to_cute(take(iq)), to_cute(norm_w, 4), to_cute(norm_b, 4))
         args += (to_cute(index), to_cute(s, 8), to_cute(q_fp8), to_cute(head_w, 4))
         index_kernel(*args, cutlass.Float32(EPS), stream(dev))
@@ -4421,7 +4556,9 @@ def _dcp_mailbox_worker(rank, size, port, batch, q, dsa, partials="bf16"):
     from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.mla import (
         prepared as mla_prepared,
     )
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.mla.dcp import DcpBox
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.mla.dcp import (
+        DcpBox,
+    )
 
     torch.accelerator.set_device_index(rank)
     dev = torch.device("cuda", rank)
@@ -5047,8 +5184,12 @@ def check_dcp_value_merge_stock(layout, batch, q):
     from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.dcp_value import (  # noqa: E501
         compile_value,
     )
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.r1 import DsaBox
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.mla.dcp import DcpBox
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.r1 import (
+        DsaBox,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.mla.dcp import (
+        DcpBox,
+    )
     from vllm.v1.attention.ops.dcp import DirectDCPA2AWorkspace
 
     if layout != "dsa":
@@ -5308,7 +5449,7 @@ def test_prepared_dsa_compiles_once_per_kernel(
                 torch.empty(cap, 1536, device=dev, dtype=bf),
                 torch.empty(cap, 32 * 128, device=dev, dtype=bf),
                 torch.empty(cap, 32, 128, device=dev, dtype=torch.uint8),
-                torch.empty(cap, 32, device=dev, dtype=bf),
+                torch.empty(cap, 32, device=dev, dtype=torch.float32),  # head weights
                 fi_buffers(cap, 128),
             )
             pitches = dict.fromkeys(batches, pitch)

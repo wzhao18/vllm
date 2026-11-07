@@ -61,16 +61,27 @@ class Sm107DecodeConfig(DecodeConfig):
         """Build the decode on ``lm`` (KimiLinearForCausalLM, weights loaded, aux
         layers set): every rank together, outside CUDA graph capture."""
         backbone, vllm_config = lm.model, lm.vllm_config
-        init_dsa_merge(backbone, vllm_config)
+        # The DSA indexer runs at stock Kimi K3 precision (FP32 logits): no
+        # one-round DCP top-k merge (#63, BF16 logits only) is set up; the DCP
+        # top-k is the FP32 local top-K and merge (cutedsl/dsa/dcp_topk.py).
         # MegaMoE wide-EP kernel header / expert placement (env-selected), before
         # the runner's warmup compiles MegaMoE.
         from .megamoe import prepare_megamoe
 
         prepare_megamoe(backbone, vllm_config)
-        # DSA decode under DCP: NCCL-free top-k exchange (VLLM_K31_DCP_EXCHANGE).
-        from .dsa_kernels.dcp_exchange.decode import build as build_dcpx
+        # DSA decode under DCP: DcpExchange (VLLM_K31_DCP_EXCHANGE, off by default)
+        # selects BF16 indexer logits only; stock Kimi K3's are FP32, which the
+        # FP32 DCP top-k serves. Switched on, it raises.
+        from .dsa_kernels.dcp_exchange.decode import ENV as DCPX_ENV
+        from .dsa_kernels.dcp_exchange.decode import wanted as dcpx_wanted
 
-        dcpx = build_dcpx(backbone, vllm_config)
+        if dcpx_wanted(vllm_config):
+            raise ValueError(
+                f"Kimi K3 specialized decode (SM107): {DCPX_ENV} turns on DcpExchange, "
+                "whose top-k selects BF16 indexer logits; stock Kimi K3's are FP32 "
+                "(the FP32 DCP top-k serves DCP): unset it"
+            )
+        dcpx = None
         # The DSA sparse core (VLLM_K31_DSA_CORE=1), which the DSA layers'
         # PreparedDsa picks up from their indexers.
         from .dsa_kernels.dsa_core.decode import build as build_dsa_core
@@ -92,25 +103,6 @@ class Sm107DecodeConfig(DecodeConfig):
             lm.sampled_verify = SampledVerify.build(vllm_config, lm)
             # Compile the verification kernels now (every rank together).
             warm_sampling(vllm_config, lm)
-
-
-def init_dsa_merge(backbone, vllm_config) -> None:
-    """The vendored one-round DCP top-k merge (``dsa_kernels.dcp_topk_merge``) for the
-    stock indexers' (K, N): its own rescue workspace and, with
-    ``VLLM_DSA_BPRIME_MAILBOX=1``, its round-1 mailbox. Collective."""
-    from vllm.models.kimi_k3.nvidia.dsa import KimiK3DSAAttention
-
-    from .dsa_kernels.dcp_topk_merge import init_dcp_topk_merge
-
-    seen = set()
-    for module in backbone.modules():
-        if not isinstance(module, KimiK3DSAAttention):
-            continue
-        indexer = module.dsa_indexer
-        key = (indexer.topk_tokens, indexer.dcp_local_topk)
-        if key not in seen:
-            seen.add(key)
-            init_dcp_topk_merge(vllm_config, *key)
 
 
 def sm107_decode_config(vllm_config) -> Sm107DecodeConfig:
@@ -137,7 +129,9 @@ def sm107_decode_config(vllm_config) -> Sm107DecodeConfig:
         config.captured,
         config.q,
     )
-    return Sm107DecodeConfig(**{f.name: getattr(config, f.name) for f in fields(config)})
+    return Sm107DecodeConfig(
+        **{f.name: getattr(config, f.name) for f in fields(config)}
+    )
 
 
 # -- verification (the source branch's model methods) ------------------------------
