@@ -1,22 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Fused decode indexer of a K3.1 DSA layer at stock Kimi K3 precision (FP32 head
-weights, FP32 logits, exact top-k on the FP32 logits). TP (every rank scores the
-whole context): the FP8 indexer query and FP32 head weights of the step's rows over
-the paged FP8 indexer cache -> the exact top-k of every row as the physical KV rows
-the sparse attention reads, compacted to a prefix, and their counts. Two
-PDL-chained kernels replace the stock chain (DeepGEMM FP32 logits, top-k, then the
-logical -> physical conversion on a side stream):
+"""Decode indexer of a K3.1 DSA layer at stock Kimi K3 precision (FP32 head weights,
+FP32 logits, exact top-k on the FP32 logits), FP8 or MXFP4 indexer cache. TP (every
+rank scores the whole context): the indexer query and FP32 head weights of the
+step's rows over the paged indexer cache -> the exact top-k of every row as the
+physical KV rows the sparse attention reads, compacted to a prefix, and their counts
+(or, for FlashMLA, the key indices). Two PDL-chained kernels replace the stock
+chain (DeepGEMM FP32 logits, top-k, then the logical -> physical conversion on a
+side stream):
 
   IndexerScore   key-balanced persistent tcgen05 scorer: the 128-key tiles of
                  all requests are cut into equal ranges, one per SM, and one
-                 [128 keys x q * 32] FP8 MMA per tile scores every verify row of
-                 the request, so each key page is read once per step. The
-                 epilogue reduces the heads in FP32 exactly as DeepGEMM's FP32
-                 reduction does (below), scales by the key's UE8M0 scale, and
-                 stores the FP32 logits into a request-compact scratch, and each
-                 8 keys' largest order-preserving 32-bit key into a scratch 1/8
-                 its size. Requests whose rows all fit the top-k are not scored.
+                 block-scaled [128 keys x q * 32] MMA chain per tile (DeepGEMM's:
+                 kind::mxf8f6f4 for FP8 keys and the FP8 query at unit MX scales,
+                 kind::mxf4 for MXFP4; the UE8M0 scales inside the MMA) scores
+                 every verify row of the request, so each key page is read once
+                 per step. The epilogue reduces the heads in FP32 exactly as
+                 DeepGEMM's FP32 reduction does (below) and stores the FP32 logits
+                 into a request-compact scratch, and each 8 keys' largest
+                 order-preserving 32-bit key into a scratch 1/8 its size. Requests
+                 whose rows all fit the top-k are not scored.
   IndexerSelect  one CTA per row, exact over 32-bit keys: the K-th largest of the
                  row's 8-key maxima bounds its K-th largest key from below (to 22
                  bits: two 11-bit histograms), so only the keys of the about K
@@ -31,11 +34,13 @@ rows, key index = column), and the same select in "candidates" mode takes each
 row's full local top-K as (score, global id) words for the FP32 DCP merge
 (dcp_topk.py), as stock's FP32 rule does: no one-round merge.
 
-logits[t, k] = scale[k] * 0.5 * ((s0 + s2) + (s1 + s3)), s_j = the FP32 FMA chain
-over heads h = j mod 4 (in head order) of (x_h + |x_h|) * w[t, h], x_h = q[t, h] .
-key[k]: DeepGEMM SM100 paged MQA logits with FP32 weights and logits
-(sm100_mqa_logits.cuh, kIsFP32Reduce), on the FP8 query with unit MX scales and the
-FP32 head weights that fold its scale (DsaIndex). No value is rounded to BF16.
+logits[t, k] = 0.5 * ((s0 + s2) + (s1 + s3)), s_j = the FP32 FMA chain over heads
+h = j mod 4 (in head order) of (x_h + |x_h|) * w[t, h], x_h = the block-scaled MMA's
+FP32 q[t, h] . key[k]: DeepGEMM SM100 paged MQA logits with FP32 weights and logits
+(vllm/third_party/deep_gemm/include/deep_gemm/impls/sm100_mqa_logits.cuh of this
+tree: SM100_MMA_MXF8F6F4_SS / SM100_MMA_MXF4_SS, kIsFP32Reduce), with the FP32 head
+weights DsaIndex folds the query scale into. No value is rounded to BF16; the logits
+are bit-equal to DeepGEMM's (test_*_match_deepgemm).
 """
 
 import functools
