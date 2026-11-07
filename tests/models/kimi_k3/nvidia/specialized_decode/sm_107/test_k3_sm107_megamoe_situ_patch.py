@@ -166,6 +166,22 @@ def _reference(xq, idx, tw, w1, w2):
     return y
 
 
+def _code_sections(elf: bytes) -> dict[str, bytes]:
+    """The ``.text.*`` sections of an ELF64 cubin, by name."""
+    import struct
+
+    shoff, = struct.unpack_from("<Q", elf, 0x28)
+    shentsize, shnum, shstrndx = struct.unpack_from("<HHH", elf, 0x3A)
+    heads = [struct.unpack_from("<IIQQQQIIQQ", elf, shoff + i * shentsize) for i in range(shnum)]
+    names = heads[shstrndx]
+
+    def name(off):
+        start = names[4] + off
+        return elf[start:elf.index(b"\0", start)].decode()
+
+    return {name(h[0]): elf[h[4]:h[4] + h[5]] for h in heads if name(h[0]).startswith(".text")}
+
+
 def _worker(rank: int, nranks: int, port: int, cache: str, epr: int, cases: tuple, out: dict):
     os.environ["DG_JIT_CACHE_DIR"] = str(Path(cache) / "dg_jit")
     import torch.distributed as dist
@@ -265,8 +281,10 @@ def _worker(rank: int, nranks: int, port: int, cache: str, epr: int, cases: tupl
         ours = mk.build(src, (mk._dg_include(dg.__file__),), rank, str(Path(cache) / "stock_build"))
         theirs = next(p.parent / "kernel.cubin" for p in (Path(cache) / "dg_jit" / "cache").glob(
             "sm100_fp8_fp4_mega_moe_situ.*/kernel.cu") if src in p.read_text())
-        # (cuobjdump cannot dump an sm_100f cubin; the same NVCC command gives the same bytes)
-        assert ours.read_bytes() == theirs.read_bytes()
+        # Same machine code: equal executable sections (cuobjdump cannot dump an sm_100f cubin;
+        # the files differ in embedded build paths).
+        a, b = _code_sections(ours.read_bytes()), _code_sections(theirs.read_bytes())
+        assert a and a == b, (sorted(a), sorted(b))
     # Expert localization (VLLM_K3_MEGAMOE_LOCALIZE=1, MLOPart): each N half in its die's HBM.
     localized = hasattr(dg, "is_localization_available") and dg.is_localization_available()
     if localized:
