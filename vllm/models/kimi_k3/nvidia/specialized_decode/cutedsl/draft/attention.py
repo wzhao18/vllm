@@ -346,10 +346,10 @@ def compile_query(
     )  # fmt: skip
     with torch.accelerator.device_index(device):
         compiled = cute.compile(kernel, *args, make_fake_stream())
+        if size > 1 and gather:  # on the raw compiled kernel, before its wrapper
+            check_query_clusters(compiled, kernel, device)
         if rows > 1:
             compiled = prepare_shared_carveout(compiled, device, 100)
-        if size > 1 and gather:
-            check_query_clusters(compiled, kernel, device)
     return compiled
 
 
