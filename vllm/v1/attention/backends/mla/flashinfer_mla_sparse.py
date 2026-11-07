@@ -1079,7 +1079,10 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         layer: AttentionLayer,
         block_size: int,
         is_decode: bool,
+        return_lse: bool | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if return_lse is None:
+            return_lse = self.need_to_return_lse_for_decode
         if isinstance(q, tuple):
             ql_nope, q_pe = q
             if q_pe.shape[-1] == 0 and ql_nope.is_contiguous():
@@ -1145,7 +1148,7 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
             (num_tokens, padded_heads, self.kv_lora_rank), dtype=torch.bfloat16
         )
         lse = None
-        if self.need_to_return_lse_for_decode:
+        if return_lse:
             lse = q.new_empty((num_tokens, padded_heads), dtype=torch.float32)
 
         # One trtllm-gen request per token, and requests map to gridDim.z: a
