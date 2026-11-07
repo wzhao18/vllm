@@ -45,6 +45,7 @@ import cutlass.cute as cute
 import cutlass.pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
+import cutlass.utils.blockscaled_layout as blockscaled_utils
 import torch
 from cutlass import Float32, Int32, Int64, Uint32
 from cutlass.cute.nvgpu import cpasync, tcgen05
@@ -79,6 +80,9 @@ TOPS = 32768  # 32-bit vector maxima of a row kept in shared memory (128 KB)
 CANDIDATES = 6144  # keys at or above the bound (more: the exact fallback)
 HOT = 4096  # vectors holding a candidate (more: the exact fallback)
 LOGITS_DTYPE = torch.float32  # stock Kimi K3's indexer logits (the op's default)
+SF_DTYPE = cutlass.Float8E8M0FNU  # the MX scale factors (UE8M0)
+SF_VEC = 32  # elements per scale factor
+UNIT_SCALES = 0x7F7F7F7F  # four UE8M0 1.0 (the FP8 query's MX scales)
 
 
 # --------------------------------------------------------------------------
@@ -338,23 +342,64 @@ class IndexerScore:
     ``pitch`` > 0 (DCP): DeepGEMM's paged MQA logits layout instead, row ``t`` at
     element ``t * pitch`` (key index = column; ``pitch`` a multiple of 512, so
     1 KiB rows), no vector maxima, and every request is scored (``topk`` 0: a
-    rank's share of the global top-k is unknown before the merge)."""
+    rank's share of the global top-k is unknown before the merge).
 
-    def __init__(self, rows: int, q: int, ctas: int, topk: int, pitch: int = 0):
-        assert rows % q == 0 and 1 <= q <= 8 and rows // q <= MAX_REQUESTS
-        assert pitch % 512 == 0 and not (pitch and topk)
+    ``fp4``: MXFP4 keys and query (E2M1, one UE8M0 scale per 32 elements), else
+    FP8 E4M3 keys with their UE8M0 scales and the FP8 query at unit scales (the MX
+    inputs stock passes DeepGEMM, mqa_logits_mx_inputs). Each 128-key tile is the
+    block-scaled tcgen05 MMA chain DeepGEMM's SM100 paged MQA logits issue over
+    K = 128 (kind::mxf8f6f4: four K32 steps; kind::mxf4: two K64 steps; the scale
+    factors in TMEM), so the FP32 head scores are DeepGEMM's.
+
+    TMEM holds one [128 x N] FP32 accumulator per epilogue warpgroup and the scale
+    factors (keys: 4 columns; query: 4 per 128 rows). Where that passes its 512
+    columns (N = q x 32 = 256), each tile's MMA splits into two N / 2 halves,
+    warpgroup h taking half h of every tile (half of its rows), through a ring of
+    three N / 2 accumulators (the MMA of the next tile's first half overlaps the
+    epilogue of this one)."""
+
+    def __init__(
+        self,
+        rows: int,
+        q: int,
+        ctas: int,
+        topk: int,
+        pitch: int = 0,
+        fp4: bool = False,
+    ):
+        if rows % q or not 1 <= q <= 8 or rows // q > MAX_REQUESTS:
+            raise ValueError(f"IndexerScore: rows {rows}, q {q}")
+        if pitch % 512 or (pitch and topk):
+            raise ValueError(f"IndexerScore: pitch {pitch}, top-k {topk}")
         self.rows, self.q, self.ctas, self.topk = rows, q, ctas, topk
-        self.pitch = pitch
+        self.pitch, self.fp4 = pitch, fp4
+        self.ab = cutlass.Float4E2M1FN if fp4 else cutlass.Float8E4M3FN
         self.n = q * HEADS
-        self.tiler = (TILE, self.n, DIM)
-        self.columns = max(32, 1 << (EPI_GROUPS * self.n - 1).bit_length())
+        sfb_cols = -(-self.n // 128) * 4
+        self.halves = 1 if EPI_GROUPS * self.n + 4 + sfb_cols <= 512 else 2
+        if self.halves == 2 and q % 2:
+            raise ValueError(f"IndexerScore: q {q} splits into halves")
+        self.nt = self.n // self.halves  # MMA N
+        self.tiler = (TILE, self.nt, DIM)
+        self.sfb_half = -(-self.nt // 128) * 4  # TMEM columns of a half's query SFs
+        # Accumulator slots: one per warpgroup, or the halves' ring of three.
+        self.slots = EPI_GROUPS if self.halves == 1 else 3
+        self.sfa_col = self.slots * self.nt
+        self.sfb_col = self.sfa_col + 4
+        used = self.sfb_col + self.halves * self.sfb_half
+        self.columns = max(32, 1 << (used - 1).bit_length())
+        if self.columns > 512:
+            raise ValueError(f"IndexerScore: {used} TMEM columns")
+        # Bytes of one tile's keys and of one request's query rows.
+        self.key_bytes = TILE * DIM * self.ab.width // 8
 
     @cute.jit
     def __call__(
         self,
-        query: cute.Tensor,  # FP8 [rows * 32, 128, 1]
+        query: cute.Tensor,  # FP8 [rows * 32, 128, 1]; fp4: uint8 [rows * 32, 64, 1]
+        qscales: cute.Tensor,  # Int32 [rows * 32] (fp4: UE8M0 x4 per row and head)
         weights: cute.Tensor,  # FP32 [rows * 32]
-        keys: cute.Tensor,  # FP8 [64, 128, blocks]
+        keys: cute.Tensor,  # FP8 [64, 128, blocks]; fp4: uint8 [64, 64, blocks]
         scales: cute.Tensor,  # Int32 (UE8M0 x4) [blocks, 64]
         table_address: Int64,  # Int32 [requests, pages]: index block ids
         table_pitch: Int32,
@@ -364,19 +409,45 @@ class IndexerScore:
         tops: cute.Tensor,  # Int32 [capacity / 8]: each 8 logits' largest key
         s,
     ):
-        ab = cutlass.Float8E4M3FN
-        mma = sm100_utils.make_trivial_tiled_mma(
+        ab = self.ab
+        if cutlass.const_expr(self.fp4):
+            # The packed E2M1 bytes as 4-bit elements (two per byte).
+            query = cute.make_tensor(
+                cute.recast_ptr(query.iterator, dtype=ab),
+                cute.make_layout(
+                    (query.shape[0], DIM, 1),
+                    stride=(DIM, 1, query.shape[0] * DIM),
+                ),
+            )
+            keys = cute.make_tensor(
+                cute.recast_ptr(keys.iterator, dtype=ab),
+                cute.make_layout(
+                    (PAGE, DIM, keys.shape[2]), stride=(DIM, 1, keys.stride[2] * 2)
+                ),
+            )
+        mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
+            ab,
             ab,
             tcgen05.OperandMajorMode.K,
             tcgen05.OperandMajorMode.K,
-            Float32,
+            SF_DTYPE,
+            SF_VEC,
             tcgen05.CtaGroup.ONE,
             self.tiler[:2],
         )
         vmnk = cute.tiled_divide(cute.make_layout((1, 1, 1)), (mma.thr_id.shape,))
         a_layout = sm100_utils.make_smem_layout_a(mma, self.tiler, ab, STAGES)
-        b_layout = sm100_utils.make_smem_layout_b(mma, self.tiler, ab, 2)
-        atom = sm100_utils.make_smem_layout_atom(tcgen05.SmemLayoutAtomKind.K_SW128, ab)
+        b_layout = sm100_utils.make_smem_layout_b(mma, self.tiler, ab, 2 * self.halves)
+        sfa_layout = blockscaled_utils.make_smem_layout_sfa(
+            mma, self.tiler, SF_VEC, STAGES
+        )
+        sfb_layout = blockscaled_utils.make_smem_layout_sfb(
+            mma, self.tiler, SF_VEC, 2 * self.halves
+        )
+        kind = tcgen05.SmemLayoutAtomKind.K_SW128
+        if cutlass.const_expr(self.fp4):
+            kind = tcgen05.SmemLayoutAtomKind.K_SW64  # 128 E2M1 = 64 B rows
+        atom = sm100_utils.make_smem_layout_atom(kind, ab)
         page_layout = cute.tile_to_shape(atom, (PAGE, DIM, 2 * STAGES), (0, 1, 2))
         tma_k, tma_k_tensor = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileG2SOp(),
@@ -402,8 +473,11 @@ class IndexerScore:
             tma_q_tensor,
             a_layout,
             b_layout,
+            sfa_layout,
+            sfb_layout,
             page_layout,
             scales,
+            qscales,
             weights,
             (table_address, table_pitch, table_width),
             row_ends,
@@ -429,21 +503,24 @@ class IndexerScore:
         rows,
         bases,
     ):
-        """Verify rows [lo, hi) of one tile: relu, the head weights and the key
-        scale -> FP32 logits, and each 8 keys' largest (the select's bound)."""
-        row0, pitch, key, kscale, qs, acc, lt = rows
+        """Verify rows [lo, hi) of one tile (accumulator ``acc``'s tokens from
+        ``lo`` when the tile's MMA splits in halves, else from 0): relu and the
+        head weights -> FP32 logits, and each 8 keys' largest (the select's
+        bound)."""
+        row0, pitch, key, qs, acc, lt = rows
         out_base, tops_base = bases
+        first: cutlass.Constexpr = lo if self.halves == 2 else 0
         frags = [cute.make_fragment_like(cD, Float32) for _ in range(lo, hi)]
         for tok in cutlass.range_constexpr(lo, hi):
-            cute.copy(t2r, tAll[(None, None, None, 0, tok, acc)], frags[tok - lo])
+            src = tAll[(None, None, None, 0, tok - first, acc)]
+            cute.copy(t2r, src, frags[tok - lo])
         for tok in cutlass.range_constexpr(lo, hi):
             frag = frags[tok - lo]
             # Stock's precision (DeepGEMM SM100 paged MQA logits, FP32 weights and
-            # logits): per head 2 relu(x) = x + |x| in FP32, four FP32 FMA chains
-            # over the FP32 head weights (heads 4i, 4i + 1, 4i + 2, 4i + 3 in
-            # head order), (s0 + s2) + (s1 + s3), halved. Nothing is rounded to
-            # BF16. The key's UE8M0 scale (a power of two, inside DeepGEMM's MMA)
-            # scales the FP32 result exactly.
+            # logits): per head 2 relu(x) = x + |x| in FP32 on the block-scaled
+            # MMA's FP32 score, four FP32 FMA chains over the FP32 head weights
+            # (heads 4i, 4i + 1, 4i + 2, 4i + 3 in head order), (s0 + s2) + (s1 +
+            # s3), halved. Nothing is rounded to BF16.
             s0 = Float32(0)
             s1 = Float32(0)
             s2 = Float32(0)
@@ -458,7 +535,7 @@ class IndexerScore:
                 s3 = ffma(relu2(frag[h + 3]), bits_float(w[3]), s3)
             total = fmul(fadd(fadd(s0, s2), fadd(s1, s3)), Float32(0.5))
             element = row0 + Int64(tok) * pitch + Int64(key)
-            bits = Uint32(float_bits(fmul(total, kscale)))
+            bits = Uint32(float_bits(total))
             if cutlass.const_expr(self.pitch):
                 if key < sEnd[tok, qs]:
                     store_b32(out_base + element * 4, bits)
@@ -472,6 +549,24 @@ class IndexerScore:
                 if lt % 8 == 0:
                     store_b32(tops_base + (element >> 3) * 4, top)
 
+    @cute.jit
+    def transpose_sf(self, raw, dst, count, lane):
+        """``count`` rows' UE8M0 words (``raw``: Int32 shared pointer, row order;
+        None: unit scales) -> one 128-row block of the tcgen05 SF atom at ``dst``
+        (row r's word at (r % 32) * 4 + r // 32): lane l's 16 bytes hold rows l,
+        l + 32, l + 64, l + 96."""
+        words = []
+        for i in cutlass.range_constexpr(4):
+            word = Uint32(UNIT_SCALES)
+            if cutlass.const_expr(raw is not None):
+                word = Uint32(0)
+                if i * 32 + lane < count:
+                    word = Uint32(
+                        load_words(raw + i * 32 + lane, count=1, shared=True)[0]
+                    )
+            words.append(word)
+        store_shared_words(dst + lane * 4, tuple(words))
+
     @cute.kernel
     def kernel(
         self,
@@ -482,52 +577,58 @@ class IndexerScore:
         mQ: cute.Tensor,
         a_layout: cute.ComposedLayout,
         b_layout: cute.ComposedLayout,
+        sfa_layout: cute.Layout,
+        sfb_layout: cute.Layout,
         page_layout: cute.ComposedLayout,
         scales: cute.Tensor,
+        qscales: cute.Tensor,
         weights: cute.Tensor,
         table,
         row_ends: cute.Tensor,
         logits: cute.Tensor,
         tops: cute.Tensor,
     ):
-        Q = self.q
+        Q, H = self.q, self.halves
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
         bid, _, _ = cute.arch.block_idx()
         lane = cute.arch.lane_idx()
+        qsc_words: cutlass.Constexpr = 2 * self.n if self.fp4 else 4
 
         @cute.struct
         class Storage:
             kv_full: cute.struct.MemRange[cutlass.Int64, STAGES]
             kv_empty: cute.struct.MemRange[cutlass.Int64, STAGES]
-            sc_empty: cute.struct.MemRange[cutlass.Int64, STAGES]
             q_full: cute.struct.MemRange[cutlass.Int64, 2]
             q_empty: cute.struct.MemRange[cutlass.Int64, 2]
-            acc_full: cute.struct.MemRange[cutlass.Int64, EPI_GROUPS]
-            acc_empty: cute.struct.MemRange[cutlass.Int64, EPI_GROUPS]
+            acc_full: cute.struct.MemRange[cutlass.Int64, self.slots]
+            acc_empty: cute.struct.MemRange[cutlass.Int64, self.slots]
             tmem_hold: Int32
             row_end: cute.struct.MemRange[Int32, 8 * 2]
             start: cute.struct.MemRange[Int32, MAX_REQUESTS + 1]
             w: cute.struct.Align[cute.struct.MemRange[Float32, 2 * self.n], 16]
             scale: cute.struct.Align[cute.struct.MemRange[Int32, STAGES * TILE], 16]
+            qsc: cute.struct.Align[cute.struct.MemRange[Int32, qsc_words], 16]
 
         smem = utils.SmemAllocator()
         st = smem.allocate(Storage)
-        sA = smem.allocate_tensor(
-            cutlass.Float8E4M3FN, a_layout.outer, 1024, swizzle=a_layout.inner
-        )
-        sB = smem.allocate_tensor(
-            cutlass.Float8E4M3FN, b_layout.outer, 1024, swizzle=b_layout.inner
-        )
+        sA = smem.allocate_tensor(self.ab, a_layout.outer, 1024, swizzle=a_layout.inner)
+        sB = smem.allocate_tensor(self.ab, b_layout.outer, 1024, swizzle=b_layout.inner)
+        sSFA = smem.allocate_tensor(SF_DTYPE, sfa_layout, 128)
+        sSFB = smem.allocate_tensor(SF_DTYPE, sfb_layout, 128)
         sPage = cute.make_tensor(sA.iterator, page_layout.outer)
         sW = st.w.get_tensor(cute.make_layout((self.n, 2)))
         sEnd = st.row_end.get_tensor(cute.make_layout((8, 2)))
         sStart = st.start.get_tensor(cute.make_layout((MAX_REQUESTS + 1,)))
         sSc = st.scale.get_tensor(cute.make_layout((TILE, STAGES)))
+        sQsc = st.qsc.get_tensor(cute.make_layout((qsc_words,)))
+        # The SF atoms as 32-bit words: one 128-row block is 128 words.
+        sfa_words = cute.recast_ptr(sSFA.iterator, dtype=Int32)
+        sfb_words = cute.recast_ptr(sSFB.iterator, dtype=Int32)
+        sfb_stage: cutlass.Constexpr = self.sfb_half * 32  # words per (qs, half)
 
         kv_full = st.kv_full.data_ptr()
         kv_empty = st.kv_empty.data_ptr()
-        sc_empty = st.sc_empty.data_ptr()
         q_full = st.q_full.data_ptr()
         q_empty = st.q_empty.data_ptr()
         acc_full = st.acc_full.data_ptr()
@@ -536,11 +637,10 @@ class IndexerScore:
             for i in cutlass.range_constexpr(STAGES):
                 cute.arch.mbarrier_init(kv_full + i, 1)
                 cute.arch.mbarrier_init(kv_empty + i, 1)
-                cute.arch.mbarrier_init(sc_empty + i, 128)
             for i in cutlass.range_constexpr(2):
                 cute.arch.mbarrier_init(q_full + i, 1)
                 cute.arch.mbarrier_init(q_empty + i, 1 + 4 * EPI_GROUPS)
-            for i in cutlass.range_constexpr(EPI_GROUPS):
+            for i in cutlass.range_constexpr(self.slots):
                 cute.arch.mbarrier_init(acc_full + i, 1)
                 cute.arch.mbarrier_init(acc_empty + i, 128)
             cute.arch.mbarrier_init_fence()
@@ -559,7 +659,7 @@ class IndexerScore:
         tmem.wait_for_alloc()
         tmem_ptr = tmem.retrieve_ptr(Float32)
         acc_shape = mma.partition_shape_C(self.tiler[:2])
-        acc_fake = mma.make_fragment_C(cute.append(acc_shape, EPI_GROUPS))
+        acc_fake = mma.make_fragment_C(cute.append(acc_shape, self.slots))
         tAcc = cute.make_tensor(tmem_ptr, acc_fake.layout)
 
         # The schedule: sStart[r] = first global tile of request r (row ends are
@@ -630,6 +730,7 @@ class IndexerScore:
                 )
                 n_end = row_ends[n_req * Q + cutlass.min(lane, Q - 1)]
             has_item = n_nt > 0
+            q_tx: cutlass.Constexpr = self.n * 4 * (2 if self.fp4 else 1)
             while has_item:
                 req = n_req
                 ntile = n_nt
@@ -649,7 +750,7 @@ class IndexerScore:
                 cute.arch.sync_warp()
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive_and_expect_tx(
-                        q_full + qs, self.q_bytes + self.n * 4
+                        q_full + qs, self.q_bytes * H + q_tx
                     )
                     bulk_g2s(
                         sW.iterator + qs * self.n,
@@ -657,12 +758,20 @@ class IndexerScore:
                         q_full + qs,
                         self.n * 4,
                     )
-                cute.copy(
-                    tma_q,
-                    tQgQ[(None, req, 0, 0)],
-                    tQsQ[(None, qs)],
-                    tma_bar_ptr=q_full + qs,
-                )
+                    if cutlass.const_expr(self.fp4):
+                        bulk_g2s(
+                            sQsc.iterator + qs * self.n,
+                            qscales.iterator + req * Q * HEADS,
+                            q_full + qs,
+                            self.n * 4,
+                        )
+                for h in cutlass.range_constexpr(H):
+                    cute.copy(
+                        tma_q,
+                        tQgQ[(None, req * H + h, 0, 0)],
+                        tQsQ[(None, qs * H + h)],
+                        tma_bar_ptr=q_full + qs,
+                    )
                 j += 1
                 for t in cutlass.range(ntile, unroll=1):
                     stage = it % STAGES
@@ -673,10 +782,9 @@ class IndexerScore:
                     p1 = cutlass.min(cutlass.max(p1, Int32(0)), blocks - 1)
                     ph = ((it // STAGES) & 1) ^ 1
                     cute.arch.mbarrier_wait(kv_empty + stage, ph)
-                    cute.arch.mbarrier_wait(sc_empty + stage, ph)
                     with cute.arch.elect_one():
                         cute.arch.mbarrier_arrive_and_expect_tx(
-                            kv_full + stage, TILE * DIM + TILE * 4
+                            kv_full + stage, self.key_bytes + TILE * 4
                         )
                         # 64-bit page offsets: page ids index the whole KV pool
                         # view, so page x stride (2112 words) passes Int32 from
@@ -711,35 +819,103 @@ class IndexerScore:
         elif warp == MMA_WARP:
             tCrA = mma.make_fragment_A(sA)
             tCrB = mma.make_fragment_B(sB)
+            # The scale factors in TMEM (after the accumulators): the keys' (one
+            # slot, rewritten per tile) and the query's (one slot per half,
+            # rewritten per item). tcgen05.cp and tcgen05.mma issue in order, so a
+            # copy lands after the MMAs before it read the slot.
+            sfa_tmem = blockscaled_utils.make_tmem_layout_sfa(
+                mma, self.tiler, SF_VEC, cute.slice_(sfa_layout, (None, None, None, 0))
+            )
+            sfb_tmem = blockscaled_utils.make_tmem_layout_sfb(
+                mma, self.tiler, SF_VEC, cute.slice_(sfb_layout, (None, None, None, 0))
+            )
+            tCtSFA = cute.make_tensor(
+                cute.recast_ptr(tmem_ptr + self.sfa_col, dtype=SF_DTYPE), sfa_tmem
+            )
+            copy_atom = cute.make_copy_atom(
+                tcgen05.Cp4x32x128bOp(tcgen05.CtaGroup.ONE), SF_DTYPE
+            )
+            copy_a, src_a, dst_a = s2t_partition(copy_atom, sSFA, tCtSFA)
+            tCtSFB = []
+            copies_b = []
+            for h in cutlass.range_constexpr(H):
+                col = self.sfb_col + h * self.sfb_half
+                tSF = cute.make_tensor(
+                    cute.recast_ptr(tmem_ptr + col, dtype=SF_DTYPE), sfb_tmem
+                )
+                tCtSFB.append(tSF)
+                copies_b.append(s2t_partition(copy_atom, sSFB, tSF))
+            if cutlass.const_expr(not self.fp4):
+                # The FP8 query's unit scales (UE8M0 127), in every query stage.
+                for b in cutlass.range_constexpr(2 * H * self.sfb_half // 4):
+                    self.transpose_sf(None, sfb_words + b * 128, 0, lane)
+                cute.arch.fence_proxy("async.shared", space="cta")
+                cute.arch.sync_warp()
             while g < hi:
                 _req, _k0, ntile, g, r = _next_item(sStart, requests, g, r, hi)
                 qs = j % 2
                 cute.arch.mbarrier_wait(q_full + qs, (j // 2) & 1)
+                if cutlass.const_expr(self.fp4):
+                    # This item's query scale words -> the SF atom of each half.
+                    for h in cutlass.range_constexpr(H):
+                        for b in cutlass.range_constexpr(self.sfb_half // 4):
+                            q_raw = sQsc.iterator + qs * self.n + h * self.nt + b * 128
+                            q_dst = sfb_words + (qs * H + h) * sfb_stage + b * 128
+                            count = min(self.nt - b * 128, 128)
+                            self.transpose_sf(q_raw, q_dst, count, lane)
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    cute.arch.sync_warp()
+                for h in cutlass.range_constexpr(H):
+                    copy_b, src_b, dst_b = copies_b[h]
+                    cute.copy(
+                        copy_b, src_b[(None, None, None, None, qs * H + h)], dst_b
+                    )
                 for _t in cutlass.range(ntile, unroll=1):
                     stage = it % STAGES
-                    a = it % EPI_GROUPS
-                    cute.arch.mbarrier_wait(acc_empty + a, ((it // EPI_GROUPS) & 1) ^ 1)
                     cute.arch.mbarrier_wait(kv_full + stage, (it // STAGES) & 1)
-                    mma.set(tcgen05.Field.ACCUMULATE, False)
-                    for kb in cutlass.range_constexpr(cute.size(tCrA, mode=[2])):
-                        cute.gemm(
-                            mma,
-                            tAcc[(None, None, None, a)],
-                            tCrA[(None, None, kb, stage)],
-                            tCrB[(None, None, kb, qs)],
-                            tAcc[(None, None, None, a)],
-                        )
-                        mma.set(tcgen05.Field.ACCUMULATE, True)
+                    # The tile's key scale words (key order) -> the SF atom.
+                    k_raw = sSc.iterator + stage * TILE
+                    self.transpose_sf(k_raw, sfa_words + stage * 128, TILE, lane)
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    cute.arch.sync_warp()
+                    cute.copy(copy_a, src_a[(None, None, None, None, stage)], dst_a)
+                    for h in cutlass.range_constexpr(H):
+                        # Accumulator slot a of this (half-)tile, free once its
+                        # previous user's epilogue read it.
+                        a = it % EPI_GROUPS
+                        ph = ((it // EPI_GROUPS) & 1) ^ 1
+                        if cutlass.const_expr(H == 2):
+                            k = it * 2 + h
+                            a = k % 3
+                            ph = ((k // 3) & 1) ^ 1
+                        cute.arch.mbarrier_wait(acc_empty + a, ph)
+                        mma.set(tcgen05.Field.ACCUMULATE, False)
+                        for kb in cutlass.range_constexpr(cute.size(tCrA, mode=[2])):
+                            mma.set(
+                                tcgen05.Field.SFA, tCtSFA[(None, None, kb)].iterator
+                            )
+                            mma.set(
+                                tcgen05.Field.SFB, tCtSFB[h][(None, None, kb)].iterator
+                            )
+                            cute.gemm(
+                                mma,
+                                tAcc[(None, None, None, a)],
+                                tCrA[(None, None, kb, stage)],
+                                tCrB[(None, None, kb, qs * H + h)],
+                                tAcc[(None, None, None, a)],
+                            )
+                            mma.set(tcgen05.Field.ACCUMULATE, True)
+                        with cute.arch.elect_one():
+                            tcgen05.commit(acc_full + a)
                     with cute.arch.elect_one():
                         tcgen05.commit(kv_empty + stage)
-                        tcgen05.commit(acc_full + a)
                     it += 1
                 with cute.arch.elect_one():
                     tcgen05.commit(q_empty + qs)
                 j += 1
         else:
-            # Epilogue: warpgroup ``acc`` owns TMEM accumulator acc (every other
-            # tile).
+            # Epilogue: warpgroup ``acc`` owns TMEM accumulator acc: every other
+            # tile, or (halves) half ``acc`` of every tile's rows from the ring.
             acc = warp // 4
             lt = tidx % 128
             ld_atom = cute.make_copy_atom(
@@ -751,6 +927,7 @@ class IndexerScore:
             tAll = thr.partition_S(acc_cols)
             cD = thr.partition_D(cute.make_identity_tensor((TILE, HEADS)))
             bases = logits.iterator.toint(), tops.iterator.toint()
+            half: cutlass.Constexpr = Q // 2
             while g < hi:
                 req, k0, ntile, g, r = _next_item(sStart, requests, g, r, hi)
                 if cutlass.const_expr(self.pitch):
@@ -763,22 +940,27 @@ class IndexerScore:
                 qs = j % 2
                 cute.arch.mbarrier_wait(q_full + qs, (j // 2) & 1)
                 for t in cutlass.range(ntile, unroll=1):
-                    if it % EPI_GROUPS == acc:
-                        stage = it % STAGES
+                    if cutlass.const_expr(H == 2):
                         key = k0 + t * TILE + lt
-                        cute.arch.mbarrier_wait(kv_full + stage, (it // STAGES) & 1)
-                        # Read before the arrive frees the stage: else the next
-                        # tile's scale copy can land under it (wrong key scales).
-                        scale_at = sSc.iterator + stage * TILE + lt
-                        scale_bits = load_shared_acquire(scale_at)
-                        cute.arch.mbarrier_arrive(sc_empty + stage)
-                        # UE8M0: the low byte is the biased exponent.
-                        kscale = cute.math.exp2(Float32((scale_bits & 0xFF) - 127))
-                        cute.arch.mbarrier_wait(acc_full + acc, (it // EPI_GROUPS) & 1)
-                        rows = row0, pitch, key, kscale, qs, acc, lt
-                        self.rows_out(0, Q, t2r, tAll, cD, sW, sEnd, rows, bases)
+                        k = it * 2 + acc
+                        slot = k % 3
+                        cute.arch.mbarrier_wait(acc_full + slot, (k // 3) & 1)
+                        rows = row0, pitch, key, qs, slot, lt
+                        if acc == 0:
+                            self.rows_out(0, half, t2r, tAll, cD, sW, sEnd, rows, bases)
+                        else:
+                            self.rows_out(half, Q, t2r, tAll, cD, sW, sEnd, rows, bases)
                         cute.arch.fence_view_async_tmem_load()
-                        cute.arch.mbarrier_arrive(acc_empty + acc)
+                        cute.arch.mbarrier_arrive(acc_empty + slot)
+                    else:
+                        if it % EPI_GROUPS == acc:
+                            key = k0 + t * TILE + lt
+                            ph = (it // EPI_GROUPS) & 1
+                            cute.arch.mbarrier_wait(acc_full + acc, ph)
+                            rows = row0, pitch, key, qs, acc, lt
+                            self.rows_out(0, Q, t2r, tAll, cD, sW, sEnd, rows, bases)
+                            cute.arch.fence_view_async_tmem_load()
+                            cute.arch.mbarrier_arrive(acc_empty + acc)
                     it += 1
                 cute.arch.sync_warp()
                 if lane == 0:
@@ -789,6 +971,17 @@ class IndexerScore:
         if warp == MMA_WARP:
             tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)
+
+
+def s2t_partition(copy_atom, sSF, tSF):
+    """The tcgen05.cp (4x32dp128bit) of a staged SF atom in shared memory into its
+    TMEM slot: (tiled copy, source descriptors (.., stage), destination)."""
+    tiled = tcgen05.make_s2t_copy(copy_atom, cute.filter_zeros(tSF))
+    thr = tiled.get_slice(0)
+    source = tcgen05.get_s2t_smem_desc_tensor(
+        tiled, thr.partition_S(cute.filter_zeros(sSF))
+    )
+    return tiled, source, thr.partition_D(cute.filter_zeros(tSF))
 
 
 # --------------------------------------------------------------------------
@@ -808,6 +1001,9 @@ class IndexerSelect:
       hybrid models whose attention pages match the mamba state's) of the
       selected keys, -1 past the row's count; ``ids`` (``logical``): the key
       indices too;
+    - "compact_ids" (TP, the same scratch and maxima as "rows"): ``out`` [rows,
+      topk] the key indices, -1 past the count (the top-k buffer a FlashMLA
+      sparse decode reads);
     - "ids" (row ``t`` at ``t * pitch`` FP32 elements, DeepGEMM's layout):
       ``out`` [rows, topk] the key indices, -1 past the count;
     - "candidates" (the same layout; DCP, this rank's local logits): ``out``
@@ -839,10 +1035,16 @@ class IndexerSelect:
         world: int = 1,
         interleave: int = 1,
     ):
-        assert topk % SELECT_THREADS == 0 and rows % q == 0
-        assert page > 0 and page & (page - 1) == 0, page
-        assert mode in ("rows", "ids", "candidates"), mode
+        if topk % SELECT_THREADS or rows % q:
+            raise ValueError(f"IndexerSelect: top-k {topk}, rows {rows}, q {q}")
+        if page <= 0 or page & (page - 1):
+            raise ValueError(f"IndexerSelect: page {page}")
+        if mode not in ("rows", "compact_ids", "ids", "candidates"):
+            raise ValueError(f"IndexerSelect: mode {mode!r}")
         self.rows, self.q, self.topk, self.mode = rows, q, topk, mode
+        # The scorer's request-compact scratch and 8-key maxima (TP), else rows of
+        # ``pitch`` FP32 elements (DeepGEMM's layout).
+        self.compact = mode in ("rows", "compact_ids")
         self.logical = logical and mode == "rows"
         # release: launch the next kernel early (PDL). Off when it reads the rows
         # without waiting for this grid first (FlashInfer prims_ts' split-KV decode
@@ -892,7 +1094,7 @@ class IndexerSelect:
             out[row, pos] = page * block_rows + (index & ((1 << shift) - 1))
             if cutlass.const_expr(self.logical):
                 ids[row, pos] = index
-        elif cutlass.const_expr(self.mode == "ids"):
+        elif cutlass.const_expr(self.mode in ("ids", "compact_ids")):
             out[row, pos] = index
         else:
             span: cutlass.Constexpr = self.interleave
@@ -920,7 +1122,7 @@ class IndexerSelect:
         if v < TOPS:  # noqa: SIM108 (a branch: the global load stays conditional)
             top = tops_s[v]
         else:
-            if cutlass.const_expr(self.mode == "rows"):
+            if cutlass.const_expr(self.compact):
                 top = Uint32(load_words(tops_address + Int64(v) * 4, count=1)[0])
             else:
                 top = vector_max(vector_keys(vector_words(address, v), v, length))
@@ -986,7 +1188,7 @@ class IndexerSelect:
         hot_list = smem.allocate_tensor(Int32, cute.make_layout(HOT), 16)
         tops_s = smem.allocate_tensor(Uint32, cute.make_layout(TOPS), 16)
 
-        if cutlass.const_expr(self.mode == "rows"):  # noqa: SIM102 (constexpr)
+        if cutlass.const_expr(self.compact):  # noqa: SIM102 (constexpr)
             # This row's logits: request ``request``'s row ``row % Q`` of the
             # scratch.
             if warp == 0:
@@ -1008,7 +1210,7 @@ class IndexerSelect:
         length = row_ends[row]
         address = base + Int64(row) * Int64(pitch) * 4
         tops_address = Int64(0)
-        if cutlass.const_expr(self.mode == "rows"):
+        if cutlass.const_expr(self.compact):
             element = Int64(info[0]) * Int64(TILE * Q)
             element += Int64(row % Q) * Int64(info[1]) * Int64(TILE)
             address = base + element * 4
@@ -1071,7 +1273,7 @@ class IndexerSelect:
 
         # Pass 1: the top 11 bits of the vector maxima (dense: of the keys); the
         # maxima of the first TOPS vectors into shared memory.
-        if cutlass.const_expr(self.mode == "rows"):
+        if cutlass.const_expr(self.compact):
             if dense:
                 self.maxima_pass(address, vectors, length, dense, hist, tops_s, tid)
             else:
@@ -1299,6 +1501,23 @@ class IndexerSelect:
 _SCRATCH: dict = {}
 
 
+def kv_cache_blocks():
+    """The 64-token blocks the KV cache holds, if known before it is allocated (a
+    num_gpu_blocks override, or a cache already sized): a request's context fits in
+    it, so it bounds the fused indexer's logits with the longest context. None if
+    unknown (the KV cache is sized after the specialized decode is built)."""
+    from vllm.config import get_current_vllm_config_or_none
+
+    config = get_current_vllm_config_or_none()
+    if config is None:
+        return None
+    cache = config.cache_config
+    blocks = cache.num_gpu_blocks or cache.num_gpu_blocks_override
+    if not blocks or not cache.block_size:
+        return None
+    return -(-blocks * cache.block_size // PAGE)
+
+
 def logits_scratch(device, elements: int, name: str = "logits") -> torch.Tensor:
     """One int32 scratch (FP32 logits bits, or 32-bit maxima) per device shared by
     every layer (every layer prepares before any graph capture, so the last,
@@ -1318,6 +1537,13 @@ def select_outputs(device, rows, topk, fill=-1):
     out = torch.full((rows, topk), fill, dtype=torch.int32, device=device)
     valid = torch.zeros(rows, dtype=torch.int32, device=device)
     return out, valid, torch.zeros(rows, dtype=torch.int32, device=device)
+
+
+@functools.cache
+def unit_scales(device, rows):
+    """The FP8 query's scale words [rows * 32] int32 the scorer takes (unread: its
+    MX scales are the unit ones), shared by every layer."""
+    return torch.zeros(rows * HEADS, dtype=torch.int32, device=device)
 
 
 def dcp_interleave(indexer) -> int:
@@ -1360,6 +1586,7 @@ def reserve(indexer, device, max_rows, dcp=False, blocks=None):
     logits = logits_scratch(device, capacity)
     tops = logits_scratch(device, capacity // 8, "tops")
     out, valid, ends = select_outputs(device, max_rows, indexer.topk_tokens)
+    unit_scales(device, max_rows)
     return logits, tops, out, valid, ends, pitch
 
 
@@ -1386,13 +1613,15 @@ def static_unsupported(indexer, rows, q) -> str | None:
 
 
 def supports(indexer, rows, q) -> str | None:
-    """Why the fused indexer cannot run this layer (None: it can)."""
+    """Why the fused indexer cannot run this layer (None: it can): FP8 [blocks, 64,
+    132] or MXFP4 [blocks, 64, 68] pages (keys, then their UE8M0 x4 words)."""
     reason = static_unsupported(indexer, rows, q)
     cache = indexer.k_cache.kv_cache
+    width = DIM // 2 + 4 if indexer.use_fp4_cache else DIM + 4
     if reason is None and (
-        cache.dim() != 3 or cache.shape[1] != PAGE or cache.shape[2] != DIM + 4
+        cache.dim() != 3 or cache.shape[1] != PAGE or cache.shape[2] != width
     ):
-        reason = f"indexer cache {tuple(cache.shape)} (needs FP8 [blocks, 64, 132])"
+        reason = f"indexer cache {tuple(cache.shape)} (needs [blocks, 64, {width}])"
     return reason
 
 
@@ -1449,36 +1678,45 @@ def compile_indexer(
     pitch=0,
     release=True,
     page=PAGE,
+    fp4=False,
+    mode="rows",
 ):
     """The score and (TP) select kernels of one (rows, q) for an indexer cache
     layout (every DSA layer's is the same). DCP (``pitch``): the scorer only, into
     DeepGEMM-layout logits. ``page``: the MLA cache's tokens per block (TP
-    select)."""
-    score = IndexerScore(rows, q, ctas, 0 if pitch else topk, pitch)
-    fp8 = cutlass.Float8E4M3FN
+    select); ``mode``: the select's ("rows": physical rows, "compact_ids": the
+    key indices); ``fp4``: MXFP4 keys and query."""
+    score = IndexerScore(rows, q, ctas, 0 if pitch else topk, pitch, fp4)
+    width = DIM // 2 if fp4 else DIM
+    element = torch.uint8 if fp4 else cutlass.Float8E4M3FN
     with torch.accelerator.device_index(device):
-        query = fake((rows * HEADS, DIM, 1), (DIM, 1, rows * HEADS * DIM), fp8)
+        query = fake(
+            (rows * HEADS, width, 1), (width, 1, rows * HEADS * width), element
+        )
+        qscales = fake((rows * HEADS,), (1,), torch.int32)
         weights = fake((rows * HEADS,), (1,), torch.float32)
-        key_view = fake(*keys, fp8)
+        key_view = fake(*keys, element)
         scale_view = fake(*scales, torch.int32)
         table = Int64(0), Int32(0), Int32(0)
         ends = fake((rows,), (1,), torch.int32, 4)
         scratch = fake(logits, (1,), cutlass.Int32)
         maxima = fake(tops, (1,), cutlass.Int32)
         s = make_fake_stream()
-        args = query, weights, key_view, scale_view, *table, ends, scratch, maxima, s
-        score_kernel = cute.compile(score, *args)
+        args = query, qscales, weights, key_view, scale_view, *table, ends
+        score_kernel = cute.compile(score, *args, scratch, maxima, s)
     if pitch:
         return score_kernel, None
-    select = compile_select(rows, q, topk, "rows", device, tops[0], ids, release, page)
-    return score_kernel, select
+    args = rows, q, topk, mode, device, tops[0], ids, release, page
+    return score_kernel, compile_select(*args)
 
 
 class FusedIndexer:
     """The fused decode indexer of one DSA layer, compiled per (rows, q) for the
-    layer's indexer cache. TP: ``run`` -> (physical rows [B, topk] of the MLA
-    cache, valid counts [B]). DCP (``dcp``): ``run_dcp`` scores this rank's keys
-    into DeepGEMM's FP32 logits layout (the DCP top-k, dcp_topk.py, selects)."""
+    layer's indexer cache (FP8 or MXFP4 keys). TP: ``run`` -> (physical rows [B,
+    topk] of the MLA cache, valid counts [B]), or (``ids``) ``run_ids`` -> the
+    top-k key indices in a buffer. DCP (``dcp``): ``run_dcp`` scores this rank's
+    keys into DeepGEMM's FP32 logits layout (the DCP top-k, dcp_topk.py,
+    selects)."""
 
     def __init__(
         self,
@@ -1489,27 +1727,43 @@ class FusedIndexer:
         dcp=False,
         hold=(),
         page=PAGE,
+        ids=False,
     ):
+        from .index import fp4_query_views, is_fp4_cache
+
         cache = indexer.k_cache.kv_cache
+        for shape in shapes:
+            reason = supports(indexer, *shape)
+            if reason is not None:
+                raise ValueError(
+                    f"Kimi K3.1 specialized DSA: the indexer scorer cannot run rows x "
+                    f"q {shape[0]}x{shape[1]} ({reason})"
+                )
         # The (rows, q) whose select must not launch the next kernel early (TP: it
         # is a decode that reads the rows before its PDL wait; IndexerSelect).
         self.hold = frozenset(hold)
         self.indexer, self.device, self.page = indexer, device, page
         self.topk = indexer.topk_tokens
+        self.fp4 = is_fp4_cache(cache)
+        self._fp4_query = fp4_query_views
+        self.mode = "compact_ids" if ids else "rows"
+        if ids and dcp:
+            raise ValueError("FusedIndexer: ids is a TP mode")
         blocks, unit = cache.shape[0], cache.stride(0)
-        self.keys = torch.as_strided(cache, (PAGE, DIM, blocks), (DIM, 1, unit)).view(
-            torch.float8_e4m3fn
-        )
+        width = DIM // 2 if self.fp4 else DIM  # key bytes
+        keys = torch.as_strided(cache, (PAGE, width, blocks), (width, 1, unit))
+        self.keys = keys if self.fp4 else keys.view(torch.float8_e4m3fn)
         words = cache.view(torch.int32)
         self.scales = torch.as_strided(
             words,
             (blocks, PAGE),
             (unit // 4, 1),
-            storage_offset=words.storage_offset() + PAGE * DIM // 4,
+            storage_offset=words.storage_offset() + PAGE * width // 4,
         )
         buffers = reserve(indexer, device, max_rows, dcp, blocks)
         self.logits, self.tops, self.out, self.valid, self.ends, self.pitch = buffers
         self.ctas = torch.cuda.get_device_properties(device).multi_processor_count
+        self.unit_scales = unit_scales(device, max_rows)
         self.ids: torch.Tensor | None = None
         self.kernels = {shape: self.compile(*shape) for shape in shapes}
 
@@ -1521,12 +1775,15 @@ class FusedIndexer:
         args = rows, q, self.topk, self.ctas, keys, scales, logits, tops
         args += (self.device.index, self.ids is not None, self.pitch)
         release = (rows, q) not in self.hold
-        return compile_indexer(*args, release=release, page=self.page)
+        return compile_indexer(
+            *args, release=release, page=self.page, fp4=self.fp4, mode=self.mode
+        )
 
     def write_ids(self, ids: torch.Tensor):
         """Also write the selected key indices (the logical top-k, -1 past the
-        count) into ``ids`` [>= rows, topk] (tests; TP only)."""
-        assert not self.pitch
+        count) into ``ids`` [>= rows, topk] (tests; TP "rows" only)."""
+        if self.pitch or self.mode != "rows":
+            raise ValueError("FusedIndexer.write_ids: TP physical rows only")
         self.ids = ids
         self.kernels = {shape: self.compile(*shape) for shape in self.kernels}
 
@@ -1536,13 +1793,15 @@ class FusedIndexer:
     @staticmethod
     def _table(t):
         """(address, row pitch, width) of an int32 block table view."""
-        assert t.dtype == torch.int32 and t.stride(1) == 1
+        if t.dtype != torch.int32 or t.stride(1) != 1:
+            raise ValueError(f"FusedIndexer: int32 block table rows, {t.dtype}")
         return Int64(t.data_ptr()), Int32(t.stride(0)), Int32(t.shape[1])
 
     def score(self, q_fp8, head_w, index_decode, rows, q):
         """The scorer over the step's rows -> the per-row ends (cute)."""
         score, _ = self.kernels[rows, q]
-        assert head_w.dtype == torch.float32, head_w.dtype
+        if head_w.dtype != torch.float32:
+            raise TypeError(f"FusedIndexer: FP32 head weights, got {head_w.dtype}")
         ends = index_decode.seq_lens.reshape(-1)
         index_table = index_decode.block_table
         if q > 1 and index_table.shape[0] == ends.shape[0]:
@@ -1552,13 +1811,23 @@ class FusedIndexer:
             self.ends[: ends.shape[0]].copy_(ends)
             ends = self.ends
         ends = ends[:rows]
-        query = torch.as_strided(
-            q_fp8[:rows].view(torch.float8_e4m3fn),
-            (rows * HEADS, DIM, 1),
-            (DIM, 1, rows * HEADS * DIM),
-        )
+        if self.fp4:  # DsaIndex's E2M1 rows and UE8M0 x4 words of the step
+            packed, qscales = self._fp4_query(q_fp8, rows, rows)
+            width = DIM // 2
+            query = torch.as_strided(
+                packed, (rows * HEADS, width, 1), (width, 1, rows * HEADS * width)
+            )
+            qscales = qscales.reshape(-1)
+        else:
+            query = torch.as_strided(
+                q_fp8[:rows].view(torch.float8_e4m3fn),
+                (rows * HEADS, DIM, 1),
+                (DIM, 1, rows * HEADS * DIM),
+            )
+            qscales = self.unit_scales[: rows * HEADS]
         score(
             to_cute(query),
+            to_cute(qscales),
             to_cute(head_w[:rows].reshape(-1)),
             to_cute(self.keys),
             to_cute(self.scales),
@@ -1573,7 +1842,8 @@ class FusedIndexer:
     def run(self, q_fp8, head_w, index_decode, block_table, block_rows, rows, q):
         """TP. ``index_decode``: the indexer's decode metadata (per-row ends and
         index block table); ``block_table`` / ``block_rows``: the MLA cache's."""
-        assert not self.pitch
+        if self.pitch or self.mode != "rows":
+            raise RuntimeError("FusedIndexer.run: a TP physical-rows indexer")
         _, select = self.kernels[rows, q]
         ends = self.score(q_fp8, head_w, index_decode, rows, q)
         out, valid = self.out[:rows], self.valid[:rows]
@@ -1593,10 +1863,37 @@ class FusedIndexer:
         )
         return out, valid
 
+    def run_ids(self, q_fp8, head_w, index_decode, rows, q, buffer):
+        """TP: the exact top-k key indices of the step's ``rows`` rows into
+        ``buffer`` [>= rows, topk] int32 (-1 past each row's count)."""
+        if self.pitch or self.mode != "compact_ids":
+            raise RuntimeError("FusedIndexer.run_ids: a TP ids indexer")
+        if buffer.dtype != torch.int32 or buffer.stride(0) != self.topk:
+            raise ValueError(f"FusedIndexer.run_ids: int32 [rows, {self.topk}] buffer")
+        _, select = self.kernels[rows, q]
+        ends = self.score(q_fp8, head_w, index_decode, rows, q)
+        out = buffer[:rows]
+        select(
+            Int64(self.logits.data_ptr()),
+            Int32(0),
+            to_cute(self.tops),
+            to_cute(ends, 4),
+            Int64(0),
+            Int32(0),
+            Int32(0),
+            Int32(0),
+            to_cute(out, 4),
+            to_cute(self.valid[:rows], 4),
+            to_cute(out, 4),
+            stream(self.device),
+        )
+        return buffer
+
     def run_dcp(self, q_fp8, head_w, index_decode, rows, q):
         """DCP -> (the FP32 logits [rows, pitch] of this rank's keys in DeepGEMM's
         layout, the row ends [rows])."""
-        assert self.pitch
+        if not self.pitch:
+            raise RuntimeError("FusedIndexer.run_dcp: a DCP indexer")
         ends = self.score(q_fp8, head_w, index_decode, rows, q)
         logits = self.logits[: rows * self.pitch].view(torch.float32)
         return logits.view(rows, self.pitch), ends

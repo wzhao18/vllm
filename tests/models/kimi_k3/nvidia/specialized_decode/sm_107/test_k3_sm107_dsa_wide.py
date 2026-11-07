@@ -541,6 +541,9 @@ def test_flashinfer_dcp_core_merges_to_full_attention(
     from types import SimpleNamespace
 
     from vllm.model_executor.layers.linear import ColumnParallelLinear
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.compat.dcp_index import (
+        filter_and_convert_dcp_index,
+    )
     from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.wide import (
         WideDsa,
     )
@@ -548,6 +551,7 @@ def test_flashinfer_dcp_core_merges_to_full_attention(
     from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
         FlashInferMLASparseImpl,
     )
+    from vllm.v1.attention.backends.mla.sparse_utils import flat_kv_row_view
 
     if kernel == "prims_ts" and (reason := prims_ts_sparse_mla_format_error("native")):
         pytest.skip(reason)
@@ -640,16 +644,30 @@ def test_flashinfer_dcp_core_merges_to_full_attention(
                 dcp_rank=rank, cp_kv_cache_interleave_size=interleave
             ),
         )
+        # This rank's slots of the global ids (as the FP32 DCP top-k gives them).
+        _, stride_rows = flat_kv_row_view(cache, block)
+        merged = filter_and_convert_dcp_index(
+            md.req_id_per_token[:rows],
+            md.block_table,
+            tokens[:rows],
+            dcp_size=dcp,
+            dcp_rank=rank,
+            cp_kv_cache_interleave_size=interleave,
+            BLOCK_SIZE=block,
+            BLOCK_STRIDE_ROWS=stride_rows,
+            NUM_TOPK_TOKENS=tokens.shape[1],
+            return_valid_counts=True,
+        )
         if cap > 64:
             # Wide rows read the widened box passed in, not the layer's own 64-row
             # box (here: garbage).
             own = torch.full_like(box[:, :64], 0x7F)
             core.box = SimpleNamespace(q=own)
             row, lse, valid = WideDsa.dcp_core(
-                core, cache, tokens, md, rows, SimpleNamespace(q=box)
+                core, cache, md, rows, SimpleNamespace(q=box), merged
             )
         else:
-            row, lse, valid = WideDsa.dcp_core(core, cache, tokens, md, rows)
+            row, lse, valid = WideDsa.dcp_core(core, cache, md, rows, core.box, merged)
         # Per-row counts of this rank's top-k entries (DcpValue "proj" reads them).
         owned = (owner[tokens.long().clamp(min=0)] == rank) & (tokens >= 0)
         assert torch.equal(valid.view(-1).long(), owned.sum(1)), rank

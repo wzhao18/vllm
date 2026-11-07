@@ -48,21 +48,6 @@ DEEPGEMM = pytest.mark.skipif(
 )
 
 
-def init_sm107_dcp_topk_merge(config, topk):
-    """The DCP top-k merge as the SM107 model build sets it up: the stock indexer's
-    N (``KimiK3DSAIndexer.__init__``: stock ``init_dcp_topk_merge``), then the sm_107
-    copy's rescue workspace and round-1 mailbox for that (K, N)
-    (``integration.init_dsa_merge``). Returns N (0: no merge). Collective."""
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels.dcp_topk_merge import (  # noqa: E501
-        init_dcp_topk_merge,
-    )
-    from vllm.v1.attention.ops.dcp_topk_merge import (
-        init_dcp_topk_merge as init_stock_dcp_topk_merge,
-    )
-
-    return init_dcp_topk_merge(config, topk, init_stock_dcp_topk_merge(config, topk))
-
-
 def no_prims_ts():
     """Why FlashInfer's prims_ts sparse MLA cannot run here, else None (SM107:
     FlashInfer 0.7.2 has none, 0.7.3 accepts SM100 / SM103 only)."""
@@ -854,6 +839,8 @@ FUSED_INDEXER_CASES = {
     # Past 64 rows (the attention cores serve up to 320): R48 / R64 at q5.
     "wide240": ([9000 + 61 * r for r in range(48)], 5),
     "wide320": ([3000 + 257 * r for r in range(64)], 5),
+    # q8 (DL7): N = 256 query rows, each tile's MMA in two halves (TMEM).
+    "q8": ([20000, 4000, 70000, 2000], 8),
 }
 
 
@@ -914,9 +901,11 @@ def deepgemm_head_sum(score, weights):
 
 
 def check_fused_logits(got, x, t, r, length):
-    """Row ``t`` (request ``r``) of the fused scorer's FP32 logits against stock's
-    precision (deepgemm_head_sum) over the dequantized keys: equal up to the FP32
-    q . k summation order of the MMA (no value is rounded to BF16)."""
+    """Row ``t`` (request ``r``) of the fused scorer's FP32 logits against a torch
+    emulation of stock's precision (deepgemm_head_sum over the key-scaled q . k):
+    within the FP32 rounding of the q . k sums, whose order (the MMA's) torch does
+    not reproduce (no value is rounded to BF16). Bit equality with stock is
+    checked against the real DeepGEMM kernel (test_*_match_deepgemm)."""
     if length == 0:  # a padded row: nothing scored
         return
     got = got.view(torch.float32)
@@ -924,9 +913,10 @@ def check_fused_logits(got, x, t, r, length):
     blk = x.table[r][pos // UNIT].long()
     k = x.keys[blk, pos % UNIT].float()
     scale = torch.exp2(x.exps[blk, pos % UNIT].float() - 127)
-    score = torch.relu(x.query[t].float() @ k.T)
-    ref = deepgemm_head_sum(score, x.weights[t]) * scale
-    terms = (score * x.weights[t].float()[:, None]).abs().sum(0) * scale
+    # The key's UE8M0 scale inside the q . k sum, as DeepGEMM's block-scaled MMA.
+    score = torch.relu((x.query[t].float() @ k.T) * scale)
+    ref = deepgemm_head_sum(score, x.weights[t])
+    terms = (score * x.weights[t].float()[:, None]).abs().sum(0)
     bound = terms * 2**-18 + 1e-30
     assert bool(((got - ref).abs() <= bound).all()), t
     assert (got == ref).float().mean() > 0.9, t
@@ -1008,6 +998,7 @@ def test_fused_indexer_selects_exact_topk(case, gap, mla_page):
     )
     indexer = SimpleNamespace(
         k_cache=SimpleNamespace(kv_cache=x.index),
+        use_fp4_cache=False,
         topk_tokens=topk,
         max_model_len=1 << 20,
     )
@@ -1042,7 +1033,7 @@ def test_fused_indexer_selects_exact_topk(case, gap, mla_page):
 
 
 @DEEPGEMM
-@pytest.mark.parametrize("case", ["mixed", "long", "ties", "q1_64", "wide240"])
+@pytest.mark.parametrize("case", ["mixed", "long", "ties", "q1_64", "wide240", "q8"])
 def test_fused_indexer_logits_match_deepgemm(case):
     """The fused scorer's FP32 logits against main's stock Kimi K3 logits (DeepGEMM
     fp8_fp4_paged_mqa_logits, FP32 head weights and logits) of the same FP8 query,
@@ -1061,6 +1052,7 @@ def test_fused_indexer_logits_match_deepgemm(case):
     )
     indexer = SimpleNamespace(
         k_cache=SimpleNamespace(kv_cache=x.index),
+        use_fp4_cache=False,
         topk_tokens=topk,
         max_model_len=1 << 20,
     )
@@ -1089,8 +1081,211 @@ def test_fused_indexer_logits_match_deepgemm(case):
         if length > topk:
             assert torch.equal(ids[t].long(), exact_topk(ref, topk)), t
     print(f"{case}: {equal}/{total} logits bit-equal to DeepGEMM's")
-    # Measured on VR: every logit bit-equal (the same FP32 reduction order).
+    # Measured on VR: every logit bit-equal (the same block-scaled MMA and FP32
+    # reduction order).
     assert equal == total
+
+
+@DEEPGEMM
+@pytest.mark.parametrize("case", ["mixed", "long", "ties", "q1_64", "wide320", "q8"])
+def test_fused_indexer_dcp_logits_match_deepgemm(case):
+    """The DCP scorer (FusedIndexer.run_dcp: this rank's keys in DeepGEMM's logits
+    layout, DCP8's pitch) against DeepGEMM fp8_fp4_paged_mqa_logits (FP32 head
+    weights and logits) of the same FP8 query, head weights and keys: bit-equal
+    on every scored element."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.indexer import (
+        FusedIndexer,
+    )
+
+    contexts, q = FUSED_INDEXER_CASES[case]
+    x = fused_indexer_inputs(contexts, q, 0, case == "ties", len(contexts) * 17 + q)
+    rows = len(contexts) * q
+    decode = SimpleNamespace(
+        seq_lens=x.ends.view(rows, 1), block_table=x.table.repeat_interleave(q, 0)
+    )
+    indexer = SimpleNamespace(
+        k_cache=SimpleNamespace(kv_cache=x.index),
+        topk_tokens=2048,
+        max_model_len=1 << 20,
+        use_fp4_cache=False,
+        dcp_world_size=8,
+        cp_kv_cache_interleave_size=1,
+    )
+    device = torch.device("cuda")
+    fused = FusedIndexer(indexer, [(rows, q)], device, max(64, rows), dcp=True)
+    logits, ends = fused.run_dcp(x.query.view(torch.uint8), x.weights, decode, rows, q)
+    stock = deepgemm_logits(x, x.ends, q, rows)
+    torch.accelerator.synchronize()
+    equal = total = 0
+    for t in range(rows):
+        n = int(x.ends[t])
+        equal += int(
+            (logits[t, :n].view(torch.int32) == stock[t, :n].view(torch.int32)).sum()
+        )
+        total += n
+    print(f"{case}: {equal}/{total} DCP logits bit-equal to DeepGEMM's")
+    assert equal == total
+
+
+# IndexerSelect over pitched FP32 rows ("ids": TP's ids of DeepGEMM-layout logits;
+# "candidates": a DCP rank's local top-K words): rows on the dense bound (< 2K
+# vectors), on the vector-maxima bound, past the shared maxima (TOPS vectors: the
+# rest recomputed from the logits), tie-heavy rows (the exact fallback past the
+# candidate list), and K = 4096 (HOT = 4096 vectors: the hot list overflows on every
+# long row, so the exact fallback serves them).
+SELECT_CASES = {
+    "dense": ([3000, 2049, 15000], 2048, False),
+    "maxima": ([16400, 70000, 200000], 2048, False),
+    "past_tops": ([270000, 300000], 2048, False),
+    "ties": ([20000, 300000], 2048, True),
+    "k4096": ([4096, 4097, 40000, 270000], 4096, False),
+    "k4096_ties": ([9000, 70000], 4096, True),
+}
+
+
+@pytest.mark.parametrize("mode", ["ids", "candidates"])
+@pytest.mark.parametrize("case", list(SELECT_CASES))
+def test_select_pitched_exact(case, mode):
+    """IndexerSelect on pitched FP32 logits rows: exactly each row's top-K (ties to
+    the lowest key index), in key order, -1 past the count ("ids"), or the local
+    top-K words of rank 3 of DCP4 ("candidates": check_local_candidates)."""
+    from cutlass import Int32, Int64
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.common.host import (
+        stream,
+        to_cute,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.indexer import (
+        compile_select,
+    )
+
+    lengths, topk, ties = SELECT_CASES[case]
+    gen = torch.Generator(device="cuda").manual_seed(len(lengths) * 7 + topk)
+    rows = len(lengths)
+    pitch = -(-max(lengths) // 512) * 512
+    logits = torch.randn(rows, pitch, device="cuda", generator=gen)
+    if ties:
+        logits = (logits * 2).round()
+    ends = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    if mode == "candidates":
+        words, counts = local_candidates(logits, ends, 3, 4, 1, topk)
+        torch.accelerator.synchronize()
+        check_local_candidates(words, counts, logits, ends, 3, 4)
+        return
+    out = torch.full((rows, topk), -7, dtype=torch.int32, device="cuda")
+    valid = torch.full((rows,), -7, dtype=torch.int32, device="cuda")
+    select = compile_select(rows, 1, topk, "ids", 0, 1)
+    dummy = torch.zeros(1, dtype=torch.int32, device="cuda")
+    select(
+        Int64(logits.data_ptr()),
+        Int32(pitch),
+        to_cute(dummy, 4),
+        to_cute(ends, 4),
+        Int64(0),
+        Int32(0),
+        Int32(0),
+        Int32(0),
+        to_cute(out, 4),
+        to_cute(valid, 4),
+        to_cute(out, 4),
+        stream(torch.device("cuda")),
+    )
+    torch.accelerator.synchronize()
+    for t, n in enumerate(lengths):
+        k = min(n, topk)
+        assert int(valid[t]) == k, t
+        assert torch.equal(out[t, :k].long(), exact_topk(logits[t, :n], topk)), t
+        assert bool((out[t, k:] == -1).all()), t
+
+
+def test_indexer_stage_refuses():
+    """No silent stock fallback in the indexer stage (fast or raise): a step the
+    specialized decode does not run (prefill rows, non-uniform decode lengths, more
+    rows than the stage holds, per-request lengths), BF16 head weights, and a top-k
+    the layer did not build raise; so do a scorer shape it cannot run (q 9) and a
+    DCP top-k wider than its shared candidates."""
+    import vllm.forward_context
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa import (
+        indexer_stage,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.dcp_topk import (  # noqa: E501
+        DcpTopk,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.indexer import (
+        FusedIndexer,
+        IndexerScore,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.shapes import Uncovered
+
+    dev = torch.device("cuda")
+    prefix = "model.layers.3.self_attn.indexer.k_cache"
+    md = SimpleNamespace(
+        num_prefills=0,
+        num_decode_tokens=8,
+        decode=SimpleNamespace(
+            requires_padding=False,
+            decode_lens=torch.ones(8, dtype=torch.int32),
+            seq_lens=torch.ones(8, 1, dtype=torch.int32),
+        ),
+    )
+    context = SimpleNamespace(attn_metadata={prefix: md})
+    stage = indexer_stage.IndexerStage.__new__(indexer_stage.IndexerStage)
+    stage.indexer = SimpleNamespace(k_cache=SimpleNamespace(prefix=prefix))
+    stage.max_rows, stage.local_topk, stage.fused = 8, 0, None
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(vllm.forward_context, "get_forward_context", lambda: context)
+        assert stage.decode_step(8)[1] == 8
+        for field, value in (("num_prefills", 1), ("num_decode_tokens", 9)):
+            bad = SimpleNamespace(**{**vars(md), field: value})
+            context.attn_metadata[prefix] = bad
+            with pytest.raises(Uncovered):
+                stage.decode_step(8 if field == "num_prefills" else 16)
+        decode = SimpleNamespace(**{**vars(md.decode), "requires_padding": True})
+        context.attn_metadata[prefix] = SimpleNamespace(
+            **{**vars(md), "decode": decode}
+        )
+        with pytest.raises(Uncovered, match="non-uniform"):
+            stage.decode_step(8)
+        decode = SimpleNamespace(**{**vars(md.decode), "seq_lens": torch.ones(4)})
+        context.attn_metadata[prefix] = SimpleNamespace(
+            **{**vars(md), "decode": decode}
+        )
+        with pytest.raises(Uncovered, match="lengths"):
+            stage.decode_step(8)
+    bf16 = torch.zeros(8, 32, dtype=torch.bfloat16)
+    with pytest.raises(TypeError, match="FP32"):
+        stage.run(None, bf16, 8)
+    with pytest.raises(TypeError, match="FP32"):
+        stage.merge_rows(None, bf16, None, 0, 8)
+    fp32 = bf16.float()
+    with pytest.raises(RuntimeError, match="not built"):
+        stage.run(None, fp32, 8)
+    with pytest.raises(RuntimeError, match="not built"):
+        stage.merge_rows(None, fp32, None, 0, 8)
+    with pytest.raises(ValueError):
+        IndexerScore(9, 9, 1, 2048)
+    x = fused_indexer_inputs([3000], 1, 0, False, 1)
+    indexer = SimpleNamespace(
+        k_cache=SimpleNamespace(kv_cache=x.index),
+        topk_tokens=2048,
+        max_model_len=1 << 20,
+        use_fp4_cache=True,  # an FP8 cache read as MXFP4
+    )
+    with pytest.raises(ValueError, match="indexer cache"):
+        FusedIndexer(indexer, [(1, 1)], dev, 64)
+    indexer.use_fp4_cache = False
+    fused = FusedIndexer(indexer, [(1, 1)], dev, 64, ids=True)
+    decode = SimpleNamespace(seq_lens=x.ends.view(1, 1), block_table=x.table)
+    with pytest.raises(TypeError, match="FP32"):
+        fused.score(x.query.view(torch.uint8), x.weights.bfloat16(), decode, 1, 1)
+    with pytest.raises(RuntimeError):
+        fused.run_dcp(x.query.view(torch.uint8), x.weights, decode, 1, 1)
+    merge = DcpTopk(2048, 4, 0, 1, dev, 8)
+    logits = torch.zeros(16, 512, device=dev)
+    ends = torch.zeros(16, dtype=torch.int32, device=dev)
+    rows = torch.zeros(16, 2048, dtype=torch.int32, device=dev)
+    with pytest.raises(ValueError, match="candidates hold 8"):
+        merge.run(logits, ends, ends, rows, 64, 64, rows, ends)
 
 
 DCP_INDEXER_CASES = {
@@ -1198,6 +1393,7 @@ def check_fused_dcp(contexts, q, world, case, seed):
     )
     indexer = SimpleNamespace(
         k_cache=SimpleNamespace(kv_cache=x.index),
+        use_fp4_cache=False,
         topk_tokens=2048,
         max_model_len=1 << 20,
         dcp_world_size=world,
@@ -1226,7 +1422,7 @@ def test_fused_indexer_dcp(case):
 
 
 DCP_MERGE_CASES = {
-    # (global contexts, world, interleave, ties)
+    # (global contexts, world, interleave, ties[, topk])
     "short": ([500, 3000, 9000], 4, 1, False),
     "mixed": ([500, 30000, 90000, 200000], 8, 1, False),
     "ties": ([30000, 90000, 2100], 8, 1, True),
@@ -1234,6 +1430,12 @@ DCP_MERGE_CASES = {
     "w16_ties": ([40000, 2047, 2049], 16, 1, True),
     "interleave64": ([5000, 40000], 4, 64, False),
     "empty_rank": ([3, 2], 8, 1, False),  # ranks with no keys of a row
+    # Local rows on the vector-maxima bound (>= 2K vectors) and past the shared
+    # maxima (> TOPS vectors), and K = 4096.
+    "long_local": ([300000, 70000], 4, 1, False),
+    "past_tops": ([1100000], 4, 1, False),
+    "k4096": ([40000, 9000, 4097], 8, 1, False, 4096),
+    "k4096_ties": ([300000, 30000], 4, 1, True, 4096),
 }
 
 
@@ -1245,7 +1447,8 @@ def test_dcp_topk_merge_exact(case):
     top-K by (FP32 score desc, global id asc) — stock's FP32 merge key
     (dcp_topk_score_bits(FP32) = 32) — as the global ids, and this rank's
     physical KV rows of the owned ones in its local key order, -1 after, with
-    their counts."""
+    their counts. Stock's FP32 merge of the same candidates (its CuTe DSL packer
+    and stable selector) selects the same ids."""
     from cutlass import Int32, Int64
 
     from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.common.host import (
@@ -1256,8 +1459,8 @@ def test_dcp_topk_merge_exact(case):
         compile_merge,
     )
 
-    lengths, world, span, ties = DCP_MERGE_CASES[case]
-    topk, block, stride_rows = 2048, 64, 64 + GAP
+    lengths, world, span, ties, *k = DCP_MERGE_CASES[case]
+    topk, block, stride_rows = k[0] if k else 2048, 64, 64 + GAP
     gen = torch.Generator(device="cuda").manual_seed(len(lengths) * 31 + world)
     scores = [torch.randn(n, device="cuda", generator=gen) for n in lengths]
     if ties:
@@ -1272,7 +1475,7 @@ def test_dcp_topk_merge_exact(case):
     perm = torch.randperm(rows * pages * 2, device="cuda", generator=gen)
     table = perm[: rows * pages].int().view(rows, pages).contiguous()
     req_id = torch.arange(rows, dtype=torch.int32, device="cuda")
-    shards = []
+    shards, locals_, local_ends = [], [], []
     for r in range(world):
         local = torch.full((rows, pitch), float("nan"), device="cuda")
         ends = torch.zeros(rows, dtype=torch.int32, device="cuda")
@@ -1285,7 +1488,12 @@ def test_dcp_topk_merge_exact(case):
         torch.accelerator.synchronize()
         check_local_candidates(words, counts, local, ends, r, world, span)
         shards.append(words)
+        locals_.append(local.nan_to_num(nan=-1e30))  # (stock's packer reads them)
+        local_ends.append(ends)
     gathered = torch.cat(shards).contiguous()  # rank-major, as the all-gather
+    # Stock's FP32 merge (its packer and stable selector, 32 score bits) of the
+    # same local top-K: the same global ids.
+    stock = stock_dcp_merge(locals_, local_ends, 0, world, span, topk)
     merge = compile_merge(rows, world, topk, span, True, 0)
     for r in range(world):
         rows_out = torch.full((rows, topk), 9, dtype=torch.int32, device="cuda")
@@ -1310,6 +1518,8 @@ def test_dcp_topk_merge_exact(case):
             want = exact_topk(scores[t], topk)  # global ids, ties to the lowest
             k = min(n, topk)
             assert torch.equal(ids[t, :k].long().sort().values, want), (r, t)
+            stock_ids = stock[t][stock[t] >= 0].long().sort().values
+            assert torch.equal(stock_ids, want), (r, t)
             assert bool((ids[t, k:] == -1).all()), (r, t)
             owner, idx = owner_local(want)
             mine = idx[owner == r].sort().values
@@ -1385,6 +1595,7 @@ def test_fused_indexer_high_pages(mode):
     )
     indexer = SimpleNamespace(
         k_cache=SimpleNamespace(kv_cache=index),
+        use_fp4_cache=False,
         topk_tokens=2048,
         # DCP: a rank's keys of a context (interleave 1) size the logits rows; TP:
         # small, as the request-compact logits scale with it.
@@ -1437,9 +1648,6 @@ def test_flashinfer_dcp_core_merges_to_full_attention(
     )
     from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.prepared import (
         PreparedDsa,
-    )
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.shapes import (
-        target_topology,
     )
     from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
         FlashInferMLASparseImpl,
@@ -1527,20 +1735,26 @@ def test_flashinfer_dcp_core_merges_to_full_attention(
         box[0] = query
         buffers = fi_buffers(rows_n, 128)
         fi = FlashInferCore(impl, layer, 128, buffers, {rows_n: kernel}, dcp, rank)
+
+        # This rank's rows of the global ids ``tokens`` (the stock DCP filter, as
+        # the FP32 DCP top-k's merge gives them), from the indexer stage.
+        def merge_rows(q_fp8, head_w, md_, stride_rows, batch, q_=1, fi=fi):
+            return fi.convert(tokens, md_, batch, stride_rows, 1)
+
         core = SimpleNamespace(
             fi=fi,
             impl=impl,
             count_stats=None,
             indexer=SimpleNamespace(cp_kv_cache_interleave_size=1),
+            indexer_stage=SimpleNamespace(merge_rows=merge_rows),
+            query_stage=SimpleNamespace(q_fp8=None, head_w=None),
             parity=0,
             box=SimpleNamespace(q=box),
-            # PreparedDsa's: NQ-NOFALLBACK applies on TP16 = DCP16 only (DCP8 here)
-            strict=target_topology(True, dcp, dcp, q),
         )
         # Stale rows and LSEs of an earlier layer must not leak into empty rows.
         buffers[2].fill_(float("nan"))
         buffers[3].fill_(1.0)
-        row, lse, valid = PreparedDsa.dcp_core(core, cache, tokens, md, rows_n)
+        row, lse, valid = PreparedDsa.dcp_core(core, cache, md, rows_n)
         assert row.shape == (rows_n, 128, 512) and lse.shape == (rows_n, 128)
         assert row.data_ptr() == buffers[2].data_ptr()
         assert lse.data_ptr() == buffers[3].data_ptr()
@@ -2132,7 +2346,6 @@ def run_layer_step(
     offset=0,
     replays=5,
     sparse_core=None,
-    exchange=False,
     skew=False,
 ):
     """One decode step of a real DSA layer (``q`` rows per request, contexts on
@@ -2154,14 +2367,10 @@ def run_layer_step(
     sparse core's variant (dsa_core.decode.parse_variant) at every row, as
     VLLM_K31_DSA_CORE=1 serves it (its own pushes and DcpValue(pushed); with
     ``graph`` the merge's rows and counts are still poisoned before each layer).
-    ``exchange``: under DCP, DcpExchange's top-k (dcp_exchange.decode.DcpxDecode)
-    attached after the stock forward (which keeps the #63 merge), as the model's
-    process_weights_after_loading attaches it: merge_rows gives PreparedDsa's step to
-    it (and the core, with build()'s PDL rows), its slots and counts are poisoned
-    before each captured layer, and the step's top-k is its slots as global ids;
-    with ``sparse_core`` the step also runs on FlashInfer's chain over the
-    exchange's rows (``chain_out``). ``skew``: the first half of the ranks score
-    their old keys 2^SKEW_EXP higher."""
+    Under DCP the top-k is the FP32 DCP top-k (every rank's local top-K, the
+    all-gather and the exact merge), which also writes the global ids for the
+    checks. ``skew``: the first half of the ranks score their old keys 2^SKEW_EXP
+    higher."""
     from vllm import _custom_ops as ops
     from vllm import ir
     from vllm.config import set_current_vllm_config
@@ -2309,32 +2518,9 @@ def run_layer_step(
         policy: dict = dict(queries=(q,), overlap=overlap, core="auto")
         policy.update(fi_policy(attn, kernel, cache_dtype))
         core_calls: list = []
-        topk_calls: list = []
-        dcpx = None
-        pdl_rows = 0
-        if exchange:
-            from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels.dcp_exchange.decode import (
-                DcpxDecode,
-                topk_pdl_rows,
-            )
-
-            assert world > 1
-            dcpx = DcpxDecode(config, dev, HEADS * world, indexer.topk_tokens)
-            assert "topk" in dcpx.parts, dcpx.parts
-            dcpx.attach(attn)
-            dcpx.warm()
-            dcpx.serve()  # peer waits of VLLM_K31_DCP_EXCHANGE_SPIN_S
-            pdl_rows = topk_pdl_rows()
-            run_topk = dcpx.decode_topk
-
-            def counted_topk(*args, **kwargs):
-                topk_calls.append(args[1].shape[0])
-                return run_topk(*args, **kwargs)
-
-            dcpx.decode_topk = counted_topk  # (the hook's late lookup)
         if sparse_core is not None:
             assert world > 1
-            indexer.dsac = sparse_dsa_core(dev, HEADS * world, sparse_core, pdl_rows)
+            indexer.dsac = sparse_dsa_core(dev, HEADS * world, sparse_core)
             indexer.dsac_layer = 0
         if world > 1:
             runtime = SimpleNamespace(
@@ -2351,14 +2537,6 @@ def run_layer_step(
                 attn, {batch: packed.shape[0]}, scratch_rows, **policy, parity=1
             )
             layers.append(second.prepare_cache(ours_mla))
-        chain = chain_out = None
-        if dcpx is not None and sparse_core is not None:
-            # The step on FlashInfer's chain over the same exchanged rows (the
-            # other parity, as the next layer).
-            chain = PreparedDsa(
-                attn, {batch: packed.shape[0]}, scratch_rows, **policy, parity=1
-            )
-            chain.prepare_cache(ours_mla).core_step = lambda *_: None
         # prims_ts' plans share one workspace (attn_fi._Plans): each decode runs
         # on the stream the layer runs on, never on a query overlap side stream.
         layer_streams: list = []
@@ -2388,16 +2566,14 @@ def run_layer_step(
             prepared.fused.write_ids(topk_buffer)  # the fused indexer's top-k
         out = torch.empty(batch, HEADS * 128, device=dev, dtype=bf)
         merge = prepared.indexer_stage
-        if world > 1 and flashinfer:
+        if world > 1:
             # The FP32 DCP top-k (every rank's local top-K and the merge; stock's
-            # FP32 rule: no one-round #63 merge); ours also writes the global ids
-            # for the top-k check below.
+            # FP32 rule: no one-round #63 merge) over the scorer's FP32 logits;
+            # ours also writes the global ids for the top-k check below.
             assert merge.local_topk == indexer.topk_tokens
+            assert merge.fused is not None and merge.fused.pitch
             merge.dcp_ids = topk_buffer
-            merge.warm(UNIT, [batch])  # its ids variant, before any capture
-            # The fused DCP scorer feeds it where it serves the layer's cache
-            # (RUBIN_DCP_FUSED_INDEXER on Rubin), else DeepGEMM's FP32 logits.
-            assert (merge.fused is not None) == prepared.dcp_fused
+            merge.warm([batch])  # its ids variant, before any capture
         topk_buffer.fill_(-1)
         if prepared.overlaps[batch, q] in ("fork", "front") and rank == 0:
             # Hold back the forked query (and under DCP rank 0's publish): the
@@ -2418,21 +2594,12 @@ def run_layer_step(
             )
 
         with context:
-            exchanged = rank_counts = None
-            if dcpx is not None:
-                # merge_rows gives the step to the exchange: no #63 merge, no ids.
-                assert merge.merge_source(batch) == ("exchange", batch)
+            rank_counts = None
             run()
-            if dcpx is not None:
-                # This rank's slots and counts; as every rank's global ids for the
-                # checks below, and every rank's counts.
-                exchanged = merge.dcp_rows[:batch].clone(), dcpx.counts[:batch].clone()
-                topk_buffer[:batch] = exchange_ids(*exchanged, md, index_md, ours_mla)
-                rank_counts = get_dcp_group().all_gather(exchanged[1], dim=0)
+            if world > 1:  # every rank's counts of the step
+                counts = merge.dcp_valid[:batch].clone()
+                rank_counts = get_dcp_group().all_gather(counts, dim=0)
                 rank_counts = rank_counts.view(world, batch)
-            if chain is not None:
-                chain_out = torch.full_like(out, float("nan"))
-                run(chain, chain_out)
             if graph and world > 1:
                 from vllm.distributed.parallel_state import graph_capture
 
@@ -2448,8 +2615,6 @@ def run_layer_step(
                         stage = layer.indexer_stage
                         stage.dcp_rows.fill_(0)
                         stage.dcp_valid.fill_(stage.topk)
-                        if dcpx is not None:  # the exchange's counts
-                            dcpx.counts.fill_(stage.topk)
                         layer.fi.latent.fill_(float("nan"))
                         layer.fi.lse.fill_(float("nan"))
                         run(layer, rows)
@@ -2481,8 +2646,6 @@ def run_layer_step(
                 for _ in range(5):
                     g.replay()
         torch.accelerator.synchronize()
-        if dcpx is not None:
-            dcpx.ex.check()  # no peer wait timed out, every row's K-th key found
         off_stream = [(s, main) for s, main in prims_ts_streams if s != main]
         assert not off_stream, off_stream
         owned = None
@@ -2498,7 +2661,7 @@ def run_layer_step(
                 local_slots(md, ids[:batch], world, rank, 1, stride_rows)
                 for ids in (topk_buffer, stock_topk)
             ]
-            merged = exchanged or (merge.dcp_rows[:batch], merge.dcp_valid[:batch])
+            merged = merge.dcp_rows[:batch], merge.dcp_valid[:batch]
             owned = (merged, *filtered)
         # The fused indexer's top-k (TP) or the merge of its scores (DCP) against
         # the exact top-k of its own query. The stock top-k is measured against the
@@ -2534,50 +2697,20 @@ def run_layer_step(
         owned=owned,
         prims_ts_calls=len(prims_ts_streams),
         core_calls=core_calls,
-        topk_calls=topk_calls,
         rank_counts=rank_counts,
-        chain_out=chain_out,
         lengths=torch.tensor([c + j + 1 for c in contexts for j in range(q)]),
     )
 
 
-def sparse_dsa_core(device, heads, variant, pdl_rows=0):
+def sparse_dsa_core(device, heads, variant):
     """The DSA sparse core (dsa_core.decode.DsacDecode) serving ``variant`` at every
-    row up to 64 (``pdl_rows``: build()'s under DcpExchange's top-k)."""
+    row up to 64."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels.dsa_core.decode import (
         DsacDecode,
     )
 
     spec = f"1-64:{variant}"
-    return DsacDecode(device, heads, rows=64, spec=spec, skip="", pdl_rows=pdl_rows)
-
-
-def exchange_ids(slots, counts, md, index_md, cache):
-    """DcpExchange's top-k of a DCP step (this rank's KV slots [T, K] and counts [T])
-    as the global ids [T, K] of every rank's, as its BPRIME check maps them
-    (dcp_topk_merge.check; collective)."""
-    from vllm.distributed import get_dcp_group
-    from vllm.v1.attention.backends.mla.sparse_utils import flat_kv_row_view
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.compat.dcp_topk_merge_check import (
-        exchange_slot_ids,
-        merge_exchange_ids,
-    )
-
-    group = get_dcp_group()
-    _, stride = flat_kv_row_view(cache, md.block_size)
-    mine = exchange_slot_ids(
-        slots,
-        counts,
-        md.block_table,
-        md.req_id_per_token,
-        md.block_size,
-        stride,
-        index_md.decode.seq_lens.reshape(-1),
-        group.rank_in_group,
-        group.world_size,
-    )
-    every = group.all_gather(mine, dim=0)
-    return merge_exchange_ids(every.view(group.world_size, *mine.shape))
+    return DsacDecode(device, heads, rows=64, spec=spec, skip="")
 
 
 def exact_topk_widths(index, table, contexts, q, query, weights, ids, world=1):
@@ -2836,11 +2969,8 @@ def test_rubin_dcp_policy():
     FlashInfer kernels where FlashInfer plans prims_ts (SM107 too since
     flashinfer#8186), else trtllm-gen alone, and prims_ts alone on nvfp4_ds_mla;
     under DCP the query overlap is the cluster IndexFront ("front") up to 16 rows
-    and the fork from 17; the #63 merge reads DeepGEMM's logits (no fused DCP
-    indexer). GB300 keeps #108's policies."""
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa import (
-        prepared,
-    )
+    and the fork from 17. (The indexer is sm_107's scorer on every device: no
+    policy.) GB300 keeps #108's policies."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.attn_fi import (
         KERNELS,
         fi_kernels,
@@ -2857,7 +2987,6 @@ def test_rubin_dcp_policy():
     assert modes == ["front"] * 3 + ["fork"] * 5, modes
     assert all(overlap_for(b, None, True, False) == "front" for b in rows)
     assert overlap_for(64, "serial", True, True) == "serial"
-    assert prepared.RUBIN_DCP_FUSED_INDEXER  # the FP32 DCP scorer beats DeepGEMM
 
 
 @pytest.mark.parametrize("case", list(DCP16_INDEXER_CASES))
@@ -3006,8 +3135,7 @@ def check_prepare_allocates_nothing(core, world=1, partials="bf16"):
             torch.accelerator.synchronize()
             gc.collect()
             fused = prepared.fused if world == 1 else prepared.indexer_stage.fused
-            # (Under DCP on Rubin the merge reads DeepGEMM's logits: no fused one.)
-            assert (fused is not None) == (world == 1 or prepared.dcp_fused)
+            assert fused is not None  # the scorer serves every layer
             grown = torch.cuda.memory_allocated(dev) - bound
             assert grown == 0, f"prepare_cache allocated {grown} bytes"
 
@@ -3135,17 +3263,6 @@ def dcp8_group():
             tensor_model_parallel_size=world, decode_context_model_parallel_size=world
         )
         init_workspace_manager(torch.device("cuda", local))
-        # The exact DCP top-k merge's rescue workspace (once per process, as the
-        # model's first DSA layer does): sized for the widest DSpark verify step
-        # the tests run (64 requests x 5 = 320 rows).
-        from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels.dcp_topk_merge import (  # noqa: E501
-            dcp_topk_merge_max_rows,
-        )
-
-        wide = layer_config("fi-trtllm", 5, world)
-        with set_current_vllm_config(wide):
-            n = init_sm107_dcp_topk_merge(wide, 2048)
-        assert n and dcp_topk_merge_max_rows(2048, n) >= (320 if world == 8 else 64)
         yield world
         reset_workspace_manager()
     HEADS = heads
@@ -3270,10 +3387,11 @@ def test_prepared_dsa_dcp_sparse_core_partials(dcp8_group, batch, partials):
     assert len(step.core_calls) == (3 if served else 0), step.core_calls
 
 
-# DcpExchange's core steps: "short" the existing contexts (0.6K: the exchange selects
-# every key; 2.1K), else every row past the top-k (6.6K and 8.1K token contexts);
-# "skewed", the first half of the ranks score their old keys 2^SKEW_EXP higher.
-EXCHANGE_OFFSET, SKEW_EXP = 6000, 8
+# The DSA sparse core's steps over the FP32 DCP top-k: "short" the existing contexts
+# (0.6K: every key selected; 2.1K), else every row past the top-k (6.6K and 8.1K
+# token contexts); "skewed", the first half of the ranks score their old keys
+# 2^SKEW_EXP higher.
+LONG_OFFSET, SKEW_EXP = 6000, 8
 
 
 @pytest.mark.skipif(DCP_INIT is None, reason="needs an 8-rank launch (DCP8)")
@@ -3281,40 +3399,17 @@ EXCHANGE_OFFSET, SKEW_EXP = 6000, 8
 @pytest.mark.parametrize("overlap", [None, "fork"])
 @pytest.mark.parametrize("rows", ["short", "balanced", "skewed"])
 @pytest.mark.parametrize("batch", [8, 16])
-def test_prepared_dsa_dcp_sparse_core_exchange(
-    dcp8_group, monkeypatch, batch, rows, overlap
-):
-    """test_prepared_dsa_dcp_sparse_core with DcpExchange's top-k feeding the core
-    (VLLM_K31_DCP_EXCHANGE, PARTS=topk, and VLLM_K31_DSA_CORE at 1-16:2x16s2) at q8:
-    a DcpxDecode attached after the stock forward (which keeps the #63 merge), as
-    process_weights_after_loading attaches it, gives merge_rows the step and every
-    rank's core its slots and counts. The exchanged top-k, as global ids, holds
-    min(K, length) keys a row, is exact and is the stock one up to near-ties; the
-    rows entering o_proj are the stock forward's where the top-k is the same
-    (check_layer_step: every "short" M8 row; past ~6K tokens the two paths' query
-    rounding moves keys at the K-th, so few rows or none) and, every row, those of
-    FlashInfer's chain over the exchange's rows; in a CUDA graph of two layers on
-    alternating parities with the exchange's slots and counts poisoned before each,
-    200 replays give the eager rows bit for bit. Skewed: the first half of the ranks
-    score their old keys 2^8 higher (positive logits first, negative ones last), so
-    a row's counts differ twofold over the ranks (else never). At most
-    K31_DCPX_PDL rows (default 16) the exchange's top-k launches with PDL and the
-    core keeps out (its q poll precedes its PDL wait), FlashInfer decoding the
-    exchange's rows: K31_DCPX_PDL=0 gives the core M8 and M16."""
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels import hooks
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels.dcp_exchange import (
-        decode as dcpx,
-    )
-
-    # This case's layer alone takes the exchange (the other tests: the #63 merge).
-    monkeypatch.setattr(hooks, "DCP_DECODE_TOPK_HOOKS", {})
-    monkeypatch.setattr(hooks, "_LOCAL_TOPK_COUNTS", {})
-    monkeypatch.setenv(dcpx.PARTS_ENV, "topk")
-    monkeypatch.setenv(dcpx.ENV + "_ONE_ROUND_ROWS", "256")
-    monkeypatch.delenv(dcpx.ENV + "_TIES", raising=False)  # (rank, position)
-    monkeypatch.delenv(dcpx.GRAPH_ONLY_ENV, raising=False)
-    # A rank still compiling its first case's kernels must not trap its peers.
-    monkeypatch.setenv(dcpx.SPIN_ENV, "120")
+def test_prepared_dsa_dcp_sparse_core_rows(dcp8_group, batch, rows, overlap):
+    """test_prepared_dsa_dcp_sparse_core (VLLM_K31_DSA_CORE at 1-64:2x16s2, q8) on
+    the FP32 DCP top-k's rows of short, long and rank-skewed contexts: every rank's
+    core decodes its rows of the exact global top-k, which hold min(K, length) keys
+    a row over the ranks; on skewed rows a row's counts differ twofold over the
+    ranks (else never). The step is the stock forward's where the top-k is the
+    same (check_layer_step: every "short" M8 row), this rank's rows are those of
+    its global ids, and in a CUDA graph of two layers on alternating parities with
+    the merge's rows and counts poisoned before each, 200 replays give the eager
+    rows bit for bit (no core reads its rows before the merge: DcpMerge does not
+    launch it early)."""
     step = run_layer_step(
         "fi-trtllm",
         batch,
@@ -3323,10 +3418,9 @@ def test_prepared_dsa_dcp_sparse_core_exchange(
         overlap,
         "bf16",
         graph=True,
-        offset=0 if rows == "short" else EXCHANGE_OFFSET,
+        offset=0 if rows == "short" else LONG_OFFSET,
         replays=200,
         sparse_core="2x16s2",
-        exchange=True,
         skew=rows == "skewed",
     )
     check_layer_step(step, 8, reference=False)
@@ -3343,11 +3437,6 @@ def test_prepared_dsa_dcp_sparse_core_exchange(
         assert -1 not in merged[t] and merged[t] == ours[t], t
         if same[t]:
             assert merged[t] == stock[t], t
-    # Every row against FlashInfer's chain over the same rows.
-    core_rows, chain_rows = step.out.float(), step.chain_out.float()
-    error = float((core_rows - chain_rows).norm() / chain_rows.norm())
-    print(f"relative error vs FlashInfer over the exchanged rows: {error:.4f}")
-    torch.testing.assert_close(step.out, step.chain_out, atol=2e-2, rtol=2e-2)
     counts = step.rank_counts  # [ranks, rows]
     low, high = counts.amin(0), counts.amax(0)
     print(f"ranks' counts by row: min {low.tolist()} max {high.tolist()}")
@@ -3355,89 +3444,37 @@ def test_prepared_dsa_dcp_sparse_core_exchange(
     assert bool((counts.sum(0) == keys).all()), (counts.sum(0), keys)
     skewed = high >= 2 * low.clamp(min=1)
     assert bool(skewed.any()) == (rows == "skewed"), (low, high)
-    # the eager step, the chain's and the two captured layers: the exchange's top-k
-    # each, and the core but on the chain and after a PDL top-k
-    assert step.topk_calls == [batch] * 4, step.topk_calls
-    pdl_rows = dcpx.topk_pdl_rows()
-    print(f"core calls {len(step.core_calls)} (K31_DCPX_PDL rows {pdl_rows})")
-    assert len(step.core_calls) == 3 * (batch > pdl_rows), step.core_calls
-
-
-@pytest.mark.skipif(DCP_INIT is None, reason="needs an 8-rank launch (DCP8)")
-@pytest.mark.skip_global_cleanup  # the DCP8 group outlives each case
-@pytest.mark.parametrize("batch", [8, 64])
-@pytest.mark.parametrize("core", ["fi-trtllm", "fi-nvfp4"])
-def test_prepared_dsa_dcp_exchange_proj(dcp8_group, monkeypatch, core, batch):
-    """PreparedDsa's "proj" rows (partials "proj") fed by DcpExchange's
-    top-k (VLLM_K31_DCP_EXCHANGE, PARTS=topk, as served) at q8, DL7's C1 and C8
-    rows (at most K31_DCPX_PDL rows the top-k launches with PDL): FlashInfer
-    decodes the exchange's rows, the W_UV bmm projects them and DcpValue("proj")
-    merges, as the stock DCP forward of the step where the top-k is the same
-    (check_layer_step: every row of the short M8 context); in a CUDA graph of two
-    layers on alternating parities, the exchange's slots and counts poisoned
-    before each, 200 replays give the eager rows bit for bit."""
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels import hooks
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels.dcp_exchange import (
-        decode as dcpx,
-    )
-
-    if LAYER_CORES[core][2] == "prims_ts" and no_prims_ts():
-        pytest.skip("FlashInfer prims_ts sparse MLA cannot run here")
-    # This case's layer alone takes the exchange (the other tests: the #63 merge).
-    monkeypatch.setattr(hooks, "DCP_DECODE_TOPK_HOOKS", {})
-    monkeypatch.setattr(hooks, "_LOCAL_TOPK_COUNTS", {})
-    monkeypatch.setenv(dcpx.PARTS_ENV, "topk")
-    monkeypatch.setenv(dcpx.ENV + "_ONE_ROUND_ROWS", "256")
-    monkeypatch.delenv(dcpx.ENV + "_TIES", raising=False)  # (rank, position)
-    monkeypatch.delenv(dcpx.GRAPH_ONLY_ENV, raising=False)
-    monkeypatch.setenv(dcpx.SPIN_ENV, "120")
-    step = run_layer_step(
-        core, batch, 8, dcp8_group, None, "proj", graph=True, replays=200, exchange=True
-    )
-    check_layer_step(step, 8, reference=False)
-    same = [
-        set(step.topk[t].tolist()) == set(step.stock_topk[t].tolist())
-        for t in range(batch)
-    ]
-    print(f"rows of the stock top-k: {sum(same)} of {batch}")
-    assert all(same) or batch != 8, same
     # the eager step and the two captured layers
-    assert step.topk_calls == [batch] * 3, step.topk_calls
+    assert len(step.core_calls) == 3, step.core_calls
 
 
-# DcpExchange's top-k feeding WideDsa above 96 rows at DCP16: DL7's C64 band (q8 at
-# 128 and 256 rows, a widened DSA box of 256) and DL3's (q4 at 128 and 256 rows, the
-# exchange's one-round top-k, and its widest step at 512 rows; a box of 512: the
-# cap-128 tree's).
-WIDE_EXCHANGE_CASES = [(128, 8), (256, 8), (128, 4), (256, 4), (512, 4)]
-WIDE_EXCHANGE_BOX = {8: 256, 4: 512}
+# WideDsa above 96 rows at DCP16: DL7's C64 band (q8 at 128 and 256 rows, a widened
+# DSA box of 256) and DL3's (q4 at 128 and 256 rows, and its widest step at 512 rows;
+# a box of 512: the cap-128 tree's).
+WIDE_DCP_CASES = [(128, 8), (256, 8), (128, 4), (256, 4), (512, 4)]
+WIDE_DCP_BOX = {8: 256, 4: 512}
 WIDE_DSA_BOX: dict = {}  # the DSA DcpBox: one per process, as one per model
 
 
-def run_wide_exchange_step(batch, q, world, replays, core="fi-trtllm", partials="bf16"):
+def run_wide_step(batch, q, world, replays, core="fi-trtllm", partials="bf16"):
     """One decode step of a real DSA layer at ``batch`` rows (``q`` per request, the
     layer tests' contexts: rows of two requests in five select every key) under DCP
-    (``world`` ranks, interleave 1) through the stock forward (the #63 or the
-    generic merge) and then, DcpExchange's top-k (DcpxDecode, PARTS=topk) attached
-    as the model's process_weights_after_loading attaches it, through
-    dsa.wide.WideDsa built as the providers build it (on the case's rows and the
-    DL's widest, whose widened box serves both) over copies of the same caches. The
-    step's top-k is the exchange's slots as global ids; ``chain_out`` is a second
-    WideDsa's step (the other parity) whose sparse decode takes those ids through
-    the stock DCP filter (FlashInfer over the same keys); the two layers in a CUDA
-    graph, the exchange's slots and counts poisoned before each, replay
-    ``replays`` times. ``core``: the cache and FlashInfer kernel (LAYER_CORES);
-    ``partials``: both WideDsa layers' DcpValue partials (r1.dsa_partials; the
-    automatic policy would exchange "proj" at every wide row)."""
+    (``world`` ranks, interleave 1) through the stock forward (FP32 logits: the
+    local top-K, the all-gather and the stable merge) and through dsa.wide.WideDsa
+    built as the providers build it (on the case's rows and the DL's widest, whose
+    widened box serves both) over copies of the same caches. WideDsa's top-k is
+    the FP32 DCP top-k (the scorer, every rank's local top-K and the merge), which
+    also writes the global ids; the two layers (both parities) in a CUDA graph,
+    the merge's rows and counts poisoned before each, replay ``replays`` times.
+    ``core``: the cache and FlashInfer kernel (LAYER_CORES); ``partials``: both
+    WideDsa layers' DcpValue partials (r1.dsa_partials; the automatic policy would
+    exchange "proj" at every wide row)."""
     from vllm import _custom_ops as ops
     from vllm import ir
     from vllm.config import set_current_vllm_config
     from vllm.distributed import get_dcp_group
     from vllm.distributed.parallel_state import graph_capture
     from vllm.forward_context import create_forward_context, override_forward_context
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels.dcp_exchange.decode import (
-        DcpxDecode,
-    )
     from vllm.models.kimi_k3.nvidia.ops.dsa_indexer import (
         indexer_k_norm_quant_insert,
     )
@@ -3462,8 +3499,8 @@ def run_wide_exchange_step(batch, q, world, replays, core="fi-trtllm", partials=
 
     cache_dtype = LAYER_CORES[core][0]
     config = layer_config(core, q, world)
-    # The indexer builder's decode buffers and DcpExchange's rows take
-    # max_num_seqs x q: DL3's 128 requests x q4 = 512 rows need 128.
+    # The indexer builder's decode buffers take max_num_seqs x q: DL3's 128
+    # requests x q4 = 512 rows need 128.
     config.scheduler_config.max_num_seqs = max(64, 512 // q)
     group = get_dcp_group()
     rank = group.rank_in_group
@@ -3532,8 +3569,8 @@ def run_wide_exchange_step(batch, q, world, replays, core="fi-trtllm", partials=
             )
             return md, index_md, override_forward_context(context)
 
-        # The stock forward (no exchange yet): the rows entering o_proj, its RMSNorms
-        # on vllm_c (run_layer_step).
+        # The stock forward: the rows entering o_proj, its RMSNorms on vllm_c
+        # (run_layer_step).
         stock_mla, stock_index = mla.clone(), index.clone()
         entering = []
         hook = attn.o_proj.register_forward_pre_hook(
@@ -3545,20 +3582,6 @@ def run_wide_exchange_step(batch, q, world, replays, core="fi-trtllm", partials=
         hook.remove()
         stock_topk = topk_buffer[:batch].clone()
 
-        dcpx = DcpxDecode(config, dev, HEADS * world, indexer.topk_tokens)
-        assert "topk" in dcpx.parts and dcpx.topk_cap >= batch, (dcpx.parts, dcpx.cap)
-        dcpx.attach(attn)
-        dcpx.warm()
-        dcpx.serve()  # peer waits of VLLM_K31_DCP_EXCHANGE_SPIN_S
-        topk_calls: list = []
-        run_topk = dcpx.decode_topk
-
-        def counted_topk(*args, **kwargs):
-            topk_calls.append(args[1].shape[0])
-            return run_topk(*args, **kwargs)
-
-        dcpx.decode_topk = counted_topk  # (the hook's late lookup)
-
         projected = torch.cat(
             [
                 attn.fused_qkv_a_proj(hidden)[0],
@@ -3569,7 +3592,7 @@ def run_wide_exchange_step(batch, q, world, replays, core="fi-trtllm", partials=
         )
         ours_mla, ours_index = mla.clone(), index.clone()
         md, index_md, context = step(ours_mla, ours_index)
-        cap = WIDE_EXCHANGE_BOX[q]
+        cap = WIDE_DCP_BOX[q]
         scratch_rows = (
             torch.zeros(cap, 64, 576, device=dev, dtype=bf),
             torch.empty(cap, 1536, device=dev, dtype=bf),
@@ -3591,6 +3614,7 @@ def run_wide_exchange_step(batch, q, world, replays, core="fi-trtllm", partials=
             WideDsa(attn, pitches, scratch_rows, **policy, parity=p) for p in (0, 1)
         ]
         for core in layers:
+            core.stage.dcp_ids = topk_buffer  # the merge's global ids too
             core.prepare_cache(ours_mla)
         assert layers[0].boxes[batch].cap >= batch, layers[0].boxes[batch].cap
         out = torch.full((batch, HEADS * 128), float("nan"), device=dev, dtype=bf)
@@ -3606,45 +3630,28 @@ def run_wide_exchange_step(batch, q, world, replays, core="fi-trtllm", partials=
                 q=q,
             )
 
-        # Every rank compiled its kernels: no exchange peer wait spans a compile.
+        # Every rank compiled its kernels: no peer wait spans a compile.
         torch.accelerator.synchronize()
         group.barrier()
         with context:
-            # The indexer op gives the step to the exchange (and the MLA layer its
-            # counts).
-            assert dcpx.topk_active(indexer.k_cache.prefix, batch)
+            stage = layers[0].stage
+            topk_buffer.fill_(-1)
             run(layers[0], out)
             torch.accelerator.synchronize()
             eager = out.clone()
-            # This rank's slots and counts; as every rank's global ids for the checks
-            # below, and every rank's counts.
-            slots, counts = topk_buffer[:batch].clone(), dcpx.counts[:batch].clone()
-            ids = exchange_ids(slots, counts, md, index_md, ours_mla)
+            # This rank's slots and counts, the global ids, every rank's counts.
+            slots = stage.dcp_rows[:batch].clone()
+            counts = stage.dcp_valid[:batch].clone()
+            ids = topk_buffer[:batch].clone()
             rank_counts = group.all_gather(counts, dim=0).view(world, batch)
-            # FlashInfer over the same keys: the second layer takes the ids through
-            # the stock DCP filter (no exchange counts) instead of the indexer.
-            chain, impl = layers[1], layer.impl
-            from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels import (
-                hooks,
-            )
-
-            exchange_counts = hooks.local_topk_counts(impl)
-            hooks._LOCAL_TOPK_COUNTS.pop(id(impl))
-            chain.indexer_core = lambda *_: topk_buffer
-            topk_buffer[:batch] = ids
-            chain_out = torch.full_like(out, float("nan"))
-            run(chain, chain_out)
-            del chain.indexer_core
-            hooks.set_local_topk_counts(impl, exchange_counts)
-            torch.accelerator.synchronize()
             outs = [torch.full_like(out, float("nan")) for _ in layers]
             g = torch.cuda.CUDAGraph()
             with graph_capture(dev) as ctx, torch.cuda.graph(g, stream=ctx.stream):
                 for core, rows in zip(layers, outs):
-                    # A read of the top-k before the exchange wrote it (a premature
+                    # A read of the merge's rows before it wrote them (a premature
                     # launch) sees all K keys at slot 0.
-                    topk_buffer[:batch].fill_(0)
-                    dcpx.counts.fill_(indexer.topk_tokens)
+                    core.stage.dcp_rows.fill_(0)
+                    core.stage.dcp_valid.fill_(indexer.topk_tokens)
                     run(core, rows)
             for _ in range(replays):
                 for rows in outs:
@@ -3653,12 +3660,12 @@ def run_wide_exchange_step(batch, q, world, replays, core="fi-trtllm", partials=
             torch.accelerator.synchronize()
             for i, rows in enumerate(outs):
                 assert torch.equal(rows, eager), (i, float((rows - eager).abs().max()))
-            # The last layer's exchange: the eager slots and counts.
-            assert torch.equal(dcpx.counts[:batch], counts)
-            taken = torch.arange(slots.shape[1], device=dev) < counts.view(-1, 1)
-            assert torch.equal(topk_buffer[:batch][taken], slots[taken])
-        dcpx.ex.check()  # no peer wait timed out, every row's K-th key found
-        # This rank's rows of the exchange's ids and of the stock top-k, as the stock
+            # The last layer's merge: the eager slots, counts and ids.
+            last = layers[1].stage
+            assert torch.equal(last.dcp_valid[:batch], counts)
+            assert torch.equal(last.dcp_rows[:batch], slots)
+            assert torch.equal(topk_buffer[:batch], ids)
+        # This rank's rows of the merge's ids and of the stock top-k, as the stock
         # DCP filter gives them.
         _, stride_rows = flat_kv_row_view(ours_mla, md.block_size)
         filtered = [
@@ -3688,47 +3695,29 @@ def run_wide_exchange_step(batch, q, world, replays, core="fi-trtllm", partials=
         kv=cache_dtype,
         owned=((slots, counts), *filtered),
         rank_counts=rank_counts,
-        chain_out=chain_out,
-        topk_calls=topk_calls,
         lengths=torch.tensor([c + j + 1 for c in contexts for j in range(q)]),
     )
 
 
 @pytest.mark.skipif(DCP16_INIT is None, reason="needs a 16-rank launch (DCP16)")
 @pytest.mark.skip_global_cleanup  # the DCP16 group outlives each case
-@pytest.mark.parametrize("batch,q", WIDE_EXCHANGE_CASES)
+@pytest.mark.parametrize("batch,q", WIDE_DCP_CASES)
 @pytest.mark.parametrize("core", ["fi-trtllm", "fi-nvfp4"])
-def test_wide_dsa_dcp_exchange(dcp8_group, monkeypatch, core, batch, q):
-    """WideDsa above 96 rows fed by DcpExchange's top-k (VLLM_K31_DCP_EXCHANGE,
-    PARTS=topk) at DCP16, with BF16 latent partials: C64's combination (q8, 256 rows)
-    and DL3's (q4 at 128, 256 and 512 rows; run on the cap-128 tree). The indexer op
-    gives the step to the exchange, whose slots and counts WideDsa's sparse decode reads
-    (``dcp_local_topk_counts``). The exchanged top-k, as global ids, holds min(K,
-    length) keys a row over the ranks (balanced keys: no rank's count twice another's),
-    is exact, and is the stock one up to near-ties (every row that selects every key);
-    this rank's slots are those of its ids. The rows entering o_proj are, on every row,
-    those of FlashInfer over the same keys through the stock DCP filter (a second
-    WideDsa) and, where the top-k is the same, the stock forward's (check_layer_step);
-    in a CUDA graph of two layers on alternating parities, the exchange's slots and
-    counts poisoned before each, 200 replays give the eager rows bit for bit. ``core``
-    "fi-nvfp4": an nvfp4_ds_mla cache (WideDsa's MlaQuery inserts its rows; FlashInfer
-    prims_ts everywhere)."""
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels import hooks
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels.dcp_exchange import (
-        decode as dcpx,
-    )
-
+def test_wide_dsa_dcp(dcp8_group, core, batch, q):
+    """WideDsa above 96 rows at DCP16 with BF16 latent partials: C64's combination
+    (q8, 256 rows) and DL3's (q4 at 128, 256 and 512 rows; run on the cap-128 tree).
+    Its top-k is the FP32 DCP top-k (stock's FP32 rule): as global ids it holds
+    min(K, length) keys a row over the ranks (balanced keys: no rank's count twice
+    another's), is exact, and is the stock one where the two paths' queries agree
+    (every row that selects every key); this rank's slots are those of its ids. The
+    rows entering o_proj are the stock forward's where the top-k is the same
+    (check_layer_step); in a CUDA graph of two layers on alternating parities, the
+    merge's rows and counts poisoned before each, 200 replays give the eager rows
+    bit for bit. ``core`` "fi-nvfp4": an nvfp4_ds_mla cache (WideDsa's MlaQuery
+    inserts its rows; FlashInfer prims_ts everywhere)."""
     if LAYER_CORES[core][2] == "prims_ts" and no_prims_ts():
         pytest.skip("FlashInfer prims_ts sparse MLA cannot run here")
-    # This case's layer alone takes the exchange (the other tests: the #63 merge).
-    monkeypatch.setattr(hooks, "DCP_DECODE_TOPK_HOOKS", {})
-    monkeypatch.setattr(hooks, "_LOCAL_TOPK_COUNTS", {})
-    monkeypatch.setenv(dcpx.PARTS_ENV, "topk")
-    monkeypatch.setenv(dcpx.ENV + "_ONE_ROUND_ROWS", "256")
-    monkeypatch.delenv(dcpx.ENV + "_TIES", raising=False)  # (rank, position)
-    monkeypatch.delenv(dcpx.GRAPH_ONLY_ENV, raising=False)
-    monkeypatch.setenv(dcpx.SPIN_ENV, "120")
-    step = run_wide_exchange_step(batch, q, dcp8_group, replays=200, core=core)
+    step = run_wide_step(batch, q, dcp8_group, replays=200, core=core)
     check_layer_step(step, q, reference=False)
     same = [
         set(step.topk[t].tolist()) == set(step.stock_topk[t].tolist())
@@ -3744,10 +3733,6 @@ def test_wide_dsa_dcp_exchange(dcp8_group, monkeypatch, core, batch, q):
         assert -1 not in merged[t] and merged[t] == ours[t], t
         if same[t]:
             assert merged[t] == stock[t], t
-    core_rows, chain_rows = step.out.float(), step.chain_out.float()
-    error = float((core_rows - chain_rows).norm() / chain_rows.norm())
-    print(f"relative error vs FlashInfer over the same keys: {error:.4f}")
-    torch.testing.assert_close(step.out, step.chain_out, atol=2e-2, rtol=2e-2)
     counts = step.rank_counts  # [ranks, rows]
     low, high = counts.amin(0), counts.amax(0)
     print(
@@ -3757,51 +3742,31 @@ def test_wide_dsa_dcp_exchange(dcp8_group, monkeypatch, core, batch, q):
     keys = step.lengths.to(counts.device).clamp(max=2048)
     assert bool((counts.sum(0) == keys).all()), (counts.sum(0), keys)
     assert not bool((high >= 2 * low.clamp(min=1)).any()), (low, high)
-    # the eager step and the two captured layers (the chain bypasses the indexer)
-    assert step.topk_calls == [batch] * 3, step.topk_calls
 
 
 @pytest.mark.skipif(DCP16_INIT is None, reason="needs a 16-rank launch (DCP16)")
 @pytest.mark.skip_global_cleanup  # the DCP16 group outlives each case
-@pytest.mark.parametrize("batch,q", WIDE_EXCHANGE_CASES)
+@pytest.mark.parametrize("batch,q", WIDE_DCP_CASES)
 @pytest.mark.parametrize("core", ["fi-trtllm", "fi-nvfp4"])
-def test_wide_dsa_dcp_exchange_proj(dcp8_group, monkeypatch, core, batch, q):
-    """test_wide_dsa_dcp_exchange with "proj" partials (the automatic policy's at every
-    wide row, r1.AUTO_PARTIALS; given to both WideDsa layers): the W_UV bmm's value rows
+def test_wide_dsa_dcp_proj(dcp8_group, core, batch, q):
+    """test_wide_dsa_dcp with "proj" partials (the automatic policy's at every wide
+    row, r1.AUTO_PARTIALS; given to both WideDsa layers): the W_UV bmm's value rows
     of every gathered head go through the widened box's "proj" DcpMailbox and #108's
-    DcpValue merges them. The rows entering o_proj are, on every row, the chain's
-    (FlashInfer over the same keys through the stock DCP filter) and, where the top-k is
-    the same, the stock forward's; 200 graph replays of the two layers on alternating
-    parities give the eager rows bit for bit; afterwards the "proj" mailbox and the q
-    mailbox rows of the step are re-armed on both parities. ``core`` "fi-nvfp4": an
+    DcpValue merges them. The rows entering o_proj are the stock forward's where the
+    top-k is the same; 200 graph replays of the two layers on alternating parities
+    give the eager rows bit for bit; afterwards the "proj" mailbox and the q mailbox
+    rows of the step are re-armed on both parities. ``core`` "fi-nvfp4": an
     nvfp4_ds_mla cache (prims_ts everywhere), agentx-local's."""
     import torch.distributed as dist
 
     from vllm.distributed import get_dcp_group
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels import hooks
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels.dcp_exchange import (
-        decode as dcpx,
-    )
 
     if LAYER_CORES[core][2] == "prims_ts" and no_prims_ts():
         pytest.skip("FlashInfer prims_ts sparse MLA cannot run here")
-    monkeypatch.setattr(hooks, "DCP_DECODE_TOPK_HOOKS", {})
-    monkeypatch.setattr(hooks, "_LOCAL_TOPK_COUNTS", {})
-    monkeypatch.setenv(dcpx.PARTS_ENV, "topk")
-    monkeypatch.setenv(dcpx.ENV + "_ONE_ROUND_ROWS", "256")
-    monkeypatch.delenv(dcpx.ENV + "_TIES", raising=False)  # (rank, position)
-    monkeypatch.delenv(dcpx.GRAPH_ONLY_ENV, raising=False)
-    monkeypatch.setenv(dcpx.SPIN_ENV, "120")
-    step = run_wide_exchange_step(
-        batch, q, dcp8_group, replays=200, core=core, partials="proj"
-    )
+    step = run_wide_step(batch, q, dcp8_group, replays=200, core=core, partials="proj")
     check_layer_step(step, q, reference=False)
-    core_rows, chain_rows = step.out.float(), step.chain_out.float()
-    error = float((core_rows - chain_rows).norm() / chain_rows.norm())
-    print(f"relative error vs FlashInfer over the same keys: {error:.4f}")
-    torch.testing.assert_close(step.out, step.chain_out, atol=2e-2, rtol=2e-2)
     group = get_dcp_group()
-    box = WIDE_DSA_BOX["box"].widened(WIDE_EXCHANGE_BOX[q])
+    box = WIDE_DSA_BOX["box"].widened(WIDE_DCP_BOX[q])
     mail = box.dsa_projected  # r1.projected_mailbox: the layers took "proj"
     sent, gathered = 0x80000000 - (1 << 32), HEADS * group.world_size
     q_box = box.q.view(torch.uint8)[:, :batch]
@@ -3862,52 +3827,78 @@ def test_prims_ts_runs_on_the_layer_stream_dcp(dcp8_group, batch, q, overlap):
     assert step.prims_ts_calls > 0
 
 
-def dcp_merge_vs_exact(world, saturate, repeats=1):
-    """The specialized DCP decode's top-k merge (#63's dcp_topk_merge_rows, as
-    IndexerStage.merge_rows calls it on DeepGEMM-layout logits) against the exact
-    global top-2048 of the same scores. Every rank draws the same global scores
-    (distinct up to BF16 ties) of 32K-token rows and holds its interleave-1
-    shard; ``saturate``: rank 0's keys score above every other rank's, so it
-    holds all 2048 of the global top-k (more than its N local candidates).
-    Compares the multiset of the merged ids' scores with the exact top-2048's
-    (exact selection up to ties), and each rank's rows with its owned ids.
-    ``repeats``: merges the same scores that many times; every rank's rows must
-    come out bit-identical, order included (the sparse decode sums in it)."""
+def stock_dcp_merge(local_logits, ends, rank, world, interleave, topk):
+    """Stock's FP32 DCP merge (sparse_attn_indexer._merge_dcp_topk_global on CUDA)
+    of every rank's local logits (``local_logits[r]`` [rows, pitch] FP32, row
+    lengths ``ends[r]``), each rank's local top-K exact (ties to the lowest local
+    index), as one GPU sees it: its CuTe DSL packer, the rank-major stack the
+    all-gather gives, and its stable selector at 32 score bits (FP32 logits) ->
+    the global ids [rows, K] (-1 padding)."""
+    from vllm.model_executor.kernels.attention.dsa.dcp_indexer_cutedsl import (
+        dcp_topk_score_bits,
+        pack_dcp_topk_candidates_cutedsl,
+        stable_topk_from_gathered_candidates_cutedsl,
+    )
+
+    packed = []
+    for r in range(world):
+        logits, rows = local_logits[r], ends[r].shape[0]
+        local = torch.full((rows, topk), -1, dtype=torch.int32, device="cuda")
+        for t in range(rows):
+            n = int(ends[r][t])
+            pick = exact_topk(logits[t, :n], topk) if n else local[t, :0]
+            local[t, : pick.numel()] = pick.int()
+        pack = torch.empty(rows, topk, 2, dtype=torch.float32, device="cuda")
+        pack_dcp_topk_candidates_cutedsl(
+            logits, local, pack, r, world, interleave, None
+        )
+        packed.append(pack)
+    gathered = torch.stack(packed).contiguous()
+    return stable_topk_from_gathered_candidates_cutedsl(
+        gathered, topk, score_bits=dcp_topk_score_bits(torch.float32)
+    )
+
+
+def dcp_topk_vs_stock(world, saturate, repeats=1, topk=2048):
+    """The FP32 DCP top-k of the specialized DCP decode (dcp_topk.DcpTopk, as
+    IndexerStage.merge_rows runs it on the scorer's DeepGEMM-layout logits: each
+    rank's local top-K, the real all-gather over the DCP group, DcpMerge) against
+    the exact global top-K (score desc, global id asc) of the same scores and
+    against stock's FP32 merge of them (stock_dcp_merge, every rank's shard on
+    this GPU). Every rank draws the same global scores (FP32, tie-heavy: half of
+    every row on few values) of 33K-token rows and holds its interleave-1 shard;
+    ``saturate``: rank 0's keys score above every other rank's, so it holds all
+    of the global top-K. Each rank's rows are its owned ids' physical rows.
+    ``repeats``: the same scores that many times; every rank's rows must come out
+    bit-identical, order included (the sparse decode sums in it)."""
     import torch.distributed as dist
 
-    from vllm.config import set_current_vllm_config
     from vllm.distributed import get_dcp_group
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels import (
-        dcp_topk_merge as merge_pkg,
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.dcp_topk import (  # noqa: E501
+        DcpTopk,
     )
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels.dcp_topk_merge.kernels import (  # noqa: E501
-        dcp_topk_merge_rows,
-    )
-    from vllm.v1.attention.ops import dcp_topk_merge as stock_merge
 
-    topk, local_len, rows, block = 2048, 4096, 6, UNIT
-    rank = get_dcp_group().rank_in_group
+    local_len, rows, block = 4100, 6, UNIT
+    group = get_dcp_group()
+    rank = group.rank_in_group
     dev = torch.device("cuda", torch.accelerator.current_device_index())
-    config = layer_config("fi-trtllm", 1, world)
-    n = stock_merge.dcp_merge_local_topk(topk, world)
-    # 1.5x the fair share, warp-aligned: DCP8 384, DCP16 192.
-    assert n == {8: 384, 16: 192}[world], n
-    with set_current_vllm_config(config):  # the rescue workspace (collective)
-        assert init_sm107_dcp_topk_merge(config, topk) == n
-    assert merge_pkg.dcp_topk_merge_fits(rows, topk, n)
     gen = torch.Generator(device=dev).manual_seed(29)
-    scores = torch.rand(rows, local_len * world, device=dev, generator=gen)
+    scores = torch.randn(rows, local_len * world, device=dev, generator=gen)
+    scores[:, ::2] = (scores[:, ::2] * 4).round()  # ties at the cut
     if saturate:
-        scores[:, 0::world] += 2  # rank 0 owns gid % world == 0
-    scores = scores.bfloat16()
-    # This rank's logits in DeepGEMM's layout (1 KiB-aligned BF16 rows).
-    logits = scores[:, rank::world].contiguous()
-    assert logits.stride(0) * 2 % 1024 == 0
-    row_ends = torch.full((rows,), local_len, dtype=torch.int32, device=dev)
+        scores[:, 0::world] += 64  # rank 0 owns gid % world == 0
+    pitch = -(-local_len // 512) * 512
+    shards = []
+    for r in range(world):
+        shard = torch.full((rows, pitch), float("nan"), device=dev)
+        shard[:, :local_len] = scores[:, r::world]
+        shards.append(shard)
+    ends = torch.full((rows,), local_len, dtype=torch.int32, device=dev)
     req_id = torch.arange(rows, dtype=torch.int32, device=dev)
-    pages = local_len // block
+    pages = local_len // block + 1
     table = torch.arange(rows * pages, dtype=torch.int32, device=dev)
     table = table.view(rows, pages)
+    merge = DcpTopk(topk, world, rank, 1, dev, rows)
     rows_out = torch.full((rows, topk), -7, dtype=torch.int32, device=dev)
     valid_out = torch.full((rows,), -7, dtype=torch.int32, device=dev)
     ids_out = torch.full((rows, topk), -7, dtype=torch.int32, device=dev)
@@ -3915,111 +3906,82 @@ def dcp_merge_vs_exact(world, saturate, repeats=1):
     for _ in range(repeats):
         rows_out.fill_(-7)
         valid_out.fill_(-7)
-        dcp_topk_merge_rows(
-            logits=logits,
-            row_ends=row_ends,
-            max_local_len=local_len,
-            local_topk=n,
-            topk=topk,
-            req_id=req_id,
-            block_table=table,
-            block_size=block,
-            stride_rows=block,
-            dcp_rank=rank,
-            rows_out=rows_out,
-            valid_out=valid_out,
-            ids_out=ids_out,
-        )
-        runs.append((rows_out.clone(), valid_out.clone()))
+        args = req_id, table, block, block, rows_out, valid_out, ids_out
+        merge.run(shards[rank], ends, *args)
+        runs.append((rows_out.clone(), valid_out.clone(), ids_out.clone()))
     torch.accelerator.synchronize()
-    for again, count in runs[1:]:
+    for again, count, ids in runs[1:]:
         assert torch.equal(count, runs[0][1])
+        assert torch.equal(ids, runs[0][2])
         assert torch.equal(again, runs[0][0]), "the merged rows' order changed"
-    exact = torch.topk(scores.float(), topk, dim=1)
-    held = int((exact.indices[0] % world == 0).sum())
-    assert (held > n) == saturate, held  # the construction is (not) saturated
+    stock = stock_dcp_merge(shards, [ends] * world, rank, world, 1, topk)
+    torch.accelerator.synchronize()
+    held = int((exact_topk(scores[0], topk) % world == 0).sum())
+    assert (held == topk) == saturate, held
     for t in range(rows):
         ids = ids_out[t].long()
-        assert bool((ids >= 0).all()) and ids.unique().numel() == topk, t
-        got = scores[t, ids].float().sort(descending=True).values
-        torch.testing.assert_close(got, exact.values[t], atol=0, rtol=0)
-        mine = ids[ids % world == rank] // world  # this rank's local positions
+        want = exact_topk(scores[t], topk)  # global ids, ties to the lowest
+        assert torch.equal(ids.sort().values, want), t
+        assert torch.equal(stock[t].long().sort().values, want), t  # stock's too
+        mine = want[want % world == rank] // world  # this rank's local positions
         assert int(valid_out[t]) == mine.numel(), t
-        want = (table[t, mine // block].long() * block + mine % block).sort().values
-        assert torch.equal(rows_out[t, : mine.numel()].long().sort().values, want), t
-    dist.barrier(get_dcp_group().cpu_group)
+        physical = table[t, mine // block].long() * block + mine % block
+        assert torch.equal(rows_out[t, : mine.numel()].long(), physical), t
+        assert bool((rows_out[t, mine.numel() :] == -1).all()), t
+    dist.barrier(group.cpu_group)
 
 
 @pytest.mark.skipif(DCP_INIT is None, reason="needs an 8-rank launch (DCP8)")
 @pytest.mark.skip_global_cleanup  # the DCP8 group outlives each case
-def test_dcp_topk_merge_exact_unsaturated(dcp8_group):
-    """The merge the specialized DCP8 decode feeds selects exactly the global
-    top-2048 when no rank holds more than its N = 384 local candidates of it
-    (random scores: about 256 per rank)."""
-    dcp_merge_vs_exact(dcp8_group, saturate=False)
-
-
-@pytest.mark.skipif(DCP_INIT is None, reason="needs an 8-rank launch (DCP8)")
-@pytest.mark.skip_global_cleanup  # the DCP8 group outlives each case
-def test_dcp_topk_merge_exact_saturated(dcp8_group):
-    """A saturated row (rank 0 holds all of the global top-2048, more than its N
-    = 384 local candidates): the exact merge (#63: saturation detection, the
-    owner's push and the rescue round) still selects the exact global top-2048,
-    and rank 0's rows hold all 2048 (the specialized decode admits no
-    approximate top-k)."""
-    dcp_merge_vs_exact(dcp8_group, saturate=True)
+@pytest.mark.parametrize("topk", [2048, 4096])
+@pytest.mark.parametrize("saturate", [False, True])
+def test_dcp_topk_matches_stock_merge(dcp8_group, saturate, topk):
+    """The FP32 DCP top-k over the real DCP8 group selects exactly the global top-K
+    and stock's FP32 merge (_merge_dcp_topk_global's packer and stable selector)
+    selects the same ids, unsaturated (about K / 8 a rank) or saturated (rank 0
+    holds all of it), at K = 2048 and 4096."""
+    dcp_topk_vs_stock(dcp8_group, saturate, topk=topk)
 
 
 @pytest.mark.skipif(DCP_INIT is None, reason="needs an 8-rank launch (DCP8)")
 @pytest.mark.skip_global_cleanup  # the DCP8 group outlives each case
 @pytest.mark.parametrize("saturate", [False, True])
-def test_dcp_topk_merge_rows_deterministic(dcp8_group, saturate):
-    """DCP8 runs to the same output every time: the merge's owned rows (the
-    sparse decode's KV order, so its summation order) are the same rows in the
-    same order on every run of the same scores, in the first round and in the
-    rescue round of a saturated row."""
-    dcp_merge_vs_exact(dcp8_group, saturate, repeats=8)
+def test_dcp_topk_rows_deterministic(dcp8_group, saturate):
+    """DCP8 runs to the same output every time: the merge's owned rows (the sparse
+    decode's KV order, so its summation order) are the same rows in the same order
+    on every run of the same scores."""
+    dcp_topk_vs_stock(dcp8_group, saturate, repeats=8)
 
 
 @pytest.mark.skip_global_cleanup  # no group needed: keep a DCP8 launch's group
-@pytest.mark.parametrize("check", [False, True], ids=["rows", "rows+ids"])
-def test_merge_rows_kernels_compile_at_prepare(monkeypatch, check):
+@pytest.mark.parametrize("ids", [False, True], ids=["rows", "rows+ids"])
+@pytest.mark.parametrize("release", [True, False])
+def test_merge_rows_kernels_compile_at_prepare(monkeypatch, ids, release):
     """The FP32 DCP top-k's kernels (each rank's local top-K select and the merge,
-    with the global ids too for tests) and, where the fused TP indexer does not
-    serve the layer, the TP select compile for every batch when PreparedDsa
-    prepares its cache (``IndexerStage.warm``), not at their first launch: the
-    specialized decode runs only inside graph captures, where a first compile
-    invalidates the capture (CUDA error 901)."""
+    with the global ids too for tests; the merge launching the next kernel early or
+    not: the DSA sparse core) compile for every batch when the layer prepares its
+    cache (``IndexerStage.warm``), not at their first launch: the specialized
+    decode runs only inside graph captures, where a first compile invalidates the
+    capture (CUDA error 901)."""
     from unittest.mock import MagicMock
 
     from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa import (
         dcp_topk,
-        indexer,
         indexer_stage,
     )
 
     dev = torch.device("cuda", torch.accelerator.current_device_index())
     stage = indexer_stage.IndexerStage.__new__(indexer_stage.IndexerStage)
-    stage.topk, stage.local_topk, stage.tp_rows = 2048, 2048, 0
+    stage.topk, stage.local_topk, stage.release = 2048, 2048, release
     stage.dcp = dcp_topk.DcpTopk(2048, 16, 3, 1, dev, 64)
-    stage.dcp_ids = torch.empty(1) if check else None
-    stage.warm(1024, [8, 64])  # compiles (and is cached per process)
+    stage.dcp_ids = torch.empty(1) if ids else None
+    stage.warm([8, 64])  # compiles (and is cached per process)
     warm = MagicMock()
     monkeypatch.setattr(stage.dcp, "warm", warm)
-    stage.warm(1024, [8, 64])
-    assert warm.call_args_list == [((8, check),), ((64, check),)]
-    # TP: the select of DeepGEMM's logits, unless the fused indexer serves it.
-    compile_select = MagicMock()
-    monkeypatch.setattr(indexer, "compile_select", compile_select)
-    stage.dcp, stage.tp_rows = None, 64
-    stage.indexer = SimpleNamespace(topk_indices_buffer=torch.empty(1, device=dev))
-    stage.warm(1024, [8, 64], tp=False)
-    compile_select.assert_not_called()
-    stage.warm(1024, [8, 64])
-    assert [c.args[:4] for c in compile_select.call_args_list] == [
-        (8, 1, 2048, "ids"),
-        (64, 1, 2048, "ids"),
-    ]
+    stage.warm([8, 64])
+    assert warm.call_args_list == [((8, ids, release),), ((64, ids, release),)]
+    with pytest.raises(ValueError, match="rows"):  # past the shared candidates
+        dcp_topk.DcpTopk(2048, 16, 3, 1, dev, 64).warm(65)
 
 
 @pytest.mark.skip_global_cleanup  # pure policy check: keep a DCP8 launch's group
@@ -5486,31 +5448,3 @@ def test_prepared_dsa_compiles_once_per_kernel(
         assert all(x is y for x, y in zip(kernels, b.kernels[shape])), shape
     for shape, kernels in a.overlap_kernels.items():
         assert all(x is y for x, y in zip(kernels, b.overlap_kernels[shape])), shape
-
-
-@pytest.mark.skipif(DCP_INIT is None, reason="needs an 8-rank launch (DCP8)")
-@pytest.mark.skip_global_cleanup  # the DCP8 group outlives each case
-@pytest.mark.parametrize("batch,q", [(8, 8), (64, 8)])
-def test_prepared_dsa_dcp_bprime_check(dcp8_group, batch, q):
-    """VLLM_DSA_BPRIME_CHECK on the specialized merge (IndexerStage.check): the
-    generic merge of the same logits agrees with the one-round merge on every row
-    (no miss), as for the stock op. Last in the file: the check stays on for the
-    process once initialized."""
-    from vllm.distributed import get_dcp_group
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.compat.dcp_topk_merge_check import (
-        MISS_ROWS,
-        ROWS,
-        get_dcp_topk_merge_check,
-        init_dcp_topk_merge_check,
-    )
-
-    dev = torch.device("cuda", torch.accelerator.current_device_index())
-    init_dcp_topk_merge_check(dev, get_dcp_group().rank_in_group)
-    state = get_dcp_topk_merge_check()
-    before = state.snapshot()["totals"]
-    step = run_layer_step("fi-auto", batch, q, dcp8_group, None, "bf16")
-    check_layer_step(step, q, reference=False)
-    torch.accelerator.synchronize()
-    after = state.snapshot()["totals"]
-    assert after[ROWS] - before[ROWS] > 0, (before, after)
-    assert after[MISS_ROWS] == before[MISS_ROWS], (before, after)

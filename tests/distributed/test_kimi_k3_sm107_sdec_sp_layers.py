@@ -37,9 +37,9 @@ on the same input rows, the same metadata and each on its own copy of the caches
   exact against our own k_pe, ``_check_rope_part``), the new indexer keys
   (few codes different) and every other cache byte as it was; then the block replayed in
   a CUDA graph bit for bit as its eager run. Contexts per request cycle through short
-  (all keys) and long ones, one of 128K tokens. The top-k runs the #63 merge or, as C512
-  deploys it (VLLM_K31_DCP_EXCHANGE=1, parts topk, one round to 256 rows), DcpExchange
-  on both paths.
+  (all keys) and long ones, one of 128K tokens. The top-k is the FP32 DCP top-k
+  (stock's FP32 rule on both paths: every rank's local top-K, the all-gather and
+  the exact merge).
 * ``test_sp_kda_block_matches_stock_layer`` (two steps) and
   ``test_sp_kda_recoverssm_multistep`` (``CHAIN_STEPS`` steps, the specialized block
   replayed in one CUDA graph): RecoverSSM over consecutive steps of the same
@@ -75,8 +75,8 @@ from vllm.utils.network_utils import get_open_port
 WORLD, Q, HEADS, WIDTH = 4, 4, 24, 7168
 CAP = 512  # max_num_seqs 128 x q4
 ALL_ROWS = tuple(range(4, CAP + 1, 4))
-# DSA: front / fork query overlap (16 | 20), the 64-row seam, DcpExchange's one /
-# two rounds (256 | 260), the cap.
+# DSA: front / fork query overlap (16 | 20), the 64-row seam, 256 | 260 rows, the
+# cap.
 DSA_ROWS = (4, 16, 20, 64, 68, 128, 256, 260, 512)
 # KDA record cores by requests n (cutedsl.kda.sp.RECORD_KINDS at 24 heads): KdaSplit
 # n1, KdaWS n8, KdaWide n16, KdaStream n32 / n35, KdaWS n81 / n128.
@@ -87,14 +87,8 @@ FP8_ROW, INDEX_ROWS = 576, {"fp8": 132, "mxfp4": 68}
 MAX_LEN = 1 << 17
 LONG = MAX_LEN - 64  # the u128k request
 SHORT = (600, 1500, 2050, 4321, 3000, 9000)
-# C512's decode environment (its stock DSA top-k exchange) and conv layout.
+# C512's decode conv layout.
 DEPLOYED_ENV = {"VLLM_SSM_CONV_STATE_LAYOUT": "DS"}
-EXCHANGE_ENV = {
-    "VLLM_K31_DCP_EXCHANGE": "1",
-    "VLLM_K31_DCP_EXCHANGE_PARTS": "topk",
-    "VLLM_K31_DCP_EXCHANGE_ONE_ROUND_ROWS": "256",
-    "K31_DCPX_PDL": "0",
-}
 TIMEOUT = 3600  # one launch, every rank (CuTe compiles on a cold cache)
 
 
@@ -872,11 +866,8 @@ def _launch(case: str, *args) -> None:
 
 def _worker(rank: int, port: int, case: str, args: tuple) -> None:
     """One TP4 = DCP4 rank: the vLLM groups (and their symmetric memory), the
-    workspace and the DCP top-k merge's buffers, then ``case``."""
-    env = dict(DEPLOYED_ENV)
-    if case == "dsa" and args[1] == "exchange":
-        env.update(EXCHANGE_ENV)
-    os.environ.update(env)
+    workspace, then ``case``."""
+    os.environ.update(DEPLOYED_ENV)
     torch.accelerator.set_device_index(rank)
     device = torch.device("cuda", rank)
 
@@ -914,11 +905,6 @@ def _worker(rank: int, port: int, case: str, args: tuple) -> None:
         init_workspace_manager(device)
         try:
             if case == "dsa":
-                from tests.models.kimi_k3.nvidia.specialized_decode.sm_107.test_k3_sm107_dsa import (  # noqa: E501
-                    init_sm107_dcp_topk_merge,
-                )
-
-                assert init_sm107_dcp_topk_merge(config, TOPK)
                 _dsa_case(config, rank, device, *args)
             else:
                 _kda_case(config, rank, device, *args)
@@ -1182,16 +1168,7 @@ def _dsa_case(config, rank, device, indexer, topk_mode, rows, refusals):
     topk_buffer = torch.full((8192, TOPK), -1, dtype=torch.int32, device=device)
     attn = _dsa_attention(config, rank, topk_buffer)
     layer, idx = attn.mla_attn.mla_attn, attn.dsa_indexer
-    if topk_mode == "exchange":  # C512's stock hook, attached as the model does
-        from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels.dcp_exchange.decode import (
-            DcpxDecode,
-        )
-
-        dcpx = DcpxDecode(config, device, WORLD * HEADS, idx.topk_tokens)
-        assert "topk" in dcpx.parts, dcpx.parts
-        dcpx.attach(attn)
-        dcpx.warm()
-        dcpx.serve()
+    assert topk_mode == "merge", topk_mode  # the FP32 DCP top-k
 
     # One cache per path, sized for the widest case (the kernels compile for it).
     widest = max(rows) // Q
@@ -1466,8 +1443,8 @@ def _dsa_refusals(attn, block, step, rank, device):
         block.core.choice(step.rows[0] + 2)
 
 
-# The top-k: the FP32 DCP top-k ("merge"; stock Kimi K3's indexer logits are FP32, so
-# DcpExchange, which selects BF16 logits, is refused).
+# The top-k: the FP32 DCP top-k ("merge": stock Kimi K3's FP32 rule, over sm_107's
+# MXFP4 / FP8 scorer).
 @pytest.mark.parametrize("topk", ["merge"])
 @pytest.mark.parametrize("indexer", ["mxfp4", "fp8"])
 def test_sp_dsa_block_matches_stock_layer(indexer, topk):

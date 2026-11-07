@@ -34,7 +34,6 @@ from cutlass.cute.runtime import make_fake_stream
 
 from vllm.logger import init_logger
 from vllm.utils.deep_gemm import mqa_logits_use_mx_scales
-from vllm.utils.torch_utils import _encode_layer_name
 
 from ...shapes import Choice, Path, rows_policy
 from ..common.host import (
@@ -55,6 +54,13 @@ from . import dcp_value
 from .dcp_stage import compile_dcp_value, projected_rows, run_value
 from .dcp_value import PROJECTED
 from .index import DIM, HEADS, DsaIndex
+from .indexer import (
+    FusedIndexer,
+    kv_cache_blocks,
+    reserve,
+    static_unsupported,
+    supports,
+)
 from .r1 import DsaBox
 
 logger = init_logger(__name__)
@@ -395,21 +401,38 @@ class WideDsa:
         policies = index_policies(sorted(pitches))
         wq = self.indexer.wq_index.weight
         self.index_projection = PreparedProjection(wq, policies).prepare()
-        self.k_cache_name = _encode_layer_name(self.indexer.k_cache.prefix)
-        self.max_model_len = self.indexer.max_model_len
-        self.max_total = self.indexer.max_total_seq_len
         self.topk = self.indexer.topk_tokens
         from .indexer_stage import IndexerStage
 
         # The FP32 DCP top-k's owned rows, sized for the widest step.
-        self.stage = IndexerStage(self.indexer, rows, self.impl)
+        self.stage = IndexerStage(self.indexer, rows)
+        for shape in self.shapes:  # the scorer runs every shape (fast or raise)
+            reason = static_unsupported(self.indexer, *shape)
+            if reason is not None:
+                raise ValueError(
+                    f"Kimi K3.1 WideDsa: the indexer scorer cannot run rows x q "
+                    f"{shape[0]}x{shape[1]} ({reason})"
+                )
+        reserve(self.indexer, self.device, rows, True, blocks=kv_cache_blocks())
 
     def prepare_cache(self, kv):
         from .indexer_stage import check_index_cache
 
         check_index_cache(self.indexer)
-        # The DCP top-k's kernels of every batch, before any capture.
-        self.stage.warm(kv.shape[1], sorted({b for b, _ in self.shapes}))
+        for shape in self.shapes:
+            reason = supports(self.indexer, *shape)
+            if reason is not None:
+                raise ValueError(
+                    f"Kimi K3.1 WideDsa: the indexer scorer cannot run rows x q "
+                    f"{shape[0]}x{shape[1]} ({reason})"
+                )
+        # This rank's keys' FP32 logits (the scorer) for the DCP top-k, and its
+        # kernels of every batch, before any capture.
+        rows = max(self.pitches)
+        self.stage.fused = FusedIndexer(
+            self.indexer, self.shapes, self.device, rows, dcp=True
+        )
+        self.stage.warm(sorted({b for b, _ in self.shapes}))
         caches = kv.view(torch.uint8), self.indexer.k_cache.kv_cache
         specs = tuple(layout(w) for w in (*self.weights, *caches))
         sms = torch.cuda.get_device_properties(self.device).multi_processor_count
@@ -462,115 +485,31 @@ class WideDsa:
     def stock_pieces(self, batch):
         """NQ-NOFALLBACK: the stock kernels inside this core at ``batch`` rows, for the
         coverage log. As a whole the core was measured against seam S2-DSA (DSA_WIDE);
-        the pieces were not measured against PreparedDsa's #63 merge / DcpExchange
-        rows path (NQ-TUNE)."""
-        pieces = [
-            "DeepGEMM FP32 paged MQA logits (the FP32 DCP top-k selects and merges)",
-            "FlashInfer _forward_mqa_kernel" if self.fp8 else "FlashMLA sparse",
-        ]
+        the pieces were not measured against PreparedDsa's rows path (NQ-TUNE). The
+        indexer is sm_107's (scorer and FP32 DCP top-k)."""
+        pieces = ["FlashInfer _forward_mqa_kernel" if self.fp8 else "FlashMLA sparse"]
         if batch not in self.index_projection.kernels:
             pieces.append("wq_index cuBLAS (no split-K tactic)")
         return "; ".join(pieces) + " (vs the merge-rows path unmeasured: NQ-TUNE)"
 
-    def indexer_core(self, projected, batch):
-        """Top-k of the current rows into the shared buffer (stock decode scoring of
-        DsaIndex's FP8 query, or on an MXFP4 indexer cache its MXFP4 query and
-        scales)."""
-        from .index import fp4_query_views
-
-        from ...dsa_kernels.hooks import run_hooked_topk
-        from .indexer_stage import stock_logits_dtype
-
-        indexer, fp4 = self.indexer, self.indexer.use_fp4_cache
-        # DcpExchange's top-k (BF16 logits only) raises on stock K3's FP32 logits.
-        stage = self.stage
-        hooked = run_hooked_topk(
-            indexer,
-            lambda decode, rows: stage.decode_logits(
-                self.q_fp8, self.head_w, decode, rows, batch
-            ),
-        )
-        if hooked is not None:
-            return hooked
-        query = self.q_fp8[:batch].view(torch.float8_e4m3fn), None
-        if fp4:
-            query = fp4_query_views(self.q_fp8, batch, batch)
-        return torch.ops.vllm.sparse_attn_indexer(
-            projected,
-            self.k_cache_name,
-            indexer.k_cache.kv_cache,
-            *query,
-            None,
-            self.head_w[:batch],
-            DIM,
-            indexer.scale_fmt,
-            self.topk,
-            DIM,
-            self.max_model_len,
-            self.max_total,
-            indexer.topk_indices_buffer,
-            True,  # the key is inserted by DsaIndex
-            False,
-            False,
-            _encode_layer_name(""),
-            fp4,
-            indexer.dcp_rank,
-            indexer.dcp_world_size,
-            indexer.cp_kv_cache_interleave_size,
-            topk_backend=indexer.topk_backend,
-            dcp_local_topk=indexer.dcp_local_topk,
-            logits_dtype=stock_logits_dtype(),
-        )
-
-    def dcp_core(self, cache, topk, metadata, batch, box=None, merged=None):
+    def dcp_core(self, cache, metadata, batch, box, merged):
         """Sparse decode of every rank's query heads (the gathered q mailbox) over the
-        local shard into the DcpValue rows, LSE and per-row valid counts. The global
-        top-k ids are filtered to this rank's slots and compacted to a prefix whose
-        length bounds the work (about 1 / DCP of the top-k). FlashMLA (natural-log
-        LSE; a fresh scheduler metadata per call follows those lengths) or, on a
-        per-tensor FP8 cache, FlashInfer's sparse decode over the flat rows, as the
-        stock decode."""
+        local shard into the DcpValue rows, LSE and per-row valid counts, over
+        ``merged``: this rank's slots of the FP32 DCP top-k (a compacted prefix
+        whose length bounds the work, about 1 / DCP of the top-k) and their counts.
+        FlashMLA (natural-log LSE; a fresh scheduler metadata per call follows
+        those lengths) or, on a per-tensor FP8 cache, FlashInfer's sparse decode
+        over the flat rows, as the stock decode."""
         from vllm.v1.attention.backends.mla.flashmla_sparse import _fp8_kv_pages
-        from vllm.v1.attention.backends.mla.sparse_utils import flat_kv_row_view
-
-        from ...compat.dcp_index import (
-            filter_and_convert_dcp_index as triton_filter_and_convert_dcp_index,
-        )
         from vllm.v1.attention.ops.flashmla import (
             flash_mla_with_kvcache,
             get_mla_metadata,
         )
 
-        indexer, md = self.indexer, metadata
-        box = self.box if box is None else box  # (``boxes[batch]``: widened rows)
-        stride_rows: int | None
-        if self.fp8:
-            _, stride_rows = flat_kv_row_view(cache, md.block_size)
-        else:
-            pages, stride_rows = _fp8_kv_pages(cache, md.block_size)
-        # The DcpExchange top-k (dsa_kernels.dcp_exchange.decode) already left this
-        # rank's slots and their counts in the buffer.
-        from ...dsa_kernels.hooks import local_topk_counts
-
-        counts = local_topk_counts(self.impl)
-        valid = counts(batch) if counts is not None and merged is None else None
-        if merged is not None:  # the FP32 DCP top-k's slots and counts
-            slots, valid = merged
-        elif valid is not None:
-            slots = topk[:batch]
-        else:
-            slots, valid = triton_filter_and_convert_dcp_index(
-                md.req_id_per_token[:batch],
-                md.block_table,
-                topk[:batch],
-                dcp_size=self.dcp,
-                dcp_rank=indexer.dcp_rank,
-                cp_kv_cache_interleave_size=indexer.cp_kv_cache_interleave_size,
-                BLOCK_SIZE=md.block_size,
-                BLOCK_STRIDE_ROWS=stride_rows,
-                NUM_TOPK_TOKENS=topk.shape[1],
-                return_valid_counts=True,
-            )
+        md = metadata
+        if not self.fp8:
+            pages, _ = _fp8_kv_pages(cache, md.block_size)
+        slots, valid = merged
         if self.fp8:
             self.impl.record_logical_topk_ready()
             rows, lse = self.impl._forward_mqa_kernel(
@@ -619,14 +558,10 @@ class WideDsa:
         publish = (mailbox, box.mc(p), cutlass.Int32(box.rank))
         mq(*q_args, to_cute(self.query[:batch]), to_cute(self.qc[:batch]), *publish, s)
         self.run_index(x, index_slots, batch, index)
-        topk = merged = None
-        if self.stage.local_topk:
-            stride_rows = self.stride_rows(cache, metadata.block_size)
-            args = self.q_fp8, self.head_w, metadata, stride_rows, batch
-            merged = self.stage.merge_rows(*args, q)
-        if merged is None:
-            topk = self.indexer_core(projected, batch)
-        latent, lse, valid = self.dcp_core(cache, topk, metadata, batch, box, merged)
+        stride_rows = self.stride_rows(cache, metadata.block_size)
+        args = self.q_fp8, self.head_w, metadata, stride_rows, batch
+        merged = self.stage.merge_rows(*args, q)
+        latent, lse, valid = self.dcp_core(cache, metadata, batch, box, merged)
         if self.dsa_box.mailbox(batch).format == PROJECTED:
             core, (w_uv, uv_view) = (latent, lse, valid), self.uv_gathered
             args = value, self.dsa_box, p, publish, self.heads, core, lengths[:reqs]
