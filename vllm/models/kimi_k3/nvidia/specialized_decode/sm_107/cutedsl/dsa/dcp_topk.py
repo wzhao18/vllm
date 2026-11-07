@@ -67,10 +67,14 @@ class DcpMerge:
     score and the ties at it to take; only when the ties outnumber them does a
     second one over those ties' low halves (read again) pick the lowest ids."""
 
-    def __init__(self, rows, world, topk, interleave=1, emit_ids=False):
-        assert topk % SELECT_THREADS == 0
+    def __init__(self, rows, world, topk, interleave=1, emit_ids=False, release=True):
+        if topk % SELECT_THREADS:
+            raise ValueError(f"DcpMerge: top-k {topk} not a multiple of 1024")
         self.rows, self.world, self.topk = rows, world, topk
         self.interleave, self.emit_ids = interleave, emit_ids
+        # release: launch the next kernel early (PDL); off before a kernel that
+        # reads before its PDL wait (the DSA sparse core polls its q tiles).
+        self.release = release
 
     @cute.jit
     def __call__(
@@ -164,7 +168,8 @@ class DcpMerge:
         fill = smem.allocate_tensor(Uint32, cute.make_layout(1), 16)
         sm = hist, scan, info
         cute.arch.griddepcontrol_wait()
-        cute.arch.griddepcontrol_launch_dependents()
+        if cutlass.const_expr(self.release):
+            cute.arch.griddepcontrol_launch_dependents()
         # Item i of this thread: rank i // per_rank, candidate (i % per_rank) x
         # 1024 + tid (coalesced). Its score key only.
         keys = []
@@ -242,8 +247,8 @@ class DcpMerge:
 
 
 @functools.cache
-def compile_merge(rows, world, topk, interleave, emit_ids, device):
-    merge = DcpMerge(rows, world, topk, interleave, emit_ids)
+def compile_merge(rows, world, topk, interleave, emit_ids, device, release=True):
+    merge = DcpMerge(rows, world, topk, interleave, emit_ids, release)
     with torch.accelerator.device_index(device):
         req = fake((rows,), (1,), torch.int32, 4)
         out = fake((rows, topk), (topk, 1), torch.int32, 4)
@@ -282,25 +287,33 @@ class DcpTopk:
         self.dummy = torch.zeros(1, dtype=torch.int32, device=device)
         self.candidates = candidate_rows(device, max_rows, topk)
 
-    def warm(self, rows, emit_ids=False):
+    def warm(self, rows, emit_ids=False, release=True):
         """Compile ``run``'s kernels for steps of ``rows`` rows now (a first compile
         inside a CUDA graph capture invalidates it)."""
-        assert rows <= self.candidates.shape[0], (rows, self.candidates.shape)
-        self.kernels(rows, emit_ids)
+        self.check_rows(rows)
+        self.kernels(rows, emit_ids, release)
+
+    def check_rows(self, rows):
+        """The select and merge grids write ``rows`` rows of the shared candidates."""
+        if not 0 < rows <= self.candidates.shape[0]:
+            raise ValueError(
+                f"DCP top-k: {rows} rows, the candidates hold "
+                f"{self.candidates.shape[0]}"
+            )
 
     @property
     def interleave(self) -> int:
         span = self._interleave
         return int(span() if callable(span) else span)
 
-    def kernels(self, rows, emit_ids):
+    def kernels(self, rows, emit_ids, release=True):
         index = self.device.index
         args = self.topk, "candidates", index, 1
         select = compile_select(
             rows, 1, *args, world=self.world, interleave=self.interleave
         )
         merge = compile_merge(
-            rows, self.world, self.topk, self.interleave, emit_ids, index
+            rows, self.world, self.topk, self.interleave, emit_ids, index, release
         )
         return select, merge
 
@@ -323,14 +336,19 @@ class DcpTopk:
         rows_out,
         valid_out,
         ids_out=None,
+        release=True,
     ):
         """``logits`` [>= the rows with keys, >= max(row_ends)] FP32 (16-byte
         aligned rows): this rank's local keys; ``row_ends`` [rows] int32 their
         counts per row (0: a row past the step's requests, its logits unread);
         ``req_id`` / ``block_table`` / ``block_size`` / ``stride_rows``: the MLA
         layer's metadata and flat KV row stride. Writes ``rows_out`` [rows, >= K],
-        ``valid_out`` [rows] and (tests) ``ids_out`` [rows, K]."""
+        ``valid_out`` [rows] and (tests) ``ids_out`` [rows, K]. ``release``: the
+        merge launches the next kernel early (PDL)."""
         rows = row_ends.shape[0]
+        self.check_rows(rows)
+        if rows_out.shape[0] < rows or valid_out.shape[0] < rows:
+            raise ValueError(f"DCP top-k: outputs of {rows_out.shape[0]} rows < {rows}")
         if logits.dtype != torch.float32:
             raise TypeError(f"DCP top-k: FP32 logits (stock K3), got {logits.dtype}")
         if logits.stride(1) != 1 or logits.stride(0) % 4 or logits.data_ptr() % 16:
@@ -339,7 +357,7 @@ class DcpTopk:
             raise ValueError("DCP top-k: contiguous block table rows, K-wide rows_out")
         if ids_out is not None and ids_out.stride(0) != self.topk:
             raise ValueError("DCP top-k: K-wide ids_out")
-        select, merge = self.kernels(rows, ids_out is not None)
+        select, merge = self.kernels(rows, ids_out is not None, release)
         candidates = self.candidates[:rows]
         s = stream(self.device)
         dummy = to_cute(self.dummy, 4)

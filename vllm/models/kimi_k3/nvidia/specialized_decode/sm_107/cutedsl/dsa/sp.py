@@ -298,13 +298,7 @@ class SpDsaCore:
 
     def log_policy(self):
         """The SP DSA policy at startup (once, global rank 0)."""
-        from ...dsa_kernels.hooks import DCP_DECODE_TOPK_HOOKS
-
         stage = self.prepared.indexer_stage
-        if self.prefix in DCP_DECODE_TOPK_HOOKS:
-            raise Unsupported(
-                "dsa", Shape(self.rows[0], self.q), "DcpExchange selects BF16 logits"
-            )
         topk = f"FP32 DCP top-k (local top-{stage.local_topk} + merge, exact)"
         modes: dict[str, list[int]] = {}
         for r in self.rows:

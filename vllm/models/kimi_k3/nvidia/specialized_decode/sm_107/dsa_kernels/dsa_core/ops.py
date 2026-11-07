@@ -3,7 +3,7 @@
 """Kimi K3.1 DSA sparse core under DCP for small M (csrc/dsa_core.cu).
 
 One kernel per DSA layer from the gathered q mailbox (polled) and this rank's
-DcpExchange top-k slots to the head owners' DcpBox O mailboxes: sparse MLA over the
+FP32 DCP top-k slots to the head owners' DcpBox O mailboxes: sparse MLA over the
 local per-tensor FP8 KV rows for every gathered query head (FP8 QK, FP32 softmax,
 FP16 PV, FP32 accumulation), the normalized partial O (bf16) and its base-2 LSE
 stored into ``DcpBox.partial`` / ``DcpBox.lse`` of each head's owner, the format
@@ -112,7 +112,7 @@ class DsaCore:
     ) -> None:
         """``q_box``: the DcpBox q mailbox of this layer's parity [cap, q_heads, 576]
         (FP8 bytes); ``sel`` [>= rows, >= K] int32 / ``cnt`` [>= rows]: this rank's
-        selected flat KV rows and their counts (DcpExchange.topk_merge); ``kv``: the
+        selected flat KV rows and their counts (IndexerStage.merge_rows); ``kv``: the
         flat per-tensor FP8 KV rows [N, 576]; ``bmm1_scale`` = softmax scale x q scale x
         k scale, ``bmm2_scale`` = k scale; ``part_peers`` / ``lse_peers``: DcpBox.peers
         / lse_peers; ``parity``: the DcpBox parity of this layer; ``lse_wide``: the LSE

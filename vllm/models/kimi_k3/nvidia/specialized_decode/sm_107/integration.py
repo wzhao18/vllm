@@ -3,17 +3,16 @@
 """How the SM107 specialized decode plugs into this tree's Kimi K3 model.
 
 The source branch built its specialized decode from edits to the stock model
-(``process_weights_after_loading``: the MegaMoE header patch and the DcpExchange;
+(``process_weights_after_loading``: the MegaMoE header patch;
 ``build_specialized_decode``: the DSA sparse core, the decode, the vocabulary-sharded
 verification), its model state, its runner and its rejection sampler. Here the model
 only asks the decode config to build itself (``Sm107DecodeConfig.build``) and for its
 model state class (``Sm107DecodeConfig.model_state_cls``); everything else lives in
 this package:
 
-- ``build``: the vendored DCP top-k merge (round-1 mailbox), the MegaMoE header
-  patch, DcpExchange, the DSA sparse core, then ``Sm107SpecializedDecode`` and the
-  verification pieces (``VerifyArgmax``, ``SampledVerify``, ``warm_sampling``), in
-  the source branch's order.
+- ``build``: the MegaMoE header patch, the DSA sparse core, then
+  ``Sm107SpecializedDecode`` and the verification pieces (``VerifyArgmax``,
+  ``SampledVerify``, ``warm_sampling``), in the source branch's order.
 - ``model_state.Sm107KimiK3ModelState``: greedy and vocabulary-sharded verification
   through this tree's model-state sampler hooks (``custom_sampler``,
   ``compute_sample_logits``) instead of runner edits.
@@ -69,26 +68,12 @@ class Sm107DecodeConfig(DecodeConfig):
         from .megamoe import prepare_megamoe
 
         prepare_megamoe(backbone, vllm_config)
-        # DSA decode under DCP: DcpExchange (VLLM_K31_DCP_EXCHANGE, off by default)
-        # selects BF16 indexer logits only; stock Kimi K3's are FP32, which the
-        # FP32 DCP top-k serves. Switched on, it raises.
-        from .dsa_kernels.dcp_exchange.decode import ENV as DCPX_ENV
-        from .dsa_kernels.dcp_exchange.decode import wanted as dcpx_wanted
-
-        if dcpx_wanted(vllm_config):
-            raise ValueError(
-                f"Kimi K3 specialized decode (SM107): {DCPX_ENV} turns on DcpExchange, "
-                "whose top-k selects BF16 indexer logits; stock Kimi K3's are FP32 "
-                "(the FP32 DCP top-k serves DCP): unset it"
-            )
-        dcpx = None
         # The DSA sparse core (VLLM_K31_DSA_CORE=1), which the DSA layers'
         # PreparedDsa picks up from their indexers.
         from .dsa_kernels.dsa_core.decode import build as build_dsa_core
 
         build_dsa_core(backbone)
         decode = Sm107SpecializedDecode(backbone, self)
-        decode.dcpx = dcpx
         lm.specialized_decode = decode
         # From here on forward() returns normalized hidden states on every step.
         lm.needs_norm_in_logits = False
