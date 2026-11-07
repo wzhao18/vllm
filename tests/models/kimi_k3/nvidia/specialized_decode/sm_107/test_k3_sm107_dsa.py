@@ -1771,7 +1771,7 @@ def dsa_layer(config, topk_buffer, heads=HEADS):
             param.data.copy_(torch.rand_like(param) + 0.5)
         else:
             param.data.copy_(torch.randn_like(param) * param.shape[-1] ** -0.5)
-    attn.mla_attn.mla_attn.process_weights_after_loading(torch.bfloat16)
+    attn.mla_attn.mla_attn.process_weights_after_loading()
     return attn
 
 
@@ -1894,6 +1894,7 @@ def layer_config(core, q, world=1):
             num_speculative_tokens=q - 1,
             enable_adaptive_verification=False,
             parallel_drafting=False,
+            max_num_new_slots_for_drafting=0,  # DSpark drafts in its own pass
         )
     return config
 

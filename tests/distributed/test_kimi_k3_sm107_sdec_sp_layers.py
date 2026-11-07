@@ -1022,6 +1022,7 @@ def _dsa_config(indexer):
         num_speculative_tokens=Q - 1,
         enable_adaptive_verification=False,
         parallel_drafting=False,
+        max_num_new_slots_for_drafting=0,  # DSpark drafts in its own pass
     )
     return config
 
@@ -1063,7 +1064,7 @@ def _dsa_attention(config, rank, topk_buffer):
                 param.copy_(torch.rand_like(param) + 0.5)
             else:
                 param.copy_(torch.randn_like(param) * param.shape[-1] ** -0.5)
-    attn.mla_attn.mla_attn.process_weights_after_loading(torch.bfloat16)
+    attn.mla_attn.mla_attn.process_weights_after_loading()
     attn.o_proj.reduce_results = False  # (KimiDecoderLayer under SP)
     return attn
 
@@ -1505,6 +1506,7 @@ def _kda_config():
         num_speculative_tokens=Q - 1,
         enable_adaptive_verification=False,
         parallel_drafting=False,
+        max_num_new_slots_for_drafting=0,  # DSpark drafts in its own pass
     )
     return config
 
