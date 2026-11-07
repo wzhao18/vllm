@@ -224,7 +224,7 @@ class IndexFront:
                 quantize_fp4_query(values, 4, codes, scales, head, lane, lane)
                 if lane == 0:
                     wv = Float32(projected[b, self.weight + head])
-                    w_out[b, head] = BFloat16(wv * Float32(FP4_WEIGHT))
+                    w_out[b, head] = wv * Float32(FP4_WEIGHT)
             else:
                 self.fp8_head(values, projected, q_out, w_out, b, head, lane)
         token = head * CLUSTER + part
@@ -249,4 +249,4 @@ class IndexFront:
         if lane == 0:
             wv = Float32(projected[b, self.weight + head])
             fold = (wv * scale) * Float32((HEADS * DIM) ** -0.5)
-            w_out[b, head] = BFloat16(fold)
+            w_out[b, head] = fold

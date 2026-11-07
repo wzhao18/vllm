@@ -464,7 +464,7 @@ class IndexFrontMma:
                             store_b8(scales + head * 4 + warp, byte)
                         if tid == 0:
                             weight = wv_s[c] * Float32(FP4_WEIGHT)
-                            w_out[row0 + column, head] = BFloat16(weight)
+                            w_out[row0 + column, head] = weight
                 elif column < valid:
                     amax = Float32(1e-10)
                     for w in cutlass.range_constexpr(4):
@@ -475,7 +475,7 @@ class IndexFrontMma:
                     q_out[b, head, tid] = fp8_bits(values[j] * inverse)
                     if tid == 0:
                         fold = (wv_s[c] * scale) * Float32((HEADS * DIM) ** -0.5)
-                        w_out[b, head] = BFloat16(fold)
+                        w_out[b, head] = fold
 
     @cute.jit
     def reduced(self, lane_base, mailbox, s, c):

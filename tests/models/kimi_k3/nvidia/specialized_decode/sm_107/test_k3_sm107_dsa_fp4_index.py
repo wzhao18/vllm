@@ -19,7 +19,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tests.models.kimi_k3.nvidia.specialized_decode.sm_107 import test_k3_sm107_dsa as dsa
+from tests.models.kimi_k3.nvidia.specialized_decode.sm_107 import (
+    test_k3_sm107_dsa as dsa,
+)
 from tests.models.kimi_k3.nvidia.specialized_decode.sm_107.test_k3_sm107_dsa import (  # noqa: F401
     dcp8_group,  # (fixture)
 )
@@ -150,7 +152,7 @@ def test_fp4_indexer_inputs(batch, gap):
         slots[1] = -1  # a padded row (or a token another DCP rank owns)
     kernel = compile_index(batch, HEADS, PITCH, fake(*layout(index)))
     q_rows = torch.full((batch, 32, 128), 0x77, device=dev, dtype=torch.uint8)
-    head_w = torch.zeros(batch, 32, device=dev, dtype=bf)
+    head_w = torch.zeros(batch, 32, device=dev, dtype=torch.float32)
     args = (to_cute(projected), to_cute(iq), to_cute(norm_w, 4), to_cute(norm_b, 4))
     args += (to_cute(index), to_cute(slots, 8), to_cute(q_rows), to_cute(head_w, 4))
     kernel(*args, cutlass.Float32(EPS), stream(dev))
@@ -160,8 +162,8 @@ def test_fp4_indexer_inputs(batch, gap):
     packed, scales = check_query_layout(q_rows, batch)
     assert torch.equal(packed, ref_q)
     assert torch.equal(scales, ref_s)
-    # The stock decode casts the FP32 weights to BF16 for SM100's MQA logits.
-    assert torch.equal(head_w, ref_w.to(bf))
+    # Stock Kimi K3 keeps the head weights FP32 (its MQA logits are FP32).
+    assert ref_w.dtype == torch.float32 and torch.equal(head_w, ref_w)
 
     stock = dsa.packed_cache(blocks, UNIT, FP4_ROW, gap)
     topk = torch.empty(batch, TOPK, device=dev, dtype=torch.int32)
@@ -224,7 +226,7 @@ def test_fp4_index_front(monkeypatch, batch, kernel_kind):
         batch, HEADS, PITCH, *specs, dev_index, normalized
     )
     q_rows = torch.full((batch, 32, 128), 0x77, device=dev, dtype=torch.uint8)
-    head_w = torch.zeros(batch, 32, device=dev, dtype=bf)
+    head_w = torch.zeros(batch, 32, device=dev, dtype=torch.float32)
     q_c = dsa.rms_norm(projected[:, :1536], q_norm)
     args = (to_cute(projected),)
     weights = to_cute(wq)
@@ -238,7 +240,7 @@ def test_fp4_index_front(monkeypatch, batch, kernel_kind):
     kernel(*args, cutlass.Float32(EPS), cutlass.Float32(EPS), stream(dev))
 
     wv = projected[:, KEY + 128 : KEY + 160]
-    assert torch.equal(head_w, (wv.float() / 64).to(bf))
+    assert torch.equal(head_w, wv.float() / 64)  # FP32, as stock
     iq = (q_c.float() @ wq.float().T).to(bf)
     ref_q, ref_s, _ = mxfp4_q_quant(iq.view(batch, 32, 128), wv, 1 / 64, 32)
     packed, scales = check_query_layout(q_rows, batch)
@@ -391,7 +393,7 @@ def mxfp4_readers(monkeypatch, batch, rows):
     adversarial_heads(iq)
     kernel = compile_index(batch, HEADS, PITCH, fake(*layout(cache)))
     q_rows = torch.full((batch, 32, 128), 0x77, device=dev, dtype=torch.uint8)
-    head_w = torch.zeros(batch, 32, device=dev, dtype=bf)
+    head_w = torch.zeros(batch, 32, device=dev, dtype=torch.float32)
     norm = torch.ones(128, device=dev)
     none = torch.full((batch,), -1, dtype=torch.int64, device=dev)
     args = (to_cute(projected), to_cute(iq), to_cute(norm, 4), to_cute(norm, 4))
@@ -447,14 +449,14 @@ def mxfp4_readers(monkeypatch, batch, rows):
         num_prefill_tokens=0,
         decode=decode,
     )
-    monkeypatch.setattr(
-        sparse_indexer,
-        "get_forward_context",
-        lambda: SimpleNamespace(
-            attn_metadata={prefix: metadata},
-            cudagraph_runtime_mode=CUDAGraphMode.NONE,
-        ),
+    context = SimpleNamespace(
+        attn_metadata={prefix: metadata},
+        cudagraph_runtime_mode=CUDAGraphMode.NONE,
     )
+    monkeypatch.setattr(sparse_indexer, "get_forward_context", lambda: context)
+    import vllm.forward_context
+
+    monkeypatch.setattr(vllm.forward_context, "get_forward_context", lambda: context)
     q = iq.view(batch, 32, 128)[:rows]
     wv = projected[:rows, KEY + 128 : KEY + 160]
     KimiK3DSAIndexer.score(indexer, projected[:rows], q, wv, None)
@@ -476,7 +478,10 @@ def mxfp4_readers(monkeypatch, batch, rows):
     )
 
     stage = IndexerStage(indexer)
+    # TP with the step's rows: DeepGEMM's FP32 logits and IndexerSelect ("ids").
+    selecting = IndexerStage(indexer, batch)
     wide = SimpleNamespace(
+        stage=stage,
         indexer=indexer,
         k_cache_name=_encode_layer_name(prefix),
         q_fp8=q_rows,
@@ -487,6 +492,7 @@ def mxfp4_readers(monkeypatch, batch, rows):
     )
     selects = {
         "IndexerStage.run": partial(stage.run, projected, q_rows, head_w),
+        "IndexerStage.select_ids": partial(selecting.run, projected, q_rows, head_w),
         "WideDsa.indexer_core": partial(WideDsa.indexer_core, wide, projected, batch),
     }
     logits = partial(stage.decode_logits, q_rows, head_w, decode, rows, batch)
@@ -496,9 +502,9 @@ def mxfp4_readers(monkeypatch, batch, rows):
 
 
 def check_readers_logits(step, logits):
-    """IndexerStage.decode_logits (the logits of the #63 merge, DcpExchange and the
-    DSA core's rows) are DeepGEMM's MXFP4 logits of the stock query, bit for bit."""
-    assert logits.dtype == step.ref.dtype == torch.bfloat16
+    """IndexerStage.decode_logits (the logits of the DCP top-k and the DSA core's
+    rows) are DeepGEMM's MXFP4 FP32 logits of the stock query, bit for bit."""
+    assert logits.dtype == step.ref.dtype == torch.float32
     for i, n in enumerate(step.lens):
         assert torch.equal(logits[i, :n], step.ref[i, :n]), i
 

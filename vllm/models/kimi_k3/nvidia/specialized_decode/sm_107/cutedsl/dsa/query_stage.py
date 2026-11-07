@@ -171,7 +171,7 @@ def _compile_front(batch, heads, pitch, wq, index_kv, device, normalized, kind, 
     slots = fake((batch,), (1,), torch.int64, 8)
     norm = fake((DIM,), (1,), torch.float32, 4)
     q_out = fake((batch, HEADS, DIM), None, torch.uint8)
-    w_out = fake((batch, HEADS), None, torch.bfloat16, 4)
+    w_out = fake((batch, HEADS), None, torch.float32, 4)
     eps = cutlass.Float32(1e-6)
     tail = (norm, norm, index_kv, slots, q_out, w_out, eps, eps)
     if kind == "cluster" and not normalized:
@@ -201,7 +201,7 @@ def compile_index(batch, heads, pitch, index_kv):
     iq = fake((batch, HEADS * DIM), (HEADS * DIM, 1))
     norm = fake((DIM,), (1,), torch.float32, 4)
     q_out = fake((batch, HEADS, DIM), None, torch.uint8)
-    w_out = fake((batch, HEADS), None, torch.bfloat16, 4)
+    w_out = fake((batch, HEADS), None, torch.float32, 4)
     eps = cutlass.Float32(1e-6)
     i_args = (projected, iq, norm, norm, index_kv, slots, q_out, w_out, eps)
     return cute.compile(index, *i_args, make_fake_stream())

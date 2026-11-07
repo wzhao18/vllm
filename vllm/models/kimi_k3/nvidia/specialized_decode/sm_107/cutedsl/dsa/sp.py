@@ -18,10 +18,9 @@ group, 0.25..32 per GPU) and hands them here; this is PreparedDsa on one DcpBox 
                    on other ranks' MlaQuery, which waits on nothing.
   index            the fused index front (front) or QueryNorm -> wq_b -> DsaIndex
                    (fork) into the MXFP4 (or FP8) indexer query, key insert
-  top-k            exact over the bf16 logits (IndexerStage): DcpExchange's this-rank
-                   slots on its automatic policy (the stock hook, one round up to 256
-                   rows, two above) where it admits the step, else the #63 merge, else
-                   the stock op's global ids filtered to this rank's slots
+  top-k            exact over the FP32 logits at stock K3 precision (IndexerStage):
+                   the FP32 DCP top-k (every rank's local top-K, the all-gather and
+                   the exact merge) straight to this rank's slots
   sparse core      FlashInfer trtllm-gen over the gathered 128 query heads and this
                    rank's KV shard (``SP_KERNELS``; prims_ts is refused: SM107 has
                    none, and the stock C512 decode runs trtllm-gen)
@@ -123,7 +122,7 @@ class SpDsaScratch(NamedTuple):
     qc: torch.Tensor  # [rows, 1536] BF16
     iq: torch.Tensor  # [rows, 32 x 128] BF16
     q_fp8: torch.Tensor  # [rows, 32, 128] bytes
-    head_w: torch.Tensor  # [rows, 32] BF16
+    head_w: torch.Tensor  # [rows, 32] FP32 (stock K3's head weights)
 
 
 def sp_dsa_scratch(device, rows_cap: int = SP_ROWS) -> SpDsaScratch:
@@ -132,7 +131,7 @@ def sp_dsa_scratch(device, rows_cap: int = SP_ROWS) -> SpDsaScratch:
         torch.empty((rows_cap, 1536), **bf16),
         torch.empty((rows_cap, HEADS * DIM), **bf16),
         torch.empty((rows_cap, HEADS, DIM), dtype=torch.uint8, device=device),
-        torch.empty((rows_cap, HEADS), **bf16),
+        torch.empty((rows_cap, HEADS), dtype=torch.float32, device=device),
     )
 
 
@@ -303,12 +302,10 @@ class SpDsaCore:
 
         stage = self.prepared.indexer_stage
         if self.prefix in DCP_DECODE_TOPK_HOOKS:
-            topk = "DcpExchange where its policy admits the step"
-        else:
-            topk = "no DcpExchange hook"
-        if stage.local_topk:
-            topk += f", else the #63 merge (N={stage.local_topk})"
-        topk += ", else the stock op + local-slot filter (all exact)"
+            raise Unsupported(
+                "dsa", Shape(self.rows[0], self.q), "DcpExchange selects BF16 logits"
+            )
+        topk = f"FP32 DCP top-k (local top-{stage.local_topk} + merge, exact)"
         modes: dict[str, list[int]] = {}
         for r in self.rows:
             modes.setdefault(self.modes[r], []).append(r)
