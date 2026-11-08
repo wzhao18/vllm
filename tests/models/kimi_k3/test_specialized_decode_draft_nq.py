@@ -328,11 +328,11 @@ def test_draft_work_list_limits(monkeypatch):
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.mla import wlist
 
     made = []
-    monkeypatch.setattr(attention, "long_split", lambda *a: (1, 64, 128))
+    monkeypatch.setattr(attention, "long_split", lambda *a, **k: (1, 64, 128))
     monkeypatch.setattr(wlist, "WorkList", lambda *a: made.append(a) or a)
     monkeypatch.setattr(wlist, "_LISTS", {})
     monkeypatch.setattr(attention, "DRAFT_WLIST", {r: 1 for r in range(1, 4000)})
-    dcp = SimpleNamespace(steps=3, device="cpu")
+    dcp = SimpleNamespace(steps=3, device="cpu", size=16)
     work = attention.DraftDcp.work_list
     assert work(dcp, 3 * 192, 96, 3, 4, 160) is not None  # 192 x 3 x 4 = 2304 slots
     assert work(dcp, 3 * 257, 96, 3, 1, 160) is None  # 257 requests
@@ -537,14 +537,15 @@ def _rubin_world():
 
 
 @pytest.mark.parametrize(
-    "part", ["markov", "dcp", "dcp96", "query96", "context", "arnorm"]
+    "part", ["markov", "dcp", "dcp96", "query96", "c512rows", "context", "arnorm"]
 )
 def test_gpu_torchrun(part):
     """The torchrun checks below on every local GPU (skipped without 2+ Rubin-class
     GPUs). The DCP check runs at DCP = the local GPU count (6 heads per rank: 96
     gathered heads only at 16 GPUs, ``torchrun --nnodes 4``); ``dcp96`` / ``query96``
     at 96 gathered heads (96 / GPUs per rank: 24 at 4 GPUs, C512's drafter layer;
-    ``query96`` from the in-projection rows through MlaQuery). ``context`` / ``arnorm``:
+    ``query96`` from the in-projection rows through MlaQuery; ``c512rows``: C512's
+    whole DL3 row range served at 4 GPUs). ``context`` / ``arnorm``:
     the drafter's wide context row gather and wide all-reduce sites at row counts
     above one wave (the persistent kernels)."""
     import subprocess
@@ -903,11 +904,13 @@ def _exact_dcp(q, cache, metadata, w_uv, world, rank, interleave, group):
     return result.reshape(rows, per * 128)
 
 
-def _q_ideal(layer, qkv, staged, positions=None):
+def _q_ideal(layer, qkv, staged, positions=None, rope_bound=False):
     """This rank's q rows [rows, heads, 576] as FP8 bytes, in FP64 from the
     in-projection rows: RMSNorm, Q_B, W_UK (nope), GPT-J RoPE at ``positions`` (pe);
     ``staged``: rounded to BF16 after each stage as stock's kernels store them (the
-    rope rotates the BF16 Q_B output), else only at the FP8 store."""
+    rope rotates the BF16 Q_B output), else only at the FP8 store. ``rope_bound``:
+    also the scaled FP64 rope values [rows, heads, 64] and their inputs' magnitude
+    |x||cos| + |y||sin| (per output; see _rope_violations)."""
     rows, heads = qkv.shape[0], layer.num_local_heads
     f64 = torch.float64
     q_c = qkv[:, :1536].to(f64)
@@ -928,7 +931,25 @@ def _q_ideal(layer, qkv, staged, positions=None):
     x, y = q[..., 128::2], q[..., 129::2]
     pe = torch.stack((x * cos - y * sin, y * cos + x * sin), dim=-1).flatten(-2)
     out = torch.cat((nope, pe), dim=-1) * layer._q_scale_inv.to(f64)
-    return out.float().to(torch.float8_e4m3fn).view(torch.uint8)
+    q_bytes = out.float().to(torch.float8_e4m3fn).view(torch.uint8)
+    if not rope_bound:
+        return q_bytes
+    ax, ay, ac, as_ = x.abs(), y.abs(), cos.abs(), sin.abs()
+    mag = torch.stack((ax * ac + ay * as_, ay * ac + ax * as_), dim=-1).flatten(-2)
+    return q_bytes, out[..., 512:], mag * layer._q_scale_inv.to(f64)
+
+
+def _rope_violations(q_bytes, value, mag):
+    """How many FP8 rope bytes lie further from the FP64 rope ``value`` than one FP8
+    spacing (the store's rounding) plus 2^-6 of their inputs' magnitude ``mag``: a
+    rotation of BF16 Q_B values up to one BF16 ulp (2^-7 relative) from the staged
+    ones, as a Q_B accumulated in another order rounds, moves the result by up to
+    2^-7 mag, which is many FP8 spacings where x cos - y sin cancels. A wrong
+    position, head, row or scale moves bytes by about mag itself."""
+    got = q_bytes.view(torch.float8_e4m3fn).double()
+    big = torch.maximum(got.abs(), value.abs())
+    spacing = torch.exp2(torch.floor(torch.log2(big.clamp_min(2.0**-6))) - 3)
+    return int(((got - value).abs() > spacing + mag * 2.0**-6).sum())
 
 
 def _fp8_ulps(a, b):
@@ -1095,7 +1116,7 @@ def _dcp_main(rank, world, device, group, interleave=1):
     max_seq = dcp.local_max(1 << 20, world, interleave)
     long_row = None
     for rows in (39, 51, 54, 57):
-        split = attention.draft_fold_splits(rows, 3, heads, max_seq, device)[0]
+        split = attention.draft_fold_splits(rows, 3, heads, max_seq, device, world)[0]
         polled = attention.POLLED_CORE.get(rows) or attention.ROWS_MODE.get(rows)
         if split > 1 and not polled and (rows, heads) not in dcp.LONG_SPLIT:
             long_row = rows
@@ -1273,7 +1294,7 @@ def _query96_main(rank, world, device, group, interleave=1):
         return 0
     failures, seen, worst = 0, {}, 0.0
     accuracy: dict = {}  # (steps, rows) -> largest (specialized, stock) error
-    q_ulps = [0.0, 0.0]
+    q_ulps = [0.0] * 4  # (specialized, stock) nope, then rope columns
     cos_sin = _rope_cache(1 << 16, device)
     for steps, rows_list in ((3, [3, 6, 9, 24, 54, 63, 96, 120, 168]),
                              (7, [7, 14, 63, 112])):  # fmt: skip
@@ -1282,8 +1303,9 @@ def _query96_main(rank, world, device, group, interleave=1):
         cache0, _, _ = _dcp_inputs(1, steps, world, rank, interleave, shared_gen, gen,
                                    device, heads_rank=heads)  # fmt: skip
         layers = [
-            _QueryAttention(gen, shared_gen, device, cache0, world, rank, interleave,
-                            heads, cos_sin)  # fmt: skip
+            _QueryAttention(
+                gen, shared_gen, device, cache0, world, rank, interleave, heads, cos_sin
+            )  # fmt: skip
             for _ in (0, 1)
         ]
         shared = DraftDcp(
@@ -1363,17 +1385,28 @@ def _query96_main(rank, world, device, group, interleave=1):
                     )
                     failures += 1
                 mine = slice(rank * heads, (rank + 1) * heads)
-                ideal = _q_ideal(layer, qkv, True, positions)
+                ideal, rope, mag = _q_ideal(layer, qkv, True, positions, True)
                 for part in (slice(0, 512), slice(512, 576)):  # (nope, rope)
                     spec_ulps = _fp8_ulps(fast_q[:, mine, part], ideal[..., part])
                     stock_ulps = _fp8_ulps(q[:, mine, part], ideal[..., part])
-                    q_ulps[0] = max(q_ulps[0], spec_ulps)
-                    q_ulps[1] = max(q_ulps[1], stock_ulps)
-                    if spec_ulps > max(stock_ulps, 1.0) + 1.0:
-                        print(f"rank {rank}: {label} call {step}: q columns {part}: "
+                    which = 0 if part.start == 0 else 2
+                    q_ulps[which] = max(q_ulps[which], spec_ulps)
+                    q_ulps[which + 1] = max(q_ulps[which + 1], stock_ulps)
+                    if part.start == 0 and spec_ulps > Q_ULPS_LIMIT:
+                        print(f"rank {rank}: {label} call {step}: q nope columns: "
                               f"{spec_ulps:.2f} FP8 ulps from the staged FP64 query "
                               f"(stock {stock_ulps:.2f})")  # fmt: skip
                         failures += 1
+                # The rope columns: within one FP8 spacing + 2^-6 of the rotation's
+                # input magnitude of the FP64 rope (stock must hold the same bound).
+                rope_bad = [
+                    _rope_violations(x[:, mine, 512:], rope, mag) for x in (fast_q, q)
+                ]
+                if any(rope_bad):
+                    print(f"rank {rank}: {label} call {step}: rope bytes past the "
+                          f"rotation bound: specialized {rope_bad[0]}, stock "
+                          f"{rope_bad[1]}")  # fmt: skip
+                    failures += 1
                 flipped = (fast_q != q).float().mean().item()
                 if flipped > FP8_FLIP_LIMIT:
                     print(
@@ -1405,6 +1438,19 @@ def _query96_main(rank, world, device, group, interleave=1):
                     failures += 1
         del layers, shared
         torch.cuda.empty_cache()
+    # The nope q bytes: no further from the staged FP64 query than stock's (+1 FP8
+    # ulp), over every call and rank. (The rope columns' FP8 ulps are reported only:
+    # where x cos - y sin cancels, one BF16 ulp of Q_B is several FP8 ulps of the
+    # result for both paths; their check is _rope_violations.)
+    ulps = torch.tensor(q_ulps, device=device)
+    torch.distributed.all_reduce(ulps, op=torch.distributed.ReduceOp.MAX)
+    q_ulps = ulps.tolist()
+    if q_ulps[0] > q_ulps[1] + 1.0:
+        print(
+            f"rank {rank}: q nope columns {q_ulps[0]:.2f} FP8 ulps from the staged "
+            f"FP64 query, stock {q_ulps[1]:.2f}"
+        )
+        failures += 1
     for (steps, rows), errors in sorted(accuracy.items()):
         both = torch.tensor(errors, device=device)
         torch.distributed.all_reduce(both, op=torch.distributed.ReduceOp.MAX)
@@ -1423,13 +1469,82 @@ def _query96_main(rank, world, device, group, interleave=1):
     if rank == 0:
         print(f"DraftDcp 96h query paths: {sorted(seen.items())}")
     print(
-        f"rank {rank}: q FP8 ulps from the staged FP64 query: specialized "
-        f"{q_ulps[0]:.2f}, stock {q_ulps[1]:.2f}; largest end-to-end error past "
-        f"_close vs stock: {worst:.4g}"
+        f"rank {rank}: q FP8 ulps from the staged FP64 query (nope / rope): "
+        f"specialized {q_ulps[0]:.2f} / {q_ulps[2]:.2f}, stock {q_ulps[1]:.2f} / "
+        f"{q_ulps[3]:.2f}; largest end-to-end error past _close vs stock: {worst:.4g}"
     )
     return failures
 
 
+def _c512_rows_main(rank, world, device, group, interleave=1):
+    """C512's drafter attention at its whole captured row range: TP4 = DCP4 (24
+    heads per rank, MlaQuery publish-only), DL3, max-num-seqs 128 per DP rank ->
+    drafter rows 3..384, max-model-len 2^20, as runtime.draft builds DraftDcp there
+    (FAST_DCP[4] = every row, strict). Every row must be served (runtime.draft
+    refuses the load otherwise), have its fused query (a served row without one
+    reaches ``merge``'s ungathered-q refusal at capture) and run a fold / polled /
+    wide / fork core (stock_core_rows is refused)."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.draft.attention import (  # noqa: E501
+        DraftDcp,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.runtime import draft
+
+    if world != 4:
+        print(f"rank {rank}: C512's drafter is DCP4, not {world}")
+        return 0
+    steps, heads = 3, 96 // world
+    spec = draft.closed(draft.FAST_DCP.get(4, ""), 384)
+    rows = [r for r in range(steps, 128 * steps + 1, steps)
+            if draft.covered(spec, r, steps)]  # fmt: skip
+    failures = 0
+    if len(rows) != 128:
+        print(f"rank {rank}: FAST_DCP[4] lists {len(rows)} of C512's 128 rows")
+        failures += 1
+    gen = torch.Generator().manual_seed(4512 + rank)
+    shared_gen = torch.Generator().manual_seed(4512)
+    cache0, _, _ = _dcp_inputs(1, steps, world, rank, interleave, shared_gen, gen,
+                               device, heads_rank=heads)  # fmt: skip
+    layers = [
+        _QueryAttention(
+            gen,
+            shared_gen,
+            device,
+            cache0,
+            world,
+            rank,
+            interleave,
+            heads,
+            _rope_cache(1 << 16, device),
+        )  # fmt: skip
+        for _ in (0, 1)
+    ]
+    shared = DraftDcp(layers, group, world, rank, rows, steps, 1 << 20, interleave,
+                      True)  # fmt: skip
+    unserved = {r: shared.dropped.get(r, "not covered")
+                for r in rows if not shared.served(r)}  # fmt: skip
+    if unserved:
+        print(f"rank {rank}: C512 drafter rows not served: {unserved}")
+        failures += 1
+    no_query = [r for r in rows if shared.served(r) and r not in shared.queries]
+    if no_query:
+        print(f"rank {rank}: C512 served rows without the fused query: {no_query}")
+        failures += 1
+    seams = shared.stock_core_rows()
+    if seams:
+        print(f"rank {rank}: C512 rows on the stock tokenspeed core: {seams}")
+        failures += 1
+    if rank == 0:
+        print(f"C512 drafter coverage: {shared.coverage(rows)}")
+    del layers, shared
+    torch.cuda.empty_cache()
+    return failures
+
+
+# Any one call's nope q bytes further than this from the staged FP64 query (FP8 ulps
+# at the larger magnitude) are wrong (a head, row or scale error moves them far): both
+# the fused query and stock land up to 3 away (W_UK over BF16 Q_B outputs one BF16 ulp
+# apart).
+Q_ULPS_LIMIT = 4.0
 # The specialized drafter attention's largest error against the exact FP32 attention
 # (per row, over calls and ranks) may exceed stock's by this factor: the same FP8
 # roundings (P in the core, the BF16 partial rows) in another order land elsewhere.
@@ -1684,6 +1799,8 @@ def _gpu_main(parts):
         failures += _dcp96_main(rank, world, device, group)
     if "query96" in parts:
         failures += _query96_main(rank, world, device, group)
+    if "c512rows" in parts:
+        failures += _c512_rows_main(rank, world, device, group)
     if "context" in parts:
         failures += _context_main(rank, world, device, group)
     if "arnorm" in parts:
@@ -1695,6 +1812,14 @@ def _gpu_main(parts):
 
 if __name__ == "__main__":
     # torchrun ... test_specialized_decode_draft_nq.py [markov] [dcp] [dcp96]
-    # [query96] [context] [arnorm] (default: all)
-    parts = sys.argv[1:] or ("markov", "dcp", "dcp96", "query96", "context", "arnorm")
+    # [query96] [c512rows] [context] [arnorm] (default: all)
+    parts = sys.argv[1:] or (
+        "markov",
+        "dcp",
+        "dcp96",
+        "query96",
+        "c512rows",
+        "context",
+        "arnorm",
+    )
     sys.exit(1 if _gpu_main(parts) else 0)
