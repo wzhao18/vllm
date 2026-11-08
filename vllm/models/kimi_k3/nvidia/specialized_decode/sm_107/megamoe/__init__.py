@@ -13,25 +13,10 @@ the runner's warmup:
   kernels are untouched. The SM107 specialized decode raises when the installed
   DeepGEMM's header or heuristics do not match (it never falls back to the stock
   kernel silently).
-- ``VLLM_K3_MEGAMOE_LOCALIZE`` (default 0; set 1 to opt in): place each rank's routed expert weights
-  in the GPU's two locality domains (MLOPart), so every die streams its half of N
-  from its own HBM (bitwise-identical output). Full K3.1 DEP16 on VR: -0.57..-0.65 ms
-  per step on one 4-node block (MegaMoE 119.7 -> 113.7 us/launch at 128 rows), 5 of
-  5 processes clean. The gain depends on the node: DEP4 8-layer B/C repeats on three
-  dedicated nodes saved -334..-381 us per step on two and -179..-211 us on the third.
-  The KV pool is 0.1-3% smaller per GPU and varies from one start to the next (full
-  DEP16: 102.34 -> 101.96-102.21 GiB; DEP4 8-layer: 202.54 -> 196.1-201.5 GiB). The
-  MLOPart weights live outside the PyTorch allocator and vLLM's profile counts
-  them, plus a start-dependent MLOPart overhead, as non-torch memory. Falls back
-  to the plain placement without MLOPart or under EPLB (the weights change shape to
-  ``(2, E, N / 2, K)``, which EPLB cannot move). Caveat: on a shared DEP4 node
-  (224 experts/rank) 4 of 8 localized processes had cases 17-25% slower (one rank's
-  drafter MLA decode ~1.4x slower) while other jobs used the same GPUs.
 """
 
 from __future__ import annotations
 
-import os
 import types
 
 import torch
@@ -39,18 +24,6 @@ import torch
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
-
-_LOCALIZE = os.environ.get("VLLM_K3_MEGAMOE_LOCALIZE", "0") == "1"
-
-
-def _localize_experts(experts, deep_gemm) -> None:
-    """Routed weights ``(E, N, K)`` -> ``(2, E, N / 2, K)``, one N half per locality
-    domain; the block scales stay as they are."""
-    for name in ("w13_weight", "w2_weight"):
-        w = getattr(experts, name)
-        if not deep_gemm.is_localized(w.data):
-            w.data = deep_gemm.localize(w.data)
-
 
 def _situ_forward(
     self,
@@ -115,7 +88,7 @@ def _situ_forward(
 
 
 def prepare_megamoe(model: torch.nn.Module, vllm_config) -> None:
-    """Apply the env-selected MegaMoE tuning to every ``DeepGemmMegaMoEExperts``."""
+    """Launch the SM107 wide-EP kernel from every FP8 x FP4 SiTU ``DeepGemmMegaMoEExperts``."""
     from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import (
         DeepGemmMegaMoEExperts,
     )
@@ -144,18 +117,4 @@ def prepare_megamoe(model: torch.nn.Module, vllm_config) -> None:
         logger.info_once(
             "Kimi K3 MegaMoE: K3.1 wide-EP kernel (SM107 decode build, %s)",
             situ.include[0],
-        )
-    if _LOCALIZE:
-        if vllm_config.parallel_config.enable_eplb:
-            logger.info_once("Kimi K3 MegaMoE: routed expert weights not localized (EPLB)")
-            return
-        if not deep_gemm.is_localization_available():
-            logger.info_once("Kimi K3 MegaMoE: routed expert weights not localized (no MLOPart)")
-            return
-        for e in experts:
-            _localize_experts(e, deep_gemm)
-            torch.cuda.empty_cache()
-        deep_gemm.destroy_localizer()
-        logger.info_once(
-            "Kimi K3 MegaMoE: localized the routed expert weights of %d layers", len(experts)
         )
