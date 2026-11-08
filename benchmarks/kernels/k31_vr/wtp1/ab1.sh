@@ -4,7 +4,7 @@
 # ("A B B2 A2"); the first booked A/B (ab3n1/ab3n2) ran ARMS="A B" per node, with an A/A control (ab2 offA/offB).
 # usage: [ARMS="A B"] [PFX=..] ab1.sh <jobid> <envtag> (never re-push <envtag> while it runs)
 W=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr; cd $W/wtp1/tools
-export TAG=wtp1-$2 K31W0_LAYERS=8 VLLM_K31_DSA_FUSED_DECODE_Q=${FQ:-0}
+export TAG=wtp1-$2 K31W0_LAYERS=8
 J=$1; P=${PFX:-ab1}
 for arm in ${ARMS:-A B B2 A2}; do
   case $arm in A*) export VLLM_TOKENSPEED_SM107_SPLIT=0;; B*) unset VLLM_TOKENSPEED_SM107_SPLIT;; esac

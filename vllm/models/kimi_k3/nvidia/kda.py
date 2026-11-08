@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
 from collections.abc import Callable
 from dataclasses import replace
 from typing import Literal
@@ -11,7 +10,6 @@ from einops import rearrange
 from torch import nn
 from torch.nn.parameter import Parameter
 
-import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
@@ -88,12 +86,9 @@ from vllm.v1.worker.workspace import (
 
 logger = init_logger(__name__)
 
-# VLLM_K3_KDA_CONV_TILE=0: the generic causal_conv1d_fn for the prefill short
-# convolutions (ops/kda_conv.py is bitwise equal to it).
-_CONV_TILE = os.environ.get("VLLM_K3_KDA_CONV_TILE", "1") == "1"
-# VLLM_K3_KDA_NORM_TILES=0: FLA's rms_norm_gated for the output gate norm
-# (ops/kda_norm.py is bitwise equal to it).
-_NORM_TILES = os.environ.get("VLLM_K3_KDA_NORM_TILES", "1") == "1"
+# The prefill short convolutions run ops/kda_conv.py and the output gate norm
+# ops/kda_norm.py wherever they apply (``supported``): both are bitwise equal to the
+# generic causal_conv1d_fn / FLA rms_norm_gated they replace.
 
 _KDA_GATE_LOGBOUND_MIN = -5.0
 
@@ -868,7 +863,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 ((workspace_size,), torch.uint8),
             )
             self._checkpoint_exporter = self._make_checkpoint_exporter()
-            if kda_segscan.enabled() and D == 128:
+            if kda_segscan.wanted(vllm_config) and D == 128:
                 # Segment-parallel prefill buffers, shared by every KDA layer
                 # and allocated before the memory profile.
                 self._segscan_bufs = kda_segscan.init_buffers(
@@ -1035,12 +1030,10 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             return self.o_proj(o_mxfp8.activation())[0]
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
         if self.gemm_rs_ar is not None and self.gemm_rs_ar.should_run(core_attn_out):
-            # VLLM_KIMI_K3_GEMM_AR_ALIAS: hand back the workspace view; the
-            # decoder layer consumes it before the next GEMM-AR, and copies it
-            # only where it keeps it (AttnRes block-write layers).
-            return self.gemm_rs_ar.apply(
-                core_attn_out, self.o_proj, copy_out=not envs.VLLM_KIMI_K3_GEMM_AR_ALIAS
-            )
+            # Hand back the workspace view (bitwise; no copy): the decoder layer
+            # consumes it before the next GEMM-AR, and copies it only where it
+            # keeps it (AttnRes block-write layers).
+            return self.gemm_rs_ar.apply(core_attn_out, self.o_proj, copy_out=False)
         return self.o_proj(core_attn_out)[0]
 
     def _recoverssm_verify(
@@ -1137,7 +1130,6 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
 
             self._o_norm_mxfp8_ok = (
                 self.gemm_rs_ar is None
-                and _NORM_TILES
                 and takes_mxfp8_activation(self.o_proj)
             )
         return (
@@ -1395,7 +1387,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                     weight: torch.Tensor,
                 ) -> torch.Tensor:
                     xt = x.transpose(0, 1)
-                    if _CONV_TILE and kda_conv.supported(xt, weight, state, m):
+                    if kda_conv.supported(xt, weight, state, m):
                         assert non_spec_state_indices_tensor is not None
                         assert has_initial_state is not None
                         return kda_conv.kda_prefill_conv(
@@ -1687,7 +1679,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             kda_norm.rmsnorm_gated_mxfp8(
                 core_attn_out, g2, self.o_norm.weight, self.o_norm.eps, out=o_mxfp8
             )
-        elif _NORM_TILES and kda_norm.supported(core_attn_out, g2, self.o_norm):
+        elif kda_norm.supported(core_attn_out, g2, self.o_norm):
             kda_norm.rmsnorm_gated_(
                 core_attn_out, g2, self.o_norm.weight, self.o_norm.eps
             )

@@ -3,7 +3,7 @@
 """DCP top-k merge at the small-batch decode shapes (dev tool, torchrun).
 
 Times ``DcpExchange.topk_merge`` with the decode wiring's launch parameters
-(``DcpxDecode.launch_params``, block-table-free positions, ``tie_order="rank"``)
+(``DcpxDecode.launch_params``, block-table-free positions, ties by global id)
 for each variant in ``K31_TK_VARIANTS``:
 
 * ``r8``: the int1 default (octave round R8 -> R4 -> 16-key refine: 3 rounds)
@@ -111,7 +111,7 @@ def main():
         ref = None
         for v in variants:
             kw = dict(VARIANTS[v], max_local_len=min(model_local, stride),
-                      cluster=cluster, segmax=segmax, tie_order="rank")
+                      cluster=cluster, segmax=segmax)
             stats = torch.zeros(8, dtype=torch.int32, device=dev)
             ex.topk_merge(local, Lr, G, out, cnt, stats=stats, **kw)
             torch.cuda.synchronize()

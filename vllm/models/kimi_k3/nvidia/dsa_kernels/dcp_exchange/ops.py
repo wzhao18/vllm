@@ -102,8 +102,7 @@ def _load_ext():
     import hashlib
 
     digest = hashlib.sha1(src.read_bytes()).hexdigest()[:10]
-    if os.environ.get("K31_DCPX_DEBUG_PRINT"):
-        digest += "_dbg"
+    # (infrastructure: where torch keeps the extension build; default its cache)
     build = os.environ.get("K31_DCPX_BUILD_DIR")
     if build:
         build = str(Path(build) / digest)
@@ -116,11 +115,9 @@ def _load_ext():
             f"-gencode=arch=compute_{arch},code=sm_{arch}",
             "--use_fast_math",
             "-std=c++20",
-        ] + (["-Xptxas=-v"] if os.environ.get("K31_DCPX_PTXAS_V") else [])
-        + (["-DK31_DCPX_DEBUG_PRINT"] if os.environ.get("K31_DCPX_DEBUG_PRINT") else []),
+        ],
         extra_cflags=["-O3", "-std=c++20"],
         build_directory=build,
-        verbose=bool(os.environ.get("K31_DCPX_VERBOSE")),
     )
     return _EXT
 
@@ -182,10 +179,7 @@ class DcpExchange:
         }
         self.off = {}
         o = 0
-        order = list(sizes)
-        if os.environ.get("K31_DCPX_TL_FIRST"):
-            order = ["tl", "tr", "tk"] + [k for k in order if k not in ("tl", "tr", "tk")]
-        for k in order:
+        for k in sizes:
             v = sizes[k]
             self.off[k] = o
             o += (v + 63) & ~63
@@ -196,18 +190,9 @@ class DcpExchange:
             [int(x) for x in h.buffer_ptrs], dtype=torch.int64, device=device
         )
         self.tk_mc = int(getattr(h, "multicast_ptr", 0) or 0)
-        if os.environ.get("K31_DCPX_NO_MULTICAST"):
-            self.tk_mc = 0
         self.tk_epoch = torch.zeros(cap, dtype=torch.int32, device=device)  # per row
         self.tk_ticket = torch.zeros(1, dtype=torch.int32, device=device)
         self.err = torch.zeros(1, dtype=torch.int32, device=device)
-        if os.environ.get("K31_DCPX_DEBUG_ERR"):
-            # debug: error codes in pinned host memory (readable after a device trap)
-            self.err = torch.zeros(1, dtype=torch.int32).pin_memory()
-            import atexit
-
-            atexit.register(lambda e=self.err: print(f"DcpExchange err at exit: {int(e[0])}",
-                                                     flush=True))
         self.mailbox_bytes = 4 * o
         # top-k pre-pass scratch (per row: coarse histogram, window counts, candidate
         # list; csrc topk_pp_*_kernel), zero between uses
@@ -263,7 +248,6 @@ class DcpExchange:
         next_n: int = 1,
         block_stride: int = 0,
         req_of_row: torch.Tensor | None = None,
-        tie_order: str = "global",
         cluster: int | None = None,
         segmax: int = 8192,
         one_round: bool = True,
@@ -279,9 +263,8 @@ class DcpExchange:
         ``prepass`` / ``prepass_min``: the pre-pass and the local keys up to which a
         row still runs its own passes (None: ``topk_prepass`` / ``topk_prepass_min``;
         the outputs are the same either way).
-        ``tie_order``: "global" selects the ties at the K-th key by ascending global
-        token id (the stock merge's rule; one extra round when they straddle ranks),
-        "rank" by (rank, position) with no extra round (the same score multiset).
+        Ties at the K-th key are selected by ascending global token id (the stock
+        merge's rule; one extra round when they straddle ranks).
         ``window`` (1-round rows): "top" ends each rank's window at its local
         maximum; "center" centres it at the rank's local estimate of the K-th key
         (its local ceil(K * L / G)-th key). Rows whose K-th key falls outside a
@@ -321,7 +304,7 @@ class DcpExchange:
             next_n,
             block_stride,
             req_of_row,
-            {"global": 0, "rank": 1}[tie_order],
+            0,  # (ties by global id; the kernel's rank-order mode is not exposed)
             self.tk_box.data_ptr(),
             self.tk_mc,
             self.tk_peers,

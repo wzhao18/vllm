@@ -1920,7 +1920,7 @@ def run_layer_step(
     and FlashInfer's latent and LSE poisoned before it, ``replays`` times; both
     must give the eager step's rows bit for bit. ``sparse_core``: under DCP, the DSA
     sparse core's variant (dsa_core.decode.parse_variant) at every row, as
-    VLLM_K31_DSA_CORE=1 serves it (its own pushes and DcpValue(pushed); with
+    the DSA sparse core serves it (its own pushes and DcpValue(pushed); with
     ``graph`` the merge's rows and counts are still poisoned before each layer).
     ``exchange``: under DCP, DcpExchange's top-k (dcp_exchange.decode.DcpxDecode)
     attached after the stock forward (which keeps the #63 merge), as the model's
@@ -2079,20 +2079,16 @@ def run_layer_step(
         core_calls: list = []
         topk_calls: list = []
         dcpx = None
-        pdl_rows = 0
         if exchange:
             from vllm.models.kimi_k3.nvidia.dsa_kernels.dcp_exchange.decode import (
                 DcpxDecode,
-                topk_pdl_rows,
             )
 
             assert world > 1
             dcpx = DcpxDecode(config, dev, HEADS * world, indexer.topk_tokens)
-            assert "topk" in dcpx.parts, dcpx.parts
             dcpx.attach(attn)
             dcpx.warm()
-            dcpx.serve()  # peer waits of VLLM_K31_DCP_EXCHANGE_SPIN_S
-            pdl_rows = topk_pdl_rows()
+            dcpx.serve()  # peer waits of the serving deadline
             run_topk = dcpx.decode_topk
 
             def counted_topk(*args, **kwargs):
@@ -2102,7 +2098,7 @@ def run_layer_step(
             dcpx.decode_topk = counted_topk  # (the hook's late lookup)
         if sparse_core is not None:
             assert world > 1
-            indexer.dsac = sparse_dsa_core(dev, HEADS * world, sparse_core, pdl_rows)
+            indexer.dsac = sparse_dsa_core(dev, HEADS * world, sparse_core)
             indexer.dsac_layer = 0
         if world > 1:
             runtime = SimpleNamespace(
@@ -2316,13 +2312,12 @@ def run_layer_step(
     )
 
 
-def sparse_dsa_core(device, heads, variant, pdl_rows=0):
+def sparse_dsa_core(device, heads, variant):
     """The DSA sparse core (dsa_core.decode.DsacDecode) serving ``variant`` at every
-    row up to 64 (``pdl_rows``: build()'s under DcpExchange's top-k)."""
+    row up to 64."""
     from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core.decode import DsacDecode
 
-    spec = f"1-64:{variant}"
-    return DsacDecode(device, heads, rows=64, spec=spec, skip="", pdl_rows=pdl_rows)
+    return DsacDecode(device, heads, rows=64, spec=f"1-64:{variant}")
 
 
 def exchange_ids(slots, counts, md, index_md, cache):
@@ -3069,7 +3064,7 @@ def test_prepared_dsa_dcp_graph_poisoned(dcp8_group, batch, overlap, partials):
 @pytest.mark.parametrize("variant", ["2x16s2", "1x16", "8x16s4"])
 @pytest.mark.parametrize("batch", [8, 16])
 def test_prepared_dsa_dcp_sparse_core(dcp8_group, batch, variant, overlap):
-    """The DSA sparse core (VLLM_K31_DSA_CORE) on PreparedDsa's DCP steps at q8 (the
+    """The DSA sparse core on PreparedDsa's DCP steps at q8 (the
     DL7 rows of C1 and C8; under the KIMI_K3_SD_DCP16_INIT launch DCP16): every
     rank's core polls the q mailbox (rank 0's forked publish held back), decodes
     the 96 gathered heads over its rows of the #63 merge and pushes them to their
@@ -3101,7 +3096,7 @@ def test_prepared_dsa_dcp_sparse_core(dcp8_group, batch, variant, overlap):
     [(8, "1-16:bf16,17-64:proj"), (16, "1-16:bf16,17-64:proj"), (8, "proj")],
 )
 def test_prepared_dsa_dcp_sparse_core_partials(dcp8_group, batch, partials):
-    """The DSA sparse core (VLLM_K31_DSA_CORE, 2x16s2 at q8) under a partials
+    """The DSA sparse core (2x16s2 at q8) under a partials
     policy (r1.DsaBox's argument): on the "bf16" rows of a mixed table (a DL7 render's
     "1-16:bf16,17-64:proj") it still serves M8 / M16; on "proj" rows it stands
     aside (it pushes BF16 latent rows only) for FlashInfer's decode, the W_UV bmm
@@ -3144,7 +3139,7 @@ def test_prepared_dsa_dcp_sparse_core_exchange(
     dcp8_group, monkeypatch, batch, rows, overlap
 ):
     """test_prepared_dsa_dcp_sparse_core with DcpExchange's top-k feeding the core
-    (VLLM_K31_DCP_EXCHANGE, PARTS=topk, and VLLM_K31_DSA_CORE at 1-16:2x16s2) at q8:
+    (its decode policy, and the DSA sparse core at 1-16:2x16s2) at q8:
     a DcpxDecode attached after the stock forward (which keeps the #63 merge), as
     process_weights_after_loading attaches it, gives merge_rows the step and every
     rank's core its slots and counts. The exchanged top-k, as global ids, holds
@@ -3156,20 +3151,13 @@ def test_prepared_dsa_dcp_sparse_core_exchange(
     alternating parities with the exchange's slots and counts poisoned before each,
     200 replays give the eager rows bit for bit. Skewed: the first half of the ranks
     score their old keys 2^8 higher (positive logits first, negative ones last), so
-    a row's counts differ twofold over the ranks (else never). At most
-    K31_DCPX_PDL rows (default 16) the exchange's top-k launches with PDL and the
-    core keeps out (its q poll precedes its PDL wait), FlashInfer decoding the
-    exchange's rows: K31_DCPX_PDL=0 gives the core M8 and M16."""
+    a row's counts differ twofold over the ranks (else never). The exchange's top-k
+    launches without PDL, so the core takes M8 and M16 (its q poll precedes its PDL
+    wait)."""
     from vllm.model_executor.layers import sparse_attn_indexer
-    from vllm.models.kimi_k3.nvidia.dsa_kernels.dcp_exchange import decode as dcpx
 
-    # This case's layer alone takes the exchange (the other tests: the #63 merge).
+    # This case's layer alone takes the exchange (the other tests: the #63 merge)
     monkeypatch.setattr(sparse_attn_indexer, "DCP_DECODE_TOPK_HOOKS", {})
-    monkeypatch.setenv(dcpx.PARTS_ENV, "topk")
-    monkeypatch.delenv(dcpx.ENV + "_TIES", raising=False)  # (rank, position)
-    monkeypatch.delenv(dcpx.GRAPH_ONLY_ENV, raising=False)
-    # A rank still compiling its first case's kernels must not trap its peers.
-    monkeypatch.setenv(dcpx.SPIN_ENV, "120")
     step = run_layer_step(
         "fi-trtllm",
         batch,
@@ -3211,11 +3199,9 @@ def test_prepared_dsa_dcp_sparse_core_exchange(
     skewed = high >= 2 * low.clamp(min=1)
     assert bool(skewed.any()) == (rows == "skewed"), (low, high)
     # the eager step, the chain's and the two captured layers: the exchange's top-k
-    # each, and the core but on the chain and after a PDL top-k
+    # each, and the core but on the chain
     assert step.topk_calls == [batch] * 4, step.topk_calls
-    pdl_rows = dcpx.topk_pdl_rows()
-    print(f"core calls {len(step.core_calls)} (K31_DCPX_PDL rows {pdl_rows})")
-    assert len(step.core_calls) == 3 * (batch > pdl_rows), step.core_calls
+    assert len(step.core_calls) == 3, step.core_calls
 
 
 @pytest.mark.skipif(DCP_INIT is None, reason="needs an 8-rank launch (DCP8)")
@@ -3224,24 +3210,18 @@ def test_prepared_dsa_dcp_sparse_core_exchange(
 @pytest.mark.parametrize("core", ["fi-trtllm", "fi-nvfp4"])
 def test_prepared_dsa_dcp_exchange_proj(dcp8_group, monkeypatch, core, batch):
     """PreparedDsa's "proj" rows (partials "proj") fed by DcpExchange's
-    top-k (VLLM_K31_DCP_EXCHANGE, PARTS=topk, as served) at q8, DL7's C1 and C8
-    rows (at most K31_DCPX_PDL rows the top-k launches with PDL): FlashInfer
+    top-k (as served) at q8, DL7's C1 and C8 rows: FlashInfer
     decodes the exchange's rows, the W_UV bmm projects them and DcpValue("proj")
     merges, as the stock DCP forward of the step where the top-k is the same
     (check_layer_step: every row of the short M8 context); in a CUDA graph of two
     layers on alternating parities, the exchange's slots and counts poisoned
     before each, 200 replays give the eager rows bit for bit."""
     from vllm.model_executor.layers import sparse_attn_indexer
-    from vllm.models.kimi_k3.nvidia.dsa_kernels.dcp_exchange import decode as dcpx
 
     if LAYER_CORES[core][2] == "prims_ts" and no_prims_ts():
         pytest.skip("FlashInfer prims_ts sparse MLA cannot run here")
-    # This case's layer alone takes the exchange (the other tests: the #63 merge).
+    # This case's layer alone takes the exchange (the other tests: the #63 merge)
     monkeypatch.setattr(sparse_attn_indexer, "DCP_DECODE_TOPK_HOOKS", {})
-    monkeypatch.setenv(dcpx.PARTS_ENV, "topk")
-    monkeypatch.delenv(dcpx.ENV + "_TIES", raising=False)  # (rank, position)
-    monkeypatch.delenv(dcpx.GRAPH_ONLY_ENV, raising=False)
-    monkeypatch.setenv(dcpx.SPIN_ENV, "120")
     step = run_layer_step(
         core, batch, 8, dcp8_group, None, "proj", graph=True, replays=200, exchange=True
     )
@@ -3254,6 +3234,43 @@ def test_prepared_dsa_dcp_exchange_proj(dcp8_group, monkeypatch, core, batch):
     assert all(same) or batch != 8, same
     # the eager step and the two captured layers
     assert step.topk_calls == [batch] * 3, step.topk_calls
+
+
+@pytest.mark.skipif(DCP_INIT is None, reason="needs an 8-rank launch (DCP8)")
+@pytest.mark.skip_global_cleanup  # the DCP8 group outlives each case
+@pytest.mark.parametrize("batch", [16, 32, 64])
+def test_prepared_dsa_dcp_served_topk(dcp8_group, monkeypatch, batch):
+    """The served top-k route at q8 by DCP size: at DCP16 (MERGE_DCP) the model
+    builds no DcpExchange and every step keeps the #63 merge; at DCP8 the exchange,
+    attached as served, takes every step. Either way the step is the stock DCP
+    forward's (check_layer_step), the rows of at most 16 on the DSA sparse core
+    (2x16s2, as served), and 200 graph replays give the eager rows bit for bit."""
+    from vllm.model_executor.layers import sparse_attn_indexer
+    from vllm.models.kimi_k3.nvidia.dsa_kernels.dcp_exchange import decode as dcpx
+
+    monkeypatch.setattr(sparse_attn_indexer, "DCP_DECODE_TOPK_HOOKS", {})
+    world = dcp8_group
+    exchanged = world not in dcpx.MERGE_DCP
+    step = run_layer_step(
+        "fi-trtllm",
+        batch,
+        8,
+        dcp8_group,
+        None,
+        None,
+        graph=True,
+        replays=200,
+        sparse_core="2x16s2" if batch <= 16 else None,
+        exchange=exchanged,
+    )
+    check_layer_step(step, 8, reference=False)
+    print(f"DCP{world} M{batch}: exchange top-k calls {step.topk_calls}")
+    assert step.topk_calls == ([batch] * len(step.topk_calls) if exchanged else []), (
+        step.topk_calls
+    )
+    assert exchanged == bool(step.topk_calls), step.topk_calls
+    if batch <= 16:
+        assert len(step.core_calls) >= 3, step.core_calls
 
 
 # DcpExchange's top-k feeding WideDsa above 96 rows at DCP16: DL7's C64 band (q8 at
@@ -3393,10 +3410,10 @@ def run_wide_exchange_step(batch, q, world, replays, core="fi-trtllm", partials=
         stock_topk = topk_buffer[:batch].clone()
 
         dcpx = DcpxDecode(config, dev, HEADS * world, indexer.topk_tokens)
-        assert "topk" in dcpx.parts and dcpx.topk_cap >= batch, (dcpx.parts, dcpx.cap)
+        assert dcpx.topk_cap >= batch, (dcpx.topk_cap, batch)
         dcpx.attach(attn)
         dcpx.warm()
-        dcpx.serve()  # peer waits of VLLM_K31_DCP_EXCHANGE_SPIN_S
+        dcpx.serve()  # peer waits of the serving deadline
         topk_calls: list = []
         run_topk = dcpx.decode_topk
 
@@ -3542,8 +3559,8 @@ def run_wide_exchange_step(batch, q, world, replays, core="fi-trtllm", partials=
 @pytest.mark.parametrize("batch,q", WIDE_EXCHANGE_CASES)
 @pytest.mark.parametrize("core", ["fi-trtllm", "fi-nvfp4"])
 def test_wide_dsa_dcp_exchange(dcp8_group, monkeypatch, core, batch, q):
-    """WideDsa above 96 rows fed by DcpExchange's top-k (VLLM_K31_DCP_EXCHANGE,
-    PARTS=topk) at DCP16, with BF16 latent partials: C64's combination (q8, 256 rows)
+    """WideDsa above 96 rows fed by DcpExchange's top-k at DCP16, with BF16 latent
+    partials: C64's combination (q8, 256 rows)
     and DL3's (q4 at 128, 256 and 512 rows; run on the cap-128 tree). The indexer op
     gives the step to the exchange, whose slots and counts WideDsa's sparse decode reads
     (``dcp_local_topk_counts``). The exchanged top-k, as global ids, holds min(K,
@@ -3557,16 +3574,11 @@ def test_wide_dsa_dcp_exchange(dcp8_group, monkeypatch, core, batch, q):
     "fi-nvfp4": an nvfp4_ds_mla cache (WideDsa's MlaQuery inserts its rows; FlashInfer
     prims_ts everywhere)."""
     from vllm.model_executor.layers import sparse_attn_indexer
-    from vllm.models.kimi_k3.nvidia.dsa_kernels.dcp_exchange import decode as dcpx
 
     if LAYER_CORES[core][2] == "prims_ts" and no_prims_ts():
         pytest.skip("FlashInfer prims_ts sparse MLA cannot run here")
-    # This case's layer alone takes the exchange (the other tests: the #63 merge).
+    # This case's layer alone takes the exchange (the other tests: the #63 merge)
     monkeypatch.setattr(sparse_attn_indexer, "DCP_DECODE_TOPK_HOOKS", {})
-    monkeypatch.setenv(dcpx.PARTS_ENV, "topk")
-    monkeypatch.delenv(dcpx.ENV + "_TIES", raising=False)  # (rank, position)
-    monkeypatch.delenv(dcpx.GRAPH_ONLY_ENV, raising=False)
-    monkeypatch.setenv(dcpx.SPIN_ENV, "120")
     step = run_wide_exchange_step(batch, q, dcp8_group, replays=200, core=core)
     check_layer_step(step, q, reference=False)
     same = [
@@ -3618,15 +3630,10 @@ def test_wide_dsa_dcp_exchange_proj(dcp8_group, monkeypatch, core, batch, q):
 
     from vllm.distributed import get_dcp_group
     from vllm.model_executor.layers import sparse_attn_indexer
-    from vllm.models.kimi_k3.nvidia.dsa_kernels.dcp_exchange import decode as dcpx
 
     if LAYER_CORES[core][2] == "prims_ts" and no_prims_ts():
         pytest.skip("FlashInfer prims_ts sparse MLA cannot run here")
     monkeypatch.setattr(sparse_attn_indexer, "DCP_DECODE_TOPK_HOOKS", {})
-    monkeypatch.setenv(dcpx.PARTS_ENV, "topk")
-    monkeypatch.delenv(dcpx.ENV + "_TIES", raising=False)  # (rank, position)
-    monkeypatch.delenv(dcpx.GRAPH_ONLY_ENV, raising=False)
-    monkeypatch.setenv(dcpx.SPIN_ENV, "120")
     step = run_wide_exchange_step(
         batch, q, dcp8_group, replays=200, core=core, partials="proj"
     )
@@ -3815,7 +3822,7 @@ def test_dcp_topk_merge_rows_deterministic(dcp8_group, saturate):
 @pytest.mark.parametrize("check", [False, True], ids=["rows", "rows+ids"])
 def test_merge_rows_kernels_compile_at_prepare(monkeypatch, check):
     """The #63 merge's select and rescue kernels as ``merge_rows`` launches them
-    (physical rows of the MLA blocks; global ids too under VLLM_DSA_BPRIME_CHECK)
+    (physical rows of the MLA blocks; global ids too where a test asks for them)
     compile when PreparedDsa prepares its cache (``IndexerStage.warm``), not at
     their first launch: the specialized decode runs only inside graph captures,
     where a first compile invalidates the capture (CUDA error 901), and the
@@ -5302,31 +5309,3 @@ def test_prepared_dsa_compiles_once_per_kernel(
         assert all(x is y for x, y in zip(kernels, b.kernels[shape])), shape
     for shape, kernels in a.overlap_kernels.items():
         assert all(x is y for x, y in zip(kernels, b.overlap_kernels[shape])), shape
-
-
-@pytest.mark.skipif(DCP_INIT is None, reason="needs an 8-rank launch (DCP8)")
-@pytest.mark.skip_global_cleanup  # the DCP8 group outlives each case
-@pytest.mark.parametrize("batch,q", [(8, 8), (64, 8)])
-def test_prepared_dsa_dcp_bprime_check(dcp8_group, batch, q):
-    """VLLM_DSA_BPRIME_CHECK on the specialized merge (IndexerStage.check): the
-    generic merge of the same logits agrees with the one-round merge on every row
-    (no miss), as for the stock op. Last in the file: the check stays on for the
-    process once initialized."""
-    from vllm.distributed import get_dcp_group
-    from vllm.v1.attention.ops.dcp_topk_merge.check import (
-        MISS_ROWS,
-        ROWS,
-        get_dcp_topk_merge_check,
-        init_dcp_topk_merge_check,
-    )
-
-    dev = torch.device("cuda", torch.accelerator.current_device_index())
-    init_dcp_topk_merge_check(dev, get_dcp_group().rank_in_group)
-    state = get_dcp_topk_merge_check()
-    before = state.snapshot()["totals"]
-    step = run_layer_step("fi-auto", batch, q, dcp8_group, None, "bf16")
-    check_layer_step(step, q, reference=False)
-    torch.accelerator.synchronize()
-    after = state.snapshot()["totals"]
-    assert after[ROWS] - before[ROWS] > 0, (before, after)
-    assert after[MISS_ROWS] == before[MISS_ROWS], (before, after)

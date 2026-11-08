@@ -29,7 +29,9 @@ call, reassociated at segment boundaries (fp32). M_p is a product of contraction
 The K1 / K2 split is FlashKDA itself with a `mode` argument
 (ops/flashkda_split, vllm-project/FlashKDA 17a037d, MIT), JIT-built once per
 source hash into VLLM_CACHE_ROOT and reused across restarts.
-VLLM_K3_KDA_SEGSCAN=0 disables the path.
+Policy (``wanted``): on wherever prefills run locally; a P/D decode-only instance
+(KV consumer, not producer) prefills only to recompute a failed KV load and keeps the
+plain FlashKDA prefill (no segment buffers or extension build there).
 """
 
 from __future__ import annotations
@@ -44,9 +46,8 @@ import torch
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import async_tensor_h2d
 
-_ENABLED = os.environ.get("VLLM_K3_KDA_SEGSCAN", "1") == "1"
 # Segment only steps whose longest sequence has at least this many tokens.
-_MIN_TOKENS = int(os.environ.get("VLLM_K3_KDA_SEGSCAN_MIN_TOKENS", "6144"))
+_MIN_TOKENS = 6144
 # Pseudo-sequences per launch: one wave of V-split CTA pairs (2 x 12 heads x 8
 # = 192 of 212 SMs on Rubin). Segmenting triples the K2 work (two phase-A
 # passes + the output pass), so it pays only when the longest chain shrinks by
@@ -59,8 +60,15 @@ _D = 128
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flashkda_split")
 
 
-def enabled() -> bool:
-    return _ENABLED
+def wanted(vllm_config) -> bool:
+    """Whether the instance builds the segment-parallel prefill (module docstring)."""
+    kv_transfer = getattr(vllm_config, "kv_transfer_config", None)
+    decode_only = (
+        kv_transfer is not None
+        and kv_transfer.is_kv_consumer
+        and not kv_transfer.is_kv_producer
+    )
+    return not decode_only
 
 
 # --- the K1 / K2-split FlashKDA build ----------------------------------------
@@ -251,8 +259,6 @@ def make_plan(
     A sequence's checkpoint offset becomes a segment boundary whenever the
     sequence is split, so its checkpoint state is the scan's X there (no
     in-kernel export); at the sequence end it is the final state."""
-    if not _ENABLED:
-        return None
     lens = tuple(int(x) for x in query_start_loc_cpu.diff().tolist())
     offs = (
         tuple(int(x) for x in checkpoint_offsets)

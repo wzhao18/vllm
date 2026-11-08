@@ -132,11 +132,7 @@ def rubin(monkeypatch):
     from vllm.v1.attention.backends.mla import flashinfer_mla_sparse
 
     monkeypatch.setattr(flashinfer_mla_sparse, "use_prims_ts", lambda c, d: False)
-    for name in (
-        "VLLM_ENABLE_GEMM_RS",
-        "VLLM_KIMI_K3_AUX_ATTN_RES_STREAM",
-        "VLLM_KIMI_K3_MOE_TOKEN_SHARD",
-    ):
+    for name in ("VLLM_ENABLE_GEMM_RS", "VLLM_KIMI_K3_AUX_ATTN_RES_STREAM"):
         monkeypatch.setattr(envs, name, False, raising=False)
 
 

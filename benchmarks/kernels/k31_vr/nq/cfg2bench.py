@@ -127,6 +127,30 @@ ENV_DROP = {
     "VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS": "removed: WideDsa rows are an automatic per-shape policy",
     "VLLM_K31_DSA_PARTIALS": "removed: the DSA partials format is an automatic per-shape policy",
 }
+# Env switches the Kimi K3 code no longer reads (on by default with an automatic
+# per-shape / per-role policy in code, constants, or a deleted selection): dropped
+# with this reason if an older config still carries them.
+REMOVED_ENV = (
+    [f"VLLM_K31_DCP_EXCHANGE{s}" for s in (
+        "", "_PARTS", "_ONE_ROUND_ROWS", "_SPIN_S", "_GRAPH_ONLY", "_SEGMAX", "_TIES",
+        "_SMALL_CTX", "_STATS", "_DUMP", "_VERIFY", "_VERIFY_OUT")]
+    + [f"K31_DCPX_{s}" for s in (
+        "PDL", "TL_FIRST", "NO_MULTICAST", "DEBUG_ERR", "DEBUG_PRINT", "PTXAS_V", "VERBOSE")]
+    + [f"VLLM_K31_DSA_CORE{s}" for s in (
+        "", "_ROWS", "_VARIANT", "_SKIP_LAYERS", "_SPREAD", "_SPIN_S", "_STATS")]
+    + ["K31_DSAC_FAULT", "K31_DSAC_PTXAS_V", "K31_DSAC_VERBOSE"]
+    + [f"VLLM_K3_{s}" for s in (
+        "KDA_SEGSCAN", "KDA_SEGSCAN_MIN_TOKENS", "KDA_CONV_TILE", "KDA_NORM_TILES",
+        "KDA_CONV_BN", "KDA_CONV_WARPS", "KDA_NORM_TILES_MAX", "KDA_NORM_STAGES",
+        "MXFP8_DISPATCH_TABLE", "MXFP8_FUSED_ACT", "MXFP8_PACK_MOE", "MEGAMOE_PATCH",
+        "MEGAMOE_LOCALIZE")]
+    + [f"VLLM_KIMI_K3_{s}" for s in (
+        "MOE_TOKEN_SHARD", "MOE_TOKEN_SHARD_GEMM_AR", "MOE_TOKEN_SHARD_GEMM_AR_MIN_TOKENS",
+        "VEC_SITU", "GEMM_AR", "GEMM_AR_ALIAS", "DS_T2P", "DS_LPC")]
+)  # fmt: skip
+ENV_DROP.update(
+    {k: "removed: an automatic policy or constant in the code under test" for k in REMOVED_ENV}
+)
 # reasons for the global `environment` keys outside ENV_PREFIXES (every dropped key is listed)
 ENV_DROP_PREFIX = {
     "UCX_": "UCX transport (P/D NIXL), not on the bench path",

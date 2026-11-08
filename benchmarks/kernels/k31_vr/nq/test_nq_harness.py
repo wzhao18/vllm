@@ -83,6 +83,8 @@ def test_cfg2bench():
     assert "VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS" not in env and "VLLM_K31_DSA_PARTIALS" not in env
     assert "removed" in ls["dropped_env"]["VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS"]
     assert "removed" in ls["dropped_env"]["VLLM_K31_DSA_PARTIALS"]
+    assert "VLLM_K31_DCP_EXCHANGE" not in env  # on by policy in the code
+    assert "removed" in ls["dropped_env"]["VLLM_K31_DCP_EXCHANGE"]
     # every dropped key is listed with a reason (nothing silently lost)
     assert "UCX_TLS" in ls["dropped_env"] and "CUTE_DSL_CACHE_DIR" in ls["dropped_env"]
     assert ls["production_limit"] == 512 and any("NOT PRODUCTION" in n for n in ls["notes"])

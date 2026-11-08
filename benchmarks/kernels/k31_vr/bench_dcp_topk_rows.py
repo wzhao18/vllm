@@ -5,8 +5,8 @@
 Times ``DcpExchange.topk_merge`` with the decode wiring's launch parameters
 (``DcpxDecode.launch_params``: the cluster-by-batch rule, with and without the
 one-wave fit) and a fixed-cluster sweep, at AgentX q8 batches (rows = 8 x requests),
-interleave 1, the model's local bound (1M / DCP), positions output, ``tie_order``
-"rank" and the centred one-round window, as the TP4/DCP4 decode runs them.
+interleave 1, the model's local bound (1M / DCP), positions output (ties by global id)
+and the centred one-round window, as the TP4/DCP4 decode runs them.
 
 usage: torchrun --nproc-per-node 4 bench_dcp_topk_rows.py <decode_ctx_vectors.json>
 env: K31_TR_BATCHES (requests, default 16,18,20,22,24,26,28,32), K31_TR_CLUSTERS
@@ -98,7 +98,7 @@ def main():
                                       smem=228 * 1024, segmax_override=-1), T, c, ml)))
         ref = None
         for name, cluster, segmax in arms:
-            kw = dict(max_local_len=ml, cluster=cluster, segmax=segmax, tie_order="rank",
+            kw = dict(max_local_len=ml, cluster=cluster, segmax=segmax,
                       one_round=True, window="center", small_ctx=1 << 30)
             try:
                 ex.topk_merge(logits, Lr, G32, out, cnt, **kw)

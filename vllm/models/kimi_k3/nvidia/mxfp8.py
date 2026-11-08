@@ -19,7 +19,6 @@ Kimi K3.1's fused DSA forward packs ``[q_a | kv_a | wk | weights_proj]`` and
 ``[q_b | wq_index]`` this way when they are online MXFP8.
 """
 
-import os
 
 import torch
 from torch import nn
@@ -46,8 +45,6 @@ CUTE_DSL_MAX_ROWS = 16
 # bench_proj_gemm.py). A call takes the winner of the first grid point >= its
 # rows; above 256 rows, or for shapes not listed, CUTE_DSL_MAX_ROWS applies.
 _ROW_GRID = (16, 32, 48, 64, 96, 128, 160, 224, 256)
-# VLLM_K3_MXFP8_DISPATCH_TABLE=0: the plain CUTE_DSL_MAX_ROWS threshold.
-_DISPATCH_TABLE = os.environ.get("VLLM_K3_MXFP8_DISPATCH_TABLE", "1") == "1"
 _TP1_WINNER = {
     (12288, 7168): "CCCCCCCCC",  # DSA g_proj, shared-expert gate_up
     (7168, 6144): "CCLCLLCCC",  # shared-expert down
@@ -64,7 +61,7 @@ _TP1_WINNER = {
 
 def use_cute_dsl(n: int, k: int, rows: int) -> bool:
     """CuTe DSL (True) or cuBLASLt (False) for an [N, K] MXFP8 GEMM."""
-    winners = _TP1_WINNER.get((n, k)) if _DISPATCH_TABLE else None
+    winners = _TP1_WINNER.get((n, k))
     if winners is None or rows > _ROW_GRID[-1]:
         return rows <= CUTE_DSL_MAX_ROWS
     for grid_rows, winner in zip(_ROW_GRID, winners):
@@ -275,9 +272,6 @@ class PackedMxfp8Linear:
         return self.kernel.apply_weights(self.holder, x)
 
 
-# VLLM_K3_MXFP8_FUSED_ACT=0: every online-MXFP8 linear quantizes its own BF16
-# input (one FlashInfer mxfp8_quantize launch per call), as before.
-_FUSED_ACT = os.environ.get("VLLM_K3_MXFP8_FUSED_ACT", "1") == "1"
 
 
 def takes_mxfp8_activation(*linears: nn.Module | None) -> bool:
@@ -285,7 +279,7 @@ def takes_mxfp8_activation(*linears: nn.Module | None) -> bool:
     pre-quantized MXFP8 activation (FlashInfer F8_128x4 scales), so the
     producer of their shared input may hand them a QuantizedActivation from
     ``ops/mxfp8_act.py`` instead of BF16."""
-    if not (_FUSED_ACT and current_platform.is_device_capability_family(100)):
+    if not current_platform.is_device_capability_family(100):
         return False
     from vllm.model_executor.layers.quantization.utils.quant_utils import (
         kMxfp8Dynamic,

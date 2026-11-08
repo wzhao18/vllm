@@ -117,8 +117,10 @@ limit is
 `min(max-num-seqs * q, capture cap)`. Rows above it run in their own process (`<tag>-hi`), which raises
 max-cudagraph-capture-size and max-num-seqs to the largest measured row (a `NOT PRODUCTION` note; the summary marks
 those rows XCAP). All of this is printed as comments in `<run>.cfg.sh` and at the top of the log; every dropped
-production arg and env key is listed with its reason. The removed env switches `VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS` and
-`VLLM_K31_DSA_PARTIALS` (now an automatic per-shape policy) are dropped if a config still carries them.
+production arg and env key is listed with its reason. The removed env switches (`VLLM_KIMI_K3_DSA_WIDE_MAX_ROWS`,
+`VLLM_K31_DSA_PARTIALS`, and `cfg2bench.REMOVED_ENV`: the DSA sparse core and DcpExchange switches and the Kimi K3
+`VLLM_K3_*` / `VLLM_KIMI_K3_*` switches the serving recipes set, now automatic policies or constants in the code) are
+dropped if a config still carries them.
 
 **Overlay** (`stage_overlay.sh <checkout> <tag>`): `$NB/ov/<tag>` is a whole vllm tree. It starts as
 `env/vllm-jh-242fb49cd4`, hard-linked, so the base is never written. Every file that differs from 242fb49cd4 under

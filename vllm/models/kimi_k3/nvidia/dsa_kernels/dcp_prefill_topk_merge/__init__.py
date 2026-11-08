@@ -4,6 +4,11 @@
 
 The kernels live in ``hist_merge.py`` (imports CuTe DSL); this module only
 holds the configuration helper so model construction stays import-light.
+
+Selection: the stock vLLM setting ``VLLM_DSA_DCP_PREFILL_HIST_MERGE`` (vllm/envs.py,
+default off), honoured with its stock meaning: the stock sparse_attn_indexer runs this
+merge when the indexer passes ``dcp_prefill_merge_tie_words > 0``. Not a Kimi K3
+feature switch; no serving recipe sets it.
 """
 
 from typing import Any

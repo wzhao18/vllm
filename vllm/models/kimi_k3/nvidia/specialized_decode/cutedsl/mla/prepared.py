@@ -15,13 +15,11 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import make_fake_stream
 
-import vllm.envs as envs
 
 from ...shapes import Choice, Path
 from ..common.host import fake, layout, prepare_shared_carveout, stream, to_cute
 from ..common.policy import batch_table
 from .core import RUBIN_CORE, compile_dcp_core, core_args, split_workspace
-from .core_p2 import compile_p2, ds_partials
 from .core_q import (
     POLLED_VERIFY,
     VALID_VERIFY,
@@ -46,9 +44,6 @@ from .dcp import (
     FORK_VALID,
     FORK_VALID_DELAY,
     GB300_SMS,
-    LPC_LONG,
-    LPC_ROWS,
-    LPC_SLOTS,
     LSE_FOLD,
     POLLED_TS,
     RUBIN_TS,
@@ -393,33 +388,7 @@ class PreparedMla:
         # ... whose persistent core runs the per-step work list (mla.wlist.WLIST),
         # shared by every layer; the first MLA layer (``wlist_build``) builds it.
         self.verify_wlist: dict = {}
-        # ... whose work list runs on DS-T2P (mla.core_p2, VLLM_KIMI_K3_DS_T2P) instead
-        # of core_q's polled core, or (VLLM_KIMI_K3_DS_LPC) DS-T2P on its LPC partition:
-        # (batch, q) -> (long split, packed rows, slots, LPC)
-        self.verify_p2: dict = {}
-        # ... LPC shapes: (batch, q) -> (groups, slots), DcpValue's ``lpc``
-        self.verify_lpc: dict = {}
-        self.lpc_dummy = None  # (ds_partials' unused work-list words under LPC)
         self.wlist_build = wlist_build
-
-    def lpc_on(self, batch, q, kv, sms):
-        """DS-T2P runs LPC (dcp.lpc_table) at this verify shape: VLLM_KIMI_K3_DS_T2P
-        and VLLM_KIMI_K3_DS_LPC, q 8, LPC_ROWS, 64-key pages, Rubin."""
-        on = envs.VLLM_KIMI_K3_DS_T2P and envs.VLLM_KIMI_K3_DS_LPC
-        on = on and q == 8 and sms > GB300_SMS and batch in LPC_ROWS
-        return bool(on and kv.shape[1] == 64)
-
-    def lpc_prepare(self, batch, q, packed, sms, kv):
-        """Record an LPC shape: DS-T2P's (long, packed, slots, lpc) and DcpValue's
-        (groups, slots); groups as the core's (CTA pairs // items per request)."""
-        tiles = packed // 128
-        items = 2 * (tiles // 2) + tiles % 2
-        groups = (sms // 2) // items
-        slots = tiles * (batch // q) * LPC_SLOTS  # (P2Core's compile key only)
-        self.verify_p2[batch, q] = LPC_LONG, packed, slots, True
-        self.verify_lpc[batch, q] = groups, LPC_SLOTS
-        if self.lpc_dummy is None:
-            self.lpc_dummy = torch.zeros(1, dtype=torch.int32, device=kv.device)
 
     def work_list(self, batch, q, heads, tiles, split, sms, kv):
         """The shared per-step work list (mla.wlist) of a WLIST verify shape launched
@@ -465,19 +434,14 @@ class PreparedMla:
                 split, packed = verify_fold_splits(
                     batch, q, heads, self.max_seq, self.device
                 )
-                lpc = self.lpc_on(batch, q, kv, sms)
-                if lpc:  # DS-T2P's LPC partition: LPC_SLOTS slots, no work list
-                    split = LPC_SLOTS
                 if split > 1:  # DcpValue folds the split partials
                     fold, lse_fold = split, self.stock_scales[1]
                     self.verify_fold[batch, q] = split
                 self.verify_split[batch, q] = split
                 persistent = wide_persistent(batch // q, packed // 128, split, sms)
                 tiles = packed // 128
-                work = None
-                if not lpc:
-                    work = self.work_list(batch, q, heads, tiles, split, sms, kv)
-                persistent = persistent or work is not None or lpc
+                work = self.work_list(batch, q, heads, tiles, split, sms, kv)
+                persistent = persistent or work is not None
                 self.verify_persistent[batch, q] = persistent
                 self.verify_valid[batch, q] = 2
                 qv = dcp_box.mailbox(True)[self.parity]
@@ -497,14 +461,6 @@ class PreparedMla:
                 if work is not None and push is None:
                     table = work.table(table)
                     self.verify_wlist[batch, q] = work
-                    # DS-T2P (axa): q 8 rows 128-256 on its 64-key pages; the same q
-                    # mailbox (validity TMA), work list, split workspace and partitions
-                    p2 = envs.VLLM_KIMI_K3_DS_T2P and q == 8 and 128 <= batch <= 256
-                    if p2 and kv.shape[1] == 64:
-                        long = long_split(batch, heads, split, sms, q)
-                        self.verify_p2[batch, q] = long, packed, work.slots, False
-                if lpc:
-                    self.lpc_prepare(batch, q, packed, sms, kv)
                 self.verify_poll[batch, q] = table
             verify = dcp and sms > GB300_SMS and q > 1 and not wide
             verify = verify and batch in VERIFY_FOLD
@@ -514,10 +470,6 @@ class PreparedMla:
                 split, packed = verify_fold_splits(
                     batch, q, heads, self.max_seq, self.device
                 )
-                lpc = self.lpc_on(batch, q, kv, sms) and batch in POLLED_VERIFY
-                lpc = lpc and VALID_VERIFY.get(batch) == 2
-                if lpc:  # DS-T2P's LPC partition (as the wide rows)
-                    split = LPC_SLOTS
                 gathered = split > 1 and batch not in POLLED_VERIFY
                 if gathered and long_split(batch, heads, split, sms, q):
                     # (as draft.attention: the gathered core has no long partition, so
@@ -537,18 +489,11 @@ class PreparedMla:
                         box = self.dcp.mailbox(self.valid_box(batch, q))[self.parity]
                         table = verify_table(box, batch // q, kv.device)
                         tiles = packed // 128
-                        work = None
-                        if not lpc:
-                            work = self.work_list(
-                                batch, q, heads, tiles, split, sms, kv
-                            )
+                        work = self.work_list(batch, q, heads, tiles, split, sms, kv)
                         if work is not None and VALID_VERIFY.get(batch) == 2:
                             table = work.table(table)
                             self.verify_wlist[batch, q] = work
                             self.verify_persistent[batch, q] = True
-                        if lpc:
-                            self.verify_persistent[batch, q] = True
-                            self.lpc_prepare(batch, q, packed, sms, kv)
                         self.verify_poll[batch, q] = table
             poll = bool(umma) and batch in POLLED_X.get(dcp, {})
             if q_polled:  # the fork polls q and re-arms x: MlaQuery polls x
@@ -587,8 +532,7 @@ class PreparedMla:
             query = to_cute(self.query_scratch[:batch])
             latent = to_cute(self.latent[:batch])
             pushed = self.verify_push.get((batch, q)) is not None
-            lpc_value = self.verify_lpc.get((batch, q))
-            kernels = compile_core(*args, cap=cap, pushed=pushed, lpc=lpc_value)
+            kernels = compile_core(*args, cap=cap, pushed=pushed)
             self.kernels[batch, q] = (*kernels, query, latent)
             if policy:
                 compile_rubin = compile_dcp_core_umma if umma else compile_dcp_core
@@ -626,21 +570,10 @@ class PreparedMla:
                 valid = self.verify_valid.get((batch, q), 0)
                 split = self.verify_split.get((batch, q), fold)
                 persistent = self.verify_persistent.get((batch, q), False)
-                if (batch, q) in self.verify_p2:  # DS-T2P: its own core (no JIT later)
-                    long, _, slots, lpc = self.verify_p2[batch, q]
-                    raw = kv.view(torch.uint8)
-                    spec = tuple(raw.shape), tuple(raw.stride())
-                    pairs = torch.cuda.get_device_properties(kv.device)
-                    pairs = pairs.multi_processor_count // 2
-                    compile_p2(
-                        heads, q, kv.shape[1], split, where, device, True, q,
-                        tuple(long), spec, reqs, slots, pairs, lpc,
-                    )  # fmt: skip
-                else:
-                    compile_polled_q(
-                        heads, kv.shape[1], split, reqs, q, where, device, valid=valid,
-                        persistent=persistent, push=self.verify_push.get((batch, q)),
-                    )  # fmt: skip
+                compile_polled_q(
+                    heads, kv.shape[1], split, reqs, q, where, device, valid=valid,
+                    persistent=persistent, push=self.verify_push.get((batch, q)),
+                )  # fmt: skip
                 rows = verify_fold_splits(batch, q, heads, self.max_seq, self.device)[1]
                 reserve_split_workspace(self.device, rows, reqs, fold)
             elif kv.is_cuda and not policy:
@@ -791,16 +724,6 @@ class PreparedMla:
             work = self.verify_wlist.get((batch, q))
             if work is not None and self.wlist_build:  # this step's list, all layers
                 work.build(lengths[:reqs])
-            if (batch, q) in self.verify_p2:  # DS-T2P on the same workspace
-                long, packed, slots, lpc = self.verify_p2[batch, q]
-                workspace = split_workspace_ts(self.device, packed, reqs, split)[0]
-                words = self.lpc_dummy if lpc else work.buffer
-                ds_partials(
-                    query, cache, *tables, scales, out, lse, workspace, split, where,
-                    table, x_rows=q, causal=True, long=long, wlist=(words, slots),
-                    lpc=lpc,
-                )  # fmt: skip
-                return
             polled_partials_q(
                 *call, valid=valid, persistent=persistent, push=push, wlist=bool(work)
             )

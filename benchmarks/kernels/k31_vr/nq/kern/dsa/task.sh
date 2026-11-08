@@ -2,7 +2,7 @@
 # queue task for holds/runner_once.sbatch (POOL nqk-dsa, 1 node, 4 GPUs): the nq DSA kernel microbenchmarks of the code
 # under test (overlay nq-786ce08 = wzhao/k31-nq-sdec 786ce08), Kimi K3.1 specialized decode DSA layers at DCP16 rank
 # shapes, fp8 MLA KV (trtllm-gen), verify q4 / q8, rows up to 2048:
-#   core   1 GPU x 4 processes: DSA sparse core (VLLM_K31_DSA_CORE path, every variant) vs the trtllm-gen chain, plus
+#   core   1 GPU x 4 processes: DSA sparse core (on by policy at q8 rows <= 16, every variant) vs the trtllm-gen chain, plus
 #          prims_ts fp8 and the previous nvfp4_ds_mla (prims_ts) reference, rows <= 64 (5 count patterns) and 96..2048
 #   value  torchrun 4 GPUs (4 real ranks + 12 emulated): DcpValue bf16 (PreparedDsa / WideDsa), forced row-tile
 #          strides, "proj" (bmm + DcpValue), DcpValue(pushed[/spread]) vs the stock A2A LSE reduce + W_UV + gate

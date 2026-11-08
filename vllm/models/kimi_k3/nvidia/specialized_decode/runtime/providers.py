@@ -888,7 +888,7 @@ class Attention:
         if b in self.oproj_wide:
             return self.output.run(local, prefix, blocks, out)[0]
         # The stock o-projection, reduced over the TP ranks: GEMM-AR where the stock
-        # layer runs it (VLLM_KIMI_K3_GEMM_AR, from 128 rows; DSA layers have none),
+        # layer runs it (from 128 rows; DSA layers have none),
         # else GEMM + all-reduce.
         fused = getattr(attention, "gemm_rs_ar", None)
         if fused is not None and fused.should_run(local):
