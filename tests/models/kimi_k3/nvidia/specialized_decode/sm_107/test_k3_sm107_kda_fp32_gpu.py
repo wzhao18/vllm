@@ -14,9 +14,11 @@
   state must match bit for bit. The BF16 state (the measured serving dtype) runs the
   same comparison as a control: a mismatch in both dtypes points at the reference
   pair, one in FP32 only at the FP32 head.
-* the wide verify kernel an FP32 state runs at q4 / q8 (``KdaVerifyWide``:
-  ``kda.prepared.FP32_VERIFY_WIDE``; ``KdaVerifyHalves`` only at other q) vs KdaSplit
-  at the same shape.
+An FP32 state's pair runs the stock-math ``KdaSplitStock`` (q = 1 and verify; checked
+against the stock layer in ``test_k3_sm107_kda_loop_gpu.py`` /
+``test_k3_sm107_kda_stock_gpu.py``) and the FP32 heads compute its math
+(``KdaHead.stock``), so they match it bit for bit too; the BF16 heads and pair keep
+KdaSplit's math.
 
 One GPU; a few minutes of CuTe compiles on a cold cache."""
 
@@ -214,61 +216,3 @@ def test_kda_head_matches_the_pair(rows, q, polled, state_dtype):
     assert_bitwise("conv state", got_caches[0], want_caches[0])
     if polled:
         assert (bits(rearm[:rows]) == -1).all(), "previous output re-armed"
-
-
-WIDE_SHAPES = [
-    pytest.param(35, 4, "wide", id="q4-B35"),
-    pytest.param(41, 4, "wide", id="q4-B41"),
-    pytest.param(12, 8, "wide", id="q8-B12"),
-    pytest.param(64, 4, "wide", id="q4-B64"),
-    pytest.param(128, 4, "wide", id="q4-B128"),
-    pytest.param(512, 4, "wide", id="q4-B512"),
-    pytest.param(65, 8, "wide", id="q8-B65"),
-    pytest.param(128, 8, "wide", id="q8-B128"),
-]
-
-
-@pytest.mark.parametrize("requests,q,kind", WIDE_SHAPES)
-def test_kda_fp32_wide_verify_matches_kdasplit(monkeypatch, requests, q, kind):
-    """With an FP32 state the plain verify above the tuned rows runs KdaVerifyWide /
-    KdaVerifyHalves (never the BF16-only chunked verify), bitwise KdaSplit's verify
-    at the same shape: outputs, every token's checkpoint and the conv window."""
-    state_dtype = torch.float32
-    assert prepared.verify_kernel(requests, q, RUBIN, bf16_state=False) == kind
-    attention = kda_attention()
-    rows, slots = requests * q, requests * q + 1
-    base = caches(state_dtype, slots, q)
-    key = (requests, q)
-    core = prepared.PreparedKda(attention, {key: (PITCH, 0)}, True)
-    core.prepare_caches(base)  # the production kernel at this shape
-    names = {prepared.KdaVerifyWide: "wide", prepared.KdaVerifyHalves: "halves"}
-    schedule = prepared.schedule_of(HEADS, requests, 0, q, RUBIN, False)
-    kernel = prepared.make_kernel(
-        (HEADS, requests, 0, False, schedule, q, False), RUBIN
-    )
-    assert names[type(kernel)] == kind
-
-    # KdaSplit at the same shape and schedule table: the same executable, with the
-    # wide kinds switched off (its compile cache cleared on both sides)
-    prepared.executable.cache_clear()
-    monkeypatch.setattr(prepared, "wide_kind", lambda *args, **kwargs: 0)
-    reference = prepared.PreparedKda(attention, {key: (PITCH, 0)}, True)
-    reference.prepare_caches(base)
-    monkeypatch.undo()
-    prepared.executable.cache_clear()
-
-    g = torch.Generator(device=DEVICE).manual_seed(4)
-    projected = torch.randn(rows, PITCH, generator=g, device=DEVICE)
-    projected = projected.to(torch.bfloat16)
-    slot_index, accepted = spec_inputs(requests, q, slots)
-    outputs = []
-    for runner in (core, reference):
-        state = clone(base)
-        out = torch.empty(rows, DIM, dtype=torch.bfloat16, device=DEVICE)
-        runner.run(projected, out, caches=state, slots=slot_index, accepted=accepted)
-        outputs.append((out, state))
-    torch.cuda.synchronize()
-    (got, got_caches), (want, want_caches) = outputs
-    assert_bitwise("output", got, want)
-    assert_bitwise("recurrent state", got_caches[1], want_caches[1])
-    assert_bitwise("conv state", got_caches[0], want_caches[0])

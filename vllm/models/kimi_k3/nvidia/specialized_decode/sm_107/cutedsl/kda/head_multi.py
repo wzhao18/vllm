@@ -19,7 +19,8 @@ gate.
 Recurrence: CTA c is KDA CTA c % 8 of request c // 8 (state rows [16 (c % 8), + 16)) and
 runs ``KdaHeadVerify``'s recurrence (``KdaSplit``'s B1 verify schedule) for its request,
 so given the same projected inputs the outputs, checkpoints and conv windows are bit for
-bit ``KdaSplit``'s. KDA CTA j < tokens of a request normalizes token j's q / k. Owner c
+bit ``KdaSplit``'s (an FP32 state: ``KdaSplitStock``'s, see ``KdaHeadVerify``). KDA
+CTA j < tokens of a request normalizes token j's q / k. Owner c
 then applies the gated RMS norm of token row c.
 
 At q = 4 every cluster CTA still runs one KDA role (two requests x eight 16-row
@@ -48,7 +49,6 @@ from ..common.primitives import (
     mma_into,
     named_barrier,
     push_float,
-    sigmoid,
     wait,
     warp_sum,
     zeros,
@@ -563,9 +563,8 @@ class KdaHeadMulti(KdaHeadVerify):
             for i in cutlass.range_constexpr(2):
                 for column in cutlass.range_constexpr(2):
                     raw_g = Float32(BFloat16(acc[2 * i + column]))
-                    gate = cute.math.exp(a, fastmath=True) * (raw_g + dt[i])
-                    gate = sigmoid(gate, False)
-                    decay = float_bits(cute.math.exp(lower_bound * gate, fastmath=True))
+                    decay = self.head_decay(a, raw_g, dt[i], lower_bound)
+                    decay = float_bits(decay)
                     t = 2 * quarter + column
                     pointer = shared_decay.iterator + t * 128 + value_base + features[i]
                     if t < T:
@@ -573,7 +572,7 @@ class KdaHeadMulti(KdaHeadVerify):
                             first = KDA_CTAS * request
                             store_async_dsmem(pointer, decay, barrier, first + dest)
             if (quarter == 0) & (group < T):  # this CTA's betas (bytes on its barrier)
-                beta_gate = sigmoid(Float32(beta), False)
+                beta_gate = self.activate(Float32(beta))
                 push_float(shared_beta.iterator + group, beta_gate, barrier, rank)
         self.rearm(counter, target, lane, fa_beta)
 
@@ -632,12 +631,17 @@ class KdaHeadMulti(KdaHeadVerify):
             if kt < ROWS:
                 for t in cutlass.range_constexpr(T):
                     shared_v[t * ROWS + kt] = accum[3 * t + 2]
-            if cutlass.const_expr(T == KDA_CTAS):
-                act = sigmoids([pre_q, pre_k, Float32(gate_owned)])
-                q, k, out_gate = pre_q * act[0], pre_k * act[1], act[2]
-            else:  # (owners gate their rows in ``owned_norm``)
-                act = sigmoids([pre_q, pre_k])
-                q, k = pre_q * act[0], pre_k * act[1]
+            if cutlass.const_expr(self.stock):
+                q, k = self.silu(pre_q), self.silu(pre_k)
+                if cutlass.const_expr(T == KDA_CTAS):
+                    out_gate = self.activate(Float32(gate_owned))
+            else:
+                if cutlass.const_expr(T == KDA_CTAS):
+                    act = sigmoids([pre_q, pre_k, Float32(gate_owned)])
+                    q, k, out_gate = pre_q * act[0], pre_k * act[1], act[2]
+                else:  # (owners gate their rows in ``owned_norm``)
+                    act = sigmoids([pre_q, pre_k])
+                    q, k = pre_q * act[0], pre_k * act[1]
             square_q, square_k = warp_sum(q * q), warp_sum(k * k)
             if lane == 0:
                 reductions[warp] = square_q
@@ -645,24 +649,25 @@ class KdaHeadMulti(KdaHeadVerify):
             named_barrier(1, 128)
             if cutlass.const_expr(T * ROWS == 128):  # noqa: SIM114
                 pre_v = shared_v[kt]
-                shared_v[kt] = pre_v * sigmoids([pre_v])[0]
+                shared_v[kt] = self.silu_v(pre_v)
             elif kt < T * ROWS:  # (row kt % 16, token kt // 16)
                 pre_v = shared_v[kt]
-                shared_v[kt] = pre_v * sigmoids([pre_v])[0]
+                shared_v[kt] = self.silu_v(pre_v)
             qn = (reductions[0] + reductions[2]) + (reductions[1] + reductions[3])
             kn = (reductions[4] + reductions[6]) + (reductions[5] + reductions[7])
-            fq = cute.math.rsqrt(qn + 1.0e-6, fastmath=True) * scale
-            fk = cute.math.rsqrt(kn + 1.0e-6, fastmath=True)
+            fq = self.norm_factor(qn + 1.0e-6, scale)
+            fk = self.norm_factor(kn + 1.0e-6)
+            q_n, k_n = self.normalized(q, fq, scale), self.normalized(k, fk)
             q_ptr = shared_q.iterator + block * 128 + kt
             k_ptr = shared_k.iterator + block * 128 + kt
             if cutlass.const_expr(T == KDA_CTAS):  # noqa: SIM114
                 for dest in cutlass.range_constexpr(KDA_CTAS):
-                    push_float(q_ptr, q * fq, bar_qk, first + dest)
-                    push_float(k_ptr, k * fk, bar_qk, first + dest)
+                    push_float(q_ptr, q_n, bar_qk, first + dest)
+                    push_float(k_ptr, k_n, bar_qk, first + dest)
             elif block < T:  # KDA CTAs past the request's tokens normalize none
                 for dest in cutlass.range_constexpr(KDA_CTAS):
-                    push_float(q_ptr, q * fq, bar_qk, first + dest)
-                    push_float(k_ptr, k * fk, bar_qk, first + dest)
+                    push_float(q_ptr, q_n, bar_qk, first + dest)
+                    push_float(k_ptr, k_n, bar_qk, first + dest)
             if kt < T:
                 slot_rows[kt] = slots[request, kt]
             named_barrier(1, 128)  # shared_v, slot_rows
@@ -689,14 +694,14 @@ class KdaHeadMulti(KdaHeadVerify):
                         history, cur, other, sources, t, group_lane, v_row, beta
                     )
                     if (group_lane == 0) & (t > 0):
-                        local_o[(t - 1) * ROWS + group] = out_prev
+                        local_o[(t - 1) * ROWS + group] = self.round_output(out_prev)
                     slot_t = slot_rows[t]
                     self.store_checkpoint(
                         history, state, slot_t, head, value_base, lanes
                     )
             out_last = self.query_dot(history, buffers[1][0, None, None])
             if group_lane == 0:
-                local_o[(T - 1) * ROWS + group] = out_last
+                local_o[(T - 1) * ROWS + group] = self.round_output(out_last)
             # thread kt pushes row kt % 16 of token kt // 16 to that token row's owner
             named_barrier(1, 128)
             position = self.vkda.output_position(value_base + kt % ROWS)
@@ -744,7 +749,7 @@ class KdaHeadMulti(KdaHeadVerify):
             s0, s1, s2, s3 = (o * o for o in o4)
             sums[g] = warp_sum((s0 + s2) + (s1 + s3), 8)
         sumsq = (sums[0] + sums[2]) + (sums[1] + sums[3])
-        rstd = cute.math.rsqrt(sumsq * (1.0 / 128) + eps, fastmath=True)
+        rstd = self.inverse_sqrt(sumsq * (1.0 / 128) + eps)
         result = raw_o * rstd * nw * out_gate
         if cutlass.const_expr(self.polled_out):
             store_bf16_canonical(at(output, row, qk_channel), result)
@@ -763,7 +768,11 @@ class KdaHeadMulti(KdaHeadVerify):
         if slots[request, accepted[request] - 1] <= 0:
             output[rank, qk_channel] = BFloat16(0)
         else:
-            out_gate = sigmoids([Float32(mine[384 + kt])])[0]
+            out_gate = Float32(0)
+            if cutlass.const_expr(self.stock):
+                out_gate = self.activate(Float32(mine[384 + kt]))
+            else:
+                out_gate = sigmoids([Float32(mine[384 + kt])])[0]
             nw = norm_w[kt]
             wait(bar_out)
             self.norm_row(kt, shared_o, output, rank, qk_channel, nw, out_gate, eps)
