@@ -232,35 +232,217 @@ class OpenRules(dict):
 LONG_OPEN = {96: (768, 4, (1, 2, 64, 128)), 64: (576, 3, (1, 4, 64, 128))}
 LONG_SPLIT = OpenRules(LONG_SPLIT)
 
+# Packed twins: (gathered heads, q) -> the verify q whose packed core has the same
+# query tiles per request (ceil(heads x q / 128)): 96 x 3 = 288 and 96 x 4 = 384 rows
+# are 3 M128 tiles, 96 x 7 = 672 and 96 x 8 = 768 are 6. A packed core of R = B x q
+# rows at such a q (the 96-head causal drafter, kimi-k3.1-pro-dspark-preview: DL3 q3,
+# DL7 q7) is the twin verify core of the same B requests (B x twin rows) tile for tile,
+# KV tile for KV tile (only the causal mask's last rows differ), so it takes that
+# verify shape's measured split decision (``verify_fold_splits``) and LONG_SPLIT rule:
+# the length-keyed partition (``long_per``) decided on the GPU from each request's own
+# length (graph-safe), in place of tokenspeed's shape-only split, which ran the 96-head
+# drafter's wide rows (and B18-B21) unsplit: the longest AgentX context held the launch
+# (draft eff sweep, 4 x VR200: spec / uniform-length bound 2.6-3.5 at 54-112 rows).
+# Every reader of a rule (the cores' compiles, DcpValue's fold, the work list, the
+# callers' split choice) passes its q, so a shape reads one rule everywhere; the
+# target's verify q (4, 8) has no twin and reads LONG_SPLIT at its own rows as before.
+PACKED_TWIN = {(96, 3): 4, (96, 7): 8}
+# Twin rows the twin verify has no rule for (q4 at odd B below B17: 12-60 rows), as
+# TWIN_FOLD_SPLITS short split, LONG_SPLIT rule: the next request count's (B + 1, its
+# VERIFY_FOLD_SPLITS / LONG_SPLIT entry), read only through a twin (the target's own
+# q4 rows are unchanged). Drafter DL3 B3-B15 (9-45 rows).
+TWIN_LONG_SPLIT = {
+    (12, 96): (4, 8, 64),  # B3 <- B4 (16)
+    (20, 96): (5, 8, 64),  # B5 <- B6 (24)
+    (28, 96): (4, 8, 64),  # B7 <- B8 (32)
+    (36, 96): (3, 8, 64),  # B9 <- B10 (40)
+    (44, 96): (2, 8, 64),  # B11 <- B12 (48)
+    (52, 96): (2, 8, 64),  # B13 <- B14 (56)
+    (60, 96): (2, 8, 64),  # B15 <- B16 (64)
+}
+TWIN_FOLD_SPLITS = {key: rule[0] for key, rule in TWIN_LONG_SPLIT.items()}
+# The drafter's own rules, by its DCP size: (rows, gathered heads, q, DCP size) ->
+# (short split, launched split, 0, quantum floor, a wave's fixed cost), read before
+# the twin's (``split_rule``, ``verify_fold_splits``, ``draft``). A cake balance
+# decided on the GPU from the step's actual local lengths (cf. GB300
+# ZJY0516/vllm#25 cake_balance), in place of a static length rule: each step, the
+# first drafter layer writes the rank's quantum Q (mla.wlist.StepQuant; host twin
+# ``cake_quant``), and a request of T tiles runs min(launched, ceil(T / Q)) equal
+# splits (``long_per``); the cores (core_ts ``get_k_tile_count``: the address
+# table's QUANT_WORD), DcpValue's fold (``quant_at``) and the work list read that one
+# word. Q is the candidate max(floor, ceil(T_max / s)), s = 1 .. launched (the
+# longest request at s splits), of the least modelled time on the core's P CTA
+# pairs: max(largest item, waves x mean item) + waves x the fixed cost, waves =
+# ceil(items / P), items = q tiles x the batch's splits; ties to the fewer splits.
+# Graph-safe (a device word per captured shape), exact (a partition of each
+# request's keys, folded in split order with the same FP32 LSE weights).
+# The fixed cost per wave (20 tiles at the fold rows, 6 at the wide rows: dreff5 r3,
+# 4 x VR200; fitted from DL3 B6 uniform, 361 local tiles each: 5 splits, one wave of
+# 73 tiles, 67 us vs 11 splits, two waves of 33, 80 us) makes a uniform batch take
+# the most splits that fit whole waves; one long request among short ones takes the
+# launched splits, the short ones one or two. The static rules this replaces
+# (e6e13cb30a's (16, 64) at DCP4, tuned on the AgentX vectors the gate measures) cut
+# the uniform-length bound by 20-43% at 12-96 rows (dreff3, pw4 r21 68.0 -> 97.6 us);
+# a quantum of max(floor, total / slots) without the wave model did too (dreff5 r1).
+DRAFT_LONG_SPLIT: dict = {}
+# (DCP size) -> ((fold rows' launched split, quantum floor in tiles, a wave's fixed
+# cost in quarter tiles), (wide rows' floor, fixed cost)); the wide rows (above the
+# 64-row box) keep their twin rule's launched split (its workspace). The fold rows'
+# launched split where DRAFT_CAKE_LAUNCHED has none. Fold floor 1: short contexts
+# split as finely as one wave allows, as tokenspeed's shape split does. A coarser
+# floor (8, 16) left a DL3 B3 batch of <= 12-tile contexts in 1-2 splits, whose FP8 P
+# (each split's keys against its own running max) lost twice stock's accuracy vs
+# exact FP32 (query96: 0.050 vs 0.025 of the row max; floor 1 and the static rules:
+# 0.025, dreff6 probe); at AgentX lengths the floor never binds (dreff5 r2).
+# The DCP16 constants are flat: fold costs 80 / 40 / 20 and wide (floor, cost) (32,
+# 24) / (32, 8) / (32, 0) / (16, 8) are within 4% of each other at every DL3 9-480 /
+# DL7 14-448 row on agentic and held-out pw16 lengths and within 6% on uniform ones
+# but DL3 72 (90-100 us; dreff7 tune16, 4 x VR200): no candidate wins.
+DRAFT_CAKE = {4: ((8, 1, 80), (32, 24)), 16: ((8, 1, 80), (32, 24))}
+# Fold rows' launched split by (DCP size) -> (q, rows). Launched splits a step leaves
+# empty are not free (their CTAs, or the persistent loop's items, still run their
+# setup): 24 / 32 launched at DCP4 cost 1.3-2x at 9-63 rows on every length mix, and
+# at DCP16's short local contexts 16 cost 1.1-1.4x vs 4-8 (dreff5 r4). Per row the
+# launch of the least worst ratio to the best measured over agentic / uniform /
+# held-out lengths (candidates 4, 6, 8, 12, 16 at DCP16; 8, 16, 24, 32 at DCP4;
+# rows the sweep did not run take a neighbour's).
+DRAFT_CAKE_LAUNCHED = {
+    4: {(3, 9): 16, (3, 12): 16, (3, 42): 16, (7, 14): 16},
+    16: {
+        **{(3, r): 6 for r in (30, 33, 36, 39, 42, 45, 63)},
+        **{(3, r): 4 for r in (48, 51, 54, 57, 60)},
+        (7, 14): 12,
+        **{(7, r): 6 for r in (35, 42, 49)},
+        (7, 63): 4,
+    },
+}
+# Drafter rows the cake rule covers per q (DL3: the fold rows 9-63 and the wide rows
+# 66-480; DL7: 14-63 and 70-448), where a launched split above 1 exists.
+DRAFT_CAKE_ROWS = {3: range(9, 481, 3), 7: range(14, 449, 7)}
 
-def long_split(rows, heads, split, sms):
+
+def _cake_rules(cake=None, launch=None):
+    """DRAFT_LONG_SPLIT's cake entries (``DRAFT_CAKE`` / ``DRAFT_CAKE_LAUNCHED`` or
+    ``cake`` / ``launch``) from the twin rules."""
+    cake = DRAFT_CAKE if cake is None else cake
+    launch = DRAFT_CAKE_LAUNCHED if launch is None else launch
+    rules = {}
+    for q, rows in DRAFT_CAKE_ROWS.items():
+        for size, (fold, wide) in cake.items():
+            for r in rows:
+                key = (r // q * PACKED_TWIN[96, q], 96)
+                twin = TWIN_LONG_SPLIT.get(key) or LONG_SPLIT.get(key)
+                if twin is None:
+                    continue
+                launched, floor, over = (twin[1], *wide) if r > 64 else fold
+                if r <= 64:
+                    launched = launch.get(size, {}).get((q, r), launched)
+                if launched > 1:
+                    rules[r, 96, q, size] = (twin[0], launched, 0, floor, over)
+    return rules
+
+
+DRAFT_LONG_SPLIT.update(_cake_rules())
+
+
+def split_key(rows, heads, q=None, draft=0):
+    """(the (rows, heads) key of the split tables, twin): the drafter's (``draft``: its
+    DCP size, 0 for the target) ``rows`` of a packed core at ``q`` read their
+    PACKED_TWIN verify's rows (B x twin q); any other shape (no q, q = 1 rows, every
+    target verify, whatever its q) its own rows."""
+    twin = PACKED_TWIN.get((heads, q)) if q and draft else None
+    if twin is None or rows % q:
+        return (rows, heads), False
+    return (rows // q * twin, heads), True
+
+
+def split_rule(rows, heads, q=None, draft=0):
+    """The LONG_SPLIT rule ``rows`` of ``heads`` gathered heads at ``q`` read: the
+    drafter's (``draft``: its DCP size) own measured rule (DRAFT_LONG_SPLIT), else
+    through its packed twin (``split_key``), or None."""
+    if draft and (rows, heads, q, draft) in DRAFT_LONG_SPLIT:
+        return DRAFT_LONG_SPLIT[rows, heads, q, draft]
+    key, twin = split_key(rows, heads, q, draft)
+    if twin and key in TWIN_LONG_SPLIT:
+        return TWIN_LONG_SPLIT[key]
+    return LONG_SPLIT.get(key)
+
+
+def long_split(rows, heads, split, sms, q=None, draft=0):
     """(short split, long tiles, quantum) of LONG_SPLIT's length-keyed partition when
-    ``rows`` of ``heads`` gathered heads launch its long split on a Rubin-class device
-    (``sms``), else None. An optional 4th LONG_SPLIT field, the quantum q (tiles): a
-    long request of T tiles runs min(launched, ceil(T / q)) equal splits instead of
-    all launched ones (``long_per``); 0: every launched split."""
-    rule = LONG_SPLIT.get((rows, heads))
+    ``rows`` of ``heads`` gathered heads (``q`` rows per request: ``split_key``'s
+    packed twin; ``draft``: the drafter's DCP size, ``split_rule``) launch its long
+    split on a Rubin-class device (``sms``), else None.
+    An optional 4th LONG_SPLIT field, the quantum q (tiles): a long request of T tiles
+    runs min(launched, ceil(T / q)) equal splits instead of all launched ones
+    (``long_per``); 0: every launched split. A drafter cake rule (5 fields,
+    DRAFT_LONG_SPLIT) returns 6: (short split, long tiles, quantum floor, CTA pairs,
+    q tiles per request, a wave's fixed cost in quarter tiles), its quantum decided
+    per step on the GPU (``cake_quant``, mla.wlist.StepQuant)."""
+    rule = split_rule(rows, heads, q, draft)
     if sms <= GB300_SMS or rule is None or split != rule[1]:
         return None
+    if len(rule) > 4:  # the cake rule: (short, long tiles, floor, pairs, q tiles, over)
+        tiles = -(-(q or 1) * heads // 128)
+        return rule[0], rule[2], rule[3], sms // 2, tiles, rule[4]
     return rule[0], rule[2], rule[3] if len(rule) > 3 else 0
 
 
 @cute.jit
-def long_per(tiles, split, long):
+def long_per(tiles, split, long, quant=None):
     """Tiles per split of a request of ``tiles`` K tiles under ``long``
     (``long_split``) launched at ``split``: the short split's partition up to the long
     tiles, past them ``split`` (quantum 0) or min(split, ceil(tiles / quantum)) equal
-    splits. The core's partition and DcpValue's fold both read this."""
+    splits. A cake rule (4 fields): the quantum is this step's ``quant`` (the device
+    word ``cake_quant`` wrote). The core's partition and DcpValue's fold both read
+    this."""
     short = max((tiles + long[0] - 1) // long[0], 1)
     splits = split
-    if cutlass.const_expr(long[2] > 0):
+    if cutlass.const_expr(len(long) > 3):
+        splits = min(split, max((tiles + quant - 1) // quant, 1))
+    elif cutlass.const_expr(long[2] > 0):
         splits = min(split, (tiles + long[2] - 1) // long[2])
     per = max((tiles + splits - 1) // splits, 1)
     return Int32(cutlass.select_(tiles > long[1], per, short))
 
 
+def cake_quant(lengths, launched, long):
+    """Host twin of the cake rule's per-step quantum (mla.wlist ``_quant_kernel``)
+    for ``launched`` splits under ``long`` (``long_split``'s cake rule: (short, long
+    tiles, floor, pairs, q tiles, over)): of the candidates max(floor, ceil(T_max /
+    s)), s = 1 .. launched, the one of the least modelled time in quarter tiles,
+    max(4 x largest item, waves x 4 x tiles // splits) + waves x over, waves =
+    ceil(q tiles x splits / pairs); ties to the smaller s."""
+    floor, pairs, qtiles, over = long[2], long[3], long[4], long[5]
+    tiles = [-(-int(n) // 128) if int(n) > 0 else 0 for n in lengths]
+    top, total = max(tiles, default=0), sum(tiles)
+    best = None
+    for s in range(1, launched + 1):
+        quant = max(-(-top // s), floor)
+        splits = [min(launched, max(-(-t // quant), 1)) if t else 0 for t in tiles]
+        largest = max([-(-t // n) for t, n in zip(tiles, splits) if n], default=0)
+        count = max(sum(splits), 1)
+        waves = -(-count * qtiles // pairs)
+        cost = max(4 * largest, waves * (4 * total // count)) + waves * over
+        if best is None or cost < best[0]:
+            best = cost, quant
+    return best[1]
+
+
+def long_per_host(tiles, split, long, quant=None):
+    """Host twin of ``long_per`` (the tests' reference partition)."""
+    short = max(-(-tiles // long[0]), 1)
+    splits = split
+    if len(long) > 3:
+        splits = min(split, max(-(-tiles // quant), 1))
+    elif long[2] > 0:
+        splits = min(split, -(-tiles // long[2]))
+    per = max(-(-tiles // splits), 1)
+    return per if tiles > long[1] else short
+
+
 @cute.jit
-def filled_splits(n, split, long):
+def filled_splits(n, split, long, quant=None):
     """KV splits a core fills for a request of ``n`` local tokens (128-token tiles)
     launched at ``split`` (``long``: ``long_split``'s rule, else tokenspeed's equal
     partition): contiguous from split 0, every one full but the last. The cores that
@@ -269,7 +451,7 @@ def filled_splits(n, split, long):
     tiles = (n + 127) // 128
     per = max((tiles + split - 1) // split, 1)
     if cutlass.const_expr(long is not None):
-        per = long_per(tiles, split, long)
+        per = long_per(tiles, split, long, quant)
     return (tiles + per - 1) // per
 
 
@@ -750,13 +932,19 @@ class DcpValue:
         spread=False,
         prefetch_uv=True,
         resident_sms=0,
+        draft=0,
+        quant_at=0,
     ):
         """``q_chunks``: 16 B chunks per q mailbox head row (36 FP8, 72 BF16);
         ``q_heads``: q mailbox rows per token (default DCP * H); ``lse_scale``: to
         base 2 (LOG2E for a natural-log LSE). Rubin's ``lean`` re-arm assumes the
         FP8 layout: the DSA (BF16) mailbox compiles with ``sms`` <= GB300_SMS.
         ``resident_sms``: the device's real SM count (0: ``sms``), which bounds the
-        co-resident grid (``tile_stride``) when ``sms`` is the capped GB300 schedule."""
+        co-resident grid (``tile_stride``) when ``sms`` is the capped GB300 schedule.
+        ``draft``: the drafter's DCP size (``split_rule``: its own rules and twins;
+        0: the target). ``quant_at``: the device address of the step's cake quantum
+        (mla.wlist.StepQuant) where the drafter's rule is a cake rule (``long_split``
+        4 fields), else 0."""
         self.heads, self.size, self.batch = heads, size, batch
         self.q_chunks, self.q_heads = q_chunks, q_heads or size * heads
         self.lse_scale = lse_scale
@@ -788,8 +976,22 @@ class DcpValue:
         self.lse_split = lse_split and fold > 0
         # LONG_SPLIT: the core partitions each request by its own length (valid_splits)
         self.long = (
-            long_split(batch, size * heads, fold, sms) if self.lse_split else None
+            long_split(batch, size * heads, fold, sms, q, draft)
+            if self.lse_split
+            else None
         )
+        # A cake rule's partition reads the step's quantum word (written by the first
+        # drafter layer before any core: read after this kernel's PDL wait, as the
+        # lengths). NQ-NOFALLBACK: a cake rule without its word is a build error.
+        self.quant_at = int(quant_at)
+        cake = self.long is not None and len(self.long) > 3
+        if cake != bool(self.quant_at):
+            raise ValueError(
+                f"Kimi K3 MLA DcpValue (batch {batch}, q {q}, split {fold}): cake "
+                f"rule {self.long} needs its step quantum word (quant_at "
+                f"{self.quant_at:#x}) and only it does"
+            )
+        assert not (cake and polled_split), "the cake fold reads lengths after the wait"
         self.out_scale = out_scale
         # Rubin DcpCore (mla.core): the pushers LSE-merge its ``fold`` split partials
         # (FP32 O and (max, sum) per split) into each row first.
@@ -1092,6 +1294,9 @@ class DcpValue:
         LPC: request r's chunk count (lpc_filled)."""
         if cutlass.const_expr(self.lpc is not None):
             return lpc_filled(self.lpc_words, n, r, self.batch // self.q)
+        if cutlass.const_expr(self.quant_at != 0):  # the cake rule's step quantum
+            word = load_words(Int64(self.quant_at), count=1, mutable=True)[0]
+            return filled_splits(n, self.fold, self.long, Int32(word))
         return filled_splits(n, self.fold, self.long)
 
     @cute.jit
@@ -1737,6 +1942,8 @@ def compile_value(
     lse_base_e=True,
     spread=False,
     resident_sms=0,
+    draft=0,
+    quant_at=0,
 ):
     """DcpValue of one batch (``q`` rows per request); ``uv``: the (shape, stride,
     dtype) of W_UV, ``pitch``: the projected rows' (the gate follows the 2112 query /
@@ -1751,7 +1958,9 @@ def compile_value(
     decode returns them (``lse_base_e``: natural-log, else base 2), on the GB300
     schedule. ``resident_sms``: the wave the merging CTAs' grid must fit in
     (``DcpValue.tile_stride``; 0: ``sms``, the caller's real SM count; the tests
-    give a smaller one to compare row-tile strides)."""
+    give a smaller one to compare row-tile strides). ``draft``: the drafter's DCP
+    size (its split rules, ``split_rule``; 0: the target); ``quant_at``: the
+    address of its cake rule's step quantum word (DcpValue)."""
     error = uv_layout_error(uv)  # (the fragment loads assume it: no GPU-side check)
     if error:
         raise ValueError(f"Kimi K3 MLA DcpValue: {error}")
@@ -1806,6 +2015,8 @@ def compile_value(
         lpc=lpc,
         spread=spread,
         resident_sms=resident,
+        draft=draft,
+        quant_at=quant_at,
         **dsa,
     )
     if value.polled_out:
@@ -2170,18 +2381,34 @@ VERIFY_FOLD_SPLITS.update({(r, 96): 2 for r in range(68, 125, 8)})
 VERIFY_FOLD_SPLITS[28, 64] = 2
 
 
-def verify_fold_splits(batch, q, heads, max_seq, device):
+def verify_fold_splits(batch, q, heads, max_seq, device, draft=0):
     """Tokenspeed's split count of the packed verify core (``stock_decode``'s rule at
-    q > 1; ``VERIFY_FOLD_SPLITS`` on Rubin) and its packed rows (tiles x 128)."""
+    q > 1; ``VERIFY_FOLD_SPLITS`` on Rubin) and its packed rows (tiles x 128). The
+    drafter's (``draft``: its DCP size) PACKED_TWIN shape (``split_key``) takes its
+    twin verify's decision: tokenspeed's rule and the tables at the twin rows (the
+    same requests and tiles), or its own measured rule (DRAFT_LONG_SPLIT: launched at
+    the rule's short split, its long split where some request can pass the long
+    tiles)."""
     from tokenspeed_mla import mla_decode as md
 
     tiles = md.compute_q_tile_layout(heads, q, 128)[1]
+    key, twin = split_key(batch, heads, q, draft)
+    rows, shape_q = batch, q
+    if twin:
+        rows, shape_q = key[0], PACKED_TWIN[heads, q]
+        twin_tiles = md.compute_q_tile_layout(heads, shape_q, 128)[1]
+        assert twin_tiles == tiles, (heads, q, shape_q, tiles, twin_tiles)
     sms = md.get_num_sm(device)
-    args = batch // q, tiles, 128, 512, sms, max_seq, torch.float8_e4m3fn, (128, 128)
-    split = md._get_split_kv_and_workspace_size(*args, fill_splits(batch, device))[0]
+    args = rows // shape_q, tiles, 128, 512, sms, max_seq, torch.float8_e4m3fn
+    args += ((128, 128),)
+    split = md._get_split_kv_and_workspace_size(*args, fill_splits(rows, device))[0]
     if sms > GB300_SMS:
-        split = VERIFY_FOLD_SPLITS.get((batch, heads), split)
-        rule = LONG_SPLIT.get((batch, heads))
+        split = VERIFY_FOLD_SPLITS.get(key, split)
+        if twin:
+            split = TWIN_FOLD_SPLITS.get(key, split)
+        rule = split_rule(batch, heads, q, draft)
+        if draft and (batch, heads, q, draft) in DRAFT_LONG_SPLIT:
+            split = rule[0]
         if rule and split == rule[0] and max_seq > 128 * rule[2]:
             split = rule[1]  # (only where some request can pass the long tiles)
     return split, tiles * 128

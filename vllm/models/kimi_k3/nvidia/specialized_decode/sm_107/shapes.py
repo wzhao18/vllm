@@ -240,7 +240,7 @@ def captured_rows(capture_sizes: Iterable[int], q: int, limit: int) -> tuple[int
 # Families the SP decode keeps as the stock module (``Path.DECLARED``): embedding,
 # AttnRes, the MegaMoE / dense MLPs on the shard, the final row all-gather, the LM
 # head, the sampler, verification under synthetic rejection and the DSpark drafter
-# (phase 1).
+# (but for its MLA attention: runtime.sp_attention SP_DRAFTER_TABLES).
 DECLARED_STOCK = frozenset(
     {
         "embed",
