@@ -265,7 +265,14 @@ class KdaSplitStock(RecoverKdaSplit):
     order costs ~0 on the verify rows (<= 0.6% vs the policy's modes) and +7..13% on
     the q1 early-3 rows (the F_B staging it drops: TP16 B32 / B64, TP8 B16-64), not
     serving rows of the spec configs (q > 1); an 8-byte-order F_B staging would
-    recover it."""
+    recover it.
+
+    "Stock" is the backend the stock layer resolves: in a speculative deployment at
+    the DS conv layout that is the Triton path at every head count (q = 1 and
+    verify). A plain (non-speculative) deployment at 12 / 24 / 48 / 96 heads
+    resolves q = 1 to the CUDA ``fused_kda_decode`` (fast-math exp / rsqrt: state
+    relerr ~1.9e-3 vs Triton), whose math this kernel does not compute (open:
+    ``test_fp32_decode_q1_plain``, strict xfail)."""
 
     bf16_state = False
 

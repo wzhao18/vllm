@@ -914,7 +914,8 @@ def test_kda_fp32_verify_is_stock_math_at_every_q():
             stock = (prepared.KdaVerifyLoopStock, prepared.KdaSplitStock)
             assert type(kernel) in stock, (q, b, type(kernel))
             assert prepared.verify_kernel(b, q, RUBIN, False, 0, 24) in (
-                "kdasplit", "loopstock"
+                "kdasplit",
+                "loopstock",
             )
 
 
@@ -1088,13 +1089,19 @@ def test_kda_fp32_head_compile_probe(head_probe, batch, q, name):
     assert head.head_supported(*bf16, **probe) and not calls
 
 
-@pytest.mark.parametrize("compiles", [True, False], ids=["compiles", "fails"])
-def test_kda_fp32_head_probe_decides_in_the_provider(monkeypatch, head_probe, compiles):
+@pytest.mark.parametrize(
+    "compiles,q", [(True, 8), (False, 8), (True, 4)], ids=["compiles", "fails", "q4"]
+)
+def test_kda_fp32_head_probe_decides_in_the_provider(
+    monkeypatch, head_probe, compiles, q
+):
     """A Rubin TP16 KDA layer (q8) with an FP32 state builds its KdaHead kernels (q1
     B8, the verify heads B1 x q8 and 2 x q8: the stock verify's math) only when they
     compile; when none does it builds none, before anything is set up for the head
     (no KdaHead index or F_A buffer, which the MoE tail's early release and the
-    AttnRes carve-out follow), and keeps the pair."""
+    AttnRes carve-out follow), and keeps the pair. At q4 an FP32 state builds no
+    verify head (HEAD_MULTI_FP32: the 2 x q4 head serves no q4 deployment's steady
+    rows and costs the rows it does not serve)."""
     head, calls, fail = head_probe
     if not compiles:
         fail.update({"head", "verify", "multi"})
@@ -1114,9 +1121,9 @@ def test_kda_fp32_head_probe_decides_in_the_provider(monkeypatch, head_probe, co
     device = SimpleNamespace(multi_processor_count=212)
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda index: device)
     runtime = SimpleNamespace(
-        tp=16, q=8, tuned=batches, batches=batches, wide=(), bf16_state=False,
+        tp=16, q=q, tuned=batches, batches=batches, wide=(), bf16_state=False,
         buffers={}, device="cpu", kda_heads=0, kda_side=None, capacity=16,
-        sharded=frozenset(), shard_box=None, context=kda_context(False, 8),
+        sharded=frozenset(), shard_box=None, context=kda_context(False, q),
     )  # fmt: skip
     decoder = SimpleNamespace(
         self_attn=SimpleNamespace(in_proj_qkvgfab=None), layer_idx=0,
@@ -1126,7 +1133,10 @@ def test_kda_fp32_head_probe_decides_in_the_provider(monkeypatch, head_probe, co
     with pytest.raises(Built):  # past the KDA branch, at the o-projection
         Attention.__init__(provider, decoder, runtime, None, None, None)
     assert provider.kind == "kda"
-    if compiles:
+    if q == 4:
+        assert "multi" not in {c[0] for c in calls}
+        assert not built.called or built.call_args.kwargs["verify"] == []
+    elif compiles:
         assert sorted({c[0] for c in calls}) == ["head", "multi", "verify"]
         built.assert_called_once()
         args, kwargs = built.call_args

@@ -68,18 +68,22 @@ HEAD_BATCHES = (8,)
 # polled fused o-projection); its projection sums K in four split-K partials instead
 # of the 8-row bin's two (the same stated FP32 reorder).
 # FP32 state (stock math since 2026-11-08: ``KdaHead.stock``, bitwise the in-projection
-# -> KdaSplitStock pair): the same rows. VR200 kernel bench (nqbench kda2-t1, bench_kda
-# section a, 1 GPU, 69 layers each behind a PDL AttnRes stand-in, graph us per layer
-# incl. the stand-in), head vs that pair: q8 M8 (KdaHeadVerify) 14.57 vs 17.92, q8 M16
-# 16.05 vs 20.75, q4 M8 13.89 vs 16.77, q1 B8 13.70 vs 16.18. TP16 4-node step A/B (as
-# KDA_FOLD64_FP32's), pair -> head: q8 M8 (C1) 5470.2 -> 5261.1 (-3.8%), q8 M16 (C8)
-# 7173.3 -> 7025.9 (-2.1%), q4 M8 (B2, c256's config) 5421.1 -> 5258.6 (-3.0%). The
-# q4 layers' head also moves rows it does not serve, by the per-layer AttnRes
-# carve-out (HEAD_BEFORE_CARVEOUT) and the MoE tail's early release (``use_heads``):
-# q4 M64 11889.9 -> 11912.5 (+0.19%, both process pairs), M256 20074.0 -> 20089.7
-# (+0.08%), M512 28852.3 -> 28841.2 (-0.04%); q8 M32 9205.3 -> 9208.6. (NQ-TUNE: a
-# per-batch carve-out would keep those at the plain rows' setting.)
+# -> KdaSplitStock pair): HEAD_MULTI_FP32. VR200 kernel bench (nqbench kda2-t1,
+# bench_kda section a, 1 GPU, 69 layers each behind a PDL AttnRes stand-in, graph us
+# per layer incl. the stand-in), head vs that pair: q8 M8 (KdaHeadVerify) 14.57 vs
+# 17.92, q8 M16 16.05 vs 20.75, q4 M8 13.89 vs 16.77, q1 B8 13.70 vs 16.18.
 HEAD_MULTI = {8: "16:1", 4: "8:1"}
+# FP32 state: q8 only. TP16 4-node step A/B (as KDA_FOLD64_FP32's), pair (5ec8564) ->
+# head: q8 M8 (C1) 5470.2 -> 5261.1 (-3.8%), q8 M16 (C8) 7173.3 -> 7025.9 (-2.1%);
+# the B1 x q8 KdaHeadVerify and these rows match or beat the KdaSplit-math heads before
+# 2026-11-08 (b801dda, same nodes, two processes each: M8 5267.4 -> 5261.0, M16
+# 7051.8 -> 7036.8). The q4 M8 head (B2) saves ~177 us at c256's config (5432.6 ->
+# 5255.1) but no q4 deployment serves B2 in steady state (q4 = C160 / C256: 160-256
+# requests per TP16 decode group), while a head layer's set-up moves the rows it does
+# not serve: q4 with the head vs without (same nodes, kda2-xq4: without = 5ec8564
+# within 1 us) M64 11874.1 vs 11875.6 / 11878.1, M256 20098.6 vs 20092.3 (+6; +16 on
+# another allocation), M512 28936.0 vs 28920.6 (+15). So q4 keeps the pair.
+HEAD_MULTI_FP32 = {8: "16:1"}
 # Devices with more SMs than GB300's 152 (Rubin: 212), TP16 B<=8, by rows. KDA: 102 CTAs
 # (split 2) instead of 204, so every CTA starts and preloads its weights beside the
 # 56-CTA AttnRes. MLA: SplitKTmemGemm, M128 tiles split over K by 7 (161 CTAs in
@@ -137,6 +141,9 @@ KDA_FOLD64: dict[int, str] = {16: "32:1,64:1"}
 # forward + drafter propose in one CUDA graph, AgentX contexts, median us of the max
 # over 16 ranks, two processes per arm on the same nodes): no fold (5ec8564,
 # KdaSplitStock) -> the stock-math fold at q8 M64 (c64) 11648.9 -> 11576.3 (-0.62%);
+# the KdaSplit-math fold before 2026-11-08 (b801dda) was 6 us faster still (same
+# nodes, two processes each: 11556.3 vs 11562.6, +0.05%: the stock epilogue / rstd /
+# decay formulas);
 # the q4 fold (KdaSplit's math, before) paid nothing at step level (b801dda -> 5ec8564
 # q4 M32 -1.8), so q4 keeps the plain KdaSplitStock.
 KDA_FOLD64_FP32: dict[int, str] = {16: "64:1"}
@@ -532,7 +539,8 @@ class Attention:
             # Verify heads (KdaHeadVerify / KdaHeadMulti): an FP32 state's compute the
             # stock verify's math (``KdaHead.stock``: bitwise the in-projection ->
             # KdaSplitStock pair)
-            multi = batch_table(HEAD_MULTI.get(q, ""))
+            multi = HEAD_MULTI if runtime.bf16_state else HEAD_MULTI_FP32
+            multi = batch_table(multi.get(q, ""))
             multi = [
                 b for b in runtime.batches if multi.get(b) and b % q == 0 and fits(b, q)
             ]
