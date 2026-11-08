@@ -467,18 +467,19 @@ def _tma_sf(t, shape_mn, shape_k, block_mn, num_groups, smem_outer, sf_k_stride)
 
 
 def _tma_weights(t, block_k, load_block_n, domains, batched):
-    """``make_tma_weights_{3,2}d_desc``: (B, N, K) / (N, K), or localized
-    (2, B, N / 2, K) / (2, N / 2, K) -> 4D (K, N / domains, domains, B)."""
-    localized = t.dim() == (4 if batched else 3)
+    """``make_tma_weights_{3,2}d_desc``: (B, N, K) / (N, K) -> 4D
+    (K, N / domains, domains, B). The decode never localizes the routed weights
+    (the stock ``(2, B, N / 2, K)`` MLOPart layout is not served)."""
+    if t.dim() != (3 if batched else 2):
+        raise RuntimeError(
+            f"MegaMoE: weights of shape {tuple(t.shape)}: the SM107 launcher takes "
+            "unlocalized (B, N, K) / (N, K) weights only"
+        )
     k = t.size(-1) * (2 if t.dtype == torch.int8 else 1)
-    if batched:
-        batches = t.size(1 if localized else 0)
-        n = t.size(2) if localized else t.size(1) // domains
-    else:
-        batches = 1
-        n = t.size(1) if localized else t.size(0) // domains
-    slice_stride = t.stride(0) if localized else n * t.stride(-2)
-    outer = (t.stride(1 if localized else 0)) if batched else slice_stride * domains
+    batches = t.size(0) if batched else 1
+    n = t.size(-2) // domains
+    slice_stride = n * t.stride(-2)
+    outer = t.stride(0) if batched else slice_stride * domains
     return _encode(t, (k, n, domains, batches), (t.stride(-2), slice_stride, outer),
                    (block_k, load_block_n, 1, 1), 128)  # fmt: skip
 
@@ -612,9 +613,14 @@ class SituMegaMoE:
             raise RuntimeError("MegaMoE: shared L1 and L2 weights go together")
         num_tokens, device = y.size(0), y.device.index
         domains_n = dg.get_num_locality_domains()
-        # check_weights_layout_3d: logical (E, N, K); localized (domains, E, N / domains, K)
+        # check_weights_layout_3d: logical (E, N, K) (never localized here)
+        if w1.dim() != 3 or w2.dim() != 3:
+            raise RuntimeError(
+                f"MegaMoE: weights {tuple(w1.shape)} / {tuple(w2.shape)}: the SM107 "
+                "launcher takes unlocalized (E, N, K) weights only"
+            )
         epr = w1.size(-3)
-        inter2 = w1.size(-2) * (domains_n if w1.dim() == 4 else 1)
+        inter2 = w1.size(-2)
         hidden = w1.size(-1) * (2 if w1.dtype == torch.int8 else 1)
         inter = w2.size(-1) * (2 if w2.dtype == torch.int8 else 1)
         if inter2 != 2 * inter or w1.dtype != w2.dtype:
