@@ -232,7 +232,7 @@ def _compile_polled_q(
 
     base = md.BlackwellMultiHeadLatentAttentionForwardFP8
     sms = md.get_num_sm(torch.device("cuda", device))
-    long = long_split(reqs * q, heads, split, sms)
+    long = long_split(reqs * q, heads, split, sms, q)
     md.BlackwellMultiHeadLatentAttentionForwardFP8 = _without_reducer(
         polled_q_core(reqs * q, valid, persistent, push, long, wlist)
     )

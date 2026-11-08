@@ -46,7 +46,6 @@ from .dcp import (
     FORK_VALID,
     FORK_VALID_DELAY,
     GB300_SMS,
-    LONG_SPLIT,
     LPC_LONG,
     LPC_ROWS,
     LPC_SLOTS,
@@ -65,6 +64,7 @@ from .dcp import (
     lse_fold_splits,
     reserve_split_workspace,
     rubin_decode,
+    split_rule,
     split_partials,
     split_partials_q,
     split_workspace_ts,
@@ -424,7 +424,7 @@ class PreparedMla:
     def work_list(self, batch, q, heads, tiles, split, sms, kv):
         """The shared per-step work list (mla.wlist) of a WLIST verify shape launched
         at its LONG_SPLIT split, or None."""
-        long = long_split(batch, heads, split, sms)
+        long = long_split(batch, heads, split, sms, q)
         if batch not in WLIST or long is None:
             return None
         return shared_list(batch // q, tiles, split, long, sms // 2, kv.device)
@@ -501,7 +501,7 @@ class PreparedMla:
                     # mailbox (validity TMA), work list, split workspace and partitions
                     p2 = envs.VLLM_KIMI_K3_DS_T2P and q == 8 and 128 <= batch <= 256
                     if p2 and kv.shape[1] == 64:
-                        long = long_split(batch, heads, split, sms)
+                        long = long_split(batch, heads, split, sms, q)
                         self.verify_p2[batch, q] = long, packed, work.slots, False
                 if lpc:
                     self.lpc_prepare(batch, q, packed, sms, kv)
@@ -519,12 +519,12 @@ class PreparedMla:
                 if lpc:  # DS-T2P's LPC partition (as the wide rows)
                     split = LPC_SLOTS
                 gathered = split > 1 and batch not in POLLED_VERIFY
-                if gathered and long_split(batch, heads, split, sms):
+                if gathered and long_split(batch, heads, split, sms, q):
                     # (as draft.attention: the gathered core has no long partition, so
                     # DcpValue would fold the wrong partials at short contexts)
                     raise ValueError(
                         f"verify rows {batch} (q {q}): LONG_SPLIT "
-                        f"{LONG_SPLIT[batch, heads]} fires on the gathered verify "
+                        f"{split_rule(batch, heads, q)} fires on the gathered verify "
                         "core, which has no long partition: add the rows to "
                         "POLLED_VERIFY or drop the rule"
                     )

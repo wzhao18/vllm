@@ -506,15 +506,27 @@ def test_core_build_failures_propagate(fakes, family):
 
 
 def test_drafter_table_with_a_tp4_entry_raises(fakes, monkeypatch):
-    """The DSpark drafter is declared stock at TP4: a drafter table gaining a TP4
-    entry (a specialized drafter piece) stops the startup instead of silently
-    contradicting the declaration."""
+    """The DSpark drafter is declared stock at TP4 but for its attention
+    (SP_DRAFTER_TABLES: FAST_DCP): another drafter table gaining a TP4 entry (a
+    specialized drafter piece) stops the startup instead of silently contradicting
+    the declaration."""
     fakes()
     tables = sp_attention.check_stock_drafter(TP)
     assert tables and all(name.isupper() for name in tables)
-    name = tables[0]
+    assert sp_attention.SP_DRAFTER_TABLES == {"FAST_DCP"} and TP in draft.FAST_DCP
+    name = next(n for n in tables if n not in sp_attention.SP_DRAFTER_TABLES)
     monkeypatch.setattr(draft, name, {**getattr(draft, name), TP: "x"})
     with pytest.raises(shapes.Unsupported, match=rf"\['{name}'\] have TP4 entries"):
+        sp_attention.SpStep(runtime())
+
+
+def test_drafter_attention_without_its_tp4_entry_raises(fakes, monkeypatch):
+    """FAST_DCP without its TP4 entry would leave the drafter's attention stock under
+    a declaration that says it is specialized: refused at startup."""
+    fakes()
+    fast_dcp = {k: v for k, v in draft.FAST_DCP.items() if k != TP}
+    monkeypatch.setattr(draft, "FAST_DCP", fast_dcp)
+    with pytest.raises(shapes.Unsupported, match=r"\['FAST_DCP'\] have no TP4 entry"):
         sp_attention.SpStep(runtime())
 
 

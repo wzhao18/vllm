@@ -107,7 +107,14 @@ CONTEXT_OVERLAP = {16: "1-63:1"}
 # keeps the wide rows whose DcpValue grid is co-resident, with the work list where it
 # fits mla.wlist's packing.)
 # NQ-TUNE: drafter wide rows above 576 (DL7 B83+, DL3 B193+) vs the stock DCP path.
-FAST_DCP = {8: "1-64:1", 16: "1-:1"}
+# TP4 = DCP4 (C512's sequence-parallel decode role, ``runtime.sp_topology``): 24 heads
+# per rank, publish-only MlaQuery and polled cores at every row; the drafter's only
+# specialized piece there (the rest stays the stock module: sp_attention
+# SP_DRAFTER_TABLES), strict (a served row runs it or the load is refused). Draft eff
+# sweep (bench_draft_eff.py, 4 x VR200, AgentX lengths, DCP4 local = total / 4), us
+# per drafter attention layer, stock DCP path -> DraftDcp with the packed-twin splits
+# (mla.dcp PACKED_TWIN): see the commit message tables.
+FAST_DCP = {4: "1-:1", 8: "1-64:1", 16: "1-:1"}
 # Context rows whose context step runs the sharded context projection + Lamport row
 # gather and the fused context-KV epilogue (cutedsl.draft.context; above 64 rows the
 # shape-dynamic kernels and the stock shard GEMM), per TP, on Rubin. It replaces the
@@ -491,6 +498,11 @@ class DraftFastPath:
         # piece a captured graph runs is covered or the load is refused; elsewhere
         # (out of scope) uncovered pieces keep the stock drafter path, logged.
         strict = target_topology(True, tp, dcp, steps + 1)
+        # C512's SP decode role (TP4 = DCP4): the drafter's attention is specialized
+        # and strict; its other pieces are the declared stock module (sp_attention).
+        from . import sp_topology
+
+        attention_strict = strict or sp_topology(vllm_config)
 
         def fail(site, cause):
             if strict:
@@ -722,13 +734,18 @@ class DraftFastPath:
                 )
         attentions = [layer.self_attn for layer in model.model.layers]
         rows = [r for r in query_rows if policy(FAST_DCP, r)]
-        if strict and rows != query_rows:
-            fail("DSpark drafter attention", "FAST_DCP misses query rows")
+
+        def fail_attention(cause):
+            if attention_strict:
+                refuse("DSpark drafter attention", cause)
+            fail("DSpark drafter attention", cause)
+
+        if attention_strict and rows != query_rows:
+            fail_attention("FAST_DCP misses query rows")
         if dcp == tp > 1 and rows and any(a.dcp_world_size != tp for a in attentions):
             # NQ-NOFALLBACK: the drafter's MLA layers would keep the stock DCP
             # attention at every row.
-            fail(
-                "DSpark drafter attention",
+            fail_attention(
                 f"drafter MLA layers with DCP sizes "
                 f"{sorted({a.dcp_world_size for a in attentions})} under DCP{dcp}",
             )
@@ -739,10 +756,7 @@ class DraftFastPath:
             if not query_heads(heads):
                 # (MlaQuery's drafter tile is keyed by heads per rank: mla.query
                 # DRAFT_TILED_FROM) NQ-NOFALLBACK
-                fail(
-                    "DSpark drafter attention",
-                    f"no fused drafter query for {heads} heads per rank",
-                )
+                fail_attention(f"no fused drafter query for {heads} heads per rank")
             else:
                 # The drafter's mask exactly as stock decides it: the DSpark speculator
                 # builds its metadata causal unless the checkpoint asks for non-causal
@@ -762,7 +776,7 @@ class DraftFastPath:
                     vllm_config.parallel_config.cp_kv_cache_interleave_size,
                     causal,
                 )  # fmt: skip
-                prepared_dcp.strict = strict  # NQ-NOFALLBACK
+                prepared_dcp.strict = attention_strict  # NQ-NOFALLBACK
                 served = (*prepared_dcp.rows, *prepared_dcp.wide)
                 logger.info_once(
                     "Kimi K3 DSpark drafter: Lamport DCP attention (%s) for %s rows",
@@ -777,10 +791,18 @@ class DraftFastPath:
                         reason = prepared_dcp.dropped.get(r, "not covered")
                         reasons.setdefault(reason, []).append(r)
                 for reason, dropped in reasons.items():
-                    fail(
-                        "DSpark drafter attention",
+                    fail_attention(
                         f"rows {tuple(dropped)} would keep the stock DCP attention "
-                        f"({reason})",
+                        f"({reason})"
+                    )
+                # NQ-NOFALLBACK: a served row whose core would be the stock tokenspeed
+                # core inside the fast path (no fold, wide or rows-mode core).
+                seams = prepared_dcp.stock_core_rows()
+                if seams and attention_strict:
+                    fail_attention(
+                        f"rows {seams} would run the stock tokenspeed core ("
+                        + "; ".join(prepared_dcp.core_of(r) for r in seams[:2])
+                        + ")"
                     )
                 log_coverage(rank, "draft attention", prepared_dcp.coverage(rows))
         logger.info_once(

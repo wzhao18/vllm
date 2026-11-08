@@ -353,9 +353,10 @@ def test_query_heads_reads_mlaquery_table():
 
 
 def test_draft_fold_splits_role(monkeypatch):
-    """The drafter reads mla.dcp's (rows, heads) split tables only at the gathered
-    head counts measured on a drafter (64); at 96 (the K3 target's keys) it takes
-    tokenspeed's own split."""
+    """The drafter reads mla.dcp's split tables at the gathered head counts measured
+    on a drafter (64, its own (rows, 64) keys) and at its packed twins (96 heads, q 3
+    / 7: the twin verify's keys, mla.dcp PACKED_TWIN), both through
+    verify_fold_splits."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.draft import (
         attention,
     )
@@ -365,8 +366,61 @@ def test_draft_fold_splits_role(monkeypatch):
         attention, "verify_fold_splits", lambda *a: called.append(a) or (9, 128)
     )
     assert attention.draft_fold_splits(56, 7, 64, 1 << 16, "cpu") == (9, 128)
-    assert called == [(56, 7, 64, 1 << 16, "cpu")]
+    assert attention.draft_fold_splits(54, 3, 96, 1 << 16, "cpu") == (9, 128)
+    assert attention.draft_fold_splits(63, 7, 96, 1 << 16, "cpu") == (9, 128)
+    assert called == [
+        (56, 7, 64, 1 << 16, "cpu"),
+        (54, 3, 96, 1 << 16, "cpu"),
+        (63, 7, 96, 1 << 16, "cpu"),
+    ]
     assert 64 in attention.DRAFT_RULE_HEADS and 96 not in attention.DRAFT_RULE_HEADS
+
+
+def test_packed_twin_keys():
+    """A 96-head packed core at q 3 / 7 (the causal drafter) reads its twin verify's
+    rows (the same requests at q 4 / 8: the same 3 / 6 query tiles per request); the
+    target's own verify q and other head counts read their own rows."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.mla import dcp
+
+    for (heads, q), twin in dcp.PACKED_TWIN.items():
+        assert -(-heads * q // 128) == -(-heads * twin // 128)
+    assert dcp.split_key(54, 96, 3) == ((72, 96), True)
+    assert dcp.split_key(63, 96, 7) == ((72, 96), True)
+    assert dcp.split_key(480, 96, 3) == ((640, 96), True)
+    for rows, heads, q in ((72, 96, 4), (72, 96, 8), (63, 64, 7), (54, 64, 3),
+                           (8, 96, 1), (54, 96, None), (55, 96, 3)):  # fmt: skip
+        assert dcp.split_key(rows, heads, q) == ((rows, heads), False)
+    # The target's verify rows (q 4 / 8) read LONG_SPLIT as before.
+    for (rows, heads), rule in dict.items(dcp.LONG_SPLIT):
+        for q in (4, 8):
+            if heads == 96 and rows % q == 0:
+                assert dcp.split_rule(rows, heads, q) == rule
+    # The drafter's seam rows (DL3 B18 / B19 / B21, DL7 B9): the twin's (2, 8, 64).
+    sms = 200
+    for rows, q in ((54, 3), (57, 3), (63, 3), (63, 7)):
+        assert dcp.long_split(rows, 96, 8, sms, q) == (2, 64, 0), rows
+        assert dcp.long_split(rows, 96, 2, sms, q) is None  # (the short split)
+        assert dcp.long_split(rows, 96, 8, 148, q) is None  # (GB300: no rule)
+    # Odd DL3 batches below B17 (no q4 rule): the next batch's rule, twin only.
+    assert dcp.split_rule(9, 96, 3) == (4, 8, 64)
+    assert dcp.split_rule(12, 96, 4) is None
+    assert dcp.TWIN_FOLD_SPLITS[12, 96] == 4
+
+
+@pytest.mark.parametrize("steps, top", [(3, 192), (7, 96)])
+def test_packed_twin_rules_cover_drafter_rows(steps, top):
+    """Every 96-head drafter fold / wide row (not rows mode) has a length-keyed rule
+    through its twin: none is left to tokenspeed's shape-only split."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.draft import (
+        attention,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.mla import dcp
+
+    for reqs in range(1, top + 1):
+        rows = reqs * steps
+        if attention.ROWS_MODE.get(rows):
+            continue
+        assert dcp.split_rule(rows, 96, steps) is not None, rows
 
 
 def test_dcp_value_uv_layout():
@@ -406,11 +460,15 @@ def _rubin_world():
     return torch.cuda.device_count()
 
 
-@pytest.mark.parametrize("part", ["markov", "dcp", "context", "arnorm"])
+@pytest.mark.parametrize(
+    "part", ["markov", "dcp", "dcp96", "query96", "context", "arnorm"]
+)
 def test_gpu_torchrun(part):
     """The torchrun checks below on every local GPU (skipped without 2+ Rubin-class
     GPUs). The DCP check runs at DCP = the local GPU count (6 heads per rank: 96
-    gathered heads only at 16 GPUs, ``torchrun --nnodes 4``). ``context`` / ``arnorm``:
+    gathered heads only at 16 GPUs, ``torchrun --nnodes 4``); ``dcp96`` / ``query96``
+    at 96 gathered heads (96 / GPUs per rank: 24 at 4 GPUs, C512's drafter layer;
+    ``query96`` from the in-projection rows through MlaQuery). ``context`` / ``arnorm``:
     the drafter's wide context row gather and wide all-reduce sites at row counts
     above one wave (the persistent kernels)."""
     import subprocess
@@ -592,13 +650,16 @@ def _local_len(total, world, rank, interleave):
     return full * interleave + min(max(rest - rank * interleave, 0), interleave)
 
 
-def _dcp_inputs(reqs, steps, world, rank, interleave, gen, pages_gen, device, long=0):
+def _dcp_inputs(
+    reqs, steps, world, rank, interleave, gen, pages_gen, device, long=0,
+    heads_rank=DCP_HEADS,
+):  # fmt: skip
     """Contexts mixing very short requests (each token weighs a few percent: a mask
     error shows), medium ones and ``long`` past 64 local KV tiles (the long splits);
     every rank's FP8 KV of its own tokens in pages shuffled by the rank's
     ``pages_gen``; the global FP8 query rows [rows, DCP x heads, 576]. ``gen`` draws
     the same on every rank (contexts, then queries)."""
-    heads = world * DCP_HEADS
+    heads = world * heads_rank
     kinds = torch.randint(0, 3, (reqs,), generator=gen, device="cpu").tolist()
     totals = []
     for i, kind in enumerate(kinds):
@@ -718,14 +779,14 @@ class _DraftAttention:
     the check fills the q mailboxes itself); ``impl.forward_mqa``: the stock
     tokenspeed decode (the gathered rows without a fold)."""
 
-    def __init__(self, gen, device, cache, world, rank, interleave):
-        self.num_local_heads = DCP_HEADS
+    def __init__(self, gen, device, cache, world, rank, interleave, heads=DCP_HEADS):
+        self.num_local_heads = heads
         # W_UV [H, 512, 128] latent-contiguous, as the model's (split_kv_b_proj: the
         # kv_b_proj weight's .T view [L, N, V], then (L, N, V) -> (N, L, V)): DcpValue
         # loads its MMA fragments as 16 B runs of latent values (mla.dcp
         # uv_layout_error). (As many draws from ``gen`` as before.)
-        w_uv = torch.randn((DCP_HEADS * 128, 512), generator=gen, device="cpu") * 0.05
-        w_uv = w_uv.bfloat16().to(device).T.view(512, DCP_HEADS, 128)
+        w_uv = torch.randn((heads * 128, 512), generator=gen, device="cpu") * 0.05
+        w_uv = w_uv.bfloat16().to(device).T.view(512, heads, 128)
         self.W_UV = w_uv.transpose(0, 1)
         self.scale = SOFTMAX_SCALE
         self._q_scale_float, self._k_scale_float = Q_SCALE, K_SCALE
@@ -759,7 +820,7 @@ def _dcp_path(shared, rows):
 
 
 def _dcp_case(steps, rows_list, causal, world, rank, group, device, interleave,
-              label, seen, long_rows=()):  # fmt: skip
+              label, seen, long_rows=(), heads_rank=DCP_HEADS):  # fmt: skip
     """One DraftDcp over ``rows_list`` drafter rows (q = ``steps``): per rows, two
     layers (parities 0 and 1) twice, each against the stock output."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.draft.attention import (
@@ -770,9 +831,10 @@ def _dcp_case(steps, rows_list, causal, world, rank, group, device, interleave,
     shared_gen = torch.Generator().manual_seed(4242 + steps + 2 * causal)
     largest = max(rows_list)
     inputs = world, rank, interleave, shared_gen, gen, device
-    cache, _, _ = _dcp_inputs(1, steps, *inputs)
+    cache, _, _ = _dcp_inputs(1, steps, *inputs, heads_rank=heads_rank)
     layers = [
-        _DraftAttention(gen, device, cache, world, rank, interleave) for _ in (0, 1)
+        _DraftAttention(gen, device, cache, world, rank, interleave, heads_rank)
+        for _ in (0, 1)
     ]
     shared = DraftDcp(
         layers, group, world, rank, rows_list, steps, 1 << 20, interleave, causal
@@ -782,8 +844,9 @@ def _dcp_case(steps, rows_list, causal, world, rank, group, device, interleave,
         reqs = rows // steps
         long = 2 if rows >= 6 * steps or rows in long_rows else 0
         cache, q, metadata = _dcp_inputs(
-            reqs, steps, world, rank, interleave, shared_gen, gen, device, long
-        )
+            reqs, steps, world, rank, interleave, shared_gen, gen, device, long,
+            heads_rank,
+        )  # fmt: skip
         metadata.causal = causal
         path = _dcp_path(shared, rows)
         seen.setdefault(path, []).append((label, rows))
@@ -809,7 +872,7 @@ def _dcp_case(steps, rows_list, causal, world, rank, group, device, interleave,
                 print(f"rank {rank}: {label} rows {rows}: the mask is not observable")
                 failures += 1
         padded = shared.row_modes.get(rows, (rows,))[0]
-        heads = world * DCP_HEADS
+        heads = world * heads_rank
         for step in range(4):
             index = step % 2
             layer = layers[index]
@@ -820,7 +883,7 @@ def _dcp_case(steps, rows_list, causal, world, rank, group, device, interleave,
                 mailbox = shared.box.mailbox(rows in shared.valid)
             mailbox[dcp.parity, :rows, :heads].copy_(q)
             out = torch.empty(
-                (padded, DCP_HEADS * 128), dtype=torch.bfloat16, device=device
+                (padded, heads_rank * 128), dtype=torch.bfloat16, device=device
             )
             dcp.merge(layer, metadata, rows, out, rows_mode=rows in shared.row_modes)
             torch.accelerator.synchronize(device)
@@ -899,6 +962,235 @@ def _dcp_main(rank, world, device, group, interleave=1):
     if missing:
         print(f"rank {rank}: DraftDcp paths not exercised: {sorted(missing)}")
         failures += 1
+    return failures
+
+
+def _dcp96_main(rank, world, device, group, interleave=1):
+    """DraftDcp at the production gathered head count (96 = world x 96 / world heads
+    per rank: 24 at 4 GPUs, C512's TP4 = DCP4 shape) against the stock path, causal
+    (kimi-k3.1-pro-dspark-preview), with long requests past 64 local tiles: the
+    packed-twin split rules (mla.dcp PACKED_TWIN) at DL3 / DL7 fold rows (the former
+    stock-core seam rows 54 / 57 / 63 included) and wide rows. At 24 heads per rank
+    (MlaQuery publishes only) every fold row runs the polled core and no row runs the
+    stock core or a gathered one."""
+    if 96 % world:
+        print(f"rank {rank}: 96 heads do not split over {world} ranks")
+        return 0
+    heads_rank = 96 // world
+    seen: dict = {}
+    args = world, rank, torch.distributed.group.WORLD, device, interleave
+    dl3 = [3, 6, 9, 12, 24, 45, 54, 57, 63, 96, 192, 288]
+    dl7 = [7, 14, 28, 42, 56, 63, 112, 224, 448]
+    failures = _dcp_case(3, dl3, True, *args, "DL3 96h causal", seen,
+                         heads_rank=heads_rank)  # fmt: skip
+    failures += _dcp_case(7, dl7, True, *args, "DL7 96h causal", seen,
+                          heads_rank=heads_rank)  # fmt: skip
+    if rank == 0:
+        for path, cases in sorted(seen.items()):
+            print(f"DraftDcp 96h {path}: {cases}")
+    bad = {"stock core", "fold"} & set(seen) if heads_rank == 24 else set()
+    bad |= {"stock core"} & set(seen)
+    missing = {"fork", "wide"} - set(seen)
+    if not ({"polled", "long_polled"} & set(seen)):
+        missing.add("polled")
+    if bad or missing:
+        print(f"rank {rank}: DraftDcp 96h paths: unexpected {bad}, missing {missing}")
+        failures += 1
+    return failures
+
+
+def _rope_cache(positions, device):
+    """[positions, 64] FP32 cos | sin of a 64-wide rope (base 10000)."""
+    inv = 1.0 / (10000 ** (torch.arange(0, 64, 2, dtype=torch.float32) / 64))
+    freqs = torch.arange(positions, dtype=torch.float32)[:, None] * inv[None]
+    return torch.cat([freqs.cos(), freqs.sin()], dim=-1).to(device)
+
+
+class _QueryAttention(_DraftAttention):
+    """A drafter MLA layer with its query weights (DraftDcp compiles MlaQuery with
+    RoPE for it): the norms and q_a output are replicated, q_b / kv_b (W_UK_T, W_UV
+    as the model absorbs them) are this rank's heads."""
+
+    def __init__(self, gen, shared_gen, device, cache, world, rank, interleave, heads,
+                 cos_sin):  # fmt: skip
+        super().__init__(gen, device, cache, world, rank, interleave, heads)
+        bf16 = torch.bfloat16
+        kv_b = torch.randn((heads * 256, 512), generator=gen) / 16
+        kv_b = kv_b.to(bf16).to(device)
+        split = kv_b.T.view(512, heads, 256).split([128, 128], dim=-1)
+        self.W_UK_T = split[0].permute(1, 2, 0)  # (L, N, P) -> (N, P, L)
+        self.W_UV = split[1].transpose(0, 1)  # (L, N, V) -> (N, L, V)
+        q_b = torch.randn((heads * 192, 1536), generator=gen) / 40
+        self.q_b_proj = SimpleNamespace(weight=q_b.to(bf16).to(device))
+        norms = [torch.rand(n, generator=shared_gen) + 0.5 for n in (1536, 512)]
+        self.q_a_layernorm = SimpleNamespace(weight=norms[0].to(bf16).to(device))
+        self.kv_a_layernorm = SimpleNamespace(weight=norms[1].to(bf16).to(device))
+        f32 = dict(dtype=torch.float32, device=device)
+        self._q_scale_inv = torch.full((1,), 1 / Q_SCALE, **f32)
+        self._k_scale_inv = torch.full((1,), 1 / K_SCALE, **f32)
+        self.rms_norm_eps = 1e-6
+        self.rotary_emb = SimpleNamespace(cos_sin_cache=cos_sin)
+
+
+def _draft_slots(metadata, steps, world, rank, interleave):
+    """The draft rows' KV slots on this rank (-1 where another rank owns the token)
+    and their global positions: request r's rows are its last ``steps`` tokens."""
+    decode = metadata.decode
+    totals = decode.dcp_tot_seq_lens.tolist()
+    table = decode.block_table.cpu()
+    slots, positions = [], []
+    for r, total in enumerate(totals):
+        for t in range(total - steps, total):
+            positions.append(t)
+            if (t // interleave) % world != rank:
+                slots.append(-1)
+                continue
+            local = (t // (interleave * world)) * interleave + t % interleave
+            slots.append(int(table[r, local // PAGE]) * PAGE + local % PAGE)
+    i64 = dict(dtype=torch.int64, device=decode.block_table.device)
+    return torch.tensor(slots, **i64), torch.tensor(positions, **i64)
+
+
+def _stock_query(layer, qkv, cache, slots, positions, world, group):
+    """The stock drafter query (fused q / kv RMSNorm, q_b_proj, W_UK bmm, the fused
+    RoPE + FP8 concat and KV insert into ``cache``), all-gathered over the ranks'
+    heads: [rows, world x heads, 576] FP8 bytes."""
+    import torch.distributed as dist
+
+    from vllm.models.common.ops import fused_q_kv_rmsnorm
+    from vllm.models.kimi_k3.nvidia.ops.fused_mla_key_concat_kv_cache import (
+        fused_mla_decode_q_concat_kv_cache_insert,
+    )
+
+    rows, heads = qkv.shape[0], layer.num_local_heads
+    q_c, kv_c, k_pe = qkv.split([1536, 512, 64], dim=-1)
+    q_c, kv_c = fused_q_kv_rmsnorm(
+        q_c, kv_c, layer.q_a_layernorm.weight, layer.kv_a_layernorm.weight,
+        layer.rms_norm_eps,
+    )  # fmt: skip
+    q = (q_c @ layer.q_b_proj.weight.T).view(rows, heads, 192)
+    nope = torch.bmm(q[..., :128].transpose(0, 1), layer.W_UK_T).transpose(0, 1)
+    mqa_q = fused_mla_decode_q_concat_kv_cache_insert(
+        nope, q[..., 128:], kv_c, k_pe.unsqueeze(1), cache, slots,
+        q_scale_inv=layer._q_scale_inv, cache_scale_inv=layer._k_scale_inv,
+        positions=positions, cos_sin_cache=layer.rotary_emb.cos_sin_cache,
+    )  # fmt: skip
+    mine = mqa_q.view(torch.uint8).contiguous()
+    every = torch.empty((world, *mine.shape), dtype=torch.uint8, device=mine.device)
+    dist.all_gather_into_tensor(every, mine, group=group)
+    return every.permute(1, 0, 2, 3).reshape(rows, world * heads, 576)
+
+
+def _query96_main(rank, world, device, group, interleave=1):
+    """The drafter's whole fast attention at 96 gathered heads (24 per rank at 4
+    GPUs: C512's TP4 = DCP4 layer) from the in-projection rows, as
+    ``DraftLayerDcp.attend_projected`` runs it: MlaQuery (RoPE, FP8, KV insert,
+    publish-only q) -> the fork / polled / wide core -> DcpValue, against the stock
+    query + KV insert -> tokenspeed -> LSE combine -> W_UV, causal, with long
+    requests; and the KV rows both paths inserted."""
+    from cutlass import Int32
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
+        dynamic_view,
+        stream,
+        to_cute,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.draft.attention import (  # noqa: E501
+        DraftDcp,
+        query_heads,
+    )
+
+    heads = 96 // world if 96 % world == 0 else 0
+    if not heads or not query_heads(heads):
+        print(f"rank {rank}: no drafter MlaQuery tile at 96 / {world} heads")
+        return 0
+    failures, seen = 0, {}
+    cos_sin = _rope_cache(1 << 16, device)
+    for steps, rows_list in ((3, [3, 6, 9, 24, 54, 63, 96, 120, 168]),
+                             (7, [7, 14, 63, 112])):  # fmt: skip
+        gen = torch.Generator().manual_seed(91 + steps + rank * 1000)
+        shared_gen = torch.Generator().manual_seed(5151 + steps)
+        cache0, _, _ = _dcp_inputs(1, steps, world, rank, interleave, shared_gen, gen,
+                                   device, heads_rank=heads)  # fmt: skip
+        layers = [
+            _QueryAttention(gen, shared_gen, device, cache0, world, rank, interleave,
+                            heads, cos_sin)  # fmt: skip
+            for _ in (0, 1)
+        ]
+        shared = DraftDcp(
+            layers, group, world, rank, rows_list, steps, 1 << 20, interleave, True
+        )
+        for rows in rows_list:
+            reqs = rows // steps
+            label = f"DL{steps} 96h query rows {rows}"
+            if not shared.served(rows) or rows not in shared.queries:
+                print(f"rank {rank}: {label}: not served ({shared.dropped.get(rows)})")
+                failures += 1
+                continue
+            long = 2 if reqs >= 6 else 0
+            cache, _, metadata = _dcp_inputs(
+                reqs, steps, world, rank, interleave, shared_gen, gen, device, long,
+                heads,
+            )  # fmt: skip
+            metadata.causal = True
+            slots, positions = _draft_slots(metadata, steps, world, rank, interleave)
+            qkv = torch.randn((rows, 2112), generator=shared_gen) * 2
+            qkv = qkv.to(torch.bfloat16).to(device)
+            seen.setdefault(_dcp_path(shared, rows), []).append(rows)
+            for step in range(4):
+                index = step % 2
+                layer, dcp = layers[index], layers[index].draft_dcp
+                fast_cache, stock_cache = cache.clone(), cache.clone()
+                layer.kv_cache = stock_cache
+                q = _stock_query(layer, qkv, stock_cache, slots, positions, world,
+                                 group)  # fmt: skip
+                expected = _stock_dcp(q, stock_cache, metadata, True, layer.W_UV,
+                                      world, rank, interleave, group)  # fmt: skip
+                layer.kv_cache = fast_cache
+                for each in layers:
+                    each.draft_dcp.bind(fast_cache)
+                torch.accelerator.synchronize(device)
+                torch.distributed.barrier()
+                qnorm, kvnorm, qb, uk, qinv, kinv = dcp.query_weights
+                p = dcp.parity
+                shared.queries[rows](
+                    to_cute(qkv), qnorm, kvnorm, qb, uk,
+                    dynamic_view(fast_cache.view(torch.uint8)), to_cute(slots, 8),
+                    qinv, kinv, dcp.eps, to_cute(dcp.scratch[:rows]),
+                    *shared.mailbox(rows, p), Int32(rank), to_cute(positions, 8),
+                    dcp.cos_sin, stream(device),
+                )  # fmt: skip
+                padded = shared.row_modes.get(rows, (rows,))[0]
+                out = torch.empty((padded, heads * 128), dtype=torch.bfloat16,
+                                  device=device)  # fmt: skip
+                dcp.merge(layer, metadata, rows, out, rows_mode=True)
+                torch.accelerator.synchronize(device)
+                torch.distributed.barrier()
+                if not _close(out[:rows], expected):
+                    error = (out[:rows].float() - expected.float()).abs().max()
+                    print(f"rank {rank}: {label} call {step}: max error "
+                          f"{error.item():.4g}")  # fmt: skip
+                    failures += 1
+                live = slots[slots >= 0]
+                ours, ref = (
+                    c.view(torch.uint8)[live // PAGE, live % PAGE]
+                    for c in (fast_cache, stock_cache)
+                )
+                wrong = (ours != ref).float().mean().item() if live.numel() else 0.0
+                if wrong > 0.01:
+                    print(f"rank {rank}: {label}: {wrong:.3%} KV bytes differ")
+                    failures += 1
+                untouched = torch.ones(cache.shape[:2], dtype=torch.bool,
+                                       device=device)  # fmt: skip
+                untouched[live // PAGE, live % PAGE] = False
+                if not torch.equal(fast_cache.view(torch.uint8)[untouched],
+                                   cache.view(torch.uint8)[untouched]):  # fmt: skip
+                    print(f"rank {rank}: {label}: KV written outside its slots")
+                    failures += 1
+        del layers, shared
+        torch.cuda.empty_cache()
+    if rank == 0:
+        print(f"DraftDcp 96h query paths: {sorted(seen.items())}")
     return failures
 
 
@@ -1133,6 +1425,10 @@ def _gpu_main(parts):
         failures += _markov_main(rank, world, device, group)
     if "dcp" in parts:
         failures += _dcp_main(rank, world, device, group)
+    if "dcp96" in parts:
+        failures += _dcp96_main(rank, world, device, group)
+    if "query96" in parts:
+        failures += _query96_main(rank, world, device, group)
     if "context" in parts:
         failures += _context_main(rank, world, device, group)
     if "arnorm" in parts:
@@ -1143,7 +1439,7 @@ def _gpu_main(parts):
 
 
 if __name__ == "__main__":
-    # torchrun ... test_specialized_decode_draft_nq.py [markov] [dcp] [context]
-    # [arnorm] (default: all)
-    parts = sys.argv[1:] or ("markov", "dcp", "context", "arnorm")
+    # torchrun ... test_specialized_decode_draft_nq.py [markov] [dcp] [dcp96]
+    # [query96] [context] [arnorm] (default: all)
+    parts = sys.argv[1:] or ("markov", "dcp", "dcp96", "query96", "context", "arnorm")
     sys.exit(1 if _gpu_main(parts) else 0)

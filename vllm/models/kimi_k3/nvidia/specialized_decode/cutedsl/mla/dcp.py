@@ -232,14 +232,64 @@ class OpenRules(dict):
 LONG_OPEN = {96: (768, 4, (1, 2, 64, 128)), 64: (576, 3, (1, 4, 64, 128))}
 LONG_SPLIT = OpenRules(LONG_SPLIT)
 
+# Packed twins: (gathered heads, q) -> the verify q whose packed core has the same
+# query tiles per request (ceil(heads x q / 128)): 96 x 3 = 288 and 96 x 4 = 384 rows
+# are 3 M128 tiles, 96 x 7 = 672 and 96 x 8 = 768 are 6. A packed core of R = B x q
+# rows at such a q (the 96-head causal drafter, kimi-k3.1-pro-dspark-preview: DL3 q3,
+# DL7 q7) is the twin verify core of the same B requests (B x twin rows) tile for tile,
+# KV tile for KV tile (only the causal mask's last rows differ), so it takes that
+# verify shape's measured split decision (``verify_fold_splits``) and LONG_SPLIT rule:
+# the length-keyed partition (``long_per``) decided on the GPU from each request's own
+# length (graph-safe), in place of tokenspeed's shape-only split, which ran the 96-head
+# drafter's wide rows (and B18-B21) unsplit: the longest AgentX context held the launch
+# (draft eff sweep, 4 x VR200: spec / uniform-length bound 2.6-3.5 at 54-112 rows).
+# Every reader of a rule (the cores' compiles, DcpValue's fold, the work list, the
+# callers' split choice) passes its q, so a shape reads one rule everywhere; the
+# target's verify q (4, 8) has no twin and reads LONG_SPLIT at its own rows as before.
+PACKED_TWIN = {(96, 3): 4, (96, 7): 8}
+# Twin rows the twin verify has no rule for (q4 at odd B below B17: 12-60 rows), as
+# TWIN_FOLD_SPLITS short split, LONG_SPLIT rule: the next request count's (B + 1, its
+# VERIFY_FOLD_SPLITS / LONG_SPLIT entry), read only through a twin (the target's own
+# q4 rows are unchanged). Drafter DL3 B3-B15 (9-45 rows).
+TWIN_LONG_SPLIT = {
+    (12, 96): (4, 8, 64),  # B3 <- B4 (16)
+    (20, 96): (5, 8, 64),  # B5 <- B6 (24)
+    (28, 96): (4, 8, 64),  # B7 <- B8 (32)
+    (36, 96): (3, 8, 64),  # B9 <- B10 (40)
+    (44, 96): (2, 8, 64),  # B11 <- B12 (48)
+    (52, 96): (2, 8, 64),  # B13 <- B14 (56)
+    (60, 96): (2, 8, 64),  # B15 <- B16 (64)
+}
+TWIN_FOLD_SPLITS = {key: rule[0] for key, rule in TWIN_LONG_SPLIT.items()}
 
-def long_split(rows, heads, split, sms):
+
+def split_key(rows, heads, q=None):
+    """(the (rows, heads) key of the split tables, twin): ``rows`` of a packed core at
+    ``q`` read their PACKED_TWIN verify's rows (B x twin q); any other shape (no q,
+    q = 1 rows, the target's verify q) its own rows."""
+    twin = PACKED_TWIN.get((heads, q)) if q else None
+    if twin is None or rows % q:
+        return (rows, heads), False
+    return (rows // q * twin, heads), True
+
+
+def split_rule(rows, heads, q=None):
+    """The LONG_SPLIT rule ``rows`` of ``heads`` gathered heads at ``q`` read (through
+    their packed twin, ``split_key``), or None."""
+    key, twin = split_key(rows, heads, q)
+    if twin and key in TWIN_LONG_SPLIT:
+        return TWIN_LONG_SPLIT[key]
+    return LONG_SPLIT.get(key)
+
+
+def long_split(rows, heads, split, sms, q=None):
     """(short split, long tiles, quantum) of LONG_SPLIT's length-keyed partition when
-    ``rows`` of ``heads`` gathered heads launch its long split on a Rubin-class device
-    (``sms``), else None. An optional 4th LONG_SPLIT field, the quantum q (tiles): a
-    long request of T tiles runs min(launched, ceil(T / q)) equal splits instead of
-    all launched ones (``long_per``); 0: every launched split."""
-    rule = LONG_SPLIT.get((rows, heads))
+    ``rows`` of ``heads`` gathered heads (``q`` rows per request: ``split_key``'s
+    packed twin) launch its long split on a Rubin-class device (``sms``), else None.
+    An optional 4th LONG_SPLIT field, the quantum q (tiles): a long request of T tiles
+    runs min(launched, ceil(T / q)) equal splits instead of all launched ones
+    (``long_per``); 0: every launched split."""
+    rule = split_rule(rows, heads, q)
     if sms <= GB300_SMS or rule is None or split != rule[1]:
         return None
     return rule[0], rule[2], rule[3] if len(rule) > 3 else 0
@@ -788,7 +838,7 @@ class DcpValue:
         self.lse_split = lse_split and fold > 0
         # LONG_SPLIT: the core partitions each request by its own length (valid_splits)
         self.long = (
-            long_split(batch, size * heads, fold, sms) if self.lse_split else None
+            long_split(batch, size * heads, fold, sms, q) if self.lse_split else None
         )
         self.out_scale = out_scale
         # Rubin DcpCore (mla.core): the pushers LSE-merge its ``fold`` split partials
@@ -2172,16 +2222,27 @@ VERIFY_FOLD_SPLITS[28, 64] = 2
 
 def verify_fold_splits(batch, q, heads, max_seq, device):
     """Tokenspeed's split count of the packed verify core (``stock_decode``'s rule at
-    q > 1; ``VERIFY_FOLD_SPLITS`` on Rubin) and its packed rows (tiles x 128)."""
+    q > 1; ``VERIFY_FOLD_SPLITS`` on Rubin) and its packed rows (tiles x 128). A
+    PACKED_TWIN shape (``split_key``) takes its twin verify's decision: tokenspeed's
+    rule and the tables at the twin rows (the same requests and tiles)."""
     from tokenspeed_mla import mla_decode as md
 
     tiles = md.compute_q_tile_layout(heads, q, 128)[1]
+    key, twin = split_key(batch, heads, q)
+    rows, shape_q = batch, q
+    if twin:
+        rows, shape_q = key[0], PACKED_TWIN[heads, q]
+        twin_tiles = md.compute_q_tile_layout(heads, shape_q, 128)[1]
+        assert twin_tiles == tiles, (heads, q, shape_q, tiles, twin_tiles)
     sms = md.get_num_sm(device)
-    args = batch // q, tiles, 128, 512, sms, max_seq, torch.float8_e4m3fn, (128, 128)
-    split = md._get_split_kv_and_workspace_size(*args, fill_splits(batch, device))[0]
+    args = rows // shape_q, tiles, 128, 512, sms, max_seq, torch.float8_e4m3fn
+    args += ((128, 128),)
+    split = md._get_split_kv_and_workspace_size(*args, fill_splits(rows, device))[0]
     if sms > GB300_SMS:
-        split = VERIFY_FOLD_SPLITS.get((batch, heads), split)
-        rule = LONG_SPLIT.get((batch, heads))
+        split = VERIFY_FOLD_SPLITS.get(key, split)
+        if twin:
+            split = TWIN_FOLD_SPLITS.get(key, split)
+        rule = split_rule(batch, heads, q)
         if rule and split == rule[0] and max_seq > 128 * rule[2]:
             split = rule[1]  # (only where some request can pass the long tiles)
     return split, tiles * 128
