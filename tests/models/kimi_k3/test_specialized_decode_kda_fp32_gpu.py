@@ -12,10 +12,11 @@
   state must match bit for bit. The BF16 state (the measured serving dtype) runs the
   same comparison as a control: a mismatch in both dtypes points at the reference
   pair, one in FP32 only at the FP32 head.
-An FP32 state's verify rows run the stock-math plain verify (``KdaVerifyLoopStock`` /
-``KdaSplitStock``, checked against the stock verify in
-``test_specialized_decode_kda_loop_gpu.py``), never the verify heads (KdaSplit's math):
-the FP32 verify head shapes are skipped here (the BF16 rows keep them).
+An FP32 state's pair runs the stock-math ``KdaSplitStock`` (q = 1 and verify; checked
+against the stock layer in ``test_specialized_decode_kda_loop_gpu.py`` /
+``test_specialized_decode_kda_stock_gpu.py``) and the FP32 heads compute its math
+(``KdaHead.stock``), so they match it bit for bit too; the BF16 heads and pair keep
+KdaSplit's math.
 
 One GPU; a few minutes of CuTe compiles on a cold cache."""
 
@@ -144,8 +145,6 @@ def test_kda_head_matches_the_pair(rows, q, polled, state_dtype):
     """KdaHead (plain or polled output) vs in-projection -> PreparedKda, bitwise on
     the output, the recurrent state / checkpoints and the conv state; the head is
     admitted for this shape and dtype (its compile probe passes)."""
-    if q > 1 and state_dtype == torch.float32:
-        pytest.skip("FP32 verify runs the stock-math plain verify, not the head")
     attention = kda_attention()
     g = torch.Generator(device=DEVICE).manual_seed(3)
     weight = torch.randn(PITCH, HIDDEN, generator=g, device=DEVICE) * HIDDEN**-0.5

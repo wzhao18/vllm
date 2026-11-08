@@ -238,17 +238,54 @@ BF16_ONLY, FP32_WIDE, KIND_WIDE = (3, 4), 7, 1
 
 
 class KdaSplitStock(RecoverKdaSplit):
-    """The plain verify (q > 1, gate mode 0) of an FP32 state at the KdaSplit rows:
-    ``recover.KdaSplit`` (the stock Triton verify's formulas and instructions, see its
-    docstring) without records, at ``schedule_of``'s geometry. KdaSplit's L2
-    evict-first hint only marks staged traffic, which verify never stages (its FP32
-    checkpoint stores are predicated and take no hint), so it is dropped here."""
+    """``KdaSplit``'s rows for an FP32 state: ``recover.KdaSplit`` (the stock Triton
+    decode's formulas and instructions, see its docstring) without records, at
+    ``schedule_of``'s geometry: the plain verify (q > 1) at the KdaSplit rows and
+    the q = 1 decode, TP16 (6 heads) and TP8 (12 heads, without KdaSplit's TP8 fast
+    math). The L2 evict-first hint marks staged traffic only (recover's assert):
+    unstaged schedules (every verify's: its FP32 checkpoint stores are predicated and
+    take no hint) drop it.
+
+    F_B (the gate projection, BF16 operands, FP32 accumulation, rounded to BF16 like
+    stock's ``f_b_proj`` output) always runs gate mode 0 with the 8-byte K order:
+    one MMA chain over K in order, which gives stock's BF16 gates bit for bit at
+    every measured shape. TP8's modes 1 (four chains) and 2 (FMA partials) and the
+    16-byte rows (two decays per lane, early 3's staged F_B) sum K in other orders:
+    the same precision, but their BF16 gates sit a rounding off stock's now and
+    then, which moves that feature's decay (TP8 B64 verify: state relerr 1.5e-5 vs
+    stock instead of < 1e-7). So ``gate_mode`` is ignored (the F_A operands are the
+    same for every mode) and early 3 stages the state rows only (early 2).
+
+    VR200 (nqbench kda2-t2: 1 GPU, 69 layers, own cold FP32 slots, CUDA graph, us
+    per layer), KdaSplit (its math, before 2026-11-08) -> KdaSplitStock: TP16 q1 B1
+    1.86 -> 1.82, B8 2.67 -> 2.64, B16 3.32 -> 3.63, B32 4.60 -> 5.19, B64 8.56 ->
+    9.24; TP8 q1 B1 2.25 -> 2.32, B8 5.00 -> 4.77, B16 4.61 -> 5.21, B64 12.98 ->
+    14.51; TP8 verify q4 B1 3.62 -> 3.72, B16 14.89 -> 14.04, B64 39.53 -> 40.57, q8
+    B1 4.98 -> 5.34, B16 24.72 -> 22.60, B64 78.26 -> 82.58. Of that, the stock F_B
+    order costs ~0 on the verify rows (<= 0.6% vs the policy's modes) and +7..13% on
+    the q1 early-3 rows (the F_B staging it drops: TP16 B32 / B64, TP8 B16-64), not
+    serving rows of the spec configs (q > 1); an 8-byte-order F_B staging would
+    recover it.
+
+    "Stock" is the backend the stock layer resolves: in a speculative deployment at
+    the DS conv layout that is the Triton path at every head count (q = 1 and
+    verify). A plain (non-speculative) deployment at 12 / 24 / 48 / 96 heads
+    resolves q = 1 to the CUDA ``fused_kda_decode`` (fast-math exp / rsqrt: state
+    relerr ~1.9e-3 vs Triton), whose math this kernel does not compute (open:
+    ``test_fp32_decode_q1_plain``, strict xfail)."""
 
     bf16_state = False
 
     def __init__(self, heads, batch, gate_mode, has_bias, schedule, tokens):
-        assert tokens > 1 and gate_mode == 0, "KdaSplitStock: plain verify, mode 0"
-        super().__init__(heads, batch, gate_mode, has_bias, tuple(schedule)[:4], tokens)
+        schedule = tuple(schedule)
+        if schedule[0] < 2:  # not staged
+            schedule = schedule[:4]
+        elif schedule[0] == 3:  # no staged F_B rows (their 16-byte K order)
+            schedule = (2, *schedule[1:])
+        super().__init__(heads, batch, 0, has_bias, schedule, tokens)
+        self.narrow_fb = True
+
+
 _VERIFY = {
     "rows": VERIFY_ROWS, "cols": VERIFY_COLS, "wide": VERIFY_WIDE,
     "load_norm": VERIFY_LOAD_NORM,
@@ -286,7 +323,7 @@ def wide_kind(requests, tokens, capability, bf16_state=False, gate_mode=0, heads
     and head count, and the stock-math ``KdaSplitStock`` elsewhere (``make_kernel``);
     ``BF16_ONLY`` values need q <= 4 (else Wide). The wide kernels run gate mode 0
     without fast math (their asserts): other layers (TP8: gate mode 1, 12 heads) keep
-    KdaSplit."""
+    KdaSplit (an FP32 state: ``KdaSplitStock``)."""
     if tokens == 1 or gate_mode != 0 or heads == 12:
         return 0
     table = wide_table(capability, tokens, bf16_state)
@@ -352,11 +389,8 @@ def make_kernel(options, capability, prepared=False) -> KdaSplit:
     rows = rows if isinstance(rows, tuple) else (rows,)
     cols = verify_table("cols", capability, tokens).get(requests)
     wide = wide_kind(requests, tokens, capability, bf16_state, gate_mode, heads)
-    if prepared and not bf16_state:  # no silent fallback: fold only a BF16 state
-        raise ValueError(
-            "the prepared verify (KdaInProj64 operands, KdaSplit's math) needs a BF16 "
-            "state; an FP32 state runs the stock-math plain verify"
-        )
+    # (the prepared kernels compute the stock verify's math for an FP32 state, on
+    # ``KdaInProj64(stock=True)``'s operands)
     if prepared and cols is not None:  # the transposed recurrence
         return KdaVerifyCols(*options, cols)
     if prepared and rows[0] > 1:  # several state rows per thread, operands loaded once
@@ -365,7 +399,7 @@ def make_kernel(options, capability, prepared=False) -> KdaSplit:
         return KdaVerifyPrepared(*options)
     if wide:  # one or two CTAs per (request, head), or the chunked verify
         return WIDE_KINDS[wide - 1](*options)
-    if not bf16_state and tokens > 1 and gate_mode == 0:  # stock math (FP32 state)
+    if not bf16_state:  # stock math (FP32 state): verify, q = 1, TP8
         return KdaSplitStock(*options[:6])
     lean = tokens > 1 and capability in LEAN_VERIFY
     norm = verify_table("load_norm", capability, tokens).get(requests)

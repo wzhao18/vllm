@@ -77,6 +77,7 @@ from ..gemm.splitk import (
     _wait_cluster,
 )
 from .kernel import KdaSplit, load_activation_bf16x4, load_bf16x4
+from .recover import mul_rn, triton_decay, triton_rstd, triton_sigmoid, triton_silu
 
 logger = init_logger(__name__)
 
@@ -285,6 +286,13 @@ class KdaHead(SplitKGemm):
         kda = KdaSplit(heads, 8, 0, has_bias, (1, 16, 0, 2), 1, bf16_state)
         kda.wave, kda.evict = kda.passes, True  # one wave; evict-first state stores
         self.kda = kda
+        # An FP32 state (the production precision) computes the stock decode's math
+        # (native Triton causal_conv1d_update -> fused_recurrent_kda -> rms_norm_gated,
+        # ``recover.KdaSplit``'s formulas: the conv's SiLU outputs and the recurrence's
+        # outputs rounded to BF16, Triton's exp / sigmoid / sqrt / divide); a BF16 state
+        # keeps KdaSplit's (unrounded SiLU and recurrence outputs, fast rsqrt / exp).
+        # The operations' order is the same either way.
+        self.stock = not bf16_state
         self.late_rearm = False  # re-arm F_A's counter after the decays (not before)
         self.fa_poll = False  # poll F_A's rows (sentinel), its counter as the fallback
         # ``polled_out`` (KdaHeadWide, Rubin TP16 B8, see ``POLLED_OUT``): the output
@@ -587,9 +595,7 @@ class KdaHead(SplitKGemm):
                     if quarter & 1:
                         selected = acc[2 * r + 1, 2]
                 raw_g = Float32(BFloat16(selected))
-                gate = cute.math.exp(a, fastmath=True) * (raw_g + dt[r])
-                gate = sigmoid(gate, False)
-                decay.append(cute.math.exp(lower_bound * gate, fastmath=True))
+                decay.append(self.head_decay(a, raw_g, dt[r], lower_bound))
             packet, destination = lane % 16, lane // 16
             values = cute.make_rmem_tensor(4, Float32)
             for e in cutlass.range_constexpr(4):
@@ -607,10 +613,78 @@ class KdaHead(SplitKGemm):
             words = tuple(float_bits(values[e]) for e in range(4))
             store_async_dsmem(pointer, words, barrier, 2 * token + destination)
             if lane == 0:
-                beta_gate = sigmoid(Float32(beta), False)
+                beta_gate = self.activate(Float32(beta))
                 push_float(shared_beta.iterator, beta_gate, barrier, rank)
         if cutlass.const_expr(self.late_rearm):
             self.rearm(counter, target, lane, fa_beta)
+
+    # The recurrence's activations and norms by ``self.stock`` (the stock Triton
+    # formulas for an FP32 state, else KdaSplit's), shared with KdaHeadVerify / Multi;
+    # plain methods traced inline (``stock`` and ``scale is None`` are Python values).
+    def silu(self, value):
+        """The conv output's SiLU (stock: x / (1 + exp(-x)) rounded to BF16)."""
+        result = Float32(0)
+        if cutlass.const_expr(self.stock):
+            result = triton_silu(value)
+        else:
+            result = value * sigmoid(value, False)
+        return result
+
+    def activate(self, value):
+        """The sigmoid of an output gate or beta."""
+        result = Float32(0)
+        if cutlass.const_expr(self.stock):
+            result = triton_sigmoid(value)
+        else:
+            result = sigmoid(value, False)
+        return result
+
+    def head_decay(self, a_log, raw_g, dt, lower_bound):
+        """exp(lower_bound * sigmoid(exp(A_log) * (raw_g + dt_bias)))."""
+        decay = Float32(0)
+        if cutlass.const_expr(self.stock):
+            decay = triton_decay(a_log, raw_g, dt, lower_bound)
+        else:
+            gate = cute.math.exp(a_log, fastmath=True) * (raw_g + dt)
+            gate = sigmoid(gate, False)
+            decay = cute.math.exp(lower_bound * gate, fastmath=True)
+        return decay
+
+    def inverse_sqrt(self, value):
+        """1 / sqrt(value) (the norms' factors)."""
+        result = Float32(0)
+        if cutlass.const_expr(self.stock):
+            result = triton_rstd(value)
+        else:
+            result = cute.math.rsqrt(value, fastmath=True)
+        return result
+
+    def norm_factor(self, squares, scale=None):
+        """The L2 norm factor of q (``scale``: times the query scale, KdaSplit's) or k
+        from the sum of squares plus epsilon; ``normalized`` applies it."""
+        factor = self.inverse_sqrt(squares)
+        if cutlass.const_expr(scale is not None and not self.stock):
+            factor = factor * scale
+        return factor
+
+    def normalized(self, value, factor, scale=None):
+        """The value x ``norm_factor`` (stock: q / |q|, then x scale, as Triton)."""
+        result = Float32(0)
+        if cutlass.const_expr(self.stock):
+            result = mul_rn(value, factor)
+            if cutlass.const_expr(scale is not None):
+                result = mul_rn(result, scale)
+        else:
+            result = value * factor
+        return result
+
+    def round_output(self, value):
+        """A recurrence output (stock: rounded to BF16, as fused_recurrent_kda stores
+        it, before the gated RMS norm)."""
+        result = value
+        if cutlass.const_expr(self.stock):
+            result = Float32(BFloat16(value))
+        return result
 
     @cute.jit
     def poll_fa(self, fa_beta, counter, target, token, quarter, head):
@@ -755,10 +829,8 @@ class KdaHead(SplitKGemm):
                 for i in cutlass.range_constexpr(4):
                     term = Float32(taps[s, i] if i < 3 else inputs[s])
                     accum[s] = fma(term, Float32(coeff[s, i]), accum[s])
-            q = accum[0] * sigmoid(accum[0], False)
-            k = accum[1] * sigmoid(accum[1], False)
-            v = accum[2] * sigmoid(accum[2], False)
-            out_gate = sigmoid(Float32(gate_in), False)
+            q, k, v = self.silu(accum[0]), self.silu(accum[1]), self.silu(accum[2])
+            out_gate = self.activate(Float32(gate_in))
             shared_q[kt] = q
             shared_k[kt] = k
             if kt < 64:
@@ -771,8 +843,8 @@ class KdaHead(SplitKGemm):
             r = lambda i: reductions[i]
             qn = (r(0) + r(2)) + (r(1) + r(3))
             kn = (r(4) + r(6)) + (r(5) + r(7))
-            fq = cute.math.rsqrt(qn + 1.0e-6, fastmath=True) * scale
-            fk = cute.math.rsqrt(kn + 1.0e-6, fastmath=True)
+            fq = self.norm_factor(qn + 1.0e-6, scale)
+            fk = self.norm_factor(kn + 1.0e-6)
             qr = cute.make_rmem_tensor((self.kda.chunks, 4), Float32)
             kr = cute.make_rmem_tensor((self.kda.chunks, 4), Float32)
             for j in cutlass.range_constexpr(self.kda.chunks):
@@ -780,8 +852,8 @@ class KdaHead(SplitKGemm):
                 q4 = load_f32x4(shared_q.iterator + column, shared=True)
                 k4 = load_f32x4(shared_k.iterator + column, shared=True)
                 for e in cutlass.range_constexpr(4):
-                    qr[j, e] = q4[e] * fq
-                    kr[j, e] = k4[e] * fk
+                    qr[j, e] = self.normalized(q4[e], fq, scale)
+                    kr[j, e] = self.normalized(k4[e], fk)
             wait(bar_gate)
             decays = []
             for j in cutlass.range_constexpr(self.kda.chunks):
@@ -798,7 +870,8 @@ class KdaHead(SplitKGemm):
                 if group_lane == 0:
                     position = self.kda.output_position(value_base + row)
                     dst = shared_o.iterator + position
-                    store_async_dsmem(dst, float_bits(dots[p]), bar_out, owner)
+                    o = self.round_output(dots[p])
+                    store_async_dsmem(dst, float_bits(o), bar_out, owner)
             self.kda.store_rows(history, state_row, (0, self.kda.passes), lanes)
             if kt < 64:
                 window = (taps[2, 1], taps[2, 2], inputs[2])
@@ -814,7 +887,7 @@ class KdaHead(SplitKGemm):
                     s0, s1, s2, s3 = (o * o for o in o4)
                     sums[g] = warp_sum((s0 + s2) + (s1 + s3), 8)
                 sumsq = (sums[0] + sums[2]) + (sums[1] + sums[3])
-                rstd = cute.math.rsqrt(sumsq * (1.0 / 128) + eps, fastmath=True)
+                rstd = self.inverse_sqrt(sumsq * (1.0 / 128) + eps)
                 value = raw_o * rstd * nw * out_gate
                 if cutlass.const_expr(self.polled_out):
                     store_bf16_canonical(at(output, token, qk_channel), value)
