@@ -57,6 +57,8 @@ def _wlist_kernel(
     SHORT: tl.constexpr,
     THR: tl.constexpr,
     QUANT: tl.constexpr,
+    quant,
+    CAKE: tl.constexpr,
     P: tl.constexpr,
     PB: tl.constexpr,
     NSLOTS: tl.constexpr,
@@ -77,7 +79,10 @@ def _wlist_kernel(
     # min(SPLIT, ceil(tiles / QUANT)) equal splits
     short = tl.maximum((tiles + SHORT - 1) // SHORT, 1)
     splits = SPLIT
-    if QUANT > 0:
+    if CAKE:  # the step's cake quantum (StepQuant: written before this kernel)
+        qd = tl.load(quant)
+        splits = tl.minimum(SPLIT, tl.maximum((tiles + qd - 1) // qd, 1))
+    elif QUANT > 0:
         splits = tl.minimum(SPLIT, (tiles + QUANT - 1) // QUANT)
         splits = tl.maximum(splits, 1)
     per = tl.maximum((tiles + splits - 1) // splits, 1)
@@ -110,6 +115,75 @@ def _wlist_kernel(
         tl.debug_barrier()
         load += tl.load(bins + p)
         tl.debug_barrier()
+
+
+@triton.jit
+def _quant_kernel(
+    lens,
+    out,
+    NREQ: tl.constexpr,
+    RB: tl.constexpr,
+    FLOOR: tl.constexpr,
+    LAUNCHED: tl.constexpr,
+    SB: tl.constexpr,
+    PAIRS: tl.constexpr,
+    QTILES: tl.constexpr,
+    OVER: tl.constexpr,
+):
+    # mla.dcp.cake_quant (its host twin): candidates s = 1 .. LAUNCHED (rows) over the
+    # requests (columns), the least modelled makespan, ties to the smaller s
+    i = tl.arange(0, RB)
+    n = tl.load(lens + i, mask=i < NREQ, other=0)
+    tiles = tl.where(n > 0, (n + 127) // 128, 0)
+    top = tl.max(tiles, 0)
+    total = tl.sum(tiles, 0)
+    s = tl.arange(0, SB) + 1
+    quant = tl.maximum((top + s - 1) // s, FLOOR)
+    t2 = tiles[None, :]
+    q2 = quant[:, None]
+    splits = tl.minimum(LAUNCHED, tl.maximum((t2 + q2 - 1) // q2, 1))
+    splits = tl.where(t2 > 0, splits, 0)
+    per = tl.where(splits > 0, (t2 + splits - 1) // tl.maximum(splits, 1), 0)
+    largest = tl.max(per, 1)
+    count = tl.maximum(tl.sum(splits, 1), 1)
+    waves = (count * QTILES + PAIRS - 1) // PAIRS
+    cost = tl.maximum(4 * largest, waves * (4 * total // count)) + waves * OVER
+    cost = tl.where(s <= LAUNCHED, cost, 1 << 28)
+    key = cost.to(tl.int64) * SB + (s - 1)
+    pick = tl.min(key, 0) % SB
+    tl.store(out, tl.sum(tl.where(s - 1 == pick, quant, 0), 0))
+
+
+class StepQuant:
+    """A drafter cake rule's per-step quantum (mla.dcp DRAFT_LONG_SPLIT, ``long_split``
+    6 fields: (short, long tiles, floor, pairs, q tiles, over)) at ``launched``
+    splits: one int32 device word, rewritten each step by the first drafter layer
+    from the requests' local lengths (one small kernel, captured with the step; mla.dcp
+    ``cake_quant`` is its host twin), before any core. The cores (core_ts
+    QUANT_WORD), DcpValue's fold (``quant_at``) and the work list read it, so every
+    reader of a request's partition sees the same quantum."""
+
+    def __init__(self, reqs, long, launched, device):
+        assert len(long) == 6 and long[2] >= 1 and long[3] >= 1, long
+        self.reqs, self.long, self.launched = reqs, tuple(long), int(launched)
+        self.buffer = torch.full((1,), long[2], dtype=torch.int32, device=device)
+        self.address = self.buffer.data_ptr()
+
+    def build(self, lengths):
+        """Write this step's quantum from the requests' local lengths (int32)."""
+        _quant_kernel[(1,)](
+            lengths,
+            self.buffer,
+            NREQ=self.reqs,
+            RB=max(16, triton.next_power_of_2(self.reqs)),
+            FLOOR=self.long[2],
+            LAUNCHED=self.launched,
+            SB=max(16, triton.next_power_of_2(self.launched)),
+            PAIRS=self.long[3],
+            QTILES=self.long[4],
+            OVER=self.long[5],
+            num_warps=4,
+        )
 
 
 _LISTS: dict = {}
@@ -150,6 +224,7 @@ class WorkList:
             SHORT=long[0],
             THR=long[1],
             QUANT=long[2],
+            CAKE=len(long) > 3,
             P=pairs,
             PB=triton.next_power_of_2(pairs),
             NSLOTS=self.slots,
@@ -163,10 +238,15 @@ class WorkList:
             (words,), WLIST_EMPTY, dtype=torch.int32, device=device
         )
 
-    def build(self, lengths):
-        """Write this step's list from the requests' local lengths (int32 [reqs])."""
+    def build(self, lengths, quant=None):
+        """Write this step's list from the requests' local lengths (int32 [reqs]);
+        ``quant``: a cake rule's StepQuant (built first this step)."""
+        assert (quant is not None) == self.shape["CAKE"], "the cake list needs its word"
         scratch = self.buffer[self.slots :]
-        _wlist_kernel[(1,)](lengths, self.buffer, scratch, **self.shape, num_warps=4)
+        word = self.buffer if quant is None else quant.buffer  # (unread: no cake)
+        _wlist_kernel[(1,)](
+            lengths, self.buffer, scratch, quant=word, **self.shape, num_warps=4
+        )
 
     def table(self, table):
         """``table`` (``core_q.verify_table``) with the list's address in words 6-7."""

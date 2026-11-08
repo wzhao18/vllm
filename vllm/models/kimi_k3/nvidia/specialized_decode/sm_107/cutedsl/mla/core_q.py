@@ -164,11 +164,16 @@ def polled_q_core(batch, valid=0, persistent=False, push=None, long=None, wlist=
     return TsCoreQ
 
 
-def verify_table(query_box, reqs, device):
+def verify_table(query_box, reqs, device, quant=None):
     """The core's address table (``mla.dcp.fork_table``'s layout, one word per request
-    at least): this parity's q mailbox address in words 0-1; the x words are unused."""
+    at least): this parity's q mailbox address in words 0-1; the x words are unused;
+    (mla.wlist) the work list's address in words 6-7 (``WorkList.table``) and
+    ``quant``'s (a drafter cake rule's step quantum word, mla.wlist.StepQuant) in
+    words 8-9 (core_ts.QUANT_WORD)."""
     address = query_box.data_ptr()
-    words = [address & 0xFFFFFFFF, address >> 32] + [0] * (max(8, reqs) - 2)
+    words = [address & 0xFFFFFFFF, address >> 32] + [0] * (max(10, reqs) - 2)
+    if quant is not None:
+        words[8:10] = [quant.address & 0xFFFFFFFF, quant.address >> 32]
     table = torch.tensor(words, dtype=torch.int64).to(torch.int32)  # wraps
     return table.to(device)
 
@@ -198,7 +203,7 @@ def push_table(query_box, reqs, box, parity, device, flags):
 
 def compile_polled_q(
     heads, page, split, reqs, q, cp, device, causal=True, valid=0, persistent=False,
-    push=None, wlist=False,
+    push=None, wlist=False, draft=0,
 ):  # fmt: skip
     """``compile_split_partials_q`` with ``polled_q_core``'s polled q intake (the
     split argument slot carries ``verify_table``; ``valid``: the VALID_VERIFY mode;
@@ -208,9 +213,10 @@ def compile_polled_q(
     (a workspace would take FP32 partials of the one split, for a reducer). ``push``
     (split 1, persistent): the core push's ``early`` (``polled_core``; the slot carries
     ``push_table``); None: no core push. ``wlist`` (persistent, no push): the work
-    list after the table's address words (``polled_core``)."""
+    list after the table's address words (``polled_core``). ``draft``: the drafter's
+    DCP size (mla.dcp.split_rule: its own LONG_SPLIT rules and twins; 0: the target)."""
     mode = int(valid)
-    key = heads, page, split, reqs, q, cp, device, causal, mode
+    key = heads, page, split, reqs, q, cp, device, causal, mode, int(draft)
     if push is not None:
         assert split == 1 and persistent, "the core push: split 1, persistent only"
         where = cp[0], cp[1], heads // cp[0], q, int(push)
@@ -225,14 +231,14 @@ def compile_polled_q(
 
 @cache
 def _compile_polled_q(
-    heads, page, split, reqs, q, cp, device, causal, valid, persistent=False, push=None,
-    wlist=False,
+    heads, page, split, reqs, q, cp, device, causal, valid, draft, persistent=False,
+    push=None, wlist=False,
 ):  # fmt: skip
     from tokenspeed_mla import mla_decode as md
 
     base = md.BlackwellMultiHeadLatentAttentionForwardFP8
     sms = md.get_num_sm(torch.device("cuda", device))
-    long = long_split(reqs * q, heads, split, sms)
+    long = long_split(reqs * q, heads, split, sms, q, draft)
     md.BlackwellMultiHeadLatentAttentionForwardFP8 = _without_reducer(
         polled_q_core(reqs * q, valid, persistent, push, long, wlist)
     )
@@ -272,7 +278,7 @@ def _compile_polled_q(
 
 def polled_partials_q(
     query, cache, block_table, lengths, totals, scales, out, lse, split, cp, table,
-    causal=True, valid=0, persistent=False, push=None, wlist=False,
+    causal=True, valid=0, persistent=False, push=None, wlist=False, draft=0,
 ):  # fmt: skip
     """``split_partials_q`` with the polled q intake: ``query`` is the (ungathered)
     q mailbox view [requests, q, H, 576]; ``table``: ``verify_table`` of it;
@@ -287,8 +293,9 @@ def polled_partials_q(
     device, page = query.device, cache.shape[1]
     key = heads, page, split, reqs, q, cp, device.index
     kernel = compile_polled_q(
-        *key, causal, valid=valid, persistent=persistent, push=push, wlist=wlist
-    )
+        *key, causal, valid=valid, persistent=persistent, push=push, wlist=wlist,
+        draft=draft,
+    )  # fmt: skip
     rows = md.compute_q_tile_layout(heads, q, 128)[1] * 128
     # (split 1: no workspace, the rows and LSEs go straight to ``out`` / ``lse``)
     buf = split_workspace_ts(device, rows, reqs, split)[0] if split > 1 else None
