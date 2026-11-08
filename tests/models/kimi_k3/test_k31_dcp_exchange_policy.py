@@ -75,8 +75,8 @@ def test_stock_tie_rule():
     per-shape row floor."""
     assert decode.TIE_ORDER == "global"
     assert decode.ONE_ROUND_ROWS == 256
-    # DCP16 (C1 / C8): steps up to 16 rows keep the #63 merge; other DCP sizes: all
-    assert decode.MIN_ROWS == {16: 17}
+    # DCP16 (C1 / C8): steps up to 64 rows keep the #63 merge; other DCP sizes: all
+    assert decode.MIN_ROWS == {16: 65}
 
 
 def _launcher(resident: dict[int, int], fit_wave: bool = True):

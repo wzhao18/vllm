@@ -53,12 +53,13 @@ ONE_ROUND_ROWS = 256
 # Fewest rows a step needs for the exchange's top-k, by DCP size (others: 1); smaller
 # steps keep the #63 one-round DCP top-k merge (stock ties too), which the DSA sparse
 # core also reads.
-# 16-rank step (TP16 = DCP16, AgentX, q8, new drafter, stock-precision core; us per
-# step, exchange at every row / #63 merge up to 16 rows): B1 M8 5289 / 4919, B2 M16
-# 7205 / 6805. The stock tie rule's extra NVLink round costs the exchange 8.3-9.2 us
-# per call at DCP16 q8 rows 8-64 (ties straddle ranks on every row of bf16 logits;
+# 16-rank step (TP16 = DCP16, AgentX, q8, new drafter, stock-precision sparse core; us
+# per step, exchange / #63 merge, both with stock ties): B1 M8 5289 / 4919, B2 M16
+# 7205 / 6805, B4 M32 9499-9551 / 9091-9092, B8 M64 11750-11793 / 11310-11312. The
+# stock tie rule's extra NVLink round costs the exchange 8.3-9.2 us per call at DCP16
+# q8 rows 8-64 (ties straddle ranks on every row of bf16 logits;
 # bench_dcp_topk_ties.py), 1.3-8.2 at q4 rows 64-512, 13.8-14.8 at DCP4 rows 512.
-MIN_ROWS = {16: 17}
+MIN_ROWS = {16: 65}
 # Most bf16 keys a top-k CTA stages in shared memory (the kernel's 96 KB opt-in), and
 # a bound on its static shared memory (bytes).
 SMEM_KEYS = 48 * 1024
