@@ -43,8 +43,11 @@ def sm(monkeypatch):
 @pytest.mark.parametrize(
     "tp,dcp,cap,mx,expected",
     [
-        (16, 16, (10, 7), True, True),  # on by policy: no switch
-        (4, 4, (10, 7), True, True),  # C512's TP4 = DCP4 groups
+        (4, 4, (10, 7), True, True),  # on by policy (no switch): C512's TP4 = DCP4
+        (8, 8, (10, 7), True, True),
+        (16, 16, (10, 7), True, False),  # DCP16 (MERGE_DCP): the #63 merge
+        (4, 4, (10, 0), True, False),  # measured on SM107 only
+        (4, 4, (10, 7), False, False),  # no bf16 MX-scaled logits
         (16, 8, (10, 7), True, False),  # DCP < TP: the stock path
         (8, 4, (10, 7), True, False),
         (16, 1, (10, 7), True, False),  # no DCP
@@ -67,20 +70,20 @@ def test_wanted(sm, tp, dcp, cap, mx, expected):
 )
 def test_wanted_kv_role(sm, kv_role, expected):
     sm(10, 7)
-    assert decode.wanted(_config(16, 16, kv_role)) is expected
+    assert decode.wanted(_config(4, 4, kv_role)) is expected
 
 
 def test_stock_tie_rule():
     """Ties at the K-th key go by ascending global id, the stock merge's rule (no
-    other tie order is selectable); the per-shape row floor."""
+    other tie order is selectable); the DCP sizes that keep the #63 merge."""
     import inspect
 
     from vllm.models.kimi_k3.nvidia.dsa_kernels.dcp_exchange.ops import DcpExchange
 
     assert "tie_order" not in inspect.signature(DcpExchange.topk_merge).parameters
     assert decode.ONE_ROUND_ROWS == 256
-    # DCP16 (C1 / C8): steps up to 64 rows keep the #63 merge; other DCP sizes: all
-    assert decode.MIN_ROWS == {16: 65}
+    # DCP16 (C1-C256): the #63 merge at every row (faster at rows 8-512, measured)
+    assert decode.MERGE_DCP == {16}
 
 
 def _launcher(resident: dict[int, int], fit_wave: bool = True):
