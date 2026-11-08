@@ -404,43 +404,87 @@ def test_packed_twin_keys():
                 assert dcp.split_rule(rows, heads, q) == rule
     assert dcp.split_rule(12, 96, 3) is None
     assert dcp.long_split(12, 96, 8, 200, 3) is None
-    # The drafter's seam rows (DL3 B18 / B19 / B21, DL7 B9) at DCP16: the twin's
-    # (2, 8, 64); at DCP4 (DL3) its own (2, 16, 64, 64).
+    # The drafter's seam rows (DL3 B18 / B19 / B21, DL7 B9): its cake rule at both
+    # DCP sizes (the twin's short split 2, its launched split), only at that split.
     sms = 200
-    for rows, q in ((54, 3), (57, 3), (63, 3), (63, 7)):
-        assert dcp.long_split(rows, 96, 8, sms, q, 16) == (2, 64, 0), rows
-        assert dcp.long_split(rows, 96, 2, sms, q, 16) is None  # (the short split)
-        assert dcp.long_split(rows, 96, 8, 148, q, 16) is None  # (GB300: no rule)
-    for rows in (54, 57, 63):
-        assert dcp.long_split(rows, 96, 16, sms, 3, 4) == (2, 64, 64), rows
-        assert dcp.long_split(rows, 96, 8, sms, 3, 4) is None
-    # Odd DL3 batches below B17 (no q4 rule): the next batch's rule, twin only.
-    assert dcp.split_rule(9, 96, 3, 16) == (4, 8, 64)
+    for size in (4, 16):
+        _, floor, over = dcp.DRAFT_CAKE[size][0]
+        for rows, q in ((54, 3), (57, 3), (63, 3), (63, 7)):
+            qtiles = -(-q * 96 // 128)
+            launched = dcp.split_rule(rows, 96, q, size)[1]
+            long = dcp.long_split(rows, 96, launched, sms, q, size)
+            want = (2, 0, floor, sms // 2, qtiles, over)
+            assert long == want, (rows, q, size)
+            assert dcp.long_split(rows, 96, 2, sms, q, size) is None  # (short split)
+            assert dcp.long_split(rows, 96, launched, 148, q, size) is None  # (GB300)
+    # Odd DL3 batches below B17 (no q4 rule): the next batch's short split, twin only.
+    assert dcp.split_rule(9, 96, 3, 16)[0] == 4
     assert dcp.split_rule(12, 96, 4, 16) is None
     assert dcp.TWIN_FOLD_SPLITS[12, 96] == 4
 
 
-def test_draft_rules_by_dcp_size():
-    """The 96-head drafter's measured rules (mla.dcp DRAFT_LONG_SPLIT) by its DCP size:
-    DL3 B3-B21 at DCP4 launch 16 splits (quantum 64 tiles; 32 at 9 / 18 rows), DL3
-    21 / 24 rows at DCP16 (16, 32); each keeps its twin rule's short split and long
-    tiles; every other drafter row and DCP size reads the twin's, the target none."""
+def test_draft_cake_rules():
+    """The 96-head drafter's cake rules (mla.dcp DRAFT_LONG_SPLIT, per DCP size
+    DRAFT_CAKE): every DL3 / DL7 fold and wide row whose twin launches a split above
+    1, with the twin's short split, long tiles 0 (every request on the per-step
+    quantum), the fold rows at DRAFT_CAKE's launched split and the wide rows at the
+    twin's (its workspace); the target reads none of them."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.mla import dcp
 
     for (rows, heads, q, size), rule in dcp.DRAFT_LONG_SPLIT.items():
         key = (rows // q * dcp.PACKED_TWIN[heads, q], heads)
         twin = dcp.TWIN_LONG_SPLIT.get(key) or dcp.LONG_SPLIT[key]
-        assert rule[0] == twin[0] and rule[2] == twin[2]
-        assert rule[1] == 16 and dcp.split_rule(rows, heads, q, size) == rule
+        fold, wide = dcp.DRAFT_CAKE[size]
+        want = (twin[1], *wide) if rows > 64 else fold
+        launched = want[0]
+        if rows <= 64:
+            launched = dcp.DRAFT_CAKE_LAUNCHED[size].get((q, rows), launched)
+        assert rule == (twin[0], launched, 0, want[1], want[2])
+        assert dcp.split_rule(rows, heads, q, size) == rule
         assert dcp.split_rule(rows, heads, q) == dcp.LONG_SPLIT.get((rows, heads))
-    assert {r for r, _, q, size in dcp.DRAFT_LONG_SPLIT if size == 4} == set(
-        range(9, 64, 3)
-    )
-    assert dcp.split_rule(9, 96, 3, 4) == (4, 16, 64, 32)
-    assert dcp.split_rule(24, 96, 3, 4) == (4, 16, 64, 64)  # (twin B8: (32, 96))
-    assert dcp.split_rule(24, 96, 3, 16) == (4, 16, 64, 32)
-    assert dcp.split_rule(27, 96, 3, 16) == dcp.split_rule(27, 96, 3, 8) == (3, 8, 64)
-    assert dcp.split_rule(66, 96, 3, 4) == dcp.split_rule(66, 96, 3, 16)
+    for size in (4, 16):
+        assert {r for r, _, q, s in dcp.DRAFT_LONG_SPLIT if s == size and q == 3} == (
+            set(range(9, 481, 3))
+        )
+        assert {r for r, _, q, s in dcp.DRAFT_LONG_SPLIT if s == size and q == 7} == (
+            set(range(14, 449, 7))
+        )
+    assert dcp.split_rule(66, 96, 3, 4)[1] == dcp.LONG_SPLIT[88, 96][1]
+
+
+def test_cake_partition():
+    """The cake partition (mla.dcp ``cake_quant`` + ``long_per``, host twins of the
+    device word and the cores' / DcpValue's partition): a uniform batch takes the
+    most splits that still fit one wave of items (not the ones just past a wave),
+    one long request among short ones takes the launched splits and the short ones
+    one or two; every partition covers its request's tiles exactly once
+    (contiguous splits, the last one partial)."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.mla import dcp
+
+    sms, q, launched = 212, 3, 16
+    long = (2, 0, 16, 106, 3, 112)  # (short, long tiles, floor, pairs, q tiles, over)
+
+    def splits(lengths):
+        quant = dcp.cake_quant(lengths, launched, long)
+        out = []
+        for n in lengths:
+            tiles = -(-n // 128)
+            per = dcp.long_per_host(tiles, launched, long, quant)
+            filled = -(-tiles // per) if tiles else 0
+            assert filled <= launched and (filled - 1) * per < tiles <= filled * per
+            out.append(filled)
+        return out
+
+    # DL3 B6, 390 tiles each: 5 splits (90 items: one wave of 78 tiles), not 6 (108
+    # items: a second wave) nor 11 (2 waves of 36)
+    assert splits([390 * 128] * 6) == [5] * 6
+    skewed = splits([1560 * 128] + [100 * 128] * 5)
+    assert skewed[0] == launched and max(skewed[1:]) <= 2
+    assert splits([16 * 128] * 18) == [1] * 18  # (the floor: one split each)
+    assert splits([0, 5_000])[0] == 0
+    assert dcp.cake_quant([0, 0], launched, long) == 16
+    rule = dcp.long_split(54, 96, dcp.DRAFT_CAKE[4][0][0], sms, q, 4)
+    assert rule[3:] == (sms // 2, 3, dcp.DRAFT_CAKE[4][0][2])
 
 
 @pytest.mark.parametrize("strict, gather_q, raises", [
@@ -1782,6 +1826,195 @@ def _arnorm_main(rank, world, device, group):
     return failures
 
 
+def _cake_inputs(sets, steps, world, rank, interleave, gen, pages_gen, device, heads):
+    """KV pages for every request at its longest total over the length ``sets`` (one
+    list of global totals per set), the global FP8 query rows, and metadata at
+    ``sets[0]`` (its tensors rewritten in place for the other sets: a shorter total
+    reads a prefix of the same local pages)."""
+    reqs, rows = len(sets[0]), len(sets[0]) * steps
+    top = [max(s[r] for s in sets) for r in range(reqs)]
+    q = torch.randn((rows, world * heads, 576), generator=gen, device="cpu") * 0.5
+    q = q.to(torch.float8_e4m3fn).view(torch.uint8)
+    q[q == 0x80] = 0  # (no chunk starts with the validity sentinel)
+    local = [_local_len(t, world, rank, interleave) for t in top]
+    pages = [max(1, -(-n // PAGE)) for n in local]
+    blocks = sum(pages) + 1
+    order = torch.randperm(blocks - 1, generator=pages_gen) + 1
+    table = torch.zeros((reqs, max(pages)), dtype=torch.int32)
+    used = 0
+    for r, n in enumerate(pages):
+        table[r, :n] = order[used : used + n]
+        used += n
+    table = table.to(device)
+    cache = torch.zeros((blocks, PAGE, 576), dtype=torch.uint8, device=device)
+    for r, total in enumerate(top):
+        g = torch.Generator(device=device).manual_seed(9000 + r)
+        t = torch.arange(total, device=device)
+        mine = (t // interleave) % world == rank
+        kv = torch.randn((int(mine.sum()), 576), generator=g, device=device) * 0.5
+        kv = kv.to(torch.float8_e4m3fn).view(torch.uint8)
+        t = t[mine]
+        position = (t // (interleave * world)) * interleave + t % interleave
+        cache[table[r].long()[position // PAGE], position % PAGE] = kv
+    i32 = dict(dtype=torch.int32, device=device)
+    first = [_local_len(t, world, rank, interleave) for t in sets[0]]
+    metadata = SimpleNamespace(
+        decode=SimpleNamespace(
+            block_table=table,
+            seq_lens=torch.tensor(first, **i32),
+            dcp_tot_seq_lens=torch.tensor(sets[0], **i32),
+        ),
+        num_decodes=reqs,
+        num_decode_tokens=rows,
+        num_prefills=0,
+        max_seq_len=max(top),
+        causal=True,
+    )
+    return cache.view(torch.float8_e4m3fn), q.to(device), metadata
+
+
+def _cake_main(rank, world, device, group, interleave=1):
+    """The drafter's cake rule (mla.dcp DRAFT_LONG_SPLIT: per-step quantum on the
+    GPU, mla.wlist.StepQuant) at the production gathered heads (96, causal), C512's
+    DCP4 rules (and the DCP16 rules mapped onto this DCP4 group, ``as16``): one CUDA
+    graph per rows captured once, replayed over skewed (one 600k context), uniform
+    (every request at the skewed batch's mean) and short (below the quantum floor)
+    lengths rewritten in place. Each replay against the stock path, and the step
+    quantum word against its host twin (mla.dcp.cake_quant) from this rank's local
+    lengths: the partition follows the lengths of the replayed step."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.mla import core_q, dcp
+
+    if world != 4:
+        print(f"rank {rank}: the cake check runs the 96-head drafter at DCP4")
+        return 0
+    heads, failures = 96 // world, 0
+    saved = dict(dcp.DRAFT_LONG_SPLIT)
+    for role in (4, 16):
+        # (role 16: the DCP16 entries on this DCP4 group; the polled cores' compile
+        # cache is keyed by shape, not rule: cleared per role)
+        core_q._compile_polled_q.cache_clear()
+        dcp.DRAFT_LONG_SPLIT.clear()
+        dcp.DRAFT_LONG_SPLIT.update({
+            (r, h, q, 4): rule for (r, h, q, size), rule in saved.items()
+            if size == role
+        })  # fmt: skip
+        for steps, rows_list in ((3, [12, 54, 120]), (7, [63, 112])):
+            gen = torch.Generator().manual_seed(6100 + steps + role)
+            for rows in rows_list:
+                failures += _cake_case(rows, steps, role, world, rank, group, device,
+                                       interleave, heads, gen)  # fmt: skip
+    dcp.DRAFT_LONG_SPLIT.clear()
+    dcp.DRAFT_LONG_SPLIT.update(saved)
+    core_q._compile_polled_q.cache_clear()
+    return failures
+
+
+def _cake_case(rows, steps, role, world, rank, group, device, interleave, heads, gen):
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.draft.attention import (  # noqa: E501
+        DraftDcp,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.mla import dcp
+
+    reqs = rows // steps
+    rest = torch.randint(3000, 20000, (reqs - 1,), generator=gen).tolist()
+    skewed = [600_000] + rest
+    mean = sum(skewed) // reqs
+    short = torch.randint(steps + 2, 4000, (reqs,), generator=gen).tolist()
+    sets = {"skewed": skewed, "uniform": [mean] * reqs, "short": short}
+    pages_gen = torch.Generator().manual_seed(77 + rank)
+    inputs = world, rank, interleave, gen, pages_gen, device, heads
+    cache, q, metadata = _cake_inputs(list(sets.values()), steps, *inputs)
+    layers = [
+        _DraftAttention(gen, device, cache, world, rank, interleave, heads)
+        for _ in (0, 1)
+    ]
+    shared = DraftDcp(layers, group, world, rank, [rows], steps, 1 << 20, interleave,
+                      True)  # fmt: skip
+    label = f"cake DCP{role} rules q{steps} rows {rows}"
+    quant = shared.quants.get(rows)
+    if quant is None or not shared.served(rows):
+        print(f"rank {rank}: {label}: no cake rule ({_dcp_path(shared, rows)})")
+        return 1
+    for layer in layers:
+        layer.draft_dcp.bind(cache)
+    total = world * heads
+    outs = [torch.empty((rows, heads * 128), dtype=torch.bfloat16, device=device)
+            for _ in layers]  # fmt: skip
+    wide = rows in shared.wide_cores
+
+    def step():
+        for i, layer in enumerate(layers):
+            dcp_ = layer.draft_dcp
+            if wide:
+                box = shared.wide_box.mailbox(True)
+            else:
+                box = shared.box.mailbox(rows in shared.valid)
+            box[dcp_.parity, :rows, :total].copy_(q)
+            dcp_.merge(layer, metadata, rows, outs[i])
+
+    step()  # (warm: compiles and the first lists outside the capture)
+    torch.accelerator.synchronize(device)
+    graph = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream(device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.graph(graph, stream=stream):
+        step()
+    torch.accelerator.synchronize(device)
+    failures, quanta = 0, {}
+    split = shared.folds.get(rows) or shared.wide_cores[rows][0]
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    long = dcp.long_split(rows, total, split, sms, steps, draft=world)
+    for name, totals in list(sets.items()) + [("skewed again", skewed)]:
+        local = [_local_len(t, world, rank, interleave) for t in totals]
+        metadata.decode.seq_lens.copy_(torch.tensor(local, dtype=torch.int32))
+        metadata.decode.dcp_tot_seq_lens.copy_(torch.tensor(totals, dtype=torch.int32))
+        metadata.max_seq_len = max(totals)
+        graph.replay()
+        torch.accelerator.synchronize(device)
+        got = [o.clone() for o in outs]
+        word = int(quant.buffer.item())
+        want = dcp.cake_quant(local, split, long)
+        quanta[name] = word
+        if word != want:
+            print(f"rank {rank}: {label} {name}: step quantum {word}, host {want}")
+            failures += 1
+        # Against the exact FP32 attention (no intermediate rounding), per row
+        # relative to its largest value, as query96: no further than stock's
+        # tokenspeed + LSE combine + W_UV on the same bytes (ACCURACY_SLACK). Both
+        # round P to FP8 per KV split, so a different partition of a short context
+        # (a few tokens dominating the softmax) lands up to a few % from stock's.
+        errors = [0.0, 0.0]
+        for i, layer in enumerate(layers):
+            expected = _stock_dcp(q, cache, metadata, True, layer.W_UV, world, rank,
+                                  interleave, group)  # fmt: skip
+            exact = _exact_dcp(q, cache, metadata, layer.W_UV, world, rank,
+                               interleave, group)  # fmt: skip
+            scale = exact.abs().amax(-1, keepdim=True).clamp_min(1e-6)
+            for j, x in enumerate((got[i], expected)):
+                if not torch.isfinite(x).all():
+                    errors[j] = float("inf")
+                    continue
+                err = ((x.float() - exact).abs() / scale).max().item()
+                errors[j] = max(errors[j], err)
+        both = torch.tensor(errors, device=device)
+        torch.distributed.all_reduce(both, op=torch.distributed.ReduceOp.MAX)
+        ours, stock = both.tolist()
+        if not ours <= ACCURACY_SLACK * stock + 2e-3:
+            print(f"rank {rank}: {label} {name}: vs exact FP32 specialized "
+                  f"{ours:.4f}, stock {stock:.4f}")  # fmt: skip
+            failures += 1
+        elif rank == 0:
+            print(f"{label} {name}: vs exact FP32 specialized {ours:.4f}, stock "
+                  f"{stock:.4f}")  # fmt: skip
+    if quanta["skewed"] == quanta["uniform"] == quanta["short"]:
+        print(f"rank {rank}: {label}: the quantum never moved ({quanta})")
+        failures += 1
+    if rank == 0:
+        print(f"{label} ({_dcp_path(shared, rows)}, rule {long}): quanta {quanta}")
+    del graph
+    return failures
+
+
 def _gpu_main(parts):
     import torch.distributed as dist
 
@@ -1801,6 +2034,8 @@ def _gpu_main(parts):
         failures += _query96_main(rank, world, device, group)
     if "c512rows" in parts:
         failures += _c512_rows_main(rank, world, device, group)
+    if "cake" in parts:
+        failures += _cake_main(rank, world, device, group)
     if "context" in parts:
         failures += _context_main(rank, world, device, group)
     if "arnorm" in parts:
@@ -1812,13 +2047,14 @@ def _gpu_main(parts):
 
 if __name__ == "__main__":
     # torchrun ... test_specialized_decode_draft_nq.py [markov] [dcp] [dcp96]
-    # [query96] [c512rows] [context] [arnorm] (default: all)
+    # [query96] [c512rows] [cake] [context] [arnorm] (default: all)
     parts = sys.argv[1:] or (
         "markov",
         "dcp",
         "dcp96",
         "query96",
         "c512rows",
+        "cake",
         "context",
         "arnorm",
     )

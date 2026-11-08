@@ -102,6 +102,9 @@ POLL_Q = True  # False only in the tests' positive control (q read unpolled)
 X_SENT = 0xFFFFFFFF  # two BF16 0xFFFF (mla.query.X_SENT)
 # ``wlist``: the address table's words holding the work list's address (mla.wlist)
 WLIST_WORD = 6
+# A drafter cake rule (mla.dcp ``long_split``, 4 fields): the address table's words
+# holding the step quantum word's address (mla.wlist.StepQuant; core_q.verify_table)
+QUANT_WORD = 8
 
 
 @asm()
@@ -143,11 +146,13 @@ def polled_core(
     pushers would (the address table of ``core_q.push_table``), and DcpValue only
     merges. ``long`` (mla.dcp.LONG_SPLIT): (short split, long tiles) -- a request of at
     most ``long tiles`` 128-token K tiles keeps the short split's partition, the launched
-    splits past it left empty (``get_k_tile_count``). ``wlist`` (persistent, no push):
+    splits past it left empty (``get_k_tile_count``); a drafter cake rule (4 fields)
+    reads its step quantum through the address table's words QUANT_WORD.. ``wlist`` (persistent, no push):
     the work list -- persistent work block j runs word j of the list whose address is in
     the address table's words WLIST_WORD.. (``ts_item``, ``mla.wlist``), so a per-step schedule orders and places the items
     (e.g. longest first); the items and their partitions are unchanged."""
     assert not wlist or (persistent and not push), "the work list: persistent, no push"
+    assert not (push and long and len(long) > 3), "the cake quantum: no core push"
     assert not persistent or valid == 2, "a persistent polled core needs FORK_VALID 2"
     assert not push or persistent, "the core push uses the persistent schedule"
     # ``valid`` 2: the q mailbox's TMA descriptors are grid-constant kernel parameters
@@ -194,7 +199,14 @@ def polled_core(
             k_tile_total = cute.ceil_div(K, self.mma_qk_tiler[1])
             k_tile_per_cta = cute.ceil_div(k_tile_total, split_kv)
             if cutlass.const_expr(self.ts_long is not None):  # [axl] LONG_SPLIT
-                k_tile_per_cta = long_per(k_tile_total, split_kv, self.ts_long)
+                quant = None
+                if cutlass.const_expr(len(self.ts_long) > 3):  # the step's cake quantum
+                    address = self.ts_address(block_split_kvs, QUANT_WORD)
+                    ptr = cute.make_ptr(
+                        Int32, address, cute.AddressSpace.gmem, assumed_align=4
+                    )
+                    quant = cute.make_tensor(ptr, cute.make_layout(1))[0]
+                k_tile_per_cta = long_per(k_tile_total, split_kv, self.ts_long, quant)
             k_index = blk_coord[3] * k_tile_per_cta
             count = max(0, min(k_tile_total, k_index + k_tile_per_cta) - k_index)
             return k_index, count, split_kv

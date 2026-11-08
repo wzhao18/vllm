@@ -40,7 +40,11 @@ PACKED_TWIN: 3 / 6 query tiles per request), so ``draft_fold_splits`` and every 
 reader (the cores, DcpValue's fold, the work list) read that twin's measured split
 and length-keyed LONG_SPLIT partition (decided on the GPU from each request's own
 length, graph-safe) instead of tokenspeed's shape-only split, which ran the wide rows
-and B18-B21 unsplit. A gathered fold row a rule fires on moves to the polled core
+and B18-B21 unsplit; the drafter's own cake rules (mla.dcp DRAFT_LONG_SPLIT) go
+further: the first layer of each step writes the split quantum from the batch's
+actual local lengths (mla.wlist.StepQuant, ``step_tables``), which every core,
+work list and DcpValue fold of the step reads. A gathered fold row a rule fires on
+moves to the polled core
 (``long_polled``: the gathered fold core has no long partition). Rows mode (q = 1)
 keeps the (padded rows, heads) q = 1 rules: the same shape whichever role measured
 them. At heads per rank whose MlaQuery cannot gather (mla.query UNGATHERED_HEADS: 24)
@@ -58,6 +62,7 @@ import torch
 from cutlass import Float32, Int32, Int64
 from cutlass.cute.runtime import make_fake_stream
 
+from ...shapes import Shape, full_capture, refuse
 from ..common.host import (
     dynamic_fake,
     dynamic_view,
@@ -68,7 +73,6 @@ from ..common.host import (
     stream,
     to_cute,
 )
-from ...shapes import Shape, full_capture, refuse
 from ..common.policy import batch_table
 from ..common.primitives import (
     launch,
@@ -112,7 +116,7 @@ from ..mla.dcp import (
     verify_fold_splits,
 )
 from ..mla.rows import compile_rows
-from ..mla.wlist import shared_list
+from ..mla.wlist import StepQuant, shared_list
 
 # Drafter query rows (requests x draft length; Rubin, DCP) whose tokenspeed core skips
 # its reducer and folds its FP32 split partials in DcpValue (mla.dcp's q > 1 fold).
@@ -446,6 +450,10 @@ class DraftDcp:
         # split partials (mla.dcp split_partials_q, non-causal): rows -> split count.
         # The cores compile once the cache (its page size) is bound (``bind``).
         self.folds, self.fold_values, self.fold_cores = {}, {}, set()
+        # Rows whose drafter rule is a cake rule (mla.dcp DRAFT_LONG_SPLIT): rows ->
+        # their step quantum word (mla.wlist.StepQuant), built by the first layer each
+        # step and read by the core, the work list and DcpValue (``step_quant``).
+        self.quants: dict = {}
         # NQ-NOFALLBACK: rows left unfolded -> why (the coverage log's ``core_of``).
         self.unfolded: dict[int, str] = {}
         self.max_seq = local_max(max_context or 1 << 17, size, interleave)
@@ -485,7 +493,7 @@ class DraftDcp:
             self.fold_values[r] = compile_value(
                 self.heads, size, r, self.cap, uv, width, index, sms, steps, split,
                 lse_split=True, out_scale=self.scales[1], valid_box=r in self.valid,
-                draft=size,
+                draft=size, quant_at=self.step_quant(r, split, sms),
             )  # fmt: skip
             split_workspace_ts(self.device, packed, r // steps, split)
         # Rows mode (ROWS_MODE): rows -> (padded rows, splits, DcpValue, row metadata
@@ -551,6 +559,7 @@ class DraftDcp:
                     self.heads, size, r, cap, uv, width, index, sms, steps, fold,
                     lse_split=fold > 0, out_scale=self.scales[1] if fold else 1.0,
                     valid_box=True, pushed=push is not None, draft=size,
+                    quant_at=self.step_quant(r, fold, sms) if fold else 0,
                 )  # fmt: skip
             except RuntimeError as error:  # (check_residency: not co-resident)
                 if "co-resident" not in str(error):
@@ -572,7 +581,10 @@ class DraftDcp:
                     for p in (0, 1)
                 ]
             else:
-                tables = [verify_table(qbox[p], reqs, self.device) for p in (0, 1)]
+                quant = self.quants.get(r)
+                tables = [
+                    verify_table(qbox[p], reqs, self.device, quant) for p in (0, 1)
+                ]
                 if work is not None:
                     tables = [work.table(t) for t in tables]
                     self.wlists[r] = work
@@ -601,7 +613,10 @@ class DraftDcp:
             if polled and r not in self.row_modes:
                 reqs = r // steps
                 qbox = self.box.mailbox(r in self.valid)
-                tables = [verify_table(qbox[p], reqs, self.device) for p in (0, 1)]
+                quant = self.quants.get(r)
+                tables = [
+                    verify_table(qbox[p], reqs, self.device, quant) for p in (0, 1)
+                ]
                 tiles = -(-steps * size * self.heads // 128)
                 work = self.work_list(r, size * self.heads, tiles, self.folds[r], sms)
                 if work is not None and self.valid.get(r) == 2:
@@ -677,6 +692,18 @@ class DraftDcp:
             self.wide_mailboxes = [to_cute(wide_box.qv[p]) for p in (0, 1)]
         for index, attention in enumerate(attentions):
             attention.draft_dcp = DraftLayerDcp(self, attention, index % 2, index == 0)
+
+    def step_quant(self, rows, split, sms):
+        """The address of ``rows``' cake-rule step quantum word (created here) where
+        the drafter's rule at ``split`` launched splits is a cake rule, else 0."""
+        heads = self.size * self.heads
+        long = long_split(rows, heads, split, sms, self.steps, draft=self.size)
+        if long is None or len(long) <= 3:
+            return 0
+        if rows not in self.quants:
+            reqs = rows // self.steps
+            self.quants[rows] = StepQuant(reqs, long, split, self.device)
+        return self.quants[rows].address
 
     def core_of(self, rows):
         """NQ-NOFALLBACK: the attention core a served drafter row runs, for the
@@ -785,6 +812,9 @@ class DraftLayerDcp:
         self.shared, self.parity = shared, parity
         # The first layer writes the rows mode's per-row metadata of each forward.
         self.first = first
+        # Rows whose step tables (``step_tables``) this layer already launched ahead
+        # of its MlaQuery (host-side, while capturing; the core's call consumes it).
+        self.tables_ahead = None
         self.uv = to_cute(attention.W_UV)
         self.query_weights = None
         if shared.queries:
@@ -883,6 +913,10 @@ class DraftLayerDcp:
             return decline("wide core not compiled for the bound cache page")
         cache = attention.kv_cache
         qnorm, kvnorm, qb, uk, qinv, kinv = self.query_weights
+        if self.first and (rows in shared.quants or rows in shared.wlists):
+            # (ahead of MlaQuery: the core stays its PDL successor)
+            self.step_tables(rows, decode.seq_lens[: rows // shared.steps])
+            self.tables_ahead = rows
         shared.queries[rows](
             to_cute(qkv),
             qnorm,
@@ -942,6 +976,25 @@ class DraftLayerDcp:
             return False
         return (rows, cache.shape[1]) in self.shared.fold_cores
 
+    def step_tables(self, rows, lengths):
+        """The first layer's per-step tables of ``rows`` from the requests' local
+        ``lengths``: the cake rule's quantum word (mla.wlist.StepQuant), then the work
+        list (it reads the word), each where ``rows`` has one; every layer's core,
+        work list and DcpValue read them."""
+        shared = self.shared
+        work, quant = shared.wlists.get(rows), shared.quants.get(rows)
+        if quant is not None:
+            quant.build(lengths)
+        if work is not None:
+            work.build(lengths, quant)
+
+    def tables_for(self, rows, lengths):
+        """``step_tables`` here unless this (first) layer launched them ahead of its
+        MlaQuery for these rows."""
+        if self.first and self.tables_ahead != rows:
+            self.step_tables(rows, lengths)
+        self.tables_ahead = None
+
     def fold_core(self, attention, metadata, rows):
         """The reducer-free tokenspeed core over the q mailbox (gathered, or polled by
         the core for POLLED_CORE rows): FP32 split partials + LSEs in the shared
@@ -964,8 +1017,7 @@ class DraftLayerDcp:
         tables += (decode.dcp_tot_seq_lens[:reqs],)
         if rows in shared.polled:
             work = shared.wlists.get(rows)
-            if work is not None and self.first:  # this step's list, every layer
-                work.build(tables[1])
+            self.tables_for(rows, tables[1])  # (this step's, every layer)
             polled_partials_q(
                 query, cache, *tables, shared.scales, out, lse, split, shared.cp(),
                 shared.polled[rows][p], causal=shared.causal, valid=valid,
@@ -1002,8 +1054,7 @@ class DraftLayerDcp:
         meta = decode.block_table[:reqs], decode.seq_lens[:reqs]
         meta += (decode.dcp_tot_seq_lens[:reqs],)
         work = shared.wlists.get(rows)
-        if work is not None and self.first:  # this step's list, every layer
-            work.build(meta[1])
+        self.tables_for(rows, meta[1])  # (this step's, every layer)
         polled_partials_q(
             query, cache, *meta, shared.scales, out_rows, lse, split, shared.cp(),
             tables[p], causal=shared.causal, valid=2, persistent=persistent, push=push,

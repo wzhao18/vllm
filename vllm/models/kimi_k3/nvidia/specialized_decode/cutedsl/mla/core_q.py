@@ -164,11 +164,16 @@ def polled_q_core(batch, valid=0, persistent=False, push=None, long=None, wlist=
     return TsCoreQ
 
 
-def verify_table(query_box, reqs, device):
+def verify_table(query_box, reqs, device, quant=None):
     """The core's address table (``mla.dcp.fork_table``'s layout, one word per request
-    at least): this parity's q mailbox address in words 0-1; the x words are unused."""
+    at least): this parity's q mailbox address in words 0-1; the x words are unused;
+    (mla.wlist) the work list's address in words 6-7 (``WorkList.table``) and
+    ``quant``'s (a drafter cake rule's step quantum word, mla.wlist.StepQuant) in
+    words 8-9 (core_ts.QUANT_WORD)."""
     address = query_box.data_ptr()
-    words = [address & 0xFFFFFFFF, address >> 32] + [0] * (max(8, reqs) - 2)
+    words = [address & 0xFFFFFFFF, address >> 32] + [0] * (max(10, reqs) - 2)
+    if quant is not None:
+        words[8:10] = [quant.address & 0xFFFFFFFF, quant.address >> 32]
     table = torch.tensor(words, dtype=torch.int64).to(torch.int32)  # wraps
     return table.to(device)
 

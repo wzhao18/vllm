@@ -261,42 +261,79 @@ TWIN_LONG_SPLIT = {
     (60, 96): (2, 8, 64),  # B15 <- B16 (64)
 }
 TWIN_FOLD_SPLITS = {key: rule[0] for key, rule in TWIN_LONG_SPLIT.items()}
-# The drafter's own measured rules, by its DCP size (the role: the same rows see 4x
-# longer local contexts at DCP4 than at DCP16): (rows, gathered heads, q, DCP size)
-# -> LONG_SPLIT rule, read before the twin's (``split_rule``, ``verify_fold_splits``,
-# ``draft``). The 96-head causal drafter's DL3 fold rows (B3-B21): the twin rule's
-# short split, then (launched, 64 tiles, quantum); a long request of T tiles spreads
-# over min(launched, ceil(T / quantum)) splits (``long_per``, on the GPU from its
-# own length: graph-safe). Draft split-rule sweep (bench_draft_tune.py: the eff
-# sweep with one candidate rule on every DL3 9-63 / DL7 14-63 row; 4 x VR200, 96
-# gathered heads, AgentX lengths, local = total / DCP), us per drafter attention
-# layer at the agentic lengths, candidates (launched, quantum) (8, 0) (the twin's),
-# (16, 0), (16, 32), (16, 64), (32, 32), (32, 64), no rule:
-#   DCP4 (C512's TP4 = DCP4): (16, 64) best at 12-57 rows: 75.0 -> 62.9 (12), 128.2
-#     -> 102.7 (24), 155.1 -> 120.9 (30), 170.0 -> 137.0 (33), 195.0 -> 166.9 (39),
-#     215.3 -> 171.8 (48), 238.3 -> 207.7 (54) vs the twin's (8, 0); (16, 32) at 9
-#     / 18 rows (66.1 -> 50.0, 108.2 -> 91.0); 63 rows within 2% of (8, 0); the
-#     others 20-90% slower.
-#   DCP16 (TP16): the twin's (8, 0) best or within 5% at every row but DL3 21 / 24
-#     ((16, 32): 45.4 -> 41.5, 48.2 -> 45.5).
-# Rows the sweep did not run (DL3 27 / 36 / 45 / 51 / 60) take their neighbours'
-# (16, 64). NQ-TUNE: DL7 at DCP4 (C512 runs DL3).
+# The drafter's own rules, by its DCP size: (rows, gathered heads, q, DCP size) ->
+# (short split, launched split, 0, quantum floor, a wave's fixed cost), read before
+# the twin's (``split_rule``, ``verify_fold_splits``, ``draft``). A cake balance
+# decided on the GPU from the step's actual local lengths (cf. GB300
+# ZJY0516/vllm#25 cake_balance), in place of a static length rule: each step, the
+# first drafter layer writes the rank's quantum Q (mla.wlist.StepQuant; host twin
+# ``cake_quant``), and a request of T tiles runs min(launched, ceil(T / Q)) equal
+# splits (``long_per``); the cores (core_ts ``get_k_tile_count``: the address
+# table's QUANT_WORD), DcpValue's fold (``quant_at``) and the work list read that one
+# word. Q is the candidate max(floor, ceil(T_max / s)), s = 1 .. launched (the
+# longest request at s splits), of the least modelled time on the core's P CTA
+# pairs: max(largest item, waves x mean item) + waves x the fixed cost, waves =
+# ceil(items / P), items = q tiles x the batch's splits; ties to the fewer splits.
+# Graph-safe (a device word per captured shape), exact (a partition of each
+# request's keys, folded in split order with the same FP32 LSE weights).
+# The fixed cost per wave (20 tiles at the fold rows, 6 at the wide rows: dreff5 r3,
+# 4 x VR200; fitted from DL3 B6 uniform, 361 local tiles each: 5 splits, one wave of
+# 73 tiles, 67 us vs 11 splits, two waves of 33, 80 us) makes a uniform batch take
+# the most splits that fit whole waves; one long request among short ones takes the
+# launched splits, the short ones one or two. The static rules this replaces
+# (e6e13cb30a's (16, 64) at DCP4, tuned on the AgentX vectors the gate measures) cut
+# the uniform-length bound by 20-43% at 12-96 rows (dreff3, pw4 r21 68.0 -> 97.6 us);
+# a quantum of max(floor, total / slots) without the wave model did too (dreff5 r1).
 DRAFT_LONG_SPLIT: dict = {}
+# (DCP size) -> ((fold rows' launched split, quantum floor in tiles, a wave's fixed
+# cost in quarter tiles), (wide rows' floor, fixed cost)); the wide rows (above the
+# 64-row box) keep their twin rule's launched split (its workspace). The fold rows'
+# launched split where DRAFT_CAKE_LAUNCHED has none.
+DRAFT_CAKE = {4: ((8, 8, 80), (32, 24)), 16: ((8, 8, 80), (32, 24))}
+# Fold rows' launched split by (DCP size) -> (q, rows). Launched splits a step leaves
+# empty are not free (their CTAs, or the persistent loop's items, still run their
+# setup): 24 / 32 launched at DCP4 cost 1.3-2x at 9-63 rows on every length mix, and
+# at DCP16's short local contexts 16 cost 1.1-1.4x vs 4-8 (dreff5 r4). Per row the
+# launch of the least worst ratio to the best measured over agentic / uniform /
+# held-out lengths (candidates 4, 6, 8, 12, 16 at DCP16; 8, 16, 24, 32 at DCP4;
+# rows the sweep did not run take a neighbour's).
+DRAFT_CAKE_LAUNCHED = {
+    4: {(3, 9): 16, (3, 12): 16, (3, 42): 16, (7, 14): 16},
+    16: {
+        **{(3, r): 6 for r in (30, 33, 36, 39, 42, 45, 63)},
+        **{(3, r): 4 for r in (48, 51, 54, 57, 60)},
+        (7, 14): 12,
+        **{(7, r): 6 for r in (35, 42, 49)},
+        (7, 63): 4,
+    },
+}
+# Drafter rows the cake rule covers per q (DL3: the fold rows 9-63 and the wide rows
+# 66-480; DL7: 14-63 and 70-448), where a launched split above 1 exists.
+DRAFT_CAKE_ROWS = {3: range(9, 481, 3), 7: range(14, 449, 7)}
 
 
-def _draft_rule(rows, q, launched, quantum):
-    """The 96-head drafter's measured rule at ``rows``: its twin rule's short split
-    and long tiles, ``launched`` splits past them, ``quantum``."""
-    key = (rows // q * PACKED_TWIN[96, q], 96)
-    twin = TWIN_LONG_SPLIT.get(key) or LONG_SPLIT[key]
-    return twin[0], launched, twin[2], quantum
+def _cake_rules(cake=None, launch=None):
+    """DRAFT_LONG_SPLIT's cake entries (``DRAFT_CAKE`` / ``DRAFT_CAKE_LAUNCHED`` or
+    ``cake`` / ``launch``) from the twin rules."""
+    cake = DRAFT_CAKE if cake is None else cake
+    launch = DRAFT_CAKE_LAUNCHED if launch is None else launch
+    rules = {}
+    for q, rows in DRAFT_CAKE_ROWS.items():
+        for size, (fold, wide) in cake.items():
+            for r in rows:
+                key = (r // q * PACKED_TWIN[96, q], 96)
+                twin = TWIN_LONG_SPLIT.get(key) or LONG_SPLIT.get(key)
+                if twin is None:
+                    continue
+                launched, floor, over = (twin[1], *wide) if r > 64 else fold
+                if r <= 64:
+                    launched = launch.get(size, {}).get((q, r), launched)
+                if launched > 1:
+                    rules[r, 96, q, size] = (twin[0], launched, 0, floor, over)
+    return rules
 
 
-DRAFT_LONG_SPLIT.update(
-    {(r, 96, 3, 4): _draft_rule(r, 3, 16, 32 if r in (9, 18) else 64)
-     for r in range(9, 64, 3)}
-)  # fmt: skip
-DRAFT_LONG_SPLIT.update({(r, 96, 3, 16): _draft_rule(r, 3, 16, 32) for r in (21, 24)})
+DRAFT_LONG_SPLIT.update(_cake_rules())
 
 
 def split_key(rows, heads, q=None, draft=0):
@@ -329,29 +366,74 @@ def long_split(rows, heads, split, sms, q=None, draft=0):
     split on a Rubin-class device (``sms``), else None.
     An optional 4th LONG_SPLIT field, the quantum q (tiles): a long request of T tiles
     runs min(launched, ceil(T / q)) equal splits instead of all launched ones
-    (``long_per``); 0: every launched split."""
+    (``long_per``); 0: every launched split. A drafter cake rule (5 fields,
+    DRAFT_LONG_SPLIT) returns 6: (short split, long tiles, quantum floor, CTA pairs,
+    q tiles per request, a wave's fixed cost in quarter tiles), its quantum decided
+    per step on the GPU (``cake_quant``, mla.wlist.StepQuant)."""
     rule = split_rule(rows, heads, q, draft)
     if sms <= GB300_SMS or rule is None or split != rule[1]:
         return None
+    if len(rule) > 4:  # the cake rule: (short, long tiles, floor, pairs, q tiles, over)
+        tiles = -(-(q or 1) * heads // 128)
+        return rule[0], rule[2], rule[3], sms // 2, tiles, rule[4]
     return rule[0], rule[2], rule[3] if len(rule) > 3 else 0
 
 
 @cute.jit
-def long_per(tiles, split, long):
+def long_per(tiles, split, long, quant=None):
     """Tiles per split of a request of ``tiles`` K tiles under ``long``
     (``long_split``) launched at ``split``: the short split's partition up to the long
     tiles, past them ``split`` (quantum 0) or min(split, ceil(tiles / quantum)) equal
-    splits. The core's partition and DcpValue's fold both read this."""
+    splits. A cake rule (4 fields): the quantum is this step's ``quant`` (the device
+    word ``cake_quant`` wrote). The core's partition and DcpValue's fold both read
+    this."""
     short = max((tiles + long[0] - 1) // long[0], 1)
     splits = split
-    if cutlass.const_expr(long[2] > 0):
+    if cutlass.const_expr(len(long) > 3):
+        splits = min(split, max((tiles + quant - 1) // quant, 1))
+    elif cutlass.const_expr(long[2] > 0):
         splits = min(split, (tiles + long[2] - 1) // long[2])
     per = max((tiles + splits - 1) // splits, 1)
     return Int32(cutlass.select_(tiles > long[1], per, short))
 
 
+def cake_quant(lengths, launched, long):
+    """Host twin of the cake rule's per-step quantum (mla.wlist ``_quant_kernel``)
+    for ``launched`` splits under ``long`` (``long_split``'s cake rule: (short, long
+    tiles, floor, pairs, q tiles, over)): of the candidates max(floor, ceil(T_max /
+    s)), s = 1 .. launched, the one of the least modelled time in quarter tiles,
+    max(4 x largest item, waves x 4 x tiles // splits) + waves x over, waves =
+    ceil(q tiles x splits / pairs); ties to the smaller s."""
+    floor, pairs, qtiles, over = long[2], long[3], long[4], long[5]
+    tiles = [-(-int(n) // 128) if int(n) > 0 else 0 for n in lengths]
+    top, total = max(tiles, default=0), sum(tiles)
+    best = None
+    for s in range(1, launched + 1):
+        quant = max(-(-top // s), floor)
+        splits = [min(launched, max(-(-t // quant), 1)) if t else 0 for t in tiles]
+        largest = max([-(-t // n) for t, n in zip(tiles, splits) if n], default=0)
+        count = max(sum(splits), 1)
+        waves = -(-count * qtiles // pairs)
+        cost = max(4 * largest, waves * (4 * total // count)) + waves * over
+        if best is None or cost < best[0]:
+            best = cost, quant
+    return best[1]
+
+
+def long_per_host(tiles, split, long, quant=None):
+    """Host twin of ``long_per`` (the tests' reference partition)."""
+    short = max(-(-tiles // long[0]), 1)
+    splits = split
+    if len(long) > 3:
+        splits = min(split, max(-(-tiles // quant), 1))
+    elif long[2] > 0:
+        splits = min(split, -(-tiles // long[2]))
+    per = max(-(-tiles // splits), 1)
+    return per if tiles > long[1] else short
+
+
 @cute.jit
-def filled_splits(n, split, long):
+def filled_splits(n, split, long, quant=None):
     """KV splits a core fills for a request of ``n`` local tokens (128-token tiles)
     launched at ``split`` (``long``: ``long_split``'s rule, else tokenspeed's equal
     partition): contiguous from split 0, every one full but the last. The cores that
@@ -360,7 +442,7 @@ def filled_splits(n, split, long):
     tiles = (n + 127) // 128
     per = max((tiles + split - 1) // split, 1)
     if cutlass.const_expr(long is not None):
-        per = long_per(tiles, split, long)
+        per = long_per(tiles, split, long, quant)
     return (tiles + per - 1) // per
 
 
@@ -842,6 +924,7 @@ class DcpValue:
         prefetch_uv=True,
         resident_sms=0,
         draft=0,
+        quant_at=0,
     ):
         """``q_chunks``: 16 B chunks per q mailbox head row (36 FP8, 72 BF16);
         ``q_heads``: q mailbox rows per token (default DCP * H); ``lse_scale``: to
@@ -850,7 +933,9 @@ class DcpValue:
         ``resident_sms``: the device's real SM count (0: ``sms``), which bounds the
         co-resident grid (``tile_stride``) when ``sms`` is the capped GB300 schedule.
         ``draft``: the drafter's DCP size (``split_rule``: its own rules and twins;
-        0: the target)."""
+        0: the target). ``quant_at``: the device address of the step's cake quantum
+        (mla.wlist.StepQuant) where the drafter's rule is a cake rule (``long_split``
+        4 fields), else 0."""
         self.heads, self.size, self.batch = heads, size, batch
         self.q_chunks, self.q_heads = q_chunks, q_heads or size * heads
         self.lse_scale = lse_scale
@@ -886,6 +971,18 @@ class DcpValue:
             if self.lse_split
             else None
         )
+        # A cake rule's partition reads the step's quantum word (written by the first
+        # drafter layer before any core: read after this kernel's PDL wait, as the
+        # lengths). NQ-NOFALLBACK: a cake rule without its word is a build error.
+        self.quant_at = int(quant_at)
+        cake = self.long is not None and len(self.long) > 3
+        if cake != bool(self.quant_at):
+            raise ValueError(
+                f"Kimi K3 MLA DcpValue (batch {batch}, q {q}, split {fold}): cake "
+                f"rule {self.long} needs its step quantum word (quant_at "
+                f"{self.quant_at:#x}) and only it does"
+            )
+        assert not (cake and polled_split), "the cake fold reads lengths after the wait"
         self.out_scale = out_scale
         # Rubin DcpCore (mla.core): the pushers LSE-merge its ``fold`` split partials
         # (FP32 O and (max, sum) per split) into each row first.
@@ -1188,6 +1285,9 @@ class DcpValue:
         LPC: request r's chunk count (lpc_filled)."""
         if cutlass.const_expr(self.lpc is not None):
             return lpc_filled(self.lpc_words, n, r, self.batch // self.q)
+        if cutlass.const_expr(self.quant_at != 0):  # the cake rule's step quantum
+            word = load_words(Int64(self.quant_at), count=1, mutable=True)[0]
+            return filled_splits(n, self.fold, self.long, Int32(word))
         return filled_splits(n, self.fold, self.long)
 
     @cute.jit
@@ -1834,6 +1934,7 @@ def compile_value(
     spread=False,
     resident_sms=0,
     draft=0,
+    quant_at=0,
 ):
     """DcpValue of one batch (``q`` rows per request); ``uv``: the (shape, stride,
     dtype) of W_UV, ``pitch``: the projected rows' (the gate follows the 2112 query /
@@ -1849,7 +1950,8 @@ def compile_value(
     schedule. ``resident_sms``: the wave the merging CTAs' grid must fit in
     (``DcpValue.tile_stride``; 0: ``sms``, the caller's real SM count; the tests
     give a smaller one to compare row-tile strides). ``draft``: the drafter's DCP
-    size (its split rules, ``split_rule``; 0: the target)."""
+    size (its split rules, ``split_rule``; 0: the target); ``quant_at``: the
+    address of its cake rule's step quantum word (DcpValue)."""
     error = uv_layout_error(uv)  # (the fragment loads assume it: no GPU-side check)
     if error:
         raise ValueError(f"Kimi K3 MLA DcpValue: {error}")
@@ -1905,6 +2007,7 @@ def compile_value(
         spread=spread,
         resident_sms=resident,
         draft=draft,
+        quant_at=quant_at,
         **dsa,
     )
     if value.polled_out:
