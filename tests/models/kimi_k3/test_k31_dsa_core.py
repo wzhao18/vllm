@@ -514,32 +514,39 @@ def test_dsa_core_policy():
     assert every.variant(8, 4) == (1, 16, 4) and every.variant(64, 8) == (4, 32, 4)
 
 
-def _model(kv_dtype="fp8", dcp=16):
+def _model(kv_dtype="fp8", dcp=16, prims_ts=False):
     from vllm.models.kimi_k3.nvidia.dsa import KimiK3DSAAttention
 
     layer = KimiK3DSAAttention.__new__(KimiK3DSAAttention)
     torch.nn.Module.__init__(layer)
     layer.dsa_indexer = SimpleNamespace(dcp_world_size=dcp)
-    layer.mla_attn = SimpleNamespace(mla_attn=SimpleNamespace(kv_cache_dtype=kv_dtype))
+    layer.mla_attn = SimpleNamespace(
+        mla_attn=SimpleNamespace(
+            kv_cache_dtype=kv_dtype, impl=SimpleNamespace(use_prims_ts=prims_ts)
+        )
+    )
     return torch.nn.ModuleList([layer])
 
 
 @pytest.mark.parametrize(
-    "kv_dtype,dcp,sp,q,reason",
+    "kv_dtype,dcp,sp,q,prims_ts,reason",
     [
-        ("fp8", 16, False, 8, None),  # C1 / C8 / C48 / C64: the core runs
-        ("fp8", 16, False, 4, "verify length 4"),  # C160 / C256: no q4 table
-        ("fp8", 4, True, 4, "sequence-parallel"),  # C512: SpDsaCore
-        ("fp8", 1, False, 8, "no DCP"),
-        ("nvfp4_ds_mla", 16, False, 8, "nvfp4_ds_mla"),  # capability: FP8 rows only
+        ("fp8", 16, False, 8, False, None),  # C1 / C8 / C48 / C64: the core runs
+        ("fp8", 16, False, 4, False, "verify length 4"),  # C160 / C256: no q4 table
+        ("fp8", 4, True, 4, False, "sequence-parallel"),  # C512: SpDsaCore
+        ("fp8", 1, False, 8, False, "no DCP"),
+        ("nvfp4_ds_mla", 16, False, 8, False, "nvfp4_ds_mla"),  # FP8 rows only
+        # SM100 / SM103 where stock plans prims_ts: the core is not stock precision
+        ("fp8", 16, False, 8, True, "not trtllm-gen"),
     ],
 )
-def test_dsa_core_build_policy(kv_dtype, dcp, sp, q, reason):
-    """``unsupported``: the core is on wherever it can run (no switch); every other
-    deployment keeps FlashInfer's chain, and build() then attaches nothing."""
+def test_dsa_core_build_policy(kv_dtype, dcp, sp, q, prims_ts, reason):
+    """``unsupported``: the core is on wherever it can run and stock runs trtllm-gen
+    (no switch); every other deployment keeps FlashInfer's chain, and build() then
+    attaches nothing."""
     from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core import decode
 
-    model = _model(kv_dtype, dcp)
+    model = _model(kv_dtype, dcp, prims_ts)
     config = SimpleNamespace(sequence_parallel=sp, q=q)
     why = decode.unsupported(model, config)
     if reason is None:

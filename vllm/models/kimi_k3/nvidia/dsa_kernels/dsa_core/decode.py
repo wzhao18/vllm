@@ -234,6 +234,12 @@ def unsupported(model, config=None) -> str | None:
         return "an nvfp4_ds_mla MLA cache (the core reads per-tensor FP8 rows)"
     if not current_platform.is_device_capability_family(100):
         return "not an SM100-family GPU (mma.sync e4m3, clusters)"
+    # The core reproduces trtllm-gen's precision (KV CTA split, E4M3 P, BF16 partials).
+    # Where stock's FLASHINFER_MLA_SPARSE runs prims_ts instead (use_prims_ts: SM100 /
+    # SM103 with a FlashInfer that plans it), the core would not be stock precision.
+    impl = getattr(layers[0].mla_attn.mla_attn, "impl", None)
+    if impl is None or getattr(impl, "use_prims_ts", True):
+        return "stock sparse MLA is not trtllm-gen here (prims_ts or another backend)"
     return None
 
 
