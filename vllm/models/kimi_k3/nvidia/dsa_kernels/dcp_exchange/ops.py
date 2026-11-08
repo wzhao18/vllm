@@ -171,6 +171,11 @@ class DcpExchange:
             atexit.register(lambda e=self.err: print(f"DcpExchange err at exit: {int(e[0])}",
                                                      flush=True))
         self.mailbox_bytes = 4 * o
+        # top-k pre-pass scratch (per row: coarse histogram, window counts, candidate
+        # list; csrc topk_pp_*_kernel), zero between uses
+        self.tk_pp = torch.zeros(
+            int(self.ext.topk_pp_words(cap)), dtype=torch.int32, device=device
+        )
 
         # ---- O mailboxes, one per head dim
         self.ox = {}
@@ -295,6 +300,7 @@ class DcpExchange:
             segmax,
             dbg,
             stats,
+            self.tk_pp,
         )
 
     def resident_clusters(self, cluster: int, segmax: int) -> int:
