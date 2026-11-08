@@ -800,6 +800,7 @@ def test_kda_verify_kernels_take_the_state_dtype(q, requests, bf16_state):
 
     names = {
         prepared.KdaVerifyWide: "wide",
+        prepared.KdaVerifyLoopStock: "loopstock",
         prepared.KdaVerifyHalves: "halves",
         prepared.KdaVerifyStream: "stream",
         prepared.KdaVerifyStream3: "stream3",
@@ -834,12 +835,14 @@ def kda_runs(kinds):
 
 # FP32 state (production): FP32_VERIFY_WIDE, the VR200 kernel bench's measured-best
 # kernel per (q, requests) (kda.prepared's table notes), open-ended above the last row.
+# Since 2026-11-08 the Wide rows run KdaVerifyLoopStock (stock math, persistent).
 FP32_Q4_RUNS = [
-    (1, 11, "kdasplit"), (12, 12, "wide"), (13, 15, "kdasplit"), (16, 35, "wide"),
-    (36, 40, "kdasplit"), (41, 1024, "wide"),
+    (1, 11, "kdasplit"), (12, 12, "loopstock"), (13, 15, "kdasplit"),
+    (16, 35, "loopstock"), (36, 40, "kdasplit"), (41, 1024, "loopstock"),
 ]  # fmt: skip
 FP32_Q8_RUNS = [
-    (1, 11, "kdasplit"), (12, 12, "wide"), (13, 15, "kdasplit"), (16, 1024, "wide"),
+    (1, 11, "kdasplit"), (12, 12, "loopstock"), (13, 15, "kdasplit"),
+    (16, 1024, "loopstock"),
 ]  # fmt: skip
 # BF16 state: VERIFY_WIDE with VERIFY_Q's rows on top (Stream3 from 36 requests at q4).
 BF16_Q4_RUNS = [
@@ -877,12 +880,13 @@ def test_kda_fp32_policy_picks_the_measured_best():
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import prepared
 
     kind = prepared.verify_kernel
-    picks = {(4, 35): "wide", (4, 36): "kdasplit", (4, 40): "kdasplit"}
-    picks.update({(4, 41): "wide", (4, 48): "wide", (8, 12): "wide", (8, 48): "wide"})
+    wide = "loopstock"  # the Wide rows' kernel since 2026-11-08
+    picks = {(4, 35): wide, (4, 36): "kdasplit", (4, 40): "kdasplit"}
+    picks.update({(4, 41): wide, (4, 48): wide, (8, 12): wide, (8, 48): wide})
     for (q, b), name in picks.items():
         assert kind(b, q, RUBIN, False) == name, (q, b)
-    assert {kind(b, 4, RUBIN, False) for b in range(1, 1025)} <= {"kdasplit", "wide"}
-    assert {kind(b, 8, RUBIN, False) for b in range(1, 1025)} <= {"kdasplit", "wide"}
+    assert {kind(b, 4, RUBIN, False) for b in range(1, 1025)} <= {"kdasplit", wide}
+    assert {kind(b, 8, RUBIN, False) for b in range(1, 1025)} <= {"kdasplit", wide}
     assert kind(48, 8, RUBIN, True) == "halves"
     assert [kind(b, 4, RUBIN, True) for b in (35, 36, 64, 65)] == ["wide"] + [
         "stream3"

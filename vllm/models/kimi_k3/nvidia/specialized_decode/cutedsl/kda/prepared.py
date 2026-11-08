@@ -20,6 +20,8 @@ from ..common.host import fake, layout, prepare_shared_carveout, stream, to_cute
 from ..common.policy import batch_table
 from .kernel import KdaSplit
 from .verify import KdaVerifyCols, KdaVerifyPrepared, KdaVerifyRows
+from .verify_loop import KdaVerifyLoop, KdaVerifyLoopStock
+from .verify_packed import KdaVerifyPacked
 from .verify_stream import KdaVerifyStream
 from .verify_stream3 import KdaVerifyStream3
 from .verify_wide import KdaVerifyHalves, KdaVerifyWide
@@ -178,28 +180,44 @@ VERIFY_Q: dict = {
 #             (Halves trails by 3-8%; unchanged)
 # q values without a row here keep VERIFY_WIDE / VERIFY_Q with ``FP32_WIDE`` in place
 # of the BF16-only kernels.
+# 2026-11-08: the Wide rows run KdaVerifyLoopStock (7) instead: the stock composed
+# verify's math (KdaSplit's / Wide's differ from stock native Triton by relerr 3.4e-3
+# in the outputs and 2.1e-3 in the checkpoints; LoopStock by FP32 reduction order
+# only: 4e-8 state relerr, ~1e-5 output relerr, 1 in 10^5 BF16 outputs differ, conv
+# window bitwise) and persistent (kda.verify_loop). VR200 kernel bench (nqbench
+# kdaf7 / kdaf8: 1 GPU, 69 layers, own cold FP32 slots, CUDA graph, us per layer,
+# Wide -> LoopStock): q4 B16 7.40 -> 7.17, B32 8.48 -> 8.53, B64 16.77 -> 15.94,
+# B128 32.70 -> 30.82, B256 64.58 -> 61.72; q8 B16 12.29 -> 12.11, B32 13.67 ->
+# 13.72, B64 26.63 -> 26.09. The KdaSplit rows (q4 B1-11 / B13-15 / B36-40, q8 B1-11
+# / B13-15) are unchanged.
 FP32_VERIFY_WIDE: dict = {
-    (10, 7): {4: "12:1,16-35:1,36-40:0,41-512:1", 8: "12:1,16-256:1"},
+    (10, 7): {4: "12:7,16-35:7,36-40:0,41-512:7", 8: "12:7,16-256:7"},
 }
 # Plain verify kernels by VERIFY_WIDE / VERIFY_Q "wide" value (0: KdaSplit).
-WIDE_KINDS = (KdaVerifyWide, KdaVerifyHalves, KdaVerifyStream, KdaVerifyStream3)
-WIDE_NAMES = ("kdasplit", "wide", "halves", "stream", "stream3")
+WIDE_KINDS = (
+    KdaVerifyWide, KdaVerifyHalves, KdaVerifyStream, KdaVerifyStream3, KdaVerifyPacked,
+    KdaVerifyLoop, KdaVerifyLoopStock,
+)
+WIDE_NAMES = ("kdasplit", "wide", "halves", "stream", "stream3", "packed",
+              "loop", "loopstock")
 # Values whose kernel holds the base state as BF16 (KdaVerifyStream / Stream3: S0
 # staged as BF16 pairs and, in Stream3, fed exactly to BF16 tensor-core MMAs; their
 # constructor asserts a BF16 state). An FP32 state (--mamba-ssm-cache-dtype float32)
-# runs FP32_WIDE at those rows instead: KdaVerifyWide, bitwise KdaSplit's verify, which
+# runs FP32_WIDE at those rows instead (KdaVerifyLoopStock since 2026-11-08, see
+# FP32_VERIFY_WIDE; before: KdaVerifyWide, bitwise KdaSplit's verify, which
 # reads and stores the state through ``load_state`` / ``store_state`` (FP32 rows) and
 # scales with the requests (grid (1, heads, B)); with a BF16 state it led Halves and
 # the default-geometry KdaSplit at every measured row above 48 (numbers above: B64
 # 12.28 / 13.88, B96 18.65 vs KdaSplit 36.38). An FP32 chunked verify (S0 staged as
-# FP32, three-term BF16 splits of S0 into the row-dot MMAs) is not written.
+# FP32, three-term BF16 splits of S0 into the row-dot MMAs) is not written.)
 # The FP32 crossovers are FP32_VERIFY_WIDE's (measured verify alone).
 # NQ-TUNE: FP32 state in the serving chain (AttnRes, in-projection, verify,
 # o-projection) at the FP32_VERIFY_WIDE crossovers (q4 B12 / B16 Halves vs Wide, B36-48
 # KdaSplit vs Wide, q8 B12 Halves vs Wide); q4 B9-11 / B13 / B15 and q8 B9-11 / B13-15
 # (KdaSplit, unmeasured); SPEC_SCHEDULE / DEVICE_SPEC_SCHEDULE(_Q) and VERIFY_ROWS /
 # COLS at B8 swept with an FP32 state; the stock S1 crossover (STOCK_ROWS) too.
-BF16_ONLY, FP32_WIDE = (3, 4), 1
+# (FP32_WIDE: KdaVerifyLoopStock, FP32 state only; a BF16 state at q > 4 runs Wide.)
+BF16_ONLY, FP32_WIDE, KIND_WIDE = (3, 4), 7, 1
 _VERIFY = {
     "rows": VERIFY_ROWS, "cols": VERIFY_COLS, "wide": VERIFY_WIDE,
     "load_norm": VERIFY_LOAD_NORM,
@@ -243,7 +261,7 @@ def wide_kind(requests, tokens, capability, bf16_state=False, gate_mode=0, heads
     if kind is None and table and requests > max(table):
         kind = table[max(table)]
     if kind in BF16_ONLY and (not bf16_state or tokens > 4):
-        kind = FP32_WIDE
+        kind = KIND_WIDE if bf16_state else FP32_WIDE
     return kind or 0
 
 
@@ -278,9 +296,9 @@ def executable(specs, heads, gate_mode, has_bias, device, tokens=1, prepared=Fal
         heads, requests, gate_mode, tokens, capability, bf16_state, rows
     )
     options = (heads, requests, gate_mode, has_bias, schedule, tokens, bf16_state)
-    kernel = make_kernel(options, capability, prepared)
     scalars = (cutlass.Float32(v) for v in (-5, 128**-0.5, 1e-6))
-    with torch.accelerator.device_index(device):
+    kernel = make_kernel(options, capability, prepared)
+    with torch.accelerator.device_index(device):  # (persistent kernels: its SMs)
         compiled = cute.compile(
             kernel, *args[:13], *scalars, *args[13:], make_fake_stream()
         )
