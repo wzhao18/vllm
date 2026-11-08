@@ -90,7 +90,6 @@ DEPLOYED_ENV = {"VLLM_SSM_CONV_STATE_LAYOUT": "DS"}
 EXCHANGE_ENV = {
     "VLLM_K31_DCP_EXCHANGE": "1",
     "VLLM_K31_DCP_EXCHANGE_PARTS": "topk",
-    "VLLM_K31_DCP_EXCHANGE_ONE_ROUND_ROWS": "256",
     "K31_DCPX_PDL": "0",
 }
 TIMEOUT = 3600  # one launch, every rank (CuTe compiles on a cold cache)

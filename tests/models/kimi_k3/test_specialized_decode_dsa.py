@@ -3166,7 +3166,6 @@ def test_prepared_dsa_dcp_sparse_core_exchange(
     # This case's layer alone takes the exchange (the other tests: the #63 merge).
     monkeypatch.setattr(sparse_attn_indexer, "DCP_DECODE_TOPK_HOOKS", {})
     monkeypatch.setenv(dcpx.PARTS_ENV, "topk")
-    monkeypatch.setenv(dcpx.ENV + "_ONE_ROUND_ROWS", "256")
     monkeypatch.delenv(dcpx.ENV + "_TIES", raising=False)  # (rank, position)
     monkeypatch.delenv(dcpx.GRAPH_ONLY_ENV, raising=False)
     # A rank still compiling its first case's kernels must not trap its peers.
@@ -3240,7 +3239,6 @@ def test_prepared_dsa_dcp_exchange_proj(dcp8_group, monkeypatch, core, batch):
     # This case's layer alone takes the exchange (the other tests: the #63 merge).
     monkeypatch.setattr(sparse_attn_indexer, "DCP_DECODE_TOPK_HOOKS", {})
     monkeypatch.setenv(dcpx.PARTS_ENV, "topk")
-    monkeypatch.setenv(dcpx.ENV + "_ONE_ROUND_ROWS", "256")
     monkeypatch.delenv(dcpx.ENV + "_TIES", raising=False)  # (rank, position)
     monkeypatch.delenv(dcpx.GRAPH_ONLY_ENV, raising=False)
     monkeypatch.setenv(dcpx.SPIN_ENV, "120")
@@ -3566,7 +3564,6 @@ def test_wide_dsa_dcp_exchange(dcp8_group, monkeypatch, core, batch, q):
     # This case's layer alone takes the exchange (the other tests: the #63 merge).
     monkeypatch.setattr(sparse_attn_indexer, "DCP_DECODE_TOPK_HOOKS", {})
     monkeypatch.setenv(dcpx.PARTS_ENV, "topk")
-    monkeypatch.setenv(dcpx.ENV + "_ONE_ROUND_ROWS", "256")
     monkeypatch.delenv(dcpx.ENV + "_TIES", raising=False)  # (rank, position)
     monkeypatch.delenv(dcpx.GRAPH_ONLY_ENV, raising=False)
     monkeypatch.setenv(dcpx.SPIN_ENV, "120")
@@ -3627,7 +3624,6 @@ def test_wide_dsa_dcp_exchange_proj(dcp8_group, monkeypatch, core, batch, q):
         pytest.skip("FlashInfer prims_ts sparse MLA cannot run here")
     monkeypatch.setattr(sparse_attn_indexer, "DCP_DECODE_TOPK_HOOKS", {})
     monkeypatch.setenv(dcpx.PARTS_ENV, "topk")
-    monkeypatch.setenv(dcpx.ENV + "_ONE_ROUND_ROWS", "256")
     monkeypatch.delenv(dcpx.ENV + "_TIES", raising=False)  # (rank, position)
     monkeypatch.delenv(dcpx.GRAPH_ONLY_ENV, raising=False)
     monkeypatch.setenv(dcpx.SPIN_ENV, "120")

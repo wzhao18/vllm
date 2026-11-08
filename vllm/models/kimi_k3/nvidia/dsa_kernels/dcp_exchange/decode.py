@@ -26,8 +26,8 @@ DCP top-k merge) | auto (on for SM107 under 1 < DCP == TP; other layouts keep th
 stock path) | 1 (DCP must equal TP); a prefill-only instance never builds it;
 ``VLLM_K31_DCP_EXCHANGE_PARTS`` = a comma (or semicolon) list of topk, q, o (default
 topk,o) and optionally ``part=lo-hi`` row ranges (e.g. ``topk,q=97-4096,o``);
-``VLLM_K31_DCP_EXCHANGE_ONE_ROUND_ROWS`` (default 256, 0: off) = the rows that take
-the one-round top-k (window centred at each rank's local estimate of the K-th key).
+Every top-k row takes the one-round exchange (window centred at each rank's local
+estimate of the K-th key; its mailbox holds every row of ``cap``).
 ``VLLM_K31_DCP_EXCHANGE_SPIN_S``: how long a kernel waits for a peer rank before it
 traps (default 600 s, the NCCL watchdog's order; 0 = forever, like DcpBox). The
 kernels' own 5 s default applies to tests and the build-time warmup only.
@@ -176,12 +176,6 @@ class DcpxDecode:
         # 65 us at M128.
         self.small_ctx = int(os.environ.get(ENV + "_SMALL_CTX", str(1 << 30)))
         self.spin_s = float(os.environ.get(SPIN_ENV, str(DEFAULT_SPIN_S)))
-        # Rows below this take one NVLink round: each rank sends 16-bit counts of a
-        # 256-key window centred at its local estimate of the K-th key (its local
-        # ceil(K * L / G)-th key) and its 256-key bin counts; rows whose K-th key
-        # falls outside the windows take one refine round over the K-th key's bin,
-        # so the selection is exact either way. 0: off.
-        self.one_round_rows = int(os.environ.get(ENV + "_ONE_ROUND_ROWS", "256"))
         self.fit_wave = bool(FIT_WAVE)
         if self.tie_order not in ("rank", "global"):
             raise ValueError(f"{ENV}_TIES: rank or global, got {self.tie_order!r}")
@@ -213,7 +207,15 @@ class DcpxDecode:
         span = self.W * self.interleave
         self.max_local_len = -(-model_len // span) * self.interleave
         self.K = topk
-        cap1 = min(self.cap, self.one_round_rows)
+        # Every row takes one NVLink round: each rank sends 16-bit counts of a 256-key
+        # window centred at its local estimate of the K-th key (its local
+        # ceil(K * L / G)-th key) and its 256-key bin counts; rows whose K-th key falls
+        # outside the windows take one refine round over the K-th key's bin, so the
+        # selection is exact either way. Rows past a 256-row 1R mailbox took the
+        # octave rounds (R8 + R4 + refine: 3 rounds, 8-12 us per call more at 512 rows),
+        # so the 1R mailbox holds every row (2 x cap x W x 392 words: 51 MB at DCP16,
+        # cap 1024).
+        cap1 = self.cap
         # Every rank's extension before any rank enters the first rendezvous: torch's
         # JIT load builds one rank at a time on the build directory's lock, and a
         # rendezvous wait past the store timeout (a FileStore's: 300 s a key) leaves
