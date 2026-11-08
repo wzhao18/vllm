@@ -59,6 +59,8 @@ ONE_ROUND_ROWS = 256
 # 20848 / 20288, B128 M512 29634 / 28788. The stock tie rule's extra NVLink round costs
 # the exchange 8.3-9.2 us per call at DCP16 q8 rows 8-64 (ties straddle ranks on every
 # row of bf16 logits), 1.3-8.2 at q4 rows 64-512, 13.8-14.8 at DCP4 rows 512.
+# DCP4 keeps the exchange: C512's TP4 x DCP4 x DP4 step (16 GPUs, q4, rows per DP
+# rank, same node, exchange / #63 merge) M128 26595 / 27576, M256 34041 / 34661.
 MERGE_DCP = frozenset({16})
 # Most bf16 keys a top-k CTA stages in shared memory (the kernel's 96 KB opt-in), and
 # a bound on its static shared memory (bytes).
