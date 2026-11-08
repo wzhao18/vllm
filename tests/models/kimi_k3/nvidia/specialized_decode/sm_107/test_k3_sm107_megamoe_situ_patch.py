@@ -7,8 +7,7 @@
 CPU: the patch applies to the installed DeepGEMM header; the SM107 launcher's
 host-side mirror of DeepGEMM (FP32 BLOCK_M rule, float literals). GPU (>= 2 SM107
 GPUs, DeepGEMM): the SM107 decode's own build of the patched kernel
-(``megamoe.kernel.SituMegaMoE``) is bitwise identical to DeepGEMM's stock kernel (also with the routed weights localized
-across the two dies, when MLOPart is available) and matches a PyTorch reference of the
+(``megamoe.kernel.SituMegaMoE``) is bitwise identical to DeepGEMM's stock kernel and matches a PyTorch reference of the
 K3.1 routed experts (MXFP8 x MXFP4, SiTU alpha 4 / beta 25, FP8 L1 output) on
 EP-sharded problems with random top-16 routing. Two shapes: 4 experts per rank
 at 1/7/64 tokens per rank (every expert is hit), and 28 experts per rank (the EP32
@@ -285,16 +284,6 @@ def _worker(rank: int, nranks: int, port: int, cache: str, epr: int, cases: tupl
         # the files differ in embedded build paths).
         a, b = _code_sections(ours.read_bytes()), _code_sections(theirs.read_bytes())
         assert a and a == b, (sorted(a), sorted(b))
-    # Expert localization (VLLM_K3_MEGAMOE_LOCALIZE=1, MLOPart): each N half in its die's HBM.
-    localized = hasattr(dg, "is_localization_available") and dg.is_localization_available()
-    if localized:
-        w1 = (dg.localize(l1[0]), l1[1])
-        w2 = (dg.localize(l2[0]), l2[1])
-        dg.destroy_localizer()
-        assert dg.is_localized(w1[0]) and dg.is_localized(w2[0])
-        for _ in range(2):
-            for t in cases:
-                assert torch.equal(run(t, w1, w2, situ), stock[t]), ("localized", rank, t)
     for t in cases:
         x, idx, tw = data[t]
         xq = utils.per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32)
@@ -302,7 +291,7 @@ def _worker(rank: int, nranks: int, port: int, cache: str, epr: int, cases: tupl
         ref = _reference(xq, idx, tw, w1_ref, w2_ref)
         err = (patched[t].float() - ref).norm() / ref.norm()
         print(f"rank {rank} experts/rank {epr} tokens {t} block_m {block_m[t]} zero-token experts "
-              f"{zero_experts[t]}/{num_experts}: patched{' == localized' if localized else ''} == stock "
+              f"{zero_experts[t]}/{num_experts}: patched == stock "
               f"bitwise, rel. L2 error vs reference "
               f"{float(err):.2e}")
         assert err < 2e-2, (rank, t, float(err))

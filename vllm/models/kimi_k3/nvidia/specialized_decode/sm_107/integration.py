@@ -63,7 +63,7 @@ class Sm107DecodeConfig(DecodeConfig):
         # The DSA indexer runs at stock Kimi K3 precision (FP32 logits): no
         # one-round DCP top-k merge (#63, BF16 logits only) is set up; the DCP
         # top-k is the FP32 local top-K and merge (cutedsl/dsa/dcp_topk.py).
-        # MegaMoE wide-EP kernel header / expert placement (env-selected), before
+        # The MegaMoE wide-EP kernel (megamoe.prepare_megamoe), before
         # the runner's warmup compiles MegaMoE.
         from .megamoe import prepare_megamoe
 
