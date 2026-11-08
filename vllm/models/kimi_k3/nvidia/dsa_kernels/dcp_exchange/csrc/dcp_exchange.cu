@@ -2511,6 +2511,8 @@ __global__ void __launch_bounds__(kThreads) topk_pp_hist_kernel(TopkParams p) {
   __shared__ uint32_t warp_sums[kWarps + 1];
   __shared__ int s_pre[kPPMaxRows + 1];
   const int tid = threadIdx.x;
+  // PDL: the window kernel may launch now; it waits for this grid's completion
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
   PPSched ps;
   pp_sched(p, s_pre, warp_sums, tid, ps);
   int it = blockIdx.x;
@@ -2553,6 +2555,11 @@ __global__ void __launch_bounds__(kThreads) topk_pp_window_kernel(TopkParams p) 
   __shared__ uint32_t s_v8[256], s_x8[256], s_a8c;
   __shared__ int s_b8c, s_top8, s_cq;
   const int row = blockIdx.x, tid = threadIdx.x;
+  // PDL (launched behind the histogram kernel): every CTA waits for its completion
+  // (and so for its pp_hist sums) before any read of them or exit, then releases the
+  // window-count kernel's launch
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
   const int L = p.local_len[row], Gl = p.global_len[row];
   if (!pp_row(p, L, Gl)) return;
   const uint4* hg = reinterpret_cast<const uint4*>(p.pp_hist + (int64_t)row * kCoarseBins);
@@ -2585,11 +2592,16 @@ __global__ void __launch_bounds__(kThreads) topk_pp_win_kernel(TopkParams p) {
   PPSched ps;
   pp_sched(p, s_pre, warp_sums, tid, ps);
   int it = blockIdx.x;
-  if (it >= ps.total) return;
+  if (it >= ps.total) {
+    asm volatile("griddepcontrol.wait;" ::: "memory");  // no exit before the window kernel's
+    return;
+  }
   int row, t0;
   pp_item(p, ps, it, row, t0);
   uint4 r[kPPG];
-  pp_load(p, row, t0, tid, r);
+  pp_load(p, row, t0, tid, r);  // the logits precede the pre-pass (stream order)
+  // PDL (launched behind the window kernel): its pp_lo / pp_thr after its completion
+  asm volatile("griddepcontrol.wait;" ::: "memory");
   int lo = p.pp_lo[row], thr = p.pp_thr[row];
   for (; it < ps.total; it += gridDim.x) {
     const int crow = row, ct0 = t0, clo = lo, cthr = thr;
@@ -3032,10 +3044,21 @@ void topk_merge(torch::Tensor logits, torch::Tensor local_len, torch::Tensor glo
     const dim3 g3((unsigned)std::max<int64_t>(1, std::min<int64_t>(s_grid3, items)), 1, 1);
     topk_pp_hist_kernel<<<g, kThreads, 0, cfg.stream>>>(p);
     C10_CUDA_CHECK(cudaGetLastError());
-    topk_pp_window_kernel<<<T, kThreads, 0, cfg.stream>>>(p);
-    C10_CUDA_CHECK(cudaGetLastError());
-    topk_pp_win_kernel<<<g3, kThreads, 0, cfg.stream>>>(p);
-    C10_CUDA_CHECK(cudaGetLastError());
+    // the window and window-count kernels launch programmatically behind their
+    // predecessor (each waits on griddepcontrol for its predecessor's results); the
+    // merge kernel keeps its own launch rule below
+    cudaLaunchAttribute pa[1];
+    pa[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    pa[0].val.programmaticStreamSerializationAllowed = 1;
+    cudaLaunchConfig_t c2 = {};
+    c2.blockDim = dim3(kThreads, 1, 1);
+    c2.stream = cfg.stream;
+    c2.attrs = pa;
+    c2.numAttrs = 1;
+    c2.gridDim = dim3((unsigned)T, 1, 1);
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&c2, topk_pp_window_kernel, p));
+    c2.gridDim = g3;
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&c2, topk_pp_win_kernel, p));
   }
   C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, kern, p));
 }
