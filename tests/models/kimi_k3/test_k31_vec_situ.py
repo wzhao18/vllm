@@ -30,6 +30,7 @@ pytestmark = pytest.mark.skipif(
     ],
 )
 def test_vec_situ_bitwise_stock(rows, cols, beta, linear_beta):
+    from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.model_executor.layers.activation import SituAndMul
     from vllm.models.kimi_k3.nvidia.model import KimiVecSituAndMul
 
@@ -37,8 +38,10 @@ def test_vec_situ_bitwise_stock(rows, cols, beta, linear_beta):
     x = torch.randn(rows, 2 * cols, generator=g, device="cuda") * 6
     x[0, :8] = torch.tensor([0.0, -0.0, 1e-30, -1e-30, 60.0, -60.0, 3e4, -3e4])
     x = x.to(torch.bfloat16)
-    ours = KimiVecSituAndMul(beta=beta, linear_beta=linear_beta)(x)
-    stock = SituAndMul(beta=beta, linear_beta=linear_beta)
-    for ref in (stock(x), stock.forward_cuda(x)):  # (its dispatch, and the CUDA op)
+    with set_current_vllm_config(VllmConfig()):
+        ours = KimiVecSituAndMul(beta=beta, linear_beta=linear_beta)(x)
+        stock = SituAndMul(beta=beta, linear_beta=linear_beta)
+        refs = stock(x), stock.forward_cuda(x)  # (its dispatch, and the CUDA op)
+    for ref in refs:
         assert ours.dtype == ref.dtype and ours.shape == ref.shape
         assert torch.equal(ours.view(torch.int16), ref.view(torch.int16))

@@ -71,9 +71,13 @@ def test_wanted_kv_role(sm, kv_role, expected):
 
 
 def test_stock_tie_rule():
-    """Ties at the K-th key go by ascending global id, the stock merge's rule; the
-    per-shape row floor."""
-    assert decode.TIE_ORDER == "global"
+    """Ties at the K-th key go by ascending global id, the stock merge's rule (no
+    other tie order is selectable); the per-shape row floor."""
+    import inspect
+
+    from vllm.models.kimi_k3.nvidia.dsa_kernels.dcp_exchange.ops import DcpExchange
+
+    assert "tie_order" not in inspect.signature(DcpExchange.topk_merge).parameters
     assert decode.ONE_ROUND_ROWS == 256
     # DCP16 (C1 / C8): steps up to 64 rows keep the #63 merge; other DCP sizes: all
     assert decode.MIN_ROWS == {16: 65}
