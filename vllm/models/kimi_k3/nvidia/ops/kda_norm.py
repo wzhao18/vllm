@@ -13,17 +13,14 @@ tile shape, warps and expressions, so the same layout and reduction order).
 The rstd / mean side outputs, which KDA does not read, are not written.
 """
 
-import os
 
 import torch
 
 from vllm.triton_utils import tl, triton
 
 _BT = 16  # rows per tile: FLA's choice for D <= 512
-_TILES = int(
-    os.environ.get("VLLM_K3_KDA_NORM_TILES_MAX", "8")
-)  # tiles per program, at most
-_STAGES = int(os.environ.get("VLLM_K3_KDA_NORM_STAGES", "3"))
+_TILES = 8  # tiles per program, at most
+_STAGES = 3
 _MIN_PROGRAMS = 848  # keep >= 4 programs per SM (212 SMs) before taking more tiles each
 
 

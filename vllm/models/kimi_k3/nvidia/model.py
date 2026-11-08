@@ -3,7 +3,6 @@
 """Kimi-K3 multimodal model implementation for vLLM."""
 
 import math
-import os
 from collections.abc import Hashable, Iterable
 from typing import TYPE_CHECKING, Any, cast
 
@@ -186,18 +185,35 @@ def can_shard_sequence_parallel_shared_expert(vllm_config: VllmConfig) -> bool:
     )
 
 
+def pd_prefill_worker(vllm_config: VllmConfig) -> bool:
+    """Whether this instance is the prefill side of a P/D deployment (a KV producer:
+    kv_producer or kv_both)."""
+    kv_transfer = getattr(vllm_config, "kv_transfer_config", None)
+    return kv_transfer is not None and bool(kv_transfer.is_kv_producer)
+
+
+# Smallest step (tokens, after CUDA-graph padding) whose token-shard MoE finishes with
+# the fused GEMM-AR (``KimiMoE._token_shard_gemm_ar``). Smaller steps keep the
+# separate all-reduce, which is faster there: on a TP8 prefill worker the fused path
+# cost ~+2 ms per 128-token step and saved ~1 ms per 384-token step.
+TOKEN_SHARD_GEMM_AR_MIN_TOKENS = 288
+
+
 def use_moe_token_shard(vllm_config: VllmConfig) -> bool:
     """Whether the routed MoE runs on token shards over a replicated stream.
 
-    Opt-in via ``VLLM_KIMI_K3_MOE_TOKEN_SHARD`` with EP + MegaMoE at TP > 1 and
-    DP 1. It replaces full sequence parallelism: attention, AttnRes and the
-    shared experts stay as under plain TP (shared weights TP-sharded), and only
-    the routed experts see one 1/TP token slice per rank (see
-    :meth:`KimiMoE._token_shard_forward`).
+    On by policy on the prefill workers of a P/D deployment (``pd_prefill_worker``,
+    where it was measured; decode instances and unified serving keep plain TP or
+    sequence parallelism) with EP + MegaMoE at TP > 1 and DP 1. It replaces full
+    sequence parallelism: attention, AttnRes and the shared experts stay as under
+    plain TP (shared weights TP-sharded), and only the routed experts see one 1/TP
+    token slice per rank (see :meth:`KimiMoE._token_shard_forward`), whose shared
+    down-projection's GEMM-AR adds them in its epilogue from
+    TOKEN_SHARD_GEMM_AR_MIN_TOKENS tokens on.
     """
     parallel_config = vllm_config.parallel_config
     return (
-        envs.VLLM_KIMI_K3_MOE_TOKEN_SHARD
+        pd_prefill_worker(vllm_config)
         and vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
         and parallel_config.enable_expert_parallel
         and parallel_config.pipeline_parallel_size == 1
@@ -228,7 +244,9 @@ def maybe_init_gemm_rs_ar(vllm_config: VllmConfig, use_sequence_parallel: bool) 
     # its singleton to exactly one mode.
     all_reduce = not use_sequence_parallel
     mode = "GEMM-AR" if all_reduce else "GEMM-RS"
-    enabled = envs.VLLM_KIMI_K3_GEMM_AR if all_reduce else envs.VLLM_ENABLE_GEMM_RS
+    # GEMM-AR: on wherever the shared kernel can run (its own capability checks);
+    # GEMM-RS: the stock VLLM_ENABLE_GEMM_RS opt-in.
+    enabled = True if all_reduce else envs.VLLM_ENABLE_GEMM_RS
     if not enabled:
         return False
 
@@ -243,14 +261,15 @@ def maybe_init_gemm_rs_ar(vllm_config: VllmConfig, use_sequence_parallel: bool) 
         vllm_config, N=config.hidden_size, all_reduce=all_reduce
     ):
         return False
-    flag = "VLLM_KIMI_K3_GEMM_AR" if all_reduce else "VLLM_ENABLE_GEMM_RS"
-    logger.info_once("To disable %s, set %s=0.", mode, flag)
+    if not all_reduce:
+        logger.info_once("To disable %s, set VLLM_ENABLE_GEMM_RS=0.", mode)
     return True
 
 
 def _gemm_ar_owns(t: torch.Tensor) -> bool:
-    if not envs.VLLM_KIMI_K3_GEMM_AR_ALIAS:
-        return False
+    """Whether ``t`` is a view of the GEMM-AR workspace: the GEMM-AR o_proj and
+    token-shard MoE hand their reduced output back as such a view (no copy; bitwise),
+    and a layer that keeps it past the next GEMM-AR copies it."""
     from vllm.model_executor.kernels.linear.cute_dsl import gemm_rs_ar
 
     op = gemm_rs_ar._gemm_rs_ar
@@ -259,7 +278,7 @@ def _gemm_ar_owns(t: torch.Tensor) -> bool:
 
 class KimiVecSituAndMul(nn.Module):
     """SituAndMul through the vectorized kernel in ops/situ_and_mul.py (bitwise
-    equal to the CUDA op for every input). Opt-in via ``VLLM_KIMI_K3_VEC_SITU``.
+    equal to the CUDA op for every input), for every SiTU MLP.
 
     For small inputs (up to 2048 rows of the TP8 shared expert's 768 columns,
     the CUDA-graph range) the CUDA op's one-block-per-row layout keeps more
@@ -364,13 +383,8 @@ class KimiMLP(nn.Module):
                 gemm_rs_ar.warn_incompatible_projection()
         if hidden_act == "silu":
             self.act_fn = SiluAndMul()
-        elif hidden_act == "situ" and envs.VLLM_KIMI_K3_VEC_SITU:
-            self.act_fn = KimiVecSituAndMul(
-                beta=activation_situ_beta or 1.0,
-                linear_beta=activation_situ_linear_beta,
-            )
         elif hidden_act == "situ":
-            self.act_fn = SituAndMul(
+            self.act_fn = KimiVecSituAndMul(
                 beta=activation_situ_beta or 1.0,
                 linear_beta=activation_situ_linear_beta,
             )
@@ -640,7 +654,6 @@ class KimiMoE(nn.Module):
             self.moe_token_shard
             and run_gemm_rs_ar
             and self.shared_experts is not None
-            and envs.VLLM_KIMI_K3_MOE_TOKEN_SHARD_GEMM_AR
         ):
             from vllm.model_executor.kernels.linear.cute_dsl.gemm_rs_ar import (
                 get_gemm_rs_ar,
@@ -800,12 +813,8 @@ class KimiMoE(nn.Module):
         * along K: ``[shared down | routed latent up]`` on
           ``[act(shared gate_up) | norm(MegaMoE output)]``, which is the layer
           output ``shared + routed`` in one GEMM (FP32 accumulation; replaces
-          the up projection's BF16 beta-add of the shared output).
-
-        VLLM_K3_MXFP8_PACK_MOE=0 keeps the four GEMMs."""
+          the up projection's BF16 beta-add of the shared output)."""
         self._packed_moe = None
-        if os.environ.get("VLLM_K3_MXFP8_PACK_MOE", "1") != "1":
-            return
         shared = self.shared_experts
         transform = self.routed_output_transform
         if (
@@ -983,7 +992,7 @@ class KimiMoE(nn.Module):
         gemm_ar = self._token_shard_gemm_ar
         if (
             gemm_ar is not None
-            and num_tokens >= envs.VLLM_KIMI_K3_MOE_TOKEN_SHARD_GEMM_AR_MIN_TOKENS
+            and num_tokens >= TOKEN_SHARD_GEMM_AR_MIN_TOKENS
             and gemm_ar.should_run(hidden_states)
         ):
             # Shared gate/up + activation, then the shared down-projection's
@@ -1002,7 +1011,7 @@ class KimiMoE(nn.Module):
                 shared.down_proj,
                 residual=routed_rows,
                 residual_row0=start,
-                copy_out=not envs.VLLM_KIMI_K3_GEMM_AR_ALIAS,
+                copy_out=False,
             )
         # TP-sharded shared experts (reduce_results=False): this rank's partial.
         output = self.shared_experts(hidden_states)
@@ -1281,7 +1290,7 @@ class KimiDecoderLayer(nn.Module):
         assert prefix_sum is not None
         if self.is_block_write_layer:
             # The prefix sum lives across later layers' GEMM-ARs: never keep a
-            # view of the GEMM-AR workspace (VLLM_KIMI_K3_GEMM_AR_ALIAS).
+            # view of the GEMM-AR workspace (``_gemm_ar_owns``).
             if _gemm_ar_owns(hidden_states):
                 hidden_states = hidden_states.clone()
             prefix_sum = hidden_states
@@ -1942,8 +1951,7 @@ class KimiLinearForCausalLM(
             # Build the fused MXFP8 activation producers at load, not mid-step.
             mxfp8_act.warmup()
             logger.info_once(
-                "Kimi K3: online-MXFP8 projections take fused MXFP8 activations "
-                "(VLLM_K3_MXFP8_FUSED_ACT=0 to quantize per linear)."
+                "Kimi K3: online-MXFP8 projections take fused MXFP8 activations."
             )
         # The specialized decode packs the DSA projections its own way.
         if self.specialized_decode_config is None:
@@ -1961,11 +1969,10 @@ class KimiLinearForCausalLM(
                 packed_moe += module._packed_moe is not None
         if packed_moe:
             logger.info_once(
-                "Kimi K3: %d MoE layers run the packed MXFP8 shared/latent GEMMs "
-                "(VLLM_K3_MXFP8_PACK_MOE=0 to disable).",
+                "Kimi K3: %d MoE layers run the packed MXFP8 shared/latent GEMMs.",
                 packed_moe,
             )
-        # K3.1 DSA decode under DCP: NCCL-free top-k / Q / O exchanges.
+        # K3.1 DSA decode under DCP: the NCCL-free top-k exchange (on by policy).
         from .dsa_kernels.dcp_exchange.decode import build as build_dcpx
 
         self.dcpx = build_dcpx(self.model, self.vllm_config)
@@ -1974,9 +1981,9 @@ class KimiLinearForCausalLM(
         from .dsa_kernels.dsa_core.decode import build as build_dsa_core
         from .specialized_decode.runtime.decode import SpecializedDecode
 
-        # The DSA sparse core (VLLM_K31_DSA_CORE=1), which the DSA layers' PreparedDsa
-        # picks up from their indexers.
-        build_dsa_core(self.model)
+        # The DSA sparse core (on by policy where it can run: dsa_core.decode.build),
+        # which the DSA layers' PreparedDsa picks up from their indexers.
+        build_dsa_core(self.model, self.specialized_decode_config)
         self.specialized_decode = SpecializedDecode(
             self.model, self.specialized_decode_config
         )

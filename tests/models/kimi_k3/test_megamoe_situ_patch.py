@@ -214,7 +214,7 @@ def _worker(rank: int, nranks: int, port: int, cache: str, epr: int, cases: tupl
         patched = {t: run(t) for t in cases}
         for t in cases:
             assert torch.equal(patched[t], stock[t]), (rank, t)
-    # Expert localization (VLLM_K3_MEGAMOE_LOCALIZE=1, MLOPart): each N half in its die's HBM.
+    # Expert localization (MLOPart, DeepGEMM's localize): each N half in its die's HBM.
     localized = hasattr(dg, "is_localization_available") and dg.is_localization_available()
     if localized:
         w1 = (dg.localize(l1[0]), l1[1])

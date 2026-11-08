@@ -37,7 +37,6 @@ from typing import TYPE_CHECKING, cast
 import torch
 from torch import nn
 
-import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import (
@@ -643,12 +642,10 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             attn_out = _gate_sigmoid_mul(attn_out, gate)
 
         if self.gemm_rs_ar is not None and self.gemm_rs_ar.should_run(attn_out):
-            # VLLM_KIMI_K3_GEMM_AR_ALIAS: hand back the workspace view; the
-            # decoder layer consumes it before the next GEMM-AR, and copies it
-            # only where it keeps it (AttnRes block-write layers).
-            return self.gemm_rs_ar.apply(
-                attn_out, self.o_proj, copy_out=not envs.VLLM_KIMI_K3_GEMM_AR_ALIAS
-            )
+            # Hand back the workspace view (bitwise; no copy): the decoder layer
+            # consumes it before the next GEMM-AR, and copies it only where it
+            # keeps it (AttnRes block-write layers).
+            return self.gemm_rs_ar.apply(attn_out, self.o_proj, copy_out=False)
 
         return self.o_proj(attn_out)[0]
 

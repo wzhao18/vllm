@@ -517,8 +517,9 @@ def lpc_filled(table, n, r, reqs: cutlass.Constexpr, page: cutlass.Constexpr = 6
     return cutlass.select_(pages > 0, nf, Int32(0))
 
 
-# The DL7 verify rows (q 8) whose DS-T2P core runs LPC instead of the LONG_SPLIT work
-# list (VLLM_KIMI_K3_DS_LPC), at LPC_SLOTS partial slots per request. 16 ranks, whole
+# The DL7 verify rows (q 8) whose DS-T2P core ran LPC instead of the LONG_SPLIT work
+# list, at LPC_SLOTS partial slots per request (DS-T2P is no longer selected: its
+# correctness hold, 10-19). 16 ranks, whole
 # step, LPC vs the list (axa-lpc16r1, before the prologue-after-wait fix, ~1 us per MLA
 # layer): mix8 -2.08%, mix16 -0.51%, mix24 -0.37%; uniform 32k B8 / B16 / B24 +0.06 /
 # +0.90 / -0.11%. Only B8 (rows 64) wins clearly; 112-192 keep DS-T2P's list.

@@ -39,7 +39,6 @@ old state). What changes: the 8 row loads are issued up front and the 8 token
 bodies are unrolled, and a program covers 512 channels (4 warps): 18.6 us.
 """
 
-import os
 
 import torch
 
@@ -415,8 +414,8 @@ def packed_causal_conv1d_fn(
 
 # Per-plane kernel (``supported`` / ``kda_prefill_conv``); see the module docstring.
 _BLOCK_M = 8  # must match the causal-conv1d metadata (compute_causal_conv1d_metadata)
-_BLOCK_N = int(os.environ.get("VLLM_K3_KDA_CONV_BN", "512"))
-_WARPS = int(os.environ.get("VLLM_K3_KDA_CONV_WARPS", "4"))
+_BLOCK_N = 512
+_WARPS = 4
 
 
 @triton.jit
