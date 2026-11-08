@@ -171,7 +171,7 @@ def sp_unsupported(attention, box, ctx):
         ),
         (
             getattr(indexer, "dsac", None) is not None,
-            "the DSA sparse core (VLLM_K31_DSA_CORE; trtllm-gen only)",
+            "the DSA sparse core (its build() leaves SP to trtllm-gen)",
         ),
         (heads != box.heads, f"{heads} heads per rank on a {box.heads}-head box"),
         (

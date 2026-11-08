@@ -22,11 +22,6 @@ _LOCAL: dict[str, Callable[[], Any]] = {
     # chunks (LPC, mla.dcp.lpc_table) at the q 8 verify rows LPC_ROWS. Off by
     # default.
     "VLLM_KIMI_K3_DS_LPC": lambda: bool(int(os.getenv("VLLM_KIMI_K3_DS_LPC", "0"))),
-    # The routed MoE on token shards over a replicated stream (prefill side; the
-    # decode only reads it to refuse sequence-parallel decode under it).
-    "VLLM_KIMI_K3_MOE_TOKEN_SHARD": lambda: bool(
-        int(os.getenv("VLLM_KIMI_K3_MOE_TOKEN_SHARD", "0"))
-    ),
 }
 
 

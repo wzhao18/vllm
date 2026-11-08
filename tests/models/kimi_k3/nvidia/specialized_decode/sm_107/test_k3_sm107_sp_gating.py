@@ -165,11 +165,7 @@ def rubin(monkeypatch):
     from vllm.v1.attention.backends.mla import flashinfer_mla_sparse
 
     monkeypatch.setattr(flashinfer_mla_sparse, "use_prims_ts", lambda c, d: False)
-    for name in (
-        "VLLM_ENABLE_GEMM_RS",
-        "VLLM_KIMI_K3_AUX_ATTN_RES_STREAM",
-        "VLLM_KIMI_K3_MOE_TOKEN_SHARD",
-    ):
+    for name in ("VLLM_ENABLE_GEMM_RS", "VLLM_KIMI_K3_AUX_ATTN_RES_STREAM"):
         monkeypatch.setattr(envs, name, False, raising=False)
 
 
@@ -209,13 +205,12 @@ def test_other_topologies_are_not_sp(tp, dcp, ep, backend):
     assert unsupported(config) is not None
 
 
-def test_moe_token_shard_is_not_sp(monkeypatch):
-    """The MoE token shard replaces SP in the stock decoder: not the SP topology."""
-    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.compat import model
-
-    monkeypatch.setattr(model, "use_moe_token_shard", lambda config: True)
-    assert not sp_topology(deployment())
-    assert "TP other than 8/16" in unsupported(deployment())
+def test_sp_topology_has_no_token_shard_switch(monkeypatch):
+    """This tree's stock decoder has no MoE token shard: no environment switch
+    (the source branch's VLLM_KIMI_K3_MOE_TOKEN_SHARD) takes TP4 = DCP4 off SP."""
+    monkeypatch.setenv("VLLM_KIMI_K3_MOE_TOKEN_SHARD", "1")
+    assert sp_topology(deployment())
+    assert unsupported(deployment()) is None
 
 
 def test_tp16_gate_unchanged():

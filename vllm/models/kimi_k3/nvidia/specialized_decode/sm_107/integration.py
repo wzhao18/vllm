@@ -68,11 +68,12 @@ class Sm107DecodeConfig(DecodeConfig):
         from .megamoe import prepare_megamoe
 
         prepare_megamoe(backbone, vllm_config)
-        # The DSA sparse core (VLLM_K31_DSA_CORE=1), which the DSA layers'
-        # PreparedDsa picks up from their indexers.
+        # The DSA sparse core (on by policy where it can run: dsa_core.decode.build,
+        # given this DecodeConfig for the SP / verify-length policy), which the DSA
+        # layers' PreparedDsa picks up from their indexers.
         from .dsa_kernels.dsa_core.decode import build as build_dsa_core
 
-        build_dsa_core(backbone)
+        build_dsa_core(backbone, self)
         decode = Sm107SpecializedDecode(backbone, self)
         lm.specialized_decode = decode
         # From here on forward() returns normalized hidden states on every step.
