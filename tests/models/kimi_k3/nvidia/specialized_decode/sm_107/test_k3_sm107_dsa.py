@@ -1744,7 +1744,6 @@ def test_flashinfer_dcp_core_merges_to_full_attention(
         core = SimpleNamespace(
             fi=fi,
             impl=impl,
-            count_stats=None,
             indexer=SimpleNamespace(cp_kv_cache_interleave_size=1),
             indexer_stage=SimpleNamespace(merge_rows=merge_rows),
             query_stage=SimpleNamespace(q_fp8=None, head_w=None),
@@ -2364,8 +2363,8 @@ def run_layer_step(
     parity (consecutive layers alternate), each with the merge's rows and counts
     and FlashInfer's latent and LSE poisoned before it, ``replays`` times; both
     must give the eager step's rows bit for bit. ``sparse_core``: under DCP, the DSA
-    sparse core's variant (dsa_core.decode.parse_variant) at every row, as
-    VLLM_K31_DSA_CORE=1 serves it (its own pushes and DcpValue(pushed); with
+    sparse core's variant (dsa_core.decode.parse_variant) at every row, as its
+    build() policy serves it (its own pushes and DcpValue(pushed); with
     ``graph`` the merge's rows and counts are still poisoned before each layer),
     and the step again on FlashInfer's chain over the same rows (``chain_out``).
     Under DCP the top-k is the FP32 DCP top-k (every rank's local top-K, the
@@ -2724,7 +2723,7 @@ def sparse_dsa_core(device, heads, variant):
     )
 
     spec = f"1-64:{variant}"
-    return DsacDecode(device, heads, rows=64, spec=spec, skip="")
+    return DsacDecode(device, heads, rows=64, spec=spec)
 
 
 def exact_topk_widths(index, table, contexts, q, query, weights, ids, world=1):
@@ -3353,7 +3352,7 @@ def test_prepared_dsa_dcp_graph_poisoned(dcp8_group, batch, overlap, partials):
 @pytest.mark.parametrize("variant", ["2x16s2", "1x16", "8x16s4"])
 @pytest.mark.parametrize("batch", [8, 16])
 def test_prepared_dsa_dcp_sparse_core(dcp8_group, batch, variant, overlap):
-    """The DSA sparse core (VLLM_K31_DSA_CORE) on PreparedDsa's DCP steps at q8 (the
+    """The DSA sparse core (on by policy) on PreparedDsa's DCP steps at q8 (the
     DL7 rows of C1 and C8; under the KIMI_K3_SD_DCP16_INIT launch DCP16): every
     rank's core polls the q mailbox (rank 0's forked publish held back), decodes
     the 96 gathered heads over its rows of the FP32 DCP top-k and pushes them to their
@@ -3385,7 +3384,7 @@ def test_prepared_dsa_dcp_sparse_core(dcp8_group, batch, variant, overlap):
     [(8, "1-16:bf16,17-64:proj"), (16, "1-16:bf16,17-64:proj"), (8, "proj")],
 )
 def test_prepared_dsa_dcp_sparse_core_partials(dcp8_group, batch, partials):
-    """The DSA sparse core (VLLM_K31_DSA_CORE, 2x16s2 at q8) under a partials
+    """The DSA sparse core (2x16s2 at q8) under a partials
     policy (r1.DsaBox's argument): on the "bf16" rows of a mixed table (a DL7 render's
     "1-16:bf16,17-64:proj") it still serves M8 / M16; on "proj" rows it stands
     aside (it pushes BF16 latent rows only) for FlashInfer's decode, the W_UV bmm
@@ -3426,7 +3425,7 @@ LONG_OFFSET, SKEW_EXP = 6000, 8
 @pytest.mark.parametrize("rows", ["short", "balanced", "skewed"])
 @pytest.mark.parametrize("batch", [8, 16])
 def test_prepared_dsa_dcp_sparse_core_rows(dcp8_group, batch, rows, overlap):
-    """test_prepared_dsa_dcp_sparse_core (VLLM_K31_DSA_CORE at 1-64:2x16s2, q8) on
+    """test_prepared_dsa_dcp_sparse_core (the core at 1-64:2x16s2, q8) on
     the FP32 DCP top-k's rows of short, long and rank-skewed contexts: every rank's
     core decodes its rows of the exact global top-k, which hold min(K, length) keys
     a row over the ranks; on skewed rows a row's counts differ twofold over the

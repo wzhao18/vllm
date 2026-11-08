@@ -109,21 +109,17 @@ def target_decode_rows(vllm_config, q) -> tuple[int, ...]:
 
 def sp_topology(vllm_config) -> bool:
     """Whether the deployment is the sequence-parallel decode topology: TP4 = DCP4
-    attention groups (one pipeline stage) over expert-parallel MegaMoE without the
-    MoE token shard, i.e. the stock K3 decoder's ``use_sequence_parallel`` at TP4 =
-    DCP4."""
+    attention groups (one pipeline stage) over expert-parallel MegaMoE, i.e. the stock
+    K3 decoder's ``use_sequence_parallel`` at TP4 = DCP4 (this tree's stock model
+    has no MoE token shard, so no switch can turn it off)."""
     parallel = vllm_config.parallel_config
-    if not (
+    return (
         parallel.tensor_parallel_size == 4
         and parallel.decode_context_parallel_size == 4
         and parallel.pipeline_parallel_size == 1
         and parallel.enable_expert_parallel
         and vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
-    ):
-        return False
-    from ..compat.model import use_moe_token_shard
-
-    return not use_moe_token_shard(vllm_config)
+    )
 
 
 def kda_dtypes(vllm_config):
