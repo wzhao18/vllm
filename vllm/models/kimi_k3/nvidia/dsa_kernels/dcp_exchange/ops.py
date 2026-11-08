@@ -53,37 +53,41 @@ _ERR_CODES = {
 }
 
 # A top-k launch with keys in global memory (segmax 0) takes the balanced pre-pass
-# (csrc topk_pp_*_kernel: the coarse histogram, window counts and candidates of every
-# row from a grid over all keys) when a row's CTA would stream more than this many
-# keys itself. The pre-pass costs about one pass over every row's keys and leaves the
-# merge kernel the exchange and the WRITE; the in-kernel passes cost ~3 latency-bound
-# passes over the longest row's CTA segment. Measured on VR200 (q4 AgentX contexts,
-# us per call, in-kernel passes -> pre-pass): DCP4 (100K keys per CTA, 2 CTAs per
-# row) 64 / 256 / 512 rows 68.7 / 81.6 / 115.0 -> 47.8 / 61.3 / 106.3; DCP16 (50K keys,
-# 1 CTA) 256 / 512 / 1024 rows 53.1 / 57.5 / 87.6 -> 58.3 / 68.1 / 122.4.
-TOPK_PREPASS_MIN_KEYS = 1 << 16
+# (csrc topk_pp_*_kernel: the coarse histogram, window counts and candidates of the
+# rows from a grid over their keys) when a row's CTA could stream more than
+# ``TOPK_PREPASS_ROW_KEYS`` keys itself. The in-kernel passes are issue-latency bound
+# (one 256-thread CTA per row segment: ~3 passes at ~8 GB/s over the longest
+# segment); the pre-pass spreads the long rows' keys over the whole GPU and leaves the
+# merge kernel the exchange and the WRITE.
+#
+# Rows of at most ``topk_prepass_min`` local keys still run their own passes in the
+# merge kernel (pp_row(); the pre-pass kernels cost about one pass over the keys they
+# cover plus three launches): 16K keys per CTA when every row is co-resident, 32K
+# when the rows take more than one persistent turn (the merge kernel is long then).
+# Measured on VR200 (q4 AgentX contexts, real-logit marginals, us per call; pre-pass
+# for rows above 0 / 8K / 16K / 32K keys per CTA, "-": not measured):
+#   DCP4  (2 CTAs per row) 64 rows 45.7 / 46.8 / - / 56.4, 256 rows 59.5 / 57.5 / - / 63.1,
+#         512 rows (2 turns) 104.3 / 100.7 / - / 86.5;
+#   DCP8  256 rows (2 CTAs) 55.8 / 56.8 / 52.5 / 57.7, 512 rows 77.5 / 74.6 / 66.3 / 64.0,
+#         1024 rows (2 turns) 150.1 / 147.6 / 142.7 / 118.9;
+#   DCP16 local lengths (4 ranks, contexts / 4) 256 rows 44.2 / 41.6 / 47.0 / 54.8,
+#         512 rows 56.9 / 54.7 / 52.9 / 62.9, 1024 rows (2 turns) 101.0 / 91.0 / 91.3 / 86.0
+#         (no pre-pass: 53.6 / 59.8 / 88.8).
+TOPK_PREPASS_ROW_KEYS = 1 << 14
+TOPK_PREPASS_TURN_KEYS = 1 << 15
 
 
 def topk_prepass(cluster: int, segmax: int, max_local_len: int) -> bool:
     """Whether a top-k launch of ``cluster`` CTAs per row with ``segmax`` staged keys
-    (0: keys in global memory) takes the pre-pass (``TOPK_PREPASS_MIN_KEYS``)."""
-    return segmax == 0 and -(-max_local_len // cluster) > TOPK_PREPASS_MIN_KEYS
-
-
-# Under the pre-pass, rows of at most this many local keys per CTA run their own passes
-# in the merge kernel when the launch's rows take more than one persistent turn (the
-# merge kernel is long then, and the shorter rows' passes cost less there than in the
-# pre-pass kernels ahead of it); with every row resident, every row takes the pre-pass.
-# Measured (VR200 DCP4, 2 CTAs per row, us per call, every row -> rows above 32K keys
-# per CTA): 64 / 256 rows (one turn) 45.7 / 59.5 -> 56.4 / 63.1; 512 rows (two turns)
-# 104.3 -> 86.5 (above 8K keys per CTA: 100.7, 24K: 95.0, 48K: 113.0, 64K: 120.6).
-TOPK_PREPASS_TURN_KEYS = 1 << 15
+    (0: keys in global memory) takes the pre-pass (``TOPK_PREPASS_ROW_KEYS``)."""
+    return segmax == 0 and -(-max_local_len // cluster) > TOPK_PREPASS_ROW_KEYS
 
 
 def topk_prepass_min(cluster: int, rows: int, resident: int) -> int:
     """Local keys up to which a row of a pre-pass launch (``rows`` rows, ``resident``
     co-resident clusters of ``cluster`` CTAs) runs its own passes."""
-    return 0 if rows <= resident else TOPK_PREPASS_TURN_KEYS * cluster
+    per_cta = TOPK_PREPASS_ROW_KEYS if rows <= resident else TOPK_PREPASS_TURN_KEYS
+    return per_cta * cluster
 
 
 def _load_ext():
