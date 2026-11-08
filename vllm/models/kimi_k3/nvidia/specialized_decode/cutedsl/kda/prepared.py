@@ -19,6 +19,7 @@ from ...shapes import Choice, Path, rows_policy
 from ..common.host import fake, layout, prepare_shared_carveout, stream, to_cute
 from ..common.policy import batch_table
 from .kernel import KdaSplit
+from .recover import KdaSplit as RecoverKdaSplit
 from .verify import KdaVerifyCols, KdaVerifyPrepared, KdaVerifyRows
 from .verify_loop import KdaVerifyLoop, KdaVerifyLoopStock
 from .verify_packed import KdaVerifyPacked
@@ -180,16 +181,32 @@ VERIFY_Q: dict = {
 #             (Halves trails by 3-8%; unchanged)
 # q values without a row here keep VERIFY_WIDE / VERIFY_Q with ``FP32_WIDE`` in place
 # of the BF16-only kernels.
-# 2026-11-08: the Wide rows run KdaVerifyLoopStock (7) instead: the stock composed
-# verify's math (KdaSplit's / Wide's differ from stock native Triton by relerr 3.4e-3
-# in the outputs and 2.1e-3 in the checkpoints; LoopStock by FP32 reduction order
-# only: 4e-8 state relerr, ~1e-5 output relerr, 1 in 10^5 BF16 outputs differ, conv
-# window bitwise) and persistent (kda.verify_loop). VR200 kernel bench (nqbench
-# kdaf7 / kdaf8: 1 GPU, 69 layers, own cold FP32 slots, CUDA graph, us per layer,
-# Wide -> LoopStock): q4 B16 7.40 -> 7.17, B32 8.48 -> 8.53, B64 16.77 -> 15.94,
-# B128 32.70 -> 30.82, B256 64.58 -> 61.72; q8 B16 12.29 -> 12.11, B32 13.67 ->
-# 13.72, B64 26.63 -> 26.09. The KdaSplit rows (q4 B1-11 / B13-15 / B36-40, q8 B1-11
-# / B13-15) are unchanged.
+# 2026-11-08: an FP32 state's plain verify computes the stock composed verify's math
+# (native Triton causal_conv1d_update -> fused_recurrent_kda -> rms_norm_gated, what
+# stock runs at TP16: FlashInfer's packed decode rejects 6 heads) at every row: the
+# Wide rows run KdaVerifyLoopStock (7, kda.verify_loop) and the KdaSplit rows (0) the
+# stock-math KdaSplit (``KdaSplitStock``: recover.KdaSplit, the RecoverSSM record
+# kernel's Triton formulas, record off). KdaSplit / Wide / Halves / Packed / Loop
+# differ from stock by output relerr 3.4e-3 and checkpoint relerr 2.1e-3 (no BF16
+# rounding of the conv / SiLU outputs, fast rsqrt / exp); never selected for an FP32
+# state (``wide_kind``). The two stock-math kernels are bit for bit equal to each
+# other at every measured row (q4 B1-40, q8 B1-15) and vs stock (nqbench kdaf9 /
+# kdaf11): conv window bitwise, checkpoints relerr <= 4.6e-8 (FP32 reduction order;
+# ~17% of the state words differ in the last bits), outputs relerr <= 1.2e-4, at
+# most 1.5e-4 of the BF16 outputs one rounding apart. VR200 kernel bench (1 GPU, 69
+# layers, own cold FP32 slots, CUDA graph, us per layer), kdaf9, Wide -> LoopStock:
+# q4 B16 7.43 -> 7.21, B32 8.39 -> 8.54, B64 16.85 -> 15.97, B128 32.86 -> 30.86,
+# B256 64.86 -> 61.84; q8 B16 12.40 -> 12.23, B32 13.58 -> 13.90, B64 26.90 ->
+# 26.12; kdaf11: q4 B25 8.10 -> 7.95, B28 8.38 -> 8.23, B35 8.74 -> 8.96, B41
+# 14.92 -> 15.42, B44 15.20 -> 15.37, B47 15.50 -> 15.39 (+1..+3.3% at B32-44: the
+# price of stock math, Wide's is not; KdaSplitStock trails further there). The
+# KdaSplit rows, kdaf11, KdaSplit -> KdaSplitStock (LoopStock): q4 B1 2.92 -> 2.95
+# (6.53), B4 3.54 -> 3.59 (6.60), B8 4.68 -> 4.69 (6.67), B11 5.64 -> 5.77, B14
+# 5.59 -> 5.57, B15 6.87 -> 6.85 (7.05), B36 13.10 -> 13.20 (15.47), B40 13.37 ->
+# 13.54 (15.41); q8 B1 4.73 -> 4.84 (10.44), B4 5.93 -> 6.13 (10.54), B8 7.50 ->
+# 7.52 (10.84), B11 8.74 -> 8.73 (10.96), B14 11.88 -> 11.59 (11.33), B15 11.99 ->
+# 11.86 (12.05): stock math at +0..3%, KdaSplit stays ahead of LoopStock there
+# (q8 B14 within 2.3%), so the crossovers stand.
 FP32_VERIFY_WIDE: dict = {
     (10, 7): {4: "12:7,16-35:7,36-40:0,41-512:7", 8: "12:7,16-256:7"},
 }
@@ -218,6 +235,20 @@ WIDE_NAMES = ("kdasplit", "wide", "halves", "stream", "stream3", "packed",
 # COLS at B8 swept with an FP32 state; the stock S1 crossover (STOCK_ROWS) too.
 # (FP32_WIDE: KdaVerifyLoopStock, FP32 state only; a BF16 state at q > 4 runs Wide.)
 BF16_ONLY, FP32_WIDE, KIND_WIDE = (3, 4), 7, 1
+
+
+class KdaSplitStock(RecoverKdaSplit):
+    """The plain verify (q > 1, gate mode 0) of an FP32 state at the KdaSplit rows:
+    ``recover.KdaSplit`` (the stock Triton verify's formulas and instructions, see its
+    docstring) without records, at ``schedule_of``'s geometry. KdaSplit's L2
+    evict-first hint only marks staged traffic, which verify never stages (its FP32
+    checkpoint stores are predicated and take no hint), so it is dropped here."""
+
+    bf16_state = False
+
+    def __init__(self, heads, batch, gate_mode, has_bias, schedule, tokens):
+        assert tokens > 1 and gate_mode == 0, "KdaSplitStock: plain verify, mode 0"
+        super().__init__(heads, batch, gate_mode, has_bias, tuple(schedule)[:4], tokens)
 _VERIFY = {
     "rows": VERIFY_ROWS, "cols": VERIFY_COLS, "wide": VERIFY_WIDE,
     "load_norm": VERIFY_LOAD_NORM,
@@ -250,9 +281,11 @@ def wide_kind(requests, tokens, capability, bf16_state=False, gate_mode=0, heads
     Open-ended: requests above the table's last row take that row's kernel (each
     wide kernel's grid is (CTAs per head, heads, B): no request cap), so any captured
     batch runs the kernel that scales instead of the default-geometry KdaSplit (~1.9x
-    Wide's time at q4 B96-192, see above). ``BF16_ONLY`` values need a BF16 state and
-    q <= 4; otherwise ``FP32_WIDE`` runs. The wide kernels run gate mode 0 without
-    fast math (their asserts): other layers (TP8: gate mode 1, 12 heads) keep
+    Wide's time at q4 B96-192, see above). An FP32 state runs ``FP32_WIDE`` (the
+    stock-math KdaVerifyLoopStock) wherever its table names a wide kernel, at any q
+    and head count, and the stock-math ``KdaSplitStock`` elsewhere (``make_kernel``);
+    ``BF16_ONLY`` values need q <= 4 (else Wide). The wide kernels run gate mode 0
+    without fast math (their asserts): other layers (TP8: gate mode 1, 12 heads) keep
     KdaSplit."""
     if tokens == 1 or gate_mode != 0 or heads == 12:
         return 0
@@ -260,8 +293,10 @@ def wide_kind(requests, tokens, capability, bf16_state=False, gate_mode=0, heads
     kind = table.get(requests)
     if kind is None and table and requests > max(table):
         kind = table[max(table)]
-    if kind in BF16_ONLY and (not bf16_state or tokens > 4):
-        kind = KIND_WIDE if bf16_state else FP32_WIDE
+    if kind and not bf16_state:  # the stock-math wide verify (FP32_VERIFY_WIDE)
+        kind = FP32_WIDE
+    if kind in BF16_ONLY and tokens > 4:
+        kind = KIND_WIDE
     return kind or 0
 
 
@@ -317,6 +352,11 @@ def make_kernel(options, capability, prepared=False) -> KdaSplit:
     rows = rows if isinstance(rows, tuple) else (rows,)
     cols = verify_table("cols", capability, tokens).get(requests)
     wide = wide_kind(requests, tokens, capability, bf16_state, gate_mode, heads)
+    if prepared and not bf16_state:  # no silent fallback: fold only a BF16 state
+        raise ValueError(
+            "the prepared verify (KdaInProj64 operands, KdaSplit's math) needs a BF16 "
+            "state; an FP32 state runs the stock-math plain verify"
+        )
     if prepared and cols is not None:  # the transposed recurrence
         return KdaVerifyCols(*options, cols)
     if prepared and rows[0] > 1:  # several state rows per thread, operands loaded once
@@ -325,6 +365,8 @@ def make_kernel(options, capability, prepared=False) -> KdaSplit:
         return KdaVerifyPrepared(*options)
     if wide:  # one or two CTAs per (request, head), or the chunked verify
         return WIDE_KINDS[wide - 1](*options)
+    if not bf16_state and tokens > 1 and gate_mode == 0:  # stock math (FP32 state)
+        return KdaSplitStock(*options[:6])
     lean = tokens > 1 and capability in LEAN_VERIFY
     norm = verify_table("load_norm", capability, tokens).get(requests)
     return KdaSplit(*options, lean, bool(norm))

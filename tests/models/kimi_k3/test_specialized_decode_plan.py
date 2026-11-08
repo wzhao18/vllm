@@ -893,17 +893,29 @@ def test_kda_fp32_policy_picks_the_measured_best():
     ] * 3
 
 
-def test_kda_fp32_table_falls_back_per_q():
-    """A verify length without an FP32_VERIFY_WIDE row keeps VERIFY_WIDE / VERIFY_Q
-    with KdaVerifyWide in place of the BF16-only kernels (q2: Halves at 33-48)."""
+def test_kda_fp32_verify_is_stock_math_at_every_q():
+    """A verify length without an FP32_VERIFY_WIDE row keeps VERIFY_WIDE / VERIFY_Q's
+    crossovers, with the stock-math kernels of an FP32 state: KdaVerifyLoopStock
+    wherever they name a wide kernel (q2: Wide / Halves / Wide from 16), the
+    stock-math KdaSplit elsewhere; 24 heads (the SP decode) likewise."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import prepared
 
     assert 2 not in prepared.FP32_VERIFY_WIDE[RUBIN]
     kinds = kda_kinds(2, False, range(1, 129))
-    assert kda_runs(kinds) == [
+    assert kda_runs(kinds) == [(1, 15, "kdasplit"), (16, 128, "loopstock")]
+    bf16 = kda_kinds(2, True, range(1, 129))
+    assert kda_runs(bf16) == [
         (1, 15, "kdasplit"), (16, 32, "wide"), (33, 48, "halves"), (49, 128, "wide"),
     ]  # fmt: skip
     assert prepared.wide_table(RUBIN, 2, False) == prepared.wide_table(RUBIN, 2, True)
+    for q in (2, 4, 5, 8):
+        for b in (1, 8, 16, 36, 48, 64, 256):
+            kernel = kda_kernel(b, q, False)
+            stock = (prepared.KdaVerifyLoopStock, prepared.KdaSplitStock)
+            assert type(kernel) in stock, (q, b, type(kernel))
+            assert prepared.verify_kernel(b, q, RUBIN, False, 0, 24) in (
+                "kdasplit", "loopstock"
+            )
 
 
 @pytest.mark.parametrize("bf16_state", [False, True], ids=["fp32", "bf16"])
@@ -1029,13 +1041,15 @@ def test_kda_fp32_head_compile_probe(head_probe, batch, q, name):
 
 @pytest.mark.parametrize("compiles", [True, False], ids=["compiles", "fails"])
 def test_kda_fp32_head_probe_decides_in_the_provider(monkeypatch, head_probe, compiles):
-    """A Rubin TP16 KDA layer (q8) with an FP32 state builds its KdaHead (q1 B8, B1 x
-    q8, 2 x q8) only when the kernels compile; when they fail it builds none, before
-    anything is set up for the head (no KdaHead index or F_A buffer, which the MoE
-    tail's early release and the AttnRes carve-out follow), and keeps the pair."""
+    """A Rubin TP16 KDA layer (q8) with an FP32 state builds its q1 B8 KdaHead only
+    when the kernel compiles, and no verify heads (B1 x q8, 2 x q8: KdaSplit's math;
+    the FP32 verify rows run the stock-math plain verify), which it does not even
+    probe; when the q1 head fails it builds none, before anything is set up for the
+    head (no KdaHead index or F_A buffer, which the MoE tail's early release and the
+    AttnRes carve-out follow), and keeps the pair."""
     head, calls, fail = head_probe
     if not compiles:
-        fail.update({"head", "verify", "multi"})
+        fail.update({"head"})
     batches = (*range(1, 9), 16)
     weight = torch.empty((3216, 7168), dtype=torch.bfloat16, device="meta")
     monkeypatch.setattr(providers_module, "bf16_weight", lambda linear: weight)
@@ -1065,16 +1079,16 @@ def test_kda_fp32_head_probe_decides_in_the_provider(monkeypatch, head_probe, co
         Attention.__init__(provider, decoder, runtime, None, None, None)
     assert provider.kind == "kda"
     if compiles:
-        assert sorted({c[0] for c in calls}) == ["head", "multi", "verify"]
+        assert sorted({c[0] for c in calls}) == ["head"]
         built.assert_called_once()
         args, kwargs = built.call_args
-        assert args[2] == [8] and kwargs["verify"] == [(8, 8), (16, 8)]
+        assert args[2] == [8] and kwargs["verify"] == []
         assert kwargs["polled"] == [8] and runtime.kda_heads == 1
         assert provider.head is built.return_value
         assert provider.head_state == torch.float32
         assert runtime.buffers["kda.head.fa"].shape == (128, 64, 144)
-    else:  # the verify head is only probed for an admitted q1 batch
-        assert sorted({c[0] for c in calls}) == ["head", "multi"]
+    else:
+        assert sorted({c[0] for c in calls}) == ["head"]
         built.assert_not_called()
         assert provider.head is None and provider.head_state is None
         assert runtime.kda_heads == 0 and "kda.head.fa" not in runtime.buffers

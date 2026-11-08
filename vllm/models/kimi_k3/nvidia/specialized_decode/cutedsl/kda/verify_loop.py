@@ -16,7 +16,13 @@ item's state page arrives by ``cp.async.bulk`` into the shared page while the
 previous item runs (issued once that item holds its page in registers), and the
 checkpoint stores of one item drain under the next. (Measured on VR200 and dropped: a
 second page in flight and L2 prefetches of the next item's conv taps, both within
-noise or slower.)
+noise or slower.) Measured, persistence alone does not pay: ``KdaVerifyLoop`` (Wide's
+math) is within -2..+4% of Wide (nqbench kdaf8, us per layer, Wide / Loop: q4 B16
+7.40 / 7.56, B32 8.48 / 8.83, B64 16.77 / 16.69, B128 32.70 / 32.04); the stock-math
+``KdaVerifyLoopStock`` gains 3-6% over Wide at B64-256 (B128 30.82) with its
+stock-math prologue and gate path on the persistent structure (which of the two
+pays is not isolated). Kept as LoopStock's base and its
+bitwise-vs-Wide test anchor (an FP32 state never selects it: ``prepared.wide_kind``).
 
 Math: per item exactly ``KdaVerifyPacked``'s (Wide's prologue, gates, conv window,
 packed token loop and gated norm; the state values pass through shared memory
@@ -86,6 +92,8 @@ class KdaVerifyLoop(KdaVerifyPacked):
         assert args[0].shape[0] // self.tokens * self.heads == self.items
         self.ctas = persistent_ctas(self.items)
         self.most = -(-self.items // self.ctas)  # items per CTA at most
+        # thread i < count fills item i's metadata: a CTA takes at most THREADS items
+        assert self.most <= THREADS, f"{self.items} items on {self.ctas} CTAs"
         threads = [THREADS, 1, 1]
         launch(self.kernel, args, self.ctas, THREADS, max_number_threads=threads)
 

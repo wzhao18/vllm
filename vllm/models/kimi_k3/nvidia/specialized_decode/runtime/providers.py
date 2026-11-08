@@ -117,6 +117,8 @@ WIDE_B64_STAGES = 6
 # earlier); the fold's in-projection costs ~+1.0 us at q4 and q8 alike, the q4 verify
 # saves less. (A pair timed with no consumer, ended by its slowest CTA, shows the
 # fold losing at every q, q8 included.) Rows 40 / 48 (q 5 / 6) fold bitwise, untimed.
+# BF16 state only (an FP32 state keeps the stock-math plain verify: the fold computes
+# KdaSplit's math).
 KDA_FOLD64: dict[int, str] = {16: "32:1,64:1"}
 # Devices with more SMs than GB300's 152 (Rubin), TP16 bins 16-64, by rows:
 # SplitKTmemGemm64 (128, 64, split, x's slots, 14): the weights of each 128-row tile's K
@@ -468,6 +470,10 @@ class Attention:
             fold = batch_table(KDA_FOLD64.get(tp, "") if sms > 152 else "")
             folded = 64 in tactics and len(tactics[64]) > 4 and pitch == 3216
             folded = folded and bool(fold.get(8 * q)) and 4 <= q <= 8 and 8 in verify
+            # BF16 state only: the fold's epilogue (KdaInProj64) and KdaVerifyPrepared
+            # / Cols compute KdaSplit's math (fast rsqrt, no BF16 conv rounding), not
+            # stock's; an FP32 state's B8 rows run the stock-math plain verify
+            folded = folded and runtime.bf16_state
             prepared = ((8, q),) if folded else ()
             dim_first = is_conv_state_dim_first()
             self.core = PreparedKda(attention, policies, dim_first, prepared=prepared)
@@ -506,7 +512,12 @@ class Attention:
                 strict=runtime.context.target,
             )  # fmt: skip
             batches = [b for b in HEAD_BATCHES if b in runtime.batches and fits(b, 1)]
-            multi = batch_table(HEAD_MULTI.get(q, ""))
+            # Verify heads (KdaHeadVerify / KdaHeadMulti) for a BF16 state only (not
+            # probed otherwise): their recurrence is KdaSplit's math (fast rsqrt / exp,
+            # no BF16 conv rounding); an FP32 state's verify rows run the stock-math
+            # plain verify (kda.prepared.KdaSplitStock / KdaVerifyLoopStock)
+            stock_verify = not runtime.bf16_state
+            multi = batch_table("" if stock_verify else HEAD_MULTI.get(q, ""))
             multi = [
                 b for b in runtime.batches if multi.get(b) and b % q == 0 and fits(b, q)
             ]
@@ -536,7 +547,7 @@ class Attention:
                 verify = [
                     (b, runtime.q)
                     for b in batches
-                    if b == runtime.q == 8 and fits(b, runtime.q)
+                    if b == runtime.q == 8 and not stock_verify and fits(b, runtime.q)
                 ]
                 verify += [(b, q) for b in multi]  # KdaHeadMulti
                 self.head = PreparedKdaHead(
