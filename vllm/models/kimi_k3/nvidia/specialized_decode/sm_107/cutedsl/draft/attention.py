@@ -31,21 +31,27 @@ describe the 64-head drafter the tables were measured on.
 
 The drafter's row-keyed tables here (FAST_CORE .. DRAFT_WLIST) are its own (drafter
 rows: multiples of the draft length). mla.dcp's split tables (LONG_SPLIT,
-VERIFY_FOLD_SPLITS) are keyed by (rows, gathered heads), not by role or q, and shared
-with the target's MLA verify: the (rows, 64) keys are the 64-head drafter's (measured
-on it, q 3 / 7), but at 96 gathered heads (kimi-k3.1-pro-dspark-preview, 6 per rank at
-DCP16) they are the K3 target's, measured at its verify q (4 / 8: other packed tiles
-and requests at the same rows). The drafter's split (``draft_fold_splits``) therefore
-takes those tables only at the gathered head counts measured on a drafter
-(DRAFT_RULE_HEADS), else tokenspeed's own split (the stock drafter's). A rule the
-cores and DcpValue still read where that split equals a rule's long split keeps the
-partition consistent (both read it), and a gathered fold row it fires on moves to the
-polled core (``long_polled``: the gathered fold core has no long partition). Rows mode
-(q = 1) keeps the (padded rows, heads) q = 1 rules: the same shape whichever role
-measured them. NQ-TUNE: a drafter key in mla.dcp's split tables (rows, heads, role)
-and the 96-head drafter's LONG_SPLIT / VERIFY_FOLD_SPLITS / POLLED_CORE / VALID_CORE /
-DRAFT_WLIST / QUERY_TOKENS / DRAFT_CORE_PUSH, DL3 B1-B166 and DL7 B1-B36 graphs
-(scripts/dsdraft/layer_test.py at 6 heads x DCP16).
+VERIFY_FOLD_SPLITS) are keyed by (rows, gathered heads) and shared with the target's
+MLA verify: the (rows, 64) keys are the 64-head drafter's (measured on it, q 3 / 7,
+DRAFT_RULE_HEADS). At 96 gathered heads (kimi-k3.1-pro-dspark-preview: 6 per rank at
+TP16 = DCP16, 24 at C512's TP4 = DCP4) the drafter's packed core (q 3 / 7) is the K3
+target's verify core of the same requests at q 4 / 8 tile for tile (mla.dcp
+PACKED_TWIN: 3 / 6 query tiles per request), so ``draft_fold_splits`` and every rule
+reader (the cores, DcpValue's fold, the work list) read that twin's measured split
+and length-keyed LONG_SPLIT partition (decided on the GPU from each request's own
+length, graph-safe) instead of tokenspeed's shape-only split, which ran the wide rows
+and B18-B21 unsplit; the drafter's own cake rules (mla.dcp DRAFT_LONG_SPLIT) go
+further: the first layer of each step writes the split quantum from the batch's
+actual local lengths (mla.wlist.StepQuant, ``step_tables``), which every core,
+work list and DcpValue fold of the step reads. A gathered fold row a rule fires on
+moves to the polled core
+(``long_polled``: the gathered fold core has no long partition). Rows mode (q = 1)
+keeps the (padded rows, heads) q = 1 rules: the same shape whichever role measured
+them. At heads per rank whose MlaQuery cannot gather (mla.query UNGATHERED_HEADS: 24)
+every served row runs a core that polls its own q rows (fork, polled fold, wide).
+NQ-TUNE: the twin rules re-measured on the drafter (scripts/dsdraft/layer_test.py)
+and its POLLED_CORE / VALID_CORE / DRAFT_WLIST / QUERY_TOKENS / DRAFT_CORE_PUSH at 6
+and 24 heads per rank.
 """
 
 from functools import cache
@@ -56,6 +62,7 @@ import torch
 from cutlass import Float32, Int32, Int64
 from cutlass.cute.runtime import make_fake_stream
 
+from ...shapes import Shape, full_capture, refuse
 from ..common.host import (
     dynamic_fake,
     dynamic_view,
@@ -66,7 +73,6 @@ from ..common.host import (
     stream,
     to_cute,
 )
-from ...shapes import Shape, full_capture, refuse
 from ..common.policy import batch_table
 from ..common.primitives import (
     launch,
@@ -91,6 +97,7 @@ from ..mla.dcp import (
     GB300_SMS,
     LONG_SPLIT,
     LSE_FOLD,
+    PACKED_TWIN,
     Q_SENT,
     DcpBox,
     compile_fork,
@@ -104,11 +111,12 @@ from ..mla.dcp import (
     long_split,
     split_partials,
     split_partials_q,
+    split_rule,
     split_workspace_ts,
     verify_fold_splits,
 )
 from ..mla.rows import compile_rows
-from ..mla.wlist import shared_list
+from ..mla.wlist import StepQuant, shared_list
 
 # Drafter query rows (requests x draft length; Rubin, DCP) whose tokenspeed core skips
 # its reducer and folds its FP32 split partials in DcpValue (mla.dcp's q > 1 fold).
@@ -280,14 +288,16 @@ def uncovered_rows(rows, steps, cap, size, sms):
     return dropped
 
 
-def draft_fold_splits(rows, steps, heads, max_seq, device):
+def draft_fold_splits(rows, steps, heads, max_seq, device, size):
     """(split, packed rows) of the drafter's packed (q = ``steps``) tokenspeed core for
-    ``rows`` drafter rows of ``heads`` gathered heads: mla.dcp.verify_fold_splits
-    (its Rubin tables VERIFY_FOLD_SPLITS / LONG_SPLIT) at DRAFT_RULE_HEADS, else its
-    tokenspeed rule alone (the target's (rows, heads) keys were measured at another
-    q). The cores and DcpValue read LONG_SPLIT with the split this returns."""
-    if heads in DRAFT_RULE_HEADS:
-        return verify_fold_splits(rows, steps, heads, max_seq, device)
+    ``rows`` drafter rows of ``heads`` gathered heads over DCP ``size``:
+    mla.dcp.verify_fold_splits (its Rubin tables VERIFY_FOLD_SPLITS / LONG_SPLIT) at
+    DRAFT_RULE_HEADS (keys measured on the 64-head drafter) and at a PACKED_TWIN shape
+    (96 heads, q 3 / 7: the drafter's own DRAFT_LONG_SPLIT rule at its DCP size, else
+    the twin verify's decision), else its tokenspeed rule alone. The cores and DcpValue
+    read the same rule (``draft=size``) with the split this returns."""
+    if heads in DRAFT_RULE_HEADS or (heads, steps) in PACKED_TWIN:
+        return verify_fold_splits(rows, steps, heads, max_seq, device, draft=size)
     from tokenspeed_mla import mla_decode as md
 
     # (verify_fold_splits without its Rubin tables)
@@ -440,9 +450,18 @@ class DraftDcp:
         # split partials (mla.dcp split_partials_q, non-causal): rows -> split count.
         # The cores compile once the cache (its page size) is bound (``bind``).
         self.folds, self.fold_values, self.fold_cores = {}, {}, set()
+        # Rows whose drafter rule is a cake rule (mla.dcp DRAFT_LONG_SPLIT): rows ->
+        # their step quantum word (mla.wlist.StepQuant), built by the first layer each
+        # step and read by the core, the work list and DcpValue (``step_quant``).
+        self.quants: dict = {}
         # NQ-NOFALLBACK: rows left unfolded -> why (the coverage log's ``core_of``).
         self.unfolded: dict[int, str] = {}
         self.max_seq = local_max(max_context or 1 << 17, size, interleave)
+        # Whether MlaQuery can gather this layer's q rows (under DCP: not at
+        # mla.query UNGATHERED_HEADS heads per rank, C512's 24).
+        from ..mla.query import UNGATHERED_HEADS
+
+        self.gather_q = size == 1 or self.heads not in UNGATHERED_HEADS
         # Packed rows (tiles x 128) of the folded and wide rows (``draft_fold_splits``).
         self.packed: dict[int, int] = {}
         self.scales = (
@@ -463,7 +482,7 @@ class DraftDcp:
                 self.unfolded[r] = "not in FAST_CORE"
                 continue
             split, packed = draft_fold_splits(
-                r, steps, heads, self.max_seq, self.device
+                r, steps, heads, self.max_seq, self.device, size
             )
             if split <= 1:
                 self.valid.pop(r, None)
@@ -474,6 +493,7 @@ class DraftDcp:
             self.fold_values[r] = compile_value(
                 self.heads, size, r, self.cap, uv, width, index, sms, steps, split,
                 lse_split=True, out_scale=self.scales[1], valid_box=r in self.valid,
+                draft=size, quant_at=self.step_quant(r, split, sms),
             )  # fmt: skip
             split_workspace_ts(self.device, packed, r // steps, split)
         # Rows mode (ROWS_MODE): rows -> (padded rows, splits, DcpValue, row metadata
@@ -525,7 +545,7 @@ class DraftDcp:
         for r in self.wide:
             reqs, cap = r // steps, self.wide_box.cap
             split, packed = draft_fold_splits(
-                r, steps, heads, self.max_seq, self.device
+                r, steps, heads, self.max_seq, self.device, size
             )
             persistent = wide_persistent(reqs, packed // 128, split, sms)
             work = self.work_list(r, heads, packed // 128, split, sms)
@@ -538,7 +558,8 @@ class DraftDcp:
                 value = compile_value(
                     self.heads, size, r, cap, uv, width, index, sms, steps, fold,
                     lse_split=fold > 0, out_scale=self.scales[1] if fold else 1.0,
-                    valid_box=True, pushed=push is not None,
+                    valid_box=True, pushed=push is not None, draft=size,
+                    quant_at=self.step_quant(r, fold, sms) if fold else 0,
                 )  # fmt: skip
             except RuntimeError as error:  # (check_residency: not co-resident)
                 if "co-resident" not in str(error):
@@ -560,7 +581,10 @@ class DraftDcp:
                     for p in (0, 1)
                 ]
             else:
-                tables = [verify_table(qbox[p], reqs, self.device) for p in (0, 1)]
+                quant = self.quants.get(r)
+                tables = [
+                    verify_table(qbox[p], reqs, self.device, quant) for p in (0, 1)
+                ]
                 if work is not None:
                     tables = [work.table(t) for t in tables]
                     self.wlists[r] = work
@@ -580,15 +604,19 @@ class DraftDcp:
             if not POLLED_CORE.get(r)
             and r not in self.row_modes
             and r not in self.forks
-            and long_split(r, heads, split, sms)
+            and long_split(r, heads, split, sms, steps, draft=size)
         }
         self.polled = {}
         for r in self.folds:
             polled = POLLED_CORE.get(r) or r in self.long_polled
+            polled = polled or not self.gather_q  # (MlaQuery publishes only)
             if polled and r not in self.row_modes:
                 reqs = r // steps
                 qbox = self.box.mailbox(r in self.valid)
-                tables = [verify_table(qbox[p], reqs, self.device) for p in (0, 1)]
+                quant = self.quants.get(r)
+                tables = [
+                    verify_table(qbox[p], reqs, self.device, quant) for p in (0, 1)
+                ]
                 tiles = -(-steps * size * self.heads // 128)
                 work = self.work_list(r, size * self.heads, tiles, self.folds[r], sms)
                 if work is not None and self.valid.get(r) == 2:
@@ -602,13 +630,28 @@ class DraftDcp:
         # short contexts. Such a table entry is a startup error.
         for r, split in self.folds.items():
             gathered = r not in self.polled and r not in self.row_modes
-            if gathered and r not in self.forks and long_split(r, heads, split, sms):
+            long = long_split(r, heads, split, sms, steps, draft=size)
+            if gathered and r not in self.forks and long:
                 raise ValueError(
-                    f"drafter rows {r} (q {steps}): LONG_SPLIT {LONG_SPLIT[r, heads]} "
+                    f"drafter rows {r} (q {steps}): LONG_SPLIT "
+                    f"{split_rule(r, heads, steps, draft=size)} "
                     "fires on the gathered fold core, which has no long partition: "
                     "add the rows to POLLED_CORE or drop the rule"
                 )
         ungathered = self.fork_rows | set(self.polled)
+        if not self.gather_q:
+            # MlaQuery cannot gather q at these heads per rank (its grid cannot be
+            # co-resident; mla.query UNGATHERED_HEADS): only cores that poll their own
+            # q rows serve (the fork, the polled fold core, the wide core). The others
+            # (the gathered q = 1 core, the stock tokenspeed core) would read an
+            # ungathered mailbox: dropped (runtime.draft refuses them, NQ-NOFALLBACK).
+            for r in self.rows:
+                if r not in ungathered:
+                    self.dropped[r] = (
+                        f"{self.core_of(r)}: needs the gathered q, which MlaQuery "
+                        f"cannot gather at {self.heads} heads per rank"
+                    )
+            self.rows = tuple(r for r in self.rows if r not in self.dropped)
         # Rows the fused query kernel (MlaQuery, RoPE) serves (FAST_QUERY: the lean
         # tile up to 8 rows, the tiled kernel above).
         self.queries = {}
@@ -650,6 +693,18 @@ class DraftDcp:
         for index, attention in enumerate(attentions):
             attention.draft_dcp = DraftLayerDcp(self, attention, index % 2, index == 0)
 
+    def step_quant(self, rows, split, sms):
+        """The address of ``rows``' cake-rule step quantum word (created here) where
+        the drafter's rule at ``split`` launched splits is a cake rule, else 0."""
+        heads = self.size * self.heads
+        long = long_split(rows, heads, split, sms, self.steps, draft=self.size)
+        if long is None or len(long) <= 3:
+            return 0
+        if rows not in self.quants:
+            reqs = rows // self.steps
+            self.quants[rows] = StepQuant(reqs, long, split, self.device)
+        return self.quants[rows].address
+
     def core_of(self, rows):
         """NQ-NOFALLBACK: the attention core a served drafter row runs, for the
         coverage log."""
@@ -675,10 +730,17 @@ class DraftDcp:
         """Whether a captured drafter graph of ``rows`` must run this fast path."""
         return rows in self.rows or rows in self.wide
 
+    def stock_core_rows(self):
+        """Served rows whose attention core would be the stock tokenspeed core inside
+        the fast path (``merge``): not a fold, wide or rows-mode row. NQ-NOFALLBACK:
+        runtime.draft refuses them on the strict topologies, ``merge`` raises."""
+        cores = set(self.folds) | set(self.wide_cores) | set(self.row_modes)
+        return tuple(r for r in self.rows if r not in cores)
+
     def work_list(self, rows, heads, tiles, split, sms):
         """The shared per-step work list (mla.wlist) of DRAFT_WLIST ``rows`` launched
         at their LONG_SPLIT split, or None."""
-        long = long_split(rows, heads, split, sms)
+        long = long_split(rows, heads, split, sms, self.steps, draft=self.size)
         if rows not in DRAFT_WLIST or long is None:
             return None
         # (None past mla.wlist.fits: the long split without the list)
@@ -713,7 +775,9 @@ class DraftDcp:
             if rows in self.polled:
                 wl = rows in self.wlists
                 valid = self.valid.get(rows, 0)
-                compile_polled_q(*args, valid=valid, persistent=wl, wlist=wl)
+                compile_polled_q(
+                    *args, valid=valid, persistent=wl, wlist=wl, draft=self.size
+                )
             else:
                 compile_split_partials_q(*args)
             self.fold_cores.add((rows, page))
@@ -724,8 +788,9 @@ class DraftDcp:
                 args += (self.causal,)
                 wl = rows in self.wlists
                 compile_polled_q(
-                    *args, valid=2, persistent=persistent, push=push, wlist=wl
-                )
+                    *args, valid=2, persistent=persistent, push=push, wlist=wl,
+                    draft=self.size,
+                )  # fmt: skip
                 self.fold_cores.add(("wide", rows, page))
         for rows, (padded, split, _, _) in self.row_modes.items():
             if ("rows", rows, page) not in self.fold_cores:
@@ -747,6 +812,9 @@ class DraftLayerDcp:
         self.shared, self.parity = shared, parity
         # The first layer writes the rows mode's per-row metadata of each forward.
         self.first = first
+        # Rows whose step tables (``step_tables``) this layer already launched ahead
+        # of its MlaQuery (host-side, while capturing; the core's call consumes it).
+        self.tables_ahead = None
         self.uv = to_cute(attention.W_UV)
         self.query_weights = None
         if shared.queries:
@@ -845,6 +913,10 @@ class DraftLayerDcp:
             return decline("wide core not compiled for the bound cache page")
         cache = attention.kv_cache
         qnorm, kvnorm, qb, uk, qinv, kinv = self.query_weights
+        if self.first and (rows in shared.quants or rows in shared.wlists):
+            # (ahead of MlaQuery: the core stays its PDL successor)
+            self.step_tables(rows, decode.seq_lens[: rows // shared.steps])
+            self.tables_ahead = rows
         shared.queries[rows](
             to_cute(qkv),
             qnorm,
@@ -904,6 +976,25 @@ class DraftLayerDcp:
             return False
         return (rows, cache.shape[1]) in self.shared.fold_cores
 
+    def step_tables(self, rows, lengths):
+        """The first layer's per-step tables of ``rows`` from the requests' local
+        ``lengths``: the cake rule's quantum word (mla.wlist.StepQuant), then the work
+        list (it reads the word), each where ``rows`` has one; every layer's core,
+        work list and DcpValue read them."""
+        shared = self.shared
+        work, quant = shared.wlists.get(rows), shared.quants.get(rows)
+        if quant is not None:
+            quant.build(lengths)
+        if work is not None:
+            work.build(lengths, quant)
+
+    def tables_for(self, rows, lengths):
+        """``step_tables`` here unless this (first) layer launched them ahead of its
+        MlaQuery for these rows."""
+        if self.first and self.tables_ahead != rows:
+            self.step_tables(rows, lengths)
+        self.tables_ahead = None
+
     def fold_core(self, attention, metadata, rows):
         """The reducer-free tokenspeed core over the q mailbox (gathered, or polled by
         the core for POLLED_CORE rows): FP32 split partials + LSEs in the shared
@@ -926,12 +1017,11 @@ class DraftLayerDcp:
         tables += (decode.dcp_tot_seq_lens[:reqs],)
         if rows in shared.polled:
             work = shared.wlists.get(rows)
-            if work is not None and self.first:  # this step's list, every layer
-                work.build(tables[1])
+            self.tables_for(rows, tables[1])  # (this step's, every layer)
             polled_partials_q(
                 query, cache, *tables, shared.scales, out, lse, split, shared.cp(),
                 shared.polled[rows][p], causal=shared.causal, valid=valid,
-                persistent=work is not None, wlist=work is not None,
+                persistent=work is not None, wlist=work is not None, draft=shared.size,
             )  # fmt: skip
         else:
             split_partials_q(
@@ -964,12 +1054,11 @@ class DraftLayerDcp:
         meta = decode.block_table[:reqs], decode.seq_lens[:reqs]
         meta += (decode.dcp_tot_seq_lens[:reqs],)
         work = shared.wlists.get(rows)
-        if work is not None and self.first:  # this step's list, every layer
-            work.build(meta[1])
+        self.tables_for(rows, meta[1])  # (this step's, every layer)
         polled_partials_q(
             query, cache, *meta, shared.scales, out_rows, lse, split, shared.cp(),
             tables[p], causal=shared.causal, valid=2, persistent=persistent, push=push,
-            wlist=work is not None,
+            wlist=work is not None, draft=shared.size,
         )  # fmt: skip
         if split > 1:  # DcpValue folds the split partials
             packed = shared.packed[rows]
@@ -1094,6 +1183,14 @@ class DraftLayerDcp:
                 s,
             )
             return
+        if (shared.strict and full_capture()) or not shared.gather_q:
+            # NQ-NOFALLBACK: no stock tokenspeed core inside a strict captured graph
+            # (and none where MlaQuery cannot gather the q rows it would read).
+            refuse(
+                "DSpark drafter attention",
+                f"rows {rows} have no specialized core ({shared.core_of(rows)})",
+                Shape(rows, shared.steps),
+            )
         query = box.q[p, :rows].view(torch.float8_e4m3fn)
         cache = attention._attn_read_kv_cache()
         latent, lse = attention.impl.forward_mqa(query, cache, metadata, attention)

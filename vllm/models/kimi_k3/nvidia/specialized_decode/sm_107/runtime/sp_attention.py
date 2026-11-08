@@ -20,8 +20,10 @@ Everything else is the stock module, called as the stock forward calls it
 ``_post_attn_norm`` (AttnRes) on the shard, the MegaMoE / dense MLP on the shard (with
 stock's ``sp_padding_mask``), the aux streams, the final AttnRes, the final
 ``sp_all_gather`` and the norm. The verification (synthetic rejection), LM head,
-sampler and the DSpark drafter (phase 1: ``runtime.draft`` has no TP4 entry, checked at
-build) stay stock too.
+sampler and the DSpark drafter stay stock too, except the drafter's MLA attention:
+``runtime.draft`` FAST_DCP's TP4 entry runs it on cutedsl.draft.attention DraftDcp
+(publish-only MlaQuery, polled cores with length-keyed splits, DcpValue), strict;
+no other drafter table has a TP4 entry (SP_DRAFTER_TABLES, checked at build).
 
 R = 4 n for n = 1..128 requests per DP group (0.25..32 requests per GPU): every
 captured R is a multiple of TP4, so SP never pads. Every captured R is served by every
@@ -190,10 +192,17 @@ class SpAttentionBlock:
         }
 
 
+# ``runtime.draft`` TP-keyed tables the SP decode specializes the drafter with at TP4:
+# its MLA attention (DraftDcp). Every other drafter piece is the declared stock module.
+SP_DRAFTER_TABLES = frozenset({"FAST_DCP"})
+DRAFTER_NOTE = "stock DSpark module; its MLA attention on DraftDcp (strict)"
+
+
 def check_stock_drafter(tp):
-    """The DSpark drafter is a declared stock module in phase 1: raises if any of
-    ``runtime.draft``'s TP-keyed tables would install a specialized drafter piece at
-    ``tp`` (the declaration would then be false)."""
+    """The DSpark drafter is the declared stock module but for its attention: raises
+    if a ``runtime.draft`` TP-keyed table other than SP_DRAFTER_TABLES would install
+    a specialized drafter piece at ``tp`` (the declaration would then be false), or
+    one of SP_DRAFTER_TABLES lacks its TP entry (the attention would stay stock)."""
     from . import draft
 
     tables = {
@@ -204,12 +213,23 @@ def check_stock_drafter(tp):
         and table
         and all(isinstance(key, int) for key in table)
     }
-    covered = sorted(name for name, table in tables.items() if tp in table)
+    covered = sorted(
+        name
+        for name, table in tables.items()
+        if tp in table and name not in SP_DRAFTER_TABLES
+    )
     if covered:
         raise Unsupported(
             "drafter", None,
             f"runtime.draft tables {covered} have TP{tp} entries: the SP decode "
-            "declares the drafter stock (phase 1)",
+            f"declares the drafter stock but for {sorted(SP_DRAFTER_TABLES)}",
+        )  # fmt: skip
+    missing = sorted(n for n in SP_DRAFTER_TABLES if tp not in tables.get(n, {}))
+    if missing:
+        raise Unsupported(
+            "drafter", None,
+            f"runtime.draft tables {missing} have no TP{tp} entry: the SP decode "
+            "runs the drafter's attention on DraftDcp",
         )  # fmt: skip
     return tuple(sorted(tables))
 
@@ -280,8 +300,8 @@ class SpStep:
         logger.info_once(
             "Kimi K3 SP decode (TP%d = DCP%d over DP%d, EP%d, q%d, rows %d-%d, %d "
             "graphs): %d SP blocks (%s), RecoverSSM %s; SP mailboxes %.0f MiB "
-            "symmetric; the DSpark drafter stays the stock module (phase 1: no TP%d "
-            "entry in %d drafter tables)",
+            "symmetric; the DSpark drafter stays the stock module but for its "
+            "attention (TP%d entries only in FAST_DCP of %d drafter tables)",
             ctx.tp, ctx.dcp, ctx.dp, ctx.ep, self.q, rows[0], rows[-1], len(rows),
             len(self.blocks), "/".join(sorted(kinds)), self.records,
             self.comm.nbytes() / 2**20, ctx.tp, len(self.draft_tables),
@@ -311,7 +331,7 @@ class SpStep:
             "final_gather": "stock sp_all_gather",
             "lm_head": "stock",
             "sampler": "stock",
-            "drafter": "stock DSpark module (phase 1)",
+            "drafter": DRAFTER_NOTE,
         }
         if self.moe:
             declared["moe"] = f"stock MegaMoE on the shard (EP{ctx.ep})"

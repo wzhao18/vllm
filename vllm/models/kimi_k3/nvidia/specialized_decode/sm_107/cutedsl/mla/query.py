@@ -76,9 +76,12 @@ UNGATHERED_HEADS = frozenset({24})
 # (MlaQuery(rope=True) needs the lean kernel). kimi-k3-dspark (64 heads): 4 per rank at
 # TP16, 8 at TP8; kimi-k3.1-pro-dspark-preview (96 heads): 6 at TP16, 12 at TP8 (the
 # K3 target's head counts per rank; the same per-head CTA grid, cluster of 8 parts of
-# 24 Q_B rows). NQ-TUNE: the 6- and 12-head drafter tiles (QUERY_TOKENS, GATED_QUERY)
-# on the drafter forward.
-DRAFT_TILED_FROM = {4: 1, 8: 1, 6: 1, 12: 1}
+# 24 Q_B rows); 24 at C512's TP4 = DCP4 (sequence-parallel decode role): the tiled
+# kernel at every row as the 24-head DSA query (TILED_FROM), publish-only
+# (UNGATHERED_HEADS: the drafter's cores poll their q rows, draft.attention).
+# NQ-TUNE: the 6-, 12- and 24-head drafter tiles (QUERY_TOKENS, GATED_QUERY) on the
+# drafter forward.
+DRAFT_TILED_FROM = {4: 1, 8: 1, 6: 1, 12: 1, 24: 1}
 Q_SENT = 0xFFFFFFFF  # q mailbox sentinel: four FP8 0xFF bytes, never written
 # Rubin-class devices (more SMs than GB300's 152), DCP16, q = 1: batches whose gathered
 # q poll is gated on one chunk per source rank (``MlaQuery.gate``). 16-rank MLA chain
