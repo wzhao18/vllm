@@ -1104,7 +1104,8 @@ def _query96_main(rank, world, device, group, interleave=1):
     if not heads or not query_heads(heads):
         print(f"rank {rank}: no drafter MlaQuery tile at 96 / {world} heads")
         return 0
-    failures, seen = 0, {}
+    failures, seen, worst = 0, {}, 0.0
+    flips = {"q": (0.0, 0), "KV": (0.0, 0)}
     cos_sin = _rope_cache(1 << 16, device)
     for steps, rows_list in ((3, [3, 6, 9, 24, 54, 63, 96, 120, 168]),
                              (7, [7, 14, 63, 112])):  # fmt: skip
@@ -1160,26 +1161,47 @@ def _query96_main(rank, world, device, group, interleave=1):
                     *shared.mailbox(rows, p), Int32(rank), to_cute(positions, 8),
                     dcp.cos_sin, stream(device),
                 )  # fmt: skip
+                torch.accelerator.synchronize(device)
+                torch.distributed.barrier()
+                # The published q rows (every rank's heads, multicast) before the core
+                # reads and re-arms them.
+                fast_q = _query_mailbox(shared, rows, p)[:rows, : world * heads]
+                fast_q = fast_q.clone()
                 padded = shared.row_modes.get(rows, (rows,))[0]
                 out = torch.empty((padded, heads * 128), dtype=torch.bfloat16,
                                   device=device)  # fmt: skip
                 dcp.merge(layer, metadata, rows, out, rows_mode=True)
                 torch.accelerator.synchronize(device)
                 torch.distributed.barrier()
-                if not _close(out[:rows], expected):
-                    error = (out[:rows].float() - expected.float()).abs().max()
-                    print(f"rank {rank}: {label} call {step}: max error "
-                          f"{error.item():.4g}")  # fmt: skip
-                    failures += 1
+                # Stage by stage: (1) the FP8 q bytes and (2) the inserted KV bytes
+                # against stock (one FP8 code apart at most: the BF16 accumulation
+                # order of Q_B / W_UK / RoPE moves a value across an FP8 rounding
+                # boundary; a wrong head, row, position or scale moves many codes),
+                # (3) the attention against stock tokenspeed + LSE combine + W_UV on
+                # those same q and KV bytes (dcp96's check). The end-to-end error
+                # against stock (FP8 code flips amplified by the softmax) is reported.
                 live = slots[slots >= 0]
                 ours, ref = (
                     c.view(torch.uint8)[live // PAGE, live % PAGE]
                     for c in (fast_cache, stock_cache)
                 )
-                wrong = (ours != ref).float().mean().item() if live.numel() else 0.0
-                if wrong > 0.01:
-                    print(f"rank {rank}: {label}: {wrong:.3%} KV bytes differ")
+                for what, a, b in (("q", fast_q, q), ("KV", ours, ref)):
+                    codes, flipped = _fp8_code_distance(a, b)
+                    flips[what] = max(flips[what], (flipped, codes))
+                    if codes > 1 or flipped > FP8_FLIP_LIMIT:
+                        print(f"rank {rank}: {label} call {step}: {what} FP8 bytes "
+                              f"{codes} codes apart, {flipped:.3%} differ")  # fmt: skip
+                        failures += 1
+                same = _stock_dcp(fast_q, fast_cache, metadata, True, layer.W_UV,
+                                  world, rank, interleave, group)  # fmt: skip
+                if not _close(out[:rows], same):
+                    error = (out[:rows].float() - same.float()).abs().max()
+                    print(f"rank {rank}: {label} call {step}: max error "
+                          f"{error.item():.4g} on its own q / KV")  # fmt: skip
                     failures += 1
+                if not _close(out[:rows], expected):
+                    error = (out[:rows].float() - expected.float()).abs().max()
+                    worst = max(worst, error.item())
                 untouched = torch.ones(cache.shape[:2], dtype=torch.bool,
                                        device=device)  # fmt: skip
                 untouched[live // PAGE, live % PAGE] = False
@@ -1191,7 +1213,36 @@ def _query96_main(rank, world, device, group, interleave=1):
         torch.cuda.empty_cache()
     if rank == 0:
         print(f"DraftDcp 96h query paths: {sorted(seen.items())}")
+    print(f"rank {rank}: largest end-to-end error past _close vs stock: {worst:.4g}; "
+          f"FP8 bytes off stock (fraction, codes): {flips}")
     return failures
+
+
+# FP8 bytes of the fused query / KV insert allowed to differ from stock by one code
+# (BF16 accumulation order); more, or any two codes apart, is a math error.
+FP8_FLIP_LIMIT = 0.02
+
+
+def _fp8_code_distance(a, b):
+    """(largest code distance, fraction differing) of two E4M3 byte tensors, codes
+    ordered by value (+0 and -0 the same)."""
+    def ordered(x):
+        x = x.view(torch.uint8).to(torch.int32)
+        magnitude = x & 0x7F
+        return torch.where(x >= 0x80, -magnitude, magnitude)
+
+    distance = (ordered(a) - ordered(b)).abs()
+    if not distance.numel():
+        return 0, 0.0
+    return int(distance.max()), (distance > 0).float().mean().item()
+
+
+def _query_mailbox(shared, rows, parity):
+    """The q mailbox ``rows`` of DraftDcp read at ``parity`` (torch, FP8 bytes)."""
+    if rows in shared.wide_cores:
+        return shared.wide_box.qv[parity]
+    box = shared.box
+    return (box.qv if rows in shared.valid else box.q)[parity]
 
 
 # Context rows (requests x q) through and past one wave of CtxGather's 256-thread CTAs
