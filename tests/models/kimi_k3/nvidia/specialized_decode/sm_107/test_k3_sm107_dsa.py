@@ -3977,14 +3977,13 @@ def test_dcp_topk_rows_deterministic(dcp8_group, saturate):
 
 @pytest.mark.skip_global_cleanup  # no group needed: keep a DCP8 launch's group
 @pytest.mark.parametrize("ids", [False, True], ids=["rows", "rows+ids"])
-@pytest.mark.parametrize("release", [True, False])
-def test_merge_rows_kernels_compile_at_prepare(monkeypatch, ids, release):
+def test_merge_rows_kernels_compile_at_prepare(monkeypatch, ids):
     """The FP32 DCP top-k's kernels (each rank's local top-K select and the merge,
-    with the global ids too for tests; the merge launching the next kernel early or
-    not: the DSA sparse core) compile for every batch when the layer prepares its
-    cache (``IndexerStage.warm``), not at their first launch: the specialized
-    decode runs only inside graph captures, where a first compile invalidates the
-    capture (CUDA error 901)."""
+    with the global ids too for tests) compile for every batch when the layer
+    prepares its cache (``IndexerStage.warm``), not at their first launch: the
+    specialized decode runs only inside graph captures, where a first compile
+    invalidates the capture (CUDA error 901). Neither launches the next kernel
+    early (no release switch: every consumer reads before its PDL wait)."""
     from unittest.mock import MagicMock
 
     from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa import (
@@ -3994,14 +3993,14 @@ def test_merge_rows_kernels_compile_at_prepare(monkeypatch, ids, release):
 
     dev = torch.device("cuda", torch.accelerator.current_device_index())
     stage = indexer_stage.IndexerStage.__new__(indexer_stage.IndexerStage)
-    stage.topk, stage.local_topk, stage.release = 2048, 2048, release
+    stage.topk, stage.local_topk = 2048, 2048
     stage.dcp = dcp_topk.DcpTopk(2048, 16, 3, 1, dev, 64)
     stage.dcp_ids = torch.empty(1) if ids else None
     stage.warm([8, 64])  # compiles (and is cached per process)
     warm = MagicMock()
     monkeypatch.setattr(stage.dcp, "warm", warm)
     stage.warm([8, 64])
-    assert warm.call_args_list == [((8, ids, release),), ((64, ids, release),)]
+    assert warm.call_args_list == [((8, ids),), ((64, ids),)]
     with pytest.raises(ValueError, match="rows"):  # past the shared candidates
         dcp_topk.DcpTopk(2048, 16, 3, 1, dev, 64).warm(65)
 
