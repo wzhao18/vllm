@@ -294,6 +294,10 @@ DRAFT_LONG_SPLIT: dict = {}
 # (each split's keys against its own running max) lost twice stock's accuracy vs
 # exact FP32 (query96: 0.050 vs 0.025 of the row max; floor 1 and the static rules:
 # 0.025, dreff6 probe); at AgentX lengths the floor never binds (dreff5 r2).
+# The DCP16 constants are flat: fold costs 80 / 40 / 20 and wide (floor, cost) (32,
+# 24) / (32, 8) / (32, 0) / (16, 8) are within 4% of each other at every DL3 9-480 /
+# DL7 14-448 row on agentic and held-out pw16 lengths and within 6% on uniform ones
+# but DL3 72 (90-100 us; dreff7 tune16, 4 x VR200): no candidate wins.
 DRAFT_CAKE = {4: ((8, 1, 80), (32, 24)), 16: ((8, 1, 80), (32, 24))}
 # Fold rows' launched split by (DCP size) -> (q, rows). Launched splits a step leaves
 # empty are not free (their CTAs, or the persistent loop's items, still run their

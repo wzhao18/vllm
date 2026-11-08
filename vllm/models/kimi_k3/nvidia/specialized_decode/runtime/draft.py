@@ -112,10 +112,13 @@ CONTEXT_OVERLAP = {16: "1-63:1"}
 # specialized piece there (the rest stays the stock module: sp_attention
 # SP_DRAFTER_TABLES), strict (a served row runs it or the load is refused). Draft eff
 # sweep (bench_draft_eff.py, 4 x VR200, 24 heads per rank, AgentX lengths, DCP4 local
-# = total / 4), us per drafter attention layer, DL3, stock DCP path -> DraftDcp (its
-# DCP4 split rules, mla.dcp DRAFT_LONG_SPLIT / PACKED_TWIN): C512's 120 / 144 / 168
-# rows 1020 / 1095 / 1227 -> 356 / 395 / 469 (its uniform-length bound 340 / 430 /
-# 458); the former stock-core rows 54 / 57 / 63 ~840 -> ~210 / 215 / 190.
+# = total / 4; dreff7 pw4, arms interleaved, mean of two), us per drafter attention
+# layer, DL3, stock DCP path -> DraftDcp (its DCP4 cake rule, mla.dcp
+# DRAFT_LONG_SPLIT): C512's 120 / 144 / 168 rows 1027 / 1109 / 1148 -> 320 / 385 / 488
+# (its uniform-length time 343 / 408 / 470); the former stock-core rows 54 / 57 / 63
+# 842 / 844 / 848 -> 211 / 217 / 184. The whole layer (norms, q_b, W_UK, RoPE, FP8,
+# KV insert, attention, W_UV; bench_c512_layer.py, dreff7): 1088 / 1160 / 1250 ->
+# 341 / 407 / 503.
 FAST_DCP = {4: "1-:1", 8: "1-64:1", 16: "1-:1"}
 # Context rows whose context step runs the sharded context projection + Lamport row
 # gather and the fused context-KV epilogue (cutedsl.draft.context; above 64 rows the
