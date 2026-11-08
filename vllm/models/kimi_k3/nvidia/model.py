@@ -285,8 +285,11 @@ class KimiVecSituAndMul(nn.Module):
     threads busy and wins (128-token steps: +7 us per call with the vectorized
     kernel); larger ones (eager token-shard steps, and hybrid-SP steps' ~2k
     rows x 6144 columns of the replicated shared expert: 34.3 -> 24.7 us) take
-    the vectorized kernel. Both are bitwise equal, so dispatching on the size
-    changes no numerics."""
+    the vectorized kernel. The small inputs (every decode step) run the stock
+    SituAndMul module itself, through its own dispatch; the vectorized kernel is
+    bitwise its CUDA op (forward_cuda). Where the custom op dispatches to
+    forward_native instead, the large inputs keep the CUDA op's bits (the same FP32
+    math, one BF16 rounding)."""
 
     _VEC_MIN_OUT_ELEMS = 2048 * 768 + 1
 

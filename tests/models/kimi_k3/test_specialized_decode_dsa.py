@@ -2187,11 +2187,14 @@ def run_layer_step(
 
         with context:
             exchanged = rank_counts = None
+            # merge_rows gives steps of MIN_ROWS[DCP] rows on to the exchange (no #63
+            # merge, no ids); smaller ones keep the #63 merge.
+            routed = dcpx is not None and batch >= dcpx.min_rows
             if dcpx is not None:
-                # merge_rows gives the step to the exchange: no #63 merge, no ids.
-                assert merge.merge_source(batch) == ("exchange", batch)
+                source = "exchange" if routed else "merge"
+                assert merge.merge_source(batch) == (source, batch)
             run()
-            if dcpx is not None:
+            if routed:
                 # This rank's slots and counts; as every rank's global ids for the
                 # checks below, and every rank's counts.
                 exchanged = merge.dcp_rows[:batch].clone(), dcpx.counts[:batch].clone()
