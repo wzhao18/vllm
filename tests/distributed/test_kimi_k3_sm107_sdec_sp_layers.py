@@ -213,6 +213,15 @@ DSA_DIRECT = dict(median=1.6e-2, tail=3e-2, worst=0.15)
 # error (our error against FP64 0.998 of stock's). So the median is held to the
 # larger of ``DSA_DIRECT``'s and hypot(``DSA_FLOOR``, ``DSA_Q_GAIN`` x query
 # distance): the fixed 1.6e-2 below query 3.8e-3, 2.2e-2 at R68's 5.29e-3.
+# Plus the row-order term: the decode kernel's output depends on the order of its
+# selected KV rows. Main's stock FP32 DCP merge (stable_topk_from_gathered_
+# candidates_cutedsl) writes each selected id at an atomic counter, so stock's
+# order is thread arrival (undefined, run to run); ours is the deterministic local
+# key order. On the same key set that order alone moves the latent by a median
+# ~2.0e-2 per (row, head) at R64 (LSE within 1e-6): it enters in quadrature, as
+# measured each run (``_report_core`` on stock's inputs in our order). The bounds
+# above were calibrated against the source branch's stock (the BF16 one-round
+# merge, a fixed order).
 DSA_FLOOR, DSA_Q_GAIN = 5e-3, 4.0
 DSA_SAME = dict(atol=2e-2, rtol=2e-2)
 DSA_BAND, DSA_SWAP = 1.0, 0.1
@@ -490,13 +499,14 @@ def _check_selection(name, same, overlap, counts, lengths):
     )  # fmt: skip
 
 
-def _check_dsa_rows(name, got, want, refs, same, query):
+def _check_dsa_rows(name, got, want, refs, same, query, order=0.0):
     """Ours vs stock per row (``got``, ``want``) with each path's FP64 reference over
     the keys it selected (``refs``: ours', stock's; ``_dsa_selected_reference``)
     and whether the row's global top-k set is the same on both (``same``):
     ``DSA_DIRECT`` (median, p98; the median bound raised to hypot(``DSA_FLOOR``,
-    ``DSA_Q_GAIN`` x ``query``) where larger, ``query`` the FP8 query's dequantized
-    distance from ``_check_q_codes``) and ``DSA_SAME`` (elementwise) on the same-set
+    ``DSA_Q_GAIN`` x ``query``, ``order``) where larger, ``query`` the FP8 query's
+    dequantized distance from ``_check_q_codes``, ``order`` the decode kernel's
+    measured distance on stock's inputs in our row order: ``_report_core``) and ``DSA_SAME`` (elementwise) on the same-set
     rows; on every row the distance less the selections' FP64 effect within
     ``DSA_BAND`` of stock's own error, and no same-set row past ``DSA_DIRECT``'s
     worst.
@@ -543,7 +553,9 @@ def _check_dsa_rows(name, got, want, refs, same, query):
         # of the per-row spread (exact rows measured 0.5-2.23e-2): there every row
         # is held to the tail bound instead.
         worst = float(errors[same].max())
-        median = max(DSA_DIRECT["median"], math.hypot(DSA_FLOOR, DSA_Q_GAIN * query))
+        median = max(
+            DSA_DIRECT["median"], math.hypot(DSA_FLOOR, DSA_Q_GAIN * query, order)
+        )
         if int(same.sum()) >= DSA_MEDIAN_ROWS:
             assert quantiles[0] <= median, (name, quantiles, median)
         else:
@@ -584,7 +596,7 @@ def _report_core(name, factor, got, stock, rows):
     the direct distance)."""
     if not bool(rows.any()):
         print(f"{name} core, {factor}: no rows")
-        return
+        return 0.0
     errors = _rows_error(got[0][rows].flatten(0, 1), stock[0][rows].flatten(0, 1))
     lse, want = got[1][rows], stock[1][rows]
     live = torch.isfinite(want)
@@ -593,6 +605,7 @@ def _report_core(name, factor, got, stock, rows):
         f"{name} core, {factor}: latent per (row, head) median {errors.median():.2e} "
         f"max {errors.max():.2e}, LSE max {shift:.2e} ({int(rows.sum())} rows)"
     )
+    return float(errors.median())
 
 
 def _check_dsa_reference(name, got, want, refs):
@@ -1354,7 +1367,7 @@ def _dsa_case(config, rank, device, indexer, topk_mode, rows, refusals):
         keyed = stock["counts"][:r] > 0
         _report_core(where, "our FP8 query", seen["query"], stock_core, keyed)
         _report_core(where, "our new MLA rows", seen["kv"], stock_core, keyed)
-        _report_core(
+        order = _report_core(
             where, "our flat row order (same set)", seen["order"], stock_core,
             keyed & same_set,
         )  # fmt: skip
@@ -1369,9 +1382,11 @@ def _dsa_case(config, rank, device, indexer, topk_mode, rows, refusals):
         # within stock's error once the selections' FP64 effect is taken out.
         mine = slice(rank * n, (rank + 1) * n)
         _check_dsa_rows(
-            f"{where} o_proj input", attn_in, entering[0], sel_in, same, query
+            f"{where} o_proj input", attn_in, entering[0], sel_in, same, query, order
         )
-        _check_dsa_rows(f"{where} shard", got, want, sel_shard, same[mine], query)
+        _check_dsa_rows(
+            f"{where} shard", got, want, sel_shard, same[mine], query, order
+        )
         # Accuracy: each path against FP64 attention over the keys it selected.
         _check_dsa_reference(f"{where} o_proj input", attn_in, entering[0], sel_in)
         _check_dsa_reference(f"{where} shard", got, want, sel_shard)
