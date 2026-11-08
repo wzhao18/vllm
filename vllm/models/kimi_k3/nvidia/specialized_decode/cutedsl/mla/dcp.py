@@ -288,8 +288,13 @@ DRAFT_LONG_SPLIT: dict = {}
 # (DCP size) -> ((fold rows' launched split, quantum floor in tiles, a wave's fixed
 # cost in quarter tiles), (wide rows' floor, fixed cost)); the wide rows (above the
 # 64-row box) keep their twin rule's launched split (its workspace). The fold rows'
-# launched split where DRAFT_CAKE_LAUNCHED has none.
-DRAFT_CAKE = {4: ((8, 8, 80), (32, 24)), 16: ((8, 8, 80), (32, 24))}
+# launched split where DRAFT_CAKE_LAUNCHED has none. Fold floor 1: short contexts
+# split as finely as one wave allows, as tokenspeed's shape split does. A coarser
+# floor (8, 16) left a DL3 B3 batch of <= 12-tile contexts in 1-2 splits, whose FP8 P
+# (each split's keys against its own running max) lost twice stock's accuracy vs
+# exact FP32 (query96: 0.050 vs 0.025 of the row max; floor 1 and the static rules:
+# 0.025, dreff6 probe); at AgentX lengths the floor never binds (dreff5 r2).
+DRAFT_CAKE = {4: ((8, 1, 80), (32, 24)), 16: ((8, 1, 80), (32, 24))}
 # Fold rows' launched split by (DCP size) -> (q, rows). Launched splits a step leaves
 # empty are not free (their CTAs, or the persistent loop's items, still run their
 # setup): 24 / 32 launched at DCP4 cost 1.3-2x at 9-63 rows on every length mix, and
