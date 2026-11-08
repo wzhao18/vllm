@@ -84,7 +84,7 @@ def _launcher(resident: dict[int, int], fit_wave: bool = True):
     """A ``DcpxDecode`` stand-in for ``launch_params``: 212 SMs (VR200), the kernel's
     co-resident clusters per cluster size from ``resident``."""
     ns = SimpleNamespace(
-        ex=SimpleNamespace(resident_clusters=lambda c, segmax: resident[c]),
+        ex=SimpleNamespace(resident_clusters=lambda c, segmax, pre: resident[c]),
         sms=212,
         smem=228 * 1024,
         segmax_override=-1,
@@ -159,7 +159,7 @@ def test_topk_cluster_dcp16_one_wave(rows, expected):
     ran 72-128 rows in two turns (W16, 39-42 us per layer against 23-26 us at the
     clusters that fit one wave)."""
     ns = SimpleNamespace(
-        ex=SimpleNamespace(resident_clusters=lambda c, segmax: GR100[c, segmax]),
+        ex=SimpleNamespace(resident_clusters=lambda c, segmax, pre: GR100[c, segmax]),
         sms=212,
         smem=228 * 1024,
         segmax_override=-1,
@@ -167,3 +167,21 @@ def test_topk_cluster_dcp16_one_wave(rows, expected):
     )
     ns._segmax = lambda r, c, ml: decode.DcpxDecode._segmax(ns, r, c, ml)
     assert decode.DcpxDecode.launch_params(ns, rows, 1 << 16) == expected
+
+
+def test_topk_prepass_policy():
+    """The top-k pre-pass: launches with keys in global memory whose CTAs could stream
+    more than 16K keys each (DCP4 / DCP8 / DCP16 at 1M) take it; staged launches run
+    their own passes. It covers the rows above 16K keys per CTA while the rows fit one
+    persistent turn, else the rows above 32K keys per CTA."""
+    from vllm.models.kimi_k3.nvidia.dsa_kernels.dcp_exchange import ops
+
+    assert ops.topk_prepass(2, 0, LOCAL_1M_DCP4)
+    assert ops.topk_prepass(1, 0, 1 << 17)  # DCP8 at 1M
+    assert ops.topk_prepass(1, 0, 1 << 16)  # DCP16 at 1M
+    assert not ops.topk_prepass(1, 0, 1 << 14)  # every CTA segment <= 16K keys
+    assert not ops.topk_prepass(2, 32768, LOCAL_1M_DCP4)
+    assert ops.topk_prepass_min(2, 256, 424) == 2 * 16384
+    assert ops.topk_prepass_min(1, 512, 848) == 16384
+    assert ops.topk_prepass_min(2, 512, 424) == 2 * 32768
+    assert ops.topk_prepass_min(1, 1024, 848) == 32768

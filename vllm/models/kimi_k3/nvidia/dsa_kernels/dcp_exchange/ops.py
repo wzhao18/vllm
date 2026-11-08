@@ -49,7 +49,45 @@ _ERR_CODES = {
     18: "1R window broadcast timeout",
     19: "act broadcast timeout",
     20: "top-k WRITE: CTA counts differ from the window counts",
+    21: "top-k pre-pass: window start differs from the merge kernel's",
 }
+
+# A top-k launch with keys in global memory (segmax 0) takes the balanced pre-pass
+# (csrc topk_pp_*_kernel: the coarse histogram, window counts and candidates of the
+# rows from a grid over their keys) when a row's CTA could stream more than
+# ``TOPK_PREPASS_ROW_KEYS`` keys itself. The in-kernel passes are issue-latency bound
+# (one 256-thread CTA per row segment: ~3 passes at ~8 GB/s over the longest
+# segment); the pre-pass spreads the long rows' keys over the whole GPU and leaves the
+# merge kernel the exchange and the WRITE.
+#
+# Rows of at most ``topk_prepass_min`` local keys still run their own passes in the
+# merge kernel (pp_row(); the pre-pass kernels cost about one pass over the keys they
+# cover plus three launches): 16K keys per CTA when every row is co-resident, 32K
+# when the rows take more than one persistent turn (the merge kernel is long then).
+# Measured on VR200 (q4 AgentX contexts, real-logit marginals, us per call; pre-pass
+# for rows above 0 / 8K / 16K / 32K keys per CTA, "-": not measured):
+#   DCP4  (2 CTAs per row) 64 rows 45.7 / 46.8 / - / 56.4, 256 rows 59.5 / 57.5 / - / 63.1,
+#         512 rows (2 turns) 104.3 / 100.7 / - / 86.5;
+#   DCP8  256 rows (2 CTAs) 55.8 / 56.8 / 52.5 / 57.7, 512 rows 77.5 / 74.6 / 66.3 / 64.0,
+#         1024 rows (2 turns) 150.1 / 147.6 / 142.7 / 118.9;
+#   DCP16 local lengths (4 ranks, contexts / 4) 256 rows 44.2 / 41.6 / 47.0 / 54.8,
+#         512 rows 56.9 / 54.7 / 52.9 / 62.9, 1024 rows (2 turns) 101.0 / 91.0 / 91.3 / 86.0
+#         (no pre-pass: 53.6 / 59.8 / 88.8).
+TOPK_PREPASS_ROW_KEYS = 1 << 14
+TOPK_PREPASS_TURN_KEYS = 1 << 15
+
+
+def topk_prepass(cluster: int, segmax: int, max_local_len: int) -> bool:
+    """Whether a top-k launch of ``cluster`` CTAs per row with ``segmax`` staged keys
+    (0: keys in global memory) takes the pre-pass (``TOPK_PREPASS_ROW_KEYS``)."""
+    return segmax == 0 and -(-max_local_len // cluster) > TOPK_PREPASS_ROW_KEYS
+
+
+def topk_prepass_min(cluster: int, rows: int, resident: int) -> int:
+    """Local keys up to which a row of a pre-pass launch (``rows`` rows, ``resident``
+    co-resident clusters of ``cluster`` CTAs) runs its own passes."""
+    per_cta = TOPK_PREPASS_ROW_KEYS if rows <= resident else TOPK_PREPASS_TURN_KEYS
+    return per_cta * cluster
 
 
 def _load_ext():
@@ -171,6 +209,11 @@ class DcpExchange:
             atexit.register(lambda e=self.err: print(f"DcpExchange err at exit: {int(e[0])}",
                                                      flush=True))
         self.mailbox_bytes = 4 * o
+        # top-k pre-pass scratch (per row: coarse histogram, window counts, candidate
+        # list; csrc topk_pp_*_kernel), zero between uses
+        self.tk_pp = torch.zeros(
+            int(self.ext.topk_pp_words(cap)), dtype=torch.int32, device=device
+        )
 
         # ---- O mailboxes, one per head dim
         self.ox = {}
@@ -229,8 +272,13 @@ class DcpExchange:
         dbg: torch.Tensor | None = None,
         stats: torch.Tensor | None = None,
         interleave: int | None = None,
+        prepass: bool | None = None,
+        prepass_min: int | None = None,
     ) -> None:
         """``stats``: optional int32[8] row counters (``STAT_NAMES``), added to.
+        ``prepass`` / ``prepass_min``: the pre-pass and the local keys up to which a
+        row still runs its own passes (None: ``topk_prepass`` / ``topk_prepass_min``;
+        the outputs are the same either way).
         ``tie_order``: "global" selects the ties at the K-th key by ascending global
         token id (the stock merge's rule; one extra round when they straddle ranks),
         "rank" by (rank, position) with no extra round (the same score multiset).
@@ -256,6 +304,12 @@ class DcpExchange:
         assert -(-max_local_len // cluster) <= 131072, "local context too long"
         if -(-max_local_len // cluster) > segmax:
             segmax = 0  # keys re-read from global memory
+        pre = topk_prepass(cluster, segmax, max_local_len) if prepass is None else prepass
+        pre = pre and segmax == 0
+        if prepass_min is None:
+            res = self.resident_clusters(cluster, segmax, True) if pre else 0
+            prepass_min = topk_prepass_min(cluster, T, res)
+        pp_min = prepass_min
         self.ext.topk_merge(
             logits,
             local_len,
@@ -295,12 +349,15 @@ class DcpExchange:
             segmax,
             dbg,
             stats,
+            self.tk_pp if pre else None,
+            pp_min,
         )
 
-    def resident_clusters(self, cluster: int, segmax: int) -> int:
-        """Top-k clusters of ``cluster`` CTAs (``segmax`` staged keys each) that fit
-        on the GPU at once; a launch walks rows beyond it in turns."""
-        return int(self.ext.topk_resident_clusters(cluster, segmax))
+    def resident_clusters(self, cluster: int, segmax: int, pre: bool) -> int:
+        """Top-k clusters of ``cluster`` CTAs (``segmax`` staged keys each; ``pre``:
+        a pre-pass launch, ``topk_prepass``) that fit on the GPU at once; a launch
+        walks rows beyond it in turns."""
+        return int(self.ext.topk_resident_clusters(cluster, segmax, pre))
 
     def set_spin_timeout(self, seconds: float) -> None:
         """Cross-rank spin deadline of the kernels launched (or captured) from now

@@ -90,6 +90,10 @@ constexpr int kTieBuckets = 64;  // global-id buckets per tie radix round
 constexpr int kTieWords = kTieBuckets / 2;
 constexpr int kTieStore = kG;    // tied local positions kept in SMEM per row
 constexpr int kMaxK = 2048;      // top-k sizes the packed WRITE scan supports
+constexpr int kDbgRow = 64;      // per-row dbg stamps (dbg_rows)
+constexpr int kPPTile = 16384;   // pre-pass keys per CTA tile (kThreads x 8 x 8)
+constexpr int kPPList = 4096;    // pre-pass candidates kept per row
+constexpr int kPPCand = 2;       // candidate bound: this many coarse bins below the centre
 
 __device__ __forceinline__ void spin_fail(int* err, int code) {
   atomicCAS(err, 0, code);
@@ -213,13 +217,34 @@ struct TopkParams {
   int small_ctx;
   int* stats;      // optional per-path row counters (see kSt*)
   long long* dbg;  // optional phase timestamps (row 0, leader, tid 0)
+  int dbg_rows;     // dbg holds kDbgRow stamps for every row (profiling)
   int pdl;  // launched with programmatic stream serialization: release dependents early
   int* epoch;
   int* ticket;
   int* err;
   int segmax;
   long long spin_ns;  // cross-rank spin deadline (<= 0: none)
+  // Pre-pass (pre = 1; see topk_pp_*_kernel): the coarse histogram, centred window
+  // counts and candidate list of every row with more than pp_min local keys were
+  // computed by the balanced pre-pass kernels; shorter rows run their own passes.
+  int pre;
+  int pp_min;
+  int ring_stages;  // key-streaming ring chunks (segmax == 0)
+  uint32_t* pp_hist;  // [cap, kCoarseBins] (zero between uses)
+  uint32_t* pp_win;   // [cap, 512] window counts (zero between uses)
+  int* pp_lo;         // [cap] window start (written by the last pp_hist tile of a row)
+  int* pp_thr;        // [cap] candidate key bound
+  int* pp_spare;      // [cap] (reserved)
+  int* pp_cn;         // [cap] candidates appended (zero between uses)
+  uint32_t* pp_pos;   // [cap, kPPList] candidate local positions
+  uint16_t* pp_key;   // [cap, kPPList] candidate keys
 };
+
+// A row whose passes come from the pre-pass: more than pp_min local keys (and not
+// selected whole). The pre-pass kernels and the merge kernel use this one rule.
+__device__ __forceinline__ bool pp_row(const TopkParams& p, int L, int Gl) {
+  return p.pre && Gl > p.K && L > p.pp_min;
+}
 
 enum Act : int {
   kActNone = 0, kActFine = 1, kActWrite = 3, kActTieHist = 4,
@@ -386,28 +411,263 @@ __device__ __forceinline__ uint32_t raw_key(const uint4& v, int j) {
   return bf16_key((j & 1) ? (w >> 16) : (w & 0xFFFFu));
 }
 
-// Visits this CTA's keys (unordered): fn(i, key) for i in [0, n). The SMEM copy
-// holds the raw bf16 bits.
+// ------------------------------------------------------------------ key streaming
+// Passes over a CTA's keys in global memory (segmax == 0) are latency-bound with one
+// 16-byte load in flight per thread (4 KB per CTA): the longest row's 1-2 CTAs then
+// set the kernel time while the rest of the GPU idles. stream_keys instead streams the
+// segment through a kRingStages-deep SMEM ring with 1-D bulk async copies (one thread
+// issues, an mbarrier per stage), so (kRingStages - 1) chunks stay in flight at no
+// register cost. It only changes how the keys reach the threads: every key of the
+// segment is visited exactly once, and all the passes it feeds are order-independent
+// (histogram / count atomics, bitmap ORs), so the results are bit-identical.
+constexpr int kRingCU = 2;                              // 16-byte words per thread per chunk
+constexpr int kRingStages = 3;                          // chunks in the ring
+constexpr int kChunkWords = kThreads * kRingCU;         // uint4 per chunk
+constexpr int kChunkBytes = kChunkWords * 16;           // 8 KB
+constexpr int kRingBytes = kRingStages * kChunkBytes;   // dynamic SMEM when segmax == 0
+
+__device__ __forceinline__ uint32_t smem_u32(const void* p) {
+  return (uint32_t)__cvta_generic_to_shared(p);
+}
+__device__ __forceinline__ void mbar_init(uint64_t* bar, uint32_t count) {
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(smem_u32(bar)), "r"(count)
+               : "memory");
+}
+__device__ __forceinline__ void mbar_wait(uint64_t* bar, uint32_t phase) {
+  asm volatile(
+      "{\n\t.reg .pred P1;\n\t"
+      "LAB_WAIT:\n\t"
+      "mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1;\n\t"
+      "@P1 bra DONE;\n\t"
+      "bra LAB_WAIT;\n\t"
+      "DONE:\n\t}" ::"r"(smem_u32(bar)),
+      "r"(phase)
+      : "memory");
+}
+// One bulk copy of `bytes` (multiple of 16, both addresses 16-byte aligned) into this
+// CTA's SMEM, completing on `bar` (which expects exactly these bytes).
+__device__ __forceinline__ void bulk_g2s(void* dst, const void* src, uint32_t bytes,
+                                         uint64_t* bar) {
+  asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(smem_u32(bar)),
+               "r"(bytes)
+               : "memory");
+  asm volatile(
+      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::
+          "r"(smem_u32(dst)),
+      "l"(src), "r"(bytes), "r"(smem_u32(bar))
+      : "memory");
+}
+
+// Ring state of a CTA: the stage barriers and the number of chunks it consumed so far
+// (uniform over the CTA; a chunk's stage is seq % kRingStages, its phase the parity
+// of seq / kRingStages).
+struct Ring {
+  uint4* buf;      // stages x kChunkWords (dynamic SMEM)
+  uint64_t* bar;   // stages mbarriers
+  uint32_t seq;
+  uint32_t stages;  // 1..kRingStages (1 under the pre-pass: rare fallback passes only)
+};
+
+// Up to 8 keys [i, i + cnt) read one by one (head / tail of an unaligned segment);
+// the other halves read as -NaN 0xFFFF (key 0).
+__device__ __forceinline__ uint4 load_part(const uint16_t* lrow, int i, int cnt) {
+  uint32_t w[4];
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const uint32_t lo = 2 * j < cnt ? lrow[i + 2 * j] : 0xFFFFu;
+    const uint32_t hi = 2 * j + 1 < cnt ? lrow[i + 2 * j + 1] : 0xFFFFu;
+    w[j] = lo | (hi << 16);
+  }
+  return make_uint4(w[0], w[1], w[2], w[3]);
+}
+
+// Visits keys [0, n) of lrow (global memory) as groups of 8 consecutive keys:
+// fn(i0, raw, valid) with raw holding the bf16 bits of keys [i0, i0 + 8) and bit j of
+// valid set iff key i0 + j is in [0, n) (other halves are 0xFFFF). Every key is in
+// exactly one group; groups come in no particular order and i0 need not be a
+// multiple of 8 (the 16-byte aligned body starts at the first aligned key). Every
+// thread of the CTA must call it (it ends with a CTA barrier).
 template <typename F>
-__device__ __forceinline__ void for_keys(const uint16_t* keys, bool smem, const uint16_t* lrow,
-                                         int n, int tid, F fn) {
+__device__ __forceinline__ void stream_keys(Ring& rg, const uint16_t* lrow, int n, int tid,
+                                            F fn) {
+  const uintptr_t a = reinterpret_cast<uintptr_t>(lrow);
+  const int hoff = min(n, (int)(((16u - (uint32_t)(a & 15)) & 15u) >> 1));
+  const int ng = (n - hoff) >> 3;  // 16-byte groups of the aligned body
+  const int t0 = hoff + ng * 8;    // tail keys [t0, n)
+  if (tid == 0 && hoff > 0) fn(0, load_part(lrow, 0, hoff), (1u << hoff) - 1u);
+  if (tid == kThreads - 1 && t0 < n) fn(t0, load_part(lrow, t0, n - t0), (1u << (n - t0)) - 1u);
+  const char* body = reinterpret_cast<const char*>(lrow + hoff);
+  const int64_t bytes = (int64_t)ng * 16;
+  const int nch = (int)((bytes + kChunkBytes - 1) / kChunkBytes);
+  auto issue = [&](int c) {
+    const uint32_t s = (rg.seq + (uint32_t)c) % rg.stages;
+    const long long rem = (long long)bytes - (long long)c * kChunkBytes;
+    const uint32_t nb = (uint32_t)(rem < kChunkBytes ? rem : (long long)kChunkBytes);
+    bulk_g2s(rg.buf + s * kChunkWords, body + (int64_t)c * kChunkBytes, nb, rg.bar + s);
+  };
+  if (tid == 0)
+    for (int c = 0; c < min(nch, (int)rg.stages); ++c) issue(c);
+  for (int c = 0; c < nch; ++c) {
+    const uint32_t q = rg.seq + (uint32_t)c;
+    const uint32_t s = q % rg.stages;
+    mbar_wait(rg.bar + s, (q / rg.stages) & 1u);
+    const int g0 = c * kChunkWords;
+#pragma unroll
+    for (int u = 0; u < kRingCU; ++u) {
+      const int g = g0 + u * kThreads + tid;
+      if (g < ng) fn(hoff + g * 8, rg.buf[s * kChunkWords + u * kThreads + tid], 0xFFu);
+    }
+    __syncthreads();  // every thread is done with stage s: refill it
+    if (tid == 0 && c + (int)rg.stages < nch) issue(c + (int)rg.stages);
+  }
+  rg.seq += (uint32_t)nch;
+  if (nch == 0) __syncthreads();
+}
+
+// ORs the 8-bit mask m of keys [i0, i0 + 8) into a position bitmap (i0 need not be a
+// multiple of 8: the mask may straddle two words).
+__device__ __forceinline__ void or_bits8(uint32_t* bm, int i0, uint32_t m) {
+  const int w = i0 >> 5, sh = i0 & 31;
+  atomicOr(&bm[w], m << sh);
+  if (sh > 24) {
+    const uint32_t hi = m >> (32 - sh);
+    if (hi) atomicOr(&bm[w + 1], hi);
+  }
+}
+
+// Two bf16 values (one 32-bit word) -> their order-preserving 16-bit keys (bf16_key
+// on both halves at once, plain 32-bit ops: the SIMD video intrinsics are emulated):
+// x ^ 0x8000 for x >= 0, x ^ 0xFFFF for x < 0, NaN (|x| bits > 0x7F80) -> 0.
+__device__ __forceinline__ uint32_t keys2(uint32_t w) {
+  const uint32_t neg = (w >> 15) & 0x00010001u;
+  const uint32_t k = w ^ (neg * 0x7FFFu + 0x80008000u);
+  // per half: (|x| bits) + 0x7F reaches bit 15 iff |x| bits > 0x7F80 (no carry out)
+  const uint32_t nan = (((w & 0x7FFF7FFFu) + 0x007F007Fu) >> 15) & 0x00010001u;
+  return k & ~(nan * 0xFFFFu);
+}
+// Keys of 8 bf16 values as 4 packed words.
+struct Keys8 {
+  uint32_t w[4];
+  __device__ __forceinline__ explicit Keys8(const uint4& r)
+      : w{keys2(r.x), keys2(r.y), keys2(r.z), keys2(r.w)} {}
+  __device__ __forceinline__ uint32_t key(int j) const {
+    return (j & 1) ? (w[j >> 1] >> 16) : (w[j >> 1] & 0xFFFFu);
+  }
+};
+// An upper bound of the largest key of 8 bf16 values from 3 native bf16x2 max ops
+// (max.bf16x2 ignores a NaN operand; -0 / +0 compare equal, so the bound adds 1):
+// every key of the group is <= the bound, and the bound is 1 when all 8 are NaN.
+__device__ __forceinline__ uint32_t max_key_bound(const uint4& r) {
+  uint32_t a, b, m;
+  asm("max.bf16x2 %0, %1, %2;" : "=r"(a) : "r"(r.x), "r"(r.y));
+  asm("max.bf16x2 %0, %1, %2;" : "=r"(b) : "r"(r.z), "r"(r.w));
+  asm("max.bf16x2 %0, %1, %2;" : "=r"(m) : "r"(a), "r"(b));
+  const uint32_t k = keys2(m);
+  return ::max(k & 0xFFFFu, k >> 16) + 1u;
+}
+
+// Visits this CTA's keys [0, n) as groups of 8 consecutive keys (unordered):
+// fn(i0, raw, valid) as stream_keys, from the SMEM copy (raw bf16 bits, i0 a multiple
+// of 8) or streamed from global memory. Every thread of the CTA must call it.
+template <typename F>
+__device__ __forceinline__ void for_groups(const uint16_t* keys, bool smem, Ring& rg,
+                                           const uint16_t* lrow, int n, int tid, F fn) {
   if (smem) {
-    for (int i = tid; i < n; i += kThreads) fn(i, bf16_key(keys[i]));
+    for (int b0 = tid * 8; b0 < n; b0 += kThreads * 8) {
+      if (b0 + 8 <= n) fn(b0, *reinterpret_cast<const uint4*>(keys + b0), 0xFFu);
+      else fn(b0, load_part(keys, b0, n - b0), (1u << (n - b0)) - 1u);
+    }
     return;
   }
-  const bool vec = ((reinterpret_cast<uintptr_t>(lrow) & 15) == 0);
-  for (int b = tid * 8; b < n; b += kThreads * 8 * kUnroll) {
-    uint4 raw[kUnroll];
+  stream_keys(rg, lrow, n, tid, fn);
+}
+
+// Counts this CTA's keys in [lo, lo + nn) into cnt[] (SMEM atomics) and adds its keys
+// >= lo + nn to *above (if given). Most groups lie entirely below the window (it sits
+// near the K-th key): one packed max test skips them.
+__device__ __forceinline__ void count_window(const uint16_t* keys, bool smem, Ring& rg,
+                                             const uint16_t* lrow, int n, int tid, int lo,
+                                             int nn, uint32_t* cnt, uint32_t* above) {
+  uint32_t myab = 0;
+  for_groups(keys, smem, rg, lrow, n, tid, [&](int, const uint4& r, uint32_t valid) {
+    if ((int)max_key_bound(r) < lo) return;
+    const Keys8 k8(r);
 #pragma unroll
-    for (int u = 0; u < kUnroll; ++u) raw[u] = load8_raw(lrow, b + u * kThreads * 8, n, vec);
-#pragma unroll
-    for (int u = 0; u < kUnroll; ++u)
-#pragma unroll
-      for (int j = 0; j < 8; ++j) {
-        const int i = b + u * kThreads * 8 + j;
-        if (i < n) fn(i, raw_key(raw[u], j));
+    for (int j = 0; j < 8; ++j) {
+      const int u = (int)k8.key(j) - lo;
+      if ((valid >> j) & 1u) {
+        if (u >= 0 && u < nn) atomicAdd(&cnt[u], 1u);
+        myab += u >= nn;
       }
+    }
+  });
+  if (above) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) myab += __shfl_xor_sync(0xffffffffu, myab, o);
+    if ((tid & 31) == 0 && myab) atomicAdd(above, myab);
   }
+}
+
+// Masks of the 8 keys above tau (mg) and tied at tau != 0 (me); 0 / 0 for most groups
+// (one packed max test). Keys outside the segment read as key 0: never selected.
+__device__ __forceinline__ bool mark_masks(const uint4& r, uint32_t tau, uint32_t& mg,
+                                           uint32_t& me) {
+  if (max_key_bound(r) < tau) return false;
+  const Keys8 k8(r);
+  mg = 0, me = 0;
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    const uint32_t k = k8.key(j);
+    mg |= (uint32_t)(k > tau) << j;
+    me |= (uint32_t)((k == tau) && (tau != 0u)) << j;
+  }
+  return (mg | me) != 0u;
+}
+
+// Centred 1R window (block of kThreads, hist = a row's 4096 coarse bins in SMEM):
+// *s_cq = the coarse bin of the row's local q-th key from the top (of its top key when
+// it has fewer than q valid keys; 0 with none). Also leaves s_v8[b] = the keys of
+// 256-key bin b and s_x8[b] = the keys above bin b. Ends with a CTA barrier.
+__device__ __forceinline__ void c1r_center(const uint32_t* hist, uint32_t q, uint32_t* s_v8,
+                                           uint32_t* s_x8, int* s_b8c, int* s_top8,
+                                           uint32_t* s_a8c, int* s_cq, uint32_t* warp_sums,
+                                           int tid) {
+  // thread t: the 256-key bin t = coarse bins [16t, 16t + 16)
+  const uint4* lh4 = reinterpret_cast<const uint4*>(hist) + tid * 4;
+  uint32_t cb16[16];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const uint4 v = lh4[i];
+    cb16[4 * i] = v.x; cb16[4 * i + 1] = v.y; cb16[4 * i + 2] = v.z; cb16[4 * i + 3] = v.w;
+  }
+  uint32_t v8 = 0;
+#pragma unroll
+  for (int i = 0; i < 16; ++i) v8 += cb16[i];
+  // exclusive scan from the top: thread t holds bin 255 - t
+  if (tid == 0) { *s_b8c = -1; *s_top8 = -1; }
+  s_v8[tid] = v8;
+  __syncthreads();
+  const int bin = 255 - tid;
+  const uint32_t vb = s_v8[bin];
+  uint32_t tot8;
+  const uint32_t ex = block_excl_scan(vb, warp_sums, &tot8);
+  s_x8[bin] = ex;
+  if (ex < q && ex + vb >= q) { *s_b8c = bin; *s_a8c = ex; }
+  if (vb > 0 && ex == 0) *s_top8 = bin;
+  __syncthreads();
+  int b8 = *s_b8c;
+  uint32_t need = q, cum = *s_a8c;
+  if (b8 < 0) { b8 = *s_top8; need = 1; cum = 0; }  // fewer than q valid keys: the top
+  if (b8 >= 0 && tid == b8) {
+    int cq = b8 * 16;
+    for (int k = 15; k >= 0; --k) {
+      if (cum + cb16[k] >= need) { cq = b8 * 16 + k; break; }
+      cum += cb16[k];
+    }
+    *s_cq = cq;
+  }
+  if (tid == 0 && b8 < 0) *s_cq = 0;
+  __syncthreads();
 }
 
 template <int CS_MAX>
@@ -417,8 +677,13 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
   const int cs = (int)cl.num_blocks();
   const int tid = threadIdx.x;
   const bool leader = crank == 0;
-#define DBG(i) \
-  if (p.dbg && row == 0 && crank == 0 && threadIdx.x == 0) p.dbg[i] = now_ns();
+#define DBG(i)                                                                \
+  if (p.dbg && (p.dbg_rows || row == 0) && crank == 0 && threadIdx.x == 0)   \
+    p.dbg[(p.dbg_rows ? (int64_t)row * kDbgRow : 0) + (i)] = now_ns();
+  // per-row-only stamps (profiling: dbg_rows): 32 R8 start, 33 R8 polled, 34 R4 start,
+  // 35 R4 polled, 36 refine start, 37 refine polled, 38 1R refine-bin round polled
+#define DBGX(i) \
+  if (p.dbg && p.dbg_rows && crank == 0 && threadIdx.x == 0) p.dbg[(int64_t)row * kDbgRow + (i)] = now_ns();
   // dbg (32 stamps, row 0, leader, thread 0): 0 row start, 1 pass A, 2 S1, 4 1R send
   // start, 16 estimate, 17 window counts, 19 1R header, 20 1R sent, 5 1R polled, 21 1R
   // accumulated, 22 1R resolved, 23 1R done, 6 quota, 7 WRITE, 12 bitmap, 24 offsets,
@@ -426,7 +691,9 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
 #define STAT(i) \
   if (p.stats && tid == 0) atomicAdd(&p.stats[i], 1);
 
-  extern __shared__ uint16_t keys[];  // [segmax]
+  // [segmax] staged keys, or (segmax == 0) the kRingBytes key-streaming ring
+  extern __shared__ __align__(128) uint16_t keys[];
+  __shared__ __align__(8) uint64_t s_rbar[kRingStages];
   __shared__ __align__(16) uint32_t hist[kCoarseBins];
   __shared__ uint32_t G[kG];
   __shared__ __align__(16) uint32_t fine[512];
@@ -457,9 +724,9 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
   __shared__ uint32_t s_above_c1r;  // centred 1R, leader: keys above the window
   __shared__ int s_fkey_c1r;        // centred 1R fallback: the octave rounds' key bound
   __shared__ int s_cnt2[2 * 16];    // centred 1R: every CTA's (tokens above tau, ties)
-  __shared__ uint32_t s_myabove;    // centred 1R: this CTA's keys above the window
   __shared__ uint32_t s_v8[256];    // centred 1R, leader: the 256-key bin counts (sums)
   __shared__ uint32_t s_a8c;
+  __shared__ int s_pp_cn, s_pp_thr, s_pp_lo;  // pre-pass: candidates, their bound, window
 
   // PDL: the launch, CTA placement and the shared-memory carve-out above overlap
   // the logits kernel's tail; every global read (logits, lengths, epoch,
@@ -473,6 +740,12 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
   for (int b = tid; b < kCoarseBins; b += kThreads) hist[b] = 0;
   for (int b = tid; b < 512; b += kThreads) fine2[b] = 0;
   if (tid == 0) { s_wlo = 0; s_seq = 0; s_fkey_c1r = 0; }
+  Ring ring{reinterpret_cast<uint4*>(keys), s_rbar, 0u, (uint32_t)p.ring_stages};
+  if (tid == 0 && p.segmax == 0) {
+    for (int i = 0; i < kRingStages; ++i) mbar_init(&s_rbar[i], 1);
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+  }
   if (cs > 1) cl.sync();
   else __syncthreads();
   asm volatile("griddepcontrol.wait;" ::: "memory");
@@ -497,6 +770,8 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
   const uint16_t* lseg = p.logits + (int64_t)row * p.lstride + s0;
   int* orow = p.out + (int64_t)row * p.ostride;
   const int req = p.req_of_row != nullptr ? p.req_of_row[row] : row / p.next_n;
+  // this row's passes came from the pre-pass (pp_row: the pre-pass kernels' rule)
+  const bool rpre = pp_row(p, L, Gl);
 
   auto slot_of = [&](int pos) -> int {
     if (p.block_table == nullptr) return pos;
@@ -533,29 +808,56 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
     if (leader) STAT(kStRows);
     // ---- pass A: keys into shared memory, local coarse histogram (zeroed in the
     // prologue / at the previous row's end)
-    const bool vec = ((reinterpret_cast<uintptr_t>(lseg) & 15) == 0);
-    for (int b0 = tid * 8; b0 < n; b0 += kThreads * 8 * kUnroll) {
-      uint4 raw[kUnroll];
+    if (rpre) {
+      // pre-pass: the leader takes the row's histogram, window counts' bound and
+      // candidate count, and re-zeroes them for the next use (the other CTAs keep
+      // zero histograms: the leader's holds the row's sums, as after S1)
+      if (leader) {
+        uint4* hg = reinterpret_cast<uint4*>(p.pp_hist + (int64_t)row * kCoarseBins);
+        uint4* h4 = reinterpret_cast<uint4*>(hist);
+        for (int b = tid; b < kCoarseBins / 4; b += kThreads) {
+          h4[b] = __ldcg(&hg[b]);
+          hg[b] = make_uint4(0u, 0u, 0u, 0u);
+        }
+        if (tid == 0) {
+          s_pp_cn = p.pp_cn[row];
+          s_pp_thr = p.pp_thr[row];
+          s_pp_lo = p.pp_lo[row];
+          p.pp_cn[row] = 0;
+        }
+      }
+    } else if (smem_keys) {
+      const bool vec = ((reinterpret_cast<uintptr_t>(lseg) & 15) == 0);
+      for (int b0 = tid * 8; b0 < n; b0 += kThreads * 8 * kUnroll) {
+        uint4 raw[kUnroll];
 #pragma unroll
-      for (int u = 0; u < kUnroll; ++u) raw[u] = load8_raw(lseg, b0 + u * kThreads * 8, n, vec);
+        for (int u = 0; u < kUnroll; ++u) raw[u] = load8_raw(lseg, b0 + u * kThreads * 8, n, vec);
 #pragma unroll
-      for (int u = 0; u < kUnroll; ++u)
+        for (int u = 0; u < kUnroll; ++u)
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-          const int i = b0 + u * kThreads * 8 + j;
-          const uint32_t k = raw_key(raw[u], j);
-          if (i < n) {
-            if (smem_keys) {
+          for (int j = 0; j < 8; ++j) {
+            const int i = b0 + u * kThreads * 8 + j;
+            const uint32_t k = raw_key(raw[u], j);
+            if (i < n) {
               const uint32_t w = (j >> 1) == 0 ? raw[u].x : (j >> 1) == 1 ? raw[u].y
                                : (j >> 1) == 2 ? raw[u].z : raw[u].w;
               keys[i] = (uint16_t)((j & 1) ? (w >> 16) : (w & 0xFFFFu));
+              if (k != 0u) atomicAdd(&hist[k >> 4], 1u);
             }
-            if (k != 0u) atomicAdd(&hist[k >> 4], 1u);
           }
+      }
+    } else {
+      stream_keys(ring, lseg, n, tid, [&](int, const uint4& r, uint32_t valid) {
+        const Keys8 k8(r);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          const uint32_t k = k8.key(j);
+          if (((valid >> j) & 1u) && k != 0u) atomicAdd(&hist[k >> 4], 1u);
         }
+      });
     }
     DBG(1);
-    if (!leader) {
+    if (!leader && !rpre) {
       // add this CTA's non-zero bins into the leader's histogram (DSMEM reductions;
       // the leader's own atomics commute with them)
       __syncthreads();
@@ -565,6 +867,10 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
     }
     cl.sync();  // S1: the leader's hist holds the cluster sums
     DBG(2);
+    if (rpre && !leader && tid == 0) {  // the row's candidate count / bound
+      s_pp_cn = *cl.map_shared_rank(&s_pp_cn, 0);
+      s_pp_thr = *cl.map_shared_rank(&s_pp_thr, 0);
+    }
     const uint32_t tag = (uint32_t)s_tag;
     const int par = s_par;
     // Centred 1-round window: every CTA derives the same window from the leader's
@@ -578,44 +884,11 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
       // with one release store each (bulk DSMEM reads of the leader's histogram by
       // every CTA are far slower); the others spin on their own copy.
       if (leader) {
-        const uint4* lh4 = reinterpret_cast<const uint4*>(hist) + tid * 4;
-        uint32_t cb16[16];
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-          const uint4 v = lh4[i];
-          cb16[4 * i] = v.x; cb16[4 * i + 1] = v.y; cb16[4 * i + 2] = v.z; cb16[4 * i + 3] = v.w;
-        }
-        uint32_t v8 = 0;
-#pragma unroll
-        for (int i = 0; i < 16; ++i) v8 += cb16[i];
-        // exclusive scan from the top: thread t holds bin 255 - t
-        if (tid == 0) { s_b8c = -1; s_top8 = -1; }
-        s_v8[tid] = v8;
-        __syncthreads();
-        const int bin = 255 - tid;
-        const uint32_t vb = s_v8[bin];
-        uint32_t tot8;
-        const uint32_t ex = block_excl_scan(vb, warp_sums, &tot8);
-        s_x8[bin] = ex;
         const uint32_t q = (uint32_t)max(1LL, ((long long)K * L + Gl - 1) / Gl);
-        if (ex < q && ex + vb >= q) { s_b8c = bin; s_a8c = ex; }
-        if (vb > 0 && ex == 0) s_top8 = bin;
-        __syncthreads();
-        int b8 = s_b8c;
-        uint32_t need = q, cum = s_a8c;
-        if (b8 < 0) { b8 = s_top8; need = 1; cum = 0; }  // fewer than q valid keys: the top
-        if (b8 >= 0 && tid == b8) {
-          int cq = b8 * 16;
-          for (int k = 15; k >= 0; --k) {
-            if (cum + cb16[k] >= need) { cq = b8 * 16 + k; break; }
-            cum += cb16[k];
-          }
-          s_cq = cq;
-        }
-        if (tid == 0 && b8 < 0) s_cq = 0;
-        __syncthreads();
+        c1r_center(hist, q, s_v8, s_x8, &s_b8c, &s_top8, &s_a8c, &s_cq, warp_sums, tid);
         const int nb = p.nw1 / 16;
         c1r_lo = min(max(0, s_cq - nb / 2), kCoarseBins - nb) * 16;
+        if (rpre && L > 0 && tid == 0 && c1r_lo != s_pp_lo) spin_fail(p.err, 21);
         const uint32_t word = ((uint32_t)(row + 1) << 17) | (uint32_t)c1r_lo;
         if (tid > 0 && tid < cs) {
           uint32_t* f = cl.map_shared_rank(&s_wlo, tid);
@@ -664,20 +937,22 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
       // leader's SM), and the leader sums them.
       const int nn = p.nw1;
       const bool parts = cs <= kMaxW * 260 / 512;
-      for (int b = tid; b < nn; b += kThreads) fine[b] = 0;
-      if (tid == 0) s_myabove = 0;
-      __syncthreads();
-      uint32_t myab = 0;  // this CTA's keys above the window
-      for_keys(keys, smem_keys, lseg, n, tid, [&](int, uint32_t k) {
-        const int u = (int)k - c1r_lo;
-        if (u >= 0 && u < nn) atomicAdd(&fine[u], 1u);
-        myab += u >= nn;
-      });
-#pragma unroll
-      for (int o = 16; o > 0; o >>= 1) myab += __shfl_xor_sync(0xffffffffu, myab, o);
-      if ((tid & 31) == 0 && myab) atomicAdd(&s_myabove, myab);
+      if (rpre) {
+        // pre-pass: the row's window counts (the leader's message; zeroed for reuse)
+        if (leader) {
+          uint32_t* wg = p.pp_win + (int64_t)row * 512;
+          for (int b = tid; b < nn; b += kThreads) {
+            fine[b] = __ldcg(&wg[b]);
+            wg[b] = 0u;
+          }
+        }
+      } else {
+        for (int b = tid; b < nn; b += kThreads) fine[b] = 0;
+        __syncthreads();
+        count_window(keys, smem_keys, ring, lseg, n, tid, c1r_lo, nn, fine, nullptr);
+      }
       DBG(28);
-      if (!leader) {
+      if (!leader && !rpre) {
         __syncthreads();
         if (parts) {
           uint4* dst = reinterpret_cast<uint4*>(cl.map_shared_rank(rx, 0) + crank * 512);
@@ -698,7 +973,8 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
         const int words = 2 + nn / 2, wpad = (words + 3) & ~3;
         for (int j = tid; j < nn / 2; j += kThreads) {
           uint32_t a = fine[2 * j], b = fine[2 * j + 1];
-          if (parts) {
+          if (rpre) {
+          } else if (parts) {
             for (int c = 1; c < cs; ++c) {
               a += rx[c * 512 + 2 * j];
               b += rx[c * 512 + 2 * j + 1];
@@ -707,6 +983,7 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
             a += fine2[2 * j], b += fine2[2 * j + 1];
             fine2[2 * j] = 0, fine2[2 * j + 1] = 0;
           }
+          fine[2 * j] = a, fine[2 * j + 1] = b;  // the row's sums (WRITE check)
           msg[2 + j] = pack2(tag, a, b);
         }
         for (int j = words + tid; j < wpad; j += kThreads)
@@ -723,10 +1000,7 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
     // outside a window (and global-id ties that straddle ranks) continue in the
     // leader state machine below (stage 20 / 30).
     int c1r_stage = -1;  // -1: row done here
-    // this CTA's counts of the window that located tau (the 1R window, or the refine
-    // bin), its first key and size; s_myabove: this CTA's keys above it
-    uint32_t* c1r_cnt = fine;
-    int c1r_clo = c1r_lo, c1r_cn = p.nw1;
+    bool refined = false;  // tau located by the refine round (not the 1R window)
     if (c1r) {
       // Mailbox slot per rank (stride wpad + 260): the window message (wpad words),
       // the 256-key bin counts (128 pair words) and a refine message (132 words).
@@ -864,17 +1138,19 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
           const int rlo = b8 * 256;
           for (int b = tid; b < 256; b += kThreads) fine[b] = 0;
           for (int b = tid; b < kG; b += kThreads) G[b] = 0;  // for the refine resolve
-          if (tid == 0) s_myabove = 0;
           __syncthreads();
-          uint32_t myab = 0;
-          for_keys(keys, smem_keys, lseg, n, tid, [&](int, uint32_t k) {
-            const int u = (int)k - rlo;
-            if (u >= 0 && u < 256) atomicAdd(&fine[u], 1u);
-            myab += u >= 256;
-          });
-#pragma unroll
-          for (int o = 16; o > 0; o >>= 1) myab += __shfl_xor_sync(0xffffffffu, myab, o);
-          if ((tid & 31) == 0 && myab) atomicAdd(&s_myabove, myab);
+          if (rpre && (L == 0 || (s_pp_cn <= kPPList && rlo >= s_pp_thr))) {
+            // the pre-pass candidates hold every key of the bin
+            const uint32_t* cpos = p.pp_pos + (int64_t)row * kPPList;
+            const uint16_t* ckey = p.pp_key + (int64_t)row * kPPList;
+            for (int c = tid; c < s_pp_cn; c += kThreads) {
+              const int i = (int)cpos[c] - s0;
+              const int u = (int)ckey[c] - rlo;
+              if (i >= 0 && i < n && u >= 0 && u < 256) atomicAdd(&fine[u], 1u);
+            }
+          } else {
+            count_window(keys, smem_keys, ring, lseg, n, tid, rlo, 256, fine, nullptr);
+          }
           __syncthreads();
           if (!leader) {
             uint4* dst = reinterpret_cast<uint4*>(cl.map_shared_rank(hist, 0) + crank * 256);
@@ -883,7 +1159,7 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
           }
           if (cs > 1) cl.sync();
           else __syncthreads();
-          c1r_cnt = fine, c1r_clo = rlo, c1r_cn = 256;
+          refined = true;
           if (leader) {
             // the bin's counts summed over the CTAs + this rank's keys above the bin
             const uint32_t own_above = s_x8[b8];
@@ -906,6 +1182,7 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
           }
           poll_ranks<(kMaxW * 132 + kThreads * 4 - 1) / (kThreads * 4)>(
               p, rx, rbox + wpad + 128, slot, 132, 132, tag, tid, 3);
+          DBGX(38);
           // Re-arm the refine messages once every CTA of the cluster has its copy.
           // Unlike the window and bin words, a rank writes them only on the rows that
           // take this round, so a word left from this use would carry the current
@@ -958,54 +1235,33 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
       } else if (q < 0) {
         c1r_stage = 30;  // tie round (leader state machine)
       } else {
-        // this CTA's tokens above tau and ties at tau from its window counts
-        const int d0 = (int)tau - c1r_clo;
-        uint32_t g = 0;
-        for (int u = max(d0 + 1, 0) + tid; u < c1r_cn; u += kThreads) g += c1r_cnt[u];
-#pragma unroll
-        for (int o = 16; o > 0; o >>= 1) g += __shfl_xor_sync(0xffffffffu, g, o);
-        __shared__ uint32_t s_wg[kWarps];
-        if ((tid & 31) == 0) s_wg[tid >> 5] = g;
-        __syncthreads();
-        if (tid < cs) {
-          uint32_t gt = s_myabove;
-          for (int w = 0; w < kWarps; ++w) gt += s_wg[w];
-          // tau at or above the window top: no keys above it here (validity of tau)
-          if (d0 >= c1r_cn) gt = 0;
-          const uint32_t eq = (tau != 0u && d0 >= 0 && d0 < c1r_cn) ? c1r_cnt[d0] : 0u;
-          int* dst = tid == crank ? s_cnt2 : cl.map_shared_rank(s_cnt2, tid);
-          dst[2 * crank] = (int)gt;
-          dst[2 * crank + 1] = (int)eq;
-        }
-        if (cs > 1) cl.sync();  // every CTA's counts in every CTA
-        else __syncthreads();
-        DBG(24);
-        int go = 0, eo = 0, gtt = 0;
-        for (int c = 0; c < cs; ++c) {
-          if (c < crank) { go += s_cnt2[2 * c]; eo += s_cnt2[2 * c + 1]; }
-          gtt += s_cnt2[2 * c];
-        }
-        // WRITE: bitmaps of the tokens above tau and of the ties, one packed scan,
-        // tokens at go + rank, ties of rank < q at gtt + rank
-        const uint16_t* src = smem_keys ? keys : lseg;
-        const bool vec = ((reinterpret_cast<uintptr_t>(src) & 15) == 0);
+        // WRITE: bitmaps of this CTA's tokens above tau and ties, one packed scan
+        // (its counts), the CTAs' counts exchanged, then tokens at go + rank and
+        // ties of rank < q at gtt + rank. The bitmaps come from the pre-pass
+        // candidates when they hold every key >= tau, else from the keys.
         const int nw = (n + 31) >> 5;
         if (nw > kCoarseBins && tid == 0) spin_fail(p.err, 17);
         uint32_t* bmg = hist;
         uint32_t* bme = rx;
         for (int i = tid; i < nw; i += kThreads) { bmg[i] = 0; bme[i] = 0; }
         __syncthreads();
-        for (int b0 = tid * 8; b0 < n; b0 += kThreads * 8) {
-          const uint4 r = load8_raw(src, b0, n, vec);
-          uint32_t mg = 0, me = 0;
-#pragma unroll
-          for (int j = 0; j < 8; ++j) {
-            const uint32_t k = raw_key(r, j);
-            mg |= (uint32_t)(k > tau) << j;
-            me |= (uint32_t)((k == tau) && (tau != 0u)) << j;
+        if (rpre && (L == 0 || (s_pp_cn <= kPPList && tau >= (uint32_t)s_pp_thr))) {
+          const uint32_t* cpos = p.pp_pos + (int64_t)row * kPPList;
+          const uint16_t* ckey = p.pp_key + (int64_t)row * kPPList;
+          for (int c = tid; c < s_pp_cn; c += kThreads) {
+            const int i = (int)cpos[c] - s0;
+            if (i < 0 || i >= n) continue;
+            const uint32_t k = ckey[c];
+            if (k > tau) atomicOr(&bmg[i >> 5], 1u << (i & 31));
+            else if (k == tau && tau != 0u) atomicOr(&bme[i >> 5], 1u << (i & 31));
           }
-          if (mg) atomicOr(&bmg[b0 >> 5], mg << (b0 & 31));
-          if (me) atomicOr(&bme[b0 >> 5], me << (b0 & 31));
+        } else {
+          for_groups(keys, smem_keys, ring, lseg, n, tid, [&](int i0, const uint4& r, uint32_t) {
+            uint32_t mg, me;
+            if (!mark_masks(r, tau, mg, me)) return;
+            if (mg) or_bits8(bmg, i0, mg);
+            if (me) or_bits8(bme, i0, me);
+          });
         }
         __syncthreads();
         DBG(12);
@@ -1013,12 +1269,36 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
         const int w0 = min(nw, tid * wpt), w1 = min(nw, w0 + wpt);
         uint32_t cgt = 0, ce = 0;
         for (int w = w0; w < w1; ++w) { cgt += __popc(bmg[w]); ce += __popc(bme[w]); }
+        // gt in the low 12 bits (a CTA holds < K <= 2048 tokens above tau), ties in
+        // the high 20 bits, clamped per thread at kMaxK (tie ranks >= K are never
+        // written, so every rank that is used stays exact)
         uint32_t tot;
         const uint32_t pre = block_excl_scan(cgt | (min(ce, (uint32_t)kMaxK) << 12), warp_sums, &tot);
-        if (tid == 0) {
-          const int eq = s_cnt2[2 * crank + 1];
-          if ((int)(tot & 0xFFFu) != s_cnt2[2 * crank] || (eq < kMaxK && (int)(tot >> 12) != eq))
-            spin_fail(p.err, 20);
+        if (tid < cs) {
+          int* dst = tid == crank ? s_cnt2 : cl.map_shared_rank(s_cnt2, tid);
+          dst[2 * crank] = (int)(tot & 0xFFFu);
+          dst[2 * crank + 1] = (int)(tot >> 12);
+        }
+        if (cs > 1) cl.sync();  // every CTA's counts in every CTA
+        else __syncthreads();
+        DBG(24);
+        int go = 0, eo = 0, gtt = 0, eqt = 0;
+        for (int c = 0; c < cs; ++c) {
+          if (c < crank) { go += s_cnt2[2 * c]; eo += s_cnt2[2 * c + 1]; }
+          gtt += s_cnt2[2 * c];
+          eqt += s_cnt2[2 * c + 1];
+        }
+        if (leader && tid == 0 && !refined) {
+          // the row's counts above tau and at tau agree with its window counts
+          // (fine[] = the row's sums; keys above the window from the histogram)
+          const int d0 = (int)tau - c1r_lo;
+          if (d0 >= 0 && d0 < p.nw1) {
+            uint32_t eg = s_above_c1r;
+            for (int u = d0 + 1; u < p.nw1; ++u) eg += fine[u];
+            const uint32_t ee = tau != 0u ? fine[d0] : 0u;
+            if ((uint32_t)gtt != eg || (ee < (uint32_t)kMaxK && (uint32_t)eqt != ee))
+              spin_fail(p.err, 20);
+          }
         }
         int gp = go + (int)(pre & 0xFFFu), ep = eo + (int)(pre >> 12);
         for (int w = w0; w < w1; ++w) {
@@ -1412,10 +1692,12 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
           __syncthreads();
           if (tid < 128) msg[tid] = pack2(tag, G[2 * tid], G[2 * tid + 1]);
           __syncthreads();
+          DBGX(32);
           const int64_t rowoff = p.off_r8 + ((int64_t)(par * p.cap + row) * p.W) * 128;
           send_msg(p, msg, 128, rowoff, tid);
           poll_msg<2>(p, rx, rowoff, p.W * 128, tag, tid, 6);
           __syncthreads();
+          DBGX(33);
           if (tid < 256) {
             uint32_t a = 0;
             for (int s2 = 0; s2 < p.W; ++s2) {
@@ -1448,10 +1730,12 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
                              ((int)c1 * 16 < fk) ? hist[c1] : 0u);
           }
           __syncthreads();
+          DBGX(34);
           const int64_t rowoff = p.off_r4 + ((int64_t)(par * p.cap + row) * p.W) * 8;
           send_msg(p, msg, 8, rowoff, tid);
           poll_msg<1>(p, rx, rowoff, p.W * 8, tag, tid, 7);
           __syncthreads();
+          DBGX(35);
           if (tid == 0) {
             uint32_t g[16];
             for (int k = 0; k < 16; ++k) g[k] = 0;
@@ -1494,6 +1778,7 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
             msg[2 * tid + 1] = pack2(tag, fine[4 * tid + 2], fine[4 * tid + 3]);
           }
           __syncthreads();
+          DBGX(36);
           const int64_t rowoff = p.off_f1 + ((int64_t)(par * p.cap + row) * p.W) * kFineWords;
           if (tid < 2) {
             int j = tid * 4;
@@ -1506,6 +1791,7 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
           }
           poll_msg<1>(p, rx, rowoff, p.W * kFineWords, tag, tid, 3);
           __syncthreads();
+          DBGX(37);
           if (tid == 0) {
             uint32_t g[16];
             for (int k = 0; k < 16; ++k) g[k] = 0;
@@ -1837,10 +2123,7 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
           for (int b = tid; b < nn; b += kThreads) fine[b] = 0;
           __syncthreads();
         }
-        for_keys(keys, smem_keys, lseg, n, tid, [&](int, uint32_t k) {
-          int u = (int)k - lo;
-          if (u >= 0 && u < nn) atomicAdd(&cnt[u], 1u);
-        });
+        count_window(keys, smem_keys, ring, lseg, n, tid, lo, nn, cnt, nullptr);
         if (!leader) {
           __syncthreads();
           uint32_t* lf = cl.map_shared_rank(fine2, 0);
@@ -1879,8 +2162,6 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
         // the leader the count: no tie list and no leader tail
         const bool direct = act == kActWriteDirect;
         const uint32_t tau = ctl.tau;
-        const uint16_t* src = smem_keys ? keys : lseg;
-        const bool vec = ((reinterpret_cast<uintptr_t>(src) & 15) == 0);
         const int nw = (n + 31) >> 5;
         if (nw > kCoarseBins && tid == 0) spin_fail(p.err, 17);  // host keeps n <= 131072
         uint32_t* bmg = hist;  // tokens above tau
@@ -1893,29 +2174,23 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
         int* tc = leader ? &s_tcnt : cl.map_shared_rank(&s_tcnt, 0);
         uint32_t* tl = leader ? G : cl.map_shared_rank(G, 0);
         uint32_t neq_fast = 0;
-        for (int b0 = tid * 8; b0 < n; b0 += kThreads * 8) {
-          const uint4 r = load8_raw(src, b0, n, vec);
-          uint32_t mg = 0, me = 0;
-#pragma unroll
-          for (int j = 0; j < 8; ++j) {
-            const uint32_t k = raw_key(r, j);
-            mg |= (uint32_t)(k > tau) << j;
-            me |= (uint32_t)((k == tau) && (tau != 0u)) << j;
-          }
-          if (mg) atomicOr(&bmg[b0 >> 5], mg << (b0 & 31));
+        for_groups(keys, smem_keys, ring, lseg, n, tid, [&](int i0, const uint4& r, uint32_t) {
+          uint32_t mg, me;
+          if (!mark_masks(r, tau, mg, me)) return;
+          if (mg) or_bits8(bmg, i0, mg);
           if (me) {
             if (fastw) {
               neq_fast += __popc(me);
               for (int j = 0; j < 8; ++j)
                 if ((me >> j) & 1u) {
                   const int idx = atomicAdd(tc, 1);
-                  if (idx < kTieList) tl[idx] = (uint32_t)(s0 + b0 + j);
+                  if (idx < kTieList) tl[idx] = (uint32_t)(s0 + i0 + j);
                 }
             } else {
-              atomicOr(&bme[b0 >> 5], me << (b0 & 31));
+              or_bits8(bme, i0, me);
             }
           }
-        }
+        });
         __syncthreads();
         DBG(12);
         const int wpt = (nw + kThreads - 1) / kThreads;
@@ -2154,7 +2429,260 @@ next_row:
   }
 }
 
-// ------------------------------------------------------------------ O exchange
+
+// ------------------------------------------------------------------ top-k pre-pass
+// Large launches without staged keys (segmax == 0) spent most of the merge streaming
+// each row's keys three times through the row's 1-2 CTAs: a CTA streams at ~10 GB/s
+// (its bytes in flight / memory latency, with or without peers), and the longest row
+// (~4x the mean) set the time while the rest of the GPU idled. The pre-pass reads every
+// row twice over the whole GPU instead, in kPPTile tiles, and leaves per row exactly
+// what the merge kernel's passes A and B computed: the coarse histogram (pp_hist), the
+// centred 1R window (pp_lo, derived with the merge kernel's own c1r_center; the merge
+// kernel checks it against its own) and its counts (pp_win), plus every key >= pp_thr
+// with its position (pp_pos / pp_key). The merge kernel's WRITE bitmaps then come from
+// the candidates when tau >= pp_thr and the list did not overflow, else from the keys
+// (the same bits either way).
+// Kernels 1 and 3 walk a flat list of (row, tile) items with a persistent grid: every CTA
+// builds the rows' tile prefix (rows with Gl <= K have none) in SMEM, takes items
+// blockIdx.x, + gridDim.x, ... and keeps the next item's keys in flight while it works
+// on the current one.
+constexpr int kPPMaxRows = 2048;
+struct PPSched {
+  int* pre;  // [T + 1] SMEM: first item of each row
+  int total;
+};
+__device__ __forceinline__ void pp_sched(const TopkParams& p, int* s_pre, uint32_t* warp_sums,
+                                         int tid, PPSched& ps) {
+  // rows [tid * per, (tid + 1) * per) per thread, then one block scan
+  const int per = (p.T + kThreads - 1) / kThreads;
+  const int r0 = min(p.T, tid * per), r1 = min(p.T, r0 + per);
+  int cnt[8];
+  uint32_t sum = 0;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const int r = r0 + i;
+    int c = 0;
+    if (r < r1) {
+      const int L = p.local_len[r], Gl = p.global_len[r];
+      c = pp_row(p, L, Gl) ? (L + kPPTile - 1) / kPPTile : 0;
+    }
+    cnt[i] = c;
+    sum += (uint32_t)c;
+  }
+  uint32_t tot;
+  uint32_t ex = block_excl_scan(sum, warp_sums, &tot);
+#pragma unroll
+  for (int i = 0; i < 8; ++i)
+    if (r0 + i < r1) { s_pre[r0 + i] = (int)ex; ex += (uint32_t)cnt[i]; }
+  if (tid == 0) s_pre[p.T] = (int)tot;
+  __syncthreads();
+  ps.pre = s_pre;
+  ps.total = (int)tot;
+}
+// item -> (row, first key of its tile)
+__device__ __forceinline__ void pp_item(const TopkParams& p, const PPSched& ps, int it, int& row,
+                                        int& t0) {
+  int lo = 0, hi = p.T;  // last row with pre[row] <= it
+  while (hi - lo > 1) {
+    const int mid = (lo + hi) >> 1;
+    if (ps.pre[mid] <= it) lo = mid;
+    else hi = mid;
+  }
+  row = lo;
+  t0 = (it - ps.pre[lo]) * kPPTile;
+}
+// The kPPG x kThreads groups of 8 keys of an item (keys beyond the row read as 0xFFFF).
+constexpr int kPPG = kPPTile / (kThreads * 8);
+__device__ __forceinline__ void pp_load(const TopkParams& p, int row, int t0, int tid,
+                                        uint4 (&r)[kPPG]) {
+  const uint16_t* lrow = p.logits + (int64_t)row * p.lstride;
+  const bool vec = ((reinterpret_cast<uintptr_t>(lrow) & 15) == 0);
+  const int e = min(p.local_len[row], t0 + kPPTile);
+#pragma unroll
+  for (int u = 0; u < kPPG; ++u) {
+    const int i = t0 + (u * kThreads + tid) * 8;
+    r[u] = i < e ? load8_raw(lrow, i, e, vec) : make_uint4(~0u, ~0u, ~0u, ~0u);
+  }
+}
+
+// Kernel 1: the rows' coarse histograms.
+__global__ void __launch_bounds__(kThreads) topk_pp_hist_kernel(TopkParams p) {
+  __shared__ __align__(16) uint32_t h[kCoarseBins];
+  __shared__ uint32_t warp_sums[kWarps + 1];
+  __shared__ int s_pre[kPPMaxRows + 1];
+  const int tid = threadIdx.x;
+  // PDL: the window kernel may launch now; it waits for this grid's completion
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+  PPSched ps;
+  pp_sched(p, s_pre, warp_sums, tid, ps);
+  int it = blockIdx.x;
+  if (it >= ps.total) return;
+  int row, t0;
+  pp_item(p, ps, it, row, t0);
+  uint4 r[kPPG];
+  pp_load(p, row, t0, tid, r);
+  for (; it < ps.total; it += gridDim.x) {
+    for (int b = tid; b < kCoarseBins; b += kThreads) h[b] = 0;
+    __syncthreads();
+#pragma unroll
+    for (int u = 0; u < kPPG; ++u) {
+      const Keys8 k8(r[u]);
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const uint32_t k = k8.key(j);  // keys beyond the row read as 0xFFFF: key 0
+        if (k != 0u) atomicAdd(&h[k >> 4], 1u);
+      }
+    }
+    const int crow = row;
+    const int nit = it + (int)gridDim.x;
+    if (nit < ps.total) {  // the next item's keys in flight during the flush
+      pp_item(p, ps, nit, row, t0);
+      pp_load(p, row, t0, tid, r);
+    }
+    __syncthreads();
+    uint32_t* hg = p.pp_hist + (int64_t)crow * kCoarseBins;
+    for (int b = tid; b < kCoarseBins; b += kThreads)
+      if (h[b]) atomicAdd(&hg[b], h[b]);
+    __syncthreads();
+  }
+}
+
+// Kernel 2 (one CTA per row): the centred window (c1r_center, as the merge kernel's
+// leader does: it checks pp_lo against its own) and the candidate bound.
+__global__ void __launch_bounds__(kThreads) topk_pp_window_kernel(TopkParams p) {
+  __shared__ __align__(16) uint32_t h[kCoarseBins];
+  __shared__ uint32_t warp_sums[kWarps + 1];
+  __shared__ uint32_t s_v8[256], s_x8[256], s_a8c;
+  __shared__ int s_b8c, s_top8, s_cq;
+  const int row = blockIdx.x, tid = threadIdx.x;
+  // PDL (launched behind the histogram kernel): every CTA waits for its completion
+  // (and so for its pp_hist sums) before any read of them or exit, then releases the
+  // window-count kernel's launch
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+  const int L = p.local_len[row], Gl = p.global_len[row];
+  if (!pp_row(p, L, Gl)) return;
+  const uint4* hg = reinterpret_cast<const uint4*>(p.pp_hist + (int64_t)row * kCoarseBins);
+  for (int b = tid; b < kCoarseBins / 4; b += kThreads) reinterpret_cast<uint4*>(h)[b] = hg[b];
+  __syncthreads();
+  const uint32_t q = (uint32_t)max(1LL, ((long long)p.K * L + Gl - 1) / Gl);
+  c1r_center(h, q, s_v8, s_x8, &s_b8c, &s_top8, &s_a8c, &s_cq, warp_sums, tid);
+  if (tid == 0) {
+    const int nb = p.nw1 / 16;
+    const int lo = min(max(0, s_cq - nb / 2), kCoarseBins - nb) * 16;
+    p.pp_lo[row] = lo;
+    p.pp_thr[row] = max(lo, (s_cq - kPPCand) * 16);
+  }
+}
+
+// Kernel 3: window counts [lo, lo + nw1) and the candidate list (keys >= thr). A tile
+// gathers its candidates in SMEM, then appends them with one global atomic and
+// coalesced stores; a tile with more than kPPTileCand marks the row's list overflowed.
+constexpr int kPPTileCand = 2048;
+__global__ void __launch_bounds__(kThreads) topk_pp_win_kernel(TopkParams p) {
+  // window counts per warp (no cross-warp contention on the dense window bins)
+  __shared__ uint32_t cntw[kWarps][512];
+  __shared__ uint32_t warp_sums[kWarps + 1];
+  __shared__ int s_pre[kPPMaxRows + 1];
+  __shared__ uint32_t s_cpos[kPPTileCand];
+  __shared__ uint16_t s_ckey[kPPTileCand];
+  __shared__ int s_cn, s_base;
+  const int tid = threadIdx.x, lane = tid & 31, nn = p.nw1;
+  uint32_t* cnt = cntw[tid >> 5];
+  PPSched ps;
+  pp_sched(p, s_pre, warp_sums, tid, ps);
+  int it = blockIdx.x;
+  if (it >= ps.total) {
+    asm volatile("griddepcontrol.wait;" ::: "memory");  // no exit before the window kernel's
+    return;
+  }
+  int row, t0;
+  pp_item(p, ps, it, row, t0);
+  uint4 r[kPPG];
+  pp_load(p, row, t0, tid, r);  // the logits precede the pre-pass (stream order)
+  // PDL (launched behind the window kernel): its pp_lo / pp_thr after its completion
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+  int lo = p.pp_lo[row], thr = p.pp_thr[row];
+  for (; it < ps.total; it += gridDim.x) {
+    const int crow = row, ct0 = t0, clo = lo, cthr = thr;
+    const int e = min(p.local_len[crow], ct0 + kPPTile);
+    for (int b = tid; b < kWarps * 512; b += kThreads) (&cntw[0][0])[b] = 0;
+    if (tid == 0) s_cn = 0;
+    __syncthreads();
+    uint64_t cms = 0;  // candidate masks, 8 bits per group
+#pragma unroll
+    for (int u = 0; u < kPPG; ++u) {
+      if ((int)max_key_bound(r[u]) < clo) continue;
+      const Keys8 k8(r[u]);
+      const int i0 = ct0 + (u * kThreads + tid) * 8;
+      // keys of the group inside the row (key 0 beyond it: below any window but lo = 0)
+      const int nv = ::min(8, e - i0);
+      uint32_t cm = 0;  // bit j: key j is a candidate
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        if (j >= nv) break;
+        const int k = (int)k8.key(j);
+        if ((unsigned)(k - clo) < (unsigned)nn) atomicAdd(&cnt[k - clo], 1u);
+        cm |= (uint32_t)(k >= cthr) << j;
+      }
+      cms |= (uint64_t)cm << (8 * u);
+    }
+    // gather the candidates in SMEM (one SMEM atomic per warp)
+    {
+      const uint32_t nc = __popcll(cms);
+      uint32_t incl = nc;
+#pragma unroll
+      for (int o = 1; o < 32; o <<= 1) {
+        const uint32_t y = __shfl_up_sync(0xffffffffu, incl, o);
+        if (lane >= o) incl += y;
+      }
+      const uint32_t wtot = __shfl_sync(0xffffffffu, incl, 31);
+      int base = 0;
+      if (lane == 31 && wtot) base = atomicAdd(&s_cn, (int)wtot);
+      int c = __shfl_sync(0xffffffffu, base, 31) + (int)(incl - nc);
+#pragma unroll
+      for (int u = 0; u < kPPG; ++u) {
+        uint32_t cm = (uint32_t)(cms >> (8 * u)) & 0xFFu;
+        if (!cm) continue;
+        const Keys8 k8(r[u]);
+        const int i0 = ct0 + (u * kThreads + tid) * 8;
+        while (cm) {
+          const int j = __ffs(cm) - 1;
+          cm &= cm - 1;
+          if (c < kPPTileCand) { s_cpos[c] = (uint32_t)(i0 + j); s_ckey[c] = (uint16_t)k8.key(j); }
+          ++c;
+        }
+      }
+    }
+    const int nit = it + (int)gridDim.x;
+    if (nit < ps.total) {  // the next item's keys in flight during the append and flush
+      pp_item(p, ps, nit, row, t0);
+      pp_load(p, row, t0, tid, r);
+      lo = p.pp_lo[row];
+      thr = p.pp_thr[row];
+    }
+    __syncthreads();
+    const int nc = s_cn;
+    if (tid == 0 && nc)  // an overflowing tile pushes the row's count past kPPList
+      s_base = atomicAdd(&p.pp_cn[crow], nc > kPPTileCand ? nc + kPPList : nc);
+    uint32_t* wg = p.pp_win + (int64_t)crow * 512;
+    for (int b = tid; b < nn; b += kThreads) {
+      uint32_t v = 0;
+#pragma unroll
+      for (int w = 0; w < kWarps; ++w) v += cntw[w][b];
+      if (v) atomicAdd(&wg[b], v);
+    }
+    __syncthreads();
+    if (nc) {
+      const int base = s_base, m = min(min(nc, kPPTileCand), kPPList - base);
+      uint32_t* pos = p.pp_pos + (int64_t)crow * kPPList + base;
+      uint16_t* key = p.pp_key + (int64_t)crow * kPPList + base;
+      for (int c = tid; c < m; c += kThreads) { pos[c] = s_cpos[c]; key[c] = s_ckey[c]; }
+    }
+    __syncthreads();
+  }
+}
+
 struct OxParams {
   const __nv_bfloat16* y;  // [T, H, D] strided, D contiguous
   int64_t ys_row, ys_head;
@@ -2330,14 +2858,27 @@ static long long g_spin_ns = kSpinNsDefault;
 void set_spin_ns(int64_t ns) { g_spin_ns = (long long)ns; }
 int64_t get_spin_ns() { return (int64_t)g_spin_ns; }
 
+// int32 words of a DcpExchange's top-k pre-pass buffer for ``cap`` rows (zeroed once).
+int64_t topk_pp_words(int64_t cap) {
+  return cap * (kCoarseBins + 512 + 4 + kPPList + kPPList / 2);
+}
+
+// Dynamic SMEM of a top-k CTA: the staged keys, or the key-streaming ring.
+static size_t topk_dyn_smem(int64_t segmax, bool pre) {
+  return segmax > 0 ? (size_t)segmax * 2 : pre ? (size_t)kChunkBytes : (size_t)kRingBytes;
+}
+
 // Co-resident top-k clusters of ``cluster`` CTAs with ``segmax`` staged keys each
 // (cudaOccupancyMaxActiveClusters; cached per shape). A launch walks rows beyond it in
 // turns, so the decode policy (``DcpxDecode.launch_params``) keeps a step's rows within
 // it: cluster packing per GPC makes it smaller than SMs x CTAs per SM / cluster.
-int64_t topk_resident_clusters(int64_t cluster, int64_t segmax) {
+// ``pre``: a pre-pass launch (segmax == 0, a ``pp`` buffer and every row on the centred
+// 1R path; ops.topk_prepass decides), whose ring is one chunk.
+static int resident_clusters_for(int64_t cluster, int64_t segmax, bool pre) {
   TORCH_CHECK(cluster >= 1 && cluster <= 16 && segmax >= 0);
   static std::map<std::pair<int64_t, int64_t>, int> resident;
-  auto key = std::make_pair(cluster, segmax);
+  const size_t dyn = topk_dyn_smem(segmax, pre);
+  auto key = std::make_pair(cluster, (int64_t)dyn);
   auto itr = resident.find(key);
   if (itr != resident.end()) return itr->second;
   auto kern = topk_merge_kernel<16>;
@@ -2350,7 +2891,7 @@ int64_t topk_resident_clusters(int64_t cluster, int64_t segmax) {
   cudaLaunchConfig_t cfg = {};
   cfg.gridDim = dim3((unsigned)cluster, 1, 1);
   cfg.blockDim = dim3(kThreads, 1, 1);
-  cfg.dynamicSmemBytes = (size_t)segmax * 2;
+  cfg.dynamicSmemBytes = dyn;
   cudaLaunchAttribute attr[1];
   attr[0].id = cudaLaunchAttributeClusterDimension;
   attr[0].val.clusterDim.x = (unsigned)cluster;
@@ -2364,6 +2905,9 @@ int64_t topk_resident_clusters(int64_t cluster, int64_t segmax) {
   resident[key] = nres;
   return nres;
 }
+int64_t topk_resident_clusters(int64_t cluster, int64_t segmax, bool pre) {
+  return resident_clusters_for(cluster, segmax, pre && segmax == 0);
+}
 
 void topk_merge(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global_len,
                 torch::Tensor out, torch::Tensor out_count,
@@ -2375,7 +2919,8 @@ void topk_merge(torch::Tensor logits, torch::Tensor local_len, torch::Tensor glo
                 int64_t off_tl, int64_t off_tr, int64_t off_tk, int64_t interleave,
                 int64_t small_ctx, torch::Tensor epoch,
                 torch::Tensor ticket, torch::Tensor err, int64_t cluster, int64_t segmax,
-                c10::optional<torch::Tensor> dbg, c10::optional<torch::Tensor> stats) {
+                c10::optional<torch::Tensor> dbg, c10::optional<torch::Tensor> stats,
+                c10::optional<torch::Tensor> pp, int64_t pp_min) {
   TORCH_CHECK(logits.dtype() == torch::kBFloat16 && logits.stride(1) == 1);
   TORCH_CHECK(W <= kMaxW && cluster >= 1 && cluster <= 16);
   TORCH_CHECK(K >= 1 && K <= kMaxK, "topk_merge: K must be in [1, 2048]");
@@ -2383,7 +2928,7 @@ void topk_merge(torch::Tensor logits, torch::Tensor local_len, torch::Tensor glo
   const int T = (int)logits.size(0);
   if (T == 0) return;
   const c10::cuda::CUDAGuard guard(logits.device());
-  TopkParams p;
+  TopkParams p{};
   p.logits = reinterpret_cast<const uint16_t*>(logits.data_ptr());
   p.lstride = logits.stride(0);
   p.local_len = local_len.data_ptr<int>();
@@ -2411,18 +2956,51 @@ void topk_merge(torch::Tensor logits, torch::Tensor local_len, torch::Tensor glo
   p.stats = stats.has_value() ? stats->data_ptr<int>() : nullptr;
   TORCH_CHECK(!dbg.has_value() || dbg->numel() >= 32, "topk_merge: dbg needs 32 int64");
   p.dbg = dbg.has_value() ? reinterpret_cast<long long*>(dbg->data_ptr<int64_t>()) : nullptr;
+  // profiling: one kDbgRow-stamp record per row when dbg is large enough
+  p.dbg_rows = dbg.has_value() && dbg->numel() >= (int64_t)kDbgRow * logits.size(0) ? 1 : 0;
   p.epoch = epoch.data_ptr<int>();
   p.ticket = ticket.data_ptr<int>();
   p.err = err.data_ptr<int>();
   p.segmax = (int)segmax;
   p.spin_ns = g_spin_ns;
   TORCH_CHECK(T <= cap);
+  // Pre-pass: launches whose rows all take the centred 1R path with keys in global
+  // memory (the large batches) get their key passes from the two balanced kernels.
+  p.pre = pp.has_value() && segmax == 0 && w1c && nw1 > 0 && T <= cap1 ? 1 : 0;
+  TORCH_CHECK(pp_min >= 0 && pp_min < (1LL << 30));
+  p.pp_min = (int)pp_min;
+  // The key-streaming ring: every chunk for launches that stream keys (no pre-pass, or
+  // rows of at most pp_min keys when the deeper ring keeps the rows co-resident), one
+  // chunk when only the pre-pass's rare fallback passes stream (4 CTAs per SM).
+  const bool deep_ring = !p.pre || (p.pp_min > 0 && T <= resident_clusters_for(cluster, segmax, false));
+  p.ring_stages = deep_ring ? kRingStages : 1;
+  if (p.pre) {
+    TORCH_CHECK(pp->dtype() == torch::kInt32 && pp->is_contiguous() &&
+                    pp->numel() >= topk_pp_words(cap),
+                "topk_merge: pre-pass buffer too small");
+    uint32_t* b = reinterpret_cast<uint32_t*>(pp->data_ptr<int>());
+    p.pp_hist = b;
+    b += cap * kCoarseBins;
+    p.pp_win = b;
+    b += cap * 512;
+    p.pp_lo = reinterpret_cast<int*>(b);
+    b += cap;
+    p.pp_thr = reinterpret_cast<int*>(b);
+    b += cap;
+    p.pp_spare = reinterpret_cast<int*>(b);
+    b += cap;
+    p.pp_cn = reinterpret_cast<int*>(b);
+    b += cap;
+    p.pp_pos = b;
+    b += cap * kPPList;
+    p.pp_key = reinterpret_cast<uint16_t*>(b);
+  }
   TORCH_CHECK(epoch.numel() >= T, "topk_merge: one epoch per row");
 
   cudaLaunchConfig_t cfg = {};
   cfg.gridDim = dim3((unsigned)cluster, 1, 1);
   cfg.blockDim = dim3(kThreads, 1, 1);
-  cfg.dynamicSmemBytes = (size_t)segmax * 2;
+  cfg.dynamicSmemBytes = topk_dyn_smem(segmax, !deep_ring);
   cfg.stream = c10::cuda::getCurrentCUDAStream();
   cudaLaunchAttribute attr[2];
   attr[0].id = cudaLaunchAttributeClusterDimension;
@@ -2444,10 +3022,44 @@ void topk_merge(torch::Tensor logits, torch::Tensor local_len, torch::Tensor glo
   auto kern = topk_merge_kernel<16>;
   // Persistent rows: at most the co-resident cluster count (identical on every
   // rank, so all ranks walk the rows in the same order).
-  const int nres = (int)topk_resident_clusters(cluster, segmax);
+  const int nres = resident_clusters_for(cluster, segmax, !deep_ring);
   cfg.gridDim = dim3((unsigned)cluster, (unsigned)std::min(T, nres), 1);
   cfg.numAttrs = s_pdl ? 2 : 1;
   p.pdl = s_pdl ? 1 : 0;
+  if (p.pre) {
+    TORCH_CHECK(T <= kPPMaxRows, "topk_merge: pre-pass rows > ", kPPMaxRows);
+    // persistent: every co-resident CTA (no more than the items' upper bound)
+    static int s_grid1 = 0, s_grid3 = 0;
+    if (!s_grid1) {
+      int dev, sms, occ1 = 0, occ3 = 0;
+      C10_CUDA_CHECK(cudaGetDevice(&dev));
+      C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+      C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ1, topk_pp_hist_kernel, kThreads, 0));
+      C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ3, topk_pp_win_kernel, kThreads, 0));
+      s_grid1 = sms * std::max(1, occ1);
+      s_grid3 = sms * std::max(1, occ3);
+    }
+    const int64_t items = (int64_t)T * ((logits.size(1) + kPPTile - 1) / kPPTile);
+    const dim3 g((unsigned)std::max<int64_t>(1, std::min<int64_t>(s_grid1, items)), 1, 1);
+    const dim3 g3((unsigned)std::max<int64_t>(1, std::min<int64_t>(s_grid3, items)), 1, 1);
+    topk_pp_hist_kernel<<<g, kThreads, 0, cfg.stream>>>(p);
+    C10_CUDA_CHECK(cudaGetLastError());
+    // the window and window-count kernels launch programmatically behind their
+    // predecessor (each waits on griddepcontrol for its predecessor's results); the
+    // merge kernel keeps its own launch rule below
+    cudaLaunchAttribute pa[1];
+    pa[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    pa[0].val.programmaticStreamSerializationAllowed = 1;
+    cudaLaunchConfig_t c2 = {};
+    c2.blockDim = dim3(kThreads, 1, 1);
+    c2.stream = cfg.stream;
+    c2.attrs = pa;
+    c2.numAttrs = 1;
+    c2.gridDim = dim3((unsigned)T, 1, 1);
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&c2, topk_pp_window_kernel, p));
+    c2.gridDim = g3;
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&c2, topk_pp_win_kernel, p));
+  }
   C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, kern, p));
 }
 
@@ -2505,6 +3117,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("o_exchange", &o_exchange);
   m.def("max_coresident_ox", &max_coresident_ox);
   m.def("topk_resident_clusters", &topk_resident_clusters);
+  m.def("topk_pp_words", &topk_pp_words);
   m.def("set_spin_ns", &set_spin_ns);
   m.def("get_spin_ns", &get_spin_ns);
 }

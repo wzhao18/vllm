@@ -430,6 +430,71 @@ def check_slots(ex: DcpExchange, B: int, q: int, ctx: int, seed: int):
     return errs
 
 
+def check_layouts(ex: DcpExchange, case: str, B: int, q: int, ctx: int, seed: int):
+    """Key-path equivalence: the same rows through every key path of the kernel give
+    bitwise identical outputs and counts: keys staged in SMEM (segmax > 0) and keys
+    streamed from global memory (segmax = 0) at 1, 2, 4 and 16 CTAs per row, both
+    from 16-byte aligned rows and from a view whose rows start at odd 2-byte offsets
+    (unaligned heads and tails), with 1 and 2 rounds; one-round streamed launches also
+    with the pre-pass for every row and for the longer rows only (the others run their
+    own passes in the same launch)."""
+    W, rank, dev = ex.W, ex.rank, ex.device
+    T = B * q
+    gen = torch.Generator(device=dev)
+    gen.manual_seed(seed + SEED_OFF[0])
+    ctxs = torch.randint(max(1, ctx // 2), ctx + 1, (B,), generator=gen, device=dev)
+    ctxs[0] = ctx
+    G = (ctxs[:, None] - q + 1 + torch.arange(q, device=dev)[None, :]).clamp(min=1).reshape(-1)
+    G = G.to(torch.int32)
+    INTERLEAVE_CUR[0], WORLD[0] = 1, W
+    full = make_logits(case, T, G, gen, dev)
+    Lr = local_len_of(G.to(torch.int64), rank, W, 1).to(torch.int32)
+    Lmax = int(Lr.max())
+    loc = full[:, rank::W][:, :Lmax]
+    stride = (Lmax + 7) // 8 * 8 + 8
+    aligned = torch.full((T, stride), float("nan"), dtype=torch.bfloat16, device=dev)
+    aligned[:, : loc.shape[1]] = loc
+    # odd row stride, rows starting 2 bytes past a 16-byte boundary (row 0) and then
+    # at every 2-byte offset
+    buf = torch.full((T, stride + 5), float("nan"), dtype=torch.bfloat16, device=dev)
+    odd = buf[:, 1 : 1 + stride]
+    odd.copy_(aligned)
+    assert odd.stride(0) % 8 != 0 and odd.data_ptr() % 16 != 0
+    outs = []
+    paths = [("staged", None, 1 << 20, False, 0)]
+    Lmid = int(Lr.float().median())
+    for cl in (1, 2, 4, 16):
+        if -(-Lmax // cl) <= 131072:
+            paths.append((f"stream c{cl}", cl, 0, False, 0))
+            paths.append((f"stream c{cl} pre-pass", cl, 0, True, 0))
+            paths.append((f"stream c{cl} pre-pass > {Lmid}", cl, 0, True, Lmid))
+    for name, cl, segmax, pre, pp_min in paths:
+        for lname, lg in (("aligned", aligned), ("odd", odd)):
+            for one_round in (True, False) if not pre else (True,):
+                out = torch.full((T, K), -7, dtype=torch.int32, device=dev)
+                cnt = torch.full((T,), -7, dtype=torch.int32, device=dev)
+                c_ = cl
+                sm = segmax
+                if cl is None:  # staged: enough CTAs per row for the segment to fit 48K keys
+                    c_ = 1
+                    while c_ < 16 and -(-Lmax // c_) > 48 * 1024:
+                        c_ *= 2
+                    sm = -(-(-(-Lmax // c_)) // 8) * 8
+                ex.topk_merge(lg, Lr, G, out, cnt, max_local_len=Lmax, cluster=c_, segmax=sm,
+                              one_round=one_round, window="center", tie_order="rank",
+                              interleave=1, prepass=pre, prepass_min=pp_min)
+                outs.append((f"{name} {lname} {'1R' if one_round else '2R'}", out, cnt))
+    torch.cuda.synchronize()
+    ex.check()
+    errs = []
+    _, o0, c0 = outs[0]
+    for tag, o, c in outs[1:]:
+        if not (torch.equal(o, o0) and torch.equal(c, c0)):
+            nd = int(((o != o0).any(1) | (c != c0)).sum())
+            errs.append(f"{tag} differs from {outs[0][0]} in {nd} rows")
+    return errs
+
+
 def check_o(ex: DcpExchange, T: int, D: int, seed: int):
     W, rank, dev, H, hpr = ex.W, ex.rank, ex.device, ex.heads, ex.hpr
     gen = torch.Generator(device=dev)
@@ -536,6 +601,16 @@ def main():
     ):
         errs = check_tie_rank(ex, case, B, q, ctx, 700 + i)
         tag = f"tie_order=rank {case} B{B} q{q} ctx{ctx}"
+        if errs:
+            failures.append(tag + ": " + "; ".join(errs[:3]))
+        if rank == 0:
+            print(("FAIL " if errs else "ok   ") + tag, flush=True)
+    for i, (case, B, q, ctx) in enumerate(
+        [("normal", 4, 4, 150_000), ("ties", 4, 4, 120_000), ("relu", 8, 4, 90_000),
+         ("neg", 2, 4, 400_000), ("hot_recent", 16, 4, 40_000)]
+    ):
+        errs = check_layouts(ex, case, B, q, ctx, 900 + i)
+        tag = f"key paths (staged / streamed, aligned / odd rows) {case} B{B} q{q} ctx{ctx}"
         if errs:
             failures.append(tag + ": " + "; ".join(errs[:3]))
         if rank == 0:
