@@ -32,6 +32,11 @@ ALLOWED = {
     "VLLM_USE_FUSED_MOE_GROUPED_TOPK",
     "VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD",
     "VLLM_DISABLE_SHARED_EXPERTS_STREAM",
+    # stock vllm/envs.py opt-in (default off) of the stock sparse_attn_indexer's
+    # histogram DCP prefill top-k merge, whose kernels live under dsa_kernels/
+    # dcp_prefill_topk_merge; the K3 indexer mirrors it (stock behaviour), no recipe
+    # sets it
+    "VLLM_DSA_DCP_PREFILL_HIST_MERGE",
     # upstream vLLM Kimi K3 options (stock code: #50656, #50487), off by default and
     # set by no serving recipe
     "VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT",
