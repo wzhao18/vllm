@@ -35,6 +35,7 @@ from ..common.primitives import (
     zeros,
 )
 from .kernel import KdaSplit, load_bf16x4
+from .recover import triton_rstd
 
 FA_SENT = 0xFFFF  # an F_A element not yet written (the in-projection stores canonical)
 FA_BACKOFF_NS = 128  # between the light poll's looks
@@ -72,6 +73,11 @@ class KdaVerifyPrepared(KdaSplit):
         assert tokens > 1 and tokens % 2 == 0 and self.cluster == tokens
         assert self.passes == 1 and self.early and not self.staged
         self.fa_polled = True
+        # An FP32 state: the stock verify's math (with ``KdaInProj64(stock=True)``'s
+        # operands): the decays' Triton formulas (``KdaSplit.gate_decay``), the
+        # recurrence outputs rounded to BF16 before the gated RMS norm and its
+        # sqrt.approx / div.full factor (``recover.KdaSplit``'s)
+        self.stock = not bf16_state
 
     @cute.kernel
     def kernel(self, args):
@@ -204,9 +210,20 @@ class KdaVerifyPrepared(KdaSplit):
                     s0, s1, s2, s3 = (o * o for o in o4)
                     sums[g] = warp_sum((s0 + s2) + (s1 + s3), 8)
                 sumsq = (sums[0] + sums[2]) + (sums[1] + sums[3])
-                rstd = cute.math.rsqrt(sumsq * (1.0 / 128) + eps, fastmath=True)
+                rstd = self.inverse_sqrt(sumsq * (1.0 / 128) + eps)
                 result = raw_o * rstd * nw * out_gate
                 output[token + partition, qk_channel] = BFloat16(result)
+
+    def round_output(self, value):
+        """A recurrence output as the norm reads it (stock: rounded to BF16, as
+        fused_recurrent_kda stores it); traced inline."""
+        return Float32(BFloat16(value)) if self.stock else value
+
+    def inverse_sqrt(self, value):
+        """The gated RMS norm's 1 / sqrt(variance + eps); traced inline."""
+        if self.stock:
+            return triton_rstd(value)
+        return cute.math.rsqrt(value, fastmath=True)
 
     @cute.jit
     def polled_fa(self, f_a, token, quarter, args):
@@ -311,7 +328,7 @@ class KdaVerifyPrepared(KdaSplit):
                 history[0, j, e] = fma(
                     kr[j, e], v_new, history[0, j, e], ftz=self.fast_math
                 )
-        return dot_q
+        return self.round_output(dot_q)
 
     @cute.jit
     def query_dot(self, history, qr):
@@ -319,7 +336,7 @@ class KdaVerifyPrepared(KdaSplit):
         dot_q = self.row_dot(history, qr, 0)
         for shift in reversed(range(self.lanes_per_row.bit_length() - 1)):
             dot_q += cute.arch.shuffle_sync_bfly(dot_q, 1 << shift)
-        return dot_q
+        return self.round_output(dot_q)
 
 
 class KdaVerifyRows(KdaVerifyPrepared):
@@ -500,7 +517,7 @@ class KdaVerifyRows(KdaVerifyPrepared):
                     s0, s1, s2, s3 = (o * o for o in o4)
                     sums[g] = warp_sum((s0 + s2) + (s1 + s3), 8)
                 sumsq = (sums[0] + sums[2]) + (sums[1] + sums[3])
-                rstd = cute.math.rsqrt(sumsq * (1.0 / 128) + eps, fastmath=True)
+                rstd = self.inverse_sqrt(sumsq * (1.0 / 128) + eps)
                 for k in cutlass.range_constexpr(R):
                     channel = thread + W * k
                     raw_o = shared_o[self.output_position(channel)]
@@ -624,7 +641,7 @@ class KdaVerifyRows(KdaVerifyPrepared):
                     history[r, j, e] = fma(
                         kr[j, e], v_new, history[r, j, e], ftz=self.fast_math
                     )
-        return dot_q
+        return [self.round_output(d) for d in dot_q]
 
     @cute.jit
     def rows_query_dot(self, history, qr):
@@ -633,7 +650,7 @@ class KdaVerifyRows(KdaVerifyPrepared):
         for shift in reversed(range(self.lanes_per_row.bit_length() - 1)):
             for r in cutlass.range_constexpr(self.per_thread):
                 dot_q[r] += cute.arch.shuffle_sync_bfly(dot_q[r], 1 << shift)
-        return dot_q
+        return [self.round_output(d) for d in dot_q]
 
 
 class KdaVerifyCols(KdaVerifyRows):
@@ -669,6 +686,7 @@ class KdaVerifyCols(KdaVerifyRows):
         assert self.gate_mode in (0, 1) and not self.trigger_at_entry
         self.fa_polled = True
         self.per_thread, self.workers, self.spare = 4, 128, spare
+        self.stock = not bf16_state  # (as KdaVerifyPrepared)
 
     @cute.kernel
     def kernel(self, args):
@@ -799,6 +817,7 @@ class KdaVerifyCols(KdaVerifyRows):
                     dot([history[r, e] for e in range(4)], q_last) for r in range(4)
                 ]
                 out_last, _ = scatter_reduce(dots, lane, 4)
+                out_last = self.round_output(out_last)
                 if lane % 8 == 0:  # lane 8 r: row r
                     local_o[(T - 1) * ROWS + 4 * warp + lane // 8] = out_last
                 # Thread i pushes row i % 16 of token i // 16 to the token's owner.
@@ -836,7 +855,7 @@ class KdaVerifyCols(KdaVerifyRows):
             s0, s1, s2, s3 = (o * o for o in o4)
             sums[g] = warp_sum((s0 + s2) + (s1 + s3), 8)
         sumsq = (sums[0] + sums[2]) + (sums[1] + sums[3])
-        rstd = cute.math.rsqrt(sumsq * (1.0 / 128) + eps, fastmath=True)
+        rstd = self.inverse_sqrt(sumsq * (1.0 / 128) + eps)
         result = raw_o * rstd * nw * out_gate
         output[token + partition, head * 128 + thread] = BFloat16(result)
 
@@ -871,7 +890,7 @@ class KdaVerifyCols(KdaVerifyRows):
             v_new = (v_rows[r] - dot_k) * beta
             for e in cutlass.range_constexpr(4):
                 history[r, e] = fma(kr[e], v_new, history[r, e], ftz=self.fast_math)
-        return owned
+        return self.round_output(owned)  # (lanes 4 r: the query dots)
 
     @cute.jit
     def cols_checkpoint(self, history, state, slot, head, value_base, lane):

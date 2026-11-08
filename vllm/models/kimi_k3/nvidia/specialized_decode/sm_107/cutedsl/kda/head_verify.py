@@ -15,8 +15,10 @@ and the output gate to the token's owner. KDA CTA r (r < 8) owns state rows
 (lanes 8, eight CTAs per head): the convolution, normalization, decays (the gate warp
 projects F_B for its 16 features from ``SignalGemm``'s F_A rows, polled as in
 ``KdaHeadWide``), token loop, checkpoints and outputs are ``KdaSplit``'s, so given the
-same projected inputs the outputs and checkpoints are bit for bit ``KdaSplit``'s. CTA t
-applies the gated RMS norm of token t; with ``polled_out`` its output is the polled
+same projected inputs the outputs and checkpoints are bit for bit ``KdaSplit``'s (an
+FP32 state: the stock verify's formulas, ``KdaHead.stock``, so bit for bit
+``prepared.KdaSplitStock``'s at that geometry). CTA t applies the gated RMS norm of
+token t; with ``polled_out`` its output is the polled
 buffer of ``self.vkda.head.POLLED_OUT`` (canonical stores; warp 1 re-arms the previous
 KDA layer's buffer after its PDL wait)."""
 
@@ -40,7 +42,6 @@ from ..common.primitives import (
     mma_into,
     named_barrier,
     push_float,
-    sigmoid,
     wait,
     warp_sum,
     zeros,
@@ -396,18 +397,27 @@ class KdaHeadVerify(KdaHeadWide):
             for i in cutlass.range_constexpr(2):
                 for column in cutlass.range_constexpr(2):
                     raw_g = Float32(BFloat16(acc[2 * i + column]))
-                    gate = cute.math.exp(a, fastmath=True) * (raw_g + dt[i])
-                    gate = sigmoid(gate, False)
-                    decay = float_bits(cute.math.exp(lower_bound * gate, fastmath=True))
+                    decay = self.head_decay(a, raw_g, dt[i], lower_bound)
+                    decay = float_bits(decay)
                     t = 2 * quarter + column
                     pointer = shared_decay.iterator + t * 128 + value_base + features[i]
                     if t < T:
                         for dest in cutlass.range_constexpr(KDA_CTAS):
                             store_async_dsmem(pointer, decay, barrier, dest)
             if (quarter == 0) & (group < T):  # this CTA's betas (bytes on its barrier)
-                beta_gate = sigmoid(Float32(beta), False)
+                beta_gate = self.activate(Float32(beta))
                 push_float(shared_beta.iterator + group, beta_gate, barrier, rank)
         self.rearm(counter, target, lane, fa_beta)
+
+    def silu_v(self, value):
+        """A V channel's SiLU (KdaSplit's form: ``sigmoids``' fast path, bitwise
+        ``sigmoid``)."""
+        result = Float32(0)
+        if cutlass.const_expr(self.stock):
+            result = self.silu(value)
+        else:
+            result = value * sigmoids([value])[0]
+        return result
 
     @cute.jit
     def load_operands(self, ops, sources, t, group_lane):
@@ -521,24 +531,29 @@ class KdaHeadVerify(KdaHeadWide):
             if kt < ROWS:  # V pre-activations; thread kt activates (row kt % 16, token
                 for t in cutlass.range_constexpr(T):  # kt // 16) after the barrier
                     shared_v[t * ROWS + kt] = accum[3 * t + 2]
-            act = sigmoids([pre_q, pre_k, Float32(gate_owned)])
-            q, k, out_gate = pre_q * act[0], pre_k * act[1], act[2]
+            if cutlass.const_expr(self.stock):
+                q, k = self.silu(pre_q), self.silu(pre_k)
+                out_gate = self.activate(Float32(gate_owned))
+            else:  # (the three sigmoids' fast paths together)
+                act = sigmoids([pre_q, pre_k, Float32(gate_owned)])
+                q, k, out_gate = pre_q * act[0], pre_k * act[1], act[2]
             square_q, square_k = warp_sum(q * q), warp_sum(k * k)
             if lane == 0:
                 reductions[warp] = square_q
                 reductions[warp + 4] = square_k
             named_barrier(1, 128)
             pre_v = shared_v[kt]
-            shared_v[kt] = pre_v * sigmoids([pre_v])[0]
+            shared_v[kt] = self.silu_v(pre_v)
             qn = (reductions[0] + reductions[2]) + (reductions[1] + reductions[3])
             kn = (reductions[4] + reductions[6]) + (reductions[5] + reductions[7])
-            fq = cute.math.rsqrt(qn + 1.0e-6, fastmath=True) * scale
-            fk = cute.math.rsqrt(kn + 1.0e-6, fastmath=True)
+            fq = self.norm_factor(qn + 1.0e-6, scale)
+            fk = self.norm_factor(kn + 1.0e-6)
+            q_n, k_n = self.normalized(q, fq, scale), self.normalized(k, fk)
             q_ptr = shared_q.iterator + rank * 128 + kt
             k_ptr = shared_k.iterator + rank * 128 + kt
             for dest in cutlass.range_constexpr(KDA_CTAS):
-                push_float(q_ptr, q * fq, bar_qk, dest)
-                push_float(k_ptr, k * fk, bar_qk, dest)
+                push_float(q_ptr, q_n, bar_qk, dest)
+                push_float(k_ptr, k_n, bar_qk, dest)
             if kt < T:  # the tokens' checkpoint slots, for the rolled loop
                 slot_rows[kt] = slots[0, kt]
             named_barrier(1, 128)  # shared_v, slot_rows
@@ -574,14 +589,14 @@ class KdaHeadVerify(KdaHeadWide):
                         history, cur, other, sources, t, group_lane, v_row, beta
                     )
                     if (group_lane == 0) & (t > 0):  # (pushed together after the loop)
-                        local_o[(t - 1) * ROWS + group] = out_prev
+                        local_o[(t - 1) * ROWS + group] = self.round_output(out_prev)
                     slot_t = slot_rows[t]
                     self.store_checkpoint(
                         history, state, slot_t, head, value_base, lanes
                     )
             out_last = self.query_dot(history, buffers[1][0, None, None])
             if group_lane == 0:
-                local_o[(T - 1) * ROWS + group] = out_last
+                local_o[(T - 1) * ROWS + group] = self.round_output(out_last)
             # The outputs of every token: thread kt pushes row kt % 16 of token kt // 16
             # to that token's owner (one remote store per thread instead of eight
             # dependent ones per row lane inside the loop).
@@ -607,7 +622,7 @@ class KdaHeadVerify(KdaHeadWide):
                     s0, s1, s2, s3 = (o * o for o in o4)
                     sums[g] = warp_sum((s0 + s2) + (s1 + s3), 8)
                 sumsq = (sums[0] + sums[2]) + (sums[1] + sums[3])
-                rstd = cute.math.rsqrt(sumsq * (1.0 / 128) + eps, fastmath=True)
+                rstd = self.inverse_sqrt(sumsq * (1.0 / 128) + eps)
                 result = raw_o * rstd * nw * out_gate
                 if cutlass.const_expr(self.polled_out):
                     store_bf16_canonical(at(output, partition, qk_channel), result)

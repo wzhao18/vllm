@@ -93,6 +93,26 @@ def triton_sigmoid(value):
     return div_full(Float32(1), Float32(1) + triton_exp(-value))
 
 
+@cute.jit
+def triton_silu(value):
+    """The stock convolution's SiLU, x / (1 + exp(-x)), stored BF16 (as FP32)."""
+    silu = div_full(value, Float32(1) + triton_exp(-value))
+    return Float32(BFloat16(silu))
+
+
+@cute.jit
+def triton_decay(a_log, raw_g, dt, lower_bound):
+    """The stock gate: exp(lower_bound * sigmoid(exp(A_log) * (raw_g + dt_bias)))."""
+    gate = lower_bound * triton_sigmoid(triton_exp(a_log) * (raw_g + dt))
+    return triton_exp(gate)
+
+
+@cute.jit
+def triton_rstd(value):
+    """1 / sqrt(value) as the stock norms compute it (sqrt.approx, then div.full)."""
+    return reciprocal(sqrt_approx(value))
+
+
 def record_row(args, request):
     """A request's RecoverSSM record slot: its row of the step, or under deferred
     RecoverSSM (operands record_rows [B] and pending after the records) its
@@ -185,6 +205,9 @@ class KdaSplit:
         self.chunks = 32 // self.lanes_per_row
         assert not self.gate_staged or self.rows >= 64
         self.evict = bool(evict)  # staged state traffic marked L2 evict-first
+        # Subclasses: F_B's K order per MMA chain always 16 c + 4 quarter (the 8-byte
+        # rows) instead of the 16-byte rows' permuted chunks at two decays per lane
+        self.narrow_fb = False
         assert self.staged or not self.evict
 
     @cute.jit
@@ -605,7 +628,7 @@ class KdaSplit:
                     dt[r] = dt_bias[head * 128 + value_base + 32 * r + feature]
             # Two decays per lane load 16 bytes per row: chunk c then covers columns
             # 32 (c // 2) + 8 quarter + 4 (c % 2) + [0, 4) instead of 16 c + 4 quarter.
-            wide: cutlass.Constexpr = per >= 2
+            wide: cutlass.Constexpr = per >= 2 and not self.narrow_fb
             wr = cute.make_rmem_tensor((tiles, 8, 4), Uint32)
             if cutlass.const_expr(staged_rows is not None):
                 for tile in cutlass.range_constexpr(tiles):

@@ -811,6 +811,7 @@ def test_kda_verify_kernels_take_the_state_dtype(q, requests, bf16_state):
 
     names = {
         prepared.KdaVerifyWide: "wide",
+        prepared.KdaVerifyLoopStock: "loopstock",
         prepared.KdaVerifyHalves: "halves",
         prepared.KdaVerifyStream: "stream",
         prepared.KdaVerifyStream3: "stream3",
@@ -845,12 +846,14 @@ def kda_runs(kinds):
 
 # FP32 state (production): FP32_VERIFY_WIDE, the VR200 kernel bench's measured-best
 # kernel per (q, requests) (kda.prepared's table notes), open-ended above the last row.
+# Since 2026-11-08 the Wide rows run KdaVerifyLoopStock (stock math, persistent).
 FP32_Q4_RUNS = [
-    (1, 11, "kdasplit"), (12, 12, "wide"), (13, 15, "kdasplit"), (16, 35, "wide"),
-    (36, 40, "kdasplit"), (41, 1024, "wide"),
+    (1, 11, "kdasplit"), (12, 12, "loopstock"), (13, 15, "kdasplit"),
+    (16, 35, "loopstock"), (36, 40, "kdasplit"), (41, 1024, "loopstock"),
 ]  # fmt: skip
 FP32_Q8_RUNS = [
-    (1, 11, "kdasplit"), (12, 12, "wide"), (13, 15, "kdasplit"), (16, 1024, "wide"),
+    (1, 11, "kdasplit"), (12, 12, "loopstock"), (13, 15, "kdasplit"),
+    (16, 1024, "loopstock"),
 ]  # fmt: skip
 # BF16 state: VERIFY_WIDE with VERIFY_Q's rows on top (Stream3 from 36 requests at q4).
 BF16_Q4_RUNS = [
@@ -888,42 +891,105 @@ def test_kda_fp32_policy_picks_the_measured_best():
     from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.kda import prepared
 
     kind = prepared.verify_kernel
-    picks = {(4, 35): "wide", (4, 36): "kdasplit", (4, 40): "kdasplit"}
-    picks.update({(4, 41): "wide", (4, 48): "wide", (8, 12): "wide", (8, 48): "wide"})
+    wide = "loopstock"  # the Wide rows' kernel since 2026-11-08
+    picks = {(4, 35): wide, (4, 36): "kdasplit", (4, 40): "kdasplit"}
+    picks.update({(4, 41): wide, (4, 48): wide, (8, 12): wide, (8, 48): wide})
     for (q, b), name in picks.items():
         assert kind(b, q, RUBIN, False) == name, (q, b)
-    assert {kind(b, 4, RUBIN, False) for b in range(1, 1025)} <= {"kdasplit", "wide"}
-    assert {kind(b, 8, RUBIN, False) for b in range(1, 1025)} <= {"kdasplit", "wide"}
+    assert {kind(b, 4, RUBIN, False) for b in range(1, 1025)} <= {"kdasplit", wide}
+    assert {kind(b, 8, RUBIN, False) for b in range(1, 1025)} <= {"kdasplit", wide}
     assert kind(48, 8, RUBIN, True) == "halves"
     assert [kind(b, 4, RUBIN, True) for b in (35, 36, 64, 65)] == ["wide"] + [
         "stream3"
     ] * 3
 
 
-def test_kda_fp32_table_falls_back_per_q():
-    """A verify length without an FP32_VERIFY_WIDE row keeps VERIFY_WIDE / VERIFY_Q
-    with KdaVerifyWide in place of the BF16-only kernels (q2: Halves at 33-48)."""
+def test_kda_fp32_verify_is_stock_math_at_every_q():
+    """A verify length without an FP32_VERIFY_WIDE row keeps VERIFY_WIDE / VERIFY_Q's
+    crossovers, with the stock-math kernels of an FP32 state: KdaVerifyLoopStock
+    wherever they name a wide kernel (q2: Wide / Halves / Wide from 16), the
+    stock-math KdaSplit elsewhere; 24 heads (the SP decode) likewise."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.kda import prepared
 
     assert 2 not in prepared.FP32_VERIFY_WIDE[RUBIN]
     kinds = kda_kinds(2, False, range(1, 129))
-    assert kda_runs(kinds) == [
+    assert kda_runs(kinds) == [(1, 15, "kdasplit"), (16, 128, "loopstock")]
+    bf16 = kda_kinds(2, True, range(1, 129))
+    assert kda_runs(bf16) == [
         (1, 15, "kdasplit"), (16, 32, "wide"), (33, 48, "halves"), (49, 128, "wide"),
     ]  # fmt: skip
     assert prepared.wide_table(RUBIN, 2, False) == prepared.wide_table(RUBIN, 2, True)
+    for q in (2, 4, 5, 8):
+        for b in (1, 8, 16, 36, 48, 64, 256):
+            kernel = kda_kernel(b, q, False)
+            stock = (prepared.KdaVerifyLoopStock, prepared.KdaSplitStock)
+            assert type(kernel) in stock, (q, b, type(kernel))
+            assert prepared.verify_kernel(b, q, RUBIN, False, 0, 24) in (
+                "kdasplit",
+                "loopstock",
+            )
 
 
 @pytest.mark.parametrize("bf16_state", [False, True], ids=["fp32", "bf16"])
 def test_kda_tp8_verify_keeps_kdasplit(bf16_state):
-    """TP8 verify layers (12 heads, gate mode 1, fast math) are outside the wide
-    kernels' asserts: they keep KdaSplit at every request count, and say so."""
+    """TP8 verify layers (12 heads, gate mode 1) are outside the wide kernels'
+    asserts: they keep KdaSplit's geometry at every request count, and say so; an
+    FP32 state runs it with the stock formulas (``KdaSplitStock``, no fast math)."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.kda import prepared
 
-    for b in (16, 36, 64, 65, 256):
+    kind = prepared.KdaSplit if bf16_state else prepared.KdaSplitStock
+    for b in (1, 4, 16, 36, 64, 65, 256):
         kernel = kda_kernel(b, 4, bf16_state, gate_mode=1, heads=12)
-        assert type(kernel) is prepared.KdaSplit
+        assert type(kernel) is kind
         note = prepared.choose(Shape(4 * b, 4), kda_context(bf16_state, 4, 8)).note
         assert note.startswith("kdasplit")
+
+
+@pytest.mark.parametrize("bf16_state", [False, True], ids=["fp32", "bf16"])
+def test_kda_q1_decode_math_by_state_dtype(bf16_state):
+    """The q = 1 decode (TP16 6 heads gate mode 0; TP8 12 heads gate modes 1 / 2 / 0
+    by batch, as ``providers.Attention``): an FP32 state runs the stock formulas
+    (``KdaSplitStock``, staged schedules keep their L2 hint), a BF16 state
+    KdaSplit."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.kda import prepared
+
+    kind = prepared.KdaSplit if bf16_state else prepared.KdaSplitStock
+    for heads, mode in (
+        (6, lambda b: 0),
+        (12, lambda b: 1 if b == 1 else 2 if b <= 8 else 0),
+    ):
+        for b in (1, 2, 4, 5, 8, 16, 32, 64):
+            schedule = prepared.schedule_of(heads, b, mode(b), 1, RUBIN, bf16_state)
+            options = (heads, b, mode(b), False, schedule, 1, bf16_state)
+            kernel = prepared.make_kernel(options, RUBIN)
+            assert type(kernel) is kind, (heads, b)
+            if not bf16_state and schedule[0] >= 2 and len(schedule) > 4:
+                assert kernel.evict == bool(schedule[4]), (heads, b)
+
+
+def test_kda_fp32_fold_is_stock_math_at_q8_only():
+    """The B8 fold of an FP32 state: q8 only (KDA_FOLD64_FP32, the step A/B: the q4
+    fold paid nothing), and its prepared verify computes the stock verify's math
+    (``stock``; KdaVerifyCols at B8, as for a BF16 state)."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.common.policy import (
+        batch_table,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.kda import prepared
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.kda.verify import (
+        KdaVerifyCols,
+    )
+
+    fp32 = batch_table(providers_module.KDA_FOLD64_FP32[16])
+    bf16 = batch_table(providers_module.KDA_FOLD64[16])
+    assert fp32.get(64) and not fp32.get(32)
+    assert bf16.get(64) and bf16.get(32)
+    for q in (4, 8):
+        for bf16_state in (False, True):
+            schedule = prepared.schedule_of(6, 8, 0, q, RUBIN, bf16_state)
+            options = (6, 8, 0, False, schedule, q, bf16_state)
+            kernel = prepared.make_kernel(options, RUBIN, prepared=True)
+            assert type(kernel) is KdaVerifyCols
+            assert kernel.stock == (not bf16_state)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
@@ -1034,12 +1100,19 @@ def test_kda_fp32_head_compile_probe(head_probe, batch, q, name):
     assert head.head_supported(*bf16, **probe) and not calls
 
 
-@pytest.mark.parametrize("compiles", [True, False], ids=["compiles", "fails"])
-def test_kda_fp32_head_probe_decides_in_the_provider(monkeypatch, head_probe, compiles):
-    """A Rubin TP16 KDA layer (q8) with an FP32 state builds its KdaHead (q1 B8, B1 x
-    q8, 2 x q8) only when the kernels compile; when they fail it builds none, before
-    anything is set up for the head (no KdaHead index or F_A buffer, which the MoE
-    tail's early release and the AttnRes carve-out follow), and keeps the pair."""
+@pytest.mark.parametrize(
+    "compiles,q", [(True, 8), (False, 8), (True, 4)], ids=["compiles", "fails", "q4"]
+)
+def test_kda_fp32_head_probe_decides_in_the_provider(
+    monkeypatch, head_probe, compiles, q
+):
+    """A Rubin TP16 KDA layer (q8) with an FP32 state builds its KdaHead kernels (q1
+    B8, the verify heads B1 x q8 and 2 x q8: the stock verify's math) only when they
+    compile; when none does it builds none, before anything is set up for the head
+    (no KdaHead index or F_A buffer, which the MoE tail's early release and the
+    AttnRes carve-out follow), and keeps the pair. At q4 an FP32 state builds no
+    verify head (HEAD_MULTI_FP32: the 2 x q4 head serves no q4 deployment's steady
+    rows and costs the rows it does not serve)."""
     head, calls, fail = head_probe
     if not compiles:
         fail.update({"head", "verify", "multi"})
@@ -1059,9 +1132,9 @@ def test_kda_fp32_head_probe_decides_in_the_provider(monkeypatch, head_probe, co
     device = SimpleNamespace(multi_processor_count=212)
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda index: device)
     runtime = SimpleNamespace(
-        tp=16, q=8, tuned=batches, batches=batches, wide=(), bf16_state=False,
+        tp=16, q=q, tuned=batches, batches=batches, wide=(), bf16_state=False,
         buffers={}, device="cpu", kda_heads=0, kda_side=None, capacity=16,
-        sharded=frozenset(), shard_box=None, context=kda_context(False, 8),
+        sharded=frozenset(), shard_box=None, context=kda_context(False, q),
     )  # fmt: skip
     decoder = SimpleNamespace(
         self_attn=SimpleNamespace(in_proj_qkvgfab=None), layer_idx=0,
@@ -1071,7 +1144,10 @@ def test_kda_fp32_head_probe_decides_in_the_provider(monkeypatch, head_probe, co
     with pytest.raises(Built):  # past the KDA branch, at the o-projection
         Attention.__init__(provider, decoder, runtime, None, None, None)
     assert provider.kind == "kda"
-    if compiles:
+    if q == 4:
+        assert "multi" not in {c[0] for c in calls}
+        assert not built.called or built.call_args.kwargs["verify"] == []
+    elif compiles:
         assert sorted({c[0] for c in calls}) == ["head", "multi", "verify"]
         built.assert_called_once()
         args, kwargs = built.call_args
@@ -1080,7 +1156,7 @@ def test_kda_fp32_head_probe_decides_in_the_provider(monkeypatch, head_probe, co
         assert provider.head is built.return_value
         assert provider.head_state == torch.float32
         assert runtime.buffers["kda.head.fa"].shape == (128, 64, 144)
-    else:  # the verify head is only probed for an admitted q1 batch
+    else:
         assert sorted({c[0] for c in calls}) == ["head", "multi"]
         built.assert_not_called()
         assert provider.head is None and provider.head_state is None

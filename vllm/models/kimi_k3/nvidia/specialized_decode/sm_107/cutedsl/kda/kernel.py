@@ -31,6 +31,7 @@ from ..common.primitives import (
     warp_sum,
     zeros,
 )
+from .recover import triton_decay
 
 load_bf16x4 = partial(load_words, count=2, cache_policy="nc", word_type="u32")
 load_weight_bf16x8 = partial(load_words, count=4, cache_policy="nc", word_type="u32")
@@ -195,6 +196,10 @@ class KdaSplit:
         self.row_bytes = 256 if bf16_state else 512
         self.lean = lean and tokens > 1 and not self.fast_math
         self.load_norm = load_norm and tokens > 1
+        # Stock Triton formulas (subclasses serving an FP32 state: ``kda.verify``'s
+        # prepared verify; ``KdaSplit`` itself never: an FP32 state runs
+        # ``prepared.KdaSplitStock``)
+        self.stock = False
 
     @cute.jit
     def __call__(self, *args):
@@ -720,11 +725,7 @@ class KdaSplit:
                     )
                 raw_g.append(Float32(BFloat16(value)))
 
-        decay = []
-        for r in cutlass.range_constexpr(per):
-            gate = cute.math.exp(a, fastmath=True) * (raw_g[r] + dt[r])
-            gate = sigmoid(gate, self.fast_math)
-            decay.append(cute.math.exp(lower_bound * gate, fastmath=True))
+        decay = [self.gate_decay(a, raw_g[r], dt[r], lower_bound) for r in range(per)]
         packets: cutlass.Constexpr = rows // 4
         packet, destination = lane % packets, lane // packets
         values = cute.make_rmem_tensor(4, Float32)
@@ -778,15 +779,26 @@ class KdaSplit:
                     parts = [acc[c, tile, e + column] for c in range(4)]
                     value = Float32(0) + (((value + parts[1]) + parts[2]) + parts[3])
                 raw_g = Float32(BFloat16(value))
-                gate = cute.math.exp(a, fastmath=True) * (raw_g + dt[i])
-                gate = sigmoid(gate, self.fast_math)
-                decay = float_bits(cute.math.exp(lower_bound * gate, fastmath=True))
+                decay = float_bits(self.gate_decay(a, raw_g, dt[i], lower_bound))
                 token = 2 * quarter + column
                 offset = token * 128 + value_base + features[i]
                 pointer = shared_decay.iterator + offset
                 if token < self.tokens:
                     for rank in cutlass.range_constexpr(self.cluster):
                         store_async_dsmem(pointer, decay, barrier, rank)
+
+    def gate_decay(self, a_log, raw_g, dt, lower_bound):
+        """exp(lower_bound * sigmoid(exp(A_log) * (raw_g + dt_bias))): with ``stock``
+        (the prepared verify of an FP32 state, ``kda.verify``) the stock Triton
+        formulas (``recover.triton_decay``), else exp's fast path and ``sigmoid``."""
+        decay = Float32(0)
+        if cutlass.const_expr(self.stock):
+            decay = triton_decay(a_log, raw_g, dt, lower_bound)
+        else:
+            gate = cute.math.exp(a_log, fastmath=True) * (raw_g + dt)
+            gate = sigmoid(gate, self.fast_math)
+            decay = cute.math.exp(lower_bound * gate, fastmath=True)
+        return decay
 
     @staticmethod
     def split_pairs(wr, tile, chunk, low, high):
