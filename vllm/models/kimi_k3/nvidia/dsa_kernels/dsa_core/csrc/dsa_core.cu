@@ -18,20 +18,24 @@
 //    insert): the row's local count n and the slots of this split's 128-key tiles
 //    (tiles s, s + S, .., two 64-row chunks each), KV rows gathered with cp.async (2
 //    chunks deep), FP8 QK (mma.sync e4m3, FP32 accumulation) and the stock FP8 MLA
-//    decode's precision at the core's rows (trtllm-gen's multi-CTA KV split of small
-//    batches, one 128-key tile per CTA; probed bitwise on DCP16 q8 rows 8-48): per
-//    tile, base-2 softmax in FP32 against the tile's own max m_t, P = E4M3(448 x
-//    2^(s - m_t)), l_t from the unquantized P, P x V with both operands as exactly
-//    converted FP16 (E4M3 values; FP32 accumulation: the products and accumulator
-//    precision of an E4M3 x E4M3 MMA), the tile's partial O = P V x vscale / 448
-//    rounded to BF16 unnormalized; the tiles merged in FP32 (weights 2^(m_t - M), sum
-//    L = sum l_t 2^(m_t - M)), O = merged / L rounded to BF16.
+//    decode's precision (trtllm-gen's multi-CTA KV split; probed bitwise on VR200 at
+//    rows 1-64 and local counts 100-2048, probe_split3): the batch's trtllm-gen KV CTA
+//    count C (``kv_ctas``, its host heuristic for this many rows) splits a row's
+//    T = ceil(n / 128) tiles into pieces of k = ceil(T / C) consecutive tiles (one
+//    trtllm-gen CTA each). Per piece, base-2 softmax in FP32 with one running max
+//    step m per 128-key tile, P = E4M3(448 x 2^(s - m)), the piece's FP32 P V and row
+//    sum (from the unquantized P) rescaled by 2^(m_old - m) at each step, P x V with
+//    both operands as exactly converted FP16 (E4M3 values; FP32 accumulation: the
+//    products and accumulator precision of an E4M3 x E4M3 MMA), the piece's partial
+//    O = P V x vscale / 448 rounded to BF16 unnormalized (C > 1; C == 1: no split,
+//    no partial rounding); the pieces merged in FP32 (weights 2^(m_p - M), sum
+//    L = sum l_p 2^(m_p - M)), O = merged / L rounded to BF16.
 //  * S == 1: the normalized partial O (bf16, no negative zero: 0x8000 halves are the
 //    mailbox sentinel's) and its base-2 LSE go straight to the head owners'
 //    DcpBox.partial / DcpBox.lse (slot ((parity * W + rank) * cap + t) * H + h).
 //    Rows without local entries push zeros and the EMPTY LSE (DcpValue's rule).
-//  * S > 1 (2, 4, 8): the S splits of (t, g) are one cluster. Each leaves its FP32 O
-//    (its tiles' BF16 partials merged at its running max) and (max, sum) in its shared
+//  * S > 1 (2, 4, 8): the S splits of (t, g) are one cluster (pieces s, s + S, ..).
+//    Each leaves its FP32 O (its pieces' BF16 partials merged at its running max) and (max, sum) in its shared
 //    memory; after one cluster barrier split s merges latent dims [512 s / S, +512 /
 //    S) of all splits through distributed shared memory (FP32 weights 2^(m_s - M) /
 //    L, one BF16 rounding) and pushes them (split 0: the LSE).
@@ -47,6 +51,7 @@
 #include <stdint.h>
 
 #include <algorithm>
+#include <type_traits>
 
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -80,8 +85,8 @@ struct Plan {
                                                             // (one 128-key tile)
   static constexpr int kP = kS + 32 * kSStr * 4;            // [HG][kPStr] FP16
   static constexpr int kIdx = kP + HG * kPStr * 2;          // [kMaxK] slots
-  static constexpr int kStat = kIdx + kMaxK * 4;            // m, l, alpha, beta [HG]
-  static constexpr int kSmem = kStat + 4 * HG * 4;
+  static constexpr int kStat = kIdx + kMaxK * 4;            // m, l, alpha, beta, piece m, l, alpha [HG]
+  static constexpr int kSmem = kStat + 7 * HG * 4;
   static constexpr int kQChunks = HG * kRowB / 16;          // 16 B chunks per Q tile
   static constexpr int kQPer = (kQChunks + kThreads - 1) / kThreads;
   static_assert(kSmem + 2048 <= 227 * 1024, "dsa_core shared memory");
@@ -102,6 +107,7 @@ struct Params {
   const uint64_t* lse_peers;   // [W] DcpBox.lse bases
   int lse_wide;  // DcpBox.lse as [2, CAP, H, W] (DcpValue's wide / spread merge)
   int split_min;  // S > 1: rows of at most this many 64-key chunks run on split 0 alone
+  int kv_ctas;    // trtllm-gen's KV CTAs per row at this batch (pieces of ceil(T / kv_ctas) tiles)
   int box_cap, hpr, parity, rank, W, T, splits;
   int* err;
   long long spin_ns;
@@ -260,6 +266,9 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
   float* sL = sM + HG;
   float* sA = sL + HG;
   float* sB = sA + HG;
+  float* sMp = sB + HG;  // the current piece's running max, sum and rescale
+  float* sLp = sMp + HG;
+  float* sAp = sLp + HG;
   __shared__ int s_n;
   long long* dbg = p.dbg ? p.dbg + ((int64_t)(t * G + grp) * S + sp) * 24 : nullptr;
   if (dbg && tid == 0) dbg[0] = now_ns();
@@ -323,228 +332,293 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
     __syncthreads();
   }
   const int Se = solo ? 1 : S;
-  // This split's 128-key tiles: global tiles sp, sp + Se, .. of the row, each two
-  // 64-key chunks; local chunk c is chunk c & 1 of the split's tile c >> 1 (a row's
-  // last tile may hold one chunk)
+  // The row's pieces (trtllm-gen's KV CTAs): kp consecutive 128-key tiles each. This
+  // split's pieces: sp, sp + Se, ..; its local tile i is tile i % kp of its piece
+  // i / kp, each tile two 64-key chunks; local chunk c is chunk c & 1 of local tile
+  // c >> 1 (a row's last tile may hold one chunk)
   const int ntiles = (n + kTile - 1) / kTile;
-  const int mytiles = ntiles > sp ? (ntiles - sp + Se - 1) / Se : 0;
-  auto gchunk = [&](int c) { return 2 * ((c >> 1) * Se + sp) + (c & 1); };
+  // (kp == 1, the common case, takes the per-tile mapping without the divisions)
+  const int kp = ntiles > p.kv_ctas ? (ntiles + p.kv_ctas - 1) / p.kv_ctas : 1;
+  // global 64-key chunk of local chunk c when kp > 1 (a table: no division in the loop)
+  __shared__ int s_gch[kMaxK / kChunk];
+  int mytiles, last;  // this split's tiles, the global tile of its last one
+  if (kp == 1) {
+    mytiles = ntiles > sp ? (ntiles - sp + Se - 1) / Se : 0;
+    last = (mytiles - 1) * Se + sp;
+  } else {
+    const int npieces = (ntiles + kp - 1) / kp;
+    const int mypieces = npieces > sp ? (npieces - sp + Se - 1) / Se : 0;
+    mytiles =
+        mypieces > 0 ? (mypieces - 1) * kp + min(kp, ntiles - ((mypieces - 1) * Se + sp) * kp) : 0;
+    if (tid < 2 * mytiles) {
+      const int i = tid >> 1;
+      s_gch[tid] = 2 * (((i / kp) * Se + sp) * kp + i % kp) + (tid & 1);
+    }
+    const int i = mytiles - 1;
+    last = ((i / kp) * Se + sp) * kp + i % kp;
+  }
   int nchunks = 2 * mytiles;
-  if (nchunks > 0 && gchunk(nchunks - 1) >= nall) --nchunks;
+  // (the row's last tile may hold one chunk: only a split's last local one)
+  if (nchunks > 0 && 2 * last + 1 >= nall) --nchunks;
 #pragma unroll
   for (int b = 0; b < kMaxK / kThreads; ++b) {
     const int k = b * kThreads + tid;
     sIdx[k] = k < n ? v[b] : -1;
   }
-  // slot of row r of this CTA's chunk c
-  auto slot_of = [&](int c, int r) { return sIdx[gchunk(c) * kChunk + r]; };
   __syncthreads();
   if (dbg && tid == 0) {
     dbg[2] = now_ns();
     dbg[18] = clock64();
   }
   // acc: the row's O so far (FP32, x vscale / 448, relative to the running max sM);
-  // tacc: this tile's P V (relative to the tile's own max)
+  // tacc: the current piece's P V (relative to the piece's running max sMp)
   float acc[4 * MT][4], tacc[4 * MT][4];
 #pragma unroll
   for (int j = 0; j < 4 * MT; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.f;
+  // The main loop, compiled twice: P (pieces of more than one tile: the row has more
+  // tiles than trtllm-gen's KV CTAs) keeps the piece's running state across its
+  // tiles; !P (every piece one tile, the common case) is the per-tile form.
+  auto mainloop = [&](auto pieces) {
+    constexpr bool P = decltype(pieces)::value;
+    auto gchunk = [&](int c) { return P ? s_gch[c] : 2 * ((c >> 1) * Se + sp) + (c & 1); };
+    // slot of row r of this CTA's chunk c
+    auto slot_of = [&](int c, int r) { return sIdx[gchunk(c) * kChunk + r]; };
 
-  // chunk c -> KV buffer c & 1 (cp.async, the two chunks of a tile); rows past the
-  // count are zeroed (P = 0 must not meet a NaN code)
-  auto issue = [&](int c) {
-    uint8_t* buf = sKV + (c & 1) * kChunk * kRowS;
-    for (int i = tid; i < kChunk * (kRowB / 16); i += kThreads) {
-      const int r = i / (kRowB / 16), pc = i % (kRowB / 16);
-      const int slot = slot_of(c, r);
-      if (slot >= 0) {
-        cp_async16(buf + r * kRowS + 16 * pc, p.kv + (int64_t)slot * kRowB + 16 * pc);
+    // chunk c -> KV buffer c & 1 (cp.async, the two chunks of a tile); rows past the
+    // count are zeroed (P = 0 must not meet a NaN code)
+    auto issue = [&](int c) {
+      uint8_t* buf = sKV + (c & 1) * kChunk * kRowS;
+      for (int i = tid; i < kChunk * (kRowB / 16); i += kThreads) {
+        const int r = i / (kRowB / 16), pc = i % (kRowB / 16);
+        const int slot = slot_of(c, r);
+        if (slot >= 0) {
+          cp_async16(buf + r * kRowS + 16 * pc, p.kv + (int64_t)slot * kRowB + 16 * pc);
+        } else {
+          *reinterpret_cast<uint4*>(buf + r * kRowS + 16 * pc) = make_uint4(0, 0, 0, 0);
+        }
+      }
+      cp_commit();
+    };
+    // keys of chunk c below the count (a partial last chunk skips its empty key tiles in
+    // QK, the V cast and PV; the softmax masks them)
+    auto valid_of = [&](int c) { return min(kChunk, n - gchunk(c) * kChunk); };
+    // ---- V of chunk c -> FP16 (exact) for the PV fragments: 64 rows x 512 dims
+    auto cast_v = [&](int c) {
+      const uint8_t* buf = sKV + (c & 1) * kChunk * kRowS;
+      constexpr int kItems = kChunk * 32 / kThreads;  // 4
+      const int vrows = (valid_of(c) + 15) & ~15;  // (PV's 16-key steps)
+      uint4 w[kItems];
+#pragma unroll
+      for (int j = 0; j < kItems; ++j) {
+        const int i = tid + j * kThreads, r = i >> 5, c16 = i & 31;
+        if (r < vrows) w[j] = *reinterpret_cast<const uint4*>(buf + r * kRowS + 16 * c16);
+      }
+#pragma unroll
+      for (int j = 0; j < kItems; ++j) {
+        const int i = tid + j * kThreads, r = i >> 5, c16 = i & 31;
+        if (r >= vrows) continue;
+        const uint32_t ws[4] = {w[j].x, w[j].y, w[j].z, w[j].w};
+        uint32_t h[8];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+          h[2 * k] = e4m3x2_to_f16x2(ws[k] & 0xFFFFu);
+          h[2 * k + 1] = e4m3x2_to_f16x2(ws[k] >> 16);
+        }
+        uint4* dst = reinterpret_cast<uint4*>(sVh + r * kVStr + 16 * c16);
+        dst[0] = make_uint4(h[0], h[1], h[2], h[3]);
+        dst[1] = make_uint4(h[4], h[5], h[6], h[7]);
+      }
+    };
+    // ---- tile O += P V of chunk c (P columns [64 (c & 1), +64) of the tile; FP16
+    // operands, FP32 accumulation): warp w owns latent dims [32 w, +32)
+    auto pv = [&](int c) {
+      const int valid = valid_of(c);
+      // ldmatrix.trans rows: lane l -> key 16 ks + 8 ((l >> 3) & 1) + (l & 7), dims
+      // 32 w + 8 (l >> 4) (+ 16 for the second x4)
+      const __half* vb = sVh + (((lane >> 3) & 1) * 8 + (lane & 7)) * kVStr + 32 * warp +
+                         (lane >> 4) * 8;
+      const __half* pb = sP + (c & 1) * kChunk;
+#pragma unroll
+      for (int ks = 0; ks < kChunk / 16; ++ks) {
+        if (16 * ks >= valid) break;  // (empty key steps of a partial chunk)
+        uint32_t b[8];
+        ldsm_x4_t(b[0], b[1], b[2], b[3], vb + 16 * ks * kVStr);
+        ldsm_x4_t(b[4], b[5], b[6], b[7], vb + 16 * ks * kVStr + 16);
+#pragma unroll
+        for (int m2 = 0; m2 < MT; ++m2) {
+          uint32_t a0, a1, a2, a3;
+          ldsm_x4(a0, a1, a2, a3, pb + (16 * m2 + (lane & 15)) * kPStr + 16 * ks + (lane >> 4) * 8);
+          // x4.trans matrices: (k 0-7, n 0-7), (k 8-15, n 0-7), (k 0-7, n 8-15), (k 8-15, n 8-15)
+          mma_f16(tacc[4 * m2 + 0], a0, a1, a2, a3, b[0], b[1]);
+          mma_f16(tacc[4 * m2 + 1], a0, a1, a2, a3, b[2], b[3]);
+          mma_f16(tacc[4 * m2 + 2], a0, a1, a2, a3, b[4], b[5]);
+          mma_f16(tacc[4 * m2 + 3], a0, a1, a2, a3, b[6], b[7]);
+        }
+      }
+    };
+    if (nchunks > 0) issue(0);
+    if (nchunks > 1) issue(1);
+    for (int c = 0; c < nchunks; c += 2) {
+      const int nh = min(2, nchunks - c);  // chunks of this tile
+      cp_wait<0>();
+      __syncthreads();
+      if (dbg && tid == 0 && c == 0) dbg[10] = clock64();
+      // ---- S = Q K^T of the tile's chunks (FP8, FP32 accumulation, 3 chains; fragments
+      // loaded 2 steps ahead) into S columns [64 h, +64); HG = 32: warp (m-tile w >> 3,
+      // n-tile w & 7); HG = 16: (n-tile w & 7, k-half w >> 3)
+      for (int h = 0; h < nh; ++h) {
+        const uint8_t* buf = sKV + h * kChunk * kRowS;
+        const int valid = valid_of(c + h);
+        const int nt = warp & 7;
+        const int mt = HG == 32 ? (warp >> 3) : 0;
+        const int kh = HG == 32 ? 0 : (warp >> 3);
+        constexpr int KS = HG == 32 ? kRowB / 32 : kRowB / 64;  // m16n8k32 steps
+        if (8 * nt < valid) {
+        float sacc[3][4] = {};
+        const uint8_t* qa = sQ + (mt * 16 + (lane & 15)) * kRowS + (lane >> 4) * 16 + kh * KS * 32;
+        const uint8_t* kb =
+            buf + (8 * nt + (lane & 7)) * kRowS + ((lane >> 3) & 1) * 16 + kh * KS * 32;
+        uint32_t fa[3][4], fb[3][2];
+        ldsm_x4(fa[0][0], fa[0][1], fa[0][2], fa[0][3], qa);
+        ldsm_x2(fb[0][0], fb[0][1], kb);
+        ldsm_x4(fa[1][0], fa[1][1], fa[1][2], fa[1][3], qa + 32);
+        ldsm_x2(fb[1][0], fb[1][1], kb + 32);
+#pragma unroll
+        for (int ks = 0; ks < KS; ++ks) {
+          if (ks + 2 < KS) {
+            ldsm_x4(fa[(ks + 2) % 3][0], fa[(ks + 2) % 3][1], fa[(ks + 2) % 3][2],
+                    fa[(ks + 2) % 3][3], qa + 32 * (ks + 2));
+            ldsm_x2(fb[(ks + 2) % 3][0], fb[(ks + 2) % 3][1], kb + 32 * (ks + 2));
+          }
+          mma_fp8(sacc[ks % 3], fa[ks % 3][0], fa[ks % 3][1], fa[ks % 3][2], fa[ks % 3][3],
+                  fb[ks % 3][0], fb[ks % 3][1]);
+        }
+        float* sS = sSall + (mt + kh) * 16 * kSStr + h * kChunk;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          const int r = 8 * nt + 2 * q4 + (i & 1);
+          sS[(g8 + 8 * (i >> 1)) * kSStr + r] = (sacc[0][i] + sacc[1][i]) + sacc[2][i];
+        }
+        }  // (8 nt < valid)
+      }
+      cast_v(c);  // (chunk c's V while the softmax waits for every warp's S)
+      __syncthreads();
+      if (dbg && tid == 0 && c == 0) dbg[11] = clock64();
+      // ---- softmax of the tile's 128 keys (base 2), one running max step of the piece
+      // (trtllm-gen's KV CTA): m = max(m_piece, tile max), P = E4M3(448 x 2^(s - m)),
+      // the piece's sum from the unquantized P (l_p = l_p 2^(m_old - m) + sum, P V
+      // rescaled alike, sAp); at the piece's last tile the row's running max M and sum
+      // L take the piece in (alpha = 2^(M_old - M), beta = 2^(m_p - M)). Warp w owns
+      // heads w * HG / 16 .., lane l keys l, 32 + l, 64 + l, 96 + l
+      const int jt = P ? (c >> 1) % kp : 0;  // tile of the piece
+      const bool piece_end = !P || jt == kp - 1 || c + 2 >= nchunks;
+#pragma unroll
+      for (int hh = 0; hh < HG / 16; ++hh) {
+        const int h = warp * (HG / 16) + hh;
+        const int r0 = (h >> 4) * 16 + (h & 15);  // row of the [2][16] / [32] S tiles
+        float x[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+          x[k] = sSall[r0 * kSStr + 32 * k + lane];
+          if (HG == 16) x[k] += sSall[(16 + h) * kSStr + 32 * k + lane];  // the second k-half
+          x[k] *= p.s2scale;
+          if ((k >> 1) >= nh || slot_of(c + (k >> 1), 32 * (k & 1) + lane) < 0) x[k] = -INFINITY;
+        }
+        float mx = fmaxf(fmaxf(x[0], x[1]), fmaxf(x[2], x[3]));
+#pragma unroll
+        for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+        const float mpold = (!P || jt == 0) ? -INFINITY : sMp[h];
+        const float mp = fmaxf(mpold, mx);
+        const float base = mp == -INFINITY ? 0.f : mp;
+        float sum = 0.f;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+          const float e = exp2f(x[k] - base);
+          sum += e;  // (l from the unquantized P, as trtllm-gen)
+          // P = E4M3(448 e), then exactly to FP16 for the FP16 MMA
+          const __nv_fp8_storage_t q8 = __nv_cvt_float_to_fp8(kPScale * e, __NV_SATFINITE, __NV_E4M3);
+          sP[h * kPStr + 32 * k + lane] = __half(__nv_cvt_fp8_to_halfraw(q8, __NV_E4M3));
+        }
+#pragma unroll
+        for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+        __syncwarp();
+        if (lane == 0) {
+          const float ap = mpold == -INFINITY ? 0.f : exp2f(mpold - mp);
+          const float lp = ((!P || jt == 0) ? 0.f : sLp[h] * ap) + sum;
+          if (P) {
+            sAp[h] = ap;
+            sMp[h] = mp;
+            sLp[h] = lp;
+          }
+          if (piece_end) {
+            const float mold = sM[h], mnew = fmaxf(mold, mp);
+            const float alpha = mold == -INFINITY ? 0.f : exp2f(mold - mnew);
+            const float beta = mp == -INFINITY ? 0.f : exp2f(mp - mnew);
+            sA[h] = alpha;
+            sB[h] = beta;
+            sL[h] = sL[h] * alpha + lp * beta;
+            sM[h] = mnew;
+          }
+        }
+      }
+      __syncthreads();
+      if (dbg && tid == 0 && c == 0) dbg[12] = clock64();
+      // the piece's P V: zero at its first tile, else rescaled to the new running max
+      if (!P || jt == 0) {
+#pragma unroll
+        for (int j = 0; j < 4 * MT; ++j) tacc[j][0] = tacc[j][1] = tacc[j][2] = tacc[j][3] = 0.f;
       } else {
-        *reinterpret_cast<uint4*>(buf + r * kRowS + 16 * pc) = make_uint4(0, 0, 0, 0);
-      }
-    }
-    cp_commit();
-  };
-  // keys of chunk c below the count (a partial last chunk skips its empty key tiles in
-  // QK, the V cast and PV; the softmax masks them)
-  auto valid_of = [&](int c) { return min(kChunk, n - gchunk(c) * kChunk); };
-  // ---- V of chunk c -> FP16 (exact) for the PV fragments: 64 rows x 512 dims
-  auto cast_v = [&](int c) {
-    const uint8_t* buf = sKV + (c & 1) * kChunk * kRowS;
-    constexpr int kItems = kChunk * 32 / kThreads;  // 4
-    const int vrows = (valid_of(c) + 15) & ~15;  // (PV's 16-key steps)
-    uint4 w[kItems];
 #pragma unroll
-    for (int j = 0; j < kItems; ++j) {
-      const int i = tid + j * kThreads, r = i >> 5, c16 = i & 31;
-      if (r < vrows) w[j] = *reinterpret_cast<const uint4*>(buf + r * kRowS + 16 * c16);
-    }
+        for (int m2 = 0; m2 < MT; ++m2) {
+          const float r0 = sAp[16 * m2 + g8], r1 = sAp[16 * m2 + g8 + 8];
 #pragma unroll
-    for (int j = 0; j < kItems; ++j) {
-      const int i = tid + j * kThreads, r = i >> 5, c16 = i & 31;
-      if (r >= vrows) continue;
-      const uint32_t ws[4] = {w[j].x, w[j].y, w[j].z, w[j].w};
-      uint32_t h[8];
-#pragma unroll
-      for (int k = 0; k < 4; ++k) {
-        h[2 * k] = e4m3x2_to_f16x2(ws[k] & 0xFFFFu);
-        h[2 * k + 1] = e4m3x2_to_f16x2(ws[k] >> 16);
-      }
-      uint4* dst = reinterpret_cast<uint4*>(sVh + r * kVStr + 16 * c16);
-      dst[0] = make_uint4(h[0], h[1], h[2], h[3]);
-      dst[1] = make_uint4(h[4], h[5], h[6], h[7]);
-    }
-  };
-  // ---- tile O += P V of chunk c (P columns [64 (c & 1), +64) of the tile; FP16
-  // operands, FP32 accumulation): warp w owns latent dims [32 w, +32)
-  auto pv = [&](int c) {
-    const int valid = valid_of(c);
-    // ldmatrix.trans rows: lane l -> key 16 ks + 8 ((l >> 3) & 1) + (l & 7), dims
-    // 32 w + 8 (l >> 4) (+ 16 for the second x4)
-    const __half* vb = sVh + (((lane >> 3) & 1) * 8 + (lane & 7)) * kVStr + 32 * warp +
-                       (lane >> 4) * 8;
-    const __half* pb = sP + (c & 1) * kChunk;
-#pragma unroll
-    for (int ks = 0; ks < kChunk / 16; ++ks) {
-      if (16 * ks >= valid) break;  // (empty key steps of a partial chunk)
-      uint32_t b[8];
-      ldsm_x4_t(b[0], b[1], b[2], b[3], vb + 16 * ks * kVStr);
-      ldsm_x4_t(b[4], b[5], b[6], b[7], vb + 16 * ks * kVStr + 16);
-#pragma unroll
-      for (int m2 = 0; m2 < MT; ++m2) {
-        uint32_t a0, a1, a2, a3;
-        ldsm_x4(a0, a1, a2, a3, pb + (16 * m2 + (lane & 15)) * kPStr + 16 * ks + (lane >> 4) * 8);
-        // x4.trans matrices: (k 0-7, n 0-7), (k 8-15, n 0-7), (k 0-7, n 8-15), (k 8-15, n 8-15)
-        mma_f16(tacc[4 * m2 + 0], a0, a1, a2, a3, b[0], b[1]);
-        mma_f16(tacc[4 * m2 + 1], a0, a1, a2, a3, b[2], b[3]);
-        mma_f16(tacc[4 * m2 + 2], a0, a1, a2, a3, b[4], b[5]);
-        mma_f16(tacc[4 * m2 + 3], a0, a1, a2, a3, b[6], b[7]);
-      }
-    }
-  };
-  if (nchunks > 0) issue(0);
-  if (nchunks > 1) issue(1);
-  for (int c = 0; c < nchunks; c += 2) {
-    const int nh = min(2, nchunks - c);  // chunks of this tile
-    cp_wait<0>();
-    __syncthreads();
-    if (dbg && tid == 0 && c == 0) dbg[10] = clock64();
-    // ---- S = Q K^T of the tile's chunks (FP8, FP32 accumulation, 3 chains; fragments
-    // loaded 2 steps ahead) into S columns [64 h, +64); HG = 32: warp (m-tile w >> 3,
-    // n-tile w & 7); HG = 16: (n-tile w & 7, k-half w >> 3)
-    for (int h = 0; h < nh; ++h) {
-      const uint8_t* buf = sKV + h * kChunk * kRowS;
-      const int valid = valid_of(c + h);
-      const int nt = warp & 7;
-      const int mt = HG == 32 ? (warp >> 3) : 0;
-      const int kh = HG == 32 ? 0 : (warp >> 3);
-      constexpr int KS = HG == 32 ? kRowB / 32 : kRowB / 64;  // m16n8k32 steps
-      if (8 * nt < valid) {
-      float sacc[3][4] = {};
-      const uint8_t* qa = sQ + (mt * 16 + (lane & 15)) * kRowS + (lane >> 4) * 16 + kh * KS * 32;
-      const uint8_t* kb =
-          buf + (8 * nt + (lane & 7)) * kRowS + ((lane >> 3) & 1) * 16 + kh * KS * 32;
-      uint32_t fa[3][4], fb[3][2];
-      ldsm_x4(fa[0][0], fa[0][1], fa[0][2], fa[0][3], qa);
-      ldsm_x2(fb[0][0], fb[0][1], kb);
-      ldsm_x4(fa[1][0], fa[1][1], fa[1][2], fa[1][3], qa + 32);
-      ldsm_x2(fb[1][0], fb[1][1], kb + 32);
-#pragma unroll
-      for (int ks = 0; ks < KS; ++ks) {
-        if (ks + 2 < KS) {
-          ldsm_x4(fa[(ks + 2) % 3][0], fa[(ks + 2) % 3][1], fa[(ks + 2) % 3][2],
-                  fa[(ks + 2) % 3][3], qa + 32 * (ks + 2));
-          ldsm_x2(fb[(ks + 2) % 3][0], fb[(ks + 2) % 3][1], kb + 32 * (ks + 2));
-        }
-        mma_fp8(sacc[ks % 3], fa[ks % 3][0], fa[ks % 3][1], fa[ks % 3][2], fa[ks % 3][3],
-                fb[ks % 3][0], fb[ks % 3][1]);
-      }
-      float* sS = sSall + (mt + kh) * 16 * kSStr + h * kChunk;
-#pragma unroll
-      for (int i = 0; i < 4; ++i) {
-        const int r = 8 * nt + 2 * q4 + (i & 1);
-        sS[(g8 + 8 * (i >> 1)) * kSStr + r] = (sacc[0][i] + sacc[1][i]) + sacc[2][i];
-      }
-      }  // (8 nt < valid)
-    }
-    cast_v(c);  // (chunk c's V while the softmax waits for every warp's S)
-    __syncthreads();
-    if (dbg && tid == 0 && c == 0) dbg[11] = clock64();
-    // ---- softmax of the tile's 128 keys against the tile's own max m_t (base 2), as
-    // trtllm-gen's multi-CTA KV split of small batches (one 128-key tile per CTA):
-    // P = E4M3(448 x 2^(s - m_t)), l_t from the unquantized P; the row's running max
-    // M and sum L take the tile in (alpha = 2^(M_old - M), beta = 2^(m_t - M)). Warp w
-    // owns heads w * HG / 16 .., lane l keys l, 32 + l, 64 + l, 96 + l
-#pragma unroll
-    for (int hh = 0; hh < HG / 16; ++hh) {
-      const int h = warp * (HG / 16) + hh;
-      const int r0 = (h >> 4) * 16 + (h & 15);  // row of the [2][16] / [32] S tiles
-      float x[4];
-#pragma unroll
-      for (int k = 0; k < 4; ++k) {
-        x[k] = sSall[r0 * kSStr + 32 * k + lane];
-        if (HG == 16) x[k] += sSall[(16 + h) * kSStr + 32 * k + lane];  // the second k-half
-        x[k] *= p.s2scale;
-        if ((k >> 1) >= nh || slot_of(c + (k >> 1), 32 * (k & 1) + lane) < 0) x[k] = -INFINITY;
-      }
-      float mx = fmaxf(fmaxf(x[0], x[1]), fmaxf(x[2], x[3]));
-#pragma unroll
-      for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
-      const float base = mx == -INFINITY ? 0.f : mx;
-      float sum = 0.f;
-#pragma unroll
-      for (int k = 0; k < 4; ++k) {
-        const float e = exp2f(x[k] - base);
-        sum += e;  // (l from the unquantized P, as trtllm-gen)
-        // P = E4M3(448 e), then exactly to FP16 for the FP16 MMA
-        const __nv_fp8_storage_t q8 = __nv_cvt_float_to_fp8(kPScale * e, __NV_SATFINITE, __NV_E4M3);
-        sP[h * kPStr + 32 * k + lane] = __half(__nv_cvt_fp8_to_halfraw(q8, __NV_E4M3));
-      }
-#pragma unroll
-      for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
-      __syncwarp();
-      if (lane == 0) {
-        const float mold = sM[h], mnew = fmaxf(mold, mx);
-        const float alpha = mold == -INFINITY ? 0.f : exp2f(mold - mnew);
-        const float beta = mx == -INFINITY ? 0.f : exp2f(mx - mnew);
-        sA[h] = alpha;
-        sB[h] = beta;
-        sL[h] = sL[h] * alpha + sum * beta;
-        sM[h] = mnew;
-      }
-    }
-    __syncthreads();
-    if (dbg && tid == 0 && c == 0) dbg[12] = clock64();
-#pragma unroll
-    for (int j = 0; j < 4 * MT; ++j) tacc[j][0] = tacc[j][1] = tacc[j][2] = tacc[j][3] = 0.f;
-    pv(c);
-    __syncthreads();
-    if (c + 2 < nchunks) issue(c + 2);
-    if (nh > 1) {
-      cast_v(c + 1);
-      __syncthreads();
-      pv(c + 1);
-      __syncthreads();
-      if (c + 3 < nchunks) issue(c + 3);
-    }
-    // ---- the tile's partial O, unnormalized and rounded to BF16 (trtllm-gen's
-    // multi-CTA partial), joins the row's FP32 O at its running max
-    {
-      const float vs = p.vscale / kPScale;
-      auto bf16r = [](float x) { return __bfloat162float(__float2bfloat16_rn(x)); };
-#pragma unroll
-      for (int m2 = 0; m2 < MT; ++m2) {
-        const float a0 = sA[16 * m2 + g8], a1 = sA[16 * m2 + g8 + 8];
-        const float b0 = sB[16 * m2 + g8], b1 = sB[16 * m2 + g8 + 8];
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-          acc[4 * m2 + j][0] = acc[4 * m2 + j][0] * a0 + bf16r(tacc[4 * m2 + j][0] * vs) * b0;
-          acc[4 * m2 + j][1] = acc[4 * m2 + j][1] * a0 + bf16r(tacc[4 * m2 + j][1] * vs) * b0;
-          acc[4 * m2 + j][2] = acc[4 * m2 + j][2] * a1 + bf16r(tacc[4 * m2 + j][2] * vs) * b1;
-          acc[4 * m2 + j][3] = acc[4 * m2 + j][3] * a1 + bf16r(tacc[4 * m2 + j][3] * vs) * b1;
+          for (int j = 0; j < 4; ++j) {
+            tacc[4 * m2 + j][0] *= r0;
+            tacc[4 * m2 + j][1] *= r0;
+            tacc[4 * m2 + j][2] *= r1;
+            tacc[4 * m2 + j][3] *= r1;
+          }
         }
       }
+      pv(c);
+      __syncthreads();
+      if (c + 2 < nchunks) issue(c + 2);
+      if (nh > 1) {
+        cast_v(c + 1);
+        __syncthreads();
+        pv(c + 1);
+        __syncthreads();
+        if (c + 3 < nchunks) issue(c + 3);
+      }
+      // ---- at the piece's last tile: its partial O, unnormalized and rounded to BF16
+      // (trtllm-gen's multi-CTA partial; kv_ctas == 1: no split, no rounding), joins the
+      // row's FP32 O at its running max
+      if (piece_end) {
+        const float vs = p.vscale / kPScale;
+        const bool split = p.kv_ctas > 1;
+        auto bf16r = [split](float x) {
+          return split ? __bfloat162float(__float2bfloat16_rn(x)) : x;
+        };
+#pragma unroll
+        for (int m2 = 0; m2 < MT; ++m2) {
+          const float a0 = sA[16 * m2 + g8], a1 = sA[16 * m2 + g8 + 8];
+          const float b0 = sB[16 * m2 + g8], b1 = sB[16 * m2 + g8 + 8];
+#pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            acc[4 * m2 + j][0] = acc[4 * m2 + j][0] * a0 + bf16r(tacc[4 * m2 + j][0] * vs) * b0;
+            acc[4 * m2 + j][1] = acc[4 * m2 + j][1] * a0 + bf16r(tacc[4 * m2 + j][1] * vs) * b0;
+            acc[4 * m2 + j][2] = acc[4 * m2 + j][2] * a1 + bf16r(tacc[4 * m2 + j][2] * vs) * b1;
+            acc[4 * m2 + j][3] = acc[4 * m2 + j][3] * a1 + bf16r(tacc[4 * m2 + j][3] * vs) * b1;
+          }
+        }
+      }
+      if (dbg && tid == 0 && c == 0) dbg[13] = clock64();
     }
-    if (dbg && tid == 0 && c == 0) dbg[13] = clock64();
+  };
+  if (kp > 1) {
+    mainloop(std::true_type{});
+  } else {
+    mainloop(std::false_type{});
   }
   if (dbg && tid == 0) dbg[3] = now_ns();
   constexpr int kGroupHeads = HG;
@@ -694,7 +768,8 @@ __global__ void __launch_bounds__(kThreads, 1) dsac_kernel(const __grid_constant
 void run(torch::Tensor q, torch::Tensor sel, torch::Tensor cnt, torch::Tensor kv,
          double s2scale, double vscale, torch::Tensor part_peers, torch::Tensor lse_peers,
          int64_t box_cap, int64_t hpr, int64_t parity, int64_t rank, int64_t T, int64_t lse_wide,
-         int64_t splits, int64_t split_min, int64_t heads_per_cta, torch::Tensor err, int64_t spin_ns, int64_t pdl,
+         int64_t splits, int64_t split_min, int64_t kv_ctas, int64_t heads_per_cta, torch::Tensor err,
+         int64_t spin_ns, int64_t pdl,
          c10::optional<torch::Tensor> dbg) {
   if (T == 0) return;
   const int W = (int)part_peers.numel();
@@ -722,6 +797,8 @@ void run(torch::Tensor q, torch::Tensor sel, torch::Tensor cnt, torch::Tensor kv
   p.box_cap = (int)box_cap;
   p.lse_wide = (int)lse_wide;
   p.split_min = (int)split_min;
+  TORCH_CHECK(kv_ctas >= 1 && kv_ctas <= kMaxK / kTile, "dsa_core: kv_ctas in [1, 16]");
+  p.kv_ctas = (int)kv_ctas;
   p.hpr = (int)hpr;
   p.parity = (int)parity;
   p.rank = (int)rank;

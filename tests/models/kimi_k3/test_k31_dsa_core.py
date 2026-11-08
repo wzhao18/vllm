@@ -8,7 +8,7 @@ negative zero in a pushed pair, EMPTY LSE for rows without entries); DCP16 emula
 on one GPU: the merged rows against the trtllm-gen chain, and every rank's pushed
 partial rows elementwise against the stock trtllm-gen sparse MLA decode of the same
 rank (its precision: E4M3 P at 448 x the running max of 128-key tiles, l from the
-unquantized P, BF16 partials of a multi-CTA KV split), and the decode policy.
+unquantized P, BF16 partials of trtllm-gen's KV CTA pieces), and the decode policy.
 """
 
 import math
@@ -127,7 +127,8 @@ def _dcp_case(rows, pattern, seed=1, nkv=1 << 16):
     """Every rank's selection of each row: 2048 keys spread over the 16 ranks'
     disjoint KV rows ("balanced"), or row 0 entirely on rank 3 (a saturated rank,
     count 0 on the others), row 1 on no rank (an empty row) and row 2 on two ranks
-    only ("skewed")."""
+    only ("skewed"), or row r's keys on 1 + r % 8 ranks ("long": local counts of
+    256-2048, 2-16 tiles per rank-row: every trtllm-gen piece size at 8-16 rows)."""
     g = torch.Generator(device="cuda").manual_seed(seed)
     kv = torch.randn(nkv, D, generator=g, device="cuda") * 0.5
     k_scale = float(kv.abs().max()) / 448.0
@@ -148,6 +149,10 @@ def _dcp_case(rows, pattern, seed=1, nkv=1 << 16):
             keys = keys[:0]
         elif pattern == "skewed" and r == 2:
             keys = keys[(owner[keys] == 5) | (owner[keys] == 11)]
+        elif pattern == "long":
+            ranks = 1 + r % 8
+            pool = torch.randperm(nkv // W, generator=g, device="cuda")[:2048] * W
+            keys = pool + (torch.arange(2048, device="cuda") % ranks + r) % W
         for rank in range(W):
             mine = keys[owner[keys] == rank].int()
             sel[rank, r, : mine.numel()] = mine
@@ -357,23 +362,37 @@ def test_dsa_core_graph_replay_alternates_parities(variant):
 LOG2E = math.log2(math.e)
 
 
-def _emulate(q8, k8, bmm1, bmm2):
-    """The stock trtllm-gen sparse MLA decode of one row at the core's rows (FP32
-    emulation; probed bitwise against trtllm-gen at DCP16 q8 rows 8-48): its multi-CTA
-    KV split, one 128-key tile per CTA. Per tile, base-2 softmax against the tile's
-    own max m_t, P = E4M3(448 x 2^(s - m_t)), l_t from the unquantized P, the
-    unnormalized partial P V x bmm2 / 448 rounded to BF16; merged in FP32 with weights
-    2^(m_t - M), divided by L = sum l_t 2^(m_t - M), rounded to BF16. q8 [H, 576] and
-    k8 [n, 576] are E4M3 values (float). (rows bf16 [H, 512], base-2 LSE [H])."""
+def _emulate(q8, k8, bmm1, bmm2, kv_ctas):
+    """The stock trtllm-gen sparse MLA decode of one row (FP32 emulation; probed bitwise
+    against trtllm-gen on VR200 at rows 1-64, local counts 100-2048): its KV CTA split
+    (``kv_ctas`` = ops.trtllm_kv_ctas of the batch), the row's T = ceil(n / 128) tiles
+    in pieces of k = ceil(T / kv_ctas) consecutive tiles. Per piece, one base-2 running
+    max step per tile, P = E4M3(448 x 2^(s - m)), the piece's P V and sum (from the
+    unquantized P) rescaled by 2^(m_old - m), its unnormalized partial P V x bmm2 / 448
+    rounded to BF16 (kv_ctas > 1); merged in FP32 with weights 2^(m_p - M), divided by
+    L = sum l_p 2^(m_p - M), rounded to BF16. q8 [H, 576] and k8 [n, 576] are E4M3
+    values (float). (rows bf16 [H, 512], base-2 LSE [H])."""
     s = (q8 @ k8.T) * (bmm1 * LOG2E)
+    tiles = (k8.shape[0] + 127) // 128
+    per = -(-tiles // kv_ctas)
     parts = []
-    for t0 in range(0, k8.shape[0], 128):
-        st = s[:, t0 : t0 + 128]
-        m = st.amax(1)
-        p = torch.exp2(st - m[:, None])
-        p8 = (p * 448.0).to(torch.float8_e4m3fn).float()
-        x = (p8 @ k8[t0 : t0 + 128, :NOPE] * (bmm2 / 448.0)).to(torch.bfloat16).float()
-        parts.append((x, m, p.sum(1)))
+    for p0 in range(0, tiles, per):
+        m = torch.full((s.shape[0],), -float("inf"), device=s.device)
+        acc = torch.zeros(s.shape[0], NOPE, device=s.device)
+        l = torch.zeros(s.shape[0], device=s.device)
+        for t in range(p0, min(tiles, p0 + per)):
+            st = s[:, 128 * t : 128 * t + 128]
+            mn = torch.maximum(m, st.amax(1))
+            a = torch.exp2(m - mn)
+            p = torch.exp2(st - mn[:, None])
+            p8 = (p * 448.0).to(torch.float8_e4m3fn).float()
+            acc = acc * a[:, None] + p8 @ k8[128 * t : 128 * t + 128, :NOPE]
+            l = l * a + p.sum(1)
+            m = mn
+        x = acc * (bmm2 / 448.0)
+        if kv_ctas > 1:
+            x = x.to(torch.bfloat16).float()
+        parts.append((x, m, l))
     M = torch.stack([m for _, m, _ in parts]).amax(0)
     L = sum(l * torch.exp2(m - M) for _, m, l in parts)
     o = sum(x * torch.exp2(m - M)[:, None] for x, m, _ in parts) / L[:, None]
@@ -391,22 +410,21 @@ def _ulps(a, b):
     return (a - b).abs() / ulp
 
 
-@pytest.mark.parametrize("pattern", ["balanced", "skewed"])
-@pytest.mark.parametrize("rows", [8, 16])
+@pytest.mark.parametrize("pattern", ["balanced", "skewed", "long"])
+@pytest.mark.parametrize("rows", [8, 14, 16])
 def test_dsa_core_matches_trtllm_per_rank(rows, pattern):
-    """Stock precision, rank by rank (C1 / C8: DCP16 q8 rows 8 / 16, the served
-    2x16s2): every rank's pushed partial rows and base-2 LSEs against the stock
-    trtllm-gen sparse MLA decode of the same rank's rows (attn_fi.trtllm's call),
-    and both against the FP32 emulation of trtllm-gen's precision (``_emulate``).
-    The core matches the emulation bit for bit (FP32 accumulation order aside) and
-    trtllm-gen on 99.98% of the elements of balanced rows (99.0-99.6% with a row of
-    2048 keys on one rank, where trtllm-gen itself departs from the emulation); the
-    old FP16-P core matched trtllm-gen on 53-68% of them."""
+    """Stock precision, rank by rank (DCP16 q8 rows 8 / 14 / 16: trtllm-gen KV CTAs 8 /
+    7 / 6 on VR200, the served 2x16s2): every rank's pushed partial rows and base-2
+    LSEs against the stock trtllm-gen sparse MLA decode of the same rank's rows
+    (attn_fi.trtllm's call), and both against the FP32 emulation of trtllm-gen's
+    precision (``_emulate``), with local counts of up to 2048 (every piece size of
+    trtllm-gen's KV CTA split at these rows). The old FP16-P core matched trtllm-gen
+    on 53-68% of the elements."""
     from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core.decode import (
         VARIANT,
         parse_variant,
     )
-    from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core.ops import DsaCore
+    from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core.ops import DsaCore, trtllm_kv_ctas
 
     torch.backends.cuda.matmul.allow_tf32 = False
     variant = parse_variant(VARIANT[8].split(":")[1])
@@ -414,6 +432,7 @@ def test_dsa_core_matches_trtllm_per_rank(rows, pattern):
     sm_scale = 1.0 / math.sqrt(192)
     scales = sm_scale * q_scale * k_scale, k_scale
     core = DsaCore(torch.device("cuda"), cap=CAP, heads=H, max_splits=8)
+    kv_ctas = trtllm_kv_ctas(rows, QH, 2048, core.sms)
     _, ours, our_lse = _core_dcp16(core, box, sel, cnt, kv8, scales, variant)
     _, theirs, their_lse = _trtllm_dcp16(box, sel, cnt, kv8, scales, raw=True)
     live = cnt > 0  # [W, T]
@@ -429,7 +448,7 @@ def test_dsa_core_matches_trtllm_per_rank(rows, pattern):
             n = int(cnt[w, t])
             if n == 0:
                 continue
-            e, _ = _emulate(qf[t], kf[sel[w, t, :n].long()], *scales)
+            e, _ = _emulate(qf[t], kf[sel[w, t, :n].long()], *scales, kv_ctas)
             e = e.view(torch.int16)
             tr = theirs[w, t].to(torch.bfloat16).view(torch.int16)
             emu_eq["trtllm"].append(float((e == tr).float().mean()))
@@ -438,15 +457,15 @@ def test_dsa_core_matches_trtllm_per_rank(rows, pattern):
     counts = cnt[live]
     p999 = float(ulps.flatten()[::4].quantile(0.999))  # (quantile: < 16M elements)
     print(
-        f"DCP16 q8 M{rows} {pattern} (local counts {int(counts.min())}-"
+        f"DCP16 q8 M{rows} kv_ctas {kv_ctas} {pattern} (local counts {int(counts.min())}-"
         f"{int(counts.max())}): core vs trtllm-gen bitwise {equal:.5f}, ulps max "
         f"{float(ulps.max()):.1f} p99.9 {p999:.2f}, LSE max |diff| {lse_err:.2e}; "
         f"emulation bitwise vs {summary}"
     )
     assert summary["core"] >= 0.999, summary
-    assert equal >= 0.98, equal
-    if pattern == "balanced":  # (skewed: trtllm-gen's 2048-key rows depart from the
-        assert p999 <= 1.0, p999  # one-tile-per-CTA model; the core matches the model)
+    assert summary["trtllm"] >= 0.999, summary
+    assert equal >= 0.999, equal
+    assert p999 <= 1.0, p999
     assert lse_err <= 1e-4, lse_err
 
 
@@ -457,6 +476,22 @@ def test_dsa_core_serving_deadline():
     from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core import decode
 
     assert decode.SERVING_SPIN_S == dcpx.SERVING_SPIN_S == 600.0
+
+
+def test_trtllm_kv_ctas():
+    """trtllm-gen's KV CTAs per row as probed on VR200 (212 SMs, 128 padded heads,
+    2048 slots per row) and FlashInfer's rule elsewhere."""
+    from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core.ops import trtllm_kv_ctas
+
+    probed = {1: 8, 2: 8, 4: 8, 8: 8, 12: 8, 16: 6, 24: 4, 32: 3, 48: 2, 56: 1, 64: 1}
+    for rows, ctas in probed.items():
+        assert trtllm_kv_ctas(rows, 128, 2048, 212) == ctas, rows
+    assert trtllm_kv_ctas(14, 128, 2048, 212) == 7
+    assert trtllm_kv_ctas(8, 128, 2048, 148) == 8
+    assert trtllm_kv_ctas(16, 128, 2048, 148) == 4
+    assert trtllm_kv_ctas(1, 128, 512, 212) == 2
+    with pytest.raises(ValueError):
+        trtllm_kv_ctas(8, 32, 2048, 212)
 
 
 def test_dsa_core_policy():

@@ -205,7 +205,6 @@ class DcpExchange:
         next_n: int = 1,
         block_stride: int = 0,
         req_of_row: torch.Tensor | None = None,
-        tie_order: str = "global",
         cluster: int | None = None,
         segmax: int = 8192,
         one_round: bool = True,
@@ -216,9 +215,8 @@ class DcpExchange:
         interleave: int | None = None,
     ) -> None:
         """``stats``: optional int32[8] row counters (``STAT_NAMES``), added to.
-        ``tie_order``: "global" selects the ties at the K-th key by ascending global
-        token id (the stock merge's rule; one extra round when they straddle ranks),
-        "rank" by (rank, position) with no extra round (the same score multiset).
+        Ties at the K-th key are selected by ascending global token id (the stock
+        merge's rule; one extra round when they straddle ranks).
         ``window`` (1-round rows): "top" ends each rank's window at its local
         maximum; "center" centres it at the rank's local estimate of the K-th key
         (its local ceil(K * L / G)-th key). Rows whose K-th key falls outside a
@@ -252,7 +250,7 @@ class DcpExchange:
             next_n,
             block_stride,
             req_of_row,
-            {"global": 0, "rank": 1}[tie_order],
+            0,  # (ties by global id; the kernel's rank-order mode is not exposed)
             self.tk_box.data_ptr(),
             self.tk_mc,
             self.tk_peers,

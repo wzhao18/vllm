@@ -3242,6 +3242,44 @@ def test_prepared_dsa_dcp_exchange_proj(dcp8_group, monkeypatch, core, batch):
     assert step.topk_calls == [batch] * 3, step.topk_calls
 
 
+@pytest.mark.skipif(DCP_INIT is None, reason="needs an 8-rank launch (DCP8)")
+@pytest.mark.skip_global_cleanup  # the DCP8 group outlives each case
+@pytest.mark.parametrize("batch", [16, 32, 64])
+def test_prepared_dsa_dcp_exchange_min_rows(dcp8_group, monkeypatch, batch):
+    """The served top-k route by rows (dcp_exchange.decode.MIN_ROWS unpatched) with
+    DcpExchange attached at q8: at DCP16 steps of up to 64 rows keep the #63 merge
+    (the exchange's top-k is never called), at DCP8 the exchange takes every step;
+    either way the step is the stock DCP forward's (check_layer_step), the rows of
+    at most 16 on the DSA sparse core (2x16s2, as served), and 200 graph replays give
+    the eager rows bit for bit."""
+    from vllm.model_executor.layers import sparse_attn_indexer
+    from vllm.models.kimi_k3.nvidia.dsa_kernels.dcp_exchange import decode as dcpx
+
+    monkeypatch.setattr(sparse_attn_indexer, "DCP_DECODE_TOPK_HOOKS", {})
+    world = dcp8_group
+    step = run_layer_step(
+        "fi-trtllm",
+        batch,
+        8,
+        dcp8_group,
+        None,
+        "default",
+        graph=True,
+        replays=200,
+        sparse_core="2x16s2" if batch <= 16 else None,
+        exchange=True,
+    )
+    check_layer_step(step, 8, reference=False)
+    exchanged = batch >= dcpx.MIN_ROWS.get(world, 1)
+    print(f"DCP{world} M{batch}: exchange top-k calls {step.topk_calls}")
+    assert step.topk_calls == ([batch] * len(step.topk_calls) if exchanged else []), (
+        step.topk_calls
+    )
+    assert exchanged == bool(step.topk_calls), step.topk_calls
+    if batch <= 16:
+        assert len(step.core_calls) >= 3, step.core_calls
+
+
 # DcpExchange's top-k feeding WideDsa above 96 rows at DCP16: DL7's C64 band (q8 at
 # 128 and 256 rows, a widened DSA box of 256) and DL3's (q4 at 128 and 256 rows, the
 # exchange's one-round top-k, and its widest step at 512 rows; a box of 512: the
@@ -3794,7 +3832,7 @@ def test_dcp_topk_merge_rows_deterministic(dcp8_group, saturate):
 @pytest.mark.parametrize("check", [False, True], ids=["rows", "rows+ids"])
 def test_merge_rows_kernels_compile_at_prepare(monkeypatch, check):
     """The #63 merge's select and rescue kernels as ``merge_rows`` launches them
-    (physical rows of the MLA blocks; global ids too under VLLM_DSA_BPRIME_CHECK)
+    (physical rows of the MLA blocks; global ids too where a test asks for them)
     compile when PreparedDsa prepares its cache (``IndexerStage.warm``), not at
     their first launch: the specialized decode runs only inside graph captures,
     where a first compile invalidates the capture (CUDA error 901), and the
@@ -5281,31 +5319,3 @@ def test_prepared_dsa_compiles_once_per_kernel(
         assert all(x is y for x, y in zip(kernels, b.kernels[shape])), shape
     for shape, kernels in a.overlap_kernels.items():
         assert all(x is y for x, y in zip(kernels, b.overlap_kernels[shape])), shape
-
-
-@pytest.mark.skipif(DCP_INIT is None, reason="needs an 8-rank launch (DCP8)")
-@pytest.mark.skip_global_cleanup  # the DCP8 group outlives each case
-@pytest.mark.parametrize("batch,q", [(8, 8), (64, 8)])
-def test_prepared_dsa_dcp_bprime_check(dcp8_group, batch, q):
-    """VLLM_DSA_BPRIME_CHECK on the specialized merge (IndexerStage.check): the
-    generic merge of the same logits agrees with the one-round merge on every row
-    (no miss), as for the stock op. Last in the file: the check stays on for the
-    process once initialized."""
-    from vllm.distributed import get_dcp_group
-    from vllm.v1.attention.ops.dcp_topk_merge.check import (
-        MISS_ROWS,
-        ROWS,
-        get_dcp_topk_merge_check,
-        init_dcp_topk_merge_check,
-    )
-
-    dev = torch.device("cuda", torch.accelerator.current_device_index())
-    init_dcp_topk_merge_check(dev, get_dcp_group().rank_in_group)
-    state = get_dcp_topk_merge_check()
-    before = state.snapshot()["totals"]
-    step = run_layer_step("fi-auto", batch, q, dcp8_group, None, "bf16")
-    check_layer_step(step, q, reference=False)
-    torch.accelerator.synchronize()
-    after = state.snapshot()["totals"]
-    assert after[ROWS] - before[ROWS] > 0, (before, after)
-    assert after[MISS_ROWS] == before[MISS_ROWS], (before, after)

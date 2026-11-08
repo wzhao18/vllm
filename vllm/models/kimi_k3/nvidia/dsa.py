@@ -44,9 +44,6 @@ from vllm.models.kimi_k3.common.dsa_cache import (
     indexer_cache_entry_bytes,
     kimi_k3_indexer_uses_fp4,
 )
-from vllm.models.kimi_k3.nvidia.dsa_kernels.dcp_prefill_topk_merge import (
-    dcp_prefill_merge_tie_words,
-)
 from vllm.models.kimi_k3.nvidia.index_rope import index_rope
 from vllm.models.kimi_k3.nvidia.low_latency_gemm import (
     low_latency_linear,
@@ -264,21 +261,6 @@ class KimiK3DSAIndexer(nn.Module):
         # Same as the upstream SparseAttnIndexer: decode merges each rank's
         # packed local top-N in one exchange (0 keeps the generic merge).
         self.dcp_local_topk = init_dcp_topk_merge(vllm_config, index_topk)
-        # Prefill chunks merge the DCP top-k by histogram exchange.
-        self.dcp_prefill_merge_tie_words = dcp_prefill_merge_tie_words(
-            vllm_config, index_topk
-        )
-        if (
-            self.dcp_prefill_merge_tie_words
-            and vllm_config.kernel_config.enable_jit_warmup
-        ):
-            from vllm.models.kimi_k3.nvidia.dsa_kernels.dcp_prefill_topk_merge.hist_merge import (  # noqa: E501
-                register_dcp_prefill_merge_warmup,
-            )
-
-            register_dcp_prefill_merge_warmup(
-                index_topk, self.dcp_world_size, self.dcp_prefill_merge_tie_words
-            )
 
     @property
     def cp_kv_cache_interleave_size(self) -> int:
@@ -454,7 +436,6 @@ class KimiK3DSAIndexer(nn.Module):
             topk_backend=self.topk_backend,
             shardq_layer_name=self.shardq_layer_name,
             dcp_local_topk=self.dcp_local_topk,
-            dcp_prefill_merge_tie_words=self.dcp_prefill_merge_tie_words,
         )
 
 

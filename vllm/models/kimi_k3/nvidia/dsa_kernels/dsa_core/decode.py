@@ -20,10 +20,12 @@ by
     -> DcpValue(pushed=True) (merge, W_UV, gate)
 
 The core computes the stock FP8 sparse MLA decode's (trtllm-gen's) precision at every
-stage (csrc/dsa_core.cu): E4M3 Q K with FP32 accumulation, FP32 base-2 softmax with
-one running max step per 128-key tile, P = E4M3(448 x 2^(s - m)) with the row sum
-from the unquantized P, FP32 P V accumulation, BF16-rounded partials of a row's
-multi-CTA KV split merged in FP32.
+stage (csrc/dsa_core.cu): trtllm-gen's KV CTA split of the batch's rows
+(ops.trtllm_kv_ctas: a row's 128-key tiles in pieces of ceil(tiles / C) consecutive
+tiles), per piece E4M3 Q K with FP32 accumulation, FP32 base-2 softmax with one
+running max step per 128-key tile, P = E4M3(448 x 2^(s - m)) with the row sum from
+the unquantized P, FP32 P V accumulation, the pieces' BF16-rounded unnormalized
+partials merged in FP32.
 
 Policy (``build``, no switch): on wherever it can run, i.e. a decode under DCP (TP =
 DCP > 1, not the sequence-parallel decode, which runs its own DSA path) over a
@@ -77,14 +79,14 @@ ROWS = 16
 # x600 16.81 / 18.14, x2048 18.21 / 42.81. Still -5.3 / -6.3 us per layer on the
 # balanced rows of real indexer logits (96-155 local entries per rank-row); a row whose
 # selection sits on one rank (x600 and up) is slower, as before.
+# With trtllm-gen's KV CTA pieces (ops.trtllm_kv_ctas: rows of more tiles than KV CTAs
+# keep a running max across a piece's tiles; bitwise stock on such rows too), same
+# bench, trtllm-gen chain / core with pieces (/ per-tile core): M8 bal 14.25 / 9.46
+# (/ 9.15), x256 15.01 / 10.04, x384 15.10 / 14.60, x600 16.87 / 18.58, x2048 18.88 /
+# 45.10; M16 bal 15.63 / 9.73 (/ 9.42), x256 15.50 / 10.13, x384 15.65 / 14.62, x600
+# 16.59 / 18.60, x2048 18.60 / 49.45 (envs lane exact4): -4.8 / -5.9 us per layer on
+# balanced rows.
 VARIANT = {8: "1-16:2x16s2"}
-# Rows whose pushed DcpValue spreads every row's merge over its CTAs (Rubin schedule,
-# LSE box [CAP, H, DCP]; spec verify rows only) instead of one merge CTA per (head, 16
-# rows). DCP16 layer bench with 1x16: B8 q4 59.0 -> 55.9, B8 q8 76.8 -> 73.7 us; step
-# H -> S: B8 q8 11511 -> 11447 (-64), B8 q4 8889 -> 8825 (-64). Applies only where the
-# device has more than 152 SMs (PreparedDsa.run_dcp). No row the core serves (ROWS)
-# reaches it today; it stays for a larger ROWS.
-SPREAD = frozenset(range(17, 65))
 # The served core's q mailbox poll deadline (s; ``build``): a peer stalled on the host
 # (cold JIT, GC, a P/D handshake) then only delays this rank, as with DcpExchange's
 # serving deadline (600 s) and DcpBox's polls (none). DsaCore's own 5 s stays for tests.
@@ -152,7 +154,6 @@ class DsacDecode:
         self.rows = min(ROWS if rows is None else rows, cap)
         self.spec = spec  # every q's variant table, else VARIANT[q]
         self.tables: dict[int, dict] = {}
-        self.spread = SPREAD
         self.core = DsaCore(device, cap=self.rows, heads=heads, max_splits=8)
         logger.info(
             "Kimi K3.1 DSA decode: sparse core on (rows <= %d, variants %s)",

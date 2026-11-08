@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The Kimi K3 NVIDIA code selects its paths in code, not through environment
-switches: no source under vllm/models/kimi_k3/nvidia reads a K3 / K3.1 environment
-variable other than the infrastructure ones (extension build directories, CUDA_HOME)
-and the two stock-semantics opt-ins no serving recipe sets; and the role policies
-that replaced the recipes' per-role switches (CPU only)."""
+switches: no source under vllm/models/kimi_k3/nvidia reads an environment variable
+(``envs.X``, ``os.environ`` / ``os.getenv`` / C ``getenv``) other than the
+infrastructure ones (extension build directories, CUDA_HOME) and stock (upstream)
+vLLM settings it honours with their stock meaning; and the role policies that replaced
+the recipes' per-role switches (CPU only)."""
 
 import re
 from pathlib import Path
@@ -14,15 +15,25 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[3] / "vllm" / "models" / "kimi_k3" / "nvidia"
 READ = re.compile(
-    r"os\.environ\.get\(\s*['\"]([A-Z0-9_]+)|os\.getenv\(\s*['\"]([A-Z0-9_]+)"
-    r"|getenv\(\s*\"([A-Z0-9_]+)|envs\.(VLLM_K(?:IMI_)?3[A-Z0-9_]*|VLLM_K31[A-Z0-9_]*)"
+    r"os\.environ\.get\(\s*['\"]([A-Za-z0-9_]+)|os\.environ\[\s*['\"]([A-Za-z0-9_]+)['\"]\s*\]"
+    r"(?!\s*=[^=])|getenv\(\s*['\"]([A-Za-z0-9_]+)|\benvs\.([A-Z][A-Z0-9_]+)"
+    r"|getattr\(\s*envs\s*,\s*['\"]([A-Za-z0-9_]+)"
 )
-# infrastructure (where builds go, where CUDA is) and the stock-semantics opt-ins
-# outside the serving recipes (follow-ups, not feature switches of the served paths)
 ALLOWED = {
+    # infrastructure: where extension builds go, where CUDA is
     "K31_DCPX_BUILD_DIR",
     "K31_DSAC_BUILD_DIR",
     "CUDA_HOME",
+    # stock vLLM settings, honoured with their stock meaning (not K3 feature switches)
+    "VLLM_CACHE_ROOT",
+    "VLLM_BATCH_INVARIANT",
+    "VLLM_MOE_SKIP_PADDING",
+    "VLLM_ENABLE_GEMM_RS",
+    "VLLM_USE_FUSED_MOE_GROUPED_TOPK",
+    "VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD",
+    "VLLM_DISABLE_SHARED_EXPERTS_STREAM",
+    # upstream vLLM Kimi K3 options (stock code: #50656, #50487), off by default and
+    # set by no serving recipe
     "VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT",
     "VLLM_KIMI_K3_AUX_ATTN_RES_STREAM",
 }

@@ -20,8 +20,9 @@ key in position order, then its selected ties in position order, padded with
 -1; it must be bitwise identical across repeated calls and between the 1- and
 2-round modes. Every case runs at interleave 896 and 1. Where the stock merge
 (fp32 upcast + persistent_topk + pack + all_gather + stable select) runs, its
-global set is compared too (it can differ from the reference only when a
-rank's local top-K cut itself falls inside the tie group).
+global set is compared too: equal where it equals the reference; where a rank's
+local top-K cut falls inside the tie group (persistent_topk then keeps an arbitrary
+subset of that rank's ties) ours must be a legal stock outcome (_check_stock).
 O exchange: the owner's merged heads must equal the FP32 LSE merge of all
 ranks' partials (bf16 rounding tolerance).
 Spin limits: with the serving limit (600 s) or none (0), a peer that launches 7 s
@@ -239,14 +240,83 @@ def check_topk(ex: DcpExchange, case: str, B: int, q: int, ctx: int, seed: int, 
     if stock:
         sm = _stock_global_mask(full, G, Lr, local, rank, W, il, T, Gmax, dev)
         if sm is not None:
-            srow = (sm != ref).any(1)
-            nd = int(srow.sum())
-            nmo = int(((sm != ours).any(1) & ~srow).sum())
-            if rank == 0:
-                print(f"     stock merge: differs from the reference in {nd}/{T} rows; "
-                      f"ours differs from stock in {nmo} of the others", flush=True)
-            if nmo:
-                errs.append(f"set != stock merge in {nmo} rows")
+            errs += _check_stock(sm, ours, ref, full, G, tau, nvalid, Lr, local, Lmax_all,
+                                 rank, W, il, T, Gmax, dev)
+    return errs
+
+
+def _check_stock(sm, ours, ref, full, G, tau, nvalid, Lr, local, Lmax_all, rank, W, il,
+                 T, Gmax, dev):
+    """``ours`` against the stock merge's set ``sm`` (persistent_topk per rank, then
+    the stable merge by (key, ascending global id)). Where stock equals the reference
+    (ties by ascending global id), ours must equal stock. Where it does not, the
+    rank's local top-K cut fell inside the tie group at tau: persistent_topk keeps
+    an arbitrary K - (keys above tau) of that rank's ties (its tie loop takes the
+    threshold bin's elements in atomicAdd order, across CTAs on long rows), so stock
+    has no fixed tie rule there. On those rows ours must be a legal stock outcome:
+    (1) the same keys above tau and as many keys at tau as stock, (2) only keys at
+    tau differ, (3) a rank's local top-K cut is at tau (its keys >= tau exceed K) on
+    each such row, (4) ours takes from every rank at most K - (its keys above tau)
+    ties, so it is stock's outcome when each persistent_topk keeps its lowest-id
+    ties (the stable merge then takes the lowest global ids). persistent_topk is
+    rerun 8 times on those rows: its run-to-run differences are reported."""
+    errs = []
+    fk = keys_of(full).long()
+    colmask = torch.arange(Gmax, device=dev)[None, :] < G[:, None]
+    fk = torch.where(colmask, fk, torch.zeros_like(fk))
+    srow = (sm != ref).any(1)
+    nd = int(srow.sum())
+    nmo = int(((sm != ours).any(1) & ~srow).sum())
+    if nmo:
+        errs.append(f"set != stock merge in {nmo} rows where stock = reference")
+    # this rank's keys above / at tau, per row (local positions below Lr)
+    lk = keys_of(local[:, :Lmax_all]).long()
+    lk = torch.where(torch.arange(Lmax_all, device=dev)[None, :] < Lr[:, None], lk, 0)
+    tl = tau.long()[:, None]
+    gt_r = ((lk > tl) & (lk > 0)).sum(1)
+    eq_r = ((lk == tl) & (lk > 0)).sum(1)
+    every = torch.stack([gt_r, eq_r], 1)
+    allr = [torch.zeros_like(every) for _ in range(W)]
+    dist.all_gather(allr, every, group=GROUP[0])
+    allr = torch.stack(allr, 1)  # [T, W, 2]
+    owner = (torch.arange(Gmax, device=dev) // il) % W
+    bad = []
+    for r in srow.nonzero()[:, 0].tolist():
+        t = int(tau[r])
+        d = sm[r] ^ ours[r]
+        if int(sm[r].sum()) != int(ours[r].sum()):
+            bad.append(f"row {r}: {int(sm[r].sum())} stock vs {int(ours[r].sum())} ours")
+            continue
+        if bool((fk[r][d] != t).any()):
+            bad.append(f"row {r}: a key off tau differs")
+            continue
+        cut_at_tau = (allr[r, :, 0] + allr[r, :, 1] > K) & (allr[r, :, 1] > 0)
+        if not bool(cut_at_tau.any()):
+            bad.append(f"row {r}: stock differs but no rank's local cut is at tau")
+            continue
+        mine_ties = torch.bincount(owner[ours[r] & (fk[r] == t)], minlength=W)
+        if bool((mine_ties > (K - allr[r, :, 0]).clamp(min=0)).any()):
+            bad.append(f"row {r}: more ties from a rank than its local top-K keeps")
+    if bad:
+        errs.append("stock-departing rows: " + "; ".join(bad[:3]))
+    # persistent_topk's run-to-run choice on the departing rows (report only)
+    reruns = 0
+    if nd:
+        lg32 = torch.nan_to_num(local.float().contiguous(), nan=float("-inf"))
+        ws = torch.empty(1024 * 1024, dtype=torch.uint8, device=dev)
+        outs = []
+        for _ in range(8):
+            loc = torch.empty(T, K, dtype=torch.int32, device=dev)
+            torch.ops._C.persistent_topk(lg32, Lr, loc, ws, K, int(Lr.max()))
+            outs.append(loc.sort(1).values)
+        reruns = sum(int((o != outs[0]).any(1).sum()) for o in outs[1:])
+    stat = torch.tensor([reruns], device=dev)
+    dist.all_reduce(stat, group=GROUP[0])
+    if rank == 0:
+        print(f"     stock merge: differs from the reference in {nd}/{T} rows (a rank's "
+              f"local cut at tau: ours is a legal stock outcome{' (FAIL)' if bad else ''}); "
+              f"ours differs from stock in {nmo} of the others; persistent_topk reruns "
+              f"changed a rank-row {int(stat)} times", flush=True)
     return errs
 
 
@@ -298,79 +368,6 @@ def check_stale_refine(ex: DcpExchange, il: int, stats: torch.Tensor):
     if lo < 0 or hi >= 510:
         errs.append(f"epoch out of [0, 510): {lo}..{hi}")
     return errs
-
-
-def check_tie_rank(ex: DcpExchange, case: str, B: int, q: int, ctx: int, seed: int):
-    """tie_order="rank" (the decode wiring's default): the same tokens above the K-th
-    key and the same number of ties at it as the global-id order, the ties filling
-    the ranks in rank order (each rank before the last one with selected ties gives
-    all of its ties), each rank's in position order."""
-    W, rank, dev = ex.W, ex.rank, ex.device
-    T = B * q
-    gen = torch.Generator(device=dev)
-    gen.manual_seed(seed + SEED_OFF[0])
-    ctxs = torch.randint(max(1, ctx // 4), ctx + 1, (B,), generator=gen, device=dev)
-    G = (ctxs[:, None] - q + 1 + torch.arange(q, device=dev)[None, :]).reshape(-1)
-    G = G.to(torch.int32)
-    full = make_logits(case, T, G, gen, dev)
-    Lr = local_len_of(G.to(torch.int64), rank, W, INTERLEAVE).to(torch.int32)
-    Lmax = int(local_len_of(torch.tensor([full.shape[1]]), 0, W, INTERLEAVE))
-    pos = torch.arange(Lmax, device=dev)
-    gid = local_to_global(pos, rank, W, INTERLEAVE)
-    local = torch.full((T, Lmax + 8), float("nan"), dtype=torch.bfloat16, device=dev)
-    ok = gid < full.shape[1]
-    local[:, :Lmax][:, ok] = full[:, gid[ok]]
-    res = {}
-    for name, order, one_round in (("global", "global", False), ("rank", "rank", False),
-                                   ("rank1c", "rank", True)):
-        out = torch.full((T, K), -7, dtype=torch.int32, device=dev)
-        cnt = torch.zeros(T, dtype=torch.int32, device=dev)
-        ex.topk_merge(local, Lr, G, out, cnt, max_local_len=int(Lr.max()),
-                      one_round=one_round, window="center", tie_order=order,
-                      small_ctx=0)
-        res[name] = (out, cnt)
-    torch.cuda.synchronize()
-    ex.check()
-    keys = keys_of(local[:, :Lmax])
-    keys = torch.where(pos[None, :] < Lr[:, None], keys, torch.zeros_like(keys))
-    errs = []
-    if not (torch.equal(res["rank1c"][0], res["rank"][0])
-            and torch.equal(res["rank1c"][1], res["rank"][1])):
-        errs.append("tie_order=rank: 1-round centred window differs from 2 rounds")
-    # the K-th key: the smallest selected key over all ranks (global-id run)
-    big = 1 << 20
-    taus = torch.full((T,), big, dtype=torch.int64, device=dev)
-    for r in range(T):
-        c = int(res["global"][1][r])
-        if c:
-            taus[r] = int(keys[r, res["global"][0][r, :c].long()].min())
-    dist.all_reduce(taus, op=dist.ReduceOp.MIN, group=GROUP[0])
-    sel_eq = torch.zeros(T, W, dtype=torch.int64, device=dev)
-    ties_r = torch.zeros(T, W, dtype=torch.int64, device=dev)
-    for r in range(T):
-        sg = res["global"][0][r, : int(res["global"][1][r])].long()
-        sr = res["rank"][0][r, : int(res["rank"][1][r])].long()
-        tau = int(taus[r])
-        kg, kr = keys[r, sg], keys[r, sr]
-        if not torch.equal(sg[kg > tau].sort().values, sr[kr > tau].sort().values):
-            errs.append(f"row {r}: tokens above the K-th key differ")
-        if bool((kr < tau).any()):
-            errs.append(f"row {r}: rank order selected below the K-th key")
-        sel_eq[r, rank] = int((kr == tau).sum())
-        ties_r[r, rank] = int((keys[r] == tau).sum())
-    dist.all_reduce(sel_eq, group=GROUP[0])
-    dist.all_reduce(ties_r, group=GROUP[0])
-    cnt_g = res["global"][1].clone()
-    cnt_r = res["rank"][1].clone()
-    dist.all_reduce(cnt_g, group=GROUP[0])
-    dist.all_reduce(cnt_r, group=GROUP[0])
-    if not torch.equal(cnt_g, cnt_r):
-        errs.append("total counts differ between tie orders")
-    for r in range(T):
-        last = int((sel_eq[r] > 0).nonzero().max()) if bool((sel_eq[r] > 0).any()) else -1
-        if last > 0 and not torch.equal(sel_eq[r, :last], ties_r[r, :last]):
-            errs.append(f"row {r}: ties not filled in rank order")
-    return errs[:5]
 
 
 def check_slots(ex: DcpExchange, B: int, q: int, ctx: int, seed: int):
@@ -529,17 +526,6 @@ def main():
         failures.append("stale refine / epoch wrap: " + "; ".join(errs[:3]))
     if rank == 0:
         print(("FAIL " if errs else "ok   ") + "stale refine / epoch wrap", flush=True)
-    for i, (case, B, q, ctx) in enumerate(
-        [("normal", 4, 4, 150_000), ("ties", 8, 4, 50_000), ("relu", 16, 8, 60_000),
-         # more rows than resident CTAs: the 1R rows' direct write in multi-row CTAs
-         ("hot_recent", 192, 8, 150_000)]
-    ):
-        errs = check_tie_rank(ex, case, B, q, ctx, 700 + i)
-        tag = f"tie_order=rank {case} B{B} q{q} ctx{ctx}"
-        if errs:
-            failures.append(tag + ": " + "; ".join(errs[:3]))
-        if rank == 0:
-            print(("FAIL " if errs else "ok   ") + tag, flush=True)
     for i, (B, q, ctx) in enumerate([(4, 4, 150_000), (16, 8, 60_000), (64, 4, 30_000)]):
         errs = check_slots(ex, B, q, ctx, 500 + i)
         tag = f"slots B{B} q{q} ctx{ctx}"

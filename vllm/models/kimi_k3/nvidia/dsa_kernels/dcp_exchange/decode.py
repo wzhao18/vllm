@@ -15,7 +15,12 @@ conversion (``SparseMLACommonImpl.dcp_local_topk_counts``) and
 ``PreparedDsa.dcp_core``.
 
 The selection is the stock one: the exact global top-K of the logits, ties at the
-K-th key by ascending global token id (the stock merge's rule; ``TIE_ORDER``).
+K-th key by ascending global token id. That is the stock merge's rule (its stable
+select over the gathered (key, global id) candidates) on every row where no rank's
+local top-K cut falls inside the tie group; where one does, stock's persistent_topk
+keeps an arbitrary subset of that rank's ties (atomicAdd order), and this selection
+is the stock outcome where each rank keeps its lowest-id ties
+(test_k31_dcp_exchange: _check_stock).
 
 Policy (``wanted``, no switch): built on a decode instance (not a prefill-only P/D
 producer) under 1 < DCP == TP (head owner = rank) on SM107 (Rubin, where it was
@@ -38,12 +43,6 @@ logger = init_logger(__name__)
 # a P/D handshake) only delays its peers, as a stock collective would. The kernels'
 # own 5 s default applies to tests and the build-time warmup only.
 SERVING_SPIN_S = 600.0
-# Ties at the K-th key by ascending global token id: the stock merge's rule (one extra
-# NVLink round only when the ties straddle two or more ranks). "rank" order (no extra
-# round, the same selected score multiset) selects other keys than stock on ties,
-# which bf16 logits make common. Cost of the stock rule at production shapes: envs
-# lane bench_dcp_topk_ties (TIES-COST).
-TIE_ORDER = "global"
 # Rows that take the one-round top-k: each rank sends 16-bit counts of a 256-key window
 # centred at its local estimate of the K-th key (its local ceil(K * L / G)-th key) and
 # its 256-key bin counts; rows whose K-th key falls outside the windows take one refine
@@ -170,7 +169,7 @@ class DcpxDecode:
             heads=heads,
             o_dims=(),
             topk=topk,
-            interleave=self.interleave,  # global ids (tie_order="global")
+            interleave=self.interleave,  # global ids (ties by global id)
         )
         props = torch.cuda.get_device_properties(device)
         self.sms = props.multi_processor_count
@@ -185,19 +184,6 @@ class DcpxDecode:
         self.heads, self.hpr = heads, heads // self.W
         self.layers: dict[str, Any] = {}  # indexer prefix -> MLA layer
         self.indexers: dict[str, Any] = {}  # indexer prefix -> indexer
-        # VLLM_DSA_BPRIME_CHECK (interleave 1): every exchanged top-k also against
-        # the generic merge of the same logits, as the one-round DCP merge's.
-        from vllm.v1.attention.ops.dcp_topk_merge.check import (
-            dcp_topk_merge_check_enabled,
-        )
-
-        self.check_sat = None
-        if self.interleave == 1 and dcp_topk_merge_check_enabled():
-            self.check_sat = torch.zeros(self.cap, dtype=torch.int32, device=device)
-            logger.warning_once(
-                "DSA DCP top-k merge check: the DcpExchange top-k is checked too "
-                "(its slots as global ids through the MLA block table)"
-            )
         logger.info(
             "Kimi K3.1 DSA decode: DcpExchange top-k on (DCP%d, interleave %d, rows "
             "%d-%d, one-round rows <= %d, ties by global id)",
@@ -285,59 +271,9 @@ class DcpxDecode:
             req_of_row=md.req_id_per_token[:rows],
             one_round=self.ex.cap1 > 0,
             window="center",
-            tie_order=TIE_ORDER,
             small_ctx=self.small_ctx,
         )
-        if self.check_sat is not None:
-            self.check_topk(prefix, logits, decode, out, rows, md, stride)
         return True
-
-    def check_topk(self, prefix, logits, decode, out, rows, md, stride) -> None:
-        """VLLM_DSA_BPRIME_CHECK: this step's exchanged slots as global ids against
-        the generic merge of the same logits (dcp_topk_merge.check: collective, no
-        host syncs, so captured graphs keep it)."""
-        from vllm.distributed import get_dcp_group
-        from vllm.forward_context import get_forward_context
-        from vllm.model_executor.layers.sparse_attn_indexer import (
-            _check_dcp_decode_topk_merge,
-        )
-        from vllm.v1.attention.ops.dcp_topk_merge.check import (
-            exchange_slot_ids,
-            merge_exchange_ids,
-        )
-
-        indexer = self.indexers[prefix]
-        local = decode.seq_lens.reshape(-1)[:rows]
-        mine = exchange_slot_ids(
-            out[:rows, : self.K],
-            self.counts[:rows],
-            md.block_table,
-            md.req_id_per_token[:rows],
-            md.block_size,
-            stride,
-            local,
-            self.rank,
-            self.W,
-        )
-        every = get_dcp_group().all_gather(mine, dim=0).view(self.W, *mine.shape)
-        reqs = decode.decode_lens.shape[0]
-        _check_dcp_decode_topk_merge(
-            prefix,
-            logits,
-            local,
-            decode.seq_lens[:reqs],
-            rows // reqs,
-            merge_exchange_ids(every),
-            0,
-            indexer.topk_backend,
-            indexer.topk_backend != "deep_select",
-            get_forward_context().attn_metadata[prefix].max_seq_len,
-            indexer.max_model_len,
-            self.rank,
-            self.W,
-            16,  # bf16 logits
-            sat_word=self.check_sat[:rows],
-        )
 
     def launch_params(self, rows: int, max_local: int) -> tuple[int, int]:
         """(CTAs per row, shared-memory keys per CTA or 0) of a top-k launch.

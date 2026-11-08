@@ -534,7 +534,7 @@ class PreparedDsa:
         variant = self.dsac.variant(batch, q)
         if variant is None or self.overlaps[batch, q] in LATE:
             return
-        spread = q > 1 and batch in self.dsac.spread and sms > GB300_SMS
+        spread = False  # (the core's rows <= 16: one merge CTA per (head, 16 rows))
         box = self.box
         args = self.heads, self.dcp, batch, uv, self.pitches[batch], self.device.index
         value = compile_core_value(*args, sms, q, box.q_heads, box.cap, spread)
