@@ -36,6 +36,7 @@ from vllm.v1.kv_cache_interface import (
     SinkFullAttentionSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
+    get_mamba_prefill_checkpoint_col,
     get_mamba_prefill_checkpoint_position,
     get_mamba_prefill_snapshot_col,
     is_mamba_prefill_checkpoint_valid,
@@ -1579,6 +1580,9 @@ class MambaManager(SingleTypeKVCacheManager):
             # checkpoint position and reserved block index for the current
             # allocation.
             self._checkpoints: dict[str, tuple[int, int]] = {}
+            # Requests whose checkpoint reuses the column of the mid-block state
+            # they resume from, so it needs no block of its own.
+            self._checkpoints_in_initial_state_block: set[str] = set()
             # Requests that registered their own last-prompt-boundary partial
             # tail (producers). A later CoW hands its private copy to the
             # connector; a request that finishes first hands off this table
@@ -1893,7 +1897,9 @@ class MambaManager(SingleTypeKVCacheManager):
         prefill_end: int,
     ) -> bool:
         assert isinstance(self.kv_cache_spec, MambaSpec)
-        checkpoint_idx = cdiv(query_end, self.block_size) - 2
+        checkpoint_idx = get_mamba_prefill_checkpoint_col(
+            query_start, query_end, self.block_size
+        )
         blocks = self.req_to_blocks[request_id]
         return (
             self.has_prefill_checkpoint_blocks
@@ -1908,7 +1914,10 @@ class MambaManager(SingleTypeKVCacheManager):
             )
             and checkpoint_idx >= 0
             and (
-                checkpoint_idx >= len(blocks)
+                # The resumed mid-block state's own column (see
+                # `get_mamba_prefill_checkpoint_col`).
+                query_start % self.block_size != 0
+                or checkpoint_idx >= len(blocks)
                 or blocks[checkpoint_idx].is_null
                 or (
                     request_id in self._allocated_block_reqs
@@ -2009,25 +2018,56 @@ class MambaManager(SingleTypeKVCacheManager):
                 )
                 if snapshot_col < 0:
                     checkpoint_position = 0
-            checkpoint_block = int(checkpoint_position > 0 and snapshot_col < 0)
+            # A mid-block start exports into the column it resumes from (a
+            # first-chunk snapshot instead goes below the initial state).
+            in_initial_state_block = (
+                checkpoint_position > 0
+                and snapshot_col < 0
+                and total_computed_tokens % self.block_size != 0
+            )
+            checkpoint_block = int(
+                checkpoint_position > 0
+                and snapshot_col < 0
+                and not in_initial_state_block
+            )
             if not apply_admission_cap:
                 self._chunk_starts[request_id] = total_computed_tokens
+                self._checkpoints_in_initial_state_block.discard(request_id)
                 if checkpoint_position > 0:
                     checkpoint_idx = (
                         snapshot_col
                         if snapshot_col >= 0
-                        else cdiv(num_tokens, self.block_size) - 2
+                        else get_mamba_prefill_checkpoint_col(
+                            total_computed_tokens, num_tokens, self.block_size
+                        )
                     )
                     self._checkpoints[request_id] = (
                         checkpoint_position,
                         checkpoint_idx,
                     )
+                    if in_initial_state_block:
+                        self._checkpoints_in_initial_state_block.add(request_id)
                 else:
                     self._checkpoints.pop(request_id, None)
                 if snapshot_col >= 0:
                     self._snapshot_cols[request_id] = snapshot_col
                 else:
                     self._snapshot_cols.pop(request_id, None)
+                # A prefill chunk (decode rows are shorter than a hash block)
+                # that leaves the block it resumes in mid-block must export its
+                # checkpoint there; `_stop_mamba_chunk_at_block_end` ensures it.
+                assert not (
+                    self.has_prefill_checkpoint_blocks
+                    and total_computed_tokens % self.block_size != 0
+                    and checkpoint_position == 0
+                    and num_tokens - total_computed_tokens
+                    > self.block_pool.hash_block_size
+                    and num_tokens > cdiv(total_computed_tokens, self.block_size)
+                    * self.block_size
+                ), (
+                    f"Mamba chunk [{total_computed_tokens}, {num_tokens}) of "
+                    f"{request_id} leaves its block without a checkpoint"
+                )
             if num_new_blocks > 0:
                 blocks_allocated = request_id in self._allocated_block_reqs
                 physical_block_cap = 1 + int(has_partial_hit) + checkpoint_block
@@ -2069,10 +2109,12 @@ class MambaManager(SingleTypeKVCacheManager):
                 cdiv(num_tokens, self.block_size) + self.num_speculative_blocks
             )
             # A first-chunk snapshot block is placed separately, below the
-            # initial state (_place_snapshot_block).
+            # initial state (_place_snapshot_block); a mid-block checkpoint
+            # reuses the resumed block's own column.
             checkpoint_block = int(
                 request_id in self._checkpoints
                 and request_id not in self._snapshot_cols
+                and request_id not in self._checkpoints_in_initial_state_block
             )
             partial_hit = self._partial_hit_reqs.get(request_id)
             has_partial_hit = partial_hit is not None
@@ -2084,6 +2126,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 and not checkpoint_block
             ):
                 self._allocated_block_reqs.add(request_id)
+                self._assert_checkpoint_block_private(request_id)
                 return self._place_snapshot_block(request_id, [])
             else:
                 prev_block_len = len(req_blocks)
@@ -2175,7 +2218,23 @@ class MambaManager(SingleTypeKVCacheManager):
                 self._partial_hit_reqs.pop(request_id, None)
                 self._partial_hit_tokens.pop(request_id, None)
                 returned_blocks.extend(new_blocks)
+                self._assert_checkpoint_block_private(request_id)
                 return self._place_snapshot_block(request_id, returned_blocks)
+
+    def _assert_checkpoint_block_private(self, request_id: str) -> None:
+        """The export overwrites a mid-block checkpoint's column after the CoW
+        copies run, so no cache entry may point at it (a pending copy may still
+        hold an extra reference)."""
+        if request_id in self._checkpoints_in_initial_state_block:
+            block = self.req_to_blocks[request_id][self._checkpoints[request_id][1]]
+            assert (
+                not block.is_null
+                and block.block_hash is None
+                and block.block_id not in self.block_pool.cached_block_hashes_by_block
+            ), (
+                f"Mamba checkpoint block {block.block_id} of {request_id} is "
+                f"null or cached as state@{block.block_hash_num_tokens}"
+            )
 
     def _relocate_speculative_block(
         self, req_blocks: list[KVCacheBlock], block_idx: int
@@ -2214,6 +2273,7 @@ class MambaManager(SingleTypeKVCacheManager):
             self._chunk_starts.pop(request_id, None)
             self._snapshot_cols.pop(request_id, None)
             self._first_chunk_reqs.discard(request_id)
+            self._checkpoints_in_initial_state_block.discard(request_id)
             self._producer_partial_tail_reqs.pop(request_id, None)
             # An offer is only guaranteed to hold committed bytes until the end
             # of the pass that made it. This request's blocks are going back to
