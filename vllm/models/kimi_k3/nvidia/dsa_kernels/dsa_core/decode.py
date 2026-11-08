@@ -85,7 +85,8 @@ ROWS = 16
 # (/ 9.15), x256 15.01 / 10.04, x384 15.10 / 14.60, x600 16.87 / 18.58, x2048 18.88 /
 # 45.10; M16 bal 15.63 / 9.73 (/ 9.42), x256 15.50 / 10.13, x384 15.65 / 14.62, x600
 # 16.59 / 18.60, x2048 18.60 / 49.45 (envs lane exact4): -4.8 / -5.9 us per layer on
-# balanced rows.
+# balanced rows. 16-rank step (TP16 = DCP16, AgentX, new drafter, #63 merge; us per
+# step, same node, core / trtllm-gen): q8 B1 M8 4913 / 5133, B2 M16 6705 / 6899.
 VARIANT = {8: "1-16:2x16s2"}
 # The served core's q mailbox poll deadline (s; ``build``): a peer stalled on the host
 # (cold JIT, GC, a P/D handshake) then only delays this rank, as with DcpExchange's
