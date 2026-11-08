@@ -90,6 +90,7 @@ constexpr int kTieBuckets = 64;  // global-id buckets per tie radix round
 constexpr int kTieWords = kTieBuckets / 2;
 constexpr int kTieStore = kG;    // tied local positions kept in SMEM per row
 constexpr int kMaxK = 2048;      // top-k sizes the packed WRITE scan supports
+constexpr int kDbgRow = 64;      // per-row dbg stamps (dbg_rows)
 
 __device__ __forceinline__ void spin_fail(int* err, int code) {
   atomicCAS(err, 0, code);
@@ -213,6 +214,7 @@ struct TopkParams {
   int small_ctx;
   int* stats;      // optional per-path row counters (see kSt*)
   long long* dbg;  // optional phase timestamps (row 0, leader, tid 0)
+  int dbg_rows;     // dbg holds kDbgRow stamps for every row (profiling)
   int pdl;  // launched with programmatic stream serialization: release dependents early
   int* epoch;
   int* ticket;
@@ -417,8 +419,13 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
   const int cs = (int)cl.num_blocks();
   const int tid = threadIdx.x;
   const bool leader = crank == 0;
-#define DBG(i) \
-  if (p.dbg && row == 0 && crank == 0 && threadIdx.x == 0) p.dbg[i] = now_ns();
+#define DBG(i)                                                                \
+  if (p.dbg && (p.dbg_rows || row == 0) && crank == 0 && threadIdx.x == 0)   \
+    p.dbg[(p.dbg_rows ? (int64_t)row * kDbgRow : 0) + (i)] = now_ns();
+  // per-row-only stamps (profiling: dbg_rows): 32 R8 start, 33 R8 polled, 34 R4 start,
+  // 35 R4 polled, 36 refine start, 37 refine polled, 38 1R refine-bin round polled
+#define DBGX(i) \
+  if (p.dbg && p.dbg_rows && crank == 0 && threadIdx.x == 0) p.dbg[(int64_t)row * kDbgRow + (i)] = now_ns();
   // dbg (32 stamps, row 0, leader, thread 0): 0 row start, 1 pass A, 2 S1, 4 1R send
   // start, 16 estimate, 17 window counts, 19 1R header, 20 1R sent, 5 1R polled, 21 1R
   // accumulated, 22 1R resolved, 23 1R done, 6 quota, 7 WRITE, 12 bitmap, 24 offsets,
@@ -906,6 +913,7 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
           }
           poll_ranks<(kMaxW * 132 + kThreads * 4 - 1) / (kThreads * 4)>(
               p, rx, rbox + wpad + 128, slot, 132, 132, tag, tid, 3);
+          DBGX(38);
           // Re-arm the refine messages once every CTA of the cluster has its copy.
           // Unlike the window and bin words, a rank writes them only on the rows that
           // take this round, so a word left from this use would carry the current
@@ -1412,10 +1420,12 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
           __syncthreads();
           if (tid < 128) msg[tid] = pack2(tag, G[2 * tid], G[2 * tid + 1]);
           __syncthreads();
+          DBGX(32);
           const int64_t rowoff = p.off_r8 + ((int64_t)(par * p.cap + row) * p.W) * 128;
           send_msg(p, msg, 128, rowoff, tid);
           poll_msg<2>(p, rx, rowoff, p.W * 128, tag, tid, 6);
           __syncthreads();
+          DBGX(33);
           if (tid < 256) {
             uint32_t a = 0;
             for (int s2 = 0; s2 < p.W; ++s2) {
@@ -1448,10 +1458,12 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
                              ((int)c1 * 16 < fk) ? hist[c1] : 0u);
           }
           __syncthreads();
+          DBGX(34);
           const int64_t rowoff = p.off_r4 + ((int64_t)(par * p.cap + row) * p.W) * 8;
           send_msg(p, msg, 8, rowoff, tid);
           poll_msg<1>(p, rx, rowoff, p.W * 8, tag, tid, 7);
           __syncthreads();
+          DBGX(35);
           if (tid == 0) {
             uint32_t g[16];
             for (int k = 0; k < 16; ++k) g[k] = 0;
@@ -1494,6 +1506,7 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
             msg[2 * tid + 1] = pack2(tag, fine[4 * tid + 2], fine[4 * tid + 3]);
           }
           __syncthreads();
+          DBGX(36);
           const int64_t rowoff = p.off_f1 + ((int64_t)(par * p.cap + row) * p.W) * kFineWords;
           if (tid < 2) {
             int j = tid * 4;
@@ -1506,6 +1519,7 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
           }
           poll_msg<1>(p, rx, rowoff, p.W * kFineWords, tag, tid, 3);
           __syncthreads();
+          DBGX(37);
           if (tid == 0) {
             uint32_t g[16];
             for (int k = 0; k < 16; ++k) g[k] = 0;
@@ -2411,6 +2425,8 @@ void topk_merge(torch::Tensor logits, torch::Tensor local_len, torch::Tensor glo
   p.stats = stats.has_value() ? stats->data_ptr<int>() : nullptr;
   TORCH_CHECK(!dbg.has_value() || dbg->numel() >= 32, "topk_merge: dbg needs 32 int64");
   p.dbg = dbg.has_value() ? reinterpret_cast<long long*>(dbg->data_ptr<int64_t>()) : nullptr;
+  // profiling: one kDbgRow-stamp record per row when dbg is large enough
+  p.dbg_rows = dbg.has_value() && dbg->numel() >= (int64_t)kDbgRow * logits.size(0) ? 1 : 0;
   p.epoch = epoch.data_ptr<int>();
   p.ticket = ticket.data_ptr<int>();
   p.err = err.data_ptr<int>();
