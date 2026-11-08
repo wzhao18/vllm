@@ -261,35 +261,76 @@ TWIN_LONG_SPLIT = {
     (60, 96): (2, 8, 64),  # B15 <- B16 (64)
 }
 TWIN_FOLD_SPLITS = {key: rule[0] for key, rule in TWIN_LONG_SPLIT.items()}
+# The drafter's own measured rules, by its DCP size (the role: the same rows see 4x
+# longer local contexts at DCP4 than at DCP16): (rows, gathered heads, q, DCP size)
+# -> LONG_SPLIT rule, read before the twin's (``split_rule``, ``verify_fold_splits``,
+# ``draft``). The 96-head causal drafter's DL3 fold rows (B3-B21): the twin rule's
+# short split, then (launched, 64 tiles, quantum); a long request of T tiles spreads
+# over min(launched, ceil(T / quantum)) splits (``long_per``, on the GPU from its
+# own length: graph-safe). Draft split-rule sweep (bench_draft_tune.py: the eff
+# sweep with one candidate rule on every DL3 9-63 / DL7 14-63 row; 4 x VR200, 96
+# gathered heads, AgentX lengths, local = total / DCP), us per drafter attention
+# layer at the agentic lengths, candidates (launched, quantum) (8, 0) (the twin's),
+# (16, 0), (16, 32), (16, 64), (32, 32), (32, 64), no rule:
+#   DCP4 (C512's TP4 = DCP4): (16, 64) best at 12-57 rows: 75.0 -> 62.9 (12), 128.2
+#     -> 102.7 (24), 155.1 -> 120.9 (30), 170.0 -> 137.0 (33), 195.0 -> 166.9 (39),
+#     215.3 -> 171.8 (48), 238.3 -> 207.7 (54) vs the twin's (8, 0); (16, 32) at 9
+#     / 18 rows (66.1 -> 50.0, 108.2 -> 91.0); 63 rows within 2% of (8, 0); the
+#     others 20-90% slower.
+#   DCP16 (TP16): the twin's (8, 0) best or within 5% at every row but DL3 21 / 24
+#     ((16, 32): 45.4 -> 41.5, 48.2 -> 45.5).
+# Rows the sweep did not run (DL3 27 / 36 / 45 / 51 / 60) take their neighbours'
+# (16, 64). NQ-TUNE: DL7 at DCP4 (C512 runs DL3).
+DRAFT_LONG_SPLIT: dict = {}
 
 
-def split_key(rows, heads, q=None):
-    """(the (rows, heads) key of the split tables, twin): ``rows`` of a packed core at
-    ``q`` read their PACKED_TWIN verify's rows (B x twin q); any other shape (no q,
-    q = 1 rows, the target's verify q) its own rows."""
-    twin = PACKED_TWIN.get((heads, q)) if q else None
+def _draft_rule(rows, q, launched, quantum):
+    """The 96-head drafter's measured rule at ``rows``: its twin rule's short split
+    and long tiles, ``launched`` splits past them, ``quantum``."""
+    key = (rows // q * PACKED_TWIN[96, q], 96)
+    twin = TWIN_LONG_SPLIT.get(key) or LONG_SPLIT[key]
+    return twin[0], launched, twin[2], quantum
+
+
+DRAFT_LONG_SPLIT.update(
+    {(r, 96, 3, 4): _draft_rule(r, 3, 16, 32 if r in (9, 18) else 64)
+     for r in range(9, 64, 3)}
+)  # fmt: skip
+DRAFT_LONG_SPLIT.update({(r, 96, 3, 16): _draft_rule(r, 3, 16, 32) for r in (21, 24)})
+
+
+def split_key(rows, heads, q=None, draft=0):
+    """(the (rows, heads) key of the split tables, twin): the drafter's (``draft``: its
+    DCP size, 0 for the target) ``rows`` of a packed core at ``q`` read their
+    PACKED_TWIN verify's rows (B x twin q); any other shape (no q, q = 1 rows, every
+    target verify, whatever its q) its own rows."""
+    twin = PACKED_TWIN.get((heads, q)) if q and draft else None
     if twin is None or rows % q:
         return (rows, heads), False
     return (rows // q * twin, heads), True
 
 
-def split_rule(rows, heads, q=None):
-    """The LONG_SPLIT rule ``rows`` of ``heads`` gathered heads at ``q`` read (through
-    their packed twin, ``split_key``), or None."""
-    key, twin = split_key(rows, heads, q)
+def split_rule(rows, heads, q=None, draft=0):
+    """The LONG_SPLIT rule ``rows`` of ``heads`` gathered heads at ``q`` read: the
+    drafter's (``draft``: its DCP size) own measured rule (DRAFT_LONG_SPLIT), else
+    through its packed twin (``split_key``), or None."""
+    if draft and (rows, heads, q, draft) in DRAFT_LONG_SPLIT:
+        return DRAFT_LONG_SPLIT[rows, heads, q, draft]
+    key, twin = split_key(rows, heads, q, draft)
     if twin and key in TWIN_LONG_SPLIT:
         return TWIN_LONG_SPLIT[key]
     return LONG_SPLIT.get(key)
 
 
-def long_split(rows, heads, split, sms, q=None):
+def long_split(rows, heads, split, sms, q=None, draft=0):
     """(short split, long tiles, quantum) of LONG_SPLIT's length-keyed partition when
     ``rows`` of ``heads`` gathered heads (``q`` rows per request: ``split_key``'s
-    packed twin) launch its long split on a Rubin-class device (``sms``), else None.
+    packed twin; ``draft``: the drafter's DCP size, ``split_rule``) launch its long
+    split on a Rubin-class device (``sms``), else None.
     An optional 4th LONG_SPLIT field, the quantum q (tiles): a long request of T tiles
     runs min(launched, ceil(T / q)) equal splits instead of all launched ones
     (``long_per``); 0: every launched split."""
-    rule = split_rule(rows, heads, q)
+    rule = split_rule(rows, heads, q, draft)
     if sms <= GB300_SMS or rule is None or split != rule[1]:
         return None
     return rule[0], rule[2], rule[3] if len(rule) > 3 else 0
@@ -800,13 +841,16 @@ class DcpValue:
         spread=False,
         prefetch_uv=True,
         resident_sms=0,
+        draft=0,
     ):
         """``q_chunks``: 16 B chunks per q mailbox head row (36 FP8, 72 BF16);
         ``q_heads``: q mailbox rows per token (default DCP * H); ``lse_scale``: to
         base 2 (LOG2E for a natural-log LSE). Rubin's ``lean`` re-arm assumes the
         FP8 layout: the DSA (BF16) mailbox compiles with ``sms`` <= GB300_SMS.
         ``resident_sms``: the device's real SM count (0: ``sms``), which bounds the
-        co-resident grid (``tile_stride``) when ``sms`` is the capped GB300 schedule."""
+        co-resident grid (``tile_stride``) when ``sms`` is the capped GB300 schedule.
+        ``draft``: the drafter's DCP size (``split_rule``: its own rules and twins;
+        0: the target)."""
         self.heads, self.size, self.batch = heads, size, batch
         self.q_chunks, self.q_heads = q_chunks, q_heads or size * heads
         self.lse_scale = lse_scale
@@ -838,7 +882,9 @@ class DcpValue:
         self.lse_split = lse_split and fold > 0
         # LONG_SPLIT: the core partitions each request by its own length (valid_splits)
         self.long = (
-            long_split(batch, size * heads, fold, sms, q) if self.lse_split else None
+            long_split(batch, size * heads, fold, sms, q, draft)
+            if self.lse_split
+            else None
         )
         self.out_scale = out_scale
         # Rubin DcpCore (mla.core): the pushers LSE-merge its ``fold`` split partials
@@ -1787,6 +1833,7 @@ def compile_value(
     lse_base_e=True,
     spread=False,
     resident_sms=0,
+    draft=0,
 ):
     """DcpValue of one batch (``q`` rows per request); ``uv``: the (shape, stride,
     dtype) of W_UV, ``pitch``: the projected rows' (the gate follows the 2112 query /
@@ -1801,7 +1848,8 @@ def compile_value(
     decode returns them (``lse_base_e``: natural-log, else base 2), on the GB300
     schedule. ``resident_sms``: the wave the merging CTAs' grid must fit in
     (``DcpValue.tile_stride``; 0: ``sms``, the caller's real SM count; the tests
-    give a smaller one to compare row-tile strides)."""
+    give a smaller one to compare row-tile strides). ``draft``: the drafter's DCP
+    size (its split rules, ``split_rule``; 0: the target)."""
     error = uv_layout_error(uv)  # (the fragment loads assume it: no GPU-side check)
     if error:
         raise ValueError(f"Kimi K3 MLA DcpValue: {error}")
@@ -1856,6 +1904,7 @@ def compile_value(
         lpc=lpc,
         spread=spread,
         resident_sms=resident,
+        draft=draft,
         **dsa,
     )
     if value.polled_out:
@@ -2220,15 +2269,18 @@ VERIFY_FOLD_SPLITS.update({(r, 96): 2 for r in range(68, 125, 8)})
 VERIFY_FOLD_SPLITS[28, 64] = 2
 
 
-def verify_fold_splits(batch, q, heads, max_seq, device):
+def verify_fold_splits(batch, q, heads, max_seq, device, draft=0):
     """Tokenspeed's split count of the packed verify core (``stock_decode``'s rule at
-    q > 1; ``VERIFY_FOLD_SPLITS`` on Rubin) and its packed rows (tiles x 128). A
-    PACKED_TWIN shape (``split_key``) takes its twin verify's decision: tokenspeed's
-    rule and the tables at the twin rows (the same requests and tiles)."""
+    q > 1; ``VERIFY_FOLD_SPLITS`` on Rubin) and its packed rows (tiles x 128). The
+    drafter's (``draft``: its DCP size) PACKED_TWIN shape (``split_key``) takes its
+    twin verify's decision: tokenspeed's rule and the tables at the twin rows (the
+    same requests and tiles), or its own measured rule (DRAFT_LONG_SPLIT: launched at
+    the rule's short split, its long split where some request can pass the long
+    tiles)."""
     from tokenspeed_mla import mla_decode as md
 
     tiles = md.compute_q_tile_layout(heads, q, 128)[1]
-    key, twin = split_key(batch, heads, q)
+    key, twin = split_key(batch, heads, q, draft)
     rows, shape_q = batch, q
     if twin:
         rows, shape_q = key[0], PACKED_TWIN[heads, q]
@@ -2242,7 +2294,9 @@ def verify_fold_splits(batch, q, heads, max_seq, device):
         split = VERIFY_FOLD_SPLITS.get(key, split)
         if twin:
             split = TWIN_FOLD_SPLITS.get(key, split)
-        rule = split_rule(batch, heads, q)
+        rule = split_rule(batch, heads, q, draft)
+        if draft and (batch, heads, q, draft) in DRAFT_LONG_SPLIT:
+            split = rule[0]
         if rule and split == rule[0] and max_seq > 128 * rule[2]:
             split = rule[1]  # (only where some request can pass the long tiles)
     return split, tiles * 128

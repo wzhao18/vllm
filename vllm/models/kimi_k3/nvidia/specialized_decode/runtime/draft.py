@@ -111,9 +111,11 @@ CONTEXT_OVERLAP = {16: "1-63:1"}
 # per rank, publish-only MlaQuery and polled cores at every row; the drafter's only
 # specialized piece there (the rest stays the stock module: sp_attention
 # SP_DRAFTER_TABLES), strict (a served row runs it or the load is refused). Draft eff
-# sweep (bench_draft_eff.py, 4 x VR200, AgentX lengths, DCP4 local = total / 4), us
-# per drafter attention layer, stock DCP path -> DraftDcp with the packed-twin splits
-# (mla.dcp PACKED_TWIN): see the commit message tables.
+# sweep (bench_draft_eff.py, 4 x VR200, 24 heads per rank, AgentX lengths, DCP4 local
+# = total / 4), us per drafter attention layer, DL3, stock DCP path -> DraftDcp (its
+# DCP4 split rules, mla.dcp DRAFT_LONG_SPLIT / PACKED_TWIN): C512's 120 / 144 / 168
+# rows 1020 / 1095 / 1227 -> 356 / 395 / 469 (its uniform-length bound 340 / 430 /
+# 458); the former stock-core rows 54 / 57 / 63 ~840 -> ~210 / 215 / 190.
 FAST_DCP = {4: "1-:1", 8: "1-64:1", 16: "1-:1"}
 # Context rows whose context step runs the sharded context projection + Lamport row
 # gather and the fused context-KV epilogue (cutedsl.draft.context; above 64 rows the

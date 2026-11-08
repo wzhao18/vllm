@@ -284,15 +284,16 @@ def uncovered_rows(rows, steps, cap, size, sms):
     return dropped
 
 
-def draft_fold_splits(rows, steps, heads, max_seq, device):
+def draft_fold_splits(rows, steps, heads, max_seq, device, size):
     """(split, packed rows) of the drafter's packed (q = ``steps``) tokenspeed core for
-    ``rows`` drafter rows of ``heads`` gathered heads: mla.dcp.verify_fold_splits
-    (its Rubin tables VERIFY_FOLD_SPLITS / LONG_SPLIT) at DRAFT_RULE_HEADS (keys
-    measured on the 64-head drafter) and at a PACKED_TWIN shape (96 heads, q 3 / 7:
-    the twin verify's decision), else its tokenspeed rule alone. The cores and
-    DcpValue read LONG_SPLIT (through the same twin) with the split this returns."""
+    ``rows`` drafter rows of ``heads`` gathered heads over DCP ``size``:
+    mla.dcp.verify_fold_splits (its Rubin tables VERIFY_FOLD_SPLITS / LONG_SPLIT) at
+    DRAFT_RULE_HEADS (keys measured on the 64-head drafter) and at a PACKED_TWIN shape
+    (96 heads, q 3 / 7: the drafter's own DRAFT_LONG_SPLIT rule at its DCP size, else
+    the twin verify's decision), else its tokenspeed rule alone. The cores and DcpValue
+    read the same rule (``draft=size``) with the split this returns."""
     if heads in DRAFT_RULE_HEADS or (heads, steps) in PACKED_TWIN:
-        return verify_fold_splits(rows, steps, heads, max_seq, device)
+        return verify_fold_splits(rows, steps, heads, max_seq, device, draft=size)
     from tokenspeed_mla import mla_decode as md
 
     # (verify_fold_splits without its Rubin tables)
@@ -473,7 +474,7 @@ class DraftDcp:
                 self.unfolded[r] = "not in FAST_CORE"
                 continue
             split, packed = draft_fold_splits(
-                r, steps, heads, self.max_seq, self.device
+                r, steps, heads, self.max_seq, self.device, size
             )
             if split <= 1:
                 self.valid.pop(r, None)
@@ -484,6 +485,7 @@ class DraftDcp:
             self.fold_values[r] = compile_value(
                 self.heads, size, r, self.cap, uv, width, index, sms, steps, split,
                 lse_split=True, out_scale=self.scales[1], valid_box=r in self.valid,
+                draft=size,
             )  # fmt: skip
             split_workspace_ts(self.device, packed, r // steps, split)
         # Rows mode (ROWS_MODE): rows -> (padded rows, splits, DcpValue, row metadata
@@ -535,7 +537,7 @@ class DraftDcp:
         for r in self.wide:
             reqs, cap = r // steps, self.wide_box.cap
             split, packed = draft_fold_splits(
-                r, steps, heads, self.max_seq, self.device
+                r, steps, heads, self.max_seq, self.device, size
             )
             persistent = wide_persistent(reqs, packed // 128, split, sms)
             work = self.work_list(r, heads, packed // 128, split, sms)
@@ -548,7 +550,7 @@ class DraftDcp:
                 value = compile_value(
                     self.heads, size, r, cap, uv, width, index, sms, steps, fold,
                     lse_split=fold > 0, out_scale=self.scales[1] if fold else 1.0,
-                    valid_box=True, pushed=push is not None,
+                    valid_box=True, pushed=push is not None, draft=size,
                 )  # fmt: skip
             except RuntimeError as error:  # (check_residency: not co-resident)
                 if "co-resident" not in str(error):
@@ -590,7 +592,7 @@ class DraftDcp:
             if not POLLED_CORE.get(r)
             and r not in self.row_modes
             and r not in self.forks
-            and long_split(r, heads, split, sms, steps)
+            and long_split(r, heads, split, sms, steps, draft=size)
         }
         self.polled = {}
         for r in self.folds:
@@ -613,11 +615,11 @@ class DraftDcp:
         # short contexts. Such a table entry is a startup error.
         for r, split in self.folds.items():
             gathered = r not in self.polled and r not in self.row_modes
-            long = long_split(r, heads, split, sms, steps)
+            long = long_split(r, heads, split, sms, steps, draft=size)
             if gathered and r not in self.forks and long:
                 raise ValueError(
                     f"drafter rows {r} (q {steps}): LONG_SPLIT "
-                    f"{split_rule(r, heads, steps)} "
+                    f"{split_rule(r, heads, steps, draft=size)} "
                     "fires on the gathered fold core, which has no long partition: "
                     "add the rows to POLLED_CORE or drop the rule"
                 )
@@ -711,7 +713,7 @@ class DraftDcp:
     def work_list(self, rows, heads, tiles, split, sms):
         """The shared per-step work list (mla.wlist) of DRAFT_WLIST ``rows`` launched
         at their LONG_SPLIT split, or None."""
-        long = long_split(rows, heads, split, sms, self.steps)
+        long = long_split(rows, heads, split, sms, self.steps, draft=self.size)
         if rows not in DRAFT_WLIST or long is None:
             return None
         # (None past mla.wlist.fits: the long split without the list)
@@ -746,7 +748,9 @@ class DraftDcp:
             if rows in self.polled:
                 wl = rows in self.wlists
                 valid = self.valid.get(rows, 0)
-                compile_polled_q(*args, valid=valid, persistent=wl, wlist=wl)
+                compile_polled_q(
+                    *args, valid=valid, persistent=wl, wlist=wl, draft=self.size
+                )
             else:
                 compile_split_partials_q(*args)
             self.fold_cores.add((rows, page))
@@ -757,8 +761,9 @@ class DraftDcp:
                 args += (self.causal,)
                 wl = rows in self.wlists
                 compile_polled_q(
-                    *args, valid=2, persistent=persistent, push=push, wlist=wl
-                )
+                    *args, valid=2, persistent=persistent, push=push, wlist=wl,
+                    draft=self.size,
+                )  # fmt: skip
                 self.fold_cores.add(("wide", rows, page))
         for rows, (padded, split, _, _) in self.row_modes.items():
             if ("rows", rows, page) not in self.fold_cores:
@@ -964,7 +969,7 @@ class DraftLayerDcp:
             polled_partials_q(
                 query, cache, *tables, shared.scales, out, lse, split, shared.cp(),
                 shared.polled[rows][p], causal=shared.causal, valid=valid,
-                persistent=work is not None, wlist=work is not None,
+                persistent=work is not None, wlist=work is not None, draft=shared.size,
             )  # fmt: skip
         else:
             split_partials_q(
@@ -1002,7 +1007,7 @@ class DraftLayerDcp:
         polled_partials_q(
             query, cache, *meta, shared.scales, out_rows, lse, split, shared.cp(),
             tables[p], causal=shared.causal, valid=2, persistent=persistent, push=push,
-            wlist=work is not None,
+            wlist=work is not None, draft=shared.size,
         )  # fmt: skip
         if split > 1:  # DcpValue folds the split partials
             packed = shared.packed[rows]

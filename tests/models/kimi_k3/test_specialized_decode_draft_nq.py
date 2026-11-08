@@ -363,48 +363,123 @@ def test_draft_fold_splits_role(monkeypatch):
 
     called = []
     monkeypatch.setattr(
-        attention, "verify_fold_splits", lambda *a: called.append(a) or (9, 128)
+        attention,
+        "verify_fold_splits",
+        lambda *a, **k: called.append((*a, k)) or (9, 128),
     )
-    assert attention.draft_fold_splits(56, 7, 64, 1 << 16, "cpu") == (9, 128)
-    assert attention.draft_fold_splits(54, 3, 96, 1 << 16, "cpu") == (9, 128)
-    assert attention.draft_fold_splits(63, 7, 96, 1 << 16, "cpu") == (9, 128)
+    assert attention.draft_fold_splits(56, 7, 64, 1 << 16, "cpu", 16) == (9, 128)
+    assert attention.draft_fold_splits(54, 3, 96, 1 << 16, "cpu", 4) == (9, 128)
+    assert attention.draft_fold_splits(63, 7, 96, 1 << 16, "cpu", 16) == (9, 128)
+    # (the drafter's role, its DCP size: its own rules and twins)
     assert called == [
-        (56, 7, 64, 1 << 16, "cpu"),
-        (54, 3, 96, 1 << 16, "cpu"),
-        (63, 7, 96, 1 << 16, "cpu"),
+        (56, 7, 64, 1 << 16, "cpu", {"draft": 16}),
+        (54, 3, 96, 1 << 16, "cpu", {"draft": 4}),
+        (63, 7, 96, 1 << 16, "cpu", {"draft": 16}),
     ]
     assert 64 in attention.DRAFT_RULE_HEADS and 96 not in attention.DRAFT_RULE_HEADS
 
 
 def test_packed_twin_keys():
-    """A 96-head packed core at q 3 / 7 (the causal drafter) reads its twin verify's
-    rows (the same requests at q 4 / 8: the same 3 / 6 query tiles per request); the
-    target's own verify q and other head counts read their own rows."""
+    """The drafter's (``draft``) 96-head packed core at q 3 / 7 (the causal drafter)
+    reads its twin verify's rows (the same requests at q 4 / 8: the same 3 / 6 query
+    tiles per request); every target verify (whatever its q) and other head counts
+    read their own rows."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.mla import dcp
 
     for (heads, q), twin in dcp.PACKED_TWIN.items():
         assert -(-heads * q // 128) == -(-heads * twin // 128)
-    assert dcp.split_key(54, 96, 3) == ((72, 96), True)
-    assert dcp.split_key(63, 96, 7) == ((72, 96), True)
-    assert dcp.split_key(480, 96, 3) == ((640, 96), True)
+    assert dcp.split_key(54, 96, 3, 16) == ((72, 96), True)
+    assert dcp.split_key(63, 96, 7, 4) == ((72, 96), True)
+    assert dcp.split_key(480, 96, 3, 16) == ((640, 96), True)
     for rows, heads, q in ((72, 96, 4), (72, 96, 8), (63, 64, 7), (54, 64, 3),
                            (8, 96, 1), (54, 96, None), (55, 96, 3)):  # fmt: skip
-        assert dcp.split_key(rows, heads, q) == ((rows, heads), False)
-    # The target's verify rows (q 4 / 8) read LONG_SPLIT as before.
+        assert dcp.split_key(rows, heads, q, 16) == ((rows, heads), False)
+    # The target's verify rows read LONG_SPLIT at their own rows at every q, the
+    # drafter's q 3 / 7 included (a K3 target at 2 / 6 speculative tokens): no twin,
+    # no drafter rule (e.g. q 3 B4, 12 rows, has none: its gathered verify core stays
+    # a valid startup).
     for (rows, heads), rule in dict.items(dcp.LONG_SPLIT):
-        for q in (4, 8):
+        for q in (3, 4, 7, 8):
             if heads == 96 and rows % q == 0:
                 assert dcp.split_rule(rows, heads, q) == rule
-    # The drafter's seam rows (DL3 B18 / B19 / B21, DL7 B9): the twin's (2, 8, 64).
+    assert dcp.split_rule(12, 96, 3) is None
+    assert dcp.long_split(12, 96, 8, 200, 3) is None
+    # The drafter's seam rows (DL3 B18 / B19 / B21, DL7 B9) at DCP16: the twin's
+    # (2, 8, 64); at DCP4 (DL3) its own (2, 16, 64, 64).
     sms = 200
     for rows, q in ((54, 3), (57, 3), (63, 3), (63, 7)):
-        assert dcp.long_split(rows, 96, 8, sms, q) == (2, 64, 0), rows
-        assert dcp.long_split(rows, 96, 2, sms, q) is None  # (the short split)
-        assert dcp.long_split(rows, 96, 8, 148, q) is None  # (GB300: no rule)
+        assert dcp.long_split(rows, 96, 8, sms, q, 16) == (2, 64, 0), rows
+        assert dcp.long_split(rows, 96, 2, sms, q, 16) is None  # (the short split)
+        assert dcp.long_split(rows, 96, 8, 148, q, 16) is None  # (GB300: no rule)
+    for rows in (54, 57, 63):
+        assert dcp.long_split(rows, 96, 16, sms, 3, 4) == (2, 64, 64), rows
+        assert dcp.long_split(rows, 96, 8, sms, 3, 4) is None
     # Odd DL3 batches below B17 (no q4 rule): the next batch's rule, twin only.
-    assert dcp.split_rule(9, 96, 3) == (4, 8, 64)
-    assert dcp.split_rule(12, 96, 4) is None
+    assert dcp.split_rule(9, 96, 3, 16) == (4, 8, 64)
+    assert dcp.split_rule(12, 96, 4, 16) is None
     assert dcp.TWIN_FOLD_SPLITS[12, 96] == 4
+
+
+def test_draft_rules_by_dcp_size():
+    """The 96-head drafter's measured rules (mla.dcp DRAFT_LONG_SPLIT) by its DCP size:
+    DL3 B3-B21 at DCP4 launch 16 splits (quantum 64 tiles; 32 at 9 / 18 rows), DL3
+    21 / 24 rows at DCP16 (16, 32); each keeps its twin rule's short split and long
+    tiles; every other drafter row and DCP size reads the twin's, the target none."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.mla import dcp
+
+    for (rows, heads, q, size), rule in dcp.DRAFT_LONG_SPLIT.items():
+        key = (rows // q * dcp.PACKED_TWIN[heads, q], heads)
+        twin = dcp.TWIN_LONG_SPLIT.get(key) or dcp.LONG_SPLIT[key]
+        assert rule[0] == twin[0] and rule[2] == twin[2]
+        assert rule[1] == 16 and dcp.split_rule(rows, heads, q, size) == rule
+        assert dcp.split_rule(rows, heads, q) == dcp.LONG_SPLIT.get((rows, heads))
+    assert {r for r, _, q, size in dcp.DRAFT_LONG_SPLIT if size == 4} == set(
+        range(9, 64, 3)
+    )
+    assert dcp.split_rule(9, 96, 3, 4) == (4, 16, 64, 32)
+    assert dcp.split_rule(24, 96, 3, 4) == (4, 16, 64, 64)  # (twin B8: (32, 96))
+    assert dcp.split_rule(24, 96, 3, 16) == (4, 16, 64, 32)
+    assert dcp.split_rule(27, 96, 3, 16) == dcp.split_rule(27, 96, 3, 8) == (3, 8, 64)
+    assert dcp.split_rule(66, 96, 3, 4) == dcp.split_rule(66, 96, 3, 16)
+
+
+@pytest.mark.parametrize("strict, gather_q, raises", [
+    (False, True, False), (False, False, True), (True, True, True),
+])  # fmt: skip
+def test_merge_refuses_the_stock_core(monkeypatch, strict, gather_q, raises):
+    """NQ-NOFALLBACK: a drafter row with no specialized core reaches ``merge``'s stock
+    tokenspeed forward_mqa only outside a strict captured graph and where MlaQuery
+    gathers the q rows it would read (24 heads per rank: never); otherwise it is
+    refused there."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.draft import (
+        attention,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.shapes import Uncovered
+
+    class Stock(Exception):
+        pass
+
+    def forward_mqa(*args):
+        raise Stock
+
+    monkeypatch.setattr(attention, "stream", lambda device: None)
+    monkeypatch.setattr(attention, "full_capture", lambda: True)
+    shared = SimpleNamespace(
+        box=SimpleNamespace(q=torch.zeros((2, 64, 4, 576), dtype=torch.uint8)),
+        device="cpu", wide_cores={}, strict=strict, gather_q=gather_q, steps=3,
+        core_of=lambda rows: "stock tokenspeed forward_mqa + DcpValue",
+    )  # fmt: skip
+    layer = object.__new__(attention.DraftLayerDcp)
+    layer.shared, layer.parity = shared, 0
+    layer.join_context = lambda: None
+    layer.fold_core = lambda *args: False
+    module = SimpleNamespace(
+        impl=SimpleNamespace(forward_mqa=forward_mqa),
+        _attn_read_kv_cache=lambda: None,
+    )
+    out = torch.empty((54, 512))
+    with pytest.raises(Uncovered if raises else Stock):
+        layer.merge(module, SimpleNamespace(decode=None), 54, out)
 
 
 @pytest.mark.parametrize("steps, top", [(3, 192), (7, 96)])
@@ -420,7 +495,8 @@ def test_packed_twin_rules_cover_drafter_rows(steps, top):
         rows = reqs * steps
         if attention.ROWS_MODE.get(rows):
             continue
-        assert dcp.split_rule(rows, 96, steps) is not None, rows
+        for size in (4, 16):
+            assert dcp.split_rule(rows, 96, steps, draft=size) is not None, rows
 
 
 def test_dcp_value_uv_layout():
@@ -774,6 +850,97 @@ def _stock_dcp(q, cache, metadata, causal, w_uv, world, rank, interleave, group)
     return result.view(rows, per * 128)
 
 
+def _exact_dcp(q, cache, metadata, w_uv, world, rank, interleave, group):
+    """The drafter's causal DCP attention in FP32 from the FP8 q / KV bytes, with no
+    intermediate rounding: per rank the local softmax over its tokens (global
+    positions, interleave) for every gathered head, the ranks' (max, sum, rows)
+    merged exactly, then this rank's heads through W_UV. [rows, H*128] FP32: the
+    reference both the stock and the specialized path round away from."""
+    import torch.distributed as dist
+
+    decode = metadata.decode
+    reqs = decode.seq_lens.shape[0]
+    rows, heads = q.shape[0], q.shape[1]
+    steps = rows // reqs
+    f32 = torch.float32
+    qf = q.view(torch.float8_e4m3fn).to(f32)
+    flat = cache.view(torch.float8_e4m3fn).view(-1, 576)
+    scale = SOFTMAX_SCALE * Q_SCALE * K_SCALE
+    o = torch.zeros((rows, heads, 512), dtype=f32, device=q.device)
+    m = torch.full((rows, heads), float("-inf"), dtype=f32, device=q.device)
+    total = torch.zeros((rows, heads), dtype=f32, device=q.device)
+    lens = decode.seq_lens.tolist()
+    totals = decode.dcp_tot_seq_lens.tolist()
+    table = decode.block_table.long()
+    for r in range(reqs):
+        n = lens[r]
+        if not n:
+            continue
+        i = torch.arange(n, device=q.device)
+        g = (i // interleave) * interleave * world + rank * interleave + i % interleave
+        kv = flat[table[r, i // PAGE] * PAGE + i % PAGE].to(f32)
+        part = slice(r * steps, (r + 1) * steps)
+        pos = torch.arange(totals[r] - steps, totals[r], device=q.device)
+        logits = torch.einsum("shd,nd->shn", qf[part], kv) * scale
+        logits = logits.masked_fill((g[None, :] > pos[:, None])[:, None, :], -torch.inf)
+        top = logits.amax(-1)
+        weights = torch.exp(logits - top.clamp_min(-1e30)[..., None])
+        o[part] = torch.einsum("shn,nd->shd", weights, kv[:, :512]) * K_SCALE
+        m[part], total[part] = top, weights.sum(-1)
+    gathered = []
+    for t in (o, m, total):
+        buf = torch.empty((world, *t.shape), dtype=t.dtype, device=t.device)
+        dist.all_gather_into_tensor(buf, t.contiguous(), group=group)
+        gathered.append(buf)
+    os, ms, sums = gathered  # (os: each rank's unnormalized sum of weighted rows)
+    top = ms.amax(0)
+    weights = torch.exp(ms - top.clamp_min(-1e30)[None])
+    weights = torch.where(sums > 0, weights, torch.zeros_like(weights))
+    merged = (os * weights[..., None]).sum(0) / (weights * sums).sum(0)[..., None]
+    per = heads // world
+    mine = merged[:, rank * per : (rank + 1) * per]
+    result = torch.einsum("rhl,hlv->rhv", mine, w_uv.float())
+    return result.reshape(rows, per * 128)
+
+
+def _q_ideal(layer, qkv, staged, positions=None):
+    """This rank's q rows [rows, heads, 576] as FP8 bytes, in FP64 from the
+    in-projection rows: RMSNorm, Q_B, W_UK (nope), GPT-J RoPE at ``positions`` (pe);
+    ``staged``: rounded to BF16 after each stage as stock's kernels store them (the
+    rope rotates the BF16 Q_B output), else only at the FP8 store."""
+    rows, heads = qkv.shape[0], layer.num_local_heads
+    f64 = torch.float64
+    q_c = qkv[:, :1536].to(f64)
+    variance = (q_c * q_c).mean(-1, keepdim=True)
+    q_c = q_c * torch.rsqrt(variance + layer.rms_norm_eps)
+    q_c = q_c * layer.q_a_layernorm.weight.to(f64)
+    if staged:
+        q_c = q_c.bfloat16().to(f64)
+    q = q_c @ layer.q_b_proj.weight.to(f64).T
+    if staged:
+        q = q.bfloat16().to(f64)
+    q = q.view(rows, heads, 192)
+    nope = torch.einsum("rhp,hpl->rhl", q[..., :128], layer.W_UK_T.to(f64))
+    if staged:
+        nope = nope.bfloat16().to(f64)
+    cos_sin = layer.rotary_emb.cos_sin_cache[positions].to(f64)[:, None]
+    cos, sin = cos_sin[..., :32], cos_sin[..., 32:]
+    x, y = q[..., 128::2], q[..., 129::2]
+    pe = torch.stack((x * cos - y * sin, y * cos + x * sin), dim=-1).flatten(-2)
+    out = torch.cat((nope, pe), dim=-1) * layer._q_scale_inv.to(f64)
+    return out.float().to(torch.float8_e4m3fn).view(torch.uint8)
+
+
+def _fp8_ulps(a, b):
+    """Largest |a - b| of two E4M3 byte tensors in units of the FP8 spacing at the
+    larger magnitude (subnormal spacing 2^-9 at the bottom)."""
+    x, y = (t.view(torch.float8_e4m3fn).float() for t in (a, b))
+    big = torch.maximum(x.abs(), y.abs())
+    exponent = torch.floor(torch.log2(big.clamp_min(2.0**-6)))
+    spacing = torch.exp2(exponent - 3)
+    return float(((x - y).abs() / spacing).max()) if x.numel() else 0.0
+
+
 class _DraftAttention:
     """What DraftDcp reads of a drafter MLA layer (no RoPE: MlaQuery is not built,
     the check fills the q mailboxes itself); ``impl.forward_mqa``: the stock
@@ -1105,7 +1272,8 @@ def _query96_main(rank, world, device, group, interleave=1):
         print(f"rank {rank}: no drafter MlaQuery tile at 96 / {world} heads")
         return 0
     failures, seen, worst = 0, {}, 0.0
-    flips = {"q": (0.0, 0), "KV": (0.0, 0)}
+    accuracy: dict = {}  # (steps, rows) -> largest (specialized, stock) error
+    q_ulps = [0.0, 0.0]
     cos_sin = _rope_cache(1 << 16, device)
     for steps, rows_list in ((3, [3, 6, 9, 24, 54, 63, 96, 120, 168]),
                              (7, [7, 14, 63, 112])):  # fmt: skip
@@ -1173,31 +1341,57 @@ def _query96_main(rank, world, device, group, interleave=1):
                 dcp.merge(layer, metadata, rows, out, rows_mode=True)
                 torch.accelerator.synchronize(device)
                 torch.distributed.barrier()
-                # Stage by stage: (1) the FP8 q bytes and (2) the inserted KV bytes
-                # against stock (one FP8 code apart at most: the BF16 accumulation
-                # order of Q_B / W_UK / RoPE moves a value across an FP8 rounding
-                # boundary; a wrong head, row, position or scale moves many codes),
-                # (3) the attention against stock tokenspeed + LSE combine + W_UV on
-                # those same q and KV bytes (dcp96's check). The end-to-end error
-                # against stock (FP8 code flips amplified by the softmax) is reported.
+                # Stage by stage. (1) The inserted KV bytes: bitwise stock's. (2) The
+                # FP8 q bytes: each within stock's own distance (+1 FP8 ulp: the BF16
+                # accumulation order of Q_B / W_UK) of the FP64 query rounded to BF16
+                # where stock's kernels store it; a wrong head, row, position or scale
+                # moves many bytes far. (3) The attention on those q / KV bytes: no
+                # further from the exact FP32 attention (no intermediate rounding)
+                # than stock's tokenspeed + LSE combine + W_UV on the same bytes, per
+                # row over the calls and ranks. Both round P to FP8 in the core, ~6%
+                # of the row's largest value from exact where a few new draft tokens
+                # dominate the softmax, so they are not within _close of each other.
                 live = slots[slots >= 0]
                 ours, ref = (
                     c.view(torch.uint8)[live // PAGE, live % PAGE]
                     for c in (fast_cache, stock_cache)
                 )
-                for what, a, b in (("q", fast_q, q), ("KV", ours, ref)):
-                    codes, flipped = _fp8_code_distance(a, b)
-                    flips[what] = max(flips[what], (flipped, codes))
-                    if codes > 1 or flipped > FP8_FLIP_LIMIT:
-                        print(f"rank {rank}: {label} call {step}: {what} FP8 bytes "
-                              f"{codes} codes apart, {flipped:.3%} differ")  # fmt: skip
+                if not torch.equal(ours, ref):
+                    print(
+                        f"rank {rank}: {label} call {step}: KV bytes differ from "
+                        f"stock's insert ({_fp8_ulps(ours, ref):.2f} FP8 ulps)"
+                    )
+                    failures += 1
+                mine = slice(rank * heads, (rank + 1) * heads)
+                ideal = _q_ideal(layer, qkv, True, positions)
+                for part in (slice(0, 512), slice(512, 576)):  # (nope, rope)
+                    spec_ulps = _fp8_ulps(fast_q[:, mine, part], ideal[..., part])
+                    stock_ulps = _fp8_ulps(q[:, mine, part], ideal[..., part])
+                    q_ulps[0] = max(q_ulps[0], spec_ulps)
+                    q_ulps[1] = max(q_ulps[1], stock_ulps)
+                    if spec_ulps > max(stock_ulps, 1.0) + 1.0:
+                        print(f"rank {rank}: {label} call {step}: q columns {part}: "
+                              f"{spec_ulps:.2f} FP8 ulps from the staged FP64 query "
+                              f"(stock {stock_ulps:.2f})")  # fmt: skip
                         failures += 1
+                flipped = (fast_q != q).float().mean().item()
+                if flipped > FP8_FLIP_LIMIT:
+                    print(
+                        f"rank {rank}: {label} call {step}: {flipped:.3%} of the q "
+                        "bytes differ from stock's"
+                    )
+                    failures += 1
                 same = _stock_dcp(fast_q, fast_cache, metadata, True, layer.W_UV,
                                   world, rank, interleave, group)  # fmt: skip
-                if not _close(out[:rows], same):
-                    error = (out[:rows].float() - same.float()).abs().max()
-                    print(f"rank {rank}: {label} call {step}: max error "
-                          f"{error.item():.4g} on its own q / KV")  # fmt: skip
+                exact = _exact_dcp(fast_q, fast_cache, metadata, layer.W_UV, world,
+                                   rank, interleave, group)  # fmt: skip
+                scale = exact.abs().amax(-1, keepdim=True)
+                errors = [((x[:rows].float() - exact).abs() / scale).max().item()
+                          for x in (out, same)]  # fmt: skip
+                row = accuracy.setdefault((steps, rows), [0.0, 0.0])
+                row[0], row[1] = max(row[0], errors[0]), max(row[1], errors[1])
+                if not torch.isfinite(out[:rows]).all():
+                    print(f"rank {rank}: {label} call {step}: non-finite rows")
                     failures += 1
                 if not _close(out[:rows], expected):
                     error = (out[:rows].float() - expected.float()).abs().max()
@@ -1211,30 +1405,40 @@ def _query96_main(rank, world, device, group, interleave=1):
                     failures += 1
         del layers, shared
         torch.cuda.empty_cache()
+    for (steps, rows), errors in sorted(accuracy.items()):
+        both = torch.tensor(errors, device=device)
+        torch.distributed.all_reduce(both, op=torch.distributed.ReduceOp.MAX)
+        ours, stock = both.tolist()
+        if rank == 0:
+            print(
+                f"DL{steps} 96h query rows {rows}: vs exact FP32, largest error per "
+                f"row max: specialized {ours:.4f}, stock {stock:.4f}"
+            )
+        if ours > ACCURACY_SLACK * stock + 2e-3:
+            print(
+                f"rank {rank}: DL{steps} 96h query rows {rows}: specialized "
+                f"{ours:.4f} vs exact, stock {stock:.4f}"
+            )
+            failures += 1
     if rank == 0:
         print(f"DraftDcp 96h query paths: {sorted(seen.items())}")
-    print(f"rank {rank}: largest end-to-end error past _close vs stock: {worst:.4g}; "
-          f"FP8 bytes off stock (fraction, codes): {flips}")
+    print(
+        f"rank {rank}: q FP8 ulps from the staged FP64 query: specialized "
+        f"{q_ulps[0]:.2f}, stock {q_ulps[1]:.2f}; largest end-to-end error past "
+        f"_close vs stock: {worst:.4g}"
+    )
     return failures
 
 
-# FP8 bytes of the fused query / KV insert allowed to differ from stock by one code
-# (BF16 accumulation order); more, or any two codes apart, is a math error.
+# The specialized drafter attention's largest error against the exact FP32 attention
+# (per row, over calls and ranks) may exceed stock's by this factor: the same FP8
+# roundings (P in the core, the BF16 partial rows) in another order land elsewhere.
+ACCURACY_SLACK = 1.25
+
+
+# Fraction of the fused query's FP8 bytes allowed to differ from stock's (measured
+# at most 0.11%: order-of-accumulation flips at FP8 rounding boundaries).
 FP8_FLIP_LIMIT = 0.02
-
-
-def _fp8_code_distance(a, b):
-    """(largest code distance, fraction differing) of two E4M3 byte tensors, codes
-    ordered by value (+0 and -0 the same)."""
-    def ordered(x):
-        x = x.view(torch.uint8).to(torch.int32)
-        magnitude = x & 0x7F
-        return torch.where(x >= 0x80, -magnitude, magnitude)
-
-    distance = (ordered(a) - ordered(b)).abs()
-    if not distance.numel():
-        return 0, 0.0
-    return int(distance.max()), (distance > 0).float().mean().item()
 
 
 def _query_mailbox(shared, rows, parity):
