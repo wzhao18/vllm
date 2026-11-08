@@ -224,9 +224,12 @@ struct TopkParams {
   int* err;
   int segmax;
   long long spin_ns;  // cross-rank spin deadline (<= 0: none)
-  // Pre-pass (pre = 1; see topk_pp_*_kernel): the row's coarse histogram, centred
-  // window counts and candidate list were computed by two balanced kernels.
+  // Pre-pass (pre = 1; see topk_pp_*_kernel): the coarse histogram, centred window
+  // counts and candidate list of every row with more than pp_min local keys were
+  // computed by the balanced pre-pass kernels; shorter rows run their own passes.
   int pre;
+  int pp_min;
+  int ring_stages;  // key-streaming ring chunks (segmax == 0)
   uint32_t* pp_hist;  // [cap, kCoarseBins] (zero between uses)
   uint32_t* pp_win;   // [cap, 512] window counts (zero between uses)
   int* pp_lo;         // [cap] window start (written by the last pp_hist tile of a row)
@@ -236,6 +239,12 @@ struct TopkParams {
   uint32_t* pp_pos;   // [cap, kPPList] candidate local positions
   uint16_t* pp_key;   // [cap, kPPList] candidate keys
 };
+
+// A row whose passes come from the pre-pass: more than pp_min local keys (and not
+// selected whole). The pre-pass kernels and the merge kernel use this one rule.
+__device__ __forceinline__ bool pp_row(const TopkParams& p, int L, int Gl) {
+  return p.pre && Gl > p.K && L > p.pp_min;
+}
 
 enum Act : int {
   kActNone = 0, kActFine = 1, kActWrite = 3, kActTieHist = 4,
@@ -731,7 +740,7 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
   for (int b = tid; b < kCoarseBins; b += kThreads) hist[b] = 0;
   for (int b = tid; b < 512; b += kThreads) fine2[b] = 0;
   if (tid == 0) { s_wlo = 0; s_seq = 0; s_fkey_c1r = 0; }
-  Ring ring{reinterpret_cast<uint4*>(keys), s_rbar, 0u, p.pre ? 1u : (uint32_t)kRingStages};
+  Ring ring{reinterpret_cast<uint4*>(keys), s_rbar, 0u, (uint32_t)p.ring_stages};
   if (tid == 0 && p.segmax == 0) {
     for (int i = 0; i < kRingStages; ++i) mbar_init(&s_rbar[i], 1);
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
@@ -761,6 +770,8 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
   const uint16_t* lseg = p.logits + (int64_t)row * p.lstride + s0;
   int* orow = p.out + (int64_t)row * p.ostride;
   const int req = p.req_of_row != nullptr ? p.req_of_row[row] : row / p.next_n;
+  // this row's passes came from the pre-pass (pp_row: the pre-pass kernels' rule)
+  const bool rpre = pp_row(p, L, Gl);
 
   auto slot_of = [&](int pos) -> int {
     if (p.block_table == nullptr) return pos;
@@ -797,7 +808,7 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
     if (leader) STAT(kStRows);
     // ---- pass A: keys into shared memory, local coarse histogram (zeroed in the
     // prologue / at the previous row's end)
-    if (p.pre) {
+    if (rpre) {
       // pre-pass: the leader takes the row's histogram, window counts' bound and
       // candidate count, and re-zeroes them for the next use (the other CTAs keep
       // zero histograms: the leader's holds the row's sums, as after S1)
@@ -846,7 +857,7 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
       });
     }
     DBG(1);
-    if (!leader && !p.pre) {
+    if (!leader && !rpre) {
       // add this CTA's non-zero bins into the leader's histogram (DSMEM reductions;
       // the leader's own atomics commute with them)
       __syncthreads();
@@ -856,7 +867,7 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
     }
     cl.sync();  // S1: the leader's hist holds the cluster sums
     DBG(2);
-    if (p.pre && !leader && tid == 0) {  // the row's candidate count / bound
+    if (rpre && !leader && tid == 0) {  // the row's candidate count / bound
       s_pp_cn = *cl.map_shared_rank(&s_pp_cn, 0);
       s_pp_thr = *cl.map_shared_rank(&s_pp_thr, 0);
     }
@@ -877,7 +888,7 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
         c1r_center(hist, q, s_v8, s_x8, &s_b8c, &s_top8, &s_a8c, &s_cq, warp_sums, tid);
         const int nb = p.nw1 / 16;
         c1r_lo = min(max(0, s_cq - nb / 2), kCoarseBins - nb) * 16;
-        if (p.pre && L > 0 && tid == 0 && c1r_lo != s_pp_lo) spin_fail(p.err, 21);
+        if (rpre && L > 0 && tid == 0 && c1r_lo != s_pp_lo) spin_fail(p.err, 21);
         const uint32_t word = ((uint32_t)(row + 1) << 17) | (uint32_t)c1r_lo;
         if (tid > 0 && tid < cs) {
           uint32_t* f = cl.map_shared_rank(&s_wlo, tid);
@@ -926,7 +937,7 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
       // leader's SM), and the leader sums them.
       const int nn = p.nw1;
       const bool parts = cs <= kMaxW * 260 / 512;
-      if (p.pre) {
+      if (rpre) {
         // pre-pass: the row's window counts (the leader's message; zeroed for reuse)
         if (leader) {
           uint32_t* wg = p.pp_win + (int64_t)row * 512;
@@ -941,7 +952,7 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
         count_window(keys, smem_keys, ring, lseg, n, tid, c1r_lo, nn, fine, nullptr);
       }
       DBG(28);
-      if (!leader && !p.pre) {
+      if (!leader && !rpre) {
         __syncthreads();
         if (parts) {
           uint4* dst = reinterpret_cast<uint4*>(cl.map_shared_rank(rx, 0) + crank * 512);
@@ -962,7 +973,7 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
         const int words = 2 + nn / 2, wpad = (words + 3) & ~3;
         for (int j = tid; j < nn / 2; j += kThreads) {
           uint32_t a = fine[2 * j], b = fine[2 * j + 1];
-          if (p.pre) {
+          if (rpre) {
           } else if (parts) {
             for (int c = 1; c < cs; ++c) {
               a += rx[c * 512 + 2 * j];
@@ -1128,7 +1139,7 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
           for (int b = tid; b < 256; b += kThreads) fine[b] = 0;
           for (int b = tid; b < kG; b += kThreads) G[b] = 0;  // for the refine resolve
           __syncthreads();
-          if (p.pre && (L == 0 || (s_pp_cn <= kPPList && rlo >= s_pp_thr))) {
+          if (rpre && (L == 0 || (s_pp_cn <= kPPList && rlo >= s_pp_thr))) {
             // the pre-pass candidates hold every key of the bin
             const uint32_t* cpos = p.pp_pos + (int64_t)row * kPPList;
             const uint16_t* ckey = p.pp_key + (int64_t)row * kPPList;
@@ -1234,7 +1245,7 @@ __global__ void __launch_bounds__(kThreads, 4) topk_merge_kernel(TopkParams p) {
         uint32_t* bme = rx;
         for (int i = tid; i < nw; i += kThreads) { bmg[i] = 0; bme[i] = 0; }
         __syncthreads();
-        if (p.pre && (L == 0 || (s_pp_cn <= kPPList && tau >= (uint32_t)s_pp_thr))) {
+        if (rpre && (L == 0 || (s_pp_cn <= kPPList && tau >= (uint32_t)s_pp_thr))) {
           const uint32_t* cpos = p.pp_pos + (int64_t)row * kPPList;
           const uint16_t* ckey = p.pp_key + (int64_t)row * kPPList;
           for (int c = tid; c < s_pp_cn; c += kThreads) {
@@ -2453,7 +2464,7 @@ __device__ __forceinline__ void pp_sched(const TopkParams& p, int* s_pre, uint32
     int c = 0;
     if (r < r1) {
       const int L = p.local_len[r], Gl = p.global_len[r];
-      c = Gl > p.K ? (L + kPPTile - 1) / kPPTile : 0;
+      c = pp_row(p, L, Gl) ? (L + kPPTile - 1) / kPPTile : 0;
     }
     cnt[i] = c;
     sum += (uint32_t)c;
@@ -2543,7 +2554,7 @@ __global__ void __launch_bounds__(kThreads) topk_pp_window_kernel(TopkParams p) 
   __shared__ int s_b8c, s_top8, s_cq;
   const int row = blockIdx.x, tid = threadIdx.x;
   const int L = p.local_len[row], Gl = p.global_len[row];
-  if (Gl <= p.K || L == 0) return;
+  if (!pp_row(p, L, Gl)) return;
   const uint4* hg = reinterpret_cast<const uint4*>(p.pp_hist + (int64_t)row * kCoarseBins);
   for (int b = tid; b < kCoarseBins / 4; b += kThreads) reinterpret_cast<uint4*>(h)[b] = hg[b];
   __syncthreads();
@@ -2562,13 +2573,15 @@ __global__ void __launch_bounds__(kThreads) topk_pp_window_kernel(TopkParams p) 
 // coalesced stores; a tile with more than kPPTileCand marks the row's list overflowed.
 constexpr int kPPTileCand = 2048;
 __global__ void __launch_bounds__(kThreads) topk_pp_win_kernel(TopkParams p) {
-  __shared__ uint32_t cnt[512];
+  // window counts per warp (no cross-warp contention on the dense window bins)
+  __shared__ uint32_t cntw[kWarps][512];
   __shared__ uint32_t warp_sums[kWarps + 1];
   __shared__ int s_pre[kPPMaxRows + 1];
   __shared__ uint32_t s_cpos[kPPTileCand];
   __shared__ uint16_t s_ckey[kPPTileCand];
   __shared__ int s_cn, s_base;
   const int tid = threadIdx.x, lane = tid & 31, nn = p.nw1;
+  uint32_t* cnt = cntw[tid >> 5];
   PPSched ps;
   pp_sched(p, s_pre, warp_sums, tid, ps);
   int it = blockIdx.x;
@@ -2581,7 +2594,7 @@ __global__ void __launch_bounds__(kThreads) topk_pp_win_kernel(TopkParams p) {
   for (; it < ps.total; it += gridDim.x) {
     const int crow = row, ct0 = t0, clo = lo, cthr = thr;
     const int e = min(p.local_len[crow], ct0 + kPPTile);
-    for (int b = tid; b < nn; b += kThreads) cnt[b] = 0;
+    for (int b = tid; b < kWarps * 512; b += kThreads) (&cntw[0][0])[b] = 0;
     if (tid == 0) s_cn = 0;
     __syncthreads();
     uint64_t cms = 0;  // candidate masks, 8 bits per group
@@ -2641,8 +2654,12 @@ __global__ void __launch_bounds__(kThreads) topk_pp_win_kernel(TopkParams p) {
     if (tid == 0 && nc)  // an overflowing tile pushes the row's count past kPPList
       s_base = atomicAdd(&p.pp_cn[crow], nc > kPPTileCand ? nc + kPPList : nc);
     uint32_t* wg = p.pp_win + (int64_t)crow * 512;
-    for (int b = tid; b < nn; b += kThreads)
-      if (cnt[b]) atomicAdd(&wg[b], cnt[b]);
+    for (int b = tid; b < nn; b += kThreads) {
+      uint32_t v = 0;
+#pragma unroll
+      for (int w = 0; w < kWarps; ++w) v += cntw[w][b];
+      if (v) atomicAdd(&wg[b], v);
+    }
     __syncthreads();
     if (nc) {
       const int base = s_base, m = min(min(nc, kPPTileCand), kPPList - base);
@@ -2843,8 +2860,8 @@ static size_t topk_dyn_smem(int64_t segmax, bool pre) {
 // (cudaOccupancyMaxActiveClusters; cached per shape). A launch walks rows beyond it in
 // turns, so the decode policy (``DcpxDecode.launch_params``) keeps a step's rows within
 // it: cluster packing per GPC makes it smaller than SMs x CTAs per SM / cluster.
-// ``pre``: a pre-pass launch (segmax == 0 and every row on the centred 1R path, as the
-// decode wiring launches every segmax == 0 call), whose ring is one chunk.
+// ``pre``: a pre-pass launch (segmax == 0, a ``pp`` buffer and every row on the centred
+// 1R path; ops.topk_prepass decides), whose ring is one chunk.
 static int resident_clusters_for(int64_t cluster, int64_t segmax, bool pre) {
   TORCH_CHECK(cluster >= 1 && cluster <= 16 && segmax >= 0);
   static std::map<std::pair<int64_t, int64_t>, int> resident;
@@ -2876,8 +2893,8 @@ static int resident_clusters_for(int64_t cluster, int64_t segmax, bool pre) {
   resident[key] = nres;
   return nres;
 }
-int64_t topk_resident_clusters(int64_t cluster, int64_t segmax) {
-  return resident_clusters_for(cluster, segmax, segmax == 0);
+int64_t topk_resident_clusters(int64_t cluster, int64_t segmax, bool pre) {
+  return resident_clusters_for(cluster, segmax, pre && segmax == 0);
 }
 
 void topk_merge(torch::Tensor logits, torch::Tensor local_len, torch::Tensor global_len,
@@ -2891,7 +2908,7 @@ void topk_merge(torch::Tensor logits, torch::Tensor local_len, torch::Tensor glo
                 int64_t small_ctx, torch::Tensor epoch,
                 torch::Tensor ticket, torch::Tensor err, int64_t cluster, int64_t segmax,
                 c10::optional<torch::Tensor> dbg, c10::optional<torch::Tensor> stats,
-                c10::optional<torch::Tensor> pp) {
+                c10::optional<torch::Tensor> pp, int64_t pp_min) {
   TORCH_CHECK(logits.dtype() == torch::kBFloat16 && logits.stride(1) == 1);
   TORCH_CHECK(W <= kMaxW && cluster >= 1 && cluster <= 16);
   TORCH_CHECK(K >= 1 && K <= kMaxK, "topk_merge: K must be in [1, 2048]");
@@ -2938,6 +2955,13 @@ void topk_merge(torch::Tensor logits, torch::Tensor local_len, torch::Tensor glo
   // Pre-pass: launches whose rows all take the centred 1R path with keys in global
   // memory (the large batches) get their key passes from the two balanced kernels.
   p.pre = pp.has_value() && segmax == 0 && w1c && nw1 > 0 && T <= cap1 ? 1 : 0;
+  TORCH_CHECK(pp_min >= 0 && pp_min < (1LL << 30));
+  p.pp_min = (int)pp_min;
+  // The key-streaming ring: every chunk for launches that stream keys (no pre-pass, or
+  // rows of at most pp_min keys when the deeper ring keeps the rows co-resident), one
+  // chunk when only the pre-pass's rare fallback passes stream (4 CTAs per SM).
+  const bool deep_ring = !p.pre || (p.pp_min > 0 && T <= resident_clusters_for(cluster, segmax, false));
+  p.ring_stages = deep_ring ? kRingStages : 1;
   if (p.pre) {
     TORCH_CHECK(pp->dtype() == torch::kInt32 && pp->is_contiguous() &&
                     pp->numel() >= topk_pp_words(cap),
@@ -2964,7 +2988,7 @@ void topk_merge(torch::Tensor logits, torch::Tensor local_len, torch::Tensor glo
   cudaLaunchConfig_t cfg = {};
   cfg.gridDim = dim3((unsigned)cluster, 1, 1);
   cfg.blockDim = dim3(kThreads, 1, 1);
-  cfg.dynamicSmemBytes = topk_dyn_smem(segmax, p.pre);
+  cfg.dynamicSmemBytes = topk_dyn_smem(segmax, !deep_ring);
   cfg.stream = c10::cuda::getCurrentCUDAStream();
   cudaLaunchAttribute attr[2];
   attr[0].id = cudaLaunchAttributeClusterDimension;
@@ -2986,7 +3010,7 @@ void topk_merge(torch::Tensor logits, torch::Tensor local_len, torch::Tensor glo
   auto kern = topk_merge_kernel<16>;
   // Persistent rows: at most the co-resident cluster count (identical on every
   // rank, so all ranks walk the rows in the same order).
-  const int nres = resident_clusters_for(cluster, segmax, p.pre);
+  const int nres = resident_clusters_for(cluster, segmax, !deep_ring);
   cfg.gridDim = dim3((unsigned)cluster, (unsigned)std::min(T, nres), 1);
   cfg.numAttrs = s_pdl ? 2 : 1;
   p.pdl = s_pdl ? 1 : 0;

@@ -435,7 +435,9 @@ def check_layouts(ex: DcpExchange, case: str, B: int, q: int, ctx: int, seed: in
     bitwise identical outputs and counts: keys staged in SMEM (segmax > 0) and keys
     streamed from global memory (segmax = 0) at 1, 2, 4 and 16 CTAs per row, both
     from 16-byte aligned rows and from a view whose rows start at odd 2-byte offsets
-    (unaligned heads and tails), with 1 and 2 rounds."""
+    (unaligned heads and tails), with 1 and 2 rounds; one-round streamed launches also
+    with the pre-pass for every row and for the longer rows only (the others run their
+    own passes in the same launch)."""
     W, rank, dev = ex.W, ex.rank, ex.device
     T = B * q
     gen = torch.Generator(device=dev)
@@ -459,13 +461,16 @@ def check_layouts(ex: DcpExchange, case: str, B: int, q: int, ctx: int, seed: in
     odd.copy_(aligned)
     assert odd.stride(0) % 8 != 0 and odd.data_ptr() % 16 != 0
     outs = []
-    paths = [("staged", None, 1 << 20)]
+    paths = [("staged", None, 1 << 20, False, 0)]
+    Lmid = int(Lr.float().median())
     for cl in (1, 2, 4, 16):
         if -(-Lmax // cl) <= 131072:
-            paths.append((f"stream c{cl}", cl, 0))
-    for name, cl, segmax in paths:
+            paths.append((f"stream c{cl}", cl, 0, False, 0))
+            paths.append((f"stream c{cl} pre-pass", cl, 0, True, 0))
+            paths.append((f"stream c{cl} pre-pass > {Lmid}", cl, 0, True, Lmid))
+    for name, cl, segmax, pre, pp_min in paths:
         for lname, lg in (("aligned", aligned), ("odd", odd)):
-            for one_round in (True, False):
+            for one_round in (True, False) if not pre else (True,):
                 out = torch.full((T, K), -7, dtype=torch.int32, device=dev)
                 cnt = torch.full((T,), -7, dtype=torch.int32, device=dev)
                 c_ = cl
@@ -477,7 +482,7 @@ def check_layouts(ex: DcpExchange, case: str, B: int, q: int, ctx: int, seed: in
                     sm = -(-(-(-Lmax // c_)) // 8) * 8
                 ex.topk_merge(lg, Lr, G, out, cnt, max_local_len=Lmax, cluster=c_, segmax=sm,
                               one_round=one_round, window="center", tie_order="rank",
-                              interleave=1)
+                              interleave=1, prepass=pre, prepass_min=pp_min)
                 outs.append((f"{name} {lname} {'1R' if one_round else '2R'}", out, cnt))
     torch.cuda.synchronize()
     ex.check()

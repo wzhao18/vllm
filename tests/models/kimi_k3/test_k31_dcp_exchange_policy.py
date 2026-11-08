@@ -84,7 +84,7 @@ def _launcher(resident: dict[int, int], fit_wave: bool = True):
     """A ``DcpxDecode`` stand-in for ``launch_params``: 212 SMs (VR200), the kernel's
     co-resident clusters per cluster size from ``resident``."""
     ns = SimpleNamespace(
-        ex=SimpleNamespace(resident_clusters=lambda c, segmax: resident[c]),
+        ex=SimpleNamespace(resident_clusters=lambda c, segmax, pre: resident[c]),
         sms=212,
         smem=228 * 1024,
         segmax_override=-1,
@@ -159,7 +159,7 @@ def test_topk_cluster_dcp16_one_wave(rows, expected):
     ran 72-128 rows in two turns (W16, 39-42 us per layer against 23-26 us at the
     clusters that fit one wave)."""
     ns = SimpleNamespace(
-        ex=SimpleNamespace(resident_clusters=lambda c, segmax: GR100[c, segmax]),
+        ex=SimpleNamespace(resident_clusters=lambda c, segmax, pre: GR100[c, segmax]),
         sms=212,
         smem=228 * 1024,
         segmax_override=-1,
@@ -167,3 +167,19 @@ def test_topk_cluster_dcp16_one_wave(rows, expected):
     )
     ns._segmax = lambda r, c, ml: decode.DcpxDecode._segmax(ns, r, c, ml)
     assert decode.DcpxDecode.launch_params(ns, rows, 1 << 16) == expected
+
+
+def test_topk_prepass_policy():
+    """The top-k pre-pass: launches with keys in global memory whose CTAs would stream
+    more than 64K keys each (DCP4 at 1M: 2 CTAs x 131072 keys) take it; DCP16 at 1M
+    (65536 keys, one CTA) and staged launches run their own passes. Every row takes it
+    while the rows fit one persistent turn, else rows above 32K keys per CTA only."""
+    from vllm.models.kimi_k3.nvidia.dsa_kernels.dcp_exchange import ops
+
+    assert ops.topk_prepass(2, 0, LOCAL_1M_DCP4)
+    assert ops.topk_prepass(1, 0, 1 << 17)  # DCP8 at 1M
+    assert not ops.topk_prepass(1, 0, 1 << 16)  # DCP16 at 1M
+    assert not ops.topk_prepass(2, 32768, LOCAL_1M_DCP4)
+    assert ops.topk_prepass_min(2, 256, 424) == 0
+    assert ops.topk_prepass_min(2, 512, 424) == 2 * 32768
+    assert ops.topk_prepass_min(1, 1024, 848) == 32768

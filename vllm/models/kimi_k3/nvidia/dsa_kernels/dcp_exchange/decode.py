@@ -461,6 +461,8 @@ class DcpxDecode:
         between 160 and 192 rows (cluster 4: fewer co-resident clusters than rows).
         So the cluster halves until the rows fit, down to the smallest cluster whose
         CTA segment fits the WRITE bitmap (``topk_merge``)."""
+        from .ops import topk_prepass
+
         cluster = 1  # as DcpExchange.topk_merge: CTAs per row by batch
         while cluster < 8 and rows * cluster * 2 <= 800:
             cluster *= 2
@@ -470,7 +472,9 @@ class DcpxDecode:
         cluster = max(cluster, floor)
         segmax = self._segmax(rows, cluster, max_local)
         if self.fit_wave:
-            while cluster > floor and rows > self.ex.resident_clusters(cluster, segmax):
+            while cluster > floor and rows > self.ex.resident_clusters(
+                cluster, segmax, topk_prepass(cluster, segmax, max_local)
+            ):
                 cluster //= 2
                 segmax = self._segmax(rows, cluster, max_local)
         return cluster, segmax
