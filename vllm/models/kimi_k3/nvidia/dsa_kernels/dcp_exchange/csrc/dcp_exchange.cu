@@ -2429,13 +2429,12 @@ void topk_merge(torch::Tensor logits, torch::Tensor local_len, torch::Tensor glo
   attr[0].val.clusterDim.x = (unsigned)cluster;
   attr[0].val.clusterDim.y = 1;
   attr[0].val.clusterDim.z = 1;
-  // Programmatic dependent launch (the kernel waits on griddepcontrol before any
-  // global access; it releases its dependents after its row loop) for calls of at
-  // most K31_DCPX_PDL rows (default 16; 0: never). With the release at kernel
-  // entry (since removed) the 16-rank step hung at 64 rows (B8 q8, trtllm-gen)
-  // even without this launch attribute; the cause is open, so larger calls keep
-  // the stream-serialized launch until a hang regression at every batch passes.
-  static const int s_pdl_rows = getenv("K31_DCPX_PDL") ? atoi(getenv("K31_DCPX_PDL")) : 16;
+  // Programmatic dependent launch: never (stream-serialized launches). The decode's
+  // DSA sparse core polls its q tiles before its PDL wait, so the kernel before it
+  // must not release it early; a PDL top-k measured neutral (16-rank B1 step, PDL at
+  // <= 16 rows vs never: 2 us per 9 layers). With the release at kernel entry (since
+  // removed) the 16-rank step hung at 64 rows (B8 q8, trtllm-gen).
+  constexpr int s_pdl_rows = 0;
   const bool s_pdl = T <= s_pdl_rows;
   attr[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attr[1].val.programmaticStreamSerializationAllowed = 1;

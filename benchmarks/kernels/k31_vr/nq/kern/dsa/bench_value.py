@@ -449,7 +449,7 @@ class ValueBench:
         if rows <= CAP and not self.args.no_pushed:
             from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core import decode
 
-            spread_on = bool(decode.rows_table(decode.SPREAD.replace(";", ",")).get(rows))
+            spread_on = rows in decode.SPREAD
             for spread in sorted({spread_on} | ({False, True} if rows in (8, 16) else set())):
                 name = "pushed_spread" if spread else "pushed"
                 self.measure(rec, case, q, rows, name, "part",

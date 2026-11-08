@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The DCP value stage of a Kimi K3.1 DSA layer, as served ("prod") and with #108's
-"proj" partials (VLLM_K31_DSA_PARTIALS), for bench_dcp_exchange.py --paths value.
+"proj" partials (r1.auto_partials), for bench_dcp_exchange.py --paths value.
 
 Per (B requests, q) bucket of T = B * q rows, one DCP16 rank's 6 heads of 96
 gathered (FlashInfer's 128-padded rows and natural-log LSEs, random; per-row valid

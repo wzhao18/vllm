@@ -4,12 +4,14 @@
 
 One kernel per DSA layer from the gathered q mailbox (polled) and this rank's
 DcpExchange top-k slots to the head owners' DcpBox O mailboxes: sparse MLA over the
-local per-tensor FP8 KV rows for every gathered query head (FP8 QK, FP32 softmax,
-FP16 PV, FP32 accumulation), the normalized partial O (bf16) and its base-2 LSE
+local per-tensor FP8 KV rows for every gathered query head at the stock FP8 sparse
+MLA decode's precision (FP8 QK, FP32 softmax with one running max step per 128-key
+tile, E4M3 P at 448 x the running max, FP32 PV accumulation), the normalized partial
+O (bf16) and its base-2 LSE
 stored into ``DcpBox.partial`` / ``DcpBox.lse`` of each head's owner, the format
-``DcpValue(pushed=True)`` merges. ``splits`` > 1 spreads a row's local chunks over
-that many CTAs of one cluster, which LSE-merge them through distributed shared memory
-before the push.
+``DcpValue(pushed=True)`` merges. ``splits`` > 1 spreads a row's local tiles over
+that many CTAs of one cluster, which LSE-merge their BF16 partials through distributed
+shared memory before the push.
 """
 
 from __future__ import annotations
@@ -23,11 +25,8 @@ import torch
 
 _EXT = None
 LOG2E = math.log2(math.e)
-_ERR = {1: "q mailbox poll timeout", 2: "QK MMA wait timeout", 3: "PV MMA wait timeout"}
+_ERR = {1: "q mailbox poll timeout"}
 GROUP_HEADS = 32
-# Test only (fault-sensitivity of whole-step checks): K31_DSAC_FAULT=1 runs the core
-# with a quarter of its softmax scale.
-FAULT = os.environ.get("K31_DSAC_FAULT") == "1"
 
 
 def load_ext():
@@ -37,10 +36,11 @@ def load_ext():
     from torch.utils.cpp_extension import load
 
     csrc = Path(__file__).parent / "csrc"
-    srcs = [csrc / "dsa_core.cu", csrc / "dsa_core_umma.cu"]
+    srcs = [csrc / "dsa_core.cu"]
     major, minor = torch.cuda.get_device_capability()
     arch = f"{major}{minor}" + ("a" if major >= 9 else "")
     digest = hashlib.sha1(b"".join(s.read_bytes() for s in srcs)).hexdigest()[:10]
+    # (infrastructure: where torch keeps the extension build; default its cache)
     build = os.environ.get("K31_DSAC_BUILD_DIR")
     if build:
         build = str(Path(build) / digest)
@@ -52,11 +52,9 @@ def load_ext():
             "-O3",
             f"-gencode=arch=compute_{arch},code=sm_{arch}",
             "-std=c++20",
-        ]
-        + (["-Xptxas=-v"] if os.environ.get("K31_DSAC_PTXAS_V") else []),
+        ],
         extra_cflags=["-O3", "-std=c++20"],
         build_directory=build,
-        verbose=bool(os.environ.get("K31_DSAC_VERBOSE")),
     )
     return _EXT
 
@@ -105,7 +103,6 @@ class DsaCore:
         splits: int = 1,
         split_min: int = 4,
         heads_per_cta: int = 32,
-        umma: bool = False,
         lse_wide: bool = False,
         pdl: bool = True,
         dbg: torch.Tensor | None = None,
@@ -118,21 +115,12 @@ class DsaCore:
         / lse_peers; ``parity``: the DcpBox parity of this layer; ``lse_wide``: the LSE
         box in the [2, CAP, H, W] layout of DcpValue's wide / spread merge.
         ``splits`` > 1: rows of at most ``split_min`` 64-key chunks still run on one CTA
-        (no cluster merge), longer ones over the ``splits`` CTAs of their cluster."""
+        (no cluster merge), longer ones over the ``splits`` CTAs of their cluster (128-key
+        tiles s, s + splits, ..)."""
         if rows > self.cap:
             raise ValueError(f"DsaCore: {rows} rows > cap {self.cap}")
         if splits not in (1, 2, 4, 8) or splits > self.max_splits:
             raise ValueError(f"DsaCore: splits {splits} not 1, 2, 4 or 8 (<= max)")
-        if FAULT:  # test only: a wrong softmax scale (whole-step checks must see it)
-            bmm1_scale *= 0.25
-        if umma:  # tcgen05 variant: CTA (latent half, row), every gathered head
-            self.ext.run_umma(
-                q_box, sel, cnt, kv, bmm1_scale * LOG2E, bmm2_scale, part_peers,
-                lse_peers, box_cap, hpr, parity, rank, rows, int(lse_wide), self.err,
-                self.spin_ns,
-                1 if pdl else 0, dbg,
-            )  # fmt: skip
-            return
         self.ext.run(
             q_box,
             sel,

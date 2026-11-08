@@ -27,35 +27,33 @@ def _config(tp: int, dcp: int, kv_role: str | None = None):
 
 @pytest.fixture
 def sm(monkeypatch):
-    def set_cap(major: int, minor: int):
+    def set_cap(major: int, minor: int, mx: bool = True):
         platform = SimpleNamespace(
-            get_device_capability=lambda: SimpleNamespace(major=major, minor=minor)
+            get_device_capability=lambda: SimpleNamespace(major=major, minor=minor),
+            is_cuda=lambda: True,
         )
         monkeypatch.setattr(vllm.platforms, "current_platform", platform, raising=False)
+        import vllm.utils.deep_gemm as deep_gemm
+
+        monkeypatch.setattr(deep_gemm, "mqa_logits_use_mx_scales", lambda: mx)
 
     return set_cap
 
 
 @pytest.mark.parametrize(
-    "tp,dcp,cap,mode,expected",
+    "tp,dcp,cap,mx,expected",
     [
-        (16, 16, (10, 7), None, False),  # off unless set
-        (16, 16, (10, 7), "auto", True),
-        (16, 8, (10, 7), "auto", False),  # DCP < TP: auto keeps the stock path
-        (8, 4, (10, 7), "auto", False),
-        (16, 1, (10, 7), "auto", False),  # no DCP
-        (16, 16, (10, 0), "auto", False),  # auto is SM107 only
-        (16, 16, (10, 7), "0", False),
-        (16, 16, (10, 0), "1", True),  # forced
-        (16, 8, (10, 7), "1", True),  # forced: DcpxDecode rejects the layout
+        (16, 16, (10, 7), True, True),  # on by policy: no switch
+        (4, 4, (10, 7), True, True),  # C512's TP4 = DCP4 groups
+        (16, 8, (10, 7), True, False),  # DCP < TP: the stock path
+        (8, 4, (10, 7), True, False),
+        (16, 1, (10, 7), True, False),  # no DCP
+        (16, 16, (10, 0), True, False),  # measured on SM107 only
+        (16, 16, (10, 7), False, False),  # no bf16 MX-scaled logits
     ],
 )
-def test_wanted(monkeypatch, sm, tp, dcp, cap, mode, expected):
-    sm(*cap)
-    if mode is None:
-        monkeypatch.delenv(decode.ENV, raising=False)
-    else:
-        monkeypatch.setenv(decode.ENV, mode)
+def test_wanted(sm, tp, dcp, cap, mx, expected):
+    sm(*cap, mx=mx)
     assert decode.wanted(_config(tp, dcp)) is expected
 
 
@@ -67,17 +65,15 @@ def test_wanted(monkeypatch, sm, tp, dcp, cap, mode, expected):
         ("kv_both", True),
     ],
 )
-def test_wanted_kv_role(monkeypatch, sm, kv_role, expected):
+def test_wanted_kv_role(sm, kv_role, expected):
     sm(10, 7)
-    monkeypatch.setenv(decode.ENV, "1")
     assert decode.wanted(_config(16, 16, kv_role)) is expected
 
 
-def test_parts_semicolons():
-    """Harness env lists are comma-separated, so the parts may use semicolons."""
-    parts = {"topk": (1, 1 << 30), "o": (97, 4096)}
-    assert decode._parse_parts("topk;o=97-4096") == parts
-    assert decode._parse_parts("topk,o=97-4096") == parts
+def test_stock_tie_rule():
+    """Ties at the K-th key go by ascending global id, the stock merge's rule."""
+    assert decode.TIE_ORDER == "global"
+    assert decode.ONE_ROUND_ROWS == 256
 
 
 def _launcher(resident: dict[int, int], fit_wave: bool = True):
@@ -87,7 +83,6 @@ def _launcher(resident: dict[int, int], fit_wave: bool = True):
         ex=SimpleNamespace(resident_clusters=lambda c, segmax: resident[c]),
         sms=212,
         smem=228 * 1024,
-        segmax_override=-1,
         fit_wave=fit_wave,
     )
     ns._segmax = lambda rows, c, ml: decode.DcpxDecode._segmax(ns, rows, c, ml)
@@ -162,7 +157,6 @@ def test_topk_cluster_dcp16_one_wave(rows, expected):
         ex=SimpleNamespace(resident_clusters=lambda c, segmax: GR100[c, segmax]),
         sms=212,
         smem=228 * 1024,
-        segmax_override=-1,
         fit_wave=True,
     )
     ns._segmax = lambda r, c, ml: decode.DcpxDecode._segmax(ns, r, c, ml)

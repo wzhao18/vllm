@@ -36,7 +36,7 @@ on the same input rows, the same metadata and each on its own copy of the caches
   (few codes different) and every other cache byte as it was; then the block replayed in
   a CUDA graph bit for bit as its eager run. Contexts per request cycle through short
   (all keys) and long ones, one of 128K tokens. The top-k runs the #63 merge or, as C512
-  deploys it (VLLM_K31_DCP_EXCHANGE=1, parts topk, one round to 256 rows), DcpExchange
+  deploys it (its policy: the top-k exchange, one round to 256 rows), DcpExchange
   on both paths.
 * ``test_sp_kda_block_matches_stock_layer`` (two steps) and
   ``test_sp_kda_recoverssm_multistep`` (``CHAIN_STEPS`` steps, the specialized block
@@ -85,14 +85,8 @@ FP8_ROW, INDEX_ROWS = 576, {"fp8": 132, "mxfp4": 68}
 MAX_LEN = 1 << 17
 LONG = MAX_LEN - 64  # the u128k request
 SHORT = (600, 1500, 2050, 4321, 3000, 9000)
-# C512's decode environment (its stock DSA top-k exchange) and conv layout.
+# C512's decode conv layout (its DSA top-k exchange needs no environment).
 DEPLOYED_ENV = {"VLLM_SSM_CONV_STATE_LAYOUT": "DS"}
-EXCHANGE_ENV = {
-    "VLLM_K31_DCP_EXCHANGE": "1",
-    "VLLM_K31_DCP_EXCHANGE_PARTS": "topk",
-    "VLLM_K31_DCP_EXCHANGE_ONE_ROUND_ROWS": "256",
-    "K31_DCPX_PDL": "0",
-}
 TIMEOUT = 3600  # one launch, every rank (CuTe compiles on a cold cache)
 
 
@@ -860,10 +854,7 @@ def _launch(case: str, *args) -> None:
 def _worker(rank: int, port: int, case: str, args: tuple) -> None:
     """One TP4 = DCP4 rank: the vLLM groups (and their symmetric memory), the
     workspace and the DCP top-k merge's buffers, then ``case``."""
-    env = dict(DEPLOYED_ENV)
-    if case == "dsa" and args[1] == "exchange":
-        env.update(EXCHANGE_ENV)
-    os.environ.update(env)
+    os.environ.update(DEPLOYED_ENV)
     torch.accelerator.set_device_index(rank)
     device = torch.device("cuda", rank)
 
@@ -1166,7 +1157,6 @@ def _dsa_case(config, rank, device, indexer, topk_mode, rows, refusals):
         )
 
         dcpx = DcpxDecode(config, device, WORLD * HEADS, idx.topk_tokens)
-        assert "topk" in dcpx.parts, dcpx.parts
         dcpx.attach(attn)
         dcpx.warm()
         dcpx.serve()

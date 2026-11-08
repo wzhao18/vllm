@@ -13,7 +13,7 @@ With the fused DCP indexer (``fused``, indexer.py) the scoring is its scorer (th
 same logits layout) and, packed, its select also takes the local top-N (the
 merge's B' rows), so the merge only all-gathers and selects.
 
-With Wei's DcpExchange on (``VLLM_K31_DCP_EXCHANGE``, dsa_kernels.dcp_exchange),
+With Wei's DcpExchange on (dsa_kernels.dcp_exchange: built by policy on decode),
 ``merge_rows`` gives the steps it admits to its exact top-k instead: the same
 DeepGEMM logits, its KV slots and counts in place of the merge's (no DeepSelect,
 pack or all-gather). The merge stays built for the steps it declines."""

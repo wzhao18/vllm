@@ -64,8 +64,7 @@ def _load_ext():
     import hashlib
 
     digest = hashlib.sha1(src.read_bytes()).hexdigest()[:10]
-    if os.environ.get("K31_DCPX_DEBUG_PRINT"):
-        digest += "_dbg"
+    # (infrastructure: where torch keeps the extension build; default its cache)
     build = os.environ.get("K31_DCPX_BUILD_DIR")
     if build:
         build = str(Path(build) / digest)
@@ -78,11 +77,9 @@ def _load_ext():
             f"-gencode=arch=compute_{arch},code=sm_{arch}",
             "--use_fast_math",
             "-std=c++20",
-        ] + (["-Xptxas=-v"] if os.environ.get("K31_DCPX_PTXAS_V") else [])
-        + (["-DK31_DCPX_DEBUG_PRINT"] if os.environ.get("K31_DCPX_DEBUG_PRINT") else []),
+        ],
         extra_cflags=["-O3", "-std=c++20"],
         build_directory=build,
-        verbose=bool(os.environ.get("K31_DCPX_VERBOSE")),
     )
     return _EXT
 
@@ -144,10 +141,7 @@ class DcpExchange:
         }
         self.off = {}
         o = 0
-        order = list(sizes)
-        if os.environ.get("K31_DCPX_TL_FIRST"):
-            order = ["tl", "tr", "tk"] + [k for k in order if k not in ("tl", "tr", "tk")]
-        for k in order:
+        for k in sizes:
             v = sizes[k]
             self.off[k] = o
             o += (v + 63) & ~63
@@ -158,18 +152,9 @@ class DcpExchange:
             [int(x) for x in h.buffer_ptrs], dtype=torch.int64, device=device
         )
         self.tk_mc = int(getattr(h, "multicast_ptr", 0) or 0)
-        if os.environ.get("K31_DCPX_NO_MULTICAST"):
-            self.tk_mc = 0
         self.tk_epoch = torch.zeros(cap, dtype=torch.int32, device=device)  # per row
         self.tk_ticket = torch.zeros(1, dtype=torch.int32, device=device)
         self.err = torch.zeros(1, dtype=torch.int32, device=device)
-        if os.environ.get("K31_DCPX_DEBUG_ERR"):
-            # debug: error codes in pinned host memory (readable after a device trap)
-            self.err = torch.zeros(1, dtype=torch.int32).pin_memory()
-            import atexit
-
-            atexit.register(lambda e=self.err: print(f"DcpExchange err at exit: {int(e[0])}",
-                                                     flush=True))
         self.mailbox_bytes = 4 * o
 
         # ---- O mailboxes, one per head dim

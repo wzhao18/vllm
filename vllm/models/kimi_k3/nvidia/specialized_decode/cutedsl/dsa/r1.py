@@ -24,8 +24,8 @@ from .dcp_value import DSA_PARTIALS, FORMATS, PROJECTED, DcpMailbox, gather_head
 # partials there, and "proj" ties BF16 at few rows) and every row from 17 on exchanges
 # "proj", open-ended ("proj"'s merging CTAs stride the row tiles over at most one
 # wave, ``dcp_value.DcpValue``, so it serves any rows). "proj" numerics are what
-# production already ran: the serving configs set VLLM_K31_DSA_PARTIALS "proj"
-# (C48-C256) and "1-16:bf16,17-512:proj" (C1 / C8). FlashMLA sparse (fp8_ds_mla):
+# production already ran (the C48-C256 recipes ran "proj", C1 / C8
+# "1-16:bf16,17-512:proj"). FlashMLA sparse (fp8_ds_mla):
 # "bf16" at every row (its DcpValue strides its row tiles above one wave too:
 # ``mla.dcp.DcpValue.tile_stride``).
 # The BF16 rows follow the sparse core's coverage of the deployment's verify length

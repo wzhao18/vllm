@@ -9,8 +9,9 @@ the 128-padded q mailbox rows), CUDA graphs of --inner calls, median of --reps:
                FlashInfer trtllm-gen sparse MLA decode over the flat fp8 KV rows,
                128 query heads, LSE out, then the stock _finish_dcp_partials
                (empty-row identity) = "the trtllm-gen chain"
-  dsac_<v>     dsa_kernels.dsa_core.DsaCore (the VLLM_K31_DSA_CORE path) variant v
-               (1x16 1x32 2x16s2 4x16s2 8x16s4 u), pushing O + base-2 LSE into the
+  dsac_<v>     dsa_kernels.dsa_core.DsaCore (the served core: on by policy at the
+               rows of its VARIANT table) variant v (1x16 1x32 2x16s2 4x16s2 8x16s4),
+               pushing O + base-2 LSE into the
                16 head owners' DcpBox slots (16 owner boxes on this GPU: local
                stores, not NVLink; the multi-rank merge is bench_value.py's
                "pushed" arms), at rows <= 64 (the DcpBox cap); the code's policy
@@ -45,7 +46,7 @@ from common import DCP, GATHERED, HPR, Q_HEADS, TOPK, Recorder  # noqa: E402
 
 NKV = 1 << 20
 CAP = 64
-VARIANTS = ("1x16", "1x32", "2x16s2", "4x16s2", "8x16s4", "u")
+VARIANTS = ("1x16", "1x32", "2x16s2", "4x16s2", "8x16s4")
 PATTERNS = ("bal", "x256", "x384", "x600", "x2048")
 
 
@@ -189,8 +190,8 @@ class CoreBench:
                      bmm1_scale=self.bmm1, bmm2_scale=self.bmm2,
                      part_peers=self.peers, lse_peers=self.lpeers, box_cap=CAP,
                      hpr=HPR, parity=parity, rank=5, rows=rows, splits=splits,
-                     split_min=split_min, heads_per_cta=heads or 32, umma=heads == 0,
-                     lse_wide=lse_wide, pdl=True)  # fmt: skip
+                     split_min=split_min, heads_per_cta=heads, lse_wide=lse_wide,
+                     pdl=True)  # fmt: skip
 
         return common.Alternating(call)
 
@@ -198,14 +199,13 @@ class CoreBench:
     @staticmethod
     def policy(rows, q):
         """(variant name or None, spread) of the code's DSA core policy at these rows
-        (as if VLLM_K31_DSA_CORE=1; default off: the served op is trtllm_fp8)."""
+        (where its build() puts it on: DCP on per-tensor FP8)."""
         from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core import decode
 
         if rows > decode.ROWS:
             return None, False
         table = decode.rows_table(decode.VARIANT.get(q, "").replace(";", ","))
-        spread = decode.rows_table(decode.SPREAD.replace(";", ",")).get(rows)
-        return table.get(rows), bool(spread)
+        return table.get(rows), rows in decode.SPREAD
 
     def time(self, fn):
         return common.graph_time(fn, self.args.inner, self.args.reps)
@@ -238,7 +238,7 @@ class CoreBench:
                 arms.append((f"dsac_{v}", role,
                              lambda v=v: self.dsac(rows, sel, cnt, v, spread)))  # fmt: skip
         spec_arm = f"dsac_{pol}" if (pol and rows <= CAP and not a.no_dsac) else "trtllm_fp8"
-        note = "VLLM_K31_DSA_CORE policy" if pol else "policy: trtllm-gen (no core)"
+        note = "DSA core policy" if pol else "policy: trtllm-gen (no core)"
         for name, role, build in arms:
             try:
                 fn = build()

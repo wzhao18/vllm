@@ -13,7 +13,7 @@ stages over the packed MLA cache and the indexer cache (64-entry pages):
                    trtllm-gen or prims_ts per batch, called directly into the value
                    stage's rows), else FlashMLA sparse on fp8_ds_mla (attn_ds.py);
                    under DCP with the #63 merge, on the rows of its table, the DSA
-                   sparse core (dsa_kernels.dsa_core, VLLM_K31_DSA_CORE=1)
+                   sparse core (dsa_kernels.dsa_core; on by policy, its build())
   MlaValue         W_UV and the sigmoid gate of the BF16 latent
 
 Query overlap (overlap.py, per batch of rows): the indexer path needs only q_c, so
@@ -368,31 +368,20 @@ class PreparedDsa:
         self.uv_gathered = dcp.value_weights(layer) if dcp else None
         if self.uv_gathered is not None:
             projected_rows(self.device, dcp.cap, dcp.size * self.heads)
-        # The DSA sparse core (dsa_kernels.dsa_core.decode.build, VLLM_K31_DSA_CORE=1)
-        # under DCP on FlashInfer with the #63 merge: on the shapes of its variant
-        # table (this DSA layer not skipped), the steps merge_rows serves (the #63
-        # merge, or DcpExchange's top-k above the rows it launches with PDL) run
+        # The DSA sparse core (dsa_kernels.dsa_core.decode.build: on by policy) under
+        # DCP on FlashInfer with the #63 merge: on the shapes of its variant table,
+        # the steps merge_rows serves (the #63 merge, or DcpExchange's top-k) run
         # DsaCore and DcpValue(pushed) instead of QueryWait, FlashInfer's decode and
         # DcpValue's push: (batch, q) -> (variant, DcpValue(pushed), spread).
         self.dsac = self.dsac_rows = None
         self.dsa_layer = getattr(self.indexer, "dsac_layer", -1)
         self.core_kernels: dict = {}
-        # NQ-NOFALLBACK: core shapes left on FlashInfer by design, decided at build
-        # (prepare_core): (batch, q) -> why.
-        self.core_excluded: dict = {}
         dsac = getattr(self.indexer, "dsac", None)
         if dsac is not None and self.fi is not None and local_topk and self.dcp > 1:
             from ....dsa_kernels.dsa_core.decode import MergeRows
 
             self.dsac = dsac
-            self.dsac_rows = MergeRows(self.indexer_stage, dsac.pdl_rows)
-        # VLLM_K31_DSA_CORE_STATS=1: each step's largest local count of the merge
-        # (dsa_core.decode.CountStats), with the core on or off.
-        self.count_stats = None
-        if self.fi is not None and self.dcp > 1:
-            from ....dsa_kernels.dsa_core.decode import count_stats
-
-            self.count_stats = count_stats(self.device)
+            self.dsac_rows = MergeRows(self.indexer_stage)
         # TP on FlashInfer: the fused decode indexer (prepare_cache; None: stock).
         self.fused: FusedIndexer | None = None
 
@@ -444,10 +433,8 @@ class PreparedDsa:
                 )
             if self.dsac is not None and partials == "bf16":
                 self.prepare_core(batch, q, specs[4], sms)
-            elif self.dsac is not None and self.dsac.variant(batch, q, self.dsa_layer):
+            elif self.dsac is not None and self.dsac.variant(batch, q):
                 unserved.append(f"{batch}x{q}")
-            if self.count_stats is not None:
-                self.count_stats.reserve(self.dsa_layer, batch)
         rows = max(self.pitches)
         if fused:
             # Every mode but the late ones has the select right before the decode
@@ -479,7 +466,7 @@ class PreparedDsa:
             )
         if unserved:
             logger.warning_once(
-                "Kimi K3.1 DSA sparse core (VLLM_K31_DSA_CORE): rows x q %s exchange "
+                "Kimi K3.1 DSA sparse core: rows x q %s exchange "
                 '"proj" partials (%s), which the core does not push: they run '
                 "FlashInfer's decode",
                 " ".join(unserved),
@@ -544,48 +531,14 @@ class PreparedDsa:
 
     def prepare_core(self, batch, q, uv, sms):
         """DcpValue(pushed) of a shape the DSA sparse core's table serves here."""
-        variant = self.dsac.variant(batch, q, self.dsa_layer)
+        variant = self.dsac.variant(batch, q)
         if variant is None or self.overlaps[batch, q] in LATE:
-            return
-        if self.exchange_pdl(batch):
-            # NQ-NOFALLBACK: a documented design exclusion, not a fallback. The core
-            # polls its q tiles before its PDL wait, unsafe behind DcpExchange's top-k
-            # launched with PDL (at most K31_DCPX_PDL rows: MergeRows.fits declines
-            # those steps). Decided here, per shape, at build: the shape keeps
-            # FlashInfer's chain and the coverage log says so.
-            self.core_excluded[batch, q] = (
-                f"DcpExchange top-k launches with PDL at <= {self.dsac.pdl_rows} "
-                "rows (K31_DCPX_PDL; 0 gives the core every row)"
-            )
-            logger.info_once(
-                "Kimi K3.1 DSA sparse core: rows x q %dx%d keep FlashInfer's chain by "
-                "design: %s",
-                batch,
-                q,
-                self.core_excluded[batch, q],
-                scope="global",
-            )
             return
         spread = q > 1 and batch in self.dsac.spread and sms > GB300_SMS
         box = self.box
         args = self.heads, self.dcp, batch, uv, self.pitches[batch], self.device.index
         value = compile_core_value(*args, sms, q, box.q_heads, box.cap, spread)
         self.core_kernels[batch, q] = variant, value, spread
-
-    def exchange_pdl(self, batch):
-        """Whether this layer's DcpExchange top-k (VLLM_K31_DCP_EXCHANGE) is wired
-        and launches with PDL at ``batch`` rows (``K31_DCPX_PDL``): the steps
-        ``MergeRows.fits`` refuses the core. Static, at build: the hook's run-time
-        admission (step metadata, its parts' rows) is not known here, so a shape the
-        exchange could leave to the #63 merge stays on FlashInfer too (conservative;
-        K31_DCPX_PDL=0 is the lever)."""
-        from vllm.model_executor.layers.sparse_attn_indexer import (
-            DCP_DECODE_TOPK_HOOKS,
-        )
-
-        rows = self.dsac_rows.pdl_rows if self.dsac_rows is not None else 0
-        hooked = self.indexer.k_cache.prefix in DCP_DECODE_TOPK_HOOKS
-        return hooked and self.indexer_stage.impl is not None and batch <= rows
 
     def core_step(self, batch, q):
         """The DSA sparse core's (variant, DcpValue(pushed), spread) of this step, or
@@ -597,9 +550,7 @@ class PreparedDsa:
         if not self.dsac_rows.fits(batch):
             if self.strict and full_capture():
                 # NQ-NOFALLBACK: a captured core shape whose merge rows do not fit
-                # would capture FlashInfer's chain instead. (The PDL exclusion of
-                # DcpExchange's steps is decided at build, prepare_core: such shapes
-                # never reach here.)
+                # would capture FlashInfer's chain instead.
                 source = self.indexer_stage.merge_source(batch)
                 refuse(
                     "DSA sparse core",
@@ -615,14 +566,9 @@ class PreparedDsa:
         kernel = self.cores.get((batch, q), "")
         if (batch, q) in self.core_kernels:
             return f"DSA sparse core {self.core_kernels[batch, q][0]}"
-        if (batch, q) in self.core_excluded:
-            return (
-                f"FlashInfer {kernel} (deliberate per-shape choice: "
-                f"{self.core_excluded[batch, q]})"
-            )
         if self.dsac is None:
             return f"FlashInfer {kernel} (sparse core off)"
-        if self.dsac.variant(batch, q, self.dsa_layer) is None:
+        if self.dsac.variant(batch, q) is None:
             return (
                 f"FlashInfer {kernel} (no sparse core variant: its table stops at "
                 f"{self.dsac.rows} rows)"
@@ -642,8 +588,6 @@ class PreparedDsa:
         stage = self.query_stage
         args = stage.q_fp8, stage.head_w, md, stride_rows, batch
         sel, counts = self.dsac_rows.rows(*args, q=q)
-        if self.count_stats is not None:
-            self.count_stats.record(self.dsa_layer, batch, counts)
         if join is not None:
             join()
         impl = self.impl  # FlashInfer's scales of this layer (attn_fi.trtllm)
@@ -809,8 +753,6 @@ class PreparedDsa:
                 interleave = indexer.cp_kv_cache_interleave_size
                 args = topk, md, batch, stride_rows, interleave
                 merged = self.fi.convert(*args)
-            if self.count_stats is not None:
-                self.count_stats.record(self.dsa_layer, batch, merged[1])
             if join is not None:
                 join()
             latent, lse = self.fi.decode(query, cache, *merged, md.block_size)

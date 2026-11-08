@@ -23,7 +23,7 @@ Q:
                  VLLM_USE_DIRECT_DCP_Q_GATHER=1 path), padded to 128 heads; the
                  NCCL all_gather variant is also timed
   local_q        q_b GEMM (all 96 heads) + W_UK bmm + fp8 cast (no exchange)
-value (the DSA DcpValue stage, bench_dcp_value.py; VLLM_K31_DSA_PARTIALS):
+value (the DSA DcpValue stage, bench_dcp_value.py; r1.auto_partials):
   value_prod     as served: run_value "bf16" up to 64 rows, MR !8's DcpValue above
   value_proj     W_UV bmm over the 96 gathered heads + DcpValue(preprojected)
                  through the "proj" DcpMailbox (_contig: a contiguous W_UV)

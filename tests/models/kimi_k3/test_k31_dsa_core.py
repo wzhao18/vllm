@@ -4,8 +4,11 @@
 owned by this rank): the pushed partial rows and base-2 LSEs vs an FP32 reference
 over the selected FP8 KV rows, for every split count and heads per CTA, with empty
 rows, partial and full (2048) local lists, and the mailbox sentinel rules (no
-negative zero in a pushed pair, EMPTY LSE for rows without entries). The multi-rank
-path (DcpValue(pushed) merge, W_UV, gate) is benchmarks/kernels/k31_vr/dcp_dsa_core.py.
+negative zero in a pushed pair, EMPTY LSE for rows without entries); DCP16 emulated
+on one GPU: the merged rows against the trtllm-gen chain, and every rank's pushed
+partial rows elementwise against the stock trtllm-gen sparse MLA decode of the same
+rank (its precision: E4M3 P at 448 x the running max of 128-key tiles, l from the
+unquantized P, BF16 partials of a multi-CTA KV split), and the decode policy.
 """
 
 import math
@@ -58,8 +61,7 @@ def _reference(q8, kv8, sel, counts, q_scale, k_scale, sm_scale):
 
 
 @pytest.mark.parametrize(
-    "splits,heads_per_cta",
-    [(s, h) for h in (16, 32) for s in (1, 2, 4, 8)] + [(1, 0)],  # 0: tcgen05 variant
+    "splits,heads_per_cta", [(s, h) for h in (16, 32) for s in (1, 2, 4, 8)]
 )
 def test_dsa_core_push(splits, heads_per_cta):
     from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core.ops import DsaCore
@@ -93,8 +95,7 @@ def test_dsa_core_push(splits, heads_per_cta):
             rank=0,
             rows=rows,
             splits=splits,
-            heads_per_cta=heads_per_cta or 32,
-            umma=heads_per_cta == 0,
+            heads_per_cta=heads_per_cta,
         )
         torch.cuda.synchronize()
         core.check()
@@ -109,8 +110,8 @@ def test_dsa_core_push(splits, heads_per_cta):
                 assert bool((o[r] == 0).all()) and bool((lv[r] == EMPTY).all())
                 continue
             err = (o[r] - ref_o[r]).abs().max() / ref_o[r].abs().max()
-            # (tcgen05: P in E4M3, as the stock FP8 MLA decode)
-            assert err < (4e-2 if heads_per_cta == 0 else 1.5e-2), (r, n, float(err))
+            # (P in E4M3, as the stock FP8 MLA decode)
+            assert err < 4e-2, (r, n, float(err))
             assert torch.allclose(lv[r], ref_l[r], rtol=1e-3, atol=2e-3), (r, n)
         # the other parity is never written
         other = part[1 - parity].view(torch.int32)
@@ -118,7 +119,7 @@ def test_dsa_core_push(splits, heads_per_cta):
 
 
 # --- DCP16 on one GPU: 16 emulated ranks (the core's 16 pushes to the head owners'
-# boxes per rank), as PreparedDsa runs it under VLLM_K31_DSA_CORE (dsa_core.decode).
+# boxes per rank), as PreparedDsa runs it (dsa_core.decode).
 W, HPR, CAP = 16, 6, 64
 
 
@@ -182,7 +183,8 @@ def _lse_merge(rows, lses, live):
 
 def _core_dcp16(core, box, sel, cnt, kv8, scales, variant, parity=0, pdl=False):
     """The 16 ranks' cores pushing into 16 owner boxes; the merged rows of every
-    gathered head [T, H, 512] and the raw boxes."""
+    gathered head [T, H, 512] and every rank's pushed rows [W, T, H, 512] (bf16) and
+    base-2 LSEs [W, T, H]."""
     rows = sel.shape[1]
     part = [
         torch.zeros(2, W, CAP, HPR, 512, dtype=torch.bfloat16, device="cuda")
@@ -201,7 +203,7 @@ def _core_dcp16(core, box, sel, cnt, kv8, scales, variant, parity=0, pdl=False):
                  bmm1_scale=scales[0], bmm2_scale=scales[1], part_peers=peers,
                  lse_peers=lpeers, box_cap=CAP, hpr=HPR, parity=parity, rank=rank,
                  rows=rows, splits=splits, split_min=split_min,
-                 heads_per_cta=heads or 32, umma=heads == 0, pdl=pdl)  # fmt: skip
+                 heads_per_cta=heads, pdl=pdl)  # fmt: skip
     torch.cuda.synchronize()
     core.check()
     # owner o's box holds gathered heads o * HPR .. from every source s
@@ -211,12 +213,13 @@ def _core_dcp16(core, box, sel, cnt, kv8, scales, variant, parity=0, pdl=False):
     lses = lses.reshape(W, rows, H)
     assert not bool((lses.view(torch.int32) == -1).any())  # every LSE pushed
     live = lses > EMPTY
-    return _lse_merge(rows_, lses, live.any(-1)), part, lse
+    return _lse_merge(rows_, lses, live.any(-1)), rows_, lses
 
 
-def _trtllm_dcp16(box, sel, cnt, kv8, scales):
+def _trtllm_dcp16(box, sel, cnt, kv8, scales, raw=False):
     """The trtllm-gen chain per rank (attn_fi.trtllm's call) merged by LSE over the
-    ranks with entries (DcpValue drops rows of count 0)."""
+    ranks with entries (DcpValue drops rows of count 0); ``raw``: also every rank's
+    rows [W, T, H, 512] (bf16) and base-2 LSEs [W, T, H]."""
     from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
 
     from vllm.v1.attention.backends.mla import flashinfer_mla_sparse as fims
@@ -251,7 +254,8 @@ def _trtllm_dcp16(box, sel, cnt, kv8, scales):
         outs.append(out[:, 0, :H])
         lses.append(lse[:, :H])
     torch.cuda.synchronize()
-    return _lse_merge(torch.stack(outs), torch.stack(lses), cnt > 0)
+    merged = _lse_merge(torch.stack(outs), torch.stack(lses), cnt > 0)
+    return (merged, torch.stack(outs), torch.stack(lses)) if raw else merged
 
 
 def _error(x, ref):
@@ -350,77 +354,172 @@ def test_dsa_core_graph_replay_alternates_parities(variant):
     assert torch.equal(lse.view(torch.int32), eager[1].view(torch.int32))
 
 
-def test_dsa_core_serving_spin(monkeypatch):
-    """The served core's q mailbox poll deadline (build()): 600 s by default, as
-    DcpExchange's serving one, so a peer stalled on the host does not trap it; 0: no
-    deadline."""
-    from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core import decode
-
-    monkeypatch.delenv(decode.SPIN_ENV, raising=False)
-    assert decode.serving_spin_ns() == 600 * 10**9
-    monkeypatch.setenv(decode.SPIN_ENV, "2.5")
-    assert decode.serving_spin_ns() == 2_500_000_000
-    monkeypatch.setenv(decode.SPIN_ENV, "0")
-    assert decode.serving_spin_ns() >= 1 << 62
+LOG2E = math.log2(math.e)
 
 
-def test_dsa_core_policy(monkeypatch):
-    """VLLM_K31_DSA_CORE's table: by q, then rows (a q without a table and rows past
-    ROWS keep FlashInfer), split_min in the variant name, skipped DSA layers, an
-    environment table for every q; off by default (whatever the caller exported)."""
-    from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core import decode
+def _emulate(q8, k8, bmm1, bmm2):
+    """The stock trtllm-gen sparse MLA decode of one row at the core's rows (FP32
+    emulation; probed bitwise against trtllm-gen at DCP16 q8 rows 8-48): its multi-CTA
+    KV split, one 128-key tile per CTA. Per tile, base-2 softmax against the tile's
+    own max m_t, P = E4M3(448 x 2^(s - m_t)), l_t from the unquantized P, the
+    unnormalized partial P V x bmm2 / 448 rounded to BF16; merged in FP32 with weights
+    2^(m_t - M), divided by L = sum l_t 2^(m_t - M), rounded to BF16. q8 [H, 576] and
+    k8 [n, 576] are E4M3 values (float). (rows bf16 [H, 512], base-2 LSE [H])."""
+    s = (q8 @ k8.T) * (bmm1 * LOG2E)
+    parts = []
+    for t0 in range(0, k8.shape[0], 128):
+        st = s[:, t0 : t0 + 128]
+        m = st.amax(1)
+        p = torch.exp2(st - m[:, None])
+        p8 = (p * 448.0).to(torch.float8_e4m3fn).float()
+        x = (p8 @ k8[t0 : t0 + 128, :NOPE] * (bmm2 / 448.0)).to(torch.bfloat16).float()
+        parts.append((x, m, p.sum(1)))
+    M = torch.stack([m for _, m, _ in parts]).amax(0)
+    L = sum(l * torch.exp2(m - M) for _, m, l in parts)
+    o = sum(x * torch.exp2(m - M)[:, None] for x, m, _ in parts) / L[:, None]
+    return o.to(torch.bfloat16), M + torch.log2(L)
 
-    for suffix in ("", "_ROWS", "_VARIANT", "_SKIP_LAYERS", "_SPREAD", "_STATS"):
-        monkeypatch.delenv(decode.ENV + suffix, raising=False)
-    assert not decode.wanted()
-    assert decode.parse_variant("2x16s2") == (2, 16, 2)
-    assert decode.parse_variant("1x32") == (1, 32, 4)
-    assert decode.parse_variant("u") == (1, 0, 4)
-    with pytest.raises(ValueError):
-        decode.parse_variant("3x16")
-    dsac = decode.DsacDecode(torch.device("cuda"), H, skip="2;5")
-    assert dsac.rows == decode.ROWS == 16
-    assert dsac.variant(8, 8, 0) == dsac.variant(16, 8, 1) == (2, 16, 2)
-    assert dsac.variant(8, 4, 0) is None  # no q4 table
-    assert dsac.variant(24, 8, 0) is None  # past ROWS
-    assert dsac.variant(8, 8, 2) is dsac.variant(16, 8, 5) is None  # skipped
-    every = decode.DsacDecode(torch.device("cuda"), H, rows=64, spec="1-8:1x16;9-64:u")
-    assert every.variant(8, 4, 0) == (1, 16, 4) and every.variant(64, 8, 3) == (1, 0, 4)
+
+def _ulps(a, b):
+    """Elementwise distance of two bf16 tensors in units of bf16 ulps (of the
+    larger magnitude, at least 2^-8 of the tensor's largest: values that cancel to
+    near zero are compared at that scale); 0 where both are equal."""
+    a, b = a.float(), b.float()
+    floor = float(torch.maximum(a.abs().max(), b.abs().max())) * 2.0**-8
+    scale = torch.maximum(a.abs(), b.abs()).clamp(min=max(floor, 1e-30))
+    ulp = torch.exp2(torch.floor(torch.log2(scale)) - 7)
+    return (a - b).abs() / ulp
 
 
-def test_dsa_core_refuses_nvfp4(monkeypatch):
-    """The core reads 576-byte per-tensor FP8 KV rows: under DCP with
-    VLLM_K31_DSA_CORE=1, build() refuses an nvfp4_ds_mla cache at startup, naming
-    the switch; with the core off it builds nothing."""
-    from vllm.models.kimi_k3.nvidia.dsa import KimiK3DSAAttention
-    from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core import decode
-
-    layer = KimiK3DSAAttention.__new__(KimiK3DSAAttention)
-    torch.nn.Module.__init__(layer)
-    layer.dsa_indexer = SimpleNamespace(dcp_world_size=16)
-    layer.mla_attn = SimpleNamespace(
-        mla_attn=SimpleNamespace(kv_cache_dtype="nvfp4_ds_mla")
+@pytest.mark.parametrize("pattern", ["balanced", "skewed"])
+@pytest.mark.parametrize("rows", [8, 16])
+def test_dsa_core_matches_trtllm_per_rank(rows, pattern):
+    """Stock precision, rank by rank (C1 / C8: DCP16 q8 rows 8 / 16, the served
+    2x16s2): every rank's pushed partial rows and base-2 LSEs against the stock
+    trtllm-gen sparse MLA decode of the same rank's rows (attn_fi.trtllm's call),
+    and both against the FP32 emulation of trtllm-gen's precision (``_emulate``).
+    The core matches the emulation bit for bit (FP32 accumulation order aside) and
+    trtllm-gen on 99.98% of the elements of balanced rows (99.0-99.6% with a row of
+    2048 keys on one rank, where trtllm-gen itself departs from the emulation); the
+    old FP16-P core matched trtllm-gen on 53-68% of them."""
+    from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core.decode import (
+        VARIANT,
+        parse_variant,
     )
-    model = torch.nn.ModuleList([layer])
-    monkeypatch.delenv(decode.ENV, raising=False)
-    assert decode.build(model) is None
-    monkeypatch.setenv(decode.ENV, "1")
-    with pytest.raises(ValueError, match=f"nvfp4_ds_mla cache: set {decode.ENV}=0"):
-        decode.build(model)
+    from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core.ops import DsaCore
+
+    torch.backends.cuda.matmul.allow_tf32 = False
+    variant = parse_variant(VARIANT[8].split(":")[1])
+    box, sel, cnt, kv8, q8, q_scale, k_scale = _dcp_case(rows, pattern)
+    sm_scale = 1.0 / math.sqrt(192)
+    scales = sm_scale * q_scale * k_scale, k_scale
+    core = DsaCore(torch.device("cuda"), cap=CAP, heads=H, max_splits=8)
+    _, ours, our_lse = _core_dcp16(core, box, sel, cnt, kv8, scales, variant)
+    _, theirs, their_lse = _trtllm_dcp16(box, sel, cnt, kv8, scales, raw=True)
+    live = cnt > 0  # [W, T]
+    a, b = ours[live], theirs[live].to(torch.bfloat16)  # [N, H, 512]
+    equal = float((a.view(torch.int16) == b.view(torch.int16)).float().mean())
+    ulps = _ulps(a, b)
+    lse_err = float((our_lse[live] - their_lse[live]).abs().max())
+    # the emulation of trtllm-gen's precision per row, against both
+    kf, qf = kv8.float(), q8.float()
+    emu_eq: dict = {"trtllm": [], "core": []}
+    for w in range(W):
+        for t in range(rows):
+            n = int(cnt[w, t])
+            if n == 0:
+                continue
+            e, _ = _emulate(qf[t], kf[sel[w, t, :n].long()], *scales)
+            e = e.view(torch.int16)
+            tr = theirs[w, t].to(torch.bfloat16).view(torch.int16)
+            emu_eq["trtllm"].append(float((e == tr).float().mean()))
+            emu_eq["core"].append(float((e == ours[w, t].view(torch.int16)).float().mean()))
+    summary = {k: round(sum(v) / len(v), 5) for k, v in emu_eq.items()}
+    counts = cnt[live]
+    p999 = float(ulps.flatten()[::4].quantile(0.999))  # (quantile: < 16M elements)
+    print(
+        f"DCP16 q8 M{rows} {pattern} (local counts {int(counts.min())}-"
+        f"{int(counts.max())}): core vs trtllm-gen bitwise {equal:.5f}, ulps max "
+        f"{float(ulps.max()):.1f} p99.9 {p999:.2f}, LSE max |diff| {lse_err:.2e}; "
+        f"emulation bitwise vs {summary}"
+    )
+    assert summary["core"] >= 0.999, summary
+    assert equal >= 0.98, equal
+    if pattern == "balanced":  # (skewed: trtllm-gen's 2048-key rows depart from the
+        assert p999 <= 1.0, p999  # one-tile-per-CTA model; the core matches the model)
+    assert lse_err <= 1e-4, lse_err
 
 
-def test_dsa_core_rows_source(monkeypatch):
-    """The core's rows (MergeRows): the #63 merge's steps, and DcpExchange's steps
-    above the rows its top-k launches with PDL (K31_DCPX_PDL, as the extension
-    parses it): the core polls its q tiles before its PDL wait."""
+def test_dsa_core_serving_deadline():
+    """The served core's q mailbox poll deadline (build()): 600 s, as DcpExchange's
+    serving one, so a peer stalled on the host does not trap it."""
     from vllm.models.kimi_k3.nvidia.dsa_kernels.dcp_exchange import decode as dcpx
     from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core import decode
 
-    monkeypatch.delenv(dcpx.PDL_ENV, raising=False)
-    assert dcpx.topk_pdl_rows() == dcpx.DEFAULT_PDL_ROWS == 16
-    for value, rows in (("0", 0), ("8", 8), (" 32x", 32), ("", 0), ("off", 0)):
-        monkeypatch.setenv(dcpx.PDL_ENV, value)
-        assert dcpx.topk_pdl_rows() == rows, value
+    assert decode.SERVING_SPIN_S == dcpx.SERVING_SPIN_S == 600.0
+
+
+def test_dsa_core_policy():
+    """The core's tables (no switch): by q, then rows (a q without a table and rows
+    past ROWS keep FlashInfer), split_min in the variant name; a test table for
+    every q."""
+    from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core import decode
+
+    assert decode.parse_variant("2x16s2") == (2, 16, 2)
+    assert decode.parse_variant("1x32") == (1, 32, 4)
+    for bad in ("u", "3x16", "2x8", "x16", "2x16s0"):
+        with pytest.raises(ValueError):
+            decode.parse_variant(bad)
+    dsac = decode.DsacDecode(torch.device("cuda"), H)
+    assert dsac.rows == decode.ROWS == 16
+    assert dsac.variant(8, 8) == dsac.variant(16, 8) == (2, 16, 2)
+    assert dsac.variant(8, 4) is None  # no q4 table
+    assert dsac.variant(24, 8) is None  # past ROWS
+    every = decode.DsacDecode(torch.device("cuda"), H, rows=64, spec="1-8:1x16;9-64:4x32")
+    assert every.variant(8, 4) == (1, 16, 4) and every.variant(64, 8) == (4, 32, 4)
+
+
+def _model(kv_dtype="fp8", dcp=16):
+    from vllm.models.kimi_k3.nvidia.dsa import KimiK3DSAAttention
+
+    layer = KimiK3DSAAttention.__new__(KimiK3DSAAttention)
+    torch.nn.Module.__init__(layer)
+    layer.dsa_indexer = SimpleNamespace(dcp_world_size=dcp)
+    layer.mla_attn = SimpleNamespace(mla_attn=SimpleNamespace(kv_cache_dtype=kv_dtype))
+    return torch.nn.ModuleList([layer])
+
+
+@pytest.mark.parametrize(
+    "kv_dtype,dcp,sp,q,reason",
+    [
+        ("fp8", 16, False, 8, None),  # C1 / C8 / C48 / C64: the core runs
+        ("fp8", 16, False, 4, "verify length 4"),  # C160 / C256: no q4 table
+        ("fp8", 4, True, 4, "sequence-parallel"),  # C512: SpDsaCore
+        ("fp8", 1, False, 8, "no DCP"),
+        ("nvfp4_ds_mla", 16, False, 8, "nvfp4_ds_mla"),  # capability: FP8 rows only
+    ],
+)
+def test_dsa_core_build_policy(kv_dtype, dcp, sp, q, reason):
+    """``unsupported``: the core is on wherever it can run (no switch); every other
+    deployment keeps FlashInfer's chain, and build() then attaches nothing."""
+    from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core import decode
+
+    model = _model(kv_dtype, dcp)
+    config = SimpleNamespace(sequence_parallel=sp, q=q)
+    why = decode.unsupported(model, config)
+    if reason is None:
+        assert why is None
+    else:
+        assert why is not None and reason in why, why
+        assert decode.build(model, config) is None
+        assert getattr(model[0].dsa_indexer, "dsac", None) is None
+
+
+def test_dsa_core_rows_source():
+    """The core's rows (MergeRows): the #63 merge's steps and DcpExchange's steps
+    (its top-k launches without PDL: the core polls its q tiles before its PDL
+    wait)."""
+    from vllm.models.kimi_k3.nvidia.dsa_kernels.dsa_core import decode
 
     class Stage:  # IndexerStage's step predicate and rows
         source: tuple = (None, 0)
@@ -432,15 +531,13 @@ def test_dsa_core_rows_source(monkeypatch):
             return None if self.source[0] is None else ("sel", "cnt")
 
     stage = Stage()
-    source = decode.MergeRows(stage, pdl_rows=16)
+    source = decode.MergeRows(stage)
     for step, fits in (
         ((None, 0), False),
         (("merge", 8), True),
-        (("exchange", 16), False),  # its top-k launched with PDL
-        (("exchange", 17), True),
+        (("exchange", 8), True),
+        (("exchange", 64), True),
     ):
         stage.source = step
         assert source.fits(64) is fits, step
     assert source.rows(None, None, None, None, 64, q=8) == ("sel", "cnt")
-    stage.source = "exchange", 8
-    assert decode.MergeRows(stage).fits(64)  # K31_DCPX_PDL=0: every exchange step
