@@ -3263,7 +3263,7 @@ def test_prepared_dsa_dcp_exchange_min_rows(dcp8_group, monkeypatch, batch):
         8,
         dcp8_group,
         None,
-        "default",
+        None,
         graph=True,
         replays=200,
         sparse_core="2x16s2" if batch <= 16 else None,
