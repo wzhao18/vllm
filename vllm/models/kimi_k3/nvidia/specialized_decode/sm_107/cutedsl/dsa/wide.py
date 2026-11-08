@@ -524,7 +524,13 @@ class WideDsa:
             )
             if lse is None:
                 raise RuntimeError("Kimi K3.1 specialized DSA: no LSE from the decode")
-            lse = lse.masked_fill((valid == 0).view(-1, 1), float("-inf"))
+            # A row without local entries must reach DcpValue with LSE -inf. On
+            # trtllm-gen the stock decode's _finish_dcp_partials already wrote it (and
+            # a zero latent), so the out-of-place masked_fill would only add two
+            # kernels per DSA layer (CompareEq + masked_fill, 3.8 us per layer at q4
+            # M512 on VR200, nsys); prims_ts keeps it.
+            if self.impl.use_prims_ts:
+                lse = lse.masked_fill((valid == 0).view(-1, 1), float("-inf"))
             return rows, lse, valid
         rows, lse = flash_mla_with_kvcache(
             q=box.q[self.parity, :batch].unsqueeze(1),
