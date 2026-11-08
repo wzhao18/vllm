@@ -66,6 +66,7 @@ from ..gemm.projection import matrix_view, weight_map
 from ..gemm.splitk import SplitKTactic, _smem
 from ..gemm.splitk_tmem64 import SplitKTmemGemm64, _ld_shared_v4, _st_shared_bf16
 from .kernel import sigmoids
+from .recover import mul_rn, triton_rstd, triton_sigmoid, triton_silu
 
 __all__ = ["PREPARED_PITCH", "KdaInProj64", "KdaInProjQ", "PreparedKdaInProj64"]
 
@@ -88,13 +89,20 @@ def _canonical(value):
 
 class KdaInProj64(SplitKTmemGemm64):
     """``tactic`` (128, 64, split, x's slots) over the KDA in-projection rows
-    [Q | K | V | gate | F_A, beta] of ``heads`` heads; ``has_bias``: the conv bias."""
+    [Q | K | V | gate | F_A, beta] of ``heads`` heads; ``has_bias``: the conv bias;
+    ``stock`` (an FP32 recurrent state): the prologue computes the stock verify's math
+    (``recover.KdaSplit``'s Triton formulas: the SiLU outputs rounded to BF16,
+    x / (1 + exp(-x)) and Triton's sigmoid, q / k scaled by 1 / sqrt.approx(n + eps)
+    and then q by the query scale) for ``KdaVerifyPrepared(bf16_state=False)``."""
 
-    def __init__(self, *, tactic: SplitKTactic, heads=6, has_bias=False, k=7168):
+    def __init__(
+        self, *, tactic: SplitKTactic, heads=6, has_bias=False, k=7168, stock=False
+    ):
         super().__init__(tactic=tactic, k=k, owners=OWNERS)
         assert self.share == SHARE
         self.heads, self.dim, self.has_bias = heads, heads * 128, has_bias
         self.tokens = TOKENS  # verify length q (KdaInProjQ: q < 8)
+        self.stock = stock
 
     def kept(self, t):
         """Whether the thread's token t (of 16: requests 2 g + t // 8) is a real one."""
@@ -237,9 +245,13 @@ class KdaInProj64(SplitKTmemGemm64):
                     for i, value in enumerate(window):
                         page[row, i] = value
             kept = [t for t in range(16) if self.kept(t)]
-            act = sigmoids([y[t] for t in kept])
-            for i, t in enumerate(kept):
-                y[t] = y[t] * act[i]
+            if cutlass.const_expr(self.stock):
+                for t in kept:
+                    y[t] = triton_silu(y[t])
+            else:
+                act = sigmoids([y[t] for t in kept])
+                for i, t in enumerate(kept):
+                    y[t] = y[t] * act[i]
             if section == 2:
                 for t in cutlass.range_constexpr(16):
                     if cutlass.const_expr(self.kept(t)):
@@ -250,12 +262,12 @@ class KdaInProj64(SplitKTmemGemm64):
                 )
         elif section == 3:
             kept = [t for t in range(16) if self.kept(t)]
-            act = sigmoids([Float32(xb[t]) for t in kept])
+            act = self.sigmoids([Float32(xb[t]) for t in kept])
             for i, t in enumerate(kept):
                 prepared[self.token_row(col0, g, t), 3 * dim + channel] = act[i]
         elif (channel >= 128) & (channel - 128 < self.heads):  # beta rows (4 dim + 128)
             kept = [t for t in range(16) if self.kept(t)]
-            act = sigmoids([Float32(xb[t]) for t in kept])
+            act = self.sigmoids([Float32(xb[t]) for t in kept])
             for i, t in enumerate(kept):
                 row = self.token_row(col0, g, t)
                 prepared[row, 4 * dim + channel - 128] = act[i]
@@ -284,13 +296,27 @@ class KdaInProj64(SplitKTmemGemm64):
             if cutlass.const_expr(self.kept(t)):
                 r = [self.norm_parts[o * 64 + token] for o in range(OWNERS)]
                 n = (r[0] + r[2]) + (r[1] + r[3])
-                factor = cute.math.rsqrt(n + 1.0e-6, fastmath=True)
-                if section == 0:
-                    factor = factor * scale
+                value = Float32(0)
+                if cutlass.const_expr(self.stock):  # q / |q|, then x scale
+                    value = mul_rn(y[t], triton_rstd(n + 1.0e-6))
+                    if section == 0:
+                        value = mul_rn(value, scale)
+                else:
+                    factor = cute.math.rsqrt(n + 1.0e-6, fastmath=True)
+                    if section == 0:
+                        factor = factor * scale
+                    value = y[t] * factor
                 row = col0 + token  # (q = 8; else the compact row)
                 if cutlass.const_expr(self.tokens != TOKENS):
                     row = self.token_row(col0, g, t)
-                prepared[row, section * self.dim + channel] = y[t] * factor
+                prepared[row, section * self.dim + channel] = value
+
+    def sigmoids(self, values):
+        """The sigmoid of each value (output gates, betas): Triton's (stock) or the
+        correctly rounded ``kernel.sigmoids``; traced inline."""
+        if self.stock:
+            return [triton_sigmoid(v) for v in values]
+        return sigmoids(values)
 
 
 class KdaInProjQ(KdaInProj64):
@@ -300,9 +326,12 @@ class KdaInProjQ(KdaInProj64):
     of the q real tokens at the compact row r q + t (see the module docstring)."""
 
     def __init__(
-        self, *, tactic: SplitKTactic, heads=6, has_bias=False, k=7168, tokens
-    ):
-        super().__init__(tactic=tactic, heads=heads, has_bias=has_bias, k=k)
+        self, *, tactic: SplitKTactic, heads=6, has_bias=False, k=7168, tokens,
+        stock=False,
+    ):  # fmt: skip
+        super().__init__(
+            tactic=tactic, heads=heads, has_bias=has_bias, k=k, stock=stock
+        )
         assert 1 < tokens < TOKENS
         self.tokens = tokens
 
@@ -369,9 +398,10 @@ class KdaInProjQ(KdaInProj64):
 
 
 @cache
-def compile_inproj64(tactic, heads, has_bias, specs, arch):
+def compile_inproj64(tactic, heads, has_bias, specs, arch, stock=False):
     """``KdaInProj64`` for ``tactic`` (128, 64, split, x's slots) and the layouts
-    ``specs`` of (prepared, conv weight, bias, conv state view, slots, accepted)."""
+    ``specs`` of (prepared, conv weight, bias, conv state view, slots, accepted);
+    ``stock``: the stock verify's math (an FP32 recurrent state)."""
 
     def matrix(leading):
         shape = tuple(cute.sym_int() for _ in range(3))
@@ -379,7 +409,7 @@ def compile_inproj64(tactic, heads, has_bias, specs, arch):
         return make_fake_tensor(cutlass.BFloat16, shape, stride, assumed_align=16)
 
     kernel = KdaInProj64(
-        tactic=SplitKTactic(*tactic[:4]), heads=heads, has_bias=has_bias
+        tactic=SplitKTactic(*tactic[:4]), heads=heads, has_bias=has_bias, stock=stock
     )
     tensors = [fake(shape, stride, dtype) for shape, stride, dtype in specs]
     args = (matrix(1), matrix(1), matrix(0), *tensors, Float32(1.0), cutlass.Int64(0))
@@ -389,7 +419,7 @@ def compile_inproj64(tactic, heads, has_bias, specs, arch):
 
 
 @cache
-def compile_inproj_q(tactic, heads, has_bias, specs, arch, tokens):
+def compile_inproj_q(tactic, heads, has_bias, specs, arch, tokens, stock=False):
     """``KdaInProjQ`` (q = ``tokens`` < 8) for ``tactic`` and ``specs`` as
     ``compile_inproj64``; x comes through a tensor map argument."""
 
@@ -399,8 +429,9 @@ def compile_inproj_q(tactic, heads, has_bias, specs, arch, tokens):
         return make_fake_tensor(cutlass.BFloat16, shape, stride, assumed_align=16)
 
     kernel = KdaInProjQ(
-        tactic=SplitKTactic(*tactic[:4]), heads=heads, has_bias=has_bias, tokens=tokens
-    )
+        tactic=SplitKTactic(*tactic[:4]), heads=heads, has_bias=has_bias,
+        tokens=tokens, stock=stock,
+    )  # fmt: skip
     tensors = [fake(shape, stride, dtype) for shape, stride, dtype in specs]
     args = (matrix(1), matrix(1), matrix(0), *tensors, Float32(1.0))
     args += (cutlass.Int64(0), cutlass.Int64(0))
@@ -437,12 +468,16 @@ class PreparedKdaInProj64:
         tensors = self._tensors(prepared, caches, slots, accepted)
         specs, arch = tuple(map(layout, tensors)), architecture(self.device)
         heads, bias = self.core.heads, self.core.has_bias
+        # an FP32 recurrent state: the stock verify's math (KdaVerifyPrepared's too)
+        stock = caches[1].dtype != torch.bfloat16
         with torch.accelerator.device_index(self.device.index):
             if tokens == TOKENS:
-                self.code = compile_inproj64(self.tactic, heads, bias, specs, arch)
+                self.code = compile_inproj64(
+                    self.tactic, heads, bias, specs, arch, stock
+                )
             else:
                 self.code = compile_inproj_q(
-                    self.tactic, heads, bias, specs, arch, tokens
+                    self.tactic, heads, bias, specs, arch, tokens, stock
                 )
         # The early start beside the AttnRes needs the register budget (REGISTERS).
         _, function = resolve_kernel(self.code, self.device.index)
