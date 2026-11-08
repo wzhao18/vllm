@@ -249,6 +249,17 @@ def test_loaded_groups_follow_the_connector_serving_the_request(mc, chosen):
     mc._connectors[1 - chosen].get_loaded_kv_cache_group_ids.assert_not_called()
 
 
+def test_multi_connector_polls_every_connector(mc: MultiConnector):
+    first, second = mc._connectors
+    first.poll_finished_recving.return_value = {"a", "b"}
+    # A connector that does not report loads early contributes nothing.
+    second.poll_finished_recving.return_value = set()
+
+    assert mc.poll_finished_recving() == {"a", "b"}
+    first.poll_finished_recving.assert_called_once_with()
+    second.poll_finished_recving.assert_called_once_with()
+
+
 def test_multi_connector_mem_pool_context_none(mc: MultiConnector):
     assert mc.get_mem_pool_context() is None
 

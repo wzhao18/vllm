@@ -356,6 +356,7 @@ def test_worker_methods_delegate_to_store_worker():
     worker = mock_worker_cls.return_value
     worker.get_finished.return_value = ({"req-1"}, {"req-2"})
     worker.get_block_ids_with_load_errors.return_value = {3, 4}
+    worker.poll_finished_recving.return_value = {"req-5"}
     connector.bind_connector_metadata(metadata)
 
     connector.register_kv_caches(kv_caches)
@@ -371,6 +372,7 @@ def test_worker_methods_delegate_to_store_worker():
     assert result == ({"req-1"}, {"req-2"})
     worker.get_block_ids_with_load_errors.assert_called_once_with()
     assert invalid_block_ids == {3, 4}
+    assert connector.poll_finished_recving() == {"req-5"}
 
 
 def test_get_transfer_results_delegates_to_store_worker():

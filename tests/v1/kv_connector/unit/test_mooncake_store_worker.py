@@ -4415,6 +4415,7 @@ def _make_bare_worker(
     worker.kv_recv_threads = []
     worker.num_recv_threads = 1
     worker.recv_request_queue = queue.Queue()
+    worker._recv_poller_active = False
     worker._device_regions = {}
     worker._released_regions = set()
     worker.finished_store_req = set()
@@ -6271,3 +6272,198 @@ def test_blob_block_hashes_empty():
     view = BlobBlockHashes(memoryview(b""), 0)
     assert len(view) == 0
     assert list(view) == []
+
+
+# ---------------------------------------------------------------------------
+# Early (output-time) reporting of clean loads
+# ---------------------------------------------------------------------------
+
+
+def test_recv_thread_successful_load_is_clean():
+    store = MagicMock()
+    store.batch_get_into_multi_buffers.return_value = [256, 256]
+    thread = _make_store_recving_thread(store)
+
+    thread._handle_request(_make_load_req("req-a", [b"a0", b"a1"], token_len=32))
+
+    # Left to the poller by the in-band report, then drained exactly once.
+    assert thread.get_and_clear_finished_requests(include_clean=False) == set()
+    assert thread.take_clean_finished_requests() == {"req-a"}
+    assert thread.take_clean_finished_requests() == set()
+    assert thread.get_and_clear_finished_requests() == set()
+
+
+@pytest.mark.parametrize("failure", ["partial", "exception", "oversized"])
+@pytest.mark.parametrize("is_hma_required", [False, True])
+def test_recv_thread_failed_load_is_reported_in_band(failure, is_hma_required):
+    store = MagicMock()
+    if failure == "partial":
+        store.batch_get_into_multi_buffers.return_value = [256, -5]
+    elif failure == "exception":
+        store.batch_get_into_multi_buffers.side_effect = RuntimeError("boom")
+    thread = _make_store_recving_thread(
+        store,
+        disk_offload_buffer_budget_bytes=(
+            _DISK_OFFLOAD_BUDGET_TOO_SMALL if failure == "oversized" else None
+        ),
+        is_hma_required=is_hma_required,
+    )
+
+    thread._handle_request(_make_load_req("req-a", [b"a0", b"a1"], token_len=32))
+
+    assert thread.take_clean_finished_requests() == set()
+    # The failure is drained together with the finished report.
+    assert thread.get_and_clear_finished_requests(include_clean=False) == {"req-a"}
+    if is_hma_required:
+        assert thread.get_and_clear_failed_requests() == {"req-a"}
+    else:
+        assert thread.get_and_clear_block_ids_with_load_errors()
+
+
+def test_recv_thread_in_band_drain_keeps_clean_loads_for_the_poller():
+    thread = _make_store_recving_thread(MagicMock())
+    thread.set_finished_request("ok", clean=True)
+    thread.set_finished_request("bad")
+
+    assert thread.get_and_clear_finished_requests(include_clean=False) == {"bad"}
+    assert thread.take_clean_finished_requests() == {"ok"}
+    assert thread.get_and_clear_finished_requests() == set()
+
+    # Before the poller runs, the in-band drain reports clean loads too.
+    thread.set_finished_request("ok2", clean=True)
+    assert thread.get_and_clear_finished_requests() == {"ok2"}
+    assert thread.take_clean_finished_requests() == set()
+
+
+@pytest.mark.parametrize("first_clean", [True, False])
+def test_recv_thread_duplicate_sighting_is_reported_in_band(first_clean):
+    thread = _make_store_recving_thread(MagicMock())
+    thread.set_finished_request("req-a", clean=first_clean)
+    thread.set_finished_request("req-a", clean=True)
+
+    assert thread.take_clean_finished_requests() == set()
+    assert thread.get_and_clear_finished_requests(include_clean=False) == {"req-a"}
+
+
+def test_recv_thread_concurrent_drains_report_each_load_once():
+    thread = _make_store_recving_thread(MagicMock())
+    num_loads = 5000
+    clean = {f"req-{i}" for i in range(num_loads) if i % 3}
+    done = threading.Event()
+    polled: list[set[str]] = []
+    in_band: list[set[str]] = []
+
+    def drain(take, out):
+        while not done.is_set():
+            if taken := take():
+                out.append(taken)
+        out.append(take())
+
+    drainers = [
+        threading.Thread(
+            target=drain, args=(thread.take_clean_finished_requests, polled)
+        ),
+        threading.Thread(
+            target=drain,
+            args=(
+                lambda: thread.get_and_clear_finished_requests(include_clean=False),
+                in_band,
+            ),
+        ),
+    ]
+    for t in drainers:
+        t.start()
+    for i in range(num_loads):
+        req_id = f"req-{i}"
+        thread.set_finished_request(req_id, clean=req_id in clean)
+    done.set()
+    for t in drainers:
+        t.join()
+
+    polled_ids = set().union(*polled)
+    in_band_ids = set().union(*in_band)
+    assert sum(map(len, polled)) == len(polled_ids)
+    assert sum(map(len, in_band)) == len(in_band_ids)
+    assert polled_ids == clean
+    assert in_band_ids == {f"req-{i}" for i in range(num_loads)} - clean
+
+
+def test_poller_takes_over_clean_loads_once_active():
+    w = _make_bare_worker(kv_role="kv_consumer")
+    recv_thread = _make_store_recving_thread(MagicMock())
+    w.kv_recv_threads = [recv_thread]
+    meta = mooncake_store_worker.MooncakeStoreConnectorMetadata(set(), set())
+
+    # Before the first poll every load is reported in-band, as before.
+    recv_thread.set_finished_request("a", clean=True)
+    assert w.get_finished(set(), meta) == (set(), {"a"})
+
+    recv_thread.set_finished_request("b", clean=True)
+    recv_thread.set_finished_request("c")
+    assert w.poll_finished_recving() == {"b"}
+    assert w.get_finished(set(), meta) == (set(), {"c"})
+
+    recv_thread.set_finished_request("d", clean=True)
+    assert w.get_transfer_results(set(), meta).finished_recving == set()
+    assert w.poll_finished_recving() == {"d"}
+    assert w.poll_finished_recving() == set()
+
+    stats = w.get_kv_connector_stats()
+    assert stats is not None
+    reduced = stats.reduce()
+    assert reduced["events_recv_reported_in_band"] == 2
+    assert reduced["events_recv_reported_by_poll"] == 2
+
+
+@pytest.mark.parametrize(
+    ("capacity_only", "load_async"), [(True, True), (False, False)]
+)
+def test_poller_is_inert_without_async_loads(capacity_only, load_async):
+    w = _make_bare_worker(kv_role="kv_consumer")
+    recv_thread = _make_store_recving_thread(MagicMock())
+    w.kv_recv_threads = [recv_thread]
+    w._capacity_only = capacity_only
+    w.load_async = load_async
+    recv_thread.set_finished_request("a", clean=True)
+
+    assert w.poll_finished_recving() == set()
+    assert not w._recv_poller_active
+    assert recv_thread.take_clean_finished_requests() == {"a"}
+
+
+def test_mooncake_store_stats_event_counts_aggregate_reduce():
+    stats = MooncakeStoreConnectorStats()
+    stats.increment("recv_reported_by_poll", 2)
+    other = MooncakeStoreConnectorStats()
+    other.increment("recv_reported_by_poll")
+    other.increment("recv_reported_in_band", 4)
+    other.record_operation("load_get", 0.01, 2, num_bytes=128)
+
+    reduced = stats.aggregate(other).reduce()
+
+    assert reduced["events_recv_reported_by_poll"] == 3
+    assert reduced["events_recv_reported_in_band"] == 4
+    assert reduced["load_get_count"] == 1
+
+
+def test_mooncake_store_prom_metrics_skip_event_counts():
+    from prometheus_client import Counter, Gauge, Histogram
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.metrics import (  # noqa: E501
+        MooncakeStorePromMetrics,
+    )
+
+    metric_cls = MagicMock()
+    prom = MooncakeStorePromMetrics(
+        SimpleNamespace(kv_transfer_config=None),
+        {Gauge: metric_cls, Counter: metric_cls, Histogram: metric_cls},
+        ["model_name", "engine"],
+        {0: ["model", "0"]},
+    )
+    stats = MooncakeStoreConnectorStats()
+    stats.increment("recv_reported_by_poll")
+    stats.record_operation("load_get", 0.01, 2, num_bytes=128)
+
+    prom.observe(stats.data)
+
+    assert list(prom._metric_cache) == [(0, "load_get", "ok")]

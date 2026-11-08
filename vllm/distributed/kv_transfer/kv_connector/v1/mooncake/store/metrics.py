@@ -4,7 +4,8 @@
 
 Records one row per Mooncake RPC (``save_exists``, ``save_put``, ``load_get``,
 ``lookup_exists``) with duration, key/byte counts, status, and failed-key
-count. Exposed to the logger via ``KVConnectorLogging`` and to Prometheus
+count, plus plain event counters (e.g. where finished loads were reported).
+Exposed to the logger via ``KVConnectorLogging`` and to Prometheus
 via ``MooncakeStorePromMetrics``.
 """
 
@@ -19,6 +20,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     PromMetric,
     PromMetricT,
 )
+
+# Key in MooncakeStoreConnectorStats.data holding {event name: count}.
+_EVENT_COUNTS = "event_counts"
+
+_OperationRecords = list[dict[str, int | float | str]]
 
 
 def _nearest_rank_percentile(values: list[float], percentile: float) -> float:
@@ -40,7 +46,7 @@ class MooncakeStoreConnectorStats(KVConnectorStats):
             self.reset()
 
     def reset(self):
-        self.data: dict[str, list[dict[str, int | float | str]]] = {}
+        self.data: dict[str, _OperationRecords | dict[str, int]] = {}
 
     def is_empty(self) -> bool:
         return not self.data
@@ -49,13 +55,23 @@ class MooncakeStoreConnectorStats(KVConnectorStats):
         if other.is_empty():
             return self
         for operation, records in other.data.items():
-            self.data.setdefault(operation, []).extend(records)
+            if isinstance(records, dict):
+                for event, count in records.items():
+                    self.increment(event, count)
+            else:
+                self._records(operation).extend(records)
         return self
 
     def reduce(self) -> dict[str, int | float]:
         reduced: dict[str, int | float] = {}
         for operation, records in sorted(self.data.items()):
             if not records:
+                continue
+            if isinstance(records, dict):
+                reduced.update(
+                    (f"events_{event}", count)
+                    for event, count in sorted(records.items())
+                )
                 continue
             durations = [float(record["duration_seconds"]) for record in records]
             reduced[f"{operation}_count"] = len(records)
@@ -77,6 +93,12 @@ class MooncakeStoreConnectorStats(KVConnectorStats):
             )
         return reduced
 
+    def increment(self, event: str, count: int = 1) -> None:
+        """Add `count` occurrences of a plain event counter."""
+        counts = self.data.setdefault(_EVENT_COUNTS, {})
+        assert isinstance(counts, dict)
+        counts[event] = counts.get(event, 0) + count
+
     def record_operation(
         self,
         operation: str,
@@ -87,7 +109,7 @@ class MooncakeStoreConnectorStats(KVConnectorStats):
         status: str = "ok",
         num_failed_keys: int = 0,
     ) -> None:
-        self.data.setdefault(operation, []).append(
+        self._records(operation).append(
             {
                 "duration_seconds": duration_seconds,
                 "num_keys": num_keys,
@@ -96,6 +118,11 @@ class MooncakeStoreConnectorStats(KVConnectorStats):
                 "num_failed_keys": num_failed_keys,
             }
         )
+
+    def _records(self, operation: str) -> _OperationRecords:
+        records = self.data.setdefault(operation, [])
+        assert isinstance(records, list)
+        return records
 
 
 class MooncakeStorePromMetrics(KVConnectorPromMetrics):
@@ -177,6 +204,8 @@ class MooncakeStorePromMetrics(KVConnectorPromMetrics):
         if not transfer_stats_data:
             return
         for operation, records in transfer_stats_data.items():
+            if operation == _EVENT_COUNTS:
+                continue
             assert isinstance(records, list)
             for record in records:
                 assert isinstance(record, dict)

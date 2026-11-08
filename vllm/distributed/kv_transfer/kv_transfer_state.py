@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from copy import copy
 from typing import TYPE_CHECKING
 
 from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBaseType
@@ -8,10 +9,14 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorBase_V1,
     KVConnectorRole,
 )
+from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.kv_cache_interface import KVCacheConfig
+    from vllm.v1.outputs import ModelRunnerOutput
+
+logger = init_logger(__name__)
 
 _KV_CONNECTOR_AGENT: KVConnectorBaseType | None = None
 
@@ -47,6 +52,46 @@ def is_v1_kv_transfer_group(connector: KVConnectorBaseType | None = None) -> boo
         return False
 
     return isinstance(connector, KVConnectorBase_V1)
+
+
+def poll_finished_recving_into(output: "ModelRunnerOutput") -> "ModelRunnerOutput":
+    """Add the loads the connector finished since its last report to `output`.
+
+    Called right before a worker sends a step's output, so a load that
+    finished while the step ran rides the earliest output instead of the
+    output of the step that next calls `get_transfer_results()`. See
+    `KVConnectorBase_V1.poll_finished_recving`.
+
+    An output without a KVConnectorOutput may be shared (e.g. the empty
+    output), so it is copied rather than written to; callers must use the
+    return value.
+    """
+    # Read once: set_disabled() and shutdown can reset the agent concurrently.
+    connector = _KV_CONNECTOR_AGENT
+    if not isinstance(connector, KVConnectorBase_V1):
+        return output
+    try:
+        finished_recving = connector.poll_finished_recving()
+    except Exception:
+        # Keep the output flowing: a raise here would stall the engine on this
+        # step. Implementations must not raise; loads drained before a raise
+        # are lost.
+        logger.exception("KV connector poll_finished_recving() failed")
+        return output
+    if not finished_recving:
+        return output
+    if (kv_connector_output := output.kv_connector_output) is None:
+        from vllm.v1.outputs import KVConnectorOutput
+
+        output = copy(output)
+        output.kv_connector_output = KVConnectorOutput(
+            finished_recving=finished_recving
+        )
+    else:
+        kv_connector_output.finished_recving = (
+            kv_connector_output.finished_recving or set()
+        ) | finished_recving
+    return output
 
 
 def _sync_engine_id_across_tp(vllm_config: "VllmConfig") -> None:
