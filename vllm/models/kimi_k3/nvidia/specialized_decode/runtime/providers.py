@@ -67,7 +67,19 @@ HEAD_BATCHES = (8,)
 # (the B1 x q8 head leaves eight idle), so DL3 B2 takes DL7 B1's KDA layer (head ->
 # polled fused o-projection); its projection sums K in four split-K partials instead
 # of the 8-row bin's two (the same stated FP32 reorder).
-HEAD_MULTI = {8: "16:1", 4: "8:1"}  # (BF16 state; FP32: see HEAD_BATCHES' NQ-TUNE)
+# FP32 state (stock math since 2026-11-08: ``KdaHead.stock``, bitwise the in-projection
+# -> KdaSplitStock pair): the same rows. VR200 kernel bench (nqbench kda2-t1, bench_kda
+# section a, 1 GPU, 69 layers each behind a PDL AttnRes stand-in, graph us per layer
+# incl. the stand-in), head vs that pair: q8 M8 (KdaHeadVerify) 14.57 vs 17.92, q8 M16
+# 16.05 vs 20.75, q4 M8 13.89 vs 16.77, q1 B8 13.70 vs 16.18. TP16 4-node step A/B (as
+# KDA_FOLD64_FP32's), pair -> head: q8 M8 (C1) 5470.2 -> 5261.1 (-3.8%), q8 M16 (C8)
+# 7173.3 -> 7025.9 (-2.1%), q4 M8 (B2, c256's config) 5421.1 -> 5258.6 (-3.0%). The
+# q4 layers' head also moves rows it does not serve, by the per-layer AttnRes
+# carve-out (HEAD_BEFORE_CARVEOUT) and the MoE tail's early release (``use_heads``):
+# q4 M64 11889.9 -> 11912.5 (+0.19%, both process pairs), M256 20074.0 -> 20089.7
+# (+0.08%), M512 28852.3 -> 28841.2 (-0.04%); q8 M32 9205.3 -> 9208.6. (NQ-TUNE: a
+# per-batch carve-out would keep those at the plain rows' setting.)
+HEAD_MULTI = {8: "16:1", 4: "8:1"}
 # Devices with more SMs than GB300's 152 (Rubin: 212), TP16 B<=8, by rows. KDA: 102 CTAs
 # (split 2) instead of 204, so every CTA starts and preloads its weights beside the
 # 56-CTA AttnRes. MLA: SplitKTmemGemm, M128 tiles split over K by 7 (161 CTAs in
@@ -117,9 +129,17 @@ WIDE_B64_STAGES = 6
 # earlier); the fold's in-projection costs ~+1.0 us at q4 and q8 alike, the q4 verify
 # saves less. (A pair timed with no consumer, ended by its slowest CTA, shows the
 # fold losing at every q, q8 included.) Rows 40 / 48 (q 5 / 6) fold bitwise, untimed.
-# BF16 state only (an FP32 state keeps the stock-math plain verify: the fold computes
-# KdaSplit's math).
+# An FP32 state (the production precision) folds by KDA_FOLD64_FP32: the epilogue
+# and the prepared verify then compute the stock verify's math (KdaInProj64 /
+# KdaVerifyPrepared with ``stock``; bitwise the stock-math KdaSplitStock pair).
 KDA_FOLD64: dict[int, str] = {16: "32:1,64:1"}
+# FP32 state: B8 x q8 only. TP16 4-node step A/B (VR200, the whole decode step: target
+# forward + drafter propose in one CUDA graph, AgentX contexts, median us of the max
+# over 16 ranks, two processes per arm on the same nodes): no fold (5ec8564,
+# KdaSplitStock) -> the stock-math fold at q8 M64 (c64) 11648.9 -> 11576.3 (-0.62%);
+# the q4 fold (KdaSplit's math, before) paid nothing at step level (b801dda -> 5ec8564
+# q4 M32 -1.8), so q4 keeps the plain KdaSplitStock.
+KDA_FOLD64_FP32: dict[int, str] = {16: "64:1"}
 # Devices with more SMs than GB300's 152 (Rubin), TP16 bins 16-64, by rows:
 # SplitKTmemGemm64 (128, 64, split, x's slots, 14): the weights of each 128-row tile's K
 # slice staged in tensor memory (and shared memory) before the PDL wait, clusters of
@@ -467,13 +487,10 @@ class Attention:
             kdasplit = [b for b in runtime.batches if b not in self.kda_stock]
             verify = [b // q for b in kdasplit if q > 1 and b % q == 0]
             policies.update({(b, q): (pitch, int(tp == 8)) for b in verify})
-            fold = batch_table(KDA_FOLD64.get(tp, "") if sms > 152 else "")
+            fold = KDA_FOLD64 if runtime.bf16_state else KDA_FOLD64_FP32
+            fold = batch_table(fold.get(tp, "") if sms > 152 else "")
             folded = 64 in tactics and len(tactics[64]) > 4 and pitch == 3216
             folded = folded and bool(fold.get(8 * q)) and 4 <= q <= 8 and 8 in verify
-            # BF16 state only: the fold's epilogue (KdaInProj64) and KdaVerifyPrepared
-            # / Cols compute KdaSplit's math (fast rsqrt, no BF16 conv rounding), not
-            # stock's; an FP32 state's B8 rows run the stock-math plain verify
-            folded = folded and runtime.bf16_state
             prepared = ((8, q),) if folded else ()
             dim_first = is_conv_state_dim_first()
             self.core = PreparedKda(attention, policies, dim_first, prepared=prepared)
@@ -512,12 +529,10 @@ class Attention:
                 strict=runtime.context.target,
             )  # fmt: skip
             batches = [b for b in HEAD_BATCHES if b in runtime.batches and fits(b, 1)]
-            # Verify heads (KdaHeadVerify / KdaHeadMulti) for a BF16 state only (not
-            # probed otherwise): their recurrence is KdaSplit's math (fast rsqrt / exp,
-            # no BF16 conv rounding); an FP32 state's verify rows run the stock-math
-            # plain verify (kda.prepared.KdaSplitStock / KdaVerifyLoopStock)
-            stock_verify = not runtime.bf16_state
-            multi = batch_table("" if stock_verify else HEAD_MULTI.get(q, ""))
+            # Verify heads (KdaHeadVerify / KdaHeadMulti): an FP32 state's compute the
+            # stock verify's math (``KdaHead.stock``: bitwise the in-projection ->
+            # KdaSplitStock pair)
+            multi = batch_table(HEAD_MULTI.get(q, ""))
             multi = [
                 b for b in runtime.batches if multi.get(b) and b % q == 0 and fits(b, q)
             ]
@@ -547,7 +562,7 @@ class Attention:
                 verify = [
                     (b, runtime.q)
                     for b in batches
-                    if b == runtime.q == 8 and not stock_verify and fits(b, runtime.q)
+                    if b == runtime.q == 8 and fits(b, runtime.q)
                 ]
                 verify += [(b, q) for b in multi]  # KdaHeadMulti
                 self.head = PreparedKdaHead(
