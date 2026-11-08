@@ -3155,9 +3155,12 @@ def test_prepared_dsa_dcp_sparse_core_exchange(
     launches without PDL, so the core takes M8 and M16 (its q poll precedes its PDL
     wait)."""
     from vllm.model_executor.layers import sparse_attn_indexer
+    from vllm.models.kimi_k3.nvidia.dsa_kernels.dcp_exchange import decode as dcpx
 
-    # This case's layer alone takes the exchange (the other tests: the #63 merge).
+    # This case's layer alone takes the exchange (the other tests: the #63 merge),
+    # at every row (production: MIN_ROWS by DCP size; the kernel path is under test)
     monkeypatch.setattr(sparse_attn_indexer, "DCP_DECODE_TOPK_HOOKS", {})
+    monkeypatch.setattr(dcpx, "MIN_ROWS", {})
     step = run_layer_step(
         "fi-trtllm",
         batch,
@@ -3217,11 +3220,14 @@ def test_prepared_dsa_dcp_exchange_proj(dcp8_group, monkeypatch, core, batch):
     layers on alternating parities, the exchange's slots and counts poisoned
     before each, 200 replays give the eager rows bit for bit."""
     from vllm.model_executor.layers import sparse_attn_indexer
+    from vllm.models.kimi_k3.nvidia.dsa_kernels.dcp_exchange import decode as dcpx
 
     if LAYER_CORES[core][2] == "prims_ts" and no_prims_ts():
         pytest.skip("FlashInfer prims_ts sparse MLA cannot run here")
-    # This case's layer alone takes the exchange (the other tests: the #63 merge).
+    # This case's layer alone takes the exchange (the other tests: the #63 merge),
+    # at every row (production: MIN_ROWS by DCP size; the kernel path is under test)
     monkeypatch.setattr(sparse_attn_indexer, "DCP_DECODE_TOPK_HOOKS", {})
+    monkeypatch.setattr(dcpx, "MIN_ROWS", {})
     step = run_layer_step(
         core, batch, 8, dcp8_group, None, "proj", graph=True, replays=200, exchange=True
     )
@@ -3537,11 +3543,14 @@ def test_wide_dsa_dcp_exchange(dcp8_group, monkeypatch, core, batch, q):
     "fi-nvfp4": an nvfp4_ds_mla cache (WideDsa's MlaQuery inserts its rows; FlashInfer
     prims_ts everywhere)."""
     from vllm.model_executor.layers import sparse_attn_indexer
+    from vllm.models.kimi_k3.nvidia.dsa_kernels.dcp_exchange import decode as dcpx
 
     if LAYER_CORES[core][2] == "prims_ts" and no_prims_ts():
         pytest.skip("FlashInfer prims_ts sparse MLA cannot run here")
-    # This case's layer alone takes the exchange (the other tests: the #63 merge).
+    # This case's layer alone takes the exchange (the other tests: the #63 merge),
+    # at every row (production: MIN_ROWS by DCP size; the kernel path is under test)
     monkeypatch.setattr(sparse_attn_indexer, "DCP_DECODE_TOPK_HOOKS", {})
+    monkeypatch.setattr(dcpx, "MIN_ROWS", {})
     step = run_wide_exchange_step(batch, q, dcp8_group, replays=200, core=core)
     check_layer_step(step, q, reference=False)
     same = [

@@ -71,9 +71,12 @@ def test_wanted_kv_role(sm, kv_role, expected):
 
 
 def test_stock_tie_rule():
-    """Ties at the K-th key go by ascending global id, the stock merge's rule."""
+    """Ties at the K-th key go by ascending global id, the stock merge's rule; the
+    per-shape row floor."""
     assert decode.TIE_ORDER == "global"
     assert decode.ONE_ROUND_ROWS == 256
+    # DCP16 (C1 / C8): steps up to 16 rows keep the #63 merge; other DCP sizes: all
+    assert decode.MIN_ROWS == {16: 17}
 
 
 def _launcher(resident: dict[int, int], fit_wave: bool = True):

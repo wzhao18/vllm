@@ -19,8 +19,9 @@ K-th key by ascending global token id (the stock merge's rule; ``TIE_ORDER``).
 
 Policy (``wanted``, no switch): built on a decode instance (not a prefill-only P/D
 producer) under 1 < DCP == TP (head owner = rank) on SM107 (Rubin, where it was
-measured), where DeepGEMM's MX-scaled MQA logits give bf16 logits; every pure-decode
-step up to ``topk_cap`` rows. Other layouts keep the stock DCP path, logged.
+measured), where DeepGEMM's MX-scaled MQA logits give bf16 logits; the pure-decode
+steps of MIN_ROWS[DCP] to ``topk_cap`` rows (smaller ones: the #63 merge). Other layouts
+keep the stock DCP path, logged.
 """
 
 from __future__ import annotations
@@ -49,6 +50,15 @@ TIE_ORDER = "global"
 # round over the K-th key's bin, so the selection is exact either way. Old DCP16 q8
 # step (AgentX): B1 5731 -> 5635 us with it.
 ONE_ROUND_ROWS = 256
+# Fewest rows a step needs for the exchange's top-k, by DCP size (others: 1); smaller
+# steps keep the #63 one-round DCP top-k merge (stock ties too), which the DSA sparse
+# core also reads.
+# 16-rank step (TP16 = DCP16, AgentX, q8, new drafter, stock-precision core; us per
+# step, exchange at every row / #63 merge up to 16 rows): B1 M8 5289 / 4919, B2 M16
+# 7205 / 6805. The stock tie rule's extra NVLink round costs the exchange 8.3-9.2 us
+# per call at DCP16 q8 rows 8-64 (ties straddle ranks on every row of bf16 logits;
+# bench_dcp_topk_ties.py), 1.3-8.2 at q4 rows 64-512, 13.8-14.8 at DCP4 rows 512.
+MIN_ROWS = {16: 17}
 # Most bf16 keys a top-k CTA stages in shared memory (the kernel's 96 KB opt-in), and
 # a bound on its static shared memory (bytes).
 SMEM_KEYS = 48 * 1024
@@ -122,6 +132,7 @@ class DcpxDecode:
         # window), so the coarse round is wasted: 55 -> 40 us per call at M8, 99 ->
         # 65 us at M128.
         self.small_ctx = 1 << 30
+        self.min_rows = MIN_ROWS.get(self.W, 1)
         self.fit_wave = FIT_WAVE
         # topk_merge reads bf16 logits: DeepGEMM's MX-scaled MQA logits kernels (SM100
         # family) return bf16 (``wanted`` checked them). Decided here, not per step:
@@ -188,9 +199,10 @@ class DcpxDecode:
             )
         logger.info(
             "Kimi K3.1 DSA decode: DcpExchange top-k on (DCP%d, interleave %d, rows "
-            "<= %d, one-round rows <= %d, ties by global id)",
+            "%d-%d, one-round rows <= %d, ties by global id)",
             self.W,
             self.interleave,
+            self.min_rows,
             self.topk_cap,
             cap1,
         )
@@ -200,7 +212,7 @@ class DcpxDecode:
         """Pure-decode steps of uniform rows whose indexer and MLA metadata the
         exchange covers. Both the indexer op and the MLA layer decide with this, from
         the same step metadata, so they always agree (and so do all DCP ranks)."""
-        if not 0 < rows <= self.topk_cap:
+        if not self.min_rows <= rows <= self.topk_cap:
             return False
         from vllm.forward_context import get_forward_context
 
