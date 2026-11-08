@@ -1,19 +1,33 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Kimi K3 specialized decode KDA kernels with an FP32 recurrent state on Rubin vs the
-stock layer (``KimiK3DeltaAttention._forward``, native Triton: ``causal_conv1d_update``
--> ``fused_recurrent_kda`` (verify) / ``fused_recurrent_kda_packed_decode`` (q = 1) ->
-``o_norm``) on the same in-projection rows:
+stock layer (``KimiK3DeltaAttention._forward``) on the same in-projection rows. The
+stock backends are the ones the layer resolves (``resolve_kda_decode_backend`` /
+``resolve_kda_spec_decode_backend``, ``auto``) for the deployment: at the production
+conv layout (DS) in a speculative deployment (``num_spec`` > 0) every head count
+resolves to the native Triton path (``causal_conv1d_update`` -> ``fused_recurrent_kda``
+(verify) / ``fused_recurrent_kda_packed_decode`` (q = 1) -> ``o_norm``): FlashInfer's
+packed verify needs the SD layout, the CUDA ``fused_kda_decode`` no speculation.
+Covered:
 
 * the verify heads (``KdaHeadVerify`` B1 x q8, ``KdaHeadMulti`` 2 x q8 / 2 x q4) and the
   q = 1 head (``KdaHeadWide`` B8), plain and polled output, from x through the
-  projection the heads reproduce (``reference_projection``);
+  projection the heads reproduce (``reference_projection``), two weight / input seeds;
 * the B8 fold (``KdaInProj64`` / ``KdaInProjQ`` epilogue -> ``KdaVerifyCols``), from
   the rows the fold publishes; also bit for bit the plain stock-math pair
-  (``KdaSplitStock``) on those rows;
+  (``KdaSplitStock``) on those rows, and its in-projection GEMM (the published Q / K /
+  V / gate / F_A / beta columns) within one BF16 rounding of the exact product (FP32
+  accumulation in its split-K order); two seeds;
 * the q = 1 decode (``KdaSplitStock``) at TP16 (6 heads, gate mode 0) and TP8 (12
   heads, gate modes 1 / 2 / 0 by batch, as ``providers.Attention``);
-* the TP8 verify (12 heads, gate mode 1: ``KdaSplitStock``).
+* the TP8 verify (12 heads, gate mode 1: ``KdaSplitStock``), each ``SPEC_SCHEDULE[12]``
+  class (requests 1, 4, 8, 16) and 64.
+
+A plain (non-speculative) deployment at 12 / 24 / 48 / 96 local heads resolves its
+q = 1 decode to the CUDA ``fused_kda_decode`` (fast-math exp / rsqrt) when the build
+has it, a different math (state relerr ~1.9e-3 vs Triton):
+``test_fp32_decode_q1_plain`` compares against what that deployment resolves (TP8:
+strict xfail, an open item; the sweep's deployments are speculative).
 
 Each matches stock to FP32 reduction order, with the thresholds of
 ``test_specialized_decode_kda_loop_gpu.py``: the conv window bit for bit, the states
@@ -51,7 +65,14 @@ from tests.models.kimi_k3.test_specialized_decode_kda_loop_gpu import (  # noqa:
     relative_error,
     spec_inputs,
 )
-from vllm.models.kimi_k3.nvidia.kda import KimiK3DeltaAttention  # noqa: E402
+from vllm.model_executor.layers.mamba.mamba_utils import (  # noqa: E402
+    is_conv_state_dim_first,
+)
+from vllm.models.kimi_k3.nvidia.kda import (  # noqa: E402
+    KimiK3DeltaAttention,
+    resolve_kda_decode_backend,
+    resolve_kda_spec_decode_backend,
+)
 from vllm.models.kimi_k3.nvidia.kda_metadata import KimiK3KDAMetadata  # noqa: E402
 from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda import (  # noqa: E402
     prepared,
@@ -75,12 +96,43 @@ DIM = 768
 FOLD_TACTIC = providers.WIDE_B64[PITCH][:4]
 
 
-def stock_run(attention, projected, base, slots, accepted, q, monkeypatch):
+def stock_backends(heads, num_spec):
+    """The (decode, spec decode) backends the stock layer resolves (``auto``) for an
+    FP32 state, BF16 activations / conv state, D 128, W 4 and this process's conv
+    layout (the test caches': DS)."""
+    assert is_conv_state_dim_first(), "run with VLLM_SSM_CONV_STATE_LAYOUT=DS"
+    dtypes = (torch.bfloat16, torch.bfloat16, torch.float32)
+    decode = resolve_kda_decode_backend("auto", heads, 128, 4, num_spec, *dtypes)
+    spec = resolve_kda_spec_decode_backend(
+        "auto", heads, 128, 4, num_spec, *dtypes, -5.0, False
+    )
+    return decode, spec
+
+
+def stock_run(
+    attention, projected, base, slots, accepted, q, monkeypatch, num_spec=None
+):
     """The stock layer's KDA core from the in-projection rows (seam S1,
     ``providers.Attention.stock_kda``): the spec verify for q > 1 (``slots`` [B, q],
-    ``accepted`` [B]), the plain decode for q = 1 (``slots`` [B])."""
+    ``accepted`` [B]), the plain decode for q = 1 (``slots`` [B]), on the backends
+    the layer resolves in a deployment of ``num_spec`` speculative tokens (default
+    q - 1, and 3 for q = 1: a speculative deployment's plain rows)."""
     rows = projected.shape[0]
     heads = attention.A_log.numel()
+    if num_spec is None:
+        num_spec = q - 1 if q > 1 else 3
+    decode_backend, spec_backend = stock_backends(heads, num_spec)
+    assert spec_backend == "native", spec_backend  # DS: no FlashInfer packed verify
+    assert decode_backend in ("triton", "native"), decode_backend
+    assert decode_backend == "triton" or not num_spec, decode_backend
+    dim = 128 * heads
+    decode_conv = decode_norm = None
+    if decode_backend == "native":  # the CUDA fused_kda_decode's weight copies
+        conv = attention.conv1d.weight.squeeze(1)
+        decode_conv = torch.stack(
+            [conv[i * dim : (i + 1) * dim].transpose(0, 1) for i in range(3)]
+        ).contiguous()
+        decode_norm = attention.o_norm.weight.detach().clone()
     fields = dict(num_prefills=0, num_prefill_tokens=0, num_actual_tokens=rows)
     if q > 1:
         requests = rows // q
@@ -106,9 +158,10 @@ def stock_run(attention, projected, base, slots, accepted, q, monkeypatch):
     monkeypatch.setattr(kda_module, "get_forward_context", lambda: context)
     state = tuple(t.clone() for t in base)
     layer = Module(
-        prefix=PREFIX, kv_cache=state, kda_spec_decode_backend="native",
-        kda_decode_backend="triton", kda_prefill_backend="triton",
-        decode_conv1d_weight=None, decode_norm_weight=None, conv1d=attention.conv1d,
+        prefix=PREFIX, kv_cache=state, kda_spec_decode_backend=spec_backend,
+        kda_decode_backend=decode_backend, kda_prefill_backend="triton",
+        decode_conv1d_weight=decode_conv, decode_norm_weight=decode_norm,
+        conv1d=attention.conv1d,
         local_projection_size=128 * heads, local_num_heads=heads, head_dim=128,
         use_recoverssm=False, A_log=attention.A_log, dt_bias=attention.dt_bias,
         gate_lower_bound=attention.gate_lower_bound, o_norm=attention.o_norm,
@@ -156,12 +209,13 @@ HEAD_SHAPES = [
 ]
 
 
+@pytest.mark.parametrize("seed", [3, 11])
 @pytest.mark.parametrize("rows,q,polled", HEAD_SHAPES)
-def test_fp32_heads_match_stock(monkeypatch, rows, q, polled):
+def test_fp32_heads_match_stock(monkeypatch, rows, q, polled, seed):
     """A KdaHead kernel (FP32 state: ``KdaHead.stock``) from x vs the stock layer on
     the projection the head reproduces."""
-    attention = kda_attention()
-    g = torch.Generator(device=DEVICE).manual_seed(3)
+    attention = kda_attention(seed=seed)
+    g = torch.Generator(device=DEVICE).manual_seed(seed)
     weight = torch.randn(PITCH, HIDDEN, generator=g, device=DEVICE) * HIDDEN**-0.5
     weight = weight.to(torch.bfloat16)
     x = torch.randn(rows, HIDDEN, generator=g, device=DEVICE).to(torch.bfloat16)
@@ -169,15 +223,16 @@ def test_fp32_heads_match_stock(monkeypatch, rows, q, polled):
     key = rows if q == 1 else (requests, q)
     core = prepared.PreparedKda(attention, {key: (PITCH, 0)}, True)
     slots = 4 * rows + 1
-    base = caches(slots, q)
+    base = caches(slots, q, seed=seed)
     core.prepare_caches(base)
     probe = dict(core=core, fa_width=FA_ROWS, cache_tokens=q, tp=16)
     assert head_supported(6, torch.float32, False, HIDDEN, rows, q, **probe)
     if q == 1:
-        order = torch.randperm(slots - 1, generator=torch.Generator().manual_seed(5))
+        g = torch.Generator().manual_seed(seed + 2)
+        order = torch.randperm(slots - 1, generator=g)
         table, accepted = (order[:rows] + 1).to(torch.int32).to(DEVICE), None
     else:
-        table, accepted = spec_inputs(requests, q, slots)
+        table, accepted = spec_inputs(requests, q, slots, seed=seed)
 
     side = KdaSide(DEVICE)
     counter = torch.zeros(2, dtype=torch.int32, device=DEVICE)
@@ -214,20 +269,22 @@ def test_fp32_heads_match_stock(monkeypatch, rows, q, polled):
     assert_stock(got, got_caches, want, want_caches, base, table.view(-1).long())
 
 
+@pytest.mark.parametrize("seed", [3, 11])
 @pytest.mark.parametrize("q", [8, 4], ids=["q8-M64", "q4-M32"])
-def test_fp32_fold_matches_stock_and_pair(monkeypatch, q):
+def test_fp32_fold_matches_stock_and_pair(monkeypatch, q, seed):
     """The B8 x q fold (in-projection epilogue -> prepared verify, FP32 state) vs the
-    stock layer on the rows it publishes, and bit for bit vs the plain stock-math
-    pair (``KdaSplitStock``) on those rows."""
-    attention = kda_attention()
-    g = torch.Generator(device=DEVICE).manual_seed(3)
+    stock layer on the rows it publishes, bit for bit vs the plain stock-math pair
+    (``KdaSplitStock``) on those rows, and its in-projection GEMM vs the exact
+    product."""
+    attention = kda_attention(seed=seed)
+    g = torch.Generator(device=DEVICE).manual_seed(seed)
     weight = torch.randn(PITCH, HIDDEN, generator=g, device=DEVICE) * HIDDEN**-0.5
     weight = weight.to(torch.bfloat16)
     requests, rows = 8, 8 * q
     x = torch.randn(rows, HIDDEN, generator=g, device=DEVICE).to(torch.bfloat16)
     slots = rows + 1
-    base = caches(slots, q)
-    table, accepted = spec_inputs(requests, q, slots)
+    base = caches(slots, q, seed=seed)
+    table, accepted = spec_inputs(requests, q, slots, seed=seed)
     key = (requests, q)
     core = prepared.PreparedKda(attention, {key: (PITCH, 0)}, True, prepared=(key,))
     core.prepare_caches(base)
@@ -249,6 +306,7 @@ def test_fp32_fold_matches_stock_and_pair(monkeypatch, q):
     torch.cuda.synchronize()
     # the published rows (the prepared verify's last reader re-arms their F_A)
     published = projected.clone()
+    assert_projection(published, weight, x, 4 * DIM + 128 + 6)
     core.run(
         projected, got, caches=got_caches, slots=table, accepted=accepted,
         prepared=operands,
@@ -267,6 +325,21 @@ def test_fp32_fold_matches_stock_and_pair(monkeypatch, q):
         attention, published, base, table, accepted, q, monkeypatch
     )
     assert_stock(got, got_caches, want, want_caches, base, table.view(-1).long())
+
+
+def assert_projection(published, weight, x, columns):
+    """The published in-projection columns: an FP32 accumulation of BF16 products
+    rounded to BF16. Each within one BF16 ulp of the exact product plus one FP32
+    epsilon of sum |x||w| (the accumulation's own rounding, any order; near-zero
+    results of cancelling sums sit many BF16 ulps off for that reason alone, a BF16
+    accumulation ~2^-8 of the sum). VR200 kda2-t4: worst excess 0.2 FP32 eps."""
+    got = published[:, :columns].double()
+    exact = x.double() @ weight[:columns].double().T
+    magnitude = x.double().abs() @ weight[:columns].double().abs().T
+    ulp = torch.exp2(torch.floor(torch.log2(exact.abs().clamp_min(2.0**-126))) - 7)
+    excess = ((got - exact).abs() - ulp) / magnitude
+    worst = excess.max().item()
+    assert worst <= 2.0**-23, f"in-projection {worst:.3e} of sum |x||w| past 1 ulp"
 
 
 def tp8_decode_mode(batch):
@@ -309,7 +382,7 @@ def test_fp32_decode_q1_matches_stock(monkeypatch, heads, batch, mode):
 
 
 @pytest.mark.parametrize("q", [4, 8])
-@pytest.mark.parametrize("requests", [1, 4, 16, 64])
+@pytest.mark.parametrize("requests", [1, 4, 8, 16, 64])
 def test_fp32_tp8_verify_matches_stock(monkeypatch, q, requests):
     """TP8's verify (12 heads, gate mode 1) of an FP32 state (``KdaSplitStock``) vs
     the stock verify."""
@@ -333,3 +406,51 @@ def test_fp32_tp8_verify_matches_stock(monkeypatch, q, requests):
         attention, projected, base, table, accepted, q, monkeypatch
     )
     assert_stock(got, got_caches, want, want_caches, base, table.view(-1).long())
+
+
+# A non-speculative 12-head deployment's stock q = 1 decode is the CUDA
+# fused_kda_decode (``auto``, when the build has it): fast-math exp / rsqrt, state
+# relerr ~1.9e-3 vs the Triton path (VR200 kda2-t3), which KdaSplitStock computes
+# (bit for bit near: state 1e-8). Open; the sweep's deployments are speculative.
+CUDA_DECODE_MATH = pytest.mark.xfail(
+    strict=True, reason="plain TP8 stock = CUDA fused_kda_decode math (open)"
+)
+PLAIN_SHAPES = [
+    *(pytest.param(6, b, 0, id=f"tp16-B{b}") for b in (1, 8, 64)),
+    *(
+        pytest.param(12, b, tp8_decode_mode(b), id=f"tp8-B{b}", marks=CUDA_DECODE_MATH)
+        for b in (1, 8, 64)
+    ),
+]
+
+
+@pytest.mark.parametrize("heads,batch,mode", PLAIN_SHAPES)
+def test_fp32_decode_q1_plain(monkeypatch, heads, batch, mode):
+    """The q = 1 decode (``KdaSplitStock``) vs a plain (non-speculative) deployment's
+    stock decode: Triton at 6 heads; at 12 the CUDA ``fused_kda_decode`` when the
+    build has it (``auto``), else Triton."""
+    if heads == 12 and stock_backends(heads, 0)[0] != "native":
+        pytest.skip("no CUDA fused_kda_decode in this build: Triton (covered above)")
+    schedule = prepared.schedule_of(heads, batch, mode, 1, (10, 7), False)
+    kernel = prepared.make_kernel(
+        (heads, batch, mode, False, schedule, 1, False), (10, 7)
+    )
+    assert type(kernel) is prepared.KdaSplitStock, type(kernel)
+    attention = kda_attention(heads=heads)
+    slots = batch + 2
+    base = caches(slots, 1, heads=heads)
+    g = torch.Generator(device="cpu").manual_seed(5)
+    table = (torch.randperm(slots - 1, generator=g)[:batch] + 1).to(torch.int32)
+    table = table.to(DEVICE)
+    pitch = pitch_of(heads)
+    projected = projected_rows(batch, pitch=pitch)
+    core = prepared.PreparedKda(attention, {batch: (pitch, mode)}, True)
+    core.prepare_caches(base)
+    got_caches = clone(base)
+    got = torch.empty(batch, 128 * heads, dtype=torch.bfloat16, device=DEVICE)
+    core.run(projected, got, caches=got_caches, slots=table)
+    torch.cuda.synchronize()
+    want, want_caches = stock_run(
+        attention, projected, base, table, None, 1, monkeypatch, num_spec=0
+    )
+    assert_stock(got, got_caches, want, want_caches, base, table.long())
