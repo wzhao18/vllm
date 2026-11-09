@@ -188,10 +188,7 @@ from vllm.v1.worker.gpu.ubatch_utils import (
     maybe_build_ubatch_runner,
 )
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
-from vllm.v1.worker.mamba_utils import (
-    get_prefill_checkpoint_group_ids,
-    prefill_checkpoint_block_ids,
-)
+from vllm.v1.worker.mamba_utils import get_prefill_checkpoint_group_ids
 from vllm.v1.worker.replayssm_utils import get_replayssm_block_copy_tensors
 from vllm.v1.worker.utils import (
     KVBlockZeroer,
@@ -758,6 +755,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             copy_admitted_drafts_to_host=self.batch_sharder is not None,
         )
 
+        checkpoint_group_ids = get_prefill_checkpoint_group_ids(kv_cache_config)
+        reserved_last_col = [
+            i in checkpoint_group_ids
+            for i in range(len(kv_cache_config.kv_cache_groups))
+        ]
         self.block_tables = BlockTables(
             block_sizes=block_sizes,
             max_num_reqs=self.max_num_reqs,
@@ -767,6 +769,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             slot_mapping_enabled=slot_mapping_enabled,
             dcp_sharded=dcp_sharded,
             sliding_window_reach=sliding_window_reach,
+            reserved_last_col=reserved_last_col,
             cp_size=self.dcp_size,
             cp_rank=self.dcp_rank,
             cp_interleave=self.cp_interleave,
@@ -1355,6 +1358,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     req_index, req_new_block_ids, overwrite=False
                 )
 
+        # Mamba prefill checkpoint blocks ride the staged block-table writes.
+        checkpoint_blocks = scheduler_output.mamba_prefill_checkpoint_blocks or {}
+        self.block_tables.stage_prefill_checkpoint_blocks(
+            {
+                self.req_states.req_id_to_index[req_id]: block_ids
+                for req_id, block_ids in checkpoint_blocks.items()
+            }
+        )
+
         # Update CPU num_computed_prefill_tokens.
         np.minimum(
             self.req_states.num_computed_tokens_np,
@@ -1376,38 +1388,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_cache_config.num_blocks,
                 scheduler_output.kv_cache_block_copies,
             )
-
-    def _write_prefill_checkpoint_blocks(
-        self,
-        scheduler_output: SchedulerOutput,
-        input_batch: InputBatch,
-        block_tables: tuple[torch.Tensor, ...],
-    ) -> None:
-        """Write each row's Mamba prefill checkpoint block into its Mamba
-        groups' reserved last block-table column."""
-        if self.cache_config.mamba_cache_mode != "align":
-            return
-        group_ids = getattr(self, "_prefill_checkpoint_group_ids", None)
-        if group_ids is None:
-            group_ids = get_prefill_checkpoint_group_ids(self.kv_cache_config)
-            self._prefill_checkpoint_group_ids = group_ids
-        checkpoint_blocks = scheduler_output.mamba_prefill_checkpoint_blocks
-        # Most steps have no checkpoint: skip unless an earlier step's entries
-        # must be cleared (the gather does not reach the reserved column).
-        if not group_ids or not (
-            checkpoint_blocks or getattr(self, "_checkpoint_col_dirty", False)
-        ):
-            return
-        self._checkpoint_col_dirty = bool(checkpoint_blocks)
-        num_reqs = input_batch.num_reqs
-        block_ids = async_tensor_h2d(
-            prefill_checkpoint_block_ids(
-                checkpoint_blocks, input_batch.req_ids[:num_reqs], group_ids
-            ),
-            device=self.device,
-        )
-        for k, group_id in enumerate(group_ids):
-            block_tables[group_id][:num_reqs, -1] = block_ids[k]
 
     def gather_batch_req_state(
         self, scheduler_output: SchedulerOutput, dummy_run: bool
@@ -1961,9 +1941,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 scheduler_output, batch_req_state, batch_desc, num_active_loras
             )
             block_tables, slot_mappings = self.prepare_attn(input_batch)
-            self._write_prefill_checkpoint_blocks(
-                scheduler_output, input_batch, block_tables
-            )
             # Mamba prefix-cache pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
             # before model_state.prepare_attn gathers num_accepted_tokens so the

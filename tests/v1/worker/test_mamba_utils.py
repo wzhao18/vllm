@@ -43,7 +43,6 @@ from vllm.v1.worker.mamba_utils import (
     get_mamba_groups,
     get_prefill_checkpoint_group_ids,
     postprocess_mamba_fused_kernel,
-    prefill_checkpoint_block_ids,
 )
 from vllm.v1.worker.replayssm_utils import (
     ReplaySSMModelContext,
@@ -3065,10 +3064,8 @@ class TestPostprocessMambaFusedKernel:
         )
 
 
-def test_prefill_checkpoint_block_ids_fill_the_reserved_column():
-    """Only align-mode Mamba groups with checkpoints reserve the column; rows
-    the scheduler gave no checkpoint block get the null block."""
-    from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+def test_prefill_checkpoint_groups_reserve_the_last_column():
+    """Only align-mode Mamba groups with checkpoints reserve the column."""
 
     def mamba(num_prefill_checkpoint_blocks):
         return MambaSpec(
@@ -3089,18 +3086,4 @@ def test_prefill_checkpoint_block_ids_fill_the_reserved_column():
             KVCacheGroupSpec(["c"], mamba(1)),
         ],
     )
-    group_ids = get_prefill_checkpoint_group_ids(kv_cache_config)
-    assert group_ids == [0, 2]
-    block_ids = prefill_checkpoint_block_ids(
-        {"r1": {0: 7, 2: 9}}, ["r0", "r1", "r2"], group_ids
-    )
-    np.testing.assert_array_equal(
-        block_ids,
-        [
-            [NULL_BLOCK_ID, 7, NULL_BLOCK_ID],
-            [NULL_BLOCK_ID, 9, NULL_BLOCK_ID],
-        ],
-    )
-    np.testing.assert_array_equal(
-        prefill_checkpoint_block_ids(None, ["r0"], group_ids), [[0], [0]]
-    )
+    assert get_prefill_checkpoint_group_ids(kv_cache_config) == [0, 2]

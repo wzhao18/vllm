@@ -455,3 +455,38 @@ def test_larger_draft_batch_uses_null_kpool_slots(
     else:
         slots = compute_slots()
     assert slots.tolist() == [24, 9, 42, 19, 36, -1, -1, -1]
+
+
+def test_prefill_checkpoint_blocks_ride_staged_writes_and_gather():
+    """A group's reserved last column carries the step's checkpoint block
+    through the staged writes and the gather, and is cleared the next step."""
+    device = torch.device("cuda")
+    block_tables = BlockTables(
+        block_sizes=[16, 64],
+        max_num_reqs=4,
+        max_num_batched_tokens=64,
+        max_num_blocks_per_group=[8, 8],
+        device=device,
+        reserved_last_col=[False, True],
+    )
+    for req_index in range(2):
+        block_tables.append_block_ids(
+            req_index, ([req_index + 1], [req_index + 10]), overwrite=True
+        )
+    # Request row 1 checkpoints into block 42 of the reserved group.
+    block_tables.stage_prefill_checkpoint_blocks({1: {1: 42}})
+    block_tables.apply_staged_writes()
+    idx_mapping = torch.tensor([1, 0], dtype=torch.int32, device=device)
+    attn, mamba = block_tables.gather_block_tables(idx_mapping, 2)
+    torch.accelerator.synchronize()
+    assert mamba[:, -1].tolist() == [42, 0]
+    assert mamba[:, 0].tolist() == [11, 10]
+    # Groups without the reserved column are gathered as before.
+    assert attn[:, -1].tolist() == [0, 0]
+
+    # The next step gives it none: the column is cleared.
+    block_tables.stage_prefill_checkpoint_blocks({})
+    block_tables.apply_staged_writes()
+    _, mamba = block_tables.gather_block_tables(idx_mapping, 2)
+    torch.accelerator.synchronize()
+    assert mamba[:, -1].tolist() == [0, 0]

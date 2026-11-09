@@ -5,7 +5,7 @@ from collections.abc import Iterable
 import torch
 
 from vllm.triton_utils import tl, triton
-from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
 from vllm.v1.worker.gpu.buffer_utils import (
     FusedStagedWriter,
     StagedWriteTensor,
@@ -31,6 +31,7 @@ class BlockTables:
         slot_mapping_enabled: list[bool] | None = None,
         dcp_sharded: list[bool] | None = None,
         sliding_window_reach: list[int] | None = None,
+        reserved_last_col: list[bool] | None = None,
     ):
         self.block_sizes = block_sizes
         self.max_num_reqs = max_num_reqs
@@ -61,6 +62,19 @@ class BlockTables:
         assert len(sliding_window_reach) == self.num_kv_cache_groups
         self._sliding_window_reach = sliding_window_reach
         self.has_sliding_window_groups = any(r > 0 for r in sliding_window_reach)
+        # Groups whose rows end in a column outside the position-indexed
+        # entries (a Mamba group's prefill checkpoint block). The gather copies
+        # it along with the row; `stage_prefill_checkpoint_blocks` fills it.
+        if reserved_last_col is None:
+            reserved_last_col = [False] * self.num_kv_cache_groups
+        assert len(reserved_last_col) == self.num_kv_cache_groups
+        self._reserved_last_col = reserved_last_col
+        self._reserved_last_col_groups = [
+            i for i, reserved in enumerate(reserved_last_col) if reserved
+        ]
+        # Request rows whose reserved column holds a block id, cleared the
+        # next step they get none.
+        self._reserved_last_col_rows: set[int] = set()
 
         # num_kv_cache_groups x [max_num_reqs, max_num_blocks]
         self.block_tables: list[StagedWriteTensor] = []
@@ -120,6 +134,9 @@ class BlockTables:
         self.sliding_window_reach = torch.tensor(
             self._sliding_window_reach, dtype=torch.int32, device=self.device
         )
+        self.reserved_last_col = torch.tensor(
+            self._reserved_last_col, dtype=torch.int32, device=self.device
+        )
         self.input_block_table_ptrs = self._make_ptr_tensor(self.input_block_tables)
 
     def append_block_ids(
@@ -142,6 +159,27 @@ class BlockTables:
                 )
             self.block_tables[i].stage_write(req_index, start, block_ids)
             self.num_blocks.np[i, req_index] = end
+
+    def stage_prefill_checkpoint_blocks(
+        self, block_ids_by_row: dict[int, dict[int, int]]
+    ) -> None:
+        """Stage each request row's prefill checkpoint block into its groups'
+        reserved last column, and clear rows that had one last step.
+
+        Rides the step's staged block-table writes: no extra transfer.
+        """
+        if not self._reserved_last_col_groups:
+            return
+        for row in self._reserved_last_col_rows - block_ids_by_row.keys():
+            for group_id in self._reserved_last_col_groups:
+                table = self.block_tables[group_id]
+                table.stage_write(row, table.gpu.shape[1] - 1, (NULL_BLOCK_ID,))
+        for row, block_ids in block_ids_by_row.items():
+            for group_id, block_id in block_ids.items():
+                assert self._reserved_last_col[group_id]
+                table = self.block_tables[group_id]
+                table.stage_write(row, table.gpu.shape[1] - 1, (block_id,))
+        self._reserved_last_col_rows = set(block_ids_by_row)
 
     def apply_staged_writes(self) -> None:
         if self.num_kv_cache_groups == 0:
@@ -205,6 +243,7 @@ class BlockTables:
             num_computed_tokens,
             self.sliding_window_reach,
             self.block_sizes_tensor,
+            self.reserved_last_col,
             MASK_SLIDING_WINDOW=mask_sliding_window,
             BLOCK_SIZE=1024,  # type: ignore
         )
@@ -283,6 +322,7 @@ def _gather_block_tables_kernel(
     num_computed_tokens_ptr,  # [max_num_reqs]
     sliding_window_reach_ptr,  # [num_kv_cache_groups]
     block_sizes_ptr,  # [num_kv_cache_groups]
+    reserved_last_col_ptr,  # [num_kv_cache_groups]
     MASK_SLIDING_WINDOW: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -328,6 +368,11 @@ def _gather_block_tables_kernel(
             other=0,
         )
         tl.store(dst_row_ptr + offset, block_ids, mask=offset < num_blocks)
+
+    # The reserved last column sits outside the row's position-indexed entries.
+    if tl.load(reserved_last_col_ptr + group_id):
+        last = max_num_blocks - 1
+        tl.store(dst_row_ptr + last, tl.load(src_row_ptr + last))
 
 
 @triton.jit
