@@ -306,37 +306,46 @@ def test_kda_recoverssm_startup_metadata_flow_without_model(monkeypatch):
     )
 
 
+# Block ids in the reserved checkpoint column, distinct from the arange table.
+CHECKPOINT_BLOCK_BASE = 1000
+
+
+def _with_checkpoint_column(common_attn_metadata):
+    """Append the reserved last column holding each row's checkpoint block."""
+    table = common_attn_metadata.block_table_tensor
+    checkpoint_blocks = CHECKPOINT_BLOCK_BASE + torch.arange(
+        table.shape[0], dtype=table.dtype, device=table.device
+    )
+    return common_attn_metadata.replace(
+        block_table_tensor=torch.cat([table, checkpoint_blocks[:, None]], dim=1)
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
-    "batch,prefix_match_unit,hit_alignment,expected_offsets,expected_states",
+    "batch,prefix_match_unit,hit_alignment,expected_offsets",
     [
-        (
-            BatchSpec(seq_lens=[50, 32], query_lens=[50, 16]),
-            None,
-            16,
-            [48, 0],
-            [2, NULL_BLOCK_ID],
-        ),
-        (
-            BatchSpec(seq_lens=[50, 32], query_lens=[50, 16]),
-            16,
-            16,
-            [48, 0],
-            [2, NULL_BLOCK_ID],
-        ),
-        (BatchSpec(seq_lens=[530], query_lens=[530]), None, 128, [512], [32]),
-        (BatchSpec(seq_lens=[530], query_lens=[50]), None, 128, [32], [32]),
-        (BatchSpec(seq_lens=[530], query_lens=[530]), 16, 16, [528], [32]),
-        (BatchSpec(seq_lens=[530], query_lens=[50]), 16, 16, [48], [32]),
+        (BatchSpec(seq_lens=[50, 32], query_lens=[50, 16]), None, 16, [48, 0]),
+        (BatchSpec(seq_lens=[50, 32], query_lens=[50, 16]), 16, 16, [48, 0]),
+        (BatchSpec(seq_lens=[530], query_lens=[530]), None, 128, [512]),
+        (BatchSpec(seq_lens=[530], query_lens=[50]), None, 128, [32]),
+        (BatchSpec(seq_lens=[530], query_lens=[530]), 16, 16, [528]),
+        (BatchSpec(seq_lens=[530], query_lens=[50]), 16, 16, [48]),
     ],
 )
 def test_internal_checkpoint_metadata_targets_last_aligned_boundary(
-    batch, prefix_match_unit, hit_alignment, expected_offsets, expected_states
+    batch, prefix_match_unit, hit_alignment, expected_offsets
 ):
     device = torch.device("cuda")
-    common_attn_metadata = create_common_attn_metadata(
-        batch, BLOCK_SIZE, device, arange_block_indices=True
-    ).replace(is_prefilling=torch.tensor([True] * len(batch.seq_lens)))
+    common_attn_metadata = _with_checkpoint_column(
+        create_common_attn_metadata(
+            batch, BLOCK_SIZE, device, arange_block_indices=True
+        ).replace(is_prefilling=torch.tensor([True] * len(batch.seq_lens)))
+    )
+    expected_states = [
+        CHECKPOINT_BLOCK_BASE + row if offset else NULL_BLOCK_ID
+        for row, offset in enumerate(expected_offsets)
+    ]
     builder = _make_builder(
         KimiK3KDAMetadataBuilder,
         num_speculative_tokens=0,
@@ -399,9 +408,11 @@ def test_spec_internal_checkpoint_metadata_targets_replay_boundary(
     common_attn_metadata = create_common_attn_metadata(
         batch, BLOCK_SIZE, device, arange_block_indices=True
     )
-    common_attn_metadata = common_attn_metadata.replace(
-        is_prefilling=torch.tensor([True]),
-        block_table_tensor=common_attn_metadata.block_table_tensor + 1,
+    common_attn_metadata = _with_checkpoint_column(
+        common_attn_metadata.replace(
+            is_prefilling=torch.tensor([True]),
+            block_table_tensor=common_attn_metadata.block_table_tensor + 1,
+        )
     )
     builder = _make_builder(
         KimiK3KDAMetadataBuilder,
@@ -431,7 +442,7 @@ def test_spec_internal_checkpoint_metadata_targets_replay_boundary(
     assert actual.checkpoint is not None
     torch.testing.assert_close(
         actual.checkpoint.state_indices,
-        torch.tensor([1], dtype=torch.int32, device=device),
+        torch.tensor([CHECKPOINT_BLOCK_BASE], dtype=torch.int32, device=device),
     )
     torch.testing.assert_close(
         actual.checkpoint.checkpoint_offsets,

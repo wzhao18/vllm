@@ -876,6 +876,31 @@ class KVCacheManager:
                 blocks = mgr.req_to_blocks[request_id]
                 mgr.new_block_ids.extend(blk.block_id for blk in blocks[start_idx:])
 
+    def drop_mamba_prefill_checkpoint(self, request: Request) -> None:
+        """Discard the prefill checkpoint of a step that will not run."""
+        for mgr in self.coordinator.single_type_managers:
+            if isinstance(mgr, MambaManager):
+                mgr.drop_prefill_checkpoint(request.request_id)
+
+    def take_mamba_prefill_checkpoint_blocks(
+        self,
+    ) -> tuple[dict[str, dict[int, int]], list[KVCacheBlock]]:
+        """Drain this step's Mamba prefill checkpoint blocks.
+
+        Returns the per-request ``{group id: block id}`` the worker exports to,
+        and the blocks whose request reference the caller releases once the
+        step has run.
+        """
+        block_ids: dict[str, dict[int, int]] = {}
+        blocks: list[KVCacheBlock] = []
+        for mgr in self.coordinator.single_type_managers:
+            if not isinstance(mgr, MambaManager):
+                continue
+            for req_id, block in mgr.take_prefill_checkpoint_blocks():
+                block_ids.setdefault(req_id, {})[mgr.kv_cache_group_id] = block.block_id
+                blocks.append(block)
+        return block_ids, blocks
+
     def take_kv_cache_block_copies(
         self,
     ) -> tuple[list[KVCacheBlockCopy], list[KVCacheBlock]]:

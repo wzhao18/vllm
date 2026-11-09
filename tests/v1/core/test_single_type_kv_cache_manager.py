@@ -297,13 +297,136 @@ def test_mamba_checkpoint_hash_maps_only_to_checkpoint_block(
     manager.new_step_starts()
     step(first_chunk_blocks * block_size, prompt_tokens)
 
-    checkpoint_position, checkpoint_idx = manager._checkpoints["r"]
-    checkpoint_block = manager.req_to_blocks["r"][checkpoint_idx]
+    checkpoint_position, checkpoint_block, _ = manager._checkpoints["r"]
     assert all(
         b.block_hash is None or b is checkpoint_block for b in speculative_blocks
     )
     block_hash = request.block_hashes[checkpoint_position // block_size - 1]
     assert pool.get_cached_block(block_hash, [0]) == [checkpoint_block]
+
+
+@pytest.mark.parametrize(
+    ("resume_at", "prompt_tokens"),
+    [
+        (320, 380),  # resumes mid-block, ends in the same block
+        (320, 450),  # resumes mid-block, ends in the next block
+        (256, 300),  # resumes at a block boundary, ends in the first block
+        (0, 100),  # fresh prompt shorter than a block
+    ],
+)
+def test_mamba_checkpoint_gets_its_own_block(resume_at, prompt_tokens):
+    """The final chunk's checkpoint goes to a block outside the request's table,
+    keyed at the checkpoint, so it needs no spare table column. A chunk that
+    resumes mid-block and runs past the block's end never writes the state at
+    that end, so the resumed block gets no full-block hash."""
+    block_size, hash_block_size = 128, 16
+    spec = MambaSpec(
+        block_size=block_size,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        num_prefill_checkpoint_blocks=1,
+        prefill_checkpoint_alignment=16,
+    )
+    pool = BlockPool(
+        num_gpu_blocks=64, enable_caching=True, hash_block_size=hash_block_size
+    )
+    manager = MambaManager(
+        spec,
+        block_pool=pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=hash_block_size,
+    )
+    init_none_hash(sha256)
+    request = Request(
+        request_id="r",
+        prompt_token_ids=list(range(prompt_tokens)),
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(hash_block_size, sha256),
+    )
+
+    def step(start, end):
+        estimate = manager.get_num_blocks_to_allocate(
+            "r", end, [], start, start, end, prefill_end=prompt_tokens
+        )
+        free_before = pool.get_num_free_blocks()
+        manager.allocate_new_blocks("r", end, end)
+        assert free_before - pool.get_num_free_blocks() == estimate
+        manager.cache_blocks(request, end, replay_boundaries=[])
+        request.num_computed_tokens = end
+
+    if resume_at:
+        step(0, resume_at)
+        assert "r" not in manager._checkpoints
+        manager.new_step_starts()
+    step(resume_at, prompt_tokens)
+
+    checkpoint_position = (prompt_tokens - 1) // hash_block_size * hash_block_size
+    position, checkpoint_block, _ = manager._checkpoints["r"]
+    assert position == checkpoint_position
+    assert checkpoint_block not in manager.req_to_blocks["r"]
+    block_hash = request.block_hashes[checkpoint_position // hash_block_size - 1]
+    assert pool.get_cached_block(block_hash, [0]) == [checkpoint_block]
+    assert checkpoint_block.block_hash_num_tokens == checkpoint_position
+    offloads = manager.take_pending_boundary_state_offloads()
+    assert ("r", 0, checkpoint_block, checkpoint_position) in offloads
+
+    resumed_block_idx = (resume_at - 1) // block_size
+    if resume_at % block_size and prompt_tokens >= (resumed_block_idx + 1) * (
+        block_size
+    ):
+        assert manager.req_to_blocks["r"][resumed_block_idx].block_hash is None
+
+    # The scheduler takes the block with the step; the request holds no other
+    # reference to it.
+    assert manager.take_prefill_checkpoint_blocks() == [("r", checkpoint_block)]
+    assert not manager._checkpoints
+    assert checkpoint_block.ref_cnt == 1
+
+
+def test_mamba_checkpoint_dropped_when_its_step_never_runs():
+    """A request preempted in the pass that scheduled it leaves no key on a
+    block nothing will write."""
+    block_size = 128
+    spec = MambaSpec(
+        block_size=block_size,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        num_prefill_checkpoint_blocks=1,
+        prefill_checkpoint_alignment=16,
+    )
+    pool = BlockPool(num_gpu_blocks=64, enable_caching=True, hash_block_size=16)
+    manager = MambaManager(
+        spec,
+        block_pool=pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=16,
+    )
+    init_none_hash(sha256)
+    request = Request(
+        request_id="r",
+        prompt_token_ids=list(range(100)),
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(16, sha256),
+    )
+    num_free = pool.get_num_free_blocks()
+    manager.get_num_blocks_to_allocate("r", 100, [], 0, 0, 100, prefill_end=100)
+    manager.allocate_new_blocks("r", 100, 100)
+    manager.cache_blocks(request, 100, replay_boundaries=[])
+    _, checkpoint_block, _ = manager._checkpoints["r"]
+    assert checkpoint_block.block_hash is not None
+
+    manager.drop_prefill_checkpoint("r")
+    pool.free_blocks(manager.pop_blocks_for_free("r"))
+    assert checkpoint_block.block_hash is None
+    assert not manager.take_pending_boundary_state_offloads()
+    assert pool.get_num_free_blocks() == num_free
+    assert manager.take_prefill_checkpoint_blocks() == []
 
 
 def get_sliding_window_manager(

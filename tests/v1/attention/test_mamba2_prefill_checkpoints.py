@@ -153,10 +153,10 @@ def test_update_block_table_regathers_checkpoint_blocks():
         meta, other_table, torch.zeros(1000, dtype=torch.int64)
     )
 
-    # Row 0 checkpoints in column cdiv(900, 256) - 2 == 2; row 1 declined.
+    # Row 0 checkpoints into the reserved last column; row 1 declined.
     assert updated.checkpoint_meta is not None
     assert updated.checkpoint_meta.state_indices.tolist() == [
-        other_table[0, 2].item(),
+        other_table[0, -1].item(),
         NULL_BLOCK_ID,
     ]
 

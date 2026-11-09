@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+from collections.abc import Sequence
 from typing import Any
 
+import numpy as np
 import torch
 
 from vllm.logger import init_logger
@@ -17,6 +19,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 from vllm.triton_utils import tl, triton
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -654,6 +657,45 @@ def _get_mamba_spec_for_layer(
         kv_cache_spec = kv_cache_spec.kv_cache_specs[layer_name]
     assert isinstance(kv_cache_spec, MambaSpec)
     return kv_cache_spec
+
+
+def get_prefill_checkpoint_group_ids(kv_cache_config: KVCacheConfig) -> list[int]:
+    """KV cache groups whose block tables reserve a prefill checkpoint column."""
+    group_ids = []
+    for i, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
+        spec = kv_cache_group.kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            spec = spec.first_spec
+        if (
+            isinstance(spec, MambaSpec)
+            and spec.mamba_cache_mode == "align"
+            and spec.num_prefill_checkpoint_blocks > 0
+        ):
+            group_ids.append(i)
+    return group_ids
+
+
+def prefill_checkpoint_block_ids(
+    checkpoint_blocks: dict[str, dict[int, int]] | None,
+    req_ids: Sequence[str],
+    group_ids: Sequence[int],
+) -> np.ndarray:
+    """Each batch row's prefill checkpoint block per group, in ``group_ids``
+    order; the null block where the scheduler gave the row none.
+
+    The worker writes these into the block tables' reserved last column
+    (``get_mamba_prefill_checkpoint_col``) every step, so a stale entry from an
+    earlier step never survives.
+    """
+    block_ids = np.full((len(group_ids), len(req_ids)), NULL_BLOCK_ID, np.int32)
+    if checkpoint_blocks:
+        for row, req_id in enumerate(req_ids):
+            req_blocks = checkpoint_blocks.get(req_id)
+            if req_blocks is None:
+                continue
+            for k, group_id in enumerate(group_ids):
+                block_ids[k, row] = req_blocks.get(group_id, NULL_BLOCK_ID)
+    return block_ids
 
 
 def get_mamba_group_ids(mamba_groups: dict[MambaSpec, list[int]]) -> list[int]:

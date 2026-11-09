@@ -83,6 +83,18 @@ from vllm.v1.utils import record_function_or_nullcontext
 logger = init_logger(__name__)
 
 
+def _stop_mamba_chunk_at_block_end(
+    request: Request, start: int, num_new_tokens: int, block_size: int
+) -> int:
+    """A chunk that starts mid-block and ends short of the prefill exports no
+    checkpoint, so it must stop at the block's end: past it, the block's
+    full-block hash would name a state the block does not hold."""
+    prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+    if start % block_size and start + num_new_tokens < prefill_end:
+        num_new_tokens = min(num_new_tokens, block_size - start % block_size)
+    return num_new_tokens
+
+
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -585,7 +597,6 @@ class Scheduler(SchedulerInterface):
                 query_end=end,
                 checkpoint_position=checkpoint_position,
                 hash_block_size=self.hash_block_size,
-                mamba_block_size=block_size,
                 checkpoint_alignment=self.mamba_prefill_checkpoint_alignment,
             )
         )
@@ -646,7 +657,9 @@ class Scheduler(SchedulerInterface):
         )
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)
-        return max(end - start, 0)
+        return _stop_mamba_chunk_at_block_end(
+            request, start, max(end - start, 0), block_size
+        )
 
     def _get_local_prefix_cache_hit(
         self, request: Request, max_cache_hit_length: int | None = None
@@ -848,6 +861,14 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = self._reserve_prefill_lookahead(
                 request, request.num_computed_tokens, num_new_tokens
             )
+            if self.need_mamba_block_aligned_split:
+                # The caps above can cut a final chunk short.
+                num_new_tokens = _stop_mamba_chunk_at_block_end(
+                    request,
+                    request.num_computed_tokens,
+                    num_new_tokens,
+                    self.cache_config.block_size,
+                )
 
             if num_new_tokens == 0:
                 # The request cannot be scheduled because one of the following
@@ -1385,6 +1406,14 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens = self._reserve_prefill_lookahead(
                         request, num_computed_tokens, num_new_tokens
                     )
+                    if self.need_mamba_block_aligned_split:
+                        # The caps above can cut a final chunk short.
+                        num_new_tokens = _stop_mamba_chunk_at_block_end(
+                            request,
+                            num_computed_tokens,
+                            num_new_tokens,
+                            self.cache_config.block_size,
+                        )
 
                     if (
                         request.has_encoder_inputs
@@ -1682,6 +1711,14 @@ class Scheduler(SchedulerInterface):
             # have run.
             self._free_cow_retained_blocks(cow_retained_blocks, self.sched_step_seq + 1)
         pending_kv_cache_block_copies = kv_cache_block_copies or None
+        mamba_prefill_checkpoint_blocks, checkpoint_blocks = (
+            self.kv_cache_manager.take_mamba_prefill_checkpoint_blocks()
+        )
+        if checkpoint_blocks:
+            # The request's reference ends with this step: the block stays in
+            # the prefix cache under its key. Like a CoW retention, its return
+            # to the pool waits for the step that writes it.
+            self._free_cow_retained_blocks(checkpoint_blocks, self.sched_step_seq + 1)
 
         # Dynamic speculative decoding: compute optimal K
         num_spec_tokens_to_schedule = self.num_spec_tokens
@@ -1720,6 +1757,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
             has_sync_kv_loads=has_sync_kv_loads,
             kv_cache_block_copies=pending_kv_cache_block_copies,
+            mamba_prefill_checkpoint_blocks=mamba_prefill_checkpoint_blocks or None,
             kv_connector_block_state=kv_connector_block_state,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             skip_drafts=not drafts_needed,
@@ -1790,6 +1828,9 @@ class Scheduler(SchedulerInterface):
         )
         if self.aux_output_connector is not None:
             self.aux_output_connector.request_finished(request)
+        # A request preempted in the pass that scheduled it never runs that
+        # step, so its prefill checkpoint is never written.
+        self.kv_cache_manager.drop_mamba_prefill_checkpoint(request)
         self._free_request_blocks(request)
         self.encoder_cache_manager.free(request)
         self._pending_encoder_input_ids.pop(request.request_id, None)

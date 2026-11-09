@@ -188,6 +188,10 @@ from vllm.v1.worker.gpu.ubatch_utils import (
     maybe_build_ubatch_runner,
 )
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.worker.mamba_utils import (
+    get_prefill_checkpoint_group_ids,
+    prefill_checkpoint_block_ids,
+)
 from vllm.v1.worker.replayssm_utils import get_replayssm_block_copy_tensors
 from vllm.v1.worker.utils import (
     KVBlockZeroer,
@@ -1373,6 +1377,33 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 scheduler_output.kv_cache_block_copies,
             )
 
+    def _write_prefill_checkpoint_blocks(
+        self,
+        scheduler_output: SchedulerOutput,
+        input_batch: InputBatch,
+        block_tables: tuple[torch.Tensor, ...],
+    ) -> None:
+        """Write each row's Mamba prefill checkpoint block into its Mamba
+        groups' reserved last block-table column."""
+        if self.cache_config.mamba_cache_mode != "align":
+            return
+        group_ids = getattr(self, "_prefill_checkpoint_group_ids", None)
+        if group_ids is None:
+            group_ids = get_prefill_checkpoint_group_ids(self.kv_cache_config)
+            self._prefill_checkpoint_group_ids = group_ids
+        if not group_ids:
+            return
+        num_reqs = input_batch.num_reqs
+        block_ids = torch.from_numpy(
+            prefill_checkpoint_block_ids(
+                scheduler_output.mamba_prefill_checkpoint_blocks,
+                input_batch.req_ids[:num_reqs],
+                group_ids,
+            )
+        ).to(self.device, non_blocking=True)
+        for k, group_id in enumerate(group_ids):
+            block_tables[group_id][:num_reqs, -1] = block_ids[k]
+
     def gather_batch_req_state(
         self, scheduler_output: SchedulerOutput, dummy_run: bool
     ) -> tuple["BatchReqState | None", int | None]:
@@ -1925,6 +1956,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 scheduler_output, batch_req_state, batch_desc, num_active_loras
             )
             block_tables, slot_mappings = self.prepare_attn(input_batch)
+            self._write_prefill_checkpoint_blocks(
+                scheduler_output, input_batch, block_tables
+            )
             # Mamba prefix-cache pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
             # before model_state.prepare_attn gathers num_accepted_tokens so the

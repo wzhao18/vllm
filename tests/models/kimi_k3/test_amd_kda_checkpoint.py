@@ -50,6 +50,8 @@ pytestmark = pytest.mark.skipif(
 # multiple of the kernel's 64-token chunk behaves the same and keeps the
 # fixtures small.
 BLOCK_SIZE = 64
+# Block ids in the reserved checkpoint column, distinct from the arange table.
+CHECKPOINT_BLOCK_BASE = 1000
 
 
 class _StubSpeculativeConfig:
@@ -106,6 +108,14 @@ def _build(batch: BatchSpec, block_size: int = BLOCK_SIZE, **kw):
     common = create_common_attn_metadata(
         batch, block_size, torch.device("cuda"), arange_block_indices=True
     )
+    # The reserved last column holds each row's prefill checkpoint block.
+    table = common.block_table_tensor
+    checkpoint_blocks = CHECKPOINT_BLOCK_BASE + torch.arange(
+        table.shape[0], dtype=table.dtype, device=table.device
+    )
+    common = common.replace(
+        block_table_tensor=torch.cat([table, checkpoint_blocks[:, None]], dim=1)
+    )
     return _builder(block_size=block_size, **kw).build(0, common)
 
 
@@ -114,24 +124,28 @@ def _i32(values: list[int]) -> torch.Tensor:
 
 
 def test_checkpoint_metadata_targets_last_aligned_boundary() -> None:
-    # Slot p holds the state after (p + 1) * block_size tokens, so a 200-token
-    # prompt checkpoints at 192 into slot 2 and a 128-token one at 64 into slot
-    # 0. The block table is an arange, so request 1 owns blocks 4..7.
+    # A 200-token prompt checkpoints at 192 and a 128-token one at 64, each into
+    # the checkpoint block in its row's reserved last column.
     md = _build(BatchSpec(seq_lens=[200, 128], query_lens=[200, 128]))
 
     assert md.checkpoint is not None
     torch.testing.assert_close(md.checkpoint.checkpoint_offsets, _i32([192, 64]))
-    torch.testing.assert_close(md.checkpoint.state_indices, _i32([2, 4]))
+    torch.testing.assert_close(
+        md.checkpoint.state_indices,
+        _i32([CHECKPOINT_BLOCK_BASE, CHECKPOINT_BLOCK_BASE + 1]),
+    )
 
 
 def test_checkpoint_offset_is_relative_to_query_start() -> None:
     # 256 tokens computed, 144 more this step: the boundary at 384 lands 128
-    # tokens into the chunk, and cdiv(400, 64) - 2 = 5 is its slot.
+    # tokens into the chunk.
     md = _build(BatchSpec(seq_lens=[400, 64], query_lens=[144, 64]))
 
     assert md.checkpoint is not None
     torch.testing.assert_close(md.checkpoint.checkpoint_offsets, _i32([128, 0]))
-    torch.testing.assert_close(md.checkpoint.state_indices, _i32([5, NULL_BLOCK_ID]))
+    torch.testing.assert_close(
+        md.checkpoint.state_indices, _i32([CHECKPOINT_BLOCK_BASE, NULL_BLOCK_ID])
+    )
 
 
 def test_checkpoint_metadata_avoids_live_state_row() -> None:

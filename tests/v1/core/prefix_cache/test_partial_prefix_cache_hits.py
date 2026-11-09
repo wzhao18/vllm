@@ -2828,10 +2828,10 @@ def test_checkpoint_reservation_matches_worker(
     chunk_blocks,
 ):
     """The worker exports a checkpoint wherever `compute_mamba_prefill_checkpoints`
-    says, into whatever block sits at its column. Each chunk, the manager must
-    either reserve exactly that position and column, or leave the column null so
-    the export is masked; anything else publishes a hash over the wrong state.
-    Under sparse retention, only the prefill-end chunk may reserve one.
+    says, into the block the scheduler hands it (the null block when none). Each
+    chunk, a block the manager reserves must be for exactly that position;
+    anything else publishes a hash over the wrong state. Under sparse retention,
+    only the prefill-end chunk may reserve one.
     """
     manager = make_full_mamba_manager(
         dcp_world_size=1,
@@ -2862,11 +2862,11 @@ def test_checkpoint_reservation_matches_worker(
     while start < num_tokens:
         end = min(start + chunk_blocks * mamba_block_size, num_tokens)
         assert manager.allocate_slots(request, end - start) is not None
-        offsets, cols = compute_mamba_prefill_checkpoints(
+        offsets, _ = compute_mamba_prefill_checkpoints(
             [end],
             [end - start],
             hash_block_size=hash_block_size,
-            mamba_block_size=mamba_block_size,
+            checkpoint_col=0,
             checkpoint_alignment=16,
             drop_eagle_block=use_eagle,
             cache_hit_alignment_tokens=mamba_manager.cache_hit_alignment_tokens,
@@ -2874,10 +2874,11 @@ def test_checkpoint_reservation_matches_worker(
         )
         reserved = mamba_manager._checkpoints.get(request.request_id)
         if reserved is not None:
-            assert reserved == (start + offsets[0], cols[0])
+            position, block, _ = reserved
+            assert offsets[0] and position == start + offsets[0]
+            assert block is not None
+            assert block not in mamba_manager.req_to_blocks[request.request_id]
             assert retention_interval is None or end >= prefill_end
-        elif offsets[0]:
-            assert mamba_manager.req_to_blocks[request.request_id][cols[0]].is_null
         request.num_computed_tokens = end
         manager.new_step_starts()
         start = end

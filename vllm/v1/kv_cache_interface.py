@@ -1185,8 +1185,15 @@ class MambaSpec(KVCacheSpec):
             # even though only 2 + num_speculative_blocks state blocks are
             # resident at a time (earlier states are nulled out by
             # remove_skipped_blocks), so the row length must cover max_len
-            # rather than max_memory_usage_bytes.
-            return cdiv(max_len, self.block_size) + self.num_speculative_blocks
+            # rather than max_memory_usage_bytes. The row's last
+            # `num_prefill_checkpoint_blocks` entries are not position-indexed:
+            # the worker writes the step's prefill checkpoint block there (see
+            # `get_mamba_prefill_checkpoint_col`).
+            return (
+                cdiv(max_len, self.block_size)
+                + self.num_speculative_blocks
+                + self.num_prefill_checkpoint_blocks
+            )
         return cdiv(self.max_memory_usage_bytes(vllm_config), self.page_size_bytes)
 
     def is_uniform_with_collection(
@@ -1224,24 +1231,34 @@ def get_mamba_prefill_checkpoint_position(
     return max(checkpoint_position, 0)
 
 
+def get_mamba_prefill_checkpoint_col(block_table_width: int) -> int:
+    """Block-table column the worker writes the prefill checkpoint block to.
+
+    The checkpoint block is not position-indexed: the scheduler hands it to the
+    worker per step (`SchedulerOutput.mamba_prefill_checkpoint_blocks`), and
+    the worker writes it into this reserved last column of each Mamba group's
+    block table before building attention metadata.
+    """
+    return block_table_width - 1
+
+
 def is_mamba_prefill_checkpoint_valid(
     query_start: int,
     query_end: int,
     checkpoint_position: int,
     hash_block_size: int,
-    mamba_block_size: int,
     checkpoint_alignment: int | None,
 ) -> bool:
-    """Whether a backend can export the checkpoint in this query."""
+    """Whether a backend can export the checkpoint in this query.
+
+    The checkpoint goes to its own block, so where the query starts and ends
+    relative to Mamba blocks does not matter.
+    """
     if checkpoint_alignment is None:
         return False
     assert checkpoint_alignment > 0
-
-    initial_state_col = (query_start - 1) // mamba_block_size
-    checkpoint_col = cdiv(query_end, mamba_block_size) - 2
     return (
         query_start % hash_block_size == 0
-        and checkpoint_col > initial_state_col
         and query_start + hash_block_size <= checkpoint_position
         and query_start < checkpoint_position < query_end
         and (checkpoint_position - query_start) % checkpoint_alignment == 0

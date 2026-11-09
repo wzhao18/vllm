@@ -484,6 +484,9 @@ def _create_checkpoint_builder_and_batch(
     table = common.block_table_tensor + 1
     if num_spec:
         table = torch.cat([table, torch.zeros(3, num_spec, dtype=table.dtype)], dim=1)
+    # The reserved last column holds each row's prefill checkpoint block.
+    checkpoint_blocks = torch.arange(900, 903, dtype=table.dtype).reshape(3, 1)
+    table = torch.cat([table, checkpoint_blocks.to(table.device)], dim=1)
     common = common.replace(block_table_tensor=table)
     kwargs = {}
     if num_spec:
@@ -510,7 +513,7 @@ def test_checkpoint_metadata_preserves_non_spec_order(
     actual = builder.build(0, common, **kwargs)
     assert actual.checkpoint is not None
     offsets = [expected_offset, 0] if num_spec else [0, expected_offset, 0]
-    slots = [common.block_table_tensor[1, 0].item(), NULL_BLOCK_ID]
+    slots = [common.block_table_tensor[1, -1].item(), NULL_BLOCK_ID]
     if not num_spec:
         slots.insert(0, NULL_BLOCK_ID)
     torch.testing.assert_close(

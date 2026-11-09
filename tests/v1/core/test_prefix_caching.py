@@ -4496,20 +4496,19 @@ def test_lookahead_checkpoint_has_available_hash(
     assert blocks is not None
     assert blocks[0].block_hash_num_tokens == expected_boundary
     if checkpoint_blocks:
-        offsets, cols = compute_mamba_prefill_checkpoints(
+        offsets, _ = compute_mamba_prefill_checkpoints(
             [prompt_len],
             [prompt_len],
             hash_block_size=64,
-            mamba_block_size=512,
+            checkpoint_col=0,
             checkpoint_alignment=64,
             drop_eagle_block=False,
             cache_hit_alignment_tokens=64,
             num_hash_lookahead_tokens=lookahead,
         )
         assert offsets == [expected_boundary]
-        assert (
-            blocks[0].block_id == manager.get_block_ids(request.request_id)[1][cols[0]]
-        )
+        # The checkpoint has its own block, outside the request's table.
+        assert blocks[0].block_id not in manager.get_block_ids(request.request_id)[1]
 
     request.num_computed_tokens = len(tokens)
     manager.free(request)

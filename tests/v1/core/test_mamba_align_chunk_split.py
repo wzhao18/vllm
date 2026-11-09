@@ -8,6 +8,7 @@ the wrong offset, and a later chunk crossing that boundary publishes it anyway.
 Requests resuming from it then restore a truncated state (#43559).
 """
 
+import functools
 import sys
 from types import SimpleNamespace
 
@@ -19,7 +20,7 @@ from vllm.utils.hashing import sha256
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import init_none_hash
-from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.sched.scheduler import Scheduler, _stop_mamba_chunk_at_block_end
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -57,7 +58,8 @@ MAMBA_GROUP_ID = 1
         (0, 100, 96, 8, 64, 16, True),
         (0, 100, 96, 8, 64, None, False),
         (8, 100, 96, 8, 64, 16, False),
-        (15360, 16896, 16768, 128, 1536, 16, False),
+        # Spanning one or two Mamba blocks is fine: the checkpoint has its own.
+        (15360, 16896, 16768, 128, 1536, 16, True),
         (15360, 16960, 16896, 128, 1536, 16, True),
         (15360, 16960, 16768, 128, 1536, 16, True),
         (16064, 18433, 18432, 128, 1536, 16, False),
@@ -78,7 +80,6 @@ def test_mamba_prefill_checkpoint_valid(
             query_end=query_end,
             checkpoint_position=checkpoint_position,
             hash_block_size=hash_size,
-            mamba_block_size=block_size,
             checkpoint_alignment=alignment,
         )
         is expected
@@ -206,9 +207,8 @@ def test_partial_checkpoint_resume_stops_at_mamba_block_boundary() -> None:
         == MAMBA_BLOCK_SIZE - resume_at % MAMBA_BLOCK_SIZE
     )
 
-    # A hash-aligned resume inside a physical Mamba block cannot use the fixed
-    # internal-checkpoint column: it aliases the initial-state column. Enabling
-    # checkpoints must therefore preserve the normal aligned split.
+    # With an internal checkpoint the final chunk runs to the prompt end: the
+    # checkpoint is exported to its own block.
     assert (
         _split(
             request,
@@ -217,7 +217,50 @@ def test_partial_checkpoint_resume_stops_at_mamba_block_boundary() -> None:
             partial_hit=True,
             num_prefill_checkpoint_blocks=1,
         )
-        == MAMBA_BLOCK_SIZE - resume_at % MAMBA_BLOCK_SIZE
+        == prompt_len - resume_at
+    )
+
+
+@pytest.mark.parametrize(
+    ("resume_at", "prompt_len"),
+    [
+        (1984, 2584),  # resumes mid-block, ends in the same block
+        (1984, 3602),  # resumes mid-block, ends in the next block
+        (1984, 5000),  # resumes mid-block, ends two blocks later
+        (1600, 2400),  # resumes at a block boundary, ends in the first block
+        (0, 1000),  # fresh prompt shorter than a block
+    ],
+)
+def test_final_chunk_with_internal_checkpoint_runs_in_one_step(
+    resume_at: int, prompt_len: int
+) -> None:
+    """However few Mamba blocks the final chunk spans, it needs no stop at the
+    prompt checkpoint or a block boundary."""
+    (request,) = create_requests(1, num_tokens=prompt_len, block_size=ATTN_BLOCK_SIZE)
+    request.num_computed_tokens = resume_at
+    num_new_tokens = prompt_len - resume_at
+    split = functools.partial(
+        _split, request, num_new_tokens, use_eagle=False, partial_hit=True
+    )
+    assert split(num_prefill_checkpoint_blocks=1) == num_new_tokens
+    # Without one, the chunk stops early to land the checkpoint.
+    assert split() < num_new_tokens
+
+
+def test_chunk_cut_short_from_mid_block_stops_at_block_end() -> None:
+    """A chunk resuming mid-block that a cap ends short of the prefill exports
+    no checkpoint, so it stops at the block's end."""
+    (request,) = create_requests(1, num_tokens=5000, block_size=ATTN_BLOCK_SIZE)
+    assert _stop_mamba_chunk_at_block_end(request, 1984, 2000, MAMBA_BLOCK_SIZE) == (
+        2 * MAMBA_BLOCK_SIZE - 1984
+    )
+    # The final chunk keeps running: it exports the checkpoint.
+    assert _stop_mamba_chunk_at_block_end(request, 1984, 3016, MAMBA_BLOCK_SIZE) == (
+        3016
+    )
+    # Block-aligned starts are untouched.
+    assert _stop_mamba_chunk_at_block_end(request, 1600, 2000, MAMBA_BLOCK_SIZE) == (
+        2000
     )
 
 

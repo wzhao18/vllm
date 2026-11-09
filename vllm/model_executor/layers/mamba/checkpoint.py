@@ -7,12 +7,12 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.triton_utils import tl, triton
-from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.kv_cache_interface import (
     MambaSpec,
+    get_mamba_prefill_checkpoint_col,
     get_mamba_prefill_checkpoint_position,
     is_mamba_prefill_checkpoint_valid,
 )
@@ -22,7 +22,7 @@ def compute_mamba_prefill_checkpoints(
     seq_lens: list[int],
     query_lens: list[int],
     hash_block_size: int,
-    mamba_block_size: int,
+    checkpoint_col: int,
     checkpoint_alignment: int | None,
     drop_eagle_block: bool,
     cache_hit_alignment_tokens: int,
@@ -33,11 +33,14 @@ def compute_mamba_prefill_checkpoints(
     Backends call this instead of re-deriving the rules, so they decline in
     lockstep with the scheduler and `MambaManager`: allocating a checkpoint
     block without writing it leaves the prefix cache serving uninitialized
-    state.
+    state. A row the scheduler gave no checkpoint block (e.g. a chunk that does
+    not finish the prefill) finds the null block in `checkpoint_col` and
+    exports into it harmlessly.
 
     Returns:
         `(offsets, cols)`: the checkpoint's offset into each row's query and
-        its block-table column. `0` and `-1` mean the row has none.
+        its block-table column, `checkpoint_col`. `0` and `-1` mean the row has
+        none.
 
     """
     offsets: list[int] = []
@@ -55,11 +58,10 @@ def compute_mamba_prefill_checkpoints(
             query_end=seq_len,
             checkpoint_position=position,
             hash_block_size=hash_block_size,
-            mamba_block_size=mamba_block_size,
             checkpoint_alignment=checkpoint_alignment,
         )
         offsets.append(position - query_start if valid else 0)
-        cols.append(cdiv(seq_len, mamba_block_size) - 2 if valid else -1)
+        cols.append(checkpoint_col if valid else -1)
     return offsets, cols
 
 
@@ -129,12 +131,13 @@ class MambaPrefillCheckpointBuilder:
         all_query_lens = m.query_start_loc_cpu.diff().tolist()
         query_lens = [all_query_lens[row] for row in request_rows]
         seq_lens = m.seq_lens_cpu_upper_bound.tolist()
-        block_size = self.kv_cache_spec.block_size
         checkpoint_offsets, checkpoint_cols = compute_mamba_prefill_checkpoints(
             [seq_lens[row] for row in request_rows],
             query_lens,
             hash_block_size=hash_block_size,
-            mamba_block_size=block_size,
+            checkpoint_col=get_mamba_prefill_checkpoint_col(
+                m.block_table_tensor.shape[1]
+            ),
             checkpoint_alignment=self.kv_cache_spec.prefill_checkpoint_alignment,
             drop_eagle_block=self.drop_eagle_block,
             cache_hit_alignment_tokens=cache_hit_alignment_tokens,
