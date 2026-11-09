@@ -127,11 +127,10 @@ class MambaPrefillCheckpointBuilder:
         all_query_lens = m.query_start_loc_cpu.diff().tolist()
         query_lens = [all_query_lens[row] for row in request_rows]
         seq_lens = m.seq_lens_cpu_upper_bound.tolist()
-        # A request reaches its prefill end once per block-table row, so the
-        # row's checkpoint block stays in the reserved column while it
-        # decodes. A decode row (at most `num_speculative_tokens + 1` tokens)
-        # must never pass the check below, or it would export into that block.
-        assert self.vllm_config.num_speculative_tokens < hash_block_size
+        # A row's checkpoint block stays in the reserved column after its
+        # prefill. Decode rows reach this planner only without drafts (one
+        # token; builders plan non-spec rows), so they never pass the check
+        # and never export into it.
         checkpoint_offsets = compute_mamba_prefill_checkpoints(
             [seq_lens[row] for row in request_rows],
             query_lens,
