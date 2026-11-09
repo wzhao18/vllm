@@ -2327,11 +2327,18 @@ class MambaManager(SingleTypeKVCacheManager):
                     self._state_hashes.setdefault(request.request_id, set()).add(
                         partial_hash
                     )
-                snapshot_col = self._snapshot_cols.get(request.request_id)
-                if snapshot_col is not None:
+                offload_col = self._snapshot_cols.get(request.request_id)
+                if (
+                    offload_col is None
+                    and request.request_id in self._checkpoints_in_initial_state_block
+                ):
+                    # A mid-block start exports into the resumed column, which
+                    # `_skip_stale_initial_state` keeps out of the cached range.
+                    offload_col = self._checkpoints[request.request_id][1]
+                if offload_col is not None:
                     # Below the cached-block range, so the full-block loop below
                     # does not offer it to the connector.
-                    block = self.req_to_blocks[request.request_id][snapshot_col]
+                    block = self.req_to_blocks[request.request_id][offload_col]
                     assert block.block_hash_num_tokens is not None
                     self._pending_boundary_state_offloads.append(
                         (
