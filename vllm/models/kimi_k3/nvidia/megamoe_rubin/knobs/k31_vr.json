@@ -1,0 +1,2697 @@
+{
+ "version": 2,
+ "comment": "Merged FlashInfer 0.7.3.dev20261031 sm107 tuner winners for the Kimi K3.1 routed MoE on VR200 (W=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr): every $W/moe4/results/fi107/knobs_*.json incl. the EP4 smoke files. Tuner timer: profiling_policy per record (native_events = eager launches behind a stream delay kernel, CUDA events, warm L2, no CUDA graph). Read-only data for megamoe_rubin.config.resolve_knobs.",
+ "source_files": 44,
+ "entries": [
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "genphase",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4_mxfp8",
+   "world_size": 16,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 128,
+   "live_tokens": 50,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     128
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "grouped",
+     null
+    ],
+    "work_id_mode": "grid_stride",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 323.59999418258667,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:24:06",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_ep16b_mxfp4_mxfp8_dec50.json",
+    "sha256": "04f35c65c4dc60986d68c13d1fffb77ec88493570a064f859ef7256f1f820333",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4_mxfp8",
+   "world_size": 16,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 6144,
+   "live_tokens": 5925,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     128
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "grouped",
+     null
+    ],
+    "work_id_mode": "grid_stride",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 1360.5599999427795,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:22:49",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_ep16b_mxfp4_mxfp8_t5925.json",
+    "sha256": "8462449f57be90b1ad9f99e4e65f7d052e8d37a65a765374b7dbedf1aeb4f73d",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4_mxfp8",
+   "world_size": 16,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 9728,
+   "live_tokens": 9600,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     128
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "grouped",
+     null
+    ],
+    "work_id_mode": "grid_stride",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 2197.07190990448,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:25:18",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_ep16b_mxfp4_mxfp8_t9600.json",
+    "sha256": "b9106f42a310f108bd8d58c011b06d380615c74195afdac0aa31b498fc8ee46f",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "genphase",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "nvfp4",
+   "world_size": 16,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 128,
+   "live_tokens": 50,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "phase_interleave",
+     null
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 270.52800357341766,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:23:27",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_ep16b_nvfp4_dec50.json",
+    "sha256": "81ef96be397fd27c4bdb62df4709fc3c07c774ed15bcda21e605091f20207d9d",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "nvfp4",
+   "world_size": 16,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 6144,
+   "live_tokens": 5925,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "grouped",
+     null
+    ],
+    "work_id_mode": "grid_stride",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 1188.2240176200867,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:22:06",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_ep16b_nvfp4_t5925.json",
+    "sha256": "f7afc3e485cc06413427835e8bb21f579be39dbdedc0ac5f19485e66188fec67",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "nvfp4",
+   "world_size": 16,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 9728,
+   "live_tokens": 9600,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "grouped",
+     null
+    ],
+    "work_id_mode": "grid_stride",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 1852.8159856796265,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:24:42",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_ep16b_nvfp4_t9600.json",
+    "sha256": "cf128da2ba619f28ab02c883e5ca6b9a068efe782bee99e56563defbd13ee6db",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4_mxfp8",
+   "world_size": 8,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 768,
+   "live_tokens": 720,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     128
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "grouped",
+     null
+    ],
+    "work_id_mode": "grid_stride",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 367.2799915075302,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:19:21",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_ep8b_mxfp4_mxfp8_t720.json",
+    "sha256": "73fe9e1cfbec1b496e31492e9440164b71907b81ea8dacb80cb23245fd6e7b6d",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "genphase",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4_mxfp8",
+   "world_size": 8,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 768,
+   "live_tokens": 720,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     128
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "phase_interleave",
+     null
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     2,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 283.1200063228607,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:20:01",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_ep8b_mxfp4_mxfp8_t720g.json",
+    "sha256": "307117ca54ce51e6fd5cd32bb6795ec1c5a7d1fcb23a70858ed3745bc40662af",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "nvfp4",
+   "world_size": 8,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 768,
+   "live_tokens": 720,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "grouped",
+     null
+    ],
+    "work_id_mode": "grid_stride",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 321.53600454330444,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:18:06",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_ep8b_nvfp4_t720.json",
+    "sha256": "a961f755abe4b5031305d89b4cef9ccdc8e5d215f8b696b48556f54aff968a68",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "genphase",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "nvfp4",
+   "world_size": 8,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 768,
+   "live_tokens": 720,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "phase_interleave",
+     null
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 279.6639949083328,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:18:46",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_ep8b_nvfp4_t720g.json",
+    "sha256": "34f108d4d7cd42bf8f400a7b8e06ec37be937195918a259c47642a7ad1688778",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4_mxfp8",
+   "world_size": 8,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 5760,
+   "live_tokens": 5760,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     128
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": [
+     2,
+     1
+    ],
+    "schedule_policy": [
+     "phase_interleave",
+     null
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 1121.1360096931458,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:24:32",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_ep8w_mxfp4_mxfp8_t5760.json",
+    "sha256": "2590b68d5dd8154cb0030a8864d94e0a8ebfb4ecadb2ba7a4c9506395c104b07",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "genphase",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4_mxfp8",
+   "world_size": 8,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 768,
+   "live_tokens": 720,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     128
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "phase_interleave",
+     null
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     2,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 286.51200234889984,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:26:26",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_ep8w_mxfp4_mxfp8_t720g.json",
+    "sha256": "a231be040e9d783f04bd7ec78442100a427efc3a16af6d682bcac5f765e0ef9c",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "nvfp4",
+   "world_size": 8,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 5760,
+   "live_tokens": 5760,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": [
+     2,
+     1
+    ],
+    "schedule_policy": [
+     "phase_interleave",
+     null
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 923.664003610611,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:23:47",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_ep8w_nvfp4_t5760.json",
+    "sha256": "6b9edfbcd39e7bc5ce86e76df1b2775a97c8a6d76ee573deb1cf2f9f6e686332",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "genphase",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "nvfp4",
+   "world_size": 8,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 768,
+   "live_tokens": 720,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "phase_interleave",
+     null
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     2,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 279.1520059108734,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:25:25",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_ep8w_nvfp4_t720g.json",
+    "sha256": "c785fd62ba7a88cfda39aa2ebfecccac46eab59ad31174d10d11af7bb870922f",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4_mxfp8",
+   "world_size": 4,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 2048,
+   "live_tokens": 2048,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     128
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "grouped",
+     null
+    ],
+    "work_id_mode": "grid_stride",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 893.2320177555084,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:10:07",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_smoke_mxfp4_mxfp8.json",
+    "sha256": "acf24b29f232d56fe3f757d385fc4f6e31abd430a1a6bee430afd1ef6e9bbc25",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "nvfp4",
+   "world_size": 4,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 2048,
+   "live_tokens": 2048,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "grouped",
+     null
+    ],
+    "work_id_mode": "grid_stride",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 793.503999710083,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:09:36",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_smoke_nvfp4.json",
+    "sha256": "161462ec4f8de0432dfc115ac298a3fb11c9954edc7ea892b15dd47548239d4e",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "genphase",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4_mxfp8",
+   "world_size": 16,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 1024,
+   "live_tokens": 1024,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     128
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "phase_interleave",
+     null
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     2,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 379.64800000190735,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:38:29",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_xo_ep16_mxfp4_mxfp8_g1024.json",
+    "sha256": "86ce495a45b50e39e7300c64d47a8ffc3e09f36e89b36530ff821d57005f6a35",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "genphase",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4_mxfp8",
+   "world_size": 16,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 128,
+   "live_tokens": 128,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     128
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "phase_interleave",
+     null
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 234.49599742889404,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:34:19",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_xo_ep16_mxfp4_mxfp8_g128.json",
+    "sha256": "fcb4eec477865ea0e6add8689deb5ac2d6f2dc332e8073414c934367a41f7d2a",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "genphase",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4_mxfp8",
+   "world_size": 16,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 256,
+   "live_tokens": 256,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     128
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "phase_interleave",
+     null
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     2,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 211.56799793243408,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:35:37",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_xo_ep16_mxfp4_mxfp8_g256.json",
+    "sha256": "a35c49b12bffb3658b2e063d3a80446d5feeee9527ea40b7bf97adc2ab8ffeac",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "genphase",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4_mxfp8",
+   "world_size": 16,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 512,
+   "live_tokens": 512,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     128
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "phase_interleave",
+     null
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     2,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 339.58400785923004,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:36:57",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_xo_ep16_mxfp4_mxfp8_g512.json",
+    "sha256": "078b217266e57847b8bd05860d8d59c1a44bb62e7ec94dc7df2d46a0a89c2998",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4_mxfp8",
+   "world_size": 16,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 1024,
+   "live_tokens": 1024,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     128
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "grouped",
+     null
+    ],
+    "work_id_mode": "grid_stride",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 477.6960015296936,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:39:42",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_xo_ep16_mxfp4_mxfp8_i1024.json",
+    "sha256": "e28ce179d1283d29288fc664be3307912c648a4834e804b7f8b9371791fd8161",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4_mxfp8",
+   "world_size": 16,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 2048,
+   "live_tokens": 2048,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     128
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "grouped",
+     null
+    ],
+    "work_id_mode": "grid_stride",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 795.5360114574432,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:41:03",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_xo_ep16_mxfp4_mxfp8_i2048.json",
+    "sha256": "09f828a1c231f8fc7c233d1e0df27bcee1963e74ad34b83c854f38d939d57f0e",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4_mxfp8",
+   "world_size": 16,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 4096,
+   "live_tokens": 4096,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     128
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "grouped",
+     null
+    ],
+    "work_id_mode": "grid_stride",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 1096.0000157356262,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:42:22",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_xo_ep16_mxfp4_mxfp8_i4096.json",
+    "sha256": "467f8345e5685a64113f1aef07b4de7d62e9dbd3a9a54101cdff2b1f9bec1d1a",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "genphase",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "nvfp4",
+   "world_size": 16,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 1024,
+   "live_tokens": 1024,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "phase_interleave",
+     null
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     2,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 353.39200496673584,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:37:41",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_xo_ep16_nvfp4_g1024.json",
+    "sha256": "6751a918867d93ee43c907361743b05bbe7fb6321f797bd3177df375d61cdc1a",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "genphase",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "nvfp4",
+   "world_size": 16,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 128,
+   "live_tokens": 128,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "phase_interleave",
+     null
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 229.5840010046959,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:33:39",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_xo_ep16_nvfp4_g128.json",
+    "sha256": "19e53470a129c9aa97e1082adacb4b42a4a72dd0608d0b66f097c3e067dd403e",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "genphase",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "nvfp4",
+   "world_size": 16,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 256,
+   "live_tokens": 256,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "phase_interleave",
+     null
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     2,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 203.68000119924545,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:34:57",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_xo_ep16_nvfp4_g256.json",
+    "sha256": "4e8e747c17a7ffed0fb2ea2092d87f582aef16d0cb3cef9c04b790e0561d1c1b",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "genphase",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "nvfp4",
+   "world_size": 16,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 512,
+   "live_tokens": 512,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "phase_interleave",
+     null
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     2,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 321.3120102882385,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:36:17",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_xo_ep16_nvfp4_g512.json",
+    "sha256": "e0129139fb19a2dfc7e3b7c69f2243c9b7cd78b398f0d83010c9fcd3ac802a6c",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "nvfp4",
+   "world_size": 16,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 1024,
+   "live_tokens": 1024,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "grouped",
+     null
+    ],
+    "work_id_mode": "grid_stride",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 413.2479876279831,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:39:05",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_xo_ep16_nvfp4_i1024.json",
+    "sha256": "0c25e0980f90c52a219db91632561b7f3097efaaf906a13793f9ad852978c308",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "nvfp4",
+   "world_size": 16,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 2048,
+   "live_tokens": 2048,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "grouped",
+     null
+    ],
+    "work_id_mode": "grid_stride",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 671.999990940094,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:40:23",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_xo_ep16_nvfp4_i2048.json",
+    "sha256": "a49ee0c75a9092ce7af65bca4c5784a8b8ff385e8532120882f23048fe87dcf6",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "nvfp4",
+   "world_size": 16,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 4096,
+   "live_tokens": 4096,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "grouped",
+     null
+    ],
+    "work_id_mode": "grid_stride",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 944.1439807415009,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:41:43",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_xo_ep16_nvfp4_i4096.json",
+    "sha256": "fb020a98f9960667a1064520a6bfdb533beadbcac34bc27c5436e4e3f2e842bd",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "genphase",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4_mxfp8",
+   "world_size": 8,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 1024,
+   "live_tokens": 1024,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     128
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "phase_interleave",
+     null
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 504.12800908088684,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:36:36",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_xo_ep8_mxfp4_mxfp8_g1024.json",
+    "sha256": "18a604f5300e7422eb5f807034eda7d39a348cc3c05470bd64e25d8cd0c70059",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "genphase",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4_mxfp8",
+   "world_size": 8,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 256,
+   "live_tokens": 256,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     128
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "phase_interleave",
+     null
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 314.6720081567764,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:33:57",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_xo_ep8_mxfp4_mxfp8_g256.json",
+    "sha256": "11070ed0d0fbd4567c0f933c727a61ff37d9bd6401d9c5e423e8b789c2ad79a2",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "genphase",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4_mxfp8",
+   "world_size": 8,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 512,
+   "live_tokens": 512,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     128
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "phase_interleave",
+     null
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     2,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 281.96799755096436,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:35:13",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_xo_ep8_mxfp4_mxfp8_g512.json",
+    "sha256": "c079792aa2c99beb524e60b46b12706cb3eb10fb2df15bde9746fc312e31cddc",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4_mxfp8",
+   "world_size": 8,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 1024,
+   "live_tokens": 1024,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     128
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "grouped",
+     null
+    ],
+    "work_id_mode": "grid_stride",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 508.91199707984924,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:37:47",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_xo_ep8_mxfp4_mxfp8_i1024.json",
+    "sha256": "0e826618eb914a43545ee7f4f1f4eacccfa0c463efe932662c25a7736c14df01",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4_mxfp8",
+   "world_size": 8,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 1440,
+   "live_tokens": 1440,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     128
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "grouped",
+     null
+    ],
+    "work_id_mode": "grid_stride",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 549.5999753475189,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:39:01",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_xo_ep8_mxfp4_mxfp8_i1440.json",
+    "sha256": "1adf53851076587e06bfe63171f4bd39dc979a004a4c67bf1c9901d279d64d29",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4_mxfp8",
+   "world_size": 8,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 2048,
+   "live_tokens": 2048,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     128
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "grouped",
+     null
+    ],
+    "work_id_mode": "grid_stride",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 742.143988609314,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:40:16",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_xo_ep8_mxfp4_mxfp8_i2048.json",
+    "sha256": "a86cd9698c6855a1dd59b64655b0e7836ba7327b6d70b278c20be25a43a94afe",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "mxfp4_mxfp8",
+   "world_size": 8,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 2880,
+   "live_tokens": 2880,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     128
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "grouped",
+     null
+    ],
+    "work_id_mode": "grid_stride",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 851.2960076332092,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:41:31",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_xo_ep8_mxfp4_mxfp8_i2880.json",
+    "sha256": "2542f67ab4194f0d00284f8fececd1d9d6619f03f977b2a0be53d6363511656b",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "genphase",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "nvfp4",
+   "world_size": 8,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 1024,
+   "live_tokens": 1024,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "phase_interleave",
+     null
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     2,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 463.5840058326721,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:35:55",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_xo_ep8_nvfp4_g1024.json",
+    "sha256": "6ab021964ab3e925effad598fc0c908519cfa33a4c2e41c19b827a0ce1405f20",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "genphase",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "nvfp4",
+   "world_size": 8,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 256,
+   "live_tokens": 256,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "phase_interleave",
+     null
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     2,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 312.73600459098816,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:33:20",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_xo_ep8_nvfp4_g256.json",
+    "sha256": "5ed8e51a39d88ff33a52dbe51269faa2d176bdd91c62bc17811d700e72e8a5d5",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "genphase",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "nvfp4",
+   "world_size": 8,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 512,
+   "live_tokens": 512,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "phase_interleave",
+     null
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     2,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 266.62400364875793,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:34:35",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_xo_ep8_nvfp4_g512.json",
+    "sha256": "db9732b6724b62ed6e97f1c48707f8cbc6978f496bd6e21bafa92722bf0a39a8",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "nvfp4",
+   "world_size": 8,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 1024,
+   "live_tokens": 1024,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "grouped",
+     null
+    ],
+    "work_id_mode": "grid_stride",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 452.91200280189514,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:37:12",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_xo_ep8_nvfp4_i1024.json",
+    "sha256": "1222875edc5b41d60aea95d6bc51b01c498062dc2fbfc9f2306a80eaf432942f",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "nvfp4",
+   "world_size": 8,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 1440,
+   "live_tokens": 1440,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "grouped",
+     null
+    ],
+    "work_id_mode": "grid_stride",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 477.1520048379898,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:38:24",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_xo_ep8_nvfp4_i1440.json",
+    "sha256": "b9b2c59357417ab298eec0f0cc56fcd5d13137d5f44fe89b891d69c73dfef416",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "nvfp4",
+   "world_size": 8,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 2048,
+   "live_tokens": 2048,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "grouped",
+     null
+    ],
+    "work_id_mode": "grid_stride",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 644.5920169353485,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:39:38",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_xo_ep8_nvfp4_i2048.json",
+    "sha256": "d22b966dcef105a075b26d27424da1693d754f040c6a542be5c84cef0ec49918",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "nvfp4",
+   "world_size": 8,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 2880,
+   "live_tokens": 2880,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     128,
+     256
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "grouped",
+     null
+    ],
+    "work_id_mode": "grid_stride",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 753.711998462677,
+   "source": "autotune-sampled-oracle",
+   "tuned_at": "2026-11-09T11:40:54",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/moe4/results/fi107/knobs_xo_ep8_nvfp4_i2880.json",
+    "sha256": "fd947cdbb980e73b597eb51f69495e41f70267caad335a98ea769b0983a29883",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  }
+ ]
+}
