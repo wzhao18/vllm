@@ -1711,6 +1711,13 @@ class Scheduler(SchedulerInterface):
             # have run.
             self._free_cow_retained_blocks(cow_retained_blocks, self.sched_step_seq + 1)
         pending_kv_cache_block_copies = kv_cache_block_copies or None
+        mamba_prefill_checkpoint_blocks = (
+            self.kv_cache_manager.get_mamba_prefill_checkpoint_blocks(
+                num_scheduled_tokens
+            )
+            if self.mamba_has_prefill_checkpoint_blocks
+            else None
+        )
 
         # Dynamic speculative decoding: compute optimal K
         num_spec_tokens_to_schedule = self.num_spec_tokens
@@ -1749,14 +1756,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
             has_sync_kv_loads=has_sync_kv_loads,
             kv_cache_block_copies=pending_kv_cache_block_copies,
-            mamba_prefill_checkpoint_blocks=(
-                self.kv_cache_manager.get_mamba_prefill_checkpoint_blocks(
-                    num_scheduled_tokens
-                )
-                or None
-            )
-            if self.mamba_has_prefill_checkpoint_blocks
-            else None,
+            mamba_prefill_checkpoint_blocks=mamba_prefill_checkpoint_blocks or None,
             kv_connector_block_state=kv_connector_block_state,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             skip_drafts=not drafts_needed,

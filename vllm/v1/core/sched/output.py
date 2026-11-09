@@ -297,7 +297,7 @@ class SchedulerOutput:
     # Mamba "align" prefill checkpoints: request id -> {KV cache group id:
     # block id} the step's internal prompt checkpoint is exported to. The block
     # is not in the request's block table; the worker writes it into the
-    # table's reserved last column (`get_mamba_prefill_checkpoint_col`).
+    # table's reserved last column (`MambaSpec.reserves_prefill_checkpoint_col`).
     mamba_prefill_checkpoint_blocks: dict[str, dict[int, int]] | None = None
 
     # Scheduler-local; always None by the time this reaches a worker.

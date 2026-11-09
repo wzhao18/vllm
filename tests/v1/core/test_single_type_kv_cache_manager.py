@@ -417,6 +417,27 @@ def test_mamba_block_table_reserves_a_checkpoint_column(
     )
 
 
+def test_mamba_checkpoint_blocks_empty_outside_align_mode():
+    """Specs may declare checkpoints in any cache mode; only "align" exports."""
+    spec = MambaSpec(
+        block_size=128,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        num_prefill_checkpoint_blocks=1,
+        prefill_checkpoint_alignment=1,
+    )
+    pool = BlockPool(num_gpu_blocks=8, enable_caching=False, hash_block_size=128)
+    manager = MambaManager(
+        spec,
+        block_pool=pool,
+        enable_caching=False,
+        kv_cache_group_id=0,
+        scheduler_block_size=128,
+    )
+    assert not spec.reserves_prefill_checkpoint_col
+    assert not manager.checkpoint_blocks
+
+
 def test_mamba_checkpoint_block_freed_with_the_request():
     """A request freed before its next step returns its checkpoint block."""
     spec = MambaSpec(

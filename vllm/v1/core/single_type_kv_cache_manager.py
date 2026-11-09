@@ -1455,6 +1455,10 @@ class MambaManager(SingleTypeKVCacheManager):
         # Mamba checkpoints follow Eagle's global replay boundary.
         self.drop_eagle_checkpoint_block = False
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
+        # Each request's latest checkpoint block ("align" mode only). It is not
+        # in the block table, and is released when the request's next step is
+        # scheduled.
+        self._checkpoint_blocks: dict[str, KVCacheBlock] = {}
         if self.mamba_cache_mode == "align":
             # Mapping from request ID to the index of the block
             # allocated in the previous step
@@ -1465,9 +1469,6 @@ class MambaManager(SingleTypeKVCacheManager):
             # Checkpoint position for the current allocation, and the number of
             # leading blocks it must not hash (see `cache_blocks`).
             self._checkpoints: dict[str, tuple[int, int]] = {}
-            # Each request's latest checkpoint block. It is not in the block
-            # table, and is released when the request's next step is scheduled.
-            self._checkpoint_blocks: dict[str, KVCacheBlock] = {}
             # Requests that registered their own last-prompt-boundary partial
             # tail (producers). A later CoW hands its private copy to the
             # connector; a request that finishes first hands off this table
@@ -1982,7 +1983,10 @@ class MambaManager(SingleTypeKVCacheManager):
                 if entry[0] != request_id
             ]
             if checkpoint_block is not None:
-                return [*super().pop_blocks_for_free(request_id), checkpoint_block]
+                # Blocks are freed in reverse, tail first, so the tail is
+                # evicted first; the checkpoint, which the next turn resumes
+                # from, goes back last.
+                return [checkpoint_block, *super().pop_blocks_for_free(request_id)]
         return super().pop_blocks_for_free(request_id)
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
@@ -2000,11 +2004,12 @@ class MambaManager(SingleTypeKVCacheManager):
         *,
         replay_boundaries: Sequence[int],
     ) -> None:
-        checkpoint = self._checkpoints.get(request.request_id)
-        if checkpoint is not None and checkpoint[1] > self.num_cached_block.get(
-            request.request_id, 0
-        ):
-            self.num_cached_block[request.request_id] = checkpoint[1]
+        if self.mamba_cache_mode == "align":
+            checkpoint = self._checkpoints.get(request.request_id)
+            if checkpoint is not None and checkpoint[1] > self.num_cached_block.get(
+                request.request_id, 0
+            ):
+                self.num_cached_block[request.request_id] = checkpoint[1]
         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
         super().cache_blocks(
             request,
