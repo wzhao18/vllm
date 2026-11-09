@@ -522,6 +522,23 @@ def test_mamba_checkpoint_blocks_released_once_processed():
     assert "r" not in manager._checkpoint_blocks
 
 
+def test_mamba_checkpoint_evicted_on_kv_load_recovery():
+    """A checkpoint exported from a step whose KV load failed loses its key,
+    so the prefix cache never serves it."""
+    manager, pool = _make_checkpoint_manager()
+    request = _make_request(100)
+    manager.get_num_blocks_to_allocate("r", 100, [], 0, 0, 100, prefill_end=100)
+    manager.allocate_new_blocks("r", 100, 100)
+    manager.cache_blocks(request, 100, replay_boundaries=[])
+    block, position = manager.new_checkpoints["r"]
+    block_hash = request.block_hashes[position // 16 - 1]
+    assert pool.get_cached_block(block_hash, [0]) == [block]
+
+    manager.evict_checkpoints("r")
+    assert block.block_hash is None
+    assert pool.get_cached_block(block_hash, [0]) is None
+
+
 def test_mamba_checkpoint_block_freed_with_the_request():
     """A request freed before its next step returns its checkpoint block."""
     spec = MambaSpec(

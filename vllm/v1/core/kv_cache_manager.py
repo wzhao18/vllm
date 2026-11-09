@@ -892,6 +892,13 @@ class KVCacheManager:
                 checkpoint.block_ids[mgr.kv_cache_group_id] = block.block_id
         return checkpoints
 
+    def evict_mamba_checkpoints(self, request_id: str) -> None:
+        """Drop the prefix-cache keys of the request's Mamba prefill checkpoint
+        blocks (see `MambaManager.evict_checkpoints`)."""
+        for mgr in self.coordinator.single_type_managers:
+            if isinstance(mgr, MambaManager):
+                mgr.evict_checkpoints(request_id)
+
     def take_kv_cache_block_copies(
         self,
     ) -> tuple[list[KVCacheBlockCopy], list[KVCacheBlock]]:

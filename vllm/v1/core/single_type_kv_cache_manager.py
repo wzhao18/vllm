@@ -1928,6 +1928,16 @@ class MambaManager(SingleTypeKVCacheManager):
                 returned_blocks.extend(new_blocks)
                 return returned_blocks
 
+    def evict_checkpoints(self, request_id: str) -> None:
+        """Drop the prefix-cache keys of the request's held checkpoint blocks.
+
+        Recovery from a failed KV load recomputes the request, and evicts or
+        rewrites only its block table; a checkpoint exported from the failed
+        state lives outside it and must not be served.
+        """
+        for block, _ in self._checkpoint_blocks.get(request_id, ()):
+            self.block_pool._maybe_evict_cached_block(block)
+
     def _relocate_speculative_block(
         self, req_blocks: list[KVCacheBlock], block_idx: int
     ) -> None:

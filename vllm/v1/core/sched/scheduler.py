@@ -3757,6 +3757,9 @@ class Scheduler(SchedulerInterface):
                     )
                     request.num_computed_tokens = req_num_computed_tokens
 
+                # A Mamba prefill checkpoint exported from the failed state is
+                # outside the block table: drop its prefix-cache keys too.
+                self.kv_cache_manager.evict_mamba_checkpoints(req_id)
                 affected_req_ids.add(request.request_id)
 
         return affected_req_ids, total_affected_tokens, blocks_to_evict
