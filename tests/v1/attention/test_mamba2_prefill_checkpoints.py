@@ -147,8 +147,9 @@ def test_update_block_table_regathers_checkpoint_blocks():
     meta = _build(builder, seq_lens=[900, 100], query_lens=[900, 100])
     assert meta.checkpoint_meta is not None
 
-    # A second group's table: same shape as the first, disjoint block ids.
-    other_table = torch.arange(1000, 1016, dtype=torch.int32).reshape(2, 8)
+    # A second group's table: same shape as the first (Mamba groups share a
+    # block-table width), disjoint block ids.
+    other_table = torch.arange(1000, 1008, dtype=torch.int32).reshape(2, 4)
     updated = builder.update_block_table(
         meta, other_table, torch.zeros(1000, dtype=torch.int64)
     )
