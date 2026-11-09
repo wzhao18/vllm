@@ -10,8 +10,9 @@ stages over the packed MLA cache and the indexer cache (64-entry pages):
                    (scores, exact top-k and the physical rows in two PDL-chained
                    kernels); on FlashMLA the scores and the exact top-k ids. DCP:
                    stock's FP32 rule (no one-round #63 merge): this rank's FP32
-                   logits, every rank's local top-K, the all-gather and the exact
-                   merge to this rank's rows (indexer_stage.py, dcp_topk.py)
+                   logits, every rank's local top-K, the peer-store exchange and
+                   the exact merge to this rank's rows (indexer_stage.py,
+                   dcp_topk.py, dcp_round.py)
   sparse core      FlashInfer sparse MLA on a per-tensor FP8 cache (attn_fi.py:
                    trtllm-gen or prims_ts per batch, called directly into the value
                    stage's rows), else FlashMLA sparse on fp8_ds_mla (attn_ds.py);
