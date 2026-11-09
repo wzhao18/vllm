@@ -1286,6 +1286,9 @@ def test_indexer_stage_refuses():
     rows = torch.zeros(16, 2048, dtype=torch.int32, device=dev)
     with pytest.raises(ValueError, match="candidates hold 8"):
         merge.run(logits, ends, ends, rows, 64, 64, rows, ends)
+    # The exchange's symmetric box is built (collectively) by warm, never on a run.
+    with pytest.raises(RuntimeError, match="before warm"):
+        merge.run(logits, ends[:8], ends, rows, 64, 64, rows, ends)
 
 
 DCP_INDEXER_CASES = {
@@ -1528,6 +1531,217 @@ def test_dcp_topk_merge_exact(case):
             assert c == mine.numel(), (r, t)
             assert torch.equal(rows_out[t, :c].long(), physical), (r, t)
             assert bool((rows_out[t, c:] == -1).all()), (r, t)
+
+
+DCP_ROUND_CASES = {
+    # (global contexts, world, interleave, ties, boost[, topk]); boost: (ranks,
+    # amount) raises those ranks' keys so they hold most of the top-K: their N
+    # round-1 words are all selected (saturated) and the exchange reads their whole
+    # local top-K (the rescue).
+    "w16": ([1000, 40000, 300000], 16, 1, False, None),
+    "w16_ties": ([40000, 2047, 2049], 16, 1, True, None),
+    "w4": ([500, 30000, 90000, 200000], 4, 1, False, None),
+    "w8_ties": ([30000, 90000, 2100], 8, 1, True, None),
+    "interleave64": ([5000, 40000], 4, 64, False, None),
+    "empty_rank": ([3, 2], 8, 1, False, None),
+    "sat_one": ([60000, 9000], 16, 1, False, ((3,), 4.0)),
+    "sat_three": ([60000, 300], 16, 1, False, ((0, 5, 15), 4.0)),
+    "sat_ties": ([60000, 5000], 16, 1, True, ((2, 9), 6.0)),
+    # Round 1 below K words (5 ranks hold keys): every rank holding more is read.
+    "sat_short": ([5000], 16, 1024, False, None),
+    # K / N = 10 saturated ranks (the bound).
+    "sat_ten": ([200000], 16, 1, False, (tuple(range(10)), 5.0)),
+    "k4096": ([40000, 9000, 4097], 8, 1, False, None, 4096),
+    "k4096_sat": ([90000], 8, 1, False, ((1, 6), 5.0), 4096),
+    # Short rows: odd and even counts below N on every rank (an odd count pushes
+    # an armed word past it), an empty row, a one-key row.
+    "short_odd": ([16 * 7 + 5, 1, 0, 16 * 101 + 9], 16, 1, False, None),
+    "short_odd_w8": ([8 * 51 + 3, 0, 8 * 3 + 7], 8, 1, True, None),
+}
+# Cases whose rows grow over the three calls (call c: about (c + 1) / 3 of the
+# length, odd): parity 0's counts grow from call 0 to call 2 (a word past call 0's
+# odd count is read in call 2: it must have stayed armed).
+DCP_ROUND_GROW = {
+    "grow_odd": ([16 * 30 + 7, 16 * 100 + 9, 16 * 200 + 1], 16, 1, False, None),
+    "grow_sat": ([16 * 260 + 5, 16 * 400 + 3], 16, 1, False, ((4,), 4.0)),
+}
+# Ordinals starting at 2^32 - 2: the three calls' 64-bit tags cross the 32-bit
+# carry (2^32 - 1, 2^32, 2^32 + 1; a saturated rank releases each).
+DCP_ROUND_START = {"tag_carry": 2**32 - 2}
+DCP_ROUND_CASES.update(DCP_ROUND_GROW)
+DCP_ROUND_CASES["tag_carry"] = ([60000, 333], 16, 1, False, ((3, 7), 4.0))
+
+
+@pytest.mark.parametrize("case", list(DCP_ROUND_CASES))
+def test_dcp_round_exchange_exact(case):
+    """The FP32 DCP top-k's exchange (dcp_round.py), every rank simulated on one GPU
+    (each rank's box and copies a separate buffer, the peer tables their addresses):
+    each rank's DcpPack pushes its local top-N, then each rank's DcpSelect selects
+    -> exactly the global top-K by (FP32 score desc, global id asc) as the global
+    ids, and this rank's physical KV rows of the owned ones in its local key order,
+    -1 after, with their counts, as the all-gather merge (DcpMerge). Saturated ranks
+    (more than N of the top-K) take the rescue. The ranks' selects run concurrently
+    (one stream each: a select polls its peers' words and release flags). Three
+    calls per case (both parities, new scores each call; the middle one without the
+    test ids: only saturated ranks release their copies, as in production). After
+    every call every rank's box is armed throughout (dcp_round.py, Lamport box: an
+    odd count's padding word included); rows short, odd, empty, growing on a parity
+    (DCP_ROUND_GROW), and 64-bit tags across the 32-bit carry (DCP_ROUND_START)."""
+    from cutlass import Int32, Int64
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.common.host import (
+        stream,
+        to_cute,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.dcp_round import (  # noqa: E501
+        compile_pack,
+        arm_box,
+        compile_round_select,
+        round1_words,
+        slot_words,
+    )
+
+    lengths, world, span, ties, boost, *k = DCP_ROUND_CASES[case]
+    topk, block, stride_rows = k[0] if k else 2048, 64, 64 + GAP
+    n = round1_words(topk, world)
+    rows = len(lengths)
+    gen = torch.Generator(device="cuda").manual_seed(len(lengths) * 37 + world)
+
+    def owner_local(gid):
+        return (gid // span) % world, (gid // (span * world)) * span + gid % span
+
+    pitch = -(-max(lengths) // 512) * 512
+    pages = -(-pitch // block)
+    perm = torch.randperm(rows * pages * 2, device="cuda", generator=gen)
+    table = perm[: rows * pages].int().view(rows, pages).contiguous()
+    req_id = torch.arange(rows, dtype=torch.int32, device="cuda")
+    i32 = dict(dtype=torch.int32, device="cuda")
+    boxes = [
+        arm_box(torch.empty((2, rows, world, slot_words(n)), **i32))
+        for _ in range(world)
+    ]
+    copies = [torch.zeros((2, rows, 2 * topk), **i32) for _ in range(world)]
+    i64 = dict(dtype=torch.int64, device="cuda")
+    ready = [torch.zeros((rows, world), **i64) for _ in range(world)]  # 64-bit tags
+    start = DCP_ROUND_START.get(case, 0)
+    ordinals = [torch.full((rows,), start, **i64) for _ in range(world)]
+    box_peers = torch.tensor([b.data_ptr() for b in boxes], **i64)
+    copy_peers = torch.tensor([c.data_ptr() for c in copies], **i64)
+    ready_peers = torch.tensor([x.data_ptr() for x in ready], **i64)
+    pack = compile_pack(rows, world, topk, n, rows, 0)
+    selects = [
+        compile_round_select(rows, world, topk, n, rows, span, ids, 0)
+        for ids in (False, True)
+    ]
+    streams = [torch.cuda.Stream() for _ in range(world)]
+    s = stream(torch.device("cuda"))
+    ever = False
+    for call in range(3):
+        emit = call != 1
+        if case in DCP_ROUND_GROW:  # about (call + 1) / 3 of each length, odd
+            lengths = [n_ * (call + 1) // 3 | 1 for n_ in DCP_ROUND_CASES[case][0]]
+        scores = [torch.randn(n_, device="cuda", generator=gen) for n_ in lengths]
+        if ties:
+            scores = [(x * 2).round() for x in scores]
+        if boost is not None:
+            ranks, amount = boost
+            for t, n_ in enumerate(lengths):
+                owner, _ = owner_local(torch.arange(n_, device="cuda"))
+                hot = torch.isin(owner, torch.tensor(ranks, device="cuda"))
+                scores[t] = scores[t] + amount * hot
+        words = []
+        for r in range(world):
+            local = torch.full((rows, pitch), float("nan"), device="cuda")
+            ends = torch.zeros(rows, dtype=torch.int32, device="cuda")
+            for t, n_ in enumerate(lengths):
+                owner, idx = owner_local(torch.arange(n_, device="cuda"))
+                mine = owner == r
+                local[t, idx[mine]] = scores[t][mine]
+                ends[t] = int(idx[mine].max()) + 1 if bool(mine.any()) else 0
+            w, _ = local_candidates(local, ends, r, world, span, topk)
+            words.append(w)
+        for r in range(world):
+            pack(
+                Int64(words[r].data_ptr()),
+                Int64(ordinals[r].data_ptr()),
+                to_cute(box_peers, 8),
+                Int64(copies[r].data_ptr()),
+                Int32(r),
+                s,
+            )
+        saturated = False
+        outs = []
+        packed = torch.cuda.current_stream()
+        for r in range(world):
+            rows_out = torch.full((rows, topk), 9, **i32)
+            valid = torch.full((rows,), -9, **i32)
+            ids = torch.full((rows, topk), 9, **i32)
+            outs.append((rows_out, valid, ids))
+            streams[r].wait_stream(packed)
+            with torch.cuda.stream(streams[r]):
+                selects[emit](
+                    Int64(boxes[r].data_ptr()),
+                    to_cute(copy_peers, 8),
+                    to_cute(ready_peers, 8),
+                    Int64(ordinals[r].data_ptr()),
+                    Int64(words[r].data_ptr()),
+                    to_cute(req_id, 4),
+                    Int64(table.data_ptr()),
+                    Int32(table.stride(0)),
+                    Int32(table.shape[1]),
+                    Int32(block),
+                    Int32(stride_rows),
+                    Int32(r),
+                    to_cute(rows_out, 4),
+                    to_cute(valid, 4),
+                    to_cute(ids, 4),
+                    stream(torch.device("cuda")),
+                )
+        torch.accelerator.synchronize()
+        for r, (rows_out, valid, ids) in enumerate(outs):
+            for t, n_ in enumerate(lengths):
+                want = exact_topk(scores[t], topk)  # global ids, ties to the lowest
+                kk = min(n_, topk)
+                if emit:
+                    got = ids[t, :kk].long().sort().values
+                    assert torch.equal(got, want), (call, r, t)
+                    assert bool((ids[t, kk:] == -1).all()), (call, r, t)
+                owner, idx = owner_local(want)
+                held = torch.bincount(owner, minlength=world)
+                saturated |= bool((held > n).any())
+                mine = idx[owner == r].sort().values
+                physical = table[t][mine // block].long() * stride_rows + mine % block
+                c = int(valid[t])
+                assert c == mine.numel(), (call, r, t)
+                assert torch.equal(rows_out[t, :c].long(), physical), (call, r, t)
+                assert bool((rows_out[t, c:] == -1).all()), (call, r, t)
+        ever |= saturated
+        if case not in DCP_ROUND_GROW:
+            assert saturated == (boost is not None or case == "sat_short"), case
+        for r in range(world):
+            assert bool((ordinals[r] == start + call + 1).all()), (call, r)
+            # Armed throughout: every word DcpSelect took is re-armed, and an odd
+            # count's padding word was pushed armed (never a zero word).
+            pairs = boxes[r].view(-1, 2)
+            assert bool((pairs[:, 0] == 1).all()), (call, r, "low half")
+            assert bool((pairs[:, 1] == 0).all()), (call, r, "high half")
+    assert ever == (boost is not None or case == "sat_short"), case
+
+
+def test_dcp_round_select_never_triggers_early():
+    """The exchange's box reuse rests on DcpSelect never triggering its dependents
+    early (dcp_round.py, Ordering (a)): every later kernel, the next call's DcpPack
+    included, starts after it exited. DcpPack does trigger (DcpSelect waits for it
+    before reading)."""
+    import inspect
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa import (
+        dcp_round,
+    )
+
+    assert "launch_dependents" not in inspect.getsource(dcp_round.DcpSelect)
+    assert "griddepcontrol_wait" in inspect.getsource(dcp_round.DcpSelect.kernel)
+    assert "launch_dependents" in inspect.getsource(dcp_round.DcpPack.kernel)
 
 
 # The first indexer page whose scale row lies 2^31 int32 words (8 GiB) past the
@@ -3390,25 +3604,49 @@ def test_prepared_dsa_dcp_sparse_core_partials(dcp8_group, batch, partials):
     aside (it pushes BF16 latent rows only) for FlashInfer's decode, the W_UV bmm
     and DcpValue("proj"). Either way the step is the stock one's
     (check_layer_step) and 200 graph replays of two layers on alternating parities
-    give the eager rows bit for bit."""
+    give the eager rows bit for bit. On the target topology (Rubin TP16 = DCP16,
+    verify: PreparedDsa.strict) a "proj" row the core's variant table lists is
+    refused when the layer prepares (Uncovered, NQ-NOFALLBACK: it would quietly run
+    FlashInfer's chain), as on the VR freeze it stood aside; production never builds
+    that policy: its partials are the automatic ones (runtime.providers passes
+    none: r1.auto_partials), "bf16" on every row the core serves at q8 (C1 / C8:
+    M8 / M16), "proj" past them."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.dcp_value import (  # noqa: E501
         partials_for,
     )
-
-    step = run_layer_step(
-        "fi-trtllm",
-        batch,
-        8,
-        dcp8_group,
-        None,
-        partials,
-        graph=True,
-        replays=200,
-        sparse_core="2x16s2",
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.r1 import (
+        dsa_partials,
     )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.mla.query import (
+        GB300_SMS,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.dsa_kernels.dsa_core.decode import (  # noqa: E501
+        ROWS,
+        VARIANT,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.shapes import (
+        Uncovered,
+        target_topology,
+    )
+
+    # Production's policy at q8 (FlashInfer sparse, per-tensor FP8): the core's rows
+    # exchange BF16 partials, so the core serves C1 / C8 (M8 / M16).
+    auto = dsa_partials(None, fp8=True, q=8)
+    assert 8 in VARIANT and ROWS >= 16, (VARIANT, ROWS)
+    assert all(partials_for(auto, b) == "bf16" for b in range(1, ROWS + 1)), auto
+    assert partials_for(auto, ROWS + 1) == "proj", auto
+    served = partials_for(partials, batch) == "bf16"
+    sms = torch.cuda.get_device_properties(torch.device("cuda")).multi_processor_count
+    strict = target_topology(sms > GB300_SMS, dcp8_group, dcp8_group, 8)
+    args = ("fi-trtllm", batch, 8, dcp8_group, None, partials)
+    kwargs = dict(graph=True, replays=200, sparse_core="2x16s2")
+    if strict and not served:
+        with pytest.raises(Uncovered, match='exchange "proj" partials'):
+            run_layer_step(*args, **kwargs)
+        return
+    step = run_layer_step(*args, **kwargs)
     check_layer_step(step, 8, reference=False)
     # the eager step and the two captured layers, on "bf16" rows only
-    served = partials_for(partials, batch) == "bf16"
     assert len(step.core_calls) == (3 if served else 0), step.core_calls
 
 
@@ -3930,6 +4168,9 @@ def dcp_topk_vs_stock(world, saturate, repeats=1, topk=2048):
     table = torch.arange(rows * pages, dtype=torch.int32, device=dev)
     table = table.view(rows, pages)
     merge = DcpTopk(topk, world, rank, 1, dev, rows)
+    # As IndexerStage.warm at prepare: the exchange's symmetric box (collective)
+    # and the kernels, before any run (a run before warm raises).
+    merge.warm(rows, emit_ids=True)
     rows_out = torch.full((rows, topk), -7, dtype=torch.int32, device=dev)
     valid_out = torch.full((rows,), -7, dtype=torch.int32, device=dev)
     ids_out = torch.full((rows, topk), -7, dtype=torch.int32, device=dev)
@@ -3984,6 +4225,184 @@ def test_dcp_topk_rows_deterministic(dcp8_group, saturate):
     dcp_topk_vs_stock(dcp8_group, saturate, repeats=8)
 
 
+@pytest.mark.skipif(DCP_INIT is None, reason="needs an 8-rank launch (DCP8)")
+@pytest.mark.skip_global_cleanup  # the DCP8 group outlives each case
+def test_dcp_round_stress(dcp8_group):
+    """The exchange's box reuse (dcp_round.py, Ordering and Visibility) under skew,
+    on the real DCP group: graphs of three DcpTopk calls (parities alternate inside
+    a replay and across replays) with GPU sleeps before, between and after the
+    calls, a different sleep pattern per graph; every rank draws its own graph per
+    replay and a host jitter, and replays back to back (inputs and outputs copied
+    on the stream), so ranks run calls apart and a fast rank's next exchange meets
+    a slow rank's last select. Every replay's every call: the global ids exactly
+    the top-K by (FP32 score desc, global id asc) (stock's FP32 rule; stock's merge
+    agrees on every input), this rank's rows and counts exact. Inputs mix full rows
+    (plain, tie-heavy, saturated: rank-0 / three-rank boosts, the rescue reads
+    peers' copies, the parity a fast rank rewrites two calls later) with short
+    rows: empty, one key, odd and even per-rank counts below N (an odd count pushes
+    an armed padding word), a saturated rank on short rows; half the batches run a
+    ladder whose per-rank counts grow every call (so on each parity too: a word
+    past an earlier odd count is read later, torn writes included), the other half
+    random picks. The middle call of each replay runs without the test ids
+    (production: only saturated ranks release their copies)."""
+    import random
+    import time
+
+    from vllm.distributed import get_dcp_group
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.dcp_round import (  # noqa: E501
+        round1_words,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa.dcp_topk import (  # noqa: E501
+        DcpTopk,
+    )
+
+    world = dcp8_group
+    group = get_dcp_group()
+    rank = group.rank_in_group
+    dev = torch.device("cuda", torch.accelerator.current_device_index())
+    topk, rows, local_len, block, calls = 2048, 6, 4100, UNIT, 3
+    n = round1_words(topk, world)  # N: 384 at DCP8, 192 at DCP16
+    full = local_len * world
+    gen = torch.Generator(device=dev).manual_seed(4242)  # the same on every rank
+    # (kind, global row lengths): full rows, then short ones.
+    kinds = [
+        ("plain", [full] * rows),
+        ("ties", [full] * rows),
+        ("rank0", [full] * rows),
+        ("three", [full] * rows),
+        ("plain", [full] * rows),
+        ("ties", [full] * rows),
+        # empty, one key, odd per-rank counts, ranks < W/2 one more (even), a
+        # count just under N, full
+        (
+            "plain",
+            [0, 1, world * 7 + 3, world * 51 + world // 2, world * (n - 1), full],
+        ),
+        ("ties", [world * 3, 0, world * 101 + 5, 2, world * (n // 2) + 1, world * n]),
+        # rank 0 saturated on short rows (more than N keys, all selected)
+        ("rank0", [world * (n + 51) + 3, world * (n + 7), 1, 0, world * 9 + 1, full]),
+    ]
+    # The ladder: per-rank counts grow every call (odd, then even on ranks < W/2).
+    ladder = [k * 2 + 1 for k in (2, 9, 23, 60, 110, (n - 3) // 2)]
+    for step, count in enumerate(ladder):
+        lens = [world * (count + 2 * t) + world // 2 * (step % 2) for t in range(rows)]
+        kinds.append(("plain", [min(x, world * (n + 40)) for x in lens]))
+    first_rung = len(kinds) - len(ladder)
+    inputs, wants, lengths = [], [], []
+    for kind, lens in kinds:
+        scores = torch.randn(rows, full, device=dev, generator=gen)
+        if kind == "ties":
+            scores[:, ::2] = (scores[:, ::2] * 4).round()
+        if kind == "rank0":
+            scores[:, 0::world] += 64  # rank 0 holds the whole top-K
+        if kind == "three":
+            for r in (1, world // 2, world - 1):
+                scores[:, r::world] += 3
+        inputs.append(scores)
+        lengths.append(lens)
+        wants.append([exact_topk(scores[t, : lens[t]], topk) for t in range(rows)])
+    pitch = -(-local_len // 512) * 512
+    shards, ends = [], []  # [input] -> this rank's [rows, pitch] logits, row ends
+    for i, scores in enumerate(inputs):
+        every, every_ends = [], []
+        for r in range(world):
+            shard = torch.full((rows, pitch), float("nan"), device=dev)
+            own = torch.zeros(rows, dtype=torch.int32, device=dev)
+            for t, length in enumerate(lengths[i]):
+                keys = max(0, -(-(length - r) // world))  # gids < length, % W == r
+                shard[t, :keys] = scores[t, r::world][:keys]
+                own[t] = keys
+            every.append(shard)
+            every_ends.append(own)
+        stock = stock_dcp_merge(every, every_ends, rank, world, 1, topk)
+        for t in range(rows):
+            picked = stock[t][stock[t] >= 0].long().sort().values
+            assert torch.equal(picked, wants[i][t]), (i, t)
+        shards.append(every[rank])
+        ends.append(every_ends[rank])
+    req_id = torch.arange(rows, dtype=torch.int32, device=dev)
+    pages = local_len // block + 1
+    table = torch.arange(rows * pages, dtype=torch.int32, device=dev).view(rows, pages)
+    merge = DcpTopk(topk, world, rank, 1, dev, rows)
+    merge.warm(rows, emit_ids=True)
+    merge.warm(rows, emit_ids=False)
+    i32 = dict(dtype=torch.int32, device=dev)
+    logits = [torch.empty(rows, pitch, device=dev) for _ in range(calls)]
+    row_ends = [torch.empty(rows, **i32) for _ in range(calls)]
+    outs = [
+        (torch.empty(rows, topk, **i32), torch.empty(rows, **i32))
+        for _ in range(calls)
+    ]
+    ids = [torch.empty(rows, topk, **i32) for _ in range(calls)]
+    rng = random.Random(1000 + rank)  # this rank's graphs, sleeps and jitter
+    shared = random.Random(77)  # the inputs: the same on every rank
+    cycles = [0, 2_000, 20_000, 200_000, 2_000_000]  # ~0-1 ms of GPU sleep
+    patterns = [[rng.choice(cycles) for _ in range(calls + 1)] for _ in range(6)]
+    patterns[rank % 6] = [0] * (calls + 1)  # a rank that never waits
+    graphs = []
+    capture = torch.cuda.Stream(device=dev)
+    for pattern in patterns:
+        torch.accelerator.synchronize()
+        group.barrier()  # every rank's capture ran no call yet: the ordinals agree
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=capture):
+            for c in range(calls):
+                if pattern[c]:
+                    torch.cuda._sleep(pattern[c])
+                # The middle call without the test ids: only saturated ranks then
+                # release their copies (production).
+                (rows_out, valid_out), ids_out = outs[c], ids[c] if c != 1 else None
+                args = req_id, table, block, block, rows_out, valid_out, ids_out
+                merge.run(logits[c], row_ends[c], *args)
+            if pattern[calls]:
+                torch.cuda._sleep(pattern[calls])
+        graphs.append(g)
+    # Capture does not run the calls: the ordinals are where warm left them.
+    replays, batch = 480, 24
+    done, rung = 0, 0
+    while done < replays:
+        picks, results = [], []
+        climb = (done // batch) % 2 == 0  # the ladder, else random picks
+        for _ in range(batch):
+            if climb:
+                chosen = []
+                for _ in range(calls):
+                    chosen.append(first_rung + rung)
+                    rung = (rung + 1) % len(ladder)
+            else:
+                chosen = [shared.randrange(len(inputs)) for _ in range(calls)]
+            for c, j in enumerate(chosen):
+                logits[c].copy_(shards[j])
+                row_ends[c].copy_(ends[j])
+            graphs[rng.randrange(len(graphs))].replay()
+            results.append(
+                [(o[0].clone(), o[1].clone(), x.clone()) for o, x in zip(outs, ids)]
+            )
+            picks.append(chosen)
+            if rng.random() < 0.3:
+                time.sleep(rng.random() * 2e-4)  # host jitter
+        torch.accelerator.synchronize()
+        for k, (chosen, got) in enumerate(zip(picks, results)):
+            for c, j in enumerate(chosen):
+                rows_out, valid_out, ids_out = got[c]
+                for t in range(rows):
+                    where = (done + k, c, j, t)
+                    want = wants[j][t]
+                    kk = want.numel()
+                    if c != 1:
+                        got_ids = ids_out[t, :kk].long().sort().values
+                        assert torch.equal(got_ids, want), where
+                        assert bool((ids_out[t, kk:] == -1).all()), where
+                    mine = want[want % world == rank] // world
+                    assert int(valid_out[t]) == mine.numel(), where
+                    physical = table[t, mine // block].long() * block + mine % block
+                    assert torch.equal(rows_out[t, : mine.numel()].long(), physical)
+                    assert bool((rows_out[t, mine.numel() :] == -1).all()), where
+        done += batch
+    torch.accelerator.synchronize()
+    group.barrier()
+
+
 @pytest.mark.skip_global_cleanup  # no group needed: keep a DCP8 launch's group
 @pytest.mark.parametrize("ids", [False, True], ids=["rows", "rows+ids"])
 def test_merge_rows_kernels_compile_at_prepare(monkeypatch, ids):
@@ -3991,8 +4410,8 @@ def test_merge_rows_kernels_compile_at_prepare(monkeypatch, ids):
     with the global ids too for tests) compile for every batch when the layer
     prepares its cache (``IndexerStage.warm``), not at their first launch: the
     specialized decode runs only inside graph captures, where a first compile
-    invalidates the capture (CUDA error 901). Neither launches the next kernel
-    early (no release switch: every consumer reads before its PDL wait)."""
+    invalidates the capture (CUDA error 901). The warm also builds the exchange's
+    symmetric box (collective; stubbed here: one GPU, no DCP group)."""
     from unittest.mock import MagicMock
 
     from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.dsa import (
@@ -4000,12 +4419,15 @@ def test_merge_rows_kernels_compile_at_prepare(monkeypatch, ids):
         indexer_stage,
     )
 
+    exchange = MagicMock()
+    monkeypatch.setattr(dcp_topk.DcpTopk, "exchange", exchange)
     dev = torch.device("cuda", torch.accelerator.current_device_index())
     stage = indexer_stage.IndexerStage.__new__(indexer_stage.IndexerStage)
     stage.topk, stage.local_topk = 2048, 2048
     stage.dcp = dcp_topk.DcpTopk(2048, 16, 3, 1, dev, 64)
     stage.dcp_ids = torch.empty(1) if ids else None
     stage.warm([8, 64])  # compiles (and is cached per process)
+    assert exchange.call_count == 2  # the box, before each rows' kernels
     warm = MagicMock()
     monkeypatch.setattr(stage.dcp, "warm", warm)
     stage.warm([8, 64])
