@@ -10,9 +10,9 @@ top-k on them. No stock op runs here: a step this stage does not serve raises.
        on FlashInfer, PreparedDsa's FusedIndexer gives the physical rows itself).
   DCP  ``merge_rows``: stock's FP32 rule (no one-round #63 merge: stock gates it
        on BF16 logits): the FP32 logits of this rank's keys (the scorer, in
-       DeepGEMM's logits layout), every rank's full local top-K, the all-gather
-       and the exact merge straight to this rank's physical KV rows and counts
-       (dcp_topk.DcpTopk).
+       DeepGEMM's logits layout), every rank's full local top-K, the peer-store
+       exchange of each rank's top-N (dcp_round.py, exact) and the merge straight
+       to this rank's physical KV rows and counts (dcp_topk.DcpTopk).
 
 Both serve the steps the specialized decode runs (runtime.decode.decode_metadata):
 pure decode or uniform verify, the same on every rank."""
@@ -117,8 +117,8 @@ class IndexerStage:
         """DCP: this rank's flat KV rows of the exact global top-k of the first
         ``batch`` rows (``q`` per request; compacted to a prefix in its local key
         order) and their counts, as ``dcp_stage.local_slots`` of the stock op's
-        global ids; ``metadata``: the MLA layer's. One all-gather over the DCP
-        group: every rank runs it on every step."""
+        global ids; ``metadata``: the MLA layer's. One peer-store exchange over
+        the DCP group: every rank runs it on every step."""
         check_head_weights(head_w)
         if not self.local_topk or self.fused is None or not self.fused.pitch:
             raise RuntimeError("Kimi K3.1 specialized DSA: the DCP top-k is not built")

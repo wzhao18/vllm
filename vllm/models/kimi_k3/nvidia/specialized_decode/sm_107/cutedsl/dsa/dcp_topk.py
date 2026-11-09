@@ -8,16 +8,23 @@ one-round (#63) merge (stock gates it on BF16 logits), but stock's FP32 rule
                 logits (ties to the lowest local index), each as a 64-bit word,
                 high half the score's order-preserving 32-bit key, low half
                 0xFFFFFFFF - its global id; zero words past a short row's count
-  all-gather    the [rows, K] words over the DCP group (rank-major)
-  DcpMerge      per row, the exact top-K of the W * K words (a 64-bit radix
-                select: the 32 score bits, then the id bits; every global id is
-                on one rank only, so the words are distinct) -> this rank's
-                selected keys as its physical KV rows (a compacted prefix in its
-                local key order, -1 after) and their counts
+  exchange      DcpTopk (dcp_round.py): each rank's local top-N (N ~ 1.5 K / W)
+                pushed by peer stores into every rank's symmetric box, the exact
+                K-th word of the W * N, and every rank whose N words are all
+                selected while it holds more read whole from its symmetric copy
+                -> this rank's selected keys as its physical KV rows (a compacted
+                prefix in its local key order, -1 after) and their counts. No
+                NCCL all-gather (DCP16: 16 x fewer bytes than the K words, and no
+                ring latency; 4-node C1 step 35.5 us -> a few us per DSA layer).
+  DcpMerge      (the all-gather reference, tests) per row, the exact top-K of the
+                W * K all-gathered words (a 64-bit radix select: the 32 score bits,
+                then the id bits; every global id is on one rank only, so the
+                words are distinct)
 
 The global top-K is exact: a key of it has at most K - 1 keys above it overall, so
-at most K - 1 on its own rank, and is in that rank's local top-K. The selection
-(score desc, global id asc) is the stock merge's stable key at 32 score bits."""
+at most K - 1 on its own rank, and is in that rank's local top-K (dcp_round.py: and
+in the union of the exchange). The selection (score desc, global id asc) is the
+stock merge's stable key at 32 score bits."""
 
 import functools
 
@@ -270,10 +277,12 @@ class DcpTopk:
     ``rank``; ``interleave``: the DCP interleave, or a callable giving it once it is
     final, after the block size setup): ``run`` takes FP32 logits rows of this
     rank's keys to this rank's physical KV rows of the exact global top-K and their
-    counts. Collective over ``group`` (default: the DCP group): every rank must call
-    it with the same rows."""
+    counts. Collective over ``group`` (default: the DCP group's device group): every
+    rank must call ``warm`` (which builds the exchange's symmetric box, dcp_round.py)
+    and ``run`` with the same rows, in the same order."""
 
     def __init__(self, topk, world, rank, interleave, device, max_rows, group=None):
+        from .dcp_round import round1_words
         from .indexer import select_unsupported
 
         reason = select_unsupported(topk)
@@ -283,12 +292,32 @@ class DcpTopk:
         self._interleave, self.device, self.group = interleave, device, group
         self.dummy = torch.zeros(1, dtype=torch.int32, device=device)
         self.candidates = candidate_rows(device, max_rows, topk)
+        self.local_topk = round1_words(topk, world)
+        self.box = None  # the exchange's DcpRoundBox (``warm``: collective)
 
     def warm(self, rows, emit_ids=False):
-        """Compile ``run``'s kernels for steps of ``rows`` rows now (a first compile
-        inside a CUDA graph capture invalidates it)."""
+        """Build the exchange's symmetric box (collective, once per device, rows and
+        group) and compile ``run``'s kernels for steps of ``rows`` rows now (a first
+        compile inside a CUDA graph capture invalidates it)."""
         self.check_rows(rows)
+        self.exchange()
         self.kernels(rows, emit_ids)
+
+    def exchange(self):
+        """The DcpRoundBox this top-k exchanges through (built here on first use)."""
+        if self.box is None:
+            from .dcp_round import round_box
+
+            group = self.group
+            if group is None:
+                from vllm.distributed.parallel_state import get_dcp_group
+
+                group = get_dcp_group()
+            group = getattr(group, "device_group", group)
+            max_rows = self.candidates.shape[0]
+            args = self.device, max_rows, self.topk, self.world, self.rank, group
+            self.box = round_box(*args)
+        return self.box
 
     def check_rows(self, rows):
         """The select and merge grids write ``rows`` rows of the shared candidates."""
@@ -304,25 +333,23 @@ class DcpTopk:
         return int(span() if callable(span) else span)
 
     def kernels(self, rows, emit_ids):
+        """(IndexerSelect "candidates", DcpPack, DcpSelect) of ``rows`` rows. The
+        select launches DcpPack early and DcpPack DcpSelect (each waits for its
+        predecessor before reading anything)."""
+        from .dcp_round import compile_pack, compile_round_select
+
         index = self.device.index
         args = self.topk, "candidates", index, 1
-        # The select does not launch the all-gather early either (a collective
-        # kernel need not wait on PDL).
         select = compile_select(
-            rows, 1, *args, release=False, world=self.world, interleave=self.interleave
+            rows, 1, *args, release=True, world=self.world, interleave=self.interleave
         )
-        merge = compile_merge(
-            rows, self.world, self.topk, self.interleave, emit_ids, index
+        shape = rows, self.world, self.topk, self.local_topk
+        max_rows = self.candidates.shape[0]
+        pack = compile_pack(*shape, max_rows, index)
+        merge = compile_round_select(
+            *shape, max_rows, self.interleave, emit_ids, index
         )
-        return select, merge
-
-    def gather(self, candidates):
-        """The rank-major all-gather [world * rows, 2 K] of every rank's words."""
-        if self.group is None:
-            from vllm.distributed.parallel_state import get_dcp_group
-
-            self.group = get_dcp_group()
-        return self.group.all_gather(candidates, dim=0)
+        return select, pack, merge
 
     def run(
         self,
@@ -355,7 +382,13 @@ class DcpTopk:
             raise ValueError("DCP top-k: contiguous block table rows, K-wide rows_out")
         if ids_out is not None and ids_out.stride(0) != self.topk:
             raise ValueError("DCP top-k: K-wide ids_out")
-        select, merge = self.kernels(rows, ids_out is not None)
+        box = self.box
+        if box is None:
+            raise RuntimeError(
+                "DCP top-k: run before warm (the exchange's symmetric box is built "
+                "collectively by warm, outside any capture)"
+            )
+        select, pack, merge = self.kernels(rows, ids_out is not None)
         candidates = self.candidates[:rows]
         s = stream(self.device)
         dummy = to_cute(self.dummy, 4)
@@ -373,10 +406,23 @@ class DcpTopk:
             to_cute(candidates, 4),
             s,
         )
-        gathered = self.gather(candidates)
+        ordinal = Int64(box.ordinal.data_ptr())  # int64 [max_rows]
+        copies = int(box.copies.data_ptr())
+        pack(
+            Int64(candidates.data_ptr()),
+            ordinal,
+            to_cute(box.box_peers, 8),
+            Int64(copies),
+            Int32(self.rank),
+            s,
+        )
         ids = ids_out if ids_out is not None else rows_out
         merge(
-            Int64(gathered.data_ptr()),
+            Int64(box.box.data_ptr()),
+            to_cute(box.copy_peers, 8),
+            to_cute(box.ready_peers, 8),
+            ordinal,
+            Int64(candidates.data_ptr()),
             to_cute(req_id[:rows], 4),
             Int64(block_table.data_ptr()),
             Int32(block_table.stride(0)),
