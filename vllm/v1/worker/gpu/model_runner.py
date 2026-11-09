@@ -1391,16 +1391,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if group_ids is None:
             group_ids = get_prefill_checkpoint_group_ids(self.kv_cache_config)
             self._prefill_checkpoint_group_ids = group_ids
-        if not group_ids:
+        checkpoint_blocks = scheduler_output.mamba_prefill_checkpoint_blocks
+        # Most steps have no checkpoint: skip unless an earlier step's entries
+        # must be cleared (the gather does not reach the reserved column).
+        if not group_ids or not (
+            checkpoint_blocks or getattr(self, "_checkpoint_col_dirty", False)
+        ):
             return
+        self._checkpoint_col_dirty = bool(checkpoint_blocks)
         num_reqs = input_batch.num_reqs
-        block_ids = torch.from_numpy(
+        block_ids = async_tensor_h2d(
             prefill_checkpoint_block_ids(
-                scheduler_output.mamba_prefill_checkpoint_blocks,
-                input_batch.req_ids[:num_reqs],
-                group_ids,
-            )
-        ).to(self.device, non_blocking=True)
+                checkpoint_blocks, input_batch.req_ids[:num_reqs], group_ids
+            ),
+            device=self.device,
+        )
         for k, group_id in enumerate(group_ids):
             block_tables[group_id][:num_reqs, -1] = block_ids[k]
 

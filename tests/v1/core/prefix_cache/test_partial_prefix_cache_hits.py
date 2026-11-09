@@ -656,15 +656,16 @@ def test_internal_checkpoint_uses_partial_hash_lifecycle():
 
     assert new_blocks is not None
     mamba_blocks = manager.get_blocks(request.request_id).blocks[1]
-    checkpoint_idx = 2
-    checkpoint_block = mamba_blocks[checkpoint_idx]
-    running_block = mamba_blocks[checkpoint_idx + 1]
-    assert not checkpoint_block.is_null
+    mamba_manager = manager.coordinator.single_type_managers[1]
+    _, checkpoint_block, _ = mamba_manager._checkpoints[request.request_id]
+    running_block = mamba_blocks[3]
     assert not running_block.is_null
-    assert checkpoint_block is not running_block
+    # The checkpoint has its own block, outside the request's table; the table
+    # column for state@96 is never written, so it holds the null block.
+    assert checkpoint_block not in mamba_blocks
+    assert mamba_blocks[2].is_null
 
-    # The internal block is exported at state@112, replacing its temporary
-    # full-block state@96 key while retaining #52789's req_to_blocks ownership.
+    # The checkpoint block is exported at state@112.
     partial_hash = request.block_hashes[112 // hash_block_size - 1]
     partial_hit = manager.block_pool.get_cached_block(partial_hash, [1])
     assert partial_hit is not None
@@ -869,8 +870,8 @@ def test_eagle_block_aligned_checkpoint_replaces_newer_hash():
 
     assert manager.allocate_slots(request, request.num_tokens) is not None
 
-    mamba_blocks = manager.get_blocks(request.request_id).blocks[1]
-    checkpoint_block = mamba_blocks[2]
+    mamba_manager = manager.coordinator.single_type_managers[1]
+    _, checkpoint_block, _ = mamba_manager._checkpoints[request.request_id]
     checkpoint_hash = request.block_hashes[64 // hash_block_size - 1]
     checkpoint_hit = manager.block_pool.get_cached_block(checkpoint_hash, [1])
     assert checkpoint_hit is not None

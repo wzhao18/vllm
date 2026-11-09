@@ -1765,6 +1765,12 @@ class MambaManager(SingleTypeKVCacheManager):
                 prefill_end,
             ):
                 checkpoint_position = 0
+            previous = self._checkpoints.get(request_id)
+            # The checkpoint's own block, outside the block table, unless this
+            # pass already allocated it.
+            num_checkpoint_blocks = int(
+                checkpoint_position > 0 and (previous is None or previous[1] is None)
+            )
             if not apply_admission_cap:
                 if checkpoint_position > 0:
                     # A chunk resuming mid-block that runs past the block's end
@@ -1779,7 +1785,6 @@ class MambaManager(SingleTypeKVCacheManager):
                         and num_tokens > resumed_block_end
                         else 0
                     )
-                    previous = self._checkpoints.get(request_id)
                     self._checkpoints[request_id] = (
                         checkpoint_position,
                         # Keep a block this pass already allocated.
@@ -1787,8 +1792,7 @@ class MambaManager(SingleTypeKVCacheManager):
                         num_unhashed_blocks,
                     )
                 else:
-                    previous = self._checkpoints.pop(request_id, None)
-                    assert previous is None or previous[1] is None
+                    self.drop_prefill_checkpoint(request_id)
             if num_new_blocks > 0:
                 blocks_allocated = request_id in self._allocated_block_reqs
                 physical_block_cap = 1 + int(has_partial_hit)
@@ -1799,11 +1803,8 @@ class MambaManager(SingleTypeKVCacheManager):
             num_evictable_computed_blocks = self._get_num_evictable_blocks(
                 new_computed_blocks
             )
-            # The checkpoint's own block, outside the block table.
             return (
-                num_new_blocks
-                + int(checkpoint_position > 0)
-                + num_evictable_computed_blocks
+                num_new_blocks + num_checkpoint_blocks + num_evictable_computed_blocks
             )
 
     def allocate_new_blocks(
