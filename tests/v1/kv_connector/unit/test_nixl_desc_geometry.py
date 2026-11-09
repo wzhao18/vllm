@@ -430,6 +430,7 @@ def _register_overlaid_mla_worker(
     worker.src_xfer_handles_by_block_size = {}
     worker.kv_caches_base_addr = defaultdict(dict)
     worker._mamba_ssm_size = (0, 0)
+    worker._mamba_state_geometry = None
     worker.kv_cache_layout = "LBNHC"
     worker.host_buffer_kv_cache_layout = "LBNHC"
     worker._physical_blocks_per_logical_kv_block = 1
@@ -1437,6 +1438,8 @@ def test_dcp_rejects_different_logical_block_sizes():
         remote_num_logical=12,
         remote_ssm_sizes=(24, 32),
     )
+    # Different DCP sizes need block-sized interleave on the DCP-sharded side.
+    meta_r.cp_kv_cache_interleave_size = 8
     with pytest.raises(NotImplementedError, match="matching P/D logical block sizes"):
         worker.add_remote_agent(
             meta_r, remote_tp_rank=0, remote_tp_size=2, remote_dcp_size=2
@@ -1462,6 +1465,8 @@ def test_dcp_pull_with_block_size_ratio_writes_stay_within_request_blocks():
         remote_num_logical=8,
         remote_ssm_sizes=(24, 32),
     )
+    # Different DCP sizes need block-sized interleave on the DCP-sharded side.
+    meta_r.cp_kv_cache_interleave_size = 8
     worker._remote_agents[meta_r.engine_id] = {
         (0, rank): worker.add_remote_agent(
             meta_r, remote_tp_rank=rank, remote_tp_size=2, remote_dcp_size=2

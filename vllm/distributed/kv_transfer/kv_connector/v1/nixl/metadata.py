@@ -3,7 +3,7 @@
 """Metadata dataclasses and helpers for the NIXL connector."""
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds, EngineId
@@ -12,6 +12,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
 )
 from vllm.logger import init_logger
+
+if TYPE_CHECKING:
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.dcp_pair_exchange import (
+        PairUnit,
+    )
 
 logger = init_logger(__name__)
 
@@ -77,6 +82,9 @@ class NixlAgentMetadata:
     region_mem_types: list[str] | None = None
     dcp_size: int = 1
     pcp_size: int = 1
+    # DCP token interleave of the attention KV (cp_kv_cache_interleave_size).
+    # None: the peer predates the field, so its token layout is unknown.
+    cp_kv_cache_interleave_size: int | None = None
     # Page length of the PLE short-conv state (None when the model has none).
     ple_block_len: int | None = None
     # Layer names sharing each advertised region, in region order.
@@ -85,6 +93,10 @@ class NixlAgentMetadata:
     layer_group_ids: dict[str, int] = field(default_factory=dict)
     # Packed member -> (byte offset in its region's block, bytes per page).
     packed_member_layouts: dict[str, tuple[int, int]] = field(default_factory=dict)
+    # Per-rank Mamba state page geometry: (TP size, state shapes, state dtypes).
+    # Dim 0 of each shape is the TP-sharded one; peers must agree on the rest
+    # (e.g. conv rows = conv width - 1 + num_speculative_tokens). None: no Mamba.
+    mamba_state_geometry: tuple[int, list[list[int]], list[str]] | None = None
 
 
 @dataclass
@@ -270,6 +282,33 @@ class ReqMeta:
     # Worker-only, per-group range of the remote-sized sub-blocks of each local
     # group a pull covers. None derives it from the block counts.
     covered_sub_blocks: list[range] | None = None
+    # Worker-only, group -> local attention kernel blocks the pull leaves
+    # unwritten. Set only with a host buffer, whose h2d sync would restore the
+    # stale bytes: zeroed on the device after that sync. Device pulls zero them
+    # when the reads are posted.
+    unwritten_blocks: dict[int, list[int]] | None = None
+
+
+@dataclass
+class KVFingerprintReq:
+    """One request's KV to fingerprint; sent only with VLLM_NIXL_KV_FINGERPRINT
+    on (see kv_fingerprint.py)."""
+
+    # P's request id, which joins P's and D's records.
+    req_id: ReqId
+    # The request's own blocks per KV cache group: on D its block table from
+    # the KV cache manager, never the pair plan's units; on P the blocks
+    # request_finished receives.
+    block_ids: BlockIds
+    # L: the tokens P computed (P) or D loads (D).
+    num_tokens: int
+    # D: its prefix-cache hit in blocks, from its hit in tokens; the record
+    # starts at that block.
+    first_block: int = 0
+    # D: False for a pull that ended without its plan being emitted. Logged
+    # without cells, so the comparator reports the request's cells missing on
+    # D rather than listing it as P only.
+    exchanged: bool = True
 
 
 class NixlConnectorMetadata(KVConnectorMetadata):
@@ -293,6 +332,15 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         # Push mode (P side): newly finished request blocks to be matched
         # against pending D registrations on the P worker.
         self.push_finished_blocks: dict[ReqId, BlockIds] = {}
+        # DCP pair mode (D side): the blocks each finished pull exchanges with
+        # the partner rank, run by finalize_loaded_kv before the next forward.
+        self.reqs_to_pair_exchange: dict[ReqId, list[PairUnit]] = {}
+        # KV fingerprints (VLLM_NIXL_KV_FINGERPRINT only). P side: requests
+        # whose KV D will pull, logged before they are reported sent.
+        self.fingerprint_sends: dict[ReqId, KVFingerprintReq] = {}
+        # D side, pair mode: pulls that ended, logged after this step's
+        # exchanges.
+        self.fingerprint_pulls: dict[ReqId, KVFingerprintReq] = {}
 
     def _add_new_req(
         self,

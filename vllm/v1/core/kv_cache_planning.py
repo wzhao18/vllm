@@ -9,6 +9,7 @@ from dataclasses import replace
 from functools import partial, reduce
 from typing import TYPE_CHECKING, Any
 
+from vllm import envs
 from vllm.config import SpeculativeConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_up
@@ -1066,6 +1067,16 @@ def _get_packed_kv_cache_groups(
             num_groups = max(
                 num_groups, cdiv(len(spec.kv_cache_specs), states_per_block)
             )
+        if (fixed := envs.VLLM_PACKED_KV_STATE_GROUPS) and is_state_bucket(spec):
+            # State pages scale with 1/TP, so the split above depends on TP. P/D
+            # connectors hand blocks off by group: a prefiller and a decoder with
+            # different TP must fix the same count.
+            if fixed < num_groups:
+                raise ValueError(
+                    f"VLLM_PACKED_KV_STATE_GROUPS={fixed}: the {len(spec.kv_cache_specs)}"
+                    f" state layers need at least {num_groups} groups at this TP"
+                )
+            num_groups = fixed
         if num_groups == 1:
             groups.append(KVCacheGroupSpec(list(spec.kv_cache_specs), spec))
             continue

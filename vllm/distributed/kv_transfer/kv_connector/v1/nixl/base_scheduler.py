@@ -4,6 +4,7 @@
 
 import threading
 import time
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import msgspec
@@ -20,20 +21,28 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.kv_fingerprint import (
+    fingerprint_dir,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     GET_META_MSG,
     HeartbeatInfo,
+    KVFingerprintReq,
     NixlConnectorMetadata,
     NixlHandshakePayload,
     ReqId,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import zmq_ctx
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
+    get_representative_spec_type,
+    zmq_ctx,
+)
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 from vllm.utils.network_utils import make_zmq_path
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     FullAttentionSpec,
     MambaSpec,
     SlidingWindowSpec,
@@ -41,6 +50,9 @@ from vllm.v1.kv_cache_interface import (
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.dcp_pair_exchange import (
+        PairUnit,
+    )
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.outputs import KVConnectorOutput
@@ -56,6 +68,12 @@ class NixlBaseConnectorScheduler:
     # pull (READ) producer from a push (WRITE) one. Overridden by the push
     # scheduler.
     _TRANSFER_MODE: str = "pull"
+
+    # DCP pair mode (decoder, pull; see dcp_pair_exchange.py) and KV
+    # fingerprints. The class defaults keep schedulers built without __init__
+    # (unit tests) off them.
+    _pair_mode: bool = False
+    _fingerprint: bool = False
 
     def __init__(
         self,
@@ -130,6 +148,53 @@ class NixlBaseConnectorScheduler:
         # Reqs to remove from processed set because they're not to send after
         # remote prefill or aborted.
         self._reqs_not_processed: set[ReqId] = set()
+
+        # DCP pair mode (decoder, pull): partner DCP ranks swap half-blocks after
+        # each pull at interleave 1. Only a JSON true enables it, as in the
+        # worker, whose startup checks reject any other truthy value. A
+        # producer (kv_producer or kv_both) ignores it, as its workers do.
+        self._pair_mode = (
+            self._TRANSFER_MODE == "pull"
+            and not vllm_config.kv_transfer_config.is_kv_producer
+            and vllm_config.kv_transfer_config.get_from_extra_config(
+                "dcp_pair_exchange", False
+            )
+            is True
+        )
+        # The exchanged groups: the DCP-sharded attention groups, whose blocks
+        # the pull matches by DCP position. Transfer-group indices, as in the
+        # worker's read path.
+        self._pair_groups = (
+            tuple(
+                i
+                for i, g in enumerate(kv_cache_config.transfer_groups)
+                if g.kv_cache_spec.dcp_sharded
+                and issubclass(
+                    get_representative_spec_type(g.kv_cache_spec), AttentionSpec
+                )
+            )
+            if self._pair_mode
+            else ()
+        )
+        # Exchange plans, built at allocation. Ready once every rank finished
+        # the pull, then emitted with the next step's connector metadata.
+        self._pair_plans: dict[ReqId, list[PairUnit]] = {}
+        self._pair_ready: dict[ReqId, list[PairUnit]] = {}
+        if self._pair_mode:
+            logger.info(
+                "NIXL DCP pair mode: partner ranks exchange the blocks of "
+                "transfer groups %s after each pull from a prefiller with half "
+                "this DCP size.",
+                self._pair_groups,
+            )
+        # KV fingerprints (VLLM_NIXL_KV_FINGERPRINT, see kv_fingerprint.py).
+        self._fingerprint = fingerprint_dir() is not None
+        # D, pair mode: each pull's request from its allocation until the pull
+        # ends, then ready to be sent with its plan (or alone, unexchanged).
+        self._fingerprint_pulls: dict[ReqId, KVFingerprintReq] = {}
+        self._fingerprint_pulls_ready: dict[ReqId, KVFingerprintReq] = {}
+        # P: requests whose KV D will pull, sent with the next step's metadata.
+        self._fingerprint_sends: dict[ReqId, KVFingerprintReq] = {}
 
         # Heartbeat tracking: requests needing periodic lease-renewal heartbeats to
         # remote P-side, stored as ready-to-send HeartbeatInfo grouped by remote engine
@@ -515,6 +580,16 @@ class NixlBaseConnectorScheduler:
         meta.reqs_in_batch = self._reqs_in_batch
         meta.reqs_not_processed = self._reqs_not_processed
 
+        if self._pair_mode and self._pair_ready:
+            # This step is the first that can promote these requests, so every
+            # rank exchanges their blocks before any forward reads them.
+            meta.reqs_to_pair_exchange, self._pair_ready = self._pair_ready, {}
+        if self._fingerprint:
+            # Sends go with their reqs_to_send, pulls with their plans.
+            meta.fingerprint_sends = self._fingerprint_sends
+            meta.fingerprint_pulls = self._fingerprint_pulls_ready
+            self._fingerprint_sends, self._fingerprint_pulls_ready = {}, {}
+
         # Package heartbeats, throttled by heartbeat_interval.
         if self._heartbeat_by_engine:
             now = time.perf_counter()
@@ -534,6 +609,27 @@ class NixlBaseConnectorScheduler:
         """Stop heartbeating for requests whose KV transfer completed."""
         for req_id in connector_output.finished_recving or ():
             self._stop_heartbeat(req_id)
+            # A pull completes once, on every rank. A failed pull drops its
+            # plan: the request recomputes from token 0 or fails.
+            if (
+                self._pair_mode
+                and (units := self._pair_plans.pop(req_id, None))
+                and req_id not in connector_output.failed_recving
+            ):
+                self._pair_ready[req_id] = units
+            # A pull that failed, or whose request finished, is logged by P
+            # only. One that ended without a plan to emit is logged without
+            # rows, so the comparator does not take it for either.
+            if (
+                self._fingerprint
+                and (pulled := self._fingerprint_pulls.pop(req_id, None))
+                and req_id not in connector_output.failed_recving
+            ):
+                self._fingerprint_pulls_ready[req_id] = (
+                    pulled
+                    if req_id in self._pair_ready
+                    else replace(pulled, exchanged=False)
+                )
 
     def has_pending_push_work(self) -> bool:
         return False

@@ -361,6 +361,18 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
+    def finalize_loaded_kv(self, metadata: KVConnectorMetadata) -> None:
+        """Finish, in place and on the current stream, loads that completed in
+        earlier steps. The V2 model runner calls it at the top of every
+        non-dummy step, before it zeroes new blocks, applies copy-on-write
+        copies and runs the forward.
+
+        Args:
+            metadata: This step's connector metadata.
+
+        """
+        return
+
     @abstractmethod
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         """Start loading the KV cache from the connector to vLLM's paged
