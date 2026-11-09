@@ -35,9 +35,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
     OffloadingConnector,
 )
 from vllm.lora.request import LoRARequest
-from vllm.model_executor.layers.mamba.checkpoint import (
-    compute_mamba_prefill_checkpoints,
-)
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
     MultiModalKwargsItem,
@@ -4496,19 +4493,9 @@ def test_lookahead_checkpoint_has_available_hash(
     assert blocks is not None
     assert blocks[0].block_hash_num_tokens == expected_boundary
     if checkpoint_blocks:
-        offsets = compute_mamba_prefill_checkpoints(
-            [prompt_len],
-            [prompt_len],
-            hash_block_size=64,
-            checkpoint_alignment=64,
-            drop_eagle_block=False,
-            cache_hit_alignment_tokens=64,
-            num_hash_lookahead_tokens=lookahead,
-        )
-        assert offsets == [expected_boundary]
         # The checkpoint has its own block, outside the request's table.
         mamba_manager = manager.coordinator.single_type_managers[1]
-        assert blocks[0] is mamba_manager.new_checkpoint_blocks[request.request_id]
+        assert blocks[0] is mamba_manager.new_checkpoints[request.request_id][0]
         assert blocks[0].block_id not in manager.get_block_ids(request.request_id)[1]
 
     request.num_computed_tokens = len(tokens)

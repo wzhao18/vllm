@@ -310,14 +310,18 @@ def test_kda_recoverssm_startup_metadata_flow_without_model(monkeypatch):
 CHECKPOINT_BLOCK_BASE = 1000
 
 
-def _with_checkpoint_column(common_attn_metadata):
-    """Append the reserved last column holding each row's checkpoint block."""
+def _with_checkpoint_column(common_attn_metadata, checkpoint_offsets):
+    """Append the reserved last column holding each row's checkpoint block,
+    and grant the rows checkpoints at `checkpoint_offsets` (0: none)."""
     table = common_attn_metadata.block_table_tensor
     checkpoint_blocks = CHECKPOINT_BLOCK_BASE + torch.arange(
         table.shape[0], dtype=table.dtype, device=table.device
     )
     return common_attn_metadata.replace(
-        block_table_tensor=torch.cat([table, checkpoint_blocks[:, None]], dim=1)
+        block_table_tensor=torch.cat([table, checkpoint_blocks[:, None]], dim=1),
+        prefill_checkpoint_offsets_cpu=torch.tensor(
+            checkpoint_offsets, dtype=torch.int32
+        ),
     )
 
 
@@ -340,7 +344,8 @@ def test_internal_checkpoint_metadata_targets_last_aligned_boundary(
     common_attn_metadata = _with_checkpoint_column(
         create_common_attn_metadata(
             batch, BLOCK_SIZE, device, arange_block_indices=True
-        ).replace(is_prefilling=torch.tensor([True] * len(batch.seq_lens)))
+        ).replace(is_prefilling=torch.tensor([True] * len(batch.seq_lens))),
+        expected_offsets,
     )
     expected_states = [
         CHECKPOINT_BLOCK_BASE + row if offset else NULL_BLOCK_ID
@@ -412,7 +417,8 @@ def test_spec_internal_checkpoint_metadata_targets_replay_boundary(
         common_attn_metadata.replace(
             is_prefilling=torch.tensor([True]),
             block_table_tensor=common_attn_metadata.block_table_tensor + 1,
-        )
+        ),
+        [expected_offset or 0],
     )
     builder = _make_builder(
         KimiK3KDAMetadataBuilder,
@@ -451,10 +457,11 @@ def test_spec_internal_checkpoint_metadata_targets_replay_boundary(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_internal_checkpoint_metadata_skips_unaligned_offset():
+def test_internal_checkpoint_metadata_skips_ungranted_rows():
     device = torch.device("cuda")
     # The checkpoint block boundary is 48, but this query starts at token 1,
-    # making the real checkpoint offset 47, which is not FlashKDA-aligned.
+    # making the checkpoint offset 47, which is not FlashKDA-aligned: the
+    # scheduler grants none, so the builder plans none.
     batch = BatchSpec(seq_lens=[50], query_lens=[49])
     common_attn_metadata = create_common_attn_metadata(
         batch, BLOCK_SIZE, device, arange_block_indices=True

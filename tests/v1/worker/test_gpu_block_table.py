@@ -459,8 +459,7 @@ def test_larger_draft_batch_uses_null_kpool_slots(
 
 def test_prefill_checkpoint_blocks_ride_staged_writes_and_gather():
     """A group's reserved last column carries the step's checkpoint block
-    through the staged writes and the gather; a row given to a new request
-    starts with the null block there."""
+    through the staged writes and the gather."""
     device = torch.device("cuda")
     block_tables = BlockTables(
         block_sizes=[16, 64],
@@ -484,15 +483,6 @@ def test_prefill_checkpoint_blocks_ride_staged_writes_and_gather():
     assert mamba[:, 0].tolist() == [11, 10]
     # Groups without the reserved column are gathered as before.
     assert attn[:, -1].tolist() == [0, 0]
-
-    # A new request takes row 1: it does not inherit block 42.
-    block_tables.append_block_ids(1, ([5], [50]), overwrite=True)
-    block_tables.stage_prefill_checkpoint_blocks({})
-    block_tables.apply_staged_writes()
-    _, mamba = block_tables.gather_block_tables(idx_mapping, 2)
-    torch.accelerator.synchronize()
-    assert mamba[:, -1].tolist() == [0, 0]
-    assert mamba[:, 0].tolist() == [50, 10]
 
 
 def test_prefill_checkpoint_blocks_single_group_fill_every_row():

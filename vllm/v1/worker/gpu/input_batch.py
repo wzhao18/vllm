@@ -131,6 +131,10 @@ class InputBatch:
     # adaptive verification with batch-sharded sampling, when the budget binds.
     num_admitted_draft_tokens: "AdmittedDraftCounts | None" = None
 
+    # [num_reqs] offset into each row's query of the Mamba prefill checkpoint
+    # the scheduler granted it, 0 for none. None if the step has none.
+    prefill_checkpoint_offsets_np: np.ndarray | None = None
+
     @classmethod
     def make_dummy(
         cls,

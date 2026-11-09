@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
-from collections.abc import Container, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
 
@@ -15,6 +15,7 @@ from vllm.v1.core.kv_cache_coordinator import (
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy, trim_null_head
+from vllm.v1.core.sched.output import MambaPrefillCheckpoint
 from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -876,21 +877,20 @@ class KVCacheManager:
                 blocks = mgr.req_to_blocks[request_id]
                 mgr.new_block_ids.extend(blk.block_id for blk in blocks[start_idx:])
 
-    def get_mamba_prefill_checkpoint_blocks(
-        self, scheduled_request_ids: Container[str]
-    ) -> dict[str, dict[int, int]]:
-        """`{request id: {group id: block id}}` of the scheduled requests whose
-        step exports a Mamba prefill checkpoint."""
-        block_ids: dict[str, dict[int, int]] = {}
+    def get_mamba_prefill_checkpoints(self) -> dict[str, MambaPrefillCheckpoint]:
+        """This step's Mamba prefill checkpoints: per request, the position and
+        each Mamba group's block it is exported to."""
+        checkpoints: dict[str, MambaPrefillCheckpoint] = {}
         for mgr in self.coordinator.single_type_managers:
             if not isinstance(mgr, MambaManager):
                 continue
-            for request_id, block in mgr.new_checkpoint_blocks.items():
-                if request_id in scheduled_request_ids:
-                    block_ids.setdefault(request_id, {})[mgr.kv_cache_group_id] = (
-                        block.block_id
-                    )
-        return block_ids
+            for request_id, (block, position) in mgr.new_checkpoints.items():
+                checkpoint = checkpoints.setdefault(
+                    request_id, MambaPrefillCheckpoint(position, {})
+                )
+                assert checkpoint.position == position
+                checkpoint.block_ids[mgr.kv_cache_group_id] = block.block_id
+        return checkpoints
 
     def take_kv_cache_block_copies(
         self,

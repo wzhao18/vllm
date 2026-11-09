@@ -504,11 +504,17 @@ def _create_checkpoint_builder_and_batch(
 def test_checkpoint_metadata_preserves_non_spec_order(
     num_spec, prefix_match_unit, expected_offset
 ):
-    """Only eligible non-spec rows get a checkpoint in their reserved page."""
+    """Only granted non-spec rows get a checkpoint in their reserved page."""
     from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
     builder, common, kwargs = _create_checkpoint_builder_and_batch(
         num_spec, prefix_match_unit
+    )
+    # The scheduler grants row 1 a checkpoint.
+    common = common.replace(
+        prefill_checkpoint_offsets_cpu=torch.tensor(
+            [0, expected_offset, 0], dtype=torch.int32
+        )
     )
     actual = builder.build(0, common, **kwargs)
     assert actual.checkpoint is not None
@@ -532,6 +538,9 @@ def test_update_block_table_regathers_checkpoint(num_spec):
     src, common, kwargs = _create_checkpoint_builder_and_batch(num_spec)
     dst, _, _ = _create_checkpoint_builder_and_batch(num_spec)
     ref, _, _ = _create_checkpoint_builder_and_batch(num_spec)
+    common = common.replace(
+        prefill_checkpoint_offsets_cpu=torch.tensor([0, 64, 0], dtype=torch.int32)
+    )
     other_table = common.block_table_tensor + 100
     other = common.replace(block_table_tensor=other_table)
     dst.mamba_aligned_state_indices = mamba_get_block_table_tensor(

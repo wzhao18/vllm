@@ -10,55 +10,7 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
-from vllm.v1.kv_cache_interface import (
-    MambaSpec,
-    get_mamba_prefill_checkpoint_position,
-    is_mamba_prefill_checkpoint_valid,
-)
-
-
-def compute_mamba_prefill_checkpoints(
-    seq_lens: list[int],
-    query_lens: list[int],
-    hash_block_size: int,
-    checkpoint_alignment: int | None,
-    drop_eagle_block: bool,
-    cache_hit_alignment_tokens: int,
-    num_hash_lookahead_tokens: int = 0,
-) -> list[int]:
-    """Per-row internal prefill checkpoint offsets into the row's query.
-
-    Backends call this instead of re-deriving the rules, so they decline in
-    lockstep with the scheduler and `MambaManager`: allocating a checkpoint
-    block without writing it leaves the prefix cache serving uninitialized
-    state. A row exports into the block in the reserved last column of its
-    block table (`MambaSpec.reserves_prefill_checkpoint_col`): the block the
-    scheduler gave its chunk, or the null block for a row that got none since
-    it was assigned. The column keeps a row's checkpoint block after its
-    prefill, but its decode rows never pass the check.
-
-    Returns:
-        Each row's checkpoint offset; `0` means the row has none.
-
-    """
-    offsets: list[int] = []
-    for seq_len, query_len in zip(seq_lens, query_lens):
-        query_start = seq_len - query_len
-        position = get_mamba_prefill_checkpoint_position(
-            seq_len,
-            cache_hit_alignment_tokens,
-            drop_eagle_block=drop_eagle_block,
-            num_hash_lookahead_tokens=num_hash_lookahead_tokens,
-        )
-        valid = is_mamba_prefill_checkpoint_valid(
-            query_start=query_start,
-            query_end=seq_len,
-            checkpoint_position=position,
-            hash_block_size=hash_block_size,
-            checkpoint_alignment=checkpoint_alignment,
-        )
-        offsets.append(position - query_start if valid else 0)
-    return offsets
+from vllm.v1.kv_cache_interface import MambaSpec
 
 
 def _gather_checkpoint_state_indices(
@@ -98,50 +50,29 @@ class MambaPrefillCheckpointMetadata:
 
 
 class MambaPrefillCheckpointBuilder:
-    """Build backend-neutral prefill checkpoint locations."""
+    """Build the prefill checkpoints the scheduler granted this step."""
 
     def __init__(self, vllm_config: VllmConfig, kv_cache_spec: MambaSpec) -> None:
-        self.vllm_config = vllm_config
         self.kv_cache_spec = kv_cache_spec
-        speculative_config = vllm_config.speculative_config
-        self.drop_eagle_block = (
-            speculative_config is not None
-            and speculative_config.use_eagle_block_drop()
-            and not vllm_config.num_hash_lookahead_tokens
-        )
 
     def build(
         self,
         m: CommonAttentionMetadata,
         request_rows: list[int],
     ) -> MambaPrefillCheckpointMetadata | None:
-        if self.vllm_config.cache_config.mamba_cache_mode != "align":
+        # Only the rows the scheduler granted a checkpoint export one, at the
+        # offset it chose; their block is in the reserved last column.
+        offsets_cpu = m.prefill_checkpoint_offsets_cpu
+        if (
+            offsets_cpu is None
+            or not self.kv_cache_spec.reserves_prefill_checkpoint_col
+        ):
             return None
-        if self.kv_cache_spec.num_prefill_checkpoint_blocks == 0:
-            return None
-        cache_config = self.vllm_config.cache_config
-        hash_block_size = cache_config.hash_block_size
-        cache_hit_alignment_tokens = cache_config.cache_hit_alignment_tokens
-        if hash_block_size is None or cache_hit_alignment_tokens is None:
-            # Unresolved only for the minimal KV cache built for profiling.
-            return None
-        assert m.seq_lens_cpu_upper_bound is not None
-        all_query_lens = m.query_start_loc_cpu.diff().tolist()
-        query_lens = [all_query_lens[row] for row in request_rows]
-        seq_lens = m.seq_lens_cpu_upper_bound.tolist()
-        # Decode rows reach this planner only without drafts (one token;
-        # builders plan non-spec rows), so they never pass the check.
-        checkpoint_offsets = compute_mamba_prefill_checkpoints(
-            [seq_lens[row] for row in request_rows],
-            query_lens,
-            hash_block_size=hash_block_size,
-            checkpoint_alignment=self.kv_cache_spec.prefill_checkpoint_alignment,
-            drop_eagle_block=self.drop_eagle_block,
-            cache_hit_alignment_tokens=cache_hit_alignment_tokens,
-            num_hash_lookahead_tokens=self.vllm_config.num_hash_lookahead_tokens,
-        )
+        checkpoint_offsets = offsets_cpu[request_rows].tolist()
         if not any(checkpoint_offsets):
             return None
+        all_query_lens = m.query_start_loc_cpu.diff().tolist()
+        query_lens = [all_query_lens[row] for row in request_rows]
         checkpoint_offsets_tensor = async_tensor_h2d(
             checkpoint_offsets,
             dtype=torch.int32,

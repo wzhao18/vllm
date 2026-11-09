@@ -34,7 +34,11 @@ from vllm.models.kimi_k3.amd.ops.kda_chunk import (
 )
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_cache_interface import (
+    MambaSpec,
+    get_mamba_prefill_checkpoint_position,
+    is_mamba_prefill_checkpoint_valid,
+)
 
 pytestmark = pytest.mark.skipif(
     not (
@@ -104,19 +108,47 @@ def _builder(
     return builder
 
 
-def _build(batch: BatchSpec, block_size: int = BLOCK_SIZE, **kw):
-    common = create_common_attn_metadata(
-        batch, block_size, torch.device("cuda"), arange_block_indices=True
-    )
-    # The reserved last column holds each row's prefill checkpoint block.
+def _granted_offsets(
+    batch: BatchSpec, hash_block_size: int, alignment: int | None
+) -> torch.Tensor:
+    """The checkpoint offsets the scheduler grants a batch of final chunks."""
+    offsets = []
+    for seq_len, query_len in zip(batch.seq_lens, batch.query_lens):
+        start = seq_len - query_len
+        position = get_mamba_prefill_checkpoint_position(
+            seq_len, hash_block_size, False
+        )
+        valid = is_mamba_prefill_checkpoint_valid(
+            start, seq_len, position, hash_block_size, alignment
+        )
+        offsets.append(position - start if valid else 0)
+    return torch.tensor(offsets, dtype=torch.int32)
+
+
+def _with_checkpoint_column(common, offsets: torch.Tensor):
+    """Append the reserved last column holding each row's checkpoint block,
+    and grant the rows checkpoints at `offsets`."""
     table = common.block_table_tensor
     checkpoint_blocks = CHECKPOINT_BLOCK_BASE + torch.arange(
         table.shape[0], dtype=table.dtype, device=table.device
     )
-    common = common.replace(
-        block_table_tensor=torch.cat([table, checkpoint_blocks[:, None]], dim=1)
+    return common.replace(
+        block_table_tensor=torch.cat([table, checkpoint_blocks[:, None]], dim=1),
+        prefill_checkpoint_offsets_cpu=offsets,
     )
-    return _builder(block_size=block_size, **kw).build(0, common)
+
+
+def _build(batch: BatchSpec, block_size: int = BLOCK_SIZE, **kw):
+    common = create_common_attn_metadata(
+        batch, block_size, torch.device("cuda"), arange_block_indices=True
+    )
+    builder = _builder(block_size=block_size, **kw)
+    offsets = _granted_offsets(
+        batch,
+        kw.get("prefix_match_unit") or block_size,
+        builder.kv_cache_spec.prefill_checkpoint_alignment,
+    )
+    return builder.build(0, _with_checkpoint_column(common, offsets))
 
 
 def _i32(values: list[int]) -> torch.Tensor:
@@ -166,21 +198,14 @@ def test_checkpoint_metadata_skips_chunk_without_boundary() -> None:
     assert _build(BatchSpec(seq_lens=[168], query_lens=[40])).checkpoint is None
 
 
-def test_checkpoint_metadata_skips_null_reservation() -> None:
-    # Only the chunk that finishes a prompt gets a block reserved; every
-    # earlier one leaves the shared null block, which nothing hashes and
-    # writing it would corrupt every other request's scratch row.
+def test_checkpoint_metadata_skips_ungranted_rows() -> None:
+    # Only a chunk the scheduler granted a checkpoint exports one.
     batch = BatchSpec(seq_lens=[200], query_lens=[200])
     common = create_common_attn_metadata(
         batch, BLOCK_SIZE, torch.device("cuda"), arange_block_indices=True
     )
-    # cdiv(200, 64) - 2 = 2 is the checkpoint slot.
-    common.block_table_tensor[0, 2] = NULL_BLOCK_ID
 
-    md = _builder().build(0, common)
-
-    assert md.checkpoint is not None
-    torch.testing.assert_close(md.checkpoint.state_indices, _i32([NULL_BLOCK_ID]))
+    assert _builder().build(0, common).checkpoint is None
 
 
 def test_checkpoint_metadata_absent_without_reserved_block() -> None:
@@ -203,12 +228,15 @@ def test_spec_checkpoint_metadata_gathers_non_spec_rows_by_index() -> None:
     common = create_common_attn_metadata(
         batch, BLOCK_SIZE, torch.device("cuda"), arange_block_indices=True
     )
-    # Align mode reads 1 + num_speculative_blocks columns, so widen the table.
+    # Align mode reads 1 + num_speculative_blocks columns, plus the reserved
+    # checkpoint column, so widen the table.
     rows, cols = common.block_table_tensor.shape
-    width = cols + num_spec
+    width = cols + num_spec + 1
     common.block_table_tensor = torch.arange(
         rows * width, dtype=torch.int32, device="cuda"
     ).view(rows, width)
+    # The scheduler grants the final prefill chunks of requests 1 and 4.
+    common.prefill_checkpoint_offsets_cpu = _i32([0, 192, 0, 0, 64]).cpu()
 
     md = _builder(num_spec=num_spec).build(
         0,
@@ -224,10 +252,10 @@ def test_spec_checkpoint_metadata_gathers_non_spec_rows_by_index() -> None:
     assert md.checkpoint is not None
     # Row 3 resumes mid-block, so its chunk holds no reusable boundary.
     torch.testing.assert_close(md.checkpoint.checkpoint_offsets, _i32([192, 0, 64]))
-    # Request r owns blocks r*width.., so slot cdiv(200, 64) - 2 = 2 for
-    # request 1 and cdiv(128, 64) - 2 = 0 for request 4.
+    # Request r owns blocks r*width.., its reserved column last.
     torch.testing.assert_close(
-        md.checkpoint.state_indices, _i32([width + 2, NULL_BLOCK_ID, 4 * width])
+        md.checkpoint.state_indices,
+        _i32([2 * width - 1, NULL_BLOCK_ID, 5 * width - 1]),
     )
 
 
@@ -406,8 +434,9 @@ def test_checkpoint_metadata_indexes_prefill_rows_after_decodes() -> None:
     assert md.num_decodes == 1 and md.num_prefills == 1
     assert md.checkpoint is not None
     torch.testing.assert_close(md.checkpoint.checkpoint_offsets, _i32([192]))
-    # Request 1 owns blocks 4..7, so its slot-2 state block is 6.
-    torch.testing.assert_close(md.checkpoint.state_indices, _i32([6]))
+    torch.testing.assert_close(
+        md.checkpoint.state_indices, _i32([CHECKPOINT_BLOCK_BASE + 1])
+    )
 
 
 def test_conv_checkpoint_addresses_row_past_int32_limit() -> None:
@@ -467,14 +496,14 @@ def test_finer_prefix_match_unit_moves_checkpoint_to_hash_grid() -> None:
 
     assert md.checkpoint is not None
     torch.testing.assert_close(md.checkpoint.checkpoint_offsets, _i32([640]))
-    # Slot is still block-indexed: cdiv(700, 256) - 2 = 1, request 0 owns 0..2.
-    torch.testing.assert_close(md.checkpoint.state_indices, _i32([1]))
+    torch.testing.assert_close(
+        md.checkpoint.state_indices, _i32([CHECKPOINT_BLOCK_BASE])
+    )
 
 
 def test_checkpoint_metadata_skips_unaligned_offset() -> None:
     # The scheduler declines a boundary off the published alignment and
-    # reserves nothing, so the builder has to reach the same verdict or it
-    # writes a block nobody hashed.
+    # grants nothing, so the builder plans nothing.
     # Block 192, unit 96: a 700-token prompt's last hash boundary is 672, which
     # is 32 tokens off the chunk grid.
     md = _build(

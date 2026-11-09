@@ -118,8 +118,10 @@ def test_mamba_prefill_checkpoint_block_reaches_the_worker():
     scheduler.add_request(request)
     prefill = scheduler.schedule()
     assert prefill.num_scheduled_tokens[request.request_id] == 40
-    assert prefill.mamba_prefill_checkpoint_blocks is not None
-    (block_id,) = prefill.mamba_prefill_checkpoint_blocks[request.request_id].values()
+    assert prefill.mamba_prefill_checkpoints is not None
+    checkpoint = prefill.mamba_prefill_checkpoints[request.request_id]
+    assert checkpoint.position == 32
+    (block_id,) = checkpoint.block_ids.values()
     assert (
         block_id not in scheduler.kv_cache_manager.get_block_ids(request.request_id)[0]
     )
@@ -131,7 +133,7 @@ def test_mamba_prefill_checkpoint_block_reaches_the_worker():
         ModelRunnerOutput(req_ids=[request.request_id], sampled_token_ids=[[0]]),
     )
     decode = scheduler.schedule()
-    assert decode.mamba_prefill_checkpoint_blocks is None
+    assert decode.mamba_prefill_checkpoints is None
     assert block.ref_cnt == 0
     assert block.block_hash_num_tokens == 32
 

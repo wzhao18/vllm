@@ -455,6 +455,10 @@ class CommonAttentionMetadata:
     (num_computed_tokens < num_prompt_tokens). Used by some backends to
     distinguish actual decodes from short extends."""
 
+    prefill_checkpoint_offsets_cpu: torch.Tensor | None = None
+    """(batch_size,) CPU int32: offset into each row's query of the Mamba
+    "align" prefill checkpoint the scheduler granted it, 0 for none."""
+
     seq_lens_cpu_upper_bound: torch.Tensor | None = None
     """(batch_size,) CPU upper bound on seq_lens. Precise for prefill rows
     and for all rows outside async spec decode; optimistic for async-spec

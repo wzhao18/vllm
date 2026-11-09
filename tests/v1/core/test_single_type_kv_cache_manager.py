@@ -301,8 +301,7 @@ def test_mamba_checkpoint_hash_maps_only_to_checkpoint_block(
     manager.new_step_starts()
     step(first_chunk_blocks * block_size, prompt_tokens)
 
-    checkpoint_position = manager._checkpoints["r"]
-    checkpoint_block = manager.new_checkpoint_blocks["r"]
+    checkpoint_block, checkpoint_position = manager.new_checkpoints["r"]
     assert all(
         b.block_hash is None or b is checkpoint_block for b in speculative_blocks
     )
@@ -369,8 +368,8 @@ def test_mamba_checkpoint_gets_its_own_block(resume_at, prompt_tokens):
     step(resume_at, prompt_tokens)
 
     checkpoint_position = (prompt_tokens - 1) // hash_block_size * hash_block_size
-    assert manager._checkpoints["r"] == checkpoint_position
-    checkpoint_block = manager.new_checkpoint_blocks["r"]
+    checkpoint_block, position = manager.new_checkpoints["r"]
+    assert position == checkpoint_position
     assert checkpoint_block not in manager.req_to_blocks["r"]
     block_hash = request.block_hashes[checkpoint_position // hash_block_size - 1]
     assert pool.get_cached_block(block_hash, [0]) == [checkpoint_block]
@@ -438,7 +437,7 @@ def test_mamba_checkpoint_blocks_empty_outside_align_mode():
         scheduler_block_size=128,
     )
     assert not spec.reserves_prefill_checkpoint_col
-    assert not manager.new_checkpoint_blocks
+    assert not manager.new_checkpoints
 
 
 def _make_checkpoint_manager(num_prefill_checkpoint_blocks=1, block_size=128):
@@ -497,22 +496,30 @@ def test_mamba_checkpoint_keyed_only_within_the_prompt():
     manager.get_num_blocks_to_allocate("r", 140, [], 112, 112, 140)
     manager.allocate_new_blocks("r", 140, 140)
     manager.cache_blocks(request, 140, replay_boundaries=[])
-    assert manager._checkpoints["r"] == 128
-    assert manager.new_checkpoint_blocks["r"].block_hash is None
+    block, position = manager.new_checkpoints["r"]
+    assert position == 128
+    assert block.block_hash is None
 
 
-def test_mamba_second_checkpoint_releases_the_first():
-    """A new prefill of the same request (a resumed streaming session) can
-    come before the first checkpoint block's release; it releases it."""
-    manager, pool = _make_checkpoint_manager()
-    manager.get_num_blocks_to_allocate("r", 112, [], 0, 0, 112, prefill_end=112)
+def test_mamba_checkpoint_blocks_released_once_processed():
+    """Under dense retention each chunk may export a checkpoint; with steps in
+    flight a request holds several, each released once its step has been
+    processed."""
+    manager, _ = _make_checkpoint_manager()
+    manager.get_num_blocks_to_allocate("r", 112, [], 0, 0, 112)
     manager.allocate_new_blocks("r", 112, 112)
-    first = manager.new_checkpoint_blocks["r"]
+    first, _ = manager.new_checkpoints["r"]
     manager.new_step_starts()
-    manager.get_num_blocks_to_allocate("r", 200, [], 112, 112, 200, prefill_end=200)
+    manager.remove_skipped_blocks("r", 0)  # the first step is still in flight
+    manager.get_num_blocks_to_allocate("r", 200, [], 112, 112, 200)
     manager.allocate_new_blocks("r", 200, 200)
-    assert first.ref_cnt == 0
-    assert manager.new_checkpoint_blocks["r"] is not first
+    second, _ = manager.new_checkpoints["r"]
+    assert first.ref_cnt == second.ref_cnt == 1
+    manager.remove_skipped_blocks("r", 112)
+    assert first.ref_cnt == 0 and second.ref_cnt == 1
+    manager.remove_skipped_blocks("r", 200)
+    assert second.ref_cnt == 0
+    assert "r" not in manager._checkpoint_blocks
 
 
 def test_mamba_checkpoint_block_freed_with_the_request():
@@ -545,7 +552,7 @@ def test_mamba_checkpoint_block_freed_with_the_request():
     manager.get_num_blocks_to_allocate("r", 100, [], 0, 0, 100, prefill_end=100)
     manager.allocate_new_blocks("r", 100, 100)
     manager.cache_blocks(request, 100, replay_boundaries=[])
-    checkpoint_block = manager.new_checkpoint_blocks["r"]
+    checkpoint_block = manager.new_checkpoints["r"][0]
 
     freed = manager.pop_blocks_for_free("r")
     assert checkpoint_block in freed

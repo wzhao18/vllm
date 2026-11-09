@@ -1358,13 +1358,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
 
         # Mamba prefill checkpoint blocks ride the staged block-table writes.
-        checkpoint_blocks = scheduler_output.mamba_prefill_checkpoint_blocks or {}
-        self.block_tables.stage_prefill_checkpoint_blocks(
-            {
-                self.req_states.req_id_to_index[req_id]: block_ids
-                for req_id, block_ids in checkpoint_blocks.items()
-            }
-        )
+        if checkpoints := scheduler_output.mamba_prefill_checkpoints:
+            self.block_tables.stage_prefill_checkpoint_blocks(
+                {
+                    self.req_states.req_id_to_index[req_id]: checkpoint.block_ids
+                    for req_id, checkpoint in checkpoints.items()
+                }
+            )
 
         # Update CPU num_computed_prefill_tokens.
         np.minimum(
@@ -1387,6 +1387,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_cache_config.num_blocks,
                 scheduler_output.kv_cache_block_copies,
             )
+
+    @staticmethod
+    def _prefill_checkpoint_offsets(
+        scheduler_output: SchedulerOutput,
+        req_ids: list[str],
+        num_computed_tokens_np: np.ndarray,
+    ) -> np.ndarray | None:
+        """Each row's offset into its query of the Mamba prefill checkpoint the
+        scheduler granted it (0 for none), or None if the step has none."""
+        checkpoints = scheduler_output.mamba_prefill_checkpoints
+        if not checkpoints:
+            return None
+        offsets = np.zeros(len(req_ids), dtype=np.int32)
+        for row, req_id in enumerate(req_ids):
+            if (checkpoint := checkpoints.get(req_id)) is not None:
+                offsets[row] = checkpoint.position - num_computed_tokens_np[row]
+        return offsets
 
     def gather_batch_req_state(
         self, scheduler_output: SchedulerOutput, dummy_run: bool
@@ -1671,6 +1688,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 int(num_scheduled_tokens_upper_bound.max())
                 if adaptive_verification is not None
                 else None
+            ),
+            prefill_checkpoint_offsets_np=self._prefill_checkpoint_offsets(
+                scheduler_output, req_ids, num_computed_tokens_np
             ),
         )
         if self.pcp_manager is not None:

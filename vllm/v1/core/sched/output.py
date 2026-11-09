@@ -4,7 +4,7 @@
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import cached_property
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from vllm.multimodal.utils import strip_covered_mm_data
 from vllm.utils.gc_utils import untrack_long_lists
@@ -216,6 +216,15 @@ class KVConnectorBlockState:
         return self.resolve_block_ids(req_id)
 
 
+class MambaPrefillCheckpoint(NamedTuple):
+    """A step's Mamba "align" internal prefill checkpoint."""
+
+    # Token count of the prefix whose state is exported.
+    position: int
+    # KV cache group id -> block id the state is exported to.
+    block_ids: dict[int, int]
+
+
 @dataclass
 class SchedulerOutput:
     # list of the requests that are scheduled for the first time.
@@ -294,11 +303,11 @@ class SchedulerOutput:
     # CoW copies to apply after zeroing new blocks and before forward.
     kv_cache_block_copies: list[KVCacheBlockCopy] | None = None
 
-    # Mamba "align" prefill checkpoints: request id -> {KV cache group id:
-    # block id} the step's internal prompt checkpoint is exported to. The block
-    # is not in the request's block table; the worker writes it into the
-    # table's reserved last column (`MambaSpec.reserves_prefill_checkpoint_col`).
-    mamba_prefill_checkpoint_blocks: dict[str, dict[int, int]] | None = None
+    # Mamba "align" internal prefill checkpoints the step exports, by request
+    # id. The blocks are not in the requests' block tables; the worker writes
+    # them into each Mamba group table's reserved last column
+    # (`MambaSpec.reserves_prefill_checkpoint_col`).
+    mamba_prefill_checkpoints: dict[str, MambaPrefillCheckpoint] | None = None
 
     # Scheduler-local; always None by the time this reaches a worker.
     kv_connector_block_state: KVConnectorBlockState | None = None

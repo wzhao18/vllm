@@ -13,9 +13,6 @@ import torch
 
 from tests.v1.core.test_prefix_caching import make_kv_cache_manager, make_request
 from vllm.distributed.kv_transfer.kv_connector.v1.base import SupportsHMA
-from vllm.model_executor.layers.mamba.checkpoint import (
-    compute_mamba_prefill_checkpoints,
-)
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import (
     KVCacheBlockCopy,
@@ -657,7 +654,7 @@ def test_internal_checkpoint_uses_partial_hash_lifecycle():
     assert new_blocks is not None
     mamba_blocks = manager.get_blocks(request.request_id).blocks[1]
     mamba_manager = manager.coordinator.single_type_managers[1]
-    checkpoint_block = mamba_manager.new_checkpoint_blocks[request.request_id]
+    checkpoint_block = mamba_manager.new_checkpoints[request.request_id][0]
     running_block = mamba_blocks[3]
     assert not running_block.is_null
     # The checkpoint has its own block, outside the request's table; the table
@@ -850,7 +847,7 @@ def test_intermediate_chunk_checkpoint_reserved_only_under_dense_retention(
     manager.new_step_starts()
     # Final chunk: the prefill-end checkpoint at 224 is reserved either way.
     assert manager.allocate_slots(request, 112) is not None
-    assert mamba_manager._checkpoints[request.request_id] == 224
+    assert mamba_manager.new_checkpoints[request.request_id][1] == 224
     end_hash = request.block_hashes[224 // hash_block_size - 1]
     assert manager.block_pool.get_cached_block(end_hash, [1]) is not None
 
@@ -871,7 +868,7 @@ def test_eagle_block_aligned_checkpoint_replaces_newer_hash():
     assert manager.allocate_slots(request, request.num_tokens) is not None
 
     mamba_manager = manager.coordinator.single_type_managers[1]
-    checkpoint_block = mamba_manager.new_checkpoint_blocks[request.request_id]
+    checkpoint_block = mamba_manager.new_checkpoints[request.request_id][0]
     checkpoint_hash = request.block_hashes[64 // hash_block_size - 1]
     checkpoint_hit = manager.block_pool.get_cached_block(checkpoint_hash, [1])
     assert checkpoint_hit is not None
@@ -2828,11 +2825,9 @@ def test_checkpoint_reservation_matches_worker(
     num_output_tokens,
     chunk_blocks,
 ):
-    """The worker exports a checkpoint wherever `compute_mamba_prefill_checkpoints`
-    says, into the block the scheduler hands it (the null block when none). Each
-    chunk, a block the manager reserves must be for exactly that position;
-    anything else publishes a hash over the wrong state. Under sparse retention,
-    only the prefill-end chunk may reserve one.
+    """A checkpoint block the manager reserves is outside the request's
+    table, at a position inside its chunk. Under sparse retention, only the
+    prefill-end chunk may reserve one.
     """
     manager = make_full_mamba_manager(
         dcp_world_size=1,
@@ -2863,19 +2858,10 @@ def test_checkpoint_reservation_matches_worker(
     while start < num_tokens:
         end = min(start + chunk_blocks * mamba_block_size, num_tokens)
         assert manager.allocate_slots(request, end - start) is not None
-        offsets = compute_mamba_prefill_checkpoints(
-            [end],
-            [end - start],
-            hash_block_size=hash_block_size,
-            checkpoint_alignment=16,
-            drop_eagle_block=use_eagle,
-            cache_hit_alignment_tokens=mamba_manager.cache_hit_alignment_tokens,
-            num_hash_lookahead_tokens=lookahead,
-        )
-        reserved = mamba_manager._checkpoints.get(request.request_id)
+        reserved = mamba_manager.new_checkpoints.get(request.request_id)
         if reserved is not None:
-            assert offsets[0] and reserved == start + offsets[0]
-            block = mamba_manager.new_checkpoint_blocks[request.request_id]
+            block, position = reserved
+            assert start < position < end
             assert block not in mamba_manager.req_to_blocks[request.request_id]
             assert retention_interval is None or end >= prefill_end
         request.num_computed_tokens = end
