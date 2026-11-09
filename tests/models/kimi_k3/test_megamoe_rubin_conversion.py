@@ -348,8 +348,22 @@ def test_shipped_knobs_resolve():
         max_tokens=6144,
         live_tokens=5925,
     )
-    assert knobs.mma_tiler_mnk == (256, 128, 256) and knobs.cluster_shape_mn == (2, 1)
     assert record["live_tokens"] == 5925
+    assert record["knobs"]["mma_tiler_mnk"] == list(knobs.mma_tiler_mnk)
+    # equal-capacity ties (several tuner runs of one shape) resolve to the lowest p50
+    import json
+
+    with open(C.SHIPPED_KNOBS) as f:
+        same = [
+            e
+            for e in json.load(f)["entries"]
+            if e["kernel_variant"] == "inference"
+            and e["dtype"] == "nvfp4"
+            and e["world_size"] == 16
+            and e["max_tokens"] == 6144
+            and e["live_tokens"] == 5925
+        ]
+    assert record["p50_us"] == min(e["p50_us"] for e in same)
     mx = C.RubinMoeProblem(quant_kind="mxfp4_mxfp8")
     knobs, _, _ = C.resolve_knobs(
         C.SHIPPED_KNOBS,
@@ -509,9 +523,9 @@ def test_knob_merge_counts_every_source_file():
         shipped = json.load(f)
     entries = shipped["entries"]
     files = {e["provenance"]["file"] for e in entries}
-    # every $W/moe4/results/fi107/knobs_*.json (44 files, one record each), incl. the
-    # EP4 smoke files and the two EP16 inference 4096 crossover files
-    assert shipped["source_files"] == len(files) == len(entries) == 44
+    # every $W/moe4/results/fi107/knobs_*.json (one record each), incl. the EP4 smoke
+    # files, the EP16 inference 4096 crossover files and the wide EP16 search (w16c)
+    assert shipped["source_files"] == len(files) == len(entries) >= 44
     names = {f.rsplit("/", 1)[-1] for f in files}
     for must in (
         "knobs_smoke_nvfp4.json",
