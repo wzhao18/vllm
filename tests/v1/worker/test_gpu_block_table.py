@@ -493,3 +493,28 @@ def test_prefill_checkpoint_blocks_ride_staged_writes_and_gather():
     torch.accelerator.synchronize()
     assert mamba[:, -1].tolist() == [0, 0]
     assert mamba[:, 0].tolist() == [50, 10]
+
+
+def test_prefill_checkpoint_blocks_single_group_fill_every_row():
+    """With one group, every row taking both a new-request write and a
+    checkpoint block in one step fits the staged-write buffers."""
+    device = torch.device("cuda")
+    block_tables = BlockTables(
+        block_sizes=[64],
+        max_num_reqs=4,
+        max_num_batched_tokens=64,
+        max_num_blocks_per_group=[8],
+        device=device,
+        reserved_last_col=[True],
+    )
+    for row in range(4):
+        block_tables.append_block_ids(row, ([row + 10],), overwrite=True)
+    block_tables.stage_prefill_checkpoint_blocks(
+        {row: {0: row + 40} for row in range(4)}
+    )
+    block_tables.apply_staged_writes()
+    idx_mapping = torch.arange(4, dtype=torch.int32, device=device)
+    (table,) = block_tables.gather_block_tables(idx_mapping, 4)
+    torch.accelerator.synchronize()
+    assert table[:, 0].tolist() == [10, 11, 12, 13]
+    assert table[:, -1].tolist() == [40, 41, 42, 43]

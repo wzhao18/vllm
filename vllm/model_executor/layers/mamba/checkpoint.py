@@ -32,8 +32,10 @@ def compute_mamba_prefill_checkpoints(
     lockstep with the scheduler and `MambaManager`: allocating a checkpoint
     block without writing it leaves the prefix cache serving uninitialized
     state. A row exports into the block in the reserved last column of its
-    block table (`MambaSpec.reserves_prefill_checkpoint_col`), which holds the
-    null block unless the scheduler gave the row's chunk a checkpoint block.
+    block table (`MambaSpec.reserves_prefill_checkpoint_col`): the block the
+    scheduler gave its chunk, or the null block for a row that got none since
+    it was assigned. The column keeps a row's checkpoint block after its
+    prefill, but its decode rows never pass the check.
 
     Returns:
         Each row's checkpoint offset; `0` means the row has none.
@@ -127,10 +129,8 @@ class MambaPrefillCheckpointBuilder:
         all_query_lens = m.query_start_loc_cpu.diff().tolist()
         query_lens = [all_query_lens[row] for row in request_rows]
         seq_lens = m.seq_lens_cpu_upper_bound.tolist()
-        # A row's checkpoint block stays in the reserved column after its
-        # prefill. Decode rows reach this planner only without drafts (one
-        # token; builders plan non-spec rows), so they never pass the check
-        # and never export into it.
+        # Decode rows reach this planner only without drafts (one token;
+        # builders plan non-spec rows), so they never pass the check.
         checkpoint_offsets = compute_mamba_prefill_checkpoints(
             [seq_lens[row] for row in request_rows],
             query_lens,

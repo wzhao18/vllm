@@ -243,27 +243,6 @@ def test_final_chunk_with_internal_checkpoint_runs_in_one_step(
     assert split() < num_new_tokens
 
 
-def test_chunk_cut_short_from_mid_block_stops_at_block_end() -> None:
-    """A chunk resuming mid-block that a cap ends short of the prefill exports
-    no checkpoint, so it stops at the block's end."""
-    (request,) = create_requests(1, num_tokens=5000, block_size=ATTN_BLOCK_SIZE)
-    stub = SimpleNamespace(
-        need_mamba_block_aligned_split=True,
-        cache_config=SimpleNamespace(block_size=MAMBA_BLOCK_SIZE),
-    )
-
-    def stop(start, num_new_tokens):
-        return Scheduler._stop_mamba_chunk_at_block_end(
-            stub, request, start, num_new_tokens
-        )
-
-    assert stop(1984, 2000) == 2 * MAMBA_BLOCK_SIZE - 1984
-    # The final chunk keeps running: it exports the checkpoint.
-    assert stop(1984, 3016) == 3016
-    # Block-aligned starts are untouched.
-    assert stop(1600, 2000) == 2000
-
-
 def test_disabling_eagle_block_drop_keeps_the_trailing_cache_boundary() -> None:
     (request,) = create_requests(1, num_tokens=3602, block_size=ATTN_BLOCK_SIZE)
 

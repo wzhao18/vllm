@@ -647,21 +647,6 @@ class Scheduler(SchedulerInterface):
         end = min((s for s in stops if start < s < end), default=end)
         return max(end - start, 0)
 
-    def _stop_mamba_chunk_at_block_end(
-        self, request: Request, start: int, num_new_tokens: int
-    ) -> int:
-        """Cut a Mamba "align" chunk that starts mid-block and, after the caps
-        on its length, ends short of the prefill at the block's end. Such a
-        chunk exports no checkpoint, so past the block's end the block's
-        full-block hash would name a state the block does not hold."""
-        if not self.need_mamba_block_aligned_split:
-            return num_new_tokens
-        block_size = self.cache_config.block_size
-        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
-        if start % block_size and start + num_new_tokens < prefill_end:
-            num_new_tokens = min(num_new_tokens, block_size - start % block_size)
-        return num_new_tokens
-
     def _get_local_prefix_cache_hit(
         self, request: Request, max_cache_hit_length: int | None = None
     ) -> tuple[KVCacheBlocks, int, int, bool]:
@@ -860,9 +845,6 @@ class Scheduler(SchedulerInterface):
             # Multi-module MTP: avoid ending a prefill chunk within
             # num_prefill_lookahead of the prefill end.
             num_new_tokens = self._reserve_prefill_lookahead(
-                request, request.num_computed_tokens, num_new_tokens
-            )
-            num_new_tokens = self._stop_mamba_chunk_at_block_end(
                 request, request.num_computed_tokens, num_new_tokens
             )
 
@@ -1400,9 +1382,6 @@ class Scheduler(SchedulerInterface):
                     # Multi-module MTP: avoid ending a prefill chunk within
                     # num_prefill_lookahead of the prefill end.
                     num_new_tokens = self._reserve_prefill_lookahead(
-                        request, num_computed_tokens, num_new_tokens
-                    )
-                    num_new_tokens = self._stop_mamba_chunk_at_block_end(
                         request, num_computed_tokens, num_new_tokens
                     )
 

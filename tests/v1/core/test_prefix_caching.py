@@ -4507,6 +4507,8 @@ def test_lookahead_checkpoint_has_available_hash(
         )
         assert offsets == [expected_boundary]
         # The checkpoint has its own block, outside the request's table.
+        mamba_manager = manager.coordinator.single_type_managers[1]
+        assert blocks[0] is mamba_manager.new_checkpoint_blocks[request.request_id]
         assert blocks[0].block_id not in manager.get_block_ids(request.request_id)[1]
 
     request.num_computed_tokens = len(tokens)

@@ -850,7 +850,7 @@ def test_intermediate_chunk_checkpoint_reserved_only_under_dense_retention(
     manager.new_step_starts()
     # Final chunk: the prefill-end checkpoint at 224 is reserved either way.
     assert manager.allocate_slots(request, 112) is not None
-    assert mamba_manager._checkpoints[request.request_id][0] == 224
+    assert mamba_manager._checkpoints[request.request_id] == 224
     end_hash = request.block_hashes[224 // hash_block_size - 1]
     assert manager.block_pool.get_cached_block(end_hash, [1]) is not None
 
@@ -2874,7 +2874,7 @@ def test_checkpoint_reservation_matches_worker(
         )
         reserved = mamba_manager._checkpoints.get(request.request_id)
         if reserved is not None:
-            assert offsets[0] and reserved[0] == start + offsets[0]
+            assert offsets[0] and reserved == start + offsets[0]
             block = mamba_manager.new_checkpoint_blocks[request.request_id]
             assert block not in mamba_manager.req_to_blocks[request.request_id]
             assert retention_interval is None or end >= prefill_end
