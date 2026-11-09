@@ -13,9 +13,10 @@ as it was while #108's ``dsa.prepared.PreparedDsa`` serves the steps up to 64 ro
   DsaIndex         FP8 indexer query + head weights, indexer key insert
   indexer core     stock Kimi K3 precision: DeepGEMM's FP32 logits of this rank's
                    keys and the FP32 DCP top-k (every rank's local top-K, the
-                   all-gather and the exact merge: indexer_stage.IndexerStage,
-                   dcp_topk.py) straight to this rank's slots; a step it does not
-                   take (not pure decode) the stock op (FP32) and the slot filter
+                   peer-store exchange and the exact merge:
+                   indexer_stage.IndexerStage, dcp_topk.py, dcp_round.py) straight
+                   to this rank's slots; a step it does not take (not pure
+                   decode) the stock op (FP32) and the slot filter
   sparse core      the sparse decode of every rank's gathered heads over this
                    rank's slots of the local shard:
                    FlashInfer's (as the stock decode) or FlashMLA sparse
