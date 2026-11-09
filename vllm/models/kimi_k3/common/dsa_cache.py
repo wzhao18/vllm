@@ -7,7 +7,9 @@ from dataclasses import replace
 
 import torch
 
+from vllm import envs
 from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.logger import init_logger
 from vllm.model_executor.layers.sparse_attn_indexer import MXFP4_BLOCK_SIZE
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.platforms import current_platform
@@ -29,6 +31,8 @@ from vllm.v1.kv_cache_interface import (
     get_kv_quant_mode,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
+
+logger = init_logger(__name__)
 
 
 def kimi_k3_indexer_uses_fp4(vllm_config: VllmConfig) -> bool:
@@ -209,7 +213,10 @@ def packed_dsa_block_size(
     rounded at ``_PD_REFERENCE_TP`` and scaled by ``_PD_REFERENCE_TP / tp``.
     Block sizes of different TP sizes stay divisible, and the rounding stays
     fine: a power of two would leave up to half the row empty once spec
-    decoding grows the conv state past one.
+    decoding grows the conv state past one. ``VLLM_KIMI_K3_PACKED_BLOCK_SIZE``
+    pins it instead: the KV cache planner then splits the KDA states into
+    enough groups to fit that block (``VLLM_PACKED_KV_STATE_GROUPS``, required
+    with a KV transfer config).
     """
     text_config = vllm_config.model_config.hf_text_config
     dsa_config = getattr(text_config, "dsa_config", None)
@@ -233,4 +240,28 @@ def packed_dsa_block_size(
         states_per_row * state_bytes * tp_size,
         alignment * reference_tp * row_bytes_per_token,
     )
-    return alignment * reference_units * (reference_tp // tp_size)
+    block_size = alignment * reference_units * (reference_tp // tp_size)
+    if not (pinned := envs.VLLM_KIMI_K3_PACKED_BLOCK_SIZE):
+        return block_size
+    if pinned < 0 or pinned % alignment:
+        raise ValueError(
+            f"VLLM_KIMI_K3_PACKED_BLOCK_SIZE={pinned} must be a positive "
+            f"multiple of the block alignment {alignment}"
+        )
+    if (
+        vllm_config.kv_transfer_config is not None
+        and not envs.VLLM_PACKED_KV_STATE_GROUPS
+    ):
+        # Unset, each side's planner picks the fewest groups at its own TP, and
+        # NIXL refuses peers whose state regions differ.
+        raise ValueError(
+            "VLLM_KIMI_K3_PACKED_BLOCK_SIZE with a KV transfer config needs "
+            "VLLM_PACKED_KV_STATE_GROUPS, set the same on P and D"
+        )
+    logger.info_once(
+        "Kimi K3 packed DSA block pinned to %d tokens by "
+        "VLLM_KIMI_K3_PACKED_BLOCK_SIZE (unpinned: %d).",
+        pinned,
+        block_size,
+    )
+    return pinned

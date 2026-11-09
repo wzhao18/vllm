@@ -1833,6 +1833,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         randomize_inputs: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
+            # Before update_requests zeroes new blocks and applies CoW copies.
+            self.kv_connector.finalize_loaded_kv(scheduler_output)
             self.draft_tokens_handler.begin_step(scheduler_output)
             # Update the request states.
             self.update_pp_decode_requests()

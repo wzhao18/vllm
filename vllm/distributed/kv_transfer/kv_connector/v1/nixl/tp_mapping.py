@@ -61,6 +61,17 @@ class TPMapping:
     # a request's blocks only once that many notifications have come in.
     local_consumers: int = 1
 
+    # Per-source-rank override of ``local_consumers``. Hybrid attention+SSM with
+    # different DCP sizes reads attention KV and SSM state from different remote
+    # ranks, so remote ranks have different reader counts.
+    consumers_by_rank: dict[int, int] | None = None
+
+    def consumers_for(self, remote_rank: int) -> int:
+        """Local ranks (in aggregate) that read from ``remote_rank``."""
+        if self.consumers_by_rank is None:
+            return self.local_consumers
+        return self.consumers_by_rank.get(remote_rank, self.local_consumers)
+
 
 # ======================================================================
 # TP mapping computation
@@ -103,40 +114,24 @@ def compute_tp_mapping(
     tp_size = transfer_topology.tp_size
     is_mla = transfer_topology.is_mla and head_sharded_kv_heads is None
     total_num_kv_heads = head_sharded_kv_heads or transfer_topology.total_num_kv_heads
-    # --- Attention source ranks ---
-    if is_mla or tp_size >= remote_tp_size:
-        if is_mla and remote_dcp_size > 1:
-            attn_ranks = transfer_topology.dcp_source_ranks(
-                remote_tp_size, remote_dcp_size
-            )
-        else:
-            # D (local TP) > P (remote TP): multiple local ranks read different chunks
-            # from *one* remote rank, corresponding to different kv heads.
-            # For MLA, we only need one remote since cache is duplicated. When
-            # P TP=k*TP k, this will spread mla ranks to read from remote k*tp_rank.
-            attn_ranks = [tp_rank * remote_tp_size // tp_size]
-    else:
-        # P (remote TP) > D (local TP): one local rank
-        # reads from multiple remote ranks.
-        # GQA dedup: when K < remote_tp_size, several remote ranks
-        # hold the same KV head.  np.unique keeps only the first
-        # rank per unique head so we don't issue redundant reads.
-        abs_tp = remote_tp_size // tp_size
-        start = tp_rank * abs_tp
-        heads = np.arange(start, start + abs_tp) * total_num_kv_heads // remote_tp_size
-        _, unique_idx = np.unique(heads, return_index=True)
-        attn_ranks = (start + np.sort(unique_idx)).tolist()
+    attn_ranks = _attention_source_ranks(
+        transfer_topology,
+        tp_rank,
+        remote_tp_size,
+        remote_dcp_size,
+        is_mla=is_mla,
+        total_num_kv_heads=total_num_kv_heads,
+    )
 
     # --- SSM source ranks ---
+    # SSM state is head-sharded over TP and never DCP-sharded, so its source
+    # ranks follow the TP ratio even when DCP moves the attention source.
     has_ssm = any(_is_ssm_spec(t) for t in group_spec_types)
-    if has_ssm:
-        if tp_size < remote_tp_size:
-            abs_tp = remote_tp_size // tp_size
-            ssm_ranks = list(range(tp_rank * abs_tp, (tp_rank + 1) * abs_tp))
-        else:
-            ssm_ranks = list(attn_ranks)
-    else:
-        ssm_ranks = []
+    ssm_ranks = (
+        transfer_topology.ssm_source_ranks(remote_tp_size, tp_rank=tp_rank)
+        if has_ssm
+        else []
+    )
 
     all_ranks = sorted(set(attn_ranks) | set(ssm_ranks))
 
@@ -166,10 +161,72 @@ def compute_tp_mapping(
         remote_tp_size, remote_dcp_size
     )
 
+    # Hybrid attention+SSM: count, for every remote rank, the local ranks that
+    # read anything (attention KV or SSM state) from it. With equal DCP sizes
+    # (or no DCP) the attention and SSM sources coincide and every count equals
+    # ``local_consumers``; with different DCP sizes they do not.
+    consumers_by_rank = None
+    if has_ssm and transfer_topology.dcp_size != remote_dcp_size:
+        readers: dict[int, set[int]] = {}
+        for rank in range(tp_size):
+            sources = set(
+                _attention_source_ranks(
+                    transfer_topology,
+                    rank,
+                    remote_tp_size,
+                    remote_dcp_size,
+                    is_mla=is_mla,
+                    total_num_kv_heads=total_num_kv_heads,
+                )
+            ) | set(transfer_topology.ssm_source_ranks(remote_tp_size, tp_rank=rank))
+            for source in sources:
+                readers.setdefault(source, set()).add(rank)
+        consumers_by_rank = {source: len(r) for source, r in readers.items()}
+
     return TPMapping(
         source_ranks_per_group=source_ranks_per_group,
         all_source_ranks=tuple(all_ranks),
         rank_to_attention_slot=rank_to_attention_slot,
         rank_offset_factor=rank_offset_factor,
         local_consumers=local_consumers,
+        consumers_by_rank=consumers_by_rank,
     )
+
+
+def _attention_source_ranks(
+    transfer_topology: TransferTopology,
+    tp_rank: int,
+    remote_tp_size: int,
+    remote_dcp_size: int,
+    is_mla: bool | None = None,
+    total_num_kv_heads: int | None = None,
+) -> list[int]:
+    """Remote ranks that local rank ``tp_rank`` reads attention KV from.
+    ``is_mla`` / ``total_num_kv_heads`` default to the topology's."""
+    tp_size = transfer_topology.tp_size
+    if is_mla is None:
+        is_mla = transfer_topology.is_mla
+    if total_num_kv_heads is None:
+        total_num_kv_heads = transfer_topology.total_num_kv_heads
+    if is_mla or tp_size >= remote_tp_size:
+        if is_mla and remote_dcp_size > 1:
+            return transfer_topology.dcp_source_ranks(
+                remote_tp_size,
+                remote_dcp_size,
+                local_dcp_rank=tp_rank % transfer_topology.dcp_size,
+            )
+        # D (local TP) > P (remote TP): multiple local ranks read different chunks
+        # from *one* remote rank, corresponding to different kv heads.
+        # For MLA, we only need one remote since cache is duplicated. When
+        # P TP=k*TP k, this will spread mla ranks to read from remote k*tp_rank.
+        return [tp_rank * remote_tp_size // tp_size]
+    # P (remote TP) > D (local TP): one local rank
+    # reads from multiple remote ranks.
+    # GQA dedup: when K < remote_tp_size, several remote ranks
+    # hold the same KV head.  np.unique keeps only the first
+    # rank per unique head so we don't issue redundant reads.
+    abs_tp = remote_tp_size // tp_size
+    start = tp_rank * abs_tp
+    heads = np.arange(start, start + abs_tp) * total_num_kv_heads // remote_tp_size
+    _, unique_idx = np.unique(heads, return_index=True)
+    return (start + np.sort(unique_idx)).tolist()

@@ -9,6 +9,14 @@ from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
     NixlBaseConnectorScheduler,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.dcp_pair_exchange import (
+    NixlPairModeError,
+    check_pair_coverage,
+    pair_units,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    KVFingerprintReq,
+)
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
@@ -167,6 +175,18 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
                         )
                         for group in blocks.blocks
                     )
+                    if (
+                        self._pair_mode
+                        and params.get("do_remote_prefill")
+                        and num_external_tokens > 0
+                    ):
+                        self._plan_pair_exchange(
+                            request,
+                            blocks,
+                            local_block_ids,
+                            local_num_computed_blocks,
+                            num_external_tokens,
+                        )
 
                     # Get unhashed blocks to pull from remote. Mind that a full prefix
                     # cache hit is indicated with an empty list.
@@ -191,6 +211,67 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             params["do_remote_prefill"] = False
             params["_remote_blocks_processed"] = True
 
+    def _plan_pair_exchange(
+        self,
+        request: "Request",
+        blocks: "KVCacheBlocks",
+        local_block_ids: BlockIds,
+        local_num_computed_blocks: tuple[int, ...],
+        num_external_tokens: int,
+    ) -> None:
+        """DCP pair mode: record the blocks partner ranks exchange once every
+        rank has pulled ``request`` from a prefiller with half this DCP size.
+
+        Raises:
+            NixlPairModeError: The prefiller did not advertise its DCP size, or
+                computed fewer tokens or blocks than this decoder loads. That
+                is P/D configuration skew, so it stops the engine instead of
+                leaving rows unexchanged or zero-filling the tail.
+
+        """
+        params = request.kv_transfer_params
+        assert params is not None
+        remote_dcp_size = params.get("dcp_size")
+        if remote_dcp_size is None:
+            # The workers pair by the handshake's DCP size; without this one,
+            # a pair-mode pull would go unexchanged.
+            raise NixlPairModeError(
+                "DCP pair exchange: the prefiller of request "
+                f"{request.request_id} did not advertise its DCP size"
+            )
+        dcp_size = self.vllm_config.parallel_config.decode_context_parallel_size
+        if remote_dcp_size * 2 != dcp_size:
+            # An equal DCP size needs no exchange; the handshake rejects others.
+            return
+        remote_block_ids = params["remote_block_ids"]
+        num_tokens = self._get_remote_prefill_token_count(
+            len(request.prompt_token_ids or [])
+        )
+        check_pair_coverage(
+            num_tokens,
+            params.get("remote_num_tokens"),
+            remote_block_ids,
+            self._pair_groups,
+            remote_block_tokens=self.block_size * remote_dcp_size,
+        )
+        if units := pair_units(
+            local_block_ids,
+            local_num_computed_blocks,
+            remote_block_ids,
+            self._pair_groups,
+        ):
+            self._pair_plans[request.request_id] = units
+        if self._fingerprint:
+            # The request's own blocks, and its hit from the token counts: a
+            # plan with a wrong 2m offset must not shift the logged tokens too.
+            self._fingerprint_pulls[request.request_id] = KVFingerprintReq(
+                req_id=params["remote_request_id"],
+                block_ids=blocks.get_block_ids(),
+                num_tokens=num_tokens,
+                first_block=(num_tokens - num_external_tokens)
+                // (self.block_size * dcp_size),
+            )
+
     def request_finished(
         self,
         request: "Request",
@@ -200,6 +281,15 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
         should be freed now or will be sent asynchronously and freed later.
         """
         from vllm.v1.request import RequestStatus
+
+        if self._pair_mode:
+            # Before any early return: a finished request's blocks are freed
+            # when its pull ends, or at once, so its exchange must not run.
+            self._pair_plans.pop(request.request_id, None)
+            self._pair_ready.pop(request.request_id, None)
+            if self._fingerprint:
+                self._fingerprint_pulls.pop(request.request_id, None)
+                self._fingerprint_pulls_ready.pop(request.request_id, None)
 
         params = request.kv_transfer_params
         logger.debug(
@@ -270,6 +360,14 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             if is_d_node:
                 # D blocks expiry time exported for the turn-2 readback.
                 blocks_expiry_time = self._reqs_need_send[request.request_id]
+            elif self._fingerprint:
+                # P->D pull, sent with reqs_to_send; the workers log it before
+                # they report it sent.
+                self._fingerprint_sends[request.request_id] = KVFingerprintReq(
+                    req_id=request.request_id,
+                    block_ids=tuple(list(group) for group in block_ids),
+                    num_tokens=request.num_computed_tokens,
+                )
             # NOTE HMA will "mark" empty/null blocks in groups with 0s (eg SWA ones),
             # trimming down after allocating for the whole sequence length. Empty
             # blocks are always at the start of the list.

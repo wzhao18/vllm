@@ -11,7 +11,7 @@ import queue
 import threading
 import time
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
@@ -39,8 +39,16 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorTransferResults,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.kv_fingerprint import (
+    FingerprintGrid,
+    KVFingerprintLog,
+    LayerView,
+    fingerprint_dir,
+    layer_views,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     GET_META_MSG,
+    KVFingerprintReq,
     NixlAgentMetadata,
     NixlConnectorMetadata,
     NixlHandshakePayload,
@@ -48,6 +56,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     ReqMeta,
     TransferHandle,
     compute_nixl_compatibility_hash,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.page_zeroer import (
+    PageZeroer,
+    unwritten_blocks,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.stats import (
     NixlKVConnectorStats,
@@ -92,6 +104,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
+    SparseCacheRole,
     UniformTypeKVCacheSpecs,
     iter_layer_specs,
 )
@@ -99,6 +112,10 @@ from vllm.v1.worker.utils import select_common_block_size
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.dcp_pair_exchange import (
+        DcpPairExchanger,
+        PairRegion,
+    )
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
@@ -110,6 +127,16 @@ _SHARED_REGION_GROUP_ID = -1
 _INVALID_PEER_MIN_BACKOFF_S = 1.0
 _INVALID_PEER_MAX_BACKOFF_S = 60.0
 _MAX_HYBRID_BLOCK_SPLIT = 128
+
+
+class NixlPeerConfigMismatch(RuntimeError):
+    """A peer whose configuration needs a different KV mapping, e.g. another
+    DCP interleave. Fatal: the handshake records it and the worker's main thread
+    re-raises it, instead of failing requests into a silent recompute."""
+
+
+def _describe_interleave(interleave: int | None) -> str:
+    return "not advertised (older peer)" if interleave is None else str(interleave)
 
 
 def _region_sort_key(layer_name: str) -> tuple[tuple[int, int | str], ...]:
@@ -165,6 +192,33 @@ class NixlBaseConnectorWorker:
 
     # Only NixlPushConnector supports PP with HMA or packed KV caches.
     _supports_pp_hma = False
+
+    # Set by register_kv_caches. The class default keeps workers that never
+    # register caches (and the zeroing bookkeeping behind it) inert.
+    _page_zeroer: PageZeroer | None = None
+
+    # DCP pair exchange opt-in (see _is_dcp_pair_peer), and the first peer
+    # mismatch a handshake found (see _raise_peer_config_mismatch).
+    _dcp_pair_exchange: bool = False
+    _peer_config_mismatch: NixlPeerConfigMismatch | None = None
+    # Pair mode: the exchanger register_kv_caches builds and the transfer group
+    # it rewrites, the last metadata whose exchanges ran, and the event recorded
+    # after each step's exchanges with that step's metadata (see
+    # finalize_loaded_kv).
+    _pair_exchanger: "DcpPairExchanger | None" = None
+    _pair_group: int | None = None
+    _pair_consumed: NixlConnectorMetadata | None = None
+    _pair_events: tuple[tuple[NixlConnectorMetadata, torch.cuda.Event], ...] = ()
+
+    # KV fingerprints (VLLM_NIXL_KV_FINGERPRINT, see kv_fingerprint.py): this
+    # rank's log, whose side is P on a producer and D in pair mode, and its
+    # fingerprinted layers per KV cache group. Set by register_kv_caches.
+    _fingerprint_log: KVFingerprintLog | None = None
+    _fingerprint_views: tuple[tuple[int, tuple[LayerView, ...]], ...] = ()
+    # P: requests whose send this rank was told about, so whose fingerprint is
+    # written, and requests D read before that, whose send is held back.
+    _fingerprint_decided: set[ReqId]
+    _fingerprint_held: set[ReqId]
 
     def _compute_desc_ids(
         self,
@@ -738,6 +792,7 @@ class NixlBaseConnectorWorker:
         # The transfer requires DS (dim, state_len) conv layout so that
         # conv sub-projections are contiguous in memory.
         self._conv_decomp: MambaConvSplitInfo | None = None
+        self._mamba_state_geometry: tuple[int, list[list[int]], list[str]] | None = None
         self._has_mamba = any(
             isinstance(spec, MambaSpec) for spec in self._layer_specs.values()
         )
@@ -785,6 +840,11 @@ class NixlBaseConnectorWorker:
                 vllm_config.parallel_config.tensor_parallel_size,
             )
             mamba_ssm_size = self._conv_decomp.ssm_sizes
+            self._mamba_state_geometry = (
+                vllm_config.parallel_config.tensor_parallel_size,
+                [list(shape) for shape in mamba_spec.shapes],
+                [str(dtype) for dtype in mamba_spec.dtypes],
+            )
         self._mamba_ssm_size = mamba_ssm_size
 
         # Agent.
@@ -884,6 +944,11 @@ class NixlBaseConnectorWorker:
                 "is not supported."
             )
         self.device_kv_caches: dict[str, torch.Tensor] = {}
+        # Group -> attention blocks a pull leaves unwritten (see page_zeroer),
+        # gathered over one start_load_kv.
+        self._unwritten_batch: dict[int, list[int]] = {}
+        # Requests whose zeroing was queued in the current step.
+        self._fresh_zeroed_reqs: set[str] = set()
 
         # cpu kv buffer for xfer
         # used when device memory can not be registered under nixl
@@ -1038,6 +1103,20 @@ class NixlBaseConnectorWorker:
         )
         # Map of pull peer (host, port) -> engine_id currently serving it.
         self._engine_by_address: dict[tuple[str, int], EngineId] = {}
+        # Decoder opt-in: pull at DCP interleave 1 from peers with half this
+        # DCP size, partner ranks swapping half-blocks after the reads. Kept
+        # raw so that a truthy non-boolean fails the startup checks.
+        self._dcp_pair_exchange = vllm_config.kv_transfer_config.get_from_extra_config(
+            "dcp_pair_exchange", False
+        )
+        if self._dcp_pair_exchange and self.kv_transfer_config.is_kv_producer:
+            # Its scheduler ignores the flag too, so it emits no pair units.
+            logger.warning(
+                "NIXL dcp_pair_exchange is a decoder (kv_consumer) option: this "
+                "%s instance ignores it and builds no pair exchanger.",
+                self.kv_transfer_config.kv_role,
+            )
+            self._dcp_pair_exchange = False
 
         self.model_config = vllm_config.model_config
 
@@ -1118,6 +1197,53 @@ class NixlBaseConnectorWorker:
         self.enforce_compat_hash = self.kv_transfer_config.get_from_extra_config(
             "enforce_handshake_compat", True
         )
+        if self._dcp_pair_exchange:
+            self._validate_dcp_pair_exchange_config()
+
+    def _validate_dcp_pair_exchange_config(self) -> None:
+        """Startup checks for the decoder side of the DCP pair exchange."""
+        interleave = self.vllm_config.parallel_config.cp_kv_cache_interleave_size
+        problems = []
+        if self._dcp_pair_exchange is not True:
+            problems.append(
+                f"the flag must be a JSON boolean, got {self._dcp_pair_exchange!r}"
+            )
+        if interleave != 1:
+            problems.append(
+                f"cp_kv_cache_interleave_size is {interleave}; pass "
+                "--cp-kv-cache-interleave-size 1 explicitly"
+            )
+        if (self.dcp_size, self.pcp_size, self.pp_size) != (self.world_size, 1, 1):
+            problems.append(
+                f"DCP must equal TP with PCP 1 and PP 1 (TP {self.world_size}, "
+                f"DCP {self.dcp_size}, PCP {self.pcp_size}, PP {self.pp_size})"
+            )
+        if not self.vllm_config.use_v2_model_runner:
+            problems.append("the V2 model runner is required")
+        if self._TRANSFER_MODE != "pull":
+            problems.append("NixlPullConnector is required")
+        if self.use_host_buffer or self.vllm_config.model_config.enable_sleep_mode:
+            problems.append("host transfer buffers and sleep mode are unsupported")
+        if self._physical_blocks_per_logical_kv_block != 1:
+            problems.append(
+                "the kernel block must equal the KV cache block ("
+                f"{self._physical_blocks_per_logical_kv_block} kernel blocks per block)"
+            )
+        config = self.kv_cache_config
+        if config.transfer_group_ids != tuple(range(len(config.kv_cache_groups))):
+            problems.append("every KV cache group must be a transfer group")
+        replicated = [
+            name
+            for name, spec in self._layer_specs.items()
+            if isinstance(spec, AttentionSpec) and not spec.dcp_sharded
+        ]
+        if replicated:
+            problems.append(
+                f"every attention layer must be DCP-sharded ({len(replicated)} "
+                f"are not, e.g. {replicated[0]})"
+            )
+        if problems:
+            raise ValueError("NIXL dcp_pair_exchange: " + "; ".join(problems) + ".")
 
     def _validate_remote_parallel_config(
         self, agent_metadata: NixlAgentMetadata
@@ -1138,6 +1264,20 @@ class NixlBaseConnectorWorker:
                 "Replicated PCP cannot be paired with a DCP-sharded NIXL peer. "
                 f"Local PCP/DCP={local_pcp_size}/{local_dcp_size}; "
                 f"remote PCP/DCP={remote_pcp_size}/{remote_dcp_size}."
+            )
+        # A side with DCP 1 never resolves its interleave, nor depends on it.
+        if local_dcp_size == 1 or remote_dcp_size == 1:
+            return
+        local_interleave = self.vllm_config.parallel_config.cp_kv_cache_interleave_size
+        remote_interleave = agent_metadata.cp_kv_cache_interleave_size
+        if remote_interleave != local_interleave:
+            raise NixlPeerConfigMismatch(
+                "NIXL DCP peers must use the same cp_kv_cache_interleave_size, "
+                "as it determines how tokens are laid out in transferred blocks. "
+                f"Local: DCP {local_dcp_size}, interleave {local_interleave}; "
+                f"remote engine {agent_metadata.engine_id}: DCP {remote_dcp_size}, "
+                f"interleave {_describe_interleave(remote_interleave)}. Set the "
+                "same --cp-kv-cache-interleave-size on both instances."
             )
 
     def _sync_block_size_with_kernel(self) -> None:
@@ -1515,6 +1655,11 @@ class NixlBaseConnectorWorker:
                         self._engine_last_active[eid] = time.perf_counter()
                         self._track_remote_engine_replacement(eid, host, port)
                     except Exception as e:
+                        if (
+                            isinstance(e, NixlPeerConfigMismatch)
+                            and self._peer_config_mismatch is None
+                        ):
+                            self._peer_config_mismatch = e
                         self._log_failure(
                             failure_type="handshake_setup_failed",
                             req_id=None,
@@ -1550,6 +1695,10 @@ class NixlBaseConnectorWorker:
             try:
                 f.result()
                 self._ready_requests.put(entry)
+            except NixlPeerConfigMismatch:
+                # _ensure_handshake's callback records it (possibly after this
+                # one runs); the main thread raises it instead of recomputing.
+                pass
             except Exception as e:
                 self._log_failure(
                     failure_type="handshake_failed",
@@ -1948,6 +2097,10 @@ class NixlBaseConnectorWorker:
                 "Mixed-device KV registration is only supported for MLA "
                 "models without Mamba layers."
             )
+            if self._dcp_pair_exchange:
+                raise ValueError(
+                    "NIXL dcp_pair_exchange does not support mixed-memory KV caches."
+                )
         for mem_type in sorted(set(region_mem_types)):
             if mem_type == "DRAM" and self._skip_dram_xfer:
                 continue
@@ -1965,6 +2118,8 @@ class NixlBaseConnectorWorker:
             self._registered_descs.append(descs)
 
         self.device_kv_caches = kv_caches
+        if self._TRANSFER_MODE == "pull":
+            self._page_zeroer = self._build_page_zeroer()
         self.dst_num_blocks[self.engine_id] = self.num_blocks
         self.dst_region_num_blocks[self.engine_id] = self.region_num_blocks
         self.dst_region_group_ids[self.engine_id] = self.region_group_ids
@@ -2014,6 +2169,9 @@ class NixlBaseConnectorWorker:
             region_mem_types=self.region_mem_types,
             dcp_size=self.dcp_size,
             pcp_size=self.pcp_size,
+            cp_kv_cache_interleave_size=int(
+                self.vllm_config.parallel_config.cp_kv_cache_interleave_size
+            ),
             region_members=self.region_members,
             layer_group_ids={
                 name: self.kv_cache_config.transfer_group_index_by_layer[name]
@@ -2021,6 +2179,7 @@ class NixlBaseConnectorWorker:
                 for name in names
             },
             packed_member_layouts=self._packed_member_layouts,
+            mamba_state_geometry=self._mamba_state_geometry,
         )
         # Wrap metadata in payload with hash for defensive decoding
         assert self.compat_hash is not None
@@ -2029,6 +2188,257 @@ class NixlBaseConnectorWorker:
             compatibility_hash=self.compat_hash,
             agent_metadata_bytes=encoder.encode(agent_metadata),
         )
+        if self._dcp_pair_exchange:
+            self._build_dcp_pair_exchanger(kv_caches)
+        self._init_kv_fingerprint(kv_caches)
+
+    def _init_kv_fingerprint(self, kv_caches: dict[str, torch.Tensor]) -> None:
+        """With VLLM_NIXL_KV_FINGERPRINT on, open this rank's log: a pull
+        producer logs the KV of each request a decoder pulls from it, a
+        pair-mode decoder each pull's KV after its exchange."""
+        out_dir = fingerprint_dir()
+        if out_dir is None:
+            return
+        if self._pair_exchanger is not None:
+            side, p_dcp_size = "D", self.dcp_size // 2
+        elif self._TRANSFER_MODE == "pull" and self.kv_transfer_config.is_kv_producer:
+            side, p_dcp_size = "P", self.dcp_size
+        else:
+            return
+        draft = self._draft_layer_names()
+        views = layer_views(
+            kv_caches,
+            self._layer_specs,
+            self.vllm_config.compilation_config.static_forward_context,
+            draft,
+        )
+        if not views:
+            logger.warning(
+                "NIXL KV fingerprint: no DCP-sharded attention layer to log."
+            )
+            return
+        block_sizes = {self._layer_specs[view.name].block_size for view in views}
+        if len(block_sizes) != 1:
+            raise ValueError(
+                f"NIXL KV fingerprint: layers of block sizes {sorted(block_sizes)}"
+            )
+        group_of = {
+            name: g
+            for g, group in enumerate(self.kv_cache_config.kv_cache_groups)
+            for name in group.layer_names
+        }
+        by_group: dict[int, list[LayerView]] = defaultdict(list)
+        for view in views:
+            by_group[group_of[view.name]].append(view)
+        self._fingerprint_views = tuple(
+            (g, tuple(group_views)) for g, group_views in sorted(by_group.items())
+        )
+        grid = FingerprintGrid(p_dcp_size, 2 * p_dcp_size, block_sizes.pop())
+        self._fingerprint_log = KVFingerprintLog(
+            out_dir, side, self.dcp_rank, grid, self.engine_id
+        )
+        if side == "P":
+            self._fingerprint_decided = set()
+            self._fingerprint_held = set()
+        logger.info(
+            "NIXL KV fingerprint: %s DCP rank %d logs %d layers (%d of the "
+            "drafter) of KV cache groups %s to %s.",
+            side,
+            self.dcp_rank,
+            len(views),
+            sum(view.draft for view in views),
+            sorted(by_group),
+            self._fingerprint_log.path,
+        )
+
+    def _draft_layer_names(self) -> set[str]:
+        """The drafter's layers, as the model runner marks them: on their KV
+        cache specs, or on the layers themselves."""
+        layers = self.vllm_config.compilation_config.static_forward_context
+        return {
+            name
+            for name, spec in self._layer_specs.items()
+            if spec.is_draft or getattr(layers.get(name), "is_draft_layer", False)
+        }
+
+    def _build_dcp_pair_exchanger(self, kv_caches: dict[str, torch.Tensor]) -> None:
+        """Check pair mode's geometry on the registered caches, then build the
+        exchanger and run its warm-up round trip with the partner rank."""
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
+            dcp_pair_exchange,
+        )
+
+        group, regions = self._dcp_pair_regions(kv_caches)
+        index_kernel_rows, index_value_bytes = self._dcp_pair_index_format(regions)
+        chunk_units = self.kv_transfer_config.get_from_extra_config(
+            "dcp_pair_exchange_chunk_units", 4
+        )
+        if type(chunk_units) is not int or chunk_units < 1:
+            raise ValueError(
+                "NIXL dcp_pair_exchange_chunk_units must be a positive integer, "
+                f"got {chunk_units!r}."
+            )
+        device = kv_caches[regions[0].layer_name].device
+        exchanger = dcp_pair_exchange.build_dcp_pair_exchanger(
+            regions,
+            index_kernel_rows=index_kernel_rows,
+            index_value_bytes=index_value_bytes,
+            layout=dcp_pair_exchange.pair_layout(
+                self.dcp_rank,
+                self.dcp_size,
+                self.dcp_size // 2,
+                regions[0].spec.block_size,
+                self.vllm_config.parallel_config.cp_kv_cache_interleave_size,
+            ),
+            device=device,
+            chunk_units=chunk_units,
+        )
+        table = exchanger.table
+        arrays = Counter((array.kind.value, array.width) for array in table.arrays)
+        draft = self._draft_layer_names()
+        # What a deployment exchanges, to check against the model: the regions
+        # per transfer group and the drafter's pages among them.
+        logger.info(
+            "NIXL DCP pair exchange, DCP rank %d: %d NIXL regions (per transfer "
+            "group, -1 shared: %s); %d drafter layers; group %d exchanges %d "
+            "layer pages (%d of the drafter); row table: %d-row blocks %d B "
+            "apart, arrays %s, %d B per unit half, %d units per NCCL round.",
+            self.dcp_rank,
+            self.num_regions,
+            dict(sorted(Counter(self.region_group_ids).items())),
+            len(draft),
+            group,
+            len(regions),
+            sum(region.layer_name in draft for region in regions),
+            table.block_size,
+            table.block_stride,
+            ", ".join(f"{n} x {kind} {width} B" for (kind, width), n in arrays.items()),
+            table.half_bytes,
+            chunk_units,
+        )
+        # On every rank: checks the partner and logs the buffers and memory.
+        exchanger.warm_up()
+        self._pair_exchanger = exchanger
+        self._pair_group = group
+
+    def _dcp_pair_regions(
+        self, kv_caches: dict[str, torch.Tensor]
+    ) -> tuple[int, list["PairRegion"]]:
+        """The one attention transfer group, which must be DCP-sharded, and its
+        NIXL regions in region order. Each layer page must be a region of its
+        own, so that the bytes a pull writes are the bytes its backend reads."""
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
+            dcp_pair_exchange,
+        )
+
+        groups = self.kv_cache_config.transfer_groups
+        attention = [
+            g for g, t in enumerate(self._group_spec_types) if _is_attention_spec(t)
+        ]
+        if len(attention) != 1 or not groups[attention[0]].kv_cache_spec.dcp_sharded:
+            raise dcp_pair_exchange.NixlPairModeError(
+                "DCP pair exchange needs exactly one attention transfer group, "
+                f"DCP-sharded; got groups {attention}, DCP-sharded "
+                f"{[groups[g].kv_cache_spec.dcp_sharded for g in attention]}"
+            )
+        group = attention[0]
+        bases = self.kv_caches_base_addr[self.engine_id][self.tp_rank]
+        region_of_page = {
+            page: i for i, page in enumerate(zip(bases, self.block_len_per_layer))
+        }
+        layer_of_region: dict[int, str] = {}
+        for name in groups[group].layer_names:
+            cache = kv_caches[name]
+            region = region_of_page.get(
+                (cache.data_ptr(), self._layer_specs[name].page_size_bytes)
+            )
+            # One block per kernel block: the units' block ids are NIXL's.
+            if (
+                region is None
+                or region in layer_of_region
+                or self.region_group_ids[region] != group
+                or self.region_num_blocks[region] != self.kv_cache_config.num_blocks
+                or self.block_stride_per_layer[region]
+                != cache.stride(0) * cache.element_size()
+            ):
+                raise dcp_pair_exchange.NixlPairModeError(
+                    f"DCP pair exchange: the pages of layer {name} are not a NIXL "
+                    "region of their own with its block stride and KV cache blocks"
+                )
+            layer_of_region[region] = name
+        unmatched = [
+            self.region_names[i]
+            for i, g in enumerate(self.region_group_ids)
+            if g == group and i not in layer_of_region
+        ]
+        if unmatched:
+            raise dcp_pair_exchange.NixlPairModeError(
+                f"DCP pair exchange: NIXL regions of transfer group {group} hold "
+                f"no single layer page (e.g. {unmatched[0]})"
+            )
+        return group, [
+            dcp_pair_exchange.PairRegion(
+                name,
+                self._layer_specs[name],
+                bases[i],
+                self.block_len_per_layer[i],
+                self.block_stride_per_layer[i],
+            )
+            for i, name in sorted(layer_of_region.items())
+        ]
+
+    def _dcp_pair_index_format(self, regions: list["PairRegion"]) -> tuple[int, int]:
+        """Rows per kernel page of the indexer caches, from the kernel block
+        views bound to their layers, and the value bytes of an indexer row (the
+        rest are its scales), from its width: index_head_dim fp8 values and a
+        4-byte scale, or index_head_dim / 2 MXFP4 (E2M1) bytes and a UE8M0 byte
+        per 32 values. Zeros without indexer caches."""
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
+            dcp_pair_exchange,
+        )
+
+        layers = self.vllm_config.compilation_config.static_forward_context
+        kernel_rows, widths = set(), set()
+        for region in regions:
+            if getattr(region.spec, "cache_role", None) != SparseCacheRole.INDEXER:
+                continue
+            view = getattr(layers.get(region.layer_name), "kv_cache", None)
+            # Kernel pages of rows: [..., rows, row bytes].
+            if (
+                not isinstance(view, torch.Tensor)
+                or view.dim() < 2
+                or view.data_ptr() != region.base_addr
+                or view.shape[-1] * view.element_size()
+                != region.spec.state_content_size_bytes
+            ):
+                raise dcp_pair_exchange.NixlPairModeError(
+                    f"DCP pair exchange: indexer layer {region.layer_name} is not "
+                    "bound to a view of its registered KV cache"
+                )
+            kernel_rows.add(view.shape[-2])
+            widths.add(region.spec.state_content_size_bytes)
+        if not kernel_rows:
+            return 0, 0
+        text_config = self.vllm_config.model_config.hf_text_config
+        head_dim = getattr(
+            getattr(text_config, "dsa_config", None), "index_head_dim", None
+        )
+        if len(kernel_rows) != 1 or len(widths) != 1 or not isinstance(head_dim, int):
+            raise dcp_pair_exchange.NixlPairModeError(
+                "DCP pair exchange: the indexer caches need one kernel page size "
+                f"(got {sorted(kernel_rows)} rows), one row width (got "
+                f"{sorted(widths)} bytes) and dsa_config.index_head_dim (got "
+                f"{head_dim!r})"
+            )
+        width = widths.pop()
+        values = {head_dim + 4: head_dim, head_dim // 2 + head_dim // 32: head_dim // 2}
+        if width not in values:
+            raise dcp_pair_exchange.NixlPairModeError(
+                f"DCP pair exchange: {width}-byte indexer rows are neither fp8 "
+                f"({head_dim} + 4 bytes) nor MXFP4 ({head_dim // 2} + "
+                f"{head_dim // 32} bytes) rows of index_head_dim {head_dim}"
+            )
+        return kernel_rows.pop(), values[width]
 
     def _ple_page_len(self) -> int:
         """Transfer length of one PLE state page.
@@ -2767,6 +3177,168 @@ class NixlBaseConnectorWorker:
 
         return remote_agent_name
 
+    def _validate_hybrid_hetero_dcp(
+        self,
+        nixl_agent_meta: NixlAgentMetadata,
+        remote_tp_size: int,
+        remote_dcp_size: int,
+    ) -> None:
+        """Hybrid MLA+Mamba peers with different DCP sizes (e.g. a TP8/DCP8
+        prefiller feeding a TP16/DCP16 decoder).
+
+        MLA KV is matched block by block by global DCP position
+        (``_apply_dcp_prefix_caching``), which needs both sides fully DCP-sharded
+        (DCP == TP), the same per-rank logical block size, and one of the
+        interleave modes of ``_hetero_dcp_interleave_problem``. An interleave or
+        mode mismatch, or any problem in pair mode, raises
+        ``NixlPeerConfigMismatch``; in block mode the other problems only fail
+        the handshake. Mamba state is not DCP-sharded and is read from the rank
+        owning this rank's heads (``TPMapping`` SSM sources).
+        """
+        local_block = self.block_size * self._physical_blocks_per_logical_kv_block
+        remote_block = (
+            nixl_agent_meta.block_size
+            * nixl_agent_meta.physical_blocks_per_logical_kv_block
+        )
+        local_interleave = self.vllm_config.parallel_config.cp_kv_cache_interleave_size
+        problems = []
+        if not self.use_mla:
+            problems.append("the attention layers must be MLA")
+        if self.world_size < remote_tp_size:
+            problems.append(
+                f"local TP {self.world_size} must be >= remote TP {remote_tp_size}"
+            )
+        if self.dcp_size != self.world_size or remote_dcp_size != remote_tp_size:
+            problems.append(
+                "DCP must span TP on both sides "
+                f"(local TP/DCP {self.world_size}/{self.dcp_size}, "
+                f"remote {remote_tp_size}/{remote_dcp_size})"
+            )
+        if self.pcp_size > 1 or nixl_agent_meta.pcp_size > 1:
+            problems.append("PCP is not supported")
+        if local_block != remote_block:
+            problems.append(
+                f"per-rank block sizes differ (local {local_block}, remote "
+                f"{remote_block}); set the same --block-size on both"
+            )
+        pair_mode = self._is_dcp_pair_peer(nixl_agent_meta, remote_dcp_size)
+        interleave_problem = self._hetero_dcp_interleave_problem(
+            nixl_agent_meta, remote_dcp_size
+        )
+        if interleave_problem is not None:
+            problems.append(interleave_problem)
+        if problems:
+            fatal = pair_mode or interleave_problem is not None
+            error = NixlPeerConfigMismatch if fatal else RuntimeError
+            raise error(
+                "Hybrid MLA+Mamba NIXL transfers with different DCP sizes "
+                f"(local={self.dcp_size}, remote={remote_dcp_size}): "
+                + "; ".join(problems)
+                + "."
+            )
+        logger.info_once(
+            "Hybrid MLA+Mamba NIXL transfer with heterogeneous DCP: local "
+            "TP/DCP %d/%d, remote %d/%d, per-rank block %d, interleave %d (%s "
+            "mode).",
+            self.world_size,
+            self.dcp_size,
+            remote_tp_size,
+            remote_dcp_size,
+            local_block,
+            local_interleave,
+            "pair" if pair_mode else "block",
+        )
+
+    def _is_dcp_pair_peer(
+        self, nixl_agent_meta: NixlAgentMetadata, remote_dcp_size: int
+    ) -> bool:
+        """Whether this decoder pulls from the peer in DCP pair mode: interleave
+        1 on both sides, the same per-rank block, no PCP, local DCP = 2 x remote
+        DCP, and pull mode with ``dcp_pair_exchange`` on. Partner decoder ranks
+        then swap half-blocks after the reads."""
+        local_block = self.block_size * self._physical_blocks_per_logical_kv_block
+        remote_block = (
+            nixl_agent_meta.block_size
+            * nixl_agent_meta.physical_blocks_per_logical_kv_block
+        )
+        local_interleave = self.vllm_config.parallel_config.cp_kv_cache_interleave_size
+        return (
+            self._dcp_pair_exchange is True
+            and self._TRANSFER_MODE == "pull"
+            and local_interleave == nixl_agent_meta.cp_kv_cache_interleave_size == 1
+            and self.dcp_size == 2 * remote_dcp_size
+            and local_block == remote_block
+            and self.pcp_size == nixl_agent_meta.pcp_size == 1
+        )
+
+    def _hetero_dcp_interleave_problem(
+        self, nixl_agent_meta: NixlAgentMetadata, remote_dcp_size: int
+    ) -> str | None:
+        """Why peers with different DCP sizes cannot pair their attention
+        blocks, or None when one of two modes applies.
+
+        Block mode: each DCP-sharded side's interleave equals its per-rank
+        block, so a block holds one interleave chunk and blocks match by global
+        position. Pair mode: see ``_is_dcp_pair_peer``.
+        """
+        local_block = self.block_size * self._physical_blocks_per_logical_kv_block
+        remote_block = (
+            nixl_agent_meta.block_size
+            * nixl_agent_meta.physical_blocks_per_logical_kv_block
+        )
+        local_interleave = self.vllm_config.parallel_config.cp_kv_cache_interleave_size
+        remote_interleave = nixl_agent_meta.cp_kv_cache_interleave_size
+        block_mode = (self.dcp_size == 1 or local_interleave == local_block) and (
+            remote_dcp_size == 1 or remote_interleave == remote_block
+        )
+        if block_mode or self._is_dcp_pair_peer(nixl_agent_meta, remote_dcp_size):
+            return None
+        return (
+            "cp_kv_cache_interleave_size must equal the per-rank block size on "
+            "each DCP-sharded side, or be 1 on both sides with the same per-rank "
+            "block, no PCP, local DCP = 2 x remote DCP, pull mode and "
+            f"dcp_pair_exchange on (local: DCP {self.dcp_size}, PCP "
+            f"{self.pcp_size}, interleave {local_interleave}, block {local_block}, "
+            f"{self._TRANSFER_MODE} mode, dcp_pair_exchange "
+            f"{'on' if self._dcp_pair_exchange else 'off'}; remote: DCP "
+            f"{remote_dcp_size}, PCP {nixl_agent_meta.pcp_size}, interleave "
+            f"{_describe_interleave(remote_interleave)}, block {remote_block})"
+        )
+
+    def _validate_mamba_state_geometry(self, nixl_agent_meta: NixlAgentMetadata):
+        """Fail the handshake when the peers' Mamba state pages differ.
+
+        The state is sharded over TP on dim 0, so dim 0 is compared as a global
+        size and every other dim must match. Conv rows count the speculative
+        columns, so e.g. a DL3 prefiller paired with a DL7 decoder is rejected
+        here instead of transferring misaligned conv state.
+        """
+        local = self._mamba_state_geometry
+        remote = nixl_agent_meta.mamba_state_geometry
+        if local is None:
+            return
+        if remote is None:
+            logger.warning(
+                "Remote engine %s does not advertise its Mamba state geometry; "
+                "skipping the check.",
+                nixl_agent_meta.engine_id,
+            )
+            return
+        local_tp, local_shapes, local_dtypes = local
+        remote_tp, remote_shapes, remote_dtypes = remote
+        local_global = [[s[0] * local_tp, *s[1:]] for s in local_shapes]
+        remote_global = [[s[0] * remote_tp, *s[1:]] for s in remote_shapes]
+        if local_global != remote_global or list(local_dtypes) != list(remote_dtypes):
+            raise RuntimeError(
+                "NIXL handshake with engine "
+                f"{nixl_agent_meta.engine_id} rejected: Mamba state geometry "
+                f"differs (global shapes local {local_global} vs remote "
+                f"{remote_global}; dtypes local {list(local_dtypes)} vs remote "
+                f"{list(remote_dtypes)}). Conv rows include the speculative "
+                "columns: check that both sides use the same "
+                "num_speculative_tokens and mamba_ssm_cache_dtype."
+            )
+
     def _validate_remote_agent_handshake(
         self,
         nixl_agent_meta: NixlAgentMetadata,
@@ -2794,11 +3366,20 @@ class NixlBaseConnectorWorker:
             f"DCP sizes must divide one another: local={self.dcp_size}, "
             f"remote={remote_dcp_size} (engine {remote_engine_id})."
         )
-        if self._has_mamba and self.dcp_size != remote_dcp_size:
-            raise RuntimeError(
-                "Hybrid MLA+Mamba NIXL transfers require matching DCP sizes, "
-                f"got local={self.dcp_size}, remote={remote_dcp_size}."
-            )
+        if self.dcp_size != remote_dcp_size:
+            if self._has_mamba:
+                self._validate_hybrid_hetero_dcp(
+                    nixl_agent_meta, remote_tp_size, remote_dcp_size
+                )
+            elif problem := self._hetero_dcp_interleave_problem(
+                nixl_agent_meta, remote_dcp_size
+            ):
+                raise NixlPeerConfigMismatch(
+                    "NIXL transfers with different DCP sizes (local="
+                    f"{self.dcp_size}, remote={remote_dcp_size}): {problem}."
+                )
+        if self._has_mamba:
+            self._validate_mamba_state_geometry(nixl_agent_meta)
 
         tp_ratio = self.transfer_topo.tp_ratio(remote_tp_size)
         block_size_ratio = self.transfer_topo.block_size_ratio(
@@ -2990,14 +3571,30 @@ class NixlBaseConnectorWorker:
             # SSM geometry is validated via ssm_sizes/conv offsets instead.
             # A head-sharded draft's blocks also scale with its heads per rank.
             local_lens = [self.block_len_per_layer[r] for r in local_regions]
-            assert local_lens == [
+            if self._has_packed_cache:
+                assert len(local_lens) == len(nixl_agent_meta.block_lens), (
+                    "Hybrid packed KV caches must register the same regions on P "
+                    "and D (VLLM_PACKED_KV_STATE_GROUPS must match): "
+                    f"local={local_lens}, remote={nixl_agent_meta.block_lens}."
+                )
+            remote_lens = [
                 block_len * block_size_ratio * draft_local_heads // draft_remote_heads
                 if r in self._head_sharded_draft_regions
                 else block_len * block_size_ratio
                 for r, block_len in zip(
                     local_regions, nixl_agent_meta.block_lens, strict=True
                 )
-            ], (
+            ]
+            if self._has_packed_cache:
+                # Block-outermost pages: an SSM region is the per-rank state, which
+                # scales with 1/TP. With the same KV cache groups (see
+                # VLLM_PACKED_KV_STATE_GROUPS) both sides register the same
+                # regions in the same order; compare the attention ones.
+                ssm = set(self._ssm_region_indices)
+                keep = [i for i, r in enumerate(local_regions) if r not in ssm]
+                local_lens = [local_lens[i] for i in keep]
+                remote_lens = [remote_lens[i] for i in keep]
+            assert local_lens == remote_lens, (
                 "Hybrid MLA kernel-granularity block lengths must match "
                 f"between P and D (block_size_ratio={block_size_ratio}): "
                 f"local={local_lens}, remote={nixl_agent_meta.block_lens}."
@@ -3269,6 +3866,86 @@ class NixlBaseConnectorWorker:
         )
         return skip
 
+    def _build_page_zeroer(self) -> PageZeroer | None:
+        """Segment table over the device views of every attention group."""
+        caches_by_group: dict[int, list[torch.Tensor]] = {}
+        flat_page_bytes: dict[int, int | None] = {}
+        for g, group in enumerate(self.kv_cache_config.transfer_groups):
+            spec = group.kv_cache_spec
+            if (
+                not _is_attention_spec(get_representative_spec_type(spec))
+                or group.host_resident
+            ):
+                continue
+            caches = [
+                self.device_kv_caches[name]
+                for name in group.layer_names
+                if name in self.device_kv_caches
+                and self.device_kv_caches[name].device.type != "cpu"
+            ]
+            if not caches:
+                continue
+            caches_by_group[g] = caches
+            # Only a flat 1-D view needs it, as registration does.
+            flat_page_bytes[g] = (
+                spec.page_size_bytes // self._physical_blocks_per_logical_kv_block
+            )
+        if not caches_by_group:
+            return None
+        return PageZeroer(caches_by_group, flat_page_bytes)
+
+    def _queue_unwritten_zeroing(
+        self,
+        req_id: str,
+        meta: ReqMeta,
+        written: list[set[int]],
+        block_size_ratio: int,
+    ) -> None:
+        """Queue the attention blocks the posted reads of a pull leave unwritten.
+
+        The scheduler skipped their alloc-time zeroing, since the pull was to
+        fill them. The reads never touch them, so they can be zeroed now, while
+        the transfer is in flight. With a host buffer they are deferred: the
+        h2d sync at completion would copy the stale host pages back.
+        """
+        if self._page_zeroer is None:
+            return
+        local = meta.local_physical_block_ids
+        ids = {
+            g: blocks
+            for g in self._page_zeroer.groups
+            if g < len(local)
+            and (blocks := unwritten_blocks(local[g], written[g], block_size_ratio))
+        }
+        if not ids:
+            return
+        if self.use_host_buffer:
+            meta.unwritten_blocks = ids
+            return
+        for g, blocks in ids.items():
+            self._unwritten_batch.setdefault(g, []).extend(blocks)
+        self._fresh_zeroed_reqs.add(req_id)
+
+    def _flush_unwritten_zeroing(self) -> None:
+        """Zero the queued blocks in one launch per group, off the main stream."""
+        if self._page_zeroer is None or not self._unwritten_batch:
+            return
+        batch, self._unwritten_batch = self._unwritten_batch, {}
+        logger.info_once(
+            "NIXL pull: zeroing local attention blocks the pull leaves unwritten "
+            "(first batch: %d kernel blocks)",
+            sum(len(ids) for ids in batch.values()),
+        )
+        self._page_zeroer.zero_async(batch)
+
+    def _zero_attention_blocks(self, block_ids: BlockIds) -> None:
+        """Zero every attention block of a request (failed pull)."""
+        if self._page_zeroer is None or not block_ids:
+            return
+        self._page_zeroer.zero(
+            {g: block_ids[g] for g in self._page_zeroer.groups if g < len(block_ids)}
+        )
+
     def _zero_region_blocks(self, block_ids: BlockIds) -> None:
         """Clear clipped physical pages in their owning region only."""
         if not any(block_ids):
@@ -3297,6 +3974,7 @@ class NixlBaseConnectorWorker:
         The scheduler process (via the MultiprocExecutor) will use this output
         to track which workers are done.
         """
+        self._raise_peer_config_mismatch()
         assert self.transfer_topo is not None
         done_sending = self._get_new_notifs()
         done_recving, newly_failed = self._pop_done_transfers(self._recving_transfers)
@@ -3350,6 +4028,10 @@ class NixlBaseConnectorWorker:
             # Skip KV sync and post-processing for failed requests
             if req_id in failed_recv_reqs:
                 self._pending_recv_notifs.pop(req_id, None)
+                # Every page may be partly written or not written at all. The
+                # scheduler recomputes them; zero them so no stale byte
+                # survives into a block it keeps or reallocates for a load.
+                self._zero_attention_blocks(meta.local_physical_block_ids)
                 # TODO (NickLucche) handle failed transfer for HMA.
                 if not self._is_hma_required:
                     self._invalid_block_ids.put(set(meta.local_block_ids[0]))
@@ -3371,6 +4053,10 @@ class NixlBaseConnectorWorker:
                 # including any local allocation padding the read did not cover.
                 self._zero_region_blocks(meta.region_blocks_to_zero)
                 continue
+
+            if meta.unwritten_blocks and self._page_zeroer is not None:
+                # Host buffer: the sync above restored the stale pages.
+                self._page_zeroer.zero(meta.unwritten_blocks)
 
             # Post processing for heteroblocksize/layout, and for blocks the
             # transfer clipped. _pair_blocks_by_last_token records the covered
@@ -3441,8 +4127,20 @@ class NixlBaseConnectorWorker:
 
         self._sync_device_after_direct_recv(direct_device_recving)
 
+        if self._page_zeroer is not None:
+            # Order the next forward after the zeroing queued in earlier steps;
+            # it ran beside this step's forward, so the wait is free. Zeroing
+            # queued this step is waited on only for a pull that also finished
+            # this step, the one case where the next forward may read it.
+            self._page_zeroer.step_fence(
+                include_fresh=not self._fresh_zeroed_reqs.isdisjoint(done_recving)
+            )
+            self._fresh_zeroed_reqs.clear()
+
         # Handle timeout to avoid stranding blocks on remote.
         self._reap_expired_send_leases(done_sending)
+        if self._fingerprint_log is not None and self._fingerprint_log.side == "P":
+            done_sending = self._release_logged_sends(done_sending)
 
         self._cleanup_remote_engines()
         return KVConnectorTransferResults(
@@ -3450,6 +4148,139 @@ class NixlBaseConnectorWorker:
             finished_recving=done_recving,
             failed_recving=failed_recv_reqs,
         )
+
+    def _raise_peer_config_mismatch(self) -> None:
+        """Re-raise on the main thread the peer mismatch a handshake found, so
+        the engine stops instead of recomputing that peer's requests."""
+        if self._peer_config_mismatch is not None:
+            raise self._peer_config_mismatch
+
+    def finalize_loaded_kv(self, metadata: NixlConnectorMetadata) -> None:
+        """Run this step's DCP pair exchanges, before the model runner zeroes
+        new blocks, applies copy-on-write copies and runs the forward. With KV
+        fingerprints on, log the pulls that ended right after them."""
+        if metadata.reqs_to_pair_exchange:
+            self.run_pair_exchanges(metadata)
+            self._pair_consumed = metadata
+        if metadata.fingerprint_pulls and self._fingerprint_log is not None:
+            self._log_fingerprints(metadata.fingerprint_pulls)
+
+    def log_send_fingerprints(self, metadata: NixlConnectorMetadata) -> None:
+        """P with KV fingerprints on: log the requests whose KV D will pull,
+        in the step after request_finished, and let this step report their
+        sends (see _release_logged_sends)."""
+        log = self._fingerprint_log
+        if log is None or log.side != "P":
+            return
+        if metadata.fingerprint_sends:
+            self._log_fingerprints(metadata.fingerprint_sends)
+        # The scheduler sends a request's fingerprint with its reqs_to_send.
+        self._fingerprint_decided.update(metadata.reqs_to_send)
+
+    def _log_fingerprints(self, reqs: dict[ReqId, KVFingerprintReq]) -> None:
+        """Log each request's KV per KV cache group: its block table from its
+        prefix hit ``m`` on, holding tokens ``[m * B * DCP, L)`` on this
+        rank. A failed record is reported, never raised: the comparator then
+        finds the request's cells missing."""
+        log = self._fingerprint_log
+        assert log is not None
+        # The sums are read back to the host: a sync, debug runs only.
+        with gpu_sync_allowed():
+            for local_id, req in reqs.items():
+                try:
+                    if not req.exchanged:
+                        log.log_unexchanged(
+                            req.req_id,
+                            req.num_tokens,
+                            req.first_block,
+                            "no exchange plan emitted",
+                            extra={"local_req": local_id},
+                        )
+                        continue
+                    for group, views in self._fingerprint_views:
+                        log.log_request(
+                            req.req_id,
+                            views,
+                            req.block_ids[group][req.first_block :],
+                            req.num_tokens,
+                            first_block=req.first_block,
+                            extra={"group": group, "local_req": local_id},
+                        )
+                except Exception:
+                    logger.exception(
+                        "NIXL KV fingerprint of request %s (%s) failed.",
+                        local_id,
+                        req.req_id,
+                    )
+
+    def _release_logged_sends(self, done_sending: set[str]) -> set[str]:
+        """P with KV fingerprints on: report a send only once this rank
+        processed the metadata announcing it, so after its fingerprint.
+
+        D can read and notify first, since async scheduling lets P lag, and
+        reporting the send then would free the blocks the fingerprint reads.
+        Holding it only delays that free (debug runs only).
+        """
+        pending = self._fingerprint_held | done_sending
+        done = pending & self._fingerprint_decided
+        self._fingerprint_held = pending - done
+        self._fingerprint_decided -= done
+        return done
+
+    def check_pair_exchanges_ran(self, metadata: NixlConnectorMetadata) -> None:
+        """Stop before the forward if this step's DCP pair exchanges did not
+        run: its blocks would be read in P's row order."""
+        if metadata.reqs_to_pair_exchange and self._pair_consumed is not metadata:
+            raise RuntimeError(
+                "NIXL DCP pair exchange did not run before the forward: the model "
+                "runner (or a connector wrapping NIXL) did not call "
+                "finalize_loaded_kv for this step."
+            )
+
+    def run_pair_exchanges(self, metadata: NixlConnectorMetadata) -> None:
+        """Exchange the units of every request with the partner rank, in
+        metadata order as on every rank, and record an event after them."""
+        exchanger = self._pair_exchanger
+        if exchanger is None:
+            raise RuntimeError(
+                "NIXL DCP pair exchange: the scheduler emitted pair units, but "
+                "this worker built no exchanger (dcp_pair_exchange is off)."
+            )
+        units = [u for plan in metadata.reqs_to_pair_exchange.values() for u in plan]
+        # The exchanger addresses only block ids: a unit of another group, or a
+        # block twice, would rewrite blocks it does not own. Every rank checks
+        # the same units, so all raise before any NCCL round.
+        groups = {u.group for u in units}
+        num_blocks = len({u.block_id for u in units})
+        if groups - {self._pair_group} or num_blocks != len(units):
+            raise RuntimeError(
+                f"NIXL DCP pair exchange: {len(units)} units of transfer groups "
+                f"{sorted(groups)} on {num_blocks} distinct blocks, but the "
+                "exchanger rewrites distinct blocks of transfer group "
+                f"{self._pair_group}."
+            )
+        if units:
+            exchanger.exchange(units)
+            self._pair_events += ((metadata, exchanger.record_event()),)
+
+    def _drain_pair_events(self, metadata: NixlConnectorMetadata) -> None:
+        """Wait for the exchanges of earlier steps before this step's READs.
+
+        An aborted request frees its blocks while its exchange may still be
+        queued, and a later pull can READ into them. This step's exchanges
+        need no wait: their requests were alive when this metadata was built,
+        so its pulls do not target their blocks.
+        """
+        if not self._pair_events:
+            return
+        pending = []
+        for meta, event in self._pair_events:
+            if meta is metadata:
+                pending.append((meta, event))
+                continue
+            with gpu_sync_allowed():
+                event.synchronize()
+        self._pair_events = tuple(pending)
 
     def get_finished(self) -> tuple[set[str], set[str]]:
         """Compatibility wrapper for the legacy completion API."""
