@@ -3,7 +3,7 @@
 import itertools
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, ClassVar
 
 from vllm.distributed.kv_events import MEDIUM_CPU
@@ -1449,16 +1449,17 @@ class MambaManager(SingleTypeKVCacheManager):
         )
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
         self.has_prefill_checkpoint_blocks = (
-            self.mamba_cache_mode == "align"
-            and kv_cache_spec.num_prefill_checkpoint_blocks > 0
+            kv_cache_spec.reserves_prefill_checkpoint_col
         )
         # Mamba checkpoints follow Eagle's global replay boundary.
         self.drop_eagle_checkpoint_block = False
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
-        # Each request's latest checkpoint block ("align" mode only). It is not
-        # in the block table, and is released when the request's next step is
-        # scheduled.
-        self._checkpoint_blocks: dict[str, KVCacheBlock] = {}
+        # Each request's checkpoint block ("align" mode only) and the token
+        # count the step exporting it ends at. It is not in the block table,
+        # and is released once that step has been processed.
+        self._checkpoint_blocks: dict[str, tuple[KVCacheBlock, int]] = {}
+        # The checkpoint blocks allocated this step, for the worker.
+        self.new_checkpoint_blocks: dict[str, KVCacheBlock] = {}
         if self.mamba_cache_mode == "align":
             # Mapping from request ID to the index of the block
             # allocated in the previous step
@@ -1647,11 +1648,12 @@ class MambaManager(SingleTypeKVCacheManager):
             request_id, processed_computed_tokens, num_prompt_tokens
         )
         if self.mamba_cache_mode == "align":
-            # The previous step wrote its checkpoint block; the request is done
-            # with it, and the prefix cache keeps it under its key.
-            checkpoint_block = self._checkpoint_blocks.pop(request_id, None)
-            if checkpoint_block is not None:
-                self.block_pool.free_blocks([checkpoint_block])
+            # Once the step exporting the checkpoint has been processed, the
+            # request is done with its block; the prefix cache keeps it keyed.
+            checkpoint = self._checkpoint_blocks.get(request_id)
+            if checkpoint is not None and processed_computed_tokens >= checkpoint[1]:
+                del self._checkpoint_blocks[request_id]
+                self.block_pool.free_blocks([checkpoint[0]])
             # `last_state_block_idx` refers to the block index allocated two steps ago.
             # The block allocated in the previous step is used to copy Mamba states
             # into the block allocated in the current step; the earlier block is
@@ -1832,9 +1834,9 @@ class MambaManager(SingleTypeKVCacheManager):
                 # The checkpoint gets its own block, outside the block table, so
                 # a chunk needs no spare column for it.
                 assert request_id not in self._checkpoint_blocks
-                (self._checkpoint_blocks[request_id],) = self.block_pool.get_new_blocks(
-                    1
-                )
+                (block,) = self.block_pool.get_new_blocks(1)
+                self._checkpoint_blocks[request_id] = (block, num_tokens)
+                self.new_checkpoint_blocks[request_id] = block
             partial_hit = self._partial_hit_reqs.get(request_id)
             has_partial_hit = partial_hit is not None
             # `num_required_blocks` might be less than `len(req_blocks)` if blocks are
@@ -1932,11 +1934,6 @@ class MambaManager(SingleTypeKVCacheManager):
                 returned_blocks.extend(new_blocks)
                 return returned_blocks
 
-    @property
-    def checkpoint_blocks(self) -> Mapping[str, KVCacheBlock]:
-        """Each request's checkpoint block, held until its next step."""
-        return self._checkpoint_blocks
-
     def _relocate_speculative_block(
         self, req_blocks: list[KVCacheBlock], block_idx: int
     ) -> None:
@@ -1970,7 +1967,8 @@ class MambaManager(SingleTypeKVCacheManager):
             self.last_state_block_idx.pop(request_id, None)
             self._num_retired_blocks.pop(request_id, None)
             self._checkpoints.pop(request_id, None)
-            checkpoint_block = self._checkpoint_blocks.pop(request_id, None)
+            checkpoint = self._checkpoint_blocks.pop(request_id, None)
+            self.new_checkpoint_blocks.pop(request_id, None)
             self._producer_partial_tail_reqs.pop(request_id, None)
             # An offer is only guaranteed to hold committed bytes until the end
             # of the pass that made it. This request's blocks are going back to
@@ -1982,11 +1980,11 @@ class MambaManager(SingleTypeKVCacheManager):
                 for entry in self._pending_boundary_state_offloads
                 if entry[0] != request_id
             ]
-            if checkpoint_block is not None:
+            if checkpoint is not None:
                 # Blocks are freed in reverse, tail first, so the tail is
                 # evicted first; the checkpoint, which the next turn resumes
                 # from, goes back last.
-                return [checkpoint_block, *super().pop_blocks_for_free(request_id)]
+                return [checkpoint[0], *super().pop_blocks_for_free(request_id)]
         return super().pop_blocks_for_free(request_id)
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
@@ -2051,6 +2049,7 @@ class MambaManager(SingleTypeKVCacheManager):
 
     def new_step_starts(self) -> None:
         self.cached_blocks_this_step.clear()
+        self.new_checkpoint_blocks.clear()
 
     def _cache_partial_tail_block(
         self,
@@ -2061,7 +2060,7 @@ class MambaManager(SingleTypeKVCacheManager):
         hash_block_size = self.block_pool.hash_block_size
         # Key the checkpoint's block at its exported boundary.
         checkpoint = self._checkpoints.get(request.request_id)
-        checkpoint_block = self._checkpoint_blocks.get(request.request_id)
+        checkpoint_block = self.new_checkpoint_blocks.get(request.request_id)
         if checkpoint is not None and checkpoint_block is not None:
             checkpoint_position, _ = checkpoint
             # The prompt's final chunk caches only up to its last full block,

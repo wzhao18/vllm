@@ -21,29 +21,25 @@ def compute_mamba_prefill_checkpoints(
     seq_lens: list[int],
     query_lens: list[int],
     hash_block_size: int,
-    checkpoint_col: int,
     checkpoint_alignment: int | None,
     drop_eagle_block: bool,
     cache_hit_alignment_tokens: int,
     num_hash_lookahead_tokens: int = 0,
-) -> tuple[list[int], list[int]]:
-    """Per-row internal prefill checkpoint offsets and cache block columns.
+) -> list[int]:
+    """Per-row internal prefill checkpoint offsets into the row's query.
 
     Backends call this instead of re-deriving the rules, so they decline in
     lockstep with the scheduler and `MambaManager`: allocating a checkpoint
     block without writing it leaves the prefix cache serving uninitialized
-    state. A row the scheduler gave no checkpoint block (e.g. a chunk that does
-    not finish the prefill) finds the null block in `checkpoint_col` and
-    exports into it harmlessly.
+    state. A row exports into the block in the reserved last column of its
+    block table (`MambaSpec.reserves_prefill_checkpoint_col`), which holds the
+    null block unless the scheduler gave the row's chunk a checkpoint block.
 
     Returns:
-        `(offsets, cols)`: the checkpoint's offset into each row's query and
-        its block-table column, `checkpoint_col`. `0` and `-1` mean the row has
-        none.
+        Each row's checkpoint offset; `0` means the row has none.
 
     """
     offsets: list[int] = []
-    cols: list[int] = []
     for seq_len, query_len in zip(seq_lens, query_lens):
         query_start = seq_len - query_len
         position = get_mamba_prefill_checkpoint_position(
@@ -60,15 +56,17 @@ def compute_mamba_prefill_checkpoints(
             checkpoint_alignment=checkpoint_alignment,
         )
         offsets.append(position - query_start if valid else 0)
-        cols.append(checkpoint_col if valid else -1)
-    return offsets, cols
+    return offsets
 
 
 def _gather_checkpoint_state_indices(
-    block_table: torch.Tensor, request_rows: torch.Tensor, block_cols: torch.Tensor
+    block_table: torch.Tensor,
+    request_rows: torch.Tensor,
+    checkpoint_offsets: torch.Tensor,
 ) -> torch.Tensor:
+    # The checkpoint block sits in the reserved last column.
     return torch.where(
-        block_cols >= 0, block_table[request_rows, block_cols], NULL_BLOCK_ID
+        checkpoint_offsets > 0, block_table[request_rows, -1], NULL_BLOCK_ID
     )
 
 
@@ -76,24 +74,23 @@ def _gather_checkpoint_state_indices(
 class MambaPrefillCheckpointMetadata:
     checkpoint_offsets: torch.Tensor
     state_indices: torch.Tensor
-    # Host copies of ``checkpoint_offsets`` and of each row's query length, for
+    # Host copies of `checkpoint_offsets` and of each row's query length, for
     # backends that lay out the checkpoint before any tensor exists (Mamba2's
     # SSD chunk split, FlashInfer GDN's checkpoint plan).
     offsets: list[int] | None = None
     query_lens: list[int] | None = None
-    # Gather indices into the block table, kept so that another KV cache group
-    # with the same spec can re-derive its own ``state_indices``.
+    # Block-table rows of the checkpoints, kept so that another KV cache group
+    # with the same spec can re-derive its own `state_indices`.
     request_rows: torch.Tensor | None = None
-    block_cols: torch.Tensor | None = None
 
     def regather_state_indices(
         self, block_table: torch.Tensor
     ) -> "MambaPrefillCheckpointMetadata":
-        assert self.request_rows is not None and self.block_cols is not None
+        assert self.request_rows is not None
         return replace(
             self,
             state_indices=_gather_checkpoint_state_indices(
-                block_table, self.request_rows, self.block_cols
+                block_table, self.request_rows, self.checkpoint_offsets
             ),
         )
 
@@ -130,12 +127,15 @@ class MambaPrefillCheckpointBuilder:
         all_query_lens = m.query_start_loc_cpu.diff().tolist()
         query_lens = [all_query_lens[row] for row in request_rows]
         seq_lens = m.seq_lens_cpu_upper_bound.tolist()
-        checkpoint_offsets, checkpoint_cols = compute_mamba_prefill_checkpoints(
+        # A request reaches its prefill end once per block-table row, so the
+        # row's checkpoint block stays in the reserved column while it
+        # decodes. A decode row (at most `num_speculative_tokens + 1` tokens)
+        # must never pass the check below, or it would export into that block.
+        assert self.vllm_config.num_speculative_tokens < hash_block_size
+        checkpoint_offsets = compute_mamba_prefill_checkpoints(
             [seq_lens[row] for row in request_rows],
             query_lens,
             hash_block_size=hash_block_size,
-            # The reserved last column (`MambaSpec.reserves_prefill_checkpoint_col`).
-            checkpoint_col=m.block_table_tensor.shape[1] - 1,
             checkpoint_alignment=self.kv_cache_spec.prefill_checkpoint_alignment,
             drop_eagle_block=self.drop_eagle_block,
             cache_hit_alignment_tokens=cache_hit_alignment_tokens,
@@ -151,18 +151,14 @@ class MambaPrefillCheckpointBuilder:
         request_rows_tensor = async_tensor_h2d(
             request_rows, dtype=torch.int64, device=m.query_start_loc.device
         )
-        checkpoint_cols_tensor = async_tensor_h2d(
-            checkpoint_cols, dtype=torch.int64, device=m.query_start_loc.device
-        )
         return MambaPrefillCheckpointMetadata(
             checkpoint_offsets_tensor,
             _gather_checkpoint_state_indices(
-                m.block_table_tensor, request_rows_tensor, checkpoint_cols_tensor
+                m.block_table_tensor, request_rows_tensor, checkpoint_offsets_tensor
             ),
             offsets=checkpoint_offsets,
             query_lens=query_lens,
             request_rows=request_rows_tensor,
-            block_cols=checkpoint_cols_tensor,
         )
 
 

@@ -75,10 +75,17 @@ class BlockTables:
         self._reassigned_rows: set[int] = set()
 
         # num_kv_cache_groups x [max_num_reqs, max_num_blocks]
+        # A row of a group with the reserved column can take two writes a step:
+        # its new blocks and its checkpoint block.
         self.block_tables: list[StagedWriteTensor] = []
-        for max_num_blocks in max_num_blocks_per_group:
+        for max_num_blocks, reserved in zip(
+            max_num_blocks_per_group, reserved_last_col
+        ):
             block_table = StagedWriteTensor(
-                (self.max_num_reqs, max_num_blocks), dtype=torch.int32, device=device
+                (self.max_num_reqs, max_num_blocks),
+                dtype=torch.int32,
+                device=device,
+                max_writes=(1 + int(reserved)) * self.max_num_reqs,
             )
             self.block_tables.append(block_table)
 
@@ -89,7 +96,8 @@ class BlockTables:
         if self.num_kv_cache_groups > 1:
             # Only the multi-group path uses the fused writer.
             self.fused_writer = FusedStagedWriter(
-                self.device, self.num_kv_cache_groups * self.max_num_reqs
+                self.device,
+                (self.num_kv_cache_groups + sum(reserved_last_col)) * self.max_num_reqs,
             )
 
         # Block tables used for model's forward pass.
@@ -151,7 +159,10 @@ class BlockTables:
             if self.redirect_writes_to_null_block:
                 block_ids = [0] * len(block_ids)
             end = start + len(block_ids)
-            row_capacity = self.block_tables[i].gpu.shape[1]
+            # The reserved last column is not addressable by positions.
+            row_capacity = self.block_tables[i].gpu.shape[1] - int(
+                self._reserved_last_col[i]
+            )
             if end > row_capacity:
                 raise RuntimeError(
                     f"Block table write for request {req_index}, group {i} exceeds "

@@ -174,7 +174,10 @@ class StagedWriteTensor:
         device: torch.device,
         max_concurrency: int | None = None,
         uva_instead_of_gpu: bool = False,
+        max_writes: int | None = None,
     ):
+        """`max_writes`: staged writes per apply to size the buffers for
+        (default: one per row)."""
         if max_concurrency is None:
             max_concurrency = _DEFAULT_MAX_CONCURRENCY
         if dtype not in TORCH_DTYPE_TO_ARRAY_TYPECODE:
@@ -210,9 +213,10 @@ class StagedWriteTensor:
 
         new_buffer = partial(UvaBufferPool, max_concurrency=max_concurrency)
 
-        self.write_indices = new_buffer(self.num_rows, dtype=torch.int32)
-        self.write_starts = new_buffer(self.num_rows, dtype=torch.int32)
-        self.write_cu_lens = new_buffer(self.num_rows, dtype=torch.int32)
+        max_writes = max_writes or self.num_rows
+        self.write_indices = new_buffer(max_writes, dtype=torch.int32)
+        self.write_starts = new_buffer(max_writes, dtype=torch.int32)
+        self.write_cu_lens = new_buffer(max_writes, dtype=torch.int32)
         self.write_contents = new_buffer(1, dtype=dtype)
 
     def stage_write(

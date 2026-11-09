@@ -302,7 +302,7 @@ def test_mamba_checkpoint_hash_maps_only_to_checkpoint_block(
     step(first_chunk_blocks * block_size, prompt_tokens)
 
     checkpoint_position, _ = manager._checkpoints["r"]
-    checkpoint_block = manager.checkpoint_blocks["r"]
+    checkpoint_block = manager.new_checkpoint_blocks["r"]
     assert all(
         b.block_hash is None or b is checkpoint_block for b in speculative_blocks
     )
@@ -370,7 +370,7 @@ def test_mamba_checkpoint_gets_its_own_block(resume_at, prompt_tokens):
 
     checkpoint_position = (prompt_tokens - 1) // hash_block_size * hash_block_size
     assert manager._checkpoints["r"][0] == checkpoint_position
-    checkpoint_block = manager.checkpoint_blocks["r"]
+    checkpoint_block = manager.new_checkpoint_blocks["r"]
     assert checkpoint_block not in manager.req_to_blocks["r"]
     block_hash = request.block_hashes[checkpoint_position // hash_block_size - 1]
     assert pool.get_cached_block(block_hash, [0]) == [checkpoint_block]
@@ -388,7 +388,7 @@ def test_mamba_checkpoint_gets_its_own_block(resume_at, prompt_tokens):
     # cache keeps it under its key.
     assert checkpoint_block.ref_cnt == 1
     manager.remove_skipped_blocks("r", prompt_tokens)
-    assert "r" not in manager.checkpoint_blocks
+    assert "r" not in manager._checkpoint_blocks
     assert checkpoint_block.ref_cnt == 0
     assert pool.get_cached_block(block_hash, [0]) == [checkpoint_block]
 
@@ -435,7 +435,7 @@ def test_mamba_checkpoint_blocks_empty_outside_align_mode():
         scheduler_block_size=128,
     )
     assert not spec.reserves_prefill_checkpoint_col
-    assert not manager.checkpoint_blocks
+    assert not manager._checkpoint_blocks
 
 
 def test_mamba_checkpoint_block_freed_with_the_request():
@@ -468,13 +468,13 @@ def test_mamba_checkpoint_block_freed_with_the_request():
     manager.get_num_blocks_to_allocate("r", 100, [], 0, 0, 100, prefill_end=100)
     manager.allocate_new_blocks("r", 100, 100)
     manager.cache_blocks(request, 100, replay_boundaries=[])
-    checkpoint_block = manager.checkpoint_blocks["r"]
+    checkpoint_block = manager.new_checkpoint_blocks["r"]
 
     freed = manager.pop_blocks_for_free("r")
     assert checkpoint_block in freed
     pool.free_blocks(freed)
     assert pool.get_num_free_blocks() == num_free
-    assert not manager.checkpoint_blocks
+    assert not manager._checkpoint_blocks
 
 
 def get_sliding_window_manager(

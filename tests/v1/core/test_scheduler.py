@@ -93,6 +93,49 @@ from .utils import (
 pytestmark = pytest.mark.cpu_test
 
 
+def test_mamba_prefill_checkpoint_block_reaches_the_worker():
+    """A final prefill chunk runs in one step with its checkpoint in its own
+    block: the output names it, it is not in the request's block table, and
+    the request releases it, still cached, once the step is processed."""
+    block_size = 16
+    scheduler = create_scheduler(
+        model="Qwen/Qwen3-0.6B",
+        enable_prefix_caching=True,
+        block_size=block_size,
+        kv_cache_spec=MambaSpec(
+            block_size=block_size,
+            shapes=((1, 1),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode="align",
+            num_prefill_checkpoint_blocks=1,
+            prefill_checkpoint_alignment=1,
+        ),
+    )
+    # 40 tokens: the checkpoint at 32 lies in the same block as the prompt end.
+    (request,) = create_requests(
+        num_requests=1, num_tokens=40, block_size=block_size, max_tokens=4
+    )
+    scheduler.add_request(request)
+    prefill = scheduler.schedule()
+    assert prefill.num_scheduled_tokens[request.request_id] == 40
+    assert prefill.mamba_prefill_checkpoint_blocks is not None
+    (block_id,) = prefill.mamba_prefill_checkpoint_blocks[request.request_id].values()
+    assert (
+        block_id not in scheduler.kv_cache_manager.get_block_ids(request.request_id)[0]
+    )
+    block = scheduler.kv_cache_manager.block_pool.blocks[block_id]
+    assert block.block_hash_num_tokens == 32
+
+    scheduler.update_from_output(
+        prefill,
+        ModelRunnerOutput(req_ids=[request.request_id], sampled_token_ids=[[0]]),
+    )
+    decode = scheduler.schedule()
+    assert decode.mamba_prefill_checkpoint_blocks is None
+    assert block.ref_cnt == 0
+    assert block.block_hash_num_tokens == 32
+
+
 @pytest.mark.parametrize(
     ("async_scheduling", "outcome", "num_speculative_tokens"),
     [

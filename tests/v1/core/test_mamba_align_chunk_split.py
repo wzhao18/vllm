@@ -20,7 +20,7 @@ from vllm.utils.hashing import sha256
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import init_none_hash
-from vllm.v1.core.sched.scheduler import Scheduler, _stop_mamba_chunk_at_block_end
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -49,20 +49,17 @@ MAMBA_GROUP_ID = 1
         "query_end",
         "checkpoint_position",
         "hash_size",
-        "block_size",
         "alignment",
         "expected",
     ),
     [
-        (0, 100, 88, 8, 64, 16, False),
-        (0, 100, 96, 8, 64, 16, True),
-        (0, 100, 96, 8, 64, None, False),
-        (8, 100, 96, 8, 64, 16, False),
-        # Spanning one or two Mamba blocks is fine: the checkpoint has its own.
-        (15360, 16896, 16768, 128, 1536, 16, True),
-        (15360, 16960, 16896, 128, 1536, 16, True),
-        (15360, 16960, 16768, 128, 1536, 16, True),
-        (16064, 18433, 18432, 128, 1536, 16, False),
+        (0, 100, 88, 8, 16, False),
+        (0, 100, 96, 8, 16, True),
+        (0, 100, 96, 8, None, False),
+        (8, 100, 96, 8, 16, False),
+        # How many Mamba blocks the query spans does not matter.
+        (15360, 16896, 16768, 128, 16, True),
+        (16064, 18433, 18432, 128, 16, False),
     ],
 )
 def test_mamba_prefill_checkpoint_valid(
@@ -70,7 +67,6 @@ def test_mamba_prefill_checkpoint_valid(
     query_end: int,
     checkpoint_position: int,
     hash_size: int,
-    block_size: int,
     alignment: int | None,
     expected: bool,
 ) -> None:
@@ -251,17 +247,21 @@ def test_chunk_cut_short_from_mid_block_stops_at_block_end() -> None:
     """A chunk resuming mid-block that a cap ends short of the prefill exports
     no checkpoint, so it stops at the block's end."""
     (request,) = create_requests(1, num_tokens=5000, block_size=ATTN_BLOCK_SIZE)
-    assert _stop_mamba_chunk_at_block_end(request, 1984, 2000, MAMBA_BLOCK_SIZE) == (
-        2 * MAMBA_BLOCK_SIZE - 1984
+    stub = SimpleNamespace(
+        need_mamba_block_aligned_split=True,
+        cache_config=SimpleNamespace(block_size=MAMBA_BLOCK_SIZE),
     )
+
+    def stop(start, num_new_tokens):
+        return Scheduler._stop_mamba_chunk_at_block_end(
+            stub, request, start, num_new_tokens
+        )
+
+    assert stop(1984, 2000) == 2 * MAMBA_BLOCK_SIZE - 1984
     # The final chunk keeps running: it exports the checkpoint.
-    assert _stop_mamba_chunk_at_block_end(request, 1984, 3016, MAMBA_BLOCK_SIZE) == (
-        3016
-    )
+    assert stop(1984, 3016) == 3016
     # Block-aligned starts are untouched.
-    assert _stop_mamba_chunk_at_block_end(request, 1600, 2000, MAMBA_BLOCK_SIZE) == (
-        2000
-    )
+    assert stop(1600, 2000) == 2000
 
 
 def test_disabling_eagle_block_drop_keeps_the_trailing_cache_boundary() -> None:

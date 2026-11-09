@@ -4496,11 +4496,10 @@ def test_lookahead_checkpoint_has_available_hash(
     assert blocks is not None
     assert blocks[0].block_hash_num_tokens == expected_boundary
     if checkpoint_blocks:
-        offsets, _ = compute_mamba_prefill_checkpoints(
+        offsets = compute_mamba_prefill_checkpoints(
             [prompt_len],
             [prompt_len],
             hash_block_size=64,
-            checkpoint_col=0,
             checkpoint_alignment=64,
             drop_eagle_block=False,
             cache_hit_alignment_tokens=64,

@@ -880,14 +880,12 @@ class KVCacheManager:
         self, scheduled_request_ids: Container[str]
     ) -> dict[str, dict[int, int]]:
         """`{request id: {group id: block id}}` of the scheduled requests whose
-        step exports a Mamba prefill checkpoint. A request's checkpoint block is
-        released when its next step is scheduled, so a scheduled request holds
-        only the block of this step."""
+        step exports a Mamba prefill checkpoint."""
         block_ids: dict[str, dict[int, int]] = {}
         for mgr in self.coordinator.single_type_managers:
             if not isinstance(mgr, MambaManager):
                 continue
-            for request_id, block in mgr.checkpoint_blocks.items():
+            for request_id, block in mgr.new_checkpoint_blocks.items():
                 if request_id in scheduled_request_ids:
                     block_ids.setdefault(request_id, {})[mgr.kv_cache_group_id] = (
                         block.block_id

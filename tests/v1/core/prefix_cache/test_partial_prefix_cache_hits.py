@@ -657,7 +657,7 @@ def test_internal_checkpoint_uses_partial_hash_lifecycle():
     assert new_blocks is not None
     mamba_blocks = manager.get_blocks(request.request_id).blocks[1]
     mamba_manager = manager.coordinator.single_type_managers[1]
-    checkpoint_block = mamba_manager.checkpoint_blocks[request.request_id]
+    checkpoint_block = mamba_manager.new_checkpoint_blocks[request.request_id]
     running_block = mamba_blocks[3]
     assert not running_block.is_null
     # The checkpoint has its own block, outside the request's table; the table
@@ -871,7 +871,7 @@ def test_eagle_block_aligned_checkpoint_replaces_newer_hash():
     assert manager.allocate_slots(request, request.num_tokens) is not None
 
     mamba_manager = manager.coordinator.single_type_managers[1]
-    checkpoint_block = mamba_manager.checkpoint_blocks[request.request_id]
+    checkpoint_block = mamba_manager.new_checkpoint_blocks[request.request_id]
     checkpoint_hash = request.block_hashes[64 // hash_block_size - 1]
     checkpoint_hit = manager.block_pool.get_cached_block(checkpoint_hash, [1])
     assert checkpoint_hit is not None
@@ -2863,11 +2863,10 @@ def test_checkpoint_reservation_matches_worker(
     while start < num_tokens:
         end = min(start + chunk_blocks * mamba_block_size, num_tokens)
         assert manager.allocate_slots(request, end - start) is not None
-        offsets, _ = compute_mamba_prefill_checkpoints(
+        offsets = compute_mamba_prefill_checkpoints(
             [end],
             [end - start],
             hash_block_size=hash_block_size,
-            checkpoint_col=0,
             checkpoint_alignment=16,
             drop_eagle_block=use_eagle,
             cache_hit_alignment_tokens=mamba_manager.cache_hit_alignment_tokens,
@@ -2876,7 +2875,7 @@ def test_checkpoint_reservation_matches_worker(
         reserved = mamba_manager._checkpoints.get(request.request_id)
         if reserved is not None:
             assert offsets[0] and reserved[0] == start + offsets[0]
-            block = mamba_manager.checkpoint_blocks[request.request_id]
+            block = mamba_manager.new_checkpoint_blocks[request.request_id]
             assert block not in mamba_manager.req_to_blocks[request.request_id]
             assert retention_interval is None or end >= prefill_end
         request.num_computed_tokens = end

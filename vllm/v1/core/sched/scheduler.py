@@ -83,18 +83,6 @@ from vllm.v1.utils import record_function_or_nullcontext
 logger = init_logger(__name__)
 
 
-def _stop_mamba_chunk_at_block_end(
-    request: Request, start: int, num_new_tokens: int, block_size: int
-) -> int:
-    """A chunk that starts mid-block and ends short of the prefill exports no
-    checkpoint, so it must stop at the block's end: past it, the block's
-    full-block hash would name a state the block does not hold."""
-    prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
-    if start % block_size and start + num_new_tokens < prefill_end:
-        num_new_tokens = min(num_new_tokens, block_size - start % block_size)
-    return num_new_tokens
-
-
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -657,9 +645,22 @@ class Scheduler(SchedulerInterface):
         )
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)
-        return _stop_mamba_chunk_at_block_end(
-            request, start, max(end - start, 0), block_size
-        )
+        return max(end - start, 0)
+
+    def _stop_mamba_chunk_at_block_end(
+        self, request: Request, start: int, num_new_tokens: int
+    ) -> int:
+        """Cut a Mamba "align" chunk that starts mid-block and, after the caps
+        on its length, ends short of the prefill at the block's end. Such a
+        chunk exports no checkpoint, so past the block's end the block's
+        full-block hash would name a state the block does not hold."""
+        if not self.need_mamba_block_aligned_split:
+            return num_new_tokens
+        block_size = self.cache_config.block_size
+        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+        if start % block_size and start + num_new_tokens < prefill_end:
+            num_new_tokens = min(num_new_tokens, block_size - start % block_size)
+        return num_new_tokens
 
     def _get_local_prefix_cache_hit(
         self, request: Request, max_cache_hit_length: int | None = None
@@ -861,14 +862,9 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = self._reserve_prefill_lookahead(
                 request, request.num_computed_tokens, num_new_tokens
             )
-            if self.need_mamba_block_aligned_split:
-                # The caps above can cut a final chunk short.
-                num_new_tokens = _stop_mamba_chunk_at_block_end(
-                    request,
-                    request.num_computed_tokens,
-                    num_new_tokens,
-                    self.cache_config.block_size,
-                )
+            num_new_tokens = self._stop_mamba_chunk_at_block_end(
+                request, request.num_computed_tokens, num_new_tokens
+            )
 
             if num_new_tokens == 0:
                 # The request cannot be scheduled because one of the following
@@ -1406,14 +1402,9 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens = self._reserve_prefill_lookahead(
                         request, num_computed_tokens, num_new_tokens
                     )
-                    if self.need_mamba_block_aligned_split:
-                        # The caps above can cut a final chunk short.
-                        num_new_tokens = _stop_mamba_chunk_at_block_end(
-                            request,
-                            num_computed_tokens,
-                            num_new_tokens,
-                            self.cache_config.block_size,
-                        )
+                    num_new_tokens = self._stop_mamba_chunk_at_block_end(
+                        request, num_computed_tokens, num_new_tokens
+                    )
 
                     if (
                         request.has_encoder_inputs
@@ -1713,10 +1704,8 @@ class Scheduler(SchedulerInterface):
         pending_kv_cache_block_copies = kv_cache_block_copies or None
         mamba_prefill_checkpoint_blocks = (
             self.kv_cache_manager.get_mamba_prefill_checkpoint_blocks(
-                num_scheduled_tokens
+                num_scheduled_tokens.keys()
             )
-            if self.mamba_has_prefill_checkpoint_blocks
-            else None
         )
 
         # Dynamic speculative decoding: compute optimal K
