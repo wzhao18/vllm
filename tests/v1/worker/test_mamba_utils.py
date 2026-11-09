@@ -41,7 +41,6 @@ from vllm.v1.worker.mamba_utils import (
     _reinterpret_u64_as_i64,
     get_mamba_group_ids,
     get_mamba_groups,
-    get_prefill_checkpoint_group_ids,
     postprocess_mamba_fused_kernel,
 )
 from vllm.v1.worker.replayssm_utils import (
@@ -3062,28 +3061,3 @@ class TestPostprocessMambaFusedKernel:
             atol=0,
             msg="DS num_accepted_tokens result is wrong",
         )
-
-
-def test_prefill_checkpoint_groups_reserve_the_last_column():
-    """Only align-mode Mamba groups with checkpoints reserve the column."""
-
-    def mamba(num_prefill_checkpoint_blocks):
-        return MambaSpec(
-            block_size=64,
-            shapes=((1, 1),),
-            dtypes=(torch.float32,),
-            mamba_cache_mode="align",
-            num_prefill_checkpoint_blocks=num_prefill_checkpoint_blocks,
-            prefill_checkpoint_alignment=16 if num_prefill_checkpoint_blocks else None,
-        )
-
-    kv_cache_config = KVCacheConfig(
-        num_blocks=16,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(["a"], mamba(1)),
-            KVCacheGroupSpec(["b"], mamba(0)),
-            KVCacheGroupSpec(["c"], mamba(1)),
-        ],
-    )
-    assert get_prefill_checkpoint_group_ids(kv_cache_config) == [0, 2]

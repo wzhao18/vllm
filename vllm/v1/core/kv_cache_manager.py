@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
-from collections.abc import Sequence
+from collections.abc import Container, Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
 
@@ -876,30 +876,23 @@ class KVCacheManager:
                 blocks = mgr.req_to_blocks[request_id]
                 mgr.new_block_ids.extend(blk.block_id for blk in blocks[start_idx:])
 
-    def drop_mamba_prefill_checkpoint(self, request: Request) -> None:
-        """Discard the prefill checkpoint of a step that will not run."""
-        for mgr in self.coordinator.single_type_managers:
-            if isinstance(mgr, MambaManager):
-                mgr.drop_prefill_checkpoint(request.request_id)
-
-    def take_mamba_prefill_checkpoint_blocks(
-        self,
-    ) -> tuple[dict[str, dict[int, int]], list[KVCacheBlock]]:
-        """Drain this step's Mamba prefill checkpoint blocks.
-
-        Returns the per-request ``{group id: block id}`` the worker exports to,
-        and the blocks whose request reference the caller releases once the
-        step has run.
-        """
+    def get_mamba_prefill_checkpoint_blocks(
+        self, scheduled_request_ids: Container[str]
+    ) -> dict[str, dict[int, int]]:
+        """`{request id: {group id: block id}}` of the scheduled requests whose
+        step exports a Mamba prefill checkpoint. A request's checkpoint block is
+        released when its next step is scheduled, so a scheduled request holds
+        only the block of this step."""
         block_ids: dict[str, dict[int, int]] = {}
-        blocks: list[KVCacheBlock] = []
         for mgr in self.coordinator.single_type_managers:
             if not isinstance(mgr, MambaManager):
                 continue
-            for req_id, block in mgr.take_prefill_checkpoint_blocks():
-                block_ids.setdefault(req_id, {})[mgr.kv_cache_group_id] = block.block_id
-                blocks.append(block)
-        return block_ids, blocks
+            for request_id, block in mgr.checkpoint_blocks.items():
+                if request_id in scheduled_request_ids:
+                    block_ids.setdefault(request_id, {})[mgr.kv_cache_group_id] = (
+                        block.block_id
+                    )
+        return block_ids
 
     def take_kv_cache_block_copies(
         self,

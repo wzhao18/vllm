@@ -69,12 +69,10 @@ class BlockTables:
             reserved_last_col = [False] * self.num_kv_cache_groups
         assert len(reserved_last_col) == self.num_kv_cache_groups
         self._reserved_last_col = reserved_last_col
-        self._reserved_last_col_groups = [
-            i for i, reserved in enumerate(reserved_last_col) if reserved
-        ]
-        # Request rows whose reserved column holds a block id, cleared the
-        # next step they get none.
-        self._reserved_last_col_rows: set[int] = set()
+        self._has_reserved_last_col = any(reserved_last_col)
+        # Rows given to a new or resumed request this step: their reserved
+        # column must not keep the row's previous checkpoint block.
+        self._reassigned_rows: set[int] = set()
 
         # num_kv_cache_groups x [max_num_reqs, max_num_blocks]
         self.block_tables: list[StagedWriteTensor] = []
@@ -145,6 +143,8 @@ class BlockTables:
         new_block_ids: tuple[list[int], ...],
         overwrite: bool,
     ) -> None:
+        if overwrite and self._has_reserved_last_col:
+            self._reassigned_rows.add(req_index)
         for i in range(self.num_kv_cache_groups):
             start = self.num_blocks.np[i, req_index] if not overwrite else 0
             block_ids = new_block_ids[i]
@@ -164,22 +164,25 @@ class BlockTables:
         self, block_ids_by_row: dict[int, dict[int, int]]
     ) -> None:
         """Stage each request row's prefill checkpoint block into its groups'
-        reserved last column, and clear rows that had one last step.
+        reserved last column, with the step's other block-table writes. A row
+        given to a new or resumed request gets the null block instead.
 
-        Rides the step's staged block-table writes: no extra transfer.
+        Call once per step, after the step's `append_block_ids`: each entry is
+        staged once, so the fused write has no conflicting writes.
         """
-        if not self._reserved_last_col_groups:
+        if not self._has_reserved_last_col:
             return
-        for row in self._reserved_last_col_rows - block_ids_by_row.keys():
-            for group_id in self._reserved_last_col_groups:
-                table = self.block_tables[group_id]
-                table.stage_write(row, table.gpu.shape[1] - 1, (NULL_BLOCK_ID,))
         for row, block_ids in block_ids_by_row.items():
             for group_id, block_id in block_ids.items():
                 assert self._reserved_last_col[group_id]
                 table = self.block_tables[group_id]
                 table.stage_write(row, table.gpu.shape[1] - 1, (block_id,))
-        self._reserved_last_col_rows = set(block_ids_by_row)
+        for row in self._reassigned_rows:
+            for group_id, reserved in enumerate(self._reserved_last_col):
+                if reserved and group_id not in block_ids_by_row.get(row, {}):
+                    table = self.block_tables[group_id]
+                    table.stage_write(row, table.gpu.shape[1] - 1, (NULL_BLOCK_ID,))
+        self._reassigned_rows.clear()
 
     def apply_staged_writes(self) -> None:
         if self.num_kv_cache_groups == 0:

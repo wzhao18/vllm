@@ -188,7 +188,6 @@ from vllm.v1.worker.gpu.ubatch_utils import (
     maybe_build_ubatch_runner,
 )
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
-from vllm.v1.worker.mamba_utils import get_prefill_checkpoint_group_ids
 from vllm.v1.worker.replayssm_utils import get_replayssm_block_copy_tensors
 from vllm.v1.worker.utils import (
     KVBlockZeroer,
@@ -680,6 +679,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         slot_mapping_enabled = []
         dcp_sharded = []
         sliding_window_reach = []
+        reserved_last_col = []
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             spec = kv_cache_group.kv_cache_spec
             block_sizes.append(spec.block_size)
@@ -692,6 +692,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 layer_spec.num_retained_tokens
                 if isinstance(layer_spec, SlidingWindowSpec)
                 else 0
+            )
+            reserved_last_col.append(
+                isinstance(layer_spec, MambaSpec)
+                and layer_spec.reserves_prefill_checkpoint_col
             )
             # Let each cache type account for CP. Attention KV is DCP-sharded,
             # while Mamba/GDN recurrent state is replicated across DCP ranks.
@@ -755,11 +759,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             copy_admitted_drafts_to_host=self.batch_sharder is not None,
         )
 
-        checkpoint_group_ids = get_prefill_checkpoint_group_ids(kv_cache_config)
-        reserved_last_col = [
-            i in checkpoint_group_ids
-            for i in range(len(kv_cache_config.kv_cache_groups))
-        ]
         self.block_tables = BlockTables(
             block_sizes=block_sizes,
             max_num_reqs=self.max_num_reqs,

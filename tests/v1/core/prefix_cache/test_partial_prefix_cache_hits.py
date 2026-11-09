@@ -657,7 +657,7 @@ def test_internal_checkpoint_uses_partial_hash_lifecycle():
     assert new_blocks is not None
     mamba_blocks = manager.get_blocks(request.request_id).blocks[1]
     mamba_manager = manager.coordinator.single_type_managers[1]
-    _, checkpoint_block, _ = mamba_manager._checkpoints[request.request_id]
+    checkpoint_block = mamba_manager.checkpoint_blocks[request.request_id]
     running_block = mamba_blocks[3]
     assert not running_block.is_null
     # The checkpoint has its own block, outside the request's table; the table
@@ -871,7 +871,7 @@ def test_eagle_block_aligned_checkpoint_replaces_newer_hash():
     assert manager.allocate_slots(request, request.num_tokens) is not None
 
     mamba_manager = manager.coordinator.single_type_managers[1]
-    _, checkpoint_block, _ = mamba_manager._checkpoints[request.request_id]
+    checkpoint_block = mamba_manager.checkpoint_blocks[request.request_id]
     checkpoint_hash = request.block_hashes[64 // hash_block_size - 1]
     checkpoint_hit = manager.block_pool.get_cached_block(checkpoint_hash, [1])
     assert checkpoint_hit is not None
@@ -2875,9 +2875,8 @@ def test_checkpoint_reservation_matches_worker(
         )
         reserved = mamba_manager._checkpoints.get(request.request_id)
         if reserved is not None:
-            position, block, _ = reserved
-            assert offsets[0] and position == start + offsets[0]
-            assert block is not None
+            assert offsets[0] and reserved[0] == start + offsets[0]
+            block = mamba_manager.checkpoint_blocks[request.request_id]
             assert block not in mamba_manager.req_to_blocks[request.request_id]
             assert retention_interval is None or end >= prefill_end
         request.num_computed_tokens = end

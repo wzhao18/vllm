@@ -12,7 +12,6 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.kv_cache_interface import (
     MambaSpec,
-    get_mamba_prefill_checkpoint_col,
     get_mamba_prefill_checkpoint_position,
     is_mamba_prefill_checkpoint_valid,
 )
@@ -135,9 +134,8 @@ class MambaPrefillCheckpointBuilder:
             [seq_lens[row] for row in request_rows],
             query_lens,
             hash_block_size=hash_block_size,
-            checkpoint_col=get_mamba_prefill_checkpoint_col(
-                m.block_table_tensor.shape[1]
-            ),
+            # The reserved last column (`MambaSpec.reserves_prefill_checkpoint_col`).
+            checkpoint_col=m.block_table_tensor.shape[1] - 1,
             checkpoint_alignment=self.kv_cache_spec.prefill_checkpoint_alignment,
             drop_eagle_block=self.drop_eagle_block,
             cache_hit_alignment_tokens=cache_hit_alignment_tokens,

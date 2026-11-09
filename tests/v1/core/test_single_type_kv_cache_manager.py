@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import random
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -224,6 +225,7 @@ def test_mamba_checkpoint_admission_matches_allocation(
             num_local_computed_tokens=total_computed_tokens,
             num_tokens_main_model=num_tokens,
             apply_admission_cap=apply_admission_cap,
+            prefill_end=prompt_tokens,
         )
 
     estimate(computed_tokens, 0, False)
@@ -280,7 +282,9 @@ def test_mamba_checkpoint_hash_maps_only_to_checkpoint_block(
     )
 
     def step(start, end):
-        estimate = manager.get_num_blocks_to_allocate("r", end, [], start, start, end)
+        estimate = manager.get_num_blocks_to_allocate(
+            "r", end, [], start, start, end, prefill_end=prompt_tokens
+        )
         free_before = pool.get_num_free_blocks()
         manager.allocate_new_blocks("r", end, end)
         assert free_before - pool.get_num_free_blocks() == estimate
@@ -297,7 +301,8 @@ def test_mamba_checkpoint_hash_maps_only_to_checkpoint_block(
     manager.new_step_starts()
     step(first_chunk_blocks * block_size, prompt_tokens)
 
-    checkpoint_position, checkpoint_block, _ = manager._checkpoints["r"]
+    checkpoint_position, _ = manager._checkpoints["r"]
+    checkpoint_block = manager.checkpoint_blocks["r"]
     assert all(
         b.block_hash is None or b is checkpoint_block for b in speculative_blocks
     )
@@ -364,8 +369,8 @@ def test_mamba_checkpoint_gets_its_own_block(resume_at, prompt_tokens):
     step(resume_at, prompt_tokens)
 
     checkpoint_position = (prompt_tokens - 1) // hash_block_size * hash_block_size
-    position, checkpoint_block, _ = manager._checkpoints["r"]
-    assert position == checkpoint_position
+    assert manager._checkpoints["r"][0] == checkpoint_position
+    checkpoint_block = manager.checkpoint_blocks["r"]
     assert checkpoint_block not in manager.req_to_blocks["r"]
     block_hash = request.block_hashes[checkpoint_position // hash_block_size - 1]
     assert pool.get_cached_block(block_hash, [0]) == [checkpoint_block]
@@ -379,19 +384,43 @@ def test_mamba_checkpoint_gets_its_own_block(resume_at, prompt_tokens):
     ):
         assert manager.req_to_blocks["r"][resumed_block_idx].block_hash is None
 
-    # The scheduler takes the block with the step; the request holds no other
-    # reference to it.
-    assert manager.take_prefill_checkpoint_blocks() == [("r", checkpoint_block)]
-    assert not manager._checkpoints
+    # The request holds the block until its next step is scheduled; the prefix
+    # cache keeps it under its key.
     assert checkpoint_block.ref_cnt == 1
+    manager.remove_skipped_blocks("r", prompt_tokens)
+    assert "r" not in manager.checkpoint_blocks
+    assert checkpoint_block.ref_cnt == 0
+    assert pool.get_cached_block(block_hash, [0]) == [checkpoint_block]
 
 
-def test_mamba_checkpoint_dropped_when_its_step_never_runs():
-    """A request preempted in the pass that scheduled it leaves no key on a
-    block nothing will write."""
-    block_size = 128
+@pytest.mark.parametrize("num_prefill_checkpoint_blocks", [0, 1])
+def test_mamba_block_table_reserves_a_checkpoint_column(
+    num_prefill_checkpoint_blocks,
+):
+    """Rows end in one column for the checkpoint block, beyond every position
+    and speculative column."""
     spec = MambaSpec(
-        block_size=block_size,
+        block_size=128,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        num_speculative_blocks=3,
+        num_prefill_checkpoint_blocks=num_prefill_checkpoint_blocks,
+        prefill_checkpoint_alignment=16 if num_prefill_checkpoint_blocks else None,
+    )
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(mamba_cache_mode="align")
+    )
+    assert spec.reserves_prefill_checkpoint_col == bool(num_prefill_checkpoint_blocks)
+    assert spec.max_num_blocks_per_req(vllm_config, 1000) == (
+        8 + 3 + num_prefill_checkpoint_blocks
+    )
+
+
+def test_mamba_checkpoint_block_freed_with_the_request():
+    """A request freed before its next step returns its checkpoint block."""
+    spec = MambaSpec(
+        block_size=128,
         shapes=((1, 1),),
         dtypes=(torch.float32,),
         mamba_cache_mode="align",
@@ -418,15 +447,13 @@ def test_mamba_checkpoint_dropped_when_its_step_never_runs():
     manager.get_num_blocks_to_allocate("r", 100, [], 0, 0, 100, prefill_end=100)
     manager.allocate_new_blocks("r", 100, 100)
     manager.cache_blocks(request, 100, replay_boundaries=[])
-    _, checkpoint_block, _ = manager._checkpoints["r"]
-    assert checkpoint_block.block_hash is not None
+    checkpoint_block = manager.checkpoint_blocks["r"]
 
-    manager.drop_prefill_checkpoint("r")
-    pool.free_blocks(manager.pop_blocks_for_free("r"))
-    assert checkpoint_block.block_hash is None
-    assert not manager.take_pending_boundary_state_offloads()
+    freed = manager.pop_blocks_for_free("r")
+    assert checkpoint_block in freed
+    pool.free_blocks(freed)
     assert pool.get_num_free_blocks() == num_free
-    assert manager.take_prefill_checkpoint_blocks() == []
+    assert not manager.checkpoint_blocks
 
 
 def get_sliding_window_manager(

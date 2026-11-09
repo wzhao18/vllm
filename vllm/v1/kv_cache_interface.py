@@ -1145,6 +1145,16 @@ class MambaSpec(KVCacheSpec):
             assert self.page_size_padded % self.state_alignment == 0, (
                 "page_size_padded must be aligned to state_alignment"
             )
+        # One checkpoint per prefill step, exported to one block.
+        assert self.num_prefill_checkpoint_blocks in (0, 1)
+
+    @property
+    def reserves_prefill_checkpoint_col(self) -> bool:
+        """Whether block-table rows end in a column holding the step's prefill
+        checkpoint block rather than a position's state."""
+        return (
+            self.mamba_cache_mode == "align" and self.num_prefill_checkpoint_blocks > 0
+        )
 
     @property
     def state_content_size_bytes(self) -> int:
@@ -1185,14 +1195,11 @@ class MambaSpec(KVCacheSpec):
             # even though only 2 + num_speculative_blocks state blocks are
             # resident at a time (earlier states are nulled out by
             # remove_skipped_blocks), so the row length must cover max_len
-            # rather than max_memory_usage_bytes. The row's last
-            # `num_prefill_checkpoint_blocks` entries are not position-indexed:
-            # the worker writes the step's prefill checkpoint block there (see
-            # `get_mamba_prefill_checkpoint_col`).
+            # rather than max_memory_usage_bytes.
             return (
                 cdiv(max_len, self.block_size)
                 + self.num_speculative_blocks
-                + self.num_prefill_checkpoint_blocks
+                + int(self.reserves_prefill_checkpoint_col)
             )
         return cdiv(self.max_memory_usage_bytes(vllm_config), self.page_size_bytes)
 
@@ -1229,17 +1236,6 @@ def get_mamba_prefill_checkpoint_position(
     if drop_eagle_block:
         checkpoint_position -= hash_block_size
     return max(checkpoint_position, 0)
-
-
-def get_mamba_prefill_checkpoint_col(block_table_width: int) -> int:
-    """Block-table column the worker writes the prefill checkpoint block to.
-
-    The checkpoint block is not position-indexed: the scheduler hands it to the
-    worker per step (`SchedulerOutput.mamba_prefill_checkpoint_blocks`), and
-    the worker writes it into this reserved last column of each Mamba group's
-    block table before building attention metadata.
-    """
-    return block_table_width - 1
 
 
 def is_mamba_prefill_checkpoint_valid(

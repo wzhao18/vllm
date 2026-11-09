@@ -656,22 +656,6 @@ def _get_mamba_spec_for_layer(
     return kv_cache_spec
 
 
-def get_prefill_checkpoint_group_ids(kv_cache_config: KVCacheConfig) -> list[int]:
-    """KV cache groups whose block tables reserve a prefill checkpoint column."""
-    group_ids = []
-    for i, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
-        spec = kv_cache_group.kv_cache_spec
-        if isinstance(spec, UniformTypeKVCacheSpecs):
-            spec = spec.first_spec
-        if (
-            isinstance(spec, MambaSpec)
-            and spec.mamba_cache_mode == "align"
-            and spec.num_prefill_checkpoint_blocks > 0
-        ):
-            group_ids.append(i)
-    return group_ids
-
-
 def get_mamba_group_ids(mamba_groups: dict[MambaSpec, list[int]]) -> list[int]:
     """Return the sorted group ids of all mamba groups, without duplicates.
 
