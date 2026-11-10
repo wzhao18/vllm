@@ -88,7 +88,11 @@ def _situ_forward(
 
 
 def prepare_megamoe(model: torch.nn.Module, vllm_config) -> None:
-    """Launch the SM107 wide-EP kernel from every FP8 x FP4 SiTU ``DeepGemmMegaMoEExperts``."""
+    """Launch the SM107 wide-EP kernel from every FP8 x FP4 SiTU ``DeepGemmMegaMoEExperts``.
+    DeepGEMM MegaMoE only: nothing to do for any other MoE backend
+    (``kimi_k3_mega_moe`` runs its own vendored kernels)."""
+    if vllm_config.kernel_config.moe_backend != "deep_gemm_mega_moe":
+        return
     from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import (
         DeepGemmMegaMoEExperts,
     )

@@ -169,7 +169,15 @@ def _mega_moe_may_use_deep_gemm(
     if _mega_moe_uses_mega_gate(module):
         return module.use_native_mega_moe
     kimi = sys.modules.get("vllm.models.kimi_k3.nvidia.model")
-    return kimi is not None and isinstance(module, kimi.KimiMoE) and module.use_mega_moe
+    if not (
+        kimi is not None and isinstance(module, kimi.KimiMoE) and module.use_mega_moe
+    ):
+        return False
+    # Kimi K3 on kimi_k3_mega_moe runs its own kernels (warmed at load), not DeepGEMM.
+    rubin = sys.modules.get("vllm.models.kimi_k3.nvidia.megamoe_rubin.experts")
+    return rubin is None or not isinstance(
+        getattr(module, "experts", None), rubin.KimiK3MegaMoEExperts
+    )
 
 
 FP8_GEMM_NT_WARMUP_CACHE: set[torch.Size] = set()

@@ -307,6 +307,7 @@ def test_shard_sequence_parallel_mlp_gating(
     ("moe_backend", "all2all_backend", "expected"),
     [
         ("deep_gemm_mega_moe", "naive", True),
+        ("kimi_k3_mega_moe", "naive", True),
         ("auto", "deepep_v2", True),
         ("auto", "deepep_low_latency", False),
     ],

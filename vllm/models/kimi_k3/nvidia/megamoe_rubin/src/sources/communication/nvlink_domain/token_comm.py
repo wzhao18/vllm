@@ -94,6 +94,18 @@ def _copy_atom(dtype, num_bits_per_copy: int):
     return cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), dtype, num_bits_per_copy=num_bits_per_copy)
 
 
+@cute.jit
+def _warp_inclusive_sum(value: Int32, lane_idx: Int32) -> Int32:
+    """Inclusive prefix sum of one value per lane across the warp (a lane below the step ignores what it read)."""
+    inclusive = value
+    for step_log in cutlass.range_constexpr(5):
+        step = Int32(1 << step_log)
+        previous = Int32(cute.arch.shuffle_sync(inclusive, lane_idx - step))
+        if lane_idx >= step:
+            inclusive = inclusive + previous
+    return inclusive
+
+
 class _MetadataPushRouter(KernelComponent):
     """Sort and push routing metadata into each destination rank's final pool."""
 
@@ -116,6 +128,14 @@ class _MetadataPushRouter(KernelComponent):
     router_size_counter_region = "nvlink.token_comm.router_size_counter"
     router_histogram_done_region = "nvlink.token_comm.router_histogram_done"
     source_base_ready_region = "nvlink.token_comm.source_base_ready"
+    # Decode landing (trace-time gate ``decode_landing``): sources store each route's metadata straight into the
+    # destination's landing rows at sizes time, so sizes_ready publishes sizes and metadata in one cross-rank round.
+    src_prefix_by_rank_region = "nvlink.token_comm.src_prefix_by_rank"
+    landing_metadata_region = "nvlink.token_comm.landing_metadata"
+    landing_scores_region = "nvlink.token_comm.landing_scores"
+    decode_landing_max_routes: ClassVar[int] = 4096
+    decode_landing_max_world_size: ClassVar[int] = 32
+    decode_sizes_poll_sleep_cycles: ClassVar[int] = 200
 
     router_data_histogram_region = "nvlink.token_comm.router_smem.data_histogram"
     router_data_prefix_region = "nvlink.token_comm.router_smem.data_prefix"
@@ -164,8 +184,21 @@ class _MetadataPushRouter(KernelComponent):
         self.expert_count_with_trash = self.expert_count_padded + 1
         self.router_elements_per_lane, self.router_data_cta_count = self._router_launch_configuration()
         self.router_tokens_per_cta = self.router_elements_per_lane * self.router_warps_per_cta * 32
-        self.router_push_cta_count = ceil_div(self.expert_count, self.router_warps_per_cta)
-        self.router_grid_cta_count = max(self.router_data_cta_count + 1, self.router_push_cta_count)
+        # Decode gate (trace time, no env): this rank's routes fit one data CTA, and one lane per source rank.
+        self.decode_landing = (
+            self.max_tokens_per_rank * self.topk <= self.decode_landing_max_routes
+            and self.world_size <= self.decode_landing_max_world_size
+            and self.router_data_cta_count == 1
+        )
+        # A source sends at most max_tokens_per_rank * topk routes to one destination: the landing row capacity.
+        self.landing_capacity_per_source = self.max_tokens_per_rank * self.topk
+        if self.decode_landing:
+            # One CTA: histogram, publish sizes + prefixes + landing metadata behind sizes_ready, exit.
+            self.router_push_cta_count = 0
+            self.router_grid_cta_count = self.router_data_cta_count
+        else:
+            self.router_push_cta_count = ceil_div(self.expert_count, self.router_warps_per_cta)
+            self.router_grid_cta_count = max(self.router_data_cta_count + 1, self.router_push_cta_count)
         if self.router_grid_cta_count > self.promised_launchable_sm_count:
             raise ValueError(
                 "Router grid exceeds promised_launchable_sm_count; all metadata-push CTAs must be concurrently resident."
@@ -284,6 +317,64 @@ class _MetadataPushRouter(KernelComponent):
         self._register_router_workspace(workspace)
 
     def _register_router_workspace(self, workspace: DeviceWorkspace) -> None:
+        if self.decode_landing:
+            self._register_landing_router_workspace(workspace)
+        else:
+            self._register_push_router_workspace(workspace)
+
+    def _register_landing_router_workspace(self, workspace: DeviceWorkspace) -> None:
+        """Decode regions: size exchange, source prefix rows and landing rows. No sort/push tables, no metadata_ready.
+
+        sizes_by_rank, src_prefix_by_rank and the landing rows are rewritten by their source every launch before it
+        publishes sizes_ready, and are read only after sizes_ready, so they need no reset.
+        """
+        workspace.register(
+            self.sizes_by_rank_region,
+            cutlass.Int32,
+            (self.world_size, self.expert_count_padded),
+            buffer_space="shared",
+            stride=(self.expert_count_padded, 1),
+        )
+        workspace.register(
+            self.sizes_region, cutlass.Int32, (self.expert_count_padded,), buffer_space="shared", reset="tail_reset"
+        )
+        workspace.register(self.sizes_ready_region, cutlass.Int32, (1,), buffer_space="shared", reset="tail_reset")
+        workspace.register(
+            self.src_prefix_by_rank_region,
+            cutlass.Int32,
+            (self.world_size, self.expert_count_padded),
+            buffer_space="shared",
+            stride=(self.expert_count_padded, 1),
+        )
+        workspace.register(
+            self.landing_metadata_region,
+            cutlass.Int64,
+            (self.world_size, self.landing_capacity_per_source),
+            buffer_space="shared",
+            stride=(self.landing_capacity_per_source, 1),
+            byte_alignment=16,
+        )
+        if self.apply_topk_at_fc1:
+            workspace.register(
+                self.landing_scores_region,
+                cutlass.Float32,
+                (self.world_size, self.landing_capacity_per_source),
+                buffer_space="shared",
+                stride=(self.landing_capacity_per_source, 1),
+            )
+        workspace.register(
+            self.token_src_metadata_region,
+            cutlass.Int64,
+            (self.worst_case_token_count,),
+            buffer_space="shared",
+            byte_alignment=16,
+        )
+        if self.apply_topk_at_fc1:
+            workspace.register(
+                self.fc1_topk_scores_region, cutlass.Float32, (self.worst_case_token_count,), buffer_space="shared"
+            )
+
+    def _register_push_router_workspace(self, workspace: DeviceWorkspace) -> None:
         maximum_routed_tokens = self.max_tokens_per_rank * self.topk
         workspace.register(
             self.sizes_by_rank_region,
@@ -412,12 +503,15 @@ class _MetadataPushRouter(KernelComponent):
         self._router_warp_idx = warp_idx
         self._router_lane_idx = lane_idx
 
-        if cutlass.const_expr(self.router_data_cta_count == 1):
-            self._router_single_cta(topk_indices, topk_scores, smem_base)
+        if cutlass.const_expr(self.decode_landing):
+            self._router_landing_single_cta(topk_indices, topk_scores, smem_base)
         else:
-            self._router_multiple_ctas(topk_indices, topk_scores, smem_base)
-        if linear_cta_idx < Int32(self.router_push_cta_count):
-            self._router_push_metadata()
+            if cutlass.const_expr(self.router_data_cta_count == 1):
+                self._router_single_cta(topk_indices, topk_scores, smem_base)
+            else:
+                self._router_multiple_ctas(topk_indices, topk_scores, smem_base)
+            if linear_cta_idx < Int32(self.router_push_cta_count):
+                self._router_push_metadata()
 
         device_workspace.remove_device_members()
         self._device_workspace = None
@@ -494,6 +588,125 @@ class _MetadataPushRouter(KernelComponent):
             iket.range_pop()
         elif self._router_linear_cta_idx == Int32(self.router_data_cta_count):
             self._router_helper_single_cta(smem_base)
+
+    @cute.jit
+    def _router_landing_single_cta(
+        self, topk_indices: cute.Tensor, topk_scores: Optional[cute.Tensor], smem_base: cute.Pointer
+    ) -> None:
+        """Decode router (the only CTA): histogram, then size rows, source-prefix rows and every route's metadata
+        to its destination, all published by the single sizes_ready flag."""
+        block_thread_count = self.router_warps_per_cta * 32
+        histogram = self._router_smem_workspace.tensor(self.router_data_histogram_region, smem_base)
+        prefix = self._router_smem_workspace.tensor(self.router_data_prefix_region, smem_base)
+        warp_totals = self._router_smem_workspace.tensor(self.router_data_warp_totals_region, smem_base)
+
+        zero_round_count = ceil_div(self.expert_count_with_trash, block_thread_count)
+        for zero_round in cutlass.range_constexpr(zero_round_count):
+            expert = Int32(zero_round * block_thread_count) + self._router_thread_idx
+            if expert < Int32(self.expert_count_with_trash):
+                histogram[expert] = Int32(0)
+
+        iket.range_push("router.histogram")
+        expert_registers, score_registers = self._load_router_inputs(topk_indices, topk_scores)
+        cute.arch.sync_threads()
+        within_expert_indices = self._build_histogram(expert_registers, histogram)
+        iket.range_pop()
+
+        iket.range_push("router.prefix_and_rows")
+        expert_counts = cute.make_tensor(histogram.iterator, cute.make_layout((self.expert_count_padded,)))
+        source_prefix = cute.make_tensor(prefix.iterator, cute.make_layout((self.expert_count_padded,)))
+        publish_sizes = self._broadcast_sizes_to_peers(expert_counts)
+        smem_exclusive_prefix(
+            expert_counts,
+            source_prefix,
+            warp_totals,
+            block_thread_count,
+            self._router_thread_idx,
+            self._router_lane_idx,
+            self._router_warp_idx,
+        )
+        self._broadcast_source_prefix_to_peers(source_prefix)
+        iket.range_pop()
+
+        iket.range_push("router.landing_push")
+        self._push_landing_metadata(
+            expert_registers, within_expert_indices, score_registers, source_prefix, topk_indices.dtype
+        )
+        iket.range_pop()
+
+        iket.range_push("router.publish_sizes")
+        # wait_group(0) covers the size, total and prefix bulk copies; the fence orders the landing stores too.
+        publish_sizes()
+        iket.range_pop()
+
+    @cute.jit
+    def _broadcast_source_prefix_to_peers(self, source_prefix: cute.Tensor) -> None:
+        """Bulk-copy this rank's exclusive per-expert prefix into row local_rank of every peer's src_prefix_by_rank.
+
+        Completion is awaited by the size publisher's finalize(), which runs after these copies are committed.
+        """
+        cute.arch.fence_proxy(kind="async.shared", space="cta")
+        cute.arch.sync_threads()
+        row_bytes = Int32(self.expert_count_padded * 4)
+        matrix_address = self._device_workspace.ptr(self.src_prefix_by_rank_region).toint()
+        rank_round_count = ceil_div(self.world_size, self.router_warps_per_cta)
+        for rank_round in cutlass.range_constexpr(rank_round_count):
+            destination_rank = self._router_warp_idx + Int32(rank_round * self.router_warps_per_cta)
+            if destination_rank < Int32(self.world_size):
+                peer_offset = self._peer_rank_ptr_mapper.map(Int64(0), destination_rank, Int64(0))
+                destination_row_address = (
+                    matrix_address
+                    + peer_offset
+                    + Int64(Int32(self._router_local_rank) * Int32(self.expert_count_padded)) * Int64(4)
+                )
+                destination_row = cute.make_ptr(
+                    cutlass.Int32, destination_row_address, AddressSpace.gmem, assumed_align=16
+                )
+                with cute.arch.elect_one():
+                    cp_async_bulk_s2g(destination_row, source_prefix.iterator, row_bytes)
+                    cute.arch.cp_async_bulk_commit_group()
+
+    @cute.jit
+    def _push_landing_metadata(
+        self,
+        expert_registers: cute.Tensor,
+        within_expert_indices: cute.Tensor,
+        score_registers: Optional[cute.Tensor],
+        source_prefix: cute.Tensor,
+        topk_index_type: type,
+    ) -> None:
+        """Store each valid route at landing[local_rank][slot] on its destination rank.
+
+        slot = (routes of this rank to the destination's earlier experts) + within, i.e. the route's position in this
+        rank's expert-major run for that destination; within is the histogram atomic return used by the old sort.
+        """
+        register_count = cute.size(expert_registers)
+        landing_metadata_address = self._device_workspace.ptr(self.landing_metadata_region).toint()
+        if cutlass.const_expr(self.apply_topk_at_fc1):
+            landing_scores_address = self._device_workspace.ptr(self.landing_scores_region).toint()
+        source_row_begin = Int64(Int32(self._router_local_rank)) * Int64(self.landing_capacity_per_source)
+        for register_idx in cutlass.range_constexpr(register_count):
+            expert = expert_registers[register_idx]
+            if expert != Int32(self.expert_count_padded):
+                token_idx, topk_slot = self._router_value_coordinate(register_idx, topk_index_type)
+                destination_rank = expert // Int32(self.experts_per_rank)
+                destination_expert_begin = destination_rank * Int32(self.experts_per_rank)
+                landing_slot = (
+                    source_prefix[expert] - source_prefix[destination_expert_begin] + within_expert_indices[register_idx]
+                )
+                landing_index = source_row_begin + Int64(landing_slot)
+                peer_offset = self._peer_rank_ptr_mapper.map(Int64(0), destination_rank, Int64(0))
+                metadata = TokenSrcMetadata(
+                    src_rank=Int32(self._router_local_rank), src_token=token_idx, src_topk=topk_slot
+                )
+                stg_b64(
+                    landing_metadata_address + peer_offset + landing_index * Int64(TokenSrcMetadata.nbytes),
+                    metadata.pack(),
+                )
+                if cutlass.const_expr(self.apply_topk_at_fc1):
+                    stg_f32(
+                        landing_scores_address + peer_offset + landing_index * Int64(4), score_registers[register_idx]
+                    )
 
     @cute.jit
     def _router_multiple_ctas(
@@ -1096,6 +1309,9 @@ class TokenCommNonDeterministic(KernelComponent):
     pre_reduced_activation_region = "nvlink.token_comm.pre_reduced_activation"
     pre_reduced_activation_sf_region = "nvlink.token_comm.pre_reduced_activation_sf"
     token_back_schedule_region = "nvlink.token_comm.token_back_schedule"
+    token_in_schedule_region = "nvlink.token_comm.token_in_schedule"
+    # Decode buckets claim token_in work dynamically (late-entering CTAs must not own pulls); prefill keeps the static stride.
+    token_in_dynamic_claim_max_routes: ClassVar[int] = 4096
 
     token_in_mbarrier_region = "nvlink.token_comm.main_smem.token_in_mbarriers"
     token_back_mbarrier_region = "nvlink.token_comm.main_smem.token_back_mbarriers"
@@ -1153,11 +1369,18 @@ class TokenCommNonDeterministic(KernelComponent):
         self.token_in_flag_batch = impl_desc["token_in_flag_batch"]
         self.token_back_mode: TokenBackMode = impl_desc["token_back_mode"]
         self.token_back_schedule_mode: TokenBackScheduleMode = impl_desc["token_back_schedule_mode"]
+        self.token_in_dynamic_claim = (
+            problem_desc["max_tokens_per_rank"] * problem_desc["topk"] <= self.token_in_dynamic_claim_max_routes
+        )
         self.reduce_topk_in_kernel = impl_desc["reduce_topk_in_kernel"]
         self.router_smem_limit_bytes = impl_desc.get("router_smem_limit_bytes", 227 * 1024)
 
         self._validate_configuration()
         self._router = _MetadataPushRouter(problem_desc, impl_desc)
+        self.decode_landing = self._router.decode_landing
+        # The landing token_in path lives inside S0's dynamic-claim loop (both gates are T * topk <= 4096).
+        if self.decode_landing and not self.token_in_dynamic_claim:
+            raise AssertionError("decode_landing requires token_in_dynamic_claim.")
         self._nvlink_barrier = NvlinkBarrier(world_size=self.world_size, barrier_id=self.grid_sync_barrier_id)
         self.tail_reset_single_cta = False
         self._device_workspace = None
@@ -1342,9 +1565,15 @@ class TokenCommNonDeterministic(KernelComponent):
     def local_expert_sizes(self, device_workspace: DeviceWorkspace, local_rank: Int32) -> cute.Tensor:
         return self._router.local_expert_sizes(device_workspace, local_rank)
 
+    def _sizes_poll_sleep_cycles(self, sleep_cycles: int) -> int:
+        """sizes_ready is the only dispatch gate in decode buckets: poll it more tightly there."""
+        if self.decode_landing:
+            return min(sleep_cycles, self._router.decode_sizes_poll_sleep_cycles)
+        return sleep_cycles
+
     @cute.jit
     def wait_for_sizes_ready(self, device_workspace: DeviceWorkspace, sleep_cycles: int = 1000) -> None:
-        self._router.wait_for_sizes_ready(device_workspace, sleep_cycles)
+        self._router.wait_for_sizes_ready(device_workspace, self._sizes_poll_sleep_cycles(sleep_cycles))
 
     @cute.jit
     def token_src_metadata_tensor(self, device_workspace: DeviceWorkspace) -> cute.Tensor:
@@ -1460,6 +1689,10 @@ class TokenCommNonDeterministic(KernelComponent):
         if self.token_back_enabled and self.token_back_schedule_mode == "atomic_counter":
             workspace.register(
                 self.token_back_schedule_region, cutlass.Int32, (1,), buffer_space="local", reset="tail_reset"
+            )
+        if self.token_in_dynamic_claim:
+            workspace.register(
+                self.token_in_schedule_region, cutlass.Int32, (1,), buffer_space="local", reset="tail_reset"
             )
 
         if not self.reduce_topk_in_kernel:
@@ -1623,11 +1856,17 @@ class TokenCommNonDeterministic(KernelComponent):
         global_warp_count = Int32(self.promised_launchable_sm_count * self.transfer_warp_count)
 
         sizes = self._router.sizes_tensor(self._device_workspace)
-        pool_expert_bases = self._router.pool_expert_base_tensor(self._device_workspace)
+        if cutlass.const_expr(self.decode_landing):
+            # Pool bases are the running padded prefix of the owned sizes; metadata comes from the landing rows.
+            pool_expert_bases = None
+            sizes_by_rank = self._device_workspace.tensor(self._router.sizes_by_rank_region)
+            source_prefix_by_rank = self._device_workspace.tensor(self._router.src_prefix_by_rank_region)
+        else:
+            pool_expert_bases = self._router.pool_expert_base_tensor(self._device_workspace)
         token_metadata_pointer = self._router.token_src_metadata_pointer(self._device_workspace)
 
         iket.range_push("token_in.wait_sizes_ready")
-        self._router.wait_for_sizes_ready(self._device_workspace)
+        self._router.wait_for_sizes_ready(self._device_workspace, self._sizes_poll_sleep_cycles(1000))
         iket.range_pop()
         iket.range_push("token_in.stage_sizes")
         owned_sizes = smem_workspace.tensor(self.expert_sizes_smem_region, smem_base)
@@ -1654,9 +1893,10 @@ class TokenCommNonDeterministic(KernelComponent):
                 )
         iket.range_pop()
 
-        iket.range_push("token_in.wait_metadata_ready")
-        self._router.wait_for_metadata_ready(self._device_workspace)
-        iket.range_pop()
+        if cutlass.const_expr(not self.decode_landing):
+            iket.range_push("token_in.wait_metadata_ready")
+            self._router.wait_for_metadata_ready(self._device_workspace)
+            iket.range_pop()
 
         for size_copy_round in cutlass.range_constexpr(size_copy_rounds):
             vector_idx = Int32(size_copy_round * self.transfer_thread_count) + transfer_thread_idx
@@ -1700,6 +1940,8 @@ class TokenCommNonDeterministic(KernelComponent):
         sf_copy_atom = _copy_atom(self.activation_sf_dtype, sf_copy_elements * int(self.activation_sf_dtype.width))
 
         next_dense_token = global_warp_idx
+        if cutlass.const_expr(self.token_in_dynamic_claim):
+            next_dense_token = self.claim_token_in()
         expert_valid_begin = Int32(0)
         expert_sf_begin = Int32(0)
         expert_ready_slot_begin = Int32(0)
@@ -1712,99 +1954,250 @@ class TokenCommNonDeterministic(KernelComponent):
             thread_idx=lane_idx,
         )
 
-        local_expert = Int32(0)
-        while local_expert < Int32(self.experts_per_rank):
-            expert_token_count = owned_sizes[local_expert]
-            expert_valid_end = expert_valid_begin + expert_token_count
-            pull_count = Int32(0)
-            if next_dense_token < expert_valid_end:
-                pull_count = (expert_valid_end - next_dense_token + global_warp_count - Int32(1)) // global_warp_count
+        if cutlass.const_expr(not self.token_in_dynamic_claim):
+            local_expert = Int32(0)
+            while local_expert < Int32(self.experts_per_rank):
+                expert_token_count = owned_sizes[local_expert]
+                expert_valid_end = expert_valid_begin + expert_token_count
+                pull_count = Int32(0)
+                if next_dense_token < expert_valid_end:
+                    pull_count = (expert_valid_end - next_dense_token + global_warp_count - Int32(1)) // global_warp_count
 
-            for pull_round in cutlass.range(pull_count, unroll=1):
-                dense_token_idx = next_dense_token + Int32(pull_round) * global_warp_count
-                token_in_expert = dense_token_idx - expert_valid_begin
-                pool_token_idx = pool_expert_bases[local_expert] + token_in_expert
-                sf_token_idx = expert_sf_begin + token_in_expert
-                ready_slot_idx = expert_ready_slot_begin + token_in_expert // Int32(self.tokens_per_fc1_ready_slot)
+                for pull_round in cutlass.range(pull_count, unroll=1):
+                    dense_token_idx = next_dense_token + Int32(pull_round) * global_warp_count
+                    token_in_expert = dense_token_idx - expert_valid_begin
+                    pool_token_idx = pool_expert_bases[local_expert] + token_in_expert
+                    sf_token_idx = expert_sf_begin + token_in_expert
+                    ready_slot_idx = expert_ready_slot_begin + token_in_expert // Int32(self.tokens_per_fc1_ready_slot)
 
-                metadata = TokenSrcMetadata.load(
-                    token_metadata_pointer.toint() + Int64(pool_token_idx) * Int64(TokenSrcMetadata.nbytes)
-                )
-                peer_offset = self._token_comm_args.peer_rank_ptr_mapper.map(Int64(0), metadata.src_rank, Int64(0))
-                remote_activation_address = (
-                    self._token_comm_args.activation.iterator.toint()
-                    + peer_offset
-                    + Int64(metadata.src_token) * Int64(self.bytes_per_token)
-                )
-                remote_sf = cute.make_tensor(
-                    cute.make_ptr(
-                        self._token_comm_args.activation_sf.dtype,
-                        self._token_comm_args.activation_sf.iterator.toint() + peer_offset,
-                        AddressSpace.gmem,
-                        assumed_align=(self._token_comm_args.activation_sf.iterator.max_alignment),
-                    ),
-                    self._token_comm_args.activation_sf.layout,
-                )
-                remote_sf_row = remote_sf[Int64(metadata.src_token), None]
-
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        warp_mbarrier, Int32(activation_bytes + activation_sf_bytes)
+                    metadata = TokenSrcMetadata.load(
+                        token_metadata_pointer.toint() + Int64(pool_token_idx) * Int64(TokenSrcMetadata.nbytes)
                     )
-                    tma_load_1d(
-                        warp_activation_stage.iterator,
-                        Int64(remote_activation_address),
-                        warp_mbarrier,
-                        Int32(activation_bytes),
+                    peer_offset = self._token_comm_args.peer_rank_ptr_mapper.map(Int64(0), metadata.src_rank, Int64(0))
+                    remote_activation_address = (
+                        self._token_comm_args.activation.iterator.toint()
+                        + peer_offset
+                        + Int64(metadata.src_token) * Int64(self.bytes_per_token)
                     )
-                    tma_load_1d(
-                        warp_sf_stage.iterator, remote_sf_row.iterator, warp_mbarrier, Int32(activation_sf_bytes)
+                    remote_sf = cute.make_tensor(
+                        cute.make_ptr(
+                            self._token_comm_args.activation_sf.dtype,
+                            self._token_comm_args.activation_sf.iterator.toint() + peer_offset,
+                            AddressSpace.gmem,
+                            assumed_align=(self._token_comm_args.activation_sf.iterator.max_alignment),
+                        ),
+                        self._token_comm_args.activation_sf.layout,
                     )
-                cute.arch.sync_warp()
-                cute.arch.mbarrier_wait(warp_mbarrier, pull_phase)
+                    remote_sf_row = remote_sf[Int64(metadata.src_token), None]
 
-                destination_activation = cute.make_ptr(
-                    self.activation_dtype,
-                    fc1_activation_pointer.toint() + Int64(pool_token_idx) * Int64(self.bytes_per_token),
-                    AddressSpace.gmem,
-                    assumed_align=16,
-                )
-                with cute.arch.elect_one():
-                    cp_async_bulk_s2g(destination_activation, warp_activation_stage.iterator, Int32(activation_bytes))
-                cute.arch.sync_warp()
-                cute.arch.cp_async_bulk_commit_group()
-
-                destination_sf_row = fc1_activation_sf[Int64(sf_token_idx), ((None, None), None)]
-                destination_sf_values = cute.slice_(destination_sf_row, (0, None, None))
-                destination_sf_values = cute.group_modes(destination_sf_values, 0, 2)
-                destination_sf_vectors = cute.zipped_divide(destination_sf_values, (sf_copy_elements,))
-                sf_vector_count = cute.size(destination_sf_vectors, mode=[1])
-                for sf_round in cutlass.range_constexpr(ceil_div(sf_vector_count, 32)):
-                    sf_vector_idx = Int32(sf_round * 32) + lane_idx
-                    if sf_vector_idx < Int32(sf_vector_count):
-                        cute.copy(
-                            sf_copy_atom,
-                            source_sf_vectors[None, sf_vector_idx],
-                            destination_sf_vectors[None, sf_vector_idx],
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive_and_expect_tx(
+                            warp_mbarrier, Int32(activation_bytes + activation_sf_bytes)
                         )
+                        tma_load_1d(
+                            warp_activation_stage.iterator,
+                            Int64(remote_activation_address),
+                            warp_mbarrier,
+                            Int32(activation_bytes),
+                        )
+                        tma_load_1d(
+                            warp_sf_stage.iterator, remote_sf_row.iterator, warp_mbarrier, Int32(activation_sf_bytes)
+                        )
+                    cute.arch.sync_warp()
+                    cute.arch.mbarrier_wait(warp_mbarrier, pull_phase)
 
-                cute.arch.cp_async_bulk_wait_group(0, read=True)
-                cute.arch.sync_warp()
-                ready_address = (fc1_ready_counter + ready_slot_idx).toint()
-                flag_tracker = flag_tracker.accumulate(Int32(0), self.token_in_flag_batch, ready_address)
-                cute.arch.sync_warp()
-                pull_phase = pull_phase ^ Int32(1)
+                    destination_activation = cute.make_ptr(
+                        self.activation_dtype,
+                        fc1_activation_pointer.toint() + Int64(pool_token_idx) * Int64(self.bytes_per_token),
+                        AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    with cute.arch.elect_one():
+                        cp_async_bulk_s2g(destination_activation, warp_activation_stage.iterator, Int32(activation_bytes))
+                    cute.arch.sync_warp()
+                    cute.arch.cp_async_bulk_commit_group()
 
-            next_dense_token = next_dense_token + pull_count * global_warp_count
-            expert_valid_begin = expert_valid_end
-            expert_sf_begin = expert_sf_begin + (
-                (expert_token_count + Int32(self.sf_padding_block - 1)) // Int32(self.sf_padding_block)
-            ) * Int32(self.sf_padding_block)
-            expert_ready_slot_begin = expert_ready_slot_begin + (
-                (expert_token_count + Int32(self.tokens_per_fc1_ready_slot - 1))
-                // Int32(self.tokens_per_fc1_ready_slot)
-            )
-            local_expert = local_expert + Int32(1)
+                    destination_sf_row = fc1_activation_sf[Int64(sf_token_idx), ((None, None), None)]
+                    destination_sf_values = cute.slice_(destination_sf_row, (0, None, None))
+                    destination_sf_values = cute.group_modes(destination_sf_values, 0, 2)
+                    destination_sf_vectors = cute.zipped_divide(destination_sf_values, (sf_copy_elements,))
+                    sf_vector_count = cute.size(destination_sf_vectors, mode=[1])
+                    for sf_round in cutlass.range_constexpr(ceil_div(sf_vector_count, 32)):
+                        sf_vector_idx = Int32(sf_round * 32) + lane_idx
+                        if sf_vector_idx < Int32(sf_vector_count):
+                            cute.copy(
+                                sf_copy_atom,
+                                source_sf_vectors[None, sf_vector_idx],
+                                destination_sf_vectors[None, sf_vector_idx],
+                            )
+
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+                    cute.arch.sync_warp()
+                    ready_address = (fc1_ready_counter + ready_slot_idx).toint()
+                    flag_tracker = flag_tracker.accumulate(Int32(0), self.token_in_flag_batch, ready_address)
+                    cute.arch.sync_warp()
+                    pull_phase = pull_phase ^ Int32(1)
+
+                next_dense_token = next_dense_token + pull_count * global_warp_count
+                expert_valid_begin = expert_valid_end
+                expert_sf_begin = expert_sf_begin + (
+                    (expert_token_count + Int32(self.sf_padding_block - 1)) // Int32(self.sf_padding_block)
+                ) * Int32(self.sf_padding_block)
+                expert_ready_slot_begin = expert_ready_slot_begin + (
+                    (expert_token_count + Int32(self.tokens_per_fc1_ready_slot - 1))
+                    // Int32(self.tokens_per_fc1_ready_slot)
+                )
+                local_expert = local_expert + Int32(1)
+        else:
+            # Decode landing state (loop-carried in this branch only).
+            expert_pool_begin = Int32(0)
+            lane_source_size = Int32(0)
+            lane_landing_base = Int32(0)
+            lane_ring_end = Int32(0)
+            local_expert = Int32(0)
+            while local_expert < Int32(self.experts_per_rank):
+                expert_token_count = owned_sizes[local_expert]
+                expert_valid_end = expert_valid_begin + expert_token_count
+                pull_count = Int32(0)
+                if cutlass.const_expr(not self.token_in_dynamic_claim):
+                    if next_dense_token < expert_valid_end:
+                        pull_count = (expert_valid_end - next_dense_token + global_warp_count - Int32(1)) // global_warp_count
+                else:
+                    # Dynamic claim: one pull per loop trip while the claimed token lies in this expert.
+                    if next_dense_token < expert_valid_end:
+                        pull_count = Int32(1)
+                if cutlass.const_expr(self.decode_landing):
+                    if pull_count > Int32(0):
+                        # Ring table of this expert, once per expert visit with work: lane l <-> source (rank + l) % W.
+                        owner_column = owner_expert_begin + local_expert
+                        lane_source_size = Int32(0)
+                        lane_landing_base = Int32(0)
+                        if lane_idx < Int32(self.world_size):
+                            lane_source_rank = (self._local_rank + lane_idx) % Int32(self.world_size)
+                            lane_source_size = sizes_by_rank[lane_source_rank, owner_column]
+                            lane_landing_base = (
+                                source_prefix_by_rank[lane_source_rank, owner_column]
+                                - source_prefix_by_rank[lane_source_rank, owner_expert_begin]
+                            )
+                        lane_ring_end = _warp_inclusive_sum(lane_source_size, lane_idx)
+                pull_round = Int32(0)
+                while pull_round < pull_count:
+                    dense_token_idx = next_dense_token + pull_round * global_warp_count
+                    if cutlass.const_expr(self.token_in_dynamic_claim):
+                        dense_token_idx = next_dense_token
+                    token_in_expert = dense_token_idx - expert_valid_begin
+                    if cutlass.const_expr(self.decode_landing):
+                        pool_token_idx = expert_pool_begin + token_in_expert
+                    else:
+                        pool_token_idx = pool_expert_bases[local_expert] + token_in_expert
+                    sf_token_idx = expert_sf_begin + token_in_expert
+                    ready_slot_idx = expert_ready_slot_begin + token_in_expert // Int32(self.tokens_per_fc1_ready_slot)
+
+                    if cutlass.const_expr(self.decode_landing):
+                        metadata = self._land_route_metadata(
+                            token_in_expert,
+                            pool_token_idx,
+                            lane_source_size,
+                            lane_landing_base,
+                            lane_ring_end,
+                            token_metadata_pointer,
+                        )
+                    else:
+                        metadata = TokenSrcMetadata.load(
+                            token_metadata_pointer.toint() + Int64(pool_token_idx) * Int64(TokenSrcMetadata.nbytes)
+                        )
+                    peer_offset = self._token_comm_args.peer_rank_ptr_mapper.map(Int64(0), metadata.src_rank, Int64(0))
+                    remote_activation_address = (
+                        self._token_comm_args.activation.iterator.toint()
+                        + peer_offset
+                        + Int64(metadata.src_token) * Int64(self.bytes_per_token)
+                    )
+                    remote_sf = cute.make_tensor(
+                        cute.make_ptr(
+                            self._token_comm_args.activation_sf.dtype,
+                            self._token_comm_args.activation_sf.iterator.toint() + peer_offset,
+                            AddressSpace.gmem,
+                            assumed_align=(self._token_comm_args.activation_sf.iterator.max_alignment),
+                        ),
+                        self._token_comm_args.activation_sf.layout,
+                    )
+                    remote_sf_row = remote_sf[Int64(metadata.src_token), None]
+
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive_and_expect_tx(
+                            warp_mbarrier, Int32(activation_bytes + activation_sf_bytes)
+                        )
+                        tma_load_1d(
+                            warp_activation_stage.iterator,
+                            Int64(remote_activation_address),
+                            warp_mbarrier,
+                            Int32(activation_bytes),
+                        )
+                        tma_load_1d(
+                            warp_sf_stage.iterator, remote_sf_row.iterator, warp_mbarrier, Int32(activation_sf_bytes)
+                        )
+                    cute.arch.sync_warp()
+                    upcoming_token = next_dense_token
+                    if cutlass.const_expr(self.token_in_dynamic_claim):
+                        upcoming_token = self.claim_token_in()  # overlaps the payload transfer
+                    cute.arch.mbarrier_wait(warp_mbarrier, pull_phase)
+
+                    destination_activation = cute.make_ptr(
+                        self.activation_dtype,
+                        fc1_activation_pointer.toint() + Int64(pool_token_idx) * Int64(self.bytes_per_token),
+                        AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    with cute.arch.elect_one():
+                        cp_async_bulk_s2g(destination_activation, warp_activation_stage.iterator, Int32(activation_bytes))
+                    cute.arch.sync_warp()
+                    cute.arch.cp_async_bulk_commit_group()
+
+                    destination_sf_row = fc1_activation_sf[Int64(sf_token_idx), ((None, None), None)]
+                    destination_sf_values = cute.slice_(destination_sf_row, (0, None, None))
+                    destination_sf_values = cute.group_modes(destination_sf_values, 0, 2)
+                    destination_sf_vectors = cute.zipped_divide(destination_sf_values, (sf_copy_elements,))
+                    sf_vector_count = cute.size(destination_sf_vectors, mode=[1])
+                    for sf_round in cutlass.range_constexpr(ceil_div(sf_vector_count, 32)):
+                        sf_vector_idx = Int32(sf_round * 32) + lane_idx
+                        if sf_vector_idx < Int32(sf_vector_count):
+                            cute.copy(
+                                sf_copy_atom,
+                                source_sf_vectors[None, sf_vector_idx],
+                                destination_sf_vectors[None, sf_vector_idx],
+                            )
+
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+                    cute.arch.sync_warp()
+                    ready_address = (fc1_ready_counter + ready_slot_idx).toint()
+                    flag_tracker = flag_tracker.accumulate(Int32(0), self.token_in_flag_batch, ready_address)
+                    cute.arch.sync_warp()
+                    pull_phase = pull_phase ^ Int32(1)
+                    if cutlass.const_expr(self.token_in_dynamic_claim):
+                        next_dense_token = upcoming_token
+                        pull_count = Int32(0)
+                        if next_dense_token < expert_valid_end:
+                            pull_count = Int32(1)
+                        pull_round = Int32(0)
+                    else:
+                        pull_round = pull_round + Int32(1)
+
+                if cutlass.const_expr(not self.token_in_dynamic_claim):
+                    next_dense_token = next_dense_token + pull_count * global_warp_count
+                if cutlass.const_expr(self.decode_landing):
+                    # == pool_expert_base[local_expert + 1] of _compute_push_tables (padded prefix of owned sizes).
+                    expert_pool_begin = expert_pool_begin + (
+                        (expert_token_count + Int32(self.token_padding_block - 1)) // Int32(self.token_padding_block)
+                    ) * Int32(self.token_padding_block)
+                expert_valid_begin = expert_valid_end
+                expert_sf_begin = expert_sf_begin + (
+                    (expert_token_count + Int32(self.sf_padding_block - 1)) // Int32(self.sf_padding_block)
+                ) * Int32(self.sf_padding_block)
+                expert_ready_slot_begin = expert_ready_slot_begin + (
+                    (expert_token_count + Int32(self.tokens_per_fc1_ready_slot - 1))
+                    // Int32(self.tokens_per_fc1_ready_slot)
+                )
+                local_expert = local_expert + Int32(1)
 
         flag_tracker.fire()
         cute.arch.sync_warp()
@@ -1885,7 +2278,10 @@ class TokenCommNonDeterministic(KernelComponent):
             )
             sizes_ready_barrier.arrive_and_wait()
 
-        pool_expert_bases = self._router.pool_expert_base_tensor(self._device_workspace)
+        if cutlass.const_expr(self.decode_landing):
+            pool_expert_bases = None
+        else:
+            pool_expert_bases = self._router.pool_expert_base_tensor(self._device_workspace)
         token_metadata_pointer = self._router.token_src_metadata_pointer(self._device_workspace)
         fc2_done = self._device_workspace.ptr(self.fc2_done_region)
         if cutlass.const_expr(self.token_back_push_data):
@@ -1920,175 +2316,407 @@ class TokenCommNonDeterministic(KernelComponent):
         transfer_phase = Int32(0)
 
         iket.range_push("token_back.work")
-        local_expert = Int32(0)
-        while local_expert < Int32(self.experts_per_rank):
-            expert_token_count = owned_sizes[local_expert]
-            expert_valid_end = expert_valid_begin + expert_token_count
-            if next_dense_token < expert_valid_end:
-                token_tile_count = (expert_token_count + Int32(self.tokens_per_fc1_ready_slot - 1)) // Int32(
-                    self.tokens_per_fc1_ready_slot
-                )
-                completion_target = token_tile_count * Int32(self.fc2_done_signals_per_token_tile)
-                iket.range_push("token_back.wait_fc2")
-                while cute.arch.load(fc2_done + local_expert, Int32, sem="acquire", scope="gpu") < completion_target:
-                    nanosleep(500)
-                iket.range_pop()
-
-            while next_dense_token < expert_valid_end:
-                token_in_expert = next_dense_token - expert_valid_begin
-                pool_token_idx = pool_expert_bases[local_expert] + token_in_expert
-                metadata = TokenSrcMetadata.load(
-                    token_metadata_pointer.toint() + Int64(pool_token_idx) * Int64(TokenSrcMetadata.nbytes)
-                )
-                destination_topk = metadata.src_topk
-                if cutlass.const_expr(self.reduce_topk_in_kernel):
-                    destination_topk = Int32(0)
-                peer_offset = self._token_comm_args.peer_rank_ptr_mapper.map(Int64(0), metadata.src_rank, Int64(0))
-                is_remote_token = metadata.src_rank != self._local_rank
-
-                if cutlass.const_expr(self.token_back_push_data):
-                    iket.range_push("token_back.push_data")
-                    local_activation_address = fc2_activation_pointer.toint() + Int64(pool_token_idx) * Int64(
-                        output_token_bytes
+        if cutlass.const_expr(not self.decode_landing):
+            local_expert = Int32(0)
+            while local_expert < Int32(self.experts_per_rank):
+                expert_token_count = owned_sizes[local_expert]
+                expert_valid_end = expert_valid_begin + expert_token_count
+                if next_dense_token < expert_valid_end:
+                    token_tile_count = (expert_token_count + Int32(self.tokens_per_fc1_ready_slot - 1)) // Int32(
+                        self.tokens_per_fc1_ready_slot
                     )
-                    remote_activation = cute.make_tensor(
-                        cute.make_ptr(
-                            self._token_comm_args.pre_reduced_activation.dtype,
-                            self._token_comm_args.pre_reduced_activation.iterator.toint() + peer_offset,
-                            AddressSpace.gmem,
-                            assumed_align=(self._token_comm_args.pre_reduced_activation.iterator.max_alignment),
-                        ),
-                        self._token_comm_args.pre_reduced_activation.layout,
-                    )
-                    destination_row = remote_activation[Int64(metadata.src_token), destination_topk, None]
-                    for chunk_idx in cutlass.range_constexpr(activation_chunk_count):
-                        chunk_byte_offset = Int64(chunk_idx * activation_chunk_bytes)
-                        chunk_bytes_this_round = min(
-                            activation_chunk_bytes, output_token_bytes - chunk_idx * activation_chunk_bytes
-                        )
-                        current_chunk_bytes = Int32(chunk_bytes_this_round)
-                        current_window_unit = ceil_div(chunk_bytes_this_round * 2, 3)
-                        stateless_data_pacing_enabled = (
-                            self.token_back_mode != "reuse_dispatch_warps"
-                            and current_window_unit > self.minimum_pacing_window_cycles
-                        )
-                        round_start_clock = Int64(0)
-                        cute.arch.sync_warp()
-                        if cutlass.const_expr(reuse_data_pacing_enabled or stateless_data_pacing_enabled):
-                            if is_remote_token:
-                                round_start_clock = read_clock64()
-                            else:
-                                round_start_clock = round_start_clock
-                        with cute.arch.elect_one():
-                            cute.arch.mbarrier_arrive_and_expect_tx(worker_mbarrier, current_chunk_bytes)
-                            tma_load_1d(
-                                worker_activation_stage.iterator,
-                                local_activation_address + chunk_byte_offset,
-                                worker_mbarrier,
-                                current_chunk_bytes,
-                            )
-                        cute.arch.mbarrier_wait(worker_mbarrier, transfer_phase)
-                        destination_chunk = cute.make_ptr(
-                            cutlass.Uint8,
-                            destination_row.iterator.toint() + chunk_byte_offset,
-                            AddressSpace.gmem,
-                            assumed_align=16,
-                        )
-                        with cute.arch.elect_one():
-                            if cutlass.const_expr(self.reduce_topk_in_kernel):
-                                cp_reduce_async_bulk_add_bf16_s2g(
-                                    destination_chunk, worker_activation_stage.iterator, current_chunk_bytes
-                                )
-                            else:
-                                cp_async_bulk_s2g(
-                                    destination_chunk, worker_activation_stage.iterator, current_chunk_bytes
-                                )
-                        cute.arch.cp_async_bulk_commit_group()
-                        cute.arch.cp_async_bulk_wait_group(0)
-                        transfer_phase = transfer_phase ^ Int32(1)
-                        cute.arch.sync_warp()
-                        if cutlass.const_expr(reuse_data_pacing_enabled):
-                            if is_remote_token:
-                                current_window = Int32(read_clock64() - round_start_clock)
-                                data_average_window = self._adaptive_pace(
-                                    data_average_window, current_window, data_low_window, data_high_window
-                                )
-                        elif cutlass.const_expr(stateless_data_pacing_enabled):
-                            if is_remote_token:
-                                current_window = Int32(read_clock64() - round_start_clock)
-                                self._stateless_pace(Int32(current_window_unit), current_window)
+                    completion_target = token_tile_count * Int32(self.fc2_done_signals_per_token_tile)
+                    iket.range_push("token_back.wait_fc2")
+                    while cute.arch.load(fc2_done + local_expert, Int32, sem="acquire", scope="gpu") < completion_target:
+                        nanosleep(500)
                     iket.range_pop()
 
-                if cutlass.const_expr(self.token_back_push_sf):
-                    iket.range_push("token_back.push_sf")
-                    local_sf_address = fc2_sf_pointer.toint() + Int64(pool_token_idx) * Int64(output_sf_bytes)
-                    remote_sf = cute.make_tensor(
-                        cute.make_ptr(
-                            self._token_comm_args.pre_reduced_activation_sf.dtype,
-                            self._token_comm_args.pre_reduced_activation_sf.iterator.toint() + peer_offset,
-                            AddressSpace.gmem,
-                            assumed_align=(self._token_comm_args.pre_reduced_activation_sf.iterator.max_alignment),
-                        ),
-                        self._token_comm_args.pre_reduced_activation_sf.layout,
+                while next_dense_token < expert_valid_end:
+                    token_in_expert = next_dense_token - expert_valid_begin
+                    pool_token_idx = pool_expert_bases[local_expert] + token_in_expert
+                    metadata = TokenSrcMetadata.load(
+                        token_metadata_pointer.toint() + Int64(pool_token_idx) * Int64(TokenSrcMetadata.nbytes)
                     )
-                    destination_sf_row = remote_sf[Int64(metadata.src_token), destination_topk, None]
-                    for chunk_idx in cutlass.range_constexpr(sf_chunk_count):
-                        chunk_byte_offset = Int64(chunk_idx * sf_chunk_bytes)
-                        chunk_bytes_this_round = min(sf_chunk_bytes, output_sf_bytes - chunk_idx * sf_chunk_bytes)
-                        current_chunk_bytes = Int32(chunk_bytes_this_round)
-                        current_window_unit = ceil_div(chunk_bytes_this_round * 2, 3)
-                        stateless_sf_pacing_enabled = (
-                            self.token_back_mode != "reuse_dispatch_warps"
-                            and current_window_unit > self.minimum_pacing_window_cycles
+                    destination_topk = metadata.src_topk
+                    if cutlass.const_expr(self.reduce_topk_in_kernel):
+                        destination_topk = Int32(0)
+                    peer_offset = self._token_comm_args.peer_rank_ptr_mapper.map(Int64(0), metadata.src_rank, Int64(0))
+                    is_remote_token = metadata.src_rank != self._local_rank
+
+                    if cutlass.const_expr(self.token_back_push_data):
+                        iket.range_push("token_back.push_data")
+                        local_activation_address = fc2_activation_pointer.toint() + Int64(pool_token_idx) * Int64(
+                            output_token_bytes
                         )
-                        round_start_clock = Int64(0)
-                        cute.arch.sync_warp()
-                        if cutlass.const_expr(reuse_sf_pacing_enabled or stateless_sf_pacing_enabled):
-                            if is_remote_token:
-                                round_start_clock = read_clock64()
-                            else:
-                                round_start_clock = round_start_clock
-                        with cute.arch.elect_one():
-                            cute.arch.mbarrier_arrive_and_expect_tx(worker_mbarrier, current_chunk_bytes)
-                            tma_load_1d(
-                                worker_sf_stage.iterator,
-                                local_sf_address + chunk_byte_offset,
-                                worker_mbarrier,
-                                current_chunk_bytes,
+                        remote_activation = cute.make_tensor(
+                            cute.make_ptr(
+                                self._token_comm_args.pre_reduced_activation.dtype,
+                                self._token_comm_args.pre_reduced_activation.iterator.toint() + peer_offset,
+                                AddressSpace.gmem,
+                                assumed_align=(self._token_comm_args.pre_reduced_activation.iterator.max_alignment),
+                            ),
+                            self._token_comm_args.pre_reduced_activation.layout,
+                        )
+                        destination_row = remote_activation[Int64(metadata.src_token), destination_topk, None]
+                        for chunk_idx in cutlass.range_constexpr(activation_chunk_count):
+                            chunk_byte_offset = Int64(chunk_idx * activation_chunk_bytes)
+                            chunk_bytes_this_round = min(
+                                activation_chunk_bytes, output_token_bytes - chunk_idx * activation_chunk_bytes
                             )
-                        cute.arch.mbarrier_wait(worker_mbarrier, transfer_phase)
-                        destination_chunk = cute.make_ptr(
-                            cutlass.Uint8,
-                            destination_sf_row.iterator.toint() + chunk_byte_offset,
-                            AddressSpace.gmem,
-                            assumed_align=16,
-                        )
-                        with cute.arch.elect_one():
-                            cp_async_bulk_s2g(destination_chunk, worker_sf_stage.iterator, current_chunk_bytes)
-                        cute.arch.cp_async_bulk_commit_group()
-                        cute.arch.cp_async_bulk_wait_group(0)
-                        transfer_phase = transfer_phase ^ Int32(1)
-                        cute.arch.sync_warp()
-                        if cutlass.const_expr(reuse_sf_pacing_enabled):
-                            if is_remote_token:
-                                current_window = Int32(read_clock64() - round_start_clock)
-                                sf_average_window = self._adaptive_pace(
-                                    sf_average_window, current_window, sf_low_window, sf_high_window
+                            current_chunk_bytes = Int32(chunk_bytes_this_round)
+                            current_window_unit = ceil_div(chunk_bytes_this_round * 2, 3)
+                            stateless_data_pacing_enabled = (
+                                self.token_back_mode != "reuse_dispatch_warps"
+                                and current_window_unit > self.minimum_pacing_window_cycles
+                            )
+                            round_start_clock = Int64(0)
+                            cute.arch.sync_warp()
+                            if cutlass.const_expr(reuse_data_pacing_enabled or stateless_data_pacing_enabled):
+                                if is_remote_token:
+                                    round_start_clock = read_clock64()
+                                else:
+                                    round_start_clock = round_start_clock
+                            with cute.arch.elect_one():
+                                cute.arch.mbarrier_arrive_and_expect_tx(worker_mbarrier, current_chunk_bytes)
+                                tma_load_1d(
+                                    worker_activation_stage.iterator,
+                                    local_activation_address + chunk_byte_offset,
+                                    worker_mbarrier,
+                                    current_chunk_bytes,
                                 )
-                        elif cutlass.const_expr(stateless_sf_pacing_enabled):
-                            if is_remote_token:
-                                current_window = Int32(read_clock64() - round_start_clock)
-                                self._stateless_pace(Int32(current_window_unit), current_window)
+                            cute.arch.mbarrier_wait(worker_mbarrier, transfer_phase)
+                            destination_chunk = cute.make_ptr(
+                                cutlass.Uint8,
+                                destination_row.iterator.toint() + chunk_byte_offset,
+                                AddressSpace.gmem,
+                                assumed_align=16,
+                            )
+                            with cute.arch.elect_one():
+                                if cutlass.const_expr(self.reduce_topk_in_kernel):
+                                    cp_reduce_async_bulk_add_bf16_s2g(
+                                        destination_chunk, worker_activation_stage.iterator, current_chunk_bytes
+                                    )
+                                else:
+                                    cp_async_bulk_s2g(
+                                        destination_chunk, worker_activation_stage.iterator, current_chunk_bytes
+                                    )
+                            cute.arch.cp_async_bulk_commit_group()
+                            cute.arch.cp_async_bulk_wait_group(0)
+                            transfer_phase = transfer_phase ^ Int32(1)
+                            cute.arch.sync_warp()
+                            if cutlass.const_expr(reuse_data_pacing_enabled):
+                                if is_remote_token:
+                                    current_window = Int32(read_clock64() - round_start_clock)
+                                    data_average_window = self._adaptive_pace(
+                                        data_average_window, current_window, data_low_window, data_high_window
+                                    )
+                            elif cutlass.const_expr(stateless_data_pacing_enabled):
+                                if is_remote_token:
+                                    current_window = Int32(read_clock64() - round_start_clock)
+                                    self._stateless_pace(Int32(current_window_unit), current_window)
+                        iket.range_pop()
+
+                    if cutlass.const_expr(self.token_back_push_sf):
+                        iket.range_push("token_back.push_sf")
+                        local_sf_address = fc2_sf_pointer.toint() + Int64(pool_token_idx) * Int64(output_sf_bytes)
+                        remote_sf = cute.make_tensor(
+                            cute.make_ptr(
+                                self._token_comm_args.pre_reduced_activation_sf.dtype,
+                                self._token_comm_args.pre_reduced_activation_sf.iterator.toint() + peer_offset,
+                                AddressSpace.gmem,
+                                assumed_align=(self._token_comm_args.pre_reduced_activation_sf.iterator.max_alignment),
+                            ),
+                            self._token_comm_args.pre_reduced_activation_sf.layout,
+                        )
+                        destination_sf_row = remote_sf[Int64(metadata.src_token), destination_topk, None]
+                        for chunk_idx in cutlass.range_constexpr(sf_chunk_count):
+                            chunk_byte_offset = Int64(chunk_idx * sf_chunk_bytes)
+                            chunk_bytes_this_round = min(sf_chunk_bytes, output_sf_bytes - chunk_idx * sf_chunk_bytes)
+                            current_chunk_bytes = Int32(chunk_bytes_this_round)
+                            current_window_unit = ceil_div(chunk_bytes_this_round * 2, 3)
+                            stateless_sf_pacing_enabled = (
+                                self.token_back_mode != "reuse_dispatch_warps"
+                                and current_window_unit > self.minimum_pacing_window_cycles
+                            )
+                            round_start_clock = Int64(0)
+                            cute.arch.sync_warp()
+                            if cutlass.const_expr(reuse_sf_pacing_enabled or stateless_sf_pacing_enabled):
+                                if is_remote_token:
+                                    round_start_clock = read_clock64()
+                                else:
+                                    round_start_clock = round_start_clock
+                            with cute.arch.elect_one():
+                                cute.arch.mbarrier_arrive_and_expect_tx(worker_mbarrier, current_chunk_bytes)
+                                tma_load_1d(
+                                    worker_sf_stage.iterator,
+                                    local_sf_address + chunk_byte_offset,
+                                    worker_mbarrier,
+                                    current_chunk_bytes,
+                                )
+                            cute.arch.mbarrier_wait(worker_mbarrier, transfer_phase)
+                            destination_chunk = cute.make_ptr(
+                                cutlass.Uint8,
+                                destination_sf_row.iterator.toint() + chunk_byte_offset,
+                                AddressSpace.gmem,
+                                assumed_align=16,
+                            )
+                            with cute.arch.elect_one():
+                                cp_async_bulk_s2g(destination_chunk, worker_sf_stage.iterator, current_chunk_bytes)
+                            cute.arch.cp_async_bulk_commit_group()
+                            cute.arch.cp_async_bulk_wait_group(0)
+                            transfer_phase = transfer_phase ^ Int32(1)
+                            cute.arch.sync_warp()
+                            if cutlass.const_expr(reuse_sf_pacing_enabled):
+                                if is_remote_token:
+                                    current_window = Int32(read_clock64() - round_start_clock)
+                                    sf_average_window = self._adaptive_pace(
+                                        sf_average_window, current_window, sf_low_window, sf_high_window
+                                    )
+                            elif cutlass.const_expr(stateless_sf_pacing_enabled):
+                                if is_remote_token:
+                                    current_window = Int32(read_clock64() - round_start_clock)
+                                    self._stateless_pace(Int32(current_window_unit), current_window)
+                        iket.range_pop()
+
+                    cute.arch.sync_warp()
+                    next_dense_token = self.next_token(next_dense_token)
+
+                expert_valid_begin = expert_valid_end
+                local_expert = local_expert + Int32(1)
+        else:
+            expert_pool_begin = Int32(0)
+            local_expert = Int32(0)
+            while local_expert < Int32(self.experts_per_rank):
+                expert_token_count = owned_sizes[local_expert]
+                expert_valid_end = expert_valid_begin + expert_token_count
+                if next_dense_token < expert_valid_end:
+                    token_tile_count = (expert_token_count + Int32(self.tokens_per_fc1_ready_slot - 1)) // Int32(
+                        self.tokens_per_fc1_ready_slot
+                    )
+                    completion_target = token_tile_count * Int32(self.fc2_done_signals_per_token_tile)
+                    iket.range_push("token_back.wait_fc2")
+                    while cute.arch.load(fc2_done + local_expert, Int32, sem="acquire", scope="gpu") < completion_target:
+                        nanosleep(500)
                     iket.range_pop()
 
-                cute.arch.sync_warp()
-                next_dense_token = self.next_token(next_dense_token)
+                while next_dense_token < expert_valid_end:
+                    token_in_expert = next_dense_token - expert_valid_begin
+                    if cutlass.const_expr(self.decode_landing):
+                        pool_token_idx = expert_pool_begin + token_in_expert
+                    else:
+                        pool_token_idx = pool_expert_bases[local_expert] + token_in_expert
+                    metadata = TokenSrcMetadata.load(
+                        token_metadata_pointer.toint() + Int64(pool_token_idx) * Int64(TokenSrcMetadata.nbytes)
+                    )
+                    destination_topk = metadata.src_topk
+                    if cutlass.const_expr(self.reduce_topk_in_kernel):
+                        destination_topk = Int32(0)
+                    peer_offset = self._token_comm_args.peer_rank_ptr_mapper.map(Int64(0), metadata.src_rank, Int64(0))
+                    is_remote_token = metadata.src_rank != self._local_rank
 
-            expert_valid_begin = expert_valid_end
-            local_expert = local_expert + Int32(1)
+                    if cutlass.const_expr(self.token_back_push_data):
+                        iket.range_push("token_back.push_data")
+                        local_activation_address = fc2_activation_pointer.toint() + Int64(pool_token_idx) * Int64(
+                            output_token_bytes
+                        )
+                        remote_activation = cute.make_tensor(
+                            cute.make_ptr(
+                                self._token_comm_args.pre_reduced_activation.dtype,
+                                self._token_comm_args.pre_reduced_activation.iterator.toint() + peer_offset,
+                                AddressSpace.gmem,
+                                assumed_align=(self._token_comm_args.pre_reduced_activation.iterator.max_alignment),
+                            ),
+                            self._token_comm_args.pre_reduced_activation.layout,
+                        )
+                        destination_row = remote_activation[Int64(metadata.src_token), destination_topk, None]
+                        for chunk_idx in cutlass.range_constexpr(activation_chunk_count):
+                            chunk_byte_offset = Int64(chunk_idx * activation_chunk_bytes)
+                            chunk_bytes_this_round = min(
+                                activation_chunk_bytes, output_token_bytes - chunk_idx * activation_chunk_bytes
+                            )
+                            current_chunk_bytes = Int32(chunk_bytes_this_round)
+                            current_window_unit = ceil_div(chunk_bytes_this_round * 2, 3)
+                            stateless_data_pacing_enabled = (
+                                self.token_back_mode != "reuse_dispatch_warps"
+                                and current_window_unit > self.minimum_pacing_window_cycles
+                            )
+                            round_start_clock = Int64(0)
+                            cute.arch.sync_warp()
+                            if cutlass.const_expr(reuse_data_pacing_enabled or stateless_data_pacing_enabled):
+                                if is_remote_token:
+                                    round_start_clock = read_clock64()
+                                else:
+                                    round_start_clock = round_start_clock
+                            with cute.arch.elect_one():
+                                cute.arch.mbarrier_arrive_and_expect_tx(worker_mbarrier, current_chunk_bytes)
+                                tma_load_1d(
+                                    worker_activation_stage.iterator,
+                                    local_activation_address + chunk_byte_offset,
+                                    worker_mbarrier,
+                                    current_chunk_bytes,
+                                )
+                            cute.arch.mbarrier_wait(worker_mbarrier, transfer_phase)
+                            destination_chunk = cute.make_ptr(
+                                cutlass.Uint8,
+                                destination_row.iterator.toint() + chunk_byte_offset,
+                                AddressSpace.gmem,
+                                assumed_align=16,
+                            )
+                            with cute.arch.elect_one():
+                                if cutlass.const_expr(self.reduce_topk_in_kernel):
+                                    cp_reduce_async_bulk_add_bf16_s2g(
+                                        destination_chunk, worker_activation_stage.iterator, current_chunk_bytes
+                                    )
+                                else:
+                                    cp_async_bulk_s2g(
+                                        destination_chunk, worker_activation_stage.iterator, current_chunk_bytes
+                                    )
+                            cute.arch.cp_async_bulk_commit_group()
+                            cute.arch.cp_async_bulk_wait_group(0)
+                            transfer_phase = transfer_phase ^ Int32(1)
+                            cute.arch.sync_warp()
+                            if cutlass.const_expr(reuse_data_pacing_enabled):
+                                if is_remote_token:
+                                    current_window = Int32(read_clock64() - round_start_clock)
+                                    data_average_window = self._adaptive_pace(
+                                        data_average_window, current_window, data_low_window, data_high_window
+                                    )
+                            elif cutlass.const_expr(stateless_data_pacing_enabled):
+                                if is_remote_token:
+                                    current_window = Int32(read_clock64() - round_start_clock)
+                                    self._stateless_pace(Int32(current_window_unit), current_window)
+                        iket.range_pop()
+
+                    if cutlass.const_expr(self.token_back_push_sf):
+                        iket.range_push("token_back.push_sf")
+                        local_sf_address = fc2_sf_pointer.toint() + Int64(pool_token_idx) * Int64(output_sf_bytes)
+                        remote_sf = cute.make_tensor(
+                            cute.make_ptr(
+                                self._token_comm_args.pre_reduced_activation_sf.dtype,
+                                self._token_comm_args.pre_reduced_activation_sf.iterator.toint() + peer_offset,
+                                AddressSpace.gmem,
+                                assumed_align=(self._token_comm_args.pre_reduced_activation_sf.iterator.max_alignment),
+                            ),
+                            self._token_comm_args.pre_reduced_activation_sf.layout,
+                        )
+                        destination_sf_row = remote_sf[Int64(metadata.src_token), destination_topk, None]
+                        for chunk_idx in cutlass.range_constexpr(sf_chunk_count):
+                            chunk_byte_offset = Int64(chunk_idx * sf_chunk_bytes)
+                            chunk_bytes_this_round = min(sf_chunk_bytes, output_sf_bytes - chunk_idx * sf_chunk_bytes)
+                            current_chunk_bytes = Int32(chunk_bytes_this_round)
+                            current_window_unit = ceil_div(chunk_bytes_this_round * 2, 3)
+                            stateless_sf_pacing_enabled = (
+                                self.token_back_mode != "reuse_dispatch_warps"
+                                and current_window_unit > self.minimum_pacing_window_cycles
+                            )
+                            round_start_clock = Int64(0)
+                            cute.arch.sync_warp()
+                            if cutlass.const_expr(reuse_sf_pacing_enabled or stateless_sf_pacing_enabled):
+                                if is_remote_token:
+                                    round_start_clock = read_clock64()
+                                else:
+                                    round_start_clock = round_start_clock
+                            with cute.arch.elect_one():
+                                cute.arch.mbarrier_arrive_and_expect_tx(worker_mbarrier, current_chunk_bytes)
+                                tma_load_1d(
+                                    worker_sf_stage.iterator,
+                                    local_sf_address + chunk_byte_offset,
+                                    worker_mbarrier,
+                                    current_chunk_bytes,
+                                )
+                            cute.arch.mbarrier_wait(worker_mbarrier, transfer_phase)
+                            destination_chunk = cute.make_ptr(
+                                cutlass.Uint8,
+                                destination_sf_row.iterator.toint() + chunk_byte_offset,
+                                AddressSpace.gmem,
+                                assumed_align=16,
+                            )
+                            with cute.arch.elect_one():
+                                cp_async_bulk_s2g(destination_chunk, worker_sf_stage.iterator, current_chunk_bytes)
+                            cute.arch.cp_async_bulk_commit_group()
+                            cute.arch.cp_async_bulk_wait_group(0)
+                            transfer_phase = transfer_phase ^ Int32(1)
+                            cute.arch.sync_warp()
+                            if cutlass.const_expr(reuse_sf_pacing_enabled):
+                                if is_remote_token:
+                                    current_window = Int32(read_clock64() - round_start_clock)
+                                    sf_average_window = self._adaptive_pace(
+                                        sf_average_window, current_window, sf_low_window, sf_high_window
+                                    )
+                            elif cutlass.const_expr(stateless_sf_pacing_enabled):
+                                if is_remote_token:
+                                    current_window = Int32(read_clock64() - round_start_clock)
+                                    self._stateless_pace(Int32(current_window_unit), current_window)
+                        iket.range_pop()
+
+                    cute.arch.sync_warp()
+                    next_dense_token = self.next_token(next_dense_token)
+
+                if cutlass.const_expr(self.decode_landing):
+                    expert_pool_begin = expert_pool_begin + (
+                        (expert_token_count + Int32(self.token_padding_block - 1)) // Int32(self.token_padding_block)
+                    ) * Int32(self.token_padding_block)
+                expert_valid_begin = expert_valid_end
+                local_expert = local_expert + Int32(1)
         iket.range_pop()
         # with cute.arch.elect_one():
         #     cute.printf(" final data_average_window: {} ", data_average_window)
+
+    @cute.jit
+    def _land_route_metadata(
+        self,
+        token_in_expert: Int32,
+        pool_token_idx: Int32,
+        lane_source_size: Int32,
+        lane_landing_base: Int32,
+        lane_ring_end: Int32,
+        token_metadata_pointer: cute.Pointer,
+    ) -> TokenSrcMetadata:
+        """Decode landing: the record of the expert-relative token, mirrored into the pool-indexed tables.
+
+        Lane l describes ring position l (source rank (local_rank + l) % W): its route count for this expert, its
+        landing row offset for this rank's expert, and the inclusive ring end. Ring ends are nondecreasing, so the
+        owner is the count of lanes whose ring end is <= token_in_expert (lanes >= W hold the total, which exceeds it).
+        """
+        below_mask = Int32(cute.arch.vote_ballot_sync(lane_ring_end <= token_in_expert))
+        source_position = Int32(cute.arch.popc(below_mask))
+        source_ring_end = Int32(cute.arch.shuffle_sync(lane_ring_end, source_position))
+        source_size = Int32(cute.arch.shuffle_sync(lane_source_size, source_position))
+        source_base = Int32(cute.arch.shuffle_sync(lane_landing_base, source_position))
+        source_rank = (self._local_rank + source_position) % Int32(self.world_size)
+        landing_slot = source_base + token_in_expert - (source_ring_end - source_size)
+        landing_index = Int64(source_rank) * Int64(self._router.landing_capacity_per_source) + Int64(landing_slot)
+        landing_metadata_address = self._device_workspace.ptr(self._router.landing_metadata_region).toint()
+        metadata = TokenSrcMetadata.load(landing_metadata_address + landing_index * Int64(TokenSrcMetadata.nbytes))
+        if self._lane_idx == Int32(0):
+            # Published to FC1/FC2/token_back by this pull's fc1_ready release, like the SF rows.
+            stg_b64(
+                token_metadata_pointer.toint() + Int64(pool_token_idx) * Int64(TokenSrcMetadata.nbytes),
+                metadata.pack(),
+            )
+            if cutlass.const_expr(self.apply_topk_at_fc1):
+                landing_scores_address = self._device_workspace.ptr(self._router.landing_scores_region).toint()
+                score = cute.arch.load(
+                    cute.make_ptr(
+                        cutlass.Float32,
+                        landing_scores_address + landing_index * Int64(4),
+                        AddressSpace.gmem,
+                        assumed_align=4,
+                    ),
+                    cutlass.Float32,
+                )
+                pool_scores_address = self._device_workspace.ptr(self._router.fc1_topk_scores_region).toint()
+                stg_f32(pool_scores_address + Int64(pool_token_idx) * Int64(4), score)
+        return metadata
+
+    @cute.jit
+    def claim_token_in(self) -> Int32:
+        """Warp-uniform dense token index claimed from the token_in schedule counter."""
+        counter = self._device_workspace.ptr(self.token_in_schedule_region)
+        claimed = Int32(0)
+        if self._lane_idx == Int32(0):
+            claimed = cute.arch.atomic_add(counter, Int32(1), sem="relaxed", scope="gpu")
+        return Int32(cute.arch.shuffle_sync(claimed, Int32(0)))
 
     @cute.jit
     def next_token(self, current_token: Int32) -> Int32:
