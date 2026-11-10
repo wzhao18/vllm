@@ -6,8 +6,8 @@ by ``additional_config={"decode_backend": "latency_specialized"}``.
 The deployment's topology (``topology.Topology``, computed at load) selects the mode:
 ``TP_EXPERTS`` (plain TP8 / TP16, DCP 1 or = TP, no expert parallelism), ``EP_GROUP``
 (expert-parallel MegaMoE over attention groups of TP 4 / 8 / 16, DCP 1 or = TP, any
-DP) or ``DEP`` (TP1, refused at load until W5). EP_GROUP runs in one of two residual
-layouts (``Topology.step_layout``):
+DP) or ``DEP`` (TP1 x DP16 / DP32, EP16 / EP32: ``runtime.dep``, ``dep_unsupported``).
+EP_GROUP runs in one of two residual layouts (``Topology.step_layout``):
 
 - the sequence-parallel (SP) decode role of K3.1's C512 recipe (``Topology.sp_step``:
   TP4 = DCP4 over native MegaMoE), where the step keeps stock's row shard
@@ -18,6 +18,10 @@ layouts (``Topology.step_layout``):
   layer's in-projection and core specialized on every row of the group, the o_proj
   partial reduced by stock's reduce-scatter + all-gather, and the stock SP MoE module
   on stock's row shard (declared seams, listed per shape at load).
+
+DEP (``runtime.dep``) runs each DSA / KDA layer's in-projection, core (96 heads) and
+o_proj specialized on the rank's own rows, with no TP collective, and the stock MoE
+module on all of them (declared seams, listed per shape at load).
 
 Anything else raises at load (``topology.refusal`` and the layouts' checks).
 """
@@ -146,6 +150,21 @@ def ep_group_topology(vllm_config) -> bool:
     return Topology.from_config(vllm_config).mode is Mode.EP_GROUP
 
 
+def dep_topology(vllm_config) -> bool:
+    """Whether the deployment runs the DEP mode (TP1 attention, expert-parallel
+    MegaMoE): its verification and drafter are declared stock seams in phase A
+    (``runtime.dep``), never a per-site silent keep."""
+    return Topology.from_config(vllm_config).mode is Mode.DEP
+
+
+def ep_topology(vllm_config) -> Mode | None:
+    """The expert-parallel mode (EP_GROUP or DEP) of the deployment, None without
+    expert parallelism: the strictness sites (verification, drafter) branch on
+    it."""
+    mode = Topology.from_config(vllm_config).mode
+    return mode if mode in (Mode.EP_GROUP, Mode.DEP) else None
+
+
 def kda_dtypes(vllm_config):
     """(conv, recurrent) KDA state dtypes the deployment's cache config selects."""
     from vllm.model_executor.layers.mamba.mamba_utils import MambaStateDtypeCalculator
@@ -210,6 +229,7 @@ def unsupported(vllm_config) -> str | None:
     topology = Topology.from_config(vllm_config)
     sp = topology.sp_step
     group = topology.mode is Mode.EP_GROUP and not sp
+    dep = topology.mode is Mode.DEP
     topology_reason = refusal(
         topology, dsa=dsa, pp=parallel.pipeline_parallel_size
     )
@@ -260,7 +280,8 @@ def unsupported(vllm_config) -> str | None:
             )
             and not sp,
             "ReplaySSM / RecoverSSM (--use-replayssm) outside TP4 = DCP4 sequence "
-            "parallelism (the EP_GROUP replicated step runs no records yet: W7)",
+            "parallelism (the EP_GROUP replicated step runs no records yet: W7; "
+            "DEP: B9)",
         ),
         # The verify kernels take at most 8 tokens per request (KdaSplit's barriers).
         (
@@ -298,6 +319,8 @@ def unsupported(vllm_config) -> str | None:
         reason = sp_unsupported(vllm_config)
     if reason is None and group:
         reason = ep_group_unsupported(vllm_config)
+    if reason is None and dep:
+        reason = dep_unsupported(vllm_config)
     return reason
 
 
@@ -383,6 +406,93 @@ def ep_group_unsupported(vllm_config) -> str | None:
     if reason is None:
         return None
     return f"expert-parallel attention groups (EP_GROUP, replicated step) on {reason}"
+
+
+# DEP's requests per rank (max_num_seqs): the fused decode indexer's request cap
+# (``cutedsl.dsa.indexer.MAX_REQUESTS``; mirrored here so the CPU gate imports no CuTe
+# DSL). Every other DEP family is uncapped in rows (``runtime.dep``).
+DEP_MAX_REQUESTS = 512
+
+
+def dep_unsupported(vllm_config) -> str | None:
+    """Why the DEP topology (TP1 x DP, EP = DP over native MegaMoE: ``runtime.dep``)
+    is not what the DEP step serves (phase A): Rubin, K3.1 DSA layers on a
+    per-tensor FP8 KV cache under FlashInfer sparse's trtllm-gen kernel (96 query
+    heads zero-padded to 128, as stock), a BF16 conv / FP32 recurrent KDA state,
+    DSpark q 2..8, at most ``DEP_MAX_REQUESTS`` requests per rank and no fused GEMM-RS
+    (none applies at TP1; refused as for EP_GROUP so no fused projection is misread).
+    ReplaySSM / RecoverSSM is refused by ``unsupported`` (B9). Deferred, refused with
+    the reason: fp8_ds_mla (FlashMLA pads 96 heads to 128 against the query stage's
+    64: a BF16 128-head query path) and nvfp4_ds_mla (prims_ts at DCP1, 96 heads),
+    W6; a BF16 KDA recurrent state or an FP32 conv state (D2); q1 (D3)."""
+    import torch
+
+    from vllm import envs
+    from vllm.platforms import current_platform
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    spec, cache = vllm_config.speculative_config, vllm_config.cache_config
+    fi_sparse = (
+        vllm_config.attention_config.backend
+        == AttentionBackendEnum.FLASHINFER_MLA_SPARSE
+    )
+    dsa = getattr(vllm_config.model_config.hf_text_config, "dsa_config", None)
+    dtype = cache.cache_dtype
+    fp8 = dtype in ("fp8", "fp8_e4m3")
+    requests = vllm_config.scheduler_config.max_num_seqs
+    checks = (
+        (
+            not current_platform.is_device_capability((10, 7)),
+            "this GPU (Rubin SM107 only)",
+        ),
+        (dsa is None, "models without DSA layers (Kimi K3 MLA)"),
+        (
+            dtype == "fp8_ds_mla",
+            "the fp8_ds_mla KV cache (FlashMLA sparse pads 96 query heads to 128, "
+            "the query stage writes 64: a BF16 128-head query path, W6)",
+        ),
+        (
+            dtype == "nvfp4_ds_mla",
+            "the nvfp4_ds_mla KV cache (FlashInfer prims_ts at DCP1 with 96 heads: "
+            "W6)",
+        ),
+        (
+            not fp8,
+            f"KV cache dtype {dtype} (per-tensor fp8 on FlashInfer sparse "
+            "trtllm-gen only)",
+        ),
+        (not fi_sparse, "attention backends but FLASHINFER_MLA_SPARSE"),
+        (
+            vllm_config.kernel_config.flashinfer_sparse_mla_kernel == "prims_ts"
+            or (fi_sparse and fp8 and _stock_prims_ts(vllm_config)),
+            "FlashInfer sparse's prims_ts kernel (trtllm-gen only; "
+            "flashinfer_sparse_mla_kernel=trtllm)",
+        ),
+        (
+            kda_dtypes(vllm_config) != (torch.bfloat16, torch.float32),
+            "KDA cache dtypes other than a BF16 conv state and an FP32 recurrent "
+            "state (a BF16 recurrent state or an FP32 conv state: deferred, D2)",
+        ),
+        (
+            spec is None,
+            "no speculation (q1: the stock plain KDA decode resolves to the CUDA "
+            "fused_kda_decode's fast math, which the specialized KDA core's stock "
+            "Triton math does not reproduce; DSpark q 2..8 only)",
+        ),
+        (
+            requests > DEP_MAX_REQUESTS,
+            f"more than {DEP_MAX_REQUESTS} requests per rank (max_num_seqs "
+            f"{requests}: the fused decode indexer's request cap)",
+        ),
+        (
+            envs.VLLM_ENABLE_GEMM_RS,
+            "the fused GEMM + reduce-scatter o_proj (VLLM_ENABLE_GEMM_RS)",
+        ),
+    )
+    reason = next((reason for failed, reason in checks if failed), None)
+    if reason is None:
+        return None
+    return f"data-parallel attention (DEP, TP1) on {reason}"
 
 
 def sp_unsupported(vllm_config) -> str | None:

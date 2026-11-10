@@ -28,7 +28,11 @@ mode        cores (ported from the upstream specialized decode)
 ==========  ======================================================================
 
 The replicated EP_GROUP step (``runtime.group_ep``: TP4 / TP8 / TP16 groups, 24 / 12 /
-6 heads per rank) builds this core in "none" mode (its records are W7).
+6 heads per rank) builds this core in "none" mode (its records are W7), as does DEP
+(``runtime.dep``: TP1, 96 heads per rank; gate mode 0, ``prepared.make_kernel``'s
+KdaSplitStock / KdaVerifyLoopStock for the FP32 state; records are B9).
+NQ-TUNE (B4): ``prepared.FP32_VERIFY_WIDE`` / ``SPEC_SCHEDULE`` are keyed by requests
+and were measured at 6 heads; at 96 heads the (request, head) items are 16x more.
 
 Precision: every record core has the stock Triton verify's math (``recover.KdaSplit``
 docstring): BF16 conv / SiLU outputs, raw gates and recurrence outputs, FP32 state and
@@ -212,10 +216,16 @@ class SpKdaCore:
     def __init__(self, attention, rows, *, records, ctx):
         if records not in MODES:
             raise Unsupported("kda", None, f"RecoverSSM records mode {records!r}")
-        if not ctx.ep_group_step:
+        if not ctx.ep_mode_step:
             raise Unsupported(
                 "kda", None,
-                "SpKdaCore serves the EP_GROUP decode only (the SP or replicated step)",
+                "SpKdaCore serves the expert-parallel decode modes only (EP_GROUP's SP "
+                "or replicated step, DEP)",
+            )  # fmt: skip
+        if ctx.dep and records != "none":
+            raise Unsupported(
+                "kda", None,
+                f"RecoverSSM records ({records}) at DEP (B9: RECORD_KINDS at 96 heads)",
             )  # fmt: skip
         self.mode, self.q = records, ctx.q
         self.heads = heads = attention.A_log.numel()
@@ -262,6 +272,20 @@ class SpKdaCore:
         if records == "none":
             if getattr(attention, "recoverssm_records", None) is not None:
                 raise Unsupported("kda", None, "mode 'none' on a RecoverSSM layer")
+            # The plain cores reproduce stock's native (Triton composed) verify. The
+            # layer's resolved kda_spec_decode_backend is what stock runs at these
+            # heads: "flashinfer" (auto at 12 / 24 / 32 / 48 / 96 heads, SD conv
+            # layout, packed_fused_kda_decode present) is another rounding form.
+            # (RecoverSSM layers always resolve "native": FlashInfer rejects them.)
+            backend = getattr(attention, "kda_spec_decode_backend", None)
+            if backend != "native":
+                cause = (
+                    f"stock KDA verify backend {backend!r} at {heads} heads (the "
+                    "plain cores reproduce the native verify only; FlashInfer "
+                    "packed_fused_kda_decode is another rounding form: pin "
+                    "additional_config kda_spec_decode_backend=native)"
+                )
+                raise Unsupported("kda", None, cause)
             from .prepared import PreparedKda, verify_kernel
 
             capability = torch.cuda.get_device_capability(dt)

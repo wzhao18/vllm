@@ -20,16 +20,23 @@ loaded weight, these are the shapes per heads h = 96 / G:
                                        fuses the SP reduce-scatter; ``group_ep``
                                        writes the partial for stock's reduce-scatter)
 
+DEP (``runtime.dep``: TP1, h = 96, ``Context.dep``, key (1, 1, N, K)): dsa_in 14560 x
+7168, kda_in 49376 x 7168, q_b 18432 x 1536, o_proj 7168 x 12288 (the whole output,
+no reduction).
+
 Rows are the TP group's R = n q (n requests per DP group): 4..512 at C512, 1..64 in
-the replicated step (``runtime.EP_GROUP_MAX_ROWS``).
+the replicated step (``runtime.EP_GROUP_MAX_ROWS``), n <= 512 per rank at DEP
+(``runtime.DEP_MAX_REQUESTS``).
 
 GENERIC rule (every R a structurally valid tactic, at every group size and pitch):
 warp split-K up to 16 rows (``decode.warp_tactic`` for the device's SM count and
 per-SM shared memory), the cluster split-K (``GENERIC_SPLIT``: VR's TP16 bin
 tactics, M tile 64, split 2) at 17-64, cuBLAS above 64 (UP GB300 TP8: split-K
 re-reads the weight per 64-column tile and loses from 80 rows; cuBLAS is the stock
-GEMM, a declared tactic). All of them sum K in FP32 and round once to BF16 (the stock
-BF16 linear's precision; the order differs).
+GEMM, a declared tactic). A weight warp split-K cannot take (K / 128 > 64: DEP's
+o_proj, K = 12288) runs the cluster split-K at 1-16 rows too (``NARROW_SPLIT``: M
+tile 64, N tile 8 up to 8 rows, 16 up to 16, split 2). All of them sum K in FP32 and
+round once to BF16 (the stock BF16 linear's precision; the order differs).
 
 The measured tables are keyed by (G, DCP, N, K): N and K fix the heads per rank, G
 and DCP the group's communication around the projection (TP8 DCP1 and TP8 = DCP8
@@ -70,6 +77,13 @@ SP_TP = 4
 GENERIC_KIND = {"*": f"1-{WARP_ROWS}:warp,{WARP_ROWS + 1}-{SPLIT_K_ROWS}:split_k,"
                 f"{SPLIT_K_ROWS + 1}-:cublas"}  # fmt: skip
 GENERIC_SPLIT = {"*": f"{WARP_ROWS + 1}-32:64.32.2.8,33-{SPLIT_K_ROWS}:64.64.2.6"}
+# GENERIC at 1-16 rows for a weight warp split-K cannot take (``warp_eligible``
+# False: DEP's o_proj, K = 12288): the cluster split-K with the narrow N tiles.
+# NQ-TUNE (B5): seeds are sm_100's DEP_OPROJ (only N tiles 8 / 16 / 32 / 64 are legal
+# on sm_107) and the Rubin tensor-memory split-K.
+NARROW_SPLIT = {"*": f"1-8:64.8.2.8,9-{WARP_ROWS}:64.16.2.8"}
+# The DEP mode's (G, DCP) key of the tables (TP1, DCP1).
+DEP_GROUP = (1, 1)
 
 # NQ-TUNE (all three): measured VR200 tables by (G, DCP, N, K): {q | "*": spec}.
 # ``TUNED_KIND``: "warp" / "split_k" / "cublas" per R; ``TUNED_SPLIT``: the split-K
@@ -117,14 +131,15 @@ def measured(
 
 def _generic(kind, n, k, shape, ctx, sm_bytes):
     name = rows_policy(GENERIC_KIND, shape, name=f"{kind} kinds")
+    split = GENERIC_SPLIT
     if name == "warp":
-        if not warp_eligible(n, k):
-            raise Unsupported(
-                kind, shape, f"warp split-K cannot take a [{n}, {k}] weight"
-            )
-        return "warp", warp_tactic(shape.rows, n, k, ctx.sms, sm_bytes)
+        if warp_eligible(n, k):
+            return "warp", warp_tactic(shape.rows, n, k, ctx.sms, sm_bytes)
+        # (the narrow split-K: every EP_GROUP weight is warp-eligible, so their
+        # tactics do not change)
+        name, split = "split_k", NARROW_SPLIT
     if name == "split_k":
-        tactic = rows_policy(GENERIC_SPLIT, shape, name=f"{kind} split-K")
+        tactic = rows_policy(split, shape, name=f"{kind} split-K")
         problem = split_k_problem(tactic, k)
         if problem is not None:
             raise Unsupported(kind, shape, problem)
@@ -139,15 +154,19 @@ def sp_projection_tactics(
     (``KINDS``): the measured table's of (G = TP, DCP, n, k) where it has one, the
     GENERIC rule's otherwise. Raises ``Unsupported`` outside an EP_GROUP decode step
     (``Context.ep_group_step``: the SP step or the replicated one) of a ``GROUPS``
-    size, or when a row has no valid tactic (never a stock fallback)."""
+    size and outside DEP (``Context.dep`` at TP1 = DCP1, key ``DEP_GROUP``), or when
+    a row has no valid tactic (never a stock fallback)."""
     if kind not in KINDS:
         raise Unsupported(kind, None, f"no SP projection policy (kinds {KINDS})")
-    if not ctx.ep_group_step or ctx.tp not in GROUPS:
+    group = ctx.ep_group_step and ctx.tp in GROUPS
+    dep = ctx.dep and not ctx.ep_group_step and (ctx.tp, ctx.dcp) == DEP_GROUP
+    if not (group or dep):
         raise Unsupported(
             kind, None,
             f"the EP_GROUP projection tables serve TP{'/'.join(map(str, GROUPS))} "
-            f"attention groups under expert parallelism (TP{ctx.tp}, "
-            f"ep_group={ctx.ep_group}, sequence_parallel={ctx.sequence_parallel})",
+            f"attention groups under expert parallelism, the DEP ones TP1 = DCP1 "
+            f"(TP{ctx.tp} DCP{ctx.dcp}, ep_group={ctx.ep_group}, "
+            f"sequence_parallel={ctx.sequence_parallel}, dep={ctx.dep})",
         )  # fmt: skip
     if n <= 0 or k <= 0:
         raise Unsupported(kind, None, f"weight [{n}, {k}]")

@@ -64,7 +64,12 @@ KP = 1536 + 32  # padded Q_B / x row (elements): 3136 B, conflict-free 16 B frag
 # tiled kernel from B4, the 12-head crossover; its rows R = 4 n (n requests per DP
 # group, q 4) are all tiled. NQ-TUNE: the lean / tiled crossover at 24 heads (the
 # SP step never runs fewer than 4 rows).
-TILED_FROM = {12: 4, 6: 6, 24: 4}
+# 96 heads (K3.1 DSA at DEP, TP1 = DCP1, runtime.dep): the tiled kernel from B4, the
+# 12- / 24-head crossover. Its per-tensor FP8 query goes into a 128-head buffer for
+# trtllm-gen (dsa.prepared ``fi_heads``: a host-side stride, the kernel stores by
+# layout). NQ-TUNE: the 96-head crossover; B3's split query (QueryNorm -> Q_B GEMM ->
+# MlaAbsorb) replaces the per-head RMSNorm repeats of these 768+ CTAs.
+TILED_FROM = {12: 4, 6: 6, 24: 4, 96: 4}
 # Head counts whose gathered-q poll (``gather``, under DCP) is refused: one row tile
 # of 24 heads is 24 clusters of 8 CTAs, more than Rubin holds at once (22 at the DSA
 # query's shared memory, ``dsa.wide.check_query_residency``), so a whole-grid or

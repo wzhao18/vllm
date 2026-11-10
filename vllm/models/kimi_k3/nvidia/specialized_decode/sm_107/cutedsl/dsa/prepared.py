@@ -132,8 +132,11 @@ def compile_core(
     partials="bf16",
     cap=64,
     release=True,
+    fi_heads=0,
 ):
     """CuTe kernels (query, index, value) of one batch of rows (``q`` per request).
+    ``fi_heads`` (TP FlashInfer only; 0: ``heads``): the heads of the FP8 query rows
+    and of the sparse decode's latent rows (DEP: 96 heads padded to trtllm-gen's 128).
     ``specs``: the layouts of the weights, the MLA cache and the indexer cache.
     Under DCP (``dcp``: its size, ``q_heads``: the gathered query's padded heads,
     ``cap``: the DcpBox rows) the query also publishes into the q mailbox and the
@@ -148,7 +151,12 @@ def compile_core(
         fake(shape, stride, dtype, 4 if dtype == torch.float32 else 16)
         for shape, stride, dtype in specs
     )
-    query_heads = heads if fp8 else QUERY_HEADS
+    if fi_heads and (dcp or not fp8 or fi_heads < heads):
+        raise ValueError(
+            f"Kimi K3.1 DSA: padded query heads {fi_heads} at {heads} heads need the "
+            "TP FlashInfer query"
+        )
+    query_heads = (fi_heads or heads) if fp8 else QUERY_HEADS
     with torch.accelerator.device_index(device):
         fakes = qnorm, kvnorm, qb, uk, kv
         query_kernel = compile_query(
@@ -164,6 +172,7 @@ def compile_core(
             overlap=overlap,
             cap=cap,
             release=release,
+            fi_heads=fi_heads,
         )
         index_kernel = compile_index(batch, heads, pitch, index_kv)
         if dcp:
@@ -258,13 +267,26 @@ class PreparedDsa:
                     f"heads, the query stage to {QUERY_HEADS}"
                 )
         self.heads = layer.W_UK_T.shape[0]
+        # TP FlashInfer: the FP8 query / latent rows' heads, trtllm-gen's padded count
+        # (``trtllm_gen_query_heads``: 96 -> 128 at DEP, as the stock decode's
+        # ``_pad_query_heads``; the head counts of every other mode run unpadded).
+        self.fi_heads = self.heads
+        if dcp is None and self.fp8:
+            from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
+                trtllm_gen_query_heads,
+            )
+
+            self.fi_heads = trtllm_gen_query_heads(self.heads)
         self.device, self.pitches = layer.W_UK_T.device, pitches
         *shared, fi = scratch
         if isinstance(fi, torch.Tensor):  # the round-1 scratch
-            heads = dcp.q_heads if dcp is not None else self.heads
+            heads = dcp.q_heads if dcp is not None else self.fi_heads
             topk = self.indexer.topk_tokens
             fi = fi_buffers(self.device, max(pitches), topk, heads)
-        self.query_stage = QueryStage(attention, pitches, shared, self.fp8, self.nvfp4)
+        padded = self.fi_heads if self.fi_heads != self.heads else 0
+        self.query_stage = QueryStage(
+            attention, pitches, shared, self.fp8, self.nvfp4, fi_heads=padded
+        )
         # The indexer stage's outputs (TP on FlashMLA: the top-k ids; DCP: the FP32
         # DCP top-k's owned rows), sized for the widest step.
         self.indexer_stage = IndexerStage(self.indexer, max(pitches))
@@ -282,7 +304,15 @@ class PreparedDsa:
             dcp_size = self.dcp
             rows = {b: kernel_for(b, dcp_size > 1, kernels) for b in pitches}
             self.cores = {(b, q): rows[b] for b, q in self.shapes}
-            heads = dcp.q_heads if dcp is not None else self.heads
+            if padded and set(rows.values()) != {"trtllm"}:
+                # The padded query is trtllm-gen's (stock pads for it only).
+                odd = sorted(b for b, k in rows.items() if k != "trtllm")
+                raise ValueError(
+                    f"Kimi K3.1 specialized DSA: {self.heads} query heads padded to "
+                    f"{self.fi_heads} run trtllm-gen only (rows {odd} resolve to "
+                    f"{rows[odd[0]]}: W6)"
+                )
+            heads = dcp.q_heads if dcp is not None else self.fi_heads
             sharding = dcp_size, self.indexer.dcp_rank
             # The merge's rows are narrower than the top-k: plan both widths.
             merged = self.indexer_stage.local_topk
@@ -397,6 +427,7 @@ class PreparedDsa:
                 partials=partials,
                 cap=cap,
                 release=(batch, q) not in self.held(LATE),
+                fi_heads=self.fi_heads if self.fi_heads != self.heads else 0,
             )
             if overlap != "serial" or batch <= FUSED_INDEX:
                 self.overlap_kernels[batch, q] = self.compile_overlap(

@@ -209,9 +209,11 @@ class SpecializedDecode:
     it (``sp``): ``sp_attention.SpStep`` under sequence parallelism
     (``config.sequence_parallel``: C512's TP4 = DCP4 decode role, layout (c)),
     ``group_ep.GroupStep`` otherwise (the replicated layout (b)); none of the TP8 /
-    TP16 providers below is built."""
+    TP16 providers below is built. The DEP mode likewise builds and delegates to
+    ``dep.DepStep`` (TP1, the rank's own rows)."""
 
-    # The EP_GROUP step (sp_attention.SpStep or group_ep.GroupStep), else None.
+    # The expert-parallel step (sp_attention.SpStep, group_ep.GroupStep or
+    # dep.DepStep), else None.
     sp = None
 
     def __init__(self, backbone, config):
@@ -226,6 +228,9 @@ class SpecializedDecode:
             return
         if mode is Mode.EP_GROUP:
             self.init_group_ep(config)
+            return
+        if mode is Mode.DEP:
+            self.init_dep(config)
             return
         if mode is not Mode.TP_EXPERTS:
             raise ValueError(
@@ -470,11 +475,58 @@ class SpecializedDecode:
         self.sp = GroupStep(self)
         self.coverage = self.sp.coverage()
 
+    def init_dep(self, config):
+        """The DEP decode (``dep``: TP1 = DCP1 attention on the rank's own rows, all
+        96 heads, expert-parallel MegaMoE over the DP ranks): the deployment facts,
+        then the DEP step, which builds its blocks and checks that every captured R
+        is covered (specialized or a declared stock seam) or raises."""
+        from .dep import DepStep
+
+        group = get_tp_group()
+        self.tp, self.rank = group.world_size, group.rank_in_group
+        self.group = group.device_group
+        if self.tp != 1 or config.dcp != 1:
+            raise Unsupported(
+                "dep_step", None, f"TP{self.tp} / DCP{config.dcp} (DEP is TP1 = DCP1)"
+            )
+        self.device = torch.device(current_platform.current_device())
+        properties = torch.cuda.get_device_properties(self.device)
+        cc = (properties.major, properties.minor)
+        self.q, self.dcp = config.q, config.dcp
+        self.queries = (config.q,)
+        self.captured = config.captured
+        # (no tuned / wide TP8 / TP16 batches, step switch or MLA rows here)
+        self.tuned, self.wide, self.wide_off = (), (), None
+        self.batches = tuple(sorted(set(config.captured)))
+        self.switched, self.switch = {}, None
+        self.max_context, self.bf16_state = config.max_context, config.bf16_state
+        backbone = self.backbone
+        layers = backbone.layers[backbone.start_layer : backbone.end_layer]
+        self.layers = tuple(layers)
+        self.aux_layers = tuple(backbone.aux_hidden_state_layers)
+        self.context = Context(
+            arch="rubin" if cc == (10, 7) else "gb300",
+            tp=1,
+            rank=self.rank,
+            dcp=1,
+            sms=properties.multi_processor_count,
+            q=config.q,
+            max_rows=max(self.batches, default=0),
+            max_context=config.max_context,
+            bf16_state=config.bf16_state,
+            dp=config.dp,
+            ep=config.ep,
+            heads_per_rank=backbone.config.num_attention_heads,
+            dep=True,
+        )
+        self.sp = DepStep(self)
+        self.coverage = self.sp.coverage()
+
     def build_providers(self):
         """Every layer's attention and feed-forward providers, the model's mailboxes
         and the prefetch side stream. All collective allocations, weight packing and
         kernel compiles finish here, before KV binding and CUDA graph capture."""
-        if self.context.ep_group_step:  # (expert parallel: no TP-reduce providers)
+        if self.context.ep_mode_step:  # (expert parallel: no TP-reduce providers)
             raise RuntimeError(
                 "Kimi K3 decode: TP providers built under SP / EP_GROUP (expert "
                 "parallel)"

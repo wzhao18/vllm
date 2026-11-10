@@ -15,6 +15,8 @@ replicated EP_GROUP step at TP4 / TP8 / TP16, ``runtime.ep_group_topology``) syn
 rejection keeps the stock sampler, a declared stock module (``verify`` in
 ``shapes.DECLARED_STOCK``); otherwise the build either covers the group at every row
 count or raises ``shapes.Unsupported`` naming the cause: never the silent stock path.
+In the DEP mode (TP1, ``runtime.dep_topology``) the stock sampler is declared at every
+rejection method (``dep.DEP_DECLARED``) until the TP1 kernels (B1 / B2).
 """
 
 import torch
@@ -61,10 +63,20 @@ class VerifyArgmax:
         the argmax or ``shapes.Unsupported``."""
         if vllm_config.speculative_config is None:
             return None
-        from . import ep_group_topology
+        from . import dep_topology, ep_group_topology
 
-        sp = ep_group_topology(vllm_config)
         method = vllm_config.speculative_config.rejection_sample_method
+        if dep_topology(vllm_config):
+            # DEP phase A: the stock rejection sampler at every rejection method
+            # (``dep.DEP_DECLARED`` "verify" / "sampler"); the vocabulary-sharded
+            # kernels need TP > 1 (TP1 argmax / sampled verify: B1 / B2).
+            logger.info_once(
+                "Kimi K3 DEP decode: verify: declared stock (%s rejection; DEP: TP1 "
+                "verify pending B1 / B2)",
+                method,
+            )
+            return None
+        sp = ep_group_topology(vllm_config)
         if sp and method == "synthetic":
             logger.info_once(
                 "Kimi K3 EP_GROUP decode: verify: declared stock (synthetic rejection)"

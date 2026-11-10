@@ -94,6 +94,9 @@ class Context:
     # (``runtime.group_ep``, layout (b)). Its attention families (the decode
     # projections, ``dsa.sp.SpDsaCore``, ``kda.sp.SpKdaCore``) serve both.
     ep_group: bool = False
+    # The DEP mode (``runtime.dep``: TP1 attention, 96 heads per rank, expert-parallel
+    # MegaMoE over the DP ranks).
+    dep: bool = False
 
     @property
     def ep_group_step(self) -> bool:
@@ -101,6 +104,14 @@ class Context:
         context the group attention families accept. Hand-built SP contexts
         (``sequence_parallel`` only) count."""
         return self.ep_group or self.sequence_parallel
+
+    @property
+    def ep_mode_step(self) -> bool:
+        """Whether this is a decode step of an expert-parallel mode (EP_GROUP in
+        either layout, or DEP): the context the mode-generic families (the KDA plain
+        verify core, the decode projections) accept. ``ep_group_step`` keeps its
+        EP_GROUP-only meaning."""
+        return self.ep_group_step or self.dep
 
     @property
     def target(self) -> bool:
