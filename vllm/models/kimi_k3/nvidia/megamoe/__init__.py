@@ -66,7 +66,10 @@ def install_patched_header(deep_gemm, cache_root: Path | None = None) -> Path | 
 
 def prepare_megamoe(model: torch.nn.Module, vllm_config) -> None:
     """Install the Kimi K3.1 MegaMoE kernel header for every ``DeepGemmMegaMoEExperts``
-    (FP8 x FP4 SiTU) of ``model``."""
+    (FP8 x FP4 SiTU) of ``model``. DeepGEMM MegaMoE only: nothing to do for any
+    other MoE backend (``kimi_k3_mega_moe`` runs its own vendored kernels)."""
+    if vllm_config.kernel_config.moe_backend != "deep_gemm_mega_moe":
+        return
     from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import (
         DeepGemmMegaMoEExperts,
     )

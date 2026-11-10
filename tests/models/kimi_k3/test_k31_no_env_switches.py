@@ -42,12 +42,17 @@ ALLOWED = {
     "VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT",
     "VLLM_KIMI_K3_AUX_ATTN_RES_STREAM",
 }
+# Byte-identical vendored kernel sources (megamoe_rubin/VENDOR.md); their diagnostic
+# variables (MEGA_USE_NCU, MEGA_F4CVT_USE_MANUAL) are never set by vLLM.
+VENDORED = ROOT / "megamoe_rubin" / "src"
 
 
 def test_no_env_switches():
     reads = {}
     for path in sorted(ROOT.rglob("*")):
         if path.suffix not in (".py", ".cu", ".cuh", ".h", ".cpp"):
+            continue
+        if path.is_relative_to(VENDORED):
             continue
         for match in READ.finditer(path.read_text()):
             name = next(g for g in match.groups() if g)

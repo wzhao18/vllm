@@ -9,6 +9,7 @@ import threading
 import torch
 
 from vllm.config import ParallelConfig
+from vllm.config.kernel import NATIVE_MEGA_MOE_BACKENDS
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -83,12 +84,13 @@ def override_envs_for_eplb(
 
     Args:
         parallel_config: The parallel configuration object.
-        moe_backend: The configured MoE backend (e.g. ``deep_gemm_mega_moe``).
+        moe_backend: The configured MoE backend (e.g. ``deep_gemm_mega_moe``,
+            ``kimi_k3_mega_moe``).
 
     """
     is_data_parallel = parallel_config.data_parallel_size > 1
     is_eplb_enabled = parallel_config.enable_eplb
-    is_mega_moe = moe_backend == "deep_gemm_mega_moe"
+    is_mega_moe = moe_backend in NATIVE_MEGA_MOE_BACKENDS
     is_nccl_based_eplb_communicator = parallel_config.eplb_config.communicator in (
         "torch_nccl",
         "pynccl",
@@ -97,11 +99,12 @@ def override_envs_for_eplb(
     # Override NCCL_MAX_CTAS to avoid hangs when EPLB's NCCL weight exchange
     # contends with MoE backend's cooperative-launch on GPU SMs.
     #
-    # DeepGEMM Mega MoE uses cooperative launch, which tries to reserve a
-    # large fraction of the GPU's SMs. If those SMs are occupied by NCCL,
-    # the cooperative launch blocks until enough SMs are freed, causing a
-    # deadlock. Limiting NCCL occupancy via NCCL_MAX_CTAS leaves space for
-    # the cooperative kernel to launch and complete.
+    # The native Mega MoE backends (DeepGEMM, Rubin) use cooperative or
+    # persistent launches, which try to reserve a large fraction of the GPU's
+    # SMs. If those SMs are occupied by NCCL, the cooperative launch blocks
+    # until enough SMs are freed, causing a deadlock. Limiting NCCL occupancy
+    # via NCCL_MAX_CTAS leaves space for the cooperative kernel to launch and
+    # complete.
     if (
         is_data_parallel
         and is_eplb_enabled
@@ -118,6 +121,6 @@ def override_envs_for_eplb(
         logger.info_once(
             f"EPLB: Setting NCCL_MAX_CTAS={override_value} "
             f"for expert parallel with NCCL-based EPLB communicator and "
-            f"cooperative MoE backend (deep_gemm_mega_moe)",
+            f"cooperative MoE backend ({moe_backend})",
             scope="global",
         )

@@ -85,14 +85,17 @@ def sp_topology(vllm_config) -> bool:
     """Whether the deployment is the sequence-parallel decode topology: TP4 = DCP4
     attention groups (one pipeline stage) over expert-parallel MegaMoE without the
     MoE token shard, i.e. the stock K3 decoder's ``use_sequence_parallel`` at TP4 =
-    DCP4."""
+    DCP4. Any native MegaMoE backend (DeepGEMM, or Rubin on SM107): the SP step runs
+    the stock MoE module on the shard either way."""
+    from vllm.config.kernel import NATIVE_MEGA_MOE_BACKENDS
+
     parallel = vllm_config.parallel_config
     if not (
         parallel.tensor_parallel_size == 4
         and parallel.decode_context_parallel_size == 4
         and parallel.pipeline_parallel_size == 1
         and parallel.enable_expert_parallel
-        and vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+        and vllm_config.kernel_config.moe_backend in NATIVE_MEGA_MOE_BACKENDS
     ):
         return False
     from ...model import use_moe_token_shard

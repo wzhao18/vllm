@@ -117,6 +117,17 @@ def test_mega_moe_predicate_matches_only_native_mega_moe_layers(monkeypatch) -> 
     assert deep_gemm_warmup._mega_moe_may_use_deep_gemm(kimi_mega)
     assert not deep_gemm_warmup._mega_moe_may_use_deep_gemm(kimi_fused)
 
+    # Kimi K3 on kimi_k3_mega_moe: its experts are not DeepGEMM's.
+    rubin_name = "vllm.models.kimi_k3.nvidia.megamoe_rubin.experts"
+    rubin_cls = type("KimiK3MegaMoEExperts", (), {})
+    monkeypatch.setitem(
+        sys.modules, rubin_name, SimpleNamespace(KimiK3MegaMoEExperts=rubin_cls)
+    )
+    kimi_rubin = kimi_cls()
+    kimi_rubin.use_mega_moe, kimi_rubin.experts = True, rubin_cls()
+    assert not deep_gemm_warmup._mega_moe_may_use_deep_gemm(kimi_rubin)
+    assert deep_gemm_warmup._mega_moe_may_use_deep_gemm(kimi_mega)
+
 
 def test_mega_moe_m_values_reach_mega_gate(monkeypatch) -> None:
     """Each bf16_mega_gate config is warmed with an M above the GateLinear

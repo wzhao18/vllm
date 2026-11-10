@@ -125,6 +125,7 @@ MoEBackend = Literal[
     "batched_triton",
     "deep_gemm",
     "deep_gemm_mega_moe",
+    "kimi_k3_mega_moe",
     "cutlass",
     "flashinfer_trtllm",
     "flashinfer_cutlass",
@@ -160,10 +161,21 @@ FLASHINFER_MOE_EP_BACKENDS = frozenset(
 # run a separate all2all around them.
 PASSTHROUGH_ALL2ALL_BACKEND: Final = "passthrough"
 
-# "Native" here meaning that the backend does not use the fused MoE path.
-# Currently only relevant for the vLLM provided DeepGEMM MegaMoE.,
+KIMI_K3_MEGA_MOE = "kimi_k3_mega_moe"
+
+# "Native" here meaning that the backend does not use the fused MoE path: the
+# vLLM provided DeepGEMM MegaMoE, and the Kimi K3 Rubin (SM107) MegaMoE.
 # TODO: migrate to the fused MoE path ultimately.
-NATIVE_MEGA_MOE_BACKENDS = frozenset({"deep_gemm_mega_moe"})
+NATIVE_MEGA_MOE_BACKENDS = frozenset({"deep_gemm_mega_moe", KIMI_K3_MEGA_MOE})
+
+# The Rubin MegaMoE experts are wired into the Kimi K3 model only.
+KIMI_K3_MEGA_MOE_ARCHITECTURES = frozenset(
+    {
+        "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
+        "KimiLinearForCausalLM",
+    }
+)
 
 # Every megakernel backend. The FlashInfer variants run through the standard
 # fused-MoE model path; the quantization method binds the kernel.
@@ -246,6 +258,21 @@ def validate_flashinfer_moe_ep_model(
         )
 
 
+def validate_kimi_k3_mega_moe_model(
+    moe_backend: str, architectures: Iterable[str]
+) -> None:
+    """Reject ``kimi_k3_mega_moe`` for models that do not wire its experts (other
+    native-MegaMoE models would silently build DeepGEMM MegaMoE instead)."""
+    if moe_backend != KIMI_K3_MEGA_MOE:
+        return
+    if not any(arch in KIMI_K3_MEGA_MOE_ARCHITECTURES for arch in architectures):
+        raise ValueError(
+            f"moe_backend={moe_backend!r} is only supported for Kimi K3 models "
+            f"({sorted(KIMI_K3_MEGA_MOE_ARCHITECTURES)}), but the model is "
+            f"{list(architectures)}."
+        )
+
+
 LinearBackend = Literal[
     "auto",
     "cutlass",
@@ -324,6 +351,12 @@ class KernelConfig:
       activation format ([E_local, max_num_tokens, K])
     - "deep_gemm": Use DeepGEMM kernels (FP8 block-quantized only)
     - "deep_gemm_mega_moe": Use DeepGEMM mega MoE kernels
+    - "kimi_k3_mega_moe": Use the Rubin (SM107, VR200) CuTe DSL MegaMoE kernels
+      (fused dispatch/GEMMs/combine on symmetric memory) for the Kimi K3
+      routed experts; requires expert parallel. MXFP4 checkpoints run MXFP8
+      activations x MXFP4 weights when a rank's MoE sees at most 512 tokens
+      per forward, else the weights are converted exactly to NVFP4 at load
+      (Kimi K3 only)
     - "cutlass": Use vLLM CUTLASS kernels
     - "flashinfer_trtllm": Use FlashInfer with TRTLLM-GEN kernels
     - "flashinfer_cutlass": Use FlashInfer with CUTLASS kernels
@@ -518,6 +551,9 @@ class KernelConfig:
 
         if vllm_config.model_config is not None:
             validate_flashinfer_moe_ep_model(
+                self.moe_backend, vllm_config.model_config.architectures
+            )
+            validate_kimi_k3_mega_moe_model(
                 self.moe_backend, vllm_config.model_config.architectures
             )
         bind_passthrough_all2all_backend(self.moe_backend, vllm_config.parallel_config)

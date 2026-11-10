@@ -152,6 +152,13 @@ def test_c512_is_the_sp_topology():
     assert (decode.q, decode.dcp, decode.captured) == (4, 4, C512_ROWS)
 
 
+def test_c512_on_kimi_k3_mega_moe_is_the_sp_topology():
+    """The Rubin MegaMoE backend (a native MegaMoE) keeps C512's decode role SP."""
+    config = deployment(**{"kernel_config.moe_backend": "kimi_k3_mega_moe"})
+    assert sp_topology(config)
+    assert unsupported(config) is None
+
+
 @pytest.mark.parametrize(
     "tp,dcp,ep,backend",
     [
