@@ -109,6 +109,60 @@ def test_add_request_seeds_state_idx_in_mamba_blocks() -> None:
     assert state._mamba_state_idx_gpu[1] == 121
 
 
+@pytest.mark.parametrize("plan", [None, {"a": 288}])
+def test_prepare_attn_hands_the_step_plan_to_checkpoint_builders(
+    monkeypatch: pytest.MonkeyPatch, plan
+) -> None:
+    """Each batch row gets its request's planned checkpoint (0 for none); a
+    step without a plan (warmup) leaves the builders on the shared rule."""
+    state = object.__new__(MambaHybridModelState)
+    state.vllm_config = SimpleNamespace(num_speculative_tokens=0)
+    state.model_config = SimpleNamespace(max_model_len=8192)
+    state._align_mode = True
+    state._use_flashinfer_replayssm = False
+    state.recoverssm = None
+    state._get_mamba_group_info = lambda kv_cache_config: ([0], None)
+    state.begin_step(SimpleNamespace(mamba_prefill_checkpoints=plan))
+    query_start_loc = np.array([0, 8, 108], dtype=np.int32)
+    input_batch = SimpleNamespace(
+        num_reqs=2,
+        num_tokens=108,
+        num_reqs_after_padding=3,
+        num_tokens_after_padding=108,
+        req_ids=["b", "a"],
+        idx_mapping=torch.arange(2),
+        query_start_loc_np=query_start_loc,
+        query_start_loc=torch.from_numpy(query_start_loc),
+        num_scheduled_tokens=np.array([8, 100], dtype=np.int32),
+        num_draft_tokens_per_req=None,
+        max_query_len=100,
+        seq_lens_cpu_upper_bound=torch.tensor([60, 300], dtype=torch.int32),
+        seq_lens=torch.tensor([60, 300], dtype=torch.int32),
+        is_prefilling_np=np.array([True, True]),
+        prefill_runs_as_decode_np=None,
+        dcp_local_seq_lens=None,
+        positions=torch.zeros(108, dtype=torch.int64),
+        prompt_lens=None,
+    )
+    checkpoint_builder = SimpleNamespace(planned_positions="stale")
+    builder = SimpleNamespace(checkpoint_builder=checkpoint_builder)
+    group = SimpleNamespace(get_metadata_builder=lambda ubatch_idx: builder)
+    monkeypatch.setattr(mamba_hybrid, "build_attn_metadata", Mock(return_value={}))
+    state.prepare_attn(
+        input_batch=input_batch,
+        cudagraph_mode=CUDAGraphMode.FULL,
+        block_tables=(),
+        slot_mappings=torch.empty(0, dtype=torch.int64),
+        attn_groups=[[group]],
+        kv_cache_config=Mock(),
+    )
+    if plan is None:
+        assert checkpoint_builder.planned_positions is None
+    else:
+        # The padded row is never planned.
+        assert checkpoint_builder.planned_positions.tolist() == [0, 288, 0]
+
+
 def test_padded_prompt_tail_builds_as_spec_decode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

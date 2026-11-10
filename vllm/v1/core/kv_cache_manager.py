@@ -893,6 +893,15 @@ class KVCacheManager:
         retained_blocks = [block for pair in pending_copies for block in pair]
         return copies, retained_blocks
 
+    def take_mamba_prefill_checkpoints(self) -> dict[str, int]:
+        """Drain this step's planned Mamba prefill checkpoint positions."""
+        planned: dict[str, int] = {}
+        for manager in self.coordinator.single_type_managers:
+            if isinstance(manager, MambaManager):
+                # Mamba groups share one spec, so they plan alike.
+                planned |= manager.take_planned_checkpoints()
+        return planned
+
     def take_boundary_state_offloads(
         self,
     ) -> dict[str, list[tuple[int, int, int]]]:

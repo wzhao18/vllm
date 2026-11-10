@@ -298,6 +298,11 @@ class SchedulerOutput:
     # CoW copies to apply after zeroing new blocks and before forward.
     kv_cache_block_copies: list[KVCacheBlockCopy] | None = None
 
+    # Mamba prefill checkpoints planned by the KV cache manager, by request:
+    # the worker exports exactly these token positions. None (a step built
+    # without the scheduler, e.g. warmup) follows the shared rule instead.
+    mamba_prefill_checkpoints: dict[str, int] | None = None
+
     # Scheduler-local; always None by the time this reaches a worker.
     kv_connector_block_state: KVConnectorBlockState | None = None
 

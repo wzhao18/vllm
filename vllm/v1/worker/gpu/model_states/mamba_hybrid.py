@@ -21,7 +21,7 @@ from vllm.v1.attention.backends.short_conv_attn import (
     PleShortConvAttentionMetadataBuilder,
     ShortConvAttentionMetadataBuilder,
 )
-from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
 from vllm.v1.worker.gpu.block_table import BlockTables
@@ -91,6 +91,8 @@ class MambaHybridModelState(DefaultModelState):
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
         self._replayssm_query_start_loc: torch.Tensor | None = None
+        # This step's planned prefill checkpoint positions, by request.
+        self._mamba_prefill_checkpoints: dict[str, int] | None = None
         # Pre-copy prefix-cache state (V2). The migration of each request's
         # mamba state across block boundaries runs as a fused GPU kernel reusing
         # the postprocess copy machinery, so the per-step src columns and the
@@ -134,6 +136,10 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_state_idx_gpu[req_index].fill_(
                 (new_req_data.num_computed_tokens - 1) // mamba_block_size
             )
+
+    def begin_step(self, scheduler_output: SchedulerOutput) -> None:
+        super().begin_step(scheduler_output)
+        self._mamba_prefill_checkpoints = scheduler_output.mamba_prefill_checkpoints
 
     def _get_mamba_group_info(
         self, kv_cache_config: KVCacheConfig
@@ -322,10 +328,22 @@ class MambaHybridModelState(DefaultModelState):
 
         if self._align_mode:
             mamba_group_ids, _ = self._get_mamba_group_info(kv_cache_config)
+            # The checkpoints the KV cache manager planned, per batch row (0
+            # for none). Capture and dummy rows match no planned request.
+            planned_checkpoints = None
+            if self._mamba_prefill_checkpoints is not None:
+                planned_checkpoints = np.zeros(num_reqs, dtype=np.int64)
+                for row, req_id in enumerate(input_batch.req_ids):
+                    planned_checkpoints[row] = self._mamba_prefill_checkpoints.get(
+                        req_id, 0
+                    )
             aligned_index_builders = []
             for group_idx, group_id in enumerate(mamba_group_ids):
                 for group in attn_groups[group_id]:
                     builder = group.get_metadata_builder(0)
+                    checkpoint_builder = getattr(builder, "checkpoint_builder", None)
+                    if checkpoint_builder is not None:
+                        checkpoint_builder.planned_positions = planned_checkpoints
                     if hasattr(builder, "mamba_aligned_state_indices"):
                         aligned_index_builders.append((group_idx, builder))
             if aligned_index_builders:

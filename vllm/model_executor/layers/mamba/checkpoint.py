@@ -3,6 +3,7 @@
 
 from dataclasses import dataclass, replace
 
+import numpy as np
 import torch
 
 from vllm.config import VllmConfig
@@ -109,6 +110,10 @@ class MambaPrefillCheckpointBuilder:
             and speculative_config.use_eagle_block_drop()
             and not vllm_config.num_hash_lookahead_tokens
         )
+        # Per batch row, the checkpoint position the KV cache manager planned
+        # (0 for none); set by the model state each step. Rows export exactly
+        # this. None (no planner: warmup, a bare builder) follows the rule.
+        self.planned_positions: np.ndarray | None = None
 
     def build(
         self,
@@ -125,6 +130,9 @@ class MambaPrefillCheckpointBuilder:
         if hash_block_size is None or cache_hit_alignment_tokens is None:
             # Unresolved only for the minimal KV cache built for profiling.
             return None
+        planned = self.planned_positions
+        if planned is not None and not planned.any():
+            return None
         assert m.seq_lens_cpu_upper_bound is not None
         all_query_lens = m.query_start_loc_cpu.diff().tolist()
         query_lens = [all_query_lens[row] for row in request_rows]
@@ -140,6 +148,21 @@ class MambaPrefillCheckpointBuilder:
             cache_hit_alignment_tokens=cache_hit_alignment_tokens,
             num_hash_lookahead_tokens=self.vllm_config.num_hash_lookahead_tokens,
         )
+        if planned is not None:
+            # Only prefill rows can export, so only they may be planned.
+            assert not np.delete(planned, request_rows).any()
+            for i, row in enumerate(request_rows):
+                position = int(planned[row])
+                if not position:
+                    checkpoint_offsets[i], checkpoint_cols[i] = 0, -1
+                else:
+                    # The plan and the shared rule must agree.
+                    query_start = seq_lens[row] - query_lens[i]
+                    assert checkpoint_offsets[i] == position - query_start, (
+                        position,
+                        query_start,
+                        checkpoint_offsets[i],
+                    )
         if not any(checkpoint_offsets):
             return None
         checkpoint_offsets_tensor = async_tensor_h2d(

@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Internal prefill checkpoints for Mamba2 align-mode prefix caching."""
 
+import numpy as np
+import pytest
 import torch
 
 from tests.v1.attention.utils import (
@@ -134,6 +136,22 @@ def test_builder_emits_one_checkpoint_entry_per_prefill_row():
     # also proves the chunk split actually landed on the checkpoint.
     ckpt_chunk = meta.checkpoint_chunk_idx[0]
     assert meta.cu_chunk_seqlen_p[ckpt_chunk + 1].item() == 768
+
+
+def test_builder_exports_only_the_planned_checkpoints():
+    """Rows export exactly the KV cache manager's plan; the rule cross-checks it."""
+    builder = _create_mamba2_builder()
+    checkpoints = builder.checkpoint_builder
+    checkpoints.planned_positions = np.array([0, 0])
+    assert _build(builder, [900, 100], [900, 100]).checkpoint_meta is None
+    checkpoints.planned_positions = np.array([768, 0])
+    meta = _build(builder, [900, 100], [900, 100])
+    assert meta.checkpoint_meta is not None
+    assert meta.checkpoint_meta.checkpoint_offsets.tolist() == [768, 0]
+    # A plan the rule rejects is a bug, not a silent skip.
+    checkpoints.planned_positions = np.array([512, 0])
+    with pytest.raises(AssertionError):
+        _build(builder, [900, 100], [900, 100])
 
 
 def test_update_block_table_regathers_checkpoint_blocks():
