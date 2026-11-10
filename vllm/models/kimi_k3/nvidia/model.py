@@ -1093,6 +1093,38 @@ class KimiMoE(nn.Module):
         return final_hidden_states.view(num_tokens, hidden_size)
 
 
+def warm_prefill_indexer(model: nn.Module) -> None:
+    """Compile trtllm_gvr2's prefill top-k engines at load, on every rank, when
+    the model has DSA layers and sparse_indexer_topk_backend="trtllm_gvr2": the
+    engines never compile under CUDA graph capture (an uncompiled shape there
+    falls back to the FP32 per-row kernel), and one layer's (topk,
+    max_model_len) covers them all. A mid-serving JIT on one DCP rank would
+    also stall its peers in the next bounded DCP exchange.
+
+    Kimi K3's DSA indexer (KimiK3DSAIndexer) is not a SparseAttnIndexer, so
+    both are matched by their topk_backend attribute."""
+    if not any(isinstance(m, KimiK3DSAAttention) for m in model.modules()):
+        return
+    from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
+
+    from .dsa import KimiK3DSAIndexer
+
+    indexer = next(
+        (
+            m
+            for m in model.modules()
+            if isinstance(m, (KimiK3DSAIndexer, SparseAttnIndexer))
+            and m.topk_backend == "trtllm_gvr2"
+        ),
+        None,
+    )
+    if indexer is None:
+        return
+    from vllm.model_executor.layers.indexer_topk import warmup_trtllm_gvr2_prefill
+
+    warmup_trtllm_gvr2_prefill(indexer.topk_tokens, indexer.max_model_len)
+
+
 class KimiDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -1998,6 +2030,8 @@ class KimiLinearForCausalLM(
         from .dsa_kernels.dcp_exchange.decode import build as build_dcpx
 
         self.dcpx = build_dcpx(self.model, self.vllm_config)
+        # trtllm_gvr2 prefill top-k engines, built before any forward.
+        warm_prefill_indexer(self.model)
 
     def build_specialized_decode(self) -> None:
         from .dsa_kernels.dsa_core.decode import build as build_dsa_core

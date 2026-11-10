@@ -63,6 +63,7 @@ if TYPE_CHECKING:
     VLLM_DSA_BPRIME_CHECK: bool = False
     VLLM_DSA_BPRIME_MAILBOX: bool = False
     VLLM_DSA_DCP_PREFILL_HIST_MERGE: bool = False
+    VLLM_SPARSE_INDEXER_PREFILL_LOGITS_SCHEDULE: bool = True
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_XPU_PP_MICROBATCH: bool = True
     VLLM_DISTRIBUTED_USE_SPLIT_GROUP: bool = False
@@ -1138,6 +1139,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # candidate (vllm/models/kimi_k3/nvidia/dsa_kernels/dcp_prefill_topk_merge).
     "VLLM_DSA_DCP_PREFILL_HIST_MERGE": lambda: bool(
         int(os.getenv("VLLM_DSA_DCP_PREFILL_HIST_MERGE", "0"))
+    ),
+    # Sparse MLA indexer prefill: pass DeepGEMM's cost-balanced CTA schedule
+    # (get_mqa_logits_metadata) to the MQA logits kernel instead of its
+    # round-robin Q-block assignment. Bit-identical logits. Default: on
+    "VLLM_SPARSE_INDEXER_PREFILL_LOGITS_SCHEDULE": lambda: bool(
+        int(os.getenv("VLLM_SPARSE_INDEXER_PREFILL_LOGITS_SCHEDULE", "1"))
     ),
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.

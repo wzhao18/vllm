@@ -192,6 +192,7 @@ _grouped_impl: Callable[..., Any] | None = None
 _grouped_masked_impl: Callable[..., Any] | None = None
 _grouped_fp4_impl: Callable[..., Any] | None = None
 _fp8_fp4_mqa_logits_impl: Callable[..., Any] | None = None
+_get_mqa_logits_metadata_impl: Callable[..., Any] | None = None
 _fp8_fp4_paged_mqa_logits_impl: Callable[..., Any] | None = None
 _get_paged_mqa_logits_metadata_impl: Callable[..., Any] | None = None
 _fp8_fp4_sparse_mqa_logits_impl: Callable[..., Any] | None = None
@@ -272,6 +273,7 @@ def _lazy_init() -> None:
     global _fp8_gemm_nt_impl, _fp8_einsum_impl
     global _grouped_impl, _grouped_masked_impl, _grouped_fp4_impl
     global _fp8_fp4_mqa_logits_impl, _fp8_fp4_paged_mqa_logits_impl
+    global _get_mqa_logits_metadata_impl
     global _get_paged_mqa_logits_metadata_impl
     global _fp8_fp4_sparse_mqa_logits_impl, _fp8_fp4_paged_sparse_mqa_logits_impl
     global _get_sparse_mqa_logits_metadata_impl
@@ -337,6 +339,7 @@ def _lazy_init() -> None:
     # DeepGEMM exposes fp8_fp4_*_mqa_logits as the canonical symbols that
     # handle both the FP8 and FP4 Q/K paths via a tuple-typed `q`.
     _fp8_fp4_mqa_logits_impl = getattr(_dg, "fp8_fp4_mqa_logits", None)
+    _get_mqa_logits_metadata_impl = getattr(_dg, "get_mqa_logits_metadata", None)
     _fp8_fp4_paged_mqa_logits_impl = getattr(_dg, "fp8_fp4_paged_mqa_logits", None)
     _get_paged_mqa_logits_metadata_impl = getattr(
         _dg, "get_paged_mqa_logits_metadata", None
@@ -675,6 +678,7 @@ def fp8_fp4_mqa_logits(
     cu_seqlen_ks: torch.Tensor,
     cu_seqlen_ke: torch.Tensor,
     max_seqlen_k: int,
+    schedule_meta: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute MQA logits for a single sequence without KV paging.
 
@@ -694,6 +698,9 @@ def fp8_fp4_mqa_logits(
         cu_seqlen_ke: End indices (exclusive) for valid K per query
             position, shape [M], dtype int32.
         max_seqlen_k: Upper bound on ``cu_seqlen_ke - cu_seqlen_ks``.
+        schedule_meta: Optional `get_mqa_logits_metadata` output (SM100): the
+            CTAs split the KV work by cost instead of taking Q blocks
+            round-robin. The logits are bit-identical either way.
 
     Returns:
         Compressed logits of shape [M, max_seqlen_k]: row ``i`` holds K
@@ -704,6 +711,16 @@ def fp8_fp4_mqa_logits(
     _lazy_init()
     if _fp8_fp4_mqa_logits_impl is None:
         return _missing()
+    if schedule_meta is not None:
+        return _fp8_fp4_mqa_logits_impl(
+            q,
+            kv,
+            weights,
+            cu_seqlen_ks,
+            cu_seqlen_ke,
+            max_seqlen_k,
+            schedule_meta=schedule_meta,
+        )
     return _fp8_fp4_mqa_logits_impl(
         q,
         kv,
@@ -711,6 +728,32 @@ def fp8_fp4_mqa_logits(
         cu_seqlen_ks,
         cu_seqlen_ke,
         max_seqlen_k,
+    )
+
+
+def get_mqa_logits_metadata(
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    num_kv_tokens: int,
+    num_heads: int,
+) -> torch.Tensor | None:
+    """Cost-balanced CTA schedule for `fp8_fp4_mqa_logits` (SM100).
+
+    Args:
+        cu_seqlen_ks: Per-row K start (int32, [M]), as for the logits call.
+        cu_seqlen_ke: Per-row K end (int32, [M]), as for the logits call.
+        num_kv_tokens: Rows of the K tensor passed to the logits call.
+        num_heads: Query heads of the logits call.
+
+    Returns:
+        The ``schedule_meta`` tensor, or None when DeepGEMM has no builder.
+
+    """
+    _lazy_init()
+    if _get_mqa_logits_metadata_impl is None:
+        return None
+    return _get_mqa_logits_metadata_impl(
+        cu_seqlen_ks, cu_seqlen_ke, num_kv_tokens, num_heads
     )
 
 
@@ -1126,6 +1169,7 @@ __all__ = [
     "m_grouped_fp8_fp4_gemm_nt_contiguous",
     "fp8_m_grouped_gemm_nt_masked",
     "fp8_fp4_mqa_logits",
+    "get_mqa_logits_metadata",
     "fp8_fp4_paged_mqa_logits",
     "get_paged_mqa_logits_metadata",
     "mqa_logits_mx_inputs",
