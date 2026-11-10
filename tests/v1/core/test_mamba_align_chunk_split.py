@@ -61,6 +61,12 @@ MAMBA_GROUP_ID = 1
         (15360, 16960, 16896, 128, 1536, 16, True),
         (15360, 16960, 16768, 128, 1536, 16, True),
         (16064, 18433, 18432, 128, 1536, 16, False),
+        # A mid-block start may export into the resumed state's column...
+        (192, 300, 288, 16, 128, 16, True),
+        # ... but ending in the block it resumes in leaves no column for it.
+        (192, 250, 240, 16, 128, 16, False),
+        # A block-aligned start resumes from a boundary state it may not touch.
+        (256, 300, 288, 16, 128, 16, False),
     ],
 )
 def test_mamba_prefill_checkpoint_valid(
@@ -188,7 +194,7 @@ def test_internal_checkpoint_split(
     )
 
 
-def test_partial_checkpoint_resume_stops_at_mamba_block_boundary() -> None:
+def test_partial_checkpoint_resume_split() -> None:
     prompt_len = 3602
     resume_at = 1984
     (request,) = create_requests(1, num_tokens=prompt_len, block_size=ATTN_BLOCK_SIZE)
@@ -206,9 +212,9 @@ def test_partial_checkpoint_resume_stops_at_mamba_block_boundary() -> None:
         == MAMBA_BLOCK_SIZE - resume_at % MAMBA_BLOCK_SIZE
     )
 
-    # A hash-aligned resume inside a physical Mamba block cannot use the fixed
-    # internal-checkpoint column: it aliases the initial-state column. Enabling
-    # checkpoints must therefore preserve the normal aligned split.
+    # With one, a hash-aligned resume inside a physical Mamba block exports
+    # the prompt checkpoint into the column it resumes from, so the final
+    # chunk runs in one step.
     assert (
         _split(
             request,
@@ -217,7 +223,7 @@ def test_partial_checkpoint_resume_stops_at_mamba_block_boundary() -> None:
             partial_hit=True,
             num_prefill_checkpoint_blocks=1,
         )
-        == MAMBA_BLOCK_SIZE - resume_at % MAMBA_BLOCK_SIZE
+        == prompt_len - resume_at
     )
 
 

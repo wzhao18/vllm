@@ -1232,16 +1232,21 @@ def is_mamba_prefill_checkpoint_valid(
     mamba_block_size: int,
     checkpoint_alignment: int | None,
 ) -> bool:
-    """Whether a backend can export the checkpoint in this query."""
+    """Whether a backend can export the checkpoint in this query.
+
+    The checkpoint goes in the column before the running one, which must not
+    precede the query's first column: earlier columns may hold shared prefix
+    cache blocks. A mid-block start's first column is the request's private
+    copy of the resumed state, read before the forward.
+    """
     if checkpoint_alignment is None:
         return False
     assert checkpoint_alignment > 0
 
-    initial_state_col = (query_start - 1) // mamba_block_size
     checkpoint_col = cdiv(query_end, mamba_block_size) - 2
     return (
         query_start % hash_block_size == 0
-        and checkpoint_col > initial_state_col
+        and checkpoint_col >= query_start // mamba_block_size
         and query_start + hash_block_size <= checkpoint_position
         and query_start < checkpoint_position < query_end
         and (checkpoint_position - query_start) % checkpoint_alignment == 0
