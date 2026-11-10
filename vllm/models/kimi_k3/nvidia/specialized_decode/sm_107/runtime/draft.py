@@ -492,6 +492,18 @@ class DraftFastPath:
         device = torch.device(torch.cuda.current_device())
         if torch.cuda.get_device_capability(device) != (10, 7):
             return None
+        from . import dep_topology
+
+        if dep_topology(vllm_config):
+            # DEP phase A: the whole DSpark drafter is the declared stock module at
+            # G = 1 (``dep.DEP_DECLARED`` "drafter"): no TP1 tables yet (W10: fused
+            # Markov without the exchange, the drafter LM head, 96-head drafter MLA),
+            # one declared coverage line instead of per-site keeps.
+            log_coverage(
+                0, "drafter",
+                "DEP (TP1): declared stock DSpark module at every row (W10)",
+            )  # fmt: skip
+            return None
         from vllm.distributed import get_tp_group
 
         group = get_tp_group()

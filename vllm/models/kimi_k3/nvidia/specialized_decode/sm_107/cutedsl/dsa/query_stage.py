@@ -57,6 +57,7 @@ def compile_query(
     overlap="serial",
     cap=64,
     release=True,
+    fi_heads=0,
 ):
     """MlaQuery (dsa) of one batch of rows. ``fakes``: the fake weight and cache
     tensors (q_a norm, kv_a norm, Q_B, W_UK, the MLA cache). Under DCP the query
@@ -65,11 +66,14 @@ def compile_query(
     q mailbox rows (DcpBox.cap). ``overlap`` (overlap.MODES): "fork" and "front"
     leave the q_c rows to QueryNorm or IndexFront, and every mode but "serial" the
     mailbox poll to QueryWait.
-    ``release``: launch the next kernel early (PDL)."""
+    ``release``: launch the next kernel early (PDL). ``fi_heads``: the FP8 query
+    buffer's heads per row (0: ``heads``; DEP's 96 heads: 128, trtllm-gen's padded
+    query, ``QueryStage``), its row stride; the kernel writes the first ``heads``."""
     qnorm, kvnorm, qb, uk, kv = fakes
     scalar = fake((1,), (1,), torch.float32, 4)
-    if fp8:
-        query = fake((batch, heads, 576), (heads * 576, 576, 1), torch.uint8)
+    if fp8:  # the query buffer's row stride, never the projection's ``pitch``
+        qpitch = (fi_heads or heads) * 576
+        query = fake((batch, heads, 576), (qpitch, 576, 1), torch.uint8)
     else:
         query = fake((batch, QUERY_HEADS, 576), (QUERY_HEADS * 576, 576, 1))
     qc = fake((batch, 1536), (1536, 1))
@@ -213,10 +217,18 @@ class QueryStage:
     query (FlashInfer), whose query rows are this layer's own, over a per-tensor FP8
     cache or (``nvfp4``) an nvfp4_ds_mla one, whose rows carry their own scales."""
 
-    def __init__(self, attention, pitches, scratch, fp8, nvfp4=False):
+    def __init__(self, attention, pitches, scratch, fp8, nvfp4=False, fi_heads=0):
+        """``fi_heads``: the FP8 query rows' heads (0: the layer's; DEP's 96 heads:
+        128, trtllm-gen's zero-padded query as stock's ``_pad_query_heads``: the
+        pad heads are zero from allocation and never written)."""
         wrapper = attention.mla_attn
         layer, self.indexer = wrapper.mla_attn, attention.dsa_indexer
         self.heads = layer.W_UK_T.shape[0]
+        self.fi_heads = fi_heads or self.heads
+        if self.fi_heads < self.heads:
+            raise ValueError(
+                f"Kimi K3.1 DSA query: {self.fi_heads} buffer heads < {self.heads}"
+            )
         norms = wrapper.q_a_layernorm.weight, wrapper.kv_a_layernorm.weight
         self.weights: tuple = (*norms, wrapper.q_b_proj.weight, layer.W_UK_T)
         self.weights += (layer.W_UV,)
@@ -233,12 +245,13 @@ class QueryStage:
         # The FP8 query's inverse per-tensor scale and the KV row's scale (the
         # stock concat_and_cache_mla divides by it; FlashMLA: unused).
         self.scales = self.unit, self.unit
+        self.fp8_rows = fp8  # this layer's own FP8 query rows (else the BF16 scratch)
         if fp8:
             q_scale_inv = (1 / layer._q_scale.float()).reshape(1).to(device)
             k_scale = layer._k_scale.float().reshape(1).to(device)
             # nvfp4_ds_mla: the KV row is unscaled (prims_ts: kv_descale 1)
             self.scales = q_scale_inv, self.unit if nvfp4 else k_scale
-            shape = (max(pitches), self.heads, 576)
+            shape = (max(pitches), self.fi_heads, 576)
             self.query = torch.zeros(shape, dtype=torch.uint8, device=device)
         policies = index_policies(sorted(pitches))
         wq = self.indexer.wq_index.weight
@@ -257,7 +270,11 @@ class QueryStage:
         x, q_slots = to_cute(projected), to_cute(slots[:batch], 8)
         scales = q_scale_inv, k_scale, self.eps
         q_args = (x, qnorm, kvnorm, qb, uk, kv, q_slots, *scales)
-        query, qc = to_cute(self.query[:batch]), to_cute(self.qc[:batch])
+        # (the layer's heads of the rows: the padded FP8 buffer's row stride stays)
+        query = self.query[:batch]
+        if self.fp8_rows:
+            query = query[:, : self.heads]
+        query, qc = to_cute(query), to_cute(self.qc[:batch])
         kernel(*q_args, query, qc, *publish, s)
 
     def run_norm(self, kernel, projected):

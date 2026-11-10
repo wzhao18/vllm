@@ -217,30 +217,26 @@ TABLE = [
         REP,  # stock SP needs PP1
         "pipeline parallelism",
     ),
-    # -- DEP: expert parallelism over TP1 ----------------------------------------
+    # -- DEP: expert parallelism over TP1 (runtime.dep) ---------------------------
+    ("dep16", dict(tp=1, dp=16, ep=True), True, DEP, LOC, None),
+    ("dep32", dict(tp=1, dp=32, ep=True), True, DEP, LOC, None),
+    ("dep16-kk", dict(tp=1, dp=16, ep=True, backend=KK), True, DEP, LOC, None),
+    ("dep16-q1", dict(tp=1, dp=16, ep=True, spec=None), True, DEP, LOC, None),
     (
-        "dep16",
-        dict(tp=1, dp=16, ep=True),
+        "dep16-dcp2",
+        dict(tp=1, dcp=2, dp=16, ep=True),
         True,
         DEP,
         LOC,
-        "mode DEP not implemented on sm_107 yet (TP1 x DP16, EP16)",
+        "decode context parallel other than 1 or TP (DCP2 at TP1",
     ),
     (
-        "dep32",
-        dict(tp=1, dp=32, ep=True),
+        "dep16-pp2",
+        dict(tp=1, dp=16, ep=True, pp=2),
         True,
         DEP,
         LOC,
-        "mode DEP not implemented on sm_107 yet (TP1 x DP32, EP32)",
-    ),
-    (
-        "dep16-kk",
-        dict(tp=1, dp=16, ep=True, backend=KK),
-        True,
-        DEP,
-        LOC,
-        "mode DEP not implemented on sm_107 yet (TP1 x DP16, EP16)",
+        "pipeline parallelism",
     ),
     (
         "dep32-kk",
@@ -458,7 +454,7 @@ def deployment(**kwargs):
 @pytest.mark.parametrize(
     "kwargs,overrides,prefix",
     [
-        (dict(tp=1, dcp=1, dp=16), {}, "mode DEP not implemented on sm_107 yet"),
+        (dict(tp=1, dcp=1, dp=16), {}, "ReplaySSM / RecoverSSM (--use-replayssm) out"),
         (dict(tp=8, dcp=8, dp=2), {}, "ReplaySSM / RecoverSSM (--use-replayssm) out"),
         (
             dict(tp=8, dcp=8, dp=2),
@@ -573,6 +569,135 @@ def test_gate_refuses_replicated_step_states_and_env(gate, monkeypatch):
     with monkeypatch.context() as patch:
         patch.setattr(current_platform, "is_device_capability", lambda cc: False)
         assert "Rubin SM107 only" in gate.unsupported(config)
+
+
+# The DEP step's deployment (runtime.dep): no ReplaySSM (B9), 64 requests x q4 per
+# rank; DSpark q4 under synthetic rejection (any method is served at DEP phase A).
+DEP_DEPLOYMENT = {
+    "cache_config.use_replayssm": False,
+    "scheduler_config.max_num_seqs": 64,
+}
+
+
+@pytest.mark.parametrize(
+    "dp,backend,mnbt",
+    [
+        (16, DG, None),  # DEP16 on DeepGEMM MegaMoE
+        (32, DG, None),  # DEP32 on DeepGEMM MegaMoE
+        (16, DG, 8192),
+        (16, KK, None),  # DEP16 on the Rubin MegaMoE (no capacity known)
+        (16, KK, 1024),  # EP16 1024-token record: exact
+        (16, KK, 8192),  # EP16 inference bucket (token-bucket selection)
+    ],
+)
+def test_gate_serves_dep(gate, dp, backend, mnbt):
+    """DEP (TP1 x DP16 / DP32) passes as the DEP step: its config carries the DEP
+    mode, the local layout, DP = EP, MegaMoE's full MNBT capacity (no SP shard) and
+    every captured row (4..256 at 64 requests x q4)."""
+    overrides = dict(DEP_DEPLOYMENT)
+    overrides["kernel_config.moe_backend"] = backend
+    if mnbt is not None:
+        overrides["scheduler_config.max_num_batched_tokens"] = mnbt
+    config = deployment(tp=1, dcp=1, dp=dp, **overrides)
+    assert gate.unsupported(config) is None
+    assert gate.dep_topology(config) and not gate.ep_group_topology(config)
+    assert gate.ep_topology(config) is DEP and not gate.sp_topology(config)
+    decode = gate.specialized_decode_config(config)
+    assert decode.mode is DEP and not decode.sequence_parallel
+    assert decode.topology.step_layout is LOC and decode.topology.layout is LOC
+    assert (decode.dp, decode.ep, decode.dcp, decode.topology.g) == (dp, dp, 1, 1)
+    assert decode.topology.moe_tokens == (mnbt or 0)
+    assert decode.captured == tuple(range(4, 257, 4)) and not decode.replayssm
+
+
+def test_gate_refuses_dep32_on_the_rubin_megamoe(gate):
+    """DEP32 on kimi_k3_mega_moe: no EP32 record (W9), refused by the topology."""
+    overrides = {**DEP_DEPLOYMENT, "kernel_config.moe_backend": KK}
+    reason = gate.unsupported(deployment(tp=1, dcp=1, dp=32, **overrides))
+    assert reason is not None and reason.startswith("kimi_k3_mega_moe at EP32"), reason
+
+
+@pytest.mark.parametrize(
+    "overrides,cause",
+    [
+        ({"cache_config.cache_dtype": "fp8_ds_mla"}, "fp8_ds_mla KV cache"),
+        ({"cache_config.cache_dtype": "nvfp4_ds_mla"}, "nvfp4_ds_mla"),
+        ({"attention_config.backend": "FLASHMLA_SPARSE"}, "FLASHINFER_MLA_SPARSE"),
+        ({"kernel_config.flashinfer_sparse_mla_kernel": "prims_ts"}, "prims_ts"),
+        ({"speculative_config": None}, "no speculation (q1"),
+        ({"scheduler_config.max_num_seqs": 513}, "more than 512 requests per rank"),
+        ({"cache_config.use_replayssm": True}, "DEP: B9"),
+        ({"cache_config.use_kda_recoverssm": True}, "DEP: B9"),
+    ],
+)
+def test_gate_refuses_dep(gate, overrides, cause):
+    """Each narrowing of the DEP step raises at load with its reason."""
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    settings = {**DEP_DEPLOYMENT, **overrides}
+    if settings.get("attention_config.backend") == "FLASHMLA_SPARSE":
+        settings["attention_config.backend"] = AttentionBackendEnum.FLASHMLA_SPARSE
+    no_spec = "speculative_config" in settings
+    settings.pop("speculative_config", None)
+    config = deployment(tp=1, dcp=1, dp=16, **settings)
+    if no_spec:  # (after the decode sizes resolved)
+        config.speculative_config = None
+    reason = gate.unsupported(config)
+    assert reason is not None and cause in reason, reason
+    with pytest.raises(ValueError, match="Kimi K3 specialized decode does not"):
+        gate.specialized_decode_config(config)
+
+
+def test_gate_refuses_dep_states_and_env(gate, monkeypatch):
+    """A BF16 KDA recurrent state and an FP32 conv state (D2), the fused GEMM-RS
+    o_proj, a model without DSA layers and a non-Rubin GPU are refused for DEP."""
+    from vllm import envs
+    from vllm.platforms import current_platform
+
+    config = deployment(tp=1, dcp=1, dp=16, **DEP_DEPLOYMENT)
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            gate, "kda_dtypes", lambda config: (torch.bfloat16, torch.bfloat16)
+        )
+        reason = gate.unsupported(config)
+        assert reason.startswith("data-parallel attention (DEP, TP1)"), reason
+        assert "deferred, D2" in reason, reason
+    with monkeypatch.context() as patch:
+        patch.setattr(gate, "kda_dtypes", lambda config: (torch.float32, torch.float32))
+        assert "KDA cache dtypes other than a BF16 conv" in gate.unsupported(config)
+    with monkeypatch.context() as patch:
+        patch.setattr(envs, "VLLM_ENABLE_GEMM_RS", True, raising=False)
+        assert "VLLM_ENABLE_GEMM_RS" in gate.unsupported(config)
+    with monkeypatch.context() as patch:
+        patch.setattr(current_platform, "is_device_capability", lambda cc: False)
+        assert "this GPU" in gate.unsupported(config)
+    k3 = deployment(tp=1, dcp=1, dp=16, **DEP_DEPLOYMENT)
+    k3.model_config.hf_text_config.dsa_config = None
+    assert "without DSA layers" in gate.unsupported(k3)
+
+
+@pytest.mark.parametrize("method", ["synthetic", "probabilistic", "greedy"])
+def test_dep_verify_is_declared_stock(gate, method):
+    """DEP phase A: VerifyArgmax declares the stock sampler at every rejection method
+    (no TP1 kernels until B1 / B2) instead of raising or building the vocabulary-
+    sharded kernels; so SampledVerify is not built either."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.runtime.verify import (
+        VerifyArgmax,
+    )
+
+    config = deployment(tp=1, dcp=1, dp=16, **DEP_DEPLOYMENT)
+    config.speculative_config.rejection_sample_method = method
+    assert VerifyArgmax.build(config, model=None) is None
+
+
+def test_gate_dep_keeps_other_modes(gate):
+    """Lifting the DEP refusal leaves C512 and the replicated step's gating as is."""
+    assert gate.unsupported(deployment()) is None
+    assert gate.unsupported(deployment(tp=8, dcp=8, dp=2, **GROUP)) is None
+    assert not gate.dep_topology(deployment())
+    assert gate.ep_topology(deployment(tp=8, dcp=8, dp=2, **GROUP)) is EPG
+    tp16 = deployment(tp=16, dcp=16, dp=1, ep=False, **GROUP)
+    assert gate.ep_topology(tp16) is None
 
 
 def test_sp_topology_alias_matches_sp_step(gate):

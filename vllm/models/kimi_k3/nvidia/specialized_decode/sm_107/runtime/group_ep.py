@@ -359,6 +359,10 @@ class GroupStep:
     DCP = G, the DSA layers' W_UV gathers) happen here, in layer order on every
     rank, before the KV cache is profiled."""
 
+    # The family ``plan`` / ``scratch`` name in ``Unsupported`` (``dep.DepStep``:
+    # "dep_step").
+    family = "group_step"
+
     def __init__(self, runtime):
         self.runtime = runtime
         self.ctx = ctx = runtime.context
@@ -500,7 +504,7 @@ class GroupStep:
             self.buffers[name] = buffer
         elif tuple(buffer.shape) != tuple(shape):
             raise Unsupported(
-                "group_step", None, f"scratch {name} {tuple(buffer.shape)} vs {shape}"
+                self.family, None, f"scratch {name} {tuple(buffer.shape)} vs {shape}"
             )
         return buffer
 
@@ -614,29 +618,29 @@ class GroupStep:
         stock forward."""
         from .decode import Step, decode_metadata
 
-        b = positions.shape[0]
+        b, family = positions.shape[0], self.family
         if not torch.cuda.is_current_stream_capturing():
             return None
         if not is_forward_context_available():
-            raise Unsupported("group_step", b, "a capture without a forward context")
+            raise Unsupported(family, b, "a capture without a forward context")
         context = get_forward_context()
         if context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
             return None
         if intermediate_tensors is not None:
-            raise Unsupported("group_step", b, "pipeline-parallel stage inputs")
+            raise Unsupported(family, b, "pipeline-parallel stage inputs")
         by_layer = context.attn_metadata
         found = list(by_layer.values()) if isinstance(by_layer, dict) else []
         q = self.q if any(getattr(md, "num_spec_decodes", 0) for md in found) else 1
         shape = Shape(b, q)
         if b not in self.rows:
             raise Unsupported(
-                "group_step", shape,
+                family, shape,
                 f"a FULL decode capture outside the captured rows {self.rows[0]}-"
                 f"{self.rows[-1]}",
             )  # fmt: skip
         if q != self.q:
             raise Unsupported(
-                "group_step", shape, f"a FULL decode capture that is not a q{self.q} "
+                family, shape, f"a FULL decode capture that is not a q{self.q} "
                 "verify",
             )  # fmt: skip
         layers = self.layers
@@ -644,7 +648,7 @@ class GroupStep:
         missing = [d.layer_idx for d, md in zip(layers, metadata) if md is None]
         if missing:
             raise Unsupported(
-                "group_step", shape,
+                family, shape,
                 f"layers {missing[:4]} ({len(missing)}) lack uniform q{q} verify "
                 "metadata",
             )  # fmt: skip

@@ -26,13 +26,16 @@ It selects one of three modes (``Mode``):
   sequence-parallel step (TP4 = DCP4, ``sp_step``: stock's row shard, layout (c),
   ``runtime.sp_attention``) and the replicated step everywhere else (layout (b),
   ``runtime.group_ep``).
-- ``DEP``: expert parallelism with ``g = 1`` (data-parallel attention).
+- ``DEP``: expert parallelism with ``g = 1`` (data-parallel attention: TP1 x DP16 /
+  DP32, EP16 / EP32, ``runtime.dep``): the residual stream is the rank's own rows
+  (``Layout.LOCAL``), MegaMoE's capacity is ``max_num_batched_tokens`` (no SP shard).
 
 ``refusal`` gives the reason a topology is not served (None when it is). It is the
 only topology gate of the decode: a refused topology raises at load, never a silent
-fallback to the stock forward. DEP is refused ("mode DEP not implemented on sm_107
-yet"); the EP_GROUP layouts' own deployment checks (KV dtype, rows, speculation)
-follow in ``runtime.sp_unsupported`` / ``runtime.ep_group_unsupported``.
+fallback to the stock forward. The modes' own deployment checks (KV dtype, rows,
+speculation) follow in ``runtime.sp_unsupported`` / ``runtime.ep_group_unsupported``
+/ ``runtime.dep_unsupported``. The Rubin MegaMoE record gate checks DEP's full MNBT
+bucket (no shard), so DEP32 on ``kimi_k3_mega_moe`` is refused until W9 tunes EP32.
 
 CPU-only: nothing here imports CuTe DSL or a device API (the Rubin MegaMoE record
 checks read the shipped JSON file).
@@ -306,8 +309,7 @@ def refusal(topology: Topology, *, dsa: bool, pp: int = 1) -> str | None:
         gap = rubin_megamoe_capacity_gap(t.ep, t.moe_tokens) if t.moe_tokens else None
         if gap is not None:
             return f"{KIMI_K3_MEGA_MOE} at EP{t.ep}: {gap}"
-    if t.mode is Mode.DEP:
-        return f"mode DEP not implemented on sm_107 yet (TP1 x DP{t.dp}, EP{t.ep})"
-    # EP_GROUP: TP4 / TP8 / TP16, DCP 1 or TP, any DP; the layout's own checks follow
-    # (``runtime.sp_unsupported`` / ``runtime.ep_group_unsupported``).
+    # EP_GROUP: TP4 / TP8 / TP16, DCP 1 or TP, any DP; DEP: TP1 (DCP1) x any DP. The
+    # mode's own checks follow (``runtime.sp_unsupported`` /
+    # ``runtime.ep_group_unsupported`` / ``runtime.dep_unsupported``).
     return None

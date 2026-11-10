@@ -80,6 +80,8 @@ def layer(heads, q, seed=0):
         weight=torch.empty(pitch_of(heads), 8, device="meta")
     )
     attention.recoverssm_records = None
+    # stock's resolved verify backend: the plain cores (and stock_run) are native
+    attention.kda_spec_decode_backend = "native"
     return attention
 
 
@@ -124,7 +126,7 @@ def test_plain_core_matches_stock_verify(monkeypatch, heads, q, requests):
 def test_plain_core_refusals():
     """Outside the EP_GROUP mode, a BF16 state, or no speculation: refused at build
     (never a stock fallback)."""
-    with pytest.raises(Unsupported, match="EP_GROUP decode only"):
+    with pytest.raises(Unsupported, match="expert-parallel decode modes only"):
         ctx = context(12, 4, ep_group=False)
         sp.SpKdaCore(layer(12, 4), (16,), records="none", ctx=ctx)
     with pytest.raises(Unsupported, match="FP32 SSM state"):
@@ -134,3 +136,9 @@ def test_plain_core_refusals():
         sp.SpKdaCore(layer(12, 1), (4,), records="none", ctx=context(12, 1))
     with pytest.raises(Unsupported, match="not whole requests"):
         sp.SpKdaCore(layer(24, 4), (6,), records="none", ctx=context(24, 4))
+    # stock resolving FlashInfer's packed fused KDA decode (auto at 12 / 24 heads)
+    for heads in (12, 24):
+        attention = layer(heads, 4)
+        attention.kda_spec_decode_backend = "flashinfer"
+        with pytest.raises(Unsupported, match="stock KDA verify backend"):
+            sp.SpKdaCore(attention, (16,), records="none", ctx=context(heads, 4))
