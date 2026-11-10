@@ -11,7 +11,7 @@ q_b 4608 x 1536, o_proj 7168 x 3072) vs an FP32 reference rounded once to BF16:
   64, 68, 128, 324, 512}: within one BF16 rounding of the reference (the split-K
   kinds reorder the FP32 sum); cuBLAS bitwise equal to ``torch.mm``, the stock GEMM;
 * a captured graph replays every R with fresh inputs;
-* the policy covers every captured R (4-512) and refuses non-SP contexts; operands
+* the policy covers every captured R (4-512) and refuses non-EP_GROUP contexts; operands
   the selected tactics cannot take raise at build (no runtime fallback).
 
 One GPU; about a minute of CuTe compiles on a cold cache."""
@@ -90,12 +90,17 @@ def test_policy_covers_captured(kind):
     assert {kinds[r] for r in CAPTURED if r > 64} == {"cublas"}
 
 
-def test_policy_refuses_outside_sp():
-    with pytest.raises(Unsupported, match="TP4"):
-        sp_projection_tactics("dsa_in", 5344, 7168, CAPTURED, context(tp=8))
-    with pytest.raises(Unsupported, match="TP4"):
+def test_policy_refuses_outside_ep_group():
+    """The tables serve the EP_GROUP steps (SP or replicated) of TP4 / TP8 / TP16
+    groups only."""
+    with pytest.raises(Unsupported, match="EP_GROUP projection tables"):
+        sp_projection_tactics("dsa_in", 5344, 7168, CAPTURED, context(tp=2))
+    with pytest.raises(Unsupported, match="EP_GROUP projection tables"):
         ctx = context(sequence_parallel=False)
         sp_projection_tactics("dsa_in", 5344, 7168, CAPTURED, ctx)
+    # (the replicated EP_GROUP step at TP8: test_k3_sm107_ep_group_gemm_gpu.py)
+    ctx = context(tp=8, dcp=8, sequence_parallel=False, ep_group=True)
+    assert set(sp_projection_tactics("dsa_in", 3808, 7168, (4, 64), ctx)) == {4, 64}
 
 
 @pytest.mark.parametrize("kind", list(SHAPES))

@@ -3,15 +3,28 @@
 """Kimi K3 specialized decode: a CuTe decode executor over the stock backbone, enabled
 by ``additional_config={"decode_backend": "latency_specialized"}``.
 
-Two topologies: plain TP8 / TP16 (DCP 1 or = TP, no expert parallelism), and the
-sequence-parallel (SP) decode role of K3.1's C512 recipe (``sp_topology``): TP4 = DCP4
-attention groups over DP4 with expert-parallel MegaMoE (EP16), where the stock backbone
-keeps the residual stream row-sharded over the TP group (``sp_shard``) and the
-specialized decode replaces each DSA / KDA layer's all-gather -> attention -> o_proj ->
-reduce-scatter (``runtime.sp_attention``).
+The deployment's topology (``topology.Topology``, computed at load) selects the mode:
+``TP_EXPERTS`` (plain TP8 / TP16, DCP 1 or = TP, no expert parallelism), ``EP_GROUP``
+(expert-parallel MegaMoE over attention groups of TP 4 / 8 / 16, DCP 1 or = TP, any
+DP) or ``DEP`` (TP1, refused at load until W5). EP_GROUP runs in one of two residual
+layouts (``Topology.step_layout``):
+
+- the sequence-parallel (SP) decode role of K3.1's C512 recipe (``Topology.sp_step``:
+  TP4 = DCP4 over native MegaMoE), where the step keeps stock's row shard
+  (``sp_shard``) and replaces each DSA / KDA layer's all-gather -> attention ->
+  o_proj -> reduce-scatter (``runtime.sp_attention``; ``sp_unsupported``);
+- every other EP_GROUP topology (TP4 DCP1, TP8 / TP16 with DCP 1 or TP): the
+  replicated step (``runtime.group_ep``; ``ep_group_unsupported``), each DSA / KDA
+  layer's in-projection and core specialized on every row of the group, the o_proj
+  partial reduced by stock's reduce-scatter + all-gather, and the stock SP MoE module
+  on stock's row shard (declared seams, listed per shape at load).
+
+Anything else raises at load (``topology.refusal`` and the layouts' checks).
 """
 
 from dataclasses import dataclass
+
+from .topology import Mode, Topology, refusal
 
 
 @dataclass(frozen=True)
@@ -28,13 +41,24 @@ class DecodeConfig:
     bf16_state: bool = False
     # Token rows of the runner's FULL decode graphs (``shapes.captured_rows``).
     captured: tuple[int, ...] = ()
-    # The SP topology (``sp_topology``): TP4 = DCP4 attention, residual row-sharded.
+    # The SP step (``Topology.sp_step``): TP4 = DCP4 attention, residual row-sharded.
+    # In the EP_GROUP mode without it the decode runs the replicated step
+    # (``runtime.group_ep``).
     sequence_parallel: bool = False
     dp: int = 1
     # Expert-parallel ranks of the MoE (TP x DP under expert parallelism, else 1).
     ep: int = 1
     # ReplaySSM / RecoverSSM records on the KDA layers (--use-replayssm; SP only).
     replayssm: bool = False
+    # The deployment's topology (mode, group, DCP, DP, EP); None only for configs
+    # built by hand (tests), whose mode follows ``sequence_parallel``.
+    topology: Topology | None = None
+
+    @property
+    def mode(self) -> Mode:
+        if self.topology is not None:
+            return self.topology.mode
+        return Mode.EP_GROUP if self.sequence_parallel else Mode.TP_EXPERTS
 
 
 def specialized_decode_config(vllm_config) -> DecodeConfig | None:
@@ -52,9 +76,10 @@ def specialized_decode_config(vllm_config) -> DecodeConfig | None:
     if reason is not None:
         raise ValueError(f"Kimi K3 specialized decode does not support {reason}")
     spec, compilation = vllm_config.speculative_config, vllm_config.compilation_config
-    parallel, cache = vllm_config.parallel_config, vllm_config.cache_config
+    cache = vllm_config.cache_config
     q = 1 + spec.num_speculative_tokens if spec is not None else 1
     sizes = tuple(compilation.cudagraph_capture_sizes or ())
+    topology = Topology.from_config(vllm_config)
     return DecodeConfig(
         max_context=vllm_config.model_config.max_model_len,
         mla_core=extra.get("mla_core", "auto"),
@@ -64,14 +89,11 @@ def specialized_decode_config(vllm_config) -> DecodeConfig | None:
         capture_sizes=sizes,
         bf16_state=kda_dtypes(vllm_config)[1] == torch.bfloat16,
         captured=target_decode_rows(vllm_config, q),
-        sequence_parallel=sp_topology(vllm_config),
-        dp=parallel.data_parallel_size,
-        ep=(
-            parallel.tensor_parallel_size * parallel.data_parallel_size
-            if parallel.enable_expert_parallel
-            else 1
-        ),
+        sequence_parallel=topology.sp_step,
+        dp=topology.dp,
+        ep=topology.ep,
         replayssm=cache.use_replayssm or cache.use_kda_recoverssm,
+        topology=topology,
     )
 
 
@@ -108,22 +130,20 @@ def target_decode_rows(vllm_config, q) -> tuple[int, ...]:
 
 
 def sp_topology(vllm_config) -> bool:
-    """Whether the deployment is the sequence-parallel decode topology: TP4 = DCP4
-    attention groups (one pipeline stage) over expert-parallel MegaMoE, i.e. the stock
-    K3 decoder's ``use_sequence_parallel`` at TP4 = DCP4 (this tree's stock model
-    has no MoE token shard, so no switch can turn it off). Any native MegaMoE
-    backend (DeepGEMM, or Rubin on SM107: ``kimi_k3_mega_moe``): the SP step runs
-    the stock MoE module on the shard either way."""
-    from vllm.config.kernel import NATIVE_MEGA_MOE_BACKENDS
+    """Compatibility alias of ``Topology.sp_step``: whether the deployment is the
+    sequence-parallel decode topology, TP4 = DCP4 attention groups (one pipeline
+    stage) over expert-parallel native MegaMoE (DeepGEMM, or Rubin on SM107:
+    ``kimi_k3_mega_moe``), i.e. the stock K3 decoder's ``use_sequence_parallel`` at
+    TP4 = DCP4 (this tree's stock model has no MoE token shard, so no switch can turn
+    it off)."""
+    return Topology.from_config(vllm_config).sp_step
 
-    parallel = vllm_config.parallel_config
-    return (
-        parallel.tensor_parallel_size == 4
-        and parallel.decode_context_parallel_size == 4
-        and parallel.pipeline_parallel_size == 1
-        and parallel.enable_expert_parallel
-        and vllm_config.kernel_config.moe_backend in NATIVE_MEGA_MOE_BACKENDS
-    )
+
+def ep_group_topology(vllm_config) -> bool:
+    """Whether the deployment runs the EP_GROUP mode (either layout: the SP step or
+    the replicated step): its verification and drafter attention are strict (an
+    uncovered piece raises at load instead of keeping the stock path)."""
+    return Topology.from_config(vllm_config).mode is Mode.EP_GROUP
 
 
 def kda_dtypes(vllm_config):
@@ -182,36 +202,30 @@ def unsupported(vllm_config) -> str | None:
     # Kimi K3.1: sparse (DSA) MLA layers over the packed MLA and indexer caches,
     # fp8_ds_mla on FlashMLA sparse or per-tensor FP8 on FlashInfer sparse.
     dsa = getattr(text, "dsa_config", None) is not None
-    # TP4 with expert parallelism and ReplaySSM records only as the SP topology
-    # (``sp_unsupported`` narrows it to C512's decode role).
-    sp = sp_topology(vllm_config)
+    # The topology gate (``topology.refusal``): TP_EXPERTS at TP8 / TP16, EP modes
+    # with native MegaMoE on K3.1 only, DCP 1 or TP, no pipeline parallelism; DEP
+    # raises (not implemented yet). EP_GROUP runs the SP step at TP4 = DCP4
+    # (``sp_unsupported`` narrows it to C512's decode role) and the replicated step
+    # elsewhere (``ep_group_unsupported``); ReplaySSM records only in the SP step.
+    topology = Topology.from_config(vllm_config)
+    sp = topology.sp_step
+    group = topology.mode is Mode.EP_GROUP and not sp
+    topology_reason = refusal(
+        topology, dsa=dsa, pp=parallel.pipeline_parallel_size
+    )
     checks = (
         (not current_platform.is_device_capability_family(100), "this GPU (SM100/103)"),
         (
             moe != ("situ", 4.0, 25.0, 896, 16, 1, 1, "sigmoid"),
             "MoE configs but the one-group sigmoid top-16 SiTU MoE of Kimi K3",
         ),
-        (
-            parallel.tensor_parallel_size not in (8, 16) and not sp,
-            "TP other than 8/16 (TP4 only as TP4 = DCP4 sequence parallelism over "
-            "expert-parallel MegaMoE)",
-        ),
+        (topology_reason is not None, topology_reason),
         (
             online_linear_quantization(vllm_config.model_config.quantization_config),
             "online quantization of linear layers (quantization_config.targets or "
             "a linear weight spec; its projections read BF16 weights)",
         ),
-        (parallel.pipeline_parallel_size != 1, "pipeline parallelism"),
-        (
-            parallel.enable_expert_parallel and not sp,
-            "expert parallelism (except TP4 = DCP4 sequence parallelism over MegaMoE)",
-        ),
         (parallel.use_ubatching, "DBO"),
-        (
-            parallel.decode_context_parallel_size
-            not in (1, parallel.tensor_parallel_size),
-            "decode context parallel other than 1 or TP",
-        ),
         (vllm_config.model_config.enable_sleep_mode, "sleep mode"),
         (vllm_config.lora_config is not None, "LoRA"),
         # The runner's ModelState hooks build the executor and prepare the KV layouts.
@@ -246,7 +260,7 @@ def unsupported(vllm_config) -> str | None:
             )
             and not sp,
             "ReplaySSM / RecoverSSM (--use-replayssm) outside TP4 = DCP4 sequence "
-            "parallelism",
+            "parallelism (the EP_GROUP replicated step runs no records yet: W7)",
         ),
         # The verify kernels take at most 8 tokens per request (KdaSplit's barriers).
         (
@@ -282,12 +296,93 @@ def unsupported(vllm_config) -> str | None:
         reason = nvfp4_unsupported(vllm_config)
     if reason is None and sp:
         reason = sp_unsupported(vllm_config)
+    if reason is None and group:
+        reason = ep_group_unsupported(vllm_config)
     return reason
 
 
 # The SP topology's verify rows: max_num_seqs x q (the shared scratch, the DSA box
 # and the o_proj mailboxes are sized for 512 rows, 128 per SP shard).
 SP_MAX_ROWS = 512
+# The replicated EP_GROUP step's verify rows per attention group (max_num_seqs x q):
+# the projections' GENERIC tactics, the KDA plain verify and the DSA cores are the
+# ones the TP8 / TP16 deployments run up to 64 rows; wider rows need W4's wide
+# providers at TP8 (and W3's strict coverage with them).
+EP_GROUP_MAX_ROWS = 64
+
+
+def ep_group_unsupported(vllm_config) -> str | None:
+    """Why the EP_GROUP topology outside C512's SP role (``Topology.step_layout``
+    REPLICATED: TP4 DCP1, TP8 / TP16 with DCP 1 or TP, any DP over native MegaMoE)
+    is not what the replicated step (``runtime.group_ep``) serves: Rubin, K3.1 DSA
+    layers on a per-tensor FP8 KV cache under FlashInfer sparse's trtllm-gen kernel,
+    a BF16 conv / FP32 recurrent KDA state, DSpark q 2..8 (no speculation refused: see
+    the check), at most ``EP_GROUP_MAX_ROWS`` verify rows per group and the stock
+    (unfused)
+    reduce-scatter o_proj (VLLM_ENABLE_GEMM_RS refused: its fused GEMM-RS is not the
+    partial + reduce-scatter the step reproduces). VLLM_KIMI_K3_GEMM_AR is inert here
+    (the stock SP decoder binds GEMM-RS, never GEMM-AR); a TP-sharded shared expert
+    (VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT) and any fused GEMM-RS / AR projection are
+    refused at build, from the stock modules (``group_ep.group_layer``). The narrowings
+    (fp8_ds_mla / nvfp4_ds_mla KV, a BF16 KDA state, ReplaySSM) are W6 / W7."""
+    import torch
+
+    from vllm import envs
+    from vllm.platforms import current_platform
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    spec, cache = vllm_config.speculative_config, vllm_config.cache_config
+    q = 1 + spec.num_speculative_tokens if spec is not None else 1
+    fi_sparse = (
+        vllm_config.attention_config.backend
+        == AttentionBackendEnum.FLASHINFER_MLA_SPARSE
+    )
+    dsa = getattr(vllm_config.model_config.hf_text_config, "dsa_config", None)
+    fp8 = cache.cache_dtype in ("fp8", "fp8_e4m3")
+    rows = vllm_config.scheduler_config.max_num_seqs * q
+    checks = (
+        (
+            not current_platform.is_device_capability((10, 7)),
+            "this GPU (Rubin SM107 only)",
+        ),
+        (dsa is None, "models without DSA layers (Kimi K3 MLA)"),
+        (
+            not fp8,
+            "KV cache dtypes other than per-tensor fp8 (FlashInfer sparse trtllm-gen; "
+            "fp8_ds_mla / nvfp4_ds_mla: W6)",
+        ),
+        (not fi_sparse, "attention backends but FLASHINFER_MLA_SPARSE"),
+        (
+            vllm_config.kernel_config.flashinfer_sparse_mla_kernel == "prims_ts"
+            or (fi_sparse and fp8 and _stock_prims_ts(vllm_config)),
+            "FlashInfer sparse's prims_ts kernel (trtllm-gen only; "
+            "flashinfer_sparse_mla_kernel=trtllm)",
+        ),
+        (
+            kda_dtypes(vllm_config) != (torch.bfloat16, torch.float32),
+            "KDA cache dtypes other than a BF16 conv state and an FP32 recurrent "
+            "state (a BF16 recurrent state: W6)",
+        ),
+        (
+            spec is None,
+            "no speculation (q1: the stock plain KDA decode resolves to the CUDA "
+            "fused_kda_decode's fast math, which the specialized KDA core's stock "
+            "Triton math does not reproduce; DSpark q 2..8 only)",
+        ),
+        (
+            rows > EP_GROUP_MAX_ROWS,
+            f"more than {EP_GROUP_MAX_ROWS} verify rows per attention group "
+            f"(max_num_seqs x q = {rows}; the wide rows need W4)",
+        ),
+        (
+            envs.VLLM_ENABLE_GEMM_RS,
+            "the fused GEMM + reduce-scatter o_proj (VLLM_ENABLE_GEMM_RS)",
+        ),
+    )
+    reason = next((reason for failed, reason in checks if failed), None)
+    if reason is None:
+        return None
+    return f"expert-parallel attention groups (EP_GROUP, replicated step) on {reason}"
 
 
 def sp_unsupported(vllm_config) -> str | None:

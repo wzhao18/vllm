@@ -23,8 +23,12 @@ mode        cores (ported from the upstream specialized decode)
             (``KDARecoverSSMDeferred.flush``), or a replaying core (``REPLAY``)
             folds it in its own pass
 "none"      no records: the plain verify with q state slots (``prepared.
-            PreparedKda``, the TP8 / TP16 kernels at 24 heads)
+            PreparedKda``, the TP8 / TP16 kernels at the layer's heads, the TP8
+            gate mode at 12 heads: ``plain_gate_mode``)
 ==========  ======================================================================
+
+The replicated EP_GROUP step (``runtime.group_ep``: TP4 / TP8 / TP16 groups, 24 / 12 /
+6 heads per rank) builds this core in "none" mode (its records are W7).
 
 Precision: every record core has the stock Triton verify's math (``recover.KdaSplit``
 docstring): BF16 conv / SiLU outputs, raw gates and recurrence outputs, FP32 state and
@@ -75,6 +79,19 @@ REPLAY = {24: ""}
 FUSED_SPLIT = ((48, 8), (96, 4), (192, 2), (1 << 30, 1))
 KINDS = ("split", "ws", "wide", "stream", "fused", "fused_ws")
 MODES = ("deferred", "triton", "none")
+# "none" (no records: the plain ``prepared.PreparedKda`` verify) gate mode by heads
+# per rank, the one the TP_EXPERTS deployments at that head count verify on
+# (``providers.Attention``): 12 heads (TP8; EP_GROUP TP8) gate mode 1; every other
+# head count (6: TP16; 24: the SP step; EP_GROUP TP4 / TP16) gate mode 0. Same KDA
+# math (``prepared.make_kernel``: KdaSplitStock or the stock-math wide verify for an
+# FP32 state); the gate modes differ in the F_B MMA chain only.
+PLAIN_VERIFY_GATE = {12: 1}
+
+
+def plain_gate_mode(heads):
+    """The verify gate mode of the plain KDA core at ``heads`` per rank
+    (PLAIN_VERIFY_GATE, else 0)."""
+    return PLAIN_VERIFY_GATE.get(heads, 0)
 
 
 def record_kind(heads, requests):
@@ -195,8 +212,11 @@ class SpKdaCore:
     def __init__(self, attention, rows, *, records, ctx):
         if records not in MODES:
             raise Unsupported("kda", None, f"RecoverSSM records mode {records!r}")
-        if not ctx.sequence_parallel:
-            raise Unsupported("kda", None, "SpKdaCore serves the SP decode only")
+        if not ctx.ep_group_step:
+            raise Unsupported(
+                "kda", None,
+                "SpKdaCore serves the EP_GROUP decode only (the SP or replicated step)",
+            )  # fmt: skip
         self.mode, self.q = records, ctx.q
         self.heads = heads = attention.A_log.numel()
         self.dim, self.has_bias = heads * K, attention.conv1d.bias is not None
@@ -205,6 +225,9 @@ class SpKdaCore:
         if ctx.heads_per_rank and ctx.heads_per_rank != heads:
             cause = f"{heads} KDA heads per rank, the context says {ctx.heads_per_rank}"
             raise Unsupported("kda", None, cause)
+        # Verify steps of 2..8 tokens only. (No speculation, q = 1: a plain deployment's
+        # stock decode resolves to the CUDA fused_kda_decode, fast-math exp / rsqrt,
+        # which the plain core's stock-math KdaSplitStock does not reproduce.)
         if attention.spec_query_len != self.q or not 2 <= self.q <= 8:
             cause = f"verify length q{self.q} (layer: q{attention.spec_query_len})"
             raise Unsupported("kda", None, cause)
@@ -242,11 +265,13 @@ class SpKdaCore:
             from .prepared import PreparedKda, verify_kernel
 
             capability = torch.cuda.get_device_capability(dt)
-            keys = {(r // self.q, self.q): (self.pitch, 0) for r in self.rows}
+            gate = plain_gate_mode(heads)
+            keys = {(r // self.q, self.q): (self.pitch, gate) for r in self.rows}
             self.plain = PreparedKda(attention, keys, self.conv_dim_first)
             for r in self.rows:
                 n = r // self.q
-                self.kinds[r] = verify_kernel(n, self.q, capability, False, 0, heads)
+                kind = verify_kernel(n, self.q, capability, False, gate, heads)
+                self.kinds[r] = kind if gate == 0 else f"{kind} gate{gate}"
             return
         found = getattr(attention, "recoverssm_records", None)
         if found is None:
@@ -326,10 +351,10 @@ class SpKdaCore:
         return self
 
     def run(self, projected, out, *, caches, metadata):
-        """``projected`` [R, pitch] BF16 (stride (pitch, 1)); ``out`` [R, 3072] BF16
-        (o_norm-gated, the o_proj input); reads ``metadata.spec_state_indices_tensor``
-        [>= R / q, 1] (q without records), ``num_accepted_tokens`` and, deferred,
-        ``recoverssm_deferred``."""
+        """``projected`` [R, pitch] BF16 (stride (pitch, 1)); ``out`` [R, heads x 128]
+        BF16 (o_norm-gated, the o_proj input); reads ``metadata.
+        spec_state_indices_tensor`` [>= R / q, 1] (q without records),
+        ``num_accepted_tokens`` and, deferred, ``recoverssm_deferred``."""
         rows = projected.shape[0]
         n = rows // self.q
         slots = metadata.spec_state_indices_tensor

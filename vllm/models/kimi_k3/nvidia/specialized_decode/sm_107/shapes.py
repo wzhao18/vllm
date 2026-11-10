@@ -8,11 +8,15 @@ Each kernel family decides per shape whether it runs a tuned kernel, a generic o
 or a stock seam (``Choice``); the coverage plan records those decisions for every
 captured shape, and a shape that some family cannot run stays on the stock forward.
 
-Under sequence parallelism (``Context.sequence_parallel``: C512's TP4 = DCP4 decode
-role) nothing stays stock silently: every captured shape is specialized, a family that
-cannot serve a shape raises ``Unsupported`` at build, and the stock modules the design
-keeps (embedding, AttnRes, MegaMoE, ...) are ``Path.DECLARED`` choices from
-``DECLARED_STOCK`` (``Coverage.assert_complete``).
+In the EP_GROUP mode (``Context.ep_group_step``: C512's TP4 = DCP4 sequence-parallel
+role, ``Context.sequence_parallel``, and the replicated-layout step of
+``runtime.group_ep``) nothing stays stock silently: every captured shape is
+specialized, a family that cannot serve a shape raises ``Unsupported`` at build, and
+the stock modules the design keeps are ``Path.DECLARED`` choices from
+``DECLARED_STOCK`` (the SP step: embedding, AttnRes, MegaMoE, ...) or
+``runtime.group_ep.GROUP_DECLARED`` (the replicated step: collectives, the MoE /
+dense modules, DCP1 sparse MLA; its AttnRes and embedding are specialized), listed
+per shape (``Coverage.assert_complete``).
 """
 
 from collections.abc import Iterable
@@ -78,12 +82,25 @@ class Context:
     max_rows: int  # the largest captured decode graph: capacity above TUNED_ROWS
     max_context: int
     bf16_state: bool
-    # Sequence parallelism (C512): the DP size, the expert-parallel ranks (TP x DP)
-    # and the attention heads per TP rank (24 at C512; 0 = not set).
+    # The DP size and the expert-parallel ranks (TP x DP under expert parallelism,
+    # else 1), carried in every mode (``runtime.topology``); sequence parallelism
+    # (C512) and the attention heads per TP rank (24 at C512; 0 = not set).
     dp: int = 1
     ep: int = 1
     sequence_parallel: bool = False
     heads_per_rank: int = 0
+    # The EP_GROUP mode (``runtime.topology.Mode``) in either residual layout: the
+    # SP step (``sequence_parallel``, layout (c)) or the replicated step
+    # (``runtime.group_ep``, layout (b)). Its attention families (the decode
+    # projections, ``dsa.sp.SpDsaCore``, ``kda.sp.SpKdaCore``) serve both.
+    ep_group: bool = False
+
+    @property
+    def ep_group_step(self) -> bool:
+        """Whether this is an EP_GROUP decode step (SP or replicated layout): the
+        context the group attention families accept. Hand-built SP contexts
+        (``sequence_parallel`` only) count."""
+        return self.ep_group or self.sequence_parallel
 
     @property
     def target(self) -> bool:

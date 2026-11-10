@@ -204,6 +204,9 @@ def unsupported(model, config=None) -> str | None:
         return "no DCP"
     if config is not None and config.sequence_parallel:
         return "the sequence-parallel decode (its own DSA path, SpDsaCore)"
+    mode = getattr(config, "mode", None)
+    if mode is not None and mode.value == "ep_group":
+        return "the EP_GROUP replicated decode (its own DSA path: SpDsaCore)"
     if config is not None and config.q not in VARIANT:
         return f"verify length {config.q} (variant table only at q {sorted(VARIANT)})"
     dtype = layers[0].mla_attn.mla_attn.kv_cache_dtype
