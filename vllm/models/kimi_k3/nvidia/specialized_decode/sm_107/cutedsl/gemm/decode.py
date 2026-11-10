@@ -120,8 +120,12 @@ class DecodeProjection:
         *,
         gather: Any = None,
         family: str = "projection",
+        group: tuple[int, int] | None = None,
     ):
         self.family = family
+        # (G, DCP) of the measured tables this projection's coverage reads
+        # (``sp_policy.measured``; None: any group's)
+        self.group = group
         if weight.dim() != 2 or weight.dtype != torch.bfloat16:
             raise Unsupported(
                 family, None,
@@ -245,5 +249,6 @@ class DecodeProjection:
             raise Unsupported(self.family, rows, f"not prepared ({self.prepared()})")
         kind, tactic = self.tactics[rows]
         n, k = self.weight.shape
-        path = Path.TUNED if measured(n, k, rows, (kind, tactic)) else Path.GENERIC
+        tuned = measured(n, k, rows, (kind, tactic), self.group)
+        path = Path.TUNED if tuned else Path.GENERIC
         return Choice(path, tactic=(kind, tactic), note=f"{kind} {n}x{k}")

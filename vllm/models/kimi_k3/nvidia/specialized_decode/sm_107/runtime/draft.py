@@ -505,9 +505,13 @@ class DraftFastPath:
         strict = target_topology(True, tp, dcp, steps + 1)
         # C512's SP decode role (TP4 = DCP4): the drafter's attention is specialized
         # and strict; its other pieces are the declared stock module (sp_attention).
-        from . import sp_topology
+        # The replicated EP_GROUP step at DCP = TP (TP8 = DCP8, TP16 = DCP16): its
+        # attention is strict too (FAST_DCP covers its <= 64-row groups); its other
+        # pieces follow this TP's tables as in TP_EXPERTS (group_ep's "drafter").
+        from . import ep_group_topology, sp_topology
 
-        attention_strict = strict or sp_topology(vllm_config)
+        group_dcp = ep_group_topology(vllm_config) and dcp == tp
+        attention_strict = strict or sp_topology(vllm_config) or group_dcp
 
         def fail(site, cause):
             if strict:

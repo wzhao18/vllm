@@ -35,7 +35,14 @@ exact top-k, and "proj" moves only the BF16 rounding point of the partials (the
 merge is linear: sum_s w_s (O_s W) = (sum_s w_s O_s) W).
 
 Every captured row count either compiles here or raises ``Unsupported`` at build,
-naming the cause: there is no stock DSA fallback under SP."""
+naming the cause: there is no stock DSA fallback under SP.
+
+The replicated EP_GROUP step (``runtime.group_ep``) runs the same core at DCP = TP
+for TP4 / TP8 / TP16 groups (24 / 12 / 6 heads per rank; the heads come from the
+layer and the context, the box from ``sp_dsa_box(heads=...)``): the trtllm-gen
+query stays padded to 128 heads (96 gathered), the query overlap is the group's
+(``query_overlap``), and below TILED_FROM only the 24-head query is refused
+(``tiled_rows_only``)."""
 
 from functools import cache
 from typing import NamedTuple
@@ -64,7 +71,31 @@ SP_ROWS = 512  # the most rows of a captured SP step (max_num_seqs 128 x q 4)
 # open-ended. NQ-TUNE: front vs fork vs wait at TP4 / DCP4, 24 heads, q4, rows
 # 4..512 (u128k and AgentX contexts; front's IndexFrontMma from 41 rows).
 SP_QUERY_OVERLAP = "1-16:front,17-:fork"
+# The replicated EP_GROUP step (``runtime.group_ep``) at DCP = TP (TP8 = DCP8: 12
+# heads, TP16 = DCP16: 6) runs this core too: its query overlap by (G, DCP); a group
+# without an entry runs SP_QUERY_OVERLAP, which is the Rubin DCP16 table's split
+# (dsa.overlap QUERY_OVERLAP "dcp_rubin", measured at 6 heads), publish-only at
+# every head count. NQ-TUNE: front vs fork vs wait at TP8 = DCP8 (12 heads, q4 / q8,
+# rows 1..64).
+GROUP_QUERY_OVERLAP: dict[tuple[int, int], str] = {}
 SP_MODES = ("front", "fork", "wait")
+
+
+def query_overlap(ctx) -> str:
+    """The query overlap table of ``ctx``'s (TP, DCP) group (GROUP_QUERY_OVERLAP,
+    else SP_QUERY_OVERLAP)."""
+    return GROUP_QUERY_OVERLAP.get((ctx.tp, ctx.dcp), SP_QUERY_OVERLAP)
+
+
+def tiled_rows_only(heads: int) -> bool:
+    """Whether the core serves only rows on the tiled MlaQuery (TILED_FROM): at a
+    head count whose gathered-q poll is refused (mla.query UNGATHERED_HEADS: 24), the
+    publish-only tiled kernel is the one validated under SP. Other head counts (12,
+    6) publish from the lean kernel below TILED_FROM too, as the TP8 = DCP8 / TP16 =
+    DCP16 DSA layers' front / fork rows do."""
+    from ..mla.query import UNGATHERED_HEADS
+
+    return heads in UNGATHERED_HEADS
 # DcpValue partials at every row: "proj". The BF16 latent partials win only where
 # the DSA sparse core (dsa_kernels.dsa_core) pushes them, which SP never runs; on
 # VR200 with the core off "proj" wins from the first row (1 GPU, fp8 KV, DcpValue +
@@ -156,7 +187,10 @@ def sp_unsupported(attention, box, ctx):
     padded = trtllm_gen_query_heads(box.size * heads)
     ranks = (indexer.dcp_rank, indexer.dcp_world_size, box.rank, box.size)
     checks = (
-        (not ctx.sequence_parallel, "not the sequence-parallel decode"),
+        (
+            not ctx.ep_group_step,
+            "not an EP_GROUP decode (the sequence-parallel or replicated step)",
+        ),
         (
             not dsa_on_flashinfer(attention),
             f"the {type(layer.impl).__name__} backend (FLASHINFER_MLA_SPARSE only)",
@@ -230,17 +264,18 @@ class SpDsaCore:
                 "dsa", None, f"packed in-projection pitch {pitch} (expected {expected})"
             )
         self.modes: dict[int, str] = {}
+        self.overlap = overlap = query_overlap(ctx)
         for r in rows:
             shape = Shape(r, q)
             if r % q:
                 raise Unsupported("dsa", shape, f"{r} rows are not whole q{q} requests")
             if r > box.cap:
                 raise Unsupported("dsa", shape, f"above the DcpBox's {box.cap} rows")
-            if r < TILED_FROM[heads]:
+            if r < TILED_FROM[heads] and tiled_rows_only(heads):
                 raise Unsupported(
                     "dsa", shape, f"below the {heads}-head tiled MlaQuery's rows"
                 )
-            mode = overlap_for(r, SP_QUERY_OVERLAP, True, True)
+            mode = overlap_for(r, overlap, True, True)
             if mode not in SP_MODES:
                 raise Unsupported(
                     "dsa", shape, f"query overlap {mode!r} (publish-only modes only)"
@@ -258,7 +293,7 @@ class SpDsaCore:
             dcp=box,
             parity=parity,
             kernels=SP_KERNELS,
-            overlap=SP_QUERY_OVERLAP,
+            overlap=overlap,
             partials=SP_PARTIALS,
         )
         prepared = self.prepared
@@ -345,13 +380,14 @@ class SpDsaCore:
         )
 
     def choice(self, rows):
-        """The coverage choice at ``rows``: GENERIC (specialized, untuned at DCP4);
-        its tactic is (query overlap, sparse kernel, DcpValue partials)."""
+        """The coverage choice at ``rows``: GENERIC (specialized, untuned at DCP4 /
+        DCP8 / DCP16); its tactic is (query overlap, sparse kernel, DcpValue
+        partials)."""
         if rows not in self.modes:
             raise Unsupported("dsa", Shape(rows, self.q), "not a prepared row count")
         mode = self.modes[rows]
         return Choice(
             Path.GENERIC,
             tactic=(mode, SP_KERNELS[0], SP_PARTIALS),
-            note=f"sp {mode}/{SP_KERNELS[0]}/{SP_PARTIALS}",
+            note=f"sp {mode}/{SP_KERNELS[0]}/{SP_PARTIALS} {self.heads}h",
         )

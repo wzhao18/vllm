@@ -18,6 +18,8 @@ from vllm.config import CompilationMode, CUDAGraphMode
 from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107 import runtime
 from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.runtime import (
     DecodeConfig,
+    Mode,
+    Topology,
     sp_topology,
     specialized_decode_config,
     unsupported,
@@ -183,6 +185,7 @@ def test_c512_is_the_sp_topology():
         True,
     )
     assert (decode.q, decode.dcp, decode.captured) == (4, 4, C512_ROWS)
+    assert decode.mode is Mode.EP_GROUP and decode.topology.sp_step
 
 
 def test_c512_on_kimi_k3_mega_moe_is_the_sp_topology():
@@ -204,8 +207,10 @@ def test_c512_on_kimi_k3_mega_moe_is_the_sp_topology():
     ],
 )
 def test_other_topologies_are_not_sp(tp, dcp, ep, backend):
-    """Only TP4 = DCP4 over expert-parallel MegaMoE is SP; everything else keeps the
-    TP8 / TP16 gate, which refuses TP4, EP and ReplaySSM as before."""
+    """Only TP4 = DCP4 over expert-parallel MegaMoE is SP; everything else here is
+    refused (TP4 without EP, a non-MegaMoE EP backend, DCP strictly between 1 and TP
+    by the topology gate; EP_GROUP outside the SP step, the replicated step, by C512's
+    ReplaySSM records and its 512 verify rows: runtime.ep_group_unsupported)."""
     backend = {"kernel_config.moe_backend": backend}
     config = deployment(tp=tp, dcp=dcp, ep=ep, **backend)
     assert not sp_topology(config)
@@ -222,7 +227,9 @@ def test_sp_topology_has_no_token_shard_switch(monkeypatch):
 
 def test_tp16_gate_unchanged():
     """TP16 = DCP16 (K3.1's decode role) passes as before, with the SP fields at their
-    defaults; ReplaySSM and EP stay refused there."""
+    defaults and the TP_EXPERTS topology; ReplaySSM stays refused there, and TP16
+    with EP is the EP_GROUP mode's replicated step, refused above 64 verify rows per
+    group (q8 x 32 requests: 256)."""
     assert unsupported(tp16()) is None
     decode = specialized_decode_config(tp16())
     assert (decode.sequence_parallel, decode.dp, decode.ep, decode.replayssm) == (
@@ -230,6 +237,16 @@ def test_tp16_gate_unchanged():
         1,
         1,
         False,
+    )
+    assert decode.mode is Mode.TP_EXPERTS
+    assert decode.topology == Topology(
+        g=16,
+        dcp=16,
+        dp=1,
+        ep=1,
+        moe_backend="deep_gemm_mega_moe",
+        q_set=(8,),
+        stock_sp=False,
     )
     assert decode == DecodeConfig(
         max_context=decode.max_context,
@@ -239,11 +256,15 @@ def test_tp16_gate_unchanged():
         q=8,
         capture_sizes=decode.capture_sizes,
         captured=decode.captured,
+        topology=decode.topology,
     )
     assert "ReplaySSM" in unsupported(tp16(**{"cache_config.use_replayssm": True}))
     config = tp16()
     config.parallel_config.enable_expert_parallel = True
-    assert unsupported(config).startswith("expert parallelism")
+    assert unsupported(config).startswith(
+        "expert-parallel attention groups (EP_GROUP, replicated step) on more than "
+        "64 verify rows per attention group (max_num_seqs x q = 256"
+    )
 
 
 @pytest.mark.parametrize(
@@ -433,7 +454,8 @@ def test_verify_declared_stock_under_synthetic(lm_head_rank):
 def test_verify_raises_when_not_covered_under_sp(lm_head_rank, monkeypatch):
     """Real rejection under SP: an uncovered build raises ``Unsupported``. TP16 = DCP16
     with speculation (the NQ-NOFALLBACK target) refuses it (``Uncovered``); other
-    topologies keep the stock sampler (None)."""
+    topologies keep the stock sampler (None), but every EP_GROUP one raises (TP8 =
+    DCP8 under EP: the replicated step)."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.runtime.verify import (
         VerifyArgmax,
     )
@@ -443,11 +465,13 @@ def test_verify_raises_when_not_covered_under_sp(lm_head_rank, monkeypatch):
         Unsupported, match="verify at every shape: an LM head without vocabulary"
     ):
         VerifyArgmax.build(config, lm_head_rank)
-    config = deployment(
-        tp=8, dcp=8, dp=1, **{"speculative_config.rejection_sample_method": "standard"}
-    )
+    standard = {"speculative_config.rejection_sample_method": "standard"}
+    config = deployment(tp=8, dcp=8, dp=1, ep=False, **standard)
     tp_group(monkeypatch, 8)
     assert VerifyArgmax.build(config, lm_head_rank) is None
+    config = deployment(tp=8, dcp=8, dp=2, **standard)
+    with pytest.raises(Unsupported, match="an LM head without vocabulary"):
+        VerifyArgmax.build(config, lm_head_rank)
     config = tp16(**{"speculative_config.rejection_sample_method": "standard"})
     tp_group(monkeypatch, 16)
     with pytest.raises(Uncovered, match="an LM head without vocabulary shards"):
@@ -467,9 +491,9 @@ def test_verify_raises_off_rubin_under_sp(lm_head_rank, monkeypatch):
 
 
 def test_sampled_verify_fp64_gumbel_raises_under_sp(monkeypatch):
-    """FP64 Gumbel draws: under SP ``Unsupported`` (before the TP group is read); at
-    TP16 = DCP16 with speculation refused (``Uncovered``); elsewhere the stock
-    sampler (None)."""
+    """FP64 Gumbel draws: in the EP_GROUP mode (SP or replicated step)
+    ``Unsupported`` (before the TP group is read); at TP16 = DCP16 with speculation
+    refused (``Uncovered``); elsewhere the stock sampler (None)."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.runtime.sampled_verify import (
         SampledVerify,
     )
@@ -477,7 +501,10 @@ def test_sampled_verify_fp64_gumbel_raises_under_sp(monkeypatch):
     config = deployment(**{"model_config.use_fp64_gumbel": True})
     with pytest.raises(Unsupported, match="fp64 Gumbel"):
         SampledVerify.build(config, None)
-    config = deployment(tp=8, dcp=8, dp=1, **{"model_config.use_fp64_gumbel": True})
+    fp64 = {"model_config.use_fp64_gumbel": True}
+    with pytest.raises(Unsupported, match="fp64 Gumbel"):
+        SampledVerify.build(deployment(tp=8, dcp=8, dp=2, **fp64), None)
+    config = deployment(tp=8, dcp=8, dp=1, ep=False, **fp64)
     tp_group(monkeypatch, 8)
     assert SampledVerify.build(config, None) is None
     config = tp16(**{"model_config.use_fp64_gumbel": True})

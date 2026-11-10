@@ -111,7 +111,8 @@ def sm107_decode_config(vllm_config) -> Sm107DecodeConfig:
 
         register()
     logger.info_once(
-        "Kimi K3 specialized decode (SM107): verify graphs at %s rows (q%d)",
+        "Kimi K3 specialized decode (SM107): %s; verify graphs at %s rows (q%d)",
+        config.topology,
         config.captured,
         config.q,
     )

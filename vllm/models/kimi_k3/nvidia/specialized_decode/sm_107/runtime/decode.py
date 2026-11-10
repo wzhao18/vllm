@@ -205,17 +205,33 @@ class SpecializedDecode:
     """Built once the weights are loaded; owns every prepared provider, the
     mailboxes and the decode buffers. Reads the backbone, never modifies it.
 
-    Under sequence parallelism (``config.sequence_parallel``: C512's TP4 = DCP4
-    decode role) it builds only ``sp_attention.SpStep`` and delegates every hook to
-    it; none of the TP8 / TP16 providers below is built."""
+    In the EP_GROUP mode it builds only that mode's step and delegates every hook to
+    it (``sp``): ``sp_attention.SpStep`` under sequence parallelism
+    (``config.sequence_parallel``: C512's TP4 = DCP4 decode role, layout (c)),
+    ``group_ep.GroupStep`` otherwise (the replicated layout (b)); none of the TP8 /
+    TP16 providers below is built."""
 
-    sp = None  # the SP step (sp_attention.SpStep) under sequence parallelism
+    # The EP_GROUP step (sp_attention.SpStep or group_ep.GroupStep), else None.
+    sp = None
 
     def __init__(self, backbone, config):
         self.backbone, self.buffers = backbone, {}
-        if config.sequence_parallel:
+        # Dispatch on the topology's mode (``runtime.topology``); the load-time gate
+        # refuses every mode below that is not served, this re-checks it.
+        from . import Mode
+
+        mode = config.mode
+        if mode is Mode.EP_GROUP and config.sequence_parallel:
             self.init_sequence_parallel(config)
             return
+        if mode is Mode.EP_GROUP:
+            self.init_group_ep(config)
+            return
+        if mode is not Mode.TP_EXPERTS:
+            raise ValueError(
+                f"Kimi K3 specialized decode: mode {mode.name} not implemented on "
+                f"sm_107 yet ({config.topology})"
+            )
         q = config.q
         # Verify steps decode q tokens per request at M = requests * q tokens; FULL
         # verify graphs round each capture size up to whole requests.
@@ -260,6 +276,8 @@ class SpecializedDecode:
             max_rows=self.capacity,
             max_context=self.max_context,
             bf16_state=self.bf16_state,
+            dp=config.dp,
+            ep=config.ep,
         )
         self.coverage: Coverage | None = None
         # NQ-NOFALLBACK: run-time steps without a captured FULL graph (mixed prefill +
@@ -407,12 +425,60 @@ class SpecializedDecode:
         self.sp = SpStep(self)
         self.coverage = self.sp.coverage()
 
+    def init_group_ep(self, config):
+        """The replicated EP_GROUP decode (``group_ep``, layout (b)): the deployment
+        facts, then the group step, which builds its blocks and checks that every
+        captured R is covered (specialized or a declared stock seam) or raises."""
+        from .group_ep import GroupStep
+
+        group = get_tp_group()
+        self.tp, self.rank = group.world_size, group.rank_in_group
+        self.group = group.device_group
+        self.device = torch.device(current_platform.current_device())
+        properties = torch.cuda.get_device_properties(self.device)
+        cc = (properties.major, properties.minor)
+        self.q, self.dcp = config.q, config.dcp
+        self.queries = (config.q,)
+        self.captured = config.captured
+        # (no tuned / wide TP8 / TP16 batches, step switch or MLA rows here)
+        self.tuned, self.wide, self.wide_off = (), (), None
+        self.batches = tuple(sorted(set(config.captured)))
+        self.switched, self.switch = {}, None
+        self.max_context, self.bf16_state = config.max_context, config.bf16_state
+        backbone = self.backbone
+        layers = backbone.layers[backbone.start_layer : backbone.end_layer]
+        self.layers = tuple(layers)
+        self.aux_layers = tuple(backbone.aux_hidden_state_layers)
+        heads = backbone.config.num_attention_heads
+        if heads % self.tp:
+            raise Unsupported("group_step", None, f"{heads} heads over TP{self.tp}")
+        self.context = Context(
+            arch="rubin" if cc == (10, 7) else "gb300",
+            tp=self.tp,
+            rank=self.rank,
+            dcp=self.dcp,
+            sms=properties.multi_processor_count,
+            q=config.q,
+            max_rows=max(self.batches, default=0),
+            max_context=config.max_context,
+            bf16_state=config.bf16_state,
+            dp=config.dp,
+            ep=config.ep,
+            heads_per_rank=heads // self.tp,
+            ep_group=True,
+        )
+        self.sp = GroupStep(self)
+        self.coverage = self.sp.coverage()
+
     def build_providers(self):
         """Every layer's attention and feed-forward providers, the model's mailboxes
         and the prefetch side stream. All collective allocations, weight packing and
         kernel compiles finish here, before KV binding and CUDA graph capture."""
-        if self.context.sequence_parallel:  # (expert parallel: no TP-reduce providers)
-            raise RuntimeError("Kimi K3 SP decode: TP providers built under SP")
+        if self.context.ep_group_step:  # (expert parallel: no TP-reduce providers)
+            raise RuntimeError(
+                "Kimi K3 decode: TP providers built under SP / EP_GROUP (expert "
+                "parallel)"
+            )
         config, layers = self.backbone.config, self.layers
         beta = config.activation_situ_beta
         linear_beta = config.activation_situ_linear_beta
@@ -1001,11 +1067,13 @@ class SpecializedDecode:
         return (out, aux_out) if aux_out else out
 
     def process_weights_after_loading(self):
-        """After a weight reload: the SP blocks re-derive their weight copies (the
-        TP8 / TP16 providers have no reload hook)."""
+        """After a weight reload: the EP_GROUP blocks (SP or replicated step)
+        re-derive their weight copies (the TP8 / TP16 providers have no reload hook:
+        refused)."""
         if self.sp is None:
             raise NotImplementedError(
-                "Kimi K3 specialized decode: weight reload outside sequence parallelism"
+                "Kimi K3 specialized decode: weight reload outside the EP_GROUP mode "
+                "(the TP8 / TP16 providers keep packed weight copies)"
             )
         self.sp.process_weights_after_loading()
 

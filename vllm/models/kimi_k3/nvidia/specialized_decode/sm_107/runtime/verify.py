@@ -10,10 +10,11 @@ rows the shard GEMM with evict-first weight loads (cutedsl.verify.lmhead; FP32
 accumulation orders stated there). Above 64 rows the stock shard GEMM feeds the argmax
 kernel in launches of ``argmax.MAX_ROWS`` rows: one per verify step.
 
-Under sequence parallelism (C512's TP4 = DCP4 decode role, ``runtime.sp_topology``)
-synthetic rejection keeps the stock sampler, a declared stock module (``verify`` in
-``shapes.DECLARED_STOCK``); otherwise the build either covers TP4 at every row count or
-raises ``shapes.Unsupported`` naming the cause: never the silent stock path.
+In the EP_GROUP mode (C512's TP4 = DCP4 sequence-parallel decode role and the
+replicated EP_GROUP step at TP4 / TP8 / TP16, ``runtime.ep_group_topology``) synthetic
+rejection keeps the stock sampler, a declared stock module (``verify`` in
+``shapes.DECLARED_STOCK``); otherwise the build either covers the group at every row
+count or raises ``shapes.Unsupported`` naming the cause: never the silent stock path.
 """
 
 import torch
@@ -31,8 +32,8 @@ FAST_ARGMAX_TP = (4, 8, 16)
 
 
 def _uncovered(sp: bool, cause: str):
-    """The uncovered build: None (the stock sampler) without sequence parallelism;
-    under it a raise (``verify`` is declared stock only under synthetic rejection)."""
+    """The uncovered build: None (the stock sampler) outside the EP_GROUP mode; in it
+    a raise (``verify`` is declared stock only under synthetic rejection)."""
     if not sp:
         return None
     from ..shapes import Unsupported
@@ -55,18 +56,18 @@ class VerifyArgmax:
     @classmethod
     def build(cls, vllm_config, model):
         """None unless this deployment speculates and this device and TP size are
-        covered. ``model``: the KimiLinearForCausalLM (weights loaded). Under
-        sequence parallelism: None (declared stock) with synthetic rejection, else
+        covered. ``model``: the KimiLinearForCausalLM (weights loaded). In the EP_GROUP
+        mode (either layout): None (declared stock) with synthetic rejection, else
         the argmax or ``shapes.Unsupported``."""
         if vllm_config.speculative_config is None:
             return None
-        from . import sp_topology
+        from . import ep_group_topology
 
-        sp = sp_topology(vllm_config)
+        sp = ep_group_topology(vllm_config)
         method = vllm_config.speculative_config.rejection_sample_method
         if sp and method == "synthetic":
             logger.info_once(
-                "Kimi K3 SP decode: verify: declared stock (synthetic rejection)"
+                "Kimi K3 EP_GROUP decode: verify: declared stock (synthetic rejection)"
             )
             return None
         device = torch.device(torch.cuda.current_device())
