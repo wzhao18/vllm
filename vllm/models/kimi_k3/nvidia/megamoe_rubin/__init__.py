@@ -36,6 +36,9 @@ _EXPORTS = {
     "convert_mxfp4_to_nvfp4": "weights",
     "prepare_weights": "weights",
     "parse_expert_key": "weights",
+    # model integration (moe_backend="kimi_k3_mega_moe")
+    "KimiK3MegaMoEExperts": "experts",
+    "prepare_rubin_megamoe": "experts",
     # GPU runtime
     "RubinMegaMoE": "runtime",
     "require_sm107": "arch",

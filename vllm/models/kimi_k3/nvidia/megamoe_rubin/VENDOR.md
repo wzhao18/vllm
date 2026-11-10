@@ -11,15 +11,38 @@
   below; a re-export from upstream must re-apply them.
 - **Entry points**: `RubinInferenceMegaMoE` (`BlockScaledSwapAbMegaMoeKernel`) and
   `RubinInferenceGenphaseMegaMoE` (`BlockScaledSwapAbGenphaseMoeKernel`).
-- **Check**: the aggregate hash of the 41 files equals that of the installed
-  `fi-0.7.3.dev20261031` tree on Hecate
+- **Check**: apart from the files listed under "Local differences" below, every file
+  is byte-identical to the installed `fi-0.7.3.dev20261031` tree on Hecate
   (`$W/env/fi-0.7.3.dev20261031`, `W=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr`).
   The CPU unit test `tests/models/kimi_k3/test_megamoe_rubin_conversion.py` recomputes
   every per-file hash below.
 
+## Local differences
+
+- **S1 (with S0)** in `sources/communication/nvlink_domain/token_comm.py`
+  (FlashInfer 0.7.3.dev20261031 sha256
+  `4731d31ad1871b24e6a22c1d6fad3bee33794a54ae0ec192632dc13d6f8d4134`, local sha256 in
+  the manifest below). Source: FlashInfer commit `3a47d4d53` on github
+  `wzhao18/flashinfer`, branch `wzhao/kimi-k3-megamoe-sm107`; copied byte for byte.
+  - S0: token_in claims tokens dynamically (`token_in_dynamic_claim`) instead of static
+    striping when `max_tokens_per_rank * topk <= 4096`.
+  - S1: decode-gated metadata-with-sizes. When `max_tokens_per_rank * topk <= 4096`,
+    `world_size <= 32` and one router data CTA (trace-time `decode_landing`, no env
+    var), the router is one CTA: it publishes sizes, its expert-major source prefix
+    and every route's `TokenSrcMetadata` (and score) straight into the destination's
+    landing rows in the sizes round, so token_in waits on `sizes_ready` only (no sort,
+    no push CTAs, no `metadata_ready`; scheduler poll 200 instead of 1000 cycles).
+    Otherwise (prefill) the stock router, regions and expert walks are traced
+    verbatim.
+  - Outputs are bit-identical to stock (the GEMMs, SiTU and the top-k reduction order
+    are unchanged); measured -9..-12 us per launch at decode buckets on VR.
+  - The kernel file (`block_scaled_swap_ab_mega_moe_kernel.py`) is unchanged; it uses
+    only `token_comm` entry points whose signatures S1 keeps.
+
 ## Rewrite rule
 
-**R0 (applied): identity.** Every file is byte-identical to the FlashInfer original. All
+**R0 (applied): identity.** Every file is byte-identical to the FlashInfer original
+(except the "Local differences" above, which are whole-file copies, not rewrites). All
 internal imports of the export are relative (the deepest, `.....` from
 `kernel_src/rubin/inference/mega/*`, resolves to `sources`); the only absolute imports
 are `cutlass*`, `cuda.bindings.driver`, `packaging.version` and the standard library.
@@ -46,9 +69,9 @@ need an exclude for `vllm/models/kimi_k3/nvidia/megamoe_rubin/src/` (a stock
 - `MEGA_F4CVT_USE_MANUAL` (`topk_reduce.py`): FP4 conversion path of the quantized
   combine (not used with BF16 combine).
 
-This backend never sets them; they must stay unset in serving. They make
-`tests/models/kimi_k3/test_k31_no_env_switches.py` flag `src/` (needs an allow-list entry
-or a path exclusion for vendored code in the integration PR).
+This backend never sets them; they must stay unset in serving.
+`tests/models/kimi_k3/test_k31_no_env_switches.py` excludes `src/` (vendored) from its
+scan; the backend's own modules stay covered.
 
 ## sha256 manifest of `src/sources`
 
@@ -58,7 +81,7 @@ dc585a31e5810fc4dda00e55b07c6bfde2fd75c34985b7dbe618378642bdc4b8  sources/api.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/communication/__init__.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/communication/nvlink_domain/__init__.py
 315da23c5bf66deb796b5837f7b8c4beb8d20cdd1a7ec158b2e75d64100719aa  sources/communication/nvlink_domain/symmetric_buffer.py
-4731d31ad1871b24e6a22c1d6fad3bee33794a54ae0ec192632dc13d6f8d4134  sources/communication/nvlink_domain/token_comm.py
+725b855edb022d5e3a3ee7c077342012d3aa9eb9c0169e8c9753b3df2dde0b81  sources/communication/nvlink_domain/token_comm.py
 5a342ca0a2a89761ee7d0ad3cd07b6bf2a2b54e714d475a75a95c22a90e30b72  sources/communication/token_protocol.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/helpers/__init__.py
 4af7ec124e769b0db2839ac42f90cbfc41fbfe693723f79c471f4b4fff8d0cb8  sources/helpers/constants.py
