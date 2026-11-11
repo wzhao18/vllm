@@ -322,9 +322,19 @@ def test_plan_bounds_and_capacity():
         [page_start[q] * PAGE + np.arange(c, c + n) for q, (c, n) in enumerate(lens)]
     )
     np.testing.assert_array_equal(plan.slot_mapping.cpu().numpy(), expected_slots)
-    # A step one page larger than the workspace keeps the DCP path.
-    total_pages = int((-(-seq_lens // PAGE)).sum())
-    assert _build_context(lens, layout, 8, 3, total_pages - 1) is None
+    # A step one page larger than the workspace runs in request groups that
+    # each fit; each group's pages start at the workspace's first page.
+    pages = -(-seq_lens // PAGE)
+    total_pages = int(pages.sum())
+    split = _build_context(lens, layout, 8, 3, total_pages - 1)
+    assert split is not None and split.num_groups == 2
+    lo, hi = split.groups[1]
+    assert (lo, hi) == (len(lens) - 1, len(lens))
+    table = split.block_table.cpu().numpy()
+    np.testing.assert_array_equal(table[lo, : pages[lo]], np.arange(pages[lo]))
+    assert [c for g in split.group_chunks for c in g] == split.indexer_chunks
+    # Only a request larger than the whole workspace has no plan.
+    assert _build_context(lens, layout, 8, 3, int(pages.max()) - 1) is None
 
 
 @pytest.mark.parametrize("cache_dtype,index_format", LAYOUT_CASES)
@@ -379,13 +389,16 @@ def test_indexer_chunks_read_the_workspace_like_a_replicated_cache(
 
 
 def test_workspace_holds_a_max_model_len_request():
-    """DCP ShardQ has no capacity knob: the workspace fits one request of
-    ``max_model_len`` tokens, plus a page of rounding per request."""
+    """DCP ShardQ has no capacity knob: the workspace holds WORKSPACE_TOKENS
+    and at least one request of ``max_model_len`` tokens, plus a page of
+    rounding per request."""
     from vllm.v1.attention.ops.dcp_shardq import context as dcp
 
     config = SimpleNamespace(model_config=SimpleNamespace(max_model_len=131072))
-    assert dcp.workspace_max_tokens(config) == 131072
-    assert dcp.capacity_pages(dcp.workspace_max_tokens(config), 8) == 2048 + 8
+    assert dcp.workspace_max_tokens(config) == dcp.WORKSPACE_TOKENS == 2 << 20
+    assert dcp.capacity_pages(dcp.workspace_max_tokens(config), 8) == 32768 + 8
+    config.model_config.max_model_len = 4 << 20
+    assert dcp.workspace_max_tokens(config) == 4 << 20
 
 
 def test_stats_report_paths_since_last_report():
@@ -404,13 +417,14 @@ def test_stats_report_paths_since_last_report():
     assert stats.report() == (
         "DCP ShardQ prefill: 2/4 steps, 24384/39984 tokens (61.0%; 61.0% since "
         "start) on ShardQ; DCP path: dense MHA 1 steps / 600 tokens, "
-        "workspace full 1 steps / 15000 tokens"
+        "workspace full 1 steps / 15000 tokens; grouped steps 0 (0 groups)"
     )
     stats.recent.clear()
     stats.record(dcp.FEW_TOKENS, 900)
     assert stats.report() == (
         "DCP ShardQ prefill: 0/1 steps, 0/900 tokens (0.0%; 59.6% since start) "
-        "on ShardQ; DCP path: few tokens 1 steps / 900 tokens"
+        "on ShardQ; DCP path: few tokens 1 steps / 900 tokens; "
+        "grouped steps 0 (0 groups)"
     )
 
 
@@ -1147,6 +1161,13 @@ def _layer_worker(rank, world, init_file, cache_dtype, kernel, index_format="fp8
             small = FlashInferMLASparseTRTLLMBackend.get_builder_cls()(
                 spec, [layer.layer_name], config, device
             )
+            # The same steps in request groups: a workspace that holds the
+            # largest prefill request (3000 + 1100 tokens) but none of the
+            # steps' prefill rows together.
+            dcp.workspace_max_tokens = lambda _: 4100
+            grouped = FlashInferMLASparseTRTLLMBackend.get_builder_cls()(
+                spec, [layer.layer_name], config, device
+            )
             for name, lens in LAYER_STEPS.items():
                 layout = _layout(cache_dtype, index_format)
                 rep = Replicated(lens, layout, fill_random=False)
@@ -1242,6 +1263,38 @@ def _layer_worker(rank, world, init_file, cache_dtype, kernel, index_format="fp8
                 q_rep = get_tp_group().all_gather(q, dim=1)
                 assert torch.equal(forward(metadata, q_rep), out)
 
+                # In request groups the step computes exactly the same: each
+                # request's top-k and attention see only its own context.
+                grouped_metadata = grouped.build(0, step)
+                grouped_context = grouped_metadata.shardq.gathered_context
+                assert grouped_context.num_groups > 1, name
+                assert grouped_metadata.shardq.split.counts == shardq.split.counts
+                score(grouped_metadata, index_builder.build(0, index_step))
+                assert torch.equal(
+                    topk_buffer[num_decode_tokens:num_rows], local_topk
+                ), name
+                assert torch.equal(topk_buffer[:num_decode_tokens], decode_topk), name
+                grouped_out = forward(grouped_metadata)
+                # Each group's slice runs the MQA kernel on fewer rows, whose
+                # split heuristics may reorder the sum: equal up to rounding.
+                err = (grouped_out.float() - out.float()).norm() / out.float().norm()
+                # Requests in a group with a long row are bitwise equal.
+                qs = np.r_[0, np.cumsum([n for _, n in lens])]
+                for lo, hi in grouped_context.groups:
+                    first = num_decodes + lo
+                    rows = slice(int(qs[first]), int(qs[num_decodes + hi]))
+                    if max(n for _, n in lens[first : num_decodes + hi]) >= 500:
+                        assert torch.equal(grouped_out[rows], out[rows]), name
+                grouped_for_ref = grouped_out.clone()
+                # A group's requests attend exactly as before (bitwise on the
+                # steps measured) or, in a group of a few short rows, through
+                # the MQA kernel's small-batch configuration: within the
+                # E4M3-softmax rounding that separates the paths below.
+                assert err < 3e-2, (name, err)
+                # Restore the single-group workspace for the checks below.
+                score(metadata, index_metadata)
+                forward(metadata)
+
                 # The DCP path over the same keys: every rank's top-k rows.
                 topk = torch.zeros_like(dcp_topk)
                 topk[local] = local_topk + 1
@@ -1255,7 +1308,11 @@ def _layer_worker(rank, world, init_file, cache_dtype, kernel, index_format="fp8
                 # (test_flashinfer_mla_sparse_prims_ts), and they differ by
                 # about 2.1e-2.
                 err = (out.float() - expected.float()).norm() / expected.float().norm()
+                g_err = (
+                    grouped_for_ref.float() - expected.float()
+                ).norm() / expected.float().norm()
                 assert err < 3e-2, (name, err)
+                assert g_err < 3e-2, (name, g_err)
 
             # The next layer's gather waits for every rank to finish reading
             # this one: rank 0 lags, and its copy must still hold this layer.

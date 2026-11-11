@@ -32,7 +32,7 @@ with the DCP group equal to the TP group; nothing here is model-specific.
 """
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -41,7 +41,6 @@ import torch
 import vllm.envs as envs
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import init_logger
-from vllm.platforms import current_platform
 from vllm.utils.math_utils import round_up
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backend import CommonAttentionMetadata
@@ -53,7 +52,7 @@ from vllm.v1.attention.backends.mla.indexer import (
 from vllm.v1.attention.backends.mla.sparse_utils import (
     ConvertReqIndexToGlobalIndexKernel,
 )
-from vllm.v1.attention.ops.dcp import dcp_a2a_lse_reduce, dcp_shardq_configured
+from vllm.v1.attention.ops.dcp import dcp_a2a_lse_reduce
 from vllm.v1.attention.ops.dcp_shardq import PAGE_TOKENS
 from vllm.v1.attention.ops.shardq import (
     ShardQSplit,
@@ -123,13 +122,25 @@ class ContextLayout:
         return PAGE_TOKENS * (self.index_row_bytes + self.index_scale_bytes)
 
 
+# Context tokens the workspace holds (at least max_model_len: it always
+# holds one whole request). A step whose prefill rows' context exceeds it runs
+# in request groups that each fit (DcpShardQContext.groups), so this only sets
+# how many rows share one gather. Measured on VR200 (DCP4 K3.1 DSA layer,
+# fp8 KV): steps that fit take the same time at 1M, 2.2M or 4.4M tokens; a
+# 16-row step of 2.1M context takes 8.66 ms per layer in one group vs 9.45 ms
+# in two. 2M tokens (~1.4 GiB per GPU with fp8 KV) holds a full 32K-token step
+# of ~130K-context rows in one group.
+WORKSPACE_TOKENS = 2 << 20
+
+
 def workspace_max_tokens(vllm_config: "VllmConfig") -> int:
-    """Tokens of context the workspace holds: ``max_model_len``, so any one
-    request fits. It costs about ``mla_row_bytes + index_row_bytes`` (plus
-    the index scales) per token on each rank, ~0.7 GB per 1M tokens with a
-    per-tensor ``fp8`` cache and ~0.5 GB with ``nvfp4_ds_mla``. Call it
-    through this module so tests can patch it."""
-    return vllm_config.model_config.max_model_len
+    """Tokens of context the workspace holds: ``WORKSPACE_TOKENS``, and at
+    least ``max_model_len`` so any one request fits. It costs about
+    ``mla_row_bytes + index_row_bytes`` (plus the index scales) per token on
+    each rank, ~0.7 GB per 1M tokens with a per-tensor ``fp8`` cache and
+    ~0.5 GB with ``nvfp4_ds_mla``. Call it through this module so tests can
+    patch it."""
+    return max(vllm_config.model_config.max_model_len, WORKSPACE_TOKENS)
 
 
 def capacity_pages(max_tokens: int, max_reqs: int) -> int:
@@ -137,33 +148,9 @@ def capacity_pages(max_tokens: int, max_reqs: int) -> int:
     return -(-max_tokens // PAGE_TOKENS) + max_reqs
 
 
-def scheduler_context_pages(vllm_config: "VllmConfig") -> int | None:
-    """The workspace pages the scheduler keeps each step's prefill rows
-    within (the sum over them of ``ceil(seq_len / 64)``), or None when DCP
-    ShardQ steps cannot run under this configuration.
-
-    With the cap, no step finds the workspace full, so the DCP path only runs
-    a step's leading decode rows and steps of fewer than
-    ``sparse_mla_shard_q_min_tokens`` prefill tokens, and the memory profile
-    reserves those (``dcp_fallback_max_tokens``) instead of a whole
-    ``max_num_batched_tokens`` step. The conditions are the configuration's
-    (``dcp_shardq_configured``) and the platform's (SM10x); where the backend
-    has no DCP ShardQ, the cap merely keeps a step's prefill context within
-    ``max_model_len``.
-    """
-    if not (
-        dcp_shardq_configured(vllm_config)
-        and current_platform.is_device_capability_family(100)
-    ):
-        return None
-    return capacity_pages(
-        workspace_max_tokens(vllm_config), vllm_config.scheduler_config.max_num_seqs
-    )
-
-
 def dcp_fallback_max_tokens(vllm_config: "VllmConfig", decode_query_len: int) -> int:
-    """Most tokens of a step that keeps the DCP path under DCP ShardQ, given
-    the scheduler's context cap: its leading decode rows plus fewer than
+    """Most tokens of a step that keeps the DCP path under DCP ShardQ (whose
+    steps never fall back for a full workspace): its leading decode rows plus fewer than
     ``sparse_mla_shard_q_min_tokens`` prefill tokens, or a padded step of at
     most the DCP workspace's tokens."""
     from vllm.v1.attention.ops.dcp import get_dcp_workspace_max_num_tokens
@@ -312,11 +299,40 @@ class DcpShardQContext:
     block_table: torch.Tensor
     # int64 [num_prefill_tokens]: workspace slot of each new prefill token.
     slot_mapping: torch.Tensor
-    # Indexer prefill chunks over the workspace, in the non-DCP form.
+    # Indexer prefill chunks over the workspace, in the non-DCP form (all
+    # groups, in order).
     indexer_chunks: list[DeepseekV32IndexerPrefillChunkMetadata]
+    # Request groups of the prefill rows (relative to the first prefill row),
+    # each fitting the workspace: [lo, hi). Each group's pages start at the
+    # workspace's first page, so one block table addresses every group and a
+    # group runs while its context is the one in the workspace. Almost every
+    # step has one group.
+    groups: list[tuple[int, int]] = field(default_factory=list)
+    # Each group's indexer chunks.
+    group_chunks: list[list[DeepseekV32IndexerPrefillChunkMetadata]] = field(
+        default_factory=list
+    )
+    # Each group's prefill tokens (relative to the first prefill token): G + 1
+    # bounds, on the host.
+    group_token_bounds: np.ndarray | None = None
+    # This rank's ShardQ slice bounds of each group (G + 1, the slice is in
+    # request order), set by the planner once the split exists.
+    group_local_bounds: np.ndarray | None = None
+    # Per layer: the group whose context the workspace holds, and the caches
+    # it was gathered from (the indexer gathers, the MLA layer re-gathers the
+    # other groups).
+    resident_group: int = -1
+    gather_args: tuple | None = None
+    # Per layer, for a step of several groups: writes the prefill tokens
+    # [lo, hi)'s MLA rows into the workspace (set by the MLA layer).
+    write_new_tokens: Any = None
 
     # The workspace's pages of 64 tokens address its views and block table.
     block_size = PAGE_TOKENS
+
+    @property
+    def num_groups(self) -> int:
+        return max(len(self.groups), 1)
 
     def _view(self, dtype: torch.dtype, offset: int, row_bytes: int, device):
         """The workspace pages at ``offset`` as a [pages, 64, row] cache."""
@@ -350,25 +366,29 @@ class DcpShardQContext:
         index_cache: torch.Tensor,
         index_block_table: torch.Tensor,
         dst_addrs: torch.Tensor,
+        group: int = 0,
     ) -> None:
-        """Copy this rank's rows of the prefill requests of one layer's
-        DCP-local paged caches (with the step's kernel block tables) into the
-        workspaces at ``dst_addrs``."""
+        """Copy this rank's rows of the prefill requests of ``group`` (all of
+        them when the step has one group) of one layer's DCP-local paged
+        caches (with the step's kernel block tables) into the workspaces at
+        ``dst_addrs``."""
         if self.max_local_pages:
             # gather imports cutlass, so import it only on the SM100 path.
             from vllm.v1.attention.ops.dcp_shardq.gather import (
                 DCP_CONTEXT_PUSH_KERNEL,
             )
 
-            first = self.num_decodes
+            lo, hi = self.groups[group] if self.groups else (0, len(self.seq_lens))
+            first = self.num_decodes + lo
+            last = self.num_decodes + hi
             DCP_CONTEXT_PUSH_KERNEL(
                 mla_cache=mla_cache,
-                mla_block_table=mla_block_table[first:],
+                mla_block_table=mla_block_table[first:last],
                 index_cache=index_cache,
-                index_block_table=index_block_table[first:],
-                seq_lens=self.seq_lens,
-                query_start_loc=self.query_start_loc,
-                dst_block_table=self.block_table[first:],
+                index_block_table=index_block_table[first:last],
+                seq_lens=self.seq_lens[lo:hi],
+                query_start_loc=self.query_start_loc[lo : hi + 1],
+                dst_block_table=self.block_table[first:last],
                 max_local_pages=self.max_local_pages,
                 dst_addrs=dst_addrs,
                 dst_index_offset=self.pages * self.layout.mla_page_bytes,
@@ -382,19 +402,69 @@ class DcpShardQContext:
         mla_block_table: torch.Tensor,
         index_cache: torch.Tensor,
         index_block_table: torch.Tensor,
+        group: int = 0,
     ) -> torch.Tensor:
-        """Push this rank's rows of one layer into every rank's workspace (see
-        ``push``) and return the workspace as the indexer's cache view, once
-        every rank's rows have landed in it."""
+        """Push this rank's rows of ``group`` of one layer into every rank's
+        workspace (see ``push``) and return the workspace as the indexer's
+        cache view, once every rank's rows have landed in it."""
         index_view = self.index_view(index_cache)
         buffer = _workspace(self.layout, self.pages, index_cache.device)
-        # Peers may still read the previous layer from their workspaces.
+        # Peers may still read the previous layer (or group) from their
+        # workspaces.
         buffer.handle.barrier()
         self.push(
-            mla_cache, mla_block_table, index_cache, index_block_table, buffer.peer_ptrs
+            mla_cache,
+            mla_block_table,
+            index_cache,
+            index_block_table,
+            buffer.peer_ptrs,
+            group,
         )
         buffer.handle.barrier()
+        self.resident_group = group
+        self.gather_args = (mla_cache, mla_block_table, index_cache, index_block_table)
         return index_view
+
+    def gathered_indexer_chunks(
+        self,
+        mla_cache: torch.Tensor,
+        mla_block_table: torch.Tensor,
+        index_cache: torch.Tensor,
+        index_block_table: torch.Tensor,
+    ):
+        """The indexer's prefill chunks with the workspace view each runs on:
+        every group is gathered right before its chunks (every rank runs the
+        same groups in the same order), so the last group stays resident."""
+        for group in range(self.num_groups):
+            view = self.gather(
+                mla_cache, mla_block_table, index_cache, index_block_table, group
+            )
+            chunks = self.group_chunks[group] if self.group_chunks else self.indexer_chunks
+            for chunk in chunks:
+                yield chunk, view
+
+    def ensure_resident(self, group: int) -> None:
+        """Re-gather ``group`` (from the caches this layer's indexer gathered
+        from) unless the workspace holds it."""
+        if self.resident_group != group:
+            assert self.gather_args is not None
+            self.gather(*self.gather_args, group)
+
+    def group_tokens(self, group: int) -> tuple[int, int]:
+        """The prefill tokens of ``group``, relative to the first one."""
+        if self.group_token_bounds is None:
+            return 0, int(self.slot_mapping.shape[0])
+        return int(self.group_token_bounds[group]), int(
+            self.group_token_bounds[group + 1]
+        )
+
+    def group_local(self, group: int, num_local: int) -> tuple[int, int]:
+        """This rank's ShardQ slice rows of ``group``."""
+        if self.group_local_bounds is None:
+            return 0, num_local
+        return int(self.group_local_bounds[group]), int(
+            self.group_local_bounds[group + 1]
+        )
 
 
 def build_dcp_shardq_context(
@@ -409,8 +479,10 @@ def build_dcp_shardq_context(
     num_decodes: int = 0,
 ) -> DcpShardQContext | None:
     """The context plan of a step's prefill rows (its requests from
-    ``num_decodes`` on) on DCP rank ``rank`` of ``world``, or None when they
-    do not fit the ``max_pages`` workspace pages.
+    ``num_decodes`` on) on DCP rank ``rank`` of ``world``. When their context
+    exceeds the ``max_pages`` workspace pages, they run in consecutive
+    request groups that each fit (one request always fits: the workspace
+    holds at least ``max_model_len`` tokens).
 
     Every rank derives the same plan; the push kernel finds each rank's rows
     from the step's device sequence lengths.
@@ -426,9 +498,20 @@ def build_dcp_shardq_context(
     query_lens = np.diff(qsl)
     seq_lens = seq_lens_cpu.numpy().astype(np.int64)[num_decodes:]
     pages = -(-seq_lens // PAGE_TOKENS)
-    if pages.sum() > max_pages:
-        return None
-    page_start = np.cumsum(pages) - pages
+    if pages.max() > max_pages:
+        return None  # cannot happen: one request fits the workspace
+    # Greedy consecutive request groups of at most max_pages pages; each
+    # group's pages start at page 0.
+    groups: list[tuple[int, int]] = []
+    page_start = np.empty_like(pages)
+    lo, used = 0, 0
+    for i, p in enumerate(pages.tolist()):
+        if used + p > max_pages:
+            groups.append((lo, i))
+            lo, used = i, 0
+        page_start[i] = used
+        used += p
+    groups.append((lo, len(pages)))
 
     context_lens = seq_lens - query_lens
     # Rank 0 holds the most rows: ceil(seq_len / world).
@@ -449,28 +532,39 @@ def build_dcp_shardq_context(
 
     block_table_gpu = to_device(block_table, torch.int32)
     seq_lens_gpu = common_attn_metadata.seq_lens[:num_reqs]
-    chunk_specs = DeepseekV32IndexerMetadataBuilder._split_indexer_prefill_chunks(
-        seq_lens_cpu[num_decodes:],
-        torch.from_numpy(query_lens),
-        max_indexer_keys,
-        max_logits_bytes,
-    )
-    indexer_chunks = [
-        build_prefill_chunk_metadata(
-            num_decodes + req_slice.start,
-            num_decodes + req_slice.stop,
-            common_attn_metadata.query_start_loc,
-            query_start_loc_cpu,
-            seq_lens_gpu,
-            seq_lens_gpu,
-            seq_lens_cpu,
-            block_table_gpu,
-            1,
-            query_slice=query_slice,
-            skip_kv_gather=query_slice.start > 0,
+    prefill_seq_lens_cpu = seq_lens_cpu[num_decodes:]
+    query_lens_cpu = torch.from_numpy(query_lens)
+    group_chunks = []
+    for g_lo, g_hi in groups:
+        # A group's chunks never span two groups: each runs over one gather.
+        chunk_specs = DeepseekV32IndexerMetadataBuilder._split_indexer_prefill_chunks(
+            prefill_seq_lens_cpu[g_lo:g_hi],
+            query_lens_cpu[g_lo:g_hi],
+            max_indexer_keys,
+            max_logits_bytes,
         )
-        for req_slice, query_slice in chunk_specs
-    ]
+        chunks = [
+            build_prefill_chunk_metadata(
+                num_decodes + g_lo + req_slice.start,
+                num_decodes + g_lo + req_slice.stop,
+                common_attn_metadata.query_start_loc,
+                query_start_loc_cpu,
+                seq_lens_gpu,
+                seq_lens_gpu,
+                seq_lens_cpu,
+                block_table_gpu,
+                1,
+                query_slice=query_slice,
+                skip_kv_gather=query_slice.start > 0,
+            )
+            for req_slice, query_slice in chunk_specs
+        ]
+        group_chunks.append([chunk for chunk in chunks if chunk is not None])
+    indexer_chunks = [chunk for chunks in group_chunks for chunk in chunks]
+    rel_qsl = qsl - qsl[0]
+    group_token_bounds = np.array(
+        [rel_qsl[g_lo] for g_lo, _ in groups] + [rel_qsl[-1]], dtype=np.int64
+    )
     return DcpShardQContext(
         layout=layout,
         world=world,
@@ -485,7 +579,10 @@ def build_dcp_shardq_context(
         max_local_pages=max_local_pages,
         block_table=block_table_gpu,
         slot_mapping=to_device(slot_mapping, torch.int64),
-        indexer_chunks=[chunk for chunk in indexer_chunks if chunk is not None],
+        indexer_chunks=indexer_chunks,
+        groups=groups,
+        group_chunks=group_chunks,
+        group_token_bounds=group_token_bounds,
     )
 
 
@@ -563,6 +660,8 @@ class DcpShardQStats:
         # Path -> [steps, tokens].
         self.recent: dict[str, list[int]] = {}
         self.total: dict[str, list[int]] = {}
+        # ShardQ steps that ran in more than one request group: [steps, groups].
+        self.grouped = [0, 0]
 
     def record(self, path: str, num_tokens: int) -> None:
         for counts in (self.recent, self.total):
@@ -575,6 +674,7 @@ class DcpShardQStats:
                 self.last_report = now
                 logger.info("%s", self.report())
                 self.recent.clear()
+                self.grouped = [0, 0]
 
     @staticmethod
     def _share(counts: dict[str, list[int]]) -> tuple[int, int, int, int]:
@@ -597,7 +697,8 @@ class DcpShardQStats:
             f"{tokens}/{all_tokens} tokens "
             f"({100 * tokens / max(all_tokens, 1):.1f}%; "
             f"{100 * total_tokens / max(total_all, 1):.1f}% since start) on "
-            f"ShardQ; DCP path: {fallback or 'none'}"
+            f"ShardQ; DCP path: {fallback or 'none'}; "
+            f"grouped steps {self.grouped[0]} ({self.grouped[1]} groups)"
         )
 
 
@@ -694,4 +795,14 @@ class DcpShardQPlanner:
         split = make_shardq_split(
             qsl[num_decodes:] - qsl[num_decodes], self.world, self.rank, self.device
         )
+        if len(context.groups) > 1:
+            # The split lists this rank's tokens in request order (each
+            # request's two pieces ascending), so each group's are one
+            # contiguous run of the slice.
+            assert context.group_token_bounds is not None
+            context.group_local_bounds = np.searchsorted(
+                split.local_idx_cpu, context.group_token_bounds
+            )
+            self.stats.grouped[0] += 1
+            self.stats.grouped[1] += len(context.groups)
         return split, context
