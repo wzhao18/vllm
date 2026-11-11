@@ -8,7 +8,8 @@
 - ``KimiK3MegaMoEExperts`` registers DeepGEMM MegaMoE's parameter names, shapes and
   dtypes at the K3.1 shapes, loads checkpoint shards as stored, converts to the
   kernel layout (raising on non-representable NVFP4 weights on every rank), exposes
-  EPLB views, masks padding and passes the server's bucket;
+  EPLB views, masks padding and passes the smallest EP-uniform bucket per forward
+  (decode bucket at the token_comm decode-landing limit, else the server's bucket);
 - the Kimi K3 model picks the experts class per backend; the DeepGEMM header
   install skips kimi_k3_mega_moe;
 - the S1 token_comm drop is recorded in VENDOR.md.
@@ -40,9 +41,10 @@ SITU = dg.MegaMoEActivation("situ", alpha=4.0, beta=25.0)
 PKG_DIR = Path(X.__file__).resolve().parent
 
 
-def _vllm_config(mnbt=8192):
+def _vllm_config(mnbt=8192, dp=1):
     return SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_batched_tokens=mnbt),
+        parallel_config=SimpleNamespace(data_parallel_size=dp),
         compilation_config=SimpleNamespace(static_forward_context={}),
     )
 
@@ -168,6 +170,53 @@ def test_server_bucket_resolves_shipped_knobs(world, tokens):
     assert bucket.variant == X.rubin_kernel_variant(tokens)
     # every admission rule of the kernel config holds for the resolved knobs
     C.RubinMoeConfig.make(problem, bucket, rank=0, world_size=world)
+
+
+@pytest.mark.parametrize(
+    ("tokens", "caps"),
+    [
+        (2048, (256, 2048)),  # decode server: MNBT 8192 / TP4 (C512)
+        (4096, (256, 4096)),
+        (1025, (256, 1025)),
+        (1024, (1024,)),  # genphase server: one bucket
+        (512, (512,)),
+        (256, (256,)),
+        (160, (160,)),
+    ],
+)
+def test_bucket_capacities(tokens, caps):
+    assert X.rubin_bucket_capacities(tokens, 16) == caps
+    assert X.rubin_bucket_capacities(4096, 2) == (2048, 4096)
+    with pytest.raises(ValueError):
+        X.rubin_bucket_capacities(2048, 0)
+
+
+def test_decode_bucket_limit_matches_token_comm():
+    """The decode bucket sits exactly at the token_comm trace-time gates (S1 decode
+    landing and S0 dynamic token_in claim), read from the vendored source."""
+    src = (
+        PKG_DIR / "src/sources/communication/nvlink_domain/token_comm.py"
+    ).read_text()
+    for name in ("decode_landing_max_routes", "token_in_dynamic_claim_max_routes"):
+        (value,) = re.findall(rf"{name}: ClassVar\[int\] = (\d+)", src)
+        assert int(value) == X.RUBIN_DECODE_BUCKET_MAX_ROUTES
+
+
+@pytest.mark.parametrize(("world", "tokens"), [(16, 2048), (16, 4096), (8, 2048)])
+def test_server_buckets_share_the_main_knob_record(world, tokens):
+    X.select_rubin_bucket.cache_clear()
+    problem = C.RubinMoeProblem(quant_kind=X.rubin_quant_kind(tokens))
+    buckets, notes = X.select_rubin_buckets(problem, world, tokens)
+    main, _ = X.select_rubin_bucket(problem, world, tokens)
+    assert [b.max_tokens for b in buckets] == [256, tokens]
+    assert buckets[-1] == main
+    assert all(b.variant == "inference" and b.knobs == main.knobs for b in buckets)
+    assert any("decode bucket" in n for n in notes)
+    for b in buckets:  # every admission rule holds at both capacities
+        C.RubinMoeConfig.make(problem, b, rank=0, world_size=world)
+    # a genphase server keeps its one bucket
+    problem = C.RubinMoeProblem(quant_kind=X.rubin_quant_kind(512))
+    assert len(X.select_rubin_buckets(problem, 16, 512)[0]) == 1
 
 
 def test_server_bucket_without_knob_record_raises():
@@ -338,7 +387,11 @@ def test_process_weights_converts_and_frees(monkeypatch, ep, small_bucket, mnbt,
     with pytest.raises(RuntimeError, match="reloading"):
         module.weight_loader(module.w2_weight, torch.zeros(1), "w2_weight", "w2", 4)
 
-    # forward: padding rows masked to -1, the server's one bucket every call
+    # forward: padding rows masked to -1, the smallest bucket holding the tokens
+    assert [b.max_tokens for b in module.buckets] == (
+        [2048, 4096] if mnbt == 4096 else [64]
+    )
+    assert module.bucket is module.buckets[-1]
     hidden = torch.randn(3, 128).to(torch.bfloat16)
     ids = torch.tensor([[4, 5], [6, 7], [0, 1]], dtype=torch.int32)
     wts = torch.rand(3, 2)
@@ -348,9 +401,36 @@ def test_process_weights_converts_and_frees(monkeypatch, ep, small_bucket, mnbt,
     staged_ids, staged_wts, kernel_weights, bucket = runtime.calls[-1]
     assert staged_ids.tolist() == [[4, 5], [-1, -1], [0, 1]]
     assert staged_ids.dtype == torch.int32 and staged_wts is wts
-    assert kernel_weights is w and bucket is module.bucket
+    assert kernel_weights is w and bucket is module.buckets[0]
+    if mnbt == 4096:
+        big = torch.zeros(2049, 128, dtype=torch.bfloat16)
+        module(big, torch.rand(2049, 2), torch.zeros(2049, 2, dtype=torch.int32))
+        assert runtime.calls[-1][3] is module.bucket
     with pytest.raises(ValueError, match="sized for"):
         module(torch.zeros(mnbt + 1, 128, dtype=torch.bfloat16), wts, ids)
+
+
+def test_bucket_selection_is_ep_uniform(monkeypatch, ep, small_bucket):
+    """DP > 1: equal DP batch sizes -> the smallest bucket holding the tokens; unequal
+    ones (the same counts on every rank) -> the largest bucket on every rank; no DP
+    metadata -> error (a rank-local choice could deadlock the lock-step kernel)."""
+    ep.world_size, ep.rank_in_group = 2, 1
+    module = _experts(_vllm_config(dp=4), ep=ep, max_num_tokens=4096, **SMALL)
+    small, large = module.buckets
+    ctx = SimpleNamespace(dp_metadata=None)
+    monkeypatch.setattr(X, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(X, "get_forward_context", lambda: ctx)
+    with pytest.raises(RuntimeError, match="DP metadata"):
+        module.select_bucket(52)
+    counts = torch.tensor([208, 208, 208, 208])
+    ctx.dp_metadata = SimpleNamespace(num_tokens_across_dp_cpu=counts)
+    assert module.select_bucket(52) is small
+    assert module.select_bucket(2048) is small
+    assert module.select_bucket(2049) is large
+    counts[2] = 200
+    assert module.select_bucket(52) is large
+    with pytest.raises(ValueError, match="sized for"):
+        module.select_bucket(4097)
 
 
 def test_non_representable_nvfp4_raises_on_every_rank(monkeypatch, ep, small_bucket):
