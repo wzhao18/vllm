@@ -1054,14 +1054,26 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             # context, which still lacks the step's tokens; every rank holds
             # all of them.
             num_dcp_decode_tokens = gathered_context.num_decode_tokens
-            self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
-                k_c_normed[num_dcp_decode_tokens:],
-                k_pe[num_dcp_decode_tokens:],
-                gathered_context.mla_view(kv_cache),
-                gathered_context.slot_mapping,
-                self.kv_cache_dtype,
-                self._k_scale,
-            )
+
+            def write_new_tokens(lo: int, hi: int) -> None:
+                # Prefill tokens [lo, hi) (relative to the first one) into
+                # the workspace, which must hold their request group.
+                first = num_dcp_decode_tokens
+                self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
+                    k_c_normed[first + lo : first + hi],
+                    k_pe[first + lo : first + hi],
+                    gathered_context.mla_view(kv_cache),
+                    gathered_context.slot_mapping[lo:hi],
+                    self.kv_cache_dtype,
+                    self._k_scale,
+                )
+
+            if gathered_context.num_groups == 1:
+                write_new_tokens(0, int(gathered_context.slot_mapping.shape[0]))
+                gathered_context.write_new_tokens = None
+            else:
+                # Each group's tokens land while the attention holds it.
+                gathered_context.write_new_tokens = write_new_tokens
 
         mha_use_quant_output = (
             quant_key is not None

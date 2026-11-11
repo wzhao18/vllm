@@ -1170,27 +1170,56 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
         topk = self.topk_indices_buffer[
             num_decode_tokens : num_decode_tokens + q.shape[0]
         ]
-        physical_topk, valid_counts = triton_convert_req_index_to_global_index(
-            shardq.req_id_per_token,
-            block_table,
-            topk,
-            BLOCK_SIZE=block_size,
-            BLOCK_STRIDE_ROWS=block_stride_rows,
-            NUM_TOPK_TOKENS=topk.shape[1],
-            return_valid_counts=True,
-        )
-        # The token slice's output goes straight back to the head shards: the
-        # LSE (and the empty-row masking that comes with it) is never read.
-        out, _ = self._forward_mqa_kernel(
-            q,
-            kv_c_and_k_pe_cache,
-            physical_topk,
-            valid_counts,
-            layer=layer,
-            block_size=block_size,
-            is_decode=False,
-            return_lse=False,
-        )
+
+        def attend(rows: slice) -> torch.Tensor:
+            physical_topk, valid_counts = triton_convert_req_index_to_global_index(
+                shardq.req_id_per_token[rows],
+                block_table,
+                topk[rows],
+                BLOCK_SIZE=block_size,
+                BLOCK_STRIDE_ROWS=block_stride_rows,
+                NUM_TOPK_TOKENS=topk.shape[1],
+                return_valid_counts=True,
+            )
+            # The token slice's output goes straight back to the head shards:
+            # the LSE (and the empty-row masking that comes with it) is never
+            # read.
+            out, _ = self._forward_mqa_kernel(
+                q[rows],
+                kv_c_and_k_pe_cache,
+                physical_topk,
+                valid_counts,
+                layer=layer,
+                block_size=block_size,
+                is_decode=False,
+                return_lse=False,
+            )
+            return out
+
+        context = shardq.gathered_context
+        if context is None or context.num_groups == 1:
+            out = attend(slice(None))
+        else:
+            # A step of several request groups: each group's slice rows attend
+            # while the workspace holds that group (the indexer left the last
+            # one resident). Every rank visits the groups in the same order,
+            # since each re-gather is a collective push.
+            num_groups = context.num_groups
+            order = [num_groups - 1, *range(num_groups - 1)]
+            out = None
+            for group in order:
+                context.ensure_resident(group)
+                lo, hi = context.group_tokens(group)
+                context.write_new_tokens(lo, hi)
+                a, b = context.group_local(group, q.shape[0])
+                if b == a:
+                    continue
+                part = attend(slice(a, b))
+                if out is None:
+                    out = part.new_empty((q.shape[0], *part.shape[1:]))
+                out[a:b] = part
+            if out is None:
+                out = attend(slice(None))
         out = unshard_out(
             out[:, :num_heads], shardq.split, num_leading_rows=num_decode_tokens
         )

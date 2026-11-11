@@ -835,6 +835,7 @@ def sparse_attn_indexer(
     # sides agree on which top-k rows exist.
     shardq = None
     prefill_chunks = None
+    prefill_chunk_iter = None
     prefill_kv_cache = kv_cache
     prefill_dcp_world_size = dcp_world_size
     if shardq_layer_name:
@@ -850,7 +851,9 @@ def sparse_attn_indexer(
             # ranks. Its decode rows keep the DCP decode path.
             assert num_decode_tokens == shardq.num_decode_tokens
             mla_layer = forward_context.no_compile_layers[shardq_layer_name]
-            prefill_kv_cache = shardq.gathered_context.gather(
+            # Each request group of the step is gathered right before its
+            # chunks run (one group, gathered once, for almost every step).
+            prefill_chunk_iter = shardq.gathered_context.gathered_indexer_chunks(
                 mla_layer.kv_cache,
                 attn_metadata[shardq_layer_name].block_table,
                 kv_cache,
@@ -922,7 +925,9 @@ def sparse_attn_indexer(
             *gather_specs,
         )
         assert shardq is None or candidate_blocks is None
-        for chunk in prefill_chunks:
+        if prefill_chunk_iter is None:
+            prefill_chunk_iter = ((chunk, prefill_kv_cache) for chunk in prefill_chunks)
+        for chunk, prefill_kv_cache in prefill_chunk_iter:
             cu_seqlen_ks = chunk.cu_seqlen_ks
             cu_seqlen_ke = chunk.cu_seqlen_ke
             assert chunk.local_cu_seq_lens is not None
@@ -1122,6 +1127,11 @@ def sparse_attn_indexer(
             # the profile run has one chunk, so two live chunks would exceed
             # the logits budget it reserved.
             del logits, bf16_logits
+    elif prefill_chunk_iter is not None:
+        # The MLA layer attends the gathered context whether or not this
+        # indexer scored prefill rows: gather every group as before.
+        for _ in prefill_chunk_iter:
+            pass
 
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
