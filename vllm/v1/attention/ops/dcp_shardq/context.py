@@ -58,6 +58,7 @@ from vllm.v1.attention.ops.shardq import (
     ShardQSplit,
     _symm_buffer,
     _SymmBuffer,
+    fold_split,
     make_shardq_split,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
@@ -467,6 +468,62 @@ class DcpShardQContext:
         )
 
 
+def _rank_chunk_specs(
+    seq_lens_cpu: torch.Tensor,
+    query_lens: np.ndarray,
+    max_indexer_keys: int,
+    max_logits_bytes: int,
+    world: int,
+    rank: int,
+) -> list[tuple[slice, slice]]:
+    """This rank's indexer chunks of prefill requests ``seq_lens_cpu`` /
+    ``query_lens``: (request slice, query-token slice of those requests).
+
+    Each rank scores only its ShardQ rows (two fold pieces per request,
+    ``fold_split``), so the logits budget bounds a chunk's *local* rows. The
+    chunks are planned over the most rows any rank owns of each request (one
+    plan shape on every rank), and a request split on the query dimension is
+    cut at this rank's own row boundaries: every rank then scores equal row
+    counts in the same number of calls. Cutting the global token range instead
+    leaves each rank a different, misaligned share of each chunk (e.g. 435 /
+    426 + 9 / 142 + 293 + 435 / 719 + 151 rows), and the top-k and logits
+    launches pay per call. The rows scored, hence the top-k, are unchanged.
+    """
+    rows = [fold_split(np.array([0, int(q)]), world) for q in query_lens]
+    local_lens = torch.tensor([max(len(r) for r in per_rank) for per_rank in rows])
+    specs = DeepseekV32IndexerMetadataBuilder._split_indexer_prefill_chunks(
+        seq_lens_cpu, local_lens, max_indexer_keys, max_logits_bytes
+    )
+    # Sub-chunks per request the splitter cut on the query dimension; they are
+    # re-cut into equal parts (e.g. 683 + 683 local rows, not 998 + 368).
+    num_parts: dict[int, int] = {}
+    for req_slice, local in specs:
+        if req_slice.stop - req_slice.start == 1:
+            num_parts[req_slice.start] = num_parts.get(req_slice.start, 0) + 1
+    out: list[tuple[slice, slice]] = []
+    for req_slice, local in specs:
+        first = req_slice.start
+        parts = num_parts.get(first, 1)
+        if parts == 1:
+            # Whole requests (the splitter only sub-chunks a single request).
+            if any(len(rows[q][rank]) for q in range(first, req_slice.stop)):
+                out.append((req_slice, slice(0, int(query_lens[req_slice].sum()))))
+            continue
+        if local.start > 0:
+            continue  # The request's parts were emitted at its first sub-chunk.
+        own = rows[first][rank]
+        cuts = [(j * len(own)) // parts for j in range(parts + 1)]
+        keep = [j for j in range(parts) if cuts[j] < cuts[j + 1]]
+        if not keep:
+            continue  # This rank owns no row of the request.
+        # Each part runs from this rank's first row of it (0 for the first
+        # part, which gathers the request's keys) to the next part's.
+        starts = [0] + [int(own[cuts[j]]) for j in keep[1:]]
+        starts.append(int(query_lens[first]))
+        out.extend((req_slice, slice(lo, hi)) for lo, hi in zip(starts, starts[1:]))
+    return out
+
+
 def build_dcp_shardq_context(
     common_attn_metadata: CommonAttentionMetadata,
     layout: ContextLayout,
@@ -484,8 +541,10 @@ def build_dcp_shardq_context(
     request groups that each fit (one request always fits: the workspace
     holds at least ``max_model_len`` tokens).
 
-    Every rank derives the same plan; the push kernel finds each rank's rows
-    from the step's device sequence lengths.
+    Every rank derives the same groups and workspace layout; the push kernel
+    finds each rank's rows from the step's device sequence lengths. Only the
+    indexer chunks are per rank (``_rank_chunk_specs``): no collective runs
+    between a group's chunks.
     """
     num_reqs = common_attn_metadata.num_reqs
     query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
@@ -533,15 +592,16 @@ def build_dcp_shardq_context(
     block_table_gpu = to_device(block_table, torch.int32)
     seq_lens_gpu = common_attn_metadata.seq_lens[:num_reqs]
     prefill_seq_lens_cpu = seq_lens_cpu[num_decodes:]
-    query_lens_cpu = torch.from_numpy(query_lens)
     group_chunks = []
     for g_lo, g_hi in groups:
         # A group's chunks never span two groups: each runs over one gather.
-        chunk_specs = DeepseekV32IndexerMetadataBuilder._split_indexer_prefill_chunks(
+        chunk_specs = _rank_chunk_specs(
             prefill_seq_lens_cpu[g_lo:g_hi],
-            query_lens_cpu[g_lo:g_hi],
+            query_lens[g_lo:g_hi],
             max_indexer_keys,
             max_logits_bytes,
+            world,
+            rank,
         )
         chunks = [
             build_prefill_chunk_metadata(
