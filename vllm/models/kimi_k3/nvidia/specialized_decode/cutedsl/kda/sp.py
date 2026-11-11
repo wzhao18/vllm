@@ -32,14 +32,17 @@ recurrence, the Triton formulas and instructions; only FP32 reduction order diff
 The replaying cores (``fused``: chunked WY form) also round the recurrence in FP32 in
 another form, so ``REPLAY`` is empty until that is signed off.
 
-Record cores by requests n at 24 heads, from the upstream GB300 (request, head) item
-crossovers (``items = 24 n``; TP8 / TP1 sweeps, FP32 state and conv, q5): KdaSplit
-below 192 items, KdaWS 192-383 (two or three items per CTA), KdaWide from 384,
-KdaStream from 768, KdaWS from 864.
-NQ-TUNE: none of it is measured at 24 heads on VR200 (SM107): sweep KdaSplit (and its
-SP_SPEC_SCHEDULE geometry) / KdaWS / KdaWide / KdaStream at n = 1..128, q4, FP32
-state, records on, in the AG -> in-proj -> KDA -> o_proj+RS chain, u128k-independent
-(the KDA state is per request); then REPLAY (KdaFused / KdaFusedWS) in "deferred" mode
+Record cores by requests n at 24 heads (``items = 24 n``), measured on VR200 (SM107):
+q4, FP32 state, "triton" records, one CUDA graph of 69 layers over 8 disjoint slot
+sets (state working set above L2), every core at n = 1..16, 24, 32, 36, 40, 48, 52,
+56, 60, 64, 68..72, 76, 80, 88, 96 (us per layer, the winner first):
+n1 / n2 KdaSplit 3.8 / 4.7 (KdaWide 5.6); n3..n7 KdaWide 5.7..6.2 (KdaSplit
+6.0..11.3); n8..n15 KdaWide 6.2..9.1 (KdaWS 10.2..11.2); n16..n70 KdaWide (n32 18.1
+against KdaStream 19.8, n52 27.4 against KdaWS 29.6, n70 36.2 against 36.5); from n71
+(1704 items, past eight per SM) KdaWS (n71 39.1 against 39.3, n80 42.3 against 43.2,
+n96 45.7 against 49.5). KdaStream wins nowhere. The cores differ from each other only
+in FP32 reduction order (not bit for bit; each one's error against the stock verify is
+the same, the chain test's bound). REPLAY (KdaFused / KdaFusedWS) in "deferred" mode
 once its precision is accepted.
 """
 
@@ -63,7 +66,7 @@ from .wide import KdaWide
 
 K = 128
 # Record core per request count n, by heads per rank (items = heads x n, see above).
-RECORD_KINDS = {24: "1-7:split,8-15:ws,16-31:wide,32-35:stream,36-:ws"}
+RECORD_KINDS = {24: "1-2:split,3-70:wide,71-:ws"}
 # Record KdaSplit geometry ("early.lanes.occupancy.cluster", as prepared.SPEC_SCHEDULE)
 # by n; empty: the batch defaults (eight-CTA clusters at n1, then four; 16 lanes).
 SP_SPEC_SCHEDULE = {24: ""}

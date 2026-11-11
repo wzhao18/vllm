@@ -56,10 +56,11 @@ LOWER_BOUND = -5.0
 # One request count per record core (sp.RECORD_KINDS at 24 heads).
 REQUESTS = [
     pytest.param(1, id="split-n1"),
-    pytest.param(5, id="split-n5"),
-    pytest.param(8, id="ws-n8"),
-    pytest.param(16, id="wide-n16"),
-    pytest.param(32, id="stream-n32"),
+    pytest.param(5, id="wide-n5"),
+    pytest.param(8, id="wide-n8"),
+    pytest.param(32, id="wide-n32"),
+    pytest.param(70, id="wide-n70"),
+    pytest.param(71, id="ws-n71"),
     pytest.param(128, id="ws-n128"),
 ]
 
@@ -214,7 +215,7 @@ def test_record_core_matches_stock_verify(n):
     assert_bitwise("committed conv window", kv[0], ref_kv[0])
 
 
-DEFERRED = [pytest.param(5, id="split-n5"), pytest.param(16, id="wide-n16")]
+DEFERRED = [pytest.param(2, id="split-n2"), pytest.param(16, id="wide-n16")]
 
 
 @pytest.mark.parametrize("n", DEFERRED)

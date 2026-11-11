@@ -14,8 +14,8 @@ checkpoint state, corrections and outputs differ only by FP32 reduction order, w
 the commit carries forward: the state stays within the bound below at every step
 (no drift past it after ``STEPS`` commits). Run eagerly and with the specialized
 verify captured once in a CUDA graph and replayed every step (as the FULL decode
-graphs run it), at one request count per record core (KdaSplit, KdaWS, KdaWide,
-KdaStream, KdaWS at 128 requests).
+graphs run it), at one request count per record core (KdaSplit, KdaWide, KdaWS at
+its first request count and at 128 requests).
 
 The single-step comparison (records, deferred mode) is
 test_specialized_decode_sp_kda_gpu.py; the block-level chain (AG -> in-proj -> core
@@ -37,9 +37,9 @@ Q, HEADS, DIM, MAX_REQS = kda.Q, kda.HEADS, kda.DIM, kda.MAX_REQS
 STEPS = 8
 REQUESTS = [
     pytest.param(1, id="split-n1"),
-    pytest.param(9, id="ws-n9"),
-    pytest.param(16, id="wide-n16"),
-    pytest.param(33, id="stream-n33"),
+    pytest.param(9, id="wide-n9"),
+    pytest.param(33, id="wide-n33"),
+    pytest.param(71, id="ws-n71"),
     pytest.param(128, id="ws-n128"),
 ]
 

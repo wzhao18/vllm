@@ -77,7 +77,7 @@ ALL_ROWS = tuple(range(4, CAP + 1, 4))
 # two rounds (256 | 260), the cap.
 DSA_ROWS = (4, 16, 20, 64, 68, 128, 256, 260, 512)
 # KDA record cores by requests n (cutedsl.kda.sp.RECORD_KINDS at 24 heads): KdaSplit
-# n1, KdaWS n8, KdaWide n16, KdaStream n32 / n35, KdaWS n81 / n128.
+# n1, KdaWide n8 / n16 / n35, KdaWS n81 / n128.
 KDA_ROWS = (4, 32, 64, 128, 140, 324, 512)
 CHAIN_ROWS, CHAIN_STEPS = (4, 64, 140, 512), 8
 TOPK, UNIT, EPS = 2048, 64, 1e-6
