@@ -219,6 +219,41 @@ def test_server_buckets_share_the_main_knob_record(world, tokens):
     assert len(X.select_rubin_buckets(problem, 16, 512)[0]) == 1
 
 
+@pytest.mark.parametrize(
+    ("world", "tokens"), [(16, 160), (16, 512), (16, 2048), (8, 2048)]
+)
+def test_shared_overlap_sm_cap_admits_every_server_bucket(world, tokens):
+    """reserve_sms_for_shared_expert's bucket (grid capped, fallback clusters
+    dropped) passes the kernel admission rules for every shipped server record,
+    including the mixed-CGA EP16 2048 one, and reaches the kernel config."""
+    X.select_rubin_bucket.cache_clear()
+    problem = C.RubinMoeProblem(quant_kind=X.rubin_quant_kind(tokens))
+    bucket, _ = X.select_rubin_bucket(problem, world, tokens)
+    buckets, _ = X.select_rubin_buckets(problem, world, tokens)
+    module = SimpleNamespace(
+        bucket=bucket, buckets=buckets, kernel_weights=None, prefix="layer"
+    )
+    X.KimiK3MegaMoEExperts.reserve_sms_for_shared_expert(module)
+    capped = module.bucket
+    # every compiled bucket (the decode bucket included) is capped
+    assert len(module.buckets) == len(buckets)
+    assert all(
+        b.max_sm_count == X.RUBIN_SHARED_OVERLAP_MAX_SMS
+        and b.knobs.fallback_cluster_shape_mn is None
+        for b in module.buckets
+    )
+    assert capped == module.buckets[-1]
+    assert capped.max_sm_count == X.RUBIN_SHARED_OVERLAP_MAX_SMS
+    assert capped.knobs.fallback_cluster_shape_mn is None
+    assert capped.variant == bucket.variant
+    assert capped.max_tokens == bucket.max_tokens
+    cfg = C.RubinMoeConfig.make(problem, capped, rank=0, world_size=world)
+    assert cfg.max_sm_count == X.RUBIN_SHARED_OVERLAP_MAX_SMS
+    module.kernel_weights = object()
+    with pytest.raises(RuntimeError):
+        X.KimiK3MegaMoEExperts.reserve_sms_for_shared_expert(module)
+
+
 def test_server_bucket_without_knob_record_raises():
     X.select_rubin_bucket.cache_clear()
     problem = C.RubinMoeProblem(quant_kind="mxfp4_mxfp8")

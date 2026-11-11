@@ -790,6 +790,21 @@ class KimiMoE(nn.Module):
                 skip_padding=True,
                 runner_cls=LatentMoERunner if self.use_latent_moe else None,
             )
+        # Sequence-parallel Rubin MegaMoE: the replicated shared expert (no
+        # collective) runs on a side stream concurrently with the MegaMoE launch,
+        # whose persistent grid is capped to leave it SMs; joined before the
+        # up-projection adds it. Same kernels and math, only concurrent.
+        self._shared_overlap = (
+            self.use_mega_moe
+            and use_sequence_parallel
+            and vllm_config.kernel_config.moe_backend == KIMI_K3_MEGA_MOE
+            and isinstance(self.shared_experts, KimiMLP)
+            and not self.shared_experts.shard_sequence_parallel
+        )
+        if self._shared_overlap:
+            self.experts.reserve_sms_for_shared_expert()
+            self._shared_stream = aux_stream()
+            self._shared_events = (torch.cuda.Event(), torch.cuda.Event())
         if self.padded_moe_intermediate_size != moe_intermediate_size:
             w13_weight = getattr(self.experts, "w13_weight", None)
             if w13_weight is None:
@@ -1066,18 +1081,26 @@ class KimiMoE(nn.Module):
             assert topk_ids is not None
             # The shared expert reads the un-projected hidden states, so it
             # stays outside the latent-space MegaMoE launch.
-            final_hidden_states = self.experts(
-                routed_hidden_states, router_output, topk_ids
-            )
+            shared_input = hidden_states if mxfp8_input is None else mxfp8_input
+            if self._shared_overlap:
+                final_hidden_states, shared_output = maybe_execute_in_parallel(
+                    lambda: self.experts(routed_hidden_states, router_output, topk_ids),
+                    lambda: self.shared_experts(shared_input),
+                    self._shared_events[0],
+                    self._shared_events[1],
+                    self._shared_stream,
+                )
+            else:
+                final_hidden_states = self.experts(
+                    routed_hidden_states, router_output, topk_ids
+                )
+                shared_output = (
+                    self.shared_experts(shared_input)
+                    if self.shared_experts is not None
+                    else None
+                )
             # The shared output is folded into the up-projection GEMM's beta-add
             # epilogue, so combining the two branches costs no extra kernel.
-            shared_output = (
-                self.shared_experts(
-                    hidden_states if mxfp8_input is None else mxfp8_input
-                )
-                if self.shared_experts is not None
-                else None
-            )
             final_hidden_states = self.routed_output_transform(
                 final_hidden_states, residual=shared_output
             )
