@@ -210,7 +210,7 @@ class RubinMegaMoE:
             f"({self.buckets[-1].max_tokens})."
         )
 
-    def _stage(self, session, hidden, topk_ids, topk_weights) -> None:
+    def _stage(self, session, hidden, topk_ids, topk_weights, is_padding=None) -> None:
         stage_inputs(
             hidden,
             topk_ids,
@@ -223,6 +223,7 @@ class RubinMegaMoE:
             quant_kind=self.problem.quant_kind,
             num_experts=self.problem.num_experts,
             input_norm_const=self.problem.input_norm_const,
+            is_padding=is_padding,
         )
 
     def warmup(
@@ -281,13 +282,16 @@ class RubinMegaMoE:
         *,
         bucket: RubinBucket,
         out: torch.Tensor | None = None,
+        is_padding: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """``out[:n] = sum_k topk_weights[:, k] * expert_{topk_ids[:, k]}(hidden)``.
 
         ``hidden`` (n, H) BF16; ``topk_ids`` (n, top_k) int32/int64 GLOBAL PHYSICAL
         expert ids (-1 = masked; any other id outside ``[0, num_experts)`` raises
         :class:`RouteIdError`, see the module docstring); ``topk_weights`` (n, top_k)
-        fp32/bf16/fp16 (``routed_scaling_factor`` folded in by the caller). Output
+        fp32/bf16/fp16 (``routed_scaling_factor`` folded in by the caller);
+        ``is_padding`` optional bool (n,): rows whose routes are masked to -1 in the
+        stager (as ``torch.where(is_padding[:, None], -1, topk_ids)``). Output
         BF16. Both the staging and the kernel run on the current stream.
         """
         session = self.sessions.get(bucket)
@@ -298,7 +302,7 @@ class RubinMegaMoE:
             raise ValueError(f"hidden must be (n, {self.problem.hidden}).")
         if n > bucket.max_tokens:
             raise ValueError(f"{n} tokens exceed bucket capacity {bucket.max_tokens}.")
-        self._stage(session, hidden, topk_ids, topk_weights)
+        self._stage(session, hidden, topk_ids, topk_weights, is_padding)
         if n == 0:
             # Every rank launches (lock step); the reduce writes the scratch row only.
             session.launch(weights, session.empty_output)

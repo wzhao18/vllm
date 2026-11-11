@@ -1,7 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """BF16 hidden states + top-k routes -> the session's staged kernel inputs, one
-Triton launch on the current stream (CUDA graph safe: fixed grid, no host sync).
+Triton launch on the current stream (CUDA graph safe: the grid depends only on the
+static row count ``n`` and the bucket capacity, no host sync).
+
+Grid: ``n`` live-row programs (x ``hidden / CH`` chunks) plus
+``ceil((capacity - n) / DEAD_ROWS)`` dead-row programs, each of which writes
+``topk_idx = -1`` for ``DEAD_ROWS`` rows of ``[n, capacity)`` (only chunk 0 works).
 
 Rows ``< n``:
 
@@ -12,7 +17,9 @@ Rows ``< n``:
   ``q = e2m1_rne_satfinite(v * (n_in / s))`` (0 where ``s == 0``), even element in
   the low nibble (FlashInfer ``quantize_nvfp4_block16``).
 - SF columns beyond ``hidden / vec`` (kernel row padding) are zeroed.
-- ``topk_idx = id`` for ``0 <= id < E``, -1 for ``id == -1`` (masked route);
+- ``topk_idx = id`` for ``0 <= id < E``, -1 for ``id == -1`` (masked route) or for
+  every route of a row with ``is_padding[row]`` set (when given: the caller's
+  ``torch.where(is_padding[:, None], -1, topk_ids)`` folded into this launch);
   ``topk_weights = w`` (fp32) for valid ids, else 0.
 - Any other id (``< -1`` or ``>= E``) is an error, as in FlashInfer's
   ``validate_routing_values``: the route is masked so the kernel never indexes out of
@@ -56,7 +63,19 @@ def _e2m1_code(m):
     return code
 
 
-@triton.jit(do_not_specialize=["n_tokens", "hid_stride", "ids_stride", "wts_stride"])
+# Dead rows [n, capacity) written per dead-row program (topk_idx = -1 only).
+DEAD_ROWS = 64
+
+
+@triton.jit(
+    do_not_specialize=[
+        "n_tokens",
+        "n_dead_rows",
+        "hid_stride",
+        "ids_stride",
+        "wts_stride",
+    ]
+)
 def _stage_kernel(
     hid_ptr,
     hid_stride,
@@ -71,7 +90,9 @@ def _stage_kernel(
     idx_ptr,
     sw_ptr,
     err_ptr,
+    pad_ptr,
     n_tokens,
+    n_dead_rows,
     num_experts,
     scale_mult,
     norm_const,
@@ -83,6 +104,8 @@ def _stage_kernel(
     SF_PAD_P2: tl.constexpr,
     TOPK: tl.constexpr,
     TOPK_P2: tl.constexpr,
+    HAS_PAD: tl.constexpr,
+    DEAD: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     chunk = tl.program_id(1)
@@ -94,6 +117,9 @@ def _stage_kernel(
             ids = tl.load(ids_ptr + row * ids_stride + k, mask=km, other=-1).to(
                 tl.int64
             )
+            if HAS_PAD:
+                padded = tl.load(pad_ptr + row) != 0
+                ids = tl.where(padded, -1, ids)
             w = tl.load(wts_ptr + row * wts_stride + k, mask=km, other=0.0).to(
                 tl.float32
             )
@@ -114,8 +140,14 @@ def _stage_kernel(
                     mask=p < SF_COLS - H // VEC,
                 )
         else:
+            # Dead-row program: -1 routes for DEAD rows starting at ``base``.
+            base = n_tokens + (row - n_tokens) * DEAD
+            r = tl.arange(0, DEAD)[:, None]
+            m = (base + r < n_tokens + n_dead_rows) & km[None, :]
             tl.store(
-                idx_ptr + row * TOPK + k, tl.full([TOPK_P2], -1, tl.int32), mask=km
+                idx_ptr + (base + r) * TOPK + k[None, :],
+                tl.full([DEAD, TOPK_P2], -1, tl.int32),
+                mask=m,
             )
     if live:
         offs = chunk * CH + tl.arange(0, CH)
@@ -188,10 +220,13 @@ def stage_inputs(
     quant_kind: str,
     num_experts: int,
     input_norm_const: float = 1.0,
+    is_padding: torch.Tensor | None = None,
 ) -> None:
     """Stage ``hidden_states[:n]`` and its routes into a session's buffers (n may be
     0). ``route_error``: the caller's sticky int64 ``[2]`` device flag (see module
-    docstring); ``num_experts``: the physical expert count (linear placement)."""
+    docstring); ``num_experts``: the physical expert count (linear placement);
+    ``is_padding``: optional bool ``(n,)`` device mask, a set row's routes are all
+    masked to -1 (activations are still staged, as for any row)."""
     if (
         route_error.dtype != torch.int64
         or route_error.numel() != 2
@@ -222,11 +257,22 @@ def stage_inputs(
         raise ValueError(f"x_sf has {sf_cols} columns < hidden/{vec}.")
     if topk_idx.dtype != torch.int32 or staged_weights.dtype != torch.float32:
         raise ValueError("session route buffers must be int32 ids and fp32 weights.")
+    if is_padding is not None and (
+        is_padding.dtype != torch.bool
+        or is_padding.shape != (n,)
+        or is_padding.stride(0) != 1
+        or is_padding.device != topk_idx.device
+    ):
+        raise ValueError(
+            f"is_padding must be a contiguous bool ({n},) tensor on the device, got "
+            f"{is_padding.dtype} {tuple(is_padding.shape)} on {is_padding.device}."
+        )
     ch = _chunk(hidden, vec)
     x_u8 = x.view(torch.uint8)
     sf_u8 = x_sf.view(torch.uint8)
     pad = sf_cols - hidden // vec
-    grid = (capacity, hidden // ch)
+    n_dead = capacity - n
+    grid = (n + triton.cdiv(n_dead, DEAD_ROWS), hidden // ch)
     _stage_kernel[grid](
         hidden_states,
         hidden_states.stride(0),
@@ -241,7 +287,9 @@ def stage_inputs(
         topk_idx,
         staged_weights,
         route_error,
+        is_padding if is_padding is not None else route_error,
         n,
+        n_dead,
         num_experts,
         float(input_norm_const) / 6.0,
         float(input_norm_const),
@@ -253,5 +301,7 @@ def stage_inputs(
         SF_PAD_P2=max(1, triton.next_power_of_2(max(pad, 1))),
         TOPK=topk,
         TOPK_P2=triton.next_power_of_2(topk),
+        HAS_PAD=is_padding is not None,
+        DEAD=DEAD_ROWS,
         num_warps=4,
     )
