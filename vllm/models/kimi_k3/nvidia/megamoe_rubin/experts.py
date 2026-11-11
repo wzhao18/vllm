@@ -630,9 +630,11 @@ class KimiK3MegaMoEExperts(nn.Module):
         if self.capture_fn is not None:
             self.capture_fn(topk_ids)
 
-        if is_padding is not None:
-            topk_ids = torch.where(is_padding.unsqueeze(1), -1, topk_ids)
         eplb_state = self.eplb_state
+        if is_padding is not None and eplb_state.logical_to_physical_map is not None:
+            # EPLB maps and records the masked ids: mask before it.
+            topk_ids = torch.where(is_padding.unsqueeze(1), -1, topk_ids)
+            is_padding = None
         if eplb_state.logical_to_physical_map is not None:
             assert eplb_state.expert_load_view is not None
             assert eplb_state.logical_replica_count is not None
@@ -650,8 +652,14 @@ class KimiK3MegaMoEExperts(nn.Module):
                 else None,
             )
 
+        # Without EPLB the padding mask is folded into the stager launch.
         y = self.get_runtime().forward(
-            hidden_states, topk_ids, topk_weights, weights, bucket=bucket
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            weights,
+            bucket=bucket,
+            is_padding=is_padding,
         )
         if shared_experts is not None:
             y += shared_experts(hidden_states)
