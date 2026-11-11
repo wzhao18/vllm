@@ -647,6 +647,11 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
                     region_group_ids=self.region_group_ids,
                     region_mem_types=self.region_mem_types,
                     region_members=self.region_members,
+                    # A peer with the same layout as this worker.
+                    cp_kv_cache_interleave_size=self._dcp_layout.interleave,
+                    kv_row_layouts=self._kv_row_layouts,
+                    kv_cache_scales=self._kv_cache_scales,
+                    mamba_state_geometry=self._mamba_state_geometry,
                 ),
                 remote_tp_rank=remote_tp_rank,
                 remote_tp_size=remote_tp_size,

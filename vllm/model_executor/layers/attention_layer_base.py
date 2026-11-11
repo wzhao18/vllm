@@ -8,7 +8,7 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.v1.attention.backend import AttentionBackend, AttentionImpl
-from vllm.v1.kv_cache_interface import KVCacheSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
 
 
 class AttentionLayerBase(ABC):
@@ -45,3 +45,12 @@ class AttentionLayerBase(ABC):
         May be None if the layer does not need KV cache.
         """
         pass
+
+    def get_kv_cache_scales(
+        self, kv_cache_spec: AttentionSpec
+    ) -> tuple[float, float] | None:
+        """The per-tensor `(k_scale, v_scale)` this layer quantizes its KV cache
+        with, or None when no per-tensor scale enters the stored bytes. KV moved
+        between engines is only read correctly with the scales it was written
+        with."""
+        return None

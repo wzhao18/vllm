@@ -35,6 +35,7 @@ from vllm.v1.attention.backend import (
     MLAAttentionImpl,
     MultipleOf,
     max_decode_query_len,
+    mla_kv_cache_row_layout,
 )
 from vllm.v1.attention.backends.mla.index_group import HiSparseMLAIndexGroup
 from vllm.v1.attention.backends.mla.sparse_utils import (
@@ -43,7 +44,12 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
     prepare_sparse_mla_safe_lengths,
 )
 from vllm.v1.attention.ops.metadata import compute_token_to_req_indices
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec, is_quantized_kv_cache
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheSpec,
+    KVRowLayout,
+    is_quantized_kv_cache,
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.deepseek_v2 import Indexer
@@ -79,6 +85,12 @@ class _FlashInferMLASparseBackendBase(AttentionBackend):
     @classmethod
     def is_sparse(cls) -> bool:
         return True
+
+    @classmethod
+    def get_kv_cache_row_layout(
+        cls, kv_cache_spec: AttentionSpec, kernel_block_size: int
+    ) -> KVRowLayout | None:
+        return mla_kv_cache_row_layout(cls, kv_cache_spec)
 
     @classmethod
     def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:

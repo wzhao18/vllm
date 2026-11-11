@@ -701,6 +701,45 @@ class ParallelConfig:
         if self.dcp_q_replicate is None:
             self.dcp_q_replicate = q_replicate
 
+    def resolve_dcp_kv_cache_interleave_alias(self) -> None:
+        """Apply the deprecated `--dcp-kv-cache-interleave-size`, when set,
+        to `cp_kv_cache_interleave_size`. Its default (1) cannot be told from
+        an explicit 1, so only values above 1 count as set."""
+        alias = self.dcp_kv_cache_interleave_size
+        if alias > 1 and self.cp_kv_cache_interleave_size != alias:
+            self.cp_kv_cache_interleave_size = alias
+            logger.warning_once(
+                "cp_kv_cache_interleave_size is overridden by dcp_kv_cache"
+                "_interleave_size. And dcp-kv-cache-interleave-size will be "
+                "deprecated when PCP is fully supported."
+            )
+
+    def require_cp_kv_cache_interleave_size(self, value: int, reason: str) -> None:
+        """Pin the DCP KV interleave size a model's kernels require.
+
+        Models call this from their `verify_and_update_config` hook. The value
+        then is no longer auto-resolved (e.g. by NIXL P/D to the block size),
+        and an explicitly configured different value is an error rather than
+        a silently wrong KV layout.
+        """
+        if self.decode_context_parallel_size <= 1:
+            return
+        self.resolve_dcp_kv_cache_interleave_alias()
+        explicit = (
+            not self._allow_auto_resolve_cp_interleave_size
+            or self.dcp_kv_cache_interleave_size > 1
+        )
+        if explicit and self.cp_kv_cache_interleave_size != value:
+            raise ValueError(
+                f"{reason} requires cp_kv_cache_interleave_size={value} under "
+                "decode context parallelism; got "
+                f"{self.cp_kv_cache_interleave_size}. Remove "
+                "--cp-kv-cache-interleave-size and --dcp-kv-cache-interleave-"
+                "size: the model sets the interleave."
+            )
+        self.cp_kv_cache_interleave_size = value
+        self._allow_auto_resolve_cp_interleave_size = False
+
     @property
     def world_size_across_dp(self) -> int:
         """Process world size across TP, PCP, PP, and DP."""

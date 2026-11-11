@@ -768,9 +768,18 @@ class KimiK3ForConditionalGenerationConfig(VerifyAndUpdateConfig):
 
     @classmethod
     def verify_and_update_config(cls, vllm_config: "VllmConfig") -> None:
-        """Default the kv-cache dtype when the text backbone carries DSA:
-        per-tensor fp8 for FLASHINFER_MLA_SPARSE, the default on SM10x, and
-        "fp8_ds_mla" otherwise."""
+        """Pin the DCP KV interleave to 1. Default the kv-cache dtype when the
+        text backbone carries DSA: per-tensor fp8 for FLASHINFER_MLA_SPARSE,
+        the default on SM10x, and "fp8_ds_mla" otherwise.
+
+        Kimi K3's DCP kernels assume token-level interleave: the DSpark causal
+        verify mask, the FlashInfer MLA (drafter) DCP path, the one-round DCP
+        top-k merge, ShardQ and the specialized decode. Interleave 1 also
+        spreads every sequence evenly over the DCP ranks, which these kernels'
+        load balance relies on. Pinning it keeps NIXL P/D from resolving it to
+        the block size.
+        """
+        vllm_config.parallel_config.require_cp_kv_cache_interleave_size(1, "Kimi K3")
         hf_config = vllm_config.model_config.hf_config
         # Multimodal composite configs carry dsa_config on text_config;
         # text-only models have it at the top level.

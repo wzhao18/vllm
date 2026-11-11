@@ -46,8 +46,10 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     FullAttentionSpec,
     KVCacheSpec,
+    KVQuantMode,
     SlidingWindowSpec,
     get_kv_quant_mode,
 )
@@ -167,6 +169,18 @@ def set_default_quant_scales(layer: nn.Module, register_buffer: bool = False) ->
     layer._k_scale_cpu = torch.tensor(1.0, dtype=torch.float32)
     layer._v_scale_cpu = torch.tensor(1.0, dtype=torch.float32)
     layer._prob_scale_float = 1.0
+
+
+def get_kv_cache_quant_scales(
+    layer: nn.Module, kv_cache_spec: AttentionSpec
+) -> tuple[float, float] | None:
+    """`AttentionLayerBase.get_kv_cache_scales` of a layer set up by
+    `_init_kv_cache_quant`: its `(k_scale, v_scale)` when the cache is
+    quantized. The scales come with the weights (vLLM computes none at
+    runtime), so they are final once the model is loaded."""
+    if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE:
+        return None
+    return float(layer._k_scale_float), float(layer._v_scale_float)
 
 
 def _init_kv_cache_quant(
@@ -633,6 +647,11 @@ class Attention(nn.Module, AttentionLayerBase):
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.attn_backend
+
+    def get_kv_cache_scales(
+        self, kv_cache_spec: AttentionSpec
+    ) -> tuple[float, float] | None:
+        return get_kv_cache_quant_scales(self, kv_cache_spec)
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         # Block size may get updated after model loading, refresh it

@@ -32,6 +32,7 @@ from unittest.mock import MagicMock, patch
 import msgspec
 import pytest
 
+from vllm.distributed.kv_transfer.kv_connector.dcp_layout import DcpLayout
 from vllm.distributed.kv_transfer.kv_connector.utils import TransferTopology
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorTransferResults,
@@ -394,6 +395,14 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         # Single non-hybrid attention group, matching the stub block id lists.
         w._has_mamba = False
         w._is_csa_linear = False
+        # Layout facts a handshake checks: no DCP, no declared rows or scales.
+        w.dcp_size = 1
+        w._dcp_layout = DcpLayout(dcp_size=1, interleave=1, block_size=16)
+        w._layer_specs = {}
+        w._kv_row_layouts = {}
+        w._kv_cache_scales = {}
+        w._mamba_state_geometry = None
+        w.dcp_transfer_modes = {}
         w._group_spec_types = (FullAttentionSpec,)
         w._engine_ttl = 0.0
         w._engine_last_active = {}

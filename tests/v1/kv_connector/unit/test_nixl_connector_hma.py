@@ -17,13 +17,18 @@ import torch
 from tests.v1.attention.utils import MockMambaBuilder
 from vllm import LLM, SamplingParams
 from vllm.config import KVTransferConfig, set_current_vllm_config
+from vllm.distributed.kv_transfer.kv_connector.dcp_layout import DcpLayout
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import base_worker as bw
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlAgentMetadata,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
+    DcpTransferMode,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
     NixlConnectorWorker,
 )
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.core.single_type_kv_cache_manager import (
     FullAttentionManager,
     SlidingWindowManager,
@@ -33,6 +38,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
+    KVRowLayout,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
 )
@@ -71,6 +77,7 @@ def region_pull_worker():
     worker.use_mla, worker._has_mamba = True, False
     worker.dcp_size = 1
     worker.dcp_rank = 0
+    worker._dcp_layout = DcpLayout(dcp_size=1, interleave=1, block_size=64)
     spec = MLAAttentionSpec(
         block_size=64, num_kv_heads=1, head_size=8, dtype=torch.bfloat16
     )
@@ -2551,3 +2558,403 @@ def test_sync_recved_kv_copies_each_group_own_layers(group_block_ids):
     assert calls == [
         ([name], [name], ids, ids, "h2d") for name, ids in zip(names, group_block_ids)
     ]
+
+
+# ---------------------------------------------------------------------------
+# Handshake checks of the v17 layout metadata
+# ---------------------------------------------------------------------------
+
+_INDEXER_ROWS = KVRowLayout(64, ((0, 128), (64 * 128, 4)))
+_MXFP4_INDEXER_ROWS = KVRowLayout(64, ((0, 64), (64 * 64, 4)))
+_MLA_ROWS = KVRowLayout.token_major(656)
+_MAMBA_GEOMETRY = ([[4], [128, 128]], ["torch.bfloat16", "torch.float32"])
+
+
+def _layout_worker(**attrs) -> NixlConnectorWorker:
+    """A K3.1-like DCP8 worker: MLA + indexer pages and KDA state."""
+    worker = object.__new__(NixlConnectorWorker)
+    worker._remote_agents = {}
+    worker.dcp_size = 8
+    worker._has_mamba = True
+    worker._layer_specs = dict.fromkeys(["mla.0", "indexer.0", "kda.1"])
+    worker._kv_row_layouts = {"mla.0": _MLA_ROWS, "indexer.0": _INDEXER_ROWS}
+    worker._kv_cache_scales = {"mla.0": (1.0, 1.0)}
+    worker._mamba_state_geometry = _MAMBA_GEOMETRY
+    worker._dcp_layout = DcpLayout(dcp_size=8, interleave=1, block_size=1280)
+    worker.tp_mappings = {}
+    worker.dcp_transfer_modes = {}
+    worker._packed_member_layouts = {}
+    worker.transfer_topo = MagicMock()
+    worker.nixl_wrapper = MagicMock()
+    for name, value in attrs.items():
+        setattr(worker, name, value)
+    return worker
+
+
+def _peer_meta(**fields) -> SimpleNamespace:
+    meta = dict(
+        engine_id="P",
+        region_members=[["mla.0", "indexer.0"], ["kda.1"]],
+        kv_row_layouts={"mla.0": _MLA_ROWS, "indexer.0": _INDEXER_ROWS},
+        kv_cache_scales={"mla.0": [1.0, 1.0]},
+        mamba_state_geometry=_MAMBA_GEOMETRY,
+        cp_kv_cache_interleave_size=1,
+        block_size=128,
+        physical_blocks_per_logical_kv_block=10,
+    )
+    meta.update(fields)
+    return SimpleNamespace(**meta)
+
+
+@pytest.mark.cpu_test
+def test_handshake_accepts_matching_layouts():
+    worker = _layout_worker()
+    mode = worker._check_peer_compatibility(_peer_meta(), remote_dcp_size=8)
+    assert mode is DcpTransferMode.DIRECT
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    ("remote_dcp_size", "fields", "match"),
+    [
+        (8, dict(cp_kv_cache_interleave_size=64), "interleave"),
+        (8, dict(block_size=64), "logical block sizes"),
+        # Hybrid models need equal DCP sizes.
+        (16, dict(), "matching DCP sizes"),
+        # A peer older than v17 does not tell its interleave.
+        (8, dict(cp_kv_cache_interleave_size=None), "older than version 17"),
+        # A layout DCP cannot produce.
+        (8, dict(cp_kv_cache_interleave_size=3), "Invalid DCP layout"),
+        # Another indexer key format (MXFP4 vs FP8).
+        (
+            8,
+            dict(kv_row_layouts={"mla.0": _MLA_ROWS, "indexer.0": _MXFP4_INDEXER_ROWS}),
+            "layer indexer.0 stores its KV token rows",
+        ),
+        # A layer the peer holds without declaring its rows.
+        (
+            8,
+            dict(kv_row_layouts={"mla.0": _MLA_ROWS}),
+            "layer indexer.0 stores its KV token rows",
+        ),
+        (8, dict(kv_cache_scales={"mla.0": [0.5, 1.0]}), "layer mla.0 quantizes"),
+        # More conv rows: another num_speculative_tokens.
+        (
+            8,
+            dict(mamba_state_geometry=([[6], [128, 128]], _MAMBA_GEOMETRY[1])),
+            "num_speculative_tokens",
+        ),
+        (8, dict(mamba_state_geometry=None), "other Mamba state"),
+    ],
+)
+def test_handshake_rejects_incompatible_peers(remote_dcp_size, fields, match):
+    """Deterministic mismatches are fatal and leave no peer state behind."""
+    worker = _layout_worker()
+    with pytest.raises(bw.NixlPeerIncompatibleError, match=f"engine P .*{match}"):
+        worker.add_remote_agent(
+            _peer_meta(**fields), remote_tp_size=8, remote_dcp_size=remote_dcp_size
+        )
+    assert worker.tp_mappings == {}
+    assert worker.dcp_transfer_modes == {}
+    worker.transfer_topo.register_remote_engine.assert_not_called()
+    worker.nixl_wrapper.add_remote_agent.assert_not_called()
+
+
+@pytest.mark.cpu_test
+def test_handshake_checks_mamba_state_of_either_side():
+    worker = _layout_worker(_has_mamba=False, _mamba_state_geometry=None)
+    worker._check_peer_compatibility(
+        _peer_meta(mamba_state_geometry=None), remote_dcp_size=8
+    )
+    with pytest.raises(bw.NixlPeerIncompatibleError, match="other Mamba state"):
+        worker._check_peer_compatibility(_peer_meta(), remote_dcp_size=8)
+
+
+@pytest.mark.cpu_test
+def test_handshake_ignores_layers_the_peer_does_not_hold():
+    # E.g. a PP stage holding a subset of the layers; scales of layers only one
+    # side quantizes are not compared either.
+    worker = _layout_worker()
+    meta = _peer_meta(
+        region_members=[["mla.0"], ["kda.1"]],
+        kv_row_layouts={"mla.0": _MLA_ROWS},
+        kv_cache_scales={},
+    )
+    worker._check_peer_compatibility(meta, remote_dcp_size=8)
+
+
+@pytest.mark.cpu_test
+def test_mamba_state_geometry_is_tp_invariant():
+    """Mamba2 with fewer B/C groups than TP ranks replicates the groups: the
+    conv channels do not scale with TP, yet P TP4 and D TP8 hold the same state
+    per sequence."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import (
+        mamba_state_geometry,
+    )
+    from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    def spec(tp: int, conv_rows: int = 3) -> MambaSpec:
+        heads, head_dim, state, groups = 128 // tp, 64, 128, 1
+        conv_dim = heads * head_dim + 2 * groups * state  # groups replicated
+        return MambaSpec(
+            block_size=16,
+            shapes=((conv_dim, conv_rows), (heads, head_dim, state)),
+            dtypes=(torch.bfloat16, torch.float32),
+            mamba_type=MambaAttentionBackendEnum.MAMBA2,
+        )
+
+    assert mamba_state_geometry(spec(4)) == mamba_state_geometry(spec(8))
+    assert mamba_state_geometry(spec(8)) != mamba_state_geometry(spec(8, 5))
+
+
+@pytest.mark.cpu_test
+def test_incompatible_peer_stops_the_engine():
+    """A background handshake that finds a deterministic mismatch fails the
+    engine on its next step; a transient failure only fails the request."""
+    from concurrent.futures import Future
+
+    worker = object.__new__(NixlConnectorWorker)
+    worker._engine_ttl = 0
+    worker._handshake_lock = threading.RLock()
+    worker._remote_agents = {}
+    worker._handshake_futures = {}
+    worker.engine_id = "D"
+    worker.xfer_stats = MagicMock()
+    futures: list[Future] = []
+
+    def submit(*args):
+        futures.append(Future())
+        return futures[-1]
+
+    worker._handshake_initiation_executor = SimpleNamespace(submit=submit)
+
+    worker._ensure_handshake("P0", "host", 1, 8, 8)
+    futures[-1].set_exception(RuntimeError("connection refused"))
+    worker._raise_peer_incompatible_error()
+
+    worker._ensure_handshake("P1", "host", 1, 8, 8)
+    futures[-1].set_exception(bw.NixlPeerIncompatibleError("other interleave"))
+    with pytest.raises(bw.NixlPeerIncompatibleError, match="other interleave"):
+        worker.get_transfer_results()
+    assert worker.xfer_stats.record_failed_handshake.call_count == 2
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    ("num_tokens", "pages_per_rank"),
+    [
+        # 12-13 tokens per rank: every rank holds one page.
+        (100, [1] * 8),
+        # 64 tokens per rank, plus one more on ranks 0..4.
+        (8 * 64 + 5, [2] * 5 + [1] * 3),
+    ],
+)
+def test_region_pull_pairs_pages_at_token_interleave(num_tokens, pages_per_rank):
+    """Region-mapped pulls between equal DCP8 layouts at interleave 1 load
+    each rank's own pages, counted at that interleave."""
+    layout = DcpLayout(dcp_size=8, interleave=1, block_size=64)
+    for rank in range(8):
+        worker = object.__new__(NixlConnectorWorker)
+        worker._dcp_layout = layout
+        worker.dcp_size, worker.dcp_rank, worker.block_size = 8, rank, 64
+        local, remote = worker._apply_prefix_caching_by_region(
+            [[10, 11, 12]],
+            [[20, 21, 22]],
+            num_computed_blocks=[0],
+            num_tokens=num_tokens,
+            remote_rank=rank,
+            remote_dcp_size=8,
+        )
+        expected = pages_per_rank[rank]
+        assert expected == -(-layout.num_local_tokens(num_tokens, rank) // 64)
+        assert local == [[10, 11, 12][:expected]]
+        assert remote == [[20, 21, 22][:expected]]
+
+
+@pytest.mark.cpu_test
+def test_v17_layout_metadata_roundtrip():
+    sent = NixlAgentMetadata(
+        engine_id="P",
+        agent_metadata=b"",
+        kv_caches_base_addr=[0],
+        device_id=0,
+        num_blocks=1,
+        block_lens=[1],
+        block_strides=[1],
+        kv_cache_layout="BLHNC",
+        block_size=64,
+        ssm_sizes=(0, 0),
+        attn_backend_name="FLASHMLA_SPARSE",
+        physical_blocks_per_logical_kv_block=10,
+        cp_kv_cache_interleave_size=1,
+        kv_row_layouts={"mla.0": _MLA_ROWS, "indexer.0": _INDEXER_ROWS},
+        kv_cache_scales={"mla.0": (0.5, 1.0)},
+        mamba_state_geometry=([[4]], ["torch.bfloat16"]),
+    )
+    got = msgspec.msgpack.Decoder(NixlAgentMetadata).decode(
+        msgspec.msgpack.Encoder().encode(sent)
+    )
+    assert got.kv_row_layouts == sent.kv_row_layouts
+    assert got.kv_cache_scales == sent.kv_cache_scales
+    assert tuple(got.mamba_state_geometry) == sent.mamba_state_geometry
+    assert got.cp_kv_cache_interleave_size == 1
+
+
+@pytest.mark.cpu_test
+def test_v16_peer_metadata_decodes_without_layout_facts():
+    """A peer from before version 17 (with enforce_handshake_compat off)
+    decodes with no interleave, which DCP then rejects at the handshake."""
+    sent = msgspec.msgpack.Encoder().encode(
+        dict(
+            engine_id="P",
+            agent_metadata=b"",
+            kv_caches_base_addr=[0],
+            device_id=0,
+            num_blocks=1,
+            block_lens=[1],
+            block_strides=[1],
+            kv_cache_layout="BLHNC",
+            block_size=128,
+            ssm_sizes=(0, 0),
+            attn_backend_name="FLASHMLA_SPARSE",
+            physical_blocks_per_logical_kv_block=10,
+        )
+    )
+    got = msgspec.msgpack.Decoder(NixlAgentMetadata).decode(sent)
+    assert got.cp_kv_cache_interleave_size is None
+    assert got.kv_row_layouts == {} and got.mamba_state_geometry is None
+    worker = _layout_worker()
+    with pytest.raises(bw.NixlPeerIncompatibleError, match="older than version 17"):
+        worker._check_peer_compatibility(got, remote_dcp_size=8)
+
+
+def _mla_spec(cache_dtype: str, **kwargs) -> MLAAttentionSpec:
+    from vllm.v1.kv_cache_interface import DS_MLA_STATE_CONTENT_BYTES, get_kv_quant_mode
+
+    return MLAAttentionSpec(
+        block_size=640,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.uint8 if "ds_mla" in cache_dtype else torch.float8_e4m3fn,
+        cache_dtype_str=cache_dtype,
+        kv_quant_mode=get_kv_quant_mode(cache_dtype),
+        state_content_bytes=DS_MLA_STATE_CONTENT_BYTES.get(cache_dtype),
+        **kwargs,
+    )
+
+
+def _mla_backend(writes_own_cache: bool = False):
+    """An MLA backend whose impl keeps the stock cache writer, or has its own."""
+    from vllm.model_executor.layers.attention.mla_attention import MLACommonBackend
+    from vllm.v1.attention.backend import MLAAttentionImpl
+
+    impl = type("Impl", (MLAAttentionImpl,), {})
+    if writes_own_cache:
+        impl.do_kv_cache_update = lambda self, *args, **kwargs: None
+    return type("Backend", (MLACommonBackend,), {"get_impl_cls": lambda: impl})
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    ("cache_dtype", "row_bytes"),
+    [("fp8_e4m3", 576), ("fp8_ds_mla", 656), ("nvfp4_ds_mla", 352)],
+)
+def test_mla_backends_declare_rows_of_the_stock_cache_writer(cache_dtype, row_bytes):
+    from vllm.model_executor.layers.attention.mla_attention import MLACommonBackend
+
+    spec = _mla_spec(cache_dtype)
+    layout = _mla_backend().get_kv_cache_row_layout(spec, 64)
+    assert layout == KVRowLayout.token_major(row_bytes)
+    layout.validate(spec)
+    # A writer of its own, or no impl at all, declares nothing.
+    assert _mla_backend(writes_own_cache=True).get_kv_cache_row_layout(spec, 64) is None
+    assert MLACommonBackend.get_kv_cache_row_layout(spec, 64) is None
+
+
+@pytest.mark.cpu_test
+def test_mla_rows_undeclared_for_compressed_pages():
+    spec = _mla_spec("fp8_ds_mla", tokens_per_state=4)
+    assert _mla_backend().get_kv_cache_row_layout(spec, 64) is None
+
+
+class _FakeAttentionLayer(AttentionLayerBase):
+    def __init__(self, backend, scales=None):
+        self.backend = backend
+        self.scales = scales
+
+    def get_attn_backend(self):
+        return self.backend
+
+    def get_kv_cache_spec(self, vllm_config):
+        return None
+
+    def get_kv_cache_scales(self, kv_cache_spec):
+        return self.scales
+
+
+@pytest.mark.cpu_test
+def test_worker_collects_row_layouts_and_scales_of_its_layers():
+    from vllm.distributed.kv_transfer.kv_connector.utils import (
+        get_kv_cache_scales,
+        get_kv_row_layouts,
+    )
+    from vllm.models.kimi_k3.common.dsa_cache import (
+        KimiK3IndexerBackend,
+        indexer_cache_entry_bytes,
+    )
+    from vllm.v1.attention.backend import AttentionBackend
+    from vllm.v1.kv_cache_interface import MambaSpec, SparseCacheRole
+
+    index_spec = MLAAttentionSpec(
+        block_size=640,
+        num_kv_heads=1,
+        head_size=indexer_cache_entry_bytes(128, False),
+        dtype=torch.uint8,
+        cache_role=SparseCacheRole.INDEXER,
+    )
+    mamba_spec = MambaSpec(block_size=640, shapes=((4, 3),), dtypes=(torch.bfloat16,))
+    layers = {
+        "mla": _FakeAttentionLayer(_mla_backend(), scales=(0.5, 1.0)),
+        "idx": _FakeAttentionLayer(KimiK3IndexerBackend),
+        "kda": _FakeAttentionLayer(AttentionBackend),
+        "undeclared": _FakeAttentionLayer(_mla_backend(writes_own_cache=True)),
+    }
+    specs = {
+        "mla": _mla_spec("fp8_ds_mla"),
+        "idx": index_spec,
+        "kda": mamba_spec,
+        "undeclared": _mla_spec("fp8_ds_mla"),
+    }
+    vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(static_forward_context=layers)
+    )
+    layouts = get_kv_row_layouts(vllm_config, specs)
+    assert layouts == {
+        "mla": _MLA_ROWS,
+        # The indexer backend's 64-token kernel pages inside each block.
+        "idx": _INDEXER_ROWS,
+    }
+    assert get_kv_cache_scales(vllm_config, specs) == {"mla": (0.5, 1.0)}
+
+    # A declaration that does not tile the page fails the worker's start.
+    wrong_rows = classmethod(lambda cls, spec, rows: KVRowLayout.token_major(576))
+    layers["mla"].backend = type(
+        "Wrong", (_mla_backend(),), {"get_kv_cache_row_layout": wrong_rows}
+    )
+    with pytest.raises(ValueError, match="does not tile"):
+        get_kv_row_layouts(vllm_config, specs)
+
+
+@pytest.mark.cpu_test
+def test_kv_cache_scales_only_of_quantized_caches():
+    from vllm.model_executor.layers.attention.attention import (
+        get_kv_cache_quant_scales,
+    )
+
+    layer = SimpleNamespace(_k_scale_float=0.5, _v_scale_float=2.0)
+    assert get_kv_cache_quant_scales(layer, _mla_spec("fp8_e4m3")) == (0.5, 2.0)
+    unquantized = MLAAttentionSpec(
+        block_size=640, num_kv_heads=1, head_size=576, dtype=torch.bfloat16
+    )
+    assert get_kv_cache_quant_scales(layer, unquantized) is None

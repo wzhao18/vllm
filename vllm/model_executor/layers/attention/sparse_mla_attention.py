@@ -874,8 +874,10 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
                     and dcp_size == parallel_config.tensor_parallel_size
                     # The gathered context is laid out for interleave 1, in
                     # one workspace that micro-batches would share, and its
-                    # exchanges need symmetric memory.
+                    # exchanges need symmetric memory. Under NIXL P/D the
+                    # interleave is only resolved after the model is built.
                     and parallel_config.cp_kv_cache_interleave_size == 1
+                    and not vllm_config.nixl_resolves_dcp_kv_cache_interleave_size()
                     and not parallel_config.use_ubatching
                     and current_platform.is_device_capability_family(100)
                     and symm_mem_available

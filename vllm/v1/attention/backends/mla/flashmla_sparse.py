@@ -32,6 +32,7 @@ from vllm.v1.attention.backend import (
     AttentionLayer,
     CommonAttentionMetadata,
     MultipleOf,
+    mla_kv_cache_row_layout,
 )
 from vllm.v1.attention.backends.mla.index_group import HiSparseMLAIndexGroup
 from vllm.v1.attention.backends.mla.sparse_utils import (
@@ -56,6 +57,7 @@ from vllm.v1.attention.ops.flashmla import (
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVQuantMode,
+    KVRowLayout,
     is_quantized_kv_cache,
 )
 from vllm.v1.worker.workspace import current_workspace_manager
@@ -189,6 +191,12 @@ class FlashMLASparseBackend(AttentionBackend):
     @staticmethod
     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
         return [MultipleOf(64)]
+
+    @classmethod
+    def get_kv_cache_row_layout(
+        cls, kv_cache_spec: AttentionSpec, kernel_block_size: int
+    ) -> KVRowLayout | None:
+        return mla_kv_cache_row_layout(cls, kv_cache_spec)
 
     @classmethod
     def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:

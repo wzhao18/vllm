@@ -224,6 +224,20 @@ def derive_mamba_conv_split(
     )
 
 
+def mamba_state_geometry(mamba_spec: MambaSpec) -> tuple[list[list[int]], list[str]]:
+    """The TP-invariant geometry of a Mamba state page: each state's shape
+    without its leading dim, and the dtypes.
+
+    TP shards (or, for replicated B/C groups or a `tp_replicated` state,
+    repeats) only the leading dim of each state (the DS conv layout puts the
+    channels first), so two engines hold the same state per sequence exactly
+    when these match, whatever their TP sizes. E.g. another
+    num_speculative_tokens grows the conv state's rows.
+    """
+    shapes = [[int(dim) for dim in shape[1:]] for shape in mamba_spec.shapes]
+    return shapes, [str(dtype) for dtype in mamba_spec.dtypes]
+
+
 def compute_physical_blocks_per_logical(
     ssm_sizes: tuple[int, ...], block_len: int
 ) -> int:

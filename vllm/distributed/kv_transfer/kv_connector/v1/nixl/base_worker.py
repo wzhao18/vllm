@@ -23,6 +23,7 @@ import regex as re
 import torch
 import zmq
 
+from vllm.distributed.kv_transfer.kv_connector.dcp_layout import DcpLayout
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     BlockIds,
     EngineId,
@@ -31,6 +32,8 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
     check_compressed_kernel_split,
     get_current_attn_backends,
     get_current_attn_backends_and_specs,
+    get_kv_cache_scales,
+    get_kv_row_layouts,
     kv_postprocess_blksize_and_layout_on_receive,
     kv_postprocess_blksize_on_receive,
 )
@@ -53,13 +56,16 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.stats import (
     NixlKVConnectorStats,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
+    DcpTransferMode,
     TPMapping,
     _is_attention_spec,
     _is_ssm_spec,
     compute_tp_mapping,
+    select_dcp_transfer_mode,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     _NIXL_SUPPORTED_DEVICE,
+    NixlPeerIncompatibleError,
     get_dcp_replicated_group_ids,
     get_representative_spec_type,
     zmq_ctx,
@@ -67,6 +73,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
 from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import (
     MambaConvSplitInfo,
     derive_mamba_conv_split,
+    mamba_state_geometry,
 )
 from vllm.distributed.nixl_utils import (
     NixlWrapper,
@@ -166,6 +173,10 @@ class NixlBaseConnectorWorker:
 
     # Only NixlPushConnector supports PP with HMA or packed KV caches.
     _supports_pp_hma = False
+
+    # The first peer configuration mismatch a handshake found, which the
+    # engine thread re-raises (see `_raise_peer_incompatible_error`).
+    _peer_incompatible_error: NixlPeerIncompatibleError | None = None
 
     def _compute_desc_ids(
         self,
@@ -729,6 +740,8 @@ class NixlBaseConnectorWorker:
         # The transfer requires DS (dim, state_len) conv layout so that
         # conv sub-projections are contiguous in memory.
         self._conv_decomp: MambaConvSplitInfo | None = None
+        # TP-invariant Mamba state geometry a peer must match.
+        self._mamba_state_geometry: tuple[list[list[int]], list[str]] | None = None
         self._has_mamba = any(
             isinstance(spec, MambaSpec) for spec in self._layer_specs.values()
         )
@@ -776,6 +789,7 @@ class NixlBaseConnectorWorker:
                 vllm_config.parallel_config.tensor_parallel_size,
             )
             mamba_ssm_size = self._conv_decomp.ssm_sizes
+            self._mamba_state_geometry = mamba_state_geometry(mamba_spec)
         self._mamba_ssm_size = mamba_ssm_size
 
         # Agent.
@@ -1103,8 +1117,20 @@ class NixlBaseConnectorWorker:
         self.region_members = []
         self._regions_by_layer = {}
         self._packed_member_layouts: dict[str, tuple[int, int]] = {}
-        # Per-engine TP mappings. Generated during handshake.
+        # Layout facts a peer checks at the handshake: how DCP spreads tokens
+        # over the ranks and pages, the token rows of each layer's page, and
+        # the scales the KV cache is quantized with.
+        self._dcp_layout = DcpLayout(
+            dcp_size=self.dcp_size,
+            interleave=vllm_config.parallel_config.cp_kv_cache_interleave_size,
+            block_size=self.block_size * self._physical_blocks_per_logical_kv_block,
+        )
+        self._kv_row_layouts = get_kv_row_layouts(vllm_config, self._layer_specs)
+        self._kv_cache_scales = get_kv_cache_scales(vllm_config, self._layer_specs)
+        # Per-engine TP mappings and DCP transfer modes. Generated during
+        # handshake.
         self.tp_mappings: dict[EngineId, TPMapping] = {}
+        self.dcp_transfer_modes: dict[EngineId, DcpTransferMode] = {}
         # GQA draft under an MLA target: its SPLIT regions use a draft TP mapping.
         self._head_sharded_draft_kv_heads = self._resolve_head_sharded_draft_kv_heads()
         self.draft_tp_mappings: dict[EngineId, TPMapping] = {}
@@ -1509,6 +1535,11 @@ class NixlBaseConnectorWorker:
                         self._engine_last_active[eid] = time.perf_counter()
                         self._track_remote_engine_replacement(eid, host, port)
                     except Exception as e:
+                        if (
+                            isinstance(e, NixlPeerIncompatibleError)
+                            and self._peer_incompatible_error is None
+                        ):
+                            self._peer_incompatible_error = e
                         self._log_failure(
                             failure_type="handshake_setup_failed",
                             req_id=None,
@@ -2010,6 +2041,10 @@ class NixlBaseConnectorWorker:
                 for name in names
             },
             packed_member_layouts=self._packed_member_layouts,
+            cp_kv_cache_interleave_size=self._dcp_layout.interleave,
+            kv_row_layouts=self._kv_row_layouts,
+            kv_cache_scales=self._kv_cache_scales,
+            mamba_state_geometry=self._mamba_state_geometry,
         )
         # Wrap metadata in payload with hash for defensive decoding
         assert self.compat_hash is not None
@@ -2553,6 +2588,11 @@ class NixlBaseConnectorWorker:
                 "Packed KV block rows differ between P and D. Use the same "
                 "VLLM_KV_CACHE_LAYOUT and block size on both sides."
             )
+        # Before registering any of the peer's state: a peer whose KV layout
+        # needs another mapping is rejected for good.
+        dcp_transfer_mode = self._check_peer_compatibility(
+            nixl_agent_meta, remote_dcp_size
+        )
         pairs = self._pair_regions(nixl_agent_meta)
         if self._dst_pairs.setdefault(engine_id, pairs) != pairs:
             raise RuntimeError(
@@ -2585,6 +2625,7 @@ class NixlBaseConnectorWorker:
             group_spec_types=self._group_spec_types,
             remote_dcp_size=remote_dcp_size,
         )
+        self.dcp_transfer_modes[engine_id] = dcp_transfer_mode
         if self._head_sharded_draft_regions:
             self.draft_tp_mappings[engine_id] = compute_tp_mapping(
                 transfer_topology=transfer_topo,
@@ -2742,6 +2783,113 @@ class NixlBaseConnectorWorker:
 
         return remote_agent_name
 
+    def _check_peer_compatibility(
+        self, nixl_agent_meta: NixlAgentMetadata, remote_dcp_size: int
+    ) -> DcpTransferMode:
+        """Check that the peer's configuration fits this engine's KV layout,
+        and pick the DCP transfer mode.
+
+        Runs before any of the peer's state is registered. A mismatch raises
+        `NixlPeerIncompatibleError`: it is deterministic, so the engine stops
+        instead of failing (and recomputing) every request of that peer.
+        """
+        try:
+            mode = select_dcp_transfer_mode(
+                self._dcp_layout,
+                self._remote_dcp_layout(nixl_agent_meta, remote_dcp_size),
+                has_mamba=self._has_mamba,
+            )
+            self._validate_kv_row_layouts(nixl_agent_meta)
+            self._validate_kv_cache_scales(nixl_agent_meta)
+            self._validate_mamba_state_geometry(nixl_agent_meta)
+        except (NixlPeerIncompatibleError, ValueError) as e:
+            raise NixlPeerIncompatibleError(
+                f"NIXL engine {nixl_agent_meta.engine_id} is incompatible with "
+                f"this engine: {e}"
+            ) from e
+        return mode
+
+    def _remote_dcp_layout(
+        self, nixl_agent_meta: NixlAgentMetadata, remote_dcp_size: int
+    ) -> DcpLayout:
+        """The peer's DCP layout, from its handshake metadata."""
+        interleave = nixl_agent_meta.cp_kv_cache_interleave_size
+        if interleave is None:
+            if self.dcp_size > 1 or remote_dcp_size > 1:
+                raise NixlPeerIncompatibleError(
+                    "the peer does not advertise its cp_kv_cache_interleave_size "
+                    "(NIXL connector metadata older than version 17), which "
+                    "decode context parallelism needs. Upgrade it."
+                )
+            interleave = 1  # Without DCP the interleave places nothing.
+        return DcpLayout(
+            dcp_size=remote_dcp_size,
+            interleave=interleave,
+            block_size=nixl_agent_meta.block_size
+            * nixl_agent_meta.physical_blocks_per_logical_kv_block,
+        )
+
+    def _validate_kv_row_layouts(self, nixl_agent_meta: NixlAgentMetadata) -> None:
+        """Reject a peer for which a layer both sides hold stores its token
+        rows differently."""
+        remote_layers = set(itertools.chain(*nixl_agent_meta.region_members))
+        remote_layouts = nixl_agent_meta.kv_row_layouts
+        for name in sorted(self._kv_row_layouts.keys() | remote_layouts.keys()):
+            local = self._kv_row_layouts.get(name)
+            remote = remote_layouts.get(name)
+            if local == remote:
+                continue
+            held_by_both = name in self._layer_specs and (
+                name in remote_layouts or name in remote_layers
+            )
+            if held_by_both:
+                spec = self._layer_specs[name]
+                cache_format = (
+                    f" (local cache dtype {spec.dtype}, quant mode "
+                    f"{spec.kv_quant_mode.name})"
+                    if isinstance(spec, AttentionSpec)
+                    else ""
+                )
+                raise NixlPeerIncompatibleError(
+                    f"layer {name} stores its KV token rows as {local} here"
+                    f"{cache_format} and as {remote} on the peer. Both sides "
+                    "must store every layer they share in the same format."
+                )
+
+    def _validate_kv_cache_scales(self, nixl_agent_meta: NixlAgentMetadata) -> None:
+        """Reject a peer for which a layer both sides hold quantizes its KV
+        cache with other scales: the transferred bytes would be read with the
+        wrong scales. Scales come with the weights, so equal checkpoints give
+        bit-equal scales."""
+        remote_scales = nixl_agent_meta.kv_cache_scales
+        for name in sorted(self._kv_cache_scales.keys() & remote_scales.keys()):
+            local = self._kv_cache_scales[name]
+            remote = tuple(remote_scales[name])
+            if local != remote:
+                raise NixlPeerIncompatibleError(
+                    f"layer {name} quantizes its KV cache with (k_scale, "
+                    f"v_scale) {local} here and {remote} on the peer. Use the "
+                    "same checkpoint and KV cache scales on both sides."
+                )
+
+    def _validate_mamba_state_geometry(
+        self, nixl_agent_meta: NixlAgentMetadata
+    ) -> None:
+        """Reject a peer whose Mamba state per sequence differs, compared
+        TP-invariantly (`mamba_state_geometry`). E.g. peers with different
+        num_speculative_tokens hold different conv rows."""
+        local = self._mamba_state_geometry
+        remote = nixl_agent_meta.mamba_state_geometry
+        if local is None and remote is None:
+            return
+        if local is None or remote is None or tuple(local) != tuple(remote):
+            raise NixlPeerIncompatibleError(
+                "the peer holds other Mamba state (shapes without the TP "
+                f"dim, dtypes) {remote} than this engine's {local}. Use the "
+                "same model, num_speculative_tokens and mamba_ssm_cache_dtype "
+                "on both sides."
+            )
+
     def _validate_remote_agent_handshake(
         self,
         nixl_agent_meta: NixlAgentMetadata,
@@ -2769,11 +2917,6 @@ class NixlBaseConnectorWorker:
             f"DCP sizes must divide one another: local={self.dcp_size}, "
             f"remote={remote_dcp_size} (engine {remote_engine_id})."
         )
-        if self._has_mamba and self.dcp_size != remote_dcp_size:
-            raise RuntimeError(
-                "Hybrid MLA+Mamba NIXL transfers require matching DCP sizes, "
-                f"got local={self.dcp_size}, remote={remote_dcp_size}."
-            )
         if self._dcp_replicated_groups and (
             self.dcp_size > 1 or (remote_dcp_size > 1 and self._TRANSFER_MODE != "pull")
         ):
@@ -2829,13 +2972,6 @@ class NixlBaseConnectorWorker:
             raise NotImplementedError(
                 "DCP region pulls require matching logical and physical block sizes"
             )
-        # DCP shards tokens across ranks at the logical block size, and reads
-        # pair blocks by logical position.
-        if (self.dcp_size > 1 or remote_dcp_size > 1) and (
-            self.block_size * self._physical_blocks_per_logical_kv_block
-            != nixl_agent_meta.block_size * remote_physical_per_logical
-        ):
-            raise NotImplementedError("DCP requires matching P/D logical block sizes")
         if (
             self._has_mamba
             and remote_physical_per_logical
@@ -3263,12 +3399,20 @@ class NixlBaseConnectorWorker:
             for block in blocks:
                 pages[block].zero_()
 
+    def _raise_peer_incompatible_error(self) -> None:
+        """Re-raise on the engine thread the peer mismatch a background
+        handshake found, so the engine stops instead of recomputing every
+        request of that peer."""
+        if self._peer_incompatible_error is not None:
+            raise self._peer_incompatible_error
+
     def get_transfer_results(self) -> KVConnectorTransferResults:
         """Get transfers that completed on this specific worker.
 
         The scheduler process (via the MultiprocExecutor) will use this output
         to track which workers are done.
         """
+        self._raise_peer_incompatible_error()
         assert self.transfer_topo is not None
         done_sending = self._get_new_notifs()
         done_recving, newly_failed = self._pop_done_transfers(self._recving_transfers)
@@ -3771,55 +3915,57 @@ class NixlBaseConnectorWorker:
         local_dcp_rank: int,
         remote_dcp_size: int,
         local_num_computed_blocks: int,
-        num_remote_blocks: int | None = None,
+        num_local_blocks: int | None = None,
     ) -> tuple[list[int], list[int]]:
-        """Match local and remote block IDs by global DCP position.
+        """Pair the local pages still to load with the pages of `remote_rank`
+        that hold the same positions.
 
         `local_ids` excludes blocks already satisfied by the local prefix
         cache, while `remote_ids` contains the full transferable remote list.
-        `num_remote_blocks`, when provided, is the global block count before
-        DCP partitioning and excludes allocation padding.
+        `num_local_blocks`, when provided, is how many pages this rank holds
+        of the request (excluding allocation padding); the remote must then
+        cover them all.
+
+        Both sides have a DIRECT layout pair (`select_dcp_transfer_mode`), so
+        whole pages pair: page `j` of rank `r` is page slot `j * dcp_size + r`
+        on both sides, a slot being one run of positions (or, for equal
+        layouts, the same rows of the same rank). Slots go round-robin over
+        the ranks, as `DcpLayout` places positions with interleave 1.
 
         Example:
-            local DCP size 2, rank 0 owns *global positions*=[0, 2, 4, 6]
+            local DCP size 2, rank 0 holds slots [0, 2, 4, 6]
             cached_blocks=[0,2,4]
             to transfer: [6] (the rest is cached)
 
             remote DCP size 4
-            remote rank 0 owns [0, 4] -> no more match, skip the read
-            remote rank 2 owns [2, 6] -> match position 6 and read
+            remote rank 0 holds [0, 4] -> no more match, skip the read
+            remote rank 2 holds [2, 6] -> match slot 6 and read
 
         An empty result (rank 0 above) takes the notification-only path, allowing the
         remote to release its blocks without performing a transfer.
 
         """
-        local_size, remote_size = local_dcp_size, remote_dcp_size
-        if num_remote_blocks is not None:
-            num_local = cdiv(num_remote_blocks - local_dcp_rank, local_size)
-            local_ids = local_ids[: max(0, num_local - local_num_computed_blocks)]
-
-        if local_size == remote_size:
-            local_slice = local_ids
-            remote_slice = remote_ids[local_num_computed_blocks:]
-        elif local_size < remote_size:
-            k = remote_size // local_size
-            p = (remote_rank - local_dcp_rank) // local_size
-            start_local = (p - local_num_computed_blocks) % k
-            start_remote = (local_num_computed_blocks + start_local - p) // k
-            local_slice = local_ids[start_local::k]
-            remote_slice = remote_ids[start_remote:]
-        else:
-            k = local_size // remote_size
-            remote_dcp_rank = remote_rank % remote_size
-            c = (local_dcp_rank - remote_dcp_rank) // remote_size
-            start_remote = c + local_num_computed_blocks * k
-            local_slice = local_ids
-            remote_slice = remote_ids[start_remote::k]
-
-        matched_blocks = min(len(local_slice), len(remote_slice))
-        if num_remote_blocks is not None and matched_blocks < len(local_slice):
+        if num_local_blocks is not None:
+            num_to_load = max(0, num_local_blocks - local_num_computed_blocks)
+            local_ids = local_ids[:num_to_load]
+        local_slots = DcpLayout(local_dcp_size, 1, 1)
+        remote_slots = DcpLayout(remote_dcp_size, 1, 1)
+        pages = np.arange(
+            local_num_computed_blocks, local_num_computed_blocks + len(local_ids)
+        )
+        slots = local_slots.global_pos(local_dcp_rank, pages)
+        on_remote_rank = np.flatnonzero(
+            remote_slots.owner(slots) == remote_rank % remote_dcp_size
+        )
+        remote_pages = remote_slots.local_row(slots[on_remote_rank])
+        # Remote pages increase with local ones, so the covered ones lead.
+        matched_blocks = int(np.count_nonzero(remote_pages < len(remote_ids)))
+        if num_local_blocks is not None and matched_blocks < len(on_remote_rank):
             raise ValueError("Remote KV pages do not cover the requested range")
-        return local_slice[:matched_blocks], remote_slice[:matched_blocks]
+        return (
+            [local_ids[i] for i in on_remote_rank[:matched_blocks]],
+            [remote_ids[p] for p in remote_pages[:matched_blocks]],
+        )
 
     @staticmethod
     def _block_ids_by_region(
@@ -3841,18 +3987,27 @@ class NixlBaseConnectorWorker:
         prefill_block_ids: BlockIds,
         *,
         num_computed_blocks: list[int] | None = None,
-        num_remote_blocks: int | None = None,
+        num_tokens: int | None = None,
         remote_rank: int = 0,
         remote_dcp_size: int = 1,
     ) -> tuple[BlockIds, BlockIds]:
-        """Pair an uncached decode suffix with the same prefill regions."""
+        """Pair an uncached decode suffix with the same prefill regions.
+
+        `num_tokens` is the request's KV length, which the prefill pages
+        cover; required with `num_computed_blocks`.
+        """
         assert len(decode_block_ids) == len(prefill_block_ids)
         if not any(decode_block_ids):
             empty_regions: list[list[int]] = [[] for _ in decode_block_ids]
             return empty_regions, empty_regions.copy()
 
         if num_computed_blocks is not None:
-            assert num_remote_blocks is not None
+            assert num_tokens is not None
+            # The pages this rank holds of the request, at any interleave.
+            num_local_blocks = cdiv(
+                int(self._dcp_layout.num_local_tokens(num_tokens, self.dcp_rank)),
+                self.block_size,
+            )
             matched_decode, matched_prefill = [], []
             for decode_region, prefill_region, start in zip(
                 decode_block_ids, prefill_block_ids, num_computed_blocks, strict=True
@@ -3865,7 +4020,7 @@ class NixlBaseConnectorWorker:
                     self.dcp_rank,
                     remote_dcp_size,
                     start,
-                    num_remote_blocks=num_remote_blocks,
+                    num_local_blocks=num_local_blocks,
                 )
                 matched_decode.append(local)
                 matched_prefill.append(remote)

@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.config import ParallelConfig
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
 from vllm.model_executor.models.config import KimiK3ForConditionalGenerationConfig
 from vllm.models.kimi_k3.common import dsa_cache
@@ -63,6 +64,7 @@ def test_kimi_k31_defaults_draft_attention(method, draft_text_config, expected):
         model_config=SimpleNamespace(hf_config=K31_TEXT_CONFIG),
         cache_config=SimpleNamespace(cache_dtype="auto"),
         attention_config=SimpleNamespace(backend=None),
+        parallel_config=ParallelConfig(),
         speculative_config=spec_config,
     )
 
@@ -76,10 +78,46 @@ def _k31_cache_dtype(cache_dtype, backend=None):
         model_config=SimpleNamespace(hf_config=K31_TEXT_CONFIG),
         cache_config=SimpleNamespace(cache_dtype=cache_dtype),
         attention_config=SimpleNamespace(backend=backend),
+        parallel_config=ParallelConfig(),
         speculative_config=None,
     )
     KimiK3ForConditionalGenerationConfig.verify_and_update_config(vllm_config)
     return vllm_config.cache_config.cache_dtype
+
+
+def _k3_parallel_config(**kwargs) -> ParallelConfig:
+    parallel_config = ParallelConfig(**kwargs)
+    parallel_config.decode_context_parallel_size = 8
+    return parallel_config
+
+
+@pytest.mark.parametrize("hf_config", [K31_TEXT_CONFIG, SimpleNamespace()])
+def test_kimi_k3_pins_dcp_interleave(hf_config):
+    """Kimi K3 and K3.1 run DCP at interleave 1, which NIXL P/D then keeps
+    instead of resolving it to the block size."""
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=hf_config),
+        cache_config=SimpleNamespace(cache_dtype="fp8_ds_mla"),
+        attention_config=SimpleNamespace(backend=None),
+        parallel_config=_k3_parallel_config(),
+        speculative_config=None,
+    )
+    KimiK3ForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+    parallel_config = vllm_config.parallel_config
+    assert parallel_config.cp_kv_cache_interleave_size == 1
+    assert not parallel_config._allow_auto_resolve_cp_interleave_size
+
+
+def test_kimi_k3_rejects_explicit_dcp_interleave():
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=K31_TEXT_CONFIG),
+        parallel_config=_k3_parallel_config(
+            cp_kv_cache_interleave_size=64,
+            _allow_auto_resolve_cp_interleave_size=False,
+        ),
+    )
+    with pytest.raises(ValueError, match="Kimi K3 requires cp_kv_cache_interleave"):
+        KimiK3ForConditionalGenerationConfig.verify_and_update_config(vllm_config)
 
 
 @pytest.mark.parametrize("cache_dtype", ["fp8_ds_mla", "nvfp4_ds_mla"])

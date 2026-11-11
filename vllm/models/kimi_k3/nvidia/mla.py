@@ -49,6 +49,7 @@ from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import (
     _init_kv_cache_quant,
+    get_kv_cache_quant_scales,
     set_default_quant_scales,
     should_load_quant_weights,
 )
@@ -105,6 +106,7 @@ from vllm.v1.attention.ops.dcp import MLADCPManager
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     KVCacheSpec,
     MLAAttentionSpec,
     get_kv_quant_mode,
@@ -422,6 +424,11 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.attn_backend
+
+    def get_kv_cache_scales(
+        self, kv_cache_spec: AttentionSpec
+    ) -> tuple[float, float] | None:
+        return get_kv_cache_quant_scales(self, kv_cache_spec)
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(
