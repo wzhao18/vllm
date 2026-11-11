@@ -46,8 +46,26 @@ import torch
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import async_tensor_h2d
 
-# Segment only steps whose longest sequence has at least this many tokens.
+# Segment only steps whose longest sequence has at least this many tokens, by KDA
+# heads per rank (the plain launch's (sequence, head) CTA pairs; fewer heads leave
+# more SMs idle, so segmenting pays from shorter sequences). Measured on VR200
+# (SM107), one sequence, plain FlashKDA against this path (us per layer, 8
+# pseudo-sequences): 12 heads loses up to 2816 tokens (2816: 127 against 155) and
+# wins from 3072 (138 -> 124, 4096 167 -> 140, 5504 213 -> 162); 24 heads loses up
+# to 4096 (178 against 182), about breaks even at 4608 (197 / 193) and wins from
+# 5120 (213 -> 204, 5504 227 -> 210, 6144 249 -> 223). Above 24 heads (unmeasured)
+# the previous 6144.
+_MIN_TOKENS_BY_HEADS = ((12, 3072), (24, 5120))
 _MIN_TOKENS = 6144
+
+
+def _min_tokens(heads: int) -> int:
+    """The shortest longest-sequence that segments at ``heads`` KDA heads per rank."""
+    for most_heads, tokens in _MIN_TOKENS_BY_HEADS:
+        if heads <= most_heads:
+            return tokens
+    return _MIN_TOKENS
+
 # Pseudo-sequences per launch: one wave of V-split CTA pairs (2 x 12 heads x 8
 # = 192 of 212 SMs on Rubin). Segmenting triples the K2 work (two phase-A
 # passes + the output pass), so it pays only when the longest chain shrinks by
@@ -223,11 +241,11 @@ class SegPlan:
 _PLANS: dict[tuple, SegPlan | None] = {}
 
 
-def _segment_counts(lens: tuple[int, ...]) -> list[int] | None:
+def _segment_counts(lens: tuple[int, ...], heads: int) -> list[int] | None:
     """Pseudo-sequences per sequence: the extra segments go, one at a time, to
     the sequence with the longest current segment. None if it does not pay."""
     n = len(lens)
-    if n == 0 or n >= _MAX_PSEUDO or max(lens) < _MIN_TOKENS:
+    if n == 0 or n >= _MAX_PSEUDO or max(lens) < _min_tokens(heads):
         return None
     parts = [1] * n
     for _ in range(_MAX_PSEUDO - n):
@@ -269,7 +287,7 @@ def make_plan(
     if key in _PLANS:
         return _PLANS[key]
     plan = None
-    parts = _segment_counts(lens) if len(offs) == len(lens) else None
+    parts = _segment_counts(lens, heads) if len(offs) == len(lens) else None
     if parts is not None:
         bounds_all = []
         for i, n in enumerate(lens):
