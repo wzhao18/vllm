@@ -46,6 +46,7 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
+    get_mqa_logits_metadata,
     has_deep_gemm,
     mqa_logits_mx_inputs,
     mqa_logits_use_mx_scales,
@@ -514,13 +515,14 @@ def as_fp32_logits(logits: torch.Tensor, row_ends: torch.Tensor) -> torch.Tensor
 
 
 def _decode_topk_backend(topk_backend: str, dcp_world_size: int) -> str:
-    """The configured top-k backend, or "auto" for "balanced" under DCP > 1:
-    the balanced top-k is validated at DCP1 only, and its BF16 local logits
-    would feed the DCP top-k merge untested."""
-    if topk_backend == "balanced" and dcp_world_size > 1:
+    """The configured decode top-k backend, or "auto" for "balanced" and
+    "trtllm_gvr2" under DCP > 1: they are validated at DCP1 only, and their
+    BF16 local logits would feed the DCP top-k merge untested."""
+    if topk_backend in ("balanced", "trtllm_gvr2") and dcp_world_size > 1:
         logger.warning_once(
-            "sparse_indexer_topk_backend='balanced' is not supported with "
-            "decode context parallelism (DCP=%d); using 'auto'",
+            "sparse_indexer_topk_backend='%s' is not supported with decode "
+            "context parallelism (DCP=%d) in decode; using 'auto'",
+            topk_backend,
             dcp_world_size,
         )
         return "auto"
@@ -561,7 +563,8 @@ def _prefill_topk(
     if _use_deep_select_prefill(logits, row_starts, topk_tokens, topk_backend):
         deep_select_topk(logits, topk_tokens, end=row_ends, output_idx=topk_indices)
         return
-    logits = as_fp32_logits(logits, row_ends)
+    if topk_backend != "trtllm_gvr2":
+        logits = as_fp32_logits(logits, row_ends)
     get_indexer_topk(topk_backend).forward_prefill(
         logits, row_starts, row_ends, topk_indices, topk_tokens
     )
@@ -655,12 +658,16 @@ def sparse_attn_indexer(
         )
         assert candidate_block_size > 0
 
-    topk_backend = _decode_topk_backend(topk_backend, dcp_world_size)
+    decode_topk_backend = _decode_topk_backend(topk_backend, dcp_world_size)
 
-    # DeepSelect and the balanced top-k rank SM100's BF16 decode logits
-    # directly (DeepSelect also under DCP, whose merge reads them as well);
-    # the other top-k backends read an FP32 copy.
-    fp32_decode_logits = topk_backend not in ("deep_select", "balanced")
+    # DeepSelect, the balanced top-k and trtllm_gvr2 rank SM100's BF16 decode
+    # logits directly (DeepSelect also under DCP, whose merge reads them as
+    # well); the other top-k backends read an FP32 copy.
+    fp32_decode_logits = decode_topk_backend not in (
+        "deep_select",
+        "balanced",
+        "trtllm_gvr2",
+    )
 
     # assert isinstance(attn_metadata, dict)
     # kv_cache is an empty placeholder until bind_kv_cache runs after memory
@@ -1010,6 +1017,20 @@ def sparse_attn_indexer(
                         q_slice_cast, q_scale_slice, chunk_weights
                     )
                     row_ends = cu_seqlen_ke - cu_seqlen_ks
+                    # Round-robin 4-token Q blocks leave SMs idle when a chunk
+                    # has few rows or uneven KV; the cost-balanced schedule
+                    # splits the KV work evenly over the SMs.
+                    schedule_meta = (
+                        get_mqa_logits_metadata(
+                            cu_seqlen_ks,
+                            cu_seqlen_ke,
+                            k_quant_cast.shape[0],
+                            q_slice_cast.shape[1],
+                        )
+                        if envs.VLLM_SPARSE_INDEXER_PREFILL_LOGITS_SCHEDULE
+                        and mqa_logits_use_mx_scales()
+                        else None
+                    )
                     logits = fp8_fp4_mqa_logits(
                         (q_slice_cast, q_scale_slice),
                         (k_quant_cast, k_scale_cast),
@@ -1017,6 +1038,7 @@ def sparse_attn_indexer(
                         cu_seqlen_ks,
                         cu_seqlen_ke,
                         chunk.max_seqlen_k,
+                        schedule_meta=schedule_meta,
                     )
                     score_bits = 16 if logits.dtype == torch.bfloat16 else 32
                     if dcp_prefill_merge_tie_words:
@@ -1024,9 +1046,13 @@ def sparse_attn_indexer(
                     # DeepSelect ranks the bf16 logits in place of their exact fp32
                     # copy, also under DCP (whose merge below reads them as well);
                     # fp32 logits go to the selected top-k backend.
-                    if not _use_deep_select_prefill(
-                        logits, row_starts, topk_tokens, topk_backend
-                    ):
+                    # trtllm_gvr2 ranks the 16-bit logits natively as well.
+                    keeps_16bit = topk_backend == "trtllm_gvr2" or (
+                        _use_deep_select_prefill(
+                            logits, row_starts, topk_tokens, topk_backend
+                        )
+                    )
+                    if not keeps_16bit:
                         logits = as_fp32_logits(logits, row_ends)
                 if candidate_blocks is not None:
                     # Two-level selection (v4.1): the candidate source
@@ -1297,7 +1323,7 @@ def sparse_attn_indexer(
         else:
             # The backend comes from the layer (config is only readable at
             # model construction); dispatchers are cached per backend.
-            get_indexer_topk(topk_backend)(
+            get_indexer_topk(decode_topk_backend)(
                 logits,
                 seq_lens,
                 next_n,

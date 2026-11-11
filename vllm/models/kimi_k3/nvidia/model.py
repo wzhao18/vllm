@@ -253,30 +253,42 @@ def mega_moe_experts_cls(vllm_config: VllmConfig) -> type[nn.Module]:
 
 
 def maybe_init_gemm_rs_ar(vllm_config: VllmConfig, use_sequence_parallel: bool) -> bool:
-    # Both feature flags may be enabled; the worker's static SP topology binds
-    # its singleton to exactly one mode.
+    """Bind the row-parallel projections (attention o_proj, MLP / shared-expert
+    down_proj) to the fused GEMM + multicast reduction where the shared kernel can
+    run (its own capability checks): GEMM-RS under sequence parallelism, GEMM-AR
+    otherwise. The worker's static SP topology binds the singleton to one mode.
+
+    Both modes are on by policy (no switch): the fused kernel computes the same
+    BF16 GEMM and reduction (summation order over the TP ranks may differ, as for
+    the stock NCCL collectives). GEMM-RS replaced the separate GEMM + NCCL ring
+    reduce-scatter on the 40-layer TP4 SP prefill step: -4.4% at 17.4K tokens,
+    -3.5% at 8.2K tokens.
+
+    The one exception is the SP topology of the specialized decode: its stock
+    (eager / piecewise) steps keep the unfused reduce-scatter o_proj its SP step
+    reproduces (``specialized_decode.runtime.sp_unsupported``).
+    """
     all_reduce = not use_sequence_parallel
-    mode = "GEMM-AR" if all_reduce else "GEMM-RS"
-    # GEMM-AR: on wherever the shared kernel can run (its own capability checks);
-    # GEMM-RS: the stock VLLM_ENABLE_GEMM_RS opt-in.
-    enabled = True if all_reduce else envs.VLLM_ENABLE_GEMM_RS
-    if not enabled:
+    if not all_reduce and specialized_decode_config(vllm_config) is not None:
         return False
 
-    # The kernel module pulls in cute_dsl, so import it only once the flag
-    # asks for it.
+    # The kernel module pulls in cute_dsl, so import it only when used.
     from vllm.model_executor.kernels.linear.cute_dsl.gemm_rs_ar import (
         maybe_init_gemm_rs_ar as maybe_init_shared_gemm_rs_ar,
     )
 
     config = vllm_config.model_config.hf_text_config
-    if not maybe_init_shared_gemm_rs_ar(
+    return maybe_init_shared_gemm_rs_ar(
         vllm_config, N=config.hidden_size, all_reduce=all_reduce
-    ):
-        return False
-    if not all_reduce:
-        logger.info_once("To disable %s, set VLLM_ENABLE_GEMM_RS=0.", mode)
-    return True
+    )
+
+
+def dsa_runs_gemm_rs_ar(vllm_config: VllmConfig, run_gemm_rs_ar: bool) -> bool:
+    """Whether the DSA o_proj binds the fused GEMM-RS/AR (prefill and stock
+    serving). A specialized-decode deployment keeps the DSA o_proj unfused: its
+    DSA layers reproduce the stock GEMM + all-reduce o_proj (TP16 non-SP C256
+    decode), so the binding must not change that role's math or timing."""
+    return run_gemm_rs_ar and specialized_decode_config(vllm_config) is None
 
 
 def _gemm_ar_owns(t: torch.Tensor) -> bool:
@@ -1116,6 +1128,38 @@ class KimiMoE(nn.Module):
         return final_hidden_states.view(num_tokens, hidden_size)
 
 
+def warm_prefill_indexer(model: nn.Module) -> None:
+    """Compile trtllm_gvr2's prefill top-k engines at load, on every rank, when
+    the model has DSA layers and sparse_indexer_topk_backend="trtllm_gvr2": the
+    engines never compile under CUDA graph capture (an uncompiled shape there
+    falls back to the FP32 per-row kernel), and one layer's (topk,
+    max_model_len) covers them all. A mid-serving JIT on one DCP rank would
+    also stall its peers in the next bounded DCP exchange.
+
+    Kimi K3's DSA indexer (KimiK3DSAIndexer) is not a SparseAttnIndexer, so
+    both are matched by their topk_backend attribute."""
+    if not any(isinstance(m, KimiK3DSAAttention) for m in model.modules()):
+        return
+    from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
+
+    from .dsa import KimiK3DSAIndexer
+
+    indexer = next(
+        (
+            m
+            for m in model.modules()
+            if isinstance(m, (KimiK3DSAIndexer, SparseAttnIndexer))
+            and m.topk_backend == "trtllm_gvr2"
+        ),
+        None,
+    )
+    if indexer is None:
+        return
+    from vllm.model_executor.layers.indexer_topk import warmup_trtllm_gvr2_prefill
+
+    warmup_trtllm_gvr2_prefill(indexer.topk_tokens, indexer.max_model_len)
+
+
 class KimiDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -1195,6 +1239,7 @@ class KimiDecoderLayer(nn.Module):
                     prefix=f"{prefix}.self_attn",
                     topk_indices_buffer=topk_indices_buffer,
                     aux_stream=aux_stream,
+                    run_gemm_rs_ar=dsa_runs_gemm_rs_ar(vllm_config, run_gemm_rs_ar),
                 )
             # q_lora_rank may be None (Kimi-Linear): the MLA layer then uses an
             # uncompressed q_proj instead of the fused q-LoRA front-end.
@@ -2021,6 +2066,8 @@ class KimiLinearForCausalLM(
         from .dsa_kernels.dcp_exchange.decode import build as build_dcpx
 
         self.dcpx = build_dcpx(self.model, self.vllm_config)
+        # trtllm_gvr2 prefill top-k engines, built before any forward.
+        warm_prefill_indexer(self.model)
 
     def build_specialized_decode(self) -> None:
         from .dsa_kernels.dsa_core.decode import build as build_dsa_core

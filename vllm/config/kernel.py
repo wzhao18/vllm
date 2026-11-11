@@ -192,6 +192,7 @@ SparseIndexerTopkBackend = Literal[
     "torch",
     "aiter",
     "balanced",
+    "trtllm_gvr2",
 ]
 
 FlashInferSparseMLAKernel = Literal["auto", "trtllm", "prims_ts"]
@@ -420,6 +421,14 @@ class KernelConfig:
       time follows the step's total context, not its longest row
       (data-parallel ranks with skewed contexts), and the BF16 logits are read
       without the FP32 upcast copy. Falls back to "auto" for FP32 logits.
+    - "trtllm_gvr2": TensorRT-LLM's self-sampling GVR V2 top-k with native
+      BF16 / FP16 logits (vendored in vllm/third_party/trtllm_gvr; SM100
+      family). Prefill: every chunk, BF16 logits with no FP32 copy and no row
+      minimum, also under DCP; its engines are compiled at model load. Decode:
+      the stock top-k on the BF16 decode logits ("auto" under DCP > 1).
+      Unsupported layouts and uncompiled shapes under CUDA graph capture fall
+      back to the FP32 kernels. Like gvr_2, its latency depends on the logit
+      distribution.
     """
 
     flashinfer_sparse_mla_kernel: FlashInferSparseMLAKernel = "auto"

@@ -171,6 +171,61 @@ def balanced_topk_impl():
         return balanced_topk
 
 
+# Logits dtypes the vendored GVR V2 engine ranks natively (TRT-LLM PR #19285).
+TRTLLM_GVR2_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
+
+
+@functools.cache
+def trtllm_gvr2_host():
+    """TensorRT-LLM's self-sampling GVR V2 host API (vllm/third_party/trtllm_gvr),
+    or None when it cannot be imported."""
+    try:
+        from vllm.third_party.trtllm_gvr._torch.kernels.blackwell.top_k import (
+            gvr_topk_decode_self_sampling_host as host,
+        )
+    except Exception as e:  # noqa: BLE001 - e.g. no CuTe DSL: other backends
+        logger.warning("TensorRT-LLM GVR V2 top-k is unavailable: %s", e)
+        return None
+    return host
+
+
+def trtllm_gvr2_supported(logits: torch.Tensor, topk_tokens: int) -> bool:
+    """The vendored GVR V2 engine's format gate: FP32 or 16-bit row-major
+    logits wider than the top-k with a 16-byte row stride and base (16-bit
+    logits also need topk >= 8)."""
+    return (
+        logits.dim() == 2
+        and logits.dtype in TRTLLM_GVR2_DTYPES
+        and logits.stride(1) == 1
+        and logits.stride(0) % (16 // logits.element_size()) == 0
+        and logits.data_ptr() % 16 == 0
+        and logits.shape[1] > topk_tokens
+        and (logits.dtype == torch.float32 or topk_tokens >= 8)
+    )
+
+
+def warmup_trtllm_gvr2_prefill(topk_tokens: int, max_cols: int) -> None:
+    """Compile every BF16 GVR V2 prefill engine ``run_prefill`` can pick for
+    rows of up to ``max_cols`` columns. The engine never compiles under CUDA
+    graph capture, and a mid-serving JIT on one DCP rank stalls its peers, so
+    models call this at load (warm_prefill_indexer)."""
+    if not (
+        current_platform.is_cuda() and current_platform.is_device_capability_family(100)
+    ):
+        return
+    host = trtllm_gvr2_host()
+    if host is None:
+        return
+    start = time.perf_counter()
+    host.warmup_prefill(top_k=topk_tokens, max_cols=max_cols, dtype=torch.bfloat16)
+    logger.info(
+        "Warmed up the BF16 GVR V2 prefill top-k (topk %d, up to %d columns) in %.1fs",
+        topk_tokens,
+        max_cols,
+        time.perf_counter() - start,
+    )
+
+
 @functools.cache
 def get_indexer_topk(backend: str) -> "SparseIndexerTopk":
     return SparseIndexerTopk(backend)
@@ -200,6 +255,7 @@ class SparseIndexerTopk(torch.nn.Module):
                 1 + (spec.num_speculative_tokens if spec is not None else 0)
             )
         self._gvr2_warmed: set[tuple[int, int, int]] = set()
+        self._trtllm_gvr2_warmed: set[tuple[int, int, int, torch.dtype]] = set()
         self._is_cuda = current_platform.is_cuda()
         self._has_deep_select = self._is_cuda and (
             current_platform.is_device_capability_family(100)
@@ -209,6 +265,12 @@ class SparseIndexerTopk(torch.nn.Module):
             self._is_cuda
             and current_platform.is_device_capability_family(100)
             and has_flashinfer_topk_varlen_gvr2()
+        )
+        self._has_trtllm_gvr2 = (
+            backend == "trtllm_gvr2"
+            and self._is_cuda
+            and current_platform.is_device_capability_family(100)
+            and trtllm_gvr2_host() is not None
         )
         self._cooperative_capable = self._is_cuda and (
             current_platform.has_device_capability(90)
@@ -240,6 +302,16 @@ class SparseIndexerTopk(torch.nn.Module):
                 "sparse_indexer_topk_backend='balanced' needs BF16 decode logits "
                 "(got %s); using the auto chain",
                 logits.dtype,
+            )
+            return self._resolve_auto(logits, topk_tokens, num_rows)
+        if self._backend == "trtllm_gvr2":
+            if self._has_trtllm_gvr2 and trtllm_gvr2_supported(logits, topk_tokens):
+                return "trtllm_gvr2"
+            logger.info_once(
+                "sparse_indexer_topk_backend='trtllm_gvr2' cannot rank these "
+                "decode logits (dtype=%s, stride=%s); using the auto chain",
+                logits.dtype,
+                tuple(logits.stride()),
             )
             return self._resolve_auto(logits, topk_tokens, num_rows)
 
@@ -358,6 +430,42 @@ class SparseIndexerTopk(torch.nn.Module):
             time.perf_counter() - start,
         )
 
+    def _trtllm_gvr2_warmup(self, logits: torch.Tensor, topk_tokens: int) -> None:
+        """Compile the GVR V2 decode engine for every decode row count at this
+        logits width / stride / dtype (its launcher keys), eagerly: it never
+        compiles under CUDA graph capture."""
+        key = (logits.shape[1], logits.stride(0), topk_tokens, logits.dtype)
+        if key in self._trtllm_gvr2_warmed:
+            return
+        rows_cap = max(1, (256 << 20) // (logits.stride(0) * logits.element_size()))
+        max_rows = max(logits.shape[0], min(self._gvr2_max_rows, rows_cap))
+        start = time.perf_counter()
+        trtllm_gvr2_host().warmup_varlen(
+            top_k=topk_tokens,
+            max_seq_len=logits.shape[1],
+            num_rows_list=range(1, max_rows + 1),
+            row_stride=logits.stride(0),
+            dtype=logits.dtype,
+        )
+        self._trtllm_gvr2_warmed.add(key)
+        logger.info_once(
+            "Warmed up the %s GVR V2 decode top-k for up to %d rows x %d (topk %d) "
+            "in %.1fs",
+            logits.dtype,
+            max_rows,
+            logits.shape[1],
+            topk_tokens,
+            time.perf_counter() - start,
+        )
+
+    @staticmethod
+    def _fp32(logits: torch.Tensor, row_ends: torch.Tensor) -> torch.Tensor:
+        """FP32 copy for the FP32-only top-k kernels (trtllm_gvr2 keeps 16-bit
+        logits and falls back to them when its engine cannot run)."""
+        from vllm.model_executor.layers.sparse_attn_indexer import as_fp32_logits
+
+        return as_fp32_logits(logits, row_ends)
+
     @staticmethod
     def _gvr2_constraints(logits: torch.Tensor, topk_tokens: int) -> list[str]:
         """Unmet input constraints of gvr_2 (empty when applicable)."""
@@ -425,6 +533,35 @@ class SparseIndexerTopk(torch.nn.Module):
         writes indices relative to the row start (int32, -1 fill for rows
         shorter than topk_tokens)."""
         num_rows = logits.shape[0]
+        if self._backend == "trtllm_gvr2":
+            if self._has_trtllm_gvr2 and trtllm_gvr2_supported(logits, topk_tokens):
+                host = trtllm_gvr2_host()
+                direct = (
+                    topk_indices.is_contiguous() and topk_indices.data_ptr() % 16 == 0
+                )
+                out = topk_indices if direct else torch.empty_like(topk_indices)
+                # Under capture only engines compiled at load can launch.
+                if not torch.cuda.is_current_stream_capturing() or host.prefill_ready(
+                    logits, out
+                ):
+                    logger.info_once(
+                        "Sparse indexer prefill top-k backend: trtllm_gvr2 (%s)",
+                        logits.dtype,
+                    )
+                    # Row r ranks logits[r, ks:ks + row_ends[r]) into the local
+                    # frame (column - ks), -1 padded; ks = row_starts or 0.
+                    host.run_prefill(
+                        logits,
+                        torch.zeros_like(row_ends)
+                        if row_starts is None
+                        else row_starts,
+                        row_ends,
+                        out,
+                    )
+                    if not direct:
+                        topk_indices.copy_(out)
+                    return
+            logits = self._fp32(logits, row_ends)
         backend = self.resolve_prefill_backend(logits, topk_tokens, row_starts)
         if backend == "flashinfer_gvr2":
             logger.info_once("Sparse indexer prefill top-k backend: flashinfer_gvr2")
@@ -516,7 +653,23 @@ class SparseIndexerTopk(torch.nn.Module):
         """Run the resolved decode top-k implementation, writing into
         topk_indices (int32, -1 fill for rows shorter than topk_tokens).
         """
-        backend = self.resolve_backend(logits, topk_tokens, logits.shape[0])
+        num_rows = logits.shape[0]
+        backend = self.resolve_backend(logits, topk_tokens, num_rows)
+        if backend == "trtllm_gvr2":
+            if not torch.cuda.is_current_stream_capturing():
+                self._trtllm_gvr2_warmup(logits, topk_tokens)
+            elif not trtllm_gvr2_host().varlen_ready(
+                logits, topk_indices, max_seq_len=logits.shape[1]
+            ):
+                logger.warning_once(
+                    "trtllm_gvr2 decode top-k is not compiled for this shape and "
+                    "cannot compile under CUDA graph capture; using the auto chain"
+                )
+                backend = "auto"
+        if self._backend == "trtllm_gvr2" and backend != "trtllm_gvr2":
+            # The other kernels read FP32: copy the 16-bit logits kept for GVR.
+            logits = self._fp32(logits, self._row_ends(seq_lens, next_n, num_rows))
+            backend = self._resolve_auto(logits, topk_tokens, num_rows)
         logger.info_once("Sparse indexer decode top-k backend: %s", backend)
         if backend == "deep_select":
             row_ends = self._row_ends(seq_lens, next_n, logits.shape[0])
@@ -564,6 +717,23 @@ class SparseIndexerTopk(torch.nn.Module):
             # row and -1-fills past the row length.
             indices = top_k_ragged_transform(logits, offsets, row_ends, topk_tokens)
             topk_indices.copy_(indices)
+        elif backend == "trtllm_gvr2":
+            # Every row is its own request (next_n=1) with its length as the KV
+            # length, as for flashinfer_gvr2; max_seq_len=row width keeps the
+            # call free of host reads.
+            row_ends = self._row_ends(seq_lens, next_n, num_rows).contiguous()
+            direct = topk_indices.is_contiguous() and topk_indices.data_ptr() % 16 == 0
+            out = topk_indices if direct else torch.empty_like(topk_indices)
+            trtllm_gvr2_host().run_varlen(
+                logits,
+                row_ends,
+                out,
+                next_n=1,
+                compress_ratio=1,
+                max_seq_len=logits.shape[1],
+            )
+            if not direct:
+                topk_indices.copy_(out)
         elif backend == "flashinfer_gvr2":
             # The production varlen entry point; the public top_k_varlen
             # wrapper adds ~50us of host-side validation per call, which the

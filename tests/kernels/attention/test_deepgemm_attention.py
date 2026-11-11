@@ -12,6 +12,7 @@ from vllm.utils.deep_gemm import (
     calc_diff,
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
+    get_mqa_logits_metadata,
     get_num_sms,
     get_paged_mqa_logits_metadata,
     mqa_logits_mx_inputs,
@@ -152,6 +153,25 @@ def test_deepgemm_fp8_mqa_logits(layout: str):
         max_seqlen_k,
     )
     assert logits.shape == (seq_len, max_seqlen_k)
+    schedule_meta = (
+        get_mqa_logits_metadata(ks, ke, seq_len_kv, num_heads)
+        if mqa_logits_use_mx_scales()
+        else None
+    )
+    if schedule_meta is not None:
+        # The cost-balanced schedule only reassigns KV splits to CTAs: every
+        # logit is computed the same way, so the valid spans match bit for bit.
+        scheduled = fp8_fp4_mqa_logits(
+            (q_fp8, q_scale),
+            (kv_fp8, encode_indexer_scales(kv_sf)),
+            kernel_weights,
+            ks,
+            ke,
+            max_seqlen_k,
+            schedule_meta=schedule_meta,
+        )
+        span = torch.arange(max_seqlen_k, device="cuda")[None, :] < (ke - ks)[:, None]
+        assert torch.equal(scheduled[span], logits[span])
     logits = as_fp32_logits(logits, ke - ks)
 
     ref_logits = _ref_fp8_mqa_logits(

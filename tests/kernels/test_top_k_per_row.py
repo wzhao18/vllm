@@ -2437,6 +2437,22 @@ requires_flashinfer_gvr2 = pytest.mark.skipif(
 )
 
 
+def _has_trtllm_gvr2() -> bool:
+    """The vendored TensorRT-LLM GVR V2 engine needs the SM100 family and the
+    CuTe DSL; probed without importing either at collection."""
+    import importlib.util
+
+    return (
+        current_platform.is_device_capability_family(100)
+        and importlib.util.find_spec("cutlass") is not None
+    )
+
+
+requires_trtllm_gvr2 = pytest.mark.skipif(
+    not _has_trtllm_gvr2(), reason="requires the CuTe DSL GVR V2 top-k on SM100"
+)
+
+
 SPARSE_INDEXER_EXPLICIT_BACKENDS = [
     pytest.param(
         "per_row",
@@ -2466,6 +2482,7 @@ SPARSE_INDEXER_EXPLICIT_BACKENDS = [
     ),
     pytest.param("flashinfer_gvr2", marks=requires_flashinfer_gvr2),
     pytest.param("deep_select", marks=requires_sm100),
+    pytest.param("trtllm_gvr2", marks=requires_trtllm_gvr2),
 ]
 
 
@@ -2542,6 +2559,7 @@ def test_sparse_indexer_decode_topk_explicit_backends(
         ),
         pytest.param("flashinfer_gvr2", marks=requires_flashinfer_gvr2),
         pytest.param("deep_select", marks=requires_sm100),
+        pytest.param("trtllm_gvr2", marks=requires_trtllm_gvr2),
     ],
 )
 @torch.inference_mode()
@@ -2902,3 +2920,104 @@ def test_sparse_indexer_prefill_topk_gvr2(
     ).masked_fill(indices < 0, 0)
     expected = reference.topk(top_k, dim=1).values.masked_fill(~valid, 0)
     torch.testing.assert_close(picked.sort(1).values, expected.sort(1).values)
+
+
+def _assert_topk_values(
+    reference: torch.Tensor,
+    indices: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    top_k: int,
+) -> None:
+    """Indices are local to each row's start, -1 padded past its length, and
+    select torch.topk's values (tie-aware: 16-bit logits tie often)."""
+    width = reference.shape[1]
+    lens = (row_ends - row_starts)[:, None]
+    valid = torch.arange(top_k, device="cuda")[None, :] < lens
+    assert ((indices == -1) | ((indices >= 0) & (indices < lens))).all()
+    assert torch.equal((indices >= 0).sum(1), valid.sum(1))
+    picked = reference.gather(
+        1, (indices.long() + row_starts[:, None]).clamp(0, width - 1)
+    ).masked_fill(indices < 0, 0)
+    expected = reference.topk(top_k, dim=1).values.masked_fill(~valid, 0)
+    assert torch.equal(picked.sort(1).values, expected.sort(1).values)
+
+
+@requires_trtllm_gvr2
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "q_lens,ctx_lens,row_relative",
+    [
+        ([96], [40000], True),
+        ([1024, 700, 300], [0, 33000, 1500], True),
+        ([1024, 700, 300], [0, 33000, 1500], False),
+    ],
+)
+@torch.inference_mode()
+def test_sparse_indexer_prefill_topk_trtllm_gvr2_16bit(
+    dtype: torch.dtype, q_lens: list[int], ctx_lens: list[int], row_relative: bool
+) -> None:
+    """trtllm_gvr2 ranks 16-bit prefill logits without an FP32 copy for every
+    chunk (no row minimum, row-relative or per-row starts), selecting
+    logits[r, ks[r]:ke[r]] into indices relative to ks[r]."""
+    set_random_seed(0)
+    top_k = 2048
+    ks, ke, k_off = [], [], 0
+    for q, c in zip(q_lens, ctx_lens):
+        for i in range(q):
+            ks.append(k_off)
+            ke.append(k_off + c + i + 1)
+        k_off += c + q
+    row_starts = torch.tensor(ks, dtype=torch.int32, device="cuda")
+    row_ends = torch.tensor(ke, dtype=torch.int32, device="cuda")
+    if row_relative:
+        row_ends -= row_starts
+        row_starts.zero_()
+    num_rows, width = len(ks), int(row_ends.max())
+    pitch = (width + 255) // 256 * 256
+    logits = torch.randn(num_rows, pitch, device="cuda", dtype=dtype)[:, :width]
+    cols = torch.arange(width, device="cuda")
+    outside = (cols < row_starts[:, None]) | (cols >= row_ends[:, None])
+    logits[outside] = torch.finfo(dtype).max
+    reference = logits.float().masked_fill(outside, float("-inf"))
+
+    indices = torch.full((num_rows, top_k), 7, dtype=torch.int32, device="cuda")
+    _make_topk("trtllm_gvr2").forward_prefill(
+        logits, None if row_relative else row_starts, row_ends, indices, top_k
+    )
+    _assert_topk_values(reference, indices, row_starts, row_ends, top_k)
+
+
+@requires_trtllm_gvr2
+@pytest.mark.parametrize("next_n", [1, 4])
+@torch.inference_mode()
+def test_sparse_indexer_decode_topk_trtllm_gvr2_bf16(next_n: int, workspace_init):
+    """trtllm_gvr2 ranks BF16 decode logits natively: each row restricted to
+    its seq_len (dirty tail never selected), matching torch.topk's values."""
+    from vllm.model_executor.layers.indexer_topk import trtllm_gvr2_supported
+
+    set_random_seed(0)
+    top_k, batch_size = 2048, 4
+    num_rows = batch_size * next_n
+    row_ends = torch.randint(4000, 160000, (num_rows,), dtype=torch.int32)
+    row_ends = row_ends.cuda()
+    max_seq_len = int(row_ends.max())
+    stride = (max_seq_len + 255) // 256 * 256
+    logits = torch.randn(num_rows, stride, device="cuda", dtype=torch.bfloat16)
+    cols = torch.arange(stride, device="cuda")
+    tail = cols[None, :] >= row_ends[:, None]
+    logits[tail] = torch.finfo(torch.bfloat16).max
+    reference = logits.float().masked_fill(tail, float("-inf"))
+    assert trtllm_gvr2_supported(logits, top_k)
+
+    indices = torch.full((num_rows, top_k), -2, dtype=torch.int32, device="cuda")
+    _make_topk("trtllm_gvr2")(
+        logits,
+        row_ends.reshape(batch_size, next_n),
+        next_n,
+        indices,
+        top_k,
+        max_seq_len,
+    )
+    zeros = torch.zeros_like(row_ends)
+    _assert_topk_values(reference, indices, zeros, row_ends, top_k)
