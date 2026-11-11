@@ -742,3 +742,45 @@ def test_indexer_score_reads_its_cache_format(
         # SM100 sums the heads in bf16: only near-ties at the cut may differ.
         recall = torch.isin(got, ref_set).float().mean().item()
         assert recall > 0.97, (b, recall)
+
+
+@pytest.mark.parametrize("use_fp4_cache", [False, True])
+@pytest.mark.parametrize("row", [0, 5, 63, 64, 100, 127])
+@torch.inference_mode()
+def test_key_insert_writes_the_declared_rows(use_fp4_cache: bool, row: int):
+    """The row layout KimiK3IndexerBackend declares for KV transfers matches
+    the bytes the key inserts write: a token at page row `row` lands only in
+    that row's value and scale pieces, over a 128-token page of two
+    64-token kernel pages."""
+    from vllm.models.kimi_k3.common.dsa_cache import (
+        KimiK3IndexerBackend,
+        indexer_cache_entry_bytes,
+    )
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec, SparseCacheRole
+
+    torch.manual_seed(row)
+    entry = indexer_cache_entry_bytes(HEAD_DIM, use_fp4_cache)
+    spec = MLAAttentionSpec(
+        block_size=2 * BLOCK,
+        num_kv_heads=1,
+        head_size=entry,
+        dtype=torch.uint8,
+        cache_role=SparseCacheRole.INDEXER,
+    )
+    layout = KimiK3IndexerBackend.get_kv_cache_row_layout(spec, BLOCK)
+    layout.validate(spec)
+
+    raw, view = _make_cache(False, 2, entry)
+    _, k, weight, bias, eps, _ = _index_k_inputs(1)
+    slots = torch.tensor([row], dtype=torch.int64, device="cuda")
+    topk = torch.full((1, TOPK), 7, dtype=torch.int32, device="cuda")
+    insert = mxfp4_k_norm_quant_insert if use_fp4_cache else indexer_k_norm_quant_insert
+    insert(k, weight, bias, eps, slots, view, topk, 1)
+
+    written = torch.nonzero(raw.flatten()).flatten().tolist()
+    assert written
+    pieces = layout.row_byte_ranges(row)
+    assert all(any(o <= b < o + n for o, n in pieces) for b in written)
+    # The scales are never all zero.
+    scale_offset, scale_bytes = pieces[-1]
+    assert raw.flatten()[scale_offset : scale_offset + scale_bytes].any()

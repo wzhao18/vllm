@@ -236,6 +236,7 @@ from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.attention.attention import (
     _init_kv_cache_quant,
     get_attention_context,
+    get_kv_cache_quant_scales,
     set_default_quant_scales,
     should_load_quant_weights,
 )
@@ -283,6 +284,7 @@ from vllm.v1.attention.backend import (
     AttentionType,
     CommonAttentionMetadata,
     MLAAttentionImpl,
+    mla_kv_cache_row_layout,
 )
 from vllm.v1.attention.backends.mla.index_group import HiSparseMLAIndexGroup
 from vllm.v1.attention.backends.mla.prefill import (
@@ -308,6 +310,7 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheSpec,
     KVQuantMode,
+    KVRowLayout,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     get_kv_quant_mode,
@@ -1656,6 +1659,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.attn_backend
 
+    def get_kv_cache_scales(
+        self, kv_cache_spec: AttentionSpec
+    ) -> tuple[float, float] | None:
+        return get_kv_cache_quant_scales(self, kv_cache_spec)
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
@@ -1918,6 +1926,12 @@ class MLACommonBackend(AttentionBackend):
     @classmethod
     def is_mla(cls) -> bool:
         return True
+
+    @classmethod
+    def get_kv_cache_row_layout(
+        cls, kv_cache_spec: AttentionSpec, kernel_block_size: int
+    ) -> KVRowLayout | None:
+        return mla_kv_cache_row_layout(cls, kv_cache_spec)
 
 
 @dataclass

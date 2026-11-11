@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from vllm.distributed.kv_transfer.kv_connector.dcp_layout import DcpLayout
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
@@ -109,12 +110,6 @@ def _coalesce_runs(runs: list[CopyRun]) -> tuple[CopyRun, ...]:
     return tuple(out)
 
 
-def _local_to_canonical_token(local_idx: int, ctx: _RankContext) -> int:
-    """Canonical position of one of this rank's local token indices."""
-    chunk, pos_in_chunk = divmod(local_idx, ctx.interleave)
-    return (chunk * ctx.cp_size + ctx.total_cp_rank) * ctx.interleave + pos_in_chunk
-
-
 def _interleave_cp_tokens(
     regions: list[ByteRegion],
     num_tokens: int,
@@ -123,8 +118,13 @@ def _interleave_cp_tokens(
     """Place each region's num_tokens rows at their canonical token positions,
     one run per chunk of interleaved tokens."""
     runs: list[CopyRun] = []
+    # The canonical page interleaves all CP ranks' rows: a rank's local row
+    # sits at its global position within the offloaded block.
+    cp_layout = (
+        DcpLayout(ctx.cp_size, ctx.interleave, num_tokens) if ctx.cp_size > 1 else None
+    )
     for region in regions:
-        if ctx.cp_size == 1:
+        if cp_layout is None:
             runs.append(
                 CopyRun(
                     region.local_offset,
@@ -137,7 +137,7 @@ def _interleave_cp_tokens(
             )
             continue
         for chunk_start in range(0, num_tokens, ctx.interleave):
-            canonical_token = _local_to_canonical_token(chunk_start, ctx)
+            canonical_token = int(cp_layout.global_pos(ctx.total_cp_rank, chunk_start))
             runs.append(
                 CopyRun(
                     region.local_offset + chunk_start * region.bytes_per_token,

@@ -360,6 +360,7 @@ def _register_overlaid_mla_worker(
     rounded up to a page boundary does. Clearing `page_covers_view` narrows
     each layer's view below its page, leaving the block interior non-contiguous.
     """
+    from vllm.distributed.kv_transfer.kv_connector.dcp_layout import DcpLayout
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl import base_worker as bw
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
         NixlPushConnectorWorker,
@@ -430,10 +431,15 @@ def _register_overlaid_mla_worker(
     worker.src_xfer_handles_by_block_size = {}
     worker.kv_caches_base_addr = defaultdict(dict)
     worker._mamba_ssm_size = (0, 0)
+    worker._mamba_state_geometry = None
     worker.kv_cache_layout = "LBNHC"
     worker.host_buffer_kv_cache_layout = "LBNHC"
     worker._physical_blocks_per_logical_kv_block = 1
     worker._logical_num_blocks = num_blocks
+    worker._dcp_layout = DcpLayout(dcp_size=1, interleave=1, block_size=4)
+    worker._kv_row_layouts = {}
+    worker._kv_cache_scales = {}
+    worker.dcp_transfer_modes = {}
     worker.region_mem_types = []
     worker.region_group_ids = []
     worker._mixed_mem_types = False
@@ -872,6 +878,9 @@ def _make_remote_meta(
         region_members=region_members,
         region_group_ids=region_group_ids,
         layer_group_ids=layer_group_ids,
+        # A NIXL DCP peer resolves the interleave to its per-rank block.
+        cp_kv_cache_interleave_size=remote_block_size,
+        mamba_state_geometry=worker._mamba_state_geometry,
     )
 
 
@@ -1437,7 +1446,7 @@ def test_dcp_rejects_different_logical_block_sizes():
         remote_num_logical=12,
         remote_ssm_sizes=(24, 32),
     )
-    with pytest.raises(NotImplementedError, match="matching P/D logical block sizes"):
+    with pytest.raises(bw.NixlPeerIncompatibleError, match="logical block sizes"):
         worker.add_remote_agent(
             meta_r, remote_tp_rank=0, remote_tp_size=2, remote_dcp_size=2
         )

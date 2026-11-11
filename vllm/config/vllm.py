@@ -3489,6 +3489,21 @@ class VllmConfig:
                     f"{', '.join(unsupported)}"
                 )
 
+    def nixl_resolves_dcp_kv_cache_interleave_size(self) -> bool:
+        """Whether `adjust_dcp_kv_cache_interleave_size` will set the DCP
+        interleave from the KV cache groups, i.e. after the model is built.
+
+        Model-build-time code that depends on the interleave (rather than
+        reading it lazily) must not trust the current value then.
+        """
+        return (
+            self.kv_transfer_config is not None
+            and self.kv_transfer_config.is_kv_transfer_instance
+            and self.kv_transfer_config.has_connector("NixlConnector")
+            and self.parallel_config.decode_context_parallel_size > 1
+            and self.parallel_config._allow_auto_resolve_cp_interleave_size
+        )
+
     def adjust_dcp_kv_cache_interleave_size(
         self, kv_cache_groups: list["KVCacheGroupSpec"]
     ) -> None:
@@ -3506,22 +3521,19 @@ class VllmConfig:
         dcp_size = self.parallel_config.decode_context_parallel_size
         if dcp_size <= 1:
             return
-        if self.parallel_config.dcp_kv_cache_interleave_size > 1 and (
-            self.parallel_config.cp_kv_cache_interleave_size
-            != self.parallel_config.dcp_kv_cache_interleave_size
-        ):
-            self.parallel_config.cp_kv_cache_interleave_size = (
-                self.parallel_config.dcp_kv_cache_interleave_size
-            )
-            logger.warning_once(
-                "cp_kv_cache_interleave_size is overridden by dcp_kv_cache"
-                "_interleave_size. And dcp-kv-cache-interleave-size will be "
-                "deprecated when PCP is fully supported."
-            )
+        self.parallel_config.resolve_dcp_kv_cache_interleave_alias()
 
         if not self.kv_transfer_config.has_connector("NixlConnector"):
             return
-        if not self.parallel_config._allow_auto_resolve_cp_interleave_size:
+        if not self.nixl_resolves_dcp_kv_cache_interleave_size():
+            # Set explicitly or by the model: blocks are only final here.
+            for group in kv_cache_groups:
+                if group.kv_cache_spec.dcp_sharded:
+                    _check_dcp_interleave_tiles_block(
+                        self.parallel_config,
+                        group.kv_cache_spec.block_size,
+                        f"the DCP-sharded KV cache group {group.layer_names[:1]}",
+                    )
             return
 
         # Get the kernel block_size, but don't use resolve_kv_cache_block_size to avoid
@@ -3555,13 +3567,8 @@ class VllmConfig:
             and self.kv_transfer_config.has_connector("NixlConnector")
         )
         if self.parallel_config.decode_context_parallel_size > 1 and not nixl_pd_active:
-            assert (
-                self.parallel_config.cp_kv_cache_interleave_size <= block_size
-                and block_size % self.parallel_config.cp_kv_cache_interleave_size == 0
-            ), (
-                f"Block_size({block_size}) should be greater "
-                "than or equal to and divisible by cp_kv_cache_interleave_size "
-                f"({self.parallel_config.cp_kv_cache_interleave_size})."
+            _check_dcp_interleave_tiles_block(
+                self.parallel_config, block_size, "--block-size"
             )
         # Mamba cache align-mode constraints
         if self.cache_config.mamba_cache_mode == "align":
@@ -3792,6 +3799,21 @@ def get_current_vllm_config_or_none() -> VllmConfig | None:
 
 
 T = TypeVar("T")
+
+
+def _check_dcp_interleave_tiles_block(
+    parallel_config: ParallelConfig, block_size: int, where: str
+) -> None:
+    """Every DCP-sharded block must hold whole interleave chunks, or a rank's
+    chunk would straddle two of its pages."""
+    interleave = parallel_config.cp_kv_cache_interleave_size
+    if not 1 <= interleave <= block_size or block_size % interleave:
+        raise ValueError(
+            f"cp_kv_cache_interleave_size={interleave} must divide the block "
+            f"size {block_size} of {where} (1 <= interleave <= block size) "
+            "under decode context parallelism (decode_context_parallel_size="
+            f"{parallel_config.decode_context_parallel_size})."
+        )
 
 
 def get_layers_from_vllm_config(

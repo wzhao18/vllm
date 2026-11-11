@@ -4,13 +4,18 @@
 
 from __future__ import annotations
 
+import enum
 from dataclasses import dataclass
 
 import numpy as np
 
+from vllm.distributed.kv_transfer.kv_connector.dcp_layout import DcpLayout
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     BlockIds,
     TransferTopology,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
+    NixlPeerIncompatibleError,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec, MambaSpec
 
@@ -60,6 +65,68 @@ class TPMapping:
     # Local ranks (in aggregate) that read from a given source rank. The producer frees
     # a request's blocks only once that many notifications have come in.
     local_consumers: int = 1
+
+
+class DcpTransferMode(enum.Enum):
+    """How attention KV moves between a remote and a local DCP layout."""
+
+    DIRECT = "direct"
+    """Local pages read remote pages as they are; nothing is copied after the
+    transfer."""
+
+
+def select_dcp_transfer_mode(
+    local: DcpLayout, remote: DcpLayout, *, has_mamba: bool = False
+) -> DcpTransferMode:
+    """Pick how attention KV moves from `remote` to `local`, or raise
+    `NixlPeerIncompatibleError` for a pair of layouts no mode supports.
+
+    DIRECT pairs whole pages of one rank with whole pages of another (see
+    `_apply_dcp_prefix_caching`):
+
+    - Same DCP size and interleave: a rank's row stream is the same on both
+      sides, so page `j` holds the same positions.
+    - Pages of consecutive positions on both sides (`interleave ==
+      block_size`, or no DCP): page `j` of any rank is one run of positions,
+      so it maps to one remote page whatever the DCP sizes.
+
+    Other layouts (e.g. token-level interleave over different DCP sizes) need
+    rows moved between pages and are rejected. Mode selection assumes each
+    side's DCP group spans its TP ranks (`dcp_size` 1 or TP).
+    """
+    if local.dcp_size == 1 and remote.dcp_size == 1:
+        return DcpTransferMode.DIRECT
+    # DCP shards tokens at the logical block size, and reads pair blocks by
+    # logical position.
+    if local.block_size != remote.block_size:
+        raise NixlPeerIncompatibleError(
+            "DCP requires matching P/D logical block sizes: local "
+            f"{local.block_size}, remote {remote.block_size}."
+        )
+    if has_mamba and local.dcp_size != remote.dcp_size:
+        raise NixlPeerIncompatibleError(
+            "Hybrid MLA+Mamba NIXL transfers require matching DCP sizes, "
+            f"got local={local.dcp_size}, remote={remote.dcp_size}."
+        )
+    if (
+        local.dcp_size > 1
+        and remote.dcp_size > 1
+        and local.interleave != remote.interleave
+    ):
+        raise NixlPeerIncompatibleError(
+            "Both P and D shard KV with decode context parallelism but their "
+            f"cp_kv_cache_interleave_size differ: local {local.interleave}, "
+            f"remote {remote.interleave}. Use the same interleave on both sides."
+        )
+    if local.dcp_size == remote.dcp_size or (
+        local.pages_hold_contiguous_positions and remote.pages_hold_contiguous_positions
+    ):
+        return DcpTransferMode.DIRECT
+    raise NixlPeerIncompatibleError(
+        "NIXL transfers between different DCP sizes need a block-level "
+        "interleave (cp_kv_cache_interleave_size equal to the per-rank KV "
+        f"block size) on both sides: local {local}, remote {remote}."
+    )
 
 
 # ======================================================================

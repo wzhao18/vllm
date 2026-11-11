@@ -20,7 +20,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
     _is_attention_spec,
 )
 from vllm.logger import init_logger
-from vllm.utils.math_utils import cdiv
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -263,7 +262,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 local_block_ids, local_region_groups
             )
             num_computed_blocks = None
-            num_remote_blocks = None
+            num_tokens = None
             if (
                 meta.remote.num_tokens is not None
                 and meta.local_num_computed_blocks
@@ -276,9 +275,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     * self._physical_blocks_per_logical_kv_block
                     for group in local_region_groups
                 ]
-                num_remote_blocks = cdiv(
-                    meta.remote.num_tokens, remote_info.remote_block_size
-                )
+                num_tokens = meta.remote.num_tokens
             elif any(local_by_region) and (
                 dcp_active
                 or remote_info.remote_physical_blocks_per_logical
@@ -296,7 +293,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                         local_by_region,
                         remote_by_region,
                         num_computed_blocks=num_computed_blocks,
-                        num_remote_blocks=num_remote_blocks,
+                        num_tokens=num_tokens,
                         remote_rank=rank,
                         remote_dcp_size=remote_info.remote_dcp_size,
                     ),

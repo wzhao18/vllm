@@ -12,6 +12,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
 )
 from vllm.logger import init_logger
+from vllm.v1.kv_cache_interface import KVRowLayout
 
 logger = init_logger(__name__)
 
@@ -53,8 +54,10 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #  15: Add remote_registration_generation to kv_transfer_params
 #  16: Pair regions by the layers both sides hold: every peer advertises
 #      region_members and the cache group of each layer
+#  17: Advertise the DCP interleave size, per-layer KV row layouts and KV
+#      cache scales, and the Mamba state geometry
 #
-NIXL_CONNECTOR_VERSION: int = 16
+NIXL_CONNECTOR_VERSION: int = 17
 
 
 @dataclass
@@ -85,6 +88,17 @@ class NixlAgentMetadata:
     layer_group_ids: dict[str, int] = field(default_factory=dict)
     # Packed member -> (byte offset in its region's block, bytes per page).
     packed_member_layouts: dict[str, tuple[int, int]] = field(default_factory=dict)
+    # cp_kv_cache_interleave_size: DCP ranks take turns every this many tokens.
+    # None only from a peer older than version 17.
+    cp_kv_cache_interleave_size: int | None = None
+    # Attention layer -> token-row layout of its KV page, for the layers that
+    # declare one.
+    kv_row_layouts: dict[str, KVRowLayout] = field(default_factory=dict)
+    # Attention layer -> per-tensor (k_scale, v_scale) of its quantized KV cache.
+    kv_cache_scales: dict[str, tuple[float, float]] = field(default_factory=dict)
+    # Mamba state shapes without their TP-sharded leading dim, and dtypes (see
+    # `mamba_state_geometry`); None without Mamba state.
+    mamba_state_geometry: tuple[list[list[int]], list[str]] | None = None
 
 
 @dataclass

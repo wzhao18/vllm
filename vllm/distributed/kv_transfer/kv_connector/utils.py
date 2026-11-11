@@ -22,7 +22,13 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import AttentionBackend
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, iter_layer_specs
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheConfig,
+    KVCacheSpec,
+    KVRowLayout,
+    iter_layer_specs,
+)
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 
 if TYPE_CHECKING:
@@ -427,6 +433,53 @@ def get_current_attn_backends_and_specs(
     if not has_layers:
         return fallback, [None] * len(fallback)
     return [backend for backend, _ in pairs], [spec for _, spec in pairs]
+
+
+def get_kv_row_layouts(
+    vllm_config: VllmConfig, layer_specs: dict[str, KVCacheSpec]
+) -> dict[str, KVRowLayout]:
+    """Token-row layout of the KV page of each attention layer whose backend
+    declares one (`AttentionBackend.get_kv_cache_row_layout`), checked against
+    the layer's spec.
+
+    A layer's kernel blocks are the largest its backend supports within the
+    layer's block, as the model runner picks them for a packed cache, which
+    views them consecutively inside each block (`AttentionGroup`,
+    `map_kv_cache_to_kernel_blocks`).
+    """
+    from vllm.v1.worker.utils import select_common_block_size
+
+    layer_type = cast(type[Any], AttentionLayerBase)
+    layers = get_layers_from_vllm_config(vllm_config, layer_type, layer_specs)
+    layouts: dict[str, KVRowLayout] = {}
+    for name, layer in layers.items():
+        spec = layer_specs[name]
+        if not isinstance(spec, AttentionSpec):
+            continue
+        backend = layer.get_attn_backend()
+        kernel_block_size = select_common_block_size(spec.block_size, [backend], [spec])
+        layout = backend.get_kv_cache_row_layout(spec, kernel_block_size)
+        if layout is not None:
+            layout.validate(spec)
+            layouts[name] = layout
+    return layouts
+
+
+def get_kv_cache_scales(
+    vllm_config: VllmConfig, layer_specs: dict[str, KVCacheSpec]
+) -> dict[str, tuple[float, float]]:
+    """The per-tensor `(k_scale, v_scale)` of each attention layer whose KV
+    cache is quantized with them (`AttentionLayerBase.get_kv_cache_scales`)."""
+    layer_type = cast(type[Any], AttentionLayerBase)
+    layers = get_layers_from_vllm_config(vllm_config, layer_type, layer_specs)
+    scales: dict[str, tuple[float, float]] = {}
+    for name, layer in layers.items():
+        spec = layer_specs[name]
+        if isinstance(spec, AttentionSpec):
+            layer_scales = layer.get_kv_cache_scales(spec)
+            if layer_scales is not None:
+                scales[name] = layer_scales
+    return scales
 
 
 def check_compressed_kernel_split(

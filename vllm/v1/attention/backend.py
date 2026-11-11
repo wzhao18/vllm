@@ -28,7 +28,13 @@ if TYPE_CHECKING:
         KVQuantMode,
     )
 
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout, get_kv_quant_mode
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheLayout,
+    KVRowLayout,
+    MLAAttentionSpec,
+    get_kv_quant_mode,
+)
 
 
 class AttentionType(StrEnum):
@@ -375,6 +381,19 @@ class AttentionBackend(ABC):
     def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...] | None:
         """Layouts this backend's kernels can consume, most preferred first, or
         None when the kernels consume any layout and express no preference."""
+        return None
+
+    @classmethod
+    def get_kv_cache_row_layout(
+        cls, kv_cache_spec: AttentionSpec, kernel_block_size: int
+    ) -> KVRowLayout | None:
+        """Byte layout of the token rows of a page this backend's cache writer
+        fills, or None when the backend does not declare it.
+
+        `kernel_block_size` is the rows per kernel block the layer's cache is
+        viewed in. A KV transfer that moves single token rows between pages
+        (e.g. across different DCP layouts) can only move declared layouts.
+        """
         return None
 
     @classmethod
@@ -1114,6 +1133,30 @@ class MLAAttentionImpl(AttentionImplBase[T], Generic[T]):
             scale=k_scale,
             skip_scale=skip_scale,
         )
+
+
+def mla_kv_cache_row_layout(
+    backend: type[AttentionBackend], kv_cache_spec: AttentionSpec
+) -> KVRowLayout | None:
+    """Token rows of an MLA backend's page when its impl writes the cache with
+    `MLAAttentionImpl.do_kv_cache_update`: `concat_and_cache_mla` stores a
+    token's whole entry at its slot of a `[num_blocks, block_size, entry]`
+    cache, in every MLA cache dtype (the ds_mla formats are opaque per-token
+    records). None for impls with their own writer, compressed pages (several
+    tokens per stored state) and DeepSeek-V4 pages (`model_version`)."""
+    try:
+        impl_cls = backend.get_impl_cls()
+    except NotImplementedError:
+        return None
+    if (
+        impl_cls.do_kv_cache_update is not MLAAttentionImpl.do_kv_cache_update
+        or not isinstance(kv_cache_spec, MLAAttentionSpec)
+        or kv_cache_spec.model_version is not None
+        or kv_cache_spec.num_heads != 1
+        or kv_cache_spec.tokens_per_state != 1
+    ):
+        return None
+    return KVRowLayout.token_major(kv_cache_spec.state_content_size_bytes)
 
 
 def subclass_attention_backend(

@@ -26,7 +26,9 @@ from vllm.v1.attention.backends.mla.indexer import (
 )
 from vllm.v1.kv_cache_interface import (
     DS_MLA_STATE_CONTENT_BYTES,
+    AttentionSpec,
     KVCacheSpec,
+    KVRowLayout,
     MLAAttentionSpec,
     get_kv_quant_mode,
 )
@@ -58,6 +60,12 @@ def kimi_k3_indexer_uses_fp4(vllm_config: VllmConfig) -> bool:
             "parallelism for Kimi K3 DSA."
         )
     return True
+
+
+# Both key formats end a token's entry with 4 scale bytes: one fp32 scale for
+# FP8 keys, or the four UE8M0 scales of a 128-dim MXFP4 key (the only MXFP4 key
+# size the indexer supports, see `mxfp4_q_quant`).
+INDEXER_KEY_SCALE_BYTES = 4
 
 
 def indexer_cache_entry_bytes(head_dim: int, use_fp4_cache: bool) -> int:
@@ -139,6 +147,22 @@ class KimiK3IndexerBackend(DeepseekV32IndexerBackend):
         # Pack the indexer pages beside the MLA pages inside each block, so a
         # KDA state page sizes the whole block row rather than one MLA page.
         return (KVCacheLayout.BLHNC,)
+
+    @classmethod
+    def get_kv_cache_row_layout(
+        cls, kv_cache_spec: AttentionSpec, kernel_block_size: int
+    ) -> KVRowLayout | None:
+        """The key inserts (`dsa_indexer`, `dsa_indexer_mxfp4`) store each
+        kernel page's key values first, then their scales: row `r`'s values at
+        `r * value_bytes` and its scales at `rows * value_bytes + r *
+        scale_bytes` of the kernel page. The ROCm inserts are not verified
+        against this, so their layout stays undeclared."""
+        if current_platform.is_rocm():
+            return None
+        rows = kernel_block_size
+        scale_bytes = INDEXER_KEY_SCALE_BYTES
+        value_bytes = kv_cache_spec.state_content_size_bytes - scale_bytes
+        return KVRowLayout(rows, ((0, value_bytes), (rows * value_bytes, scale_bytes)))
 
     @staticmethod
     def get_builder_cls() -> type[KimiK3IndexerMetadataBuilder]:

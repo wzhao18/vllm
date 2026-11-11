@@ -552,6 +552,134 @@ def test_pd_dcp_interleave_size_is_adjusted_to_block_size(
     assert "automatically adjusted from 3 to block_size 16" in caplog.text
 
 
+def _nixl_dcp_config(**parallel_kwargs) -> VllmConfig:
+    return VllmConfig(
+        cache_config=CacheConfig(block_size=16),
+        device_config=DeviceConfig(device="cpu"),
+        parallel_config=ParallelConfig(
+            tensor_parallel_size=2,
+            decode_context_parallel_size=2,
+            distributed_executor_backend="mp",
+            **parallel_kwargs,
+        ),
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="NixlConnector", kv_role="kv_both"
+        ),
+    )
+
+
+def _dcp_groups(block_size: int = 16):
+    spec = SimpleNamespace(block_size=block_size, dcp_sharded=True)
+    return [SimpleNamespace(kv_cache_spec=spec, layer_names=["model.layers.0.attn"])]
+
+
+def test_model_required_dcp_interleave_survives_nixl_auto_resolve():
+    config = _nixl_dcp_config()
+    config.parallel_config.require_cp_kv_cache_interleave_size(1, "Test model")
+    config.adjust_dcp_kv_cache_interleave_size(_dcp_groups())
+    assert config.parallel_config.cp_kv_cache_interleave_size == 1
+
+
+@pytest.mark.parametrize(
+    "parallel_kwargs",
+    [
+        dict(
+            cp_kv_cache_interleave_size=16,
+            _allow_auto_resolve_cp_interleave_size=False,
+        ),
+        dict(dcp_kv_cache_interleave_size=16),
+    ],
+)
+def test_model_required_dcp_interleave_rejects_explicit_conflict(parallel_kwargs):
+    config = _nixl_dcp_config(**parallel_kwargs)
+    with pytest.raises(ValueError, match="Test model requires"):
+        config.parallel_config.require_cp_kv_cache_interleave_size(1, "Test model")
+
+
+def test_model_required_dcp_interleave_accepts_explicit_match():
+    parallel_config = ParallelConfig(
+        cp_kv_cache_interleave_size=1, _allow_auto_resolve_cp_interleave_size=False
+    )
+    parallel_config.decode_context_parallel_size = 2
+    parallel_config.require_cp_kv_cache_interleave_size(1, "Test model")
+    assert parallel_config.cp_kv_cache_interleave_size == 1
+
+
+def test_model_required_dcp_interleave_ignored_without_dcp():
+    parallel_config = ParallelConfig()
+    parallel_config.require_cp_kv_cache_interleave_size(1, "Test model")
+    assert parallel_config._allow_auto_resolve_cp_interleave_size
+
+
+@pytest.mark.parametrize(
+    ("interleave", "block_size", "ok"),
+    [(1, 16, True), (16, 16, True), (8, 16, True), (3, 16, False), (32, 16, False)],
+)
+def test_nixl_explicit_dcp_interleave_must_tile_blocks(interleave, block_size, ok):
+    config = _nixl_dcp_config(
+        cp_kv_cache_interleave_size=interleave,
+        _allow_auto_resolve_cp_interleave_size=False,
+    )
+    groups = _dcp_groups(block_size) + [
+        # A group that DCP does not shard (e.g. Mamba state) is not checked.
+        SimpleNamespace(
+            kv_cache_spec=SimpleNamespace(block_size=3, dcp_sharded=False),
+            layer_names=["model.layers.1.mixer"],
+        )
+    ]
+    if ok:
+        config.adjust_dcp_kv_cache_interleave_size(groups)
+        assert config.parallel_config.cp_kv_cache_interleave_size == interleave
+    else:
+        with pytest.raises(ValueError, match="must divide the block size 16"):
+            config.adjust_dcp_kv_cache_interleave_size(groups)
+
+
+@pytest.mark.parametrize("kv_role", ["kv_producer", "kv_both"])
+def test_nixl_resolves_dcp_interleave_after_model_build(kv_role):
+    """Under NIXL DCP the interleave is only final after the model is built:
+    model-build-time gates that need interleave 1 (DCP ShardQ) must not see
+    the default 1, which then resolves to the block size."""
+    config = _nixl_dcp_config()
+    config.kv_transfer_config.kv_role = kv_role
+    assert config.parallel_config.cp_kv_cache_interleave_size == 1
+    assert config.nixl_resolves_dcp_kv_cache_interleave_size()
+    config.adjust_dcp_kv_cache_interleave_size(_dcp_groups())
+    assert config.parallel_config.cp_kv_cache_interleave_size == 16
+    # A model that pins the interleave keeps it.
+    config = _nixl_dcp_config()
+    config.parallel_config.require_cp_kv_cache_interleave_size(1, "Test model")
+    assert not config.nixl_resolves_dcp_kv_cache_interleave_size()
+
+
+def test_nixl_does_not_resolve_dcp_interleave_without_dcp():
+    config = VllmConfig(
+        cache_config=CacheConfig(block_size=16),
+        device_config=DeviceConfig(device="cpu"),
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="NixlConnector", kv_role="kv_both"
+        ),
+    )
+    assert not config.nixl_resolves_dcp_kv_cache_interleave_size()
+
+
+def test_dcp_interleave_must_tile_block_without_nixl():
+    config = VllmConfig(
+        cache_config=CacheConfig(block_size=16),
+        device_config=DeviceConfig(device="cpu"),
+        parallel_config=ParallelConfig(
+            tensor_parallel_size=2,
+            decode_context_parallel_size=2,
+            distributed_executor_backend="mp",
+            cp_kv_cache_interleave_size=16,
+        ),
+    )
+    config.validate_block_size()
+    config.parallel_config.cp_kv_cache_interleave_size = 32
+    with pytest.raises(ValueError, match="block size 16 of --block-size"):
+        config.validate_block_size()
+
+
 def test_kv_offloading_does_not_adjust_dcp_interleave_size():
     config = VllmConfig(
         cache_config=CacheConfig(block_size=16),
@@ -609,7 +737,7 @@ def test_kv_offloading_does_not_skip_dcp_interleave_validation():
         ),
     )
 
-    with pytest.raises(AssertionError, match="divisible by"):
+    with pytest.raises(ValueError, match="must divide the block size"):
         VllmConfig.validate_block_size(config)
 
 

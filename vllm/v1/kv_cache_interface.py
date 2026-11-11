@@ -559,6 +559,53 @@ class HiSparseResidentSpec(KVCacheSpec):
         return False
 
 
+@dataclass(frozen=True)
+class KVRowLayout:
+    """Where each token row of a one-head attention KV page lives.
+
+    A page is `block_size // kernel_page_rows` consecutive kernel pages of
+    `kernel_page_rows` rows. Within a kernel page, `pieces` lists each part of
+    a row as `(offset, bytes_per_row)`: row `r` keeps `bytes_per_row` bytes
+    at `offset + r * bytes_per_row`. A token-major page is one piece over
+    one-row kernel pages; an indexer page that stores a kernel page's values
+    before its scales has two. Lets a KV transfer move single token rows of
+    a page, like the offloading connector's `ByteRegion`s.
+    """
+
+    kernel_page_rows: int
+    pieces: tuple[tuple[int, int], ...]
+
+    @classmethod
+    def token_major(cls, bytes_per_row: int) -> KVRowLayout:
+        return cls(1, ((0, bytes_per_row),))
+
+    @property
+    def bytes_per_row(self) -> int:
+        return sum(size for _, size in self.pieces)
+
+    def row_byte_ranges(self, row: int) -> list[tuple[int, int]]:
+        """`(offset in page, length)` of each piece of page row `row`."""
+        kernel_page, r = divmod(row, self.kernel_page_rows)
+        base = kernel_page * self.kernel_page_rows * self.bytes_per_row
+        return [(base + offset + r * size, size) for offset, size in self.pieces]
+
+    def validate(self, spec: AttentionSpec) -> None:
+        """Check that the pieces tile the spec's (unpadded) page exactly."""
+        offset = 0
+        for piece_offset, size in self.pieces:
+            if piece_offset != offset or size <= 0:
+                raise ValueError(f"{self} does not tile its kernel page")
+            offset += size * self.kernel_page_rows
+        if (
+            spec.block_size % self.kernel_page_rows
+            or spec.block_size * self.bytes_per_row != spec.real_page_size_bytes
+        ):
+            raise ValueError(
+                f"{self} does not tile a page of {spec.block_size} rows and "
+                f"{spec.real_page_size_bytes} bytes"
+            )
+
+
 @dataclass(frozen=True, kw_only=True)
 class AttentionSpec(KVCacheSpec):
     dcp_sharded: bool = True

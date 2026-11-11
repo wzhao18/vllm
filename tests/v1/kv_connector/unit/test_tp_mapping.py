@@ -14,10 +14,16 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from vllm.distributed.kv_transfer.kv_connector.dcp_layout import DcpLayout
 from vllm.distributed.kv_transfer.kv_connector.utils import TransferTopology
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
+    DcpTransferMode,
     TPMapping,
     compute_tp_mapping,
+    select_dcp_transfer_mode,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
+    NixlPeerIncompatibleError,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
     NixlConnectorWorker,
@@ -350,3 +356,53 @@ def test_csa_linear_tp_layout_boundary(total_kv_heads, local_tp, remote_tp, comp
     else:
         with pytest.raises(ValueError, match="KV-head sharding boundary"):
             worker._validate_csa_linear_tp_layout(remote_tp)
+
+
+# ======================================================================
+# DCP transfer mode selection
+# ======================================================================
+
+
+@pytest.mark.parametrize(
+    ("local", "remote", "has_mamba"),
+    [
+        # No DCP on either side, whatever the blocks.
+        ((1, 1, 16), (1, 1, 64), False),
+        # Same DCP layout (homogeneous DCP, e.g. Kimi K3.1 DCP8 <-> DCP8).
+        ((8, 1, 1280), (8, 1, 1280), False),
+        ((8, 1, 1280), (8, 1, 1280), True),
+        ((4, 16, 64), (4, 16, 64), False),
+        # Block-interleaved pages of equal size over different DCP sizes.
+        ((1, 1, 16), (2, 16, 16), False),
+        ((4, 16, 16), (2, 16, 16), False),
+        ((2, 64, 64), (8, 64, 64), False),
+    ],
+)
+def test_dcp_transfer_mode_direct(local, remote, has_mamba):
+    mode = select_dcp_transfer_mode(
+        DcpLayout(*local), DcpLayout(*remote), has_mamba=has_mamba
+    )
+    assert mode is DcpTransferMode.DIRECT
+
+
+@pytest.mark.parametrize(
+    ("local", "remote", "has_mamba", "match"),
+    [
+        # Both shard, but rank turns differ: positions land on other ranks.
+        ((4, 1, 64), (4, 64, 64), False, "interleave"),
+        ((4, 1, 64), (2, 64, 64), False, "interleave"),
+        # DCP shards at the logical block, so blocks must match.
+        ((8, 1, 640), (8, 1, 1280), False, "logical block sizes"),
+        ((1, 1, 32), (4, 64, 64), False, "logical block sizes"),
+        # Different DCP sizes with token-level interleave (Kimi K3.1 P8 -> D16).
+        ((16, 1, 640), (8, 1, 640), False, "block-level"),
+        ((1, 1, 64), (2, 1, 64), False, "block-level"),
+        # Hybrid models keep their state per rank.
+        ((4, 64, 64), (2, 64, 64), True, "matching DCP sizes"),
+    ],
+)
+def test_dcp_transfer_mode_rejects(local, remote, has_mamba, match):
+    with pytest.raises(NixlPeerIncompatibleError, match=match):
+        select_dcp_transfer_mode(
+            DcpLayout(*local), DcpLayout(*remote), has_mamba=has_mamba
+        )
