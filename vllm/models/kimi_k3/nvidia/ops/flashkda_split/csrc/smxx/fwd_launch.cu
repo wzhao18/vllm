@@ -1,6 +1,7 @@
 // Kimi-K3: FlashKDA fwd_launch.cu @ vllm-project/FlashKDA 17a037d (MIT, see
 // LICENSE.FlashKDA), changed only to take `mode` (bit 0: run K1 prepare, bit 1:
-// run K2 recurrence) and to instantiate varlen int32 only.
+// run K2 recurrence) and to instantiate varlen int32 only. Kimi-K3: K2 picks
+// the narrowest one-wave V slicing (64, 32 or 16 columns) per launch shape.
 #include <type_traits>
 
 #include "fwd.h"
@@ -24,11 +25,9 @@ void launch_fwd(
   constexpr int kInputStages = 3;
   constexpr int kOutputStages = 2;
   constexpr int CHUNK = 16;
-  constexpr int VD = 64;
 
   using K1L = K1Layouts<D, CHUNK>;
   using K2L = K2Layouts<D, CHUNK>;
-  using K2VSplitL = K2Layouts<D, CHUNK, VD>;
   using WS = WorkspaceSizes<CHUNK, D>;
 
   // Raw bulk copies make the swizzled shared-memory layout a private ABI
@@ -49,10 +48,6 @@ void launch_fwd(
   using TMAVOLayout = typename K2L::TMAVOLayout;
   using TMAStateSmemLayout = typename K2L::TMAStateSmemLayout;
   using TMAFP32StateSmemLayout = typename K2L::TMAFP32StateSmemLayout;
-  using K2VSplitTMAVOLayout = typename K2VSplitL::TMAVOLayout;
-  using K2VSplitTMAStateSmemLayout = typename K2VSplitL::TMAStateSmemLayout;
-  using K2VSplitTMAFP32StateSmemLayout =
-      typename K2VSplitL::TMAFP32StateSmemLayout;
 
   // --- gmem layouts for original tensors
   auto gmem_layout =
@@ -173,60 +168,57 @@ void launch_fwd(
 #if BLOCK_LEVEL_K2 >= 0
   if (mode & 2) {
     // Full width: one math warpgroup plus one load/store warpgroup, for
-    // register reallocation. V-split: math warpgroup plus load/store warps.
+    // register reallocation. V-split: one math warp per 16 value columns
+    // (four for VD=64) plus load/store warps. The gated delta rule updates
+    // every value column of the state independently, and each math warp runs
+    // the same instruction sequence on its 16 columns whatever the slice
+    // width, so all slicings give bitwise-identical outputs and states.
     constexpr int kK2Threads = 128 + 128;
-    constexpr int kK2VSplitThreads = 32 * 2 + 128;
     dim3 block_k2(kK2Threads);
 
-    // V-split doubles the blocks per head. Use it while its grid fits in
-    // one wave.
-    const int vsplit_blocks = H * (D / VD) * N;
-    if (vsplit_blocks <= 2 * num_sms) {
-      // Keep the default path's host launch overhead unchanged: split
-      // TensorMaps are constructed only when this path may be used.
+    // Returns false when the VD slicing does not fit in one wave.
+    auto launch_vsplit = [&](auto vd_tag, int blocks_per_sm) -> bool {
+      constexpr int kVD = decltype(vd_tag)::value;
+      constexpr int kThreads = (kVD >= 64 ? 128 : (kVD / 16) * 32) + 2 * 32;
+      using L = K2Layouts<D, CHUNK, kVD>;
+      const int blocks = H * (D / kVD) * N;
+      if (blocks > blocks_per_sm * num_sms) return false;
       auto tma_load_v_vsplit =
-          make_tma_copy(SM90_TMA_LOAD{}, m_v, K2VSplitTMAVOLayout{});
+          make_tma_copy(SM90_TMA_LOAD{}, m_v, typename L::TMAVOLayout{});
       auto tma_store_out_vsplit =
-          make_tma_copy(SM90_TMA_STORE{}, m_out, K2VSplitTMAVOLayout{});
+          make_tma_copy(SM90_TMA_STORE{}, m_out, typename L::TMAVOLayout{});
       auto [tma_load_initial_state_vsplit, tma_store_final_state_vsplit] =
-          make_state_tma(K2VSplitTMAStateSmemLayout{},
-                         K2VSplitTMAFP32StateSmemLayout{});
-
-      using SharedStorageK2T =
-          SharedStorageK2<K2VSplitL, kInputStages, kOutputStages>;
+          make_state_tma(typename L::TMAStateSmemLayout{},
+                         typename L::TMAFP32StateSmemLayout{});
+      using SharedStorageK2T = SharedStorageK2<L, kInputStages, kOutputStages>;
       int smem_size_k2 = sizeof(SharedStorageK2T);
-      dim3 grid_k2(H * (D / VD), N);
-
+      dim3 grid_k2(H * (D / kVD), N);
       auto kernel2 = _flash_kda_fwd_recurrence<
           decltype(tma_load_v_vsplit), decltype(tma_load_beta2),
           decltype(tma_load_initial_state_vsplit),
           decltype(tma_store_final_state_vsplit),
           decltype(tma_store_out_vsplit), CHUNK, D, kInputStages, kOutputStages,
-          kK2VSplitThreads, HasStateIn, HasStateOut, StateFP32, HasCheckpoint,
-          IsVarlen, SeqlenT, VD>;
-
+          kThreads, HasStateIn, HasStateOut, StateFP32, HasCheckpoint,
+          IsVarlen, SeqlenT, kVD>;
       cudaFuncSetAttribute(kernel2, cudaFuncAttributeMaxDynamicSharedMemorySize,
                            smem_size_k2);
-      int blocks_per_sm = 1;
-      // On sm_10x a V-split grid at two blocks per SM is slower than full
-      // width.
-      cudaFuncAttributes attr;
-      if (vsplit_blocks > num_sms &&
-          cudaFuncGetAttributes(&attr, kernel2) == cudaSuccess &&
-          attr.binaryVersion / 10 != 10) {
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &blocks_per_sm, kernel2, kK2VSplitThreads, smem_size_k2);
-      }
-      if (vsplit_blocks <= blocks_per_sm * num_sms) {
-        kernel2<<<grid_k2, dim3(kK2VSplitThreads), smem_size_k2, stream>>>(
-            tma_load_v_vsplit, tma_load_beta2, tma_load_initial_state_vsplit,
-            tma_store_final_state_vsplit, tma_store_out_vsplit, out_ptr,
-            checkpoint_state_ptr, checkpoint_offsets_ptr, T_total, H, N,
-            cu_seqlens_ptr, total_tiles, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv,
-            ws_mqk);
-        return;
-      }
-    }
+      kernel2<<<grid_k2, dim3(kThreads), smem_size_k2, stream>>>(
+          tma_load_v_vsplit, tma_load_beta2, tma_load_initial_state_vsplit,
+          tma_store_final_state_vsplit, tma_store_out_vsplit, out_ptr,
+          checkpoint_state_ptr, checkpoint_offsets_ptr, T_total, H, N,
+          cu_seqlens_ptr, total_tiles, ws_kd, ws_qd, ws_kr, ws_gt, ws_inv,
+          ws_mqk);
+      return true;
+    };
+
+    // Narrowest slicing whose grid fits one block per SM: fewer math warps
+    // per CTA shorten the per-chunk critical path (measured on sm_107, H=12
+    // 1x5504: VD=64 181 us, VD=32 150 us, VD=16 141 us). Two blocks per SM
+    // are slower than the full width on sm_10x, so a grid that does not fit
+    // one wave falls back to the full-width kernel below.
+    if (launch_vsplit(std::integral_constant<int, 16>{}, 1)) return;
+    if (launch_vsplit(std::integral_constant<int, 32>{}, 1)) return;
+    if (launch_vsplit(std::integral_constant<int, 64>{}, 1)) return;
 
     using SharedStorageK2T = SharedStorageK2<K2L, kInputStages, kOutputStages>;
     int smem_size_k2 = sizeof(SharedStorageK2T);

@@ -430,13 +430,11 @@ def _flashkda_prefill(
     checkpoint_state: torch.Tensor | None = None,
     checkpoint_offsets: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    import vllm._flashkda_C  # noqa: F401
-
     # FlashKDA hardcodes dense Q/K/V/G strides. Beta may be row-strided because
     # FlashKDA materializes its transposed [H, T] layout internally.
     # TODO: Teach FlashKDA to consume beta in [T, H] layout directly instead
     # of transposing it to contiguous [H, T] storage internally.
-    torch.ops._flashkda_C.fwd(
+    args = (
         q.contiguous(),
         k.contiguous(),
         v.contiguous(),
@@ -454,6 +452,19 @@ def _flashkda_prefill(
         checkpoint_state,
         checkpoint_offsets.contiguous() if checkpoint_offsets is not None else None,
     )
+    if kda_segscan.narrow_vsplit_fits(
+        q.shape[2], cu_seqlens.shape[0] - 1, q.shape[-1], q.device
+    ):
+        # The in-tree FlashKDA build (ops/flashkda_split, shared with the
+        # segment-parallel path) splits the recurrence over 16-value-column
+        # slices when that grid fits one wave: bitwise-identical outputs,
+        # exact fp32 final state, 1.2-1.3x faster at the C256 TP8 shapes.
+        kda_segscan.load_extension()
+        torch.ops.k3_flashkda_split.fwd(*args, 3)
+    else:
+        import vllm._flashkda_C  # noqa: F401
+
+        torch.ops._flashkda_C.fwd(*args)
     return out, final_state
 
 

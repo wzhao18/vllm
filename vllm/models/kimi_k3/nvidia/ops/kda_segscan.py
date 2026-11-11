@@ -36,6 +36,7 @@ plain FlashKDA prefill (no segment buffers or extension build there).
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import os
 import threading
@@ -147,6 +148,20 @@ def load_extension() -> None:
             verbose=False,
         )
         _loaded = True
+
+
+@functools.cache
+def _num_sms(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def narrow_vsplit_fits(heads: int, sequences: int, head_dim: int, device) -> bool:
+    """Whether the K2 recurrence of this build runs its 16-column V split
+    (fwd_launch.cu: one block per (sequence, head, 16 value columns) in one
+    wave). The plain prefill uses this build only then; elsewhere it gains
+    nothing over the stock FlashKDA build (measured: H=24 5x3480 +4%)."""
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return heads * (head_dim // 16) * sequences <= _num_sms(index)
 
 
 def workspace_size(tokens: int, heads: int, sequences: int) -> int:

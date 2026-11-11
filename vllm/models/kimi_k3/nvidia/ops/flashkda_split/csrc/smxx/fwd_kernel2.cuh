@@ -262,8 +262,8 @@ __global__ void __launch_bounds__(NumThreads,
   using StateT = std::conditional_t<StateFP32, float, BF16>;
   auto* checkpoint_state_ptr = static_cast<StateT*>(checkpoint_state_raw);
   static_assert(D % VD == 0, "VD must divide D");
-  static_assert(VD == 64 || VD == D,
-                "K2 currently supports the original V tile or VD=64");
+  static_assert(VD == D || VD == 64 || VD == 32 || VD == 16,
+                "K2 supports the full V tile or a V slice of 64, 32 or 16");
   using Layouts = K2Layouts<D, CHUNK, VD>;
   using MMALayout = typename Layouts::MMALayout;
   using TransposedMMALayout = typename Layouts::TransposedMMALayout;
@@ -284,12 +284,18 @@ __global__ void __launch_bounds__(NumThreads,
       *reinterpret_cast<SharedStorageT*>(shared_mem);
 
   constexpr int kWarpSize = 32;
-  constexpr int kComputeThreads = 128;
+  // Each math warp owns 16-column value blocks of the [K, V] state. The full
+  // tile and the 64-column slice run four math warps; narrower slices run one
+  // warp per 16 columns, so every warp performs the identical per-block
+  // instruction sequence whatever the slice width.
+  constexpr int kComputeThreads = VD >= 64 ? 128 : (VD / 16) * kWarpSize;
   constexpr int kVSlices = D / VD;
   // The full-width fp32 state needs more than 168 registers, so that path
   // runs 256 threads and warpgroup 1 (load/store) hands registers to
   // warpgroup 0 (math) via setmaxnreg. The V-split path keeps 192.
-  constexpr bool kFullWidthThreads = NumThreads == 2 * kComputeThreads;
+  constexpr bool kFullWidthThreads = VD == D;
+  static_assert(!kFullWidthThreads || NumThreads == 2 * kComputeThreads,
+                "the full-width K2 runs two warpgroups");
   constexpr bool kRegRealloc = kFullWidthThreads && FLASHKDA_K2_REG_REALLOC;
   static_assert(
       kFullWidthThreads || NumThreads == kComputeThreads + 2 * kWarpSize,
