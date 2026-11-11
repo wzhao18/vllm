@@ -120,6 +120,7 @@ from vllm.models.kimi_k3.nvidia.mxfp8 import (
     takes_mxfp8_activation,
 )
 from vllm.models.kimi_k3.nvidia.ops import attn_res, mxfp8_act
+from vllm.models.kimi_k3.nvidia.ops import sp_all_gather as sp_ag
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import NestedTensors
 from vllm.platforms import current_platform
@@ -1413,7 +1414,7 @@ class KimiDecoderLayer(nn.Module):
 
         M = None
         if self.use_sequence_parallel:
-            hidden_states = sp_all_gather(hidden_states)
+            hidden_states = sp_ag.kimi_sp_all_gather(hidden_states)
             # Remove SP padding before attention.
             hidden_states = hidden_states[: positions.shape[0]]
             M = hidden_states.shape[0]
@@ -1486,6 +1487,13 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         self.run_gemm_rs_ar = maybe_init_gemm_rs_ar(
             vllm_config, self.use_sequence_parallel
         )
+        # The decoder layers' SP all-gather pushes into a symmetric-memory
+        # buffer of the largest stock step above the custom all-gather's size,
+        # if this instance runs one (ops/sp_all_gather.py).
+        if self.use_sequence_parallel:
+            sp_ag.init_sp_all_gather(
+                vllm_config, config.hidden_size, vllm_config.model_config.dtype
+            )
 
         if get_pp_group().is_first_rank or spec_decode_needs_target_embed(vllm_config):
             self.embed_tokens = VocabParallelEmbedding(
@@ -1695,6 +1703,8 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
 
         full_num_tokens = positions.shape[0]
         if self.use_sequence_parallel:
+            # One decoder-layer SP all-gather per layer: their buffer slots.
+            sp_ag.begin_forward(self.end_layer - self.start_layer)
             if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
                 forward_context = get_forward_context()
                 forward_context.is_padding = sp_padding_mask(
