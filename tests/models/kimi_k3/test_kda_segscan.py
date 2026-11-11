@@ -5,7 +5,10 @@
 The policy tests are host-only: the head-aware length threshold, the segment
 split, make_plan's go / no-go at the served shapes, and the narrow V-split
 dispatch with a mocked SM count. The GPU tests compare the segmented prefill
-and the narrow V-split launch against plain FlashKDA.
+and the narrow V-split launch against plain FlashKDA: the V-split launch is
+bitwise stock (outputs, final and checkpoint states, fp32 states rounded through
+bf16 as stock); the segmented prefill is bitwise on its first segment, and
+bitwise overall when the gate forgets the state within a segment.
 """
 
 import pytest
@@ -132,13 +135,26 @@ requires_split_build = pytest.mark.skipif(
 )
 
 
-def _inputs(lens: list[int], heads: int, state_dtype: torch.dtype, seed: int = 7):
+def _inputs(
+    lens: list[int],
+    heads: int,
+    state_dtype: torch.dtype,
+    seed: int = 7,
+    slow_decay: bool = False,
+):
+    """Random KDA inputs. ``slow_decay`` makes the gate ~1 (g = -60) with unit
+    q / k, so the initial state survives the whole sequence and its rounding at
+    the kernel boundary shows in the outputs and the final state."""
     torch.manual_seed(seed)
     T, H, D = sum(lens), heads, 128
     dev = "cuda"
     q, k, v, g = (
         torch.randn(1, T, H, D, dtype=torch.bfloat16, device=dev) for _ in range(4)
     )
+    if slow_decay:
+        q = torch.nn.functional.normalize(q.float(), dim=-1).to(torch.bfloat16)
+        k = torch.nn.functional.normalize(k.float(), dim=-1).to(torch.bfloat16)
+        g = torch.full_like(g, -60.0)
     return dict(
         q=q,
         k=k,
@@ -191,6 +207,39 @@ def _plain_flashkda(x: dict, checkpoint_offsets: torch.Tensor | None = None):
     return out, final, ckpt
 
 
+def _split_flashkda(
+    x: dict, mode: int, checkpoint_offsets: torch.Tensor | None = None
+):
+    """The in-tree split build (ops/flashkda_split), one K1 + K2 launch."""
+    kda_segscan.load_extension()
+    _, T, H, D = x["q"].shape
+    N = x["initial_state"].shape[0]
+    out = torch.empty_like(x["v"])
+    final = torch.empty_like(x["initial_state"])
+    ckpt = torch.empty_like(final) if checkpoint_offsets is not None else None
+    torch.ops.k3_flashkda_split.fwd(
+        x["q"].contiguous(),
+        x["k"].contiguous(),
+        x["v"].contiguous(),
+        x["g"].contiguous(),
+        x["beta"],
+        D**-0.5,
+        out,
+        _workspace(T, H, N),
+        x["A_log"].contiguous(),
+        x["dt_bias"].view(-1, D).contiguous(),
+        x["lower_bound"],
+        x["initial_state"].contiguous(),
+        final,
+        x["cu_seqlens"],
+        ckpt,
+        checkpoint_offsets,
+        mode,
+    )
+    torch.accelerator.synchronize()
+    return out, final, ckpt
+
+
 def _close(name: str, ref: torch.Tensor, got: torch.Tensor, tol: float) -> None:
     ref, got = ref.float(), got.float()
     err = (ref - got).abs().max().item()
@@ -199,18 +248,23 @@ def _close(name: str, ref: torch.Tensor, got: torch.Tensor, tol: float) -> None:
     assert err <= tol * max(scale, 1.0), f"{name}: max err {err} (scale {scale})"
 
 
+def _bf16_representable(state: torch.Tensor) -> bool:
+    return torch.equal(state.to(torch.bfloat16).to(state.dtype), state)
+
+
 @requires_split_build
+@pytest.mark.parametrize("slow_decay", [False, True], ids=["decay", "slow_decay"])
 @pytest.mark.parametrize(
     "state_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"]
 )
 @pytest.mark.parametrize("checkpoint", [None, 1024], ids=["no_ckpt", "ckpt1024"])
 @torch.inference_mode()
 def test_segmented_prefill_matches_flashkda(
-    state_dtype: torch.dtype, checkpoint: int | None
+    state_dtype: torch.dtype, checkpoint: int | None, slow_decay: bool
 ):
     # 3072 tokens at 2 heads segments by the shipped policy (8 pieces).
     lens, H = [3072], 2
-    x = _inputs(lens, H, state_dtype)
+    x = _inputs(lens, H, state_dtype, slow_decay=slow_decay)
     offs = [checkpoint] if checkpoint is not None else None
     plan = kda_segscan.make_plan(x["cu_seqlens"].cpu(), H, "cuda", offs)
     assert plan is not None and plan.num_pseudo == 8
@@ -244,53 +298,71 @@ def test_segmented_prefill_matches_flashkda(
     )
     torch.accelerator.synchronize()
 
-    tol = 0.01 if state_dtype == torch.float32 else 0.03
-    _close("out", ref_out, out, tol)
-    _close("final_state", ref_final, final, tol)
-    if ckpt is not None:
-        _close("checkpoint", ref_ckpt, ckpt, tol)
+    # Segment 0 runs FlashKDA's chunks from FlashKDA's (bf16-rounded) initial
+    # state: bitwise. States leave through bf16, as FlashKDA's.
+    seg0 = int(plan.cu[1])
+    torch.testing.assert_close(out[:, :seg0], ref_out[:, :seg0], rtol=0, atol=0)
+    assert _bf16_representable(final)
+    assert ckpt is None or _bf16_representable(ckpt)
+    if not slow_decay:
+        # The gate forgets each segment's initial state within the segment, so
+        # the scan's X_p reach nothing: bitwise FlashKDA.
+        torch.testing.assert_close(out, ref_out, rtol=0, atol=0)
+        assert torch.equal(final, ref_final)
+        if ckpt is not None:
+            assert torch.equal(ckpt, ref_ckpt)
+    else:
+        # The state survives every segment: later segments see the scan's
+        # bf16-operand rounding of the M_p / C_p partials instead of the true
+        # state's (kda_segscan docstring; measured max err 7e-3 x scale).
+        _close("out", ref_out, out, 0.02)
+        _close("final_state", ref_final, final, 0.02)
+        if ckpt is not None:
+            _close("checkpoint", ref_ckpt, ckpt, 0.02)
 
 
 @requires_split_build
+@pytest.mark.parametrize("slow_decay", [False, True], ids=["decay", "slow_decay"])
+@pytest.mark.parametrize("checkpoint", [False, True], ids=["no_ckpt", "ckpt"])
 @pytest.mark.parametrize(
     "state_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"]
 )
 @torch.inference_mode()
-def test_narrow_vsplit_matches_flashkda(state_dtype: torch.dtype):
+def test_narrow_vsplit_matches_flashkda(
+    state_dtype: torch.dtype, checkpoint: bool, slow_decay: bool
+):
     # Two sequences at 2 heads: 2 x 8 x 2 = 32 blocks, one wave anywhere.
     lens, H = [700, 333], 2
-    x = _inputs(lens, H, state_dtype, seed=3)
+    x = _inputs(lens, H, state_dtype, seed=3, slow_decay=slow_decay)
     assert kda_segscan.narrow_vsplit_fits(H, len(lens), 128, x["q"].device)
-    ref_out, ref_final, _ = _plain_flashkda(x)
-
-    kda_segscan.load_extension()
-    _, T, _, D = x["q"].shape
-    out = torch.empty_like(x["v"])
-    final = torch.empty_like(x["initial_state"])
-    torch.ops.k3_flashkda_split.fwd(
-        x["q"].contiguous(),
-        x["k"].contiguous(),
-        x["v"].contiguous(),
-        x["g"].contiguous(),
-        x["beta"],
-        D**-0.5,
-        out,
-        _workspace(T, H, len(lens)),
-        x["A_log"].contiguous(),
-        x["dt_bias"].view(-1, D).contiguous(),
-        x["lower_bound"],
-        x["initial_state"].contiguous(),
-        final,
-        x["cu_seqlens"],
-        None,
-        None,
-        3,
+    offs = (
+        torch.tensor([512, 208], dtype=torch.int32, device="cuda")
+        if checkpoint
+        else None
     )
-    torch.accelerator.synchronize()
-    # Same per-column arithmetic as the stock kernel: bitwise outputs; the final
-    # state is exact in fp32 (and rounds once to the served dtype).
+    ref_out, ref_final, ref_ckpt = _plain_flashkda(x, offs)
+    out, final, ckpt = _split_flashkda(x, 3, offs)
+    # Same per-column arithmetic as the stock kernel, and the same state I/O:
+    # an fp32 initial state is read through bf16 and the final / checkpoint
+    # states are written through bf16 (round to nearest even), so outputs and
+    # states are bitwise those of stock _flashkda_C.
     torch.testing.assert_close(out, ref_out, rtol=0, atol=0)
-    if state_dtype == torch.float32:
-        torch.testing.assert_close(final, ref_final, rtol=0, atol=0)
-    else:
-        _close("final_state", ref_final, final, 0.01)
+    assert torch.equal(final, ref_final)
+    if checkpoint:
+        assert torch.equal(ckpt, ref_ckpt)
+
+
+@requires_split_build
+@torch.inference_mode()
+def test_exact_state_mode_keeps_fp32():
+    # Mode bit 2 (segment partials only) moves the fp32 state across the
+    # kernel boundary exactly; the default mode rounds it through bf16. With
+    # the fast-decaying gate the initial state does not reach the final state,
+    # so the exact final state rounds to the stock one.
+    lens, H = [700, 333], 2
+    x = _inputs(lens, H, torch.float32, seed=3)
+    _, ref_final, _ = _plain_flashkda(x)
+    _, exact_final, _ = _split_flashkda(x, 3 | 4)
+    assert _bf16_representable(ref_final)
+    assert (exact_final.to(torch.bfloat16).float() != exact_final).float().mean() > 0.5
+    assert torch.equal(exact_final.to(torch.bfloat16).float(), ref_final)

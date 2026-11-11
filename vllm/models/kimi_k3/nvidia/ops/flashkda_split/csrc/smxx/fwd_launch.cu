@@ -1,7 +1,9 @@
 // Kimi-K3: FlashKDA fwd_launch.cu @ vllm-project/FlashKDA 17a037d (MIT, see
 // LICENSE.FlashKDA), changed only to take `mode` (bit 0: run K1 prepare, bit 1:
-// run K2 recurrence) and to instantiate varlen int32 only. Kimi-K3: K2 picks
-// the narrowest one-wave V slicing (64, 32 or 16 columns) per launch shape.
+// run K2 recurrence, bit 2: exact fp32 state I/O for the segment-parallel
+// prefill's partials, fwd_kernel2.cuh ExactState) and to instantiate varlen
+// int32 only. Kimi-K3: K2 picks the narrowest one-wave V slicing (64, 32 or 16
+// columns) per launch shape.
 #include <type_traits>
 
 #include "fwd.h"
@@ -176,9 +178,15 @@ void launch_fwd(
     constexpr int kK2Threads = 128 + 128;
     dim3 block_k2(kK2Threads);
 
+    // ExactState only changes fp32 state I/O; without bit 2 the fp32 state is
+    // staged through bf16 exactly as FlashKDA.
+    const bool exact_state = StateFP32 && (mode & 4);
+
     // Returns false when the VD slicing does not fit in one wave.
-    auto launch_vsplit = [&](auto vd_tag, int blocks_per_sm) -> bool {
+    auto launch_vsplit = [&](auto vd_tag, auto exact_tag,
+                             int blocks_per_sm) -> bool {
       constexpr int kVD = decltype(vd_tag)::value;
+      constexpr bool kExact = decltype(exact_tag)::value;
       constexpr int kThreads = (kVD >= 64 ? 128 : (kVD / 16) * 32) + 2 * 32;
       using L = K2Layouts<D, CHUNK, kVD>;
       const int blocks = H * (D / kVD) * N;
@@ -199,7 +207,7 @@ void launch_fwd(
           decltype(tma_store_final_state_vsplit),
           decltype(tma_store_out_vsplit), CHUNK, D, kInputStages, kOutputStages,
           kThreads, HasStateIn, HasStateOut, StateFP32, HasCheckpoint,
-          IsVarlen, SeqlenT, kVD>;
+          IsVarlen, SeqlenT, kVD, kExact>;
       cudaFuncSetAttribute(kernel2, cudaFuncAttributeMaxDynamicSharedMemorySize,
                            smem_size_k2);
       kernel2<<<grid_k2, dim3(kThreads), smem_size_k2, stream>>>(
@@ -216,32 +224,46 @@ void launch_fwd(
     // 1x5504: VD=64 181 us, VD=32 150 us, VD=16 141 us). Two blocks per SM
     // are slower than the full width on sm_10x, so a grid that does not fit
     // one wave falls back to the full-width kernel below.
-    if (launch_vsplit(std::integral_constant<int, 16>{}, 1)) return;
-    if (launch_vsplit(std::integral_constant<int, 32>{}, 1)) return;
-    if (launch_vsplit(std::integral_constant<int, 64>{}, 1)) return;
+    auto launch_k2 = [&](auto exact_tag) {
+      if (launch_vsplit(std::integral_constant<int, 16>{}, exact_tag, 1))
+        return;
+      if (launch_vsplit(std::integral_constant<int, 32>{}, exact_tag, 1))
+        return;
+      if (launch_vsplit(std::integral_constant<int, 64>{}, exact_tag, 1))
+        return;
 
-    using SharedStorageK2T = SharedStorageK2<K2L, kInputStages, kOutputStages>;
-    int smem_size_k2 = sizeof(SharedStorageK2T);
+      using SharedStorageK2T =
+          SharedStorageK2<K2L, kInputStages, kOutputStages>;
+      int smem_size_k2 = sizeof(SharedStorageK2T);
 
-    auto kernel2 = _flash_kda_fwd_recurrence<
-        decltype(tma_load_v), decltype(tma_load_beta2),
-        decltype(tma_load_initial_state), decltype(tma_store_final_state),
-        decltype(tma_store_out), CHUNK, D, kInputStages, kOutputStages,
-        kK2Threads, HasStateIn, HasStateOut, StateFP32, HasCheckpoint, IsVarlen,
-        SeqlenT>;
+      auto kernel2 = _flash_kda_fwd_recurrence<
+          decltype(tma_load_v), decltype(tma_load_beta2),
+          decltype(tma_load_initial_state), decltype(tma_store_final_state),
+          decltype(tma_store_out), CHUNK, D, kInputStages, kOutputStages,
+          kK2Threads, HasStateIn, HasStateOut, StateFP32, HasCheckpoint,
+          IsVarlen, SeqlenT, D, decltype(exact_tag)::value>;
 
-    cudaFuncSetAttribute(kernel2, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         smem_size_k2);
+      cudaFuncSetAttribute(kernel2,
+                           cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           smem_size_k2);
 
-    // K2 maps x to head so all heads of a sequence launch together.
-    // Varlen reverses y in-kernel to process vLLM's trailing prefills first.
-    dim3 grid_k2(H, N);
+      // K2 maps x to head so all heads of a sequence launch together.
+      // Varlen reverses y in-kernel to process vLLM's trailing prefills first.
+      dim3 grid_k2(H, N);
 
-    kernel2<<<grid_k2, block_k2, smem_size_k2, stream>>>(
-        tma_load_v, tma_load_beta2, tma_load_initial_state,
-        tma_store_final_state, tma_store_out, out_ptr, checkpoint_state_ptr,
-        checkpoint_offsets_ptr, T_total, H, N, cu_seqlens_ptr, total_tiles,
-        ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk);
+      kernel2<<<grid_k2, block_k2, smem_size_k2, stream>>>(
+          tma_load_v, tma_load_beta2, tma_load_initial_state,
+          tma_store_final_state, tma_store_out, out_ptr, checkpoint_state_ptr,
+          checkpoint_offsets_ptr, T_total, H, N, cu_seqlens_ptr, total_tiles,
+          ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk);
+    };
+    if constexpr (StateFP32) {
+      if (exact_state) {
+        launch_k2(std::true_type{});
+        return;
+      }
+    }
+    launch_k2(std::false_type{});
   }
 #endif
 }

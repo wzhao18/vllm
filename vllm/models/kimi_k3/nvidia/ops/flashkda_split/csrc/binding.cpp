@@ -2,7 +2,8 @@
 // FlashKDA csrc/torch_api.cpp @ vllm-project/FlashKDA 17a037d, MIT, see
 // LICENSE.FlashKDA). Namespace k3_flashkda_split; fwd takes `mode` (1 = K1
 // prepare only, 2 = K2 recurrence only on a workspace K1 already filled, 3 =
-// both, as FlashKDA).
+// both, as FlashKDA; + 4 = fp32 state crosses K2's boundary exactly instead of
+// rounding to bf16 as FlashKDA, for the segment-parallel prefill's partials).
 #include <Python.h>
 
 #include <torch/csrc/stable/library.h>

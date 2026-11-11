@@ -457,8 +457,9 @@ def _flashkda_prefill(
     ):
         # The in-tree FlashKDA build (ops/flashkda_split, shared with the
         # segment-parallel path) splits the recurrence over 16-value-column
-        # slices when that grid fits one wave: bitwise-identical outputs,
-        # exact fp32 final state, 1.2-1.3x faster at the C256 TP8 shapes.
+        # slices when that grid fits one wave: bitwise-identical outputs and
+        # states (an fp32 state crosses the kernel through bf16, as stock),
+        # 1.2-1.3x faster at the C256 TP8 shapes.
         kda_segscan.load_extension()
         torch.ops.k3_flashkda_split.fwd(*args, 3)
     else:

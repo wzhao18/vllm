@@ -1,12 +1,18 @@
 // Kimi-K3: FlashKDA csrc/smxx/fwd_kernel2.cuh @ vllm-project/FlashKDA
-// 17a037d98da5 (MIT, see LICENSE.FlashKDA). Changed only on the StateFP32 path:
-// FlashKDA staged the fp32 initial / final / checkpoint state through the bf16
-// state_acc tile (rounding it to bf16). Here the fp32 state crosses the kernel
+// 17a037d98da5 (MIT, see LICENSE.FlashKDA). FlashKDA stages the fp32 initial /
+// final / checkpoint state through the bf16 state_acc tile, so every fp32 state
+// that crosses its kernel boundary is round-to-nearest-even bf16 (the register
+// state in between is fp32). That staging is kept by default (ExactState =
+// false): the narrow V-split prefill (mode 3) reads and writes the cache state
+// bit-for-bit like stock _flashkda_C. Kimi-K3 adds ExactState
+// (StateFP32 only, `mode` bit 2), used only for the segment-parallel prefill's
+// internal fp32 partials (kda_segscan.py: segment transitions M_p, offsets C_p,
+// segment initial states X_p and the per-segment end states), which stock holds
+// in fp32 registers inside one launch: there the fp32 state crosses the kernel
 // boundary exactly, split bitwise into its high and low 16 bits in two
 // bf16-layout tiles (state_acc, state_lo) that reuse FlashKDA's own LDSM / STSM
-// state moves, so the register-resident main loop is unchanged. The
-// segment-parallel prefill (kda_segscan.py) passes segment transitions /
-// offsets / initial states as fp32 partials. The bf16-state path is unchanged.
+// state moves, so the register-resident main loop is unchanged. kda_segscan.py
+// rounds the states it hands back to the cache as stock does.
 #pragma once
 
 #include <type_traits>
@@ -89,7 +95,7 @@ struct SharedStorageK2 {
 
   alignas(
       128) cute::ArrayEngine<BF16, cute::cosize_v<StateSmemLayout>> state_acc;
-  // Kimi-K3: low 16 bits of the fp32 state (StateFP32 I/O), state_acc then
+  // Kimi-K3: low 16 bits of the fp32 state (ExactState I/O), state_acc then
   // holds the high 16 bits.
   alignas(
       128) cute::ArrayEngine<BF16, cute::cosize_v<StateSmemLayout>> state_lo;
@@ -243,7 +249,8 @@ template <class TmaLoadV, class TmaLoadBeta, class TmaLoadState,
           int InputStages, int OutputStages, int NumThreads,
           bool HasStateIn = true, bool HasStateOut = true,
           bool StateFP32 = false, bool HasCheckpoint = false,
-          bool IsVarlen = true, typename SeqlenT = int64_t, int VD = D>
+          bool IsVarlen = true, typename SeqlenT = int64_t, int VD = D,
+          bool ExactState = false>
 __global__ void __launch_bounds__(NumThreads,
                                   k2_min_blocks_per_sm<NumThreads>())
     _flash_kda_fwd_recurrence(
@@ -260,6 +267,8 @@ __global__ void __launch_bounds__(NumThreads,
         cutlass::bfloat16_t const* ws_inv, cutlass::bfloat16_t const* ws_mqk) {
   using BF16 = cutlass::bfloat16_t;
   using StateT = std::conditional_t<StateFP32, float, BF16>;
+  // Kimi-K3: fp32 state I/O without the bf16 staging (segment partials only).
+  constexpr bool kExactState = StateFP32 && ExactState;
   auto* checkpoint_state_ptr = static_cast<StateT*>(checkpoint_state_raw);
   static_assert(D % VD == 0, "VD must divide D");
   static_assert(VD == D || VD == 64 || VD == 32 || VD == 16,
@@ -449,11 +458,19 @@ __global__ void __launch_bounds__(NumThreads,
     __syncthreads();
     cutlass::arch::fence_view_async_shared();
 
-    // Kimi-K3: all threads split fp32 into its exact high / low 16 bits
-    smem_split_fp32<FP32StateSmemLayout, StateSmemLayout, VD, D, NumThreads>(
-        reinterpret_cast<float*>(shared_storage.state_fp32_buf),
-        shared_storage.state_acc.begin(), shared_storage.state_lo.begin(),
-        threadIdx.x);
+    if constexpr (kExactState) {
+      // Kimi-K3: all threads split fp32 into its exact high / low 16 bits
+      smem_split_fp32<FP32StateSmemLayout, StateSmemLayout, VD, D, NumThreads>(
+          reinterpret_cast<float*>(shared_storage.state_fp32_buf),
+          shared_storage.state_acc.begin(), shared_storage.state_lo.begin(),
+          threadIdx.x);
+    } else {
+      // All threads: convert fp32 -> bf16 (round to nearest even), as FlashKDA
+      smem_cvt_fp32_to_bf16<FP32StateSmemLayout, StateSmemLayout, VD, D,
+                            NumThreads>(
+          reinterpret_cast<float*>(shared_storage.state_fp32_buf),
+          shared_storage.state_acc.begin(), threadIdx.x);
+    }
     __syncthreads();
   } else {
     // No state in: zero-initialize state_acc
@@ -618,7 +635,7 @@ __global__ void __launch_bounds__(NumThreads,
         ResidentStateFragment state_bf16;
         copy(resident_load_c, resident_thr_load_c.partition_S(state_block),
              resident_thr_load_c.retile_D(state_bf16));
-        if constexpr (HasStateIn && StateFP32) {
+        if constexpr (HasStateIn && kExactState) {
           Tensor lo_block = local_tile(
               make_tensor(make_smem_ptr(shared_storage.state_lo.begin()),
                           TransposedStateSmemLayout{}),
@@ -717,11 +734,11 @@ __global__ void __launch_bounds__(NumThreads,
             make_tiled_copy_C(Copy_Atom<SM90_U16x8_STSM_T, BF16>{}, mma);
         auto smem_thr_store_C_T = smem_tiled_store_C_T.get_slice(lane_id);
 
-        // State spill to shared memory: bf16 (FlashKDA), or for StateFP32 the
+        // State spill to shared memory: bf16 (FlashKDA), or for ExactState the
         // exact high / low 16 bits into state_acc / state_lo (Kimi-K3).
         auto spill = [&](auto const& fragment, auto& s_block, int m_blk,
                          int v_blk) {
-          if constexpr (StateFP32) {
+          if constexpr (kExactState) {
             ResidentStateFragment hi_bits, lo_bits;
             split_state(fragment, hi_bits, lo_bits);
             copy(smem_tiled_store_C_T, smem_thr_store_C_T.retile_S(hi_bits),
@@ -1037,8 +1054,10 @@ __global__ void __launch_bounds__(NumThreads,
           }
         }
         // Kimi-K3: the StateFP32 final state is spilled after the tile loop
-        // (below), which keeps the exact hi / lo spill out of the main loop's
-        // register budget.
+        // (below), which keeps it out of the main loop's register budget
+        // (measured on sm_107, C256 2 x 8192 x 12 heads, VD=16: in-loop bf16
+        // spill 220 us, after the loop 211.5 us). The values are the same: the
+        // resident state after the last tile.
         if (kSpillAfterUpdate &&
             ((HasStateOut && !StateFP32 && t + 1 == t_tiles) ||
              export_checkpoint)) {
@@ -1065,7 +1084,7 @@ __global__ void __launch_bounds__(NumThreads,
                state_idx += kComputeThreads) {
             const int row = state_idx / D;
             const int col = state_idx % D;
-            if constexpr (StateFP32) {
+            if constexpr (kExactState) {
               Tensor s_lo =
                   make_tensor(make_smem_ptr(shared_storage.state_lo.begin()),
                               StateSmemLayout{});
@@ -1088,8 +1107,9 @@ __global__ void __launch_bounds__(NumThreads,
       ++out_write;
     }
     if constexpr (HasStateOut && StateFP32) {
-      // Kimi-K3: exact fp32 final state -> (state_acc, state_lo), after the
-      // loop.
+      // Kimi-K3: the fp32 final state -> state_acc after the loop, rounded to
+      // bf16 as FlashKDA's spill, or for ExactState its exact high / low 16
+      // bits -> (state_acc, state_lo).
       const int warp_id = compute_tid / 32;
       const int lane_id = compute_tid % 32;
       auto mma = make_tiled_mma(MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>{},
@@ -1105,15 +1125,23 @@ __global__ void __launch_bounds__(NumThreads,
       for (int m = 0; m < kResidentStateRowBlocks; ++m) {
 #pragma unroll
         for (int bi = 0; bi < kValueBlocksPerWarp; ++bi) {
-          ResidentStateFragment hi_bits, lo_bits;
-          split_state(resident_state[bi][m], hi_bits, lo_bits);
           auto coord = make_coord(m, warp_id * kValueBlocksPerWarp + bi);
           Tensor hb = local_tile(hi_T, make_shape(Int<16>{}, Int<16>{}), coord);
-          Tensor lb = local_tile(lo_T, make_shape(Int<16>{}, Int<16>{}), coord);
-          copy(store_C_T, thr_store_C_T.retile_S(hi_bits),
-               thr_store_C_T.partition_D(hb));
-          copy(store_C_T, thr_store_C_T.retile_S(lo_bits),
-               thr_store_C_T.partition_D(lb));
+          if constexpr (kExactState) {
+            ResidentStateFragment hi_bits, lo_bits;
+            split_state(resident_state[bi][m], hi_bits, lo_bits);
+            Tensor lb =
+                local_tile(lo_T, make_shape(Int<16>{}, Int<16>{}), coord);
+            copy(store_C_T, thr_store_C_T.retile_S(hi_bits),
+                 thr_store_C_T.partition_D(hb));
+            copy(store_C_T, thr_store_C_T.retile_S(lo_bits),
+                 thr_store_C_T.partition_D(lb));
+          } else {
+            auto state_bf16 =
+                narrow_state<ResidentStateFragment>(resident_state[bi][m]);
+            copy(store_C_T, thr_store_C_T.retile_S(state_bf16),
+                 thr_store_C_T.partition_D(hb));
+          }
         }
       }
     }
@@ -1191,9 +1219,18 @@ __global__ void __launch_bounds__(NumThreads,
 
     __syncthreads();  // all warps sync — pipeline smem now free
 
-    smem_join_fp32<StateSmemLayout, FP32StateSmemLayout, VD, D, NumThreads>(
-        shared_storage.state_acc.begin(), shared_storage.state_lo.begin(),
-        reinterpret_cast<float*>(shared_storage.state_fp32_buf), threadIdx.x);
+    if constexpr (kExactState) {
+      // Kimi-K3: exact fp32 from the high / low 16 bits
+      smem_join_fp32<StateSmemLayout, FP32StateSmemLayout, VD, D, NumThreads>(
+          shared_storage.state_acc.begin(), shared_storage.state_lo.begin(),
+          reinterpret_cast<float*>(shared_storage.state_fp32_buf), threadIdx.x);
+    } else {
+      // The bf16-rounded state, widened to fp32, as FlashKDA
+      smem_cvt_bf16_to_fp32<StateSmemLayout, FP32StateSmemLayout, VD, D,
+                            NumThreads>(
+          shared_storage.state_acc.begin(),
+          reinterpret_cast<float*>(shared_storage.state_fp32_buf), threadIdx.x);
+    }
     cutlass::arch::fence_view_async_shared();  // generic-proxy writes ->
                                                // visible to async proxy (TMA)
     __syncthreads();                           // conversion complete
