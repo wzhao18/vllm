@@ -20,8 +20,10 @@ Differences from DeepGEMM that the caller sees:
   weights up to :data:`RUBIN_MX_MAX_TOKENS_PER_RANK`, else an exact MXFP4 -> NVFP4
   conversion at load (:class:`NonRepresentableError` when a weight is not exactly
   representable; nothing is re-quantized).
-- One compiled bucket per server, sized to ``max_num_tokens`` (EP-uniform by
-  construction, which the kernel's lock-step contract needs).
+- One compiled bucket sized to ``max_num_tokens``, plus, on inference-kernel servers
+  whose capacity exceeds the token_comm decode-landing limit, one decode bucket at
+  that limit (:func:`rubin_bucket_capacities`); each forward runs the smallest bucket
+  holding its EP-uniform token count (:meth:`KimiK3MegaMoEExperts.select_bucket`).
 - The shared expert is never fused (the Rubin kernel has no shared-expert path).
 """
 
@@ -86,6 +88,37 @@ RUBIN_MX_MAX_TOKENS_PER_RANK = 512
 # 477.7 us.
 RUBIN_GENPHASE_MAX_TOKENS_PER_RANK = 1024
 
+# Decode bucket: the kernel's token_comm decode paths (S0 dynamic token_in claim, S1
+# decode landing) are traced in only when capacity x top_k <= this many routes
+# (token_comm ``decode_landing_max_routes`` / ``token_in_dynamic_claim_max_routes``;
+# a unit test keeps them equal). A server sized above it (decode: MNBT 8192 / TP 4 =
+# 2048 tokens/rank) also compiles a bucket at this limit (4096 / top-16 = 256 tokens
+# per rank) with the same kernel variant, quant kind and knob record as its main
+# bucket, so decode steps (52-128 tokens/rank at C512) run with both paths on and a
+# 256-row stager grid. Same math, bitwise-identical outputs. Measured on VR200 (EP16
+# per-rank shape on EP4: 56 local experts, top-16, NVFP4, CUDA graph, stage+kernel
+# p50) at 52 tokens/rank: 2048 bucket 130.0 us, 256 bucket 111.8 us. The genphase
+# kernel is not used for it (139.7-225.5 us at that shape).
+RUBIN_DECODE_BUCKET_MAX_ROUTES = 4096
+
+
+def rubin_bucket_capacities(
+    max_tokens_per_rank: int, top_k: int
+) -> tuple[int, ...]:
+    """Ascending token capacities per rank of a server's compiled buckets
+    (automatic, no flag): ``max_tokens_per_rank``, preceded by the decode bucket
+    (``RUBIN_DECODE_BUCKET_MAX_ROUTES // top_k``) on inference-kernel servers sized
+    above it."""
+    if top_k <= 0:
+        raise ValueError(f"top_k must be positive: {top_k}")
+    decode = RUBIN_DECODE_BUCKET_MAX_ROUTES // top_k
+    if (
+        rubin_kernel_variant(max_tokens_per_rank) == "inference"
+        and 0 < decode < max_tokens_per_rank
+    ):
+        return (decode, max_tokens_per_rank)
+    return (max_tokens_per_rank,)
+
 
 def rubin_quant_kind(max_tokens_per_rank: int) -> QuantKind:
     """Routed-expert precision of a server whose layer sees at most
@@ -120,6 +153,26 @@ def select_rubin_bucket(
         points=[(rubin_kernel_variant(max_tokens), max_tokens, None)],
     )
     return buckets[0], tuple(notes)
+
+
+def select_rubin_buckets(
+    problem: RubinMoeProblem, world_size: int, max_tokens: int
+) -> tuple[tuple[RubinBucket, ...], tuple[str, ...]]:
+    """Every compiled bucket of a server, ascending (:func:`rubin_bucket_capacities`):
+    the main bucket of :func:`select_rubin_bucket`, and below it the decode bucket,
+    which keeps the main bucket's variant and knob record (only the capacity
+    differs)."""
+    main, notes = select_rubin_bucket(problem, world_size, max_tokens)
+    buckets = [
+        RubinBucket(main.variant, cap, main.knobs)
+        for cap in rubin_bucket_capacities(max_tokens, problem.top_k)[:-1]
+    ]
+    extra = tuple(
+        f"[{b.variant} {b.max_tokens}] decode bucket, knobs of the "
+        f"{main.max_tokens} bucket"
+        for b in buckets
+    )
+    return (*buckets, main), notes + extra
 
 
 def check_kimi_k3_mega_moe_supported() -> None:
@@ -230,15 +283,17 @@ class KimiK3MegaMoEExperts(nn.Module):
             situ_linear_beta=float(activation.beta),
             quant_kind=self.quant_kind,
         )
-        self.bucket, notes = select_rubin_bucket(
+        self.buckets, notes = select_rubin_buckets(
             self.problem, ep_size, self.max_num_tokens
         )
+        self.bucket = self.buckets[-1]
+        self.dp_size = vllm_config.parallel_config.data_parallel_size
         if ep_rank == 0:
             logger.info_once(
-                "Rubin MegaMoE: %s %s bucket of %d tokens/rank at EP%d (%s).",
+                "Rubin MegaMoE: %s %s buckets of %s tokens/rank at EP%d (%s).",
                 self.quant_kind,
                 self.bucket.variant,
-                self.max_num_tokens,
+                tuple(b.max_tokens for b in self.buckets),  # info_once hashes args
                 ep_size,
                 "; ".join(notes),
             )
@@ -362,7 +417,7 @@ class KimiK3MegaMoEExperts(nn.Module):
 
     def get_runtime(self) -> RubinMegaMoE:
         """The EP group's shared :class:`RubinMegaMoE` for this layer's problem and
-        bucket (collective on first use: symmetric arena, compile objects)."""
+        buckets (collective on first use: symmetric arena, compile objects)."""
         from .runtime import RubinMegaMoE
 
         group = get_ep_group().device_group
@@ -370,11 +425,11 @@ class KimiK3MegaMoEExperts(nn.Module):
             id(group),
             torch.accelerator.current_device_index(),
             self.problem,
-            self.bucket,
+            self.buckets,
         )
         runtime = self._runtimes.get(key)
         if runtime is None:
-            runtime = RubinMegaMoE(self.problem, group, [self.bucket])
+            runtime = RubinMegaMoE(self.problem, group, list(self.buckets))
             self._runtimes[key] = runtime
         return runtime
 
@@ -462,6 +517,43 @@ class KimiK3MegaMoEExperts(nn.Module):
 
     # -- forward ----------------------------------------------------------------------
 
+    def select_bucket(self, num_tokens: int) -> RubinBucket:
+        """The bucket for a forward of ``num_tokens`` tokens on this rank.
+
+        The kernel's lock-step contract needs the same bucket on every EP rank. An EP
+        rank's token count is its DP rank's (DP-padded) batch, or its 1/TP shard of
+        it, the same on every TP rank of the DP group; so equal DP batch sizes make
+        ``num_tokens`` EP-uniform and the smallest bucket holding it is taken. With
+        unequal DP batch sizes (identical ``num_tokens_across_dp`` on every rank) all
+        ranks take the largest bucket. Raises when DP > 1 without DP metadata.
+        """
+        if num_tokens > self.max_num_tokens:
+            raise ValueError(
+                f"Rubin MegaMoE got {num_tokens} tokens, but its buckets were sized "
+                f"for {self.max_num_tokens}."
+            )
+        buckets = self.buckets
+        if len(buckets) == 1:
+            return buckets[0]
+        if self.dp_size > 1:
+            dp_metadata = (
+                get_forward_context().dp_metadata
+                if is_forward_context_available()
+                else None
+            )
+            if dp_metadata is None:
+                raise RuntimeError(
+                    f"{self.prefix}: Rubin MegaMoE at DP{self.dp_size} needs the "
+                    "forward context's DP metadata to pick an EP-uniform bucket."
+                )
+            counts = dp_metadata.num_tokens_across_dp_cpu
+            if int(counts.min()) != int(counts.max()):
+                return buckets[-1]
+        for b in buckets:
+            if num_tokens <= b.max_tokens:
+                return b
+        raise AssertionError("unreachable: the largest bucket holds max_num_tokens")
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -485,11 +577,8 @@ class KimiK3MegaMoEExperts(nn.Module):
                 "process_weights_after_loading (prepare_rubin_megamoe)."
             )
         num_tokens = hidden_states.shape[0]
-        if num_tokens > self.max_num_tokens:
-            raise ValueError(
-                f"Rubin MegaMoE got {num_tokens} tokens, but its bucket was sized for "
-                f"{self.max_num_tokens}."
-            )
+        # Static per captured CUDA graph size (shape-only + host DP metadata).
+        bucket = self.select_bucket(num_tokens)
         if (
             is_padding is None
             and envs.VLLM_MOE_SKIP_PADDING
@@ -523,7 +612,7 @@ class KimiK3MegaMoEExperts(nn.Module):
             )
 
         y = self.get_runtime().forward(
-            hidden_states, topk_ids, topk_weights, weights, bucket=self.bucket
+            hidden_states, topk_ids, topk_weights, weights, bucket=bucket
         )
         if shared_experts is not None:
             y += shared_experts(hidden_states)
