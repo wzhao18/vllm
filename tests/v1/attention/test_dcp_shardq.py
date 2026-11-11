@@ -389,13 +389,16 @@ def test_indexer_chunks_read_the_workspace_like_a_replicated_cache(
 
 
 def test_workspace_holds_a_max_model_len_request():
-    """DCP ShardQ has no capacity knob: the workspace fits one request of
-    ``max_model_len`` tokens, plus a page of rounding per request."""
+    """DCP ShardQ has no capacity knob: the workspace holds WORKSPACE_TOKENS
+    and at least one request of ``max_model_len`` tokens, plus a page of
+    rounding per request."""
     from vllm.v1.attention.ops.dcp_shardq import context as dcp
 
     config = SimpleNamespace(model_config=SimpleNamespace(max_model_len=131072))
-    assert dcp.workspace_max_tokens(config) == 131072
-    assert dcp.capacity_pages(dcp.workspace_max_tokens(config), 8) == 2048 + 8
+    assert dcp.workspace_max_tokens(config) == dcp.WORKSPACE_TOKENS == 2 << 20
+    assert dcp.capacity_pages(dcp.workspace_max_tokens(config), 8) == 32768 + 8
+    config.model_config.max_model_len = 4 << 20
+    assert dcp.workspace_max_tokens(config) == 4 << 20
 
 
 def test_stats_report_paths_since_last_report():

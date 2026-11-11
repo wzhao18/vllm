@@ -123,10 +123,14 @@ class ContextLayout:
 
 
 # Context tokens the workspace holds (at least max_model_len: it always
-# holds one whole request). A step whose prefill rows' context exceeds it runs in
-# request groups that each fit (DcpShardQContext.groups), so this only sets
-# how many rows share one gather: a memory / gather-amortization trade-off.
-WORKSPACE_TOKENS = 0
+# holds one whole request). A step whose prefill rows' context exceeds it runs
+# in request groups that each fit (DcpShardQContext.groups), so this only sets
+# how many rows share one gather. Measured on VR200 (DCP4 K3.1 DSA layer,
+# fp8 KV): steps that fit take the same time at 1M, 2.2M or 4.4M tokens; a
+# 16-row step of 2.1M context takes 8.66 ms per layer in one group vs 9.45 ms
+# in two. 2M tokens (~1.4 GiB per GPU with fp8 KV) holds a full 32K-token step
+# of ~130K-context rows in one group.
+WORKSPACE_TOKENS = 2 << 20
 
 
 def workspace_max_tokens(vllm_config: "VllmConfig") -> int:
