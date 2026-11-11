@@ -58,3 +58,15 @@ def test_capability_fallback_reported(monkeypatch):
         gemm_rs_ar, "maybe_init_gemm_rs_ar", lambda c, *, N, all_reduce: False
     )
     assert not model.maybe_init_gemm_rs_ar(_config(), use_sequence_parallel=True)
+
+
+@pytest.mark.parametrize("bound", [False, True])
+def test_dsa_binding_skips_specialized_decode(monkeypatch, bound):
+    """The DSA o_proj takes the fused GEMM-RS/AR only without the specialized
+    decode: the C256 decode role (TP16 non-SP, latency_specialized) keeps its
+    stock GEMM + all-reduce DSA o_proj."""
+    monkeypatch.setattr(model, "specialized_decode_config", lambda c: None)
+    assert model.dsa_runs_gemm_rs_ar(_config(), bound) is bound
+    decode = SimpleNamespace(sequence_parallel=False)
+    monkeypatch.setattr(model, "specialized_decode_config", lambda c: decode)
+    assert model.dsa_runs_gemm_rs_ar(_config(), bound) is False

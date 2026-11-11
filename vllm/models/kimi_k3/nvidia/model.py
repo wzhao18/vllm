@@ -261,7 +261,8 @@ def maybe_init_gemm_rs_ar(vllm_config: VllmConfig, use_sequence_parallel: bool) 
     Both modes are on by policy (no switch): the fused kernel computes the same
     BF16 GEMM and reduction (summation order over the TP ranks may differ, as for
     the stock NCCL collectives). GEMM-RS replaced the separate GEMM + NCCL ring
-    reduce-scatter on the TP4 SP prefill step at 8-17K tokens (-3.3% step).
+    reduce-scatter on the 40-layer TP4 SP prefill step: -4.4% at 17.4K tokens,
+    -3.5% at 8.2K tokens.
 
     The one exception is the SP topology of the specialized decode: its stock
     (eager / piecewise) steps keep the unfused reduce-scatter o_proj its SP step
@@ -280,6 +281,14 @@ def maybe_init_gemm_rs_ar(vllm_config: VllmConfig, use_sequence_parallel: bool) 
     return maybe_init_shared_gemm_rs_ar(
         vllm_config, N=config.hidden_size, all_reduce=all_reduce
     )
+
+
+def dsa_runs_gemm_rs_ar(vllm_config: VllmConfig, run_gemm_rs_ar: bool) -> bool:
+    """Whether the DSA o_proj binds the fused GEMM-RS/AR (prefill and stock
+    serving). A specialized-decode deployment keeps the DSA o_proj unfused: its
+    DSA layers reproduce the stock GEMM + all-reduce o_proj (TP16 non-SP C256
+    decode), so the binding must not change that role's math or timing."""
+    return run_gemm_rs_ar and specialized_decode_config(vllm_config) is None
 
 
 def _gemm_ar_owns(t: torch.Tensor) -> bool:
@@ -1207,7 +1216,7 @@ class KimiDecoderLayer(nn.Module):
                     prefix=f"{prefix}.self_attn",
                     topk_indices_buffer=topk_indices_buffer,
                     aux_stream=aux_stream,
-                    run_gemm_rs_ar=run_gemm_rs_ar,
+                    run_gemm_rs_ar=dsa_runs_gemm_rs_ar(vllm_config, run_gemm_rs_ar),
                 )
             # q_lora_rank may be None (Kimi-Linear): the MLA layer then uses an
             # uncompressed q_proj instead of the fused q-LoRA front-end.

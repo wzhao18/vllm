@@ -830,7 +830,7 @@ class KimiK3DSAAttention(nn.Module):
             self._mxfp8_acts = (
                 isinstance(self._packed[0], PackedMxfp8Linear)
                 and takes_mxfp8_activation(self.g_proj),
-                self.gemm_rs_ar is None and takes_mxfp8_activation(self.o_proj),
+                takes_mxfp8_activation(self.o_proj),
             )
         shared_input, fused_gate = self._mxfp8_acts
         x = mxfp8_act.quantize(hidden_states) if shared_input else hidden_states
@@ -849,12 +849,17 @@ class KimiK3DSAAttention(nn.Module):
         else:
             attn_out = self._fused_attention(hidden_states, x)
             gate = self.g_proj(x)[0]
-        if fused_gate:
+        # The fused GEMM-RS/AR takes a BF16 input: the MXFP8 fused gate only feeds
+        # an o_proj call that runs unfused (per call, as GEMM-RS/AR's should_run).
+        if fused_gate and not self._fused_o_proj(attn_out):
             return self.o_proj(mxfp8_act.gate_sigmoid_mul_quantize(attn_out, gate))[0]
         return self._o_proj(_gate_sigmoid_mul(attn_out, gate))
 
+    def _fused_o_proj(self, attn_out: torch.Tensor) -> bool:
+        return self.gemm_rs_ar is not None and self.gemm_rs_ar.should_run(attn_out)
+
     def _o_proj(self, attn_out: torch.Tensor) -> torch.Tensor:
-        if self.gemm_rs_ar is not None and self.gemm_rs_ar.should_run(attn_out):
+        if self._fused_o_proj(attn_out):
             # GEMM-RS returns this rank's sequence shard; GEMM-AR hands back the
             # workspace view (bitwise; no copy), which the decoder layer consumes
             # before the next GEMM-AR and copies only where it keeps it (AttnRes
