@@ -414,13 +414,14 @@ def test_stats_report_paths_since_last_report():
     assert stats.report() == (
         "DCP ShardQ prefill: 2/4 steps, 24384/39984 tokens (61.0%; 61.0% since "
         "start) on ShardQ; DCP path: dense MHA 1 steps / 600 tokens, "
-        "workspace full 1 steps / 15000 tokens"
+        "workspace full 1 steps / 15000 tokens; grouped steps 0 (0 groups)"
     )
     stats.recent.clear()
     stats.record(dcp.FEW_TOKENS, 900)
     assert stats.report() == (
         "DCP ShardQ prefill: 0/1 steps, 0/900 tokens (0.0%; 59.6% since start) "
-        "on ShardQ; DCP path: few tokens 1 steps / 900 tokens"
+        "on ShardQ; DCP path: few tokens 1 steps / 900 tokens; "
+        "grouped steps 0 (0 groups)"
     )
 
 
@@ -1270,7 +1271,23 @@ def _layer_worker(rank, world, init_file, cache_dtype, kernel, index_format="fp8
                     topk_buffer[num_decode_tokens:num_rows], local_topk
                 ), name
                 assert torch.equal(topk_buffer[:num_decode_tokens], decode_topk), name
-                assert torch.equal(forward(grouped_metadata), out), name
+                grouped_out = forward(grouped_metadata)
+                # Each group's slice runs the MQA kernel on fewer rows, whose
+                # split heuristics may reorder the sum: equal up to rounding.
+                err = (grouped_out.float() - out.float()).norm() / out.float().norm()
+                # Requests in a group with a long row are bitwise equal.
+                qs = np.r_[0, np.cumsum([n for _, n in lens])]
+                for lo, hi in grouped_context.groups:
+                    first = num_decodes + lo
+                    rows = slice(int(qs[first]), int(qs[num_decodes + hi]))
+                    if max(n for _, n in lens[first : num_decodes + hi]) >= 500:
+                        assert torch.equal(grouped_out[rows], out[rows]), name
+                grouped_for_ref = grouped_out.clone()
+                # A group's requests attend exactly as before (bitwise on the
+                # steps measured) or, in a group of a few short rows, through
+                # the MQA kernel's small-batch configuration: within the
+                # E4M3-softmax rounding that separates the paths below.
+                assert err < 3e-2, (name, err)
                 # Restore the single-group workspace for the checks below.
                 score(metadata, index_metadata)
                 forward(metadata)
@@ -1288,7 +1305,11 @@ def _layer_worker(rank, world, init_file, cache_dtype, kernel, index_format="fp8
                 # (test_flashinfer_mla_sparse_prims_ts), and they differ by
                 # about 2.1e-2.
                 err = (out.float() - expected.float()).norm() / expected.float().norm()
+                g_err = (
+                    grouped_for_ref.float() - expected.float()
+                ).norm() / expected.float().norm()
                 assert err < 3e-2, (name, err)
+                assert g_err < 3e-2, (name, g_err)
 
             # The next layer's gather waits for every rank to finish reading
             # this one: rank 0 lags, and its copy must still hold this layer.
