@@ -1,6 +1,6 @@
 // Kimi-K3: FlashKDA csrc/flash_kda.h @ vllm-project/FlashKDA 17a037d98da5 (MIT,
 // see LICENSE.FlashKDA), with a `mode` argument (bit 0: K1 prepare, bit 1: K2
-// recurrence).
+// recurrence, bit 2: exact fp32 state I/O for segment partials).
 #pragma once
 
 #include <optional>

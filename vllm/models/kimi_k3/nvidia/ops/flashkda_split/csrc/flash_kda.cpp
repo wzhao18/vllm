@@ -1,6 +1,8 @@
 // Kimi-K3: FlashKDA flash_kda.cpp @ vllm-project/FlashKDA 17a037d (MIT, see
 // LICENSE.FlashKDA), changed only to pass `mode` (bit 0: K1 prepare, bit 1: K2
-// recurrence) and to dispatch varlen int32 only.
+// recurrence, bit 2: exact fp32 state I/O for the segment-parallel prefill's
+// partials; without it fp32 states round to bf16 at the kernel boundary exactly
+// as FlashKDA) and to dispatch varlen int32 only.
 #include <torch/csrc/inductor/aoti_torch/c/shim.h>
 #include <torch/csrc/stable/ops.h>
 #include <torch/csrc/stable/tensor_inl.h>
@@ -37,6 +39,8 @@ void fwd(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
          std::optional<Tensor> final_state, std::optional<Tensor> cu_seqlens,
          std::optional<Tensor> checkpoint_state,
          std::optional<Tensor> checkpoint_offsets, int64_t mode) {
+  STD_TORCH_CHECK((mode & ~int64_t(7)) == 0 && (mode & 3) != 0,
+                  "mode: bit 0 K1, bit 1 K2, bit 2 exact fp32 state I/O");
   STD_TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && g.is_cuda() &&
                       beta.is_cuda() && out.is_cuda() && workspace.is_cuda(),
                   "all tensors must be on CUDA");

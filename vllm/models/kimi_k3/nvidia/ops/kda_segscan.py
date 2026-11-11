@@ -19,11 +19,28 @@ tiles are unchanged) that run as pseudo-sequences of one varlen launch:
   B   a per-sequence fp32 scan X_{p+1} = X_p @ M_p + C_p from the real initial state;
   C   K2 from X_p over every segment -> outputs, final state, checkpoint.
 
-All states between phases are fp32: the split build's StateFP32 path reads and
-writes the fp32 register state directly (FlashKDA staged it through bf16), so
-M_p, C_p and X_p are fp32 partials. The served state dtype is restored at the
-end. It is the same arithmetic per chunk as one long K2
-call, reassociated at segment boundaries (fp32). M_p is a product of contractions
+All states between phases are fp32: phases A and C run the split build's
+exact-state mode (``_EXACT_STATE``), which reads and writes the fp32 register
+state directly, so M_p, C_p, X_p and the segment end states are fp32 partials,
+as one FlashKDA launch keeps its state in fp32 registers. At the boundaries
+FlashKDA crosses, the rounding is FlashKDA's: its K2 stages an fp32 initial,
+final or checkpoint state through bf16 (round to nearest even), so the scan
+starts from the bf16-rounded initial state and every state handed back (final,
+checkpoint) is rounded to bf16 before it is stored in the served dtype.
+
+Against one FlashKDA launch: the chunks of segment 0 are bitwise the same (same
+K1 tiles, same K2 arithmetic, same bf16-rounded initial state). Later segments
+start from X_p = X_{p-1} M_{p-1} + C_{p-1} instead of the chunk-by-chunk
+recurrence, and this is not only a change of fp32 summation order: K2 is affine
+in the state only up to its bf16 operand roundings (the state enters the k.S
+and q.S MMAs as bf16, and each chunk's U is rounded to bf16), and the
+decomposition applies those roundings to the partial states of M_p and C_p
+rather than to the true state. So after segment 0, states and outputs differ
+from one launch at the bf16 rounding level wherever the state survives a
+segment (measured, 3072 tokens in 8 segments with a gate of ~1: relative rms
+~5e-3 in outputs, final and checkpoint states, at most ~10 bf16 ulps on
+elements above a tenth of the maximum); where the gate forgets the state within
+a segment, the result is bitwise FlashKDA's. M_p is a product of contractions
 (singular values < 1), so boundary rounding is damped, not amplified.
 
 The K1 / K2 split is FlashKDA itself with a `mode` argument
@@ -76,6 +93,8 @@ _MAX_PSEUDO = 8
 _MIN_SEG = 256
 _CHUNK = 16
 _D = 128
+# K2 only (mode bit 1) with exact fp32 state I/O (bit 2): the segment partials.
+_EXACT_STATE = 2 | 4
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flashkda_split")
 
 
@@ -401,7 +420,10 @@ def _chain_scan_kernel(
     rn = tl.arange(0, D)
     hdd = H * D * D
     row = h * D * D + rv[:, None] * D
-    x0 = tl.load(init_ptr + s.to(tl.int64) * hdd + row + rn[None, :]).to(tl.float32)
+    # FlashKDA loads an fp32 initial state through bf16 (round to nearest even);
+    # a bf16 initial state passes unchanged.
+    x0 = tl.load(init_ptr + s.to(tl.int64) * hdd + row + rn[None, :])
+    x0 = x0.to(tl.bfloat16).to(tl.float32)
     tl.store(x_ptr + first * hdd + row + rn[None, :], x0)
     for j in range(cnt - 1):
         tl.debug_barrier()
@@ -518,7 +540,7 @@ def segmented_prefill(
         plan.cu,
         None,
         None,
-        2,
+        _EXACT_STATE,
     )
     op(
         q,
@@ -537,7 +559,7 @@ def segmented_prefill(
         plan.cu,
         None,
         None,
-        2,
+        _EXACT_STATE,
     )
     # B: each sequence's segment initial states, fp32
     chain_scan(initial_state.contiguous(), M, C, X, plan)
@@ -560,9 +582,10 @@ def segmented_prefill(
         plan.cu,
         K if kernel_ckpt else None,
         plan.kernel_ckpt_offsets if kernel_ckpt else None,
-        2,
+        _EXACT_STATE,
     )
-    final_state.copy_(F.index_select(0, plan.last))
+    # Hand states back rounded as FlashKDA stores them: fp32 through bf16.
+    final_state.copy_(F.index_select(0, plan.last).to(torch.bfloat16))
     if checkpoint_state is not None:
         for src, rows in (
             (X, plan.ck_x),
@@ -571,6 +594,10 @@ def segmented_prefill(
         ):
             if src is not None and rows is not None:
                 checkpoint_state.index_copy_(
-                    0, rows[0], src.index_select(0, rows[1]).to(checkpoint_state.dtype)
+                    0,
+                    rows[0],
+                    src.index_select(0, rows[1])
+                    .to(torch.bfloat16)
+                    .to(checkpoint_state.dtype),
                 )
     return out
