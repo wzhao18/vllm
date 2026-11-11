@@ -482,6 +482,7 @@ class KimiK3DSAAttention(nn.Module):
         reduce_results: bool = True,
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream: torch.cuda.Stream | None = None,
+        run_gemm_rs_ar: bool = False,
     ) -> None:
         super().__init__()
         if config.dsa_config is None:
@@ -562,6 +563,19 @@ class KimiK3DSAAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
+        # The fused GEMM-RS/AR o_proj (as the dense Kimi-K3 MLA and KDA layers),
+        # when the model initialized it for this worker.
+        self.gemm_rs_ar = None
+        if run_gemm_rs_ar:
+            from vllm.model_executor.kernels.linear.cute_dsl.gemm_rs_ar import (
+                get_gemm_rs_ar,
+            )
+
+            gemm_rs_ar = get_gemm_rs_ar()
+            if gemm_rs_ar.can_run(self.o_proj):
+                self.gemm_rs_ar = gemm_rs_ar
+            else:
+                gemm_rs_ar.warn_incompatible_projection()
 
         # Full-attention layers are NoPE; the rope path below only runs for
         # checkpoints whose MLA uses positional encoding (GPT-J interleaved
@@ -804,7 +818,11 @@ class KimiK3DSAAttention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         if self._packed is None:
-            return self.mla_attn(positions, hidden_states)
+            if self.gemm_rs_ar is None:
+                return self.mla_attn(positions, hidden_states)
+            return self._o_proj(
+                self.mla_attn(positions, hidden_states, skip_o_proj=True)
+            )
         # Online MXFP8: the packed input projection and g_proj share one
         # quantization of the layer input, and the output gate writes o_proj's
         # MXFP8 input (mxfp8_act).
@@ -812,7 +830,7 @@ class KimiK3DSAAttention(nn.Module):
             self._mxfp8_acts = (
                 isinstance(self._packed[0], PackedMxfp8Linear)
                 and takes_mxfp8_activation(self.g_proj),
-                takes_mxfp8_activation(self.o_proj),
+                self.gemm_rs_ar is None and takes_mxfp8_activation(self.o_proj),
             )
         shared_input, fused_gate = self._mxfp8_acts
         x = mxfp8_act.quantize(hidden_states) if shared_input else hidden_states
@@ -833,7 +851,16 @@ class KimiK3DSAAttention(nn.Module):
             gate = self.g_proj(x)[0]
         if fused_gate:
             return self.o_proj(mxfp8_act.gate_sigmoid_mul_quantize(attn_out, gate))[0]
-        return self.o_proj(_gate_sigmoid_mul(attn_out, gate))[0]
+        return self._o_proj(_gate_sigmoid_mul(attn_out, gate))
+
+    def _o_proj(self, attn_out: torch.Tensor) -> torch.Tensor:
+        if self.gemm_rs_ar is not None and self.gemm_rs_ar.should_run(attn_out):
+            # GEMM-RS returns this rank's sequence shard; GEMM-AR hands back the
+            # workspace view (bitwise; no copy), which the decoder layer consumes
+            # before the next GEMM-AR and copies only where it keeps it (AttnRes
+            # block-write layers), as for the MLA and KDA o_proj.
+            return self.gemm_rs_ar.apply(attn_out, self.o_proj, copy_out=False)
+        return self.o_proj(attn_out)[0]
 
     def _fused_attention(
         self,
