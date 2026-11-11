@@ -49,14 +49,23 @@ VENDORED = ROOT / "megamoe_rubin" / "src"
 
 def test_no_env_switches():
     reads = {}
+    scanned = 0
     for path in sorted(ROOT.rglob("*")):
         if path.suffix not in (".py", ".cu", ".cuh", ".h", ".cpp"):
             continue
         if path.is_relative_to(VENDORED):
             continue
-        for match in READ.finditer(path.read_text()):
+        # macOS AppleDouble metadata ("._x.py" next to x.py on copied trees) is not
+        # source; any other file is scanned even when not valid UTF-8 (the patterns
+        # are ASCII), so one stray byte cannot turn the lint off.
+        if path.name.startswith("._") or not path.is_file():
+            continue
+        scanned += 1
+        text = path.read_bytes().decode("utf-8", errors="replace")
+        for match in READ.finditer(text):
             name = next(g for g in match.groups() if g)
             reads.setdefault(name, set()).add(str(path.relative_to(ROOT)))
+    assert scanned > 100, f"only {scanned} sources under {ROOT}"
     switches = {k: sorted(v) for k, v in reads.items() if k not in ALLOWED}
     assert not switches, switches
 

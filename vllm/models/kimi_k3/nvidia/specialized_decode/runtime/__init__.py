@@ -271,11 +271,11 @@ def sp_unsupported(vllm_config) -> str | None:
     """Why the SP topology (``sp_topology``) is not C512's decode role, the one the
     SP specialized decode covers: Rubin, K3.1 DSA layers on a per-tensor FP8 KV cache
     under FlashInfer sparse's trtllm-gen kernel, a BF16 conv / FP32 recurrent KDA
-    state, DSpark q4, at most 512 verify rows, the stock (unfused) reduce-scatter
-    o_proj and DCP = TP."""
+    state, DSpark q4, at most 512 verify rows and DCP = TP. (The stock unfused
+    reduce-scatter o_proj it also needs is a model policy, checked per layer at
+    build: ``sp_attention.sp_layer``.)"""
     import torch
 
-    from vllm import envs
     from vllm.platforms import current_platform
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -318,10 +318,6 @@ def sp_unsupported(vllm_config) -> str | None:
         (
             vllm_config.scheduler_config.max_num_seqs * q > SP_MAX_ROWS,
             f"more than {SP_MAX_ROWS} verify rows (max_num_seqs x q)",
-        ),
-        (
-            envs.VLLM_ENABLE_GEMM_RS,
-            "the fused GEMM + reduce-scatter o_proj (VLLM_ENABLE_GEMM_RS)",
         ),
         (
             parallel.decode_context_parallel_size != parallel.tensor_parallel_size,

@@ -91,6 +91,10 @@ def sp_layer(decoder, step):
         raise Unsupported("sp_step", None, f"{where}: not a sequence-parallel layer")
     if attention.o_proj.reduce_results:
         raise Unsupported("oproj_rs", None, f"{where}: a reducing stock o_proj")
+    if getattr(attention, "gemm_rs_ar", None) is not None:
+        raise Unsupported(
+            "oproj_rs", None, f"{where}: a fused GEMM + reduce-scatter stock o_proj"
+        )
     if not decoder.is_moe_layer:
         return
     mlp = decoder.mlp

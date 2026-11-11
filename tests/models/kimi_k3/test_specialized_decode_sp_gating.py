@@ -132,8 +132,7 @@ def rubin(monkeypatch):
     from vllm.v1.attention.backends.mla import flashinfer_mla_sparse
 
     monkeypatch.setattr(flashinfer_mla_sparse, "use_prims_ts", lambda c, d: False)
-    for name in ("VLLM_ENABLE_GEMM_RS", "VLLM_KIMI_K3_AUX_ATTN_RES_STREAM"):
-        monkeypatch.setattr(envs, name, False, raising=False)
+    monkeypatch.setattr(envs, "VLLM_KIMI_K3_AUX_ATTN_RES_STREAM", False, raising=False)
 
 
 def test_c512_is_the_sp_topology():
@@ -253,9 +252,28 @@ def test_sp_refuses_auto_prims_ts(monkeypatch):
     assert "prims_ts" in unsupported(deployment())
 
 
-def test_sp_refuses_gemm_rs(monkeypatch):
-    monkeypatch.setattr(envs, "VLLM_ENABLE_GEMM_RS", True)
-    assert "VLLM_ENABLE_GEMM_RS" in unsupported(deployment())
+def test_sp_layer_refuses_fused_gemm_rs_oproj():
+    """The SP step reproduces the stock unfused o_proj + reduce-scatter: a layer whose
+    o_proj the model bound to the fused GEMM-RS raises at build (no env check)."""
+    pytest.importorskip("cutlass")
+    from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.sp_attention import (
+        sp_layer,
+    )
+
+    attention = SimpleNamespace(
+        in_proj_qkvgfab=None,  # a KDA layer
+        o_proj=SimpleNamespace(reduce_results=False),
+        gemm_rs_ar=None,
+    )
+    decoder = SimpleNamespace(
+        layer_idx=3, self_attn=attention, use_sequence_parallel=True,
+        is_moe_layer=False,
+    )  # fmt: skip
+    step = SimpleNamespace(shard_cap=128, rows=(512,), q=4)
+    sp_layer(decoder, step)
+    attention.gemm_rs_ar = object()
+    with pytest.raises(Unsupported, match="GEMM \\+ reduce-scatter"):
+        sp_layer(decoder, step)
 
 
 def test_sp_refuses_off_rubin(monkeypatch):

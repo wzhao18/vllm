@@ -20,10 +20,11 @@ Differences from DeepGEMM that the caller sees:
   weights up to :data:`RUBIN_MX_MAX_TOKENS_PER_RANK`, else an exact MXFP4 -> NVFP4
   conversion at load (:class:`NonRepresentableError` when a weight is not exactly
   representable; nothing is re-quantized).
-- One compiled bucket sized to ``max_num_tokens``, plus, on inference-kernel servers
-  whose capacity exceeds the token_comm decode-landing limit, one decode bucket at
-  that limit (:func:`rubin_bucket_capacities`); each forward runs the smallest bucket
-  holding its EP-uniform token count (:meth:`KimiK3MegaMoEExperts.select_bucket`).
+- One compiled bucket sized to ``max_num_tokens``, plus, on decoding (not P/D
+  prefill) inference-kernel servers whose capacity exceeds the token_comm
+  decode-landing limit, one decode bucket at that limit
+  (:func:`rubin_bucket_capacities`); each forward runs the smallest bucket holding
+  its EP-uniform token count (:meth:`KimiK3MegaMoEExperts.select_bucket`).
 - The shared expert is never fused (the Rubin kernel has no shared-expert path).
 """
 
@@ -59,6 +60,7 @@ from .config import (
     SHIPPED_KNOBS,
     QuantKind,
     RubinBucket,
+    RubinMoeConfig,
     RubinMoeProblem,
     Variant,
     make_buckets,
@@ -92,33 +94,39 @@ RUBIN_GENPHASE_MAX_TOKENS_PER_RANK = 1024
 # Decode bucket: the kernel's token_comm decode paths (S0 dynamic token_in claim, S1
 # decode landing) are traced in only when capacity x top_k <= this many routes
 # (token_comm ``decode_landing_max_routes`` / ``token_in_dynamic_claim_max_routes``;
-# a unit test keeps them equal). A server sized above it (decode: MNBT 8192 / TP 4 =
-# 2048 tokens/rank) also compiles a bucket at this limit (4096 / top-16 = 256 tokens
-# per rank) with the same kernel variant, quant kind and knob record as its main
-# bucket, so decode steps (52-128 tokens/rank at C512) run with both paths on and a
-# 256-row stager grid. Same math, bitwise-identical outputs. Measured on VR200 (EP16
-# per-rank shape on EP4: 56 local experts, top-16, NVFP4, CUDA graph, stage+kernel
-# p50) at 52 tokens/rank: 2048 bucket 130.0 us, 256 bucket 111.8 us. The genphase
-# kernel is not used for it (139.7-225.5 us at that shape).
+# a unit test keeps them equal). A decoding server sized above it (C512 decode: MNBT
+# 8192 / TP 4 = 2048 tokens/rank) also compiles a bucket at this limit (4096 / top-16
+# = 256 tokens per rank) with the same kernel variant, quant kind and knob record as
+# its main bucket, so decode steps (52-128 tokens/rank at C512) run with both paths
+# on and a 256-row stager grid. Same math, bitwise-identical outputs. Measured on
+# VR200 (EP16 per-rank shape on EP4: 56 local experts, top-16, NVFP4, CUDA graph,
+# stage+kernel p50) at 52 tokens/rank: 2048 bucket 128.3 us, 256 bucket 110.4 us
+# (64: 128.9 / 110.9, 128: 130.0 / 113.6, 256: 135.1 / 122.7). The genphase kernel
+# is not used for it (139.7-225.5 us at that shape). P/D prefill workers (C512
+# prefill: SP shard of 8192 tokens/rank at EP16 on the i4096 record; C256 prefill:
+# token shard of 2048 at EP8 on the grouped i2048 record) run prefill chunks, where
+# the bucket was not measured, and keep their one bucket (no extra compile or arena).
 RUBIN_DECODE_BUCKET_MAX_ROUTES = 4096
 
 
 def rubin_bucket_capacities(
-    max_tokens_per_rank: int, top_k: int
+    max_tokens_per_rank: int, top_k: int, *, prefill_worker: bool
 ) -> tuple[int, ...]:
     """Ascending token capacities per rank of a server's compiled buckets
     (automatic, no flag): ``max_tokens_per_rank``, preceded by the decode bucket
-    (``RUBIN_DECODE_BUCKET_MAX_ROUTES // top_k``) on inference-kernel servers sized
-    above it."""
+    (``RUBIN_DECODE_BUCKET_MAX_ROUTES // top_k``) on decoding (not P/D prefill,
+    ``prefill_worker``) inference-kernel servers sized above it."""
     if top_k <= 0:
         raise ValueError(f"top_k must be positive: {top_k}")
     decode = RUBIN_DECODE_BUCKET_MAX_ROUTES // top_k
     if (
-        rubin_kernel_variant(max_tokens_per_rank) == "inference"
+        not prefill_worker
+        and rubin_kernel_variant(max_tokens_per_rank) == "inference"
         and 0 < decode < max_tokens_per_rank
     ):
         return (decode, max_tokens_per_rank)
     return (max_tokens_per_rank,)
+
 
 # Persistent-grid cap (SMs) when the caller runs the BF16 shared expert concurrently
 # on a side stream (KimiMoE under sequence parallelism): the remaining SMs serve the
@@ -168,23 +176,50 @@ def select_rubin_bucket(
 
 
 def select_rubin_buckets(
-    problem: RubinMoeProblem, world_size: int, max_tokens: int
+    problem: RubinMoeProblem,
+    world_size: int,
+    max_tokens: int,
+    *,
+    prefill_worker: bool,
 ) -> tuple[tuple[RubinBucket, ...], tuple[str, ...]]:
     """Every compiled bucket of a server, ascending (:func:`rubin_bucket_capacities`):
     the main bucket of :func:`select_rubin_bucket`, and below it the decode bucket,
     which keeps the main bucket's variant and knob record (only the capacity
-    differs)."""
+    differs). Raises (``ValueError``) when the kernel's admission rules refuse that
+    record at the decode capacity."""
     main, notes = select_rubin_bucket(problem, world_size, max_tokens)
-    buckets = [
-        RubinBucket(main.variant, cap, main.knobs)
-        for cap in rubin_bucket_capacities(max_tokens, problem.top_k)[:-1]
-    ]
+    caps = rubin_bucket_capacities(
+        max_tokens, problem.top_k, prefill_worker=prefill_worker
+    )
+    buckets = [RubinBucket(main.variant, cap, main.knobs) for cap in caps[:-1]]
+    for bucket in buckets:
+        RubinMoeConfig.make(problem, bucket, rank=0, world_size=world_size)
     extra = tuple(
         f"[{b.variant} {b.max_tokens}] decode bucket, knobs of the "
         f"{main.max_tokens} bucket"
         for b in buckets
     )
     return (*buckets, main), notes + extra
+
+
+# The forward's DPMetadata (held, so its id is never reused) and whether its DP batch
+# sizes are equal: computed once per forward, not once per MoE layer.
+_dp_uniform_memo: tuple[object, bool] | None = None
+
+
+def _dp_batches_uniform(dp_metadata) -> bool:
+    """Whether every DP rank runs the same token count this forward. A forward
+    context builds a new DPMetadata per forward (its counts are never written in
+    place), so the answer is cached by object identity; host-only, so a CUDA graph
+    capture bakes in the bucket of its own padded size."""
+    global _dp_uniform_memo
+    memo = _dp_uniform_memo
+    if memo is not None and memo[0] is dp_metadata:
+        return memo[1]
+    counts = dp_metadata.num_tokens_across_dp_cpu
+    uniform = int(counts.min()) == int(counts.max())
+    _dp_uniform_memo = (dp_metadata, uniform)
+    return uniform
 
 
 def check_kimi_k3_mega_moe_supported() -> None:
@@ -295,8 +330,13 @@ class KimiK3MegaMoEExperts(nn.Module):
             situ_linear_beta=float(activation.beta),
             quant_kind=self.quant_kind,
         )
+        from ..model import pd_prefill_worker  # (model.py imports this lazily)
+
         self.buckets, notes = select_rubin_buckets(
-            self.problem, ep_size, self.max_num_tokens
+            self.problem,
+            ep_size,
+            self.max_num_tokens,
+            prefill_worker=pd_prefill_worker(vllm_config),
         )
         self.bucket = self.buckets[-1]
         self.dp_size = vllm_config.parallel_config.data_parallel_size
@@ -443,9 +483,7 @@ class KimiK3MegaMoEExperts(nn.Module):
         self.buckets = tuple(
             dataclasses.replace(
                 bucket,
-                knobs=dataclasses.replace(
-                    bucket.knobs, fallback_cluster_shape_mn=None
-                ),
+                knobs=dataclasses.replace(bucket.knobs, fallback_cluster_shape_mn=None),
                 max_sm_count=RUBIN_SHARED_OVERLAP_MAX_SMS,
             )
             for bucket in self.buckets
@@ -585,8 +623,7 @@ class KimiK3MegaMoEExperts(nn.Module):
                     f"{self.prefix}: Rubin MegaMoE at DP{self.dp_size} needs the "
                     "forward context's DP metadata to pick an EP-uniform bucket."
                 )
-            counts = dp_metadata.num_tokens_across_dp_cpu
-            if int(counts.min()) != int(counts.max()):
+            if not _dp_batches_uniform(dp_metadata):
                 return buckets[-1]
         for b in buckets:
             if num_tokens <= b.max_tokens:

@@ -185,10 +185,12 @@ def test_server_bucket_resolves_shipped_knobs(world, tokens):
     ],
 )
 def test_bucket_capacities(tokens, caps):
-    assert X.rubin_bucket_capacities(tokens, 16) == caps
-    assert X.rubin_bucket_capacities(4096, 2) == (2048, 4096)
+    assert X.rubin_bucket_capacities(tokens, 16, prefill_worker=False) == caps
+    assert X.rubin_bucket_capacities(4096, 2, prefill_worker=False) == (2048, 4096)
+    # P/D prefill workers keep their one bucket
+    assert X.rubin_bucket_capacities(tokens, 16, prefill_worker=True) == (tokens,)
     with pytest.raises(ValueError):
-        X.rubin_bucket_capacities(2048, 0)
+        X.rubin_bucket_capacities(2048, 0, prefill_worker=False)
 
 
 def test_decode_bucket_limit_matches_token_comm():
@@ -206,7 +208,9 @@ def test_decode_bucket_limit_matches_token_comm():
 def test_server_buckets_share_the_main_knob_record(world, tokens):
     X.select_rubin_bucket.cache_clear()
     problem = C.RubinMoeProblem(quant_kind=X.rubin_quant_kind(tokens))
-    buckets, notes = X.select_rubin_buckets(problem, world, tokens)
+    buckets, notes = X.select_rubin_buckets(
+        problem, world, tokens, prefill_worker=False
+    )
     main, _ = X.select_rubin_bucket(problem, world, tokens)
     assert [b.max_tokens for b in buckets] == [256, tokens]
     assert buckets[-1] == main
@@ -214,9 +218,78 @@ def test_server_buckets_share_the_main_knob_record(world, tokens):
     assert any("decode bucket" in n for n in notes)
     for b in buckets:  # every admission rule holds at both capacities
         C.RubinMoeConfig.make(problem, b, rank=0, world_size=world)
+    # a P/D prefill worker keeps its one bucket
+    assert X.select_rubin_buckets(problem, world, tokens, prefill_worker=True)[0] == (
+        main,
+    )
     # a genphase server keeps its one bucket
     problem = C.RubinMoeProblem(quant_kind=X.rubin_quant_kind(512))
-    assert len(X.select_rubin_buckets(problem, 16, 512)[0]) == 1
+    buckets = X.select_rubin_buckets(problem, 16, 512, prefill_worker=False)[0]
+    assert len(buckets) == 1
+
+
+def _inference_record_capacities():
+    """(world, quant kind, record capacity) of every shipped inference knob record."""
+    data = C.load_knob_source(C.SHIPPED_KNOBS)
+    return sorted(
+        {
+            (e["world_size"], e["dtype"], e["max_tokens"])
+            for e in data["entries"]
+            if e.get("kernel_variant") == "inference"
+        }
+    )
+
+
+@pytest.mark.parametrize(("world", "kind", "tokens"), _inference_record_capacities())
+def test_decode_bucket_admits_every_shipped_inference_record(world, kind, tokens):
+    """Wherever a decoding server would resolve a shipped inference record (any EP
+    size, precision, capacity), the decode bucket on that record passes every
+    admission rule (select_rubin_buckets checks it and raises otherwise)."""
+    if tokens <= X.RUBIN_GENPHASE_MAX_TOKENS_PER_RANK:
+        tokens = X.RUBIN_GENPHASE_MAX_TOKENS_PER_RANK + 1  # resolves the same record
+    X.select_rubin_bucket.cache_clear()
+    problem = C.RubinMoeProblem(quant_kind=kind)
+    buckets, _ = X.select_rubin_buckets(problem, world, tokens, prefill_worker=False)
+    assert [b.max_tokens for b in buckets] == [256, tokens]
+    C.RubinMoeConfig.make(problem, buckets[0], rank=0, world_size=world)
+
+
+@pytest.mark.parametrize(
+    ("role", "world", "mnbt", "tp", "token_sharded", "caps"),
+    [
+        # C512 prefill: DP4 x TP4 (EP16), MNBT 32768, sequence parallel
+        ("kv_both", 16, 32768, 4, True, (8192,)),
+        # C512 prefill if it ran without the 1/TP shard
+        ("kv_both", 16, 32768, 4, False, (32768,)),
+        # C256 prefill: TP8 (EP8) MoE token shard, MNBT 16384
+        ("kv_both", 8, 16384, 8, True, (2048,)),
+        # C512 decode: DP4 x TP4 (EP16), MNBT 8192, sequence parallel
+        ("kv_consumer", 16, 8192, 4, True, (256, 2048)),
+        # unified serving decodes too
+        (None, 16, 8192, 4, True, (256, 2048)),
+    ],
+)
+def test_deployment_buckets_per_role(
+    monkeypatch, ep, role, world, mnbt, tp, token_sharded, caps
+):
+    """The experts module's buckets at the deployed roles' capacities: the P/D
+    prefill workers (both kimi_k3_mega_moe) keep one bucket on the shipped record,
+    the decode role adds the 256 decode bucket on the same record."""
+    ep.world_size = world
+    tokens = kimi_model.mega_moe_max_num_tokens(mnbt, tp, token_sharded)
+    config = _vllm_config(mnbt=mnbt, dp=4)
+    if role is not None:
+        config.kv_transfer_config = SimpleNamespace(
+            is_kv_producer=role in ("kv_producer", "kv_both")
+        )
+    with torch.device("meta"):
+        module = _experts(config, ep=ep, max_num_tokens=tokens, **K31)
+    assert tuple(b.max_tokens for b in module.buckets) == caps
+    main, _ = X.select_rubin_bucket(module.problem, world, tokens)
+    assert module.bucket == main
+    assert all(b.knobs == main.knobs for b in module.buckets)
+    for b in module.buckets:
+        C.RubinMoeConfig.make(module.problem, b, rank=0, world_size=world)
 
 
 @pytest.mark.parametrize(
@@ -229,7 +302,7 @@ def test_shared_overlap_sm_cap_admits_every_server_bucket(world, tokens):
     X.select_rubin_bucket.cache_clear()
     problem = C.RubinMoeProblem(quant_kind=X.rubin_quant_kind(tokens))
     bucket, _ = X.select_rubin_bucket(problem, world, tokens)
-    buckets, _ = X.select_rubin_buckets(problem, world, tokens)
+    buckets, _ = X.select_rubin_buckets(problem, world, tokens, prefill_worker=False)
     module = SimpleNamespace(
         bucket=bucket, buckets=buckets, kernel_weights=None, prefix="layer"
     )
@@ -464,10 +537,49 @@ def test_bucket_selection_is_ep_uniform(monkeypatch, ep, small_bucket):
     assert module.select_bucket(52) is small
     assert module.select_bucket(2048) is small
     assert module.select_bucket(2049) is large
-    counts[2] = 200
+    # each forward has its own DPMetadata
+    ctx.dp_metadata = SimpleNamespace(num_tokens_across_dp_cpu=counts.clone())
+    ctx.dp_metadata.num_tokens_across_dp_cpu[2] = 200
     assert module.select_bucket(52) is large
     with pytest.raises(ValueError, match="sized for"):
         module.select_bucket(4097)
+
+
+def test_dp_uniform_check_runs_once_per_forward(monkeypatch, ep, small_bucket):
+    """Every MoE layer of a forward shares one DP-uniform check (host overhead):
+    the counts are reduced once per DPMetadata, i.e. once per forward."""
+    ep.world_size, ep.rank_in_group = 2, 1
+    layers = [
+        _experts(
+            _vllm_config(dp=4),
+            ep=ep,
+            max_num_tokens=4096,
+            prefix=f"model.layers.{i}.mlp.experts",
+            **SMALL,
+        )
+        for i in range(3)
+    ]
+
+    class Counts:
+        def __init__(self, values):
+            self.values, self.reductions = torch.tensor(values), 0
+
+        def min(self):
+            self.reductions += 1
+            return self.values.min()
+
+        def max(self):
+            return self.values.max()
+
+    ctx = SimpleNamespace(dp_metadata=None)
+    monkeypatch.setattr(X, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(X, "get_forward_context", lambda: ctx)
+    for values, index in (([52] * 4, 0), ([52, 52, 40, 52], 1), ([52] * 4, 0)):
+        counts = Counts(values)
+        ctx.dp_metadata = SimpleNamespace(num_tokens_across_dp_cpu=counts)
+        for module in layers:
+            assert module.select_bucket(52) is module.buckets[index]
+        assert counts.reductions == 1
 
 
 def test_non_representable_nvfp4_raises_on_every_rank(monkeypatch, ep, small_bucket):
