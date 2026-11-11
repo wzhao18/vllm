@@ -40,9 +40,14 @@ NUM_HEADS = 96
 MLA_ROW = {"fp8": 576, "nvfp4_ds_mla": 352}
 CACHE_DTYPES = list(MLA_ROW)
 FILL = 0xA5
+# FlashInfer's prims_ts sparse MLA raises "requires SM100 or SM103" elsewhere
+# (e.g. SM107), so the import alone is not enough.
 _needs_prims_ts = pytest.mark.skipif(
-    not has_flashinfer_prims_ts_sparse_mla(),
-    reason="needs FlashInfer's prims_ts sparse MLA",
+    not (
+        has_flashinfer_prims_ts_sparse_mla()
+        and any(current_platform.is_device_capability(cap) for cap in (100, 103))
+    ),
+    reason="needs FlashInfer's prims_ts sparse MLA (SM100 or SM103)",
 )
 # (cache dtype, FlashInfer sparse MLA kernel): every pairing the backend serves.
 KERNEL_CASES = [
