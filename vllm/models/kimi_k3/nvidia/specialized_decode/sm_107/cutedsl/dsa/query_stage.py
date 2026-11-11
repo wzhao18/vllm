@@ -101,8 +101,8 @@ def compile_query(
         publish = (mailbox, cutlass.Int64(0), cutlass.Int32(0))
     s = make_fake_stream()
     kernel = cute.compile(mla_query, *q_args, query, qc, *publish, s)
-    if batch > 1:
-        kernel = prepare_shared_carveout(kernel, device, 100)
+    if mla_query.carveout is not None:
+        kernel = prepare_shared_carveout(kernel, device, mla_query.carveout)
     return kernel
 
 

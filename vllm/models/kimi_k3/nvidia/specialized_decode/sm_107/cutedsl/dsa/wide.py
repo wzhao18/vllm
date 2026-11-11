@@ -188,8 +188,10 @@ def compile_core(
             # Wide rows: the CTAs poll the gathered mailbox, which other ranks' CTAs
             # fill, so every CTA that polls with them must be resident (hazard H1).
             check_query_residency(query_kernel, mla_query, device)
-        if batch > 1:
-            query_kernel = prepare_shared_carveout(query_kernel, device, 100)
+        if mla_query.carveout is not None:
+            query_kernel = prepare_shared_carveout(
+                query_kernel, device, mla_query.carveout
+            )
         index_kernel = cute.compile(index, *i_args, s)
         if dcp and partials == PROJECTED:
             args = heads, dcp, batch, specs[4], pitch, device, sms, q, q_heads
