@@ -358,8 +358,8 @@ def compile_query(
         compiled = cute.compile(kernel, *args, make_fake_stream())
         if size > 1 and gather:  # on the raw compiled kernel, before its wrapper
             check_query_clusters(compiled, kernel, device)
-        if rows > 1:
-            compiled = prepare_shared_carveout(compiled, device, 100)
+        if kernel.carveout is not None:
+            compiled = prepare_shared_carveout(compiled, device, kernel.carveout)
     return compiled
 
 

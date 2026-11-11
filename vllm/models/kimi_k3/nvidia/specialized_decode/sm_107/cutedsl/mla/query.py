@@ -333,8 +333,14 @@ class MlaQuery:
         self.tile_poll = bool(tile_poll) and self.wide and batch > 64
         # (the gate waits for the batch's last token: the whole-grid poll's)
         assert not (self.tile_poll and self.gate), "MlaQuery: tile_poll is ungated"
-        carveout = 100 if batch > 1 else None
-        self.options = dict(cluster=self.cluster, preferred_smem_carveout=carveout)
+        # The tiled kernel prefers the maximum shared-memory carveout. The one-CTA
+        # (non-wide) kernel keeps the driver default: on Rubin (sm_107a) a 100%
+        # carveout makes its launch fail with cudaErrorLaunchFailure (96 heads at
+        # batch 1-3, 24 heads at batch 2; 50% and the default pass).
+        self.carveout = 100 if batch > 1 and self.wide else None
+        self.options = dict(
+            cluster=self.cluster, preferred_smem_carveout=self.carveout
+        )
         self.q_b_cp_async = q_b_cp_async
 
     @cute.jit

@@ -8,6 +8,8 @@ not checked at launch: the packed DSA in-projection rows (``projected``) must ke
 FlashInfer's padded heads) x 576. A regression that compiled ``projected`` at the
 query stride read rows 1+ from the wrong addresses (batch 1 unaffected)."""
 
+from types import SimpleNamespace
+
 import pytest
 
 pytest.importorskip("cutlass")
@@ -35,7 +37,8 @@ def test_compile_query_strides(monkeypatch, batch, heads, fi_heads, pitch, fp8):
         return "kernel"
 
     monkeypatch.setattr(query_stage, "fake", fake)
-    monkeypatch.setattr(query_stage, "MlaQuery", lambda *a, **k: "mla_query")
+    mla_query = SimpleNamespace(carveout=None)
+    monkeypatch.setattr(query_stage, "MlaQuery", lambda *a, **k: mla_query)
     monkeypatch.setattr(query_stage, "make_fake_stream", lambda: "stream")
     monkeypatch.setattr(query_stage, "prepare_shared_carveout", lambda k, d, c: k)
     monkeypatch.setattr(query_stage.cute, "compile", compile_)
@@ -54,3 +57,16 @@ def test_compile_query_strides(monkeypatch, batch, heads, fi_heads, pitch, fp8):
     else:
         rows = query_stage.QUERY_HEADS
         assert query == ("fake", (batch, rows, 576), (rows * 576, 576, 1))
+
+
+@pytest.mark.parametrize("heads", [96, 24, 12, 6])
+def test_lean_query_keeps_default_carveout(heads):
+    """Only the tiled MlaQuery asks for the 100% shared-memory carveout: on sm_107a
+    the lean (one-CTA) kernel fails its launch (cudaErrorLaunchFailure) under it."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.cutedsl.mla.query import (  # noqa: E501
+        MlaQuery,
+    )
+
+    for batch in range(1, 9):
+        query = MlaQuery(heads, batch, dsa=True, fp8=True)
+        assert query.carveout == (100 if query.wide else None), (heads, batch)

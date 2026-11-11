@@ -179,8 +179,9 @@ def compile_core(
         q_args += (mailbox, cutlass.Int64(0), cutlass.Int32(0))
     with torch.accelerator.device_index(device):
         kernels = [cute.compile(mla_query, *q_args, s)]
-        if batch > 1:
-            kernels = [prepare_shared_carveout(kernels[0], device, 100)]
+        if mla_query.carveout is not None:
+            carveout = mla_query.carveout
+            kernels = [prepare_shared_carveout(kernels[0], device, carveout)]
         if dcp:
             uv_spec = specs[4]
             kernels.append(
