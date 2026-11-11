@@ -27,6 +27,7 @@ Differences from DeepGEMM that the caller sees:
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 from collections.abc import Callable
 from typing import TYPE_CHECKING, ClassVar
@@ -85,6 +86,17 @@ RUBIN_MX_MAX_TOKENS_PER_RANK = 512
 # 1024-token capacity: genphase NVFP4 346.6 us vs inference 413.2 us, MX 381.8 vs
 # 477.7 us.
 RUBIN_GENPHASE_MAX_TOKENS_PER_RANK = 1024
+
+# Persistent-grid cap (SMs) when the caller runs the BF16 shared expert concurrently
+# on a side stream (KimiMoE under sequence parallelism): the remaining SMs serve the
+# shared expert's GEMMs. Measured on VR200 (EP16 decode shape emulated on EP4: 56
+# experts/rank, top-16; CUDA graph, stage + kernel, per layer): the shipped EP16
+# NVFP4 inference 2048 record (cluster 4 + fallback 2) at 32 / 52 / 64 tokens/rank
+# runs 125.2 / 126.6 / 126.9 us on the full grid and 123.9 / 124.3 / 124.6 us capped
+# at 148 SMs without fallback clusters; MegaMoE + shared expert + latent up-projection
+# drops from 186.4 / 198.3 / 199.4 us serial to 168.3 / 183.3 / 179.2 us overlapped
+# (bitwise-equal outputs).
+RUBIN_SHARED_OVERLAP_MAX_SMS = 148
 
 
 def rubin_quant_kind(max_tokens_per_rank: int) -> QuantKind:
@@ -356,6 +368,26 @@ class KimiK3MegaMoEExperts(nn.Module):
             self.w13_weight_scale.data.view(torch.uint8),
             self.w2_weight.data.view(torch.uint8),
             self.w2_weight_scale.data.view(torch.uint8),
+        )
+
+    def reserve_sms_for_shared_expert(self) -> None:
+        """Cap this layer's persistent grid at :data:`RUBIN_SHARED_OVERLAP_MAX_SMS`
+        so a shared expert the caller runs on another stream gets the remaining SMs.
+        Every layer of the EP group must make the same call (the bucket keys the
+        shared runtime); it must come before the runtime is built."""
+        if self.kernel_weights is not None:
+            raise RuntimeError(
+                f"{self.prefix}: reserve_sms_for_shared_expert after the runtime "
+                "was built."
+            )
+        # A capped grid launches preferred-shape clusters only: the mixed-CGA
+        # fallback clusters exist to fill the SMs the cap leaves to the shared
+        # expert. Tiles and their accumulation order do not depend on the grid.
+        bucket = self.bucket
+        self.bucket = dataclasses.replace(
+            bucket,
+            knobs=dataclasses.replace(bucket.knobs, fallback_cluster_shape_mn=None),
+            max_sm_count=RUBIN_SHARED_OVERLAP_MAX_SMS,
         )
 
     # -- runtime / kernel layout -----------------------------------------------------

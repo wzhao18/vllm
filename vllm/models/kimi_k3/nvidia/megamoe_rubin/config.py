@@ -150,11 +150,16 @@ class RubinKnobs:
 
 @dataclasses.dataclass(frozen=True)
 class RubinBucket:
-    """One compiled session: kernel variant, token capacity per rank and its knobs."""
+    """One compiled session: kernel variant, token capacity per rank and its knobs.
+
+    ``max_sm_count``: cap on the persistent grid (SMs, whole clusters), or None for
+    the occupancy limit. A server policy rather than a knob: it leaves SMs to work
+    the caller runs concurrently on another stream; the math is unchanged."""
 
     variant: Variant
     max_tokens: int
     knobs: RubinKnobs
+    max_sm_count: int | None = None
 
     def __post_init__(self) -> None:
         if self.variant not in ("inference", "genphase"):
@@ -239,6 +244,7 @@ class RubinMoeConfig:
             situ_linear_beta=float(problem.situ_linear_beta),
             kernel_variant=bucket.variant,
             reduce_topk_in_kernel=k.reduce_topk_in_kernel,
+            max_sm_count=bucket.max_sm_count,
         )
 
     def __post_init__(self) -> None:  # noqa: C901 - verbatim rule list
