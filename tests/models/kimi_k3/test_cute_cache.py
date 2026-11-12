@@ -339,6 +339,89 @@ def test_warm_start_loads_every_kernel_bitwise(tmp_path):
         assert _bitwise(broken_out["cached"][name], ref), f"rebuilt {name}"
 
 
+def _scale_kwargs_kernel_class():
+    """A TVM-FFI launcher with a defaulted runtime argument: compiled, it calls
+    through the DSL's kwargs wrapper."""
+    import cutlass
+    import cutlass.cute as cute
+
+    class ScaleKw:
+        @cute.jit
+        def __call__(
+            self, x: cute.Tensor, y: cute.Tensor, stream, factor: cutlass.Float32 = 2.0
+        ):
+            self.kernel(x, y, factor).launch(
+                grid=[x.shape[0] // 128, 1, 1], block=[128, 1, 1], stream=stream
+            )
+
+        @cute.kernel
+        def kernel(self, x: cute.Tensor, y: cute.Tensor, factor: cutlass.Float32):
+            tidx, _, _ = cute.arch.thread_idx()
+            bidx, _, _ = cute.arch.block_idx()
+            i = bidx * 128 + tidx
+            y[i] = x[i] * factor
+
+    return ScaleKw
+
+
+def _kwargs_worker(path: str):
+    """Compile the kwargs launcher through the cache (cold or warm) and the plain
+    DSL compile; call each with the default, positionally and by keyword."""
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
+
+    from vllm.models.kimi_k3.nvidia import cute_cache
+
+    cute_cache.VERIFY = True
+    device = torch.device("cuda", 0)
+    torch.cuda.set_device(device)
+    inner = cute.compile._inner if hasattr(cute.compile, "_inner") else cute.compile
+    fx = make_fake_compact_tensor(cutlass.Float32, (4096,), assumed_align=16)
+    stream = make_fake_stream(use_tvm_ffi_env_stream=True)
+    kernel = _scale_kwargs_kernel_class()()
+    options = "--enable-tvm-ffi"
+    cached = cute_cache._compile(inner, kernel, (fx, fx, stream), {"options": options})
+    plain = inner(kernel, fx, fx, stream, options=options)
+    x = torch.arange(4096, device=device, dtype=torch.float32)
+    outs = {}
+    for name, run in (("cached", cached), ("plain", plain)):
+        calls = []
+        for args, kwargs in (((), {}), ((3.0,), {}), ((), {"factor": 4.0})):
+            y = torch.empty_like(x)
+            run(x, y, *args, **kwargs)
+            calls.append(y.cpu())
+        outs[name] = calls
+    torch.cuda.synchronize()
+    stats = {k: v for k, v in vars(cute_cache.stats).items() if k != "kernels"}
+    torch.save(outs, path + ".pt")
+    with open(path + ".json", "w") as f:
+        json.dump({"stats": stats}, f)
+
+
+@_needs_blackwell
+def test_kwargs_launcher_is_cached_and_calls_alike(tmp_path):
+    env = dict(os.environ, VLLM_CACHE_ROOT=str(tmp_path / "cache"))
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))))  # fmt: skip
+    env["PYTHONPATH"] = root + os.pathsep + env.get("PYTHONPATH", "")
+    results = []
+    for arm in ("cold", "warm"):
+        out = str(tmp_path / arm)
+        cmd = [sys.executable, os.path.abspath(__file__), "kwargs", out]
+        subprocess.run(cmd, env=env, check=True, timeout=900)
+        with open(out + ".json") as f:
+            results.append((json.load(f)["stats"], torch.load(out + ".pt")))
+    (cold, cold_out), (warm, warm_out) = results
+    assert (cold["compiled"], cold["uncached"]) == (1, 0), cold
+    assert (warm["loaded"], warm["compiled"], warm["uncached"]) == (1, 0, 0), warm
+    x = torch.arange(4096, dtype=torch.float32)
+    expected = [x * 2.0, x * 3.0, x * 4.0]  # default, positional, keyword
+    for outs in (cold_out, warm_out):
+        for got, ref, want in zip(outs["cached"], outs["plain"], expected):
+            assert torch.equal(got, ref) and torch.equal(got, want)
+
+
 SHARED_KERNELS = 12
 
 
@@ -422,5 +505,7 @@ def test_ranks_split_cold_compiles(tmp_path):
 if __name__ == "__main__":
     if sys.argv[1] == "shared":
         _shared_worker(sys.argv[2], sys.argv[3])
+    elif sys.argv[1] == "kwargs":
+        _kwargs_worker(sys.argv[2])
     else:
         _worker(sys.argv[1], sys.argv[2] == "1")

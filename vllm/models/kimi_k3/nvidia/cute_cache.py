@@ -52,6 +52,7 @@ import functools
 import hashlib
 import json
 import marshal
+import math
 import os
 import shutil
 import socket
@@ -494,27 +495,69 @@ def _write_atomic(path: str, write) -> None:
         shutil.rmtree(work, ignore_errors=True)
 
 
-def _cacheable(compiled: Any, tvm_ffi: bool) -> bool:
-    """Whether the loaded object calls exactly like ``compiled``: a TVM-FFI object
-    loads as the plain ``tvm_ffi.Function``, which is ``compiled``'s call when every
-    argument is positional without a default and none is a raw pointer address."""
+_NOT_CACHEABLE = object()
+
+
+def _json_value(value: Any) -> bool:
+    """A default that survives a JSON round trip unchanged (type and value)."""
+    if type(value) is float:
+        return math.isfinite(value)
+    return type(value) in (type(None), bool, int, str)
+
+
+def _launcher(compiled: Any, tvm_ffi: bool) -> Any:
+    """How the loaded object is made to call exactly like ``compiled``: None (the
+    loaded object as is), a kwargs-wrapper spec (dict), or _NOT_CACHEABLE.
+
+    A TVM-FFI object loads as the plain positional ``tvm_ffi.Function``. That is
+    ``compiled``'s call when every argument is positional without a default. With
+    keyword-only arguments or defaults, ``compiled`` calls through
+    ``tvm_ffi.utils.kwargs_wrapper.make_kwargs_wrapper`` with the DSL's
+    ``KwargsWrapperSpec`` (recorded at its construction, ``install``): the loaded
+    object gets the same wrapper from the stored spec. Raw pointer-address
+    arguments and dataclass arguments (unpacked by the wrapper) are not cached."""
     if not tvm_ffi:
-        return True
+        return None
     arguments = compiled.execution_args
+    if arguments.has_pointer_address_arg_specs:
+        return _NOT_CACHEABLE
+    params = list(arguments.signature.parameters.values())
+    if any(dataclasses.is_dataclass(p.annotation) for p in params):
+        return _NOT_CACHEABLE
     positional = (Parameter.POSITIONAL_ONLY, Parameter.POSITIONAL_OR_KEYWORD)
-    return not arguments.has_pointer_address_arg_specs and all(
-        p.kind in positional
-        and p.default is Parameter.empty
-        and not dataclasses.is_dataclass(p.annotation)
-        for p in arguments.signature.parameters.values()
-    )
+    if all(p.kind in positional and p.default is Parameter.empty for p in params):
+        return None
+    recorded = getattr(compiled, "_k3_kwargs_wrapper", None)
+    if recorded is None:
+        return _NOT_CACHEABLE
+    spec, dataclass_args = recorded
+    defaults = (*spec.arg_defaults, *spec.kwonly_defaults.values())
+    if dataclass_args or not all(map(_json_value, defaults)):
+        return _NOT_CACHEABLE
+    return {
+        "arg_names": list(spec.arg_names),
+        "arg_defaults": list(spec.arg_defaults),
+        "kwonly_names": list(spec.kwonly_names),
+        "kwonly_defaults": dict(spec.kwonly_defaults),
+    }
 
 
-def _load(key: str, variant: str, tvm_ffi: bool) -> Any:
+def _load(key: str, variant: str, tvm_ffi: bool, kwargs: dict | None = None) -> Any:
     from cutlass.cute.runtime import load_module
 
     module = load_module(_paths(key, variant)[0], enable_tvm_ffi=tvm_ffi)
-    return module[_prefix(key)]
+    loaded = module[_prefix(key)]
+    if kwargs is None:
+        return loaded
+    from tvm_ffi.utils.kwargs_wrapper import make_kwargs_wrapper
+
+    return make_kwargs_wrapper(
+        loaded,
+        arg_names=kwargs["arg_names"],
+        arg_defaults=tuple(kwargs["arg_defaults"]),
+        kwonly_names=kwargs["kwonly_names"],
+        kwonly_defaults=kwargs["kwonly_defaults"],
+    )
 
 
 def _find(key: str) -> tuple[str, dict] | None:
@@ -773,7 +816,8 @@ def _compile_and_store(inner, fn, args, kwargs, key, modules, name):
     with _Executed() as executed:
         compiled = inner(fn, *args, trace_finalize_hooks=_trace_hook(found), **kwargs)
     tvm_ffi = found.get("tvm_ffi", False)
-    if "ir" not in found or not _cacheable(compiled, tvm_ffi):
+    launcher = _launcher(compiled, tvm_ffi) if "ir" in found else _NOT_CACHEABLE
+    if launcher is _NOT_CACHEABLE:
         why = "no module hash" if "ir" not in found else "loaded launcher differs"
         _uncached_reason(name, why)
         seconds = time.perf_counter() - start
@@ -789,6 +833,7 @@ def _compile_and_store(inner, fn, args, kwargs, key, modules, name):
         "compile_s": round(time.perf_counter() - start, 3),
         "host": socket.gethostname(),
         "sources": sources,
+        "kwargs": launcher,
     }
 
     def write_obj(path):
@@ -805,7 +850,7 @@ def _compile_and_store(inner, fn, args, kwargs, key, modules, name):
     try:
         _write_atomic(meta, write_meta)
         _write_atomic(obj, write_obj)
-        loaded = _load(key, variant, tvm_ffi)
+        loaded = _load(key, variant, tvm_ffi, launcher)
     except Exception as error:
         logger.warning(
             "Kimi K3 CuTe cache: %s compiled but its object cannot be stored or "
@@ -825,7 +870,7 @@ def _load_entry(inner, fn, args, kwargs, key, modules, name, found):
     variant, record = found
     loaded_at = time.perf_counter()
     try:
-        loaded = _load(key, variant, record["tvm_ffi"])
+        loaded = _load(key, variant, record["tvm_ffi"], record.get("kwargs"))
     except Exception as error:
         logger.warning(
             "Kimi K3 CuTe cache: entry %s/%s (%s) does not load (%s: %s); recompiling "
@@ -956,6 +1001,32 @@ def install() -> None:
     for owner in (cute, experimental):
         if not getattr(owner.compile, "_k3_cached", False):
             owner.compile = _CachedCompile(owner.compile)
+    _record_kwargs_wrappers()
+
+
+def _record_kwargs_wrappers() -> None:
+    """Keep the DSL's kwargs-wrapper spec on each TVM-FFI launcher built with one,
+    so its stored entry loads with the same wrapper (``_launcher``)."""
+    try:
+        from cutlass.cutlass_dsl.tvm_ffi_provider import (
+            TVMFFIJitCompiledFunctionWithKwargs as launcher,
+        )
+    except ImportError:
+        return
+    init = launcher.__init__
+    if getattr(init, "_k3_recorded", False):
+        return
+
+    @functools.wraps(init)
+    def recording_init(self, *args, **kwargs):
+        spec = kwargs.get("kwargs_wrapper_spec")
+        dataclass_args = list(kwargs.get("map_dataclass_to_tuple") or ())
+        init(self, *args, **kwargs)
+        if spec is not None:
+            self._k3_kwargs_wrapper = (spec, dataclass_args)
+
+    recording_init._k3_recorded = True
+    launcher.__init__ = recording_init
 
 
 def log_summary(stage: str, table: bool = False) -> None:
