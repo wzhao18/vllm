@@ -43,7 +43,9 @@ def _check(per_rank, seq_lens, query_lens, world, max_keys, max_elems):
             assert padded * width <= max(max_elems, _LOGITS_ROW_ALIGN * width)
             scored.append(rows)
         # Every one of this rank's rows once, in order.
-        np.testing.assert_array_equal(np.concatenate(scored), own)
+        np.testing.assert_array_equal(
+            np.concatenate(scored) if scored else own[:0], own
+        )
 
 
 @pytest.mark.parametrize("q,world", [(3480, 4), (8192, 8), (1, 4), (7, 4), (5461, 4)])
@@ -102,3 +104,30 @@ def test_chunks_cover_and_fit(seq_lens, query_lens, world, max_keys, max_elems):
     # One plan: every rank owning rows of every request makes the same calls.
     if all(q >= 2 * world for q in query_lens):
         assert len({len(c) for c in per_rank}) == 1
+
+
+@pytest.mark.parametrize(
+    "seq_lens,query_lens,world",
+    [
+        ([5], [5], 16),  # the engine's 5-token warm-up step at DCP16
+        ([1], [1], 4),
+        ([2], [2], 4),
+        ([3], [3], 4),
+        ([67], [3], 4),  # with cached context
+        ([1, 9], [1, 2], 8),
+    ],
+)
+@pytest.mark.parametrize("max_elems", [1 << 30, 1])  # packed / cut path
+def test_tiny_prefill_leaves_ranks_without_chunks(
+    seq_lens, query_lens, world, max_elems
+):
+    """A prefill of fewer tokens than 2 x the DCP size leaves some ranks no
+    fold rows: those ranks get no chunks (the indexer then scores nothing on
+    them and only joins the gathers), the others cover their rows once."""
+    seq_lens, query_lens = np.array(seq_lens), np.array(query_lens)
+    per_rank = _all_ranks(seq_lens, query_lens, world, 1 << 20, max_elems)
+    _check(per_rank, seq_lens, query_lens, world, 1 << 20, max_elems)
+    folds = fold_split(np.concatenate(([0], np.cumsum(query_lens))), world)
+    empty = [rank for rank in range(world) if not len(folds[rank])]
+    assert empty
+    assert [rank for rank in range(world) if not per_rank[rank]] == empty
