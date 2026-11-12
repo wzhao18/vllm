@@ -836,11 +836,17 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         if slot_mapping is None or (cache is not None and cache.dummy_batch):
             return
         if (
-            self._shardq_fused_kv_insert(kv_c_normed, k_pe, kv_cache, attn_metadata)
+            not torch.cuda.is_current_stream_capturing()
+            and self._shardq_fused_kv_insert(
+                kv_c_normed, k_pe, kv_cache, attn_metadata
+            )
             is not None
         ):
             # forward_impl writes the local and workspace rows in one kernel,
-            # with this slot mapping.
+            # with this slot mapping. Only when this write runs eagerly: a
+            # captured graph would replay the capture batch's decision for
+            # every later step, including steps without a ShardQ context whose
+            # rows nothing else writes.
             self._shardq_local_slots = slot_mapping
             return
         kv_c_normed, k_pe, slot_mapping = maybe_gather_mla_latent_cache_inputs(
