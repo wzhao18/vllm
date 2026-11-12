@@ -64,6 +64,7 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.v1.attention.ops.dcp_shardq.rank_major import InFlight, RankMajorPlan
     from vllm.v1.attention.ops.dcp import MLADCPManager
 
 logger = init_logger(__name__)
@@ -167,6 +168,18 @@ def dcp_fallback_max_tokens(vllm_config: "VllmConfig", decode_query_len: int) ->
     )
 
 
+_PEER_PTRS_HOST: dict[int, list[int]] = {}
+
+
+def _peer_ptrs_host(buffer: _SymmBuffer) -> list[int]:
+    """``buffer``'s peer addresses on the host (cached per buffer)."""
+    key = id(buffer)
+    ptrs = _PEER_PTRS_HOST.get(key)
+    if ptrs is None:
+        ptrs = _PEER_PTRS_HOST[key] = buffer.peer_ptrs.tolist()
+    return ptrs
+
+
 def _workspace(layout: ContextLayout, pages: int, device) -> _SymmBuffer:
     # Sizes come from the configuration, so every rank rendezvouses together.
     nbytes = pages * (layout.mla_page_bytes + layout.index_page_bytes)
@@ -179,8 +192,13 @@ def reserve_workspace(
     layout: ContextLayout, max_tokens: int, max_reqs: int, device: torch.device
 ) -> None:
     """Allocate the workspace in the memory profile; symmetric memory lives
-    outside the torch caching allocator, so it counts as non-torch memory."""
+    outside the torch caching allocator, so it counts as non-torch memory.
+    Also creates the rank-major copies' flag words (a collective)."""
+    from vllm.v1.attention.ops.dcp_shardq.rank_major import reserve_flags
+
     _workspace(layout, capacity_pages(max_tokens, max_reqs), device)
+    tp = get_tp_group()
+    reserve_flags(tp.device_group, tp.world_size, tp.rank_in_group, device)
 
 
 # The (group, step shape) keys warm_up_dcp_fallback ran.
@@ -326,6 +344,14 @@ class DcpShardQContext:
     # Per layer, for a step of several groups: writes the prefill tokens
     # [lo, hi)'s MLA rows into the workspace (set by the MLA layer).
     write_new_tokens: Any = None
+    # A step of one group whose MLA rows fit the rank-major layout
+    # (rank_major.py): the workspace's MLA pages hold rank-major rows, the
+    # context's MLA rows move by the copy engine, and ``mla_slot_mapping``
+    # gives the new tokens' rank-major rows (``slot_mapping`` stays the
+    # token-ordered one of ``push``).
+    rank_major: "RankMajorPlan | None" = None
+    # Per layer, under ``rank_major``: the copies into the peers in flight.
+    mla_in_flight: "InFlight | None" = None
 
     # The workspace's pages of 64 tokens address its views and block table.
     block_size = PAGE_TOKENS
@@ -412,18 +438,88 @@ class DcpShardQContext:
         # Peers may still read the previous layer (or group) from their
         # workspaces.
         buffer.handle.barrier()
-        self.push(
-            mla_cache,
-            mla_block_table,
-            index_cache,
-            index_block_table,
-            buffer.peer_ptrs,
-            group,
-        )
+        if self.rank_major is not None:
+            self._gather_rank_major(
+                mla_cache, mla_block_table, index_cache, index_block_table, buffer
+            )
+        else:
+            self.push(
+                mla_cache,
+                mla_block_table,
+                index_cache,
+                index_block_table,
+                buffer.peer_ptrs,
+                group,
+            )
         buffer.handle.barrier()
         self.resident_group = group
         self.gather_args = (mla_cache, mla_block_table, index_cache, index_block_table)
         return index_view
+
+    def _gather_rank_major(
+        self,
+        mla_cache: torch.Tensor,
+        mla_block_table: torch.Tensor,
+        index_cache: torch.Tensor,
+        index_block_table: torch.Tensor,
+        buffer: _SymmBuffer,
+    ) -> None:
+        """Pack this rank's context MLA rows into its region, push the
+        indexer rows, then start the MLA rows' copies into the peers on the
+        copy engine (the barrier after this call waits for the indexer rows
+        only)."""
+        from vllm.v1.attention.ops.dcp_shardq import rank_major
+        from vllm.v1.attention.ops.dcp_shardq.gather import DCP_CONTEXT_PUSH_KERNEL
+
+        plan = self.rank_major
+        assert plan is not None
+        mla_rows = buffer.storage[: self.pages * self.layout.mla_page_bytes]
+        rank_major.pack(
+            plan, mla_cache, mla_block_table, self.num_decodes, mla_rows
+        )
+        if self.max_local_pages:
+            DCP_CONTEXT_PUSH_KERNEL(
+                mla_cache=mla_cache,
+                mla_block_table=mla_block_table[self.num_decodes :],
+                index_cache=index_cache,
+                index_block_table=index_block_table[self.num_decodes :],
+                seq_lens=self.seq_lens,
+                query_start_loc=self.query_start_loc,
+                dst_block_table=self.block_table[self.num_decodes :],
+                max_local_pages=self.max_local_pages,
+                dst_addrs=buffer.peer_ptrs,
+                dst_index_offset=self.pages * self.layout.mla_page_bytes,
+                rank=self.rank,
+                index_row_bytes=self.layout.index_row_bytes,
+                push_mla=False,
+            )
+        # The copies start once the indexer rows went out: they would slow
+        # that push (on the critical path) by sharing NVLink with it.
+        packed = torch.cuda.Event()
+        packed.record()
+        self.mla_in_flight = rank_major.copy_to_peers(
+            plan,
+            get_tp_group().device_group,
+            _peer_ptrs_host(buffer),
+            self.layout.mla_row_bytes,
+            packed,
+            index_cache.device,
+        )
+
+    @property
+    def mla_slot_mapping(self) -> torch.Tensor:
+        """int64 [num_prefill_tokens]: the workspace MLA row of each new
+        prefill token (rank-major under ``rank_major``)."""
+        if self.rank_major is not None:
+            assert self.rank_major.slot_mapping is not None
+            return self.rank_major.slot_mapping
+        return self.slot_mapping
+
+    def wait_mla(self) -> None:
+        """Order the current stream after every rank's context MLA rows landed
+        in this rank's workspace (a no-op without ``rank_major``)."""
+        if self.mla_in_flight is not None:
+            self.mla_in_flight.wait()
 
     def gathered_indexer_chunks(
         self,
@@ -561,6 +657,21 @@ def build_dcp_shardq_context(
         ]
         group_chunks.append([chunk for chunk in chunks if chunk is not None])
     indexer_chunks = [chunk for chunks in group_chunks for chunk in chunks]
+    rank_major = None
+    if len(groups) == 1 and world > 1:
+        from vllm.v1.attention.ops.dcp_shardq.rank_major import (
+            plan_rank_major,
+            rank_major_slots,
+        )
+
+        rank_major = plan_rank_major(
+            seq_lens, query_lens, num_decodes, max_pages, PAGE_TOKENS, world, rank,
+            to_device,
+        )
+        if rank_major is not None:
+            rank_major.slot_mapping = to_device(
+                rank_major_slots(rank_major, seq_lens, query_lens), torch.int64
+            )
     rel_qsl = qsl - qsl[0]
     group_token_bounds = np.array(
         [rel_qsl[g_lo] for g_lo, _ in groups] + [rel_qsl[-1]], dtype=np.int64
@@ -583,6 +694,7 @@ def build_dcp_shardq_context(
         groups=groups,
         group_chunks=group_chunks,
         group_token_bounds=group_token_bounds,
+        rank_major=rank_major,
     )
 
 
@@ -595,23 +707,26 @@ class _GatheredContextIndexRemap(ConvertReqIndexToGlobalIndexKernel):
     warms the runtime launches."""
 
     def get_warmup_keys(  # type: ignore[override]
-        self, *, num_topk_tokens: int
+        self, *, num_topk_tokens: int, world: int = 1, rank: int = 0
     ) -> list[ConvertReqIndexToGlobalIndexKernel.CompileKey]:
+        # The token-ordered workspace, and the rank-major MLA rows
+        # (rank_major.py: the prefill-workspace mode, de-interleaved by DCP).
         return [
             self.dispatch(
                 BLOCK_SIZE=PAGE_TOKENS,
                 BLOCK_STRIDE_ROWS=PAGE_TOKENS,
                 BLOCK_N=128,
                 NUM_TOPK_TOKENS=num_topk_tokens,
-                HAS_PREFILL_WORKSPACE=False,
+                HAS_PREFILL_WORKSPACE=rank_major,
                 HAS_IDX_MAPPING=False,
                 COUNT_VALID=True,
                 COMPACT_TO_FRONT=True,
-                DCP_SIZE=1,
-                DCP_RANK=0,
+                DCP_SIZE=world if rank_major else 1,
+                DCP_RANK=rank if rank_major else 0,
                 DCP_INTERLEAVE=1,
                 max_num_blocks_per_req=TABLE_PAGES_ALIGN,
             )
+            for rank_major in ((False, True) if world > 1 else (False,))
         ]
 
 
@@ -627,13 +742,20 @@ def register_warmup(layout: ContextLayout, world: int, num_topk_tokens: int) -> 
     # gather imports cutlass, so import it only on the SM100 path.
     from vllm.v1.attention.ops.dcp_shardq.gather import DCP_CONTEXT_PUSH_KERNEL
 
+    from vllm.v1.attention.ops.dcp_shardq.rank_major import RANK_MAJOR_PACK_KERNEL
+
     DCP_CONTEXT_PUSH_KERNEL.register_warmup(
         world=world,
         mla_row_bytes=layout.mla_row_bytes,
         index_row_bytes=layout.index_row_bytes,
         index_scale_bytes=layout.index_scale_bytes,
     )
-    _GATHERED_CONTEXT_INDEX_REMAP.register_warmup(num_topk_tokens=num_topk_tokens)
+    RANK_MAJOR_PACK_KERNEL.register_warmup(row_bytes=layout.mla_row_bytes, world=world)
+    _GATHERED_CONTEXT_INDEX_REMAP.register_warmup(
+        num_topk_tokens=num_topk_tokens,
+        world=world,
+        rank=get_tp_group().rank_in_group,
+    )
 
 
 SHARDQ = "ShardQ"

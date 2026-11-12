@@ -115,6 +115,9 @@ class DcpContextPushKernel(VllmCuTeDSLJitKernel["DcpContextPushKernel.CompileKey
         mla_row_bytes: int
         index_row_bytes: int
         index_scale_bytes: int
+        # False: the indexer rows only (the MLA rows move by
+        # rank_major.RankMajorContext).
+        push_mla: bool = True
 
     @staticmethod
     def kernel(compile_key: CompileKey) -> Any:
@@ -125,6 +128,7 @@ class DcpContextPushKernel(VllmCuTeDSLJitKernel["DcpContextPushKernel.CompileKey
         mla_row = compile_key.mla_row_bytes
         index_row = compile_key.index_row_bytes
         scale_bytes = compile_key.index_scale_bytes
+        push_mla = compile_key.push_mla
         assert mla_row % 16 == 0 and index_row % 16 == 0 and scale_bytes == 4
         mla_page = PAGE_TOKENS * mla_row
         index_page = PAGE_TOKENS * (index_row + scale_bytes)
@@ -216,26 +220,27 @@ class DcpContextPushKernel(VllmCuTeDSLJitKernel["DcpContextPushKernel.CompileKey
                     Int64(dst_addrs[d]) + dst_index_offset for d in range(world)
                 ]
 
-                mla_src = page_address(
-                    mla_base,
-                    mla_block_stride,
-                    mla_pages_per_block,
-                    mla_block_table,
-                    req,
-                    page,
-                    mla_page,
-                )
-                copy_rows(
-                    mla_src,
-                    mla_dst,
-                    dst_page,
-                    rank,
-                    row0,
-                    num_mla,
-                    mla_page,
-                    0,
-                    mla_row,
-                )
+                if cutlass.const_expr(push_mla):
+                    mla_src = page_address(
+                        mla_base,
+                        mla_block_stride,
+                        mla_pages_per_block,
+                        mla_block_table,
+                        req,
+                        page,
+                        mla_page,
+                    )
+                    copy_rows(
+                        mla_src,
+                        mla_dst,
+                        dst_page,
+                        rank,
+                        row0,
+                        num_mla,
+                        mla_page,
+                        0,
+                        mla_row,
+                    )
                 index_src = (
                     index_base
                     + Int64(index_block_table[req, page]) * index_block_stride
@@ -310,12 +315,14 @@ class DcpContextPushKernel(VllmCuTeDSLJitKernel["DcpContextPushKernel.CompileKey
         mla_row_bytes: int,
         index_row_bytes: int,
         index_scale_bytes: int,
+        push_mla: bool = True,
     ) -> CompileKey:
         return self.CompileKey(
             world=world,
             mla_row_bytes=mla_row_bytes,
             index_row_bytes=index_row_bytes,
             index_scale_bytes=index_scale_bytes,
+            push_mla=push_mla,
         )
 
     # The JIT warmup registry passes a registration's keywords through as is
@@ -334,7 +341,9 @@ class DcpContextPushKernel(VllmCuTeDSLJitKernel["DcpContextPushKernel.CompileKey
                 mla_row_bytes=mla_row_bytes,
                 index_row_bytes=index_row_bytes,
                 index_scale_bytes=index_scale_bytes,
+                push_mla=push_mla,
             )
+            for push_mla in (True, False)
         ]
 
     def warmup_inputs(self, compile_key: CompileKey) -> tuple[Any, ...]:
@@ -383,6 +392,7 @@ class DcpContextPushKernel(VllmCuTeDSLJitKernel["DcpContextPushKernel.CompileKey
         dst_index_offset: int,
         rank: int,
         index_row_bytes: int,
+        push_mla: bool = True,
     ) -> CuTeDSLLaunchSpec[CompileKey]:
         """Push this rank's rows of the first ``seq_lens`` tokens of each
         request (MLA rows of its context only; ``query_start_loc`` bounds its
@@ -404,6 +414,7 @@ class DcpContextPushKernel(VllmCuTeDSLJitKernel["DcpContextPushKernel.CompileKey
             mla_row_bytes=mla_cache.shape[-1],
             index_row_bytes=index_row_bytes,
             index_scale_bytes=index_scale_bytes,
+            push_mla=push_mla,
         )
         return compile_key, (
             mla_cache.data_ptr(),
