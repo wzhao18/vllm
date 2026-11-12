@@ -4612,6 +4612,14 @@ def test_fa4_sparse_hook_routes_lanes(monkeypatch, is_decode):
     dcp_filter = MagicMock(return_value=(inputs.topk_indices, inputs.valid_counts))
     monkeypatch.setattr(sparse_mla, "triton_filter_and_convert_dcp_index", dcp_filter)
     inputs.metadata.num_decode_tokens = num_tokens if is_decode else 1
+    # The trtllm-gen workspace as the metadata builders size it: its DCP
+    # softmax-stats slab covers the batch's LSE rows.
+    import vllm.v1.attention.backends.mla.flashinfer_mla_sparse as fims
+
+    monkeypatch.setattr(fims, "_fi_sparse_workspace", None)
+    fims._get_workspace_buffer(
+        torch.device("cpu"), fims._required_workspace_bytes(dcp, 16, num_tokens)
+    )
 
     with torch.inference_mode():
         out, lse = impl.forward_mqa(q, inputs.kv_cache, inputs.metadata, None)
