@@ -428,7 +428,8 @@ def test_draft_cake_rules():
     DRAFT_CAKE): every DL3 / DL7 fold and wide row whose twin launches a split above
     1, with the twin's short split, long tiles 0 (every request on the per-step
     quantum), the fold rows at DRAFT_CAKE's launched split and the wide rows at the
-    twin's (its workspace); the target reads none of them."""
+    twin's (its workspace), at least DRAFT_WIDE_MIN_LAUNCH; the target reads none of
+    them."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.mla import dcp
 
     for (rows, heads, q, size), rule in dcp.DRAFT_LONG_SPLIT.items():
@@ -439,6 +440,8 @@ def test_draft_cake_rules():
         launched = want[0]
         if rows <= 64:
             launched = dcp.DRAFT_CAKE_LAUNCHED[size].get((q, rows), launched)
+        else:
+            launched = max(launched, dcp.DRAFT_WIDE_MIN_LAUNCH)
         assert rule == (twin[0], launched, 0, want[1], want[2])
         assert dcp.split_rule(rows, heads, q, size) == rule
         assert dcp.split_rule(rows, heads, q) == dcp.LONG_SPLIT.get((rows, heads))
@@ -450,6 +453,12 @@ def test_draft_cake_rules():
             set(range(14, 449, 7))
         )
     assert dcp.split_rule(66, 96, 3, 4)[1] == dcp.LONG_SPLIT[88, 96][1]
+    # DL3 B129-B160 (twin 516-640 rows: the verify's 2 long splits) launch 3; the
+    # target's own rule there stays 2
+    for size in (4, 16):
+        assert dcp.split_rule(420, 96, 3, size)[1] == 3
+        assert dcp.split_rule(270, 96, 3, size)[1] == dcp.LONG_SPLIT[360, 96][1]
+    assert dcp.split_rule(560, 96, 4)[1] == 2
 
 
 def test_cake_partition():
@@ -1211,7 +1220,8 @@ def _dcp96_main(rank, world, device, group, interleave=1):
     heads_rank = 96 // world
     seen: dict = {}
     args = world, rank, torch.distributed.group.WORLD, device, interleave
-    dl3 = [3, 6, 9, 12, 24, 45, 54, 57, 63, 96, 192, 288]
+    # (420: DL3 B140, a wide row at DRAFT_WIDE_MIN_LAUNCH)
+    dl3 = [3, 6, 9, 12, 24, 45, 54, 57, 63, 96, 192, 288, 420]
     dl7 = [7, 14, 28, 42, 56, 63, 112, 224, 448]
     failures = _dcp_case(3, dl3, True, *args, "DL3 96h causal", seen,
                          heads_rank=heads_rank)  # fmt: skip
