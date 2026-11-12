@@ -27,7 +27,9 @@ logger = init_logger(__name__)
 
 def _rates(spec, device):
     from vllm.config import SpeculativeConfig
-    from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
+    from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
+        unconditional_to_conditional_rates,
+    )
 
     if spec.rejection_sample_method != "synthetic":
         return None

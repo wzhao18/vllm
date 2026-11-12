@@ -1170,7 +1170,7 @@ def _dsa_case(config, rank, device, indexer, topk_mode, rows, refusals):
     from vllm.v1.attention.backends.mla.indexer import (
         DeepseekV32IndexerMetadataBuilder,
     )
-    from vllm.v1.worker.block_table import get_block_table_width
+    from vllm.v1.kv_cache_interface import get_block_table_width
 
     bf = torch.bfloat16
     index_row = INDEX_ROWS[indexer]
