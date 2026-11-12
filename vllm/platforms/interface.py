@@ -19,7 +19,7 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 if TYPE_CHECKING:
     from torch.distributed import PrefixStore, ProcessGroup
 
-    from vllm.config import VllmConfig
+    from vllm.config import CacheConfig, VllmConfig
     from vllm.config.kernel import IrOpPriorityConfig
     from vllm.inputs import EngineInput
     from vllm.pooling_params import PoolingParams
@@ -66,6 +66,30 @@ def get_assigned_physical_gpu_ids() -> list[int] | None:
 def in_wsl() -> bool:
     # Reference: https://github.com/microsoft/WSL/issues/4071
     return "microsoft" in " ".join(platform.uname()).lower()
+
+
+def set_packed_hybrid_block_size(
+    cache_config: "CacheConfig", packed_block_size: int, architecture: str
+) -> None:
+    """Use the block row a packed hybrid model sizes for itself.
+
+    The model sizes the row from its layers and TP so that P/D instances of
+    different TP sizes keep compatible rows and state-group counts. A user
+    `--block-size` would move it off that grid, so it is replaced (with a
+    warning) rather than taken as a floor as for other hybrid models.
+    """
+    if (
+        cache_config.user_specified_block_size
+        and cache_config.block_size != packed_block_size
+    ):
+        logger.warning(
+            "%s sizes its packed KV block row from the model and TP; ignoring "
+            "--block-size %d and using %d.",
+            architecture,
+            cache_config.block_size,
+            packed_block_size,
+        )
+    cache_config.block_size = packed_block_size
 
 
 class PlatformEnum(enum.Enum):
@@ -1114,17 +1138,26 @@ class Platform:
             )
 
         # Models that pack every layer's page into one block row (BLHNC) size
-        # the row themselves; no page is padded then.
+        # the row themselves; no page is padded then. The row also lands on
+        # the prefix-cache grid: a block that is not a multiple of
+        # prefix_match_unit is rejected (`resolve_kv_cache_block_sizes`).
         packed_block_size = None
         if hasattr(model_cls, "get_packed_hybrid_block_size"):
             packed_block_size = model_cls.get_packed_hybrid_block_size(
                 vllm_config,
                 attn_page_size_1_token,
                 mamba_page_size,
-                lcm(backend_block_alignment, checkpoint_alignment),
+                lcm(
+                    backend_block_alignment,
+                    checkpoint_alignment,
+                    cache_config.prefix_match_unit or 1,
+                ),
             )
         if packed_block_size is not None:
             attn_block_size = packed_block_size
+            set_packed_hybrid_block_size(
+                cache_config, packed_block_size, model_config.architecture
+            )
         else:
             # Use minimum block size that satisfies both backend alignment and
             # mamba page size compatibility

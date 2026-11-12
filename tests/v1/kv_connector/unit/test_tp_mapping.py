@@ -52,6 +52,7 @@ def _compute_mapping(
     transfer_topology.is_mla = is_mla
     transfer_topology.total_num_kv_heads = num_kv_heads
     transfer_topology.dcp_size = dcp_size
+    transfer_topology.is_mamba = any(t is MambaSpec for t in group_spec_types)
     return compute_tp_mapping(
         transfer_topology=transfer_topology,
         remote_tp_size=remote_tp_size,
@@ -175,7 +176,86 @@ def test_dcp_consumer_count_matches_readers(
     for remote_rank in range(remote_tp_size):
         readers = [m for m in mappings if remote_rank in m.all_source_ranks]
         for mapping in readers:
-            assert mapping.local_consumers == len(readers)
+            assert mapping.consumers(remote_rank) == len(readers)
+
+
+# ======================================================================
+# Hybrid (attention + Mamba state) source ranks under DCP
+# ======================================================================
+
+HYBRID_GROUPS = (FullAttentionSpec, MambaSpec)
+
+
+def _hybrid_mappings(tp_size: int, remote_tp_size: int) -> list[TPMapping]:
+    """Mappings of every local rank of an MLA+Mamba model with TP = DCP on
+    both sides."""
+    return [
+        _compute_mapping(
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            remote_tp_size=remote_tp_size,
+            is_mla=True,
+            num_kv_heads=1,
+            group_spec_types=HYBRID_GROUPS,
+            dcp_size=tp_size,
+            remote_dcp_size=remote_tp_size,
+        )
+        for tp_rank in range(tp_size)
+    ]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    ("tp_size", "remote_tp_size"), [(16, 8), (8, 16), (16, 4), (4, 16), (8, 8)]
+)
+def test_hybrid_dcp_attention_and_state_sources_split(tp_size, remote_tp_size):
+    """Attention KV comes from the remote ranks holding this rank's DCP
+    positions (rank mod DCP), Mamba state from those holding its TP shard of
+    the heads (TP ratio); each producer counts every local rank reading any
+    kind from it."""
+    mappings = _hybrid_mappings(tp_size, remote_tp_size)
+    for tp_rank, mapping in enumerate(mappings):
+        attn, state = mapping.source_ranks_per_group
+        if tp_size >= remote_tp_size:
+            assert attn == (tp_rank % remote_tp_size,)
+            assert state == (tp_rank * remote_tp_size // tp_size,)
+        else:
+            ratio = remote_tp_size // tp_size
+            assert attn == tuple(range(tp_rank, remote_tp_size, tp_size))
+            assert state == tuple(range(tp_rank * ratio, (tp_rank + 1) * ratio))
+        assert mapping.all_source_ranks == tuple(sorted(set(attn) | set(state)))
+    # Per producer: the count equals the brute-force reader set, and every
+    # reader of a producer sends the same count.
+    for remote_rank in range(remote_tp_size):
+        readers = [m for m in mappings if remote_rank in m.all_source_ranks]
+        assert readers
+        assert {m.consumers(remote_rank) for m in readers} == {len(readers)}
+
+
+@pytest.mark.cpu_test
+def test_hybrid_dcp_p8_to_d16_consumers():
+    """P TP8 -> D TP16: P rank 3 serves attention to D ranks {3, 11} and state
+    to D ranks {6, 7}, so it waits for four notifications."""
+    mappings = _hybrid_mappings(16, 8)
+    attention_readers = {
+        r for r, m in enumerate(mappings) if 3 in m.source_ranks_per_group[0]
+    }
+    state_readers = {
+        r for r, m in enumerate(mappings) if 3 in m.source_ranks_per_group[1]
+    }
+    assert attention_readers == {3, 11}
+    assert state_readers == {6, 7}
+    assert mappings[3].consumers(3) == mappings[6].consumers(3) == 4
+
+
+@pytest.mark.cpu_test
+def test_handshake_targets_cover_attention_and_state_sources():
+    topology = object.__new__(TransferTopology)
+    topology.tp_rank, topology.tp_size, topology.dcp_size = 6, 16, 16
+    topology.is_mamba = True
+    assert topology.handshake_target_ranks(8, 8) == [3, 6]
+    topology.is_mamba = False
+    assert topology.handshake_target_ranks(8, 8) == [6]
 
 
 # ======================================================================
@@ -236,6 +316,41 @@ class TestBuildSrcSplitHandles:
 
 class TestMambaPlanSplitHandles:
     """Verify split handles for Mamba with FA/SSM distinction."""
+
+    def test_ssm_slice_follows_state_source_index(self):
+        """Under DCP the attention sources are not the state sources (D TP8
+        <- P TP16, D rank 1: attention {1, 9}, state {2, 3}): a state source
+        takes its slice by its index among the state sources, not among all
+        sources."""
+        plan = _compute_mapping(
+            tp_rank=1,
+            tp_size=8,
+            remote_tp_size=16,
+            is_mla=True,
+            num_kv_heads=1,
+            group_spec_types=(FullAttentionSpec, MambaSpec),
+            dcp_size=8,
+            remote_dcp_size=16,
+        )
+        assert plan.all_source_ranks == (1, 2, 3, 9)
+        worker = _make_mock_worker_for_splits((FullAttentionSpec, MambaSpec))
+        worker._region_is_mla = [True]
+        worker.block_len_per_layer = [200]
+        worker.num_regions = 1
+        worker.region_num_blocks = [1]
+        src_blocks_data = np.array(
+            [(1000, 200, 0, 200, 1), (3000, 400, 0, 400, 1)], dtype=np.uint64
+        )
+        splits = dict(
+            zip(
+                plan.all_source_ranks,
+                worker._build_local_splits_from_plan(plan, src_blocks_data, 1),
+            )
+        )
+        # MLA attention is read whole from every attention source.
+        assert all(h[0].tolist() == [1000, 200, 0, 200, 1] for h in splits.values())
+        assert splits[2][1].tolist() == [3000, 200, 0, 400, 1]
+        assert splits[3][1].tolist() == [3200, 200, 0, 400, 1]
 
     def test_fa_and_ssm_different_split_factors(self):
         """Section 0 split by num_attn_reads, section 1 by abs_tp."""
@@ -364,45 +479,43 @@ def test_csa_linear_tp_layout_boundary(total_kv_heads, local_tp, remote_tp, comp
 
 
 @pytest.mark.parametrize(
-    ("local", "remote", "has_mamba"),
+    ("local", "remote"),
     [
         # No DCP on either side, whatever the blocks.
-        ((1, 1, 16), (1, 1, 64), False),
+        ((1, 1, 16), (1, 1, 64)),
         # Same DCP layout (homogeneous DCP, e.g. Kimi K3.1 DCP8 <-> DCP8).
-        ((8, 1, 1280), (8, 1, 1280), False),
-        ((8, 1, 1280), (8, 1, 1280), True),
-        ((4, 16, 64), (4, 16, 64), False),
+        ((8, 1, 1280), (8, 1, 1280)),
+        ((4, 16, 64), (4, 16, 64)),
+        # Same DCP size and interleave, other per-rank blocks: rows pair.
+        ((8, 1, 640), (8, 1, 1280)),
+        ((4, 1, 2560), (4, 1, 640)),
+        ((4, 16, 64), (4, 16, 128)),
         # Block-interleaved pages of equal size over different DCP sizes.
-        ((1, 1, 16), (2, 16, 16), False),
-        ((4, 16, 16), (2, 16, 16), False),
-        ((2, 64, 64), (8, 64, 64), False),
+        ((1, 1, 16), (2, 16, 16)),
+        ((4, 16, 16), (2, 16, 16)),
+        ((2, 64, 64), (8, 64, 64)),
     ],
 )
-def test_dcp_transfer_mode_direct(local, remote, has_mamba):
-    mode = select_dcp_transfer_mode(
-        DcpLayout(*local), DcpLayout(*remote), has_mamba=has_mamba
-    )
+def test_dcp_transfer_mode_direct(local, remote):
+    mode = select_dcp_transfer_mode(DcpLayout(*local), DcpLayout(*remote))
     assert mode is DcpTransferMode.DIRECT
 
 
 @pytest.mark.parametrize(
-    ("local", "remote", "has_mamba", "match"),
+    ("local", "remote", "match"),
     [
         # Both shard, but rank turns differ: positions land on other ranks.
-        ((4, 1, 64), (4, 64, 64), False, "interleave"),
-        ((4, 1, 64), (2, 64, 64), False, "interleave"),
-        # DCP shards at the logical block, so blocks must match.
-        ((8, 1, 640), (8, 1, 1280), False, "logical block sizes"),
-        ((1, 1, 32), (4, 64, 64), False, "logical block sizes"),
-        # Different DCP sizes with token-level interleave (Kimi K3.1 P8 -> D16).
-        ((16, 1, 640), (8, 1, 640), False, "block-level"),
-        ((1, 1, 64), (2, 1, 64), False, "block-level"),
-        # Hybrid models keep their state per rank.
-        ((4, 64, 64), (2, 64, 64), True, "matching DCP sizes"),
+        ((4, 1, 64), (4, 64, 64), "interleave"),
+        ((4, 1, 64), (2, 64, 64), "interleave"),
+        # Different DCP sizes move rows between pages: token-level interleave
+        # (Kimi K3.1 P8 -> D16), or block-level pages of different sizes.
+        ((16, 1, 640), (8, 1, 1280), "not supported yet"),
+        ((16, 1, 640), (8, 1, 640), "not supported yet"),
+        ((1, 1, 64), (2, 1, 64), "not supported yet"),
+        ((1, 1, 32), (4, 64, 64), "not supported yet"),
+        ((4, 64, 64), (2, 128, 128), "interleave"),
     ],
 )
-def test_dcp_transfer_mode_rejects(local, remote, has_mamba, match):
+def test_dcp_transfer_mode_rejects(local, remote, match):
     with pytest.raises(NixlPeerIncompatibleError, match=match):
-        select_dcp_transfer_mode(
-            DcpLayout(*local), DcpLayout(*remote), has_mamba=has_mamba
-        )
+        select_dcp_transfer_mode(DcpLayout(*local), DcpLayout(*remote))

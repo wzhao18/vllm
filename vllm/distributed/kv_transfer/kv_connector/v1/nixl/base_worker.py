@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict
-from collections.abc import Iterator, Sequence
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
@@ -161,6 +161,16 @@ class _RegionPairs:
     # SSM descriptors are built, and its PLE region (set by _pair_ssm_regions).
     remote_ssm_regions: list[int] | None = None
     remote_ple_region: int | None = None
+    # The peer's cache groups holding Mamba state (their block ids are state
+    # slots, never split into kernel blocks). Its group numbering is its own
+    # when `groups_match` is False.
+    remote_ssm_groups: frozenset[int] = frozenset()
+
+    def region_groups(self) -> dict[int, int]:
+        """Region -> its local cache group, for region-mapped transfers, whose
+        regions each belong to one group and pair with the same-index region
+        of the peer (see `pull_worker`)."""
+        return dict(zip(self.local, self.group))
 
 
 class NixlBaseConnectorWorker:
@@ -187,6 +197,7 @@ class NixlBaseConnectorWorker:
         pairs: tuple[Sequence[int], Sequence[int]],
         region_num_blocks: list[int] | None = None,
         ssm_regions: Sequence[int] | None = None,
+        key_groups: Mapping[int, int] | None = None,
     ) -> np.ndarray:
         """Compute NIXL descriptor IDs for given block IDs.
 
@@ -196,6 +207,10 @@ class NixlBaseConnectorWorker:
 
         `ssm_regions` lists this side's SSM regions in the order its SSM
         descriptors are built; it defaults to the local ones.
+
+        `key_groups` maps a key of `block_ids` to the local cache group whose
+        kind (attention, SSM, PLE) its blocks have; without it keys are cache
+        groups. Region-mapped transfers key by region (`region_groups`).
         """
         num_ssm_regions = 0
         if self._has_mamba:
@@ -265,11 +280,12 @@ class NixlBaseConnectorWorker:
             group_regions = pair_regions[pair_keys == i]
             if not blocks.size or not group_regions.size:
                 continue
-            spec_type = self._group_spec_types[i]
+            cache_group = i if key_groups is None else key_groups[i]
+            spec_type = self._group_spec_types[cache_group]
             if _is_attention_spec(spec_type):
                 desc_ids = region_offsets[group_regions][:, None] + blocks[None, :]
             elif _is_ssm_spec(spec_type):
-                if i == self._ple_group_index:
+                if cache_group == self._ple_group_index:
                     ssm_desc_ids = np.array([num_ssm_descs], dtype=np.int64)
                 else:
                     # Each SSM region owns ssm_regions_per_layer consecutive
@@ -284,9 +300,7 @@ class NixlBaseConnectorWorker:
                     + num_fa_descs
                 )
             else:
-                raise ValueError(
-                    f"Unknown spec type {self._group_spec_types[i]} at index {i}"
-                )
+                raise ValueError(f"Unknown spec type {spec_type} at index {i}")
             all_descs.append(desc_ids.ravel())
 
         if not all_descs:
@@ -306,7 +320,7 @@ class NixlBaseConnectorWorker:
         num_fa_descs is the boundary between FA and SSM descriptors.
         Split counts are derived from source_ranks_per_group lengths.
         FA uses rank_to_attention_slot for the slot offset;
-        SSM uses the rank's positional index.
+        SSM uses the rank's index among the SSM source ranks.
         Each Nx5 strided desc covers one region, so slicing it slices every block.
         """
         fa_idx = next(
@@ -321,11 +335,17 @@ class NixlBaseConnectorWorker:
             (i for i, t in enumerate(self._group_spec_types) if _is_ssm_spec(t)),
             None,
         )
-        ssm_num_splits = (
-            len(plan.source_ranks_per_group[ssm_idx])
+        ssm_ranks = (
+            plan.source_ranks_per_group[ssm_idx]
             if has_ssm_descs and ssm_idx is not None
-            else 0
+            else ()
         )
+        ssm_num_splits = len(ssm_ranks)
+        # A state source's slice is its index among the state sources, which
+        # under DCP are not the attention sources (`state_source_ranks`). A
+        # rank that is only an attention source reads no state, so its SSM
+        # slice is never used.
+        ssm_slot = {rank: i for i, rank in enumerate(ssm_ranks)}
         sharded_desc_end = num_descs - (
             self._logical_num_blocks if self._ple_region_index is not None else 0
         )
@@ -346,14 +366,14 @@ class NixlBaseConnectorWorker:
         fa_split[is_fa] = ~fa_replicated
         ssm_split = ~is_fa & (starts < sharded_desc_end)
 
-        for p_idx, p_rank in enumerate(plan.all_source_ranks):
+        for p_rank in plan.all_source_ranks:
             fa_slot = plan.rank_to_attention_slot.get(p_rank, 0)
             handle = src_blocks_data.copy()
             handle[fa_split, 1] //= fa_num_splits
             handle[fa_split, 0] += fa_slot * handle[fa_split, 1]
             if ssm_num_splits:
                 handle[ssm_split, 1] //= ssm_num_splits
-                handle[ssm_split, 0] += p_idx * handle[ssm_split, 1]
+                handle[ssm_split, 0] += ssm_slot.get(p_rank, 0) * handle[ssm_split, 1]
             yield handle
 
     def _needs_split_local_xfer_handles(self, tp_ratio: int, plan: TPMapping) -> bool:
@@ -402,6 +422,18 @@ class NixlBaseConnectorWorker:
         block_len_per_layer without register_kv_caches).
         """
         return region_idx < len(self._region_is_mla) and self._region_is_mla[region_idx]
+
+    def _region_holds_only_mamba_state(self, region_idx: int) -> bool:
+        """Whether every layer of region `region_idx` is a Mamba layer, so its
+        block holds state pages only (sharded with TP, not by tokens)."""
+        members = (
+            self.region_members[region_idx]
+            if region_idx < len(self.region_members)
+            else []
+        )
+        return bool(members) and all(
+            isinstance(self._layer_specs.get(name), MambaSpec) for name in members
+        )
 
     def _resolve_head_sharded_draft_kv_heads(self) -> int | None:
         """Total KV heads of a non-MLA draft under an MLA target, else None.
@@ -615,23 +647,29 @@ class NixlBaseConnectorWorker:
             groups_match=groups_match,
         )
         if self._has_mamba:
-            self._pair_ssm_regions(pairs, engine_id)
+            self._pair_ssm_regions(pairs, engine_id, remote_layer_groups)
         return pairs
 
-    def _pair_ssm_regions(self, pairs: _RegionPairs, engine_id: EngineId) -> None:
+    def _pair_ssm_regions(
+        self,
+        pairs: _RegionPairs,
+        engine_id: EngineId,
+        remote_layer_groups: dict[str, int],
+    ) -> None:
         """Find the peer's SSM and PLE regions through the pairs.
 
         SSM descriptors are built per region holding SSM state. The peer's SSM
         regions are listed in the order of the local SSM regions they pair
         with, so identical layouts keep identical descriptor lists.
+
+        Pairs are per layer, so each layer's state reads from the peer's slot
+        of that layer whichever cache group holds it on either side: the two
+        sides may group their Mamba layers differently (e.g. other block sizes
+        give other state-group counts), and the reads are then mapped by region
+        (`pull_worker`). A slot is the one holding the state at the position
+        the prefill shipped: both sides clip their state groups to that slot
+        (`get_exchange_clipped_blocks`), whatever their block sizes.
         """
-        if not pairs.groups_match:
-            # Region-mapped reads, the only fallback, support pure MLA alone.
-            raise NotImplementedError(
-                f"Engine {engine_id} puts Mamba/SSM hybrid KV layers in other "
-                "cache groups than this worker; use the same KV cache plan on P "
-                "and D."
-            )
         local_ssm = self._ssm_region_indices or range(len(self.block_len_per_layer))
         ssm_slot = {region: slot for slot, region in enumerate(local_ssm)}
         ssm_pairs: list[tuple[int, int]] = []
@@ -649,6 +687,37 @@ class NixlBaseConnectorWorker:
             dict.fromkeys(remote for _, remote in sorted(ssm_pairs))
         )
         pairs.remote_ple_region = next(iter(ple_regions), None)
+        if pairs.groups_match:
+            pairs.remote_ssm_groups = frozenset(
+                group
+                for group, spec_type in enumerate(self._group_spec_types)
+                if _is_ssm_spec(spec_type)
+            )
+        else:
+            # Region-mapped reads key blocks by region, so a region must hold
+            # the layers of one cache group (it pairs once per group it holds).
+            if len(set(pairs.local)) != len(pairs.local) or len(
+                set(pairs.remote)
+            ) != len(pairs.remote):
+                raise NotImplementedError(
+                    f"Engine {engine_id} puts Mamba/SSM hybrid KV layers in "
+                    "other cache groups than this worker, and some KV regions "
+                    "hold layers of several cache groups; use the same KV "
+                    "cache plan on P and D."
+                )
+            mamba_layers = [
+                name
+                for name, spec in self._layer_specs.items()
+                if isinstance(spec, MambaSpec)
+            ]
+            if any(name not in remote_layer_groups for name in mamba_layers):
+                raise NotImplementedError(
+                    f"Engine {engine_id} groups its KV layers differently but "
+                    "does not advertise the cache group of each Mamba layer."
+                )
+            pairs.remote_ssm_groups = frozenset(
+                remote_layer_groups[name] for name in mamba_layers
+            )
 
     @staticmethod
     def _select_remote_regions(
@@ -2591,7 +2660,7 @@ class NixlBaseConnectorWorker:
         # Before registering any of the peer's state: a peer whose KV layout
         # needs another mapping is rejected for good.
         dcp_transfer_mode = self._check_peer_compatibility(
-            nixl_agent_meta, remote_dcp_size
+            nixl_agent_meta, remote_dcp_size, remote_tp_size
         )
         pairs = self._pair_regions(nixl_agent_meta)
         if self._dst_pairs.setdefault(engine_id, pairs) != pairs:
@@ -2784,7 +2853,10 @@ class NixlBaseConnectorWorker:
         return remote_agent_name
 
     def _check_peer_compatibility(
-        self, nixl_agent_meta: NixlAgentMetadata, remote_dcp_size: int
+        self,
+        nixl_agent_meta: NixlAgentMetadata,
+        remote_dcp_size: int,
+        remote_tp_size: int,
     ) -> DcpTransferMode:
         """Check that the peer's configuration fits this engine's KV layout,
         and pick the DCP transfer mode.
@@ -2794,10 +2866,10 @@ class NixlBaseConnectorWorker:
         instead of failing (and recomputing) every request of that peer.
         """
         try:
+            self._validate_dcp_spans_tp(remote_dcp_size, remote_tp_size)
             mode = select_dcp_transfer_mode(
                 self._dcp_layout,
                 self._remote_dcp_layout(nixl_agent_meta, remote_dcp_size),
-                has_mamba=self._has_mamba,
             )
             self._validate_kv_row_layouts(nixl_agent_meta)
             self._validate_kv_cache_scales(nixl_agent_meta)
@@ -2808,6 +2880,24 @@ class NixlBaseConnectorWorker:
                 f"this engine: {e}"
             ) from e
         return mode
+
+    def _validate_dcp_spans_tp(self, remote_dcp_size: int, remote_tp_size: int) -> None:
+        """Reject different DCP sizes unless each side's DCP group is 1 or its
+        whole TP group: the source-rank math (`TransferTopology`) pairs one
+        DCP rank per TP rank, so a TP group holding several copies of each
+        DCP shard would read and count those copies as distinct shards."""
+        if self.dcp_size == remote_dcp_size:
+            return
+        for side, dcp_size, tp_size in (
+            ("local", self.dcp_size, self.transfer_tp_size),
+            ("remote", remote_dcp_size, remote_tp_size),
+        ):
+            if dcp_size not in (1, tp_size):
+                raise NixlPeerIncompatibleError(
+                    "NIXL transfers between different DCP sizes need DCP equal "
+                    "to TP (or no DCP) on each side; the "
+                    f"{side} side has TP {tp_size} and DCP {dcp_size}."
+                )
 
     def _remote_dcp_layout(
         self, nixl_agent_meta: NixlAgentMetadata, remote_dcp_size: int
@@ -2961,8 +3051,12 @@ class NixlBaseConnectorWorker:
         remote_physical_per_logical = (
             nixl_agent_meta.physical_blocks_per_logical_kv_block
         )
+        # Region pulls pair kernel pages. Over equal DCP sizes a rank's row
+        # stream is the same on both sides, so kernel pages pair whatever the
+        # logical blocks; over different DCP sizes pages pair as whole
+        # logical (interleave) blocks, which kernel pages cannot express.
         if (
-            (self.dcp_size > 1 or remote_dcp_size > 1)
+            self.dcp_size != remote_dcp_size
             and not self._dst_pairs[remote_engine_id].groups_match
             and (
                 self._physical_blocks_per_logical_kv_block != 1
@@ -2970,7 +3064,8 @@ class NixlBaseConnectorWorker:
             )
         ):
             raise NotImplementedError(
-                "DCP region pulls require matching logical and physical block sizes"
+                "DCP region pulls between different DCP sizes require matching "
+                "logical and physical block sizes"
             )
         if (
             self._has_mamba
@@ -3101,14 +3196,22 @@ class NixlBaseConnectorWorker:
             # per-token page is TP-independent, so the block lengths must
             # match up to the kernel block size ratio even under
             # heterogeneous TP (remote kernel blocks may be smaller).
-            # SSM geometry is validated via ssm_sizes/conv offsets instead.
-            local_lens = [self.block_len_per_layer[r] for r in local_regions]
+            # Regions holding only Mamba state (a packed row's per-layer state
+            # pages) shard with TP; their geometry is validated through
+            # ssm_sizes, conv offsets and `mamba_state_geometry` instead.
+            compared = [
+                i
+                for i, region in enumerate(local_regions)
+                if not self._region_holds_only_mamba_state(region)
+            ]
+            local_lens = [self.block_len_per_layer[local_regions[i]] for i in compared]
+            remote_lens = [nixl_agent_meta.block_lens[i] for i in compared]
             assert local_lens == [
-                block_len * block_size_ratio for block_len in nixl_agent_meta.block_lens
+                block_len * block_size_ratio for block_len in remote_lens
             ], (
                 "Hybrid MLA kernel-granularity block lengths must match "
                 f"between P and D (block_size_ratio={block_size_ratio}): "
-                f"local={local_lens}, remote={nixl_agent_meta.block_lens}."
+                f"local={local_lens}, remote={remote_lens}."
             )
         elif not self._has_mamba:
             assert len(local_regions) == len(nixl_agent_meta.block_lens), (
@@ -3879,7 +3982,12 @@ class NixlBaseConnectorWorker:
             covered.append(range(len(local) - num_pairs, len(local)))
         return paired_local, paired_remote, covered
 
-    def _logical_to_kernel_block_ids(self, block_ids: BlockIds, ratio: int) -> BlockIds:
+    def _logical_to_kernel_block_ids(
+        self,
+        block_ids: BlockIds,
+        ratio: int,
+        ssm_groups: Collection[int] | None = None,
+    ) -> BlockIds:
         """Convert block ids to kernel physical block ids.
         This is required when the logical block size (the one set by the user)
         does not match the one required by the attn backend.
@@ -3887,6 +3995,10 @@ class NixlBaseConnectorWorker:
         We always receive logical blocks from the engine, so we expand them here eg:
         logical block ids: [(SW-clipped) [1], (FA) [2, 3]], ratio=2
         physical block ids: [(SW-clipped) [2, 3], (FA) [4, 5, 6, 7]]
+
+        `ssm_groups` lists the groups holding Mamba state for block ids of a
+        peer that groups its layers differently (`_RegionPairs.remote_ssm_groups`);
+        by default the groups are this engine's.
         """
         if ratio == 1:
             # Noop when physical and logical block sizes are the same
@@ -3895,8 +4007,12 @@ class NixlBaseConnectorWorker:
         # Mamba blocks have no logical<>physical discrepancy (block-size=1)
         physical_block_ids = []
         for i, group in enumerate(block_ids):
-            spec = self.kv_cache_config.transfer_groups[i].kv_cache_spec
-            if _is_ssm_spec(get_representative_spec_type(spec)):
+            if ssm_groups is not None:
+                is_ssm = i in ssm_groups
+            else:
+                spec = self.kv_cache_config.transfer_groups[i].kv_cache_spec
+                is_ssm = _is_ssm_spec(get_representative_spec_type(spec))
+            if is_ssm:
                 physical_block_ids.append(group)
             else:
                 physical_block_ids.append(
@@ -3905,6 +4021,60 @@ class NixlBaseConnectorWorker:
                     .tolist()
                 )
         return physical_block_ids
+
+    def _pair_same_dcp_layout_pages(
+        self,
+        local_kernel_ids: BlockIds,
+        remote_kernel_ids: BlockIds,
+        local_num_computed_blocks: Sequence[int],
+        block_size_ratio: int,
+    ) -> tuple[BlockIds, BlockIds]:
+        """Pair kernel pages of a peer with the same DCP size and interleave
+        but other per-rank logical blocks (DIRECT, `select_dcp_transfer_mode`).
+
+        A rank then holds the same positions in the same order on both sides
+        (`DcpLayout.global_pos` does not depend on the block size), so its
+        local row `j` is the peer rank's row `j`: pages pair by row, cut at
+        the remote kernel page. Local kernel pages are split into
+        `block_size_ratio` remote-sized sub-blocks (`get_mapped_blocks`), as
+        for other block-size ratios. `local_kernel_ids` excludes the local
+        prefix-cache hit of `local_num_computed_blocks` logical blocks per
+        group, while `remote_kernel_ids` lists the whole request. Mamba state
+        slots pair as they are (both sides clip to the slot of the shipped
+        position).
+        """
+        local_rows_per_block = (
+            self.block_size * self._physical_blocks_per_logical_kv_block
+        )
+        remote_page_rows = self.block_size // block_size_ratio
+        paired_local: list[list[int]] = []
+        paired_remote: list[list[int]] = []
+        for g, (local_group, remote_group) in enumerate(
+            zip(local_kernel_ids, remote_kernel_ids, strict=True)
+        ):
+            if not local_group or not _is_attention_spec(self._group_spec_types[g]):
+                paired_local.append(list(local_group))
+                paired_remote.append(list(remote_group))
+                continue
+            assert g not in self._dcp_replicated_groups, (
+                "DCP-replicated groups are rejected under local DCP"
+            )
+            local_pages = (
+                self.get_mapped_blocks(
+                    np.asarray(local_group), block_size_ratio
+                ).tolist()
+                if block_size_ratio > 1
+                else list(local_group)
+            )
+            first_row = local_num_computed_blocks[g] * local_rows_per_block
+            start = first_row // remote_page_rows
+            remote_pages = list(remote_group[start : start + len(local_pages)])
+            paired_local.append(local_pages[: len(remote_pages)])
+            paired_remote.append(remote_pages)
+        if not any(paired_local):
+            # Full prefix cache hit is indicated with an empty list.
+            return [], paired_remote
+        return paired_local, paired_remote
 
     def _apply_dcp_prefix_caching(
         self,

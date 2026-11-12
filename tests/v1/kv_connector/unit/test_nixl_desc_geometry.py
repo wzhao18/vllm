@@ -1034,8 +1034,9 @@ def test_hetero_ppl_pull_without_remote_num_tokens_fails():
 @pytest.mark.cpu_test
 def test_mla_hybrid_peer_with_other_cache_groups_is_refused():
     """A hybrid layer in another cache group on P would be read at the wrong
-    group's blocks, and region-mapped reads cannot serve SSM state, so the
-    handshake refuses the peer before any transfer."""
+    group's blocks, and region-mapped reads cannot serve regions holding
+    layers of several groups, so the handshake refuses the peer before any
+    transfer."""
     worker = _make_mla_hybrid_worker(
         local_block_size=16,
         kernel_block_size=16,
@@ -1436,6 +1437,8 @@ def test_mismatched_mla_kernel_page_rejected_for_mla_hybrid():
 
 @pytest.mark.cpu_test
 def test_dcp_rejects_different_logical_block_sizes():
+    """D DCP1 <- P DCP2 with other logical blocks (12 vs 8 rows): positions
+    would move between pages, which no DIRECT pairing expresses."""
     worker = _make_mla_hybrid_worker(
         local_block_size=12, kernel_block_size=4, num_logical_blocks=8, mamba=False
     )
@@ -1446,7 +1449,7 @@ def test_dcp_rejects_different_logical_block_sizes():
         remote_num_logical=12,
         remote_ssm_sizes=(24, 32),
     )
-    with pytest.raises(bw.NixlPeerIncompatibleError, match="logical block sizes"):
+    with pytest.raises(bw.NixlPeerIncompatibleError, match="not supported yet"):
         worker.add_remote_agent(
             meta_r, remote_tp_rank=0, remote_tp_size=2, remote_dcp_size=2
         )

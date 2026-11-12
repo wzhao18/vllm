@@ -18,6 +18,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
     ReadSpec,
     _is_attention_spec,
+    _is_ssm_spec,
 )
 from vllm.logger import init_logger
 
@@ -237,10 +238,10 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     "Different NIXL cache-group layouts need the same KV regions "
                     "on both sides"
                 )
-            if not self.use_mla or self._has_mamba:
+            if not self.use_mla:
                 raise NotImplementedError(
                     "Different NIXL cache-group layouts are only supported for "
-                    "pure MLA models"
+                    "MLA and MLA+Mamba hybrid models"
                 )
             if dcp_active and self._dcp_replicated_groups:
                 raise NotImplementedError(
@@ -254,6 +255,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             remote_physical_block_ids = self._logical_to_kernel_block_ids(
                 meta.remote.block_ids,
                 remote_info.remote_physical_blocks_per_logical,
+                ssm_groups=pairs.remote_ssm_groups,
             )
             remote_by_region = self._block_ids_by_region(
                 remote_physical_block_ids, remote_region_groups
@@ -261,6 +263,21 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             local_by_region = self._block_ids_by_region(
                 local_block_ids, local_region_groups
             )
+            # Mamba state regions read their one state slot as is, from the
+            # state source ranks; attention regions pair pages by position
+            # below, from the attention source ranks. A region shared by
+            # several groups (-1) is attention only: hybrids reach this path
+            # only with one group per region (`_pair_ssm_regions`).
+            region_ranks = [
+                plan.source_ranks_per_group[group]
+                if group >= 0
+                else plan.all_source_ranks
+                for group in local_region_groups
+            ]
+            state_regions = [
+                group >= 0 and _is_ssm_spec(self._group_spec_types[group])
+                for group in local_region_groups
+            ]
             num_computed_blocks = None
             num_tokens = None
             if (
@@ -286,21 +303,32 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     "require remote_num_tokens, per-group prefix counts "
                     "and unshared regions"
                 )
-            read_specs = [
-                ReadSpec(
-                    rank,
-                    *self._apply_prefix_caching_by_region(
-                        local_by_region,
-                        remote_by_region,
-                        num_computed_blocks=num_computed_blocks,
-                        num_tokens=num_tokens,
-                        remote_rank=rank,
-                        remote_dcp_size=remote_info.remote_dcp_size,
-                    ),
-                    block_ids_by_region=True,
+
+            def region_ids(block_ids: BlockIds, rank: int, state: bool) -> BlockIds:
+                return [
+                    list(ids) if rank in ranks and is_state == state else []
+                    for ids, ranks, is_state in zip(
+                        block_ids, region_ranks, state_regions
+                    )
+                ]
+
+            read_specs = []
+            for rank in plan.all_source_ranks:
+                local_ids, remote_ids = self._apply_prefix_caching_by_region(
+                    region_ids(local_by_region, rank, state=False),
+                    region_ids(remote_by_region, rank, state=False),
+                    num_computed_blocks=num_computed_blocks,
+                    num_tokens=num_tokens,
+                    remote_rank=rank,
+                    remote_dcp_size=remote_info.remote_dcp_size,
                 )
-                for rank in plan.all_source_ranks
-            ]
+                for r, ids in enumerate(region_ids(local_by_region, rank, True)):
+                    if ids:
+                        local_ids[r] = ids
+                        remote_ids[r] = list(remote_by_region[r])
+                read_specs.append(
+                    ReadSpec(rank, local_ids, remote_ids, block_ids_by_region=True)
+                )
             meta.region_blocks_to_zero = [
                 list(blocks[sum(len(spec.local_block_ids[r]) for spec in read_specs) :])
                 for r, blocks in enumerate(local_by_region)
@@ -335,9 +363,27 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 remote_info.remote_physical_blocks_per_logical,
             )
 
+            # Per-rank pages of different sizes: the DCP layouts are equal up
+            # to the block size (`select_dcp_transfer_mode`), so pages pair
+            # by row at kernel-page granularity.
+            dcp_pages_differ = dcp_active and (
+                self.block_size * self._physical_blocks_per_logical_kv_block
+                != remote_info.remote_block_size
+                * remote_info.remote_physical_blocks_per_logical
+            )
+
             read_specs = []
             for rank in plan.all_source_ranks:
-                if dcp_active:
+                if dcp_pages_differ:
+                    local_physical_ids, remote_physical_ids = (
+                        self._pair_same_dcp_layout_pages(
+                            group_ids(meta.local_physical_block_ids, rank),
+                            group_ids(meta.remote.block_ids, rank),
+                            meta.local_num_computed_blocks,
+                            block_size_ratio,
+                        )
+                    )
+                elif dcp_active:
                     local_ids = group_ids(meta.local_block_ids, rank)
                     remote_ids = group_ids(remote_logical_block_ids, rank)
                     for g in range(num_groups):
@@ -378,8 +424,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                         remote_ids,
                         remote_info.remote_physical_blocks_per_logical,
                     )
-                    # DCP requires equal logical block sizes, so the lists start
-                    # and end at the same token and pair by position.
+                    # Equal logical block sizes (others pair above), so the
+                    # lists start and end at the same token and pair by position.
                     if block_size_ratio > 1:
                         local_physical_ids, remote_physical_ids = (
                             self._map_block_ids_for_block_size_ratio(
@@ -455,7 +501,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 local_xfer_side_handle=local_xfer_side_handle,
                 local_dram_handle=local_dram_handle,
                 remote_xfer_side_handle=remote_xfer_side_handle,
-                expected_consumers=plan.local_consumers,
+                expected_consumers=plan.consumers(spec.remote_rank),
                 awaiting_kvs=meta.awaiting_kvs,
             ):
                 return
@@ -465,10 +511,11 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             # have the blocks we need so they can update the request state.
             # Same thing for DCP (tp_size == dcp_size), so the raw tp_ratio already
             # reflects whether any remote replica is left unchosen.
-            notif_id = f"{meta.remote.request_id}:{plan.local_consumers}".encode()
             remote_agents = self._remote_agents[meta.remote.engine_id]
             for rank_to_notify, agent in remote_agents.items():
                 if rank_to_notify != (0, read_specs[0].remote_rank):
+                    consumers = plan.consumers(rank_to_notify[1])
+                    notif_id = f"{meta.remote.request_id}:{consumers}".encode()
                     try:
                         self.nixl_wrapper.send_notif(agent, notif_msg=notif_id)
                     except Exception as e:
@@ -586,6 +633,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             region_num_blocks=(self.dst_region_num_blocks.get(dst_engine_id) or None),
             pairs=(pairs.remote, pairs.remote if by_region else pairs.group),
             ssm_regions=pairs.remote_ssm_regions,
+            key_groups=pairs.region_groups() if by_region else None,
         )
         local_block_descs_ids = self._compute_desc_ids(
             block_ids=local_block_ids,
@@ -594,6 +642,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             physical_blocks_per_logical=self._physical_blocks_per_logical_kv_block,
             region_num_blocks=(self.dst_region_num_blocks.get(self.engine_id) or None),
             pairs=(pairs.local, pairs.local if by_region else pairs.group),
+            key_groups=pairs.region_groups() if by_region else None,
         )
 
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)

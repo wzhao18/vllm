@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -62,9 +62,17 @@ class TPMapping:
     # FA head offset factor for hetero-TP (D_TP > P_TP).
     rank_offset_factor: int
 
-    # Local ranks (in aggregate) that read from a given source rank. The producer frees
-    # a request's blocks only once that many notifications have come in.
-    local_consumers: int = 1
+    # Remote rank -> local ranks (in aggregate) that notify it about a request,
+    # for every remote rank this rank notifies (`compute_tp_mapping` fills it).
+    # The producer frees a request's blocks only once that many notifications
+    # have come in. Counts differ per producer when attention and Mamba state
+    # come from different ranks.
+    consumers_per_rank: dict[int, int] = field(default_factory=dict)
+
+    def consumers(self, remote_rank: int) -> int:
+        """Notifications `remote_rank` waits for per request; a rank without a
+        count has this rank as its only reader (a one-to-one mapping)."""
+        return self.consumers_per_rank.get(remote_rank, 1)
 
 
 class DcpTransferMode(enum.Enum):
@@ -75,39 +83,30 @@ class DcpTransferMode(enum.Enum):
     transfer."""
 
 
-def select_dcp_transfer_mode(
-    local: DcpLayout, remote: DcpLayout, *, has_mamba: bool = False
-) -> DcpTransferMode:
+def select_dcp_transfer_mode(local: DcpLayout, remote: DcpLayout) -> DcpTransferMode:
     """Pick how attention KV moves from `remote` to `local`, or raise
     `NixlPeerIncompatibleError` for a pair of layouts no mode supports.
 
-    DIRECT pairs whole pages of one rank with whole pages of another (see
-    `_apply_dcp_prefix_caching`):
+    `block_size` is each side's logical block (rows per page on one rank).
+    DIRECT pairs pages of one rank with pages of another, with no copy after
+    the transfer:
 
-    - Same DCP size and interleave: a rank's row stream is the same on both
-      sides, so page `j` holds the same positions.
+    - Same DCP size and interleave, any block sizes: a rank's row stream is
+      the same on both sides, so local row `j` is remote row `j` of the same
+      rank, and pages pair at kernel-page granularity whatever the logical
+      blocks are (`_pair_same_dcp_layout_pages`).
     - Pages of consecutive positions on both sides (`interleave ==
-      block_size`, or no DCP): page `j` of any rank is one run of positions,
-      so it maps to one remote page whatever the DCP sizes.
+      block_size`, or no DCP) and equal blocks: page `j` of any rank is one
+      run of positions, so it maps to one remote page whatever the DCP sizes
+      (`_apply_dcp_prefix_caching`).
 
-    Other layouts (e.g. token-level interleave over different DCP sizes) need
-    rows moved between pages and are rejected. Mode selection assumes each
-    side's DCP group spans its TP ranks (`dcp_size` 1 or TP).
+    Attention KV only: Mamba state is never DCP-sharded, and comes from its
+    own source ranks (`TransferTopology.state_source_ranks`) whatever the
+    mode. Mode selection assumes each side's DCP group spans its TP ranks
+    (`dcp_size` 1 or TP).
     """
     if local.dcp_size == 1 and remote.dcp_size == 1:
         return DcpTransferMode.DIRECT
-    # DCP shards tokens at the logical block size, and reads pair blocks by
-    # logical position.
-    if local.block_size != remote.block_size:
-        raise NixlPeerIncompatibleError(
-            "DCP requires matching P/D logical block sizes: local "
-            f"{local.block_size}, remote {remote.block_size}."
-        )
-    if has_mamba and local.dcp_size != remote.dcp_size:
-        raise NixlPeerIncompatibleError(
-            "Hybrid MLA+Mamba NIXL transfers require matching DCP sizes, "
-            f"got local={local.dcp_size}, remote={remote.dcp_size}."
-        )
     if (
         local.dcp_size > 1
         and remote.dcp_size > 1
@@ -118,14 +117,22 @@ def select_dcp_transfer_mode(
             f"cp_kv_cache_interleave_size differ: local {local.interleave}, "
             f"remote {remote.interleave}. Use the same interleave on both sides."
         )
-    if local.dcp_size == remote.dcp_size or (
-        local.pages_hold_contiguous_positions and remote.pages_hold_contiguous_positions
+    if local.dcp_size == remote.dcp_size:
+        return DcpTransferMode.DIRECT
+    if (
+        local.block_size == remote.block_size
+        and local.pages_hold_contiguous_positions
+        and remote.pages_hold_contiguous_positions
     ):
         return DcpTransferMode.DIRECT
+    # The only layouts left move rows between pages after the transfer (e.g.
+    # Kimi K3.1 P DCP8 -> D DCP16 at interleave 1).
     raise NixlPeerIncompatibleError(
-        "NIXL transfers between different DCP sizes need a block-level "
-        "interleave (cp_kv_cache_interleave_size equal to the per-rank KV "
-        f"block size) on both sides: local {local}, remote {remote}."
+        "NIXL transfers between different DCP sizes need pages of consecutive "
+        "positions of equal size on both sides (cp_kv_cache_interleave_size "
+        "equal to the per-rank KV block size, or no DCP); other layouts need "
+        "KV rows moved between pages after the transfer, which is not "
+        f"supported yet: local {local}, remote {remote}."
     )
 
 
@@ -195,15 +202,9 @@ def compute_tp_mapping(
         attn_ranks = (start + np.sort(unique_idx)).tolist()
 
     # --- SSM source ranks ---
+    # Mamba state follows TP even where attention KV follows DCP.
     has_ssm = any(_is_ssm_spec(t) for t in group_spec_types)
-    if has_ssm:
-        if tp_size < remote_tp_size:
-            abs_tp = remote_tp_size // tp_size
-            ssm_ranks = list(range(tp_rank * abs_tp, (tp_rank + 1) * abs_tp))
-        else:
-            ssm_ranks = list(attn_ranks)
-    else:
-        ssm_ranks = []
+    ssm_ranks = transfer_topology.state_source_ranks(remote_tp_size) if has_ssm else []
 
     all_ranks = sorted(set(attn_ranks) | set(ssm_ranks))
 
@@ -229,14 +230,17 @@ def compute_tp_mapping(
         else compute_head_offset(tp_rank, tp_size, remote_tp_size, total_num_kv_heads)
     )
 
-    local_consumers = transfer_topology.dcp_consumer_count(
-        remote_tp_size, remote_dcp_size
-    )
+    consumers_per_rank = {
+        rank: transfer_topology.consumer_count(rank, remote_tp_size, remote_dcp_size)
+        for rank in transfer_topology.handshake_target_ranks(
+            remote_tp_size, remote_dcp_size
+        )
+    }
 
     return TPMapping(
         source_ranks_per_group=source_ranks_per_group,
         all_source_ranks=tuple(all_ranks),
         rank_to_attention_slot=rank_to_attention_slot,
         rank_offset_factor=rank_offset_factor,
-        local_consumers=local_consumers,
+        consumers_per_rank=consumers_per_rank,
     )
