@@ -21,6 +21,7 @@ from vllm.model_executor.layers.mla import (  # noqa: E402
     MultiHeadLatentAttentionWrapper,
 )
 from vllm.models.kimi_k3.nvidia.dsa import KimiK3DSAIndexer  # noqa: E402
+from vllm.models.kimi_k3.nvidia.ops import prefill_glue  # noqa: E402
 from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.moe.dense import (  # noqa: E402
     PreparedDenseMLP,
 )
@@ -264,6 +265,7 @@ def dsa_layer(fused_insert):
         q_b_proj=Linear(HEADS * (NOPE + ROPE), Q_LORA, trace, "q_b"),
         mla_attn=SparseMla(trace),
         g_proj=Linear(HEADS * V_DIM),
+        gate_sigmoid_mul=prefill_glue.eager_gate_sigmoid_mul,  # as KimiK3DSAAttention
         o_proj=lambda rows: (rows, None),
     )
     attention = SimpleNamespace(
