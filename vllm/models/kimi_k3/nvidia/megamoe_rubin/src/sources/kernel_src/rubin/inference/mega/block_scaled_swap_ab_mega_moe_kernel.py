@@ -22,6 +22,7 @@ from .....helpers.smem_workspace import SmemWorkspace
 from .....helpers.utils import ceil_div, round_up
 from .....quant_def import CombineFormat, QuantKind
 from ....schedulers.base import WorkIdAcquisitionMode
+from ....schedulers.die_split_fc12_scheduler import DieSplitPhaseInterleavedFc12Scheduler
 from ....schedulers.fc12_scheduler import (
     BlackwellFusedFc12Scheduler,
     PhaseInterleavedFc12Scheduler,
@@ -113,6 +114,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             "reduce_topk_in_kernel": bool,
             # vLLM S2: 1 or 2 epilogue warpgroups; None (absent) = 2 wherever S2 is eligible.
             "epilogue_warpgroups": OptionalRequirement(Optional[int]),
+            "die_sm_mask32": OptionalRequirement(Optional[tuple]),
         }
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
@@ -157,6 +159,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.token_in_flag_batch = impl_desc["token_in_flag_batch"]
         self.token_back_mode = impl_desc["token_back_mode"]
         self.reduce_topk_in_kernel = impl_desc["reduce_topk_in_kernel"]
+        self.die_sm_mask32 = impl_desc.get("die_sm_mask32")
 
         self.occupancy = 1
         self.architecture = "sm_107"
@@ -255,6 +258,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         scheduler_type = (
             BlackwellFusedFc12Scheduler if self.schedule_mode == "grouped" else PhaseInterleavedFc12Scheduler
         )
+        if self.schedule_mode == "phase_interleave" and impl_desc.get("die_sm_mask32") is not None:
+            scheduler_type = DieSplitPhaseInterleavedFc12Scheduler
         self.scheduler = scheduler_type(fc12_problem_desc, resolved_impl_desc)
         self.epilogue = SwapABGatedActEpilogue(fc12_problem_desc, resolved_impl_desc)
         if self.epilogue.fc1_output_dtype is not self.b_dtype:
@@ -520,6 +525,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             f"singlectareset{int(self.token_comm.tail_reset_single_cta)}_"
             f"epiflag{epi_flags}_epiwg{self.epilogue_warpgroups}_clusters{self.launch_cluster_count}_ctas{self.mixed_cga_config.total_cta_cnt}_"
             f"tokeninflag{self.token_in_flag_batch}_tokenback{self.token_back_mode}_"
+            f"die{'none' if self.die_sm_mask32 is None else 'split'}_"
             f"combine{self.combine_format.name}_clamp{self.gate_up_clamp}_"
             # The SiTU betas are codegen-time constants, so they must key the compiled kernel.
             f"situ{self.situ_beta}x{self.situ_linear_beta}_"

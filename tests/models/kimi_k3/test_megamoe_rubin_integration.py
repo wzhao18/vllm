@@ -295,16 +295,20 @@ def test_deployment_buckets_per_role(
 @pytest.mark.parametrize(
     ("world", "tokens"), [(16, 160), (16, 512), (16, 2048), (8, 2048)]
 )
-def test_shared_overlap_sm_cap_admits_every_server_bucket(world, tokens):
+def test_shared_overlap_sm_cap_admits_every_server_bucket(monkeypatch, world, tokens):
     """reserve_sms_for_shared_expert's bucket (grid capped, fallback clusters
     dropped) passes the kernel admission rules for every shipped server record,
     including the mixed-CGA EP16 2048 one, and reaches the kernel config."""
+    from vllm.models.kimi_k3.nvidia.megamoe_rubin import die_local
+
+    monkeypatch.setattr(die_local, "current_die_sm_mask32", lambda: None)
     X.select_rubin_bucket.cache_clear()
     problem = C.RubinMoeProblem(quant_kind=X.rubin_quant_kind(tokens))
     bucket, _ = X.select_rubin_bucket(problem, world, tokens)
     buckets, _ = X.select_rubin_buckets(problem, world, tokens, prefill_worker=False)
     module = SimpleNamespace(
-        bucket=bucket, buckets=buckets, kernel_weights=None, prefix="layer"
+        bucket=bucket, buckets=buckets, kernel_weights=None, prefix="layer",
+        prefill_worker=False,
     )
     X.KimiK3MegaMoEExperts.reserve_sms_for_shared_expert(module)
     capped = module.bucket

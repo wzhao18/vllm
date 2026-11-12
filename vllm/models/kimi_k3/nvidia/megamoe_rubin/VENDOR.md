@@ -36,7 +36,7 @@
     verbatim.
   - Outputs are bit-identical to stock (the GEMMs, SiTU and the top-k reduction order
     are unchanged); measured -9..-12 us per launch at decode buckets on VR.
-  - The kernel file (`block_scaled_swap_ab_mega_moe_kernel.py`) is unchanged by S1 (S2 below changes it); it uses
+  - The kernel file (`block_scaled_swap_ab_mega_moe_kernel.py`) is unchanged by S1 (S2 and DL1 below change it); it uses
     only `token_comm` entry points whose signatures S1 keeps.
 
 - **S2** (vLLM-local, not upstream) in `sources/kernel_src/rubin/inference/mega/`
@@ -73,6 +73,30 @@
     on the capped grid above the crossover (see `session.py`).
   - Outputs are bit-identical (same per-tile math and top-k reduction order; checked by an
     output fingerprint on every A/B point in `$W/hti/p2/megamoe-prefill`).
+
+- **DL (die-local expert streams)** (vLLM-local, not upstream), two parts. Independent of
+  S2: the scheduler (DL) and the epilogue (S2) are separate compile-time impl fields, and
+  either, both or neither may be set; the per-tile math is the same in every combination.
+  - **DL1** in `sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py`
+    (FlashInfer 0.7.3.dev20261031 sha256
+    `a578368593bed9cf91b8dacf16fa65f8ab822a3001bb457e053f2b4b179013a0`; this file also
+    carries S2, local sha256 in the manifest below): optional impl field `die_sm_mask32`
+    (bound; `name()` gains `diesplit_` / `dienone_`, rank-uniform because it tags the
+    arena layout; the per-GPU mask itself keys `session.compile_cache_key`); with it the
+    phase-interleaved schedule uses `DieSplitPhaseInterleavedFc12Scheduler` (DL2).
+    Without it the scheduler is the FlashInfer one.
+  - **DL2** new file `sources/kernel_src/schedulers/die_split_fc12_scheduler.py` (ours,
+    no upstream): die-local expert streams for the phase-interleaved FC12 scheduler (4
+    atomic streams, FC1/FC2 x die; per-die expert ranges in the stock order; cross-die
+    stealing). Producer side only (the consumer count, and so S2's second epilogue
+    warpgroup, comes from the base scheduler unchanged). Same tiles and accumulation order
+    (bitwise-identical output). Host side: `die_local.py`.
+  - When (automatic, no knob/env; `experts.py` `reserve_sms_for_shared_expert`): decode
+    servers only (P/D prefill workers keep the capped die-oblivious grid, so S2 still
+    applies to their capped prefill buckets), every bucket phase-interleaved, and a
+    trusted SM -> die map; then the buckets drop the shared-overlap SM cap (uncapped:
+    `session.build_kernels` traces the stock epilogue, and no decode bucket is
+    S2-eligible anyway). Without a trusted die map: warning, capped die-oblivious path.
 
 ## Rewrite rule
 
@@ -139,7 +163,7 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/kernel
 6355b04c8672b40e96d2ae1a3309650e1e06eadaf3172e3ccaf2a2b51a88f740  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_extension.py
 ed192f39cce199441a3116869898f0c1c275aeb0ac5218d809b8d3f0b68be7ed  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop.py
 e7f3aa713f90170f3f2c4b616af7a338ee4cb3cdef34621cb21e6ad8a90aabf6  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop_gen_specialized.py
-094c99b444a3f0c5405eeda8eaad10dd4725f12d0bf4eeadb8b4336e2cbca4f5  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py
+14a181fec57aa9004a6bb154fcac3abd8db025ba2177a677508ce4b3414862b1  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py
 292cd6c6d62b9d6cb7a15e0f43363756941124a645c34be6947b5542282c3ee5  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py
 d85b41f1f605c8ce4ae97696e4c8aad5f02eb95412eb42e20d0cfca2dcc4e54a  sources/kernel_src/rubin/inference/mega/dynamic_mainloop.py
 0fbc10e05282241250de08ccfaebd533076f29abdd3bb949c063cf80daf54496  sources/kernel_src/rubin/inference/mega/tma_gather.py
@@ -147,6 +171,7 @@ f8640f21703099acbf74064368d2d1a6d410760e358bb4341a8b26402b0a8a1f  sources/kernel
 56efd874b9859abfcafb2e0cdc39c2690404a274b07590f5c1630f57f57e3f9b  sources/kernel_src/rubin/inference/mega/topk_reduce.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/kernel_src/schedulers/__init__.py
 22a68aede7b609cd7f770954d428098207bcb504c12cb71b0bb2198ca339cc04  sources/kernel_src/schedulers/base.py
+f4569f517f8cdaac72b920b893f426c5b41a676ebac0f6432ffa8903a91d22be  sources/kernel_src/schedulers/die_split_fc12_scheduler.py
 bf754355af676f767eca31dee76dade21bd9e440a755c159861c943ab45b57c6  sources/kernel_src/schedulers/fc12_mapping.py
 ce86b6234fe181b31dc6bbfafe0ed9093a39a600a8e0d3f4dae25983a8f72f97  sources/kernel_src/schedulers/fc12_scheduler.py
 c43fc6e1b0858191776e82e702b2f1c373d3984b14f58a8d5011764d20ce7f47  sources/kernel_src/schedulers/non_clc_mixed_cga.py

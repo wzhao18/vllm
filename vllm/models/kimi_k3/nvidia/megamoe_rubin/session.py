@@ -76,7 +76,9 @@ def compile_cache_key(
 ) -> tuple:
     """Process-wide compiled-kernel key. The kernel name encodes the constexprs of
     both variants, except that the genphase name omits the SiTU betas (codegen
-    constants), so they, the quant kind and the device are keyed explicitly."""
+    constants) and the die-local SM mask (per GPU: its die map; the name, which
+    also tags the EP-uniform arena layout, only says "split"), so they, the quant
+    kind and the device are keyed explicitly."""
     return (
         kernel_name,
         str(cutlass_version),
@@ -84,6 +86,7 @@ def compile_cache_key(
         float(cfg.situ_beta),
         float(cfg.situ_linear_beta),
         int(device),
+        getattr(cfg, "die_sm_mask32", None),
     )
 
 
@@ -209,6 +212,8 @@ def build_kernel(cfg: RubinMoeConfig, epilogue_warpgroups: int | None = None):
         if cfg.kernel_variant == "genphase":
             raise ValueError("the genphase kernel has a single epilogue warpgroup.")
         impl_fields["epilogue_warpgroups"] = epilogue_warpgroups
+    if cfg.die_sm_mask32 is not None:
+        impl_fields["die_sm_mask32"] = tuple(cfg.die_sm_mask32)
     if cfg.fallback_cluster_shape_mn is not None:
         impl_fields["fallback_cluster_shape_mn"] = tuple(cfg.fallback_cluster_shape_mn)
         impl_fields["preferred_cluster_count"] = preferred_count

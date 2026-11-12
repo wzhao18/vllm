@@ -351,11 +351,12 @@ class KimiK3MegaMoEExperts(nn.Module):
         )
         from ..model import pd_prefill_worker  # (model.py imports this lazily)
 
+        self.prefill_worker = pd_prefill_worker(vllm_config)
         self.buckets, notes = select_rubin_buckets(
             self.problem,
             ep_size,
             self.max_num_tokens,
-            prefill_worker=pd_prefill_worker(vllm_config),
+            prefill_worker=self.prefill_worker,
         )
         self.bucket = self.buckets[-1]
         self.dp_size = vllm_config.parallel_config.data_parallel_size
@@ -501,11 +502,32 @@ class KimiK3MegaMoEExperts(nn.Module):
         # expert. Tiles and their accumulation order do not depend on the grid.
         # Every compiled bucket (the decode bucket included): forward picks one per
         # batch, and each must leave the shared expert its SMs.
+        # Decode servers also stream each die's experts from its own HBM
+        # (``die_local``; the phase-interleaved schedule on one cluster shape), when
+        # the device has a trusted die map. Die-local streams then take the full grid
+        # (no SM cap): measured on VR200 (EP16 decode shape on EP4, 8 layers of
+        # MegaMoE + side-stream shared expert + latent up, CUDA graph, p50 us/layer at
+        # 32 / 52 / 64 tok/rank): capped die-oblivious 151.8 / 161.7 / 162.4, capped
+        # die-local 148.3 / 158.6 / 158.9, full-grid die-local 140.8 / 149.8 / 150.5
+        # (bitwise equal). Capped, each die's stream gets the clusters the side
+        # stream leaves on that die; full, both dies' HBM is streamed by all SMs.
+        die_mask = None
+        if not self.prefill_worker and all(
+            bucket.variant == "inference"
+            and tuple(bucket.knobs.schedule_policy)[0] == "phase_interleave"
+            for bucket in self.buckets
+        ):
+            from . import die_local
+
+            die_mask = die_local.current_die_sm_mask32()
         self.buckets = tuple(
             dataclasses.replace(
                 bucket,
                 knobs=dataclasses.replace(bucket.knobs, fallback_cluster_shape_mn=None),
-                max_sm_count=RUBIN_SHARED_OVERLAP_MAX_SMS,
+                max_sm_count=(
+                    RUBIN_SHARED_OVERLAP_MAX_SMS if die_mask is None else None
+                ),
+                die_sm_mask32=die_mask,
             )
             for bucket in self.buckets
         )
@@ -563,12 +585,19 @@ class KimiK3MegaMoEExperts(nn.Module):
                 "EP rank (see its log)."
             )
         assert weights is not None
+        if self.bucket.die_sm_mask32 is not None:
+            from .die_local import place_experts
+
+            weights = place_experts(weights)
         self.kernel_weights = weights
         if weights.report is not None and get_ep_group().rank_in_group == 0:
             logger.debug("%s: %s", self.prefix, weights.report.summary())
         # The kernel copy replaces the checkpoint layout (the MX path may alias w2).
         for _, param in self.named_parameters(recurse=False):
             param.data = torch.empty(0, dtype=param.dtype, device=param.device)
+        if self.bucket.die_sm_mask32 is not None:
+            del weights
+            torch.accelerator.empty_cache()  # the default-allocated originals
 
     # -- EPLB -------------------------------------------------------------------------
 

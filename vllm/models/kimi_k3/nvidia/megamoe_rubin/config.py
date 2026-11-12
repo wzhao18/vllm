@@ -154,12 +154,18 @@ class RubinBucket:
 
     ``max_sm_count``: cap on the persistent grid (SMs, whole clusters), or None for
     the occupancy limit. A server policy rather than a knob: it leaves SMs to work
-    the caller runs concurrently on another stream; the math is unchanged."""
+    the caller runs concurrently on another stream; the math is unchanged.
+
+    die_sm_mask32: die-local expert streams (die_local): bit s of the
+    32-bit words set when SM s is on die 1; the layer's local experts
+    [0, E/2) are homed on die 0 and [E/2, E) on die 1. None: die-oblivious.
+    Also a server policy (the device's die map), same tiles and math."""
 
     variant: Variant
     max_tokens: int
     knobs: RubinKnobs
     max_sm_count: int | None = None
+    die_sm_mask32: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.variant not in ("inference", "genphase"):
@@ -206,6 +212,7 @@ class RubinMoeConfig:
     combine_dtype: str = "bf16"
     gate_up_clamp: float | None = None
     max_sm_count: int | None = None
+    die_sm_mask32: tuple[int, ...] | None = None
 
     @classmethod
     def make(
@@ -245,6 +252,7 @@ class RubinMoeConfig:
             kernel_variant=bucket.variant,
             reduce_topk_in_kernel=k.reduce_topk_in_kernel,
             max_sm_count=bucket.max_sm_count,
+            die_sm_mask32=bucket.die_sm_mask32,
         )
 
     def __post_init__(self) -> None:  # noqa: C901 - verbatim rule list
@@ -404,6 +412,20 @@ class RubinMoeConfig:
             type(self.max_sm_count) is not int or self.max_sm_count < cm
         ):
             raise ValueError("max_sm_count must accommodate at least one cluster.")
+        if self.die_sm_mask32 is not None:
+            if (
+                self.kernel_variant != "inference"
+                or tuple(self.schedule_policy)[0] != "phase_interleave"
+                or self.fallback_cluster_shape_mn is not None
+            ):
+                raise ValueError(
+                    "die-local expert streams need the inference kernel's "
+                    "phase-interleaved schedule with one cluster shape."
+                )
+            if not self.die_sm_mask32 or not all(
+                type(w) is int and 0 <= w < (1 << 32) for w in self.die_sm_mask32
+            ):
+                raise ValueError("die_sm_mask32 must be a tuple of 32-bit ints.")
         if self.fc2_tma_stages is not None and not (
             type(self.fc2_tma_stages) is int
             and 1 <= self.fc2_tma_stages <= tiler[1] // 64
