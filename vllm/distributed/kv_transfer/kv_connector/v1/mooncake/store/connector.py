@@ -374,6 +374,12 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
         start_load_kv() is called after that launch. Issuing here starts the
         loads about one step earlier. The worker orders them after all GPU
         work queued so far (MooncakeStoreWorker.start_load_kv).
+
+        The RDMA write can now overlap this step's whole forward (before, only
+        its tail). That relies on the invariant stock deferred-free relies on:
+        a block freed in this step's schedule() (preemption,
+        remove_skipped_blocks for SWA or mamba-align state) and handed to a
+        loading request in the same step is not read by this step's forward.
         """
         super().bind_connector_metadata(connector_metadata)
         if self.connector_worker is None:
