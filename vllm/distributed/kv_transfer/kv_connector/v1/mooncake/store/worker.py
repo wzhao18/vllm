@@ -2904,6 +2904,24 @@ class LookupKeyClient:
         # request within the same step, sees one result instead of starting a
         # new lookup each time.
         self.futures: dict[str, Future[MooncakeLookupResult]] = {}
+        # req_id -> the lookup inputs its future was computed for. A query with
+        # other inputs never reuses it (it starts a new lookup).
+        self._inputs: dict[str, tuple[int, int, bytes]] = {}
+        # Arrival lookups (``prefetch``) still owned by the arriving Request
+        # object: the scheduler has not taken that request in yet.
+        self._arrival_owner: dict[str, object] = {}
+        # Arrival lookups not yet read by the scheduler (for the counters).
+        self._arrival_unread: set[str] = set()
+        # ``prefetch`` runs on the engine core's input thread, everything else
+        # on the scheduler thread.
+        self._lock = threading.Lock()
+        self.stats = {
+            "arrival_lookups": 0,
+            "ready_at_first_use": 0,
+            "pending_at_first_use": 0,
+            "refreshed": 0,
+            "dropped": 0,
+        }
         extra_config = (
             vllm_config.kv_transfer_config.kv_connector_extra_config
             if vllm_config.kv_transfer_config is not None
@@ -2912,6 +2930,39 @@ class LookupKeyClient:
         # Bound on a blocking (lookup_async=False) lookup; past it the lookup
         # counts as a miss and the request recomputes.
         self.lookup_timeout_s = float(extra_config.get("lookup_timeout_s", 10.0))
+
+    @staticmethod
+    def _lookup_inputs(
+        num_tokens: int, block_hashes: Sequence[BlockHash]
+    ) -> tuple[int, int, bytes]:
+        # Block hashes are chained, so the last one stands for all of them.
+        return (
+            num_tokens,
+            len(block_hashes),
+            bytes(block_hashes[-1]) if block_hashes else b"",
+        )
+
+    def _submit_locked(
+        self,
+        req_id: str,
+        num_tokens: int,
+        block_hashes: Sequence[BlockHash],
+        known_prefix_tokens: int,
+    ) -> Future[MooncakeLookupResult]:
+        future = self.executor.submit(
+            self._lookup, num_tokens, list(block_hashes), known_prefix_tokens
+        )
+        self.futures[req_id] = future
+        self._inputs[req_id] = self._lookup_inputs(num_tokens, block_hashes)
+        return future
+
+    def _drop_locked(self, req_id: str) -> None:
+        future = self.futures.pop(req_id, None)
+        self._inputs.pop(req_id, None)
+        self._arrival_owner.pop(req_id, None)
+        self._arrival_unread.discard(req_id)
+        if future is not None:
+            future.cancel()
 
     def _lookup(
         self,
@@ -2934,6 +2985,57 @@ class LookupKeyClient:
         result.known_prefix_tokens = known_prefix_tokens
         return result
 
+    def prefetch(
+        self,
+        req_id: str,
+        num_tokens: int,
+        block_hashes: Sequence[BlockHash],
+        owner: object,
+    ) -> bool:
+        """Start the lookup of a request that just arrived, before the
+        scheduler has it, so the result is ready when it is first scheduled.
+
+        It is the lookup the scheduler would start at that first schedule
+        (same inputs, no known local prefix), kept and dropped like it: read
+        by ``lookup`` only while its inputs still match, dropped by
+        ``discard`` at admission or finish. Until the scheduler takes the
+        request in (``adopt``), ``owner`` (the arriving Request object) owns
+        it, and ``release_unadopted`` drops it if the request never becomes a
+        scheduler request. Never replaces an existing lookup of ``req_id``.
+        Thread-safe; returns whether a lookup was started.
+        """
+        with self._lock:
+            if req_id in self.futures:
+                return False
+            self._submit_locked(req_id, num_tokens, block_hashes, 0)
+            self._arrival_owner[req_id] = owner
+            self._arrival_unread.add(req_id)
+            self.stats["arrival_lookups"] += 1
+            if self.stats["arrival_lookups"] % 1000 == 0:
+                logger.info("Mooncake arrival lookups: %s", dict(self.stats))
+        return True
+
+    def adopt(self, req_id: str, owner: object) -> None:
+        """The scheduler took in ``owner``: its arrival lookup now lives
+        exactly like a lookup the scheduler started (until ``discard``)."""
+        with self._lock:
+            if self._arrival_owner.get(req_id) is owner:
+                del self._arrival_owner[req_id]
+
+    def release_unadopted(self, req_id: str, owner: object) -> None:
+        """Drop ``owner``'s arrival lookup if the scheduler never took the
+        request in (rejected, failed, or a streaming-session update)."""
+        with self._lock:
+            if self._arrival_owner.get(req_id) is owner:
+                self.stats["dropped"] += 1
+                self._drop_locked(req_id)
+
+    def invalidate_all(self) -> None:
+        """Drop every kept or in-flight lookup (the store was reset)."""
+        with self._lock:
+            for req_id in list(self.futures):
+                self._drop_locked(req_id)
+
     def lookup(
         self,
         req_id: str,
@@ -2946,12 +3048,24 @@ class LookupKeyClient:
         so the caller retries on a later step. ``known_prefix_tokens`` (the
         local GPU hit) lets the server skip probing below it; the result
         records the value used."""
-        future = self.futures.get(req_id)
-        if future is None:
-            future = self.executor.submit(
-                self._lookup, num_tokens, list(block_hashes), known_prefix_tokens
-            )
-            self.futures[req_id] = future
+        with self._lock:
+            future = self.futures.get(req_id)
+            if future is not None and self._inputs.get(
+                req_id
+            ) != self._lookup_inputs(num_tokens, block_hashes):
+                # Computed for other tokens (e.g. the request's hashes were
+                # rebuilt after it arrived): never serve it.
+                self.stats["refreshed"] += 1
+                self._drop_locked(req_id)
+                future = None
+            if future is None:
+                future = self._submit_locked(
+                    req_id, num_tokens, block_hashes, known_prefix_tokens
+                )
+            elif req_id in self._arrival_unread:
+                self._arrival_unread.discard(req_id)
+                key = "ready_at_first_use" if future.done() else "pending_at_first_use"
+                self.stats[key] += 1
         if non_block and not future.done():
             return None
         try:
@@ -2963,18 +3077,24 @@ class LookupKeyClient:
                 req_id,
                 self.lookup_timeout_s,
             )
-            del self.futures[req_id]
+            self._drop_if_current(req_id, future)
             return MooncakeLookupResult(0)
         except Exception as e:
             logger.error("Async Mooncake lookup failed for %s: %s", req_id, e)
-            del self.futures[req_id]
+            self._drop_if_current(req_id, future)
             return MooncakeLookupResult(0)
+
+    def _drop_if_current(
+        self, req_id: str, future: Future[MooncakeLookupResult]
+    ) -> None:
+        with self._lock:
+            if self.futures.get(req_id) is future:
+                self._drop_locked(req_id)
 
     def discard(self, req_id: str) -> None:
         """Drop any cached/in-flight lookup for ``req_id`` (e.g. on abort)."""
-        future = self.futures.pop(req_id, None)
-        if future is not None:
-            future.cancel()
+        with self._lock:
+            self._drop_locked(req_id)
 
     def _reset(self) -> bool:
         """Trigger ``store.remove_all(force=True)`` on worker rank 0.

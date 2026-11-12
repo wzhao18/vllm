@@ -642,6 +642,31 @@ class KVConnectorBase_V1(ABC):
         """
         pass
 
+    def on_request_arrival(self, request: "Request") -> None:
+        """Called when a new request arrives at the engine core, before the
+        scheduler has it (``EngineCore.preprocess_add_request``).
+
+        In a multiprocess engine this runs on the engine core's input thread,
+        concurrently with ``schedule()`` and every other scheduler-side
+        method, so an override must be thread-safe, must not block, and must
+        not touch scheduler state. It lets a connector start work for the
+        request (e.g. a cache lookup) while the engine core is busy. Every
+        call is followed on the scheduler thread by ``on_new_request`` if the
+        scheduler takes the request in, and then always by
+        ``on_request_arrival_handled``. Raising rejects the request. The
+        default implementation is a no-op.
+        """
+        return
+
+    def on_request_arrival_handled(self, request: "Request") -> None:
+        """Called on the scheduler thread once an arrived request was handled:
+        added (``on_new_request`` ran first), rejected, or merged into an
+        existing request. A connector releases here whatever
+        ``on_request_arrival`` set up for a request that ``on_new_request``
+        never saw. The default implementation is a no-op.
+        """
+        return
+
     def on_new_request(self, request: "Request") -> None:
         """Called by the scheduler when a new request is added.
 

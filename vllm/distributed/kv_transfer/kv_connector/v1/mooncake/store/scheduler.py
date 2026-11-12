@@ -244,6 +244,47 @@ class MooncakeStoreScheduler:
     def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
         self._gpu_block_pool = gpu_block_pool
 
+    def _looks_up(self, request: Request) -> bool:
+        """Whether ``get_num_new_matched_tokens`` queries the store at all."""
+        if not self.enable_lookup:
+            return False
+        align = (
+            self._hash_block_size if self.enable_partial_hash_hits else self._block_size
+        )
+        return request.num_tokens >= align
+
+    def on_request_arrival(self, request: Request) -> None:
+        """Start the store lookup of a request as it arrives at the engine core
+        (input thread), so its result is ready at its first schedule.
+
+        Same lookup the first schedule would start (``get_num_new_matched_tokens``
+        reads it through the same client and drops it at admission or finish).
+        Not started when that lookup's inputs are only known at schedule time:
+        with ``lookup_from_local_hit`` it probes above the local GPU hit, and a
+        resumable (streaming) request's block hashes are rebuilt by the
+        scheduler. Those keep the lookup at their first schedule. A KV cleanup
+        marker (``abort_immediately``) is never scheduled, so never looked up.
+        """
+        if (
+            self.lookup_from_local_hit
+            or request.resumable
+            or request.abort_immediately
+            or not self._looks_up(request)
+        ):
+            return
+        self.client.prefetch(
+            request.request_id, request.num_tokens, request.block_hashes, request
+        )
+
+    def on_new_request(self, request: Request) -> None:
+        """The scheduler took ``request`` in: its arrival lookup, if any, is now
+        an ordinary admission lookup."""
+        self.client.adopt(request.request_id, request)
+
+    def on_request_arrival_handled(self, request: Request) -> None:
+        """Drop the arrival lookup of a request the scheduler did not take in."""
+        self.client.release_unadopted(request.request_id, request)
+
     def get_num_new_matched_tokens(
         self,
         request: Request,
@@ -254,15 +295,9 @@ class MooncakeStoreScheduler:
         Returns ``(None, False)`` when an async lookup is still in flight,
         signaling the scheduler to retry this request on a later step.
         """
-        if not self.enable_lookup:
-            return 0, False
-
         # Fine-grained hits may land on a hash boundary inside a block; without
         # partial hits, prefixes shorter than one physical block are skipped.
-        align = (
-            self._hash_block_size if self.enable_partial_hash_hits else self._block_size
-        )
-        if request.num_tokens < align:
+        if not self._looks_up(request):
             return 0, False
 
         lookup_kwargs = {}
@@ -924,3 +959,10 @@ class MooncakeStoreScheduler:
         except Exception as e:
             logger.error("Mooncake reset_store RPC failed: %s", e)
             return False
+        finally:
+            # Lookups kept for waiting requests (including arrival lookups,
+            # which the paused scheduler does not hold back) may predate the
+            # reset; their next admission looks up again. Lookups submitted
+            # after the reset returned queue behind it on the client's one
+            # thread, so dropping them too only costs a repeat.
+            self.client.invalidate_all()
