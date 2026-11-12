@@ -28,6 +28,7 @@ from vllm.distributed.kv_transfer.kv_connector.dcp_relayout import (
     RelayoutRegion,
     RowGather,
     StagedRelayout,
+    concat_staged_relayouts,
     relayout_read_amplification,
     row_table,
 )
@@ -179,6 +180,27 @@ class _RegionPairs:
         regions each belong to one group and pair with the same-index region
         of the peer (see `pull_worker`)."""
         return dict(zip(self.local, self.group))
+
+
+@dataclass
+class _RelayoutBuffer:
+    """Attention caches of one storage a RELAYOUT receive gathers rows of:
+    a flat byte view of the storage, and its regions with their indices."""
+
+    flat: torch.Tensor
+    regions: list[RelayoutRegion]
+    region_ids: list[int]
+
+
+@dataclass(frozen=True)
+class _PeerRelayout:
+    """How a RELAYOUT peer's KV is read: units of `unit_rows` rows' worth of
+    bytes of its `src_kernel_block_size`-row kernel blocks, gathered by one
+    `RowGather` per local storage."""
+
+    unit_rows: int
+    src_kernel_block_size: int
+    gathers: list[RowGather]
 
 
 class NixlBaseConnectorWorker:
@@ -1194,15 +1216,17 @@ class NixlBaseConnectorWorker:
         self._kv_cache_scales = get_kv_cache_scales(vllm_config, self._layer_specs)
         # Per-engine TP mappings. Generated during handshake.
         self.tp_mappings: dict[EngineId, TPMapping] = {}
-        # RELAYOUT peers: their DCP layout; the row gathers of the local
-        # caches, built at the first RELAYOUT handshake; the side stream the
-        # gathers run on; and the receives whose gather is in flight, with its
+        # RELAYOUT peers: their DCP layout; the local caches the row gathers
+        # move, resolved at the first RELAYOUT handshake; each peer's read
+        # unit and row gathers (`_PeerRelayout`); the side stream the gathers
+        # run on; and the receives whose gather is in flight, with its
         # completion event and the row table it reads (`_start_relayouts`).
         # Such a request is reported in finished_recving only once its event
         # completes, so the scheduler caches its blocks (and stores or
         # offloads them) only after the gather.
         self._remote_dcp_layouts: dict[EngineId, DcpLayout] = {}
-        self._row_gathers: list[RowGather] | None = None
+        self._relayout_buffers: list[_RelayoutBuffer] | None = None
+        self._peer_relayouts: dict[EngineId, _PeerRelayout] = {}
         self._relayout_stream: torch.cuda.Stream | None = None
         self._relayouting: dict[ReqId, tuple[torch.cuda.Event, object]] = {}
         # GQA draft under an MLA target: its SPLIT regions use a draft TP mapping.
@@ -2557,7 +2581,9 @@ class NixlBaseConnectorWorker:
         differ with TP. Backends that accept any kernel block size keep them
         whole, and non-multiples cannot otherwise be paired. A RELAYOUT peer
         reads its units into staging blocks the same way (`required`: a
-        layout that cannot be split rejects the peer).
+        layout that cannot be split rejects the peer); its row gather reads
+        them in the peer's row layout, so they need not hold whole kernel
+        pages.
 
         `block_strides` keep the stride of the unsplit blocks: the units of a
         padded block (a page inside a longer packed row) abut only within
@@ -2584,12 +2610,14 @@ class NixlBaseConnectorWorker:
             if i not in state_regions
         ):
             problem = f"the remote KV layout cannot be split into {unit}-token units"
-        elif split_pages := sorted(
-            {
-                layout.kernel_page_rows
-                for layout in self._kv_row_layouts.values()
-                if unit % layout.kernel_page_rows
-            }
+        elif not required and (
+            split_pages := sorted(
+                {
+                    layout.kernel_page_rows
+                    for layout in self._kv_row_layouts.values()
+                    if unit % layout.kernel_page_rows
+                }
+            )
         ):
             problem = (
                 f"{unit}-token units would split the {split_pages}-row kernel "
@@ -2733,6 +2761,13 @@ class NixlBaseConnectorWorker:
                     for i, region in enumerate(pairs.partner)
                     if self._region_holds_only_mamba_state(region)
                 },
+            )
+
+        if relayout:
+            self._peer_relayouts[engine_id] = self._peer_relayout(
+                nixl_agent_meta,
+                unit_rows=nixl_agent_meta.block_size,
+                src_kernel_block_size=nixl_agent_meta.block_size * block_split,
             )
 
         ### Register remote engine in TransferTopology (idempotent).
@@ -2946,7 +2981,7 @@ class NixlBaseConnectorWorker:
                 remote_layout,
                 tp_sizes=(self.transfer_tp_size, remote_tp_size),
             )
-            self._validate_kv_row_layouts(nixl_agent_meta)
+            self._validate_kv_row_layouts(nixl_agent_meta, mode)
             self._validate_kv_cache_scales(nixl_agent_meta)
             self._validate_mamba_state_geometry(nixl_agent_meta)
             if mode is DcpTransferMode.RELAYOUT:
@@ -2985,7 +3020,7 @@ class NixlBaseConnectorWorker:
             return "host-resident KV caches (HiSparse) are not relayouted."
         # The row gather must address every attention cache.
         try:
-            self._get_row_gathers()
+            self._get_relayout_buffers()
         except ValueError as e:
             return str(e)
         return None
@@ -3022,19 +3057,19 @@ class NixlBaseConnectorWorker:
                 "relayout transfers move with the others."
             )
 
-    def _get_row_gathers(self) -> list[RowGather]:
-        """The row gathers of a RELAYOUT receive, one per storage holding
-        the attention caches it moves (`_relayout_regions`), over a flat byte
-        view of the storage.
+    def _get_relayout_buffers(self) -> list[_RelayoutBuffer]:
+        """The caches a RELAYOUT receive gathers rows of
+        (`_relayout_regions`), one entry per storage holding them, over a flat
+        byte view of the storage.
 
         Each region must be one layer's page (or pages several layers share),
         laid out as its `KVRowLayout`: the per-layer page views of a packed
         hybrid cache qualify, a whole packed row does not.
         """
-        if self._row_gathers is not None:
-            return self._row_gathers
+        if self._relayout_buffers is not None:
+            return self._relayout_buffers
         bases = self.kv_caches_base_addr[self.engine_id][self.tp_rank]
-        buffers: dict[int, tuple[torch.Tensor, list[RelayoutRegion]]] = {}
+        buffers: dict[int, _RelayoutBuffer] = {}
         for region in self._relayout_regions():
             layers = self.region_members[region]
             layouts = {self._kv_row_layouts.get(layer) for layer in layers}
@@ -3057,8 +3092,9 @@ class NixlBaseConnectorWorker:
                 flat = torch.empty(0, dtype=torch.uint8, device=cache.device).set_(
                     storage, 0, (storage.nbytes(),), (1,)
                 )
-                buffers[storage.data_ptr()] = (flat, [])
-            buffers[storage.data_ptr()][1].append(
+                buffers[storage.data_ptr()] = _RelayoutBuffer(flat, [], [])
+            buffers[storage.data_ptr()].region_ids.append(region)
+            buffers[storage.data_ptr()].regions.append(
                 RelayoutRegion(
                     offset=bases[region] - storage.data_ptr(),
                     page_stride=self.block_stride_per_layer[region],
@@ -3066,10 +3102,44 @@ class NixlBaseConnectorWorker:
                     rows=layout,
                 )
             )
-        self._row_gathers = [
-            RowGather(buffer, regions) for buffer, regions in buffers.values()
-        ]
-        return self._row_gathers
+        self._relayout_buffers = list(buffers.values())
+        return self._relayout_buffers
+
+    def _peer_relayout(
+        self,
+        nixl_agent_meta: NixlAgentMetadata,
+        unit_rows: int,
+        src_kernel_block_size: int,
+    ) -> _PeerRelayout:
+        """The row gathers of a RELAYOUT peer: the local caches
+        (`_get_relayout_buffers`) from staged units of `unit_rows` rows' worth
+        of bytes of the peer's `src_kernel_block_size`-row kernel blocks, laid
+        out as the peer declares each layer's rows."""
+        gathers = []
+        for buffer in self._get_relayout_buffers():
+            src_rows = []
+            for region in buffer.region_ids:
+                layers = self.region_members[region]
+                layouts = {nixl_agent_meta.kv_row_layouts.get(n) for n in layers}
+                layout = layouts.pop() if len(layouts) == 1 else None
+                if layout is None or src_kernel_block_size % layout.kernel_page_rows:
+                    raise NotImplementedError(
+                        f"NIXL engine {nixl_agent_meta.engine_id} lays out the "
+                        f"rows of layers {layers} as {layout}, which a relayout "
+                        f"of its {src_kernel_block_size}-row kernel blocks "
+                        "cannot read."
+                    )
+                src_rows.append(layout)
+            try:
+                gathers.append(
+                    RowGather(buffer.flat, buffer.regions, src_rows, unit_rows)
+                )
+            except ValueError as e:
+                raise NotImplementedError(
+                    f"NIXL engine {nixl_agent_meta.engine_id}'s KV cannot be "
+                    f"relayouted into this engine's: {e}"
+                ) from e
+        return _PeerRelayout(unit_rows, src_kernel_block_size, gathers)
 
     def _remote_dcp_layout(
         self, nixl_agent_meta: NixlAgentMetadata, remote_dcp_size: int
@@ -3094,9 +3164,14 @@ class NixlBaseConnectorWorker:
         except ValueError as e:
             raise RuntimeError(str(e)) from e
 
-    def _validate_kv_row_layouts(self, nixl_agent_meta: NixlAgentMetadata) -> None:
+    def _validate_kv_row_layouts(
+        self, nixl_agent_meta: NixlAgentMetadata, mode: DcpTransferMode
+    ) -> None:
         """Reject a peer for which a layer both sides hold stores its token
-        rows differently."""
+        rows differently: other row pieces (another KV format) always, and
+        other pages (e.g. an indexer page of another block size keeps its
+        scales elsewhere) unless the row gather of a RELAYOUT converts them
+        (`check_staged_rows`, at the peer's `RowGather`)."""
         remote_layers = set(itertools.chain(*nixl_agent_meta.region_members))
         remote_layouts = nixl_agent_meta.kv_row_layouts
         for name in sorted(self._kv_row_layouts.keys() | remote_layouts.keys()):
@@ -3107,7 +3182,20 @@ class NixlBaseConnectorWorker:
             held_by_both = name in self._layer_specs and (
                 name in remote_layouts or name in remote_layers
             )
-            if held_by_both:
+            same_rows = (
+                local is not None
+                and remote is not None
+                and [size for _, size in local.pieces]
+                == [size for _, size in remote.pieces]
+            )
+            if held_by_both and same_rows:
+                if mode is not DcpTransferMode.RELAYOUT:
+                    raise NotImplementedError(
+                        f"layer {name} lays out its KV pages as {local} here "
+                        f"and as {remote} on the peer; only DCP relayout "
+                        "transfers convert between page layouts."
+                    )
+            elif held_by_both:
                 spec = self._layer_specs[name]
                 cache_format = (
                     f" (local cache dtype {spec.dtype}, quant mode "
@@ -3726,7 +3814,7 @@ class NixlBaseConnectorWorker:
         block_ids_for_blocksize_post_process = defaultdict(list)
         block_ids_for_heterogeneous_attn_post_process = list[list[int]]()
         direct_device_recving = set[str]()
-        relayout_jobs: list[tuple[ReqId, StagedRelayout]] = []
+        relayout_jobs: list[tuple[ReqId, EngineId, StagedRelayout]] = []
         for req_id in done_recving:
             # clean up metadata for completed requests
             meta = self._recving_metadata.pop(req_id, None)
@@ -3754,7 +3842,7 @@ class NixlBaseConnectorWorker:
             if meta.relayout is not None:
                 # The rows are in staging: gather them below; the request
                 # completes once the gather has.
-                relayout_jobs.append((req_id, meta.relayout))
+                relayout_jobs.append((req_id, meta.remote.engine_id, meta.relayout))
                 continue
 
             if meta.region_blocks_to_zero is not None:
@@ -3817,7 +3905,7 @@ class NixlBaseConnectorWorker:
         self._sync_device_after_direct_recv(direct_device_recving)
         if relayout_jobs:
             self._start_relayouts(relayout_jobs)
-            done_recving.difference_update(req_id for req_id, _ in relayout_jobs)
+            done_recving.difference_update(req_id for req_id, _, _ in relayout_jobs)
         done_recving |= relayouted
 
         # Handle timeout to avoid stranding blocks on remote.
@@ -3830,32 +3918,33 @@ class NixlBaseConnectorWorker:
             failed_recving=failed_recv_reqs,
         )
 
-    def _start_relayouts(self, jobs: list[tuple[ReqId, StagedRelayout]]) -> None:
+    def _start_relayouts(
+        self, jobs: list[tuple[ReqId, EngineId, StagedRelayout]]
+    ) -> None:
         """Gather the staged rows of `jobs` into their blocks, and hold the
         requests back from finished_recving until the gather completes.
 
         Their READs completed (and P was notified), so their staging blocks
-        hold the source rows. One gather per cache storage covers all jobs.
+        hold the source rows. One gather per peer and cache storage covers
+        all jobs of the peer.
         """
-        in_flight = self._launch_relayouts(
-            *(
-                np.concatenate([getattr(job, field) for _, job in jobs])
-                for field in ("src_blocks", "src_rows", "dst_blocks", "dst_rows")
+        by_engine: dict[EngineId, list[tuple[ReqId, StagedRelayout]]] = {}
+        for req_id, engine_id, job in jobs:
+            by_engine.setdefault(engine_id, []).append((req_id, job))
+        for engine_id, engine_jobs in by_engine.items():
+            in_flight = self._launch_relayouts(
+                self._peer_relayouts[engine_id],
+                concat_staged_relayouts([job for _, job in engine_jobs]),
             )
-        )
-        for req_id, _ in jobs:
-            self._relayouting[req_id] = in_flight
+            for req_id, _ in engine_jobs:
+                self._relayouting[req_id] = in_flight
 
     def _launch_relayouts(
-        self,
-        src_blocks: np.ndarray,
-        src_rows: np.ndarray,
-        dst_blocks: np.ndarray,
-        dst_rows: np.ndarray,
+        self, peer: _PeerRelayout, job: StagedRelayout
     ) -> tuple[torch.cuda.Event, object]:
-        """Run the row gather on a side stream, off the forward pass, and
-        return its completion event and the device row table it reads (kept
-        alive until the event completes).
+        """Run the row gathers of `job` on a side stream, off the forward
+        pass, and return its completion event and the device row table it
+        reads (kept alive until the event completes).
 
         The side stream first waits for the work queued on the current
         stream, so the gather follows this step's copy-on-write block copies
@@ -3864,16 +3953,13 @@ class NixlBaseConnectorWorker:
         waits for the device: the row table is copied asynchronously and the
         region tables are on the device already (`RowGather`).
         """
-        gathers = self._get_row_gathers()
         if self._relayout_stream is None:
             self._relayout_stream = torch.cuda.Stream()
         self._relayout_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self._relayout_stream):
-            rows = row_table(
-                src_blocks, src_rows, dst_blocks, dst_rows, gathers[0].device
-            )
-            for gather in gathers:
-                gather(rows)
+            rows = row_table(job, peer.gathers[0].device)
+            for gather in peer.gathers:
+                gather(rows, len(job.src_slots))
             event = torch.cuda.Event()
             event.record()
         return event, rows
@@ -4743,6 +4829,7 @@ class NixlBaseConnectorWorker:
         self.dst_region_mem_types.pop(engine_id, None)
         self.tp_mappings.pop(engine_id, None)
         self._remote_dcp_layouts.pop(engine_id, None)
+        self._peer_relayouts.pop(engine_id, None)
         self.draft_tp_mappings.pop(engine_id, None)
         if self.transfer_topo is not None:
             self.transfer_topo.unregister_remote_engine(engine_id)

@@ -24,14 +24,20 @@ token-major pages.
 A transfer executes this in three steps, all derived from the same plan:
 
 1. Staging (`num_staging_blocks`, scheduler side): the destination reserves
-   blocks of its own cache to receive the source rows it needs, in units of
-   `gcd(source block, destination block)` rows so that a unit of a source page
-   fits inside a destination block.
+   blocks of its own cache to receive the source pages that hold the rows it
+   needs.
 2. Reads (`plan_staged_relayout`, worker side): which source units to read
-   into which staging units.
+   into which staging units. A unit is a run of `unit_rows` rows' worth of
+   bytes of a source kernel block (pages split for the transfer, e.g.
+   `gcd(source block, destination block)` rows), read as it is: its bytes
+   are in the source's page layout, which another block size can change
+   (an indexer page keeps its values before its scales, so a unit of a
+   longer page is not a run of rows). Every unit of a source kernel block
+   that holds a planned row is read, into consecutive staging units.
 3. Row gather (`RowGather`, on the device): every destination row is copied
-   from its staged row, region by region, and the destination rows past the
-   transferred positions are zeroed.
+   piece by piece from its staged source kernel block, addressed with the
+   source's `KVRowLayout`, into the destination's layout, region by region;
+   the destination rows past the transferred positions are zeroed.
 """
 
 import math
@@ -92,58 +98,38 @@ def plan_dcp_rows(
 # ----------------------------------------------------------------------
 
 
-def staging_unit_rows(src: DcpLayout, dst: DcpLayout) -> int:
-    """Rows of a staging unit: the largest run of rows that tiles the pages of
-    both sides, so that a unit of a source page fits in a destination page."""
-    return math.gcd(src.block_size, dst.block_size)
-
-
-def _source_units(
-    plan: DcpRowPlan, unit_rows: int
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """The source units (runs of `unit_rows` rows of one source rank) the
-    plan reads as `(ranks, units)`, sorted by rank then unit, and the index
-    of each planned row's unit in them."""
-    units = plan.src_rows // unit_rows
-    if not len(units):
-        empty = np.zeros(0, dtype=np.int64)
-        return empty, empty, empty
-    keys = plan.src_ranks * (int(units.max()) + 1) + units
-    unique_keys, slots = np.unique(keys, return_inverse=True)
-    ranks, unit_ids = np.divmod(unique_keys, int(units.max()) + 1)
-    return ranks, unit_ids, slots.reshape(-1)
-
-
 def num_staging_blocks(src: DcpLayout, dst: DcpLayout, start: int, end: int) -> int:
     """Destination blocks to reserve for staging positions `[start, end)`.
 
     A block id names a page on every destination rank, so this is the most
-    that any destination rank needs. Units of `staging_unit_rows` rows bound
-    the need of a worker that stages finer units (e.g. kernel blocks): every
-    finer unit it reads lies in a unit counted here.
+    that any destination rank needs: the whole source pages holding its rows.
+    A worker staging finer units (whole source kernel blocks of units that
+    tile both sides' pages) needs no more.
     """
-    unit_rows = staging_unit_rows(src, dst)
     most = max(
-        len(_source_units(plan_dcp_rows(src, dst, rank, start, end), unit_rows)[0])
+        _num_source_pages(plan_dcp_rows(src, dst, rank, start, end), src)
         for rank in range(dst.dcp_size)
     )
-    return cdiv(most * unit_rows, dst.block_size)
+    return cdiv(most * src.block_size, dst.block_size)
+
+
+def _num_source_pages(plan: DcpRowPlan, src: DcpLayout) -> int:
+    return sum(len(pages) for pages in plan.source_pages(src).values())
 
 
 def relayout_read_amplification(src: DcpLayout, dst: DcpLayout) -> float:
     """Source rows the destination ranks read per row they keep, over a long
-    sequence: units of whole source pages carry rows of other destination
-    ranks (e.g. 2.0 when every destination rank keeps every other row)."""
+    sequence, reading whole source pages (e.g. 2.0 when every destination
+    rank keeps every other row of the pages it reads)."""
     # Pages of both sides tile one period of positions whole (a page of a
-    # rank spans `dcp_size * block_size` positions), so the units read repeat
+    # rank spans `dcp_size * block_size` positions), so the pages read repeat
     # with it and one period gives the exact ratio.
     period = math.lcm(src.dcp_size * src.block_size, dst.dcp_size * dst.block_size)
-    unit_rows = staging_unit_rows(src, dst)
     read = sum(
-        len(_source_units(plan_dcp_rows(src, dst, rank, 0, period), unit_rows)[0])
+        _num_source_pages(plan_dcp_rows(src, dst, rank, 0, period), src)
         for rank in range(dst.dcp_size)
     )
-    return read * unit_rows / period
+    return read * src.block_size / period
 
 
 @dataclass(frozen=True)
@@ -151,17 +137,24 @@ class StagedRelayout:
     """One request's relayout on one destination rank: the reads into
     staging and the row gather after them.
 
-    Rows of the gather are rows of the destination cache's physical (kernel)
-    blocks; a negative source block zeroes the destination row.
+    The gather names each source row by the staged copy of its source kernel
+    block: `src_slots[i]` is the slot (index into `staging_units`) of the
+    block's first unit, its other units following in the next slots, and
+    `src_rows[i]` the row in that block. A negative slot zeroes the
+    destination row. Destination rows are rows of the destination cache's
+    physical (kernel) blocks.
     """
 
     reads: dict[int, tuple[list[int], list[int]]]
     """Source rank -> `(source units, staging units)` to read, each named as
     `block id * units per block + unit in block` on its side."""
-    src_blocks: np.ndarray
+    src_slots: np.ndarray
     src_rows: np.ndarray
     dst_blocks: np.ndarray
     dst_rows: np.ndarray
+    staging_units: np.ndarray
+    """The staging unit of each slot, in units of the destination's kernel
+    blocks (`kernel block * units per kernel block + unit in it`)."""
 
 
 def plan_staged_relayout(
@@ -172,6 +165,7 @@ def plan_staged_relayout(
     end: int,
     *,
     unit_rows: int,
+    src_kernel_block_size: int,
     src_block_ids: list[int],
     dst_block_ids: list[int],
     staging_block_ids: list[int],
@@ -186,52 +180,82 @@ def plan_staged_relayout(
       page of its first row at or after `start`. Rows of that page below
       `start` (a prefix hit ending inside the page) are left untouched; rows
       of the given pages past `end` are zeroed.
-    - Source units are read into consecutive units of `staging_block_ids`.
-      `unit_rows` must tile both sides' pages and the destination's kernel
-      blocks must tile its pages.
+    - Every unit (`unit_rows` rows' worth of bytes) of each source kernel
+      block holding a planned row is read, into consecutive units of
+      `staging_block_ids`. Units must tile both sides' kernel blocks, and
+      kernel blocks their pages.
     """
-    if src.block_size % unit_rows or dst.block_size % unit_rows:
-        raise ValueError(f"{unit_rows}-row units do not tile pages of {src}, {dst}")
-    if dst.block_size % dst_kernel_block_size:
-        raise ValueError(
-            f"{dst_kernel_block_size}-row kernel blocks do not tile pages of {dst}"
-        )
+    for rows, of in (
+        (src_kernel_block_size, src.block_size),
+        (unit_rows, src_kernel_block_size),
+        (dst_kernel_block_size, dst.block_size),
+        (unit_rows, dst_kernel_block_size),
+    ):
+        if of % rows:
+            raise ValueError(
+                f"{rows}-row units do not tile {of}-row blocks ({src} -> {dst}, "
+                f"{src_kernel_block_size}/{dst_kernel_block_size}-row kernel "
+                f"blocks, {unit_rows}-row read units)"
+            )
     plan = plan_dcp_rows(src, dst, dst_rank, start, end)
-    ranks, units, slots = _source_units(plan, unit_rows)
 
-    # Source units, as unit-granular ids of the source blocks.
-    src_units_per_page = src.block_size // unit_rows
-    src_pages, src_sub = np.divmod(units, src_units_per_page)
-    if len(src_pages) and src_pages.max() >= len(src_block_ids):
+    # Source kernel blocks holding planned rows, each read whole.
+    src_pages, src_page_rows = src.page_row(plan.src_rows)
+    src_kernel, src_rows = np.divmod(
+        np.asarray(src_page_rows, dtype=np.int64), src_kernel_block_size
+    )
+    kernel_per_page = src.block_size // src_kernel_block_size
+    keys = np.asarray(src_pages, dtype=np.int64) * kernel_per_page + src_kernel
+    stride = (int(keys.max()) + 1) if len(keys) else 1
+    blocks, block_of_row = np.unique(
+        plan.src_ranks * stride + keys, return_inverse=True
+    )
+    ranks, kernel_keys = np.divmod(blocks, stride)
+    pages, kernel = np.divmod(kernel_keys, kernel_per_page)
+    if len(pages) and pages.max() >= len(src_block_ids):
         raise ValueError(
             f"Source pages {len(src_block_ids)} do not cover positions "
             f"[{start}, {end}) of {src}"
         )
+    units_per_kernel = src_kernel_block_size // unit_rows
+    sub = np.tile(np.arange(units_per_kernel, dtype=np.int64), len(blocks))
     src_unit_ids = (
-        np.asarray(src_block_ids, dtype=np.int64)[src_pages] * src_units_per_page
-        + src_sub
+        np.repeat(
+            np.asarray(src_block_ids, dtype=np.int64)[pages]
+            * (src.block_size // unit_rows)
+            + kernel * units_per_kernel,
+            units_per_kernel,
+        )
+        + sub
     )
+    unit_ranks = np.repeat(ranks, units_per_kernel)
     # Staging units, consecutive over the staging blocks.
     dst_units_per_page = dst.block_size // unit_rows
-    staging_pages, staging_sub = np.divmod(
-        np.arange(len(units), dtype=np.int64), dst_units_per_page
-    )
-    if len(units) > len(staging_block_ids) * dst_units_per_page:
+    num_units = len(src_unit_ids)
+    if num_units > len(staging_block_ids) * dst_units_per_page:
         raise ValueError(
-            f"{len(units)} staging units need more than the "
+            f"{num_units} staging units need more than the "
             f"{len(staging_block_ids)} staging blocks"
         )
-    staging_ids = np.asarray(staging_block_ids, dtype=np.int64)
-    staging_unit_ids = staging_ids[staging_pages] * dst_units_per_page + staging_sub
+    staging_pages, staging_sub = np.divmod(
+        np.arange(num_units, dtype=np.int64), dst_units_per_page
+    )
+    # Unit ids of the staging blocks; also those of their kernel blocks, as
+    # kernel blocks tile the pages and units tile the kernel blocks.
+    staging_units = (
+        np.asarray(staging_block_ids, dtype=np.int64)[staging_pages]
+        * dst_units_per_page
+        + staging_sub
+    )
     reads = {
         int(rank): (
-            src_unit_ids[ranks == rank].tolist(),
-            staging_unit_ids[ranks == rank].tolist(),
+            src_unit_ids[unit_ranks == rank].tolist(),
+            staging_units[unit_ranks == rank].tolist(),
         )
         for rank in np.unique(ranks)
     }
 
-    # Gather: planned rows from their staged rows, then zero the tail.
+    # Gather: planned rows from their staged kernel blocks, then zero the tail.
     kernel_blocks_per_page = dst.block_size // dst_kernel_block_size
     lo = int(dst.num_local_tokens(start, dst_rank))
     hi = int(dst.num_local_tokens(end, dst_rank))
@@ -242,13 +266,6 @@ def plan_staged_relayout(
             f"Destination pages {len(dst_block_ids)} do not cover positions "
             f"[{start}, {end}) of rank {dst_rank} of {dst}"
         )
-    # A unit's rows keep their order, at the unit's place in its staging page.
-    src_blocks, src_rows = _kernel_block_rows(
-        staging_ids[staging_pages[slots]],
-        staging_sub[slots] * unit_rows + plan.src_rows % unit_rows,
-        kernel_blocks_per_page,
-        dst_kernel_block_size,
-    )
     dst_local_rows = np.arange(lo, (first_page + len(dst_block_ids)) * dst.block_size)
     dst_pages, dst_page_rows = dst.page_row(dst_local_rows)
     dst_blocks, dst_rows = _kernel_block_rows(
@@ -257,13 +274,16 @@ def plan_staged_relayout(
         kernel_blocks_per_page,
         dst_kernel_block_size,
     )
-    num_zero = len(dst_local_rows) - len(src_blocks)
+    num_zero = len(dst_local_rows) - len(src_rows)
     return StagedRelayout(
         reads=reads,
-        src_blocks=np.concatenate([src_blocks, np.full(num_zero, -1, np.int64)]),
+        src_slots=np.concatenate(
+            [block_of_row.reshape(-1) * units_per_kernel, np.full(num_zero, -1)]
+        ).astype(np.int64),
         src_rows=np.concatenate([src_rows, np.zeros(num_zero, np.int64)]),
         dst_blocks=dst_blocks,
         dst_rows=dst_rows,
+        staging_units=staging_units,
     )
 
 
@@ -304,83 +324,158 @@ class RelayoutRegion:
             raise ValueError(f"{self.rows} does not fit pages of {self}")
 
 
+def check_staged_rows(src_rows: KVRowLayout, dst_rows: KVRowLayout, unit_rows: int):
+    """Raise ValueError unless rows staged in `src_rows`' layout, in units of
+    `unit_rows` rows' worth of bytes, can be gathered into `dst_rows`' layout:
+    the rows must have the same pieces (what one token's KV is), and no piece
+    of a row may straddle two units."""
+    sizes = [size for _, size in src_rows.pieces]
+    if sizes != [size for _, size in dst_rows.pieces]:
+        raise ValueError(
+            f"KV row layouts differ in their row pieces: source {src_rows}, "
+            f"destination {dst_rows}"
+        )
+    if unit_rows % src_rows.kernel_page_rows == 0:
+        return  # Units hold whole kernel pages: they end between rows.
+    unit_bytes = unit_rows * src_rows.bytes_per_row
+    kernel_page_bytes = src_rows.kernel_page_rows * src_rows.bytes_per_row
+    for offset, size in src_rows.pieces:
+        if unit_bytes % size or offset % size or kernel_page_bytes % size:
+            raise ValueError(
+                f"{unit_rows}-row units of pages laid out as {src_rows} split "
+                f"the {size}-byte row pieces"
+            )
+
+
 _ELEMENT_DTYPES = {8: torch.int64, 4: torch.int32, 2: torch.int16, 1: torch.uint8}
 # Elements one loop step of the gather kernel copies of a row piece; longer
 # pieces take several steps.
 _COPY_BLOCK = 256
+# Region table columns before the pieces, and per piece.
+_REGION_COLUMNS = 7
+_PIECE_COLUMNS = 3
 
 
 def _region_table(
-    regions: list[RelayoutRegion], element_size: int, max_pieces: int
+    regions: list[RelayoutRegion],
+    src_rows: list[KVRowLayout],
+    unit_rows: int,
+    element_size: int,
+    max_pieces: int,
 ) -> np.ndarray:
     """One row per region, in `element_size` units: offset, page stride,
-    kernel page rows, row size, then (offset, size) of each row piece, padded
-    with empty pieces to `max_pieces`."""
-    table = np.zeros((len(regions), 4 + 2 * max_pieces), dtype=np.int64)
-    for i, region in enumerate(regions):
-        table[i, :4] = (
+    kernel page rows, row size, source kernel page rows, staging units per
+    page and unit size, then (offset, size, source offset) of each row piece,
+    padded with empty pieces to `max_pieces`."""
+    table = np.zeros(
+        (len(regions), _REGION_COLUMNS + _PIECE_COLUMNS * max_pieces), dtype=np.int64
+    )
+    for i, (region, src) in enumerate(zip(regions, src_rows)):
+        row_size = region.rows.bytes_per_row
+        table[i, :_REGION_COLUMNS] = (
             region.offset // element_size,
             region.page_stride // element_size,
             region.rows.kernel_page_rows,
-            region.rows.bytes_per_row // element_size,
+            row_size // element_size,
+            src.kernel_page_rows,
+            region.page_rows // unit_rows,
+            unit_rows * row_size // element_size,
         )
-        for p, (offset, size) in enumerate(region.rows.pieces):
-            table[i, 4 + 2 * p : 6 + 2 * p] = (
+        for p, ((offset, size), (src_offset, _)) in enumerate(
+            zip(region.rows.pieces, src.pieces)
+        ):
+            at = _REGION_COLUMNS + _PIECE_COLUMNS * p
+            table[i, at : at + _PIECE_COLUMNS] = (
                 offset // element_size,
                 size // element_size,
+                src_offset // element_size,
             )
     return table
 
 
-def _element_size(buf: torch.Tensor, regions: list[RelayoutRegion]) -> int:
+def _element_size(
+    buf: torch.Tensor, regions: list[RelayoutRegion], src_rows: list[KVRowLayout]
+) -> int:
     """Widest element (up to 8 bytes) dividing every address the gather
     forms, so it moves whole elements."""
     values = [buf.data_ptr(), buf.numel()]
-    for region in regions:
+    for region, src in zip(regions, src_rows):
         values += [region.offset, region.page_stride, region.rows.bytes_per_row]
         values += [v for piece in region.rows.pieces for v in piece]
+        values += [offset for offset, _ in src.pieces]
     common = math.gcd(*values)
     return next(size for size in (8, 4, 2, 1) if common % size == 0)
 
 
-def row_table(
-    src_blocks: np.ndarray,
-    src_rows: np.ndarray,
-    dst_blocks: np.ndarray,
-    dst_rows: np.ndarray,
-    device: torch.device,
-) -> torch.Tensor:
-    """The `(4, rows)` table a `RowGather` reads, on `device`: source page,
-    source row, destination page and destination row of each row (a negative
-    source page zeroes the destination row). Copied asynchronously from
-    pinned memory, ordered on the current stream."""
-    rows = np.stack([src_blocks, src_rows, dst_blocks, dst_rows]).astype(np.int64)
+def row_table(job: StagedRelayout, device: torch.device) -> torch.Tensor:
+    """The table a `RowGather` reads, on `device`: source slot, source row,
+    destination page and destination row of each row (`StagedRelayout`), then
+    the staging unit of each slot. Copied asynchronously from pinned memory,
+    ordered on the current stream."""
+    rows = np.concatenate(
+        [job.src_slots, job.src_rows, job.dst_blocks, job.dst_rows, job.staging_units]
+    ).astype(np.int64)
     return async_tensor_h2d(rows, device, torch.int64)
 
 
+def concat_staged_relayouts(jobs: list[StagedRelayout]) -> StagedRelayout:
+    """The gather of several jobs as one: slots renumbered past the slots of
+    the jobs before (reads are not merged)."""
+    first_slot = np.cumsum([0] + [len(job.staging_units) for job in jobs[:-1]])
+    return StagedRelayout(
+        reads={},
+        src_slots=np.concatenate(
+            [
+                np.where(job.src_slots < 0, -1, job.src_slots + first)
+                for job, first in zip(jobs, first_slot)
+            ]
+        ),
+        src_rows=np.concatenate([job.src_rows for job in jobs]),
+        dst_blocks=np.concatenate([job.dst_blocks for job in jobs]),
+        dst_rows=np.concatenate([job.dst_rows for job in jobs]),
+        staging_units=np.concatenate([job.staging_units for job in jobs]),
+    )
+
+
 class RowGather:
-    """The row gather of the regions of one flat uint8 buffer on the device:
-    for every region and row `i` of a row table (`row_table`), move row
-    `src_rows[i]` of page `src_blocks[i]` to row `dst_rows[i]` of page
-    `dst_blocks[i]`, or zero it if the source page is negative. Source and
-    destination rows must not overlap.
+    """The row gather of the regions of one flat uint8 buffer on the device,
+    from one source's staged pages: for every region and row `i` of a row
+    table (`row_table`), copy row `src_rows[i]` of the source kernel block
+    staged from slot `src_slots[i]` on, laid out as that region's
+    `src_rows` layout, into row `dst_rows[i]` of page `dst_blocks[i]`, or
+    zero it if the slot is negative. Staged units hold `unit_rows` rows'
+    worth of bytes. Source and destination rows must not overlap.
 
     The region table is built on the device once."""
 
-    def __init__(self, buf: torch.Tensor, regions: list[RelayoutRegion]) -> None:
+    def __init__(
+        self,
+        buf: torch.Tensor,
+        regions: list[RelayoutRegion],
+        src_rows: list[KVRowLayout],
+        unit_rows: int,
+    ) -> None:
         assert buf.dtype == torch.uint8 and buf.dim() == 1
+        if len(src_rows) != len(regions):
+            raise ValueError("Every region needs its source row layout")
+        for region, src in zip(regions, src_rows):
+            check_staged_rows(src, region.rows, unit_rows)
+            if region.page_rows % unit_rows:
+                raise ValueError(
+                    f"{unit_rows}-row units do not tile the pages of {region}"
+                )
         self.device = buf.device
         self.regions = regions
         self._max_pieces = max((len(r.rows.pieces) for r in regions), default=0)
-        element_size = _element_size(buf, regions)
+        element_size = _element_size(buf, regions, src_rows)
         self._elements = buf.view(_ELEMENT_DTYPES[element_size])
         self._table = torch.from_numpy(
-            _region_table(regions, element_size, self._max_pieces)
+            _region_table(regions, src_rows, unit_rows, element_size, self._max_pieces)
         ).to(buf.device)
 
-    def __call__(self, rows: torch.Tensor) -> None:
-        """Run the gather of `rows` (`row_table`) on the current stream."""
-        num_rows = rows.shape[1]
+    def __call__(self, rows: torch.Tensor, num_rows: int) -> None:
+        """Run the gather of the first `num_rows` rows of `rows`
+        (`row_table`) on the current stream."""
         if num_rows == 0 or not self.regions:
             return
         _relayout_rows_kernel[(num_rows, len(self.regions))](
@@ -390,6 +485,8 @@ class RowGather:
             self._table,
             self._table.shape[1],
             MAX_PIECES=self._max_pieces,
+            REGION_COLUMNS=_REGION_COLUMNS,
+            PIECE_COLUMNS=_PIECE_COLUMNS,
             BLOCK=_COPY_BLOCK,
         )
 
@@ -402,39 +499,57 @@ def _relayout_rows_kernel(
     table_ptr,
     table_width,
     MAX_PIECES: tl.constexpr,
+    REGION_COLUMNS: tl.constexpr,
+    PIECE_COLUMNS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     """One program per (row, region): the `KVRowLayout` address arithmetic
-    (`KVRowLayout.row_byte_ranges`), in elements."""
+    (`KVRowLayout.row_byte_ranges`) of both sides, in elements, the source
+    side spread over the staging units of its kernel block."""
     row = tl.program_id(0).to(tl.int64)
     region = tl.program_id(1).to(tl.int64)
-    src_block = tl.load(rows_ptr + row)
+    src_slot = tl.load(rows_ptr + row)
     src_row = tl.load(rows_ptr + num_rows + row)
     dst_block = tl.load(rows_ptr + 2 * num_rows + row)
     dst_row = tl.load(rows_ptr + 3 * num_rows + row)
+    slots_ptr = rows_ptr + 4 * num_rows
     entry = table_ptr + region * table_width
     offset = tl.load(entry)
     page_stride = tl.load(entry + 1)
     kernel_page_rows = tl.load(entry + 2)
     row_size = tl.load(entry + 3)
-    has_src = src_block >= 0
-    src_base = (
-        offset
-        + tl.maximum(src_block, 0) * page_stride
-        + src_row // kernel_page_rows * kernel_page_rows * row_size
-    )
+    src_kernel_page_rows = tl.load(entry + 4)
+    units_per_page = tl.load(entry + 5)
+    unit_size = tl.load(entry + 6)
+    has_src = src_slot >= 0
     dst_base = (
         offset
         + dst_block * page_stride
         + dst_row // kernel_page_rows * kernel_page_rows * row_size
     )
-    src_r = src_row % kernel_page_rows
     dst_r = dst_row % kernel_page_rows
+    # Offset of the source row's kernel page in its staged kernel block.
+    src_page = src_row // src_kernel_page_rows * src_kernel_page_rows * row_size
+    src_r = src_row % src_kernel_page_rows
     for p in tl.static_range(MAX_PIECES):
-        piece_offset = tl.load(entry + 4 + 2 * p)
-        size = tl.load(entry + 5 + 2 * p)
-        src = src_base + piece_offset + src_r * size
+        piece = entry + REGION_COLUMNS + PIECE_COLUMNS * p
+        piece_offset = tl.load(piece)
+        size = tl.load(piece + 1)
+        src_offset = tl.load(piece + 2)
         dst = dst_base + piece_offset + dst_r * size
+        # The piece in the staged block, and the staging unit holding it.
+        at = src_page + src_offset + src_r * size
+        unit = tl.load(
+            slots_ptr + tl.maximum(src_slot, 0) + at // unit_size,
+            mask=has_src & (size > 0),
+            other=0,
+        )
+        src = (
+            offset
+            + unit // units_per_page * page_stride
+            + unit % units_per_page * unit_size
+            + at % unit_size
+        )
         for start in range(0, size, BLOCK):
             idx = start + tl.arange(0, BLOCK)
             mask = idx < size
