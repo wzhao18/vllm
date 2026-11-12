@@ -4,7 +4,8 @@
 Triton launch on the current stream (CUDA graph safe: the grid depends only on the
 static row count ``n`` and the bucket capacity, no host sync).
 
-Grid: ``n`` live-row programs (x ``hidden / CH`` chunks) plus
+Grid: ``ceil(n / R)`` live-row programs of ``R`` rows (x ``hidden / CH`` chunks;
+``R`` = 1 for decode batches, 4 from 512 rows, :func:`_rows_per_program`) plus
 ``ceil((capacity - n) / DEAD_ROWS)`` dead-row programs, each of which writes
 ``topk_idx = -1`` for ``DEAD_ROWS`` rows of ``[n, capacity)`` (only chunk 0 works).
 
@@ -51,25 +52,44 @@ from vllm.triton_utils import tl, triton
 
 
 @triton.jit
-def _e2m1_code(m):
-    # |y| (<= 6, non-NaN) -> E2M1 magnitude code, round to nearest, ties to even code.
-    code = tl.where(m <= 0.25, 0, 1)
-    code = tl.where(m >= 0.75, 2, code)
-    code = tl.where(m > 1.25, 3, code)
-    code = tl.where(m >= 1.75, 4, code)
-    code = tl.where(m > 2.5, 5, code)
-    code = tl.where(m >= 3.5, 6, code)
-    code = tl.where(m > 5.0, 7, code)
-    return code
+def _e2m1x2(x_hi, x_lo):
+    """``cvt.rn.satfinite.e2m1x2.f32``: x_hi in the high nibble, x_lo in the low."""
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .b8 tmp;
+            cvt.rn.satfinite.e2m1x2.f32 tmp, $1, $2;
+            cvt.u32.u8 $0, tmp;
+        }
+        """,
+        constraints="=r,f,f",
+        args=[x_hi, x_lo],
+        dtype=tl.uint32,
+        is_pure=True,
+        pack=1,
+    ).to(tl.uint8)
 
 
 # Dead rows [n, capacity) written per dead-row program (topk_idx = -1 only).
 DEAD_ROWS = 64
 
+# Live rows per program: one row per program for decode-sized batches (the grid is
+# already a single wave there); ``_PREFILL_ROWS`` from ``PREFILL_STAGE_MIN_TOKENS``
+# rows, so each thread keeps 8 x 16 B of hidden states in flight (prefill: 2048 /
+# 4350 rows per rank ran 15 / 49 us as 7 x n single-row programs, latency bound at
+# 32 warps per SM; the HBM time of the bytes is 1-3 us).
+_PREFILL_ROWS = 4
+PREFILL_STAGE_MIN_TOKENS = 512
+
+
+def _rows_per_program(n: int) -> int:
+    return _PREFILL_ROWS if n >= PREFILL_STAGE_MIN_TOKENS else 1
+
 
 @triton.jit(
     do_not_specialize=[
         "n_tokens",
+        "n_live_programs",
         "n_dead_rows",
         "hid_stride",
         "ids_stride",
@@ -92,6 +112,7 @@ def _stage_kernel(
     err_ptr,
     pad_ptr,
     n_tokens,
+    n_live_programs,
     n_dead_rows,
     num_experts,
     scale_mult,
@@ -106,56 +127,70 @@ def _stage_kernel(
     TOPK_P2: tl.constexpr,
     HAS_PAD: tl.constexpr,
     DEAD: tl.constexpr,
+    ROWS: tl.constexpr,
 ):
-    row = tl.program_id(0).to(tl.int64)
+    pid = tl.program_id(0)
     chunk = tl.program_id(1)
-    live = row < n_tokens
-    if chunk == 0:
-        k = tl.arange(0, TOPK_P2)
-        km = k < TOPK
-        if live:
-            ids = tl.load(ids_ptr + row * ids_stride + k, mask=km, other=-1).to(
-                tl.int64
-            )
+    k = tl.arange(0, TOPK_P2)
+    km = k < TOPK
+    if pid < n_live_programs:
+        rows = pid.to(tl.int64) * ROWS + tl.arange(0, ROWS)
+        rm = rows < n_tokens
+        if chunk == 0:
+            m2 = rm[:, None] & km[None, :]
+            ids = tl.load(
+                ids_ptr + rows[:, None] * ids_stride + k[None, :], mask=m2, other=-1
+            ).to(tl.int64)
             if HAS_PAD:
-                padded = tl.load(pad_ptr + row) != 0
-                ids = tl.where(padded, -1, ids)
-            w = tl.load(wts_ptr + row * wts_stride + k, mask=km, other=0.0).to(
-                tl.float32
-            )
+                padded = tl.load(pad_ptr + rows, mask=rm, other=0) != 0
+                ids = tl.where(padded[:, None], -1, ids)
+            w = tl.load(
+                wts_ptr + rows[:, None] * wts_stride + k[None, :], mask=m2, other=0.0
+            ).to(tl.float32)
             valid = (ids >= 0) & (ids < num_experts)
-            bad = km & (ids != -1) & (~valid)
+            bad = m2 & (ids != -1) & (~valid)
             # Sticky error flag: [1, offending id] (racing writers store equal flags).
-            tl.store(err_ptr + k * 0, tl.full([TOPK_P2], 1, tl.int64), mask=bad)
-            tl.store(err_ptr + 1 + k * 0, ids, mask=bad)
+            zero2 = rows[:, None] * 0 + k[None, :] * 0
+            tl.store(err_ptr + zero2, tl.full([ROWS, TOPK_P2], 1, tl.int64), mask=bad)
+            tl.store(err_ptr + 1 + zero2, ids, mask=bad)
             tl.store(
-                idx_ptr + row * TOPK + k, tl.where(valid, ids, -1).to(tl.int32), mask=km
+                idx_ptr + rows[:, None] * TOPK + k[None, :],
+                tl.where(valid, ids, -1).to(tl.int32),
+                mask=m2,
             )
-            tl.store(sw_ptr + row * TOPK + k, tl.where(valid, w, 0.0), mask=km)
+            tl.store(
+                sw_ptr + rows[:, None] * TOPK + k[None, :],
+                tl.where(valid, w, 0.0),
+                mask=m2,
+            )
             if SF_COLS > H // VEC:
                 p = tl.arange(0, SF_PAD_P2)
                 tl.store(
-                    sf_ptr + row * sf_stride + H // VEC + p,
-                    tl.zeros([SF_PAD_P2], dtype=tl.uint8),
-                    mask=p < SF_COLS - H // VEC,
+                    sf_ptr + rows[:, None] * sf_stride + H // VEC + p[None, :],
+                    tl.zeros([ROWS, SF_PAD_P2], dtype=tl.uint8),
+                    mask=rm[:, None] & (p[None, :] < SF_COLS - H // VEC),
                 )
-        else:
-            # Dead-row program: -1 routes for DEAD rows starting at ``base``.
-            base = n_tokens + (row - n_tokens) * DEAD
-            r = tl.arange(0, DEAD)[:, None]
-            m = (base + r < n_tokens + n_dead_rows) & km[None, :]
-            tl.store(
-                idx_ptr + (base + r) * TOPK + k[None, :],
-                tl.full([DEAD, TOPK_P2], -1, tl.int32),
-                mask=m,
-            )
-    if live:
-        offs = chunk * CH + tl.arange(0, CH)
-        v = tl.load(hid_ptr + row * hid_stride + offs).to(tl.float32)
-        vb = tl.reshape(v, (CH // VEC, VEC))
-        amax = tl.max(tl.abs(vb), axis=1)
-        sf_offs = chunk * (CH // VEC) + tl.arange(0, CH // VEC)
         if NVFP4:
+            # One 16-element block per row of a [blocks, 8] tile of bf16 pairs read
+            # as 32-bit words: the block amax and the packed E2M1 bytes stay inside
+            # a thread (no reshape / split relayout); bf16 -> fp32 is exact.
+            NB: tl.constexpr = ROWS * (CH // VEC)
+            b = tl.arange(0, NB)
+            brow = pid.to(tl.int64) * ROWS + b // (CH // VEC)
+            bcol = chunk * (CH // VEC) + b % (CH // VEC)
+            bm = brow < n_tokens
+            wj = tl.arange(0, VEC // 2)
+            words = tl.load(
+                hid_ptr.to(tl.pointer_type(tl.uint32))
+                + brow[:, None] * (hid_stride // 2)
+                + bcol[:, None] * (VEC // 2)
+                + wj[None, :],
+                mask=bm[:, None],
+                other=0,
+            )
+            lo = (words << 16).to(tl.float32, bitcast=True)
+            hi = (words & 0xFFFF0000).to(tl.float32, bitcast=True)
+            amax = tl.maximum(tl.max(tl.abs(lo), axis=1), tl.max(tl.abs(hi), axis=1))
             s = tl.minimum(amax * scale_mult, 448.0)
             s8 = s.to(tl.float8e4nv)
             srt = s8.to(tl.float32)
@@ -168,20 +203,38 @@ def _stage_kernel(
                 ),
                 0.0,
             )
-            y = vb * acc[:, None]
-            m = tl.abs(y)
-            m = tl.where(m == m, tl.minimum(m, 6.0), 0.0)
-            code = _e2m1_code(m)
-            neg = (y.to(tl.int32, bitcast=True) < 0) & (code != 0)
-            nib = (code | tl.where(neg, 8, 0)).to(tl.uint8)
-            lo, hi = tl.split(tl.reshape(nib, (CH // 2, 2)))
-            packed = lo | (hi << 4)
+            y_lo = lo * acc[:, None]
+            y_hi = hi * acc[:, None]
+            # Hardware E2M1 (grid 0, .5, 1, 1.5, 2, 3, 4, 6): round to nearest, ties
+            # to the even code, |y| > 6 and inf saturate to 6. As FlashInfer's
+            # quantize_nvfp4_block16: NaN -> 0 and a nibble that rounds to zero is +0.
+            y_lo = tl.where(y_lo == y_lo, y_lo, 0.0)
+            y_hi = tl.where(y_hi == y_hi, y_hi, 0.0)
+            packed = _e2m1x2(y_hi, y_lo)
+            zero_lo = (packed & 0x07) == 0
+            zero_hi = (packed & 0x70) == 0
+            packed = packed & tl.where(zero_lo, 0xF7, 0xFF).to(tl.uint8)
+            packed = packed & tl.where(zero_hi, 0x7F, 0xFF).to(tl.uint8)
             tl.store(
-                x_ptr + row * x_stride + chunk * (CH // 2) + tl.arange(0, CH // 2),
+                x_ptr + brow[:, None] * x_stride + bcol[:, None] * (VEC // 2) + wj[None, :],
                 packed,
+                mask=bm[:, None],
             )
-            tl.store(sf_ptr + row * sf_stride + sf_offs, s8.to(tl.uint8, bitcast=True))
+            tl.store(
+                sf_ptr + brow * sf_stride + bcol,
+                s8.to(tl.uint8, bitcast=True),
+                mask=bm,
+            )
         else:
+            offs = chunk * CH + tl.arange(0, CH)
+            v = tl.load(
+                hid_ptr + rows[:, None] * hid_stride + offs[None, :],
+                mask=rm[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            vb = tl.reshape(v, (ROWS, CH // VEC, VEC))
+            amax = tl.max(tl.abs(vb), axis=2)
+            sf_offs = chunk * (CH // VEC) + tl.arange(0, CH // VEC)
             t = amax * (1.0 / 448.0)
             t = tl.where((t == t) & (t < float("inf")), t, 0.0)
             t = tl.maximum(t, 1.1754943508222875e-38)
@@ -190,14 +243,29 @@ def _stage_kernel(
             e = tl.minimum(tl.maximum(e, -126), 127)
             scale = ((e + 127) << 23).to(tl.float32, bitcast=True)
             q = tl.math.div_rn(
-                vb, tl.broadcast_to(scale[:, None], (CH // VEC, VEC))
+                vb, tl.broadcast_to(scale[:, :, None], (ROWS, CH // VEC, VEC))
             ).to(tl.float8e4nv)
             tl.store(
-                x_ptr + row * x_stride + offs,
-                tl.reshape(q, (CH,)).to(tl.uint8, bitcast=True),
+                x_ptr + rows[:, None] * x_stride + offs[None, :],
+                tl.reshape(q, (ROWS, CH)).to(tl.uint8, bitcast=True),
+                mask=rm[:, None],
             )
             sfb = tl.minimum(tl.maximum(e + 127, 1), 254).to(tl.uint8)
-            tl.store(sf_ptr + row * sf_stride + sf_offs, sfb)
+            tl.store(
+                sf_ptr + rows[:, None] * sf_stride + sf_offs[None, :],
+                sfb,
+                mask=rm[:, None],
+            )
+    elif chunk == 0:
+        # Dead-row program: -1 routes for DEAD rows starting at ``base``.
+        base = n_tokens + (pid - n_live_programs).to(tl.int64) * DEAD
+        r = tl.arange(0, DEAD)[:, None]
+        m = (base + r < n_tokens + n_dead_rows) & km[None, :]
+        tl.store(
+            idx_ptr + (base + r) * TOPK + k[None, :],
+            tl.full([DEAD, TOPK_P2], -1, tl.int32),
+            mask=m,
+        )
 
 
 def _chunk(hidden: int, vec: int) -> int:
@@ -241,6 +309,11 @@ def stage_inputs(
         raise ValueError(f"{n} tokens exceed the bucket capacity {capacity}.")
     if hidden_states.dtype != torch.bfloat16 or hidden_states.stride(-1) != 1:
         raise ValueError("hidden_states must be BF16 with unit inner stride.")
+    if nvfp4 and n and (hidden_states.stride(0) % 2 or hidden_states.data_ptr() % 4):
+        raise ValueError(
+            "NVFP4 staging reads BF16 pairs as 32-bit words: hidden_states needs an "
+            "even row stride and 4-byte alignment."
+        )
     if topk_ids.shape != (n, topk) or topk_weights.shape != (n, topk):
         raise ValueError(
             f"topk_ids / topk_weights must be ({n}, {topk}), got "
@@ -272,7 +345,9 @@ def stage_inputs(
     sf_u8 = x_sf.view(torch.uint8)
     pad = sf_cols - hidden // vec
     n_dead = capacity - n
-    grid = (n + triton.cdiv(n_dead, DEAD_ROWS), hidden // ch)
+    rows = _rows_per_program(n)
+    n_live = triton.cdiv(n, rows)
+    grid = (n_live + triton.cdiv(n_dead, DEAD_ROWS), hidden // ch)
     _stage_kernel[grid](
         hidden_states,
         hidden_states.stride(0),
@@ -289,6 +364,7 @@ def stage_inputs(
         route_error,
         is_padding if is_padding is not None else route_error,
         n,
+        n_live,
         n_dead,
         num_experts,
         float(input_norm_const) / 6.0,
@@ -303,5 +379,6 @@ def stage_inputs(
         TOPK_P2=triton.next_power_of_2(topk),
         HAS_PAD=is_padding is not None,
         DEAD=DEAD_ROWS,
+        ROWS=rows,
         num_warps=4,
     )

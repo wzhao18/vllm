@@ -37,7 +37,7 @@ from vllm.logger import init_logger
 from .arch import require_sm107
 from .config import RouteIdError, RubinBucket, RubinMoeConfig, RubinMoeProblem
 from .session import RubinMegaMoeSession, layout_tag
-from .staging import stage_inputs
+from .staging import PREFILL_STAGE_MIN_TOKENS, stage_inputs
 from .symm_arena import SymmetricArena, ensure_not_capturing, group_barrier
 from .weights import RubinMoeWeights, prepare_weights
 
@@ -248,11 +248,22 @@ class RubinMegaMoE:
         dev = self.route_error.device
         row = torch.zeros((1, p.hidden), dtype=torch.bfloat16, device=dev)
         first = self.sessions[self.buckets[0]]
+        last = self.sessions[self.buckets[-1]]
+        # The multi-row prefill grid is its own specialization: compile it too when
+        # the largest bucket can take that many rows.
+        wide = PREFILL_STAGE_MIN_TOKENS
+        wide_rows = None
+        if self.buckets[-1].max_tokens >= wide:
+            wide_rows = torch.zeros((wide, p.hidden), dtype=torch.bfloat16, device=dev)
         for ids_dtype in ids_dtypes:
             for w_dtype in weight_dtypes:
                 ids = torch.full((1, p.top_k), -1, dtype=ids_dtype, device=dev)
                 wts = torch.zeros((1, p.top_k), dtype=w_dtype, device=dev)
                 self._stage(first, row, ids, wts)
+                if wide_rows is not None:
+                    ids = torch.full((wide, p.top_k), -1, dtype=ids_dtype, device=dev)
+                    wts = torch.zeros((wide, p.top_k), dtype=w_dtype, device=dev)
+                    self._stage(last, wide_rows, ids, wts)
         self.check_route_errors()
         ids = torch.full((1, p.top_k), -1, dtype=ids_dtypes[0], device=dev)
         ids[0, 0] = p.num_experts
