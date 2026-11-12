@@ -22,7 +22,7 @@ as it was while #108's ``dsa.prepared.PreparedDsa`` serves the steps up to 64 ro
 
 The packed projection row is [q_a 1536 | kv_a 576 | gate H*128 | wk 128 | wv 32]."""
 
-from functools import cache
+from functools import cache, partial
 
 import cutlass
 import cutlass.cute as cute
@@ -52,6 +52,7 @@ from . import dcp_value
 from .dcp_stage import compile_dcp_value, projected_rows, run_value
 from .dcp_value import PROJECTED
 from .index import DIM, HEADS, DsaIndex
+from .overlap import QueryWait
 from .r1 import DsaBox
 
 logger = init_logger(__name__)
@@ -69,7 +70,7 @@ QUERY_HEADS = 64  # FlashMLA sparse FP8 decode reads 64 or 128 query heads
 # q8 M72 18.22 -> 17.62 / 17.13 -> 16.53, M96 20.45 -> 19.84 / 19.25 -> 18.68; real
 # (test) weights q4 M72 16.13 -> 15.58, M96 17.53 -> 16.96. The serving configs ran
 # it up to 256 (C48 / C64) and 512 rows (C160 / C256, "proj" partials). Open-ended:
-# every kernel of the core serves any rows (MlaQuery's tile poll above
+# every kernel of the core serves any rows (MlaQuery publish-only above
 # ``WIDE_MAX_ROWS``; "proj" DcpValue's merging CTAs and the BF16 one's row tiles
 # stride over at most one wave), each checked co-resident at compile; the widened box
 # holds the largest captured row. NQ-TUNE: 16-rank step vs S2-DSA above 512 rows (q4
@@ -78,11 +79,27 @@ DSA_WIDE: dict = {"*": "65-:1"}
 # The most rows whose MlaQuery polls the whole gathered mailbox from every CTA: that
 # grid (8-CTA clusters x 6 heads x 32-row tiles at DCP16) must be co-resident, and Rubin
 # holds 22 such clusters (cuOccupancyMaxActiveClusters, checked at compile by
-# ``check_query_residency``), i.e. 3 row tiles (96 rows: 18). Above it each row tile
-# polls only its own tokens (``MlaQuery(tile_poll=True)``, Wei's d6347e7603): one
-# tile's 6 clusters must be resident at once, and the tiles are dispatched in order,
-# so every rank's lowest unfinished tile is resident (any rows).
+# ``check_query_residency``), i.e. 3 row tiles (96 rows: 18). Above it MlaQuery only
+# publishes (``gather=False``) and QueryWait (dsa.overlap) polls the gathered mailbox
+# on the main stream right before the sparse decode, its first reader
+# (``query_publishes_only``): the query's grid then waits on nothing (no residency
+# need), and the q all-gather's NVLink delivery and the ranks' arrival skew run
+# behind the indexer chain (wq_b -> DsaIndex -> logits -> top-k -> merge), which reads
+# only q_c. Under the previous tile poll (``MlaQuery(tile_poll=True)``) every 32-row
+# tile was a 16-rank barrier inside the query kernel: 22 resident clusters of 8 CTAs,
+# 4 / 5 rounds at 360 / 560 rows, each paying the slowest rank plus that round's
+# NVLink delivery (C256 trace, AgentX q4: 62.9 / 89.1 us per MLA layer on the
+# critical path).
 WIDE_MAX_ROWS = 96
+# QueryWait at the publish-only rows: CTAs per SM (one pass of at most 8 polled
+# 16 B chunks per thread up to 4 x SMs x 2048 chunks: 1.24M at 360 rows, DCP16).
+WAIT_CTAS_PER_SM = 4
+
+
+def query_publishes_only(batch, dcp):
+    """Whether WideDsa's MlaQuery at ``batch`` rows under DCP only publishes (the
+    gathered mailbox then polled by QueryWait before the sparse decode)."""
+    return bool(dcp) and batch > WIDE_MAX_ROWS
 
 
 def choose(shape, ctx):
@@ -154,7 +171,7 @@ def compile_core(
         nvfp4=nvfp4,
         dcp=dcp,
         q_heads=q_heads,
-        tile_poll=bool(dcp) and batch > WIDE_MAX_ROWS,
+        gather=not query_publishes_only(batch, dcp),
     )
     q_args = (projected, qnorm, kvnorm, qb, uk, kv, slots, scalar, scalar, f32(1e-6))
     publish: tuple = ()
@@ -174,7 +191,7 @@ def compile_core(
     output = fake((batch, heads * 128), (heads * 128, 1))
     with torch.accelerator.device_index(device):
         query_kernel = cute.compile(mla_query, *q_args, query, qc, *publish, s)
-        if dcp and batch > 64:
+        if dcp and batch > 64 and mla_query.gather:
             # Wide rows: the CTAs poll the gathered mailbox, which other ranks' CTAs
             # fill, so every CTA that polls with them must be resident (hazard H1).
             check_query_residency(query_kernel, mla_query, device)
@@ -209,14 +226,29 @@ def compile_core(
     return query_kernel, index_kernel, value_kernel
 
 
+@cache
+def compile_query_wait(batch, heads, dcp, q_heads, sms, cap, fp8=True):
+    """QueryWait of ``batch`` publish-only rows (``query_publishes_only``; else
+    None): every 16 B chunk of the DCP x ``heads`` gathered heads (rows of
+    ``q_heads``) polled until published, over up to WAIT_CTAS_PER_SM x ``sms`` CTAs.
+    Shared by every DSA layer (the mailbox is a launch argument)."""
+    if not query_publishes_only(batch, dcp):
+        return None
+    q_bytes = 1 if fp8 else 2
+    mailbox = fake((cap, q_heads, 576 * q_bytes), None, torch.uint8)
+    ctas = WAIT_CTAS_PER_SM * sms
+    wait = QueryWait(batch, dcp * heads, q_heads, q_bytes, ctas=ctas)
+    return cute.compile(wait, mailbox, make_fake_stream())
+
+
 def check_query_residency(compiled, mla_query, device):
     """Raise unless the device holds at once every cluster of ``mla_query``'s grid
     that polls together (cuOccupancyMaxActiveClusters at its shared memory and
     carve-out): the whole grid, or under ``tile_poll`` one row tile's; returns the
     measured clusters. Rubin (VR200, 212 SMs), DCP16, FP8, 6 heads: one CTA per SM
     (227 KB shared, 208 registers), 22 clusters of 8 CTAs at once; 65-96 rows need
-    18 (3 tiles of 32 rows x 6 heads), 97-128 rows would need 24 (hence the tile
-    poll above WIDE_MAX_ROWS: 6)."""
+    18 (3 tiles of 32 rows x 6 heads), 97-128 rows would need 24 (hence the
+    publish-only query above WIDE_MAX_ROWS, which polls nothing)."""
     grid, cluster = mla_query.grid, mla_query.cluster
     resident = max_active_clusters(compiled, device, grid, 256, cluster, 100)
     need = grid[1] * (1 if mla_query.tile_poll else grid[2])
@@ -380,6 +412,7 @@ class WideDsa:
             (rows,), self.indexer.max_model_len, dtype=torch.int32, device=device
         )
         self.kernels = {}
+        self.waits = {}  # QueryWait per batch (publish-only rows; else None)
         policies = index_policies(sorted(pitches))
         wq = self.indexer.wq_index.weight
         self.index_projection = PreparedProjection(wq, policies).prepare()
@@ -405,11 +438,14 @@ class WideDsa:
             self.kernels[batch, q] = compile_core(
                 *args, fp8=self.fp8, lse_base_e=lse_base_e, cap=cap, nvfp4=self.nvfp4
             )
+            w_args = batch, self.heads, self.dcp, box.q_heads, sms, cap, self.fp8
+            self.waits[batch] = compile_query_wait(*w_args)
         rows = sorted(b for b, _ in self.shapes)
         proj = [b for b in rows if self.dsa_box.mailbox(b).format == PROJECTED]
         logger.info_once(
             "Kimi K3.1 WideDsa (DCP %d): rows %s, widened DSA box %d rows (%s), "
-            'MlaQuery tile poll above %d rows, DcpValue partials %s ("proj" at rows '
+            "MlaQuery publish-only (QueryWait before the sparse decode) above %d rows, "
+            'DcpValue partials %s ("proj" at rows '
             "%s)",
             self.dcp,
             " ".join(map(str, rows)),
@@ -492,14 +528,15 @@ class WideDsa:
             dcp_local_topk=indexer.dcp_local_topk,
         )
 
-    def dcp_core(self, cache, topk, metadata, batch, box=None):
+    def dcp_core(self, cache, topk, metadata, batch, box=None, wait=None):
         """Sparse decode of every rank's query heads (the gathered q mailbox) over the
         local shard into the DcpValue rows, LSE and per-row valid counts. The global
         top-k ids are filtered to this rank's slots and compacted to a prefix whose
         length bounds the work (about 1 / DCP of the top-k). FlashMLA (natural-log
         LSE; a fresh scheduler metadata per call follows those lengths) or, on a
         per-tensor FP8 cache, FlashInfer's sparse decode over the flat rows, as the
-        stock decode."""
+        stock decode. ``wait``: QueryWait's launch (publish-only rows), right before
+        the decode reads the gathered q mailbox."""
         from vllm.v1.attention.backends.mla.flashmla_sparse import _fp8_kv_pages
         from vllm.v1.attention.backends.mla.sparse_utils import (
             flat_kv_row_view,
@@ -536,6 +573,8 @@ class WideDsa:
                 NUM_TOPK_TOKENS=topk.shape[1],
                 return_valid_counts=True,
             )
+        if wait is not None:
+            wait()
         if self.fp8:
             self.impl.record_logical_topk_ready()
             rows, lse = self.impl._forward_mqa_kernel(
@@ -591,7 +630,10 @@ class WideDsa:
         mq(*q_args, to_cute(self.query[:batch]), to_cute(self.qc[:batch]), *publish, s)
         self.run_index(x, index_slots, batch, index)
         topk = self.indexer_core(projected, batch)
-        latent, lse, valid = self.dcp_core(cache, topk, metadata, batch, box)
+        query_wait, wait = self.waits.get(batch), None
+        if query_wait is not None:  # publish-only rows: poll before the decode
+            wait = partial(query_wait, mailbox, s)
+        latent, lse, valid = self.dcp_core(cache, topk, metadata, batch, box, wait)
         if self.dsa_box.mailbox(batch).format == PROJECTED:
             core, (w_uv, uv_view) = (latent, lse, valid), self.uv_gathered
             args = value, self.dsa_box, p, publish, self.heads, core, lengths[:reqs]
