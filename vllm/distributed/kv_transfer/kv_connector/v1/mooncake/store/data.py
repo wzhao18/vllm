@@ -67,6 +67,27 @@ class BlobBlockHashes(Sequence[BlockHash]):
         off = idx * self._hash_len
         return BlockHash(self._blob[off : off + self._hash_len])
 
+    def hex_and_bytes(self, start: int, stop: int) -> tuple[list[str], list[bytes]]:
+        """Hex strings and bytes of the hashes in ``[start, stop)``.
+
+        Equal to ``[self[i].hex() ...]`` and ``[bytes(self[i]) ...]``, but
+        converts the contiguous range with one ``hex()`` and one copy instead
+        of one view and two conversions per hash (the lookup server probes
+        ~3K hashes per request on the worker that also launches kernels).
+        """
+        start = max(0, start)
+        stop = min(self._n, stop)
+        if stop <= start:
+            return [], []
+        hl = self._hash_len
+        raw = bytes(self._blob[start * hl : stop * hl])
+        hx = raw.hex()
+        n = len(raw)
+        return (
+            [hx[2 * i : 2 * i + 2 * hl] for i in range(0, n, hl)],
+            [raw[i : i + hl] for i in range(0, n, hl)],
+        )
+
 
 class _CompactChunkHashList(BlockHashListWithBlockSize):
     """View that keys each ``block_size`` chunk by the last constituent
@@ -181,6 +202,14 @@ class PoolKey:
     @staticmethod
     def build_key_string(key_prefix: str, chunk_hash: str) -> str:
         return f"{key_prefix}@{chunk_hash}"
+
+    @staticmethod
+    def build_key_strings(
+        key_prefixes: Sequence[str], chunk_hashes: Sequence[str]
+    ) -> list[str]:
+        """``build_key_string`` for every hash, each across all prefixes
+        (hash-major: the prefixes of one hash are adjacent)."""
+        return [f"{p}@{h}" for h in chunk_hashes for p in key_prefixes]
 
     def to_string(self) -> str:
         return self.build_key_string(

@@ -2457,9 +2457,10 @@ class MooncakeStoreWorker:
             return MooncakeLookupResult(0)
 
         # Build per-(group, hash) candidate keys expanded across rank namespaces.
-        # candidate_meta stores the (group, hash_bytes) for key slice.
+        # Each segment is (group, its hashes' bytes, namespaces per hash); its
+        # keys are hash-major, so a hash's namespaces are adjacent.
         candidate_keys: list[str] = []
-        candidate_meta: list[tuple[int, bytes]] = []
+        segments: list[tuple[int, list[bytes], int]] = []
         fine_grained = self.coord.enable_partial_hash_hits
         lookup_masks = None if fine_grained else self.coord.lookup_mask(token_len)
         start_unit = 0
@@ -2499,14 +2500,10 @@ class MooncakeStoreWorker:
                     for chunk_id in range(mask_limit)
                     if lookup_mask is None or lookup_mask[chunk_id]
                 ]
-            for chunk_id in unit_ids:
-                h = group_hashes[chunk_id]
-                hash_hex = h.hex()
-                for key_prefix in key_prefixes:
-                    candidate_keys.append(
-                        PoolKey.build_key_string(key_prefix, hash_hex)
-                    )
-                candidate_meta.append((g_idx, bytes(h)))
+            hexes, raws = _hash_units(group_hashes, unit_ids)
+            if raws:
+                candidate_keys += PoolKey.build_key_strings(key_prefixes, hexes)
+                segments.append((g_idx, raws, len(key_prefixes)))
 
         if not candidate_keys:
             return MooncakeLookupResult(0, known_prefix_tokens=known_prefix_tokens)
@@ -2538,11 +2535,18 @@ class MooncakeStoreWorker:
         # shard, replicated groups one namespace per unique KV head).
         exists_set = trusted
         pos = 0
-        for g_idx, hash_bytes in candidate_meta:
-            count = len(self._lookup_key_prefixes[g_idx])
-            if all(res[pos + j] == 1 for j in range(count)):
-                exists_set.add((g_idx, hash_bytes))
-            pos += count
+        for g_idx, raws, count in segments:
+            end = pos + len(raws) * count
+            hit_flags = [r == 1 for r in res[pos:end]]
+            pos = end
+            present = (
+                hit_flags
+                if count == 1
+                else map(all, zip(*(hit_flags[j::count] for j in range(count))))
+            )
+            exists_set.update(
+                (g_idx, h) for h, ok in zip(raws, present, strict=True) if ok
+            )
 
         hit = self._longest_hit(
             num_tokens, token_len, block_hashes, known_prefix_tokens, exists_set
@@ -2690,6 +2694,24 @@ class MooncakeStoreWorker:
             store.close()
         except Exception as e:
             logger.warning("Error closing MooncakeDistributedStore: %s", e)
+
+
+def _hash_units(
+    hashes: Sequence[BlockHash], unit_ids: Sequence[int]
+) -> tuple[list[str], list[bytes]]:
+    """Hex strings and bytes of ``hashes[u]`` for each ``u`` in ``unit_ids``.
+
+    A contiguous range of a ``BlobBlockHashes`` (the lookup server's input) is
+    converted in one pass; anything else per hash.
+    """
+    if (
+        isinstance(hashes, BlobBlockHashes)
+        and isinstance(unit_ids, range)
+        and unit_ids.step == 1
+    ):
+        return hashes.hex_and_bytes(unit_ids.start, unit_ids.stop)
+    raws = [bytes(hashes[u]) for u in unit_ids]
+    return [h.hex() for h in raws], raws
 
 
 def _has_state_spec(spec: Any) -> bool:
