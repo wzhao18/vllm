@@ -3,9 +3,10 @@
 """Kimi K3 specialized decode plain KDA verify with an FP32 recurrent state on Rubin:
 
 * every plain verify row of an FP32 state runs a stock-math kernel
-  (``KdaVerifyLoopStock`` at the ``kda.prepared.FP32_VERIFY_WIDE`` wide rows,
-  ``KdaSplitStock`` elsewhere; TP16's 6 heads at q4 / q8, other q and the SP decode's
-  24 heads, with and without a conv bias) and matches the stock verify of the layer
+  (``KdaVerifyLoopStock`` at the ``kda.prepared.FP32_VERIFY_WIDE`` wide rows, or
+  ``KdaVerifyFeed`` at its ``FP32_FEED`` rows; ``KdaSplitStock`` elsewhere;
+  TP16's 6 heads at q4 / q8, other q and the SP decode's 24 heads, with and
+  without a conv bias) and matches the stock verify of the layer
   (``KimiK3DeltaAttention._forward``, native Triton backend: ``causal_conv1d_update``
   -> ``fused_recurrent_kda`` -> ``o_norm``; FlashInfer's packed decode does not take
   6 heads) to FP32 reduction order: the conv window bit for bit, every token's
@@ -15,6 +16,10 @@
 * ``KdaVerifyPacked`` and ``KdaVerifyLoop`` (``KdaVerifyWide``'s math: KdaSplit's;
   LoopStock's bases, never selected for an FP32 state) equal ``KdaVerifyWide`` bit
   for bit;
+* ``KdaVerifyFeed`` (LoopStock with feed warps: per-item prologue and gated norm
+  beside the recurrence warps, operands staged in shared memory) equals
+  ``KdaVerifyLoopStock`` bit for bit, with and without padding requests, and
+  refuses q > 4;
 * padding requests (slot -1) leave the caches untouched and output zeros, and the
   live requests' results do not depend on them.
 
@@ -212,10 +217,12 @@ def test_fp32_verify_rows_match_stock(monkeypatch, q, requests, heads, bias):
     """The production kernel at this shape (``PreparedKda`` with an FP32 state: a
     stock-math kind) against the stock verify."""
     name = prepared.verify_kernel(requests, q, RUBIN, False, 0, heads)
-    assert name in ("loopstock", "kdasplit"), name
+    assert name in ("loopstock", "feed", "kdasplit"), name
     schedule = prepared.schedule_of(heads, requests, 0, q, RUBIN, False)
     kernel = prepared.make_kernel((heads, requests, 0, bias, schedule, q, False), RUBIN)
-    stock_kinds = (prepared.KdaVerifyLoopStock, prepared.KdaSplitStock)
+    stock_kinds = (
+        prepared.KdaVerifyLoopStock, prepared.KdaVerifyFeed, prepared.KdaSplitStock
+    )
     assert type(kernel) in stock_kinds, type(kernel)
     attention = kda_attention(heads=heads, bias=bias)
     slots = requests * q + 1
@@ -265,7 +272,44 @@ def test_packed_and_loop_equal_wide(monkeypatch, q, requests, kind):
     assert_bitwise("conv state", got[1][0], want[1][0])
 
 
-@pytest.mark.parametrize("kind", ["loopstock", "loop", "kdasplit"])
+# Feed vs LoopStock (q4): one item per CTA (B16 / B35), CTA ranges across a head
+# boundary and two to four items per CTA (B41, C256's B90 / B140, B256).
+FEED_SHAPES = [(4, 16), (4, 35), (4, 41), (4, 90), (4, 140), (4, 256)]
+
+
+@pytest.mark.parametrize("q,requests", FEED_SHAPES, ids=lambda v: str(v))
+@pytest.mark.parametrize("pad", [False, True], ids=["live", "padded"])
+def test_feed_equals_loopstock(monkeypatch, q, requests, pad):
+    attention = kda_attention()
+    slots = requests * q + 1
+    base = caches(slots, q)
+    table, accepted = spec_inputs(requests, q, slots)
+    if pad:  # every third request is padding
+        padded = torch.arange(requests, device=DEVICE) % 3 == 1
+        table[padded] = -1
+        accepted[padded] = 0
+    projected = projected_rows(requests * q)
+    got = run(
+        core_of(attention, requests, q, "feed", base, monkeypatch),
+        projected, base, table, accepted,
+    )  # fmt: skip
+    want = run(
+        core_of(attention, requests, q, "loopstock", base, monkeypatch),
+        projected, base, table, accepted,
+    )  # fmt: skip
+    assert_bitwise("output", got[0], want[0])
+    assert_bitwise("recurrent state", got[1][1], want[1][1])
+    assert_bitwise("conv state", got[1][0], want[1][0])
+
+
+def test_feed_refuses_long_verify():
+    """Its operand buffers fit shared memory up to q = 4 (the policy has no q8 row)."""
+    with pytest.raises(AssertionError, match="KdaVerifyFeed"):
+        prepared.KdaVerifyFeed(HEADS, 64, 0, False, (1, 8, 0, 1), 8, False)
+    assert prepared.verify_kernel(64, 8, RUBIN, False) == "loopstock"
+
+
+@pytest.mark.parametrize("kind", ["loopstock", "feed", "loop", "kdasplit"])
 def test_loop_padding_requests(monkeypatch, kind):
     """Every third request is padding (slots -1): zero outputs, no cache
     writes, and the live requests' results equal a batch of the live ones alone."""
