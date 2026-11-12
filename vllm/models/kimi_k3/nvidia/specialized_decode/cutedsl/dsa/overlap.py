@@ -80,6 +80,19 @@ QUERY_OVERLAP = {
 # TP without the fused indexer (the late modes follow its select): the TP table the
 # stack ran before them.
 QUERY_OVERLAP_UNFUSED = "1:front,2-9:serial,10:front,11-320:fork"
+# Index priority per rows (DCP fork / front only; "chain": on, other rows: off): the
+# indexer chain, wq_b through the sparse core, on ``index_stream`` instead of the
+# main stream. The forked MlaQuery (8-CTA clusters, several waves) otherwise takes
+# the SMs as they free up and stretches the chain beside it (C512 decode trace,
+# TP4 = DCP4, AgentX, integ 6486a21616: wq_b 23.8 / 45.0 us at 128 / 256 rows
+# against 14.9 / 19.2 alone), while MlaQuery has slack until the sparse core joins
+# it. The chain also starves MlaQuery through the top-k, so it pays only while
+# MlaQuery still ends before the top-k merge does. "sp" the C512 sequence-parallel
+# decode; per rows, measured (hti/p2/d512-combined, 4-node C512 decode step A/B,
+# CUDA-graph step vs none, ms): 128 rows -0.22, 208 rows -0.21; at 256 rows the
+# QueryWait end is the join (1-node SP DSA block, chain: -19..+0.3 us/layer; step,
+# wq_b through the logits only on the stream: +0.20 ms), so 209- runs without it.
+INDEX_PRIORITY = {"sp": "17-208:chain"}
 MODES = ("serial", "fork", "wait", "front", "late", "late_front")
 LATE = ("late", "late_front")  # TP with the fused indexer only (else: fork, front)
 NORM = ("fork", "late")  # QueryNorm writes the q_c rows
@@ -102,6 +115,16 @@ def overlap_for(batch, policy=None, dcp=False, rubin=False):
 def side_stream(device_index):
     """The DSA layers' query side stream of a device."""
     return torch.cuda.Stream(device=device_index)
+
+
+@cache
+def index_stream(device_index):
+    """The DSA layers' high-priority index stream of a device: under fork / front
+    the indexer chain (wq_b, DsaIndex, logits, top-k, the sparse core) runs on it,
+    so the SMs MlaQuery's queued CTAs (side stream, default priority) would take
+    go to the indexer chain first (``INDEX_PRIORITY``)."""
+    highest = torch.cuda.Stream.priority_range()[1]
+    return torch.cuda.Stream(device=device_index, priority=highest)
 
 
 class QueryNorm:

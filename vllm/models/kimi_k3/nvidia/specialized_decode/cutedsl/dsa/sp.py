@@ -51,7 +51,7 @@ from ..mla.query import TILED_FROM
 from .attn_fi import dsa_on_flashinfer
 from .dcp_value import PROJECTED
 from .index import DIM, HEADS
-from .overlap import overlap_for
+from .overlap import INDEX_PRIORITY, overlap_for
 from .prepared import PreparedDsa
 from .r1 import fi_buffers
 
@@ -261,6 +261,7 @@ class SpDsaCore:
             kernels=SP_KERNELS,
             overlap=SP_QUERY_OVERLAP,
             partials=SP_PARTIALS,
+            priority=INDEX_PRIORITY["sp"],
         )
         prepared = self.prepared
         # The per-layer FP8 query rows PreparedDsa's QueryStage took: the shared ones
