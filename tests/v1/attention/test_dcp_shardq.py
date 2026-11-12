@@ -737,6 +737,88 @@ def test_attention_over_workspace_matches_replicated_cache(cache_dtype, kernel):
     assert torch.equal(out, attend(rep.mla))
 
 
+def test_dense_mha_step_mqa_rows_beyond_the_lse_slab():
+    """A dense-MHA step (its fresh prefill row no longer than the top-k) stays
+    on the DCP path and runs MQA, with LSE, on the MLA builder's decode rows:
+    requests of up to 1024 new tokens at K3.1's 24 heads per rank, so more rows
+    than the softmax-stats slab sized for the DCP path's bounded steps. They
+    launch in slab-sized row chunks and match one launch over a slab that
+    holds every row, bit for bit."""
+    from unittest.mock import patch
+
+    import flashinfer.decode
+
+    from vllm.v1.attention.backends.mla import flashinfer_mla_sparse as fims
+    from vllm.v1.attention.ops.dcp_shardq import context as dcp
+
+    world, heads, slab_rows = 4, NUM_HEADS // 4, 2048
+    assert fims.mla_decode_query_len_threshold(heads) == 1024
+    # Five prefix hits of 500 new tokens (decode rows for the MLA builder),
+    # then a fresh 1100-token request (a prefill row, shorter than the top-k).
+    lens = [(1500, 500)] * 5 + [(0, 1100)]
+    num_mqa = sum(n for _, n in lens if n <= 1024)
+    assert num_mqa == 2500 > slab_rows
+
+    planner = dcp.DcpShardQPlanner(
+        _layout("fp8"),
+        1 << 12,
+        1 << 20,
+        1 << 30,
+        64,
+        4,
+        world,
+        0,
+        torch.device("cuda"),
+        label="layers.0, 1 layers",
+    )
+    table = torch.zeros(len(lens), 1, dtype=torch.int32, device="cuda")
+    assert planner.plan(_common_metadata(lens, table), use_dense_mha=True) is None
+    assert planner.stats.total == {dcp.DENSE_MHA: [1, 3600]}
+
+    # The MQA rows over the replicated cache (dense pages: a request's token
+    # t is flat row page_start * PAGE + t).
+    rep = Replicated(lens, _layout("fp8"), fill_random=False)
+    _real_rows(rep, "fp8")
+    topk, req_id = _random_topk(lens[:5])
+    first_row = torch.from_numpy(_page_start(lens) * PAGE).cuda()[req_id.long()]
+    physical = torch.where(topk >= 0, topk + first_row[:, None].int(), -1)
+    valid = (topk >= 0).sum(dim=1, dtype=torch.int32)
+    q = _fp8_query(num_mqa, NUM_HEADS)
+    launch = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla
+
+    def attend(rows):
+        impl = _flashinfer_impl("fp8", "trtllm", world)
+        impl._workspace_buffer = torch.zeros(
+            fims.compute_trtllm_sparse_mla_workspace_bytes(
+                fims._DEFAULT_WORKSPACE_BUFFER_SIZE, world, heads, rows
+            ),
+            dtype=torch.int8,
+            device="cuda",
+        )
+        with patch.object(
+            flashinfer.decode, "trtllm_batch_decode_with_kv_cache_mla", wraps=launch
+        ) as launches:
+            out, lse = impl._forward_mqa_kernel(
+                q,
+                rep.mla,
+                physical,
+                valid,
+                layer=SCALES,
+                block_size=PAGE,
+                is_decode=True,
+            )
+        return out, lse, launches.call_count
+
+    out, lse, num_launches = attend(slab_rows)
+    ref_out, ref_lse, ref_launches = attend(num_mqa)
+    assert (num_launches, ref_launches) == (2, 1)
+    assert lse is not None and ref_lse is not None
+    assert out.shape == (num_mqa, NUM_HEADS, 512)
+    assert torch.isfinite(out).all() and torch.isfinite(lse).all()
+    assert torch.equal(out, ref_out)
+    assert torch.equal(lse, ref_lse)
+
+
 def _distributed_worker(rank, world, init_file, cache_dtype, kernel):
     """One rank of a DCP = TP group: the production gather, indexer and
     attention over the gathered context against TP ShardQ over the replicated
@@ -1090,22 +1172,6 @@ def _indexer_topk(
         indexer.score(hidden, index_q, index_weights, index_k=None)
 
 
-def _reserve_whole_step_lse(config, device, kernel, world):
-    """Size trtllm-gen's DCP softmax-stats slab for whole prefill steps.
-
-    Under DCP ShardQ the slab covers only the DCP path's bounded steps
-    (trtllm_gen_lse_max_rows). These tests shrink the gathered-context
-    workspace below max_model_len to send whole prefill steps to the DCP path,
-    which a served configuration never does, so they size the slab as without
-    DCP ShardQ.
-    """
-    if kernel != "trtllm":
-        return
-    from vllm.v1.attention.backends.mla import flashinfer_mla_sparse as fims
-
-    fims.reserve_trtllm_gen_buffers(config, device, world, dcp_shardq=False)
-
-
 def _layer_worker(rank, world, init_file, cache_dtype, kernel, index_format="fp8"):
     """One rank of a DCP = TP group running a real K3.1 DSA layer (its indexer
     keys in ``index_format``).
@@ -1237,7 +1303,6 @@ def _layer_worker(rank, world, init_file, cache_dtype, kernel, index_format="fp8
             grouped = FlashInferMLASparseTRTLLMBackend.get_builder_cls()(
                 spec, [layer.layer_name], config, device
             )
-            _reserve_whole_step_lse(config, device, kernel, world)
             for name, lens in LAYER_STEPS.items():
                 layout = _layout(cache_dtype, index_format)
                 rep = Replicated(lens, layout, fill_random=False)
@@ -1583,7 +1648,6 @@ def _profile_worker(rank, world, init_file, cache_dtype, kernel, index_format="f
                     ),
                 )
             registry.warmup()
-            _reserve_whole_step_lse(config, device, kernel, world)
             group = layer.dcp_manager.group
             group_all_gather = group.all_gather
 

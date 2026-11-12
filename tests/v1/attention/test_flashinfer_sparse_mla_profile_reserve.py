@@ -8,9 +8,9 @@ layers' profile pass (FlashInferMLASparseImpl.reserve_workspace) therefore
 allocates the workspace and KV counters at their final size and claims one full
 step's attention working set.
 
-Under DCP ShardQ only the DCP path's bounded steps ask for LSE, so the DCP
-softmax-stats slab covers dcp_fallback_max_tokens rows, and a launch that asks
-for more LSE rows than the slab holds raises.
+Under DCP ShardQ the DCP softmax-stats slab covers the DCP path's
+dcp_fallback_max_tokens rows; dense-MHA steps, whose MQA rows can exceed them,
+launch in slab-sized row chunks.
 """
 
 from types import SimpleNamespace
@@ -304,9 +304,26 @@ def test_lse_launch_within_slab_runs():
     assert launches[0]["lse"].shape == (16, 128)
 
 
-def test_lse_launch_beyond_slab_raises():
-    with pytest.raises(RuntimeError, match="17 rows x 128 heads asks for LSE"):
-        _mqa(rows=17, slab_rows=16, return_lse=None)
+def test_lse_launch_beyond_slab_runs_in_slab_chunks():
+    """A dense-MHA step's MQA rows can exceed the slab: they launch in
+    slab-sized row chunks, each writing its rows of the output and LSE."""
+    launches = _mqa(rows=40, slab_rows=16, return_lse=None)
+    assert [len(kw["query"]) for kw in launches] == [16, 16, 8]
+    assert all(kw["return_lse"] for kw in launches)
+    out, lse = launches[0]["out"], launches[0]["lse"]
+    for i, kw in enumerate(launches):
+        assert kw["lse"].shape == (len(kw["query"]), 128)
+        assert kw["lse"].data_ptr() == lse.data_ptr() + i * 16 * lse.stride(0) * 4
+        assert kw["out"].data_ptr() == out.data_ptr() + i * 16 * out.stride(0) * 2
+        assert kw["seq_lens"].shape == (len(kw["query"]),)
+        assert kw["block_tables"].shape[0] == len(kw["query"])
+
+
+def test_lse_launch_without_slab_raises():
+    """A workspace without a softmax-stats slab (not sized for DCP) cannot
+    run any LSE launch."""
+    with pytest.raises(RuntimeError, match="no softmax-stats slab"):
+        _mqa(rows=1, slab_rows=0, return_lse=None)
 
 
 def test_launch_without_lse_ignores_slab():

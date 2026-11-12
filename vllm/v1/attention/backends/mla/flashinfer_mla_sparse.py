@@ -267,6 +267,12 @@ class FlashInferMLASparseMetadata(SparseMLACommonMetadata):
     """Attention metadata for FlashInfer MLA Sparse backend."""
 
 
+def mla_decode_query_len_threshold(num_q_heads: int) -> int:
+    """Longest query of a request the MLA metadata builders count as a decode
+    row (their reorder threshold), at ``num_q_heads`` query heads per rank."""
+    return {8: 128, 16: 128, 32: 128, 64: 256, 128: 1024}.get(num_q_heads, 1024)
+
+
 class FlashInferMLASparseMetadataBuilder(
     SparseMLACommonMetadataBuilder[FlashInferMLASparseMetadata]
 ):
@@ -287,11 +293,8 @@ class FlashInferMLASparseMetadataBuilder(
         num_q_heads = vllm_config.model_config.get_num_attention_heads(
             vllm_config.parallel_config
         )
-        threshold = {8: 128, 16: 128, 32: 128, 64: 256, 128: 1024}.get(
-            num_q_heads, 1024
-        )
         self._init_reorder_batch_threshold(
-            threshold,
+            mla_decode_query_len_threshold(num_q_heads),
             supports_spec_as_decode=True,
             supports_dcp_with_varlen=True,
         )
@@ -399,11 +402,11 @@ def compute_trtllm_sparse_mla_workspace_bytes(
     counter and scratch regions. ``base_workspace_bytes`` must stay available
     for those regions, so the slab is added on top of it (see #50781).
 
-    ``max_num_batched_tokens``: the most rows a step asks LSE for
+    ``max_num_batched_tokens``: the rows the slab holds
     (``trtllm_gen_lse_max_rows``). Without DCP no LSE is requested, no slab is
     carved, and the base size is returned unchanged. A launch covers at most
-    ``_TRTLLM_GEN_MAX_REQUESTS`` tokens, and launches run in order on one
-    stream, so larger batches reuse the same slab.
+    ``_TRTLLM_GEN_MAX_REQUESTS`` tokens and at most the slab's rows, and
+    launches run in order on one stream, so larger batches reuse the same slab.
     """
     if dcp_world_size <= 1:
         return base_workspace_bytes
@@ -669,8 +672,10 @@ def _reserve_kv_counters(device: torch.device, num_rows: int, num_heads: int) ->
 
 
 def trtllm_gen_lse_max_rows(vllm_config: VllmConfig, dcp_shardq: bool) -> int:
-    """Most query rows of one step that ask trtllm-gen for LSE; it sizes the
-    DCP softmax-stats slab (``compute_trtllm_sparse_mla_workspace_bytes``).
+    """Query rows the DCP softmax-stats slab is sized for
+    (``compute_trtllm_sparse_mla_workspace_bytes``): the LSE rows of one step
+    except dense-MHA steps, whose larger MQA row counts run in slab-sized
+    launches (``FlashInferMLASparseImpl._forward_mqa_kernel``).
 
     Only the DCP path asks for LSE (``need_to_return_lse_for_decode``, for the
     DCP combine), for every MQA row of its step: up to max_num_batched_tokens.
@@ -686,17 +691,20 @@ def trtllm_gen_lse_max_rows(vllm_config: VllmConfig, dcp_shardq: bool) -> int:
       most the indexer's decode threshold;
     * the steps the planner leaves on the DCP path: steps without prefill rows,
       few-token steps (decode rows plus fewer than
-      ``sparse_mla_shard_q_min_tokens`` prefill tokens), dense-MHA steps (MQA
-      on their decode rows only) and padded steps (FULL CUDA graphs, at most
-      the DCP workspace's tokens; DCP ShardQ excludes FULL mixed graphs). No
-      step keeps it for a full gathered-context workspace: that holds at least
-      max_model_len tokens, so one request always fits, and larger steps run
-      in request groups.
+      ``sparse_mla_shard_q_min_tokens`` prefill tokens) and padded steps (FULL
+      CUDA graphs, at most the DCP workspace's tokens; DCP ShardQ excludes FULL
+      mixed graphs), all bounded by ``dcp_fallback_max_tokens``; and dense-MHA
+      steps, which run MQA on their decode rows: the MLA builder's decode rows
+      (``mla_decode_query_len_threshold``, 1024 tokens a request at Kimi
+      K3.1's 12 or 24 heads per rank), so up to max_num_batched_tokens rows.
+      No step keeps it for a full gathered-context workspace: that holds at
+      least max_model_len tokens, so one request always fits, and larger steps
+      run in request groups.
 
-    ``dcp_fallback_max_tokens`` bounds all of them (2048 rows for Kimi K3.1
+    The slab covers ``dcp_fallback_max_tokens`` rows (2048 rows for Kimi K3.1
     C512 prefill against 32768 tokens per step: 0.9 instead of 8.4 GiB per
-    rank at 128 padded heads). ``FlashInferMLASparseImpl._forward_mqa_kernel``
-    raises if a launch ever asks for more LSE rows than the slab holds.
+    rank at 128 padded heads); a dense-MHA step's MQA runs in launches of that
+    many rows, which reuse the slab in stream order.
     """
     max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
     if not dcp_shardq:
@@ -1493,28 +1501,30 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
             (num_tokens, padded_heads, self.kv_lora_rank), dtype=torch.bfloat16
         )
         lse = None
-        if return_lse:
-            # trtllm-gen carves each launch's softmax stats from the workspace
-            # unchecked; the slab covers trtllm_gen_lse_max_rows rows only.
-            launch_rows = min(num_tokens, _TRTLLM_GEN_MAX_REQUESTS)
-            capacity = trtllm_gen_lse_rows_capacity(
-                self._workspace_buffer.numel(), padded_heads
-            )
-            if launch_rows > capacity:
-                raise RuntimeError(
-                    f"trtllm-gen sparse MLA: a launch of {launch_rows} rows x "
-                    f"{padded_heads} heads asks for LSE, but the workspace's "
-                    f"softmax-stats slab holds {capacity} rows "
-                    "(trtllm_gen_lse_max_rows). Running it would overwrite the "
-                    "workspace's other regions."
-                )
-            lse = q.new_empty((num_tokens, padded_heads), dtype=torch.float32)
-
         # One trtllm-gen request per token, and requests map to gridDim.z: a
         # launch over more than 65535 tokens fails without raising and leaves
         # ``out`` unwritten (flashinfer-ai/flashinfer#3125). Launch row chunks.
-        for start in range(0, num_tokens, _TRTLLM_GEN_MAX_REQUESTS):
-            end = min(start + _TRTLLM_GEN_MAX_REQUESTS, num_tokens)
+        launch_rows = _TRTLLM_GEN_MAX_REQUESTS
+        if return_lse:
+            # trtllm-gen carves each launch's softmax stats from the workspace
+            # unchecked; the slab covers trtllm_gen_lse_max_rows rows only
+            # (dense-MHA steps' MQA rows can exceed it). Launches run in order
+            # on one stream, so each reuses the slab; rows are independent.
+            capacity = trtllm_gen_lse_rows_capacity(
+                self._workspace_buffer.numel(), padded_heads
+            )
+            if capacity == 0:
+                raise RuntimeError(
+                    f"trtllm-gen sparse MLA: a launch of {padded_heads} heads "
+                    "asks for LSE, but the workspace has no softmax-stats slab "
+                    "(it was not sized for DCP). Running it would overwrite "
+                    "the workspace's other regions."
+                )
+            launch_rows = min(launch_rows, capacity)
+            lse = q.new_empty((num_tokens, padded_heads), dtype=torch.float32)
+
+        for start in range(0, num_tokens, launch_rows):
+            end = min(start + launch_rows, num_tokens)
             extra_kwargs = _kv_counters(end - start, padded_heads, q.device)
             if topk_lens is not None:
                 extra_kwargs["sparse_mla_top_k_lens"] = topk_lens[start:end]
