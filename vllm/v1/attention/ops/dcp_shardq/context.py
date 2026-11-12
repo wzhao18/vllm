@@ -45,7 +45,6 @@ from vllm.utils.math_utils import round_up
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.mla.indexer import (
-    DeepseekV32IndexerMetadataBuilder,
     DeepseekV32IndexerPrefillChunkMetadata,
     build_prefill_chunk_metadata,
 )
@@ -467,12 +466,93 @@ class DcpShardQContext:
         )
 
 
+# DeepGEMM's prefill logits: rows padded to its 4-token Q block, row stride a
+# whole number of 384-key splits rounded to 1024 bytes (bf16: 512 columns).
+_LOGITS_ROW_ALIGN = 4
+_LOGITS_COL_ALIGN = 384 * 512 // np.gcd(384, 512)
+
+
+def _logits_width(max_seq_len: int) -> int:
+    return round_up(max(max_seq_len, 1), _LOGITS_COL_ALIGN)
+
+
+def _rank_query_rows(query_len: int, world: int) -> np.ndarray:
+    """Rows of one request of ``query_len`` tokens that each rank scores under
+    the ShardQ two-piece fold (``shardq.fold_split``)."""
+    pieces = 2 * world
+    bounds = (np.arange(pieces + 1) * query_len) // pieces
+    lens = np.diff(bounds)
+    return lens[:world] + lens[world:][::-1]
+
+
+def split_shardq_indexer_chunks(
+    seq_lens: np.ndarray,
+    query_lens: np.ndarray,
+    world: int,
+    max_keys: int,
+    max_logits_elems: int,
+) -> list[tuple[slice, slice]]:
+    """Indexer prefill chunks of a ShardQ request group, as
+    ``(req_slice, query_slice)`` like
+    ``DeepseekV32IndexerMetadataBuilder._split_indexer_prefill_chunks``.
+
+    A rank scores only its fold pieces of each request, so a chunk's logits
+    hold that rank's rows, not the chunk's query tokens: the budget bounds the
+    most rows any rank scores in the chunk times the logits row width (every
+    rank gets the same chunks). Consecutive requests share a chunk while their
+    keys fit ``max_keys`` and their logits fit ``max_logits_elems``; a request
+    that does not fit alone is cut along its query tokens at the fold pieces
+    (inside a piece only when one piece alone exceeds the budget).
+    """
+    n = len(seq_lens)
+    chunks: list[tuple[slice, slice]] = []
+    i = 0
+    while i < n:
+        start, rows, keys, width = i, np.zeros(world, np.int64), 0, 0
+        while i < n:
+            new_rows = rows + _rank_query_rows(int(query_lens[i]), world)
+            new_width = max(width, _logits_width(int(seq_lens[i])))
+            new_keys = keys + int(seq_lens[i])
+            padded = round_up(int(new_rows.max()), _LOGITS_ROW_ALIGN)
+            if new_keys > max_keys or padded * new_width > max_logits_elems:
+                break
+            rows, keys, width = new_rows, new_keys, new_width
+            i += 1
+        if i > start:
+            chunks.append((slice(start, i), slice(0, int(query_lens[start:i].sum()))))
+            continue
+        # One request over the budget: cut its query tokens at the pieces.
+        q = int(query_lens[i])
+        max_rows = max_logits_elems // _logits_width(int(seq_lens[i]))
+        max_rows = max(_LOGITS_ROW_ALIGN, max_rows // _LOGITS_ROW_ALIGN * _LOGITS_ROW_ALIGN)
+        bounds = (np.arange(2 * world + 1) * q) // (2 * world)
+        counts = np.zeros(world, np.int64)
+        lo = pos = 0
+        for piece in range(2 * world):
+            owner = piece if piece < world else 2 * world - 1 - piece
+            left = int(bounds[piece + 1] - bounds[piece])
+            while left > 0:
+                take = min(left, max_rows - int(counts[owner]))
+                if take == 0:
+                    chunks.append((slice(i, i + 1), slice(lo, pos)))
+                    counts[:] = 0
+                    lo = pos
+                    continue
+                counts[owner] += take
+                pos += take
+                left -= take
+        if pos > lo:
+            chunks.append((slice(i, i + 1), slice(lo, pos)))
+        i += 1
+    return chunks
+
+
 def build_dcp_shardq_context(
     common_attn_metadata: CommonAttentionMetadata,
     layout: ContextLayout,
     max_pages: int,
     max_indexer_keys: int,
-    max_logits_bytes: int,
+    max_logits_elems: int,
     world: int,
     rank: int,
     device: torch.device,
@@ -533,15 +613,15 @@ def build_dcp_shardq_context(
     block_table_gpu = to_device(block_table, torch.int32)
     seq_lens_gpu = common_attn_metadata.seq_lens[:num_reqs]
     prefill_seq_lens_cpu = seq_lens_cpu[num_decodes:]
-    query_lens_cpu = torch.from_numpy(query_lens)
     group_chunks = []
     for g_lo, g_hi in groups:
         # A group's chunks never span two groups: each runs over one gather.
-        chunk_specs = DeepseekV32IndexerMetadataBuilder._split_indexer_prefill_chunks(
-            prefill_seq_lens_cpu[g_lo:g_hi],
-            query_lens_cpu[g_lo:g_hi],
+        chunk_specs = split_shardq_indexer_chunks(
+            prefill_seq_lens_cpu[g_lo:g_hi].numpy(),
+            query_lens[g_lo:g_hi],
+            world,
             max_indexer_keys,
-            max_logits_bytes,
+            max_logits_elems,
         )
         chunks = [
             build_prefill_chunk_metadata(
@@ -711,7 +791,7 @@ class DcpShardQPlanner:
         layout: ContextLayout,
         max_pages: int,
         max_indexer_keys: int,
-        max_logits_bytes: int,
+        max_logits_elems: int,
         min_tokens: int,
         max_decode_query_len: int,
         world: int,
@@ -727,7 +807,7 @@ class DcpShardQPlanner:
         )
         self.max_pages = max_pages
         self.max_indexer_keys = max_indexer_keys
-        self.max_logits_bytes = max_logits_bytes
+        self.max_logits_elems = max_logits_elems
         self.min_tokens = min_tokens
         self.max_decode_query_len = max_decode_query_len
         self.world = world
@@ -773,7 +853,7 @@ class DcpShardQPlanner:
                 self.layout,
                 self.max_pages,
                 self.max_indexer_keys,
-                self.max_logits_bytes,
+                self.max_logits_elems,
                 self.world,
                 self.rank,
                 self.device,

@@ -201,7 +201,7 @@ def _build_context(lens, layout, world, rank, max_pages=None):
         layout,
         total_pages if max_pages is None else max_pages,
         max_indexer_keys=1 << 20,
-        max_logits_bytes=1 << 30,
+        max_logits_elems=1 << 30,
         world=world,
         rank=rank,
         device=torch.device("cuda"),
