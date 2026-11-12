@@ -39,7 +39,7 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
-from vllm.distributed import get_ep_group
+from vllm.distributed import get_ep_group, get_tensor_model_parallel_world_size
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
@@ -65,6 +65,7 @@ from .config import (
     Variant,
     make_buckets,
 )
+from .session import ep_mean_tokens
 from .weights import MX_BLOCK, RubinMoeWeights
 
 if TYPE_CHECKING:
@@ -223,6 +224,23 @@ def _dp_batches_uniform(dp_metadata) -> bool:
     return uniform
 
 
+# The forward's DPMetadata (held), the sequence-parallel size and the EP-mean live
+# tokens per rank: computed once per forward, not once per MoE layer.
+_ep_mean_memo: tuple[object, int, int] | None = None
+
+
+def _ep_mean_tokens(dp_metadata, sp_size: int) -> int:
+    """:func:`ep_mean_tokens` of the forward's DP batch sizes (host-only, identical on
+    every rank), cached per DPMetadata object."""
+    global _ep_mean_memo
+    memo = _ep_mean_memo
+    if memo is not None and memo[0] is dp_metadata and memo[1] == sp_size:
+        return memo[2]
+    mean = ep_mean_tokens(dp_metadata.num_tokens_across_dp_cpu, sp_size)
+    _ep_mean_memo = (dp_metadata, sp_size, mean)
+    return mean
+
+
 def check_kimi_k3_mega_moe_supported() -> None:
     """Raise unless this process runs on an SM107 (VR200) GPU."""
     if not current_platform.is_cuda() or not current_platform.is_device_capability(
@@ -341,6 +359,8 @@ class KimiK3MegaMoEExperts(nn.Module):
         )
         self.bucket = self.buckets[-1]
         self.dp_size = vllm_config.parallel_config.data_parallel_size
+        # Whether forward gets a 1/TP sequence-parallel shard (see ep_tokens).
+        self.sequence_parallel = False
         if ep_rank == 0:
             logger.info_once(
                 "Rubin MegaMoE: %s %s buckets of %s tokens/rank at EP%d (%s).",
@@ -490,6 +510,9 @@ class KimiK3MegaMoEExperts(nn.Module):
             for bucket in self.buckets
         )
         self.bucket = self.buckets[-1]
+        # The overlap runs under sequence parallelism: each TP rank holds a 1/TP
+        # shard of its DP batch (sequence_parallel_chunk).
+        self.sequence_parallel = True
 
     # -- runtime / kernel layout -----------------------------------------------------
 
@@ -631,6 +654,26 @@ class KimiK3MegaMoEExperts(nn.Module):
                 return b
         raise AssertionError("unreachable: the largest bucket holds max_num_tokens")
 
+    def ep_tokens(self, num_tokens: int) -> int | None:
+        """EP-uniform live tokens per rank of this forward (the EP mean, which sets
+        each rank's expert work); picks a capped prefill bucket's epilogue variant
+        (``session.RubinMegaMoeSession.use_s2``). ``num_tokens`` itself at DP1 (every
+        EP rank holds the same count); None (the bucket capacity) at DP > 1 without
+        DP metadata, which every rank sees alike."""
+        if self.dp_size == 1:
+            return num_tokens
+        dp_metadata = (
+            get_forward_context().dp_metadata
+            if is_forward_context_available()
+            else None
+        )
+        if dp_metadata is None:
+            return None
+        sp_size = (
+            get_tensor_model_parallel_world_size() if self.sequence_parallel else 1
+        )
+        return _ep_mean_tokens(dp_metadata, sp_size)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -699,6 +742,7 @@ class KimiK3MegaMoEExperts(nn.Module):
             bucket=bucket,
             is_padding=is_padding,
             owner=self.prefix,
+            ep_tokens=self.ep_tokens(num_tokens),
         )
         if shared_experts is not None:
             y += shared_experts(hidden_states)

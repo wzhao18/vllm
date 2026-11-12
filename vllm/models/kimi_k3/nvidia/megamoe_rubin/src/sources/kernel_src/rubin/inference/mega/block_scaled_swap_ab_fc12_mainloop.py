@@ -95,6 +95,11 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
         self.use_2cta_instrs = impl_desc["use_2cta_instrs"]
         self.mainloop_smem_budget_bytes = impl_desc["mainloop_smem_budget_bytes"]
         self.num_accumulator_consumer_warps_per_cta = impl_desc["num_accumulator_consumer_warps_per_cta"]
+        # vLLM S2: epilogue warpgroups sharing the TMEM allocation (each consumes its own acc stages).
+        self.num_epilogue_warpgroups = impl_desc.get("epilogue_warpgroups", 1)
+        self.tmem_sharing_thread_count = 32 * (
+            1 + self.num_epilogue_warpgroups * self.num_accumulator_consumer_warps_per_cta
+        )
 
         self.architecture = "sm_107"
         self.mma_cta_count = 2 if self.use_2cta_instrs else 1
@@ -628,7 +633,7 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
         """Bind the SM107 TMEM allocator to finalized SMEM regions."""
         allocation_barrier = pipeline.NamedBarrier(
             barrier_id=self.tmem_allocation_barrier_id,
-            num_threads=32 * (1 + self.num_accumulator_consumer_warps_per_cta),
+            num_threads=self.tmem_sharing_thread_count,
         )
         return utils.TmemAllocator(
             smem_workspace.ptr(self.tmem_holding_buffer_region, smem_base),
@@ -1062,7 +1067,7 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
         fragment_a = tiled_mma.make_fragment_A(self.a_smem_tensor)
         fragment_b = tiled_mma.make_fragment_B(self.b_smem_tensor)
 
-        barrier_sync_unaligned(self.tmem_allocation_barrier_id, 32 * (1 + self.num_accumulator_consumer_warps_per_cta))
+        barrier_sync_unaligned(self.tmem_allocation_barrier_id, self.tmem_sharing_thread_count)
         accumulator_pointer = tmem_allocator.retrieve_ptr(self.acc_dtype)
         accumulator_layout = cute.make_layout(self.accumulator_shape, stride=self.accumulator_stride)
         accumulator_base = cute.make_tensor(accumulator_pointer, accumulator_layout)
