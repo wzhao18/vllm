@@ -66,6 +66,43 @@ def _e2m1_code(m):
 # Dead rows [n, capacity) written per dead-row program (topk_idx = -1 only).
 DEAD_ROWS = 64
 
+# Per-shape policy (VR200 microbenchmarks, hidden 3584): batches of at least
+# this many rows stage with ``prefill_glue.stage_rows`` (one CUDA thread per 8
+# columns, bitwise this module's ``_stage_kernel``); smaller ones (decode) keep
+# ``_stage_kernel``, equal at 1000 rows.
+ROWS_STAGER_MIN_TOKENS = 1024
+
+
+def _use_rows_stager(
+    nvfp4: bool,
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    x_u8: torch.Tensor,
+    sf_u8: torch.Tensor,
+    topk_idx: torch.Tensor,
+) -> bool:
+    n, hidden = hidden_states.shape
+    capacity, topk = topk_idx.shape
+    vec = 16 if nvfp4 else 32
+    return (
+        n >= ROWS_STAGER_MIN_TOKENS
+        and hidden % 32 == 0
+        and hidden // 8 >= topk
+        and 0 <= sf_u8.shape[1] - hidden // vec <= hidden // 8
+        and capacity * (hidden // 8) < 2**31
+        and hidden_states.stride(0) % 8 == 0
+        and hidden_states.data_ptr() % 16 == 0
+        and x_u8.stride(1) == 1
+        and x_u8.stride(0) % 4 == 0
+        and x_u8.data_ptr() % (4 if nvfp4 else 8) == 0
+        and sf_u8.stride(1) == 1
+        and topk_idx.is_contiguous()
+        and topk_idx.dtype == torch.int32
+        and topk_ids.dtype in (torch.int32, torch.int64)
+        and topk_weights.dtype in (torch.float32, torch.bfloat16, torch.float16)
+    )
+
 
 @triton.jit(
     do_not_specialize=[
@@ -267,11 +304,31 @@ def stage_inputs(
             f"is_padding must be a contiguous bool ({n},) tensor on the device, got "
             f"{is_padding.dtype} {tuple(is_padding.shape)} on {is_padding.device}."
         )
-    ch = _chunk(hidden, vec)
     x_u8 = x.view(torch.uint8)
     sf_u8 = x_sf.view(torch.uint8)
     pad = sf_cols - hidden // vec
     n_dead = capacity - n
+    if _use_rows_stager(nvfp4, hidden_states, topk_ids, topk_weights, x_u8, sf_u8, topk_idx):
+        # Prefill-sized batches: one thread per 8 columns (bitwise the same
+        # staging as _stage_kernel).
+        from vllm.models.kimi_k3.nvidia.ops import prefill_glue
+
+        prefill_glue.stage_rows(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            x_u8,
+            sf_u8,
+            topk_idx,
+            staged_weights,
+            route_error,
+            is_padding,
+            num_experts,
+            nvfp4,
+            input_norm_const,
+        )
+        return
+    ch = _chunk(hidden, vec)
     grid = (n + triton.cdiv(n_dead, DEAD_ROWS), hidden // ch)
     _stage_kernel[grid](
         hidden_states,

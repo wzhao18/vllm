@@ -62,7 +62,7 @@ from vllm.models.kimi_k3.nvidia.mxfp8 import (
     can_pack_mxfp8,
     takes_mxfp8_activation,
 )
-from vllm.models.kimi_k3.nvidia.ops import mxfp8_act
+from vllm.models.kimi_k3.nvidia.ops import mxfp8_act, prefill_glue
 from vllm.models.kimi_k3.nvidia.ops.dsa_indexer import (
     dsa_fused_prologue,
     indexer_k_norm_quant_insert,
@@ -524,7 +524,9 @@ class KimiK3DSAAttention(nn.Module):
                 prefix=f"{prefix}.fused_qkv_a_proj",
                 disable_tp=True,
             )
-            self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
+            self.q_a_layernorm = prefill_glue.KimiRowsRMSNorm(
+                self.q_lora_rank, eps=config.rms_norm_eps
+            )
             self.q_b_proj = ColumnParallelLinear(
                 self.q_lora_rank,
                 self.num_heads * self.qk_head_dim,
@@ -547,7 +549,9 @@ class KimiK3DSAAttention(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.q_proj",
             )
-        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
+        self.kv_a_layernorm = prefill_glue.KimiRowsRMSNorm(
+            self.kv_lora_rank, eps=config.rms_norm_eps
+        )
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
@@ -708,6 +712,7 @@ class KimiK3DSAAttention(nn.Module):
             q_b_proj=self.q_b_proj if self.q_lora_rank is not None else None,
             q_proj=self.q_proj if self.q_lora_rank is None else None,
             g_proj=self.g_proj if (hasattr(self, "g_proj")) else None,
+            gate_sigmoid_mul=prefill_glue.eager_gate_sigmoid_mul,
             indexer=self.dsa_indexer,
             indexer_rotary_emb=self.rotary_emb,
             is_sparse=True,

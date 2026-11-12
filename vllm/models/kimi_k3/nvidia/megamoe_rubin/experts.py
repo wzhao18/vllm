@@ -697,6 +697,7 @@ class KimiK3MegaMoEExperts(nn.Module):
             weights,
             bucket=bucket,
             is_padding=is_padding,
+            owner=self.prefix,
         )
         if shared_experts is not None:
             y += shared_experts(hidden_states)

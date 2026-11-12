@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -37,6 +38,11 @@ class MLAModules:
     indexer_rotary_emb: torch.nn.Module | None = None
     g_proj: torch.nn.Module | None = None
     index_group_builder: "SparseMLAIndexGroupBuilder | None" = None
+    # Optional ``(attn_out, gate) -> attn_out * gate.sigmoid()`` (same result)
+    # for models with a fused implementation of the output gate.
+    gate_sigmoid_mul: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = (
+        None
+    )
 
 
 # --8<-- [start:multi_head_latent_attention]
@@ -101,6 +107,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.indexer_rope_emb = mla_modules.indexer_rotary_emb
         self.is_sparse = mla_modules.is_sparse
         self.g_proj = mla_modules.g_proj
+        self.gate_sigmoid_mul = mla_modules.gate_sigmoid_mul
 
         # Whether to skip top-k token selection computation in this layer.
         # When True, the indexer will not be called, and the layer will reuse
@@ -251,7 +258,11 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         )
 
         if self.g_proj is not None:
-            attn_out = attn_out * self.g_proj(hidden_states)[0].sigmoid()
+            gate = self.g_proj(hidden_states)[0]
+            if self.gate_sigmoid_mul is not None:
+                attn_out = self.gate_sigmoid_mul(attn_out, gate)
+            else:
+                attn_out = attn_out * gate.sigmoid()
 
         if skip_o_proj:
             return attn_out
