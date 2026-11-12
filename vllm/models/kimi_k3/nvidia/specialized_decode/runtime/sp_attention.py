@@ -36,11 +36,12 @@ the DSA DcpBox by DSA-layer ordinal. With an odd block count the last block of a
 and the first of the next share a parity; the stock final ``sp_all_gather`` (a TP
 collective) separates them.
 
-RecoverSSM: "triton" records (``recoverssm.prepare_recoverssm(defer=False)``), the
-stock row layout and the stock Triton commit after sampling. The "deferred" commit
-needs the stock ``KimiK3ModelState`` to call ``recoverssm.bind_model_state``, which it
-does not; until it does, deferring would gain nothing anyway (``kda.sp.REPLAY`` is
-empty).
+RecoverSSM: "deferred" records (``recoverssm.prepare_recoverssm``): the commit after
+sampling only stages each request's accepted count, and the next step's KDA core folds
+it into the checkpoint in its own pass (KdaWide, ``kda.sp.FOLDS``, the stock commit's
+math bit for bit) or, before a core that does not fold, the step's first KDA block
+flushes every layer's pending commit. ``KimiK3ModelState`` binds the runner-state side
+(``SpecializedDecode.bind_model_state``).
 
 NQ-TUNE: every family is GENERIC (no VR200 table at TP4 / DCP4 / 24 heads); see each
 provider's module docstring for its sweep.
@@ -288,8 +289,8 @@ class SpStep:
             self.dsa_scratch = sp_dsa_scratch(self.device, rows[-1])
         self.records = "none"
         if "kda" in kinds:
-            # "triton": the stock record layout and commit (no stock hook needed).
-            self.records = prepare_recoverssm(layers, ctx, defer=False)
+            # "deferred": the KDA cores fold the commit (KimiK3ModelState binds it).
+            self.records = prepare_recoverssm(layers, ctx)
         self.blocks = {
             d.layer_idx: SpAttentionBlock(d, self, ordinal)
             for ordinal, d in enumerate(layers)

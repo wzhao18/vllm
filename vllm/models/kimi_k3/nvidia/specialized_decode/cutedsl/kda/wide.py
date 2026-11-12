@@ -14,16 +14,28 @@ packed FP32 FMAs, so the step runs at the HBM or FP32-pipe bound.
 Same operands, cache semantics and precision as ``KdaSplit`` (see its docstring):
 the Triton formulas and instructions of the stock composed decode, BF16-rounded
 convolution outputs, raw gates and recurrence outputs; only FP32 reduction order
-differs."""
+differs.
+
+Deferred RecoverSSM (operands ``record_rows`` [B] and ``pending`` after the records):
+before its verify, a record core folds the request's pending commit (the n accepted
+tokens of its last verify, from the records in its record slot) into the checkpoint
+with the stock Triton commit's math (``_commit_kda_state_kernel``) bit for bit: per
+key, the normalized recorded key rsqrt.approx.ftz(sum k^2 + 1e-6) * k (the same warp
+butterfly and cross-warp order as the commit's tl.sum), the stock gate's decay, and
+per state element the reverse token loop fc = fma(u_t * kn_t, P_t, fc) from 0, P_t
+the commit's final_decay before token t, then S = fma(S_0, D_n, fc). S is written
+back once and verified from; the conv window is read at the offset n - 1 the
+commit's compaction would have rolled it by."""
 
 from functools import partial
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import BFloat16, Float32, Int64, Uint32
+from cutlass import BFloat16, Float32, Int32, Int64, Uint32
 
 from ..common.primitives import (
     alloc,
+    asm,
     at,
     copy_g2s,
     fma,
@@ -59,6 +71,12 @@ LANES = 4  # threads per row pair
 KCHUNKS = 32 // LANES  # 4-key chunks a thread owns per row
 ACCUMULATORS = 4  # independent FMA chains per dot product
 CTAS_PER_SM = 2
+
+
+@asm(Float32, pure=True)
+def rsqrt_ftz(value):
+    """tl.rsqrt as the stock commit compiles it (rsqrt.approx.ftz.f32)."""
+    return "rsqrt.approx.ftz.f32 $0,$1;", "=f,f", (value,)
 
 
 class KdaWide:
@@ -114,6 +132,15 @@ class KdaWide:
             shared_beta = alloc(smem, Float32, 8)
             sums = alloc(smem, Float32, (T, 2, 4))  # q, k squares per warp
             out_sums = alloc(smem, Float32, (T, 4))
+            # Deferred RecoverSSM: the pending commit's per-key operands.
+            FOLD: cutlass.Constexpr = self.record and len(args) > 20
+            RQ: cutlass.Constexpr = args[18].shape[2] if self.record else 1
+            fold_keys = fold_suffix = fold_decay = fold_sums = None
+            if cutlass.const_expr(FOLD):
+                fold_keys = alloc(smem, Float32, (RQ, 128))  # kn_t
+                fold_suffix = alloc(smem, Float32, (RQ, 128))  # P_t
+                fold_decay = alloc(smem, Float32, 128)  # D_n
+                fold_sums = alloc(smem, Float32, (RQ, 4))  # recorded k squares
 
             if cutlass.const_expr(self.ahead > 0):  # noqa: SIM102
                 if tid == 0:
@@ -133,6 +160,32 @@ class KdaWide:
                     copy_g2s(staged[r * KCHUNKS + c, tid, None].iterator, source)
             cute.arch.cp_async_commit_group()
 
+            # The pending commit's operands (the old records are read before this
+            # verify writes the new ones into the same record slot).
+            pending_n = Int32(0)
+            rec = Int32(-1)
+            if cutlass.const_expr(FOLD):
+                rec = args[20][request]
+                if rec >= 0:
+                    pending_n = args[21][rec]
+                if pending_n > RQ:
+                    pending_n = Int32(RQ)
+                if pending_n < 0:
+                    pending_n = Int32(0)
+            u_old = zeros((ROWS, RQ), Float32)
+            old_keys = zeros(RQ, Float32)
+            old_gates = zeros(RQ, Float32)
+            if cutlass.const_expr(FOLD):
+                if pending_n > 0:
+                    for r in cutlass.range_constexpr(ROWS):
+                        for t in cutlass.range_constexpr(RQ):
+                            u_old[r, t] = args[18][rec, head, t, base_row + 64 * r]
+                    if tid >= 128:
+                        for t in cutlass.range_constexpr(RQ):
+                            old_keys[t] = Float32(args[19][rec, head, t, tid - 128])
+                            old_gates[t] = Float32(args[19][rec, head, t, tid])
+                cute.arch.barrier()  # every old record is read before any is written
+
             # Convolution operands: threads 0-127 the q and k channels, 128-255 v.
             channel = tid % 128
             section = tid // 128  # 0: q and k, 1: v
@@ -141,12 +194,16 @@ class KdaWide:
             taps = zeros((2, 3), conv_type)
             coeff = zeros((2, 4), Float32)
             accum = zeros((2, T), Float32)
+            conv_offset = offset
+            if cutlass.const_expr(FOLD):  # noqa: SIM102
+                if pending_n > 0:  # the window the commit's compaction would roll
+                    conv_offset = offset + pending_n - 1
             for s in cutlass.range_constexpr(2):
                 part = 2 * section + s  # 0 q, 1 k, 2 v
                 if (section == 0) | (s == 0):
                     conv_channel = part * dim + head * 128 + channel
                     for t in cutlass.range_constexpr(3):
-                        taps[s, t] = conv_page[conv_channel, offset + t]
+                        taps[s, t] = conv_page[conv_channel, conv_offset + t]
                     for t in cutlass.range_constexpr(4):
                         coeff[s, t] = Float32(weights[part, t, head * 128 + channel])
                     if cutlass.const_expr(self.has_bias):
@@ -213,6 +270,17 @@ class KdaWide:
                         )
                 else:
                     shared_v[t, channel] = first
+            old_decays = zeros(RQ, Float32)
+            if cutlass.const_expr(FOLD):  # noqa: SIM102
+                if (section == 1) & (pending_n > 0):
+                    dt_channel = Float32(dt_bias[head * 128 + channel])
+                    for t in cutlass.range_constexpr(RQ):
+                        squares = warp_sum(old_keys[t] * old_keys[t])
+                        if lane == 0:
+                            fold_sums[t, warp - 4] = squares
+                        old_decays[t] = self.decay(
+                            a, old_gates[t], dt_channel, lower_bound
+                        )
 
             # Gate projection: D[feature, token] over 8 K chunks of 16.
             chains: cutlass.Constexpr = 4 if self.gate_mode == 1 else 1
@@ -248,6 +316,21 @@ class KdaWide:
                     q_n = mul_rn(mul_rn(shared_q[t, channel], fq), scale)
                     shared_q[t, channel] = q_n
                     shared_k[t, channel] = mul_rn(shared_k[t, channel], fk)
+            if cutlass.const_expr(FOLD):  # noqa: SIM102
+                if (section == 1) & (pending_n > 0):
+                    # The commit's reverse token loop over this key: kn_t, the
+                    # final_decay P_t token t's update is scaled by, and D_n.
+                    final_decay = Float32(1)
+                    for i in cutlass.range_constexpr(RQ):
+                        t = RQ - 1 - i
+                        if t < pending_n:
+                            total = self.quad_sum(fold_sums[t, None]) + 1.0e-6
+                            fold_keys[t, channel] = mul_rn(
+                                rsqrt_ftz(total), old_keys[t]
+                            )
+                            fold_suffix[t, channel] = final_decay
+                            final_decay = mul_rn(final_decay, old_decays[t])
+                    fold_decay[channel] = final_decay
             cute.arch.barrier()
 
             # The recurrence: thread (g, l) owns keys 4 (l + LANES c) + [0, 4) of
@@ -261,6 +344,17 @@ class KdaWide:
                     )
                     for e in cutlass.range_constexpr(4):
                         history[r, c, e] = values[e]
+            if cutlass.const_expr(FOLD):  # noqa: SIM102
+                if pending_n > 0:  # the committed checkpoint, written once
+                    operands = (fold_keys, fold_suffix, fold_decay)
+                    self.fold(history, u_old, pending_n, RQ, lane_in, operands)
+                    destination = state[Int64(slot), None, None, None]
+                    for r in cutlass.range_constexpr(ROWS):
+                        for c in cutlass.range_constexpr(KCHUNKS):
+                            row_values = [history[r, c, e] for e in range(4)]
+                            key = 4 * (lane_in + LANES * c)
+                            pointer = at(destination, head, base_row + 64 * r, key)
+                            store_f32x4(pointer, row_values)
             for t in cutlass.range_constexpr(T):
 
                 def chunk_of(buffer, c, t=t):
@@ -358,6 +452,36 @@ class KdaWide:
             if slot > 0:
                 page = state[Int64(slot), None, None, None]
                 prefetch_bytes(at(page, h, 0, 0), 128 * 128 * 4)
+
+    @cute.jit
+    def fold(self, history, u_old, n, RQ: cutlass.Constexpr, lane_in, operands):
+        """The stock commit of the n pending tokens into this thread's state
+        elements: fc = fma(u_t * kn_t, P_t, fc) over t = n - 1 .. 0 from 0, then
+        S = fma(S_0, D_n, fc) (the commit's FMA contraction)."""
+        keys, suffix, decay = operands
+        for c in cutlass.range_constexpr(KCHUNKS):
+            key = 4 * (lane_in + LANES * c)
+            d4 = load_shared_f32x4(decay.iterator + key)
+            fc = zeros((ROWS, 4), Float32)
+            for i in cutlass.range_constexpr(RQ):
+                t = RQ - 1 - i
+                if t < n:
+                    k4 = load_shared_f32x4(at(keys, t, key))
+                    p4 = load_shared_f32x4(at(suffix, t, key))
+                    for r in cutlass.range_constexpr(ROWS):
+                        u = u_old[r, t]
+                        for p in cutlass.range_constexpr(2):
+                            # (packed: IEEE per lane, the scalar mul / fma bits)
+                            update = mul2((u, u), (k4[2 * p], k4[2 * p + 1]))
+                            acc = (fc[r, 2 * p], fc[r, 2 * p + 1])
+                            acc = fma2(update, (p4[2 * p], p4[2 * p + 1]), acc)
+                            fc[r, 2 * p], fc[r, 2 * p + 1] = acc
+            for r in cutlass.range_constexpr(ROWS):
+                for p in cutlass.range_constexpr(2):
+                    pair = (history[r, c, 2 * p], history[r, c, 2 * p + 1])
+                    pair = fma2(pair, (d4[2 * p], d4[2 * p + 1]),
+                                (fc[r, 2 * p], fc[r, 2 * p + 1]))  # fmt: skip
+                    history[r, c, 2 * p], history[r, c, 2 * p + 1] = pair
 
     @cute.jit
     def lane_sum(self, value):

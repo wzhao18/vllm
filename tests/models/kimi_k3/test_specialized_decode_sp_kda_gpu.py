@@ -41,6 +41,7 @@ from vllm.models.kimi_k3.nvidia.ops.recoverssm import (  # noqa: E402
     KDARecoverSSMRecords,
 )
 from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.kda.sp import (  # noqa: E402
+    FOLDS,
     SpKdaCore,
 )
 from vllm.models.kimi_k3.nvidia.specialized_decode.shapes import Context  # noqa: E402
@@ -251,7 +252,8 @@ def test_deferred_records_at_record_slots(n):
         projected, out_deferred, caches=caches_deferred, metadata=metadata_deferred
     )
     torch.cuda.synchronize()
-    assert flushes == [1]
+    # (the cores that fold the pending commit themselves never flush)
+    assert flushes == ([] if core.kinds[rows] in FOLDS else [1])
     assert_bitwise("output", out_deferred, out)
     assert_bitwise("conv window", kv_deferred[0], kv[0])
     want = triton_attention.recoverssm_records

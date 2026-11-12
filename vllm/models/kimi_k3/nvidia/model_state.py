@@ -34,6 +34,8 @@ class KimiK3ModelState(MambaHybridModelState):
         self.language_model = model
         if model.specialized_decode_config is not None:
             model.build_specialized_decode()
+            # Deferred RecoverSSM (the SP decode's KDA cores fold the commit).
+            model.specialized_decode.bind_model_state(self)
         self._step_prep = None  # step_prep.KdaStepPrep, built at the first step
         self._step_prep_checked = False
         self._prepped = None  # (num_accepted, aligned indices) of this step
