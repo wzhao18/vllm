@@ -4,7 +4,7 @@ import itertools
 import os
 import time
 from collections import defaultdict, deque
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import replace
 from importlib.metadata import entry_points
 from typing import Any
@@ -301,6 +301,9 @@ class Scheduler(SchedulerInterface):
         # scan or enqueued in a blocked status.
         self.deferred_waiting: set[Request] = set()
         self.running: list[Request] = []
+        # DP prefill pull-up: set by the DP engine core before each step (see
+        # set_dp_prefill_exchange) and consumed by that step's schedule().
+        self._dp_prefill_exchange: Callable[[int], int] | None = None
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -947,6 +950,18 @@ class Scheduler(SchedulerInterface):
         ):
             defer_prefills = True
 
+        # DP prefill pull-up: the running prefill chunks cut by the long-prefill
+        # threshold get their KV slots after the waiting queue, once the token
+        # counts of every DP rank's step are known (see _dp_prefill_pull_up).
+        dp_exchange = self._dp_prefill_exchange
+        self._dp_prefill_exchange = None
+        dp_pull_reqs: dict[str, tuple[Request, int]] = {}
+        defer_dp_pull = (
+            dp_exchange is not None
+            and long_prefill_token_threshold > 0
+            and self._dp_pull_kv_headroom()
+        )
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -998,6 +1013,7 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
+            num_unclipped_tokens = num_new_tokens
             if 0 < long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = long_prefill_token_threshold
             num_new_tokens = min(
@@ -1070,6 +1086,28 @@ class Scheduler(SchedulerInterface):
                 # NOTE(woosuk): Here, by doing `continue` instead of `break`,
                 # we do not strictly follow the FCFS scheduling policy and
                 # allow the lower-priority requests to be scheduled.
+                req_index += 1
+                continue
+
+            if (
+                defer_dp_pull
+                and num_unclipped_tokens > long_prefill_token_threshold
+                and not request.spec_token_ids
+                and not request.has_encoder_inputs
+            ):
+                # DP prefill pull-up: book the stock chunk now (same budgets and
+                # order as stock); its KV slots, and any pulled-up tokens, are
+                # allocated in _dp_prefill_pull_up after the waiting queue.
+                request_id = request.request_id
+                scheduled_running_reqs.append(request)
+                prefill_scheduled |= request.is_prefill_chunk
+                req_to_new_blocks[request_id] = (
+                    self.kv_cache_manager.empty_kv_cache_blocks
+                )
+                num_scheduled_tokens[request_id] = num_new_tokens
+                token_budget -= num_new_tokens
+                input_budget -= num_new_tokens + draft_slots
+                dp_pull_reqs[request_id] = (request, num_unclipped_tokens)
                 req_index += 1
                 continue
 
@@ -1817,6 +1855,21 @@ class Scheduler(SchedulerInterface):
             if not defer_prefills:
                 _, num_waiting = self.get_request_counts()
                 self.prefill_capacity_bound = num_waiting > len(self.deferred_waiting)
+
+        if dp_exchange is not None:
+            # Exactly one exchange per armed step, also when nothing is deferred:
+            # every DP rank takes part in it.
+            token_budget, input_budget, pulled_drafts_needed = self._dp_prefill_pull_up(
+                dp_exchange,
+                dp_pull_reqs,
+                scheduled_running_reqs,
+                num_scheduled_tokens,
+                req_to_new_blocks,
+                token_budget,
+                input_budget,
+                draft_slots,
+            )
+            drafts_needed = drafts_needed or pulled_drafts_needed
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
@@ -3148,6 +3201,129 @@ class Scheduler(SchedulerInterface):
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""
         return len(self.running), len(self.waiting) + len(self.kv_holding_waiting)
+
+    def set_dp_prefill_exchange(self, exchange: Callable[[int], int] | None) -> None:
+        """DP prefill pull-up for the next schedule() only.
+
+        Every DP rank of an EP group waits in each MoE layer for the rank with the
+        most tokens, so a step costs the busiest rank's work. With `exchange`
+        set, the next schedule() books its stock schedule, calls
+        `exchange(own scheduled tokens)` exactly once (it returns the largest
+        count over the DP ranks; the DP engine core all-reduces it), and lets the
+        running prefill chunks that the long-prefill threshold cut take up to the
+        difference, in scheduling order. The step's busiest rank is unchanged,
+        no request gets fewer tokens than stock, and nothing is taken from the
+        waiting queue: only where this rank's long prompts are chunked moves.
+        """
+        self._dp_prefill_exchange = exchange
+
+    def _dp_pull_kv_headroom(self) -> bool:
+        """Whether the free KV blocks cover every allocation one step can make,
+        so allocating the pull-up chunks after the waiting queue (instead of in
+        running order) cannot change any allocation outcome."""
+        max_reqs = self.max_num_running_reqs
+        lookahead = self.num_lookahead_tokens
+        needed = self.kv_cache_manager.watermark_blocks
+        for manager in self.kv_cache_manager.coordinator.single_type_managers:
+            # Token blocks of the whole step, plus per request: a partial block,
+            # lookahead slots and Mamba state / checkpoint / spec blocks.
+            needed += cdiv(self.max_num_scheduled_tokens, manager.block_size)
+            needed += max_reqs * (4 + cdiv(lookahead, manager.block_size))
+        return self.kv_cache_manager.block_pool.get_num_free_blocks() >= needed
+
+    def _dp_pull_chunk(
+        self, request: Request, num_new_tokens: int, token_room: int
+    ) -> int:
+        """The running loop's clamps of a chunk, for a pull-up chunk (no
+        encoder inputs, no spec tokens: see the running loop)."""
+        num_new_tokens = min(num_new_tokens, token_room)
+        num_new_tokens = min(
+            num_new_tokens,
+            self.max_model_len
+            - request.num_computed_tokens
+            - self.num_sampled_tokens_per_step,
+        )
+        if self.need_mamba_block_aligned_split:
+            num_new_tokens = self._mamba_block_aligned_split(request, num_new_tokens)
+        num_new_tokens = self._reserve_prefill_lookahead(
+            request, request.num_computed_tokens, num_new_tokens
+        )
+        if self.need_mamba_block_aligned_split:
+            num_new_tokens = _stop_mamba_chunk_at_block_end(
+                request,
+                request.num_computed_tokens,
+                num_new_tokens,
+                self.cache_config.block_size,
+            )
+        return num_new_tokens
+
+    def _dp_prefill_pull_up(
+        self,
+        exchange: Callable[[int], int],
+        pull_reqs: dict[str, tuple[Request, int]],
+        scheduled_running_reqs: list[Request],
+        num_scheduled_tokens: dict[str, int],
+        req_to_new_blocks: dict[str, KVCacheBlocks],
+        token_budget: int,
+        input_budget: int,
+        draft_slots: int,
+    ) -> tuple[int, int, bool]:
+        """Exchange this step's token count with the DP peers, then allocate the
+        deferred running prefill chunks, pulled up toward the busiest rank's
+        count. Returns the updated (token_budget, input_budget, drafts_needed)."""
+        num_tokens = sum(num_scheduled_tokens.values())
+        extra = max(exchange(num_tokens) - num_tokens, 0)
+        drafts_needed = False
+        for request_id, (request, num_unclipped) in pull_reqs.items():
+            if request_id not in num_scheduled_tokens:
+                # Preempted later in the step (priority policy); its booking was
+                # already returned.
+                continue
+            num_stock = num_scheduled_tokens[request_id]
+            num_new_tokens = num_stock
+            if extra > 0:
+                # The stock clamps decide the pulled chunk too; both it and the
+                # stock chunk are chunks the stock rules can produce.
+                pulled = self._dp_pull_chunk(
+                    request,
+                    num_stock + min(extra, num_unclipped - num_stock),
+                    num_stock + min(token_budget, input_budget),
+                )
+                num_new_tokens = max(pulled, num_stock)
+            new_blocks = self.kv_cache_manager.allocate_slots(
+                request,
+                num_new_tokens,
+                num_lookahead_tokens=self.num_lookahead_tokens,
+            )
+            if new_blocks is None and num_new_tokens > num_stock:
+                num_new_tokens = num_stock
+                new_blocks = self.kv_cache_manager.allocate_slots(
+                    request,
+                    num_new_tokens,
+                    num_lookahead_tokens=self.num_lookahead_tokens,
+                )
+            if new_blocks is None:
+                # Unreachable with _dp_pull_kv_headroom; like a stock allocation
+                # failure, the request waits for a later step.
+                logger.warning(
+                    "DP prefill pull-up: no KV blocks for %s; it waits a step.",
+                    request_id,
+                )
+                scheduled_running_reqs.remove(request)
+                del num_scheduled_tokens[request_id]
+                del req_to_new_blocks[request_id]
+                token_budget += num_stock
+                input_budget += num_stock + draft_slots
+                continue
+            req_to_new_blocks[request_id] = new_blocks
+            num_scheduled_tokens[request_id] = num_new_tokens
+            token_budget -= num_new_tokens - num_stock
+            input_budget -= num_new_tokens - num_stock
+            extra -= num_new_tokens - num_stock
+            drafts_needed = drafts_needed or not self._drafts_unused(
+                request, request.num_computed_tokens, num_new_tokens
+            )
+        return token_budget, input_budget, drafts_needed
 
     def get_kv_cache_usage(self) -> float:
         """Returns the fraction of the KV cache currently in use (0.0-1.0)."""

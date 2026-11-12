@@ -19,6 +19,7 @@ from typing import Any, TypeVar, cast, get_args
 
 import msgspec
 import pydantic
+import torch
 import zmq
 
 import vllm.envs as envs
@@ -31,6 +32,7 @@ from vllm.distributed import (
 from vllm.distributed.ec_transfer.ec_connector.encoder_output_width import (
     measure_encoder_output_widths,
 )
+from vllm.distributed.utils import cpu_all_reduce_
 from vllm.envs import enable_envs_cache
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import configure_logging, init_logger
@@ -2466,6 +2468,22 @@ class DPEngineCoreProc(EngineCoreProc):
 
         self.eep_scaling_state: ElasticEPScalingState | None = None
 
+        # DP prefill pull-up (see Scheduler.set_dp_prefill_exchange): whenever
+        # prompts are chunked per request, a rank lighter than the step's busiest
+        # DP peer runs more of its own chunked prompts in that step. Elastic EP
+        # swaps the DP group between steps, which this per-step exchange does
+        # not follow, so it is not used there.
+        self.dp_prefill_pull_up = (
+            scheduler_config.long_prefill_token_threshold > 0
+            and not vllm_config.parallel_config.enable_elastic_ep
+        )
+        self._dp_prefill_exchanged = False
+        if (
+            scheduler_config.long_prefill_token_threshold > 0
+            and not self.dp_prefill_pull_up
+        ):
+            logger.info("DP prefill pull-up is not used with elastic EP.")
+
         # Initialize the engine.
         dp_rank = vllm_config.parallel_config.data_parallel_rank
         super().__init__(
@@ -2640,7 +2658,7 @@ class DPEngineCoreProc(EngineCoreProc):
                 elif not state.commit_requested and state.is_ready_for_switch():
                     self.process_input_queue_block = True
 
-            executed = self._process_engine_step()
+            executed = self._process_engine_step_dp()
             self._maybe_publish_request_counts()
 
             local_unfinished_reqs = self.scheduler.has_unfinished_requests()
@@ -2699,6 +2717,44 @@ class DPEngineCoreProc(EngineCoreProc):
                 )
 
         raise SystemExit
+
+    def _process_engine_step_dp(self) -> bool:
+        """One engine step; while the DP engines run, with exactly one DP
+        prefill pull-up exchange (every DP rank runs one real or dummy forward
+        per running iteration, so the exchange rides on the same lockstep)."""
+        if not (self.dp_prefill_pull_up and self.engines_running):
+            return self._process_engine_step()
+        self._dp_prefill_exchanged = False
+        self.scheduler.set_dp_prefill_exchange(self._exchange_dp_prefill_tokens)
+        executed = self._process_engine_step()
+        self.scheduler.set_dp_prefill_exchange(None)
+        if not self._dp_prefill_exchanged:
+            # No schedule() this step (no local requests): take part with 0
+            # tokens, before this rank's dummy forward.
+            self._exchange_dp_prefill_tokens(0)
+        return executed
+
+    def _exchange_dp_prefill_tokens(self, num_tokens: int) -> int:
+        """All-reduce this step's scheduled token count over the engine DP group;
+        returns the largest count of any DP rank (DP prefill pull-up)."""
+        self._dp_prefill_exchanged = True
+        size = self.dp_group.size()
+        counts = torch.zeros(size + 1, dtype=torch.int64)
+        counts[self.dp_group.rank()] = num_tokens
+        # Every rank adds 1: a collective paired with a different one on some
+        # rank shows up here instead of returning a wrong count.
+        counts[size] = 1
+        cpu_all_reduce_(
+            counts,
+            self.dp_group,
+            timeout=self.vllm_config.parallel_config.cpu_distributed_timeout,
+        )
+        if int(counts[size]) != size:
+            raise RuntimeError(
+                "DP prefill pull-up exchange is out of step across DP ranks "
+                f"({int(counts[size])} of {size} ranks)."
+            )
+        return int(counts[:size].max())
 
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
         # Sync step 1 too: an idle pause needs one dummy batch, not a full interval.
