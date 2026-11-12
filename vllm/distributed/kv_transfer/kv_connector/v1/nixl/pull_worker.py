@@ -221,12 +221,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         local_region_groups = self.region_group_ids or remote_region_groups
         pairs = self._dst_pairs[engine_id]
         num_groups = len(meta.local_block_ids)
-
-        def group_ids(block_ids: BlockIds, rank: int) -> list[list[int]]:
-            return [
-                list(block_ids[g]) if rank in plan.source_ranks_per_group[g] else []
-                for g in range(num_groups)
-            ]
+        group_ids = plan.rank_block_ids
 
         if not local_block_ids:
             # Region expansion cannot index empty groups. Pass empty specs to
@@ -273,17 +268,11 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             local_by_region = self._block_ids_by_region(
                 local_block_ids, local_region_groups
             )
-            # Mamba state regions read their one state slot as is, from the
-            # state source ranks; attention regions pair pages by position
-            # below, from the attention source ranks. A region shared by
+            # Mamba state regions read their one state slot as is; attention
+            # regions pair pages by position below. Each reads from its own
+            # source ranks (`TPMapping.rank_block_ids`). A region shared by
             # several groups (-1) is attention only: hybrids reach this path
             # only with one group per region (`_pair_ssm_regions`).
-            region_ranks = [
-                plan.source_ranks_per_group[group]
-                if group >= 0
-                else plan.all_source_ranks
-                for group in local_region_groups
-            ]
             state_regions = [
                 group >= 0 and _is_ssm_spec(self._group_spec_types[group])
                 for group in local_region_groups
@@ -314,28 +303,28 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     "and unshared regions"
                 )
 
-            def region_ids(block_ids: BlockIds, rank: int, state: bool) -> BlockIds:
+            def attention_regions(block_ids: BlockIds) -> BlockIds:
                 return [
-                    list(ids) if rank in ranks and is_state == state else []
-                    for ids, ranks, is_state in zip(
-                        block_ids, region_ranks, state_regions
-                    )
+                    [] if is_state else list(ids)
+                    for ids, is_state in zip(block_ids, state_regions, strict=True)
                 ]
 
             read_specs = []
             for rank in plan.all_source_ranks:
+                local_rank_ids = group_ids(local_by_region, rank, local_region_groups)
+                remote_rank_ids = group_ids(remote_by_region, rank, local_region_groups)
                 local_ids, remote_ids = self._apply_prefix_caching_by_region(
-                    region_ids(local_by_region, rank, state=False),
-                    region_ids(remote_by_region, rank, state=False),
+                    attention_regions(local_rank_ids),
+                    attention_regions(remote_rank_ids),
                     num_computed_blocks=num_computed_blocks,
                     num_tokens=num_tokens,
                     remote_rank=rank,
                     remote_dcp_size=remote_info.remote_dcp_size,
                 )
-                for r, ids in enumerate(region_ids(local_by_region, rank, True)):
-                    if ids:
-                        local_ids[r] = ids
-                        remote_ids[r] = list(remote_by_region[r])
+                for r, is_state in enumerate(state_regions):
+                    if is_state and local_rank_ids[r]:
+                        local_ids[r] = local_rank_ids[r]
+                        remote_ids[r] = remote_rank_ids[r]
                 read_specs.append(
                     ReadSpec(rank, local_ids, remote_ids, block_ids_by_region=True)
                 )
@@ -373,26 +362,22 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 remote_info.remote_physical_blocks_per_logical,
             )
 
-            # Per-rank pages of different sizes: the DCP layouts are equal up
-            # to the block size (`select_dcp_transfer_mode`), so pages pair
-            # by row at kernel-page granularity.
-            dcp_pages_differ = dcp_active and (
-                self.block_size * self._physical_blocks_per_logical_kv_block
-                != remote_info.remote_block_size
-                * remote_info.remote_physical_blocks_per_logical
-            )
-
+            if plan.dcp_mode is DcpTransferMode.DIRECT_ROWS:
+                # Same DCP layout, other per-rank blocks: kernel pages pair
+                # by row.
+                paired_local, paired_remote, meta.covered_sub_blocks = (
+                    self._pair_same_dcp_layout_pages(
+                        meta.local_physical_block_ids,
+                        meta.remote.block_ids,
+                        meta.local_num_computed_blocks,
+                        block_size_ratio,
+                    )
+                )
             read_specs = []
             for rank in plan.all_source_ranks:
-                if dcp_pages_differ:
-                    local_physical_ids, remote_physical_ids = (
-                        self._pair_same_dcp_layout_pages(
-                            group_ids(meta.local_physical_block_ids, rank),
-                            group_ids(meta.remote.block_ids, rank),
-                            meta.local_num_computed_blocks,
-                            block_size_ratio,
-                        )
-                    )
+                if plan.dcp_mode is DcpTransferMode.DIRECT_ROWS:
+                    local_physical_ids = group_ids(paired_local, rank)
+                    remote_physical_ids = group_ids(paired_remote, rank)
                 elif dcp_active:
                     local_ids = group_ids(meta.local_block_ids, rank)
                     remote_ids = group_ids(remote_logical_block_ids, rank)
@@ -434,8 +419,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                         remote_ids,
                         remote_info.remote_physical_blocks_per_logical,
                     )
-                    # Equal logical block sizes (others pair above), so the
-                    # lists start and end at the same token and pair by position.
+                    # Equal logical block sizes (DIRECT), so the lists start
+                    # and end at the same token and pair by position.
                     if block_size_ratio > 1:
                         local_physical_ids, remote_physical_ids = (
                             self._map_block_ids_for_block_size_ratio(
@@ -547,81 +532,75 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         """Reads of a request from a RELAYOUT peer, and its row gather.
 
         The attention group reads the remote units holding this rank's rows
-        into the request's staging blocks (`plan_staged_relayout`); the gather
-        then moves them into the request's blocks once the READs complete
-        (`get_transfer_results`). State groups read their blocks 1:1, as for
-        DIRECT peers. Returns None if the request was failed instead.
+        of the positions the scheduler reserved staging for
+        (`ReqMeta.relayout_tokens`) into the staging blocks
+        (`plan_staged_relayout`); the gather then moves them into the
+        request's blocks once the READs complete (`get_transfer_results`).
+        Other groups read from their own source ranks as for DIRECT peers
+        (`TPMapping.rank_block_ids`). Returns None if the request was failed
+        (and recomputes) instead.
         """
         assert meta.remote is not None and self.transfer_topo is not None
         engine_id = meta.remote.engine_id
         remote_layout = self._remote_dcp_layouts[engine_id]
-        if meta.remote.num_tokens is None:
-            logger.error_once(
-                "Declining remote reads from engine %s: DCP row relayouts "
-                "require remote_num_tokens in kv_transfer_params. Make the "
-                "proxy forward it.",
+        remote_info = self.transfer_topo.get_engine_info(engine_id)
+        # One attention group (`relayout_config_problem`).
+        (group,) = (
+            g
+            for g in range(len(meta.local_block_ids))
+            if _is_attention_spec(self._group_spec_types[g])
+        )
+        # The remote rank read for each remote DCP rank: the rank itself
+        # (TP = DCP), or the replica chosen for a remote without DCP.
+        rank_of_dcp_rank: dict[int, int] = {}
+        for rank in plan.source_ranks_per_group[group]:
+            rank_of_dcp_rank.setdefault(rank % remote_layout.dcp_size, rank)
+        try:
+            if meta.relayout_tokens is None:
+                raise ValueError("the scheduler reserved no staging for it")
+            start, end = meta.relayout_tokens
+            tokens_per_block = self._dcp_layout.block_size * self.dcp_size
+            if start // tokens_per_block != meta.local_num_computed_blocks[group]:
+                raise ValueError(
+                    f"its first position {start} is not in its first uncached "
+                    f"block ({meta.local_num_computed_blocks[group]} cached)"
+                )
+            relayout = plan_staged_relayout(
+                remote_layout,
+                self._dcp_layout,
+                self.dcp_rank,
+                start,
+                end,
+                # The reads' unit: the remote kernel blocks, split to divide
+                # the local ones (`_split_remote_blocks`).
+                unit_rows=remote_info.remote_block_size,
+                src_block_ids=list(meta.remote.block_ids[group]),
+                dst_block_ids=list(meta.local_block_ids[group]),
+                staging_block_ids=meta.staging_block_ids,
+                dst_kernel_block_size=self.block_size,
+            )
+            unmapped = relayout.reads.keys() - rank_of_dcp_rank.keys()
+            if unmapped:
+                raise ValueError(f"it reads unmapped remote DCP ranks {unmapped}")
+        except ValueError as e:
+            logger.error(
+                "Failing the KV receive of request %s from engine %s, which "
+                "is recomputed: its DCP row relayout cannot be planned: %s",
+                req_id,
                 engine_id,
+                e,
             )
             self._handle_failed_transfer(
                 req_id, None, self._recv_failures, record_failed_transfer=False
             )
             return None
-        if (meta.remote.block_size, meta.remote.cp_kv_cache_interleave_size) != (
-            remote_layout.block_size,
-            remote_layout.interleave,
-        ):
-            # The scheduler sized the staging from these.
-            raise RuntimeError(
-                f"Request {req_id} describes engine {engine_id}'s KV layout as "
-                f"block_size={meta.remote.block_size}, "
-                "cp_kv_cache_interleave_size="
-                f"{meta.remote.cp_kv_cache_interleave_size}, but its handshake "
-                f"advertised {remote_layout}."
-            )
-        remote_info = self.transfer_topo.get_engine_info(engine_id)
-        # The reads' unit: the remote kernel blocks, split to divide the local
-        # ones (`_split_remote_blocks`).
-        unit_rows = remote_info.remote_block_size
-        num_groups = len(meta.local_block_ids)
-        # One attention group (`_relayout_unsupported_reason`).
-        (group,) = (
-            g
-            for g in range(num_groups)
-            if _is_attention_spec(self._group_spec_types[g])
-        )
-        tokens_per_block = self._dcp_layout.block_size * self.dcp_size
-        relayout = plan_staged_relayout(
-            remote_layout,
-            self._dcp_layout,
-            self.dcp_rank,
-            # The local prefix hit ends on a block, which holds one page of
-            # every rank.
-            meta.local_num_computed_blocks[group] * tokens_per_block,
-            meta.remote.num_tokens,
-            unit_rows=unit_rows,
-            src_block_ids=list(meta.remote.block_ids[group]),
-            dst_block_ids=list(meta.local_block_ids[group]),
-            staging_block_ids=meta.staging_block_ids,
-            dst_kernel_block_size=self.block_size,
-        )
-        missing = relayout.reads.keys() - set(plan.source_ranks_per_group[group])
-        assert not missing, f"Relayout reads from unmapped remote ranks {missing}"
         meta.relayout = relayout
+        reads = {rank_of_dcp_rank[d]: units for d, units in relayout.reads.items()}
         read_specs = []
         for rank in plan.all_source_ranks:
-            local_ids: list[list[int]] = []
-            remote_ids: list[list[int]] = []
-            for g in range(num_groups):
-                if g == group:
-                    remote_units, staging_units = relayout.reads.get(rank, ([], []))
-                    local_ids.append(staging_units)
-                    remote_ids.append(remote_units)
-                elif rank in plan.source_ranks_per_group[g]:
-                    local_ids.append(list(meta.local_block_ids[g]))
-                    remote_ids.append(list(meta.remote.block_ids[g]))
-                else:
-                    local_ids.append([])
-                    remote_ids.append([])
+            local_ids = plan.rank_block_ids(meta.local_block_ids, rank)
+            remote_ids = plan.rank_block_ids(meta.remote.block_ids, rank)
+            remote_ids[group], local_ids[group] = reads.get(rank, ([], []))
             read_specs.append(ReadSpec(rank, local_ids, remote_ids))
         return read_specs
 

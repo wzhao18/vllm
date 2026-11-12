@@ -295,8 +295,11 @@ class ReqMeta:
     # group a pull covers. None derives it from the block counts.
     covered_sub_blocks: list[range] | None = None
     # Blocks the scheduler reserved for staging the remote rows of a DCP row
-    # relayout (`DcpTransferMode.RELAYOUT`); empty otherwise.
+    # relayout (`DcpTransferMode.RELAYOUT`), and the positions `[start, end)`
+    # it reserved them for, which the relayout then moves; empty / None
+    # otherwise.
     staging_block_ids: list[int] = field(default_factory=list)
+    relayout_tokens: tuple[int, int] | None = None
     # Worker-only: the relayout planned for this request, run once its READs
     # complete.
     relayout: StagedRelayout | None = None
@@ -360,7 +363,7 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         kv_transfer_params: dict[str, Any],
         local_num_computed_blocks: tuple[int, ...] = (),
         awaiting_kvs: bool = False,
-        staging_block_ids: list[int] | None = None,
+        staging: tuple[list[int], int, int] | None = None,
     ):
         req = self._add_new_req(
             local_block_ids,
@@ -368,7 +371,10 @@ class NixlConnectorMetadata(KVConnectorMetadata):
             local_num_computed_blocks,
             awaiting_kvs,
         )
-        req.staging_block_ids = list(staging_block_ids or ())
+        if staging is not None:
+            staging_block_ids, start, end = staging
+            req.staging_block_ids = list(staging_block_ids)
+            req.relayout_tokens = (start, end)
         req.remote = RemoteMeta(
             block_ids=kv_transfer_params["remote_block_ids"],
             engine_id=kv_transfer_params["remote_engine_id"],

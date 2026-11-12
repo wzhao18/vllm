@@ -441,19 +441,18 @@ def get_current_attn_backends_and_specs(
 
 
 def get_kv_row_layouts(
-    vllm_config: VllmConfig, layer_specs: dict[str, KVCacheSpec]
+    vllm_config: VllmConfig,
+    layer_specs: dict[str, KVCacheSpec],
+    kernel_block_size: int,
 ) -> dict[str, KVRowLayout]:
     """Token-row layout of the KV page of each attention layer whose backend
     declares one (`AttentionBackend.get_kv_cache_row_layout`), checked against
     the layer's spec.
 
-    A layer's kernel blocks are the largest its backend supports within the
-    layer's block, as the model runner picks them for a packed cache, which
-    views them consecutively inside each block (`AttentionGroup`,
-    `map_kv_cache_to_kernel_blocks`).
+    `kernel_block_size` is the kernel block the layers' pages are cut into,
+    as the caller (the KV connector worker) derived it with the model runner
+    (`select_common_block_size`).
     """
-    from vllm.v1.worker.utils import select_common_block_size
-
     layer_type = cast(type[Any], AttentionLayerBase)
     layers = get_layers_from_vllm_config(vllm_config, layer_type, layer_specs)
     layouts: dict[str, KVRowLayout] = {}
@@ -461,9 +460,9 @@ def get_kv_row_layouts(
         spec = layer_specs[name]
         if not isinstance(spec, AttentionSpec):
             continue
-        backend = layer.get_attn_backend()
-        kernel_block_size = select_common_block_size(spec.block_size, [backend], [spec])
-        layout = backend.get_kv_cache_row_layout(spec, kernel_block_size)
+        layout = layer.get_attn_backend().get_kv_cache_row_layout(
+            spec, kernel_block_size
+        )
         if layout is not None:
             layout.validate(spec)
             layouts[name] = layout
@@ -729,7 +728,8 @@ class TransferTopology:
         once it is done with a request (`consumer_count`).
 
         DCP support is scoped to `dcp_size in (1, tp_size)` on each side
-        and DCP sizes that divide one another: neither side ever has a
+        and DCP sizes that divide one another (checked by the NIXL
+        connector's `select_dcp_transfer_mode`): neither side ever has a
         partially-duplicated, partially-sharded KV cache. When the
         remote is not sharded (`remote_dcp_size == 1`) this reduces
         exactly to the DTP>=PTP case, since a sharded local side
@@ -763,9 +763,9 @@ class TransferTopology:
         The producer frees a request's blocks once that many notifications
         came in. Every local rank notifies each of its handshake targets once
         (reading from it or not), so this counts the local ranks targeting
-        `remote_rank`. The count is per producer: e.g. with hybrid DCP P TP8
-        -> D TP16, P rank 3 serves attention to D ranks {3, 11} and state to D
-        ranks {6, 7}. Every reader of a producer computes the same count.
+        `remote_rank`. The count is per producer, as attention and Mamba
+        state may come from different producers (`state_source_ranks`); every
+        reader of a producer computes the same count.
         """
         return sum(
             remote_rank

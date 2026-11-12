@@ -2,18 +2,24 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Row relayout of DCP-sharded KV between two DCP layouts.
 
-When a KV transfer's two sides shard a sequence differently (different DCP
-sizes or interleaves), a destination rank's rows are not a run of whole source
-pages: at interleave 1 a decode rank of a DCP twice the prefill's takes every
-other row of one prefill rank. Page RDMA cannot express that, so the
-destination pulls the source pages that hold its rows into staging pages and
-moves the rows into its own pages with a row gather.
+When a KV transfer's two sides shard a sequence differently, a destination
+rank's rows are not a run of whole source pages: at interleave 1 a decode rank
+of a DCP twice the prefill's takes every other row of one prefill rank. Page
+RDMA cannot express that, so the destination pulls the source pages that hold
+its rows into staging pages and moves the rows into its own pages with a row
+gather.
+
+The planning here is general in both layouts (any DCP sizes, interleaves and
+block sizes, either direction; `DcpLayout`). What a connector supports is
+narrower and decided by its mode selection (for NIXL,
+`select_dcp_transfer_mode`: e.g. both sides sharding need the same
+interleave).
 
 `plan_dcp_rows` maps each destination row to its source (rank, page, row) with
-the two sides' `DcpLayout`s; `RowRelayout` turns that into the gather of one
-cache: row byte ranges from each side's `KVRowLayout`, so packed pages (e.g. a
-DSA indexer page that stores a kernel page's values before its scales) move
-row by row like plain token-major pages.
+the two sides' `DcpLayout`s; the gather moves each row piece by piece from
+each cache's `KVRowLayout`, so packed pages (e.g. a DSA indexer page that
+stores a kernel page's values before its scales) move row by row like plain
+token-major pages.
 
 A transfer executes this in three steps, all derived from the same plan:
 
@@ -23,10 +29,9 @@ A transfer executes this in three steps, all derived from the same plan:
    fits inside a destination block.
 2. Reads (`plan_staged_relayout`, worker side): which source units to read
    into which staging units.
-3. Row gather (`relayout_rows`, device side; `relayout_rows_reference` on the
-   host): every destination row is copied from its staged row, region by
-   region, and the destination rows past the transferred positions are
-   zeroed.
+3. Row gather (`RowGather`, on the device): every destination row is copied
+   from its staged row, region by region, and the destination rows past the
+   transferred positions are zeroed.
 """
 
 import math
@@ -38,6 +43,7 @@ import torch
 from vllm.distributed.kv_transfer.kv_connector.dcp_layout import DcpLayout
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
+from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.kv_cache_interface import KVRowLayout
 
 
@@ -79,111 +85,6 @@ def plan_dcp_rows(
         src_ranks=np.asarray(src.owner(positions), dtype=np.int64),
         src_rows=np.asarray(src.local_row(positions), dtype=np.int64),
     )
-
-
-@dataclass(frozen=True)
-class RowRelayout:
-    """The row gather of one cache from staged source pages into destination
-    pages.
-
-    Byte copies are expressed per row piece (see `KVRowLayout`), so one
-    relayout handles any page layout both sides share row-wise: the two
-    layouts must give each row the same pieces in the same order and sizes,
-    which is what makes the KV of one token identical on both sides.
-    """
-
-    src_layout: KVRowLayout
-    dst_layout: KVRowLayout
-    src_block_size: int
-    dst_block_size: int
-
-    def __post_init__(self) -> None:
-        if [s for _, s in self.src_layout.pieces] != [
-            s for _, s in self.dst_layout.pieces
-        ]:
-            raise ValueError(
-                f"KV row layouts differ in their row pieces: source "
-                f"{self.src_layout}, destination {self.dst_layout}"
-            )
-
-    @property
-    def src_page_bytes(self) -> int:
-        return self.src_block_size * self.src_layout.bytes_per_row
-
-    @property
-    def dst_page_bytes(self) -> int:
-        return self.dst_block_size * self.dst_layout.bytes_per_row
-
-    def byte_copies(
-        self,
-        src_slots: np.ndarray,
-        src_rows: np.ndarray,
-        dst_slots: np.ndarray,
-        dst_rows: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """`(src offset, dst offset, length)` of every byte copy that moves
-        rows `src_rows` of staging slots `src_slots` into rows `dst_rows` of
-        destination slots `dst_slots` (one entry per row; slots index pages
-        of the respective buffers)."""
-        return _row_byte_copies(
-            self.src_layout,
-            self.dst_layout,
-            np.asarray(src_slots, dtype=np.int64) * self.src_page_bytes,
-            src_rows,
-            np.asarray(dst_slots, dtype=np.int64) * self.dst_page_bytes,
-            dst_rows,
-        )
-
-
-def _row_byte_copies(
-    src_layout: KVRowLayout,
-    dst_layout: KVRowLayout,
-    src_page_offsets: np.ndarray,
-    src_rows: np.ndarray,
-    dst_page_offsets: np.ndarray,
-    dst_rows: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """`(src offset, dst offset, length)` of every byte copy moving row
-    `src_rows[i]` of the page at byte `src_page_offsets[i]` to row
-    `dst_rows[i]` of the page at `dst_page_offsets[i]`, piece by piece."""
-    src_off = []
-    dst_off = []
-    lengths = []
-    for piece in range(len(src_layout.pieces)):
-        s = _piece_offsets(src_layout, piece, src_rows)
-        d = _piece_offsets(dst_layout, piece, dst_rows)
-        src_off.append(src_page_offsets + s)
-        dst_off.append(dst_page_offsets + d)
-        lengths.append(np.full_like(src_rows, src_layout.pieces[piece][1]))
-    return (
-        np.concatenate(src_off).astype(np.int64),
-        np.concatenate(dst_off).astype(np.int64),
-        np.concatenate(lengths).astype(np.int64),
-    )
-
-
-def _piece_offsets(layout: KVRowLayout, piece: int, rows: np.ndarray) -> np.ndarray:
-    """Offset in its page of piece `piece` of each row in `rows` (see
-    `KVRowLayout.row_byte_ranges`, vectorized)."""
-    kernel_page, r = np.divmod(rows, layout.kernel_page_rows)
-    offset, size = layout.pieces[piece]
-    return (
-        kernel_page * layout.kernel_page_rows * layout.bytes_per_row + offset + r * size
-    )
-
-
-def copy_byte_ranges_reference(
-    src: torch.Tensor,
-    dst: torch.Tensor,
-    src_off: np.ndarray,
-    dst_off: np.ndarray,
-    lengths: np.ndarray,
-) -> None:
-    """Reference for the relayout gather on flat uint8 buffers: the semantics
-    the device kernel must match, used by the CPU tests."""
-    assert src.dtype == dst.dtype == torch.uint8 and src.dim() == dst.dim() == 1
-    for s, d, n in zip(src_off.tolist(), dst_off.tolist(), lengths.tolist()):
-        dst[d : d + n] = src[s : s + n]
 
 
 # ----------------------------------------------------------------------
@@ -233,7 +134,10 @@ def relayout_read_amplification(src: DcpLayout, dst: DcpLayout) -> float:
     """Source rows the destination ranks read per row they keep, over a long
     sequence: units of whole source pages carry rows of other destination
     ranks (e.g. 2.0 when every destination rank keeps every other row)."""
-    period = math.lcm(src.dcp_size * src.block_size, dst.dcp_size * dst.block_size) * 4
+    # Pages of both sides tile one period of positions whole (a page of a
+    # rank spans `dcp_size * block_size` positions), so the units read repeat
+    # with it and one period gives the exact ratio.
+    period = math.lcm(src.dcp_size * src.block_size, dst.dcp_size * dst.block_size)
     unit_rows = staging_unit_rows(src, dst)
     read = sum(
         len(_source_units(plan_dcp_rows(src, dst, rank, 0, period), unit_rows)[0])
@@ -400,71 +304,20 @@ class RelayoutRegion:
             raise ValueError(f"{self.rows} does not fit pages of {self}")
 
 
-def relayout_byte_copies(
-    regions: list[RelayoutRegion],
-    src_blocks: np.ndarray,
-    src_rows: np.ndarray,
-    dst_blocks: np.ndarray,
-    dst_rows: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """`(src offset, dst offset, length)` in the buffer of every byte copy of
-    the row gather; a negative source offset zeroes the destination range."""
-    zero = np.asarray(src_blocks) < 0
-    src_blocks = np.where(zero, 0, src_blocks)
-    copies = []
-    for region in regions:
-        src_off, dst_off, lengths = _row_byte_copies(
-            region.rows,
-            region.rows,
-            region.offset + src_blocks * region.page_stride,
-            src_rows,
-            region.offset + np.asarray(dst_blocks, dtype=np.int64) * region.page_stride,
-            dst_rows,
-        )
-        src_off[np.tile(zero, len(region.rows.pieces))] = -1
-        copies.append((src_off, dst_off, lengths))
-    if not copies:
-        empty = np.zeros(0, dtype=np.int64)
-        return empty, empty, empty
-    return tuple(np.concatenate(c) for c in zip(*copies))  # type: ignore[return-value]
-
-
-def relayout_rows_reference(
-    buf: torch.Tensor,
-    regions: list[RelayoutRegion],
-    src_blocks: np.ndarray,
-    src_rows: np.ndarray,
-    dst_blocks: np.ndarray,
-    dst_rows: np.ndarray,
-) -> None:
-    """Host reference of `relayout_rows` on a flat uint8 buffer: the
-    semantics the device kernel must match, used by the CPU tests."""
-    assert buf.dtype == torch.uint8 and buf.dim() == 1
-    src_off, dst_off, lengths = relayout_byte_copies(
-        regions, src_blocks, src_rows, dst_blocks, dst_rows
-    )
-    zero = src_off < 0
-    buf_zero = torch.zeros(1, dtype=torch.uint8)
-    for d, n in zip(dst_off[zero].tolist(), lengths[zero].tolist()):
-        buf[d : d + n] = buf_zero
-    copy_byte_ranges_reference(
-        buf.clone(), buf, src_off[~zero], dst_off[~zero], lengths[~zero]
-    )
-
-
-_MAX_ROW_PIECES = 4
 _ELEMENT_DTYPES = {8: torch.int64, 4: torch.int32, 2: torch.int16, 1: torch.uint8}
+# Elements one loop step of the gather kernel copies of a row piece; longer
+# pieces take several steps.
+_COPY_BLOCK = 256
 
 
-def _region_table(regions: list[RelayoutRegion], element_size: int) -> np.ndarray:
+def _region_table(
+    regions: list[RelayoutRegion], element_size: int, max_pieces: int
+) -> np.ndarray:
     """One row per region, in `element_size` units: offset, page stride,
     kernel page rows, row size, then (offset, size) of each row piece, padded
-    with empty pieces."""
-    width = 4 + 2 * _MAX_ROW_PIECES
-    table = np.zeros((len(regions), width), dtype=np.int64)
+    with empty pieces to `max_pieces`."""
+    table = np.zeros((len(regions), 4 + 2 * max_pieces), dtype=np.int64)
     for i, region in enumerate(regions):
-        if len(region.rows.pieces) > _MAX_ROW_PIECES:
-            raise ValueError(f"{region.rows} has more than {_MAX_ROW_PIECES} pieces")
         table[i, :4] = (
             region.offset // element_size,
             region.page_stride // element_size,
@@ -490,38 +343,55 @@ def _element_size(buf: torch.Tensor, regions: list[RelayoutRegion]) -> int:
     return next(size for size in (8, 4, 2, 1) if common % size == 0)
 
 
-def relayout_rows(
-    buf: torch.Tensor,
-    regions: list[RelayoutRegion],
+def row_table(
     src_blocks: np.ndarray,
     src_rows: np.ndarray,
     dst_blocks: np.ndarray,
     dst_rows: np.ndarray,
-) -> None:
-    """Row gather on the device, on the current stream: for every region and
-    row `i`, move row `src_rows[i]` of page `src_blocks[i]` to row
-    `dst_rows[i]` of page `dst_blocks[i]` (zero it if the source page is
-    negative). Same semantics as `relayout_rows_reference`; source and
-    destination rows must not overlap."""
-    assert buf.dtype == torch.uint8 and buf.dim() == 1
-    num_rows = len(src_blocks)
-    if num_rows == 0 or not regions:
-        return
-    element_size = _element_size(buf, regions)
-    elements = buf.view(_ELEMENT_DTYPES[element_size])
-    table = torch.from_numpy(_region_table(regions, element_size)).to(buf.device)
-    rows = torch.from_numpy(
-        np.stack([src_blocks, src_rows, dst_blocks, dst_rows]).astype(np.int64)
-    ).to(buf.device)
-    _relayout_rows_kernel[(num_rows, len(regions))](
-        elements,
-        rows,
-        num_rows,
-        table,
-        table.shape[1],
-        MAX_PIECES=_MAX_ROW_PIECES,
-        BLOCK=256,
-    )
+    device: torch.device,
+) -> torch.Tensor:
+    """The `(4, rows)` table a `RowGather` reads, on `device`: source page,
+    source row, destination page and destination row of each row (a negative
+    source page zeroes the destination row). Copied asynchronously from
+    pinned memory, ordered on the current stream."""
+    rows = np.stack([src_blocks, src_rows, dst_blocks, dst_rows]).astype(np.int64)
+    return async_tensor_h2d(rows, device, torch.int64)
+
+
+class RowGather:
+    """The row gather of the regions of one flat uint8 buffer on the device:
+    for every region and row `i` of a row table (`row_table`), move row
+    `src_rows[i]` of page `src_blocks[i]` to row `dst_rows[i]` of page
+    `dst_blocks[i]`, or zero it if the source page is negative. Source and
+    destination rows must not overlap.
+
+    The region table is built on the device once."""
+
+    def __init__(self, buf: torch.Tensor, regions: list[RelayoutRegion]) -> None:
+        assert buf.dtype == torch.uint8 and buf.dim() == 1
+        self.device = buf.device
+        self.regions = regions
+        self._max_pieces = max((len(r.rows.pieces) for r in regions), default=0)
+        element_size = _element_size(buf, regions)
+        self._elements = buf.view(_ELEMENT_DTYPES[element_size])
+        self._table = torch.from_numpy(
+            _region_table(regions, element_size, self._max_pieces)
+        ).to(buf.device)
+
+    def __call__(self, rows: torch.Tensor) -> None:
+        """Run the gather of `rows` (`row_table`) on the current stream."""
+        num_rows = rows.shape[1]
+        if num_rows == 0 or not self.regions:
+            return
+        _relayout_rows_kernel[(num_rows, len(self.regions))](
+            self._elements,
+            rows,
+            num_rows,
+            self._table,
+            self._table.shape[1],
+            MAX_PIECES=self._max_pieces,
+            BLOCK=_COPY_BLOCK,
+        )
 
 
 @triton.jit
@@ -534,8 +404,8 @@ def _relayout_rows_kernel(
     MAX_PIECES: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """One program per (row, region): the `KVRowLayout` address arithmetic of
-    `_piece_offsets`, in elements."""
+    """One program per (row, region): the `KVRowLayout` address arithmetic
+    (`KVRowLayout.row_byte_ranges`), in elements."""
     row = tl.program_id(0).to(tl.int64)
     region = tl.program_id(1).to(tl.int64)
     src_block = tl.load(rows_ptr + row)

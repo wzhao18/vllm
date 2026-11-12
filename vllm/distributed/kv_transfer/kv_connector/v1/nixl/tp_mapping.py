@@ -5,7 +5,10 @@
 from __future__ import annotations
 
 import enum
+import math
+from collections.abc import Sequence
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -16,8 +19,19 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     NixlPeerIncompatibleError,
+    get_dcp_replicated_group_ids,
+    get_representative_spec_type,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    CircularBufferSpec,
+    KVCacheSpec,
+    MambaSpec,
+)
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+    from vllm.v1.kv_cache_interface import KVCacheConfig
 
 # ======================================================================
 # Data structures
@@ -43,11 +57,17 @@ def _is_ssm_spec(spec_type: type[KVCacheSpec]) -> bool:
 
 
 class DcpTransferMode(enum.Enum):
-    """How attention KV moves between a remote and a local DCP layout."""
+    """How attention KV moves between a remote and a local DCP layout
+    (`select_dcp_transfer_mode`); each mode has its own page pairing."""
 
     DIRECT = "direct"
-    """Local pages read remote pages as they are; nothing is copied after the
-    transfer."""
+    """Pages pair whole by position, nothing is copied after the transfer:
+    equal per-rank logical blocks of the same layout, or pages of consecutive
+    positions (`_apply_dcp_prefix_caching`)."""
+    DIRECT_ROWS = "direct_rows"
+    """Same DCP size and interleave but other per-rank logical blocks: a rank
+    holds the same rows in the same order on both sides, so kernel pages pair
+    by row (`_pair_same_dcp_layout_pages`); nothing is copied either."""
     RELAYOUT = "relayout"
     """Local ranks read the remote pages holding their rows into staging
     blocks, then gather the rows into their own pages
@@ -81,55 +101,165 @@ class TPMapping:
     # come from different ranks.
     consumers_per_rank: dict[int, int] = field(default_factory=dict)
 
-    def consumers(self, remote_rank: int) -> int:
-        """Notifications `remote_rank` waits for per request; a rank without a
-        count has this rank as its only reader (a one-to-one mapping)."""
-        return self.consumers_per_rank.get(remote_rank, 1)
-
     # How attention KV moves from this remote (`select_dcp_transfer_mode`).
     dcp_mode: DcpTransferMode = DcpTransferMode.DIRECT
+
+    def consumers(self, remote_rank: int) -> int:
+        """Notifications `remote_rank` waits for per request. A mapping with
+        counts has one for every rank this rank notifies; a missing one would
+        let the producer free a request's blocks too early, so it is an
+        error. A mapping built without counts has one reader per producer."""
+        if not self.consumers_per_rank:
+            return 1
+        return self.consumers_per_rank[remote_rank]
+
+    def rank_block_ids(
+        self,
+        block_ids: BlockIds,
+        rank: int,
+        key_groups: Sequence[int] | None = None,
+    ) -> list[list[int]]:
+        """`block_ids` with the entries `rank` is no source of emptied.
+
+        Entries are per cache group, or per region with `key_groups` giving
+        each region's cache group (-1: a region shared by several groups,
+        read from every source rank). Attention groups come from their
+        attention sources and Mamba state groups from their state sources
+        (`TransferTopology.state_source_ranks`), whatever the transfer mode.
+        """
+        groups = range(len(block_ids)) if key_groups is None else key_groups
+        return [
+            list(ids)
+            if rank
+            in (self.source_ranks_per_group[g] if g >= 0 else self.all_source_ranks)
+            else []
+            for ids, g in zip(block_ids, groups, strict=True)
+        ]
+
+
+def engine_dcp_layout(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+) -> DcpLayout:
+    """Where an engine's DCP ranks hold a request's attention KV rows: its
+    interleave, and the per-rank logical block of its attention cache groups
+    (the lcm of their block sizes; Mamba state and circular buffers are not
+    placed by position).
+
+    The scheduler (which advertises it in `kv_transfer_params` and sizes the
+    relayout staging from it) and the workers (which advertise it at the
+    handshake and plan the transfers with it) both derive it here.
+    """
+    block_sizes = [
+        group.kv_cache_spec.block_size
+        for group in kv_cache_config.transfer_groups
+        if get_representative_spec_type(group.kv_cache_spec)
+        not in (MambaSpec, CircularBufferSpec)
+    ]
+    parallel_config = vllm_config.parallel_config
+    return DcpLayout(
+        dcp_size=parallel_config.decode_context_parallel_size,
+        interleave=parallel_config.cp_kv_cache_interleave_size,
+        block_size=math.lcm(*block_sizes)
+        if block_sizes
+        else vllm_config.cache_config.block_size,
+    )
+
+
+def relayout_config_problem(
+    kv_cache_config: KVCacheConfig,
+    *,
+    transfer_mode: str,
+    use_host_buffer: bool,
+    pcp_size: int,
+) -> str | None:
+    """Why an engine with this configuration cannot receive KV through a
+    `DcpTransferMode.RELAYOUT`, or None.
+
+    Shared by the scheduler (which then reserves no staging) and the workers
+    (which reject such a peer at the handshake, adding the checks only the
+    registered caches can answer).
+    """
+    if transfer_mode != "pull":
+        return "push transfers write whole pages."
+    if use_host_buffer:
+        return "KV staged through a host buffer is not relayouted."
+    groups = kv_cache_config.transfer_groups
+    if any(group.host_resident for group in groups):
+        return "host-resident KV cache groups (HiSparse) are not relayouted."
+    if pcp_size > 1:
+        return "prefill context parallelism is not supported."
+    if get_dcp_replicated_group_ids(groups):
+        return (
+            "DCP-replicated KV cache groups (e.g. a separate MLA draft cache) "
+            "are not supported."
+        )
+    num_attention_groups = sum(
+        _is_attention_spec(get_representative_spec_type(group.kv_cache_spec))
+        for group in groups
+    )
+    if num_attention_groups != 1:
+        return (
+            "it needs exactly one attention KV cache group, got "
+            f"{num_attention_groups}."
+        )
+    return None
 
 
 def select_dcp_transfer_mode(
     local: DcpLayout,
     remote: DcpLayout,
     *,
-    tp_sizes: tuple[int, int] | None = None,
+    tp_sizes: tuple[int, int],
 ) -> DcpTransferMode:
     """Pick how attention KV moves from `remote` to `local`, or raise
     `NixlPeerIncompatibleError` for a pair of layouts no mode supports.
 
-    `block_size` is each side's logical block (rows per page on one rank).
-    DIRECT pairs pages of one rank with pages of another, with no copy after
-    the transfer:
+    `block_size` is each side's per-rank logical block (rows per page on one
+    rank) and `tp_sizes` are the (local, remote) transfer TP sizes.
 
-    - Same DCP size and interleave, any block sizes: a rank's row stream is
-      the same on both sides, so local row `j` is remote row `j` of the same
-      rank, and pages pair at kernel-page granularity whatever the logical
-      blocks are (`_pair_same_dcp_layout_pages`).
-    - Pages of consecutive positions on both sides (`interleave ==
-      block_size`, or no DCP) and equal blocks: page `j` of any rank is one
-      run of positions, so it maps to one remote page whatever the DCP sizes
-      (`_apply_dcp_prefix_caching`).
+    Supported pairs:
 
-    Other layouts (e.g. token-level interleave over different DCP sizes)
-    move rows between pages: RELAYOUT, which any pair of layouts supports as
-    long as
+    - Different DCP sizes need each side's DCP group to be 1 or its whole TP
+      group, and the sizes to divide one another: the source-rank and
+      consumer-count math (`TransferTopology`) pairs one DCP rank per TP rank.
+    - Both sides sharding (DCP > 1) need the same interleave. RELAYOUT itself
+      maps rows between any interleaves, but every supported model declares
+      its interleave, so other interleaves mean other model configurations.
 
-    - `tp_sizes` (local, remote) equal the DCP sizes: each side's DCP group
-      spans its TP ranks, so a DCP rank is a TP rank to read from;
-    - the DCP sizes divide one another (the read and consumer-count maps of
-      `TransferTopology`).
+    The mode then follows from the layouts:
 
-    Whether the engine itself can receive through a relayout (pull mode, no
-    host staging, ...) is for the caller to check.
+    - DIRECT: no DCP; or same layout and per-rank blocks; or pages of
+      consecutive positions on both sides (`interleave == block_size`, or no
+      DCP on that side) of equal size, so page `j` of any rank is one run of
+      positions and maps to one remote page whatever the DCP sizes.
+    - DIRECT_ROWS: same DCP size and interleave, other per-rank blocks.
+    - RELAYOUT: everything else (e.g. token-level interleave over different
+      DCP sizes, as Kimi K3.1 P DCP8 -> D DCP16).
 
-    Attention KV only: Mamba state is never DCP-sharded, and comes from its
-    own source ranks (`TransferTopology.state_source_ranks`) whatever the
-    mode.
+    Whether the engine can receive through a relayout is for the caller to
+    check (`relayout_config_problem`). Attention KV only: Mamba state is never
+    DCP-sharded, and comes from its own source ranks
+    (`TransferTopology.state_source_ranks`) whatever the mode.
     """
     if local.dcp_size == 1 and remote.dcp_size == 1:
         return DcpTransferMode.DIRECT
+    if local.dcp_size != remote.dcp_size:
+        for side, layout, tp_size in (
+            ("local", local, tp_sizes[0]),
+            ("remote", remote, tp_sizes[1]),
+        ):
+            if layout.dcp_size not in (1, tp_size):
+                raise NixlPeerIncompatibleError(
+                    "NIXL transfers between different DCP sizes need DCP equal "
+                    f"to TP (or no DCP) on each side; the {side} side has TP "
+                    f"{tp_size} and DCP {layout.dcp_size}."
+                )
+        if local.dcp_size % remote.dcp_size and remote.dcp_size % local.dcp_size:
+            raise NixlPeerIncompatibleError(
+                "NIXL transfers between different DCP sizes need sizes that "
+                f"divide one another, got local {local.dcp_size}, remote "
+                f"{remote.dcp_size}."
+            )
     if (
         local.dcp_size > 1
         and remote.dcp_size > 1
@@ -140,55 +270,17 @@ def select_dcp_transfer_mode(
             f"cp_kv_cache_interleave_size differ: local {local.interleave}, "
             f"remote {remote.interleave}. Use the same interleave on both sides."
         )
-    direct_problem = _direct_problem(local, remote)
-    if direct_problem is None:
-        return DcpTransferMode.DIRECT
-    relayout_problem = _relayout_problem(local, remote, tp_sizes)
-    if relayout_problem is None:
-        return DcpTransferMode.RELAYOUT
-    raise NixlPeerIncompatibleError(
-        f"{direct_problem} Relayout of the rows is not possible either: "
-        f"{relayout_problem}"
-    )
-
-
-def _direct_problem(local: DcpLayout, remote: DcpLayout) -> str | None:
-    """Why pages cannot pair between the layouts without moving rows, or
-    None. Called with equal interleaves whenever both sides shard."""
     if local.dcp_size == remote.dcp_size:
-        return None
+        if local.block_size == remote.block_size:
+            return DcpTransferMode.DIRECT
+        return DcpTransferMode.DIRECT_ROWS
     if (
         local.block_size == remote.block_size
         and local.pages_hold_contiguous_positions
         and remote.pages_hold_contiguous_positions
     ):
-        return None
-    return (
-        "Pages pair directly between different DCP sizes only when both "
-        "sides' pages hold consecutive positions and are the same size "
-        "(cp_kv_cache_interleave_size equal to the per-rank KV block size, "
-        f"or no DCP): local {local}, remote {remote}."
-    )
-
-
-def _relayout_problem(
-    local: DcpLayout,
-    remote: DcpLayout,
-    tp_sizes: tuple[int, int] | None,
-) -> str | None:
-    """Why RELAYOUT cannot move rows between the layouts, or None."""
-    if tp_sizes is None or tp_sizes != (local.dcp_size, remote.dcp_size):
-        return (
-            "it needs TP = DCP on both sides, got local TP/DCP "
-            f"{tp_sizes[0] if tp_sizes else '?'}/{local.dcp_size}, remote "
-            f"TP/DCP {tp_sizes[1] if tp_sizes else '?'}/{remote.dcp_size}."
-        )
-    if local.dcp_size % remote.dcp_size and remote.dcp_size % local.dcp_size:
-        return (
-            f"the DCP sizes must divide one another, got local "
-            f"{local.dcp_size}, remote {remote.dcp_size}."
-        )
-    return None
+        return DcpTransferMode.DIRECT
+    return DcpTransferMode.RELAYOUT
 
 
 # ======================================================================
@@ -216,6 +308,7 @@ def compute_tp_mapping(
     group_spec_types: tuple[type[KVCacheSpec], ...],
     remote_dcp_size: int = 1,
     head_sharded_kv_heads: int | None = None,
+    dcp_mode: DcpTransferMode = DcpTransferMode.DIRECT,
 ) -> TPMapping:
     """Build the complete local-to-remote TP mapping.
 
@@ -227,6 +320,7 @@ def compute_tp_mapping(
 
     `head_sharded_kv_heads` maps head-sharded KV with that many total KV heads
     instead of the topology's, e.g. a GQA draft under an MLA target.
+    `dcp_mode` is how attention KV moves (`select_dcp_transfer_mode`).
     """
     tp_rank = transfer_topology.tp_rank
     tp_size = transfer_topology.tp_size
@@ -298,4 +392,5 @@ def compute_tp_mapping(
         rank_to_attention_slot=rank_to_attention_slot,
         rank_offset_factor=rank_offset_factor,
         consumers_per_rank=consumers_per_rank,
+        dcp_mode=dcp_mode,
     )

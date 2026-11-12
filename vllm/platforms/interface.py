@@ -68,30 +68,6 @@ def in_wsl() -> bool:
     return "microsoft" in " ".join(platform.uname()).lower()
 
 
-def set_packed_hybrid_block_size(
-    cache_config: "CacheConfig", packed_block_size: int, architecture: str
-) -> None:
-    """Use the block row a packed hybrid model sizes for itself.
-
-    The model sizes the row from its layers and TP so that P/D instances of
-    different TP sizes keep compatible rows and state-group counts. A user
-    `--block-size` would move it off that grid, so it is replaced (with a
-    warning) rather than taken as a floor as for other hybrid models.
-    """
-    if (
-        cache_config.user_specified_block_size
-        and cache_config.block_size != packed_block_size
-    ):
-        logger.warning(
-            "%s sizes its packed KV block row from the model and TP; ignoring "
-            "--block-size %d and using %d.",
-            architecture,
-            cache_config.block_size,
-            packed_block_size,
-        )
-    cache_config.block_size = packed_block_size
-
-
 class PlatformEnum(enum.Enum):
     """Enumeration of supported hardware platforms."""
 
@@ -970,6 +946,32 @@ class Platform:
         if cache_config.mamba_page_size_padded is not None:
             cache_config.mamba_page_size_padded = shared_page
 
+    @staticmethod
+    def _set_packed_hybrid_block_size(
+        cache_config: "CacheConfig", packed_block_size: int, architecture: str
+    ) -> None:
+        """Use the block row a packed hybrid model sizes for itself
+        (`_align_hybrid_block_size`).
+
+        The model sizes the row from its layers and TP so that P/D instances
+        of different TP sizes keep compatible rows and state-group counts. A
+        user `--block-size` would move it off that grid, so it is replaced
+        (with a warning) rather than taken as a floor as for other hybrid
+        models.
+        """
+        if (
+            cache_config.user_specified_block_size
+            and cache_config.block_size != packed_block_size
+        ):
+            logger.warning(
+                "%s sizes its packed KV block row from the model and TP; "
+                "ignoring --block-size %d and using %d.",
+                architecture,
+                cache_config.block_size,
+                packed_block_size,
+            )
+        cache_config.block_size = packed_block_size
+
     @classmethod
     def _align_hybrid_block_size(
         cls,
@@ -1155,7 +1157,7 @@ class Platform:
             )
         if packed_block_size is not None:
             attn_block_size = packed_block_size
-            set_packed_hybrid_block_size(
+            cls._set_packed_hybrid_block_size(
                 cache_config, packed_block_size, model_config.architecture
             )
         else:

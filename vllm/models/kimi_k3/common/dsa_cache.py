@@ -61,8 +61,9 @@ def kimi_k3_indexer_uses_fp4(vllm_config: VllmConfig) -> bool:
 
 
 # Both key formats end a token's entry with 4 scale bytes: one fp32 scale for
-# FP8 keys, or the four UE8M0 scales of a 128-dim MXFP4 key (the only MXFP4 key
-# size the indexer supports, see `mxfp4_q_quant`).
+# FP8 keys of any head dim, or the four UE8M0 scales of a 128-dim MXFP4 key
+# (the only MXFP4 key size the indexer supports: `dsa_indexer_mxfp4` asserts
+# `head_dim == 4 * MXFP4_BLOCK_SIZE`).
 INDEXER_KEY_SCALE_BYTES = 4
 
 
@@ -71,7 +72,7 @@ def indexer_cache_entry_bytes(head_dim: int, use_fp4_cache: bool) -> int:
     values (two per byte) + one UE8M0 byte per 32 values."""
     if use_fp4_cache:
         return head_dim // 2 + head_dim // MXFP4_BLOCK_SIZE
-    return head_dim + 4
+    return head_dim + INDEXER_KEY_SCALE_BYTES
 
 
 class KimiK3IndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):

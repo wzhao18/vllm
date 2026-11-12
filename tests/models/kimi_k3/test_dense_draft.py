@@ -368,7 +368,7 @@ def test_packed_block_replaces_a_user_block_size(
     cache_config = SimpleNamespace(
         block_size=user_block_size, user_specified_block_size=user_specified
     )
-    interface.set_packed_hybrid_block_size(cache_config, 640, "KimiK3")
+    interface.Platform._set_packed_hybrid_block_size(cache_config, 640, "KimiK3")
     assert cache_config.block_size == 640
     assert bool(warnings) == warns
     if warns:
