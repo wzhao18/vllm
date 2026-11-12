@@ -822,6 +822,11 @@ class ReqMeta:
     can_save: bool | None = None
     load_spec: LoadSpec | None = None
     current_event: torch.cuda.Event | None = None
+    # Worker-side, set when the load is issued at bind (start_load_kv): the
+    # load writes its blocks only after this event (recorded on the compute
+    # stream at bind) completes, and load_issue_time is when it was issued.
+    load_ready_event: torch.cuda.Event | None = None
+    load_issue_time: float | None = None
 
     token_ids: list[int] | None = None
     # Absolute request offset represented by token_ids[0].

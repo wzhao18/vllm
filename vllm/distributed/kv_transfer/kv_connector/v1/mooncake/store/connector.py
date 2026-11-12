@@ -205,6 +205,8 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
 
         self.connector_scheduler: MooncakeStoreScheduler | None = None
         self.connector_worker: MooncakeStoreWorker | None = None
+        # Worker side: the bound metadata whose loads were issued at bind.
+        self._loads_issued_for: MooncakeStoreConnectorMetadata | None = None
 
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler = MooncakeStoreScheduler(
@@ -365,11 +367,35 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         self.connector_worker.restore_kv_caches()
 
+    def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
+        """Bind the step's metadata and issue its async loads right away.
+
+        The model runner binds right before it launches the step's forward;
+        start_load_kv() is called after that launch. Issuing here starts the
+        loads about one step earlier. The worker orders them after all GPU
+        work queued so far (MooncakeStoreWorker.start_load_kv).
+        """
+        super().bind_connector_metadata(connector_metadata)
+        if self.connector_worker is None:
+            return
+        assert isinstance(connector_metadata, MooncakeStoreConnectorMetadata)
+        if connector_metadata is self._loads_issued_for:
+            # Re-bound for the same step: its loads are already queued.
+            return
+        self.connector_worker.start_load_kv(connector_metadata)
+        self._loads_issued_for = connector_metadata
+
+    def clear_connector_metadata(self) -> None:
+        super().clear_connector_metadata()
+        self._loads_issued_for = None
+
     def start_load_kv(self, forward_context: ForwardContext, **kwargs: Any) -> None:
         assert self.connector_worker is not None
         metadata = self._get_connector_metadata()
-        assert isinstance(metadata, MooncakeStoreConnectorMetadata)
-        self.connector_worker.start_load_kv(metadata)
+        # Issued when the metadata was bound (bind_connector_metadata).
+        assert metadata is self._loads_issued_for, (
+            "Mooncake store loads must be issued when the metadata is bound"
+        )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         # No layerwise support - no-op
