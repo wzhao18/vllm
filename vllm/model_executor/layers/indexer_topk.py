@@ -18,6 +18,21 @@ logger = init_logger(__name__)
 
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
+# Grown int32 zero buffers (row starts of rows that start at column 0); kept
+# alive since CUDA graphs captured earlier may still read them.
+_zero_row_starts: dict[torch.device, list[torch.Tensor]] = {}
+
+
+def zero_row_starts(like: torch.Tensor) -> torch.Tensor:
+    """A zero tensor shaped and typed like the 1-D ``like`` without a memset
+    per call: a prefix of a grown, never-written device buffer."""
+    numel = like.numel()
+    bufs = _zero_row_starts.setdefault(like.device, [])
+    if not bufs or bufs[-1].numel() < numel or bufs[-1].dtype != like.dtype:
+        size = max(numel, 2 * bufs[-1].numel() if bufs else 0, 1024)
+        bufs.append(torch.zeros(size, dtype=like.dtype, device=like.device))
+    return bufs[-1][:numel].view(like.shape)
+
 # Prefill chunks with fewer rows run faster on top_k_per_row_prefill (GB300),
 # and their many distinct small shapes would JIT-compile gvr_2 mid-serving.
 GVR2_PREFILL_MIN_ROWS = 1024
@@ -552,7 +567,7 @@ class SparseIndexerTopk(torch.nn.Module):
                     # frame (column - ks), -1 padded; ks = row_starts or 0.
                     host.run_prefill(
                         logits,
-                        torch.zeros_like(row_ends)
+                        zero_row_starts(row_ends)
                         if row_starts is None
                         else row_starts,
                         row_ends,

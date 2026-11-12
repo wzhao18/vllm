@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar
 import numpy as np
 import torch
 
-import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.config import CUDAGraphMode, get_current_vllm_config
 from vllm.distributed import (
@@ -346,6 +345,9 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
                 "prefill steps keep the DCP path."
             )
             return False
+        from vllm.model_executor.layers.sparse_attn_indexer import (
+            prefill_logits_budget_elems,
+        )
         from vllm.v1.attention.backends.mla.indexer import (
             DeepseekV32IndexerMetadataBuilder,
             get_max_prefill_buffer_size,
@@ -362,7 +364,9 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
                 vllm_config.scheduler_config.max_num_seqs,
             ),
             get_max_prefill_buffer_size(vllm_config),
-            envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024,
+            prefill_logits_budget_elems(
+                vllm_config.kernel_config.sparse_indexer_topk_backend
+            ),
             self.shardq_min_tokens,
             # Rows the indexer scores as decodes keep the DCP path.
             decode_query_len,

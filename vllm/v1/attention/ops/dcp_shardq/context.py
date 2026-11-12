@@ -45,7 +45,6 @@ from vllm.utils.math_utils import round_up
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.mla.indexer import (
-    DeepseekV32IndexerMetadataBuilder,
     DeepseekV32IndexerPrefillChunkMetadata,
     build_prefill_chunk_metadata,
 )
@@ -468,59 +467,93 @@ class DcpShardQContext:
         )
 
 
+# DeepGEMM's prefill logits: rows padded to its 4-token Q block, row stride a
+# whole number of 384-key splits rounded to 1024 bytes (bf16: 512 columns).
+_LOGITS_ROW_ALIGN = 4
+_LOGITS_COL_ALIGN = 384 * 512 // np.gcd(384, 512)
+
+
+def _logits_width(max_seq_len: int) -> int:
+    return round_up(max(max_seq_len, 1), _LOGITS_COL_ALIGN)
+
+
+def _rank_query_rows(query_len: int, world: int) -> np.ndarray:
+    """Rows of one request of ``query_len`` tokens that each rank scores under
+    the ShardQ two-piece fold (``shardq.fold_split``)."""
+    pieces = 2 * world
+    bounds = (np.arange(pieces + 1) * query_len) // pieces
+    lens = np.diff(bounds)
+    return lens[:world] + lens[world:][::-1]
+
+
 def _rank_chunk_specs(
-    seq_lens_cpu: torch.Tensor,
+    seq_lens: np.ndarray,
     query_lens: np.ndarray,
-    max_indexer_keys: int,
-    max_logits_bytes: int,
+    max_keys: int,
+    max_logits_elems: int,
     world: int,
     rank: int,
 ) -> list[tuple[slice, slice]]:
-    """This rank's indexer chunks of prefill requests ``seq_lens_cpu`` /
+    """This rank's indexer chunks of prefill requests ``seq_lens`` /
     ``query_lens``: (request slice, query-token slice of those requests).
 
     Each rank scores only its ShardQ rows (two fold pieces per request,
-    ``fold_split``), so the logits budget bounds a chunk's *local* rows. The
-    chunks are planned over the most rows any rank owns of each request (one
-    plan shape on every rank), and a request split on the query dimension is
-    cut at this rank's own row boundaries: every rank then scores equal row
-    counts in the same number of calls. Cutting the global token range instead
-    leaves each rank a different, misaligned share of each chunk (e.g. 435 /
-    426 + 9 / 142 + 293 + 435 / 719 + 151 rows), and the top-k and logits
-    launches pay per call. The rows scored, hence the top-k, are unchanged.
+    ``fold_split``), so the logits budget bounds a chunk's *local* rows:
+    (most rows any rank scores in the chunk, padded to DeepGEMM's 4-row Q
+    block) x (the aligned logits row width) <= ``max_logits_elems``.
+    Consecutive requests share a chunk while their keys fit ``max_keys`` and
+    their logits fit the budget; every rank derives the same plan.
+
+    A request that does not fit alone is cut into the fewest parts whose rows
+    fit, and each rank cuts *its own* rows of the request into that many equal
+    parts: every rank then scores equal row counts in the same number of
+    calls (cutting the global token range instead leaves each rank a
+    different, misaligned share of each part, e.g. 435 / 426 + 9 / 142 + 293,
+    and the top-k and logits launches pay per call). The rows scored, hence
+    the top-k, are unchanged.
     """
     rows = [fold_split(np.array([0, int(q)]), world) for q in query_lens]
-    local_lens = torch.tensor([max(len(r) for r in per_rank) for per_rank in rows])
-    specs = DeepseekV32IndexerMetadataBuilder._split_indexer_prefill_chunks(
-        seq_lens_cpu, local_lens, max_indexer_keys, max_logits_bytes
-    )
-    # Sub-chunks per request the splitter cut on the query dimension; they are
-    # re-cut into equal parts (e.g. 683 + 683 local rows, not 998 + 368).
-    num_parts: dict[int, int] = {}
-    for req_slice, local in specs:
-        if req_slice.stop - req_slice.start == 1:
-            num_parts[req_slice.start] = num_parts.get(req_slice.start, 0) + 1
+    n = len(seq_lens)
     out: list[tuple[slice, slice]] = []
-    for req_slice, local in specs:
-        first = req_slice.start
-        parts = num_parts.get(first, 1)
-        if parts == 1:
-            # Whole requests (the splitter only sub-chunks a single request).
-            if any(len(rows[q][rank]) for q in range(first, req_slice.stop)):
-                out.append((req_slice, slice(0, int(query_lens[req_slice].sum()))))
+    i = 0
+    while i < n:
+        start, chunk_rows, keys, width = i, np.zeros(world, np.int64), 0, 0
+        while i < n:
+            new_rows = chunk_rows + _rank_query_rows(int(query_lens[i]), world)
+            new_width = max(width, _logits_width(int(seq_lens[i])))
+            new_keys = keys + int(seq_lens[i])
+            padded = round_up(int(new_rows.max()), _LOGITS_ROW_ALIGN)
+            if new_keys > max_keys or padded * new_width > max_logits_elems:
+                break
+            chunk_rows, keys, width = new_rows, new_keys, new_width
+            i += 1
+        if i > start:
+            # Whole requests; a rank owning none of their rows skips the chunk.
+            if any(len(rows[q][rank]) for q in range(start, i)):
+                out.append(
+                    (slice(start, i), slice(0, int(query_lens[start:i].sum())))
+                )
             continue
-        if local.start > 0:
-            continue  # The request's parts were emitted at its first sub-chunk.
-        own = rows[first][rank]
+        # One request over the budget: the fewest equal parts of every rank's
+        # rows that fit (at least one 4-row block per part).
+        max_rows = max_logits_elems // _logits_width(int(seq_lens[i]))
+        max_rows = max(
+            _LOGITS_ROW_ALIGN, max_rows // _LOGITS_ROW_ALIGN * _LOGITS_ROW_ALIGN
+        )
+        local_max = max(len(r) for r in rows[i])
+        parts = max(1, -(-local_max // max_rows))
+        own = rows[i][rank]
         cuts = [(j * len(own)) // parts for j in range(parts + 1)]
         keep = [j for j in range(parts) if cuts[j] < cuts[j + 1]]
-        if not keep:
-            continue  # This rank owns no row of the request.
-        # Each part runs from this rank's first row of it (0 for the first
-        # part, which gathers the request's keys) to the next part's.
-        starts = [0] + [int(own[cuts[j]]) for j in keep[1:]]
-        starts.append(int(query_lens[first]))
-        out.extend((req_slice, slice(lo, hi)) for lo, hi in zip(starts, starts[1:]))
+        if keep:
+            # Each part runs from this rank's first row of it (0 for the first
+            # part, which gathers the request's keys) to the next part's.
+            starts = [0] + [int(own[cuts[j]]) for j in keep[1:]]
+            starts.append(int(query_lens[i]))
+            out.extend(
+                (slice(i, i + 1), slice(lo, hi)) for lo, hi in zip(starts, starts[1:])
+            )
+        i += 1
     return out
 
 
@@ -529,7 +562,7 @@ def build_dcp_shardq_context(
     layout: ContextLayout,
     max_pages: int,
     max_indexer_keys: int,
-    max_logits_bytes: int,
+    max_logits_elems: int,
     world: int,
     rank: int,
     device: torch.device,
@@ -596,10 +629,10 @@ def build_dcp_shardq_context(
     for g_lo, g_hi in groups:
         # A group's chunks never span two groups: each runs over one gather.
         chunk_specs = _rank_chunk_specs(
-            prefill_seq_lens_cpu[g_lo:g_hi],
+            prefill_seq_lens_cpu[g_lo:g_hi].numpy(),
             query_lens[g_lo:g_hi],
             max_indexer_keys,
-            max_logits_bytes,
+            max_logits_elems,
             world,
             rank,
         )
@@ -771,7 +804,7 @@ class DcpShardQPlanner:
         layout: ContextLayout,
         max_pages: int,
         max_indexer_keys: int,
-        max_logits_bytes: int,
+        max_logits_elems: int,
         min_tokens: int,
         max_decode_query_len: int,
         world: int,
@@ -787,7 +820,7 @@ class DcpShardQPlanner:
         )
         self.max_pages = max_pages
         self.max_indexer_keys = max_indexer_keys
-        self.max_logits_bytes = max_logits_bytes
+        self.max_logits_elems = max_logits_elems
         self.min_tokens = min_tokens
         self.max_decode_query_len = max_decode_query_len
         self.world = world
@@ -833,7 +866,7 @@ class DcpShardQPlanner:
                 self.layout,
                 self.max_pages,
                 self.max_indexer_keys,
-                self.max_logits_bytes,
+                self.max_logits_elems,
                 self.world,
                 self.rank,
                 self.device,
