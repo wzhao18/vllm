@@ -12,28 +12,39 @@ its 64 minutes, GPUs idle.
 process. Compiles of kernels defined under ``vllm/models/kimi_k3`` go through
 ``_compile``; every other caller gets the DSL call unchanged.
 
-- Key (taken before tracing): the digest of every ``.py`` file of the ``vllm``
-  package (any source edit is a new key space), the CuTe DSL / torch / Python
-  versions, the GPU (capability, SM count), the DSL and Kimi K3 environment, the
-  compile options, and a deep fingerprint of the kernel callable (the kernel
-  object's state, function bytecode, closures and defaults) and of every
-  argument (fake tensor layouts, scalars, real tensors with their address). An
-  argument the fingerprint cannot describe makes that compile uncached: it is
-  compiled in memory, counted and named in the cache log, never silently served.
+- Key (taken before tracing): the CuTe DSL / torch / Python versions and the
+  versions of the foreign packages kernels run while tracing, the GPU (capability,
+  SM count), the DSL and Kimi K3 environment, the compile options, and a deep
+  fingerprint of the kernel callable (the kernel object's state, function bytecode,
+  closures and defaults) and of every argument (fake tensor layouts, scalars, real
+  tensors with their address). An argument the fingerprint cannot describe makes
+  that compile uncached: it is compiled in memory, counted and named in the cache
+  log, never silently served.
+- Sources: an entry records the vllm files its trace depends on (``_sources``: the
+  modules of the kernel and its arguments, every file whose code ran during the
+  trace, and their direct imports) with their content digests, and is a hit only
+  while all of them are unchanged. An edit elsewhere in the tree keeps the entry;
+  an edit to one of its files adds a new entry for the key next to the old one.
 - Entry: the AOT object of the compile (``export_to_c`` for TVM-FFI launchers,
   ``dump_to_object`` otherwise) and a JSON record (launcher kind, DSL module hash
-  of the traced IR, compile seconds), written by atomic rename: ranks, nodes and
-  processes share one directory without locks. A hit loads the object
-  (``cute.runtime.load_module``): the cubin the compile produced, so kernels are
-  bitwise the compiled ones, and neither tracing nor the MLIR pipeline runs. A
-  miss compiles, exports and returns the loaded object, so cold and warm starts
-  run the same launcher. An entry that does not load is logged, recompiled and
-  replaced.
+  of the traced IR, compile seconds, sources), written by atomic rename. A hit
+  loads the object (``cute.runtime.load_module``): the cubin the compile produced,
+  so kernels are bitwise the compiled ones, and neither tracing nor the MLIR
+  pipeline runs. A miss compiles, exports and returns the loaded object, so cold
+  and warm starts run the same launcher. An entry that does not load is logged,
+  recompiled and replaced.
+- Shared cold starts: ranks, nodes and processes share the directory (put
+  ``VLLM_CACHE_ROOT`` on a shared file system for cross-node sharing). A miss takes
+  the key's claim file; a process that finds it taken gets a ``_Deferred`` kernel
+  and goes on, so the ranks of a deployment compile disjoint parts of the key set in
+  parallel and load the rest (see "cross-process claims").
 - ``VERIFY`` (tests only): every hit is also traced and its DSL module hash must
   equal the stored one, which checks that the pre-trace key covers every trace
   input of the kernels a start compiles.
 """
 
+import ast
+import contextlib
 import ctypes
 import dataclasses
 import enum
@@ -60,7 +71,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 # Bumped when the key or the entry layout changes.
-FORMAT = 1
+FORMAT = 2
 # Tests: re-trace every hit and compare the DSL module hash with the stored one.
 VERIFY = False
 
@@ -88,9 +99,11 @@ class Stats:
     key_s: float = 0.0  # fingerprinting
     load_s: float = 0.0
     compile_s: float = 0.0  # trace + MLIR + export of misses and uncached
+    deferred: int = 0  # claimed by another process when first asked for
+    wait_s: float = 0.0  # resolving deferred kernels (waiting for peers)
     # what made compiles uncached -> count
     reasons: dict = field(default_factory=dict)
-    # kernel -> [hits, misses, uncached, compile seconds]
+    # kernel -> [hits, misses, uncached, compile seconds, deferred]
     kernels: dict = field(default_factory=dict)
 
 
@@ -260,19 +273,115 @@ class _Fingerprint:
                     w("unset")
 
 
+def _tree_file(path: str) -> str | None:
+    """``path`` relative to the vllm package when it is one of its ``.py`` files."""
+    if not path or not path.endswith(".py"):
+        return None
+    path = os.path.abspath(path)
+    if not path.startswith(_PKG_ROOT + os.sep):
+        return None
+    return os.path.relpath(path, _PKG_ROOT)
+
+
 @functools.cache
-def _source_digest() -> str:
-    """Every ``.py`` of the vllm package, by relative path and content."""
-    h = hashlib.sha256()
-    for dirpath, dirnames, filenames in os.walk(_PKG_ROOT):
-        dirnames[:] = sorted(d for d in dirnames if d != "__pycache__")
-        for name in sorted(filenames):
-            if name.endswith(".py"):
-                path = os.path.join(dirpath, name)
-                h.update(os.path.relpath(path, _PKG_ROOT).encode() + b"\0")
-                with open(path, "rb") as f:
-                    h.update(hashlib.sha256(f.read()).digest())
-    return h.hexdigest()
+def _file_digest(rel: str) -> str:
+    """Content digest of a vllm ``.py`` file (read once per process)."""
+    try:
+        with open(os.path.join(_PKG_ROOT, rel), "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:32]
+    except OSError:
+        return "missing"
+
+
+def _module_file(name: str) -> str | None:
+    """The vllm file of dotted module ``name`` (module or package), if any."""
+    if name != "vllm" and not name.startswith("vllm."):
+        return None
+    base = os.path.join(_PKG_ROOT, *name.split(".")[1:])
+    for path in (base + ".py", os.path.join(base, "__init__.py")):
+        if os.path.isfile(path):
+            return os.path.relpath(path, _PKG_ROOT)
+    return None
+
+
+@functools.cache
+def _direct_imports(rel: str) -> tuple[str, ...]:
+    """The vllm files a vllm file imports (any import statement, any scope)."""
+    try:
+        with open(os.path.join(_PKG_ROOT, rel), "rb") as f:
+            tree = ast.parse(f.read())
+    except (OSError, SyntaxError, ValueError):
+        return ()
+    parts = ["vllm", *rel[:-3].split(os.sep)]
+    package = parts if parts[-1] == "__init__" else parts[:-1]
+    if package[-1] == "__init__":
+        package = package[:-1]
+    names: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names += [a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                anchor = package[: len(package) - (node.level - 1)]
+                base = ".".join(anchor + ([node.module] if node.module else []))
+            else:
+                base = node.module or ""
+            names.append(base)
+            names += [f"{base}.{a.name}" for a in node.names]
+    found = {f for f in map(_module_file, names) if f is not None}
+    found.discard(rel)
+    return tuple(sorted(found))
+
+
+def _sources(modules: set[str], executed: set[str]) -> dict[str, str]:
+    """The vllm source files a kernel's trace depends on, with their digests: the
+    modules of the kernel callable and its arguments (classes, functions), every
+    file whose code ran during the trace, and the files those import directly (a
+    value a traced function takes from a cached helper in an imported module, whose
+    code then did not run again). Files outside the vllm package are covered by the
+    package versions in the key."""
+    seeds = {f for f in map(_module_file, modules) if f is not None}
+    seeds |= {f for f in map(_tree_file, executed) if f is not None}
+    files = set(seeds)
+    for rel in seeds:
+        files.update(_direct_imports(rel))
+    return {rel: _file_digest(rel) for rel in sorted(files)}
+
+
+class _Executed:
+    """The Python files whose code runs inside the ``with`` block (each code object
+    reported once per compile through ``sys.monitoring``; all threads)."""
+
+    _tool: int | None = None
+
+    def __init__(self):
+        self.files: set[str] = set()
+
+    def _start(self, code, offset):
+        self.files.add(code.co_filename)
+        return sys.monitoring.DISABLE
+
+    def __enter__(self):
+        mon = sys.monitoring
+        if _Executed._tool is None:
+            for tool in (4, 3, 5, 1):
+                if mon.get_tool(tool) is None:
+                    mon.use_tool_id(tool, "kimi_k3_cute_cache")
+                    _Executed._tool = tool
+                    break
+            else:
+                raise RuntimeError("Kimi K3 CuTe cache: no free sys.monitoring tool")
+        tool = _Executed._tool
+        mon.register_callback(tool, mon.events.PY_START, self._start)
+        mon.set_events(tool, mon.events.PY_START)
+        mon.restart_events()  # code reported (disabled) by an earlier compile
+        return self
+
+    def __exit__(self, *exc):
+        mon = sys.monitoring
+        mon.set_events(_Executed._tool, 0)
+        mon.register_callback(_Executed._tool, mon.events.PY_START, None)
+        return False
 
 
 # Packages outside the vllm tree whose Python code Kimi K3 kernels run while tracing
@@ -326,16 +435,22 @@ def _environment() -> str:
     return "\n".join(parts)
 
 
-def key_of(compile_fn: Any, fn: Any, args: tuple, kwargs: dict) -> str:
-    """The pre-trace key of ``compile_fn(fn, *args, **kwargs)`` (raises
-    ``_Uncacheable`` when an input cannot be described)."""
+def _key_and_modules(compile_fn: Any, fn: Any, args: tuple, kwargs: dict):
     fp = _Fingerprint()
     fp.add(getattr(compile_fn, "_compile_options", None))
     fp.add(fn)
     fp.add(args)
     fp.add(kwargs)
-    head = f"{_versions()}\n{_source_digest()}\n{_environment()}\n"
-    return hashlib.sha256((head + fp.digest()).encode()).hexdigest()
+    head = f"{_versions()}\n{_environment()}\n"
+    return hashlib.sha256((head + fp.digest()).encode()).hexdigest(), fp.modules
+
+
+def key_of(compile_fn: Any, fn: Any, args: tuple, kwargs: dict) -> str:
+    """The pre-trace key of ``compile_fn(fn, *args, **kwargs)`` (raises
+    ``_Uncacheable`` when an input cannot be described). The kernel's vllm source
+    files are not in it: each entry records the files its trace depends on
+    (``_sources``) and is a hit only while they are unchanged."""
+    return _key_and_modules(compile_fn, fn, args, kwargs)[0]
 
 
 # ------------------------------------------------------------------------- store
@@ -350,9 +465,18 @@ def cache_dir() -> str:
     return os.path.join(envs.VLLM_CACHE_ROOT, "kimi_k3", "cutedsl_pretrace", version)
 
 
-def _paths(key: str) -> tuple[str, str]:
-    base = os.path.join(cache_dir(), key[:2], key)
+def _entry_dir(key: str) -> str:
+    """A key's entries: one per source version, ``<variant>.json`` + ``<variant>.o``."""
+    return os.path.join(cache_dir(), key[:2], key)
+
+
+def _paths(key: str, variant: str) -> tuple[str, str]:
+    base = os.path.join(_entry_dir(key), variant)
     return base + ".o", base + ".json"
+
+
+def _variant(sources: dict[str, str]) -> str:
+    return hashlib.sha256(json.dumps(sources, sort_keys=True).encode()).hexdigest()[:24]
 
 
 def _prefix(key: str) -> str:
@@ -386,19 +510,187 @@ def _cacheable(compiled: Any, tvm_ffi: bool) -> bool:
     )
 
 
-def _load(key: str, tvm_ffi: bool) -> Any:
+def _load(key: str, variant: str, tvm_ffi: bool) -> Any:
     from cutlass.cute.runtime import load_module
 
-    module = load_module(_paths(key)[0], enable_tvm_ffi=tvm_ffi)
+    module = load_module(_paths(key, variant)[0], enable_tvm_ffi=tvm_ffi)
     return module[_prefix(key)]
 
 
-def _read_record(key: str) -> dict | None:
-    obj, meta = _paths(key)
-    if not os.path.exists(obj):
+def _find(key: str) -> tuple[str, dict] | None:
+    """The entry of ``key`` whose recorded source files equal the current ones."""
+    folder = _entry_dir(key)
+    try:
+        names = os.listdir(folder)
+    except FileNotFoundError:
         return None
-    with open(meta) as f:  # written before the object: present with it
-        return json.load(f)
+    for name in sorted(names):
+        if not name.endswith(".json"):
+            continue
+        variant = name[:-5]
+        obj, meta = _paths(key, variant)
+        if not os.path.exists(obj):  # the record is written first
+            continue
+        try:
+            with open(meta) as f:
+                record = json.load(f)
+        except (OSError, ValueError):
+            continue
+        sources = record.get("sources", {})
+        if all(_file_digest(rel) == d for rel, d in sources.items()):
+            return variant, record
+    return None
+
+
+# ------------------------------------------------------------- cross-process claims
+#
+# Every rank of a deployment (and every node sharing the cache directory) compiles
+# the same keys in the same order. A miss first takes the key's claim file
+# (O_CREAT | O_EXCL, atomic on local file systems and Lustre); a process that finds
+# the claim taken does not wait but returns a ``_Deferred`` for the key and goes on
+# to its next compile, so the ranks spread the misses over themselves instead of all
+# compiling all of them. A deferred kernel resolves (loads the peer's entry) on its
+# first use. Claims are refreshed by a heartbeat; a claim not refreshed for
+# CLAIM_STALE_S (its process died) is taken over.
+
+CLAIM_STALE_S = 300.0
+_HEARTBEAT_S = 20.0
+_held: set[str] = set()
+_heartbeat: threading.Thread | None = None
+_pending: list["_Deferred"] = []
+
+
+def _claim_path(key: str) -> str:
+    return _entry_dir(key) + ".claim"
+
+
+def _beat() -> None:
+    while True:
+        time.sleep(_HEARTBEAT_S)
+        with _lock:
+            held = list(_held)
+        for path in held:
+            try:
+                os.utime(path)
+            except OSError:
+                pass
+
+
+def _claimer_dead(path: str) -> bool:
+    """A claim by a process of this host that no longer exists."""
+    try:
+        with open(path) as f:
+            host, pid = f.read().split()
+        if host != socket.gethostname() or int(pid) == os.getpid():
+            return False
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return True
+    except (OSError, ValueError):
+        return False
+    return False
+
+
+def _claim(key: str) -> bool:
+    global _heartbeat
+    path = _claim_path(key)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    for _ in range(3):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            try:
+                age = time.time() - os.stat(path).st_mtime
+            except FileNotFoundError:
+                continue  # released meanwhile: try again
+            if age < CLAIM_STALE_S and not _claimer_dead(path):
+                return False
+            stale = f"{path}.stale-{socket.gethostname()}-{os.getpid()}"
+            try:  # one taker wins the rename
+                os.rename(path, stale)
+            except FileNotFoundError:
+                return False
+            logger.warning(
+                "Kimi K3 CuTe cache: claim %s not refreshed for %.0f s or its process "
+                "is gone; taking it over", os.path.basename(path), age,
+            )  # fmt: skip
+            with contextlib.suppress(OSError):
+                os.unlink(stale)
+            continue
+        with os.fdopen(fd, "w") as f:
+            f.write(f"{socket.gethostname()} {os.getpid()}\n")
+        with _lock:
+            _held.add(path)
+            if _heartbeat is None:
+                _heartbeat = threading.Thread(
+                    target=_beat, name="k3-cute-cache-claims", daemon=True
+                )
+                _heartbeat.start()
+        return True
+    return False
+
+
+def _release(key: str) -> None:
+    path = _claim_path(key)
+    with _lock:
+        _held.discard(path)
+    with contextlib.suppress(OSError):
+        os.unlink(path)
+
+
+class _Deferred:
+    """A kernel another process is compiling: resolves to the loaded entry (or
+    compiles it, when the claim frees without an entry this process can use) on the
+    first call or attribute access, or in ``settle()``."""
+
+    __slots__ = ("_job", "_obj")
+
+    def __init__(self, job: tuple):
+        self._job, self._obj = job, None
+
+    def _resolve(self) -> Any:
+        if self._obj is None:
+            self._obj = _await(*self._job)
+            self._job = None
+        return self._obj
+
+    def __call__(self, *args, **kwargs):
+        return self._resolve()(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._resolve(), name)
+
+
+_phase_depth = 0
+
+
+@contextlib.contextmanager
+def shared_phase(name: str):
+    """A build phase whose misses claimed by peers are deferred (the rank goes on to
+    its next compile) and all resolved when the phase ends. Outside a phase, a miss
+    another process has claimed waits for that entry: no deferred kernel outlives
+    its phase, so none is first resolved while serving."""
+    global _phase_depth
+    _phase_depth += 1
+    try:
+        yield
+    finally:
+        _phase_depth -= 1
+    if _phase_depth == 0:
+        settle()
+        log_summary(name, table=True)
+
+
+def settle() -> None:
+    """Resolve every deferred kernel of this process (end of a build phase)."""
+    while True:
+        with _lock:
+            pending = list(_pending)
+            _pending.clear()
+        if not pending:
+            return
+        for deferred in pending:
+            deferred._resolve()
 
 
 # ----------------------------------------------------------------------- compile
@@ -412,16 +704,16 @@ def _kernel_name(fn: Any) -> str:
 
 
 def _record(name: str, slot: int | None, seconds: float = 0.0, **times) -> None:
-    """Add ``times`` to the totals and, with a ``slot`` (0 hit, 1 miss, 2 uncached),
-    one event of kernel ``name``."""
+    """Add ``times`` to the totals and, with a ``slot`` (0 hit, 1 miss, 2 uncached,
+    3 deferred to another process), one event of kernel ``name``."""
     global _events
     with _lock:
         for k, v in times.items():
             setattr(stats, k, getattr(stats, k) + v)
         if slot is None:
             return
-        entry = stats.kernels.setdefault(name, [0, 0, 0, 0.0])
-        entry[slot] += 1
+        entry = stats.kernels.setdefault(name, [0, 0, 0, 0.0, 0])
+        entry[slot if slot < 3 else 4] += 1
         entry[3] += seconds
         _events += 1
         report = _events % 500 == 0
@@ -464,27 +756,39 @@ def _trace_only(inner, fn, args, kwargs) -> dict:
     return found
 
 
-def _compile_and_store(inner, fn, args, kwargs, key: str | None, name: str):
+def _uncached_reason(name: str, why: str) -> None:
+    with _lock:
+        reason = f"{name}: {why}"
+        stats.reasons[reason] = stats.reasons.get(reason, 0) + 1
+
+
+def _compile_and_store(inner, fn, args, kwargs, key, modules, name):
     found: dict = {}
     start = time.perf_counter()
-    compiled = inner(fn, *args, trace_finalize_hooks=_trace_hook(found), **kwargs)
-    tvm_ffi = found.get("tvm_ffi", False)
-    if key is None or "ir" not in found or not _cacheable(compiled, tvm_ffi):
-        if key is not None:
-            why = "no module hash" if "ir" not in found else "loaded launcher differs"
-            with _lock:
-                reason = f"{name}: {why}"
-                stats.reasons[reason] = stats.reasons.get(reason, 0) + 1
-        _record(name, 2, time.perf_counter() - start, uncached=1,
-                compile_s=time.perf_counter() - start)  # fmt: skip
+    if key is None:
+        compiled = inner(fn, *args, trace_finalize_hooks=_trace_hook(found), **kwargs)
+        seconds = time.perf_counter() - start
+        _record(name, 2, seconds, uncached=1, compile_s=seconds)
         return compiled
-    obj, meta = _paths(key)
+    with _Executed() as executed:
+        compiled = inner(fn, *args, trace_finalize_hooks=_trace_hook(found), **kwargs)
+    tvm_ffi = found.get("tvm_ffi", False)
+    if "ir" not in found or not _cacheable(compiled, tvm_ffi):
+        why = "no module hash" if "ir" not in found else "loaded launcher differs"
+        _uncached_reason(name, why)
+        seconds = time.perf_counter() - start
+        _record(name, 2, seconds, uncached=1, compile_s=seconds)
+        return compiled
+    sources = _sources(modules, executed.files)
+    variant = _variant(sources)
+    obj, meta = _paths(key, variant)
     record = {
         "kernel": name,
         "tvm_ffi": tvm_ffi,
         "ir": found["ir"],
         "compile_s": round(time.perf_counter() - start, 3),
         "host": socket.gethostname(),
+        "sources": sources,
     }
 
     def write_obj(path):
@@ -501,16 +805,14 @@ def _compile_and_store(inner, fn, args, kwargs, key: str | None, name: str):
     try:
         _write_atomic(meta, write_meta)
         _write_atomic(obj, write_obj)
-        loaded = _load(key, tvm_ffi)
+        loaded = _load(key, variant, tvm_ffi)
     except Exception as error:
         logger.warning(
             "Kimi K3 CuTe cache: %s compiled but its object cannot be stored or "
             "loaded (%s: %s); this compile stays in memory",
             name, type(error).__name__, str(error)[:300],
         )  # fmt: skip
-        with _lock:
-            reason = f"{name}: export {type(error).__name__}"
-            stats.reasons[reason] = stats.reasons.get(reason, 0) + 1
+        _uncached_reason(name, f"export {type(error).__name__}")
         seconds = time.perf_counter() - start
         _record(name, 2, seconds, uncached=1, compile_s=seconds)
         return compiled
@@ -519,41 +821,97 @@ def _compile_and_store(inner, fn, args, kwargs, key: str | None, name: str):
     return loaded
 
 
-def _compile(inner, fn, args: tuple, kwargs: dict):
-    name = _kernel_name(fn)
-    start = time.perf_counter()
-    try:
-        key = key_of(inner, fn, args, kwargs)
-    except _Uncacheable as why:
-        with _lock:
-            reason = f"{name}: {why}"
-            stats.reasons[reason] = stats.reasons.get(reason, 0) + 1
-        key = None
-    _record(name, None, key_s=time.perf_counter() - start)
-    if key is None:
-        return _compile_and_store(inner, fn, args, kwargs, None, name)
-    record = _read_record(key)
-    if record is None:
-        return _compile_and_store(inner, fn, args, kwargs, key, name)
+def _load_entry(inner, fn, args, kwargs, key, modules, name, found):
+    variant, record = found
     loaded_at = time.perf_counter()
     try:
-        loaded = _load(key, record["tvm_ffi"])
+        loaded = _load(key, variant, record["tvm_ffi"])
     except Exception as error:
         logger.warning(
-            "Kimi K3 CuTe cache: entry %s (%s) does not load (%s: %s); recompiling "
-            "and replacing it", key[:16], name, type(error).__name__, str(error)[:300],
+            "Kimi K3 CuTe cache: entry %s/%s (%s) does not load (%s: %s); recompiling "
+            "and replacing it",
+            key[:16], variant, name, type(error).__name__, str(error)[:300],
         )  # fmt: skip
-        return _compile_and_store(inner, fn, args, kwargs, key, name)
+        return _compile_and_store(inner, fn, args, kwargs, key, modules, name)
     if VERIFY:
-        found = _trace_only(inner, fn, args, kwargs)
-        if found.get("ir") != record["ir"]:
+        traced = _trace_only(inner, fn, args, kwargs)
+        if traced.get("ir") != record["ir"]:
             raise RuntimeError(
                 f"Kimi K3 CuTe cache: key {key[:16]} of {name} hit an entry traced "
                 f"to a different module (stored {record['ir'][:16]}, now "
-                f"{str(found.get('ir'))[:16]}): the pre-trace key misses an input"
+                f"{str(traced.get('ir'))[:16]}): the pre-trace key misses an input"
             )
     _record(name, 0, 0.0, loaded=1, load_s=time.perf_counter() - loaded_at)
     return loaded
+
+
+def _compile_claimed(inner, fn, args, kwargs, key, modules, name):
+    """Under this process's claim of ``key``: load an entry a peer finished in the
+    meantime, else compile and store."""
+    try:
+        found = _find(key)
+        if found is not None:
+            return _load_entry(inner, fn, args, kwargs, key, modules, name, found)
+        return _compile_and_store(inner, fn, args, kwargs, key, modules, name)
+    finally:
+        _release(key)
+
+
+def _await(inner, fn, args, kwargs, key, modules, name):
+    """Resolve a deferred kernel: wait for the claim holder's entry (or take the
+    claim when it frees without an entry for these sources, or goes stale)."""
+    start, delay, warned = time.perf_counter(), 0.02, False
+    while True:
+        found = _find(key)
+        if found is not None:
+            loaded = _load_entry(inner, fn, args, kwargs, key, modules, name, found)
+            _record(name, None, wait_s=time.perf_counter() - start)
+            return loaded
+        if _claim(key):
+            compiled = _compile_claimed(inner, fn, args, kwargs, key, modules, name)
+            _record(name, None, wait_s=time.perf_counter() - start)
+            return compiled
+        waited = time.perf_counter() - start
+        if waited > 120 and not warned:
+            warned = True
+            logger.info(
+                "Kimi K3 CuTe cache: %s waiting %.0f s for a peer's compile of %s",
+                name, waited, key[:16],
+            )  # fmt: skip
+        time.sleep(delay)
+        delay = min(delay * 1.5, 0.5)
+
+
+def _compile(inner, fn, args: tuple, kwargs: dict):
+    name = _kernel_name(fn)
+    start = time.perf_counter()
+    for value in (*args, *kwargs.values()):  # a deferred kernel as an argument
+        if isinstance(value, _Deferred):
+            value._resolve()
+    args = tuple(a._obj if isinstance(a, _Deferred) else a for a in args)
+    kwargs = {k: v._obj if isinstance(v, _Deferred) else v for k, v in kwargs.items()}
+    try:
+        key, modules = _key_and_modules(inner, fn, args, kwargs)
+        if not hasattr(sys, "monitoring"):  # the sources need sys.monitoring
+            raise _Uncacheable("Python without sys.monitoring")
+    except _Uncacheable as why:
+        _uncached_reason(name, str(why))
+        key, modules = None, set()
+    _record(name, None, key_s=time.perf_counter() - start)
+    if key is None:
+        return _compile_and_store(inner, fn, args, kwargs, None, modules, name)
+    found = _find(key)
+    if found is not None:
+        return _load_entry(inner, fn, args, kwargs, key, modules, name, found)
+    if _claim(key):
+        return _compile_claimed(inner, fn, args, kwargs, key, modules, name)
+    if _phase_depth == 0:  # outside a build phase: wait for the peer's entry
+        return _await(inner, fn, args, kwargs, key, modules, name)
+    deferred = _Deferred((inner, fn, args, kwargs, key, modules, name))
+    with _lock:
+        _pending.append(deferred)
+    _record(name, 3, deferred=1)
+    return deferred
 
 
 class _CachedCompile:
@@ -600,17 +958,27 @@ def install() -> None:
             owner.compile = _CachedCompile(owner.compile)
 
 
-def log_summary(stage: str) -> None:
+def log_summary(stage: str, table: bool = False) -> None:
+    """One line of totals; with ``table``, one line per kernel (calls, compiles,
+    seconds) sorted by compile seconds."""
     with _lock:
         s = Stats(**{k: v for k, v in vars(stats).items()
                      if k not in ("kernels", "reasons")})  # fmt: skip
-        kernels = sorted(stats.kernels.items(), key=lambda kv: -kv[1][3])[:8]
+        kernels = sorted(stats.kernels.items(), key=lambda kv: -kv[1][3])
         reasons = sorted(stats.reasons.items(), key=lambda kv: -kv[1])[:5]
     logger.info(
         "Kimi K3 CuTe cache (%s, %.0f s since import): %d loaded, %d compiled, %d "
-        "uncached; keys %.0f s, loads %.0f s, compiles %.0f s (%s); slowest: %s%s",
+        "uncached, %d deferred to peers (waited %.0f s); keys %.0f s, loads %.0f s, "
+        "compiles %.0f s (%s); slowest: %s%s",
         stage, time.perf_counter() - _started, s.loaded, s.compiled, s.uncached,
-        s.key_s, s.load_s, s.compile_s, cache_dir(),
-        ", ".join(f"{n} {e[1] + e[2]}x {e[3]:.0f} s" for n, e in kernels),
+        s.deferred, s.wait_s, s.key_s, s.load_s, s.compile_s, cache_dir(),
+        ", ".join(f"{n} {e[1] + e[2]}x {e[3]:.0f} s" for n, e in kernels[:8]),
         "; uncached: " + ", ".join(f"{r} {c}x" for r, c in reasons) if reasons else "",
     )  # fmt: skip
+    if table:
+        for n, e in kernels:
+            logger.info(
+                "Kimi K3 CuTe cache kernel %s: calls %d, loaded %d, compiled %d, "
+                "uncached %d, deferred %d, compile %.1f s",
+                n, sum(e[:3]) + e[4], e[0], e[1], e[2], e[4], e[3],
+            )  # fmt: skip

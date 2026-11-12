@@ -10,6 +10,8 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 
+from . import cute_cache
+
 logger = init_logger(__name__)
 
 
@@ -33,7 +35,10 @@ class KimiK3ModelState(MambaHybridModelState):
             model = model.get_language_model()
         self.language_model = model
         if model.specialized_decode_config is not None:
-            model.build_specialized_decode()
+            # Ranks split the cold compiles (cute_cache.shared_phase): all loaded
+            # when the build returns.
+            with cute_cache.shared_phase("specialized decode built"):
+                model.build_specialized_decode()
             # Deferred RecoverSSM (the SP decode's KDA cores fold the commit).
             model.specialized_decode.bind_model_state(self)
         self._step_prep = None  # step_prep.KdaStepPrep, built at the first step
@@ -53,7 +58,8 @@ class KimiK3ModelState(MambaHybridModelState):
         self._block_tables = block_tables
         decode = self.language_model.specialized_decode
         if decode is not None:
-            decode.prepare_kv()
+            with cute_cache.shared_phase("specialized decode KV prepared"):
+                decode.prepare_kv()
         self._step_prep = None
         self._step_prep_checked = False
 

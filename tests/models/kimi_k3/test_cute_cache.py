@@ -21,6 +21,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 
 import pytest
 import torch
@@ -65,9 +66,76 @@ def test_key_is_deterministic_and_input_sensitive(monkeypatch):
     c = _key(_Kernel(2.0), torch.empty(0), 3, options="--opt-level 3")
     monkeypatch.setenv("VLLM_ITERLOG_DIR", "/tmp/b")
     assert c == _key(_Kernel(2.0), torch.empty(0), 3, options="--opt-level 3")
-    # any source edit is a new key space
-    monkeypatch.setattr(cute_cache, "_source_digest", lambda: "edited tree")
-    assert c != _key(_Kernel(2.0), torch.empty(0), 3, options="--opt-level 3")
+    # sources are not in the key (each entry records its own files)
+    assert not hasattr(cute_cache, "_source_digest")
+
+
+def test_sources_cover_kernel_executed_files_and_their_imports():
+    from vllm.models.kimi_k3.nvidia import cute_cache
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.oproj import producer
+
+    module = producer.__name__
+    executed = {producer.__file__, "/usr/lib/python3/foreign.py", "<string>"}
+    sources = cute_cache._sources({module, "torch"}, executed)
+    rel = os.path.relpath(producer.__file__, cute_cache._PKG_ROOT)
+    assert rel in sources  # the kernel's own module
+    assert all(not os.path.isabs(f) for f in sources)  # foreign files: versions
+    # its direct imports (helpers whose cached values a trace may read)
+    assert set(cute_cache._direct_imports(rel)) <= set(sources)
+    assert any("common" in f for f in cute_cache._direct_imports(rel))
+    # an unrelated file is not a dependency
+    assert "vllm/entrypoints/cli/main.py" not in sources
+    assert "entrypoints/cli/main.py" not in sources
+
+
+def test_find_matches_only_unchanged_sources(tmp_path, monkeypatch):
+    from vllm.models.kimi_k3.nvidia import cute_cache
+
+    monkeypatch.setattr(cute_cache, "cache_dir", lambda: str(tmp_path))
+    digests = {"a.py": "1", "b.py": "2", "c.py": "9"}
+    monkeypatch.setattr(cute_cache, "_file_digest", lambda rel: digests[rel])
+    key = "ab" * 32
+    for sources in ({"a.py": "1", "b.py": "2"}, {"a.py": "0"}):
+        variant = cute_cache._variant(sources)
+        obj, meta = cute_cache._paths(key, variant)
+        os.makedirs(os.path.dirname(obj), exist_ok=True)
+        with open(meta, "w") as f:
+            json.dump({"sources": sources, "tvm_ffi": False, "ir": "x"}, f)
+        open(obj, "wb").close()
+    found = cute_cache._find(key)
+    assert found is not None and found[1]["sources"] == {"a.py": "1", "b.py": "2"}
+    digests["c.py"] = "edited"  # a file outside the entry's sources: still a hit
+    assert cute_cache._find(key) is not None
+    digests["b.py"] = "edited"  # one of its sources: a miss
+    assert cute_cache._find(key) is None
+    digests["a.py"] = "0"  # the other entry's sources
+    assert cute_cache._find(key)[1]["sources"] == {"a.py": "0"}
+
+
+def test_claims_exclusive_stale_and_dead_owner(tmp_path, monkeypatch):
+    from vllm.models.kimi_k3.nvidia import cute_cache
+
+    monkeypatch.setattr(cute_cache, "cache_dir", lambda: str(tmp_path))
+    key = "cd" * 32
+    assert cute_cache._claim(key)
+    path = cute_cache._claim_path(key)
+    assert os.path.exists(path)
+    with open(path, "w") as f:  # held by a live process of this host
+        f.write(f"{cute_cache.socket.gethostname()} {os.getppid()}\n")
+    assert not cute_cache._claim(key)
+    old = time.time() - cute_cache.CLAIM_STALE_S - 10  # not refreshed: taken over
+    os.utime(path, (old, old))
+    assert cute_cache._claim(key)
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    with open(path, "w") as f:  # fresh, but its process is gone: taken over
+        f.write(f"{cute_cache.socket.gethostname()} {dead.pid}\n")
+    assert cute_cache._claim(key)
+    with open(path, "w") as f:  # another host's fresh claim: kept
+        f.write(f"other-host {dead.pid}\n")
+    assert not cute_cache._claim(key)
+    cute_cache._release(key)
+    assert not os.path.exists(path)
 
 
 def test_fingerprint_functions_closures_cycles():
@@ -271,5 +339,88 @@ def test_warm_start_loads_every_kernel_bitwise(tmp_path):
         assert _bitwise(broken_out["cached"][name], ref), f"rebuilt {name}"
 
 
+SHARED_KERNELS = 12
+
+
+def _shared_worker(path: str, start_file: str):
+    """One of two processes compiling the same SHARED_KERNELS kernels in a shared
+    phase over one cache directory; writes its stats and outputs."""
+    import cutlass
+    from cutlass.cute.runtime import from_dlpack, make_fake_compact_tensor
+
+    from vllm.models.kimi_k3.nvidia import cute_cache
+
+    device = torch.device("cuda", 0)
+    torch.cuda.set_device(device)
+    import cutlass.cute as cute
+
+    inner = cute.compile._inner if hasattr(cute.compile, "_inner") else cute.compile
+    fx = make_fake_compact_tensor(cutlass.Float32, (4096,), assumed_align=16)
+    Scale = _scale_kernel_class()
+    while not os.path.exists(start_file):  # both processes start together
+        time.sleep(0.01)
+    with cute_cache.shared_phase("test"):
+        runs = [
+            cute_cache._compile(inner, Scale(float(i + 1)), (fx, fx), {})
+            for i in range(SHARED_KERNELS)
+        ]
+        deferred = sum(isinstance(r, cute_cache._Deferred) for r in runs)
+    assert not cute_cache._pending  # the phase resolved every deferred kernel
+    x = torch.arange(4096, device=device, dtype=torch.float32)
+    outs = []
+    for run in runs:
+        y = torch.empty_like(x)
+        run(from_dlpack(x, assumed_align=16), from_dlpack(y, assumed_align=16))
+        outs.append(y.cpu())
+    stats = {k: v for k, v in vars(cute_cache.stats).items() if k != "kernels"}
+    torch.save(outs, path + ".pt")
+    with open(path + ".json", "w") as f:
+        json.dump({"stats": stats, "deferred_handles": deferred}, f)
+
+
+@_needs_blackwell
+def test_ranks_split_cold_compiles(tmp_path):
+    env = dict(os.environ, VLLM_CACHE_ROOT=str(tmp_path / "cache"))
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))))  # fmt: skip
+    env["PYTHONPATH"] = root + os.pathsep + env.get("PYTHONPATH", "")
+    start = str(tmp_path / "go")
+    procs = [
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "shared",
+             str(tmp_path / f"p{i}"), start],
+            env=env,
+        )  # fmt: skip
+        for i in range(2)
+    ]
+    time.sleep(20)  # both imported and waiting
+    open(start, "w").close()
+    for p in procs:
+        assert p.wait(timeout=900) == 0
+    metas = []
+    for i in range(2):
+        with open(tmp_path / f"p{i}.json") as f:
+            metas.append(json.load(f))
+        outs = torch.load(tmp_path / f"p{i}.pt")
+        x = torch.arange(4096, dtype=torch.float32)
+        for k, y in enumerate(outs):
+            assert torch.equal(y, x * float(k + 1)), (i, k)
+    compiled = [m["stats"]["compiled"] for m in metas]
+    loaded = [m["stats"]["loaded"] for m in metas]
+    # every kernel compiled exactly once over both processes, the rest loaded
+    assert sum(compiled) == SHARED_KERNELS, metas
+    assert [c + l for c, l in zip(compiled, loaded)] == [SHARED_KERNELS] * 2, metas
+    assert all(m["stats"]["uncached"] == 0 for m in metas), metas
+    # both did part of the work (the claims split the misses)
+    assert min(compiled) > 0, metas
+    claims = [
+        f for r, _, fs in os.walk(tmp_path / "cache") for f in fs if f.endswith(".claim")
+    ]
+    assert not claims, claims  # every claim released
+
+
 if __name__ == "__main__":
-    _worker(sys.argv[1], sys.argv[2] == "1")
+    if sys.argv[1] == "shared":
+        _shared_worker(sys.argv[2], sys.argv[3])
+    else:
+        _worker(sys.argv[1], sys.argv[2] == "1")
