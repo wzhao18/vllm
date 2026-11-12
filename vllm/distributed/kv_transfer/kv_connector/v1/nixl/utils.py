@@ -37,13 +37,6 @@ _NIXL_SUPPORTED_DEVICE = {
 _NIXL_SUPPORTED_DEVICE.update(current_platform.get_nixl_supported_devices())
 
 
-class NixlPeerIncompatibleError(RuntimeError):
-    """A peer whose configuration needs another KV layout than this engine's
-    (e.g. another DCP interleave, KV format or Mamba state). Retrying cannot
-    fix it, so the handshake records it and the worker re-raises it on the
-    engine thread instead of recomputing every request of that peer."""
-
-
 # TODO: merge with vllm.utils.network_utils.zmq_socket_ctx
 @contextlib.contextmanager
 def zmq_ctx(socket_type: Any, addr: str) -> Iterator[zmq.Socket]:

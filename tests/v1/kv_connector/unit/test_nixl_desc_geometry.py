@@ -1450,7 +1450,7 @@ def test_dcp_rejects_different_logical_block_sizes():
         remote_ssm_sizes=(24, 32),
     )
     with pytest.raises(
-        bw.NixlPeerIncompatibleError,
+        NotImplementedError,
         match="needs a relayout.*token-row layout",
     ):
         worker.add_remote_agent(

@@ -21,7 +21,6 @@ from vllm.distributed.kv_transfer.kv_connector.dcp_relayout import (
     plan_staged_relayout,
 )
 from vllm.distributed.kv_transfer.kv_connector.utils import TransferTopology
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl import base_worker as bw
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlConnectorMetadata,
     RemoteMeta,
@@ -310,7 +309,7 @@ def test_worker_relayout_unsupported_reasons(attrs, match):
         block_size=64,
         physical_blocks_per_logical_kv_block=20,
     )
-    with pytest.raises(bw.NixlPeerIncompatibleError, match=f"cannot receive.*{match}"):
+    with pytest.raises(NotImplementedError, match=f"cannot receive.*{match}"):
         worker._check_peer_compatibility(meta, remote_tp_size=8, remote_dcp_size=8)
     assert worker._remote_dcp_layouts == {}
 
@@ -790,12 +789,12 @@ def test_row_gathers_reject_undeclared_pages(attrs, match):
 def test_relayout_peer_must_pair_every_gathered_region():
     worker = _gather_worker()
     pairs = SimpleNamespace(groups_match=True, local=[0, 1, 3])
-    with pytest.raises(bw.NixlPeerIncompatibleError, match=r"regions \[2\]"):
+    with pytest.raises(NotImplementedError, match=r"regions \[2\]"):
         worker._check_relayout_pairs("P", pairs)
     worker._check_relayout_pairs(
         "P", SimpleNamespace(groups_match=True, local=[0, 1, 2])
     )
-    with pytest.raises(bw.NixlPeerIncompatibleError, match="other KV cache groups"):
+    with pytest.raises(NotImplementedError, match="other KV cache groups"):
         worker._check_relayout_pairs(
             "P", SimpleNamespace(groups_match=False, local=[0, 1, 2])
         )
@@ -856,7 +855,7 @@ def test_split_remote_blocks_rejects_bad_units(
 ):
     worker = _split_worker(kernel_page_rows)
     meta = _split_meta(96, block_lens, block_lens)
-    with pytest.raises(bw.NixlPeerIncompatibleError, match=match):
+    with pytest.raises(NotImplementedError, match=match):
         worker._split_remote_blocks(meta, required=True, state_regions=state_regions)
     # Without `required` (DIRECT hybrids) the blocks stay whole, unpaired.
     meta = _split_meta(96, block_lens, block_lens)

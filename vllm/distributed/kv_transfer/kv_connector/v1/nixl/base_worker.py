@@ -74,7 +74,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     _NIXL_SUPPORTED_DEVICE,
-    NixlPeerIncompatibleError,
     get_dcp_replicated_group_ids,
     get_representative_spec_type,
     zmq_ctx,
@@ -2598,7 +2597,7 @@ class NixlBaseConnectorWorker:
             )
         if problem is not None:
             if required:
-                raise NixlPeerIncompatibleError(
+                raise NotImplementedError(
                     f"Cannot read remote {meta.block_size}-token blocks into "
                     f"local {self.block_size}-token blocks: {problem}."
                 )
@@ -2935,9 +2934,10 @@ class NixlBaseConnectorWorker:
         """Check that the peer's configuration fits this engine's KV layout,
         and pick the DCP transfer mode.
 
-        Runs before any of the peer's state is registered. A mismatch raises
-        `NixlPeerIncompatibleError`, which fails the handshake like the other
-        handshake checks: the peer's requests are recomputed locally.
+        Runs before any of the peer's state is registered. Like the other
+        handshake checks, a peer whose configuration differs raises
+        `RuntimeError`, and a combination of layouts this engine does not
+        support raises `NotImplementedError`; either fails the handshake.
         """
         try:
             remote_layout = self._remote_dcp_layout(nixl_agent_meta, remote_dcp_size)
@@ -2952,13 +2952,13 @@ class NixlBaseConnectorWorker:
             if mode is DcpTransferMode.RELAYOUT:
                 reason = self._relayout_unsupported_reason()
                 if reason is not None:
-                    raise NixlPeerIncompatibleError(
+                    raise NotImplementedError(
                         f"its KV layout {remote_layout} needs a relayout of "
                         f"the rows into this engine's {self._dcp_layout}, "
                         f"which this engine cannot receive: {reason}"
                     )
-        except NixlPeerIncompatibleError as e:
-            raise NixlPeerIncompatibleError(
+        except RuntimeError as e:  # Including NotImplementedError.
+            raise type(e)(
                 f"NIXL engine {nixl_agent_meta.engine_id} is incompatible with "
                 f"this engine: {e}"
             ) from e
@@ -3009,13 +3009,13 @@ class NixlBaseConnectorWorker:
         the same cache groups: the gather moves all of them, so a region no
         read filled would receive staging bytes of no request."""
         if not pairs.groups_match:
-            raise NixlPeerIncompatibleError(
+            raise NotImplementedError(
                 f"NIXL engine {engine_id} puts layers in other KV cache groups "
                 "than this engine, which relayout transfers do not support."
             )
         unpaired = set(self._relayout_regions()) - set(pairs.local)
         if unpaired:
-            raise NixlPeerIncompatibleError(
+            raise NotImplementedError(
                 f"NIXL engine {engine_id} holds no KV for the local attention "
                 f"regions {sorted(unpaired)} (layers "
                 f"{[self.region_members[r] for r in sorted(unpaired)]}), which "
@@ -3078,7 +3078,7 @@ class NixlBaseConnectorWorker:
         interleave = nixl_agent_meta.cp_kv_cache_interleave_size
         if interleave is None:
             if self.dcp_size > 1 or remote_dcp_size > 1:
-                raise NixlPeerIncompatibleError(
+                raise RuntimeError(
                     "the peer does not advertise its cp_kv_cache_interleave_size "
                     "(NIXL connector metadata older than version 17), which "
                     "decode context parallelism needs. Upgrade it."
@@ -3092,7 +3092,7 @@ class NixlBaseConnectorWorker:
                 * nixl_agent_meta.physical_blocks_per_logical_kv_block,
             )
         except ValueError as e:
-            raise NixlPeerIncompatibleError(str(e)) from e
+            raise RuntimeError(str(e)) from e
 
     def _validate_kv_row_layouts(self, nixl_agent_meta: NixlAgentMetadata) -> None:
         """Reject a peer for which a layer both sides hold stores its token
@@ -3115,7 +3115,7 @@ class NixlBaseConnectorWorker:
                     if isinstance(spec, AttentionSpec)
                     else ""
                 )
-                raise NixlPeerIncompatibleError(
+                raise RuntimeError(
                     f"layer {name} stores its KV token rows as {local} here"
                     f"{cache_format} and as {remote} on the peer. Both sides "
                     "must store every layer they share in the same format."
@@ -3131,7 +3131,7 @@ class NixlBaseConnectorWorker:
             local = self._kv_cache_scales[name]
             remote = tuple(remote_scales[name])
             if local != remote:
-                raise NixlPeerIncompatibleError(
+                raise RuntimeError(
                     f"layer {name} quantizes its KV cache with (k_scale, "
                     f"v_scale) {local} here and {remote} on the peer. Use the "
                     "same checkpoint and KV cache scales on both sides."
@@ -3148,7 +3148,7 @@ class NixlBaseConnectorWorker:
         if local is None and remote is None:
             return
         if local is None or remote is None or tuple(local) != tuple(remote):
-            raise NixlPeerIncompatibleError(
+            raise RuntimeError(
                 "the peer holds other Mamba state (shapes without the TP "
                 f"dim, dtypes) {remote} than this engine's {local}. Use the "
                 "same model, num_speculative_tokens and mamba_ssm_cache_dtype "
