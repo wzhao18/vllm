@@ -1034,8 +1034,9 @@ def test_hetero_ppl_pull_without_remote_num_tokens_fails():
 @pytest.mark.cpu_test
 def test_mla_hybrid_peer_with_other_cache_groups_is_refused():
     """A hybrid layer in another cache group on P would be read at the wrong
-    group's blocks, and region-mapped reads cannot serve SSM state, so the
-    handshake refuses the peer before any transfer."""
+    group's blocks, and region-mapped reads cannot serve regions holding
+    layers of several groups, so the handshake refuses the peer before any
+    transfer."""
     worker = _make_mla_hybrid_worker(
         local_block_size=16,
         kernel_block_size=16,

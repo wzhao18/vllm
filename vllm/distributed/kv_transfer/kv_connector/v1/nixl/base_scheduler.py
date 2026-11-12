@@ -616,7 +616,6 @@ class NixlBaseConnectorScheduler:
             mode = select_dcp_transfer_mode(
                 self._dcp_layout,
                 remote,
-                has_mamba=self._has_mamba,
                 tp_sizes=(self.transfer_tp_size, params.get("tp_size", 1)),
             )
         except (NixlPeerIncompatibleError, ValueError):

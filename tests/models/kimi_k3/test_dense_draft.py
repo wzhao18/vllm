@@ -226,7 +226,9 @@ def _kda_state(tp: int, num_spec: int) -> MambaSpec:
     )
 
 
-def _packed_block_size(monkeypatch, tp, state_bytes, speculative_config=None):
+def _packed_block_size(
+    monkeypatch, tp, state_bytes, speculative_config=None, alignment=64
+):
     monkeypatch.setattr(dsa_cache, "kimi_k3_indexer_uses_fp4", lambda _: False)
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(hf_text_config=K31_PACKED_TEXT_CONFIG),
@@ -234,9 +236,9 @@ def _packed_block_size(monkeypatch, tp, state_bytes, speculative_config=None):
         speculative_config=speculative_config,
     )
     block_size = dsa_cache.packed_dsa_block_size(
-        vllm_config, MLA_BYTES, state_bytes, 64
+        vllm_config, MLA_BYTES, state_bytes, alignment
     )
-    assert block_size is not None and block_size % 64 == 0
+    assert block_size is not None and block_size % alignment == 0
     return block_size
 
 
@@ -325,3 +327,49 @@ def test_packed_dsa_block_counts_a_dense_mla_draft_in_the_row(monkeypatch):
     kda_groups = [g for g in groups if g.layer_names[0].endswith(".kda")]
     assert [len(g.layer_names) for g in kda_groups] == [23, 23, 23]
     assert 23 * kda.page_size_bytes > 0.85 * bytes_per_block
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("num_spec", [0, 5, 7])
+def test_packed_dsa_block_lands_on_the_prefix_grid(monkeypatch, num_spec):
+    """With prefix_match_unit 128 folded into the alignment, every TP size
+    gets a 128-token multiple (an unpinned TP16 decode would otherwise get a
+    block prefix caching rejects), still TP-invariant in B * TP and in the
+    KDA state-group count, so P and D of different TP sizes pair."""
+    row_bytes_per_token = len(K31_DSA_LAYERS) * (MLA_BYTES + INDEX_BYTES)
+    block_sizes = {}
+    for tp in (4, 8, 16):
+        state = _kda_state(tp, num_spec).page_size_bytes
+        block_sizes[tp] = _packed_block_size(monkeypatch, tp, state, alignment=128)
+        # A row fits 23 KDA states (3 groups on every side), and is the
+        # smallest 128-aligned (at the reference TP 16) row that does.
+        assert 23 * state <= block_sizes[tp] * row_bytes_per_token
+        smaller = block_sizes[tp] - 128 * 16 // tp
+        assert smaller * row_bytes_per_token < 23 * state
+    assert len({tp * block for tp, block in block_sizes.items()}) == 1
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    ("user_block_size", "user_specified", "warns"),
+    [(1024, True, True), (640, True, False), (16, False, False)],
+)
+def test_packed_block_replaces_a_user_block_size(
+    monkeypatch, user_block_size, user_specified, warns
+):
+    """A packed hybrid's block row is sized from the model and TP; a user
+    --block-size is replaced with a warning instead of acting as a floor."""
+    from vllm.platforms import interface
+
+    warnings = []
+    monkeypatch.setattr(
+        interface.logger, "warning", lambda msg, *args: warnings.append(msg % args)
+    )
+    cache_config = SimpleNamespace(
+        block_size=user_block_size, user_specified_block_size=user_specified
+    )
+    interface.set_packed_hybrid_block_size(cache_config, 640, "KimiK3")
+    assert cache_config.block_size == 640
+    assert bool(warnings) == warns
+    if warns:
+        assert "ignoring --block-size 1024 and using 640" in warnings[0]
