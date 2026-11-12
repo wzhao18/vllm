@@ -1090,6 +1090,22 @@ def _indexer_topk(
         indexer.score(hidden, index_q, index_weights, index_k=None)
 
 
+def _reserve_whole_step_lse(config, device, kernel, world):
+    """Size trtllm-gen's DCP softmax-stats slab for whole prefill steps.
+
+    Under DCP ShardQ the slab covers only the DCP path's bounded steps
+    (trtllm_gen_lse_max_rows). These tests shrink the gathered-context
+    workspace below max_model_len to send whole prefill steps to the DCP path,
+    which a served configuration never does, so they size the slab as without
+    DCP ShardQ.
+    """
+    if kernel != "trtllm":
+        return
+    from vllm.v1.attention.backends.mla import flashinfer_mla_sparse as fims
+
+    fims.reserve_trtllm_gen_buffers(config, device, world, dcp_shardq=False)
+
+
 def _layer_worker(rank, world, init_file, cache_dtype, kernel, index_format="fp8"):
     """One rank of a DCP = TP group running a real K3.1 DSA layer (its indexer
     keys in ``index_format``).
@@ -1221,6 +1237,7 @@ def _layer_worker(rank, world, init_file, cache_dtype, kernel, index_format="fp8
             grouped = FlashInferMLASparseTRTLLMBackend.get_builder_cls()(
                 spec, [layer.layer_name], config, device
             )
+            _reserve_whole_step_lse(config, device, kernel, world)
             for name, lens in LAYER_STEPS.items():
                 layout = _layout(cache_dtype, index_format)
                 rep = Replicated(lens, layout, fill_random=False)
@@ -1566,6 +1583,7 @@ def _profile_worker(rank, world, init_file, cache_dtype, kernel, index_format="f
                     ),
                 )
             registry.warmup()
+            _reserve_whole_step_lse(config, device, kernel, world)
             group = layer.dcp_manager.group
             group_all_gather = group.all_gather
 
