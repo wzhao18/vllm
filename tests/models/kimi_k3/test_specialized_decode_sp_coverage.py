@@ -345,7 +345,7 @@ def test_every_block_serves_every_row(fakes):
 
 def test_collective_build_order_and_parities(fakes):
     """Collective allocations in the same order on every rank: SpComm, the DSA box
-    and scratch, RecoverSSM ("triton": no stock hook), then each layer's block in
+    and scratch, RecoverSSM (deferred), then each layer's block in
     layer order. SP mailbox parity by block ordinal, DSA box parity by DSA ordinal."""
     _, events = fakes()
     step = sp_attention.SpStep(runtime())
@@ -353,7 +353,7 @@ def test_collective_build_order_and_parities(fakes):
     assert names[:4] == ["SpComm", "sp_dsa_box", "sp_dsa_scratch", "prepare_recoverssm"]
     assert events[0] == ("SpComm", TP, 0, WIDTH, 512)
     assert events[1] == ("sp_dsa_box", HEADS, 512, 1)
-    assert events[3] == ("prepare_recoverssm", False)
+    assert events[3] == ("prepare_recoverssm", True)  # deferred (the cores fold)
     cores = [e for e in events if e[0] in ("SpDsaCore", "SpKdaCore")]
     assert [e[1] for e in cores] == list(range(len(KINDS)))
     dsa = [e[2] for e in cores if e[0] == "SpDsaCore"]

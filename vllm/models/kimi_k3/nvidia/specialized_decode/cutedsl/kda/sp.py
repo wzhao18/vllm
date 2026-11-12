@@ -18,10 +18,12 @@ mode        cores (ported from the upstream specialized decode)
 ==========  ======================================================================
 "triton"    record cores, records at the step row (the stock layout), the stock
             Triton commit after sampling (unchanged)
-"deferred"  record cores at the request's record slot (``record_rows``); the step's
-            first KDA core folds the pending commit of every layer first
-            (``KDARecoverSSMDeferred.flush``), or a replaying core (``REPLAY``)
-            folds it in its own pass
+"deferred"  record cores at the request's record slot (``record_rows``); KdaWide
+            folds the pending commit into its own pass with the stock Triton
+            commit's math bit for bit (``wide`` docstring), a replaying core
+            (``REPLAY``) in its own form; before the other cores the step's first
+            KDA core folds every layer's pending commit
+            (``KDARecoverSSMDeferred.flush``)
 "none"      no records: the plain verify with q state slots (``prepared.
             PreparedKda``, the TP8 / TP16 kernels at 24 heads)
 ==========  ======================================================================
@@ -77,6 +79,9 @@ REPLAY = {24: ""}
 # KdaFused CTAs per (request, head) by items (upstream FUSED_SPLIT).
 FUSED_SPLIT = ((48, 8), (96, 4), (192, 2), (1 << 30, 1))
 KINDS = ("split", "ws", "wide", "stream", "fused", "fused_ws")
+# "deferred": cores that fold the pending commit themselves (no flush): the replaying
+# cores, and KdaWide, whose prologue runs the stock Triton commit's math bit for bit.
+FOLDS = ("fused", "fused_ws", "wide")
 MODES = ("deferred", "triton", "none")
 
 
@@ -353,7 +358,7 @@ class SpKdaCore:
                     "(recoverssm.bind_model_state)"
                 )
                 raise Unsupported("kda", Shape(rows, self.q), cause)
-            if self.kinds[rows] not in ("fused", "fused_ws"):
+            if self.kinds[rows] not in FOLDS:
                 deferred.flush()  # this core verifies from committed checkpoints
             extra = (deferred.record_rows[:n], deferred.pending)
         slots = slots[:n]

@@ -1000,6 +1000,16 @@ class SpecializedDecode:
         self.kda_side.join()
         return (out, aux_out) if aux_out else out
 
+    def bind_model_state(self, state):
+        """The runner-state side of the SP step's deferred RecoverSSM (its KDA
+        cores fold the pending commit; ``recoverssm.bind_model_state``), called once
+        by the ``KimiK3ModelState`` that built this decode. No-op for the other
+        records modes and outside sequence parallelism."""
+        if self.sp is not None and self.sp.records == "deferred":
+            from ..recoverssm import bind_model_state
+
+            bind_model_state(state)
+
     def process_weights_after_loading(self):
         """After a weight reload: the SP blocks re-derive their weight copies (the
         TP8 / TP16 providers have no reload hook)."""
