@@ -94,7 +94,13 @@ class ConvertReqIndexToGlobalIndexKernel(
         block_table_stride: int
 
     @staticmethod
-    @triton.jit(do_not_specialize=["max_num_blocks_per_req", "workspace_rank_stride"])
+    # req_id / prefill_request_id are one scalar load per row and arrive as
+    # slices at any row offset (a serving step's prefill rows start mid-batch),
+    # so their alignment is not specialized: one compile serves every offset.
+    @triton.jit(
+        do_not_specialize=["max_num_blocks_per_req", "workspace_rank_stride"],
+        do_not_specialize_on_alignment=["req_id_ptr", "prefill_request_id_ptr"],
+    )
     def sparse_mla_index_remap_kernel(
         req_id_ptr,  # int32 [num_tokens]
         block_table_ptr,  # int32 [num_requests, max_num_blocks_per_req]

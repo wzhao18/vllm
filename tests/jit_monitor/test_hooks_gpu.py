@@ -55,7 +55,7 @@ def test_no_warning_on_cached_shape():
     _run_add_kernel(1024)
 
     jit_monitor.activate()
-    with mock.patch.object(jit_monitor.logger, "warning_once") as w:
+    with mock.patch.object(jit_monitor.logger, "error") as w:
         _run_add_kernel(1024)
     w.assert_not_called()
 
@@ -64,7 +64,7 @@ def test_warning_on_new_constexpr():
     _run_add_kernel(1024, block=256)
 
     jit_monitor.activate()
-    with mock.patch.object(jit_monitor.logger, "warning_once") as w:
+    with mock.patch.object(jit_monitor.logger, "error") as w:
         # Different BLOCK (a tl.constexpr) forces recompilation.
         _run_add_kernel(1024, block=512)
     w.assert_called()
@@ -77,9 +77,7 @@ def test_verbose_warning_on_each_new_pointer_alignment():
 
     jit_monitor.activate(verbose=True)
     with (
-        mock.patch.object(jit_monitor.logger, "warning") as w,
-        mock.patch.object(jit_monitor.logger, "warning_once") as w_once,
+        mock.patch.object(jit_monitor.logger, "error") as w,
     ):
         _run_add_kernel(1024, offset=1)
     assert w.called
-    w_once.assert_not_called()

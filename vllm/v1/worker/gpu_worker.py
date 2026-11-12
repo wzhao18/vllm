@@ -113,7 +113,7 @@ from vllm.v1.worker.workspace import init_workspace_manager
 
 from ...model_executor.model_loader import TensorizerLoader
 from .gpu.cudagraph_utils import has_compiled_submodule
-from .gpu.warmup import warmup_kernels
+from .gpu.warmup import serving_shape_warmup_kernels, warmup_kernels
 from .utils import request_memory
 
 logger = init_logger(__name__)
@@ -988,6 +988,11 @@ class Worker(WorkerBase):
             if self.vllm_config.kernel_config.enable_jit_warmup:
                 # A workspace resize after capture frees what the graphs point at.
                 warmup_kernels(
+                    self.model_runner, self.execute_model, self.sample_tokens
+                )
+                # Full-budget mixed serving steps, then a verification step
+                # that fails startup if any kernel still compiles.
+                serving_shape_warmup_kernels(
                     self.model_runner, self.execute_model, self.sample_tokens
                 )
 

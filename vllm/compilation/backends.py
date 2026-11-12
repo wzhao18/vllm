@@ -296,6 +296,14 @@ class CompilerManager:
             compilation_start_time = time.perf_counter()
 
         compilation_counter.num_backend_compilations += 1
+        if graph_index == 0:
+            from vllm.utils import jit_monitor
+
+            # A graph compiled (or loaded from the cache) after warmup stalls
+            # the serving step that hit it.
+            jit_monitor.report_compile(
+                "torch.compile", f"graph for compile range {compile_range}"
+            )
 
         compiled_graph = None
         handle = None

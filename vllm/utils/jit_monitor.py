@@ -38,8 +38,12 @@ JitMonitorMode = Literal["warn", "error"]
 _active: bool = False
 _mode: JitMonitorMode = "warn"
 _verbose: bool = False
+_triton_hook_installed: bool = False
 _cutedsl_hook_installed: bool = False
 _tilelang_hook_installed: bool = False
+# While set, monitored JIT events are appended here instead of warned/raised
+# (see ``record_jit_events``).
+_recorded_events: list[str] | None = None
 _tilelang_jitimpl_compile_depth: int = 0
 
 
@@ -72,6 +76,17 @@ def activate(*, mode: JitMonitorMode = "warn", verbose: bool = False) -> None:
     _verbose = verbose
 
     _setup_triton_autotuning_print()
+    _install_jit_hooks()
+
+    logger.info(
+        "Kernel JIT monitor activated; monitored JIT compilations during "
+        "inference will use mode=%s.",
+        mode,
+    )
+
+
+def _install_jit_hooks() -> None:
+    """Install the compile hooks (idempotent; they report via _handle_jit_event)."""
     _setup_triton_jit_hook()
     _setup_cutedsl_jit_hook()
 
@@ -81,11 +96,61 @@ def activate(*, mode: JitMonitorMode = "warn", verbose: bool = False) -> None:
     if not current_platform.is_rocm():
         _setup_tilelang_jit_hook()
 
-    logger.info(
-        "Kernel JIT monitor activated; monitored JIT compilations during "
-        "inference will use mode=%s.",
-        mode,
-    )
+
+def _triton_jit_functions() -> list[Any]:
+    """Every live Triton ``JITFunction`` (gc scan; startup verification only)."""
+    if not HAS_TRITON:
+        return []
+    import gc
+
+    from triton.runtime.jit import JITFunction
+
+    return [obj for obj in gc.get_objects() if isinstance(obj, JITFunction)]
+
+
+def _triton_compiled_variants(fns: list[Any]) -> dict[int, int]:
+    """Number of compiled specializations held by each JITFunction (by id)."""
+    counts: dict[int, int] = {}
+    for fn in fns:
+        total = 0
+        for entry in getattr(fn, "device_caches", {}).values():
+            kernel_cache = entry[0] if isinstance(entry, tuple) else entry
+            with suppress(TypeError):
+                total += len(kernel_cache)
+        counts[id(fn)] = total
+    return counts
+
+
+@contextlib.contextmanager
+def record_jit_events() -> Iterator[list[str]]:
+    """Collect every monitored JIT compilation in this block.
+
+    Yields a list that receives one ``"<backend>: <kernel>"`` entry per
+    compile event (Triton, CuTeDSL, TileLang hooks), plus one entry per Triton
+    ``JITFunction`` whose in-memory compiled-variant count grew in the block
+    (catches compiles that bypass ``jit_post_compile_hook``). Events are
+    recorded instead of warned or raised. Used by the startup warmup
+    verification, which turns any entry into a startup error.
+    """
+    global _recorded_events
+    if _recorded_events is not None:
+        raise RuntimeError("record_jit_events() does not nest.")
+    _install_jit_hooks()
+    fns = _triton_jit_functions()
+    before = _triton_compiled_variants(fns)
+    events: list[str] = []
+    _recorded_events = events
+    try:
+        yield events
+    finally:
+        _recorded_events = None
+        after = _triton_compiled_variants(fns)
+        hooked = {event.split(": ", 1)[-1].split(" ", 1)[0] for event in events}
+        for fn in fns:
+            grew = after.get(id(fn), 0) - before.get(id(fn), 0)
+            name = getattr(fn, "__name__", None) or getattr(fn, "name", "<unknown>")
+            if grew > 0 and name not in hooked:
+                events.append(f"Triton (cache): {name} +{grew}")
 
 
 # ------------------------------------------------------------------
@@ -122,6 +187,15 @@ def _handle_jit_event(
     fn_name: str,
     detail: str | None = None,
 ) -> None:
+    if _recorded_events is not None:
+        _recorded_events.append(
+            f"{backend}: {fn_name}" + (f" ({detail})" if detail else "")
+        )
+        return
+    if not _active:
+        # Hooks installed by record_jit_events() before activate(): startup
+        # compiles (warmup, CUDA graph capture) are expected.
+        return
     message = (
         "%s %s during inference: %s%s. "
         "This causes a latency spike; consider extending warmup "
@@ -133,11 +207,19 @@ def _handle_jit_event(
     if _mode == "error":
         raise RuntimeError(message % args)
 
-    if _verbose:
-        logger.warning(message, *args)
-        return
+    # Every post-warmup compile is an ERROR line with a fixed tag that the e2e
+    # health checks grep for (JIT_AFTER_WARMUP); a run that has one did not
+    # measure the steady state.
+    logger.error("JIT_AFTER_WARMUP " + message, *args)
 
-    logger.warning_once(message, *args)
+
+def report_compile(backend: str, fn_name: str, detail: str | None = None) -> None:
+    """Report a compile from a runtime without a hook here (e.g. torch.compile
+    graphs): recorded under ``record_jit_events``, reported after
+    ``activate()``, ignored during startup."""
+    _handle_jit_event(
+        backend=backend, event="compilation", fn_name=fn_name, detail=detail
+    )
 
 
 def _safe_repr(value: object, *, max_len: int = 120) -> str:
@@ -226,7 +308,11 @@ def _format_verbose_triton_compile_details(kwargs: Mapping[str, object]) -> str:
 
 
 def _log_triton_jit_compile(fn_name: str, kwargs) -> None:
-    detail = _format_verbose_triton_compile_details(kwargs) if _verbose else None
+    detail = (
+        _format_verbose_triton_compile_details(kwargs)
+        if _verbose or _recorded_events is not None
+        else None
+    )
     _handle_jit_event(
         backend="Triton",
         event="kernel JIT compilation",
@@ -237,7 +323,8 @@ def _log_triton_jit_compile(fn_name: str, kwargs) -> None:
 
 def _setup_triton_jit_hook() -> None:
     """Register a jit_post_compile_hook that warns on compilation."""
-    if not HAS_TRITON:
+    global _triton_hook_installed
+    if not HAS_TRITON or _triton_hook_installed:
         return
     from triton import knobs
     from triton.runtime import jit as _triton_jit
@@ -273,6 +360,7 @@ def _setup_triton_jit_hook() -> None:
         return None
 
     knobs.runtime.jit_post_compile_hook = _on_jit_compile
+    _triton_hook_installed = True
 
 
 # ------------------------------------------------------------------

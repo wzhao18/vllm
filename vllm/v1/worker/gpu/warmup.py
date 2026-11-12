@@ -11,6 +11,7 @@ import torch
 from vllm import PoolingParams, SamplingParams
 from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
+from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -496,3 +497,352 @@ def _warmup_kernels(
     # Block 0 (the null block) included.
     _zero_warmup_blocks(model_runner, max(next_block_id, 1))
     torch.accelerator.synchronize()
+
+
+# ---------------------------------------------------------------------------
+# Serving-shape warmup and its startup verification
+# ---------------------------------------------------------------------------
+#
+# The steps above warm short prompts and decode batches. A serving step also
+# mixes full-budget prompt chunks with spec-decode rows: a chunk long enough
+# for sparse-attention top-k, a continuation chunk over a long context, a
+# prefix-cache hit (or P/D KV load) whose few new tokens attend a long context,
+# per-request sampling mixes, and, under DP, ranks that pad to each other's
+# token counts. Those steps take paths (DCP collectives beyond the direct
+# workspace, top-k candidate packing, RecoverSSM commit with request indices,
+# FP32-logit sampling, ...) that first JIT-compile in the serving loop and
+# stall it for a minute. These steps run them at startup through the real
+# step path, and a last step with different shapes verifies that nothing
+# compiles any more.
+
+
+def _serving_sampling_params() -> tuple[SamplingParams, ...]:
+    """Per-request sampling mixes of a serving step (round-robin)."""
+    common = dict(max_tokens=64, watermarking=False)
+    return (
+        # Greedy: model-dtype logits, no fused sampler for the batch.
+        SamplingParams(temperature=0.0, **common),
+        # Logits processing: FP32 logits into the Gumbel sampler.
+        SamplingParams(
+            temperature=0.8,
+            repetition_penalty=1.1,
+            frequency_penalty=0.1,
+            **common,
+        ),
+        # Temperature only: model-dtype logits, temperature in the sampler.
+        SamplingParams(temperature=0.8, **common),
+        # Top-k / top-p.
+        SamplingParams(temperature=0.8, top_p=0.95, top_k=50, **common),
+    )
+
+
+def _serving_step_shapes(
+    model_runner: GPUModelRunner, variant: int
+) -> tuple[int, int, int, int, int] | None:
+    """(decode requests, first chunk, second chunk, cache-hit context, cache-hit
+    new tokens) of serving-shape step set ``variant``.
+
+    Variant 0 fills the token budget with the same shapes on every rank;
+    later variants shrink the decode batch and chunks by rank-dependent odd
+    amounts, so DP ranks pad to each other's token counts and alignments,
+    batch-size buckets and row counts differ from variant 0.
+    """
+    budget = model_runner.scheduler_config.max_num_batched_tokens
+    query_len = model_runner.decode_query_len
+    max_model_len = model_runner.max_model_len
+    lookahead = model_runner.vllm_config.num_lookahead_tokens
+    dp_rank = model_runner.vllm_config.parallel_config.data_parallel_rank
+    shift = 0 if variant == 0 else variant * 7 + (dp_rank % 4) * 3 + 1
+
+    # Two requests (the long prompt and the cache hit) besides the decodes.
+    num_decodes = min(model_runner.max_num_reqs - 2, (budget // 2) // query_len)
+    num_decodes -= min(num_decodes - 1, shift // 2) if num_decodes > 1 else 0
+    if num_decodes < 1:
+        return None
+    hit_new = 1 if variant == 0 else query_len + 1 + shift % 5
+    free = budget - num_decodes * query_len - hit_new
+    longest = max_model_len - lookahead - 1
+    first = min(free, longest // 2) - shift
+    second = min(free, longest - first) - 2 * shift
+    hit_context = min(first, longest - hit_new)
+    if min(first, second, hit_context) < 1:
+        return None
+    return num_decodes, first, second, hit_context, hit_new
+
+
+def run_serving_shape_warmup(
+    model_runner: GPUModelRunner,
+    worker_execute_model: Callable[[SchedulerOutput], Any],
+    worker_sample_tokens: Callable[[GrammarOutput | None], Any],
+    variant: int,
+) -> bool:
+    """Run one serving-shape step set (see ``_serving_step_shapes``).
+
+    Steps: (1) prefill the decode requests; (2) spec-decode rows + the first
+    chunk of a long prompt; (3) spec-decode rows + the prompt's last chunk
+    over the first one + a new request with a long cached context and a few
+    new tokens. Returns False when the shapes or KV blocks do not fit.
+    """
+    if (
+        model_runner.is_pooling_model
+        or model_runner.vllm_config.is_mm_encoder_only
+        or model_runner.is_encoder_decoder
+    ):
+        return False
+    shapes = _serving_step_shapes(model_runner, variant)
+    if shapes is None:
+        logger.warning(
+            "Skipping serving-shape warmup %d: the token budget (%d) or "
+            "max_model_len (%d) leaves no room for its steps.",
+            variant,
+            model_runner.scheduler_config.max_num_batched_tokens,
+            model_runner.max_model_len,
+        )
+        return False
+    num_decodes, first, second, hit_context, hit_new = shapes
+    num_spec = model_runner.num_speculative_steps
+    query_len = model_runner.decode_query_len
+    prompt_len = query_len + 1
+    decode_len = prompt_len + 2 * query_len
+    long_len = first + second
+    hit_len = hit_context + hit_new
+
+    kv_cache_specs = [
+        g.kv_cache_spec for g in model_runner.kv_cache_config.kv_cache_groups
+    ]
+    block_count = _warmup_block_counter(model_runner)
+
+    def counts(num_tokens: int) -> list[int]:
+        return [block_count(num_tokens, s) for s in kv_cache_specs]
+
+    required = (
+        num_decodes * sum(counts(decode_len))
+        + sum(counts(long_len))
+        + sum(counts(hit_len))
+    )
+    if model_runner.kv_cache_config.num_blocks <= required:
+        logger.warning(
+            "Skipping serving-shape warmup %d: %d KV blocks available for %d "
+            "required.",
+            variant,
+            model_runner.kv_cache_config.num_blocks,
+            required,
+        )
+        return False
+
+    next_block_id = 1
+
+    def alloc(num_tokens: int) -> tuple[list[int], ...]:
+        nonlocal next_block_id
+        blocks = []
+        for n in counts(num_tokens):
+            blocks.append(list(range(next_block_id, next_block_id + n)))
+            next_block_id += n
+        return tuple(blocks)
+
+    params = _serving_sampling_params()
+    vocab = model_runner.model_config.get_vocab_size()
+
+    def token_ids(n: int, seed: int) -> list[int]:
+        return [(seed * 7919 + i * 31) % (vocab - 1) + 1 for i in range(n)]
+
+    prefix = f"_serving_warmup_{variant}"
+    decode_ids = [f"{prefix}_d{i}_" for i in range(num_decodes)]
+    long_id, hit_id = f"{prefix}_long_", f"{prefix}_hit_"
+    long_tokens = token_ids(long_len, 1)
+    hit_tokens = token_ids(hit_len, 2)
+
+    def new_req(
+        req_id: str,
+        tokens: list[int],
+        sampling_params: SamplingParams,
+        num_tokens_for_blocks: int,
+        num_computed: int = 0,
+    ) -> NewRequestData:
+        return NewRequestData(
+            req_id=req_id,
+            prompt_token_ids=tokens,
+            mm_features=[],
+            sampling_params=sampling_params,
+            pooling_params=None,
+            block_ids=alloc(num_tokens_for_blocks),
+            num_computed_tokens=num_computed,
+            lora_request=None,
+            prefill_token_ids=tokens,
+        )
+
+    def output(
+        new_reqs: list[NewRequestData],
+        cached_ids: list[str],
+        cached_computed: list[int],
+        cached_outputs: list[int],
+        scheduled: dict[str, int],
+    ) -> SchedulerOutput:
+        out = SchedulerOutput.make_empty()
+        out.num_spec_tokens_to_schedule = num_spec
+        out.scheduled_new_reqs = new_reqs
+        cached = CachedRequestData.make_empty()
+        cached.req_ids = cached_ids
+        cached.num_computed_tokens = cached_computed
+        cached.num_output_tokens = cached_outputs
+        cached.new_block_ids = [None] * len(cached_ids)
+        out.scheduled_cached_reqs = cached
+        out.num_scheduled_tokens = scheduled
+        if num_spec > 0:
+            out.scheduled_spec_decode_tokens = {
+                rid: [0] * num_spec for rid in cached_ids if rid in decode_ids
+            }
+        out.total_num_scheduled_tokens = sum(scheduled.values())
+        return out
+
+    # Variant 1 is homogeneous (every request processes its logits, none is
+    # greedy: FP32 logits, unfused sampling); the others mix all four.
+    if variant == 1:
+        params = (params[1],) * len(params)
+    rotation = variant % len(params)
+    decode_params = [
+        params[(i + rotation) % len(params)] for i in range(num_decodes)
+    ]
+    # Step 1: the decode requests' prompts (all blocks reserved up front).
+    step1 = output(
+        [
+            new_req(rid, token_ids(prompt_len, 10 + i), decode_params[i], decode_len)
+            for i, rid in enumerate(decode_ids)
+        ],
+        [],
+        [],
+        [],
+        {rid: prompt_len for rid in decode_ids},
+    )
+    decode_tokens = query_len if num_spec > 0 else 1
+    # Step 2: spec-decode rows + the long prompt's first chunk.
+    step2_sched = {rid: decode_tokens for rid in decode_ids}
+    step2_sched[long_id] = first
+    step2 = output(
+        [new_req(long_id, long_tokens, params[(1 + rotation) % len(params)], long_len)],
+        list(decode_ids),
+        [prompt_len] * num_decodes,
+        [1] * num_decodes,
+        step2_sched,
+    )
+    # Step 3: spec-decode rows + the long prompt's last chunk over its first
+    # chunk + a cache hit (long context, few new tokens).
+    step3_sched = {rid: decode_tokens for rid in decode_ids}
+    step3_sched[long_id] = second
+    step3_sched[hit_id] = hit_new
+    step3 = output(
+        [
+            new_req(
+                hit_id,
+                hit_tokens,
+                params[(2 + rotation) % len(params)],
+                hit_len,
+                num_computed=hit_context,
+            )
+        ],
+        [*decode_ids, long_id],
+        [prompt_len + decode_tokens] * num_decodes + [first],
+        [2] * num_decodes + [0],
+        step3_sched,
+    )
+    cleanup = SchedulerOutput.make_empty()
+    cleanup.finished_req_ids = {*decode_ids, long_id, hit_id}
+
+    logger.info(
+        "Serving-shape warmup %d: %d spec-decode rows x %d tokens, prompt "
+        "chunks %d + %d, cache hit %d + %d tokens.",
+        variant,
+        num_decodes,
+        decode_tokens,
+        first,
+        second,
+        hit_context,
+        hit_new,
+    )
+    model_runner.kv_connector.set_disabled(True)
+    try:
+        for step in (step1, step2, step3):
+            worker_execute_model(step)
+            worker_sample_tokens(None)
+        worker_execute_model(cleanup)
+    finally:
+        model_runner.kv_connector.set_disabled(False)
+    _zero_warmup_blocks(model_runner, next_block_id)
+    torch.accelerator.synchronize()
+    return True
+
+
+# Serving-shape step sets run to compile; the next one verifies.
+NUM_SERVING_WARMUP_VARIANTS = 2
+
+
+class JitWarmupGapError(RuntimeError):
+    """A kernel compiled in the serving-shape verification step after warmup."""
+
+
+@torch.inference_mode()
+def serving_shape_warmup_kernels(
+    model_runner: GPUModelRunner,
+    worker_execute_model: Callable[[SchedulerOutput], Any],
+    worker_sample_tokens: Callable[[GrammarOutput | None], Any],
+) -> None:
+    """``serving_shape_warmup`` with fixed draft counts (as ``warmup_kernels``:
+    adaptive verification is calibrated during capture, after this)."""
+    if not current_platform.is_cuda_alike():
+        return
+    adaptive_verification = model_runner.adaptive_verification
+    model_runner.adaptive_verification = None
+    rejection_sampler = model_runner.rejection_sampler
+    adaptive_sampling = (
+        rejection_sampler is not None and rejection_sampler.enable_adaptive_verification
+    )
+    if adaptive_sampling:
+        assert rejection_sampler is not None
+        rejection_sampler.enable_adaptive_verification = False
+    try:
+        serving_shape_warmup(model_runner, worker_execute_model, worker_sample_tokens)
+    finally:
+        model_runner.adaptive_verification = adaptive_verification
+        if adaptive_sampling:
+            assert rejection_sampler is not None
+            rejection_sampler.enable_adaptive_verification = True
+
+
+def serving_shape_warmup(
+    model_runner: GPUModelRunner,
+    worker_execute_model: Callable[[SchedulerOutput], Any],
+    worker_sample_tokens: Callable[[GrammarOutput | None], Any],
+) -> None:
+    """Compile what serving steps launch, then verify with new shapes.
+
+    The verification step set (rank-dependent shapes that no warmup step
+    used) runs with the JIT recorder; any Triton / CuTe DSL / TileLang
+    compile in it means a serving step would compile too, which stalls the
+    serving loop, so startup fails with the kernel names.
+    """
+    from vllm.utils import jit_monitor
+
+    for variant in range(NUM_SERVING_WARMUP_VARIANTS):
+        run_serving_shape_warmup(
+            model_runner, worker_execute_model, worker_sample_tokens, variant
+        )
+    with jit_monitor.record_jit_events() as events:
+        verified = run_serving_shape_warmup(
+            model_runner,
+            worker_execute_model,
+            worker_sample_tokens,
+            NUM_SERVING_WARMUP_VARIANTS,
+        )
+    if events:
+        for event in events:
+            logger.error("JIT_WARMUP_GAP %s", event)
+        raise JitWarmupGapError(
+            "JIT_WARMUP_GAP: kernels compiled in the serving-shape verification "
+            f"step after warmup ({len(events)}): {sorted(set(events))}. A "
+            "serving step would compile them too; extend warmup to cover them."
+        )
+    if verified:
+        logger.info(
+            "JIT_WARMUP_VERIFIED: no kernel compiled in the serving-shape "
+            "verification step."
+        )
