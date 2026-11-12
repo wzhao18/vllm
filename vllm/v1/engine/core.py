@@ -1229,7 +1229,16 @@ class EngineCore:
             # grammar compilation is async. Scheduler always checks grammar
             # compilation status before scheduling request.
             self.structured_output_manager.grammar_init(req)
+        # Let the KV connector start per-request work (e.g. its cache lookup)
+        # while the busy loop waits on the running step; see
+        # KVConnectorBase_V1.on_request_arrival for the threading contract.
+        if (connector := self.scheduler.get_kv_connector()) is not None:
+            connector.on_request_arrival(req)
         return req, request.current_wave
+
+    def _kv_connector_arrival_handled(self, request: Request) -> None:
+        if (connector := self.scheduler.get_kv_connector()) is not None:
+            connector.on_request_arrival_handled(request)
 
     def _eep_scale_up_before_kv_init(self):
         raise NotImplementedError
@@ -1853,9 +1862,14 @@ class EngineCoreProc(EngineCore):
             return
         elif request_type == EngineCoreRequestType.ADD:
             req, request_wave = request
-            if self._reject_add_in_shutdown(req) or self._reject_add_while_paused(req):
-                return
-            self.add_request(req, request_wave)
+            try:
+                if self._reject_add_in_shutdown(req) or self._reject_add_while_paused(
+                    req
+                ):
+                    return
+                self.add_request(req, request_wave)
+            finally:
+                self._kv_connector_arrival_handled(req)
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
         elif request_type == EngineCoreRequestType.UTILITY:

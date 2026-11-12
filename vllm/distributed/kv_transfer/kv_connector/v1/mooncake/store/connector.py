@@ -234,6 +234,18 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
     # Scheduler-side methods
     # ============================================================
 
+    def on_request_arrival(self, request: Request) -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.on_request_arrival(request)
+
+    def on_new_request(self, request: Request) -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.on_new_request(request)
+
+    def on_request_arrival_handled(self, request: Request) -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.on_request_arrival_handled(request)
+
     def get_num_new_matched_tokens(
         self,
         request: Request,

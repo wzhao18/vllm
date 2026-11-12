@@ -415,7 +415,10 @@ class InprocClient(EngineCoreClient):
 
     def add_request(self, request: EngineCoreRequest) -> None:
         req, request_wave = self.engine_core.preprocess_add_request(request)
-        self.engine_core.add_request(req, request_wave)
+        try:
+            self.engine_core.add_request(req, request_wave)
+        finally:
+            self.engine_core._kv_connector_arrival_handled(req)
 
     def abort_requests(self, request_ids: list[str]) -> None:
         if len(request_ids) > 0:

@@ -3648,7 +3648,13 @@ class Scheduler(SchedulerInterface):
             )
             return True
 
-        if self.connector.reset_cache() is False:
+        reset_ok = self.connector.reset_cache()
+        # A connector reset may drop kept lookups (Mooncake store drops all of
+        # them, even when the reset RPC fails): restart the bounded lookup wait
+        # of every waiting request from its next, fresh lookup.
+        self._connector_lookup_pending_since.clear()
+        self._connector_lookup_timed_out.clear()
+        if reset_ok is False:
             return False
 
         if self.log_stats:
