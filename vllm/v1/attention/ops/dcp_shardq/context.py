@@ -835,7 +835,10 @@ def register_warmup(layout: ContextLayout, world: int, num_topk_tokens: int) -> 
     # gather imports cutlass, so import it only on the SM100 path.
     from vllm.v1.attention.ops.dcp_shardq.gather import DCP_CONTEXT_PUSH_KERNEL
 
-    from vllm.v1.attention.ops.dcp_shardq.rank_major import RANK_MAJOR_PACK_KERNEL
+    from vllm.v1.attention.ops.dcp_shardq.rank_major import (
+        RANK_MAJOR_PACK_KERNEL,
+        RANK_MAJOR_SIGNAL_KERNEL,
+    )
 
     DCP_CONTEXT_PUSH_KERNEL.register_warmup(
         world=world,
@@ -844,6 +847,7 @@ def register_warmup(layout: ContextLayout, world: int, num_topk_tokens: int) -> 
         index_scale_bytes=layout.index_scale_bytes,
     )
     RANK_MAJOR_PACK_KERNEL.register_warmup(row_bytes=layout.mla_row_bytes, world=world)
+    RANK_MAJOR_SIGNAL_KERNEL.register_warmup(world=world)
     _GATHERED_CONTEXT_INDEX_REMAP.register_warmup(
         num_topk_tokens=num_topk_tokens,
         world=world,
