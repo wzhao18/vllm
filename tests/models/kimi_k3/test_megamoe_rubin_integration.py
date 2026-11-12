@@ -308,6 +308,7 @@ def test_shared_overlap_sm_cap_admits_every_server_bucket(world, tokens):
     )
     X.KimiK3MegaMoEExperts.reserve_sms_for_shared_expert(module)
     capped = module.bucket
+    assert module.sequence_parallel  # forward gets 1/TP shards (ep_tokens)
     # every compiled bucket (the decode bucket included) is capped
     assert len(module.buckets) == len(buckets)
     assert all(
@@ -464,9 +465,13 @@ class _FakeRuntime:
             layer_id=layer_id, expert_offset=4,
         )  # fmt: skip
 
-    def forward(self, hidden, ids, weights, kernel_weights, *, bucket, is_padding=None):
+    def forward(
+        self, hidden, ids, weights, kernel_weights, *, bucket, is_padding=None,
+        ep_tokens=None,
+    ):  # fmt: skip
         if is_padding is not None:  # the stager's folded padding mask
             ids = torch.where(is_padding.unsqueeze(1), -1, ids)
+        assert ep_tokens == hidden.shape[0]  # DP1: the rank's own (EP-uniform) count
         self.calls.append((ids.clone(), weights, kernel_weights, bucket))
         return torch.zeros(hidden.shape[0], hidden.shape[1], dtype=torch.bfloat16)
 
@@ -543,6 +548,30 @@ def test_bucket_selection_is_ep_uniform(monkeypatch, ep, small_bucket):
     assert module.select_bucket(52) is large
     with pytest.raises(ValueError, match="sized for"):
         module.select_bucket(4097)
+
+
+def test_ep_tokens_is_the_ep_mean(monkeypatch, ep, small_bucket):
+    """ep_tokens (the S2 epilogue choice) is EP-uniform: the rank's own count at DP1,
+    else the EP mean of the DP batch sizes, sharded 1/TP under sequence parallelism
+    (reserve_sms_for_shared_expert), None without DP metadata; once per forward."""
+    ep.world_size, ep.rank_in_group = 2, 1
+    assert _experts(_vllm_config(), ep=ep, **SMALL).ep_tokens(37) == 37
+    module = _experts(_vllm_config(dp=4), ep=ep, max_num_tokens=4096, **SMALL)
+    ctx = SimpleNamespace(dp_metadata=None)
+    monkeypatch.setattr(X, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(X, "get_forward_context", lambda: ctx)
+    assert module.ep_tokens(52) is None
+    ctx.dp_metadata = SimpleNamespace(
+        num_tokens_across_dp_cpu=torch.tensor([17400, 17400, 17000, 17801])
+    )
+    assert module.ep_tokens(17000) == 17401  # not sequence parallel: the DP mean
+    module.sequence_parallel = True
+    monkeypatch.setattr(X, "get_tensor_model_parallel_world_size", lambda: 4)
+    # shards 4350 / 4350 / 4250 / 4451 -> mean 4350.25 -> 4351, on every rank
+    ctx.dp_metadata = SimpleNamespace(
+        num_tokens_across_dp_cpu=ctx.dp_metadata.num_tokens_across_dp_cpu.clone()
+    )
+    assert module.ep_tokens(4250) == module.ep_tokens(4451) == 4351
 
 
 def test_dp_uniform_check_runs_once_per_forward(monkeypatch, ep, small_bucket):

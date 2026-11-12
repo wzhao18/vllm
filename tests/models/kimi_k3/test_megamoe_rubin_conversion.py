@@ -14,6 +14,8 @@
   source file) and the bench capacity selection;
 - checkpoint expert-key parsing (``weight_packed`` / ``weight_scale``);
 - compiled-kernel / output-binding cache keys and the arena layout tag;
+- the S2 epilogue dispatch policy (capped grids only, per-launch crossover, shared
+  workspace layout) and the EP-mean live token count;
 - rejection of out-of-range expert ids (only -1 masks) in the torch staging twin;
 - power-of-two NVFP4 norm constants from activation amax;
 - the vendored kernel tree still matches the VENDOR.md sha256 manifest.
@@ -681,6 +683,92 @@ def test_cache_keys_and_layout_tag():
     strided = torch.empty(16, 8, dtype=torch.bfloat16).t()  # same shape, other stride
     assert S.output_binding_key(strided)[1] == key[1]
     assert S.output_binding_key(strided)[2] != key[2]
+
+
+def test_s2_epilogue_dispatch_policy(monkeypatch):
+    """S2 only on capped (shared-overlap) grids, per launch up to the crossover; both
+    variants of one session must share the workspace layout; the EP-mean token count
+    follows sequence_parallel_chunk's ceil(n / sp) shards."""
+    from types import SimpleNamespace
+
+    S = _load("session")
+    x = S.S2_MAX_TOKENS_PER_RANK
+
+    class _Ws:
+        def __init__(self, extra=0):
+            self.extra = extra
+
+        def total_bytes(self, space):
+            return 1024 + self.extra
+
+        def regions(self, space):
+            return (SimpleNamespace(name="r", reset="data", dtype="i32"),)
+
+        def offset(self, name):
+            return 0
+
+        def nbytes(self, name):
+            return 64 + self.extra
+
+    built = []
+
+    def fake_build(cfg, epilogue_warpgroups=None, *, eligible=True, ws_extra=0):
+        wg = epilogue_warpgroups or (2 if eligible else 1)
+        built.append(epilogue_warpgroups)
+        return SimpleNamespace(
+            epilogue_warpgroups=wg,
+            _device_workspace=_Ws(ws_extra if wg == 1 else 0),
+        )
+
+    def cfg(cap, sm=148, variant="inference"):
+        return SimpleNamespace(
+            kernel_variant=variant, max_sm_count=sm, max_tokens_per_rank=cap
+        )
+
+    monkeypatch.setattr(S, "build_kernel", fake_build)
+    # uncapped: stock epilogue only, requested explicitly
+    built.clear()
+    ks = S.build_kernels(cfg(8192, sm=None))
+    assert set(ks) == {False} and built == [1]
+    # genphase: the kernel's own single epilogue
+    assert set(S.build_kernels(cfg(1024, variant="genphase"))) == {False}
+    # capped, capacity above the crossover: both variants
+    built.clear()
+    ks = S.build_kernels(cfg(8192))
+    assert set(ks) == {True, False} and built == [None, 1]
+    assert ks[True].epilogue_warpgroups == 2 and ks[False].epilogue_warpgroups == 1
+    # capped, capacity within the S2 range: S2 only
+    assert set(S.build_kernels(cfg(x))) == {True}
+    # capped but not S2-eligible (e.g. a 2048 decode bucket): stock only
+    monkeypatch.setattr(
+        S, "build_kernel", lambda c, w=None: fake_build(c, w, eligible=False)
+    )
+    assert set(S.build_kernels(cfg(2048))) == {False}
+    # variants whose workspace layouts differ must not share a session
+    monkeypatch.setattr(
+        S, "build_kernel", lambda c, w=None: fake_build(c, w, ws_extra=128)
+    )
+    with pytest.raises(RuntimeError, match="workspace layout"):
+        S.build_kernels(cfg(8192))
+
+    def use_s2(kernels, cap, tokens):
+        sess = SimpleNamespace(kernels=kernels, cfg=cfg(cap))
+        return S.RubinMegaMoeSession.use_s2(sess, tokens)
+
+    both = {True: object(), False: object()}
+    assert use_s2(both, 8192, 0) and use_s2(both, 8192, x)
+    assert not use_s2(both, 8192, x + 1) and not use_s2(both, 8192, 8192)
+    assert not use_s2(both, 8192, None)  # None = the capacity
+    assert use_s2({True: object()}, x, None)
+    assert not use_s2({False: object()}, 8192, 0)
+
+    t = torch.tensor
+    assert S.ep_mean_tokens(t([17400, 17400, 17400, 17400]), 4) == 4350
+    assert S.ep_mean_tokens(t([32766] * 4), 4) == 8192  # ceil(32766 / 4) per shard
+    assert S.ep_mean_tokens(t([1, 0, 0, 0]), 4) == 1  # rounded up
+    assert S.ep_mean_tokens(t([100, 300]), 1) == 200
+    with pytest.raises(ValueError):
+        S.ep_mean_tokens(t([1]), 0)
 
 
 def test_out_of_range_expert_ids_rejected():

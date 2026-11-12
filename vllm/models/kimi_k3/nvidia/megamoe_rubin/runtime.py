@@ -12,7 +12,8 @@ Lock-step contract (deadlock otherwise): every EP rank must call :meth:`forward`
 the SAME bucket, in the same order, the same number of times (barrier state persists
 in the workspace). Choose the bucket from an EP-uniform token count (the
 DP-synchronized max / CUDA graph padded size), never the local count; ranks with no
-tokens still call.
+tokens still call. The same holds for ``ep_tokens`` (the epilogue variant of a session
+that compiled two, ``session.RubinMegaMoeSession.use_s2``).
 
 Expert ids are GLOBAL PHYSICAL ids over ``problem.num_experts`` (the physical expert
 count, after any EPLB logical-to-physical mapping) with linear placement: id ``g``
@@ -240,8 +241,8 @@ class RubinMegaMoE:
            live row whose routes are all -1, staged locally (no kernel launch).
         2. Self-tests the route-id error path: one row routed to id ``num_experts``
            must set the device flag (raises otherwise), which is then cleared.
-        3. Compiles + binds every bucket and launches it once with no routed token
-           (all ids -1), then checks the route-id flag.
+        3. Compiles + binds every bucket (each epilogue variant of it) and launches it
+           once with no routed token (all ids -1), then checks the route-id flag.
         """
         ensure_not_capturing("RubinMegaMoE warmup")
         p = self.problem
@@ -269,7 +270,12 @@ class RubinMegaMoE:
         ids = torch.empty((0, p.top_k), dtype=torch.int32, device=dev)
         wts = torch.empty((0, p.top_k), dtype=torch.float32, device=dev)
         for b in self.buckets:
-            self.forward(empty, ids, wts, weights, bucket=b)
+            # ep_tokens 0 selects a session's S2 variant, the capacity its stock one.
+            for use_s2 in sorted(self.sessions[b].kernels):
+                ep_tokens = 0 if use_s2 else b.max_tokens
+                self.forward(
+                    empty, ids, wts, weights, bucket=b, ep_tokens=ep_tokens
+                )
         group_barrier(self.group)
         self.check_route_errors()
 
@@ -283,6 +289,7 @@ class RubinMegaMoE:
         bucket: RubinBucket,
         out: torch.Tensor | None = None,
         is_padding: torch.Tensor | None = None,
+        ep_tokens: int | None = None,
     ) -> torch.Tensor:
         """``out[:n] = sum_k topk_weights[:, k] * expert_{topk_ids[:, k]}(hidden)``.
 
@@ -293,6 +300,8 @@ class RubinMegaMoE:
         ``is_padding`` optional bool (n,): rows whose routes are masked to -1 in the
         stager (as ``torch.where(is_padding[:, None], -1, topk_ids)``). Output
         BF16. Both the staging and the kernel run on the current stream.
+        ``ep_tokens``: the EP-uniform live tokens per rank that pick the bucket's
+        epilogue variant (None: the capacity); same value on every EP rank.
         """
         session = self.sessions.get(bucket)
         if session is None:
@@ -305,7 +314,7 @@ class RubinMegaMoE:
         self._stage(session, hidden, topk_ids, topk_weights, is_padding)
         if n == 0:
             # Every rank launches (lock step); the reduce writes the scratch row only.
-            session.launch(weights, session.empty_output)
+            session.launch(weights, session.empty_output, ep_tokens)
             result = hidden.new_empty((0, self.problem.hidden))
         else:
             if out is None:
@@ -317,7 +326,7 @@ class RubinMegaMoE:
             elif out.shape[0] < n:
                 raise ValueError("out has fewer rows than tokens.")
             result = out[:n]
-            session.launch(weights, result)
+            session.launch(weights, result, ep_tokens)
         self.poll_route_errors()
         return result
 

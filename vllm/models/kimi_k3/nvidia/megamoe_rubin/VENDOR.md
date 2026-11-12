@@ -58,10 +58,19 @@
     (epi_flag_batches forced to (1, 1): a warpgroup must not hold a flag while it waits for a
     later stage that the other warpgroup's flags gate). Registers: epilogue 184, others
     64/72 (512 threads).
-  - When (automatic, trace-time, no knob/env): inference kernel, epi_warps token-back,
-    2CTA, tile N 128 or 256, and `max_tokens_per_rank * topk > 2048 * 16`. Every other
-    launch (decode buckets, C256 2048 bucket, genphase) traces the stock code; the kernel
-    name gains `_epiwg{1,2}`.
+  - Eligible launches: inference kernel, epi_warps token-back, 2CTA, tile N 128 or 256,
+    and `max_tokens_per_rank * topk > 2048 * 16` (`s2_eligible()`). Every other launch
+    (decode buckets, C256 2048 bucket, genphase) traces the stock code; the kernel name
+    gains `_epiwg{1,2}`. The optional impl field `epilogue_warpgroups` (1 or 2; absent =
+    2 where eligible) lets the caller trace the stock epilogue on an eligible launch.
+  - When (automatic, no knob/env; `session.py` `build_kernels` / `use_s2`): S2 only on a
+    capped grid (`max_sm_count`, the SP shared-expert overlap) and only up to
+    `S2_MAX_TOKENS_PER_RANK` EP-mean live tokens per rank; above it, and on every uncapped
+    grid, the stock epilogue. A capped session whose capacity exceeds the crossover
+    compiles both variants of the same config; they share the carved workspace (layout
+    asserted equal), the cross-rank protocol and the per-tile math, so a launch may pick
+    either. Measured at real EP16: S2 is slower on the full grid at every point and slower
+    on the capped grid above the crossover (see `session.py`).
   - Outputs are bit-identical (same per-tile math and top-k reduction order; checked by an
     output fingerprint on every A/B point in `$W/hti/p2/megamoe-prefill`).
 
@@ -130,7 +139,7 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/kernel
 6355b04c8672b40e96d2ae1a3309650e1e06eadaf3172e3ccaf2a2b51a88f740  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_extension.py
 ed192f39cce199441a3116869898f0c1c275aeb0ac5218d809b8d3f0b68be7ed  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop.py
 e7f3aa713f90170f3f2c4b616af7a338ee4cb3cdef34621cb21e6ad8a90aabf6  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop_gen_specialized.py
-79b209e7611cb80603a79ea159ac0bc85ba7c020dcc47c19af4eafccdb3efedc  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py
+094c99b444a3f0c5405eeda8eaad10dd4725f12d0bf4eeadb8b4336e2cbca4f5  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py
 292cd6c6d62b9d6cb7a15e0f43363756941124a645c34be6947b5542282c3ee5  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py
 d85b41f1f605c8ce4ae97696e4c8aad5f02eb95412eb42e20d0cfca2dcc4e54a  sources/kernel_src/rubin/inference/mega/dynamic_mainloop.py
 0fbc10e05282241250de08ccfaebd533076f29abdd3bb949c063cf80daf54496  sources/kernel_src/rubin/inference/mega/tma_gather.py

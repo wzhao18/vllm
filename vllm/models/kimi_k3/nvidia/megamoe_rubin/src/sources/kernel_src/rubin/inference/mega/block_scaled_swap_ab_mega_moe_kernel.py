@@ -111,6 +111,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             "token_in_flag_batch": int,
             "token_back_mode": str,
             "reduce_topk_in_kernel": bool,
+            # vLLM S2: 1 or 2 epilogue warpgroups; None (absent) = 2 wherever S2 is eligible.
+            "epilogue_warpgroups": OptionalRequirement(Optional[int]),
         }
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
@@ -159,7 +161,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.occupancy = 1
         self.architecture = "sm_107"
         self.local_expert_count = self.expert_count // self.world_size
-        self.epilogue_warpgroups = self._select_epilogue_warpgroups()
+        self.epilogue_warpgroups = self._select_epilogue_warpgroups(impl_desc.get("epilogue_warpgroups"))
         if self.epilogue_warpgroups == 2:
             # One flag per tile: a warpgroup must not hold a done flag while it waits for a later
             # accumulator stage that the other warpgroup's flags gate (batching measured +-1%).
@@ -389,13 +391,28 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             if self.use_2cta_instrs and fallback_cluster_m % 2 != 0:
                 raise ValueError("Two-CTA MMA requires an even fallback cluster M.")
 
-    def _select_epilogue_warpgroups(self) -> int:
-        """S2: 2 epilogue warpgroups on prefill-scale N=128/256 2CTA epi_warps launches, else the stock 1."""
-        if not isinstance(self.max_tokens_per_rank, int) or self.token_back_mode != "epi_warps":
-            return 1
-        if self.mma_tiler_mnk[1] not in (128, 256) or not self.use_2cta_instrs:
-            return 1
-        if self.max_tokens_per_rank * self.topk <= self.two_warpgroup_epilogue_min_routes:
+    def s2_eligible(self) -> bool:
+        """S2 needs N=128/256 2CTA epi_warps launches above two_warpgroup_epilogue_min_routes."""
+        return (
+            isinstance(self.max_tokens_per_rank, int)
+            and self.token_back_mode == "epi_warps"
+            and self.mma_tiler_mnk[1] in (128, 256)
+            and self.use_2cta_instrs
+            and self.max_tokens_per_rank * self.topk > self.two_warpgroup_epilogue_min_routes
+        )
+
+    def _select_epilogue_warpgroups(self, requested: Optional[int]) -> int:
+        """S2: 2 epilogue warpgroups where eligible (or as requested), else the stock 1.
+
+        The caller may request the stock epilogue (1) on an eligible launch: both variants
+        share the device workspace layout, the cross-rank protocol and the per-tile math.
+        """
+        if requested not in (None, 1, 2):
+            raise ValueError(f"epilogue_warpgroups must be 1 or 2, got {requested}.")
+        eligible = self.s2_eligible()
+        if requested == 2 and not eligible:
+            raise ValueError("two epilogue warpgroups need an S2-eligible launch.")
+        if requested == 1 or not eligible:
             return 1
         return 2
 
