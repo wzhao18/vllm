@@ -9,6 +9,10 @@ import torch.nn as nn
 
 import vllm._custom_ops as ops
 from vllm.config import VllmConfig
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -27,6 +31,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.models.common.ops.fused_allreduce_rms_norm import fused_allreduce_rms_norm
+from vllm.models.common.ops.sequence_parallel import sp_all_gather
 from vllm.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
 from vllm.models.kimi_k3.nvidia.model import KimiMLP
 from vllm.v1.kv_cache_interface import is_quantized_kv_cache
@@ -37,6 +42,47 @@ logger = init_logger(__name__)
 _GROUPED_KV_CACHE_DTYPES = frozenset(
     {"auto", "bfloat16", "fp8", "fp8_e4m3", "fp8_e5m2"}
 )
+
+# The eager context step shards its rows over the TP group (each rank combines
+# 1/tp of the rows, then one all-gather of the [rows, hidden] result) from this
+# many rows per rank. At 256 rows per rank the replicated context_proj GEMM
+# (rows x 35840 x 7168) costs (tp - 1) x ~36 us more than the shard, while the
+# all-gather of 256 x tp x 7168 bf16 rows is ~25-40 us (VR200 NVLink).
+_CONTEXT_ROW_SHARD_MIN_ROWS = 256
+
+
+def _aux_rows(aux: list[torch.Tensor], start: int, end: int) -> torch.Tensor:
+    """Rows [start, end) of the target aux hidden states concatenated along the
+    hidden dim ([end - start, len(aux) * H]).
+
+    When the aux states are adjacent column blocks of one row-major buffer (the
+    sequence-parallel target gathers them packed and returns column views), this
+    is a strided view of that buffer: no copy, the GEMM reads it with a row
+    stride. Otherwise the rows are concatenated (one copy of only these rows)."""
+    h0 = aux[0]
+    width = h0.shape[-1]
+    elem = h0.element_size()
+    adjacent = (
+        h0.dim() == 2
+        and h0.stride(1) == 1
+        and h0.stride(0) >= len(aux) * width
+        and all(
+            h.dim() == 2
+            and h.dtype == h0.dtype
+            and h.shape == h0.shape
+            and h.stride() == h0.stride()
+            and h.untyped_storage().data_ptr() == h0.untyped_storage().data_ptr()
+            and h.data_ptr() == h0.data_ptr() + i * width * elem
+            for i, h in enumerate(aux)
+        )
+    )
+    if adjacent:
+        return h0.as_strided(
+            (end - start, len(aux) * width),
+            (h0.stride(0), 1),
+            h0.storage_offset() + start * h0.stride(0),
+        )
+    return torch.cat([h[start:end] for h in aux], dim=-1)
 
 
 def _duplicate_context_kv_weights(
@@ -221,6 +267,44 @@ class K3DSparkModel(nn.Module):
             if combined is not None:
                 return combined
         return self.context_norm(self.context_proj(hidden_states))
+
+    def combine_aux_rows(
+        self,
+        aux_hidden_states: list[torch.Tensor],
+        start: int,
+        end: int,
+        out: torch.Tensor,
+    ) -> None:
+        """Eager context step: ``out`` [end - start, hidden] =
+        context_norm(context_proj(cat(aux rows [start, end)))), the stock
+        ``combine_hidden_states`` math per row.
+
+        Every TP rank holds the same target rows and the context projection is
+        replicated, so from ``_CONTEXT_ROW_SHARD_MIN_ROWS`` rows per rank each
+        rank combines a contiguous 1/tp of the rows and the TP group all-gathers
+        the [rows, hidden] result (instead of every rank projecting every row).
+        The aux rows are read in place when the target returns them as views of
+        one packed buffer (``_aux_rows``). All TP ranks call this with the same
+        rows (the drafter step is TP-replicated)."""
+        num_rows = end - start
+        if num_rows <= 0:
+            return
+        tp = get_tensor_model_parallel_world_size()
+        if tp == 1 or num_rows < tp * _CONTEXT_ROW_SHARD_MIN_ROWS:
+            rows = _aux_rows(aux_hidden_states, start, end)
+            out.copy_(self.combine_hidden_states(rows))
+            return
+        chunk = -(-num_rows // tp)
+        lo = start + get_tensor_model_parallel_rank() * chunk
+        hi = min(end, lo + chunk)
+        local = self.context_norm(
+            self.context_proj(_aux_rows(aux_hidden_states, lo, hi))
+        )
+        if hi - lo < chunk:  # the last rank's short shard: pad to the gather size
+            padded = local.new_zeros((chunk, local.shape[-1]))
+            padded[: hi - lo].copy_(local)
+            local = padded
+        out.copy_(sp_all_gather(local)[:num_rows])
 
     @torch.inference_mode()
     def precompute_and_store_context_kv(
@@ -541,6 +625,15 @@ class K3DSparkForCausalLM(nn.Module):
 
     def combine_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.model.combine_hidden_states(hidden_states)
+
+    def combine_aux_rows(
+        self,
+        aux_hidden_states: list[torch.Tensor],
+        start: int,
+        end: int,
+        out: torch.Tensor,
+    ) -> None:
+        self.model.combine_aux_rows(aux_hidden_states, start, end, out)
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         return [layer.self_attn.layer_name for layer in self.model.layers]

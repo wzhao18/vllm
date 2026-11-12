@@ -466,6 +466,18 @@ class DFlashSpeculator(DraftModelSpeculator):
             )
         if start == num_tokens:
             return
+        combine_aux_rows = getattr(self.model, "combine_aux_rows", None)
+        if aux_hidden_states and combine_aux_rows is not None:
+            # The draft model combines the rows itself (same math as
+            # combine_hidden_states(cat(...)), e.g. without the concat copy or
+            # sharded over its TP group), writing them in place.
+            combine_aux_rows(
+                aux_hidden_states,
+                start,
+                num_tokens,
+                self.hidden_states[start:num_tokens],
+            )
+            return
         if aux_hidden_states:
             hidden_states = self.model.combine_hidden_states(
                 torch.cat([h[start:num_tokens] for h in aux_hidden_states], dim=-1)
