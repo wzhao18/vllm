@@ -543,7 +543,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         assert meta.remote is not None and self.transfer_topo is not None
         engine_id = meta.remote.engine_id
         remote_layout = self._remote_dcp_layouts[engine_id]
-        remote_info = self.transfer_topo.get_engine_info(engine_id)
+        peer = self._peer_relayouts[engine_id]
         # One attention group (`relayout_config_problem`).
         (group,) = (
             g
@@ -573,7 +573,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 end,
                 # The reads' unit: the remote kernel blocks, split to divide
                 # the local ones (`_split_remote_blocks`).
-                unit_rows=remote_info.remote_block_size,
+                unit_rows=peer.unit_rows,
+                src_kernel_block_size=peer.src_kernel_block_size,
                 src_block_ids=list(meta.remote.block_ids[group]),
                 dst_block_ids=list(meta.local_block_ids[group]),
                 staging_block_ids=meta.staging_block_ids,

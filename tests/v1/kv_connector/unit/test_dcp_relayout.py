@@ -170,7 +170,16 @@ def test_row_layouts_must_split_rows_the_same_way():
 
 # Two caches of a packed block row, e.g. MLA latent and indexer keys of one
 # layer: each region is one cache's page, strided by the whole (padded) row.
-REGION_ROWS = [TOKEN_MAJOR, SPLIT]
+# "fixed": the same 4-row kernel pages on both sides; "page": the indexer
+# keeps a whole kernel block's values before its scales, so its layout
+# changes with each side's kernel block (Kimi K3.1 P TP8 vs D TP16).
+REGION_ROWS = {
+    "fixed": lambda kernel_rows: [TOKEN_MAJOR, SPLIT],
+    "page": lambda kernel_rows: [
+        TOKEN_MAJOR,
+        KVRowLayout(kernel_rows, ((0, 8), (8 * kernel_rows, 4))),
+    ],
+}
 ROW_PADDING = 8
 
 
@@ -217,7 +226,8 @@ STAGED_CASES = [
 @pytest.mark.cpu_test
 @pytest.mark.parametrize("case", STAGED_CASES, ids=str)
 @pytest.mark.parametrize("hit", ["none", "aligned", "mid_page", "empty"])
-def test_staged_relayout_matches_direct_layout(case, hit):
+@pytest.mark.parametrize("row_layouts", list(REGION_ROWS))
+def test_staged_relayout_matches_direct_layout(case, hit, row_layouts):
     """Reads of the planned source units into the staging blocks, then
     `relayout_rows_reference`, leave every destination rank's blocks as if the
     request had been computed in the destination layout: rows past the request
@@ -229,9 +239,11 @@ def test_staged_relayout_matches_direct_layout(case, hit):
     # "empty": nothing to transfer (start == end); the tail is still zeroed.
     start = {"none": 0, "aligned": 2 * dst_n * dst_b, "mid_page": 37, "empty": 301}[hit]
     unit = math.gcd(src_kb, dst_kb)
+    src_rows = REGION_ROWS[row_layouts](src_kb)
+    dst_rows = REGION_ROWS[row_layouts](dst_kb)
     kv = [
         (_token_bytes(num_tokens, rows.bytes_per_row) + 17 * r).astype(np.uint8)
-        for r, rows in enumerate(REGION_ROWS)
+        for r, rows in enumerate(dst_rows)
     ]
     # Source pages under shuffled block ids.
     num_src_pages = cdiv(num_tokens, src_n * src_b)
@@ -239,17 +251,17 @@ def test_staged_relayout_matches_direct_layout(case, hit):
     src_pages = {
         rank: [
             _kernel_pages(src, rank, rows, kv[r], src_block_ids, src_kb)
-            for r, rows in enumerate(REGION_ROWS)
+            for r, rows in enumerate(src_rows)
         ]
         for rank in range(src_n)
     }
     # Destination cache: 200 blocks of packed, padded rows.
     dst_kernel_per_block = dst_b // dst_kb
-    page_bytes = [dst_kb * rows.bytes_per_row for rows in REGION_ROWS]
+    page_bytes = [dst_kb * rows.bytes_per_row for rows in dst_rows]
     stride = sum(page_bytes) + ROW_PADDING
     regions = [
         RelayoutRegion(sum(page_bytes[:r]), stride, dst_kb, rows)
-        for r, rows in enumerate(REGION_ROWS)
+        for r, rows in enumerate(dst_rows)
     ]
     num_staging = num_staging_blocks(src, dst, start, num_tokens)
     for dst_rank in range(dst_n):
@@ -272,24 +284,24 @@ def test_staged_relayout_matches_direct_layout(case, hit):
             start,
             num_tokens,
             unit_rows=unit,
+            src_kernel_block_size=src_kb,
             src_block_ids=src_block_ids,
             dst_block_ids=dst_block_ids,
             staging_block_ids=staging_block_ids,
             dst_kernel_block_size=dst_kb,
         )
-        # The NIXL reads: source units into staging units, region by region.
+        # The NIXL reads: source units into staging units, region by region,
+        # byte for byte (in the source's page layout).
         for rank, (src_units, staging_units) in job.reads.items():
             for u_src, u_dst in zip(src_units, staging_units):
                 kernel_block, sub = divmod(u_src, src_kb // unit)
                 dst_kernel_block, dst_sub = divmod(u_dst, dst_kb // unit)
-                for r, rows in enumerate(REGION_ROWS):
+                for r, rows in enumerate(src_rows):
                     n = unit * rows.bytes_per_row
                     data = src_pages[rank][r][kernel_block, sub * n : (sub + 1) * n]
                     at = regions[r].offset + dst_kernel_block * stride + dst_sub * n
                     buf[at : at + n] = torch.from_numpy(data.copy())
-        relayout_rows_reference(
-            buf, regions, job.src_blocks, job.src_rows, job.dst_blocks, job.dst_rows
-        )
+        relayout_rows_reference(buf, regions, src_rows, unit, job)
 
         written = torch.zeros_like(buf, dtype=torch.bool)
         for block in staging_block_ids:
@@ -303,7 +315,7 @@ def test_staged_relayout_matches_direct_layout(case, hit):
                 dst_block_ids[page - first_page] * dst_kernel_per_block
                 + r_in_page // dst_kb
             )
-            for r, rows in enumerate(REGION_ROWS):
+            for r, rows in enumerate(dst_rows):
                 col = 0
                 for off, size in rows.row_byte_ranges(r_in_page % dst_kb):
                     at = kernel_block * stride + regions[r].offset + off
@@ -335,18 +347,18 @@ def test_staged_relayout_matches_direct_layout(case, hit):
 )
 @pytest.mark.parametrize(("start", "end"), [(0, 130_000), (10240, 10241), (0, 0)])
 def test_num_staging_blocks_covers_every_rank(src, dst, start, end):
-    """A block id is a page on every rank, so staging takes the most units any
-    rank reads; every rank's plan fits in that many blocks."""
+    """A block id is a page on every rank, so staging takes the most source
+    pages any rank reads."""
     need = num_staging_blocks(src, dst, start, end)
-    unit = math.gcd(src.block_size, dst.block_size)
     most = 0
     for rank in range(dst.dcp_size):
         plan = plan_dcp_rows(src, dst, rank, start, end)
-        units = {
-            (int(s), int(r) // unit) for s, r in zip(plan.src_ranks, plan.src_rows)
+        pages = {
+            (int(s), int(r) // src.block_size)
+            for s, r in zip(plan.src_ranks, plan.src_rows)
         }
-        most = max(most, len(units))
-    assert need == cdiv(most * unit, dst.block_size)
+        most = max(most, len(pages))
+    assert need == cdiv(most * src.block_size, dst.block_size)
     if end > start:
         assert need > 0
 
@@ -374,6 +386,7 @@ def test_staged_relayout_rejects_short_staging():
             0,
             1000,
             unit_rows=8,
+            src_kernel_block_size=16,
             src_block_ids=list(range(8)),
             dst_block_ids=list(range(8)),
             staging_block_ids=[0],

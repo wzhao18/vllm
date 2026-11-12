@@ -260,7 +260,7 @@ def _reason_worker(**attrs) -> NixlConnectorWorker:
     worker.use_host_buffer = False
     worker.pcp_size = 1
     worker._mixed_mem_types = False
-    worker._get_row_gathers = lambda: []
+    worker._get_relayout_buffers = lambda: []
     for name, value in attrs.items():
         setattr(worker, name, value)
     return worker
@@ -280,7 +280,7 @@ def _raise(message: str):
         (dict(use_host_buffer=True), "host buffer"),
         (dict(pcp_size=2), "prefill context parallelism"),
         (dict(_mixed_mem_types=True), "host-resident KV caches"),
-        (dict(_get_row_gathers=_raise("no token-row layout")), "no token-row"),
+        (dict(_get_relayout_buffers=_raise("no token-row layout")), "no token-row"),
     ],
 )
 def test_worker_relayout_unsupported_reasons(attrs, match):
@@ -548,9 +548,9 @@ def _read_worker(local: DcpLayout, remote: DcpLayout, rank: int) -> NixlConnecto
     worker.block_size = KERNEL
     worker._group_spec_types = (MLAAttentionSpec, MambaSpec)
     worker.transfer_topo = MagicMock()
-    worker.transfer_topo.get_engine_info.return_value = SimpleNamespace(
-        remote_block_size=KERNEL
-    )
+    worker._peer_relayouts = {
+        "P": SimpleNamespace(unit_rows=KERNEL, src_kernel_block_size=KERNEL)
+    }
     worker._recv_failures = set()
     worker._handle_failed_transfer = MagicMock()
     return worker
@@ -626,13 +626,15 @@ def test_relayout_reads_match_the_plan(remote, local, rank, hit, num_tokens):
         start,
         end,
         unit_rows=KERNEL,
+        src_kernel_block_size=KERNEL,
         src_block_ids=meta.remote.block_ids[ATTN],
         dst_block_ids=meta.local_block_ids[ATTN],
         staging_block_ids=staging,
         dst_kernel_block_size=KERNEL,
     )
     assert np.array_equal(meta.relayout.dst_rows, expected.dst_rows)
-    assert np.array_equal(meta.relayout.src_blocks, expected.src_blocks)
+    assert np.array_equal(meta.relayout.src_slots, expected.src_slots)
+    assert np.array_equal(meta.relayout.staging_units, expected.staging_units)
     assert set(expected.reads) <= set(plan.source_ranks_per_group[ATTN])
     by_rank = {spec.remote_rank: spec for spec in specs}
     assert set(by_rank) == set(plan.all_source_ranks)
@@ -724,7 +726,8 @@ def _gather_worker(rows: int = 8, padding: int = 24, **attrs) -> NixlConnectorWo
         "kda.1": _mamba(block_size=rows),
     }
     worker._kv_row_layouts = dict(LAYER_ROWS)
-    worker._row_gathers = None
+    worker._relayout_buffers = None
+    worker._peer_relayouts = {}
     for name, value in attrs.items():
         setattr(worker, name, value)
     worker._test_layout = (offsets, stride, num_blocks)
@@ -735,20 +738,24 @@ def test_row_gathers_address_the_packed_layer_pages():
     worker = _gather_worker()
     offsets, stride, _ = worker._test_layout
     assert worker._relayout_regions() == [0, 1, 2]
-    (gather,) = worker._get_row_gathers()
-    assert gather.regions == [
+    (buffer,) = worker._get_relayout_buffers()
+    assert buffer.region_ids == [0, 1, 2]
+    assert buffer.regions == [
         RelayoutRegion(offsets[i], stride, 8, LAYER_ROWS[name])
         for i, name in enumerate(LAYER_ROWS)
     ]
-    assert worker._get_row_gathers()[0] is gather  # built once
+    assert worker._get_relayout_buffers()[0] is buffer  # resolved once
 
-    # Moving row 5 of block 1 to row 2 of block 4 moves exactly each layer's
-    # row bytes, and nothing else (not the state page or the padding).
+    # Moving row 5 of block 1 (staged whole, one 8-row unit) to row 2 of
+    # block 4 moves exactly each layer's row bytes, and nothing else (not the
+    # state page or the padding).
     buf = worker._test_storage
     buf.copy_(torch.randint(0, 256, buf.shape, dtype=torch.uint8))
     before = buf.clone()
-    one = np.array([1]), np.array([5]), np.array([4]), np.array([2])
-    relayout_rows_reference(buf, gather.regions, *one)
+    one = StagedRelayout(
+        {}, np.array([0]), np.array([5]), np.array([4]), np.array([2]), np.array([1])
+    )
+    relayout_rows_reference(buf, buffer.regions, list(LAYER_ROWS.values()), 8, one)
     changed = torch.zeros_like(buf, dtype=torch.bool)
     for i, rows in enumerate(LAYER_ROWS.values()):
         for (src_off, size), (dst_off, _) in zip(
@@ -783,7 +790,67 @@ def test_row_gathers_address_the_packed_layer_pages():
 def test_row_gathers_reject_undeclared_pages(attrs, match):
     worker = _gather_worker(**attrs)
     with pytest.raises(ValueError, match=match):
-        worker._get_row_gathers()
+        worker._get_relayout_buffers()
+
+
+def _peer_meta_rows(**layouts) -> SimpleNamespace:
+    return SimpleNamespace(engine_id="P", kv_row_layouts={**LAYER_ROWS, **layouts})
+
+
+def test_peer_relayout_reads_the_peers_page_layout():
+    """A peer whose indexer pages are twice as long keeps its scales twice
+    as far: its gather reads them there (8-row kernel blocks staged as two
+    4-row units) and writes them where this engine keeps them."""
+    worker = _gather_worker(rows=4)
+    peer_indexer = KVRowLayout(8, ((0, 8), (64, 4)))
+    peer = worker._peer_relayout(
+        _peer_meta_rows(**{"idx.0": peer_indexer}),
+        unit_rows=4,
+        src_kernel_block_size=8,
+    )
+    assert (peer.unit_rows, peer.src_kernel_block_size) == (4, 8)
+    (gather,) = peer.gathers
+    assert worker._get_relayout_buffers()[0].regions == gather.regions
+
+    # Row 6 of a peer kernel block staged in blocks 1 and 3 (one 48-byte unit
+    # each) to row 1 of block 5: its key from staged byte 6 * 8 = 48 (byte 0
+    # of block 3), its scale from staged byte 64 + 6 * 4 = 88 (byte 40 of
+    # block 3).
+    buf = worker._test_storage
+    buf.copy_(torch.randint(0, 256, buf.shape, dtype=torch.uint8))
+    before = buf.clone()
+    offsets, stride, _ = worker._test_layout
+    job = StagedRelayout(
+        {}, np.array([0]), np.array([6]), np.array([5]), np.array([1]), np.array([1, 3])
+    )
+    src_rows = [MLA_ROWS, peer_indexer, MLA_ROWS]
+    relayout_rows_reference(buf, gather.regions, src_rows, 4, job)
+    unit_bytes = 4 * INDEXER_ROWS.bytes_per_row
+    key = 5 * stride + offsets[1] + 1 * 8
+    scale = 5 * stride + offsets[1] + 4 * 8 + 1 * 4
+    src_key = 3 * stride + offsets[1] + (6 * 8 - unit_bytes)
+    src_scale = 3 * stride + offsets[1] + (64 + 6 * 4 - unit_bytes)
+    assert torch.equal(buf[key : key + 8], before[src_key : src_key + 8])
+    assert torch.equal(buf[scale : scale + 4], before[src_scale : src_scale + 4])
+
+
+@pytest.mark.parametrize(
+    ("layouts", "kernel", "match"),
+    [
+        # The peer does not declare a layer's rows.
+        (dict(LAYER_ROWS, **{"idx.0": None}), 8, "lays out the rows"),
+        # Kernel pages longer than the peer's kernel blocks.
+        ({"idx.0": KVRowLayout(16, ((0, 8), (128, 4)))}, 8, "lays out the rows"),
+        # Another KV format (row pieces).
+        ({"idx.0": KVRowLayout(8, ((0, 4), (32, 8)))}, 8, "row pieces"),
+    ],
+)
+def test_peer_relayout_rejects_unreadable_pages(layouts, kernel, match):
+    worker = _gather_worker(rows=4)
+    meta = _peer_meta_rows(**layouts)
+    meta.kv_row_layouts = {k: v for k, v in meta.kv_row_layouts.items() if v}
+    with pytest.raises(NotImplementedError, match=match):
+        worker._peer_relayout(meta, unit_rows=4, src_kernel_block_size=kernel)
 
 
 def test_relayout_peer_must_pair_every_gathered_region():
@@ -843,8 +910,6 @@ def test_split_padded_remote_blocks_keeps_their_stride():
 @pytest.mark.parametrize(
     ("kernel_page_rows", "block_lens", "state_regions", "match"),
     [
-        # 32-row units would split 64-row indexer kernel pages.
-        (64, [96 * 4], set(), "kernel pages"),
         # A token region that cannot be cut in three.
         (1, [100], set(), "cannot be split"),
         # The same odd length on a state-only region is fine (see above).
@@ -863,6 +928,16 @@ def test_split_remote_blocks_rejects_bad_units(
     assert meta.block_size == 96 and meta.block_lens == block_lens
 
 
+def test_split_remote_blocks_keeps_kernel_pages_whole_only_for_direct_pairs():
+    """32-row units split 64-row indexer kernel pages: pairing them directly
+    would scramble their scales, but a relayout reads them in the peer's page
+    layout (`RowGather`)."""
+    worker = _split_worker(64)
+    meta = _split_meta(96, [96 * 4], [96 * 4])
+    assert worker._split_remote_blocks(meta) == 1
+    assert worker._split_remote_blocks(meta, required=True) == 3
+
+
 # ----------------------------------------------------------------------
 # Worker: two-phase receive completion
 # ----------------------------------------------------------------------
@@ -878,7 +953,7 @@ class _FakeEvent:
 
 def _job(n: int) -> StagedRelayout:
     rows = np.arange(n, dtype=np.int64)
-    return StagedRelayout({}, rows, rows, rows + 100, rows)
+    return StagedRelayout({}, rows, rows, rows + 100, rows, rows + 50)
 
 
 def _completion_worker(event: _FakeEvent) -> NixlConnectorWorker:
@@ -903,6 +978,7 @@ def _completion_worker(event: _FakeEvent) -> NixlConnectorWorker:
     worker._reap_expired_send_leases = MagicMock()
     worker._cleanup_remote_engines = MagicMock()
     worker._launch_relayouts = MagicMock(return_value=(event, "rows"))
+    worker._peer_relayouts = {"P": "peer P"}
     return worker
 
 
@@ -923,8 +999,12 @@ def test_receive_reported_only_after_the_relayout():
     assert results.finished_recving == set()
     assert worker._send_pending_recv_notifs.call_count == 2
     worker._launch_relayouts.assert_called_once()
-    src_blocks, _, dst_blocks, _ = worker._launch_relayouts.call_args.args
-    assert len(src_blocks) == len(dst_blocks) == 5
+    peer, job = worker._launch_relayouts.call_args.args
+    assert peer == "peer P"
+    assert len(job.src_slots) == len(job.dst_blocks) == 5
+    # Each job's slots follow the staging units of the jobs merged before it.
+    assert job.src_slots.tolist() == [0, 1, 2, 3, 4]
+    assert sorted(job.staging_units.tolist()) == [50, 50, 51, 51, 52]
     # The row table stays referenced until the gather completes.
     assert worker._relayouting == {"a": (event, "rows"), "b": (event, "rows")}
 

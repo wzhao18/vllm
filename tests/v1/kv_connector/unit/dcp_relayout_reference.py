@@ -9,7 +9,10 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from vllm.distributed.kv_transfer.kv_connector.dcp_relayout import RelayoutRegion
+from vllm.distributed.kv_transfer.kv_connector.dcp_relayout import (
+    RelayoutRegion,
+    StagedRelayout,
+)
 from vllm.v1.kv_cache_interface import KVRowLayout
 
 
@@ -120,27 +123,48 @@ def copy_byte_ranges_reference(
 
 def relayout_byte_copies(
     regions: list[RelayoutRegion],
-    src_blocks: np.ndarray,
-    src_rows: np.ndarray,
-    dst_blocks: np.ndarray,
-    dst_rows: np.ndarray,
+    src_rows: list[KVRowLayout],
+    unit_rows: int,
+    job: StagedRelayout,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """`(src offset, dst offset, length)` in the buffer of every byte copy of
-    the row gather; a negative source offset zeroes the destination range."""
-    zero = np.asarray(src_blocks) < 0
-    src_blocks = np.where(zero, 0, src_blocks)
+    the row gather of `job` (`RowGather`); a negative source offset zeroes
+    the destination range. Region `r`'s staged kernel blocks are laid out as
+    `src_rows[r]`, in staging units of `unit_rows` rows' worth of bytes."""
+    zero = job.src_slots < 0
+    slots = np.where(zero, 0, job.src_slots)
+    dst_blocks = np.asarray(job.dst_blocks, dtype=np.int64)
     copies = []
-    for region in regions:
-        src_off, dst_off, lengths = _row_byte_copies(
-            region.rows,
-            region.rows,
-            region.offset + src_blocks * region.page_stride,
-            src_rows,
-            region.offset + np.asarray(dst_blocks, dtype=np.int64) * region.page_stride,
-            dst_rows,
-        )
-        src_off[np.tile(zero, len(region.rows.pieces))] = -1
-        copies.append((src_off, dst_off, lengths))
+    for region, src in zip(regions, src_rows):
+        unit_bytes = unit_rows * src.bytes_per_row
+        units_per_page = region.page_rows // unit_rows
+        for piece, (_, size) in enumerate(src.pieces):
+            unit_index, within = np.divmod(
+                _piece_offsets(src, piece, job.src_rows), unit_bytes
+            )
+            unit = (
+                job.staging_units[slots + unit_index]
+                if len(job.staging_units)
+                else np.zeros_like(slots)
+            )
+            src_off = (
+                region.offset
+                + unit // units_per_page * region.page_stride
+                + unit % units_per_page * unit_bytes
+                + within
+            )
+            dst_off = (
+                region.offset
+                + dst_blocks * region.page_stride
+                + _piece_offsets(region.rows, piece, job.dst_rows)
+            )
+            copies.append(
+                (
+                    np.where(zero, -1, src_off).astype(np.int64),
+                    dst_off.astype(np.int64),
+                    np.full(len(dst_off), size, dtype=np.int64),
+                )
+            )
     if not copies:
         empty = np.zeros(0, dtype=np.int64)
         return empty, empty, empty
@@ -150,17 +174,14 @@ def relayout_byte_copies(
 def relayout_rows_reference(
     buf: torch.Tensor,
     regions: list[RelayoutRegion],
-    src_blocks: np.ndarray,
-    src_rows: np.ndarray,
-    dst_blocks: np.ndarray,
-    dst_rows: np.ndarray,
+    src_rows: list[KVRowLayout],
+    unit_rows: int,
+    job: StagedRelayout,
 ) -> None:
     """Host reference of `RowGather` on a flat uint8 buffer: the semantics
     the device kernel must match."""
     assert buf.dtype == torch.uint8 and buf.dim() == 1
-    src_off, dst_off, lengths = relayout_byte_copies(
-        regions, src_blocks, src_rows, dst_blocks, dst_rows
-    )
+    src_off, dst_off, lengths = relayout_byte_copies(regions, src_rows, unit_rows, job)
     zero = src_off < 0
     buf_zero = torch.zeros(1, dtype=torch.uint8)
     for d, n in zip(dst_off[zero].tolist(), lengths[zero].tolist()):
