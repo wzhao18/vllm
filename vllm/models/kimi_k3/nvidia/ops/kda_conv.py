@@ -2,6 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """KDA prefill short convolution over the packed Q|K|V projection in one launch.
 
+On SM10x the conv runs ``qkv_conv`` (CUDA, ops/kda_qkv_conv): one persistent,
+balanced launch per layer that streams the packed Q|K|V columns through a shared
+memory ring filled by bulk async copies, with the stock arithmetic (bitwise equal
+to ``causal_conv1d_fn`` for a bf16 or FP32 conv state). It replaces the three
+per-plane Triton calls below (VR200, C512 n17k: 129 -> 61 us per layer isolated;
+the Triton kernels are instruction-issue bound at 68% SM throughput). The Triton
+kernels remain for shapes it does not cover (channels not a multiple of 256,
+unaligned rows, other GPUs).
+
 The stock prefill runs ``causal_conv1d_fn`` once per Q, K and V. Each call first
 casts the row-strided bf16 slice of the in_proj output to a dense FP32 copy (the
 conv state dtype), convolves it into an FP32 output and casts that back to bf16:
@@ -40,11 +49,18 @@ bodies are unrolled, and a program covers 512 channels (4 warps): 18.6 us.
 """
 
 
+import hashlib
+import os
+import threading
+
 import torch
 
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
+
+logger = init_logger(__name__)
 
 
 def _config(part_dim: int) -> tuple[int, int, int, int]:
@@ -712,5 +728,154 @@ def kda_prefill_conv(
         num_warps=_WARPS,
         num_stages=2,
         launch_pdl=current_platform.is_arch_support_pdl(),
+    )
+    return out
+
+
+# --- CUDA fused Q|K|V conv (ops/kda_qkv_conv) ----------------------------------
+
+_QKV_SRC = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "kda_qkv_conv", "kda_qkv_conv.cu"
+)
+# Shipped as package data (setup.py) and JIT-built on first use; a missing
+# source is an install error and raises in _load_qkv_conv, never a fallback.
+_qkv_lock = threading.Lock()
+_qkv_loaded = False
+
+
+def _load_qkv_conv() -> None:
+    """Build (first use per source hash) and load torch.ops.k3_kda_conv."""
+    global _qkv_loaded
+    if _qkv_loaded:
+        return
+    with _qkv_lock:
+        if _qkv_loaded:
+            return
+        from torch.utils.cpp_extension import load
+
+        import vllm.envs as envs
+
+        h = hashlib.sha256()
+        with open(_QKV_SRC, "rb") as fh:
+            h.update(fh.read())
+        h.update(f"{torch.__version__} {torch.version.cuda}".encode())
+        build = os.path.join(envs.VLLM_CACHE_ROOT, "k3_kda_conv", h.hexdigest()[:16])
+        os.makedirs(build, exist_ok=True)
+        load(
+            name="k3_kda_conv",
+            sources=[_QKV_SRC],
+            extra_cflags=["-O3"],
+            extra_cuda_cflags=["-O3", "-gencode", "arch=compute_100f,code=sm_100f"],
+            build_directory=build,
+            is_python_module=False,
+            verbose=False,
+        )
+        _qkv_loaded = True
+
+
+def qkv_conv_supported(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    conv_states: torch.Tensor,
+    part_dim: int,
+) -> bool:
+    """Whether ``qkv_conv`` runs this call (bit for bit vs stock).
+
+    Capability (False, the caller keeps the Triton path): a non-SM10x device (the
+    build targets sm_100f), or a dtype / width combination the kernel does not
+    implement: bf16 x; FP32 weights (the KDA layer's, stock FP32 FMA chain) with a
+    bf16 or FP32 state, or bf16 weights with a bf16 state (stock bf16-product
+    chain); Q|K|V planes of a multiple of 256 channels; conv width 4. On SM10x a
+    coverage miss is logged once, so a deployed config never drops to the slow
+    path unnoticed.
+
+    Layout (raises ValueError on SM10x): within that coverage the KDA layer always
+    passes 16 B aligned unit-stride rows, contiguous weights and a (lines, 3 *
+    part_dim, >= 3) conv state; anything else is a caller bug, not a fallback."""
+    if not (x.is_cuda and current_platform.is_device_capability_family(100)):
+        return False
+    gap = None
+    if x.dtype != torch.bfloat16:
+        gap = f"x dtype {x.dtype} (bf16 only)"
+    elif not (
+        weight.dtype == torch.float32
+        or (weight.dtype == torch.bfloat16 and conv_states.dtype == torch.bfloat16)
+    ) or conv_states.dtype not in (torch.bfloat16, torch.float32):
+        gap = f"weight {weight.dtype} with conv state {conv_states.dtype}"
+    elif part_dim % 256 != 0:
+        gap = f"{part_dim} channels per plane (multiple of 256 only)"
+    elif weight.dim() != 2 or weight.size(-1) != 4:
+        gap = f"conv weight shape {tuple(weight.shape)} (width 4 only)"
+    if gap is not None:
+        logger.warning_once(
+            "Kimi K3 fused Q|K|V conv does not cover %s; the KDA prefill conv "
+            "runs the slower Triton kernels.",
+            gap,
+        )
+        return False
+    bad = []
+    if x.dim() != 2 or x.size(1) != 3 * part_dim:
+        bad.append(f"x shape {tuple(x.shape)} != (tokens, {3 * part_dim})")
+    elif x.stride(1) != 1 or x.stride(0) % 8 != 0 or x.data_ptr() % 16 != 0:
+        bad.append(f"x rows not 16 B aligned unit-stride (strides {x.stride()})")
+    if tuple(weight.shape) != (3 * part_dim, 4):
+        bad.append(f"weight shape {tuple(weight.shape)} != ({3 * part_dim}, 4)")
+    if not weight.is_contiguous() or weight.data_ptr() % 16 != 0:
+        bad.append("weight not contiguous / 16 B aligned")
+    if (
+        conv_states.dim() != 3
+        or conv_states.size(1) != 3 * part_dim
+        or conv_states.size(2) < 3
+    ):
+        bad.append(
+            f"conv state shape {tuple(conv_states.shape)} != "
+            f"(lines, {3 * part_dim}, >= 3)"
+        )
+    if bad:
+        raise ValueError("Kimi K3 fused Q|K|V conv: " + "; ".join(bad))
+    return True
+
+
+def _qkv_conv_warps(dim: int, num_tokens: int) -> int:
+    """Consumer warps per CTA (256 channels each): the CTA width must divide the
+    Q|K|V channels. Measured on VR200 (one persistent wave, 9216 channels): 4 warps
+    at 12K-24K tokens (17.4K: 60.8 vs 63.0 us), 3 warps otherwise (8K: 32.5 vs 33.4,
+    32.8K: 110.9 vs 118.6; 4608 channels: 3 only), 2 if 768 does not divide."""
+    if dim % 1024 == 0 and 12288 <= num_tokens <= 24576:
+        return 4
+    if dim % 768 == 0:
+        return 3
+    return 2
+
+
+def qkv_conv(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    conv_states: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    cache_indices: torch.Tensor,
+    has_initial_state: torch.Tensor,
+    part_dim: int,
+    null_block_id: int | None = NULL_BLOCK_ID,
+) -> torch.Tensor:
+    """``causal_conv1d_fn`` (width 4, SiLU, no bias) of the packed Q|K|V columns
+    ``x`` (tokens, 3 * part_dim), conv state (cache lines, 3 * part_dim, >= 3)
+    updated in place. Returns (3, tokens, part_dim): plane i is the dense output
+    of channels [i * part_dim, (i + 1) * part_dim). Rows of padding sequences
+    (cache line ``null_block_id``) and rows outside query_start_loc are not
+    written. CUDA graph safe: the row split is read on the device."""
+    _load_qkv_conv()
+    num_tokens, dim = x.shape
+    out = torch.empty((3, num_tokens, part_dim), dtype=x.dtype, device=x.device)
+    torch.ops.k3_kda_conv.qkv_conv(
+        x,
+        weight,
+        conv_states,
+        query_start_loc,
+        cache_indices,
+        has_initial_state,
+        out,
+        null_block_id if null_block_id is not None else -1,
+        _qkv_conv_warps(dim, num_tokens),
     )
     return out

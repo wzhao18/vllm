@@ -37,6 +37,7 @@ from vllm.model_executor.layers.indexer_topk import (
     get_indexer_topk,
     is_deep_select_available,
     is_deep_select_supported,
+    trtllm_gvr2_host,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_fp8_min_max,
@@ -60,7 +61,10 @@ from vllm.utils.torch_utils import (
     _resolve_layer_name,
     direct_register_custom_op,
 )
-from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
+from vllm.v1.attention.backends.mla.indexer import (
+    DeepseekV32IndexerMetadata,
+    DeepseekV32IndexerPrefillChunkMetadata,
+)
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.attention.ops.dcp_topk_merge import (
     dcp_topk_merge_fits,
@@ -570,6 +574,45 @@ def _prefill_topk(
     )
 
 
+def _prefill_logits_dtype() -> tuple[torch.dtype, int]:
+    """DeepGEMM's prefill logits dtype and KV split: BF16 on SM100, FP32
+    elsewhere."""
+    if current_platform.is_device_capability_family(100):
+        return torch.bfloat16, 384
+    return torch.float32, 256
+
+
+def prefill_logits_reserved_bytes() -> int:
+    """Bytes the memory profile reserves for one prefill chunk's logits.
+
+    ``VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`` budgets FP32 logits; with 16-bit
+    DeepGEMM logits the reservation also holds their FP32 copy for the top-k.
+    """
+    logits_dtype, _ = _prefill_logits_dtype()
+    copy_bytes = 0 if logits_dtype == torch.float32 else torch.float32.itemsize
+    budget = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+    return budget // torch.float32.itemsize * (logits_dtype.itemsize + copy_bytes)
+
+
+def prefill_logits_budget_elems(topk_backend: str) -> int:
+    """Logits elements one prefill chunk may hold within that reservation.
+
+    The trtllm_gvr2 top-k ranks the 16-bit logits in place (no FP32 copy), so
+    its chunks spend the whole reservation on logits; the other backends keep
+    the FP32 budget.
+    """
+    logits_dtype, _ = _prefill_logits_dtype()
+    per_elem = logits_dtype.itemsize
+    keeps_16bit = (
+        logits_dtype != torch.float32
+        and topk_backend == "trtllm_gvr2"
+        and trtllm_gvr2_host() is not None
+    )
+    if logits_dtype != torch.float32 and not keeps_16bit:
+        per_elem += torch.float32.itemsize
+    return prefill_logits_reserved_bytes() // per_elem
+
+
 def _gather_workspace_shapes(
     total_seq_lens: int,
     head_dim: int,
@@ -609,6 +652,62 @@ def kv_cache_as_quant_view(
             stride=(page_bytes, fp4_bytes, fp4_bytes, 1),
         )
     return kv_cache.unsqueeze(-2)
+
+
+def _shardq_chunk_rows(
+    chunk: DeepseekV32IndexerPrefillChunkMetadata,
+    shardq,
+    q_compact: bool,
+) -> tuple[slice, slice | torch.Tensor, torch.Tensor, torch.Tensor]:
+    """This rank's rows of a ShardQ prefill chunk: (top-k buffer rows, query
+    rows, their K starts, their K ends).
+
+    They depend only on the step's metadata, so the first DSA layer of a step
+    builds them (two index gathers) and every later layer reuses them.
+    """
+    key = ("shardq_rows", q_compact)
+    rows = chunk.logits_inputs.get(key)
+    if rows is None:
+        lo, hi = np.searchsorted(
+            shardq.indexer_rows_cpu, (chunk.token_start, chunk.token_end)
+        )
+        topk_rows = slice(int(lo), int(hi))
+        chunk_rows = shardq.indexer_rows[lo:hi] - chunk.token_start
+        # A compact query holds only the indexer rows, in their order.
+        q_rows = topk_rows if q_compact else shardq.indexer_rows[lo:hi]
+        rows = (
+            topk_rows,
+            q_rows,
+            chunk.cu_seqlen_ks[chunk_rows],
+            chunk.cu_seqlen_ke[chunk_rows],
+        )
+        chunk.logits_inputs[key] = rows
+    return rows
+
+
+def _chunk_logits_schedule(
+    chunk: DeepseekV32IndexerPrefillChunkMetadata,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    num_kv_tokens: int,
+    num_heads: int,
+    shardq_rows: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """A prefill chunk's row lengths and DeepGEMM logits schedule, built by
+    the step's first DSA layer and reused by the others (same rows, same keys
+    per row: only the key values differ per layer)."""
+    key = ("schedule", shardq_rows, num_kv_tokens, num_heads)
+    cached = chunk.logits_inputs.get(key)
+    if cached is None:
+        schedule_meta = (
+            get_mqa_logits_metadata(cu_seqlen_ks, cu_seqlen_ke, num_kv_tokens, num_heads)
+            if envs.VLLM_SPARSE_INDEXER_PREFILL_LOGITS_SCHEDULE
+            and mqa_logits_use_mx_scales()
+            else None
+        )
+        cached = (cu_seqlen_ke - cu_seqlen_ks, schedule_meta)
+        chunk.logits_inputs[key] = cached
+    return cached
 
 
 @eager_break_during_capture
@@ -706,15 +805,10 @@ def sparse_attn_indexer(
         # prefill chunk's, or the decode logits, which eager and piecewise
         # steps allocate outside the CUDA graph pools. DeepGEMM emits them in
         # BF16 on SM100 and FP32 elsewhere, each row holding whole KV splits at
-        # a 1024-byte stride; the FP32 copy keeps that stride. Prefill always
-        # reads the FP32 copy, and the chunk splitter caps it at the budget.
-        if current_platform.is_device_capability_family(100):
-            logits_dtype, split_kv = torch.bfloat16, 384
-        else:
-            logits_dtype, split_kv = torch.float32, 256
+        # a 1024-byte stride; the FP32 copy keeps that stride. The chunk
+        # splitters cap a prefill chunk at prefill_logits_budget_elems.
+        logits_dtype, split_kv = _prefill_logits_dtype()
         row_align = math.lcm(split_kv, 1024 // logits_dtype.itemsize)
-        copy_bytes = 0 if logits_dtype == torch.float32 else torch.float32.itemsize
-        prefill_budget = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
         # Same gate as a decode step: the packed DCP merge reads the bf16
         # logits, so its steps hold no FP32 copy.
         use_dcp_topk_merge = _use_dcp_decode_topk_merge(
@@ -726,9 +820,7 @@ def sparse_attn_indexer(
             topk_tokens,
         )
         max_logits_bytes = max(
-            prefill_budget
-            // torch.float32.itemsize
-            * (logits_dtype.itemsize + copy_bytes),
+            prefill_logits_reserved_bytes(),
             _decode_logits_profile_bytes(
                 max_decode_tokens,
                 max_model_len,
@@ -925,6 +1017,13 @@ def sparse_attn_indexer(
             *gather_specs,
         )
         assert shardq is None or candidate_blocks is None
+        # SM100's logits kernels take BF16 weights: convert once per layer
+        # rather than once per chunk (mqa_logits_mx_inputs then keeps them).
+        prefill_weights = (
+            weights.to(torch.bfloat16)
+            if mqa_logits_use_mx_scales() and not current_platform.is_xpu()
+            else weights
+        )
         if prefill_chunk_iter is None:
             prefill_chunk_iter = ((chunk, prefill_kv_cache) for chunk in prefill_chunks)
         for chunk, prefill_kv_cache in prefill_chunk_iter:
@@ -966,18 +1065,12 @@ def sparse_attn_indexer(
                 # gathers above stay unconditional for continuation chunks
                 # that reuse the workspace. The top-k is written compactly, in
                 # token order, for the token-sharded attention.
-                lo, hi = np.searchsorted(
-                    shardq.indexer_rows_cpu, (chunk.token_start, chunk.token_end)
+                topk_rows, q_rows, cu_seqlen_ks, cu_seqlen_ke = _shardq_chunk_rows(
+                    chunk, shardq, q_compact
                 )
-                topk_rows = slice(int(lo), int(hi))
-                chunk_rows = shardq.indexer_rows[lo:hi] - chunk.token_start
-                cu_seqlen_ks = cu_seqlen_ks[chunk_rows]
-                cu_seqlen_ke = cu_seqlen_ke[chunk_rows]
-                # A compact query holds only the indexer rows, in their order.
-                q_rows = topk_rows if q_compact else shardq.indexer_rows[lo:hi]
             q_slice = q_quant[q_rows]
             q_scale_slice = q_scale[q_rows] if q_scale is not None else None
-            chunk_weights = weights[q_rows]
+            chunk_weights = prefill_weights[q_rows]
             topk_indices = topk_indices_buffer[topk_rows, :topk_tokens]
 
             # DeepGEMM returns compressed logits: row i starts at K position
@@ -1021,20 +1114,16 @@ def sparse_attn_indexer(
                     q_scale_slice, chunk_weights = mqa_logits_mx_inputs(
                         q_slice_cast, q_scale_slice, chunk_weights
                     )
-                    row_ends = cu_seqlen_ke - cu_seqlen_ks
                     # Round-robin 4-token Q blocks leave SMs idle when a chunk
                     # has few rows or uneven KV; the cost-balanced schedule
                     # splits the KV work evenly over the SMs.
-                    schedule_meta = (
-                        get_mqa_logits_metadata(
-                            cu_seqlen_ks,
-                            cu_seqlen_ke,
-                            k_quant_cast.shape[0],
-                            q_slice_cast.shape[1],
-                        )
-                        if envs.VLLM_SPARSE_INDEXER_PREFILL_LOGITS_SCHEDULE
-                        and mqa_logits_use_mx_scales()
-                        else None
+                    row_ends, schedule_meta = _chunk_logits_schedule(
+                        chunk,
+                        cu_seqlen_ks,
+                        cu_seqlen_ke,
+                        k_quant_cast.shape[0],
+                        q_slice_cast.shape[1],
+                        shardq is not None,
                     )
                     logits = fp8_fp4_mqa_logits(
                         (q_slice_cast, q_scale_slice),

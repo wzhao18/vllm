@@ -2,7 +2,8 @@
 // LICENSE.FlashKDA), changed only to pass `mode` (bit 0: K1 prepare, bit 1: K2
 // recurrence, bit 2: exact fp32 state I/O for the segment-parallel prefill's
 // partials; without it fp32 states round to bf16 at the kernel boundary exactly
-// as FlashKDA) and to dispatch varlen int32 only.
+// as FlashKDA, bits 3 / 4: K2 without outputs / with v = 0) and to dispatch
+// varlen int32 only.
 #include <torch/csrc/inductor/aoti_torch/c/shim.h>
 #include <torch/csrc/stable/ops.h>
 #include <torch/csrc/stable/tensor_inl.h>
@@ -39,8 +40,11 @@ void fwd(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
          std::optional<Tensor> final_state, std::optional<Tensor> cu_seqlens,
          std::optional<Tensor> checkpoint_state,
          std::optional<Tensor> checkpoint_offsets, int64_t mode) {
-  STD_TORCH_CHECK((mode & ~int64_t(7)) == 0 && (mode & 3) != 0,
-                  "mode: bit 0 K1, bit 1 K2, bit 2 exact fp32 state I/O");
+  // mode: bit 0 K1 prepare, bit 1 K2 recurrence, bit 2 exact fp32 state I/O,
+  // bit 3 K2 without outputs, bit 4 K2 with v = 0 (bits 2-4 need bit 1).
+  STD_TORCH_CHECK((mode & ~int64_t(31)) == 0 && (mode & 3) != 0 &&
+                      ((mode & 28) == 0 || (mode & 2) != 0),
+                  "k3_flashkda_split: invalid mode ", mode);
   STD_TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && g.is_cuda() &&
                       beta.is_cuda() && out.is_cuda() && workspace.is_cuda(),
                   "all tensors must be on CUDA");

@@ -15,7 +15,9 @@ Every long sequence is cut into segments (multiples of the 16-token chunk, so K1
 tiles are unchanged) that run as pseudo-sequences of one varlen launch:
 
   K1  once over the segmented cu_seqlens (token-parallel; identical tiles);
-  A   K2 twice: C_p (real v, zero initial state) and M_p (v = 0, identity);
+  A   K2 twice without outputs (mode bit 3: no q@s / Mqk@U / output tile, the
+      state arithmetic unchanged): C_p (real v, zero initial state) and M_p
+      (v = 0 in-kernel via mode bit 4, identity initial state);
   B   a per-sequence fp32 scan X_{p+1} = X_p @ M_p + C_p from the real initial state;
   C   K2 from X_p over every segment -> outputs, final state, checkpoint.
 
@@ -64,37 +66,31 @@ import torch
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import async_tensor_h2d
 
-# Segment only steps whose longest sequence has at least this many tokens, by KDA
-# heads per rank (the plain launch's (sequence, head) CTA pairs; fewer heads leave
-# more SMs idle, so segmenting pays from shorter sequences). Measured on VR200
-# (SM107), one sequence, plain FlashKDA against this path (us per layer, 8
-# pseudo-sequences): 12 heads loses up to 2816 tokens (2816: 127 against 155) and
-# wins from 3072 (138 -> 124, 4096 167 -> 140, 5504 213 -> 162); 24 heads loses up
-# to 4096 (178 against 182), about breaks even at 4608 (197 / 193) and wins from
-# 5120 (213 -> 204, 5504 227 -> 210, 6144 249 -> 223). Above 24 heads (unmeasured)
-# the previous 6144.
-_MIN_TOKENS_BY_HEADS = ((12, 3072), (24, 5120))
-_MIN_TOKENS = 6144
-
-
-def _min_tokens(heads: int) -> int:
-    """The shortest longest-sequence that segments at ``heads`` KDA heads per rank."""
-    for most_heads, tokens in _MIN_TOKENS_BY_HEADS:
-        if heads <= most_heads:
-            return tokens
-    return _MIN_TOKENS
-
-# Pseudo-sequences per launch: one wave of V-split CTA pairs (2 x 12 heads x 8
-# = 192 of 212 SMs on Rubin). Segmenting triples the K2 work (two phase-A
-# passes + the output pass), so it pays only when the longest chain shrinks by
-# well over 3x: the plan requires the longest segment to be at most a fifth of
-# the longest sequence.
-_MAX_PSEUDO = 8
+# Planner cost model: one K2 launch costs (chunks of its longest pseudo-sequence)
+# x (its 16-token step), and the step depends on how many K2 blocks share an
+# SM (fwd_launch.cu picks the slicing). Measured on VR200 (sm_107, 212 SMs,
+# H = 12, 2 x 8192 split 4..13 ways), us per 16-token chunk: 16 columns at one
+# block per SM 0.40; 32 columns at 1 / 2 / 3 blocks per SM 0.44 / 0.62 / 0.70;
+# the full-width kernel 0.76 per wave. A transition pass (no outputs) costs
+# 0.73-0.76 of an output pass; each fp32 scan step (x @ M + C over
+# [128, 128]) 2.7 us; the segmented path adds ~12 us of fixed work (beta
+# transpose, final-state gather, three more launches).
+_STEP_VD16_US = 0.40
+_STEP_VD32_US = (0.44, 0.62, 0.70)
+_STEP_FULL_US = 0.76
+_NO_OUT = 0.75
+_SCAN_STEP_US = 2.7
+_FIXED_US = 12.0
+# Segment only when the plan is projected at least this much faster.
+_MIN_GAIN = 0.9
 _MIN_SEG = 256
 _CHUNK = 16
 _D = 128
 # K2 only (mode bit 1) with exact fp32 state I/O (bit 2): the segment partials.
 _EXACT_STATE = 2 | 4
+# K2 transition passes (with _EXACT_STATE): no outputs (bit 3), v = 0 (bit 4).
+_MODE_NO_OUT = 8
+_MODE_ZERO_V = 16
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flashkda_split")
 
 
@@ -192,13 +188,39 @@ def _num_sms(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
+def _vd32_blocks_per_sm() -> int:
+    """32-column K2 blocks one SM holds (fwd_launch.cu launch bounds)."""
+    return len(_STEP_VD32_US)
+
+
+def split_build_fits(heads: int, sequences: int, head_dim: int, sms: int) -> bool:
+    """Whether the in-tree build's V-split recurrence runs this shape in one
+    wave (fwd_launch.cu: 16 columns at one block per SM, else 32 columns at up
+    to three blocks per SM). Elsewhere it runs the full-width kernel and gains
+    nothing over the stock FlashKDA build."""
+    return heads * (head_dim // 32) * sequences <= _vd32_blocks_per_sm() * sms
+
+
 def narrow_vsplit_fits(heads: int, sequences: int, head_dim: int, device) -> bool:
-    """Whether the K2 recurrence of this build runs its 16-column V split
-    (fwd_launch.cu: one block per (sequence, head, 16 value columns) in one
-    wave). The plain prefill uses this build only then; elsewhere it gains
-    nothing over the stock FlashKDA build (measured: H=24 5x3480 +4%)."""
+    """split_build_fits at the device's SM count."""
     index = device.index if device.index is not None else torch.cuda.current_device()
-    return heads * (head_dim // 16) * sequences <= _num_sms(index)
+    return split_build_fits(heads, sequences, head_dim, _num_sms(index))
+
+
+def _step_us(heads: int, sequences: int, sms: int) -> float:
+    """One K2 launch's 16-token step (cost model above)."""
+    if heads * (_D // 16) * sequences <= sms:
+        return _STEP_VD16_US
+    per_sm = -(-heads * (_D // 32) * sequences // sms)
+    if per_sm <= len(_STEP_VD32_US):
+        return _STEP_VD32_US[per_sm - 1]
+    return _STEP_FULL_US * -(-heads * sequences // sms)
+
+
+def max_pseudo(heads: int, sms: int, max_seqs: int) -> int:
+    """Most pseudo-sequences a plan may use: the transition passes must run in
+    one wave of 32-column blocks, and FlashKDA's workspace holds max_seqs."""
+    return max(0, min(max_seqs, _vd32_blocks_per_sm() * sms // (heads * (_D // 32))))
 
 
 def workspace_size(tokens: int, heads: int, sequences: int) -> int:
@@ -212,17 +234,15 @@ def workspace_size(tokens: int, heads: int, sequences: int) -> int:
 
 
 class SegBuffers:
-    """fp32 phase states for up to _MAX_PSEUDO pseudo-sequences, their identity
-    initial states, and a zero v; allocated once per (tokens, heads, device) at
-    layer init. ~5 x 6.3 MB + 6.3 MB + 50 MB at 16384 tokens and 12 heads. The
-    FlashKDA workspace is the layer's own (sized for max_num_seqs sequences)
-    and phase A writes its discarded outputs into the output buffer, which
-    phase C then overwrites."""
+    """fp32 phase states for up to ``n`` pseudo-sequences (max_pseudo) and
+    their identity initial states, allocated once per (tokens, heads, device)
+    at layer init: 6 x n x heads x 64 KB (13 x 12 heads: 60 MB). The FlashKDA
+    workspace is the layer's own (sized for max_num_seqs sequences)."""
 
-    def __init__(self, tokens: int, heads: int, device):
+    def __init__(self, tokens: int, heads: int, device, n: int, sms: int):
         f32 = torch.float32
-        n = _MAX_PSEUDO
         self.n = n
+        self.sms = sms
         shape = (n, heads, _D, _D)
         self.C = torch.empty(shape, dtype=f32, device=device)
         self.M = torch.empty(shape, dtype=f32, device=device)
@@ -232,23 +252,28 @@ class SegBuffers:
             shape, dtype=f32, device=device
         )  # in-kernel checkpoint states
         self.eye = torch.eye(_D, dtype=f32, device=device).expand(shape).contiguous()
-        self.zero_v = torch.zeros(
-            (1, tokens, heads, _D), dtype=torch.bfloat16, device=device
-        )
         self.tokens = tokens
 
 
 _BUFFERS: dict[tuple, SegBuffers] = {}
 
 
-def init_buffers(tokens: int, heads: int, device) -> SegBuffers:
+def init_buffers(tokens: int, heads: int, device, max_seqs: int) -> SegBuffers | None:
+    """Buffers for plans of up to max_pseudo pseudo-sequences, or None when no
+    segment plan fits (few SMs per head)."""
     # Build / load the extension at model init (cached on disk), not at the first
     # long prefill.
     load_extension()
-    key = (tokens, heads, str(torch.device(device)))
+    device = torch.device(device)
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    sms = _num_sms(index)
+    n = max_pseudo(heads, sms, max_seqs)
+    if n < 2:
+        return None
+    key = (tokens, heads, str(device), n)
     b = _BUFFERS.get(key)
     if b is None:
-        b = _BUFFERS[key] = SegBuffers(tokens, heads, device)
+        b = _BUFFERS[key] = SegBuffers(tokens, heads, device, n, sms)
     return b
 
 
@@ -275,19 +300,55 @@ class SegPlan:
 _PLANS: dict[tuple, SegPlan | None] = {}
 
 
-def _segment_counts(lens: tuple[int, ...], heads: int) -> list[int] | None:
-    """Pseudo-sequences per sequence: the extra segments go, one at a time, to
-    the sequence with the longest current segment. None if it does not pay."""
+def _segment_counts(lens: tuple[int, ...], parts_total: int) -> list[int] | None:
+    """Pseudo-sequences per sequence for parts_total in all: the extra
+    segments go, one at a time, to the sequence with the longest current
+    segment (segments stay >= _MIN_SEG tokens). None if none can be added."""
     n = len(lens)
-    if n == 0 or n >= _MAX_PSEUDO or max(lens) < _min_tokens(heads):
+    if n == 0 or parts_total <= n:
         return None
     parts = [1] * n
-    for _ in range(_MAX_PSEUDO - n):
+    for _ in range(parts_total - n):
         i = max(range(n), key=lambda j: lens[j] / parts[j])
         if lens[i] / (parts[i] + 1) < _MIN_SEG:
             break
         parts[i] += 1
-    return parts
+    return parts if sum(parts) > n else None
+
+
+def _chunks(tokens: int) -> int:
+    return -(-tokens // _CHUNK)
+
+
+def _plan_us(lens: tuple[int, ...], parts: list[int], heads: int, sms: int) -> float:
+    """Projected K2 time of a segment plan (cost model above)."""
+    pseudo = sum(parts)
+    longest = max(_chunks(-(-n // k)) for n, k in zip(lens, parts))
+    step = _step_us(heads, pseudo, sms)
+    return (
+        (2 * _NO_OUT + 1) * step * longest
+        + _SCAN_STEP_US * (max(parts) - 1)
+        + _FIXED_US
+    )
+
+
+def choose_segments(
+    lens: tuple[int, ...], heads: int, sms: int, max_parts: int
+) -> list[int] | None:
+    """Segments per sequence for the fastest projected plan, or None when the
+    plain launch is projected within _MIN_GAIN of it."""
+    if not lens or max_parts <= len(lens):
+        return None
+    plain = _step_us(heads, len(lens), sms) * _chunks(max(lens))
+    best, best_us = None, _MIN_GAIN * plain
+    for total in range(len(lens) + 1, max_parts + 1):
+        parts = _segment_counts(lens, total)
+        if parts is None:
+            continue
+        us = _plan_us(lens, parts, heads, sms)
+        if us < best_us:
+            best, best_us = parts, us
+    return best
 
 
 def _split(a: int, b: int, k: int) -> list[int]:
@@ -304,9 +365,14 @@ def make_plan(
     heads: int,
     device,
     checkpoint_offsets: list[int] | None = None,
+    *,
+    sms: int,
+    max_parts: int,
 ) -> SegPlan | None:
     """Segment plan for one step's prefill sequences, or None to run FlashKDA as
-    one launch. Host-only (CPU query lengths, host checkpoint offsets); cached.
+    one launch (choose_segments: the projected K2 time at ``sms`` SMs, at most
+    ``max_parts`` pseudo-sequences). Host-only (CPU query lengths, host
+    checkpoint offsets); cached.
 
     A sequence's checkpoint offset becomes a segment boundary whenever the
     sequence is split, so its checkpoint state is the scan's X there (no
@@ -317,11 +383,15 @@ def make_plan(
         if checkpoint_offsets
         else (0,) * len(lens)
     )
-    key = (lens, offs, heads, str(device))
+    key = (lens, offs, heads, str(device), sms, max_parts)
     if key in _PLANS:
         return _PLANS[key]
     plan = None
-    parts = _segment_counts(lens, heads) if len(offs) == len(lens) else None
+    parts = (
+        choose_segments(lens, heads, sms, max_parts)
+        if len(offs) == len(lens)
+        else None
+    )
     if parts is not None:
         bounds_all = []
         for i, n in enumerate(lens):
@@ -336,9 +406,8 @@ def make_plan(
             max(b[j + 1] - b[j] for j in range(len(b) - 1)) for b in bounds_all
         )
         num_pseudo = sum(len(b) - 1 for b in bounds_all)
-        # three K2 passes over chains a fifth as long (or less), in one wave;
-        # at 4x a mixed batch (12k + 3k + 1.4k) gained only 1%
-        if 5 * longest_seg <= max(lens) and num_pseudo <= _MAX_PSEUDO:
+        # checkpoint boundaries can shift pieces, never add any
+        if num_pseudo <= max_parts and longest_seg < max(lens):
             ck_x: tuple[list[int], list[int]]
             ck_f: tuple[list[int], list[int]]
             ck_k: tuple[list[int], list[int]]
@@ -483,7 +552,7 @@ def segmented_prefill(
     initial_state: torch.Tensor,
     out: torch.Tensor,  # [1, T, H, D] contiguous
     final_state: torch.Tensor,  # [N, H, D, D] state dtype (written)
-    # FlashKDA workspace for >= _MAX_PSEUDO sequences of T tokens
+    # FlashKDA workspace for >= plan.num_pseudo sequences of T tokens
     workspace: torch.Tensor,
     checkpoint_state: torch.Tensor | None = None,  # [N, H, D, D] state dtype (written)
 ) -> torch.Tensor:
@@ -501,7 +570,7 @@ def segmented_prefill(
     ws = workspace
     assert ws.numel() >= workspace_size(tokens, q.shape[2], n) and out.is_contiguous()
     C, M, X, F, K = bufs.C[:n], bufs.M[:n], bufs.X[:n], bufs.F[:n], bufs.K[:n]
-    scratch = out  # phase A outputs are discarded; phase C rewrites every token
+    scratch = out  # K1 and the transition passes write no output
     # K1 once (token-parallel; the segmented tiles equal the unsegmented ones)
     op(
         q,
@@ -522,7 +591,8 @@ def segmented_prefill(
         None,
         1,
     )
-    # A: C_p from a zero state, M_p from the identity with v = 0
+    # A: C_p from a zero state, M_p from the identity with v = 0; state only
+    # (exact fp32 state, no outputs; M_p also v = 0 in-kernel)
     op(
         q,
         k,
@@ -540,12 +610,12 @@ def segmented_prefill(
         plan.cu,
         None,
         None,
-        _EXACT_STATE,
+        _EXACT_STATE | _MODE_NO_OUT,
     )
     op(
         q,
         k,
-        bufs.zero_v[:, :tokens],
+        v,
         g,
         bv,
         scale,
@@ -559,7 +629,7 @@ def segmented_prefill(
         plan.cu,
         None,
         None,
-        _EXACT_STATE,
+        _EXACT_STATE | _MODE_NO_OUT | _MODE_ZERO_V,
     )
     # B: each sequence's segment initial states, fp32
     chain_scan(initial_state.contiguous(), M, C, X, plan)

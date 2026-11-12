@@ -119,7 +119,7 @@ from vllm.models.kimi_k3.nvidia.mxfp8 import (
     can_pack_mxfp8,
     takes_mxfp8_activation,
 )
-from vllm.models.kimi_k3.nvidia.ops import attn_res, mxfp8_act
+from vllm.models.kimi_k3.nvidia.ops import attn_res, mxfp8_act, prefill_glue
 from vllm.models.kimi_k3.nvidia.ops import sp_all_gather as sp_ag
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import NestedTensors
@@ -712,7 +712,9 @@ class KimiMoE(nn.Module):
                 prefix=f"{prefix}.routed_expert_down_proj",
             )
             self.routed_expert_norm = (
-                RMSNorm(self.moe_hidden_size, eps=config.rms_norm_eps)
+                prefill_glue.KimiRowsRMSNorm(
+                    self.moe_hidden_size, eps=config.rms_norm_eps
+                )
                 if self.latent_moe_use_norm
                 else None
             )
@@ -892,23 +894,46 @@ class KimiMoE(nn.Module):
             inter,
         )
 
+    def _grouped_topk(
+        self, hidden_states: torch.Tensor, router_logits: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """MegaMoE routing: ``fused_grouped_topk``; prefill-sized batches run
+        its bitwise twin ``prefill_glue.router_topk`` (one block per token)."""
+        bias = self.gate.e_score_correction_bias.data
+        if prefill_glue.use_router_topk(
+            router_logits,
+            bias,
+            self.experts.top_k,
+            self.num_expert_group,
+            self.topk_group,
+            self.moe_router_activation_func,
+        ):
+            return prefill_glue.router_topk(
+                router_logits,
+                bias,
+                self.experts.top_k,
+                self.moe_renormalize,
+                self.routed_scaling_factor,
+            )
+        return fused_grouped_topk(
+            hidden_states=hidden_states,
+            gating_output=router_logits,
+            topk=self.experts.top_k,
+            renormalize=self.moe_renormalize,
+            e_score_correction_bias=bias,
+            num_expert_group=self.num_expert_group,
+            topk_group=self.topk_group,
+            scoring_func=self.moe_router_activation_func,
+            routed_scaling_factor=self.routed_scaling_factor,
+        )
+
     def _router(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         router_logits, _ = self.gate(hidden_states)
         if not self.use_mega_moe:
             return router_logits, None
-        return fused_grouped_topk(
-            hidden_states=hidden_states,
-            gating_output=router_logits,
-            topk=self.experts.top_k,
-            renormalize=self.moe_renormalize,
-            e_score_correction_bias=self.gate.e_score_correction_bias.data,
-            num_expert_group=self.num_expert_group,
-            topk_group=self.topk_group,
-            scoring_func=self.moe_router_activation_func,
-            routed_scaling_factor=self.routed_scaling_factor,
-        )
+        return self._grouped_topk(hidden_states, router_logits)
 
     def _packed_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """MoE layer on the packed GEMMs of pack_projections()."""
@@ -961,23 +986,7 @@ class KimiMoE(nn.Module):
 
         """
 
-        def _router(
-            hidden_states: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor | None]:
-            router_logits, _ = self.gate(hidden_states)
-            if not self.use_mega_moe:
-                return router_logits, None
-            return fused_grouped_topk(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                topk=self.experts.top_k,
-                renormalize=self.moe_renormalize,
-                e_score_correction_bias=self.gate.e_score_correction_bias.data,
-                num_expert_group=self.num_expert_group,
-                topk_group=self.topk_group,
-                scoring_func=self.moe_router_activation_func,
-                routed_scaling_factor=self.routed_scaling_factor,
-            )
+        _router = self._router
 
         down_proj = self.routed_expert_down_proj
         if down_proj is None:

@@ -37,7 +37,7 @@ from vllm.logger import init_logger
 from .arch import require_sm107
 from .config import RouteIdError, RubinBucket, RubinMoeConfig, RubinMoeProblem
 from .session import RubinMegaMoeSession, layout_tag
-from .staging import stage_inputs
+from .staging import PREFILL_STAGE_MIN_TOKENS, stage_inputs
 from .symm_arena import SymmetricArena, ensure_not_capturing, group_barrier
 from .weights import RubinMoeWeights, prepare_weights
 
@@ -97,6 +97,9 @@ class RubinMegaMoE:
         self.route_error = torch.zeros(2, dtype=torch.int64, device=device)
         self._route_error_host = torch.zeros(2, dtype=torch.int64, pin_memory=True)
         self._route_error_event: torch.cuda.Event | None = None
+        # The layer whose forwards poll the flag (the first caller that names
+        # itself): one mirror copy per model step instead of one per layer.
+        self._poll_owner: str | None = None
         local = sum(s.local_bytes for s in self.sessions.values())
         # Sessions' local tensors (topk_idx fill, local workspace zeros) and the flag
         # are initialized on the construction stream; finish them before any other
@@ -248,11 +251,22 @@ class RubinMegaMoE:
         dev = self.route_error.device
         row = torch.zeros((1, p.hidden), dtype=torch.bfloat16, device=dev)
         first = self.sessions[self.buckets[0]]
+        last = self.sessions[self.buckets[-1]]
+        # The multi-row prefill grid is its own specialization: compile it too when
+        # the largest bucket can take that many rows.
+        wide = PREFILL_STAGE_MIN_TOKENS
+        wide_rows = None
+        if self.buckets[-1].max_tokens >= wide:
+            wide_rows = torch.zeros((wide, p.hidden), dtype=torch.bfloat16, device=dev)
         for ids_dtype in ids_dtypes:
             for w_dtype in weight_dtypes:
                 ids = torch.full((1, p.top_k), -1, dtype=ids_dtype, device=dev)
                 wts = torch.zeros((1, p.top_k), dtype=w_dtype, device=dev)
                 self._stage(first, row, ids, wts)
+                if wide_rows is not None:
+                    ids = torch.full((wide, p.top_k), -1, dtype=ids_dtype, device=dev)
+                    wts = torch.zeros((wide, p.top_k), dtype=w_dtype, device=dev)
+                    self._stage(last, wide_rows, ids, wts)
         self.check_route_errors()
         ids = torch.full((1, p.top_k), -1, dtype=ids_dtypes[0], device=dev)
         ids[0, 0] = p.num_experts
@@ -283,6 +297,7 @@ class RubinMegaMoE:
         bucket: RubinBucket,
         out: torch.Tensor | None = None,
         is_padding: torch.Tensor | None = None,
+        owner: str | None = None,
     ) -> torch.Tensor:
         """``out[:n] = sum_k topk_weights[:, k] * expert_{topk_ids[:, k]}(hidden)``.
 
@@ -293,6 +308,10 @@ class RubinMegaMoE:
         ``is_padding`` optional bool (n,): rows whose routes are masked to -1 in the
         stager (as ``torch.where(is_padding[:, None], -1, topk_ids)``). Output
         BF16. Both the staging and the kernel run on the current stream.
+        ``owner``: the calling layer; the route-error flag is polled (a 16-byte
+        D2H copy on this stream) only by the first owner seen, i.e. once per
+        model step (each copy costs a copy-engine round trip between two
+        kernels); unnamed callers always poll.
         """
         session = self.sessions.get(bucket)
         if session is None:
@@ -318,7 +337,10 @@ class RubinMegaMoE:
                 raise ValueError("out has fewer rows than tokens.")
             result = out[:n]
             session.launch(weights, result)
-        self.poll_route_errors()
+        if owner is None or self._poll_owner in (None, owner):
+            if owner is not None:
+                self._poll_owner = owner
+            self.poll_route_errors()
         return result
 
     def destroy(self) -> None:

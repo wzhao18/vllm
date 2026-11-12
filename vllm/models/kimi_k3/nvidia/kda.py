@@ -51,7 +51,12 @@ from vllm.models.kimi_k3.nvidia.kda_metadata import (
     KimiK3KDAAttentionBackend,
     KimiK3KDAMetadata,
 )
-from vllm.models.kimi_k3.nvidia.ops import kda_conv, kda_norm, kda_segscan
+from vllm.models.kimi_k3.nvidia.ops import (
+    kda_conv,
+    kda_norm,
+    kda_segscan,
+    prefill_glue,
+)
 from vllm.models.kimi_k3.nvidia.ops.kda_conv import (
     packed_causal_conv1d_fn,
     packed_causal_conv1d_supported,
@@ -456,10 +461,11 @@ def _flashkda_prefill(
         q.shape[2], cu_seqlens.shape[0] - 1, q.shape[-1], q.device
     ):
         # The in-tree FlashKDA build (ops/flashkda_split, shared with the
-        # segment-parallel path) splits the recurrence over 16-value-column
-        # slices when that grid fits one wave: bitwise-identical outputs and
-        # states (an fp32 state crosses the kernel through bf16, as stock),
-        # 1.2-1.3x faster at the C256 TP8 shapes.
+        # segment-parallel path) splits the recurrence over 16- or 32-value-
+        # column slices when that grid is resident in one wave: same per-column
+        # arithmetic as stock, and an fp32 state crosses the kernel through
+        # bf16 as stock; 1.2-1.3x faster at the C256 TP8 shapes, 1.1x at C512
+        # TP4 (5 x 3480: 165 -> 147 us).
         kda_segscan.load_extension()
         torch.ops.k3_flashkda_split.fwd(*args, 3)
     else:
@@ -879,7 +885,10 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 # Segment-parallel prefill buffers, shared by every KDA layer
                 # and allocated before the memory profile.
                 self._segscan_bufs = kda_segscan.init_buffers(
-                    T, H, torch.device("cuda", torch.accelerator.current_device_index())
+                    T,
+                    H,
+                    torch.device("cuda", torch.accelerator.current_device_index()),
+                    N,
                 )
         elif self.kda_prefill_backend == "flashinfer":
             T = vllm_config.scheduler_config.max_num_batched_tokens
@@ -1423,17 +1432,40 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         metadata=m,
                     ).transpose(0, 1)
 
-                if (
+                have_meta = (
                     has_initial_state is not None
                     and non_spec_query_start_loc is not None
                     and non_spec_state_indices_tensor is not None
-                    and packed_causal_conv1d_supported(
+                )
+                if have_meta and kda_conv.qkv_conv_supported(
+                    mixed_qkv_ns,
+                    conv_weights,
+                    conv_state,
+                    self.local_projection_size,
+                ):
+                    # One persistent CUDA launch over the packed Q|K|V columns,
+                    # stock arithmetic and conv state (ops/kda_qkv_conv).
+                    assert has_initial_state is not None
+                    assert non_spec_query_start_loc is not None
+                    assert non_spec_state_indices_tensor is not None
+                    q_ns, k_ns, v_ns = kda_conv.qkv_conv(
                         mixed_qkv_ns,
                         conv_weights,
                         conv_state,
+                        non_spec_query_start_loc,
+                        non_spec_state_indices_tensor,
+                        has_initial_state,
                         self.local_projection_size,
-                    )
+                    ).unbind(0)
+                elif have_meta and packed_causal_conv1d_supported(
+                    mixed_qkv_ns,
+                    conv_weights,
+                    conv_state,
+                    self.local_projection_size,
                 ):
+                    assert has_initial_state is not None
+                    assert non_spec_query_start_loc is not None
+                    assert non_spec_state_indices_tensor is not None
                     # One launch over the packed Q|K|V columns: no FP32 copies of
                     # the inputs, same FP32 math and conv state as the stock calls.
                     q_ns, k_ns, v_ns = packed_causal_conv1d_fn(
@@ -1481,6 +1513,8 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                             self.local_num_heads,
                             q_ns.device,
                             checkpoint.offsets if checkpoint is not None else None,
+                            sms=self._segscan_bufs.sms,
+                            max_parts=self._segscan_bufs.n,
                         )
                         if self._segscan_bufs is not None
                         and m.non_spec_query_start_loc_cpu is not None
@@ -1629,8 +1663,11 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         cu_seqlens=non_spec_query_start_loc,
                         out=non_spec_out,
                     )
-                recurrent_state[non_spec_state_indices_tensor] = (
-                    last_recurrent_state.to(recurrent_state.dtype)
+                # One row-copy launch (same result as the index_put_).
+                prefill_glue.write_state_rows(
+                    recurrent_state,
+                    non_spec_state_indices_tensor,
+                    last_recurrent_state,
                 )
             else:
                 # Pure non-speculative decode.

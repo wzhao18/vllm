@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -429,6 +429,10 @@ class DeepseekV32IndexerPrefillChunkMetadata:
     max_local_total_seq_lens: int = 0
 
     pcp_deinterleave_idx: torch.Tensor | None = None
+    # Logits inputs derived from this chunk's rows alone (ShardQ rows, row
+    # lengths, the DeepGEMM schedule): the step's first indexer layer builds
+    # them and the later layers reuse them (sparse_attn_indexer).
+    logits_inputs: dict = field(default_factory=dict, repr=False, compare=False)
 
 
 class BuildPrefillChunkMetadataKernel(

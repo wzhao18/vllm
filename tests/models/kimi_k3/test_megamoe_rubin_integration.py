@@ -464,7 +464,9 @@ class _FakeRuntime:
             layer_id=layer_id, expert_offset=4,
         )  # fmt: skip
 
-    def forward(self, hidden, ids, weights, kernel_weights, *, bucket, is_padding=None):
+    def forward(
+        self, hidden, ids, weights, kernel_weights, *, bucket, is_padding=None, owner=None
+    ):
         if is_padding is not None:  # the stager's folded padding mask
             ids = torch.where(is_padding.unsqueeze(1), -1, ids)
         self.calls.append((ids.clone(), weights, kernel_weights, bucket))

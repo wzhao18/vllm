@@ -292,6 +292,13 @@ def _warm_prefill_glue(worker: Worker, layer: KimiK3DeltaAttention) -> None:
         )
         if kda_conv.supported(xt, wp, st, md):
             kda_conv.kda_prefill_conv(xt, wp, st, qsl, null, no_init, md)
+    # The fused Q|K|V conv (CUDA): builds / loads the extension here, not in
+    # the first prefill.
+    from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+
+    cs = conv_state if is_conv_state_dim_first() else conv_state.transpose(-1, -2)
+    if kda_conv.qkv_conv_supported(proj[:, : 3 * P], w, cs, P):
+        kda_conv.qkv_conv(proj[:, : 3 * P], w, cs, qsl, null, no_init, P)
 
     # Output gate norm: the gate is a view of the prefill projection (row
     # stride width) or of the decode projection-overlap output (4 P).
