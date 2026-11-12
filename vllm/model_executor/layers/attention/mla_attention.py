@@ -480,6 +480,15 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.kv_b_proj = kv_b_proj
         self.dcp_q_replicate = dcp_q_replicate
         self.W_UK_T_dcp_qrep: torch.Tensor | None = None
+        # Every TP rank's heads of W_UK_T [H, P, L] and W_UV [H, L, V] (the
+        # local W_UK_T / W_UV are views of this rank's heads): set when DCP
+        # ShardQ steps exchange the 16-bit query before W_UK and the value
+        # output after W_UV (forward_mqa_shardq_proj).
+        self.W_UK_T_shardq: torch.Tensor | None = None
+        self.W_UV_shardq: torch.Tensor | None = None
+        # The slot mapping update_kv_cache handed to forward_impl's fused write
+        # of a DCP ShardQ step's new MLA rows (_shardq_fused_kv_insert).
+        self._shardq_local_slots: torch.Tensor | None = None
         # Set by a model's DCP decode exchange: (attn_out, lse, out, rows) -> True
         # when it wrote ``out`` (the gathered heads' W_UV + O exchange), on pure
         # decode steps; else the stock LSE combine + W_UV run.
@@ -826,6 +835,14 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         cache = self.hisparse_cache
         if slot_mapping is None or (cache is not None and cache.dummy_batch):
             return
+        if (
+            self._shardq_fused_kv_insert(kv_c_normed, k_pe, kv_cache, attn_metadata)
+            is not None
+        ):
+            # forward_impl writes the local and workspace rows in one kernel,
+            # with this slot mapping.
+            self._shardq_local_slots = slot_mapping
+            return
         kv_c_normed, k_pe, slot_mapping = maybe_gather_mla_latent_cache_inputs(
             kv_c_normed,
             k_pe,
@@ -985,19 +1002,33 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     is_quantized_kv_cache(self.kv_cache_dtype)
                     and self.impl.supports_quant_query_input
                 )
-                reserve_shardq_buffers(
-                    scheduler_config.max_num_batched_tokens,
-                    scheduler_config.max_num_seqs,
-                    self.num_heads,
-                    self.kv_lora_rank + self.qk_rope_head_dim,
-                    self.kv_lora_rank,
-                    current_platform.fp8_dtype() if fp8_query else k_c_normed.dtype,
-                    k_c_normed.dtype,
-                    k_c_normed.device,
-                    padded_heads=self.impl.shardq_query_heads(  # type: ignore[attr-defined]
-                        get_tp_group().world_size * self.num_heads
-                    ),
-                )
+                if self.W_UK_T_shardq is not None:
+                    # DCP ShardQ steps exchange the 16-bit query and the value
+                    # output (forward_mqa_shardq_proj).
+                    reserve_shardq_buffers(
+                        scheduler_config.max_num_batched_tokens,
+                        scheduler_config.max_num_seqs,
+                        self.num_heads,
+                        self.qk_head_dim,
+                        self.v_head_dim,
+                        k_c_normed.dtype,
+                        k_c_normed.dtype,
+                        k_c_normed.device,
+                    )
+                else:
+                    reserve_shardq_buffers(
+                        scheduler_config.max_num_batched_tokens,
+                        scheduler_config.max_num_seqs,
+                        self.num_heads,
+                        self.kv_lora_rank + self.qk_rope_head_dim,
+                        self.kv_lora_rank,
+                        current_platform.fp8_dtype() if fp8_query else k_c_normed.dtype,
+                        k_c_normed.dtype,
+                        k_c_normed.device,
+                        padded_heads=self.impl.shardq_query_heads(  # type: ignore[attr-defined]
+                            get_tp_group().world_size * self.num_heads
+                        ),
+                    )
                 if self.impl.dcp_world_size > 1:
                     self._reserve_dcp_shardq_workspace(k_c_normed.device)
 
@@ -1063,13 +1094,43 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     k_c_normed[first + lo : first + hi],
                     k_pe[first + lo : first + hi],
                     gathered_context.mla_view(kv_cache),
-                    gathered_context.slot_mapping[lo:hi],
+                    gathered_context.mla_slot_mapping[lo:hi],
                     self.kv_cache_dtype,
                     self._k_scale,
                 )
 
-            if gathered_context.num_groups == 1:
-                write_new_tokens(0, int(gathered_context.slot_mapping.shape[0]))
+            if (
+                self._shardq_fused_kv_insert(
+                    k_c_normed, k_pe, kv_cache, attn_metadata
+                )
+                is not None
+            ):
+                # The local cache rows (update_kv_cache skipped them) and the
+                # workspace rows of the new tokens, in one kernel.
+                from vllm.v1.attention.ops.dcp_shardq.kv_insert import (
+                    shardq_kv_insert,
+                )
+
+                # The slot mapping update_kv_cache left for this write (else
+                # the step's, of this layer's KV cache group).
+                local_slots = self._shardq_local_slots
+                self._shardq_local_slots = None
+                if local_slots is None:
+                    local_slots = attn_metadata.slot_mapping
+                local_slots = local_slots[: min(local_slots.numel(), num_actual_toks)]
+                shardq_kv_insert(
+                    k_c_normed[: local_slots.numel()],
+                    k_pe[: local_slots.numel()],
+                    self._k_scale,
+                    kv_cache,
+                    local_slots,
+                    gathered_context.mla_view(kv_cache),
+                    gathered_context.mla_slot_mapping,
+                    num_dcp_decode_tokens,
+                )
+                gathered_context.write_new_tokens = None
+            elif gathered_context.num_groups == 1:
+                write_new_tokens(0, int(gathered_context.mla_slot_mapping.shape[0]))
                 gathered_context.write_new_tokens = None
             else:
                 # Each group's tokens land while the attention holds it.
@@ -1109,7 +1170,35 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 output_scale=mha_output_scale,
             )
 
-        if num_mqa_tokens > 0:
+        shardq_proj = (
+            num_mqa_tokens > 0
+            and num_mha_tokens == 0
+            and gathered_context is not None
+            and self.W_UK_T_shardq is not None
+            and self.W_UV_shardq is not None
+        )
+        if shardq_proj:
+            assert gathered_context is not None
+            # A DCP ShardQ step: the prefill rows exchange the 16-bit query
+            # before W_UK and the value output after W_UV
+            # (forward_mqa_shardq_proj); its leading decode rows keep the DCP
+            # path.
+            nd = gathered_context.num_decode_tokens
+            value = self.impl.forward_mqa_shardq_proj(  # type: ignore[attr-defined]
+                q[nd:num_mqa_tokens],
+                self.W_UK_T_shardq,
+                self.W_UV_shardq,
+                self._q_scale,
+                kv_cache,
+                attn_metadata,
+                self,
+            )
+            output[nd:num_mqa_tokens].view(value.shape).copy_(value)
+            if nd:
+                self._dcp_decode_rows_value(
+                    q[:nd], kv_cache, attn_metadata, gathered_context, output[:nd]
+                )
+        elif num_mqa_tokens > 0:
             # A DCP ShardQ step exchanges the local heads' query (shard_q).
             if q_dcp_replicated is not None and gathered_context is None:
                 mqa_q = q_dcp_replicated[:num_mqa_tokens]
@@ -1382,6 +1471,58 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             output_padded[num_actual_toks:].zero_()
         return output_padded
 
+    def _shardq_proj_capable(self) -> bool:
+        """Whether DCP ShardQ steps can exchange the 16-bit query before W_UK
+        and the value output after W_UV (forward_mqa_shardq_proj): plain BF16
+        W_UK / W_UV, a per-tensor FP8 cache with an FP8 query, no query head
+        padding of the layer's own and no PCP."""
+        return (
+            self.use_shardq
+            and self.impl.dcp_world_size > 1
+            and get_tp_group().world_size > 1
+            and hasattr(self.impl, "forward_mqa_shardq_proj")
+            and self.kv_cache_dtype in ("fp8", "fp8_e4m3")
+            and bool(getattr(self.impl, "supports_quant_query_input", False))
+            and self.q_pad_num_heads is None
+            and not self.use_pcp
+            and self.hisparse_cache is None
+        )
+
+    def _shardq_fused_kv_insert(
+        self,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: "MLACommonMetadata | None",
+    ) -> "DcpShardQContext | None":
+        """The gathered context of a DCP ShardQ step of one request group
+        whose new tokens' MLA rows ``forward_impl`` writes into the local cache
+        and the workspace with one kernel (shardq_kv_insert; ``update_kv_cache``
+        skips its write), else None."""
+        if (
+            not self.use_shardq
+            or attn_metadata is None
+            or self.hisparse_cache is not None
+            or self.use_pcp
+            or self.kv_cache_dtype not in ("fp8", "fp8_e4m3")
+            or kv_cache.numel() == 0
+        ):
+            return None
+        shardq = getattr(attn_metadata, "shardq", None)
+        context = getattr(shardq, "gathered_context", None)
+        if context is None or context.num_groups != 1:
+            return None
+        from vllm.v1.attention.ops.dcp_shardq.kv_insert import (
+            shardq_kv_insert_supported,
+        )
+
+        cache = kv_cache.view(current_platform.fp8_dtype())
+        if not shardq_kv_insert_supported(
+            kv_c_normed, k_pe.reshape(k_pe.shape[0], -1), cache
+        ):
+            return None
+        return context
+
     def _dcp_decode_rows(
         self,
         mqa_q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
@@ -1410,6 +1551,25 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             seq_lens=attn_metadata.seq_lens[:num_decodes],  # type: ignore[attr-defined]
             query_start_loc=attn_metadata.query_start_loc[: num_decodes + 1],
         )
+
+    def _dcp_decode_rows_value(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: "MLACommonMetadata",
+        gathered_context: "DcpShardQContext",
+        out: torch.Tensor,
+    ) -> None:
+        """The value output of a DCP ShardQ step's leading decode rows ``q``
+        [nd, N, P + R] into ``out`` [nd, N * V] on the DCP path, beside
+        forward_mqa_shardq_proj's prefill rows: W_UK, the FP8 query (the
+        layer's cat + static quant), ``_dcp_decode_rows`` and W_UV."""
+        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        ql_nope = q.new_empty((q.shape[0], self.num_heads, self.kv_lora_rank))
+        torch.bmm(q_nope.transpose(0, 1), self.W_UK_T, out=ql_nope.transpose(0, 1))
+        mqa_q = self._decode_concat_quant_fp8_op(ql_nope, q_pe, self._q_scale)
+        latent = self._dcp_decode_rows(mqa_q, kv_cache, attn_metadata, gathered_context)
+        self._v_up_proj(latent, out=out)
 
     def _reserve_dcp_shardq_workspace(self, device: torch.device) -> None:
         """Reserve the gathered-context workspace of DCP ShardQ steps (see
@@ -1581,6 +1741,28 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 )
                 rocm_aiter_ops.triton_fp8_bmm(
                     x, self.W_V, self.W_V_scale, group_size=128, transpose_bm=True
+                )
+        elif self._shardq_proj_capable():
+            # DCP ShardQ steps run W_UK and W_UV on token rows with every head
+            # (forward_mqa_shardq_proj): gather all TP ranks' heads, in the
+            # exchange's head order (rank-major), and keep this rank's heads as
+            # views of them.
+            tp = get_tp_group()
+            w_uk_t = tp.all_gather(W_UK.permute(1, 2, 0).contiguous(), dim=0)
+            w_uv = tp.all_gather(W_UV.transpose(0, 1).contiguous(), dim=0)
+            heads = slice(
+                tp.rank_in_group * self.num_heads,
+                (tp.rank_in_group + 1) * self.num_heads,
+            )
+            replace_parameter(self, "W_UK_T_shardq", w_uk_t)
+            replace_parameter(self, "W_UV_shardq", w_uv)
+            replace_parameter(self, "W_UV", self.W_UV_shardq[heads])
+            replace_parameter(self, "W_UK_T", self.W_UK_T_shardq[heads])
+            if self.dcp_q_replicate:
+                replace_parameter(
+                    self,
+                    "W_UK_T_dcp_qrep",
+                    get_dcp_group().all_gather(self.W_UK_T.contiguous(), dim=0),
                 )
         else:
             # Convert from (L, N, V) to (N, L, V)

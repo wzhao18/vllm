@@ -81,6 +81,28 @@ logger = init_logger(__name__)
 GLOBAL_TOPK_MASK_MAX_BYTES = 128 * 1024 * 1024  # 128 MiB
 
 
+def _shardq_query_quant_pad(
+    ql_nope: torch.Tensor, q_pe: torch.Tensor, scale: torch.Tensor, padded_heads: int
+) -> torch.Tensor:
+    """cat(``ql_nope`` [T, H, L], ``q_pe`` [T, H, R]) quantized to FP8 with the
+    static per-tensor ``scale`` into a new [T, ``padded_heads``, L + R] buffer
+    whose extra heads are zero: the MLA layer's cat + ``scaled_fp8_quant`` and
+    ShardQ's head padding, in one kernel where it applies."""
+    from vllm.v1.attention.ops.dcp_shardq.query_quant import (
+        shardq_query_quant_pad,
+    )
+
+    out = shardq_query_quant_pad(ql_nope, q_pe, scale, padded_heads)
+    if out is not None:
+        return out
+    num_tokens, num_heads, _ = ql_nope.shape
+    query = torch.cat((ql_nope, q_pe), dim=-1)
+    quant, _ = ops.scaled_fp8_quant(query.view(num_tokens * num_heads, -1), scale)
+    out = quant.new_zeros((num_tokens, padded_heads, query.shape[-1]))
+    out[:, :num_heads] = quant.view(num_tokens, num_heads, -1)
+    return out
+
+
 def _topk_mask_shape(
     batch_size: int,
     max_query_len: int,
@@ -924,15 +946,35 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
                 is_quantized_kv_cache(kv_cache_dtype)
                 and self.supports_quant_query_input
             )
-            PUSH_ROWS_KERNEL.register_warmup(
-                rows=(
-                    (
-                        current_platform.fp8_dtype() if fp8_query else dtype,
-                        num_heads * (kv_lora_rank + qk_rope_head_dim),
-                    ),
-                    (dtype, num_heads * kv_lora_rank),
+            rows = [
+                (
+                    current_platform.fp8_dtype() if fp8_query else dtype,
+                    num_heads * (kv_lora_rank + qk_rope_head_dim),
+                ),
+                (dtype, num_heads * kv_lora_rank),
+            ]
+            if fp8_query and parallel_config.decode_context_parallel_size > 1:
+                # DCP ShardQ steps exchange the 16-bit query before W_UK and the
+                # value output after W_UV (forward_mqa_shardq_proj), and write
+                # their new tokens' MLA rows with one kernel.
+                rows += [
+                    (dtype, num_heads * (qk_nope_head_dim + qk_rope_head_dim)),
+                    (dtype, num_heads * v_head_dim),
+                ]
+                from vllm.v1.attention.ops.dcp_shardq.kv_insert import (
+                    SHARDQ_KV_INSERT_KERNEL,
                 )
-            )
+                from vllm.v1.attention.ops.dcp_shardq.query_quant import (
+                    SHARDQ_QUERY_QUANT_KERNEL,
+                )
+
+                SHARDQ_KV_INSERT_KERNEL.register_warmup(
+                    src_dtype=dtype, nope=kv_lora_rank, rope=qk_rope_head_dim
+                )
+                SHARDQ_QUERY_QUANT_KERNEL.register_warmup(
+                    src_dtype=dtype, nope=kv_lora_rank, rope=qk_rope_head_dim
+                )
+            PUSH_ROWS_KERNEL.register_warmup(rows=tuple(rows))
 
     def record_logical_topk_ready(self) -> None:
         if self.index_group is not None:
@@ -1163,6 +1205,29 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
             shardq.split,
             padded_heads=self.shardq_query_heads(num_heads),
         )
+        out = self._attend_shardq(q, kv_c_and_k_pe_cache, attn_metadata, layer)
+        out = unshard_out(
+            out[:, :num_heads], shardq.split, num_leading_rows=num_decode_tokens
+        )
+        if decode_out is not None:
+            out[:num_decode_tokens] = decode_out
+        return out
+
+    def _attend_shardq(
+        self,
+        q: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: T,
+        layer: AttentionLayer,
+    ) -> torch.Tensor:
+        """The sparse MQA of this rank's ShardQ token slice ``q`` [T_rank,
+        H_kernel, D] (all heads, padded to the kernel's) over the step's cache,
+        or its gathered context under DCP: the latent [T_rank, H_kernel, L]."""
+        shardq = attn_metadata.shardq
+        assert shardq is not None and self.topk_indices_buffer is not None
+        num_decode_tokens = shardq.num_decode_tokens
+        block_size = attn_metadata.block_size
+        _, block_stride_rows = flat_kv_row_view(kv_c_and_k_pe_cache, block_size)
         block_table = attn_metadata.block_table
         if shardq.gathered_context is not None:
             # The prefill rows of a DCP step attend its gathered context.
@@ -1175,15 +1240,38 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
             num_decode_tokens : num_decode_tokens + q.shape[0]
         ]
 
+        context = shardq.gathered_context
+        rank_major = context.rank_major if context is not None else None
+        remap_kwargs: dict[str, Any] = {}
+        if rank_major is not None:
+            # Rank-major MLA rows (dcp_shardq.rank_major): token t of request q
+            # at row (t % W) * region_rows + starts[q] + t // W, the remap's
+            # prefill-workspace addressing; the copies of the peers' context
+            # rows must have landed.
+            assert context is not None
+            context.wait_mla()
+            remap_kwargs = dict(
+                HAS_PREFILL_WORKSPACE=True,
+                prefill_workspace_starts=rank_major.starts_by_req,
+                prefill_workspace_rank_stride=rank_major.region_rows,
+                dcp_size=rank_major.world,
+                dcp_rank=rank_major.rank,
+                cp_kv_cache_interleave_size=1,
+            )
+
         def attend(rows: slice) -> torch.Tensor:
+            req_ids = shardq.req_id_per_token[rows]
+            if rank_major is not None:
+                remap_kwargs["prefill_workspace_request_ids"] = req_ids
             physical_topk, valid_counts = triton_convert_req_index_to_global_index(
-                shardq.req_id_per_token[rows],
+                req_ids,
                 block_table,
                 topk[rows],
                 BLOCK_SIZE=block_size,
                 BLOCK_STRIDE_ROWS=block_stride_rows,
                 NUM_TOPK_TOKENS=topk.shape[1],
                 return_valid_counts=True,
+                **remap_kwargs,
             )
             # The token slice's output goes straight back to the head shards:
             # the LSE (and the empty-row masking that comes with it) is never
@@ -1200,7 +1288,6 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
             )
             return out
 
-        context = shardq.gathered_context
         if context is None or context.num_groups == 1:
             out = attend(slice(None))
         else:
@@ -1224,12 +1311,49 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
                 out[a:b] = part
             if out is None:
                 out = attend(slice(None))
-        out = unshard_out(
-            out[:, :num_heads], shardq.split, num_leading_rows=num_decode_tokens
-        )
-        if decode_out is not None:
-            out[:num_decode_tokens] = decode_out
         return out
+
+    def forward_mqa_shardq_proj(
+        self,
+        q: torch.Tensor,
+        w_uk_t: torch.Tensor,
+        w_uv: torch.Tensor,
+        q_scale: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: T,
+        layer: AttentionLayer,
+    ) -> torch.Tensor:
+        """The prefill rows of a DCP ShardQ step, exchanged before W_UK and
+        after W_UV (see ``SHARDQ_PROJ``): ``q`` [T, H_local, P + R] (the
+        16-bit query of every prefill token for this rank's heads) -> the
+        value output [T, H_local, V] of every prefill token for this rank's
+        heads, a view of the exchange buffer that the next call reuses.
+
+        This rank's token slice goes through W_UK (``w_uk_t`` [H, P, L], every
+        head), the FP8 query quantization and head padding, the sparse MQA and
+        W_UV (``w_uv`` [H, L, V]) with all heads, exactly the per-head math of
+        ``forward_mqa_shardq`` and the layer's W_UK / W_UV, on token rows
+        instead of head rows."""
+        shardq = attn_metadata.shardq
+        assert shardq is not None and shardq.gathered_context is not None
+        split = shardq.split
+        num_heads = split.world * q.shape[1]
+        nope, lora = w_uk_t.shape[1], w_uk_t.shape[2]
+        assert w_uk_t.shape[0] == num_heads and w_uv.shape[:2] == (num_heads, lora)
+        # [T_rank, H, P + R], the exchange buffer.
+        q = shard_q(q, split)
+        num_local = q.shape[0]
+        ql_nope = q.new_empty((num_local, num_heads, lora))
+        torch.bmm(q[..., :nope].transpose(0, 1), w_uk_t, out=ql_nope.transpose(0, 1))
+        padded_heads = self.shardq_query_heads(num_heads)
+        mqa_q = _shardq_query_quant_pad(ql_nope, q[..., nope:], q_scale, padded_heads)
+        del ql_nope
+        out = self._attend_shardq(mqa_q, kv_c_and_k_pe_cache, attn_metadata, layer)
+        del mqa_q
+        value = out.new_empty((num_local, num_heads, w_uv.shape[2]))
+        torch.bmm(out[:, :num_heads].transpose(0, 1), w_uv, out=value.transpose(0, 1))
+        del out
+        return unshard_out(value, split)
 
     def _forward_mqa_kernel(
         self,

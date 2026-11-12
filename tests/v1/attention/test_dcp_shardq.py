@@ -251,12 +251,20 @@ def _push_all(rep: Replicated, world: int, num_dst: int = 2):
 
 
 def _check_workspace(
-    ws_mla, ws_index, rep: Replicated, new_mla_rows: bool, fill, num_decodes=0
+    ws_mla,
+    ws_index,
+    rep: Replicated,
+    new_mla_rows: bool,
+    fill,
+    num_decodes=0,
+    rank_major=None,
 ):
     """The workspace holds every section of each prefill request's tokens (the
     requests from ``num_decodes`` on, in pages of their own; the MLA rows of
     its new tokens only with ``new_mla_rows``); with ``fill``, every other
-    byte still holds it."""
+    byte still holds it. With a ``rank_major`` plan the MLA rows are
+    rank-major (dcp_shardq.rank_major): token t of request q at row
+    (t % W) * region_rows + starts[q] + t // W."""
     workspaces = {"mla": ws_mla, "index": ws_index}
     expected = {
         name: torch.full_like(_flat(ws), FILL) for name, ws in workspaces.items()
@@ -271,9 +279,19 @@ def _check_workspace(
             name, offset, row = section
             keep = tokens if name == "index" or new_mla_rows else tokens[:context]
             cache, src = rep.token_bytes(q, keep, section)
-            pages = int(page_start[q - num_decodes]) + keep // PAGE
-            stride = workspaces[name].stride(0)
-            dst = _row_bytes(pages * stride, keep % PAGE, offset, row).reshape(-1)
+            if name == "mla" and rank_major is not None:
+                world = rank_major.world
+                rows = (
+                    (keep % world) * rank_major.region_rows
+                    + int(rank_major.starts[q - num_decodes])
+                    + keep // world
+                )
+                dst = _row_bytes(rows * 0, rows, offset, row).reshape(-1)
+            else:
+                pages = int(page_start[q - num_decodes]) + keep // PAGE
+                stride = workspaces[name].stride(0)
+                dst = _row_bytes(pages * stride, keep % PAGE, offset, row)
+                dst = dst.reshape(-1)
             expected[name][dst] = _flat(cache)[src.reshape(-1)]
             written[name][dst] = True
     for name, ws in (("mla", ws_mla), ("index", ws_index)):
@@ -905,7 +923,7 @@ def _distributed_worker(rank, world, init_file, cache_dtype, kernel):
                     kv_c,
                     k_pe,
                     gathered_context.mla_view(mla),
-                    gathered_context.slot_mapping,
+                    gathered_context.mla_slot_mapping,
                     cache_dtype,
                     scale,
                 )
@@ -939,6 +957,7 @@ def _distributed_worker(rank, world, init_file, cache_dtype, kernel):
                     rep,
                     new_mla_rows=True,
                     fill=False,
+                    rank_major=plan.rank_major,
                 )
                 assert torch.equal(dcp_topk, tp_topk)
                 assert torch.equal(dcp_out, tp_out)
@@ -1321,6 +1340,7 @@ def _layer_worker(rank, world, init_file, cache_dtype, kernel, index_format="fp8
                     new_mla_rows=True,
                     fill=False,
                     num_decodes=num_decodes,
+                    rank_major=shardq.gathered_context.rank_major,
                 )
                 # A replicated query (DCP query replication) is left aside.
                 q_rep = get_tp_group().all_gather(q, dim=1)
@@ -1401,6 +1421,7 @@ def _layer_worker(rank, world, init_file, cache_dtype, kernel, index_format="fp8
                 new_mla_rows=True,
                 fill=False,
                 num_decodes=context.num_decodes,
+                rank_major=context.rank_major,
             )
 
             # Steps that keep the DCP path (each fits the workspace): fewer
