@@ -337,6 +337,64 @@ def test_plan_bounds_and_capacity():
     assert _build_context(lens, layout, 8, 3, int(pages.max()) - 1) is None
 
 
+@pytest.mark.parametrize(
+    "lens,world,budget",
+    [
+        # C512 bench shapes (DCP4): 5 x 3480 new tokens on 129K context, one
+        # 870-row chunk per request on every rank; 6 x 5461 -> 2 x ~683.
+        ([(129024, 3480)] * 5, 4, 128 << 20),
+        ([(129024, 5461)] * 6, 4, 128 << 20),
+        ([(139264, 8192)] * 2, 8, 128 << 20),
+        # Requests shorter than the fold, several requests per chunk, and
+        # budgets that cut every request into many parts.
+        ([(0, 3), (5, 1), (100, 7)], 4, 1 << 28),
+        ([(50000, 2000), (0, 9), (70000, 5000)], 8, 1 << 20),
+        ([(10000, 1000)] * 3, 2, 1 << 18),
+    ],
+)
+def test_indexer_chunks_cut_each_ranks_rows_evenly(lens, world, budget):
+    """Each rank's indexer chunks score its ShardQ rows exactly once, in token
+    order, each within the logits element budget (padded rows x aligned row
+    width), in equal parts on every rank; a request's first chunk starts at
+    its first token (it gathers the keys)."""
+    from vllm.v1.attention.ops.dcp_shardq.context import (
+        _LOGITS_ROW_ALIGN,
+        _logits_width,
+        _rank_chunk_specs,
+    )
+    from vllm.v1.attention.ops.shardq import fold_split
+
+    new = np.array([n for _, n in lens])
+    seq = np.array([c + n for c, n in lens])
+    qsl = np.r_[0, np.cumsum(new)]
+    calls = []
+    for rank in range(world):
+        own = fold_split(qsl, world)[rank]
+        scored, seen, sizes = [], set(), []
+        for req, query in _rank_chunk_specs(seq, new, 1 << 30, budget, world, rank):
+            if req.start not in seen:
+                assert query.start == 0
+                seen.add(req.start)
+            lo, hi = qsl[req.start] + query.start, qsl[req.start] + query.stop
+            rows = own[(own >= lo) & (own < hi)]
+            width = max(_logits_width(int(s)) for s in seq[req])
+            padded = -(-rows.size // _LOGITS_ROW_ALIGN) * _LOGITS_ROW_ALIGN
+            assert rows.size and padded * width <= max(
+                budget, _LOGITS_ROW_ALIGN * width
+            )
+            scored.append(rows)
+            sizes.append((rows.size, req.stop - req.start))
+        np.testing.assert_array_equal(np.concatenate(scored), own)
+        calls.append(sizes)
+    # Equal parts when every rank owns rows of every request: the same calls,
+    # whose row counts differ by at most one row per fold piece.
+    if all(n >= 2 * world for n in new):
+        assert len({len(sizes) for sizes in calls}) == 1
+        for sizes in zip(*calls):
+            counts = [s for s, _ in sizes]
+            assert max(counts) - min(counts) <= 2 * sizes[0][1]
+
+
 @pytest.mark.parametrize("cache_dtype,index_format", LAYOUT_CASES)
 def test_indexer_chunks_read_the_workspace_like_a_replicated_cache(
     cache_dtype, index_format

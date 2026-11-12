@@ -57,6 +57,7 @@ from vllm.v1.attention.ops.shardq import (
     ShardQSplit,
     _symm_buffer,
     _SymmBuffer,
+    fold_split,
     make_shardq_split,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
@@ -485,66 +486,75 @@ def _rank_query_rows(query_len: int, world: int) -> np.ndarray:
     return lens[:world] + lens[world:][::-1]
 
 
-def split_shardq_indexer_chunks(
+def _rank_chunk_specs(
     seq_lens: np.ndarray,
     query_lens: np.ndarray,
-    world: int,
     max_keys: int,
     max_logits_elems: int,
+    world: int,
+    rank: int,
 ) -> list[tuple[slice, slice]]:
-    """Indexer prefill chunks of a ShardQ request group, as
-    ``(req_slice, query_slice)`` like
-    ``DeepseekV32IndexerMetadataBuilder._split_indexer_prefill_chunks``.
+    """This rank's indexer chunks of prefill requests ``seq_lens`` /
+    ``query_lens``: (request slice, query-token slice of those requests).
 
-    A rank scores only its fold pieces of each request, so a chunk's logits
-    hold that rank's rows, not the chunk's query tokens: the budget bounds the
-    most rows any rank scores in the chunk times the logits row width (every
-    rank gets the same chunks). Consecutive requests share a chunk while their
-    keys fit ``max_keys`` and their logits fit ``max_logits_elems``; a request
-    that does not fit alone is cut along its query tokens at the fold pieces
-    (inside a piece only when one piece alone exceeds the budget).
+    Each rank scores only its ShardQ rows (two fold pieces per request,
+    ``fold_split``), so the logits budget bounds a chunk's *local* rows:
+    (most rows any rank scores in the chunk, padded to DeepGEMM's 4-row Q
+    block) x (the aligned logits row width) <= ``max_logits_elems``.
+    Consecutive requests share a chunk while their keys fit ``max_keys`` and
+    their logits fit the budget; every rank derives the same plan.
+
+    A request that does not fit alone is cut into the fewest parts whose rows
+    fit, and each rank cuts *its own* rows of the request into that many equal
+    parts: every rank then scores equal row counts in the same number of
+    calls (cutting the global token range instead leaves each rank a
+    different, misaligned share of each part, e.g. 435 / 426 + 9 / 142 + 293,
+    and the top-k and logits launches pay per call). The rows scored, hence
+    the top-k, are unchanged.
     """
+    rows = [fold_split(np.array([0, int(q)]), world) for q in query_lens]
     n = len(seq_lens)
-    chunks: list[tuple[slice, slice]] = []
+    out: list[tuple[slice, slice]] = []
     i = 0
     while i < n:
-        start, rows, keys, width = i, np.zeros(world, np.int64), 0, 0
+        start, chunk_rows, keys, width = i, np.zeros(world, np.int64), 0, 0
         while i < n:
-            new_rows = rows + _rank_query_rows(int(query_lens[i]), world)
+            new_rows = chunk_rows + _rank_query_rows(int(query_lens[i]), world)
             new_width = max(width, _logits_width(int(seq_lens[i])))
             new_keys = keys + int(seq_lens[i])
             padded = round_up(int(new_rows.max()), _LOGITS_ROW_ALIGN)
             if new_keys > max_keys or padded * new_width > max_logits_elems:
                 break
-            rows, keys, width = new_rows, new_keys, new_width
+            chunk_rows, keys, width = new_rows, new_keys, new_width
             i += 1
         if i > start:
-            chunks.append((slice(start, i), slice(0, int(query_lens[start:i].sum()))))
+            # Whole requests; a rank owning none of their rows skips the chunk.
+            if any(len(rows[q][rank]) for q in range(start, i)):
+                out.append(
+                    (slice(start, i), slice(0, int(query_lens[start:i].sum())))
+                )
             continue
-        # One request over the budget: cut its query tokens at the pieces.
-        q = int(query_lens[i])
+        # One request over the budget: the fewest equal parts of every rank's
+        # rows that fit (at least one 4-row block per part).
         max_rows = max_logits_elems // _logits_width(int(seq_lens[i]))
-        max_rows = max(_LOGITS_ROW_ALIGN, max_rows // _LOGITS_ROW_ALIGN * _LOGITS_ROW_ALIGN)
-        bounds = (np.arange(2 * world + 1) * q) // (2 * world)
-        counts = np.zeros(world, np.int64)
-        lo = pos = 0
-        for piece in range(2 * world):
-            owner = piece if piece < world else 2 * world - 1 - piece
-            left = int(bounds[piece + 1] - bounds[piece])
-            while left > 0:
-                take = min(left, max_rows - int(counts[owner]))
-                if take == 0:
-                    chunks.append((slice(i, i + 1), slice(lo, pos)))
-                    counts[:] = 0
-                    lo = pos
-                    continue
-                counts[owner] += take
-                pos += take
-                left -= take
-        if pos > lo:
-            chunks.append((slice(i, i + 1), slice(lo, pos)))
+        max_rows = max(
+            _LOGITS_ROW_ALIGN, max_rows // _LOGITS_ROW_ALIGN * _LOGITS_ROW_ALIGN
+        )
+        local_max = max(len(r) for r in rows[i])
+        parts = max(1, -(-local_max // max_rows))
+        own = rows[i][rank]
+        cuts = [(j * len(own)) // parts for j in range(parts + 1)]
+        keep = [j for j in range(parts) if cuts[j] < cuts[j + 1]]
+        if keep:
+            # Each part runs from this rank's first row of it (0 for the first
+            # part, which gathers the request's keys) to the next part's.
+            starts = [0] + [int(own[cuts[j]]) for j in keep[1:]]
+            starts.append(int(query_lens[i]))
+            out.extend(
+                (slice(i, i + 1), slice(lo, hi)) for lo, hi in zip(starts, starts[1:])
+            )
         i += 1
-    return chunks
+    return out
 
 
 def build_dcp_shardq_context(
@@ -564,8 +574,10 @@ def build_dcp_shardq_context(
     request groups that each fit (one request always fits: the workspace
     holds at least ``max_model_len`` tokens).
 
-    Every rank derives the same plan; the push kernel finds each rank's rows
-    from the step's device sequence lengths.
+    Every rank derives the same groups and workspace layout; the push kernel
+    finds each rank's rows from the step's device sequence lengths. Only the
+    indexer chunks are per rank (``_rank_chunk_specs``): no collective runs
+    between a group's chunks.
     """
     num_reqs = common_attn_metadata.num_reqs
     query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
@@ -616,12 +628,13 @@ def build_dcp_shardq_context(
     group_chunks = []
     for g_lo, g_hi in groups:
         # A group's chunks never span two groups: each runs over one gather.
-        chunk_specs = split_shardq_indexer_chunks(
+        chunk_specs = _rank_chunk_specs(
             prefill_seq_lens_cpu[g_lo:g_hi].numpy(),
             query_lens[g_lo:g_hi],
-            world,
             max_indexer_keys,
             max_logits_elems,
+            world,
+            rank,
         )
         chunks = [
             build_prefill_chunk_metadata(
