@@ -1,7 +1,11 @@
 // Kimi-K3: FlashKDA fwd_launch.cu @ vllm-project/FlashKDA 17a037d (MIT, see
 // LICENSE.FlashKDA), changed only to take `mode` (bit 0: run K1 prepare, bit 1:
-// run K2 recurrence) and to instantiate varlen int32 only. Kimi-K3: K2 picks
-// the narrowest one-wave V slicing (64, 32 or 16 columns) per launch shape.
+// run K2 recurrence, bit 2: K2 without outputs, bit 3: K2 with v = 0) and to
+// instantiate varlen int32 only. Kimi-K3: K2 picks a V slicing (16, 32, 64
+// columns or the full tile) per launch shape, see the policy below.
+#include <algorithm>
+#include <stdexcept>
+#include <string>
 #include <type_traits>
 
 #include "fwd.h"
@@ -176,13 +180,25 @@ void launch_fwd(
     constexpr int kK2Threads = 128 + 128;
     dim3 block_k2(kK2Threads);
 
-    // Returns false when the VD slicing does not fit in one wave.
-    auto launch_vsplit = [&](auto vd_tag, int blocks_per_sm) -> bool {
+    // V-split launch: one block per (sequence, head, VD value columns); each
+    // math warp owns 16 columns, so every slicing runs the same per-column
+    // instruction sequence and all slicings give bitwise-identical outputs
+    // and states. kMinBlocks is the launch-bounds residency the build is
+    // compiled for (it caps registers); the launch happens only when the
+    // whole grid is resident at once (the measured occupancy), since a second
+    // wave would double the serial chunk chain.
+    auto launch_vsplit = [&](auto vd_tag, auto stages_tag, auto min_blocks_tag,
+                             auto no_out_tag, auto zero_v_tag,
+                             int max_blocks_per_sm) -> bool {
       constexpr int kVD = decltype(vd_tag)::value;
+      constexpr int kStages = decltype(stages_tag)::value;
+      constexpr int kMinBlocks = decltype(min_blocks_tag)::value;
+      constexpr bool kNoOut = decltype(no_out_tag)::value;
+      constexpr bool kZeroV = decltype(zero_v_tag)::value;
       constexpr int kThreads = (kVD >= 64 ? 128 : (kVD / 16) * 32) + 2 * 32;
       using L = K2Layouts<D, CHUNK, kVD>;
-      const int blocks = H * (D / kVD) * N;
-      if (blocks > blocks_per_sm * num_sms) return false;
+      using SharedStorageK2T = SharedStorageK2<L, kStages, kOutputStages>;
+      const int smem_size_k2 = int(sizeof(SharedStorageK2T));
       auto tma_load_v_vsplit =
           make_tma_copy(SM90_TMA_LOAD{}, m_v, typename L::TMAVOLayout{});
       auto tma_store_out_vsplit =
@@ -190,18 +206,30 @@ void launch_fwd(
       auto [tma_load_initial_state_vsplit, tma_store_final_state_vsplit] =
           make_state_tma(typename L::TMAStateSmemLayout{},
                          typename L::TMAFP32StateSmemLayout{});
-      using SharedStorageK2T = SharedStorageK2<L, kInputStages, kOutputStages>;
-      int smem_size_k2 = sizeof(SharedStorageK2T);
-      dim3 grid_k2(H * (D / kVD), N);
       auto kernel2 = _flash_kda_fwd_recurrence<
           decltype(tma_load_v_vsplit), decltype(tma_load_beta2),
           decltype(tma_load_initial_state_vsplit),
           decltype(tma_store_final_state_vsplit),
-          decltype(tma_store_out_vsplit), CHUNK, D, kInputStages, kOutputStages,
+          decltype(tma_store_out_vsplit), CHUNK, D, kStages, kOutputStages,
           kThreads, HasStateIn, HasStateOut, StateFP32, HasCheckpoint,
-          IsVarlen, SeqlenT, kVD>;
+          IsVarlen, SeqlenT, kVD, kMinBlocks, kNoOut, kZeroV>;
+      // Resident blocks per SM of this build (registers, shared memory),
+      // queried once per instantiation.
       cudaFuncSetAttribute(kernel2, cudaFuncAttributeMaxDynamicSharedMemorySize,
                            smem_size_k2);
+      static const int resident = [&] {
+        int blocks = 0;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &blocks, kernel2, kThreads, smem_size_k2) != cudaSuccess) {
+          blocks = 0;
+        }
+        return blocks;
+      }();
+      const int blocks = H * (D / kVD) * N;
+      if (blocks > std::min(resident, max_blocks_per_sm) * num_sms) {
+        return false;
+      }
+      dim3 grid_k2(H * (D / kVD), N);
       kernel2<<<grid_k2, dim3(kThreads), smem_size_k2, stream>>>(
           tma_load_v_vsplit, tma_load_beta2, tma_load_initial_state_vsplit,
           tma_store_final_state_vsplit, tma_store_out_vsplit, out_ptr,
@@ -210,15 +238,51 @@ void launch_fwd(
           ws_mqk);
       return true;
     };
+    using I16 = std::integral_constant<int, 16>;
+    using I32 = std::integral_constant<int, 32>;
+    using I64 = std::integral_constant<int, 64>;
+    using S3 = std::integral_constant<int, 3>;
+    using S4 = std::integral_constant<int, 4>;
+    using B1 = std::integral_constant<int, 0>;  // default launch bounds
+    using B3 = std::integral_constant<int, 3>;
+    using No = std::false_type;
+    using Yes = std::true_type;
 
-    // Narrowest slicing whose grid fits one block per SM: fewer math warps
-    // per CTA shorten the per-chunk critical path (measured on sm_107, H=12
-    // 1x5504: VD=64 181 us, VD=32 150 us, VD=16 141 us). Two blocks per SM
-    // are slower than the full width on sm_10x, so a grid that does not fit
-    // one wave falls back to the full-width kernel below.
-    if (launch_vsplit(std::integral_constant<int, 16>{}, 1)) return;
-    if (launch_vsplit(std::integral_constant<int, 32>{}, 1)) return;
-    if (launch_vsplit(std::integral_constant<int, 64>{}, 1)) return;
+    // Per-shape policy (measured on sm_107, 212 SMs; us per layer):
+    //  - 16 columns, one block per SM, 4 input stages: shortest chunk step
+    //    (one math warp per SM; 4 stages hide the workspace load: H=12 2x8192
+    //    217 -> 205, 2x2752 76 -> 73).
+    //  - 32 columns, up to 3 blocks per SM (6 math warps): when the 16-column
+    //    grid exceeds the SMs. H=24 5x3480 165 -> 147, 6x5461 251 -> 226 vs the
+    //    full-width kernel (one 8-block warpgroup per (sequence, head)).
+    //  - 64 columns, one block per SM; else the full-width kernel.
+    // NoOut / ZeroV (segment-parallel transition passes) use the same
+    // slicing rule and otherwise skip only the output work.
+    const bool no_out = (mode & 4) != 0;
+    const bool zero_v = (mode & 8) != 0;
+    if constexpr (HasStateOut && StateFP32 && !HasCheckpoint) {
+      if (no_out) {
+        if (zero_v) {
+          if (launch_vsplit(I16{}, S4{}, B1{}, Yes{}, Yes{}, 1)) return;
+          if (launch_vsplit(I32{}, S3{}, B3{}, Yes{}, Yes{}, 3)) return;
+        } else {
+          if (launch_vsplit(I16{}, S4{}, B1{}, Yes{}, No{}, 1)) return;
+          if (launch_vsplit(I32{}, S3{}, B3{}, Yes{}, No{}, 3)) return;
+        }
+        throw std::runtime_error(
+            "k3_flashkda_split: K2 transition pass grid does not fit one wave "
+            "(H=" + std::to_string(H) + ", sequences=" + std::to_string(N) +
+            ")");
+      }
+    }
+    if (no_out || zero_v) {
+      throw std::runtime_error(
+          "k3_flashkda_split: K2 NoOut / ZeroV need an fp32 final state and no "
+          "checkpoint");
+    }
+    if (launch_vsplit(I16{}, S4{}, B1{}, No{}, No{}, 1)) return;
+    if (launch_vsplit(I32{}, S3{}, B3{}, No{}, No{}, 3)) return;
+    if (launch_vsplit(I64{}, S3{}, B1{}, No{}, No{}, 1)) return;
 
     using SharedStorageK2T = SharedStorageK2<K2L, kInputStages, kOutputStages>;
     int smem_size_k2 = sizeof(SharedStorageK2T);
