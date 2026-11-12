@@ -31,9 +31,10 @@ A transfer executes this in three steps, all derived from the same plan:
    bytes of a source kernel block (pages split for the transfer, e.g.
    `gcd(source block, destination block)` rows), read as it is: its bytes
    are in the source's page layout, which another block size can change
-   (an indexer page keeps its values before its scales, so a unit of a
-   longer page is not a run of rows). Every unit of a source kernel block
-   that holds a planned row is read, into consecutive staging units.
+   (a values-then-scales kernel page as long as the block keeps its scales
+   elsewhere, so a unit of a longer page is not a run of rows). Every unit
+   of a source kernel block that holds a planned row is read, into
+   consecutive staging units.
 3. Row gather (`RowGather`, on the device): every destination row is copied
    piece by piece from its staged source kernel block, addressed with the
    source's `KVRowLayout`, into the destination's layout, region by region;

@@ -2945,7 +2945,12 @@ class _FakeAttentionLayer(AttentionLayerBase):
 
 
 @pytest.mark.cpu_test
-def test_worker_collects_row_layouts_and_scales_of_its_layers():
+# The worker passes the kernel block of its KV cache groups: the whole block
+# of a packed (block-outermost) cache, which the model runner keeps whole.
+@pytest.mark.parametrize("group_kernel_block_size", [64, 640])
+def test_worker_collects_row_layouts_and_scales_of_its_layers(
+    group_kernel_block_size,
+):
     from vllm.distributed.kv_transfer.kv_connector.utils import (
         get_kv_cache_scales,
         get_kv_row_layouts,
@@ -2980,10 +2985,13 @@ def test_worker_collects_row_layouts_and_scales_of_its_layers():
     vllm_config = SimpleNamespace(
         compilation_config=SimpleNamespace(static_forward_context=layers)
     )
-    layouts = get_kv_row_layouts(vllm_config, specs, kernel_block_size=64)
+    layouts = get_kv_row_layouts(
+        vllm_config, specs, kernel_block_size=group_kernel_block_size
+    )
     assert layouts == {
         "mla": _MLA_ROWS,
-        # The indexer backend's 64-token kernel pages inside each block.
+        # The indexer backend's 64-token kernel pages inside each block, which
+        # its attention group cuts a packed block into.
         "idx": _INDEXER_ROWS,
     }
     assert get_kv_cache_scales(vllm_config, specs) == {"mla": (0.5, 1.0)}
@@ -2994,7 +3002,9 @@ def test_worker_collects_row_layouts_and_scales_of_its_layers():
         "Wrong", (_mla_backend(),), {"get_kv_cache_row_layout": wrong_rows}
     )
     with pytest.raises(ValueError, match="does not tile"):
-        get_kv_row_layouts(vllm_config, specs, kernel_block_size=64)
+        get_kv_row_layouts(
+            vllm_config, specs, kernel_block_size=group_kernel_block_size
+        )
 
 
 @pytest.mark.cpu_test

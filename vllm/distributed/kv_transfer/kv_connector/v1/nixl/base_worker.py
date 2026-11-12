@@ -3173,9 +3173,10 @@ class NixlBaseConnectorWorker:
     ) -> None:
         """Reject a peer for which a layer both sides hold stores its token
         rows differently: other row pieces (another KV format) always, and
-        other pages (e.g. an indexer page of another block size keeps its
-        scales elsewhere) unless the row gather of a RELAYOUT converts them
-        (`check_staged_rows`, at the peer's `RowGather`)."""
+        other pages (e.g. a values-then-scales kernel page as long as the
+        block keeps its scales elsewhere at another block size) unless the
+        row gather of a RELAYOUT converts them (`check_staged_rows`, at the
+        peer's `RowGather`)."""
         remote_layers = set(itertools.chain(*nixl_agent_meta.region_members))
         remote_layouts = nixl_agent_meta.kv_row_layouts
         for name in sorted(self._kv_row_layouts.keys() | remote_layouts.keys()):

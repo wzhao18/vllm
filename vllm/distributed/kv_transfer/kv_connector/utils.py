@@ -444,10 +444,14 @@ def get_kv_row_layouts(
     declares one (`AttentionBackend.get_kv_cache_row_layout`), checked against
     the layer's spec.
 
-    `kernel_block_size` is the kernel block the layers' pages are cut into,
-    as the caller (the KV connector worker) derived it with the model runner
-    (`select_common_block_size`).
+    `kernel_block_size` is the kernel block the KV cache groups are cut into,
+    as the caller (the KV connector worker) derived it with the model runner.
+    A layer whose backend takes no such block is viewed in smaller kernel
+    blocks of its own, as the model runner's attention group does (e.g. the
+    64-row pages of an indexer cache packed into larger blocks).
     """
+    from vllm.v1.worker.utils import select_common_block_size
+
     layer_type = cast(type[Any], AttentionLayerBase)
     layers = get_layers_from_vllm_config(vllm_config, layer_type, layer_specs)
     layouts: dict[str, KVRowLayout] = {}
@@ -455,9 +459,11 @@ def get_kv_row_layouts(
         spec = layer_specs[name]
         if not isinstance(spec, AttentionSpec):
             continue
-        layout = layer.get_attn_backend().get_kv_cache_row_layout(
-            spec, kernel_block_size
+        backend = layer.get_attn_backend()
+        layer_kernel_block_size = select_common_block_size(
+            kernel_block_size, [backend], [spec]
         )
+        layout = backend.get_kv_cache_row_layout(spec, layer_kernel_block_size)
         if layout is not None:
             layout.validate(spec)
             layouts[name] = layout

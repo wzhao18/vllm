@@ -79,8 +79,9 @@ def indexer_mxfp4(rows: int) -> KVRowLayout:
 )
 @pytest.mark.parametrize("start", [0, 10240])
 def test_relayout_kernel_matches_reference(rows, src, dst, kernel, start):
-    """With page-long kernel pages (Kimi K3.1's indexer), each side keeps
-    its scales at another offset: the gather reads the source's."""
+    """With page-long values-then-scales kernel pages, each side keeps its
+    scales at another offset: the gather reads the source's. (Kimi K3.1's
+    indexer uses 64-row kernel pages, the same on both sides.)"""
     src_kb = 64 if kernel == "64" else src.block_size
     dst_kb = 64 if kernel == "64" else dst.block_size
     unit = math.gcd(src_kb, dst_kb)
