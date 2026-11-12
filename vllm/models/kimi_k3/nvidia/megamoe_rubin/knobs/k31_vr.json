@@ -1,7 +1,7 @@
 {
  "version": 2,
  "comment": "Merged FlashInfer 0.7.3.dev20261031 sm107 tuner winners for the Kimi K3.1 routed MoE on VR200 (W=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr): every $W/moe4/results/fi107/knobs_*.json incl. the EP4 smoke files. Tuner timer: profiling_policy per record (native_events = eager launches behind a stream delay kernel, CUDA events, warm L2, no CUDA graph). Read-only data for megamoe_rubin.config.resolve_knobs.",
- "source_files": 58,
+ "source_files": 61,
  "entries": [
   {
    "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
@@ -3555,6 +3555,192 @@
    "provenance": {
     "file": "$W/moe4/results/fi107/knobs_xo_ep8_nvfp4_i2880.json",
     "sha256": "fd947cdbb980e73b597eb51f69495e41f70267caad335a98ea769b0983a29883",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "nvfp4",
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "world_size": 8,
+   "max_tokens": 2048,
+   "live_tokens": 2048,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     256,
+     256
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "phase_interleave",
+     null
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     2,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 374.83,
+   "source": "bench-eager-native-events",
+   "tuned_at": "2026-11-11T15:20:00",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "comment": "pf-c256-moe: C256 prefill per-rank shape (112 experts x 2048 tokens/rank, top-16) emulated on EP4 (448 experts); deployed grouped record 590.1 us on the same bench",
+   "provenance": {
+    "file": "$W/hti/p2/pf-c256-moe/knobs_src/knobs_pfc256_ep8_nvfp4_i2048.json",
+    "sha256": "93572907a1f4188c4a0849f9b288325388e9c6761d00affb54a4d479477880cf",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "nvfp4",
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "world_size": 16,
+   "max_tokens": 8192,
+   "live_tokens": 4350,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     256,
+     256
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "phase_interleave",
+     null
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 4,
+    "epi_flag_batches": [
+     1,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 585.82,
+   "source": "bench-eager-native-events",
+   "tuned_at": "2026-11-11T15:20:00",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "comment": "pf-c256-moe: C512 prefill per-rank shape (56 experts x 4350 tokens/rank, cap 8192) emulated on EP4 (224 experts); deployed w16c i4096 record 632.0 us on the same bench",
+   "provenance": {
+    "file": "$W/hti/p2/pf-c256-moe/knobs_src/knobs_pfc256_ep16_nvfp4_i8192.json",
+    "sha256": "92d55f13bbef9f570dbd532cc3a10ecba8cfbdca98a05844dcdb451345638b53",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "nvfp4",
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "world_size": 4,
+   "max_tokens": 8192,
+   "live_tokens": 4350,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     256,
+     256
+    ],
+    "cluster_shape_mn": [
+     2,
+     1
+    ],
+    "fallback_cluster_shape_mn": null,
+    "schedule_policy": [
+     "phase_interleave",
+     null
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     2,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 691.12,
+   "source": "bench-eager-native-events",
+   "tuned_at": "2026-11-11T15:20:00",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "comment": "pf-c256-moe: 1-node TP4 prefill bench shape (224 experts/rank, 4350 tokens/rank, cap 8192); smoke grouped i2048 record 1132.9 us on the same bench",
+   "provenance": {
+    "file": "$W/hti/p2/pf-c256-moe/knobs_src/knobs_pfc256_ep4_nvfp4_i8192.json",
+    "sha256": "aeed739707172f2c2540738ead75c6e28cb93eb5f584631df9b219347d9b1618",
     "flashinfer_version": "0.7.3.dev20261031",
     "cuda_version": "13.4"
    }

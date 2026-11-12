@@ -727,3 +727,32 @@ def test_vendored_sources_match_manifest():
     pattern = re.compile(r"^\s*(from|import)\s+(flashinfer|nvshmem)", re.M)
     for path in PKG_DIR.rglob("*.py"):
         assert not pattern.search(path.read_text()), path
+
+
+@pytest.mark.parametrize(
+    ("world", "max_tokens", "tiler", "cluster", "fallback"),
+    [
+        (8, 2048, (256, 256, 256), (2, 1), None),  # C256 prefill token shard, EP8
+        (16, 8192, (256, 256, 256), (2, 1), None),  # C512 prefill SP shard, EP16
+        (4, 8192, (256, 256, 256), (2, 1), None),  # 1-node TP4 prefill bench, EP4
+    ],
+)
+def test_prefill_records_phase_interleaved(world, max_tokens, tiler, cluster, fallback):
+    """The NVFP4 prefill buckets resolve the phase-interleaved N256 records: the grouped
+    grid-stride schedule put each group's FC2 tiles right behind its FC1 tiles, so
+    their TMA-B warp spun on FC1-done counters (590 -> 375 us at the C256 per-rank
+    shape, bitwise-equal outputs; pf-c256-moe)."""
+    C = _load("config")
+    knobs, record, _ = C.resolve_knobs(
+        C.SHIPPED_KNOBS,
+        problem=C.RubinMoeProblem(quant_kind="nvfp4"),
+        variant="inference",
+        world_size=world,
+        max_tokens=max_tokens,
+    )
+    assert record["max_tokens"] == max_tokens
+    assert knobs.schedule_policy == ("phase_interleave", None)
+    assert knobs.work_id_mode == "atomic_counter"
+    assert tuple(knobs.mma_tiler_mnk) == tiler
+    assert tuple(knobs.cluster_shape_mn) == cluster
+    assert knobs.fallback_cluster_shape_mn == fallback

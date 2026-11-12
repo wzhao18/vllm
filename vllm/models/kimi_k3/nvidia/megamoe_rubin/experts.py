@@ -103,9 +103,10 @@ RUBIN_GENPHASE_MAX_TOKENS_PER_RANK = 1024
 # stage+kernel p50) at 52 tokens/rank: 2048 bucket 128.3 us, 256 bucket 110.4 us
 # (64: 128.9 / 110.9, 128: 130.0 / 113.6, 256: 135.1 / 122.7). The genphase kernel
 # is not used for it (139.7-225.5 us at that shape). P/D prefill workers (C512
-# prefill: SP shard of 8192 tokens/rank at EP16 on the i4096 record; C256 prefill:
-# token shard of 2048 at EP8 on the grouped i2048 record) run prefill chunks, where
-# the bucket was not measured, and keep their one bucket (no extra compile or arena).
+# prefill: SP shard of 8192 tokens/rank at EP16 on the i8192 record; C256 prefill:
+# token shard of 2048 at EP8 on the i2048 record with the lowest p50, the
+# phase-interleaved N256 one) run prefill chunks, where the bucket was not measured,
+# and keep their one bucket (no extra compile or arena).
 RUBIN_DECODE_BUCKET_MAX_ROUTES = 4096
 
 
