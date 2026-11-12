@@ -51,7 +51,12 @@ from vllm.models.kimi_k3.nvidia.kda_metadata import (
     KimiK3KDAAttentionBackend,
     KimiK3KDAMetadata,
 )
-from vllm.models.kimi_k3.nvidia.ops import kda_conv, kda_norm, kda_segscan
+from vllm.models.kimi_k3.nvidia.ops import (
+    kda_conv,
+    kda_norm,
+    kda_segscan,
+    prefill_glue,
+)
 from vllm.models.kimi_k3.nvidia.ops.kda_conv import (
     packed_causal_conv1d_fn,
     packed_causal_conv1d_supported,
@@ -1658,8 +1663,11 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         cu_seqlens=non_spec_query_start_loc,
                         out=non_spec_out,
                     )
-                recurrent_state[non_spec_state_indices_tensor] = (
-                    last_recurrent_state.to(recurrent_state.dtype)
+                # One row-copy launch (same result as the index_put_).
+                prefill_glue.write_state_rows(
+                    recurrent_state,
+                    non_spec_state_indices_tensor,
+                    last_recurrent_state,
                 )
             else:
                 # Pure non-speculative decode.
