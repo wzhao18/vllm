@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer.kv_connector.dcp_relayout import StagedRelayout
 from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds, EngineId
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorHandshakeMetadata,
@@ -56,8 +57,11 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #      region_members and the cache group of each layer
 #  17: Advertise the DCP interleave size, per-layer KV row layouts and KV
 #      cache scales, and the Mamba state geometry
+#  18: Add the producer's block_size and cp_kv_cache_interleave_size to
+#      kv_transfer_params, from which the decode scheduler sizes the staging
+#      of a DCP row relayout
 #
-NIXL_CONNECTOR_VERSION: int = 17
+NIXL_CONNECTOR_VERSION: int = 18
 
 
 @dataclass
@@ -258,6 +262,10 @@ class RemoteMeta:
     num_tokens: int | None = None
     # Bumped each time the remote publishes a changed KV cache registration.
     registration_generation: int = 0
+    # The remote's per-rank logical block size and DCP interleave, which
+    # place its KV rows (see `DcpLayout`).
+    block_size: int | None = None
+    cp_kv_cache_interleave_size: int | None = None
 
 
 @dataclass
@@ -286,6 +294,12 @@ class ReqMeta:
     # Worker-only, per-group range of the remote-sized sub-blocks of each local
     # group a pull covers. None derives it from the block counts.
     covered_sub_blocks: list[range] | None = None
+    # Blocks the scheduler reserved for staging the remote rows of a DCP row
+    # relayout (`DcpTransferMode.RELAYOUT`); empty otherwise.
+    staging_block_ids: list[int] = field(default_factory=list)
+    # Worker-only: the relayout planned for this request, run once its READs
+    # complete.
+    relayout: StagedRelayout | None = None
 
 
 class NixlConnectorMetadata(KVConnectorMetadata):
@@ -346,6 +360,7 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         kv_transfer_params: dict[str, Any],
         local_num_computed_blocks: tuple[int, ...] = (),
         awaiting_kvs: bool = False,
+        staging_block_ids: list[int] | None = None,
     ):
         req = self._add_new_req(
             local_block_ids,
@@ -353,6 +368,7 @@ class NixlConnectorMetadata(KVConnectorMetadata):
             local_num_computed_blocks,
             awaiting_kvs,
         )
+        req.staging_block_ids = list(staging_block_ids or ())
         req.remote = RemoteMeta(
             block_ids=kv_transfer_params["remote_block_ids"],
             engine_id=kv_transfer_params["remote_engine_id"],
@@ -363,6 +379,10 @@ class NixlConnectorMetadata(KVConnectorMetadata):
             num_tokens=kv_transfer_params.get("remote_num_tokens"),
             registration_generation=kv_transfer_params.get(
                 "remote_registration_generation", 0
+            ),
+            block_size=kv_transfer_params.get("block_size"),
+            cp_kv_cache_interleave_size=kv_transfer_params.get(
+                "cp_kv_cache_interleave_size"
             ),
         )
         self.reqs_to_recv[request_id] = req

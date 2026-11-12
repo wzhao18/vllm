@@ -69,6 +69,7 @@ if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
         NixlBaseConnectorWorker,
     )
+    from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
@@ -197,6 +198,21 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
         return self.connector_scheduler.get_num_new_matched_tokens(
             request, num_computed_tokens
         )
+
+    def get_num_staging_blocks(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+        num_external_tokens: int,
+    ) -> int:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.get_num_staging_blocks(
+            request, num_computed_tokens, num_external_tokens
+        )
+
+    def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.bind_gpu_block_pool(gpu_block_pool)
 
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int

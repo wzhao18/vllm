@@ -1436,6 +1436,8 @@ def test_mismatched_mla_kernel_page_rejected_for_mla_hybrid():
 
 @pytest.mark.cpu_test
 def test_dcp_rejects_different_logical_block_sizes():
+    """Different logical blocks need a relayout of the rows, which needs every
+    attention page to declare its token rows (these have none)."""
     worker = _make_mla_hybrid_worker(
         local_block_size=12, kernel_block_size=4, num_logical_blocks=8, mamba=False
     )
@@ -1446,7 +1448,10 @@ def test_dcp_rejects_different_logical_block_sizes():
         remote_num_logical=12,
         remote_ssm_sizes=(24, 32),
     )
-    with pytest.raises(bw.NixlPeerIncompatibleError, match="logical block sizes"):
+    with pytest.raises(
+        bw.NixlPeerIncompatibleError,
+        match="needs a relayout.*token-row layout",
+    ):
         worker.add_remote_agent(
             meta_r, remote_tp_rank=0, remote_tp_size=2, remote_dcp_size=2
         )

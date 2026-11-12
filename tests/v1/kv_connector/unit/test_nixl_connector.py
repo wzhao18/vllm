@@ -2549,7 +2549,9 @@ def recv_worker():
         remote_block_size=16, remote_physical_blocks_per_logical=1
     )
     worker._physical_blocks_per_logical_kv_block = 1
-    worker._recving_metadata = {"request": MagicMock(local_block_ids=([1, 2, 3],))}
+    worker._recving_metadata = {
+        "request": MagicMock(local_block_ids=([1, 2, 3],), relayout=None)
+    }
     worker._recving_transfers = defaultdict(list)
     worker._failed_recv_reqs = queue.Queue()
     worker._recv_failures = set()

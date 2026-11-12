@@ -23,6 +23,7 @@ from vllm.config import (
     VllmConfig,
 )
 from vllm.config.kv_transfer import KVCacheAccess
+from vllm.distributed.kv_transfer.kv_connector.dcp_layout import DcpLayout
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
@@ -64,6 +65,7 @@ def create_mock_connector() -> Mock:
     connector.get_external_cache_hit_sources.side_effect = lambda request, num_tokens: (
         {CacheHitSource.EXTERNAL_UNSPECIFIED: num_tokens} if num_tokens else {}
     )
+    connector.get_num_staging_blocks.return_value = 0
     return connector
 
 
@@ -632,6 +634,7 @@ def make_nixl_scheduler(
         sched.side_channel_port = 5555
         sched.blocks_per_sw = []
         sched.is_bidirectional_kv_xfer_enabled = False
+        sched._dcp_layout = DcpLayout(dcp_size=1, interleave=1, block_size=16)
     return sched
 
 

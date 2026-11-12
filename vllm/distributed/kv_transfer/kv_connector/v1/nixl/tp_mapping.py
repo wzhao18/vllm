@@ -42,6 +42,18 @@ def _is_ssm_spec(spec_type: type[KVCacheSpec]) -> bool:
     return issubclass(spec_type, MambaSpec)
 
 
+class DcpTransferMode(enum.Enum):
+    """How attention KV moves between a remote and a local DCP layout."""
+
+    DIRECT = "direct"
+    """Local pages read remote pages as they are; nothing is copied after the
+    transfer."""
+    RELAYOUT = "relayout"
+    """Local ranks read the remote pages holding their rows into staging
+    blocks, then gather the rows into their own pages
+    (`kv_connector.dcp_relayout`)."""
+
+
 @dataclass(frozen=True)
 class TPMapping:
     """Complete local-to-remote TP mapping for one remote engine.
@@ -66,17 +78,16 @@ class TPMapping:
     # a request's blocks only once that many notifications have come in.
     local_consumers: int = 1
 
-
-class DcpTransferMode(enum.Enum):
-    """How attention KV moves between a remote and a local DCP layout."""
-
-    DIRECT = "direct"
-    """Local pages read remote pages as they are; nothing is copied after the
-    transfer."""
+    # How attention KV moves from this remote (`select_dcp_transfer_mode`).
+    dcp_mode: DcpTransferMode = DcpTransferMode.DIRECT
 
 
 def select_dcp_transfer_mode(
-    local: DcpLayout, remote: DcpLayout, *, has_mamba: bool = False
+    local: DcpLayout,
+    remote: DcpLayout,
+    *,
+    has_mamba: bool = False,
+    tp_sizes: tuple[int, int] | None = None,
 ) -> DcpTransferMode:
     """Pick how attention KV moves from `remote` to `local`, or raise
     `NixlPeerIncompatibleError` for a pair of layouts no mode supports.
@@ -90,24 +101,20 @@ def select_dcp_transfer_mode(
       block_size`, or no DCP): page `j` of any rank is one run of positions,
       so it maps to one remote page whatever the DCP sizes.
 
-    Other layouts (e.g. token-level interleave over different DCP sizes) need
-    rows moved between pages and are rejected. Mode selection assumes each
-    side's DCP group spans its TP ranks (`dcp_size` 1 or TP).
+    Other layouts (e.g. token-level interleave over different DCP sizes, or
+    different block sizes) move rows between pages: RELAYOUT, which any pair
+    of layouts supports as long as
+
+    - `tp_sizes` (local, remote) equal the DCP sizes: each side's DCP group
+      spans its TP ranks, so a DCP rank is a TP rank to read from;
+    - the DCP sizes divide one another (the read and consumer-count maps of
+      `TransferTopology`).
+
+    Whether the engine itself can receive through a relayout (pull mode, no
+    host staging, ...) is for the caller to check.
     """
     if local.dcp_size == 1 and remote.dcp_size == 1:
         return DcpTransferMode.DIRECT
-    # DCP shards tokens at the logical block size, and reads pair blocks by
-    # logical position.
-    if local.block_size != remote.block_size:
-        raise NixlPeerIncompatibleError(
-            "DCP requires matching P/D logical block sizes: local "
-            f"{local.block_size}, remote {remote.block_size}."
-        )
-    if has_mamba and local.dcp_size != remote.dcp_size:
-        raise NixlPeerIncompatibleError(
-            "Hybrid MLA+Mamba NIXL transfers require matching DCP sizes, "
-            f"got local={local.dcp_size}, remote={remote.dcp_size}."
-        )
     if (
         local.dcp_size > 1
         and remote.dcp_size > 1
@@ -118,15 +125,61 @@ def select_dcp_transfer_mode(
             f"cp_kv_cache_interleave_size differ: local {local.interleave}, "
             f"remote {remote.interleave}. Use the same interleave on both sides."
         )
+    direct_problem = _direct_problem(local, remote, has_mamba)
+    if direct_problem is None:
+        return DcpTransferMode.DIRECT
+    relayout_problem = _relayout_problem(local, remote, tp_sizes)
+    if relayout_problem is None:
+        return DcpTransferMode.RELAYOUT
+    raise NixlPeerIncompatibleError(
+        f"{direct_problem} Relayout of the rows is not possible either: "
+        f"{relayout_problem}"
+    )
+
+
+def _direct_problem(local: DcpLayout, remote: DcpLayout, has_mamba: bool) -> str | None:
+    """Why whole pages cannot pair between the layouts, or None."""
+    # DCP shards tokens at the logical block size, and reads pair blocks by
+    # logical position.
+    if local.block_size != remote.block_size:
+        return (
+            "DCP requires matching P/D logical block sizes: local "
+            f"{local.block_size}, remote {remote.block_size}."
+        )
+    if has_mamba and local.dcp_size != remote.dcp_size:
+        return (
+            "Hybrid MLA+Mamba NIXL transfers require matching DCP sizes, "
+            f"got local={local.dcp_size}, remote={remote.dcp_size}."
+        )
     if local.dcp_size == remote.dcp_size or (
         local.pages_hold_contiguous_positions and remote.pages_hold_contiguous_positions
     ):
-        return DcpTransferMode.DIRECT
-    raise NixlPeerIncompatibleError(
+        return None
+    return (
         "NIXL transfers between different DCP sizes need a block-level "
         "interleave (cp_kv_cache_interleave_size equal to the per-rank KV "
         f"block size) on both sides: local {local}, remote {remote}."
     )
+
+
+def _relayout_problem(
+    local: DcpLayout,
+    remote: DcpLayout,
+    tp_sizes: tuple[int, int] | None,
+) -> str | None:
+    """Why RELAYOUT cannot move rows between the layouts, or None."""
+    if tp_sizes is None or tp_sizes != (local.dcp_size, remote.dcp_size):
+        return (
+            "it needs TP = DCP on both sides, got local TP/DCP "
+            f"{tp_sizes[0] if tp_sizes else '?'}/{local.dcp_size}, remote "
+            f"TP/DCP {tp_sizes[1] if tp_sizes else '?'}/{remote.dcp_size}."
+        )
+    if local.dcp_size % remote.dcp_size and remote.dcp_size % local.dcp_size:
+        return (
+            f"the DCP sizes must divide one another, got local "
+            f"{local.dcp_size}, remote {remote.dcp_size}."
+        )
+    return None
 
 
 # ======================================================================

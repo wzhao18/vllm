@@ -178,6 +178,8 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
                         # something to pull; a full local hit stays RUNNING.
                         num_external_tokens > 0,
                     )
+                    if num_external_tokens > 0:
+                        self._take_staging_blocks(request.request_id)
 
                 else:
                     logger.warning(
@@ -218,6 +220,9 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
         # Stop heartbeating for aborted requests that never reached finished_recving:
         # normal path cleans up in update_connector_output.
         self._stop_heartbeat(request.request_id)
+        # An admission count never taken (staging blocks taken are returned
+        # when the receive finishes).
+        self._drop_staging_need(request.request_id)
 
         if params.get("do_remote_prefill"):
             # If do_remote_prefill is still True when the request is finished,
@@ -288,6 +293,10 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             remote_port=self.side_channel_port,
             tp_size=self.transfer_tp_size,
             dcp_size=self.vllm_config.parallel_config.decode_context_parallel_size,
+            # Where the DCP ranks hold the KV rows (version 18), for a reader
+            # with another DCP layout to size its relayout staging.
+            block_size=self._dcp_layout.block_size,
+            cp_kv_cache_interleave_size=self._dcp_layout.interleave,
             pp_size=self.vllm_config.parallel_config.pipeline_parallel_size,
             remote_num_tokens=remote_num_tokens,
             remote_blocks_expiry_time=blocks_expiry_time,
