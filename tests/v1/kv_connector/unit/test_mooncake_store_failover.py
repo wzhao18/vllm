@@ -243,3 +243,47 @@ def test_load_that_raises_before_the_store_call_still_reports():
     assert thread.get_and_clear_finished_requests() == {"r"}
     assert thread.get_and_clear_block_ids_with_load_errors() == {0, 1}
     store.batch_get_into_multi_buffers.assert_not_called()
+
+
+# ------------------------------------------- early (output-time) report -----
+# Loads that end as a cache miss through the failover paths are never reported
+# early by the output-time poll: they stay in-band with their load errors.
+
+
+def test_timed_out_and_degraded_loads_are_not_polled():
+    store = MagicMock()
+    stuck = _Stuck(result=lambda keys, *_: [256] * len(keys))
+    store.batch_get_into_multi_buffers.side_effect = stuck
+    thread = _make_store_recving_thread(store)
+    thread.store_guard = StoreCallGuard("recv", TIMEOUT_S)
+
+    thread._handle_request(_make_load_req("r1", [b"h0", b"h1"], token_len=32))
+    # Degraded: skipped at once, also a miss.
+    thread._handle_request(_make_load_req("r2", [b"h2", b"h3"], token_len=32))
+    assert thread.take_clean_finished_requests() == set()
+    assert thread.get_and_clear_finished_requests(include_clean=False) == {
+        "r1",
+        "r2",
+    }
+    assert thread.get_and_clear_block_ids_with_load_errors() == {0, 1}
+
+    stuck.release.set()
+    _wait_for(lambda: not thread.store_guard.degraded)
+    store.batch_get_into_multi_buffers.side_effect = None
+    store.batch_get_into_multi_buffers.return_value = [256, 256]
+    thread._handle_request(_make_load_req("r3", [b"h4", b"h5"], token_len=32))
+    # Healthy again: a clean load goes to the poll, exactly once.
+    assert thread.get_and_clear_finished_requests(include_clean=False) == set()
+    assert thread.take_clean_finished_requests() == {"r3"}
+    thread.store_guard.shutdown()
+
+
+def test_load_that_raises_before_the_store_call_is_not_polled():
+    store = MagicMock()
+    thread = _make_store_recving_thread(store)
+    thread.coord = MagicMock()
+    thread.coord.load_mask.side_effect = IndexError("bad geometry")
+    thread._handle_request(_make_load_req("r", [b"h0", b"h1"], token_len=32))
+    assert thread.take_clean_finished_requests() == set()
+    assert thread.get_and_clear_finished_requests(include_clean=False) == {"r"}
+    assert thread.get_and_clear_block_ids_with_load_errors() == {0, 1}

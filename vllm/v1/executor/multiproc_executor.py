@@ -30,6 +30,7 @@ from vllm.config import VllmConfig
 from vllm.distributed import destroy_distributed_environment, destroy_model_parallel
 from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
 from vllm.distributed.ec_transfer.ec_connector.utils import ECOutputAggregator
+from vllm.distributed.kv_transfer import kv_transfer_state
 from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
 from vllm.distributed.parallel_state import (
     get_dcp_group,
@@ -1111,6 +1112,11 @@ class WorkerProc:
                     output = ExceptionWithKVConnectorOutput(str(e), kv_connector_output)
                 else:
                     output = e
+
+        if isinstance(output, ModelRunnerOutput):
+            # Report loads that finished while this step ran on the output
+            # that is sent first.
+            output = kv_transfer_state.poll_finished_recving_into(output)
 
         if isinstance(output, ExceptionWithKVConnectorOutput):
             result: tuple[WorkerProc.ResponseStatus, Any] = (
