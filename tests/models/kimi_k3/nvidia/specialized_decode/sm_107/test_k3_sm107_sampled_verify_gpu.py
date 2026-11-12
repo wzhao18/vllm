@@ -88,7 +88,9 @@ def _case(steps, num_reqs, world, rank, device, group):
     rank 0), as the runner's InputBatch / sampler state fields."""
     import torch.distributed as dist
 
-    from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
+    from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
+        unconditional_to_conditional_rates,
+    )
     from vllm.v1.worker.gpu.spec_decode.draft_logits import DraftLogitsCache
 
     q = steps + 1

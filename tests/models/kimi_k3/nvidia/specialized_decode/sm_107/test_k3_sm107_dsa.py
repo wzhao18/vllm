@@ -2606,7 +2606,7 @@ def run_layer_step(
     from vllm.v1.attention.backends.mla.indexer import (
         DeepseekV32IndexerMetadataBuilder,
     )
-    from vllm.v1.worker.block_table import get_block_table_width
+    from vllm.v1.kv_cache_interface import get_block_table_width
 
     current_platform.import_kernels()
     import vllm.kernels.vllm_c  # noqa: F401  (registers the vllm_c provider)
@@ -3758,7 +3758,7 @@ def run_wide_step(batch, q, world, replays, core="fi-trtllm", partials="bf16"):
         DeepseekV32IndexerMetadataBuilder,
     )
     from vllm.v1.attention.backends.mla.sparse_utils import flat_kv_row_view
-    from vllm.v1.worker.block_table import get_block_table_width
+    from vllm.v1.kv_cache_interface import get_block_table_width
 
     current_platform.import_kernels()
     import vllm.kernels.vllm_c  # noqa: F401  (registers the vllm_c provider)
