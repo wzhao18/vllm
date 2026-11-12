@@ -543,6 +543,39 @@ def test_core_abort_while_arrival_lookup_in_flight_leaves_no_state():
     _assert_empty(client)
 
 
+@pytest.mark.parametrize("reset_ack", [True, False])
+def test_core_connector_reset_restarts_the_lookup_wait_clock(reset_ack):
+    """A store reset drops kept lookups, so a waiting request's bounded lookup
+    wait restarts from its next (fresh) lookup instead of keeping the clock
+    of the dropped one."""
+    store = FakeStore(gate_open=False)
+    sched, client = _core_scheduler(store)
+    req = _new_req(sched, 1)
+    _arrive(sched, req)
+    out = sched.schedule()  # deferred: lookup pending, wait clock starts
+    assert req.request_id in sched._connector_lookup_pending_since
+    sched._connector_lookup_timed_out.add(req.request_id)
+    sched.update_from_output(out, create_model_runner_output([]))
+    # The client runs RPCs on one thread: let the pending lookup finish so the
+    # reset RPC is not queued behind it.
+    store.gate.set()
+    _wait_done(client, req.request_id)
+    with patch.object(client, "_reset", return_value=reset_ack):
+        assert sched.reset_connector_cache() is reset_ack
+    assert sched._connector_lookup_pending_since == {}
+    assert sched._connector_lookup_timed_out == set()
+    assert req.request_id not in client.futures
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        out = sched.schedule()
+        if out.num_scheduled_tokens.get(req.request_id):
+            break
+        sched.update_from_output(out, create_model_runner_output([]))
+        time.sleep(0.002)
+    assert out.num_scheduled_tokens.get(req.request_id)
+    assert len(store.calls) == 2  # dropped lookup + fresh one after reset
+
+
 def test_core_abort_before_first_schedule_leaves_no_state():
     store = FakeStore()
     sched, client = _core_scheduler(store)
