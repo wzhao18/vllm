@@ -308,3 +308,116 @@ def test_gemm_rs_ar(monkeypatch: pytest.MonkeyPatch, backend: str) -> None:
         )
     finally:
         cleanup_dist_env_and_memory()
+
+
+# BF16 tile variants: every (cta_group, BN) the dispatcher can pick, on shapes
+# whose row shards are not tile aligned (units straddling tiles and shards),
+# from a single partial wave (plain raster) to many waves (shard-interleaved
+# band raster, dynamic unit queue).
+_TILE_N = 2048
+_TILE_SHAPES = ((128, 512), (1024, 512), (4097, 768), (8191, 1536))
+_TILE_VARIANTS = ((1, 128), (2, 128), (2, 256))
+
+
+def _tile_worker(local_rank: int, world_size: int, master_port: int) -> None:
+    device = torch.device("cuda", local_rank)
+    torch.accelerator.set_device_index(device)
+    update_environment_variables(
+        {
+            "RANK": str(local_rank),
+            "LOCAL_RANK": str(local_rank),
+            "WORLD_SIZE": str(world_size),
+            "MASTER_ADDR": "localhost",
+            "MASTER_PORT": str(master_port),
+        }
+    )
+    init_distributed_environment()
+    config = VllmConfig()
+    config.model_config = ModelConfig(dtype="bfloat16")
+    with set_current_vllm_config(config):
+        initialize_model_parallel(tensor_model_parallel_size=world_size)
+    from vllm.model_executor.kernels.linear.cute_dsl.gemm_rs_ar import GemmRsAr
+
+    group = dist.group.WORLD
+    rank = dist.get_rank(group)
+    gen = torch.Generator(device=device)
+    for all_reduce in (False, True):
+        op = GemmRsAr(
+            max_M=max(M for M, _ in _TILE_SHAPES), N=_TILE_N, all_reduce=all_reduce
+        )
+        # Twice over, in alternating order: flags and the unit queue must come
+        # back clean after every launch, whatever the previous grid was.
+        for M, K in (*_TILE_SHAPES, *_TILE_SHAPES[::-1]):
+            gen.manual_seed(4000 + rank * 10 + M + K)
+            x = torch.randn(M, K, dtype=torch.bfloat16, device=device, generator=gen)
+            w = torch.randn(
+                _TILE_N, K, dtype=torch.bfloat16, device=device, generator=gen
+            )
+            residual, row0 = None, 0
+            if all_reduce:
+                rows = M // world_size
+                row0 = rank * rows
+                residual = torch.randn(
+                    rows, _TILE_N, dtype=torch.bfloat16, device=device, generator=gen
+                )
+            expected = _reference(x, w, None, world_size, group, all_reduce)
+            if residual is not None:
+                # The residual joins this rank's partial before the reduction.
+                partial = torch.zeros((M, _TILE_N), dtype=torch.bfloat16, device=device)
+                partial[row0 : row0 + residual.shape[0]] = residual
+                dist.all_reduce(partial, group=group)
+                expected = expected + partial
+            outputs = {}
+            for cta_group, BN in _TILE_VARIANTS:
+                out = op._launch(
+                    x,
+                    w,
+                    None,
+                    None,
+                    residual,
+                    row0,
+                    True,
+                    "bf16",
+                    cta_group,
+                    BN,
+                )
+                torch.accelerator.synchronize(device)
+                _assert_valid_rows_close(out, expected, M, rank, all_reduce)
+                outputs[(cta_group, BN)] = out.clone()
+            # The wider tile changes neither the K order of the MMA nor the
+            # reduction, so both 2-CTA tilings agree bitwise.
+            torch.testing.assert_close(
+                outputs[(2, 128)], outputs[(2, 256)], rtol=0, atol=0
+            )
+        dist.barrier(group=group)
+        del op
+    cleanup_dist_env_and_memory()
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(100),
+    reason="GEMM-RS/AR requires SM100",
+)
+@pytest.mark.parametrize(
+    "world_size",
+    [
+        pytest.param(2, marks=pytest.mark.distributed(num_gpus=2)),
+        # R=4 exercises the shard-interleaved band order, the per-rank unit
+        # queue across several owners and the AR stage cap at a real TP width.
+        pytest.param(4, marks=pytest.mark.distributed(num_gpus=4)),
+        # R=8: the C256 TP8 width (two 4-GPU nodes on VR200 need a multi-node
+        # launcher; runs on any single host with 8 GPUs).
+        pytest.param(8, marks=pytest.mark.distributed(num_gpus=8)),
+    ],
+)
+def test_gemm_rs_ar_tile_variants(
+    monkeypatch: pytest.MonkeyPatch, world_size: int
+) -> None:
+    if torch.accelerator.device_count() < world_size:
+        pytest.skip(f"GEMM-RS/AR tile variants need {world_size} GPUs")
+    monkeypatch.setenv("NCCL_CUMEM_ENABLE", "1")
+    monkeypatch.setenv("NCCL_NVLS_ENABLE", "1")
+    try:
+        mp.spawn(_tile_worker, args=(world_size, get_open_port()), nprocs=world_size)
+    finally:
+        cleanup_dist_env_and_memory()

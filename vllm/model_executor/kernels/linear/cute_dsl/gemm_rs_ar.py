@@ -92,6 +92,74 @@ def multimem_ld_reduce_16B(x: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
 
 
 @dsl_user_op
+def bulk_copy_g2s(
+    dst_smem: Int32,
+    src_gmem: Int64,
+    size: Int32,
+    mbar_smem: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    # Bulk async copy (TMA engine, no tensor map) of `size` bytes from global
+    # (local or NVLink peer) memory into this CTA's shared memory, completing
+    # `size` transaction bytes on the mbarrier.
+    llvm.inline_asm(
+        None,
+        [
+            Int32(dst_smem).ir_value(loc=loc, ip=ip),
+            Int64(src_gmem).ir_value(loc=loc, ip=ip),
+            Int32(size).ir_value(loc=loc, ip=ip),
+            Int32(mbar_smem).ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes "
+        "[$0], [$1], $2, [$3];",
+        "r,l,r,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def ld_acquire_sys(ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
+    # Acquire load of a flag the producers (peer GPUs) raise with red.release:
+    # system scope. Unlike fence.acq_rel.sys it does not wait for this thread's
+    # earlier stores to become system-visible, it only orders the accesses
+    # that follow it.
+    addr = ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)
+    return Int32(
+        llvm.inline_asm(
+            Int32.mlir_type,
+            [addr],
+            "ld.acquire.sys.global.b32 $0, [$1];",
+            "=r,l",
+            has_side_effects=True,
+            is_align_stack=False,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def fence_proxy_async_global(*, loc=None, ip=None) -> None:
+    # Orders this thread's generic-proxy view of global memory (the acquired
+    # producer partials) before its subsequent async-proxy accesses
+    # (cp.async.bulk reads of those partials).
+    llvm.inline_asm(
+        Int32.mlir_type,
+        [],
+        "mov.u32 $0, 0;\n\tfence.proxy.async.global;",
+        "=r",
+        has_side_effects=True,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def multimem_st_16B(dst: cute.Tensor, value: cute.Tensor, *, loc=None, ip=None) -> None:
     # The vector instruction assumes dst and value are contiguous BF16x8 vectors
     # and dst is 16-byte aligned.
@@ -110,6 +178,26 @@ def multimem_st_16B(dst: cute.Tensor, value: cute.Tensor, *, loc=None, ip=None) 
     )
 
 
+# Tile schedule shared by the GEMM roles and the communication warps.
+#
+# GEMM tiles are visited in bands of ``_BAND_PAIRS`` M-tile pairs (2-CTA) or
+# M-tiles (1-CTA) x every N tile, M fastest inside a band, so a wave of CTAs
+# reuses one band of A and a slab of B from L2 instead of streaming all of A
+# from HBM once per N column. The M tiles of a band are drawn evenly from the
+# TP ranks' row shards (shard-interleaved), so every rank always has freshly
+# produced rows to reduce and the NVLink load stays balanced across ranks.
+# Grids of at most two waves keep the plain M-fastest order.
+_BAND_PAIRS = 8
+# Rows per communication unit: one unit is ``_COMM_ROWS`` rows x BN columns of
+# this rank's rows of one GEMM tile; CTAs take units from a per-rank queue.
+_COMM_ROWS = 64
+# RS staging ring in shared memory: _COMM_STAGES chunks of _COMM_CHUNK_BYTES,
+# each holding every rank's partial of a few unit rows (64 KB in flight per
+# CTA; TP4 n17k comm-only time saturates at 48-64 KB).
+_COMM_STAGES = 4
+_COMM_CHUNK_BYTES = 16 * 1024
+
+
 class Sm100GemmRsAr:
     def __init__(
         self,
@@ -119,15 +207,18 @@ class Sm100GemmRsAr:
         all_reduce: bool = False,
         dtype: str = "bf16",
         residual: bool = False,
+        BN: int = 128,
     ) -> None:
         assert dtype in ("bf16", "mxfp8")
+        # MXFP8 keeps 16 TMEM columns for scale factors: BN=256 would leave a
+        # single accumulator stage, so it is BF16-only.
+        assert BN == 128 or (BN == 256 and dtype == "bf16")
         # residual: add a BF16 [R, N] tensor to GEMM rows [row0, row0 + R) in the
         # epilogue (FP32, before the BF16 partial is written and reduced).
         self.residual = residual
         self.rank = rank
         self.num_ranks = num_ranks
         BM = 128
-        BN = 128
         BK = {"bf16": 64, "mxfp8": 128}[dtype]  # 128B
         self.cta_tile = (BM, BN, BK)
         self.cta_group = cta_group
@@ -139,7 +230,134 @@ class Sm100GemmRsAr:
             self.stage_size = (BM + (BN // cta_group)) * BK * 2
         elif dtype == "mxfp8":
             self.stage_size = (BM + (BN // cta_group)) * BK + (BM + BN) * (BK // 32)
-        self.num_stages = smem_bytes // self.stage_size
+        # Leave 1 KB for the barriers and the scheduler slot, and room for the
+        # communication staging ring.
+        # (AR reduces through NVLS and only keeps a minimal ring allocation.)
+        comm_bytes = (1 if all_reduce else _COMM_STAGES) * _COMM_CHUNK_BYTES
+        self.num_stages = (smem_bytes - 1024 - comm_bytes) // self.stage_size
+        if all_reduce:
+            # The AR reduction is NVLS loads issued from the LSU, whose
+            # in-flight capacity lives in L1: a smaller GEMM ring leaves a
+            # larger L1 carve-out (AR GEMMs are short-K and comm-bound).
+            # TP4 M=16384: 441 -> 375 us.
+            self.num_stages = min(self.num_stages, 4)
+
+    @staticmethod
+    def shard_pair(r, local_M, pair_rows):
+        # First M-tile pair (2-CTA) or M tile (1-CTA) holding rank r's rows.
+        return (r * local_M) // pair_rows
+
+    @cute.jit
+    def tile_coords(self, bid, grid_m, grid_n, local_M, num_slots_m, banded):
+        """Map a schedule index to (bid_m, bid_n, valid); see _BAND_PAIRS.
+
+        Group r = the M-tile pairs from the one holding rank r's first row up to
+        the next rank's (the last group runs to the end). Slot s of a band takes
+        pair s // R of group s % R; slots past the end of a shorter group are
+        holes. The communication warps enumerate their rows in the same order.
+        """
+        BM = self.cta_tile[0]
+        cg = self.cta_group
+        R = self.num_ranks
+        pair_rows = BM * cg
+        num_pairs = grid_m // cg
+        band = R * max(1, _BAND_PAIRS // R)
+
+        pair_slot = bid // cg
+        sub = bid % cg
+        band_idx = pair_slot // (band * grid_n)
+        band_w = min(band, num_slots_m - band_idx * band)
+        offset = pair_slot - band_idx * band * grid_n
+        slot_m = band_idx * band + offset % band_w
+        bid_n = offset // band_w
+        r = slot_m % R
+        pair = self.shard_pair(r, local_M, pair_rows) + slot_m // R
+        group_end = self.shard_pair(r + 1, local_M, pair_rows)
+        if r == R - 1:
+            group_end = num_pairs
+        valid = pair < group_end
+        bid_m = pair * cg + sub
+        if not banded:
+            # One or two waves: no L2 reuse to win, and the band holes would
+            # fall on a CTA stride that is a multiple of R. Plain M-fastest.
+            bid_m = bid % grid_m
+            bid_n = bid // grid_m
+            valid = bid < grid_m * grid_n
+        return bid_m, bid_n, valid
+
+    @cute.jit
+    def num_slots_m(self, grid_m, local_M):
+        # Pair slots per band row: the largest group, times the TP size.
+        BM = self.cta_tile[0]
+        cg = self.cta_group
+        R = self.num_ranks
+        pair_rows = BM * cg
+        num_pairs = grid_m // cg
+        q = num_pairs - self.shard_pair(R - 1, local_M, pair_rows)
+        for r in cutlass.range_constexpr(R - 1):
+            q = max(
+                q,
+                self.shard_pair(r + 1, local_M, pair_rows)
+                - self.shard_pair(r, local_M, pair_rows),
+            )
+        return q * R
+
+    @cute.jit
+    def nvls_unit(
+        self,
+        tid_: Int32,
+        mc_vecs: cute.Tensor,
+        unit_row0: Int32,
+        row_lo: Int32,
+        row_hi: Int32,
+        bid_n: Int32,
+    ) -> None:
+        """All-reduce one communication unit through NVLS: multimem.ld_reduce
+        (FP32 accumulation in the switch) and a multimem.st broadcast. Every
+        load is unconditional (rows clamped into the unit), so a batch of
+        loads is in flight together; only the stores are predicated."""
+        BN = self.cta_tile[1]
+        vec_width = 8
+        vec_cols = BN // vec_width
+        vecs_per_thread = _COMM_ROWS * vec_cols // 128
+        # 4 vectors per thread per batch (TP4: 4-16 per batch measured equal);
+        # a batch whose rows all lie outside the unit's rows is skipped.
+        batch_vecs = min(vecs_per_thread, 4)
+        batch_rows = batch_vecs * 128 // vec_cols
+        for batch in cutlass.range_constexpr(vecs_per_thread // batch_vecs):
+            batch_row0 = unit_row0 + batch * batch_rows
+            if batch_row0 < row_hi and batch_row0 + batch_rows > row_lo:
+                vals = []
+                for v in cutlass.range_constexpr(batch_vecs):
+                    vec_idx = tid_ + (batch * batch_vecs + v) * 128
+                    row = unit_row0 + vec_idx // vec_cols
+                    row = min(max(row, row_lo), row_hi - 1)
+                    col = bid_n * vec_cols + vec_idx % vec_cols
+                    vals.append(multimem_ld_reduce_16B(mc_vecs[None, (row, col)]))
+                for v in cutlass.range_constexpr(batch_vecs):
+                    vec_idx = tid_ + (batch * batch_vecs + v) * 128
+                    row = unit_row0 + vec_idx // vec_cols
+                    col = bid_n * vec_cols + vec_idx % vec_cols
+                    if row >= row_lo and row < row_hi:
+                        multimem_st_16B(mc_vecs[None, (row, col)], vals[v])
+
+    @cute.jit
+    def next_unit(
+        self,
+        tid_: Int32,
+        unit_ctr: cute.Pointer,
+        comm_slot: cute.Tensor,
+        bar_id: cutlass.Constexpr,
+    ) -> Int32:
+        # One thread takes the next communication unit of this rank from the
+        # queue and hands it to the other communication threads.
+        cute.arch.barrier(barrier_id=bar_id, number_of_threads=128)
+        if tid_ == 0:
+            comm_slot[0] = cute.arch.atomic_add(
+                unit_ctr, Int32(1), sem="relaxed", scope="gpu"
+            )
+        cute.arch.barrier(barrier_id=bar_id, number_of_threads=128)
+        return comm_slot[0]
 
     @cute.jit
     def prepare_tma(
@@ -193,8 +411,10 @@ class Sm100GemmRsAr:
         flags_uc: cute.Tensor,
         flags_mc_ptr: cute.Pointer,
         peer_flag_ptr: cute.Pointer,
+        peer_partial_ptr: cute.Pointer,
         residual: cute.Tensor,
         residual_row0: Int32,
+        sched: cute.Tensor,
         grid_size: Int32,
         stream: CUstream,
     ) -> None:
@@ -218,6 +438,10 @@ class Sm100GemmRsAr:
             peer_flag_ptr,
             cute.make_layout(self.num_ranks),
         )
+        peer_partials = cute.make_tensor(
+            peer_partial_ptr,
+            cute.make_layout(self.num_ranks),
+        )
 
         grid = (grid_size, 1, 1)
         block = (10 * 32, 1, 1)
@@ -233,8 +457,10 @@ class Sm100GemmRsAr:
             flags_uc.iterator,
             flags_mc_ptr,
             peer_flags,
+            peer_partials,
             residual,
             residual_row0,
+            sched.iterator,
         ).launch(grid=grid, block=block, cluster=cluster, stream=stream)
 
     @cute.kernel
@@ -250,8 +476,10 @@ class Sm100GemmRsAr:
         flags_uc_ptr: cute.Pointer,
         flags_mc_ptr: cute.Pointer,
         peer_flags: cute.Tensor,
+        peer_partials: cute.Tensor,
         residual: cute.Tensor,
         residual_row0: Int32,
+        sched_ptr: cute.Pointer,
     ) -> None:
         tid, _, _ = cute.arch.thread_idx()
         raw_bid, _, _ = cute.arch.block_idx()
@@ -293,6 +521,17 @@ class Sm100GemmRsAr:
         tmem_empty_mbar = smem.allocate_array(Int64, num_tmem_stages)
 
         taddr = smem.allocate(Int32, 4)
+        # Communication unit handed from the scheduling thread to its warps.
+        comm_slot = smem.allocate_tensor(Int32, cute.make_layout(4), byte_alignment=16)
+        comm_full_mbar = smem.allocate_array(Int64, _COMM_STAGES)
+        comm_empty_mbar = smem.allocate_array(Int64, _COMM_STAGES)
+        sComm = smem.allocate_tensor(
+            BFloat16,
+            cute.make_layout(
+                (1 if self.all_reduce else _COMM_STAGES) * _COMM_CHUNK_BYTES // 2
+            ),
+            byte_alignment=128,
+        )
 
         # Named barriers
         BAR_TMEM_ALLOC = 1
@@ -317,6 +556,9 @@ class Sm100GemmRsAr:
                 for i in cutlass.range_constexpr(num_tmem_stages):
                     cute.arch.mbarrier_init(tmem_full_mbar + i, 1)
                     cute.arch.mbarrier_init(tmem_empty_mbar + i, 128 * cta_group)
+                for i in cutlass.range_constexpr(_COMM_STAGES):
+                    cute.arch.mbarrier_init(comm_full_mbar + i, 1)
+                    cute.arch.mbarrier_init(comm_empty_mbar + i, 128)
                 cute.arch.mbarrier_init_fence()
         elif warp_id == 1:
             cpasync.prefetch_descriptor(A_tma.atom)
@@ -332,6 +574,12 @@ class Sm100GemmRsAr:
             cute.arch.sync_threads()
 
         total_tiles = grid_m * grid_n
+        num_slots_m = self.num_slots_m(grid_m, local_M)
+        # Schedule length in CTA tiles; slots past a short rank group are holes.
+        banded = total_tiles > 2 * num_bids
+        total_slots = total_tiles
+        if banded:
+            total_slots = num_slots_m * cta_group * grid_n
 
         if warp_id == 9:
             # TMA warp
@@ -356,49 +604,52 @@ class Sm100GemmRsAr:
                     SFB_tma.tma_tensor, (128 * BKsf // 8, BN // 128)
                 )
 
-            for bid in range(raw_bid, total_tiles, num_bids):
-                bid_m = bid % grid_m
-                bid_n = bid // grid_m
-                if cutlass.const_expr(cta_group == 2):
-                    bid_n_b = bid_n * cta_group + cta_rank
-                else:
-                    bid_n_b = bid_n
+            for bid in range(raw_bid, total_slots, num_bids):
+                bid_m, bid_n, valid = self.tile_coords(
+                    bid, grid_m, grid_n, local_M, num_slots_m, banded
+                )
+                if valid:
+                    if cutlass.const_expr(cta_group == 2):
+                        bid_n_b = bid_n * cta_group + cta_rank
+                    else:
+                        bid_n_b = bid_n
 
-                for iter_k in cutlass.range(cute.ceil_div(K, BK), unroll=1):
-                    mbar = tma_full_mbar_ + tma_stage
-                    cute.arch.mbarrier_wait(tma_empty_mbar + tma_stage, parity)
+                    num_k = cute.ceil_div(K, BK)
+                    for iter_k in cutlass.range(num_k, unroll=1):
+                        mbar = tma_full_mbar_ + tma_stage
+                        cute.arch.mbarrier_wait(tma_empty_mbar + tma_stage, parity)
 
-                    with cute.arch.elect_one():
-                        mbarrier.arrive_expect_tx(mbar, self.stage_size, "cluster")
-                    simple_tma_copy(
-                        A_tma.atom,
-                        gA_tiles[None, (bid_m, iter_k)],
-                        sA[None, None, tma_stage],
-                        mbar,
-                    )
-                    simple_tma_copy(
-                        B_tma.atom,
-                        gB_tiles[None, (bid_n_b, iter_k)],
-                        sB[None, None, tma_stage],
-                        mbar,
-                    )
-                    if cutlass.const_expr(self.dtype == "mxfp8"):
+                        with cute.arch.elect_one():
+                            mbarrier.arrive_expect_tx(mbar, self.stage_size, "cluster")
                         simple_tma_copy(
-                            SFA_tma.atom,
-                            gSFA_tiles[None, (iter_k, bid_m)],
-                            sSFA[None, None, tma_stage],
+                            A_tma.atom,
+                            gA_tiles[None, (bid_m, iter_k)],
+                            sA[None, None, tma_stage],
                             mbar,
                         )
                         simple_tma_copy(
-                            SFB_tma.atom,
-                            gSFB_tiles[None, (iter_k, bid_n)],
-                            sSFB[None, None, tma_stage],
+                            B_tma.atom,
+                            gB_tiles[None, (bid_n_b, iter_k)],
+                            sB[None, None, tma_stage],
                             mbar,
                         )
+                        if cutlass.const_expr(self.dtype == "mxfp8"):
+                            simple_tma_copy(
+                                SFA_tma.atom,
+                                gSFA_tiles[None, (iter_k, bid_m)],
+                                sSFA[None, None, tma_stage],
+                                mbar,
+                            )
+                            simple_tma_copy(
+                                SFB_tma.atom,
+                                gSFB_tiles[None, (iter_k, bid_n)],
+                                sSFB[None, None, tma_stage],
+                                mbar,
+                            )
 
-                    tma_stage = (tma_stage + 1) % num_stages
-                    if tma_stage == 0:
-                        parity ^= 1
+                        tma_stage = (tma_stage + 1) % num_stages
+                        if tma_stage == 0:
+                            parity ^= 1
 
         elif warp_id == 8:
             # MMA warp
@@ -423,83 +674,92 @@ class Sm100GemmRsAr:
                     idesc = _tcgen05.make_bf16_idesc(MMA_M, MMA_N)
                 multicast_mask = Uint16((1 << self.cta_group) - 1)
 
-                for bid in range(raw_bid, total_tiles, num_bids):
-                    cute.arch.mbarrier_wait(
-                        tmem_empty_mbar + tmem_stage, tmem_empty_parity
+                for bid in range(raw_bid, total_slots, num_bids):
+                    _, _, valid = self.tile_coords(
+                        bid, grid_m, grid_n, local_M, num_slots_m, banded
                     )
-                    _tcgen05.fence_after_thread_sync()
-
-                    for iter_k in cutlass.range(cute.ceil_div(K, BK), unroll=1):
-                        d_tmem = BN * tmem_stage
-                        a_addr = sA[None, None, tma_stage].iterator.toint()
-                        b_addr = sB[None, None, tma_stage].iterator.toint()
-                        a_desc = sdesc | (a_addr >> 4)
-                        b_desc = sdesc | (b_addr >> 4)
-                        if cutlass.const_expr(self.dtype == "mxfp8"):
-                            sfa_desc = sdesc_sf | (
-                                sSFA[None, None, tma_stage].iterator.toint() >> 4
-                            )
-                            sfb_desc = sdesc_sf | (
-                                sSFB[None, None, tma_stage].iterator.toint() >> 4
-                            )
-
+                    if valid:
                         cute.arch.mbarrier_wait(
-                            tma_full_mbar + tma_stage, tma_full_parity
+                            tmem_empty_mbar + tmem_stage, tmem_empty_parity
                         )
                         _tcgen05.fence_after_thread_sync()
 
-                        # load SF from smem->tmem
-                        if cutlass.const_expr(self.dtype == "mxfp8"):
-                            _tcgen05.cp(
-                                sfa_tmem, sfa_desc, "32x128b", "warpx4", cta_group
-                            )
-                            for j in cutlass.range_constexpr(BN // 128):
-                                _tcgen05.cp(
-                                    sfb_tmem + j * 4,
-                                    sfb_desc,
-                                    "32x128b",
-                                    "warpx4",
-                                    cta_group,
-                                )
-                                sfb_desc += (128 * 4) >> 4
-
-                        # 4 = 128B / 32B
-                        for mma_k in cutlass.range_constexpr(4):
-                            enable_d = iter_k > 0 or mma_k > 0
+                        for iter_k in cutlass.range(cute.ceil_div(K, BK), unroll=1):
+                            d_tmem = BN * tmem_stage
+                            a_addr = sA[None, None, tma_stage].iterator.toint()
+                            b_addr = sB[None, None, tma_stage].iterator.toint()
+                            a_desc = sdesc | (a_addr >> 4)
+                            b_desc = sdesc | (b_addr >> 4)
                             if cutlass.const_expr(self.dtype == "mxfp8"):
-                                # select SF IDs
-                                idesc_k = idesc + ((mma_k << 4) | (mma_k << 29))
-                                _tcgen05.mma_mxfp8(
-                                    d_tmem,
-                                    a_desc,
-                                    b_desc,
-                                    idesc_k,
-                                    sfa_tmem,
-                                    sfb_tmem,
-                                    enable_d,
-                                    cta_group,
+                                sfa_desc = sdesc_sf | (
+                                    sSFA[None, None, tma_stage].iterator.toint() >> 4
                                 )
-                            else:
-                                _tcgen05.mma_f16(
-                                    d_tmem, a_desc, b_desc, idesc, enable_d, cta_group
+                                sfb_desc = sdesc_sf | (
+                                    sSFB[None, None, tma_stage].iterator.toint() >> 4
                                 )
-                            a_desc += 32 >> 4
-                            b_desc += 32 >> 4
+
+                            cute.arch.mbarrier_wait(
+                                tma_full_mbar + tma_stage, tma_full_parity
+                            )
+                            _tcgen05.fence_after_thread_sync()
+
+                            # load SF from smem->tmem
+                            if cutlass.const_expr(self.dtype == "mxfp8"):
+                                _tcgen05.cp(
+                                    sfa_tmem, sfa_desc, "32x128b", "warpx4", cta_group
+                                )
+                                for j in cutlass.range_constexpr(BN // 128):
+                                    _tcgen05.cp(
+                                        sfb_tmem + j * 4,
+                                        sfb_desc,
+                                        "32x128b",
+                                        "warpx4",
+                                        cta_group,
+                                    )
+                                    sfb_desc += (128 * 4) >> 4
+
+                            # 4 = 128B / 32B
+                            for mma_k in cutlass.range_constexpr(4):
+                                enable_d = iter_k > 0 or mma_k > 0
+                                if cutlass.const_expr(self.dtype == "mxfp8"):
+                                    # select SF IDs
+                                    idesc_k = idesc + ((mma_k << 4) | (mma_k << 29))
+                                    _tcgen05.mma_mxfp8(
+                                        d_tmem,
+                                        a_desc,
+                                        b_desc,
+                                        idesc_k,
+                                        sfa_tmem,
+                                        sfb_tmem,
+                                        enable_d,
+                                        cta_group,
+                                    )
+                                else:
+                                    _tcgen05.mma_f16(
+                                        d_tmem,
+                                        a_desc,
+                                        b_desc,
+                                        idesc,
+                                        enable_d,
+                                        cta_group,
+                                    )
+                                a_desc += 32 >> 4
+                                b_desc += 32 >> 4
+                            _tcgen05.commit(
+                                tma_empty_mbar + tma_stage, multicast_mask, cta_group
+                            )
+
+                            tma_stage = (tma_stage + 1) % num_stages
+                            if tma_stage == 0:
+                                tma_full_parity ^= 1
+
                         _tcgen05.commit(
-                            tma_empty_mbar + tma_stage, multicast_mask, cta_group
+                            tmem_full_mbar + tmem_stage, multicast_mask, cta_group
                         )
 
-                        tma_stage = (tma_stage + 1) % num_stages
-                        if tma_stage == 0:
-                            tma_full_parity ^= 1
-
-                    _tcgen05.commit(
-                        tmem_full_mbar + tmem_stage, multicast_mask, cta_group
-                    )
-
-                    tmem_stage = (tmem_stage + 1) % num_tmem_stages
-                    if tmem_stage == 0:
-                        tmem_empty_parity ^= 1
+                        tmem_stage = (tmem_stage + 1) % num_tmem_stages
+                        if tmem_stage == 0:
+                            tmem_empty_parity ^= 1
 
         elif warp_id >= 4:
             # Communication warps
@@ -515,37 +775,87 @@ class Sm100GemmRsAr:
                 cute.nvgpu.CopyUniversalOp(), BFloat16, num_bits_per_copy=128
             )
 
-            # Each thread issues one BF16x8 multimem reduction per vector.
+            # A communication unit is _COMM_ROWS rows x BN columns of this rank's
+            # rows of one GEMM tile. Its rows of every rank's BF16 partial are
+            # fetched with bulk async copies (one row segment each, local or over
+            # NVLink) into a shared-memory ring of _COMM_STAGES chunks, then
+            # summed in FP32 in a fixed rank order and rounded once to BF16 (as
+            # multimem.ld_reduce.acc::f32 does in the switch). Measured on VR200
+            # NVLink at TP4: the NVLS reduction moves ~0.45 TB/s per GPU, unicast
+            # pulls ~0.9 TB/s; issuing them as bulk copies keeps them off the
+            # L1 path, whose in-flight capacity this kernel's shared-memory
+            # carve-out leaves too small for NVLink latency.
             vec_width = 8
             vec_cols = BN // vec_width
-            max_tile_rows = BM // num_ranks
-            vecs_per_tile = max_tile_rows * vec_cols
-            partial_vecs = cute.zipped_divide(partial_mc, (1, vec_width))
-            if cutlass.const_expr(not self.all_reduce):
+            unit_rows = _COMM_ROWS
+            units_per_tile = BM // unit_rows
+            seg_bytes = BN * 2
+            chunk_rows = max(1, _COMM_CHUNK_BYTES // (num_ranks * seg_bytes))
+            chunks_per_unit = unit_rows // chunk_rows
+            chunk_bytes = num_ranks * chunk_rows * seg_bytes
+            vecs_per_chunk = chunk_rows * vec_cols
+            if cutlass.const_expr(self.all_reduce):
+                mc_vecs = cute.zipped_divide(partial_mc, (1, vec_width))
+            else:
                 output_vecs = cute.zipped_divide(output, (1, vec_width))
+            ld_atom = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(), BFloat16, num_bits_per_copy=128
+            )
+            partial_bases = cute.make_rmem_tensor(num_ranks, Int64)
+            for src in cutlass.range_constexpr(num_ranks):
+                partial_bases[src] = cute.arch.load(
+                    (peer_partials.iterator + src).llvm_ptr, Int64
+                )
+            row_bytes = Int64(N) * 2
+            comm_base = sComm.iterator.toint()
+            issued = Int32(0)
+            consumed = Int32(0)
 
-            for tile_id in range(raw_bid, total_tiles, num_bids):
-                rs_bid_m = tile_id % grid_m
-                bid_n = tile_id // grid_m
+            # This rank's units, in the order the band schedule produces their
+            # GEMM tiles: band by band (pairs of this rank's row group), N
+            # slowest inside a band. CTAs pull units from a per-rank counter,
+            # so the communication load is balanced whatever the GEMM order.
+            pair_rows = BM * cta_group
+            first_pair = self.shard_pair(self.rank, local_M, pair_rows)
+            num_my_pairs = Int32(0)
+            if rank_end > rank_start:
+                num_my_pairs = (rank_end - 1) // pair_rows - first_pair + 1
+            band_pairs = max(1, _BAND_PAIRS // num_ranks)
+            band_units = band_pairs * cta_group * grid_n * units_per_tile
+            total_units = num_my_pairs * cta_group * grid_n * units_per_tile
 
-                local_row_start = rs_bid_m * local_M // grid_m
-                local_row_end = (rs_bid_m + 1) * local_M // grid_m
-                global_row_start = rank_start + local_row_start
-                global_row_end = min(rank_start + local_row_end, M)
+            unit_ctr = sched_ptr
+            done_ctr = sched_ptr + 1
 
-                if global_row_start < M:
-                    # Map the current RS tile to the required GEMM tiles.
-                    # Since an RS tile is smaller than a GEMM tile, each RS tile
-                    # can overlap at most 2 GEMM tiles.
-                    gemm_bid_m0 = global_row_start // BM
-                    gemm_bid_m1 = max(global_row_end - 1, global_row_start) // BM
+            unit = self.next_unit(tid_, unit_ctr, comm_slot, BAR_COMM)
+            while unit < total_units:
+                band_idx = unit // band_units
+                band_w = min(band_pairs, num_my_pairs - band_idx * band_pairs)
+                offset = unit - band_idx * band_units
+                unit_in_tile = offset % units_per_tile
+                tile_in_band = offset // units_per_tile
+                m_in_band = tile_in_band % (band_w * cta_group)
+                bid_n = tile_in_band // (band_w * cta_group)
+                bid_m = (first_pair + band_idx * band_pairs) * cta_group + m_in_band
 
-                    # Poll local L2 with relaxed GPU-scope loads. The following
-                    # multimem reduction reads every rank's L2 directly, so no
-                    # acquire fence or L1 invalidation is needed.
+                tile_row0 = bid_m * BM
+                unit_row0 = tile_row0 + unit_in_tile * unit_rows
+                row_lo = max(unit_row0, rank_start)
+                row_hi = min(unit_row0 + unit_rows, rank_end)
+
+                if row_lo < row_hi:
+                    flag_ptr = flags_uc_ptr + bid_n * grid_m + bid_m
+                    # Poll local L2 with relaxed GPU-scope loads. RS: once every
+                    # rank has arrived, one acquire load of the flag (it only
+                    # grows until this unit's own consumer count below) pairs
+                    # with the producers' red.release, and the CTA barrier
+                    # carries that order to the issuing warp. The partials are
+                    # then read through the async proxy (cp.async.bulk), which
+                    # a generic-proxy acquire does not order: the issuing warp
+                    # adds fence.proxy.async.global below. AR reads every
+                    # rank's L2 through multimem.ld_reduce (generic proxy, no
+                    # L1), as before, and needs neither.
                     if tid_ == 0:
-                        # Poll the 1st GEMM tile.
-                        flag_ptr = flags_uc_ptr + bid_n * grid_m + gemm_bid_m0
                         arrivals = cute.arch.load(
                             flag_ptr, Int32, sem="relaxed", scope="gpu"
                         )
@@ -554,87 +864,155 @@ class Sm100GemmRsAr:
                             arrivals = cute.arch.load(
                                 flag_ptr, Int32, sem="relaxed", scope="gpu"
                             )
-                    elif tid_ == 32 and gemm_bid_m1 != gemm_bid_m0:
-                        # Poll the 2nd GEMM tile with another warp if needed.
-                        flag_ptr = flags_uc_ptr + bid_n * grid_m + gemm_bid_m1
-                        arrivals = cute.arch.load(
-                            flag_ptr, Int32, sem="relaxed", scope="gpu"
-                        )
-                        while arrivals < num_ranks:
-                            nanosleep(64)
-                            arrivals = cute.arch.load(
-                                flag_ptr, Int32, sem="relaxed", scope="gpu"
-                            )
+                        if cutlass.const_expr(not self.all_reduce):
+                            arrivals = ld_acquire_sys(flag_ptr)
                     cute.arch.barrier(barrier_id=BAR_COMM, number_of_threads=128)
 
-                    # Issue multimem.ld_reduce before storing any result.
-                    reduced_vecs = []
-                    for vec_iter in cutlass.range_constexpr(vecs_per_tile // 128):
-                        vec_idx = tid_ + vec_iter * 128
-
-                        local_row = local_row_start + vec_idx // vec_cols
-                        global_row = rank_start + local_row
-                        col = bid_n * vec_cols + vec_idx % vec_cols
-
-                        reduced_vec = cute.make_rmem_tensor(vec_width, BFloat16)
-                        if local_row < local_row_end and global_row < M:
-                            tmp = multimem_ld_reduce_16B(
-                                partial_vecs[None, (global_row, col)]
-                            )
-                            reduced_vec.store(tmp.load())
-                        reduced_vecs.append(reduced_vec)
-
-                    for vec_iter in cutlass.range_constexpr(vecs_per_tile // 128):
-                        vec_idx = tid_ + vec_iter * 128
-
-                        local_row = local_row_start + vec_idx // vec_cols
-                        global_row = rank_start + local_row
-                        col = bid_n * vec_cols + vec_idx % vec_cols
-
-                        if local_row < local_row_end and global_row < M:
-                            if cutlass.const_expr(self.all_reduce):
-                                # Broadcast the result to all ranks.
-                                multimem_st_16B(
-                                    partial_vecs[None, (global_row, col)],
-                                    reduced_vecs[vec_iter],
-                                )
-                            else:
-                                # Store the result to local L2.
-                                cute.copy(
-                                    st_atom,
-                                    reduced_vecs[vec_iter],
-                                    output_vecs[None, (local_row, col)],
-                                )
+                    if cutlass.const_expr(self.all_reduce):
+                        # AR: NVLS reduce + broadcast (the switch reads every
+                        # rank and replicates the result), so each rank moves
+                        # only ~1x its rows over NVLink instead of 2(R-1)/R.
+                        self.nvls_unit(tid_, mc_vecs, unit_row0, row_lo, row_hi, bid_n)
+                    else:
+                        col_byte = Int64(bid_n) * seg_bytes
+                        if tid_ < 32:
+                            # The issuing warp: generic -> async proxy order for
+                            # the acquired partials (see the poll above).
+                            fence_proxy_async_global()
+                        for c in cutlass.range_constexpr(
+                            chunks_per_unit + _COMM_STAGES - 1
+                        ):
+                            # Issue chunk c (the ring runs _COMM_STAGES - 1 ahead).
+                            if cutlass.const_expr(c < chunks_per_unit):
+                                # Chunks wholly outside the unit's rows are skipped.
+                                live_row0 = unit_row0 + c * chunk_rows
+                                if (
+                                    live_row0 < row_hi
+                                    and live_row0 + chunk_rows > row_lo
+                                ):
+                                    # The first communication warp issues the
+                                    # chunk: lane 0 claims the stage, then each lane
+                                    # copies one row segment per rank.
+                                    if tid_ < 32:
+                                        stage = issued % _COMM_STAGES
+                                        phase = (issued // _COMM_STAGES) % 2
+                                        if tid_ == 0:
+                                            cute.arch.mbarrier_wait(
+                                                comm_empty_mbar + stage, phase ^ 1
+                                            )
+                                            mbarrier.arrive_expect_tx(
+                                                comm_full_mbar + stage, chunk_bytes
+                                            )
+                                        cute.arch.sync_warp()
+                                        mbar_addr = (comm_full_mbar + stage).toint()
+                                        dst0 = comm_base + stage * _COMM_CHUNK_BYTES
+                                        for j in cutlass.range_constexpr(
+                                            (chunk_rows + 31) // 32
+                                        ):
+                                            r = tid_ + j * 32
+                                            if r < chunk_rows:
+                                                row = unit_row0 + c * chunk_rows + r
+                                                row = min(max(row, row_lo), row_hi - 1)
+                                                gaddr = (
+                                                    Int64(row) * row_bytes + col_byte
+                                                )
+                                                for src in cutlass.range_constexpr(
+                                                    num_ranks
+                                                ):
+                                                    bulk_copy_g2s(
+                                                        dst0
+                                                        + (src * chunk_rows + r)
+                                                        * seg_bytes,
+                                                        partial_bases[src] + gaddr,
+                                                        seg_bytes,
+                                                        mbar_addr,
+                                                    )
+                                    issued += 1
+                            # Consume chunk c - (_COMM_STAGES - 1).
+                            if cutlass.const_expr(c >= _COMM_STAGES - 1):
+                                cc = c - (_COMM_STAGES - 1)
+                                cons_row0 = unit_row0 + cc * chunk_rows
+                                if (
+                                    cons_row0 < row_hi
+                                    and cons_row0 + chunk_rows > row_lo
+                                ):
+                                    stage = consumed % _COMM_STAGES
+                                    phase = (consumed // _COMM_STAGES) % 2
+                                    cute.arch.mbarrier_wait(
+                                        comm_full_mbar + stage, phase
+                                    )
+                                    for it in cutlass.range_constexpr(
+                                        (vecs_per_chunk + 127) // 128
+                                    ):
+                                        v = tid_ + it * 128
+                                        if v < vecs_per_chunk:
+                                            vrow = v // vec_cols
+                                            vcol = v % vec_cols
+                                            acc = cute.make_rmem_tensor(
+                                                vec_width, cutlass.Float32
+                                            )
+                                            acc.fill(0.0)
+                                            for src in cutlass.range_constexpr(
+                                                num_ranks
+                                            ):
+                                                sv = cute.make_tensor(
+                                                    cute.make_ptr(
+                                                        BFloat16,
+                                                        comm_base
+                                                        + stage * _COMM_CHUNK_BYTES
+                                                        + (src * chunk_rows + vrow)
+                                                        * seg_bytes
+                                                        + vcol * 16,
+                                                        cute.AddressSpace.smem,
+                                                        assumed_align=16,
+                                                    ),
+                                                    cute.make_layout(vec_width),
+                                                )
+                                                val = cute.make_rmem_tensor(
+                                                    vec_width, BFloat16
+                                                )
+                                                cute.copy(ld_atom, sv, val)
+                                                acc.store(
+                                                    acc.load()
+                                                    + val.load().to(cutlass.Float32)
+                                                )
+                                            reduced = cute.make_rmem_tensor(
+                                                vec_width, BFloat16
+                                            )
+                                            reduced.store(acc.load().to(BFloat16))
+                                            row = unit_row0 + cc * chunk_rows + vrow
+                                            col = bid_n * vec_cols + vcol
+                                            if row >= row_lo and row < row_hi:
+                                                if cutlass.const_expr(self.all_reduce):
+                                                    # Broadcast the result to all ranks.
+                                                    multimem_st_16B(
+                                                        mc_vecs[None, (row, col)],
+                                                        reduced,
+                                                    )
+                                                else:
+                                                    cute.copy(
+                                                        st_atom,
+                                                        reduced,
+                                                        output_vecs[
+                                                            None,
+                                                            (row - rank_start, col),
+                                                        ],
+                                                    )
+                                    mbarrier.arrive(comm_empty_mbar + stage)
+                                    consumed += 1
                     cute.arch.barrier(barrier_id=BAR_COMM, number_of_threads=128)
 
-                    # Release each GEMM tile consumed by this RS tile. The last
-                    # consumer resets its producer flag for the next launch.
-                    def release_gemm_tile(
-                        gemm_bid_m,
-                        tile_M,
-                        logical_M,
-                        rank_start,
-                        rank_end,
-                        local_M,
-                        grid_m,
-                        tile_N,
-                        flags,
-                        num_ranks,
-                    ):
-                        gemm_start = gemm_bid_m * tile_M
-                        gemm_end = min(gemm_start + tile_M, logical_M)
-                        local_start = max(gemm_start, rank_start) - rank_start
-                        local_end = min(gemm_end, rank_end) - rank_start
-
-                        # Compute the number of consumers to identify the last
-                        # arrival, which resets the producer flag.
-                        first_rs_tile = (
-                            cute.ceil_div((local_start + 1) * grid_m, local_M) - 1
+                    # Release the GEMM tile. Its consumers on this rank are the
+                    # units overlapping this rank's rows; the last one resets
+                    # the producer flag for the next launch.
+                    if tid_ == 0:
+                        first_unit = (max(rank_start, tile_row0) - tile_row0) // (
+                            unit_rows
                         )
-                        last_rs_tile = cute.ceil_div(local_end * grid_m, local_M) - 1
-                        num_consumers = last_rs_tile - first_rs_tile + 1
-
-                        flag_ptr = flags + tile_N * grid_m + gemm_bid_m
+                        last_unit = (
+                            min(rank_end, tile_row0 + BM) - 1 - tile_row0
+                        ) // unit_rows
+                        num_consumers = last_unit - first_unit + 1
                         old_count = cute.arch.atomic_add(
                             flag_ptr, Int32(1), sem="relaxed", scope="gpu"
                         )
@@ -643,34 +1021,18 @@ class Sm100GemmRsAr:
                                 flag_ptr, Int32(0), sem="relaxed", scope="gpu"
                             )
 
-                    if tid_ == 0:
-                        # Arrive at the 1st GEMM tile.
-                        release_gemm_tile(
-                            gemm_bid_m0,
-                            BM,
-                            M,
-                            rank_start,
-                            rank_end,
-                            local_M,
-                            grid_m,
-                            bid_n,
-                            flags_uc_ptr,
-                            num_ranks,
-                        )
-                    elif tid_ == 32 and gemm_bid_m1 != gemm_bid_m0:
-                        # Arrive at the 2nd GEMM tile if necessary.
-                        release_gemm_tile(
-                            gemm_bid_m1,
-                            BM,
-                            M,
-                            rank_start,
-                            rank_end,
-                            local_M,
-                            grid_m,
-                            bid_n,
-                            flags_uc_ptr,
-                            num_ranks,
-                        )
+                unit = self.next_unit(tid_, unit_ctr, comm_slot, BAR_COMM)
+
+            # Every CTA has taken its final (failing) unit before it counts
+            # itself done, so the last CTA can reset both counters for the
+            # next launch.
+            if tid_ == 0:
+                done = cute.arch.atomic_add(
+                    done_ctr, Int32(1), sem="relaxed", scope="gpu"
+                )
+                if done == num_bids - 1:
+                    cute.arch.store(unit_ctr, Int32(0), sem="relaxed", scope="gpu")
+                    cute.arch.store(done_ctr, Int32(0), sem="relaxed", scope="gpu")
 
             # Exit barrier. GPU scope is sufficient for RS because the kernel
             # writes local global memory and only needs to flush it to local L2.
@@ -731,74 +1093,78 @@ class Sm100GemmRsAr:
             else:
                 tmem_empty_mbar_ = tmem_empty_mbar
 
-            for bid in range(raw_bid, total_tiles, num_bids):
-                bid_m = bid % grid_m
-                bid_n = bid // grid_m
+            for bid in range(raw_bid, total_slots, num_bids):
+                bid_m, bid_n, valid = self.tile_coords(
+                    bid, grid_m, grid_n, local_M, num_slots_m, banded
+                )
+                if valid:
+                    if warp_id_ == 0:
+                        cute.arch.mbarrier_wait(tmem_full_mbar + tmem_stage, parity)
+                    cute.arch.barrier(barrier_id=BAR_EPILOGUE, number_of_threads=128)
+                    _tcgen05.fence_after_thread_sync()
 
-                if warp_id_ == 0:
-                    cute.arch.mbarrier_wait(tmem_full_mbar + tmem_stage, parity)
-                cute.arch.barrier(barrier_id=BAR_EPILOGUE, number_of_threads=128)
-                _tcgen05.fence_after_thread_sync()
+                    for i in cutlass.range_constexpr(BN // WIDTH):
+                        tcol = tmem_stage * BN + i * WIDTH
+                        regs = _tcgen05.ld(warp_id_ * 32, tcol, "32x32b", WIDTH)
+                        _tcgen05.wait_ld()
 
-                for i in cutlass.range_constexpr(BN // WIDTH):
-                    tcol = tmem_stage * BN + i * WIDTH
-                    regs = _tcgen05.ld(warp_id_ * 32, tcol, "32x32b", WIDTH)
-                    _tcgen05.wait_ld()
+                        if cutlass.const_expr(i == BN // WIDTH - 1):
+                            _tcgen05.fence_before_thread_sync()
+                            mbarrier.arrive(tmem_empty_mbar_ + tmem_stage, "cluster")
 
-                    if cutlass.const_expr(i == BN // WIDTH - 1):
-                        _tcgen05.fence_before_thread_sync()
-                        mbarrier.arrive(tmem_empty_mbar_ + tmem_stage, "cluster")
+                        global_row = bid_m * BM + tid_
+                        tmp = cute.make_rmem_tensor(WIDTH, BFloat16)
+                        if cutlass.const_expr(self.residual):  # noqa: SIM102 (compile-time)
+                            if (
+                                global_row >= residual_row0
+                                and global_row < residual_row1
+                            ):
+                                res = cute.make_rmem_tensor(WIDTH, BFloat16)
+                                cute.copy(
+                                    bf16x16_ld_atom,
+                                    residual_vecs[
+                                        None,
+                                        (
+                                            global_row - residual_row0,
+                                            bid_n * (BN // WIDTH) + i,
+                                        ),
+                                    ],
+                                    res,
+                                )
+                                regs = regs + res.load().to(cutlass.Float32)
+                        tmp.store(regs.to(BFloat16))
 
-                    global_row = bid_m * BM + tid_
-                    tmp = cute.make_rmem_tensor(WIDTH, BFloat16)
-                    if cutlass.const_expr(self.residual):  # noqa: SIM102 (compile-time)
-                        if global_row >= residual_row0 and global_row < residual_row1:
-                            res = cute.make_rmem_tensor(WIDTH, BFloat16)
-                            cute.copy(
-                                bf16x16_ld_atom,
-                                residual_vecs[
-                                    None,
-                                    (
-                                        global_row - residual_row0,
-                                        bid_n * (BN // WIDTH) + i,
-                                    ),
-                                ],
-                                res,
-                            )
-                            regs = regs + res.load().to(cutlass.Float32)
-                    tmp.store(regs.to(BFloat16))
+                        if global_row < M:
+                            coord = (global_row, bid_n * (BN // WIDTH) + i)
+                            cute.copy(bf16x16_atom, tmp, partial_vecs[None, coord])
 
-                    if global_row < M:
-                        coord = (global_row, bid_n * (BN // WIDTH) + i)
-                        cute.copy(bf16x16_atom, tmp, partial_vecs[None, coord])
+                    cute.arch.barrier(barrier_id=BAR_EPILOGUE, number_of_threads=128)
 
-                cute.arch.barrier(barrier_id=BAR_EPILOGUE, number_of_threads=128)
+                    # Signal GEMM completion. GPU scope is sufficient because the
+                    # partial output only needs to be flushed to local L2.
+                    if tid_ == 0 and bid_m * BM < M:
+                        gemm_start = bid_m * BM
+                        gemm_end = min(gemm_start + BM, M)
+                        first_owner = gemm_start // local_M
+                        last_owner = (gemm_end - 1) // local_M
 
-                # Signal GEMM completion. GPU scope is sufficient because the
-                # partial output only needs to be flushed to local L2.
-                if tid_ == 0 and bid_m * BM < M:
-                    gemm_start = bid_m * BM
-                    gemm_end = min(gemm_start + BM, M)
-                    first_owner = gemm_start // local_M
-                    last_owner = (gemm_end - 1) // local_M
+                        # signal to all consuming ranks (can be more than 1)
+                        for rank in cutlass.range_constexpr(num_ranks):
+                            if first_owner <= rank and rank <= last_owner:
+                                ptr = cute.make_ptr(
+                                    Int32,
+                                    peer_flag_bases[rank],
+                                    cute.AddressSpace.gmem,
+                                    assumed_align=16,
+                                )
+                                ptr += bid_m + bid_n * grid_m
+                                utils.distributed.red_add1(
+                                    ptr, order="release", scope="gpu"
+                                )
 
-                    # signal to all consuming ranks (can be more than 1)
-                    for rank in cutlass.range_constexpr(num_ranks):
-                        if first_owner <= rank and rank <= last_owner:
-                            ptr = cute.make_ptr(
-                                Int32,
-                                peer_flag_bases[rank],
-                                cute.AddressSpace.gmem,
-                                assumed_align=16,
-                            )
-                            ptr += bid_m + bid_n * grid_m
-                            utils.distributed.red_add1(
-                                ptr, order="release", scope="gpu"
-                            )
-
-                tmem_stage = (tmem_stage + 1) % num_tmem_stages
-                if tmem_stage == 0:
-                    parity ^= 1
+                    tmem_stage = (tmem_stage + 1) % num_tmem_stages
+                    if tmem_stage == 0:
+                        parity ^= 1
 
             if cutlass.const_expr(is_2cta):
                 cute.arch.cluster_arrive_relaxed()
@@ -817,6 +1183,7 @@ class Sm100GemmRsAr:
         all_reduce: bool = False,
         dtype: str = "bf16",
         residual: bool = False,
+        BN: int = 128,
     ):
         M = cute.sym_int()
         padded_M = cute.sym_int()
@@ -874,8 +1241,10 @@ class Sm100GemmRsAr:
             )
         )
         flags = make_fake_tensor(Int32, (num_flags,), (1,), assumed_align=16)
+        sched = make_fake_tensor(Int32, (4,), (1,), assumed_align=16)
         flags_mc_ptr = nullptr(Int32, cute.AddressSpace.gmem, assumed_align=16)
         peer_flag_ptr = nullptr(Int64, cute.AddressSpace.gmem, assumed_align=8)
+        peer_partial_ptr = nullptr(Int64, cute.AddressSpace.gmem, assumed_align=8)
 
         residual_t = (
             make_fake_tensor(
@@ -896,6 +1265,7 @@ class Sm100GemmRsAr:
             all_reduce=all_reduce,
             dtype=dtype,
             residual=residual,
+            BN=BN,
         )
         return cute.compile(
             kernel,
@@ -909,8 +1279,10 @@ class Sm100GemmRsAr:
             flags,
             flags_mc_ptr,
             peer_flag_ptr,
+            peer_partial_ptr,
             residual_t,
             0,
+            sched,
             128,
             stream,
             options="--enable-tvm-ffi",
@@ -972,11 +1344,20 @@ class GemmRsAr:
         if self.flags_handle.multicast_ptr == 0:
             raise RuntimeError("GEMM-RS/AR requires NVLink multicast memory")
         self.flags.zero_()
+        # Per-rank communication-unit counters (next unit, finished CTAs); the
+        # last CTA of every launch resets them.
+        self.sched = torch.zeros(4, dtype=torch.int32, device=device)
         self.flags_mc_ptr = make_ptr(
             Int32,
             self.flags_handle.multicast_ptr,
             cute.AddressSpace.gmem,
             assumed_align=16,
+        )
+        self.peer_partial_ptr = make_ptr(
+            Int64,
+            self.partial_handle.buffer_ptrs_dev,
+            cute.AddressSpace.gmem,
+            assumed_align=8,
         )
         self.peer_flag_ptr = make_ptr(
             Int64,
@@ -1113,16 +1494,57 @@ class GemmRsAr:
             assert w.shape == (N, K) and K % 64 == 0
             assert w.dtype == torch.bfloat16
             assert w.is_contiguous()
+        cta_group, BN = self.select_tiles(M, dtype)
+        return self._launch(
+            x, w, x_sf, w_sf, residual, residual_row0, copy_out, dtype, cta_group, BN
+        )
+
+    def select_tiles(self, M: int, dtype: str) -> tuple[int, int]:
+        """Per-shape (cta_group, BN).
+
+        2-CTA (256-row MMA) unless a small odd M-tile grid would need padding.
+        BF16 2-CTA RS uses 256-column tiles (a 256x256 MMA) once they still
+        give the SMs >= 6 waves (TP4 K=3072: M=4096 128-col 94 vs 98 us, M=8192
+        256-col 144 vs 154 us): it halves the A traffic from L2 and the
+        number of tile handoffs to the communication warps (TP4 M=17400:
+        330 -> 257 us). AR (comm-bound, NVLS) and MXFP8 (its scale factors
+        leave room for one 256-column TMEM stage only) stay at 128 columns.
+        """
+        grid_m = (M + 127) // 128
+        cta_group = 2 if M >= 1024 or grid_m % 2 == 0 else 1
+        BN = 128
+        if (
+            dtype == "bf16"
+            and not self.all_reduce
+            and cta_group == 2
+            and self.N % 256 == 0
+            and (grid_m + 1) // 2 * (self.N // 256) * 2 >= 6 * self.num_sms
+        ):
+            BN = 256
+        return cta_group, BN
+
+    def _launch(
+        self,
+        x: torch.Tensor,
+        w: torch.Tensor,
+        x_sf: torch.Tensor | None,
+        w_sf: torch.Tensor | None,
+        residual: torch.Tensor | None,
+        residual_row0: int,
+        copy_out: bool,
+        dtype: str,
+        cta_group: int,
+        BN: int,
+    ) -> torch.Tensor:
+        M = x.shape[0]
+        N = self.N
         padded_M = (M + self.world_size - 1) // self.world_size
         padded_M *= self.world_size
         local_M = padded_M // self.world_size
-
         grid_m = (M + 127) // 128
-        # Avoid padding small odd grids; 2-CTA wins consistently for M >= 1024.
-        cta_group = 2 if M >= 1024 or grid_m % 2 == 0 else 1
         grid_m = (grid_m + cta_group - 1) // cta_group * cta_group
 
-        num_tiles = grid_m * (N // 128)
+        num_tiles = grid_m * (N // BN)
         num_ctas = min(num_tiles, self.num_sms)
         num_ctas = num_ctas // cta_group * cta_group
         assert self.flags.numel() >= num_tiles + num_ctas
@@ -1150,6 +1572,7 @@ class GemmRsAr:
             self.all_reduce,
             dtype=dtype,
             residual=residual is not None,
+            BN=BN,
         )
         compiled(
             x,
@@ -1162,8 +1585,10 @@ class GemmRsAr:
             self.flags,
             self.flags_mc_ptr,
             self.peer_flag_ptr,
+            self.peer_partial_ptr,
             residual,
             residual_row0,
+            self.sched,
             num_ctas,
         )
         if self.all_reduce:
@@ -1255,8 +1680,13 @@ def warmup_gemm_rs_ar() -> int:
         return 0
 
     variants = (False, True) if _gemm_rs_ar.residual_used else (False,)
+    count = 0
     for dtype in sorted(_gemm_rs_ar.dtypes):
-        for cta_group in (1, 2):
+        # Every (cta_group, BN) that select_tiles can return for this dtype.
+        tiles = [(1, 128), (2, 128)]
+        if dtype == "bf16" and _gemm_rs_ar.N % 256 == 0:
+            tiles.append((2, 256))
+        for cta_group, BN in tiles:
             for residual in variants:
                 Sm100GemmRsAr.compile(
                     _gemm_rs_ar.rank,
@@ -1265,8 +1695,10 @@ def warmup_gemm_rs_ar() -> int:
                     _gemm_rs_ar.all_reduce,
                     dtype=dtype,
                     residual=residual,
+                    BN=BN,
                 )
-    return 2 * len(_gemm_rs_ar.dtypes) * len(variants)
+                count += 1
+    return count
 
 
 def get_gemm_rs_ar() -> GemmRsAr:
