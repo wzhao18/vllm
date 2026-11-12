@@ -1427,17 +1427,40 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         metadata=m,
                     ).transpose(0, 1)
 
-                if (
+                have_meta = (
                     has_initial_state is not None
                     and non_spec_query_start_loc is not None
                     and non_spec_state_indices_tensor is not None
-                    and packed_causal_conv1d_supported(
+                )
+                if have_meta and kda_conv.qkv_conv_supported(
+                    mixed_qkv_ns,
+                    conv_weights,
+                    conv_state,
+                    self.local_projection_size,
+                ):
+                    # One persistent CUDA launch over the packed Q|K|V columns,
+                    # stock arithmetic and conv state (ops/kda_qkv_conv).
+                    assert has_initial_state is not None
+                    assert non_spec_query_start_loc is not None
+                    assert non_spec_state_indices_tensor is not None
+                    q_ns, k_ns, v_ns = kda_conv.qkv_conv(
                         mixed_qkv_ns,
                         conv_weights,
                         conv_state,
+                        non_spec_query_start_loc,
+                        non_spec_state_indices_tensor,
+                        has_initial_state,
                         self.local_projection_size,
-                    )
+                    ).unbind(0)
+                elif have_meta and packed_causal_conv1d_supported(
+                    mixed_qkv_ns,
+                    conv_weights,
+                    conv_state,
+                    self.local_projection_size,
                 ):
+                    assert has_initial_state is not None
+                    assert non_spec_query_start_loc is not None
+                    assert non_spec_state_indices_tensor is not None
                     # One launch over the packed Q|K|V columns: no FP32 copies of
                     # the inputs, same FP32 math and conv state as the stock calls.
                     q_ns, k_ns, v_ns = packed_causal_conv1d_fn(
