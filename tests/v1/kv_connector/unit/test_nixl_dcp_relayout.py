@@ -344,6 +344,6 @@ def test_relayout_mode_is_selected_per_peer():
     )
 
     assert (
-        select_dcp_transfer_mode(D_LAYOUT, P_LAYOUT, has_mamba=True, tp_sizes=(16, 8))
+        select_dcp_transfer_mode(D_LAYOUT, P_LAYOUT, tp_sizes=(16, 8))
         is DcpTransferMode.RELAYOUT
     )

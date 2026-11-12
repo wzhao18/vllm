@@ -2575,6 +2575,7 @@ def _layout_worker(**attrs) -> NixlConnectorWorker:
     worker = object.__new__(NixlConnectorWorker)
     worker._remote_agents = {}
     worker.dcp_size = 8
+    worker.transfer_tp_size = 8
     worker._has_mamba = True
     worker._layer_specs = dict.fromkeys(["mla.0", "indexer.0", "kda.1"])
     worker._kv_row_layouts = {"mla.0": _MLA_ROWS, "indexer.0": _INDEXER_ROWS}
@@ -2620,9 +2621,9 @@ def test_handshake_accepts_matching_layouts():
     ("remote_dcp_size", "fields", "match"),
     [
         (8, dict(cp_kv_cache_interleave_size=64), "interleave"),
-        (8, dict(block_size=64), "logical block sizes"),
-        # Hybrid models need equal DCP sizes.
-        (16, dict(), "matching DCP sizes"),
+        # Different DCP sizes at interleave 1 (Kimi K3.1 P DCP16 -> D DCP8)
+        # move rows between pages.
+        (16, dict(), "not supported yet"),
         # A peer older than v17 does not tell its interleave.
         (8, dict(cp_kv_cache_interleave_size=None), "older than version 17"),
         # A layout DCP cannot produce.
@@ -2654,7 +2655,9 @@ def test_handshake_rejects_incompatible_peers(remote_dcp_size, fields, match):
     worker = _layout_worker()
     with pytest.raises(bw.NixlPeerIncompatibleError, match=f"engine P .*{match}"):
         worker.add_remote_agent(
-            _peer_meta(**fields), remote_tp_size=8, remote_dcp_size=remote_dcp_size
+            _peer_meta(**fields),
+            remote_tp_size=remote_dcp_size,
+            remote_dcp_size=remote_dcp_size,
         )
     assert worker.tp_mappings == {}
     assert worker.dcp_transfer_modes == {}
@@ -2962,3 +2965,197 @@ def test_kv_cache_scales_only_of_quantized_caches():
         block_size=640, num_kv_heads=1, head_size=576, dtype=torch.bfloat16
     )
     assert get_kv_cache_quant_scales(layer, unquantized) is None
+
+
+# ---------------------------------------------------------------------------
+# Heterogeneous DCP: same-layout pages of other sizes, per-layer state pairing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.cpu_test
+def test_handshake_accepts_same_dcp_with_other_blocks():
+    """Same DCP size and interleave: rows pair whatever the per-rank blocks
+    (D DCP8 x 1280 rows <- P DCP8 x 640 rows)."""
+    worker = _layout_worker()
+    mode = worker._check_peer_compatibility(
+        _peer_meta(physical_blocks_per_logical_kv_block=5),
+        remote_dcp_size=8,
+        remote_tp_size=8,
+    )
+    assert mode is DcpTransferMode.DIRECT
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    ("local_tp", "remote_dcp", "remote_tp", "side"),
+    [(8, 4, 8, "remote side has TP 8 and DCP 4"), (16, 16, 16, "local side")],
+)
+def test_handshake_rejects_different_dcp_not_spanning_tp(
+    local_tp, remote_dcp, remote_tp, side
+):
+    worker = _layout_worker(transfer_tp_size=local_tp)
+    with pytest.raises(bw.NixlPeerIncompatibleError, match=f"DCP equal to TP.*{side}"):
+        worker._check_peer_compatibility(
+            _peer_meta(), remote_dcp_size=remote_dcp, remote_tp_size=remote_tp
+        )
+
+
+def _same_layout_worker(kernel_block: int, ppl: int) -> NixlConnectorWorker:
+    worker = object.__new__(NixlConnectorWorker)
+    worker.block_size = kernel_block
+    worker._physical_blocks_per_logical_kv_block = ppl
+    worker._group_spec_types = (MLAAttentionSpec, bw.MambaSpec)
+    worker._dcp_replicated_groups = set()
+    return worker
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    ("local_kernel", "local_ppl", "remote_kernel", "remote_ppl"),
+    [(64, 10, 64, 20), (64, 20, 64, 10), (128, 5, 64, 20), (128, 10, 64, 5)],
+)
+@pytest.mark.parametrize("cached", [0, 1, 2])
+def test_same_dcp_layout_pages_pair_by_row(
+    local_kernel, local_ppl, remote_kernel, remote_ppl, cached
+):
+    """Local row j is the peer rank's row j, so every paired page pair holds
+    the same rows of the rank, from the end of the local prefix hit on."""
+    num_rows = 3 * 1280 - 77  # rows this rank holds of the request
+    ratio = local_kernel // remote_kernel
+    worker = _same_layout_worker(local_kernel, local_ppl)
+    local_rows_per_block = local_kernel * local_ppl
+    num_local_blocks = -(-num_rows // local_rows_per_block)
+    # Logical local blocks 100.. (uncached part) and remote blocks 500..
+    local_logical = list(range(100 + cached, 100 + num_local_blocks))
+    remote_logical = list(
+        range(500, 500 + -(-num_rows // (remote_kernel * remote_ppl)))
+    )
+    local_kernel_ids = [
+        b * local_ppl + i for b in local_logical for i in range(local_ppl)
+    ]
+    remote_kernel_ids = [
+        b * remote_ppl + i for b in remote_logical for i in range(remote_ppl)
+    ]
+    local, remote = worker._pair_same_dcp_layout_pages(
+        [local_kernel_ids, [7]], [remote_kernel_ids, [9]], [cached, 0], ratio
+    )
+    # State slots pair as they are.
+    assert (local[1], remote[1]) == ([7], [9])
+
+    def local_first_row(sub_block: int) -> int:
+        kernel, part = divmod(sub_block, ratio)
+        block, page = divmod(kernel, local_ppl)
+        return (
+            (block - 100) * local_rows_per_block
+            + page * local_kernel
+            + part * remote_kernel
+        )
+
+    def remote_first_row(kernel: int) -> int:
+        block, page = divmod(kernel, remote_ppl)
+        return (block - 500) * remote_kernel * remote_ppl + page * remote_kernel
+
+    rows = [local_first_row(b) for b in local[0]]
+    assert rows == [remote_first_row(b) for b in remote[0]]
+    # Every local row from the prefix hit up to the last local page is read.
+    first = cached * local_rows_per_block
+    last = num_local_blocks * local_rows_per_block
+    assert rows == list(
+        range(first, min(last, len(remote_kernel_ids) * remote_kernel), remote_kernel)
+    )
+
+
+def _ssm_desc_worker() -> NixlConnectorWorker:
+    worker = object.__new__(NixlConnectorWorker)
+    worker._has_mamba = True
+    worker._conv_decomp = SimpleNamespace(local_conv_offsets=((0, 8),))
+    worker._ssm_region_indices = [1, 2]
+    worker.block_len_per_layer = [512, 64, 64]
+    worker.num_regions = 3
+    worker._ple_group_index = None
+    worker._group_spec_types = (MLAAttentionSpec, bw.MambaSpec, bw.MambaSpec)
+    return worker
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("groups", [[0, 1, 2], [0, 1, 1]])
+def test_region_keyed_state_descriptors_match_group_keyed(groups):
+    """Keying reads by region (other cache groups on the peer) gives the
+    descriptors keying by cache group gives for the same blocks."""
+    worker = _ssm_desc_worker()
+    by_group: list[list[int]] = [[] for _ in range(max(groups) + 1)]
+    blocks = [[5, 6], [3], [4] if groups[2] == 2 else [3]]
+    for region, group in enumerate(groups):
+        by_group[group] = blocks[region]
+    common = dict(
+        dst_num_blocks=10, block_size_ratio=None, physical_blocks_per_logical=1
+    )
+    expected = worker._compute_desc_ids(
+        block_ids=by_group, pairs=([0, 1, 2], groups), **common
+    )
+    got = worker._compute_desc_ids(
+        block_ids=blocks,
+        pairs=([0, 1, 2], [0, 1, 2]),
+        key_groups=dict(enumerate(groups)),
+        **common,
+    )
+    assert got.tolist() == expected.tolist()
+
+
+@pytest.mark.cpu_test
+def test_state_regions_pair_by_layer_across_group_counts():
+    """D holds its two KDA layers in one state group, P in two: each layer
+    still reads its own slot (per-layer pairs), and the peer's state groups
+    are its own numbering."""
+    worker = _ssm_desc_worker()
+    worker._layer_specs = {
+        "mla.0": MLAAttentionSpec(
+            block_size=64, num_kv_heads=1, head_size=8, dtype=torch.bfloat16
+        ),
+        "kda.1": bw.MambaSpec(block_size=64, shapes=((4,),), dtypes=(torch.float32,)),
+        "kda.2": bw.MambaSpec(block_size=64, shapes=((4,),), dtypes=(torch.float32,)),
+    }
+    pairs = region_pairs_by_index(3, groups=[0, 1, 1], groups_match=False)
+    worker._pair_ssm_regions(pairs, "P", {"mla.0": 0, "kda.1": 1, "kda.2": 2})
+    assert pairs.remote_ssm_regions == [1, 2]
+    assert pairs.remote_ssm_groups == frozenset({1, 2})
+    assert pairs.region_groups() == {0: 0, 1: 1, 2: 1}
+    with pytest.raises(NotImplementedError, match="cache group of each Mamba"):
+        worker._pair_ssm_regions(
+            region_pairs_by_index(3, groups=[0, 1, 1], groups_match=False),
+            "P",
+            {"mla.0": 0},
+        )
+    # A region holding layers of two groups pairs twice: blocks keyed by
+    # region cannot tell them apart.
+    shared = region_pairs_by_index(3, groups=[0, 1, 1], groups_match=False)
+    shared.remote.append(2)
+    shared.local.append(2)
+    shared.group.append(0)
+    with pytest.raises(NotImplementedError, match="several cache groups"):
+        worker._pair_ssm_regions(shared, "P", {"mla.0": 0, "kda.1": 1, "kda.2": 2})
+
+
+@pytest.mark.cpu_test
+def test_peer_state_groups_stay_whole_in_kernel_blocks():
+    worker = object.__new__(NixlConnectorWorker)
+    got = worker._logical_to_kernel_block_ids([[1], [2, 3], [4]], 2, ssm_groups={0, 2})
+    assert got == [[1], [4, 5, 6, 7], [4]]
+
+
+@pytest.mark.cpu_test
+def test_only_state_regions_skip_block_length_checks():
+    worker = _ssm_desc_worker()
+    worker._layer_specs = {
+        "mla.0": MLAAttentionSpec(
+            block_size=64, num_kv_heads=1, head_size=8, dtype=torch.bfloat16
+        ),
+        "kda.1": bw.MambaSpec(block_size=64, shapes=((4,),), dtypes=(torch.float32,)),
+    }
+    worker.region_members = [["mla.0"], ["kda.1"], ["mla.0", "kda.1"]]
+    assert [worker._region_holds_only_mamba_state(r) for r in range(4)] == [
+        False,
+        True,
+        False,
+        False,
+    ]
