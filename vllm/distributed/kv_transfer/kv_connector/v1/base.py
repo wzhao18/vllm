@@ -455,6 +455,26 @@ class KVConnectorBase_V1(ABC):
         """
         return set()
 
+    def poll_finished_recving(self) -> set[str]:
+        """Drain async loads that finished cleanly since the last drain.
+
+        Called by the worker right before it sends a step's output, possibly
+        from an output thread concurrently with `get_transfer_results()`, so
+        the scheduler sees a finished load on the earliest output. Executors
+        may never call it: until it is first called, an implementation must
+        keep reporting every load through `get_transfer_results()`.
+
+        Must be thread-safe, non-blocking, free of CUDA calls, must not raise
+        and must not read the bound connector metadata. Each load is reported
+        exactly once per worker, here or in-band, never both. A load with any
+        failure is not reported here; it stays in-band with its load errors.
+
+        Returns:
+            IDs of requests whose async load fully finished without error.
+
+        """
+        return set()
+
     def shutdown(self):
         """Shutdown the connector. This is called when the worker process
         is shutting down to ensure that all the async operations are

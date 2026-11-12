@@ -1264,6 +1264,10 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         # are only unique within a group, so failures are reported per request.
         self._is_hma_required = is_hma_required
         self._failed_requests: set[str] = set()
+        # Requests in finished_requests whose load finished without any error.
+        # Guarded by done_task_lock. These may be reported early by
+        # take_clean_finished_requests() instead of in-band.
+        self._clean_finished: set[str] = set()
         self.disk_offload_buffer_budget_bytes = disk_offload_buffer_budget_bytes
         self.usable_disk_offload_buffer_budget_bytes = (
             None
@@ -1281,6 +1285,39 @@ class KVCacheStoreRecvingThread(KVTransferThread):
     def set_failed_request(self, req_id: str):
         with self.done_task_lock:
             self._failed_requests.add(req_id)
+
+    def set_finished_request(self, req_id: str, clean: bool = False) -> None:
+        with self.done_task_lock:
+            # Only a single clean sighting may be reported early; anything else
+            # is left to the in-band report alongside its load errors. Dedup is
+            # per thread: a load is queued once, so it runs on one thread.
+            if clean and req_id not in self.finished_requests:
+                self._clean_finished.add(req_id)
+            else:
+                self._clean_finished.discard(req_id)
+            self.finished_requests.add(req_id)
+
+    def get_and_clear_finished_requests(self, include_clean: bool = True) -> set[str]:
+        """Drain finished loads for the in-band report.
+
+        With include_clean=False, clean loads stay pending for
+        take_clean_finished_requests().
+        """
+        with self.done_task_lock:
+            if include_clean:
+                finished, self.finished_requests = self.finished_requests, set()
+                self._clean_finished.clear()
+            else:
+                finished = self.finished_requests - self._clean_finished
+                self.finished_requests = set(self._clean_finished)
+        return finished
+
+    def take_clean_finished_requests(self) -> set[str]:
+        """Drain the loads that finished without any error."""
+        with self.done_task_lock:
+            clean, self._clean_finished = self._clean_finished, set()
+            self.finished_requests -= clean
+        return clean
 
     def get_and_clear_failed_requests(self) -> set[str]:
         with self.done_task_lock:
@@ -1443,6 +1480,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         current_batch_keys: list[str] = key_list_c
         current_batch_block_ids: list[int] = block_id_list_c
         batch_bytes = 0
+        load_failed = False
         try:
             for (
                 batch_keys,
@@ -1486,6 +1524,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     num_failed_keys=len(failed),
                 )
                 if failed:
+                    load_failed = True
                     self._report_load_error(
                         req_id, [block_id for _, _, block_id in failed]
                     )
@@ -1498,6 +1537,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     )
                     break
         except Exception as e:
+            load_failed = True
             self._report_load_error(req_id, current_batch_block_ids)
             self._record_operation(
                 "load_get",
@@ -1513,7 +1553,8 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 e,
             )
 
-        self.set_finished_request(req_id)
+        # Load errors are recorded above, before the request is reported.
+        self.set_finished_request(req_id, clean=not load_failed)
         self.request_queue.task_done()
 
 
@@ -1628,6 +1669,10 @@ class MooncakeStoreWorker:
                 "Mooncake boundary states expire %.0f s after they are stored",
                 self._prune_idle_tail_ttl_s,
             )
+        # Set once poll_finished_recving() runs, i.e. once clean loads are
+        # reported right before each step output is sent; get_finished() then
+        # leaves them to it.
+        self._recv_poller_active = False
         # Mirrors MooncakeStoreConnector._capacity_only.
         self._capacity_only = (
             self.kv_role == "kv_consumer"
@@ -2293,6 +2338,27 @@ class MooncakeStoreWorker:
 
         assert self.load_async, "load_async must be True for better performance."
 
+    def poll_finished_recving(self) -> set[str]:
+        """Drain loads that finished without error, for an early report.
+
+        Runs on the worker's output thread right before a step output is
+        sent. From the first call on, get_finished() stops reporting clean
+        loads, so each load is reported exactly once.
+        """
+        if self._capacity_only or not self.load_async:
+            return set()
+        # Activate before the first drain; from then on get_finished() leaves
+        # clean loads to this poll.
+        self._recv_poller_active = True
+        finished_recving: set[str] = set()
+        for recv_thread in self.kv_recv_threads:
+            finished_recving |= recv_thread.take_clean_finished_requests()
+        if finished_recving:
+            self._increment_kv_connector_counter(
+                "recv_reported_by_poll", len(finished_recving)
+            )
+        return finished_recving
+
     def wait_for_save(self, metadata: MooncakeStoreConnectorMetadata):
         """Issue async stores with CUDA event synchronization.
 
@@ -2334,8 +2400,16 @@ class MooncakeStoreWorker:
         done_sending: set[str] = set()
         done_recving: set[str] = set()
         if self.load_async:
+            # Once the poller runs, clean loads are left to it.
+            include_clean = not self._recv_poller_active
             for recv_thread in self.kv_recv_threads:
-                done_recving |= recv_thread.get_and_clear_finished_requests()
+                done_recving |= recv_thread.get_and_clear_finished_requests(
+                    include_clean=include_clean
+                )
+            if done_recving:
+                self._increment_kv_connector_counter(
+                    "recv_reported_in_band", len(done_recving)
+                )
 
         logger.debug(
             "Completed send: %d, recv: %d, tp_rank: %d",
@@ -2390,6 +2464,10 @@ class MooncakeStoreWorker:
                 status=status,
                 num_failed_keys=num_failed_keys,
             )
+
+    def _increment_kv_connector_counter(self, event: str, count: int) -> None:
+        with self._kv_connector_stats_lock:
+            self.kv_connector_stats.increment(event, count)
 
     def get_kv_connector_stats(self) -> MooncakeStoreConnectorStats | None:
         with self._kv_connector_stats_lock:
