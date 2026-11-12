@@ -214,13 +214,11 @@ def test_triton_hook_logs_warning():
     hook = fake.runtime.jit_post_compile_hook
 
     with (
-        mock.patch.object(jit_monitor.logger, "warning_once") as m,
-        mock.patch.object(jit_monitor.logger, "warning") as warning,
+        mock.patch.object(jit_monitor.logger, "error") as m,
     ):
         hook(**_triton_hook_kwargs("test_kernel"))
 
     m.assert_called_once()
-    warning.assert_not_called()
     msg = m.call_args[0][0] % m.call_args[0][1:]
     assert "Triton kernel JIT compilation during inference" in msg
     assert "test_kernel" in msg
@@ -268,7 +266,7 @@ def test_cutedsl_compile_logs_warning():
         import cutlass.cute as cute
 
         jit_monitor.activate()
-        with mock.patch.object(jit_monitor.logger, "warning_once") as warning_once:
+        with mock.patch.object(jit_monitor.logger, "error") as warning_once:
             result = cute.compile(lambda: None, "arg", option=True)
 
     assert result == "compiled"
@@ -282,7 +280,7 @@ def test_cutedsl_compile_logs_verbose_warning():
         import cutlass.cute as cute
 
         jit_monitor.activate(verbose=True)
-        with mock.patch.object(jit_monitor.logger, "warning") as warning:
+        with mock.patch.object(jit_monitor.logger, "error") as warning:
             result = cute.compile(lambda: None, "arg", option=True)
 
     assert result == "compiled"
@@ -314,7 +312,7 @@ def test_cutedsl_subscripted_compile_is_monitored():
         import cutlass.cute as cute
 
         jit_monitor.activate()
-        with mock.patch.object(jit_monitor.logger, "warning_once") as warning_once:
+        with mock.patch.object(jit_monitor.logger, "error") as warning_once:
             result = cute.compile[("opt_level", 3)](lambda: None, "arg")
 
     assert result == "compiled"
@@ -336,7 +334,7 @@ def test_tilelang_jit_kernel_logs_warning():
 
         func = SimpleNamespace(attrs={"global_symbol": "tl_kernel"})
         jit_monitor.activate()
-        with mock.patch.object(jit_monitor.logger, "warning_once") as warning_once:
+        with mock.patch.object(jit_monitor.logger, "error") as warning_once:
             JITKernel(func=func, out_idx=None, execution_backend="tvm_ffi")
 
     warning_once.assert_called_once()
@@ -386,13 +384,11 @@ def test_tilelang_jit_impl_logs_warning():
 
         jit_monitor.activate()
         with (
-            mock.patch.object(jit_monitor.logger, "warning_once") as warning_once,
-            mock.patch.object(jit_monitor.logger, "warning") as warning,
+            mock.patch.object(jit_monitor.logger, "error") as warning_once,
         ):
             impl(tensor, hidden_size=7168, n_splits=2)
 
     warning_once.assert_called_once()
-    warning.assert_not_called()
     msg = warning_once.call_args[0][0] % warning_once.call_args[0][1:]
     assert "TileLang JIT compilation during inference" in msg
     assert "tilelang_fn" in msg
@@ -422,7 +418,7 @@ def test_tilelang_jit_impl_does_not_log_on_cache_hit():
         impl = JITImpl(FakeFunc(), inspect.signature(tilelang_fn))
 
         jit_monitor.activate()
-        with mock.patch.object(jit_monitor.logger, "warning_once") as warning_once:
+        with mock.patch.object(jit_monitor.logger, "error") as warning_once:
             impl(tensor, n_splits=2)
             impl(tensor, n_splits=2)
 
@@ -439,7 +435,7 @@ def test_tilelang_from_database_does_not_log():
 
         func = SimpleNamespace(attrs={"global_symbol": "cached_tl_kernel"})
         jit_monitor.activate()
-        with mock.patch.object(jit_monitor.logger, "warning_once") as warning_once:
+        with mock.patch.object(jit_monitor.logger, "error") as warning_once:
             JITKernel(func=func, from_database=True)
 
     warning_once.assert_not_called()

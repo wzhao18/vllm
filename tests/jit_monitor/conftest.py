@@ -18,6 +18,8 @@ def _reset_monitor():
         jit_monitor._active = False
         jit_monitor._mode = "warn"
         jit_monitor._verbose = False
+        jit_monitor._triton_hook_installed = False
+        jit_monitor._recorded_events = None
         jit_monitor._cutedsl_hook_installed = False
         jit_monitor._tilelang_hook_installed = False
         jit_monitor._tilelang_jitimpl_compile_depth = 0

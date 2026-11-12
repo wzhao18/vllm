@@ -1031,6 +1031,20 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     )
                 if self.impl.dcp_world_size > 1:
                     self._reserve_dcp_shardq_workspace(k_c_normed.device)
+            elif self.dcp_manager is not None and self.dcp_manager.use_a2a:
+                # Without ShardQ (e.g. a disaggregated decode instance) every
+                # step keeps the DCP path, and a step beyond the direct
+                # workspace (prompt rows: recompute, cache-hit suffixes) takes
+                # the NCCL A2A fallback: warm its collectives and every Triton
+                # variant here instead of in the serving loop (a ~80 s stall).
+                from vllm.v1.attention.ops.dcp_shardq import (
+                    context as shardq_context,
+                )
+
+                shardq_context.warm_up_dcp_fallback(
+                    self.dcp_manager,
+                    get_current_vllm_config().scheduler_config.max_num_batched_tokens,
+                )
 
             # The zero fill is required when used with DP + EP
             # to ensure all ranks within a DP group compute the

@@ -962,6 +962,10 @@ class Scheduler(SchedulerInterface):
             and self._dp_pull_kv_headroom()
         )
 
+        # Budget the running prompt chunks leave for KV-holding waiting
+        # requests that are ready to admit (e.g. finished P->D loads).
+        loaded_kv_reserve = self._loaded_kv_admission_reserve(token_budget)
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -1019,6 +1023,16 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
+            if (
+                loaded_kv_reserve > 0
+                and request.num_computed_tokens < request.num_prompt_tokens
+            ):
+                # A prompt chunk (e.g. a recompute) must not take the budget of
+                # requests whose KV is already loaded: starved, their leases
+                # expire and they fall back to recompute too.
+                num_new_tokens = min(
+                    num_new_tokens, max(0, token_budget - loaded_kv_reserve)
+                )
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -2976,6 +2990,36 @@ class Scheduler(SchedulerInterface):
             RequestStatus.WAITING_FOR_REMOTE_KVS,
             RequestStatus.WAITING_FOR_STREAMING_REQ,
         )
+
+    def _loaded_kv_admission_reserve(self, token_budget: int) -> int:
+        """Tokens that KV-holding waiting requests ready to admit need this
+        step (their KV is loaded or held, so usually one token each), up to
+        the free running slots and half of ``token_budget``.
+
+        The waiting loop drains these requests first, but only with the budget
+        the running requests leave; running prompt chunks alone can take all
+        of it, step after step, so the loaded requests would wait until their
+        remote KV leases expire.
+        """
+        if token_budget <= 0 or not self.kv_holding_waiting:
+            return 0
+        free_slots = (
+            self.max_num_active_reqs
+            - len(self.running)
+            - self.num_waiting_for_streaming_input
+        )
+        reserve = 0
+        for request in self.kv_holding_waiting:
+            if free_slots <= 0:
+                break
+            if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                if request.request_id not in self.finished_recving_kv_req_ids:
+                    continue
+            elif self._is_blocked_waiting_status(request.status):
+                continue
+            reserve += max(1, request.num_tokens - request.num_computed_tokens)
+            free_slots -= 1
+        return min(reserve, token_budget // 2)
 
     @staticmethod
     def _holds_kv_blocks(request: Request) -> bool:
