@@ -439,7 +439,7 @@ def _register_overlaid_mla_worker(
     worker._dcp_layout = DcpLayout(dcp_size=1, interleave=1, block_size=4)
     worker._kv_row_layouts = {}
     worker._kv_cache_scales = {}
-    worker.dcp_transfer_modes = {}
+    worker._remote_dcp_layouts = {}
     worker.region_mem_types = []
     worker.region_group_ids = []
     worker._mixed_mem_types = False

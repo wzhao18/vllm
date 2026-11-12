@@ -10,15 +10,25 @@ import torch
 from vllm.distributed.kv_transfer.kv_connector.dcp_layout import DcpLayout
 from vllm.distributed.kv_transfer.kv_connector.dcp_relayout import (
     RelayoutRegion,
+    RowGather,
     plan_staged_relayout,
-    relayout_rows,
-    relayout_rows_reference,
+    row_table,
 )
 from vllm.v1.kv_cache_interface import KVRowLayout
+
+from .dcp_relayout_reference import relayout_rows_reference
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="The relayout kernel needs a GPU"
 )
+
+
+def relayout_rows(buf, regions, src_blocks, src_rows, dst_blocks, dst_rows):
+    """The device gather of the worker (`RowGather` over a `row_table`)."""
+    RowGather(buf, regions)(
+        row_table(src_blocks, src_rows, dst_blocks, dst_rows, buf.device)
+    )
+
 
 # Rows of one 64-row kernel page: MLA latent (fp8_ds_mla 656 B, nvfp4_ds_mla
 # 352 B), and indexer keys storing the page's values before its scales (FP8:
@@ -102,7 +112,7 @@ def test_relayout_kernel_random_rows():
         for i, r in enumerate(rows)
     ]
     rng = np.random.default_rng(0)
-    n = 500
+    n = 200  # at most the 32 x 8 destination rows
     src_blocks = rng.integers(0, 32, n)
     src_blocks[::7] = -1  # zero these rows
     dst = rng.permutation(32 * kernel_rows)[:n] + 32 * kernel_rows
@@ -114,3 +124,44 @@ def test_relayout_kernel_random_rows():
     relayout_rows(device, regions, src_blocks, src_rows, dst_blocks, dst_rows)
     torch.cuda.synchronize()
     assert torch.equal(device.cpu(), host)
+
+
+@pytest.mark.parametrize("offset", [0, 4, 3], ids=["aligned", "int32", "byte"])
+def test_relayout_kernel_long_pieces_and_offset_views(offset):
+    """Row pieces longer than one copy step of the kernel, in a buffer view
+    that starts `offset` bytes into its storage (narrower elements when the
+    view is not 8-byte aligned)."""
+    rows = [KVRowLayout.token_major(4096), KVRowLayout(8, ((0, 1000), (8000, 20)))]
+    kernel_rows = 8
+    page_bytes = [kernel_rows * r.bytes_per_row for r in rows]
+    stride = sum(page_bytes) + 8
+    regions = [
+        RelayoutRegion(sum(page_bytes[:i]), stride, kernel_rows, r)
+        for i, r in enumerate(rows)
+    ]
+    rng = np.random.default_rng(1)
+    n = 40
+    src_blocks = rng.integers(0, 8, n)
+    src_blocks[::5] = -1
+    dst = rng.permutation(8 * kernel_rows)[:n] + 8 * kernel_rows
+    dst_blocks, dst_rows = np.divmod(dst, kernel_rows)
+    src_rows = rng.integers(0, kernel_rows, n)
+    storage = torch.from_numpy(
+        rng.integers(0, 256, offset + 16 * stride, dtype=np.uint8)
+    )
+    host = storage[offset:]
+    device = storage.cuda()[offset:]
+    relayout_rows_reference(host, regions, src_blocks, src_rows, dst_blocks, dst_rows)
+    relayout_rows(device, regions, src_blocks, src_rows, dst_blocks, dst_rows)
+    torch.cuda.synchronize()
+    assert torch.equal(device.cpu(), host)
+
+
+def test_relayout_kernel_no_rows_is_a_no_op():
+    rows = KVRowLayout.token_major(16)
+    buf = torch.arange(256, dtype=torch.int64).to(torch.uint8).cuda()
+    before = buf.clone()
+    empty = np.zeros(0, dtype=np.int64)
+    relayout_rows(buf, [RelayoutRegion(0, 64, 4, rows)], empty, empty, empty, empty)
+    torch.cuda.synchronize()
+    assert torch.equal(buf, before)

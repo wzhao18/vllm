@@ -478,6 +478,15 @@ def test_csa_linear_tp_layout_boundary(total_kv_heads, local_tp, remote_tp, comp
 # ======================================================================
 
 
+def _mode(local, remote, tp_sizes=None):
+    """Select the mode with TP = DCP (or the given TP sizes)."""
+    return select_dcp_transfer_mode(
+        DcpLayout(*local),
+        DcpLayout(*remote),
+        tp_sizes=tp_sizes or (local[0], remote[0]),
+    )
+
+
 @pytest.mark.parametrize(
     ("local", "remote"),
     [
@@ -486,40 +495,29 @@ def test_csa_linear_tp_layout_boundary(total_kv_heads, local_tp, remote_tp, comp
         # Same DCP layout (homogeneous DCP, e.g. Kimi K3.1 DCP8 <-> DCP8).
         ((8, 1, 1280), (8, 1, 1280)),
         ((4, 16, 64), (4, 16, 64)),
-        # Same DCP size and interleave, other per-rank blocks: rows pair.
-        ((8, 1, 640), (8, 1, 1280)),
-        ((4, 1, 2560), (4, 1, 640)),
-        ((4, 16, 64), (4, 16, 128)),
         # Block-interleaved pages of equal size over different DCP sizes.
         ((1, 1, 16), (2, 16, 16)),
         ((4, 16, 16), (2, 16, 16)),
         ((2, 64, 64), (8, 64, 64)),
+        ((4, 64, 64), (2, 64, 64)),
     ],
 )
 def test_dcp_transfer_mode_direct(local, remote):
-    mode = select_dcp_transfer_mode(DcpLayout(*local), DcpLayout(*remote))
-    assert mode is DcpTransferMode.DIRECT
+    assert _mode(local, remote) is DcpTransferMode.DIRECT
 
 
 @pytest.mark.parametrize(
-    ("local", "remote", "match"),
+    ("local", "remote"),
     [
-        # Both shard, but rank turns differ: positions land on other ranks.
-        ((4, 1, 64), (4, 64, 64), "interleave"),
-        ((4, 1, 64), (2, 64, 64), "interleave"),
-        # Different DCP sizes move rows between pages: token-level interleave
-        # (Kimi K3.1 P8 -> D16), or block-level pages of different sizes.
-        # Without TP sizes proving TP = DCP no relayout is possible either.
-        ((16, 1, 640), (8, 1, 1280), "TP = DCP on both sides"),
-        ((16, 1, 640), (8, 1, 640), "TP = DCP on both sides"),
-        ((1, 1, 64), (2, 1, 64), "TP = DCP on both sides"),
-        ((1, 1, 32), (4, 64, 64), "TP = DCP on both sides"),
-        ((4, 64, 64), (2, 128, 128), "interleave"),
+        # Same DCP size and interleave, other per-rank blocks: rows pair.
+        ((8, 1, 640), (8, 1, 1280)),
+        ((4, 1, 2560), (4, 1, 640)),
+        ((4, 16, 64), (4, 16, 128)),
+        ((6, 1, 64), (6, 1, 192)),
     ],
 )
-def test_dcp_transfer_mode_rejects(local, remote, match):
-    with pytest.raises(NixlPeerIncompatibleError, match=match):
-        select_dcp_transfer_mode(DcpLayout(*local), DcpLayout(*remote))
+def test_dcp_transfer_mode_direct_rows(local, remote):
+    assert _mode(local, remote) is DcpTransferMode.DIRECT_ROWS
 
 
 @pytest.mark.parametrize(
@@ -531,45 +529,42 @@ def test_dcp_transfer_mode_rejects(local, remote, match):
         # Token-level interleave over different DCP sizes, equal blocks.
         ((16, 1, 640), (8, 1, 640)),
         ((1, 1, 64), (2, 1, 64)),
-        # Block-interleaved pages of different sizes.
+        ((2, 1, 64), (1, 1, 64)),
+        # Non-power-of-two DCP sizes.
+        ((6, 1, 64), (3, 1, 64)),
+        ((3, 1, 128), (6, 1, 64)),
+        # Interleave above 1 but below the block, and block-interleaved pages
+        # of different sizes.
+        ((4, 16, 64), (2, 16, 64)),
         ((4, 64, 64), (2, 64, 128)),
+        ((1, 1, 32), (4, 64, 64)),
     ],
 )
 def test_dcp_transfer_mode_relayout(local, remote):
-    mode = select_dcp_transfer_mode(
-        DcpLayout(*local), DcpLayout(*remote), tp_sizes=(local[0], remote[0])
-    )
-    assert mode is DcpTransferMode.RELAYOUT
-
-
-def test_dcp_transfer_mode_prefers_direct():
-    """Layouts whose pages pair whole never pay for a relayout."""
-    for local, remote in [
-        ((8, 1, 1280), (8, 1, 1280)),
-        ((8, 1, 640), (8, 1, 1280)),
-        ((2, 64, 64), (8, 64, 64)),
-        ((4, 64, 64), (2, 64, 64)),
-    ]:
-        mode = select_dcp_transfer_mode(
-            DcpLayout(*local), DcpLayout(*remote), tp_sizes=(local[0], remote[0])
-        )
-        assert mode is DcpTransferMode.DIRECT
+    assert _mode(local, remote) is DcpTransferMode.RELAYOUT
 
 
 @pytest.mark.parametrize(
     ("local", "remote", "tp_sizes", "match"),
     [
-        # TP != DCP on one side.
-        ((16, 1, 640), (8, 1, 1280), (16, 16), "TP = DCP on both sides"),
-        ((4, 1, 640), (8, 1, 1280), (8, 8), "TP = DCP on both sides"),
+        # Both shard, but rank turns differ: positions land on other ranks.
+        ((4, 1, 64), (4, 64, 64), None, "interleave"),
+        ((4, 1, 64), (2, 64, 64), None, "interleave"),
+        ((4, 64, 64), (2, 128, 128), None, "interleave"),
+        ((16, 1, 640), (8, 2, 1280), None, "interleave"),
+        # Different DCP sizes with a DCP group that is neither 1 nor TP.
+        ((16, 1, 640), (8, 1, 1280), (16, 16), "remote side has TP 16 and DCP 8"),
+        ((4, 1, 640), (8, 1, 1280), (8, 8), "local side has TP 8 and DCP 4"),
         # DCP sizes that do not divide one another.
-        ((6, 1, 64), (4, 1, 64), (6, 4), "divide one another"),
-        # The interleave of both sides must agree whatever the mode.
-        ((16, 1, 640), (8, 2, 1280), (16, 8), "interleave"),
+        ((6, 1, 64), (4, 1, 64), None, "divide one another"),
     ],
 )
-def test_dcp_transfer_mode_relayout_rejects(local, remote, tp_sizes, match):
+def test_dcp_transfer_mode_rejects(local, remote, tp_sizes, match):
     with pytest.raises(NixlPeerIncompatibleError, match=match):
-        select_dcp_transfer_mode(
-            DcpLayout(*local), DcpLayout(*remote), tp_sizes=tp_sizes
-        )
+        _mode(local, remote, tp_sizes)
+
+
+def test_dcp_transfer_mode_same_dcp_size_ignores_tp():
+    """Equal DCP sizes pair rank to rank, whatever spans TP (upstream
+    homogeneous DCP, e.g. TP8 with DCP2 on both sides)."""
+    assert _mode((2, 1, 64), (2, 1, 64), (8, 8)) is DcpTransferMode.DIRECT

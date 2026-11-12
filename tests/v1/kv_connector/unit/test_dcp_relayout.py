@@ -13,16 +13,19 @@ import torch
 from vllm.distributed.kv_transfer.kv_connector.dcp_layout import DcpLayout
 from vllm.distributed.kv_transfer.kv_connector.dcp_relayout import (
     RelayoutRegion,
-    RowRelayout,
-    copy_byte_ranges_reference,
     num_staging_blocks,
     plan_dcp_rows,
     plan_staged_relayout,
     relayout_read_amplification,
-    relayout_rows_reference,
 )
 from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import KVRowLayout
+
+from .dcp_relayout_reference import (
+    RowRelayout,
+    copy_byte_ranges_reference,
+    relayout_rows_reference,
+)
 
 TOKEN_MAJOR = KVRowLayout.token_major(12)
 # An indexer-like page: each 4-row kernel page stores its rows' 8-byte values,
@@ -71,10 +74,13 @@ CASES = [
 @pytest.mark.cpu_test
 @pytest.mark.parametrize("src_n,src_i,src_b,dst_n,dst_i,dst_b", CASES)
 @pytest.mark.parametrize("rows", [TOKEN_MAJOR, SPLIT], ids=["token_major", "split"])
-@pytest.mark.parametrize("start", [0, 8, 37], ids=["no_hit", "aligned_hit", "mid_hit"])
+@pytest.mark.parametrize("start", [0, 8, 37, "dst_page_end"])
 def test_relayout_matches_direct_layout(
     src_n, src_i, src_b, dst_n, dst_i, dst_b, rows, start
 ):
+    if start == "dst_page_end":
+        # A prefix hit ending exactly at a destination page end.
+        start = dst_n * dst_b
     if rows.kernel_page_rows > 1 and (
         src_b % rows.kernel_page_rows or dst_b % rows.kernel_page_rows
     ):
@@ -210,7 +216,7 @@ STAGED_CASES = [
 
 @pytest.mark.cpu_test
 @pytest.mark.parametrize("case", STAGED_CASES, ids=str)
-@pytest.mark.parametrize("hit", ["none", "aligned", "mid_page"])
+@pytest.mark.parametrize("hit", ["none", "aligned", "mid_page", "empty"])
 def test_staged_relayout_matches_direct_layout(case, hit):
     """Reads of the planned source units into the staging blocks, then
     `relayout_rows_reference`, leave every destination rank's blocks as if the
@@ -220,7 +226,8 @@ def test_staged_relayout_matches_direct_layout(case, hit):
     src = DcpLayout(src_n, src_i, src_b)
     dst = DcpLayout(dst_n, dst_i, dst_b)
     num_tokens = 301
-    start = {"none": 0, "aligned": 2 * dst_n * dst_b, "mid_page": 37}[hit]
+    # "empty": nothing to transfer (start == end); the tail is still zeroed.
+    start = {"none": 0, "aligned": 2 * dst_n * dst_b, "mid_page": 37, "empty": 301}[hit]
     unit = math.gcd(src_kb, dst_kb)
     kv = [
         (_token_bytes(num_tokens, rows.bytes_per_row) + 17 * r).astype(np.uint8)

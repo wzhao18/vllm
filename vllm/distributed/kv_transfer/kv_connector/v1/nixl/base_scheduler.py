@@ -2,12 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Base scheduler-side logic for the NIXL connector."""
 
-import math
 import threading
 import time
-from collections.abc import Mapping
-from types import MappingProxyType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import msgspec
 import zmq
@@ -36,6 +33,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
     DcpTransferMode,
+    engine_dcp_layout,
+    relayout_config_problem,
     select_dcp_transfer_mode,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
@@ -65,6 +64,15 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+class _StagingNeed(NamedTuple):
+    """Staging an admitted RELAYOUT receive takes: `num_blocks` blocks for
+    the remote rows of positions `[start, end)`."""
+
+    num_blocks: int
+    start: int
+    end: int
+
+
 class NixlBaseConnectorScheduler:
     """Base implementation of Scheduler side methods shared by pull and push."""
 
@@ -72,15 +80,6 @@ class NixlBaseConnectorScheduler:
     # pull (READ) producer from a push (WRITE) one. Overridden by the push
     # scheduler.
     _TRANSFER_MODE: str = "pull"
-
-    # Receives that relayout DCP rows take staging blocks from the GPU block
-    # pool (`bind_gpu_block_pool`): counted at admission
-    # (`get_num_staging_blocks`, `_staging_needs`), taken with the request's
-    # blocks (`_staging_blocks`) and returned when its receive finishes. The
-    # maps are immutable, rebound on every change.
-    _block_pool: "BlockPool | None" = None
-    _staging_needs: Mapping[ReqId, int] = MappingProxyType({})
-    _staging_blocks: Mapping[ReqId, "list[KVCacheBlock]"] = MappingProxyType({})
 
     def __init__(
         self,
@@ -126,21 +125,23 @@ class NixlBaseConnectorScheduler:
             )
         )
         self._has_mamba = kv_cache_config.has_mamba_layers
-        # Where this engine's DCP ranks hold a request's KV rows, as the
-        # workers see it (`NixlBaseConnectorWorker._dcp_layout`): the
-        # per-rank logical block of the attention groups.
-        attention_block_sizes = [
-            g.kv_cache_spec.block_size
-            for g in kv_cache_config.transfer_groups
-            if not isinstance(g.kv_cache_spec, MambaSpec)
-        ]
-        self._dcp_layout = DcpLayout(
-            dcp_size=parallel_config.decode_context_parallel_size,
-            interleave=parallel_config.cp_kv_cache_interleave_size,
-            block_size=math.lcm(*attention_block_sizes)
-            if attention_block_sizes
-            else self.block_size,
+        # Where this engine's DCP ranks hold a request's KV rows, as its
+        # workers advertise it at the handshake (same derivation).
+        self._dcp_layout = engine_dcp_layout(vllm_config, kv_cache_config)
+        # Receives that relayout DCP rows (`DcpTransferMode.RELAYOUT`) stage
+        # the remote rows in blocks of the GPU block pool
+        # (`bind_gpu_block_pool`): counted at admission
+        # (`get_num_staging_blocks`), taken with the request's blocks
+        # (`_take_staging_blocks`) and returned when its receive finishes.
+        self._relayout_problem = relayout_config_problem(
+            kv_cache_config,
+            transfer_mode=self._TRANSFER_MODE,
+            use_host_buffer=self.use_host_buffer,
+            pcp_size=parallel_config.prefill_context_parallel_size,
         )
+        self._block_pool: BlockPool | None = None
+        self._staging_needs: dict[ReqId, _StagingNeed] = {}
+        self._staging: dict[ReqId, tuple[list[KVCacheBlock], _StagingNeed]] = {}
         self._bounded_replay = any(
             g.kv_cache_spec.prefix_replay_tokens > 0
             for g in kv_cache_config.kv_cache_groups
@@ -542,9 +543,7 @@ class NixlBaseConnectorScheduler:
                 kv_transfer_params=req.kv_transfer_params,
                 local_num_computed_blocks=cached,
                 awaiting_kvs=awaiting_kvs,
-                staging_block_ids=[
-                    block.block_id for block in self._staging_blocks.get(req_id, ())
-                ],
+                staging=self._staging_meta(req_id),
             )
 
         if self.use_host_buffer:
@@ -590,13 +589,12 @@ class NixlBaseConnectorScheduler:
     ) -> int:
         """Staging blocks a receive of positions `[num_computed_tokens,
         num_computed_tokens + num_external_tokens)` needs: none unless the
-        remote's DCP layout needs its rows relayouted
-        (`DcpTransferMode.RELAYOUT`), with the same mode selection as the
-        workers' handshake.
+        remote's DCP layout, described by `kv_transfer_params` (version 18),
+        needs its rows relayouted (`DcpTransferMode.RELAYOUT`).
 
-        The count is remembered and taken from the pool by
-        `_take_staging_blocks` once the scheduler allocated the request.
-        `kv_transfer_params` describe the remote's layout (version 18).
+        The count and the range are remembered: `_take_staging_blocks` takes
+        the blocks once the scheduler allocated the request, and the workers
+        plan the relayout of exactly this range.
         """
         self._drop_staging_need(request.request_id)
         params = request.kv_transfer_params
@@ -605,8 +603,9 @@ class NixlBaseConnectorScheduler:
         remote_block_size = params.get("block_size")
         remote_interleave = params.get("cp_kv_cache_interleave_size")
         if remote_block_size is None or remote_interleave is None:
-            # A peer older than version 18; its handshake rejects it.
+            # Not a NIXL pull from a version 18 peer.
             return 0
+        remote_engine_id = params.get("remote_engine_id")
         try:
             remote = DcpLayout(
                 dcp_size=params.get("dcp_size", 1),
@@ -618,48 +617,64 @@ class NixlBaseConnectorScheduler:
                 remote,
                 tp_sizes=(self.transfer_tp_size, params.get("tp_size", 1)),
             )
-        except (NixlPeerIncompatibleError, ValueError):
-            # The workers reject this peer at its handshake, fatally.
+        except (NixlPeerIncompatibleError, ValueError) as e:
+            # The workers' handshake rejects the peer, and its requests are
+            # recomputed.
+            logger.warning_once(
+                "Reserving no relayout staging for KV from engine %s: %s",
+                remote_engine_id,
+                e,
+            )
             return 0
         if mode is not DcpTransferMode.RELAYOUT:
             return 0
-        need = num_staging_blocks(
-            remote,
-            self._dcp_layout,
+        if self._relayout_problem is not None:
+            logger.warning_once(
+                "KV from engine %s needs a DCP row relayout, which this engine "
+                "cannot receive: %s Its workers reject the peer at the handshake.",
+                remote_engine_id,
+                self._relayout_problem,
+            )
+            return 0
+        end = num_computed_tokens + num_external_tokens
+        need = _StagingNeed(
+            num_staging_blocks(remote, self._dcp_layout, num_computed_tokens, end),
             num_computed_tokens,
-            num_computed_tokens + num_external_tokens,
+            end,
         )
-        self._staging_needs = {**self._staging_needs, request.request_id: need}
-        return need
+        self._staging_needs[request.request_id] = need
+        return need.num_blocks
 
     def _take_staging_blocks(self, req_id: ReqId) -> None:
         """Take the staging blocks admission counted for `req_id`; the
         admission check guarantees the pool holds them."""
-        need = self._staging_needs.get(req_id, 0)
-        if need:
-            self._drop_staging_need(req_id)
+        need = self._staging_needs.pop(req_id, None)
+        if need is not None:
             assert self._block_pool is not None, "No GPU block pool bound"
-            assert req_id not in self._staging_blocks
-            self._staging_blocks = {
-                **self._staging_blocks,
-                req_id: self._block_pool.get_new_blocks(need),
-            }
+            assert req_id not in self._staging
+            self._staging[req_id] = (
+                self._block_pool.get_new_blocks(need.num_blocks),
+                need,
+            )
 
     def _drop_staging_need(self, req_id: ReqId) -> None:
         """Forget an admission count that was not taken."""
-        if req_id in self._staging_needs:
-            self._staging_needs = {
-                r: n for r, n in self._staging_needs.items() if r != req_id
-            }
+        self._staging_needs.pop(req_id, None)
+
+    def _staging_meta(self, req_id: ReqId) -> tuple[list[int], int, int] | None:
+        """`(staging block ids, start, end)` of a receive whose staging was
+        taken, for its `ReqMeta`."""
+        staging = self._staging.get(req_id)
+        if staging is None:
+            return None
+        blocks, need = staging
+        return [block.block_id for block in blocks], need.start, need.end
 
     def _free_staging_blocks(self, req_id: ReqId) -> None:
-        blocks = self._staging_blocks.get(req_id)
-        if blocks is not None:
-            self._staging_blocks = {
-                r: b for r, b in self._staging_blocks.items() if r != req_id
-            }
+        staging = self._staging.pop(req_id, None)
+        if staging is not None:
             assert self._block_pool is not None
-            self._block_pool.free_blocks(blocks)
+            self._block_pool.free_blocks(staging[0])
 
     def has_pending_push_work(self) -> bool:
         return False

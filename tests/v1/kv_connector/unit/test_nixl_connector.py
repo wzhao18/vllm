@@ -2553,6 +2553,7 @@ def recv_worker():
         "request": MagicMock(local_block_ids=([1, 2, 3],), relayout=None)
     }
     worker._recving_transfers = defaultdict(list)
+    worker._relayouting = {}
     worker._failed_recv_reqs = queue.Queue()
     worker._recv_failures = set()
     worker._handshake_lock = threading.RLock()

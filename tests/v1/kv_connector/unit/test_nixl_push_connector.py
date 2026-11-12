@@ -366,6 +366,7 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w._failed_recv_reqs = queue.Queue()
         w._recv_failures = set()
         w._recving_transfers = defaultdict(list)
+        w._relayouting = {}
         w._is_hma_required = False
         w.xfer_stats = NixlKVConnectorStats()
         w._has_packed_cache = False
@@ -402,7 +403,8 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w._kv_row_layouts = {}
         w._kv_cache_scales = {}
         w._mamba_state_geometry = None
-        w.dcp_transfer_modes = {}
+        w.transfer_tp_size = 1
+        w._remote_dcp_layouts = {}
         w._group_spec_types = (FullAttentionSpec,)
         w._engine_ttl = 0.0
         w._engine_last_active = {}

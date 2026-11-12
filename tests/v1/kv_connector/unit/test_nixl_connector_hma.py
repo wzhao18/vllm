@@ -384,6 +384,7 @@ def test_region_pull_completion_zeros_only_own_padding(region_pull_worker):
     worker._get_new_notifs = MagicMock(return_value=set())
     worker._pop_done_transfers = MagicMock(return_value=({"request"}, set()))
     worker._replicated_pcp_done_sending = set()
+    worker._relayouting = {}
     worker._failed_recv_reqs = queue.Queue()
     worker._recv_failures = set()
     worker._send_pending_recv_notifs = MagicMock()
@@ -479,6 +480,8 @@ def test_update_state_after_alloc_tracks_cached_blocks_per_group():
     from vllm.v1.core.kv_cache_utils import KVCacheBlock
 
     scheduler = object.__new__(NixlPullConnectorScheduler)
+    scheduler._staging_needs = {}
+    scheduler._staging = {}
     scheduler._reqs_in_batch = set()
     scheduler._reqs_need_save = {}
     scheduler._reqs_need_recv = {}
@@ -533,6 +536,8 @@ def test_full_local_hit_is_not_awaited_by_the_scheduler():
     from vllm.v1.core.kv_cache_utils import KVCacheBlock
 
     scheduler = object.__new__(NixlPullConnectorScheduler)
+    scheduler._staging_needs = {}
+    scheduler._staging = {}
     scheduler._reqs_in_batch = set()
     scheduler._reqs_need_save = {}
     scheduler._reqs_need_recv = {}
@@ -2583,7 +2588,7 @@ def _layout_worker(**attrs) -> NixlConnectorWorker:
     worker._mamba_state_geometry = _MAMBA_GEOMETRY
     worker._dcp_layout = DcpLayout(dcp_size=8, interleave=1, block_size=1280)
     worker.tp_mappings = {}
-    worker.dcp_transfer_modes = {}
+    worker._remote_dcp_layouts = {}
     worker._packed_member_layouts = {}
     worker.transfer_topo = MagicMock()
     worker.nixl_wrapper = MagicMock()
@@ -2621,9 +2626,8 @@ def test_handshake_accepts_matching_layouts():
     ("remote_dcp_size", "fields", "match"),
     [
         (8, dict(cp_kv_cache_interleave_size=64), "interleave"),
-        # Different DCP sizes at interleave 1 (Kimi K3.1 P DCP16 -> D DCP8)
-        # move rows between pages.
-        (16, dict(), "not supported yet"),
+        # DCP sizes that do not divide one another.
+        (6, dict(), "divide one another"),
         # A peer older than v17 does not tell its interleave.
         (8, dict(cp_kv_cache_interleave_size=None), "older than version 17"),
         # A layout DCP cannot produce.
@@ -2651,7 +2655,8 @@ def test_handshake_accepts_matching_layouts():
     ],
 )
 def test_handshake_rejects_incompatible_peers(remote_dcp_size, fields, match):
-    """Deterministic mismatches are fatal and leave no peer state behind."""
+    """Configuration mismatches fail the handshake before any peer state is
+    registered."""
     worker = _layout_worker()
     with pytest.raises(bw.NixlPeerIncompatibleError, match=f"engine P .*{match}"):
         worker.add_remote_agent(
@@ -2660,9 +2665,37 @@ def test_handshake_rejects_incompatible_peers(remote_dcp_size, fields, match):
             remote_dcp_size=remote_dcp_size,
         )
     assert worker.tp_mappings == {}
-    assert worker.dcp_transfer_modes == {}
+    assert worker._remote_dcp_layouts == {}
     worker.transfer_topo.register_remote_engine.assert_not_called()
     worker.nixl_wrapper.add_remote_agent.assert_not_called()
+
+
+@pytest.mark.cpu_test
+def test_handshake_selects_relayout_between_dcp_sizes():
+    """Kimi K3.1 P TP16=DCP16 -> D TP8=DCP8 at interleave 1 moves rows
+    between pages: RELAYOUT, with the peer's layout kept for the reads."""
+    worker = _layout_worker()
+    worker._relayout_unsupported_reason = lambda: None
+    mode = worker._check_peer_compatibility(
+        _peer_meta(physical_blocks_per_logical_kv_block=5),
+        remote_tp_size=16,
+        remote_dcp_size=16,
+    )
+    assert mode is DcpTransferMode.RELAYOUT
+    assert worker._remote_dcp_layouts == {"P": DcpLayout(16, 1, 640)}
+
+
+@pytest.mark.cpu_test
+def test_handshake_rejects_a_relayout_the_engine_cannot_receive():
+    worker = _layout_worker()
+    worker._relayout_unsupported_reason = lambda: "push transfers write whole pages."
+    with pytest.raises(
+        bw.NixlPeerIncompatibleError, match="cannot receive: push transfers"
+    ):
+        worker._check_peer_compatibility(
+            _peer_meta(), remote_tp_size=16, remote_dcp_size=16
+        )
+    assert worker._remote_dcp_layouts == {}
 
 
 @pytest.mark.cpu_test
@@ -2716,9 +2749,10 @@ def test_mamba_state_geometry_is_tp_invariant():
 
 
 @pytest.mark.cpu_test
-def test_incompatible_peer_stops_the_engine():
-    """A background handshake that finds a deterministic mismatch fails the
-    engine on its next step; a transient failure only fails the request."""
+def test_incompatible_peer_fails_its_handshake_only():
+    """A configuration mismatch fails the peer's handshake like the other
+    handshake checks (its requests are recomputed); the engine keeps
+    serving other peers."""
     from concurrent.futures import Future
 
     worker = object.__new__(NixlConnectorWorker)
@@ -2737,14 +2771,13 @@ def test_incompatible_peer_stops_the_engine():
     worker._handshake_initiation_executor = SimpleNamespace(submit=submit)
 
     worker._ensure_handshake("P0", "host", 1, 8, 8)
-    futures[-1].set_exception(RuntimeError("connection refused"))
-    worker._raise_peer_incompatible_error()
-
-    worker._ensure_handshake("P1", "host", 1, 8, 8)
     futures[-1].set_exception(bw.NixlPeerIncompatibleError("other interleave"))
-    with pytest.raises(bw.NixlPeerIncompatibleError, match="other interleave"):
-        worker.get_transfer_results()
-    assert worker.xfer_stats.record_failed_handshake.call_count == 2
+    assert worker.xfer_stats.record_failed_handshake.call_count == 1
+    assert "P0" not in worker._remote_agents
+    # Nothing is kept to fail the engine later; other peers still handshake.
+    assert not hasattr(worker, "_peer_incompatible_error")
+    assert worker._ensure_handshake("P1", "host", 1, 8, 8) is futures[-1]
+    assert len(futures) == 2
 
 
 @pytest.mark.cpu_test
@@ -2936,7 +2969,7 @@ def test_worker_collects_row_layouts_and_scales_of_its_layers():
     vllm_config = SimpleNamespace(
         compilation_config=SimpleNamespace(static_forward_context=layers)
     )
-    layouts = get_kv_row_layouts(vllm_config, specs)
+    layouts = get_kv_row_layouts(vllm_config, specs, kernel_block_size=64)
     assert layouts == {
         "mla": _MLA_ROWS,
         # The indexer backend's 64-token kernel pages inside each block.
@@ -2950,7 +2983,7 @@ def test_worker_collects_row_layouts_and_scales_of_its_layers():
         "Wrong", (_mla_backend(),), {"get_kv_cache_row_layout": wrong_rows}
     )
     with pytest.raises(ValueError, match="does not tile"):
-        get_kv_row_layouts(vllm_config, specs)
+        get_kv_row_layouts(vllm_config, specs, kernel_block_size=64)
 
 
 @pytest.mark.cpu_test
@@ -2982,7 +3015,7 @@ def test_handshake_accepts_same_dcp_with_other_blocks():
         remote_dcp_size=8,
         remote_tp_size=8,
     )
-    assert mode is DcpTransferMode.DIRECT
+    assert mode is DcpTransferMode.DIRECT_ROWS
 
 
 @pytest.mark.cpu_test
@@ -3036,11 +3069,13 @@ def test_same_dcp_layout_pages_pair_by_row(
     remote_kernel_ids = [
         b * remote_ppl + i for b in remote_logical for i in range(remote_ppl)
     ]
-    local, remote = worker._pair_same_dcp_layout_pages(
+    local, remote, covered = worker._pair_same_dcp_layout_pages(
         [local_kernel_ids, [7]], [remote_kernel_ids, [9]], [cached, 0], ratio
     )
     # State slots pair as they are.
     assert (local[1], remote[1]) == ([7], [9])
+    # The receive zeroes the local sub-blocks past the paired ones.
+    assert covered[0] == range(len(local[0]))
 
     def local_first_row(sub_block: int) -> int:
         kernel, part = divmod(sub_block, ratio)

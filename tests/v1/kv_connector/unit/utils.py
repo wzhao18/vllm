@@ -598,6 +598,9 @@ def make_nixl_scheduler(
     )
 
     sched = object.__new__(NixlConnectorScheduler)
+    # No relayout staging (`get_num_staging_blocks`).
+    sched._staging_needs = {}
+    sched._staging = {}
     sched._has_mamba = has_mamba
     sched._bounded_replay = bounded_replay
     sched._is_hma_required = is_hma_required
@@ -661,6 +664,8 @@ def make_nixl_push_scheduler(
     sched = object.__new__(NixlPushConnectorScheduler)
 
     # Base scheduler fields (shared with pull / heartbeat path).
+    sched._staging_needs = {}
+    sched._staging = {}
     sched._reqs_need_recv = {}
     sched._reqs_need_send = {}
     sched._reqs_in_batch = set()
