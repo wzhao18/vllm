@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import enum
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING
 
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
@@ -252,6 +252,12 @@ class SchedulerInterface(ABC):
     def get_kv_cache_usage(self) -> float:
         """Returns the fraction of the KV cache currently in use (0.0-1.0)."""
         return 0.0
+
+    def set_dp_prefill_exchange(self, exchange: Callable[[int], int] | None) -> None:
+        """DP prefill pull-up for the next schedule() (see Scheduler). A
+        scheduler that does not implement it never calls `exchange`; the DP
+        engine core then takes part in the exchange itself."""
+        return None
 
     @abstractmethod
     def make_stats(self) -> "SchedulerStats | None":
