@@ -200,3 +200,13 @@ stream delay kernel, CUDA events, warm L2, per-sample MAX over ranks, median. Th
 EP16 5925 (NVFP4 1188 us, MXFP4xMXFP8 1361 us) and EP8 5760 (924 / 1121 us) figures
 come from this protocol; `bench_megamoe_rubin.py` reports the same protocol as
 `kernel_eager` next to its CUDA-graph `kernel` number.
+
+Two records are local, not FlashInfer tuner output: EP16 NVFP4 inference i4096 and
+i8192 with tile N=256 (`mma_tiler_mnk` 256x256x256, otherwise the w16c i4096 record's
+knobs), tuned for the S2 kernel at real EP16 (4 nodes, 896 experts, random routing) with
+the lane bench's `kernel_eager` (the protocol above). Source files
+`$W/hti/p2/megamoe-s2/ep16/knobs_s2_ep16_nvfp4_i{4096,8192}.json`. On the S2 kernel N=256
+beats the N=128 record at every measured point (4350 tok: 729 vs 810 us on the 148-SM
+shared-overlap grid, 693 vs 781 us full grid). The i8192 record is the C512 prefill bucket,
+which fell back to the i4096 record before. The i4096 record wins the equal-capacity tie on
+p50 (682 vs 731 us).

@@ -572,6 +572,32 @@ def test_knob_merge_counts_every_source_file():
         )
 
 
+def test_ep16_prefill_records_tile_n256():
+    """The EP16 NVFP4 prefill buckets (C512 prefill: 8192 per rank) resolve to the
+    tile N=256 records tuned for the S2 kernel at real EP16; the decode-sized EP16
+    bucket keeps its tuner record."""
+    C = _load("config")
+    problem = C.RubinMoeProblem(quant_kind="nvfp4")
+
+    def resolve(max_tokens):
+        return C.resolve_knobs(
+            C.SHIPPED_KNOBS,
+            problem=problem,
+            variant="inference",
+            world_size=16,
+            max_tokens=max_tokens,
+        )
+
+    for max_tokens, cap in ((4350, 8192), (8192, 8192), (2880, 4096), (4096, 4096)):
+        knobs, record, _ = resolve(max_tokens)
+        assert record["max_tokens"] == cap, max_tokens
+        assert record["source"] == "bench-eager-native-events", max_tokens
+        assert tuple(knobs.mma_tiler_mnk) == (256, 256, 256), max_tokens
+    knobs, record, _ = resolve(2048)
+    assert record["max_tokens"] == 2048
+    assert tuple(knobs.mma_tiler_mnk) == (256, 128, 256)
+
+
 def test_bench_capacity_prefers_tuned_record():
     C = _load("config")
 

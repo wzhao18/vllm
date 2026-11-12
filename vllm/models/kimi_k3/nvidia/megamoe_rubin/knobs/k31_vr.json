@@ -1,7 +1,7 @@
 {
  "version": 2,
- "comment": "Merged FlashInfer 0.7.3.dev20261031 sm107 tuner winners for the Kimi K3.1 routed MoE on VR200 (W=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr): every $W/moe4/results/fi107/knobs_*.json incl. the EP4 smoke files. Tuner timer: profiling_policy per record (native_events = eager launches behind a stream delay kernel, CUDA events, warm L2, no CUDA graph). Read-only data for megamoe_rubin.config.resolve_knobs.",
- "source_files": 58,
+ "comment": "Merged FlashInfer 0.7.3.dev20261031 sm107 tuner winners for the Kimi K3.1 routed MoE on VR200 (W=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr): every $W/moe4/results/fi107/knobs_*.json incl. the EP4 smoke files. Tuner timer: profiling_policy per record (native_events = eager launches behind a stream delay kernel, CUDA events, warm L2, no CUDA graph). Read-only data for megamoe_rubin.config.resolve_knobs. Plus two S2 records (EP16 nvfp4 inference i4096 and i8192: tile N=256), measured on the vendored S2 kernel at real EP16 (4 nodes) with bench_mmpf kernel_eager, the native_events protocol: $W/hti/p2/megamoe-s2/ep16/knobs_s2_ep16_nvfp4_i{4096,8192}.json.",
+ "source_files": 60,
  "entries": [
   {
    "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
@@ -3555,6 +3555,134 @@
    "provenance": {
     "file": "$W/moe4/results/fi107/knobs_xo_ep8_nvfp4_i2880.json",
     "sha256": "fd947cdbb980e73b597eb51f69495e41f70267caad335a98ea769b0983a29883",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "nvfp4",
+   "world_size": 16,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 8192,
+   "live_tokens": 8192,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     256,
+     256
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": [
+     2,
+     1
+    ],
+    "schedule_policy": [
+     "phase_interleave",
+     null
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     2,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 1282.4959754943848,
+   "source": "bench-eager-native-events",
+   "tuned_at": "2026-11-11T17:37:29",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/hti/p2/megamoe-s2/ep16/knobs_s2_ep16_nvfp4_i8192.json",
+    "sha256": "b445ca168d03c8361a4d19f76a6ff5a33bf8177f8a66b3d4137e5018b6cf2451",
+    "flashinfer_version": "0.7.3.dev20261031",
+    "cuda_version": "13.4"
+   }
+  },
+  {
+   "backend_revision": "sm107-block-scaled-1667b47a-runtime-options-v1",
+   "kernel_variant": "inference",
+   "allow_nondeterministic": false,
+   "apply_routing_weights_before_fc2": true,
+   "dtype": "nvfp4",
+   "world_size": 16,
+   "hidden": 3584,
+   "intermediate": 3072,
+   "num_experts": 896,
+   "topk": 16,
+   "combine_dtype": "bf16",
+   "activation": "situ",
+   "situ_beta": 4.0,
+   "situ_linear_beta": 25.0,
+   "gate_up_clamp": null,
+   "device": "sm107:NVIDIA VR NVL72",
+   "max_tokens": 4096,
+   "live_tokens": 4096,
+   "knobs": {
+    "mma_tiler_mnk": [
+     256,
+     256,
+     256
+    ],
+    "cluster_shape_mn": [
+     4,
+     1
+    ],
+    "fallback_cluster_shape_mn": [
+     2,
+     1
+    ],
+    "schedule_policy": [
+     "phase_interleave",
+     null
+    ],
+    "work_id_mode": "atomic_counter",
+    "fc2_use_bulk": true,
+    "fc2_tma_stages": 2,
+    "epi_flag_batches": [
+     2,
+     4
+    ],
+    "token_in_flag_batch": 1,
+    "token_back_mode": "epi_warps",
+    "reduce_topk_in_kernel": false
+   },
+   "p50_us": 682.2719871997833,
+   "source": "bench-eager-native-events",
+   "tuned_at": "2026-11-11T17:41:09",
+   "measurement_policy": {},
+   "profiling_policy": {
+    "cuda_graph_profile_replays": null,
+    "cold_l2": false,
+    "timer": "native_events"
+   },
+   "provenance": {
+    "file": "$W/hti/p2/megamoe-s2/ep16/knobs_s2_ep16_nvfp4_i4096.json",
+    "sha256": "6ff736615e6dfe0104c0ebc424f47cf2c36b6dd43f22eb2b9356e59c7a30b1cb",
     "flashinfer_version": "0.7.3.dev20261031",
     "cuda_version": "13.4"
    }
