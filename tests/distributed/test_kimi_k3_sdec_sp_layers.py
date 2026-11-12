@@ -27,7 +27,8 @@ on the same input rows, the same metadata and each on its own copy of the caches
   within stock's own error against FP64; each path against FP64 attention over its
   selected cached keys, the two within 1.5x of each other either way,
   ``_check_dsa_reference``), decomposed: our FP8 query codes vs stock's (one step apart
-  at most), our decode kernel call on stock's inputs vs stock's, the same flat KV rows,
+  at most), our decode kernel call on stock's inputs vs stock's (where stock chunks its
+  launches, both against FP64 within 1.5x of each other), the same flat KV rows,
   the kernel on stock's inputs but one factor of ours each (the FP8 query, the new MLA
   rows, the flat row order), and our merge + gate on stock's partials and valid counts
   (``DSA_CROSS`` reported, ``DSA_DIRECT`` held), the new MLA rows (FP8 codes one step
@@ -364,23 +365,80 @@ class _TapQuery:
         del self.fi.decode
 
 
-def _check_core_replay(name, replay, stock, counts):
+def _stock_core_launches(impl, rows, heads):
+    """trtllm-gen launches the stock sparse core split ``rows`` query rows of ``heads``
+    heads into (FlashInferMLASparseImpl._forward_mqa_kernel with LSE: row chunks of
+    the workspace's softmax-stats slab capacity)."""
+    from vllm.v1.attention.backends.mla import flashinfer_mla_sparse as fms
+
+    capacity = fms.trtllm_gen_lse_rows_capacity(
+        impl._workspace_buffer.numel(), fms.trtllm_gen_query_heads(heads)
+    )
+    assert capacity > 0, (rows, heads, capacity)
+    return -(-rows // min(capacity, fms._TRTLLM_GEN_MAX_REQUESTS))
+
+
+def _core_reference(impl, stock, cache, keyed):
+    """FP64 sparse MLA of stock's core inputs (``stock``: the _StockCore record, its
+    FP8 query and this rank's flat KV rows and counts; ``cache``: the MLA cache it
+    read) on the ``keyed`` rows: latent [rows, H, 512] with stock's bmm1 / bmm2
+    scales on the FP8 codes (the kernel's inputs, so only its arithmetic differs)."""
+    from vllm.v1.attention.backends.mla.sparse_utils import flat_kv_row_view
+
+    kv_rows = flat_kv_row_view(cache.view(torch.float8_e4m3fn), UNIT)[0]
+    query = stock["q"].view(torch.float8_e4m3fn)
+    rows = keyed.nonzero().flatten().tolist()
+    out = torch.empty(
+        len(rows), query.shape[1], 512, dtype=torch.float64, device=query.device
+    )
+    for i, row in enumerate(rows):
+        n = int(stock["counts"][row])
+        keys = kv_rows[stock["rows"][row, :n].long()].double()
+        probs = torch.softmax(query[row].double() @ keys.T * impl.bmm1_scale, -1)
+        out[i] = probs @ keys[:, :512] * impl.bmm2_scale
+    return out
+
+
+def _check_core_replay(name, replay, record, impl, cache):
     """Our FlashInferCore.decode on stock's FP8 query, KV rows, flat rows and counts
-    against stock's own trtllm-gen call (``replay``, ``stock``: latent [R, H, 512],
-    LSE [R, H] over the real heads) on the rows with keys on this rank (``counts``;
-    stock zeroes the others): the same kernel on the same inputs."""
-    keyed = counts > 0
+    against stock's own trtllm-gen call (``replay``: latent [R, H, 512], LSE [R, H]
+    over the real heads; ``record``: the _StockCore record, stock's inputs and its
+    latent and LSE; ``impl``: the stock layer's FlashInferMLASparseImpl; ``cache``:
+    stock's MLA cache) on the rows with keys on this rank (stock zeroes the others):
+    the same kernel on the same inputs.
+
+    Stock launches row chunks of its workspace's softmax-stats slab capacity
+    (``_stock_core_launches``); ours runs all R rows in one launch. trtllm-gen picks
+    its split-KV per launch from the launch's rows, so a short tail chunk (R208 =
+    191 + 17) reduces the same keys in another order: latent per (row, head) up to
+    ~3e-2 apart from stock (each ~2e-2 from FP64; hti/p2/sparse-mla-r208), while
+    stock's own single launch over all R is bitwise ours. So: one stock launch ->
+    within 1e-3 of stock (the same call); always, both against FP64 attention over
+    the same FP8 codes (``_core_reference``) within 1.5x of each other either way;
+    the LSE within 1e-3 of stock's (chunking moves it ~1e-6)."""
+    keyed = record["counts"] > 0
     latent, lse = replay[0][keyed], replay[1][keyed]
-    want, want_lse = stock[0][keyed], stock[1][keyed]
+    want, want_lse = record["latent"][keyed], record["lse"][keyed]
     live = torch.isfinite(want_lse)
     bitwise = torch.equal(latent, want) and torch.equal(lse[live], want_lse[live])
     errors = _rows_error(latent.flatten(0, 1), want.flatten(0, 1))
     shift = float((lse[live] - want_lse[live]).abs().max()) if live.any() else 0.0
+    rows, heads = record["q"].shape[:2]
+    launches = _stock_core_launches(impl, rows, heads)
+    ref = _core_reference(impl, record, cache, keyed)[:, : want.shape[1]]
+    total = lambda x: float((x.double() - ref).norm() / ref.norm())  # noqa: E731
+    ours_total, stock_total = total(latent), total(want)
     print(
-        f"{name} core replay (stock's query, rows, counts): bitwise {bitwise}, "
-        f"latent per (row, head) max {errors.max():.2e}, LSE max {shift:.2e}"
+        f"{name} core replay (stock's query, rows, counts; stock {launches} "
+        f"launch(es)): bitwise {bitwise}, latent per (row, head) max "
+        f"{errors.max():.2e}, LSE max {shift:.2e}; vs FP64 ours {ours_total:.2e} "
+        f"stock {stock_total:.2e} (ratio {ours_total / max(stock_total, 1e-30):.3f})"
     )
-    assert float(errors.max()) <= 1e-3 and shift <= 1e-3, (name, errors.max(), shift)
+    assert shift <= 1e-3, (name, shift)
+    if launches == 1:
+        assert float(errors.max()) <= 1e-3, (name, errors.max())
+    assert ours_total <= 1.5 * stock_total + 1e-6, (name, ours_total, stock_total)
+    assert ours_total >= stock_total / 1.5 - 1e-6, (name, ours_total, stock_total)
 
 
 def _slot_sets(ours, stock, batch):
@@ -1339,7 +1397,7 @@ def _dsa_case(config, rank, device, indexer, topk_mode, rows, refusals):
         assert set(seen) == {"rows", "replay", "query", "kv", "order"}, set(seen)
         query = _check_q_codes(where, ours_q, stock["q"], q_scales)
         stock_core = stock["latent"], stock["lse"]
-        _check_core_replay(where, seen["replay"], stock_core, stock["counts"])
+        _check_core_replay(where, seen["replay"], stock, layer.impl, stock_mla)
         same_set = _check_slots(where, local_sets, exact)
         _check_selection(where, same, overlap, counts, lengths)
         keyed = stock["counts"][:r] > 0
