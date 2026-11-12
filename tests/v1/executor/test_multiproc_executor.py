@@ -110,6 +110,7 @@ def test_model_rpc_uses_execute_model_timeout(monkeypatch, method, result, stall
         (None, 1, False, False, False),  # nothing to overlap
         (None, 8, True, False, False),  # CPU backend sets OpenMP envs per worker
         (None, 8, False, True, False),  # NUMA wrapper patches the executable
+        (None, 8, False, None, False),  # automatic binding resolves to bound
     ],
 )
 def test_can_start_workers_concurrently(
@@ -120,15 +121,19 @@ def test_can_start_workers_concurrently(
     monkeypatch.setattr(
         mp_executor, "current_platform", SimpleNamespace(is_cpu=lambda: is_cpu)
     )
+    monkeypatch.setattr(mp_executor.numa_utils, "_can_auto_bind", lambda *a: True)
     executor: Any = SimpleNamespace(
         local_world_size=local_world_size,
-        parallel_config=SimpleNamespace(numa_bind=numa_bind),
+        parallel_config=SimpleNamespace(numa_bind=numa_bind, _numa_bind_auto=False),
     )
 
     assert (
         MultiprocExecutor._can_start_workers_concurrently(executor, inherited_fds)
         is expected
     )
+    if numa_bind is None and not is_cpu and inherited_fds is None:
+        # Resolved in the launcher, before any worker starts.
+        assert executor.parallel_config.numa_bind is True
 
 
 def test_start_workers_concurrently_keeps_started_workers_on_failure():

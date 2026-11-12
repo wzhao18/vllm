@@ -355,7 +355,9 @@ class MultiprocExecutor(Executor):
             inherited_fds is None
             and self.local_world_size > 1
             and not current_platform.is_cpu()
-            and not self.parallel_config.numa_bind
+            # Resolves automatic binding first: it is otherwise decided inside
+            # the first worker start, after this check.
+            and not numa_utils.resolve_numa_bind(self.parallel_config)
         )
 
     def _start_workers_concurrently(
