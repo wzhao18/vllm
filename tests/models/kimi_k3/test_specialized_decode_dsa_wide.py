@@ -172,9 +172,10 @@ def test_dsa_wide_query_grid_resident():
     other ranks' CTAs fill, so every CTA that polls with them must be resident. The
     compiled DSA query (DCP16, 6 heads, FP8) fits whole at 72 / 96 rows
     (cuOccupancyMaxActiveClusters, checked by compile_core); a 128-row grid would not
-    (the check refuses it without the tile poll), so above WIDE_MAX_ROWS each row
-    tile polls its own tokens and one tile's 6 clusters must fit (104-512 rows);
-    DcpValue's whole grid fits at every one of these rows (check_value_residency)."""
+    (the check refuses it), so above WIDE_MAX_ROWS the query only publishes (no
+    CTA polls: no residency need) and QueryWait polls before the sparse decode
+    (104-512 rows); DcpValue's whole grid fits at every one of these rows
+    (check_value_residency)."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa import wide
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.mla.dcp import (
         compile_value,
@@ -202,14 +203,16 @@ def test_dsa_wide_query_grid_resident():
     with pytest.raises(RuntimeError, match="cannot all be resident"):
         wide.check_query_residency(query.compiled, wider, device)
     for rows in (104, 128, 256, 512):
-        query, _, value = wide.compile_core(
+        _, _, value = wide.compile_core(
             rows, heads, pitch, specs, device, 4, 16, 128, sms, fp8=True, cap=512
         )
-        tiled = MlaQuery(
-            heads, rows, dsa=True, fp8=True, dcp=16, q_heads=128, tile_poll=True
+        assert wide.query_publishes_only(rows, 16)
+        published = MlaQuery(
+            heads, rows, dsa=True, fp8=True, dcp=16, q_heads=128, gather=False
         )
-        assert tiled.tile_poll and tiled.grid[1] * tiled.grid[2] > resident
-        assert wide.check_query_residency(query.compiled, tiled, device) >= heads
+        assert published.grid[1] * published.grid[2] > resident
+        wait = wide.compile_query_wait(rows, heads, 16, 128, sms, 512)
+        assert wait is not None
         grid = wide.check_value_residency(value, heads, 16, rows, 4, sms, device)
         assert grid[0] * grid[1] * grid[2] <= sms
     # 576+ rows: 6 x 36+ row tiles would be 216+ merge CTAs, one per SM; the merging
@@ -667,7 +670,7 @@ WIDE_HEADS, WIDE_Q_HEADS, WIDE_CAP = 6, 128, 512
 WIDE_GATE = WIDE_HEADS * V
 WIDE_PITCH = 2112 + WIDE_GATE + INDEX_DIM + INDEX_HEADS
 # (rows, q): DL7 (q8, 32 requests at most) and DL3 (q4, 128) wide rows, one at 96 on
-# the whole-grid poll, the others above it on the tile poll.
+# the whole-grid poll, the others above it publish-only (QueryWait polls).
 WIDE_MAILBOX_CASES = [(96, 8), (104, 8), (184, 8), (256, 8), (128, 4), (256, 4)]
 WIDE_MAILBOX_CASES += [(512, 4)]
 
@@ -732,8 +735,12 @@ def _wide_mailbox_case(box, size, rank, batch, q, skew=0):
         args += (to_cute(cache), to_cute(slots, 8), to_cute(unit, 4), to_cute(unit, 4))
         return (*args, cutlass.Float32(EPS), to_cute(query), to_cute(q_c))
 
-    # The query: every rank's box holds every rank's query rows (bit-identical).
+    # The query: every rank's box holds every rank's query rows (bit-identical);
+    # above WIDE_MAX_ROWS the query only publishes and QueryWait polls (the sparse
+    # decode's first read of the gathered mailbox).
     mq, _, value = kernels(batch)
+    wait = wide.compile_query_wait(batch, heads, size, q_heads, sms, box.cap)
+    assert (wait is not None) == (batch > wide.WIDE_MAX_ROWS)
     query = torch.zeros(batch, heads, 576, device=dev, dtype=torch.uint8)
     q_c = torch.zeros(batch, 1536, device=dev, dtype=bf)
     tp_mla = packed_cache(mla.shape[0], UNIT, FP8_ROW)  # mla's layout (the specs')
@@ -744,6 +751,8 @@ def _wide_mailbox_case(box, size, rank, batch, q, skew=0):
     if skew and rank == 1:
         torch.cuda._sleep(skew)
     mq(*query_args(mla, query, q_c), mailbox, mc, ids[1], s)
+    if wait is not None:
+        wait(mailbox, s)
     # The publish and its poll leave the query rows, q_c and KV rows as the
     # query without DCP computes them (bitwise).
     tp_query, tp_q_c = torch.zeros_like(query), torch.zeros_like(q_c)
@@ -845,7 +854,9 @@ def test_wide_dcp_mailboxes(skew):
     512-row box): the gathered q mailbox, DcpValue's LSE merge, W_UV and gate, and
     the q mailbox re-armed for the next layer. ``rank1_late``: rank 1's query starts
     ~0.1 s late, so the other ranks' first tiles poll while its later tiles are not
-    yet scheduled anywhere (the tile poll's progress, hazard H1); a hang fails."""
+    yet scheduled anywhere (hazard H1, up to WIDE_MAX_ROWS), or, above it, the other
+    ranks' QueryWait polls for its rows (the gathered rows are checked after it);
+    a hang fails."""
     import torch.multiprocessing as mp
 
     from vllm.utils.network_utils import get_open_port
@@ -865,13 +876,10 @@ def test_wide_dcp_mailboxes(skew):
 @pytest.mark.parametrize("q", [4, 8])
 def test_dsa_wide_kernels_resident_past_512(q):
     """No row cap (DSA_WIDE open-ended): compile_core at rows past the old 512 limit
-    (q4 / q8 up to 2048, DCP16, 6 heads, FP8) builds MlaQuery's tile-polled query,
-    and both DcpValue formats ("proj" and the BF16 latent merge) within one wave: the
-    compile-time residency checks pass at every one of them."""
+    (q4 / q8 up to 2048, DCP16, 6 heads, FP8) builds MlaQuery's publish-only query
+    and its QueryWait, and both DcpValue formats ("proj" and the BF16 latent merge)
+    within one wave: the compile-time residency checks pass at every one of them."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa import wide
-    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.mla.query import (
-        MlaQuery,
-    )
 
     sms = torch.cuda.get_device_properties(0).multi_processor_count
     if sms <= 152:
@@ -883,11 +891,9 @@ def test_dsa_wide_kernels_resident_past_512(q):
         rows = -(-rows // q) * q
         for partials in ("proj", "bf16"):
             args = rows, heads, pitch, specs, device, q, 16, 128, sms, partials
-            query, _, value = wide.compile_core(*args, fp8=True, cap=2048)
-            tiled = MlaQuery(
-                heads, rows, dsa=True, fp8=True, dcp=16, q_heads=128, tile_poll=True
-            )
-            assert wide.check_query_residency(query.compiled, tiled, device) >= heads
+            _, _, value = wide.compile_core(*args, fp8=True, cap=2048)
+            assert wide.query_publishes_only(rows, 16)
+            assert wide.compile_query_wait(rows, heads, 16, 128, sms, 2048) is not None
             if partials == "proj":
                 grid = wide.check_proj_residency(value, heads, 16, rows, sms, device)
             else:

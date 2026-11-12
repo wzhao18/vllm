@@ -604,8 +604,9 @@ def test_target_step_covers_every_captured_row(monkeypatch, deployment):
 @pytest.mark.parametrize("q", [4, 8])
 def test_target_dsa_wide_grids_resident(q):
     """WideDsa at every wide verify row up to 1024: its MlaQuery's polling clusters
-    (dsa/wide.py check_query_residency: the whole grid up to WIDE_MAX_ROWS, one row
-    tile's under tile_poll) within the VR200's 22 resident clusters, and both DcpValue
+    (dsa/wide.py check_query_residency: the whole grid up to WIDE_MAX_ROWS; above it
+    the query only publishes and polls nothing) within the VR200's 22 resident
+    clusters, and both DcpValue
     schedules ("proj" and the GB300-schedule latent merge) within one wave."""
     pytest.importorskip("cutlass")
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa import dcp_value
@@ -622,10 +623,10 @@ def test_target_dsa_wide_grids_resident(q):
     query, proj, latent = [], [], []
     for batch in range(64 + q, TOP_ROWS + 1, q):
         mla_query = MlaQuery(
-            6, batch, dsa=True, fp8=True, dcp=16, tile_poll=batch > WIDE_MAX_ROWS
+            6, batch, dsa=True, fp8=True, dcp=16, gather=batch <= WIDE_MAX_ROWS
         )
         grid = mla_query.grid
-        need = grid[1] * (1 if mla_query.tile_poll else grid[2])
+        need = grid[1] * grid[2] if mla_query.gather else 0
         if need > VR200_QUERY_CLUSTERS:
             query.append(batch)
         g = dcp_value.DcpValue(6, 16, batch, VR200_SMS, partials="proj").grid

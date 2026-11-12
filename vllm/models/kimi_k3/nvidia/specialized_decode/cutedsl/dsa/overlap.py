@@ -214,13 +214,15 @@ class QueryWait:
     """DCP: poll the gathered q mailbox (``batch`` tokens of ``gathered`` = DCP x H
     published heads in rows of ``q_heads``, ``q_bytes`` per element) until no 16 B
     chunk is the sentinel. It first waits for the MlaQuery before it, so the KV
-    insert is complete too when the main stream joins."""
+    insert is complete too when the main stream joins. ``ctas``: at most this many
+    CTAs (default 32; dsa.wide sizes it by the device's SMs), each thread polling
+    up to 8 chunks per pass."""
 
-    def __init__(self, batch, gathered, q_heads, q_bytes):
+    def __init__(self, batch, gathered, q_heads, q_bytes, ctas=32):
         self.row = 36 * q_bytes  # 16 B chunks per head row
         self.token, self.q_heads = gathered * self.row, q_heads
         self.chunks = batch * self.token
-        self.ctas = min(32, -(-self.chunks // (256 * 8)))
+        self.ctas = min(ctas, -(-self.chunks // (256 * 8)))
 
     @cute.jit
     def __call__(self, *args):
