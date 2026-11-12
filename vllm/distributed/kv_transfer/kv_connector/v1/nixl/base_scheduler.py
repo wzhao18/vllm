@@ -2,14 +2,21 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Base scheduler-side logic for the NIXL connector."""
 
+import math
 import threading
 import time
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 import msgspec
 import zmq
 
 from vllm import envs
+from vllm.distributed.kv_transfer.kv_connector.dcp_layout import DcpLayout
+from vllm.distributed.kv_transfer.kv_connector.dcp_relayout import (
+    num_staging_blocks,
+)
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     BlockIds,
     EngineId,
@@ -27,7 +34,14 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlHandshakePayload,
     ReqId,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import zmq_ctx
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
+    DcpTransferMode,
+    select_dcp_transfer_mode,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
+    NixlPeerIncompatibleError,
+    zmq_ctx,
+)
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
@@ -41,7 +55,9 @@ from vllm.v1.kv_cache_interface import (
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.core.kv_cache_utils import KVCacheBlock
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.outputs import KVConnectorOutput
     from vllm.v1.request import Request
@@ -56,6 +72,15 @@ class NixlBaseConnectorScheduler:
     # pull (READ) producer from a push (WRITE) one. Overridden by the push
     # scheduler.
     _TRANSFER_MODE: str = "pull"
+
+    # Receives that relayout DCP rows take staging blocks from the GPU block
+    # pool (`bind_gpu_block_pool`): counted at admission
+    # (`get_num_staging_blocks`, `_staging_needs`), taken with the request's
+    # blocks (`_staging_blocks`) and returned when its receive finishes. The
+    # maps are immutable, rebound on every change.
+    _block_pool: "BlockPool | None" = None
+    _staging_needs: Mapping[ReqId, int] = MappingProxyType({})
+    _staging_blocks: Mapping[ReqId, "list[KVCacheBlock]"] = MappingProxyType({})
 
     def __init__(
         self,
@@ -101,6 +126,21 @@ class NixlBaseConnectorScheduler:
             )
         )
         self._has_mamba = kv_cache_config.has_mamba_layers
+        # Where this engine's DCP ranks hold a request's KV rows, as the
+        # workers see it (`NixlBaseConnectorWorker._dcp_layout`): the
+        # per-rank logical block of the attention groups.
+        attention_block_sizes = [
+            g.kv_cache_spec.block_size
+            for g in kv_cache_config.transfer_groups
+            if not isinstance(g.kv_cache_spec, MambaSpec)
+        ]
+        self._dcp_layout = DcpLayout(
+            dcp_size=parallel_config.decode_context_parallel_size,
+            interleave=parallel_config.cp_kv_cache_interleave_size,
+            block_size=math.lcm(*attention_block_sizes)
+            if attention_block_sizes
+            else self.block_size,
+        )
         self._bounded_replay = any(
             g.kv_cache_spec.prefix_replay_tokens > 0
             for g in kv_cache_config.kv_cache_groups
@@ -502,6 +542,9 @@ class NixlBaseConnectorScheduler:
                 kv_transfer_params=req.kv_transfer_params,
                 local_num_computed_blocks=cached,
                 awaiting_kvs=awaiting_kvs,
+                staging_block_ids=[
+                    block.block_id for block in self._staging_blocks.get(req_id, ())
+                ],
             )
 
         if self.use_host_buffer:
@@ -531,9 +574,93 @@ class NixlBaseConnectorScheduler:
         return meta
 
     def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:
-        """Stop heartbeating for requests whose KV transfer completed."""
+        """Stop heartbeating for requests whose KV transfer completed, and
+        return their staging blocks."""
         for req_id in connector_output.finished_recving or ():
             self._stop_heartbeat(req_id)
+            self._free_staging_blocks(req_id)
+        for req_id in connector_output.failed_recving:
+            self._free_staging_blocks(req_id)
+
+    def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
+        self._block_pool = gpu_block_pool
+
+    def get_num_staging_blocks(
+        self, request: "Request", num_computed_tokens: int, num_external_tokens: int
+    ) -> int:
+        """Staging blocks a receive of positions `[num_computed_tokens,
+        num_computed_tokens + num_external_tokens)` needs: none unless the
+        remote's DCP layout needs its rows relayouted
+        (`DcpTransferMode.RELAYOUT`), with the same mode selection as the
+        workers' handshake.
+
+        The count is remembered and taken from the pool by
+        `_take_staging_blocks` once the scheduler allocated the request.
+        `kv_transfer_params` describe the remote's layout (version 18).
+        """
+        self._drop_staging_need(request.request_id)
+        params = request.kv_transfer_params
+        if not params or num_external_tokens <= 0:
+            return 0
+        remote_block_size = params.get("block_size")
+        remote_interleave = params.get("cp_kv_cache_interleave_size")
+        if remote_block_size is None or remote_interleave is None:
+            # A peer older than version 18; its handshake rejects it.
+            return 0
+        try:
+            remote = DcpLayout(
+                dcp_size=params.get("dcp_size", 1),
+                interleave=remote_interleave,
+                block_size=remote_block_size,
+            )
+            mode = select_dcp_transfer_mode(
+                self._dcp_layout,
+                remote,
+                has_mamba=self._has_mamba,
+                tp_sizes=(self.transfer_tp_size, params.get("tp_size", 1)),
+            )
+        except (NixlPeerIncompatibleError, ValueError):
+            # The workers reject this peer at its handshake, fatally.
+            return 0
+        if mode is not DcpTransferMode.RELAYOUT:
+            return 0
+        need = num_staging_blocks(
+            remote,
+            self._dcp_layout,
+            num_computed_tokens,
+            num_computed_tokens + num_external_tokens,
+        )
+        self._staging_needs = {**self._staging_needs, request.request_id: need}
+        return need
+
+    def _take_staging_blocks(self, req_id: ReqId) -> None:
+        """Take the staging blocks admission counted for `req_id`; the
+        admission check guarantees the pool holds them."""
+        need = self._staging_needs.get(req_id, 0)
+        if need:
+            self._drop_staging_need(req_id)
+            assert self._block_pool is not None, "No GPU block pool bound"
+            assert req_id not in self._staging_blocks
+            self._staging_blocks = {
+                **self._staging_blocks,
+                req_id: self._block_pool.get_new_blocks(need),
+            }
+
+    def _drop_staging_need(self, req_id: ReqId) -> None:
+        """Forget an admission count that was not taken."""
+        if req_id in self._staging_needs:
+            self._staging_needs = {
+                r: n for r, n in self._staging_needs.items() if r != req_id
+            }
+
+    def _free_staging_blocks(self, req_id: ReqId) -> None:
+        blocks = self._staging_blocks.get(req_id)
+        if blocks is not None:
+            self._staging_blocks = {
+                r: b for r, b in self._staging_blocks.items() if r != req_id
+            }
+            assert self._block_pool is not None
+            self._block_pool.free_blocks(blocks)
 
     def has_pending_push_work(self) -> bool:
         return False

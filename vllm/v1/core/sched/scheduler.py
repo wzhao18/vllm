@@ -1525,6 +1525,14 @@ class Scheduler(SchedulerInterface):
                         self._inflight_prefill_reserved_blocks()
                         + self._spec_decode_step_blocks
                     )
+                    if self.connector is not None:
+                        # Blocks the connector takes beside the request's own
+                        # for the load, e.g. to stage remote pages.
+                        reserved_blocks += self.connector.get_num_staging_blocks(
+                            request,
+                            num_new_local_computed_tokens,
+                            num_external_computed_tokens,
+                        )
 
                 # Replayed tokens are already counted in the adopted hit; a
                 # chunk that ends inside the replayed range needs no new slots.

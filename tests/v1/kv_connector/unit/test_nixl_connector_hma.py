@@ -2609,7 +2609,9 @@ def _peer_meta(**fields) -> SimpleNamespace:
 @pytest.mark.cpu_test
 def test_handshake_accepts_matching_layouts():
     worker = _layout_worker()
-    mode = worker._check_peer_compatibility(_peer_meta(), remote_dcp_size=8)
+    mode = worker._check_peer_compatibility(
+        _peer_meta(), remote_tp_size=8, remote_dcp_size=8
+    )
     assert mode is DcpTransferMode.DIRECT
 
 
@@ -2664,10 +2666,12 @@ def test_handshake_rejects_incompatible_peers(remote_dcp_size, fields, match):
 def test_handshake_checks_mamba_state_of_either_side():
     worker = _layout_worker(_has_mamba=False, _mamba_state_geometry=None)
     worker._check_peer_compatibility(
-        _peer_meta(mamba_state_geometry=None), remote_dcp_size=8
+        _peer_meta(mamba_state_geometry=None), remote_tp_size=8, remote_dcp_size=8
     )
     with pytest.raises(bw.NixlPeerIncompatibleError, match="other Mamba state"):
-        worker._check_peer_compatibility(_peer_meta(), remote_dcp_size=8)
+        worker._check_peer_compatibility(
+            _peer_meta(), remote_tp_size=8, remote_dcp_size=8
+        )
 
 
 @pytest.mark.cpu_test
@@ -2680,7 +2684,7 @@ def test_handshake_ignores_layers_the_peer_does_not_hold():
         kv_row_layouts={"mla.0": _MLA_ROWS},
         kv_cache_scales={},
     )
-    worker._check_peer_compatibility(meta, remote_dcp_size=8)
+    worker._check_peer_compatibility(meta, remote_tp_size=8, remote_dcp_size=8)
 
 
 @pytest.mark.cpu_test
@@ -2826,7 +2830,7 @@ def test_v16_peer_metadata_decodes_without_layout_facts():
     assert got.kv_row_layouts == {} and got.mamba_state_geometry is None
     worker = _layout_worker()
     with pytest.raises(bw.NixlPeerIncompatibleError, match="older than version 17"):
-        worker._check_peer_compatibility(got, remote_dcp_size=8)
+        worker._check_peer_compatibility(got, remote_tp_size=8, remote_dcp_size=8)
 
 
 def _mla_spec(cache_dtype: str, **kwargs) -> MLAAttentionSpec:

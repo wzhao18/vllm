@@ -113,6 +113,7 @@ def test_error_propagation_async_load(fail_scheduler: Scheduler):
 
     fail_scheduler.connector = create_mock_connector()
     fail_scheduler.connector.get_loaded_kv_cache_group_ids.return_value = (0,)
+    fail_scheduler.connector.get_num_staging_blocks.return_value = 0
     fail_scheduler.connector.get_num_new_matched_tokens.side_effect = (
         _make_get_num_new_matched_tokens(req_num_new_matched_tokens, True)
     )

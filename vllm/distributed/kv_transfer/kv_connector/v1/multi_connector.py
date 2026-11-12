@@ -510,6 +510,20 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
                 to_return = (toks, load_async)
         return to_return
 
+    def get_num_staging_blocks(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+        num_external_tokens: int,
+    ) -> int:
+        # Only the connector chosen to load the request stages anything.
+        chosen_connector = self._requests_to_connector.get(request.request_id)
+        if chosen_connector is None:
+            return 0
+        return self._connectors[chosen_connector].get_num_staging_blocks(
+            request, num_computed_tokens, num_external_tokens
+        )
+
     def get_external_cache_hit_sources(
         self,
         request: "Request",

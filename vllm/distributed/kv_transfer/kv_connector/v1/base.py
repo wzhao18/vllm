@@ -579,6 +579,27 @@ class KVConnectorBase_V1(ABC):
         """
         pass
 
+    def get_num_staging_blocks(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+        num_external_tokens: int,
+    ) -> int:
+        """Blocks of the GPU block pool the connector takes, besides the
+        request's own, to load `num_external_tokens` tokens after the
+        `num_computed_tokens` the request already holds asynchronously.
+
+        Called before the request's blocks are allocated for an asynchronous
+        load; the scheduler admits the request only if these fit as well. The
+        connector takes them from the pool it was bound to
+        (`bind_gpu_block_pool`) in `update_state_after_alloc`, and returns them
+        when the load finishes. E.g. a KV transfer between differently sharded
+        layouts stages remote pages before moving their rows into place.
+
+        Default: none.
+        """
+        return 0
+
     def get_external_cache_hit_sources(
         self,
         request: "Request",

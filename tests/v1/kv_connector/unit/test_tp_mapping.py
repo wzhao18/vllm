@@ -406,3 +406,56 @@ def test_dcp_transfer_mode_rejects(local, remote, has_mamba, match):
         select_dcp_transfer_mode(
             DcpLayout(*local), DcpLayout(*remote), has_mamba=has_mamba
         )
+
+
+@pytest.mark.parametrize(
+    ("local", "remote", "has_mamba"),
+    [
+        # Kimi K3.1 P TP8=DCP8 -> D TP16=DCP16 with TP-scaled blocks, and back.
+        ((16, 1, 640), (8, 1, 1280), True),
+        ((8, 1, 1280), (16, 1, 640), True),
+        # Token-level interleave over different DCP sizes, equal blocks.
+        ((16, 1, 640), (8, 1, 640), False),
+        ((1, 1, 64), (2, 1, 64), False),
+        # Same DCP size, different blocks.
+        ((8, 1, 640), (8, 1, 1280), False),
+        # Block-interleaved hybrids over different DCP sizes move rows too.
+        ((4, 64, 64), (2, 64, 64), True),
+    ],
+)
+def test_dcp_transfer_mode_relayout(local, remote, has_mamba):
+    mode = select_dcp_transfer_mode(
+        DcpLayout(*local),
+        DcpLayout(*remote),
+        has_mamba=has_mamba,
+        tp_sizes=(local[0], remote[0]),
+    )
+    assert mode is DcpTransferMode.RELAYOUT
+
+
+def test_dcp_transfer_mode_prefers_direct():
+    """Layouts whose pages pair whole never pay for a relayout."""
+    for local, remote in [((8, 1, 1280), (8, 1, 1280)), ((2, 64, 64), (8, 64, 64))]:
+        mode = select_dcp_transfer_mode(
+            DcpLayout(*local), DcpLayout(*remote), tp_sizes=(local[0], remote[0])
+        )
+        assert mode is DcpTransferMode.DIRECT
+
+
+@pytest.mark.parametrize(
+    ("local", "remote", "tp_sizes", "match"),
+    [
+        # TP != DCP on one side.
+        ((16, 1, 640), (8, 1, 1280), (16, 16), "TP = DCP on both sides"),
+        ((4, 1, 640), (8, 1, 1280), (8, 8), "TP = DCP on both sides"),
+        # DCP sizes that do not divide one another.
+        ((6, 1, 64), (4, 1, 64), (6, 4), "divide one another"),
+        # The interleave of both sides must agree whatever the mode.
+        ((16, 1, 640), (8, 2, 1280), (16, 8), "interleave"),
+    ],
+)
+def test_dcp_transfer_mode_relayout_rejects(local, remote, tp_sizes, match):
+    with pytest.raises(NixlPeerIncompatibleError, match=match):
+        select_dcp_transfer_mode(
+            DcpLayout(*local), DcpLayout(*remote), tp_sizes=tp_sizes
+        )

@@ -7,6 +7,9 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from vllm.distributed.kv_transfer.kv_connector.dcp_relayout import (
+    plan_staged_relayout,
+)
 from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds, EngineId
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
     NixlBaseConnectorWorker,
@@ -16,7 +19,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     ReqMeta,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
+    DcpTransferMode,
     ReadSpec,
+    TPMapping,
     _is_attention_spec,
 )
 from vllm.logger import init_logger
@@ -229,6 +234,11 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 ReadSpec(remote_rank=rank, local_block_ids=[], remote_block_ids=[])
                 for rank in plan.all_source_ranks
             ]
+        elif plan.dcp_mode is DcpTransferMode.RELAYOUT:
+            relayout_specs = self._relayout_read_specs(req_id, meta, plan)
+            if relayout_specs is None:
+                return
+            read_specs = relayout_specs
         elif not pairs.groups_match:
             # The two sides put some layer in different cache groups: read each
             # region at its own blocks.
@@ -483,6 +493,90 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                             remote_agent_name=agent,
                         )
                         self.xfer_stats.record_failed_notification()
+
+    def _relayout_read_specs(
+        self, req_id: str, meta: ReqMeta, plan: TPMapping
+    ) -> list[ReadSpec] | None:
+        """Reads of a request from a RELAYOUT peer, and its row gather.
+
+        The attention group reads the remote units holding this rank's rows
+        into the request's staging blocks (`plan_staged_relayout`); the gather
+        then moves them into the request's blocks once the READs complete
+        (`get_transfer_results`). State groups read their blocks 1:1, as for
+        DIRECT peers. Returns None if the request was failed instead.
+        """
+        assert meta.remote is not None and self.transfer_topo is not None
+        engine_id = meta.remote.engine_id
+        remote_layout = self._remote_dcp_layouts[engine_id]
+        if meta.remote.num_tokens is None:
+            logger.error_once(
+                "Declining remote reads from engine %s: DCP row relayouts "
+                "require remote_num_tokens in kv_transfer_params. Make the "
+                "proxy forward it.",
+                engine_id,
+            )
+            self._handle_failed_transfer(
+                req_id, None, self._recv_failures, record_failed_transfer=False
+            )
+            return None
+        if (meta.remote.block_size, meta.remote.cp_kv_cache_interleave_size) != (
+            remote_layout.block_size,
+            remote_layout.interleave,
+        ):
+            # The scheduler sized the staging from these.
+            raise RuntimeError(
+                f"Request {req_id} describes engine {engine_id}'s KV layout as "
+                f"block_size={meta.remote.block_size}, "
+                "cp_kv_cache_interleave_size="
+                f"{meta.remote.cp_kv_cache_interleave_size}, but its handshake "
+                f"advertised {remote_layout}."
+            )
+        remote_info = self.transfer_topo.get_engine_info(engine_id)
+        # The reads' unit: the remote kernel blocks, split to divide the local
+        # ones (`_split_remote_blocks`).
+        unit_rows = remote_info.remote_block_size
+        num_groups = len(meta.local_block_ids)
+        # One attention group (`_relayout_unsupported_reason`).
+        (group,) = (
+            g
+            for g in range(num_groups)
+            if _is_attention_spec(self._group_spec_types[g])
+        )
+        tokens_per_block = self._dcp_layout.block_size * self.dcp_size
+        relayout = plan_staged_relayout(
+            remote_layout,
+            self._dcp_layout,
+            self.dcp_rank,
+            # The local prefix hit ends on a block, which holds one page of
+            # every rank.
+            meta.local_num_computed_blocks[group] * tokens_per_block,
+            meta.remote.num_tokens,
+            unit_rows=unit_rows,
+            src_block_ids=list(meta.remote.block_ids[group]),
+            dst_block_ids=list(meta.local_block_ids[group]),
+            staging_block_ids=meta.staging_block_ids,
+            dst_kernel_block_size=self.block_size,
+        )
+        missing = relayout.reads.keys() - set(plan.source_ranks_per_group[group])
+        assert not missing, f"Relayout reads from unmapped remote ranks {missing}"
+        meta.relayout = relayout
+        read_specs = []
+        for rank in plan.all_source_ranks:
+            local_ids: list[list[int]] = []
+            remote_ids: list[list[int]] = []
+            for g in range(num_groups):
+                if g == group:
+                    remote_units, staging_units = relayout.reads.get(rank, ([], []))
+                    local_ids.append(staging_units)
+                    remote_ids.append(remote_units)
+                elif rank in plan.source_ranks_per_group[g]:
+                    local_ids.append(list(meta.local_block_ids[g]))
+                    remote_ids.append(list(meta.remote.block_ids[g]))
+                else:
+                    local_ids.append([])
+                    remote_ids.append([])
+            read_specs.append(ReadSpec(rank, local_ids, remote_ids))
+        return read_specs
 
     def _read_blocks(
         self,
