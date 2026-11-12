@@ -39,6 +39,17 @@
   - The kernel file (`block_scaled_swap_ab_mega_moe_kernel.py`) is unchanged; it uses
     only `token_comm` entry points whose signatures S1 keeps.
 
+- **L1** in `sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py`
+  (FlashInfer 0.7.3.dev20261031 sha256
+  `a578368593bed9cf91b8dacf16fa65f8ab822a3001bb457e053f2b4b179013a0`): optional impl field
+  `die_sm_mask32` (bound; `name()` gains `diesplit_` / `dienone_`, rank-uniform because it tags the arena layout; the per-GPU mask itself keys `session.compile_cache_key`); with it the phase-interleaved
+  schedule uses `DieSplitPhaseInterleavedFc12Scheduler` (L2). Without it the kernel is the
+  FlashInfer one.
+- **L2** new file `sources/kernel_src/schedulers/die_split_fc12_scheduler.py` (ours, no
+  upstream): die-local expert streams for the phase-interleaved FC12 scheduler (4 atomic
+  streams, FC1/FC2 x die; per-die expert ranges in the stock order; cross-die stealing).
+  Same tiles and accumulation order (bitwise-identical output). Host side: `die_local.py`.
+
 ## Rewrite rule
 
 **R0 (applied): identity.** Every file is byte-identical to the FlashInfer original
@@ -104,7 +115,7 @@ b4e8bf2729618064678aa11cc5c38476626f13cd97d40f675a9fbe3ced71dd02  sources/kernel
 6355b04c8672b40e96d2ae1a3309650e1e06eadaf3172e3ccaf2a2b51a88f740  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_extension.py
 601a5a53da27d04f6dd98cbe9eb408159bce8b0a5f26f8611b1d39339c22cf24  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop.py
 e7f3aa713f90170f3f2c4b616af7a338ee4cb3cdef34621cb21e6ad8a90aabf6  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop_gen_specialized.py
-a578368593bed9cf91b8dacf16fa65f8ab822a3001bb457e053f2b4b179013a0  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py
+d6edd1380934f2da6974064c07ef7ac757c21ea6fe48c449a89b499f537c1da2  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py
 292cd6c6d62b9d6cb7a15e0f43363756941124a645c34be6947b5542282c3ee5  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py
 d85b41f1f605c8ce4ae97696e4c8aad5f02eb95412eb42e20d0cfca2dcc4e54a  sources/kernel_src/rubin/inference/mega/dynamic_mainloop.py
 0fbc10e05282241250de08ccfaebd533076f29abdd3bb949c063cf80daf54496  sources/kernel_src/rubin/inference/mega/tma_gather.py
@@ -112,6 +123,7 @@ f8640f21703099acbf74064368d2d1a6d410760e358bb4341a8b26402b0a8a1f  sources/kernel
 56efd874b9859abfcafb2e0cdc39c2690404a274b07590f5c1630f57f57e3f9b  sources/kernel_src/rubin/inference/mega/topk_reduce.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/kernel_src/schedulers/__init__.py
 22a68aede7b609cd7f770954d428098207bcb504c12cb71b0bb2198ca339cc04  sources/kernel_src/schedulers/base.py
+f4569f517f8cdaac72b920b893f426c5b41a676ebac0f6432ffa8903a91d22be  sources/kernel_src/schedulers/die_split_fc12_scheduler.py
 bf754355af676f767eca31dee76dade21bd9e440a755c159861c943ab45b57c6  sources/kernel_src/schedulers/fc12_mapping.py
 ce86b6234fe181b31dc6bbfafe0ed9093a39a600a8e0d3f4dae25983a8f72f97  sources/kernel_src/schedulers/fc12_scheduler.py
 c43fc6e1b0858191776e82e702b2f1c373d3984b14f58a8d5011764d20ce7f47  sources/kernel_src/schedulers/non_clc_mixed_cga.py

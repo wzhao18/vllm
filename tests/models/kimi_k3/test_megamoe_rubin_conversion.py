@@ -637,8 +637,9 @@ def test_cache_keys_and_layout_tag():
         max_tokens_per_rank=128,
     )
     base = S.compile_cache_key(cfg, "kname", "4.8.0", 0)
-    assert base == ("kname", "4.8.0", "nvfp4", 4.0, 25.0, 0)
+    assert base == ("kname", "4.8.0", "nvfp4", 4.0, 25.0, 0, None)
     for change in (
+        dict(die_sm_mask32=(1, 2)),
         dict(situ_beta=2.0),
         dict(situ_linear_beta=10.0),
         dict(quant_kind="mxfp4_mxfp8"),
@@ -720,7 +721,7 @@ def test_vendored_sources_match_manifest():
         for p in src.joinpath("sources").rglob("*.py")
         if "__pycache__" not in p.parts
     }
-    assert len(manifest) == 41 and set(files) == set(manifest)
+    assert len(manifest) == 42 and set(files) == set(manifest)
     for rel, path in files.items():
         assert hashlib.sha256(path.read_bytes()).hexdigest() == manifest[rel], rel
     # no FlashInfer / NVSHMEM import anywhere in the backend
