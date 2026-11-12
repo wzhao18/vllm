@@ -38,7 +38,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
     select_dcp_transfer_mode,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
-    NixlPeerIncompatibleError,
     zmq_ctx,
 )
 from vllm.logger import init_logger
@@ -617,9 +616,8 @@ class NixlBaseConnectorScheduler:
                 remote,
                 tp_sizes=(self.transfer_tp_size, params.get("tp_size", 1)),
             )
-        except (NixlPeerIncompatibleError, ValueError) as e:
-            # The workers' handshake rejects the peer, and its requests are
-            # recomputed.
+        except (NotImplementedError, ValueError) as e:
+            # The workers' handshake rejects the peer and fails its requests.
             logger.warning_once(
                 "Reserving no relayout staging for KV from engine %s: %s",
                 remote_engine_id,

@@ -22,9 +22,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
     compute_tp_mapping,
     select_dcp_transfer_mode,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
-    NixlPeerIncompatibleError,
-)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
     NixlConnectorWorker,
 )
@@ -560,7 +557,7 @@ def test_dcp_transfer_mode_relayout(local, remote):
     ],
 )
 def test_dcp_transfer_mode_rejects(local, remote, tp_sizes, match):
-    with pytest.raises(NixlPeerIncompatibleError, match=match):
+    with pytest.raises(NotImplementedError, match=match):
         _mode(local, remote, tp_sizes)
 
 

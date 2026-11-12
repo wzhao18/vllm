@@ -2623,47 +2623,61 @@ def test_handshake_accepts_matching_layouts():
 
 @pytest.mark.cpu_test
 @pytest.mark.parametrize(
-    ("remote_dcp_size", "fields", "match"),
+    ("remote_dcp_size", "fields", "error", "match"),
     [
-        (8, dict(cp_kv_cache_interleave_size=64), "interleave"),
+        (8, dict(cp_kv_cache_interleave_size=64), NotImplementedError, "interleave"),
         # DCP sizes that do not divide one another.
-        (6, dict(), "divide one another"),
+        (6, dict(), NotImplementedError, "divide one another"),
         # A peer older than v17 does not tell its interleave.
-        (8, dict(cp_kv_cache_interleave_size=None), "older than version 17"),
+        (
+            8,
+            dict(cp_kv_cache_interleave_size=None),
+            RuntimeError,
+            "older than version 17",
+        ),
         # A layout DCP cannot produce.
-        (8, dict(cp_kv_cache_interleave_size=3), "Invalid DCP layout"),
+        (8, dict(cp_kv_cache_interleave_size=3), RuntimeError, "Invalid DCP layout"),
         # Another indexer key format (MXFP4 vs FP8).
         (
             8,
             dict(kv_row_layouts={"mla.0": _MLA_ROWS, "indexer.0": _MXFP4_INDEXER_ROWS}),
+            RuntimeError,
             "layer indexer.0 stores its KV token rows",
         ),
         # A layer the peer holds without declaring its rows.
         (
             8,
             dict(kv_row_layouts={"mla.0": _MLA_ROWS}),
+            RuntimeError,
             "layer indexer.0 stores its KV token rows",
         ),
-        (8, dict(kv_cache_scales={"mla.0": [0.5, 1.0]}), "layer mla.0 quantizes"),
+        (
+            8,
+            dict(kv_cache_scales={"mla.0": [0.5, 1.0]}),
+            RuntimeError,
+            "layer mla.0 quantizes",
+        ),
         # More conv rows: another num_speculative_tokens.
         (
             8,
             dict(mamba_state_geometry=([[6], [128, 128]], _MAMBA_GEOMETRY[1])),
+            RuntimeError,
             "num_speculative_tokens",
         ),
-        (8, dict(mamba_state_geometry=None), "other Mamba state"),
+        (8, dict(mamba_state_geometry=None), RuntimeError, "other Mamba state"),
     ],
 )
-def test_handshake_rejects_incompatible_peers(remote_dcp_size, fields, match):
+def test_handshake_rejects_incompatible_peers(remote_dcp_size, fields, error, match):
     """Configuration mismatches fail the handshake before any peer state is
     registered."""
     worker = _layout_worker()
-    with pytest.raises(bw.NixlPeerIncompatibleError, match=f"engine P .*{match}"):
+    with pytest.raises(error, match=f"engine P .*{match}") as exc:
         worker.add_remote_agent(
             _peer_meta(**fields),
             remote_tp_size=remote_dcp_size,
             remote_dcp_size=remote_dcp_size,
         )
+    assert type(exc.value) is error
     assert worker.tp_mappings == {}
     assert worker._remote_dcp_layouts == {}
     worker.transfer_topo.register_remote_engine.assert_not_called()
@@ -2689,9 +2703,7 @@ def test_handshake_selects_relayout_between_dcp_sizes():
 def test_handshake_rejects_a_relayout_the_engine_cannot_receive():
     worker = _layout_worker()
     worker._relayout_unsupported_reason = lambda: "push transfers write whole pages."
-    with pytest.raises(
-        bw.NixlPeerIncompatibleError, match="cannot receive: push transfers"
-    ):
+    with pytest.raises(NotImplementedError, match="cannot receive: push transfers"):
         worker._check_peer_compatibility(
             _peer_meta(), remote_tp_size=16, remote_dcp_size=16
         )
@@ -2704,7 +2716,7 @@ def test_handshake_checks_mamba_state_of_either_side():
     worker._check_peer_compatibility(
         _peer_meta(mamba_state_geometry=None), remote_tp_size=8, remote_dcp_size=8
     )
-    with pytest.raises(bw.NixlPeerIncompatibleError, match="other Mamba state"):
+    with pytest.raises(RuntimeError, match="other Mamba state"):
         worker._check_peer_compatibility(
             _peer_meta(), remote_tp_size=8, remote_dcp_size=8
         )
@@ -2771,11 +2783,10 @@ def test_incompatible_peer_fails_its_handshake_only():
     worker._handshake_initiation_executor = SimpleNamespace(submit=submit)
 
     worker._ensure_handshake("P0", "host", 1, 8, 8)
-    futures[-1].set_exception(bw.NixlPeerIncompatibleError("other interleave"))
+    futures[-1].set_exception(NotImplementedError("other interleave"))
     assert worker.xfer_stats.record_failed_handshake.call_count == 1
     assert "P0" not in worker._remote_agents
-    # Nothing is kept to fail the engine later; other peers still handshake.
-    assert not hasattr(worker, "_peer_incompatible_error")
+    # The failure belongs to this peer; other peers still handshake.
     assert worker._ensure_handshake("P1", "host", 1, 8, 8) is futures[-1]
     assert len(futures) == 2
 
@@ -2865,7 +2876,7 @@ def test_v16_peer_metadata_decodes_without_layout_facts():
     assert got.cp_kv_cache_interleave_size is None
     assert got.kv_row_layouts == {} and got.mamba_state_geometry is None
     worker = _layout_worker()
-    with pytest.raises(bw.NixlPeerIncompatibleError, match="older than version 17"):
+    with pytest.raises(RuntimeError, match="older than version 17"):
         worker._check_peer_compatibility(got, remote_tp_size=8, remote_dcp_size=8)
 
 
@@ -3027,7 +3038,7 @@ def test_handshake_rejects_different_dcp_not_spanning_tp(
     local_tp, remote_dcp, remote_tp, side
 ):
     worker = _layout_worker(transfer_tp_size=local_tp)
-    with pytest.raises(bw.NixlPeerIncompatibleError, match=f"DCP equal to TP.*{side}"):
+    with pytest.raises(NotImplementedError, match=f"DCP equal to TP.*{side}"):
         worker._check_peer_compatibility(
             _peer_meta(), remote_dcp_size=remote_dcp, remote_tp_size=remote_tp
         )

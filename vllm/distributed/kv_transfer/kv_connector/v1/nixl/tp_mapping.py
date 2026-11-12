@@ -18,7 +18,6 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
     TransferTopology,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
-    NixlPeerIncompatibleError,
     get_dcp_replicated_group_ids,
     get_representative_spec_type,
 )
@@ -212,7 +211,7 @@ def select_dcp_transfer_mode(
     tp_sizes: tuple[int, int],
 ) -> DcpTransferMode:
     """Pick how attention KV moves from `remote` to `local`, or raise
-    `NixlPeerIncompatibleError` for a pair of layouts no mode supports.
+    `NotImplementedError` for a pair of layouts no mode supports.
 
     `block_size` is each side's per-rank logical block (rows per page on one
     rank) and `tp_sizes` are the (local, remote) transfer TP sizes.
@@ -249,13 +248,13 @@ def select_dcp_transfer_mode(
             ("remote", remote, tp_sizes[1]),
         ):
             if layout.dcp_size not in (1, tp_size):
-                raise NixlPeerIncompatibleError(
+                raise NotImplementedError(
                     "NIXL transfers between different DCP sizes need DCP equal "
                     f"to TP (or no DCP) on each side; the {side} side has TP "
                     f"{tp_size} and DCP {layout.dcp_size}."
                 )
         if local.dcp_size % remote.dcp_size and remote.dcp_size % local.dcp_size:
-            raise NixlPeerIncompatibleError(
+            raise NotImplementedError(
                 "NIXL transfers between different DCP sizes need sizes that "
                 f"divide one another, got local {local.dcp_size}, remote "
                 f"{remote.dcp_size}."
@@ -265,7 +264,7 @@ def select_dcp_transfer_mode(
         and remote.dcp_size > 1
         and local.interleave != remote.interleave
     ):
-        raise NixlPeerIncompatibleError(
+        raise NotImplementedError(
             "Both P and D shard KV with decode context parallelism but their "
             f"cp_kv_cache_interleave_size differ: local {local.interleave}, "
             f"remote {remote.interleave}. Use the same interleave on both sides."
