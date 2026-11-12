@@ -54,6 +54,21 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
     scheduler_consumer_thread_count: ClassVar[int] = 7 * 32
     epilogue_register_count: ClassVar[int] = 256
     scheduler_register_count: ClassVar[int] = 72
+    # vLLM local difference S2: prefill-scale inference launches run a second epilogue warpgroup
+    # (warps 12-15) that takes every other accumulator stage. The epilogue (SiTU + NVFP4 requant,
+    # BF16 FC2 token-back) issues from one warp per SM sub-partition and measured ~3.5x slower
+    # than the MMA per tile at the C512 prefill shape, so the tensor pipe idled ~74%.
+    # Automatic (no knob): N=128/256 tiles, 2CTA, epi_warps token-back (named barriers 3, 8, 11,
+    # 14, 15 are free there), and more routes per rank than two_warpgroup_epilogue_min_routes.
+    second_epilogue_warp_ids: ClassVar[Tuple[int, int, int, int]] = (12, 13, 14, 15)
+    # 512 threads launch at <= 128 registers; setmaxnreg then moves registers between warpgroups:
+    # 2 x 128 x (184 - 128) = 14336 <= 65536 - 2 x 128 x 128 - 32 x (3 x 64 + 72) - 128 x 64 = 16128.
+    two_warpgroup_epilogue_register_count: ClassVar[int] = 184
+    # Strictly more routes per rank than a 2048-token bucket: at 2048 capacity the second warpgroup
+    # was neutral (C256 prefill, -0.2%) to slightly slower (decode 300-1024 tokens, +0.6..+2%).
+    two_warpgroup_epilogue_min_routes: ClassVar[int] = 2048 * 16
+    # Reuses the TMEM-allocation barrier id: its only other use completes before any epilogue work.
+    epilogue_done_barrier_id: ClassVar[int] = 2
 
     @classmethod
     def problem_desc_require(cls) -> dict[str, object]:
@@ -144,8 +159,18 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.occupancy = 1
         self.architecture = "sm_107"
         self.local_expert_count = self.expert_count // self.world_size
-        self.threads_per_cta = 16 * 32 if self.token_back_mode == "standalone_warps" else 12 * 32
-        self.other_warp_register_count = 64 if self.token_back_mode == "standalone_warps" else 72
+        self.epilogue_warpgroups = self._select_epilogue_warpgroups()
+        if self.epilogue_warpgroups == 2:
+            # One flag per tile: a warpgroup must not hold a done flag while it waits for a later
+            # accumulator stage that the other warpgroup's flags gate (batching measured +-1%).
+            self.epi_flag_batches = (1, 1)
+            self.epilogue_register_count = self.two_warpgroup_epilogue_register_count
+            self.scheduler_consumer_thread_count = (3 + 2 * len(self.epilogue_warp_ids)) * 32
+        sixteen_warps = self.token_back_mode == "standalone_warps" or self.epilogue_warpgroups == 2
+        self.threads_per_cta = 16 * 32 if sixteen_warps else 12 * 32
+        # Warps [transfer_warp_idx_start, transfer_warp_end_idx) run token_in (+ standalone token-back).
+        self.transfer_warp_end_idx = 16 if self.token_back_mode == "standalone_warps" else 12
+        self.other_warp_register_count = 64 if sixteen_warps else 72
 
         self.mixed_cga_config = NonClcMixedCgaConfig(
             preferred_cluster_shape=self.cluster_shape_mn,
@@ -218,6 +243,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 "max_tokens": self.max_tokens,
                 "num_scheduler_consumer_threads": self.scheduler_consumer_thread_count,
                 "num_accumulator_consumer_warps_per_cta": len(self.epilogue_warp_ids),
+                "epilogue_warpgroups": self.epilogue_warpgroups,
                 "communication_enabled": True,
                 "token_back_push_data": self.token_comm.token_back_push_data,
                 "fc1_epi_flag_batch": self.epi_flag_batches[0],
@@ -363,6 +389,16 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             if self.use_2cta_instrs and fallback_cluster_m % 2 != 0:
                 raise ValueError("Two-CTA MMA requires an even fallback cluster M.")
 
+    def _select_epilogue_warpgroups(self) -> int:
+        """S2: 2 epilogue warpgroups on prefill-scale N=128/256 2CTA epi_warps launches, else the stock 1."""
+        if not isinstance(self.max_tokens_per_rank, int) or self.token_back_mode != "epi_warps":
+            return 1
+        if self.mma_tiler_mnk[1] not in (128, 256) or not self.use_2cta_instrs:
+            return 1
+        if self.max_tokens_per_rank * self.topk <= self.two_warpgroup_epilogue_min_routes:
+            return 1
+        return 2
+
     def _resolve_schedule_hint(self) -> None:
         if self.schedule_mode != "phase_interleave":
             return
@@ -465,7 +501,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             f"fc2store{'tma' if self.epilogue.fc2_use_tma else 'ublk' if self.epilogue.fc2_use_ublk else 'stg'}_"
             f"fc2tmastages{self.epilogue.fc2_tma_stages}_"
             f"singlectareset{int(self.token_comm.tail_reset_single_cta)}_"
-            f"epiflag{epi_flags}_clusters{self.launch_cluster_count}_ctas{self.mixed_cga_config.total_cta_cnt}_"
+            f"epiflag{epi_flags}_epiwg{self.epilogue_warpgroups}_clusters{self.launch_cluster_count}_ctas{self.mixed_cga_config.total_cta_cnt}_"
             f"tokeninflag{self.token_in_flag_batch}_tokenback{self.token_back_mode}_"
             f"combine{self.combine_format.name}_clamp{self.gate_up_clamp}_"
             # The SiTU betas are codegen-time constants, so they must key the compiled kernel.
@@ -997,6 +1033,12 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             self.cluster_shape_mn, self.resolved_fallback_cluster_shape_mn, is_fallback_cluster
         )
         finalize_barrier_thread_count = 12 * 32 if self.token_back_mode == "standalone_warps" else 8 * 32
+        if cutlass.const_expr(self.epilogue_warpgroups == 2):
+            finalize_barrier_thread_count = 12 * 32
+        epilogue_done_barrier = pipeline.NamedBarrier(
+            barrier_id=self.epilogue_done_barrier_id, num_threads=32 * 2 * len(self.epilogue_warp_ids)
+        )
+        tmem_sharing_threads = 32 * (1 + self.epilogue_warpgroups * self._mainloop.num_accumulator_consumer_warps_per_cta)
         finalize_barrier = pipeline.NamedBarrier(barrier_id=13, num_threads=finalize_barrier_thread_count)
 
         if warp_idx == self.scheduler_warp_id:
@@ -1085,7 +1127,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             iket.range_push("mega.epilogue")
             sched_consumer = scheduler.make_consumer()
             tmem_allocator.allocate(self._mainloop.num_tmem_alloc_cols)
-            barrier_sync_unaligned(self._mainloop.tmem_allocation_barrier_id, 32 * (1 + self._mainloop.num_accumulator_consumer_warps_per_cta))
+            barrier_sync_unaligned(self._mainloop.tmem_allocation_barrier_id, tmem_sharing_threads)
             tmem_pointer = tmem_allocator.retrieve_ptr(self.acc_dtype)
             self.epilogue.run(
                 self._smem_workspace,
@@ -1108,12 +1150,48 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 peer_rank_ptr_mapper,
                 optional_epilogue_args,
             )
+            if cutlass.const_expr(self.epilogue_warpgroups == 2):
+                # The second warpgroup reads TMEM until it arrives here; free only after it.
+                epilogue_done_barrier.arrive_and_wait()
             tmem_allocator.relinquish_alloc_permit()
             tmem_allocator.free(tmem_allocator.retrieve_ptr(self.acc_dtype), self._mainloop.num_tmem_alloc_cols)
             iket.range_pop()
             finalize_barrier.arrive_unaligned()
 
-        if warp_idx >= Int32(self.transfer_warp_idx_start):
+        if cutlass.const_expr(self.epilogue_warpgroups == 2):
+            if warp_idx >= Int32(self.second_epilogue_warp_ids[0]):
+                cute.arch.warpgroup_reg_alloc(self.epilogue_register_count)
+                iket.range_push("mega.epilogue_wg1")
+                sched_consumer = scheduler.make_consumer()
+                barrier_sync_unaligned(self._mainloop.tmem_allocation_barrier_id, tmem_sharing_threads)
+                tmem_pointer = tmem_allocator.retrieve_ptr(self.acc_dtype)
+                self.epilogue.run(
+                    self._smem_workspace,
+                    smem_base,
+                    tmem_pointer,
+                    acc_pipeline,
+                    sched_consumer,
+                    kernel_extension,
+                    fc1_output_tma_atom,
+                    fc1_output_tma_tensor,
+                    fc1_output_sf,
+                    fc2_output_tma_atom,
+                    fc2_output_tma_tensor,
+                    fc2_output,
+                    fc1_done_counter,
+                    thread_idx,
+                    token_src_metadata,
+                    fc2_done_counter,
+                    fc2_output_sf,
+                    peer_rank_ptr_mapper,
+                    optional_epilogue_args,
+                    warpgroup=1,
+                )
+                iket.range_pop()
+                epilogue_done_barrier.arrive_unaligned()
+                finalize_barrier.arrive_unaligned()
+
+        if warp_idx >= Int32(self.transfer_warp_idx_start) and warp_idx < Int32(self.transfer_warp_end_idx):
             cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
             if warp_idx < Int32(self.token_in_end_warp_idx):
                 iket.range_push("mega.token_in")

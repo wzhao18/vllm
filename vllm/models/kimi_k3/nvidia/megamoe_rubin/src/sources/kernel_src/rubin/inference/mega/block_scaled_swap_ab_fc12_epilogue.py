@@ -874,6 +874,11 @@ class SwapABGatedActEpilogue(KernelComponent):
 
     _EpilogueSyncWaitBarId = 1  # Arrive and wait only
     _EpilogueAsyncBarIdBase = 4  # Some arrive, the others arrive and wait
+    # vLLM S2: the second epilogue warpgroup's barrier ids -- sync 3, subtiles 8/11/14/15 (unused by
+    # the epi_warps kernel) -- and the warpgroup whose code is being traced (trace-time state, reset
+    # after its run()).
+    _EpilogueWg1SyncWaitBarId = 3
+    _trace_warpgroup: ClassVar[int] = 0
     _EpilogueFc1GateUpInterleave = 16
     _EpilogueTokenTileSize = 64  # Fundamentally the epi_tile_n
     _EpilogueFc1IntermediateGateUpTileSize = 128  # Fundamentally epi_tile_m
@@ -1021,6 +1026,13 @@ class SwapABGatedActEpilogue(KernelComponent):
             self.intermediate_downproj: Optional[int] = None
 
         self.subtile_cnt = self.cta_tile_n // self._EpilogueTokenTileSize
+        self.epilogue_warpgroups = impl_desc.get("epilogue_warpgroups", 1)
+        if self.epilogue_warpgroups not in (1, 2):
+            raise ValueError("epilogue_warpgroups must be 1 or 2.")
+        if self.epilogue_warpgroups == 2 and (
+            self.subtile_cnt not in (2, 4) or self.fc1_epi_flag_batch != 1 or self.fc2_epi_flag_batch != 1
+        ):
+            raise ValueError("Two epilogue warpgroups need 2 or 4 token subtiles and per-tile done flags.")
 
         # One staging stage per token subtile, each an (epi_tile_n, epi_tile_m // 2) quantized tile.
         self.fc1_staging_stage_bytes = (
@@ -1068,21 +1080,38 @@ class SwapABGatedActEpilogue(KernelComponent):
         outside the subtile loop, FC1's amax exchange and FC2's bulk-store handshake belong to
         different work tiles.
         """
-        return pipeline.NamedBarrier(barrier_id=cls._EpilogueSyncWaitBarId, num_threads=32 * cls._EpilogueWarpCnt)
+        barrier_id = cls._EpilogueWg1SyncWaitBarId if cls._trace_warpgroup == 1 else cls._EpilogueSyncWaitBarId
+        return pipeline.NamedBarrier(barrier_id=barrier_id, num_threads=32 * cls._EpilogueWarpCnt)
+
+    @classmethod
+    def subtile_async_bar_id(cls, subtile_idx):
+        if cls._trace_warpgroup == 1:
+            # 0, 1, 2, 3 -> 8, 11, 14, 15
+            i = subtile_idx
+            return cutlass.Int32(8) + cutlass.Int32(3) * i - (i * (i - cutlass.Int32(1)) * (i - cutlass.Int32(2))) // cutlass.Int32(3)
+        return subtile_idx + cutlass.Int32(cls._EpilogueAsyncBarIdBase)
 
     def register_smem_regions(self, smem_workspace: SmemWorkspace) -> None:
         """Declare the epilogue scratch as one allocation shared by two exclusive lifetimes.
 
         FC1's staging tile and FC2's store tile belong to different work tiles, separated by the
-        tile-boundary TMA drain and rendezvous in ``run()``, so they never coexist.
+        tile-boundary TMA drain and rendezvous in ``run()``, so they never coexist. A second
+        epilogue warpgroup (S2) gets its own scratch.
         """
-        overlay = smem_workspace.create_overlay(self.smem_scratch_overlay)
+        for warpgroup in range(self.epilogue_warpgroups):
+            self._register_scratch(smem_workspace, warpgroup)
+
+    def _region_name(self, name: str, warpgroup: int) -> str:
+        return name if warpgroup == 0 else f"{name}.wg{warpgroup}"
+
+    def _register_scratch(self, smem_workspace: SmemWorkspace, warpgroup: int) -> None:
+        overlay = smem_workspace.create_overlay(self._region_name(self.smem_scratch_overlay, warpgroup))
         overlay.add_lifetime("fc1_staging").register_tensor(
-            self.fc1_staging_region, cutlass.Int8, (self.fc1_staging_bytes,), byte_alignment=128
+            self._region_name(self.fc1_staging_region, warpgroup), cutlass.Int8, (self.fc1_staging_bytes,), byte_alignment=128
         )
         if self.fc2_staging_spec is not None:
             overlay.add_lifetime("fc2_staging").register_tensor(
-                self.fc2_staging_region,
+                self._region_name(self.fc2_staging_region, warpgroup),
                 self.fc2_staging_spec.dtype,
                 self.fc2_staging_spec.shape,
                 stride=self.fc2_staging_spec.stride,
@@ -1204,7 +1233,6 @@ class SwapABGatedActEpilogue(KernelComponent):
             fc2_tensor = None
         return fc1_atom, fc1_tensor, fc2_atom, fc2_tensor
 
-    @cute.jit
     def run(
         self,
         smem_workspace: SmemWorkspace,
@@ -1228,6 +1256,44 @@ class SwapABGatedActEpilogue(KernelComponent):
         fc2_output_sf: Optional[cute.Tensor],
         peer_rank_ptr_mapper: Optional[SymmetricBufferDevice],
         optional_epi_args: Optional[GatedActEpilogueArgs] = None,
+        warpgroup: int = 0,
+    ):
+        if cutlass.const_expr(warpgroup >= self.epilogue_warpgroups):
+            raise ValueError(f"epilogue warpgroup {warpgroup} of {self.epilogue_warpgroups}.")
+        SwapABGatedActEpilogue._trace_warpgroup = warpgroup
+        try:
+            self._run(
+                smem_workspace, smem_base, tmem_ptr, acc_pipeline, sched_consumer, kernel_extension,
+                tma_atom_fc1_output, fc1_output, fc1_output_sf, tma_atom_fc2_output, fc2_tma_output,
+                fc2_output, fc1_done_counter, tidx, token_src_metadata, fc2_done_counter, fc2_output_sf,
+                peer_rank_ptr_mapper, optional_epi_args, warpgroup,
+            )
+        finally:
+            SwapABGatedActEpilogue._trace_warpgroup = 0
+
+    @cute.jit
+    def _run(
+        self,
+        smem_workspace: SmemWorkspace,
+        smem_base: cute.Pointer,
+        tmem_ptr: cute.Pointer,
+        acc_pipeline,
+        sched_consumer: SchedulerConsumer,
+        kernel_extension: BlockScaledSwapAbFc12Extension,
+        tma_atom_fc1_output: cute.CopyAtom,
+        fc1_output: cute.Tensor,
+        fc1_output_sf: cute.Tensor,
+        tma_atom_fc2_output: Optional[cute.CopyAtom],
+        fc2_tma_output: Optional[cute.Tensor],
+        fc2_output: cute.Tensor,
+        fc1_done_counter: cute.Tensor,
+        tidx: cutlass.Int32,
+        token_src_metadata: Optional[cute.Tensor],
+        fc2_done_counter: Optional[cute.Tensor],
+        fc2_output_sf: Optional[cute.Tensor],
+        peer_rank_ptr_mapper: Optional[SymmetricBufferDevice],
+        optional_epi_args: Optional[GatedActEpilogueArgs],
+        warpgroup: cutlass.Constexpr,
     ):
         if cutlass.const_expr(not smem_workspace.finalized):
             raise RuntimeError("SwapABGatedActEpilogue.run requires a finalized SmemWorkspace.")
@@ -1235,9 +1301,9 @@ class SwapABGatedActEpilogue(KernelComponent):
             optional_epi_args = GatedActEpilogueArgs(
                 fc1_alpha=None, fc2_alpha=None, fc1_norm_const=None, topk_scores=None
             )
-        fc1_staging_pointer = smem_workspace.ptr(self.fc1_staging_region, smem_base)
+        fc1_staging_pointer = smem_workspace.ptr(self._region_name(self.fc1_staging_region, warpgroup), smem_base)
         if cutlass.const_expr(self.fc2_tma_stages > 0):
-            fc2_smem_tensor = smem_workspace.tensor(self.fc2_staging_region, smem_base)
+            fc2_smem_tensor = smem_workspace.tensor(self._region_name(self.fc2_staging_region, warpgroup), smem_base)
         else:
             fc2_smem_tensor = None
         if cutlass.const_expr(self.fc2_use_tma and (tma_atom_fc2_output is None or fc2_tma_output is None)):
@@ -1283,6 +1349,9 @@ class SwapABGatedActEpilogue(KernelComponent):
         acc_consumer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.num_accumulator_pipeline_stages
         )
+        if cutlass.const_expr(warpgroup == 1):
+            # S2: warpgroup w consumes accumulator stages w, w+2, ... (tile k -> warpgroup k % 2).
+            acc_consumer_state.advance()
         wait_only_named_barrier = self.epilogue_sync_barrier()
         work_tile_info = sched_consumer.consume_work()
 
@@ -1294,41 +1363,77 @@ class SwapABGatedActEpilogue(KernelComponent):
             thread_idx=tidx % (self._EpilogueWarpCnt * 32),
         )
 
-        while work_tile_info.is_valid_tile:
-            tmem_acc_current = tmem_acc[None, None, acc_consumer_state.index]
-            if work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1):
-                fc1_epi(
-                    work_tile_info=work_tile_info,
-                    tmem_acc_tensor=tmem_acc_current,
-                    acc_pipeline=acc_pipeline,
-                    acc_consumer_state=acc_consumer_state,
-                )
-            else:
-                fc2_epi(
-                    work_tile_info=work_tile_info,
-                    tmem_acc_tensor=tmem_acc_current,
-                    acc_pipeline=acc_pipeline,
-                    acc_consumer_state=acc_consumer_state,
-                )
-            prev_work_tile_info = work_tile_info
-            cur_was_linear1 = prev_work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1)
+        if cutlass.const_expr(self.epilogue_warpgroups == 2):
+            tile_parity = cutlass.Int32(0)
+            while work_tile_info.is_valid_tile:
+                if tile_parity == cutlass.Int32(warpgroup):
+                    tmem_acc_current = tmem_acc[None, None, acc_consumer_state.index]
+                    if work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1):
+                        fc1_epi(
+                            work_tile_info=work_tile_info,
+                            tmem_acc_tensor=tmem_acc_current,
+                            acc_pipeline=acc_pipeline,
+                            acc_consumer_state=acc_consumer_state,
+                        )
+                    else:
+                        fc2_epi(
+                            work_tile_info=work_tile_info,
+                            tmem_acc_tensor=tmem_acc_current,
+                            acc_pipeline=acc_pipeline,
+                            acc_consumer_state=acc_consumer_state,
+                        )
+                    done_tile_info = work_tile_info
+                    done_was_linear1 = done_tile_info.phase == cutlass.Int32(BlockPhase.Linear1)
+                    acc_consumer_state.advance()
+                    acc_consumer_state.advance()
+                    work_tile_info = sched_consumer.consume_work()
+                    cute.arch.cp_async_bulk_wait_group(0)
+                    wait_only_named_barrier.arrive_and_wait()
+                    # Per-tile flags (batch 1): published before this warpgroup waits again.
+                    if done_was_linear1:
+                        flag_tracker = fc1_epi.signal_fc1_done(done_tile_info, work_tile_info, flag_tracker)
+                    else:
+                        flag_tracker = fc2_epi.signal_fc2_done(done_tile_info, work_tile_info, flag_tracker)
+                else:
+                    work_tile_info = sched_consumer.consume_work()
+                tile_parity = tile_parity ^ cutlass.Int32(1)
+            flag_tracker.fire()
+        else:
+            while work_tile_info.is_valid_tile:
+                tmem_acc_current = tmem_acc[None, None, acc_consumer_state.index]
+                if work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1):
+                    fc1_epi(
+                        work_tile_info=work_tile_info,
+                        tmem_acc_tensor=tmem_acc_current,
+                        acc_pipeline=acc_pipeline,
+                        acc_consumer_state=acc_consumer_state,
+                    )
+                else:
+                    fc2_epi(
+                        work_tile_info=work_tile_info,
+                        tmem_acc_tensor=tmem_acc_current,
+                        acc_pipeline=acc_pipeline,
+                        acc_consumer_state=acc_consumer_state,
+                    )
+                prev_work_tile_info = work_tile_info
+                cur_was_linear1 = prev_work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1)
 
-            acc_consumer_state.advance()
+                acc_consumer_state.advance()
 
-            work_tile_info = sched_consumer.consume_work()
+                work_tile_info = sched_consumer.consume_work()
 
-            # Every asynchronous store commits at issue; drain before completion or scratch reuse.
-            cute.arch.cp_async_bulk_wait_group(0)
-            # _fence_rel_gpu()
-            wait_only_named_barrier.arrive_and_wait()
+                # Every asynchronous store commits at issue; drain before completion or scratch reuse.
+                cute.arch.cp_async_bulk_wait_group(0)
+                # _fence_rel_gpu()
+                wait_only_named_barrier.arrive_and_wait()
 
-            # Publish completion for the work tile snapshotted above.
-            if cur_was_linear1:
-                flag_tracker = fc1_epi.signal_fc1_done(prev_work_tile_info, work_tile_info, flag_tracker)
-            else:
-                flag_tracker = fc2_epi.signal_fc2_done(prev_work_tile_info, work_tile_info, flag_tracker)
-        # Tail flush
-        flag_tracker.fire()
+                # Publish completion for the work tile snapshotted above.
+                if cur_was_linear1:
+                    flag_tracker = fc1_epi.signal_fc1_done(prev_work_tile_info, work_tile_info, flag_tracker)
+                else:
+                    flag_tracker = fc2_epi.signal_fc2_done(prev_work_tile_info, work_tile_info, flag_tracker)
+            # Tail flush
+            flag_tracker.fire()
 
 
 class _ImmutableAfterInit:
@@ -1586,7 +1691,7 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
             cute.group_modes(fc1_gmem_subtile_view, 0, 2),
         )
 
-        subtile_bar_id = subtile_idx + cutlass.Int32(SwapABGatedActEpilogue._EpilogueAsyncBarIdBase)
+        subtile_bar_id = SwapABGatedActEpilogue.subtile_async_bar_id(subtile_idx)
         tma_ready_to_read_smem_named_barrier = pipeline.NamedBarrier(
             barrier_id=subtile_bar_id, num_threads=self._EpilogueWarpCnt * 32
         )

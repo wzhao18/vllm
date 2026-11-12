@@ -36,8 +36,34 @@
     verbatim.
   - Outputs are bit-identical to stock (the GEMMs, SiTU and the top-k reduction order
     are unchanged); measured -9..-12 us per launch at decode buckets on VR.
-  - The kernel file (`block_scaled_swap_ab_mega_moe_kernel.py`) is unchanged; it uses
+  - The kernel file (`block_scaled_swap_ab_mega_moe_kernel.py`) is unchanged by S1 (S2 below changes it); it uses
     only `token_comm` entry points whose signatures S1 keeps.
+
+- **S2** (vLLM-local, not upstream) in `sources/kernel_src/rubin/inference/mega/`
+  `block_scaled_swap_ab_mega_moe_kernel.py`, `block_scaled_swap_ab_fc12_epilogue.py` and
+  `block_scaled_swap_ab_fc12_mainloop.py` (FlashInfer 0.7.3.dev20261031 sha256, in that order:
+  `a578368593bed9cf91b8dacf16fa65f8ab822a3001bb457e053f2b4b179013a0`,
+  `b4e8bf2729618064678aa11cc5c38476626f13cd97d40f675a9fbe3ced71dd02`,
+  `601a5a53da27d04f6dd98cbe9eb408159bce8b0a5f26f8611b1d39339c22cf24`;
+  local sha256 in the manifest below): a second epilogue warpgroup.
+  - Why: at the C512 prefill shape (EP16 per-rank load, 8192-token bucket) the epilogue
+    (SiTU + NVFP4 requant for FC1, BF16 token-back for FC2) issues from one warp per SM
+    sub-partition and took ~3.5x the MMA time per tile (ncu: tensor pipe 26% active,
+    epilogue warps busy the whole kernel at CPI ~3.7-4.9, XU 23%, L2 67%).
+  - What: warps 12-15 become a second epilogue warpgroup. Work tile k (one accumulator
+    stage) goes to warpgroup k % 2; each warpgroup consumes every scheduler tile, waits on
+    and releases only its own accumulator stages, and has its own SMEM scratch and named
+    barriers (sync 3, subtiles 8/11/14/15; the TMEM-allocation barrier 2 is reused for the
+    end-of-epilogue rendezvous before TMEM is freed). Done flags are published per tile
+    (epi_flag_batches forced to (1, 1): a warpgroup must not hold a flag while it waits for a
+    later stage that the other warpgroup's flags gate). Registers: epilogue 184, others
+    64/72 (512 threads).
+  - When (automatic, trace-time, no knob/env): inference kernel, epi_warps token-back,
+    2CTA, tile N 128 or 256, and `max_tokens_per_rank * topk > 2048 * 16`. Every other
+    launch (decode buckets, C256 2048 bucket, genphase) traces the stock code; the kernel
+    name gains `_epiwg{1,2}`.
+  - Outputs are bit-identical (same per-tile math and top-k reduction order; checked by an
+    output fingerprint on every A/B point in `$W/hti/p2/megamoe-prefill`).
 
 ## Rewrite rule
 
@@ -100,11 +126,11 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/kernel
 fbea697f91fe5c5f1623568cb3ed45951905c2428bf2a49f330943ed910df4bc  sources/kernel_src/rubin/custom_mix_cga_helpers.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/kernel_src/rubin/inference/__init__.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sources/kernel_src/rubin/inference/mega/__init__.py
-b4e8bf2729618064678aa11cc5c38476626f13cd97d40f675a9fbe3ced71dd02  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_epilogue.py
+61b09a92891324247afc6eaf2de67ae2750e14401e16ad9b0b063a100cef07d3  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_epilogue.py
 6355b04c8672b40e96d2ae1a3309650e1e06eadaf3172e3ccaf2a2b51a88f740  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_extension.py
-601a5a53da27d04f6dd98cbe9eb408159bce8b0a5f26f8611b1d39339c22cf24  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop.py
+ed192f39cce199441a3116869898f0c1c275aeb0ac5218d809b8d3f0b68be7ed  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop.py
 e7f3aa713f90170f3f2c4b616af7a338ee4cb3cdef34621cb21e6ad8a90aabf6  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop_gen_specialized.py
-a578368593bed9cf91b8dacf16fa65f8ab822a3001bb457e053f2b4b179013a0  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py
+79b209e7611cb80603a79ea159ac0bc85ba7c020dcc47c19af4eafccdb3efedc  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py
 292cd6c6d62b9d6cb7a15e0f43363756941124a645c34be6947b5542282c3ee5  sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py
 d85b41f1f605c8ce4ae97696e4c8aad5f02eb95412eb42e20d0cfca2dcc4e54a  sources/kernel_src/rubin/inference/mega/dynamic_mainloop.py
 0fbc10e05282241250de08ccfaebd533076f29abdd3bb949c063cf80daf54496  sources/kernel_src/rubin/inference/mega/tma_gather.py
