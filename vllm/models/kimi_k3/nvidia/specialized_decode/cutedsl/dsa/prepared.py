@@ -44,6 +44,7 @@ from vllm.logger import init_logger
 
 from ...shapes import Shape, full_capture, refuse, target_topology
 from ..common.host import fake, layout, stream, to_cute
+from ..common.policy import batch_table
 from ..mla.prepared import pad_requests
 from ..mla.query import GB300_SMS
 from ..mla.value import MlaValue
@@ -71,6 +72,7 @@ from .overlap import (
     MODES,
     NORM,
     QUERY_OVERLAP_UNFUSED,
+    index_stream,
     overlap_for,
     side_stream,
 )
@@ -243,6 +245,7 @@ class PreparedDsa:
         prims_ts_rows=None,
         core="auto",
         partials=None,
+        priority=None,
     ):
         from vllm.model_executor.layers.linear import UnquantizedLinearMethod
         from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseImpl
@@ -300,6 +303,17 @@ class PreparedDsa:
         self.overlaps = {
             (b, q): overlap_for(b, overlap, self.dcp > 1, self.rubin)
             for b, q in self.shapes
+        }
+        # The batches whose indexer chain runs on the high-priority index stream
+        # (``priority``: an overlap.INDEX_PRIORITY "rows:chain" table; forked query
+        # modes under DCP only, where MlaQuery runs beside the chain).
+        table = batch_table(priority) if priority else {}
+        if set(table.values()) - {"chain"}:
+            raise ValueError(f"Kimi K3.1 DSA index priority {priority!r}: not chain")
+        self.prioritized = {
+            (b, q)
+            for (b, q), mode in self.overlaps.items()
+            if self.dcp > 1 and mode in ("fork", "front") and table.get(b) == "chain"
         }
         if self.fp8:
             if kernels is None:
@@ -703,7 +717,9 @@ class PreparedDsa:
             stage.run_query(query, projected, cache, slots, publish)
             if wait is not None:
                 wait(*mailbox, stream(self.device))
-        return lambda: main.wait_stream(side)
+        # The joining stream is the one the sparse core runs on (main, or the
+        # index stream of a prioritized batch).
+        return lambda: torch.cuda.current_stream(self.device).wait_stream(side)
 
     def run_index(self, kernel, projected, index_slots, q):
         """The indexer inputs: wq_b and DsaIndex (``kernel``), or the fused index
@@ -788,15 +804,26 @@ class PreparedDsa:
         publish = publish_args(box, p)
         sparse = self.core_step(batch, q) if self.dsac is not None else None
         join = self.run_query(projected, cache, slots, q, publish, sparse is None)
-        self.run_index(index, projected, index_slots, q)
         uv = stage.views[4]
         if sparse is not None:  # the DSA sparse core, then DcpValue(pushed)
+            self.run_index(index, projected, index_slots, q)
             self.sparse_dcp_core(sparse, cache, metadata, batch, q, join)
             assert box.mailbox(batch).format == "bf16"
             buffers = self.fi.latent, self.fi.lse
             args = sparse[1], box, p, publish, self.heads, buffers, lengths[:reqs], uv
             return run_core_value(*args, projected, out)
-        core = self.dcp_core(cache, None, metadata, batch, projected, join, q)
+        if (batch, q) not in self.prioritized:
+            self.run_index(index, projected, index_slots, q)
+            core = self.dcp_core(cache, None, metadata, batch, projected, join, q)
+        else:
+            # wq_b through the sparse core on the high-priority index stream.
+            main = torch.cuda.current_stream(self.device)
+            hi = index_stream(self.device.index)
+            hi.wait_stream(main)
+            with torch.cuda.stream(hi):
+                self.run_index(index, projected, index_slots, q)
+                core = self.dcp_core(cache, None, metadata, batch, projected, join, q)
+            main.wait_stream(hi)
         w_uv = None
         if box.mailbox(batch).format == PROJECTED:
             uv, w_uv = self.uv_gathered[1], self.uv_gathered[0]
