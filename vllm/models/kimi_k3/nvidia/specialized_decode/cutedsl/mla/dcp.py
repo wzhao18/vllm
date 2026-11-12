@@ -319,6 +319,16 @@ DRAFT_CAKE_LAUNCHED = {
 # Drafter rows the cake rule covers per q (DL3: the fold rows 9-63 and the wide rows
 # 66-480; DL7: 14-63 and 70-448), where a launched split above 1 exists.
 DRAFT_CAKE_ROWS = {3: range(9, 481, 3), 7: range(14, 449, 7)}
+# The wide rows' fewest launched splits: a twin rule launching 2 (the verify's
+# (1, 2, 64, 128) at 516-768 twin rows: the drafter's DL3 387-480 rows, B129-B160)
+# launches 3 instead. The 2-split partition leaves the persistent core's 106 CTA pairs
+# unevenly loaded: 0.83 us per M128 x 128-key tile per pair vs 0.65 elsewhere. 4 x VR200,
+# the drafter layer (DraftDcp.merge, 96 gathered heads, causal DL3, the C256 core's
+# local AgentX lengths), core us per layer, launched 2 -> 3 (-> 4): B129 302 -> 240
+# (241), B140 305 -> 239 (240), B160 340 -> 283 (289); B90's 4 and C512 B52 / B64's
+# 4 unchanged by 6 or 8 (163 -> 169, 352 -> 351 / 354, 457 -> 458). Outputs within
+# the stock check (the split fold sums in another order, FP32).
+DRAFT_WIDE_MIN_LAUNCH = 3
 
 
 def _cake_rules(cake=None, launch=None):
@@ -335,6 +345,8 @@ def _cake_rules(cake=None, launch=None):
                 if twin is None:
                     continue
                 launched, floor, over = (twin[1], *wide) if r > 64 else fold
+                if r > 64:
+                    launched = max(launched, DRAFT_WIDE_MIN_LAUNCH)
                 if r <= 64:
                     launched = launch.get(size, {}).get((q, r), launched)
                 if launched > 1:
