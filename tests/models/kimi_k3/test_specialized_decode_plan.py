@@ -801,6 +801,7 @@ def test_kda_verify_kernels_take_the_state_dtype(q, requests, bf16_state):
     names = {
         prepared.KdaVerifyWide: "wide",
         prepared.KdaVerifyLoopStock: "loopstock",
+        prepared.KdaVerifyFeed: "feed",
         prepared.KdaVerifyHalves: "halves",
         prepared.KdaVerifyStream: "stream",
         prepared.KdaVerifyStream3: "stream3",
@@ -835,10 +836,11 @@ def kda_runs(kinds):
 
 # FP32 state (production): FP32_VERIFY_WIDE, the VR200 kernel bench's measured-best
 # kernel per (q, requests) (kda.prepared's table notes), open-ended above the last row.
-# Since 2026-11-08 the Wide rows run KdaVerifyLoopStock (stock math, persistent).
+# Since 2026-11-08 the Wide rows run KdaVerifyLoopStock (stock math, persistent);
+# since 2026-11-11 the q4 rows from 41 requests KdaVerifyFeed (FP32_FEED).
 FP32_Q4_RUNS = [
     (1, 11, "kdasplit"), (12, 12, "loopstock"), (13, 15, "kdasplit"),
-    (16, 35, "loopstock"), (36, 40, "kdasplit"), (41, 1024, "loopstock"),
+    (16, 35, "loopstock"), (36, 40, "kdasplit"), (41, 1024, "feed"),
 ]  # fmt: skip
 FP32_Q8_RUNS = [
     (1, 11, "kdasplit"), (12, 12, "loopstock"), (13, 15, "kdasplit"),
@@ -882,10 +884,11 @@ def test_kda_fp32_policy_picks_the_measured_best():
     kind = prepared.verify_kernel
     wide = "loopstock"  # the Wide rows' kernel since 2026-11-08
     picks = {(4, 35): wide, (4, 36): "kdasplit", (4, 40): "kdasplit"}
-    picks.update({(4, 41): wide, (4, 48): wide, (8, 12): wide, (8, 48): wide})
+    picks.update({(4, 41): "feed", (4, 48): "feed", (8, 12): wide, (8, 48): wide})
     for (q, b), name in picks.items():
         assert kind(b, q, RUBIN, False) == name, (q, b)
-    assert {kind(b, 4, RUBIN, False) for b in range(1, 1025)} <= {"kdasplit", wide}
+    q4_kinds = {kind(b, 4, RUBIN, False) for b in range(1, 1025)}
+    assert q4_kinds <= {"kdasplit", wide, "feed"}
     assert {kind(b, 8, RUBIN, False) for b in range(1, 1025)} <= {"kdasplit", wide}
     assert kind(48, 8, RUBIN, True) == "halves"
     assert [kind(b, 4, RUBIN, True) for b in (35, 36, 64, 65)] == ["wide"] + [
@@ -911,11 +914,15 @@ def test_kda_fp32_verify_is_stock_math_at_every_q():
     for q in (2, 4, 5, 8):
         for b in (1, 8, 16, 36, 48, 64, 256):
             kernel = kda_kernel(b, q, False)
-            stock = (prepared.KdaVerifyLoopStock, prepared.KdaSplitStock)
+            stock = (
+                prepared.KdaVerifyLoopStock, prepared.KdaVerifyFeed,
+                prepared.KdaSplitStock,
+            )  # fmt: skip
             assert type(kernel) in stock, (q, b, type(kernel))
             assert prepared.verify_kernel(b, q, RUBIN, False, 0, 24) in (
                 "kdasplit",
                 "loopstock",
+                "feed",
             )
 
 

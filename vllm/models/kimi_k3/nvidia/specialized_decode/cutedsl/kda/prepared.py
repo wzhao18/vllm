@@ -21,6 +21,7 @@ from ..common.policy import batch_table
 from .kernel import KdaSplit
 from .recover import KdaSplit as RecoverKdaSplit
 from .verify import KdaVerifyCols, KdaVerifyPrepared, KdaVerifyRows
+from .verify_feed import KdaVerifyFeed
 from .verify_loop import KdaVerifyLoop, KdaVerifyLoopStock
 from .verify_packed import KdaVerifyPacked
 from .verify_stream import KdaVerifyStream
@@ -213,10 +214,10 @@ FP32_VERIFY_WIDE: dict = {
 # Plain verify kernels by VERIFY_WIDE / VERIFY_Q "wide" value (0: KdaSplit).
 WIDE_KINDS = (
     KdaVerifyWide, KdaVerifyHalves, KdaVerifyStream, KdaVerifyStream3, KdaVerifyPacked,
-    KdaVerifyLoop, KdaVerifyLoopStock,
+    KdaVerifyLoop, KdaVerifyLoopStock, KdaVerifyFeed,
 )
 WIDE_NAMES = ("kdasplit", "wide", "halves", "stream", "stream3", "packed",
-              "loop", "loopstock")
+              "loop", "loopstock", "feed")
 # Values whose kernel holds the base state as BF16 (KdaVerifyStream / Stream3: S0
 # staged as BF16 pairs and, in Stream3, fed exactly to BF16 tensor-core MMAs; their
 # constructor asserts a BF16 state). An FP32 state (--mamba-ssm-cache-dtype float32)
@@ -235,6 +236,15 @@ WIDE_NAMES = ("kdasplit", "wide", "halves", "stream", "stream3", "packed",
 # COLS at B8 swept with an FP32 state; the stock S1 crossover (STOCK_ROWS) too.
 # (FP32_WIDE: KdaVerifyLoopStock, FP32 state only; a BF16 state at q > 4 runs Wide.)
 BF16_ONLY, FP32_WIDE, KIND_WIDE = (3, 4), 7, 1
+# FP32 state: request counts per q whose FP32_WIDE rows run ``KdaVerifyFeed`` (8,
+# kda.verify_feed: LoopStock bit for bit, its per-item prologue and gated norm on
+# feed warps beside the recurrence warps; q <= 4) instead of ``KdaVerifyLoopStock``.
+# VR200 kernel bench (1 GPU, 69 layers, own cold FP32 slots, CUDA graph, us per
+# layer), LoopStock -> Feed, q4: B41 15.52 -> 14.22, B64 16.19 -> 14.86, B90 23.15
+# -> 20.64, B140 32.70 -> 28.44, B256 62.87 -> 55.94, B512 117.63 -> 106.04; one
+# item per CTA (B12-35: +0.4..+1.1) stays LoopStock.
+FP32_FEED: dict = {(10, 7): {4: "41-:1"}}
+FP32_FEED_KIND = 8
 
 
 class KdaSplitStock(RecoverKdaSplit):
@@ -332,6 +342,9 @@ def wide_kind(requests, tokens, capability, bf16_state=False, gate_mode=0, heads
         kind = table[max(table)]
     if kind and not bf16_state:  # the stock-math wide verify (FP32_VERIFY_WIDE)
         kind = FP32_WIDE
+        feed = batch_table(FP32_FEED.get(capability, {}).get(tokens, ""))
+        if feed.get(requests):  # LoopStock with feed warps (bitwise)
+            kind = FP32_FEED_KIND
     if kind in BF16_ONLY and tokens > 4:
         kind = KIND_WIDE
     return kind or 0
