@@ -19,8 +19,10 @@ Per layer, each rank
    its DCP-local paged cache into its own region (``pack``: local HBM only);
 2. lets the copy engine copy that region's context rows into the same region
    of every peer's workspace, on a side stream, while the indexer runs; then
-   writes the layer's epoch into each peer's flag word (``cuStreamWriteValue32``,
-   ordered after the copies, with its memory barrier);
+   a one-warp kernel on that stream, ordered after the copies, stores the
+   layer's epoch into each peer's flag word (a system-scope release store
+   over NVLink: ``cuStreamWriteValue32`` into a peer's memory fails with
+   CUDA_ERROR_INVALID_VALUE when the peer is on another MNNVL node);
 3. before the sparse attention, waits on its own stream until every peer's
    flag word holds the epoch (``cuStreamWaitValue32``).
 
@@ -244,6 +246,55 @@ class RankMajorPackKernel(VllmTritonJitKernel["RankMajorPackKernel.CompileKey"])
 RANK_MAJOR_PACK_KERNEL = RankMajorPackKernel()
 
 
+class RankMajorSignalKernel(VllmTritonJitKernel["RankMajorSignalKernel.CompileKey"]):
+    """Store ``epoch`` into this rank's flag word on every peer (release, system
+    scope), after the copies queued before it on the same stream."""
+
+    @dataclass(frozen=True)
+    class CompileKey:
+        world: int
+
+    @staticmethod
+    @triton.jit(do_not_specialize=["rank", "epoch"])
+    def dcp_shardq_rank_major_signal_kernel(
+        peer_flags,
+        rank,
+        epoch,
+        WORLD: tl.constexpr,
+    ):
+        peer = tl.program_id(0)
+        if peer != rank:
+            flag = tl.load(peer_flags + peer).to(tl.pointer_type(tl.int32))
+            tl.atomic_xchg(flag, epoch, sem="release", scope="sys")
+
+    kernel = dcp_shardq_rank_major_signal_kernel
+
+    def dispatch(self, *, world: int) -> CompileKey:  # type: ignore[override]
+        return self.CompileKey(world=world)
+
+    def get_warmup_keys(  # type: ignore[override]
+        self, *, world: int
+    ) -> list[CompileKey]:
+        return [self.dispatch(world=world)]
+
+    def warmup_inputs(self, compile_key: CompileKey) -> dict[str, Any]:
+        return dict(
+            peer_flags=TritonWarmupTensor(torch.int64),
+            rank=0,
+            epoch=1,
+            world=compile_key.world,
+        )
+
+    @kernel_launcher
+    def __call__(
+        self, peer_flags: torch.Tensor, rank: int, epoch: int, world: int
+    ) -> LaunchSpec:
+        return (world,), dict(WORLD=world, num_warps=1)
+
+
+RANK_MAJOR_SIGNAL_KERNEL = RankMajorSignalKernel()
+
+
 def pack(
     plan: RankMajorPlan,
     mla_cache: torch.Tensor,
@@ -287,6 +338,8 @@ class _Flags:
     local: torch.Tensor
     # This rank's word on every peer.
     peer_addrs: list[int]
+    # int64 [world]: ``peer_addrs`` on the device, for the signal kernel.
+    peer_addrs_gpu: torch.Tensor
 
 
 _flags: dict[str, _Flags] = {}
@@ -312,7 +365,11 @@ def reserve_flags(group, world: int, rank: int, device: torch.device) -> _Flags:
             + rank * 4
             for peer in range(world)
         ]
-        flags = _flags[key] = _Flags(buf.storage[:world], peer_addrs)
+        flags = _flags[key] = _Flags(
+            buf.storage[:world],
+            peer_addrs,
+            torch.tensor(peer_addrs, dtype=torch.int64, device=device),
+        )
         _epochs[key] = itertools.count(1)
     return flags
 
@@ -377,7 +434,9 @@ def copy_to_peers(
 ) -> InFlight:
     """On the side stream, once ``after`` (the pack) completed: copy this
     rank's region's context rows into every peer's workspace with the copy
-    engine, then publish the epoch into each peer's flag word for this rank."""
+    engine, then publish the epoch into each peer's flag word for this rank
+    (``RANK_MAJOR_SIGNAL_KERNEL``: stream memory operations cannot write a
+    peer on another MNNVL node)."""
     from cuda.bindings import driver
 
     flags = reserve_flags(group, plan.world, plan.rank, device)
@@ -407,13 +466,13 @@ def copy_to_peers(
                     handle,
                 )
             )
-        _check(
-            driver.cuStreamWriteValue32(
-                handle,
-                driver.CUdeviceptr(flags.peer_addrs[peer]),
-                epoch,
-                driver.CUstreamWriteValue_flags.CU_STREAM_WRITE_VALUE_DEFAULT,
-            )
+    with torch.cuda.stream(side):
+        # The epoch's int32 bit pattern (the waits compare it as an int32).
+        RANK_MAJOR_SIGNAL_KERNEL(
+            flags.peer_addrs_gpu,
+            rank,
+            epoch - (1 << 32) if epoch >= 1 << 31 else epoch,
+            plan.world,
         )
     done = torch.cuda.Event()
     done.record(side)
