@@ -1352,7 +1352,23 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             self.set_finished_request(req_meta.req_id)
             self.request_queue.task_done()
 
+    def _wait_load_ready(self, req_meta: ReqMeta) -> None:
+        """Block until the GPU work queued before the load was issued is done.
+
+        The store writes the blocks with RDMA, outside any CUDA stream; see
+        MooncakeStoreWorker.start_load_kv for why this event is sufficient.
+        A failure here raises into _handle_request, which reports the load
+        as failed (load errors first, then finished).
+        """
+        ready_event = req_meta.load_ready_event
+        if ready_event is None:
+            return
+        ready_event.synchronize()
+        if req_meta.load_issue_time is not None:
+            self._record_operation("load_wait_ready", req_meta.load_issue_time, 0)
+
     def _handle_load(self, req_meta: ReqMeta):
+        self._wait_load_ready(req_meta)
         token_len = req_meta.load_spec.token_len  # type: ignore[union-attr]
         req_id = req_meta.req_id
         mask_num = (
@@ -2319,24 +2335,44 @@ class MooncakeStoreWorker:
         return totals
 
     def start_load_kv(self, metadata: MooncakeStoreConnectorMetadata):
-        """Issue async loads.
+        """Issue this step's async loads.
 
-        Runs after the forward launch on steps without sync loads
-        (SchedulerOutput.has_sync_kv_loads), keeping load submission off
-        the critical path while preserving compute-I/O overlap.
+        Called by MooncakeStoreConnector.bind_connector_metadata, i.e. when
+        the model runner binds the step's metadata right before it launches
+        the forward, instead of after that launch: the loads into blocks the
+        scheduler allocated for this step start one step earlier.
+
+        Submission is a queue put per request; the recv threads do the work.
+        Before writing any block, a recv thread waits for an event recorded
+        here on the current (compute) stream. Every GPU op queued before
+        this point has then completed: the forwards of all earlier steps
+        (any of which may have written a block's previous owner) and this
+        step's block zeroing and copy-on-write copies. GPU work queued after
+        this point never touches these blocks: they belong to requests that
+        wait for this load (WAITING_FOR_REMOTE_KVS) and are not cached yet.
         """
         if self._capacity_only:
             return
-
-        for request in metadata.requests:
-            load_spec = request.load_spec
-            if load_spec is None or not load_spec.can_load:
-                continue
-
-            load_spec.token_len = load_spec.kvpool_cached_tokens
-            self.recv_request_queue.put(request)
-
         assert self.load_async, "load_async must be True for better performance."
+
+        loads = [
+            request
+            for request in metadata.requests
+            if request.load_spec is not None and request.load_spec.can_load
+        ]
+        if not loads:
+            return
+
+        ready_event = torch.cuda.Event()
+        ready_event.record()
+        issue_time = time.perf_counter()
+        for request in loads:
+            load_spec = request.load_spec
+            assert load_spec is not None
+            load_spec.token_len = load_spec.kvpool_cached_tokens
+            request.load_ready_event = ready_event
+            request.load_issue_time = issue_time
+            self.recv_request_queue.put(request)
 
     def poll_finished_recving(self) -> set[str]:
         """Drain loads that finished without error, for an early report.

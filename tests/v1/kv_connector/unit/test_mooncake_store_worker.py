@@ -4682,10 +4682,14 @@ def test_start_load_kv_queues_async_load():
     meta = mooncake_store_worker.MooncakeStoreConnectorMetadata(set(), set())
     meta.add_request(req)
 
-    w.start_load_kv(meta)
+    with patch.object(torch.cuda, "Event") as event_cls:
+        w.start_load_kv(meta)
 
     assert req.load_spec.token_len == 32
     assert w.recv_request_queue.get_nowait() is req
+    # The load is ordered after the GPU work queued before it was issued.
+    event_cls.return_value.record.assert_called_once_with()
+    assert req.load_ready_event is event_cls.return_value
 
 
 def test_putting_consumer_queues_decode_save():
