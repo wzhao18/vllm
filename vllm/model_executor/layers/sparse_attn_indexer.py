@@ -975,12 +975,15 @@ def sparse_attn_indexer(
     )
     if not (skip_topk_buffer_clear or decode_fills_all):
         topk_indices_buffer[: hidden_states.shape[0]] = -1
-    if has_prefill:
+    if has_prefill and prefill_chunks is None:
         prefill_metadata = attn_metadata_narrowed.prefill
         assert prefill_metadata is not None
-        if prefill_chunks is None:
-            prefill_chunks = prefill_metadata.chunks
-
+        prefill_chunks = prefill_metadata.chunks
+    # A DCP ShardQ rank owning none of the step's prefill rows (a prefill of
+    # fewer tokens than 2 x the DCP size can leave a rank no fold rows) has
+    # no chunks: it scores nothing and only takes part in the group gathers
+    # (the elif below), like every other rank.
+    if has_prefill and prefill_chunks:
         # Get the shared workspace buffers once, sized for this batch's largest
         # chunk rather than the profiled bound (total_seq_lens), so the scratch
         # stays at the workspace head and leaves retained tail spans intact.
@@ -1218,7 +1221,8 @@ def sparse_attn_indexer(
             del logits, bf16_logits
     elif prefill_chunk_iter is not None:
         # The MLA layer attends the gathered context whether or not this
-        # indexer scored prefill rows: gather every group as before.
+        # indexer (or this rank) scored prefill rows: gather every group as
+        # before. The gathers are collective, so every rank runs them.
         for _ in prefill_chunk_iter:
             pass
 

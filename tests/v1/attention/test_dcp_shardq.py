@@ -847,7 +847,7 @@ def test_dense_mha_step_mqa_rows_beyond_the_lse_slab():
     assert torch.equal(lse, ref_lse)
 
 
-def _distributed_worker(rank, world, init_file, cache_dtype, kernel):
+def _distributed_worker(rank, world, init_file, cache_dtype, kernel, lens):
     """One rank of a DCP = TP group: the production gather, indexer and
     attention over the gathered context against TP ShardQ over the replicated
     caches, bit for bit, for two layers through the same workspace."""
@@ -890,9 +890,6 @@ def _distributed_worker(rank, world, init_file, cache_dtype, kernel):
             tensor_model_parallel_size=world, decode_context_model_parallel_size=world
         )
         init_workspace_manager(device)
-        # Requests within the top-k, so every row selects all its keys: the
-        # top-k kernels break ties between equal scores nondeterministically.
-        lens = [(1000, 300), (513, 64), (0, 700), (1, 63)]
         layout = _layout(cache_dtype)
         seq_lens = [c + n for c, n in lens]
         num_tokens = sum(n for _, n in lens)
@@ -1047,15 +1044,36 @@ def _distributed_worker(rank, world, init_file, cache_dtype, kernel):
             cleanup_dist_env_and_memory()
 
 
+# Requests within the top-k, so every row selects all its keys: the top-k
+# kernels break ties between equal scores nondeterministically. The tiny
+# prefills (fewer tokens than 2 x the DCP size, like the engine's 5-token
+# warm-up step at DCP16) leave some ranks no ShardQ rows, hence no indexer
+# chunks: those ranks score nothing but still join every gather.
+GATHERED_STEP_LENS = {
+    "mixed": [(1000, 300), (513, 64), (0, 700), (1, 63)],
+    "one_token": [(0, 1)],
+    "three_tokens": [(0, 3)],
+    "two_tokens_with_context": [(40, 2)],
+    "two_tiny_requests": [(0, 1), (7, 2)],
+}
+
+
 @pytest.mark.skipif(torch.accelerator.device_count() < 2, reason="needs 2 GPUs")
 @pytest.mark.parametrize(("cache_dtype", "kernel"), KERNEL_CASES)
-def test_gathered_context_step_matches_tp_shardq(cache_dtype, kernel, tmp_path):
+@pytest.mark.parametrize("lens", list(GATHERED_STEP_LENS))
+def test_gathered_context_step_matches_tp_shardq(cache_dtype, kernel, lens, tmp_path):
     import torch.multiprocessing as mp
 
     world = min(torch.accelerator.device_count(), 4)
     mp.spawn(
         _distributed_worker,
-        args=(world, str(tmp_path / "dist_init"), cache_dtype, kernel),
+        args=(
+            world,
+            str(tmp_path / "dist_init"),
+            cache_dtype,
+            kernel,
+            GATHERED_STEP_LENS[lens],
+        ),
         nprocs=world,
     )
 
