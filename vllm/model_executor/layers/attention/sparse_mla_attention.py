@@ -963,27 +963,38 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: T,
         layer: AttentionLayer,
+        *,
+        row_offset: int = 0,
+        num_step_rows: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """``q`` holds the step's rows [row_offset, row_offset + len(q)) of
+        ``num_step_rows`` (default: all of them). A DCP step's MQA may run in
+        row chunks (MLAAttention._dcp_mqa_in_row_chunks)."""
         assert self.topk_indices_buffer is not None
         num_tokens = q[0].shape[0] if isinstance(q, tuple) else q.shape[0]
-        topk = self.topk_indices_buffer[:num_tokens]
+        end = row_offset + num_tokens
+        if num_step_rows is None:
+            num_step_rows = end
+        topk = self.topk_indices_buffer[row_offset:end]
         num_decode_tokens = attn_metadata.num_decode_tokens
         block_size = attn_metadata.block_size
         index_group = self.index_group
+        # Row chunks are a DCP-path layout.
+        assert row_offset == 0 or self.dcp_world_size > 1
         if not isinstance(index_group, HiSparseMLAIndexGroup):
             _, block_stride_rows = flat_kv_row_view(kv_c_and_k_pe_cache, block_size)
             # A model's DCP decode exchange (sparse_attn_indexer.DCP_DECODE_TOPK_HOOKS)
             # left this rank's KV slots and their counts: nothing to convert.
             dcp_counts = (
-                self.dcp_local_topk_counts(num_tokens)
+                self.dcp_local_topk_counts(end)
                 if self.dcp_world_size > 1 and self.dcp_local_topk_counts is not None
                 else None
             )
             if dcp_counts is not None:
-                physical_topk, valid_counts = topk, dcp_counts
+                physical_topk, valid_counts = topk, dcp_counts[row_offset:]
             elif self.dcp_world_size > 1:
                 physical_topk, valid_counts = triton_filter_and_convert_dcp_index(
-                    attn_metadata.req_id_per_token[:num_tokens],
+                    attn_metadata.req_id_per_token[row_offset:end],
                     attn_metadata.block_table,
                     topk,
                     dcp_size=self.dcp_world_size,
@@ -1022,7 +1033,7 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
                 valid_counts,
                 layer=layer,
                 block_size=block_size,
-                is_decode=num_decode_tokens >= num_tokens,
+                is_decode=num_decode_tokens >= num_step_rows,
             )
 
         assert self.dcp_world_size == 1

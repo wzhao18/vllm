@@ -1768,6 +1768,237 @@ def test_profile_run_warms_the_dcp_path(cache_dtype, kernel, tmp_path):
     )
 
 
+# A dense-MHA step (every prefill request no longer than the top-k) whose MQA
+# rows, the MLA builder's decode rows (up to 1024 new tokens a request at 4
+# heads per rank), are ~15x the DCP-path rows the profile claims.
+DENSE_MHA_LENS = [(1000, 1000)] * 30 + [(0, 1100)]
+
+
+def _causal_topk(lens, num_rows: int) -> torch.Tensor:
+    """Every position up to each new token's (in random order; -1 pads the
+    row), for requests shorter than the top-k; the same on every rank."""
+    positions = torch.from_numpy(
+        np.concatenate([np.arange(c, c + n) for c, n in lens])[:num_rows]
+    ).cuda()
+    assert int(positions.max()) < TOPK
+    gen = torch.Generator(device="cuda").manual_seed(7)
+    keys = torch.rand(num_rows, TOPK, device="cuda", generator=gen)
+    cols = torch.arange(TOPK, device="cuda")
+    keys[cols[None, :] > positions[:, None]] = 2.0
+    order = keys.argsort(dim=1).int()
+    return torch.where(order <= positions[:, None], order, -1)
+
+
+def _dense_mha_worker(rank, world, init_file, cache_dtype, kernel, capture_size):
+    """One rank of a DCP = TP prefill instance with DCP ShardQ on the a2a DCP
+    backend. The planner leaves a dense-MHA step on the DCP path, which runs
+    MQA, with LSE, on the step's decode rows: 30000 here, against a profile
+    claim for ``dcp_path_max_rows`` rows. The layer runs them in chunks of
+    that many rows end to end (query gather, partials, combine, W_UV): the
+    step's peak memory stays below the profile run's, and its output is bit
+    for bit the single pass's, which peaks far above it.
+
+    With ``capture_size`` (the CUDA graph capture bound, as served) the DCP
+    workspace and the chunks are that many rows, so the chunks gather and
+    combine through the direct symmetric-memory workspace while the single
+    pass, beyond it, takes the NCCL fallback; without, both take NCCL."""
+    from tests.v1.attention.utils import create_vllm_config
+    from vllm.config import CUDAGraphMode, set_current_vllm_config
+    from vllm.distributed import (
+        cleanup_dist_env_and_memory,
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
+    from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
+        FlashInferMLASparseTRTLLMBackend,
+        trtllm_gen_lse_max_rows,
+    )
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    from vllm.v1.attention.ops.dcp_shardq import context as dcp
+    from vllm.v1.worker.workspace import init_workspace_manager
+
+    torch.accelerator.set_device_index(rank)
+    device = torch.device("cuda", rank)
+    max_tokens = 32768
+    config = create_vllm_config(
+        model_name=LAYER_MODEL,
+        tensor_parallel_size=world,
+        max_model_len=8192,
+        block_size=LAYER_BLOCK,
+        max_num_seqs=32,
+        max_num_batched_tokens=max_tokens,
+        hf_config_override={"index_topk": TOPK},
+    )
+    config.parallel_config.decode_context_parallel_size = world
+    config.parallel_config.dcp_comm_backend = "a2a"
+    config.cache_config.cache_dtype = cache_dtype
+    config.attention_config.backend = AttentionBackendEnum.FLASHINFER_MLA_SPARSE
+    config.kernel_config.flashinfer_sparse_mla_kernel = kernel
+    config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+    if capture_size is not None:
+        config.compilation_config.max_cudagraph_capture_size = capture_size
+    config.attention_config.sparse_mla_shard_q = True
+    dcp.workspace_max_tokens = lambda _: 8192
+    lens = DENSE_MHA_LENS
+    num_tokens = sum(n for _, n in lens)
+    num_mqa = sum(n for _, n in lens[:-1])
+    local_heads = LAYER_HEADS // world
+    with set_current_vllm_config(config):
+        init_distributed_environment(
+            world_size=world,
+            rank=rank,
+            local_rank=rank,
+            distributed_init_method=f"file://{init_file}",
+        )
+        initialize_model_parallel(
+            tensor_model_parallel_size=world, decode_context_model_parallel_size=world
+        )
+        init_workspace_manager(device)
+        try:
+            topk_buffer = torch.full(
+                (max_tokens, TOPK), -1, dtype=torch.int32, device="cuda"
+            )
+            registry = JitWarmupRegistry(config)
+            with registry.activate():
+                attn = _dsa_layer(config, topk_buffer)
+                layer = attn.mla_attn.mla_attn
+                assert layer.use_shardq
+                builder = FlashInferMLASparseTRTLLMBackend.get_builder_cls()(
+                    layer.get_kv_cache_spec(config), [layer.layer_name], config, device
+                )
+            registry.warmup()
+            row_cap = layer.impl.dcp_path_max_rows
+            # max_num_seqs x the indexer's decode threshold (1 token without
+            # speculation) + the ShardQ minimum - 1 = 32 x 1 + 1023, or the
+            # DCP workspace (the capture bound) if larger.
+            assert row_cap == trtllm_gen_lse_max_rows(config, True)
+            assert row_cap == max(1055, capture_size or 0)
+            direct = layer.dcp_manager.direct_a2a
+            if capture_size is not None:
+                assert direct is not None and direct.max_num_tokens == row_cap
+            else:
+                assert direct is None or direct.max_num_tokens < row_cap
+            assert num_mqa == 30000 > 14 * row_cap
+
+            def run(q, kv_c, k_pe, kv_cache, metadata, out) -> int:
+                """forward_impl's peak above what it was handed."""
+                torch.accelerator.synchronize()
+                torch.cuda.reset_peak_memory_stats()
+                before = torch.cuda.memory_allocated()
+                layer.forward_impl(q, kv_c, k_pe, kv_cache, metadata, out)
+                torch.accelerator.synchronize()
+                return torch.cuda.max_memory_allocated() - before
+
+            # The memory profile run at the token budget: its attention claim
+            # (the second run: the first allocates the persistent buffers).
+            profile = (
+                torch.randn(max_tokens, local_heads, 192, device="cuda").bfloat16(),
+                torch.randn(max_tokens, 512, device="cuda").bfloat16(),
+                torch.randn(max_tokens, 1, 64, device="cuda").bfloat16(),
+                torch.empty(0, device="cuda"),
+                None,
+                torch.empty(
+                    max_tokens, local_heads * 128, device="cuda", dtype=torch.bfloat16
+                ),
+            )
+            run(*profile)
+            claim = run(*profile)
+            del profile
+
+            layout = _layout(cache_dtype)
+            rep = Replicated(lens, layout, fill_random=False)
+            kv_c, k_pe, _ = _real_rows(rep, cache_dtype)
+            shard = _shard(rep, world, rank, seed=rank, mla_block=LAYER_BLOCK)
+            layer.kv_cache = shard.mla
+            metadata = builder.build(
+                0, _common_metadata(lens, shard.mla_table, (world, rank))
+            )
+            assert metadata.shardq is None
+            assert metadata.prefill is not None and metadata.prefill.use_dense_mha
+            assert metadata.num_decode_tokens == num_mqa
+            assert set(builder.dcp_shardq.stats.total) == {dcp.DENSE_MHA}
+            topk_buffer[:num_mqa] = _causal_topk(lens, num_mqa)
+            torch.manual_seed(6)
+            q_all = torch.randn(
+                num_tokens, LAYER_HEADS, 192, device="cuda", dtype=torch.bfloat16
+            )
+            q = q_all.chunk(world, dim=1)[rank].contiguous()
+            del q_all
+            step = (q, kv_c, k_pe.unsqueeze(1), shard.mla, metadata)
+
+            forward_mqa = layer.impl.forward_mqa
+            calls: list[int] = []
+
+            def counted(q, *args, **kwargs):
+                calls.append(q.shape[0])
+                return forward_mqa(q, *args, **kwargs)
+
+            layer.impl.forward_mqa = counted
+            out = torch.empty(
+                num_tokens, local_heads * 128, device="cuda", dtype=torch.bfloat16
+            )
+            run(*step, out)  # Warm the step's kernels.
+            calls.clear()
+            chunked_peak = run(*step, out)
+            assert calls == [row_cap] * (num_mqa // row_cap) + [num_mqa % row_cap]
+            chunked = out.clone()
+
+            # The single pass over every MQA row, as before.
+            layer.impl.dcp_path_max_rows = None
+            calls.clear()
+            out.fill_(0)
+            single_peak = run(*step, out)
+            assert calls == [num_mqa]
+            layer.impl.dcp_path_max_rows = row_cap
+
+            assert torch.isfinite(chunked).all()
+            if capture_size is None:
+                assert torch.equal(chunked, out)
+            else:
+                # The chunks combine in the direct workspace, the single pass
+                # with the NCCL A2A fallback: two combine kernels whose bf16
+                # rounding differs (on any inputs), here on ~0.15% of the
+                # outputs. Through the NCCL A2A the chunks match bit for bit.
+                err = (chunked.float() - out.float()).norm() / out.float().norm()
+                assert err < 1e-3, err
+                single = out.clone()
+                direct.max_num_tokens, direct_rows = 0, direct.max_num_tokens
+                run(*step, out)
+                direct.max_num_tokens = direct_rows
+                assert torch.equal(out, single)
+            # Below the profile run's claim; the single pass is far above it.
+            gib = 1 << 30
+            print(
+                f"rank {rank}: profile claim {claim / gib:.3f} GiB, chunked step "
+                f"{chunked_peak / gib:.3f} GiB, single pass {single_peak / gib:.3f} GiB"
+            )
+            assert chunked_peak < claim, (chunked_peak, claim)
+            assert single_peak > 2 * claim, (single_peak, claim)
+        finally:
+            cleanup_dist_env_and_memory()
+
+
+@pytest.mark.skipif(torch.accelerator.device_count() < 4, reason="needs 4 GPUs")
+@pytest.mark.parametrize(
+    "capture_size",
+    [
+        pytest.param(None, id="nccl_collectives"),
+        pytest.param(2048, id="direct_collectives"),
+    ],
+)
+def test_dense_mha_step_runs_the_dcp_path_in_row_chunks(capture_size, tmp_path):
+    import torch.multiprocessing as mp
+
+    # 4 local heads: requests of up to 1024 new tokens are MLA decode rows.
+    world = 4
+    mp.spawn(
+        _dense_mha_worker,
+        args=(world, str(tmp_path / "dist_init"), "fp8", "trtllm", capture_size),
+        nprocs=world,
+    )
+
+
 @pytest.mark.parametrize(
     "fp4,entry,split",
     [
