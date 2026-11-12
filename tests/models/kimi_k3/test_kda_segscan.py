@@ -2,13 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Segment-parallel FlashKDA prefill (ops/kda_segscan.py).
 
-The policy tests are host-only: the head-aware length threshold, the segment
-split, make_plan's go / no-go at the served shapes, and the narrow V-split
-dispatch with a mocked SM count. The GPU tests compare the segmented prefill
-and the narrow V-split launch against plain FlashKDA: the V-split launch is
+The policy tests are host-only: the cost-model planner (segment split, go /
+no-go at the served shapes, pseudo-sequence cap) and the V-split dispatch with
+a mocked SM count. The GPU tests compare the segmented prefill and the 16- and
+32-column V-split launches against plain FlashKDA: the V-split launch is
 bitwise stock (outputs, final and checkpoint states, fp32 states rounded through
 bf16 as stock); the segmented prefill is bitwise on its first segment, and
-bitwise overall when the gate forgets the state within a segment.
+bitwise overall when the gate forgets the state within a segment. The
+output-free transition passes give bitwise the states of the output passes.
 """
 
 import pytest
@@ -34,54 +35,71 @@ def _fresh_plan_cache():
 # --- policy (CPU) ------------------------------------------------------------
 
 
+def _plan(lens, heads, offs=None, max_parts=None):
+    if max_parts is None:
+        max_parts = kda_segscan.max_pseudo(heads, RUBIN_SMS, 64)
+    return kda_segscan.make_plan(
+        _cu(*lens), heads, "cpu", offs, sms=RUBIN_SMS, max_parts=max_parts
+    )
+
+
 @pytest.mark.parametrize(
-    ("heads", "tokens"),
-    [(1, 3072), (8, 3072), (12, 3072), (13, 5120), (24, 5120), (25, 6144)],
+    ("heads", "max_seqs", "n"),
+    [(12, 64, 13), (24, 64, 6), (12, 8, 8), (96, 64, 1)],
 )
-def test_min_tokens_by_heads(heads: int, tokens: int):
-    assert kda_segscan._min_tokens(heads) == tokens
-
-
-def test_segment_counts_threshold_is_head_aware():
-    # 4096 tokens: past the 12-head threshold, short of the 24-head one.
-    assert kda_segscan._segment_counts((4096,), 12) == [8]
-    assert kda_segscan._segment_counts((4096,), 24) is None
-    assert kda_segscan._segment_counts((3071,), 12) is None
-    assert kda_segscan._segment_counts((5120,), 24) == [8]
+def test_max_pseudo(heads: int, max_seqs: int, n: int):
+    # one wave of 32-column transition blocks: 4 x heads x P <= 3 x 212
+    assert kda_segscan.max_pseudo(heads, RUBIN_SMS, max_seqs) == n
 
 
 def test_segment_counts_shapes():
-    assert kda_segscan._segment_counts((), 12) is None
+    assert kda_segscan._segment_counts((), 8) is None
     # as many sequences as pseudo-sequences: nothing left to split
-    assert kda_segscan._segment_counts((8192,) * 8, 12) is None
-    assert kda_segscan._segment_counts((16384,), 12) == [8]
-    assert kda_segscan._segment_counts((8192, 8192), 12) == [4, 4]
+    assert kda_segscan._segment_counts((8192,) * 8, 8) is None
+    assert kda_segscan._segment_counts((16384,), 8) == [8]
+    assert kda_segscan._segment_counts((8192, 8192), 8) == [4, 4]
     # extra segments go to the longest current segment; short ones stay whole
-    assert kda_segscan._segment_counts((12288, 3072, 1400), 12) == [5, 2, 1]
+    assert kda_segscan._segment_counts((12288, 3072, 1400), 8) == [5, 2, 1]
+    # segments stay >= _MIN_SEG tokens
+    assert kda_segscan._segment_counts((600,), 8) == [2]
 
 
-def test_make_plan_2x8192_h12_declines():
-    # 4 x 2048 segments per sequence: the chain shrinks only 4x (< 5x).
-    assert kda_segscan.make_plan(_cu(8192, 8192), 12, "cpu") is None
+def test_step_model_slicing():
+    sms = RUBIN_SMS
+    assert kda_segscan._step_us(12, 2, sms) == kda_segscan._STEP_VD16_US  # 192
+    assert kda_segscan._step_us(24, 5, sms) == kda_segscan._STEP_VD32_US[2]  # 480
+    assert kda_segscan._step_us(12, 8, sms) == kda_segscan._STEP_VD32_US[1]  # 384
+    assert kda_segscan._step_us(24, 10, sms) > kda_segscan._STEP_FULL_US  # 2 waves
 
 
-def test_make_plan_1x16384_h12_eight_pieces():
-    plan = kda_segscan.make_plan(_cu(16384), 12, "cpu")
-    assert plan is not None
-    assert plan.num_seqs == 1 and plan.num_pseudo == 8
-    assert plan.cu.tolist() == list(range(0, 16384 + 1, 2048))
-    assert plan.first.tolist() == [0] and plan.count.tolist() == [8]
-    assert plan.last.tolist() == [7]
-    assert plan.ck_x is None and plan.ck_f is None and plan.ck_k is None
-    assert plan.kernel_ckpt_offsets is None
+def test_make_plan_c256_2x8192_h12_segments():
+    # 192 chains on 212 SMs: the transition passes have room for 13 pseudo-
+    # sequences, and the projected plan beats the plain 512-chunk chain.
+    plan = _plan([8192, 8192], 12)
+    assert plan is not None and plan.num_seqs == 2
+    assert 2 < plan.num_pseudo <= 13
+    assert plan.count.tolist()[0] == plan.count.tolist()[1]
+    assert plan.cu.tolist()[-1] == 16384
 
 
-def test_make_plan_c512_5x3480_h24_declines():
-    assert kda_segscan.make_plan(_cu(*([3480] * 5)), 24, "cpu") is None
+def test_make_plan_c512_shapes_decline():
+    # 24 heads: the plain launch already fills the GPU (32-column blocks).
+    assert _plan([3480] * 5, 24) is None
+    assert _plan([5461] * 6, 24) is None
+
+
+def test_make_plan_short_rows_decline():
+    assert _plan([300, 200], 12) is None
+
+
+def test_make_plan_respects_max_parts():
+    assert _plan([16384], 12, max_parts=1) is None
+    plan = _plan([16384], 12, max_parts=4)
+    assert plan is not None and plan.num_pseudo <= 4
 
 
 def test_make_plan_checkpoint_offset_is_a_boundary():
-    plan = kda_segscan.make_plan(_cu(16384), 12, "cpu", [4096])
+    plan = _plan([16384], 12, [4096], max_parts=8)
     assert plan is not None and plan.num_pseudo == 8
     cu = plan.cu.tolist()
     assert cu == [0, 2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384]
@@ -92,21 +110,22 @@ def test_make_plan_checkpoint_offset_is_a_boundary():
 
 
 def test_make_plan_is_cached():
-    a = kda_segscan.make_plan(_cu(16384), 12, "cpu")
-    assert kda_segscan.make_plan(_cu(16384), 12, "cpu") is a
+    a = _plan([16384], 12)
+    assert _plan([16384], 12) is a
 
 
 @pytest.mark.parametrize(
     ("heads", "sequences", "fits"),
     [
-        (12, 2, True),  # C256 TP8: 12 x 8 x 2 = 192 <= 212
-        (12, 1, True),
-        (24, 1, True),  # 192
-        (12, 3, False),  # 288
-        (24, 5, False),  # C512: 24 x 8 x 5 = 960
+        (12, 2, True),  # C256 TP8: 16 columns, 12 x 8 x 2 = 192 <= 212
+        (24, 5, True),  # C512 TP4: 32 columns, 24 x 4 x 5 = 480 <= 3 x 212
+        (24, 6, True),  # 576
+        (24, 7, False),  # 672
+        (96, 2, False),
     ],
 )
-def test_narrow_vsplit_fits(monkeypatch, heads: int, sequences: int, fits: bool):
+def test_split_build_fits(monkeypatch, heads: int, sequences: int, fits: bool):
+    assert kda_segscan.split_build_fits(heads, sequences, 128, RUBIN_SMS) is fits
     monkeypatch.setattr(kda_segscan, "_num_sms", lambda index: RUBIN_SMS)
     device = torch.device("cuda", 0)
     assert kda_segscan.narrow_vsplit_fits(heads, sequences, 128, device) is fits
@@ -262,12 +281,15 @@ def _bf16_representable(state: torch.Tensor) -> bool:
 def test_segmented_prefill_matches_flashkda(
     state_dtype: torch.dtype, checkpoint: int | None, slow_decay: bool
 ):
-    # 3072 tokens at 2 heads segments by the shipped policy (8 pieces).
     lens, H = [3072], 2
     x = _inputs(lens, H, state_dtype, slow_decay=slow_decay)
     offs = [checkpoint] if checkpoint is not None else None
-    plan = kda_segscan.make_plan(x["cu_seqlens"].cpu(), H, "cuda", offs)
-    assert plan is not None and plan.num_pseudo == 8
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    # 3072 tokens at 2 heads: the planner splits the chain (8 pieces at most)
+    plan = kda_segscan.make_plan(
+        x["cu_seqlens"].cpu(), H, "cuda", offs, sms=sms, max_parts=8
+    )
+    assert plan is not None and 2 <= plan.num_pseudo <= 8
 
     ckpt_offsets = (
         torch.tensor(offs, dtype=torch.int32, device="cuda") if offs else None
@@ -275,7 +297,7 @@ def test_segmented_prefill_matches_flashkda(
     ref_out, ref_final, ref_ckpt = _plain_flashkda(x, ckpt_offsets)
 
     T = sum(lens)
-    bufs = kda_segscan.init_buffers(T, H, torch.device("cuda"))
+    bufs = kda_segscan.SegBuffers(T, H, torch.device("cuda"), 8, sms)
     out = torch.empty_like(x["v"])
     final = torch.empty_like(x["initial_state"])
     ckpt = torch.empty_like(final) if offs else None
@@ -293,7 +315,7 @@ def test_segmented_prefill_matches_flashkda(
         initial_state=x["initial_state"],
         out=out,
         final_state=final,
-        workspace=_workspace(T, H, kda_segscan._MAX_PSEUDO),
+        workspace=_workspace(T, H, 8),
         checkpoint_state=ckpt,
     )
     torch.accelerator.synchronize()
@@ -366,3 +388,87 @@ def test_exact_state_mode_keeps_fp32():
     assert _bf16_representable(ref_final)
     assert (exact_final.to(torch.bfloat16).float() != exact_final).float().mean() > 0.5
     assert torch.equal(exact_final.to(torch.bfloat16).float(), ref_final)
+
+
+def _split_fwd(x: dict, initial, final, mode: int, v=None, out=None):
+    _, T, H, D = x["q"].shape
+    out = torch.empty_like(x["v"]) if out is None else out
+    torch.ops.k3_flashkda_split.fwd(
+        x["q"].contiguous(),
+        x["k"].contiguous(),
+        (x["v"] if v is None else v).contiguous(),
+        x["g"].contiguous(),
+        x["beta"],
+        D**-0.5,
+        out,
+        x["ws"],
+        x["A_log"].contiguous(),
+        x["dt_bias"].view(-1, D).contiguous(),
+        x["lower_bound"],
+        initial,
+        final,
+        x["cu_seqlens"],
+        None,
+        None,
+        mode,
+    )
+    return out
+
+
+@requires_split_build
+@torch.inference_mode()
+def test_transition_passes_match_output_passes():
+    # The transition passes (exact fp32 state I/O, mode 2 | 4, plus 8: no
+    # outputs, and 16: v = 0 in-kernel) run the same state arithmetic as the
+    # exact-state output pass: bitwise-identical states, and the output buffer
+    # is left untouched.
+    kda_segscan.load_extension()
+    lens, H = [700, 333, 1024], 2
+    x = _inputs(lens, H, torch.float32, seed=5)
+    T, N = sum(lens), len(lens)
+    x["ws"] = _workspace(T, H, N)
+    _split_fwd(x, None, None, 1)  # K1
+    eye = torch.eye(128, device="cuda").expand(N, H, 128, 128).contiguous()
+
+    c_ref = torch.empty_like(x["initial_state"])
+    _split_fwd(x, None, c_ref, 2 | 4)
+    c = torch.empty_like(c_ref)
+    sentinel = torch.full_like(x["v"], 3.0)
+    out = sentinel.clone()
+    _split_fwd(x, None, c, 2 | 4 | 8, out=out)
+    torch.testing.assert_close(c, c_ref, rtol=0, atol=0)
+    assert torch.equal(out, sentinel)
+
+    m_ref = torch.empty_like(c_ref)
+    _split_fwd(x, eye, m_ref, 2 | 4, v=torch.zeros_like(x["v"]))
+    m = torch.empty_like(c_ref)
+    _split_fwd(x, eye, m, 2 | 4 | 8 | 16)
+    torch.testing.assert_close(m, m_ref, rtol=0, atol=0)
+
+    with pytest.raises(RuntimeError):
+        _split_fwd(x, None, None, 8)  # output-free without the K2 bit
+    with pytest.raises(RuntimeError):
+        _split_fwd(x, None, c, 2 | 8)  # output-free without exact state I/O
+
+
+@requires_split_build
+@torch.inference_mode()
+def test_vd32_launch_matches_flashkda():
+    # More 16-column blocks than SMs, within three 32-column blocks per SM:
+    # the 32-column slicing; same per-column arithmetic as stock FlashKDA.
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    H = sms // 16 + 1
+    lens = [300, 517]
+    assert H * 8 * len(lens) > sms and H * 4 * len(lens) <= 3 * sms
+    x = _inputs(lens, H, torch.float32, seed=11)
+    assert kda_segscan.narrow_vsplit_fits(H, len(lens), 128, x["q"].device)
+    ref_out, ref_final, _ = _plain_flashkda(x)
+    kda_segscan.load_extension()
+    T = sum(lens)
+    x["ws"] = _workspace(T, H, len(lens))
+    final = torch.empty_like(x["initial_state"])
+    out = _split_fwd(x, x["initial_state"].contiguous(), final, 3)
+    torch.accelerator.synchronize()
+    torch.testing.assert_close(out, ref_out, rtol=0, atol=0)
+    # the fp32 state crosses the kernel through bf16, as the stock build
+    assert torch.equal(final, ref_final)

@@ -456,10 +456,11 @@ def _flashkda_prefill(
         q.shape[2], cu_seqlens.shape[0] - 1, q.shape[-1], q.device
     ):
         # The in-tree FlashKDA build (ops/flashkda_split, shared with the
-        # segment-parallel path) splits the recurrence over 16-value-column
-        # slices when that grid fits one wave: bitwise-identical outputs and
-        # states (an fp32 state crosses the kernel through bf16, as stock),
-        # 1.2-1.3x faster at the C256 TP8 shapes.
+        # segment-parallel path) splits the recurrence over 16- or 32-value-
+        # column slices when that grid is resident in one wave: same per-column
+        # arithmetic as stock, and an fp32 state crosses the kernel through
+        # bf16 as stock; 1.2-1.3x faster at the C256 TP8 shapes, 1.1x at C512
+        # TP4 (5 x 3480: 165 -> 147 us).
         kda_segscan.load_extension()
         torch.ops.k3_flashkda_split.fwd(*args, 3)
     else:
@@ -879,7 +880,10 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 # Segment-parallel prefill buffers, shared by every KDA layer
                 # and allocated before the memory profile.
                 self._segscan_bufs = kda_segscan.init_buffers(
-                    T, H, torch.device("cuda", torch.accelerator.current_device_index())
+                    T,
+                    H,
+                    torch.device("cuda", torch.accelerator.current_device_index()),
+                    N,
                 )
         elif self.kda_prefill_backend == "flashinfer":
             T = vllm_config.scheduler_config.max_num_batched_tokens
@@ -1481,6 +1485,8 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                             self.local_num_heads,
                             q_ns.device,
                             checkpoint.offsets if checkpoint is not None else None,
+                            sms=self._segscan_bufs.sms,
+                            max_parts=self._segscan_bufs.n,
                         )
                         if self._segscan_bufs is not None
                         and m.non_spec_query_start_loc_cpu is not None

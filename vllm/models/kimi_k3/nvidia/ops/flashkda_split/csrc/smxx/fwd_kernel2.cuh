@@ -13,6 +13,8 @@
 // bf16-layout tiles (state_acc, state_lo) that reuse FlashKDA's own LDSM / STSM
 // state moves, so the register-resident main loop is unchanged. kda_segscan.py
 // rounds the states it hands back to the cache as stock does.
+// Kimi-K3 also adds launch-bound / NoOut / ZeroV template parameters (V-split
+// only, see the kernel); the state arithmetic is unchanged by all of them.
 #pragma once
 
 #include <type_traits>
@@ -250,9 +252,10 @@ template <class TmaLoadV, class TmaLoadBeta, class TmaLoadState,
           bool HasStateIn = true, bool HasStateOut = true,
           bool StateFP32 = false, bool HasCheckpoint = false,
           bool IsVarlen = true, typename SeqlenT = int64_t, int VD = D,
-          bool ExactState = false>
-__global__ void __launch_bounds__(NumThreads,
-                                  k2_min_blocks_per_sm<NumThreads>())
+          bool ExactState = false, int MinBlocks = 0, bool NoOut = false,
+          bool ZeroV = false>
+__global__ void __launch_bounds__(
+    NumThreads, MinBlocks ? MinBlocks : k2_min_blocks_per_sm<NumThreads>())
     _flash_kda_fwd_recurrence(
         CUTE_GRID_CONSTANT TmaLoadV const tma_load_v,
         CUTE_GRID_CONSTANT TmaLoadBeta const tma_load_beta,
@@ -273,6 +276,14 @@ __global__ void __launch_bounds__(NumThreads,
   static_assert(D % VD == 0, "VD must divide D");
   static_assert(VD == D || VD == 64 || VD == 32 || VD == 16,
                 "K2 supports the full V tile or a V slice of 64, 32 or 16");
+  // Kimi-K3: NoOut runs the state recurrence only (no q@s, Mqk@U or output
+  // tile: the segment-parallel prefill's transition passes discard them);
+  // ZeroV takes v = 0 without loading it (the identity-state pass). Neither
+  // changes the state arithmetic. Their states are fp32 partials, so they
+  // always use the exact state I/O.
+  static_assert(!(NoOut || ZeroV) || (VD < D && HasStateOut && StateFP32 &&
+                                      kExactState && !HasCheckpoint),
+                "NoOut / ZeroV are V-split exact fp32 state-transition passes");
   using Layouts = K2Layouts<D, CHUNK, VD>;
   using MMALayout = typename Layouts::MMALayout;
   using TransposedMMALayout = typename Layouts::TransposedMMALayout;
@@ -323,11 +334,13 @@ __global__ void __launch_bounds__(NumThreads,
   // Transaction bytes: v + beta + k_decayed + q_decayed + k_restored + g_total
   // + INV + Mqk
   constexpr uint32_t kTmaTransactionBytes =
-      uint32_t(cute::cosize_v<VOLayout>) * uint32_t(sizeof(BF16)) +
+      (ZeroV ? 0u : uint32_t(cute::cosize_v<VOLayout>) * uint32_t(sizeof(BF16))) +
       uint32_t(32) * uint32_t(sizeof(BF16)) +  // beta (bf16, sigmoid fused)
-      uint32_t(cute::cosize_v<MMALayout>) * uint32_t(sizeof(BF16)) * 3 +
+      uint32_t(cute::cosize_v<MMALayout>) * uint32_t(sizeof(BF16)) *
+          (NoOut ? 2 : 3) +
       uint32_t(cute::cosize_v<GTotalLayout>) * uint32_t(sizeof(float)) +
-      uint32_t(cute::cosize_v<LMLayout>) * uint32_t(sizeof(BF16)) * 2;
+      uint32_t(cute::cosize_v<LMLayout>) * uint32_t(sizeof(BF16)) *
+          (NoOut ? 1 : 2);
 
   // --- warp specialization
   int warp_id = cutlass::canonical_warp_idx_sync();
@@ -513,16 +526,18 @@ __global__ void __launch_bounds__(NumThreads,
       int ws_idx = head_idx * total_tiles + tile_base + t;
 
       // TMA load v
-      auto v_off = g_v.layout()(head_idx, int(bos) + t * CHUNK, v_idx * VD);
-      Tensor g_v_tile =
-          make_tensor(g_v.data() + v_off,
-                      make_layout(make_shape(Int<1>{}, Int<CHUNK>{}, Int<VD>{}),
-                                  stride(g_v.layout())));
-      Tensor s_v_tile = make_tensor(
-          make_smem_ptr(shared_storage.input[stage].v.begin()), TMAVOLayout{});
-      cute::copy(tma_load_v.with(*tma_barrier),
-                 cta_tma_load_v.partition_S(g_v_tile),
-                 cta_tma_load_v.partition_D(s_v_tile));
+      if constexpr (!ZeroV) {
+        auto v_off = g_v.layout()(head_idx, int(bos) + t * CHUNK, v_idx * VD);
+        Tensor g_v_tile = make_tensor(
+            g_v.data() + v_off,
+            make_layout(make_shape(Int<1>{}, Int<CHUNK>{}, Int<VD>{}),
+                        stride(g_v.layout())));
+        Tensor s_v_tile = make_tensor(
+            make_smem_ptr(shared_storage.input[stage].v.begin()), TMAVOLayout{});
+        cute::copy(tma_load_v.with(*tma_barrier),
+                   cta_tma_load_v.partition_S(g_v_tile),
+                   cta_tma_load_v.partition_D(s_v_tile));
+      }
 
       // TMA load beta (1D)
       int beta_linear = head_idx * T_total + (int(bos) + t * CHUNK);
@@ -545,11 +560,13 @@ __global__ void __launch_bounds__(NumThreads,
           reinterpret_cast<uint64_t*>(tma_barrier),
           shared_storage.input[stage].k_decayed.begin(),
           int32_t(CHUNK * D * sizeof(BF16)));
-      cute::SM90_BULK_COPY_G2S::copy(
-          ws_qd + int64_t(ws_idx) * (CHUNK * D),
-          reinterpret_cast<uint64_t*>(tma_barrier),
-          shared_storage.input[stage].q_decayed.begin(),
-          int32_t(CHUNK * D * sizeof(BF16)));
+      if constexpr (!NoOut) {
+        cute::SM90_BULK_COPY_G2S::copy(
+            ws_qd + int64_t(ws_idx) * (CHUNK * D),
+            reinterpret_cast<uint64_t*>(tma_barrier),
+            shared_storage.input[stage].q_decayed.begin(),
+            int32_t(CHUNK * D * sizeof(BF16)));
+      }
       cute::SM90_BULK_COPY_G2S::copy(
           ws_kr + int64_t(ws_idx) * (CHUNK * D),
           reinterpret_cast<uint64_t*>(tma_barrier),
@@ -563,10 +580,13 @@ __global__ void __launch_bounds__(NumThreads,
                                      reinterpret_cast<uint64_t*>(tma_barrier),
                                      shared_storage.input[stage].INV.begin(),
                                      int32_t(CHUNK * CHUNK * sizeof(BF16)));
-      cute::SM90_BULK_COPY_G2S::copy(ws_mqk + int64_t(ws_idx) * (CHUNK * CHUNK),
-                                     reinterpret_cast<uint64_t*>(tma_barrier),
-                                     shared_storage.input[stage].Mqk.begin(),
-                                     int32_t(CHUNK * CHUNK * sizeof(BF16)));
+      if constexpr (!NoOut) {
+        cute::SM90_BULK_COPY_G2S::copy(
+            ws_mqk + int64_t(ws_idx) * (CHUNK * CHUNK),
+            reinterpret_cast<uint64_t*>(tma_barrier),
+            shared_storage.input[stage].Mqk.begin(),
+            int32_t(CHUNK * CHUNK * sizeof(BF16)));
+      }
 
       ++load_write;
     }
@@ -804,23 +824,29 @@ __global__ void __launch_bounds__(NumThreads,
                    local_tile(k_decayed, make_shape(Int<16>{}, Int<16>{}),
                               make_coord(0, 0))),
                tCrAi_k_view);
-          copy(smem_tiled_copy_A,
-               smem_thr_copy_A.partition_S(
-                   local_tile(q_decayed, make_shape(Int<16>{}, Int<16>{}),
-                              make_coord(0, 0))),
-               tCrAi_q_view);
+          if constexpr (!NoOut) {
+            copy(smem_tiled_copy_A,
+                 smem_thr_copy_A.partition_S(
+                     local_tile(q_decayed, make_shape(Int<16>{}, Int<16>{}),
+                                make_coord(0, 0))),
+                 tCrAi_q_view);
+          }
 
 #pragma unroll
           for (int k = 0; k < K_BLOCKS; ++k) {
             cute::transform(tCrAi_k, tCrA_k, cute::identity{});
-            cute::transform(tCrAi_q, tCrA_q, cute::identity{});
+            if constexpr (!NoOut) {
+              cute::transform(tCrAi_q, tCrA_q, cute::identity{});
+            }
             movm_transpose_c_to_b_16x16(
                 narrow_state<ResidentStateFragment>(resident_state[0][k]),
                 tCrB);
             gemm(thr_mma, tCrA_k(_, _, Int<0>{}), tCrB(_, _, Int<0>{}),
                  u_acc[0]);
-            gemm(thr_mma, tCrA_q(_, _, Int<0>{}), tCrB(_, _, Int<0>{}),
-                 out_acc[0]);
+            if constexpr (!NoOut) {
+              gemm(thr_mma, tCrA_q(_, _, Int<0>{}), tCrB(_, _, Int<0>{}),
+                   out_acc[0]);
+            }
 
             if constexpr (kValueBlocksPerWarp == 2) {
               movm_transpose_c_to_b_16x16(
@@ -834,37 +860,47 @@ __global__ void __launch_bounds__(NumThreads,
                        local_tile(k_decayed, make_shape(Int<16>{}, Int<16>{}),
                                   make_coord(0, k + 1))),
                    tCrAi_k_view);
-              copy(smem_tiled_copy_A,
-                   smem_thr_copy_A.partition_S(
-                       local_tile(q_decayed, make_shape(Int<16>{}, Int<16>{}),
-                                  make_coord(0, k + 1))),
-                   tCrAi_q_view);
+              if constexpr (!NoOut) {
+                copy(smem_tiled_copy_A,
+                     smem_thr_copy_A.partition_S(local_tile(
+                         q_decayed, make_shape(Int<16>{}, Int<16>{}),
+                         make_coord(0, k + 1))),
+                     tCrAi_q_view);
+              }
             }
 
             if constexpr (kValueBlocksPerWarp == 2) {
               gemm(thr_mma, tCrA_k(_, _, Int<0>{}), tCrB(_, _, Int<0>{}),
                    u_acc[1]);
-              gemm(thr_mma, tCrA_q(_, _, Int<0>{}), tCrB(_, _, Int<0>{}),
-                   out_acc[1]);
+              if constexpr (!NoOut) {
+                gemm(thr_mma, tCrA_q(_, _, Int<0>{}), tCrB(_, _, Int<0>{}),
+                     out_acc[1]);
+              }
             }
           }
         }
 
         // ======== Phase 2: Cast out (keep in regs), load v/INV/beta ========
         SFragT out_bf16[kValueBlocksPerWarp];
+        if constexpr (!NoOut) {
 #pragma unroll
-        for (int i = 0; i < kValueBlocksPerWarp; ++i)
-          cute::transform(out_acc[i], out_bf16[i],
-                          [] __device__(float x) { return BF16(x); });
+          for (int i = 0; i < kValueBlocksPerWarp; ++i)
+            cute::transform(out_acc[i], out_bf16[i],
+                            [] __device__(float x) { return BF16(x); });
+        }
 
         SFragT v_bf16[kValueBlocksPerWarp];
 #pragma unroll
         for (int i = 0; i < kValueBlocksPerWarp; ++i) {
-          Tensor v_block =
-              local_tile(v_tile, make_shape(Int<16>{}, Int<16>{}),
-                         make_coord(0, warp_id * kValueBlocksPerWarp + i));
-          copy(smem_tiled_load_C, smem_thr_load_C.partition_S(v_block),
-               smem_thr_load_C.retile_D(v_bf16[i]));
+          if constexpr (ZeroV) {
+            cute::fill(v_bf16[i], BF16(0.0f));
+          } else {
+            Tensor v_block =
+                local_tile(v_tile, make_shape(Int<16>{}, Int<16>{}),
+                           make_coord(0, warp_id * kValueBlocksPerWarp + i));
+            copy(smem_tiled_load_C, smem_thr_load_C.partition_S(v_block),
+                 smem_thr_load_C.retile_D(v_bf16[i]));
+          }
         }
 
         copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(INV), tCrAi_k_view);
@@ -919,8 +955,11 @@ __global__ void __launch_bounds__(NumThreads,
 
         // ======== Phase 4: Load Mqk, MOVM_T → tCrB_u_arr, Mqk@U + add out
         // ========
-        copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(Mqk), tCrAi_k_view);
-        cute::transform(tCrAi_k, tCrA_k, cute::identity{});
+        if constexpr (!NoOut) {
+          copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(Mqk),
+               tCrAi_k_view);
+          cute::transform(tCrAi_k, tCrA_k, cute::identity{});
+        }
 
         BFragT_u tCrB_u_arr[kValueBlocksPerWarp];
 
@@ -939,29 +978,33 @@ __global__ void __launch_bounds__(NumThreads,
           b_dst[2] = u_b_regs[2];
           b_dst[3] = u_b_regs[3];
 
-          clear(out_acc[i]);
-          gemm(thr_mma, tCrA_k(_, _, Int<0>{}), tCrB_u_arr[i](_, _, Int<0>{}),
-               out_acc[i]);
+          if constexpr (!NoOut) {
+            clear(out_acc[i]);
+            gemm(thr_mma, tCrA_k(_, _, Int<0>{}),
+                 tCrB_u_arr[i](_, _, Int<0>{}), out_acc[i]);
 
-          SFragT gemm_bf16;
-          cute::transform(out_acc[i], gemm_bf16,
-                          [] __device__(float x) { return BF16(x); });
-          cute::transform(out_bf16[i], gemm_bf16, out_bf16[i],
-                          [] __device__(BF16 c, BF16 a) { return c + a; });
+            SFragT gemm_bf16;
+            cute::transform(out_acc[i], gemm_bf16,
+                            [] __device__(float x) { return BF16(x); });
+            cute::transform(out_bf16[i], gemm_bf16, out_bf16[i],
+                            [] __device__(BF16 c, BF16 a) { return c + a; });
+          }
         }
 
-        // Late output-acquire (cycle trim): first out-stage write is in
-        // phase 5, so ownership is needed only now; the wait typically
-        // finds the stage already released.
-        store_pipeline.producer_acquire(out_write);
+        if constexpr (!NoOut) {
+          // Late output-acquire (cycle trim): first out-stage write is in
+          // phase 5, so ownership is needed only now; the wait typically
+          // finds the stage already released.
+          store_pipeline.producer_acquire(out_write);
 // ======== Phase 5: Store final out ========
 #pragma unroll
-        for (int i = 0; i < kValueBlocksPerWarp; ++i) {
-          Tensor out_block =
-              local_tile(out_tile, make_shape(Int<16>{}, Int<16>{}),
-                         make_coord(0, warp_id * kValueBlocksPerWarp + i));
-          copy(smem_tiled_store_C, smem_thr_store_C.retile_S(out_bf16[i]),
-               smem_thr_store_C.partition_D(out_block));
+          for (int i = 0; i < kValueBlocksPerWarp; ++i) {
+            Tensor out_block =
+                local_tile(out_tile, make_shape(Int<16>{}, Int<16>{}),
+                           make_coord(0, warp_id * kValueBlocksPerWarp + i));
+            copy(smem_tiled_store_C, smem_thr_store_C.retile_S(out_bf16[i]),
+                 smem_thr_store_C.partition_D(out_block));
+          }
         }
 
         // ======== Phase 6: s_acc update ========
@@ -1101,7 +1144,9 @@ __global__ void __launch_bounds__(NumThreads,
       // The collective commit releases this input stage and publishes
       // both the output tile and an optional final-state spill.
       cutlass::arch::fence_view_async_shared();
-      store_pipeline.producer_commit(out_write);
+      if constexpr (!NoOut) {
+        store_pipeline.producer_commit(out_write);
+      }
       load_pipeline.consumer_release(load_read);
       ++load_read;
       ++out_write;
@@ -1147,7 +1192,7 @@ __global__ void __launch_bounds__(NumThreads,
     }
   }
 
-  if (warp_role == WarpRole::STORE && lane_predicate) {
+  if (warp_role == WarpRole::STORE && lane_predicate && !NoOut) {
     Tensor g_out = tma_store_out.get_tma_tensor(make_shape(H, T_total, D));
     auto cta_tma_store = tma_store_out.get_slice(Int<0>{});
     StorePipelineState out_read;
