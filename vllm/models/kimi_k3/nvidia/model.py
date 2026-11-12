@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 from torch import nn
 
+import vllm._custom_ops as ops
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.kernel import NATIVE_MEGA_MOE_BACKENDS, KIMI_K3_MEGA_MOE
@@ -222,6 +223,45 @@ def use_moe_token_shard(vllm_config: VllmConfig) -> bool:
         and parallel_config.data_parallel_size == 1
         and parallel_config.tensor_parallel_size > 1
     )
+
+
+# Prefill-sized SP batches (>= 2048 tokens: >= 29 MB of bf16 rows per rank, past
+# the one-shot all-reduce range) reduce-scatter the embedding lookup.
+_SP_EMBED_RS_MIN_TOKENS = 2048
+
+
+def sp_embed(embed: nn.Module, input_ids: torch.Tensor) -> torch.Tensor:
+    """This rank's sequence-parallel token shard of ``embed(input_ids)``.
+
+    The vocab-parallel lookup leaves each token's row on the one rank whose
+    vocab shard owns it (zeros elsewhere), so reduce-scattering the shards'
+    partial rows over the TP group gives exactly the all-reduced rows of this
+    rank's shard: half the bytes of the all-reduce, and the full-batch rows that
+    ``sp_shard`` would drop are never reduced. Embeddings that are not the plain
+    fused bf16/fp16 lookup keep the all-reduce + shard, and so do batches below
+    ``_SP_EMBED_RS_MIN_TOKENS`` (decode-sized: there the all-reduce is the
+    one-shot custom kernel, whose latency a ring reduce-scatter does not beat)."""
+    if not (
+        input_ids.shape[0] >= _SP_EMBED_RS_MIN_TOKENS
+        and isinstance(embed, VocabParallelEmbedding)
+        and embed.use_fused_embedding
+        and embed.reduce_results
+        and embed.parallel_group is None
+        and embed.weight.dtype in (torch.bfloat16, torch.float16)
+        and input_ids.ndim == 1
+    ):
+        return sp_shard(embed(input_ids))
+    shards = embed.shard_indices
+    partial = ops.vocab_parallel_embedding(
+        input_ids,
+        embed.weight,
+        shards.org_vocab_start_index,
+        shards.org_vocab_end_index,
+        shards.num_org_vocab_padding,
+        shards.added_vocab_start_index,
+        shards.added_vocab_end_index,
+    )
+    return sp_reduce_scatter(partial)
 
 
 def mega_moe_max_num_tokens(
@@ -1698,9 +1738,19 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        # Under SP the lookup's shards are reduce-scattered straight to this
+        # rank's token shard (sp_embed) instead of all-reduced and sharded.
+        sp_lookup = (
+            self.use_sequence_parallel
+            and get_pp_group().is_first_rank
+            and inputs_embeds is None
+        )
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
+            elif sp_lookup:
+                assert input_ids is not None
+                hidden_states = sp_embed(self.embed_tokens, input_ids)
             else:
                 hidden_states = self.embed_input_ids(input_ids)
             residual = None
@@ -1717,9 +1767,11 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
                 forward_context = get_forward_context()
                 forward_context.is_padding = sp_padding_mask(
-                    forward_context.is_padding, hidden_states
+                    forward_context.is_padding,
+                    input_ids if sp_lookup else hidden_states,
                 )
-            hidden_states = sp_shard(hidden_states)
+            if not sp_lookup:
+                hidden_states = sp_shard(hidden_states)
             assert residual is None, "Currently, SP is not supported with PP"
 
         remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
