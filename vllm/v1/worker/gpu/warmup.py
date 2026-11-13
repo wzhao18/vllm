@@ -537,7 +537,7 @@ def _serving_sampling_params() -> tuple[SamplingParams, ...]:
 
 
 def _serving_step_shapes(
-    model_runner: GPUModelRunner, variant: int
+    model_runner: GPUModelRunner, variant: int, max_decodes: int | None = None
 ) -> tuple[int, int, int, int, int] | None:
     """(decode requests, first chunk, second chunk, cache-hit context, cache-hit
     new tokens) of serving-shape step set ``variant``.
@@ -545,7 +545,9 @@ def _serving_step_shapes(
     Variant 0 fills the token budget with the same shapes on every rank;
     later variants shrink the decode batch and chunks by rank-dependent odd
     amounts, so DP ranks pad to each other's token counts and alignments,
-    batch-size buckets and row counts differ from variant 0.
+    batch-size buckets and row counts differ from variant 0. ``max_decodes``
+    caps the decode batch before that shrink (``_serving_decode_cap``: the
+    largest batch whose KV blocks the server has).
     """
     budget = model_runner.scheduler_config.max_num_batched_tokens
     query_len = model_runner.decode_query_len
@@ -556,6 +558,8 @@ def _serving_step_shapes(
 
     # Two requests (the long prompt and the cache hit) besides the decodes.
     num_decodes = min(model_runner.max_num_reqs - 2, (budget // 2) // query_len)
+    if max_decodes is not None:
+        num_decodes = min(num_decodes, max_decodes)
     num_decodes -= min(num_decodes - 1, shift // 2) if num_decodes > 1 else 0
     if num_decodes < 1:
         return None
@@ -570,6 +574,64 @@ def _serving_step_shapes(
     return num_decodes, first, second, hit_context, hit_new
 
 
+def _serving_step_blocks(
+    model_runner: GPUModelRunner, shapes: tuple[int, int, int, int, int]
+) -> tuple[int, int]:
+    """(KV blocks a serving-shape step set holds, blocks per decode request)."""
+    num_decodes, first, second, hit_context, hit_new = shapes
+    query_len = model_runner.decode_query_len
+    decode_len = query_len + 1 + 2 * query_len
+    block_count = _warmup_block_counter(model_runner)
+    specs = [g.kv_cache_spec for g in model_runner.kv_cache_config.kv_cache_groups]
+
+    def blocks(num_tokens: int) -> int:
+        return sum(block_count(num_tokens, spec) for spec in specs)
+
+    per_decode = blocks(decode_len)
+    required = (
+        num_decodes * per_decode
+        + blocks(first + second)
+        + blocks(hit_context + hit_new)
+    )
+    return required, per_decode
+
+
+def _serving_decode_cap(model_runner: GPUModelRunner) -> int | None:
+    """The largest decode batch whose serving-shape steps fit the KV blocks
+    the server has (block 0 is the null block), or None when the full batch
+    fits. A decode server's KV pool can hold fewer per-request blocks (state
+    groups, speculative blocks) than ``max_num_seqs`` warmup requests need:
+    the steps then run a smaller batch rather than not at all, so the
+    verification step always runs. Same on every rank (``num_blocks`` is)."""
+    available = model_runner.kv_cache_config.num_blocks - 1
+    cap: int | None = None
+    while True:
+        shapes = _serving_step_shapes(model_runner, 0, cap)
+        if shapes is None:
+            return cap
+        required, per_decode = _serving_step_blocks(model_runner, shapes)
+        if required <= available:
+            if cap is not None:
+                logger.info(
+                    "Serving-shape warmup: %d decode requests fit the %d KV "
+                    "blocks (%d needed, %d per decode request).",
+                    shapes[0],
+                    available,
+                    required,
+                    per_decode,
+                )
+            return cap
+        num_decodes = shapes[0]
+        cap = num_decodes - max(1, cdiv(required - available, per_decode))
+        if cap < 1:
+            raise RuntimeError(
+                "Serving-shape warmup cannot fit one decode request with its "
+                f"prompt chunks in the {available} KV blocks the server has "
+                f"({required} needed with {num_decodes} decode requests); the "
+                "warmup verification would not run."
+            )
+
+
 def run_serving_shape_warmup(
     model_runner: GPUModelRunner,
     worker_execute_model: Callable[[SchedulerOutput], Any],
@@ -581,7 +643,8 @@ def run_serving_shape_warmup(
     Steps: (1) prefill the decode requests; (2) spec-decode rows + the first
     chunk of a long prompt; (3) spec-decode rows + the prompt's last chunk
     over the first one + a new request with a long cached context and a few
-    new tokens. Returns False when the shapes or KV blocks do not fit.
+    new tokens. Returns False when the token budget or max_model_len leaves no
+    room for the shapes; the decode batch is sized to the KV blocks.
     """
     if (
         model_runner.is_pooling_model
@@ -589,7 +652,9 @@ def run_serving_shape_warmup(
         or model_runner.is_encoder_decoder
     ):
         return False
-    shapes = _serving_step_shapes(model_runner, variant)
+    shapes = _serving_step_shapes(
+        model_runner, variant, _serving_decode_cap(model_runner)
+    )
     if shapes is None:
         logger.warning(
             "Skipping serving-shape warmup %d: the token budget (%d) or "
@@ -621,14 +686,12 @@ def run_serving_shape_warmup(
         + sum(counts(hit_len))
     )
     if model_runner.kv_cache_config.num_blocks <= required:
-        logger.warning(
-            "Skipping serving-shape warmup %d: %d KV blocks available for %d "
-            "required.",
-            variant,
-            model_runner.kv_cache_config.num_blocks,
-            required,
+        # _serving_decode_cap sized the batch to the pool: never skip.
+        raise RuntimeError(
+            f"Serving-shape warmup {variant}: {required} KV blocks needed, "
+            f"{model_runner.kv_cache_config.num_blocks} available after sizing "
+            "the decode batch to the pool."
         )
-        return False
 
     next_block_id = 1
 
@@ -700,9 +763,7 @@ def run_serving_shape_warmup(
     if variant == 1:
         params = (params[1],) * len(params)
     rotation = variant % len(params)
-    decode_params = [
-        params[(i + rotation) % len(params)] for i in range(num_decodes)
-    ]
+    decode_params = [params[(i + rotation) % len(params)] for i in range(num_decodes)]
     # Step 1: the decode requests' prompts (all blocks reserved up front).
     step1 = output(
         [

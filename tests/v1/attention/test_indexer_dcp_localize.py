@@ -1634,6 +1634,120 @@ def test_dcp_candidate_pack_warms_bf16_logits_on_sm100(monkeypatch, sm100: bool)
     }
 
 
+def _dcp_merge_warmup_config(world: int, topk: int, max_model_len: int):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(index_topk=topk),
+            max_model_len=max_model_len,
+        ),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=world, cp_kv_cache_interleave_size=1
+        ),
+    )
+
+
+def test_dcp_candidate_pack_warmup_keys_do_not_depend_on_rank(monkeypatch):
+    """The pack kernel's compile key has no DCP rank (a runtime argument), so
+    its warmup keys never read the DCP group: every rank warms the variants it
+    launches. The keys used to hold the rank, read from the group with a
+    silent rank-0 fallback, and ranks other than 0 compiled while serving."""
+    import dataclasses
+
+    import vllm.distributed.parallel_state as parallel_state
+    from vllm.model_executor.kernels.attention.dsa.dcp_indexer_cutedsl import (
+        PackDCPTopkCandidatesKernel,
+    )
+
+    assert "dcp_rank" not in {
+        f.name for f in dataclasses.fields(PackDCPTopkCandidatesKernel.CompileKey)
+    }
+
+    def no_group():
+        raise AssertionError("warmup keys must not read the DCP group")
+
+    monkeypatch.setattr(parallel_state, "get_dcp_group", no_group)
+    keys = PackDCPTopkCandidatesKernel().get_warmup_keys(
+        _dcp_merge_warmup_config(16, 2048, 1 << 20)
+    )
+    assert keys and all(key.dcp_world_size == 16 for key in keys)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not has_cutedsl(),
+    reason="This test requires CUDA and CuteDSL",
+)
+@pytest.mark.parametrize("world", [4, 16])
+def test_dcp_candidate_merge_warmup_covers_every_rank(world: int):
+    """After the registered warmup, the generic DCP merge kernels launch with
+    no JIT compile for every DCP rank, logits dtype and row-start layout the
+    serving path uses (the warmup is per process, so each rank must be covered
+    by the keys alone), and the ids are the exact global positions."""
+    from vllm.model_executor.kernels.attention.dsa.dcp_indexer_cutedsl import (
+        dcp_topk_id_bits,
+        pack_dcp_topk_candidates_cutedsl,
+        register_dcp_candidate_merge_warmup,
+        stable_topk_from_gathered_candidates_cutedsl,
+    )
+    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
+    from vllm.utils import jit_monitor
+    from vllm.utils.deep_gemm import mqa_logits_use_mx_scales
+
+    topk, max_model_len = 2048, 1 << 20
+    registry = JitWarmupRegistry(_dcp_merge_warmup_config(world, topk, max_model_len))
+    with registry.activate():
+        register_dcp_candidate_merge_warmup()
+    registry.warmup()
+
+    device = torch.device("cuda")
+    dtypes = [torch.float32]
+    if current_platform.is_device_capability_family(100):
+        dtypes.append(torch.bfloat16)
+    score_bits = 16 if mqa_logits_use_mx_scales() else 32
+    id_bits = dcp_topk_id_bits(max_model_len)
+    rows, width = 3, 4096
+    gen = torch.Generator(device=device).manual_seed(7)
+    with jit_monitor.record_jit_events() as events:
+        for dtype in dtypes:
+            for use_row_starts in (False, True):
+                row_starts = (
+                    torch.tensor([0, 5, 9], device=device, dtype=torch.int32)
+                    if use_row_starts
+                    else None
+                )
+                packed_by_rank = []
+                for rank in range(world):
+                    logits = torch.randn(
+                        (rows, width + 16), generator=gen, device=device
+                    ).to(dtype)
+                    local = torch.stack(
+                        [
+                            torch.randperm(width, generator=gen, device=device)[:topk]
+                            for _ in range(rows)
+                        ]
+                    ).to(torch.int32)
+                    local[:, -3:] = -1
+                    packed = torch.empty(
+                        (rows, topk, 2), device=device, dtype=torch.float32
+                    )
+                    pack_dcp_topk_candidates_cutedsl(
+                        logits, local, packed, rank, world, 1, row_starts
+                    )
+                    ids = packed[..., 1]
+                    want = torch.where(local >= 0, local * world + rank, -1)
+                    assert torch.equal(ids, want.to(torch.float32)), (
+                        f"rank {rank}: wrong global ids"
+                    )
+                    packed_by_rank.append(packed)
+                gathered = torch.cat(packed_by_rank, dim=1).contiguous()
+                stable_topk_from_gathered_candidates_cutedsl(
+                    gathered, topk, score_bits=score_bits, id_bits=id_bits
+                )
+        torch.accelerator.synchronize()
+    assert events == [], f"compiled after warmup: {events}"
+
+
 def _distinct_bf16_logits(rows: int, width: int, stride: int) -> torch.Tensor:
     """[rows, width] distinct positive BF16 values (consecutive bit patterns
     from 1.0, so every top-k set is unique) with the given row stride."""

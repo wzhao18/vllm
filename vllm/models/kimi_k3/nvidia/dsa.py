@@ -264,6 +264,20 @@ class KimiK3DSAIndexer(nn.Module):
         # Same as the upstream SparseAttnIndexer: decode merges each rank's
         # packed local top-N in one exchange (0 keeps the generic merge).
         self.dcp_local_topk = init_dcp_topk_merge(vllm_config, index_topk)
+        # Decode steps above that merge's row cap (and prefill chunks outside
+        # the histogram merge) take the generic merge: warm its kernels as the
+        # upstream SparseAttnIndexer does, or the first such step compiles them
+        # while serving.
+        if (
+            self.dcp_world_size > 1
+            and vllm_config.kernel_config.enable_jit_warmup
+            and current_platform.is_cuda()
+        ):
+            from vllm.model_executor.kernels.attention.dsa.dcp_indexer_cutedsl import (  # noqa: E501
+                register_dcp_candidate_merge_warmup,
+            )
+
+            register_dcp_candidate_merge_warmup()
         # Prefill chunks merge the DCP top-k by histogram exchange.
         self.dcp_prefill_merge_tie_words = dcp_prefill_merge_tie_words(
             vllm_config, index_topk

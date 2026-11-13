@@ -106,10 +106,14 @@ def pack_dcp_topk_candidates_cutedsl(
 class PackDCPTopkCandidatesKernel(
     VllmTritonJitKernel["PackDCPTopkCandidatesKernel.CompileKey"]
 ):
+    # dcp_rank is a runtime scalar, not part of the key: it only offsets the
+    # global ids (dcp_local_to_global_index), so one variant serves every DCP
+    # rank and each rank's warmup compiles exactly the variants it launches.
+    # Keying it compiled a variant per rank that warmup could not name without
+    # the DCP group (2026-11-12: post-ready compiles on TP16=DCP16 decode).
     @dataclass(frozen=True)
     class CompileKey:
         logits_dtype: torch.dtype
-        dcp_rank: int
         dcp_world_size: int
         cp_interleave: int
         has_row_starts: bool
@@ -129,6 +133,7 @@ class PackDCPTopkCandidatesKernel(
             "packed_stride1",
             "packed_stride2",
             "num_cols",
+            "dcp_rank",
         ]
     )
     def kernel(
@@ -144,7 +149,7 @@ class PackDCPTopkCandidatesKernel(
         packed_stride1,
         packed_stride2,
         num_cols,
-        DCP_RANK: tl.constexpr,
+        dcp_rank,
         DCP_WORLD_SIZE: tl.constexpr,
         CP_INTERLEAVE: tl.constexpr,
         HAS_ROW_STARTS: tl.constexpr,
@@ -177,7 +182,7 @@ class PackDCPTopkCandidatesKernel(
         )
 
         global_id = dcp_local_to_global_index(
-            safe_local_idx, DCP_RANK, DCP_WORLD_SIZE, CP_INTERLEAVE
+            safe_local_idx, dcp_rank, DCP_WORLD_SIZE, CP_INTERLEAVE
         )
         global_id = tl.where(valid, global_id, -1)
 
@@ -206,13 +211,6 @@ class PackDCPTopkCandidatesKernel(
         if topk <= 0:
             return []
 
-        try:
-            from vllm.distributed.parallel_state import get_dcp_group
-
-            dcp_rank = get_dcp_group().rank_in_group
-        except Exception:
-            dcp_rank = 0
-
         # The merge sees FP32 logits everywhere and, on SM100, also the BF16
         # MQA logits that the top-k keeps.
         logits_dtypes: tuple[torch.dtype, ...] = (torch.float32,)
@@ -220,7 +218,6 @@ class PackDCPTopkCandidatesKernel(
             logits_dtypes += (torch.bfloat16,)
         return self._trace_dispatch(self.dispatch)(
             logits_dtype=logits_dtypes,
-            dcp_rank=dcp_rank,
             dcp_world_size=dcp_world_size,
             cp_interleave=cp_interleave,
             has_row_starts=(False, True),
@@ -244,7 +241,7 @@ class PackDCPTopkCandidatesKernel(
             packed_stride1=1,
             packed_stride2=1,
             num_cols=1,
-            dcp_rank=compile_key.dcp_rank,
+            dcp_rank=0,
             dcp_world_size=compile_key.dcp_world_size,
             cp_interleave=compile_key.cp_interleave,
             has_row_starts=compile_key.has_row_starts,
@@ -278,7 +275,6 @@ class PackDCPTopkCandidatesKernel(
         grid = (topk_indices.shape[0], triton.cdiv(topk, block_size))
         return grid, dict(
             row_starts=row_starts_arg,
-            DCP_RANK=dcp_rank,
             DCP_WORLD_SIZE=dcp_world_size,
             CP_INTERLEAVE=cp_interleave,
             HAS_ROW_STARTS=has_row_starts,
@@ -650,3 +646,13 @@ class StableTopKFromGatheredCandidatesKernel(
 
 _PACK_DCP_TOPK_CANDIDATES_KERNEL = PackDCPTopkCandidatesKernel()
 _STABLE_TOPK_FROM_GATHERED_CANDIDATES_KERNEL = StableTopKFromGatheredCandidatesKernel()
+
+
+def register_dcp_candidate_merge_warmup() -> None:
+    """Register the generic DCP top-k merge kernels (candidate pack + stable
+    top-k) for JIT warmup. Every indexer that can reach
+    ``_merge_dcp_topk_global`` on CUDA with DCP > 1 must call this at
+    construction: decode steps above the one-round merge's row cap and
+    prefill chunks outside the histogram merge take that path."""
+    _PACK_DCP_TOPK_CANDIDATES_KERNEL.register_warmup()
+    _STABLE_TOPK_FROM_GATHERED_CANDIDATES_KERNEL.register_warmup()
