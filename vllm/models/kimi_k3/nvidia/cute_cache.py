@@ -17,7 +17,7 @@ process. Compiles of kernels defined under ``vllm/models/kimi_k3`` go through
   SM count), the DSL and Kimi K3 environment, the compile options, and a deep
   fingerprint of the kernel callable (the kernel object's state, function bytecode,
   closures and defaults) and of every argument (fake tensor layouts, scalars, real
-  tensors with their address). An argument the fingerprint cannot describe makes
+  tensors with their address, host tensors also with their contents). An argument the fingerprint cannot describe makes
   that compile uncached: it is compiled in memory, counted and named in the cache
   log, never silently served.
 - Sources: an entry records the vllm files its trace depends on (``_sources``: the
@@ -246,11 +246,15 @@ class _Fingerprint:
             w("Prop")
             self.add((o.fget, o.fset, o.fdel))
         elif isinstance(o, torch.Tensor):
+            if o.layout != torch.strided or o.is_quantized:
+                raise _Uncacheable(f"tensor layout {o.layout}")
             ptr = o.data_ptr() if o.device.type != "meta" else 0
             w(
                 f"Tensor:{o.dtype}:{tuple(o.shape)}:{o.stride()}:"
                 f"{o.storage_offset()}:{o.device}:{ptr}"
             )
+            if o.device.type == "cpu":  # a trace may read host values
+                w(f"data:{_cpu_tensor_digest(o)}")
         elif isinstance(
             o, (torch.dtype, torch.device, torch.Size, torch.layout, torch.memory_format)
         ):
@@ -277,6 +281,14 @@ class _Fingerprint:
                     self.add(getattr(o, name))
                 except AttributeError:
                     w("unset")
+
+
+def _cpu_tensor_digest(t: torch.Tensor) -> str:
+    """Content digest of a host tensor (its logical elements, as bytes)."""
+    flat = t.detach().contiguous().reshape(-1)
+    if flat.numel() == 0:
+        return "empty"
+    return hashlib.sha256(flat.view(torch.uint8).numpy().tobytes()).hexdigest()[:32]
 
 
 def _tree_file(path: str) -> str | None:

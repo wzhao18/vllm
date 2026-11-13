@@ -138,6 +138,29 @@ def test_claims_exclusive_stale_and_dead_owner(tmp_path, monkeypatch):
     assert not os.path.exists(path)
 
 
+def test_key_covers_cpu_tensor_contents():
+    """Host tensors (arguments or kernel state) enter the key by contents, not only
+    layout and address: the same buffer with other values is another key."""
+    host = torch.arange(16, dtype=torch.int32)
+    k = _Kernel(1.0)
+    k.table = host
+    a, a_arg = _key(k), _key(_Kernel(1.0), host)
+    assert a == _key(k) and a_arg == _key(_Kernel(1.0), host)
+    host[3] = 100  # in place: same address, layout and dtype
+    assert _key(k) != a
+    assert _key(_Kernel(1.0), host) != a_arg
+    # a strided view and a bfloat16 (no numpy dtype) tensor are hashed too
+    view = torch.arange(32, dtype=torch.float32).view(4, 8)[:, ::2]
+    b = _key(_Kernel(1.0), view)
+    view[0, 0] = -1.0
+    assert _key(_Kernel(1.0), view) != b
+    half = torch.ones(8, dtype=torch.bfloat16)
+    c = _key(_Kernel(1.0), half)
+    half[0] = 2.0
+    assert _key(_Kernel(1.0), half) != c
+    assert _key(_Kernel(1.0), torch.empty(0)) == _key(_Kernel(1.0), torch.empty(0))
+
+
 def test_fingerprint_functions_closures_cycles():
     def make(n):
         def inner():
