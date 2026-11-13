@@ -324,6 +324,35 @@ def test_uncacheable_inputs_are_reported():
         _key(k)
 
 
+def test_uncached_kernels_are_compiled_and_logged_by_name(monkeypatch):
+    """A kernel whose inputs cannot be fingerprinted is compiled normally (the plain
+    DSL compile, its result returned as is) and named in the log once per reason."""
+    from vllm.models.kimi_k3.nvidia import cute_cache
+
+    messages = []
+    monkeypatch.setattr(
+        cute_cache.logger, "info", lambda msg, *a: messages.append(msg % a)
+    )
+    compiled = object()
+    calls = []
+
+    def inner(fn, *args, trace_finalize_hooks=None, **kwargs):
+        calls.append(fn)
+        return compiled
+
+    class LockedKernel:
+        def __init__(self):
+            self.lock = threading.Lock()
+
+    before = cute_cache.stats.uncached
+    for _ in range(2):
+        assert cute_cache._compile(inner, LockedKernel(), (), {}) is compiled
+    assert len(calls) == 2 and cute_cache.stats.uncached == before + 2
+    named = [m for m in messages if "LockedKernel compiled without the cache" in m]
+    assert len(named) == 1, messages
+    assert "lock" in named[0]
+
+
 def test_only_kimi_k3_kernels_are_cached():
     from vllm.models.kimi_k3.nvidia import cute_cache
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.verify import lmhead

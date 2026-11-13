@@ -988,9 +988,16 @@ def _trace_only(inner, fn, args, kwargs) -> dict:
 
 
 def _uncached_reason(name: str, why: str) -> None:
+    """Count a compile that bypasses the cache; the first one of each kernel and
+    reason is logged by name (the kernel is compiled normally, in memory)."""
     with _lock:
         reason = f"{name}: {why}"
+        first = reason not in stats.reasons
         stats.reasons[reason] = stats.reasons.get(reason, 0) + 1
+    if first:
+        logger.info(
+            "Kimi K3 CuTe cache: %s compiled without the cache (%s)", name, why
+        )
 
 
 def _compile_and_store(inner, fn, args, kwargs, key, modules, name):
