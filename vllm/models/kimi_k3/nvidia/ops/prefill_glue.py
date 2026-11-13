@@ -444,6 +444,8 @@ __global__ void gate_sigmoid_mul_kernel(uint16_t* __restrict__ out,
 // ---------------------------------------------------------------------------
 // scatter_rows: dst[index[i]] = src[i] for whole rows (the KDA final-state
 // write-back), 16 bytes per thread; negative indices wrap as in index_put_.
+// index may be a strided view (e.g. block_table[:, 0] of a multi-column
+// spec-decode mamba block table): element i is index[i * idx_stride].
 // ---------------------------------------------------------------------------
 
 template <typename IdxT>
@@ -452,9 +454,10 @@ __global__ void scatter_rows_kernel(uint4* __restrict__ dst,
                                     const IdxT* __restrict__ index,
                                     int64_t dst_slots, int64_t row_vecs,
                                     int64_t dst_stride_vecs,
-                                    int64_t src_stride_vecs) {
+                                    int64_t src_stride_vecs,
+                                    int64_t idx_stride) {
   int64_t const i = blockIdx.y;
-  int64_t slot = (int64_t)index[i];
+  int64_t slot = (int64_t)index[i * idx_stride];
   if (slot < 0) slot += dst_slots;
   const uint4* s = src + i * src_stride_vecs;
   uint4* d = dst + slot * dst_stride_vecs;
@@ -614,16 +617,17 @@ void scatter_rows(torch::Tensor& dst, const torch::Tensor& index,
   auto stream = c10::cuda::getCurrentCUDAStream();
   const int64_t ds = dst.stride(0) * dst.element_size() / 16;
   const int64_t ss = src.stride(0) * src.element_size() / 16;
+  const int64_t is = index.stride(0);
   if (index.scalar_type() == at::kInt) {
     scatter_rows_kernel<int32_t><<<grid, threads, 0, stream>>>(
         reinterpret_cast<uint4*>(dst.data_ptr()),
         reinterpret_cast<const uint4*>(src.data_ptr()), index.data_ptr<int32_t>(),
-        dst.size(0), row_vecs, ds, ss);
+        dst.size(0), row_vecs, ds, ss, is);
   } else {
     scatter_rows_kernel<int64_t><<<grid, threads, 0, stream>>>(
         reinterpret_cast<uint4*>(dst.data_ptr()),
         reinterpret_cast<const uint4*>(src.data_ptr()), index.data_ptr<int64_t>(),
-        dst.size(0), row_vecs, ds, ss);
+        dst.size(0), row_vecs, ds, ss, is);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
