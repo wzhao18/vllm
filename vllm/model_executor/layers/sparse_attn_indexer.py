@@ -1594,12 +1594,10 @@ class SparseAttnIndexer(CustomOp):
 
             if self.dcp_world_size > 1 and current_platform.is_cuda() and has_cutedsl():
                 from vllm.model_executor.kernels.attention.dsa.dcp_indexer_cutedsl import (  # noqa: E501
-                    _PACK_DCP_TOPK_CANDIDATES_KERNEL,
-                    _STABLE_TOPK_FROM_GATHERED_CANDIDATES_KERNEL,
+                    register_dcp_candidate_merge_warmup,
                 )
 
-                _PACK_DCP_TOPK_CANDIDATES_KERNEL.register_warmup()
-                _STABLE_TOPK_FROM_GATHERED_CANDIDATES_KERNEL.register_warmup()
+                register_dcp_candidate_merge_warmup()
 
     def forward_native(
         self,
