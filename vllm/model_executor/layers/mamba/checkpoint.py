@@ -270,7 +270,11 @@ class MambaPrefillCheckpointExporter:
         )
 
 
-@triton.jit
+# raw_qkv is either its own tensor or a column slice of a wider fused
+# projection, so its token stride takes several values while serving; as a
+# constexpr each value compiled its own variant after warmup. It only scales
+# the gathered token index, so it stays an unspecialized runtime scalar.
+@triton.jit(do_not_specialize=["x_stride_0"])
 def store_cache_checkpoints_kernel(
     x_ptr,
     conv_state_ptr,
@@ -281,7 +285,7 @@ def store_cache_checkpoints_kernel(
     checkpoint_state_indices_ptr,
     recurrent_rows_ptr,
     token_indices_ptr,
-    x_stride_0: tl.constexpr,
+    x_stride_0,
     x_stride_1: tl.constexpr,
     state_stride_0: tl.constexpr,
     state_stride_1: tl.constexpr,
