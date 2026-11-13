@@ -43,6 +43,7 @@ def _check_no_compile_after_warmup(world: int, rank: int) -> None:
     )
     from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
     from vllm.utils import jit_monitor
+    from vllm.utils.deep_gemm import mqa_logits_use_mx_scales
 
     group = get_dcp_group()
     assert group.rank_in_group == rank
@@ -64,6 +65,7 @@ def _check_no_compile_after_warmup(world: int, rank: int) -> None:
     dtypes = [torch.float32]
     if current_platform.is_device_capability_family(100):
         dtypes.append(torch.bfloat16)
+    score_bits = 16 if mqa_logits_use_mx_scales() else 32
     gen = torch.Generator(device="cuda").manual_seed(1000 + rank)
     width = 4096
     with jit_monitor.record_jit_events() as events:
@@ -92,11 +94,17 @@ def _check_no_compile_after_warmup(world: int, rank: int) -> None:
                         world,
                         1,
                         row_starts=row_starts,
-                        score_bits=16 if dtype == torch.bfloat16 else 32,
+                        # As the indexer passes them: the MQA logits' bits
+                        # (BF16 on SM10x, also when the top-k reads an FP32
+                        # copy).
+                        score_bits=score_bits,
                         num_positions=MAX_MODEL_LEN,
                     )
-                    # Merged ids are global positions, identical on every rank.
-                    every = group.all_gather(topk.unsqueeze(0), dim=0)
+                    # The merged id set is identical on every rank (the
+                    # selector's slot order is not).
+                    every = group.all_gather(
+                        topk.sort(dim=1).values.unsqueeze(0), dim=0
+                    )
                     for r in range(world):
                         assert torch.equal(every[r], every[0]), f"rank {r} differs"
         torch.accelerator.synchronize()
