@@ -14,7 +14,8 @@ process. Compiles of kernels defined under ``vllm/models/kimi_k3`` go through
 
 - Key (taken before tracing): the CuTe DSL / torch / Python versions and the
   versions of the foreign packages kernels run while tracing, the GPU (capability,
-  SM count), the DSL and Kimi K3 environment, the compile options, and a deep
+  SM count), the DSL and Kimi K3 environment, the target GPU architecture and the
+  full resolved compile option set (``_compile_target``), and a deep
   fingerprint of the kernel callable (the kernel object's state, function bytecode,
   closures and defaults) and of every argument (fake tensor layouts, scalars, real
   tensors with their address, host tensors also with their contents). An argument the fingerprint cannot describe makes
@@ -453,13 +454,88 @@ def _environment() -> str:
     return "\n".join(parts)
 
 
+def _jit_function(fn: Any) -> Any:
+    """The ``@cute.jit`` function ``cute.compile(fn, ...)`` compiles (as the DSL
+    resolves it: bound method, callable instance, decorator wrappers)."""
+    target = fn
+    if isinstance(target, types.MethodType):
+        target = target.__func__
+    elif not isinstance(target, types.FunctionType):
+        call = getattr(type(target), "__call__", None)
+        target = getattr(call, "__func__", call)
+    while hasattr(target, "__wrapped__"):
+        target = target.__wrapped__
+    return target
+
+
+def _fallback_arch() -> str:
+    """The DSL's own default when no DSL object is reachable: ``CUTE_DSL_ARCH``,
+    else the current device (``sm_<major><minor>a`` from Hopper on)."""
+    arch = os.environ.get("CUTE_DSL_ARCH")
+    if arch:
+        return arch
+    if torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability()
+        return f"sm_{major}{minor}{'a' if major >= 9 else ''}"
+    return "sm_100a"
+
+
+def _dsl_arch(fn: Any) -> str:
+    """The GPU architecture the DSL compiles ``fn`` for without a ``--gpu-arch``
+    option (its environment manager's arch: ``CUTE_DSL_ARCH`` read at DSL start,
+    else the detected device)."""
+    target = _jit_function(fn)
+    dsl = getattr(target, "_dsl_object", None)
+    if dsl is None and hasattr(target, "_dsl_cls"):
+        dsl = target._dsl_cls._get_dsl()  # the singleton the compile materializes
+    envar = getattr(dsl, "envar", None)
+    arch = getattr(envar, "arch", None) if envar is not None else None
+    return str(arch) if arch else _fallback_arch()
+
+
+def _serialized(resolved: Any) -> tuple[tuple[str, ...], str]:
+    """(every option of a ``CompileOptions`` serialized, its ``--gpu-arch``)."""
+    if resolved is None:
+        return (), ""
+    flags = sorted(filter(None, (o.serialize() for o in resolved.options.values())))
+    return tuple(flags), resolved.gpu_arch
+
+
+@functools.lru_cache(maxsize=256)
+def _parsed_options(raw: str) -> tuple[tuple[str, ...], str]:
+    """An ``options=`` string resolved by the DSL's own parser (once per string)."""
+    from cutlass.base_dsl.compiler import _parse_compile_options_from_str
+
+    return _serialized(_parse_compile_options_from_str(raw))
+
+
+def _compile_target(compile_fn: Any, fn: Any, kwargs: dict) -> str:
+    """The GPU architecture and the full compile option set of this compile, as the
+    DSL resolves them (``options=`` string, else the ``cute.compile[...]`` options):
+    every option serialized, so a default the DSL changes or an architecture taken
+    from the environment is explicit in the key."""
+    raw = kwargs.get("options")
+    try:
+        if isinstance(raw, str) and raw.strip():
+            flags, arch = _parsed_options(raw)
+        else:
+            flags, arch = _serialized(getattr(compile_fn, "_compile_options", None))
+        arch = arch or _dsl_arch(fn)
+    except Exception as error:  # an option string the DSL itself would reject
+        raise _Uncacheable(
+            f"compile options not resolvable ({type(error).__name__}: {error})"
+        ) from error
+    return f"arch {arch}\noptions {' '.join(flags)}"
+
+
 def _key_and_modules(compile_fn: Any, fn: Any, args: tuple, kwargs: dict):
     fp = _Fingerprint()
     fp.add(getattr(compile_fn, "_compile_options", None))
     fp.add(fn)
     fp.add(args)
     fp.add(kwargs)
-    head = f"{_versions()}\n{_environment()}\n"
+    target = _compile_target(compile_fn, fn, kwargs)
+    head = f"{_versions()}\n{_environment()}\n{target}\n"
     return hashlib.sha256((head + fp.digest()).encode()).hexdigest(), fp.modules
 
 

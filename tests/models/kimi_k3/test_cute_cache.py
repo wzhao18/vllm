@@ -70,6 +70,47 @@ def test_key_is_deterministic_and_input_sensitive(monkeypatch):
     assert not hasattr(cute_cache, "_source_digest")
 
 
+def test_key_has_explicit_arch_and_resolved_options(monkeypatch):
+    """The target architecture and the resolved option set are in the key: an
+    architecture the DSL takes from the device (no --gpu-arch, no environment
+    change) and each option value give another key."""
+    from vllm.models.kimi_k3.nvidia import cute_cache
+
+    k = _Kernel(1.0)
+    target = cute_cache._compile_target(None, k, {"options": "--gpu-arch=sm_107a"})
+    assert target.startswith("arch sm_107a\n"), target
+    assert "sm_107a" in target.split("\n")[1]  # also among the serialized options
+    o2 = cute_cache._compile_target(None, k, {"options": "--opt-level 2"})
+    o3 = cute_cache._compile_target(None, k, {"options": "--opt-level 3"})
+    assert o2 != o3
+    ffi = cute_cache._compile_target(None, k, {"options": "--enable-tvm-ffi"})
+    assert ffi != cute_cache._compile_target(None, k, {})
+    # no --gpu-arch: the DSL's architecture, explicitly
+    monkeypatch.setattr(cute_cache, "_dsl_arch", lambda fn: "sm_100a")
+    a = _key(k, torch.empty(0), options="--opt-level 2")
+    assert cute_cache._compile_target(None, k, {}).startswith("arch sm_100a\n")
+    monkeypatch.setattr(cute_cache, "_dsl_arch", lambda fn: "sm_107a")
+    assert _key(k, torch.empty(0), options="--opt-level 2") != a
+    # an option string the DSL rejects: uncached, not guessed
+    with pytest.raises(cute_cache._Uncacheable, match="compile options"):
+        _key(k, options="--no-such-option 1")
+
+
+def test_dsl_arch_is_the_dsl_environment_arch():
+    import cutlass.cute as cute
+
+    from vllm.models.kimi_k3.nvidia import cute_cache
+
+    @cute.jit
+    def jitted(x: cute.Tensor):
+        pass
+
+    arch = cute_cache._dsl_arch(jitted)
+    assert arch.startswith("sm_"), arch
+    if os.environ.get("CUTE_DSL_ARCH"):
+        assert arch == os.environ["CUTE_DSL_ARCH"]
+
+
 def test_sources_cover_kernel_executed_files_and_their_imports():
     from vllm.models.kimi_k3.nvidia import cute_cache
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.oproj import producer
