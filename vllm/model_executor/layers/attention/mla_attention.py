@@ -1039,17 +1039,28 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     self._reserve_dcp_shardq_workspace(k_c_normed.device)
             elif self.dcp_manager is not None and self.dcp_manager.use_a2a:
                 # Without ShardQ (e.g. a disaggregated decode instance) every
-                # step keeps the DCP path, and a step beyond the direct
-                # workspace (prompt rows: recompute, cache-hit suffixes) takes
-                # the NCCL A2A fallback: warm its collectives and every Triton
-                # variant here instead of in the serving loop (a ~80 s stall).
+                # step keeps the DCP path. A backend that bounds the DCP path's
+                # rows (dcp_path_max_rows: the DCP workspace's tokens) gets
+                # larger steps (prompt rows: recompute, cache-hit suffixes) in
+                # row chunks of that size, which never leave the direct
+                # workspaces; without that bound a step beyond the direct
+                # workspace takes the NCCL A2A fallback. Warm the collectives
+                # and every Triton variant of the largest step the DCP path can
+                # take here instead of in the serving loop (a ~80 s stall),
+                # and only those: an NCCL A2A over the DCP group that serving
+                # never runs would hold its communicator buffers (GiBs over a
+                # 16-rank multi-node group) for nothing.
                 from vllm.v1.attention.ops.dcp_shardq import (
                     context as shardq_context,
                 )
 
+                max_tokens = (
+                    get_current_vllm_config().scheduler_config.max_num_batched_tokens
+                )
+                row_cap = getattr(self.impl, "dcp_path_max_rows", None)
                 shardq_context.warm_up_dcp_fallback(
                     self.dcp_manager,
-                    get_current_vllm_config().scheduler_config.max_num_batched_tokens,
+                    min(max_tokens, row_cap) if row_cap else max_tokens,
                 )
 
             # The zero fill is required when used with DP + EP

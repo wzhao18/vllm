@@ -763,7 +763,9 @@ def trtllm_gen_lse_slab_rows(vllm_config: VllmConfig, dcp_shardq: bool) -> int:
     preemption, warmup) launch the kernel in balanced row chunks that fit the
     slab (``FlashInferMLASparseImpl._forward_mqa_kernel``); the query gather,
     the DCP combine and W_UV still run once over the whole step
-    (``dcp_path_max_rows`` stays ``trtllm_gen_lse_max_rows``)."""
+    (``dcp_path_max_rows``, which on a decode-only instance is itself bounded by
+    the DCP workspace's tokens, so those steps already arrive in row chunks that
+    fit the slab)."""
     rows = trtllm_gen_lse_max_rows(vllm_config, dcp_shardq)
     if dcp_shardq or not _decode_only_instance(vllm_config):
         return rows
@@ -784,6 +786,19 @@ def trtllm_gen_lse_launch_rows(num_rows: int, max_launch_rows: int) -> int:
         return max(num_rows, 1)
     launches = -(-num_rows // max_launch_rows)
     return -(-num_rows // launches)
+
+
+def dcp_path_max_rows(vllm_config: VllmConfig, dcp_shardq: bool) -> int:
+    """Most rows of one DCP-path MQA pass: ``trtllm_gen_lse_max_rows``, and on
+    a decode-only instance at most the DCP workspace's tokens
+    (``dcp_path_rows_bound``). MLAAttention runs a step with more MQA rows in
+    row chunks of this many rows, and the memory profile claims one chunk's
+    working set."""
+    from vllm.v1.attention.ops.dcp import dcp_path_rows_bound
+
+    rows = trtllm_gen_lse_max_rows(vllm_config, dcp_shardq)
+    bound = None if dcp_shardq else dcp_path_rows_bound(vllm_config)
+    return rows if bound is None else min(rows, bound)
 
 
 def trtllm_gen_lse_rows_capacity(workspace_bytes: int, padded_heads: int) -> int:
@@ -1165,9 +1180,7 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         # trtllm-gen launches with LSE, e.g. the specialized decode's, must fit).
         self.lse_slab_rows: int | None = None
         if self.dcp_world_size > 1 and not self.use_prims_ts:
-            self.dcp_path_max_rows = trtllm_gen_lse_max_rows(
-                vllm_config, self.use_shardq
-            )
+            self.dcp_path_max_rows = dcp_path_max_rows(vllm_config, self.use_shardq)
             self.lse_slab_rows = trtllm_gen_lse_slab_rows(
                 vllm_config, self.use_shardq
             )
@@ -1351,9 +1364,10 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
             steps.append(rows * (padded * self.kv_lora_rank * 2 + topk * 4))
         if self.dcp_world_size > 1:
             # The DCP path's rows: under DCP ShardQ its steps are bounded, and
-            # the layer runs larger ones (dense-MHA steps) in chunks of these
+            # the layer runs larger ones (dense-MHA steps; on a decode-only
+            # instance any step past the DCP workspace) in chunks of these
             # rows (dcp_path_max_rows).
-            rows = trtllm_gen_lse_max_rows(vllm_config, dcp_shardq)
+            rows = dcp_path_max_rows(vllm_config, dcp_shardq)
             self.dcp_path_max_rows = rows
             steps.append(
                 kernel_bytes(rows, self.num_heads * self.dcp_world_size, True)
