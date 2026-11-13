@@ -172,3 +172,56 @@ def test_exporter_stores_each_callers_checkpoints(caller: str, state_layout: str
 
     assert torch.equal(conv_state, expected_conv)
     assert torch.equal(recurrent_state, expected_recurrent)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda_alike(), reason="needs a GPU")
+@torch.inference_mode()
+def test_exporter_raw_qkv_stride_compiles_once():
+    """raw_qkv is its own tensor or a 16-element-aligned column slice of a wider
+    fused projection, so its token stride varies while serving (2026-11-12 C512
+    run: token stride 9216 at warmup, 12448 after 70 min, a post-warmup compile
+    of store_cache_checkpoints_kernel on the prefill ranks). Every layout must
+    share one variant and store the same checkpoints."""
+    from vllm.utils import jit_monitor
+
+    device = torch.device("cuda")
+    gen = torch.Generator(device=device).manual_seed(1)
+    width, conv_window = 96, 3
+    cu_seqlens = torch.tensor(
+        [0, *torch.tensor(QUERY_LENS).cumsum(0).tolist()],
+        dtype=torch.int32,
+        device=device,
+    )
+    num_tokens = sum(QUERY_LENS)
+    raw_qkv = torch.randn(
+        num_tokens, width, device=device, dtype=torch.bfloat16, generator=gen
+    )
+    conv_state = torch.randn(
+        NUM_SLOTS, width, conv_window, device=device, dtype=torch.bfloat16
+    )
+    checkpoint = MambaPrefillCheckpointMetadata(
+        torch.tensor(OFFSETS, dtype=torch.int32, device=device),
+        torch.tensor(STATE_SLOTS, dtype=torch.int32, device=device),
+    )
+    exporter = MambaPrefillCheckpointExporter(state_len=conv_window)
+
+    def run(x):
+        out = conv_state.clone()
+        exporter.export(checkpoint, raw_qkv=x, conv_state=out, cu_seqlens=cu_seqlens)
+        torch.accelerator.synchronize()
+        return out
+
+    ref = run(raw_qkv)
+    slices = []
+    for wide_width in (160, 248, 1000):
+        wide = torch.randn(
+            num_tokens, wide_width, device=device, dtype=torch.bfloat16, generator=gen
+        )
+        wide[:, 16 : 16 + width] = raw_qkv
+        slices.append(wide[:, 16 : 16 + width])
+    assert len({x.stride(0) for x in [raw_qkv, *slices]}) == 4
+    with jit_monitor.record_jit_events() as events:
+        outs = [run(x) for x in slices]
+    assert events == [], f"compiled for another raw_qkv stride: {events}"
+    for out in outs:
+        assert torch.equal(out, ref)
