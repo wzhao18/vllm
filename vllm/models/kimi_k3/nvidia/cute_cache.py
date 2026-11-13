@@ -18,9 +18,9 @@ process. Compiles of kernels defined under ``vllm/models/kimi_k3`` go through
   full resolved compile option set (``_compile_target``), and a deep
   fingerprint of the kernel callable (the kernel object's state, function bytecode,
   closures and defaults) and of every argument (fake tensor layouts, scalars, real
-  tensors with their address, host tensors also with their contents). An argument the fingerprint cannot describe makes
-  that compile uncached: it is compiled in memory, counted and named in the cache
-  log, never silently served.
+  tensors with their address, host tensors also with their contents). An argument
+  the fingerprint cannot describe makes that compile uncached: it is compiled in
+  memory, counted and named in the cache log, never silently served.
 - Sources: an entry records the vllm files its trace depends on (``_sources``: the
   modules of the kernel and its arguments, every file whose code ran during the
   trace, and their direct imports) with their content digests, and is a hit only
@@ -42,9 +42,9 @@ process. Compiles of kernels defined under ``vllm/models/kimi_k3`` go through
   package file starts a new directory instead of hitting entries of the old code.
 - Shared cold starts: ranks, nodes and processes share the directory (put
   ``VLLM_KIMI_K3_CUTE_CACHE_DIR`` on a shared file system for cross-node
-  sharing). A miss takes the key's claim file; a process that finds it taken gets a ``_Deferred`` kernel
-  and goes on, so the ranks of a deployment compile disjoint parts of the key set in
-  parallel and load the rest (see "cross-process claims").
+  sharing). A miss takes the key's claim file; a process that finds it taken gets
+  a ``_Deferred`` kernel and goes on, so the ranks of a deployment compile disjoint
+  parts of the key set in parallel and load the rest (see "cross-process claims").
 - ``VERIFY`` (tests and validation starts only; a module attribute, no
   environment switch): every hit is also traced and its DSL module hash must equal
   the stored one, which checks that the pre-trace key covers every trace input of
