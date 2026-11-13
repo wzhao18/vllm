@@ -160,3 +160,24 @@ def test_write_state_rows_matches_index_put(pg, idx_dtype, rows):
     out = dst0.clone()
     pg.write_state_rows(out, idx, src)
     assert torch.equal(out, ref)
+
+
+@pytest.mark.parametrize("idx_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("cols", [1, 4, 8])
+@pytest.mark.parametrize("rows", [1, 2, 32])
+def test_write_state_rows_strided_index(pg, idx_dtype, cols, rows):
+    # The prefill KDA write-back passes block_table[:, 0]: with DSpark spec
+    # decoding the mamba block table has num_spec + 1 columns, so the index is
+    # a strided column view. Every row must land in ITS OWN column-0 slot.
+    slots, heads, dk, dv = 600, 4, 128, 128
+    perm = torch.randperm(slots, device="cuda")[: rows * cols].to(idx_dtype)
+    block_table = perm.view(rows, cols)
+    idx = block_table[:, 0]
+    assert idx.stride(0) == cols
+    dst0 = torch.randn(slots, heads, dk, dv, device="cuda")
+    src = torch.randn(rows, heads, dk, dv, device="cuda")
+    ref = dst0.clone()
+    ref[idx] = src
+    out = dst0.clone()
+    pg.write_state_rows(out, idx, src)
+    assert torch.equal(out, ref)
