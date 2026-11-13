@@ -44,9 +44,11 @@ process. Compiles of kernels defined under ``vllm/models/kimi_k3`` go through
   the key's claim file; a process that finds it taken gets a ``_Deferred`` kernel
   and goes on, so the ranks of a deployment compile disjoint parts of the key set in
   parallel and load the rest (see "cross-process claims").
-- ``VERIFY`` (tests only): every hit is also traced and its DSL module hash must
-  equal the stored one, which checks that the pre-trace key covers every trace
-  input of the kernels a start compiles.
+- ``VERIFY`` (tests and validation starts only; a module attribute, no
+  environment switch): every hit is also traced and its DSL module hash must equal
+  the stored one, which checks that the pre-trace key covers every trace input of
+  the kernels a start compiles. A mismatch raises ``VerifyMismatch`` (a
+  BaseException: kernel compile fallbacks cannot swallow it).
 """
 
 import ast
@@ -108,6 +110,8 @@ class Stats:
     compile_s: float = 0.0  # trace + MLIR + export of misses and uncached
     deferred: int = 0  # claimed by another process when first asked for
     wait_s: float = 0.0  # resolving deferred kernels (waiting for peers)
+    verified: int = 0  # VERIFY: hits re-traced to the stored module hash
+    mismatched: int = 0  # VERIFY: hits that did not (raised VerifyMismatch)
     # what made compiles uncached -> count
     reasons: dict = field(default_factory=dict)
     # kernel -> [hits, misses, uncached, compile seconds, deferred]
@@ -1050,6 +1054,35 @@ def _compile_and_store(inner, fn, args, kwargs, key, modules, name):
     return loaded
 
 
+class VerifyMismatch(BaseException):
+    """VERIFY: a cache hit traced to another DSL module than the stored one (the
+    pre-trace key misses a trace input), or its re-trace failed. A BaseException,
+    so no kernel's compile-failure fallback (``except Exception``) can turn it into
+    a different path: the start fails."""
+
+
+def _verify(inner, fn, args, kwargs, key, variant, name, stored) -> None:
+    """Trace a hit again and require its DSL module hash to equal the stored one."""
+    try:
+        traced = _trace_only(inner, fn, args, kwargs).get("ir")
+    except Exception as error:
+        _record(name, None, mismatched=1)
+        raise VerifyMismatch(
+            f"Kimi K3 CuTe cache VERIFY: re-trace of the hit {key[:16]}/{variant} "
+            f"({name}) failed: {type(error).__name__}: {error}"
+        ) from error
+    if traced != stored:
+        _record(name, None, mismatched=1)
+        message = (
+            f"Kimi K3 CuTe cache VERIFY MISMATCH: key {key[:16]}/{variant} of {name} "
+            f"hit an entry traced to a different module (stored {stored[:16]}, now "
+            f"{str(traced)[:16]}): the pre-trace key misses an input"
+        )
+        logger.error(message)
+        raise VerifyMismatch(message)
+    _record(name, None, verified=1)
+
+
 def _load_entry(inner, fn, args, kwargs, key, modules, name, found):
     variant, record = found
     loaded_at = time.perf_counter()
@@ -1063,13 +1096,7 @@ def _load_entry(inner, fn, args, kwargs, key, modules, name, found):
         )  # fmt: skip
         return _compile_and_store(inner, fn, args, kwargs, key, modules, name)
     if VERIFY:
-        traced = _trace_only(inner, fn, args, kwargs)
-        if traced.get("ir") != record["ir"]:
-            raise RuntimeError(
-                f"Kimi K3 CuTe cache: key {key[:16]} of {name} hit an entry traced "
-                f"to a different module (stored {record['ir'][:16]}, now "
-                f"{str(traced.get('ir'))[:16]}): the pre-trace key misses an input"
-            )
+        _verify(inner, fn, args, kwargs, key, variant, name, record["ir"])
     _record(name, 0, 0.0, loaded=1, load_s=time.perf_counter() - loaded_at)
     return loaded
 
@@ -1224,9 +1251,11 @@ def log_summary(stage: str, table: bool = False) -> None:
     logger.info(
         "Kimi K3 CuTe cache (%s, %.0f s since import): %d loaded, %d compiled, %d "
         "uncached, %d deferred to peers (waited %.0f s); keys %.0f s, loads %.0f s, "
-        "compiles %.0f s (%s); slowest: %s%s",
+        "compiles %.0f s (%s)%s; slowest: %s%s",
         stage, time.perf_counter() - _started, s.loaded, s.compiled, s.uncached,
         s.deferred, s.wait_s, s.key_s, s.load_s, s.compile_s, cache_dir(),
+        f"; VERIFY {s.verified} hits re-traced equal, {s.mismatched} mismatched"
+        if VERIFY else "",
         ", ".join(f"{n} {e[1] + e[2]}x {e[3]:.0f} s" for n, e in kernels[:8]),
         "; uncached: " + ", ".join(f"{r} {c}x" for r, c in reasons) if reasons else "",
     )  # fmt: skip

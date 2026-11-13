@@ -276,6 +276,45 @@ def test_install_identity_namespaces_the_directory(tmp_path, monkeypatch):
         cute_cache.install_identity.cache_clear()
 
 
+def test_verify_mismatch_raises_through_fallbacks(tmp_path, monkeypatch):
+    """VERIFY: a hit whose re-trace gives another module hash (or whose re-trace
+    fails) raises VerifyMismatch, which an ``except Exception`` compile fallback
+    does not catch; an equal hash is counted as verified."""
+    from vllm.models.kimi_k3.nvidia import cute_cache
+
+    loaded = object()
+    monkeypatch.setattr(cute_cache, "VERIFY", True)
+    monkeypatch.setattr(cute_cache, "_load", lambda *a: loaded)
+    record = {"ir": "a" * 64, "tvm_ffi": False}
+    entry = ("v1", record)
+    traced = {"ir": "a" * 64}
+
+    def trace_only(*a):
+        if isinstance(traced, Exception):
+            raise traced
+        return traced
+
+    monkeypatch.setattr(cute_cache, "_trace_only", trace_only)
+    before = cute_cache.stats.verified
+    hit = cute_cache._load_entry(None, None, (), {}, "k" * 64, set(), "K", entry)
+    assert hit is loaded and cute_cache.stats.verified == before + 1
+
+    traced = {"ir": "b" * 64}
+    with pytest.raises(cute_cache.VerifyMismatch, match="MISMATCH"):
+        try:  # a kernel's compile-failure fallback
+            cute_cache._load_entry(None, None, (), {}, "k" * 64, set(), "K", entry)
+        except Exception:
+            pytest.fail("VerifyMismatch was caught by an `except Exception` fallback")
+    traced = {}  # the re-trace produced no module hash
+    with pytest.raises(cute_cache.VerifyMismatch):
+        cute_cache._load_entry(None, None, (), {}, "k" * 64, set(), "K", entry)
+    traced = ValueError("trace failed")
+    with pytest.raises(cute_cache.VerifyMismatch, match="trace failed"):
+        cute_cache._load_entry(None, None, (), {}, "k" * 64, set(), "K", entry)
+    assert issubclass(cute_cache.VerifyMismatch, BaseException)
+    assert not issubclass(cute_cache.VerifyMismatch, Exception)
+
+
 def test_uncacheable_inputs_are_reported():
     from vllm.models.kimi_k3.nvidia import cute_cache
 
