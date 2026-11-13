@@ -175,6 +175,43 @@ def test_key_covers_base_classes_and_foreign_packages():
         assert name in versions
 
 
+def test_install_identity_namespaces_the_directory(tmp_path, monkeypatch):
+    """A patched Python file or a replaced compiled file of a traced package (an
+    overlay, a new image) gives a new cache directory."""
+    from vllm.models.kimi_k3.nvidia import cute_cache
+
+    pkg = tmp_path / "k3cc_fake_pkg"
+    (pkg / "sub").mkdir(parents=True)
+    (pkg / "__init__.py").write_text("X = 1\n")
+    (pkg / "sub" / "mod.py").write_text("def f():\n    return 1\n")
+    (pkg / "sub" / "_ext.so").write_bytes(b"\0" * 64)
+    (pkg / "__pycache__").mkdir()
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(cute_cache, "_IDENTITY_PACKAGES", ("k3cc_fake_pkg",))
+    monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path / "cache"))
+
+    def identity():
+        cute_cache.install_identity.cache_clear()
+        return cute_cache.install_identity()
+
+    try:
+        base = identity()
+        assert base == identity()  # stable
+        assert cute_cache.cache_dir().endswith(os.sep + base)
+        (pkg / "__pycache__" / "mod.cpython-312.pyc").write_bytes(b"x")
+        assert identity() == base  # bytecode caches are not code
+        (pkg / "sub" / "mod.py").write_text("def f():\n    return 2\n")
+        patched = identity()
+        assert patched != base  # a patched submodule
+        (pkg / "sub" / "_ext.so").write_bytes(b"\0" * 65)
+        replaced = identity()
+        assert replaced not in (base, patched)  # a replaced extension
+        (pkg / "sub" / "extra.py").write_text("")
+        assert identity() not in (base, patched, replaced)  # an added file
+    finally:
+        cute_cache.install_identity.cache_clear()
+
+
 def test_uncacheable_inputs_are_reported():
     from vllm.models.kimi_k3.nvidia import cute_cache
 

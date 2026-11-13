@@ -33,6 +33,11 @@ process. Compiles of kernels defined under ``vllm/models/kimi_k3`` go through
   pipeline runs. A miss compiles, exports and returns the loaded object, so cold
   and warm starts run the same launcher. An entry that does not load is logged,
   recompiled and replaced.
+- Directory: ``<VLLM_CACHE_ROOT>/kimi_k3/cutedsl_pretrace/<DSL version, FORMAT>/
+  <install identity>``. The install identity (``install_identity``) hashes the
+  installed distributions and the files of the foreign packages kernels trace
+  with, so a new image, an overlay or a patched package file starts a new
+  directory instead of hitting entries of the old code.
 - Shared cold starts: ranks, nodes and processes share the directory (put
   ``VLLM_CACHE_ROOT`` on a shared file system for cross-node sharing). A miss takes
   the key's claim file; a process that finds it taken gets a ``_Deferred`` kernel
@@ -72,7 +77,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 # Bumped when the key or the entry layout changes.
-FORMAT = 2
+FORMAT = 3
 # Tests: re-trace every hit and compare the DSL module hash with the stored one.
 VERIFY = False
 
@@ -457,13 +462,104 @@ def key_of(compile_fn: Any, fn: Any, args: tuple, kwargs: dict) -> str:
 # ------------------------------------------------------------------------- store
 
 
+# Installed code hashed into the cache directory name (``install_identity``): the
+# foreign packages the kernels run while tracing, and the CuTe DSL distribution
+# (its compiler libraries live next to, not inside, the ``cutlass`` package).
+_IDENTITY_PACKAGES = (*_FOREIGN_PACKAGES, "nvidia_cutlass_dsl")
+# Compiled files: identified by size and modification time (Python files by content).
+_BINARY_SUFFIXES = (".so", ".pyd", ".cubin", ".fatbin", ".ptx", ".bc")
+
+
+def _package_roots(name: str) -> list[str]:
+    import importlib.util
+
+    try:
+        spec = importlib.util.find_spec(name)
+    except (ImportError, ValueError):
+        return []
+    if spec is None:
+        return []
+    if spec.submodule_search_locations:
+        return sorted(os.path.realpath(p) for p in spec.submodule_search_locations)
+    return [os.path.realpath(spec.origin)] if spec.origin else []
+
+
+def _hash_tree(h: Any, root: str) -> int:
+    """Add every Python file under ``root`` (by content) and every compiled file
+    (by size and modification time) to ``h``; return the number of files."""
+    if os.path.isfile(root):
+        walk = [(os.path.dirname(root), [], [os.path.basename(root)])]
+    else:
+        walk = os.walk(root)
+    count = 0
+    for folder, dirs, files in walk:
+        dirs[:] = sorted(d for d in dirs if d != "__pycache__")
+        for name in sorted(files):
+            path = os.path.join(folder, name)
+            rel = os.path.relpath(path, root)
+            if name.endswith(".py"):
+                try:
+                    with open(path, "rb") as f:
+                        digest = hashlib.sha256(f.read()).hexdigest()
+                except OSError:
+                    digest = "?"
+                h.update(f"py\0{rel}\0{digest}\n".encode())
+            elif name.endswith(_BINARY_SUFFIXES) or ".so." in name:
+                try:
+                    st = os.stat(path)
+                    stamp = f"{st.st_size}:{st.st_mtime_ns}"
+                except OSError:
+                    stamp = "?"
+                h.update(f"bin\0{rel}\0{stamp}\n".encode())
+            else:
+                continue
+            count += 1
+    return count
+
+
+@functools.cache
+def install_identity() -> str:
+    """Digest of the installed code a compile depends on outside the vllm tree: the
+    Python version, every installed distribution (name and version) and the files
+    of the foreign packages the kernels trace with (``_IDENTITY_PACKAGES``: Python
+    files by content, compiled files by size and modification time). It names the
+    cache directory, so another image, an overlay on the package path or a patched
+    file of one of those packages never reads an entry of the old one. (The vllm
+    files a trace runs are matched per entry, ``_sources``.)"""
+    import importlib.metadata
+
+    start = time.perf_counter()
+    h = hashlib.sha256(f"f{FORMAT}\n{sys.version}\n".encode())
+    dists = set()
+    for dist in importlib.metadata.distributions():
+        try:
+            dists.add(f"{dist.metadata['Name']}=={dist.version}")
+        except Exception:  # a broken metadata directory
+            dists.add(f"?{getattr(dist, '_path', '?')}")
+    h.update("\n".join(sorted(dists)).encode())
+    files = 0
+    for name in _IDENTITY_PACKAGES:
+        roots = _package_roots(name)
+        h.update(f"\npackage {name}: {roots}\n".encode())
+        for root in roots:
+            files += _hash_tree(h, root)
+    identity = h.hexdigest()[:20]
+    logger.info(
+        "Kimi K3 CuTe cache: install identity %s (%d distributions, %d package files, "
+        "%.1f s)", identity, len(dists), files, time.perf_counter() - start,
+    )  # fmt: skip
+    return identity
+
+
 def cache_dir() -> str:
     from vllm import envs
 
     import cutlass
 
     version = f"cutlass-dsl-{cutlass.__version__}-f{FORMAT}"
-    return os.path.join(envs.VLLM_CACHE_ROOT, "kimi_k3", "cutedsl_pretrace", version)
+    return os.path.join(
+        envs.VLLM_CACHE_ROOT, "kimi_k3", "cutedsl_pretrace", version, install_identity()
+    )
 
 
 def _entry_dir(key: str) -> str:
