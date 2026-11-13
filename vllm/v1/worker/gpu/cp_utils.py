@@ -36,7 +36,10 @@ def prepare_dcp_local_seq_lens(
     return dcp_local_seq_lens[:num_reqs_padded]
 
 
-@triton.jit
+# Integer-only bookkeeping: the scalars are not specialized (Triton bakes in
+# values == 1 and divisibility by 16), so one variant serves every DCP rank and
+# request count; a request count no warmup step used compiled while serving.
+@triton.jit(do_not_specialize=["dcp_size", "dcp_rank", "num_reqs", "max_num_reqs"])
 def _dcp_local_seq_lens_kernel(
     out_ptr,
     seq_lens_ptr,

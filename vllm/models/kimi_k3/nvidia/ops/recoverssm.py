@@ -60,7 +60,10 @@ def _kda_recurrent_step(
     return state + correction[:, None] * normalized_k[None, :], correction
 
 
-@triton.jit
+# raw_beta's token stride depends on the projection layout (its own tensor or
+# a column slice of a wider projection) and feeds one scalar load per token:
+# not specialized, so no layout compiles a new variant while serving.
+@triton.jit(do_not_specialize=["stride_beta_token"])
 def _kda_recoverssm_verify_kernel(
     q_ptr,
     k_ptr,

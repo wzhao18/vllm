@@ -720,3 +720,64 @@ def test_cute_state_commit_align_matches_triton(window, batch, monkeypatch):
         torch.testing.assert_close(
             cute_state.float(), triton_state.float(), atol=2e-2, rtol=2e-2
         )
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+@torch.inference_mode()
+def test_triton_verify_beta_stride_compiles_once(deferred):
+    """raw_beta is its own tensor (token stride = heads, e.g. 24) or a column
+    slice of a wider projection (stride divisible by 16) depending on the
+    projection path; the Triton verify must not compile a variant per layout
+    (2026-11-12 C512 real-rejection eval: a post-warmup compile on the prefill
+    ranks), and both layouts give identical results."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.recoverssm.kernels import (
+        kda_recoverssm_verify as deferred_verify,
+    )
+    from vllm.utils import jit_monitor
+
+    verify = deferred_verify if deferred else kda_recoverssm_verify
+    heads, window, batch = 3, 4, 5
+    tokens = batch * window
+    torch.manual_seed(5)
+
+    def act(*shape):
+        return torch.randn(shape, device=DEVICE).to(torch.bfloat16)
+
+    q, k, v, raw_g = (act(1, tokens, heads, D) for _ in range(4))
+    beta = act(tokens, heads)
+    wide = act(tokens, 32)
+    wide[:, 5 : 5 + heads] = beta
+    state = torch.randn(batch + 1, heads, D, D, device=DEVICE)
+    query_start = torch.arange(0, tokens + 1, window, dtype=torch.int32, device=DEVICE)
+    state_indices = torch.arange(1, batch + 1, dtype=torch.int32, device=DEVICE)
+    A_log = torch.randn(heads, device=DEVICE) * 0.5
+    dt_bias = torch.randn(heads * D, device=DEVICE) * 0.5
+
+    def run(raw_beta):
+        records = _records(batch, heads, window)
+        out = verify(
+            q=q,
+            k=k,
+            v=v,
+            raw_g=raw_g,
+            raw_beta=raw_beta.unsqueeze(0),
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=LOWER_BOUND,
+            checkpoint_state=state,
+            records=records,
+            query_start_loc=query_start,
+            state_indices=state_indices,
+            spec_query_len=window,
+        )
+        torch.accelerator.synchronize()
+        return out, records
+
+    ref_out, ref_records = run(wide[:, 5 : 5 + heads])
+    assert wide[:, 5 : 5 + heads].stride(0) % 16 == 0 and beta.stride(0) % 16
+    with jit_monitor.record_jit_events() as events:
+        out, records = run(beta)
+    assert events == [], f"compiled for another beta stride: {events}"
+    assert torch.equal(out, ref_out)
+    assert torch.equal(records.correction, ref_records.correction)
+    assert torch.equal(records.key_gate, ref_records.key_gate)
