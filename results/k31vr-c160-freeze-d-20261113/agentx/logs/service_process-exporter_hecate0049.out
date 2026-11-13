@@ -1,0 +1,5 @@
+2026/11/13 01:13:42 Reading metrics from /proc based on "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/outputs/a1047927-integaf10frz-pareto-c160-xdr-1113011309/logs/process-exporter.yml"
+level=info ts=2026-11-13T09:13:43.406Z caller=tls_config.go:313 msg="Listening on" address=[::]:9256
+level=info ts=2026-11-13T09:13:43.406Z caller=tls_config.go:316 msg="TLS is disabled." http2=false address=[::]:9256
+[2026-11-13T03:32:12.339] error: *** STEP 1047927.91 ON hecate0049 CANCELLED AT 2026-11-13T03:32:12 DUE to SIGNAL Terminated ***
+2026/11/13 03:32:12 Shutting down the server

@@ -1,0 +1,274 @@
+storage = "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/outputs/a1050538-integaf10frz-pareto-c160-ev-spx-1113050542/logs/tachometer/raw/scrape"
+
+[[endpoints]]
+name = "backend_decode0_rank0"
+url = "http://10.66.24.137:7504/metrics"
+collect_interval_ms = 1000
+filter = "backend"
+[endpoints.node_metadata]
+"hostname" = "hecate0312"
+"worker_index" = "0"
+"worker_process" = "0"
+"worker_role" = "decode"
+
+[[endpoints]]
+name = "backend_decode0_rank1"
+url = "http://10.66.24.139:7505/metrics"
+collect_interval_ms = 1000
+filter = "backend"
+[endpoints.node_metadata]
+"hostname" = "hecate0313"
+"worker_index" = "0"
+"worker_process" = "1"
+"worker_role" = "decode"
+
+[[endpoints]]
+name = "backend_decode0_rank2"
+url = "http://10.66.24.141:7506/metrics"
+collect_interval_ms = 1000
+filter = "backend"
+[endpoints.node_metadata]
+"hostname" = "hecate0314"
+"worker_index" = "0"
+"worker_process" = "2"
+"worker_role" = "decode"
+
+[[endpoints]]
+name = "backend_decode0_rank3"
+url = "http://10.66.24.143:7507/metrics"
+collect_interval_ms = 1000
+filter = "backend"
+[endpoints.node_metadata]
+"hostname" = "hecate0315"
+"worker_index" = "0"
+"worker_process" = "3"
+"worker_role" = "decode"
+
+[[endpoints]]
+name = "backend_prefill0_rank0"
+url = "http://10.66.24.129:7500/metrics"
+collect_interval_ms = 1000
+filter = "backend"
+[endpoints.node_metadata]
+"hostname" = "hecate0308"
+"worker_index" = "0"
+"worker_process" = "0"
+"worker_role" = "prefill"
+
+[[endpoints]]
+name = "backend_prefill0_rank1"
+url = "http://10.66.24.131:7501/metrics"
+collect_interval_ms = 1000
+filter = "backend"
+[endpoints.node_metadata]
+"hostname" = "hecate0309"
+"worker_index" = "0"
+"worker_process" = "1"
+"worker_role" = "prefill"
+
+[[endpoints]]
+name = "backend_prefill1_rank0"
+url = "http://10.66.24.133:7502/metrics"
+collect_interval_ms = 1000
+filter = "backend"
+[endpoints.node_metadata]
+"hostname" = "hecate0310"
+"worker_index" = "1"
+"worker_process" = "0"
+"worker_role" = "prefill"
+
+[[endpoints]]
+name = "backend_prefill1_rank1"
+url = "http://10.66.24.135:7503/metrics"
+collect_interval_ms = 1000
+filter = "backend"
+[endpoints.node_metadata]
+"hostname" = "hecate0311"
+"worker_index" = "1"
+"worker_process" = "1"
+"worker_role" = "prefill"
+
+[[endpoints]]
+name = "frontend0"
+url = "http://10.66.24.129:8000/metrics"
+collect_interval_ms = 1000
+filter = "frontend"
+[endpoints.node_metadata]
+"frontend_index" = "0"
+"hostname" = "hecate0308"
+
+[[endpoints]]
+name = "node_exporter_hecate0308"
+url = "http://hecate0308:9101/metrics"
+collect_interval_ms = 1000
+filter = "node_exporter"
+[endpoints.node_metadata]
+"hostname" = "hecate0308"
+"job_id" = "1050538"
+"run_name" = "coreai_comparch_inferencex-k31e2e.integaf10frz-pareto-c160-ev-spx_1050538"
+"service" = "node-exporter"
+
+[[endpoints]]
+name = "node_exporter_hecate0309"
+url = "http://hecate0309:9101/metrics"
+collect_interval_ms = 1000
+filter = "node_exporter"
+[endpoints.node_metadata]
+"hostname" = "hecate0309"
+"job_id" = "1050538"
+"run_name" = "coreai_comparch_inferencex-k31e2e.integaf10frz-pareto-c160-ev-spx_1050538"
+"service" = "node-exporter"
+
+[[endpoints]]
+name = "node_exporter_hecate0310"
+url = "http://hecate0310:9101/metrics"
+collect_interval_ms = 1000
+filter = "node_exporter"
+[endpoints.node_metadata]
+"hostname" = "hecate0310"
+"job_id" = "1050538"
+"run_name" = "coreai_comparch_inferencex-k31e2e.integaf10frz-pareto-c160-ev-spx_1050538"
+"service" = "node-exporter"
+
+[[endpoints]]
+name = "node_exporter_hecate0311"
+url = "http://hecate0311:9101/metrics"
+collect_interval_ms = 1000
+filter = "node_exporter"
+[endpoints.node_metadata]
+"hostname" = "hecate0311"
+"job_id" = "1050538"
+"run_name" = "coreai_comparch_inferencex-k31e2e.integaf10frz-pareto-c160-ev-spx_1050538"
+"service" = "node-exporter"
+
+[[endpoints]]
+name = "node_exporter_hecate0312"
+url = "http://hecate0312:9101/metrics"
+collect_interval_ms = 1000
+filter = "node_exporter"
+[endpoints.node_metadata]
+"hostname" = "hecate0312"
+"job_id" = "1050538"
+"run_name" = "coreai_comparch_inferencex-k31e2e.integaf10frz-pareto-c160-ev-spx_1050538"
+"service" = "node-exporter"
+
+[[endpoints]]
+name = "node_exporter_hecate0313"
+url = "http://hecate0313:9101/metrics"
+collect_interval_ms = 1000
+filter = "node_exporter"
+[endpoints.node_metadata]
+"hostname" = "hecate0313"
+"job_id" = "1050538"
+"run_name" = "coreai_comparch_inferencex-k31e2e.integaf10frz-pareto-c160-ev-spx_1050538"
+"service" = "node-exporter"
+
+[[endpoints]]
+name = "node_exporter_hecate0314"
+url = "http://hecate0314:9101/metrics"
+collect_interval_ms = 1000
+filter = "node_exporter"
+[endpoints.node_metadata]
+"hostname" = "hecate0314"
+"job_id" = "1050538"
+"run_name" = "coreai_comparch_inferencex-k31e2e.integaf10frz-pareto-c160-ev-spx_1050538"
+"service" = "node-exporter"
+
+[[endpoints]]
+name = "node_exporter_hecate0315"
+url = "http://hecate0315:9101/metrics"
+collect_interval_ms = 1000
+filter = "node_exporter"
+[endpoints.node_metadata]
+"hostname" = "hecate0315"
+"job_id" = "1050538"
+"run_name" = "coreai_comparch_inferencex-k31e2e.integaf10frz-pareto-c160-ev-spx_1050538"
+"service" = "node-exporter"
+
+[[endpoints]]
+name = "process_exporter_hecate0308"
+url = "http://hecate0308:9256/metrics"
+collect_interval_ms = 1000
+filter = "passthrough"
+[endpoints.node_metadata]
+"hostname" = "hecate0308"
+"job_id" = "1050538"
+"run_name" = "coreai_comparch_inferencex-k31e2e.integaf10frz-pareto-c160-ev-spx_1050538"
+"service" = "process-exporter"
+
+[[endpoints]]
+name = "process_exporter_hecate0309"
+url = "http://hecate0309:9256/metrics"
+collect_interval_ms = 1000
+filter = "passthrough"
+[endpoints.node_metadata]
+"hostname" = "hecate0309"
+"job_id" = "1050538"
+"run_name" = "coreai_comparch_inferencex-k31e2e.integaf10frz-pareto-c160-ev-spx_1050538"
+"service" = "process-exporter"
+
+[[endpoints]]
+name = "process_exporter_hecate0310"
+url = "http://hecate0310:9256/metrics"
+collect_interval_ms = 1000
+filter = "passthrough"
+[endpoints.node_metadata]
+"hostname" = "hecate0310"
+"job_id" = "1050538"
+"run_name" = "coreai_comparch_inferencex-k31e2e.integaf10frz-pareto-c160-ev-spx_1050538"
+"service" = "process-exporter"
+
+[[endpoints]]
+name = "process_exporter_hecate0311"
+url = "http://hecate0311:9256/metrics"
+collect_interval_ms = 1000
+filter = "passthrough"
+[endpoints.node_metadata]
+"hostname" = "hecate0311"
+"job_id" = "1050538"
+"run_name" = "coreai_comparch_inferencex-k31e2e.integaf10frz-pareto-c160-ev-spx_1050538"
+"service" = "process-exporter"
+
+[[endpoints]]
+name = "process_exporter_hecate0312"
+url = "http://hecate0312:9256/metrics"
+collect_interval_ms = 1000
+filter = "passthrough"
+[endpoints.node_metadata]
+"hostname" = "hecate0312"
+"job_id" = "1050538"
+"run_name" = "coreai_comparch_inferencex-k31e2e.integaf10frz-pareto-c160-ev-spx_1050538"
+"service" = "process-exporter"
+
+[[endpoints]]
+name = "process_exporter_hecate0313"
+url = "http://hecate0313:9256/metrics"
+collect_interval_ms = 1000
+filter = "passthrough"
+[endpoints.node_metadata]
+"hostname" = "hecate0313"
+"job_id" = "1050538"
+"run_name" = "coreai_comparch_inferencex-k31e2e.integaf10frz-pareto-c160-ev-spx_1050538"
+"service" = "process-exporter"
+
+[[endpoints]]
+name = "process_exporter_hecate0314"
+url = "http://hecate0314:9256/metrics"
+collect_interval_ms = 1000
+filter = "passthrough"
+[endpoints.node_metadata]
+"hostname" = "hecate0314"
+"job_id" = "1050538"
+"run_name" = "coreai_comparch_inferencex-k31e2e.integaf10frz-pareto-c160-ev-spx_1050538"
+"service" = "process-exporter"
+
+[[endpoints]]
+name = "process_exporter_hecate0315"
+url = "http://hecate0315:9256/metrics"
+collect_interval_ms = 1000
+filter = "passthrough"
+[endpoints.node_metadata]
+"hostname" = "hecate0315"
+"job_id" = "1050538"
+"run_name" = "coreai_comparch_inferencex-k31e2e.integaf10frz-pareto-c160-ev-spx_1050538"
+"service" = "process-exporter"

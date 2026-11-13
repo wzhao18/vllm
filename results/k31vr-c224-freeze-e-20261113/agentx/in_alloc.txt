@@ -1,0 +1,5 @@
+alloc=1052665 run_id=a1052665-integaf10frz-pareto-c224-spx-1113120146 render=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/integaf10frz-pareto-c224-spx nodes=hecate0309,hecate0310,hecate0314,hecate0316,hecate0318,hecate0319,hecate0320,hecate0321 need=8 left=10741s start=2026-11-13T12:01:46-08:00
+exports=HOME=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/home,UV_CACHE_DIR=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/cache/uv-host,XDG_CACHE_HOME=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/cache/xdg-host,ENROOT_ROOTFS_WRITABLE=1
+memfix=1 cname=k31e2e-1052665-1113120024
+srtslurm=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/integaf10frz-pareto-c224-spx/srtslurm.yaml
+rc=0 end=2026-11-13T14:34:23-08:00

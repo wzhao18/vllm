@@ -1,0 +1,651 @@
+W1113 05:08:03.699000 1432171 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+W1113 05:08:03.699000 1432171 torch/_library/opaque_object.py:294] register_opaque_type is deprecated, use register_custom_class instead
+W1113 05:08:03.699000 1432171 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+[2m2026-11-13T13:08:13.109486Z[0m [32m INFO[0m [2mdynamo_runtime::logging[0m[2m:[0m OpenTelemetry OTLP export enabled (traces and logs) [3mendpoint[0m[2m=[0mhttp://10.66.24.129:4317 [3mprotocol[0m[2m=[0mgrpc [3mservice[0m[2m=[0mdynamo-prefill [3mconsole_format[0m[2m=[0m"readable"
+[2m2026-11-13T13:08:13.712223Z[0m [32m INFO[0m [2m__init__[0m[2m:[0m dynamo.nixl_connect: Utilizing CuPy to enable GPU acceleration.
+[2m2026-11-13T13:08:13.750678Z[0m [33mWARNING[0m [2margparse_utils.parse_args[0m[2m:[0m Found duplicate keys --served-model-name
+[2m2026-11-13T13:08:13.752713Z[0m [32m INFO[0m [2margs.cross_validate_config[0m[2m:[0m --stream-interval=10 will be propagated to the Dynamo frontend. Set DYN_VLLM_STREAM_INTERVAL env var to override.
+[2m2026-11-13T13:08:13.752808Z[0m [32m INFO[0m [2margs.create_kv_events_config[0m[2m:[0m Using user-provided kv_events_config KVEventsConfig(enable_kv_cache_events=True, publisher='zmq', endpoint='tcp://*:5203', replay_endpoint=None, buffer_steps=10000, hwm=100000, max_queue_size=100000, topic='kv-events')
+[2m2026-11-13T13:08:13.752832Z[0m [32m INFO[0m [2margs.update_engine_config_with_dynamo[0m[2m:[0m Using kv_events_config for publishing vLLM kv events over zmq: KVEventsConfig(enable_kv_cache_events=True, publisher='zmq', endpoint='tcp://*:5203', replay_endpoint=None, buffer_steps=10000, hwm=100000, max_queue_size=100000, topic='kv-events') (use_kv_events=True)
+[2m2026-11-13T13:08:15.286399Z[0m [33m WARN[0m [2mconfig_dumper._preprocess_for_encode[0m[2m:[0m Unknown type <class 'torch.dtype'>, using __dict__ or str(obj)
+[2m2026-11-13T13:08:15.286450Z[0m [33m WARN[0m [2mconfig_dumper._preprocess_for_encode[0m[2m:[0m Unknown type <class 'torch.dtype'>, using __dict__ or str(obj)
+[2m2026-11-13T13:08:15.286538Z[0m [33m WARN[0m [2mconfig_dumper._preprocess_for_encode[0m[2m:[0m Unknown type <class 'dynamo.common.configuration.groups.router_args.WorkerRouterConfig'>, using __dict__ or str(obj)
+[2m2026-11-13T13:08:15.292086Z[0m [32m INFO[0m [2mconfig_dumper.dump_config[0m[2m:[0m Dumped config to /logs/hecate0311_config.json
+(MainProcess pid=1432171) WARNING 11-13 05:08:15 [interface.py:1507] Unknown vLLM environment variable detected: VLLM_TORCH_PROFILER_DIR
+(MainProcess pid=1432171) WARNING 11-13 05:08:15 [interface.py:1507] Unknown vLLM environment variable detected: VLLM_ITERLOG_DIR
+(MainProcess pid=1432171) WARNING 11-13 05:08:15 [interface.py:1507] Unknown vLLM environment variable detected: VLLM_RPC_TIMEOUT
+(MainProcess pid=1432171) INFO 11-13 05:08:15 [kimi_k3.py:116] Overriding vision_config.text_hidden_size from 2304 to 4096 to match text_config.hidden_size
+(MainProcess pid=1432171) INFO 11-13 05:08:35 [model.py:751] Resolved architecture: KimiK31ForConditionalGeneration
+(MainProcess pid=1432171) INFO 11-13 05:08:35 [model.py:779] Defaulting to tokenizer_mode='kimi_k3' for KimiK31ForConditionalGeneration
+(MainProcess pid=1432171) INFO 11-13 05:08:35 [model.py:2180] Using max model len 1048576
+(MainProcess pid=1432171) INFO 11-13 05:08:40 [kimi_k3.py:116] Overriding vision_config.text_hidden_size from 2304 to 4096 to match text_config.hidden_size
+[2m2026-11-13T13:08:40.414513Z[0m [32m INFO[0m [2mtokenization_kimi.__init__[0m[2m:[0m Reloaded tiktoken model from /model/tiktoken.model
+[2m2026-11-13T13:08:40.414599Z[0m [32m INFO[0m [2mtokenization_kimi.__init__[0m[2m:[0m #words: 163840 - BOS ID: 163584 - EOS ID: 163585
+(MainProcess pid=1432171) WARNING 11-13 05:08:40 [registry.py:287] Using a slow tokenizer. This might cause a significant slowdown. Consider using a fast tokenizer instead.
+(MainProcess pid=1432171) INFO 11-13 05:08:40 [model.py:974] All limits of multimodal modalities supported by the model are set to 0, running in text-only mode.
+(MainProcess pid=1432171) INFO 11-13 05:08:40 [model.py:1031] Disabled mm_prefix attention mode because multimodal inputs are configuration-disabled. Attention backends without mm_prefix support may now be selected.
+(MainProcess pid=1432171) INFO 11-13 05:08:41 [cache.py:549] Using fp8 data type to store kv cache. It reduces the GPU memory footprint and boosts the performance. Meanwhile, it may cause accuracy drop without a proper scaling factor
+(MainProcess pid=1432171) INFO 11-13 05:08:41 [arg_utils.py:2574] Inferred data_parallel_rank 0 from node_rank 1
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='yarn': {'attn_factor'}
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='yarn': {'attn_factor'}
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='yarn': {'attn_factor'}
+(MainProcess pid=1432171) INFO 11-13 05:08:59 [model.py:751] Resolved architecture: K3DSparkModel
+(MainProcess pid=1432171) INFO 11-13 05:08:59 [model.py:2180] Using max model len 1048576
+(MainProcess pid=1432171) INFO 11-13 05:08:59 [scheduler.py:310] Chunked prefill is enabled with max_num_batched_tokens=16384.
+(MainProcess pid=1432171) INFO 11-13 05:08:59 [config.py:874] Mamba cache mode is set to 'align' for KimiK31ForConditionalGeneration by default when prefix caching is enabled
+(MainProcess pid=1432171) INFO 11-13 05:08:59 [vllm.py:863] Auto-enabling VLLM_USE_BREAKABLE_CUDAGRAPH=1. Set VLLM_USE_BREAKABLE_CUDAGRAPH=0 to opt out.
+(MainProcess pid=1432171) INFO 11-13 05:08:59 [kernel.py:589] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'], gelu_and_mul_sparse=['triton', 'native'])
+(MainProcess pid=1432171) INFO 11-13 05:08:59 [nixl_utils.py:73] NIXL is available
+[2m2026-11-13T13:08:59.376939Z[0m [33m WARN[0m [2menv._get_cubin_dir[0m[2m:[0m FLASHINFER_CUBIN_DIR=/opt/k3/fi-cubins-0.7.3.dev20261031 overrides the installed flashinfer-cubin package; cubins will be read from that path instead of the package.
+[2m2026-11-13T13:08:59.386761Z[0m [33m WARN[0m [2m__init__.get_jit_cache_providers[0m[2m:[0m Ignoring invalid flashinfer jit-cache provider sm90a: No module named 'flashinfer_jit_cache.providers.sm90a'
+[2m2026-11-13T13:08:59.386813Z[0m [33m WARN[0m [2m__init__.get_jit_cache_providers[0m[2m:[0m Ignoring invalid flashinfer jit-cache provider sm89: No module named 'flashinfer_jit_cache.providers.sm89'
+[2m2026-11-13T13:08:59.386844Z[0m [33m WARN[0m [2m__init__.get_jit_cache_providers[0m[2m:[0m Ignoring invalid flashinfer jit-cache provider sm80: No module named 'flashinfer_jit_cache.providers.sm80'
+[2m2026-11-13T13:08:59.386869Z[0m [33m WARN[0m [2m__init__.get_jit_cache_providers[0m[2m:[0m Ignoring invalid flashinfer jit-cache provider sm121a: No module named 'flashinfer_jit_cache.providers.sm121a'
+[2m2026-11-13T13:08:59.386892Z[0m [33m WARN[0m [2m__init__.get_jit_cache_providers[0m[2m:[0m Ignoring invalid flashinfer jit-cache provider sm120f: No module named 'flashinfer_jit_cache.providers.sm120f'
+[2m2026-11-13T13:08:59.386915Z[0m [33m WARN[0m [2m__init__.get_jit_cache_providers[0m[2m:[0m Ignoring invalid flashinfer jit-cache provider sm110a: No module named 'flashinfer_jit_cache.providers.sm110a'
+[2m2026-11-13T13:08:59.386937Z[0m [33m WARN[0m [2m__init__.get_jit_cache_providers[0m[2m:[0m Ignoring invalid flashinfer jit-cache provider sm103a: No module named 'flashinfer_jit_cache.providers.sm103a'
+[2m2026-11-13T13:08:59.386960Z[0m [33m WARN[0m [2m__init__.get_jit_cache_providers[0m[2m:[0m Ignoring invalid flashinfer jit-cache provider sm100a: No module named 'flashinfer_jit_cache.providers.sm100a'
+[2m2026-11-13T13:09:01.447897Z[0m [33m WARN[0m [2mtokenization_kimi.encode[0m[2m:[0m Calling super().encode with {'add_special_tokens': False}
+[2m2026-11-13T13:09:01.448216Z[0m [33m WARN[0m [2mtokenization_kimi.encode[0m[2m:[0m Calling super().encode with {'add_special_tokens': False}
+[2m2026-11-13T13:09:01.448344Z[0m [33m WARN[0m [2mtokenization_kimi.encode[0m[2m:[0m Calling super().encode with {'add_special_tokens': False}
+[2m2026-11-13T13:09:01.448435Z[0m [33m WARN[0m [2mtokenization_kimi.encode[0m[2m:[0m Calling super().encode with {'add_special_tokens': False}
+[2m2026-11-13T13:09:01.448528Z[0m [33m WARN[0m [2mtokenization_kimi.encode[0m[2m:[0m Calling super().encode with {'add_special_tokens': False}
+[2m2026-11-13T13:09:01.448597Z[0m [33m WARN[0m [2mtokenization_kimi.encode[0m[2m:[0m Calling super().encode with {'add_special_tokens': False}
+(MainProcess pid=1432171) INFO 11-13 05:09:01 [compilation.py:317] Enabled custom fusions: norm_quant, act_quant, allreduce_rms
+(MainProcess pid=1432171) INFO 11-13 05:09:01 [serve.py:224] Launching vLLM (v0.32.0rc2.dev0+g242fb49cd4.k31vr) headless multiproc executor, with head node address 10.66.24.133:29501 for torch.distributed process group.
+(MainProcess pid=1432171) INFO 11-13 05:09:01 [numa_utils.py:608] Launching worker subprocess (local_rank=0, dp_local_rank=None) with numactl --cpunodebind=0 --membind=0
+(MainProcess pid=1432171) INFO 11-13 05:09:01 [numa_utils.py:608] Launching worker subprocess (local_rank=1, dp_local_rank=None) with numactl --cpunodebind=0 --membind=0
+(MainProcess pid=1432171) INFO 11-13 05:09:01 [numa_utils.py:608] Launching worker subprocess (local_rank=2, dp_local_rank=None) with numactl --cpunodebind=1 --membind=1
+(MainProcess pid=1432171) INFO 11-13 05:09:01 [numa_utils.py:608] Launching worker subprocess (local_rank=3, dp_local_rank=None) with numactl --cpunodebind=1 --membind=1
+W1113 05:09:03.747000 1433966 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+W1113 05:09:03.747000 1433966 torch/_library/opaque_object.py:294] register_opaque_type is deprecated, use register_custom_class instead
+W1113 05:09:03.748000 1433966 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1113 05:09:03.747000 1433968 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+W1113 05:09:03.748000 1433968 torch/_library/opaque_object.py:294] register_opaque_type is deprecated, use register_custom_class instead
+W1113 05:09:03.748000 1433968 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1113 05:09:03.859000 1433962 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+W1113 05:09:03.860000 1433964 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+W1113 05:09:03.860000 1433962 torch/_library/opaque_object.py:294] register_opaque_type is deprecated, use register_custom_class instead
+W1113 05:09:03.860000 1433962 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1113 05:09:03.860000 1433964 torch/_library/opaque_object.py:294] register_opaque_type is deprecated, use register_custom_class instead
+W1113 05:09:03.860000 1433964 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+(Worker pid=1433962) INFO 11-13 05:09:18 [parallel_state.py:1931] world_size=8 rank=4 local_rank=0 distributed_init_method=tcp://10.66.24.133:29501 backend=nccl
+(Worker pid=1433966) INFO 11-13 05:09:18 [parallel_state.py:1931] world_size=8 rank=6 local_rank=2 distributed_init_method=tcp://10.66.24.133:29501 backend=nccl
+(Worker pid=1433968) INFO 11-13 05:09:18 [parallel_state.py:1931] world_size=8 rank=7 local_rank=3 distributed_init_method=tcp://10.66.24.133:29501 backend=nccl
+(Worker pid=1433964) INFO 11-13 05:09:18 [parallel_state.py:1931] world_size=8 rank=5 local_rank=1 distributed_init_method=tcp://10.66.24.133:29501 backend=nccl
+FLASHINFER_CUBIN_DIR=/opt/k3/fi-cubins-0.7.3.dev20261031 overrides the installed flashinfer-cubin package; cubins will be read from that path instead of the package.
+FLASHINFER_CUBIN_DIR=/opt/k3/fi-cubins-0.7.3.dev20261031 overrides the installed flashinfer-cubin package; cubins will be read from that path instead of the package.
+FLASHINFER_CUBIN_DIR=/opt/k3/fi-cubins-0.7.3.dev20261031 overrides the installed flashinfer-cubin package; cubins will be read from that path instead of the package.
+FLASHINFER_CUBIN_DIR=/opt/k3/fi-cubins-0.7.3.dev20261031 overrides the installed flashinfer-cubin package; cubins will be read from that path instead of the package.
+Ignoring invalid flashinfer jit-cache provider sm90a: No module named 'flashinfer_jit_cache.providers.sm90a'
+Ignoring invalid flashinfer jit-cache provider sm90a: No module named 'flashinfer_jit_cache.providers.sm90a'
+Ignoring invalid flashinfer jit-cache provider sm89: No module named 'flashinfer_jit_cache.providers.sm89'
+Ignoring invalid flashinfer jit-cache provider sm89: No module named 'flashinfer_jit_cache.providers.sm89'
+Ignoring invalid flashinfer jit-cache provider sm80: No module named 'flashinfer_jit_cache.providers.sm80'
+Ignoring invalid flashinfer jit-cache provider sm80: No module named 'flashinfer_jit_cache.providers.sm80'
+Ignoring invalid flashinfer jit-cache provider sm121a: No module named 'flashinfer_jit_cache.providers.sm121a'
+Ignoring invalid flashinfer jit-cache provider sm121a: No module named 'flashinfer_jit_cache.providers.sm121a'
+Ignoring invalid flashinfer jit-cache provider sm120f: No module named 'flashinfer_jit_cache.providers.sm120f'
+Ignoring invalid flashinfer jit-cache provider sm120f: No module named 'flashinfer_jit_cache.providers.sm120f'
+Ignoring invalid flashinfer jit-cache provider sm110a: No module named 'flashinfer_jit_cache.providers.sm110a'
+Ignoring invalid flashinfer jit-cache provider sm110a: No module named 'flashinfer_jit_cache.providers.sm110a'
+Ignoring invalid flashinfer jit-cache provider sm103a: No module named 'flashinfer_jit_cache.providers.sm103a'
+Ignoring invalid flashinfer jit-cache provider sm103a: No module named 'flashinfer_jit_cache.providers.sm103a'
+Ignoring invalid flashinfer jit-cache provider sm100a: No module named 'flashinfer_jit_cache.providers.sm100a'
+Ignoring invalid flashinfer jit-cache provider sm100a: No module named 'flashinfer_jit_cache.providers.sm100a'
+Ignoring invalid flashinfer jit-cache provider sm90a: No module named 'flashinfer_jit_cache.providers.sm90a'
+Ignoring invalid flashinfer jit-cache provider sm90a: No module named 'flashinfer_jit_cache.providers.sm90a'
+Ignoring invalid flashinfer jit-cache provider sm89: No module named 'flashinfer_jit_cache.providers.sm89'
+Ignoring invalid flashinfer jit-cache provider sm89: No module named 'flashinfer_jit_cache.providers.sm89'
+Ignoring invalid flashinfer jit-cache provider sm80: No module named 'flashinfer_jit_cache.providers.sm80'
+Ignoring invalid flashinfer jit-cache provider sm80: No module named 'flashinfer_jit_cache.providers.sm80'
+Ignoring invalid flashinfer jit-cache provider sm121a: No module named 'flashinfer_jit_cache.providers.sm121a'
+Ignoring invalid flashinfer jit-cache provider sm121a: No module named 'flashinfer_jit_cache.providers.sm121a'
+Ignoring invalid flashinfer jit-cache provider sm120f: No module named 'flashinfer_jit_cache.providers.sm120f'
+Ignoring invalid flashinfer jit-cache provider sm120f: No module named 'flashinfer_jit_cache.providers.sm120f'
+Ignoring invalid flashinfer jit-cache provider sm110a: No module named 'flashinfer_jit_cache.providers.sm110a'
+Ignoring invalid flashinfer jit-cache provider sm110a: No module named 'flashinfer_jit_cache.providers.sm110a'
+Ignoring invalid flashinfer jit-cache provider sm103a: No module named 'flashinfer_jit_cache.providers.sm103a'
+Ignoring invalid flashinfer jit-cache provider sm103a: No module named 'flashinfer_jit_cache.providers.sm103a'
+Ignoring invalid flashinfer jit-cache provider sm100a: No module named 'flashinfer_jit_cache.providers.sm100a'
+Ignoring invalid flashinfer jit-cache provider sm100a: No module named 'flashinfer_jit_cache.providers.sm100a'
+(Worker pid=1433962) INFO 11-13 05:09:30 [parallel_state.py:2387] rank 4 in world size 8 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 4, ETP rank 4, EP rank 4, EPLB rank N/A
+(Worker pid=1433962) INFO 11-13 05:09:30 [gpu_worker.py:513] Using V2 Model Runner
+(Worker pid=1433962) WARNING 11-13 05:09:30 [flashinfer.py:151] FlashInfer's precompiled kernels are missing or do not match flashinfer-python 0.7.3.dev20261031 (flashinfer-cubin 0.7.1, flashinfer-jit-cache 0.7.3.dev20261031). FlashInfer then downloads and compiles kernels at startup, which can take several minutes, or fails to import mismatched ones. Run `vllm download-kernels` in this Python environment to install them.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:09:32 [model_runner.py:420] Loading model from scratch...
+(Worker_TP4_DCP4_EP4 pid=1433962) WARNING 11-13 05:09:32 [vision.py:150] The number of vision attention heads is not divisible by the tensor parallel size. Falling back to data parallelism for the vision encoder.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:09:32 [cuda.py:571] Using backend AttentionBackendEnum.FLASH_ATTN for vit attention
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:09:32 [mm_encoder_attention.py:372] Using AttentionBackendEnum.FLASH_ATTN for MMEncoderAttention.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:09:32 [model.py:1031] Disabled mm_prefix attention mode because multimodal inputs are configuration-disabled. Attention backends without mm_prefix support may now be selected.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:09:32 [gemm_rs_ar.py:1672] GEMM-AR is enabled.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:09:32 [mamba_utils.py:38] VLLM_SSM_CONV_STATE_LAYOUT env detected. Setting SSM conv state layout to DS.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:09:32 [kda.py:554] Using FlashKDA KDA prefill backend.
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:13:04 [cuda.py:452] Using AttentionBackendEnum.FLASHINFER_MLA_SPARSE backend.
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:13:04 [cuda.py:452] Using AttentionBackendEnum.FLASHINFER_MLA_SPARSE backend.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:13:04 [cuda.py:452] Using AttentionBackendEnum.FLASHINFER_MLA_SPARSE backend.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:13:04 [mla_attention.py:557] Using standard fp8 KV cache format. To use DeepSeek's fp8_ds_mla KV cache format, please set `--attention-backend FLASHMLA_SPARSE`
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:13:04 [cuda.py:452] Using AttentionBackendEnum.FLASHINFER_MLA_SPARSE backend.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:13:05 [mla_attention.py:642] Sparse (DSA) attention active: backend=FLASHINFER_MLA_SPARSE, impl=FlashInferMLASparseImpl
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:13:05 [selector.py:131] Using FLASH_ATTN MLA prefill backend.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:13:05 [dcp.py:1639] Using direct symmetric-memory DCP A2A for MLA.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:13:06 [dcp.py:1707] Using direct symmetric-memory DCP query gather for MLA.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:13:06 [deep_gemm.py:234] deep_gemm not found in site-packages, trying vendored vllm.third_party.deep_gemm
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:13:06 [deep_gemm.py:261] DeepGEMM PDL enabled on vllm.third_party.deep_gemm.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:13:06 [deep_gemm.py:172] DeepGEMM E8M0 enabled on current platform.
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:13:08 [base_loader.py:151] Quantizing 0 layers of types: 
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:13:08 [base_loader.py:151] Quantizing 0 layers of types: 
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:13:08 [base_loader.py:151] Quantizing 0 layers of types: 
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:13:08 [base_loader.py:82] Initializing model took 216.284363 seconds
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:13:08 [base_loader.py:151] Quantizing 0 layers of types: 
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:14:56 [default_loader.py:506] Loading weights took 107.92 seconds
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/dsl_packages/cutlass/base_dsl/typing.py:1124: DSLWarning: 
+[93m[1mwarning[TYPE_INT_LITERAL_OUT_OF_RANGE]:[0m The Python integer -2147483859 does not fit in Int32 (range [-2147483648, 2147483647]); it was silently truncated to 2147483437. This drops the high bits of the original value.
+  [94m-->[0m /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/hti/p2/integ-af10ccc2c4/vllm/models/kimi_k3/nvidia/megamoe_rubin/src/sources/helpers/software_sync.py:60:24
+   |
+58 |     ) -> None:
+59 |         self._cta_rendezvous(participating_threads)
+60 |         leader_delta = Int32(-self.finish_sum_tag) - (actual_cta_count - Int32(1))
+   |                        [91m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+  [92msuggestion:[0m Use a wider integer type that can hold -2147483859, e.g. `Int64(-2147483859)` or
+              `Uint64(-2147483859)`.
+  [92msuggestion:[0m If the wrap-around is intentional (e.g. materializing a specific bit pattern), mask
+              the value to the type width first, e.g. `Int32(-2147483859 & 0xFFFFFFFF)`, to make the
+              intent explicit.
+
+  res = res_type(res_val, loc=loc, ip=ip)
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/dsl_packages/cutlass/base_dsl/typing.py:1124: DSLWarning: 
+[93m[1mwarning[TYPE_INT_LITERAL_OUT_OF_RANGE]:[0m The Python integer -2147483859 does not fit in Int32 (range [-2147483648, 2147483647]); it was silently truncated to 2147483437. This drops the high bits of the original value.
+  [94m-->[0m /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/hti/p2/integ-af10ccc2c4/vllm/models/kimi_k3/nvidia/megamoe_rubin/src/sources/helpers/software_sync.py:60:24
+   |
+58 |     ) -> None:
+59 |         self._cta_rendezvous(participating_threads)
+60 |         leader_delta = Int32(-self.finish_sum_tag) - (actual_cta_count - Int32(1))
+   |                        [91m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+  [92msuggestion:[0m Use a wider integer type that can hold -2147483859, e.g. `Int64(-2147483859)` or
+              `Uint64(-2147483859)`.
+  [92msuggestion:[0m If the wrap-around is intentional (e.g. materializing a specific bit pattern), mask
+              the value to the type width first, e.g. `Int32(-2147483859 & 0xFFFFFFFF)`, to make the
+              intent explicit.
+
+  res = res_type(res_val, loc=loc, ip=ip)
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/dsl_packages/cutlass/base_dsl/typing.py:1124: DSLWarning: 
+[93m[1mwarning[TYPE_INT_LITERAL_OUT_OF_RANGE]:[0m The Python integer -2147483859 does not fit in Int32 (range [-2147483648, 2147483647]); it was silently truncated to 2147483437. This drops the high bits of the original value.
+  [94m-->[0m /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/hti/p2/integ-af10ccc2c4/vllm/models/kimi_k3/nvidia/megamoe_rubin/src/sources/helpers/software_sync.py:60:24
+   |
+58 |     ) -> None:
+59 |         self._cta_rendezvous(participating_threads)
+60 |         leader_delta = Int32(-self.finish_sum_tag) - (actual_cta_count - Int32(1))
+   |                        [91m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+  [92msuggestion:[0m Use a wider integer type that can hold -2147483859, e.g. `Int64(-2147483859)` or
+              `Uint64(-2147483859)`.
+  [92msuggestion:[0m If the wrap-around is intentional (e.g. materializing a specific bit pattern), mask
+              the value to the type width first, e.g. `Int32(-2147483859 & 0xFFFFFFFF)`, to make the
+              intent explicit.
+
+  res = res_type(res_val, loc=loc, ip=ip)
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/dsl_packages/cutlass/base_dsl/typing.py:1124: DSLWarning: 
+[93m[1mwarning[TYPE_INT_LITERAL_OUT_OF_RANGE]:[0m The Python integer -2147483859 does not fit in Int32 (range [-2147483648, 2147483647]); it was silently truncated to 2147483437. This drops the high bits of the original value.
+  [94m-->[0m /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/hti/p2/integ-af10ccc2c4/vllm/models/kimi_k3/nvidia/megamoe_rubin/src/sources/helpers/software_sync.py:60:24
+   |
+58 |     ) -> None:
+59 |         self._cta_rendezvous(participating_threads)
+60 |         leader_delta = Int32(-self.finish_sum_tag) - (actual_cta_count - Int32(1))
+   |                        [91m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+  [92msuggestion:[0m Use a wider integer type that can hold -2147483859, e.g. `Int64(-2147483859)` or
+              `Uint64(-2147483859)`.
+  [92msuggestion:[0m If the wrap-around is intentional (e.g. materializing a specific bit pattern), mask
+              the value to the type width first, e.g. `Int32(-2147483859 & 0xFFFFFFFF)`, to make the
+              intent explicit.
+
+  res = res_type(res_val, loc=loc, ip=ip)
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:15:04 [experts.py:801] Rubin MegaMoE: 92 layers in the nvfp4 kernel layout, 1 runtime(s) warmed.
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:15:05 [decode.py:201] Kimi K3.1 DSA decode: DcpExchange top-k on (DCP8, interleave 1, rows 1-848, one-round rows <= 2048, ties by global id)
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:15:05 [decode.py:201] Kimi K3.1 DSA decode: DcpExchange top-k on (DCP8, interleave 1, rows 1-848, one-round rows <= 2048, ties by global id)
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:15:05 [decode.py:201] Kimi K3.1 DSA decode: DcpExchange top-k on (DCP8, interleave 1, rows 1-848, one-round rows <= 2048, ties by global id)
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:15:05 [decode.py:201] Kimi K3.1 DSA decode: DcpExchange top-k on (DCP8, interleave 1, rows 1-848, one-round rows <= 2048, ties by global id)
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:15:05 [decode.py:400] DcpExchange peer wait limit: 600 s
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:15:05 [decode.py:400] DcpExchange peer wait limit: 600 s
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:15:05 [decode.py:400] DcpExchange peer wait limit: 600 s
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:15:05 [decode.py:400] DcpExchange peer wait limit: 600 s
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:15:12 [indexer_topk.py:236] Warmed up the BF16 GVR V2 prefill top-k (topk 2048, up to 1048576 columns) in 7.0s
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:15:12 [indexer_topk.py:236] Warmed up the BF16 GVR V2 prefill top-k (topk 2048, up to 1048576 columns) in 7.0s
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:15:12 [base_loader.py:164] Online quantization as part of model loading took 0.00 seconds
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:15:12 [base_loader.py:164] Online quantization as part of model loading took 0.00 seconds
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:15:12 [eagle3_utils.py:36] Using Eagle3 auxiliary layers from config: (76, 80, 84, 88, 92)
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:15:12 [eagle3_utils.py:36] Using Eagle3 auxiliary layers from config: (76, 80, 84, 88, 92)
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:15:12 [model.py:1681] Kimi-K3 aux hidden capture: layers=(76, 80, 84, 88, 92) mode=prefix_only (VLLM_KIMI_K3_AUX_ATTN_RES_STREAM=0)
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:15:12 [cache.py:549] Using fp8 data type to store kv cache. It reduces the GPU memory footprint and boosts the performance. Meanwhile, it may cause accuracy drop without a proper scaling factor
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:15:12 [kernel.py:589] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'], gelu_and_mul_sparse=['triton', 'native'])
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:15:12 [cache.py:549] Using fp8 data type to store kv cache. It reduces the GPU memory footprint and boosts the performance. Meanwhile, it may cause accuracy drop without a proper scaling factor
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:15:12 [kernel.py:589] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'], gelu_and_mul_sparse=['triton', 'native'])
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:15:13 [nixl_utils.py:73] NIXL is available
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:15:13 [indexer_topk.py:236] Warmed up the BF16 GVR V2 prefill top-k (topk 2048, up to 1048576 columns) in 7.7s
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:15:13 [base_loader.py:164] Online quantization as part of model loading took 0.00 seconds
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:15:13 [indexer_topk.py:236] Warmed up the BF16 GVR V2 prefill top-k (topk 2048, up to 1048576 columns) in 7.7s
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:15:13 [base_loader.py:164] Online quantization as part of model loading took 0.00 seconds
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:15:13 [cuda.py:452] Using AttentionBackendEnum.TOKENSPEED_MLA backend.
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:15:13 [cuda.py:452] Using AttentionBackendEnum.TOKENSPEED_MLA backend.
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:15:13 [eagle3_utils.py:36] Using Eagle3 auxiliary layers from config: (76, 80, 84, 88, 92)
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:15:13 [eagle3_utils.py:36] Using Eagle3 auxiliary layers from config: (76, 80, 84, 88, 92)
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:15:13 [cache.py:549] Using fp8 data type to store kv cache. It reduces the GPU memory footprint and boosts the performance. Meanwhile, it may cause accuracy drop without a proper scaling factor
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:15:13 [kernel.py:589] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'], gelu_and_mul_sparse=['triton', 'native'])
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:15:13 [cache.py:549] Using fp8 data type to store kv cache. It reduces the GPU memory footprint and boosts the performance. Meanwhile, it may cause accuracy drop without a proper scaling factor
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:15:13 [kernel.py:589] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'], gelu_and_mul_sparse=['triton', 'native'])
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:15:14 [cuda.py:452] Using AttentionBackendEnum.TOKENSPEED_MLA backend.
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:15:14 [cuda.py:452] Using AttentionBackendEnum.TOKENSPEED_MLA backend.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:15:21 [base_loader.py:82] Initializing model took 8.342315 seconds
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:15:22 [default_loader.py:506] Loading weights took 0.73 seconds
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:15:23 [model_runner.py:449] Model loading took 205.79 GiB memory and 351.532160 seconds
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:15:23 [model_runner.py:449] Model loading took 205.79 GiB memory and 351.544126 seconds
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:15:23 [model_runner.py:449] Model loading took 205.79 GiB memory and 351.583459 seconds
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:15:23 [model_runner.py:449] Model loading took 205.79 GiB memory and 351.590791 seconds
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:15:23 [torch_utils.py:293] Reducing Torch threads from 88 to 1 for serving. Set OMP_NUM_THREADS in the external environment to override.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:15:23 [dsa_cache.py:214] Kimi K3 packed DSA block pinned to 1024 tokens by VLLM_KIMI_K3_PACKED_BLOCK_SIZE (unpinned: 2048).
+(MainProcess pid=1432171) INFO 11-13 05:15:23 [torch_utils.py:293] Reducing Torch threads from 88 to 1 for serving. Set OMP_NUM_THREADS in the external environment to override.
+(Worker_TP4_DCP4_EP4 pid=1433962) WARNING 11-13 05:15:26 [sparse_attn_indexer.py:526] sparse_indexer_topk_backend='trtllm_gvr2' is not supported with decode context parallelism (DCP=8) in decode; using 'auto'
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:15:28 [context.py:290] Warmed up the MLA DCP collectives of 2048-token steps.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:15:28 [flashinfer_all_reduce.py:235] Initialized FlashInfer Allreduce norm fusion workspace with backend=mnnvl
+2026-11-13 05:15:28,703 - INFO - core.py:635 - flashinfer.jit: Building JIT module trtllm_mnnvl_comm; this can take several minutes on first use.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:16:09 [indexer.py:1027] DSA indexer decode path: use_flattening=False supports_varlen=True (next_n=4, use_fp4_cache=True)
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:16:10 [dcp.py:1756] Using direct symmetric-memory DCP chunked-context KV gather for MLA.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:16:10 [sparse_mla_attention.py:331] Sharding sparse MLA prefill steps of >= 1024 tokens across TP ranks by token (sparse_mla_shard_q).
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:16:10 [speculator.py:414] Attention backend(s) TOKENSPEED_MLA cannot update draft decode metadata in place; falling back to rebuilding attention metadata eagerly.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:16:10 [breakable_cudagraph.py:294] Breakable CUDA graph enabled
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:16:10 [model_state.py:97] Kimi K3: fused KDA step prep for 4 KDA metadata builders and 2 kernel block tables
+2026-11-13 05:16:35,881 - INFO - core.py:635 - flashinfer.jit: Building JIT module fmha_gen; this can take several minutes on first use.
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:17:29 [speculator.py:179] Capturing model for DSpark speculator...
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:17:29 [speculator.py:179] Capturing model for DSpark speculator...
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:17:29 [speculator.py:179] Capturing model for DSpark speculator...
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:17:29 [speculator.py:179] Capturing model for DSpark speculator...
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:17:35 [model_runner.py:1273] Graph capturing finished in 85 secs, took 1.96 GiB
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:17:35 [model_runner.py:1273] Graph capturing finished in 85 secs, took 1.96 GiB
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:17:35 [model_runner.py:1273] Graph capturing finished in 85 secs, took 1.96 GiB
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:17:35 [model_runner.py:1273] Graph capturing finished in 85 secs, took 1.96 GiB
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:17:36 [gpu_worker.py:790] CUDA graph memory profiling is enabled (default since v0.21.0). The current --gpu-memory-utilization=0.9200 is equivalent to --gpu-memory-utilization=0.9121 without CUDA graph memory profiling. To maintain the same effective KV cache size as before, increase --gpu-memory-utilization to 0.9279. To disable, set VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0.
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:17:36 [gpu_worker.py:790] CUDA graph memory profiling is enabled (default since v0.21.0). The current --gpu-memory-utilization=0.9200 is equivalent to --gpu-memory-utilization=0.9121 without CUDA graph memory profiling. To maintain the same effective KV cache size as before, increase --gpu-memory-utilization to 0.9279. To disable, set VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0.
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:17:36 [gpu_worker.py:790] CUDA graph memory profiling is enabled (default since v0.21.0). The current --gpu-memory-utilization=0.9200 is equivalent to --gpu-memory-utilization=0.9121 without CUDA graph memory profiling. To maintain the same effective KV cache size as before, increase --gpu-memory-utilization to 0.9279. To disable, set VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:17:36 [gpu_worker.py:775] Available KV cache memory: 30.57 GiB
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:17:36 [gpu_worker.py:790] CUDA graph memory profiling is enabled (default since v0.21.0). The current --gpu-memory-utilization=0.9200 is equivalent to --gpu-memory-utilization=0.9121 without CUDA graph memory profiling. To maintain the same effective KV cache size as before, increase --gpu-memory-utilization to 0.9279. To disable, set VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0.
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:17:36 [factory.py:62] Creating v1 connector with name: MultiConnector and engine_id: db27914b-b658-4cd2-a8a7-4f62840f2056
+(Worker_TP6_DCP6_EP6 pid=1433966) WARNING 11-13 05:17:36 [base.py:220] Initializing KVConnectorBase_V1. This API is experimental and subject to change in the future as we iterate the design.
+(Worker_TP6_DCP6_EP6 pid=1433966) WARNING 11-13 05:17:36 [base.py:220] Initializing KVConnectorBase_V1. This API is experimental and subject to change in the future as we iterate the design.
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:17:36 [factory.py:62] Creating v1 connector with name: MultiConnector and engine_id: db27914b-b658-4cd2-a8a7-4f62840f2056
+(Worker_TP7_DCP7_EP7 pid=1433968) WARNING 11-13 05:17:36 [base.py:220] Initializing KVConnectorBase_V1. This API is experimental and subject to change in the future as we iterate the design.
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:17:36 [factory.py:62] Creating v1 connector with name: MultiConnector and engine_id: db27914b-b658-4cd2-a8a7-4f62840f2056
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:17:36 [factory.py:62] Creating v1 connector with name: MultiConnector and engine_id: db27914b-b658-4cd2-a8a7-4f62840f2056
+(Worker_TP7_DCP7_EP7 pid=1433968) WARNING 11-13 05:17:36 [base.py:220] Initializing KVConnectorBase_V1. This API is experimental and subject to change in the future as we iterate the design.
+(Worker_TP5_DCP5_EP5 pid=1433964) WARNING 11-13 05:17:36 [base.py:220] Initializing KVConnectorBase_V1. This API is experimental and subject to change in the future as we iterate the design.
+(Worker_TP4_DCP4_EP4 pid=1433962) WARNING 11-13 05:17:36 [base.py:220] Initializing KVConnectorBase_V1. This API is experimental and subject to change in the future as we iterate the design.
+(Worker_TP5_DCP5_EP5 pid=1433964) WARNING 11-13 05:17:36 [base.py:220] Initializing KVConnectorBase_V1. This API is experimental and subject to change in the future as we iterate the design.
+(Worker_TP4_DCP4_EP4 pid=1433962) WARNING 11-13 05:17:36 [base.py:220] Initializing KVConnectorBase_V1. This API is experimental and subject to change in the future as we iterate the design.
+(Worker_TP4_DCP4_EP4 pid=1433962) WARNING 11-13 05:17:36 [connector.py:98] Using kv_role='kv_both' with NixlConnector is deprecated and will be removed in a future release. Please set kv_role='kv_producer' for prefill instances and kv_role='kv_consumer' for decode instances. 
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:17:36 [base_worker.py:805] Initializing NIXL wrapper
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:17:36 [base_worker.py:805] Initializing NIXL wrapper
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:17:36 [base_worker.py:806] Initializing NIXL worker db27914b-b658-4cd2-a8a7-4f62840f2056
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:17:36 [base_worker.py:806] Initializing NIXL worker db27914b-b658-4cd2-a8a7-4f62840f2056
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:17:36 [base_worker.py:3380] NIXL: UCX_NET_DEVICES=mlx5_2:1,mlx5_3:1 for local GPU 1
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:17:36 [base_worker.py:3380] NIXL: UCX_NET_DEVICES=mlx5_0:1,mlx5_1:1 for local GPU 0
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:17:36 [base_worker.py:805] Initializing NIXL wrapper
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:17:36 [base_worker.py:805] Initializing NIXL wrapper
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:17:36 [base_worker.py:806] Initializing NIXL worker db27914b-b658-4cd2-a8a7-4f62840f2056
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:17:36 [base_worker.py:806] Initializing NIXL worker db27914b-b658-4cd2-a8a7-4f62840f2056
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:17:36 [base_worker.py:3380] NIXL: UCX_NET_DEVICES=mlx5_12:1,mlx5_13:1 for local GPU 3
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:17:36 [base_worker.py:3380] NIXL: UCX_NET_DEVICES=mlx5_10:1,mlx5_11:1 for local GPU 2
+2026-11-13 05:17:38 NIXL INFO    _api.py:405 Backend UCX was instantiated
+2026-11-13 05:17:38 NIXL INFO    _api.py:281 Initialized NIXL agent: 408d9cd3-80f1-4d96-9cdd-e1a3c1bd7843
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:17:38 [base_worker.py:1259] Detected attention backend(s) ['KIMI_K3_KDA', 'DEEPSEEK_V32_INDEXER', 'FLASHINFER_MLA_SPARSE', 'TOKENSPEED_MLA']
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:17:38 [base_worker.py:1263] Detected kv cache layout BLHNC
+(Worker_TP6_DCP6_EP6 pid=1433966) WARNING 11-13 05:17:38 [base.py:220] Initializing KVConnectorBase_V1. This API is experimental and subject to change in the future as we iterate the design.
+2026-11-13 05:17:38 NIXL INFO    _api.py:405 Backend UCX was instantiated
+2026-11-13 05:17:38 NIXL INFO    _api.py:281 Initialized NIXL agent: 6e81aed7-1fba-497f-b0da-fe64d663e094
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:17:38 [base_worker.py:1259] Detected attention backend(s) ['KIMI_K3_KDA', 'DEEPSEEK_V32_INDEXER', 'FLASHINFER_MLA_SPARSE', 'TOKENSPEED_MLA']
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:17:38 [base_worker.py:1263] Detected kv cache layout BLHNC
+(Worker_TP7_DCP7_EP7 pid=1433968) WARNING 11-13 05:17:38 [base.py:220] Initializing KVConnectorBase_V1. This API is experimental and subject to change in the future as we iterate the design.
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:17:38 [worker.py:1669] Mooncake store failover on: store get / put bounded at 30.0 s (timeout = cache miss / dropped put)
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:17:38 [worker.py:1669] Mooncake store failover on: store get / put bounded at 30.0 s (timeout = cache miss / dropped put)
+WARNING: Logging before InitGoogleLogging() is written to STDERR
+I1113 05:17:38.046516 1433966 client_metric.cpp:83] Client metrics enabled (default enabled)
+I1113 05:17:38.046530 1433966 client_metric.cpp:84] Client bandwidth summary enabled via MC_STORE_CLIENT_METRIC_BANDWIDTH
+2026-11-13 05:17:38 NIXL INFO    _api.py:405 Backend UCX was instantiated
+2026-11-13 05:17:38 NIXL INFO    _api.py:281 Initialized NIXL agent: a05cc381-4630-4ead-9235-c401379fc152
+WARNING: Logging before InitGoogleLogging() is written to STDERR
+I1113 05:17:38.046917 1433968 client_metric.cpp:83] Client metrics enabled (default enabled)
+I1113 05:17:38.046936 1433968 client_metric.cpp:84] Client bandwidth summary enabled via MC_STORE_CLIENT_METRIC_BANDWIDTH
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:17:38 [base_worker.py:1259] Detected attention backend(s) ['KIMI_K3_KDA', 'DEEPSEEK_V32_INDEXER', 'FLASHINFER_MLA_SPARSE', 'TOKENSPEED_MLA']
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:17:38 [base_worker.py:1263] Detected kv cache layout BLHNC
+2026-11-13 05:17:38 NIXL INFO    _api.py:405 Backend UCX was instantiated
+2026-11-13 05:17:38 NIXL INFO    _api.py:281 Initialized NIXL agent: 85f5a46b-f1e1-48ab-a904-5722514cb86e
+(Worker_TP5_DCP5_EP5 pid=1433964) WARNING 11-13 05:17:38 [base.py:220] Initializing KVConnectorBase_V1. This API is experimental and subject to change in the future as we iterate the design.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:17:38 [base_worker.py:1259] Detected attention backend(s) ['KIMI_K3_KDA', 'DEEPSEEK_V32_INDEXER', 'FLASHINFER_MLA_SPARSE', 'TOKENSPEED_MLA']
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:17:38 [base_worker.py:1263] Detected kv cache layout BLHNC
+(Worker_TP4_DCP4_EP4 pid=1433962) WARNING 11-13 05:17:38 [base.py:220] Initializing KVConnectorBase_V1. This API is experimental and subject to change in the future as we iterate the design.
+I1113 05:17:38.048530 1433966 client_service.cpp:471] client_id=4705357604577121066-884951699456579229
+I1113 05:17:38.048537 1433966 client_service.cpp:473] client_id=4705357604577121066-884951699456579229, host_id=10.66.24.135
+I1113 05:17:38.048538 1433966 client_service.cpp:485] Client metrics enabled but reporting disabled (interval=0)
+I1113 05:17:38.048900 1433968 client_service.cpp:471] client_id=6290647072311395974-14157949714196909719
+I1113 05:17:38.048908 1433968 client_service.cpp:473] client_id=6290647072311395974-14157949714196909719, host_id=10.66.24.135
+I1113 05:17:38.048910 1433968 client_service.cpp:485] Client metrics enabled but reporting disabled (interval=0)
+I1113 05:17:38.050374 1433968 client_service.cpp:1254] Storage root directory is not set. persisting data is disabled.
+I1113 05:17:38.050410 1433968 transfer_engine_impl.cpp:1184] Metrics reporting is disabled (set MC_TE_METRIC=1 to enable)
+I1113 05:17:38.050441 1433968 transfer_engine_impl.cpp:147] Transfer Engine parseHostNameWithPort. server_name: 10.66.24.135 port: 12789
+I1113 05:17:38.050453 1433968 transfer_engine_impl.cpp:214] Transfer Engine RPC using P2P handshake, listening on 10.66.24.135:15827
+I1113 05:17:38.050472 1433966 client_service.cpp:1254] Storage root directory is not set. persisting data is disabled.
+I1113 05:17:38.050513 1433966 transfer_engine_impl.cpp:1184] Metrics reporting is disabled (set MC_TE_METRIC=1 to enable)
+I1113 05:17:38.050537 1433966 transfer_engine_impl.cpp:147] Transfer Engine parseHostNameWithPort. server_name: 10.66.24.135 port: 13033
+I1113 05:17:38.050547 1433966 transfer_engine_impl.cpp:214] Transfer Engine RPC using P2P handshake, listening on 10.66.24.135:16420
+I1113 05:17:38.050549 1433968 client_service.cpp:1023] Transfer engine auto discovery is disabled for protocol: rdma
+I1113 05:17:38.050551 1433968 client_service.cpp:1035] Using specified RDMA devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3
+I1113 05:17:38.050668 1433966 client_service.cpp:1023] Transfer engine auto discovery is disabled for protocol: rdma
+I1113 05:17:38.050673 1433966 client_service.cpp:1035] Using specified RDMA devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3
+I1113 05:17:38.054806 1433968 topology.cpp:134] Device mlx5_0 port 1 is available
+I1113 05:17:38.054811 1433966 topology.cpp:134] Device mlx5_0 port 1 is available
+I1113 05:17:38.058488 1433966 topology.cpp:134] Device mlx5_1 port 1 is available
+I1113 05:17:38.058491 1433968 topology.cpp:134] Device mlx5_1 port 1 is available
+I1113 05:17:38.062377 1433966 topology.cpp:134] Device mlx5_2 port 1 is available
+I1113 05:17:38.062386 1433968 topology.cpp:134] Device mlx5_2 port 1 is available
+I1113 05:17:38.067514 1433968 topology.cpp:134] Device mlx5_3 port 1 is available
+I1113 05:17:38.067519 1433966 topology.cpp:134] Device mlx5_3 port 1 is available
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:17:38 [worker.py:1669] Mooncake store failover on: store get / put bounded at 30.0 s (timeout = cache miss / dropped put)
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:17:38 [worker.py:1669] Mooncake store failover on: store get / put bounded at 30.0 s (timeout = cache miss / dropped put)
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:17:38 [kv_cache_utils.py:894] kv cache group sizes (1024, 1024, 1024, 1024, 8192)
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:17:38 [kv_cache_utils.py:895] kv lcm block sizes 8192
+I1113 05:17:38.069628 1433968 client_service.cpp:1045] Topology discovery complete with specified devices. Found 4 HCAs
+I1113 05:17:38.069686 1433968 rdma_transport.cpp:267] [RDMA] Relaxed ordering is supported on this host; IBV_ACCESS_RELAXED_ORDERING will be requested for registered memory regions.
+I1113 05:17:38.069695 1433968 rdma_transport.cpp:1611] Increasing RDMA CQ count for mlx5_0 to match workers_per_ctx=2 for worker-owned endpoint polling
+I1113 05:17:38.069700 1433968 rdma_context.cpp:311] Using SIEVE endpoint store
+I1113 05:17:38.069757 1433966 client_service.cpp:1045] Topology discovery complete with specified devices. Found 4 HCAs
+I1113 05:17:38.069835 1433966 rdma_transport.cpp:267] [RDMA] Relaxed ordering is supported on this host; IBV_ACCESS_RELAXED_ORDERING will be requested for registered memory regions.
+I1113 05:17:38.069844 1433966 rdma_transport.cpp:1611] Increasing RDMA CQ count for mlx5_0 to match workers_per_ctx=2 for worker-owned endpoint polling
+I1113 05:17:38.069849 1433966 rdma_context.cpp:311] Using SIEVE endpoint store
+I1113 05:17:38.073385 1433968 rdma_context.cpp:1704] Using user-specified GID index: 3 on mlx5_0/1 (with network device)
+I1113 05:17:38.073823 1433966 rdma_context.cpp:1704] Using user-specified GID index: 3 on mlx5_0/1 (with network device)
+I1113 05:17:38.074862 1433968 rdma_context.cpp:407] RDMA device: mlx5_0, LID: 0, GID: (GID_Index 3) 00:00:00:00:00:00:00:00:00:00:ff:ff:ac:10:08:2c
+I1113 05:17:38.074873 1433968 rdma_transport.cpp:1611] Increasing RDMA CQ count for mlx5_1 to match workers_per_ctx=2 for worker-owned endpoint polling
+I1113 05:17:38.074875 1433968 rdma_context.cpp:311] Using SIEVE endpoint store
+I1113 05:17:38.075084 1433966 rdma_context.cpp:407] RDMA device: mlx5_0, LID: 0, GID: (GID_Index 3) 00:00:00:00:00:00:00:00:00:00:ff:ff:ac:10:08:2c
+I1113 05:17:38.075094 1433966 rdma_transport.cpp:1611] Increasing RDMA CQ count for mlx5_1 to match workers_per_ctx=2 for worker-owned endpoint polling
+I1113 05:17:38.075098 1433966 rdma_context.cpp:311] Using SIEVE endpoint store
+I1113 05:17:38.078358 1433968 rdma_context.cpp:1704] Using user-specified GID index: 3 on mlx5_1/1 (with network device)
+I1113 05:17:38.078467 1433966 rdma_context.cpp:1704] Using user-specified GID index: 3 on mlx5_1/1 (with network device)
+WARNING: Logging before InitGoogleLogging() is written to STDERR
+I1113 05:17:38.079061 1433964 client_metric.cpp:83] Client metrics enabled (default enabled)
+I1113 05:17:38.079107 1433964 client_metric.cpp:84] Client bandwidth summary enabled via MC_STORE_CLIENT_METRIC_BANDWIDTH
+I1113 05:17:38.079548 1433968 rdma_context.cpp:407] RDMA device: mlx5_1, LID: 0, GID: (GID_Index 3) 00:00:00:00:00:00:00:00:00:00:ff:ff:ac:11:08:2c
+I1113 05:17:38.079559 1433968 rdma_transport.cpp:1611] Increasing RDMA CQ count for mlx5_2 to match workers_per_ctx=2 for worker-owned endpoint polling
+I1113 05:17:38.079561 1433968 rdma_context.cpp:311] Using SIEVE endpoint store
+I1113 05:17:38.079620 1433966 rdma_context.cpp:407] RDMA device: mlx5_1, LID: 0, GID: (GID_Index 3) 00:00:00:00:00:00:00:00:00:00:ff:ff:ac:11:08:2c
+I1113 05:17:38.079627 1433966 rdma_transport.cpp:1611] Increasing RDMA CQ count for mlx5_2 to match workers_per_ctx=2 for worker-owned endpoint polling
+I1113 05:17:38.079628 1433966 rdma_context.cpp:311] Using SIEVE endpoint store
+WARNING: Logging before InitGoogleLogging() is written to STDERR
+I1113 05:17:38.079823 1433962 client_metric.cpp:83] Client metrics enabled (default enabled)
+I1113 05:17:38.079840 1433962 client_metric.cpp:84] Client bandwidth summary enabled via MC_STORE_CLIENT_METRIC_BANDWIDTH
+I1113 05:17:38.080965 1433964 client_service.cpp:471] client_id=6001110702391210700-15085994874384616862
+I1113 05:17:38.080979 1433964 client_service.cpp:473] client_id=6001110702391210700-15085994874384616862, host_id=10.66.24.135
+I1113 05:17:38.080983 1433964 client_service.cpp:485] Client metrics enabled but reporting disabled (interval=0)
+I1113 05:17:38.081975 1433962 client_service.cpp:471] client_id=4633998180152136327-2824825482597816237
+I1113 05:17:38.081986 1433962 client_service.cpp:473] client_id=4633998180152136327-2824825482597816237, host_id=10.66.24.135
+I1113 05:17:38.081990 1433962 client_service.cpp:485] Client metrics enabled but reporting disabled (interval=0)
+I1113 05:17:38.082649 1433964 client_service.cpp:1254] Storage root directory is not set. persisting data is disabled.
+I1113 05:17:38.082701 1433964 transfer_engine_impl.cpp:1184] Metrics reporting is disabled (set MC_TE_METRIC=1 to enable)
+I1113 05:17:38.082789 1433964 transfer_engine_impl.cpp:147] Transfer Engine parseHostNameWithPort. server_name: 10.66.24.135 port: 12788
+I1113 05:17:38.082813 1433964 transfer_engine_impl.cpp:214] Transfer Engine RPC using P2P handshake, listening on 10.66.24.135:15740
+I1113 05:17:38.082894 1433964 client_service.cpp:1023] Transfer engine auto discovery is disabled for protocol: rdma
+I1113 05:17:38.082902 1433964 client_service.cpp:1035] Using specified RDMA devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3
+I1113 05:17:38.082902 1433968 rdma_context.cpp:1704] Using user-specified GID index: 3 on mlx5_2/1 (with network device)
+I1113 05:17:38.082924 1433966 rdma_context.cpp:1704] Using user-specified GID index: 3 on mlx5_2/1 (with network device)
+I1113 05:17:38.084179 1433962 client_service.cpp:1254] Storage root directory is not set. persisting data is disabled.
+I1113 05:17:38.084223 1433962 transfer_engine_impl.cpp:1184] Metrics reporting is disabled (set MC_TE_METRIC=1 to enable)
+I1113 05:17:38.084255 1433962 transfer_engine_impl.cpp:147] Transfer Engine parseHostNameWithPort. server_name: 10.66.24.135 port: 13171
+I1113 05:17:38.084275 1433962 transfer_engine_impl.cpp:214] Transfer Engine RPC using P2P handshake, listening on 10.66.24.135:15044
+I1113 05:17:38.084313 1433968 rdma_context.cpp:407] RDMA device: mlx5_2, LID: 0, GID: (GID_Index 3) 00:00:00:00:00:00:00:00:00:00:ff:ff:ac:10:28:2c
+I1113 05:17:38.084323 1433968 rdma_transport.cpp:1611] Increasing RDMA CQ count for mlx5_3 to match workers_per_ctx=2 for worker-owned endpoint polling
+I1113 05:17:38.084326 1433968 rdma_context.cpp:311] Using SIEVE endpoint store
+I1113 05:17:38.084372 1433966 rdma_context.cpp:407] RDMA device: mlx5_2, LID: 0, GID: (GID_Index 3) 00:00:00:00:00:00:00:00:00:00:ff:ff:ac:10:28:2c
+I1113 05:17:38.084380 1433966 rdma_transport.cpp:1611] Increasing RDMA CQ count for mlx5_3 to match workers_per_ctx=2 for worker-owned endpoint polling
+I1113 05:17:38.084384 1433966 rdma_context.cpp:311] Using SIEVE endpoint store
+I1113 05:17:38.084631 1433962 client_service.cpp:1023] Transfer engine auto discovery is disabled for protocol: rdma
+I1113 05:17:38.084641 1433962 client_service.cpp:1035] Using specified RDMA devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3
+I1113 05:17:38.086678 1433964 topology.cpp:134] Device mlx5_0 port 1 is available
+I1113 05:17:38.087905 1433962 topology.cpp:134] Device mlx5_0 port 1 is available
+I1113 05:17:38.089563 1433964 topology.cpp:134] Device mlx5_1 port 1 is available
+I1113 05:17:38.089931 1433968 rdma_context.cpp:1704] Using user-specified GID index: 3 on mlx5_3/1 (with network device)
+I1113 05:17:38.089931 1433966 rdma_context.cpp:1704] Using user-specified GID index: 3 on mlx5_3/1 (with network device)
+I1113 05:17:38.091091 1433962 topology.cpp:134] Device mlx5_1 port 1 is available
+I1113 05:17:38.091259 1433966 rdma_context.cpp:407] RDMA device: mlx5_3, LID: 0, GID: (GID_Index 3) 00:00:00:00:00:00:00:00:00:00:ff:ff:ac:11:28:2c
+I1113 05:17:38.091262 1433968 rdma_context.cpp:407] RDMA device: mlx5_3, LID: 0, GID: (GID_Index 3) 00:00:00:00:00:00:00:00:00:00:ff:ff:ac:11:28:2c
+I1113 05:17:38.091332 1433968 transfer_metadata.cpp:61] NIC path intern pool size=1
+I1113 05:17:38.091332 1433966 transfer_metadata.cpp:61] NIC path intern pool size=1
+I1113 05:17:38.092149 1433968 transfer_task.cpp:1096] MC_STORE_MEMCPY not set, auto-detected: non-TCP transport available, memcpy disabled
+I1113 05:17:38.092159 1433968 real_client.cpp:1179] Successfully created client on port 12789 after 1 attempt(s)
+I1113 05:17:38.092273 1433966 transfer_task.cpp:1096] MC_STORE_MEMCPY not set, auto-detected: non-TCP transport available, memcpy disabled
+I1113 05:17:38.092280 1433966 real_client.cpp:1179] Successfully created client on port 13033 after 1 attempt(s)
+I1113 05:17:38.092337 1433968 real_client.cpp:1234] Registering local memory: 4294967296 bytes
+I1113 05:17:38.092453 1433966 real_client.cpp:1234] Registering local memory: 4294967296 bytes
+I1113 05:17:38.092577 1433964 topology.cpp:134] Device mlx5_2 port 1 is available
+I1113 05:17:38.093921 1433962 topology.cpp:134] Device mlx5_2 port 1 is available
+I1113 05:17:38.095520 1433964 topology.cpp:134] Device mlx5_3 port 1 is available
+I1113 05:17:38.096652 1433962 topology.cpp:134] Device mlx5_3 port 1 is available
+I1113 05:17:38.096809 1433964 client_service.cpp:1045] Topology discovery complete with specified devices. Found 4 HCAs
+I1113 05:17:38.096881 1433964 rdma_transport.cpp:267] [RDMA] Relaxed ordering is supported on this host; IBV_ACCESS_RELAXED_ORDERING will be requested for registered memory regions.
+I1113 05:17:38.096906 1433964 rdma_transport.cpp:1611] Increasing RDMA CQ count for mlx5_0 to match workers_per_ctx=2 for worker-owned endpoint polling
+I1113 05:17:38.096915 1433964 rdma_context.cpp:311] Using SIEVE endpoint store
+I1113 05:17:38.097630 1433962 client_service.cpp:1045] Topology discovery complete with specified devices. Found 4 HCAs
+I1113 05:17:38.097687 1433962 rdma_transport.cpp:267] [RDMA] Relaxed ordering is supported on this host; IBV_ACCESS_RELAXED_ORDERING will be requested for registered memory regions.
+I1113 05:17:38.097702 1433962 rdma_transport.cpp:1611] Increasing RDMA CQ count for mlx5_0 to match workers_per_ctx=2 for worker-owned endpoint polling
+I1113 05:17:38.097707 1433962 rdma_context.cpp:311] Using SIEVE endpoint store
+I1113 05:17:38.100203 1433964 rdma_context.cpp:1704] Using user-specified GID index: 3 on mlx5_0/1 (with network device)
+I1113 05:17:38.100797 1433962 rdma_context.cpp:1704] Using user-specified GID index: 3 on mlx5_0/1 (with network device)
+I1113 05:17:38.101437 1433964 rdma_context.cpp:407] RDMA device: mlx5_0, LID: 0, GID: (GID_Index 3) 00:00:00:00:00:00:00:00:00:00:ff:ff:ac:10:08:2c
+I1113 05:17:38.101460 1433964 rdma_transport.cpp:1611] Increasing RDMA CQ count for mlx5_1 to match workers_per_ctx=2 for worker-owned endpoint polling
+I1113 05:17:38.101464 1433964 rdma_context.cpp:311] Using SIEVE endpoint store
+I1113 05:17:38.101890 1433962 rdma_context.cpp:407] RDMA device: mlx5_0, LID: 0, GID: (GID_Index 3) 00:00:00:00:00:00:00:00:00:00:ff:ff:ac:10:08:2c
+I1113 05:17:38.101908 1433962 rdma_transport.cpp:1611] Increasing RDMA CQ count for mlx5_1 to match workers_per_ctx=2 for worker-owned endpoint polling
+I1113 05:17:38.101912 1433962 rdma_context.cpp:311] Using SIEVE endpoint store
+I1113 05:17:38.104723 1433964 rdma_context.cpp:1704] Using user-specified GID index: 3 on mlx5_1/1 (with network device)
+I1113 05:17:38.104967 1433962 rdma_context.cpp:1704] Using user-specified GID index: 3 on mlx5_1/1 (with network device)
+I1113 05:17:38.105819 1433964 rdma_context.cpp:407] RDMA device: mlx5_1, LID: 0, GID: (GID_Index 3) 00:00:00:00:00:00:00:00:00:00:ff:ff:ac:11:08:2c
+I1113 05:17:38.105834 1433964 rdma_transport.cpp:1611] Increasing RDMA CQ count for mlx5_2 to match workers_per_ctx=2 for worker-owned endpoint polling
+I1113 05:17:38.105837 1433964 rdma_context.cpp:311] Using SIEVE endpoint store
+I1113 05:17:38.106009 1433962 rdma_context.cpp:407] RDMA device: mlx5_1, LID: 0, GID: (GID_Index 3) 00:00:00:00:00:00:00:00:00:00:ff:ff:ac:11:08:2c
+I1113 05:17:38.106021 1433962 rdma_transport.cpp:1611] Increasing RDMA CQ count for mlx5_2 to match workers_per_ctx=2 for worker-owned endpoint polling
+I1113 05:17:38.106024 1433962 rdma_context.cpp:311] Using SIEVE endpoint store
+I1113 05:17:38.108994 1433964 rdma_context.cpp:1704] Using user-specified GID index: 3 on mlx5_2/1 (with network device)
+I1113 05:17:38.109113 1433962 rdma_context.cpp:1704] Using user-specified GID index: 3 on mlx5_2/1 (with network device)
+I1113 05:17:38.110047 1433964 rdma_context.cpp:407] RDMA device: mlx5_2, LID: 0, GID: (GID_Index 3) 00:00:00:00:00:00:00:00:00:00:ff:ff:ac:10:28:2c
+I1113 05:17:38.110061 1433964 rdma_transport.cpp:1611] Increasing RDMA CQ count for mlx5_3 to match workers_per_ctx=2 for worker-owned endpoint polling
+I1113 05:17:38.110065 1433964 rdma_context.cpp:311] Using SIEVE endpoint store
+I1113 05:17:38.110096 1433962 rdma_context.cpp:407] RDMA device: mlx5_2, LID: 0, GID: (GID_Index 3) 00:00:00:00:00:00:00:00:00:00:ff:ff:ac:10:28:2c
+I1113 05:17:38.110102 1433962 rdma_transport.cpp:1611] Increasing RDMA CQ count for mlx5_3 to match workers_per_ctx=2 for worker-owned endpoint polling
+I1113 05:17:38.110106 1433962 rdma_context.cpp:311] Using SIEVE endpoint store
+I1113 05:17:38.113390 1433962 rdma_context.cpp:1704] Using user-specified GID index: 3 on mlx5_3/1 (with network device)
+I1113 05:17:38.113390 1433964 rdma_context.cpp:1704] Using user-specified GID index: 3 on mlx5_3/1 (with network device)
+I1113 05:17:38.114414 1433962 rdma_context.cpp:407] RDMA device: mlx5_3, LID: 0, GID: (GID_Index 3) 00:00:00:00:00:00:00:00:00:00:ff:ff:ac:11:28:2c
+I1113 05:17:38.114418 1433964 rdma_context.cpp:407] RDMA device: mlx5_3, LID: 0, GID: (GID_Index 3) 00:00:00:00:00:00:00:00:00:00:ff:ff:ac:11:28:2c
+I1113 05:17:38.114511 1433962 transfer_metadata.cpp:61] NIC path intern pool size=1
+I1113 05:17:38.114511 1433964 transfer_metadata.cpp:61] NIC path intern pool size=1
+I1113 05:17:38.114915 1433962 transfer_task.cpp:1096] MC_STORE_MEMCPY not set, auto-detected: non-TCP transport available, memcpy disabled
+I1113 05:17:38.114936 1433962 real_client.cpp:1179] Successfully created client on port 13171 after 1 attempt(s)
+I1113 05:17:38.114989 1433964 transfer_task.cpp:1096] MC_STORE_MEMCPY not set, auto-detected: non-TCP transport available, memcpy disabled
+I1113 05:17:38.115000 1433964 real_client.cpp:1179] Successfully created client on port 12788 after 1 attempt(s)
+I1113 05:17:38.115123 1433962 real_client.cpp:1234] Registering local memory: 4294967296 bytes
+I1113 05:17:38.115175 1433964 real_client.cpp:1234] Registering local memory: 4294967296 bytes
+I1113 05:17:38.193645 1433966 mmap_buffer.cpp:360] NIC NUMA nodes [0] are outside this process's allowed memory nodes (cpuset.mems or an MPOL_BIND task policy); the global segment is not placed there
+I1113 05:17:38.193688 1433966 real_client.cpp:1472] Mounting segment: 268435456000 bytes, 268435456000 of 268435456000
+I1113 05:17:38.193694 1433966 registered_pinned_memory.cpp:79] Store segment pinned memory is disabled, max_bytes=0
+I1113 05:17:38.195091 1433968 mmap_buffer.cpp:360] NIC NUMA nodes [0] are outside this process's allowed memory nodes (cpuset.mems or an MPOL_BIND task policy); the global segment is not placed there
+I1113 05:17:38.195122 1433968 real_client.cpp:1472] Mounting segment: 268435456000 bytes, 268435456000 of 268435456000
+I1113 05:17:38.195127 1433968 registered_pinned_memory.cpp:79] Store segment pinned memory is disabled, max_bytes=0
+W1113 05:17:38.196298 1433966 rdma_transport.cpp:553] Auto-splitting buffer 0xffa70f000000 (268435456000 bytes) into 63 chunks of <= 4294967296 bytes each (device max_mr_size; Mooncake#2017)
+W1113 05:17:38.197701 1433968 rdma_transport.cpp:553] Auto-splitting buffer 0xffa75b000000 (268435456000 bytes) into 63 chunks of <= 4294967296 bytes each (device max_mr_size; Mooncake#2017)
+I1113 05:17:38.223666 1433962 real_client.cpp:1472] Mounting segment: 268435456000 bytes, 268435456000 of 268435456000
+I1113 05:17:38.223717 1433962 registered_pinned_memory.cpp:79] Store segment pinned memory is disabled, max_bytes=0
+W1113 05:17:38.226517 1433962 rdma_transport.cpp:553] Auto-splitting buffer 0xffa70f000000 (268435456000 bytes) into 63 chunks of <= 4294967296 bytes each (device max_mr_size; Mooncake#2017)
+I1113 05:17:38.228524 1433964 real_client.cpp:1472] Mounting segment: 268435456000 bytes, 268435456000 of 268435456000
+I1113 05:17:38.228566 1433964 registered_pinned_memory.cpp:79] Store segment pinned memory is disabled, max_bytes=0
+W1113 05:17:38.231321 1433964 rdma_transport.cpp:553] Auto-splitting buffer 0xffa707000000 (268435456000 bytes) into 63 chunks of <= 4294967296 bytes each (device max_mr_size; Mooncake#2017)
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:17:49 [worker.py:1751] Mooncake mode=embedded (global_segment_size=268435456000, local_buffer_size=4294967296, preferred_segment=<none>, enable_offload=False, tenant_id=default)
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:17:49 [base_worker.py:1897] Registering KV_Caches. use_mla: True, kv_buffer_device: cuda, use_host_buffer: False
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:17:49 [base_worker.py:2273] Hybrid SSM registration: num_blocks=1746, logical_num_blocks=1746, ratio=1, num_regions=71, num_descs=123966, mamba_ssm_size=(55296, 786432), block_len_per_layer={841728, 589824, 69632}
+W1113 05:17:49.515898 1433962 rdma_transport.cpp:553] Auto-splitting buffer 0x5c080000000 (32825917440 bytes) into 8 chunks of <= 4294967296 bytes each (device max_mr_size; Mooncake#2017)
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:17:49 [worker.py:2221] Registered KV caches: num_groups=5, num_segments=0 (host=0, device=0)
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:17:49 [worker.py:2294] Started 4 Mooncake KV-load receive thread(s)
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:17:49 [worker.py:1751] Mooncake mode=embedded (global_segment_size=268435456000, local_buffer_size=4294967296, preferred_segment=<none>, enable_offload=False, tenant_id=default)
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:17:49 [base_worker.py:1897] Registering KV_Caches. use_mla: True, kv_buffer_device: cuda, use_host_buffer: False
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:17:49 [base_worker.py:2273] Hybrid SSM registration: num_blocks=1746, logical_num_blocks=1746, ratio=1, num_regions=71, num_descs=123966, mamba_ssm_size=(55296, 786432), block_len_per_layer={841728, 589824, 69632}
+W1113 05:17:49.755200 1433964 rdma_transport.cpp:553] Auto-splitting buffer 0x64c40000000 (32825917440 bytes) into 8 chunks of <= 4294967296 bytes each (device max_mr_size; Mooncake#2017)
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:17:49 [worker.py:2221] Registered KV caches: num_groups=5, num_segments=0 (host=0, device=0)
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:17:49 [worker.py:2294] Started 4 Mooncake KV-load receive thread(s)
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:17:50 [worker.py:1751] Mooncake mode=embedded (global_segment_size=268435456000, local_buffer_size=4294967296, preferred_segment=<none>, enable_offload=False, tenant_id=default)
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:17:50 [base_worker.py:1897] Registering KV_Caches. use_mla: True, kv_buffer_device: cuda, use_host_buffer: False
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:17:50 [base_worker.py:2273] Hybrid SSM registration: num_blocks=1746, logical_num_blocks=1746, ratio=1, num_regions=71, num_descs=123966, mamba_ssm_size=(55296, 786432), block_len_per_layer={841728, 589824, 69632}
+W1113 05:17:50.261767 1433966 rdma_transport.cpp:553] Auto-splitting buffer 0x41e60000000 (32825917440 bytes) into 8 chunks of <= 4294967296 bytes each (device max_mr_size; Mooncake#2017)
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:17:50 [worker.py:2221] Registered KV caches: num_groups=5, num_segments=0 (host=0, device=0)
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:17:50 [worker.py:2294] Started 4 Mooncake KV-load receive thread(s)
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:17:50 [worker.py:1751] Mooncake mode=embedded (global_segment_size=268435456000, local_buffer_size=4294967296, preferred_segment=<none>, enable_offload=False, tenant_id=default)
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:17:50 [base_worker.py:1897] Registering KV_Caches. use_mla: True, kv_buffer_device: cuda, use_host_buffer: False
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:17:50 [base_worker.py:2273] Hybrid SSM registration: num_blocks=1746, logical_num_blocks=1746, ratio=1, num_regions=71, num_descs=123966, mamba_ssm_size=(55296, 786432), block_len_per_layer={841728, 589824, 69632}
+W1113 05:17:50.525882 1433968 rdma_transport.cpp:553] Auto-splitting buffer 0x4a9c0000000 (32825917440 bytes) into 8 chunks of <= 4294967296 bytes each (device max_mr_size; Mooncake#2017)
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:17:50 [worker.py:2221] Registered KV caches: num_groups=5, num_segments=0 (host=0, device=0)
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:17:50 [worker.py:2294] Started 4 Mooncake KV-load receive thread(s)
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:17:51 [kernel_warmup.py:219] JIT kernel warmup starting.
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:17:51 [kernel_warmup.py:219] JIT kernel warmup starting.
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:17:51 [kernel_warmup.py:219] JIT kernel warmup starting.
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:17:51 [kernel_warmup.py:219] JIT kernel warmup starting.
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:18:00 [kernel_warmup.py:232] JIT kernel warmup finished in 9.47s.
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:18:00 [kernel_warmup.py:232] JIT kernel warmup finished in 9.48s.
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:18:00 [kernel_warmup.py:232] JIT kernel warmup finished in 9.49s.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:18:00 [kernel_warmup.py:232] JIT kernel warmup finished in 9.49s.
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:18:00 [mamba_triton_warmup.py:42] Warmed Mamba batch_memcpy_kernel.
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:18:00 [mamba_triton_warmup.py:42] Warmed Mamba batch_memcpy_kernel.
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:18:00 [kimi_k3_triton_warmup.py:119] Warming up Kimi-K3 speculative KDA kernels.
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:18:00 [kimi_k3_triton_warmup.py:119] Warming up Kimi-K3 speculative KDA kernels.
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:18:00 [mamba_triton_warmup.py:42] Warmed Mamba batch_memcpy_kernel.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:18:00 [mamba_triton_warmup.py:42] Warmed Mamba batch_memcpy_kernel.
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:18:00 [kimi_k3_triton_warmup.py:119] Warming up Kimi-K3 speculative KDA kernels.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:18:00 [kimi_k3_triton_warmup.py:119] Warming up Kimi-K3 speculative KDA kernels.
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:18:00 [kimi_k3_triton_warmup.py:259] Warming up Kimi-K3 prefill glue kernels.
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:18:00 [kimi_k3_triton_warmup.py:259] Warming up Kimi-K3 prefill glue kernels.
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:18:00 [kimi_k3_triton_warmup.py:259] Warming up Kimi-K3 prefill glue kernels.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:18:00 [kimi_k3_triton_warmup.py:259] Warming up Kimi-K3 prefill glue kernels.
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:18:11 [kimi_k3_triton_warmup.py:458] Kimi-K3: compiled 10 tokenspeed MLA decode keys for 1 layer shapes.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:18:11 [kimi_k3_triton_warmup.py:458] Kimi-K3: compiled 10 tokenspeed MLA decode keys for 1 layer shapes.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:18:11 [kernel_warmup.py:100] Warming up ll_bf16 router GEMM kernels for shapes: ((7168, 896),).
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:18:11 [kimi_k3_triton_warmup.py:458] Kimi-K3: compiled 10 tokenspeed MLA decode keys for 1 layer shapes.
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:18:11 [kimi_k3_triton_warmup.py:458] Kimi-K3: compiled 10 tokenspeed MLA decode keys for 1 layer shapes.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:18:12 [kernel_warmup.py:155] Warmed up 6 GEMM-RS/AR variants.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:18:12 [cutedsl_warmup.py:107] Warming up CuTeDSL compile_units=44 names=('shape-dynamic skinny GEMM', 'shape-dynamic skinny GEMM with residual', 'Kimi-K3 KDA skinny-N GEMM', 'Kimi-K3 KDA skinny-K GEMM').
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:18:21 [kernel_warmup.py:317] Skipping FlashInfer autotune because it is disabled.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:18:21 [model_state.py:97] Kimi K3: fused KDA step prep for 4 KDA metadata builders and 1 kernel block tables
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:18:27 [warmup.py:812] Serving-shape warmup 0: 30 spec-decode rows x 4 tokens, prompt chunks 16263 + 16263, cache hit 16263 + 1 tokens.
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:18:27 [warmup.py:812] Serving-shape warmup 0: 30 spec-decode rows x 4 tokens, prompt chunks 16263 + 16263, cache hit 16263 + 1 tokens.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:18:27 [warmup.py:812] Serving-shape warmup 0: 30 spec-decode rows x 4 tokens, prompt chunks 16263 + 16263, cache hit 16263 + 1 tokens.
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:18:27 [warmup.py:812] Serving-shape warmup 0: 30 spec-decode rows x 4 tokens, prompt chunks 16263 + 16263, cache hit 16263 + 1 tokens.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:18:27 [indexer_topk.py:562] Sparse indexer prefill top-k backend: trtllm_gvr2 (torch.bfloat16)
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:18:27 [indexer_topk.py:688] Sparse indexer decode top-k backend: persistent
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:18:28 [warmup.py:812] Serving-shape warmup 1: 26 spec-decode rows x 4 tokens, prompt chunks 16264 + 16256, cache hit 16264 + 8 tokens.
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:18:28 [warmup.py:812] Serving-shape warmup 1: 26 spec-decode rows x 4 tokens, prompt chunks 16264 + 16256, cache hit 16264 + 8 tokens.
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:18:28 [warmup.py:812] Serving-shape warmup 1: 26 spec-decode rows x 4 tokens, prompt chunks 16264 + 16256, cache hit 16264 + 8 tokens.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:18:28 [warmup.py:812] Serving-shape warmup 1: 26 spec-decode rows x 4 tokens, prompt chunks 16264 + 16256, cache hit 16264 + 8 tokens.
+/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/hti/p2/integ-af10ccc2c4/vllm/utils/jit_monitor.py:108: FutureWarning: `torch.distributed.reduce_op` is deprecated, please use `torch.distributed.ReduceOp` instead
+  return [obj for obj in gc.get_objects() if isinstance(obj, JITFunction)]
+/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/hti/p2/integ-af10ccc2c4/vllm/utils/jit_monitor.py:108: FutureWarning: `torch.distributed.reduce_op` is deprecated, please use `torch.distributed.ReduceOp` instead
+  return [obj for obj in gc.get_objects() if isinstance(obj, JITFunction)]
+/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/hti/p2/integ-af10ccc2c4/vllm/utils/jit_monitor.py:108: FutureWarning: `torch.distributed.reduce_op` is deprecated, please use `torch.distributed.ReduceOp` instead
+  return [obj for obj in gc.get_objects() if isinstance(obj, JITFunction)]
+/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/hti/p2/integ-af10ccc2c4/vllm/utils/jit_monitor.py:108: FutureWarning: `torch.distributed.reduce_op` is deprecated, please use `torch.distributed.ReduceOp` instead
+  return [obj for obj in gc.get_objects() if isinstance(obj, JITFunction)]
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:18:31 [warmup.py:812] Serving-shape warmup 2: 23 spec-decode rows x 4 tokens, prompt chunks 16272 + 16257, cache hit 16272 + 5 tokens.
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:18:31 [warmup.py:812] Serving-shape warmup 2: 23 spec-decode rows x 4 tokens, prompt chunks 16272 + 16257, cache hit 16272 + 5 tokens.
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:18:31 [warmup.py:812] Serving-shape warmup 2: 23 spec-decode rows x 4 tokens, prompt chunks 16272 + 16257, cache hit 16272 + 5 tokens.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:18:31 [warmup.py:812] Serving-shape warmup 2: 23 spec-decode rows x 4 tokens, prompt chunks 16272 + 16257, cache hit 16272 + 5 tokens.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:18:32 [warmup.py:906] JIT_WARMUP_VERIFIED: no kernel compiled in the serving-shape verification step.
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:18:32 [warmup.py:906] JIT_WARMUP_VERIFIED: no kernel compiled in the serving-shape verification step.
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:18:32 [warmup.py:906] JIT_WARMUP_VERIFIED: no kernel compiled in the serving-shape verification step.
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:18:32 [warmup.py:906] JIT_WARMUP_VERIFIED: no kernel compiled in the serving-shape verification step.
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:18:40 [speculator.py:179] Capturing model for DSpark speculator...
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:18:40 [speculator.py:179] Capturing model for DSpark speculator...
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:18:40 [speculator.py:179] Capturing model for DSpark speculator...
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:18:40 [speculator.py:179] Capturing model for DSpark speculator...
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:18:40 [model_runner.py:1273] Graph capturing finished in 9 secs, took 0.85 GiB
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:18:40 [gpu_worker.py:1011] CUDA graph pool memory: 0.85 GiB (actual), 2.21 GiB (estimated), difference: 1.36 GiB (160.3%).
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:18:40 [gpu_worker.py:1074] Free memory on device (272.51/278.54 GiB) on startup. Desired GPU memory utilization is (0.92, 256.26 GiB). Actual usage is 218.74 GiB for consumed memory (weights + non-torch), 6.94 GiB for peak activation, and 0.85 GiB for CUDAGraph memory. Replace gpu_memory_utilization config with `--kv-cache-memory=31758888244` (29.58 GiB) to fit into requested memory, or `--kv-cache-memory=49212881408` (45.83 GiB) to fully utilize gpu memory. Current kv cache memory in use is 30.57 GiB.
+(Worker_TP5_DCP5_EP5 pid=1433964) INFO 11-13 05:18:40 [jit_monitor.py:81] Kernel JIT monitor activated; monitored JIT compilations during inference will use mode=warn.
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:18:40 [model_runner.py:1273] Graph capturing finished in 9 secs, took 0.85 GiB
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:18:40 [gpu_worker.py:1011] CUDA graph pool memory: 0.85 GiB (actual), 2.21 GiB (estimated), difference: 1.36 GiB (160.3%).
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:18:40 [gpu_worker.py:1074] Free memory on device (272.51/278.54 GiB) on startup. Desired GPU memory utilization is (0.92, 256.26 GiB). Actual usage is 218.74 GiB for consumed memory (weights + non-torch), 6.94 GiB for peak activation, and 0.85 GiB for CUDAGraph memory. Replace gpu_memory_utilization config with `--kv-cache-memory=31758888244` (29.58 GiB) to fit into requested memory, or `--kv-cache-memory=49212881408` (45.83 GiB) to fully utilize gpu memory. Current kv cache memory in use is 30.57 GiB.
+(Worker_TP6_DCP6_EP6 pid=1433966) INFO 11-13 05:18:40 [jit_monitor.py:81] Kernel JIT monitor activated; monitored JIT compilations during inference will use mode=warn.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:18:40 [model_runner.py:1273] Graph capturing finished in 9 secs, took 0.85 GiB
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:18:40 [gpu_worker.py:1011] CUDA graph pool memory: 0.85 GiB (actual), 2.21 GiB (estimated), difference: 1.36 GiB (160.3%).
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:18:40 [gpu_worker.py:1074] Free memory on device (272.51/278.54 GiB) on startup. Desired GPU memory utilization is (0.92, 256.26 GiB). Actual usage is 218.74 GiB for consumed memory (weights + non-torch), 6.94 GiB for peak activation, and 0.85 GiB for CUDAGraph memory. Replace gpu_memory_utilization config with `--kv-cache-memory=31758888244` (29.58 GiB) to fit into requested memory, or `--kv-cache-memory=49212881408` (45.83 GiB) to fully utilize gpu memory. Current kv cache memory in use is 30.57 GiB.
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 05:18:40 [jit_monitor.py:81] Kernel JIT monitor activated; monitored JIT compilations during inference will use mode=warn.
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:18:40 [model_runner.py:1273] Graph capturing finished in 9 secs, took 0.85 GiB
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:18:40 [gpu_worker.py:1011] CUDA graph pool memory: 0.85 GiB (actual), 2.21 GiB (estimated), difference: 1.36 GiB (160.7%).
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:18:40 [gpu_worker.py:1074] Free memory on device (272.51/278.54 GiB) on startup. Desired GPU memory utilization is (0.92, 256.26 GiB). Actual usage is 218.74 GiB for consumed memory (weights + non-torch), 6.94 GiB for peak activation, and 0.85 GiB for CUDAGraph memory. Replace gpu_memory_utilization config with `--kv-cache-memory=31763082548` (29.58 GiB) to fit into requested memory, or `--kv-cache-memory=49217075712` (45.84 GiB) to fully utilize gpu memory. Current kv cache memory in use is 30.58 GiB.
+(Worker_TP7_DCP7_EP7 pid=1433968) INFO 11-13 05:18:40 [jit_monitor.py:81] Kernel JIT monitor activated; monitored JIT compilations during inference will use mode=warn.
+I1113 06:10:43.073909 1438242 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.077281 1437426 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.080256 1437426 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.080693 1438185 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.084851 1437423 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.087735 1437423 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.112674 1437426 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.116768 1437423 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.122516 1437423 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.122570 1438242 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.124979 1437423 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.136270 1438242 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.136711 1437423 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.139201 1437423 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.148509 1437426 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.173249 1438242 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.175052 1438242 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.176685 1437423 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.185395 1437423 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.188585 1437426 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.189479 1438185 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.191699 1438242 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.199560 1437423 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.217209 1437426 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.224530 1437423 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.227167 1437423 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.227167 1438185 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.232697 1438242 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.235524 1438185 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.274840 1438242 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.279387 1437426 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.281491 1438185 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.417157 1438242 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.428527 1437423 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.439450 1438185 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.446355 1438242 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.459172 1437423 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.462168 1437423 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.467962 1438185 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.474637 1437426 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.504782 1437426 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.546347 1437426 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.566082 1438185 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.588789 1437423 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.597414 1438185 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.597659 1438242 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.709612 1438185 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.714792 1437423 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.718350 1437423 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.733192 1437423 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.770764 1438185 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.806134 1438185 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.808985 1438242 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.811365 1438242 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.820715 1438185 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.829345 1438242 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.832662 1437426 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.837153 1438185 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.848369 1438242 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.860080 1438242 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:43.910678 1438242 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+I1113 06:10:44.481429 1438185 rdma_endpoint.cpp:1051] Received RDMA ready ACK.
+[2026-11-13T06:11:09.540] error: *** STEP 1050538.134 ON hecate0311 CANCELLED AT 2026-11-13T06:11:09 DUE to SIGNAL Terminated ***
+(MainProcess pid=1432171) INFO 11-13 06:11:09 [multiproc_executor.py:581] [shutdown] Executor: waiting for worker exit count=4
+(Worker_TP4_DCP4_EP4 pid=1433962) INFO 11-13 06:11:09 [multiproc_executor.py:945] Parent process exited, terminating worker queues
+(MainProcess pid=1432171) WARNING 11-13 06:11:14 [multiproc_executor.py:593] [shutdown] Executor: workers still running after grace period; sending SIGTERM count=4
+(MainProcess pid=1432171) WARNING 11-13 06:11:18 [multiproc_executor.py:603] [shutdown] Executor: workers still running after SIGTERM; sending SIGKILL count=4

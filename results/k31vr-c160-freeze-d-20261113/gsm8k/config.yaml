@@ -1,4 +1,4 @@
-name: coreai_comparch_inferencex-k31e2e.integaf10frz-pareto-c256-spx
+name: coreai_comparch_inferencex-k31e2e.integaf10frz-pareto-c160-ev-spx
 schema: 2
 model:
   path: hf:moonshotai/Kimi-K3
@@ -93,6 +93,7 @@ frontend:
     DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS: '3600'
     DYN_TOKENIZER_CACHE_BYTES: '8589934592'
     DYN_TCP_REQUEST_TIMEOUT: '120'
+    DYN_VLLMPROC_FIXES: '1'
     VLLM_K3_FAST_SPLIT: '1'
     VLLM_K3_TOKCACHE_BYTES: 512M
     VLLM_K3_SKIP_ID_VALIDATION: '1'
@@ -208,7 +209,11 @@ roles:
       - 1
       distributed-timeout-seconds: 1800
       cpu-distributed-timeout-seconds: 1800
-      speculative-config: '{"method": "dspark", "model": "/raid/common-models/kimi-k3.1-pro-dspark-preview", "num_speculative_tokens": 3, "attention_backend": "TOKENSPEED_MLA", "draft_sample_method": "probabilistic", "rejection_sample_method": "synthetic", "synthetic_acceptance_length": 3.0}'
+      speculative-config: '{"method":"dspark","model":"/raid/common-models/kimi-k3.1-pro-dspark-preview","num_speculative_tokens":3,"attention_backend":"TOKENSPEED_MLA","draft_sample_method":"probabilistic","rejection_sample_method":"block"}'
+      reasoning-parser: kimi_k3
+      dyn-tool-call-parser: kimi_k3
+      dyn-reasoning-parser: kimi_k3
+      dyn-enable-structural-tag: true
       mamba-extra-tail-checkpoint-tokens: 1024
       attention-config: '{"indexer_kv_dtype":"mxfp4"}'
     kv_events: true
@@ -253,12 +258,16 @@ roles:
       max-num-batched-tokens: 8192
       stream-interval: 10
       additional-config: '{"decode_backend":"latency_specialized"}'
-      speculative-config: '{"method": "dspark", "model": "/raid/common-models/kimi-k3.1-pro-dspark-preview", "num_speculative_tokens": 3, "attention_backend": "TOKENSPEED_MLA", "draft_sample_method": "probabilistic", "rejection_sample_method": "synthetic", "synthetic_acceptance_length": 3.0}'
+      speculative-config: '{"method":"dspark","model":"/raid/common-models/kimi-k3.1-pro-dspark-preview","num_speculative_tokens":3,"attention_backend":"TOKENSPEED_MLA","draft_sample_method":"probabilistic","rejection_sample_method":"block"}'
+      reasoning-parser: kimi_k3
+      dyn-tool-call-parser: kimi_k3
+      dyn-reasoning-parser: kimi_k3
+      dyn-enable-structural-tag: true
       distributed-timeout-seconds: 1800
       cpu-distributed-timeout-seconds: 1800
-      max-num-seqs: 256
-      max-cudagraph-capture-size: 1024
-      compilation-config: '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[6,8,15,16,18,20,21,24,30,32,39,40,45,48,54,56,63,64,66,68,69,72,75,76,78,80,81,84,87,88,90,92,93,96,100,102,104,108,112,114,116,120,124,126,128,132,136,138,144,150,152,156,160,162,168,174,176,180,184,186,192,200,204,208,216,224,228,232,240,248,252,256,264,272,276,288,300,304,312,320,324,336,348,352,360,368,372,384,400,416,432,448,464,480,496,512,528,544,560,576,592,608,624,640,656,672,688,704,720,736,752,768,784,800,816,832,848,864,880,896,912,928,944,960,976,992,1008,1024]}'
+      max-num-seqs: 160
+      max-cudagraph-capture-size: 640
+      compilation-config: '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[6,8,15,16,18,20,21,24,30,32,39,40,45,48,54,56,63,64,66,68,69,72,75,76,78,80,81,84,87,88,90,92,93,96,100,102,104,108,112,114,116,120,124,126,128,132,136,138,144,150,152,156,160,162,168,174,176,180,184,186,192,200,204,208,216,224,228,232,240,248,252,256,264,272,276,288,300,304,312,320,324,336,348,352,360,368,372,384,400,416,432,448,464,480,496,512,528,544,560,576,592,608,624,640]}'
       attention-config: '{"indexer_kv_dtype":"mxfp4"}'
 extra_mount:
 - /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr:/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr
@@ -316,6 +325,7 @@ post_eval:
   - ENABLE_AGENTX_POWER
   - EVAL_ENDPOINT_READY_TIMEOUT_SECONDS
   - EVAL_MODEL_STABILIZATION_SECONDS
+  - EVAL_CONC
   - EVAL_ONLY
   - IS_AGENTIC
   - OPENAI_API_KEY
@@ -325,6 +335,3 @@ post_eval:
   - SGLANG_TORCH_PROFILER_DIR
   - VLLM_ENGINE_READY_TIMEOUT_S
   - VLLM_TORCH_PROFILER_DIR
-observability:
-  tachometer:
-    enabled: false
