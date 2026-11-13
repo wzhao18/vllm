@@ -1031,6 +1031,31 @@ def get_dcp_workspace_max_num_tokens(vllm_config: VllmConfig) -> int:
     )
 
 
+def dcp_path_rows_bound(vllm_config: VllmConfig) -> int | None:
+    """Most MQA rows one DCP-path pass (query gather, DCP-local attention, LSE
+    combine) may take on this instance, or None when unbounded.
+
+    A decode-only instance (P/D kv_consumer, not kv_both) serves decode and
+    spec-verify steps, which fit the DCP workspace
+    (``get_dcp_workspace_max_num_tokens``: the direct symmetric-memory query
+    gather and combine are sized for them). Its rare larger steps (local
+    recompute after a KV load failure or a preemption, cache-hit suffixes)
+    run in row chunks of that many rows (``MLAAttention._dcp_mqa_in_row_chunks``)
+    instead of taking the NCCL fallback of the gather and the combine: an
+    all-gather and an all-to-all over the DCP group, whose communicator
+    buffers (GiBs per GPU over a multi-node 16-rank group) stay allocated from
+    their first use. Rows are independent, so the chunks compute the whole
+    step's output."""
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    if (
+        kv_transfer_config is None
+        or not kv_transfer_config.is_kv_consumer
+        or kv_transfer_config.is_kv_producer
+    ):
+        return None
+    return get_dcp_workspace_max_num_tokens(vllm_config)
+
+
 def cp_kv_cache_interleave_one(vllm_config: Any) -> bool:
     """Whether DCP shards the KV cache token by token (interleave 1) for good.
 

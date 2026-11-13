@@ -725,6 +725,19 @@ def trtllm_gen_lse_max_rows(vllm_config: VllmConfig, dcp_shardq: bool) -> int:
     )
 
 
+def dcp_path_max_rows(vllm_config: VllmConfig, dcp_shardq: bool) -> int:
+    """Most rows of one DCP-path MQA pass: ``trtllm_gen_lse_max_rows``, and on
+    a decode-only instance at most the DCP workspace's tokens
+    (``dcp_path_rows_bound``). MLAAttention runs a step with more MQA rows in
+    row chunks of this many rows, and the memory profile claims one chunk's
+    working set."""
+    from vllm.v1.attention.ops.dcp import dcp_path_rows_bound
+
+    rows = trtllm_gen_lse_max_rows(vllm_config, dcp_shardq)
+    bound = None if dcp_shardq else dcp_path_rows_bound(vllm_config)
+    return rows if bound is None else min(rows, bound)
+
+
 def trtllm_gen_lse_rows_capacity(workspace_bytes: int, padded_heads: int) -> int:
     """Rows of ``padded_heads`` query heads whose softmax stats a workspace of
     ``workspace_bytes`` holds (the inverse of
@@ -1100,9 +1113,7 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         # row chunks of at most this many rows (dense-MHA steps have more).
         self.dcp_path_max_rows: int | None = None
         if self.dcp_world_size > 1 and not self.use_prims_ts:
-            self.dcp_path_max_rows = trtllm_gen_lse_max_rows(
-                vllm_config, self.use_shardq
-            )
+            self.dcp_path_max_rows = dcp_path_max_rows(vllm_config, self.use_shardq)
 
     def _prepare_mqa_kernel(
         self,
@@ -1282,9 +1293,10 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
             steps.append(rows * (padded * self.kv_lora_rank * 2 + topk * 4))
         if self.dcp_world_size > 1:
             # The DCP path's rows: under DCP ShardQ its steps are bounded, and
-            # the layer runs larger ones (dense-MHA steps) in chunks of these
+            # the layer runs larger ones (dense-MHA steps; on a decode-only
+            # instance any step past the DCP workspace) in chunks of these
             # rows (dcp_path_max_rows).
-            rows = trtllm_gen_lse_max_rows(vllm_config, dcp_shardq)
+            rows = dcp_path_max_rows(vllm_config, dcp_shardq)
             self.dcp_path_max_rows = rows
             steps.append(
                 kernel_bytes(rows, self.num_heads * self.dcp_world_size, True)
