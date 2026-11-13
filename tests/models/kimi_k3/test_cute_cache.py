@@ -315,6 +315,23 @@ def test_verify_mismatch_raises_through_fallbacks(tmp_path, monkeypatch):
     assert not issubclass(cute_cache.VerifyMismatch, Exception)
 
 
+def test_location_setting_moves_the_directory_not_the_key(tmp_path, monkeypatch):
+    from vllm.models.kimi_k3.nvidia import cute_cache
+
+    monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path / "root"))
+    monkeypatch.delenv(cute_cache.LOCATION_ENV, raising=False)
+    default = cute_cache.cache_dir()
+    assert default.startswith(str(tmp_path / "root" / "kimi_k3" / "cutedsl_pretrace"))
+    key = _key(_Kernel(1.0), torch.empty(0))
+    monkeypatch.setenv(cute_cache.LOCATION_ENV, str(tmp_path / "shared"))
+    moved = cute_cache.cache_dir()
+    assert moved.startswith(str(tmp_path / "shared") + os.sep)
+    assert os.path.relpath(moved, tmp_path / "shared") == os.path.relpath(
+        default, tmp_path / "root" / "kimi_k3" / "cutedsl_pretrace"
+    )  # same <DSL version>/<install identity> below the base
+    assert _key(_Kernel(1.0), torch.empty(0)) == key  # a location, not an input
+
+
 def test_uncacheable_inputs_are_reported():
     from vllm.models.kimi_k3.nvidia import cute_cache
 
@@ -464,6 +481,7 @@ def _worker(path: str, verify: bool):
 
 def _start(tmp_path, name, verify=False):
     env = dict(os.environ, VLLM_CACHE_ROOT=str(tmp_path / "cache"))
+    env.pop("VLLM_KIMI_K3_CUTE_CACHE_DIR", None)  # the test directory
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__)))))  # fmt: skip
     env["PYTHONPATH"] = root + os.pathsep + env.get("PYTHONPATH", "")
@@ -571,6 +589,7 @@ def _kwargs_worker(path: str):
 @_needs_blackwell
 def test_kwargs_launcher_is_cached_and_calls_alike(tmp_path):
     env = dict(os.environ, VLLM_CACHE_ROOT=str(tmp_path / "cache"))
+    env.pop("VLLM_KIMI_K3_CUTE_CACHE_DIR", None)  # the test directory
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__)))))  # fmt: skip
     env["PYTHONPATH"] = root + os.pathsep + env.get("PYTHONPATH", "")
@@ -633,6 +652,7 @@ def _shared_worker(path: str, start_file: str):
 @_needs_blackwell
 def test_ranks_split_cold_compiles(tmp_path):
     env = dict(os.environ, VLLM_CACHE_ROOT=str(tmp_path / "cache"))
+    env.pop("VLLM_KIMI_K3_CUTE_CACHE_DIR", None)  # the test directory
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__)))))  # fmt: skip
     env["PYTHONPATH"] = root + os.pathsep + env.get("PYTHONPATH", "")

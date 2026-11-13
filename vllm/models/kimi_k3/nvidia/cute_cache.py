@@ -34,14 +34,15 @@ process. Compiles of kernels defined under ``vllm/models/kimi_k3`` go through
   pipeline runs. A miss compiles, exports and returns the loaded object, so cold
   and warm starts run the same launcher. An entry that does not load is logged,
   recompiled and replaced.
-- Directory: ``<VLLM_CACHE_ROOT>/kimi_k3/cutedsl_pretrace/<DSL version, FORMAT>/
-  <install identity>``. The install identity (``install_identity``) hashes the
-  installed distributions and the files of the foreign packages kernels trace
-  with, so a new image, an overlay or a patched package file starts a new
-  directory instead of hitting entries of the old code.
+- Directory: ``<base>/<DSL version, FORMAT>/<install identity>``, base =
+  ``VLLM_KIMI_K3_CUTE_CACHE_DIR`` (a location only; not part of any key) or
+  ``<VLLM_CACHE_ROOT>/kimi_k3/cutedsl_pretrace``. The install identity
+  (``install_identity``) hashes the installed distributions and the files of the
+  foreign packages kernels trace with, so a new image, an overlay or a patched
+  package file starts a new directory instead of hitting entries of the old code.
 - Shared cold starts: ranks, nodes and processes share the directory (put
-  ``VLLM_CACHE_ROOT`` on a shared file system for cross-node sharing). A miss takes
-  the key's claim file; a process that finds it taken gets a ``_Deferred`` kernel
+  ``VLLM_KIMI_K3_CUTE_CACHE_DIR`` on a shared file system for cross-node
+  sharing). A miss takes the key's claim file; a process that finds it taken gets a ``_Deferred`` kernel
   and goes on, so the ranks of a deployment compile disjoint parts of the key set in
   parallel and load the rest (see "cross-process claims").
 - ``VERIFY`` (tests and validation starts only; a module attribute, no
@@ -643,15 +644,21 @@ def install_identity() -> str:
     return identity
 
 
-def cache_dir() -> str:
-    from vllm import envs
+# Location only (no behavior): a directory shared by every rank and node of a
+# deployment, e.g. on Lustre. Unset: ``<VLLM_CACHE_ROOT>/kimi_k3/cutedsl_pretrace``.
+LOCATION_ENV = "VLLM_KIMI_K3_CUTE_CACHE_DIR"
 
+
+def cache_dir() -> str:
     import cutlass
 
+    base = os.environ.get(LOCATION_ENV)
+    if not base:
+        from vllm import envs
+
+        base = os.path.join(envs.VLLM_CACHE_ROOT, "kimi_k3", "cutedsl_pretrace")
     version = f"cutlass-dsl-{cutlass.__version__}-f{FORMAT}"
-    return os.path.join(
-        envs.VLLM_CACHE_ROOT, "kimi_k3", "cutedsl_pretrace", version, install_identity()
-    )
+    return os.path.join(base, version, install_identity())
 
 
 def _entry_dir(key: str) -> str:
