@@ -16,7 +16,9 @@ pytestmark = pytest.mark.cpu_test
 BUDGET = 8192
 
 
-def _runner(dp_rank=0, num_spec=2, max_num_seqs=256, max_model_len=131072):
+def _runner(
+    dp_rank=0, num_spec=2, max_num_seqs=256, max_model_len=131072, num_blocks=100000
+):
     return SimpleNamespace(
         is_pooling_model=False,
         is_encoder_decoder=False,
@@ -30,7 +32,7 @@ def _runner(dp_rank=0, num_spec=2, max_num_seqs=256, max_model_len=131072):
             kv_cache_groups=[
                 SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=64))
             ],
-            num_blocks=100000,
+            num_blocks=num_blocks,
         ),
         vllm_config=SimpleNamespace(
             num_lookahead_tokens=num_spec,
@@ -102,6 +104,44 @@ def test_skips_when_model_len_is_too_short(monkeypatch):
     assert not warmup.run_serving_shape_warmup(
         runner, lambda out: None, lambda grammar_output: None, 0
     )
+
+
+def _full_blocks(runner) -> int:
+    return warmup._serving_step_blocks(runner, warmup._serving_step_shapes(runner, 0))[
+        0
+    ]
+
+
+@pytest.mark.parametrize("dp_rank", [0, 3])
+def test_small_kv_pool_shrinks_the_decode_batch_instead_of_skipping(
+    dp_rank, monkeypatch
+):
+    """A decode server whose KV pool holds fewer warmup requests than
+    max_num_seqs (2026-11-12 C256: 4326 blocks for 4457) still runs every
+    variant, including the verification step, with a smaller decode batch."""
+    full = _full_blocks(_runner(dp_rank=dp_rank))
+    runner = _runner(dp_rank=dp_rank, num_blocks=full - 50)
+    full_decodes = warmup._serving_step_shapes(runner, 0)[0]
+    cap = warmup._serving_decode_cap(runner)
+    assert cap is not None and 1 <= cap < full_decodes
+    shapes = []
+    for variant in range(warmup.NUM_SERVING_WARMUP_VARIANTS + 1):
+        steps = _run(runner, variant, monkeypatch)
+        num_decodes = len(steps[0].scheduled_new_reqs)
+        assert 1 <= num_decodes <= cap
+        shapes.append(warmup._serving_step_shapes(runner, variant, cap))
+        required = warmup._serving_step_blocks(runner, shapes[-1])[0]
+        assert required < runner.kv_cache_config.num_blocks
+    # The verification step still differs from the warmed shapes.
+    assert all(shapes[-1] != shape for shape in shapes[:-1])
+
+
+def test_kv_pool_too_small_for_one_request_fails_startup(monkeypatch):
+    runner = _runner(num_blocks=8)
+    with pytest.raises(RuntimeError, match="cannot fit one decode request"):
+        warmup.run_serving_shape_warmup(
+            runner, lambda out: None, lambda grammar_output: None, 0
+        )
 
 
 def test_compile_in_verification_fails_startup(monkeypatch):
