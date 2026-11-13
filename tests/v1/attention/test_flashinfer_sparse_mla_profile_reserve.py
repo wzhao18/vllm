@@ -305,16 +305,18 @@ def test_lse_launch_within_slab_runs():
 
 
 def test_lse_launch_beyond_slab_runs_in_slab_chunks():
-    """A dense-MHA step's MQA rows can exceed the slab: they launch in
-    slab-sized row chunks, each writing its rows of the output and LSE."""
+    """A dense-MHA step's MQA rows (or a decode-only instance's rare prefill
+    step) can exceed the slab: they launch in the fewest balanced row chunks
+    that fit it (no small tail launch), each writing its rows of the output
+    and LSE."""
     launches = _mqa(rows=40, slab_rows=16, return_lse=None)
-    assert [len(kw["query"]) for kw in launches] == [16, 16, 8]
+    assert [len(kw["query"]) for kw in launches] == [14, 14, 12]
     assert all(kw["return_lse"] for kw in launches)
     out, lse = launches[0]["out"], launches[0]["lse"]
     for i, kw in enumerate(launches):
         assert kw["lse"].shape == (len(kw["query"]), 128)
-        assert kw["lse"].data_ptr() == lse.data_ptr() + i * 16 * lse.stride(0) * 4
-        assert kw["out"].data_ptr() == out.data_ptr() + i * 16 * out.stride(0) * 2
+        assert kw["lse"].data_ptr() == lse.data_ptr() + i * 14 * lse.stride(0) * 4
+        assert kw["out"].data_ptr() == out.data_ptr() + i * 14 * out.stride(0) * 2
         assert kw["seq_lens"].shape == (len(kw["query"]),)
         assert kw["block_tables"].shape[0] == len(kw["query"])
 
@@ -330,3 +332,154 @@ def test_launch_without_lse_ignores_slab():
     """ShardQ token slices (return_lse=False) use no slab, at any row count."""
     launches = _mqa(rows=17, slab_rows=16, return_lse=False)
     assert len(launches) == 1 and not launches[0]["return_lse"]
+
+
+# Kimi K3.1 C256 decode instance on VR200: P/D kv_consumer, TP16 = DCP16 (6
+# heads per rank, 96 gathered, padded to 128), no ShardQ, max_num_batched_tokens
+# 8192, DSpark k = 3 (q 4).
+_DEC_DCP = 16
+_DEC_HEADS = 6
+_DEC_MNBT = 8192
+
+
+def _decode_config(
+    *,
+    mns=256,
+    spec=3,
+    capture=1024,
+    mnbt=_DEC_MNBT,
+    role="kv_consumer",
+):
+    producer = role in ("kv_producer", "kv_both")
+    consumer = role in ("kv_consumer", "kv_both")
+    return SimpleNamespace(
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=mnbt, max_num_seqs=mns
+        ),
+        model_config=SimpleNamespace(get_num_attention_heads=lambda pc: _DEC_HEADS),
+        parallel_config=None,
+        num_speculative_tokens=spec,
+        compilation_config=SimpleNamespace(max_cudagraph_capture_size=capture),
+        kv_transfer_config=None
+        if role is None
+        else SimpleNamespace(is_kv_consumer=consumer, is_kv_producer=producer),
+    )
+
+
+def _slab_rows(cfg, dcp_shardq=False):
+    fallback, threshold = _patch_fallback_rows()
+    with (
+        fallback,
+        threshold,
+        patch(
+            "vllm.v1.attention.ops.dcp.max_decode_query_len",
+            return_value=1 + cfg.num_speculative_tokens,
+        ),
+    ):
+        return fi.trtllm_gen_lse_slab_rows(cfg, dcp_shardq)
+
+
+@pytest.mark.parametrize(
+    "mns, spec, capture, mnbt, rows",
+    [
+        (256, 3, 1024, _DEC_MNBT, 1024),  # C256 q4: 256 x 4 = the capture bound
+        (512, 3, 1024, _DEC_MNBT, 2048),  # max_num_seqs 512: 512 x 4
+        (256, 3, 2048, _DEC_MNBT, 2048),  # a 2048-row capture bound
+        (160, 3, 640, _DEC_MNBT, 1024),  # C160 q4: at least the 1024-row floor
+        (16, 7, 128, _DEC_MNBT, 1024),  # C1-C64 q8: the floor
+        (512, 7, 4096, _DEC_MNBT, 4096),  # 512 x 8
+        (2048, 7, 16384, _DEC_MNBT, _DEC_MNBT),  # never above the old size
+        (256, 3, 1024, 512, 512),  # nor above max_num_batched_tokens
+    ],
+)
+def test_decode_only_slab_rows(mns, spec, capture, mnbt, rows):
+    cfg = _decode_config(mns=mns, spec=spec, capture=capture, mnbt=mnbt)
+    assert _slab_rows(cfg) == rows
+    # Every row count a decode step launches at once fits: the CUDA graphs
+    # (stock FULL and the specialized decode's, at most the capture bound and
+    # max_num_seqs x q) and eager decode steps (max_num_seqs x q).
+    assert _slab_rows(cfg) >= min(mnbt, max(mns * (1 + spec), capture))
+    assert _slab_rows(cfg) <= mnbt
+
+
+@pytest.mark.parametrize("role", [None, "kv_producer", "kv_both"])
+def test_slab_rows_unchanged_off_decode_only_instances(role):
+    """Prefill, colocated and kv_both instances keep the DCP path's step rows:
+    their prefill steps launch at once, as before."""
+    cfg = _decode_config(role=role)
+    assert _slab_rows(cfg) == _DEC_MNBT == fi.trtllm_gen_lse_max_rows(cfg, False)
+
+
+def test_slab_rows_unchanged_under_shardq():
+    """DCP ShardQ (e.g. the C512 / TP8 DCP8 prefill instances) keeps its slab."""
+    for role in (None, "kv_consumer"):
+        cfg = _decode_config(role=role)
+        assert _slab_rows(cfg, dcp_shardq=True) == _DCP_FALLBACK_TOKENS
+
+
+def test_c256_decode_workspace_bytes(monkeypatch):
+    """C256 decode: 0.64 GiB instead of 2.39 GiB of shared workspace, i.e.
+    1.75 GiB per GPU back to the KV cache (the slab is 8 B x 128 padded heads x
+    256 slots = 256 KiB per row: 1024 instead of 8192 rows)."""
+    monkeypatch.delenv("VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE", raising=False)
+    allocations = []
+
+    def zeros(n, **_):
+        allocations.append(n)
+        return SimpleNamespace(numel=lambda: n)
+
+    cfg = _decode_config()
+    monkeypatch.setattr(fi, "_fi_sparse_workspace", None)
+    with (
+        patch("vllm.v1.attention.ops.dcp.max_decode_query_len", return_value=4),
+        patch.object(fi.torch, "zeros", side_effect=zeros),
+        patch.object(fi, "_reserve_kv_counters"),
+    ):
+        # The profile pass, then a builder (also no ShardQ): allocated once.
+        fi.reserve_trtllm_gen_buffers(cfg, torch.device("cpu"), _DEC_DCP, False)
+        fi.reserve_trtllm_gen_buffers(cfg, torch.device("cpu"), _DEC_DCP, False)
+    monkeypatch.setattr(fi, "_fi_sparse_workspace", None)
+    required = fi._required_workspace_bytes(_DEC_DCP, _DEC_HEADS, 1024)
+    assert allocations == [required]
+    assert required == 8 * 128 * 1024 * 256 + (1 + 394) * 2**20
+    old = fi._required_workspace_bytes(_DEC_DCP, _DEC_HEADS, _DEC_MNBT)
+    assert round(old / 2**30, 2) == 2.39
+    assert round(required / 2**30, 2) == 0.64
+    assert round((old - required) / 2**30, 2) == 1.75
+    # The workspace's slab holds exactly the slab rows.
+    assert fi.trtllm_gen_lse_rows_capacity(required, 128) == 1024
+
+
+@pytest.mark.parametrize(
+    "rows, cap, launches",
+    [
+        (1, 1024, [1]),
+        (1024, 1024, [1024]),  # the largest graph: one launch, as before
+        (1025, 1024, [513, 512]),
+        (2047, 1024, [1024, 1023]),
+        (2049, 1024, [683, 683, 683]),
+        (8192, 1024, [1024] * 8),
+        (8193, 1024, [911] * 8 + [905]),
+        (8192, 2048, [2048] * 4),
+        (70000, 65535, [35000, 35000]),
+    ],
+)
+def test_lse_launch_rows_are_balanced(rows, cap, launches):
+    step = fi.trtllm_gen_lse_launch_rows(rows, cap)
+    sizes = [min(step, rows - s) for s in range(0, rows, step)]
+    assert sizes == launches
+    assert len(sizes) == -(-rows // cap)  # the fewest launches
+    assert max(sizes) <= cap
+    if len(sizes) > 1:
+        # No small tail: every launch has about half the slab's rows or more.
+        assert min(sizes) > cap // 2 - len(sizes)
+
+
+def test_decode_only_step_beyond_slab_matches_single_launch_layout():
+    """A decode-only instance's 2049-row step on a 1024-row slab: 3 launches of
+    683 rows over consecutive rows of one output and one LSE."""
+    launches = _mqa(rows=2049, slab_rows=1024, return_lse=None)
+    assert [len(kw["query"]) for kw in launches] == [683, 683, 683]
+    lse = launches[0]["lse"]
+    for i, kw in enumerate(launches):
+        assert kw["lse"].data_ptr() == lse.data_ptr() + i * 683 * lse.stride(0) * 4
