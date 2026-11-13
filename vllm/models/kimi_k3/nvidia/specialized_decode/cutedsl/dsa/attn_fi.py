@@ -209,6 +209,16 @@ class FlashInferCore:
         self.fmt = getattr(impl, "prims_ts_format", "native")
         self.topk = self.slots.shape[1]
         self.device = self.slots.device
+        # trtllm-gen carves the LSE of a DCP launch from the shared workspace's
+        # softmax-stats slab unchecked, and ``trtllm`` launches a batch at once.
+        slab_rows = getattr(impl, "lse_slab_rows", None)
+        widest = max((m for m, k in kernels.items() if k == "trtllm"), default=0)
+        if dcp > 1 and slab_rows is not None and widest > slab_rows:
+            raise ValueError(
+                f"Kimi K3.1 DSA FlashInfer core: a {widest}-row trtllm-gen batch "
+                f"exceeds the {slab_rows} rows of the sparse MLA workspace's "
+                "softmax-stats slab (trtllm_gen_lse_slab_rows)"
+            )
         batches = [m for m, k in kernels.items() if k == "prims_ts"]
         plan_rows = {m: plan_rows_for(m, capacities) for m in batches}
         # {rows: (plan rows, packed-query offsets)}
