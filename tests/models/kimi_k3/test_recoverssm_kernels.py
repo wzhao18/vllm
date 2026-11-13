@@ -745,8 +745,10 @@ def test_triton_verify_beta_stride_compiles_once(deferred):
 
     q, k, v, raw_g = (act(1, tokens, heads, D) for _ in range(4))
     beta = act(tokens, heads)
+    # A 16-byte aligned column slice: only the token stride differs (as in
+    # serving), not the pointer alignment.
     wide = act(tokens, 32)
-    wide[:, 5 : 5 + heads] = beta
+    wide[:, 8 : 8 + heads] = beta
     state = torch.randn(batch + 1, heads, D, D, device=DEVICE)
     query_start = torch.arange(0, tokens + 1, window, dtype=torch.int32, device=DEVICE)
     state_indices = torch.arange(1, batch + 1, dtype=torch.int32, device=DEVICE)
@@ -773,8 +775,8 @@ def test_triton_verify_beta_stride_compiles_once(deferred):
         torch.accelerator.synchronize()
         return out, records
 
-    ref_out, ref_records = run(wide[:, 5 : 5 + heads])
-    assert wide[:, 5 : 5 + heads].stride(0) % 16 == 0 and beta.stride(0) % 16
+    ref_out, ref_records = run(wide[:, 8 : 8 + heads])
+    assert wide[:, 8 : 8 + heads].stride(0) % 16 == 0 and beta.stride(0) % 16
     with jit_monitor.record_jit_events() as events:
         out, records = run(beta)
     assert events == [], f"compiled for another beta stride: {events}"
