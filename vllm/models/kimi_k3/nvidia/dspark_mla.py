@@ -707,11 +707,14 @@ class K3DSparkForCausalLM(nn.Module):
                 switched,
             )
         self.model._build_fused_context_kv_metadata()
+        from vllm.models.kimi_k3.nvidia import cute_cache
         from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.draft import (
             DraftFastPath,
         )
 
-        self._fast_path = DraftFastPath.build(self._vllm_config, self)
+        # Ranks split the drafter's cold compiles; all loaded when the build returns.
+        with cute_cache.shared_phase("specialized drafter built"):
+            self._fast_path = DraftFastPath.build(self._vllm_config, self)
 
     def greedy_markov_draft(
         self, hidden: torch.Tensor, anchors: torch.Tensor, draft: torch.Tensor
