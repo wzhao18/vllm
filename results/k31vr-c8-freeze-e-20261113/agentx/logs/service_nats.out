@@ -1,0 +1,29 @@
+[1730563] 2026/11/13 17:09:26.796101 [INF] Starting nats-server
+[1730563] 2026/11/13 17:09:26.796150 [INF]   Version:  2.10.28
+[1730563] 2026/11/13 17:09:26.796151 [INF]   Git:      [e0b99bd]
+[1730563] 2026/11/13 17:09:26.796153 [INF]   Name:     NDIU5SQ3YBGCYW65BD6WWTNRKJKW23OEWJVOR3ZX3VVA3HBI42L2MSI7
+[1730563] 2026/11/13 17:09:26.796155 [INF]   Node:     lBpSsTDC
+[1730563] 2026/11/13 17:09:26.796156 [INF]   ID:       NDIU5SQ3YBGCYW65BD6WWTNRKJKW23OEWJVOR3ZX3VVA3HBI42L2MSI7
+[1730563] 2026/11/13 17:09:26.796161 [INF] Using configuration file: /tmp/nats.conf
+[1730563] 2026/11/13 17:09:26.796166 [WRN] Maximum payloads over 8.00 MB are generally discouraged and could lead to poor performance
+[1730563] 2026/11/13 17:09:26.796462 [INF] Starting JetStream
+[1730563] 2026/11/13 17:09:26.796609 [INF]     _ ___ _____ ___ _____ ___ ___   _   __  __
+[1730563] 2026/11/13 17:09:26.796612 [INF]  _ | | __|_   _/ __|_   _| _ \ __| /_\ |  \/  |
+[1730563] 2026/11/13 17:09:26.796613 [INF] | || | _|  | | \__ \ | | |   / _| / _ \| |\/| |
+[1730563] 2026/11/13 17:09:26.796614 [INF]  \__/|___| |_| |___/ |_| |_|_\___/_/ \_\_|  |_|
+[1730563] 2026/11/13 17:09:26.796614 [INF] 
+[1730563] 2026/11/13 17:09:26.796615 [INF]          https://docs.nats.io/jetstream
+[1730563] 2026/11/13 17:09:26.796616 [INF] 
+[1730563] 2026/11/13 17:09:26.796617 [INF] ---------------- JETSTREAM ----------------
+[1730563] 2026/11/13 17:09:26.796619 [INF]   Max Memory:      1.05 TB
+[1730563] 2026/11/13 17:09:26.796620 [INF]   Max Storage:     536.25 GB
+[1730563] 2026/11/13 17:09:26.796621 [INF]   Store Directory: "/tmp/nats/jetstream"
+[1730563] 2026/11/13 17:09:26.796622 [INF] -------------------------------------------
+[1730563] 2026/11/13 17:09:26.796881 [INF] Listening for client connections on 0.0.0.0:4222
+[1730563] 2026/11/13 17:09:26.799486 [INF] Server is ready
+[2026-11-13T18:48:30.767] error: *** STEP 1057685.25 ON hecate0362 CANCELLED AT 2026-11-13T18:48:30 DUE to SIGNAL Terminated ***
+[1730563] 2026/11/13 18:48:30.770415 [INF] Trapped "terminated" signal
+[1730563] 2026/11/13 18:48:30.781313 [INF] Initiating Shutdown...
+[1730563] 2026/11/13 18:48:30.781323 [INF] Initiating JetStream Shutdown...
+[1730563] 2026/11/13 18:48:30.781888 [INF] JetStream Shutdown
+[1730563] 2026/11/13 18:48:30.782451 [INF] Server Exiting..
