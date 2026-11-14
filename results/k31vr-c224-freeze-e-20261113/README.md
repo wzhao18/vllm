@@ -23,8 +23,9 @@ during the burst and stays healthy (steady state ~40-47%).
 - Pre-registered projection 39.3K tok/s/GPU full hour (written during the run, before the result): +9%.
 - vs previous sweep nq4kmc C256 (45,180 @ 97 over 0-55 min): 94% of the throughput at +24% interactivity and
   37% lower TTFT p90; vs the nq4kmc curve interpolated at interactivity 119: +7%.
-- Accuracy: no gsm8k run at C224 on freeze e yet. Same 2P1D deployment on freeze d: gsm8k C160 0.974,
-  C256 0.968 (real rejection, 1319 samples).
+- Accuracy: gsm8k on the same 2P1D deployment, freeze e (real rejection, 1319 samples) strict 0.9666 / flexible
+  0.9659 (`gsm8k/`, job a1060196-integaf10frz-pareto-c256-ev-spx-1113194644; eval-only twin of the 2P1D server, the
+  eval concurrency does not change the server).
 
 Artifacts: `agentx/` = job a1052665 output. Files > 5 MB omitted (OTel traces/logs, frontend log,
 per-request profile_export.jsonl, large worker logs); they remain on Hecate under
