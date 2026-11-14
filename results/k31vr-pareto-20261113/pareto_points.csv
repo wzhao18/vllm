@@ -1,0 +1,15 @@
+series,point,interactivity_p90,tok_s_per_gpu,M_tok_s_per_MW,run
+K3.1 VR200 final freeze sweep,C1,805,1347,0.408,a1057686
+K3.1 VR200 final freeze sweep,C8,553,2960,0.897,a1057685
+K3.1 VR200 final freeze sweep,C48 (1P1D),305,15593,4.725,a1055047
+K3.1 VR200 final freeze sweep,C64,250,21002,6.364,a1055046
+K3.1 VR200 final freeze sweep,C160,164,31174,9.447,a1047927
+K3.1 VR200 final freeze sweep,C224,119,42908,13.002,a1052665
+K3.1 VR200 final freeze sweep,C512,87,76544,23.195,a1050536
+GB300 Dynamo vLLM baseline,c1,451,1526,0.72,
+GB300 Dynamo vLLM baseline,c20,263,4664,2.2,
+GB300 Dynamo vLLM baseline,c32,211,7632,3.6,
+GB300 Dynamo vLLM baseline,c56,159,12296,5.8,
+GB300 Dynamo vLLM baseline,c192,94,20564,9.7,
+GB300 Dynamo vLLM baseline,c384,72,30528,14.4,
+GB300 Dynamo vLLM baseline,c352,52,36252,17.1,

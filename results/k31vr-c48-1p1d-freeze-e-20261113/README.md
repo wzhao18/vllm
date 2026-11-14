@@ -17,7 +17,7 @@ vs 16,857 @ 312; 45-55 min 17,792 @ 296 vs 18,054 @ 282.
 - Validity: P/D health PASS (242,165 successful KV transfers, 0 failed, 0 handshake failures, 0 prefill lease
   expiries, sparse core on); container keepalive overlap NONE; decode GPU KV cache 51,228,987 tokens.
 - Accuracy: gsm8k C48 (real rejection, 1319 samples) strict 0.9727 / flexible 0.9719 on the tree-fix code (job
-  a1050535, before freeze e's decode-memory fixes, which do not touch the math).
+  a1050535, before freeze e's decode-memory fixes, which do not touch the math). gsm8k run artifacts are in `gsm8k/`.
 
 Artifacts: `agentx/` = job a1055047 output. Files > 5 MB omitted; they remain on Hecate under
 `/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/outputs/a1055047-integaf10frz-pareto-c48-1p1d-spx-1113161739`.

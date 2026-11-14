@@ -16,7 +16,7 @@ Same windows vs nq4kmc C1 (`winbench.py`, 24 GPUs): 0-55 min 1,357 @ 804 vs 1,34
 - 412 requests OK / 2 errors; profiling window 17:51:51..18:51:45; job 1057686.
 - Validity: P/D health PASS (11,651 successful KV transfers, 0 failed, 0 handshake failures, 0 prefill lease
   expiries, sparse core on); container keepalive overlap NONE; decode GPU KV cache 52,106,161 tokens.
-- Accuracy: gsm8k C1 (real rejection, 1319 samples) strict 0.9651 / flexible 0.9644 (job a1050538, freeze d
+- Accuracy: gsm8k C1 (real rejection, 1319 samples) strict 0.9651 / flexible 0.9644 (job a1050538, artifacts in `gsm8k/`, freeze d
   0f558a4414, before freeze e's decode-memory fixes, which do not touch the math).
 
 Artifacts: `agentx/` = job a1057686 output. Files > 5 MB omitted; they remain on Hecate under

@@ -17,7 +17,7 @@ Same windows vs nq4kmc C8 (`winbench.py`, 24 GPUs): 0-55 min 2,962 @ 551 vs 2,92
 - Validity: P/D health PASS (43,021 successful KV transfers, 0 failed, 0 handshake failures, 0 prefill lease
   expiries, sparse core on); container keepalive overlap NONE; decode GPU KV cache 52,106,161 tokens.
 - Accuracy: gsm8k C8 (real rejection, 1319 samples) strict 0.9689 / flexible 0.9682 on the tree-fix code (job
-  a1045081, before freeze e's decode-memory fixes, which do not touch the math).
+  a1045081, before freeze e's decode-memory fixes, which do not touch the math). gsm8k run artifacts are in `gsm8k/`.
 
 Artifacts: `agentx/` = job a1057685 output. Files > 5 MB omitted; they remain on Hecate under
 `/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/outputs/a1057685-integaf10frz-pareto-c8-spx-1113170913`.

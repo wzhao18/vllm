@@ -1,0 +1,5 @@
+alloc=1050535 run_id=a1050535-pdacc-tfix-c48-full-ev-spx-1112231627 render=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/pdacc-tfix-c48-full-ev-spx nodes=hecate0299,hecate0300,hecate0301,hecate0302,hecate0303,hecate0305 need=6 left=5740s start=2026-11-12T23:16:27-08:00
+exports=HOME=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/home,UV_CACHE_DIR=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/cache/uv-host,XDG_CACHE_HOME=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/cache/xdg-host,ENROOT_ROOTFS_WRITABLE=1
+memfix=1 cname=k31e2e-1050535-1112231503
+srtslurm=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/pdacc-tfix-c48-full-ev-spx/srtslurm.yaml
+rc=0 end=2026-11-12T23:54:58-08:00
