@@ -1,10 +1,12 @@
-# K3.1 AgentX pareto: VR200 final freeze sweep vs GB300 baseline (2026-11-13)
+# K3.1 VR200 AgentX results (Hecate, 2026-11-12/13)
+
+## Pareto: VR200 final freeze sweep vs GB300 baseline
 
 ![pareto](pareto_vr200_vs_gb300.png)
 
 - y = total (input + output) tok/s per GPU x 1e6 / all-in utility W per GPU (VR200 3.3 kW, GB300 2.12 kW);
   x = P90 interactivity = 1000 / P90 ITL (ms). Data: `pareto_points.csv`; plot: `pareto_plot.py`.
-- VR200 points: official 60-min AgentX runs (live_metrics.py, profiling phase), each in its own results directory:
+- VR200 points: official 60-min AgentX runs (live_metrics.py, profiling phase), each in its own `k31vr-<point>-*` directory below:
   C1, C8, C48 (1P1D), C64, C224 on freeze e (`k31vr-freeze-20261113e`); C160 and C512 on freeze d (0f558a4414).
   C224 replaces C256: at C256 the trace's ~5 min burst fills decode KV and collapses decode throughput (root cause:
   decode preemption + local recompute; see the decode burst investigation), C224 does not hit it.
