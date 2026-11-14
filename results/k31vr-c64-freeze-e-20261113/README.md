@@ -16,7 +16,8 @@ vs 25,027 @ 239; 45-55 min 25,073 @ 234 vs 24,874 @ 222.
 - 12,044 requests OK / 5 errors; profiling window 16:07:53..17:08:02; job 1055046.
 - Validity: P/D health PASS (347,615 successful KV transfers, 0 failed, 0 handshake failures, 0 prefill lease
   expiries, sparse core on); container keepalive overlap NONE; decode GPU KV cache 50,351,812 tokens.
-- Accuracy: gsm8k C64 on freeze e is queued (added to this directory when it lands).
+- Accuracy: gsm8k C64 on freeze e (real rejection, 1319 samples) strict 0.9735 / flexible 0.9735 (`gsm8k/`, job
+  a1057685-integaf10frz-c64-ev-spx-1113185130).
 
 Artifacts: `agentx/` = job a1055046 output. Files > 5 MB omitted; they remain on Hecate under
 `/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/outputs/a1055046-integaf10frz-c64-spx-1113150633`.
