@@ -84,6 +84,8 @@ def test_key_has_explicit_arch_and_resolved_options(monkeypatch):
     o3 = cute_cache._compile_target(None, k, {"options": "--opt-level 3"})
     assert o2 != o3
     ffi = cute_cache._compile_target(None, k, {"options": "--enable-tvm-ffi"})
+    assert "EnableTVMFFI=True" in ffi, ffi  # not part of the pipeline string
+    assert "EnableTVMFFI=False" in o2, o2  # every option, defaults included
     assert ffi != cute_cache._compile_target(None, k, {})
     # no --gpu-arch: the DSL's architecture, explicitly
     monkeypatch.setattr(cute_cache, "_dsl_arch", lambda fn: "sm_100a")

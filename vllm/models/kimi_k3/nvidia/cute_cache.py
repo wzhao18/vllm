@@ -499,10 +499,15 @@ def _dsl_arch(fn: Any) -> str:
 
 
 def _serialized(resolved: Any) -> tuple[tuple[str, ...], str]:
-    """(every option of a ``CompileOptions`` serialized, its ``--gpu-arch``)."""
+    """(every option of a ``CompileOptions`` by class and value, its ``--gpu-arch``).
+    By class, not ``serialize()``: options outside the MLIR pipeline string (e.g.
+    ``EnableTVMFFI``) serialize to nothing but change the compiled launcher."""
     if resolved is None:
         return (), ""
-    flags = sorted(filter(None, (o.serialize() for o in resolved.options.values())))
+    flags = sorted(
+        f"{type(o).__name__}={getattr(o, 'value', o)!r}"
+        for o in resolved.options.values()
+    )
     return tuple(flags), resolved.gpu_arch
 
 
