@@ -244,7 +244,11 @@ class _Fingerprint:
             w(f"T:{_qual(o)}")
             self._classes(o)
         elif isinstance(o, types.FunctionType):
-            w(f"F:{_qual(o)}:{self._code(o.__code__)}")
+            # The DSL preprocessor replaces a jit function's __code__ on its first
+            # compile and keeps the source's in _original_code: hash that one, so a
+            # key does not depend on which kernels this process compiled before.
+            code = getattr(o, "_original_code", None) or o.__code__
+            w(f"F:{_qual(o)}:{self._code(code)}")
             self.modules.add(o.__module__ or "?")
             self.add(o.__defaults__)
             self.add(o.__kwdefaults__)

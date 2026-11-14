@@ -355,6 +355,16 @@ def test_key_covers_classes_built_by_factories():
 
         return without_reducer(Core)
 
+    def preprocessed():  # the DSL swaps __code__ on first compile
+        return 1
+
+    k = _Kernel(1.0)
+    k.fn = preprocessed
+    before = _key(k)
+    preprocessed._original_code = preprocessed.__code__
+    preprocessed.__code__ = (lambda: 2).__code__
+    assert _key(k) == before
+
     a = _key(factory(8, False)(1.0))
     assert a == _key(factory(8, False)(1.0))  # same arguments, new class objects
     assert a != _key(factory(16, False)(1.0))  # a closure value of a base method
