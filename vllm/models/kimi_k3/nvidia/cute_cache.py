@@ -81,7 +81,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 # Bumped when the key or the entry layout changes.
-FORMAT = 3
+FORMAT = 4
 # Tests: re-trace every hit and compare the DSL module hash with the stored one.
 VERIFY = False
 
@@ -158,6 +158,7 @@ class _Fingerprint:
         self.memo: dict[int, int] = {}
         self.keep: list[Any] = []  # memoized objects stay alive: ids stay unique
         self.modules: set[str] = set()
+        self.namespaces: set[int] = set()  # local classes whose namespace was added
         self.nodes = 0
 
     def digest(self) -> str:
@@ -168,12 +169,36 @@ class _Fingerprint:
     def _code(self, code: types.CodeType) -> str:
         return hashlib.sha256(marshal.dumps(code)).hexdigest()[:32]
 
+    # Class namespace entries that are not trace inputs.
+    _CLASS_SKIP = frozenset((
+        "__dict__", "__weakref__", "__doc__", "__module__", "__qualname__",
+        "__firstlineno__", "__static_attributes__",
+    ))  # fmt: skip
+
     def _classes(self, cls: type) -> None:
         """A class's bases (their code runs in the trace too: e.g. a Kimi K3 subclass
-        of a tokenspeed kernel) by name and module."""
+        of a tokenspeed kernel) by name and module. A class created inside a function
+        (``<locals>`` in its qualified name, e.g. ``_without_reducer(polled_core(
+        batch, ...))``) is also described by its namespace: its methods' code,
+        defaults and closures carry the factory's arguments, which neither the name
+        nor the source files tell apart."""
+        local = []
         for k in cls.__mro__:
             self.parts.append(f"mro:{_qual(k)}")
             self.modules.add(getattr(k, "__module__", "?") or "?")
+            if "<locals>" in getattr(k, "__qualname__", ""):
+                local.append(k)
+        for k in local:
+            if id(k) in self.namespaces:  # once per fingerprint (cycles via __class__)
+                self.parts.append(f"ns@{_qual(k)}")
+                continue
+            self.namespaces.add(id(k))
+            self.keep.append(k)
+            names = [n for n in vars(k) if n not in self._CLASS_SKIP]
+            self.parts.append(f"ns:{_qual(k)}:{len(names)}")
+            for name in names:
+                self.parts.append(f".{name}")
+                self.add(vars(k)[name])
 
     def add(self, o: Any) -> None:
         self.nodes += 1

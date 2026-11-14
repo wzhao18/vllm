@@ -334,6 +334,35 @@ def test_location_setting_moves_the_directory_not_the_key(tmp_path, monkeypatch)
     assert _key(_Kernel(1.0), torch.empty(0)) == key  # a location, not an input
 
 
+def test_key_covers_classes_built_by_factories():
+    """Kernel classes created inside a function (mla/dcp.py ``_without_reducer(
+    polled_core(batch, ...))``) share their qualified name across factory
+    arguments; their methods' closures and class attributes enter the key."""
+
+    def factory(batch, balanced):
+        class Core(_Kernel):
+            BALANCED = balanced
+
+            def tiles(self):
+                return batch * 2
+
+        def without_reducer(base):
+            class SplitPartials(base):
+                def reduction_kernel(self, *args):
+                    return super().reduction_kernel(*args)
+
+            return SplitPartials
+
+        return without_reducer(Core)
+
+    a = _key(factory(8, False)(1.0))
+    assert a == _key(factory(8, False)(1.0))  # same arguments, new class objects
+    assert a != _key(factory(16, False)(1.0))  # a closure value of a base method
+    assert a != _key(factory(8, True)(1.0))  # a class attribute of a base
+    # a module-level class stays described by name (its code: the source digests)
+    assert _key(_Kernel(1.0)) == _key(_Kernel(1.0))
+
+
 def test_uncacheable_inputs_are_reported():
     from vllm.models.kimi_k3.nvidia import cute_cache
 
