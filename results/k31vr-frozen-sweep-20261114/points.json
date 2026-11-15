@@ -91,6 +91,24 @@
    "p50_ttft_s": 0.316
   },
   {
+   "label": "C112 1P1D",
+   "run": "C112-1P1D-a1094730",
+   "topology": "1P1D: P TP8+DCP8, D TP16+DCP16 (k3)",
+   "chosen": true,
+   "note": "phase-2 new config: +~6% y vs the C64-C224 chord at x 186 (proj +10%); TTFT p90 between accept 2.5 s and fail 3.0 s (single-P queue, Waiting mean ~4.5); kept per README rule (no chosen point within 10% x dominates it on the secondary panels); gsm8k on the same hold",
+   "gsm8k_strict": null,
+   "gpus": 24,
+   "ok": 18398,
+   "err": 4,
+   "span_min": 60.3,
+   "tput_per_gpu": 29863.2,
+   "p90_intvty": 186.32,
+   "p90_e2e_norm_intvty": 60.18,
+   "p90_e2el_s": 12.674,
+   "p90_ttft_s": 2.75,
+   "p50_ttft_s": 0.994
+  },
+  {
    "label": "C160 1P1D",
    "run": "C160-1P1D-a1093679",
    "topology": "1P1D: P TP8+DCP8, D TP16+DCP16",
