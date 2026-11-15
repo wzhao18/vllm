@@ -6,6 +6,8 @@ K3.1 VR200 final freeze sweep,C64,250,21002,6.364,a1055046
 K3.1 VR200 final freeze sweep,C160,164,31174,9.447,a1047927
 K3.1 VR200 final freeze sweep,C224,119,42908,13.002,a1052665
 K3.1 VR200 final freeze sweep,C512,87,76544,23.195,a1050536
+K3.1 VR200 low-latency branch,C48 (1P1D) CK-1,309.6,15580,4.721,a1068230
+K3.1 VR200 low-latency branch,C160 1P1D wm0.05,167.1,39782,12.055,a1086151
 GB300 Dynamo vLLM baseline,c1,451,1526,0.72,
 GB300 Dynamo vLLM baseline,c20,263,4664,2.2,
 GB300 Dynamo vLLM baseline,c32,211,7632,3.6,

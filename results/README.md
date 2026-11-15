@@ -28,3 +28,14 @@ Per GPU (no power normalization):
 | C160 | 31,174 | 164 | 9.45 | 0.974 |
 | C224 | 42,908 | 119 | 13.00 | 0.967 |
 | C512 | 76,544 | 87 | 23.20 | 0.968 |
+
+## Low-latency branch results (2026-11-14, `wzhao/k31-vr-ll-integ` dea4ebd06f)
+
+Green squares in the plots.
+
+| Point | GPUs | tok/s/GPU | interactivity | M tok/s/MW | gsm8k (strict) | vs official |
+|---|---|---|---|---|---|---|
+| C160 on 1P1D + decode watermark 0.05 | 24 | 39,782 | 167.1 | 12.06 | 0.966 | **+27.6% y**, +1.9% x vs C160 2P1D (31,174 @ 164) |
+| C48 1P1D checkpoint CK-1 | 24 | 15,580 | 309.6 | 4.72 | 0.968 | flat y, +1.5% x vs 15,593 @ 305 (projection missed; root cause in its README) |
+
+Details: `k31vr-c160-1p1d-wm05-llinteg-20261114/`, `k31vr-c48-1p1d-ck1-llinteg-20261114/`; config `srt-configs/c160-1p1d-wm05.yaml`.

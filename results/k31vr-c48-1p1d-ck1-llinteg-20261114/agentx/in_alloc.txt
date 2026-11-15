@@ -1,0 +1,5 @@
+alloc=1068230 run_id=a1068230-llintg-c48-1p1d-xdr-1114020355 render=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/llintg-c48-1p1d-xdr nodes=hecate0259,hecate0260,hecate0261,hecate0262,hecate0263,hecate0266 need=6 left=10757s start=2026-11-14T02:03:55-08:00
+exports=HOME=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/home,UV_CACHE_DIR=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/cache/uv-host,XDG_CACHE_HOME=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/cache/xdg-host,ENROOT_ROOTFS_WRITABLE=1
+memfix=1 cname=k31e2e-1068230-1114020010
+srtslurm=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/llintg-c48-1p1d-xdr/srtslurm.yaml
+rc=0 end=2026-11-14T03:41:16-08:00
