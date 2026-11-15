@@ -91,6 +91,24 @@
    "p50_ttft_s": 0.506
   },
   {
+   "label": "C96 1P2D k3",
+   "run": "C96-1P2D-k3-a1097000",
+   "topology": "1P2D: P TP8+DCP8, 2 x D TP16+DCP16 (k3, lookup flag on)",
+   "chosen": false,
+   "note": "xPyD search: k3 vs the chosen k7 C96 1P2D (17.13K @ 290, TTFT 1.51): equal x, -1% y, higher TTFT; misses y accept (>= 17.1K) and the x >= 305 projection -> model k3 low-B step pessimistic; triggered the 1P3D C72 k7 hedge",
+   "gsm8k_strict": null,
+   "gpus": 40,
+   "ok": 16826,
+   "err": 3,
+   "span_min": 60.1,
+   "tput_per_gpu": 16963.2,
+   "p90_intvty": 289.83,
+   "p90_e2e_norm_intvty": 91.35,
+   "p90_e2el_s": 8.865,
+   "p90_ttft_s": 1.909,
+   "p50_ttft_s": 0.594
+  },
+  {
    "label": "C64",
    "run": "C64-a1093680",
    "topology": "1P1D: P TP8+DCP8, D TP16+DCP16",
