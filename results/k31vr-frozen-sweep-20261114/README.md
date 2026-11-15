@@ -7,7 +7,7 @@ Goal: the best 4-way pareto curve for VR200, picked by config only.
 
 <!-- SUMMARY -->
 ## Summary (2026-11-14, all runs landed; gsm8k for C256 pending at time of writing)
-- **Chosen curve (9 points, frozen code b68d67e7e, K3.1 golden AL, watermark 0.05):** C1, C8, C48 1P1D, C96 1P2D, C64, C112 1P1D, C160 2P1D, C224 2P1D, C256 2P1D, C512 hybrid. Every chosen point passed gsm8k (strict 0.9659-0.9712, real rejection, same allocation).
+- **Chosen curve (10 points, frozen code b68d67e7e, K3.1 golden AL, watermark 0.05):** C1, C8, C48 1P1D, C96 1P2D, C64, C112 1P1D, C160 2P1D, C224 2P1D, C256 2P1D, C512 hybrid. Every chosen point passed gsm8k (strict 0.9659-0.9712, real rejection, same allocation).
 - **Reproductions:** every previously chosen config reproduced within its pre-registered lines. x is 2-5% below the old runs, which is the expected effect of moving from the Kimi K3 AL (3.84 / 3.0) to the InferenceX Kimi K3.1 golden AL (3.69 / 2.88). y is within 0-4%.
 - **New points:**
   - **C96 1P2D:** one prefill shared by two C48-shape decodes. It gives +10% y over C48 at -2% x. Its TTFT p90 is 1.5 s vs 0.73 s.
