@@ -1,0 +1,29 @@
+[516854] 2026/11/15 04:29:23.970008 [INF] Starting nats-server
+[516854] 2026/11/15 04:29:23.970074 [INF]   Version:  2.10.28
+[516854] 2026/11/15 04:29:23.970076 [INF]   Git:      [e0b99bd]
+[516854] 2026/11/15 04:29:23.970077 [INF]   Name:     NCPE336TX5BTCKH4MBFPVND6VCBQF3NRVQQQ5TPWCNWCCNDRHWBX2JWU
+[516854] 2026/11/15 04:29:23.970079 [INF]   Node:     RHi95pZ5
+[516854] 2026/11/15 04:29:23.970080 [INF]   ID:       NCPE336TX5BTCKH4MBFPVND6VCBQF3NRVQQQ5TPWCNWCCNDRHWBX2JWU
+[516854] 2026/11/15 04:29:23.970086 [INF] Using configuration file: /tmp/nats.conf
+[516854] 2026/11/15 04:29:23.970092 [WRN] Maximum payloads over 8.00 MB are generally discouraged and could lead to poor performance
+[516854] 2026/11/15 04:29:23.970272 [INF] Starting JetStream
+[516854] 2026/11/15 04:29:23.970365 [INF]     _ ___ _____ ___ _____ ___ ___   _   __  __
+[516854] 2026/11/15 04:29:23.970368 [INF]  _ | | __|_   _/ __|_   _| _ \ __| /_\ |  \/  |
+[516854] 2026/11/15 04:29:23.970369 [INF] | || | _|  | | \__ \ | | |   / _| / _ \| |\/| |
+[516854] 2026/11/15 04:29:23.970370 [INF]  \__/|___| |_| |___/ |_| |_|_\___/_/ \_\_|  |_|
+[516854] 2026/11/15 04:29:23.970370 [INF] 
+[516854] 2026/11/15 04:29:23.970371 [INF]          https://docs.nats.io/jetstream
+[516854] 2026/11/15 04:29:23.970372 [INF] 
+[516854] 2026/11/15 04:29:23.970373 [INF] ---------------- JETSTREAM ----------------
+[516854] 2026/11/15 04:29:23.970374 [INF]   Max Memory:      1.05 TB
+[516854] 2026/11/15 04:29:23.970376 [INF]   Max Storage:     536.26 GB
+[516854] 2026/11/15 04:29:23.970376 [INF]   Store Directory: "/tmp/nats/jetstream"
+[516854] 2026/11/15 04:29:23.970377 [INF] -------------------------------------------
+[516854] 2026/11/15 04:29:23.970610 [INF] Listening for client connections on 0.0.0.0:4222
+[516854] 2026/11/15 04:29:23.972979 [INF] Server is ready
+[2026-11-15T04:47:32.869] error: *** STEP 1097000.261 ON hecate0343 CANCELLED AT 2026-11-15T04:47:32 DUE to SIGNAL Terminated ***
+[516854] 2026/11/15 04:47:32.873562 [INF] Trapped "terminated" signal
+[516854] 2026/11/15 04:47:32.882862 [INF] Initiating Shutdown...
+[516854] 2026/11/15 04:47:32.882895 [INF] Initiating JetStream Shutdown...
+[516854] 2026/11/15 04:47:32.883675 [INF] JetStream Shutdown
+[516854] 2026/11/15 04:47:32.884415 [INF] Server Exiting..

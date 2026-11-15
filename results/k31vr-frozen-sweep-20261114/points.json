@@ -96,7 +96,7 @@
    "topology": "1P2D: P TP8+DCP8, 2 x D TP16+DCP16 (k3, lookup flag on)",
    "chosen": false,
    "note": "xPyD search: k3 vs the chosen k7 C96 1P2D (17.13K @ 290, TTFT 1.51): equal x, -1% y, higher TTFT; misses y accept (>= 17.1K) and the x >= 305 projection -> model k3 low-B step pessimistic; triggered the 1P3D C72 k7 hedge",
-   "gsm8k_strict": null,
+   "gsm8k_strict": 0.9704,
    "gpus": 40,
    "ok": 16826,
    "err": 3,
