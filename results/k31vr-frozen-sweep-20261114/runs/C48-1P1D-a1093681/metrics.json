@@ -1,0 +1,1 @@
+{"label": "C48 1P1D", "out": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/outputs/a1093681-frz-c48-1p1d-spx-1114190635", "gpus": 24, "ok": 8293, "err": 1, "span_min": 60.1, "tput_per_gpu": 15544.3, "p90_itl_ms": 3.377, "p90_intvty": 296.11, "p90_e2e_norm_intvty": 158.05, "p90_e2el_s": 7.603, "p90_ttft_s": 0.729, "p50_ttft_s": 0.261}
