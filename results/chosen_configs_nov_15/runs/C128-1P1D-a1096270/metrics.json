@@ -1,0 +1,1 @@
+{"label": "C128 1P1D", "out": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/outputs/a1096270-frz-c128-1p1d-spx-1114234530", "gpus": 24, "ok": 20162, "err": 5, "span_min": 60.4, "tput_per_gpu": 32194.4, "p90_itl_ms": 5.416, "p90_intvty": 184.64, "p90_e2e_norm_intvty": 53.02, "p90_e2el_s": 13.912, "p90_ttft_s": 3.203, "p50_ttft_s": 1.137}

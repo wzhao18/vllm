@@ -1,0 +1,1 @@
+{"label": "C16 1P2D", "out": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/outputs/a1096999-frz-c16-1p2d-xdr-1115020351", "gpus": 40, "ok": 2791, "err": 2, "span_min": 60.0, "tput_per_gpu": 3104.4, "p90_itl_ms": 1.665, "p90_intvty": 600.58, "p90_e2e_norm_intvty": 293.5, "p90_e2el_s": 3.946, "p90_ttft_s": 0.388, "p50_ttft_s": 0.205}

@@ -1,0 +1,1 @@
+frz-c16-1p2d = llintg-c96-1p2d-wm05 + conc 16, dec_workers None, dec_mns None; own AIPERF_RUNTIME_DIR /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/agentx-runtime/frz-c16-1p2d (xpyd wf_82555e99)

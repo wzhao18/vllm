@@ -1,0 +1,3 @@
+frz-c16-1p2d-xdr: run definition = /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/nq4kmc-c48-1p1d-xdr with prefill AND decode code from wzhao/k31-vr-hti-integ af10ccc2c4
+(tree /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/hti/lowlat/trees/ll-integ-dea4ebd06f, see its STAGED.txt). Built by integaf10frz-pareto-tools/mk_integ_render.sh (integf7 rules, pareto point c48-1p1d); changes listed in integ_edit.py;
+verified by integaf10frz-pareto-tools/check_integ.sh c48-1p1d xdr.

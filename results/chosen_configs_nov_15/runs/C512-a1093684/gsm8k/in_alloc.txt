@@ -1,0 +1,5 @@
+alloc=1093684 run_id=a1093684-frz-c512-ev-spx-1114194730 render=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/frz-c512-ev-spx nodes=hecate0313,hecate0315,hecate0318,hecate0319,hecate0320,hecate0321,hecate0322,hecate0323 need=8 left=10773s start=2026-11-14T19:47:30-08:00
+exports=HOME=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/home,UV_CACHE_DIR=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/cache/uv-host,XDG_CACHE_HOME=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/cache/xdg-host,ENROOT_ROOTFS_WRITABLE=1
+memfix=1 cname=k31e2e-1093684-1114194606
+srtslurm=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/frz-c512-ev-spx/srtslurm.yaml
+rc=0 end=2026-11-14T20:06:07-08:00

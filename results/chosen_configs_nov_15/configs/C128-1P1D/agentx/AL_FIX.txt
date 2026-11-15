@@ -1,0 +1,1 @@
+2026-11-14T17:28:36 AL -> 2.88 (k=3, InferenceX K3.1 golden table)

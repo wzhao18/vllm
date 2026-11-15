@@ -1,0 +1,1 @@
+{"label": "C72 1P3D", "out": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/outputs/a1098025-frz-c72-1p3d-spx-1115045137", "gpus": 56, "ok": 14085, "err": 4, "span_min": 60.2, "tput_per_gpu": 10220.6, "p90_itl_ms": 2.516, "p90_intvty": 397.49, "p90_e2e_norm_intvty": 139.98, "p90_e2el_s": 5.974, "p90_ttft_s": 1.076, "p50_ttft_s": 0.379}
