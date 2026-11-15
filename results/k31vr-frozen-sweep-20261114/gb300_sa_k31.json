@@ -1,0 +1,68 @@
+{
+ "source": "SemiAnalysis InferenceX API /api/v1/benchmarks?model=Kimi-K3.1-Pro (+ /derived-agentic-metrics), GB300 dynamo-vllm DSpark (golden AL from InferenceX K3.1 table), 2026-11-10",
+ "points": [
+  {
+   "label": "c1",
+   "id": "447875",
+   "tput_per_gpu": 1519.15677,
+   "p90_intvty": 450.45045045045043,
+   "p90_e2el_s": 12.75329,
+   "p90_ttft_s": 1.9436,
+   "p90_e2e_norm_intvty": 84.16735444114964
+  },
+  {
+   "label": "c20",
+   "id": "447877",
+   "tput_per_gpu": 4626.1722,
+   "p90_intvty": 263.1578947368421,
+   "p90_e2el_s": 9.1867,
+   "p90_ttft_s": 1.16756,
+   "p90_e2e_norm_intvty": 111.62961499007642
+  },
+  {
+   "label": "c32",
+   "id": "447878",
+   "tput_per_gpu": 7561.62432,
+   "p90_intvty": 210.5263157894737,
+   "p90_e2el_s": 10.70904,
+   "p90_ttft_s": 1.47242,
+   "p90_e2e_norm_intvty": 89.92731288048047
+  },
+  {
+   "label": "c56",
+   "id": "447879",
+   "tput_per_gpu": 12321.3649,
+   "p90_intvty": 158.4786053882726,
+   "p90_e2el_s": 14.09226,
+   "p90_ttft_s": 2.05559,
+   "p90_e2e_norm_intvty": 64.52733400667486
+  },
+  {
+   "label": "c192",
+   "id": "447880",
+   "tput_per_gpu": 20543.65068,
+   "p90_intvty": 94.0733772342427,
+   "p90_e2el_s": 26.0938,
+   "p90_ttft_s": 3.46443,
+   "p90_e2e_norm_intvty": 36.177710545800664
+  },
+  {
+   "label": "c384",
+   "id": "447881",
+   "tput_per_gpu": 30494.98119,
+   "p90_intvty": 71.94244604316548,
+   "p90_e2el_s": 34.89169,
+   "p90_ttft_s": 7.78882,
+   "p90_e2e_norm_intvty": 21.346766445036387
+  },
+  {
+   "label": "c352",
+   "id": "447876",
+   "tput_per_gpu": 36346.74363,
+   "p90_intvty": 51.75983436853002,
+   "p90_e2el_s": 57.29864,
+   "p90_ttft_s": 16.97612,
+   "p90_e2e_norm_intvty": 10.522217231029602
+  }
+ ]
+}

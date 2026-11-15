@@ -1,0 +1,42 @@
+# Kimi K3.1 AgentX on VR200: frozen-code pareto sweep (started 2026-11-14)
+
+Goal: the best 4-way pareto curve for VR200, picked by config only.
+- The main metric is throughput per GPU vs P90 interactivity.
+- A point is not chosen if it has a clear drawback on P90 E2E-normalized interactivity, P90 E2E latency or P90 TTFT.
+  Example: the C160 1P1D run of 2026-11-14 queued on its single prefill instance, which pushed TTFT p90 to 4.2 s.
+
+## Fixed for every run
+- **Code:** frozen at `wzhao/agentx-vr-nov-13` **b68d67e7e**. That is d0d09dc plus F1 (`dsa/wide.py`) and F3a (`kda/prepared.py`), and it is byte-identical to the deployed Hecate tree `hti/lowlat/trees/ll-integ-dea4ebd06f`. GitLab mirror: `weizha/vllm` `wzhao/k31-vr-freeze-ll`.
+- **Speculative decoding:** DSpark, probabilistic drafting, synthetic rejection at the **InferenceX Kimi K3.1 golden AL**. The source is `golden_al_distribution/kimi-k3.1-pro__dspark__kimi-k3.1-pro-dspark-preview__probabilistic-block.yaml`, thinking_on: k3 = 2.88, k7 = 3.69. This is the same table the GB300 baseline uses.
+  - All VR results published before this folder used the Kimi K3 values (k3 = 3.0, k7 = 3.84). They are about 4% optimistic on interactivity and are not mixed into this sweep.
+- **Decode:** `watermark: 0.05` on every config.
+- **Precision:** unchanged official rules (BF16 linears, MXFP4 MoE, FP8 MLA KV, FP32 KDA).
+- **Per allocation:** one 60-min AgentX run (DURATION 3600, profiling phase), then a full gsm8k with real rejection on the same allocation, same deployment and same nodes.
+
+## Metrics (`frz_metrics.py`, same method as `live_metrics.py`)
+- **TPS/GPU:** sum(ISL + OSL) over profiling records ÷ profiling wall time ÷ GPUs. GPUs are counted from the node configs.
+- **P90 interactivity:** 1000 / p90 ITL.
+- **P90 E2E-normalized interactivity:** 1 / p90(request latency / OSL).
+- **P90 E2E latency** and **P90 TTFT**.
+- **Per MW:** VR200 3.3 kW and GB300 2.12 kW all-in per GPU.
+
+## Files
+- `points.json`: every landed run. The `chosen` flag marks the pareto set.
+- `runs/<point>-<job>/`: AgentX summary, metrics, render config and gsm8k result.
+- `pareto4_per_gpu.png` and `pareto4_per_mw.png`: chosen points in blue, measured-but-unused points in grey, GB300 in orange.
+- `gb300_sa_k31.json`: the GB300 baseline, SemiAnalysis InferenceX Kimi-K3.1-Pro, dynamo-vllm, 7 runs from 2026-11-10.
+- Regenerate the plots with `python3 plot_pareto4.py`.
+
+## Points
+Phase 1 reproduces the previously chosen configs on the frozen code. Phase 2 adds configs chosen from the phase-1 results to push the front.
+
+| point | topology (GPUs) | status | AgentX job | TPS/GPU | P90 intvty | P90 E2E-norm | P90 E2E (s) | P90 TTFT (s) | gsm8k strict | chosen |
+|---|---|---|---|---|---|---|---|---|---|---|
+| C1 | 1P1D (24) | queued | | | | | | | | |
+| C8 | 1P1D (24) | queued | | | | | | | | |
+| C48 | 1P1D (24) | queued | | | | | | | | |
+| C64 | 1P1D (24) | queued | | | | | | | | |
+| C96 | 1P2D (40), new | queued | | | | | | | | |
+| C160 | 1P1D (24) | queued | | | | | | | | |
+| C224 | 2P1D (32) | queued | | | | | | | | |
+| C512 | 2P1D (32) | queued | | | | | | | | |
