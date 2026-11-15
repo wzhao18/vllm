@@ -1,0 +1,1 @@
+{"label": "C160 1P1D", "out": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/outputs/a1093679-frz-c160-1p1d-spx-1114180317", "gpus": 24, "ok": 23020, "err": 7, "span_min": 60.3, "tput_per_gpu": 38568.9, "p90_itl_ms": 5.87, "p90_intvty": 170.37, "p90_e2e_norm_intvty": 27.23, "p90_e2el_s": 18.689, "p90_ttft_s": 6.891, "p50_ttft_s": 2.217}
