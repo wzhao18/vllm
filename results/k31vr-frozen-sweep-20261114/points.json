@@ -1,1 +1,22 @@
-{"points": []}
+{
+ "points": [
+  {
+   "label": "C512",
+   "run": "C512-a1093684",
+   "topology": "1P1D hybrid: P and D each DP4 x (TP4+DCP4), EP16",
+   "chosen": true,
+   "note": "accept vs pre-registered >=80 @ >=71K (old K3-AL run 76.5K @ 86); gsm8k running on the same hold",
+   "gsm8k_strict": null,
+   "gpus": 32,
+   "ok": 63214,
+   "err": 21,
+   "span_min": 60.5,
+   "tput_per_gpu": 73735.7,
+   "p90_intvty": 80.29,
+   "p90_e2e_norm_intvty": 20.23,
+   "p90_e2el_s": 31.805,
+   "p90_ttft_s": 6.431,
+   "p50_ttft_s": 3.737
+  }
+ ]
+}

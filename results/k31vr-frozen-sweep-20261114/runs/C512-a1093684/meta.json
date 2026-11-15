@@ -1,0 +1,1 @@
+{"label": "C512", "topology": "1P1D hybrid: P and D each DP4 x (TP4+DCP4), EP16", "chosen": true, "note": "accept vs pre-registered >=80 @ >=71K (old K3-AL run 76.5K @ 86); gsm8k running on the same hold"}

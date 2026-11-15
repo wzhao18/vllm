@@ -30,13 +30,15 @@ Goal: the best 4-way pareto curve for VR200, picked by config only.
 ## Points
 Phase 1 reproduces the previously chosen configs on the frozen code. Phase 2 adds configs chosen from the phase-1 results to push the front.
 
-| point | topology (GPUs) | status | AgentX job | TPS/GPU | P90 intvty | P90 E2E-norm | P90 E2E (s) | P90 TTFT (s) | gsm8k strict | chosen |
+Still queued or running: see the sweep status below the table.
+
+<!-- POINTS -->
+| point | topology (GPUs) | AgentX run | TPS/GPU | P90 intvty | P90 E2E-norm | P90 E2E (s) | P90 TTFT (s) | gsm8k strict | chosen | note |
 |---|---|---|---|---|---|---|---|---|---|---|
-| C1 | 1P1D (24) | queued | | | | | | | | |
-| C8 | 1P1D (24) | queued | | | | | | | | |
-| C48 | 1P1D (24) | queued | | | | | | | | |
-| C64 | 1P1D (24) | queued | | | | | | | | |
-| C96 | 1P2D (40), new | queued | | | | | | | | |
-| C160 | 1P1D (24) | queued | | | | | | | | |
-| C224 | 2P1D (32) | queued | | | | | | | | |
-| C512 | 2P1D (32) | queued | | | | | | | | |
+| C512 | 1P1D hybrid: P and D each DP4 x (TP4+DCP4), EP16 (32) | C512-a1093684 | 73,736 | 80.3 | 20.2 | 31.8 | 6.43 | pending | **yes** | accept vs pre-registered >=80 @ >=71K (old K3-AL run 76.5K @ 86); gsm8k running on the same hold |
+<!-- /POINTS -->
+
+## Sweep status
+Topologies: C1-C160 1P1D = P TP8+DCP8 (8 GPUs) + D TP16+DCP16 (16 GPUs); C96 1P2D = one such P + two such D (40 GPUs); C224 2P1D = 2 x P TP8+DCP8 + D TP16+DCP16 (32 GPUs); C512 = hybrid P and D each DP4 x (TP4+DCP4) EP16 (32 GPUs).
+
+Phase 1 (all launched 2026-11-14 17:46-19:14 PST): C1, C8, C48 1P1D, C64, C96 1P2D, C160 1P1D, C224, C512.
