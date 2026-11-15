@@ -20,6 +20,14 @@ Goal: the best 4-way pareto curve for VR200, picked by config only.
 - **P90 E2E latency** and **P90 TTFT**.
 - **Per MW:** VR200 3.3 kW and GB300 2.12 kW all-in per GPU.
 
+## Selection rule (which measured points are chosen)
+A measured point is **chosen** unless one of these holds (then it is greyed):
+1. It is dominated on throughput vs P90 interactivity by another valid run (higher or equal on both).
+2. Clear TTFT drawback: TTFT p90 > 3 s while a neighbouring chosen point at similar interactivity (within ~15%) has TTFT p90 under half of it (e.g. C160 1P1D: 6.9 s vs 1.6 s for 2P1D).
+3. It is dominated on at least two of the three secondary panels (E2E-norm interactivity, E2E latency, TTFT) by a chosen point within 10% of its P90 interactivity.
+4. It fails validity (profiling span, errors, keepalive overlap, P/D transfers) or gsm8k strict < 0.95.
+Trade-offs that do not meet 2 or 3 are kept and noted (e.g. C96 1P2D: +10% y vs C48 at -2% x, TTFT p90 1.5 s vs 0.73 s).
+
 ## Files
 - `points.json`: every landed run. The `chosen` flag marks the pareto set.
 - `runs/<point>-<job>/`: AgentX summary, metrics, render config and gsm8k result.
@@ -36,7 +44,7 @@ Still queued or running: see the sweep status below the table.
 | point | topology (GPUs) | AgentX run | TPS/GPU | P90 intvty | P90 E2E-norm | P90 E2E (s) | P90 TTFT (s) | gsm8k strict | chosen | note |
 |---|---|---|---|---|---|---|---|---|---|---|
 | C8 | 1P1D: P TP8+DCP8, D TP16+DCP16 (24) | C8-a1093682 | 2,890 | 529.7 | 326.7 | 4.7 | 0.35 | pending | **yes** | accept: old K3-AL run 2,960 @ 553 -> -2.3% y, -4.2% x (= AL 3.84 -> 3.69); gsm8k on the same hold |
-| C96 1P2D | 1P2D: P TP8+DCP8, 2 x D TP16+DCP16 (40) | C96-1P2D-a1093473 | 17,132 | 290.3 | 106.3 | 8.2 | 1.51 | 0.9697 | **yes** | new config (shared prefill); accept vs pre-registered >=288 @ >=17.1K; same x as this sweep's C48 1P1D at +10% y vs the old C48 front |
+| C96 1P2D | 1P2D: P TP8+DCP8, 2 x D TP16+DCP16 (40) | C96-1P2D-a1093473 | 17,132 | 290.3 | 106.3 | 8.2 | 1.51 | 0.9697 | **yes** | new config (shared prefill): +10% y vs frozen C48 1P1D at -2% x; trade-off TTFT p90 1.5 s vs 0.73 s (shared P), E2E-norm 106; meets pre-registered accept; gsm8k 0.9697 |
 | C64 | 1P1D: P TP8+DCP8, D TP16+DCP16 (24) | C64-a1093680 | 20,778 | 232.8 | 128.7 | 9.1 | 0.85 | pending | **yes** | borderline vs pre-registered (x 232.8 between fail 230 and accept 235; y at top of 20.2-20.8K); ~-3% x vs expectation while C48 is ~+3% on the same code -> run-to-run drift; chosen (only point at this x); gsm8k on the same hold |
 | C160 1P1D | 1P1D: P TP8+DCP8, D TP16+DCP16 (24) | C160-1P1D-a1093679 | 38,569 | 170.4 | 27.2 | 18.7 | 6.89 | 0.9689 | no | not used: TTFT p90 6.9 s (4x 2P1D) from prefill queueing on one P; replaced by C160 2P1D (phase 2) |
 | C512 | 1P1D hybrid: P and D each DP4 x (TP4+DCP4), EP16 (32) | C512-a1093684 | 73,736 | 80.3 | 20.2 | 31.8 | 6.43 | 0.9659 | **yes** | accept vs pre-registered >=80 @ >=71K (old K3-AL run 76.5K @ 86); gsm8k running on the same hold |
