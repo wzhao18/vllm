@@ -1,6 +1,24 @@
 {
  "points": [
   {
+   "label": "C1",
+   "run": "C1-a1093683",
+   "topology": "1P1D: P TP8+DCP8, D TP16+DCP16",
+   "chosen": true,
+   "note": "accept: old K3-AL run 1,347 @ 805 -> -0.4% y, -3.2% x (AL correction); gsm8k on the same hold",
+   "gsm8k_strict": null,
+   "gpus": 24,
+   "ok": 404,
+   "err": 2,
+   "span_min": 60.0,
+   "tput_per_gpu": 1342.4,
+   "p90_intvty": 778.57,
+   "p90_e2e_norm_intvty": 328.8,
+   "p90_e2el_s": 6.493,
+   "p90_ttft_s": 0.365,
+   "p50_ttft_s": 0.267
+  },
+  {
    "label": "C8",
    "run": "C8-a1093682",
    "topology": "1P1D: P TP8+DCP8, D TP16+DCP16",

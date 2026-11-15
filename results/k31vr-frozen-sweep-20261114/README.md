@@ -43,6 +43,7 @@ Still queued or running: see the sweep status below the table.
 <!-- POINTS -->
 | point | topology (GPUs) | AgentX run | TPS/GPU | P90 intvty | P90 E2E-norm | P90 E2E (s) | P90 TTFT (s) | gsm8k strict | chosen | note |
 |---|---|---|---|---|---|---|---|---|---|---|
+| C1 | 1P1D: P TP8+DCP8, D TP16+DCP16 (24) | C1-a1093683 | 1,342 | 778.6 | 328.8 | 6.5 | 0.36 | pending | **yes** | accept: old K3-AL run 1,347 @ 805 -> -0.4% y, -3.2% x (AL correction); gsm8k on the same hold |
 | C8 | 1P1D: P TP8+DCP8, D TP16+DCP16 (24) | C8-a1093682 | 2,890 | 529.7 | 326.7 | 4.7 | 0.35 | pending | **yes** | accept: old K3-AL run 2,960 @ 553 -> -2.3% y, -4.2% x (= AL 3.84 -> 3.69); gsm8k on the same hold |
 | C96 1P2D | 1P2D: P TP8+DCP8, 2 x D TP16+DCP16 (40) | C96-1P2D-a1093473 | 17,132 | 290.3 | 106.3 | 8.2 | 1.51 | 0.9697 | **yes** | new config (shared prefill): +10% y vs frozen C48 1P1D at -2% x; trade-off TTFT p90 1.5 s vs 0.73 s (shared P), E2E-norm 106; meets pre-registered accept; gsm8k 0.9697 |
 | C64 | 1P1D: P TP8+DCP8, D TP16+DCP16 (24) | C64-a1093680 | 20,778 | 232.8 | 128.7 | 9.1 | 0.85 | pending | **yes** | borderline vs pre-registered (x 232.8 between fail 230 and accept 235; y at top of 20.2-20.8K); ~-3% x vs expectation while C48 is ~+3% on the same code -> run-to-run drift; chosen (only point at this x); gsm8k on the same hold |
