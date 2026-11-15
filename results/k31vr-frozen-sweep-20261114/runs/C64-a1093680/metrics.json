@@ -1,0 +1,1 @@
+{"label": "C64", "out": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/outputs/a1093680-frz-c64-spx-1114184536", "gpus": 24, "ok": 11967, "err": 6, "span_min": 60.2, "tput_per_gpu": 20777.5, "p90_itl_ms": 4.297, "p90_intvty": 232.75, "p90_e2e_norm_intvty": 128.68, "p90_e2el_s": 9.125, "p90_ttft_s": 0.853, "p50_ttft_s": 0.316}
