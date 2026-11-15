@@ -163,6 +163,24 @@
    "p50_ttft_s": 0.982
   },
   {
+   "label": "C256 2P1D",
+   "run": "C256-2P1D-a1095076",
+   "topology": "2P1D: 2 x P TP8+DCP8, D TP16+DCP16",
+   "chosen": true,
+   "note": "phase-2 gap filler: only TTFT-reasonable point between x 80 (C512, TTFT 6.4 s) and 113; below the C224-C512 chord on y, non-dominated; gsm8k on the same hold",
+   "gsm8k_strict": null,
+   "gpus": 32,
+   "ok": 36366,
+   "err": 13,
+   "span_min": 60.5,
+   "tput_per_gpu": 44939.7,
+   "p90_intvty": 99.94,
+   "p90_e2e_norm_intvty": 44.08,
+   "p90_e2el_s": 22.396,
+   "p90_ttft_s": 2.427,
+   "p50_ttft_s": 1.21
+  },
+  {
    "label": "C512",
    "run": "C512-a1093684",
    "topology": "1P1D hybrid: P and D each DP4 x (TP4+DCP4), EP16",

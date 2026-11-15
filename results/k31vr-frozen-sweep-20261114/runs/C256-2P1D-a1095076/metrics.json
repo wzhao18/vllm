@@ -1,0 +1,1 @@
+{"label": "C256 2P1D", "out": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/outputs/a1095076-frz-c256-spx-1114210941", "gpus": 32, "ok": 36366, "err": 13, "span_min": 60.5, "tput_per_gpu": 44939.7, "p90_itl_ms": 10.006, "p90_intvty": 99.94, "p90_e2e_norm_intvty": 44.08, "p90_e2el_s": 22.396, "p90_ttft_s": 2.427, "p50_ttft_s": 1.21}

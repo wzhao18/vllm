@@ -5,6 +5,36 @@ Goal: the best 4-way pareto curve for VR200, picked by config only.
 - A point is not chosen if it has a clear drawback on P90 E2E-normalized interactivity, P90 E2E latency or P90 TTFT.
   Example: the C160 1P1D run of 2026-11-14 queued on its single prefill instance, which pushed TTFT p90 to 4.2 s.
 
+<!-- SUMMARY -->
+## Summary (2026-11-14, all runs landed; gsm8k for C256 pending at time of writing)
+- **Chosen curve (9 points, frozen code b68d67e7e, K3.1 golden AL, watermark 0.05):** C1, C8, C48 1P1D, C96 1P2D, C64, C112 1P1D, C160 2P1D, C224 2P1D, C256 2P1D, C512 hybrid. Every chosen point passed gsm8k (strict 0.9659-0.9712, real rejection, same allocation).
+- **Reproductions:** every previously chosen config reproduced within its pre-registered lines. x is 2-5% below the old runs, which is the expected effect of moving from the Kimi K3 AL (3.84 / 3.0) to the InferenceX Kimi K3.1 golden AL (3.69 / 2.88). y is within 0-4%.
+- **New points:**
+  - **C96 1P2D:** one prefill shared by two C48-shape decodes. It gives +10% y over C48 at -2% x. Its TTFT p90 is 1.5 s vs 0.73 s.
+  - **C112 1P1D:** about +6% y over the C64-C224 chord at x 186. Its TTFT p90 is 2.75 s, from a moderate single-prefill queue.
+  - **C256 2P1D:** the only point between x 80 and 113 with TTFT p90 under 3 s.
+- **Not used:**
+  - **C160 1P1D:** 38.6K at 170, but TTFT p90 6.9 s from single-prefill saturation. Replaced by C160 2P1D at 31.0K, 161, TTFT 1.6 s.
+  - **3P2D C384:** not run. Its gate (TTFT) failed on the measured C112 and C224 runs.
+  - **About 15 other configs:** rejected in planning (`PHASE2_PLAN.md` on Hecate) because they were within drift or saturated the prefill.
+- **VR200 vs the GB300 front at the same P90 interactivity** (GB300 = SemiAnalysis InferenceX Kimi-K3.1-Pro dynamo-vllm, 2026-11-10; linear interpolation along the GB300 front):
+
+| point | TPS/GPU | P90 intvty | GB300 front at same intvty | VR200 / GB300 per GPU | per MW (x 2.12/3.3) |
+|---|---|---|---|---|---|
+| C1 | 1,342 | 779 | outside GB300 range (GB300 x 52-450) | - | - |
+| C8 | 2,890 | 530 | outside GB300 range (GB300 x 52-450) | - | - |
+| C48 1P1D | 15,544 | 296 | 4,080 | 3.81x | 2.45x |
+| C96 1P2D | 17,132 | 290 | 4,176 | 4.10x | 2.64x |
+| C64 | 20,778 | 233 | 6,322 | 3.29x | 2.11x |
+| C112 1P1D | 29,863 | 186 | 9,775 | 3.05x | 1.96x |
+| C160 2P1D | 31,049 | 161 | 12,067 | 2.57x | 1.65x |
+| C224 2P1D | 41,591 | 113 | 18,112 | 2.30x | 1.48x |
+| C256 2P1D | 44,940 | 100 | 19,795 | 2.27x | 1.46x |
+| C512 | 73,736 | 80 | 26,741 | 2.76x | 1.77x |
+
+VR200 also covers x 450-780 (C8, C1), which the GB300 series does not reach.
+<!-- /SUMMARY -->
+
 ## Fixed for every run
 - **Code:** frozen at `wzhao/agentx-vr-nov-13` **b68d67e7e**. That is d0d09dc plus F1 (`dsa/wide.py`) and F3a (`kda/prepared.py`), and it is byte-identical to the deployed Hecate tree `hti/lowlat/trees/ll-integ-dea4ebd06f`. GitLab mirror: `weizha/vllm` `wzhao/k31-vr-freeze-ll`.
 - **Speculative decoding:** DSpark, probabilistic drafting, synthetic rejection at the **InferenceX Kimi K3.1 golden AL**. The source is `golden_al_distribution/kimi-k3.1-pro__dspark__kimi-k3.1-pro-dspark-preview__probabilistic-block.yaml`, thinking_on: k3 = 2.88, k7 = 3.69. This is the same table the GB300 baseline uses.
@@ -52,6 +82,7 @@ Still queued or running: see the sweep status below the table.
 | C160 1P1D | 1P1D: P TP8+DCP8, D TP16+DCP16 (24) | C160-1P1D-a1093679 | 38,569 | 170.4 | 27.2 | 18.7 | 6.89 | 0.9689 | no | not used: TTFT p90 6.9 s (4x 2P1D) from prefill queueing on one P; replaced by C160 2P1D (phase 2) |
 | C160 2P1D | 2P1D: 2 x P TP8+DCP8, D TP16+DCP16 (32) | C160-2P1D-a1094590 | 31,049 | 161.3 | 73.5 | 14.5 | 1.64 | 0.9712 | **yes** | phase-2 replacement for greyed C160 1P1D; on projection (~158 @ 30-31K, TTFT <= 2 s); old K3-AL run 31.2K @ 164; gsm8k on the same hold |
 | C224 2P1D | 2P1D: 2 x P TP8+DCP8, D TP16+DCP16 (32) | C224-2P1D-a1093685 | 41,591 | 113.1 | 54.6 | 19.5 | 1.88 | 0.9697 | **yes** | accept: old K3-AL run 42.9K @ 119 -> AL-adjusted ~114; gsm8k on the same hold |
+| C256 2P1D | 2P1D: 2 x P TP8+DCP8, D TP16+DCP16 (32) | C256-2P1D-a1095076 | 44,940 | 99.9 | 44.1 | 22.4 | 2.43 | pending | **yes** | phase-2 gap filler: only TTFT-reasonable point between x 80 (C512, TTFT 6.4 s) and 113; below the C224-C512 chord on y, non-dominated; gsm8k on the same hold |
 | C512 | 1P1D hybrid: P and D each DP4 x (TP4+DCP4), EP16 (32) | C512-a1093684 | 73,736 | 80.3 | 20.2 | 31.8 | 6.43 | 0.9659 | **yes** | accept vs pre-registered >=80 @ >=71K (old K3-AL run 76.5K @ 86); gsm8k running on the same hold |
 <!-- /POINTS -->
 

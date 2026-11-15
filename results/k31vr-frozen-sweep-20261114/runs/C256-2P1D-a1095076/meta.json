@@ -1,0 +1,1 @@
+{"label": "C256 2P1D", "topology": "2P1D: 2 x P TP8+DCP8, D TP16+DCP16", "chosen": true, "note": "phase-2 gap filler: only TTFT-reasonable point between x 80 (C512, TTFT 6.4 s) and 113; below the C224-C512 chord on y, non-dominated; gsm8k on the same hold"}
