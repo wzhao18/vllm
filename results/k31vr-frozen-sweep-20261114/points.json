@@ -109,6 +109,24 @@
    "p50_ttft_s": 0.994
   },
   {
+   "label": "C128 1P1D",
+   "run": "C128-1P1D-a1096270",
+   "topology": "1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag off)",
+   "chosen": false,
+   "note": "mid-curve run (user 2026-11-15): meets pre-registered accept (>=32K @ >=175, TTFT <= 4.5 s); +7.5% y vs C112 at ~same x, TTFT p90 3.2 s vs 2.75 s; selection pending its lookup-flag twin frz-c128-1p1d-llh (a1096428)",
+   "gsm8k_strict": null,
+   "gpus": 24,
+   "ok": 20162,
+   "err": 5,
+   "span_min": 60.4,
+   "tput_per_gpu": 32194.4,
+   "p90_intvty": 184.64,
+   "p90_e2e_norm_intvty": 53.02,
+   "p90_e2el_s": 13.912,
+   "p90_ttft_s": 3.203,
+   "p50_ttft_s": 1.137
+  },
+  {
    "label": "C160 1P1D",
    "run": "C160-1P1D-a1093679",
    "topology": "1P1D: P TP8+DCP8, D TP16+DCP16",
