@@ -1,0 +1,10 @@
+mc_exec_0314: /usr/bin/bash (/opt/k3/mooncake-0.3.14)
+[dloan hecate0322 2026-11-14 19:48:44] cpus allowed: 0-351; master 10.66.24.139:8700 admin 10.66.24.139:8702; 950 GB in 2 segment(s)
+[dloan hecate0322 2026-11-14 19:48:44] monitor pinned to 64-79,240-255,120-135,296-311
+[dloan hecate0322 2026-11-14 19:48:44] client 0 pid 3162706 (numactl --physcpubind=64-79,240-255 --membind=0) 475GB devices mlx5_0,mlx5_1,mlx5_2,mlx5_3 port 50052
+[dloan hecate0322 2026-11-14 19:48:44] client 1 pid 3162709 (numactl --physcpubind=120-135,296-311 --membind=1) 475GB devices mlx5_0,mlx5_1,mlx5_2,mlx5_3 port 50053
+[dloan hecate0322 2026-11-14 19:49:04] master lists 2 segment(s) for 10.66.24.157
+DLOAN-READY hecate0322 1794714544
+[2026-11-14T20:05:50.651] error: *** STEP 1093684.182 ON hecate0322 CANCELLED AT 2026-11-14T20:05:50 DUE to SIGNAL Terminated ***
+[dloan hecate0322 2026-11-14 20:05:50] stopping clients 3162706 3162709
+[dloan hecate0322 2026-11-14 20:05:50] stopping clients 3162706 3162709

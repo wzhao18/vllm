@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "captured_at": "2026-11-15T03:47:33Z",
+  "job_id": "1093684",
+  "tool": {
+    "srtctl_version": "2.59.1",
+    "srtctl_commit": "ae3d6877c46f"
+  },
+  "hardware": {
+    "architecture": "aarch64",
+    "cpu_model": "ARM CPU implementer 0x4e part 0x010 (architecture 8, variant 0x0, revision 0)",
+    "host_logical_cpus": 352
+  },
+  "nodes": {
+    "count": 8,
+    "names": [
+      "hecate0313",
+      "hecate0315",
+      "hecate0318",
+      "hecate0319",
+      "hecate0320",
+      "hecate0321",
+      "hecate0322",
+      "hecate0323"
+    ]
+  },
+  "gpus": {
+    "type": "vrnvl72",
+    "configured_per_node": 4,
+    "configured_total": 32,
+    "backend_total": 32
+  },
+  "cpus": {
+    "allocated_total": null,
+    "allocated_per_node": [],
+    "current_node_allocated": 352,
+    "process_affinity_count": 352,
+    "process_affinity_list": "0-351",
+    "effective_for_check": null,
+    "backend_node_allocations": []
+  },
+  "slurm_environment": {
+    "SLURM_CPUS_ON_NODE": "352"
+  },
+  "cpu_check": {
+    "status": "unknown",
+    "gpu_count_basis": 32,
+    "minimum_cpu_count": 32,
+    "available_cpu_count": null,
+    "available_cpu_source": "unknown",
+    "node": null,
+    "message": "Could not determine effective CPU capacity from SLURM or process affinity."
+  }
+}

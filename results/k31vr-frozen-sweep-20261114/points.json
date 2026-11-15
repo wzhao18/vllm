@@ -42,7 +42,7 @@
    "topology": "1P1D hybrid: P and D each DP4 x (TP4+DCP4), EP16",
    "chosen": true,
    "note": "accept vs pre-registered >=80 @ >=71K (old K3-AL run 76.5K @ 86); gsm8k running on the same hold",
-   "gsm8k_strict": null,
+   "gsm8k_strict": 0.9659,
    "gpus": 32,
    "ok": 63214,
    "err": 21,
