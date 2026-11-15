@@ -43,7 +43,7 @@ Still queued or running: see the sweep status below the table.
 <!-- POINTS -->
 | point | topology (GPUs) | AgentX run | TPS/GPU | P90 intvty | P90 E2E-norm | P90 E2E (s) | P90 TTFT (s) | gsm8k strict | chosen | note |
 |---|---|---|---|---|---|---|---|---|---|---|
-| C1 | 1P1D: P TP8+DCP8, D TP16+DCP16 (24) | C1-a1093683 | 1,342 | 778.6 | 328.8 | 6.5 | 0.36 | pending | **yes** | accept: old K3-AL run 1,347 @ 805 -> -0.4% y, -3.2% x (AL correction); gsm8k on the same hold |
+| C1 | 1P1D: P TP8+DCP8, D TP16+DCP16 (24) | C1-a1093683 | 1,342 | 778.6 | 328.8 | 6.5 | 0.36 | 0.9659 | **yes** | accept: old K3-AL run 1,347 @ 805 -> -0.4% y, -3.2% x (AL correction); gsm8k on the same hold |
 | C8 | 1P1D: P TP8+DCP8, D TP16+DCP16 (24) | C8-a1093682 | 2,890 | 529.7 | 326.7 | 4.7 | 0.35 | 0.9659 | **yes** | accept: old K3-AL run 2,960 @ 553 -> -2.3% y, -4.2% x (= AL 3.84 -> 3.69); gsm8k on the same hold |
 | C48 1P1D | 1P1D: P TP8+DCP8, D TP16+DCP16 (24) | C48-1P1D-a1093681 | 15,544 | 296.1 | 158.1 | 7.6 | 0.73 | pending | **yes** | accept (proj ~293 @ 15.0-15.4K; old K3-AL 15,593 @ 305 -> -0.3% y, -3% x); gsm8k on the same hold |
 | C96 1P2D | 1P2D: P TP8+DCP8, 2 x D TP16+DCP16 (40) | C96-1P2D-a1093473 | 17,132 | 290.3 | 106.3 | 8.2 | 1.51 | 0.9697 | **yes** | new config (shared prefill): +10% y vs frozen C48 1P1D at -2% x; trade-off TTFT p90 1.5 s vs 0.73 s (shared P), E2E-norm 106; meets pre-registered accept; gsm8k 0.9697 |

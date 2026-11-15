@@ -6,7 +6,7 @@
    "topology": "1P1D: P TP8+DCP8, D TP16+DCP16",
    "chosen": true,
    "note": "accept: old K3-AL run 1,347 @ 805 -> -0.4% y, -3.2% x (AL correction); gsm8k on the same hold",
-   "gsm8k_strict": null,
+   "gsm8k_strict": 0.9659,
    "gpus": 24,
    "ok": 404,
    "err": 2,
