@@ -1,0 +1,1 @@
+{"label": "C8", "out": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/outputs/a1093682-frz-c8-xdr-1114190912", "gpus": 24, "ok": 1457, "err": 2, "span_min": 59.9, "tput_per_gpu": 2890.1, "p90_itl_ms": 1.888, "p90_intvty": 529.67, "p90_e2e_norm_intvty": 326.67, "p90_e2el_s": 4.723, "p90_ttft_s": 0.348, "p50_ttft_s": 0.192}
