@@ -7,7 +7,7 @@ Goal: the best 4-way pareto curve for VR200, picked by config only.
 
 <!-- SUMMARY -->
 ## Summary (2026-11-14, all runs landed; gsm8k for C256 pending at time of writing)
-- **Chosen curve (10 points, frozen code b68d67e7e, K3.1 golden AL, watermark 0.05):** C1, C8, C48 1P1D, C96 1P2D, C64, C112 1P1D, C160 2P1D, C224 2P1D, C256 2P1D, C512 hybrid. Every chosen point passed gsm8k (strict 0.9659-0.9712, real rejection, same allocation).
+- **Final chosen set (user, 2026-11-15; 6 points, frozen code b68d67e7e, K3.1 golden AL, watermark 0.05):** C1, C8, C96 1P2D, C112 1P1D, C224 2P1D, C512 hybrid. C48 1P1D, C64, C160 2P1D and C256 2P1D are measured and valid but unselected (grey). Every chosen point passed gsm8k (strict 0.9659-0.9712, real rejection, same allocation).
 - **Reproductions:** every previously chosen config reproduced within its pre-registered lines. x is 2-5% below the old runs, which is the expected effect of moving from the Kimi K3 AL (3.84 / 3.0) to the InferenceX Kimi K3.1 golden AL (3.69 / 2.88). y is within 0-4%.
 - **New points:**
   - **C96 1P2D:** one prefill shared by two C48-shape decodes. It gives +10% y over C48 at -2% x. Its TTFT p90 is 1.5 s vs 0.73 s.
@@ -19,18 +19,14 @@ Goal: the best 4-way pareto curve for VR200, picked by config only.
   - **About 15 other configs:** rejected in planning (`PHASE2_PLAN.md` on Hecate) because they were within drift or saturated the prefill.
 - **VR200 vs the GB300 front at the same P90 interactivity** (GB300 = SemiAnalysis InferenceX Kimi-K3.1-Pro dynamo-vllm, 2026-11-10; linear interpolation along the GB300 front):
 
-| point | TPS/GPU | P90 intvty | GB300 front at same intvty | VR200 / GB300 per GPU | per MW (x 2.12/3.3) |
-|---|---|---|---|---|---|
-| C1 | 1,342 | 779 | outside GB300 range (GB300 x 52-450) | - | - |
-| C8 | 2,890 | 530 | outside GB300 range (GB300 x 52-450) | - | - |
-| C48 1P1D | 15,544 | 296 | 4,080 | 3.81x | 2.45x |
-| C96 1P2D | 17,132 | 290 | 4,176 | 4.10x | 2.64x |
-| C64 | 20,778 | 233 | 6,322 | 3.29x | 2.11x |
-| C112 1P1D | 29,863 | 186 | 9,775 | 3.05x | 1.96x |
-| C160 2P1D | 31,049 | 161 | 12,067 | 2.57x | 1.65x |
-| C224 2P1D | 41,591 | 113 | 18,112 | 2.30x | 1.48x |
-| C256 2P1D | 44,940 | 100 | 19,795 | 2.27x | 1.46x |
-| C512 | 73,736 | 80 | 26,741 | 2.76x | 1.77x |
+| point | TPS/GPU | P90 intvty | TTFT p90 (s) | GB300 front at same intvty | VR200 / GB300 per GPU | per MW (x 2.12/3.3) |
+|---|---|---|---|---|---|---|
+| C1 | 1,342 | 779 | 0.36 | beyond GB300 range (max x 450) | - | - |
+| C8 | 2,890 | 530 | 0.35 | beyond GB300 range (max x 450) | - | - |
+| C96 1P2D | 17,132 | 290 | 1.51 | 4,176 | 4.10x | 2.64x |
+| C112 1P1D | 29,863 | 186 | 2.75 | 9,775 | 3.05x | 1.96x |
+| C224 2P1D | 41,591 | 113 | 1.88 | 18,112 | 2.30x | 1.48x |
+| C512 | 73,736 | 80 | 6.43 | 26,741 | 2.76x | 1.77x |
 
 VR200 also covers x 450-780 (C8, C1), which the GB300 series does not reach.
 <!-- /SUMMARY -->
@@ -75,14 +71,14 @@ Still queued or running: see the sweep status below the table.
 |---|---|---|---|---|---|---|---|---|---|---|
 | C1 | 1P1D: P TP8+DCP8, D TP16+DCP16 (24) | C1-a1093683 | 1,342 | 778.6 | 328.8 | 6.5 | 0.36 | 0.9659 | **yes** | accept: old K3-AL run 1,347 @ 805 -> -0.4% y, -3.2% x (AL correction); gsm8k on the same hold |
 | C8 | 1P1D: P TP8+DCP8, D TP16+DCP16 (24) | C8-a1093682 | 2,890 | 529.7 | 326.7 | 4.7 | 0.35 | 0.9659 | **yes** | accept: old K3-AL run 2,960 @ 553 -> -2.3% y, -4.2% x (= AL 3.84 -> 3.69); gsm8k on the same hold |
-| C48 1P1D | 1P1D: P TP8+DCP8, D TP16+DCP16 (24) | C48-1P1D-a1093681 | 15,544 | 296.1 | 158.1 | 7.6 | 0.73 | 0.9674 | **yes** | accept (proj ~293 @ 15.0-15.4K; old K3-AL 15,593 @ 305 -> -0.3% y, -3% x); gsm8k on the same hold |
+| C48 1P1D | 1P1D: P TP8+DCP8, D TP16+DCP16 (24) | C48-1P1D-a1093681 | 15,544 | 296.1 | 158.1 | 7.6 | 0.73 | 0.9674 | no | accept (proj ~293 @ 15.0-15.4K; old K3-AL 15,593 @ 305 -> -0.3% y, -3% x); gsm8k on the same hold; unselected by user 2026-11-15 (final set: C1, C8, C96 1P2D, C112 1P1D, C224 2P1D, C512) |
 | C96 1P2D | 1P2D: P TP8+DCP8, 2 x D TP16+DCP16 (40) | C96-1P2D-a1093473 | 17,132 | 290.3 | 106.3 | 8.2 | 1.51 | 0.9697 | **yes** | new config (shared prefill): +10% y vs frozen C48 1P1D at -2% x; trade-off TTFT p90 1.5 s vs 0.73 s (shared P), E2E-norm 106; meets pre-registered accept; gsm8k 0.9697 |
-| C64 | 1P1D: P TP8+DCP8, D TP16+DCP16 (24) | C64-a1093680 | 20,778 | 232.8 | 128.7 | 9.1 | 0.85 | 0.9689 | **yes** | borderline vs pre-registered (x 232.8 between fail 230 and accept 235; y at top of 20.2-20.8K); ~-3% x vs expectation while C48 is ~+3% on the same code -> run-to-run drift; chosen (only point at this x); gsm8k on the same hold |
+| C64 | 1P1D: P TP8+DCP8, D TP16+DCP16 (24) | C64-a1093680 | 20,778 | 232.8 | 128.7 | 9.1 | 0.85 | 0.9689 | no | borderline vs pre-registered (x 232.8 between fail 230 and accept 235; y at top of 20.2-20.8K); ~-3% x vs expectation while C48 is ~+3% on the same code -> run-to-run drift; chosen (only point at this x); gsm8k on the same hold; unselected by user 2026-11-15 (final set: C1, C8, C96 1P2D, C112 1P1D, C224 2P1D, C512) |
 | C112 1P1D | 1P1D: P TP8+DCP8, D TP16+DCP16 (k3) (24) | C112-1P1D-a1094730 | 29,863 | 186.3 | 60.2 | 12.7 | 2.75 | 0.9682 | **yes** | phase-2 new config: +~6% y vs the C64-C224 chord at x 186 (proj +10%); TTFT p90 between accept 2.5 s and fail 3.0 s (single-P queue, Waiting mean ~4.5); kept per README rule (no chosen point within 10% x dominates it on the secondary panels); gsm8k on the same hold |
 | C160 1P1D | 1P1D: P TP8+DCP8, D TP16+DCP16 (24) | C160-1P1D-a1093679 | 38,569 | 170.4 | 27.2 | 18.7 | 6.89 | 0.9689 | no | not used: TTFT p90 6.9 s (4x 2P1D) from prefill queueing on one P; replaced by C160 2P1D (phase 2) |
-| C160 2P1D | 2P1D: 2 x P TP8+DCP8, D TP16+DCP16 (32) | C160-2P1D-a1094590 | 31,049 | 161.3 | 73.5 | 14.5 | 1.64 | 0.9712 | **yes** | phase-2 replacement for greyed C160 1P1D; on projection (~158 @ 30-31K, TTFT <= 2 s); old K3-AL run 31.2K @ 164; gsm8k on the same hold |
+| C160 2P1D | 2P1D: 2 x P TP8+DCP8, D TP16+DCP16 (32) | C160-2P1D-a1094590 | 31,049 | 161.3 | 73.5 | 14.5 | 1.64 | 0.9712 | no | phase-2 replacement for greyed C160 1P1D; on projection (~158 @ 30-31K, TTFT <= 2 s); old K3-AL run 31.2K @ 164; gsm8k on the same hold; unselected by user 2026-11-15 (final set: C1, C8, C96 1P2D, C112 1P1D, C224 2P1D, C512) |
 | C224 2P1D | 2P1D: 2 x P TP8+DCP8, D TP16+DCP16 (32) | C224-2P1D-a1093685 | 41,591 | 113.1 | 54.6 | 19.5 | 1.88 | 0.9697 | **yes** | accept: old K3-AL run 42.9K @ 119 -> AL-adjusted ~114; gsm8k on the same hold |
-| C256 2P1D | 2P1D: 2 x P TP8+DCP8, D TP16+DCP16 (32) | C256-2P1D-a1095076 | 44,940 | 99.9 | 44.1 | 22.4 | 2.43 | pending | **yes** | phase-2 gap filler: only TTFT-reasonable point between x 80 (C512, TTFT 6.4 s) and 113; below the C224-C512 chord on y, non-dominated; gsm8k on the same hold |
+| C256 2P1D | 2P1D: 2 x P TP8+DCP8, D TP16+DCP16 (32) | C256-2P1D-a1095076 | 44,940 | 99.9 | 44.1 | 22.4 | 2.43 | pending | no | phase-2 gap filler: only TTFT-reasonable point between x 80 (C512, TTFT 6.4 s) and 113; below the C224-C512 chord on y, non-dominated; gsm8k on the same hold; unselected by user 2026-11-15 (final set: C1, C8, C96 1P2D, C112 1P1D, C224 2P1D, C512) |
 | C512 | 1P1D hybrid: P and D each DP4 x (TP4+DCP4), EP16 (32) | C512-a1093684 | 73,736 | 80.3 | 20.2 | 31.8 | 6.43 | 0.9659 | **yes** | accept vs pre-registered >=80 @ >=71K (old K3-AL run 76.5K @ 86); gsm8k running on the same hold |
 <!-- /POINTS -->
 
