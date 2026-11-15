@@ -20,6 +20,14 @@ as it was while #108's ``dsa.prepared.PreparedDsa`` serves the steps up to 64 ro
                    on "proj" rows (r1.AUTO_PARTIALS) the W_UV bmm of every
                    gathered head, then #108's DcpValue over its value rows
 
+Query overlap (``WIDE_QUERY_OVERLAP`` per rows): "fork" runs QueryNorm (the q_c rows,
+bit-identical to MlaQuery's) on the layer's stream and MlaQuery (publish only, no
+q_c) on ``overlap.side_stream``, beside the indexer chain (wq_b -> DsaIndex ->
+scoring, top-k, merge -> slot filter), which reads only q_c; the chain joins the
+side stream, then QueryWait polls the gathered mailbox and the sparse decode reads
+it. The chain runs on ``overlap.index_stream`` (``WIDE_INDEX_PRIORITY``). "serial":
+every kernel in one stream, MlaQuery first.
+
 The packed projection row is [q_a 1536 | kv_a 576 | gate H*128 | wk 128 | wv 32]."""
 
 from functools import cache, partial
@@ -43,6 +51,7 @@ from ..common.host import (
     stream,
     to_cute,
 )
+from ..common.policy import batch_table
 from ..gemm.projection import PreparedProjection
 from ..mla.dcp import GB300_SMS, DcpValue, compile_value
 from ..mla.prepared import pad_requests
@@ -52,7 +61,8 @@ from . import dcp_value
 from .dcp_stage import compile_dcp_value, projected_rows, run_value
 from .dcp_value import PROJECTED
 from .index import DIM, HEADS, DsaIndex
-from .overlap import QueryWait
+from .overlap import QueryWait, index_stream, side_stream
+from .query_stage import compile_norm
 from .r1 import DsaBox
 
 logger = init_logger(__name__)
@@ -94,12 +104,55 @@ WIDE_MAX_ROWS = 96
 # QueryWait at the publish-only rows: CTAs per SM (one pass of at most 8 polled
 # 16 B chunks per thread up to 4 x SMs x 2048 chunks: 1.24M at 360 rows, DCP16).
 WAIT_CTAS_PER_SM = 4
+# Query overlap per rows (``OVERLAP_MODES``, the same idea as overlap.QUERY_OVERLAP
+# for PreparedDsa's rows). Under "serial" the indexer chain (wq_b -> DsaIndex ->
+# logits -> top-k -> merge, 15.4-17.7 us per layer at q8 M96-M176 / q4 M128-M220)
+# waits for MlaQuery (15.1-21.5 us, the gathered-q poll included at 65-96 rows),
+# though it reads only q_c: frontier-advance critical path of the ShardQ-off
+# DCP16 step bench (hti/lowlat results dec-c48-bal-1064153-1113224545-1331131,
+# dec-c160-bal-1064153-1113225937-1632543), while PreparedDsa's fork hides the chain
+# at 17-64 rows. "fork" moves MlaQuery (publish only) off the chain onto the side
+# stream at every wide row; QueryWait stays right before the sparse decode, after
+# the join (its wide grid would take the chain's SMs while it polls).
+WIDE_QUERY_OVERLAP = "65-:fork"
+OVERLAP_MODES = ("serial", "fork")
+# Rows whose forked indexer chain (wq_b through the sparse decode) runs on the
+# high-priority index stream ("chain"; other rows: the layer's stream). MlaQuery
+# holds one CTA per SM (227 KB shared) in 0.7-1.6 waves at 96-220 rows, so without
+# priority its queued CTAs take the SMs ahead of the chain as they free up (the
+# C512 precedent in overlap.INDEX_PRIORITY); it has slack until the join (the chain
+# and the top-k merge, ~30-35 us, against its 13-18 us).
+WIDE_INDEX_PRIORITY = "65-:chain"
 
 
-def query_publishes_only(batch, dcp):
+def wide_overlap(batch, policy=None):
+    """The query overlap mode of ``batch`` wide rows: ``policy`` is a mode or a
+    "rows:mode,..." table (default WIDE_QUERY_OVERLAP)."""
+    policy = WIDE_QUERY_OVERLAP if policy is None else policy
+    mode = batch_table(policy).get(batch) if ":" in policy else policy
+    if mode not in OVERLAP_MODES:
+        raise ValueError(
+            f"Kimi K3.1 WideDsa query overlap {mode!r} at {batch} rows: expected "
+            f"one of {OVERLAP_MODES}"
+        )
+    return mode
+
+
+def chain_priority(batch, policy=None):
+    """Whether the forked indexer chain of ``batch`` rows runs on the index stream:
+    ``policy`` a "rows:chain" table (default WIDE_INDEX_PRIORITY; "": never)."""
+    policy = WIDE_INDEX_PRIORITY if policy is None else policy
+    table = batch_table(policy) if policy else {}
+    if set(table.values()) - {"chain"}:
+        raise ValueError(f"Kimi K3.1 WideDsa index priority {policy!r}: not chain")
+    return table.get(batch) == "chain"
+
+
+def query_publishes_only(batch, dcp, overlap="serial"):
     """Whether WideDsa's MlaQuery at ``batch`` rows under DCP only publishes (the
-    gathered mailbox then polled by QueryWait before the sparse decode)."""
-    return bool(dcp) and batch > WIDE_MAX_ROWS
+    gathered mailbox then polled by QueryWait before the sparse decode): every
+    forked query, and the serial ones above WIDE_MAX_ROWS."""
+    return bool(dcp) and (overlap == "fork" or batch > WIDE_MAX_ROWS)
 
 
 def choose(shape, ctx):
@@ -136,6 +189,7 @@ def compile_core(
     lse_base_e=True,
     cap=64,
     nvfp4=False,
+    overlap="serial",
 ):
     """CuTe kernels (query, index, value) of one batch of rows (``q`` per request).
     ``specs``: the layouts of the weights, the MLA cache and the indexer cache.
@@ -146,7 +200,10 @@ def compile_core(
     [B, H, 512] latent (under DCP: an FP8 q mailbox, and an LSE in base e if
     ``lse_base_e``, else base 2). ``cap``: the DCP mailboxes' rows (64, or a widened
     box's). ``nvfp4``: that FP8 query over an nvfp4_ds_mla cache (FlashInfer
-    prims_ts)."""
+    prims_ts). ``overlap`` (OVERLAP_MODES): "fork" leaves the q_c rows to QueryNorm
+    and, under DCP, the mailbox poll to QueryWait."""
+    if overlap not in OVERLAP_MODES:
+        raise ValueError(f"Kimi K3.1 WideDsa query overlap {overlap!r}")
     qnorm, kvnorm, qb, uk, uv, kv, index_kv = (
         fake(shape, stride, dtype, 4 if dtype == torch.float32 else 16)
         for shape, stride, dtype in specs
@@ -171,7 +228,8 @@ def compile_core(
         nvfp4=nvfp4,
         dcp=dcp,
         q_heads=q_heads,
-        gather=not query_publishes_only(batch, dcp),
+        store_qc=overlap == "serial",
+        gather=not query_publishes_only(batch, dcp, overlap),
     )
     q_args = (projected, qnorm, kvnorm, qb, uk, kv, slots, scalar, scalar, f32(1e-6))
     publish: tuple = ()
@@ -227,12 +285,15 @@ def compile_core(
 
 
 @cache
-def compile_query_wait(batch, heads, dcp, q_heads, sms, cap, fp8=True):
-    """QueryWait of ``batch`` publish-only rows (``query_publishes_only``; else
-    None): every 16 B chunk of the DCP x ``heads`` gathered heads (rows of
-    ``q_heads``) polled until published, over up to WAIT_CTAS_PER_SM x ``sms`` CTAs.
-    Shared by every DSA layer (the mailbox is a launch argument)."""
-    if not query_publishes_only(batch, dcp):
+def compile_query_wait(
+    batch, heads, dcp, q_heads, sms, cap, fp8=True, overlap="serial"
+):  # fmt: skip
+    """QueryWait of ``batch`` publish-only rows (``query_publishes_only`` under the
+    ``overlap`` mode; else None): every 16 B chunk of the DCP x ``heads`` gathered
+    heads (rows of ``q_heads``) polled until published, over up to
+    WAIT_CTAS_PER_SM x ``sms`` CTAs. Shared by every DSA layer (the mailbox is a
+    launch argument)."""
+    if not query_publishes_only(batch, dcp, overlap):
         return None
     q_bytes = 1 if fp8 else 2
     mailbox = fake((cap, q_heads, 576 * q_bytes), None, torch.uint8)
@@ -316,7 +377,10 @@ class WideDsa:
     widened box (``DcpBox.widened``) serves the batches above its rows; ``core``: the
     TP sparse core of the shared provider policy (unused: DCP only); ``partials``:
     the DcpValue partials of its batches (r1.DsaBox; None: r1.AUTO_PARTIALS on
-    FlashInfer sparse, else "bf16")."""
+    FlashInfer sparse, else "bf16"); ``overlap``: a query overlap mode or
+    "rows:mode" table (default WIDE_QUERY_OVERLAP); ``priority``: the forked
+    batches whose indexer chain runs on the index stream, a "rows:chain" table
+    (default WIDE_INDEX_PRIORITY)."""
 
     def __init__(
         self,
@@ -329,6 +393,8 @@ class WideDsa:
         dcp=None,
         parity=0,
         partials=None,
+        overlap=None,
+        priority=None,
     ):
         from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseImpl
 
@@ -411,8 +477,17 @@ class WideDsa:
         self.cache_lens = torch.full(
             (rows,), self.indexer.max_model_len, dtype=torch.int32, device=device
         )
+        # The query overlap per batch, and the forked batches whose indexer chain
+        # runs on the high-priority index stream.
+        self.overlaps = {b: wide_overlap(b, overlap) for b in pitches}
+        self.prioritized = frozenset(
+            b
+            for b, mode in self.overlaps.items()
+            if mode == "fork" and chain_priority(b, priority)
+        )
         self.kernels = {}
         self.waits = {}  # QueryWait per batch (publish-only rows; else None)
+        self.norms = {}  # QueryNorm per forked batch
         policies = index_policies(sorted(pitches))
         wq = self.indexer.wq_index.weight
         self.index_projection = PreparedProjection(wq, policies).prepare()
@@ -435,22 +510,43 @@ class WideDsa:
             args += (self.dcp, box.q_heads, sms, self.dsa_box.mailbox(batch).format)
             cap = box.cap
             lse_base_e = not self.fp8 or self.impl.lse_base_on_e
+            mode = self.overlaps[batch]
             self.kernels[batch, q] = compile_core(
-                *args, fp8=self.fp8, lse_base_e=lse_base_e, cap=cap, nvfp4=self.nvfp4
+                *args,
+                fp8=self.fp8,
+                lse_base_e=lse_base_e,
+                cap=cap,
+                nvfp4=self.nvfp4,
+                overlap=mode,
             )
             w_args = batch, self.heads, self.dcp, box.q_heads, sms, cap, self.fp8
-            self.waits[batch] = compile_query_wait(*w_args)
+            self.waits[batch] = compile_query_wait(*w_args, overlap=mode)
+            if mode == "fork":
+                if self.waits[batch] is None:  # (WideDsa runs under DCP only)
+                    raise RuntimeError(
+                        f"Kimi K3.1 WideDsa: no QueryWait for the forked query at "
+                        f"{batch} rows"
+                    )
+                with torch.accelerator.device_index(self.device.index):
+                    self.norms[batch] = compile_norm(
+                        batch, self.heads, self.pitches[batch]
+                    )
         rows = sorted(b for b, _ in self.shapes)
         proj = [b for b in rows if self.dsa_box.mailbox(b).format == PROJECTED]
+        forked = sorted(b for b in set(rows) if self.overlaps[b] == "fork")
+        chain = sorted(b for b in forked if b in self.prioritized)
         logger.info_once(
             "Kimi K3.1 WideDsa (DCP %d): rows %s, widened DSA box %d rows (%s), "
-            "MlaQuery publish-only (QueryWait before the sparse decode) above %d rows, "
-            'DcpValue partials %s ("proj" at rows '
-            "%s)",
+            "query forked off the indexer chain (QueryNorm; MlaQuery publish-only on "
+            "the side stream, QueryWait before the sparse decode) at rows %s, chain "
+            "on the index stream at rows %s; serial: MlaQuery publish-only above %d "
+            'rows; DcpValue partials %s ("proj" at rows %s)',
             self.dcp,
             " ".join(map(str, rows)),
             max(box.cap for box in self.boxes.values()),
             self.memory(),
+            " ".join(map(str, forked)) or "none",
+            " ".join(map(str, chain)) or "none",
             WIDE_MAX_ROWS,
             self.dsa_box.partials,
             " ".join(map(str, proj)) or "none",
@@ -615,7 +711,7 @@ class WideDsa:
     def run_dcp(self, projected, out, cache, slots, index_slots, metadata, q):
         """``run`` under DCP: the query publishes into the q mailbox and DcpValue
         merges every rank's partial rows of this rank's heads (global lengths)."""
-        batch, s = projected.shape[0], stream(self.device)
+        batch = projected.shape[0]
         reqs, box, p = batch // q, self.boxes[batch], self.parity
         _, lengths, _ = pad_requests(reqs, metadata.block_table, metadata.seq_lens)
         mq, index, value = self.kernels[batch, q]
@@ -626,14 +722,21 @@ class WideDsa:
         mailbox = to_cute(box.q[p].view(torch.uint8))
         scales = q_scale_inv, k_scale, self.eps
         q_args = (x, qnorm, kvnorm, qb, uk, kv, q_slots, *scales)
+        q_args += (to_cute(self.query[:batch]), to_cute(self.qc[:batch]))
         publish = (mailbox, box.mc(p), cutlass.Int32(box.rank))
-        mq(*q_args, to_cute(self.query[:batch]), to_cute(self.qc[:batch]), *publish, s)
-        self.run_index(x, index_slots, batch, index)
-        topk = self.indexer_core(projected, batch)
         query_wait, wait = self.waits.get(batch), None
-        if query_wait is not None:  # publish-only rows: poll before the decode
-            wait = partial(query_wait, mailbox, s)
-        latent, lse, valid = self.dcp_core(cache, topk, metadata, batch, box, wait)
+        if self.overlaps[batch] == "fork":
+            args = q_args, publish, query_wait
+            core_args = cache, index_slots, metadata, q
+            latent, lse, valid = self.forked_core(projected, *core_args, *args)
+        else:
+            mq(*q_args, *publish, stream(self.device))
+            self.run_index(x, index_slots, batch, index)
+            topk = self.indexer_core(projected, batch)
+            if query_wait is not None:  # publish-only rows: poll before the decode
+                wait = partial(query_wait, mailbox, stream(self.device))
+            latent, lse, valid = self.dcp_core(cache, topk, metadata, batch, box, wait)
+        s = stream(self.device)
         if self.dsa_box.mailbox(batch).format == PROJECTED:
             core, (w_uv, uv_view) = (latent, lse, valid), self.uv_gathered
             args = value, self.dsa_box, p, publish, self.heads, core, lengths[:reqs]
@@ -649,6 +752,48 @@ class WideDsa:
         v_args = (to_cute(latent), to_cute(lse, 4), lens, *boxes, *peers, mailbox, uv)
         value(*v_args, gate, lens, to_cute(out), cutlass.Int32(p), publish[2], s)
         return out
+
+    def forked_core(
+        self, projected, cache, index_slots, metadata, q, q_args, publish, query_wait
+    ):  # fmt: skip
+        """The "fork" query overlap up to the sparse decode's rows, LSE and counts:
+        QueryNorm writes the q_c rows on the layer's stream; MlaQuery (publish only,
+        no q_c) runs on the side stream; the indexer chain (wq_b, DsaIndex, the
+        indexer op, the slot filter) and the sparse decode run on the index stream
+        (prioritized batches) or the layer's stream, which joins the side stream
+        and runs QueryWait right before the decode reads the gathered mailbox. The
+        layer's stream waits for the index stream before DcpValue."""
+        batch = projected.shape[0]
+        mq, index = self.kernels[batch, q][:2]
+        box = self.boxes[batch]
+        main = torch.cuda.current_stream(self.device)
+        side = side_stream(self.device.index)
+        side.wait_stream(main)
+        qc = to_cute(self.qc[:batch])
+        norm = self.norms[batch]
+        norm(q_args[0], self.views[0], qc, self.eps, stream(self.device))
+        with torch.cuda.stream(side):
+            mq(*q_args, *publish, stream(self.device))
+        mailbox = publish[0]
+
+        def join():
+            joining = torch.cuda.current_stream(self.device)
+            joining.wait_stream(side)
+            query_wait(mailbox, stream(self.device))
+
+        def chain():
+            self.run_index(q_args[0], index_slots, batch, index)
+            topk = self.indexer_core(projected, batch)
+            return self.dcp_core(cache, topk, metadata, batch, box, join)
+
+        if batch not in self.prioritized:
+            return chain()
+        hi = index_stream(self.device.index)
+        hi.wait_stream(main)
+        with torch.cuda.stream(hi):
+            core = chain()
+        main.wait_stream(hi)
+        return core
 
     def run_index(self, x, index_slots, batch, index):
         """FP8 indexer query and head weights; the key into the indexer cache."""

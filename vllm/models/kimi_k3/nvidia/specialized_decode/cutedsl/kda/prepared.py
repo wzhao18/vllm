@@ -245,6 +245,43 @@ BF16_ONLY, FP32_WIDE, KIND_WIDE = (3, 4), 7, 1
 # item per CTA (B12-35: +0.4..+1.1) stays LoopStock.
 FP32_FEED: dict = {(10, 7): {4: "41-:1"}}
 FP32_FEED_KIND = 8
+# FP32 state: verify rows per compute capability, q and heads that run KdaSplitStock
+# at the geometry given ("early.lanes.occupancy.cluster", as SPEC_SCHEDULE), in place
+# of FP32_VERIFY_WIDE / FP32_FEED's kernel and on top of DEVICE_SPEC_SCHEDULE(_Q)'s
+# geometry (a BF16 state never reads it; other head counts, e.g. the SP decode's 24,
+# keep their rows). Lanes stay 8 (the lanes per row set the reduction order); the
+# cluster (CTAs per head, 128 / cluster value rows each) and the CTAs-per-SM bound (a
+# register cap) do not change the bits: every 8-lane KdaSplitStock geometry,
+# LoopStock and Feed compute the same bits (test_fp32_geometries_equal_loopstock).
+# 2026-11-14 (low-latency ledger F3a), rows from the f3a kernel sweep (VR200, 1 GPU,
+# 69 layers, own cold FP32 slots, CUDA graph, us per layer, verify alone; every
+# 8-lane geometry 1.8.{2,3,4}.{2,4,8} x LoopStock / Feed, all bitwise LoopStock): a
+# row runs the measured-best arm where it beat the old pick by more than 2 %; an
+# unsampled B takes it only where the sampled B on both sides agree.
+#   q8 B12-14 1.8.2.4: B12 9.20 / B13 9.35 / B14 9.42 (old: LoopStock 11.11, 1.8.3.4
+#             11.10 / 11.71); its two-per-SM 4-CTA clusters fall off a wave cliff
+#             at B15 (360 CTAs, 12.79).
+#   q8 B15    1.8.4.4: 11.08 (1.8.3.4 11.81; LoopStock 11.24); cliff at B16 (15.87).
+#   q8 B18-22 1.8.3.4: B18 11.55 / B20 11.87 / B22 12.36 (LoopStock 12.81 / 13.22 /
+#             13.35). B16 (LoopStock 11.33 vs 11.44) and B17 stay LoopStock, as does
+#             B23 up (B24 LoopStock 13.14 vs 1.8.3.4 20.10).
+#   q4 B41-42 1.8.3.4: B42 13.81 (Feed 14.28), B40 13.62 vs Feed 14.24; B43 up stay
+#             Feed (B44 14.12 vs 14.31: within 2 %).
+# Measured, not adopted: 8-CTA clusters at four per SM at q8 B12-15 (9.75-12.14; its
+# one-wave capacity ends between 672 and 720 CTAs, not the 848 slots) and 2-CTA
+# clusters at q4 B36-44 (14.52-15.04 vs 1.8.3.4's 13.25-14.12: four passes per CTA
+# cost more than 1.8.3.4's second wave).
+FP32_SPLIT_Q: dict = {
+    (10, 7): {
+        4: {6: "41-42:1.8.3.4"},
+        8: {6: "12-14:1.8.2.4,15:1.8.4.4,18-22:1.8.3.4"},
+    },
+}
+
+
+def fp32_split_table(capability, tokens, heads):
+    """FP32_SPLIT_Q's rows at ``capability`` / verify length ``tokens`` / ``heads``."""
+    return batch_table(FP32_SPLIT_Q.get(capability, {}).get(tokens, {}).get(heads, ""))
 
 
 class KdaSplitStock(RecoverKdaSplit):
@@ -336,6 +373,8 @@ def wide_kind(requests, tokens, capability, bf16_state=False, gate_mode=0, heads
     KdaSplit (an FP32 state: ``KdaSplitStock``)."""
     if tokens == 1 or gate_mode != 0 or heads == 12:
         return 0
+    if not bf16_state and requests in fp32_split_table(capability, tokens, heads):
+        return 0  # KdaSplitStock at FP32_SPLIT_Q's geometry (``schedule_of``)
     table = wide_table(capability, tokens, bf16_state)
     kind = table.get(requests)
     if kind is None and table and requests > max(table):
@@ -365,6 +404,8 @@ def schedule_of(heads, requests, gate_mode, tokens, capability, bf16_state, rows
         by_q = DEVICE_SPEC_SCHEDULE_Q.get(capability, {}).get(tokens, {})
         spec = ",".join(filter(None, (spec, override, by_q.get(heads, ""))))
     schedule = batch_table(spec)
+    if tokens > 1 and not bf16_state:  # FP32 state: FP32_SPLIT_Q's geometries
+        schedule.update(fp32_split_table(capability, tokens, heads))
     schedule = schedule.get(requests, (0, 0, 0)) if gate_mode != 2 else (0,) * 3
     if schedule[0] >= 2 and not rows:  # staging needs whole rows
         schedule = (1, *schedule[1:4])  # no evict hint without staging
