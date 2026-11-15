@@ -114,7 +114,7 @@
    "topology": "2P1D: 2 x P TP8+DCP8, D TP16+DCP16",
    "chosen": true,
    "note": "accept: old K3-AL run 42.9K @ 119 -> AL-adjusted ~114; gsm8k on the same hold",
-   "gsm8k_strict": null,
+   "gsm8k_strict": 0.9697,
    "gpus": 32,
    "ok": 32539,
    "err": 16,

@@ -1,0 +1,10 @@
+# srtctl git state snapshot
+Generated at: 2026-11-10T18:27:59Z
+
+Sources considered:
+  - extra_mount:/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr: /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr
+  - extra_mount:/lustre/fsw/coreai_comparch_inferencex/weizha/models/kimi-k3.1/rainhollow-test-weights-1024_v1:ro: /lustre/fsw/coreai_comparch_inferencex/weizha/models/kimi-k3.1/rainhollow-test-weights-1024_v1
+  - extra_mount:/raid/common-models/kimi-k3.1-pro-dspark-preview:ro: /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-preview
+  - extra_mount:/raid/scratch: /raid/scratch
+
+No git repositories found under the considered sources.
