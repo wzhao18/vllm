@@ -127,6 +127,24 @@
    "p50_ttft_s": 1.137
   },
   {
+   "label": "C128 1P1D llh",
+   "run": "C128-1P1D-llh-a1096428",
+   "topology": "1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag on)",
+   "chosen": false,
+   "note": "FAIL vs pre-registered (TTFT not down >=35%: 6.8 s vs 3.2 s flag-off). pfcap: flag acted (lookup 97->52 ms) but Mooncake load ready-wait 26->63 ms and prefill steps/s 5.0->4.4 on this xdr allocation (flag-off twin ran on spx): fabric/node confound, not the flag",
+   "gsm8k_strict": null,
+   "gpus": 24,
+   "ok": 19815,
+   "err": 4,
+   "span_min": 60.4,
+   "tput_per_gpu": 31660.0,
+   "p90_intvty": 184.48,
+   "p90_e2e_norm_intvty": 38.69,
+   "p90_e2el_s": 16.682,
+   "p90_ttft_s": 6.8,
+   "p50_ttft_s": 0.995
+  },
+  {
    "label": "C160 1P1D",
    "run": "C160-1P1D-a1093679",
    "topology": "1P1D: P TP8+DCP8, D TP16+DCP16",
@@ -143,6 +161,24 @@
    "p90_e2el_s": 18.689,
    "p90_ttft_s": 6.891,
    "p50_ttft_s": 2.217
+  },
+  {
+   "label": "C160 1P1D llh",
+   "run": "C160-1P1D-llh-a1096427",
+   "topology": "1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag on)",
+   "chosen": false,
+   "note": "lookup_from_local_hit A/B vs C160 1P1D (a1093679): same y, TTFT p90 cut ~40% but still > 3 s (fails the TTFT rule vs C160 2P1D 1.6 s); x ~5% lower; between accept and fail lines",
+   "gsm8k_strict": null,
+   "gpus": 24,
+   "ok": 23603,
+   "err": 7,
+   "span_min": 60.5,
+   "tput_per_gpu": 39733.6,
+   "p90_intvty": 161.58,
+   "p90_e2e_norm_intvty": 42.28,
+   "p90_e2el_s": 17.319,
+   "p90_ttft_s": 4.667,
+   "p50_ttft_s": 1.162
   },
   {
    "label": "C160 2P1D",
