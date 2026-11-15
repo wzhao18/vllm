@@ -78,7 +78,7 @@
    "topology": "1P1D: P TP8+DCP8, D TP16+DCP16",
    "chosen": true,
    "note": "borderline vs pre-registered (x 232.8 between fail 230 and accept 235; y at top of 20.2-20.8K); ~-3% x vs expectation while C48 is ~+3% on the same code -> run-to-run drift; chosen (only point at this x); gsm8k on the same hold",
-   "gsm8k_strict": null,
+   "gsm8k_strict": 0.9689,
    "gpus": 24,
    "ok": 11967,
    "err": 6,
