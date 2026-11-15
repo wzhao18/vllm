@@ -6,7 +6,7 @@
    "topology": "1P2D: P TP8+DCP8, 2 x D TP16+DCP16",
    "chosen": true,
    "note": "new config (shared prefill); accept vs pre-registered >=288 @ >=17.1K; same x as this sweep's C48 1P1D at +10% y vs the old C48 front",
-   "gsm8k_strict": null,
+   "gsm8k_strict": 0.9697,
    "gpus": 40,
    "ok": 16937,
    "err": 5,
