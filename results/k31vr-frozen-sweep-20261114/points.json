@@ -109,6 +109,24 @@
    "p50_ttft_s": 2.217
   },
   {
+   "label": "C160 2P1D",
+   "run": "C160-2P1D-a1094590",
+   "topology": "2P1D: 2 x P TP8+DCP8, D TP16+DCP16",
+   "chosen": true,
+   "note": "phase-2 replacement for greyed C160 1P1D; on projection (~158 @ 30-31K, TTFT <= 2 s); old K3-AL run 31.2K @ 164; gsm8k on the same hold",
+   "gsm8k_strict": null,
+   "gpus": 32,
+   "ok": 24224,
+   "err": 8,
+   "span_min": 60.4,
+   "tput_per_gpu": 31048.9,
+   "p90_intvty": 161.26,
+   "p90_e2e_norm_intvty": 73.51,
+   "p90_e2el_s": 14.51,
+   "p90_ttft_s": 1.637,
+   "p50_ttft_s": 0.772
+  },
+  {
    "label": "C224 2P1D",
    "run": "C224-2P1D-a1093685",
    "topology": "2P1D: 2 x P TP8+DCP8, D TP16+DCP16",
