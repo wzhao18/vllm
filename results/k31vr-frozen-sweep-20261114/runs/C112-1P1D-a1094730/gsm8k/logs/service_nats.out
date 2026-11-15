@@ -1,0 +1,29 @@
+[117280] 2026/11/14 22:32:49.847910 [INF] Starting nats-server
+[117280] 2026/11/14 22:32:49.848042 [INF]   Version:  2.10.28
+[117280] 2026/11/14 22:32:49.848046 [INF]   Git:      [e0b99bd]
+[117280] 2026/11/14 22:32:49.848047 [INF]   Name:     NC2P2CVER47I4ACQWPLNCE3FGKW4THVHWYRRYVGS7FXRHQZXECXIZUEL
+[117280] 2026/11/14 22:32:49.848050 [INF]   Node:     rcijUuC6
+[117280] 2026/11/14 22:32:49.848051 [INF]   ID:       NC2P2CVER47I4ACQWPLNCE3FGKW4THVHWYRRYVGS7FXRHQZXECXIZUEL
+[117280] 2026/11/14 22:32:49.848063 [INF] Using configuration file: /tmp/nats.conf
+[117280] 2026/11/14 22:32:49.848079 [WRN] Maximum payloads over 8.00 MB are generally discouraged and could lead to poor performance
+[117280] 2026/11/14 22:32:49.848403 [INF] Starting JetStream
+[117280] 2026/11/14 22:32:49.848499 [INF]     _ ___ _____ ___ _____ ___ ___   _   __  __
+[117280] 2026/11/14 22:32:49.848502 [INF]  _ | | __|_   _/ __|_   _| _ \ __| /_\ |  \/  |
+[117280] 2026/11/14 22:32:49.848504 [INF] | || | _|  | | \__ \ | | |   / _| / _ \| |\/| |
+[117280] 2026/11/14 22:32:49.848505 [INF]  \__/|___| |_| |___/ |_| |_|_\___/_/ \_\_|  |_|
+[117280] 2026/11/14 22:32:49.848506 [INF] 
+[117280] 2026/11/14 22:32:49.848507 [INF]          https://docs.nats.io/jetstream
+[117280] 2026/11/14 22:32:49.848508 [INF] 
+[117280] 2026/11/14 22:32:49.848510 [INF] ---------------- JETSTREAM ----------------
+[117280] 2026/11/14 22:32:49.848512 [INF]   Max Memory:      1.05 TB
+[117280] 2026/11/14 22:32:49.848515 [INF]   Max Storage:     536.25 GB
+[117280] 2026/11/14 22:32:49.848516 [INF]   Store Directory: "/tmp/nats/jetstream"
+[117280] 2026/11/14 22:32:49.848517 [INF] -------------------------------------------
+[117280] 2026/11/14 22:32:49.848840 [INF] Listening for client connections on 0.0.0.0:4222
+[117280] 2026/11/14 22:32:49.850328 [INF] Server is ready
+[2026-11-14T22:57:09.377] error: *** STEP 1094730.175 ON hecate0210 CANCELLED AT 2026-11-14T22:57:09 DUE to SIGNAL Terminated ***
+[117280] 2026/11/14 22:57:09.382093 [INF] Trapped "terminated" signal
+[117280] 2026/11/14 22:57:09.392656 [INF] Initiating Shutdown...
+[117280] 2026/11/14 22:57:09.392665 [INF] Initiating JetStream Shutdown...
+[117280] 2026/11/14 22:57:09.393788 [INF] JetStream Shutdown
+[117280] 2026/11/14 22:57:09.394455 [INF] Server Exiting..
