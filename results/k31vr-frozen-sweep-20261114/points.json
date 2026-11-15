@@ -1,6 +1,24 @@
 {
  "points": [
   {
+   "label": "C96 1P2D",
+   "run": "C96-1P2D-a1093473",
+   "topology": "1P2D: P TP8+DCP8, 2 x D TP16+DCP16",
+   "chosen": true,
+   "note": "new config (shared prefill); accept vs pre-registered >=288 @ >=17.1K; same x as this sweep's C48 1P1D at +10% y vs the old C48 front",
+   "gsm8k_strict": null,
+   "gpus": 40,
+   "ok": 16937,
+   "err": 5,
+   "span_min": 60.2,
+   "tput_per_gpu": 17131.9,
+   "p90_intvty": 290.27,
+   "p90_e2e_norm_intvty": 106.26,
+   "p90_e2el_s": 8.15,
+   "p90_ttft_s": 1.509,
+   "p50_ttft_s": 0.506
+  },
+  {
    "label": "C512",
    "run": "C512-a1093684",
    "topology": "1P1D hybrid: P and D each DP4 x (TP4+DCP4), EP16",

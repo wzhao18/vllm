@@ -1,0 +1,1 @@
+{"label": "C96 1P2D", "out": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/outputs/a1093473-llintg-c96-1p2d-wm05-spx-1114180602", "gpus": 40, "ok": 16937, "err": 5, "span_min": 60.2, "tput_per_gpu": 17131.9, "p90_itl_ms": 3.445, "p90_intvty": 290.27, "p90_e2e_norm_intvty": 106.26, "p90_e2el_s": 8.15, "p90_ttft_s": 1.509, "p50_ttft_s": 0.506}
