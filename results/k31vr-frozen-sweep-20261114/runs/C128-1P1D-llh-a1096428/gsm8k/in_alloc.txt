@@ -1,0 +1,5 @@
+alloc=1096428 run_id=a1096428-frz-c128-1p1d-llh-ev-xdr-1115025445 render=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/frz-c128-1p1d-llh-ev-xdr nodes=hecate0163,hecate0165,hecate0167,hecate0169,hecate0175,hecate0176 need=6 left=10682s start=2026-11-15T02:54:45-08:00
+exports=HOME=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/home,UV_CACHE_DIR=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/cache/uv-host,XDG_CACHE_HOME=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/cache/xdg-host,ENROOT_ROOTFS_WRITABLE=1
+memfix=1 cname=k31e2e-1096428-1115025322
+srtslurm=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/frz-c128-1p1d-llh-ev-xdr/srtslurm.yaml
+rc=0 end=2026-11-15T03:20:00-08:00
