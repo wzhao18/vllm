@@ -1,0 +1,320 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Ported from the source branch's tests/models/kimi_k3/test_megamoe_situ_patch.py for the SM107
+# specialized decode (vllm/models/kimi_k3/nvidia/specialized_decode/sm_107).
+"""Kimi K3.1 MegaMoE header patch (vllm/models/kimi_k3/nvidia/specialized_decode/sm_107/megamoe).
+
+CPU: the patch applies to the installed DeepGEMM header; the SM107 launcher's
+host-side mirror of DeepGEMM (FP32 BLOCK_M rule, float literals). GPU (>= 2 SM107
+GPUs, DeepGEMM): the SM107 decode's own build of the patched kernel
+(``megamoe.kernel.SituMegaMoE``) is bitwise identical to DeepGEMM's stock kernel and matches a PyTorch reference of the
+K3.1 routed experts (MXFP8 x MXFP4, SiTU alpha 4 / beta 25, FP8 L1 output) on
+EP-sharded problems with random top-16 routing. Two shapes: 4 experts per rank
+at 1/7/64 tokens per rank (every expert is hit), and 28 experts per rank (the EP32
+per-rank work) at 4/128/224 tokens per rank: at 4 tokens most experts receive no
+token (the K31_SKIP_ZERO_SEND path), and 128/224 tokens select BLOCK_M > 64. The
+launcher's template arguments equal the ones DeepGEMM's JIT used for the stock
+kernel (its cached kernel sources), the stock header compiled by the launcher gives
+DeepGEMM's SASS, and DeepGEMM keeps compiling its stock kernel after the SM107 build
+(no re-pointed include root).
+"""
+
+import importlib
+import os
+import socket
+from pathlib import Path
+
+import pytest
+import torch
+
+from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.megamoe.kernel import (
+    block_m_for,
+    float_literal,
+)
+from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.megamoe.situ_patch import (
+    FLAGS,
+    MARKER,
+    STOCK_HEADER,
+    PatchError,
+    patch_situ_header,
+)
+from vllm.platforms import current_platform  # noqa: E402
+
+# The SM107 specialized decode (specialized_decode/sm_107) serves VR200 only.
+_SM107_ONLY = pytest.mark.skipif(
+    not current_platform.is_device_capability((10, 7)),
+    reason="the SM107 specialized decode runs on compute capability 10.7 only",
+)
+pytestmark = _SM107_ONLY
+
+
+def _deep_gemm():
+    for name in ("deep_gemm", "vllm.third_party.deep_gemm"):
+        try:
+            return importlib.import_module(name)
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def _stock_header() -> Path | None:
+    dg = _deep_gemm()
+    if dg is None:
+        return None
+    p = Path(dg.__file__).resolve().parent / "include" / STOCK_HEADER
+    return p if p.is_file() else None
+
+
+def test_patch_applies_to_installed_header():
+    stock = _stock_header()
+    if stock is None:
+        pytest.skip("DeepGEMM with the SiTU MegaMoE header is not installed")
+    text = stock.read_text()
+    sched = stock.parents[1] / "scheduler" / "mega_moe.cuh"
+    out = patch_situ_header(text, scheduler_text=sched.read_text())
+    assert MARKER in out
+    for flag in FLAGS:
+        if flag == "K31_DECODE_SHAPED" and "bool kDecodeShaped" not in sched.read_text():
+            assert f"#define {flag} 0" in out
+            continue
+        assert f"#define {flag} 1" in out
+    assert "#define K31_DECODE_SHAPED 0" in patch_situ_header(text)  # no scheduler text
+    # Every stock path is kept under #else
+    assert out.count("ptx::atomic_add_sys(") == text.count("ptx::atomic_add_sys(")
+    assert "kBeforeDispatchPullBarrierTag" in out
+    assert "// Iterate over all token chunks" in out
+    off = patch_situ_header(text, {f: 0 for f in FLAGS})
+    assert "#define K31_BAR_ALL_CTAS 0" in off
+    with pytest.raises(PatchError):
+        patch_situ_header(out)
+    with pytest.raises(PatchError):
+        patch_situ_header(text.replace("// Count experts' tokens", "// counted"))
+
+
+def test_float_literal_matches_std_format_a():
+    """DeepGEMM's to_string(float): {sign}0x{:a}f, shortest hex of the FP32 value."""
+    assert float_literal(4.0) == "0x1p+2f"
+    assert float_literal(25.0) == "0x1.9p+4f"
+    assert float_literal(1.0) == "0x1p+0f"
+    assert float_literal(0.0) == "0x0p+0f"
+    assert float_literal(-0.5) == "-0x1p-1f"
+    assert float_literal(1.702) == "0x1.b3b646p+0f"  # FP32-rounded
+    with pytest.raises(ValueError):
+        float_literal(float("inf"))
+
+
+@pytest.mark.parametrize(
+    "ranks,experts,topk,tokens,want",
+    [
+        (16, 896, 16, 1, 16),  # 0.29 expected tokens per expert
+        (16, 896, 16, 64, 32),  # 18.3
+        (16, 896, 16, 128, 64),  # 36.6
+        (16, 896, 16, 512, 192),  # 146: one block, 158 covered
+        (4, 16, 16, 64, 192),  # 256 expected, 272 covered: two blocks of 192
+        (4, 112, 16, 224, 192),  # 128 expected, 139 covered: one block of 192
+    ],
+)
+def test_block_m_rule(ranks, experts, topk, tokens, want):
+    assert block_m_for(ranks, experts, topk, tokens) == want
+
+
+# ---------------------------------------------------------------------------- GPU
+HIDDEN, INTER, TOPK = 3584, 3072, 16
+ALPHA, BETA = 4.0, 25.0
+E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def _gpu_ok() -> bool:
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        return False
+    if torch.cuda.get_device_capability() != (10, 7):
+        return False
+    return _stock_header() is not None
+
+
+def _dequant_fp4(packed: torch.Tensor, sf: torch.Tensor) -> torch.Tensor:
+    """[n, k/2] int8 (low nibble first) x [n, k/32] float scales -> [n, k] float."""
+    lut = torch.tensor(E2M1, device=packed.device)
+    p = packed.view(torch.uint8).to(torch.int32)
+    codes = torch.stack((p & 0xF, p >> 4), dim=-1).flatten(-2)
+    vals = lut[codes & 7] * (1 - 2 * (codes >> 3)).float()
+    return vals * sf.repeat_interleave(32, dim=-1)
+
+
+def _quant_fp8_ue8m0(x: torch.Tensor) -> torch.Tensor:
+    """Per-32 MXFP8 (E4M3, power-of-two scale) quantize-dequantize."""
+    v = x.float().view(x.shape[0], -1, 32)
+    amax = v.abs().amax(-1, keepdim=True).clamp_min(1e-4)
+    sf = torch.pow(2.0, torch.ceil(torch.log2(amax / 448.0)))
+    return ((v / sf).to(torch.float8_e4m3fn).float() * sf).view_as(x)
+
+
+def _reference(xq, idx, tw, w1, w2):
+    """y[t] = sum_j tw[t, j] * expert_{idx[t, j]}(x[t]) with the kernel's roundings."""
+    y = torch.zeros(xq.shape[0], HIDDEN, device=xq.device)
+    for t in range(xq.shape[0]):
+        for j in range(TOPK):
+            e = int(idx[t, j])
+            h = w1[e] @ xq[t]
+            gate = h[:INTER].bfloat16().float()
+            up = h[INTER:].bfloat16().float()
+            g = ALPHA * torch.tanh(gate / ALPHA) * torch.sigmoid(gate)
+            act = g * BETA * torch.tanh(up / BETA) * tw[t, j]
+            a = _quant_fp8_ue8m0(act[None])[0]
+            y[t] += (w2[e] @ a).bfloat16().float()
+    return y
+
+
+def _code_sections(elf: bytes) -> dict[str, bytes]:
+    """The ``.text.*`` sections of an ELF64 cubin, by name."""
+    import struct
+
+    shoff, = struct.unpack_from("<Q", elf, 0x28)
+    shentsize, shnum, shstrndx = struct.unpack_from("<HHH", elf, 0x3A)
+    heads = [struct.unpack_from("<IIQQQQIIQQ", elf, shoff + i * shentsize) for i in range(shnum)]
+    names = heads[shstrndx]
+
+    def name(off):
+        start = names[4] + off
+        return elf[start:elf.index(b"\0", start)].decode()
+
+    return {name(h[0]): elf[h[4]:h[4] + h[5]] for h in heads if name(h[0]).startswith(".text")}
+
+
+def _worker(rank: int, nranks: int, port: int, cache: str, epr: int, cases: tuple, out: dict):
+    os.environ["DG_JIT_CACHE_DIR"] = str(Path(cache) / "dg_jit")
+    import torch.distributed as dist
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.sm_107.megamoe import kernel as mk
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        "nccl", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=nranks,
+        device_id=torch.device(f"cuda:{rank}"),
+    )
+    group = dist.new_group(list(range(nranks)))
+    dg = _deep_gemm()
+    utils = importlib.import_module(dg.__name__ + ".utils")
+    num_experts = epr * nranks
+    g = torch.Generator(device="cuda").manual_seed(1234)  # same weights on every rank
+
+    def cast(n, k):
+        bf = 0.05 * torch.randn((num_experts, n, k), device="cuda", generator=g)
+        w = torch.empty((num_experts, n, k // 2), device="cuda", dtype=torch.int8)
+        sf = torch.empty((num_experts, n, k // 32), device="cuda", dtype=torch.float)
+        for e in range(num_experts):
+            w[e], sf[e] = utils.per_token_cast_to_fp4(bf[e].bfloat16(), use_ue8m0=True, gran_k=32)
+        deq = torch.stack([_dequant_fp4(w[e], sf[e]) for e in range(num_experts)])
+        lo = rank * epr
+        local = (w[lo:lo + epr].contiguous(),
+                 dg.transform_sf_into_required_layout(sf[lo:lo + epr].contiguous(), n, k, (1, 32), epr))
+        return local, deq
+
+    l1, w1_ref = cast(2 * INTER, HIDDEN)
+    l2, w2_ref = cast(HIDDEN, INTER)
+    l1, l2 = dg.transform_weights_for_mega_moe(l1, l2, activation="situ")
+
+    buf = dg.get_symm_buffer_for_mega_moe(group, num_experts, max(cases), TOPK, HIDDEN, INTER,
+                                          mma_type="fp8xfp4", activation="situ")
+    data = {}
+    for t in cases:
+        gr = torch.Generator(device="cuda").manual_seed(100 * t + rank)
+        x = torch.randn((t, HIDDEN), device="cuda", generator=gr).bfloat16()
+        idx = torch.randn((t, num_experts), device="cuda", generator=gr).topk(TOPK, -1).indices
+        tw = torch.rand((t, TOPK), device="cuda", generator=gr) + 0.1
+        tw = tw / tw.sum(-1, keepdim=True)
+        data[t] = (x, idx, tw)
+    # Coverage of the shapes this test claims: experts with no token (skip-zero send) and BLOCK_M.
+    zero_experts = {}
+    for t in cases:
+        allidx = [torch.empty_like(data[t][1]) for _ in range(nranks)]
+        dist.all_gather(allidx, data[t][1], group=group)
+        hits = torch.bincount(torch.cat(allidx).flatten(), minlength=num_experts)
+        zero_experts[t] = int((hits == 0).sum())
+    block_m = {t: (dg.get_block_m_for_mega_moe(nranks, num_experts, buf.num_max_tokens_per_rank, t, TOPK,
+                                               "fp8xfp4") if hasattr(dg, "get_block_m_for_mega_moe") else None)
+               for t in cases}
+
+    situ = mk.SituMegaMoE(dg, Path(cache) / "sm107")
+
+    def run(t, w1=None, w2=None, launcher=None):
+        x, idx, tw = data[t]
+        xf, xs = utils.per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+        buf.x[:t].copy_(xf)
+        buf.x_sf[:t].copy_(xs)
+        buf.topk_idx[:t].copy_(idx)
+        buf.topk_weights[:t].copy_(tw)
+        y = torch.empty((t, HIDDEN), device="cuda", dtype=torch.bfloat16)
+        (launcher or dg.fp8_fp4_mega_moe)(
+            y, w1 or l1, w2 or l2, buf, activation="situ", activation_clamp=None,
+            fast_math=True, activation_alpha=ALPHA, activation_beta=BETA)
+        torch.cuda.synchronize()
+        dist.barrier(group)
+        return y
+
+    stock = {t: run(t) for t in cases}
+    for _ in range(3):  # repeated launches exercise the barrier phase / counters across launches
+        patched = {t: run(t, launcher=situ) for t in cases}
+        for t in cases:
+            assert torch.equal(patched[t], stock[t]), (rank, t)
+    # DeepGEMM untouched: its stock kernel still runs (and matches) after the SM107 build.
+    for t in cases:
+        assert torch.equal(run(t), stock[t]), ("stock after sm107", rank, t)
+    dg_sources = {p.read_text() for p in (Path(cache) / "dg_jit" / "cache").glob(
+        "sm100_fp8_fp4_mega_moe_situ.*/kernel.cu")}
+    assert dg_sources
+    # The launcher's template arguments are DeepGEMM's (its JIT sources of these shapes).
+    for t in cases:
+        ring, sf_ring = buf.l1_acts.size(0), buf.l1_acts_sf.size(0)
+        cfg = mk.situ_config(nranks, num_experts, t, TOPK, HIDDEN, ring, sf_ring)
+        src = mk.instantiation(cfg, buf.num_max_tokens_per_rank, HIDDEN, INTER, num_experts, 0,
+                               TOPK, dg.get_num_sms(), nranks, ALPHA, BETA, True, l1[0].dtype)
+        assert any(src in s for s in dg_sources), (rank, t, cfg)
+    if rank == 0:
+        # Same NVCC command: the stock header built by the launcher is DeepGEMM's cubin.
+        t = cases[-1]
+        cfg = mk.situ_config(nranks, num_experts, t, TOPK, HIDDEN, buf.l1_acts.size(0),
+                             buf.l1_acts_sf.size(0))
+        src = mk.instantiation(cfg, buf.num_max_tokens_per_rank, HIDDEN, INTER, num_experts, 0,
+                               TOPK, dg.get_num_sms(), nranks, ALPHA, BETA, True, l1[0].dtype)
+        ours = mk.build(src, (mk._dg_include(dg.__file__),), rank, str(Path(cache) / "stock_build"))
+        theirs = next(p.parent / "kernel.cubin" for p in (Path(cache) / "dg_jit" / "cache").glob(
+            "sm100_fp8_fp4_mega_moe_situ.*/kernel.cu") if src in p.read_text())
+        # Same machine code: equal executable sections (cuobjdump cannot dump an sm_100f cubin;
+        # the files differ in embedded build paths).
+        a, b = _code_sections(ours.read_bytes()), _code_sections(theirs.read_bytes())
+        assert a and a == b, (sorted(a), sorted(b))
+    for t in cases:
+        x, idx, tw = data[t]
+        xq = utils.per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32)
+        xq = xq[0].float() * xq[1].repeat_interleave(32, dim=-1)
+        ref = _reference(xq, idx, tw, w1_ref, w2_ref)
+        err = (patched[t].float() - ref).norm() / ref.norm()
+        print(f"rank {rank} experts/rank {epr} tokens {t} block_m {block_m[t]} zero-token experts "
+              f"{zero_experts[t]}/{num_experts}: patched == stock "
+              f"bitwise, rel. L2 error vs reference "
+              f"{float(err):.2e}")
+        assert err < 2e-2, (rank, t, float(err))
+        out[(rank, t)] = (float(err), zero_experts[t], block_m[t])
+    buf.destroy()
+    dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not _gpu_ok(), reason="needs >= 2 SM107 GPUs and DeepGEMM")
+@pytest.mark.parametrize("epr,cases", [(4, (1, 7, 64)), (28, (4, 128, 224))], ids=["e4", "e28"])
+def test_patched_kernel_bitwise_and_reference(tmp_path, epr, cases):
+    nranks = min(4, torch.cuda.device_count())
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    os.environ.setdefault("VLLM_CACHE_ROOT", str(tmp_path / "vllm_cache"))
+    mgr = torch.multiprocessing.Manager()
+    out = mgr.dict()
+    torch.multiprocessing.spawn(_worker, args=(nranks, port, str(tmp_path / "cache"), epr, cases, out),
+                                nprocs=nranks)
+    assert len(out) == nranks * len(cases)
+    if epr == 28:
+        # the small case leaves experts without tokens; the large ones run BLOCK_M > 64
+        assert out[(0, cases[0])][1] > 0
+        bms = [out[(0, t)][2] for t in cases[1:]]
+        assert None in bms or max(bms) > 64, bms

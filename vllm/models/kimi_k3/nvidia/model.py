@@ -11,6 +11,7 @@ from torch import nn
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
+from vllm.config.kernel import NATIVE_MEGA_MOE_BACKENDS, KIMI_K3_MEGA_MOE
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
@@ -125,7 +126,9 @@ from ..common.mm_preprocess import (
     KimiK3MultiModalProcessor,
     KimiK3ProcessingInfo,
 )
-from .specialized_decode.runtime import specialized_decode_config
+# On SM107 (Rubin) latency_specialized selects the specialized_decode.sm_107
+# decode; everywhere else this returns specialized_decode.runtime's config.
+from .specialized_decode.sm_107 import specialized_decode_config
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.model_states.interface import ModelState
@@ -171,9 +174,21 @@ def can_shard_sequence_parallel_shared_expert(vllm_config: VllmConfig) -> bool:
     all-gather/partial-GEMM/reduce-scatter implementation.
     """
     return (
-        vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+        vllm_config.kernel_config.moe_backend in NATIVE_MEGA_MOE_BACKENDS
         or vllm_config.parallel_config.all2all_backend == "deepep_v2"
     )
+
+
+def mega_moe_experts_cls(vllm_config: VllmConfig) -> type[nn.Module]:
+    """The routed-experts module of the native MegaMoE backend: DeepGEMM MegaMoE, or
+    on ``kimi_k3_mega_moe`` the same interface on the Rubin (SM107) kernels (raises
+    off SM107), with its own MXFP8 x MXFP4 / exact NVFP4 policy per tokens per
+    rank."""
+    if vllm_config.kernel_config.moe_backend == KIMI_K3_MEGA_MOE:
+        from .megamoe_rubin.experts import KimiK3MegaMoEExperts
+
+        return KimiK3MegaMoEExperts
+    return DeepGemmMegaMoEExperts
 
 
 def maybe_init_gemm_rs_ar(vllm_config: VllmConfig, use_sequence_parallel: bool) -> bool:
@@ -401,8 +416,10 @@ class KimiMoE(nn.Module):
         self.moe_router_activation_func = config.moe_router_activation_func
         self.num_shared_experts = config.num_shared_experts
         self.layer_idx = layer_idx
+        # Native MegaMoE (DeepGEMM, or Rubin on SM107): the router, latent
+        # projections and shared expert run here, the experts in one launch.
         self.use_mega_moe = (
-            vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+            vllm_config.kernel_config.moe_backend in NATIVE_MEGA_MOE_BACKENDS
         )
         if self.use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:
             raise NotImplementedError(
@@ -530,7 +547,7 @@ class KimiMoE(nn.Module):
             if use_sequence_parallel:
                 # The layer only sees this rank's shard of the batch.
                 max_num_tokens = cdiv(max_num_tokens, self.tp_size)
-            self.experts = DeepGemmMegaMoEExperts(
+            self.experts = mega_moe_experts_cls(vllm_config)(
                 vllm_config,
                 max_num_tokens=max_num_tokens,
                 num_experts=num_experts,
@@ -714,7 +731,7 @@ class KimiDecoderLayer(nn.Module):
             and layer_idx % config.moe_layer_freq == 0
         )
 
-        use_mega_moe = vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+        use_mega_moe = vllm_config.kernel_config.moe_backend in NATIVE_MEGA_MOE_BACKENDS
         self.use_sequence_parallel = (
             parallel_config.pipeline_parallel_size == 1
             and parallel_config.enable_expert_parallel
@@ -992,7 +1009,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         self.attn_res_block_size: int | None = config.attn_res_block_size
         self.use_attn_res = self.attn_res_block_size is not None
         parallel_config = vllm_config.parallel_config
-        use_mega_moe = vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+        use_mega_moe = vllm_config.kernel_config.moe_backend in NATIVE_MEGA_MOE_BACKENDS
         self.use_sequence_parallel = (
             parallel_config.pipeline_parallel_size == 1
             and parallel_config.enable_expert_parallel
@@ -1539,6 +1556,10 @@ class KimiLinearForCausalLM(
         self.needs_norm_in_logits = True
 
     def build_specialized_decode(self) -> None:
+        build = getattr(self.specialized_decode_config, "build", None)
+        if build is not None:  # the SM107 decode builds itself
+            build(self)
+            return
         from .specialized_decode.runtime.decode import SpecializedDecode
 
         self.specialized_decode = SpecializedDecode(
@@ -1551,6 +1572,9 @@ class KimiLinearForCausalLM(
         self.needs_norm_in_logits = False
 
     def get_model_state_cls(self) -> "type[ModelState]":
+        state_cls = getattr(self.specialized_decode_config, "model_state_cls", None)
+        if state_cls is not None:  # the SM107 decode's model state
+            return state_cls
         from .model_state import KimiK3ModelState
 
         return KimiK3ModelState
@@ -1648,6 +1672,12 @@ class KimiLinearForCausalLM(
             for module in self.model.modules():
                 if isinstance(module, KimiK3DSAAttention):
                     module.pack_projections()
+        # Rubin MegaMoE (kimi_k3_mega_moe): kernel-layout experts (each module's own
+        # hook already converted them; idempotent) + the EP group's collective
+        # warmup, before any forward (profile run, CUDA graph capture).
+        from .megamoe_rubin.experts import prepare_rubin_megamoe
+
+        prepare_rubin_megamoe(self.model)
         if self.specialized_decode is not None:
             self.specialized_decode.process_weights_after_loading()
 
