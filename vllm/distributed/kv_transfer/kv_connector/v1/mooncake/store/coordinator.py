@@ -20,6 +20,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     SingleTypeKVCacheManager,
+    SlidingWindowManager,
 )
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -222,6 +223,17 @@ class MooncakeStoreCoordinator:
             )
             for group in attention_groups
             if group.use_eagle and not isinstance(group.spec, MambaSpec)
+            for gid in group.group_ids
+        }
+        # Sliding-window groups: the blocks a hit at a boundary needs, ending
+        # on the block before it (with EAGLE, on the block past it).
+        self.window_tail_blocks = {
+            gid: SlidingWindowManager._contiguous_blocks_for_hit(
+                group.spec.sliding_window, group.spec.block_size, group.use_eagle
+            )
+            for group in attention_groups
+            if isinstance(group.spec, SlidingWindowSpec)
+            and issubclass(group.manager_cls, SlidingWindowManager)
             for gid in group.group_ids
         }
 
