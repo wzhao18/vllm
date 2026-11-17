@@ -1613,6 +1613,17 @@ class GqaDraftFastPath(DraftFastPath):
                 prepared.persistent,
             )
 
+        # The context step's K/V GEMM runs on the fused K/V weight of every layer
+        # (``_build_fused_kv_buffers``, built before this build wraps the qkv
+        # projections: ``K3GqaDSparkForCausalLM.process_weights_after_loading``).
+        # Without it the stock step projects every layer's whole qkv over the context
+        # rows (5 GEMMs + split-K reduces + a stack instead of one).
+        if getattr(inner, "_fused_kv_weight", None) is None:
+            fail(
+                "DSpark drafter context K/V projection",
+                "no fused K/V weight (the context buffers are not built or the qkv "
+                "projections are not unquantized)",
+            )
         installed = install_gqa_projections(model, tp, query_rows, context_rows, rank)
         if installed:
             logger.info_once(

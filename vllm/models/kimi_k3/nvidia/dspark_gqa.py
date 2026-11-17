@@ -19,6 +19,9 @@ Differences from the stock class (the same math; summation order aside):
     over the TP group from 256 rows per rank (P/D prefill instances' 16K chunks).
   * The forward is not torch.compiled (``ignore_torch_compile``): its specialized
     pieces run inside the DSpark speculator's FULL graphs, as the preview's.
+  * The context K/V buffers (the fused K/V weight of every layer) are built before
+    the specialized pieces wrap the qkv projections, also when the load skipped
+    ``load_weights`` (dummy weights), where the stock class builds them lazily.
 
 ``configure_dense_draft`` (dense_draft.py) routes a speculators ``dspark``
 checkpoint (``Qwen3DSparkModel``) on a Kimi K3.1 target to this class.
@@ -44,6 +47,7 @@ from vllm.model_executor.models.qwen3_dspark import (
     Qwen3DSparkModel,
 )
 from vllm.model_executor.models.utils import maybe_prefix
+from vllm.model_executor.utils import weights_already_processed
 from vllm.models.common.ops.fused_allreduce_rms_norm import fused_allreduce_rms_norm
 from vllm.models.common.ops.sequence_parallel import sp_all_gather
 from vllm.models.kimi_k3.nvidia.dspark_mla import (
@@ -378,6 +382,14 @@ class K3GqaDSparkForCausalLM(Qwen3DSparkForCausalLM):
             GqaDraftFastPath,
         )
 
+        if not hasattr(self.model, "_num_attn_layers"):
+            # The context step's fused K/V buffers: the stock class builds them in
+            # load_weights, which a dummy-weight load skips; its lazy build (first
+            # context step) would come after the fast path wraps the qkv projections
+            # and miss the fused K/V weight (every layer's whole qkv GEMM over the
+            # context rows). Built here as the lazy build does, before the fast path.
+            with weights_already_processed():
+                self.model._build_fused_kv_buffers()
         if switched := enable_kimi_k3_mxfp8_dispatch(self):
             logger.info_once(
                 "Kimi K3.1 GQA DSpark drafter: %d online MXFP8 linears use the CuTe "
