@@ -86,7 +86,8 @@ def spec_of(cfg: dict, role: str) -> dict:
     return json.loads(cfg["roles"][role]["args"]["speculative-config"])
 
 
-def check_render(src: str, dst: str, base: str, kind: str, prefix: str, backend: str, tree: str | None) -> dict:
+def check_render(src: str, dst: str, base: str, kind: str, prefix: str, backend: str, tree: str | None,
+                 weights: tuple[str, str] | None = None) -> dict:
     name = os.path.basename(dst)
     sname = os.path.basename(src)
     print(f"\n== {name}  (source {sname})")
@@ -106,7 +107,13 @@ def check_render(src: str, dst: str, base: str, kind: str, prefix: str, backend:
         if f == "render/git_state.txt":
             exp = a.replace(f"  - extra_mount:{G.PREVIEW_MNT}:ro: {G.PREVIEW_HOST}\n",
                             f"  - extra_mount:{G.RELEASE_MNT}:ro: {G.RELEASE_HOST}\n")
-            ok(b == exp and exp != a, f"{name}: {f} = source with the draft mount line swapped")
+            if weights is not None:
+                exp = exp.replace(f"  - extra_mount:{G.TEST_WEIGHTS}:ro: {G.TEST_WEIGHTS}\n",
+                                  f"  - extra_mount:{weights[0]}:ro: {weights[0]}\n")
+            ok(b == exp and exp != a, f"{name}: {f} = source with the draft (and target weights) mount lines swapped")
+        elif f == "srtslurm.yaml" and weights is not None:
+            exp = G.rename(a, base, prefix)[0].replace(G.TEST_VIEW, weights[1])
+            ok(b == exp and a.count(G.TEST_VIEW) == 3, f"{name}: {f} = source with the model view -> {weights[1]}")
         elif f == "golden-acceptance.json":
             continue
         elif f == "AL_FIX.txt":
@@ -126,7 +133,7 @@ def check_render(src: str, dst: str, base: str, kind: str, prefix: str, backend:
     cfg_old = yaml.safe_load(open(f"{src}/render/config.yaml"))
     for f in ("render/config.yaml", "hybrid.yaml"):
         diffs = G.yaml_diff(open(f"{src}/{f}").read(), open(f"{dst}/{f}").read(), base, prefix)
-        bad = G.check_diff(diffs, tree or G.FROZEN_TREE)
+        bad = G.check_diff(diffs, tree or G.FROZEN_TREE, weights)
         ok(not bad, f"{name}: {f} parsed diff = {len(diffs)} keys, all draft keys ({'; '.join(bad)[:400]})")
         t = open(f"{dst}/{f}").read()
         ok("kimi-k3.1-pro-dspark-preview" not in t and "TOKENSPEED_MLA" not in t, f"{name}: {f} has no preview draft / TOKENSPEED_MLA")
@@ -181,7 +188,7 @@ def check_pair(src_a: str, src_e: str, dst_a: str, dst_e: str, base: str, prefix
            f"{name} / -ev {k.split('.')[2]}: agentx -> gsm8k = synthetic -> block, AL dropped ({moved})")
 
 
-def check_mounts(dst: str) -> None:
+def check_mounts(dst: str, weights: tuple[str, str] | None = None) -> None:
     from pathlib import Path
 
     from srtctl.core.config import load_config
@@ -200,7 +207,12 @@ def check_mounts(dst: str) -> None:
     rt = RuntimeContext.from_config(c, "1", Path(f"/tmp/chk-dsrel-{os.getuid()}/{name}"))
     m = {str(h): str(t) for h, t in rt.container_mounts.items()}
     tgt = {t.split(":")[0]: (h, t) for h, t in m.items()}
-    ok(tgt.get("/model", ("",))[0] == MODEL_VIEW, f"{name}: /model <- {tgt.get('/model', ('-',))[0]}")
+    view = weights[1] if weights is not None else MODEL_VIEW
+    ok(tgt.get("/model", ("",))[0] == view, f"{name}: /model <- {tgt.get('/model', ('-',))[0]} (want {view})")
+    if weights is not None:
+        w = tgt.get(weights[0])
+        ok(w is not None and w[0] == weights[0] and w[1].endswith(":ro"), f"{name}: target weights {weights[0]} mounted ro")
+        ok(G.TEST_WEIGHTS not in m, f"{name}: test weights not mounted")
     rel = tgt.get(G.RELEASE_MNT)
     ok(rel is not None and rel[0] == G.RELEASE_HOST and rel[1].endswith(":ro"), f"{name}: draft {G.RELEASE_HOST} -> {rel and rel[1]}")
     ok(G.PREVIEW_MNT not in tgt and G.PREVIEW_HOST not in m, f"{name}: preview draft not mounted")
@@ -294,11 +306,14 @@ def main(argv=None) -> int:
     ap.add_argument("--fabrics", default=",".join(G.FABRICS))
     ap.add_argument("--kinds", default=",".join(G.KINDS))
     ap.add_argument("--prefix", default="dsrel")
-    ap.add_argument("--draft-attn-backend", default="FLASHINFER", choices=G.BACKENDS)
+    ap.add_argument("--draft-attn-backend", default="FLASH_ATTN", choices=G.BACKENDS)
     ap.add_argument("--tree", default=G.FROZEN_TREE, help="the tree gen_dsrel.py was given")
     ap.add_argument("--scratch", default=f"{G.W}/dsrel/cfg/scratch")
     ap.add_argument("--no-render", action="store_true", help="skip the srtctl render step")
+    ap.add_argument("--target-weights", default=None, metavar="WEIGHTS_DIR,MODEL_VIEW",
+                    help="the --target-weights gen_dsrel.py was given")
     a = ap.parse_args(argv)
+    weights = tuple(os.path.normpath(x) for x in a.target_weights.split(",")) if a.target_weights else None
     # refusing stubs first on PATH: nothing this checker runs (srtctl render, RuntimeContext) may call Slurm
     stubs = f"{a.scratch}/slurm-stubs"
     os.makedirs(stubs, exist_ok=True)
@@ -323,9 +338,10 @@ def main(argv=None) -> int:
                 dst = f"{G.RS}/{G.dst_name(a.prefix, base, kind, fab)}"
                 if not ok(os.path.isdir(dst), f"{dst} exists"):
                     continue
-                info = check_render(src, dst, base, kind, a.prefix, a.draft_attn_backend, os.path.normpath(a.tree))
+                info = check_render(src, dst, base, kind, a.prefix, a.draft_attn_backend, os.path.normpath(a.tree),
+                                    weights)
                 trees.add(info["tree"])
-                check_mounts(dst)
+                check_mounts(dst, weights)
                 if not a.no_render:
                     check_render_cli(src, dst, base, a.prefix, a.scratch)
                 got[kind] = (src, dst)

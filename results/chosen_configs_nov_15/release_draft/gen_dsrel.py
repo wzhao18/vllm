@@ -10,7 +10,8 @@ and changes ONLY:
      becomes                 <deps>/kimi-k3.1-pro-dspark-e4e6e626:/raid/common-models/kimi-k3.1-pro-dspark:ro
      and "model" in the speculative-config of the prefill AND the decode role becomes /raid/common-models/kimi-k3.1-pro-dspark.
   2. Draft attention backend: "attention_backend": "TOKENSPEED_MLA" (an MLA backend: it raises for the GQA sliding-window
-     draft) becomes --draft-attn-backend (default FLASHINFER; "auto" drops the key, then configure_dense_draft picks
+     draft) becomes --draft-attn-backend (default FLASH_ATTN: 1024-token draft blocks; FLASHINFER forces 64-token
+     blocks under BLHNC and fails startup with 128-token prefix matching, DSREL_NOTES.md; "auto" drops the key, then configure_dense_draft picks
      FLASH_ATTN). One value for both roles: P writes the draft KV, NIXL moves it, D reads it, so both use one KV layout.
   3. AgentX renders: synthetic_acceptance_length becomes the release golden AL for the render's k (RELEASE_AL), and
      golden-acceptance.json and AL_FIX.txt record it. gsm8k twins keep real rejection and golden-acceptance null.
@@ -66,6 +67,11 @@ RELEASE_MNT = "/raid/common-models/kimi-k3.1-pro-dspark"
 RELEASE_ID = "Inferact/Kimi-K3.1-Pro-DSpark @ e4e6e6261e9f8b6d5f249f9627eb6b109d762d5f"
 RELEASE_SHA256 = "83a4f35d3a68fe69275b548a0658f687b5bddaf48f8201f999ef81b538f1fb5f"
 FROZEN_TREE = f"{W}/hti/lowlat/trees/ll-integ-dea4ebd06f"
+# Target weights of the frozen sweep: the K3.1 test checkpoint behind the Dynamo model view (model_type kimi_k3) that
+# srtslurm.yaml maps the model aliases to (mounted at /model); the view symlinks into the checkpoint dir, which the
+# configs mount read-only at its own path. --target-weights moves all four references to another checkpoint + view.
+TEST_WEIGHTS = "/lustre/fsw/coreai_comparch_inferencex/weizha/models/kimi-k3.1/rainhollow-test-weights-1024_v1"
+TEST_VIEW = f"{W}/e2e/model-view/kimi-k3.1-k3type"
 
 # InferenceX golden AL tables (probabilistic draft sampling, block verification, thinking_on, SPEED-Bench coding).
 RELEASE_AL = {1: 1.86, 2: 2.56, 3: 3.08, 4: 3.46, 5: 3.81, 6: 4.00, 7: 4.16}
@@ -165,7 +171,8 @@ def edit_spec(js: str, kind: str, backend: str, record: bool = False) -> tuple[s
                      rejection=d["rejection_sample_method"])
 
 
-def edit_yaml(text: str, kind: str, backend: str, tree: str, record: bool = False) -> tuple[str, dict]:
+def edit_yaml(text: str, kind: str, backend: str, tree: str, record: bool = False,
+              weights: tuple[str, str] | None = None) -> tuple[str, dict]:
     specs = SPEC_RE.findall(text)
     need(len(specs) == 2, f"{len(specs)} speculative-config lines (want prefill + decode)")
     need(specs[0][1] == specs[1][1], "prefill and decode speculative-configs differ in the source")
@@ -188,6 +195,11 @@ def edit_yaml(text: str, kind: str, backend: str, tree: str, record: bool = Fals
         text, n = PYPATH_RE.subn(
             lambda m: m.group(1) + ":".join(tree if e == FROZEN_TREE else e for e in m.group(2).split(":")), text)
         need(text.count(tree) == 2 and FROZEN_TREE not in text, "tree swap did not hit exactly the 2 role PYTHONPATHs")
+    if weights is not None:
+        old_w = f"- {TEST_WEIGHTS}:{TEST_WEIGHTS}:ro\n"
+        need(text.count(old_w) == 1, f"target weights extra_mount line found {text.count(old_w)}x")
+        text = text.replace(old_w, f"- {weights[0]}:{weights[0]}:ro\n")
+        need(TEST_WEIGHTS not in text, "test weights still referenced in the config")
     for bad in ("kimi-k3.1-pro-dspark-preview", "TOKENSPEED_MLA"):
         need(bad not in text, f"{bad} still in the config")
     info["tree"] = tree
@@ -217,7 +229,7 @@ def yaml_diff(src_text: str, dst_text: str, base: str, prefix: str) -> list[tupl
             if a.get(k, "<absent>") != b.get(k, "<absent>")]
 
 
-def check_diff(diffs, tree: str) -> list[str]:
+def check_diff(diffs, tree: str, weights: tuple[str, str] | None = None) -> list[str]:
     """The parsed diff may contain only the draft keys (and the role PYTHONPATHs when the tree moves)."""
     ok_keys = {".roles.prefill.args.speculative-config", ".roles.decode.args.speculative-config"}
     if tree != FROZEN_TREE:
@@ -234,6 +246,9 @@ def check_diff(diffs, tree: str) -> list[str]:
         elif re.fullmatch(r"\.extra_mount\[\d+\]", k) and (a, b) == (
                 f"{PREVIEW_HOST}:{PREVIEW_MNT}:ro", f"{RELEASE_HOST}:{RELEASE_MNT}:ro"):
             seen.add(".extra_mount")
+        elif weights is not None and re.fullmatch(r"\.extra_mount\[\d+\]", k) and (a, b) == (
+                f"{TEST_WEIGHTS}:{TEST_WEIGHTS}:ro", f"{weights[0]}:{weights[0]}:ro"):
+            pass
         else:
             bad.append(f"{k}: {str(a)[:120]!r} -> {str(b)[:120]!r}")
     for k in sorted((ok_keys | {".extra_mount"}) - seen):
@@ -254,7 +269,7 @@ def in_progress_runs(name: str) -> list[str]:
 
 
 def derive(src: str, dst: str, *, base: str, prefix: str, kind: str, fab: str, backend: str, tree: str,
-           stamp: str, gen_md5: str, replace: bool, hecate: bool) -> dict:
+           stamp: str, gen_md5: str, replace: bool, hecate: bool, weights: tuple[str, str] | None = None) -> dict:
     need(os.path.isdir(src), f"missing source render {src}")
     sname, dname = frz_name(base, kind, fab), dst_name(prefix, base, kind, fab)
     if os.path.exists(dst):
@@ -267,7 +282,7 @@ def derive(src: str, dst: str, *, base: str, prefix: str, kind: str, fab: str, b
     shutil.copytree(src, tmp, symlinks=True)
     try:
         info = _derive_in_place(tmp, src, base=base, prefix=prefix, kind=kind, sname=sname, dname=dname,
-                                backend=backend, tree=tree, stamp=stamp, gen_md5=gen_md5)
+                                backend=backend, tree=tree, stamp=stamp, gen_md5=gen_md5, weights=weights)
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
@@ -281,7 +296,8 @@ def derive(src: str, dst: str, *, base: str, prefix: str, kind: str, fab: str, b
     return info
 
 
-def _derive_in_place(d: str, src: str, *, base, prefix, kind, sname, dname, backend, tree, stamp, gen_md5) -> dict:
+def _derive_in_place(d: str, src: str, *, base, prefix, kind, sname, dname, backend, tree, stamp, gen_md5,
+                     weights=None) -> dict:
     files = sorted(os.path.relpath(os.path.join(r, f), d) for r, _, fs in os.walk(d) for f in fs)
     need(not any(os.path.islink(os.path.join(d, f)) for f in files), "symlink in the source render")
     for f in ("hybrid.yaml", "render/config.yaml", "render/sbatch_script.sh", "render/render.json",
@@ -309,10 +325,10 @@ def _derive_in_place(d: str, src: str, *, base, prefix, kind, sname, dname, back
          "render.json script is not this render's")
     # configs: render/config.yaml is what runs (sbatch_script.sh stages render/*.yaml; run_in_alloc.sh copies it);
     # hybrid.yaml is srtctl's recipe record, which in most frozen renders predates later render/config.yaml edits
-    new, info = edit_yaml(open(f"{d}/render/config.yaml").read(), kind, backend, tree)
+    new, info = edit_yaml(open(f"{d}/render/config.yaml").read(), kind, backend, tree, weights=weights)
     with open(f"{d}/render/config.yaml", "w") as fh:
         fh.write(new)
-    new_hy, info_hy = edit_yaml(open(f"{d}/hybrid.yaml").read(), kind, backend, tree, record=True)
+    new_hy, info_hy = edit_yaml(open(f"{d}/hybrid.yaml").read(), kind, backend, tree, record=True, weights=weights)
     need(info_hy["k"] == info["k"], f"hybrid.yaml k={info_hy['k']} != render/config.yaml k={info['k']}")
     with open(f"{d}/hybrid.yaml", "w") as fh:
         fh.write(new_hy)
@@ -321,8 +337,21 @@ def _derive_in_place(d: str, src: str, *, base, prefix, kind, sname, dname, back
     g = open(gp).read()
     old_l, new_l = f"  - extra_mount:{PREVIEW_MNT}:ro: {PREVIEW_HOST}\n", f"  - extra_mount:{RELEASE_MNT}:ro: {RELEASE_HOST}\n"
     need(g.count(old_l) == 1, "git_state.txt draft mount line not found once")
+    g = g.replace(old_l, new_l)
+    if weights is not None:
+        old_w = f"  - extra_mount:{TEST_WEIGHTS}:ro: {TEST_WEIGHTS}\n"
+        need(g.count(old_w) == 1, "git_state.txt target weights mount line not found once")
+        g = g.replace(old_w, f"  - extra_mount:{weights[0]}:ro: {weights[0]}\n")
     with open(gp, "w") as fh:
-        fh.write(g.replace(old_l, new_l))
+        fh.write(g)
+    # srtslurm.yaml: the model aliases and the /model mount name the target's model view
+    if weights is not None:
+        sp = f"{d}/srtslurm.yaml"
+        need(os.path.exists(sp), "render lacks srtslurm.yaml")
+        t = open(sp).read()
+        need(t.count(TEST_VIEW) == 3, f"srtslurm.yaml names the test model view {t.count(TEST_VIEW)}x (want 2 aliases + mount)")
+        with open(sp, "w") as fh:
+            fh.write(t.replace(TEST_VIEW, weights[1]))
     # AL records
     k, al = info["k"], info["al"]
     ga = json.load(open(f"{d}/golden-acceptance.json"))
@@ -339,7 +368,7 @@ def _derive_in_place(d: str, src: str, *, base, prefix, kind, sname, dname, back
     diffs = yaml_diff(open(f"{src}/render/config.yaml").read(), new, base, prefix)
     diffs_hy = yaml_diff(open(f"{src}/hybrid.yaml").read(), new_hy, base, prefix)
     for f, dd in (("render/config.yaml", diffs), ("hybrid.yaml", diffs_hy)):
-        bad = check_diff(dd, tree) if dd is not None else []
+        bad = check_diff(dd, tree, weights) if dd is not None else []
         need(not bad, f"{f}: unexpected parsed differences: " + "; ".join(bad))
     rt = re.findall(r"^AIPERF_RUNTIME_DIR=(.*)$", open(f"{d}/workflow.env.resolved").read(), re.M)
     bare = sorted({f for f in files if not f.endswith(PROVENANCE_SUFFIXES)
@@ -359,7 +388,9 @@ def _derive_in_place(d: str, src: str, *, base, prefix, kind, sname, dname, back
             f"  hybrid.yaml (srtctl's recipe record; render/config.yaml is what runs): the same draft edits; its "
             f"speculative-config is {info_hy['rejection']}"
             + (f", AL {info_hy['old_al']} -> {info_hy['al']}" if info_hy["rejection"] == "synthetic" else "") + "\n"
-            f"  tree (prefill + decode PYTHONPATH): {tree}"
+            + (f"  target weights: {weights[0]} (model view {weights[1]} at /model); was {TEST_WEIGHTS} "
+               f"(view {TEST_VIEW})\n" if weights is not None else "")
+            + f"  tree (prefill + decode PYTHONPATH): {tree}"
             + (" (frozen tree, unchanged: no release-draft support; regenerate with --tree <integrated tree> before a "
                "launch)" if tree == FROZEN_TREE else f" (was {FROZEN_TREE})") + "\n"
             f"  renamed {sname} -> {dname} in: "
@@ -388,12 +419,16 @@ def main(argv=None) -> int:
     ap.add_argument("--points", default=",".join(p for p, _, _ in POINTS), help="labels, comma-separated")
     ap.add_argument("--fabrics", default=",".join(FABRICS))
     ap.add_argument("--kinds", default=",".join(KINDS))
-    ap.add_argument("--draft-attn-backend", default="FLASHINFER", choices=BACKENDS)
+    ap.add_argument("--draft-attn-backend", default="FLASH_ATTN", choices=BACKENDS)
     ap.add_argument("--tree", default=FROZEN_TREE, help="vLLM tree for the prefill + decode PYTHONPATH")
     ap.add_argument("--prefix", default="dsrel")
     ap.add_argument("--replace", action="store_true")
     ap.add_argument("--stamp", default=None, help="ISO time recorded in DSREL.txt / AL_FIX.txt (default: now)")
     ap.add_argument("--mirror", default=None, help="chosen_configs_nov_15 dir: write release_draft/configs from configs/")
+    ap.add_argument("--target-weights", default=None, metavar="WEIGHTS_DIR,MODEL_VIEW",
+                    help="serve another target checkpoint: its dir (mounted read-only at its path) and its Dynamo "
+                         "model view (srtslurm.yaml model aliases + /model mount); default: the frozen sweep's test "
+                         "weights")
     a = ap.parse_args(argv)
     stamp = a.stamp or datetime.datetime.now().astimezone().isoformat(timespec="seconds")
     gen_md5 = hashlib.md5(open(os.path.abspath(__file__), "rb").read()).hexdigest()
@@ -403,6 +438,14 @@ def main(argv=None) -> int:
         need(x in pts, f"unknown point {x} (known: {', '.join(pts)})")
     need(re.fullmatch(r"[a-z][a-z0-9]*", a.prefix) is not None and a.prefix != "frz", f"bad prefix {a.prefix!r}")
     tree = os.path.normpath(a.tree)
+    weights = None
+    if a.target_weights:
+        parts = [os.path.normpath(x) for x in a.target_weights.split(",")]
+        need(len(parts) == 2, "--target-weights takes WEIGHTS_DIR,MODEL_VIEW")
+        weights = (parts[0], parts[1])
+        if a.mirror is None:  # on Hecate: both must exist (the view's config.json is what the engine reads)
+            need(os.path.isfile(os.path.join(weights[0], "config.json")), f"{weights[0]} has no config.json")
+            need(os.path.isfile(os.path.join(weights[1], "config.json")), f"{weights[1]} has no config.json")
     if a.mirror is None:
         for f in ("vllm/__init__.py", "vllm/v1/attention/backends/registry.py"):
             need(os.path.isfile(f"{tree}/{f}"), f"--tree {tree} has no {f}")
@@ -432,7 +475,8 @@ def main(argv=None) -> int:
             if a.mirror:
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
             info = derive(src, dst, base=base, prefix=a.prefix, kind=kind, fab=fab, backend=a.draft_attn_backend,
-                          tree=tree, stamp=stamp, gen_md5=gen_md5, replace=a.replace, hecate=a.mirror is None)
+                          tree=tree, stamp=stamp, gen_md5=gen_md5, replace=a.replace, hecate=a.mirror is None,
+                          weights=weights)
             print("made " + summary(info))
         except GenError as e:
             print(f"FAIL {dst}: {e}")
