@@ -257,3 +257,39 @@ def test_drafter_unsupported(monkeypatch, architectures, tp, sp, refused):
     config = _vllm_config(architectures, tp=tp, dcp=tp, k=3 if sp else 7)
     reason = runtime.drafter_unsupported(config, sp)
     assert (reason is not None) == refused, reason
+
+
+def _drafter_config(target_tp, target_dcp, draft_dcp):
+    """A drafter's vllm_config as DFlashSpeculator hands it to a GQA draft: its own
+    parallel config at ``draft_dcp`` (1), the target's in the speculative config."""
+    target = SimpleNamespace(
+        tensor_parallel_size=target_tp, decode_context_parallel_size=target_dcp
+    )
+    own = SimpleNamespace(
+        tensor_parallel_size=target_tp, decode_context_parallel_size=draft_dcp
+    )
+    spec = SimpleNamespace(target_parallel_config=target)
+    return SimpleNamespace(parallel_config=own, speculative_config=spec)
+
+
+@pytest.mark.parametrize("tp,dcp", [(16, 16), (4, 4), (8, 8)])
+def test_deployment_config_is_the_targets(tp, dcp):
+    # NQ-NOFALLBACK: a GQA draft's own config runs at DCP 1, so strictness keyed on
+    # it would never hold at TP16 = DCP16 (or C512's TP4 = DCP4); the deployment
+    # config carries the target's DCP.
+    config = _drafter_config(tp, dcp, 1)
+    deployment = draft.deployment_config(config)
+    assert deployment.parallel_config.decode_context_parallel_size == dcp
+    assert config.parallel_config.decode_context_parallel_size == 1  # untouched copy
+    from vllm.models.kimi_k3.nvidia.specialized_decode.shapes import target_topology
+
+    assert target_topology(True, 16, draft.deployment_config(
+        _drafter_config(16, 16, 1)).parallel_config.decode_context_parallel_size, 8)
+
+
+def test_deployment_config_without_target():
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=16),
+        speculative_config=SimpleNamespace(target_parallel_config=None),
+    )
+    assert draft.deployment_config(config) is config

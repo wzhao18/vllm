@@ -234,6 +234,9 @@ class K3GqaDSparkModel(Qwen3DSparkModel):
             if any(s is None for s in slot_mapping):
                 return False
             if len({s.data_ptr() for s in slot_mapping}) != 1:
+                fast.uncovered_context(
+                    states.shape[0], "draft layers in several KV-cache groups"
+                )
                 return False
             slot_mapping = slot_mapping[0]
         num_ctx = states.shape[0]

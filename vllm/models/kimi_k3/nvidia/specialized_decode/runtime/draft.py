@@ -1256,6 +1256,22 @@ class GqaContextWeights:
         self.context_proj, self.context_norm = inner.fc, inner.hidden_norm
 
 
+def deployment_config(vllm_config):
+    """The deployment's (target's) config for a drafter's ``vllm_config``: a GQA draft
+    runs at DCP 1 (DFlashSpeculator replaces the parallel config of its copy), while
+    the deployment, and every strictness rule keyed on it, is the target's
+    (``speculative_config.target_parallel_config``)."""
+    import copy
+
+    spec = vllm_config.speculative_config
+    target = getattr(spec, "target_parallel_config", None) if spec is not None else None
+    if target is None or target is vllm_config.parallel_config:
+        return vllm_config
+    config = copy.copy(vllm_config)
+    config.parallel_config = target
+    return config
+
+
 class GqaAttention:
     """The fused GQA attention of the drafter's layers (``cutedsl.draft.gqa_*``,
     ``install_gqa_attention``), as the layers call it: ``forward(index, qkv,
@@ -1291,6 +1307,12 @@ class GqaAttention:
             refuse("DSpark drafter context K/V", "not covered", Shape(kv.shape[0]))
         return stored
 
+    def uncovered_context(self, rows, cause):
+        """A context step the fused K/V insert cannot take (``cause``): refuses inside
+        a FULL capture on a strict deployment (never a silent stock insert)."""
+        if self.strict and full_capture():
+            refuse("DSpark drafter context K/V", cause, Shape(rows))
+
 
 def install_gqa_attention_state(model, vllm_config, query_rows, context_rows, strict):
     """The fused GQA attention's prepared state for the drafter's layers, or None
@@ -1301,7 +1323,11 @@ def install_gqa_attention_state(model, vllm_config, query_rows, context_rows, st
     with ``forward`` / ``store_context`` (``GqaAttention``)."""
     try:
         from ..cutedsl.draft.gqa_attention import install_gqa_attention
-    except ImportError:
+    except ModuleNotFoundError as e:
+        # Only the module's absence means "not installed"; a failing import inside it
+        # is an error to see, not a missing piece.
+        if not (e.name or "").endswith("cutedsl.draft.gqa_attention"):
+            raise
         return None
     layers = [layer.self_attn for layer in model.model.layers]
     return install_gqa_attention(layers, vllm_config, query_rows, context_rows, strict)
@@ -1507,12 +1533,16 @@ class GqaDraftFastPath(DraftFastPath):
         tp, rank = group.world_size, group.rank_in_group
         steps = spec.num_speculative_tokens
         all_batches = draft_batches(vllm_config, steps)
-        dcp = vllm_config.parallel_config.decode_context_parallel_size
+        # The deployment's topology is the target's: DFlashSpeculator hands a GQA draft
+        # a copy of the config at DCP 1 (dflash/speculator.py), which would make every
+        # strict deployment look non-strict here.
+        deployment = deployment_config(vllm_config)
+        dcp = deployment.parallel_config.decode_context_parallel_size
         # NQ-NOFALLBACK: on the target topology (Rubin TP16 = DCP16) and C512's SP
         # decode role (TP4 = DCP4) every drafter piece a captured graph runs is covered
         # or the load is refused; elsewhere (out of scope) uncovered pieces keep the
         # stock drafter path, logged.
-        strict = target_topology(True, tp, dcp, steps + 1) or sp_topology(vllm_config)
+        strict = target_topology(True, tp, dcp, steps + 1) or sp_topology(deployment)
 
         def fail(site, cause):
             if strict:
