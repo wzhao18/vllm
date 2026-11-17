@@ -155,12 +155,6 @@ class K3GqaDSparkModel(Qwen3DSparkModel):
         self._context_projection = None
         # The context K/V insert of the fused GQA attention (or None).
         self._fast_context_kv = None
-        # A side stream's context step the first attention core waits for.
-        self._context_ready: torch.cuda.Event | None = None
-
-    @property
-    def final_norm(self) -> nn.Module:
-        return self.norm
 
     def combine(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """hidden_norm(fc(hidden_states)) [rows, hidden]."""
@@ -240,6 +234,9 @@ class K3GqaDSparkModel(Qwen3DSparkModel):
             if any(s is None for s in slot_mapping):
                 return False
             if len({s.data_ptr() for s in slot_mapping}) != 1:
+                fast.uncovered_context(
+                    states.shape[0], "draft layers in several KV-cache groups"
+                )
                 return False
             slot_mapping = slot_mapping[0]
         num_ctx = states.shape[0]

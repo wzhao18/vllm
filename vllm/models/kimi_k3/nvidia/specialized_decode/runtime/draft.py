@@ -1018,10 +1018,12 @@ GQA_PROJECTIONS = {
         (448, 35840): PROJECTIONS[16][(448, 35840)],
     },
     # TP4 (C512's SP decode role, DL3: 6 query / 8 context rows): qkv 6.21 -> 3.80,
-    # o_proj 3.91 -> 3.41, down 7.47 -> 5.99, context K/V 6.42 -> 4.21.
+    # o_proj 3.91 -> 3.41, gate_up 11.87 -> 10.16, down 7.47 -> 5.99, context K/V
+    # 6.42 -> 4.21.
     4: {
         (2048, 7168): (64, 8, 4, 8),
         (7168, 1536): (64, 8, 1, 8),
+        (7168, 7168): (64, 8, 1, 8),
         (7168, 3584): (64, 8, 1, 8),
         (2560, 7168): (64, 8, 4, 8),
     },
@@ -1031,7 +1033,10 @@ GQA_PROJECTIONS = {
 # TP16 (release GEMM bench, us cuBLAS -> split-K): qkv 9-15 rows 4.14 -> 2.42, 18-30
 # 3.99 -> 2.87, 33-63 4.26 -> 3.67; o_proj 9-15 2.28 -> 1.90, 18-30 2.25 -> 2.06
 # (33-63: cuBLAS 2.37 vs 2.62, kept); context K/V 12-16 4.68 -> 2.65, 20-32 4.11 ->
-# 2.92, 36-64 4.25 -> 3.70.
+# 2.92, 36-64 4.25 -> 3.70; the context fc shard (448, 35840; the preview's tables
+# have no tactic above 8 rows) 12-16 6.90 -> 5.38, 20-32 6.68 -> 6.21 (N tiles of
+# 16: published into the row mailbox by the GEMM, ``gqa_context_projection``;
+# 36 rows: cuBLAS 6.74 vs 8.28, kept).
 GQA_PROJECTIONS_WIDE = {
     16: (
         (
@@ -1040,6 +1045,7 @@ GQA_PROJECTIONS_WIDE = {
                 (512, 7168): (64, 8, 8, 7),
                 (7168, 384): (64, 16, 1, 3),
                 (640, 7168): (64, 8, 8, 7),
+                (448, 35840): (64, 16, 14, 8),
                 (1792, 7168): (64, 16, 4, 8),
                 (7168, 896): (64, 16, 1, 8),
             },
@@ -1050,6 +1056,7 @@ GQA_PROJECTIONS_WIDE = {
                 (512, 7168): (64, 16, 4, 10),
                 (7168, 384): (64, 32, 1, 3),
                 (640, 7168): (64, 16, 4, 10),
+                (448, 35840): (64, 16, 10, 8),
                 (1792, 7168): (64, 32, 4, 6),
             },
         ),
@@ -1064,7 +1071,8 @@ GQA_PROJECTIONS_WIDE = {
     ),
     # TP4 (us cuBLAS -> split-K): qkv 9-15 6.16 -> 3.92, 18-30 5.76 -> 4.55, 33-63
     # 6.59 -> 5.20; o_proj 9-15 3.93 -> 3.48, 18-30 4.06 -> 4.01 (33-63: cuBLAS 4.20
-    # vs 4.94, kept); down 9-15 7.96 -> 5.99, 18-30 7.70 -> 6.62, 33-63 8.71 -> 7.57;
+    # vs 4.94, kept); gate_up 9-15 12.11 -> 10.16, 18-30 12.61 -> 10.67, 33-63 13.74
+    # -> 12.42; down 9-15 7.96 -> 5.99, 18-30 7.70 -> 6.62, 33-63 8.71 -> 7.57;
     # context K/V 12-16 6.44 -> 4.28, 20-32 6.73 -> 4.95, 36-64 7.47 -> 5.73. Above
     # 64 rows cuBLAS (the M64 split-K loses there: TP16 qkv at 70 rows 6.49 vs 4.21).
     4: (
@@ -1073,6 +1081,7 @@ GQA_PROJECTIONS_WIDE = {
             {
                 (2048, 7168): (64, 16, 4, 8),
                 (7168, 1536): (64, 16, 1, 8),
+                (7168, 7168): (64, 16, 1, 8),
                 (7168, 3584): (64, 16, 1, 8),
                 (2560, 7168): (64, 16, 4, 8),
             },
@@ -1082,6 +1091,7 @@ GQA_PROJECTIONS_WIDE = {
             {
                 (2048, 7168): (64, 32, 4, 8),
                 (7168, 1536): (64, 32, 1, 8),
+                (7168, 7168): (64, 32, 1, 8),
                 (7168, 3584): (64, 32, 1, 8),
                 (2560, 7168): (64, 32, 4, 8),
             },
@@ -1090,6 +1100,7 @@ GQA_PROJECTIONS_WIDE = {
             64,
             {
                 (2048, 7168): (128, 64, 6, 16, 14),
+                (7168, 7168): (64, 64, 1, 6),
                 (7168, 3584): (64, 64, 1, 6),
                 (2560, 7168): (128, 64, 6, 16, 14),
             },
@@ -1204,6 +1215,38 @@ def install_gqa_projections(model, tp, query_rows, context_rows, rank=0):
     return installed
 
 
+def gqa_context_projection(prepared, tp):
+    """``PreparedContext``'s shard GEMM on the GQA tables' split-K tactics for its
+    static rows (the release drafter's fc shard: (448, 35840) at TP16, as the
+    preview's context_proj shard; (1792, 35840) at TP4), as
+    ``PreparedContext.__init__`` sets it up from the preview's tables: rows whose
+    tactic has the M tile 64 and N tiles of at most 16 publish into the row mailbox
+    from the GEMM itself (``GatherProjection``, one 8-column fragment per epilogue
+    thread; polled CtxGather), the others run the split-K GEMM and CtxGather's
+    publish. Returns the (split-K, mailbox-publishing) rows."""
+    from ..cutedsl.draft.context import CAP, GatherProjection, compile_gather
+    from ..cutedsl.gemm.projection import PreparedProjection
+
+    shard = prepared.shard
+    tactics = {}
+    for r in prepared.rows:
+        tactic = gqa_projection_tactic(shard.shape, tp, r)
+        if tactic is not None:
+            tactics[r] = tactic
+    ring = {r: t for r, t in tactics.items() if len(t) == 4 and t[1] <= 16}
+    current = prepared.projection.policies if prepared.projection is not None else {}
+    if not tactics or (tactics == current and set(ring) == set(prepared.polled)):
+        return sorted(current), sorted(prepared.polled)
+    index = prepared.device.index
+    prepared.projection = PreparedProjection(shard, tactics).prepare()
+    prepared.ring = GatherProjection(shard, ring).prepare() if ring else None
+    prepared.polled = {r: compile_gather(r, shard.shape[0], index, True) for r in ring}
+    prepared.shape_rows = torch.empty(
+        (CAP, shard.shape[0]), dtype=torch.bfloat16, device=prepared.device
+    )
+    return sorted(tactics), sorted(ring)
+
+
 class GqaContextWeights:
     """``cutedsl.draft.context.PreparedContext``'s view of the release drafter: its
     ``context_proj`` is ``fc`` and its ``context_norm`` is ``hidden_norm``
@@ -1211,6 +1254,22 @@ class GqaContextWeights:
 
     def __init__(self, inner):
         self.context_proj, self.context_norm = inner.fc, inner.hidden_norm
+
+
+def deployment_config(vllm_config):
+    """The deployment's (target's) config for a drafter's ``vllm_config``: a GQA draft
+    runs at DCP 1 (DFlashSpeculator replaces the parallel config of its copy), while
+    the deployment, and every strictness rule keyed on it, is the target's
+    (``speculative_config.target_parallel_config``)."""
+    import copy
+
+    spec = vllm_config.speculative_config
+    target = getattr(spec, "target_parallel_config", None) if spec is not None else None
+    if target is None or target is vllm_config.parallel_config:
+        return vllm_config
+    config = copy.copy(vllm_config)
+    config.parallel_config = target
+    return config
 
 
 class GqaAttention:
@@ -1248,6 +1307,12 @@ class GqaAttention:
             refuse("DSpark drafter context K/V", "not covered", Shape(kv.shape[0]))
         return stored
 
+    def uncovered_context(self, rows, cause):
+        """A context step the fused K/V insert cannot take (``cause``): refuses inside
+        a FULL capture on a strict deployment (never a silent stock insert)."""
+        if self.strict and full_capture():
+            refuse("DSpark drafter context K/V", cause, Shape(rows))
+
 
 def install_gqa_attention_state(model, vllm_config, query_rows, context_rows, strict):
     """The fused GQA attention's prepared state for the drafter's layers, or None
@@ -1258,7 +1323,11 @@ def install_gqa_attention_state(model, vllm_config, query_rows, context_rows, st
     with ``forward`` / ``store_context`` (``GqaAttention``)."""
     try:
         from ..cutedsl.draft.gqa_attention import install_gqa_attention
-    except ImportError:
+    except ModuleNotFoundError as e:
+        # Only the module's absence means "not installed"; a failing import inside it
+        # is an error to see, not a missing piece.
+        if not (e.name or "").endswith("cutedsl.draft.gqa_attention"):
+            raise
         return None
     layers = [layer.self_attn for layer in model.model.layers]
     return install_gqa_attention(layers, vllm_config, query_rows, context_rows, strict)
@@ -1464,12 +1533,16 @@ class GqaDraftFastPath(DraftFastPath):
         tp, rank = group.world_size, group.rank_in_group
         steps = spec.num_speculative_tokens
         all_batches = draft_batches(vllm_config, steps)
-        dcp = vllm_config.parallel_config.decode_context_parallel_size
+        # The deployment's topology is the target's: DFlashSpeculator hands a GQA draft
+        # a copy of the config at DCP 1 (dflash/speculator.py), which would make every
+        # strict deployment look non-strict here.
+        deployment = deployment_config(vllm_config)
+        dcp = deployment.parallel_config.decode_context_parallel_size
         # NQ-NOFALLBACK: on the target topology (Rubin TP16 = DCP16) and C512's SP
         # decode role (TP4 = DCP4) every drafter piece a captured graph runs is covered
         # or the load is refused; elsewhere (out of scope) uncovered pieces keep the
         # stock drafter path, logged.
-        strict = target_topology(True, tp, dcp, steps + 1) or sp_topology(vllm_config)
+        strict = target_topology(True, tp, dcp, steps + 1) or sp_topology(deployment)
 
         def fail(site, cause):
             if strict:
@@ -1531,6 +1604,7 @@ class GqaDraftFastPath(DraftFastPath):
                 GqaContextWeights(inner), group.device_group, tp, rank, context
             )
             prepared.strict = strict  # NQ-NOFALLBACK
+            gqa_context_projection(prepared, tp)
             inner._fast_context = prepared
             logger.info_once(
                 "Kimi K3.1 GQA DSpark drafter: sharded context step for %s rows "
@@ -1591,11 +1665,19 @@ class GqaDraftFastPath(DraftFastPath):
             model, vllm_config, query_rows, context_rows, strict
         )
         attention = None
+        missing_api = [
+            name for name in ("forward", "store_context") if not hasattr(state, name)
+        ]
         if state is None:
             fail(
                 "DSpark drafter attention",
                 "the fused GQA drafter attention (cutedsl.draft.gqa_attention "
                 "install_gqa_attention) is not installed",
+            )
+        elif missing_api:
+            fail(
+                "DSpark drafter attention",
+                f"the installed GQA attention state lacks {missing_api}",
             )
         else:
             attention = GqaAttention(state, strict)

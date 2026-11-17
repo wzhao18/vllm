@@ -127,7 +127,7 @@ def test_combine_normalizes_as_stock():
 # ---------------------------------------------------------------- torchrun
 
 
-@pytest.mark.parametrize("part", ["sites", "vpmarkov"])
+@pytest.mark.parametrize("part", ["sites", "sites4", "vpmarkov", "build", "gather"])
 def test_gpu_torchrun(part):
     """The torchrun checks below on every local GPU (skipped without 2+ Rubin
     GPUs)."""
@@ -179,25 +179,30 @@ class _Mlp:
 
 class _Layer:
     """The K3GqaDSparkDecoderLayer surface GqaSites / PreparedDraftAr read, at the
-    TP16 per-rank GQA geometry, with the stand-in attention core."""
+    release drafter's per-rank GQA geometry of ``tp`` (runtime.draft.gqa_shapes), with
+    the stand-in attention core."""
 
-    def __init__(self, index, gen, device, act_fn):
-        def w(n, k):
+    def __init__(self, index, gen, device, act_fn, tp=16):
+        from vllm.models.kimi_k3.nvidia.specialized_decode.runtime import draft
+
+        def w(shape):
+            n, k = shape
             return (torch.randn((n, k), generator=gen, device=device) * 0.02).bfloat16()
 
         def g():
             return (torch.rand(HIDDEN, generator=gen, device=device) + 0.5).bfloat16()
 
+        shapes = draft.gqa_shapes(tp)
         self.layer_idx = index
-        self.q_size = 384
+        self.q_size = shapes["o_proj"][1]
         self.input_layernorm, self.post_attention_layernorm = _Norm(g()), _Norm(g())
         self.self_attn = SimpleNamespace(
-            qkv_proj=_Linear(w(512, HIDDEN)),
-            o_proj=_Linear(w(HIDDEN, self.q_size)),
+            qkv_proj=_Linear(w(shapes["qkv"])),
+            o_proj=_Linear(w(shapes["o_proj"])),
             attention_sink_bias=None,
             v_scale=None,
         )
-        self.mlp = _Mlp(w(1792, HIDDEN), w(HIDDEN, 896), act_fn)
+        self.mlp = _Mlp(w(shapes["gate_up"]), w(shapes["down"]), act_fn)
 
     def attention_core(self, positions, hidden):
         qkv, _ = self.self_attn.qkv_proj(hidden)
@@ -269,11 +274,13 @@ def _rel(out, exact):
 SITE_ROWS = (6, 7, 9, 14, 21, 28, 56, 63, 70, 112, 224)
 
 
-def _sites_main(rank, world, device, group):
-    """GqaSites (GqaDraftFastPath's site build with the TP16 GQA tables at the local
-    world) in a CUDA graph vs the stock math, at one-shot (6, 7: ring producers,
-    polled sites), two-shot (9-63: pushing producers, SiLU-fused gate/up) and wide
-    (70-224: ArNormRows over stored partials) rows; three replays bitwise equal."""
+def _sites_main(rank, world, device, group, tp=16):
+    """GqaSites (GqaDraftFastPath's site build with the TP``tp`` GQA tables, at the
+    TP``tp`` per-rank geometry, over the local world) in a CUDA graph vs the stock
+    math, at one-shot (6, 7: ring producers, polled sites), two-shot (9-63: pushing
+    producers, SiLU-fused gate/up; stored partials where the tables have none) and
+    wide (70-224: ArNormRows over stored partials) rows; three replays bitwise
+    equal."""
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.model_executor.layers.activation import SiluAndMul
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.draft.allreduce import (
@@ -281,11 +288,14 @@ def _sites_main(rank, world, device, group):
     )
     from vllm.models.kimi_k3.nvidia.specialized_decode.runtime import draft
 
-    # The TP16 tables at the local world (the per-rank shapes are TP16's).
+    # The TP``tp`` tables at the local world (the per-rank shapes are TP``tp``'s).
     for name in dir(draft):
         table = getattr(draft, name)
-        if name.startswith("GQA_") and isinstance(table, dict) and 16 in table:
-            table[world] = table[16]
+        if name.startswith("GQA_") and isinstance(table, dict):
+            if tp in table:
+                table[world] = table[tp]
+            else:
+                table.pop(world, None)
     from vllm.config import CompilationConfig
 
     # The CUDA silu_and_mul kernel (as the served drafter's), not a torch.compiled
@@ -294,7 +304,7 @@ def _sites_main(rank, world, device, group):
     with set_current_vllm_config(config):
         act = SiluAndMul()
     gen = torch.Generator(device=device).manual_seed(100 + rank)
-    layers = [_Layer(i, gen, device, act) for i in range(5)]
+    layers = [_Layer(i, gen, device, act, tp) for i in range(5)]
     shared = torch.Generator(device=device).manual_seed(7)
     vocab = 512 * world
     embedding = (
@@ -540,6 +550,232 @@ def _vp_markov_main(rank, world, device, group):
     return failures
 
 
+def _build_main(rank, world, device, group):
+    """``GqaDraftFastPath.build`` end to end over the local world (non-strict: TP2),
+    on stand-in layers at the TP16 per-rank geometry with the release Markov head
+    shapes and a vocabulary-parallel LM head: the TP16 tables at the local world
+    (the context step dropped: CtxGather needs TP >= 4; Markov sampling on
+    VocabParallelMarkov), then ``sampled_markov_draft``'s path
+    (``DraftFastPath.greedy_markov``: the LM-head GEMV / shard GEMM and the Markov
+    kernels) in a CUDA graph, against the stock probabilistic loop on the full
+    logits."""
+    from vllm.config import (
+        CompilationConfig,
+        ParallelConfig,
+        VllmConfig,
+        set_current_vllm_config,
+    )
+    from vllm.distributed import (
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+    from vllm.model_executor.layers.activation import SiluAndMul
+    from vllm.model_executor.layers.logits_processor import LogitsProcessor
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+    from vllm.models.kimi_k3.nvidia.specialized_decode.runtime import draft
+
+    for name in dir(draft):
+        table = getattr(draft, name)
+        if name.startswith("GQA_") and isinstance(table, dict) and 16 in table:
+            table[world] = table[16]
+    draft.GQA_FAST_CONTEXT.pop(world, None)
+    draft.GQA_FUSED_MARKOV.pop(world, None)
+    draft.GQA_VP_MARKOV[world] = "1-:1"
+    steps, vocab, sizes = 7, 163840, [7, 14, 21, 56]
+    config = VllmConfig(
+        compilation_config=CompilationConfig(custom_ops=["all"]),
+        parallel_config=ParallelConfig(tensor_parallel_size=world),
+    )
+    failures = 0
+    with set_current_vllm_config(config):
+        init_distributed_environment(world, rank, local_rank=device.index)
+        initialize_model_parallel(tensor_model_parallel_size=world)
+        act = SiluAndMul()
+        gen = torch.Generator(device=device).manual_seed(300 + rank)
+        shared = torch.Generator(device=device).manual_seed(301)
+        layers = [_Layer(i, gen, device, act) for i in range(5)]
+        with torch.device(device):
+            lm_head = ParallelLMHead(vocab, HIDDEN).bfloat16()
+        lm_head.weight.data.normal_(0.0, 0.02, generator=gen)
+        markov = [
+            torch.randn((vocab, 512), generator=shared, device=device).bfloat16() * 0.05
+            for _ in range(2)
+        ]
+        embedding = torch.randn((vocab, HIDDEN), generator=shared, device=device)
+        shard = vocab // world
+        inner = SimpleNamespace(
+            layers=layers,
+            norm=_Norm((torch.rand(HIDDEN, device=device) + 0.5).bfloat16()),
+            fc=SimpleNamespace(weight=torch.zeros((HIDDEN, 2), device=device)),
+            hidden_norm=_Norm(torch.ones(HIDDEN, device=device).bfloat16()),
+            markov_head=SimpleNamespace(
+                markov_w1=SimpleNamespace(weight=markov[0]),
+                markov_w2=SimpleNamespace(weight=markov[1]),
+            ),
+            has_separate_mask_embedding=False,
+            _fused_kv_weight=(
+                torch.randn((640, HIDDEN), generator=gen, device=device) * 0.02
+            ).bfloat16(),
+            embed_tokens=SimpleNamespace(
+                weight=embedding[rank * shard : (rank + 1) * shard].bfloat16()
+            ),
+            _fast_ar=None,
+            _fast_context=None,
+            _fast_context_kv=None,
+        )
+        model = SimpleNamespace(
+            model=inner,
+            config=SimpleNamespace(
+                hidden_size=HIDDEN,
+                sample_from_anchor=True,
+                vocab_size=vocab,
+                draft_vocab_size=vocab,
+            ),
+            logits_processor=LogitsProcessor(vocab),
+            lm_head=lm_head,
+        )
+        vllm_config = SimpleNamespace(
+            additional_config={"decode_backend": "latency_specialized"},
+            speculative_config=SimpleNamespace(
+                method="dspark",
+                num_speculative_tokens=steps,
+                draft_sample_method="probabilistic",
+            ),
+            compilation_config=SimpleNamespace(
+                cudagraph_capture_sizes=sizes, max_cudagraph_capture_size=max(sizes)
+            ),
+            scheduler_config=SimpleNamespace(max_num_seqs=8),
+            parallel_config=SimpleNamespace(
+                tensor_parallel_size=world,
+                decode_context_parallel_size=1,
+                pipeline_parallel_size=1,
+                enable_expert_parallel=False,
+            ),
+            model_config=SimpleNamespace(use_fp64_gumbel=False),
+            watermark_config=None,
+        )
+        fast = draft.GqaDraftFastPath.build(vllm_config, model)
+        built = (
+            fast is not None
+            and isinstance(fast.markov, draft.VocabParallelMarkov)
+            and sorted(fast.batches) == [1, 2, 3, 8]
+            and isinstance(inner._fast_ar, draft.GqaSites)
+            and fast.attention is None
+        )
+        if rank == 0:
+            print(
+                f"build: markov {type(fast.markov).__name__}, batches "
+                f"{sorted(fast.batches)}, sites {inner._fast_ar.rows}, LM-head GEMV "
+                f"{sorted(fast.lm_batches)} {'ok' if built else 'FAIL'}",
+                flush=True,
+            )
+        failures += not built
+        for batch in (1, 8):
+            rows = batch * steps
+            hidden = torch.randn((rows, HIDDEN), generator=shared, device=device)
+            hidden = hidden.bfloat16()
+            anchors = torch.randint(
+                0, vocab, (batch,), generator=shared, device=device, dtype=torch.int32
+            )
+            temperature = torch.rand(batch, generator=shared, device=device) + 0.5
+            seeds = torch.arange(batch, dtype=torch.int64, device=device) * 7919
+            slots = torch.arange(batch, device=device).repeat_interleave(steps)
+            positions = torch.arange(rows, dtype=torch.int64, device=device) + 11
+            cache = torch.zeros(
+                (batch, steps, vocab), dtype=torch.bfloat16, device=device
+            )
+            out = torch.zeros((batch, steps), dtype=torch.int64, device=device)
+            sampling = (temperature, seeds, slots, positions, cache)
+            assert not fast.greedy_markov(model, hidden, anchors, out, sampling)
+            torch.distributed.barrier()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                ran = fast.greedy_markov(model, hidden, anchors, out, sampling)
+            torch.accelerator.synchronize(device)
+            torch.distributed.barrier()
+            graph.replay()
+            torch.accelerator.synchronize(device)
+            base = model.logits_processor._get_logits(hidden, lm_head, None)
+            expected_cache = torch.zeros_like(cache)
+            expected = _stock_markov(
+                markov[0], markov[1], base.view(batch, steps, vocab), anchors, steps,
+                (temperature, seeds, slots, positions, expected_cache), shards=world,
+            )  # fmt: skip
+            match = (out == expected).float().mean().item()
+            ok = ran and match >= 0.9
+            failures += not ok
+            if rank == 0 or not ok:
+                print(
+                    f"rank {rank}: build B{batch}: fused path {ran}, drafts equal to "
+                    f"the stock loop on cuBLAS logits {match:.3f} "
+                    f"{'ok' if ok else 'FAIL'}",
+                    flush=True,
+                )
+            del graph
+    return failures
+
+
+def _gather_main(rank, world, device, group):
+    """The context step's mailbox-publishing shard GEMM (``GatherProjection``, as
+    ``gqa_context_projection`` installs it) at the TP16 fc shard (448, 35840) with
+    the GQA tables' tactics (N tiles of 8 and 16 rows, 8-32 rows): every rank's rows
+    land in its columns of every rank's row mailbox, bitwise the split-K
+    projection's (sanitized: no -0.0), the other columns untouched."""
+    import torch.distributed._symmetric_memory as symm_mem
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.draft import context
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.projection import (
+        PreparedProjection,
+    )
+
+    hidden, shard = context.HIDDEN, 448
+    gen = torch.Generator(device=device).manual_seed(900 + rank)
+    weight = torch.randn((shard, 5 * hidden), generator=gen, device=device) * 0.01
+    weight = weight.bfloat16()
+    failures = 0
+    cases = {
+        8: (64, 8, 14, 10),
+        12: (64, 16, 14, 8),
+        16: (64, 16, 14, 8),
+        24: (64, 16, 10, 8),
+        32: (64, 16, 10, 8),
+    }
+    box = symm_mem.empty((64 * hidden,), dtype=torch.bfloat16, device=device)
+    mc = int(symm_mem.rendezvous(box, group).multicast_ptr or 0)
+    assert mc, "multicast memory"
+    ring = context.GatherProjection(weight, cases).prepare()
+    plain = PreparedProjection(weight, cases).prepare()
+    shape_rows = torch.empty((64, shard), dtype=torch.bfloat16, device=device)
+    for rows, tactic in cases.items():
+        box.view(torch.int32).fill_(-0x80000000)
+        torch.accelerator.synchronize(device)
+        torch.distributed.barrier()
+        x = torch.randn((rows, 5 * hidden), generator=gen, device=device).bfloat16()
+        ring.run_ring(x, shape_rows[:rows], mc + rank * shard * 2)
+        expected = torch.empty((rows, shard), dtype=torch.bfloat16, device=device)
+        plain.run(x, expected)
+        expected = expected + 0.0  # (-0.0 published as +0.0)
+        torch.accelerator.synchronize(device)
+        torch.distributed.barrier()
+        landed = box.view(64, hidden)[:rows]
+        parts = [torch.empty_like(expected) for _ in range(world)]
+        torch.distributed.all_gather(parts, expected)
+        ok = all(
+            torch.equal(landed[:, r * shard : (r + 1) * shard], parts[r])
+            for r in range(world)
+        )
+        rest = landed[:, world * shard :].view(torch.int32)
+        ok = ok and bool((rest == -0x80000000).all())
+        failures += not ok
+        if rank == 0 or not ok:
+            print(
+                f"rank {rank}: GatherProjection rows {rows} tactic {tactic}: "
+                f"{'ok' if ok else 'FAIL'}",
+                flush=True,
+            )
+    return failures
+
+
 def _gpu_main(parts):
     import torch.distributed as dist
 
@@ -551,13 +787,21 @@ def _gpu_main(parts):
     failures = 0
     if "sites" in parts:
         failures += _sites_main(rank, world, device, group)
+    if "sites4" in parts:
+        failures += _sites_main(rank, world, device, group, tp=4)
     if "vpmarkov" in parts:
         failures += _vp_markov_main(rank, world, device, group)
+    if "build" in parts:
+        failures += _build_main(rank, world, device, group)
+    if "gather" in parts:
+        failures += _gather_main(rank, world, device, group)
     dist.barrier()
     dist.destroy_process_group()
     return failures
 
 
 if __name__ == "__main__":
-    # torchrun ... test_dspark_gqa_fastpath_gpu.py [sites] [vpmarkov] (default: all)
-    sys.exit(1 if _gpu_main(sys.argv[1:] or ("sites", "vpmarkov")) else 0)
+    # torchrun ... test_dspark_gqa_fastpath_gpu.py [sites] [sites4] [vpmarkov]
+    # [build] [gather] (default: all)
+    parts = sys.argv[1:] or ("sites", "sites4", "vpmarkov", "build", "gather")
+    sys.exit(1 if _gpu_main(parts) else 0)
