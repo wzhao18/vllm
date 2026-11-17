@@ -1,0 +1,223 @@
+W1116 19:16:55.930000 2690447 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+W1116 19:16:55.931000 2690447 torch/_library/opaque_object.py:294] register_opaque_type is deprecated, use register_custom_class instead
+W1116 19:16:55.931000 2690447 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+PASS 32 renders match /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/dsrel-*
+PASS dsrel-c1-ev-spx prefill: dspark k=7 backend=FLASHINFER
+PASS dsrel-c1-ev-spx prefill: dspark k=7 backend=FLASHINFER: block rejection
+PASS dsrel-c1-ev-spx prefill: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c1-ev-spx decode: dspark k=7 backend=FLASHINFER
+PASS dsrel-c1-ev-spx decode: dspark k=7 backend=FLASHINFER: block rejection
+PASS dsrel-c1-ev-spx decode: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c1-ev-xdr prefill: dspark k=7 backend=FLASHINFER
+PASS dsrel-c1-ev-xdr prefill: dspark k=7 backend=FLASHINFER: block rejection
+PASS dsrel-c1-ev-xdr prefill: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c1-ev-xdr decode: dspark k=7 backend=FLASHINFER
+PASS dsrel-c1-ev-xdr decode: dspark k=7 backend=FLASHINFER: block rejection
+PASS dsrel-c1-ev-xdr decode: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c1-spx prefill: dspark k=7 backend=FLASHINFER
+PASS dsrel-c1-spx prefill: dspark k=7 backend=FLASHINFER: synthetic AL 4.16 -> rates [1.0, 1.0, 1.0, 0.16000000000000014, 0.0, 0.0, 0.0]
+PASS dsrel-c1-spx prefill: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c1-spx decode: dspark k=7 backend=FLASHINFER
+PASS dsrel-c1-spx decode: dspark k=7 backend=FLASHINFER: synthetic AL 4.16 -> rates [1.0, 1.0, 1.0, 0.16000000000000014, 0.0, 0.0, 0.0]
+PASS dsrel-c1-spx decode: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c1-xdr prefill: dspark k=7 backend=FLASHINFER
+PASS dsrel-c1-xdr prefill: dspark k=7 backend=FLASHINFER: synthetic AL 4.16 -> rates [1.0, 1.0, 1.0, 0.16000000000000014, 0.0, 0.0, 0.0]
+PASS dsrel-c1-xdr prefill: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c1-xdr decode: dspark k=7 backend=FLASHINFER
+PASS dsrel-c1-xdr decode: dspark k=7 backend=FLASHINFER: synthetic AL 4.16 -> rates [1.0, 1.0, 1.0, 0.16000000000000014, 0.0, 0.0, 0.0]
+PASS dsrel-c1-xdr decode: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c128-1p1d-ev-spx prefill: dspark k=3 backend=FLASHINFER
+PASS dsrel-c128-1p1d-ev-spx prefill: dspark k=3 backend=FLASHINFER: block rejection
+PASS dsrel-c128-1p1d-ev-spx prefill: dspark k=3 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c128-1p1d-ev-spx decode: dspark k=3 backend=FLASHINFER
+PASS dsrel-c128-1p1d-ev-spx decode: dspark k=3 backend=FLASHINFER: block rejection
+PASS dsrel-c128-1p1d-ev-spx decode: dspark k=3 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c128-1p1d-ev-xdr prefill: dspark k=3 backend=FLASHINFER
+PASS dsrel-c128-1p1d-ev-xdr prefill: dspark k=3 backend=FLASHINFER: block rejection
+PASS dsrel-c128-1p1d-ev-xdr prefill: dspark k=3 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c128-1p1d-ev-xdr decode: dspark k=3 backend=FLASHINFER
+PASS dsrel-c128-1p1d-ev-xdr decode: dspark k=3 backend=FLASHINFER: block rejection
+PASS dsrel-c128-1p1d-ev-xdr decode: dspark k=3 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c128-1p1d-spx prefill: dspark k=3 backend=FLASHINFER
+PASS dsrel-c128-1p1d-spx prefill: dspark k=3 backend=FLASHINFER: synthetic AL 3.08 -> rates [1.0, 1.0, 0.08000000000000007]
+PASS dsrel-c128-1p1d-spx prefill: dspark k=3 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c128-1p1d-spx decode: dspark k=3 backend=FLASHINFER
+PASS dsrel-c128-1p1d-spx decode: dspark k=3 backend=FLASHINFER: synthetic AL 3.08 -> rates [1.0, 1.0, 0.08000000000000007]
+PASS dsrel-c128-1p1d-spx decode: dspark k=3 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c128-1p1d-xdr prefill: dspark k=3 backend=FLASHINFER
+PASS dsrel-c128-1p1d-xdr prefill: dspark k=3 backend=FLASHINFER: synthetic AL 3.08 -> rates [1.0, 1.0, 0.08000000000000007]
+PASS dsrel-c128-1p1d-xdr prefill: dspark k=3 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c128-1p1d-xdr decode: dspark k=3 backend=FLASHINFER
+PASS dsrel-c128-1p1d-xdr decode: dspark k=3 backend=FLASHINFER: synthetic AL 3.08 -> rates [1.0, 1.0, 0.08000000000000007]
+PASS dsrel-c128-1p1d-xdr decode: dspark k=3 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c16-1p2d-ev-spx prefill: dspark k=7 backend=FLASHINFER
+PASS dsrel-c16-1p2d-ev-spx prefill: dspark k=7 backend=FLASHINFER: block rejection
+PASS dsrel-c16-1p2d-ev-spx prefill: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c16-1p2d-ev-spx decode: dspark k=7 backend=FLASHINFER
+PASS dsrel-c16-1p2d-ev-spx decode: dspark k=7 backend=FLASHINFER: block rejection
+PASS dsrel-c16-1p2d-ev-spx decode: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c16-1p2d-ev-xdr prefill: dspark k=7 backend=FLASHINFER
+PASS dsrel-c16-1p2d-ev-xdr prefill: dspark k=7 backend=FLASHINFER: block rejection
+PASS dsrel-c16-1p2d-ev-xdr prefill: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c16-1p2d-ev-xdr decode: dspark k=7 backend=FLASHINFER
+PASS dsrel-c16-1p2d-ev-xdr decode: dspark k=7 backend=FLASHINFER: block rejection
+PASS dsrel-c16-1p2d-ev-xdr decode: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c16-1p2d-spx prefill: dspark k=7 backend=FLASHINFER
+PASS dsrel-c16-1p2d-spx prefill: dspark k=7 backend=FLASHINFER: synthetic AL 4.16 -> rates [1.0, 1.0, 1.0, 0.16000000000000014, 0.0, 0.0, 0.0]
+PASS dsrel-c16-1p2d-spx prefill: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c16-1p2d-spx decode: dspark k=7 backend=FLASHINFER
+PASS dsrel-c16-1p2d-spx decode: dspark k=7 backend=FLASHINFER: synthetic AL 4.16 -> rates [1.0, 1.0, 1.0, 0.16000000000000014, 0.0, 0.0, 0.0]
+PASS dsrel-c16-1p2d-spx decode: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c16-1p2d-xdr prefill: dspark k=7 backend=FLASHINFER
+PASS dsrel-c16-1p2d-xdr prefill: dspark k=7 backend=FLASHINFER: synthetic AL 4.16 -> rates [1.0, 1.0, 1.0, 0.16000000000000014, 0.0, 0.0, 0.0]
+PASS dsrel-c16-1p2d-xdr prefill: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c16-1p2d-xdr decode: dspark k=7 backend=FLASHINFER
+PASS dsrel-c16-1p2d-xdr decode: dspark k=7 backend=FLASHINFER: synthetic AL 4.16 -> rates [1.0, 1.0, 1.0, 0.16000000000000014, 0.0, 0.0, 0.0]
+PASS dsrel-c16-1p2d-xdr decode: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c160-1p1d-llh-ev-spx prefill: dspark k=3 backend=FLASHINFER
+PASS dsrel-c160-1p1d-llh-ev-spx prefill: dspark k=3 backend=FLASHINFER: block rejection
+PASS dsrel-c160-1p1d-llh-ev-spx prefill: dspark k=3 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c160-1p1d-llh-ev-spx decode: dspark k=3 backend=FLASHINFER
+PASS dsrel-c160-1p1d-llh-ev-spx decode: dspark k=3 backend=FLASHINFER: block rejection
+PASS dsrel-c160-1p1d-llh-ev-spx decode: dspark k=3 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c160-1p1d-llh-ev-xdr prefill: dspark k=3 backend=FLASHINFER
+PASS dsrel-c160-1p1d-llh-ev-xdr prefill: dspark k=3 backend=FLASHINFER: block rejection
+PASS dsrel-c160-1p1d-llh-ev-xdr prefill: dspark k=3 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c160-1p1d-llh-ev-xdr decode: dspark k=3 backend=FLASHINFER
+PASS dsrel-c160-1p1d-llh-ev-xdr decode: dspark k=3 backend=FLASHINFER: block rejection
+PASS dsrel-c160-1p1d-llh-ev-xdr decode: dspark k=3 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c160-1p1d-llh-spx prefill: dspark k=3 backend=FLASHINFER
+PASS dsrel-c160-1p1d-llh-spx prefill: dspark k=3 backend=FLASHINFER: synthetic AL 3.08 -> rates [1.0, 1.0, 0.08000000000000007]
+PASS dsrel-c160-1p1d-llh-spx prefill: dspark k=3 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c160-1p1d-llh-spx decode: dspark k=3 backend=FLASHINFER
+PASS dsrel-c160-1p1d-llh-spx decode: dspark k=3 backend=FLASHINFER: synthetic AL 3.08 -> rates [1.0, 1.0, 0.08000000000000007]
+PASS dsrel-c160-1p1d-llh-spx decode: dspark k=3 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c160-1p1d-llh-xdr prefill: dspark k=3 backend=FLASHINFER
+PASS dsrel-c160-1p1d-llh-xdr prefill: dspark k=3 backend=FLASHINFER: synthetic AL 3.08 -> rates [1.0, 1.0, 0.08000000000000007]
+PASS dsrel-c160-1p1d-llh-xdr prefill: dspark k=3 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c160-1p1d-llh-xdr decode: dspark k=3 backend=FLASHINFER
+PASS dsrel-c160-1p1d-llh-xdr decode: dspark k=3 backend=FLASHINFER: synthetic AL 3.08 -> rates [1.0, 1.0, 0.08000000000000007]
+PASS dsrel-c160-1p1d-llh-xdr decode: dspark k=3 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c48-1p1d-ev-spx prefill: dspark k=7 backend=FLASHINFER
+PASS dsrel-c48-1p1d-ev-spx prefill: dspark k=7 backend=FLASHINFER: block rejection
+PASS dsrel-c48-1p1d-ev-spx prefill: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c48-1p1d-ev-spx decode: dspark k=7 backend=FLASHINFER
+PASS dsrel-c48-1p1d-ev-spx decode: dspark k=7 backend=FLASHINFER: block rejection
+PASS dsrel-c48-1p1d-ev-spx decode: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c48-1p1d-ev-xdr prefill: dspark k=7 backend=FLASHINFER
+PASS dsrel-c48-1p1d-ev-xdr prefill: dspark k=7 backend=FLASHINFER: block rejection
+PASS dsrel-c48-1p1d-ev-xdr prefill: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c48-1p1d-ev-xdr decode: dspark k=7 backend=FLASHINFER
+PASS dsrel-c48-1p1d-ev-xdr decode: dspark k=7 backend=FLASHINFER: block rejection
+PASS dsrel-c48-1p1d-ev-xdr decode: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c48-1p1d-spx prefill: dspark k=7 backend=FLASHINFER
+PASS dsrel-c48-1p1d-spx prefill: dspark k=7 backend=FLASHINFER: synthetic AL 4.16 -> rates [1.0, 1.0, 1.0, 0.16000000000000014, 0.0, 0.0, 0.0]
+PASS dsrel-c48-1p1d-spx prefill: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c48-1p1d-spx decode: dspark k=7 backend=FLASHINFER
+PASS dsrel-c48-1p1d-spx decode: dspark k=7 backend=FLASHINFER: synthetic AL 4.16 -> rates [1.0, 1.0, 1.0, 0.16000000000000014, 0.0, 0.0, 0.0]
+PASS dsrel-c48-1p1d-spx decode: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c48-1p1d-xdr prefill: dspark k=7 backend=FLASHINFER
+PASS dsrel-c48-1p1d-xdr prefill: dspark k=7 backend=FLASHINFER: synthetic AL 4.16 -> rates [1.0, 1.0, 1.0, 0.16000000000000014, 0.0, 0.0, 0.0]
+PASS dsrel-c48-1p1d-xdr prefill: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c48-1p1d-xdr decode: dspark k=7 backend=FLASHINFER
+PASS dsrel-c48-1p1d-xdr decode: dspark k=7 backend=FLASHINFER: synthetic AL 4.16 -> rates [1.0, 1.0, 1.0, 0.16000000000000014, 0.0, 0.0, 0.0]
+PASS dsrel-c48-1p1d-xdr decode: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c512-ev-spx prefill: dspark k=3 backend=FLASHINFER
+PASS dsrel-c512-ev-spx prefill: dspark k=3 backend=FLASHINFER: block rejection
+PASS dsrel-c512-ev-spx prefill: dspark k=3 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c512-ev-spx decode: dspark k=3 backend=FLASHINFER
+PASS dsrel-c512-ev-spx decode: dspark k=3 backend=FLASHINFER: block rejection
+PASS dsrel-c512-ev-spx decode: dspark k=3 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c512-ev-xdr prefill: dspark k=3 backend=FLASHINFER
+PASS dsrel-c512-ev-xdr prefill: dspark k=3 backend=FLASHINFER: block rejection
+PASS dsrel-c512-ev-xdr prefill: dspark k=3 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c512-ev-xdr decode: dspark k=3 backend=FLASHINFER
+PASS dsrel-c512-ev-xdr decode: dspark k=3 backend=FLASHINFER: block rejection
+PASS dsrel-c512-ev-xdr decode: dspark k=3 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c512-spx prefill: dspark k=3 backend=FLASHINFER
+PASS dsrel-c512-spx prefill: dspark k=3 backend=FLASHINFER: synthetic AL 3.08 -> rates [1.0, 1.0, 0.08000000000000007]
+PASS dsrel-c512-spx prefill: dspark k=3 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c512-spx decode: dspark k=3 backend=FLASHINFER
+PASS dsrel-c512-spx decode: dspark k=3 backend=FLASHINFER: synthetic AL 3.08 -> rates [1.0, 1.0, 0.08000000000000007]
+PASS dsrel-c512-spx decode: dspark k=3 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c512-xdr prefill: dspark k=3 backend=FLASHINFER
+PASS dsrel-c512-xdr prefill: dspark k=3 backend=FLASHINFER: synthetic AL 3.08 -> rates [1.0, 1.0, 0.08000000000000007]
+PASS dsrel-c512-xdr prefill: dspark k=3 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c512-xdr decode: dspark k=3 backend=FLASHINFER
+PASS dsrel-c512-xdr decode: dspark k=3 backend=FLASHINFER: synthetic AL 3.08 -> rates [1.0, 1.0, 0.08000000000000007]
+PASS dsrel-c512-xdr decode: dspark k=3 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c64-ev-spx prefill: dspark k=7 backend=FLASHINFER
+PASS dsrel-c64-ev-spx prefill: dspark k=7 backend=FLASHINFER: block rejection
+PASS dsrel-c64-ev-spx prefill: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c64-ev-spx decode: dspark k=7 backend=FLASHINFER
+PASS dsrel-c64-ev-spx decode: dspark k=7 backend=FLASHINFER: block rejection
+PASS dsrel-c64-ev-spx decode: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c64-ev-xdr prefill: dspark k=7 backend=FLASHINFER
+PASS dsrel-c64-ev-xdr prefill: dspark k=7 backend=FLASHINFER: block rejection
+PASS dsrel-c64-ev-xdr prefill: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c64-ev-xdr decode: dspark k=7 backend=FLASHINFER
+PASS dsrel-c64-ev-xdr decode: dspark k=7 backend=FLASHINFER: block rejection
+PASS dsrel-c64-ev-xdr decode: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c64-spx prefill: dspark k=7 backend=FLASHINFER
+PASS dsrel-c64-spx prefill: dspark k=7 backend=FLASHINFER: synthetic AL 4.16 -> rates [1.0, 1.0, 1.0, 0.16000000000000014, 0.0, 0.0, 0.0]
+PASS dsrel-c64-spx prefill: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c64-spx decode: dspark k=7 backend=FLASHINFER
+PASS dsrel-c64-spx decode: dspark k=7 backend=FLASHINFER: synthetic AL 4.16 -> rates [1.0, 1.0, 1.0, 0.16000000000000014, 0.0, 0.0, 0.0]
+PASS dsrel-c64-spx decode: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c64-xdr prefill: dspark k=7 backend=FLASHINFER
+PASS dsrel-c64-xdr prefill: dspark k=7 backend=FLASHINFER: synthetic AL 4.16 -> rates [1.0, 1.0, 1.0, 0.16000000000000014, 0.0, 0.0, 0.0]
+PASS dsrel-c64-xdr prefill: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c64-xdr decode: dspark k=7 backend=FLASHINFER
+PASS dsrel-c64-xdr decode: dspark k=7 backend=FLASHINFER: synthetic AL 4.16 -> rates [1.0, 1.0, 1.0, 0.16000000000000014, 0.0, 0.0, 0.0]
+PASS dsrel-c64-xdr decode: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c72-1p3d-ev-spx prefill: dspark k=7 backend=FLASHINFER
+PASS dsrel-c72-1p3d-ev-spx prefill: dspark k=7 backend=FLASHINFER: block rejection
+PASS dsrel-c72-1p3d-ev-spx prefill: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c72-1p3d-ev-spx decode: dspark k=7 backend=FLASHINFER
+PASS dsrel-c72-1p3d-ev-spx decode: dspark k=7 backend=FLASHINFER: block rejection
+PASS dsrel-c72-1p3d-ev-spx decode: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c72-1p3d-ev-xdr prefill: dspark k=7 backend=FLASHINFER
+PASS dsrel-c72-1p3d-ev-xdr prefill: dspark k=7 backend=FLASHINFER: block rejection
+PASS dsrel-c72-1p3d-ev-xdr prefill: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c72-1p3d-ev-xdr decode: dspark k=7 backend=FLASHINFER
+PASS dsrel-c72-1p3d-ev-xdr decode: dspark k=7 backend=FLASHINFER: block rejection
+PASS dsrel-c72-1p3d-ev-xdr decode: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c72-1p3d-spx prefill: dspark k=7 backend=FLASHINFER
+PASS dsrel-c72-1p3d-spx prefill: dspark k=7 backend=FLASHINFER: synthetic AL 4.16 -> rates [1.0, 1.0, 1.0, 0.16000000000000014, 0.0, 0.0, 0.0]
+PASS dsrel-c72-1p3d-spx prefill: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c72-1p3d-spx decode: dspark k=7 backend=FLASHINFER
+PASS dsrel-c72-1p3d-spx decode: dspark k=7 backend=FLASHINFER: synthetic AL 4.16 -> rates [1.0, 1.0, 1.0, 0.16000000000000014, 0.0, 0.0, 0.0]
+PASS dsrel-c72-1p3d-spx decode: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c72-1p3d-xdr prefill: dspark k=7 backend=FLASHINFER
+PASS dsrel-c72-1p3d-xdr prefill: dspark k=7 backend=FLASHINFER: synthetic AL 4.16 -> rates [1.0, 1.0, 1.0, 0.16000000000000014, 0.0, 0.0, 0.0]
+PASS dsrel-c72-1p3d-xdr prefill: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrel-c72-1p3d-xdr decode: dspark k=7 backend=FLASHINFER
+PASS dsrel-c72-1p3d-xdr decode: dspark k=7 backend=FLASHINFER: synthetic AL 4.16 -> rates [1.0, 1.0, 1.0, 0.16000000000000014, 0.0, 0.0, 0.0]
+PASS dsrel-c72-1p3d-xdr decode: dspark k=7 backend=FLASHINFER: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS draft /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626: vLLM config architectures ['Qwen3DSparkModel']
+PASS draft: layer_types ['sliding_attention', 'sliding_attention', 'sliding_attention', 'sliding_attention', 'sliding_attention'], sliding_window 2048
+PASS draft: heads q 96 kv 16 dim 64
+PASS draft: eagle_aux_hidden_state_layer_ids [76, 80, 84, 88, 92]
+PASS draft: markov_rank 512, sample_from_anchor True
+PASS draft at TP4: 24 q / 4 kv heads per rank
+PASS draft at TP8: 12 q / 2 kv heads per rank
+PASS draft at TP16: 6 q / 1 kv heads per rank
+FLASHINFER_CUBIN_DIR=/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/env/fi-cubins-0.7.3.dev20261030 overrides the installed flashinfer-cubin package; cubins will be read from that path instead of the package.
+Ignoring invalid flashinfer jit-cache provider sm90a: No module named 'flashinfer_jit_cache.providers.sm90a'
+Ignoring invalid flashinfer jit-cache provider sm89: No module named 'flashinfer_jit_cache.providers.sm89'
+Ignoring invalid flashinfer jit-cache provider sm80: No module named 'flashinfer_jit_cache.providers.sm80'
+Ignoring invalid flashinfer jit-cache provider sm121a: No module named 'flashinfer_jit_cache.providers.sm121a'
+Ignoring invalid flashinfer jit-cache provider sm120f: No module named 'flashinfer_jit_cache.providers.sm120f'
+Ignoring invalid flashinfer jit-cache provider sm110a: No module named 'flashinfer_jit_cache.providers.sm110a'
+Ignoring invalid flashinfer jit-cache provider sm103a: No module named 'flashinfer_jit_cache.providers.sm103a'
+Ignoring invalid flashinfer jit-cache provider sm100a: No module named 'flashinfer_jit_cache.providers.sm100a'
+W1116 19:17:00.228000 2690447 torch/utils/cpp_extension.py:183] No CUDA runtime is found, using CUDA_HOME='/usr/local/cuda'
+PASS FLASHINFER (the renders' draft backend) accepts the GQA draft layers on sm_107 (head 64, bf16 KV, block 1024, sliding window, KV connector, no DCP): reasons []
+INFO FLASHINFER kernel block sizes outside a vLLM config context: [16, 32, 64]
+INFO alternative knob value FLASH_ATTN: validate_configuration reasons at block 1024: none (valid)
+INFO FLASH_ATTN kernel block sizes outside a vLLM config context: [MultipleOf(16)]
+PASS negative control: TOKENSPEED_MLA (the frozen renders' value) rejects the GQA draft layers (block 1024): ['head_size not supported', 'kv_cache_dtype not supported', 'non-MLA not supported', 'sliding window not supported']
+INFO TOKENSPEED_MLA kernel block sizes outside a vLLM config context: [32, 64]
+INFO alternative knob value TRITON_ATTN: validate_configuration reasons at block 1024: none (valid)
+INFO TRITON_ATTN kernel block sizes outside a vLLM config context: [MultipleOf(16)]
+VLLM_CHECK PASS: 0 failure(s), 32 renders, drafts {'/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626': 64}

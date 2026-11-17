@@ -1,0 +1,3 @@
+frz-c72-1p3d-spx: run definition = /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/nq4kmc-c64-spx with prefill AND decode code from wzhao/k31-vr-hti-integ af10ccc2c4
+(tree /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/hti/lowlat/trees/ll-integ-dea4ebd06f, see its STAGED.txt). Built by frz-c72-1p3d-tools/mk_integ_render.sh (integf7 rules, point c64); changes listed in integ_edit.py;
+verified by frz-c72-1p3d-tools/check_integ.sh c64 spx.

@@ -1,0 +1,2 @@
+frz frz-c72-1p3d from /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/integaf10frz-c72-1p3d-spx (2026-11-14T17:28:35-08:00): frozen tree ll-integ-dea4ebd06f (b68d67e7e), decode watermark 0.05, K3.1 golden AL
+frz-c72-1p3d = frz-c64 + conc 72, dec_workers 3, dec_mns None; own AIPERF_RUNTIME_DIR /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/agentx-runtime/frz-c72-1p3d (xpyd wf_82555e99)

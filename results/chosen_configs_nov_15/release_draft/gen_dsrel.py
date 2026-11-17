@@ -1,0 +1,444 @@
+#!/usr/bin/env python3
+"""gen_dsrel.py: release-draft renders of the 8 chosen Kimi K3.1 VR200 points (Inferact/Kimi-K3.1-Pro-DSpark @ e4e6e626).
+
+Each chosen point has a frozen AgentX render frz-<base>-<fab> and a gsm8k twin frz-<base>-ev-<fab> per fabric (xdr = IB,
+spx = RoCE). This script derives
+    dsrel-<base>-<fab>      from  frz-<base>-<fab>        (AgentX: synthetic rejection at the release golden AL)
+    dsrel-<base>-ev-<fab>   from  frz-<base>-ev-<fab>     (gsm8k: real (block) rejection, AL dropped)
+and changes ONLY:
+  1. Draft: the extra_mount  <deps>/kimi-k3.1-pro-dspark-preview:/raid/common-models/kimi-k3.1-pro-dspark-preview:ro
+     becomes                 <deps>/kimi-k3.1-pro-dspark-e4e6e626:/raid/common-models/kimi-k3.1-pro-dspark:ro
+     and "model" in the speculative-config of the prefill AND the decode role becomes /raid/common-models/kimi-k3.1-pro-dspark.
+  2. Draft attention backend: "attention_backend": "TOKENSPEED_MLA" (an MLA backend: it raises for the GQA sliding-window
+     draft) becomes --draft-attn-backend (default FLASHINFER; "auto" drops the key, then configure_dense_draft picks
+     FLASH_ATTN). One value for both roles: P writes the draft KV, NIXL moves it, D reads it, so both use one KV layout.
+  3. AgentX renders: synthetic_acceptance_length becomes the release golden AL for the render's k (RELEASE_AL), and
+     golden-acceptance.json and AL_FIX.txt record it. gsm8k twins keep real rejection and golden-acceptance null.
+  4. Names: every full render name frz-<base>[-ev]-<fab> becomes dsrel-<base>[-ev]-<fab> in every runtime file. That covers
+     the job name, the config name, and the render dir in sbatch_script.sh / render.json. sbatch_script.sh copies
+     <render dir>/render/*.yaml into the run dir at job start, so a stale name would run the OLD render's config.yaml.
+     Provenance records (*.txt, *.log) stay verbatim; DSREL.txt is added.
+  5. render/git_state.txt: the draft line of srtctl's extra-mount snapshot (exactly what `srtctl render` writes).
+     hybrid.yaml (srtctl's recipe record) gets the same draft edits as render/config.yaml (the file that runs). In most
+     frozen renders hybrid.yaml predates later edits of render/config.yaml (Mooncake 0.3.14 wrapper, gsm8k-twin keys), and
+     those differences are kept. Any synthetic AL in it becomes the release AL of its k.
+  6. --tree (optional): the vLLM tree on the prefill and decode PYTHONPATH. The default keeps the frozen tree, so nothing
+     changes. The release draft needs the integrated dsrel code (NIXL draft-KV transfer, the K3 GQA drafter fast path,
+     the KV planner): regenerate with --tree <integrated tree> --replace before a launch (README.md).
+Everything else stays byte-identical: topology, k, CONC, capture sizes, Mooncake, precision, env, JIT/cache dirs and the
+AgentX client runtime dir. The script checks this itself: it parses both YAMLs and diffs the flattened trees, and it
+re-checks the JSON of both speculative-configs. check_dsrel.py adds the srtctl render/preflight checks on Hecate.
+
+Modes:
+  Hecate (default): python3 gen_dsrel.py [--points C1,C64,...] [--fabrics xdr,spx] [--kinds agentx,gsm8k]
+                        [--draft-attn-backend FLASHINFER] [--tree DIR] [--prefix dsrel] [--replace] [--stamp ISO]
+      reads $RS/frz-*, writes $RS/<prefix>-* (RS = /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders). It
+      refuses to overwrite an existing render without --replace. --replace moves the old one to <name>.prev-<stamp>, and it
+      refuses if a run of that render is still in progress.
+  Mirror: python3 gen_dsrel.py --mirror <chosen_configs_nov_15 dir>
+      reads configs/<point>/{agentx,gsm8k} (the frozen renders of the chosen fabric, byte copies of Hecate's) and writes
+      release_draft/configs/<point>/{agentx,gsm8k}. These are byte copies of what Hecate mode writes for that fabric with
+      the same --stamp, so the repo diff vs ../configs is the exact render change.
+Python 3.9+, standard library only; PyYAML (when importable) adds the parsed-tree self-check.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import glob
+import hashlib
+import json
+import os
+import re
+import shutil
+import sys
+import time
+
+W = "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr"
+RS = f"{W}/e2e/renders"
+OUTPUTS = f"{W}/e2e/outputs"
+DEPS = f"{W}/jh/noquant/cfg2/deps"
+PREVIEW_HOST = f"{DEPS}/kimi-k3.1-pro-dspark-preview"
+PREVIEW_MNT = "/raid/common-models/kimi-k3.1-pro-dspark-preview"
+RELEASE_HOST = f"{DEPS}/kimi-k3.1-pro-dspark-e4e6e626"
+RELEASE_MNT = "/raid/common-models/kimi-k3.1-pro-dspark"
+RELEASE_ID = "Inferact/Kimi-K3.1-Pro-DSpark @ e4e6e6261e9f8b6d5f249f9627eb6b109d762d5f"
+RELEASE_SHA256 = "83a4f35d3a68fe69275b548a0658f687b5bddaf48f8201f999ef81b538f1fb5f"
+FROZEN_TREE = f"{W}/hti/lowlat/trees/ll-integ-dea4ebd06f"
+
+# InferenceX golden AL tables (probabilistic draft sampling, block verification, thinking_on, SPEED-Bench coding).
+RELEASE_AL = {1: 1.86, 2: 2.56, 3: 3.08, 4: 3.46, 5: 3.81, 6: 4.00, 7: 4.16}
+RELEASE_AL_SRC = ("InferenceX 5146af7ab7 inferencex-e2e/infx/golden_al_distribution/"
+                  "kimi-k3.1-pro__dspark__kimi-k3.1-pro-dspark__probabilistic-block.yaml")
+PREVIEW_AL = {1: 1.82, 2: 2.44, 3: 2.88, 4: 3.19, 5: 3.41, 6: 3.57, 7: 3.69, 8: 3.68}  # hti/lowlat/fixal.sh (frozen sweep)
+
+# label (results/chosen_configs_nov_15/configs/<label>), frozen render base (frz-<base>), fabric of the chosen run
+POINTS = (
+    ("C1", "c1", "xdr"),
+    ("C16-1P2D", "c16-1p2d", "xdr"),
+    ("C72-1P3D", "c72-1p3d", "spx"),
+    ("C48-1P1D", "c48-1p1d", "spx"),
+    ("C64", "c64", "spx"),
+    ("C128-1P1D", "c128-1p1d", "spx"),
+    ("C160-1P1D-llh", "c160-1p1d-llh", "xdr"),
+    ("C512", "c512", "spx"),
+)
+FABRICS = ("xdr", "spx")
+KINDS = ("agentx", "gsm8k")
+# Valid for the release draft's layers (GQA, head_dim 64, sliding window 2048, BF16 KV): AttentionBackendEnum names, or
+# "auto" = drop the key (configure_dense_draft -> FLASH_ATTN, which is FA2 via PTX on sm_107 in the frozen tree).
+BACKENDS = ("FLASHINFER", "FLASH_ATTN", "TRITON_ATTN", "auto")
+PROVENANCE_SUFFIXES = (".txt", ".log")  # provenance records: kept verbatim (never read by a run)
+SPEC_RE = re.compile(r"^( +)speculative-config: '(\{[^']*\})'$", re.M)
+PYPATH_RE = re.compile(r"^( +PYTHONPATH: )(.*)$", re.M)
+SPEC_CHANGED = ("model", "attention_backend", "synthetic_acceptance_length")
+
+
+class GenError(RuntimeError):
+    pass
+
+
+def need(cond: bool, msg: str) -> None:
+    if not cond:
+        raise GenError(msg)
+
+
+def frz_name(base: str, kind: str, fab: str) -> str:
+    return f"frz-{base}-ev-{fab}" if kind == "gsm8k" else f"frz-{base}-{fab}"
+
+
+def dst_name(prefix: str, base: str, kind: str, fab: str) -> str:
+    return f"{prefix}-{base}-ev-{fab}" if kind == "gsm8k" else f"{prefix}-{base}-{fab}"
+
+
+def full_name_re(base: str) -> re.Pattern:
+    """Full frozen render names of one point (both kinds, both fabrics); never a prefix of another point's name."""
+    return re.compile(r"(?<![\w-])frz-" + re.escape(base) + r"(-ev)?-(xdr|spx)(?![\w-])")
+
+
+def rename(text: str, base: str, prefix: str) -> tuple[str, int]:
+    return full_name_re(base).subn(lambda m: f"{prefix}-{base}{m.group(1) or ''}-{m.group(2)}", text)
+
+
+def rates(al: float, k: int) -> list[float]:
+    """vllm/config/speculative.py SpeculativeConfig._acceptance_length_to_rates (minimum-variance schedule)."""
+    n = al - 1
+    full = int(n)
+    return ([1.0] * full + [round(n - full, 6)] + [0.0] * (k - full - 1))[:k]
+
+
+def edit_spec(js: str, kind: str, backend: str, record: bool = False) -> tuple[str, dict]:
+    """record=False: render/config.yaml (what runs), strict per kind. record=True: hybrid.yaml, srtctl's recipe record,
+    which in most frozen renders predates later edits of render/config.yaml (gsm8k twins keep the AgentX recipe there,
+    some with the old K3 AL): same draft edits, and any synthetic AL becomes the release AL of its k."""
+    d = json.loads(js)
+    k = d.get("num_speculative_tokens")
+    need(d.get("method") == "dspark", f"speculative-config method {d.get('method')!r} != dspark")
+    need(d.get("model") == PREVIEW_MNT, f"speculative-config model {d.get('model')!r} != {PREVIEW_MNT}")
+    need(d.get("attention_backend") == "TOKENSPEED_MLA", f"attention_backend {d.get('attention_backend')!r}")
+    need(d.get("draft_sample_method") == "probabilistic", f"draft_sample_method {d.get('draft_sample_method')!r}")
+    need(isinstance(k, int) and k in RELEASE_AL, f"num_speculative_tokens {k!r} has no release golden AL")
+    need("synthetic_acceptance_rates" not in d, "speculative-config carries synthetic_acceptance_rates")
+    old_al, rej = d.get("synthetic_acceptance_length"), d.get("rejection_sample_method")
+    if record:
+        need(rej in ("synthetic", "block"), f"recipe record rejection {rej!r}")
+        need(((rej == "synthetic") == isinstance(old_al, float)) and (old_al is None or 1 <= old_al <= k + 1),
+             f"recipe record rejection {rej!r} with AL {old_al!r}")
+    elif kind == "agentx":
+        need(rej == "synthetic", f"agentx rejection {rej!r}")
+        need(old_al == PREVIEW_AL[k], f"agentx AL {old_al!r} != preview golden {PREVIEW_AL[k]} for k={k}")
+    else:
+        need(rej == "block", f"gsm8k rejection {rej!r}")
+        need(old_al is None, "gsm8k twin carries a synthetic AL")
+    d["model"] = RELEASE_MNT
+    if backend == "auto":
+        del d["attention_backend"]
+    else:
+        d["attention_backend"] = backend  # same key position
+    if rej == "synthetic":
+        d["synthetic_acceptance_length"] = RELEASE_AL[k]
+    sep = (",", ":") if '":"' in js or '","' in js else (", ", ": ")
+    new = json.dumps(d, separators=sep)
+    need("'" not in new, "single quote in speculative-config JSON")
+    return new, dict(k=k, old_al=old_al, al=d.get("synthetic_acceptance_length"), spec=d,
+                     rejection=d["rejection_sample_method"])
+
+
+def edit_yaml(text: str, kind: str, backend: str, tree: str, record: bool = False) -> tuple[str, dict]:
+    specs = SPEC_RE.findall(text)
+    need(len(specs) == 2, f"{len(specs)} speculative-config lines (want prefill + decode)")
+    need(specs[0][1] == specs[1][1], "prefill and decode speculative-configs differ in the source")
+    info = {}
+
+    def fix(m: re.Match) -> str:
+        new, inf = edit_spec(m.group(2), kind, backend, record)
+        info.update(inf)
+        return f"{m.group(1)}speculative-config: '{new}'"
+
+    text, n = SPEC_RE.subn(fix, text)
+    need(n == 2, f"edited {n} speculative-configs")
+    old_mount = f"- {PREVIEW_HOST}:{PREVIEW_MNT}:ro"
+    need(text.count(old_mount + "\n") == 1, f"draft extra_mount line found {text.count(old_mount)}x")
+    text = text.replace(old_mount + "\n", f"- {RELEASE_HOST}:{RELEASE_MNT}:ro\n")
+    need(text.count(FROZEN_TREE) == 2, f"frozen tree on {text.count(FROZEN_TREE)} lines (want prefill + decode PYTHONPATH)")
+    pp = PYPATH_RE.findall(text)
+    need(sum(FROZEN_TREE in v.split(":") for _, v in pp) == 2, "frozen tree not an element of exactly 2 PYTHONPATHs")
+    if tree != FROZEN_TREE:
+        text, n = PYPATH_RE.subn(
+            lambda m: m.group(1) + ":".join(tree if e == FROZEN_TREE else e for e in m.group(2).split(":")), text)
+        need(text.count(tree) == 2 and FROZEN_TREE not in text, "tree swap did not hit exactly the 2 role PYTHONPATHs")
+    for bad in ("kimi-k3.1-pro-dspark-preview", "TOKENSPEED_MLA"):
+        need(bad not in text, f"{bad} still in the config")
+    info["tree"] = tree
+    return text, info
+
+
+def flat(o, p=""):
+    if isinstance(o, dict):
+        for k, v in o.items():
+            yield from flat(v, f"{p}.{k}")
+    elif isinstance(o, list):
+        for i, v in enumerate(o):
+            yield from flat(v, f"{p}[{i}]")
+    else:
+        yield p, o
+
+
+def yaml_diff(src_text: str, dst_text: str, base: str, prefix: str) -> list[tuple[str, object, object]] | None:
+    """Flattened parsed-tree diff (source names mapped to the new names first); None without PyYAML."""
+    try:
+        import yaml
+    except ImportError:
+        return None
+    a = dict(flat(yaml.safe_load(rename(src_text, base, prefix)[0])))
+    b = dict(flat(yaml.safe_load(dst_text)))
+    return [(k, a.get(k, "<absent>"), b.get(k, "<absent>")) for k in sorted(set(a) | set(b))
+            if a.get(k, "<absent>") != b.get(k, "<absent>")]
+
+
+def check_diff(diffs, tree: str) -> list[str]:
+    """The parsed diff may contain only the draft keys (and the role PYTHONPATHs when the tree moves)."""
+    ok_keys = {".roles.prefill.args.speculative-config", ".roles.decode.args.speculative-config"}
+    if tree != FROZEN_TREE:
+        ok_keys |= {".roles.prefill.env.PYTHONPATH", ".roles.decode.env.PYTHONPATH"}
+    seen, bad = set(), []
+    for k, a, b in diffs:
+        if k in ok_keys:
+            seen.add(k)
+            if k.endswith("speculative-config"):
+                ja, jb = json.loads(a), json.loads(b)
+                moved = {x for x in set(ja) | set(jb) if ja.get(x) != jb.get(x)}
+                if not moved <= set(SPEC_CHANGED):
+                    bad.append(f"{k}: JSON keys {sorted(moved)} changed")
+        elif re.fullmatch(r"\.extra_mount\[\d+\]", k) and (a, b) == (
+                f"{PREVIEW_HOST}:{PREVIEW_MNT}:ro", f"{RELEASE_HOST}:{RELEASE_MNT}:ro"):
+            seen.add(".extra_mount")
+        else:
+            bad.append(f"{k}: {str(a)[:120]!r} -> {str(b)[:120]!r}")
+    for k in sorted((ok_keys | {".extra_mount"}) - seen):
+        bad.append(f"{k}: expected to change, did not")
+    return bad
+
+
+def in_progress_runs(name: str) -> list[str]:
+    """run_in_alloc.sh writes in_alloc.txt at start and appends rc= at the end: no rc= and < 8 h old = live."""
+    live = []
+    for f in glob.glob(f"{OUTPUTS}/a*-{name}-*/in_alloc.txt"):
+        try:
+            if "rc=" not in open(f).read() and time.time() - os.path.getmtime(f) < 8 * 3600:
+                live.append(os.path.dirname(f))
+        except OSError:
+            continue
+    return live
+
+
+def derive(src: str, dst: str, *, base: str, prefix: str, kind: str, fab: str, backend: str, tree: str,
+           stamp: str, gen_md5: str, replace: bool, hecate: bool) -> dict:
+    need(os.path.isdir(src), f"missing source render {src}")
+    sname, dname = frz_name(base, kind, fab), dst_name(prefix, base, kind, fab)
+    if os.path.exists(dst):
+        need(replace, f"{dst} exists (use --replace)")
+        if hecate:
+            live = in_progress_runs(dname)
+            need(not live, f"{dname} has runs in progress: {live}")
+    tmp = f"{dst}.tmp-{os.getpid()}"
+    shutil.rmtree(tmp, ignore_errors=True)
+    shutil.copytree(src, tmp, symlinks=True)
+    try:
+        info = _derive_in_place(tmp, src, base=base, prefix=prefix, kind=kind, sname=sname, dname=dname,
+                                backend=backend, tree=tree, stamp=stamp, gen_md5=gen_md5)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    if os.path.exists(dst):
+        if hecate:  # keep the replaced render next to the new one
+            os.rename(dst, f"{dst}.prev-{stamp.replace(':', '')}")
+        else:  # mirror: the repo keeps history
+            shutil.rmtree(dst)
+    os.rename(tmp, dst)
+    info.update(src=src, dst=dst, name=dname)
+    return info
+
+
+def _derive_in_place(d: str, src: str, *, base, prefix, kind, sname, dname, backend, tree, stamp, gen_md5) -> dict:
+    files = sorted(os.path.relpath(os.path.join(r, f), d) for r, _, fs in os.walk(d) for f in fs)
+    need(not any(os.path.islink(os.path.join(d, f)) for f in files), "symlink in the source render")
+    for f in ("hybrid.yaml", "render/config.yaml", "render/sbatch_script.sh", "render/render.json",
+              "render/git_state.txt", "golden-acceptance.json", "workflow.env.resolved", "point.env"):
+        need(f in files, f"source render lacks {f}")
+    need(("AL_FIX.txt" in files) == (kind == "agentx"), "AL_FIX.txt presence does not match the render kind")
+    need("DSREL.txt" not in files, "source already has DSREL.txt")
+    need(sname in open(f"{d}/render/config.yaml").read(), f"source config does not name {sname}")
+    renamed = {}
+    for f in files:
+        if f.endswith(PROVENANCE_SUFFIXES):
+            continue
+        p = os.path.join(d, f)
+        t = open(p).read()
+        t2, n = rename(t, base, prefix)
+        need(not full_name_re(base).search(t2), f"{f}: frozen name left after rename")
+        if n:
+            with open(p, "w") as fh:
+                fh.write(t2)
+            renamed[f] = n
+    # the job copies <render dir>/render/*.yaml at start: it must be THIS render's dir
+    sb = open(f"{d}/render/sbatch_script.sh").read()
+    need(f'cp "{RS}/{dname}/render"/*.yaml "${{OUTPUT_DIR}}/"' in sb, "sbatch_script.sh does not stage its own render dir")
+    need(json.load(open(f"{d}/render/render.json"))["script"] == f"{RS}/{dname}/render/sbatch_script.sh",
+         "render.json script is not this render's")
+    # configs: render/config.yaml is what runs (sbatch_script.sh stages render/*.yaml; run_in_alloc.sh copies it);
+    # hybrid.yaml is srtctl's recipe record, which in most frozen renders predates later render/config.yaml edits
+    new, info = edit_yaml(open(f"{d}/render/config.yaml").read(), kind, backend, tree)
+    with open(f"{d}/render/config.yaml", "w") as fh:
+        fh.write(new)
+    new_hy, info_hy = edit_yaml(open(f"{d}/hybrid.yaml").read(), kind, backend, tree, record=True)
+    need(info_hy["k"] == info["k"], f"hybrid.yaml k={info_hy['k']} != render/config.yaml k={info['k']}")
+    with open(f"{d}/hybrid.yaml", "w") as fh:
+        fh.write(new_hy)
+    # git state snapshot: srtctl lists every extra mount as "  - extra_mount:<target>:ro: <host>"
+    gp = f"{d}/render/git_state.txt"
+    g = open(gp).read()
+    old_l, new_l = f"  - extra_mount:{PREVIEW_MNT}:ro: {PREVIEW_HOST}\n", f"  - extra_mount:{RELEASE_MNT}:ro: {RELEASE_HOST}\n"
+    need(g.count(old_l) == 1, "git_state.txt draft mount line not found once")
+    with open(gp, "w") as fh:
+        fh.write(g.replace(old_l, new_l))
+    # AL records
+    k, al = info["k"], info["al"]
+    ga = json.load(open(f"{d}/golden-acceptance.json"))
+    if kind == "agentx":
+        need(ga == {"golden_acceptance_length": PREVIEW_AL[k]}, f"source golden-acceptance.json {ga}")
+        with open(f"{d}/golden-acceptance.json", "w") as fh:
+            fh.write(f'{{"golden_acceptance_length": {al}}}\n')
+        with open(f"{d}/AL_FIX.txt", "w") as fh:
+            fh.write(f"{stamp} AL -> {al} (k={k}, InferenceX K3.1 RELEASE golden table: {RELEASE_AL_SRC}; "
+                     f"was {info['old_al']} = preview table)\n")
+    else:
+        need(ga == {"golden_acceptance_length": None}, f"gsm8k source golden-acceptance.json {ga}")
+    # parsed self-check of both YAMLs against their own sources
+    diffs = yaml_diff(open(f"{src}/render/config.yaml").read(), new, base, prefix)
+    diffs_hy = yaml_diff(open(f"{src}/hybrid.yaml").read(), new_hy, base, prefix)
+    for f, dd in (("render/config.yaml", diffs), ("hybrid.yaml", diffs_hy)):
+        bad = check_diff(dd, tree) if dd is not None else []
+        need(not bad, f"{f}: unexpected parsed differences: " + "; ".join(bad))
+    rt = re.findall(r"^AIPERF_RUNTIME_DIR=(.*)$", open(f"{d}/workflow.env.resolved").read(), re.M)
+    bare = sorted({f for f in files if not f.endswith(PROVENANCE_SUFFIXES)
+                   and f"frz-{base}" in open(os.path.join(d, f)).read()})
+    spec_line = json.dumps(info["spec"])
+    with open(f"{d}/DSREL.txt", "w") as fh:
+        fh.write(
+            f"{dname} = {sname} + release draft (gen_dsrel.py md5 {gen_md5}, {stamp})\n"
+            f"  source: {RS}/{sname} (frozen sweep render; its provenance: FRZ.txt, INTEG.txt)\n"
+            f"  draft: {RELEASE_ID} (model.safetensors sha256 {RELEASE_SHA256})\n"
+            f"         extra_mount {RELEASE_HOST} -> {RELEASE_MNT} (ro); was {PREVIEW_HOST} -> {PREVIEW_MNT}\n"
+            f"  speculative-config (prefill = decode): model -> {RELEASE_MNT}; attention_backend TOKENSPEED_MLA -> "
+            f"{'(dropped: auto = FLASH_ATTN)' if backend == 'auto' else backend}"
+            + (f"; synthetic_acceptance_length {info['old_al']} -> {al} (k={k}, release golden, rates "
+               f"{rates(al, k)})" if kind == "agentx" else "; real (block) rejection, no synthetic AL") + "\n"
+            f"  now: {spec_line}\n"
+            f"  hybrid.yaml (srtctl's recipe record; render/config.yaml is what runs): the same draft edits; its "
+            f"speculative-config is {info_hy['rejection']}"
+            + (f", AL {info_hy['old_al']} -> {info_hy['al']}" if info_hy["rejection"] == "synthetic" else "") + "\n"
+            f"  tree (prefill + decode PYTHONPATH): {tree}"
+            + (" (frozen tree, unchanged: no release-draft support; regenerate with --tree <integrated tree> before a "
+               "launch)" if tree == FROZEN_TREE else f" (was {FROZEN_TREE})") + "\n"
+            f"  renamed {sname} -> {dname} in: "
+            + ", ".join(f"{f} x{n}" for f, n in sorted(renamed.items())) + "\n"
+            f"  kept: every other key and file (parsed-YAML diff vs the source = the keys above"
+            f"{'' if diffs is not None else ' [PyYAML missing: not self-checked]'}); AIPERF_RUNTIME_DIR "
+            f"{rt[0] if rt else '-'} (the source's AgentX client venv, shared)"
+            + (f"; bare source base frz-{base} still named in {bare} (that runtime dir only)" if bare else "") + "\n")
+    info.update(renamed=renamed, diffs=len(diffs) if diffs is not None else None,
+                diffs_hy=len(diffs_hy) if diffs_hy is not None else None, bare=bare)
+    return info
+
+
+def summary(info: dict) -> str:
+    d = info["dst"]
+    nodes = json.load(open(f"{d}/render/render.json"))["total_nodes"]
+    s = info["spec"]
+    return (f"{info['name']:<30} nodes={nodes:<2} k={info['k']} {s['rejection_sample_method']:<9} "
+            f"AL={str(s.get('synthetic_acceptance_length', '-')):<5} backend={s.get('attention_backend', 'auto(FLASH_ATTN)'):<11} "
+            f"draft={s['model']} tree={os.path.basename(info['tree'])} parsed-diffs config={info['diffs']} "
+            f"hybrid={info['diffs_hy']}")
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--points", default=",".join(p for p, _, _ in POINTS), help="labels, comma-separated")
+    ap.add_argument("--fabrics", default=",".join(FABRICS))
+    ap.add_argument("--kinds", default=",".join(KINDS))
+    ap.add_argument("--draft-attn-backend", default="FLASHINFER", choices=BACKENDS)
+    ap.add_argument("--tree", default=FROZEN_TREE, help="vLLM tree for the prefill + decode PYTHONPATH")
+    ap.add_argument("--prefix", default="dsrel")
+    ap.add_argument("--replace", action="store_true")
+    ap.add_argument("--stamp", default=None, help="ISO time recorded in DSREL.txt / AL_FIX.txt (default: now)")
+    ap.add_argument("--mirror", default=None, help="chosen_configs_nov_15 dir: write release_draft/configs from configs/")
+    a = ap.parse_args(argv)
+    stamp = a.stamp or datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+    gen_md5 = hashlib.md5(open(os.path.abspath(__file__), "rb").read()).hexdigest()
+    pts = {p: (b, f) for p, b, f in POINTS}
+    labels = [x for x in a.points.split(",") if x]
+    for x in labels:
+        need(x in pts, f"unknown point {x} (known: {', '.join(pts)})")
+    need(re.fullmatch(r"[a-z][a-z0-9]*", a.prefix) is not None and a.prefix != "frz", f"bad prefix {a.prefix!r}")
+    tree = os.path.normpath(a.tree)
+    if a.mirror is None:
+        for f in ("vllm/__init__.py", "vllm/v1/attention/backends/registry.py"):
+            need(os.path.isfile(f"{tree}/{f}"), f"--tree {tree} has no {f}")
+        reg_path = f"{tree}/vllm/v1/attention/backends/registry.py"
+    else:  # the checkout this script lives in (results/chosen_configs_nov_15/release_draft -> repo root)
+        reg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../../vllm/v1/attention/backends/registry.py")
+    if a.draft_attn_backend != "auto" and os.path.isfile(reg_path):
+        need(re.search(rf"^    {a.draft_attn_backend} = ", open(reg_path).read(), re.M) is not None,
+             f"{a.draft_attn_backend} is not an AttentionBackendEnum member in {reg_path}")
+    jobs = []
+    for label in labels:
+        base, chosen = pts[label]
+        for kind in [x for x in a.kinds.split(",") if x]:
+            need(kind in KINDS, f"bad kind {kind}")
+            if a.mirror:
+                src = f"{a.mirror}/configs/{label}/{kind}"
+                dst = f"{a.mirror}/release_draft/configs/{label}/{kind}"
+                jobs.append((src, dst, base, kind, chosen))
+            else:
+                for fab in [x for x in a.fabrics.split(",") if x]:
+                    need(fab in FABRICS, f"bad fabric {fab}")
+                    jobs.append((f"{RS}/{frz_name(base, kind, fab)}", f"{RS}/{dst_name(a.prefix, base, kind, fab)}",
+                                 base, kind, fab))
+    rc = 0
+    for src, dst, base, kind, fab in jobs:
+        try:
+            if a.mirror:
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+            info = derive(src, dst, base=base, prefix=a.prefix, kind=kind, fab=fab, backend=a.draft_attn_backend,
+                          tree=tree, stamp=stamp, gen_md5=gen_md5, replace=a.replace, hecate=a.mirror is None)
+            print("made " + summary(info))
+        except GenError as e:
+            print(f"FAIL {dst}: {e}")
+            rc = 1
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())
