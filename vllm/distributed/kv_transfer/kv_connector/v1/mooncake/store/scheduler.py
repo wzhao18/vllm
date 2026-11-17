@@ -85,7 +85,8 @@ def _partial_tail_non_mamba_puts(
     are 8-10, keyed at 36, 40 and 44.
 
     A Mamba state handed off at any other position, i.e. a shared-prefix
-    junction (``--enable-mamba-shared-prefix-checkpoint``), adds no puts here.
+    junction (``--enable-mamba-shared-prefix-checkpoint``), adds no puts here;
+    sliding-window groups get their tail there from ``_state_window_tail_puts``.
 
     ``block_sizes`` are the per-group block sizes, indexed like
     ``req_meta.block_ids``.
@@ -135,6 +136,80 @@ def _partial_tail_non_mamba_puts(
             num_tokens = min((block_idx + 1) * block_size, proof_end)
             puts.append(BoundaryPut(group_id, block_id, num_tokens))
     return puts
+
+
+def _state_window_tail_puts(
+    coord: MooncakeStoreCoordinator,
+    req_meta: ReqMeta,
+    block_sizes: Sequence[int],
+) -> list[BoundaryPut]:
+    """Locate the sliding-window tails ending at the Mamba states a job stores.
+
+    A store hit lands only where every group hits. A sliding-window group hits
+    at a boundary only with its window tail, the blocks ending there
+    (``coord.window_tail_blocks``), but the normal save keeps a tail only at
+    the prompt's replay boundary (``store_mask``). So a Mamba state stored
+    anywhere else, i.e. a shared-prefix junction or the extra pre-tail
+    checkpoint (``--mamba-extra-tail-checkpoint-tokens``), could not be hit.
+    As the local prefix cache does (``SlidingWindowManager.cache_blocks`` with
+    ``tails_at_state_boundaries``), put the tail ending at each Mamba state
+    this job stores. Tails the normal or partial-tail saves already hold are
+    put again under the same keys, which the worker dedupes against the store.
+
+    Blocks past this step's computed prefix and null (already freed) blocks
+    are skipped. ``block_sizes`` are the per-group block sizes, indexed like
+    ``req_meta.block_ids``.
+    """
+    if not coord.window_tail_blocks:
+        return []
+    boundaries = {
+        put.num_tokens
+        for put in req_meta.boundary_puts or []
+        if put.group_id in coord.mamba_group_ids
+    }
+    if not boundaries:
+        return []
+    completed = req_meta.completed_token_len
+    num_hashes = len(req_meta.block_hashes)
+    puts: list[BoundaryPut] = []
+    for group_id, need in coord.window_tail_blocks.items():
+        block_size = block_sizes[group_id]
+        # With EAGLE the tail ends on the block past the boundary.
+        shift = int(group_id in coord.eagle_group_ids)
+        tail_blocks: set[int] = set()
+        for boundary in boundaries:
+            end = boundary // block_size + shift
+            tail_blocks.update(range(max(0, end - need), end))
+        group_blocks = req_meta.block_ids[group_id]
+        for block_idx in sorted(tail_blocks):
+            num_tokens = (block_idx + 1) * block_size
+            if (
+                block_idx >= len(group_blocks)
+                or (completed is not None and num_tokens > completed)
+                or num_tokens // coord.hash_block_size > num_hashes
+            ):
+                continue
+            block_id = group_blocks[block_idx]
+            if block_id != NULL_BLOCK_ID:
+                puts.append(BoundaryPut(group_id, block_id, num_tokens))
+    return puts
+
+
+def _non_mamba_boundary_puts(
+    coord: MooncakeStoreCoordinator,
+    req_meta: ReqMeta,
+    block_sizes: Sequence[int],
+) -> list[BoundaryPut]:
+    """The partial-tail puts plus the window tails at the job's Mamba states,
+    each block once."""
+    return list(
+        dict.fromkeys(
+            [
+                *_partial_tail_non_mamba_puts(coord, req_meta, block_sizes),
+                *_state_window_tail_puts(coord, req_meta, block_sizes),
+            ]
+        )
+    )
 
 
 class MooncakeStoreScheduler:
@@ -723,7 +798,7 @@ class MooncakeStoreScheduler:
             if req_meta.store_job_id is not None:
                 assert req_meta.store_job_id in self._pinned_saves
                 continue
-            if tail := _partial_tail_non_mamba_puts(coord, req_meta, block_sizes):
+            if tail := _non_mamba_boundary_puts(coord, req_meta, block_sizes):
                 req_meta.boundary_puts = [*tail, *(req_meta.boundary_puts or [])]
             req_meta.store_job_id = store_job_id = self._next_store_job_id
             self._next_store_job_id += 1
@@ -801,7 +876,7 @@ class MooncakeStoreScheduler:
         coord = self._store_coord
         assert coord is not None
         req_meta.boundary_puts = [
-            *_partial_tail_non_mamba_puts(
+            *_non_mamba_boundary_puts(
                 coord,
                 req_meta,
                 [g.kv_cache_spec.block_size for g in coord.kv_cache_groups],

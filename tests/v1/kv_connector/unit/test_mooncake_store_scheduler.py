@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator import (
+    ExternalCachedBlockPool,
     MooncakeStoreCoordinator,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
@@ -23,6 +24,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.scheduler import (
     MooncakeStoreScheduler,
     _partial_tail_non_mamba_puts,
+    _state_window_tail_puts,
 )
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -2029,3 +2031,236 @@ def test_resume_policy_keeps_the_legacy_prune():
     assert req_meta.prune_resume_tokens == 32
     assert req_meta.prune_targets == ()
     assert not scheduler._state_origin
+
+
+def _window_hybrid_groups(
+    window: int = 13, eagle: bool = False
+) -> list[KVCacheGroupSpec]:
+    """Full attention, a Mamba group and a sliding-window draft group (the
+    release DSpark draft beside Kimi K3.1's KDA and MLA/DSA groups)."""
+    return [
+        KVCacheGroupSpec(
+            ["attention"],
+            FullAttentionSpec(
+                block_size=4, num_kv_heads=1, head_size=1, dtype=torch.float32
+            ),
+            is_eagle_group=eagle,
+        ),
+        KVCacheGroupSpec(
+            ["mamba"],
+            MambaSpec(
+                block_size=16,
+                shapes=((1,),),
+                dtypes=(torch.float32,),
+                mamba_cache_mode="align",
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["draft"],
+            SlidingWindowSpec(
+                block_size=4,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=window,
+            ),
+            is_eagle_group=eagle,
+        ),
+    ]
+
+
+def _window_tail_store(
+    coord: MooncakeStoreCoordinator,
+    hashes: list[bytes],
+    num_prompt_tokens: int,
+    mamba_states: list[int],
+    window_tails: bool,
+) -> set[tuple[int, bytes]]:
+    """The ``(group, hash)`` keys one prompt leaves in the store: its normal
+    saves (``store_mask``), its Mamba states, its partial tail and, with
+    ``window_tails``, the window tails at its Mamba states."""
+    hash_block_size = coord.hash_block_size
+    lcm_end = num_prompt_tokens // coord.lcm_block_size * coord.lcm_block_size
+    exists: set[tuple[int, bytes]] = set()
+    masks = coord.store_mask(lcm_end, 0, num_prompt_tokens=num_prompt_tokens)
+    for group_id, group in enumerate(coord.kv_cache_groups):
+        block_size = group.kv_cache_spec.block_size
+        for chunk in range(lcm_end // block_size):
+            mask = masks[group_id]
+            if mask is None or mask[chunk]:
+                hash_idx = (chunk + 1) * block_size // hash_block_size - 1
+                exists.add((group_id, hashes[hash_idx]))
+    block_sizes = [g.kv_cache_spec.block_size for g in coord.kv_cache_groups]
+    req_meta = ReqMeta(
+        req_id="req-0",
+        token_len_chunk=lcm_end,
+        # Every block is still allocated (identity IDs, none null).
+        block_ids=tuple(
+            list(range(1, num_prompt_tokens // size + 2)) for size in block_sizes
+        ),
+        block_hashes=hashes,
+        num_prompt_tokens=num_prompt_tokens,
+        completed_token_len=num_prompt_tokens,
+        boundary_puts=[BoundaryPut(1, 99, n) for n in mamba_states],
+        publish_partial_tail=True,
+    )
+    puts = [
+        *_partial_tail_non_mamba_puts(coord, req_meta, block_sizes),
+        *req_meta.boundary_puts,
+    ]
+    if window_tails:
+        puts += _state_window_tail_puts(coord, req_meta, block_sizes)
+    exists.update(
+        (put.group_id, hashes[put.num_tokens // hash_block_size - 1]) for put in puts
+    )
+    return exists
+
+
+@pytest.mark.parametrize("window_tails", [False, True])
+@pytest.mark.parametrize(
+    "shared_tokens, hit_with_tails, hit_without_tails",
+    [
+        # Diverges past the shared-prefix junction (48).
+        (60, 48, 0),
+        # Diverges between the extra pre-tail checkpoint (112, below the LCM
+        # floor 128 of the prompt checkpoint) and the prompt's end.
+        (140, 112, 0),
+        # Extends the whole prompt: resumes at the prompt checkpoint (148, a
+        # sub-block state the internal snapshot exports), which the normal and
+        # partial-tail saves already cover.
+        (150, 148, 148),
+    ],
+)
+def test_store_hit_at_mamba_state_needs_window_tail(
+    window_tails, shared_tokens, hit_with_tails, hit_without_tails
+):
+    """A store hit lands only where every group hits. With a sliding-window
+    group, a Mamba state stored at a shared-prefix junction or at the extra
+    pre-tail checkpoint is reachable only if the window tail ending there is
+    stored as well, as the local prefix cache keeps it."""
+    # Retention 0 (the CacheConfig default): the normal save keeps the window
+    # tail only at the prompt's replay boundary.
+    coord = MooncakeStoreCoordinator(
+        _window_hybrid_groups(),
+        64,
+        4,
+        retention_interval=0,
+        enable_partial_hash_hits=True,
+    )
+    assert coord.window_tail_blocks == {2: 3}
+    hashes = [b"p%d" % i for i in range(150 // 4)]
+    exists = _window_tail_store(
+        coord,
+        hashes,
+        num_prompt_tokens=150,
+        mamba_states=[48, 112, 148],
+        window_tails=window_tails,
+    )
+    sibling_tokens = shared_tokens + 40
+    sibling = hashes[: shared_tokens // 4] + [
+        b"s%d" % i for i in range(shared_tokens // 4, sibling_tokens // 4)
+    ]
+
+    _, hit = coord.find_longest_cache_hit(
+        sibling,
+        coord.align_lookup_length(sibling_tokens),
+        ExternalCachedBlockPool(4, exists),
+    )
+
+    assert hit == (hit_with_tails if window_tails else hit_without_tails)
+
+
+def test_window_tail_puts_skip_freed_and_uncomputed_blocks():
+    coord = MooncakeStoreCoordinator(
+        _window_hybrid_groups(), 64, 4, enable_partial_hash_hits=True
+    )
+    window = list(range(10, 50))
+    window[9] = 0  # freed (null)
+    req_meta = ReqMeta(
+        req_id="req-0",
+        token_len_chunk=0,
+        block_ids=(list(range(1, 41)), [70, 71, 72, 73], window),
+        block_hashes=[bytes([i]) for i in range(40)],
+        num_prompt_tokens=160,
+        completed_token_len=52,
+        # A Mamba state at 48 and one at 52 (sub-block); another group's put
+        # at 100 is no state.
+        boundary_puts=[
+            BoundaryPut(1, 72, 48),
+            BoundaryPut(1, 73, 52),
+            BoundaryPut(0, 5, 100),
+        ],
+    )
+
+    # Tails: blocks 9-11 (to 48) and 10-12 (to 52); block 9 is null.
+    assert _state_window_tail_puts(coord, req_meta, [4, 16, 4]) == [
+        BoundaryPut(2, window[10], 44),
+        BoundaryPut(2, window[11], 48),
+        BoundaryPut(2, window[12], 52),
+    ]
+
+    # With EAGLE the tail ends on the block past the state: block 13 ends at
+    # 56, past the 52 computed tokens, so it is not put yet.
+    eagle = MooncakeStoreCoordinator(
+        _window_hybrid_groups(eagle=True),
+        64,
+        4,
+        use_eagle=True,
+        enable_partial_hash_hits=True,
+    )
+    assert eagle.window_tail_blocks == {2: 4}
+    req_meta.boundary_puts = [BoundaryPut(1, 73, 52)]
+    assert _state_window_tail_puts(eagle, req_meta, [4, 16, 4]) == [
+        BoundaryPut(2, window[10], 44),
+        BoundaryPut(2, window[11], 48),
+        BoundaryPut(2, window[12], 52),
+    ]
+
+    # No sliding-window group: nothing to add.
+    plain = MooncakeStoreCoordinator(
+        _window_hybrid_groups()[:2], 64, 4, enable_partial_hash_hits=True
+    )
+    assert plain.window_tail_blocks == {}
+    assert _state_window_tail_puts(plain, req_meta, [4, 16]) == []
+
+
+def test_junction_state_offload_pins_its_window_tail():
+    """The step that hands off a junction's Mamba state stores and pins the
+    window tail ending there, from the current block table."""
+    scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
+    scheduler._store_coord = MooncakeStoreCoordinator(
+        _window_hybrid_groups(window=9), 64, 4, enable_partial_hash_hits=True
+    )
+    scheduler._store_group_ids = (0, 1, 2)
+    scheduler._store_group_id_by_kv_cache_group_id = {0: 0, 1: 1, 2: 2}
+    request = SimpleNamespace(
+        all_token_ids=list(range(64)),
+        block_hashes=[bytes([i]) for i in range(16)],
+        num_output_placeholders=0,
+        num_prompt_tokens=64,
+    )
+    stale = (list(range(1, 9)), [0], [0] * 8)
+    scheduler._unfinished_requests["req-0"] = (request, stale)
+    scheduler._request_trackers["req-0"] = RequestTracker(
+        req_id="req-0",
+        token_len=32,
+        allocated_block_ids=stale,
+        num_saved_tokens=0,
+        prefill_end_tokens=64,
+    )
+    current = (list(range(1, 9)), [0, 20], [0] * 6 + [30, 31])
+    out = _make_offload_only_output([(1, 40, 32)], block_ids=current)
+
+    meta = scheduler.build_connector_meta(out)
+
+    req_meta = meta.requests[0]
+    assert req_meta.boundary_puts == [
+        BoundaryPut(2, 30, 28),
+        BoundaryPut(2, 31, 32),
+        BoundaryPut(1, 40, 32),
+    ]
+    pool = scheduler._gpu_block_pool
+    assert scheduler._pinned_saves[req_meta.store_job_id][0] == [30, 31, 40]
+    assert [pool.blocks[i].ref_cnt for i in (30, 31, 40)] == [1, 1, 1]
+    scheduler.update_connector_output(_make_worker_output({req_meta.store_job_id: 1}))
+    assert [pool.blocks[i].ref_cnt for i in (30, 31, 40)] == [0, 0, 0]
