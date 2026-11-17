@@ -81,6 +81,12 @@ GQA_WINDOW = {
              (0, (2, 4, 4, 0))),
     (1, 3): ((8, (16, 4, 2, 8)), (16, (8, 4, 3, 0)), (40, (4, 4, 3, 0)), (64, (8, 2, 3, 0)),
              (0, (4, 2, 3, 0))),
+    # k5 (C128 / C160 1P1D llh, TP16, release_draft/k5): (1, 3)'s shapes. Its 30 query
+    # rows per (request, KV head) fill the same two 16-row M tiles as k3's 18, so every
+    # shape builds alike (GqaWindow asserts) and each batch keeps k3's CTA count and
+    # wave. NQ-TUNE: --shape sweep at q5 (bench_gqa_attention_int.py) at B16-B48.
+    (1, 5): ((8, (16, 4, 2, 8)), (16, (8, 4, 3, 0)), (40, (4, 4, 3, 0)), (64, (8, 2, 3, 0)),
+             (0, (4, 2, 3, 0))),
     (2, 7): ((4, (8, 4, 3, 0)), (16, (4, 4, 4, 0)), (0, (2, 2, 3, 0))),
     (2, 3): ((4, (8, 4, 3, 0)), (32, (4, 2, 3, 0)), (0, (2, 2, 3, 0))),
     (4, 7): ((8, (8, 4, 3, 0)), (16, (8, 2, 3, 0)), (32, (4, 2, 3, 0)), (64, (2, 2, 3, 0)),
