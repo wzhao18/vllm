@@ -1596,6 +1596,10 @@ class KVCacheTensor:
     block_stride: int
     offset: int = 0  # byte offset of layers[0]'s block 0
     host_resident: bool = False
+    # Blocks this tensor addresses when its group packs several blocks into
+    # each pool block (``KVCacheGroupSpec.blocks_per_pool_block``); None: one
+    # per pool block.
+    num_blocks: int | None = None
 
 
 class KVCacheGroupRole(str, Enum):
@@ -1623,6 +1627,10 @@ class KVCacheGroupSpec:
     # source group after a connector load.
     enable_kv_transfer: bool = True
     role: KVCacheGroupRole = KVCacheGroupRole.DEFAULT
+    # Blocks of this group one block-outermost pool block holds. Above 1, the
+    # group's blocks are equal slots of pool blocks it takes from the shared
+    # pool on demand, so its block IDs index slots (pool block = ID // this).
+    blocks_per_pool_block: int = 1
 
 
 @dataclass
@@ -1724,6 +1732,8 @@ class KVCacheConfig:
 
     def num_blocks_of(self, tensor: KVCacheTensor) -> int:
         """Number of blocks addressable by the pool backing ``tensor``."""
+        if tensor.num_blocks is not None:
+            return tensor.num_blocks
         if not tensor.host_resident:
             return self.num_blocks
         assert self.hisparse_host_num_blocks is not None
