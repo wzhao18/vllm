@@ -92,6 +92,29 @@ def test_tp16_points_strict_tables_cover_every_batch(point):
         assert draft.covered(sites, b * k, k), (point, b)
 
 
+def test_c512_strict_tables_cover_every_batch():
+    """NQ-NOFALLBACK at C512's SP decode role (TP4 = DCP4, DL3 B2-B128 per DP rank):
+    every captured drafter batch has the vocabulary-parallel Markov sampling (the
+    fused kernels cannot hold TP4 at Markov rank 512), the sharded context step and
+    Lamport all-reduce sites."""
+    tp, k, batches = _batches("C512")
+    top = max(batches)
+    markov = draft.batch_table(draft.closed(draft.GQA_VP_MARKOV[tp], top))
+    context = draft.closed(draft.GQA_FAST_CONTEXT[tp], top * (k + 1))
+    sites = draft.closed(draft.GQA_FAST_AR[tp], top * k)
+    assert tp not in draft.GQA_FUSED_MARKOV
+    for b in batches:
+        assert markov.get(b), b
+        assert draft.covered(context, b * (k + 1), k), b
+        assert draft.covered(sites, b * k, k), b
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.draft import markov
+
+    rank512 = (163840, 512)
+    limits = (212, 232448, 233472)  # VR200
+    assert markov.supports(rank512, rank512, 16, limits)
+    assert not markov.supports(rank512, rank512, 4, limits)
+
+
 def test_gqa_shapes():
     assert draft.gqa_shapes(16) == {
         "qkv": (512, 7168),

@@ -1018,10 +1018,12 @@ GQA_PROJECTIONS = {
         (448, 35840): PROJECTIONS[16][(448, 35840)],
     },
     # TP4 (C512's SP decode role, DL3: 6 query / 8 context rows): qkv 6.21 -> 3.80,
-    # o_proj 3.91 -> 3.41, down 7.47 -> 5.99, context K/V 6.42 -> 4.21.
+    # o_proj 3.91 -> 3.41, gate_up 11.87 -> 10.16, down 7.47 -> 5.99, context K/V
+    # 6.42 -> 4.21.
     4: {
         (2048, 7168): (64, 8, 4, 8),
         (7168, 1536): (64, 8, 1, 8),
+        (7168, 7168): (64, 8, 1, 8),
         (7168, 3584): (64, 8, 1, 8),
         (2560, 7168): (64, 8, 4, 8),
     },
@@ -1064,7 +1066,8 @@ GQA_PROJECTIONS_WIDE = {
     ),
     # TP4 (us cuBLAS -> split-K): qkv 9-15 6.16 -> 3.92, 18-30 5.76 -> 4.55, 33-63
     # 6.59 -> 5.20; o_proj 9-15 3.93 -> 3.48, 18-30 4.06 -> 4.01 (33-63: cuBLAS 4.20
-    # vs 4.94, kept); down 9-15 7.96 -> 5.99, 18-30 7.70 -> 6.62, 33-63 8.71 -> 7.57;
+    # vs 4.94, kept); gate_up 9-15 12.11 -> 10.16, 18-30 12.61 -> 10.67, 33-63 13.74
+    # -> 12.42; down 9-15 7.96 -> 5.99, 18-30 7.70 -> 6.62, 33-63 8.71 -> 7.57;
     # context K/V 12-16 6.44 -> 4.28, 20-32 6.73 -> 4.95, 36-64 7.47 -> 5.73. Above
     # 64 rows cuBLAS (the M64 split-K loses there: TP16 qkv at 70 rows 6.49 vs 4.21).
     4: (
@@ -1073,6 +1076,7 @@ GQA_PROJECTIONS_WIDE = {
             {
                 (2048, 7168): (64, 16, 4, 8),
                 (7168, 1536): (64, 16, 1, 8),
+                (7168, 7168): (64, 16, 1, 8),
                 (7168, 3584): (64, 16, 1, 8),
                 (2560, 7168): (64, 16, 4, 8),
             },
@@ -1082,6 +1086,7 @@ GQA_PROJECTIONS_WIDE = {
             {
                 (2048, 7168): (64, 32, 4, 8),
                 (7168, 1536): (64, 32, 1, 8),
+                (7168, 7168): (64, 32, 1, 8),
                 (7168, 3584): (64, 32, 1, 8),
                 (2560, 7168): (64, 32, 4, 8),
             },
@@ -1090,6 +1095,7 @@ GQA_PROJECTIONS_WIDE = {
             64,
             {
                 (2048, 7168): (128, 64, 6, 16, 14),
+                (7168, 7168): (64, 64, 1, 6),
                 (7168, 3584): (64, 64, 1, 6),
                 (2560, 7168): (128, 64, 6, 16, 14),
             },
@@ -1202,6 +1208,39 @@ def install_gqa_projections(model, tp, query_rows, context_rows, rank=0):
                 "release GEMM bench)",
             )
     return installed
+
+
+def gqa_context_projection(prepared, tp):
+    """``PreparedContext``'s shard GEMM on the GQA tables' split-K tactics for its
+    static rows (the release drafter's fc shard: (448, 35840) at TP16, as the
+    preview's context_proj shard; (1792, 35840) at TP4), each publishing its rows
+    into the row mailbox itself (``GatherProjection``, polled CtxGather), as
+    ``PreparedContext.__init__`` sets them up from the preview's tables. Tactics with
+    the M tile 64 and N tiles of at most 16 rows only (the mailbox-publishing GEMM:
+    one 8-column fragment per epilogue thread, ``RingSplitKGemm``). Returns the rows
+    it set."""
+    from ..cutedsl.draft.context import CAP, GatherProjection, compile_gather
+    from ..cutedsl.gemm.projection import PreparedProjection
+
+    shard = prepared.shard
+    tactics = {}
+    for r in prepared.rows:
+        tactic = gqa_projection_tactic(shard.shape, tp, r)
+        if tactic is not None and len(tactic) == 4 and tactic[1] <= 16:
+            tactics[r] = tactic
+    current = prepared.projection.policies if prepared.projection is not None else {}
+    if not tactics or tactics == current:
+        return sorted(current)
+    index = prepared.device.index
+    prepared.projection = PreparedProjection(shard, tactics).prepare()
+    prepared.ring = GatherProjection(shard, tactics).prepare()
+    prepared.polled = {
+        r: compile_gather(r, shard.shape[0], index, True) for r in tactics
+    }
+    prepared.shape_rows = torch.empty(
+        (CAP, shard.shape[0]), dtype=torch.bfloat16, device=prepared.device
+    )
+    return sorted(tactics)
 
 
 class GqaContextWeights:
@@ -1531,6 +1570,7 @@ class GqaDraftFastPath(DraftFastPath):
                 GqaContextWeights(inner), group.device_group, tp, rank, context
             )
             prepared.strict = strict  # NQ-NOFALLBACK
+            gqa_context_projection(prepared, tp)
             inner._fast_context = prepared
             logger.info_once(
                 "Kimi K3.1 GQA DSpark drafter: sharded context step for %s rows "
@@ -1591,11 +1631,19 @@ class GqaDraftFastPath(DraftFastPath):
             model, vllm_config, query_rows, context_rows, strict
         )
         attention = None
+        missing_api = [
+            name for name in ("forward", "store_context") if not hasattr(state, name)
+        ]
         if state is None:
             fail(
                 "DSpark drafter attention",
                 "the fused GQA drafter attention (cutedsl.draft.gqa_attention "
                 "install_gqa_attention) is not installed",
+            )
+        elif missing_api:
+            fail(
+                "DSpark drafter attention",
+                f"the installed GQA attention state lacks {missing_api}",
             )
         else:
             attention = GqaAttention(state, strict)
