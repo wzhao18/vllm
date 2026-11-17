@@ -1,49 +1,55 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kernels of the release DSpark drafter's sliding-window GQA attention
+"""The release DSpark drafter's sliding-window GQA attention in one kernel per layer
 (Inferact/Kimi-K3.1-Pro-DSpark: Qwen3DSparkForCausalLM, DFlashQwen3Attention).
 
 Stock, per drafter layer (qwen3_dflash.DFlashQwen3Attention.forward on the qkv_proj
 rows): q_norm / k_norm (per-head RMSNorm, eps from the config), neox RoPE from the
-layer's BF16 ``cos_sin_cache``, the K/V insert of the query rows at their slots
-(``reshape_and_cache_flash``), then causal sliding-window attention (FLASH_ATTN /
-FLASHINFER, window 2048: query row i of a request with ``seq_len`` L sits at key
-L - q + i and reads keys [L - q + i - 2047, L - q + i]) over the BF16 paged cache
-[blocks, kv heads, page, K | V] (128 content values per token: K then V).
+layer's BF16 ``cos_sin_cache``, V times the layer's value scale (when the checkpoint
+sets one), the K/V insert of the query rows at their slots, then causal sliding-window
+attention (FLASH_ATTN / FLASHINFER, window W = 2048: query row i of a request with
+``seq_len`` L sits at key L - q + i and reads keys [L - q + i - W + 1, L - q + i]) over
+the BF16 paged cache [blocks, kv heads, page, K | V] (128 values per token: K then V).
 
-``GqaWindow`` runs all of it in one kernel per layer: grid (splits, kv heads,
-requests), one cluster of ``splits`` CTAs per (request, kv head). The CTAs split the
-request's window union [max(0, L - q - 2047), L) into 32-key stages; inside a CTA
-``kgroups`` key groups take contiguous runs of them. Warps: one TMA producer (box
-{64, 32, 1, 1} of K and of V, 128 B swizzle, one ring per key group) and, per key
-group, one consumer warp per 16-row tile of the request's ``group * q`` query rows
-(query row i, head g: tile row i * group + g): S = Q K^T with mma.sync m16n8k16 BF16
-(FP32 accumulate), online softmax (exp2 of the stock scale x log2 e; the O rescale is
-skipped exactly when no row max moved), P rounded to BF16, O += P V (FP32). The key
-groups' partials merge in shared memory, the cluster's by a DSMEM reduce-scatter
-(each CTA owns a slice of the tile rows). Before its PDL wait each CTA prefetches its
-stages into L2 and loads the constant inputs (norm weights, RoPE rows of the query
-positions as they stand); every read that decides a result is repeated after the
-wait (a moved position reloads its RoPE row).
+``GqaWindow`` runs all of it: grid (splits, kv heads, requests), one cluster of
+``splits`` CTAs per (request, kv head) (no cluster for one split). The CTAs split the
+request's window union [max(0, L - q - W + 1), L) into 32-key stages; inside a CTA
+``kgroups`` key groups take contiguous runs of them, each through its own ring of
+``ring`` TMA slots (box {64, 32, 1, 1} of K and of V, 128 B swizzle). A key group is
+one warp per 16-row tile of the request's ``group * q`` query rows (query row i, head g:
+tile row i * group + g). Per stage: S = Q K^T with mma.sync m16n8k16 BF16 (FP32
+accumulate), online softmax (exp2 of the stock scale x log2 e; the O rescale runs only
+when some row max moved: alpha is exactly 1 otherwise), P rounded to BF16, O += P V
+(FP32). S of stage k + 1 is issued before stage k's softmax (two score buffers). The
+last warp of a group done with a slot refills it, ``ahead`` stages past the ring kept
+requested into L2. The key groups' partials merge in shared memory (one CTA barrier),
+the cluster's by a DSMEM push to the CTA owning each tile row.
+
+Latency path: before its PDL wait a CTA reads the metadata as it stands (lengths, block
+table, query positions) only to choose addresses: it prefetches its first stages into
+L2 and loads the constant inputs (norm weights, the positions' RoPE rows). Right after
+the wait it issues its first TMA loads at those addresses and reads the metadata again;
+a CTA whose addresses moved drains and reissues them (never in a decode step: the
+metadata is written before the graph) and a moved position reloads its RoPE row. The Q
+tile (norm + RoPE, 8 lanes per head) and the query rows' K / V are computed by every
+thread of the CTA between the two.
 
 The query rows' K / V: the CTA whose stages hold a query row's position computes its
-k_norm + RoPE (and V) once, stores both at the row's slot (when the slot is >= 0, as
-stock) and uses them in place of the cache rows it loaded; a row whose slot is -1
-keeps the cache row (stock reads it there). Positions outside [window start, L) are
-zeroed in the tiles (their cache rows may hold any bytes).
+k_norm + RoPE (and V), stores both at the row's slot (when the slot is >= 0, as stock)
+and uses them in place of the cache rows it loaded; a row whose slot is -1 keeps the
+cache row (stock reads it there). Positions outside [window start, L) are zeroed in the
+tiles (their cache rows may hold any bytes); a request with ``seq_len`` 0 (a padded
+one) writes zeros.
 
-``GqaContextKV`` is the context step's epilogue: the fused K / V projection rows of
-every layer [rows, layers, 2, kv heads, 64] -> k_norm (per layer) + RoPE + the K / V
-insert at the context slots (stock: a permute copy, the grouped RMSNorm, a positions
-repeat, RoPE and one insert per layer).
-
-Rounding points (the stock modules' BF16 boundaries; FP32 arithmetic inside, sums in
-another order): RMSNorm = bf16((x * rsqrt(sum(x^2) / 64 + eps)) * w) (vLLM's
-rms_norm: one rounding, rsqrt.approx); RoPE from those BF16 values and the BF16
-cache: bf16(fma(x1, cos, -(x2 * sin))), bf16(fma(x1, sin, x2 * cos)) (vLLM's
-rotary_embedding as nvcc contracts it); V as stored (times the layer's value scale
-when the checkpoint sets one); attention: S in FP32, P in BF16, O in FP32, the
-output rounded once.
+Rounding points (FP32 arithmetic inside, sums in another order). The norm: (x * rsqrt(
+sum(x^2) / 64 + eps)) * w (rsqrt.approx). With ``round_norm`` it is rounded to BF16
+before RoPE (the stock C kernels rms_norm + rotary_embedding: eager drafters and the
+context step); without it RoPE takes the FP32 values (inductor fuses the stock native
+norm and RoPE into one kernel and elides the BF16 cast between them: the compiled
+drafter, the default). RoPE with the BF16 cache values: bf16(fma(x1, cos, -(x2 *
+sin))), bf16(fma(x1, sin, x2 * cos)) (as nvcc and Triton contract it). V: as stored, or
+bf16(v * value scale). Attention: S in FP32, P in BF16, O in FP32, the output rounded
+once.
 """
 
 from functools import cache
@@ -235,31 +241,29 @@ def swz(row, chunk):
 
 
 @cute.jit
-def norm_rope8(x, weights, cos, sin, eps, upper):
+def norm_rope8(x, weights, cos, sin, eps, upper, round_norm: cutlass.Constexpr):
     """RMSNorm + neox RoPE of one 64-value head held by an aligned group of 8 lanes,
     8 values each (lane j of the group: dims 8j..8j+7; ``upper``: j >= 4). ``x``: the
     8 FP32 values, ``weights``: the norm weight words (4 x BF16x2), ``cos`` / ``sin``
-    of dims 8(j % 4).. (4 words each). Returns 4 BF16x2 words."""
+    of dims 8(j % 4).. (4 words each); ``round_norm``: the norm output rounded to BF16
+    before RoPE (module notes). Returns 4 BF16x2 words."""
     total = Float32(0)
     for e in cutlass.range_constexpr(8):
         total = fma(x[e], x[e], total)
     for offset in (1, 2, 4):
         total = total + cute.arch.shuffle_sync_bfly(total, offset)
     scale = rsqrt_approx(div_rn(total, Float32(HEAD)) + eps)
-    normed = []
-    for k in cutlass.range_constexpr(4):
-        pair = []
-        for half in (False, True):
-            value = x[2 * k + int(half)] * scale * bf16(weights[k], half)
-            pair.append(value)
-        normed.append(bf16x2(pair[0], pair[1]))
-    partner = [cute.arch.shuffle_sync_bfly(Int32(w), 4) for w in normed]
+    normed = [x[e] * scale * bf16(weights[e // 2], e % 2 == 1) for e in range(8)]
+    if cutlass.const_expr(round_norm):
+        words = [bf16x2(normed[2 * k], normed[2 * k + 1]) for k in range(4)]
+        normed = [bf16(words[e // 2], e % 2 == 1) for e in range(8)]
+    partner = [cute.arch.shuffle_sync_bfly(v, 4) for v in normed]
     out = []
     for k in cutlass.range_constexpr(4):
         pair = []
         for half in (False, True):
-            mine = bf16(normed[k], half)
-            other = bf16(Uint32(partner[k]), half)
+            mine = normed[2 * k + int(half)]
+            other = partner[2 * k + int(half)]
             c, s = bf16(cos[k], half), bf16(sin[k], half)
             # first half (x1 = mine, x2 = other): x1 cos - x2 sin
             first = fma(mine, c, -(other * s))
@@ -278,15 +282,21 @@ class GqaWindow:
     KV head, ``kv_heads`` per rank, ``q`` query rows per request, the BF16 cache's
     ``page`` tokens per kernel block, ``splits`` CTAs per (request, kv head) (a
     cluster), ``kgroups`` key groups per CTA, ``ring`` stages per key group,
-    ``window`` keys."""
+    ``window`` keys. ``debug`` (development only, never set by the install): 1 / 2 /
+    4 / 8 skip the math / the TMA loads / the prep / the combine, 16 returns after
+    the PDL wait (latency ablations), 32 writes globaltimer phase stamps (an extra
+    pointer argument), 64 takes the redo path (tests)."""
 
     def __init__(
         self, group, kv_heads, q, page, splits, kgroups, ring, window, v_scale=None,
-        debug=0, ahead=8,
+        ahead=0, round_norm=False, debug=0,
     ):  # fmt: skip
         assert page % TB == 0 and window >= 1 and 1 <= q <= 8
         # ``ahead``: stages past the ring each key group keeps requested into L2
         self.debug, self.ahead = debug, ahead
+        # the norm output rounded to BF16 before RoPE (the stock C kernels) or kept in
+        # FP32 (inductor's fused norm + RoPE): module notes
+        self.round_norm = round_norm
         self.group, self.kv_heads, self.q, self.page = group, kv_heads, q, page
         self.splits, self.kgroups, self.ring = splits, kgroups, ring
         self.window, self.v_scale = window, v_scale
@@ -300,13 +310,16 @@ class GqaWindow:
         self.pages = -(-(window + q - 1 + 2 * TB) // page) + 1
         assert self.pages <= self.threads
         assert ring >= 2  # (the pipelined loop waits on stage k + 1 before k's release)
+        part = kgroups * self.qrows * PITCH * 4  # (the key groups' partials, after)
+        assert part <= kgroups * ring * 2 * STAGE, (part, kgroups, ring)
 
     @cute.jit
     def __call__(self, *args):
         out = args[8]
         requests = out.shape[0] // self.q
-        # (a cluster launch even at one split: the partial pushes are st.async)
-        cluster = (self.splits, 1, 1)
+        cluster = None
+        if cutlass.const_expr(self.splits > 1):
+            cluster = (self.splits, 1, 1)
         launch(
             self.kernel, args, (self.splits, self.kv_heads, requests), self.threads,
             cluster=cluster, max_number_threads=[self.threads, 1, 1],
@@ -362,7 +375,9 @@ class GqaWindow:
 
     @cute.jit
     def rope_rows(self, cos_sin, position, group8):
-        base = cos_sin.iterator + position * cos_sin.layout.stride[0]
+        # (a padded row's position may be anything: clamped into the cache)
+        row = min(max(position, Int32(0)), Int32(cos_sin.shape[0] - 1))
+        base = cos_sin.iterator + row * cos_sin.layout.stride[0]
         cos = load_words(base + 8 * (group8 % 4), count=4)
         sin = load_words(base + 32 + 8 * (group8 % 4), count=4)
         return cos, sin
@@ -564,7 +579,7 @@ class GqaWindow:
         ROWS: cutlass.Constexpr = self.rows
         QROWS: cutlass.Constexpr = self.qrows
         OWN: cutlass.Constexpr = self.owned
-        PARTS: cutlass.Constexpr = self.splits * self.kgroups  # partials per row
+        PARTS: cutlass.Constexpr = self.splits  # cluster partials per owned row
         HQ: cutlass.Constexpr = self.group * self.kv_heads
         HKV: cutlass.Constexpr = self.kv_heads
         threads: cutlass.Constexpr = self.threads
@@ -591,7 +606,7 @@ class GqaWindow:
         bars = alloc(smem, cutlass.Int64, 2 * KG * R + 1, align=8)
         counters = alloc(smem, Int32, KG * R + 1, align=16)  # [KG * R]: the redo flag
         blocks = alloc(smem, Int32, NP, align=16)
-        recv = alloc(smem, Float32, PARTS * OWN * PITCH, align=16)
+        recv = alloc(smem, Float32, max(PARTS * OWN * PITCH, 4), align=16)
         ring_base = Int32(shared_address(ring.iterator))
         q_base = Int32(shared_address(qtile.iterator))
         kv_new = Int32(shared_address(newkv.iterator))
@@ -605,8 +620,8 @@ class GqaWindow:
         full_g = full_base + kg * (R * 8)
         count_g_base = count_base + kg * (R * 4)
 
-        # tile rows this CTA finalizes; the partial rows it receives (every CTA's
-        # every key group: 64 values + max + sum, 264 bytes each)
+        # tile rows this CTA finalizes; the partial rows it receives (one per CTA of
+        # the cluster: 64 values, max, sum, 2 spare: PITCH words)
         my_rows = min(max(ROWS - split * OWN, 0), OWN)
         self.stamp(args, 0, tid)
         if tid == 0:
@@ -615,8 +630,9 @@ class GqaWindow:
                 init_barrier(fixed_base + 8 * i, 1)
                 store_shared_u32(count_base + 4 * i, 0)
             store_shared_u32(redo_flag, 0)
-            init_barrier(recv_bar, 1)
-            arm(recv_bar, PARTS * my_rows * 264)
+            if cutlass.const_expr(S > 1):
+                init_barrier(recv_bar, 1)
+                arm(recv_bar, S * my_rows * (PITCH * 4))
         if tid < (QROWS - ROWS) * 8:  # the tile's padding rows
             store_words(q_base + swz(ROWS + tid // 8, group8), (Uint32(0),) * 4,
                         shared=True)  # fmt: skip
@@ -705,7 +721,10 @@ class GqaWindow:
         page_lo = begin * TB // N
         first_g, count_g = self.group_split(begin, count, kg)
         # (a moved length moves every address: the CTA redoes its first loads)
-        if (length != length0) | (e_spec != e_spec0):
+        moved = (length != length0) | (e_spec != e_spec0)
+        if cutlass.const_expr(self.debug & 64):
+            moved = tid == 0  # (tests: the redo path with unmoved metadata)
+        if moved:
             atomic_or_shared(redo_flag, 1)
         if tid < NP:
             entry = entry_spec
@@ -739,7 +758,7 @@ class GqaWindow:
             cos = tuple(rope[k] for k in range(4))
             sin = tuple(rope[4 + k] for k in range(4))
             x = [bf16(words[e // 2], e % 2 == 1) for e in range(8)]
-            roped = norm_rope8(x, weights, cos, sin, eps, upper)
+            roped = norm_rope8(x, weights, cos, sin, eps, upper, self.round_norm)
             if t < ROWS * 8:
                 store_words(q_base + swz(t // 8, group8), tuple(roped), shared=True)
             elif t < TASKS:
@@ -833,71 +852,119 @@ class GqaWindow:
         if cutlass.const_expr(self.debug & 8):
             return
 
-        # ---- every warp's partial rows straight to their owner CTA's receive slots
-        # (partial index split * KG + key group), no CTA barrier
-        if cutlass.const_expr(S > 1):
-            cute.arch.cluster_wait()  # every peer's receive barrier is armed
-        part = split * KG + kg
+        # ---- key groups -> the CTA's rows: every warp's partial into the freed ring
+        # (one CTA barrier), then per (row, 4 columns) the key groups' merge, each
+        # task folding its row's maxima itself (no second barrier)
+        cute.arch.sync_threads()
+        part_g = ring_base + kg * (QROWS * PITCH * 4)
         for half in cutlass.range_constexpr(2):
             r = 16 * rt + 8 * half + g
-            if r < ROWS:
-                owner = r // OWN
-                row_base = recv_base + ((part * OWN + r % OWN) * PITCH) * 4
-                for n in cutlass.range_constexpr(8):
-                    pair_words = (float_word(acc[n, 2 * half]),
-                                  float_word(acc[n, 2 * half + 1]))  # fmt: skip
-                    push2(row_base + (8 * n + 2 * t4) * 4, pair_words, recv_bar, owner)
-                if t4 == 0:
-                    stat2 = (float_word(m_run[half]), float_word(l_run[half]))
-                    push2(row_base + 64 * 4, stat2, recv_bar, owner)
+            row_base = part_g + r * (PITCH * 4)
+            if t4 == 0:
+                stat2 = (float_word(m_run[half]), float_word(l_run[half]))
+                store_words(row_base + 64 * 4, stat2, shared=True)
+            for n in cutlass.range_constexpr(8):
+                pair_words = (float_word(acc[n, 2 * half]),
+                              float_word(acc[n, 2 * half + 1]))  # fmt: skip
+                store_words(row_base + (8 * n + 2 * t4) * 4, pair_words,
+                            shared=True)  # fmt: skip
+        if cutlass.const_expr(S > 1):
+            cute.arch.cluster_wait()  # every peer's receive barrier is armed
+        cute.arch.sync_threads()
         self.stamp(args, 5, tid)
-        # ---- the owned rows: every partial landed
-        wait(recv_bar, 0, scope="cta")
-        self.stamp(args, 6, tid)
-        for it in cutlass.range_constexpr(-(-(OWN * 16) // threads)):
+        for it in cutlass.range_constexpr(-(-(ROWS * 16) // threads)):
             task = it * threads + tid
-            rr, d4 = task // 16, task % 16
-            if (task < OWN * 16) & (rr < my_rows):
-                top = Float32(NEG_INF)
-                for pp in cutlass.range_constexpr(PARTS):
-                    top = cute.arch.fmax(top, recv[(pp * OWN + rr) * PITCH + 64])
+            if task < ROWS * 16:
+                r, d4 = task // 16, task % 16
+                stats = [
+                    load_words(ring_base + (w * QROWS + r) * (PITCH * 4) + 256, count=2,
+                               shared=True)  # fmt: skip
+                    for w in range(KG)
+                ]
+                top = tree(cute.arch.fmax, [bits_float(st[0]) for st in stats])
                 use = top
                 if top == Float32(NEG_INF):
                     use = Float32(0)
                 total = Float32(0)
                 values = [Float32(0)] * 4
-                for pp in cutlass.range_constexpr(PARTS):
-                    base_p = (pp * OWN + rr) * PITCH
-                    weight = ex2((recv[base_p + 64] - use) * c)
-                    total = fma(recv[base_p + 65], weight, total)
-                    got4 = load_words(recv_base + (base_p + 4 * d4) * 4, count=4,
-                                      shared=True)  # fmt: skip
+                for w in cutlass.range_constexpr(KG):
+                    weight = ex2((bits_float(stats[w][0]) - use) * c)
+                    total = fma(bits_float(stats[w][1]), weight, total)
+                    got4 = load_words(
+                        ring_base + (w * QROWS + r) * (PITCH * 4) + 16 * d4, count=4,
+                        shared=True,
+                    )  # fmt: skip
                     for e in cutlass.range_constexpr(4):
                         values[e] = fma(bits_float(got4[e]), weight, values[e])
-                inv = Float32(0)
-                if total > Float32(0):
-                    inv = Float32(1) / total
-                own_words = (
-                    bf16x2(values[0] * inv, values[1] * inv),
-                    bf16x2(values[2] * inv, values[3] * inv),
-                )
-                r_own = split * OWN + rr
-                o_row = request * Q + r_own // G
-                o_col = (head * G + r_own % G) * HEAD + 4 * d4
-                store_words(out.iterator + o_row * out.layout.stride[0] + o_col,
-                            own_words)  # fmt: skip
+                if cutlass.const_expr(S == 1):
+                    inv = Float32(0)
+                    if total > Float32(0):
+                        inv = Float32(1) / total
+                    out_words = (
+                        bf16x2(values[0] * inv, values[1] * inv),
+                        bf16x2(values[2] * inv, values[3] * inv),
+                    )
+                    o_row = request * Q + r // G
+                    o_col = (head * G + r % G) * HEAD + 4 * d4
+                    store_words(out.iterator + o_row * out.layout.stride[0] + o_col,
+                                out_words)  # fmt: skip
+                else:
+                    owner = r // OWN
+                    slot_r = (split * OWN + r % OWN) * PITCH
+                    push4(recv_base + (slot_r + 4 * d4) * 4,
+                          tuple(float_word(v) for v in values), recv_bar, owner)
+                    if d4 == 0:
+                        stat4 = (float_word(top), float_word(total), Uint32(0),
+                                 Uint32(0))  # fmt: skip
+                        push4(recv_base + (slot_r + 64) * 4, stat4, recv_bar, owner)
+        if cutlass.const_expr(S > 1):
+            # ---- the owned rows: every CTA's partial landed; each (row, 4 columns)
+            # task folds the row's maxima itself
+            wait(recv_bar, 0, scope="cta")
+            self.stamp(args, 6, tid)
+            for it in cutlass.range_constexpr(-(-(OWN * 16) // threads)):
+                task = it * threads + tid
+                rr, d4 = task // 16, task % 16
+                if (task < OWN * 16) & (rr < my_rows):
+                    tops = [recv[(sp * OWN + rr) * PITCH + 64] for sp in range(S)]
+                    top = tree(cute.arch.fmax, tops)
+                    use = top
+                    if top == Float32(NEG_INF):
+                        use = Float32(0)
+                    total = Float32(0)
+                    values = [Float32(0)] * 4
+                    for sp in cutlass.range_constexpr(S):
+                        base_s = (sp * OWN + rr) * PITCH
+                        weight = ex2((tops[sp] - use) * c)
+                        total = fma(recv[base_s + 65], weight, total)
+                        got4 = load_words(recv_base + (base_s + 4 * d4) * 4, count=4,
+                                          shared=True)  # fmt: skip
+                        for e in cutlass.range_constexpr(4):
+                            values[e] = fma(bits_float(got4[e]), weight, values[e])
+                    inv = Float32(0)
+                    if total > Float32(0):
+                        inv = Float32(1) / total
+                    own_words = (
+                        bf16x2(values[0] * inv, values[1] * inv),
+                        bf16x2(values[2] * inv, values[3] * inv),
+                    )
+                    r_own = split * OWN + rr
+                    o_row = request * Q + r_own // G
+                    o_col = (head * G + r_own % G) * HEAD + 4 * d4
+                    store_words(out.iterator + o_row * out.layout.stride[0] + o_col,
+                                own_words)  # fmt: skip
         self.stamp(args, 7, tid)
 
 
 @cache
 def compile_window(
     group, kv_heads, q, page, splits, kgroups, ring, window, v_scale, max_position,
-    device, debug=0, ahead=8,
+    device, ahead=0, round_norm=False, debug=0,
 ):  # fmt: skip
     """The fused attention for any request count (row-dynamic views)."""
     kernel = GqaWindow(
-        group, kv_heads, q, page, splits, kgroups, ring, window, v_scale, debug,
-        ahead,
+        group, kv_heads, q, page, splits, kgroups, ring, window, v_scale, ahead,
+        round_norm, debug,
     )
     i64, i32 = torch.int64, torch.int32
     count = cute.sym_int()
@@ -906,7 +973,8 @@ def compile_window(
         fake((count,), None, i64, 8),  # positions
         fake((count,), None, i64, 8),  # slots
         fake((cute.sym_int(),), None, i32, 4),  # seq_lens
-        dynamic_fake(2, i32),  # block table
+        # block table: any row stride (max blocks per request), no divisibility
+        fake((cute.sym_int(), cute.sym_int()), (cute.sym_int(), 1), i32, 4),
         fake((max_position, 2 * 32)),  # cos_sin (BF16)
         fake((HEAD,)),  # q_norm weight
         fake((HEAD,)),  # k_norm weight

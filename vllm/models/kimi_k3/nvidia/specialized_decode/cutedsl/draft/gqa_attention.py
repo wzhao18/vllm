@@ -66,22 +66,27 @@ KV_HEADS = (1, 2, 4)  # KV heads per rank: TP16, TP8, TP4
 # (largest drafter batch, (splits, key groups, ring stages, L2-ahead stages)), the last
 # bin open. Splits = CTAs (one cluster) per (request, KV head): small batches spread
 # the 2048-key window over a cluster, large ones fill the GPU with requests while the
-# grid stays one wave (VR200: 212 SMs). Measured: 1 VR200 GPU, CUDA graph, full
-# windows at 150K-token contexts, cold KV (benchmarks/kernels/k31_vr/dsrel/
-# bench_gqa_attention_int.py --shape sweeps), us per layer at the bins' batches:
-#   (1, 7) TP16 k7: B1-4 4.6-5.1, B8 5.4, B12-16 6.1-6.4, B24-32 8.1-8.3, B64 12.1
-#   (1, 3) TP16 k3: B1-8 3.8-4.6, B16 6.0, B28 6.8, B38 7.5, B64 8.4
-#   (4, 3) TP4 k3 (C512): B1-16 5.2-8.5, B32 12.0, B50 17.6, B64 19.0, B128 32.6
-# The TP8 (P instances only) and TP4 k7 rows (no deployment) follow the measured
-# shapes of the same CTA count.
+# grid stays one wave (VR200: 212 SMs; shapes at a wave's edge are avoided). Measured
+# with gqa_window a5e68ee2: 1 VR200 GPU, CUDA graph, full windows at 150K-token
+# contexts, cold KV (benchmarks/kernels/k31_vr/dsrel/bench_gqa_attention_int.py
+# --shape sweeps), us per layer:
+#   (1, 7) TP16 k7: B1-4 4.3-4.7, B8 5.1, B12-16 6.0-6.2, B24-32 7.6-7.8, B64 11.1
+#   (1, 3) TP16 k3: B1-8 3.3-4.4, B16 4.8, B28-38 6.5-6.8, B64 8.5, B128 12.1
+#   (4, 3) TP4 k3 (C512): B1 3.7, B4-8 4.8-6.8, B16 8.6, B32 12.2, B50 14.7,
+#          B64 19.3, B128 32.6
+# The TP8 rows (prefill instances, which run the stock drafter) and TP4 k7 (no
+# deployment) take shapes measured at the same CTA counts.
 GQA_WINDOW = {
-    (1, 7): ((4, (16, 2, 3, 4)), (8, (12, 2, 3, 0)), (16, (8, 2, 4, 0)), (32, (4, 3, 3, 0)),
-             (0, (4, 2, 3, 4))),
-    (1, 3): ((8, (16, 2, 3, 0)), (0, (8, 2, 3, 0))),
-    (2, 7): ((4, (8, 2, 3, 0)), (16, (4, 3, 3, 0)), (0, (2, 2, 3, 0))),
-    (2, 3): ((4, (8, 2, 3, 0)), (32, (4, 2, 3, 0)), (0, (2, 2, 3, 0))),
-    (4, 7): ((16, (8, 2, 3, 0)), (32, (4, 2, 3, 0)), (64, (2, 2, 3, 0)), (0, (1, 2, 3, 0))),
-    (4, 3): ((16, (8, 2, 3, 0)), (32, (4, 2, 3, 0)), (64, (2, 2, 3, 0)), (0, (1, 2, 3, 0))),
+    (1, 7): ((4, (16, 4, 2, 0)), (8, (16, 2, 3, 0)), (16, (8, 4, 3, 0)), (32, (4, 4, 4, 0)),
+             (0, (2, 4, 4, 0))),
+    (1, 3): ((8, (16, 4, 2, 8)), (16, (8, 4, 3, 0)), (40, (4, 4, 3, 0)), (64, (8, 2, 3, 0)),
+             (0, (4, 2, 3, 0))),
+    (2, 7): ((4, (8, 4, 3, 0)), (16, (4, 4, 4, 0)), (0, (2, 2, 3, 0))),
+    (2, 3): ((4, (8, 4, 3, 0)), (32, (4, 2, 3, 0)), (0, (2, 2, 3, 0))),
+    (4, 7): ((8, (8, 4, 3, 0)), (16, (8, 2, 3, 0)), (32, (4, 2, 3, 0)), (64, (2, 2, 3, 0)),
+             (0, (1, 2, 3, 0))),
+    (4, 3): ((2, (16, 4, 2, 8)), (8, (8, 4, 3, 0)), (16, (8, 2, 3, 0)), (32, (4, 2, 3, 0)),
+             (52, (2, 4, 3, 0)), (64, (2, 2, 3, 0)), (0, (1, 2, 3, 0))),
 }  # fmt: skip
 
 
