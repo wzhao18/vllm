@@ -3,8 +3,8 @@
 
 Series:
   - VR200 release-draft sweep (results/k31vr-release-draft-sweep-20261117/points.json), ongoing
-  - VR200 frozen preview-draft sweep (results/k31vr-frozen-sweep-20261114/points.json), all measured points
-  - GB300 dynamo-vLLM and GB300 dynamo-SGLang, latest InferenceX curves (k31vr/data/gb300_inferencex.json,
+  - VR200 frozen preview-draft sweep (results/k31vr-frozen-sweep-20261114/points.json), chosen configs only
+  - GB300 dynamo-vLLM, latest InferenceX curve (k31vr/data/gb300_inferencex.json,
     from https://inferencex.semianalysis.com/api/v1/benchmarks?model=Kimi-K3.1-Pro)
 Per MW = tok/s/GPU / all-in kW per GPU (VR200 3.3 kW, GB300 2.12 kW), shown as M tok/s per MW.
 Each series draws its own pareto front as a line; every measured point is a marker with its label and a hover tooltip.
@@ -20,8 +20,9 @@ PANELS = [("p90_intvty", "P90 interactivity (tok/s/user) = 1000 / P90 ITL", True
 
 
 def load_series():
-    rel = json.load(open(f"{ROOT}/results/k31vr-release-draft-sweep-20261117/points.json"))["points"]
-    frz = json.load(open(f"{ROOT}/results/k31vr-frozen-sweep-20261114/points.json"))["points"]
+    # chosen configs only (meta.json "chosen"); the release sweep reruns exactly the frozen sweep's chosen set
+    rel = [p for p in json.load(open(f"{ROOT}/results/k31vr-release-draft-sweep-20261117/points.json"))["points"] if p.get("chosen")]
+    frz = [p for p in json.load(open(f"{ROOT}/results/k31vr-frozen-sweep-20261114/points.json"))["points"] if p.get("chosen")]
     gb = json.load(open(f"{ROOT}/k31vr/data/gb300_inferencex.json"))["series"]
     def vr(p, run_dir):
         return dict(label=p["label"], y=p["tput_per_gpu"] / KW["vr"] / 1000, tps=p["tput_per_gpu"],
@@ -30,14 +31,12 @@ def load_series():
         return dict(label=p["label"], y=p["tput_per_gpu"] / KW["gb"] / 1000, tps=p["tput_per_gpu"],
                     tip=f"GB300 {fw} {p['label']} ({p['topo']}), InferenceX id {p['id']}, {date}", **{k: p[k] for k, _, _ in PANELS})
     return [
-        dict(key="rel", name="VR200 release draft (ongoing, 2026-11-17)", cls="s-rel", marker="circle", dash="",
+        dict(key="rel", name="VR200 release draft, chosen configs (ongoing, 2026-11-17)", cls="s-rel", marker="circle", dash="",
              pts=[vr(p, "k31vr-release-draft-sweep-20261117/runs") for p in rel]),
-        dict(key="frz", name="VR200 frozen sweep, preview draft (2026-11-14)", cls="s-frz", marker="square", dash="5 4",
+        dict(key="frz", name="VR200 frozen sweep, preview draft, chosen configs (2026-11-14)", cls="s-frz", marker="square", dash="5 4",
              pts=[vr(p, "k31vr-frozen-sweep-20261114/runs") for p in frz]),
         dict(key="gbv", name=f"GB300 dynamo-vLLM (InferenceX {gb['dynamo-vllm']['curve_date']})", cls="s-gbv", marker="triangle",
              dash="2 3", pts=[g(p, "dynamo-vLLM", gb["dynamo-vllm"]["curve_date"]) for p in gb["dynamo-vllm"]["points"]]),
-        dict(key="gbs", name=f"GB300 dynamo-SGLang (InferenceX {gb['dynamo-sglang']['curve_date']})", cls="s-gbs", marker="diamond",
-             dash="8 3 2 3", pts=[g(p, "dynamo-SGLang", gb["dynamo-sglang"]["curve_date"]) for p in gb["dynamo-sglang"]["points"]]),
     ]
 
 
