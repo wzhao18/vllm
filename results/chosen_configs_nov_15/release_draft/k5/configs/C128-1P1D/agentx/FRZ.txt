@@ -1,0 +1,3 @@
+frz frz-c128-1p1d from /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/llintg-c160-1p1d-wm05-spx (2026-11-14T17:28:36-08:00): frozen tree ll-integ-dea4ebd06f (b68d67e7e), decode watermark 0.05, K3.1 golden AL
+frz-c128-1p1d = frz-c160-1p1d with CONC 160->112 only (phase 2, wf_b2d1dec7 #1, 2026-11-14T20:20:21-08:00)
+frz-c128-1p1d = frz-c112-1p1d with CONC 112->128 only (2026-11-14T23:38:54-08:00)

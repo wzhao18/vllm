@@ -1,0 +1,33 @@
+# track K fused GQA attention (dsrel/ov/attn3: gqa_attention.py a87bdcfe + gqa_window_k5.patch -> c3494526, gqa_window.py a5e68ee2) on overlay dsrel/ov/k5attn;
+# test = attn3 tests/models/kimi_k3/test_dspark_gqa_attention_int.py with q [7, 3] -> [5]; 1 VR200 GPU (gpurun.sh k5attn 3), -k "test_window_matches_stock and 16-5"
+TP16 q5 rows: B, rel err vs FP64 (ours, stock), max rel vs stock
+  B   1  3.54e-03  3.08e-03  1.20e-01
+  B   2  3.28e-03  3.87e-03  1.21e-01
+  B   3  1.82e-03  1.82e-03  8.30e-04
+  B   4  1.83e-03  1.83e-03  3.33e-03
+  B   7  2.35e-03  2.35e-03  3.22e-03
+  B   8  1.39e-03  1.39e-03  3.17e-03
+  B  12  2.06e-03  2.06e-03  4.48e-03
+  B  16  1.96e-03  1.96e-03  4.17e-03
+  B  28  2.28e-03  2.28e-03  4.01e-03
+  B  38  3.12e-03  3.12e-03  3.65e-03
+  B  50  3.07e-03  3.07e-03  4.28e-03
+  B  64  2.10e-03  2.10e-03  4.89e-03
+  B 128  2.51e-03  2.51e-03  1.96e-02
+TP16 q5 slots: B, rel err vs FP64 (ours, stock), max rel vs stock
+  B   1  2.94e-03  2.94e-03  1.34e-01
+  B   2  3.36e-03  3.36e-03  1.62e-01
+  B   3  2.61e-03  2.61e-03  3.78e-03
+  B   4  2.46e-03  2.46e-03  3.26e-03
+  B   7  2.84e-03  2.84e-03  8.55e-03
+  B   8  2.87e-03  2.87e-03  3.25e-03
+  B  12  2.29e-03  2.29e-03  1.82e-02
+  B  16  2.73e-03  2.73e-03  3.12e-02
+  B  28  2.41e-03  2.41e-03  1.57e-02
+  B  38  2.18e-03  2.18e-03  5.63e-03
+  B  50  1.29e-03  1.29e-03  4.60e-03
+  B  64  2.80e-03  2.80e-03  4.63e-03
+  B 128  1.72e-03  1.72e-03  4.65e-03
+PASSED tests/models/kimi_k3/test_dspark_gqa_attention_int_k5.py::test_window_matches_stock[16-5-rows]
+PASSED tests/models/kimi_k3/test_dspark_gqa_attention_int_k5.py::test_window_matches_stock[16-5-slots]
+2 passed, 13 deselected in 95.13s (0:01:35)

@@ -205,11 +205,14 @@ brackets give the uncalibrated kappa 1 bound.
   q5/q4 <= 1.123).
 - **C512:** stays k3.
 
-**Applying a k change to a render.** For C128/C160 at k5:
+**Applying a k change to a render.** `gen_dsrel.py --k-override C128-1P1D=5,C160-1P1D-llh=5` writes the k5 renders
+`dsrelk5-*` (and `check_dsrel.py --k-override` checks them). It changes:
 - prefill and decode speculative-config: `num_speculative_tokens` 5 and synthetic AL 3.81 (gsm8k twin: k only);
 - decode `max-cudagraph-capture-size` (k+1) x max-num-seqs = 960;
-- the decode `cudagraph_capture_sizes` regenerated for the q6 verify rows and the k5 drafter rows;
-- the release drafter's specialized decode must cover those shapes. NQ-NOFALLBACK refuses uncovered shapes at capture.
+- the decode `cudagraph_capture_sizes`, re-derived for the q6 verify rows and the k5 drafter rows.
+
+The release drafter's specialized decode must cover those shapes: NQ-NOFALLBACK refuses uncovered shapes at capture.
+`k5/README.md` has the derivation, the checks, the q6 coverage audit and the measured k5 vs k3 steps.
 `capture_shapes.json` lists every role's current shapes for those coverage tests.
 
 ## Interface for the other tracks
@@ -234,7 +237,10 @@ brackets give the uncalibrated kappa 1 bound.
 ## Files
 
 - `gen_dsrel.py`: the generator. Hecate mode writes the 32 renders; `--mirror <chosen_configs_nov_15>` writes
-  `configs/`. Knobs: `--draft-attn-backend`, `--tree`, `--prefix`, `--points/--fabrics/--kinds`, `--replace`, `--stamp`.
+  `configs/`. Knobs: `--draft-attn-backend`, `--tree`, `--target-weights`, `--k-override` (k-variant renders,
+  `k5/`), `--prefix`, `--points/--fabrics/--kinds`, `--replace`, `--stamp`, `--mirror-out`, `--renders` (testing).
+- `k5/`: the k5 renders of C128 1P1D / C160 1P1D llh (`k5/README.md`): repo mirror, checks, the q6 coverage audit
+  (`coverage_k5.py`) and the k5 vs k3 step measurements.
 - `check_dsrel.py`: the GPU-free render checks (srtctl venv on the Hecate login node).
 - `vllm_check.py`: the vLLM-level speculative-config, checkpoint and draft-backend check (image, CPU-only).
 - `kchoice.py`: the k-choice model (standard library); `checks/kchoice.out` holds its output.

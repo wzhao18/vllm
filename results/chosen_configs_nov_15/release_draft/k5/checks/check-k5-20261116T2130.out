@@ -1,0 +1,510 @@
+
+== release draft /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626
+PASS config.json md5 = e4e6e626's
+PASS model.safetensors size = e4e6e626's LFS size
+PASS model.sha256 record = e4e6e626's LFS oid
+PASS speculators dspark checkpoint
+PASS 5 sliding-window layers, window 2048
+PASS GQA 96 q / 16 kv heads, head_dim 64
+PASS max_position_embeddings >= the renders' max-model-len 1048576
+PASS anchor sampling, block 7, Markov rank 512
+PASS aux layers / vocab = preview's
+PASS /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/renders/dsrelk5-c128-1p1d-xdr exists
+
+== dsrelk5-c128-1p1d-xdr  (source frz-c128-1p1d-xdr)
+PASS dsrelk5-c128-1p1d-xdr: file set = source + DSREL.txt (extra [], missing [])
+PASS dsrelk5-c128-1p1d-xdr: no symlinks
+PASS dsrelk5-c128-1p1d-xdr: file modes kept (sbatch_script.sh executable)
+PASS dsrelk5-c128-1p1d-xdr: no leftover temp dirs []
+PASS dsrelk5-c128-1p1d-xdr: provenance record FRZ.txt verbatim
+PASS dsrelk5-c128-1p1d-xdr: provenance record INTEG.txt verbatim
+PASS dsrelk5-c128-1p1d-xdr: kmc.args = source with the render name changed
+PASS dsrelk5-c128-1p1d-xdr: kmc.args names no frozen render
+PASS dsrelk5-c128-1p1d-xdr: nq4.drop = source with the render name changed
+PASS dsrelk5-c128-1p1d-xdr: nq4.drop names no frozen render
+PASS dsrelk5-c128-1p1d-xdr: point.env = source with the render name changed
+PASS dsrelk5-c128-1p1d-xdr: point.env names no frozen render
+PASS dsrelk5-c128-1p1d-xdr: provenance record render.log verbatim
+PASS dsrelk5-c128-1p1d-xdr: render/git_state.txt = source with the draft (and target weights) mount lines swapped
+PASS dsrelk5-c128-1p1d-xdr: render/render.json = source with the render name changed
+PASS dsrelk5-c128-1p1d-xdr: render/render.json names no frozen render
+PASS dsrelk5-c128-1p1d-xdr: render/sbatch_script.sh = source with the render name changed
+PASS dsrelk5-c128-1p1d-xdr: render/sbatch_script.sh names no frozen render
+PASS dsrelk5-c128-1p1d-xdr: srtslurm.yaml = source with the render name changed
+PASS dsrelk5-c128-1p1d-xdr: srtslurm.yaml names no frozen render
+PASS dsrelk5-c128-1p1d-xdr: workflow.env.resolved = source with the render name changed
+PASS dsrelk5-c128-1p1d-xdr: workflow.env.resolved names no frozen render
+PASS dsrelk5-c128-1p1d-xdr: sbatch_script.sh stages its own render dir
+PASS dsrelk5-c128-1p1d-xdr: job name
+PASS dsrelk5-c128-1p1d-xdr: render.json name/script
+PASS dsrelk5-c128-1p1d-xdr: render/config.yaml parsed diff = 5 keys, all draft keys ()
+PASS dsrelk5-c128-1p1d-xdr: render/config.yaml has no preview draft / TOKENSPEED_MLA
+PASS dsrelk5-c128-1p1d-xdr: hybrid.yaml parsed diff = 5 keys, all draft keys ()
+PASS dsrelk5-c128-1p1d-xdr: hybrid.yaml has no preview draft / TOKENSPEED_MLA
+PASS dsrelk5-c128-1p1d-xdr: decode capture sizes = derive_capture_sizes(frozen, k3 -> k5) (123 sizes)
+PASS dsrelk5-c128-1p1d-xdr: decode max-cudagraph-capture-size 640 -> 960 = max-num-seqs 160 x q6
+PASS dsrelk5-c128-1p1d-xdr: the frozen list re-derives to itself at k3
+PASS dsrelk5-c128-1p1d-xdr: k5 FULL graphs hold the frozen list's 79 verify / 56 drafter batches, largest 160 / 160
+PASS dsrelk5-c128-1p1d-xdr: hybrid.yaml decode capture keys = config.yaml's
+PASS dsrelk5-c128-1p1d-xdr: max-num-batched-tokens {'prefill': (32, 16384), 'decode': (160, 8192)} hold the k5 draft pass and verify rows 
+PASS dsrelk5-c128-1p1d-xdr: prefill and decode speculative-config identical
+PASS dsrelk5-c128-1p1d-xdr: speculative-config == {"method": "dspark", "model": "/raid/common-models/kimi-k3.1-pro-dspark", "num_speculative_tokens": 5, "attention_backend": "FLASH_ATTN", "draft_sample_method": "probabilistic", "rejection_sample_method": "synthetic", "synthetic_acceptance_length": 3.81}
+PASS dsrelk5-c128-1p1d-xdr: AL 3.81 -> per-position rates [1.0, 1.0, 0.81, 0.0, 0.0] (sum + 1 = AL)
+PASS dsrelk5-c128-1p1d-xdr: golden-acceptance.json {'golden_acceptance_length': 3.81}
+PASS dsrelk5-c128-1p1d-xdr: AL_FIX.txt records the release AL
+PASS dsrelk5-c128-1p1d-xdr: DSREL.txt names its source
+PASS dsrelk5-c128-1p1d-xdr: the vLLM tree on both role PYTHONPATHs = ['/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/hti/lowlat/trees/ll-integ-dea4ebd06f']
+PASS dsrelk5-c128-1p1d-xdr: container alias -> /lustre/fsw/coreai_comparch_inferencex/weizha/k3vr/images/k31vr-kmc_kmr-sweep-freeze_p242fb49cd4-mr4b8c04e28d7_d3c468ef795-kmm7989055e66_fi0.7.3.dev20261031_mc0.3.14_base3f1bcfd82b_r1-aarch64.sqsh
+PASS dsrelk5-c128-1p1d-xdr: /model <- /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/model-view/kimi-k3.1-k3type (want /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/model-view/kimi-k3.1-k3type)
+PASS dsrelk5-c128-1p1d-xdr: draft /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626 -> /raid/common-models/kimi-k3.1-pro-dspark:ro
+PASS dsrelk5-c128-1p1d-xdr: preview draft not mounted
+PASS dsrelk5-c128-1p1d-xdr: k31vr mounted at its own path (tree, JIT dirs, AgentX runtime)
+PASS dsrelk5-c128-1p1d-xdr: /raid/scratch mounted
+PASS dsrelk5-c128-1p1d-xdr: /logs mounted
+PASS dsrelk5-c128-1p1d-xdr: nothing mounted over /opt/k3
+PASS dsrelk5-c128-1p1d-xdr: srtctl render (preflight: model path + container) rc=0 (/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/scratch/dsrelk5-c128-1p1d-xdr/render.log)
+PASS dsrelk5-c128-1p1d-xdr: srtctl render of the frozen source rc=0
+PASS dsrelk5-c128-1p1d-xdr: srtctl-rendered sbatch_script.sh differs from the render's exactly as the frozen source's does (6 lines: ['# Config: /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/renders/dsrelk5-c128-1p1d-xdr/hybrid.yaml', '# Config: /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/dsrelk5-c128-1p1d-xdr/hybrid.yaml', 'cp "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/renders/dsrelk5-c128-1p1d-xdr/render"/*.yaml "${OUTPUT_DIR}/"', 'cp "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/dsrelk5-c128-1p1d-xdr/render"/*.yaml "${OUTPUT_DIR}/"'])
+PASS dsrelk5-c128-1p1d-xdr: srtctl-rendered render.json differs from the render's exactly as the frozen source's does (2 lines: ['  "script": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/renders/dsrelk5-c128-1p1d-xdr/render/sbatch_script.sh"', '  "script": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/dsrelk5-c128-1p1d-xdr/render/sbatch_script.sh"'])
+PASS dsrelk5-c128-1p1d-xdr: srtctl-rendered git_state.txt == the render's (paths, Generated stamps aside)
+PASS dsrelk5-c128-1p1d-xdr: srtctl-rendered config.yaml == the render's (paths, Generated stamps aside)
+PASS /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/renders/dsrelk5-c128-1p1d-ev-xdr exists
+
+== dsrelk5-c128-1p1d-ev-xdr  (source frz-c128-1p1d-ev-xdr)
+PASS dsrelk5-c128-1p1d-ev-xdr: file set = source + DSREL.txt (extra [], missing [])
+PASS dsrelk5-c128-1p1d-ev-xdr: no symlinks
+PASS dsrelk5-c128-1p1d-ev-xdr: file modes kept (sbatch_script.sh executable)
+PASS dsrelk5-c128-1p1d-ev-xdr: no leftover temp dirs []
+PASS dsrelk5-c128-1p1d-ev-xdr: provenance record FRZ.txt verbatim
+PASS dsrelk5-c128-1p1d-ev-xdr: provenance record INTEG.txt verbatim
+PASS dsrelk5-c128-1p1d-ev-xdr: kmc.args = source with the render name changed
+PASS dsrelk5-c128-1p1d-ev-xdr: kmc.args names no frozen render
+PASS dsrelk5-c128-1p1d-ev-xdr: nq4.drop = source with the render name changed
+PASS dsrelk5-c128-1p1d-ev-xdr: nq4.drop names no frozen render
+PASS dsrelk5-c128-1p1d-ev-xdr: point.env = source with the render name changed
+PASS dsrelk5-c128-1p1d-ev-xdr: point.env names no frozen render
+PASS dsrelk5-c128-1p1d-ev-xdr: render/git_state.txt = source with the draft (and target weights) mount lines swapped
+PASS dsrelk5-c128-1p1d-ev-xdr: render/render.json = source with the render name changed
+PASS dsrelk5-c128-1p1d-ev-xdr: render/render.json names no frozen render
+PASS dsrelk5-c128-1p1d-ev-xdr: render/sbatch_script.sh = source with the render name changed
+PASS dsrelk5-c128-1p1d-ev-xdr: render/sbatch_script.sh names no frozen render
+PASS dsrelk5-c128-1p1d-ev-xdr: srtslurm.yaml = source with the render name changed
+PASS dsrelk5-c128-1p1d-ev-xdr: srtslurm.yaml names no frozen render
+PASS dsrelk5-c128-1p1d-ev-xdr: workflow.env.resolved = source with the render name changed
+PASS dsrelk5-c128-1p1d-ev-xdr: workflow.env.resolved names no frozen render
+PASS dsrelk5-c128-1p1d-ev-xdr: sbatch_script.sh stages its own render dir
+PASS dsrelk5-c128-1p1d-ev-xdr: job name
+PASS dsrelk5-c128-1p1d-ev-xdr: render.json name/script
+PASS dsrelk5-c128-1p1d-ev-xdr: render/config.yaml parsed diff = 5 keys, all draft keys ()
+PASS dsrelk5-c128-1p1d-ev-xdr: render/config.yaml has no preview draft / TOKENSPEED_MLA
+PASS dsrelk5-c128-1p1d-ev-xdr: hybrid.yaml parsed diff = 5 keys, all draft keys ()
+PASS dsrelk5-c128-1p1d-ev-xdr: hybrid.yaml has no preview draft / TOKENSPEED_MLA
+PASS dsrelk5-c128-1p1d-ev-xdr: decode capture sizes = derive_capture_sizes(frozen, k3 -> k5) (123 sizes)
+PASS dsrelk5-c128-1p1d-ev-xdr: decode max-cudagraph-capture-size 640 -> 960 = max-num-seqs 160 x q6
+PASS dsrelk5-c128-1p1d-ev-xdr: the frozen list re-derives to itself at k3
+PASS dsrelk5-c128-1p1d-ev-xdr: k5 FULL graphs hold the frozen list's 79 verify / 56 drafter batches, largest 160 / 160
+PASS dsrelk5-c128-1p1d-ev-xdr: hybrid.yaml decode capture keys = config.yaml's
+PASS dsrelk5-c128-1p1d-ev-xdr: max-num-batched-tokens {'prefill': (32, 16384), 'decode': (160, 8192)} hold the k5 draft pass and verify rows 
+PASS dsrelk5-c128-1p1d-ev-xdr: prefill and decode speculative-config identical
+PASS dsrelk5-c128-1p1d-ev-xdr: speculative-config == {"method": "dspark", "model": "/raid/common-models/kimi-k3.1-pro-dspark", "num_speculative_tokens": 5, "attention_backend": "FLASH_ATTN", "draft_sample_method": "probabilistic", "rejection_sample_method": "block"}
+PASS dsrelk5-c128-1p1d-ev-xdr: golden-acceptance.json {'golden_acceptance_length': None}
+PASS dsrelk5-c128-1p1d-ev-xdr: DSREL.txt names its source
+PASS dsrelk5-c128-1p1d-ev-xdr: the vLLM tree on both role PYTHONPATHs = ['/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/hti/lowlat/trees/ll-integ-dea4ebd06f']
+PASS dsrelk5-c128-1p1d-ev-xdr: container alias -> /lustre/fsw/coreai_comparch_inferencex/weizha/k3vr/images/k31vr-kmc_kmr-sweep-freeze_p242fb49cd4-mr4b8c04e28d7_d3c468ef795-kmm7989055e66_fi0.7.3.dev20261031_mc0.3.14_base3f1bcfd82b_r1-aarch64.sqsh
+PASS dsrelk5-c128-1p1d-ev-xdr: /model <- /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/model-view/kimi-k3.1-k3type (want /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/model-view/kimi-k3.1-k3type)
+PASS dsrelk5-c128-1p1d-ev-xdr: draft /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626 -> /raid/common-models/kimi-k3.1-pro-dspark:ro
+PASS dsrelk5-c128-1p1d-ev-xdr: preview draft not mounted
+PASS dsrelk5-c128-1p1d-ev-xdr: k31vr mounted at its own path (tree, JIT dirs, AgentX runtime)
+PASS dsrelk5-c128-1p1d-ev-xdr: /raid/scratch mounted
+PASS dsrelk5-c128-1p1d-ev-xdr: /logs mounted
+PASS dsrelk5-c128-1p1d-ev-xdr: nothing mounted over /opt/k3
+PASS dsrelk5-c128-1p1d-ev-xdr: srtctl render (preflight: model path + container) rc=0 (/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/scratch/dsrelk5-c128-1p1d-ev-xdr/render.log)
+PASS dsrelk5-c128-1p1d-ev-xdr: srtctl render of the frozen source rc=0
+PASS dsrelk5-c128-1p1d-ev-xdr: srtctl-rendered sbatch_script.sh differs from the render's exactly as the frozen source's does (6 lines: ['# Config: /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/renders/dsrelk5-c128-1p1d-ev-xdr/hybrid.yaml', '# Config: /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/dsrelk5-c128-1p1d-ev-xdr/hybrid.yaml', 'cp "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/renders/dsrelk5-c128-1p1d-ev-xdr/render"/*.yaml "${OUTPUT_DIR}/"', 'cp "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/dsrelk5-c128-1p1d-ev-xdr/render"/*.yaml "${OUTPUT_DIR}/"'])
+PASS dsrelk5-c128-1p1d-ev-xdr: srtctl-rendered render.json differs from the render's exactly as the frozen source's does (2 lines: ['  "script": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/renders/dsrelk5-c128-1p1d-ev-xdr/render/sbatch_script.sh"', '  "script": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/dsrelk5-c128-1p1d-ev-xdr/render/sbatch_script.sh"'])
+PASS dsrelk5-c128-1p1d-ev-xdr: srtctl-rendered git_state.txt == the render's (paths, Generated stamps aside)
+PASS dsrelk5-c128-1p1d-ev-xdr: srtctl-rendered config.yaml == the render's (paths, Generated stamps aside)
+PASS dsrelk5-c128-1p1d-xdr / -ev: agentx-vs-gsm8k diff keys = the frozen pair's (22 keys)
+PASS dsrelk5-c128-1p1d-xdr / -ev: agentx-vs-gsm8k values = the frozen pair's (outside the speculative-configs)
+PASS dsrelk5-c128-1p1d-xdr / -ev decode: agentx -> gsm8k = synthetic -> block, AL dropped ({'rejection_sample_method': ('synthetic', 'block'), 'synthetic_acceptance_length': (3.81, None)})
+PASS dsrelk5-c128-1p1d-xdr / -ev prefill: agentx -> gsm8k = synthetic -> block, AL dropped ({'rejection_sample_method': ('synthetic', 'block'), 'synthetic_acceptance_length': (3.81, None)})
+PASS /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/renders/dsrelk5-c128-1p1d-spx exists
+
+== dsrelk5-c128-1p1d-spx  (source frz-c128-1p1d-spx)
+PASS dsrelk5-c128-1p1d-spx: file set = source + DSREL.txt (extra [], missing [])
+PASS dsrelk5-c128-1p1d-spx: no symlinks
+PASS dsrelk5-c128-1p1d-spx: file modes kept (sbatch_script.sh executable)
+PASS dsrelk5-c128-1p1d-spx: no leftover temp dirs []
+PASS dsrelk5-c128-1p1d-spx: provenance record FRZ.txt verbatim
+PASS dsrelk5-c128-1p1d-spx: provenance record INTEG.txt verbatim
+PASS dsrelk5-c128-1p1d-spx: kmc.args = source with the render name changed
+PASS dsrelk5-c128-1p1d-spx: kmc.args names no frozen render
+PASS dsrelk5-c128-1p1d-spx: nq4.drop = source with the render name changed
+PASS dsrelk5-c128-1p1d-spx: nq4.drop names no frozen render
+PASS dsrelk5-c128-1p1d-spx: point.env = source with the render name changed
+PASS dsrelk5-c128-1p1d-spx: point.env names no frozen render
+PASS dsrelk5-c128-1p1d-spx: provenance record render.log verbatim
+PASS dsrelk5-c128-1p1d-spx: render/git_state.txt = source with the draft (and target weights) mount lines swapped
+PASS dsrelk5-c128-1p1d-spx: render/render.json = source with the render name changed
+PASS dsrelk5-c128-1p1d-spx: render/render.json names no frozen render
+PASS dsrelk5-c128-1p1d-spx: render/sbatch_script.sh = source with the render name changed
+PASS dsrelk5-c128-1p1d-spx: render/sbatch_script.sh names no frozen render
+PASS dsrelk5-c128-1p1d-spx: srtslurm.yaml = source with the render name changed
+PASS dsrelk5-c128-1p1d-spx: srtslurm.yaml names no frozen render
+PASS dsrelk5-c128-1p1d-spx: workflow.env.resolved = source with the render name changed
+PASS dsrelk5-c128-1p1d-spx: workflow.env.resolved names no frozen render
+PASS dsrelk5-c128-1p1d-spx: sbatch_script.sh stages its own render dir
+PASS dsrelk5-c128-1p1d-spx: job name
+PASS dsrelk5-c128-1p1d-spx: render.json name/script
+PASS dsrelk5-c128-1p1d-spx: render/config.yaml parsed diff = 5 keys, all draft keys ()
+PASS dsrelk5-c128-1p1d-spx: render/config.yaml has no preview draft / TOKENSPEED_MLA
+PASS dsrelk5-c128-1p1d-spx: hybrid.yaml parsed diff = 5 keys, all draft keys ()
+PASS dsrelk5-c128-1p1d-spx: hybrid.yaml has no preview draft / TOKENSPEED_MLA
+PASS dsrelk5-c128-1p1d-spx: decode capture sizes = derive_capture_sizes(frozen, k3 -> k5) (123 sizes)
+PASS dsrelk5-c128-1p1d-spx: decode max-cudagraph-capture-size 640 -> 960 = max-num-seqs 160 x q6
+PASS dsrelk5-c128-1p1d-spx: the frozen list re-derives to itself at k3
+PASS dsrelk5-c128-1p1d-spx: k5 FULL graphs hold the frozen list's 79 verify / 56 drafter batches, largest 160 / 160
+PASS dsrelk5-c128-1p1d-spx: hybrid.yaml decode capture keys = config.yaml's
+PASS dsrelk5-c128-1p1d-spx: max-num-batched-tokens {'prefill': (32, 16384), 'decode': (160, 8192)} hold the k5 draft pass and verify rows 
+PASS dsrelk5-c128-1p1d-spx: prefill and decode speculative-config identical
+PASS dsrelk5-c128-1p1d-spx: speculative-config == {"method": "dspark", "model": "/raid/common-models/kimi-k3.1-pro-dspark", "num_speculative_tokens": 5, "attention_backend": "FLASH_ATTN", "draft_sample_method": "probabilistic", "rejection_sample_method": "synthetic", "synthetic_acceptance_length": 3.81}
+PASS dsrelk5-c128-1p1d-spx: AL 3.81 -> per-position rates [1.0, 1.0, 0.81, 0.0, 0.0] (sum + 1 = AL)
+PASS dsrelk5-c128-1p1d-spx: golden-acceptance.json {'golden_acceptance_length': 3.81}
+PASS dsrelk5-c128-1p1d-spx: AL_FIX.txt records the release AL
+PASS dsrelk5-c128-1p1d-spx: DSREL.txt names its source
+PASS dsrelk5-c128-1p1d-spx: the vLLM tree on both role PYTHONPATHs = ['/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/hti/lowlat/trees/ll-integ-dea4ebd06f']
+PASS dsrelk5-c128-1p1d-spx: container alias -> /lustre/fsw/coreai_comparch_inferencex/weizha/k3vr/images/k31vr-kmc_kmr-sweep-freeze_p242fb49cd4-mr4b8c04e28d7_d3c468ef795-kmm7989055e66_fi0.7.3.dev20261031_mc0.3.14_base3f1bcfd82b_r1-aarch64.sqsh
+PASS dsrelk5-c128-1p1d-spx: /model <- /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/model-view/kimi-k3.1-k3type (want /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/model-view/kimi-k3.1-k3type)
+PASS dsrelk5-c128-1p1d-spx: draft /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626 -> /raid/common-models/kimi-k3.1-pro-dspark:ro
+PASS dsrelk5-c128-1p1d-spx: preview draft not mounted
+PASS dsrelk5-c128-1p1d-spx: k31vr mounted at its own path (tree, JIT dirs, AgentX runtime)
+PASS dsrelk5-c128-1p1d-spx: /raid/scratch mounted
+PASS dsrelk5-c128-1p1d-spx: /logs mounted
+PASS dsrelk5-c128-1p1d-spx: nothing mounted over /opt/k3
+PASS dsrelk5-c128-1p1d-spx: srtctl render (preflight: model path + container) rc=0 (/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/scratch/dsrelk5-c128-1p1d-spx/render.log)
+PASS dsrelk5-c128-1p1d-spx: srtctl render of the frozen source rc=0
+PASS dsrelk5-c128-1p1d-spx: srtctl-rendered sbatch_script.sh differs from the render's exactly as the frozen source's does (6 lines: ['# Config: /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/renders/dsrelk5-c128-1p1d-spx/hybrid.yaml', '# Config: /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/dsrelk5-c128-1p1d-spx/hybrid.yaml', 'cp "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/renders/dsrelk5-c128-1p1d-spx/render"/*.yaml "${OUTPUT_DIR}/"', 'cp "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/dsrelk5-c128-1p1d-spx/render"/*.yaml "${OUTPUT_DIR}/"'])
+PASS dsrelk5-c128-1p1d-spx: srtctl-rendered render.json differs from the render's exactly as the frozen source's does (2 lines: ['  "script": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/renders/dsrelk5-c128-1p1d-spx/render/sbatch_script.sh"', '  "script": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/dsrelk5-c128-1p1d-spx/render/sbatch_script.sh"'])
+PASS dsrelk5-c128-1p1d-spx: srtctl-rendered git_state.txt == the render's (paths, Generated stamps aside)
+PASS dsrelk5-c128-1p1d-spx: srtctl-rendered config.yaml == the render's (paths, Generated stamps aside)
+PASS /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/renders/dsrelk5-c128-1p1d-ev-spx exists
+
+== dsrelk5-c128-1p1d-ev-spx  (source frz-c128-1p1d-ev-spx)
+PASS dsrelk5-c128-1p1d-ev-spx: file set = source + DSREL.txt (extra [], missing [])
+PASS dsrelk5-c128-1p1d-ev-spx: no symlinks
+PASS dsrelk5-c128-1p1d-ev-spx: file modes kept (sbatch_script.sh executable)
+PASS dsrelk5-c128-1p1d-ev-spx: no leftover temp dirs []
+PASS dsrelk5-c128-1p1d-ev-spx: provenance record FRZ.txt verbatim
+PASS dsrelk5-c128-1p1d-ev-spx: provenance record INTEG.txt verbatim
+PASS dsrelk5-c128-1p1d-ev-spx: kmc.args = source with the render name changed
+PASS dsrelk5-c128-1p1d-ev-spx: kmc.args names no frozen render
+PASS dsrelk5-c128-1p1d-ev-spx: nq4.drop = source with the render name changed
+PASS dsrelk5-c128-1p1d-ev-spx: nq4.drop names no frozen render
+PASS dsrelk5-c128-1p1d-ev-spx: point.env = source with the render name changed
+PASS dsrelk5-c128-1p1d-ev-spx: point.env names no frozen render
+PASS dsrelk5-c128-1p1d-ev-spx: render/git_state.txt = source with the draft (and target weights) mount lines swapped
+PASS dsrelk5-c128-1p1d-ev-spx: render/render.json = source with the render name changed
+PASS dsrelk5-c128-1p1d-ev-spx: render/render.json names no frozen render
+PASS dsrelk5-c128-1p1d-ev-spx: render/sbatch_script.sh = source with the render name changed
+PASS dsrelk5-c128-1p1d-ev-spx: render/sbatch_script.sh names no frozen render
+PASS dsrelk5-c128-1p1d-ev-spx: srtslurm.yaml = source with the render name changed
+PASS dsrelk5-c128-1p1d-ev-spx: srtslurm.yaml names no frozen render
+PASS dsrelk5-c128-1p1d-ev-spx: workflow.env.resolved = source with the render name changed
+PASS dsrelk5-c128-1p1d-ev-spx: workflow.env.resolved names no frozen render
+PASS dsrelk5-c128-1p1d-ev-spx: sbatch_script.sh stages its own render dir
+PASS dsrelk5-c128-1p1d-ev-spx: job name
+PASS dsrelk5-c128-1p1d-ev-spx: render.json name/script
+PASS dsrelk5-c128-1p1d-ev-spx: render/config.yaml parsed diff = 5 keys, all draft keys ()
+PASS dsrelk5-c128-1p1d-ev-spx: render/config.yaml has no preview draft / TOKENSPEED_MLA
+PASS dsrelk5-c128-1p1d-ev-spx: hybrid.yaml parsed diff = 5 keys, all draft keys ()
+PASS dsrelk5-c128-1p1d-ev-spx: hybrid.yaml has no preview draft / TOKENSPEED_MLA
+PASS dsrelk5-c128-1p1d-ev-spx: decode capture sizes = derive_capture_sizes(frozen, k3 -> k5) (123 sizes)
+PASS dsrelk5-c128-1p1d-ev-spx: decode max-cudagraph-capture-size 640 -> 960 = max-num-seqs 160 x q6
+PASS dsrelk5-c128-1p1d-ev-spx: the frozen list re-derives to itself at k3
+PASS dsrelk5-c128-1p1d-ev-spx: k5 FULL graphs hold the frozen list's 79 verify / 56 drafter batches, largest 160 / 160
+PASS dsrelk5-c128-1p1d-ev-spx: hybrid.yaml decode capture keys = config.yaml's
+PASS dsrelk5-c128-1p1d-ev-spx: max-num-batched-tokens {'prefill': (32, 16384), 'decode': (160, 8192)} hold the k5 draft pass and verify rows 
+PASS dsrelk5-c128-1p1d-ev-spx: prefill and decode speculative-config identical
+PASS dsrelk5-c128-1p1d-ev-spx: speculative-config == {"method": "dspark", "model": "/raid/common-models/kimi-k3.1-pro-dspark", "num_speculative_tokens": 5, "attention_backend": "FLASH_ATTN", "draft_sample_method": "probabilistic", "rejection_sample_method": "block"}
+PASS dsrelk5-c128-1p1d-ev-spx: golden-acceptance.json {'golden_acceptance_length': None}
+PASS dsrelk5-c128-1p1d-ev-spx: DSREL.txt names its source
+PASS dsrelk5-c128-1p1d-ev-spx: the vLLM tree on both role PYTHONPATHs = ['/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/hti/lowlat/trees/ll-integ-dea4ebd06f']
+PASS dsrelk5-c128-1p1d-ev-spx: container alias -> /lustre/fsw/coreai_comparch_inferencex/weizha/k3vr/images/k31vr-kmc_kmr-sweep-freeze_p242fb49cd4-mr4b8c04e28d7_d3c468ef795-kmm7989055e66_fi0.7.3.dev20261031_mc0.3.14_base3f1bcfd82b_r1-aarch64.sqsh
+PASS dsrelk5-c128-1p1d-ev-spx: /model <- /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/model-view/kimi-k3.1-k3type (want /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/model-view/kimi-k3.1-k3type)
+PASS dsrelk5-c128-1p1d-ev-spx: draft /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626 -> /raid/common-models/kimi-k3.1-pro-dspark:ro
+PASS dsrelk5-c128-1p1d-ev-spx: preview draft not mounted
+PASS dsrelk5-c128-1p1d-ev-spx: k31vr mounted at its own path (tree, JIT dirs, AgentX runtime)
+PASS dsrelk5-c128-1p1d-ev-spx: /raid/scratch mounted
+PASS dsrelk5-c128-1p1d-ev-spx: /logs mounted
+PASS dsrelk5-c128-1p1d-ev-spx: nothing mounted over /opt/k3
+PASS dsrelk5-c128-1p1d-ev-spx: srtctl render (preflight: model path + container) rc=0 (/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/scratch/dsrelk5-c128-1p1d-ev-spx/render.log)
+PASS dsrelk5-c128-1p1d-ev-spx: srtctl render of the frozen source rc=0
+PASS dsrelk5-c128-1p1d-ev-spx: srtctl-rendered sbatch_script.sh differs from the render's exactly as the frozen source's does (6 lines: ['# Config: /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/renders/dsrelk5-c128-1p1d-ev-spx/hybrid.yaml', '# Config: /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/dsrelk5-c128-1p1d-ev-spx/hybrid.yaml', 'cp "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/renders/dsrelk5-c128-1p1d-ev-spx/render"/*.yaml "${OUTPUT_DIR}/"', 'cp "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/dsrelk5-c128-1p1d-ev-spx/render"/*.yaml "${OUTPUT_DIR}/"'])
+PASS dsrelk5-c128-1p1d-ev-spx: srtctl-rendered render.json differs from the render's exactly as the frozen source's does (2 lines: ['  "script": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/renders/dsrelk5-c128-1p1d-ev-spx/render/sbatch_script.sh"', '  "script": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/dsrelk5-c128-1p1d-ev-spx/render/sbatch_script.sh"'])
+PASS dsrelk5-c128-1p1d-ev-spx: srtctl-rendered git_state.txt == the render's (paths, Generated stamps aside)
+PASS dsrelk5-c128-1p1d-ev-spx: srtctl-rendered config.yaml == the render's (paths, Generated stamps aside)
+PASS dsrelk5-c128-1p1d-spx / -ev: agentx-vs-gsm8k diff keys = the frozen pair's (22 keys)
+PASS dsrelk5-c128-1p1d-spx / -ev: agentx-vs-gsm8k values = the frozen pair's (outside the speculative-configs)
+PASS dsrelk5-c128-1p1d-spx / -ev decode: agentx -> gsm8k = synthetic -> block, AL dropped ({'rejection_sample_method': ('synthetic', 'block'), 'synthetic_acceptance_length': (3.81, None)})
+PASS dsrelk5-c128-1p1d-spx / -ev prefill: agentx -> gsm8k = synthetic -> block, AL dropped ({'rejection_sample_method': ('synthetic', 'block'), 'synthetic_acceptance_length': (3.81, None)})
+PASS /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/renders/dsrelk5-c160-1p1d-llh-xdr exists
+
+== dsrelk5-c160-1p1d-llh-xdr  (source frz-c160-1p1d-llh-xdr)
+PASS dsrelk5-c160-1p1d-llh-xdr: file set = source + DSREL.txt (extra [], missing [])
+PASS dsrelk5-c160-1p1d-llh-xdr: no symlinks
+PASS dsrelk5-c160-1p1d-llh-xdr: file modes kept (sbatch_script.sh executable)
+PASS dsrelk5-c160-1p1d-llh-xdr: no leftover temp dirs []
+PASS dsrelk5-c160-1p1d-llh-xdr: provenance record FRZ.txt verbatim
+PASS dsrelk5-c160-1p1d-llh-xdr: provenance record INTEG.txt verbatim
+PASS dsrelk5-c160-1p1d-llh-xdr: kmc.args = source with the render name changed
+PASS dsrelk5-c160-1p1d-llh-xdr: kmc.args names no frozen render
+PASS dsrelk5-c160-1p1d-llh-xdr: nq4.drop = source with the render name changed
+PASS dsrelk5-c160-1p1d-llh-xdr: nq4.drop names no frozen render
+PASS dsrelk5-c160-1p1d-llh-xdr: point.env = source with the render name changed
+PASS dsrelk5-c160-1p1d-llh-xdr: point.env names no frozen render
+PASS dsrelk5-c160-1p1d-llh-xdr: provenance record render.log verbatim
+PASS dsrelk5-c160-1p1d-llh-xdr: render/git_state.txt = source with the draft (and target weights) mount lines swapped
+PASS dsrelk5-c160-1p1d-llh-xdr: render/render.json = source with the render name changed
+PASS dsrelk5-c160-1p1d-llh-xdr: render/render.json names no frozen render
+PASS dsrelk5-c160-1p1d-llh-xdr: render/sbatch_script.sh = source with the render name changed
+PASS dsrelk5-c160-1p1d-llh-xdr: render/sbatch_script.sh names no frozen render
+PASS dsrelk5-c160-1p1d-llh-xdr: srtslurm.yaml = source with the render name changed
+PASS dsrelk5-c160-1p1d-llh-xdr: srtslurm.yaml names no frozen render
+PASS dsrelk5-c160-1p1d-llh-xdr: workflow.env.resolved = source with the render name changed
+PASS dsrelk5-c160-1p1d-llh-xdr: workflow.env.resolved names no frozen render
+PASS dsrelk5-c160-1p1d-llh-xdr: sbatch_script.sh stages its own render dir
+PASS dsrelk5-c160-1p1d-llh-xdr: job name
+PASS dsrelk5-c160-1p1d-llh-xdr: render.json name/script
+PASS dsrelk5-c160-1p1d-llh-xdr: render/config.yaml parsed diff = 5 keys, all draft keys ()
+PASS dsrelk5-c160-1p1d-llh-xdr: render/config.yaml has no preview draft / TOKENSPEED_MLA
+PASS dsrelk5-c160-1p1d-llh-xdr: hybrid.yaml parsed diff = 5 keys, all draft keys ()
+PASS dsrelk5-c160-1p1d-llh-xdr: hybrid.yaml has no preview draft / TOKENSPEED_MLA
+PASS dsrelk5-c160-1p1d-llh-xdr: decode capture sizes = derive_capture_sizes(frozen, k3 -> k5) (123 sizes)
+PASS dsrelk5-c160-1p1d-llh-xdr: decode max-cudagraph-capture-size 640 -> 960 = max-num-seqs 160 x q6
+PASS dsrelk5-c160-1p1d-llh-xdr: the frozen list re-derives to itself at k3
+PASS dsrelk5-c160-1p1d-llh-xdr: k5 FULL graphs hold the frozen list's 79 verify / 56 drafter batches, largest 160 / 160
+PASS dsrelk5-c160-1p1d-llh-xdr: hybrid.yaml decode capture keys = config.yaml's
+PASS dsrelk5-c160-1p1d-llh-xdr: max-num-batched-tokens {'prefill': (32, 16384), 'decode': (160, 8192)} hold the k5 draft pass and verify rows 
+PASS dsrelk5-c160-1p1d-llh-xdr: prefill and decode speculative-config identical
+PASS dsrelk5-c160-1p1d-llh-xdr: speculative-config == {"method": "dspark", "model": "/raid/common-models/kimi-k3.1-pro-dspark", "num_speculative_tokens": 5, "attention_backend": "FLASH_ATTN", "draft_sample_method": "probabilistic", "rejection_sample_method": "synthetic", "synthetic_acceptance_length": 3.81}
+PASS dsrelk5-c160-1p1d-llh-xdr: AL 3.81 -> per-position rates [1.0, 1.0, 0.81, 0.0, 0.0] (sum + 1 = AL)
+PASS dsrelk5-c160-1p1d-llh-xdr: golden-acceptance.json {'golden_acceptance_length': 3.81}
+PASS dsrelk5-c160-1p1d-llh-xdr: AL_FIX.txt records the release AL
+PASS dsrelk5-c160-1p1d-llh-xdr: DSREL.txt names its source
+PASS dsrelk5-c160-1p1d-llh-xdr: the vLLM tree on both role PYTHONPATHs = ['/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/hti/lowlat/trees/ll-integ-dea4ebd06f']
+PASS dsrelk5-c160-1p1d-llh-xdr: container alias -> /lustre/fsw/coreai_comparch_inferencex/weizha/k3vr/images/k31vr-kmc_kmr-sweep-freeze_p242fb49cd4-mr4b8c04e28d7_d3c468ef795-kmm7989055e66_fi0.7.3.dev20261031_mc0.3.14_base3f1bcfd82b_r1-aarch64.sqsh
+PASS dsrelk5-c160-1p1d-llh-xdr: /model <- /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/model-view/kimi-k3.1-k3type (want /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/model-view/kimi-k3.1-k3type)
+PASS dsrelk5-c160-1p1d-llh-xdr: draft /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626 -> /raid/common-models/kimi-k3.1-pro-dspark:ro
+PASS dsrelk5-c160-1p1d-llh-xdr: preview draft not mounted
+PASS dsrelk5-c160-1p1d-llh-xdr: k31vr mounted at its own path (tree, JIT dirs, AgentX runtime)
+PASS dsrelk5-c160-1p1d-llh-xdr: /raid/scratch mounted
+PASS dsrelk5-c160-1p1d-llh-xdr: /logs mounted
+PASS dsrelk5-c160-1p1d-llh-xdr: nothing mounted over /opt/k3
+PASS dsrelk5-c160-1p1d-llh-xdr: srtctl render (preflight: model path + container) rc=0 (/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/scratch/dsrelk5-c160-1p1d-llh-xdr/render.log)
+PASS dsrelk5-c160-1p1d-llh-xdr: srtctl render of the frozen source rc=0
+PASS dsrelk5-c160-1p1d-llh-xdr: srtctl-rendered sbatch_script.sh differs from the render's exactly as the frozen source's does (6 lines: ['# Config: /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/renders/dsrelk5-c160-1p1d-llh-xdr/hybrid.yaml', '# Config: /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/dsrelk5-c160-1p1d-llh-xdr/hybrid.yaml', 'cp "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/renders/dsrelk5-c160-1p1d-llh-xdr/render"/*.yaml "${OUTPUT_DIR}/"', 'cp "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/dsrelk5-c160-1p1d-llh-xdr/render"/*.yaml "${OUTPUT_DIR}/"'])
+PASS dsrelk5-c160-1p1d-llh-xdr: srtctl-rendered render.json differs from the render's exactly as the frozen source's does (2 lines: ['  "script": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/renders/dsrelk5-c160-1p1d-llh-xdr/render/sbatch_script.sh"', '  "script": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/dsrelk5-c160-1p1d-llh-xdr/render/sbatch_script.sh"'])
+PASS dsrelk5-c160-1p1d-llh-xdr: srtctl-rendered git_state.txt == the render's (paths, Generated stamps aside)
+PASS dsrelk5-c160-1p1d-llh-xdr: srtctl-rendered config.yaml == the render's (paths, Generated stamps aside)
+PASS /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/renders/dsrelk5-c160-1p1d-llh-ev-xdr exists
+
+== dsrelk5-c160-1p1d-llh-ev-xdr  (source frz-c160-1p1d-llh-ev-xdr)
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: file set = source + DSREL.txt (extra [], missing [])
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: no symlinks
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: file modes kept (sbatch_script.sh executable)
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: no leftover temp dirs []
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: provenance record FRZ.txt verbatim
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: provenance record INTEG.txt verbatim
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: kmc.args = source with the render name changed
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: kmc.args names no frozen render
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: nq4.drop = source with the render name changed
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: nq4.drop names no frozen render
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: point.env = source with the render name changed
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: point.env names no frozen render
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: render/git_state.txt = source with the draft (and target weights) mount lines swapped
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: render/render.json = source with the render name changed
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: render/render.json names no frozen render
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: render/sbatch_script.sh = source with the render name changed
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: render/sbatch_script.sh names no frozen render
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: srtslurm.yaml = source with the render name changed
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: srtslurm.yaml names no frozen render
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: workflow.env.resolved = source with the render name changed
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: workflow.env.resolved names no frozen render
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: sbatch_script.sh stages its own render dir
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: job name
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: render.json name/script
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: render/config.yaml parsed diff = 5 keys, all draft keys ()
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: render/config.yaml has no preview draft / TOKENSPEED_MLA
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: hybrid.yaml parsed diff = 5 keys, all draft keys ()
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: hybrid.yaml has no preview draft / TOKENSPEED_MLA
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: decode capture sizes = derive_capture_sizes(frozen, k3 -> k5) (123 sizes)
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: decode max-cudagraph-capture-size 640 -> 960 = max-num-seqs 160 x q6
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: the frozen list re-derives to itself at k3
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: k5 FULL graphs hold the frozen list's 79 verify / 56 drafter batches, largest 160 / 160
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: hybrid.yaml decode capture keys = config.yaml's
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: max-num-batched-tokens {'prefill': (32, 16384), 'decode': (160, 8192)} hold the k5 draft pass and verify rows 
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: prefill and decode speculative-config identical
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: speculative-config == {"method": "dspark", "model": "/raid/common-models/kimi-k3.1-pro-dspark", "num_speculative_tokens": 5, "attention_backend": "FLASH_ATTN", "draft_sample_method": "probabilistic", "rejection_sample_method": "block"}
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: golden-acceptance.json {'golden_acceptance_length': None}
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: DSREL.txt names its source
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: the vLLM tree on both role PYTHONPATHs = ['/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/hti/lowlat/trees/ll-integ-dea4ebd06f']
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: container alias -> /lustre/fsw/coreai_comparch_inferencex/weizha/k3vr/images/k31vr-kmc_kmr-sweep-freeze_p242fb49cd4-mr4b8c04e28d7_d3c468ef795-kmm7989055e66_fi0.7.3.dev20261031_mc0.3.14_base3f1bcfd82b_r1-aarch64.sqsh
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: /model <- /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/model-view/kimi-k3.1-k3type (want /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/model-view/kimi-k3.1-k3type)
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: draft /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626 -> /raid/common-models/kimi-k3.1-pro-dspark:ro
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: preview draft not mounted
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: k31vr mounted at its own path (tree, JIT dirs, AgentX runtime)
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: /raid/scratch mounted
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: /logs mounted
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: nothing mounted over /opt/k3
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: srtctl render (preflight: model path + container) rc=0 (/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/scratch/dsrelk5-c160-1p1d-llh-ev-xdr/render.log)
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: srtctl render of the frozen source rc=0
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: srtctl-rendered sbatch_script.sh differs from the render's exactly as the frozen source's does (6 lines: ['# Config: /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/renders/dsrelk5-c160-1p1d-llh-ev-xdr/hybrid.yaml', '# Config: /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/dsrelk5-c160-1p1d-llh-ev-xdr/hybrid.yaml', 'cp "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/renders/dsrelk5-c160-1p1d-llh-ev-xdr/render"/*.yaml "${OUTPUT_DIR}/"', 'cp "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/dsrelk5-c160-1p1d-llh-ev-xdr/render"/*.yaml "${OUTPUT_DIR}/"'])
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: srtctl-rendered render.json differs from the render's exactly as the frozen source's does (2 lines: ['  "script": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/renders/dsrelk5-c160-1p1d-llh-ev-xdr/render/sbatch_script.sh"', '  "script": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/dsrelk5-c160-1p1d-llh-ev-xdr/render/sbatch_script.sh"'])
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: srtctl-rendered git_state.txt == the render's (paths, Generated stamps aside)
+PASS dsrelk5-c160-1p1d-llh-ev-xdr: srtctl-rendered config.yaml == the render's (paths, Generated stamps aside)
+PASS dsrelk5-c160-1p1d-llh-xdr / -ev: agentx-vs-gsm8k diff keys = the frozen pair's (22 keys)
+PASS dsrelk5-c160-1p1d-llh-xdr / -ev: agentx-vs-gsm8k values = the frozen pair's (outside the speculative-configs)
+PASS dsrelk5-c160-1p1d-llh-xdr / -ev decode: agentx -> gsm8k = synthetic -> block, AL dropped ({'rejection_sample_method': ('synthetic', 'block'), 'synthetic_acceptance_length': (3.81, None)})
+PASS dsrelk5-c160-1p1d-llh-xdr / -ev prefill: agentx -> gsm8k = synthetic -> block, AL dropped ({'rejection_sample_method': ('synthetic', 'block'), 'synthetic_acceptance_length': (3.81, None)})
+PASS /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/renders/dsrelk5-c160-1p1d-llh-spx exists
+
+== dsrelk5-c160-1p1d-llh-spx  (source frz-c160-1p1d-llh-spx)
+PASS dsrelk5-c160-1p1d-llh-spx: file set = source + DSREL.txt (extra [], missing [])
+PASS dsrelk5-c160-1p1d-llh-spx: no symlinks
+PASS dsrelk5-c160-1p1d-llh-spx: file modes kept (sbatch_script.sh executable)
+PASS dsrelk5-c160-1p1d-llh-spx: no leftover temp dirs []
+PASS dsrelk5-c160-1p1d-llh-spx: provenance record FRZ.txt verbatim
+PASS dsrelk5-c160-1p1d-llh-spx: provenance record INTEG.txt verbatim
+PASS dsrelk5-c160-1p1d-llh-spx: kmc.args = source with the render name changed
+PASS dsrelk5-c160-1p1d-llh-spx: kmc.args names no frozen render
+PASS dsrelk5-c160-1p1d-llh-spx: nq4.drop = source with the render name changed
+PASS dsrelk5-c160-1p1d-llh-spx: nq4.drop names no frozen render
+PASS dsrelk5-c160-1p1d-llh-spx: point.env = source with the render name changed
+PASS dsrelk5-c160-1p1d-llh-spx: point.env names no frozen render
+PASS dsrelk5-c160-1p1d-llh-spx: provenance record render.log verbatim
+PASS dsrelk5-c160-1p1d-llh-spx: render/git_state.txt = source with the draft (and target weights) mount lines swapped
+PASS dsrelk5-c160-1p1d-llh-spx: render/render.json = source with the render name changed
+PASS dsrelk5-c160-1p1d-llh-spx: render/render.json names no frozen render
+PASS dsrelk5-c160-1p1d-llh-spx: render/sbatch_script.sh = source with the render name changed
+PASS dsrelk5-c160-1p1d-llh-spx: render/sbatch_script.sh names no frozen render
+PASS dsrelk5-c160-1p1d-llh-spx: srtslurm.yaml = source with the render name changed
+PASS dsrelk5-c160-1p1d-llh-spx: srtslurm.yaml names no frozen render
+PASS dsrelk5-c160-1p1d-llh-spx: workflow.env.resolved = source with the render name changed
+PASS dsrelk5-c160-1p1d-llh-spx: workflow.env.resolved names no frozen render
+PASS dsrelk5-c160-1p1d-llh-spx: sbatch_script.sh stages its own render dir
+PASS dsrelk5-c160-1p1d-llh-spx: job name
+PASS dsrelk5-c160-1p1d-llh-spx: render.json name/script
+PASS dsrelk5-c160-1p1d-llh-spx: render/config.yaml parsed diff = 5 keys, all draft keys ()
+PASS dsrelk5-c160-1p1d-llh-spx: render/config.yaml has no preview draft / TOKENSPEED_MLA
+PASS dsrelk5-c160-1p1d-llh-spx: hybrid.yaml parsed diff = 5 keys, all draft keys ()
+PASS dsrelk5-c160-1p1d-llh-spx: hybrid.yaml has no preview draft / TOKENSPEED_MLA
+PASS dsrelk5-c160-1p1d-llh-spx: decode capture sizes = derive_capture_sizes(frozen, k3 -> k5) (123 sizes)
+PASS dsrelk5-c160-1p1d-llh-spx: decode max-cudagraph-capture-size 640 -> 960 = max-num-seqs 160 x q6
+PASS dsrelk5-c160-1p1d-llh-spx: the frozen list re-derives to itself at k3
+PASS dsrelk5-c160-1p1d-llh-spx: k5 FULL graphs hold the frozen list's 79 verify / 56 drafter batches, largest 160 / 160
+PASS dsrelk5-c160-1p1d-llh-spx: hybrid.yaml decode capture keys = config.yaml's
+PASS dsrelk5-c160-1p1d-llh-spx: max-num-batched-tokens {'prefill': (32, 16384), 'decode': (160, 8192)} hold the k5 draft pass and verify rows 
+PASS dsrelk5-c160-1p1d-llh-spx: prefill and decode speculative-config identical
+PASS dsrelk5-c160-1p1d-llh-spx: speculative-config == {"method": "dspark", "model": "/raid/common-models/kimi-k3.1-pro-dspark", "num_speculative_tokens": 5, "attention_backend": "FLASH_ATTN", "draft_sample_method": "probabilistic", "rejection_sample_method": "synthetic", "synthetic_acceptance_length": 3.81}
+PASS dsrelk5-c160-1p1d-llh-spx: AL 3.81 -> per-position rates [1.0, 1.0, 0.81, 0.0, 0.0] (sum + 1 = AL)
+PASS dsrelk5-c160-1p1d-llh-spx: golden-acceptance.json {'golden_acceptance_length': 3.81}
+PASS dsrelk5-c160-1p1d-llh-spx: AL_FIX.txt records the release AL
+PASS dsrelk5-c160-1p1d-llh-spx: DSREL.txt names its source
+PASS dsrelk5-c160-1p1d-llh-spx: the vLLM tree on both role PYTHONPATHs = ['/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/hti/lowlat/trees/ll-integ-dea4ebd06f']
+PASS dsrelk5-c160-1p1d-llh-spx: container alias -> /lustre/fsw/coreai_comparch_inferencex/weizha/k3vr/images/k31vr-kmc_kmr-sweep-freeze_p242fb49cd4-mr4b8c04e28d7_d3c468ef795-kmm7989055e66_fi0.7.3.dev20261031_mc0.3.14_base3f1bcfd82b_r1-aarch64.sqsh
+PASS dsrelk5-c160-1p1d-llh-spx: /model <- /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/model-view/kimi-k3.1-k3type (want /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/model-view/kimi-k3.1-k3type)
+PASS dsrelk5-c160-1p1d-llh-spx: draft /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626 -> /raid/common-models/kimi-k3.1-pro-dspark:ro
+PASS dsrelk5-c160-1p1d-llh-spx: preview draft not mounted
+PASS dsrelk5-c160-1p1d-llh-spx: k31vr mounted at its own path (tree, JIT dirs, AgentX runtime)
+PASS dsrelk5-c160-1p1d-llh-spx: /raid/scratch mounted
+PASS dsrelk5-c160-1p1d-llh-spx: /logs mounted
+PASS dsrelk5-c160-1p1d-llh-spx: nothing mounted over /opt/k3
+PASS dsrelk5-c160-1p1d-llh-spx: srtctl render (preflight: model path + container) rc=0 (/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/scratch/dsrelk5-c160-1p1d-llh-spx/render.log)
+PASS dsrelk5-c160-1p1d-llh-spx: srtctl render of the frozen source rc=0
+PASS dsrelk5-c160-1p1d-llh-spx: srtctl-rendered sbatch_script.sh differs from the render's exactly as the frozen source's does (6 lines: ['# Config: /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/renders/dsrelk5-c160-1p1d-llh-spx/hybrid.yaml', '# Config: /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/dsrelk5-c160-1p1d-llh-spx/hybrid.yaml', 'cp "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/renders/dsrelk5-c160-1p1d-llh-spx/render"/*.yaml "${OUTPUT_DIR}/"', 'cp "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/dsrelk5-c160-1p1d-llh-spx/render"/*.yaml "${OUTPUT_DIR}/"'])
+PASS dsrelk5-c160-1p1d-llh-spx: srtctl-rendered render.json differs from the render's exactly as the frozen source's does (2 lines: ['  "script": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/renders/dsrelk5-c160-1p1d-llh-spx/render/sbatch_script.sh"', '  "script": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/dsrelk5-c160-1p1d-llh-spx/render/sbatch_script.sh"'])
+PASS dsrelk5-c160-1p1d-llh-spx: srtctl-rendered git_state.txt == the render's (paths, Generated stamps aside)
+PASS dsrelk5-c160-1p1d-llh-spx: srtctl-rendered config.yaml == the render's (paths, Generated stamps aside)
+PASS /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/renders/dsrelk5-c160-1p1d-llh-ev-spx exists
+
+== dsrelk5-c160-1p1d-llh-ev-spx  (source frz-c160-1p1d-llh-ev-spx)
+PASS dsrelk5-c160-1p1d-llh-ev-spx: file set = source + DSREL.txt (extra [], missing [])
+PASS dsrelk5-c160-1p1d-llh-ev-spx: no symlinks
+PASS dsrelk5-c160-1p1d-llh-ev-spx: file modes kept (sbatch_script.sh executable)
+PASS dsrelk5-c160-1p1d-llh-ev-spx: no leftover temp dirs []
+PASS dsrelk5-c160-1p1d-llh-ev-spx: provenance record FRZ.txt verbatim
+PASS dsrelk5-c160-1p1d-llh-ev-spx: provenance record INTEG.txt verbatim
+PASS dsrelk5-c160-1p1d-llh-ev-spx: kmc.args = source with the render name changed
+PASS dsrelk5-c160-1p1d-llh-ev-spx: kmc.args names no frozen render
+PASS dsrelk5-c160-1p1d-llh-ev-spx: nq4.drop = source with the render name changed
+PASS dsrelk5-c160-1p1d-llh-ev-spx: nq4.drop names no frozen render
+PASS dsrelk5-c160-1p1d-llh-ev-spx: point.env = source with the render name changed
+PASS dsrelk5-c160-1p1d-llh-ev-spx: point.env names no frozen render
+PASS dsrelk5-c160-1p1d-llh-ev-spx: render/git_state.txt = source with the draft (and target weights) mount lines swapped
+PASS dsrelk5-c160-1p1d-llh-ev-spx: render/render.json = source with the render name changed
+PASS dsrelk5-c160-1p1d-llh-ev-spx: render/render.json names no frozen render
+PASS dsrelk5-c160-1p1d-llh-ev-spx: render/sbatch_script.sh = source with the render name changed
+PASS dsrelk5-c160-1p1d-llh-ev-spx: render/sbatch_script.sh names no frozen render
+PASS dsrelk5-c160-1p1d-llh-ev-spx: srtslurm.yaml = source with the render name changed
+PASS dsrelk5-c160-1p1d-llh-ev-spx: srtslurm.yaml names no frozen render
+PASS dsrelk5-c160-1p1d-llh-ev-spx: workflow.env.resolved = source with the render name changed
+PASS dsrelk5-c160-1p1d-llh-ev-spx: workflow.env.resolved names no frozen render
+PASS dsrelk5-c160-1p1d-llh-ev-spx: sbatch_script.sh stages its own render dir
+PASS dsrelk5-c160-1p1d-llh-ev-spx: job name
+PASS dsrelk5-c160-1p1d-llh-ev-spx: render.json name/script
+PASS dsrelk5-c160-1p1d-llh-ev-spx: render/config.yaml parsed diff = 5 keys, all draft keys ()
+PASS dsrelk5-c160-1p1d-llh-ev-spx: render/config.yaml has no preview draft / TOKENSPEED_MLA
+PASS dsrelk5-c160-1p1d-llh-ev-spx: hybrid.yaml parsed diff = 5 keys, all draft keys ()
+PASS dsrelk5-c160-1p1d-llh-ev-spx: hybrid.yaml has no preview draft / TOKENSPEED_MLA
+PASS dsrelk5-c160-1p1d-llh-ev-spx: decode capture sizes = derive_capture_sizes(frozen, k3 -> k5) (123 sizes)
+PASS dsrelk5-c160-1p1d-llh-ev-spx: decode max-cudagraph-capture-size 640 -> 960 = max-num-seqs 160 x q6
+PASS dsrelk5-c160-1p1d-llh-ev-spx: the frozen list re-derives to itself at k3
+PASS dsrelk5-c160-1p1d-llh-ev-spx: k5 FULL graphs hold the frozen list's 79 verify / 56 drafter batches, largest 160 / 160
+PASS dsrelk5-c160-1p1d-llh-ev-spx: hybrid.yaml decode capture keys = config.yaml's
+PASS dsrelk5-c160-1p1d-llh-ev-spx: max-num-batched-tokens {'prefill': (32, 16384), 'decode': (160, 8192)} hold the k5 draft pass and verify rows 
+PASS dsrelk5-c160-1p1d-llh-ev-spx: prefill and decode speculative-config identical
+PASS dsrelk5-c160-1p1d-llh-ev-spx: speculative-config == {"method": "dspark", "model": "/raid/common-models/kimi-k3.1-pro-dspark", "num_speculative_tokens": 5, "attention_backend": "FLASH_ATTN", "draft_sample_method": "probabilistic", "rejection_sample_method": "block"}
+PASS dsrelk5-c160-1p1d-llh-ev-spx: golden-acceptance.json {'golden_acceptance_length': None}
+PASS dsrelk5-c160-1p1d-llh-ev-spx: DSREL.txt names its source
+PASS dsrelk5-c160-1p1d-llh-ev-spx: the vLLM tree on both role PYTHONPATHs = ['/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/hti/lowlat/trees/ll-integ-dea4ebd06f']
+PASS dsrelk5-c160-1p1d-llh-ev-spx: container alias -> /lustre/fsw/coreai_comparch_inferencex/weizha/k3vr/images/k31vr-kmc_kmr-sweep-freeze_p242fb49cd4-mr4b8c04e28d7_d3c468ef795-kmm7989055e66_fi0.7.3.dev20261031_mc0.3.14_base3f1bcfd82b_r1-aarch64.sqsh
+PASS dsrelk5-c160-1p1d-llh-ev-spx: /model <- /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/model-view/kimi-k3.1-k3type (want /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/model-view/kimi-k3.1-k3type)
+PASS dsrelk5-c160-1p1d-llh-ev-spx: draft /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626 -> /raid/common-models/kimi-k3.1-pro-dspark:ro
+PASS dsrelk5-c160-1p1d-llh-ev-spx: preview draft not mounted
+PASS dsrelk5-c160-1p1d-llh-ev-spx: k31vr mounted at its own path (tree, JIT dirs, AgentX runtime)
+PASS dsrelk5-c160-1p1d-llh-ev-spx: /raid/scratch mounted
+PASS dsrelk5-c160-1p1d-llh-ev-spx: /logs mounted
+PASS dsrelk5-c160-1p1d-llh-ev-spx: nothing mounted over /opt/k3
+PASS dsrelk5-c160-1p1d-llh-ev-spx: srtctl render (preflight: model path + container) rc=0 (/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/scratch/dsrelk5-c160-1p1d-llh-ev-spx/render.log)
+PASS dsrelk5-c160-1p1d-llh-ev-spx: srtctl render of the frozen source rc=0
+PASS dsrelk5-c160-1p1d-llh-ev-spx: srtctl-rendered sbatch_script.sh differs from the render's exactly as the frozen source's does (6 lines: ['# Config: /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/renders/dsrelk5-c160-1p1d-llh-ev-spx/hybrid.yaml', '# Config: /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/dsrelk5-c160-1p1d-llh-ev-spx/hybrid.yaml', 'cp "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/renders/dsrelk5-c160-1p1d-llh-ev-spx/render"/*.yaml "${OUTPUT_DIR}/"', 'cp "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/dsrelk5-c160-1p1d-llh-ev-spx/render"/*.yaml "${OUTPUT_DIR}/"'])
+PASS dsrelk5-c160-1p1d-llh-ev-spx: srtctl-rendered render.json differs from the render's exactly as the frozen source's does (2 lines: ['  "script": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/renders/dsrelk5-c160-1p1d-llh-ev-spx/render/sbatch_script.sh"', '  "script": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/dsrelk5-c160-1p1d-llh-ev-spx/render/sbatch_script.sh"'])
+PASS dsrelk5-c160-1p1d-llh-ev-spx: srtctl-rendered git_state.txt == the render's (paths, Generated stamps aside)
+PASS dsrelk5-c160-1p1d-llh-ev-spx: srtctl-rendered config.yaml == the render's (paths, Generated stamps aside)
+PASS dsrelk5-c160-1p1d-llh-spx / -ev: agentx-vs-gsm8k diff keys = the frozen pair's (22 keys)
+PASS dsrelk5-c160-1p1d-llh-spx / -ev: agentx-vs-gsm8k values = the frozen pair's (outside the speculative-configs)
+PASS dsrelk5-c160-1p1d-llh-spx / -ev decode: agentx -> gsm8k = synthetic -> block, AL dropped ({'rejection_sample_method': ('synthetic', 'block'), 'synthetic_acceptance_length': (3.81, None)})
+PASS dsrelk5-c160-1p1d-llh-spx / -ev prefill: agentx -> gsm8k = synthetic -> block, AL dropped ({'rejection_sample_method': ('synthetic', 'block'), 'synthetic_acceptance_length': (3.81, None)})
+
+== vLLM tree /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/hti/lowlat/trees/ll-integ-dea4ebd06f
+PASS tree has vllm/__init__.py
+PASS tree has vllm/_C_stable_libtorch.abi3.so
+PASS tree has vllm/vllm_flash_attn/_vllm_fa2_C.abi3.so
+PASS tree has vllm/third_party/trtllm_gvr/__init__.py
+PASS tree has vllm/models/kimi_k3/nvidia/ops/sp_all_gather.py
+PASS tree has vllm/model_executor/models/qwen3_dspark.py
+WARN MISSING release-draft code vllm/models/kimi_k3/nvidia/dspark_gqa.py
+WARN MISSING release-draft code vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/draft/gqa_*.py
+
+| render | nodes | k | rejection | AL | draft backend | tree | launch-ready |
+|---|---|---|---|---|---|---|---|
+| dsrelk5-c128-1p1d-xdr | 6 | 5 | synthetic | 3.81 | FLASH_ATTN | ll-integ-dea4ebd06f | NO (tree lacks release-draft code) |
+| dsrelk5-c128-1p1d-ev-xdr | 6 | 5 | block | - | FLASH_ATTN | ll-integ-dea4ebd06f | NO (tree lacks release-draft code) |
+| dsrelk5-c128-1p1d-spx | 6 | 5 | synthetic | 3.81 | FLASH_ATTN | ll-integ-dea4ebd06f | NO (tree lacks release-draft code) |
+| dsrelk5-c128-1p1d-ev-spx | 6 | 5 | block | - | FLASH_ATTN | ll-integ-dea4ebd06f | NO (tree lacks release-draft code) |
+| dsrelk5-c160-1p1d-llh-xdr | 6 | 5 | synthetic | 3.81 | FLASH_ATTN | ll-integ-dea4ebd06f | NO (tree lacks release-draft code) |
+| dsrelk5-c160-1p1d-llh-ev-xdr | 6 | 5 | block | - | FLASH_ATTN | ll-integ-dea4ebd06f | NO (tree lacks release-draft code) |
+| dsrelk5-c160-1p1d-llh-spx | 6 | 5 | synthetic | 3.81 | FLASH_ATTN | ll-integ-dea4ebd06f | NO (tree lacks release-draft code) |
+| dsrelk5-c160-1p1d-llh-ev-spx | 6 | 5 | block | - | FLASH_ATTN | ll-integ-dea4ebd06f | NO (tree lacks release-draft code) |
+
+CHECK_DSREL PASS: 0 failure(s), 2 warning(s), 8 renders

@@ -34,8 +34,22 @@ K3_SIZES = [
     264, 272, 276, 288, 300, 304, 312, 320, 324, 336, 348, 352, 360, 368, 372, 384,
     400, 416, 432, 448, 464, 480, 496, 512, 528, 544, 560, 576, 592, 608, 624, 640,
 ]  # fmt: skip
+# K3_SIZES at draft length 5 (results/chosen_configs_nov_15/release_draft: gen_dsrel.py
+# --k-override C128-1P1D=5,C160-1P1D-llh=5): its verify batches x 6, its drafter
+# batches x 5, cap 160 x 6.
+K5_SIZES = [
+    10, 12, 24, 25, 30, 35, 36, 40, 48, 50, 60, 65, 72, 75, 80, 84, 90, 96, 102, 105,
+    108, 110, 114, 115, 120, 125, 126, 130, 132, 135, 138, 140, 144, 145, 150, 155, 156,
+    160, 162, 168, 170, 174, 180, 186, 190, 192, 198, 200, 204, 210, 216, 220, 228, 230,
+    234, 240, 250, 252, 260, 264, 270, 276, 280, 288, 290, 300, 306, 310, 312, 320, 324,
+    336, 340, 342, 348, 360, 372, 378, 380, 384, 396, 400, 408, 414, 420, 432, 440, 450,
+    456, 460, 468, 480, 486, 500, 504, 520, 522, 528, 540, 552, 558, 560, 576, 580, 600,
+    620, 624, 640, 648, 672, 696, 720, 744, 768, 792, 800, 816, 840, 864, 888, 912, 936,
+    960,
+]  # fmt: skip
 # The decode roles of the chosen points (results/chosen_configs_nov_15/configs/<point>/
-# agentx/render/config.yaml): (TP, k, max_num_seqs, max capture size, capture sizes).
+# agentx/render/config.yaml): (TP, k, max_num_seqs, max capture size, capture sizes);
+# "-k5": the k5 renders of C128 / C160 (release_draft/k5/configs).
 POINTS = {
     "C1": (16, 7, 32, 256, [s for s in K7_SIZES if s <= 256]),
     "C16-1P2D": (16, 7, 64, 512, K7_SIZES),
@@ -44,6 +58,8 @@ POINTS = {
     "C64": (16, 7, 64, 512, K7_SIZES),
     "C128-1P1D": (16, 3, 160, 640, K3_SIZES),
     "C160-1P1D-llh": (16, 3, 160, 640, K3_SIZES),
+    "C128-1P1D-k5": (16, 5, 160, 960, K5_SIZES),
+    "C160-1P1D-llh-k5": (16, 5, 160, 960, K5_SIZES),
     "C512": (4, 3, 128, 512, [4 * b for b in range(1, 129)]),
 }
 
@@ -72,6 +88,9 @@ def test_chosen_points_drafter_batches():
     assert batches[0] == 1 and batches[-1] == 64 and 33 not in batches
     tp, k, batches = _batches("C128-1P1D")
     assert (k, batches[0], batches[-1]) == (3, 2, 160) and 1 not in batches
+    tp, k, batches = _batches("C128-1P1D-k5")
+    assert (k, batches[0], batches[-1], len(batches)) == (5, 2, 160, 90)
+    assert 1 not in batches
     tp, k, batches = _batches("C512")
     assert (tp, k, batches[0], batches[-1]) == (4, 3, 2, 128)
 

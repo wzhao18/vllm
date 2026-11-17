@@ -26,6 +26,19 @@ and changes ONLY:
   6. --tree (optional): the vLLM tree on the prefill and decode PYTHONPATH. The default keeps the frozen tree, so nothing
      changes. The release draft needs the integrated dsrel code (NIXL draft-KV transfer, the K3 GQA drafter fast path,
      the KV planner): regenerate with --tree <integrated tree> --replace before a launch (README.md).
+  7. --k-override POINT=K[,POINT=K] (optional; k-variant renders, prefix dsrelk<K> by default): the draft length K
+     instead of the frozen k, and only what K changes (k_variant):
+       - "num_speculative_tokens" K in the prefill AND decode speculative-config (one draft length: P drafts the first
+         block, D verifies K + 1 rows per request); AgentX: synthetic_acceptance_length = the release golden AL of K
+         (gsm8k twins keep real block rejection, no AL);
+       - the DECODE role's compilation-config cudagraph_capture_sizes and max-cudagraph-capture-size, re-derived for
+         q = K + 1 from the frozen list (derive_capture_sizes): the frozen list holds verify rows B*(k+1) of its verify
+         batches and drafter rows B*k of its drafter batches; each batch keeps its rows at the new length (B*(K+1),
+         B*K), the cap becomes max-num-seqs*(K+1). Re-deriving at K = k returns the frozen list unchanged (checked);
+       - nothing else: the prefill role's capture list does not depend on k (the frozen k7 and k3 points share it; P
+         never captures a verify step), and max-num-batched-tokens already holds max-num-seqs x (K+1) verify rows on D
+         and the draft pass's max-num-seqs x K query rows on both roles (k_requirements, vllm/config/vllm.py);
+       - only points whose decode is TP16 = DCP16 (C512's sequence-parallel decode accepts k3 only: sp_unsupported).
 Everything else stays byte-identical: topology, k, CONC, capture sizes, Mooncake, precision, env, JIT/cache dirs and the
 AgentX client runtime dir. The script checks this itself: it parses both YAMLs and diffs the flattened trees, and it
 re-checks the JSON of both speculative-configs. check_dsrel.py adds the srtctl render/preflight checks on Hecate.
@@ -39,7 +52,10 @@ Modes:
   Mirror: python3 gen_dsrel.py --mirror <chosen_configs_nov_15 dir>
       reads configs/<point>/{agentx,gsm8k} (the frozen renders of the chosen fabric, byte copies of Hecate's) and writes
       release_draft/configs/<point>/{agentx,gsm8k}. These are byte copies of what Hecate mode writes for that fabric with
-      the same --stamp, so the repo diff vs ../configs is the exact render change.
+      the same --stamp, so the repo diff vs ../configs is the exact render change. With --k-override the output goes to
+      release_draft/k<K>/configs (--mirror-out DIR elsewhere).
+  --renders DIR (testing): read frz-* from and write the renders to DIR instead of RS (e.g. a copy of the frozen renders
+      of both fabrics); the runtime files still name RS (they only run from there).
 Python 3.9+, standard library only; PyYAML (when importable) adds the parsed-tree self-check.
 """
 
@@ -99,6 +115,14 @@ PROVENANCE_SUFFIXES = (".txt", ".log")  # provenance records: kept verbatim (nev
 SPEC_RE = re.compile(r"^( +)speculative-config: '(\{[^']*\})'$", re.M)
 PYPATH_RE = re.compile(r"^( +PYTHONPATH: )(.*)$", re.M)
 SPEC_CHANGED = ("model", "attention_backend", "synthetic_acceptance_length")
+# --k-override (change 7): a role's args (roles.<role>.args.<name>, six spaces in srtctl's layout) and the decode keys a
+# k-variant render re-derives
+ARG_RE = {
+    name: re.compile(rf"^(      {re.escape(name)}: )(.*)$", re.M)
+    for name in ("max-cudagraph-capture-size", "compilation-config", "max-num-seqs", "max-num-batched-tokens",
+                 "tensor-parallel-size", "decode-context-parallel-size")
+}
+K_CAPTURE_KEYS = (".roles.decode.args.compilation-config", ".roles.decode.args.max-cudagraph-capture-size")
 
 
 class GenError(RuntimeError):
@@ -134,10 +158,121 @@ def rates(al: float, k: int) -> list[float]:
     return ([1.0] * full + [round(n - full, 6)] + [0.0] * (k - full - 1))[:k]
 
 
-def edit_spec(js: str, kind: str, backend: str, record: bool = False) -> tuple[str, dict]:
+def role_span(text: str, role: str) -> tuple[int, int]:
+    """Character span of the body of roles.<role> in a render YAML (srtctl's layout: 'roles:' at column 0, each role at
+    two spaces, its keys deeper; the body ends at the next non-blank line indented by at most two spaces)."""
+    top = re.search(r"^roles:\n", text, re.M)
+    need(top is not None, "no top-level 'roles:'")
+    heads = list(re.finditer(rf"^  {re.escape(role)}:\n", text[top.end():], re.M))
+    need(len(heads) == 1, f"roles.{role} found {len(heads)}x")
+    start = end = top.end() + heads[0].end()
+    for line in text[start:].splitlines(keepends=True):
+        if line.strip() and not line.startswith("   "):
+            break
+        end += len(line)
+    return start, end
+
+
+def role_arg(body: str, name: str) -> str:
+    found = ARG_RE[name].findall(body)
+    need(len(found) == 1, f"args {name} found {len(found)}x in the role")
+    return found[0][1]
+
+
+def derive_capture_sizes(sizes: list[int], k: int, k_new: int, mns: int) -> tuple[list[int], list[int], list[int]]:
+    """(capture list for draft length k_new, verify batches, drafter batches) from a decode capture list for draft length
+    k (change 7). Each frozen size is a verify row B*(k+1) of a verify batch, a drafter row B*k of a drafter batch (B <=
+    max-num-seqs: runtime/draft.draft_batches captures no larger drafter batch), or both (multiples of k(k+1)); every
+    batch keeps its rows at the new length: B*(k_new+1) for the verify batches, B*k_new for the drafter batches. A size
+    that is neither is an error. At k_new = k the frozen list comes back unchanged (k_variant checks it)."""
+    q = k + 1
+    verify = sorted({s // q for s in sizes if s % q == 0})
+    draft = sorted({s // k for s in sizes if s % k == 0 and s // k <= mns})
+    stray = sorted(s for s in sizes if s % q and not (s % k == 0 and s // k <= mns))
+    need(not stray, f"capture sizes {stray} are neither verify rows B*{q} nor drafter rows B*{k} (B <= {mns})")
+    return sorted({b * (k_new + 1) for b in verify} | {b * k_new for b in draft}), verify, draft
+
+
+def captured_graphs(sizes: list[int], k: int, mns: int, cap: int) -> tuple[list[int], list[int]]:
+    """(verify batches, drafter batches) of the FULL graphs a decode capture list gives at draft length k: Model Runner
+    V2 rounds a size up to whole (k+1)-row verify requests and drops it above max-num-seqs x (k+1) or the cap
+    (cudagraph_utils), the drafter up to whole k-row draft blocks, dropped above the cap or max-num-seqs
+    (runtime/draft.draft_batches)."""
+    q = k + 1
+    verify = {-(-s // q) for s in sizes if -(-s // q) * q <= min(cap, mns * q)}
+    draft = {-(-s // k) for s in sizes if -(-s // k) * k <= cap and -(-s // k) <= mns}
+    return sorted(verify), sorted(draft)
+
+
+def k_limits(roles: dict[str, tuple[int, int]], k_new: int) -> None:
+    """Why nothing but the speculative-configs and the decode capture keys changes with k (change 7). roles: {role:
+    (max-num-seqs, max-num-batched-tokens)}. Both roles' max-num-batched-tokens hold the DSpark draft pass of
+    max-num-seqs requests x k_new query rows (else vllm/config/vllm.py lowers max_num_active_seqs), the decode's also
+    max-num-seqs x (k_new + 1) verify rows (the widest uniform verify batch)."""
+    for role, (mns, mnbt) in roles.items():
+        need(mnbt > k_new and mnbt // k_new >= mns, f"{role}: max-num-batched-tokens {mnbt} holds the draft pass of "
+             f"{mnbt // k_new} requests at K={k_new}, below max-num-seqs {mns}")
+        if role == "decode":
+            need(mnbt >= mns * (k_new + 1), f"decode max-num-batched-tokens {mnbt} < max-num-seqs {mns} x q{k_new + 1}")
+
+
+def k_requirements(text: str, k_new: int) -> dict[str, tuple[int, int]]:
+    """k_limits on a render YAML's prefill and decode args; returns their {role: (max-num-seqs,
+    max-num-batched-tokens)}."""
+    roles = {}
+    for role in ("prefill", "decode"):
+        start, end = role_span(text, role)
+        body = text[start:end]
+        roles[role] = (int(role_arg(body, "max-num-seqs")), int(role_arg(body, "max-num-batched-tokens")))
+    k_limits(roles, k_new)
+    return roles
+
+
+def k_variant(text: str, k: int, k_new: int) -> tuple[str, dict]:
+    """Change 7 on one render YAML: the decode role's cudagraph_capture_sizes and max-cudagraph-capture-size re-derived
+    for q = k_new + 1 (derive_capture_sizes), after the checks that nothing else changes with k (k_requirements).
+    The compilation-config JSON keeps its other keys, their order and its separators."""
+    start, end = role_span(text, "decode")
+    body = text[start:end]
+    tp, dcp = (int(role_arg(body, a)) for a in ("tensor-parallel-size", "decode-context-parallel-size"))
+    need((tp, dcp) == (16, 16), f"decode TP{tp} / DCP{dcp}: k overrides are for TP16 = DCP16 decode roles only (C512's "
+         "sequence-parallel decode accepts k3 only: sp_unsupported)")
+    need(k_new in RELEASE_AL, f"K={k_new} has no release golden AL (k1..k7)")
+    mns, cap = int(role_arg(body, "max-num-seqs")), int(role_arg(body, "max-cudagraph-capture-size"))
+    raw = role_arg(body, "compilation-config")
+    need(len(raw) > 2 and raw[0] == raw[-1] == "'", "decode compilation-config is not a single-quoted JSON string")
+    comp = json.loads(raw[1:-1])
+    fmt = next((s for s in ((",", ":"), (", ", ": ")) if json.dumps(comp, separators=s) == raw[1:-1]), None)
+    need(fmt is not None, "decode compilation-config is not in a layout json.dumps reproduces")
+    sizes = comp.get("cudagraph_capture_sizes")
+    need(isinstance(sizes, list) and sizes and sizes == sorted(set(sizes)), "decode capture sizes: not a sorted list")
+    need(cap == mns * (k + 1) == sizes[-1], f"frozen decode cap {cap}: not max-num-seqs {mns} x q{k + 1} = the largest "
+         f"capture size {sizes[-1]}")
+    need(derive_capture_sizes(sizes, k, k, mns)[0] == sizes, "the frozen list does not re-derive to itself at its k")
+    new, verify, draft = derive_capture_sizes(sizes, k, k_new, mns)
+    new_cap = mns * (k_new + 1)
+    need(new[-1] == new_cap, f"largest new capture size {new[-1]} != max-num-seqs {mns} x q{k_new + 1}")
+    v_old, d_old = captured_graphs(sizes, k, mns, cap)
+    v_new, d_new = captured_graphs(new, k_new, mns, new_cap)
+    need(set(verify) <= set(v_new) and set(draft) <= set(d_new),
+         f"k{k_new} graphs miss verify batches {sorted(set(verify) - set(v_new))} / drafter batches "
+         f"{sorted(set(draft) - set(d_new))}")
+    need((v_new[-1], d_new[-1]) == (v_old[-1], d_old[-1]), f"largest verify / drafter batch (the capacity anchors) "
+         f"{v_old[-1]} / {d_old[-1]} -> {v_new[-1]} / {d_new[-1]}")
+    roles = k_requirements(text, k_new)
+    new_raw = "'" + json.dumps({**comp, "cudagraph_capture_sizes": new}, separators=fmt) + "'"
+    body = ARG_RE["max-cudagraph-capture-size"].sub(lambda m: m.group(1) + str(new_cap), body)
+    body = ARG_RE["compilation-config"].sub(lambda m: m.group(1) + new_raw, body)
+    return text[:start] + body + text[end:], dict(
+        k=k, k_new=k_new, mns=mns, cap=cap, new_cap=new_cap, sizes=sizes, new=new, verify=verify, draft=draft,
+        v_old=v_old, d_old=d_old, v_new=v_new, d_new=d_new, roles=roles)
+
+
+def edit_spec(js: str, kind: str, backend: str, record: bool = False, k_new: int | None = None) -> tuple[str, dict]:
     """record=False: render/config.yaml (what runs), strict per kind. record=True: hybrid.yaml, srtctl's recipe record,
     which in most frozen renders predates later edits of render/config.yaml (gsm8k twins keep the AgentX recipe there,
-    some with the old K3 AL): same draft edits, and any synthetic AL becomes the release AL of its k."""
+    some with the old K3 AL): same draft edits, and any synthetic AL becomes the release AL of its k. k_new: the
+    --k-override draft length (change 7; the AL follows it)."""
     d = json.loads(js)
     k = d.get("num_speculative_tokens")
     need(d.get("method") == "dspark", f"speculative-config method {d.get('method')!r} != dspark")
@@ -162,29 +297,34 @@ def edit_spec(js: str, kind: str, backend: str, record: bool = False) -> tuple[s
         del d["attention_backend"]
     else:
         d["attention_backend"] = backend  # same key position
+    k_out = k if k_new is None else k_new
+    need(k_out in RELEASE_AL, f"K={k_out} has no release golden AL")
+    d["num_speculative_tokens"] = k_out  # same key position
     if rej == "synthetic":
-        d["synthetic_acceptance_length"] = RELEASE_AL[k]
+        d["synthetic_acceptance_length"] = RELEASE_AL[k_out]
     sep = (",", ":") if '":"' in js or '","' in js else (", ", ": ")
     new = json.dumps(d, separators=sep)
     need("'" not in new, "single quote in speculative-config JSON")
-    return new, dict(k=k, old_al=old_al, al=d.get("synthetic_acceptance_length"), spec=d,
+    return new, dict(k=k_out, k_src=k, old_al=old_al, al=d.get("synthetic_acceptance_length"), spec=d,
                      rejection=d["rejection_sample_method"])
 
 
 def edit_yaml(text: str, kind: str, backend: str, tree: str, record: bool = False,
-              weights: tuple[str, str] | None = None) -> tuple[str, dict]:
+              weights: tuple[str, str] | None = None, k_new: int | None = None) -> tuple[str, dict]:
     specs = SPEC_RE.findall(text)
     need(len(specs) == 2, f"{len(specs)} speculative-config lines (want prefill + decode)")
     need(specs[0][1] == specs[1][1], "prefill and decode speculative-configs differ in the source")
     info = {}
 
     def fix(m: re.Match) -> str:
-        new, inf = edit_spec(m.group(2), kind, backend, record)
+        new, inf = edit_spec(m.group(2), kind, backend, record, k_new)
         info.update(inf)
         return f"{m.group(1)}speculative-config: '{new}'"
 
     text, n = SPEC_RE.subn(fix, text)
     need(n == 2, f"edited {n} speculative-configs")
+    if k_new is not None:  # change 7: the decode capture keys for q = K + 1
+        text, info["capture"] = k_variant(text, info["k_src"], k_new)
     old_mount = f"- {PREVIEW_HOST}:{PREVIEW_MNT}:ro"
     need(text.count(old_mount + "\n") == 1, f"draft extra_mount line found {text.count(old_mount)}x")
     text = text.replace(old_mount + "\n", f"- {RELEASE_HOST}:{RELEASE_MNT}:ro\n")
@@ -229,11 +369,15 @@ def yaml_diff(src_text: str, dst_text: str, base: str, prefix: str) -> list[tupl
             if a.get(k, "<absent>") != b.get(k, "<absent>")]
 
 
-def check_diff(diffs, tree: str, weights: tuple[str, str] | None = None) -> list[str]:
-    """The parsed diff may contain only the draft keys (and the role PYTHONPATHs when the tree moves)."""
+def check_diff(diffs, tree: str, weights: tuple[str, str] | None = None, k_change: bool = False) -> list[str]:
+    """The parsed diff may contain only the draft keys (and the role PYTHONPATHs when the tree moves; with k_change, a
+    k-variant render's num_speculative_tokens and the decode capture keys, change 7)."""
     ok_keys = {".roles.prefill.args.speculative-config", ".roles.decode.args.speculative-config"}
     if tree != FROZEN_TREE:
         ok_keys |= {".roles.prefill.env.PYTHONPATH", ".roles.decode.env.PYTHONPATH"}
+    if k_change:
+        ok_keys |= set(K_CAPTURE_KEYS)
+    spec_ok = set(SPEC_CHANGED) | ({"num_speculative_tokens"} if k_change else set())
     seen, bad = set(), []
     for k, a, b in diffs:
         if k in ok_keys:
@@ -241,8 +385,13 @@ def check_diff(diffs, tree: str, weights: tuple[str, str] | None = None) -> list
             if k.endswith("speculative-config"):
                 ja, jb = json.loads(a), json.loads(b)
                 moved = {x for x in set(ja) | set(jb) if ja.get(x) != jb.get(x)}
-                if not moved <= set(SPEC_CHANGED):
+                if not moved <= spec_ok:
                     bad.append(f"{k}: JSON keys {sorted(moved)} changed")
+            elif k.endswith("compilation-config"):
+                ja, jb = json.loads(a), json.loads(b)
+                moved = {x for x in set(ja) | set(jb) if ja.get(x) != jb.get(x)}
+                if moved != {"cudagraph_capture_sizes"}:
+                    bad.append(f"{k}: JSON keys {sorted(moved)} changed (want cudagraph_capture_sizes only)")
         elif re.fullmatch(r"\.extra_mount\[\d+\]", k) and (a, b) == (
                 f"{PREVIEW_HOST}:{PREVIEW_MNT}:ro", f"{RELEASE_HOST}:{RELEASE_MNT}:ro"):
             seen.add(".extra_mount")
@@ -269,7 +418,8 @@ def in_progress_runs(name: str) -> list[str]:
 
 
 def derive(src: str, dst: str, *, base: str, prefix: str, kind: str, fab: str, backend: str, tree: str,
-           stamp: str, gen_md5: str, replace: bool, hecate: bool, weights: tuple[str, str] | None = None) -> dict:
+           stamp: str, gen_md5: str, replace: bool, hecate: bool, weights: tuple[str, str] | None = None,
+           k_new: int | None = None) -> dict:
     need(os.path.isdir(src), f"missing source render {src}")
     sname, dname = frz_name(base, kind, fab), dst_name(prefix, base, kind, fab)
     if os.path.exists(dst):
@@ -282,7 +432,8 @@ def derive(src: str, dst: str, *, base: str, prefix: str, kind: str, fab: str, b
     shutil.copytree(src, tmp, symlinks=True)
     try:
         info = _derive_in_place(tmp, src, base=base, prefix=prefix, kind=kind, sname=sname, dname=dname,
-                                backend=backend, tree=tree, stamp=stamp, gen_md5=gen_md5, weights=weights)
+                                backend=backend, tree=tree, stamp=stamp, gen_md5=gen_md5, weights=weights,
+                                k_new=k_new)
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
@@ -297,7 +448,7 @@ def derive(src: str, dst: str, *, base: str, prefix: str, kind: str, fab: str, b
 
 
 def _derive_in_place(d: str, src: str, *, base, prefix, kind, sname, dname, backend, tree, stamp, gen_md5,
-                     weights=None) -> dict:
+                     weights=None, k_new=None) -> dict:
     files = sorted(os.path.relpath(os.path.join(r, f), d) for r, _, fs in os.walk(d) for f in fs)
     need(not any(os.path.islink(os.path.join(d, f)) for f in files), "symlink in the source render")
     for f in ("hybrid.yaml", "render/config.yaml", "render/sbatch_script.sh", "render/render.json",
@@ -325,11 +476,16 @@ def _derive_in_place(d: str, src: str, *, base, prefix, kind, sname, dname, back
          "render.json script is not this render's")
     # configs: render/config.yaml is what runs (sbatch_script.sh stages render/*.yaml; run_in_alloc.sh copies it);
     # hybrid.yaml is srtctl's recipe record, which in most frozen renders predates later render/config.yaml edits
-    new, info = edit_yaml(open(f"{d}/render/config.yaml").read(), kind, backend, tree, weights=weights)
+    new, info = edit_yaml(open(f"{d}/render/config.yaml").read(), kind, backend, tree, weights=weights, k_new=k_new)
     with open(f"{d}/render/config.yaml", "w") as fh:
         fh.write(new)
-    new_hy, info_hy = edit_yaml(open(f"{d}/hybrid.yaml").read(), kind, backend, tree, record=True, weights=weights)
+    new_hy, info_hy = edit_yaml(open(f"{d}/hybrid.yaml").read(), kind, backend, tree, record=True, weights=weights,
+                                k_new=k_new)
     need(info_hy["k"] == info["k"], f"hybrid.yaml k={info_hy['k']} != render/config.yaml k={info['k']}")
+    if k_new is not None:
+        cap, cap_hy = info["capture"], info_hy["capture"]
+        need((cap_hy["new"], cap_hy["new_cap"]) == (cap["new"], cap["new_cap"]),
+             "hybrid.yaml re-derives another decode capture list than render/config.yaml")
     with open(f"{d}/hybrid.yaml", "w") as fh:
         fh.write(new_hy)
     # git state snapshot: srtctl lists every extra mount as "  - extra_mount:<target>:ro: <host>"
@@ -353,23 +509,44 @@ def _derive_in_place(d: str, src: str, *, base, prefix, kind, sname, dname, back
         with open(sp, "w") as fh:
             fh.write(t.replace(TEST_VIEW, weights[1]))
     # AL records
-    k, al = info["k"], info["al"]
+    k, k_src, al = info["k"], info["k_src"], info["al"]
     ga = json.load(open(f"{d}/golden-acceptance.json"))
     if kind == "agentx":
-        need(ga == {"golden_acceptance_length": PREVIEW_AL[k]}, f"source golden-acceptance.json {ga}")
+        need(ga == {"golden_acceptance_length": PREVIEW_AL[k_src]}, f"source golden-acceptance.json {ga}")
         with open(f"{d}/golden-acceptance.json", "w") as fh:
             fh.write(f'{{"golden_acceptance_length": {al}}}\n')
         with open(f"{d}/AL_FIX.txt", "w") as fh:
             fh.write(f"{stamp} AL -> {al} (k={k}, InferenceX K3.1 RELEASE golden table: {RELEASE_AL_SRC}; "
-                     f"was {info['old_al']} = preview table)\n")
+                     f"was {info['old_al']} = preview table"
+                     + (f" at k={k_src}; k {k_src} -> {k} by --k-override" if k != k_src else "") + ")\n")
     else:
         need(ga == {"golden_acceptance_length": None}, f"gsm8k source golden-acceptance.json {ga}")
     # parsed self-check of both YAMLs against their own sources
     diffs = yaml_diff(open(f"{src}/render/config.yaml").read(), new, base, prefix)
     diffs_hy = yaml_diff(open(f"{src}/hybrid.yaml").read(), new_hy, base, prefix)
     for f, dd in (("render/config.yaml", diffs), ("hybrid.yaml", diffs_hy)):
-        bad = check_diff(dd, tree, weights) if dd is not None else []
+        bad = check_diff(dd, tree, weights, k != k_src) if dd is not None else []
         need(not bad, f"{f}: unexpected parsed differences: " + "; ".join(bad))
+    k_line = ""
+    if k_new is not None:
+        c = info["capture"]
+        by_v, by_d = sorted(set(c["v_new"]) - set(c["verify"])), sorted(set(c["d_new"]) - set(c["draft"]))
+        lost_v = sorted(set(c["v_old"]) - set(c["v_new"]))
+        lost_d = sorted(set(c["d_old"]) - set(c["d_new"]))
+        k_line = (
+            f"  k override (--k-override, change 7): num_speculative_tokens {k_src} -> {k} on prefill + decode"
+            + (f", synthetic AL -> {al} (release golden of k{k})" if kind == "agentx" else ", real (block) rejection")
+            + f"; decode max-cudagraph-capture-size {c['cap']} -> {c['new_cap']} (max-num-seqs {c['mns']} x q{k + 1}), "
+            f"cudagraph_capture_sizes {len(c['sizes'])} -> {len(c['new'])} sizes: the frozen list's verify batches "
+            f"({len(c['verify'])}) x {k + 1} and drafter batches ({len(c['draft'])}) x {k}\n"
+            f"    FULL graphs at k{k}: {len(c['v_new'])} verify batches (k{k_src}: {len(c['v_old'])}), "
+            f"{len(c['d_new'])} drafter batches (k{k_src}: {len(c['d_old'])}); largest {c['v_new'][-1]} / "
+            f"{c['d_new'][-1]} (unchanged); by-products of the other rounding {by_v} / {by_d}; the frozen list's own "
+            f"by-products not re-made {lost_v} / {lost_d} (they pad to the next graph)\n"
+            f"    unchanged with k: prefill / decode max-num-seqs and max-num-batched-tokens "
+            + ", ".join(f"{r} {v[0]} / {v[1]}" for r, v in c["roles"].items())
+            + f" (both hold the draft pass's max-num-seqs x {k} rows, decode its {c['mns']} x {k + 1} verify rows); "
+            "the prefill capture list (k-independent)\n")
     rt = re.findall(r"^AIPERF_RUNTIME_DIR=(.*)$", open(f"{d}/workflow.env.resolved").read(), re.M)
     bare = sorted({f for f in files if not f.endswith(PROVENANCE_SUFFIXES)
                    and f"frz-{base}" in open(os.path.join(d, f)).read()})
@@ -385,7 +562,8 @@ def _derive_in_place(d: str, src: str, *, base, prefix, kind, sname, dname, back
             + (f"; synthetic_acceptance_length {info['old_al']} -> {al} (k={k}, release golden, rates "
                f"{rates(al, k)})" if kind == "agentx" else "; real (block) rejection, no synthetic AL") + "\n"
             f"  now: {spec_line}\n"
-            f"  hybrid.yaml (srtctl's recipe record; render/config.yaml is what runs): the same draft edits; its "
+            + k_line
+            + f"  hybrid.yaml (srtctl's recipe record; render/config.yaml is what runs): the same draft edits; its "
             f"speculative-config is {info_hy['rejection']}"
             + (f", AL {info_hy['old_al']} -> {info_hy['al']}" if info_hy["rejection"] == "synthetic" else "") + "\n"
             + (f"  target weights: {weights[0]} (model view {weights[1]} at /model); was {TEST_WEIGHTS} "
@@ -429,14 +607,34 @@ def main(argv=None) -> int:
                     help="serve another target checkpoint: its dir (mounted read-only at its path) and its Dynamo "
                          "model view (srtslurm.yaml model aliases + /model mount); default: the frozen sweep's test "
                          "weights")
+    ap.add_argument("--k-override", default=None, metavar="POINT=K[,POINT=K]",
+                    help="k-variant renders (change 7) of these points; --points defaults to them and the prefix to "
+                         "dsrelk<K>")
+    ap.add_argument("--mirror-out", default=None,
+                    help="mirror mode: output dir (default release_draft/configs, release_draft/k<K>/configs with "
+                         "--k-override)")
+    ap.add_argument("--renders", default=RS, help="testing: the dir holding the frz-* sources and the outputs")
     a = ap.parse_args(argv)
     stamp = a.stamp or datetime.datetime.now().astimezone().isoformat(timespec="seconds")
     gen_md5 = hashlib.md5(open(os.path.abspath(__file__), "rb").read()).hexdigest()
     pts = {p: (b, f) for p, b, f in POINTS}
+    overrides = parse_k_override(a.k_override, pts)
+    if overrides and a.points == ap.get_default("points"):
+        a.points = ",".join(overrides)
+    if overrides and a.prefix == ap.get_default("prefix"):
+        need(len(set(overrides.values())) == 1, "--k-override with several K: name the renders with --prefix")
+        a.prefix = f"dsrelk{next(iter(overrides.values()))}"
     labels = [x for x in a.points.split(",") if x]
     for x in labels:
         need(x in pts, f"unknown point {x} (known: {', '.join(pts)})")
+        need(not overrides or x in overrides, f"point {x} has no k override: a k-variant render set holds only the "
+             "overridden points")
     need(re.fullmatch(r"[a-z][a-z0-9]*", a.prefix) is not None and a.prefix != "frz", f"bad prefix {a.prefix!r}")
+    need(not overrides or a.prefix != "dsrel", "k-variant renders need their own prefix (dsrel is the frozen-k set)")
+    ks = sorted(set(overrides.values()))
+    mirror_out = a.mirror_out or (f"release_draft/k{ks[0]}/configs" if overrides else "release_draft/configs")
+    need(not (a.mirror and len(ks) > 1 and a.mirror_out is None), "--k-override with several K: give --mirror-out")
+    renders = os.path.normpath(a.renders)
     tree = os.path.normpath(a.tree)
     weights = None
     if a.target_weights:
@@ -462,26 +660,40 @@ def main(argv=None) -> int:
             need(kind in KINDS, f"bad kind {kind}")
             if a.mirror:
                 src = f"{a.mirror}/configs/{label}/{kind}"
-                dst = f"{a.mirror}/release_draft/configs/{label}/{kind}"
-                jobs.append((src, dst, base, kind, chosen))
+                dst = f"{a.mirror}/{mirror_out}/{label}/{kind}"
+                jobs.append((src, dst, base, kind, chosen, overrides.get(label)))
             else:
                 for fab in [x for x in a.fabrics.split(",") if x]:
                     need(fab in FABRICS, f"bad fabric {fab}")
-                    jobs.append((f"{RS}/{frz_name(base, kind, fab)}", f"{RS}/{dst_name(a.prefix, base, kind, fab)}",
-                                 base, kind, fab))
+                    jobs.append((f"{renders}/{frz_name(base, kind, fab)}",
+                                 f"{renders}/{dst_name(a.prefix, base, kind, fab)}", base, kind, fab,
+                                 overrides.get(label)))
     rc = 0
-    for src, dst, base, kind, fab in jobs:
+    for src, dst, base, kind, fab, k_new in jobs:
         try:
             if a.mirror:
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
             info = derive(src, dst, base=base, prefix=a.prefix, kind=kind, fab=fab, backend=a.draft_attn_backend,
                           tree=tree, stamp=stamp, gen_md5=gen_md5, replace=a.replace, hecate=a.mirror is None,
-                          weights=weights)
+                          weights=weights, k_new=k_new)
             print("made " + summary(info))
         except GenError as e:
             print(f"FAIL {dst}: {e}")
             rc = 1
     return rc
+
+
+def parse_k_override(spec: str | None, points: dict) -> dict[str, int]:
+    """--k-override POINT=K[,POINT=K] -> {label: K} (change 7)."""
+    out: dict[str, int] = {}
+    for item in filter(None, (spec or "").split(",")):
+        label, sep, k = item.partition("=")
+        need(sep == "=" and k.isdigit(), f"--k-override item {item!r} is not POINT=K")
+        need(label in points, f"--k-override: unknown point {label} (known: {', '.join(points)})")
+        need(label not in out, f"--k-override names {label} twice")
+        need(int(k) in RELEASE_AL, f"--k-override {item}: K must be one of {sorted(RELEASE_AL)} (release golden AL)")
+        out[label] = int(k)
+    return out
 
 
 if __name__ == "__main__":
