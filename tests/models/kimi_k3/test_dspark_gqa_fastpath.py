@@ -293,3 +293,45 @@ def test_deployment_config_without_target():
         speculative_config=SimpleNamespace(target_parallel_config=None),
     )
     assert draft.deployment_config(config) is config
+
+
+@pytest.mark.parametrize("loaded", [False, True])
+def test_context_kv_buffers_built_before_fast_path(monkeypatch, loaded):
+    """``process_weights_after_loading`` builds the context step's fused K/V buffers
+    (``_build_fused_kv_buffers``, as the stock lazy build does: under
+    ``weights_already_processed``) before ``GqaDraftFastPath.build`` wraps the qkv
+    projections, when the load skipped them (dummy weights: no ``load_weights``);
+    a real load (buffers built in ``load_weights``) is left as it is."""
+    from contextlib import nullcontext
+
+    from vllm.model_executor.utils import is_weights_pre_processed
+    from vllm.models.kimi_k3.nvidia import cute_cache, dspark_gqa, mxfp8
+
+    calls = []
+
+    class Inner:
+        def _build_fused_kv_buffers(self):
+            calls.append(("buffers", is_weights_pre_processed()))
+            self._num_attn_layers = 5
+            self._fused_kv_weight = object()
+
+    inner = Inner()
+    if loaded:
+        inner._num_attn_layers = 5
+        inner._fused_kv_weight = "loaded"
+
+    def build(vllm_config, model):
+        calls.append(("build", getattr(model.model, "_fused_kv_weight", None)))
+        return "fast"
+
+    monkeypatch.setattr(mxfp8, "enable_kimi_k3_mxfp8_dispatch", lambda model: 0)
+    monkeypatch.setattr(cute_cache, "shared_phase", lambda name: nullcontext())
+    monkeypatch.setattr(draft.GqaDraftFastPath, "build", staticmethod(build))
+    model = SimpleNamespace(model=inner, _vllm_config=None, _fast_path=None)
+    dspark_gqa.K3GqaDSparkForCausalLM.process_weights_after_loading(model)
+    assert model._fast_path == "fast"
+    if loaded:
+        assert calls == [("build", "loaded")]
+    else:
+        assert calls[0] == ("buffers", True)
+        assert calls[1][0] == "build" and calls[1][1] is not None
