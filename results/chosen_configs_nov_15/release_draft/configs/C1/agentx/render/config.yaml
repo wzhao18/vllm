@@ -112,7 +112,7 @@ roles:
     env:
       HF_HUB_OFFLINE: '1'
       VLLM_ITERLOG_DIR: ''
-      PYTHONPATH: /opt/k3/mooncake-0.3.14:/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/hti/lowlat/trees/ll-integ-dea4ebd06f:/opt/k3/fi-0.7.3.dev20261031:/opt/k3/pydeps:/opt/k3/dynamo
+      PYTHONPATH: /opt/k3/mooncake-0.3.14:/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/trees/rel-9b6b764:/opt/k3/fi-0.7.3.dev20261031:/opt/k3/pydeps:/opt/k3/dynamo
     args:
       prefix-cache-policy: v2
       enable-mamba-shared-prefix-checkpoint: true
@@ -158,7 +158,7 @@ roles:
       - 1
       distributed-timeout-seconds: 1800
       cpu-distributed-timeout-seconds: 1800
-      speculative-config: '{"method": "dspark", "model": "/raid/common-models/kimi-k3.1-pro-dspark", "num_speculative_tokens": 7, "attention_backend": "FLASHINFER", "draft_sample_method": "probabilistic", "rejection_sample_method": "synthetic", "synthetic_acceptance_length": 4.16}'
+      speculative-config: '{"method": "dspark", "model": "/raid/common-models/kimi-k3.1-pro-dspark", "num_speculative_tokens": 7, "attention_backend": "FLASH_ATTN", "draft_sample_method": "probabilistic", "rejection_sample_method": "synthetic", "synthetic_acceptance_length": 4.16}'
       attention-config: '{"indexer_kv_dtype":"mxfp4"}'
     kv_events: true
   decode:
@@ -166,7 +166,7 @@ roles:
     workers: 1
     gpus: 16
     env:
-      PYTHONPATH: /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/hti/lowlat/trees/ll-integ-dea4ebd06f:/opt/k3/fi-0.7.3.dev20261031:/opt/k3/pydeps:/opt/k3/dynamo:/opt/k3/pinhook
+      PYTHONPATH: /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/trees/rel-9b6b764:/opt/k3/fi-0.7.3.dev20261031:/opt/k3/pydeps:/opt/k3/dynamo:/opt/k3/pinhook
       HF_HUB_OFFLINE: '1'
       VLLM_ITERLOG_DIR: ''
       K3_PIN_CPUS: '1'
@@ -202,7 +202,7 @@ roles:
       max-num-batched-tokens: 8192
       stream-interval: 10
       additional-config: '{"decode_backend":"latency_specialized"}'
-      speculative-config: '{"method": "dspark", "model": "/raid/common-models/kimi-k3.1-pro-dspark", "num_speculative_tokens": 7, "attention_backend": "FLASHINFER", "draft_sample_method": "probabilistic", "rejection_sample_method": "synthetic", "synthetic_acceptance_length": 4.16}'
+      speculative-config: '{"method": "dspark", "model": "/raid/common-models/kimi-k3.1-pro-dspark", "num_speculative_tokens": 7, "attention_backend": "FLASH_ATTN", "draft_sample_method": "probabilistic", "rejection_sample_method": "synthetic", "synthetic_acceptance_length": 4.16}'
       distributed-timeout-seconds: 1800
       cpu-distributed-timeout-seconds: 1800
       max-num-seqs: 32
@@ -212,7 +212,7 @@ roles:
       attention-config: '{"indexer_kv_dtype":"mxfp4"}'
 extra_mount:
 - /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr:/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr
-- /lustre/fsw/coreai_comparch_inferencex/weizha/models/kimi-k3.1/rainhollow-test-weights-1024_v1:/lustre/fsw/coreai_comparch_inferencex/weizha/models/kimi-k3.1/rainhollow-test-weights-1024_v1:ro
+- /lustre/fsw/coreai_comparch_inferencex/weizha/models/kimi-k3.1-pro-release-d9e99b07:/lustre/fsw/coreai_comparch_inferencex/weizha/models/kimi-k3.1-pro-release-d9e99b07:ro
 - /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626:/raid/common-models/kimi-k3.1-pro-dspark:ro
 - /raid/scratch:/raid/scratch
 sbatch_directives:

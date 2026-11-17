@@ -161,7 +161,7 @@ roles:
     env:
       HF_HUB_OFFLINE: '1'
       VLLM_ITERLOG_DIR: ''
-      PYTHONPATH: /opt/k3/mooncake-0.3.14:/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/hti/lowlat/trees/ll-integ-dea4ebd06f:/opt/k3/fi-0.7.3.dev20261031:/opt/k3/pydeps:/opt/k3/dynamo
+      PYTHONPATH: /opt/k3/mooncake-0.3.14:/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/trees/rel-9b6b764:/opt/k3/fi-0.7.3.dev20261031:/opt/k3/pydeps:/opt/k3/dynamo
       VLLM_MOONCAKE_STORE_SELECTIVE_LEASE: '1'
     args:
       prefix-cache-policy: v2
@@ -207,7 +207,7 @@ roles:
       - 1
       distributed-timeout-seconds: 1800
       cpu-distributed-timeout-seconds: 1800
-      speculative-config: '{"method":"dspark","model":"/raid/common-models/kimi-k3.1-pro-dspark","num_speculative_tokens":3,"attention_backend":"FLASHINFER","draft_sample_method":"probabilistic","rejection_sample_method":"block"}'
+      speculative-config: '{"method":"dspark","model":"/raid/common-models/kimi-k3.1-pro-dspark","num_speculative_tokens":3,"attention_backend":"FLASH_ATTN","draft_sample_method":"probabilistic","rejection_sample_method":"block"}'
       reasoning-parser: kimi_k3
       dyn-tool-call-parser: kimi_k3
       dyn-reasoning-parser: kimi_k3
@@ -225,7 +225,7 @@ roles:
     workers: 1
     gpus: 16
     env:
-      PYTHONPATH: /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/hti/lowlat/trees/ll-integ-dea4ebd06f:/opt/k3/fi-0.7.3.dev20261031:/opt/k3/pydeps:/opt/k3/dynamo:/opt/k3/pinhook
+      PYTHONPATH: /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/trees/rel-9b6b764:/opt/k3/fi-0.7.3.dev20261031:/opt/k3/pydeps:/opt/k3/dynamo:/opt/k3/pinhook
       HF_HUB_OFFLINE: '1'
       VLLM_ITERLOG_DIR: ''
       K3_PIN_CPUS: '0'
@@ -259,7 +259,7 @@ roles:
       stream-interval: 10
       additional-config: '{"decode_backend":"latency_specialized"}'
       kernel-config: '{"flashinfer_sparse_mla_kernel":"trtllm"}'
-      speculative-config: '{"method":"dspark","model":"/raid/common-models/kimi-k3.1-pro-dspark","num_speculative_tokens":3,"attention_backend":"FLASHINFER","draft_sample_method":"probabilistic","rejection_sample_method":"block"}'
+      speculative-config: '{"method":"dspark","model":"/raid/common-models/kimi-k3.1-pro-dspark","num_speculative_tokens":3,"attention_backend":"FLASH_ATTN","draft_sample_method":"probabilistic","rejection_sample_method":"block"}'
       reasoning-parser: kimi_k3
       dyn-tool-call-parser: kimi_k3
       dyn-reasoning-parser: kimi_k3
@@ -284,7 +284,7 @@ roles:
       compilation-config: '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76,80,84,88,92,96,100,104,108,112,116,120,124,128,132,136,140,144,148,152,156,160,164,168,172,176,180,184,188,192,196,200,204,208,212,216,220,224,228,232,236,240,244,248,252,256,260,264,268,272,276,280,284,288,292,296,300,304,308,312,316,320,324,328,332,336,340,344,348,352,356,360,364,368,372,376,380,384,388,392,396,400,404,408,412,416,420,424,428,432,436,440,444,448,452,456,460,464,468,472,476,480,484,488,492,496,500,504,508,512]}'
 extra_mount:
 - /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr:/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr
-- /lustre/fsw/coreai_comparch_inferencex/weizha/models/kimi-k3.1/rainhollow-test-weights-1024_v1:/lustre/fsw/coreai_comparch_inferencex/weizha/models/kimi-k3.1/rainhollow-test-weights-1024_v1:ro
+- /lustre/fsw/coreai_comparch_inferencex/weizha/models/kimi-k3.1-pro-release-d9e99b07:/lustre/fsw/coreai_comparch_inferencex/weizha/models/kimi-k3.1-pro-release-d9e99b07:ro
 - /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626:/raid/common-models/kimi-k3.1-pro-dspark:ro
 - /raid/scratch:/raid/scratch
 sbatch_directives:

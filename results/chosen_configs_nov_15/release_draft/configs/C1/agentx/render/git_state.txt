@@ -3,7 +3,7 @@ Generated at: 2026-11-10T18:27:45Z
 
 Sources considered:
   - extra_mount:/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr: /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr
-  - extra_mount:/lustre/fsw/coreai_comparch_inferencex/weizha/models/kimi-k3.1/rainhollow-test-weights-1024_v1:ro: /lustre/fsw/coreai_comparch_inferencex/weizha/models/kimi-k3.1/rainhollow-test-weights-1024_v1
+  - extra_mount:/lustre/fsw/coreai_comparch_inferencex/weizha/models/kimi-k3.1-pro-release-d9e99b07:ro: /lustre/fsw/coreai_comparch_inferencex/weizha/models/kimi-k3.1-pro-release-d9e99b07
   - extra_mount:/raid/common-models/kimi-k3.1-pro-dspark:ro: /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626
   - extra_mount:/raid/scratch: /raid/scratch
 
