@@ -1,12 +1,12 @@
 <title>K3.1 SOL Tracker</title>
 <meta name="claude:viewport-fit-sides" content="cover">
 <style>
-:root{--bg:#fbfaf7;--surface:#ffffff;--ink:#1f1e1c;--ink2:#52514e;--muted:#898781;--line:#e4e2db;--accent:#2a78d6;
+:root{--c-rel:#2a78d6;--c-frz:#7d8590;--c-gbv:#d9622b;--c-gbs:#8f4fc9;--bg:#fbfaf7;--surface:#ffffff;--ink:#1f1e1c;--ink2:#52514e;--muted:#898781;--line:#e4e2db;--accent:#2a78d6;
 --good:#2e7d4f;--goodbg:#e6f3ea;--warn:#9a6700;--warnbg:#fbf1d8;--bad:#b3261e;--badbg:#fbe4e2;--idle:#6b6a66;--idlebg:#eeede8}
 @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#161615;--surface:#1f1f1d;--ink:#ecebe6;--ink2:#bdbbb4;--muted:#8d8b85;--line:#33322f;--accent:#6aa6f0;
---good:#7fcf9c;--goodbg:#1d3326;--warn:#e8c06a;--warnbg:#3a3019;--bad:#f2928b;--badbg:#3d211f;--idle:#a8a6a0;--idlebg:#2a2a27;color-scheme:dark}}
+--good:#7fcf9c;--goodbg:#1d3326;--warn:#e8c06a;--warnbg:#3a3019;--bad:#f2928b;--badbg:#3d211f;--idle:#a8a6a0;--idlebg:#2a2a27;--c-rel:#6aa6f0;--c-frz:#9aa1aa;--c-gbv:#f0884f;--c-gbs:#b88ae8;color-scheme:dark}}
 :root[data-theme="dark"]{--bg:#161615;--surface:#1f1f1d;--ink:#ecebe6;--ink2:#bdbbb4;--muted:#8d8b85;--line:#33322f;--accent:#6aa6f0;
---good:#7fcf9c;--goodbg:#1d3326;--warn:#e8c06a;--warnbg:#3a3019;--bad:#f2928b;--badbg:#3d211f;--idle:#a8a6a0;--idlebg:#2a2a27;color-scheme:dark}
+--good:#7fcf9c;--goodbg:#1d3326;--warn:#e8c06a;--warnbg:#3a3019;--bad:#f2928b;--badbg:#3d211f;--idle:#a8a6a0;--idlebg:#2a2a27;--c-rel:#6aa6f0;--c-frz:#9aa1aa;--c-gbv:#f0884f;--c-gbs:#b88ae8;color-scheme:dark}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
 main{max-width:1120px;margin:0 auto;padding-block:28px 64px;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
@@ -34,10 +34,30 @@ ul.rules{margin:6px 0 0;padding-left:20px}ul.rules li{margin:3px 0}
 .card h3{margin-top:4px}
 code{font:12.5px ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--idlebg);padding:1px 5px;border-radius:4px}
 footer{margin-top:40px;color:var(--muted);font-size:13px}
+a{color:var(--accent)}
+.fn{font-size:13px}
+.legend{display:flex;flex-wrap:wrap;gap:6px 18px;margin:8px 0 10px;font-size:13px;color:var(--ink2)}
+.lg{display:inline-flex;align-items:center;gap:6px}
+.pgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,460px),1fr));gap:12px}
+.pfig{margin:0;background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:6px;min-width:0}
+.pchart{width:100%;height:auto;display:block}
+.pchart .grid{stroke:var(--line);stroke-width:1}
+.pchart .axis{stroke:var(--muted);stroke-width:1}
+.pchart .tick{fill:var(--muted);font-size:11px;font-variant-numeric:tabular-nums}
+.pchart .axlab{fill:var(--ink2);font-size:11.5px}
+.fr{fill:none;stroke-width:2;stroke-linejoin:round}
+.pt>circle:not(.hit),.pt>rect,.pt>path{stroke:var(--surface);stroke-width:1.5}
+.pt .hit{fill:transparent;stroke:none}
+.pt:hover>circle:not(.hit),.pt:hover>rect,.pt:hover>path{stroke:var(--ink);stroke-width:2}
+.plab{font-size:9.5px;paint-order:stroke;stroke:var(--surface);stroke-width:3px}
+.s-rel{--c:var(--c-rel)}.s-frz{--c:var(--c-frz)}.s-gbv{--c:var(--c-gbv)}.s-gbs{--c:var(--c-gbs)}
+.fr.s-rel,.fr.s-frz,.fr.s-gbv,.fr.s-gbs{stroke:var(--c)}
+.pt.s-rel>*:not(.hit),.pt.s-frz>*:not(.hit),.pt.s-gbv>*:not(.hit),.pt.s-gbs>*:not(.hit){fill:var(--c)}
+.plab.s-rel,.plab.s-frz,.plab.s-gbv,.plab.s-gbs{fill:var(--ink2)}
 </style>
 <main>
 <h1>Kimi K3.1 AgentX: speed-of-light tracker</h1>
-<p class="sub">VR200 (Hecate), vLLM + Dynamo disaggregated serving. Branch <code>wzhao/k31-agentx-dev</code> (Inferact/nvidia-vllm-agentx). Last updated 2026-11-17 13:45 PST.</p>
+<p class="sub">VR200 (Hecate), vLLM + Dynamo disaggregated serving. Branch <code>wzhao/k31-agentx-dev</code> (Inferact/nvidia-vllm-agentx). Last updated 2026-11-17 14:10 PST.</p>
 
 <div class="mission">
 <strong>Mission.</strong> Push K3.1 performance to the absolute speed of light by all means necessary, with <strong>no numerical loss</strong>: FP8 KV cache, FP4 indexer cache, FP32 KDA states, and the other precision rules below.
@@ -113,6 +133,387 @@ footer{margin-top:40px;color:var(--muted);font-size:13px}
 <tr><td>C512</td><td>1P1D hybrid: P and D DP4 x (TP4+DCP4), EP16 (32)</td><td><span class="pill wait">waiting for hold</span></td><td class="n">73,736 → -</td><td class="n">80 → -</td><td class="n">0.9803*</td><td class="n">3.25 (3)*</td></tr>
 </tbody></table></div>
 <p class="muted">* C512's first attempt, on tree rel-fa43a52, crashed in AgentX warmup on the <code>truncate_computed_blocks</code> assertion; commit 1767cf7 fixes it. Its gsm8k twin ran on the old tree, so it does not count. The rerun is on the next 8-node hold.</p>
+
+<h2>Pareto per MW: VR200 vs GB300</h2>
+<p class="muted">Throughput per MW against the four AgentX latency metrics. All-in power per GPU is 3.3 kW for VR200 and 2.12 kW for GB300. Each line joins one series' own pareto front; every measured run is a labeled marker. Hover a marker for the run, its topology and all five metrics.</p>
+<!-- PARETO -->
+<div class="legend"><span class="lg"><svg width="34" height="14" aria-hidden="true"><line class="fr s-rel" x1="2" x2="32" y1="7" y2="7"/><g class="pt s-rel"><circle cx="17.0" cy="7.0" r="3.6"/></g></svg>VR200 release draft (ongoing, 2026-11-17) <span class="muted">(4 points)</span></span><span class="lg"><svg width="34" height="14" aria-hidden="true"><line class="fr s-frz" x1="2" x2="32" y1="7" y2="7" stroke-dasharray="5 4"/><g class="pt s-frz"><rect x="13.4" y="3.4" width="7.2" height="7.2"/></g></svg>VR200 frozen sweep, preview draft (2026-11-14) <span class="muted">(17 points)</span></span><span class="lg"><svg width="34" height="14" aria-hidden="true"><line class="fr s-gbv" x1="2" x2="32" y1="7" y2="7" stroke-dasharray="2 3"/><g class="pt s-gbv"><path d="M17.0,2.4 L21.1,10.6 L12.9,10.6 Z"/></g></svg>GB300 dynamo-vLLM (InferenceX 2026-11-17) <span class="muted">(7 points)</span></span><span class="lg"><svg width="34" height="14" aria-hidden="true"><line class="fr s-gbs" x1="2" x2="32" y1="7" y2="7" stroke-dasharray="8 3 2 3"/><g class="pt s-gbs"><path d="M17.0,2.4 L21.6,7.0 L17.0,11.6 L12.4,7.0 Z"/></g></svg>GB300 dynamo-SGLang (InferenceX 2026-11-10) <span class="muted">(9 points)</span></span></div>
+<div class="pgrid">
+<figure class="pfig"><svg class="pchart" viewBox="0 0 560 380" role="img" aria-label="Throughput per MW vs P90 interactivity (tok/s/user) = 1000 / P90 ITL">
+<line class="grid" x1="52" x2="544" y1="334.0" y2="334.0"/><text class="tick" x="46" y="338.0" text-anchor="end">0</text>
+<line class="grid" x1="52" x2="544" y1="227.3" y2="227.3"/><text class="tick" x="46" y="231.3" text-anchor="end">10.0</text>
+<line class="grid" x1="52" x2="544" y1="120.7" y2="120.7"/><text class="tick" x="46" y="124.7" text-anchor="end">20.0</text>
+<line class="grid" x1="52" x2="544" y1="14.0" y2="14.0"/><text class="tick" x="46" y="18.0" text-anchor="end">30.0</text>
+<line class="grid" x1="52.0" x2="52.0" y1="14" y2="334"/><text class="tick" x="52.0" y="350" text-anchor="middle">0</text>
+<line class="grid" x1="150.4" x2="150.4" y1="14" y2="334"/><text class="tick" x="150.4" y="350" text-anchor="middle">200</text>
+<line class="grid" x1="248.8" x2="248.8" y1="14" y2="334"/><text class="tick" x="248.8" y="350" text-anchor="middle">400</text>
+<line class="grid" x1="347.2" x2="347.2" y1="14" y2="334"/><text class="tick" x="347.2" y="350" text-anchor="middle">600</text>
+<line class="grid" x1="445.6" x2="445.6" y1="14" y2="334"/><text class="tick" x="445.6" y="350" text-anchor="middle">800</text>
+<line class="grid" x1="544.0" x2="544.0" y1="14" y2="334"/><text class="tick" x="544.0" y="350" text-anchor="middle">1,000</text>
+<line class="axis" x1="52" x2="544" y1="334" y2="334"/><line class="axis" x1="52" x2="52" y1="14" y2="334"/>
+<text class="axlab" x="298" y="372" text-anchor="middle">P90 interactivity (tok/s/user) = 1000 / P90 ITL — higher is better</text>
+<text class="axlab" transform="translate(13,174) rotate(-90)" text-anchor="middle">M tok/s per MW (input + output)</text>
+<path class="fr s-gbs" d="M74.8,156.1 L81.3,162.6 L91.3,201.6 L104.4,259.6 L122.3,283.6 L143.1,302.7 L160.4,320.4 L212.8,323.0 L260.5,326.7" stroke-dasharray="8 3 2 3"/>
+<g class="pt s-gbs"><title>GB300 dynamo-SGLang c2 agg (agg 16G), InferenceX id 447846, 2026-11-10: 1,450 tok/s/GPU = 0.68 M tok/s/MW; P90 intvty 423.7, E2E-norm 87.0, E2E 13.7 s, TTFT 2.32 s</title><path d="M260.5,321.5 L265.7,326.7 L260.5,331.9 L255.3,326.7 Z"/><circle class="hit" cx="260.5" cy="326.7" r="9"/></g>
+<text class="plab s-gbs" x="266.5" y="320.7">c2 agg</text>
+<g class="pt s-gbs"><title>GB300 dynamo-SGLang c4 agg (agg 16G), InferenceX id 447847, 2026-11-10: 2,177 tok/s/GPU = 1.03 M tok/s/MW; P90 intvty 326.8, E2E-norm 105.1, E2E 11.7 s, TTFT 1.03 s</title><path d="M212.8,317.8 L218.0,323.0 L212.8,328.2 L207.6,323.0 Z"/><circle class="hit" cx="212.8" cy="323.0" r="9"/></g>
+<text class="plab s-gbs" x="218.8" y="317.0">c4 agg</text>
+<g class="pt s-gbs"><title>GB300 dynamo-SGLang c16 (1P x8G / 4D x32G), InferenceX id 447850, 2026-11-10: 2,695 tok/s/GPU = 1.27 M tok/s/MW; P90 intvty 220.3, E2E-norm 70.0, E2E 11.4 s, TTFT 1.75 s</title><path d="M160.4,315.2 L165.6,320.4 L160.4,325.6 L155.2,320.4 Z"/><circle class="hit" cx="160.4" cy="320.4" r="9"/></g>
+<text class="plab s-gbs" x="166.4" y="314.4">c16</text>
+<g class="pt s-gbs"><title>GB300 dynamo-SGLang c36 (1P x8G / 4D x32G), InferenceX id 447851, 2026-11-10: 6,224 tok/s/GPU = 2.94 M tok/s/MW; P90 intvty 185.2, E2E-norm 62.8, E2E 13.8 s, TTFT 2.06 s</title><path d="M143.1,297.5 L148.3,302.7 L143.1,307.9 L137.9,302.7 Z"/><circle class="hit" cx="143.1" cy="302.7" r="9"/></g>
+<text class="plab s-gbs" x="149.1" y="296.7">c36</text>
+<g class="pt s-gbs"><title>GB300 dynamo-SGLang c50 (1P x8G / 3D x24G), InferenceX id 447849, 2026-11-10: 10,014 tok/s/GPU = 4.72 M tok/s/MW; P90 intvty 142.9, E2E-norm 49.9, E2E 17.1 s, TTFT 2.31 s</title><path d="M122.3,278.4 L127.5,283.6 L122.3,288.8 L117.1,283.6 Z"/><circle class="hit" cx="122.3" cy="283.6" r="9"/></g>
+<text class="plab s-gbs" x="128.3" y="277.6">c50</text>
+<g class="pt s-gbs"><title>GB300 dynamo-SGLang c60 (1P x8G / 1D x16G), InferenceX id 447848, 2026-11-10: 14,786 tok/s/GPU = 6.97 M tok/s/MW; P90 intvty 106.5, E2E-norm 42.7, E2E 24.3 s, TTFT 2.54 s</title><path d="M104.4,254.4 L109.6,259.6 L104.4,264.8 L99.2,259.6 Z"/><circle class="hit" cx="104.4" cy="259.6" r="9"/></g>
+<text class="plab s-gbs" x="110.4" y="253.6">c60</text>
+<g class="pt s-gbs"><title>GB300 dynamo-SGLang c180 (2P x16G / 1D x16G), InferenceX id 447852, 2026-11-10: 26,305 tok/s/GPU = 12.41 M tok/s/MW; P90 intvty 79.9, E2E-norm 28.8, E2E 33.3 s, TTFT 5.50 s</title><path d="M91.3,196.4 L96.5,201.6 L91.3,206.8 L86.1,201.6 Z"/><circle class="hit" cx="91.3" cy="201.6" r="9"/></g>
+<text class="plab s-gbs" x="97.3" y="195.6">c180</text>
+<g class="pt s-gbs"><title>GB300 dynamo-SGLang c340 (3P x24G / 1D x16G), InferenceX id 447853, 2026-11-10: 34,066 tok/s/GPU = 16.07 M tok/s/MW; P90 intvty 59.5, E2E-norm 20.7, E2E 44.3 s, TTFT 9.38 s</title><path d="M81.3,157.4 L86.5,162.6 L81.3,167.8 L76.1,162.6 Z"/><circle class="hit" cx="81.3" cy="162.6" r="9"/></g>
+<text class="plab s-gbs" x="87.3" y="156.6">c340</text>
+<g class="pt s-gbs"><title>GB300 dynamo-SGLang c520 (4P x32G / 1D x16G), InferenceX id 447854, 2026-11-10: 35,364 tok/s/GPU = 16.68 M tok/s/MW; P90 intvty 46.4, E2E-norm 14.0, E2E 55.5 s, TTFT 12.47 s</title><path d="M74.8,150.9 L80.0,156.1 L74.8,161.3 L69.6,156.1 Z"/><circle class="hit" cx="74.8" cy="156.1" r="9"/></g>
+<text class="plab s-gbs" x="80.8" y="139.1">c520</text>
+<path class="fr s-gbv" d="M75.1,76.0 L90.1,149.1 L99.7,191.2 L135.7,270.6 L165.6,289.4 L188.3,300.5 L279.8,326.1" stroke-dasharray="2 3"/>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c1 agg (agg 16G), InferenceX id 448196, 2026-11-17: 1,566 tok/s/GPU = 0.74 M tok/s/MW; P90 intvty 463.0, E2E-norm 91.4, E2E 12.2 s, TTFT 1.49 s</title><path d="M279.8,320.9 L284.5,330.3 L275.1,330.3 Z"/><circle class="hit" cx="279.8" cy="326.1" r="9"/></g>
+<text class="plab s-gbv" x="285.8" y="309.1">c1 agg</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c44 (1P x8G / 5D x40G), InferenceX id 448198, 2026-11-17: 6,654 tok/s/GPU = 3.14 M tok/s/MW; P90 intvty 277.0, E2E-norm 98.7, E2E 9.0 s, TTFT 1.49 s</title><path d="M188.3,295.3 L193.0,304.7 L183.6,304.7 Z"/><circle class="hit" cx="188.3" cy="300.5" r="9"/></g>
+<text class="plab s-gbv" x="194.3" y="294.5">c44</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c56 (1P x8G / 3D x24G), InferenceX id 448197, 2026-11-17: 12,596 tok/s/GPU = 5.94 M tok/s/MW; P90 intvty 170.1, E2E-norm 75.7, E2E 13.2 s, TTFT 1.71 s</title><path d="M135.7,265.4 L140.4,274.8 L131.0,274.8 Z"/><circle class="hit" cx="135.7" cy="270.6" r="9"/></g>
+<text class="plab s-gbv" x="141.7" y="264.6">c56</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c56 (1P x8G / 5D x40G), InferenceX id 448199, 2026-11-17: 8,873 tok/s/GPU = 4.19 M tok/s/MW; P90 intvty 230.9, E2E-norm 82.6, E2E 10.1 s, TTFT 1.77 s</title><path d="M165.6,284.2 L170.3,293.6 L160.9,293.6 Z"/><circle class="hit" cx="165.6" cy="289.4" r="9"/></g>
+<text class="plab s-gbv" x="171.6" y="283.4">c56</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c256 (2P x16G / 1D x32G), InferenceX id 448201, 2026-11-17: 28,377 tok/s/GPU = 13.39 M tok/s/MW; P90 intvty 97.0, E2E-norm 32.4, E2E 24.9 s, TTFT 4.05 s</title><path d="M99.7,186.0 L104.4,195.4 L95.0,195.4 Z"/><circle class="hit" cx="99.7" cy="191.2" r="9"/></g>
+<text class="plab s-gbv" x="105.7" y="174.2">c256</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c448 (3P x24G / 1D x32G), InferenceX id 448202, 2026-11-17: 36,747 tok/s/GPU = 17.33 M tok/s/MW; P90 intvty 77.4, E2E-norm 22.4, E2E 32.5 s, TTFT 7.84 s</title><path d="M90.1,143.9 L94.8,153.3 L85.4,153.3 Z"/><circle class="hit" cx="90.1" cy="149.1" r="9"/></g>
+<text class="plab s-gbv" x="96.1" y="121.1">c448</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c960 (2P x32G / 1D x32G), InferenceX id 448200, 2026-11-17: 51,268 tok/s/GPU = 24.18 M tok/s/MW; P90 intvty 46.9, E2E-norm 11.4, E2E 57.0 s, TTFT 15.18 s</title><path d="M75.1,70.8 L79.8,80.2 L70.4,80.2 Z"/><circle class="hit" cx="75.1" cy="76.0" r="9"/></g>
+<text class="plab s-gbv" x="81.1" y="70.0">c960</text>
+<path class="fr s-frz" d="M91.5,95.7 L101.2,188.7 L107.7,199.6 L131.5,205.6 L135.8,209.3 L142.8,229.9 L143.7,237.5 L166.5,266.8 L194.8,278.6 L197.7,283.8 L247.6,301.0 L347.5,324.0 L435.1,329.7" stroke-dasharray="5 4"/>
+<g class="pt s-frz"><title>C1 (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C1-a1093683: 1,342 tok/s/GPU = 0.41 M tok/s/MW; P90 intvty 778.6, E2E-norm 328.8, E2E 6.5 s, TTFT 0.36 s</title><rect x="430.9" y="325.5" width="8.4" height="8.4"/><circle class="hit" cx="435.1" cy="329.7" r="9"/></g>
+<text class="plab s-frz" x="441.1" y="323.7">C1</text>
+<g class="pt s-frz"><title>C16 1P2D (1P2D: P TP8+DCP8, 2 x D TP16+DCP16 (k7), 40 GPUs), run k31vr-frozen-sweep-20261114/runs/C16-1P2D-a1096999: 3,104 tok/s/GPU = 0.94 M tok/s/MW; P90 intvty 600.6, E2E-norm 293.5, E2E 3.9 s, TTFT 0.39 s</title><rect x="343.3" y="319.8" width="8.4" height="8.4"/><circle class="hit" cx="347.5" cy="324.0" r="9"/></g>
+<text class="plab s-frz" x="353.5" y="318.0">C16 1P2D</text>
+<g class="pt s-frz"><title>C8 (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C8-a1093682: 2,890 tok/s/GPU = 0.88 M tok/s/MW; P90 intvty 529.7, E2E-norm 326.7, E2E 4.7 s, TTFT 0.35 s</title><rect x="308.4" y="320.5" width="8.4" height="8.4"/><circle class="hit" cx="312.6" cy="324.7" r="9"/></g>
+<text class="plab s-frz" x="318.6" y="329.7">C8</text>
+<g class="pt s-frz"><title>C72 1P3D (1P3D: P TP8+DCP8, 3 x D TP16+DCP16 (k7), 56 GPUs), run k31vr-frozen-sweep-20261114/runs/C72-1P3D-a1098025: 10,221 tok/s/GPU = 3.10 M tok/s/MW; P90 intvty 397.5, E2E-norm 140.0, E2E 6.0 s, TTFT 1.08 s</title><rect x="243.4" y="296.8" width="8.4" height="8.4"/><circle class="hit" cx="247.6" cy="301.0" r="9"/></g>
+<text class="plab s-frz" x="253.6" y="295.0">C72 1P3D</text>
+<g class="pt s-frz"><title>C48 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C48-1P1D-a1093681: 15,544 tok/s/GPU = 4.71 M tok/s/MW; P90 intvty 296.1, E2E-norm 158.1, E2E 7.6 s, TTFT 0.73 s</title><rect x="193.5" y="279.6" width="8.4" height="8.4"/><circle class="hit" cx="197.7" cy="283.8" r="9"/></g>
+<text class="plab s-frz" x="203.7" y="277.8">C48 1P1D</text>
+<g class="pt s-frz"><title>C96 1P2D (1P2D: P TP8+DCP8, 2 x D TP16+DCP16, 40 GPUs), run k31vr-frozen-sweep-20261114/runs/C96-1P2D-a1093473: 17,132 tok/s/GPU = 5.19 M tok/s/MW; P90 intvty 290.3, E2E-norm 106.3, E2E 8.2 s, TTFT 1.51 s</title><rect x="190.6" y="274.4" width="8.4" height="8.4"/><circle class="hit" cx="194.8" cy="278.6" r="9"/></g>
+<text class="plab s-frz" x="200.8" y="261.6">C96 1P2D</text>
+<g class="pt s-frz"><title>C96 1P2D k3 (1P2D: P TP8+DCP8, 2 x D TP16+DCP16 (k3, lookup flag on), 40 GPUs), run k31vr-frozen-sweep-20261114/runs/C96-1P2D-k3-a1097000: 16,963 tok/s/GPU = 5.14 M tok/s/MW; P90 intvty 289.8, E2E-norm 91.3, E2E 8.9 s, TTFT 1.91 s</title><rect x="190.4" y="275.0" width="8.4" height="8.4"/><circle class="hit" cx="194.6" cy="279.2" r="9"/></g>
+<text class="plab s-frz" x="200.6" y="273.2">C96 1P2D k3</text>
+<g class="pt s-frz"><title>C64 (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C64-a1093680: 20,778 tok/s/GPU = 6.30 M tok/s/MW; P90 intvty 232.8, E2E-norm 128.7, E2E 9.1 s, TTFT 0.85 s</title><rect x="162.3" y="262.6" width="8.4" height="8.4"/><circle class="hit" cx="166.5" cy="266.8" r="9"/></g>
+<text class="plab s-frz" x="172.5" y="260.8">C64</text>
+<g class="pt s-frz"><title>C112 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16 (k3), 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C112-1P1D-a1094730: 29,863 tok/s/GPU = 9.05 M tok/s/MW; P90 intvty 186.3, E2E-norm 60.2, E2E 12.7 s, TTFT 2.75 s</title><rect x="139.5" y="233.3" width="8.4" height="8.4"/><circle class="hit" cx="143.7" cy="237.5" r="9"/></g>
+<text class="plab s-frz" x="149.7" y="231.5">C112 1P1D</text>
+<g class="pt s-frz"><title>C128 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag off), 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C128-1P1D-a1096270: 32,194 tok/s/GPU = 9.76 M tok/s/MW; P90 intvty 184.6, E2E-norm 53.0, E2E 13.9 s, TTFT 3.20 s</title><rect x="138.6" y="225.7" width="8.4" height="8.4"/><circle class="hit" cx="142.8" cy="229.9" r="9"/></g>
+<text class="plab s-frz" x="148.8" y="212.9">C128 1P1D</text>
+<g class="pt s-frz"><title>C128 1P1D llh (1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag on), 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C128-1P1D-llh-a1096428: 31,660 tok/s/GPU = 9.59 M tok/s/MW; P90 intvty 184.5, E2E-norm 38.7, E2E 16.7 s, TTFT 6.80 s</title><rect x="138.6" y="227.5" width="8.4" height="8.4"/><circle class="hit" cx="142.8" cy="231.7" r="9"/></g>
+<text class="plab s-frz" x="148.8" y="247.7">C128 1P1D llh</text>
+<g class="pt s-frz"><title>C160 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C160-1P1D-a1093679: 38,569 tok/s/GPU = 11.69 M tok/s/MW; P90 intvty 170.4, E2E-norm 27.2, E2E 18.7 s, TTFT 6.89 s</title><rect x="131.6" y="205.1" width="8.4" height="8.4"/><circle class="hit" cx="135.8" cy="209.3" r="9"/></g>
+<text class="plab s-frz" x="141.8" y="192.3">C160 1P1D</text>
+<g class="pt s-frz"><title>C160 1P1D llh (1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag on), 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C160-1P1D-llh-a1096427: 39,734 tok/s/GPU = 12.04 M tok/s/MW; P90 intvty 161.6, E2E-norm 42.3, E2E 17.3 s, TTFT 4.67 s</title><rect x="127.3" y="201.4" width="8.4" height="8.4"/><circle class="hit" cx="131.5" cy="205.6" r="9"/></g>
+<text class="plab s-frz" x="137.5" y="177.6">C160 1P1D llh</text>
+<g class="pt s-frz"><title>C160 2P1D (2P1D: 2 x P TP8+DCP8, D TP16+DCP16, 32 GPUs), run k31vr-frozen-sweep-20261114/runs/C160-2P1D-a1094590: 31,049 tok/s/GPU = 9.41 M tok/s/MW; P90 intvty 161.3, E2E-norm 73.5, E2E 14.5 s, TTFT 1.64 s</title><rect x="127.1" y="229.4" width="8.4" height="8.4"/><circle class="hit" cx="131.3" cy="233.6" r="9"/></g>
+<text class="plab s-frz" x="137.3" y="227.6">C160 2P1D</text>
+<g class="pt s-frz"><title>C224 2P1D (2P1D: 2 x P TP8+DCP8, D TP16+DCP16, 32 GPUs), run k31vr-frozen-sweep-20261114/runs/C224-2P1D-a1093685: 41,591 tok/s/GPU = 12.60 M tok/s/MW; P90 intvty 113.1, E2E-norm 54.6, E2E 19.5 s, TTFT 1.88 s</title><rect x="103.5" y="195.4" width="8.4" height="8.4"/><circle class="hit" cx="107.7" cy="199.6" r="9"/></g>
+<text class="plab s-frz" x="113.7" y="193.6">C224 2P1D</text>
+<g class="pt s-frz"><title>C256 2P1D (2P1D: 2 x P TP8+DCP8, D TP16+DCP16, 32 GPUs), run k31vr-frozen-sweep-20261114/runs/C256-2P1D-a1095076: 44,940 tok/s/GPU = 13.62 M tok/s/MW; P90 intvty 99.9, E2E-norm 44.1, E2E 22.4 s, TTFT 2.43 s</title><rect x="97.0" y="184.5" width="8.4" height="8.4"/><circle class="hit" cx="101.2" cy="188.7" r="9"/></g>
+<text class="plab s-frz" x="107.2" y="182.7">C256 2P1D</text>
+<g class="pt s-frz"><title>C512 (1P1D hybrid: P and D each DP4 x (TP4+DCP4), EP16, 32 GPUs), run k31vr-frozen-sweep-20261114/runs/C512-a1093684: 73,736 tok/s/GPU = 22.34 M tok/s/MW; P90 intvty 80.3, E2E-norm 20.2, E2E 31.8 s, TTFT 6.43 s</title><rect x="87.3" y="91.5" width="8.4" height="8.4"/><circle class="hit" cx="91.5" cy="95.7" r="9"/></g>
+<text class="plab s-frz" x="97.5" y="89.7">C512</text>
+<path class="fr s-rel" d="M156.4,226.9 L199.6,264.4 L232.7,282.5 L495.5,329.6"/>
+<g class="pt s-rel"><title>C1 (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-release-draft-sweep-20261117/runs/C1-a1118776: 1,359 tok/s/GPU = 0.41 M tok/s/MW; P90 intvty 901.4, E2E-norm 332.2, E2E 5.6 s, TTFT 0.40 s</title><circle cx="495.5" cy="329.6" r="4.2"/><circle class="hit" cx="495.5" cy="329.6" r="9"/></g>
+<text class="plab s-rel" x="501.5" y="323.6">C1</text>
+<g class="pt s-rel"><title>C48 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-release-draft-sweep-20261117/runs/C48-1P1D-a1118778: 15,934 tok/s/GPU = 4.83 M tok/s/MW; P90 intvty 367.2, E2E-norm 177.8, E2E 6.1 s, TTFT 0.71 s</title><circle cx="232.7" cy="282.5" r="4.2"/><circle class="hit" cx="232.7" cy="282.5" r="9"/></g>
+<text class="plab s-rel" x="238.7" y="276.5">C48 1P1D</text>
+<g class="pt s-rel"><title>C64 (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-release-draft-sweep-20261117/runs/C64-a1118777: 21,527 tok/s/GPU = 6.52 M tok/s/MW; P90 intvty 300.0, E2E-norm 136.3, E2E 7.2 s, TTFT 0.96 s</title><circle cx="199.6" cy="264.4" r="4.2"/><circle class="hit" cx="199.6" cy="264.4" r="9"/></g>
+<text class="plab s-rel" x="205.6" y="236.4">C64</text>
+<g class="pt s-rel"><title>C128 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag off), 24 GPUs), run k31vr-release-draft-sweep-20261117/runs/C128-1P1D-a1118779: 33,119 tok/s/GPU = 10.04 M tok/s/MW; P90 intvty 212.2, E2E-norm 61.5, E2E 11.6 s, TTFT 3.00 s</title><circle cx="156.4" cy="226.9" r="4.2"/><circle class="hit" cx="156.4" cy="226.9" r="9"/></g>
+<text class="plab s-rel" x="162.4" y="220.9">C128 1P1D</text>
+</svg></figure>
+<figure class="pfig"><svg class="pchart" viewBox="0 0 560 380" role="img" aria-label="Throughput per MW vs P90 E2E-normalized interactivity (tok/s/user)">
+<line class="grid" x1="52" x2="544" y1="334.0" y2="334.0"/><text class="tick" x="46" y="338.0" text-anchor="end">0</text>
+<line class="grid" x1="52" x2="544" y1="227.3" y2="227.3"/><text class="tick" x="46" y="231.3" text-anchor="end">10.0</text>
+<line class="grid" x1="52" x2="544" y1="120.7" y2="120.7"/><text class="tick" x="46" y="124.7" text-anchor="end">20.0</text>
+<line class="grid" x1="52" x2="544" y1="14.0" y2="14.0"/><text class="tick" x="46" y="18.0" text-anchor="end">30.0</text>
+<line class="grid" x1="52.0" x2="52.0" y1="14" y2="334"/><text class="tick" x="52.0" y="350" text-anchor="middle">0</text>
+<line class="grid" x1="175.0" x2="175.0" y1="14" y2="334"/><text class="tick" x="175.0" y="350" text-anchor="middle">100</text>
+<line class="grid" x1="298.0" x2="298.0" y1="14" y2="334"/><text class="tick" x="298.0" y="350" text-anchor="middle">200</text>
+<line class="grid" x1="421.0" x2="421.0" y1="14" y2="334"/><text class="tick" x="421.0" y="350" text-anchor="middle">300</text>
+<line class="grid" x1="544.0" x2="544.0" y1="14" y2="334"/><text class="tick" x="544.0" y="350" text-anchor="middle">400</text>
+<line class="axis" x1="52" x2="544" y1="334" y2="334"/><line class="axis" x1="52" x2="52" y1="14" y2="334"/>
+<text class="axlab" x="298" y="372" text-anchor="middle">P90 E2E-normalized interactivity (tok/s/user) — higher is better</text>
+<text class="axlab" transform="translate(13,174) rotate(-90)" text-anchor="middle">M tok/s per MW (input + output)</text>
+<path class="fr s-gbs" d="M69.3,156.1 L77.5,162.6 L87.4,201.6 L104.5,259.6 L113.4,283.6 L129.3,302.7 L138.2,320.4 L181.2,323.0" stroke-dasharray="8 3 2 3"/>
+<g class="pt s-gbs"><title>GB300 dynamo-SGLang c2 agg (agg 16G), InferenceX id 447846, 2026-11-10: 1,450 tok/s/GPU = 0.68 M tok/s/MW; P90 intvty 423.7, E2E-norm 87.0, E2E 13.7 s, TTFT 2.32 s</title><path d="M159.0,321.5 L164.2,326.7 L159.0,331.9 L153.8,326.7 Z"/><circle class="hit" cx="159.0" cy="326.7" r="9"/></g>
+<text class="plab s-gbs" x="165.0" y="320.7">c2 agg</text>
+<g class="pt s-gbs"><title>GB300 dynamo-SGLang c4 agg (agg 16G), InferenceX id 447847, 2026-11-10: 2,177 tok/s/GPU = 1.03 M tok/s/MW; P90 intvty 326.8, E2E-norm 105.1, E2E 11.7 s, TTFT 1.03 s</title><path d="M181.2,317.8 L186.4,323.0 L181.2,328.2 L176.0,323.0 Z"/><circle class="hit" cx="181.2" cy="323.0" r="9"/></g>
+<text class="plab s-gbs" x="187.2" y="306.0">c4 agg</text>
+<g class="pt s-gbs"><title>GB300 dynamo-SGLang c16 (1P x8G / 4D x32G), InferenceX id 447850, 2026-11-10: 2,695 tok/s/GPU = 1.27 M tok/s/MW; P90 intvty 220.3, E2E-norm 70.0, E2E 11.4 s, TTFT 1.75 s</title><path d="M138.2,315.2 L143.4,320.4 L138.2,325.6 L133.0,320.4 Z"/><circle class="hit" cx="138.2" cy="320.4" r="9"/></g>
+<text class="plab s-gbs" x="144.2" y="314.4">c16</text>
+<g class="pt s-gbs"><title>GB300 dynamo-SGLang c36 (1P x8G / 4D x32G), InferenceX id 447851, 2026-11-10: 6,224 tok/s/GPU = 2.94 M tok/s/MW; P90 intvty 185.2, E2E-norm 62.8, E2E 13.8 s, TTFT 2.06 s</title><path d="M129.3,297.5 L134.5,302.7 L129.3,307.9 L124.1,302.7 Z"/><circle class="hit" cx="129.3" cy="302.7" r="9"/></g>
+<text class="plab s-gbs" x="135.3" y="296.7">c36</text>
+<g class="pt s-gbs"><title>GB300 dynamo-SGLang c50 (1P x8G / 3D x24G), InferenceX id 447849, 2026-11-10: 10,014 tok/s/GPU = 4.72 M tok/s/MW; P90 intvty 142.9, E2E-norm 49.9, E2E 17.1 s, TTFT 2.31 s</title><path d="M113.4,278.4 L118.6,283.6 L113.4,288.8 L108.2,283.6 Z"/><circle class="hit" cx="113.4" cy="283.6" r="9"/></g>
+<text class="plab s-gbs" x="119.4" y="277.6">c50</text>
+<g class="pt s-gbs"><title>GB300 dynamo-SGLang c60 (1P x8G / 1D x16G), InferenceX id 447848, 2026-11-10: 14,786 tok/s/GPU = 6.97 M tok/s/MW; P90 intvty 106.5, E2E-norm 42.7, E2E 24.3 s, TTFT 2.54 s</title><path d="M104.5,254.4 L109.7,259.6 L104.5,264.8 L99.3,259.6 Z"/><circle class="hit" cx="104.5" cy="259.6" r="9"/></g>
+<text class="plab s-gbs" x="110.5" y="253.6">c60</text>
+<g class="pt s-gbs"><title>GB300 dynamo-SGLang c180 (2P x16G / 1D x16G), InferenceX id 447852, 2026-11-10: 26,305 tok/s/GPU = 12.41 M tok/s/MW; P90 intvty 79.9, E2E-norm 28.8, E2E 33.3 s, TTFT 5.50 s</title><path d="M87.4,196.4 L92.6,201.6 L87.4,206.8 L82.2,201.6 Z"/><circle class="hit" cx="87.4" cy="201.6" r="9"/></g>
+<text class="plab s-gbs" x="93.4" y="195.6">c180</text>
+<g class="pt s-gbs"><title>GB300 dynamo-SGLang c340 (3P x24G / 1D x16G), InferenceX id 447853, 2026-11-10: 34,066 tok/s/GPU = 16.07 M tok/s/MW; P90 intvty 59.5, E2E-norm 20.7, E2E 44.3 s, TTFT 9.38 s</title><path d="M77.5,157.4 L82.7,162.6 L77.5,167.8 L72.3,162.6 Z"/><circle class="hit" cx="77.5" cy="162.6" r="9"/></g>
+<text class="plab s-gbs" x="83.5" y="156.6">c340</text>
+<g class="pt s-gbs"><title>GB300 dynamo-SGLang c520 (4P x32G / 1D x16G), InferenceX id 447854, 2026-11-10: 35,364 tok/s/GPU = 16.68 M tok/s/MW; P90 intvty 46.4, E2E-norm 14.0, E2E 55.5 s, TTFT 12.47 s</title><path d="M69.3,150.9 L74.5,156.1 L69.3,161.3 L64.1,156.1 Z"/><circle class="hit" cx="69.3" cy="156.1" r="9"/></g>
+<text class="plab s-gbs" x="75.3" y="139.1">c520</text>
+<path class="fr s-gbv" d="M66.1,76.0 L79.6,149.1 L91.9,191.2 L145.1,270.6 L153.7,289.4 L173.4,300.5" stroke-dasharray="2 3"/>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c1 agg (agg 16G), InferenceX id 448196, 2026-11-17: 1,566 tok/s/GPU = 0.74 M tok/s/MW; P90 intvty 463.0, E2E-norm 91.4, E2E 12.2 s, TTFT 1.49 s</title><path d="M164.4,320.9 L169.1,330.3 L159.7,330.3 Z"/><circle class="hit" cx="164.4" cy="326.1" r="9"/></g>
+<text class="plab s-gbv" x="170.4" y="342.1">c1 agg</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c44 (1P x8G / 5D x40G), InferenceX id 448198, 2026-11-17: 6,654 tok/s/GPU = 3.14 M tok/s/MW; P90 intvty 277.0, E2E-norm 98.7, E2E 9.0 s, TTFT 1.49 s</title><path d="M173.4,295.3 L178.1,304.7 L168.7,304.7 Z"/><circle class="hit" cx="173.4" cy="300.5" r="9"/></g>
+<text class="plab s-gbv" x="179.4" y="294.5">c44</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c56 (1P x8G / 3D x24G), InferenceX id 448197, 2026-11-17: 12,596 tok/s/GPU = 5.94 M tok/s/MW; P90 intvty 170.1, E2E-norm 75.7, E2E 13.2 s, TTFT 1.71 s</title><path d="M145.1,265.4 L149.8,274.8 L140.4,274.8 Z"/><circle class="hit" cx="145.1" cy="270.6" r="9"/></g>
+<text class="plab s-gbv" x="151.1" y="264.6">c56</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c56 (1P x8G / 5D x40G), InferenceX id 448199, 2026-11-17: 8,873 tok/s/GPU = 4.19 M tok/s/MW; P90 intvty 230.9, E2E-norm 82.6, E2E 10.1 s, TTFT 1.77 s</title><path d="M153.7,284.2 L158.4,293.6 L149.0,293.6 Z"/><circle class="hit" cx="153.7" cy="289.4" r="9"/></g>
+<text class="plab s-gbv" x="159.7" y="283.4">c56</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c256 (2P x16G / 1D x32G), InferenceX id 448201, 2026-11-17: 28,377 tok/s/GPU = 13.39 M tok/s/MW; P90 intvty 97.0, E2E-norm 32.4, E2E 24.9 s, TTFT 4.05 s</title><path d="M91.9,186.0 L96.6,195.4 L87.2,195.4 Z"/><circle class="hit" cx="91.9" cy="191.2" r="9"/></g>
+<text class="plab s-gbv" x="97.9" y="174.2">c256</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c448 (3P x24G / 1D x32G), InferenceX id 448202, 2026-11-17: 36,747 tok/s/GPU = 17.33 M tok/s/MW; P90 intvty 77.4, E2E-norm 22.4, E2E 32.5 s, TTFT 7.84 s</title><path d="M79.6,143.9 L84.3,153.3 L74.9,153.3 Z"/><circle class="hit" cx="79.6" cy="149.1" r="9"/></g>
+<text class="plab s-gbv" x="85.6" y="121.1">c448</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c960 (2P x32G / 1D x32G), InferenceX id 448200, 2026-11-17: 51,268 tok/s/GPU = 24.18 M tok/s/MW; P90 intvty 46.9, E2E-norm 11.4, E2E 57.0 s, TTFT 15.18 s</title><path d="M66.1,70.8 L70.8,80.2 L61.4,80.2 Z"/><circle class="hit" cx="66.1" cy="76.0" r="9"/></g>
+<text class="plab s-gbv" x="72.1" y="70.0">c960</text>
+<path class="fr s-frz" d="M76.9,95.7 L106.2,188.7 L119.2,199.6 L142.4,233.6 L210.3,266.8 L246.4,283.8 L413.0,324.0 L453.8,324.7 L456.4,329.7" stroke-dasharray="5 4"/>
+<g class="pt s-frz"><title>C1 (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C1-a1093683: 1,342 tok/s/GPU = 0.41 M tok/s/MW; P90 intvty 778.6, E2E-norm 328.8, E2E 6.5 s, TTFT 0.36 s</title><rect x="452.2" y="325.5" width="8.4" height="8.4"/><circle class="hit" cx="456.4" cy="329.7" r="9"/></g>
+<text class="plab s-frz" x="462.4" y="323.7">C1</text>
+<g class="pt s-frz"><title>C16 1P2D (1P2D: P TP8+DCP8, 2 x D TP16+DCP16 (k7), 40 GPUs), run k31vr-frozen-sweep-20261114/runs/C16-1P2D-a1096999: 3,104 tok/s/GPU = 0.94 M tok/s/MW; P90 intvty 600.6, E2E-norm 293.5, E2E 3.9 s, TTFT 0.39 s</title><rect x="408.8" y="319.8" width="8.4" height="8.4"/><circle class="hit" cx="413.0" cy="324.0" r="9"/></g>
+<text class="plab s-frz" x="419.0" y="307.0">C16 1P2D</text>
+<g class="pt s-frz"><title>C8 (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C8-a1093682: 2,890 tok/s/GPU = 0.88 M tok/s/MW; P90 intvty 529.7, E2E-norm 326.7, E2E 4.7 s, TTFT 0.35 s</title><rect x="449.6" y="320.5" width="8.4" height="8.4"/><circle class="hit" cx="453.8" cy="324.7" r="9"/></g>
+<text class="plab s-frz" x="459.8" y="340.7">C8</text>
+<g class="pt s-frz"><title>C72 1P3D (1P3D: P TP8+DCP8, 3 x D TP16+DCP16 (k7), 56 GPUs), run k31vr-frozen-sweep-20261114/runs/C72-1P3D-a1098025: 10,221 tok/s/GPU = 3.10 M tok/s/MW; P90 intvty 397.5, E2E-norm 140.0, E2E 6.0 s, TTFT 1.08 s</title><rect x="220.0" y="296.8" width="8.4" height="8.4"/><circle class="hit" cx="224.2" cy="301.0" r="9"/></g>
+<text class="plab s-frz" x="230.2" y="295.0">C72 1P3D</text>
+<g class="pt s-frz"><title>C48 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C48-1P1D-a1093681: 15,544 tok/s/GPU = 4.71 M tok/s/MW; P90 intvty 296.1, E2E-norm 158.1, E2E 7.6 s, TTFT 0.73 s</title><rect x="242.2" y="279.6" width="8.4" height="8.4"/><circle class="hit" cx="246.4" cy="283.8" r="9"/></g>
+<text class="plab s-frz" x="252.4" y="277.8">C48 1P1D</text>
+<g class="pt s-frz"><title>C96 1P2D (1P2D: P TP8+DCP8, 2 x D TP16+DCP16, 40 GPUs), run k31vr-frozen-sweep-20261114/runs/C96-1P2D-a1093473: 17,132 tok/s/GPU = 5.19 M tok/s/MW; P90 intvty 290.3, E2E-norm 106.3, E2E 8.2 s, TTFT 1.51 s</title><rect x="178.5" y="274.4" width="8.4" height="8.4"/><circle class="hit" cx="182.7" cy="278.6" r="9"/></g>
+<text class="plab s-frz" x="188.7" y="272.6">C96 1P2D</text>
+<g class="pt s-frz"><title>C96 1P2D k3 (1P2D: P TP8+DCP8, 2 x D TP16+DCP16 (k3, lookup flag on), 40 GPUs), run k31vr-frozen-sweep-20261114/runs/C96-1P2D-k3-a1097000: 16,963 tok/s/GPU = 5.14 M tok/s/MW; P90 intvty 289.8, E2E-norm 91.3, E2E 8.9 s, TTFT 1.91 s</title><rect x="160.2" y="275.0" width="8.4" height="8.4"/><circle class="hit" cx="164.4" cy="279.2" r="9"/></g>
+<text class="plab s-frz" x="170.4" y="251.2">C96 1P2D k3</text>
+<g class="pt s-frz"><title>C64 (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C64-a1093680: 20,778 tok/s/GPU = 6.30 M tok/s/MW; P90 intvty 232.8, E2E-norm 128.7, E2E 9.1 s, TTFT 0.85 s</title><rect x="206.1" y="262.6" width="8.4" height="8.4"/><circle class="hit" cx="210.3" cy="266.8" r="9"/></g>
+<text class="plab s-frz" x="216.3" y="238.8">C64</text>
+<g class="pt s-frz"><title>C112 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16 (k3), 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C112-1P1D-a1094730: 29,863 tok/s/GPU = 9.05 M tok/s/MW; P90 intvty 186.3, E2E-norm 60.2, E2E 12.7 s, TTFT 2.75 s</title><rect x="121.8" y="233.3" width="8.4" height="8.4"/><circle class="hit" cx="126.0" cy="237.5" r="9"/></g>
+<text class="plab s-frz" x="132.0" y="231.5">C112 1P1D</text>
+<g class="pt s-frz"><title>C128 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag off), 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C128-1P1D-a1096270: 32,194 tok/s/GPU = 9.76 M tok/s/MW; P90 intvty 184.6, E2E-norm 53.0, E2E 13.9 s, TTFT 3.20 s</title><rect x="113.0" y="225.7" width="8.4" height="8.4"/><circle class="hit" cx="117.2" cy="229.9" r="9"/></g>
+<text class="plab s-frz" x="123.2" y="212.9">C128 1P1D</text>
+<g class="pt s-frz"><title>C128 1P1D llh (1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag on), 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C128-1P1D-llh-a1096428: 31,660 tok/s/GPU = 9.59 M tok/s/MW; P90 intvty 184.5, E2E-norm 38.7, E2E 16.7 s, TTFT 6.80 s</title><rect x="95.4" y="227.5" width="8.4" height="8.4"/><circle class="hit" cx="99.6" cy="231.7" r="9"/></g>
+<text class="plab s-frz" x="105.6" y="225.7">C128 1P1D llh</text>
+<g class="pt s-frz"><title>C160 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C160-1P1D-a1093679: 38,569 tok/s/GPU = 11.69 M tok/s/MW; P90 intvty 170.4, E2E-norm 27.2, E2E 18.7 s, TTFT 6.89 s</title><rect x="81.3" y="205.1" width="8.4" height="8.4"/><circle class="hit" cx="85.5" cy="209.3" r="9"/></g>
+<text class="plab s-frz" x="91.5" y="203.3">C160 1P1D</text>
+<g class="pt s-frz"><title>C160 1P1D llh (1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag on), 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C160-1P1D-llh-a1096427: 39,734 tok/s/GPU = 12.04 M tok/s/MW; P90 intvty 161.6, E2E-norm 42.3, E2E 17.3 s, TTFT 4.67 s</title><rect x="99.8" y="201.4" width="8.4" height="8.4"/><circle class="hit" cx="104.0" cy="205.6" r="9"/></g>
+<text class="plab s-frz" x="110.0" y="199.6">C160 1P1D llh</text>
+<g class="pt s-frz"><title>C160 2P1D (2P1D: 2 x P TP8+DCP8, D TP16+DCP16, 32 GPUs), run k31vr-frozen-sweep-20261114/runs/C160-2P1D-a1094590: 31,049 tok/s/GPU = 9.41 M tok/s/MW; P90 intvty 161.3, E2E-norm 73.5, E2E 14.5 s, TTFT 1.64 s</title><rect x="138.2" y="229.4" width="8.4" height="8.4"/><circle class="hit" cx="142.4" cy="233.6" r="9"/></g>
+<text class="plab s-frz" x="148.4" y="227.6">C160 2P1D</text>
+<g class="pt s-frz"><title>C224 2P1D (2P1D: 2 x P TP8+DCP8, D TP16+DCP16, 32 GPUs), run k31vr-frozen-sweep-20261114/runs/C224-2P1D-a1093685: 41,591 tok/s/GPU = 12.60 M tok/s/MW; P90 intvty 113.1, E2E-norm 54.6, E2E 19.5 s, TTFT 1.88 s</title><rect x="115.0" y="195.4" width="8.4" height="8.4"/><circle class="hit" cx="119.2" cy="199.6" r="9"/></g>
+<text class="plab s-frz" x="125.2" y="182.6">C224 2P1D</text>
+<g class="pt s-frz"><title>C256 2P1D (2P1D: 2 x P TP8+DCP8, D TP16+DCP16, 32 GPUs), run k31vr-frozen-sweep-20261114/runs/C256-2P1D-a1095076: 44,940 tok/s/GPU = 13.62 M tok/s/MW; P90 intvty 99.9, E2E-norm 44.1, E2E 22.4 s, TTFT 2.43 s</title><rect x="102.0" y="184.5" width="8.4" height="8.4"/><circle class="hit" cx="106.2" cy="188.7" r="9"/></g>
+<text class="plab s-frz" x="112.2" y="160.7">C256 2P1D</text>
+<g class="pt s-frz"><title>C512 (1P1D hybrid: P and D each DP4 x (TP4+DCP4), EP16, 32 GPUs), run k31vr-frozen-sweep-20261114/runs/C512-a1093684: 73,736 tok/s/GPU = 22.34 M tok/s/MW; P90 intvty 80.3, E2E-norm 20.2, E2E 31.8 s, TTFT 6.43 s</title><rect x="72.7" y="91.5" width="8.4" height="8.4"/><circle class="hit" cx="76.9" cy="95.7" r="9"/></g>
+<text class="plab s-frz" x="82.9" y="89.7">C512</text>
+<path class="fr s-rel" d="M127.6,226.9 L219.6,264.4 L270.7,282.5 L460.6,329.6"/>
+<g class="pt s-rel"><title>C1 (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-release-draft-sweep-20261117/runs/C1-a1118776: 1,359 tok/s/GPU = 0.41 M tok/s/MW; P90 intvty 901.4, E2E-norm 332.2, E2E 5.6 s, TTFT 0.40 s</title><circle cx="460.6" cy="329.6" r="4.2"/><circle class="hit" cx="460.6" cy="329.6" r="9"/></g>
+<text class="plab s-rel" x="466.6" y="312.6">C1</text>
+<g class="pt s-rel"><title>C48 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-release-draft-sweep-20261117/runs/C48-1P1D-a1118778: 15,934 tok/s/GPU = 4.83 M tok/s/MW; P90 intvty 367.2, E2E-norm 177.8, E2E 6.1 s, TTFT 0.71 s</title><circle cx="270.7" cy="282.5" r="4.2"/><circle class="hit" cx="270.7" cy="282.5" r="9"/></g>
+<text class="plab s-rel" x="276.7" y="265.5">C48 1P1D</text>
+<g class="pt s-rel"><title>C64 (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-release-draft-sweep-20261117/runs/C64-a1118777: 21,527 tok/s/GPU = 6.52 M tok/s/MW; P90 intvty 300.0, E2E-norm 136.3, E2E 7.2 s, TTFT 0.96 s</title><circle cx="219.6" cy="264.4" r="4.2"/><circle class="hit" cx="219.6" cy="264.4" r="9"/></g>
+<text class="plab s-rel" x="225.6" y="258.4">C64</text>
+<g class="pt s-rel"><title>C128 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag off), 24 GPUs), run k31vr-release-draft-sweep-20261117/runs/C128-1P1D-a1118779: 33,119 tok/s/GPU = 10.04 M tok/s/MW; P90 intvty 212.2, E2E-norm 61.5, E2E 11.6 s, TTFT 3.00 s</title><circle cx="127.6" cy="226.9" r="4.2"/><circle class="hit" cx="127.6" cy="226.9" r="9"/></g>
+<text class="plab s-rel" x="133.6" y="220.9">C128 1P1D</text>
+</svg></figure>
+<figure class="pfig"><svg class="pchart" viewBox="0 0 560 380" role="img" aria-label="Throughput per MW vs P90 end-to-end latency (s)">
+<line class="grid" x1="52" x2="544" y1="334.0" y2="334.0"/><text class="tick" x="46" y="338.0" text-anchor="end">0</text>
+<line class="grid" x1="52" x2="544" y1="227.3" y2="227.3"/><text class="tick" x="46" y="231.3" text-anchor="end">10.0</text>
+<line class="grid" x1="52" x2="544" y1="120.7" y2="120.7"/><text class="tick" x="46" y="124.7" text-anchor="end">20.0</text>
+<line class="grid" x1="52" x2="544" y1="14.0" y2="14.0"/><text class="tick" x="46" y="18.0" text-anchor="end">30.0</text>
+<line class="grid" x1="52.0" x2="52.0" y1="14" y2="334"/><text class="tick" x="52.0" y="350" text-anchor="middle">0</text>
+<line class="grid" x1="216.0" x2="216.0" y1="14" y2="334"/><text class="tick" x="216.0" y="350" text-anchor="middle">20.0</text>
+<line class="grid" x1="380.0" x2="380.0" y1="14" y2="334"/><text class="tick" x="380.0" y="350" text-anchor="middle">40.0</text>
+<line class="grid" x1="544.0" x2="544.0" y1="14" y2="334"/><text class="tick" x="544.0" y="350" text-anchor="middle">60.0</text>
+<line class="axis" x1="52" x2="544" y1="334" y2="334"/><line class="axis" x1="52" x2="52" y1="14" y2="334"/>
+<text class="axlab" x="298" y="372" text-anchor="middle">P90 end-to-end latency (s) — lower is better</text>
+<text class="axlab" transform="translate(13,174) rotate(-90)" text-anchor="middle">M tok/s per MW (input + output)</text>
+<path class="fr s-gbs" d="M145.1,320.4 L165.6,302.7 L191.9,283.6 L251.3,259.6 L325.1,201.6 L415.1,162.6 L506.7,156.1" stroke-dasharray="8 3 2 3"/>
+<g class="pt s-gbs"><title>GB300 dynamo-SGLang c2 agg (agg 16G), InferenceX id 447846, 2026-11-10: 1,450 tok/s/GPU = 0.68 M tok/s/MW; P90 intvty 423.7, E2E-norm 87.0, E2E 13.7 s, TTFT 2.32 s</title><path d="M164.2,321.5 L169.4,326.7 L164.2,331.9 L159.0,326.7 Z"/><circle class="hit" cx="164.2" cy="326.7" r="9"/></g>
+<text class="plab s-gbs" x="170.2" y="320.7">c2 agg</text>
+<g class="pt s-gbs"><title>GB300 dynamo-SGLang c4 agg (agg 16G), InferenceX id 447847, 2026-11-10: 2,177 tok/s/GPU = 1.03 M tok/s/MW; P90 intvty 326.8, E2E-norm 105.1, E2E 11.7 s, TTFT 1.03 s</title><path d="M148.1,317.8 L153.3,323.0 L148.1,328.2 L142.9,323.0 Z"/><circle class="hit" cx="148.1" cy="323.0" r="9"/></g>
+<text class="plab s-gbs" x="154.1" y="306.0">c4 agg</text>
+<g class="pt s-gbs"><title>GB300 dynamo-SGLang c16 (1P x8G / 4D x32G), InferenceX id 447850, 2026-11-10: 2,695 tok/s/GPU = 1.27 M tok/s/MW; P90 intvty 220.3, E2E-norm 70.0, E2E 11.4 s, TTFT 1.75 s</title><path d="M145.1,315.2 L150.3,320.4 L145.1,325.6 L139.9,320.4 Z"/><circle class="hit" cx="145.1" cy="320.4" r="9"/></g>
+<text class="plab s-gbs" x="151.1" y="325.4">c16</text>
+<g class="pt s-gbs"><title>GB300 dynamo-SGLang c36 (1P x8G / 4D x32G), InferenceX id 447851, 2026-11-10: 6,224 tok/s/GPU = 2.94 M tok/s/MW; P90 intvty 185.2, E2E-norm 62.8, E2E 13.8 s, TTFT 2.06 s</title><path d="M165.6,297.5 L170.8,302.7 L165.6,307.9 L160.4,302.7 Z"/><circle class="hit" cx="165.6" cy="302.7" r="9"/></g>
+<text class="plab s-gbs" x="171.6" y="285.7">c36</text>
+<g class="pt s-gbs"><title>GB300 dynamo-SGLang c50 (1P x8G / 3D x24G), InferenceX id 447849, 2026-11-10: 10,014 tok/s/GPU = 4.72 M tok/s/MW; P90 intvty 142.9, E2E-norm 49.9, E2E 17.1 s, TTFT 2.31 s</title><path d="M191.9,278.4 L197.1,283.6 L191.9,288.8 L186.7,283.6 Z"/><circle class="hit" cx="191.9" cy="283.6" r="9"/></g>
+<text class="plab s-gbs" x="197.9" y="277.6">c50</text>
+<g class="pt s-gbs"><title>GB300 dynamo-SGLang c60 (1P x8G / 1D x16G), InferenceX id 447848, 2026-11-10: 14,786 tok/s/GPU = 6.97 M tok/s/MW; P90 intvty 106.5, E2E-norm 42.7, E2E 24.3 s, TTFT 2.54 s</title><path d="M251.3,254.4 L256.5,259.6 L251.3,264.8 L246.1,259.6 Z"/><circle class="hit" cx="251.3" cy="259.6" r="9"/></g>
+<text class="plab s-gbs" x="257.3" y="253.6">c60</text>
+<g class="pt s-gbs"><title>GB300 dynamo-SGLang c180 (2P x16G / 1D x16G), InferenceX id 447852, 2026-11-10: 26,305 tok/s/GPU = 12.41 M tok/s/MW; P90 intvty 79.9, E2E-norm 28.8, E2E 33.3 s, TTFT 5.50 s</title><path d="M325.1,196.4 L330.3,201.6 L325.1,206.8 L319.9,201.6 Z"/><circle class="hit" cx="325.1" cy="201.6" r="9"/></g>
+<text class="plab s-gbs" x="331.1" y="195.6">c180</text>
+<g class="pt s-gbs"><title>GB300 dynamo-SGLang c340 (3P x24G / 1D x16G), InferenceX id 447853, 2026-11-10: 34,066 tok/s/GPU = 16.07 M tok/s/MW; P90 intvty 59.5, E2E-norm 20.7, E2E 44.3 s, TTFT 9.38 s</title><path d="M415.1,157.4 L420.3,162.6 L415.1,167.8 L409.9,162.6 Z"/><circle class="hit" cx="415.1" cy="162.6" r="9"/></g>
+<text class="plab s-gbs" x="421.1" y="156.6">c340</text>
+<g class="pt s-gbs"><title>GB300 dynamo-SGLang c520 (4P x32G / 1D x16G), InferenceX id 447854, 2026-11-10: 35,364 tok/s/GPU = 16.68 M tok/s/MW; P90 intvty 46.4, E2E-norm 14.0, E2E 55.5 s, TTFT 12.47 s</title><path d="M506.7,150.9 L511.9,156.1 L506.7,161.3 L501.5,156.1 Z"/><circle class="hit" cx="506.7" cy="156.1" r="9"/></g>
+<text class="plab s-gbs" x="512.7" y="150.1">c520</text>
+<path class="fr s-gbv" d="M125.4,300.5 L134.6,289.4 L160.4,270.6 L256.3,191.2 L318.2,149.1 L519.0,76.0" stroke-dasharray="2 3"/>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c1 agg (agg 16G), InferenceX id 448196, 2026-11-17: 1,566 tok/s/GPU = 0.74 M tok/s/MW; P90 intvty 463.0, E2E-norm 91.4, E2E 12.2 s, TTFT 1.49 s</title><path d="M152.4,320.9 L157.1,330.3 L147.7,330.3 Z"/><circle class="hit" cx="152.4" cy="326.1" r="9"/></g>
+<text class="plab s-gbv" x="158.4" y="342.1">c1 agg</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c44 (1P x8G / 5D x40G), InferenceX id 448198, 2026-11-17: 6,654 tok/s/GPU = 3.14 M tok/s/MW; P90 intvty 277.0, E2E-norm 98.7, E2E 9.0 s, TTFT 1.49 s</title><path d="M125.4,295.3 L130.1,304.7 L120.7,304.7 Z"/><circle class="hit" cx="125.4" cy="300.5" r="9"/></g>
+<text class="plab s-gbv" x="131.4" y="294.5">c44</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c56 (1P x8G / 3D x24G), InferenceX id 448197, 2026-11-17: 12,596 tok/s/GPU = 5.94 M tok/s/MW; P90 intvty 170.1, E2E-norm 75.7, E2E 13.2 s, TTFT 1.71 s</title><path d="M160.4,265.4 L165.1,274.8 L155.7,274.8 Z"/><circle class="hit" cx="160.4" cy="270.6" r="9"/></g>
+<text class="plab s-gbv" x="166.4" y="264.6">c56</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c56 (1P x8G / 5D x40G), InferenceX id 448199, 2026-11-17: 8,873 tok/s/GPU = 4.19 M tok/s/MW; P90 intvty 230.9, E2E-norm 82.6, E2E 10.1 s, TTFT 1.77 s</title><path d="M134.6,284.2 L139.3,293.6 L129.9,293.6 Z"/><circle class="hit" cx="134.6" cy="289.4" r="9"/></g>
+<text class="plab s-gbv" x="140.6" y="283.4">c56</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c256 (2P x16G / 1D x32G), InferenceX id 448201, 2026-11-17: 28,377 tok/s/GPU = 13.39 M tok/s/MW; P90 intvty 97.0, E2E-norm 32.4, E2E 24.9 s, TTFT 4.05 s</title><path d="M256.3,186.0 L261.0,195.4 L251.6,195.4 Z"/><circle class="hit" cx="256.3" cy="191.2" r="9"/></g>
+<text class="plab s-gbv" x="262.3" y="185.2">c256</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c448 (3P x24G / 1D x32G), InferenceX id 448202, 2026-11-17: 36,747 tok/s/GPU = 17.33 M tok/s/MW; P90 intvty 77.4, E2E-norm 22.4, E2E 32.5 s, TTFT 7.84 s</title><path d="M318.2,143.9 L322.9,153.3 L313.5,153.3 Z"/><circle class="hit" cx="318.2" cy="149.1" r="9"/></g>
+<text class="plab s-gbv" x="324.2" y="143.1">c448</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c960 (2P x32G / 1D x32G), InferenceX id 448200, 2026-11-17: 51,268 tok/s/GPU = 24.18 M tok/s/MW; P90 intvty 46.9, E2E-norm 11.4, E2E 57.0 s, TTFT 15.18 s</title><path d="M519.0,70.8 L523.7,80.2 L514.3,80.2 Z"/><circle class="hit" cx="519.0" cy="76.0" r="9"/></g>
+<text class="plab s-gbv" x="525.0" y="70.0">c960</text>
+<path class="fr s-frz" d="M84.4,324.0 L101.0,301.0 L114.3,283.8 L118.8,278.6 L126.8,266.8 L155.9,237.5 L166.1,229.9 L194.0,205.6 L211.6,199.6 L235.6,188.7 L312.8,95.7" stroke-dasharray="5 4"/>
+<g class="pt s-frz"><title>C1 (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C1-a1093683: 1,342 tok/s/GPU = 0.41 M tok/s/MW; P90 intvty 778.6, E2E-norm 328.8, E2E 6.5 s, TTFT 0.36 s</title><rect x="101.0" y="325.5" width="8.4" height="8.4"/><circle class="hit" cx="105.2" cy="329.7" r="9"/></g>
+<text class="plab s-frz" x="111.2" y="323.7">C1</text>
+<g class="pt s-frz"><title>C16 1P2D (1P2D: P TP8+DCP8, 2 x D TP16+DCP16 (k7), 40 GPUs), run k31vr-frozen-sweep-20261114/runs/C16-1P2D-a1096999: 3,104 tok/s/GPU = 0.94 M tok/s/MW; P90 intvty 600.6, E2E-norm 293.5, E2E 3.9 s, TTFT 0.39 s</title><rect x="80.2" y="319.8" width="8.4" height="8.4"/><circle class="hit" cx="84.4" cy="324.0" r="9"/></g>
+<text class="plab s-frz" x="90.4" y="307.0">C16 1P2D</text>
+<g class="pt s-frz"><title>C8 (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C8-a1093682: 2,890 tok/s/GPU = 0.88 M tok/s/MW; P90 intvty 529.7, E2E-norm 326.7, E2E 4.7 s, TTFT 0.35 s</title><rect x="86.5" y="320.5" width="8.4" height="8.4"/><circle class="hit" cx="90.7" cy="324.7" r="9"/></g>
+<text class="plab s-frz" x="96.7" y="318.7">C8</text>
+<g class="pt s-frz"><title>C72 1P3D (1P3D: P TP8+DCP8, 3 x D TP16+DCP16 (k7), 56 GPUs), run k31vr-frozen-sweep-20261114/runs/C72-1P3D-a1098025: 10,221 tok/s/GPU = 3.10 M tok/s/MW; P90 intvty 397.5, E2E-norm 140.0, E2E 6.0 s, TTFT 1.08 s</title><rect x="96.8" y="296.8" width="8.4" height="8.4"/><circle class="hit" cx="101.0" cy="301.0" r="9"/></g>
+<text class="plab s-frz" x="107.0" y="295.0">C72 1P3D</text>
+<g class="pt s-frz"><title>C48 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C48-1P1D-a1093681: 15,544 tok/s/GPU = 4.71 M tok/s/MW; P90 intvty 296.1, E2E-norm 158.1, E2E 7.6 s, TTFT 0.73 s</title><rect x="110.1" y="279.6" width="8.4" height="8.4"/><circle class="hit" cx="114.3" cy="283.8" r="9"/></g>
+<text class="plab s-frz" x="120.3" y="266.8">C48 1P1D</text>
+<g class="pt s-frz"><title>C96 1P2D (1P2D: P TP8+DCP8, 2 x D TP16+DCP16, 40 GPUs), run k31vr-frozen-sweep-20261114/runs/C96-1P2D-a1093473: 17,132 tok/s/GPU = 5.19 M tok/s/MW; P90 intvty 290.3, E2E-norm 106.3, E2E 8.2 s, TTFT 1.51 s</title><rect x="114.6" y="274.4" width="8.4" height="8.4"/><circle class="hit" cx="118.8" cy="278.6" r="9"/></g>
+<text class="plab s-frz" x="124.8" y="250.6">C96 1P2D</text>
+<g class="pt s-frz"><title>C96 1P2D k3 (1P2D: P TP8+DCP8, 2 x D TP16+DCP16 (k3, lookup flag on), 40 GPUs), run k31vr-frozen-sweep-20261114/runs/C96-1P2D-k3-a1097000: 16,963 tok/s/GPU = 5.14 M tok/s/MW; P90 intvty 289.8, E2E-norm 91.3, E2E 8.9 s, TTFT 1.91 s</title><rect x="120.5" y="275.0" width="8.4" height="8.4"/><circle class="hit" cx="124.7" cy="279.2" r="9"/></g>
+<text class="plab s-frz" x="130.7" y="273.2">C96 1P2D k3</text>
+<g class="pt s-frz"><title>C64 (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C64-a1093680: 20,778 tok/s/GPU = 6.30 M tok/s/MW; P90 intvty 232.8, E2E-norm 128.7, E2E 9.1 s, TTFT 0.85 s</title><rect x="122.6" y="262.6" width="8.4" height="8.4"/><circle class="hit" cx="126.8" cy="266.8" r="9"/></g>
+<text class="plab s-frz" x="132.8" y="238.8">C64</text>
+<g class="pt s-frz"><title>C112 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16 (k3), 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C112-1P1D-a1094730: 29,863 tok/s/GPU = 9.05 M tok/s/MW; P90 intvty 186.3, E2E-norm 60.2, E2E 12.7 s, TTFT 2.75 s</title><rect x="151.7" y="233.3" width="8.4" height="8.4"/><circle class="hit" cx="155.9" cy="237.5" r="9"/></g>
+<text class="plab s-frz" x="161.9" y="231.5">C112 1P1D</text>
+<g class="pt s-frz"><title>C128 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag off), 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C128-1P1D-a1096270: 32,194 tok/s/GPU = 9.76 M tok/s/MW; P90 intvty 184.6, E2E-norm 53.0, E2E 13.9 s, TTFT 3.20 s</title><rect x="161.9" y="225.7" width="8.4" height="8.4"/><circle class="hit" cx="166.1" cy="229.9" r="9"/></g>
+<text class="plab s-frz" x="172.1" y="212.9">C128 1P1D</text>
+<g class="pt s-frz"><title>C128 1P1D llh (1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag on), 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C128-1P1D-llh-a1096428: 31,660 tok/s/GPU = 9.59 M tok/s/MW; P90 intvty 184.5, E2E-norm 38.7, E2E 16.7 s, TTFT 6.80 s</title><rect x="184.6" y="227.5" width="8.4" height="8.4"/><circle class="hit" cx="188.8" cy="231.7" r="9"/></g>
+<text class="plab s-frz" x="194.8" y="225.7">C128 1P1D llh</text>
+<g class="pt s-frz"><title>C160 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C160-1P1D-a1093679: 38,569 tok/s/GPU = 11.69 M tok/s/MW; P90 intvty 170.4, E2E-norm 27.2, E2E 18.7 s, TTFT 6.89 s</title><rect x="201.0" y="205.1" width="8.4" height="8.4"/><circle class="hit" cx="205.2" cy="209.3" r="9"/></g>
+<text class="plab s-frz" x="211.2" y="192.3">C160 1P1D</text>
+<g class="pt s-frz"><title>C160 1P1D llh (1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag on), 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C160-1P1D-llh-a1096427: 39,734 tok/s/GPU = 12.04 M tok/s/MW; P90 intvty 161.6, E2E-norm 42.3, E2E 17.3 s, TTFT 4.67 s</title><rect x="189.8" y="201.4" width="8.4" height="8.4"/><circle class="hit" cx="194.0" cy="205.6" r="9"/></g>
+<text class="plab s-frz" x="200.0" y="199.6">C160 1P1D llh</text>
+<g class="pt s-frz"><title>C160 2P1D (2P1D: 2 x P TP8+DCP8, D TP16+DCP16, 32 GPUs), run k31vr-frozen-sweep-20261114/runs/C160-2P1D-a1094590: 31,049 tok/s/GPU = 9.41 M tok/s/MW; P90 intvty 161.3, E2E-norm 73.5, E2E 14.5 s, TTFT 1.64 s</title><rect x="166.8" y="229.4" width="8.4" height="8.4"/><circle class="hit" cx="171.0" cy="233.6" r="9"/></g>
+<text class="plab s-frz" x="177.0" y="249.6">C160 2P1D</text>
+<g class="pt s-frz"><title>C224 2P1D (2P1D: 2 x P TP8+DCP8, D TP16+DCP16, 32 GPUs), run k31vr-frozen-sweep-20261114/runs/C224-2P1D-a1093685: 41,591 tok/s/GPU = 12.60 M tok/s/MW; P90 intvty 113.1, E2E-norm 54.6, E2E 19.5 s, TTFT 1.88 s</title><rect x="207.4" y="195.4" width="8.4" height="8.4"/><circle class="hit" cx="211.6" cy="199.6" r="9"/></g>
+<text class="plab s-frz" x="217.6" y="171.6">C224 2P1D</text>
+<g class="pt s-frz"><title>C256 2P1D (2P1D: 2 x P TP8+DCP8, D TP16+DCP16, 32 GPUs), run k31vr-frozen-sweep-20261114/runs/C256-2P1D-a1095076: 44,940 tok/s/GPU = 13.62 M tok/s/MW; P90 intvty 99.9, E2E-norm 44.1, E2E 22.4 s, TTFT 2.43 s</title><rect x="231.4" y="184.5" width="8.4" height="8.4"/><circle class="hit" cx="235.6" cy="188.7" r="9"/></g>
+<text class="plab s-frz" x="241.6" y="182.7">C256 2P1D</text>
+<g class="pt s-frz"><title>C512 (1P1D hybrid: P and D each DP4 x (TP4+DCP4), EP16, 32 GPUs), run k31vr-frozen-sweep-20261114/runs/C512-a1093684: 73,736 tok/s/GPU = 22.34 M tok/s/MW; P90 intvty 80.3, E2E-norm 20.2, E2E 31.8 s, TTFT 6.43 s</title><rect x="308.6" y="91.5" width="8.4" height="8.4"/><circle class="hit" cx="312.8" cy="95.7" r="9"/></g>
+<text class="plab s-frz" x="318.8" y="89.7">C512</text>
+<path class="fr s-rel" d="M97.6,329.6 L102.2,282.5 L111.2,264.4 L147.5,226.9"/>
+<g class="pt s-rel"><title>C1 (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-release-draft-sweep-20261117/runs/C1-a1118776: 1,359 tok/s/GPU = 0.41 M tok/s/MW; P90 intvty 901.4, E2E-norm 332.2, E2E 5.6 s, TTFT 0.40 s</title><circle cx="97.6" cy="329.6" r="4.2"/><circle class="hit" cx="97.6" cy="329.6" r="9"/></g>
+<text class="plab s-rel" x="103.6" y="345.6">C1</text>
+<g class="pt s-rel"><title>C48 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-release-draft-sweep-20261117/runs/C48-1P1D-a1118778: 15,934 tok/s/GPU = 4.83 M tok/s/MW; P90 intvty 367.2, E2E-norm 177.8, E2E 6.1 s, TTFT 0.71 s</title><circle cx="102.2" cy="282.5" r="4.2"/><circle class="hit" cx="102.2" cy="282.5" r="9"/></g>
+<text class="plab s-rel" x="108.2" y="276.5">C48 1P1D</text>
+<g class="pt s-rel"><title>C64 (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-release-draft-sweep-20261117/runs/C64-a1118777: 21,527 tok/s/GPU = 6.52 M tok/s/MW; P90 intvty 300.0, E2E-norm 136.3, E2E 7.2 s, TTFT 0.96 s</title><circle cx="111.2" cy="264.4" r="4.2"/><circle class="hit" cx="111.2" cy="264.4" r="9"/></g>
+<text class="plab s-rel" x="117.2" y="258.4">C64</text>
+<g class="pt s-rel"><title>C128 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag off), 24 GPUs), run k31vr-release-draft-sweep-20261117/runs/C128-1P1D-a1118779: 33,119 tok/s/GPU = 10.04 M tok/s/MW; P90 intvty 212.2, E2E-norm 61.5, E2E 11.6 s, TTFT 3.00 s</title><circle cx="147.5" cy="226.9" r="4.2"/><circle class="hit" cx="147.5" cy="226.9" r="9"/></g>
+<text class="plab s-rel" x="153.5" y="220.9">C128 1P1D</text>
+</svg></figure>
+<figure class="pfig"><svg class="pchart" viewBox="0 0 560 380" role="img" aria-label="Throughput per MW vs P90 TTFT (s)">
+<line class="grid" x1="52" x2="544" y1="334.0" y2="334.0"/><text class="tick" x="46" y="338.0" text-anchor="end">0</text>
+<line class="grid" x1="52" x2="544" y1="227.3" y2="227.3"/><text class="tick" x="46" y="231.3" text-anchor="end">10.0</text>
+<line class="grid" x1="52" x2="544" y1="120.7" y2="120.7"/><text class="tick" x="46" y="124.7" text-anchor="end">20.0</text>
+<line class="grid" x1="52" x2="544" y1="14.0" y2="14.0"/><text class="tick" x="46" y="18.0" text-anchor="end">30.0</text>
+<line class="grid" x1="52.0" x2="52.0" y1="14" y2="334"/><text class="tick" x="52.0" y="350" text-anchor="middle">0</text>
+<line class="grid" x1="175.0" x2="175.0" y1="14" y2="334"/><text class="tick" x="175.0" y="350" text-anchor="middle">5</text>
+<line class="grid" x1="298.0" x2="298.0" y1="14" y2="334"/><text class="tick" x="298.0" y="350" text-anchor="middle">10.0</text>
+<line class="grid" x1="421.0" x2="421.0" y1="14" y2="334"/><text class="tick" x="421.0" y="350" text-anchor="middle">15.0</text>
+<line class="grid" x1="544.0" x2="544.0" y1="14" y2="334"/><text class="tick" x="544.0" y="350" text-anchor="middle">20.0</text>
+<line class="axis" x1="52" x2="544" y1="334" y2="334"/><line class="axis" x1="52" x2="52" y1="14" y2="334"/>
+<text class="axlab" x="298" y="372" text-anchor="middle">P90 TTFT (s) — lower is better</text>
+<text class="axlab" transform="translate(13,174) rotate(-90)" text-anchor="middle">M tok/s per MW (input + output)</text>
+<path class="fr s-gbs" d="M77.3,323.0 L95.0,320.4 L102.6,302.7 L108.9,283.6 L114.5,259.6 L187.3,201.6 L282.7,162.6 L358.8,156.1" stroke-dasharray="8 3 2 3"/>
+<g class="pt s-gbs"><title>GB300 dynamo-SGLang c2 agg (agg 16G), InferenceX id 447846, 2026-11-10: 1,450 tok/s/GPU = 0.68 M tok/s/MW; P90 intvty 423.7, E2E-norm 87.0, E2E 13.7 s, TTFT 2.32 s</title><path d="M109.1,321.5 L114.3,326.7 L109.1,331.9 L103.9,326.7 Z"/><circle class="hit" cx="109.1" cy="326.7" r="9"/></g>
+<text class="plab s-gbs" x="115.1" y="320.7">c2 agg</text>
+<g class="pt s-gbs"><title>GB300 dynamo-SGLang c4 agg (agg 16G), InferenceX id 447847, 2026-11-10: 2,177 tok/s/GPU = 1.03 M tok/s/MW; P90 intvty 326.8, E2E-norm 105.1, E2E 11.7 s, TTFT 1.03 s</title><path d="M77.3,317.8 L82.5,323.0 L77.3,328.2 L72.1,323.0 Z"/><circle class="hit" cx="77.3" cy="323.0" r="9"/></g>
+<text class="plab s-gbs" x="83.3" y="306.0">c4 agg</text>
+<g class="pt s-gbs"><title>GB300 dynamo-SGLang c16 (1P x8G / 4D x32G), InferenceX id 447850, 2026-11-10: 2,695 tok/s/GPU = 1.27 M tok/s/MW; P90 intvty 220.3, E2E-norm 70.0, E2E 11.4 s, TTFT 1.75 s</title><path d="M95.0,315.2 L100.2,320.4 L95.0,325.6 L89.8,320.4 Z"/><circle class="hit" cx="95.0" cy="320.4" r="9"/></g>
+<text class="plab s-gbs" x="101.0" y="336.4">c16</text>
+<g class="pt s-gbs"><title>GB300 dynamo-SGLang c36 (1P x8G / 4D x32G), InferenceX id 447851, 2026-11-10: 6,224 tok/s/GPU = 2.94 M tok/s/MW; P90 intvty 185.2, E2E-norm 62.8, E2E 13.8 s, TTFT 2.06 s</title><path d="M102.6,297.5 L107.8,302.7 L102.6,307.9 L97.4,302.7 Z"/><circle class="hit" cx="102.6" cy="302.7" r="9"/></g>
+<text class="plab s-gbs" x="108.6" y="285.7">c36</text>
+<g class="pt s-gbs"><title>GB300 dynamo-SGLang c50 (1P x8G / 3D x24G), InferenceX id 447849, 2026-11-10: 10,014 tok/s/GPU = 4.72 M tok/s/MW; P90 intvty 142.9, E2E-norm 49.9, E2E 17.1 s, TTFT 2.31 s</title><path d="M108.9,278.4 L114.1,283.6 L108.9,288.8 L103.7,283.6 Z"/><circle class="hit" cx="108.9" cy="283.6" r="9"/></g>
+<text class="plab s-gbs" x="114.9" y="266.6">c50</text>
+<g class="pt s-gbs"><title>GB300 dynamo-SGLang c60 (1P x8G / 1D x16G), InferenceX id 447848, 2026-11-10: 14,786 tok/s/GPU = 6.97 M tok/s/MW; P90 intvty 106.5, E2E-norm 42.7, E2E 24.3 s, TTFT 2.54 s</title><path d="M114.5,254.4 L119.7,259.6 L114.5,264.8 L109.3,259.6 Z"/><circle class="hit" cx="114.5" cy="259.6" r="9"/></g>
+<text class="plab s-gbs" x="120.5" y="253.6">c60</text>
+<g class="pt s-gbs"><title>GB300 dynamo-SGLang c180 (2P x16G / 1D x16G), InferenceX id 447852, 2026-11-10: 26,305 tok/s/GPU = 12.41 M tok/s/MW; P90 intvty 79.9, E2E-norm 28.8, E2E 33.3 s, TTFT 5.50 s</title><path d="M187.3,196.4 L192.5,201.6 L187.3,206.8 L182.1,201.6 Z"/><circle class="hit" cx="187.3" cy="201.6" r="9"/></g>
+<text class="plab s-gbs" x="193.3" y="195.6">c180</text>
+<g class="pt s-gbs"><title>GB300 dynamo-SGLang c340 (3P x24G / 1D x16G), InferenceX id 447853, 2026-11-10: 34,066 tok/s/GPU = 16.07 M tok/s/MW; P90 intvty 59.5, E2E-norm 20.7, E2E 44.3 s, TTFT 9.38 s</title><path d="M282.7,157.4 L287.9,162.6 L282.7,167.8 L277.5,162.6 Z"/><circle class="hit" cx="282.7" cy="162.6" r="9"/></g>
+<text class="plab s-gbs" x="288.7" y="156.6">c340</text>
+<g class="pt s-gbs"><title>GB300 dynamo-SGLang c520 (4P x32G / 1D x16G), InferenceX id 447854, 2026-11-10: 35,364 tok/s/GPU = 16.68 M tok/s/MW; P90 intvty 46.4, E2E-norm 14.0, E2E 55.5 s, TTFT 12.47 s</title><path d="M358.8,150.9 L364.0,156.1 L358.8,161.3 L353.6,156.1 Z"/><circle class="hit" cx="358.8" cy="156.1" r="9"/></g>
+<text class="plab s-gbs" x="364.8" y="150.1">c520</text>
+<path class="fr s-gbv" d="M88.6,300.5 L94.0,270.6 L151.7,191.2 L244.9,149.1 L425.5,76.0" stroke-dasharray="2 3"/>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c1 agg (agg 16G), InferenceX id 448196, 2026-11-17: 1,566 tok/s/GPU = 0.74 M tok/s/MW; P90 intvty 463.0, E2E-norm 91.4, E2E 12.2 s, TTFT 1.49 s</title><path d="M88.7,320.9 L93.4,330.3 L84.0,330.3 Z"/><circle class="hit" cx="88.7" cy="326.1" r="9"/></g>
+<text class="plab s-gbv" x="94.7" y="353.1">c1 agg</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c44 (1P x8G / 5D x40G), InferenceX id 448198, 2026-11-17: 6,654 tok/s/GPU = 3.14 M tok/s/MW; P90 intvty 277.0, E2E-norm 98.7, E2E 9.0 s, TTFT 1.49 s</title><path d="M88.6,295.3 L93.3,304.7 L83.9,304.7 Z"/><circle class="hit" cx="88.6" cy="300.5" r="9"/></g>
+<text class="plab s-gbv" x="94.6" y="272.5">c44</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c56 (1P x8G / 3D x24G), InferenceX id 448197, 2026-11-17: 12,596 tok/s/GPU = 5.94 M tok/s/MW; P90 intvty 170.1, E2E-norm 75.7, E2E 13.2 s, TTFT 1.71 s</title><path d="M94.0,265.4 L98.7,274.8 L89.3,274.8 Z"/><circle class="hit" cx="94.0" cy="270.6" r="9"/></g>
+<text class="plab s-gbv" x="100.0" y="253.6">c56</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c56 (1P x8G / 5D x40G), InferenceX id 448199, 2026-11-17: 8,873 tok/s/GPU = 4.19 M tok/s/MW; P90 intvty 230.9, E2E-norm 82.6, E2E 10.1 s, TTFT 1.77 s</title><path d="M95.6,284.2 L100.3,293.6 L90.9,293.6 Z"/><circle class="hit" cx="95.6" cy="289.4" r="9"/></g>
+<text class="plab s-gbv" x="101.6" y="283.4">c56</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c256 (2P x16G / 1D x32G), InferenceX id 448201, 2026-11-17: 28,377 tok/s/GPU = 13.39 M tok/s/MW; P90 intvty 97.0, E2E-norm 32.4, E2E 24.9 s, TTFT 4.05 s</title><path d="M151.7,186.0 L156.4,195.4 L147.0,195.4 Z"/><circle class="hit" cx="151.7" cy="191.2" r="9"/></g>
+<text class="plab s-gbv" x="157.7" y="185.2">c256</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c448 (3P x24G / 1D x32G), InferenceX id 448202, 2026-11-17: 36,747 tok/s/GPU = 17.33 M tok/s/MW; P90 intvty 77.4, E2E-norm 22.4, E2E 32.5 s, TTFT 7.84 s</title><path d="M244.9,143.9 L249.6,153.3 L240.2,153.3 Z"/><circle class="hit" cx="244.9" cy="149.1" r="9"/></g>
+<text class="plab s-gbv" x="250.9" y="143.1">c448</text>
+<g class="pt s-gbv"><title>GB300 dynamo-vLLM c960 (2P x32G / 1D x32G), InferenceX id 448200, 2026-11-17: 51,268 tok/s/GPU = 24.18 M tok/s/MW; P90 intvty 46.9, E2E-norm 11.4, E2E 57.0 s, TTFT 15.18 s</title><path d="M425.5,70.8 L430.2,80.2 L420.8,80.2 Z"/><circle class="hit" cx="425.5" cy="76.0" r="9"/></g>
+<text class="plab s-gbv" x="431.5" y="70.0">c960</text>
+<path class="fr s-frz" d="M60.6,324.7 L61.5,324.0 L69.9,283.8 L73.0,266.8 L92.3,233.6 L98.2,199.6 L111.7,188.7 L210.2,95.7" stroke-dasharray="5 4"/>
+<g class="pt s-frz"><title>C1 (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C1-a1093683: 1,342 tok/s/GPU = 0.41 M tok/s/MW; P90 intvty 778.6, E2E-norm 328.8, E2E 6.5 s, TTFT 0.36 s</title><rect x="56.8" y="325.5" width="8.4" height="8.4"/><circle class="hit" cx="61.0" cy="329.7" r="9"/></g>
+<text class="plab s-frz" x="67.0" y="323.7">C1</text>
+<g class="pt s-frz"><title>C16 1P2D (1P2D: P TP8+DCP8, 2 x D TP16+DCP16 (k7), 40 GPUs), run k31vr-frozen-sweep-20261114/runs/C16-1P2D-a1096999: 3,104 tok/s/GPU = 0.94 M tok/s/MW; P90 intvty 600.6, E2E-norm 293.5, E2E 3.9 s, TTFT 0.39 s</title><rect x="57.3" y="319.8" width="8.4" height="8.4"/><circle class="hit" cx="61.5" cy="324.0" r="9"/></g>
+<text class="plab s-frz" x="67.5" y="318.0">C16 1P2D</text>
+<g class="pt s-frz"><title>C8 (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C8-a1093682: 2,890 tok/s/GPU = 0.88 M tok/s/MW; P90 intvty 529.7, E2E-norm 326.7, E2E 4.7 s, TTFT 0.35 s</title><rect x="56.4" y="320.5" width="8.4" height="8.4"/><circle class="hit" cx="60.6" cy="324.7" r="9"/></g>
+<text class="plab s-frz" x="66.6" y="340.7">C8</text>
+<g class="pt s-frz"><title>C72 1P3D (1P3D: P TP8+DCP8, 3 x D TP16+DCP16 (k7), 56 GPUs), run k31vr-frozen-sweep-20261114/runs/C72-1P3D-a1098025: 10,221 tok/s/GPU = 3.10 M tok/s/MW; P90 intvty 397.5, E2E-norm 140.0, E2E 6.0 s, TTFT 1.08 s</title><rect x="74.3" y="296.8" width="8.4" height="8.4"/><circle class="hit" cx="78.5" cy="301.0" r="9"/></g>
+<text class="plab s-frz" x="84.5" y="295.0">C72 1P3D</text>
+<g class="pt s-frz"><title>C48 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C48-1P1D-a1093681: 15,544 tok/s/GPU = 4.71 M tok/s/MW; P90 intvty 296.1, E2E-norm 158.1, E2E 7.6 s, TTFT 0.73 s</title><rect x="65.7" y="279.6" width="8.4" height="8.4"/><circle class="hit" cx="69.9" cy="283.8" r="9"/></g>
+<text class="plab s-frz" x="75.9" y="277.8">C48 1P1D</text>
+<g class="pt s-frz"><title>C96 1P2D (1P2D: P TP8+DCP8, 2 x D TP16+DCP16, 40 GPUs), run k31vr-frozen-sweep-20261114/runs/C96-1P2D-a1093473: 17,132 tok/s/GPU = 5.19 M tok/s/MW; P90 intvty 290.3, E2E-norm 106.3, E2E 8.2 s, TTFT 1.51 s</title><rect x="84.9" y="274.4" width="8.4" height="8.4"/><circle class="hit" cx="89.1" cy="278.6" r="9"/></g>
+<text class="plab s-frz" x="95.1" y="272.6">C96 1P2D</text>
+<g class="pt s-frz"><title>C96 1P2D k3 (1P2D: P TP8+DCP8, 2 x D TP16+DCP16 (k3, lookup flag on), 40 GPUs), run k31vr-frozen-sweep-20261114/runs/C96-1P2D-k3-a1097000: 16,963 tok/s/GPU = 5.14 M tok/s/MW; P90 intvty 289.8, E2E-norm 91.3, E2E 8.9 s, TTFT 1.91 s</title><rect x="94.8" y="275.0" width="8.4" height="8.4"/><circle class="hit" cx="99.0" cy="279.2" r="9"/></g>
+<text class="plab s-frz" x="105.0" y="273.2">C96 1P2D k3</text>
+<g class="pt s-frz"><title>C64 (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C64-a1093680: 20,778 tok/s/GPU = 6.30 M tok/s/MW; P90 intvty 232.8, E2E-norm 128.7, E2E 9.1 s, TTFT 0.85 s</title><rect x="68.8" y="262.6" width="8.4" height="8.4"/><circle class="hit" cx="73.0" cy="266.8" r="9"/></g>
+<text class="plab s-frz" x="79.0" y="260.8">C64</text>
+<g class="pt s-frz"><title>C112 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16 (k3), 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C112-1P1D-a1094730: 29,863 tok/s/GPU = 9.05 M tok/s/MW; P90 intvty 186.3, E2E-norm 60.2, E2E 12.7 s, TTFT 2.75 s</title><rect x="115.5" y="233.3" width="8.4" height="8.4"/><circle class="hit" cx="119.7" cy="237.5" r="9"/></g>
+<text class="plab s-frz" x="125.7" y="231.5">C112 1P1D</text>
+<g class="pt s-frz"><title>C128 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag off), 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C128-1P1D-a1096270: 32,194 tok/s/GPU = 9.76 M tok/s/MW; P90 intvty 184.6, E2E-norm 53.0, E2E 13.9 s, TTFT 3.20 s</title><rect x="126.6" y="225.7" width="8.4" height="8.4"/><circle class="hit" cx="130.8" cy="229.9" r="9"/></g>
+<text class="plab s-frz" x="136.8" y="212.9">C128 1P1D</text>
+<g class="pt s-frz"><title>C128 1P1D llh (1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag on), 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C128-1P1D-llh-a1096428: 31,660 tok/s/GPU = 9.59 M tok/s/MW; P90 intvty 184.5, E2E-norm 38.7, E2E 16.7 s, TTFT 6.80 s</title><rect x="215.1" y="227.5" width="8.4" height="8.4"/><circle class="hit" cx="219.3" cy="231.7" r="9"/></g>
+<text class="plab s-frz" x="225.3" y="225.7">C128 1P1D llh</text>
+<g class="pt s-frz"><title>C160 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C160-1P1D-a1093679: 38,569 tok/s/GPU = 11.69 M tok/s/MW; P90 intvty 170.4, E2E-norm 27.2, E2E 18.7 s, TTFT 6.89 s</title><rect x="217.3" y="205.1" width="8.4" height="8.4"/><circle class="hit" cx="221.5" cy="209.3" r="9"/></g>
+<text class="plab s-frz" x="227.5" y="203.3">C160 1P1D</text>
+<g class="pt s-frz"><title>C160 1P1D llh (1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag on), 24 GPUs), run k31vr-frozen-sweep-20261114/runs/C160-1P1D-llh-a1096427: 39,734 tok/s/GPU = 12.04 M tok/s/MW; P90 intvty 161.6, E2E-norm 42.3, E2E 17.3 s, TTFT 4.67 s</title><rect x="162.6" y="201.4" width="8.4" height="8.4"/><circle class="hit" cx="166.8" cy="205.6" r="9"/></g>
+<text class="plab s-frz" x="172.8" y="199.6">C160 1P1D llh</text>
+<g class="pt s-frz"><title>C160 2P1D (2P1D: 2 x P TP8+DCP8, D TP16+DCP16, 32 GPUs), run k31vr-frozen-sweep-20261114/runs/C160-2P1D-a1094590: 31,049 tok/s/GPU = 9.41 M tok/s/MW; P90 intvty 161.3, E2E-norm 73.5, E2E 14.5 s, TTFT 1.64 s</title><rect x="88.1" y="229.4" width="8.4" height="8.4"/><circle class="hit" cx="92.3" cy="233.6" r="9"/></g>
+<text class="plab s-frz" x="98.3" y="227.6">C160 2P1D</text>
+<g class="pt s-frz"><title>C224 2P1D (2P1D: 2 x P TP8+DCP8, D TP16+DCP16, 32 GPUs), run k31vr-frozen-sweep-20261114/runs/C224-2P1D-a1093685: 41,591 tok/s/GPU = 12.60 M tok/s/MW; P90 intvty 113.1, E2E-norm 54.6, E2E 19.5 s, TTFT 1.88 s</title><rect x="94.0" y="195.4" width="8.4" height="8.4"/><circle class="hit" cx="98.2" cy="199.6" r="9"/></g>
+<text class="plab s-frz" x="104.2" y="193.6">C224 2P1D</text>
+<g class="pt s-frz"><title>C256 2P1D (2P1D: 2 x P TP8+DCP8, D TP16+DCP16, 32 GPUs), run k31vr-frozen-sweep-20261114/runs/C256-2P1D-a1095076: 44,940 tok/s/GPU = 13.62 M tok/s/MW; P90 intvty 99.9, E2E-norm 44.1, E2E 22.4 s, TTFT 2.43 s</title><rect x="107.5" y="184.5" width="8.4" height="8.4"/><circle class="hit" cx="111.7" cy="188.7" r="9"/></g>
+<text class="plab s-frz" x="117.7" y="171.7">C256 2P1D</text>
+<g class="pt s-frz"><title>C512 (1P1D hybrid: P and D each DP4 x (TP4+DCP4), EP16, 32 GPUs), run k31vr-frozen-sweep-20261114/runs/C512-a1093684: 73,736 tok/s/GPU = 22.34 M tok/s/MW; P90 intvty 80.3, E2E-norm 20.2, E2E 31.8 s, TTFT 6.43 s</title><rect x="206.0" y="91.5" width="8.4" height="8.4"/><circle class="hit" cx="210.2" cy="95.7" r="9"/></g>
+<text class="plab s-frz" x="216.2" y="89.7">C512</text>
+<path class="fr s-rel" d="M61.8,329.6 L69.4,282.5 L75.6,264.4 L125.9,226.9"/>
+<g class="pt s-rel"><title>C1 (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-release-draft-sweep-20261117/runs/C1-a1118776: 1,359 tok/s/GPU = 0.41 M tok/s/MW; P90 intvty 901.4, E2E-norm 332.2, E2E 5.6 s, TTFT 0.40 s</title><circle cx="61.8" cy="329.6" r="4.2"/><circle class="hit" cx="61.8" cy="329.6" r="9"/></g>
+<text class="plab s-rel" x="67.8" y="301.6">C1</text>
+<g class="pt s-rel"><title>C48 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-release-draft-sweep-20261117/runs/C48-1P1D-a1118778: 15,934 tok/s/GPU = 4.83 M tok/s/MW; P90 intvty 367.2, E2E-norm 177.8, E2E 6.1 s, TTFT 0.71 s</title><circle cx="69.4" cy="282.5" r="4.2"/><circle class="hit" cx="69.4" cy="282.5" r="9"/></g>
+<text class="plab s-rel" x="75.4" y="276.5">C48 1P1D</text>
+<g class="pt s-rel"><title>C64 (1P1D: P TP8+DCP8, D TP16+DCP16, 24 GPUs), run k31vr-release-draft-sweep-20261117/runs/C64-a1118777: 21,527 tok/s/GPU = 6.52 M tok/s/MW; P90 intvty 300.0, E2E-norm 136.3, E2E 7.2 s, TTFT 0.96 s</title><circle cx="75.6" cy="264.4" r="4.2"/><circle class="hit" cx="75.6" cy="264.4" r="9"/></g>
+<text class="plab s-rel" x="81.6" y="247.4">C64</text>
+<g class="pt s-rel"><title>C128 1P1D (1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag off), 24 GPUs), run k31vr-release-draft-sweep-20261117/runs/C128-1P1D-a1118779: 33,119 tok/s/GPU = 10.04 M tok/s/MW; P90 intvty 212.2, E2E-norm 61.5, E2E 11.6 s, TTFT 3.00 s</title><circle cx="125.9" cy="226.9" r="4.2"/><circle class="hit" cx="125.9" cy="226.9" r="9"/></g>
+<text class="plab s-rel" x="131.9" y="220.9">C128 1P1D</text>
+</svg></figure>
+</div>
+<!-- /PARETO -->
+<p class="muted fn">Data sources:
+VR200 frozen sweep: <a href="https://github.com/Inferact/nvidia-vllm-agentx/tree/wzhao/k31-agentx-dev/results/k31vr-frozen-sweep-20261114">results/k31vr-frozen-sweep-20261114</a> (<code>points.json</code>, <code>runs/</code>).
+VR200 release-draft sweep: <a href="https://github.com/Inferact/nvidia-vllm-agentx/tree/wzhao/k31-agentx-dev/results/k31vr-release-draft-sweep-20261117">results/k31vr-release-draft-sweep-20261117</a> (<code>points.json</code>, <code>runs/</code>).
+GB300: SemiAnalysis InferenceX public API, <a href="https://inferencex.semianalysis.com/api/v1/benchmarks?model=Kimi-K3.1-Pro">inferencex.semianalysis.com/api/v1/benchmarks?model=Kimi-K3.1-Pro</a>, fetched 2026-11-17. The latest curve per framework is used: dynamo-vLLM 2026-11-17 (DSpark preview draft) and dynamo-SGLang 2026-11-10 (DFlash2 preview). Extract: <a href="https://github.com/Inferact/nvidia-vllm-agentx/tree/wzhao/k31-agentx-dev/k31vr/data">k31vr/data/gb300_inferencex.json</a>.
+Charts are generated by <a href="https://github.com/Inferact/nvidia-vllm-agentx/tree/wzhao/k31-agentx-dev/k31vr/tools">k31vr/tools/pareto_html.py</a>.</p>
 
 <h2>Workstreams</h2>
 <div class="tw"><table>
@@ -200,6 +601,13 @@ footer{margin-top:40px;color:var(--muted);font-size:13px}
 <li>Cause: <strong>Mooncake capacity</strong>. The store is 7.62 TiB at 84-93% full, with 22 eviction rounds per hour. About 50% of contexts are lost after 8.5 min idle, and 93% after 10 min.</li>
 <li>Writes average 885 MB per request against a minimum of about 567. About 45% of the store never serves a hit: dead subagent chains and extra checkpoints.</li>
 <li>Turn-0 sharing loses 1,096 tokens per request to 16K state alignment and missing junction states.</li>
+</ul></div>
+<div class="card"><h3>GB300 on InferenceX (fetched 2026-11-17)</h3>
+<ul class="rules">
+<li>GB300 dynamo-vLLM published a new curve today: 7 points, C1-C960, with the DSpark preview draft. At high throughput it now runs 2P/3P prefill to 1 decode.</li>
+<li>Its max is 51.3K tok/s/GPU at C960 (x 47, TTFT p90 15.2 s). That is <strong>24.2 M tok/s per MW</strong>, above our frozen C512's 22.3 (73.7K tok/s/GPU at x 80).</li>
+<li>Per GPU, VR200 leads at every interactivity. Per MW, the GB300 high-throughput tail now passes our best point, but only at x below 50.</li>
+<li>GB300 dynamo-SGLang (2026-11-10, DFlash2) tops out at 35.4K tok/s/GPU at C520.</li>
 </ul></div>
 <div class="card"><h3>SGLang comparison (PR #1910)</h3>
 <ul class="rules">
