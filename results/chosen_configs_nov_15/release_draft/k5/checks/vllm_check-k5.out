@@ -1,0 +1,60 @@
+# vllm_check.py (this release_draft copy) on the 8 k5 renders (Hecate scratch dsrel/k5cfg/renders/dsrelk5-*), overlay k5audit, CPU (gpurun.sh k5audit "")
+PASS 8 renders match /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/renders/dsrelk5-*
+PASS dsrelk5-c128-1p1d-ev-spx prefill: dspark k=5 backend=FLASH_ATTN
+PASS dsrelk5-c128-1p1d-ev-spx prefill: dspark k=5 backend=FLASH_ATTN: block rejection
+PASS dsrelk5-c128-1p1d-ev-spx prefill: dspark k=5 backend=FLASH_ATTN: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrelk5-c128-1p1d-ev-spx decode: dspark k=5 backend=FLASH_ATTN
+PASS dsrelk5-c128-1p1d-ev-spx decode: dspark k=5 backend=FLASH_ATTN: block rejection
+PASS dsrelk5-c128-1p1d-ev-spx decode: dspark k=5 backend=FLASH_ATTN: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrelk5-c128-1p1d-ev-xdr prefill: dspark k=5 backend=FLASH_ATTN
+PASS dsrelk5-c128-1p1d-ev-xdr prefill: dspark k=5 backend=FLASH_ATTN: block rejection
+PASS dsrelk5-c128-1p1d-ev-xdr prefill: dspark k=5 backend=FLASH_ATTN: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrelk5-c128-1p1d-ev-xdr decode: dspark k=5 backend=FLASH_ATTN
+PASS dsrelk5-c128-1p1d-ev-xdr decode: dspark k=5 backend=FLASH_ATTN: block rejection
+PASS dsrelk5-c128-1p1d-ev-xdr decode: dspark k=5 backend=FLASH_ATTN: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrelk5-c128-1p1d-spx prefill: dspark k=5 backend=FLASH_ATTN
+PASS dsrelk5-c128-1p1d-spx prefill: dspark k=5 backend=FLASH_ATTN: synthetic AL 3.81 -> rates [1.0, 1.0, 0.81, 0.0, 0.0]
+PASS dsrelk5-c128-1p1d-spx prefill: dspark k=5 backend=FLASH_ATTN: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrelk5-c128-1p1d-spx decode: dspark k=5 backend=FLASH_ATTN
+PASS dsrelk5-c128-1p1d-spx decode: dspark k=5 backend=FLASH_ATTN: synthetic AL 3.81 -> rates [1.0, 1.0, 0.81, 0.0, 0.0]
+PASS dsrelk5-c128-1p1d-spx decode: dspark k=5 backend=FLASH_ATTN: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrelk5-c128-1p1d-xdr prefill: dspark k=5 backend=FLASH_ATTN
+PASS dsrelk5-c128-1p1d-xdr prefill: dspark k=5 backend=FLASH_ATTN: synthetic AL 3.81 -> rates [1.0, 1.0, 0.81, 0.0, 0.0]
+PASS dsrelk5-c128-1p1d-xdr prefill: dspark k=5 backend=FLASH_ATTN: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrelk5-c128-1p1d-xdr decode: dspark k=5 backend=FLASH_ATTN
+PASS dsrelk5-c128-1p1d-xdr decode: dspark k=5 backend=FLASH_ATTN: synthetic AL 3.81 -> rates [1.0, 1.0, 0.81, 0.0, 0.0]
+PASS dsrelk5-c128-1p1d-xdr decode: dspark k=5 backend=FLASH_ATTN: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrelk5-c160-1p1d-llh-ev-spx prefill: dspark k=5 backend=FLASH_ATTN
+PASS dsrelk5-c160-1p1d-llh-ev-spx prefill: dspark k=5 backend=FLASH_ATTN: block rejection
+PASS dsrelk5-c160-1p1d-llh-ev-spx prefill: dspark k=5 backend=FLASH_ATTN: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrelk5-c160-1p1d-llh-ev-spx decode: dspark k=5 backend=FLASH_ATTN
+PASS dsrelk5-c160-1p1d-llh-ev-spx decode: dspark k=5 backend=FLASH_ATTN: block rejection
+PASS dsrelk5-c160-1p1d-llh-ev-spx decode: dspark k=5 backend=FLASH_ATTN: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrelk5-c160-1p1d-llh-ev-xdr prefill: dspark k=5 backend=FLASH_ATTN
+PASS dsrelk5-c160-1p1d-llh-ev-xdr prefill: dspark k=5 backend=FLASH_ATTN: block rejection
+PASS dsrelk5-c160-1p1d-llh-ev-xdr prefill: dspark k=5 backend=FLASH_ATTN: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrelk5-c160-1p1d-llh-ev-xdr decode: dspark k=5 backend=FLASH_ATTN
+PASS dsrelk5-c160-1p1d-llh-ev-xdr decode: dspark k=5 backend=FLASH_ATTN: block rejection
+PASS dsrelk5-c160-1p1d-llh-ev-xdr decode: dspark k=5 backend=FLASH_ATTN: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrelk5-c160-1p1d-llh-spx prefill: dspark k=5 backend=FLASH_ATTN
+PASS dsrelk5-c160-1p1d-llh-spx prefill: dspark k=5 backend=FLASH_ATTN: synthetic AL 3.81 -> rates [1.0, 1.0, 0.81, 0.0, 0.0]
+PASS dsrelk5-c160-1p1d-llh-spx prefill: dspark k=5 backend=FLASH_ATTN: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrelk5-c160-1p1d-llh-spx decode: dspark k=5 backend=FLASH_ATTN
+PASS dsrelk5-c160-1p1d-llh-spx decode: dspark k=5 backend=FLASH_ATTN: synthetic AL 3.81 -> rates [1.0, 1.0, 0.81, 0.0, 0.0]
+PASS dsrelk5-c160-1p1d-llh-spx decode: dspark k=5 backend=FLASH_ATTN: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrelk5-c160-1p1d-llh-xdr prefill: dspark k=5 backend=FLASH_ATTN
+PASS dsrelk5-c160-1p1d-llh-xdr prefill: dspark k=5 backend=FLASH_ATTN: synthetic AL 3.81 -> rates [1.0, 1.0, 0.81, 0.0, 0.0]
+PASS dsrelk5-c160-1p1d-llh-xdr prefill: dspark k=5 backend=FLASH_ATTN: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS dsrelk5-c160-1p1d-llh-xdr decode: dspark k=5 backend=FLASH_ATTN
+PASS dsrelk5-c160-1p1d-llh-xdr decode: dspark k=5 backend=FLASH_ATTN: synthetic AL 3.81 -> rates [1.0, 1.0, 0.81, 0.0, 0.0]
+PASS dsrelk5-c160-1p1d-llh-xdr decode: dspark k=5 backend=FLASH_ATTN: draft /raid/common-models/kimi-k3.1-pro-dspark is an extra_mount target (host /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626)
+PASS draft /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626: vLLM config architectures ['Qwen3DSparkModel']
+PASS draft: layer_types ['sliding_attention', 'sliding_attention', 'sliding_attention', 'sliding_attention', 'sliding_attention'], sliding_window 2048
+PASS draft: heads q 96 kv 16 dim 64
+PASS draft: eagle_aux_hidden_state_layer_ids [76, 80, 84, 88, 92]
+PASS draft: markov_rank 512, sample_from_anchor True
+PASS draft at TP8: 12 q / 2 kv heads per rank
+PASS draft at TP16: 6 q / 1 kv heads per rank
+PASS FLASH_ATTN (the renders' draft backend) accepts the GQA draft layers on sm_107 (head 64, bf16 KV, block 1024, sliding window, KV connector, no DCP): reasons []
+PASS negative control: TOKENSPEED_MLA (the frozen renders' value) rejects the GQA draft layers (block 1024): ['head_size not supported', 'kv_cache_dtype not supported', 'non-MLA not supported', 'sliding window not supported']
+VLLM_CHECK PASS: 0 failure(s), 8 renders, drafts {'/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/jh/noquant/cfg2/deps/kimi-k3.1-pro-dspark-e4e6e626': 16}

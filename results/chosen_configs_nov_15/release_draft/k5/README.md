@@ -84,6 +84,10 @@ python3 tools/gen_dsrel.py --k-override C128-1P1D=5,C160-1P1D-llh=5 \
 - `check-k5-20261116T2130.out`: `check_dsrel.py` on those 8 renders gives `CHECK_DSREL PASS: 0 failure(s), 2 warning(s)`
   over 475 checks. It includes srtctl `load_config` and RuntimeContext mounts, and `srtctl render` with preflight.
   The 2 warnings say the frozen tree lacks the release-draft code.
+- `vllm_check-k5.out`: `vllm_check.py` on the 8 renders gives `VLLM_CHECK PASS`.
+  - vLLM's SpeculativeConfig parses k=5 on both roles and resolves AL 3.81 to the rates [1, 1, 0.81, 0, 0].
+  - FLASH_ATTN accepts the draft layers.
+  - The release checkpoint loads as the GQA DSpark draft.
 - K = k identity: `--k-override ...=3` gives byte-for-byte the `dsrel-*` renders except names and the DSREL.txt k lines.
   The base `dsrel-*` output of the new generator equals the previous generator's except its md5 line.
   `--k-override C64=5` (k7 -> k5) also derives cleanly.
@@ -123,10 +127,21 @@ Release drafter, 90 drafter batches B2-B160 (query rows B*5 = 10..800, context r
   PreparedDraftAr rows and ArNormRows residency, MarkovWide plans.
 - LM head: evict-first at B5-B6, the stock cuBLAS shard GEMM elsewhere. These are GQA_WIDE_LM_HEAD's measured choices.
 - Split-K projections run up to 64 rows (B <= 12), cuBLAS above.
-- **The one open piece is the attention.** It is the fused GQA window kernel, track K's
-  `cutedsl.draft.gqa_attention.install_gqa_attention`, which is not in this tree. On a strict deployment
-  `GqaDraftFastPath.build` refuses it at any k. At k5 its installer must cover query rows 10..800 and context rows
-  12..960 over these 90 batches. The integrated tree must also hold the k5 rows; no draft.py change is needed for k5.
+- **The attention refuses at k5: a real gap, patch `gqa_window_k5.patch`.** The drafter's attention is track K's fused
+  GQA window kernel (`cutedsl/draft/gqa_attention.py`, not in this tree; read from overlay `dsrel/ov/attn3`, md5
+  a87bdcfe).
+  - Its launch-shape table `GQA_WINDOW` is keyed by (KV heads per rank, draft length) and has k3 / k7 rows only.
+  - `install_gqa_attention` therefore finds no shape for any k5 batch (`checks/gqa_window_k5.out`) and refuses on the
+    strict TP16 = DCP16 decode: "no GQA_WINDOW launch shape for rows [...]".
+  - The patch adds `(1, 5)` with `(1, 3)`'s shapes. k5's 30 query rows per (request, KV head) fill the same two 16-row
+    M tiles as k3's 18, so every shape builds alike and keeps k3's CTA count per batch.
+  - With the patch, all 90 k5 batches have a shape and every shape builds at 1024- and 4096-token pages
+    (`check_gqa_window_k5.py`: GQA_WINDOW_K5 PASS).
+  - On 1 VR200 GPU, track K's `test_window_matches_stock` at TP16 q5 passes for B1-B128 in both draft-cache layouts
+    (1024-token rows, 128-token slots): cache bytes equal stock's, rows within BF16 noise (`checks/gqa_attn_k5_gpu.out`).
+  - NQ-TUNE: a q5 `--shape` sweep (`bench_gqa_attention_int.py`) at B16-B48.
+  - The context K/V insert (`gqa_context_kv`) does not depend on the draft length.
+  - No `runtime/draft.py` change is needed for k5.
 
 GPU (16 ranks): see Measurement below. JIT warmup: the ksweep's k6 (q7) release-drafter run failed with
 `JIT_WARMUP_GAP Triton _causal_conv1d_update_kernel (seqlen=7, ...)` (`dsrel/results/ksweep-6a14e2f/c160k6-relfa.log`).
@@ -135,3 +150,16 @@ The q6 runs below show whether q6 has one.
 ## Measurement
 
 (see the section appended below)
+
+## Files
+
+- `configs/<point>/{agentx,gsm8k}`: the k5 renders, repo mirror of the chosen fabric.
+- `coverage_k5.py`: the CPU coverage audit, k3 vs k5 (target step plan and drafter GQA tables).
+- `gqa_window_k5.patch`: the `(1, 5)` GQA_WINDOW row for track K's `cutedsl/draft/gqa_attention.py`, against overlay
+  attn3's file (md5 a87bdcfe -> c3494526).
+- `check_gqa_window_k5.py`: the patch's CPU check (launch shapes and GqaWindow builds at k5 / k3 / k7).
+- `bench/`:
+  - the two hold-queue tasks: the k5 / k3 A/B, and the k5 production-list full capture;
+  - `mk_bench_cfg.py`, which writes the latter's bench-only config;
+  - `k5ab_table.py`, the A/B table and projection.
+- `checks/`: generation, render checks, vllm_check, tests, coverage audit, GQA_WINDOW checks, bench results.
