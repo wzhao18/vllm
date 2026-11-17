@@ -1,0 +1,1 @@
+{"label": "C48", "out": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/outputs/a1118778-dsrel-c48-1p1d-xdr-1117115323", "gpus": 24, "ok": 8441, "err": 1, "span_min": 60.1, "tput_per_gpu": 15933.9, "p90_itl_ms": 2.723, "p90_intvty": 367.22, "p90_e2e_norm_intvty": 177.82, "p90_e2el_s": 6.124, "p90_ttft_s": 0.709, "p50_ttft_s": 0.252}

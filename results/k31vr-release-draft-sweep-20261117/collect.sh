@@ -6,7 +6,7 @@
 set -eo pipefail
 LABEL=$1; TOPO=$2; AGX=$3; EV=$4
 H=$(cd "$(dirname "$0")" && pwd); J=$(basename "$AGX" | sed -E 's/^a([0-9]+)-.*/\1/')
-R=$H/runs/$LABEL-a$J; mkdir -p $R/agentx $R/gsm8k
+R=$H/runs/${LABEL// /-}-a$J; mkdir -p $R/agentx $R/gsm8k
 r() { for i in 1 2 3 4 5; do rsync -a $X "$@" && return 0; echo "rsync retry $i" >&2; sleep 20; done; return 1; }
 X="--exclude dloan --exclude otel --exclude tachometer --exclude *_timeslices.* --exclude __pycache__ --max-size=20m"
 r hecate:$AGX/ $R/agentx/; echo "source: $AGX" > $R/agentx/SOURCE.txt

@@ -53,7 +53,13 @@ How the projections were made (workflow `k31vr-pareto-projection`):
 
 Between x 96 and x 212 the release plan has no point. That band is where SGLang's C400-C720 rows sit.
 
-## Queued experiments
+## Status (2026-11-17 13:30 PST)
+
+Paused by the user: no sweep beyond the 8 baseline points. The experiment dispatcher is stopped, its holds are cancelled and the
+k5 variants are dropped from the baseline queue. The candidates below stay on record, and so does the max-throughput plan
+(k31vr-max-throughput workflow: P24+D16 at 86-89K projected, gated on decode and prefill microbenchmarks).
+
+## Queued experiments (paused)
 
 All four run on 8 nodes (32 GPUs) and are derived from existing renders without code changes. The renders are in
 `../../chosen_configs_nov_15/release_draft/next/configs`. Each runs AgentX plus its gsm8k twin on the same hold.
