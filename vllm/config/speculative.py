@@ -1618,6 +1618,7 @@ class SpeculativeConfig:
                     not in self.draft_model_config.architectures
                     and "Gemma4DSparkModel" not in self.draft_model_config.architectures
                     and "K3DSparkModel" not in self.draft_model_config.architectures
+                    and "K3GqaDSparkModel" not in self.draft_model_config.architectures
                     and "DSparkMiniMaxDraftModel"
                     not in self.draft_model_config.architectures
                 ):

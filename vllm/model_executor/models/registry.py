@@ -703,6 +703,10 @@ _SPECULATIVE_DECODING_MODELS = {
         "vllm.models.kimi_k3.nvidia.dspark_mla",
         "K3DSparkForCausalLM",
     ),
+    "K3GqaDSparkModel": (
+        "vllm.models.kimi_k3.nvidia.dspark_gqa",
+        "K3GqaDSparkForCausalLM",
+    ),
     "MuseSparkDSparkModel": (
         "vllm.models.muse_spark.common.dspark",
         "MuseSparkDSparkForCausalLM",

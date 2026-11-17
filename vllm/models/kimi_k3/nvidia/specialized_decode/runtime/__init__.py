@@ -259,7 +259,42 @@ def unsupported(vllm_config) -> str | None:
         reason = nvfp4_unsupported(vllm_config)
     if reason is None and sp:
         reason = sp_unsupported(vllm_config)
+    if reason is None:
+        reason = drafter_unsupported(vllm_config, sp)
     return reason
+
+
+# DSpark draft architectures whose drafters the specialized decode specializes
+# (``runtime.draft``): the preview MLA drafter (``dspark_mla``) and the release GQA
+# drafter (``dspark_gqa``).
+KIMI_DRAFTERS = ("K3DSparkModel", "K3GqaDSparkModel")
+
+
+def drafter_unsupported(vllm_config, sp) -> str | None:
+    """NQ-NOFALLBACK: on the deployments the no-fallback rule covers (Rubin TP16 =
+    DCP16 with DSpark, and the SP topology) a DSpark draft must be one of
+    KIMI_DRAFTERS; any other would draft every step on unspecialized stock modules."""
+    from vllm.platforms import current_platform
+
+    from ..shapes import target_topology
+
+    spec, parallel = vllm_config.speculative_config, vllm_config.parallel_config
+    draft = getattr(spec, "draft_model_config", None)
+    if spec is None or spec.method != "dspark" or draft is None:
+        return None
+    strict = sp or target_topology(
+        current_platform.is_device_capability((10, 7)),
+        parallel.tensor_parallel_size,
+        parallel.decode_context_parallel_size,
+        1 + spec.num_speculative_tokens,
+    )
+    architectures = tuple(draft.architectures or ())
+    if strict and not set(architectures) & set(KIMI_DRAFTERS):
+        return (
+            f"DSpark drafts {architectures} (the specialized drafters: "
+            f"{', '.join(KIMI_DRAFTERS)}; any other would draft on stock modules)"
+        )
+    return None
 
 
 # The SP topology's verify rows: max_num_seqs x q (the shared scratch, the DSA box

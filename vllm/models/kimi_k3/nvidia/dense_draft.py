@@ -3,7 +3,9 @@
 """Dense MLA draft support for Kimi K3.1 (DSA target).
 
 Dense EAGLE3 and DSpark drafts keep their own fp8 MLA cache and decode with
-FLASHINFER_MLA, or ROCM_AITER_MLA on ROCm (``configure_dense_draft``).
+FLASHINFER_MLA, or ROCM_AITER_MLA on ROCm (``configure_dense_draft``). The release
+GQA DSpark draft (Inferact/Kimi-K3.1-Pro-DSpark: a speculators ``dspark`` checkpoint,
+``Qwen3DSparkModel``) loads as ``dspark_gqa.K3GqaDSparkForCausalLM`` on CUDA.
 """
 
 from typing import Any
@@ -11,6 +13,34 @@ from typing import Any
 from vllm.config import SpeculativeConfig
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+# The release GQA DSpark draft's architecture on Kimi K3.1 (model registry:
+# vllm.models.kimi_k3.nvidia.dspark_gqa.K3GqaDSparkForCausalLM).
+GQA_DSPARK_ARCHITECTURE = "K3GqaDSparkModel"
+
+
+def is_gqa_dspark(spec_config: SpeculativeConfig | None) -> bool:
+    """Whether the deployment drafts with the release GQA DSpark draft."""
+    model = getattr(spec_config, "draft_model_config", None)
+    architectures = getattr(model, "architectures", None) or ()
+    return (
+        getattr(spec_config, "method", None) == "dspark"
+        and GQA_DSPARK_ARCHITECTURE in architectures
+    )
+
+
+def _route_gqa_dspark(spec_config: SpeculativeConfig) -> None:
+    """A Qwen3 DSpark GQA draft (speculators ``dspark`` -> ``Qwen3DSparkModel``) on a
+    Kimi K3.1 target loads as ``K3GqaDSparkForCausalLM`` (CUDA): the stock math with
+    the specialized decode's drafter hooks."""
+    config = spec_config.draft_model_config
+    if (
+        spec_config.method == "dspark"
+        and current_platform.is_cuda()
+        and list(config.architectures or ()) == ["Qwen3DSparkModel"]
+    ):
+        config.hf_config.architectures = [GQA_DSPARK_ARCHITECTURE]
+        spec_config.update_arch_()
 
 
 def configure_dense_draft(spec_config: SpeculativeConfig, text_config: Any) -> None:
@@ -36,5 +66,6 @@ def configure_dense_draft(spec_config: SpeculativeConfig, text_config: Any) -> N
     else:
         # GQA draft: its own cache, not the target's sparse backend or fp8_ds_mla.
         backend, kv_cache_dtype = AttentionBackendEnum.FLASH_ATTN, "auto"
+        _route_gqa_dspark(spec_config)
     spec_config.attention_backend = spec_config.attention_backend or backend
     spec_config.kv_cache_dtype = spec_config.kv_cache_dtype or kv_cache_dtype

@@ -28,6 +28,8 @@ stays on the stock path.
 import torch
 
 from vllm.logger import init_logger
+from vllm.triton_utils import tl, triton
+from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax, spec_step_seed
 
 from ..cutedsl.common.policy import batch_table
 from ..shapes import (
@@ -951,3 +953,1059 @@ class DraftFastPath:
             tuple(sorted(self.lm_batches)),
             tuple(sorted(self.wide_batches)),
         )
+
+
+# ---------------------------------------------------------------------------------
+# The release DSpark drafter (Inferact/Kimi-K3.1-Pro-DSpark: dspark_gqa
+# K3GqaDSparkForCausalLM, five sliding-window GQA layers of 96 query / 16 KV heads of
+# 64, a 35840 -> 7168 context fc, Markov rank 512, the target's embedding and LM
+# head; draft KV TP-sharded, not DCP-sharded). Its pieces are the preview drafter's
+# kernels on the GQA chain: the fused Markov sampling and LM head (unchanged shapes),
+# the sharded context step (fc shard + CtxGather with gamma = hidden_norm; the same
+# (448, 35840) shard at TP16), split-K projections for the GQA shapes, the Lamport
+# all-reduce + norm sites with ring / two-shot o_proj and down_proj producers, and
+# the fused GQA attention (cutedsl.draft.gqa_*, ``install_gqa_attention``).
+#
+# Strict (NQ-NOFALLBACK) on the target topology (Rubin TP16 = DCP16) and on C512's
+# SP decode role (TP4 = DCP4, ``runtime.sp_topology``): every captured drafter batch
+# runs every piece or the build refuses. Per-rank linear shapes (N, K):
+#
+#     linear     TP16           TP8            TP4
+#     qkv        (512, 7168)    (1024, 7168)   (2048, 7168)
+#     o_proj     (7168, 384)    (7168, 768)    (7168, 1536)
+#     gate_up    (1792, 7168)   (3584, 7168)   (7168, 7168)
+#     down       (7168, 896)    (7168, 1792)   (7168, 3584)
+#     ctx shard  (448, 35840)   (896, 35840)   (1792, 35840)
+#     ctx K/V    (640, 7168)    (1280, 7168)   (2560, 7168)
+#
+# At TP16 the row-keyed Markov / LM-head / context / site tables are the preview
+# drafter's (the same kernels at the same rows; NQ-TUNE: re-time the chain-level
+# site variants, SITE_DEFERRED / TWO_SHOT_EARLY, on the GQA chain at 16 ranks).
+
+GQA_HEADS, GQA_KV_HEADS, GQA_HEAD_DIM = 96, 16, 64
+GQA_HIDDEN, GQA_FFN, GQA_LAYERS, GQA_AUX = 7168, 14336, 5, 5
+
+
+def gqa_shapes(tp):
+    """The release drafter's per-rank (N, K) by linear at ``tp``."""
+    q = GQA_HEADS // tp * GQA_HEAD_DIM
+    kv = max(1, GQA_KV_HEADS // tp) * GQA_HEAD_DIM
+    return {
+        "qkv": (q + 2 * kv, GQA_HIDDEN),
+        "o_proj": (GQA_HIDDEN, q),
+        "gate_up": (2 * GQA_FFN // tp, GQA_HIDDEN),
+        "down": (GQA_HIDDEN, GQA_FFN // tp),
+        "ctx_shard": (GQA_HIDDEN // tp, GQA_AUX * GQA_HIDDEN),
+        "ctx_kv": (GQA_LAYERS * 2 * kv, GQA_HIDDEN),
+    }
+
+
+# Drafter GEMMs of at most PROJECTION_ROWS rows (B1 at k7, B2 at k3): split-K tactics
+# by (N, K) (cutedsl.gemm.projection; an FP32 accumulation reorder), per TP, on Rubin.
+# The (1792, 7168) / (7168, 896) / (448, 35840) entries are the preview drafter's
+# measured ones (PROJECTIONS: the same shapes); the GQA shapes from the release GEMM
+# bench (benchmarks/kernels/k31_vr/dsrel/bench_draft_gemm.py, 1 GPU, cold weights).
+# 1 GPU, cold weights, geometric mean over the bin's drafter rows, us (cuBLAS ->
+# split-K): TP16 qkv (512, 7168) 6-7 rows 4.34 -> 2.19, o_proj (7168, 384) 2.72 ->
+# 1.99, context K/V (640, 7168) 8 rows 5.07 -> 2.19.
+GQA_PROJECTIONS = {
+    16: {
+        (512, 7168): (64, 8, 7, 8),
+        (7168, 384): (64, 8, 1, 3),
+        (640, 7168): (64, 8, 8, 7),
+        (1792, 7168): PROJECTIONS[16][(1792, 7168)],
+        (7168, 896): PROJECTIONS[16][(7168, 896)],
+        (448, 35840): PROJECTIONS[16][(448, 35840)],
+    },
+    # TP4 (C512's SP decode role, DL3: 6 query / 8 context rows): qkv 6.21 -> 3.80,
+    # o_proj 3.91 -> 3.41, down 7.47 -> 5.99, context K/V 6.42 -> 4.21.
+    4: {
+        (2048, 7168): (64, 8, 4, 8),
+        (7168, 1536): (64, 8, 1, 8),
+        (7168, 3584): (64, 8, 1, 8),
+        (2560, 7168): (64, 8, 4, 8),
+    },
+}
+# Drafter GEMMs of 9-64 rows by row bin (largest rows, tactics by (N, K)), as
+# PROJECTIONS_WIDE; above the last bin cuBLAS (measured: NQ-NOFALLBACK coverage log).
+# TP16 (release GEMM bench, us cuBLAS -> split-K): qkv 9-15 rows 4.14 -> 2.42, 18-30
+# 3.99 -> 2.87, 33-63 4.26 -> 3.67; o_proj 9-15 2.28 -> 1.90, 18-30 2.25 -> 2.06
+# (33-63: cuBLAS 2.37 vs 2.62, kept); context K/V 12-16 4.68 -> 2.65, 20-32 4.11 ->
+# 2.92, 36-64 4.25 -> 3.70.
+GQA_PROJECTIONS_WIDE = {
+    16: (
+        (
+            16,
+            {
+                (512, 7168): (64, 8, 8, 7),
+                (7168, 384): (64, 16, 1, 3),
+                (640, 7168): (64, 8, 8, 7),
+                (1792, 7168): (64, 16, 4, 8),
+                (7168, 896): (64, 16, 1, 8),
+            },
+        ),
+        (
+            32,
+            {
+                (512, 7168): (64, 16, 4, 10),
+                (7168, 384): (64, 32, 1, 3),
+                (640, 7168): (64, 16, 4, 10),
+                (1792, 7168): (64, 32, 4, 6),
+            },
+        ),
+        (
+            64,
+            {
+                (512, 7168): (128, 64, 6, 14, 14),
+                (640, 7168): (128, 64, 6, 14, 14),
+                (1792, 7168): (128, 64, 6, 14, 14),
+            },
+        ),
+    ),
+    # TP4 (us cuBLAS -> split-K): qkv 9-15 6.16 -> 3.92, 18-30 5.76 -> 4.55, 33-63
+    # 6.59 -> 5.20; o_proj 9-15 3.93 -> 3.48, 18-30 4.06 -> 4.01 (33-63: cuBLAS 4.20
+    # vs 4.94, kept); down 9-15 7.96 -> 5.99, 18-30 7.70 -> 6.62, 33-63 8.71 -> 7.57;
+    # context K/V 12-16 6.44 -> 4.28, 20-32 6.73 -> 4.95, 36-64 7.47 -> 5.73. Above
+    # 64 rows cuBLAS (the M64 split-K loses there: TP16 qkv at 70 rows 6.49 vs 4.21).
+    4: (
+        (
+            16,
+            {
+                (2048, 7168): (64, 16, 4, 8),
+                (7168, 1536): (64, 16, 1, 8),
+                (7168, 3584): (64, 16, 1, 8),
+                (2560, 7168): (64, 16, 4, 8),
+            },
+        ),
+        (
+            32,
+            {
+                (2048, 7168): (64, 32, 4, 8),
+                (7168, 1536): (64, 32, 1, 8),
+                (7168, 3584): (64, 32, 1, 8),
+                (2560, 7168): (64, 32, 4, 8),
+            },
+        ),
+        (
+            64,
+            {
+                (2048, 7168): (128, 64, 6, 16, 14),
+                (7168, 3584): (64, 64, 1, 6),
+                (2560, 7168): (128, 64, 6, 16, 14),
+            },
+        ),
+    ),
+}
+# One-shot site rows' ring o_proj / down_proj producers and their gate/up (+ SiLU)
+# tactics (RING_PROJECTIONS' rule: every K tile staged before the PDL wait; o_proj's
+# 3 K tiles, the sweep's best at 6-7 rows too).
+GQA_RING_PROJECTIONS = {
+    16: {
+        (7168, 384): (64, 8, 1, 3),
+        (7168, 896): RING_PROJECTIONS[16][(7168, 896)],
+        (1792, 7168): RING_PROJECTIONS[16][(1792, 7168)],
+    },
+}
+# Markov / LM head / context step / sites: the preview drafter's tables at TP8 and
+# TP16 (the same kernels and rows).
+GQA_FUSED_MARKOV = dict(FUSED_MARKOV)
+GQA_SETTLED_MARKOV = dict(SETTLED_MARKOV)
+GQA_FAST_LM_HEAD = dict(FAST_LM_HEAD)
+GQA_WIDE_LM_HEAD = dict(WIDE_LM_HEAD)
+GQA_FAST_CONTEXT = dict(FAST_CONTEXT)
+GQA_FAST_AR = dict(FAST_AR)
+GQA_GATED_AR = dict(GATED_AR)
+GQA_SITE_DEFERRED = dict(SITE_DEFERRED)
+GQA_VALID_AR = dict(VALID_AR)
+GQA_TWO_SHOT_PRODUCERS = dict(TWO_SHOT_PRODUCERS)
+GQA_TWO_SHOT_SILU = dict(TWO_SHOT_SILU)
+GQA_TWO_SHOT_EARLY = dict(TWO_SHOT_EARLY)
+# The context step on a side stream joined before the first attention core: none
+# until measured on the GQA chain at 16 ranks (NQ-TUNE: the preview's 1-63 rows).
+GQA_CONTEXT_OVERLAP: dict[int, str] = {}
+# Requests per drafter graph whose Markov sampling runs ``VocabParallelMarkov`` (one
+# set of launches per draft position, no co-resident CTAs), per TP: TP4 (C512's SP
+# decode role), where the fused kernels' 320 CTAs per rank (Markov rank 512) exceed
+# VR200's resident CTAs.
+GQA_VP_MARKOV = {4: "1-:1"}
+# TP4 (C512's SP decode role: TP4 = DCP4, DL3 B2-B128 per DP rank, query rows 6-384,
+# context rows 8-512): the sharded context step (fc shard (1792, 35840), CtxGather at
+# every context row), the Lamport sites (one-shot to 7 rows, two-shot 8-64, ArNormRows
+# above) over stored partials. NQ-TUNE: the TP4 sites / producers on 4 ranks.
+GQA_FAST_CONTEXT[4] = "1-:1"
+GQA_FAST_AR[4] = "1-7:1,8-64:2,65-:3"
+
+
+def gqa_projection_tactic(shape, tp, rows):
+    """The GQA tables' split-K tactic of (N, K) at ``rows`` (None: cuBLAS)."""
+    shape = tuple(shape)
+    if rows <= PROJECTION_ROWS:
+        return GQA_PROJECTIONS.get(tp, {}).get(shape)
+    bins = GQA_PROJECTIONS_WIDE.get(tp, ())
+    table = next((t for top, t in bins if rows <= top), {})
+    return table.get(shape)
+
+
+def gqa_projection(weight, tp, rows):
+    """The prepared split-K projection of ``weight`` for ``rows`` (or None)."""
+    policies = {}
+    for r in rows:
+        tactic = gqa_projection_tactic(weight.shape, tp, r)
+        if tactic is not None:
+            policies[r] = tactic
+    if not policies:
+        return None
+    from ..cutedsl.gemm.projection import PreparedProjection
+
+    return PreparedProjection(weight, policies).prepare()
+
+
+def install_gqa_projections(model, tp, query_rows, context_rows, rank=0):
+    """Split-K projections for the drafter's per-layer linears (``query_rows``) and
+    its fused context K/V weight (``context_rows``; ``model.model._context_projection``,
+    the context step's K/V GEMM); returns how many were installed. The other rows run
+    cuBLAS (logged per shape: a measured choice, NQ-NOFALLBACK coverage)."""
+    inner = model.model
+    linears = []
+    for layer in inner.layers:
+        attn, mlp = layer.self_attn, layer.mlp
+        linears += [(attn.qkv_proj, query_rows), (attn.o_proj, query_rows)]
+        linears += [(mlp.gate_up_proj, query_rows), (mlp.down_proj, query_rows)]
+    installed = 0
+    stock: dict[tuple, set[int]] = {}
+    for linear, rows in linears:
+        if getattr(linear, "bias", None) is not None:
+            raise ValueError("Kimi K3.1 GQA DSpark drafter: biased linear")
+        prepared = gqa_projection(linear.weight, tp, rows)
+        served = set(prepared.kernels) if prepared is not None else set()
+        stock.setdefault(tuple(linear.weight.shape), set()).update(
+            r for r in rows if r not in served
+        )
+        if prepared is not None:
+            linear.quant_method = DraftProjectionMethod(linear.quant_method, prepared)
+            installed += 1
+    weight = getattr(inner, "_fused_kv_weight", None)
+    inner._context_projection = None
+    if weight is not None:
+        inner._context_projection = gqa_projection(weight, tp, context_rows)
+        served = inner._context_projection.kernels if inner._context_projection else {}
+        stock.setdefault(tuple(weight.shape), set()).update(
+            r for r in context_rows if r not in served
+        )
+        installed += inner._context_projection is not None
+    for shape, rows in sorted(stock.items()):
+        if rows:
+            log_coverage(
+                rank,
+                "draft linear",
+                f"(N, K) {shape}: stock cuBLAS at rows {sorted(rows)} (measured: "
+                "release GEMM bench)",
+            )
+    return installed
+
+
+class GqaContextWeights:
+    """``cutedsl.draft.context.PreparedContext``'s view of the release drafter: its
+    ``context_proj`` is ``fc`` and its ``context_norm`` is ``hidden_norm``
+    (``combine`` = hidden_norm(fc(aux)))."""
+
+    def __init__(self, inner):
+        self.context_proj, self.context_norm = inner.fc, inner.hidden_norm
+
+
+class GqaAttention:
+    """The fused GQA attention of the drafter's layers (``cutedsl.draft.gqa_*``,
+    ``install_gqa_attention``), as the layers call it: ``forward(index, qkv,
+    positions)`` (per-head q / k RMSNorm, RoPE, the K/V insert of the query block and
+    the sliding-window attention: the layer's o_proj input [rows, q_size], or None
+    when not covered) and ``store_context(kv, positions, slots)`` (the context K/V
+    epilogue over the context K/V GEMM's rows [C, L x 2 x kv_size]: per-layer k_norm,
+    RoPE, insert; False when not covered). ``state`` is the installer's prepared
+    state with the same two methods. NQ-NOFALLBACK: inside a FULL capture on a strict
+    deployment an uncovered call refuses instead of capturing the stock attention.
+    ``ready``: the side-stream context step's event the first layer waits for."""
+
+    def __init__(self, state, strict):
+        self.state, self.strict = state, strict
+        self.ready = None
+
+    def forward(self, index, qkv, positions):
+        if not torch.cuda.is_current_stream_capturing():
+            return None
+        if index == 0 and self.ready is not None:
+            torch.cuda.current_stream().wait_event(self.ready)
+            self.ready = None
+        out = self.state.forward(index, qkv, positions)
+        if out is None and self.strict and full_capture():
+            refuse("DSpark drafter attention", "not covered", Shape(qkv.shape[0]))
+        return out
+
+    def store_context(self, kv, positions, slots):
+        if not torch.cuda.is_current_stream_capturing():
+            return False
+        stored = bool(self.state.store_context(kv, positions, slots))
+        if not stored and self.strict and full_capture():
+            refuse("DSpark drafter context K/V", "not covered", Shape(kv.shape[0]))
+        return stored
+
+
+def install_gqa_attention_state(model, vllm_config, query_rows, context_rows, strict):
+    """The fused GQA attention's prepared state for the drafter's layers, or None
+    when it is not available (``cutedsl.draft.gqa_*`` not installed).
+    TODO(K31 dsrel track K): the fused GQA sliding-window attention kernel and its
+    installer ``install_gqa_attention(layers, vllm_config, query_rows, context_rows,
+    strict)`` (layers: the drafter's DFlashQwen3Attention modules) returning a state
+    with ``forward`` / ``store_context`` (``GqaAttention``)."""
+    try:
+        from ..cutedsl.draft.gqa_attention import install_gqa_attention
+    except ImportError:
+        return None
+    layers = [layer.self_attn for layer in model.model.layers]
+    return install_gqa_attention(layers, vllm_config, query_rows, context_rows, strict)
+
+
+class GqaSites:
+    """The release drafter's forward on ``PreparedDraftAr``'s Lamport all-reduce +
+    residual + RMSNorm sites (``ar``): ``PreparedDraftAr.run`` / ``run_polled`` with
+    the GQA layers (``attention_core``: qkv, attention; ``attention``: + o_proj) and
+    ``model.norm``; None (nothing launched) when not covered (strict: refuse inside a
+    FULL capture). 11 sites per step: the embedding, two per layer, the final norm."""
+
+    def __init__(self, ar):
+        self.ar = ar
+
+    @property
+    def rows(self):
+        return self.ar.rows
+
+    def run(self, model, input_ids, positions):
+        ar = self.ar
+        rows = input_ids.shape[0]
+        ar.stamp_index = 0
+        if not torch.cuda.is_current_stream_capturing():
+            return None  # eager: no graph, the stock layers and all-reduce
+        weight = getattr(model.embed_tokens, "weight", None)
+        checks = (
+            (rows not in ar.reduce, "rows without prepared sites"),
+            (input_ids.dtype != torch.int32, f"input ids {input_ids.dtype}"),
+            (not input_ids.is_contiguous(), "strided input ids"),
+            (weight is None, "no embedding"),
+            (
+                weight is not None and weight.shape[0] != ar.shard,
+                "an embedding shard other than the vocabulary / TP rows",
+            ),
+            (weight is not None and not weight.is_contiguous(), "a strided embedding"),
+            (model.has_separate_mask_embedding, "a separate mask embedding"),
+        )
+        reason = next((why for failed, why in checks if failed), None)
+        if reason is not None:
+            if ar.strict and full_capture():  # NQ-NOFALLBACK
+                refuse("DSpark drafter all-reduce sites", reason, Shape(rows))
+            return None
+        empty = lambda: torch.empty(  # noqa: E731
+            (rows, GQA_HIDDEN), dtype=weight.dtype, device=weight.device
+        )
+        # Site 0: the embedding rows from their owners (parity 0), normed.
+        ar.ring(input_ids, weight, ar.rank * ar.shard, ar.vocab, ar.embed_address(rows))
+        residual, hidden = empty(), empty()
+        layers = model.layers
+        embed = ar.polled_embed.get(rows, ar.embed[rows])
+        ar.site(embed, residual, residual, layers[0].input_layernorm, hidden, 0)
+        if rows in ar.polled:
+            return self.run_polled(model, rows, residual, hidden, positions, empty)
+        site = 1
+        for index, layer in enumerate(layers):
+            if index > 0:
+                normed = empty()
+                norm = layer.input_layernorm
+                ar.site(ar.reduce[rows], hidden, residual, norm, normed, site % 2)
+                residual, hidden, site = hidden, normed, site + 1
+            attn = layer.attention(positions, hidden)
+            normed = empty()
+            norm = layer.post_attention_layernorm
+            ar.site(ar.reduce[rows], attn, residual, norm, normed, site % 2)
+            residual, site = attn, site + 1
+            hidden = layer.mlp(normed)
+        out = empty()
+        ar.site(ar.reduce[rows], hidden, residual, model.norm, out, site % 2)
+        return out
+
+    def run_polled(self, model, rows, residual, hidden, positions, empty):
+        """The layers with ring (or two-shot pushing) o_proj / down_proj partials and
+        polled sites; the residual is updated in place."""
+        ar = self.ar
+        polled, site = ar.polled[rows], 1
+        two = rows in ar.two_rows
+        for index, layer in enumerate(model.layers):
+            o_proj, down = (ar.two_producers if two else ar.producers)[index]
+            if index > 0:  # the previous layer's down partials are in this site's slots
+                hidden = empty()
+                norm = layer.input_layernorm
+                ar.site(polled, residual, residual, norm, hidden, site % 2)
+                site += 1
+            attn_out = layer.attention_core(positions, hidden)
+            ar.publish(o_proj, attn_out, site % 2)
+            normed = empty()
+            norm = layer.post_attention_layernorm
+            ar.site(polled, residual, residual, norm, normed, site % 2)
+            site += 1
+            mlp, gate_up = layer.mlp, None
+            if two and ar.two_gate_up and rows in ar.two_gate_up[index].policies:
+                gate_up = ar.two_gate_up[index]
+            elif not two:
+                gate_up = ar.gate_up[index]
+            if gate_up is not None:
+                act = gate_up.run(normed, normed.new_empty((rows, gate_up.half)))
+            else:
+                act = mlp.act_fn(mlp.gate_up_proj(normed)[0])
+            ar.publish(down, act, site % 2)
+        out = empty()
+        ar.site(polled, residual, residual, model.norm, out, site % 2)
+        return out
+
+
+def gqa_checks(vllm_config, model):
+    """Why the release drafter's pieces cannot serve this draft (None: they can): the
+    geometry and math the kernels implement."""
+    inner = model.model
+    config = model.config
+    layers = list(inner.layers)
+    attn = layers[0].self_attn if layers else None
+    spec = vllm_config.speculative_config
+    sampled = spec.draft_sample_method == "probabilistic"
+    checks = (
+        (not layers, "no draft layers"),
+        (getattr(config, "hidden_size", 0) != GQA_HIDDEN, "a hidden size but 7168"),
+        (
+            not getattr(config, "sample_from_anchor", False),
+            "drafts that do not sample from the anchor",
+        ),
+        (getattr(config, "dspark_draft_topk", None) is not None, "top-k drafting"),
+        (attn is not None and attn.v_scale is not None, "an attention value scale"),
+        (
+            attn is not None and attn.attention_sink_bias is not None,
+            "attention sinks",
+        ),
+        (inner.has_separate_mask_embedding, "a separate mask embedding"),
+        (
+            any(
+                getattr(layer.self_attn.qkv_proj, "bias", None) is not None
+                for layer in layers
+            ),  # fmt: skip
+            "biased projections",
+        ),
+        (
+            model.logits_processor.scale != 1.0
+            or model.logits_processor.soft_cap is not None,
+            "a logit scale or soft cap",
+        ),
+        (
+            sampled and vllm_config.model_config.use_fp64_gumbel,
+            "FP64 Gumbel draws",
+        ),
+        (
+            sampled and getattr(vllm_config, "watermark_config", None) is not None,
+            "watermarked drafts",
+        ),
+    )
+    return next((why for failed, why in checks if failed), None)
+
+
+class GqaDraftFastPath(DraftFastPath):
+    """Per-rank prepared pieces of the release (GQA) drafter; built after the draft
+    weights load (``K3GqaDSparkForCausalLM.process_weights_after_loading``).
+    ``attention``: the layers' fused GQA attention (``GqaAttention``) or None."""
+
+    def __init__(
+        self, markov=None, batches=(), steps=7, tp=1, all_batches=(), sampled=False,
+        strict=False, rank=0, attention=None,
+    ):  # fmt: skip
+        super().__init__(markov, batches, steps, tp, all_batches, sampled, strict, rank)
+        rows = lambda table: frozenset(  # noqa: E731
+            b for b in all_batches if covered(table.get(tp, ""), b * steps, steps)
+        )
+        self.lm_batches = rows(GQA_FAST_LM_HEAD) & self.batches
+        self.wide_batches = rows(GQA_WIDE_LM_HEAD) & self.batches
+        self.overlap_batches = rows(GQA_CONTEXT_OVERLAP)
+        self.attention = attention
+
+    def context_overlap(self, model, num_reqs):
+        """GQA_CONTEXT_OVERLAP: the context step may run on a side stream (its
+        sharded context step and the fused attention, which takes the join, are
+        prepared)."""
+        inner = model.model
+        return (
+            num_reqs in self.overlap_batches
+            and self.attention is not None
+            and getattr(inner, "_fast_context", None) is not None
+        )
+
+    def defer_context_join(self, model, ready):
+        """The first layer's attention waits for ``ready`` before its core."""
+        self.attention.ready = ready
+
+    @classmethod
+    def build(cls, vllm_config, model):
+        """None unless the specialized decode is on and this device and deployment
+        are covered. ``model``: the K3GqaDSparkForCausalLM (weights loaded)."""
+        if not enabled(vllm_config):
+            return None
+        spec = vllm_config.speculative_config
+        if spec is None or spec.method != "dspark":
+            return None
+        device = torch.device(torch.cuda.current_device())
+        if torch.cuda.get_device_capability(device) != (10, 7):
+            return None
+        from vllm.distributed import get_tp_group
+
+        from . import sp_topology
+
+        group = get_tp_group()
+        tp, rank = group.world_size, group.rank_in_group
+        steps = spec.num_speculative_tokens
+        all_batches = draft_batches(vllm_config, steps)
+        dcp = vllm_config.parallel_config.decode_context_parallel_size
+        # NQ-NOFALLBACK: on the target topology (Rubin TP16 = DCP16) and C512's SP
+        # decode role (TP4 = DCP4) every drafter piece a captured graph runs is covered
+        # or the load is refused; elsewhere (out of scope) uncovered pieces keep the
+        # stock drafter path, logged.
+        strict = target_topology(True, tp, dcp, steps + 1) or sp_topology(vllm_config)
+
+        def fail(site, cause):
+            if strict:
+                refuse(site, cause)
+            logger.warning_once(
+                "Kimi K3.1 GQA DSpark drafter: %s keeps stock (%s)", site, cause
+            )
+
+        inner = model.model
+        layers = list(inner.layers)
+        reason = gqa_checks(vllm_config, model)
+        if reason is not None:
+            fail("DSpark drafter", reason)
+            return None
+        query_rows = [b * steps for b in all_batches]
+        context_rows = [b * (steps + 1) for b in all_batches]
+        top = max(all_batches, default=0)
+        top_rows = top * steps  # (the open query-row ranges end here)
+        policy = lambda table, r: covered(  # noqa: E731
+            closed(table.get(tp, ""), top_rows), r, steps
+        )
+
+        # Markov sampling over this rank's vocabulary shard: the fused kernels, or the
+        # per-position vocabulary-parallel launches (GQA_VP_MARKOV: TP4).
+        sampled = spec.draft_sample_method == "probabilistic"
+        head = inner.markov_head
+        markov_args = (head, tp, rank, steps, all_batches, top, sampled, fail)
+        if tp in GQA_VP_MARKOV:
+            markov, batches = cls.vp_markov(*markov_args)
+        else:
+            markov, batches = cls.fused_markov(*markov_args, group, device)
+        missing = [b for b in all_batches if b not in batches]
+        if missing:
+            fail("DSpark drafter Markov sampling", f"no Markov kernels for {missing}")
+
+        # The context step: the fc shard + Lamport row gather + hidden_norm.
+        context = [
+            r
+            for r in context_rows
+            if covered(
+                closed(GQA_FAST_CONTEXT.get(tp, ""), top * (steps + 1)), r, steps
+            )
+        ]
+        if context != context_rows:
+            fail(
+                "DSpark drafter context step",
+                f"GQA_FAST_CONTEXT misses {sorted(set(context_rows) - set(context))}",
+            )
+        if context and inner.fc.weight.shape[0] % tp:
+            fail(
+                "DSpark drafter context step",
+                f"fc rows {inner.fc.weight.shape[0]} not divisible by TP{tp}",
+            )
+            context = []
+        if context:
+            from ..cutedsl.draft.context import PreparedContext
+
+            prepared = PreparedContext(
+                GqaContextWeights(inner), group.device_group, tp, rank, context
+            )
+            prepared.strict = strict  # NQ-NOFALLBACK
+            inner._fast_context = prepared
+            logger.info_once(
+                "Kimi K3.1 GQA DSpark drafter: sharded context step for %s rows "
+                "(persistent row gather at %s)",
+                (*prepared.rows, *prepared.wide),
+                prepared.persistent,
+            )
+
+        installed = install_gqa_projections(model, tp, query_rows, context_rows, rank)
+        if installed:
+            logger.info_once(
+                "Kimi K3.1 GQA DSpark drafter: split-K projections on %d linears",
+                installed,
+            )
+
+        # The all-reduce + residual + RMSNorm sites (and their producers).
+        ar_rows = [r for r in query_rows if policy(GQA_FAST_AR, r)]
+        if query_rows and ar_rows != query_rows:
+            fail(
+                "DSpark drafter all-reduce sites",
+                f"GQA_FAST_AR misses rows {sorted(set(query_rows) - set(ar_rows))}",
+            )
+        if ar_rows:
+            from ..cutedsl.draft.allreduce import PreparedDraftAr
+
+            prepared_ar = PreparedDraftAr(
+                group.device_group,
+                device,
+                tp,
+                rank,
+                ar_rows,
+                model.config.vocab_size,
+                {r for r in ar_rows if policy(GQA_FAST_AR, r) == 2},
+                {r for r in ar_rows if policy(GQA_GATED_AR, r)},
+                {r for r in ar_rows if policy(GQA_TWO_SHOT_EARLY, r)},
+                {r for r in ar_rows if policy(GQA_VALID_AR, r)},
+                {r for r in ar_rows if policy(GQA_FAST_AR, r) == 3},
+            )
+            prepared_ar.strict = strict  # NQ-NOFALLBACK
+            unserved = sorted(set(query_rows) - set(prepared_ar.rows))
+            if unserved:
+                fail(
+                    "DSpark drafter all-reduce sites",
+                    f"query rows {unserved} have no Lamport sites",
+                )
+            if prepared_ar.rows:
+                cls.prepare_producers(prepared_ar, layers, tp, policy)
+                inner._fast_ar = GqaSites(prepared_ar)
+                logger.info_once(
+                    "Kimi K3.1 GQA DSpark drafter: Lamport all-reduce sites for %s "
+                    "rows (o_proj / down_proj publishing their partials for %s)",
+                    tuple(prepared_ar.rows),
+                    tuple(sorted(prepared_ar.polled)),
+                )
+
+        # The fused GQA attention (and the context K/V insert).
+        state = install_gqa_attention_state(
+            model, vllm_config, query_rows, context_rows, strict
+        )
+        attention = None
+        if state is None:
+            fail(
+                "DSpark drafter attention",
+                "the fused GQA drafter attention (cutedsl.draft.gqa_attention "
+                "install_gqa_attention) is not installed",
+            )
+        else:
+            attention = GqaAttention(state, strict)
+            for layer in layers:
+                layer.fast_attention = attention
+            inner._fast_context_kv = attention
+        logger.info_once(
+            "Kimi K3.1 GQA DSpark drafter: fused %s Markov sampling for draft batches "
+            "%s",
+            "probabilistic" if sampled else "greedy",
+            tuple(batches),
+        )
+        fast = cls(
+            markov, batches, steps, tp, all_batches, sampled, strict, rank, attention
+        )
+        lm = sorted(b * steps for b in fast.lm_batches)
+        wide_lm = sorted(b * steps for b in fast.wide_batches)
+        stock_lm = sorted(
+            b * steps
+            for b in batches
+            if b not in fast.lm_batches and b not in fast.wide_batches
+        )
+        log_coverage(
+            rank,
+            "draft LM head",
+            f"GEMV rows {lm}, evict-first GEMM rows {wide_lm}, stock cuBLAS shard "
+            f"GEMM rows {stock_lm} (GQA_WIDE_LM_HEAD: measured choices, as the "
+            "preview drafter's)",
+        )
+        return fast
+
+    @staticmethod
+    def fused_markov(head, tp, rank, steps, all_batches, top, sampled, fail, group,
+                     device):  # fmt: skip
+        """(PreparedMarkov, its batches) for GQA_FUSED_MARKOV's batches at ``tp`` (the
+        preview drafter's kernels and choices); each batch run once (every rank
+        together)."""
+        from ..cutedsl.draft.markov import (
+            MAX_WIDTH,
+            PreparedMarkov,
+            device_limits,
+            supports,
+        )
+
+        table = batch_table(closed(GQA_FUSED_MARKOV.get(tp, ""), top))
+        settle = batch_table(GQA_SETTLED_MARKOV.get(tp, ""))
+        batches = [b for b in all_batches if table.get(b)]
+        w1, w2 = head.markov_w1.weight, head.markov_w2.weight
+        if not batches:
+            return None, []
+        if not supports(w1.shape, w2.shape, tp, device_limits(device)):
+            fail(
+                "DSpark drafter Markov sampling",
+                f"Markov head {tuple(w2.shape)} at TP{tp} (rank, vocabulary split or "
+                "co-residency of the fused kernels)",
+            )
+            return None, []
+        markov = PreparedMarkov(
+            w1,
+            w2,
+            tp,
+            rank,
+            group.device_group,
+            steps,
+            gated=[b for b in batches if table.get(b) in (2, 3)],
+            staged=[b for b in batches if table.get(b) == 3],
+            settled=[b for b in batches if settle.get(b)],
+            wide=max(batches) > MAX_WIDTH,
+        )
+        uncovered = [b for b in batches if not markov.covers(b, sampled)]
+        if uncovered:  # NQ-NOFALLBACK
+            fail(
+                "DSpark drafter Markov sampling",
+                f"no MarkovWide launch fits this device at Markov rank "
+                f"{markov.markov_rank} for draft batches {tuple(uncovered)}",
+            )
+            batches = [b for b in batches if b not in uncovered]
+        for batch in batches:
+            markov.prepare(batch, steps, steps, sampled)
+        return (markov, batches) if batches else (None, [])
+
+    @staticmethod
+    def vp_markov(head, tp, rank, steps, all_batches, top, sampled, fail):
+        """(VocabParallelMarkov, its batches) for GQA_VP_MARKOV's batches at ``tp``;
+        each batch run once (every rank together)."""
+        table = batch_table(closed(GQA_VP_MARKOV.get(tp, ""), top))
+        batches = [b for b in all_batches if table.get(b)]
+        if not batches:
+            return None, []
+        try:
+            markov = VocabParallelMarkov(
+                head.markov_w1.weight, head.markov_w2.weight, tp, rank, steps
+            )
+        except ValueError as error:
+            fail("DSpark drafter Markov sampling", str(error))
+            return None, []
+        for batch in batches:
+            markov.prepare(batch, steps, steps, sampled)
+        return markov, batches
+
+    @staticmethod
+    def prepare_producers(prepared_ar, layers, tp, policy):
+        """The one-shot rows' ring o_proj / down_proj (+ fused gate/up SiLU), the
+        two-shot rows' pushing producers (+ fused gate/up SiLU), as the preview
+        drafter's build (``DraftFastPath.build``) with the GQA tables."""
+        rings = GQA_RING_PROJECTIONS.get(tp, {})
+        tactics = {r: rings for r in prepared_ar.rows if r <= PROJECTION_ROWS}
+        ring_shapes = {
+            tuple(layers[0].self_attn.o_proj.weight.shape),
+            tuple(layers[0].mlp.down_proj.weight.shape),
+        }
+        if tactics and not ring_shapes <= set(rings):
+            logger.warning_once(
+                "Kimi K3.1 GQA DSpark drafter: no ring projection for %s at TP%d: "
+                "rows %s keep stored partials (no polled sites)",
+                tuple(sorted(ring_shapes - set(rings))),
+                tp,
+                tuple(sorted(tactics)),
+            )
+        deferred = {r for r in prepared_ar.valid_ar if policy(GQA_SITE_DEFERRED, r)}
+        prepared_ar.prepare_producers(layers, tactics, deferred, trigger=True)
+        from ..cutedsl.draft.allreduce import plain_layer
+        from ..cutedsl.draft.producer import ROWS, TwoShotProducer
+
+        pushed = sorted(
+            r
+            for r in prepared_ar.two_rows
+            if policy(GQA_TWO_SHOT_PRODUCERS, r) and r in ROWS
+        )
+        if not pushed or not all(plain_layer(layer) for layer in layers):
+            return
+        producers = [
+            tuple(
+                TwoShotProducer(weight, pushed, tp)
+                for weight in (
+                    layer.self_attn.o_proj.weight,
+                    layer.mlp.down_proj.weight,
+                )
+            )
+            for layer in layers
+        ]
+        prepared_ar.set_two_shot_producers(producers, pushed)
+        shape = tuple(layers[0].mlp.gate_up_proj.weight.shape)
+        fused = {}
+        for r in pushed:
+            if not policy(GQA_TWO_SHOT_SILU, r):
+                continue
+            tactic = gqa_projection_tactic(shape, tp, r)
+            if tactic is not None:
+                fused[r] = tactic
+        prepared_ar.prepare_two_gate_up(layers, fused)
+
+
+# ---------------------------------------------------------------------------------
+# Vocabulary-parallel Markov sampling without co-residency (the TP4 drafter: C512's
+# SP decode role). The fused kernels (cutedsl.draft.markov / markov_wide) keep every
+# CTA of a rank resident (each polls every CTA's keys per position): at Markov rank 512
+# a rank of TP4 owns 40960 vocabulary rows = 320 CTAs of 128 staged rows (~133 KB
+# shared memory each, one per SM), above VR200's 212 SMs (``markov.supports``). Here
+# each draft position is its own launches, so no kernel waits on a CTA of its own
+# launch:
+#   1. the Markov bias of this rank's vocabulary rows: F.linear(markov_w1[prev],
+#      markov_w2 shard) (cuBLAS; the stock bias GEMM's columns, 1/TP of its weight),
+#   2. ``_vp_markov_keys``: logits = base + bias (BF16, the stock add), each live
+#      request's pre-temperature logits into this rank's columns of the draft-logits
+#      cache, the stock Gumbel-max score (``gumbel_noised_argmax``: the stock Triton
+#      code, bitwise its noise and scores) and one u64 key per request (FP32 score,
+#      then the lowest token: ``gumbel.sampled_key``'s order) by atomic max,
+#   3. the TP all-gather of the keys (TP x requests u64),
+#   4. ``_vp_markov_select``: each request's largest key (stock's first maximum over
+#      the vocabulary), its draft token, the next position's markov_w1 row; re-arms
+#      the keys.
+# Drafts as the stock loop's (``DSparkSpeculator._sample_sequential``: greedy
+# argmax, or ``gumbel_sample``); only the bias GEMM's FP32 accumulation order may
+# differ (cuBLAS on the shard's columns).
+
+VP_MARKOV_BLOCK = 1024  # vocabulary columns per program (the stock sampler's block)
+
+
+@triton.jit
+def _vp_ordered(value):
+    """Monotone u32 image of an FP32 ``value`` (-0.0 as +0.0)."""
+    bits = value.to(tl.uint32, bitcast=True)
+    bits = tl.where(bits == 0x80000000, 0, bits)
+    return tl.where((bits & 0x80000000) != 0, ~bits, bits | 0x80000000)
+
+
+@triton.jit
+def _vp_markov_keys(
+    keys_ptr,
+    base_ptr,
+    base_stride,
+    bias_ptr,
+    bias_stride,
+    cache_ptr,
+    cache_stride0,
+    cache_stride1,
+    slots_ptr,
+    pos_ptr,
+    temp_ptr,
+    seeds_ptr,
+    step,
+    steps,
+    lo,
+    vocab_rank,
+    SAMPLED: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    req = tl.program_id(0)
+    block = tl.program_id(1)
+    cols = block * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < vocab_rank
+    row = req * steps + step
+    base = tl.load(base_ptr + row * base_stride + cols, mask=mask, other=0.0)
+    bias = tl.load(bias_ptr + req * bias_stride + cols, mask=mask, other=0.0)
+    logits = (base.to(tl.float32) + bias.to(tl.float32)).to(tl.bfloat16)
+    values = tl.where(mask, logits.to(tl.float32), float("-inf"))
+    tokens = lo + cols
+    if SAMPLED:
+        slot = tl.load(slots_ptr + row)
+        live = slot >= 0
+        temp = tl.load(temp_ptr + slot, mask=live, other=0.0).to(tl.float32)
+        tl.store(
+            cache_ptr + slot * cache_stride0 + step * cache_stride1 + tokens,
+            logits,
+            mask=mask & live,
+        )
+        seed = tl.load(seeds_ptr + slot, mask=live, other=0)
+        seed = spec_step_seed(seed, step)
+        pos = tl.load(pos_ptr + row) - 1
+        value, index = gumbel_noised_argmax(
+            values,
+            tokens,
+            mask,
+            seed,
+            pos,
+            temp,
+            IS_DRAFTING=True,
+            USE_FP64=False,
+            APPLY_TEMPERATURE=True,
+        )
+    else:
+        value, index = tl.max(values, axis=0, return_indices=True)
+    token = (lo + block * BLOCK + index).to(tl.int64)
+    key = (_vp_ordered(value).to(tl.int64) << 31) | (0x7FFFFFFF - token)
+    tl.atomic_max(keys_ptr + req, key)
+
+
+@triton.jit
+def _vp_markov_select(
+    gathered_ptr,
+    keys_ptr,
+    draft_ptr,
+    draft_stride,
+    emb_ptr,
+    w1_ptr,
+    num_reqs,
+    step,
+    TP: tl.constexpr,
+    RANK: tl.constexpr,
+):
+    req = tl.program_id(0)
+    best = tl.load(gathered_ptr + req)
+    for r in tl.static_range(1, TP):
+        best = tl.maximum(best, tl.load(gathered_ptr + r * num_reqs + req))
+    token = 0x7FFFFFFF - (best & 0x7FFFFFFF)
+    tl.store(draft_ptr + req * draft_stride + step, token)
+    tl.store(keys_ptr + req, 0)
+    cols = tl.arange(0, RANK)
+    row = tl.load(w1_ptr + token * RANK + cols)
+    tl.store(emb_ptr + req * RANK + cols, row)
+
+
+class VocabParallelMarkov:
+    """Markov drafting over this rank's vocabulary shard, one set of launches per
+    draft position (module section above): ``PreparedMarkov``'s interface
+    (``covers`` / ``prepare`` / ``ready`` / ``sampling_args`` / ``run``, ``rank``,
+    ``vocab_rank``, ``markov_rank``). ``gather``: the TP group's all-gather along
+    dim 0 (in-graph)."""
+
+    def __init__(self, w1, w2, tp, rank, steps, gather=None):
+        vocab, markov_rank = w2.shape
+        if tuple(w1.shape) != tuple(w2.shape) or vocab % (tp * VP_MARKOV_BLOCK):
+            raise ValueError(f"unsupported Markov head shapes {tuple(w2.shape)}")
+        if markov_rank & (markov_rank - 1):
+            raise ValueError(f"Markov rank {markov_rank} is not a power of two")
+        self.tp, self.rank, self.steps = tp, rank, steps
+        self.vocab, self.markov_rank = vocab, markov_rank
+        self.vocab_rank = vocab // tp
+        self.w1 = w1.detach().contiguous()
+        lo = rank * self.vocab_rank
+        self.w2 = w2.detach()[lo : lo + self.vocab_rank]
+        self.device = w2.device
+        if gather is None:
+            from vllm.distributed import get_tp_group
+
+            group = get_tp_group()
+            gather = lambda x: group.all_gather(x, dim=0)  # noqa: E731
+        self.gather = gather
+        self.batches: set[tuple[int, bool]] = set()
+        self.buffers: dict[int, tuple] = {}
+
+    def covers(self, batch, sampled=False):
+        return batch > 0
+
+    def ready(self, batch, anchor_stride, draft_stride, sampled=False):
+        return (batch, sampled) in self.batches
+
+    def _buffers(self, batch):
+        if batch not in self.buffers:
+            self.buffers[batch] = (
+                torch.zeros(batch, dtype=torch.int64, device=self.device),
+                torch.empty(
+                    (batch, self.markov_rank), dtype=self.w1.dtype, device=self.device
+                ),
+            )
+        return self.buffers[batch]
+
+    def prepare(self, batch, anchor_stride, draft_stride, sampled=False):
+        """Compile and run once (every rank together: the keys are all-gathered),
+        so nothing compiles during CUDA graph capture."""
+        rows = batch * self.steps
+        base = torch.zeros(
+            (rows, self.vocab_rank), dtype=torch.bfloat16, device=self.device
+        )
+        anchors = torch.zeros(batch, dtype=torch.int32, device=self.device)
+        draft = torch.zeros((batch, self.steps), dtype=torch.int64, device=self.device)
+        sampling = None
+        if sampled:
+            sampling = self.sampling_args(
+                torch.zeros(1, dtype=torch.float32, device=self.device),
+                torch.zeros(1, dtype=torch.int64, device=self.device),
+                torch.full((rows,), -1, dtype=torch.int64, device=self.device),
+                torch.zeros(rows, dtype=torch.int64, device=self.device),
+                torch.zeros(
+                    (1, self.steps, self.vocab),
+                    dtype=torch.bfloat16,
+                    device=self.device,
+                ),
+            )
+        self.batches.add((batch, sampled))
+        self.run(base, anchors, draft, sampling)
+        torch.accelerator.synchronize(self.device)
+
+    def sampling_args(self, temperature, seeds, slots, positions, cache):
+        """As ``PreparedMarkov.sampling_args``."""
+        if (
+            temperature.dtype != torch.float32
+            or seeds.dtype != torch.int64
+            or slots.dtype != torch.int64
+            or positions.dtype != torch.int64
+            or cache.dtype != torch.bfloat16
+            or tuple(cache.shape[1:]) != (self.steps, self.vocab)
+            or cache.stride(-1) != 1
+            or not (slots.is_contiguous() and positions.is_contiguous())
+        ):
+            raise ValueError("Markov drafting: unexpected sampling arguments")
+        return (temperature, seeds, slots, positions, cache)
+
+    def run(self, base, anchors, draft, sampling=None):
+        """Base [batch * steps, vocab_rank] BF16 (this rank's LM-head logits), anchors
+        [batch] int32, draft [batch, steps] int64 (written); ``sampling``: a
+        ``sampling_args`` tuple for probabilistic drafting (else greedy)."""
+        batch = anchors.shape[0]
+        if base.shape != (batch * self.steps, self.vocab_rank) or base.stride(1) != 1:
+            raise ValueError(f"Markov drafting: unexpected base {tuple(base.shape)}")
+        if draft.shape != (batch, self.steps) or draft.stride(1) != 1:
+            raise ValueError(f"Markov drafting: unexpected draft {tuple(draft.shape)}")
+        keys, emb = self._buffers(batch)
+        torch.index_select(self.w1, 0, anchors.long(), out=emb)
+        sampled = sampling is not None
+        if sampled:
+            temperature, seeds, slots, positions, cache = sampling
+            strides = (cache.stride(0), cache.stride(1))
+        else:
+            temperature = seeds = slots = positions = cache = None
+            strides = (0, 0)
+        grid = (batch, triton.cdiv(self.vocab_rank, VP_MARKOV_BLOCK))
+        lo = self.rank * self.vocab_rank
+        for step in range(self.steps):
+            bias = torch.nn.functional.linear(emb, self.w2)
+            _vp_markov_keys[grid](
+                keys,
+                base,
+                base.stride(0),
+                bias,
+                bias.stride(0),
+                cache,
+                *strides,
+                slots,
+                positions,
+                temperature,
+                seeds,
+                step,
+                self.steps,
+                lo,
+                self.vocab_rank,
+                SAMPLED=sampled,
+                BLOCK=VP_MARKOV_BLOCK,
+            )
+            gathered = self.gather(keys)
+            _vp_markov_select[(batch,)](
+                gathered,
+                keys,
+                draft,
+                draft.stride(0),
+                emb,
+                self.w1,
+                batch,
+                step,
+                TP=self.tp,
+                RANK=self.markov_rank,
+            )
