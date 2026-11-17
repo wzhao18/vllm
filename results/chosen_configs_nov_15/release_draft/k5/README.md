@@ -28,8 +28,8 @@ The renders are `dsrelk5-c128-1p1d[-ev]-{xdr,spx}` and `dsrelk5-c160-1p1d-llh[-e
    - Batches with a frozen graph that lose their own at k5: verify B41, and 17 drafter by-products of the k3 rounding
      (B11, B14, B19, B43, B59, B67, B78, B86, B91, B102, B107, B118, B123, B134, B139, B150, B155). Each pads to its
      next graph.
-   - At the operating batches (B20-B50) the graph each batch pads to is the same at k3 and k5, except verify B41 -> 42
-     and drafter B43 -> 44.
+   - At the operating batches (B20-B50) every batch pads to the same graph as at k3 or a closer one, except verify B41
+     (-> B42) and drafter B43 (-> B44).
    - The largest verify and drafter batches (the capacity anchors) stay B160 / B160.
 4. **Names.** `dsrelk5-...` everywhere the frozen render name appears. `DSREL.txt` records the derivation.
 
@@ -149,7 +149,47 @@ The q6 runs below show whether q6 has one.
 
 ## Measurement
 
-(see the section appended below)
+### Status (2026-11-17 00:35 PST)
+
+The release-drafter k5 vs k3 A/B is **not measured yet**.
+
+- **Attempt 1 was lost.** `08-nq4-dsrel-k5ab-c160-m60/m90.sh` ran at 23:38 on backfill hold 1119830 (int1 overlay).
+  - The slow startup, from "Loading model from scratch" to the first "MoE backend" line, is seconds on the ksweep's
+    warm nodes. On these cold nodes it took 11-22 min, plus CuTe cache loads.
+  - The k5 relfa run had spent 38 min in that startup without timing any row when its step got SIGTERM at 00:16:40.
+    The job was PREEMPTED exactly 10 min later at 00:26:40, which fits a preemption grace period, and it took the k3
+    relfa run with it (`checks/bench-attempt1.out`).
+  - The task's entry stays in `queue/running/` (`...m90.sh.1119830`), so the runner will not retry it. Its logs are in
+    `dsrel/results/k5ab-int1`.
+- **Attempt 2 is queued:** `08-nq4-dsrel-k5ab2-c160-m90.sh`, with the same runs, writing to `dsrel/results/k5ab2-int1`.
+  - The next hold that can take it is r2hd8 1118813 (begin time 01:59), after the 06 / 07 tasks ahead of it.
+  - To read it: `python3 bench/k5ab_table.py $W/dsrel/results/k5ab2-int1` gives the table and the projection per B.
+- **Also queued:** `08-nq4-dsrel-k5strict-c160-m120.sh` (results `dsrel/results/k5strict`). It runs the k5 production
+  list with full capture on overlay `k5attn`: the strict integrated drafter, track K's attention and
+  `gqa_window_k5.patch`. Target-only runs first.
+
+### Projection from the data in hand (same contexts, same c160 config)
+
+Inputs:
+- **Target only** at k5 vs k3: `dsrel/results/ksweep-6a14e2f`, one task on the same 4 nodes (job 1117399), base overlay.
+- **Release drafter at k3**: int1's fast path on c160 (`dsrel/results/int1`). Its drafter time, int1 relfa minus the
+  ksweep target, is 477 / 566 / 564 us at B16 / B28 / B38. These come from different allocations.
+- **Release drafter at k5**: not yet measured. The table brackets it:
+  - d5 = d3: int1's drafter is latency-bound, flat from k3 at c160 (490-565 us) to k7 at c64 (447-548 us).
+  - d5 = 5/3 d3: every drafter cost scales with its 5/3 more query rows.
+
+Projected change of interactivity, dx = (AL5 / AL3 = 1.237) / (T(q6) / T(q4)) - 1, at a fixed batch:
+
+| B (point) | target q6/q4 | dx target only | release q6/q4, d5 = d3 | dx | release q6/q4, d5 = 5/3 d3 | dx |
+|---|---|---|---|---|---|---|
+| 16 | 1.249 | -1.0% | 1.239 | -0.1% | 1.267 | -2.4% |
+| 28 (C128) | 1.120 | +10.4% | 1.116 | **+10.9%** | 1.142 | +8.4% |
+| 38 (C160) | 1.163 | +6.3% | 1.157 | **+6.9%** | 1.181 | +4.7% |
+| 48 | 1.174 | +5.4% | - | - | - | - |
+
+So k5 projects to **+8..11% interactivity at C128 and +5..7% at C160**, both above break-even. At a fixed concurrency
+tok/s/GPU moves ~5x less than interactivity (`../README.md`). Around B16 and below, q6 breaks even or loses.
+`08-nq4-dsrel-k5ab2` replaces this projection with the same-node release-drafter ratio.
 
 ## Files
 

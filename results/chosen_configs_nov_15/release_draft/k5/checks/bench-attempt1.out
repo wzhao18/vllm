@@ -1,0 +1,22 @@
+# attempt 1 of the k5 / k3 A/B (08-nq4-dsrel-k5ab-c160-m90.sh on backfill hold 1119830, overlay int1): dsrel/results/k5ab-int1
+## status.txt
+23:38:02 k5ab c160 on hecate0010,hecate0011,hecate0014,hecate0016 job 1119830 (ov /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/ov/int1)
+23:38:02 start c160k5-relfa ov int1 (job 1119830, cap none)
+00:16:49 end c160k5-relfa rc=0 NQEND rc=143 end=2026-11-17T00:16:49
+  
+00:16:49 start c160k3-relfa ov int1 (job 1119830, cap none)
+## sacct -j 1119830
+JobID|State|ExitCode|Start|End
+1119830|PREEMPTED|0:0|2026-11-16T23:37:32|2026-11-17T00:26:40
+1119830.batch|CANCELLED|0:15|2026-11-16T23:37:32|2026-11-17T00:26:41
+1119830.extern|COMPLETED|0:0|2026-11-16T23:37:32|2026-11-17T00:18:39
+1119830.0|CANCELLED|0:15|2026-11-16T23:38:02|2026-11-17T00:16:49
+1119830.1|CANCELLED|0:15|2026-11-17T00:16:49|2026-11-17T00:26:44
+## hold runner log
+runner2 1119830 pools [h8|e2e[a-z0-9]*|nq4|n4[a-z0-9]*|n2[a-z0-9]*|nq1b?|nqk-[a-z]+|nqz|nqx|nqy|n1[a-z0-9]*|any] 4 nodes hecate0010 hecate0011 hecate0014 hecate0016 until 01:33:32
+23:38:02 start 08-nq4-dsrel-k5ab-c160-m90.sh on hecate0010,hecate0011,hecate0014,hecate0016 (need 4n 90m, 115m left)
+[2026-11-17T00:26:40.009] error: *** JOB 1119830 ON hecate0010 CANCELLED AT 2026-11-17T00:26:40 DUE TO PREEMPTION ***
+## k5 relfa startup (rank 8): Loading model -> MoE backend; last CuTe cache progress line
+INFO 11-16 23:39:13 [model_runner.py:420] Loading model from scratch...
+INFO 11-16 23:50:21 [mxfp4.py:844] Using 'FLASHINFER_TRTLLM_MXFP4_MXFP8' Mxfp4 MoE backend.
+(MainProcess pid=947337) INFO 11-17 00:16:30 [cute_cache.py:1299] Kimi K3 CuTe cache (progress, 2292 s since import): 473 loaded, 0 compiled, 1 uncached, 26 deferred to peers (waited 5 s); keys 1 s, loads 1 s, compiles 1 s (/lustre/fsw/coreai_comparch_inferenc

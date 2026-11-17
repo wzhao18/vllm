@@ -6,7 +6,7 @@
 #   k5: q6 rows 96,168,228,288 / k3: q4 rows 64,112,152,192 (B16 / B28 / B38 / B48).
 export OVTAG=int1 RUN_GUARD=900
 source /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/tools/tasks/step_common.sh
-R=$W/dsrel/results/k5ab-int1; mkdir -p $R   # own results dir (run() reads $R at call time)
+R=$W/dsrel/results/k5ab2-int1; mkdir -p $R   # own results dir (run() reads $R at call time); attempt 2 (attempt 1, k5ab-int1, lost to the preemption of backfill hold 1119830)
 unset NQ_MAX_KV_TOKENS
 echo "$(date +%T) k5ab c160 on $NQ_HOSTS job $J (ov $NQ_OV)" | tee -a $R/status.txt
 NQ_K=5 run c160k5-relfa c160 $REL 96,168,228,288
