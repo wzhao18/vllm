@@ -229,10 +229,12 @@ def test_target_groups_match_the_preview_deployment(point):
 # Per point: rows per GiB vs the preview, draft slots per row, and the draft
 # rows a decoding request (K+1 rows in flight, twice under async scheduling)
 # and a 16K prefill chunk hold, unpacked -> packed.
+# (Packed, the window keeps the block below it that FlashAttention's 256-key tiles
+# read: one more block than the 2048 window's.)
 EXPECTED = {
-    "P_TP8_DCP8": dict(slots=48, decode=(4, 18), chunk=(19, 145)),
-    "D_TP16_DCP16": dict(slots=72, decode=(4, 18), chunk=(19, 145)),
-    "C512_TP4_DCP4": dict(slots=87, decode=(2, 18), chunk=(6, 145)),
+    "P_TP8_DCP8": dict(slots=48, decode=(4, 19), chunk=(19, 146)),
+    "D_TP16_DCP16": dict(slots=72, decode=(4, 19), chunk=(19, 146)),
+    "C512_TP4_DCP4": dict(slots=87, decode=(2, 19), chunk=(6, 146)),
 }
 
 
@@ -261,7 +263,7 @@ def test_draft_window_takes_a_fraction_of_a_row(point):
         _window_slots(spec, chunk),
     ) == (expected["decode"][1], expected["chunk"][1])
     decode_rows = _window_slots(spec, decode_in_flight) / slots
-    assert decode_rows <= 0.375
+    assert decode_rows <= 0.4
     assert cdiv(_window_slots(spec, chunk), slots) <= 4
 
     # Rows: the release draft's rows are the target's alone, ~18% more than the
@@ -308,6 +310,26 @@ def test_draft_slots_tile_the_rows(point):
         start = slot * draft_tensor.block_stride
         end = start + NUM_DRAFT * page
         assert start // row_bytes == (end - 1) // row_bytes == slot // slots
+
+
+@pytest.mark.parametrize("point", POINTS)
+def test_packed_window_keeps_the_block_flash_attention_reads(point):
+    """FlashAttention-2's paged kernel reads keys in 256-key tiles aligned to 256
+    (head 64): a window starting in a tile's upper half reads the 128-token block
+    below its first one, masked (its V times 0). The packed draft group's manager
+    window keeps that block (freed, it may hold any bytes); the 1024-token blocks of
+    the unpacked group hold whole tiles."""
+    unpacked = _draft_group(_plan(point, "release", packed=False))
+    spec = _draft_group(_plan(point, "release")).kv_cache_spec.first_spec
+    assert unpacked.kv_cache_spec.first_spec.sliding_window == WINDOW
+    assert (spec.block_size, spec.sliding_window) == (HIT_UNIT, WINDOW + 256 - HIT_UNIT)
+    for start in range(WINDOW, 3 * WINDOW, 16):
+        tile_start = (start - (WINDOW - 1)) // 256 * 256  # the window start's tile
+        # the manager frees blocks wholly below start - (sliding_window - 1)
+        first_kept = (start - spec.num_retained_tokens) // HIT_UNIT
+        assert first_kept * HIT_UNIT <= tile_start
+        # and keeps no more than that block below the window's first block
+        assert first_kept >= (start - (WINDOW - 1)) // HIT_UNIT - 1
 
 
 def test_prefix_match_unit_unset_keeps_the_draft_block():
@@ -400,9 +422,10 @@ def test_next_turn_hits_where_the_preview_deployment_did(point):
     assert preview_hit == {"C512_TP4_DCP4": 16384}.get(point, 19968)
     assert per_group[draft_id] == 19968
     assert unpacked_hit == 19999 // scheduler_block * scheduler_block
-    # The hit restores the writer's own draft blocks: the window's 16 blocks.
+    # The hit restores the writer's own draft blocks: the window's 16 blocks and
+    # the one below them that FlashAttention's 256-key tile may read.
     window = [b.block_id for b in blocks.blocks[draft_id] if not b.is_null]
-    assert len(window) == WINDOW // HIT_UNIT
+    assert len(window) == WINDOW // HIT_UNIT + 1
     assert set(window) <= set(held[draft_id])
 
     # The writer's draft blocks at the end of its prefill: a row each when

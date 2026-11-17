@@ -14,6 +14,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     MLAAttentionSpec,
+    SlidingWindowSpec,
 )
 
 # A multiple of K3.1's 64-token prefix-hash unit. Draft blocks also divide the
@@ -32,10 +33,29 @@ def _fit_draft_page(spec: AttentionSpec, page_size: int) -> AttentionSpec:
     )
 
 
+def _flash_attn_key_tile(head_size: int) -> int:
+    """Keys per tile of FlashAttention-2's paged (split-KV) forward
+    (run_mha_fwd_splitkv_dispatch's kBlockN), its tiles aligned to it."""
+    return 256 if head_size <= 64 else 128 if head_size <= 128 else 64
+
+
 def _hit_unit_block(spec: AttentionSpec, hit_unit: int | None) -> AttentionSpec:
     """The draft's block at the prefix-cache hit granularity, when it divides the
     draft's block and a backend kernel takes it whole (packed blocks are never
-    split into kernel blocks)."""
+    split into kernel blocks).
+
+    A sliding window then keeps one more block below it when the attention
+    kernel's key tile is wider than the block. FlashAttention (the draft's
+    backend on P) loads whole tiles: a window starting in a tile's upper half
+    loads the block below its first block too, masked, and a masked key still
+    multiplies its V by 0. That block must hold finite bytes, so the KV cache
+    manager keeps it (it frees blocks, and a hit restores them, by the
+    ``sliding_window`` of the group's spec; the layers' attention window stays
+    their own). Released, it may hold another group's bytes (packed slots share
+    the target's rows: FP8 latents, FP32 KDA states); nulled, the null slot is in
+    the null row every group's padding writes (the KDA states), and under DCP the
+    worker does not null it at all.
+    """
     alignment = spec.block_stride_alignment
     if (
         not hit_unit
@@ -44,7 +64,16 @@ def _hit_unit_block(spec: AttentionSpec, hit_unit: int | None) -> AttentionSpec:
         or (isinstance(alignment, MultipleOf) and hit_unit > alignment.base)
     ):
         return spec
-    return replace(spec, block_size=hit_unit)
+    blocked = replace(spec, block_size=hit_unit)
+    if isinstance(spec, SlidingWindowSpec):
+        tile = _flash_attn_key_tile(spec.head_size)
+        if tile > hit_unit:
+            # The tile holding the window start begins at most tile - hit_unit
+            # tokens below the window's first block.
+            blocked = replace(
+                blocked, sliding_window=spec.sliding_window + tile - hit_unit
+            )
+    return blocked
 
 
 class GQADraftKVCacheGrouping(SupportsKVCacheGrouping):

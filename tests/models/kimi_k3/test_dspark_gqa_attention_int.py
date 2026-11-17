@@ -40,6 +40,13 @@ CONTEXTS = (
     1, 5, 31, 32, 33, 100, 1023, 1024, 2016, 2040, 2041, 2047, 2048, 2049, 2050,
     3071, 4096, 4097, 50000, 150000, MAX_POS - 16,
 )  # fmt: skip
+# window starts lo = context - 2047 with lo % 32 in 26..31: the first 32-key stage holds
+# 1-6 window keys and the query rows' own window starts (lo + i) cross the stage edge
+WINDOW_EDGES = tuple(
+    WINDOW - 1 + 32 * m + r
+    for m, r in ((0, 26), (1, 27), (3, 28), (20, 29), (50, 30), (1000, 31), (4000, 26),
+                 (30000, 31))
+)  # fmt: skip
 
 
 def _rubin():
@@ -212,12 +219,71 @@ class DraftCache:
         return buffer.as_strided(shape, strides, offset)
 
 
-def batch_case(B, q, page, blocks_free, gen, contexts=None):
+# the planner's deployment whose draft views a KV head count gets (slots per row)
+PLANNER_POINT = {1: "D_TP16_DCP16", 2: "P_TP8_DCP8", 4: "C512_TP4_DCP4"}  # 72, 48, 87
+NAN_BITS = 0x7FC0
+
+
+class PlannerCache:
+    """The draft group's five layer views exactly as the worker builds them for the
+    planned K3.1 deployment (GQADraftKVCacheGrouping, get_kv_cache_config_from_groups,
+    allocate_kv_cache: 128-token draft blocks as S equal slots of a BLHNC row, block
+    ID = slot ID), over a pool of whole rows; every byte stale (NaN, or finite)."""
+
+    def __init__(self, kv_heads, blocks, gen, fill="nan"):
+        from tests.models.kimi_k3.test_gqa_draft_kv_plan import (
+            LAYOUT,
+            POINTS,
+            _config,
+            _draft_group,
+            _plan,
+        )
+        from vllm.v1.core.kv_cache_planning import (
+            _get_kv_cache_bytes_per_block,
+            get_kv_cache_config_from_groups,
+        )
+        from vllm.v1.worker.utils import allocate_kv_cache
+
+        device = _device()
+        point = PLANNER_POINT[kv_heads]
+        groups = _plan(point, "release")
+        draft = _draft_group(groups)
+        S = draft.blocks_per_pool_block
+        row_bytes = _get_kv_cache_bytes_per_block(groups, LAYOUT)
+        rows = -(-blocks // S) + 1
+        config = get_kv_cache_config_from_groups(
+            _config(POINTS[point][1]), groups, rows * row_bytes
+        )
+        views = allocate_kv_cache(config, device, LAYOUT)
+        self.views = [views[name] for name in draft.layer_names]
+        assert len(self.views) == LAYERS
+        storage = self.views[0].untyped_storage()
+        self.buffer = torch.empty(0, dtype=torch.bfloat16, device=device)
+        self.buffer.set_(storage, 0, (storage.nbytes() // 2,), (1,))
+        if fill == "nan":
+            self.buffer.view(torch.int16).fill_(NAN_BITS)
+        else:
+            self.buffer.normal_(0, 30, generator=gen)
+        self.layout, self.H, self.page = "planner", kv_heads, 128
+        self.blocks, self.slots = rows * S, S
+        v = self.views[0]
+        assert tuple(v.shape) == (self.blocks, kv_heads, self.page, 2 * HEAD)
+        assert v.stride(0) * 2 * S == row_bytes
+
+    def view(self, layer, buffer=None):
+        buffer = self.buffer if buffer is None else buffer
+        v = self.views[layer]
+        return buffer.as_strided(v.shape, v.stride(), v.storage_offset())
+
+
+def batch_case(B, q, page, blocks_free, gen, contexts=None, seed=None):
     """seq_lens, positions, block table (window pages only; the rest the null block),
-    and the query slots of B requests."""
+    and the query slots of B requests (contexts drawn with ``seed``, default B)."""
     device = _device()
-    order = torch.randperm(len(CONTEXTS), generator=torch.Generator().manual_seed(B))
-    ctx = contexts or [CONTEXTS[int(order[b % len(CONTEXTS)])] for b in range(B)]
+    pool = CONTEXTS + WINDOW_EDGES
+    seed = B if seed is None else seed
+    order = torch.randperm(len(pool), generator=torch.Generator().manual_seed(seed))
+    ctx = contexts or [pool[int(order[b % len(pool)])] for b in range(B)]
     lengths = [c + q for c in ctx]
     width = max(-(-L // page) for L in lengths) + 2
     table = torch.zeros((B, width), dtype=torch.int32)
@@ -379,25 +445,59 @@ def test_context_insert_matches_stock(tp, layout):
 
 # ------------------------------------------------------------- attention
 def page_of(layout, kv_heads):
-    return 128 if layout == "slots" else (4096 if kv_heads == 4 else 1024)
+    return 128 if layout in ("slots", "planner") else (4096 if kv_heads == 4 else 1024)
 
 
-def run_case(state, layers, layout, B, q, gen, fill="finite", contexts=None):
-    """One drafter batch through both paths: (ours, stock, exact rows per layer,
-    lengths, cache elements whose insert differs from stock's)."""
-    from vllm.forward_context import override_forward_context
+def run_stock(layers, cache, before, qkvs, positions, stale=0):
+    """The stock path over a copy of ``before`` whose NaN are ``stale`` (stock
+    FlashAttention multiplies masked stale V by 0): (buffer after, buffer before,
+    rows per layer). Call inside the batch's forward context."""
     from vllm.models.kimi_k3.nvidia.dspark_gqa import stock_attention_core
+
+    start = before.clone()
+    start.view(torch.int16)[torch.isnan(start)] = stale
+    buffer = start.clone()
+    rows = []
+    for i, layer in enumerate(layers):
+        layer.attn.kv_cache = cache.view(i, buffer)
+        rows.append(stock_attention_core(layer, qkvs[i], positions))
+    return buffer, start, rows
+
+
+def stock_writes(layers, cache, before, qkvs, positions, buffer, start):
+    """The elements stock wrote: changed from its stale bytes, also with other stale
+    bytes where they were NaN (an insert may write the value they were set to)."""
+    i16 = torch.int16
+    written = buffer.view(i16) != start.view(i16)
+    if bool(torch.isnan(before).any()):
+        other, other_start, _ = run_stock(layers, cache, before, qkvs, positions, 0x3F80)
+        written |= other.view(i16) != other_start.view(i16)
+    return written
+
+
+def make_cache(layout, kv_heads, blocks, gen, fill="finite"):
+    if layout == "planner":
+        return PlannerCache(kv_heads, blocks, gen, fill)
+    return DraftCache(layout, kv_heads, blocks, gen, fill)
+
+
+def run_case(state, layers, layout, B, q, gen, fill="finite", contexts=None, seed=None):
+    """One drafter batch through both paths: (ours, stock, exact rows per layer,
+    lengths, cache elements whose insert differs from stock's). ``seed`` draws the
+    contexts and blocks (default B)."""
+    from vllm.forward_context import override_forward_context
 
     device = _device()
     H = layers[0].num_kv_heads
     width = (G * H + 2 * H) * HEAD
     page = page_of(layout, H)
     need = B * (-(-(WINDOW + q) // page) + 1) + 4
-    cache = DraftCache(layout, H, need, gen, fill)
-    free = torch.randperm(cache.blocks - 1, generator=torch.Generator().manual_seed(B))
+    cache = make_cache(layout, H, need, gen, fill)
+    seed = B if seed is None else seed
+    free = torch.randperm(cache.blocks - 1, generator=torch.Generator().manual_seed(seed))
     free = free[: need - 2] + 1
     seq_lens, positions, table, slots, lengths = batch_case(
-        B, q, cache.page, free, gen, contexts
+        B, q, cache.page, free, gen, contexts, seed
     )
     if B >= 3 and fill == "finite":
         # a query row whose block is the null block: no insert, stock reads the cache
@@ -407,11 +507,6 @@ def run_case(state, layers, layout, B, q, gen, fill="finite", contexts=None):
     md = metadata(seq_lens, table, slots, q)
     context = forward_context(layers, md, slots)
     before = cache.buffer.clone()
-    stock_buffer = before.clone()
-    stock_before = before
-    if fill == "nan":  # stock FlashAttention multiplies masked stale V by 0
-        stock_buffer.view(torch.int16)[torch.isnan(stock_buffer)] = 0
-        stock_before = stock_buffer.clone()
     for i, layer in enumerate(layers):
         layer.attn.bind_kv_cache(views[i])
     qkvs = [(torch.randn((B * q, width), generator=gen, device=device) * 2).bfloat16()
@@ -422,16 +517,18 @@ def run_case(state, layers, layout, B, q, gen, fill="finite", contexts=None):
             out = state.forward(i, qkvs[i], positions)
             assert out is not None, f"layer {i} B{B} not covered"
             ours.append(out)
-        for i, layer in enumerate(layers):
-            layer.attn.kv_cache = cache.view(i, stock_buffer)
-            stock.append(stock_attention_core(layer, qkvs[i], positions))
+        stock_buffer, stock_before, stock = run_stock(
+            layers, cache, before, qkvs, positions
+        )
+        written_stock = stock_writes(
+            layers, cache, before, qkvs, positions, stock_buffer, stock_before
+        )
         torch.accelerator.synchronize(device)
         for i, layer in enumerate(layers):
             exact.append(exact_rows(layer, cache.view(i, stock_buffer), qkvs[i],
                                     positions, seq_lens, table, q))  # fmt: skip
     torch.accelerator.synchronize(device)
     i16 = torch.int16
-    written_stock = stock_buffer.view(i16) != stock_before.view(i16)
     written_ours = cache.buffer.view(i16) != before.view(i16)
     differ = int((written_stock != written_ours).sum())
     differ += int(
@@ -474,7 +571,10 @@ def test_window_matches_stock(tp, q, layout):
     state = install(layers, q, BATCHES)
     worst = []
     for B in BATCHES:
-        ours, stock, exact, lengths, differ = run_case(state, layers, layout, B, q, gen)
+        seed = 1000 * tp + 100 * q + 10 * (layout == "slots") + B  # (per combo)
+        ours, stock, exact, lengths, differ = run_case(
+            state, layers, layout, B, q, gen, seed=seed
+        )
         label = f"TP{tp} q{q} {layout} B{B}"
         assert differ == 0, f"{label}: {differ} cache elements differ from stock"
         stats = check_rows(ours, stock, exact, B, q, label)
@@ -554,3 +654,199 @@ def test_install_refuses_unsupported_geometry():
     )
     assert install_gqa_attention(layers, production, [7], [8], True) is not None
     assert math.isfinite(EPS)
+
+
+# ------------------------------------------------------------- graph padding
+# (KV heads per rank, q) of the GQA_WINDOW shapes a decode deployment captures:
+# TP16 k7 / k3 (C1, C64, C160) and TP4 k3 / k7 (C512)
+PADDED = ((1, 7), (1, 3), (4, 3), (4, 7))
+
+
+def padded_graphs(kv_heads, q):
+    """(graph batch, real requests) pairs: every GQA_WINDOW bin whose launch shape
+    spreads a request over a cluster (16 splits at the small batches), its largest
+    batch (the open bin: twice the previous) padded by one request up to 16
+    requests, by half above."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.draft.gqa_attention import (  # noqa: E501
+        GQA_WINDOW,
+    )
+
+    cases, previous = [], 0
+    for top, shape in GQA_WINDOW[(kv_heads, q)]:
+        graph = top or 2 * previous
+        previous = top
+        if shape[0] > 1:
+            cases.append((graph, graph - 1 if graph <= 16 else graph // 2))
+    return cases
+
+
+def pad_batch(seq_lens, positions, table, slots, q, graph, blocks, gen):
+    """The runner's padded graph batch: trailing requests of seq_len 0, their query
+    rows at slot -1 (position 0), their block-table rows stale block IDs."""
+    device = seq_lens.device
+    pad = graph - seq_lens.shape[0]
+    stale = torch.randint(1, blocks, (pad, table.shape[1]), generator=gen,
+                          device=device, dtype=torch.int32)  # fmt: skip
+    return (
+        torch.cat((seq_lens, seq_lens.new_zeros(pad))),
+        torch.cat((positions, positions.new_zeros(pad * q))),
+        torch.cat((table, stale)),
+        torch.cat((slots, slots.new_full((pad * q,), -1))),
+    )
+
+
+@pytest.mark.parametrize("kv_heads,q", PADDED)
+def test_window_padded_requests(kv_heads, q):
+    """Graph padding: trailing requests of seq_len 0 at slot -1 over planner slot
+    pages whose never-written bytes are NaN. Per cluster launch shape: no fault or
+    hang; the real requests' rows and cache bytes bit-identical to the same launch
+    shape without the padded requests; padded rows zero; no write for slot -1; the
+    inserted bytes are stock's and the real rows as close to FP64 as stock's."""
+    from vllm.forward_context import override_forward_context
+
+    device = _device()
+    H = kv_heads
+    width = (G * H + 2 * H) * HEAD
+    page = page_of("planner", H)
+    i16 = torch.int16
+    for graph, real in padded_graphs(kv_heads, q):
+        seed = 10007 * kv_heads + 101 * q + 7 * graph + real
+        gen = torch.Generator(device=device).manual_seed(seed)
+        layers = make_layers(H, gen)
+        state = install(layers, q, (graph,))
+        # the real requests alone through the graph batch's launch shape (the
+        # state's batch -> shape table, before any cache is bound)
+        state.rows = state.rows | {real * q}
+        state.shapes[real] = state.shapes[graph]
+        need = real * (-(-(WINDOW + q) // page) + 1) + 4
+        cache = PlannerCache(H, need, gen, "nan")
+        free = torch.randperm(cache.blocks - 1, generator=torch.Generator().manual_seed(seed))
+        free = free[: need - 2] + 1
+        seq_lens, positions, table, slots, lengths = batch_case(
+            real, q, page, free, gen, seed=seed
+        )
+        views = [cache.view(i) for i in range(LAYERS)]
+        fill_context(cache, views, lengths, table, q, gen)
+        for i, layer in enumerate(layers):
+            layer.attn.bind_kv_cache(views[i])
+        padded = pad_batch(seq_lens, positions, table, slots, q, graph, cache.blocks, gen)
+        p_lens, p_pos, p_table, p_slots = padded
+        qkvs = [(torch.randn((graph * q, width), generator=gen, device=device) * 2)
+                .bfloat16() for _ in layers]  # fmt: skip
+        before = cache.buffer.clone()
+        label = f"H{H} q{q} graph {graph} real {real} {state.shapes[graph]}"
+
+        md = metadata(p_lens, p_table, p_slots, q)
+        with override_forward_context(forward_context(layers, md, p_slots)):
+            ours_padded = [state.forward(i, qkvs[i], p_pos) for i in range(LAYERS)]
+        torch.accelerator.synchronize(device)
+        assert all(o is not None for o in ours_padded), label
+        after_padded = cache.buffer.clone()
+        cache.buffer.copy_(before)
+        md = metadata(seq_lens, table, slots, q)
+        with override_forward_context(forward_context(layers, md, slots)):
+            ours = [state.forward(i, qkvs[i][: real * q], positions) for i in range(LAYERS)]
+        torch.accelerator.synchronize(device)
+        assert all(o is not None for o in ours), label
+        same = after_padded.view(i16) == cache.buffer.view(i16)
+        assert bool(same.all()), f"{label}: {int((~same).sum())} cache elements differ"
+        for i in range(LAYERS):
+            assert torch.equal(ours_padded[i][: real * q].view(i16), ours[i].view(i16)), (
+                f"{label} layer {i}: real rows differ from the unpadded run"
+            )
+            tail = ours_padded[i][real * q :]
+            assert bool(torch.isfinite(tail).all()) and not bool(tail.any()), (
+                f"{label} layer {i}: padded rows not zero"
+            )
+
+        # stock over the padded batch (its stale NaN zeroed: stock multiplies masked
+        # stale V by 0): the same inserted bytes, real rows within BF16 noise
+        md = metadata(p_lens, p_table, p_slots, q)
+        with override_forward_context(forward_context(layers, md, p_slots)):
+            stock_buffer, stock_before, stock = run_stock(
+                layers, cache, before, qkvs, p_pos
+            )
+            written_stock = stock_writes(
+                layers, cache, before, qkvs, p_pos, stock_buffer, stock_before
+            )
+        torch.accelerator.synchronize(device)
+        written_ours = after_padded.view(i16) != before.view(i16)
+        assert bool((written_stock == written_ours).all()), f"{label}: writes differ"
+        assert bool(
+            (after_padded.view(i16)[written_ours] == stock_buffer.view(i16)[written_ours]).all()
+        ), f"{label}: inserted bytes differ from stock"
+        assert int(written_ours.sum()) > 0
+        exact = [
+            exact_rows(layer, cache.view(i, stock_buffer), qkvs[i][: real * q],
+                       positions, seq_lens, table, q)
+            for i, layer in enumerate(layers)
+        ]  # fmt: skip
+        check_rows(ours, [s[: real * q] for s in stock], exact, real, q, label)
+        for i, layer in enumerate(layers):
+            layer.attn.kv_cache = views[i]
+        del cache, before, after_padded, stock_before, stock_buffer
+
+
+@pytest.mark.parametrize("kv_heads", [1, 2, 4])
+def test_context_insert_padded_rows(kv_heads):
+    """ContextKV with trailing padded rows (slot -1, position 0) over NaN planner slot
+    pages: the whole allocation bit-identical to the unpadded insert and to stock's
+    (no write for slot -1, never-written bytes untouched)."""
+    device = _device()
+    H = kv_heads
+    gen = torch.Generator(device=device).manual_seed(500 + kv_heads)
+    layers = make_layers(H, gen)
+    state = install(layers, 7, (1, 2, 4))
+    for C, pad in ((8, 8), (21, 43), (152, 104), (513, 511)):
+        cache = PlannerCache(H, -(-2 * C // 128) + 3, gen, "nan")
+        for i, layer in enumerate(layers):
+            layer.attn.bind_kv_cache(cache.view(i))
+        kv = (torch.randn(((C + pad), LAYERS * 2 * H * HEAD), generator=gen,
+                          device=device) * 3).bfloat16()  # fmt: skip
+        slots = torch.randperm(cache.blocks * 128, device=device)[: C + pad].long()
+        slots[C:] = -1
+        slots[1:C:7] = -1  # rejected / evicted rows among the real ones
+        positions = torch.randint(0, MAX_POS, (C + pad,), generator=gen, device=device)
+        positions[C:] = 0
+        before = cache.buffer.clone()
+        assert state.store_context(kv, positions, slots)
+        torch.accelerator.synchronize(device)
+        padded = cache.buffer.clone()
+        cache.buffer.copy_(before)
+        assert state.store_context(kv[:C], positions[:C], slots[:C])
+        torch.accelerator.synchronize(device)
+        i16 = torch.int16
+        same = padded.view(i16) == cache.buffer.view(i16)
+        assert bool(same.all()), f"C{C}+{pad}: {int((~same).sum())} differ (unpadded)"
+        cache.buffer.copy_(before)
+        stock_context(layers, kv, positions, slots, [cache.view(i) for i in range(LAYERS)])
+        torch.accelerator.synchronize(device)
+        same = padded.view(i16) == cache.buffer.view(i16)
+        assert bool(same.all()), f"C{C}+{pad}: {int((~same).sum())} differ (stock)"
+        written = int((padded.view(i16) != before.view(i16)).sum())
+        live = int((slots[:C] >= 0).sum())
+        assert written == live * LAYERS * H * 2 * HEAD, (written, live)
+        del cache, before, padded
+
+
+@pytest.mark.parametrize("kv_heads,q", PADDED + ((2, 7), (2, 3)))
+def test_window_start_stage_edges(kv_heads, q):
+    """Window starts lo with lo % 32 in 26..31 (the query rows' own starts cross a
+    32-key stage edge) at the 16-split small batches and a cluster batch, over NaN
+    planner slot pages: inserts identical to stock's, rows as close to FP64."""
+    device = _device()
+    gen = torch.Generator(device=device).manual_seed(77 * kv_heads + q)
+    layers = make_layers(kv_heads, gen)
+    batches = (2, 4, 8, 16)
+    state = install(layers, q, batches)
+    for B in batches:
+        seed = 31 * kv_heads + 7 * q + B
+        order = torch.randperm(len(WINDOW_EDGES), generator=torch.Generator().manual_seed(seed))
+        contexts = [WINDOW_EDGES[int(order[b % len(WINDOW_EDGES)])] for b in range(B)]
+        ours, stock, exact, lengths, differ = run_case(
+            state, layers, "planner", B, q, gen, fill="nan", contexts=contexts,
+            seed=seed,
+        )  # fmt: skip
+        label = f"H{kv_heads} q{q} B{B} edges {state.shapes[B]}"
+        assert differ == 0, f"{label}: {differ} cache elements differ from stock"
+        check_rows(ours, stock, exact, B, q, label)
