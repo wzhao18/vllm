@@ -24,10 +24,11 @@ The renders are `dsrelk5-c128-1p1d[-ev]-{xdr,spx}` and `dsrelk5-c160-1p1d-llh[-e
    - The k5 list holds 6B for the verify batches and 5B for the drafter batches.
    - Re-deriving at k = 3 returns the frozen list unchanged (checked).
    - Model Runner V2 captures one FULL graph per size, rounded up to whole requests. The verify graphs go from 82 to
-     96 batches and the drafter graphs from 80 to 90. Every frozen verify or drafter batch keeps a graph.
-   - Batches with a frozen graph that lose their own at k5: verify B41, and 17 drafter by-products of the k3 rounding
-     (B11, B14, B19, B43, B59, B67, B78, B86, B91, B102, B107, B118, B123, B134, B139, B150, B155). Each pads to its
-     next graph.
+     96 batches and the drafter graphs from 80 to 90.
+   - Every batch the frozen list holds verify or drafter rows for keeps its graph at k5.
+   - Some frozen graphs are only by-products: one role's size rounded up to the other's rows. k5 does not re-make 18 of
+     them: verify B41 and drafter B11, B14, B19, B43, B59, B67, B78, B86, B91, B102, B107, B118, B123, B134, B139,
+     B150, B155. Each of those batches pads to its next graph.
    - At the operating batches (B20-B50) every batch pads to the same graph as at k3 or a closer one, except verify B41
      (-> B42) and drafter B43 (-> B44).
    - The largest verify and drafter batches (the capacity anchors) stay B160 / B160.
