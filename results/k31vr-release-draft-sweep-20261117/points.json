@@ -1,0 +1,44 @@
+{
+ "points": [
+  {
+   "label": "C1",
+   "run": "C1-a1118776",
+   "topology": "1P1D: P TP8+DCP8, D TP16+DCP16",
+   "chosen": true,
+   "note": "",
+   "gsm8k_strict": null,
+   "gsm8k_real_al": null,
+   "k": null,
+   "gpus": 24,
+   "ok": 438,
+   "err": 2,
+   "span_min": 59.9,
+   "tput_per_gpu": 1358.9,
+   "p90_intvty": 901.42,
+   "p90_e2e_norm_intvty": 332.2,
+   "p90_e2el_s": 5.556,
+   "p90_ttft_s": 0.4,
+   "p50_ttft_s": 0.276
+  },
+  {
+   "label": "C64",
+   "run": "C64-a1118777",
+   "topology": "1P1D: P TP8+DCP8, D TP16+DCP16",
+   "chosen": true,
+   "note": "",
+   "gsm8k_strict": null,
+   "gsm8k_real_al": null,
+   "k": null,
+   "gpus": 24,
+   "ok": 12207,
+   "err": 3,
+   "span_min": 60.1,
+   "tput_per_gpu": 21526.7,
+   "p90_intvty": 300.0,
+   "p90_e2e_norm_intvty": 136.3,
+   "p90_e2el_s": 7.216,
+   "p90_ttft_s": 0.96,
+   "p50_ttft_s": 0.35
+  }
+ ]
+}

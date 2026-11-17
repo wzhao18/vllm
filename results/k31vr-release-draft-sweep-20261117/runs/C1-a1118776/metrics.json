@@ -1,0 +1,1 @@
+{"label": "C1", "out": "/lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/outputs/a1118776-dsrel-c1-xdr-1117081332", "gpus": 24, "ok": 438, "err": 2, "span_min": 59.9, "tput_per_gpu": 1358.9, "p90_itl_ms": 1.109, "p90_intvty": 901.42, "p90_e2e_norm_intvty": 332.2, "p90_e2el_s": 5.556, "p90_ttft_s": 0.4, "p50_ttft_s": 0.276}
