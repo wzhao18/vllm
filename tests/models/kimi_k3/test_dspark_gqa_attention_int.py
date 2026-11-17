@@ -530,4 +530,27 @@ def test_install_refuses_unsupported_geometry():
         model_config=SimpleNamespace(max_model_len=2 * MAX_POS),
     )
     assert install_gqa_attention(layers, longer, [7], [8], False) is None
+    # the stock norm / RoPE are not vLLM's C kernels (the arithmetic implemented)
+    native_norm = SimpleNamespace(
+        **vars(config),
+        kernel_config=SimpleNamespace(
+            ir_op_priority=SimpleNamespace(rms_norm=["native", "vllm_c"])
+        ),
+    )
+    native_rope = SimpleNamespace(
+        **vars(config),
+        compilation_config=SimpleNamespace(is_custom_op_enabled=lambda op: False),
+    )
+    for other in (native_norm, native_rope):
+        assert install_gqa_attention(layers, other, [7], [8], False) is None
+        with pytest.raises(Uncovered):
+            install_gqa_attention(layers, other, [7], [8], True)
+    production = SimpleNamespace(
+        **vars(config),
+        kernel_config=SimpleNamespace(
+            ir_op_priority=SimpleNamespace(rms_norm=["vllm_c", "native"])
+        ),
+        compilation_config=SimpleNamespace(is_custom_op_enabled=lambda op: True),
+    )
+    assert install_gqa_attention(layers, production, [7], [8], True) is not None
     assert math.isfinite(EPS)

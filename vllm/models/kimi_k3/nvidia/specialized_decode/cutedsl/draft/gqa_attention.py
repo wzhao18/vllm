@@ -42,6 +42,7 @@ assigns to the deployment's drafter batches. The context insert takes the page a
 strides at run time and compiles at install.
 """
 
+import inspect
 from dataclasses import dataclass, field
 
 import torch
@@ -82,6 +83,38 @@ GQA_WINDOW = {
     (4, 7): ((16, (8, 2, 3, 0)), (32, (4, 2, 3, 0)), (64, (2, 2, 3, 0)), (0, (1, 2, 3, 0))),
     (4, 3): ((16, (8, 2, 3, 0)), (32, (4, 2, 3, 0)), (64, (2, 2, 3, 0)), (0, (1, 2, 3, 0))),
 }  # fmt: skip
+
+
+def window_options():
+    """GqaWindow's rounding option for the stock drafter's arithmetic: the q / k norm
+    output rounded to BF16 before RoPE, as vLLM's rms_norm and rotary_embedding kernels
+    (the dispatch ``stock_dispatch_reason`` requires). Kernels without the option round
+    it always."""
+    if "round_norm" in inspect.signature(compile_window).parameters:
+        return {"round_norm": True}
+    return {}
+
+
+def stock_dispatch_reason(vllm_config):
+    """Why the stock drafter's q_norm / k_norm / RoPE would not run vLLM's C kernels
+    (rms_norm through the IR priority's ``vllm_c``, the rotary_embedding custom op):
+    the arithmetic the fused kernels implement (the drafter is never torch.compiled:
+    K3GqaDSparkModel ignores compilation, so a native dispatch would run eager torch
+    ops of other rounding points). None: it would."""
+    import vllm.envs as envs
+
+    if envs.VLLM_BATCH_INVARIANT:
+        return "the batch-invariant RMSNorm"
+    kernel = getattr(vllm_config, "kernel_config", None)
+    priority = getattr(getattr(kernel, "ir_op_priority", None), "rms_norm", None)
+    if priority and priority[0] != "vllm_c":
+        return f"rms_norm IR priority {list(priority)} (vllm_c first: the C kernel)"
+    compilation = getattr(vllm_config, "compilation_config", None)
+    if compilation is not None and not compilation.is_custom_op_enabled(
+        "rotary_embedding"
+    ):
+        return "the native rotary_embedding (custom op off)"
+    return None
 
 
 def window_shape(kv_heads, q, batch):
@@ -237,7 +270,7 @@ class GqaAttentionState:
         splits, kgroups, ring, ahead = shape
         return compile_window(
             GROUP, self.kv_heads, self.q, page, splits, kgroups, ring, WINDOW, None,
-            self.max_position, self.device.index, 0, ahead,
+            self.max_position, self.device.index, ahead=ahead, **window_options(),
         )  # fmt: skip
 
     def _bound(self, index):
@@ -505,7 +538,7 @@ def install_gqa_attention(layers, vllm_config, query_rows, context_rows, strict)
     ``query_rows`` / ``context_rows``: the drafter graphs' row counts."""
     spec = vllm_config.speculative_config
     q = spec.num_speculative_tokens if spec is not None else 0
-    reason = layer_reason(layers)
+    reason = layer_reason(layers) or stock_dispatch_reason(vllm_config)
     if reason is None and (not q or any(r % q for r in query_rows)):
         reason = f"drafter rows {sorted(query_rows)} not whole {q}-row requests"
     if reason is None:
