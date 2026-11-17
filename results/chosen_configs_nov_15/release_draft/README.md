@@ -47,7 +47,7 @@ nothing.
    - `"attention_backend": "TOKENSPEED_MLA"` becomes the `--draft-attn-backend` knob, default **FLASHINFER**.
    - One value covers both roles: P writes the draft KV, NIXL moves it and D reads it, so both must use one layout.
    - TOKENSPEED_MLA is MLA-only. vLLM rejects it for the draft layers (head_size, kv_cache_dtype, non-MLA, sliding
-     window; see `checks/vllm_check-20261116.log`), so the frozen value cannot start.
+     window; see `checks/vllm_check-20261116.out`), so the frozen value cannot start.
    - `auto` drops the key; configure_dense_draft then picks FLASH_ATTN, which is FA2 via PTX on sm_107.
    - The draft KV dtype stays the stock `auto` (BF16).
 3. **Synthetic AL** (AgentX renders only). `synthetic_acceptance_length` becomes the release golden AL for the render's k:
@@ -93,9 +93,9 @@ render/sbatch_script.sh:4,41,55,68  job name, Config path, cp "<renders>/dsrel-c
 ## Validation (GPU-free, nothing submitted)
 
 - **`gen_dsrel.py` self-check.** For every render, the parsed YAML of both `render/config.yaml` and `hybrid.yaml` differs
-  from its source in exactly 3 keys: the 2 speculative-configs and the draft extra_mount. Log: `checks/gen-20261116T1900.log`.
+  from its source in exactly 3 keys: the 2 speculative-configs and the draft extra_mount. Log: `checks/gen-20261116T1900.out`.
 - **`check_dsrel.py`** (Hecate, srtctl venv): `CHECK_DSREL PASS: 0 failure(s), 2 warning(s), 32 renders`, 1,663 checks
-  (`checks/check-20261116T1900.log`). It checks:
+  (`checks/check-20261116T1900.out`). It checks:
   - byte-level file checks against the renamed source;
   - the parsed-YAML diff;
   - speculative-config semantics on prefill = decode;
