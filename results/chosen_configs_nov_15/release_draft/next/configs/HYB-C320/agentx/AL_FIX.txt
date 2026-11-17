@@ -1,0 +1,1 @@
+2026-11-17T11:31:34-08:00 AL -> 3.08 (k=3, InferenceX K3.1 RELEASE golden table: InferenceX 5146af7ab7 inferencex-e2e/infx/golden_al_distribution/kimi-k3.1-pro__dspark__kimi-k3.1-pro-dspark__probabilistic-block.yaml; was 2.88 = preview table)
