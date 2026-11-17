@@ -1,0 +1,8 @@
+made dsrelk5-c128-1p1d-xdr          nodes=6  k=5 synthetic AL=3.81  backend=FLASH_ATTN  draft=/raid/common-models/kimi-k3.1-pro-dspark tree=ll-integ-dea4ebd06f parsed-diffs config=5 hybrid=5
+made dsrelk5-c128-1p1d-spx          nodes=6  k=5 synthetic AL=3.81  backend=FLASH_ATTN  draft=/raid/common-models/kimi-k3.1-pro-dspark tree=ll-integ-dea4ebd06f parsed-diffs config=5 hybrid=5
+made dsrelk5-c128-1p1d-ev-xdr       nodes=6  k=5 block     AL=-     backend=FLASH_ATTN  draft=/raid/common-models/kimi-k3.1-pro-dspark tree=ll-integ-dea4ebd06f parsed-diffs config=5 hybrid=5
+made dsrelk5-c128-1p1d-ev-spx       nodes=6  k=5 block     AL=-     backend=FLASH_ATTN  draft=/raid/common-models/kimi-k3.1-pro-dspark tree=ll-integ-dea4ebd06f parsed-diffs config=5 hybrid=5
+made dsrelk5-c160-1p1d-llh-xdr      nodes=6  k=5 synthetic AL=3.81  backend=FLASH_ATTN  draft=/raid/common-models/kimi-k3.1-pro-dspark tree=ll-integ-dea4ebd06f parsed-diffs config=5 hybrid=5
+made dsrelk5-c160-1p1d-llh-spx      nodes=6  k=5 synthetic AL=3.81  backend=FLASH_ATTN  draft=/raid/common-models/kimi-k3.1-pro-dspark tree=ll-integ-dea4ebd06f parsed-diffs config=5 hybrid=5
+made dsrelk5-c160-1p1d-llh-ev-xdr   nodes=6  k=5 block     AL=-     backend=FLASH_ATTN  draft=/raid/common-models/kimi-k3.1-pro-dspark tree=ll-integ-dea4ebd06f parsed-diffs config=5 hybrid=5
+made dsrelk5-c160-1p1d-llh-ev-spx   nodes=6  k=5 block     AL=-     backend=FLASH_ATTN  draft=/raid/common-models/kimi-k3.1-pro-dspark tree=ll-integ-dea4ebd06f parsed-diffs config=5 hybrid=5

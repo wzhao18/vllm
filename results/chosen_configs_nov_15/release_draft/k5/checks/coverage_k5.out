@@ -1,0 +1,51 @@
+
+######## /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/renders/frz-c160-1p1d-llh-xdr/render/config.yaml: k3, max-num-seqs 160, cap 640, 104 capture sizes
+
+== target q4 (k3): 82 captured verify rows 8..640, capacity 640, wide rows 73, wide gate open
+  whole-step stock forward (refused on the target): none
+  per captured row M (B = M / q):
+    8-40: prepared GENERIC (kda kdasplit)
+    48: prepared GENERIC (kda loopstock)
+    56: prepared GENERIC (kda kdasplit)
+    64: prepared GENERIC (kda loopstock)
+    68-140: wide kda=GENERIC[loopstock] dsa=GENERIC oproj=GENERIC moe=GENERIC attn_res=GENERIC embed=ring
+    144-168: wide kda=GENERIC[kdasplit] dsa=GENERIC oproj=GENERIC moe=GENERIC attn_res=GENERIC embed=ring
+    176-256: wide kda=GENERIC[feed] dsa=GENERIC oproj=GENERIC moe=GENERIC attn_res=GENERIC embed=ring
+    264-372: wide kda=GENERIC[feed] dsa=GENERIC oproj=GENERIC moe=GENERIC attn_res=GENERIC embed=stock-embed
+    384-640: wide kda=GENERIC[feed] dsa=GENERIC oproj=GENERIC moe=GENERIC attn_res=STOCK embed=stock-embed
+
+== release drafter k3: 80 drafter batches B2..B160 (query rows B*3 6..480, context rows B*4 8..640)
+  strict-table gaps (refused on the target): none
+  attention: the fused GQA window kernel (track K's cutedsl.draft.gqa_attention installer) at query rows 6..480 / context rows 8..640: not in this tree
+  per drafter batch B:
+    2: markov gated; sites one-shot; lm_head GEMV; qkv/o/gate_up/down splitK/splitK/splitK/splitK; context sharded fc/kv splitK/splitK
+    3-5: markov gated+staged; sites two-shot; lm_head cuBLAS; qkv/o/gate_up/down splitK/splitK/splitK/splitK; context sharded fc/kv splitK/splitK
+    6-8: markov gated+staged; sites two-shot; lm_head evict-first; qkv/o/gate_up/down splitK/splitK/splitK/cuBLAS; context sharded fc/kv splitK/splitK
+    10: markov MarkovWide; sites two-shot; lm_head evict-first; qkv/o/gate_up/down splitK/splitK/splitK/cuBLAS; context sharded fc/kv cuBLAS/splitK
+    11-16: markov MarkovWide; sites two-shot; lm_head cuBLAS; qkv/o/gate_up/down splitK/cuBLAS/splitK/cuBLAS; context sharded fc/kv cuBLAS/splitK
+    18-21: markov MarkovWide; sites two-shot; lm_head cuBLAS; qkv/o/gate_up/down splitK/cuBLAS/splitK/cuBLAS; context sharded fc/kv cuBLAS/cuBLAS
+    22-160: markov MarkovWide; sites ArNormRows; lm_head cuBLAS; qkv/o/gate_up/down cuBLAS/cuBLAS/cuBLAS/cuBLAS; context sharded fc/kv cuBLAS/cuBLAS
+
+######## /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/k5cfg/renders/dsrelk5-c160-1p1d-llh-xdr/render/config.yaml: k5, max-num-seqs 160, cap 960, 123 capture sizes
+
+== target q6 (k5): 96 captured verify rows 12..960, capacity 960, wide rows 88, wide gate open
+  whole-step stock forward (refused on the target): none
+  per captured row M (B = M / q):
+    12-60: prepared GENERIC (kda kdasplit)
+    66-90: wide kda=GENERIC[kdasplit] dsa=GENERIC oproj=GENERIC moe=GENERIC attn_res=GENERIC embed=ring
+    96-252: wide kda=GENERIC[loopstock] dsa=GENERIC oproj=GENERIC moe=GENERIC attn_res=GENERIC embed=ring
+    264-378: wide kda=GENERIC[loopstock] dsa=GENERIC oproj=GENERIC moe=GENERIC attn_res=GENERIC embed=stock-embed
+    384-960: wide kda=GENERIC[loopstock] dsa=GENERIC oproj=GENERIC moe=GENERIC attn_res=STOCK embed=stock-embed
+
+== release drafter k5: 90 drafter batches B2..B160 (query rows B*5 10..800, context rows B*6 12..960)
+  strict-table gaps (refused on the target): none
+  attention: the fused GQA window kernel (track K's cutedsl.draft.gqa_attention installer) at query rows 10..800 / context rows 12..960: not in this tree
+  per drafter batch B:
+    2: markov gated; sites two-shot; lm_head cuBLAS; qkv/o/gate_up/down splitK/splitK/splitK/splitK; context sharded fc/kv splitK/splitK
+    3: markov gated+staged; sites two-shot; lm_head cuBLAS; qkv/o/gate_up/down splitK/splitK/splitK/splitK; context sharded fc/kv splitK/splitK
+    5: markov gated+staged; sites two-shot; lm_head evict-first; qkv/o/gate_up/down splitK/splitK/splitK/cuBLAS; context sharded fc/kv splitK/splitK
+    6: markov gated+staged; sites two-shot; lm_head evict-first; qkv/o/gate_up/down splitK/splitK/splitK/cuBLAS; context sharded fc/kv cuBLAS/splitK
+    7-8: markov gated+staged; sites two-shot; lm_head cuBLAS; qkv/o/gate_up/down splitK/cuBLAS/splitK/cuBLAS; context sharded fc/kv cuBLAS/splitK
+    10: markov MarkovWide; sites two-shot; lm_head cuBLAS; qkv/o/gate_up/down splitK/cuBLAS/splitK/cuBLAS; context sharded fc/kv cuBLAS/splitK
+    12: markov MarkovWide; sites two-shot; lm_head cuBLAS; qkv/o/gate_up/down splitK/cuBLAS/splitK/cuBLAS; context sharded fc/kv cuBLAS/cuBLAS
+    13-160: markov MarkovWide; sites ArNormRows; lm_head cuBLAS; qkv/o/gate_up/down cuBLAS/cuBLAS/cuBLAS/cuBLAS; context sharded fc/kv cuBLAS/cuBLAS

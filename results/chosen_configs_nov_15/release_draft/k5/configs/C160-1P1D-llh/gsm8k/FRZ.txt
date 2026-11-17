@@ -1,0 +1,2 @@
+frz frz-c160-1p1d from /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/e2e/renders/llintg-c160-1p1d-wm05-ev-xdr (2026-11-14T17:28:36-08:00): frozen tree ll-integ-dea4ebd06f (b68d67e7e), decode watermark 0.05, K3.1 golden AL
+frz-c160-1p1d-llh = frz-c160-1p1d + prefill MooncakeStore lookup_from_local_hit true (as the k7 renders); midcurve wf_57be828b (2026-11-15T00:17:48-08:00)

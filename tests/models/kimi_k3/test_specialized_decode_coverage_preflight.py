@@ -14,6 +14,8 @@ coverage decisions on CPU, against a faked VR200 (212 SMs, SM107 shared memory),
   and
 - an arbitrary deployment: every verify row 1..1024 (q4 and q8) captured, max-num-seqs
   raised to match (``cfg2bench.build --rows`` of every row),
+- the C128 / C160 1P1D llh decode role at k5 (q6, ``PRODUCTION``): its production
+  capture list and every q6 verify row up to 1024,
 
 and asserts that no build-time site refuses, that every captured row runs the
 specialized step, and that every kernel whose CTAs wait on other ranks' same-kernel
@@ -107,6 +109,19 @@ POINTS = {
     "c160": (3, 128, 512, Q4_SIZES_512),
     "c256": (3, 128, 512, Q4_SIZES_512),
 }
+# The C128 / C160 1P1D llh decode role at k5 (q6: results/chosen_configs_nov_15/
+# release_draft/k5, gen_dsrel.py --k-override): its production capture list as the
+# runner captures it (not a cfg2bench point: no nqbench snapshot), as (name, q,
+# max-num-seqs, capture cap, capture sizes).
+Q6_SIZES_960 = (
+    "10,12,24,25,30,35,36,40,48,50,60,65,72,75,80,84,90,96,102,105,108,110,114,115,120,"
+    "125,126,130,132,135,138,140,144,145,150,155,156,160,162,168,170,174,180,186,190,"
+    "192,198,200,204,210,216,220,228,230,234,240,250,252,260,264,270,276,280,288,290,"
+    "300,306,310,312,320,324,336,340,342,348,360,372,378,380,384,396,400,408,414,420,"
+    "432,440,450,456,460,468,480,486,500,504,520,522,528,540,552,558,560,576,580,600,"
+    "620,624,640,648,672,696,720,744,768,792,800,816,840,864,888,912,936,960"
+)
+PRODUCTION = (("c160k5-prod", 6, 160, 960, Q6_SIZES_960),)
 # The rows the n4 bench ran above the production limit ('hi': c64-hi, c256-hi).
 HI_ROWS = {7: (512, 1024), 3: (768, 1024)}
 TOP_ROWS = 1024
@@ -153,6 +168,13 @@ def deployments():
             built = cfg2bench.build(doc, "ls", "new", rows)
             sizes_ = tuple(built["capture_sizes"])
             out.append((label, q, built["mns"], built["max_capture"], sizes_))
+    for name, q, mns, cap, sizes in PRODUCTION:
+        out.append((name, q, mns, cap, tuple(int(s) for s in sizes.split(","))))
+        rows = list(range(q, TOP_ROWS + 1, q))  # every verify row up to 1024
+        doc = point_doc(q - 1, mns, cap, sizes)
+        built = cfg2bench.build(doc, "ls", "new", rows)
+        out.append((f"{name[:-5]}-any", q, built["mns"], built["max_capture"],
+                    tuple(built["capture_sizes"])))  # fmt: skip
     return out
 
 
@@ -601,7 +623,7 @@ def test_target_step_covers_every_captured_row(monkeypatch, deployment):
     gaps.check()
 
 
-@pytest.mark.parametrize("q", [4, 8])
+@pytest.mark.parametrize("q", [4, 6, 8])
 def test_target_dsa_wide_grids_resident(q):
     """WideDsa at every wide verify row up to 1024: its MlaQuery's polling clusters
     (dsa/wide.py check_query_residency: the whole grid up to WIDE_MAX_ROWS; above it

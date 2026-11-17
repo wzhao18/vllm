@@ -28,6 +28,12 @@ Per render (dsrel-<base>[-ev]-<fab> vs its source frz-<base>[-ev]-<fab>):
      frozen source's re-render differs from the frozen source's files (paths and Generated stamps only).
 Once: the release draft dir (config.json md5, safetensors size, sha256 record, the fields the configs rely on) and the
 vLLM tree on the PYTHONPATH (present, full, release-draft code present = launch-ready).
+
+k-variant renders (gen_dsrel.py --k-override, change 7; pass the same --k-override here): checks 3 and 4 also accept
+exactly num_speculative_tokens K on both roles (AL = the release golden AL of K) and the decode role's
+cudagraph_capture_sizes / max-cudagraph-capture-size, which must equal gen_dsrel.derive_capture_sizes of the frozen list
+and max-num-seqs x (K+1); hybrid.yaml carries the same decode capture keys. --renders DIR (testing) reads the frz-*
+sources and the renders from DIR instead of the e2e renders dir.
 """
 
 from __future__ import annotations
@@ -86,8 +92,40 @@ def spec_of(cfg: dict, role: str) -> dict:
     return json.loads(cfg["roles"][role]["args"]["speculative-config"])
 
 
+def decode_capture(cfg: dict) -> tuple[list, int, int]:
+    a = cfg["roles"]["decode"]["args"]
+    comp = json.loads(a["compilation-config"])
+    return comp["cudagraph_capture_sizes"], int(a["max-cudagraph-capture-size"]), int(a["max-num-seqs"])
+
+
+def check_k_variant(name: str, cfg_old: dict, cfg_new: dict, hybrid_new: dict, k: int, k_new: int) -> None:
+    """Change 7: the decode capture keys re-derived for q = K + 1 (and the same in hybrid.yaml)."""
+    sizes, cap, mns = decode_capture(cfg_old)
+    new, new_cap, new_mns = decode_capture(cfg_new)
+    exp = G.derive_capture_sizes(sizes, k, k_new, mns)[0]
+    ok(new == exp, f"{name}: decode capture sizes = derive_capture_sizes(frozen, k{k} -> k{k_new}) ({len(new)} sizes)")
+    ok(new_cap == mns * (k_new + 1) == new[-1] and new_mns == mns,
+       f"{name}: decode max-cudagraph-capture-size {cap} -> {new_cap} = max-num-seqs {mns} x q{k_new + 1}")
+    ok(G.derive_capture_sizes(sizes, k, k, mns)[0] == sizes, f"{name}: the frozen list re-derives to itself at k{k}")
+    v_old, d_old = G.captured_graphs(sizes, k, mns, cap)
+    v_new, d_new = G.captured_graphs(new, k_new, mns, new_cap)
+    _, verify, draft = G.derive_capture_sizes(sizes, k, k_new, mns)
+    ok(set(verify) <= set(v_new) and set(draft) <= set(d_new) and (v_new[-1], d_new[-1]) == (v_old[-1], d_old[-1]),
+       f"{name}: k{k_new} FULL graphs hold the frozen list's {len(verify)} verify / {len(draft)} drafter batches, "
+       f"largest {v_new[-1]} / {d_new[-1]}")
+    ok(decode_capture(hybrid_new) == (new, new_cap, new_mns), f"{name}: hybrid.yaml decode capture keys = config.yaml's")
+    roles = {r: (int(cfg_new["roles"][r]["args"]["max-num-seqs"]), int(cfg_new["roles"][r]["args"]["max-num-batched-tokens"]))
+             for r in ("prefill", "decode")}
+    try:
+        G.k_limits(roles, k_new)
+        why = ""
+    except G.GenError as e:
+        why = str(e)
+    ok(not why, f"{name}: max-num-batched-tokens {roles} hold the k{k_new} draft pass and verify rows {why}")
+
+
 def check_render(src: str, dst: str, base: str, kind: str, prefix: str, backend: str, tree: str | None,
-                 weights: tuple[str, str] | None = None) -> dict:
+                 weights: tuple[str, str] | None = None, k_new: int | None = None) -> dict:
     name = os.path.basename(dst)
     sname = os.path.basename(src)
     print(f"\n== {name}  (source {sname})")
@@ -131,14 +169,17 @@ def check_render(src: str, dst: str, base: str, kind: str, prefix: str, backend:
     # parsed YAMLs
     cfg_new = yaml.safe_load(open(f"{dst}/render/config.yaml"))
     cfg_old = yaml.safe_load(open(f"{src}/render/config.yaml"))
+    k_src = spec_of(cfg_old, "decode")["num_speculative_tokens"]
+    k = k_src if k_new is None else k_new
     for f in ("render/config.yaml", "hybrid.yaml"):
         diffs = G.yaml_diff(open(f"{src}/{f}").read(), open(f"{dst}/{f}").read(), base, prefix)
-        bad = G.check_diff(diffs, tree or G.FROZEN_TREE, weights)
+        bad = G.check_diff(diffs, tree or G.FROZEN_TREE, weights, k != k_src)
         ok(not bad, f"{name}: {f} parsed diff = {len(diffs)} keys, all draft keys ({'; '.join(bad)[:400]})")
         t = open(f"{dst}/{f}").read()
         ok("kimi-k3.1-pro-dspark-preview" not in t and "TOKENSPEED_MLA" not in t, f"{name}: {f} has no preview draft / TOKENSPEED_MLA")
+    if k_new is not None:
+        check_k_variant(name, cfg_old, cfg_new, yaml.safe_load(open(f"{dst}/hybrid.yaml")), k_src, k_new)
     sp, sd = spec_of(cfg_new, "prefill"), spec_of(cfg_new, "decode")
-    k = spec_of(cfg_old, "decode")["num_speculative_tokens"]
     ok(sp == sd, f"{name}: prefill and decode speculative-config identical")
     exp = {"method": "dspark", "model": G.RELEASE_MNT, "num_speculative_tokens": k}
     if backend != "auto":
@@ -312,8 +353,19 @@ def main(argv=None) -> int:
     ap.add_argument("--no-render", action="store_true", help="skip the srtctl render step")
     ap.add_argument("--target-weights", default=None, metavar="WEIGHTS_DIR,MODEL_VIEW",
                     help="the --target-weights gen_dsrel.py was given")
+    ap.add_argument("--k-override", default=None, metavar="POINT=K[,POINT=K]",
+                    help="the --k-override gen_dsrel.py was given (--points and the prefix default as there)")
+    ap.add_argument("--renders", default=G.RS, help="testing: the dir holding the frz-* sources and the renders")
     a = ap.parse_args(argv)
     weights = tuple(os.path.normpath(x) for x in a.target_weights.split(",")) if a.target_weights else None
+    overrides = G.parse_k_override(a.k_override, {p: b for p, b, _ in G.POINTS})
+    if overrides and a.points == ap.get_default("points"):
+        a.points = ",".join(overrides)
+    if overrides and a.prefix == ap.get_default("prefix"):
+        G.need(len(set(overrides.values())) == 1, "--k-override with several K: give --prefix")
+        a.prefix = f"dsrelk{next(iter(overrides.values()))}"
+    G.need(all(p in overrides for p in a.points.split(",")) if overrides else True, "points without a k override")
+    renders = os.path.normpath(a.renders)
     # refusing stubs first on PATH: nothing this checker runs (srtctl render, RuntimeContext) may call Slurm
     stubs = f"{a.scratch}/slurm-stubs"
     os.makedirs(stubs, exist_ok=True)
@@ -334,12 +386,12 @@ def main(argv=None) -> int:
         for fab in a.fabrics.split(","):
             got = {}
             for kind in a.kinds.split(","):
-                src = f"{G.RS}/{G.frz_name(base, kind, fab)}"
-                dst = f"{G.RS}/{G.dst_name(a.prefix, base, kind, fab)}"
+                src = f"{renders}/{G.frz_name(base, kind, fab)}"
+                dst = f"{renders}/{G.dst_name(a.prefix, base, kind, fab)}"
                 if not ok(os.path.isdir(dst), f"{dst} exists"):
                     continue
                 info = check_render(src, dst, base, kind, a.prefix, a.draft_attn_backend, os.path.normpath(a.tree),
-                                    weights)
+                                    weights, overrides.get(label))
                 trees.add(info["tree"])
                 check_mounts(dst, weights)
                 if not a.no_render:
