@@ -15,6 +15,7 @@ forward ...`, one process per GPU.
 
 import argparse
 import json
+import math
 import os
 import socket
 from dataclasses import asdict
@@ -278,6 +279,11 @@ def main(args: argparse.Namespace) -> None:
                 f"eager rel rms {rank0['graph_vs_eager']['relative_rms']:.1e}",
                 flush=True,
             )
+            rel_rms = rank0["graph_vs_eager"]["relative_rms"]
+            if not math.isfinite(rel_rms):
+                # Non-finite outputs change data-dependent kernel timing (routing,
+                # top-k): this case's latency is not a valid measurement.
+                print(f"[forward] {case.name}: INVALID non-finite output", flush=True)
             if profile := rank0.get("profile"):
                 from vllm.benchmarks.forward.profile import format_summary
 

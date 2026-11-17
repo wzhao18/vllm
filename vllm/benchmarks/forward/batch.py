@@ -115,9 +115,16 @@ def build_batch(
             skipped, live = _num_blocks(
                 group.kv_cache_spec, computed, req.kv_len + lookahead, dcp_size
             )
-            block_ids.append([0] * skipped + list(range(cursor, cursor + live)))
-            ranges.append((cursor, cursor + live))
-            cursor += live
+            # A slot-packed group (``blocks_per_pool_block`` S > 1) addresses slot
+            # j in pool row j // S: reserve whole rows from the shared cursor and
+            # hand out the slot ids inside them. ``ranges`` stays in row units,
+            # which kv_init's per-tensor factor (S) expands to those rows' slots.
+            slots = getattr(group, "blocks_per_pool_block", 1)
+            rows = -(-live // slots)
+            first = cursor * slots
+            block_ids.append([0] * skipped + list(range(first, first + live)))
+            ranges.append((cursor, cursor + rows))
+            cursor += rows
         tokens = rng.integers(0, vocab_size, req.kv_len, dtype=np.int64)
         prompt = tokens[: req.prefix_len] if req.is_decode else tokens
         query_token_ids[req_id] = tokens[computed:]

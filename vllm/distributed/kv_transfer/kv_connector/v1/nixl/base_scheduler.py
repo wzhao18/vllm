@@ -3,6 +3,7 @@
 """Base scheduler-side logic for the NIXL connector."""
 
 import contextlib
+import math
 import threading
 import time
 from collections.abc import Callable
@@ -47,6 +48,7 @@ from vllm.utils.network_utils import make_zmq_path
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    CircularBufferSpec,
     FullAttentionSpec,
     MambaSpec,
     SlidingWindowSpec,
@@ -111,7 +113,22 @@ class NixlBaseConnectorScheduler:
             parallel_config.tensor_parallel_size,
             parallel_config.decode_context_parallel_size,
         )
-        self.block_size = vllm_config.cache_config.block_size
+        # The transfer block, as the worker computes it (NixlConnectorWorker:
+        # the LCM of the non-state transfer groups' block sizes). The engine's
+        # cache_config.block_size is the smallest prefix-cacheable group's block,
+        # which a smaller group (e.g. a slot-packed draft window) drags below the
+        # attention groups' blocks that P and D pair and count.
+        transfer_block_sizes = [
+            group.kv_cache_spec.block_size
+            for group in kv_cache_config.transfer_groups
+            if get_representative_spec_type(group.kv_cache_spec)
+            not in (MambaSpec, CircularBufferSpec)
+        ]
+        self.block_size = (
+            math.lcm(*transfer_block_sizes)
+            if transfer_block_sizes
+            else vllm_config.cache_config.block_size
+        )
         self.engine_id: EngineId = engine_id
         self.kv_cache_config = kv_cache_config
         self.side_channel_host = envs.VLLM_NIXL_SIDE_CHANNEL_HOST

@@ -778,3 +778,70 @@ def test_plans_reach_every_worker_through_the_scheduler_output_queue():
         writer.shutdown()
         for reader in readers:
             reader.shutdown()
+
+
+def test_small_window_group_does_not_shrink_the_paired_block():
+    """A slot-packed draft window group (blocks smaller than the attention
+    groups', not DCP-sharded) drags the engine's cache_config.block_size down to
+    its own block. The pair-mode scheduler must still count P blocks in the
+    attention groups' block (the worker's LCM), not in that smaller block."""
+    from vllm.v1.kv_cache_interface import SlidingWindowSpec
+
+    small = B // 8
+    vllm_config = create_vllm_config(
+        block_size=B,
+        max_num_seqs=16,
+        max_num_batched_tokens=4 * D_BLOCK,
+        kv_connector_extra_config={"dcp_pair_exchange": True},
+        kv_load_failure_policy="fail",
+    )
+    vllm_config.parallel_config.decode_context_parallel_size = D_DCP
+    vllm_config.cache_config.num_gpu_blocks = 128
+    groups = [
+        KVCacheGroupSpec(
+            ["attn"],
+            FullAttentionSpec(
+                block_size=B, num_kv_heads=1, head_size=16, dtype=torch.float16
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["draft"],
+            SlidingWindowSpec(
+                block_size=small,
+                num_kv_heads=1,
+                head_size=16,
+                dtype=torch.float16,
+                sliding_window=4 * small,
+                dcp_sharded=False,
+            ),
+        ),
+    ]
+    kv_cache_config = KVCacheConfig(
+        num_blocks=128, kv_cache_tensors=[], kv_cache_groups=groups
+    )
+    # What EngineCore does after planning: the smallest prefix-cacheable block.
+    vllm_config.cache_config.block_size = small
+    block_size, hash_block_size = resolve_kv_cache_block_sizes(
+        kv_cache_config, vllm_config
+    )
+    scheduler = Scheduler(
+        vllm_config=vllm_config,
+        kv_cache_config=kv_cache_config,
+        log_stats=True,
+        structured_output_manager=StructuredOutputManager(vllm_config),
+        block_size=block_size,
+        hash_block_size=hash_block_size,
+    )
+    nixl = scheduler.connector.connector_scheduler
+    assert nixl.block_size == B
+    assert nixl._pair_groups == (0,)
+    # P computed the prompt in cdiv(n, P_BLOCK) attention blocks: no skew.
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.dcp_pair_exchange import (
+        check_pair_coverage,
+    )
+
+    n = 5 * P_BLOCK + 3
+    check_pair_coverage(
+        n, n, [list(range(cdiv(n, P_BLOCK)))], nixl._pair_groups,
+        remote_block_tokens=nixl.block_size * P_DCP,
+    )  # fmt: skip
