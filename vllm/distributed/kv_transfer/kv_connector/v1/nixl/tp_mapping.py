@@ -98,6 +98,7 @@ def compute_tp_mapping(
     group_spec_types: tuple[type[KVCacheSpec], ...],
     remote_dcp_size: int = 1,
     head_sharded_kv_heads: int | None = None,
+    draft_kv_heads: int | None = None,
 ) -> TPMapping:
     """Build the complete local-to-remote TP mapping.
 
@@ -109,6 +110,9 @@ def compute_tp_mapping(
 
     ``head_sharded_kv_heads`` maps head-sharded KV with that many total KV heads
     instead of the topology's, e.g. a GQA draft under an MLA target.
+    ``draft_kv_heads`` counts, in the consumer counts, the local ranks reading
+    such a draft (with that many KV heads) from its own source ranks
+    (``head_sharded_source_ranks``), which may differ from the target's.
     """
     tp_rank = transfer_topology.tp_rank
     tp_size = transfer_topology.tp_size
@@ -164,9 +168,12 @@ def compute_tp_mapping(
     # Hybrid attention+SSM: count, for every remote rank, the local ranks that
     # read anything (attention KV or SSM state) from it. With equal DCP sizes
     # (or no DCP) the attention and SSM sources coincide and every count equals
-    # ``local_consumers``; with different DCP sizes they do not.
+    # ``local_consumers``; with different DCP sizes they do not. A head-sharded
+    # draft reads from its heads' owners, which DCP does not move.
     consumers_by_rank = None
-    if has_ssm and transfer_topology.dcp_size != remote_dcp_size:
+    if (
+        has_ssm and transfer_topology.dcp_size != remote_dcp_size
+    ) or draft_kv_heads is not None:
         readers: dict[int, set[int]] = {}
         for rank in range(tp_size):
             sources = set(
@@ -178,7 +185,20 @@ def compute_tp_mapping(
                     is_mla=is_mla,
                     total_num_kv_heads=total_num_kv_heads,
                 )
-            ) | set(transfer_topology.ssm_source_ranks(remote_tp_size, tp_rank=rank))
+            )
+            if has_ssm:
+                sources |= set(
+                    transfer_topology.ssm_source_ranks(remote_tp_size, tp_rank=rank)
+                )
+            if draft_kv_heads is not None:
+                sources |= set(
+                    head_sharded_source_ranks(
+                        transfer_topology,
+                        remote_tp_size,
+                        draft_kv_heads,
+                        tp_rank=rank,
+                    )
+                )
             for source in sources:
                 readers.setdefault(source, set()).add(rank)
         consumers_by_rank = {source: len(r) for source, r in readers.items()}
@@ -190,6 +210,25 @@ def compute_tp_mapping(
         rank_offset_factor=rank_offset_factor,
         local_consumers=local_consumers,
         consumers_by_rank=consumers_by_rank,
+    )
+
+
+def head_sharded_source_ranks(
+    transfer_topology: TransferTopology,
+    remote_tp_size: int,
+    total_num_kv_heads: int,
+    tp_rank: int | None = None,
+) -> list[int]:
+    """Remote ranks holding a local rank's heads of head-sharded KV that DCP
+    does not shard (e.g. a GQA draft at DCP 1 under an MLA target): its heads'
+    owners by TP, whatever the DCP sizes. ``tp_rank`` defaults to this rank."""
+    return _attention_source_ranks(
+        transfer_topology,
+        transfer_topology.tp_rank if tp_rank is None else tp_rank,
+        remote_tp_size,
+        remote_dcp_size=1,
+        is_mla=False,
+        total_num_kv_heads=total_num_kv_heads,
     )
 
 

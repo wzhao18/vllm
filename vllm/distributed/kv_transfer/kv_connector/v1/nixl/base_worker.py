@@ -70,6 +70,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
     _is_attention_spec,
     _is_ssm_spec,
     compute_tp_mapping,
+    head_sharded_source_ranks,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     _NIXL_SUPPORTED_DEVICE,
@@ -292,6 +293,17 @@ class NixlBaseConnectorWorker:
     # Pair mode with VLLM_ITERLOG_DIR: each step's exchange GPU time.
     _pair_times: _PairExchangeTimes | None = None
 
+    # Total KV heads of a non-MLA draft under an MLA target (see
+    # _resolve_head_sharded_draft_kv_heads), its regions and transfer groups
+    # (set by register_kv_caches), and the groups that DCP does not shard: the
+    # drafter runs at DCP 1, so every DCP rank holds every token of its heads.
+    # Under DCP their blocks pair by position from the end, read from the rank
+    # owning the heads; they are never pair-exchanged.
+    _head_sharded_draft_kv_heads: int | None = None
+    _head_sharded_draft_regions: set[int] | frozenset[int] = frozenset()
+    _head_sharded_draft_groups: set[int] | frozenset[int] = frozenset()
+    _dcp_replicated_draft_groups: frozenset[int] = frozenset()
+
     # KV fingerprints (VLLM_NIXL_KV_FINGERPRINT, see kv_fingerprint.py): this
     # rank's log, whose side is P on a producer and D in pair mode, and its
     # fingerprinted layers per KV cache group. Set by register_kv_caches.
@@ -396,10 +408,12 @@ class NixlBaseConnectorWorker:
 
         # Compute desc ids per group using the right stride: FA descs have
         # num_blocks entries per region (kernel granularity, expanded by
-        # block_size_ratio for heterogeneous block sizes), SSM descs have
+        # block_size_ratio for heterogeneous block sizes; a group packed as
+        # slots of the pool blocks has one per slot), SSM descs have
         # logical_blocks entries per region (no kernel splitting, and never
         # ratio-expanded since state blocks are indivisible).
         logical_blocks = dst_num_blocks // physical_blocks_per_logical
+        fa_region_offsets = region_offsets.astype(np.int32)
         all_descs: list[np.ndarray] = []
         for i, group in enumerate(block_ids):
             group_arr = np.asarray(group, dtype=np.int32)
@@ -417,7 +431,7 @@ class NixlBaseConnectorWorker:
                     else np.asarray(group_regions, dtype=np.int32)
                 )[:, None]
                 all_descs.append(
-                    (fa_region_ids * num_blocks + group_arr[None, :]).ravel()
+                    (fa_region_offsets[fa_region_ids] + group_arr[None, :]).ravel()
                 )
             elif _is_ssm_spec(spec_type):
                 # NOTE (NickLucche) SSM and Attention block regions can
@@ -589,31 +603,45 @@ class NixlBaseConnectorWorker:
             return None
         return draft_config.get_total_num_kv_heads()
 
-    def _get_head_sharded_draft_regions(self) -> set[int]:
-        heads = self._head_sharded_draft_kv_heads
-        if heads is None:
-            return set()
+    def _is_draft_layer_name(self, name: str) -> bool:
+        """Whether ``name`` is a layer of the speculative draft model."""
+        if name.startswith("draft_model."):
+            return True
         spec_config = self.vllm_config.speculative_config
         assert spec_config is not None and spec_config.draft_model_config is not None
         target_layers = self.model_config.get_total_num_hidden_layers()
         draft_layers = spec_config.draft_model_config.get_total_num_hidden_layers()
+        # DFlash numbers draft layers after the target instead of prefixing them.
+        match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", name)
+        return match is not None and (
+            target_layers <= int(match.group(1)) < target_layers + draft_layers
+        )
+
+    def _get_head_sharded_draft_regions(self) -> set[int]:
+        heads = self._head_sharded_draft_kv_heads
+        if heads is None:
+            return set()
         regions = set[int]()
         for i, name in enumerate(self.region_names):
-            if self._is_region_replicated(i):
+            if self._is_region_replicated(i) or not self._is_draft_layer_name(name):
                 continue
-            # DFlash numbers draft layers after the target instead of prefixing them.
-            if not name.startswith("draft_model."):
-                match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", name)
-                if match is None or not (
-                    target_layers <= int(match.group(1)) < target_layers + draft_layers
-                ):
-                    continue
             spec = self._layer_specs[name]
             assert isinstance(spec, AttentionSpec) and spec.num_kv_heads <= heads, (
                 f"Draft region {name!r} is inconsistent with {heads} total KV heads"
             )
             regions.add(i)
         return regions
+
+    def _is_dcp_replicated_draft_layer(self, name: str, spec: KVCacheSpec) -> bool:
+        """Whether layer ``name`` belongs to a head-sharded draft that DCP does
+        not shard: a non-MLA drafter running at DCP 1 under an MLA target."""
+        return (
+            self._head_sharded_draft_kv_heads is not None
+            and isinstance(spec, AttentionSpec)
+            and not isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec))
+            and not spec.dcp_sharded
+            and self._is_draft_layer_name(name)
+        )
 
     def _set_region_layers(self, region_layers: list[list[str]]) -> None:
         layer_names = [layer_name for region in region_layers for layer_name in region]
@@ -672,6 +700,7 @@ class NixlBaseConnectorWorker:
                 nixl_agent_meta.region_group_ids,
                 nixl_agent_meta.region_names,
                 nixl_agent_meta.region_mem_types,
+                nixl_agent_meta.region_dcp_sharded,
             )
         ), "Remote region metadata lengths disagree"
 
@@ -717,6 +746,10 @@ class NixlBaseConnectorWorker:
         if nixl_agent_meta.region_mem_types is not None:
             nixl_agent_meta.region_mem_types = [
                 nixl_agent_meta.region_mem_types[i] for i in remote_regions
+            ]
+        if nixl_agent_meta.region_dcp_sharded is not None:
+            nixl_agent_meta.region_dcp_sharded = [
+                nixl_agent_meta.region_dcp_sharded[i] for i in remote_regions
             ]
         if nixl_agent_meta.region_names is not None:
             nixl_agent_meta.region_names = list(self._transfer_layer_names)
@@ -783,7 +816,12 @@ class NixlBaseConnectorWorker:
         nixl_agent_meta.block_strides = [
             nixl_agent_meta.block_strides[i] for i, _, _ in regions
         ]
-        for attr in ("region_num_blocks", "region_group_ids", "region_mem_types"):
+        for attr in (
+            "region_num_blocks",
+            "region_group_ids",
+            "region_mem_types",
+            "region_dcp_sharded",
+        ):
             values = getattr(nixl_agent_meta, attr)
             if values is not None:
                 setattr(nixl_agent_meta, attr, [values[i] for i, _, _ in regions])
@@ -1284,6 +1322,8 @@ class NixlBaseConnectorWorker:
         # (MLA), False -> SPLIT (head-sharded full-attn). Mixed only for models
         # combining both (e.g. GQA main + MLA Eagle-3 draft).
         self._region_is_mla = list[bool]()
+        # Per region, whether DCP shards its token positions (advertised).
+        self._region_dcp_sharded = list[bool]()
         self._head_sharded_draft_regions = set[int]()
         # Transfer groups holding only head-sharded draft regions.
         self._head_sharded_draft_groups = set[int]()
@@ -1361,15 +1401,19 @@ class NixlBaseConnectorWorker:
         config = self.kv_cache_config
         if config.transfer_group_ids != tuple(range(len(config.kv_cache_groups))):
             problems.append("every KV cache group must be a transfer group")
+        # A head-sharded draft at DCP 1 holds every token on every rank: it is
+        # pulled whole from the rank owning its heads, not pair-exchanged.
         replicated = [
             name
             for name, spec in self._layer_specs.items()
-            if isinstance(spec, AttentionSpec) and not spec.dcp_sharded
+            if isinstance(spec, AttentionSpec)
+            and not spec.dcp_sharded
+            and not self._is_dcp_replicated_draft_layer(name, spec)
         ]
         if replicated:
             problems.append(
-                f"every attention layer must be DCP-sharded ({len(replicated)} "
-                f"are not, e.g. {replicated[0]})"
+                "every attention layer but a head-sharded draft's must be "
+                f"DCP-sharded ({len(replicated)} are not, e.g. {replicated[0]})"
             )
         if problems:
             raise ValueError("NIXL dcp_pair_exchange: " + "; ".join(problems) + ".")
@@ -1485,6 +1529,20 @@ class NixlBaseConnectorWorker:
         p_remote_ranks = self.transfer_topo.handshake_target_ranks(
             remote_tp_size, remote_dcp_size
         )
+        if self._head_sharded_draft_regions and self._head_sharded_draft_groups:
+            # A head-sharded draft reads from its heads' owners, whatever the
+            # target's DCP sources.
+            assert self._head_sharded_draft_kv_heads is not None
+            p_remote_ranks = sorted(
+                set(p_remote_ranks)
+                | set(
+                    head_sharded_source_ranks(
+                        self.transfer_topo,
+                        remote_tp_size,
+                        self._head_sharded_draft_kv_heads,
+                    )
+                )
+            )
         remote_rank_to_agent_name: dict[tuple[int, int], str] = {}
         path = make_zmq_path("tcp", host, port)
         # Clock offset to the peer, estimated from the handshake round-trip.
@@ -1879,6 +1937,16 @@ class NixlBaseConnectorWorker:
             raise NotImplementedError(
                 "NIXL host staging does not preserve CSA-linear shared tensors."
             )
+        if self.use_host_buffer and any(
+            group.blocks_per_pool_block > 1
+            for group in self.kv_cache_config.transfer_groups
+        ):
+            # Host staging copies every block ID through every layer, so block
+            # IDs must be unique across groups, which slot IDs are not.
+            raise NotImplementedError(
+                "NIXL host staging does not support KV cache groups packed as "
+                "slots of the pool blocks."
+            )
 
         if self.use_host_buffer:
             self.initialize_host_xfer_buffer(kv_caches=kv_caches)
@@ -1904,8 +1972,11 @@ class NixlBaseConnectorWorker:
 
         registration_ranges: dict[tuple[int, str], tuple[int, int, int]] = {}
         region_mem_types: list[str] = []
+        region_dcp_sharded: list[bool] = []
         seen_base_addresses: list[int] = []
-        seen_region_keys: list[tuple[int, int]] = []
+        seen_region_keys: list[tuple[int, int, int]] = []
+        # Per region, the blocks of its group one pool block holds.
+        region_blocks_per_pool_block: list[int] = []
         self._ssm_region_indices = []
         region_groups: list[set[int]] = []
         self._ple_block_len = None
@@ -1971,7 +2042,11 @@ class NixlBaseConnectorWorker:
                 logical_num_blocks = self.kv_cache_config.hisparse_host_num_blocks
                 assert logical_num_blocks is not None
             else:
-                logical_num_blocks = self.kv_cache_config.num_blocks
+                # A group packed as slots of the pool blocks has as many blocks
+                # as slots, its block IDs being slot IDs (KVCacheTensor.num_blocks).
+                logical_num_blocks = (
+                    self.kv_cache_config.num_blocks * group.blocks_per_pool_block
+                )
             group_id = group_index
             num_blocks = (
                 logical_num_blocks
@@ -2115,16 +2190,22 @@ class NixlBaseConnectorWorker:
                         for segment_idx in range(num_segments)
                     ]
 
+            is_dcp_sharded = (
+                isinstance(layer_spec, AttentionSpec) and layer_spec.dcp_sharded
+            )
             for base_addr, block_len, block_stride in region_specs:
                 # Overlaid groups can page the same bytes with different page
                 # sizes (DSv4.1 SWA, indexer and compressor caches), so views at
                 # one address share a region only if their block_len matches.
+                # Slots packed into the pool blocks start where other groups'
+                # pages do, but never share their regions.
                 # A packed PP producer keeps one region per layer.
-                region_key = (base_addr, block_len)
+                region_key = (base_addr, block_len, group.blocks_per_pool_block)
                 if region_key in seen_region_keys and not route_packed_layers:
                     region_index = seen_region_keys.index(region_key)
                     assert region_mem_types[region_index] == mem_type
                     self._region_is_mla[region_index] |= is_mla_region
+                    region_dcp_sharded[region_index] |= is_dcp_sharded
                     if is_mla_region:
                         self.block_len_per_layer[region_index] = block_len
                         self.block_stride_per_layer[region_index] = block_stride
@@ -2142,7 +2223,9 @@ class NixlBaseConnectorWorker:
                     region_groups.append({group_id})
                     self.region_names.append(layer_name)
                     self.region_num_blocks.append(num_blocks)
+                    region_blocks_per_pool_block.append(group.blocks_per_pool_block)
                     self._region_is_mla.append(is_mla_region)
+                    region_dcp_sharded.append(is_dcp_sharded)
                     region_mem_types.append(mem_type)
 
                 if track_region_layers:
@@ -2186,11 +2269,13 @@ class NixlBaseConnectorWorker:
             len(self.block_len_per_layer)
             == len(seen_base_addresses)
             == len(self._region_is_mla)
+            == len(region_dcp_sharded)
             == len(self.block_stride_per_layer)
             == len(self.region_group_ids)
             == len(self.region_names)
             == len(self.region_num_blocks)
         )
+        self._region_dcp_sharded = region_dcp_sharded
         # Descriptor ids must be region-ordered, matching the remote side.
         self._group_region_indices = [
             [r for r, groups in enumerate(region_groups) if group_id in groups] or None
@@ -2202,6 +2287,15 @@ class NixlBaseConnectorWorker:
             for g, regions in enumerate(self._group_region_indices)
             if regions and set(regions) <= self._head_sharded_draft_regions
         }
+        transfer_groups = self.kv_cache_config.transfer_groups
+        self._dcp_replicated_draft_groups = frozenset(
+            g
+            for g in self._head_sharded_draft_groups
+            if all(
+                self._is_dcp_replicated_draft_layer(name, self._layer_specs[name])
+                for name in transfer_groups[g].layer_names
+            )
+        )
 
         self.kv_caches_base_addr[self.engine_id][self.tp_rank] = seen_base_addresses
         self.num_regions = len(seen_base_addresses)
@@ -2209,7 +2303,9 @@ class NixlBaseConnectorWorker:
         self._uses_region_group_mapping = len(set(self.region_group_ids)) > 1
         self._mixed_mem_types = len(set(region_mem_types)) > 1
         if self._has_mamba:
-            self.region_num_blocks = [self.num_blocks] * self.num_regions
+            self.region_num_blocks = [
+                self.num_blocks * slots for slots in region_blocks_per_pool_block
+            ]
 
         self._set_region_layers(region_layers)
         self._packed_member_layouts = packed_member_layouts
@@ -2319,6 +2415,7 @@ class NixlBaseConnectorWorker:
             region_members=self.region_members,
             packed_member_layouts=self._packed_member_layouts,
             mamba_state_geometry=self._mamba_state_geometry,
+            region_dcp_sharded=self._region_dcp_sharded,
         )
         # Wrap metadata in payload with hash for defensive decoding
         assert self.compat_hash is not None
@@ -2455,6 +2552,15 @@ class NixlBaseConnectorWorker:
             table.half_bytes,
             chunk_units,
         )
+        if self._dcp_replicated_draft_groups:
+            logger.info(
+                "NIXL draft at DCP 1 (%d KV heads), DCP rank %d: transfer groups "
+                "%s are pulled whole from the rank owning this rank's heads, not "
+                "pair-exchanged.",
+                self._head_sharded_draft_kv_heads,
+                self.dcp_rank,
+                sorted(self._dcp_replicated_draft_groups),
+            )
         # On every rank: checks the partner and logs the buffers and memory.
         exchanger.warm_up()
         self._pair_exchanger = exchanger
@@ -2475,14 +2581,18 @@ class NixlBaseConnectorWorker:
     ) -> tuple[int, list["PairRegion"]]:
         """The one attention transfer group, which must be DCP-sharded, and its
         NIXL regions in region order. Each layer page must be a region of its
-        own, so that the bytes a pull writes are the bytes its backend reads."""
+        own, so that the bytes a pull writes are the bytes its backend reads.
+        A head-sharded draft's groups that DCP does not shard are pulled whole
+        instead, so they are not exchanged."""
         from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
             dcp_pair_exchange,
         )
 
         groups = self.kv_cache_config.transfer_groups
         attention = [
-            g for g, t in enumerate(self._group_spec_types) if _is_attention_spec(t)
+            g
+            for g, t in enumerate(self._group_spec_types)
+            if _is_attention_spec(t) and g not in self._dcp_replicated_draft_groups
         ]
         if len(attention) != 1 or not groups[attention[0]].kv_cache_spec.dcp_sharded:
             raise dcp_pair_exchange.NixlPairModeError(
@@ -2493,13 +2603,20 @@ class NixlBaseConnectorWorker:
         group = attention[0]
         bases = self.kv_caches_base_addr[self.engine_id][self.tp_rank]
         region_of_page = {
-            page: i for i, page in enumerate(zip(bases, self.block_len_per_layer))
+            page: i
+            for i, page in enumerate(
+                zip(bases, self.block_len_per_layer, self.block_stride_per_layer)
+            )
         }
         layer_of_region: dict[int, str] = {}
         for name in groups[group].layer_names:
             cache = kv_caches[name]
             region = region_of_page.get(
-                (cache.data_ptr(), self._layer_specs[name].page_size_bytes)
+                (
+                    cache.data_ptr(),
+                    self._layer_specs[name].page_size_bytes,
+                    cache.stride(0) * cache.element_size(),
+                )
             )
             # One block per kernel block: the units' block ids are NIXL's.
             if (
@@ -3149,6 +3266,10 @@ class NixlBaseConnectorWorker:
                 nixl_agent_meta.region_mem_types = nixl_agent_meta.region_mem_types[
                     start:end
                 ]
+            if nixl_agent_meta.region_dcp_sharded is not None:
+                nixl_agent_meta.region_dcp_sharded = nixl_agent_meta.region_dcp_sharded[
+                    start:end
+                ]
         # The push WRITE path is not validated with split remote blocks.
         if self._has_mamba and self.use_mla and self._TRANSFER_MODE == "pull":
             self._split_remote_blocks(nixl_agent_meta)
@@ -3183,6 +3304,12 @@ class NixlBaseConnectorWorker:
             remote_tp_size=remote_tp_size,
             group_spec_types=self._group_spec_types,
             remote_dcp_size=remote_dcp_size,
+            # Producers wait for every reader of a request, the draft's too.
+            draft_kv_heads=(
+                self._head_sharded_draft_kv_heads
+                if self._head_sharded_draft_regions and self._head_sharded_draft_groups
+                else None
+            ),
         )
         if self._head_sharded_draft_regions:
             draft_plan = self.draft_tp_mappings[engine_id] = compute_tp_mapping(
@@ -3508,6 +3635,60 @@ class NixlBaseConnectorWorker:
             f"{_describe_interleave(remote_interleave)}, block {remote_block})"
         )
 
+    def _head_sharded_draft_dcp_problem(
+        self,
+        nixl_agent_meta: NixlAgentMetadata,
+        remote_dcp_size: int,
+        tp_ratio: int,
+        block_size_ratio: int,
+    ) -> str | None:
+        """Why a head-sharded draft's KV cannot be pulled from a peer when
+        either side runs DCP, or None.
+
+        A drafter at DCP 1 (``_dcp_replicated_draft_groups``) holds every token
+        of its heads on every rank: each rank reads its heads' slice from their
+        owner by TP, its blocks paired by position from the end, whatever the
+        DCP sizes. That needs the peer's draft unsharded too, local TP >= remote
+        TP and, unless TP and DCP sizes match, equal blocks. Any other draft KV
+        pairs ranks 1:1, so needs equal TP and DCP sizes.
+        """
+        homogeneous = tp_ratio == 1 and self.dcp_size == remote_dcp_size
+        replicated_regions = {
+            region
+            for g in self._dcp_replicated_draft_groups
+            for region in self._group_region_indices[g] or ()
+        }
+        if not self._head_sharded_draft_regions <= replicated_regions:
+            if homogeneous:
+                return None
+            return "a draft that DCP shards needs equal TP and DCP sizes"
+        if self._TRANSFER_MODE != "pull" and not homogeneous:
+            return "push mode pairs ranks 1:1, so needs equal TP and DCP sizes"
+        remote_sharded = nixl_agent_meta.region_dcp_sharded
+        if remote_sharded is None:
+            if homogeneous:
+                # The peer runs the same TP and DCP sizes, so lays it out alike.
+                return None
+            return "the peer does not advertise its DCP-sharded regions (older peer)"
+        sharded = sorted(
+            region
+            for region in replicated_regions
+            if region >= len(remote_sharded) or remote_sharded[region]
+        )
+        if remote_dcp_size > 1 and sharded:
+            return (
+                f"DCP shards the peer's draft regions {sharded}, which hold every "
+                "token on this rank (the drafter must run at DCP 1 on both sides)"
+            )
+        if tp_ratio < 0:
+            return "local TP must be >= remote TP"
+        if block_size_ratio != 1 and not homogeneous:
+            return (
+                f"the per-rank blocks differ (local {self.block_size}, remote "
+                f"{nixl_agent_meta.block_size} tokens)"
+            )
+        return None
+
     def _validate_mamba_state_geometry(self, nixl_agent_meta: NixlAgentMetadata):
         """Fail the handshake when the peers' Mamba state pages differ.
 
@@ -3602,19 +3783,33 @@ class NixlBaseConnectorWorker:
                 1, self._head_sharded_draft_kv_heads // remote_tp_size
             )
             # A hybrid target already reads its SSM state from every source
-            # rank, so the draft's heads can be gathered from them too. Under
-            # DCP only equal TP and DCP pair ranks 1:1 (rank i reads rank i).
-            if (tp_ratio < 0 and not self._has_mamba) or (
-                (self.dcp_size > 1 or remote_dcp_size > 1)
-                and (tp_ratio != 1 or self.dcp_size != remote_dcp_size)
-            ):
+            # rank, so the draft's heads can be gathered from them too.
+            if tp_ratio < 0 and not self._has_mamba:
                 raise NotImplementedError(
                     "NIXL head-sharded draft KV under an MLA target requires "
-                    "local TP >= remote TP (unless the target is hybrid) and no DCP: "
+                    "local TP >= remote TP (unless the target is hybrid): "
                     f"local TP={self.transfer_topo.tp_size}, "
                     f"remote TP={remote_tp_size}, "
                     f"local DCP={self.dcp_size}, remote DCP={remote_dcp_size}, "
                     f"transfer_mode={self._TRANSFER_MODE}."
+                )
+            if (self.dcp_size > 1 or remote_dcp_size > 1) and (
+                problem := self._head_sharded_draft_dcp_problem(
+                    nixl_agent_meta, remote_dcp_size, tp_ratio, block_size_ratio
+                )
+            ):
+                # Pair mode keeps no per-request fallback (see
+                # _validate_hybrid_hetero_dcp).
+                error = (
+                    NixlPeerConfigMismatch
+                    if self._is_dcp_pair_peer(nixl_agent_meta, remote_dcp_size)
+                    else NotImplementedError
+                )
+                raise error(
+                    "NIXL head-sharded draft KV under an MLA target with DCP "
+                    f"(local TP/DCP {self.transfer_topo.tp_size}/{self.dcp_size}, "
+                    f"remote {remote_tp_size}/{remote_dcp_size}, "
+                    f"transfer_mode={self._TRANSFER_MODE}): {problem}."
                 )
 
         remote_physical_per_logical = (
@@ -5074,6 +5269,44 @@ class NixlBaseConnectorWorker:
         if num_remote_blocks is not None and matched_blocks < len(local_slice):
             raise ValueError("Remote KV pages do not cover the requested range")
         return local_slice[:matched_blocks], remote_slice[:matched_blocks]
+
+    def _num_unsharded_group_blocks(
+        self, group: int, num_tokens: int | None
+    ) -> int | None:
+        """Blocks of transfer group ``group``, which DCP does not shard,
+        holding ``num_tokens`` tokens; None when the count is unknown."""
+        if num_tokens is None:
+            return None
+        spec = self.kv_cache_config.transfer_groups[group].kv_cache_spec
+        return cdiv(num_tokens, spec.block_size)
+
+    @staticmethod
+    def _pair_blocks_from_end(
+        local_ids: list[int],
+        remote_ids: list[int],
+        num_remote_blocks: int | None = None,
+    ) -> tuple[list[int], list[int]]:
+        """Pair the blocks of a group DCP does not shard (a DCP-replicated
+        draft's) by position: both lists end at the block of the last
+        transferred token, and the local one starts after its prefix-cache hit
+        (a sliding window keeps only its tail). ``num_remote_blocks``, the
+        blocks holding the remote's computed tokens, first drops the
+        speculative lookahead blocks a prefiller may allocate past them. Local
+        blocks without a remote one stay unwritten, so they are zeroed."""
+        if num_remote_blocks is not None:
+            remote_ids = remote_ids[:num_remote_blocks]
+        num_blocks = min(len(local_ids), len(remote_ids))
+        if num_blocks < len(local_ids):
+            logger.warning_once(
+                "NIXL pull: %d local blocks of a DCP-replicated draft group have "
+                "no remote block (remote has %d); zeroing them.",
+                len(local_ids) - num_blocks,
+                len(remote_ids),
+            )
+        return (
+            local_ids[len(local_ids) - num_blocks :],
+            remote_ids[len(remote_ids) - num_blocks :],
+        )
 
     @staticmethod
     def _block_ids_by_region(

@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, ClassVar
 
 from vllm.distributed.kv_events import MEDIUM_CPU
 from vllm.utils.math_utils import cdiv
-from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.block_pool import BlockPool, SlotBlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHashList,
@@ -115,10 +115,13 @@ class SingleTypeKVCacheManager(ABC):
         self.max_admission_blocks_per_request = max_admission_blocks_per_request
         # Record newly allocated block ids only when worker-side zeroing will
         # consume them and this manager holds a spec type that gets zeroed.
+        # The worker zeroes whole pool blocks, so packed slots are not zeroed
+        # (``SlotBlockPool``).
         self._record_new_block_ids = (
             needs_kv_cache_zeroing
             and isinstance(kv_cache_spec, AttentionSpec)
             and not isinstance(kv_cache_spec, CircularBufferSpec)
+            and not isinstance(block_pool, SlotBlockPool)
         )
         self.new_block_ids: list[int] = []
 
@@ -1071,6 +1074,107 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         # multi-module MTP store-side lag can still reconstruct the window from
         # cached blocks.
         self.extra_retained_tokens = kv_cache_spec.extra_retained_tokens
+        # Set by the coordinator when Mamba groups bound where a hit can land:
+        # cache only the window tails ending at their state boundaries.
+        self.tails_at_state_boundaries = False
+
+    def get_num_blocks_to_allocate(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        total_computed_tokens: int,
+        num_local_computed_tokens: int,
+        num_tokens_main_model: int,
+        apply_admission_cap: bool = False,
+        prefill_end: int = 0,
+    ) -> int:
+        num_blocks = super().get_num_blocks_to_allocate(
+            request_id,
+            num_tokens,
+            new_computed_blocks,
+            total_computed_tokens,
+            num_local_computed_tokens,
+            num_tokens_main_model,
+            apply_admission_cap=apply_admission_cap,
+            prefill_end=prefill_end,
+        )
+        if not isinstance(self.block_pool, SlotBlockPool):
+            return num_blocks
+        # Count in the shared pool's blocks the slots come from.
+        touched: Sequence[KVCacheBlock] = ()
+        if request_id not in self.num_cached_block:
+            num_skipped_blocks = (
+                self.get_num_skipped_tokens(total_computed_tokens) // self.block_size
+            )
+            num_req_blocks = len(self.req_to_blocks.get(request_id, ()))
+            touched = new_computed_blocks[max(0, num_skipped_blocks - num_req_blocks) :]
+        num_new_blocks = num_blocks - self._get_num_evictable_blocks(touched)
+        return self.block_pool.get_num_new_parent_blocks(num_new_blocks, touched)
+
+    def cache_blocks(
+        self,
+        request: Request,
+        num_tokens: int,
+        retention_interval: int | None = None,
+        *,
+        replay_boundaries: Sequence[int],
+    ) -> None:
+        """With ``tails_at_state_boundaries``, cache the window tail ending at
+        each boundary a hit can resume at: ``replay_boundaries`` (with the
+        state boundaries the coordinator adds), the shared-prefix junction and
+        the extra Mamba checkpoint. Tails are cached once their blocks are full
+        and while the window still holds them; other blocks leave uncached."""
+        if not self.tails_at_state_boundaries:
+            super().cache_blocks(
+                request,
+                num_tokens,
+                retention_interval,
+                replay_boundaries=replay_boundaries,
+            )
+            return
+        if not self.kv_cache_spec.prefix_cacheable:
+            return
+        request_id = request.request_id
+        blocks = self.req_to_blocks[request_id]
+        num_hashed_tokens = len(request.block_hashes) * self.block_pool.hash_block_size
+        num_full_blocks = min(
+            min(num_tokens, num_hashed_tokens) // self.block_size, len(blocks)
+        )
+        boundaries = {*replay_boundaries}
+        if request.shared_prefix_boundary:
+            boundaries.add(request.shared_prefix_boundary)
+        if request.mamba_extra_checkpoint:
+            boundaries.add(request.mamba_extra_checkpoint)
+        need = self._contiguous_blocks_for_hit(
+            self.sliding_window, self.block_size, self.use_eagle
+        )
+        alignment = self.cache_hit_alignment_tokens
+        for boundary in sorted(boundaries):
+            # The tail's last block is the one before the boundary, or with
+            # EAGLE the one past it, which hits match and drop.
+            end = boundary // alignment * alignment // self.block_size + self.use_eagle
+            start = max(0, end - need)
+            end = min(end, num_full_blocks)
+            if start >= end:
+                continue
+            mask = [
+                not block.is_null and block.block_hash is None
+                for block in blocks[start:end]
+            ]
+            if any(mask):
+                self.block_pool.cache_full_blocks(
+                    request=request,
+                    blocks=blocks,
+                    num_cached_blocks=start,
+                    num_full_blocks=end,
+                    block_size=self.block_size,
+                    kv_cache_group_id=self.kv_cache_group_id,
+                    block_mask=mask,
+                )
+        self.num_cached_block[request_id] = max(
+            self.num_cached_block.get(request_id, 0), num_full_blocks
+        )
 
     @classmethod
     def _contiguous_blocks_for_hit(
@@ -1605,6 +1709,11 @@ class MambaManager(SingleTypeKVCacheManager):
         self._resumed_from: dict[
             str, tuple[KVCacheBlock, BlockHashWithGroupId | None, int]
         ] = {}
+        # Set by the coordinator when a group keeps prefix-cache tails only
+        # where the states are: the token boundaries ``cache_blocks`` registered
+        # states at since the last ``take_new_state_boundaries``.
+        self.record_state_boundaries = False
+        self._new_state_boundaries: list[int] = []
 
     def add_local_computed_blocks(
         self,
@@ -2360,6 +2469,8 @@ class MambaManager(SingleTypeKVCacheManager):
                 if block.is_null or block.block_hash is None:
                     continue
                 self.cached_blocks_this_step.add(block.block_hash)
+                if self.record_state_boundaries:
+                    self._new_state_boundaries.append((idx + 1) * self.block_size)
                 if self.record_state_hashes:
                     self._state_hashes.setdefault(request.request_id, set()).add(
                         block.block_hash
@@ -2382,6 +2493,12 @@ class MambaManager(SingleTypeKVCacheManager):
             # only at their exact boundary, take a full state slot each, and are
             # cheap to recompute: evict them before every other cached block.
             self.block_pool.mark_low_priority(self.req_to_blocks[request.request_id])
+
+    def take_new_state_boundaries(self) -> list[int]:
+        """Token boundaries of the states registered since the last call."""
+        boundaries = self._new_state_boundaries
+        self._new_state_boundaries = []
+        return boundaries
 
     def take_state_hashes(self, request_id: str) -> set[BlockHashWithGroupId]:
         """The state keys ``request_id`` registered (recording stops)."""
@@ -2493,7 +2610,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 return None
             if checkpoint_block.block_hash_num_tokens == checkpoint_position:
                 return None
-            return self.block_pool.cache_partial_block(
+            checkpoint_hash = self.block_pool.cache_partial_block(
                 request=request,
                 block=checkpoint_block,
                 num_tokens=checkpoint_position,
@@ -2501,6 +2618,9 @@ class MambaManager(SingleTypeKVCacheManager):
                 block_size=self.block_size,
                 replace_existing_hashes=True,
             )
+            if checkpoint_hash is not None and self.record_state_boundaries:
+                self._new_state_boundaries.append(checkpoint_position)
+            return checkpoint_hash
         if num_tokens <= 0 or num_tokens % hash_block_size != 0:
             return None
         latest_prompt_hash_boundary = get_mamba_prefill_checkpoint_position(
@@ -2540,6 +2660,8 @@ class MambaManager(SingleTypeKVCacheManager):
             kv_cache_group_id=self.kv_cache_group_id,
             block_size=self.block_size,
         )
+        if partial_hash is not None and self.record_state_boundaries:
+            self._new_state_boundaries.append(num_tokens)
         if partial_hash is not None and num_tokens % self.block_size:
             self._partial_hit_reqs[request.request_id] = (block_idx, source_block)
             self.num_cached_block[request.request_id] = block_idx

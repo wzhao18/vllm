@@ -41,19 +41,29 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
     compute_tp_mapping,
+    head_sharded_source_ranks,
 )
-from vllm.v1.kv_cache_interface import MambaSpec, MLAAttentionSpec
+from vllm.v1.kv_cache_interface import (
+    MambaSpec,
+    MLAAttentionSpec,
+    SlidingWindowSpec,
+)
 
 # Kimi K3's hybrid layout: one MLA group, then KDA (Mamba) groups.
 HYBRID_GROUPS = (MLAAttentionSpec, MambaSpec, MambaSpec, MambaSpec)
+# With the release DSpark draft: its sliding-window GQA group (16 KV heads).
+DRAFT_GROUPS = (*HYBRID_GROUPS, SlidingWindowSpec)
+DRAFT_GROUP, DRAFT_KV_HEADS = len(HYBRID_GROUPS), 16
 
 
-def _topology(tp_rank: int, tp_size: int, dcp_size: int) -> TransferTopology:
+def _topology(
+    tp_rank: int, tp_size: int, dcp_size: int, is_mamba: bool = True
+) -> TransferTopology:
     topo = object.__new__(TransferTopology)
     topo.tp_rank = tp_rank
     topo.tp_size = tp_size
     topo.is_mla = True
-    topo.is_mamba = True
+    topo.is_mamba = is_mamba
     topo.total_num_kv_heads = 1
     topo.dcp_size = dcp_size
     return topo
@@ -107,6 +117,75 @@ def test_hetero_tp_hybrid_without_dcp_unchanged():
         m = _mapping(r, 4, 1, 2, 1)
         assert m.source_ranks_per_group == ((r // 2,),) * 4
         assert m.consumers_by_rank is None
+
+
+def _draft_mappings(
+    tp_rank, tp_size, remote_tp_size, groups=DRAFT_GROUPS, is_mamba=True
+):
+    """A decoder rank's target mapping (counting the draft's readers) and its
+    draft mapping, as add_remote_agent builds them; DCP = TP on both sides."""
+    topo = _topology(tp_rank, tp_size, tp_size, is_mamba=is_mamba)
+    target = compute_tp_mapping(
+        topo, remote_tp_size, groups, remote_tp_size, draft_kv_heads=DRAFT_KV_HEADS
+    )
+    draft = compute_tp_mapping(
+        topo,
+        remote_tp_size,
+        groups,
+        remote_tp_size,
+        head_sharded_kv_heads=DRAFT_KV_HEADS,
+    )
+    return topo, target, draft
+
+
+@pytest.mark.parametrize("tp_rank", range(16))
+def test_release_draft_reads_its_heads_owner_tp8_to_tp16(tp_rank):
+    """The release draft at DCP 1 on D TP16/DCP16 <- P TP8/DCP8 (C1 ... C160):
+    D rank r holds draft head r, which P rank r // 2 holds as its local head
+    r % 2, whatever the DCP sizes; the target keeps its MLA (r % 8) and KDA
+    (r // 2) sources, which the handshake already covers."""
+    topo, target, draft = _draft_mappings(tp_rank, 16, 8)
+    assert draft.source_ranks_per_group[DRAFT_GROUP] == (tp_rank // 2,)
+    assert draft.rank_offset_factor == tp_rank % 2
+    assert head_sharded_source_ranks(topo, 8, DRAFT_KV_HEADS) == [tp_rank // 2]
+    attn, ssm = (tp_rank % 8,), (tp_rank // 2,)
+    assert target.source_ranks_per_group[: len(HYBRID_GROUPS)] == (attn, *[ssm] * 3)
+    assert set(topo.handshake_target_ranks(8, 8)) == {tp_rank % 8, tp_rank // 2}
+
+
+def test_release_draft_consumer_counts_tp8_to_tp16():
+    """Counting the draft's readers changes nothing for the hybrid target (the
+    KDA state comes from the same rank): P ranks 0 and 7 wait for 3 decoder
+    ranks, the others for 4."""
+    plans = [_draft_mappings(r, 16, 8)[1] for r in range(16)]
+    for p in range(8):
+        readers = [r for r in range(16) if p in {r % 8, r // 2}]
+        assert len(readers) == (3 if p in (0, 7) else 4)
+        assert {plans[r].consumers_for(p) for r in readers} == {len(readers)}
+
+
+def test_draft_readers_counted_without_kda_state():
+    """A pure MLA target pulls the draft from other ranks than its MLA KV: P
+    rank p is read by decoder ranks p and p + 8 (MLA) and 2p, 2p + 1 (draft),
+    so it must wait for all of them, not for the DCP ratio of 2."""
+    groups = (MLAAttentionSpec, SlidingWindowSpec)
+    plans = [_draft_mappings(r, 16, 8, groups, is_mamba=False)[1] for r in range(16)]
+    for p in range(8):
+        readers = {p, p + 8, 2 * p, 2 * p + 1}
+        assert {plans[r].consumers_for(p) for r in readers} == {len(readers)}
+    topo = _topology(0, 16, 16, is_mamba=False)
+    assert compute_tp_mapping(topo, 8, groups, 8).consumers_for(0) == 2
+
+
+@pytest.mark.parametrize("tp_rank", range(4))
+def test_release_draft_tp4dcp4_reads_same_rank(tp_rank):
+    """C512's DP ranks run TP4/DCP4 on both sides: each rank reads its 4 draft
+    heads whole from the same rank, which waits for that one reader."""
+    _, target, draft = _draft_mappings(tp_rank, 4, 4)
+    assert draft.source_ranks_per_group[DRAFT_GROUP] == (tp_rank,)
+    assert draft.rank_offset_factor == 0
+    assert target.all_source_ranks == (tp_rank,)
+    assert target.consumers_for(tp_rank) == 1
 
 
 def _owner_chunks(rank: int, dcp_size: int, num_chunks: int) -> list[int]:
@@ -497,6 +576,25 @@ def test_handshake_other_failures_still_fail_the_request(monkeypatch):
     assert w._peer_config_mismatch is None
 
 
+@pytest.mark.parametrize("draft", [False, True])
+def test_handshake_covers_the_draft_heads_owner(monkeypatch, draft):
+    """Without KDA state, decoder rank 5 (TP16/DCP16) reads its MLA KV from P
+    rank 5; a head-sharded draft at DCP 1 adds P rank 2, which owns its draft
+    head, so the handshake loads that agent too."""
+    w = _handshake_worker(monkeypatch, PAIR, 1)
+    w.transfer_topo = _topology(5, 16, 16, is_mamba=False)
+    w.add_remote_agent = lambda meta, rank, tp, dcp: f"agent-{rank}"
+    if draft:
+        w._head_sharded_draft_kv_heads = DRAFT_KV_HEADS
+        w._head_sharded_draft_regions = {1}
+        w._head_sharded_draft_groups = {1}
+    sock = base_worker.zmq_ctx().__enter__()
+    agents, _ = w._nixl_handshake("p", 1, 8, "P", 8)
+    asked = sorted(msgspec.msgpack.decode(c.args[0])[2] for c in sock.send.mock_calls)
+    assert asked == ([2, 5] if draft else [5])
+    assert sorted(agents) == [(0, rank) for rank in asked]
+
+
 _MLA_SPEC = MLAAttentionSpec(
     block_size=1024, num_kv_heads=1, head_size=576, dtype=torch.uint8
 )
@@ -545,6 +643,182 @@ def test_dcp_pair_exchange_startup_checks(path, attr, value, match):
     setattr(operator.attrgetter(path)(w) if path else w, attr, value)
     with pytest.raises(ValueError, match=match):
         w._validate_dcp_pair_exchange_config()
+
+
+# The release DSpark draft at TP16: one of its 16 KV heads of 64 per rank, a
+# 2048-token window, DCP 1 under the DCP target. K3.1 numbers its layers 0-92;
+# the DFlash draft's 5 layers follow them.
+_DRAFT_SPEC = SlidingWindowSpec(
+    block_size=1024,
+    num_kv_heads=1,
+    head_size=64,
+    dtype=torch.bfloat16,
+    sliding_window=2048,
+    dcp_sharded=False,
+)
+_TARGET_LAYERS, _NUM_DRAFT_LAYERS = 93, 5
+_DRAFT_LAYERS = {
+    f"model.layers.{_TARGET_LAYERS + i}.self_attn.attn": _DRAFT_SPEC
+    for i in range(_NUM_DRAFT_LAYERS)
+}
+
+
+def test_pair_startup_exempts_the_release_draft():
+    """Pair mode exchanges the DCP-sharded target pages. The release draft at
+    DCP 1 holds every token on every rank and is pulled whole, so its
+    unsharded layers pass the startup check; any other unsharded attention
+    layer still fails it, as does the draft without a head-sharded draft
+    config (it would not be pulled whole)."""
+    w = _pair_startup_worker()
+    w.model_config = SimpleNamespace(get_total_num_hidden_layers=lambda: _TARGET_LAYERS)
+    w.vllm_config.speculative_config = SimpleNamespace(
+        draft_model_config=SimpleNamespace(
+            get_total_num_hidden_layers=lambda: _NUM_DRAFT_LAYERS
+        )
+    )
+    w._head_sharded_draft_kv_heads = DRAFT_KV_HEADS
+    w.kv_cache_config = SimpleNamespace(
+        transfer_group_ids=(0, 1, 2), kv_cache_groups=[None, None, None]
+    )
+    w._layer_specs = {**w._layer_specs, **_DRAFT_LAYERS}
+    w._validate_dcp_pair_exchange_config()
+
+    w._layer_specs["model.layers.7.self_attn.attn"] = _DRAFT_SPEC
+    with pytest.raises(ValueError, match="DCP-sharded.*model.layers.7"):
+        w._validate_dcp_pair_exchange_config()
+    del w._layer_specs["model.layers.7.self_attn.attn"]
+    w._head_sharded_draft_kv_heads = None
+    with pytest.raises(ValueError, match="DCP-sharded.*model.layers.93"):
+        w._validate_dcp_pair_exchange_config()
+
+
+# Regions of the decoder stub below: MLA (0, 1), KDA state (2-4), the draft (5);
+# transfer groups: MLA, 3 x KDA, the draft (4).
+_DRAFT_REGION, _DRAFT_TRANSFER_GROUP = 5, 4
+_TARGET_REGIONS_SHARDED = [True, True, False, False, False]
+
+
+def _draft_decoder(replicated: bool = True, tp: int = 16, **worker_kwargs):
+    """A K3.1 decoder rank (TP16/DCP16 in pair mode by default) with the
+    release draft, whose handshake reaches the draft checks."""
+    w = _worker_stub(tp=tp, dcp=tp, **{**PAIR, **worker_kwargs})
+    w._has_mamba, w._mamba_state_geometry = True, None
+    w._head_sharded_draft_kv_heads = DRAFT_KV_HEADS
+    w._head_sharded_draft_regions = {_DRAFT_REGION}
+    w._group_region_indices = [[0, 1], [2], [3], [4], [_DRAFT_REGION]]
+    w._dcp_replicated_draft_groups = frozenset(
+        {_DRAFT_TRANSFER_GROUP} if replicated else ()
+    )
+    return w
+
+
+def _draft_peer(draft_sharded: bool | None = False, **meta_kwargs):
+    """A prefiller (TP8/DCP8 by default) advertising whether DCP shards its
+    draft region (None: a peer predating the field)."""
+    meta = _meta(**{"interleave": 1, **meta_kwargs})
+    meta.mamba_state_geometry = None
+    meta.region_dcp_sharded = (
+        None if draft_sharded is None else [*_TARGET_REGIONS_SHARDED, draft_sharded]
+    )
+    return meta
+
+
+def _handshake_draft(w, meta, tp_ratio: int = 2, block_size_ratio: int = 1):
+    w.transfer_topo = MagicMock(tp_size=w.world_size)
+    w.transfer_topo.tp_ratio.return_value = tp_ratio
+    w.transfer_topo.block_size_ratio.return_value = block_size_ratio
+    w.transfer_topo.get_engine_info.return_value = SimpleNamespace(
+        remote_tp_size=meta.dcp_size, remote_dcp_size=meta.dcp_size
+    )
+    w._validate_remote_agent_handshake(meta, meta.dcp_size, meta.dcp_size)
+
+
+@pytest.mark.parametrize(
+    "worker_kwargs,meta_kwargs,tp_ratio",
+    [
+        ({}, {}, 2),
+        ({"tp": 4, "interleave": 1}, {"dcp": 4}, 1),
+        ({"tp": 4, "interleave": 1}, {"dcp": 4, "draft_sharded": None}, 1),
+    ],
+    ids=["tp8dcp8-to-tp16dcp16-pair", "tp4dcp4-both", "tp4dcp4-both-older-peer"],
+)
+def test_release_draft_handshake_accepted(worker_kwargs, meta_kwargs, tp_ratio):
+    """The chosen topologies pass the draft checks: P TP8/DCP8 -> D
+    TP16/DCP16 in pair mode, and TP4/DCP4 on both sides (C512), where a peer
+    predating the advertised DCP sharding lays the draft out alike."""
+    w = _draft_decoder(**worker_kwargs)
+    meta = _draft_peer(**meta_kwargs)
+    assert w._head_sharded_draft_dcp_problem(meta, meta.dcp_size, tp_ratio, 1) is None
+
+
+@pytest.mark.parametrize(
+    "decoder_kwargs,meta_kwargs,match",
+    [
+        ({}, {"draft_sharded": True}, r"DCP shards the peer's draft regions \[5\]"),
+        ({}, {"draft_sharded": None}, "does not advertise"),
+        ({"replicated": False}, {}, "a draft that DCP shards needs equal TP"),
+    ],
+    ids=["peer-draft-dcp-sharded", "older-peer", "local-draft-dcp-sharded"],
+)
+@pytest.mark.parametrize("pair", [True, False], ids=["pair-mode", "block-mode"])
+def test_release_draft_handshake_rejected(decoder_kwargs, meta_kwargs, match, pair):
+    """A draft whose pages do not hold every token on both sides cannot pair
+    ranks by heads alone. Pair mode stops the decoder (no per-request
+    fallback); block mode (interleave = block) fails the handshake as before."""
+    if pair:
+        w = _draft_decoder(**decoder_kwargs)
+        meta = _draft_peer(**meta_kwargs)
+        error = NixlPeerConfigMismatch
+    else:
+        w = _draft_decoder(**decoder_kwargs, interleave=1024, pair=False)
+        meta = _draft_peer(**{**meta_kwargs, "interleave": 1024})
+        error = NotImplementedError
+    with pytest.raises(error, match=match) as exc_info:
+        _handshake_draft(w, meta)
+    assert "head-sharded draft KV under an MLA target with DCP" in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "decoder_kwargs,args,match",
+    [
+        ({"mode": "push"}, (2, 1), "push mode pairs ranks 1:1"),
+        ({}, (2, 2), "per-rank blocks differ"),
+        ({}, (-2, 1), "local TP must be >= remote TP"),
+    ],
+)
+def test_release_draft_problems(decoder_kwargs, args, match):
+    """The other limits of pulling the draft by heads under DCP."""
+    w = _draft_decoder(**decoder_kwargs)
+    problem = w._head_sharded_draft_dcp_problem(_draft_peer(), 8, *args)
+    assert problem is not None and match in problem
+
+
+# P's draft list as request_finished sends it: null blocks (0) before its
+# window, then its blocks up to a speculative lookahead block past its 1100
+# tokens (block size 64: positions 13-17, lookahead 18).
+_P_DRAFT_BLOCKS = [0] * 13 + [113, 114, 115, 116, 117, 118]
+
+
+@pytest.mark.parametrize(
+    "local,remote,num_remote_blocks,expected",
+    [
+        ([16, 17], _P_DRAFT_BLOCKS, 18, ([16, 17], [116, 117])),
+        ([4, 5, 6, 7], _P_DRAFT_BLOCKS, 18, ([4, 5, 6, 7], [114, 115, 116, 117])),
+        ([44, 45, 46], [143, 144, 145, 146], 47, ([44, 45, 46], [144, 145, 146])),
+        ([1, 2, 3], [10, 11], None, ([2, 3], [10, 11])),
+        ([], [10, 11], 2, ([], [])),
+    ],
+    ids=["hit-in-window", "no-hit", "window-clipped", "local-longer", "full-hit"],
+)
+def test_pair_blocks_from_end(local, remote, num_remote_blocks, expected):
+    """A DCP-replicated draft's blocks pair by position from the end of both
+    lists, after dropping the prefiller's blocks past its tokens."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
+        NixlConnectorWorker,
+    )
+
+    got = NixlConnectorWorker._pair_blocks_from_end(local, remote, num_remote_blocks)
+    assert got == expected
 
 
 def _geometry(tp: int, num_spec: int = 7, dtype: torch.dtype = torch.bfloat16):
@@ -621,6 +895,18 @@ def test_agent_metadata_carries_interleave():
         msgspec.msgpack.encode(_AGENT_FIELDS), type=NixlAgentMetadata
     )
     assert older.cp_kv_cache_interleave_size is None
+
+
+def test_agent_metadata_carries_region_dcp_sharding():
+    """Which regions DCP shards survives the handshake encoding; a peer built
+    before the field existed decodes as None (unknown)."""
+    sent = NixlAgentMetadata(**_AGENT_FIELDS, region_dcp_sharded=[False])
+    got = msgspec.msgpack.decode(msgspec.msgpack.encode(sent), type=NixlAgentMetadata)
+    assert got.region_dcp_sharded == [False]
+    older = msgspec.msgpack.decode(
+        msgspec.msgpack.encode(_AGENT_FIELDS), type=NixlAgentMetadata
+    )
+    assert older.region_dcp_sharded is None
 
 
 @pytest.mark.parametrize(

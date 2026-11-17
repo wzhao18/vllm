@@ -14,6 +14,7 @@ from vllm.distributed.kv_events import (
 )
 from vllm.logger import init_logger
 from vllm.multimodal.utils import get_mm_features_in_window
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -218,6 +219,9 @@ class BlockPool:
         # place and gate demotion.
         self._clock: Callable[[], float] = time.monotonic
         self._lru_since: OrderedDict[int, float] = OrderedDict()
+        # Free blocks given back by a ``SlotBlockPool`` while their slots hold
+        # cached blocks: reusing one evicts those (block id -> slot pool).
+        self._slot_rows: dict[int, SlotBlockPool] = {}
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -744,6 +748,10 @@ class BlockPool:
 
         ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
 
+        if self._slot_rows:
+            for block in ret:
+                if (slot_pool := self._slot_rows.pop(block.block_id, None)) is not None:
+                    slot_pool.drop_row(block.block_id)
         if self._reuse_watchers:
             self._notify_reuse(ret)
         if self._demote_on_free:
@@ -1136,6 +1144,9 @@ class BlockPool:
             )
             return False
 
+        for row, slot_pool in self._slot_rows.items():
+            slot_pool.drop_row(row)
+        self._slot_rows.clear()
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = BlockHashToBlockMap()
         self.cached_block_hashes_by_block.clear()
@@ -1161,6 +1172,39 @@ class BlockPool:
             self.kv_event_queue.append(AllBlocksCleared())
 
         return True
+
+    def release_slot_row(self, block: KVCacheBlock, slot_pool: "SlotBlockPool") -> None:
+        """Take back a block a ``SlotBlockPool`` held whose slots are all free
+        but some cached: it ages in the LRU like a cached block, and reusing
+        it evicts those slots (``reclaim_slot_row`` takes it back on a hit)."""
+        assert block.ref_cnt == 1 and block.block_hash is None
+        block.ref_cnt = 0
+        self._slot_rows[block.block_id] = slot_pool
+        if self.enable_caching:
+            self._lru_since[block.block_id] = self._clock()
+        self.free_block_queue.append(block)
+
+    def reclaim_slot_row(self, block: KVCacheBlock) -> None:
+        """Hand a block given back by ``release_slot_row`` to its slot pool
+        again, its cached slots intact."""
+        assert block.ref_cnt == 0
+        del self._slot_rows[block.block_id]
+        self.touch([block])
+
+    def is_cheap_to_reuse(self, age: float | None) -> bool:
+        """Whether the next block ``get_new_blocks`` hands out is free without
+        evicting anything, or evicts cached contents older than ``age`` (a
+        cached block's LRU join time; None: one evicted first)."""
+        head = self.free_block_queue.fake_free_list_head.next_free_block
+        if head is None or head is self.free_block_queue.fake_free_list_tail:
+            return False
+        if head.block_hash is None and head.block_id not in self._slot_rows:
+            return True
+        head_age = self._lru_since.get(head.block_id)
+        if head_age is None:
+            # Demoted or low priority: evicted before any LRU block.
+            return True
+        return age is not None and head_age < age
 
     def get_num_free_blocks(self) -> int:
         """Get the number of free blocks in the pool.
@@ -1196,3 +1240,200 @@ class BlockPool:
         events = self.kv_event_queue
         self.kv_event_queue = []
         return events
+
+
+class SlotBlockPool(BlockPool):
+    """The blocks of one KV cache group packed ``slots_per_block`` to a block of
+    ``parent``: slot ``j`` lives in parent block ``j // slots_per_block``.
+
+    Parent blocks (block-outermost rows) are taken on demand and given back
+    once none of their slots is referenced: to the parent's evict-first end if
+    no slot is cached, else to its LRU end, where reusing the block evicts the
+    cached slots and a hit on one of them takes it back. A new slot is a free
+    uncached slot of a held block, else a slot of a new parent block when that
+    evicts nothing or older contents than this pool's next cached slot, else
+    that slot: one LRU order across both pools.
+
+    Slots are not zeroed: a parent block keeps its previous owner's bytes,
+    which attention never reads (a position is read only once written).
+    """
+
+    def __init__(self, parent: BlockPool, slots_per_block: int) -> None:
+        assert slots_per_block > 1
+        # One block: slot 0 of the parent's null block is the null slot.
+        super().__init__(
+            num_gpu_blocks=1,
+            enable_caching=parent.enable_caching,
+            hash_block_size=parent.hash_block_size,
+            enable_kv_cache_events=parent.enable_kv_cache_events,
+            num_hash_lookahead_tokens=parent.num_hash_lookahead_tokens,
+            medium=parent.medium,
+        )
+        self.parent = parent
+        self.slots_per_block = slots_per_block
+        self.num_gpu_blocks = parent.num_gpu_blocks * slots_per_block
+        # Slot blocks are created with their parent block's first use.
+        self.blocks: list[KVCacheBlock | None] = [self.null_block] + [  # type: ignore[assignment]
+            None
+        ] * (self.num_gpu_blocks - 1)
+        # Held parent blocks: referenced slots in each.
+        self._held: dict[int, KVCacheBlock] = {}
+        self._num_used: dict[int, int] = {}
+        # Parent blocks given back with cached slots, until the parent reuses
+        # them or a hit takes them back.
+        self._released: dict[int, KVCacheBlock] = {}
+
+    @property  # type: ignore[override]
+    def kv_event_queue(self) -> list[KVCacheEvent]:
+        # The KV cache manager drains the parent's queue.
+        return self.parent.kv_event_queue
+
+    @kv_event_queue.setter
+    def kv_event_queue(self, events: list[KVCacheEvent]) -> None:
+        pass
+
+    def take_events(self) -> list[KVCacheEvent]:
+        # Taken with the parent's.
+        return []
+
+    def _slots(self, row: int) -> list[KVCacheBlock]:
+        start = row * self.slots_per_block
+        end = start + self.slots_per_block
+        if self.blocks[end - 1] is None:
+            for slot_id in range(start, end):
+                self.blocks[slot_id] = KVCacheBlock(slot_id, pool=self)
+        return self.blocks[start:end]  # type: ignore[return-value]
+
+    def _take_row(self) -> None:
+        (row_block,) = self.parent.get_new_blocks(1)
+        row = row_block.block_id
+        self._held[row] = row_block
+        self._num_used[row] = 0
+        slots = self._slots(row)
+        assert all(
+            slot.ref_cnt == 0
+            and slot.block_hash is None
+            and slot.prev_free_block is None
+            for slot in slots
+        )
+        self.free_block_queue.prepend_n(slots)
+
+    def _release_row(self, row: int) -> None:
+        row_block = self._held.pop(row)
+        del self._num_used[row]
+        cached = False
+        for slot in self._slots(row):
+            self.free_block_queue.remove(slot)
+            self._forget_eviction_marks(slot)
+            cached |= slot.block_hash is not None
+        if cached:
+            self._released[row] = row_block
+            self.parent.release_slot_row(row_block, self)
+        else:
+            self.parent.free_blocks([row_block])
+
+    def _reclaim_row(self, row: int) -> None:
+        row_block = self._released.pop(row)
+        self.parent.reclaim_slot_row(row_block)
+        self._held[row] = row_block
+        self._num_used[row] = 0
+        slots = self._slots(row)
+        cached = [slot for slot in slots if slot.block_hash is not None]
+        self.free_block_queue.prepend_n(
+            [slot for slot in slots if slot.block_hash is None]
+        )
+        now = self._clock()
+        for slot in cached:
+            self._lru_since[slot.block_id] = now
+        self.free_block_queue.append_n(cached)
+
+    def drop_row(self, row: int) -> None:
+        """The parent reuses a block given back with cached slots: evict them."""
+        self._released.pop(row, None)
+        for slot in self._slots(row):
+            self._maybe_evict_cached_block(slot)
+
+    def get_num_new_parent_blocks(
+        self, num_new_blocks: int, touched_blocks: Sequence[KVCacheBlock]
+    ) -> int:
+        """Parent blocks an allocation of ``num_new_blocks`` slots that first
+        touches ``touched_blocks`` takes at most."""
+        free_touched = {
+            block.block_id
+            for block in touched_blocks
+            if not block.is_null and block.ref_cnt == 0
+        }
+        rows = {slot_id // self.slots_per_block for slot_id in free_touched}
+        released = rows & self._released.keys()
+        num_free = self.free_block_queue.num_free_blocks - sum(
+            slot_id // self.slots_per_block in self._held for slot_id in free_touched
+        )
+        return len(released) + cdiv(
+            max(0, num_new_blocks - num_free), self.slots_per_block
+        )
+
+    def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
+        ret: list[KVCacheBlock] = []
+        queue = self.free_block_queue
+        for _ in range(num_blocks):
+            head = queue.fake_free_list_head.next_free_block
+            if head is queue.fake_free_list_tail or (
+                head is not None
+                and head.block_hash is not None
+                and self.parent.is_cheap_to_reuse(self._lru_since.get(head.block_id))
+            ):
+                self._take_row()
+            (block,) = super().get_new_blocks(1)
+            self._num_used[block.block_id // self.slots_per_block] += 1
+            ret.append(block)
+        return ret
+
+    def touch(self, blocks: Sequence[KVCacheBlock]) -> None:
+        newly_used: dict[int, KVCacheBlock] = {}
+        for block in blocks:
+            if block.is_null or block.ref_cnt:
+                continue
+            newly_used[block.block_id] = block
+            row = block.block_id // self.slots_per_block
+            if row in self._released:
+                self._reclaim_row(row)
+        super().touch(blocks)
+        for slot_id in newly_used:
+            self._num_used[slot_id // self.slots_per_block] += 1
+
+    def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
+        blocks = list(ordered_blocks)
+        num_frees: dict[int, int] = {}
+        for block in blocks:
+            if not block.is_null and block.pool is self:
+                num_frees[block.block_id] = num_frees.get(block.block_id, 0) + 1
+        emptied: list[int] = []
+        for slot_id, count in num_frees.items():
+            slot = self.blocks[slot_id]
+            assert slot is not None and slot.ref_cnt >= count
+            if slot.ref_cnt == count:
+                row = slot_id // self.slots_per_block
+                self._num_used[row] -= 1
+                if not self._num_used[row]:
+                    emptied.append(row)
+        super().free_blocks(blocks)
+        for row in emptied:
+            self._release_row(row)
+
+    def reset_prefix_cache(self) -> bool:
+        if self._held:
+            logger.warning(
+                "Failed to reset prefix cache because %d packed blocks are in use",
+                sum(self._num_used.values()),
+            )
+            return False
+        for row, row_block in list(self._released.items()):
+            self.drop_row(row)
+            self.parent._slot_rows.pop(row_block.block_id, None)
+        self.cached_block_hash_to_block = BlockHashToBlockMap()
+        self.cached_block_hashes_by_block.clear()
+        self._lru_since.clear()
+        return True
+
+    def get_usage(self) -> float:
+        return self.parent.get_usage()

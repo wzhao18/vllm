@@ -36,6 +36,7 @@ from vllm.multimodal.inputs import MultiModalKwargsItem
 from vllm.multimodal.utils import get_mm_features_in_window
 from vllm.outputs import RequestError
 from vllm.utils.math_utils import cdiv
+from vllm.v1.core.block_pool import SlotBlockPool
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -3271,8 +3272,12 @@ class Scheduler(SchedulerInterface):
         for manager in self.kv_cache_manager.coordinator.single_type_managers:
             # Token blocks of the whole step, plus per request: a partial block,
             # lookahead slots and Mamba state / checkpoint / spec blocks.
-            needed += cdiv(self.max_num_scheduled_tokens, manager.block_size)
-            needed += max_reqs * (4 + cdiv(lookahead, manager.block_size))
+            group_needed = cdiv(self.max_num_scheduled_tokens, manager.block_size)
+            group_needed += max_reqs * (4 + cdiv(lookahead, manager.block_size))
+            if isinstance(pool := manager.block_pool, SlotBlockPool):
+                # Slots share pool blocks: at most one partly used new block.
+                group_needed = cdiv(group_needed, pool.slots_per_block) + 1
+            needed += group_needed
         return self.kv_cache_manager.block_pool.get_num_free_blocks() >= needed
 
     def _dp_pull_chunk(

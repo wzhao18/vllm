@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from vllm.distributed.kv_transfer.kv_connector.utils import TransferTopology
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl import page_zeroer
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlConnectorMetadata,
 )
@@ -105,6 +106,53 @@ def test_page_zeroer_keeps_padding_and_widest_overlay():
     # Bytes past the attention page belong to no attention layer here.
     assert (backing[3, 40:] == POISON).all()
     assert (backing[[0, 1, 2, 4, 5]] == POISON).all()
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="needs a CUDA device"
+            ),
+        ),
+    ],
+)
+def test_page_zeroer_zeroes_packed_slots(device, monkeypatch):
+    """A group packed as slots of the block-outermost rows (the release DSpark
+    draft on Kimi K3.1): its block IDs are slot IDs, and a slot holds its
+    layers' pages side by side, slots a row's bytes / slots apart. Zeroing
+    slots clears exactly their pages, not the rest of their rows nor the
+    slots' padding; on CUDA through the zeroing kernel."""
+    if device == "cpu":
+        # Block ids are staged in pinned memory, which CPU-only hosts lack.
+        monkeypatch.setattr(
+            page_zeroer,
+            "async_tensor_h2d",
+            lambda data, device, dtype: torch.tensor(data, dtype=dtype, device=device),
+        )
+    rows, slots, layers, heads, tokens, width = 3, 4, 5, 2, 16, 32
+    page = heads * tokens * width
+    stride = layers * page + 256
+    backing = torch.full(
+        (rows * slots * stride,), POISON, dtype=torch.uint8, device=device
+    )
+    views = [
+        backing.as_strided(
+            (rows * slots, heads, tokens, width),
+            (stride, tokens * width, width, 1),
+            layer * page,
+        )
+        for layer in range(layers)
+    ]
+    zeroer = PageZeroer({3: views}, {3: None})
+    zeroer.zero({3: [1, 6, 11]})
+    expected = torch.full_like(backing, POISON)
+    for slot in (1, 6, 11):
+        expected[slot * stride : slot * stride + layers * page] = 0
+    assert torch.equal(backing, expected)
 
 
 def test_page_zeroer_async_on_cpu_is_inline():

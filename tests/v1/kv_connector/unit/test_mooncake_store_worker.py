@@ -4753,6 +4753,100 @@ def test_register_kv_caches_shared_storage(layout: KVCacheLayout):
     worker.store.register_buffer.assert_called_once_with(raw.data_ptr(), raw.nbytes)
 
 
+def test_register_kv_caches_addresses_packed_slots_by_slot():
+    """A group packed as slots of the shared block-outermost rows (Kimi K3.1's
+    release DSpark draft, ``blocks_per_pool_block``) has slot IDs for block
+    IDs: block ``j`` of that group is slot ``j`` (its 5 layers' pages side by
+    side), not row ``j``. The target's group keeps whole rows."""
+    from vllm.config import CacheConfig
+    from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups
+    from vllm.v1.kv_cache_interface import SlidingWindowSpec
+    from vllm.v1.worker.utils import allocate_kv_cache
+
+    num_rows, slots = 6, 4
+    target = FullAttentionSpec(
+        block_size=64, num_kv_heads=4, head_size=64, dtype=torch.bfloat16
+    )
+    draft = SlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.bfloat16,
+        sliding_window=64,
+        dcp_sharded=False,
+    )
+    groups = [
+        KVCacheGroupSpec(["t0", "t1"], target),
+        KVCacheGroupSpec(
+            [f"d{i}" for i in range(5)], draft, blocks_per_pool_block=slots
+        ),
+    ]
+    cache_config = CacheConfig(block_size=64)
+    cache_config.kv_cache_layout = "BLHNC"
+    cache_config.num_gpu_blocks_override = num_rows
+    config = SimpleNamespace(
+        cache_config=cache_config,
+        attention_config=SimpleNamespace(hisparse_config=None),
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+    )
+    kv_cache_config = get_kv_cache_config_from_groups(config, groups, 1)
+    views = allocate_kv_cache(kv_cache_config, torch.device("cpu"), KVCacheLayout.BLHNC)
+    row_bytes = 2 * target.page_size_bytes
+    assert views["d0"].shape[0] == num_rows * slots
+    assert views["d0"].stride(0) * views["d0"].element_size() == row_bytes // slots
+
+    worker = _make_bare_worker(num_gpu_blocks=num_rows, block_size=64)
+    worker._kv_cache_config = kv_cache_config
+    worker._kv_cache_groups = groups
+    worker.token_dbs = [
+        ChunkedTokenDatabase(
+            KeyMetadata("test-model", 0, 0, 0, 0, group_id=g),
+            block_size=group.kv_cache_spec.block_size,
+            hash_block_size=16,
+        )
+        for g, group in enumerate(groups)
+    ]
+    _refresh_group_tp_replication_factors(worker)
+    _register_with_mocked_threads(worker, views)
+
+    def merged(ranges) -> list[tuple[int, int]]:
+        out: list[tuple[int, int]] = []
+        for start, end in sorted(ranges):
+            if out and start <= out[-1][1]:
+                out[-1] = (out[-1][0], max(out[-1][1], end))
+            else:
+                out.append((start, end))
+        return out
+
+    def pages(layers: list[str], block: int) -> list[tuple[int, int]]:
+        """Bytes of the layers' pages of ``block``."""
+        return merged(
+            (views[name][block].data_ptr(), views[name][block].data_ptr() + size)
+            for name in layers
+            for size in [views[name][block].nbytes]
+        )
+
+    def stored(addrs: list[int], sizes: list[int]) -> list[tuple[int, int]]:
+        return merged((a, a + n) for a, n in zip(addrs, sizes, strict=True))
+
+    target_db, draft_db = worker.token_dbs
+    for row in range(num_rows):
+        assert stored(*target_db.prepare_value_for_block(row)) == pages(
+            ["t0", "t1"], row
+        )
+    draft_layers = groups[1].layer_names
+    for slot in range(num_rows * slots):
+        assert stored(*draft_db.prepare_value_for_block(slot)) == pages(
+            draft_layers, slot
+        )
+    # Chunks of the draft's block table address their slots.
+    addrs, sizes, _ = draft_db.store_layout.prepare_values(
+        [(0, 16), (16, 32)], [9, 2], [0, 0]
+    )
+    for chunk, slot in enumerate((9, 2)):
+        assert stored(addrs[chunk], sizes[chunk]) == pages(draft_layers, slot)
+
+
 def test_register_kv_caches_uses_transfer_group_memory_domain():
     """Derived GPU caches must not change host-source transfer addresses."""
     from vllm.v1.kv_cache_interface import (

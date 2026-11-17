@@ -13,6 +13,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator imp
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
     chunk_hashes_for_block_size,
 )
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -754,3 +755,157 @@ def test_dsv4_five_group_eagle_store_lookup_round_trip():
     # The final 256-token segment has no lookahead block, so EAGLE falls back
     # to the previous aligned boundary instead of consuming all 768 tokens.
     assert hit == 512
+
+
+@pytest.mark.parametrize("use_eagle", [False, True])
+def test_dcp_replicated_draft_store_lookup_round_trip(use_eagle):
+    """Kimi-K3.1 with the release DSpark draft on a TP8/DCP8 prefiller: the DSA
+    group is DCP-sharded (a 1024-token block per rank spans 8192 tokens), the
+    draft's 2048-token sliding window runs at DCP 1 (1024 tokens per block).
+    DCP resolution scales the target only; each 8192-token boundary stores the
+    draft's window tail, and a lookup over exactly the stored keys hits every
+    boundary the drafter's eagle drop allows."""
+    from types import SimpleNamespace
+
+    from vllm.v1.kv_cache_interface import KVCacheConfig, MLAAttentionSpec
+
+    dsa = MLAAttentionSpec(
+        block_size=1024, num_kv_heads=1, head_size=656, dtype=torch.uint8
+    )
+    draft = SlidingWindowSpec(
+        block_size=1024,
+        num_kv_heads=2,
+        head_size=64,
+        dtype=torch.bfloat16,
+        sliding_window=2048,
+        dcp_sharded=False,
+    )
+    groups = [
+        KVCacheGroupSpec(["model.layers.0.self_attn.attn"], dsa),
+        KVCacheGroupSpec(
+            ["model.layers.93.self_attn.attn"], draft, is_eagle_group=use_eagle
+        ),
+    ]
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=8),
+        speculative_config=SimpleNamespace(use_eagle_block_drop=lambda: use_eagle),
+    )
+    coord = MooncakeStoreCoordinator.from_kv_cache_config(
+        KVCacheConfig(num_blocks=64, kv_cache_tensors=[], kv_cache_groups=groups),
+        config,
+        scheduler_block_size=8192,
+        hash_block_size=1024,
+    )
+    assert [g.kv_cache_spec.block_size for g in coord.kv_cache_groups] == [8192, 1024]
+
+    token_len = 3 * 8192
+    store_masks = coord.store_mask(token_len)
+    assert store_masks[0] is None
+    # The window needs cdiv(2047, 1024) = 2 blocks before a boundary, plus the
+    # block past it that the eagle drop peeks at.
+    tails = [6, 7, 14, 15, 22, 23] if not use_eagle else [6, 7, 8, 14, 15, 16, 22, 23]
+    assert [i for i, stored in enumerate(store_masks[1]) if stored] == tails
+
+    hashes = _hashes(token_len // coord.hash_block_size)
+    exists: set[tuple[int, bytes]] = set()
+    for gid, (group, mask) in enumerate(
+        zip(coord.kv_cache_groups, store_masks, strict=True)
+    ):
+        group_hashes = coord.block_hashes_for_spec(hashes, group.kv_cache_spec)
+        for chunk_id, block_hash in enumerate(group_hashes):
+            if mask is None or mask[chunk_id]:
+                exists.add((gid, bytes(block_hash)))
+    load_masks, hit = coord.find_longest_cache_hit(
+        hashes,
+        max_length=token_len,
+        cached_block_pool=ExternalCachedBlockPool(coord.hash_block_size, exists),
+    )
+    assert hit == (token_len if not use_eagle else 2 * 8192)
+    # The draft loads exactly its window before the hit.
+    loaded = [i for i, load in enumerate(load_masks[1]) if load]
+    assert loaded == [hit // 1024 - 2, hit // 1024 - 1]
+
+
+@pytest.mark.parametrize("num_prompt_tokens", [20000, 17000])
+def test_packed_release_draft_resumes_at_the_prompt_checkpoint(num_prompt_tokens):
+    """Kimi-K3.1 with the release DSpark draft on a TP8/DCP8 prefiller, as
+    deployed: the DSA group's 1024-token blocks span 8192 tokens under DCP 8,
+    the KDA state groups align at 1024, and the draft's 2048-token window is
+    packed into 128-token blocks (the hit unit), so hits land on 128-token
+    boundaries, with no retention interval and no EAGLE drop.
+
+    A prompt stores the draft's window tail at the scheduler block below its
+    replay boundary and, with the prompt checkpoint's partial tail, the blocks
+    from there up to the checkpoint. A later lookup of exactly the stored keys
+    resumes at the checkpoint and loads the 16 draft blocks before it: the
+    whole window, also when the checkpoint is less than a window past the
+    scheduler block (17000)."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+        BoundaryPut,
+        ReqMeta,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.scheduler import (  # noqa: E501
+        _partial_tail_non_mamba_puts,
+    )
+
+    hash_block, lcm_block, window = 128, 8192, 2048
+    groups = [
+        KVCacheGroupSpec(["model.layers.0.self_attn.attn"], _full(lcm_block)),
+        KVCacheGroupSpec(["model.layers.100.linear_attn"], _mamba_align(1024)),
+        KVCacheGroupSpec(
+            ["model.layers.93.self_attn.attn"],
+            _swa(hash_block, window),
+            blocks_per_pool_block=48,
+        ),
+    ]
+    coord = _make_coord(
+        groups, hash_block, retention_interval=0, enable_partial_hash_hits=True
+    )
+    hashes = _hashes(num_prompt_tokens // hash_block)
+    checkpoint = (num_prompt_tokens - 1) // hash_block * hash_block
+    saved = checkpoint // lcm_block * lcm_block
+
+    # The normal save, up to the last scheduler block.
+    exists: set[tuple[int, bytes]] = set()
+    stored_draft_blocks: set[int] = set()
+    for gid, (group, mask) in enumerate(
+        zip(groups, coord.store_mask(saved, num_prompt_tokens=num_prompt_tokens))
+    ):
+        group_hashes = coord.block_hashes_for_spec(hashes, group.kv_cache_spec)
+        for chunk_id in range(saved // group.kv_cache_spec.block_size):
+            if mask is None or mask[chunk_id]:
+                exists.add((gid, bytes(group_hashes[chunk_id])))
+                if gid == 2:
+                    stored_draft_blocks.add(chunk_id)
+    # The prompt checkpoint: the KDA state and the other groups' partial tail.
+    num_blocks = [cdiv(num_prompt_tokens, g.kv_cache_spec.block_size) for g in groups]
+    req_meta = ReqMeta(
+        req_id="req",
+        token_len_chunk=0,
+        block_ids=tuple(list(range(1, n + 1)) for n in num_blocks),
+        block_hashes=hashes,
+        num_prompt_tokens=num_prompt_tokens,
+        completed_token_len=num_prompt_tokens,
+        boundary_puts=[BoundaryPut(1, 1, checkpoint)],
+    )
+    puts = [
+        *_partial_tail_non_mamba_puts(
+            coord, req_meta, [g.kv_cache_spec.block_size for g in groups]
+        ),
+        *req_meta.boundary_puts,
+    ]
+    for put in puts:
+        exists.add((put.group_id, bytes(hashes[put.num_tokens // hash_block - 1])))
+        if put.group_id == 2:
+            stored_draft_blocks.add(put.num_tokens // hash_block - 1)
+    window_blocks = range((checkpoint - window) // hash_block, checkpoint // hash_block)
+    assert set(window_blocks) <= stored_draft_blocks
+
+    load_masks, hit = coord.find_longest_cache_hit(
+        hashes,
+        max_length=num_prompt_tokens,
+        cached_block_pool=ExternalCachedBlockPool(hash_block, exists),
+    )
+    assert hit == checkpoint
+    loaded = [i for i, load in enumerate(load_masks[2]) if load]
+    assert loaded == list(window_blocks)
