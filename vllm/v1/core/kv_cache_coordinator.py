@@ -5,7 +5,7 @@ from collections.abc import Sequence
 from typing import NamedTuple
 
 from vllm.utils.math_utils import cdiv, round_down
-from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.block_pool import BlockPool, SlotBlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -17,6 +17,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
     MambaManager,
     SingleTypeKVCacheManager,
+    SlidingWindowManager,
     get_manager_for_kv_cache_spec,
 )
 from vllm.v1.kv_cache_interface import (
@@ -163,7 +164,11 @@ class KVCacheCoordinator(ABC):
                 kv_cache_spec=kv_cache_group.kv_cache_spec,
                 max_in_flight_tokens=max_in_flight_tokens,
                 max_model_len=max_model_len,
-                block_pool=self.block_pool,
+                block_pool=(
+                    SlotBlockPool(self.block_pool, kv_cache_group.blocks_per_pool_block)
+                    if kv_cache_group.blocks_per_pool_block > 1
+                    else self.block_pool
+                ),
                 role=kv_cache_group.role,
                 enable_caching=enable_caching,
                 kv_cache_group_id=i,
@@ -174,6 +179,36 @@ class KVCacheCoordinator(ABC):
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
+        # Groups packed into slots take their pool blocks after the other groups
+        # of a request have theirs: a slot pool may take more pool blocks than
+        # admission counted when they evict nothing.
+        self._allocation_order = sorted(
+            range(len(self.single_type_managers)),
+            key=lambda i: isinstance(
+                self.single_type_managers[i].block_pool, SlotBlockPool
+            ),
+        )
+        # A window group packed into slots beside Mamba groups caches only the
+        # window tails a hit can resume at: where the Mamba states are kept.
+        self._state_boundary_managers: list[MambaManager] = [
+            manager
+            for manager in self.single_type_managers
+            if isinstance(manager, MambaManager) and manager.enable_caching
+        ]
+        self._state_tail_managers: list[SlidingWindowManager] = [
+            manager
+            for manager in self.single_type_managers
+            if isinstance(manager, SlidingWindowManager)
+            and isinstance(manager.block_pool, SlotBlockPool)
+            and manager.enable_caching
+        ]
+        if not (self._state_boundary_managers and self._state_tail_managers):
+            self._state_boundary_managers = []
+            self._state_tail_managers = []
+        for manager in self._state_boundary_managers:
+            manager.record_state_boundaries = True
+        for manager in self._state_tail_managers:
+            manager.tails_at_state_boundaries = True
         # Match Mamba checkpoints to Eagle's attention replay boundary.
         if use_eagle:
             for manager in self.single_type_managers:
@@ -304,8 +339,8 @@ class KVCacheCoordinator(ABC):
                 num_external_computed_tokens,
             )
         if num_external_computed_tokens > 0:
-            for i, manager in enumerate(self.single_type_managers):
-                manager.allocate_external_computed_blocks(
+            for i in self._allocation_order:
+                self.single_type_managers[i].allocate_external_computed_blocks(
                     request_id,
                     num_local_computed_tokens,
                     num_external_computed_tokens,
@@ -336,16 +371,17 @@ class KVCacheCoordinator(ABC):
             The new allocated blocks.
 
         """
-        return tuple(
-            manager.allocate_new_blocks(
+        new_blocks: list[list[KVCacheBlock]] = [[] for _ in self.single_type_managers]
+        for i in self._allocation_order:
+            manager = self.single_type_managers[i]
+            new_blocks[i] = manager.allocate_new_blocks(
                 request_id,
                 num_encoder_tokens
                 if isinstance(manager, CrossAttentionManager)
                 else num_tokens,
                 num_tokens_main_model,
             )
-            for manager in self.single_type_managers
-        )
+        return tuple(new_blocks)
 
     def get_num_cacheable_tokens(
         self, num_computed_tokens: int, kv_cache_group_id: int
@@ -371,13 +407,31 @@ class KVCacheCoordinator(ABC):
             use_eagle=bool(self.drop_eagle_group_ids),
         )
         for group_id, manager in enumerate(self.single_type_managers):
-            if not manager.enable_caching:
+            if not manager.enable_caching or manager in self._state_tail_managers:
                 continue
             manager.cache_blocks(
                 request,
                 self.get_num_cacheable_tokens(num_computed_tokens, group_id),
                 retention_interval=self.retention_interval,
                 replay_boundaries=boundaries,
+            )
+        if not self._state_tail_managers:
+            return
+        # The window tails follow the states just registered (cached up to the
+        # same token count, so their blocks are still in the window).
+        state_boundaries = tuple(
+            boundary
+            for manager in self._state_boundary_managers
+            for boundary in manager.take_new_state_boundaries()
+        )
+        for manager in self._state_tail_managers:
+            manager.cache_blocks(
+                request,
+                self.get_num_cacheable_tokens(
+                    num_computed_tokens, manager.kv_cache_group_id
+                ),
+                retention_interval=self.retention_interval,
+                replay_boundaries=(*boundaries, *state_boundaries),
             )
 
     def emit_cached_block_events(

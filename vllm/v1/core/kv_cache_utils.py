@@ -1106,8 +1106,11 @@ def get_max_concurrency_for_kv_cache_config(
     host_blocks_per_request = 0
     for group in kv_cache_config.kv_cache_groups:
         required = cdiv(
-            group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
-            group.kv_cache_spec.page_size_bytes,
+            cdiv(
+                group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                group.kv_cache_spec.page_size_bytes,
+            ),
+            group.blocks_per_pool_block,
         )
         if group.host_resident:
             host_blocks_per_request += required

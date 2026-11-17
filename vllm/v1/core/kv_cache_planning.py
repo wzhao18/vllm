@@ -572,10 +572,79 @@ def _get_layer_block_stride(spec: KVCacheSpec) -> int:
     return round_up(spec.page_size_bytes, spec.get_block_stride_alignment())
 
 
+# Slots packed into a pool block start at multiples of this many bytes.
+SLOT_STRIDE_ALIGNMENT = 128
+
+
+def get_group_slot_bytes(group: KVCacheGroupSpec) -> int:
+    """Bytes of one block of ``group`` with its layers side by side, as one
+    slot of a block-outermost pool block holds it."""
+    return sum(
+        _get_per_layer_spec(group, layer_name).page_size_bytes
+        for layer_name in group.layer_names
+    )
+
+
+def get_group_slot_alignment(group: KVCacheGroupSpec) -> int:
+    """Byte alignment of the slots ``group``'s blocks are packed into."""
+    return math.lcm(
+        SLOT_STRIDE_ALIGNMENT,
+        *(
+            _get_per_layer_spec(group, layer_name).get_block_stride_alignment()
+            for layer_name in group.layer_names
+        ),
+    )
+
+
+def get_slots_per_pool_block(
+    slot_bytes: int, pool_block_bytes: int, alignment: int
+) -> int:
+    """Most equal slots of at least ``slot_bytes`` that tile a pool block of
+    ``pool_block_bytes`` exactly, each starting ``alignment``-aligned (1 if
+    fewer than 2 fit)."""
+    for slots in range(pool_block_bytes // slot_bytes, 1, -1):
+        stride, rest = divmod(pool_block_bytes, slots)
+        if rest == 0 and stride % alignment == 0:
+            return slots
+    return 1
+
+
+def _packs_slots(group: KVCacheGroupSpec) -> bool:
+    return group.blocks_per_pool_block > 1
+
+
+def _get_slot_stride(
+    group: KVCacheGroupSpec, pool_block_bytes: int, layout: KVCacheLayout
+) -> int:
+    """Byte stride between the slots ``group``'s blocks occupy, or raise if
+    its ``blocks_per_pool_block`` slots do not tile the pool block."""
+    slots = group.blocks_per_pool_block
+    stride, rest = divmod(pool_block_bytes, slots)
+    if (
+        not layout.is_block_outermost
+        or rest
+        or stride < get_group_slot_bytes(group)
+        or stride % get_group_slot_alignment(group)
+    ):
+        raise ValueError(
+            f"KV cache group {group.layer_names[0]}...: {slots} slots of "
+            f"{get_group_slot_bytes(group)} bytes do not tile a "
+            f"{pool_block_bytes}-byte {layout.name} block."
+        )
+    return stride
+
+
 def _get_kv_cache_bytes_per_block(
     kv_cache_groups: list[KVCacheGroupSpec], layout: KVCacheLayout
 ) -> int:
-    """Return the largest cache group's bytes per block."""
+    """Return the largest cache group's bytes per block.
+
+    Groups that pack several blocks into each pool block live inside the
+    other groups' pool blocks, so they do not size them.
+    """
+    kv_cache_groups = [
+        group for group in kv_cache_groups if not _packs_slots(group)
+    ] or kv_cache_groups
     if not layout.is_block_outermost:
         # Each layer's block stride is its own padded page.
         return max(
@@ -693,6 +762,10 @@ def get_kv_cache_config_from_groups(
     # layer-outer (only supported for uniform page sizes or single-group models):
     # group 0: | A [ blk 0 | blk 1 | ... ] | B [ blk 0 | blk 1 | ... ] |
     # group 1: | C [ blk 0 | blk 1 | ... ] | D [ blk 0 | blk 1 | ... ] |
+    #
+    # A group packing S blocks per pool block splits each block-outer pool
+    # block into S equal slots, its block j living in slot j % S of block j // S:
+    # group 2: | blk 0 [ E F | E F | E F ] | blk 1 [ E F | E F | E F ] | ...
 
     kv_cache_tensors = []
     for group in kv_cache_groups:
@@ -700,16 +773,21 @@ def get_kv_cache_config_from_groups(
         for layer_name in group.layer_names:
             layers_by_spec[_get_per_layer_spec(group, layer_name)].append(layer_name)
 
+        group_num_blocks: int | None = None
+        group_block_stride = interleaved_block_stride
+        if _packs_slots(group):
+            group_block_stride = _get_slot_stride(group, bytes_per_block, layout)
+            group_num_blocks = num_blocks * group.blocks_per_pool_block
         byte_offset = 0
         for spec, layer_names in layers_by_spec.items():
-            block_stride = interleaved_block_stride
+            block_stride = group_block_stride
             padded_page = _get_layer_block_stride(spec)
             if block_stride is None and padded_page != spec.page_size_bytes:
                 assert layout.is_block_compact, f"{layout.name} cannot pad pages"
                 block_stride = padded_page
             layer_stride, block_stride, _, _, _ = compute_layout_strides(
                 spec,
-                num_blocks,
+                group_num_blocks or num_blocks,
                 len(layer_names),
                 layout,
                 fixed_strides=(None, block_stride, None, None, None),
@@ -721,6 +799,7 @@ def get_kv_cache_config_from_groups(
                     layer_stride=layer_stride,
                     block_stride=block_stride,
                     offset=byte_offset,
+                    num_blocks=group_num_blocks,
                 )
             )
             # Block-outer layers share each block; layer-outer ones own regions.
@@ -911,6 +990,7 @@ def _approximate_gcd(values: Sequence[int], *, lower_bound: int | None = None) -
 def _get_packed_kv_cache_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
+    fewest_state_groups: bool = False,
 ) -> list[KVCacheGroupSpec] | None:
     """Group mixed-page-size layers for contiguous block-outermost packing.
 
@@ -919,7 +999,9 @@ def _get_packed_kv_cache_groups(
     per page size) and split into groups covering the same number of pattern
     repeats (picked by ``_approximate_gcd`` to minimize padding), so all
     groups pack into the same per-block layout. Mamba buckets are additionally
-    split to fit the block the attention buckets already need.
+    split to fit the block the attention buckets already need; with
+    ``fewest_state_groups`` only that fit splits them, not the repeat pattern
+    (each Mamba group holds a state block per request).
     Returns None when the layout is not block-outermost or all layers already
     share one page size.
     """
@@ -1011,7 +1093,11 @@ def _get_packed_kv_cache_groups(
 
     groups = []
     for spec, page_size_layers, balanced in bucketed:
-        num_groups = num_groups_for(spec, balanced)
+        num_groups = (
+            1
+            if fewest_state_groups and isinstance(spec.first_spec, MambaSpec)
+            else num_groups_for(spec, balanced)
+        )
         # Cap a state group at the states a block already fits rather than let
         # it widen the block.
         if anchor_bytes and is_state_bucket(spec):
@@ -1120,12 +1206,16 @@ def _ensure_min_page_size(
 def get_kv_cache_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
+    *,
+    fewest_state_groups: bool = False,
 ) -> list[KVCacheGroupSpec]:
     """Split the layers in the model into groups with the same KV cache spec.
 
     Args:
         vllm_config: The global VllmConfig
         kv_cache_spec: The kv cache spec of each attention layer in the model
+        fewest_state_groups: Split block-outermost Mamba buckets only as far
+            as the block fits them (see ``_get_packed_kv_cache_groups``).
 
     Returns:
         The generated KVCacheGroups
@@ -1163,7 +1253,9 @@ def get_kv_cache_groups(
         if not isinstance(v, HiddenStateCacheSpec)
     }
 
-    if packed_groups := _get_packed_kv_cache_groups(vllm_config, filtered_spec):
+    if packed_groups := _get_packed_kv_cache_groups(
+        vllm_config, filtered_spec, fewest_state_groups
+    ):
         # Block-outermost blocks are strided by the widest group, so hidden
         # groups need no page alignment.
         packed_groups += [
@@ -1282,12 +1374,13 @@ def _max_memory_usage_bytes_from_groups(
     for group in kv_cache_groups:
         spec = group.kv_cache_spec
         if isinstance(spec, UniformTypeKVCacheSpecs):
-            total_blocks += spec.max_memory_usage_pages(vllm_config)
+            group_blocks = spec.max_memory_usage_pages(vllm_config)
         else:
-            total_blocks += cdiv(
+            group_blocks = cdiv(
                 spec.max_memory_usage_bytes(vllm_config),
                 spec.page_size_bytes,
             )
+        total_blocks += cdiv(group_blocks, group.blocks_per_pool_block)
 
     return bytes_per_block * total_blocks
 
@@ -1460,6 +1553,7 @@ def _project_kv_cache_groups_to_worker(
                 host_resident=group.host_resident,
                 enable_kv_transfer=group.enable_kv_transfer,
                 role=group.role,
+                blocks_per_pool_block=group.blocks_per_pool_block,
             )
         )
     return projected_groups
