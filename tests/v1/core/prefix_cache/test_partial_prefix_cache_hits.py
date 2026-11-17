@@ -83,6 +83,65 @@ def test_capable_connector_uses_divergent_partial_hit_lookup():
     manager.get_computed_blocks.assert_not_called()
 
 
+def _connector_lookup(per_group_hits):
+    """Run KVCacheManager.get_computed_blocks_for_connector on stub groups
+    (full attention, Mamba, sliding-window draft) with these per-group hits."""
+    from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+
+    spec = dict(num_kv_heads=1, head_size=1, dtype=torch.float32)
+    groups = [
+        KVCacheGroupSpec(["fa"], FullAttentionSpec(block_size=8, **spec)),
+        KVCacheGroupSpec(
+            ["mamba"],
+            MambaSpec(
+                block_size=8,
+                shapes=(1, 1),
+                dtypes=(torch.float32,),
+                mamba_cache_mode="align",
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["draft"], SlidingWindowSpec(block_size=2, sliding_window=4, **spec)
+        ),
+    ]
+    coordinator = MagicMock(spec=HybridKVCacheCoordinator)
+    coordinator.full_attention_group_id = 0
+    per_group_blocks = (MagicMock(), MagicMock(), MagicMock())
+    coordinator.find_longest_cache_hit_per_group.return_value = (
+        per_group_blocks,
+        per_group_hits,
+    )
+    reconciled = (MagicMock(), 4, 0)
+    manager = MagicMock()
+    manager.coordinator = coordinator
+    manager.kv_cache_config = SimpleNamespace(
+        has_mamba_layers=True, kv_cache_groups=groups
+    )
+    manager.prefix_cache_lookup_enabled.return_value = True
+    manager.get_computed_blocks.return_value = reconciled
+    request = MagicMock()
+    request.get_max_cache_hit_length.return_value = 64
+    result = KVCacheManager.get_computed_blocks_for_connector(manager, request)
+    return result, reconciled, manager
+
+
+def test_connector_lookup_reconciles_a_lagging_non_mamba_group():
+    # The draft sliding-window group caches window tails only at state
+    # boundaries, so its hit (10) can stop short of full attention (16). Its
+    # block list cannot back the full-attention hit: reconcile instead of
+    # reporting 16 (which made truncate_computed_blocks overrun the draft list).
+    result, reconciled, manager = _connector_lookup((16, 8, 10))
+    assert result == (*reconciled, False)
+    manager.get_computed_blocks.assert_called_once()
+
+
+def test_connector_lookup_lets_only_mamba_lag():
+    result, _, manager = _connector_lookup((16, 8, 16))
+    assert result[1:] == (16, 0, True)
+    manager.get_computed_blocks.assert_not_called()
+
+
 def drain_boundary_state_offloads(manager):
     """Drain exact boundary-state block ids offered to a connector."""
     return manager.take_boundary_state_offloads()

@@ -423,13 +423,27 @@ class KVCacheManager:
         computed, per_group_hits = coordinator.find_longest_cache_hit_per_group(
             request.block_hashes, max_cache_hit_length
         )
-        if any(hit > per_group_hits[fa_group_id] for hit in per_group_hits):
+        num_local = per_group_hits[fa_group_id]
+        if any(hit > num_local for hit in per_group_hits):
             # A lagging group hit deeper than full attention means its
             # full-attention blocks were evicted; use the reconciled boundary
             # that every group agrees on.
             return *self.get_computed_blocks(request, max_cache_hit_length), False
+        if any(
+            hit < num_local
+            and group.kv_cache_spec.prefix_cacheable
+            and not isinstance(group.kv_cache_spec, MambaSpec)
+            for hit, group in zip(
+                per_group_hits, self.kv_cache_config.kv_cache_groups, strict=True
+            )
+        ):
+            # Only the Mamba state may lag the full-attention hit: the
+            # connector transfers it unconditionally. Any other group short of
+            # it (e.g. a sliding-window draft group that caches window tails
+            # only at state boundaries) holds no KV for the gap, so its blocks
+            # cannot back that hit; use the reconciled boundary.
+            return *self.get_computed_blocks(request, max_cache_hit_length), False
 
-        num_local = per_group_hits[fa_group_id]
         blocks = self.create_kv_cache_blocks(computed)
         # Per-group lookups do not detect an uncached shared prefix (boundary 0).
         return blocks, num_local, 0, min(per_group_hits) < num_local
