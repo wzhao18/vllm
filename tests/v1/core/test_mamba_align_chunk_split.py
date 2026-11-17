@@ -147,6 +147,7 @@ def _split(
     extra_tail_min_span: int = 0,
     snapshot: bool = False,
     first_chunk: bool = False,
+    cache_block_size: int | None = None,
 ) -> int:
     """Call the real `Scheduler._mamba_block_aligned_split` on a stub self."""
     if use_eagle_block_drop is None:
@@ -159,8 +160,12 @@ def _split(
     stub = SimpleNamespace(
         **extra,
         block_size=MAMBA_BLOCK_SIZE,
+        mamba_block_size=MAMBA_BLOCK_SIZE,
+        # EngineCore sets cache_config.block_size to the smallest group block,
+        # which a smaller (e.g. slot-packed draft) group drags below the Mamba
+        # block; the split must not read it.
         cache_config=SimpleNamespace(
-            block_size=MAMBA_BLOCK_SIZE,
+            block_size=cache_block_size or MAMBA_BLOCK_SIZE,
             mamba_extra_tail_checkpoint_min_span=extra_tail_min_span,
         ),
         use_eagle_block_drop=use_eagle_block_drop,
@@ -650,3 +655,32 @@ def test_first_chunk_snapshot_runs_a_small_turn_in_one_step(
     assert snap == (new_tokens if regular or col >= 0 else base)
     if col >= 0:
         assert base < new_tokens
+
+
+
+@pytest.mark.parametrize("computed", [0, 900, 1600, 2000])
+@pytest.mark.parametrize("num_new", [700, 1700, 2000, 4000])
+@pytest.mark.parametrize("ckpt_blocks", [0, 1])
+def test_split_ignores_a_smaller_engine_block_size(
+    computed: int, num_new: int, ckpt_blocks: int
+) -> None:
+    """A group with blocks smaller than the Mamba block (the release DSpark
+    draft's 128-token slots) makes EngineCore's cache_config.block_size smaller
+    than the Mamba block. Chunk splits, including resumes mid-block, must still
+    follow the Mamba block: the same split as with the Mamba-sized setting."""
+    splits = []
+    for cache_block_size in (None, 128):
+        (request,) = create_requests(
+            1, num_tokens=8 * MAMBA_BLOCK_SIZE + 3, block_size=ATTN_BLOCK_SIZE
+        )
+        request.num_computed_tokens = computed
+        splits.append(
+            _split(
+                request,
+                num_new,
+                use_eagle=False,
+                num_prefill_checkpoint_blocks=ckpt_blocks,
+                cache_block_size=cache_block_size,
+            )
+        )
+    assert splits[1] == splits[0]

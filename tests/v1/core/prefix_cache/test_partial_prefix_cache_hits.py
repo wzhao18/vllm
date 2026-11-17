@@ -195,6 +195,7 @@ def test_dcp_fine_hit_retention_uses_hash_alignment(
     assert manager.coordinator.enable_partial_hash_hits
     scheduler = SimpleNamespace(
         block_size=block_size * dcp_world_size,
+        mamba_block_size=block_size,
         cache_config=SimpleNamespace(block_size=block_size),
         hash_block_size=hash_block_size,
         max_num_scheduled_tokens=8192,
@@ -252,6 +253,7 @@ def test_mamba_align_split_partial_tail_schedule(dcp_world_size: int):
     hash_block_size = 32
     mock = SimpleNamespace(
         block_size=scheduler_block_size,
+        mamba_block_size=block_size,
         cache_config=SimpleNamespace(block_size=block_size),
         max_num_scheduled_tokens=8192,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
@@ -303,6 +305,7 @@ def test_mamba_align_split_when_block_exceeds_scheduling_budget():
     prompt_length = 30000
     mock = SimpleNamespace(
         block_size=block_size,
+        mamba_block_size=block_size,
         cache_config=SimpleNamespace(block_size=block_size),
         max_num_scheduled_tokens=token_budget,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
@@ -343,6 +346,7 @@ def test_mamba_align_split_when_block_exceeds_long_prefill_threshold():
     prompt_length = 1300
     mock = SimpleNamespace(
         block_size=block_size,
+        mamba_block_size=block_size,
         cache_config=SimpleNamespace(block_size=block_size),
         max_num_scheduled_tokens=token_budget,
         scheduler_config=SimpleNamespace(
@@ -2000,6 +2004,7 @@ def test_mamba_align_split_stops_below_eagle_proof_boundary():
     block_size = 1536
     hash_block_size = 128
     mock = SimpleNamespace(
+        mamba_block_size=block_size,
         cache_config=SimpleNamespace(block_size=block_size),
         max_num_scheduled_tokens=8192,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
@@ -3025,6 +3030,7 @@ class _AlignModel:
 
     def split(self, request, start, num_new, local, first):
         stub = SimpleNamespace(
+            mamba_block_size=self.block,
             cache_config=SimpleNamespace(
                 block_size=self.block, mamba_extra_tail_checkpoint_min_span=0
             ),

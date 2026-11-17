@@ -213,6 +213,7 @@ def _manager(num_blocks: int = 256):
 
 _SCHED = SimpleNamespace(
     block_size=GLOBAL_BLOCK,
+    mamba_block_size=BLOCK,
     cache_config=SimpleNamespace(block_size=BLOCK),
     hash_block_size=HASH,
     max_num_scheduled_tokens=512,

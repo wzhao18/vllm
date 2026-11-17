@@ -105,6 +105,7 @@ def _split(
 ):
     stub = SimpleNamespace(
         block_size=MAMBA_BLOCK,
+        mamba_block_size=MAMBA_BLOCK,
         cache_config=SimpleNamespace(block_size=MAMBA_BLOCK),
         use_eagle_block_drop=False,
         num_hash_lookahead_tokens=int(shared_prefix_checkpoint),
