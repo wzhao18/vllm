@@ -321,6 +321,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.use_aux_hidden_state_outputs = requires_aux_hidden_states(
                 self.speculative_config
             )
+        # A KV producer releases a finished request's KV to remote readers once
+        # the step's output is processed. The drafter writes the draft's KV of
+        # the last prompt chunk after sampling, so a step that completes a
+        # prompt publishes its output only after the drafter.
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        self._output_after_drafter = (
+            self.speculator is not None
+            and kv_transfer_config is not None
+            and kv_transfer_config.is_kv_producer
+        )
 
         # Draft tokens propagation - for spec-dec + struct outputs.
         self.draft_tokens_handler = DraftTokensHandler(self.device)
@@ -2572,6 +2582,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.adaptive_verification.record_confidences(
                     self.speculator.draft_token_confidence_probs, input_batch
                 )
+            if self._output_after_drafter and _completes_prompt(input_batch):
+                async_output.publish_after(self.main_stream)
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
@@ -2771,3 +2783,16 @@ def sort_batch_req_ids(
         num,
     )
     return sorted(num_tokens_per_req, key=key)
+
+
+def _completes_prompt(input_batch: InputBatch) -> bool:
+    """Whether the step schedules some request's last prompt tokens."""
+    if not input_batch.has_prefill:
+        return False
+    num_reqs = input_batch.num_reqs
+    done = (
+        input_batch.num_computed_prefill_tokens_np[:num_reqs]
+        + input_batch.num_scheduled_tokens[:num_reqs]
+        >= input_batch.prefill_len_np[:num_reqs]
+    )
+    return bool((done & input_batch.is_prefilling_np[:num_reqs]).any())

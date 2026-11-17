@@ -62,6 +62,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.page_zeroer import PageZe
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_worker import (
     NixlPullConnectorWorker,
 )
+from vllm.models.kimi_k3.nvidia.gqa_draft import GQADraftKVCacheGrouping
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.registry import (
@@ -74,10 +75,13 @@ from vllm.v1.core.kv_cache_planning import (
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    KVCacheGroupSpec,
+    KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowSpec,
     SparseCacheRole,
+    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.worker.gpu.kv_connector import NO_OP_KV_CONNECTOR, ActiveKVConnector
@@ -351,6 +355,13 @@ def _gqa_draft_specs(
     }
 
 
+def _layer_spec(group: KVCacheGroupSpec, name: str) -> KVCacheSpec:
+    spec = group.kv_cache_spec
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        return spec.kv_cache_specs[name]
+    return spec
+
+
 class _Rank:
     """One rank: its packed KV cache as the real planner lays it out and the
     runner binds it, and its real NIXL pull worker on a fake transport."""
@@ -370,10 +381,12 @@ class _Rank:
         bind_indexer: Callable[[torch.Tensor], torch.Tensor] | None = _bind_indexer,
         draft_window: int | None = None,
         decoder: bool | None = None,
+        draft_hit_unit: int | None = None,
     ):
         # KDA layers first: the KV cache groups are then KDA, KDA, DSA, so the
         # attention group is not group 0. With ``draft_window``, the release
-        # draft's sliding-window GQA layers follow.
+        # draft's sliding-window GQA layers follow; with ``draft_hit_unit``,
+        # Kimi's grouping packs its blocks of that many tokens as row slots.
         self.specs = {
             **_kda_specs(block_size, tp, num_kda),
             **_k31_dsa_specs(block_size, num_dsa, num_draft),
@@ -389,7 +402,16 @@ class _Rank:
             attention_config=SimpleNamespace(hisparse_config=None),
             scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
         )
-        groups = get_kv_cache_groups(config, self.specs)
+        if draft_hit_unit:
+            cache_config.prefix_match_unit = draft_hit_unit
+            groups = GQADraftKVCacheGrouping.get_kv_cache_groups(config, self.specs)
+        else:
+            groups = get_kv_cache_groups(config, self.specs)
+        self.page_bytes = {
+            name: _layer_spec(group, name).page_size_bytes
+            for group in groups
+            for name in group.layer_names
+        }
         self.kv_cache_config = get_kv_cache_config_from_groups(config, groups, 1)
         self.views = allocate_kv_cache(
             self.kv_cache_config, torch.device("cpu"), KVCacheLayout.BLHNC
@@ -408,6 +430,13 @@ class _Rank:
             for g, group in enumerate(groups)
             if isinstance(group.kv_cache_spec.first_spec, SlidingWindowSpec)
         ]
+        # Tokens per draft block, and the draft blocks one row holds.
+        self.draft_block_size = block_size
+        self.draft_slots = 1
+        if self.draft_groups:
+            draft_group = groups[self.draft_groups[0]]
+            self.draft_block_size = draft_group.kv_cache_spec.block_size
+            self.draft_slots = draft_group.blocks_per_pool_block
         # As the runner binds them: indexers see 64-row kernel pages.
         self.kernel_pages = {
             name: self._indexer_group(name).map_kv_cache_to_kernel_blocks(view)
@@ -579,7 +608,7 @@ class _Rank:
         for name in layers:
             for b in block_ids:
                 start = self.views[name][b].data_ptr() - self.buf.data_ptr()
-                mask[start : start + self.specs[name].page_size_bytes] = True
+                mask[start : start + self.page_bytes[name]] = True
         return mask
 
     def kda_groups(self) -> list[int]:
@@ -823,13 +852,15 @@ def test_pull_then_exchange_on_k31_geometry(
 # ----------------------------------------------------------------------------
 
 NULL_FILL, DRAFT_WINDOW = 0x11, 192
+# The prefix-cache hit unit the packed draft's blocks take (128 in production).
+DRAFT_HIT_UNIT = 16
 
 
 def _draft_page(name: str, heads: range, first_token: int, rank: _Rank, junk=False):
     """``[heads, block, bytes]`` of a draft page holding the given global heads
     for the tokens from ``first_token``: unique per (layer, head, token)."""
     layer = int(name.split(".")[2]) - TARGET_LAYERS
-    tokens = np.arange(first_token, first_token + rank.block_size)
+    tokens = np.arange(first_token, first_token + rank.draft_block_size)
     width = rank.draft_heads(name, 0).shape[-1]
     return np.stack(
         [
@@ -840,22 +871,39 @@ def _draft_page(name: str, heads: range, first_token: int, rank: _Rank, junk=Fal
 
 
 @pytest.mark.parametrize(
-    "p_tp,d_tp,num_tokens,num_cached,num_dsa,groups",
+    "p_tp,d_tp,num_tokens,num_cached,num_dsa,groups,hit_unit",
     [
-        (P_DCP, D_DCP, 3000, 0, NUM_DSA, 4),
-        (P_DCP, D_DCP, 1100, 1, 2, 2),
-        (4, 4, 3000, 0, NUM_DSA, 4),
-        (4, 4, 1100, 1, 2, 2),
+        (P_DCP, D_DCP, 3000, 0, NUM_DSA, 4, None),
+        (P_DCP, D_DCP, 1100, 1, 2, 2, None),
+        (4, 4, 3000, 0, NUM_DSA, 4, None),
+        (4, 4, 1100, 1, 2, 2, None),
+        (P_DCP, D_DCP, 3000, 0, NUM_DSA, 4, DRAFT_HIT_UNIT),
+        (P_DCP, D_DCP, 1100, 1, NUM_DSA, 4, DRAFT_HIT_UNIT),
+        (4, 4, 3000, 0, NUM_DSA, 4, DRAFT_HIT_UNIT),
+        (4, 4, 1100, 4, NUM_DSA, 4, DRAFT_HIT_UNIT),
     ],
     ids=[
         "P-tp8dcp8,D-tp16dcp16-pair,4-state-groups",
         "P-tp8dcp8,D-tp16dcp16-pair,D-hit-in-window,3-draft-groups",
         "P-tp4dcp4,D-tp4dcp4,4-state-groups",
         "P-tp4dcp4,D-tp4dcp4,D-hit-in-window,3-draft-groups",
+        "P-tp8dcp8,D-tp16dcp16-pair,slots-24-to-48",
+        "P-tp8dcp8,D-tp16dcp16-pair,slots-24-to-48,D-hit-in-window",
+        "P-tp4dcp4,D-tp4dcp4,slots-12",
+        "P-tp4dcp4,D-tp4dcp4,slots-12,D-hit-in-window",
     ],
 )
 def test_pull_release_draft_on_k31_geometry(
-    k31_env, fabric, monkeypatch, p_tp, d_tp, num_tokens, num_cached, num_dsa, groups
+    k31_env,
+    fabric,
+    monkeypatch,
+    p_tp,
+    d_tp,
+    num_tokens,
+    num_cached,
+    num_dsa,
+    groups,
+    hit_unit,
 ):
     """The release DSpark draft's KV (5 sliding-window GQA layers, 16 KV heads,
     DCP 1: every rank holds every token of its heads) on the chosen P/D shapes:
@@ -867,9 +915,16 @@ def test_pull_release_draft_on_k31_geometry(
     speculative lookahead block, never reading P's null or out-of-window
     blocks. The target's DSA rows, KDA state and every other byte are as
     without a draft, and each P rank waits for exactly its readers. The
-    chosen points pin 4 KDA state groups (VLLM_PACKED_KV_STATE_GROUPS)."""
+    chosen points pin 4 KDA state groups (VLLM_PACKED_KV_STATE_GROUPS).
+
+    With ``hit_unit``, Kimi's grouping cuts the draft's blocks to the
+    prefix-cache hit unit and packs them as slots of the rows
+    (``blocks_per_pool_block``), twice as many per row on D TP16 as on P TP8:
+    the draft's block IDs are slot IDs on each side, D's window slots get P's
+    slots of the same positions, and no other byte of their rows changes."""
     monkeypatch.setenv("VLLM_PACKED_KV_STATE_GROUPS", str(groups))
     block_size = 64
+    draft_block = hit_unit or block_size
     pair = d_tp == 2 * p_tp
     d_heads = DRAFT_KV_HEADS // d_tp
     p_heads = DRAFT_KV_HEADS // p_tp
@@ -878,16 +933,20 @@ def test_pull_release_draft_on_k31_geometry(
     # Draft blocks by token position: P holds a few blocks before D's window
     # (out-of-window ones are null) and a lookahead block past its tokens; D
     # allocates only its window, after its prefix-cache hit.
-    num_positions = cdiv(num_tokens, block_size)
+    num_positions = cdiv(num_tokens, draft_block)
     hit = num_cached * d_tp * block_size
-    p_first = max(0, (num_tokens - DRAFT_WINDOW) // block_size - 1)
-    window_first = max(0, num_tokens - DRAFT_WINDOW + 1) // block_size
-    d_first = max(hit // block_size, window_first)
+    p_first = max(0, (num_tokens - DRAFT_WINDOW) // draft_block - 1)
+    window_first = max(0, num_tokens - DRAFT_WINDOW + 1) // draft_block
+    d_first = max(hit // draft_block, window_first)
     d_positions = range(d_first, num_positions)
     p_positions = range(p_first, num_positions + 1)
 
     geometry = dict(
-        block_size=block_size, num_dsa=num_dsa, num_kda=4, draft_window=DRAFT_WINDOW
+        block_size=block_size,
+        num_dsa=num_dsa,
+        num_kda=4,
+        draft_window=DRAFT_WINDOW,
+        draft_hit_unit=hit_unit,
     )
     # The planner groups the 5 draft layers with the DSA layers' repeat count:
     # one group next to K3.1's 24 DSA layers, three next to 2.
@@ -902,20 +961,28 @@ def test_pull_release_draft_on_k31_geometry(
     d_ids, d_kda = d_pool[:num_d], d_pool[num_d : num_d + groups]
     p_ids, p_kda = p_pool[:num_p], p_pool[num_p : num_p + groups]
     d_rest, p_rest = d_pool[num_d + groups :], p_pool[num_p + groups :]
-    d_draft = [
-        d_rest[i * len(d_positions) : (i + 1) * len(d_positions)]
-        for i in range(num_draft_groups)
-    ]
-    p_draft = [
-        [0] * p_first + p_rest[i * len(p_positions) : (i + 1) * len(p_positions)]
-        for i in range(num_draft_groups)
-    ]
+
+    def draft_ids(rows: list[int], slots: int, num: int) -> list[list[int]]:
+        """``num`` draft block IDs per draft group from the rows the target does
+        not use: the rows, or the shuffled IDs of their slots when packed (row 0
+        holds the null slot)."""
+        ids = rows
+        if slots > 1:
+            slot_ids = [row * slots + k for row in rows if row for k in range(slots)]
+            ids = rng.permutation(slot_ids).tolist()
+        return [ids[i * num : (i + 1) * num] for i in range(num_draft_groups)]
 
     prefillers = {
         p: _Rank(fabric, p_tp, p, num_p_pool, decoder=False, **geometry)
         for p in range(p_tp)
     }
     assert len(prefillers[0].draft_groups) == num_draft_groups
+    assert prefillers[0].draft_block_size == draft_block
+    p_slots = prefillers[0].draft_slots
+    assert (p_slots > 1) == bool(hit_unit)
+    p_draft = [
+        [0] * p_first + ids for ids in draft_ids(p_rest, p_slots, len(p_positions))
+    ]
     arrays = prefillers[0].arrays()
     num_arrays = len(arrays)
     for p, rank in prefillers.items():
@@ -934,7 +1001,7 @@ def test_pull_release_draft_on_k31_geometry(
             for name in rank.group_layers(g):
                 for q in p_positions:
                     page = _draft_page(
-                        name, heads, q * block_size, rank, junk=q >= num_positions
+                        name, heads, q * draft_block, rank, junk=q >= num_positions
                     )
                     rank.write_draft_heads(name, blocks[q], page)
 
@@ -943,6 +1010,11 @@ def test_pull_release_draft_on_k31_geometry(
         _Rank(fabric, d_tp, r, num_d_pool, decoder=True, extra_config=extra, **geometry)
         for r in range(d_tp)
     ]
+    d_slots = decoders[0].draft_slots
+    if hit_unit:
+        # P and D tile the same rows into different slot counts.
+        assert d_slots == (2 * p_slots if pair else p_slots)
+    d_draft = draft_ids(d_rest, d_slots, len(d_positions))
     for r, rank in enumerate(decoders):
         assert rank.draft_groups == prefillers[0].draft_groups
         assert rank.worker._dcp_replicated_draft_groups == set(rank.draft_groups)
@@ -1012,7 +1084,7 @@ def test_pull_release_draft_on_k31_geometry(
                 for block, q in zip(blocks, d_positions, strict=True):
                     np.testing.assert_array_equal(
                         rank.draft_heads(name, block),
-                        _draft_page(name, heads, q * block_size, rank),
+                        _draft_page(name, heads, q * draft_block, rank),
                         err_msg=f"rank {r} {name} position block {q}",
                     )
         tokens = _canonical_tokens(r, d_tp, block_size, num_d)

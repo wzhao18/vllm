@@ -408,10 +408,12 @@ class NixlBaseConnectorWorker:
 
         # Compute desc ids per group using the right stride: FA descs have
         # num_blocks entries per region (kernel granularity, expanded by
-        # block_size_ratio for heterogeneous block sizes), SSM descs have
+        # block_size_ratio for heterogeneous block sizes; a group packed as
+        # slots of the pool blocks has one per slot), SSM descs have
         # logical_blocks entries per region (no kernel splitting, and never
         # ratio-expanded since state blocks are indivisible).
         logical_blocks = dst_num_blocks // physical_blocks_per_logical
+        fa_region_offsets = region_offsets.astype(np.int32)
         all_descs: list[np.ndarray] = []
         for i, group in enumerate(block_ids):
             group_arr = np.asarray(group, dtype=np.int32)
@@ -429,7 +431,7 @@ class NixlBaseConnectorWorker:
                     else np.asarray(group_regions, dtype=np.int32)
                 )[:, None]
                 all_descs.append(
-                    (fa_region_ids * num_blocks + group_arr[None, :]).ravel()
+                    (fa_region_offsets[fa_region_ids] + group_arr[None, :]).ravel()
                 )
             elif _is_ssm_spec(spec_type):
                 # NOTE (NickLucche) SSM and Attention block regions can
@@ -1935,6 +1937,16 @@ class NixlBaseConnectorWorker:
             raise NotImplementedError(
                 "NIXL host staging does not preserve CSA-linear shared tensors."
             )
+        if self.use_host_buffer and any(
+            group.blocks_per_pool_block > 1
+            for group in self.kv_cache_config.transfer_groups
+        ):
+            # Host staging copies every block ID through every layer, so block
+            # IDs must be unique across groups, which slot IDs are not.
+            raise NotImplementedError(
+                "NIXL host staging does not support KV cache groups packed as "
+                "slots of the pool blocks."
+            )
 
         if self.use_host_buffer:
             self.initialize_host_xfer_buffer(kv_caches=kv_caches)
@@ -1962,7 +1974,9 @@ class NixlBaseConnectorWorker:
         region_mem_types: list[str] = []
         region_dcp_sharded: list[bool] = []
         seen_base_addresses: list[int] = []
-        seen_region_keys: list[tuple[int, int]] = []
+        seen_region_keys: list[tuple[int, int, int]] = []
+        # Per region, the blocks of its group one pool block holds.
+        region_blocks_per_pool_block: list[int] = []
         self._ssm_region_indices = []
         region_groups: list[set[int]] = []
         self._ple_block_len = None
@@ -2028,7 +2042,11 @@ class NixlBaseConnectorWorker:
                 logical_num_blocks = self.kv_cache_config.hisparse_host_num_blocks
                 assert logical_num_blocks is not None
             else:
-                logical_num_blocks = self.kv_cache_config.num_blocks
+                # A group packed as slots of the pool blocks has as many blocks
+                # as slots, its block IDs being slot IDs (KVCacheTensor.num_blocks).
+                logical_num_blocks = (
+                    self.kv_cache_config.num_blocks * group.blocks_per_pool_block
+                )
             group_id = group_index
             num_blocks = (
                 logical_num_blocks
@@ -2179,8 +2197,10 @@ class NixlBaseConnectorWorker:
                 # Overlaid groups can page the same bytes with different page
                 # sizes (DSv4.1 SWA, indexer and compressor caches), so views at
                 # one address share a region only if their block_len matches.
+                # Slots packed into the pool blocks start where other groups'
+                # pages do, but never share their regions.
                 # A packed PP producer keeps one region per layer.
-                region_key = (base_addr, block_len)
+                region_key = (base_addr, block_len, group.blocks_per_pool_block)
                 if region_key in seen_region_keys and not route_packed_layers:
                     region_index = seen_region_keys.index(region_key)
                     assert region_mem_types[region_index] == mem_type
@@ -2203,6 +2223,7 @@ class NixlBaseConnectorWorker:
                     region_groups.append({group_id})
                     self.region_names.append(layer_name)
                     self.region_num_blocks.append(num_blocks)
+                    region_blocks_per_pool_block.append(group.blocks_per_pool_block)
                     self._region_is_mla.append(is_mla_region)
                     region_dcp_sharded.append(is_dcp_sharded)
                     region_mem_types.append(mem_type)
@@ -2282,7 +2303,9 @@ class NixlBaseConnectorWorker:
         self._uses_region_group_mapping = len(set(self.region_group_ids)) > 1
         self._mixed_mem_types = len(set(region_mem_types)) > 1
         if self._has_mamba:
-            self.region_num_blocks = [self.num_blocks] * self.num_regions
+            self.region_num_blocks = [
+                self.num_blocks * slots for slots in region_blocks_per_pool_block
+            ]
 
         self._set_region_layers(region_layers)
         self._packed_member_layouts = packed_member_layouts
@@ -2580,13 +2603,20 @@ class NixlBaseConnectorWorker:
         group = attention[0]
         bases = self.kv_caches_base_addr[self.engine_id][self.tp_rank]
         region_of_page = {
-            page: i for i, page in enumerate(zip(bases, self.block_len_per_layer))
+            page: i
+            for i, page in enumerate(
+                zip(bases, self.block_len_per_layer, self.block_stride_per_layer)
+            )
         }
         layer_of_region: dict[int, str] = {}
         for name in groups[group].layer_names:
             cache = kv_caches[name]
             region = region_of_page.get(
-                (cache.data_ptr(), self._layer_specs[name].page_size_bytes)
+                (
+                    cache.data_ptr(),
+                    self._layer_specs[name].page_size_bytes,
+                    cache.stride(0) * cache.element_size(),
+                )
             )
             # One block per kernel block: the units' block ids are NIXL's.
             if (

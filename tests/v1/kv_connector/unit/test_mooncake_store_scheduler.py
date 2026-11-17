@@ -34,6 +34,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     MambaSpec,
+    SlidingWindowSpec,
 )
 
 
@@ -77,6 +78,9 @@ def _make_bare_scheduler(
     scheduler._num_workers = 1
     scheduler._next_store_job_id = 0
     scheduler._pinned_saves = {}
+    scheduler._slot_group_ids = frozenset()
+    scheduler._slot_pools = {}
+    scheduler._pinned_slots = {}
     scheduler._boundary_state_group_ids = frozenset({1})
     scheduler._store_coord = MooncakeStoreCoordinator(
         [
@@ -1679,6 +1683,108 @@ def test_store_job_pins_current_non_null_non_mamba_blocks():
 
     scheduler.update_connector_output(_make_worker_output({store_job_id: 1}))
 
+    assert [pool.blocks[i].ref_cnt for i in (8, 7, 2, 6)] == [0, 0, 0, 0]
+
+
+def test_store_job_pins_slot_packed_group_in_its_own_pool():
+    """A group packed as slots of the shared pool's blocks (the release DSpark
+    draft's sliding window on Kimi K3.1) has slot IDs for block IDs. A store
+    job pins them in the group's own pool, so they outlive their request until
+    every rank has stored them; no shared-pool block with the same ID is
+    touched."""
+    from vllm.v1.core.block_pool import SlotBlockPool
+
+    scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
+    pool = scheduler._gpu_block_pool
+    slot_pool = SlotBlockPool(pool, slots_per_block=8)
+    scheduler._store_group_ids = (0, 1, 2)
+    scheduler._store_group_id_by_kv_cache_group_id = {0: 0, 1: 1, 2: 2}
+    scheduler._slot_group_ids = frozenset({2})
+    scheduler.bind_group_block_pools([pool, pool, slot_pool])
+    scheduler._store_coord = MooncakeStoreCoordinator(
+        [
+            *scheduler._store_coord.kv_cache_groups,
+            KVCacheGroupSpec(
+                ["draft"],
+                SlidingWindowSpec(
+                    block_size=4,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=8,
+                ),
+                blocks_per_pool_block=8,
+            ),
+        ],
+        16,
+        4,
+        enable_partial_hash_hits=True,
+    )
+    draft = slot_pool.get_new_blocks(3)
+    slot_ids = [slot.block_id for slot in draft]
+    (row,) = {slot_id // 8 for slot_id in slot_ids}
+    request = SimpleNamespace(
+        all_token_ids=list(range(48)),
+        block_hashes=[bytes([i]) for i in range(12)],
+        num_prompt_tokens=48,
+        num_output_placeholders=0,
+    )
+    window = [0] * 9 + slot_ids
+    scheduler._unfinished_requests["req-0"] = (
+        request,
+        ([7, 2, 0], [21, 0, 22], window[:-1]),
+    )
+    scheduler._request_trackers["req-0"] = RequestTracker(
+        req_id="req-0",
+        token_len=44,
+        allocated_block_ids=([7, 2, 0], [21, 0, 22], window[:-1]),
+        num_saved_tokens=32,
+        token_ids=list(range(44)),
+        prefill_end_tokens=48,
+    )
+    out = SimpleNamespace(
+        finished_req_ids=set(),
+        preempted_req_ids=set(),
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=["req-0"],
+            new_block_ids=[([6], [23], [slot_ids[-1]])],
+            num_computed_tokens=[44],
+            resumed_req_ids=set(),
+        ),
+        num_scheduled_tokens={"req-0": 4},
+        scheduled_spec_decode_tokens={},
+        kv_connector_block_state=_make_connector_block_state(
+            block_ids=([7, 2, 0, 6], [24, 0, 25, 26], window),
+            offloads=[(1, 8, 16)],
+        ),
+    )
+    shared_refs = [block.ref_cnt for block in pool.blocks]
+
+    meta = scheduler.build_connector_meta(out)
+
+    store_job_id = meta.requests[0].store_job_id
+    assert scheduler._pinned_saves[store_job_id][0] == [8, 7, 2, 6]
+    assert scheduler._pinned_slots[store_job_id].keys() == {2}
+    assert sorted(scheduler._pinned_slots[store_job_id][2]) == slot_ids
+    assert [slot.ref_cnt for slot in draft] == [2, 2, 2]
+    # Only the target's blocks were pinned in the shared pool (the slots'
+    # row stays held once by the slot pool).
+    pinned = {8, 7, 2, 6}
+    assert [block.ref_cnt for block in pool.blocks] == [
+        ref + (block_id in pinned) for block_id, ref in enumerate(shared_refs)
+    ]
+
+    # The request finishes before the save: its slots and their row stay held.
+    slot_pool.free_blocks(draft)
+    assert [slot.ref_cnt for slot in draft] == [1, 1, 1]
+    assert pool.blocks[row].ref_cnt == 1
+
+    scheduler.update_connector_output(_make_worker_output({store_job_id: 1}))
+
+    assert store_job_id not in scheduler._pinned_slots
+    assert [slot.ref_cnt for slot in draft] == [0, 0, 0]
+    assert pool.blocks[row].ref_cnt == 0
     assert [pool.blocks[i].ref_cnt for i in (8, 7, 2, 6)] == [0, 0, 0, 0]
 
 

@@ -229,10 +229,21 @@ class MooncakeStoreScheduler:
             self.enable_partial_hash_hits = self._store_coord.enable_partial_hash_hits
 
         self._gpu_block_pool: BlockPool | None = None
+        # Store groups packed as slots of the shared pool's blocks: their block
+        # IDs are slot IDs of their own pools (bind_group_block_pools).
+        self._slot_group_ids = frozenset(
+            store_group_id
+            for store_group_id, group in enumerate(store_groups)
+            if group.blocks_per_pool_block > 1
+        )
+        self._slot_pools: dict[int, BlockPool] = {}
         self._num_workers = vllm_config.parallel_config.world_size
         self._next_store_job_id = 0
         # store_job_id -> (referenced block ids, ranks yet to report completion)
         self._pinned_saves: dict[int, tuple[list[int], int]] = {}
+        # store_job_id -> slot group -> referenced slot ids, released with the
+        # job's _pinned_saves entry.
+        self._pinned_slots: dict[int, dict[int, list[int]]] = {}
 
         # Per-request state
         self.load_specs: dict[str, LoadSpec] = {}  # to be loaded
@@ -243,6 +254,40 @@ class MooncakeStoreScheduler:
 
     def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
         self._gpu_block_pool = gpu_block_pool
+
+    def bind_group_block_pools(self, block_pools: Sequence[BlockPool]) -> None:
+        """Bind the block pool of every KV cache group, by KV cache group ID."""
+        self._slot_pools = {
+            store_group_id: block_pools[self._store_group_ids[store_group_id]]
+            for store_group_id in self._slot_group_ids
+        }
+
+    def _split_slot_ids(
+        self, block_ids: Sequence[tuple[int, int]]
+    ) -> tuple[list[int], dict[int, list[int]]]:
+        """Split ``(store group, block ID)`` pairs into the shared pool's block
+        IDs and the slot groups' slot IDs, each without repeats."""
+        shared: list[int] = []
+        slots: dict[int, list[int]] = {}
+        for group_id, block_id in block_ids:
+            if group_id in self._slot_group_ids:
+                slots.setdefault(group_id, []).append(block_id)
+            else:
+                shared.append(block_id)
+        return list(dict.fromkeys(shared)), {
+            group_id: list(dict.fromkeys(ids)) for group_id, ids in slots.items()
+        }
+
+    def _pin_slots(self, store_job_id: int, slot_ids: dict[int, list[int]]) -> None:
+        if not slot_ids:
+            return
+        assert self._slot_pools.keys() == self._slot_group_ids, (
+            "Slot groups' block pools must be bound before any store job"
+        )
+        self._pinned_slots[store_job_id] = slot_ids
+        for group_id, ids in slot_ids.items():
+            pool = self._slot_pools[group_id]
+            pool.touch([pool.blocks[slot_id] for slot_id in ids])
 
     def _looks_up(self, request: Request) -> bool:
         """Whether ``get_num_new_matched_tokens`` queries the store at all."""
@@ -682,8 +727,10 @@ class MooncakeStoreScheduler:
                 req_meta.boundary_puts = [*tail, *(req_meta.boundary_puts or [])]
             req_meta.store_job_id = store_job_id = self._next_store_job_id
             self._next_store_job_id += 1
-            block_ids = [put.block_id for put in req_meta.boundary_puts or []]
-            assert NULL_BLOCK_ID not in block_ids, (
+            group_block_ids = [
+                (put.group_id, put.block_id) for put in req_meta.boundary_puts or []
+            ]
+            assert all(block_id != NULL_BLOCK_ID for _, block_id in group_block_ids), (
                 "A null block cannot back a boundary put"
             )
             if req_meta.token_len_chunk:
@@ -692,8 +739,8 @@ class MooncakeStoreScheduler:
                 # this job's token range: a rank resumes from its own last
                 # successful offset, which lags the scheduler's whenever a save was
                 # skipped or failed, so it may read anywhere below the range.
-                block_ids.extend(
-                    block_id
+                group_block_ids.extend(
+                    (group_id, block_id)
                     for group_id, group in enumerate(req_meta.block_ids)
                     if group_id not in self._boundary_state_group_ids
                     for block_id in group
@@ -701,12 +748,13 @@ class MooncakeStoreScheduler:
                 )
             # An aligned boundary block may also be present in the request's
             # block table. Take and release exactly one reference per block.
-            block_ids = list(dict.fromkeys(block_ids))
+            block_ids, slot_ids = self._split_slot_ids(group_block_ids)
             assert NULL_BLOCK_ID not in block_ids
-            if not block_ids:
+            if not block_ids and not slot_ids:
                 continue
             self._pinned_saves[store_job_id] = (block_ids, self._num_workers)
             pool.touch([pool.blocks[block_id] for block_id in block_ids])
+            self._pin_slots(store_job_id, slot_ids)
 
     def register_finished_partial_tail(
         self,
@@ -760,8 +808,8 @@ class MooncakeStoreScheduler:
             ),
             *mamba_puts,
         ]
-        pinned_block_ids = list(
-            dict.fromkeys(put.block_id for put in req_meta.boundary_puts)
+        pinned_block_ids, pinned_slot_ids = self._split_slot_ids(
+            [(put.group_id, put.block_id) for put in req_meta.boundary_puts]
         )
 
         pool = self._gpu_block_pool
@@ -773,6 +821,7 @@ class MooncakeStoreScheduler:
         self._next_store_job_id += 1
         self._pinned_saves[store_job_id] = (pinned_block_ids, self._num_workers)
         pool.touch([pool.blocks[block_id] for block_id in pinned_block_ids])
+        self._pin_slots(store_job_id, pinned_slot_ids)
 
         req_meta.store_job_id = store_job_id
         self._record_state_origins(request.request_id, request.block_hashes, mamba_puts)
@@ -922,6 +971,11 @@ class MooncakeStoreScheduler:
             del self._pinned_saves[store_job_id]
             # Tail-first, as elsewhere, so the shared prefix is evicted last.
             pool.free_blocks(pool.blocks[bid] for bid in reversed(block_ids))
+            for group_id, slot_ids in self._pinned_slots.pop(store_job_id, {}).items():
+                slot_pool = self._slot_pools[group_id]
+                slot_pool.free_blocks(
+                    slot_pool.blocks[slot_id] for slot_id in reversed(slot_ids)
+                )
 
     def has_pending_push_work(self) -> bool:
         """Keep the engine stepping while any store job still holds block refs.

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 
@@ -22,9 +23,11 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
-from vllm.v1.worker.gpu.async_utils import async_copy_to_np
+from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.worker.gpu.async_utils import AsyncOutput, async_copy_to_np
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.model_runner import ExecuteModelState, GPUModelRunner
+from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.spec_decode.standalone_ar import speculator as ar_module
 from vllm.v1.worker.gpu.spec_decode.utils import get_drafter_hidden_states
 
@@ -70,6 +73,183 @@ def test_non_last_pp_rank_uses_global_batch_for_sample_feedback(monkeypatch):
     postprocess_num_computed_tokens.assert_called_once_with(global_batch)
     postprocess_state.assert_called_once_with(global_batch.idx_mapping, 0)
     restore_for_sampling.assert_not_called()
+
+
+class _FakeAsyncOutput:
+    """AsyncOutput's interface, logging when the output is made ready."""
+
+    def __init__(self, log: list, **kwargs):
+        self.log = log
+        self.model_runner_output = kwargs["model_runner_output"]
+
+    def publish_after(self, stream) -> None:
+        self.log.append(("publish_after", stream))
+
+
+@pytest.mark.parametrize(
+    "producer,computed,scheduled,published",
+    [
+        (True, [0, 4000], [1, 96], True),
+        (True, [0, 4000], [1, 64], False),
+        (True, [7, 4096], [1, 1], False),
+        (False, [0, 4000], [1, 96], False),
+    ],
+    ids=[
+        "producer-last-chunk",
+        "producer-middle-chunk",
+        "producer-decode-only",
+        "consumer-last-chunk",
+    ],
+)
+def test_producer_output_waits_for_drafter_on_last_prompt_chunk(
+    monkeypatch, producer, computed, scheduled, published
+):
+    """A KV producer frees a finished request's KV for remote reads once the
+    step's output is processed, and the drafter writes the draft's KV of the
+    request's last prompt chunk after sampling. A producer's step that
+    completes a prompt (here request 1: 4096 prompt tokens) therefore makes its
+    output ready only after the drafter; other steps and consumers keep the
+    output ready right after sampling."""
+    log: list = []
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    main_stream = object()
+    runner.__dict__["main_stream"] = main_stream
+    runner.output_copy_stream = object()
+    runner.check_ep_fault = False
+    runner.is_last_pp_rank = True
+    runner.pcp_manager = None
+    runner.pp_handler = None
+    runner.iterlog = None
+    runner.aux_output_connector = None
+    runner.adaptive_verification = None
+    runner.num_speculative_steps = 2
+    runner._draft_workspace_lane = None
+    runner._output_after_drafter = producer
+    sampler_output = SimpleNamespace(sampled_token_ids=torch.zeros(2, 1))
+    runner.sample = Mock(return_value=(sampler_output, None, None))
+    runner.prompt_logprobs_worker = SimpleNamespace(
+        compute_prompt_logprobs=Mock(return_value={}),
+        compute_prompt_token_id_logprobs=Mock(return_value={}),
+    )
+    runner.model = SimpleNamespace(compute_logits=None)
+    runner.req_states = SimpleNamespace(
+        all_token_ids=SimpleNamespace(gpu=None),
+        num_computed_tokens=SimpleNamespace(gpu=None),
+        prompt_len=SimpleNamespace(np=None),
+        last_sampled_tokens=None,
+        next_prefill_tokens=None,
+        draft_tokens=None,
+    )
+    runner.sampler = SimpleNamespace(
+        sampling_states=SimpleNamespace(
+            temperature=SimpleNamespace(gpu=None), seeds=SimpleNamespace(gpu=None)
+        )
+    )
+    runner.speculator = SimpleNamespace(
+        supports_mm_inputs=False,
+        propose=Mock(
+            side_effect=lambda *args, **kwargs: (
+                log.append(("propose",)) or torch.zeros(2, 2)
+            )
+        ),
+    )
+    runner.kv_connector = SimpleNamespace(
+        post_forward=Mock(return_value=None), finalize_step=Mock()
+    )
+    runner.postprocess_sampled = Mock()
+    runner.draft_tokens_handler = SimpleNamespace(set_draft_tokens=Mock())
+    runner.eplb = SimpleNamespace(step=Mock())
+    monkeypatch.setattr(
+        model_runner_module,
+        "AsyncOutput",
+        lambda **kwargs: _FakeAsyncOutput(log, **kwargs),
+    )
+    monkeypatch.setattr(model_runner_module, "get_drafter_hidden_states", Mock())
+    monkeypatch.setattr(model_runner_module, "scatter_draft_tokens", Mock())
+    monkeypatch.setattr(
+        model_runner_module,
+        "use_workspace_lane",
+        lambda lane: contextlib.nullcontext(),
+    )
+    prefill_len = np.array([7, 4096])
+    num_computed = np.array(computed)
+    input_batch = SimpleNamespace(
+        req_ids=["r0", "r1"],
+        num_reqs=2,
+        idx_mapping=None,
+        query_start_loc=None,
+        num_scheduled_tokens=np.array(scheduled),
+        prefill_len_np=prefill_len,
+        num_computed_prefill_tokens_np=num_computed,
+        is_prefilling_np=num_computed < prefill_len,
+        has_prefill=bool((num_computed < prefill_len).any()),
+        has_structured_output_reqs=False,
+    )
+    runner.execute_model_state = ExecuteModelState(
+        input_batch=input_batch,
+        attn_metadata=None,
+        slot_mappings_by_layer=None,
+        hidden_states=torch.zeros(2, 4),
+        aux_hidden_states=None,
+        dp_sync_state=None,
+        finished_req_ids=set(),
+        ec_connector_output=None,
+        cudagraph_stats=None,
+        num_spec_tokens_to_schedule=2,
+    )
+
+    output = runner.sample_tokens(None)
+
+    assert isinstance(output, _FakeAsyncOutput)
+    expected = [("propose",)]
+    if published:
+        expected.append(("publish_after", main_stream))
+    assert log == expected
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_async_output_publish_after_waits_for_the_stream():
+    """``publish_after`` makes ``get_output`` return only once the work queued
+    on the given stream after the output copies has finished; without it the
+    output is ready as soon as the copies are."""
+    main_stream = torch.cuda.current_stream()
+    copy_stream = torch.cuda.Stream()
+
+    def output_then_slow_work() -> tuple[AsyncOutput, torch.cuda.Event]:
+        sampled = torch.ones(2, 1, dtype=torch.int64, device="cuda")
+        async_output = AsyncOutput(
+            model_runner_output=ModelRunnerOutput(
+                req_ids=["a", "b"], req_id_to_index={"a": 0, "b": 1}
+            ),
+            sampler_output=SamplerOutput(
+                sampled_token_ids=sampled,
+                logprobs_tensors=None,
+                num_nans=None,
+                num_sampled=torch.ones(2, dtype=torch.int32, device="cuda"),
+                num_rejected=torch.zeros(2, dtype=torch.int32, device="cuda"),
+            ),
+            num_sampled_tokens=torch.ones(2, dtype=torch.int32, device="cuda"),
+            main_stream=main_stream,
+            copy_stream=copy_stream,
+            check_ep_fault=False,
+            pending_aux_output=None,
+        )
+        # The drafter: ~1 s of GPU time queued after the copies.
+        torch.cuda._sleep(2_000_000_000)
+        drafted = torch.cuda.Event()
+        drafted.record(main_stream)
+        return async_output, drafted
+
+    torch.cuda.synchronize()
+    async_output, drafted = output_then_slow_work()
+    assert async_output.get_output().sampled_token_ids == [[1], [1]]
+    assert not drafted.query()
+    torch.cuda.synchronize()
+
+    async_output, drafted = output_then_slow_work()
+    async_output.publish_after(main_stream)
+    assert async_output.get_output().sampled_token_ids == [[1], [1]]
+    assert drafted.query()
 
 
 @pytest.mark.parametrize(

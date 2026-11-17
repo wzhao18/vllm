@@ -2113,6 +2113,8 @@ class MooncakeStoreWorker:
                 # layers. A group with no layers on this PP rank registers all.
                 # Kernel-block views: the layout groups them itself, after
                 # checking that each manager block is one gapless byte run.
+                # A group packed as slots of the pool's blocks has a block per
+                # slot (its block IDs are slot IDs).
                 group_caches = [
                     view
                     for layer_name in group.layer_names
@@ -2120,7 +2122,8 @@ class MooncakeStoreWorker:
                     for view in _layer_views(kv_caches[layer_name])
                 ]
                 db.store_layout.register_kv_caches(
-                    group_caches or cache_tensors, self.num_blocks
+                    group_caches or cache_tensors,
+                    self.num_blocks * group.blocks_per_pool_block,
                 )
 
         registered_buffers: dict[int, int] = {}
@@ -2153,7 +2156,9 @@ class MooncakeStoreWorker:
                     num_blocks = self._kv_cache_config.hisparse_host_num_blocks
                     assert num_blocks is not None
                 else:
-                    num_blocks = self._kv_cache_config.num_blocks
+                    num_blocks = (
+                        self._kv_cache_config.num_blocks * group.blocks_per_pool_block
+                    )
                 cache, block_compact = group_compact_kernel_blocks(cache, num_blocks)
                 cache_storage = cache.untyped_storage()
                 if is_host_resident:
