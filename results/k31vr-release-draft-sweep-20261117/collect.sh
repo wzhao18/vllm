@@ -7,11 +7,12 @@ set -eo pipefail
 LABEL=$1; TOPO=$2; AGX=$3; EV=$4
 H=$(cd "$(dirname "$0")" && pwd); J=$(basename "$AGX" | sed -E 's/^a([0-9]+)-.*/\1/')
 R=$H/runs/$LABEL-a$J; mkdir -p $R/agentx $R/gsm8k
+r() { for i in 1 2 3 4 5; do rsync -a $X "$@" && return 0; echo "rsync retry $i" >&2; sleep 20; done; return 1; }
 X="--exclude dloan --exclude otel --exclude tachometer --exclude *_timeslices.* --exclude __pycache__ --max-size=20m"
-rsync -a $X hecate:$AGX/ $R/agentx/; echo "source: $AGX" > $R/agentx/SOURCE.txt
+r hecate:$AGX/ $R/agentx/; echo "source: $AGX" > $R/agentx/SOURCE.txt
 ssh hecate "python3 /lustre/fsw/coreai_comparch_inferencex/weizha/k31vr/dsrel/scratch/frz_metrics.py $AGX $LABEL" | tail -1 > $R/metrics.json
 if [ -n "$EV" ]; then
-  rsync -a $X hecate:$EV/ $R/gsm8k/; echo "source: $EV" > $R/gsm8k/SOURCE.txt
+  r hecate:$EV/ $R/gsm8k/; echo "source: $EV" > $R/gsm8k/SOURCE.txt
   python3 - "$R" "$EV" <<'PY'
 import glob, json, re, sys
 r, ev = sys.argv[1:3]

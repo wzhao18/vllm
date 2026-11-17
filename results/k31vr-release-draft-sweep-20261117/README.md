@@ -22,7 +22,7 @@ Everything else is the frozen sweep's render: topology, concurrency, precision a
 | point | TPS/GPU (preview -> release) | P90 intvty (preview -> release) | P90 TTFT s (preview -> release) | gsm8k strict | real AL (k) |
 |---|---|---|---|---|---|
 | C1 | 1,342 -> 1,359 (+1.2%) | 778.6 -> 901.4 (+15.8%) | 0.36 -> 0.40 | 0.9659 -> 0.9795 | 4.763 (7) |
-| C64 | 20,778 -> 21,527 (+3.6%) | 232.8 -> 300.0 (+28.9%) | 0.85 -> 0.96 | 0.9689 -> pending | - (-) |
+| C64 | 20,778 -> 21,527 (+3.6%) | 232.8 -> 300.0 (+28.9%) | 0.85 -> 0.96 | 0.9689 -> 0.9803 | 4.807 (7) |
 <!-- /CMP -->
 
 ## Points
@@ -31,7 +31,7 @@ Everything else is the frozen sweep's render: topology, concurrency, precision a
 | point | topology (GPUs) | AgentX run | TPS/GPU | P90 intvty | P90 E2E-norm | P90 E2E (s) | P90 TTFT (s) | gsm8k strict | chosen | note |
 |---|---|---|---|---|---|---|---|---|---|---|
 | C1 | 1P1D: P TP8+DCP8, D TP16+DCP16 (24) | C1-a1118776 | 1,359 | 901.4 | 332.2 | 5.6 | 0.40 | 0.9795 | **yes** |  |
-| C64 | 1P1D: P TP8+DCP8, D TP16+DCP16 (24) | C64-a1118777 | 21,527 | 300.0 | 136.3 | 7.2 | 0.96 | pending | **yes** |  |
+| C64 | 1P1D: P TP8+DCP8, D TP16+DCP16 (24) | C64-a1118777 | 21,527 | 300.0 | 136.3 | 7.2 | 0.96 | 0.9803 | **yes** |  |
 <!-- /POINTS -->
 
 ![per GPU](pareto4_per_gpu.png)
