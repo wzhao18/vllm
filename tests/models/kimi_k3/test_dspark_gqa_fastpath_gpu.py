@@ -654,7 +654,15 @@ def _build_main(rank, world, device, group):
             model_config=SimpleNamespace(use_fp64_gumbel=False),
             watermark_config=None,
         )
-        fast = draft.GqaDraftFastPath.build(vllm_config, model)
+        # The stand-in layers have no stock attention modules for the fused GQA
+        # attention's installer (covered by test_dspark_gqa_attention_int.py): this
+        # non-strict build keeps the stand-in attention core.
+        install = draft.install_gqa_attention_state
+        draft.install_gqa_attention_state = lambda *args, **kwargs: None
+        try:
+            fast = draft.GqaDraftFastPath.build(vllm_config, model)
+        finally:
+            draft.install_gqa_attention_state = install
         built = (
             fast is not None
             and isinstance(fast.markov, draft.VocabParallelMarkov)
