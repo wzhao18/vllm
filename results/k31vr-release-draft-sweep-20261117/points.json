@@ -59,6 +59,26 @@
    "p90_e2el_s": 7.216,
    "p90_ttft_s": 0.96,
    "p50_ttft_s": 0.35
+  },
+  {
+   "label": "C128 1P1D",
+   "run": "C128-1P1D-a1118779",
+   "topology": "1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag off)",
+   "chosen": true,
+   "note": "",
+   "gsm8k_strict": null,
+   "gsm8k_real_al": null,
+   "k": null,
+   "gpus": 24,
+   "ok": 20605,
+   "err": 3,
+   "span_min": 60.4,
+   "tput_per_gpu": 33118.6,
+   "p90_intvty": 212.17,
+   "p90_e2e_norm_intvty": 61.46,
+   "p90_e2el_s": 11.641,
+   "p90_ttft_s": 3.005,
+   "p50_ttft_s": 0.927
   }
  ]
 }
