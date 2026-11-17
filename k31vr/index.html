@@ -1,0 +1,243 @@
+<title>K3.1 SOL Tracker</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<style>
+:root{--bg:#fbfaf7;--surface:#ffffff;--ink:#1f1e1c;--ink2:#52514e;--muted:#898781;--line:#e4e2db;--accent:#2a78d6;
+--good:#2e7d4f;--goodbg:#e6f3ea;--warn:#9a6700;--warnbg:#fbf1d8;--bad:#b3261e;--badbg:#fbe4e2;--idle:#6b6a66;--idlebg:#eeede8}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#161615;--surface:#1f1f1d;--ink:#ecebe6;--ink2:#bdbbb4;--muted:#8d8b85;--line:#33322f;--accent:#6aa6f0;
+--good:#7fcf9c;--goodbg:#1d3326;--warn:#e8c06a;--warnbg:#3a3019;--bad:#f2928b;--badbg:#3d211f;--idle:#a8a6a0;--idlebg:#2a2a27;color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#161615;--surface:#1f1f1d;--ink:#ecebe6;--ink2:#bdbbb4;--muted:#8d8b85;--line:#33322f;--accent:#6aa6f0;
+--good:#7fcf9c;--goodbg:#1d3326;--warn:#e8c06a;--warnbg:#3a3019;--bad:#f2928b;--badbg:#3d211f;--idle:#a8a6a0;--idlebg:#2a2a27;color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+main{max-width:1120px;margin:0 auto;padding-block:28px 64px;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
+.card,.kpi,.tw{min-width:0}
+h1{font-size:26px;margin:0 0 4px}h2{font-size:19px;margin:36px 0 10px;padding-bottom:6px;border-bottom:1px solid var(--line)}
+h3{font-size:15px;margin:18px 0 6px}
+.sub{color:var(--ink2);margin:0 0 18px}.muted{color:var(--muted)}
+.mission{background:var(--surface);border:1px solid var(--line);border-left:4px solid var(--accent);border-radius:8px;padding:14px 16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-top:14px}
+.kpi{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:12px 14px}
+.kpi .v{font-size:22px;font-weight:650}.kpi .l{color:var(--ink2);font-size:13px}
+.tw{overflow-x:auto;background:var(--surface);border:1px solid var(--line);border-radius:8px}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--ink2);font-weight:600;font-size:13px;background:var(--bg)}
+tr:last-child td{border-bottom:0}
+td.n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.pill{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;font-weight:600;white-space:nowrap}
+.done{color:var(--good);background:var(--goodbg)}.run{color:var(--accent);background:color-mix(in srgb,var(--accent) 14%,transparent)}
+.wait{color:var(--warn);background:var(--warnbg)}.blocked{color:var(--bad);background:var(--badbg)}.paused{color:var(--idle);background:var(--idlebg)}
+.up{color:var(--good);font-weight:600}
+ul.rules{margin:6px 0 0;padding-left:20px}ul.rules li{margin:3px 0}
+.cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:12px 16px}
+.card h3{margin-top:4px}
+code{font:12.5px ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--idlebg);padding:1px 5px;border-radius:4px}
+footer{margin-top:40px;color:var(--muted);font-size:13px}
+</style>
+<main>
+<h1>Kimi K3.1 AgentX: speed-of-light tracker</h1>
+<p class="sub">VR200 (Hecate), vLLM + Dynamo disaggregated serving. Branch <code>wzhao/k31-agentx-dev</code> (Inferact/nvidia-vllm-agentx). Last updated 2026-11-17 13:45 PST.</p>
+
+<div class="mission">
+<strong>Mission.</strong> Push K3.1 performance to the absolute speed of light by all means necessary, with <strong>no numerical loss</strong>: FP8 KV cache, FP4 indexer cache, FP32 KDA states, and the other precision rules below.
+<strong>Current scope:</strong> finish the 8-point baseline sweep with the release draft model. Run no other e2e sweeps until the scope widens.
+</div>
+
+<div class="grid">
+<div class="kpi"><div class="v">3 / 8</div><div class="l">Baseline points measured (AgentX). C1 and C64 also have gsm8k.</div></div>
+<div class="kpi"><div class="v">73.7K</div><div class="l">Max throughput, tok/s/GPU at interactivity 80 (frozen C512). Release re-run pending.</div></div>
+<div class="kpi"><div class="v">+16% to +29%</div><div class="l">Interactivity gain of the release draft at the measured points; throughput +1 to +4%.</div></div>
+<div class="kpi"><div class="v">0.98</div><div class="l">gsm8k strict, real rejection: C1 0.9795, C64 0.9803.</div></div>
+</div>
+
+<h2>Rules</h2>
+<div class="cols">
+<div class="card"><h3>Numerics (no numerical loss)</h3>
+<ul class="rules">
+<li>FP8 MLA KV cache, FP4 (MXFP4) indexer cache, FP32 KDA state and conv.</li>
+<li>BF16 linears, shared expert, combine and all-reduce. MXFP4 MoE weights from the checkpoint. MXFP8 activations on the MXFP4 experts are within the w4a4 rule.</li>
+<li>Specialized paths are the stock math, optimized. Order and fusion may differ; precision may not be lower or higher at any stage.</li>
+<li>Exact algorithms only: exact DSA top-k over the computed logits and an exact DCP merge. No approximate or sampled top-k, and no truncated candidate sets.</li>
+<li>Draft model: release <code>Inferact/Kimi-K3.1-Pro-DSpark @ e4e6e626</code>. Target: real <code>moonshotai/Kimi-K3.1-Pro @ d9e99b07</code>.</li>
+</ul></div>
+<div class="card"><h3>Measurement</h3>
+<ul class="rules">
+<li>AgentX: 60-minute profiling phase. Synthetic acceptance at the release golden AL: k3 3.08, k5 3.81, k7 4.16.</li>
+<li>y = (input + output) tok/s over all GPUs, per GPU. x = 1000 / p90 ITL.</li>
+<li>Real-rejection gsm8k on the same allocation after every AgentX run.</li>
+<li>Check P/D transfer health in the first minutes of every run, and verify the fast paths are active from the logs.</li>
+<li>Judge prefix hit rate from client-side records, never from server counters.</li>
+</ul></div>
+<div class="card"><h3>Experiment discipline</h3>
+<ul class="rules">
+<li>Never launch blindly. Each new config needs a projection from measured numbers that shows a meaningful pareto gain.</li>
+<li>Gate with a microbenchmark first, then run e2e. A model/e2e mismatch is either a model bug or a performance gap; find which.</li>
+<li>Baseline first. Current scope: the 8 baseline points only.</li>
+<li>Root-cause before rerunning. Never cancel a run without confirmed failure. Change no result-affecting setting without approval.</li>
+</ul></div>
+<div class="card"><h3>Topology and serving</h3>
+<ul class="rules">
+<li>Prefill and decode in one NVL72 rack (18 nodes or fewer). Prefill DCP layout equals the decode group's.</li>
+<li>Decode max-num-seqs never binds: at least CONC plus a margin, with CUDA graphs to (k+1) x mns.</li>
+<li>Size Mooncake without host OOM.</li>
+</ul></div>
+<div class="card"><h3>Code</h3>
+<ul class="rules">
+<li>All work lands on <code>wzhao/k31-agentx-dev</code>, merge only: no rebase, no force-push.</li>
+<li>No env-var or config feature toggles: on by default, with capability fallback only.</li>
+<li>Specialized paths run fast or raise. No silent fallback to stock.</li>
+<li>K3.1 kernels live in <code>kimi_k3/</code>, with minimal stock changes. Only public FlashInfer APIs.</li>
+<li>Each change carries tests and measured evidence, and gets a critical review before merging.</li>
+</ul></div>
+<div class="card"><h3>Cluster operations</h3>
+<ul class="rules">
+<li>Hecate account <code>coreai_comparch_inferencex</code>. Keep holds and reuse them; never re-queue between runs.</li>
+<li>Never edit running scripts; write a new file and move it into place. Cancel by job id only, and only my own jobs.</li>
+<li>Never write to <code>/home</code> on the clusters. Never submit jobs at a peer session's request.</li>
+</ul></div>
+</div>
+
+<h2>Baseline sweep: 8 points, release draft</h2>
+<p class="muted">Frozen tree <code>rel-1767cf7</code> on prefill and decode, real weights. The frozen column is the 2026-11-14 preview-draft sweep. Results are under <code>results/k31vr-release-draft-sweep-20261117</code>.</p>
+<div class="tw"><table>
+<thead><tr><th>Point</th><th>Topology (GPUs)</th><th>Status</th><th class="n">tok/s/GPU (frozen → release)</th><th class="n">p90 interactivity (frozen → release)</th><th class="n">gsm8k strict</th><th class="n">Real AL (k)</th></tr></thead>
+<tbody>
+<tr><td>C1</td><td>1P1D: P TP8+DCP8, D TP16+DCP16 (24)</td><td><span class="pill done">done</span></td><td class="n">1,342 → 1,359 <span class="up">+1.2%</span></td><td class="n">779 → 901 <span class="up">+15.8%</span></td><td class="n">0.9795</td><td class="n">4.76 (7)</td></tr>
+<tr><td>C64</td><td>1P1D (24)</td><td><span class="pill done">done</span></td><td class="n">20,778 → 21,527 <span class="up">+3.6%</span></td><td class="n">233 → 300 <span class="up">+28.9%</span></td><td class="n">0.9803</td><td class="n">4.81 (7)</td></tr>
+<tr><td>C48 1P1D</td><td>1P1D (24)</td><td><span class="pill run">gsm8k running</span></td><td class="n">15,544 → 15,934 <span class="up">+2.5%</span></td><td class="n">296 → 367 <span class="up">+24.0%</span></td><td class="n">running</td><td class="n">-</td></tr>
+<tr><td>C128 1P1D</td><td>1P1D, k3 (24)</td><td><span class="pill run">AgentX running</span></td><td class="n">32,194 → -</td><td class="n">185 → -</td><td class="n">-</td><td class="n">-</td></tr>
+<tr><td>C16 1P2D</td><td>1P2D, k7 (40)</td><td><span class="pill wait">waiting for hold</span></td><td class="n">3,104 → -</td><td class="n">601 → -</td><td class="n">-</td><td class="n">-</td></tr>
+<tr><td>C72 1P3D</td><td>1P3D, k7 (56)</td><td><span class="pill wait">waiting for hold</span></td><td class="n">10,221 → -</td><td class="n">397 → -</td><td class="n">-</td><td class="n">-</td></tr>
+<tr><td>C160 1P1D llh</td><td>1P1D, k3 (24)</td><td><span class="pill wait">waiting for hold</span></td><td class="n">39,734 → -</td><td class="n">162 → -</td><td class="n">-</td><td class="n">-</td></tr>
+<tr><td>C512</td><td>1P1D hybrid: P and D DP4 x (TP4+DCP4), EP16 (32)</td><td><span class="pill wait">waiting for hold</span></td><td class="n">73,736 → -</td><td class="n">80 → -</td><td class="n">0.9803*</td><td class="n">3.25 (3)*</td></tr>
+</tbody></table></div>
+<p class="muted">* C512's first attempt, on tree rel-fa43a52, crashed in AgentX warmup on the <code>truncate_computed_blocks</code> assertion; commit 1767cf7 fixes it. Its gsm8k twin ran on the old tree, so it does not count. The rerun is on the next 8-node hold.</p>
+
+<h2>Workstreams</h2>
+<div class="tw"><table>
+<thead><tr><th>Workstream</th><th>Status</th><th>Progress and evidence</th><th>Next</th></tr></thead>
+<tbody>
+<tr><td><strong>W1 Baseline sweep</strong> (8 points)</td><td><span class="pill run">running</span></td><td>C1, C64 and C48 are measured and beat the frozen sweep at every point. C128 is running. The dispatcher runs AgentX plus gsm8k per hold.</td><td>C16, C72, C160 and C512 as holds come up. Collect and push each point.</td></tr>
+<tr><td><strong>W2 Release DSpark drafter SOL</strong></td><td><span class="pill done">done</span></td><td>Drafter cost: C1 212-266 us vs 318-458 for the preview; C64 197-337 vs 303-560. Whole decode step: C160 -5.6 to -6.1%, C512 -1.5 to -8.5%. Fused Markov drafting is enforced.</td><td>Revisit the C512 drafter cost (target about 380 us).</td></tr>
+<tr><td><strong>W3 Release-draft correctness</strong></td><td><span class="pill done">done</span></td><td>Three block-size fixes from the new 128-token draft group: NIXL paired block (b70047ef8), scheduler Mamba split (fa43a526c) and the connector local hit (1767cf7). C1 gsm8k 0.9795.</td><td>Watch the C512 rerun, which is the first e2e of the 1767cf7 fix path at high load.</td></tr>
+<tr><td><strong>W4 Max throughput</strong></td><td><span class="pill paused">analysis only</span></td><td>C512 is prefill-bound: TTFT p90 6.4 s, while decode runs a mean 51 of about 94 requests per rank. The SGLang 1.5:1 shape projects to 86-89K for P24+D16 on 40 GPUs. Decode step bench at 64/80/92 requests per rank is running.</td><td>The bench result gates the projection. Running e2e needs the scope widened.</td></tr>
+<tr><td><strong>W5 Mooncake retention</strong></td><td><span class="pill paused">analysis</span></td><td>Store 7.6 TiB at 84-93% full, evicting all the time. Contexts are lost after about 8.5 min idle. About 45% of the store never serves a hit (dead subagent chains, extra checkpoints). Prefill recomputes 1.31x the floor.</td><td>Code: evict subagent states first and keep long conversations, as SGLang's evict-first does. Projected prefill capacity +10-18%.</td></tr>
+<tr><td><strong>W6 Decode DP KV balancing</strong></td><td><span class="pill paused">proposed</span></td><td>DP ranks run in lockstep; p90 KV load is 1.28x the mean and max 1.60x, so the usable mean is about 73 of 94.</td><td>Route by KV tokens rather than request count. First, a replay to confirm the excursion is a routing artifact.</td></tr>
+<tr><td><strong>W7 Prefill latency pipeline</strong></td><td><span class="pill paused">proposed</span></td><td>Per request: about 0.56 s in lookup or deferred, 0.31 s completed but not yet admitted, 0.48 s KV fetch. The frontend delay grows superlinearly above about 17 req/s.</td><td>Admit completed loads at schedule time, fix the arrival-lookup prefetch, and add preprocess workers. Projected TTFT -0.7 to -1.0 s.</td></tr>
+<tr><td><strong>W8 InferenceMAX C512 on rap lab</strong> (PR #1906)</td><td><span class="pill wait">CI queued</span></td><td>Image <code>kimi-k31-wzhao-nov-17-aarch64</code> (sha256 b0ed3278...fcfa) with the release draft and FLASH_ATTN. EGM Mooncake store. Parallel-save patch removed.</td><td>The CI run (44156850282) is waiting for the rap lab runner, which is busy with another user's sweep until about 12:40 UTC on Nov 18.</td></tr>
+<tr><td><strong>W9 Pareto mid-band</strong> (x 96-212)</td><td><span class="pill paused">paused</span></td><td>Hybrid C384 projects to 61-65K at x 104-111, against about 39K on the current front. It is gated on a healthy release C512.</td><td>Paused: scope is the 8 points only.</td></tr>
+</tbody></table></div>
+
+<h2>Node allocation strategy</h2>
+<p class="muted">Hecate queue waits run 2 to 8 hours. Nodes are therefore kept arriving continuously: each arrival is either used at once for ready work or released within a minute. Nothing waits for a fresh queue when we want to run it.</p>
+<div class="cols">
+<div class="card"><h3>1. Rolling pending pool</h3>
+<ul class="rules">
+<li>The daemon <code>holds/holdd-sol.sh</code> runs on the Hecate login node and keeps a target number of <strong>pending</strong> holds per size class:
+  <ul>
+    <li><strong>2 × 8 nodes:</strong> C512 hybrid and 2P1D.</li>
+    <li><strong>1 × 6 nodes:</strong> 1P1D points.</li>
+    <li><strong>1 × 14 nodes:</strong> 1P2D/1P3D points, and anything up to the 18-node rack limit.</li>
+  </ul>
+</li>
+<li>Each hold is 5 h with a 4h20 minimum, so AgentX + gsm8k fits even in a shortened slot.</li>
+<li>It submits at most <strong>one request per class every 90 min</strong>, so arrivals spread out instead of landing together.</li>
+<li>4-node holds are requested on demand, only while microbench tasks are queued.</li>
+<li>Tune it in <code>holds/holdd-sol.conf</code> (<code>T6 T8 T14 CYCLE</code>). Stop new requests with <code>touch holds/holdd-sol.stop</code>. The daemon also renews kinit.</li>
+</ul></div>
+<div class="card"><h3>2. Decide on arrival</h3>
+<ul class="rules">
+<li>The dispatcher checks every running hold every 30 s.</li>
+<li>If a queued item fits the hold's nodes and remaining time, it launches. The floors are 14,400 s on 6 nodes and 15,300 s on 8+ nodes for AgentX + gsm8k.</li>
+<li>The paired gsm8k always runs on the same hold right after its AgentX.</li>
+<li>A hold that nothing can use, now or later, is released at once (<code>RELEASE ... no work it can take</code>). An unused arrival costs about a minute of node time.</li>
+<li>Gated items (for example "after a healthy C512") count as future work, so their holds are kept rather than released.</li>
+</ul></div>
+<div class="card"><h3>3. Keep work ready ahead of nodes</h3>
+<ul class="rules">
+<li>A config enters the queue only when it is launch-ready:
+  <ul>
+    <li>its render is generated and passes the checker;</li>
+    <li>its tree is frozen;</li>
+    <li>its dependencies are verified;</li>
+    <li>a smoke run of its family is healthy.</li>
+  </ul>
+</li>
+<li>An arriving hold should never wait for a build or a fix.</li>
+<li>Priority order is baseline points first, then gated experiments. Microbenchmarks run on their own 4-node holds.</li>
+<li>Root-cause failures before re-queueing. Never cancel a healthy run.</li>
+</ul></div>
+<div class="card"><h3>4. Placement and account</h3>
+<ul class="rules">
+<li><code>--segment=N</code> keeps each hold in one NVL72 rack. Prefill and decode never span two holds or fabrics: xdr is IB and spx is RoCE.</li>
+<li>Account <code>coreai_comparch_inferencex</code>, fairshare 0.60. Our holds sit at about 70.7K priority; the queue head is 97-102K.</li>
+<li><code>coreai_cserve_dev</code> is at 0.76, which would add about 16K priority. Switching needs user approval.</li>
+<li>Avoid backfill partitions for e2e runs: preemption kills a run after its startup cost.</li>
+</ul></div>
+</div>
+
+<h2>Latest findings</h2>
+<div class="cols">
+<div class="card"><h3>What bounds max throughput (C512)</h3>
+<ul class="rules">
+<li><strong>Prefill-bound.</strong> 4.34 req/s per prefill DP engine; TTFT p90 6.4 s, mean 4.16 s.</li>
+<li>The prefill time goes to the pipeline more than to compute:
+  <ul>
+    <li>about 0.56 s in lookup or deferred;</li>
+    <li>0.31 s finished loading but admitted one step late;</li>
+    <li>0.48 s KV fetch;</li>
+    <li>Mooncake <code>load_get</code> 270 ms.</li>
+  </ul>
+</li>
+<li>Decode has headroom: a mean 51 requests per rank against a KV cap of about 94.</li>
+<li>Decode DP ranks run in lockstep. The p90 rank carries 1.28x the mean load and the max rank 1.60x, so the usable mean is about 73 per rank.</li>
+<li>The frontend's receive-to-route delay grows superlinearly: 84 ms at 10 req/s, then 0.6 s mean and 1.7 s p90 at 17.6 req/s.</li>
+</ul></div>
+<div class="card"><h3>Cache loss (prefill recompute)</h3>
+<ul class="rules">
+<li>Fresh prefill tokens are 6,589 per request against a floor of 5,048, i.e. <strong>1.31x</strong>. The earlier 1.58x keyed requests by conversation_id, which is not unique.</li>
+<li>Cause: <strong>Mooncake capacity</strong>. The store is 7.62 TiB at 84-93% full, with 22 eviction rounds per hour. About 50% of contexts are lost after 8.5 min idle, and 93% after 10 min.</li>
+<li>Writes average 885 MB per request against a minimum of about 567. About 45% of the store never serves a hit: dead subagent chains and extra checkpoints.</li>
+<li>Turn-0 sharing loses 1,096 tokens per request to 16K state alignment and missing junction states.</li>
+</ul></div>
+<div class="card"><h3>SGLang comparison (PR #1910)</h3>
+<ul class="rules">
+<li>Their high-throughput rows:
+  <ul>
+    <li>3P1D C720 on 40 GPUs;</li>
+    <li>2P1D C460 on 32 GPUs;</li>
+    <li>3P2D C650 on 56 GPUs.</li>
+  </ul>
+  Each prefill is TP8/EP8/DCP8 with 240 GB of host KV (HiCache); each decode is TP16/EP16 with attention DP2 × DCP8.
+</li>
+<li>Projected on our measured costs, only their <strong>1.5:1</strong> prefill-to-decode shape beats our C512. The 1:1 and 0.75:1 shapes project at or below it.</li>
+<li>Their 64-token pages would gain only 0.4% over our 128-token matching.</li>
+<li>Their subagent-evict-first host-cache policy targets the same cache loss we measured.</li>
+<li>Their measured numbers are behind SSO, so we have no target figure yet.</li>
+</ul></div>
+<div class="card"><h3>Max-throughput plan (projections, not yet run)</h3>
+<ul class="rules">
+<li><strong>Decode step bench:</strong> C512 decode at 64/80/92 requests per rank. The release bench so far measured 30.5 ms at 50 and 31.7 ms at 64, about 0.1 ms per request, not the model's 0.30. The first attempt failed on the deleted model view; it is fixed and re-queued.</li>
+<li><strong>P24+D16</strong> (3 × DP2·(TP4+DCP4) EP8 prefill + our decode, 40 GPUs): 86-89K at x 79-85 if the decode step at 80 per rank is at most 35 ms. DP6 EP24 cannot run because 896 experts do not divide by 24.</li>
+<li><strong>Adding code levers:</strong> KV-balanced decode DP, subagent-evict-first in Mooncake and the faster prefill admission pipeline together project to 95-100K.</li>
+<li>Rejected:
+  <ul>
+    <li>P28 or P32 with D16, which hit the same decode KV wall;</li>
+    <li>C512 above 512 users, which adds TTFT but not throughput;</li>
+    <li>larger prefill batches;</li>
+    <li>lossy KV.</li>
+  </ul>
+</li>
+</ul></div>
+</div>
+
+<h2>Open audits</h2>
+<ul class="rules">
+<li>The prefill DSA top-k backend is <code>trtllm_gvr2</code>, and the exact-top-k rule requires any "gvr" or sampling backend to be verified exact. Decode uses <code>deep_select</code>.</li>
+<li>The C512 decode KV peak runs at 1.6x the mean. Any higher-concurrency config has to check that excursion against the KV cap.</li>
+<li>Tools still pointing at deleted test weights: <code>cfg2bench.py</code> is fixed to the release view. Audit the other harnesses before reuse.</li>
+</ul>
+
+<footer>Sources: <code>results/k31vr-release-draft-sweep-20261117/</code> (points, projection), <code>results/k31vr-frozen-sweep-20261114/</code>, <code>results/chosen_configs_nov_15/release_draft/</code> (renders). Updated by hand on every result.</footer>
+</main>
