@@ -63,8 +63,9 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #  13: Add packed-member layouts and order-independent packed-push backend hashes
 #  14: Add Qwen3.8-Flash-Next PLE page length - #59997
 #  15: Add remote_registration_generation to kv_transfer_params
+#  16: Add per-region DCP sharding to NixlAgentMetadata
 #
-NIXL_CONNECTOR_VERSION: int = 15
+NIXL_CONNECTOR_VERSION: int = 16
 
 
 @dataclass
@@ -100,6 +101,11 @@ class NixlAgentMetadata:
     # Dim 0 of each shape is the TP-sharded one; peers must agree on the rest
     # (e.g. conv rows = conv width - 1 + num_speculative_tokens). None: no Mamba.
     mamba_state_geometry: tuple[int, list[list[int]], list[str]] | None = None
+    # Per region, whether DCP shards its token positions (KVCacheSpec.dcp_sharded
+    # of its attention layers). False for state and for a drafter that runs at
+    # DCP 1 under a DCP target: each rank holds every token of its own heads.
+    # None: the peer predates the field.
+    region_dcp_sharded: list[bool] | None = None
 
 
 @dataclass

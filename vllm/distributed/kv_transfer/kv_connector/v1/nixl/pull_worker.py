@@ -311,6 +311,15 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                             self._group_spec_types[g]
                         ):
                             continue
+                        if g in self._dcp_replicated_draft_groups:
+                            # Every rank holds every token of its heads.
+                            num_blocks = self._num_unsharded_group_blocks(
+                                g, meta.remote.num_tokens
+                            )
+                            local_ids[g], remote_ids[g] = self._pair_blocks_from_end(
+                                local_ids[g], remote_ids[g], num_blocks
+                            )
+                            continue
                         local_ids[g], remote_ids[g] = self._apply_dcp_prefix_caching(
                             local_ids[g],
                             remote_ids[g],

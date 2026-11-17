@@ -754,3 +754,72 @@ def test_dsv4_five_group_eagle_store_lookup_round_trip():
     # The final 256-token segment has no lookahead block, so EAGLE falls back
     # to the previous aligned boundary instead of consuming all 768 tokens.
     assert hit == 512
+
+
+@pytest.mark.parametrize("use_eagle", [False, True])
+def test_dcp_replicated_draft_store_lookup_round_trip(use_eagle):
+    """Kimi-K3.1 with the release DSpark draft on a TP8/DCP8 prefiller: the DSA
+    group is DCP-sharded (a 1024-token block per rank spans 8192 tokens), the
+    draft's 2048-token sliding window runs at DCP 1 (1024 tokens per block).
+    DCP resolution scales the target only; each 8192-token boundary stores the
+    draft's window tail, and a lookup over exactly the stored keys hits every
+    boundary the drafter's eagle drop allows."""
+    from types import SimpleNamespace
+
+    from vllm.v1.kv_cache_interface import KVCacheConfig, MLAAttentionSpec
+
+    dsa = MLAAttentionSpec(
+        block_size=1024, num_kv_heads=1, head_size=656, dtype=torch.uint8
+    )
+    draft = SlidingWindowSpec(
+        block_size=1024,
+        num_kv_heads=2,
+        head_size=64,
+        dtype=torch.bfloat16,
+        sliding_window=2048,
+        dcp_sharded=False,
+    )
+    groups = [
+        KVCacheGroupSpec(["model.layers.0.self_attn.attn"], dsa),
+        KVCacheGroupSpec(
+            ["model.layers.93.self_attn.attn"], draft, is_eagle_group=use_eagle
+        ),
+    ]
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=8),
+        speculative_config=SimpleNamespace(use_eagle_block_drop=lambda: use_eagle),
+    )
+    coord = MooncakeStoreCoordinator.from_kv_cache_config(
+        KVCacheConfig(num_blocks=64, kv_cache_tensors=[], kv_cache_groups=groups),
+        config,
+        scheduler_block_size=8192,
+        hash_block_size=1024,
+    )
+    assert [g.kv_cache_spec.block_size for g in coord.kv_cache_groups] == [8192, 1024]
+
+    token_len = 3 * 8192
+    store_masks = coord.store_mask(token_len)
+    assert store_masks[0] is None
+    # The window needs cdiv(2047, 1024) = 2 blocks before a boundary, plus the
+    # block past it that the eagle drop peeks at.
+    tails = [6, 7, 14, 15, 22, 23] if not use_eagle else [6, 7, 8, 14, 15, 16, 22, 23]
+    assert [i for i, stored in enumerate(store_masks[1]) if stored] == tails
+
+    hashes = _hashes(token_len // coord.hash_block_size)
+    exists: set[tuple[int, bytes]] = set()
+    for gid, (group, mask) in enumerate(
+        zip(coord.kv_cache_groups, store_masks, strict=True)
+    ):
+        group_hashes = coord.block_hashes_for_spec(hashes, group.kv_cache_spec)
+        for chunk_id, block_hash in enumerate(group_hashes):
+            if mask is None or mask[chunk_id]:
+                exists.add((gid, bytes(block_hash)))
+    load_masks, hit = coord.find_longest_cache_hit(
+        hashes,
+        max_length=token_len,
+        cached_block_pool=ExternalCachedBlockPool(coord.hash_block_size, exists),
+    )
+    assert hit == (token_len if not use_eagle else 2 * 8192)
+    # The draft loads exactly its window before the hit.
+    loaded = [i for i, load in enumerate(load_masks[1]) if load]
+    assert loaded == [hit // 1024 - 2, hit // 1024 - 1]
