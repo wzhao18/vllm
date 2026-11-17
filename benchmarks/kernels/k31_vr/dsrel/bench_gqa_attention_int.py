@@ -18,7 +18,8 @@ where the target model runs between the draft layers. Median of 5 replays, us pe
   python3 bench_gqa_attention_int.py --tp 16 --q 7 --batches 1,2,4,8,16,32
   python3 bench_gqa_attention_int.py --tp 4 --q 3 --layout slots --batches 16,64,128
   python3 bench_gqa_attention_int.py ... --shape 8/2/2/0  (GqaWindow launch shape
-  splits/key groups/ring/ahead for every batch, overriding GQA_WINDOW)
+  splits/key groups/ring/ahead for every batch, overriding GQA_WINDOW; a
+  comma-separated list sweeps the shapes, fused arm only)
 """
 
 import argparse
@@ -99,9 +100,9 @@ def rope_table(device):
     return torch.cat((freqs.cos(), freqs.sin()), -1).to(torch.bfloat16).to(device)
 
 
-def make_layers(kv_heads, device):
+def make_layers(kv_heads, device, table=None):
     heads = G * kv_heads
-    rope = _Rope(rope_table(device))
+    rope = _Rope(rope_table(device) if table is None else table)
     layers = []
     for i in range(LAYERS):
         w = lambda: (torch.rand(HEAD, device=device) + 0.5).bfloat16()  # noqa: E731
@@ -156,6 +157,27 @@ def main():
     parser.add_argument("--no-context", action="store_true")
     args = parser.parse_args()
 
+    device = torch.device("cuda", 0)
+    torch.cuda.set_device(device)
+    H = {16: 1, 8: 2, 4: 4}[args.tp]
+    q = args.q
+    batches = [int(b) for b in args.batches.split(",")]
+    shapes = [None]
+    if args.shape:
+        shapes = [tuple(int(x) for x in s.split("/")) for s in args.shape.split(",")]
+    if len(shapes) > 1:
+        args.arms, args.no_context = "fused", True
+    table = rope_table(device)
+    for shape in shapes:
+        try:
+            run_shape(args, H, q, batches, shape, table, device)
+        except Exception as e:  # (a sweep keeps going past a shape that fails)
+            if len(shapes) == 1:
+                raise
+            print(f"  shape {shape}: FAILED {type(e).__name__}: {str(e)[:200]}")
+
+
+def run_shape(args, H, q, batches, shape, table, device):
     from vllm.forward_context import ForwardContext, override_forward_context
     from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Model
     from vllm.models.kimi_k3.nvidia.dspark_gqa import stock_attention_core
@@ -164,16 +186,10 @@ def main():
     )
     from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
 
-    device = torch.device("cuda", 0)
-    torch.cuda.set_device(device)
-    H = {16: 1, 8: 2, 4: 4}[args.tp]
-    q = args.q
-    batches = [int(b) for b in args.batches.split(",")]
-    if args.shape:
-        shape = tuple(int(x) for x in args.shape.split("/"))
+    if shape is not None:
         ga.GQA_WINDOW[(H, q)] = ((0, shape),)
     arms = args.arms.split(",")
-    layers = make_layers(H, device)
+    layers = make_layers(H, device, table)
     config = SimpleNamespace(
         speculative_config=SimpleNamespace(num_speculative_tokens=q),
         model_config=SimpleNamespace(max_model_len=MAX_POS),
