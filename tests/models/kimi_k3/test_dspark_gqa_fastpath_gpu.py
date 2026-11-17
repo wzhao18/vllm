@@ -127,7 +127,7 @@ def test_combine_normalizes_as_stock():
 # ---------------------------------------------------------------- torchrun
 
 
-@pytest.mark.parametrize("part", ["sites", "sites4", "vpmarkov", "build"])
+@pytest.mark.parametrize("part", ["sites", "sites4", "vpmarkov", "build", "gather"])
 def test_gpu_torchrun(part):
     """The torchrun checks below on every local GPU (skipped without 2+ Rubin
     GPUs)."""
@@ -715,6 +715,67 @@ def _build_main(rank, world, device, group):
     return failures
 
 
+def _gather_main(rank, world, device, group):
+    """The context step's mailbox-publishing shard GEMM (``GatherProjection``, as
+    ``gqa_context_projection`` installs it) at the TP16 fc shard (448, 35840) with
+    the GQA tables' tactics (N tiles of 8 and 16 rows, 8-32 rows): every rank's rows
+    land in its columns of every rank's row mailbox, bitwise the split-K
+    projection's (sanitized: no -0.0), the other columns untouched."""
+    import torch.distributed._symmetric_memory as symm_mem
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.draft import context
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.projection import (
+        PreparedProjection,
+    )
+
+    hidden, shard = context.HIDDEN, 448
+    gen = torch.Generator(device=device).manual_seed(900 + rank)
+    weight = torch.randn((shard, 5 * hidden), generator=gen, device=device) * 0.01
+    weight = weight.bfloat16()
+    failures = 0
+    cases = {
+        8: (64, 8, 14, 10),
+        12: (64, 16, 14, 8),
+        16: (64, 16, 14, 8),
+        24: (64, 16, 10, 8),
+        32: (64, 16, 10, 8),
+    }
+    box = symm_mem.empty((64 * hidden,), dtype=torch.bfloat16, device=device)
+    mc = int(symm_mem.rendezvous(box, group).multicast_ptr or 0)
+    assert mc, "multicast memory"
+    ring = context.GatherProjection(weight, cases).prepare()
+    plain = PreparedProjection(weight, cases).prepare()
+    shape_rows = torch.empty((64, shard), dtype=torch.bfloat16, device=device)
+    for rows, tactic in cases.items():
+        box.view(torch.int32).fill_(-0x80000000)
+        torch.accelerator.synchronize(device)
+        torch.distributed.barrier()
+        x = torch.randn((rows, 5 * hidden), generator=gen, device=device).bfloat16()
+        ring.run_ring(x, shape_rows[:rows], mc + rank * shard * 2)
+        expected = torch.empty((rows, shard), dtype=torch.bfloat16, device=device)
+        plain.run(x, expected)
+        expected = expected + 0.0  # (-0.0 published as +0.0)
+        torch.accelerator.synchronize(device)
+        torch.distributed.barrier()
+        landed = box.view(64, hidden)[:rows]
+        parts = [torch.empty_like(expected) for _ in range(world)]
+        torch.distributed.all_gather(parts, expected)
+        ok = all(
+            torch.equal(landed[:, r * shard : (r + 1) * shard], parts[r])
+            for r in range(world)
+        )
+        rest = landed[:, world * shard :].view(torch.int32)
+        ok = ok and bool((rest == -0x80000000).all())
+        failures += not ok
+        if rank == 0 or not ok:
+            print(
+                f"rank {rank}: GatherProjection rows {rows} tactic {tactic}: "
+                f"{'ok' if ok else 'FAIL'}",
+                flush=True,
+            )
+    return failures
+
+
 def _gpu_main(parts):
     import torch.distributed as dist
 
@@ -732,6 +793,8 @@ def _gpu_main(parts):
         failures += _vp_markov_main(rank, world, device, group)
     if "build" in parts:
         failures += _build_main(rank, world, device, group)
+    if "gather" in parts:
+        failures += _gather_main(rank, world, device, group)
     dist.barrier()
     dist.destroy_process_group()
     return failures
@@ -739,6 +802,6 @@ def _gpu_main(parts):
 
 if __name__ == "__main__":
     # torchrun ... test_dspark_gqa_fastpath_gpu.py [sites] [sites4] [vpmarkov]
-    # [build] (default: all)
-    parts = sys.argv[1:] or ("sites", "sites4", "vpmarkov", "build")
+    # [build] [gather] (default: all)
+    parts = sys.argv[1:] or ("sites", "sites4", "vpmarkov", "build", "gather")
     sys.exit(1 if _gpu_main(parts) else 0)

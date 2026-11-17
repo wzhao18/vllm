@@ -1033,7 +1033,10 @@ GQA_PROJECTIONS = {
 # TP16 (release GEMM bench, us cuBLAS -> split-K): qkv 9-15 rows 4.14 -> 2.42, 18-30
 # 3.99 -> 2.87, 33-63 4.26 -> 3.67; o_proj 9-15 2.28 -> 1.90, 18-30 2.25 -> 2.06
 # (33-63: cuBLAS 2.37 vs 2.62, kept); context K/V 12-16 4.68 -> 2.65, 20-32 4.11 ->
-# 2.92, 36-64 4.25 -> 3.70.
+# 2.92, 36-64 4.25 -> 3.70; the context fc shard (448, 35840; the preview's tables
+# have no tactic above 8 rows) 12-16 6.90 -> 5.38, 20-32 6.68 -> 6.21 (N tiles of
+# 16: published into the row mailbox by the GEMM, ``gqa_context_projection``;
+# 36 rows: cuBLAS 6.74 vs 8.28, kept).
 GQA_PROJECTIONS_WIDE = {
     16: (
         (
@@ -1042,6 +1045,7 @@ GQA_PROJECTIONS_WIDE = {
                 (512, 7168): (64, 8, 8, 7),
                 (7168, 384): (64, 16, 1, 3),
                 (640, 7168): (64, 8, 8, 7),
+                (448, 35840): (64, 16, 14, 8),
                 (1792, 7168): (64, 16, 4, 8),
                 (7168, 896): (64, 16, 1, 8),
             },
@@ -1052,6 +1056,7 @@ GQA_PROJECTIONS_WIDE = {
                 (512, 7168): (64, 16, 4, 10),
                 (7168, 384): (64, 32, 1, 3),
                 (640, 7168): (64, 16, 4, 10),
+                (448, 35840): (64, 16, 10, 8),
                 (1792, 7168): (64, 32, 4, 6),
             },
         ),
@@ -1213,12 +1218,12 @@ def install_gqa_projections(model, tp, query_rows, context_rows, rank=0):
 def gqa_context_projection(prepared, tp):
     """``PreparedContext``'s shard GEMM on the GQA tables' split-K tactics for its
     static rows (the release drafter's fc shard: (448, 35840) at TP16, as the
-    preview's context_proj shard; (1792, 35840) at TP4), each publishing its rows
-    into the row mailbox itself (``GatherProjection``, polled CtxGather), as
-    ``PreparedContext.__init__`` sets them up from the preview's tables. Tactics with
-    the M tile 64 and N tiles of at most 16 rows only (the mailbox-publishing GEMM:
-    one 8-column fragment per epilogue thread, ``RingSplitKGemm``). Returns the rows
-    it set."""
+    preview's context_proj shard; (1792, 35840) at TP4), as
+    ``PreparedContext.__init__`` sets it up from the preview's tables: rows whose
+    tactic has the M tile 64 and N tiles of at most 16 publish into the row mailbox
+    from the GEMM itself (``GatherProjection``, one 8-column fragment per epilogue
+    thread; polled CtxGather), the others run the split-K GEMM and CtxGather's
+    publish. Returns the (split-K, mailbox-publishing) rows."""
     from ..cutedsl.draft.context import CAP, GatherProjection, compile_gather
     from ..cutedsl.gemm.projection import PreparedProjection
 
@@ -1226,21 +1231,20 @@ def gqa_context_projection(prepared, tp):
     tactics = {}
     for r in prepared.rows:
         tactic = gqa_projection_tactic(shard.shape, tp, r)
-        if tactic is not None and len(tactic) == 4 and tactic[1] <= 16:
+        if tactic is not None:
             tactics[r] = tactic
+    ring = {r: t for r, t in tactics.items() if len(t) == 4 and t[1] <= 16}
     current = prepared.projection.policies if prepared.projection is not None else {}
-    if not tactics or tactics == current:
-        return sorted(current)
+    if not tactics or (tactics == current and set(ring) == set(prepared.polled)):
+        return sorted(current), sorted(prepared.polled)
     index = prepared.device.index
     prepared.projection = PreparedProjection(shard, tactics).prepare()
-    prepared.ring = GatherProjection(shard, tactics).prepare()
-    prepared.polled = {
-        r: compile_gather(r, shard.shape[0], index, True) for r in tactics
-    }
+    prepared.ring = GatherProjection(shard, ring).prepare() if ring else None
+    prepared.polled = {r: compile_gather(r, shard.shape[0], index, True) for r in ring}
     prepared.shape_rows = torch.empty(
         (CAP, shard.shape[0]), dtype=torch.bfloat16, device=prepared.device
     )
-    return sorted(tactics)
+    return sorted(tactics), sorted(ring)
 
 
 class GqaContextWeights:
