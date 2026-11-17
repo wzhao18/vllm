@@ -206,14 +206,32 @@ class DSparkSpeculator(DFlashSpeculator):
         probabilistic drafting (the stock draws of ``_sample_logits``, and the draft
         logits cached as it caches them). Only plain anchor-as-first drafting
         qualifies; anything else, or a False from the model, keeps the loop below."""
-        if (
-            self._draft_topk is not None
-            or self.use_confidence_head
-            or self.acceptance_estimator is not None
-            or self.draft_watermarker is not None
-            or not self.sample_from_anchor
-            or self.num_query_per_req != self.num_speculative_steps
-        ):
+        bypass = (
+            (self._draft_topk is not None, "top-k drafting"),
+            (self.use_confidence_head, "a confidence head"),
+            (self.acceptance_estimator is not None, "an acceptance estimator"),
+            (self.draft_watermarker is not None, "a draft watermark"),
+            (not self.sample_from_anchor, "drafts that do not sample from the anchor"),
+            (
+                self.num_query_per_req != self.num_speculative_steps,
+                "a query count other than the draft steps",
+            ),
+        )
+        if self.draft_logits is not None:
+            bypass += (
+                (self.use_fp64_gumbel, "FP64 Gumbel draws"),
+                (self._d2t_scatter_index is not None, "a draft-to-target vocab map"),
+                (self.draft_logits.row_mapping is not None, "remapped draft-logit rows"),
+            )
+        reason = next((why for failed, why in bypass if failed), None)
+        if reason is not None:
+            # A draft model that must run every captured draft fused (no silent stock
+            # Markov loop) refuses the bypass instead.
+            if getattr(self.model, "requires_fused_markov", False):
+                raise RuntimeError(
+                    f"DSpark draft model requires fused Markov drafting; {reason} "
+                    "would draft on the stock loop"
+                )
             return False
         num_sample = num_reqs * self.num_speculative_steps
         # Anchor-as-first: sample row k is query row k (sample_indices is the identity
@@ -225,13 +243,7 @@ class DSparkSpeculator(DFlashSpeculator):
             fused = getattr(self.model, "greedy_markov_draft", None)
             return fused is not None and fused(head_hidden[:num_sample], anchors, draft)
         fused = getattr(self.model, "sampled_markov_draft", None)
-        if (
-            fused is None
-            or self.use_fp64_gumbel
-            or self._d2t_scatter_index is not None
-            # The fused drafting writes rows by request state index.
-            or self.draft_logits.row_mapping is not None
-        ):
+        if fused is None:
             return False
         return fused(
             head_hidden[:num_sample],

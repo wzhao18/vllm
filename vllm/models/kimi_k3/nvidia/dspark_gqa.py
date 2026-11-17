@@ -446,6 +446,13 @@ class K3GqaDSparkForCausalLM(Qwen3DSparkForCausalLM):
             fast.gather_draft_logits(draft_logits, slots)
 
     @property
+    def requires_fused_markov(self) -> bool:
+        """Whether every Markov draft must take the fused path: the strict
+        (target-topology) drafter refuses a speculator-side stock-loop bypass."""
+        fast = self._fast_path
+        return fast is not None and fast.strict
+
+    @property
     def shards_draft_logits(self) -> bool:
         """Whether probabilistic drafting may leave only this rank's columns of the
         draft-logits cache rows (``sampled_markov_draft``)."""

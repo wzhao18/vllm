@@ -335,3 +335,36 @@ def test_context_kv_buffers_built_before_fast_path(monkeypatch, loaded):
     else:
         assert calls[0] == ("buffers", True)
         assert calls[1][0] == "build" and calls[1][1] is not None
+
+
+@pytest.mark.parametrize("requires", [False, True])
+@pytest.mark.parametrize(
+    "bypass",
+    ["acceptance_estimator", "use_confidence_head", "row_mapping", "d2t", "fp64"],
+)
+def test_speculator_markov_bypass_refused_when_strict(requires, bypass):
+    """A speculator-side bypass of the fused Markov drafting raises for a draft model
+    that requires it (the strict release drafter) and keeps the stock loop otherwise."""
+    from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+
+    spec = object.__new__(DSparkSpeculator)
+    spec._draft_topk = None
+    spec.use_confidence_head = bypass == "use_confidence_head"
+    spec.acceptance_estimator = object() if bypass == "acceptance_estimator" else None
+    spec.draft_watermarker = None
+    spec.sample_from_anchor = True
+    spec.num_query_per_req = spec.num_speculative_steps = 3
+    spec.use_fp64_gumbel = bypass == "fp64"
+    spec._d2t_scatter_index = object() if bypass == "d2t" else None
+    spec.draft_logits = SimpleNamespace(
+        values=None, row_mapping=object() if bypass == "row_mapping" else None
+    )
+    spec.model = SimpleNamespace(
+        requires_fused_markov=requires,
+        sampled_markov_draft=lambda *a: pytest.fail("fused path must not run"),
+    )
+    if requires:
+        with pytest.raises(RuntimeError, match="requires fused Markov"):
+            spec._fused_greedy_markov(2, None)
+    else:
+        assert spec._fused_greedy_markov(2, None) is False
