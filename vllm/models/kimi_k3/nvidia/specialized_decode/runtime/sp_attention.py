@@ -20,10 +20,13 @@ Everything else is the stock module, called as the stock forward calls it
 ``_post_attn_norm`` (AttnRes) on the shard, the MegaMoE / dense MLP on the shard (with
 stock's ``sp_padding_mask``), the aux streams, the final AttnRes, the final
 ``sp_all_gather`` and the norm. The verification (synthetic rejection), LM head,
-sampler and the DSpark drafter stay stock too, except the drafter's MLA attention:
-``runtime.draft`` FAST_DCP's TP4 entry runs it on cutedsl.draft.attention DraftDcp
-(publish-only MlaQuery, polled cores with length-keyed splits, DcpValue), strict;
-no other drafter table has a TP4 entry (SP_DRAFTER_TABLES, checked at build).
+sampler and the preview (MLA) DSpark drafter stay stock too, except the drafter's MLA
+attention: ``runtime.draft`` FAST_DCP's TP4 entry runs it on cutedsl.draft.attention
+DraftDcp (publish-only MlaQuery, polled cores with length-keyed splits, DcpValue),
+strict; no other preview drafter table has a TP4 entry (SP_DRAFTER_TABLES, checked at
+build). The release (GQA) DSpark drafter is not a declared stock module: its own
+build (``runtime.draft.GqaDraftFastPath``) is strict here, every piece of every
+captured drafter batch specialized or the load refused.
 
 R = 4 n for n = 1..128 requests per DP group (0.25..32 requests per GPU): every
 captured R is a multiple of TP4, so SP never pads. Every captured R is served by every
@@ -59,6 +62,7 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_shard,
 )
 
+from ...dense_draft import is_gqa_dspark
 from ...ops.attn_res import attn_res
 from ..cutedsl.common.sp_comm import SpComm
 from ..cutedsl.dsa.sp import SpDsaCore, sp_dsa_box, sp_dsa_scratch
@@ -197,23 +201,26 @@ class SpAttentionBlock:
         }
 
 
-# ``runtime.draft`` TP-keyed tables the SP decode specializes the drafter with at TP4:
-# its MLA attention (DraftDcp). Every other drafter piece is the declared stock module.
+# ``runtime.draft`` TP-keyed tables the SP decode specializes the preview (MLA) drafter
+# with at TP4: its MLA attention (DraftDcp). Every other preview drafter piece is the
+# declared stock module. (The release drafter's GQA_* tables are its own build's.)
 SP_DRAFTER_TABLES = frozenset({"FAST_DCP"})
 DRAFTER_NOTE = "stock DSpark module; its MLA attention on DraftDcp (strict)"
 
 
 def check_stock_drafter(tp):
-    """The DSpark drafter is the declared stock module but for its attention: raises
-    if a ``runtime.draft`` TP-keyed table other than SP_DRAFTER_TABLES would install
-    a specialized drafter piece at ``tp`` (the declaration would then be false), or
-    one of SP_DRAFTER_TABLES lacks its TP entry (the attention would stay stock)."""
+    """The preview DSpark drafter is the declared stock module but for its attention:
+    raises if a ``runtime.draft`` TP-keyed table of the preview drafter other than
+    SP_DRAFTER_TABLES would install a specialized drafter piece at ``tp`` (the
+    declaration would then be false), or one of SP_DRAFTER_TABLES lacks its TP entry
+    (the attention would stay stock)."""
     from . import draft
 
     tables = {
         name: table
         for name, table in vars(draft).items()
         if name.isupper()
+        and not name.startswith("GQA_")
         and isinstance(table, dict)
         and table
         and all(isinstance(key, int) for key in table)
@@ -272,7 +279,11 @@ class SpStep:
         self.layers = layers = runtime.layers
         for decoder in layers:
             sp_layer(decoder, self)
-        self.draft_tables = check_stock_drafter(ctx.tp)
+        # The release (GQA) drafter's pieces are its own strict build's; the preview
+        # (MLA) drafter is the declared stock module but for its attention.
+        spec = get_current_vllm_config().speculative_config
+        self.gqa_drafter = is_gqa_dspark(spec)
+        self.draft_tables = () if self.gqa_drafter else check_stock_drafter(ctx.tp)
         self.aux_layers = tuple(backbone.aux_hidden_state_layers)
         self.buffers: dict[str, torch.Tensor] = {}
         owner = runtime.group, self.device, ctx.tp, ctx.rank
@@ -302,14 +313,21 @@ class SpStep:
         if ctx.rank == 0:
             for line in self.table.lines():
                 logger.info("Kimi K3 SP decode coverage %s", line)
+        drafter = (
+            "the release (GQA) DSpark drafter's pieces are its strict build's "
+            "(runtime.draft GqaDraftFastPath)"
+            if self.gqa_drafter
+            else f"the DSpark drafter stays the stock module but for its attention "
+            f"(TP{ctx.tp} entries only in FAST_DCP of {len(self.draft_tables)} "
+            "drafter tables)"
+        )
         logger.info_once(
             "Kimi K3 SP decode (TP%d = DCP%d over DP%d, EP%d, q%d, rows %d-%d, %d "
             "graphs): %d SP blocks (%s), RecoverSSM %s; SP mailboxes %.0f MiB "
-            "symmetric; the DSpark drafter stays the stock module but for its "
-            "attention (TP%d entries only in FAST_DCP of %d drafter tables)",
+            "symmetric; %s",
             ctx.tp, ctx.dcp, ctx.dp, ctx.ep, self.q, rows[0], rows[-1], len(rows),
             len(self.blocks), "/".join(sorted(kinds)), self.records,
-            self.comm.nbytes() / 2**20, ctx.tp, len(self.draft_tables),
+            self.comm.nbytes() / 2**20, drafter,
             scope="global",
         )  # fmt: skip
 
@@ -336,8 +354,9 @@ class SpStep:
             "final_gather": "stock sp_all_gather",
             "lm_head": "stock",
             "sampler": "stock",
-            "drafter": DRAFTER_NOTE,
         }
+        if not self.gqa_drafter:
+            declared["drafter"] = DRAFTER_NOTE
         if self.moe:
             declared["moe"] = f"stock MegaMoE on the shard (EP{ctx.ep})"
         if self.dense:
