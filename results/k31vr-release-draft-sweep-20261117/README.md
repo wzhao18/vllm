@@ -27,6 +27,7 @@ Everything else is the frozen sweep's render: topology, concurrency, precision a
 | C48 1P1D | 15,544 -> 15,934 (+2.5%) | 296.1 -> 367.2 (+24.0%) | 0.73 -> 0.71 | 0.9674 -> 0.9788 | 4.793 (7) |
 | C64 | 20,778 -> 21,527 (+3.6%) | 232.8 -> 300.0 (+28.9%) | 0.85 -> 0.96 | 0.9689 -> 0.9803 | 4.807 (7) |
 | C128 1P1D | 32,194 -> 33,119 (+2.9%) | 184.6 -> 212.2 (+14.9%) | 3.20 -> 3.00 | 0.9719 -> 0.9788 | 3.293 (3) |
+| C512 | 73,736 -> 64,045 (-13.1%) | 80.3 -> 85.5 (+6.5%) | 6.43 -> 16.21 | 0.9659 -> 0.9788 | 3.248 (3) |
 <!-- /CMP -->
 
 ## Points
@@ -40,6 +41,7 @@ Everything else is the frozen sweep's render: topology, concurrency, precision a
 | C48 1P1D | 1P1D: P TP8+DCP8, D TP16+DCP16 (24) | C48-1P1D-a1118778 | 15,934 | 367.2 | 177.8 | 6.1 | 0.71 | 0.9788 | **yes** |  |
 | C64 | 1P1D: P TP8+DCP8, D TP16+DCP16 (24) | C64-a1118777 | 21,527 | 300.0 | 136.3 | 7.2 | 0.96 | 0.9803 | **yes** |  |
 | C128 1P1D | 1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag off) (24) | C128-1P1D-a1118779 | 33,119 | 212.2 | 61.5 | 11.6 | 3.00 | 0.9788 | **yes** |  |
+| C512 | 1P1D hybrid: P and D each DP4 x (TP4+DCP4), EP16 (32) | C512-a1118813 | 64,045 | 85.5 | 8.5 | 35.5 | 16.21 | 0.9788 | **yes** | REGRESSION under root-cause: -13% tput, p90 TTFT 16.2s vs frozen 6.4s (xdr IB vs frozen spx RoCE; real vs test weights); not accepted yet |
 <!-- /POINTS -->
 
 ![per GPU](pareto4_per_gpu.png)

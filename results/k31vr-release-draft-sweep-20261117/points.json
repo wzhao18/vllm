@@ -119,6 +119,26 @@
    "p90_e2el_s": 11.641,
    "p90_ttft_s": 3.005,
    "p50_ttft_s": 0.927
+  },
+  {
+   "label": "C512",
+   "run": "C512-a1118813",
+   "topology": "1P1D hybrid: P and D each DP4 x (TP4+DCP4), EP16",
+   "chosen": true,
+   "note": "REGRESSION under root-cause: -13% tput, p90 TTFT 16.2s vs frozen 6.4s (xdr IB vs frozen spx RoCE; real vs test weights); not accepted yet",
+   "gsm8k_strict": 0.9788,
+   "gsm8k_real_al": 3.248,
+   "k": 3,
+   "gpus": 32,
+   "ok": 55887,
+   "err": 10,
+   "span_min": 60.5,
+   "tput_per_gpu": 64045.4,
+   "p90_intvty": 85.48,
+   "p90_e2e_norm_intvty": 8.5,
+   "p90_e2el_s": 35.497,
+   "p90_ttft_s": 16.212,
+   "p50_ttft_s": 11.667
   }
  ]
 }
