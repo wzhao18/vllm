@@ -1,25 +1,50 @@
 {
- "side": "prefill",
- "step_ms": 825,
- "shape": "DEP16 F16K (3 x 5,456 tok) at L78K, NVFP4",
- "state": "queued",
- "owner": "unassigned",
- "basis": "PROJECTED (reviewed ledger, perf-model/plan/nvfp4_ledgers_summary.txt)",
- "updated": "2026-11-18T12:40-08:00",
- "work": [],
- "evidence": [
-  "perf-model/plan/PLAN_NVFP4.md"
- ],
  "id": "P-MLA",
  "title": "Prefill: sparse MLA + prologue",
+ "side": "prefill",
+ "owner": "P-MLA workflow agent",
+ "state": "analysis",
+ "updated": "2026-11-18T12:45-08:00",
+ "shape": "DEP16 F16K (3 x 5,461 tok) at L78K, NVFP4, 96 heads/GPU, top-2048, FP8 KV 576 B rows; 24 DSA layers",
+ "step_ms": 825,
  "baseline_ms": 67,
  "current_ms": 67,
- "achievable_ms": 16,
+ "achievable_ms": 15.9,
  "target_ms": 17.5,
- "gap_analysis": "Generation-phase trtllm-gen kernel on 3072 ShardQ rows at ~30% of FP8 MMA rate; 96->128 head padding; V512 split possibly recomputes QK (hypothesis); separate quant/pad/insert prologue kernels plus an unidentified 1 ms CuTe kernel.",
+ "basis": "MEASURED in-step at F8K x2 (perf-model/microbench/results/prefill rows.json P3-16 pf8k_L78k: sparse_mla 25.43 ms incl. index_remap 0.69, prologue+aux 6.55, gate_mul 1.69 per step); model ach from out/optables.json 'nvfp4_modelopt|P3-16|prefill' (DSA.sparse_mla 643.1 us + DSA.prologue 10.9 us + DSA.gate_mul 7.7 us per layer x 24)",
+ "gap_analysis": "Per F8K step (in-step, release tree): trtllm-gen decode-form fmhaSm107a (QkvE4m3 HQk576 HV512 HVPerCta256 SparseP1 Q64Kv128 2Cta) 24.74 ms = 3.2x its model share; standalone at F16K (ops1 sparse_mla-161) 2480 us/layer vs 643 us model ach. Prologue 6.55 ms (scaled_fp8_quant 2.60, _pad_query_heads 2.06, concat_and_cache_mla 0.84, plus ~1 ms unidentified), gate_mul 1.69 ms. Code reading (this tree): at TP1/DCP1 the in-place RoPE concat path leaves q_pe empty, so quantize_decode_query (the fused quant+pad Triton kernel) is skipped and quant + pad run as two passes over a 1.1 GB/1.5 GB query; trtllm-gen writes a 128-head BF16 output that w_uv reads through a strided [:, :96] view. Kernel-level root cause of the 3.2x is not yet measured (ncu run1 queued).",
  "inefficiencies": [
-  "Decode-form kernel used for prefill",
-  "Head padding",
-  "Unfused prologue"
+  "Decode-form trtllm-gen kernel used for prefill: one token per request, 2048 KV rows gathered per token (MEASURED in-step time; per-cause split pending ncu)",
+  "96 -> 128 head padding: 25% of MMA work wasted plus a padded query copy and 128-head output (MEASURED kernel names; cost share pending ncu)",
+  "HVPerCta256: V512 split across CTAs may recompute QK per V half (HYPOTHESIS, ncu pending)",
+  "Query quant and head pad are two separate full passes (scaled_fp8_quant + _pad_query_heads) because the in-place RoPE concat disables the fused quant_pad kernel (code reading, MEASURED 4.66 ms/F8K step)",
+  "gate_mul is a separate pass over the [T, 12288] BF16 output (MEASURED 1.69 ms/F8K step)",
+  "Unidentified ~1 ms kernel in the DSA prologue (to identify in a profile)"
+ ],
+ "rubin_features": [
+  "tcgen05 FP8 (kind::f8f6f4) MMA with TMEM accumulators, 2-CTA pairs",
+  "extended TMEM column budget on sm_107 (fits S and the full 512-wide O for a 96-head tile)",
+  "TMA gather4 / async bulk copies for paged KV row gather",
+  "redux.sync f32 max for cross-lane softmax reductions (transposed-tile design option)",
+  "PDL (programmatic dependent launch) between prologue, attention and w_uv"
+ ],
+ "plan": [
+  "1. Measure the stock chain kernel by kernel at F8K/F16K on 1 GPU (bench in branch) and ncu the trtllm-gen kernel: tensor pipe %, DRAM/L2 bytes, QK recompute check",
+  "2. Bench FlashInfer prims_ts sparse MLA at 96/128 heads as an existing alternative (per-shape dispatch candidate)",
+  "3. Quick prologue win: one fused kernel for RoPE-concat + FP8 quant + (if still needed) head pad; fuse gate_mul into the w_uv bmm epilogue (bitwise vs stock)",
+  "4. New prefill-form CuTe DSL sparse MLA (sm_107): native 96 heads, single QK per KV tile feeding the full 512-wide O in TMEM, double-buffered paged-KV gather, FP8 KV as stored",
+  "5. Unit tests vs stock (tolerance of the stock FP8-P kernel), microbench at F8K/F16K vs model, then step A/B on the INFRA 1-node harness"
+ ],
+ "work": [
+  {"t": "12:40", "what": "Read plan, ledgers, microbench rows; traced the DEP16 DSA path in this tree (dsa.py -> mla_attention.forward_impl -> flashinfer_mla_sparse trtllm-gen)", "result": "stock chain identified; quant+pad unfused due to in-place concat path (code reading)"},
+  {"t": "12:45", "what": "Wrote benchmarks/kernels/benchmark_kimi_k3_prefill_sparse_mla.py (stock chain per kernel + prims_ts + ncu script); staged overlay p-mla-4fbaa15-1; run1 queued on the 1-GPU pool", "result": "waiting for a pool hold (all k31ws holds pending)"}
+ ],
+ "next": "run1 results (runs/P-MLA/run1): per-kernel times + ncu of fmhaSm107a; meanwhile design the prefill-form kernel",
+ "blockers": "No running k31ws pool hold at 12:45 (hold1 jobs pending); run1 waits in wsgpu.sh",
+ "branch": "wzhao/k31ws-p-mla @ 4fbaa15189 (bench uncommitted)",
+ "evidence": [
+  "perf-model/microbench/results/prefill/rows.json (P3-16 pf8k_L78k DSA rows)",
+  "perf-model/microbench/results/ops1/rows.json sparse_mla-161",
+  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-MLA/run1"
  ]
 }

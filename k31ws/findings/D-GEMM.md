@@ -1,0 +1,2 @@
+- 2026-11-18 12:35 D3-32 nvfp4 r24 model achievable for the decode dense GEMM family (KDA in/f_b/o, DSA qkv_a+g, q_b+wq_b, DSA o, router, latent down/up, shared gu/down) = 2.80 ms; the mxfp4 tree's same ops = 4.60 ms. Seeded status achievable 4.7 was the mxfp4 number.
+- 2026-11-18 13:10 B4 blocker confirmed in code: sdec providers.bf16_weight refuses the online-MXFP8 KDA in/o_proj and shared experts, and kda/sp.py read the in_proj pitch from weight.shape[0] (wrong for the CuTe DSL MXFP8 [K,N] view). First-cut MXFP8 path on wzhao/k31ws-d-gemm.

@@ -1,0 +1,1 @@
+- 2026-11-18 14:05 FusedConv K1 (short conv in FlashKDA prepare's load path; V conv output for K2) implemented on wzhao/k31ws-p-kda 218581f271; removes the separate conv pass (model prices conv with zero activation bytes). Untested: pool holds pending.

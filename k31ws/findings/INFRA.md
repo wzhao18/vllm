@@ -1,0 +1,5 @@
+# INFRA findings (one line each, dated)
+
+- 2026-11-18 12:45 Step benches for everyone: `k31ws/tools/step_d.sh` (D3-32 one DP rank, -g 4), `step_p.sh` (P3-16 DEP4 slice, -g 4), `step_multi.sh d8|p16` (8-node pool hold). Usage + slice deviations: `k31ws/tools/stepbench/README.md`. Pass your overlay tag; results under `k31ws/runs/<ID>/`.
+- 2026-11-18 12:45 Harness bug in the old rhea1n slice: the specialized decode reads `moe.gate.weight` in its fused MoE front, so `--routing balanced` never reached the sdec graph and each GPU touched all 224 local experts (8x deployed EP32 expert weight traffic). Any 1-node decode MoE number taken before this fix overstates MegaMoE. step_d.sh now emulates 28 experts/GPU (bench-only bias mask, `--emulate-ep 32`).
+- 2026-11-18 12:45 L24 model achievable (bench scope, same layer counts as the slice): decode r8/r16/r24 = 3.07/3.65/4.37 ms MXFP4, 2.74/3.30/3.88 ms NVFP4; prefill P3-16 F16K = 257 ms MXFP4, 165 ms NVFP4 (93-layer: 825 / 533 ms). Rows in `k31ws/tools/stepbench/model_rows_L24*.json`, `pf_model_rows_L24.json`.

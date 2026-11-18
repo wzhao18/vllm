@@ -1,26 +1,45 @@
 {
- "side": "decode",
- "step_ms": 30.5,
- "shape": "D3-32 r24: 96 requests / DP rank (384 verify rows), L\u2248135K, k=3",
- "basis": "gap512 EP16 in-step profile B92 (r23), MegaMoE moved to EP32 from the 8-node step delta",
- "state": "queued",
- "owner": "unassigned",
- "updated": "2026-11-18T12:40-08:00",
- "work": [],
- "evidence": [
-  "perf-model/microbench/results/gap512/parsed/decode_families.txt"
- ],
  "id": "D-TOPK",
  "title": "Decode: DSA exact top-k + DCP merge",
+ "side": "decode",
+ "owner": "D-TOPK agent",
+ "state": "analysis",
+ "updated": "2026-11-18T13:20-08:00",
+ "shape": "D3-32 r24: 96 requests / DP rank (384 verify rows), L≈135K (local ≈33.75K on DCP4), k=3; also r1 (16 rows), r8 (128 rows)",
  "baseline_ms": 2.3,
  "current_ms": 2.3,
- "achievable_ms": 0.22,
+ "achievable_ms": 0.227,
  "target_ms": 0.25,
- "gap_analysis": "topk_merge_kernel<16> 52-77 us/layer vs 6-7 modelled; pp hist/window/win passes 25-45 us vs 1.4; merge grid [2, rows] walks 4 ranks x 2048 candidates serially with remote NVLink reads and flag polls; logits re-read three times; on the critical stream.",
+ "step_ms": 30.5,
+ "basis": "baseline MEASURED in-step (gap512 EP16 B92 profile); achievable = rhea1n model_rows B96_L135K: DSA.topk 46.1 us + P8 DCP top-k merge 180.7 us per step (24 DSA layers: 1.9 + 7.5 us/layer); r8 (B32): 15.4 + ~154 us",
+ "gap_analysis": "Seeded from gap512: topk_merge_kernel<16> 52-77 us/layer vs 6-7 modelled; topk_pp_hist/window/win 25-45 us vs 1.4. Code read (dcp_exchange decode wiring): launch_params bounds the local length by max_model_len/DCP (1M/4 = 262144 keys), which forces cluster=2 CTAs per row (WRITE bitmap holds 131072 keys/CTA) and segmax=0 (keys streamed from global) at every batch, and the pre-pass on, independent of the real contexts (~34K local). PDL is hard-off on the merge (s_pdl_rows = 0) because the trtllm-gen sparse core reads counts before griddepcontrol.wait. Phase breakdown pending (bench with per-row dbg stamps).",
  "inefficiencies": [
-  "2 CTAs per row serial merge over remote reads",
-  "Three passes over logits",
-  "PDL off on the merge",
-  "Critical-stream placement"
+  "launch shape bounded by max_model_len (1M), not the step's contexts: 2 CTAs/row + streamed keys + pre-pass everywhere (code read; cost to be measured)",
+  "pre-pass = 3 kernels (hist, window, win) + merge kernel WRITE pass: logits read >= 3x (code read)",
+  "merge kernel PDL off (consumer reads counts before its wait); serial launch chain on the critical stream",
+  "1 NVLink round + tie round per row with flag polls in 2 CTAs/row (hypothesis: latency-bound, to be measured with dbg stamps)"
+ ],
+ "rubin_features": [
+  "NVLink multicast (multimem.st) for the candidate/histogram exchange",
+  "thread-block clusters + DSMEM for per-row parallel histogram reduce",
+  "PDL (griddepcontrol) chaining with the indexer logits kernel and the sparse core",
+  "TMA bulk loads of logits tiles"
+ ],
+ "plan": [
+  "1. 4-GPU microbench (DCP4 group) of the in-tree DcpExchange top-k at r1/r8/r24, L=135K, realistic logits; per-kernel CUPTI times + per-row phase stamps + path stats",
+  "2. root-cause the merge/pre-pass time (ncu on the merge kernel)",
+  "3. redesign: single-pass histogram select over the whole GPU, one multicast exchange, parallel resolve + WRITE, PDL",
+  "4. exactness unit test vs stock (bitwise selection sets), graph-safe tie/overflow path",
+  "5. microbench vs model at r1/r8/r24; step A/B with INFRA harness; landed-ready"
+ ],
+ "work": [
+  {"t": "13:20", "what": "read directives, model rows, gap512, dcp_exchange code; worktree /Users/weizha/k31ws-wt/d-topk on wzhao/k31ws-d-topk @ 4fbaa15189", "result": "model target per layer r24: 1.9 us topk + 7.5 us merge; found max_model_len-bound launch shape (cluster 2, streamed, pre-pass) at every batch"}
+ ],
+ "next": "write the 4-GPU DCP4 top-k microbench and run it on a pool node (-g 4)",
+ "blockers": "no k31ws pool hold running yet (hold1/hold8 pending)",
+ "branch": "wzhao/k31ws-d-topk @ 4fbaa15189",
+ "evidence": [
+  "perf-model/microbench/results/gap512/parsed/decode_families.txt",
+  "perf-model/microbench/rhea1n/model_rows.json (B32/B96 DSA.topk + COMM.P8)"
  ]
 }

@@ -1,13 +1,48 @@
 {
- "side": "infra",
- "state": "queued",
- "owner": "unassigned",
- "updated": "2026-11-18T12:40-08:00",
- "work": [],
- "basis": "-",
- "shape": "-",
  "id": "HW",
  "title": "Vera Rubin hardware reference database",
- "gap_analysis": "Every kernel workstream needs the VR200-specific features (tcgen05 block-scaled MMA shapes, TMEM, 2-CTA, TMA multicast/.COUNTED, CLC, PDL, locality domains, NVLink6 multimem) and their measured costs in one place.",
- "next": "Build the private hwdb and the per-workstream feature briefs."
+ "side": "infra",
+ "owner": "HW agent (workflow)",
+ "state": "implementing",
+ "updated": "2026-11-18T12:50-08:00",
+ "shape": "-",
+ "basis": "internal docs + local source + our measurements (private hwdb; numbers not reproduced here)",
+ "gap_analysis": "v1 of the private hwdb is live: INDEX with ten key facts, 11 topic files (block-scaled MMA 2x-K forms and rates, TMEM exclusive allocation, oversized shared memory, clusters, TMA incl. counted stores and gather4, launch/PDL/CLC costs, SM resources and FP32 rate, HBM/L2/locality domains, NVLink6/multimem, build arch and CuTe DSL support, worked examples) and 13 workstream briefs with features, design hints and the hardware limit at each deployed shape. Key new confirmations: mixed MXFP8 x MXFP4 MMA runs at the FP8 rate (only FP4 x FP4 gets the FP4 rate); the 2x-K form is selected by instruction-descriptor bits on sm_107a only; counted TMA stores signal completion at the destination; CLC is supported but static scheduling wins for small decode work. Model observations for owners: decode expert rows already assume die-local HBM, dense decode rows the default rate (die-localizing dense weights can beat model achievable); the prefill indexer-score row is costed at roughly the sm_100-form FP8 rate, below what a native kernel can reach.",
+ "inefficiencies": [
+  "Hardware probes (FFMA/FFMA2 rate, oversized shared memory launch + occupancy, graph/PDL per-kernel cost, die-local bandwidth, legacy HMMA, MUFU, shared atomics, L2 residency across kernels, cross-die L2 caching) are queued on the Rhea pool; no free GPU yet",
+  "Some Rubin ISA features (counted TMA stores, early A-buffer release, descriptor circular buffers, TMA L2 management) have no confirmed PTX/CuTe DSL spelling yet"
+ ],
+ "rubin_features": [
+  "tcgen05 2x-K block-scaled MMA (sm_107a)",
+  "TMEM exclusive 576-column allocation",
+  "oversized shared memory mode",
+  "32-CTA clusters / DSMEM",
+  "TMA counted stores and reductions, gather4, multicast",
+  "locality domains: die-local VMM allocation, green contexts per die",
+  "PDL, cluster launch control",
+  "NVLink6 multimem / NVLS"
+ ],
+ "plan": [
+  "v1 database: INDEX + topics + all briefs (done)",
+  "Answer workstream requests every ~20 min",
+  "Measure on Rhea: hw1 (attrs, FFMA/FFMA2, oversized smem, launch/PDL) + e6 die-local BW; hw2 (HMMA, MUFU, smem atomics, L2 residency, cross-die L2)",
+  "Internal-doc queries: smem operand bandwidth, M64 rate, f8f6f4 2x-K, cross-die L2, HMMA, MUFU, NVLink small-message latency",
+  "4-GPU probes: peer store latency, multimem.st / ld_reduce small-message latency, counted TMA store if ptxas accepts it",
+  "sm_107-native vs sm_100f block-scaled MMA rate microbench (CuTe DSL dense GEMM)"
+ ],
+ "work": [
+  {"t": "12:05", "what": "Read campaign directives, schema, all workstream status files, memory notes, internal-doc notes, FlashInfer a368c5f66 sm107 MegaMoE and sdec trees", "result": "source inventory for hwdb"},
+  {"t": "12:20", "what": "Internal-doc queries (batch 1-2)", "result": "confirmed mixed FP8xFP4 rate = FP8 rate; 2x-K idesc encoding; counted TMA semantics; oversized smem attributes; CLC on Rubin; locality-domain attributes; PDL proxy"},
+  {"t": "12:30", "what": "Wrote bench/hw1_probe.cu + run_hw1.sh (toolchain census, attrs, FFMA/FFMA2, oversized smem, graph/PDL launch) + reused e6_ldbw.cu; queued on Rhea pool (-g 1)", "result": "waiting for a free GPU"},
+  {"t": "12:45", "what": "hwdb v1 published: INDEX, 11 topics, 13 briefs, mirrored to Lustre", "result": "/Users/weizha/k31ws-hwdb"},
+  {"t": "12:50", "what": "Answered requests D-TOPK-1, P-MLA-1, P-KDA-1 (v1; measured items pending); wrote hw2_probe.cu (HMMA, MUFU, smem atomics, L2 residency, cross-die L2) + redux_f32.cu, queued on Rhea", "result": "answers in hwdb/requests/*.answer.md"}
+ ],
+ "next": "Collect hw1/hw2 results from /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/HW/{hw1,hw2}/log, fold into topics and the three request answers; poll hwdb/requests; integrate internal-doc batch 3 answers",
+ "blockers": "Rhea pool had no running holds at 12:30 (holds pending); probes wait in wsgpu.sh queue",
+ "branch": "- (no code branch; private hwdb at /Users/weizha/k31ws-hwdb)",
+ "evidence": [
+  "/Users/weizha/k31ws-hwdb/INDEX.md",
+  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/hwdb",
+  "/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/HW"
+ ]
 }

@@ -1,26 +1,58 @@
 {
- "side": "decode",
- "step_ms": 30.5,
- "shape": "D3-32 r24: 96 requests / DP rank (384 verify rows), L\u2248135K, k=3",
- "basis": "gap512 EP16 in-step profile B92 (r23), MegaMoE moved to EP32 from the 8-node step delta",
- "state": "queued",
- "owner": "unassigned",
- "updated": "2026-11-18T12:40-08:00",
- "work": [],
- "evidence": [
-  "perf-model/microbench/results/gap512/parsed/decode_families.txt"
- ],
  "id": "D-ATTN",
  "title": "Decode: DSA attention path (q path, sparse MLA, DCP value, indexer)",
+ "side": "decode",
+ "owner": "D-ATTN workflow agent",
+ "state": "implementing",
+ "updated": "2026-11-18T12:45-08:00",
+ "shape": "D3-32 r24: 96 requests / DP rank (384 verify rows), L~135K, k=3 (per GPU: 24 of 96 heads, DCP4 KV shard)",
  "baseline_ms": 3.3,
  "current_ms": 3.3,
  "achievable_ms": 1.3,
  "target_ms": 1.45,
- "gap_analysis": "MlaQuery q path 28-50 us/layer vs 5-10; sparse MLA fmha 18.7 us vs 5 at B50 (96->128 head padding, per-row 2048-row gather); indexer re-streams keys for each of a request's 4 verify rows.",
+ "step_ms": 30.5,
+ "basis": "MEASURED in-step gap512 EP16 D3 B80/B92cap profiles (perf-model/microbench/results/gap512/parsed); D3-32 r24 transfer",
+ "gap_analysis": "Per DSA layer at B92 (368 rows, gap512 in-step): MlaQuery 89 us (side stream, forked against the indexer chain), QueryWait 46 us (polls other ranks' publishes), trtllm-gen sparse MLA 32 us + LSE 1.3 us, DcpValue 25 us, paged_mqa_logits 35 us, DsaIndex 8.5 us; the indexer wq_b split-K GEMM on the main stream runs 62 us while MlaQuery holds the SMs (model ach ~4 us). Model ach per layer at r24: q path (qb_wq+w_uk) ~5 us + P6 q publish ~17 us, sparse_mla ~9.6 us, P7b+w_uv ~13 us, idx_score ~18 us. MlaQuery tiles 64 rows x 24 heads into 8-CTA per-head clusters (1152 CTAs at 368 rows, ~6.5 cluster rounds) and keeps the GB300 schedule for DSA (Rubin staging disabled): HYPOTHESIS that its time is cluster-round latency, not bytes or FLOPs (measuring standalone now).",
  "inefficiencies": [
-  "96->128 head padding",
-  "Per-row KV re-gather",
-  "Unfused q path",
-  "Indexer 4-row key re-streaming"
+  "MlaQuery: per-head 8-CTA cluster tiling, ~6.5 rounds at 368 rows, 89 us vs ~5 us of GEMM work (hypothesis: round latency; standalone bench running)",
+  "P6 q publish: 24 heads x 576 B x R rows multicast to 3 peers (~16 MB/layer at r24) + QueryWait cross-rank poll on the critical path",
+  "Sparse MLA trtllm-gen: 96->128 head padding (+33% MMA), per-row 2048-row KV gather (no sharing across a request's 4 verify rows), 32 us vs ~10 model",
+  "DcpValue proj: 25 us vs ~9 model (P7b push + W_UV + LSE merge)",
+  "Indexer logits: each of a request's 4 verify rows re-streams the keys (35-46 us vs 18 model)"
+ ],
+ "rubin_features": [
+  "tcgen05 UMMA (FP8 / block-scaled MXFP4) with TMEM accumulators",
+  "2-CTA (cta_group::2) MMA",
+  "TMA gather4 for paged KV / index-key row gathers",
+  "PDL chaining",
+  "NVLink multicast only where a push beats local recompute"
+ ],
+ "plan": [
+  "1. Measure standalone (1 GPU, deployed rows 128/256/384/512): MlaQuery vs cuBLAS q_b GEMM + W_UK bmm for 24 and all 96 heads",
+  "2. q path redesign: each rank already holds every gathered row's q_a, so compute all 96 heads' FP8 query locally (gathered W_qb / W_UK at build) and drop the P6 publish + QueryWait poll; KV insert of owned slots stays",
+  "3. Sparse MLA: native 96-head FP8 decode sharing each request's gathered KV across its 4 verify rows (ncu the trtllm-gen kernel first)",
+  "4. DcpValue: re-measure after 2-3; fuse W_UV + push",
+  "5. Joint 4-row indexer logits",
+  "6. Unit tests vs stock + microbench vs model at r1/r8/r24, step A/B on INFRA harness"
+ ],
+ "work": [
+  {
+   "t": "12:15",
+   "what": "read gap512 in-step evidence; worktree wzhao/k31ws-d-attn @ 4fbaa15189",
+   "result": "D-ATTN family at B92: MlaQuery 89 + QueryWait 46 + fmha 32 + DcpValue 25 + logits 35 us/layer"
+  },
+  {
+   "t": "12:40",
+   "what": "implemented LocalQuery (all 96 heads per rank, no P6 publish / QueryWait / q-mailbox re-arm) for SP rows 17-512; DcpValue rearm flag; unit test vs stock; q-path + sparse-MLA microbenches",
+   "result": "committed 33b0d1996f, pushed; GPU runs queued (runs/D-ATTN/run1.log, run2.log), waiting for a pool hold"
+  }
+ ],
+ "next": "read runs/D-ATTN/run1.log (unit test + q-path bench: MlaQuery vs LocalQuery at R 128/256/384/512) and run2.log (trtllm-gen sparse MLA + ncu at R384); then 4-GPU SP DSA layer A/B",
+ "blockers": "pool: no k31ws hold running since 12:15 PT (hold1 x5 and hold8 pending)",
+ "branch": "wzhao/k31ws-d-attn @ 33b0d1996f",
+ "evidence": [
+  "perf-model/microbench/results/gap512/parsed/dec_B80.json",
+  "perf-model/microbench/results/gap512/parsed/dec_B92cap.json",
+  "rhea:/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/D-ATTN/"
  ]
 }

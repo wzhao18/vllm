@@ -1,13 +1,40 @@
 {
- "side": "infra",
- "state": "queued",
- "owner": "unassigned",
- "updated": "2026-11-18T12:40-08:00",
- "work": [],
- "basis": "-",
- "shape": "-",
  "id": "INFRA",
  "title": "Node pool, 1-node emulations, profiling and integration branch",
- "gap_analysis": "Kernel work must iterate on 1-4 GPUs while 8-node EP32 holds queue: 1-node DP-rank slice of D3-32 and a 1-node DEP16 slice, per-family profile parser vs model at the same shapes, integration branch for verified wins.",
- "next": "Take over the Rhea 1-node D3-32 profile, build the DEP16 1-node slice."
+ "side": "infra",
+ "owner": "INFRA agent (workflow)",
+ "state": "measuring",
+ "updated": "2026-11-18T12:45-08:00",
+ "shape": "D3-32 DP-rank slice (1 node, DCP4, EP4 emulating EP32) r8/r16/r24 at L132K; P3-16 DEP4-on-1-node slice (EP4 emulating EP16) F16K/F8K at L78K; 24-layer view",
+ "basis": "-",
+ "gap_analysis": "Slices ready, first baselines queued. Key harness finding: the specialized decode fuses the MoE router GEMM into its front (reads moe.gate.weight + e_score_correction_bias directly), so the bench's --routing balanced fixture never reached the sdec graph; with dummy router weights each GPU of a 4-GPU slice touched all 224 local experts, 8x the deployed EP32 expert weight traffic (a 24-layer r8 slice measured 12.2 ms vs a 9.9 ms model achievable for the full 93-layer step). Fixed in the bench (no production change) by an expert-count emulation that restricts routing to 28 experts / GPU (decode) or 56 (prefill) at the deployed token-expert pairs per GPU.",
+ "inefficiencies": [
+  "Slice deviation: 24-layer view (896 experts x 93 layers do not fit at EP4); model rows rescaled to the same layer counts",
+  "Slice deviation: MegaMoE dispatch/combine over 4 GPUs instead of 32 (decode) / 16 (prefill)",
+  "Slice deviation: DSpark preview drafter (24-layer target ids)"
+ ],
+ "rubin_features": [],
+ "plan": [
+  "Pool: holdd-ws health + holdd.conf tuned to demand (T1 8, P1 6), poolsnap every ~20 min",
+  "step_d.sh (D3-32 DP-rank slice, wsgpu -g 4, per-overlay build) + per-family table vs model achievable: DONE, first profiled baseline queued",
+  "step_p.sh (P3-16 DEP4 slice) + pf_fam.py per-family table: script DONE, baseline queued; parser after first trace",
+  "step_multi.sh d8 / p16 for the hold8 job: DONE (dry-run cfg OK), launch when hold8 nears start",
+  "NVFP4 views of both slices once EN lands loading (model rows already generated for nvfp4_modelopt)",
+  "Integration branch wzhao/k31ws-int (worktree /Users/weizha/k31ws-wt/int): merge landed-ready workstreams + tests + step A/B"
+ ],
+ "work": [
+  {"t": "12:35", "what": "claimed; worktree /Users/weizha/k31ws-wt/infra (wzhao/k31ws-infra) + wzhao/k31ws-int at 4fbaa15189 pushed to wzhao18; holdd-ws running", "result": "hold1 x3 + hold8 pending"},
+  {"t": "12:40", "what": "ported rhea1n harness to k31ws/tools/stepbench (nq_step.py, cfg2bench, shapes, gap_parse/fam) + step_d.sh / step_inner.sh (4 local ranks in one wsgpu -g 4 task)", "result": "cfg/shape dry-run OK on login node"},
+  {"t": "12:42", "what": "root-caused the slice's MoE deviation: sdec reads moe.gate.weight in its fused front, so the routing fixture never applies to the sdec graph; added bench-only expert-count emulation (selection-bias mask, emulation-aware balanced fixture)", "result": "28 experts/GPU decode, 56/GPU prefill; to be confirmed in the first run log ('NQ: expert emulation')"},
+  {"t": "12:44", "what": "step_p.sh (P3-16 DEP4 slice), step_multi.sh (d8 full D3-32, p16 full DEP16), mk_model_rows.py (L24 model rows, mxfp4_release + nvfp4_modelopt, decode + prefill)", "result": "L24 model ach: decode r8/r16/r24 3.07/3.65/4.37 ms MXFP4, 2.74/3.30/3.88 NVFP4; prefill F16K 257 ms MXFP4, 165 ms NVFP4"},
+  {"t": "12:46", "what": "pool: 8 agents waiting for ~18 GPUs; holdd.conf T1 8 P1 6 C1 60 IDLE_MIN 45", "result": "first hold1 est 13:06 PST, hold8 est 03:11 tomorrow"}
+ ],
+ "next": "First hold: profiled base step_d r8/r16/r24 + step_p F16K/F8K (queued under wsgpu); then write per-family baselines to k31ws/measured/ and tell owners.",
+ "blockers": "Rhea queue: hold1 requests start 13:06-15:30 PST; hold8 ~03:11 tomorrow.",
+ "branch": "wzhao/k31ws-infra @ 4fbaa15189; wzhao/k31ws-int @ 4fbaa15189",
+ "evidence": [
+  "k31ws/tools/stepbench/README.md",
+  "k31ws/tools/step_d.sh, step_p.sh, step_multi.sh",
+  "Rhea: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/INFRA/"
+ ]
 }

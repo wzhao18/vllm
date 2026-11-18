@@ -1,13 +1,19 @@
 {
- "side": "infra",
- "state": "queued",
- "owner": "unassigned",
- "updated": "2026-11-18T12:40-08:00",
- "work": [],
- "basis": "-",
- "shape": "-",
  "id": "EN",
  "title": "NVFP4 checkpoint enablement",
+ "side": "both",
+ "owner": "EN agent (workflow)",
+ "state": "analysis",
+ "updated": "2026-11-18T15:25-08:00",
+ "shape": "P3-16 F16K L78K and D3-32 r8 (load + smoke; no kernel timing owned)",
+ "basis": "-",
  "gap_analysis": "No NVFP4 number exists: MegaMoE format hard-coded to MXFP4 (model.py:816), Rubin MegaMoE refuses NVFP4 scales (experts.py:289/442), no NVFP4 EP32 decode backend, specialized decode raises on MXFP8 projections.",
- "next": "Native ModelOpt NVFP4 load into Rubin MegaMoE + dummy-safe NVFP4 view."
+ "inefficiencies": [],
+ "rubin_features": [],
+ "plan": ["B1 MegaMoE format from checkpoint + ModelOpt name mapping", "B1b native NVFP4 parameter set in megamoe_rubin", "B2 dummy-safe NVFP4 view", "B5 checkpoint facts", "B6 memory feasibility", "MXFP8 stock linears detection", "1-GPU/1-node dummy load + smoke"],
+ "work": [{"t": "15:25", "what": "claimed workstream, worktree /Users/weizha/k31ws-wt/en on wzhao/k31ws-en @ 4fbaa15189", "result": "reading code"}],
+ "next": "Read model.py MegaMoE wiring and megamoe_rubin experts.py load path.",
+ "blockers": "",
+ "branch": "wzhao/k31ws-en @ 4fbaa15189",
+ "evidence": []
 }

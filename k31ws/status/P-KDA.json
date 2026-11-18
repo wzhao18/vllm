@@ -1,25 +1,53 @@
 {
- "side": "prefill",
- "step_ms": 825,
- "shape": "DEP16 F16K (3 x 5,456 tok) at L78K, NVFP4",
- "state": "queued",
- "owner": "unassigned",
- "basis": "PROJECTED (reviewed ledger, perf-model/plan/nvfp4_ledgers_summary.txt)",
- "updated": "2026-11-18T12:40-08:00",
- "work": [],
- "evidence": [
-  "perf-model/plan/PLAN_NVFP4.md"
- ],
  "id": "P-KDA",
  "title": "Prefill: KDA chain (core + conv + gated o_norm)",
+ "side": "prefill",
+ "owner": "P-KDA agent",
+ "state": "implementing",
+ "updated": "2026-11-18T14:10-08:00",
+ "shape": "DEP16 F16K (3 x 5,456 tok) at L78K, NVFP4, 96 KDA heads at TP1, FP32 state (per GPU, per prefill forward, 69 KDA layers)",
  "baseline_ms": 78,
  "current_ms": 78,
- "achievable_ms": 16,
- "target_ms": 18,
- "gap_analysis": "96 heads at TP1 fall off the v-split FlashKDA build: 288 CTAs walk 5.4K tokens chunk-serially; prepare is a separate full pass; conv and gated RMSNorm are standalone HBM passes.",
+ "achievable_ms": 17.4,
+ "target_ms": 19.1,
+ "step_ms": 825,
+ "basis": "PROJECTED (reviewed ledger); model nvfp4_modelopt|P3-16|prefill per layer: conv 55.1 + gate_beta_norm 18.4 + core_prefill 167.0 + o_norm 12.2 = 252.7 us x 69 = 17.4 ms",
+ "gap_analysis": "Model prices conv and o_norm with zero activation bytes (fused into the core's load / store) and core_prefill as one memory-bound pass (2.0 GB/layer: q,k,v,g in, o out). Today: separate fused-QKV conv pass (reads 1.2 GB, writes 1.2 GB), FlashKDA K1 prepare (reads q,k,g, writes three bf16 [T,H,D] workspaces + tiles), K2 recurrence (reads v + workspaces, writes o), separate gated o_norm + MXFP8 quant pass. 96 heads x 3 seqs exceed the in-tree v-split build's one-wave limit, so the stock full-width K2 runs (288 CTAs over 212 SMs, chunk-serial over 341 16-token chunks). Baseline per-kernel breakdown at the deployed shape is being measured.",
  "inefficiencies": [
-  "No 96-head v-split build",
-  "Separate prepare pass",
-  "Unfused conv and o_norm"
+  "No 96-head v-split recurrence build (stock full-width K2, 288 CTAs > 1 wave) [ledger, re-measuring]",
+  "Separate prepare pass K1 with ~1.2 GB workspace round trip [code reading; bytes to be measured]",
+  "Unfused conv (2.4 GB HBM pass) and gated o_norm + MXFP8 quant (~1 GB pass) [code reading]"
+ ],
+ "rubin_features": [
+  "bulk async copies (TMA) for the g / beta / dt_bias tiles, overlapped with the in-load conv",
+  "packed FP32 FMA (fma.rn.f32x2) and packed FP32 mul/add in the conv + SiLU (IEEE per lane)",
+  "planned: tcgen05 MMA with TMEM-resident accumulators for the 96-head recurrence; larger per-SM shared memory for resident state"
+ ],
+ "plan": [
+  "Baseline per-kernel microbench of the chain at F16K and F8K on 1 VR200 GPU (queued)",
+  "Fuse the Q|K|V short conv into FlashKDA prepare (K1 reads raw rows, writes conv V for K2): removes the 2.4 GB conv pass, adds ~0.8 GB (implemented, test pending)",
+  "Fuse gated o_norm + MXFP8 quant into the full-width recurrence epilogue (removes ~0.8 GB o round trip)",
+  "Hide prepare (K1) under the compute-bound recurrence: concurrent K1/K2 with per-tile ready flags (workspace stays in L2)",
+  "Recurrence throughput: balance 288 (seq, head) items over 212 SMs; tcgen05 recurrence (state FP32 in registers/TMEM, MMAs on the tensor core) if ncu shows the legacy MMA pipe bound",
+  "Wire per-shape dispatch in kda.py (stock wiring only), step A/B, landed-ready"
+ ],
+ "work": [
+  {
+   "t": "13:20",
+   "what": "read plan/ledger/model rows/code; worktree /Users/weizha/k31ws-wt/p-kda on wzhao/k31ws-p-kda @ 4fbaa15189; wrote benchmarks/kimi_k3/bench_kda_prefill_chain.py; overlay p-kda-4fbaa15-1",
+   "result": "baseline bench queued on the 1-GPU pool (holds pending)"
+  },
+  {
+   "t": "14:05",
+   "what": "implemented FusedConv K1 variant in ops/flashkda_split (conv_fused.cuh: kda_qkv_conv FP32-weight arithmetic bit for bit, conv state from the first tile), torch op k3_flashkda_split.fwd_conv, specialized_prefill/kda.py:fused_conv_prefill, bitwise unit test vs qkv_conv + FlashKDA, bench --impl stock|split|fused; commit 218581f271 pushed",
+   "result": "GPU test + A/B queued (overlay p-kda-4fbaa15-2); 1-GPU pool has no running hold since 13:15"
+  }
+ ],
+ "next": "run test + stock/split/fused breakdown at F16K/F8K as soon as a 1-GPU hold starts; then ncu K2",
+ "blockers": "k31ws 1-GPU holds all pending (Priority) since 13:15; 16 waiters in the pool",
+ "branch": "wzhao/k31ws-p-kda @ 218581f271",
+ "evidence": [
+  "perf-model/plan/PLAN_NVFP4.md",
+  "perf-model/microbench/results/ops1 kda-077"
  ]
 }

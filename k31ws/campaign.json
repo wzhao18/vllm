@@ -14,7 +14,7 @@
   "Decode r24 (tok/s/GPU)": {
    "now": "2,425 MXFP4",
    "ach": "6,280 NVFP4",
-   "note": "D3-32, 30.5 ms step"
+   "note": "D3-32: 30.5 ms 8-node; 29.8 ms 1-node projection; achievable 13.4 ms"
   }
  },
  "findings": [
@@ -29,6 +29,34 @@
   {
    "t": "11-18",
    "text": "Largest decode gaps (r24, EP16-transferred): BF16 GEMMs 4.2 ms, MegaMoE ~3.4, DCP top-k 2.0, DSA attention 1.7, KDA 1.6, small ops 1.2."
+  },
+  {
+   "t": "11-18 15:40",
+   "text": "Decode baseline MEASURED: 1-node Rhea profile (24-layer view scaled to 93) reproduces the 8-node D3-32 step within 2-4% (r24 29.8 vs 30.5 ms; model achievable 13.4). r24 gaps: BF16 GEMMs 3.5 ms, top-k+merge 2.4, MegaMoE ~2.3 (substituted), DSA attention 1.7, KDA 1.6, small ops 1.1, SP comm 0.8, drafter 0.6, indexer 0.5. SP GEMM table: -3.2/-4.1/-1.3% at r8/16/24."
+  },
+  {
+   "t": "11-18 13:00",
+   "text": "Pool: no Rhea GPU hold has started yet (6 x 1-node + 1 x 8-node pending; cluster full, first start est ~13:50 PST, 8-node ~03:20). 22 GPU requests are waiting; agents are writing kernels and tests meanwhile."
+  },
+  {
+   "t": "11-18 12:45",
+   "text": "INFRA: the earlier 1-node decode slice had all 224 local experts touched per GPU (sdec reads moe.gate.weight, so balanced routing never applied): its MoE row is 8x the EP32 expert traffic; MegaMoE must come from the new emulation."
+  },
+  {
+   "t": "11-18 12:35",
+   "text": "D-GEMM: under NVFP4 the decode dense GEMM family at r24 is 2.80 ms achievable (MXFP8 shared + KDA proj) vs 4.60 ms for the MXFP4 tree."
+  },
+  {
+   "t": "11-18",
+   "text": "HW: Rubin double-K block-scaled MMA forms only exist in sm_107a builds; sm_100f-family builds run at half the block-scaled rate. Every FP8/FP4 kernel must be checked for the native form."
+  },
+  {
+   "t": "11-18 16:20",
+   "text": "P-MOE: NVFP4 EP16 8K MegaMoE is NVLink-bound on the BF16 combine (~75% of tensor time idle), so the MXFP8 shared experts can hide under it."
+  },
+  {
+   "t": "11-18",
+   "text": "D-ATTN: LocalQuery implemented (compute all 96 q heads locally under SP instead of publishing FP8 q to peers); unit test + bench queued."
   }
  ]
 }

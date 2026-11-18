@@ -1,0 +1,6 @@
+# D-ATTN findings (decode DSA attention path)
+
+- 2026-11-18 In-step gap512 D3 B80/B92 (320/368 rows), per DSA layer: MlaQuery 74-89 us (side stream), QueryWait 30-46 us, trtllm-gen sparse MLA 30-32 us + ComputeLSEFromMD 1.2 us, DcpValue 22-25 us, paged_mqa_logits 35-46 us, DsaIndex 7-8.5 us; the main-stream indexer wq_b split-K runs 52-62 us while MlaQuery holds the SMs (model ach ~4 us).
+- 2026-11-18 Model note: the perf model charges P6 (FP8 q publish, 24 heads x 576 B x R to 3 peers) at ~17 us/layer at r24 and 23 us at r32. Under SP every rank already holds every gathered row's q_a, so computing all 96 heads locally (4x q_b/W_UK FLOPs, +52 MB weights/layer) costs ~7-8 us projected at r24 and removes P6, the QueryWait cross-rank poll and DcpValue's q-mailbox re-arm (~21 MB of sentinel stores per layer at r24). The model's DSA q-path achievable is therefore pessimistic for this topology; proposing to price q path as min(publish, local recompute).
+- 2026-11-18 DcpValue re-arms the whole published q mailbox region every layer (R x 96 x 576 B stores): an un-modelled HBM write stream inside the 25 us DcpValue.
+- 2026-11-18 Implemented LocalQuery (wzhao/k31ws-d-attn 33b0d1996f): rows 17-512 under SP; unit test + microbench queued (pool holds pending since 12:15 PT).

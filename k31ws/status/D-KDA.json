@@ -1,25 +1,54 @@
 {
- "side": "decode",
- "step_ms": 30.5,
- "shape": "D3-32 r24: 96 requests / DP rank (384 verify rows), L\u2248135K, k=3",
- "basis": "gap512 EP16 in-step profile B92 (r23), MegaMoE moved to EP32 from the 8-node step delta",
- "state": "queued",
- "owner": "unassigned",
- "updated": "2026-11-18T12:40-08:00",
- "work": [],
- "evidence": [
-  "perf-model/microbench/results/gap512/parsed/decode_families.txt"
- ],
  "id": "D-KDA",
  "title": "Decode: KDA core (FP32 state)",
+ "side": "decode",
+ "owner": "D-KDA agent",
+ "state": "implementing",
+ "updated": "2026-11-18T12:50-08:00",
+ "shape": "D3-32 r24: 96 requests / DP rank (384 verify rows), L\u2248135K, k=3; per GPU 24 KDA heads x 96 requests = 2304 (request, head) items/layer",
  "baseline_ms": 3.4,
  "current_ms": 3.4,
- "achievable_ms": 1.7,
- "target_ms": 1.9,
- "gap_analysis": "KdaWide 30-49 us/layer vs 14-25 modelled: ~35% of HBM on 166 MB FP32 state per layer; per-(head-group, request) CTA grid latency-bound on the q=4 serial update; KdaWS above B80 is a separate kernel.",
+ "achievable_ms": 1.81,
+ "target_ms": 1.99,
+ "step_ms": 29.78,
+ "basis": "MEASURED: Rhea 1-node profile, 93-layer projection (perf-model/microbench/results/rhea1n_d3x32)",
+ "gap_analysis": "KdaWide 30-49 us/layer vs model 8.8 (B32) / 26.3 (B96) us/layer. Model achievable is memory bound: per (request, head) item 64 KB FP32 state read + 64 KB write (deferred fold writes the committed checkpoint once) + ~14 KB conv window + records, at the measured full-chip default-allocation HBM rate. Hypotheses (unmeasured): (1) per-item CTA grid keeps too few state bytes in flight per SM (one 64 KB page per CTA, 2 CTAs/SM, load -> compute -> store serialized), (2) FP32 recurrence work per item (~0.8 MFLOP) is ~55% of the memory time, so compute must overlap with streaming, (3) above n=70 KdaWS is used and it does NOT fold: the step pays a separate flush (state read + write) plus a read in KdaWS = 3 state passes instead of 2. Measurement (baseline microbench + ncu) is next.",
  "inefficiencies": [
-  "Latency-bound CTA grid",
-  "35% HBM utilization on state stream",
-  "Two kernels across batch sizes"
+  "HYPOTHESIS: latency-bound per-(head, request) CTA grid: few state bytes in flight per SM",
+  "HYPOTHESIS: KdaWS (n>=71) does not fold the deferred commit: separate flush = 3 state passes instead of 2",
+  "HYPOTHESIS: die-oblivious state streaming: half the bytes cross the die-to-die link (default 4 KiB die interleave)",
+  "Two kernels across batch sizes (KdaWide <=70, KdaWS above)"
+ ],
+ "rubin_features": [
+  "two-die locality domains: per-4 KiB page home die (default interleave) + %smid -> die map (dies.py)",
+  "bulk async copies (TMA) into a multi-stage shared-memory ring",
+  "packed FP32 FMA (fma.rn.f32x2)",
+  "programmatic dependent launch"
+ ],
+ "plan": [
+  "Baseline microbench at deployed per-GPU shapes n=32/64/96/128 (r8/r16/r24/r32), deferred fold active, 69 layers over disjoint state sets in one CUDA graph",
+  "ncu KdaWide / KdaWS at n=32 and n=96: dram throughput, bytes in flight, stall reasons",
+  "Design one per-shape persistent kernel family: multi-stage bulk-copy state ring, fold + verify + conv + gate + o_norm fused, deep memory pipeline; die-local row split (value rows are independent) as the step to the die-local roofline",
+  "Bitwise/stock-tolerance unit tests vs the stock commit + verify (reuse test_specialized_decode_sp_kda_fold_gpu.py)",
+  "Microbench vs model at r8/r16/r24/r32; step A/B via INFRA harness; landed-ready"
+ ],
+ "work": [
+  {
+   "t": "12:45",
+   "what": "read plan, gap512 decode families, model rows, KdaWide/KdaWS/sp.py dispatch, dies.py; worktree /Users/weizha/k31ws-wt/d-kda on wzhao/k31ws-d-kda @ 4fbaa15189",
+   "result": "model target per layer: B32 8.76 us, B64 17.5, B96 26.3 (x69 = 0.60 / 1.21 / 1.81 ms); gap512 measured 1.47 / 2.66 / 3.36 ms at B32 / B64 / B92"
+  },
+  {
+   "t": "12:50",
+   "what": "wrote KdaFlow (cutedsl/kda/flow.py): persistent warp-specialized record core = KdaWS scan/prep + KdaWide deferred fold (commit-exact) + 2-stage bulk-copy state ring; sp.py kind flow (in FOLDS); bitwise test vs KdaWS triton + stock commit (test_specialized_decode_sp_kda_flow_gpu.py); bench benchmarks/kernels/k31_vr/kda_sp_bench.py",
+   "result": "queued on pool (overlay d-kda-flow-1, run runs/D-KDA/run2.log); no pool hold running yet"
+  }
+ ],
+ "next": "run2: flow correctness + bench wide/ws/flow1/flow2 at n=8/32/64/96/128 + ncu; then die-local row split if streaming is the limit",
+ "blockers": "pool holds pending (Priority), first expected ~13:30",
+ "branch": "wzhao/k31ws-d-kda @ 4fbaa15189 (+uncommitted KdaFlow)",
+ "evidence": [
+  "perf-model/microbench/results/gap512/parsed/decode_families.txt",
+  "perf-model/microbench/rhea1n/model_rows.json"
  ]
 }

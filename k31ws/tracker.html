@@ -41,98 +41,99 @@ table.log td { font-size:12px; } td.t { font-family:var(--f-m); white-space:nowr
 <div class="wrap">
 <h1>K3.1 VR200 Kernel Campaign</h1>
 <p class="sub">Close the gap between the implemented kernels and the perf model&#x27;s achievable time for Kimi K3.1 on VR200: NVFP4 checkpoint (NVFP4 W4A4 routed experts, MXFP8 shared experts + KDA projections), DEP16 prefill, DCP4 x DP8 EP32 decode. Every kernel family gets an owner, a measured gap analysis and a target of at most 1.1x model achievable.</p>
-<p class="sub">Rendered 2026-11-18 15:26 from the workstream status files. Gap closed = (baseline − now) / (baseline − model achievable). Targets are at most 1.1× model achievable.</p>
-<div class="kpis"><div class='kpi'><small>Prefill DEP16 (tok/s/GPU)</small><b>13.9K MXFP4 · 15.4K NVFP4-act</b><span>model achievable 30.7K NVFP4 · F16K, L78K</span></div><div class='kpi'><small>Decode r8 (tok/s/GPU)</small><b>1,178 MXFP4</b><span>model achievable 2,855 NVFP4 · D3-32, 20.9 ms step</span></div><div class='kpi'><small>Decode r24 (tok/s/GPU)</small><b>2,425 MXFP4</b><span>model achievable 6,280 NVFP4 · D3-32, 30.5 ms step</span></div></div>
-<h2>Key findings</h2><ul class="find"><li><b>11-18</b> Largest decode gaps (r24, EP16-transferred): BF16 GEMMs 4.2 ms, MegaMoE ~3.4, DCP top-k 2.0, DSA attention 1.7, KDA 1.6, small ops 1.2.</li><li><b>11-18</b> NVFP4 near-term (enablement only) projects prefill 19.4-20.5K and decode r8 1.2-1.45K; the rest of the gap to 30.7K / 2.9K is kernel efficiency.</li><li><b>11-18</b> Topology is not the lever: best unbuilt decode layouts project only +2-5% over DCP4 x DP8 EP32; the step is 2.1-2.3x model achievable, all of it kernel time.</li></ul>
+<p class="sub">Rendered 2026-11-18 15:52 from the workstream status files. Gap closed = (baseline − now) / (baseline − model achievable). Targets are at most 1.1× model achievable.</p>
+<div class="kpis"><div class='kpi'><small>Prefill DEP16 (tok/s/GPU)</small><b>13.9K MXFP4 · 15.4K NVFP4-act</b><span>model achievable 30.7K NVFP4 · F16K, L78K</span></div><div class='kpi'><small>Decode r8 (tok/s/GPU)</small><b>1,178 MXFP4</b><span>model achievable 2,855 NVFP4 · D3-32, 20.9 ms step</span></div><div class='kpi'><small>Decode r24 (tok/s/GPU)</small><b>2,425 MXFP4</b><span>model achievable 6,280 NVFP4 · D3-32: 30.5 ms 8-node; 29.8 ms 1-node projection; achievable 13.4 ms</span></div></div>
+<h2>Key findings</h2><ul class="find"><li><b>11-18</b> D-ATTN: LocalQuery implemented (compute all 96 q heads locally under SP instead of publishing FP8 q to peers); unit test + bench queued.</li><li><b>11-18 16:20</b> P-MOE: NVFP4 EP16 8K MegaMoE is NVLink-bound on the BF16 combine (~75% of tensor time idle), so the MXFP8 shared experts can hide under it.</li><li><b>11-18</b> HW: Rubin double-K block-scaled MMA forms only exist in sm_107a builds; sm_100f-family builds run at half the block-scaled rate. Every FP8/FP4 kernel must be checked for the native form.</li><li><b>11-18 12:35</b> D-GEMM: under NVFP4 the decode dense GEMM family at r24 is 2.80 ms achievable (MXFP8 shared + KDA proj) vs 4.60 ms for the MXFP4 tree.</li><li><b>11-18 12:45</b> INFRA: the earlier 1-node decode slice had all 224 local experts touched per GPU (sdec reads moe.gate.weight, so balanced routing never applied): its MoE row is 8x the EP32 expert traffic; MegaMoE must come from the new emulation.</li><li><b>11-18 13:00</b> Pool: no Rhea GPU hold has started yet (6 x 1-node + 1 x 8-node pending; cluster full, first start est ~13:50 PST, 8-node ~03:20). 22 GPU requests are waiting; agents are writing kernels and tests meanwhile.</li><li><b>11-18 15:40</b> Decode baseline MEASURED: 1-node Rhea profile (24-layer view scaled to 93) reproduces the 8-node D3-32 step within 2-4% (r24 29.8 vs 30.5 ms; model achievable 13.4). r24 gaps: BF16 GEMMs 3.5 ms, top-k+merge 2.4, MegaMoE ~2.3 (substituted), DSA attention 1.7, KDA 1.6, small ops 1.1, SP comm 0.8, drafter 0.6, indexer 0.5. SP GEMM table: -3.2/-4.1/-1.3% at r8/16/24.</li><li><b>11-18</b> Largest decode gaps (r24, EP16-transferred): BF16 GEMMs 4.2 ms, MegaMoE ~3.4, DCP top-k 2.0, DSA attention 1.7, KDA 1.6, small ops 1.2.</li><li><b>11-18</b> NVFP4 near-term (enablement only) projects prefill 19.4-20.5K and decode r8 1.2-1.45K; the rest of the gap to 30.7K / 2.9K is kernel efficiency.</li><li><b>11-18</b> Topology is not the lever: best unbuilt decode layouts project only +2-5% over DCP4 x DP8 EP32; the step is 2.1-2.3x model achievable, all of it kernel time.</li></ul>
 <h2>Workstreams</h2>
 <h3>Infrastructure and enablement</h3><div class="tw"><table>
+<thead><tr><th>Workstream</th><th>Now (ms)</th><th>Share of step</th><th>Model achievable</th><th>Target</th>
+<th>Now / achievable</th><th>Gap closed</th><th>State</th><th>Next</th></tr></thead><tbody><tr>
+<td><a href="#HW" class="wid">HW</a><div class="wt">Vera Rubin hardware reference database</div></td>
+<td class="n">–</td><td class="n">–</td>
+<td class="n">–</td><td class="n">–</td>
+<td class="n">–</td><td class="gc"></td>
+<td><span class="st st-im">implementing</span></td>
+<td class="nx">Collect hw1/hw2 results from /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/HW/{hw1,hw2}/log, fold into topics and the three request answers; poll hwdb/requests; integrate internal-doc batch 3 answers</td></tr>
+<tr>
+<td><a href="#INFRA" class="wid">INFRA</a><div class="wt">Node pool, 1-node emulations, profiling and integration branch</div></td>
+<td class="n">–</td><td class="n">–</td>
+<td class="n">–</td><td class="n">–</td>
+<td class="n">–</td><td class="gc"></td>
+<td><span class="st st-me">measuring</span></td>
+<td class="nx">First hold: profiled base step_d r8/r16/r24 + step_p F16K/F8K (queued under wsgpu); then write per-family baselines to k31ws/measured/ and tell owners.</td></tr></tbody></table></div><h3>Shared (prefill and decode)</h3><div class="tw"><table>
 <thead><tr><th>Workstream</th><th>Now (ms)</th><th>Share of step</th><th>Model achievable</th><th>Target</th>
 <th>Now / achievable</th><th>Gap closed</th><th>State</th><th>Next</th></tr></thead><tbody><tr>
 <td><a href="#EN" class="wid">EN</a><div class="wt">NVFP4 checkpoint enablement</div></td>
 <td class="n">–</td><td class="n">–</td>
 <td class="n">–</td><td class="n">–</td>
 <td class="n">–</td><td class="gc"></td>
-<td><span class="st st-q">queued</span></td>
-<td class="nx">Native ModelOpt NVFP4 load into Rubin MegaMoE + dummy-safe NVFP4 view.</td></tr>
-<tr>
-<td><a href="#HW" class="wid">HW</a><div class="wt">Vera Rubin hardware reference database</div></td>
-<td class="n">–</td><td class="n">–</td>
-<td class="n">–</td><td class="n">–</td>
-<td class="n">–</td><td class="gc"></td>
-<td><span class="st st-q">queued</span></td>
-<td class="nx">Build the private hwdb and the per-workstream feature briefs.</td></tr>
-<tr>
-<td><a href="#INFRA" class="wid">INFRA</a><div class="wt">Node pool, 1-node emulations, profiling and integration branch</div></td>
-<td class="n">–</td><td class="n">–</td>
-<td class="n">–</td><td class="n">–</td>
-<td class="n">–</td><td class="gc"></td>
-<td><span class="st st-q">queued</span></td>
-<td class="nx">Take over the Rhea 1-node D3-32 profile, build the DEP16 1-node slice.</td></tr></tbody></table></div><h3>Decode: DCP4 × DP8, EP32</h3><div class="tw"><table>
+<td><span class="st st-an">analysis</span></td>
+<td class="nx">Read model.py MegaMoE wiring and megamoe_rubin experts.py load path.</td></tr></tbody></table></div><h3>Decode: DCP4 × DP8, EP32</h3><div class="tw"><table>
 <thead><tr><th>Workstream</th><th>Now (ms)</th><th>Share of step</th><th>Model achievable</th><th>Target</th>
 <th>Now / achievable</th><th>Gap closed</th><th>State</th><th>Next</th></tr></thead><tbody><tr>
 <td><a href="#D-GEMM" class="wid">D-GEMM</a><div class="wt">Decode: low-latency dense GEMM family (BF16 + MXFP8)</div></td>
 <td class="n">8.90</td><td class="n">29%</td>
-<td class="n">4.70</td><td class="n">5.20</td>
-<td class="n">1.9×</td><td class="gc"><span class="bar"><i style="width:0%"></i></span> 0%</td>
-<td><span class="st st-q">queued</span></td>
-<td class="nx"></td></tr>
+<td class="n">2.80</td><td class="n">3.08</td>
+<td class="n">3.2×</td><td class="gc"><span class="bar"><i style="width:0%"></i></span> 0%</td>
+<td><span class="st st-im">implementing</span></td>
+<td class="nx">read bench1 (BF16 + MXFP8 backends vs model ach at R=16/128/256/384, n=4/32/64/96); fill MX_TUNED; run unit test</td></tr>
 <tr>
 <td><a href="#D-MOE" class="wid">D-MOE</a><div class="wt">Decode: MegaMoE NVFP4 EP32 + shared-expert overlap</div></td>
 <td class="n">8.30</td><td class="n">27%</td>
 <td class="n">4.90</td><td class="n">5.40</td>
 <td class="n">1.7×</td><td class="gc"><span class="bar"><i style="width:0%"></i></span> 0%</td>
-<td><span class="st st-q">queued</span></td>
-<td class="nx"></td></tr>
+<td><span class="st st-me">measuring</span></td>
+<td class="nx">read b0 results (runs/D-MOE/out/b0-*.json, logs/b0-*.log); then stamp-buffer breakdown of the fixed chain</td></tr>
 <tr>
 <td><a href="#D-FUSE" class="wid">D-FUSE</a><div class="wt">Decode: small-op fusion, SP collectives, drafter tail</div></td>
 <td class="n">3.90</td><td class="n">13%</td>
-<td class="n">1.50</td><td class="n">1.65</td>
-<td class="n">2.6×</td><td class="gc"><span class="bar"><i style="width:0%"></i></span> 0%</td>
-<td><span class="st st-q">queued</span></td>
-<td class="nx"></td></tr>
+<td class="n">1.82</td><td class="n">2.00</td>
+<td class="n">2.1×</td><td class="gc"><span class="bar"><i style="width:0%"></i></span> 0%</td>
+<td><span class="st st-im">implementing</span></td>
+<td class="nx">read run3 (runs/D-FUSE/run3): per-layer chain us stock vs fused vs model (AG+RS+AttnRes ~13.7 us/layer at n=96); fix numerics/hangs; then step A/B on INFRA step_d.sh</td></tr>
 <tr>
 <td><a href="#D-TOPK" class="wid">D-TOPK</a><div class="wt">Decode: DSA exact top-k + DCP merge</div></td>
 <td class="n">2.30</td><td class="n">8%</td>
-<td class="n">0.22</td><td class="n">0.25</td>
-<td class="n">10.5×</td><td class="gc"><span class="bar"><i style="width:0%"></i></span> 0%</td>
-<td><span class="st st-q">queued</span></td>
-<td class="nx"></td></tr>
+<td class="n">0.23</td><td class="n">0.25</td>
+<td class="n">10.1×</td><td class="gc"><span class="bar"><i style="width:0%"></i></span> 0%</td>
+<td><span class="st st-an">analysis</span></td>
+<td class="nx">write the 4-GPU DCP4 top-k microbench and run it on a pool node (-g 4)</td></tr>
 <tr>
 <td><a href="#D-ATTN" class="wid">D-ATTN</a><div class="wt">Decode: DSA attention path (q path, sparse MLA, DCP value, indexer)</div></td>
 <td class="n">3.30</td><td class="n">11%</td>
 <td class="n">1.30</td><td class="n">1.45</td>
 <td class="n">2.5×</td><td class="gc"><span class="bar"><i style="width:0%"></i></span> 0%</td>
-<td><span class="st st-q">queued</span></td>
-<td class="nx"></td></tr>
+<td><span class="st st-im">implementing</span></td>
+<td class="nx">read runs/D-ATTN/run1.log (unit test + q-path bench: MlaQuery vs LocalQuery at R 128/256/384/512) and run2.log (trtllm-gen sparse MLA + ncu at R384); then 4-GPU SP DSA layer A/B</td></tr>
 <tr>
 <td><a href="#D-KDA" class="wid">D-KDA</a><div class="wt">Decode: KDA core (FP32 state)</div></td>
 <td class="n">3.40</td><td class="n">11%</td>
-<td class="n">1.70</td><td class="n">1.90</td>
-<td class="n">2.0×</td><td class="gc"><span class="bar"><i style="width:0%"></i></span> 0%</td>
-<td><span class="st st-q">queued</span></td>
-<td class="nx"></td></tr></tbody></table></div><h3>Prefill: DEP16</h3><div class="tw"><table>
+<td class="n">1.81</td><td class="n">1.99</td>
+<td class="n">1.9×</td><td class="gc"><span class="bar"><i style="width:0%"></i></span> 0%</td>
+<td><span class="st st-im">implementing</span></td>
+<td class="nx">run2: flow correctness + bench wide/ws/flow1/flow2 at n=8/32/64/96/128 + ncu; then die-local row split if streaming is the limit</td></tr></tbody></table></div><h3>Prefill: DEP16</h3><div class="tw"><table>
 <thead><tr><th>Workstream</th><th>Now (ms)</th><th>Share of step</th><th>Model achievable</th><th>Target</th>
 <th>Now / achievable</th><th>Gap closed</th><th>State</th><th>Next</th></tr></thead><tbody><tr>
 <td><a href="#P-MOE" class="wid">P-MOE</a><div class="wt">Prefill: MegaMoE FI NVFP4 (2x8K) + shared-expert side stream</div></td>
 <td class="n">320</td><td class="n">39%</td>
 <td class="n">198</td><td class="n">218</td>
 <td class="n">1.6×</td><td class="gc"><span class="bar"><i style="width:0%"></i></span> 0%</td>
-<td><span class="st st-q">queued</span></td>
-<td class="nx"></td></tr>
+<td><span class="st st-me">measuring</span></td>
+<td class="nx">Read r1/r2 when the pool runs them (runs/P-MOE/r1, r2); meanwhile implement specialized_prefill MoE (sub-calls + overlap).</td></tr>
 <tr>
 <td><a href="#P-KDA" class="wid">P-KDA</a><div class="wt">Prefill: KDA chain (core + conv + gated o_norm)</div></td>
 <td class="n">78.00</td><td class="n">9%</td>
-<td class="n">16.00</td><td class="n">18.00</td>
-<td class="n">4.9×</td><td class="gc"><span class="bar"><i style="width:0%"></i></span> 0%</td>
-<td><span class="st st-q">queued</span></td>
-<td class="nx"></td></tr>
+<td class="n">17.40</td><td class="n">19.10</td>
+<td class="n">4.5×</td><td class="gc"><span class="bar"><i style="width:0%"></i></span> 0%</td>
+<td><span class="st st-im">implementing</span></td>
+<td class="nx">run test + stock/split/fused breakdown at F16K/F8K as soon as a 1-GPU hold starts; then ncu K2</td></tr>
 <tr>
 <td><a href="#P-MLA" class="wid">P-MLA</a><div class="wt">Prefill: sparse MLA + prologue</div></td>
 <td class="n">67.00</td><td class="n">8%</td>
-<td class="n">16.00</td><td class="n">17.50</td>
+<td class="n">15.90</td><td class="n">17.50</td>
 <td class="n">4.2×</td><td class="gc"><span class="bar"><i style="width:0%"></i></span> 0%</td>
-<td><span class="st st-q">queued</span></td>
-<td class="nx"></td></tr>
+<td><span class="st st-an">analysis</span></td>
+<td class="nx">run1 results (runs/P-MLA/run1): per-kernel times + ncu of fmhaSm107a; meanwhile design the prefill-form kernel</td></tr>
 <tr>
 <td><a href="#P-GEMM" class="wid">P-GEMM</a><div class="wt">Prefill: MXFP8 / BF16 GEMMs, router/latent, AttnRes, small ops</div></td>
 <td class="n">290</td><td class="n">35%</td>
@@ -148,188 +149,188 @@ table.log td { font-size:12px; } td.t { font-family:var(--f-m); white-space:nowr
 <td><span class="st st-q">queued</span></td>
 <td class="nx"></td></tr></tbody></table></div>
 <h2>Node pool (Rhea)</h2><p class="sub">Rolling holds from holdd-ws.sh (1-node class for kernel work, one standing 8-node request for EP32/DP8). GPUs are shared through wsgpu.sh locks.</p>
-<div class="tw"><table><thead><tr><th>Job</th><th>Name</th><th>State</th><th>Nodes</th><th>Start</th><th>Time left</th></tr></thead><tbody><tr><td>72524</td><td>coreai_cserve_dev-k31ws.hold8</td><td>PENDING</td><td>8</td><td>2026-11-19T03:09:00</td><td>8:00:00</td></tr><tr><td>72521</td><td>coreai_cserve_dev-k31ws.hold1</td><td>PENDING</td><td>1</td><td>2026-11-18T14:50:00</td><td>8:00:00</td></tr><tr><td>72377</td><td>cserve-k31gap-hold</td><td>RUNNING</td><td>1</td><td>2026-11-18T12:15:46</td><td>1:49:17</td></tr></tbody></table></div>
+<div class="tw"><table><thead><tr><th>Job</th><th>Name</th><th>State</th><th>Nodes</th><th>Start</th><th>Time left</th></tr></thead><tbody><tr><td>72524</td><td>coreai_cserve_dev-k31ws.hold8</td><td>PENDING</td><td>8</td><td>2026-11-19T03:24:00</td><td>8:00:00</td></tr><tr><td>72521</td><td>coreai_cserve_dev-k31ws.hold1</td><td>PENDING</td><td>1</td><td>2026-11-18T14:03:00</td><td>8:00:00</td></tr><tr><td>72601</td><td>coreai_cserve_dev-k31ws.hold1</td><td>PENDING</td><td>1</td><td>2026-11-18T14:04:00</td><td>8:00:00</td></tr><tr><td>72635</td><td>coreai_cserve_dev-k31ws.hold1</td><td>PENDING</td><td>1</td><td>2026-11-18T14:15:00</td><td>8:00:00</td></tr><tr><td>72662</td><td>coreai_cserve_dev-k31ws.hold1</td><td>PENDING</td><td>1</td><td>2026-11-18T14:51:00</td><td>8:00:00</td></tr><tr><td>72680</td><td>coreai_cserve_dev-k31ws.hold1</td><td>PENDING</td><td>1</td><td>2026-11-18T15:38:00</td><td>8:00:00</td></tr><tr><td>72672</td><td>coreai_cserve_dev-k31ws.hold1</td><td>PENDING</td><td>1</td><td>2026-11-18T15:20:00</td><td>8:00:00</td></tr></tbody></table></div>
 <h2>Workstream details</h2>
-<section class="card" id="EN">
+<section class="card" id="HW">
+<header><span class="wid">HW</span><h4>Vera Rubin hardware reference database</h4>
+<span class="st st-im">implementing</span></header>
+<div class="meta"><span>Shape: -</span><span>Basis: internal docs + local source + our measurements (private hwdb; numbers not reproduced here)</span>
+<span>Branch: <code>- (no code branch; private hwdb at /Users/weizha/k31ws-hwdb)</code></span><span>Owner: HW agent (workflow)</span><span>Updated: 2026-11-18T12:50-08:00</span></div>
+<div class="nums"><div><b>–</b><small>baseline ms</small></div><div><b>–</b><small>now ms</small></div>
+<div><b>–</b><small>model achievable ms</small></div><div><b>–</b><small>target ms</small></div>
+<div><b>–</b><small>step ms</small></div></div>
+<h5>Gap analysis</h5><p>v1 of the private hwdb is live: INDEX with ten key facts, 11 topic files (block-scaled MMA 2x-K forms and rates, TMEM exclusive allocation, oversized shared memory, clusters, TMA incl. counted stores and gather4, launch/PDL/CLC costs, SM resources and FP32 rate, HBM/L2/locality domains, NVLink6/multimem, build arch and CuTe DSL support, worked examples) and 13 workstream briefs with features, design hints and the hardware limit at each deployed shape. Key new confirmations: mixed MXFP8 x MXFP4 MMA runs at the FP8 rate (only FP4 x FP4 gets the FP4 rate); the 2x-K form is selected by instruction-descriptor bits on sm_107a only; counted TMA stores signal completion at the destination; CLC is supported but static scheduling wins for small decode work. Model observations for owners: decode expert rows already assume die-local HBM, dense decode rows the default rate (die-localizing dense weights can beat model achievable); the prefill indexer-score row is costed at roughly the sm_100-form FP8 rate, below what a native kernel can reach.</p>
+<div class="two"><div><h5>Current inefficiencies</h5><ul><li>Hardware probes (FFMA/FFMA2 rate, oversized shared memory launch + occupancy, graph/PDL per-kernel cost, die-local bandwidth, legacy HMMA, MUFU, shared atomics, L2 residency across kernels, cross-die L2 caching) are queued on the Rhea pool; no free GPU yet</li><li>Some Rubin ISA features (counted TMA stores, early A-buffer release, descriptor circular buffers, TMA L2 management) have no confirmed PTX/CuTe DSL spelling yet</li></ul></div>
+<div><h5>Vera Rubin features used</h5><ul><li>tcgen05 2x-K block-scaled MMA (sm_107a)</li><li>TMEM exclusive 576-column allocation</li><li>oversized shared memory mode</li><li>32-CTA clusters / DSMEM</li><li>TMA counted stores and reductions, gather4, multicast</li><li>locality domains: die-local VMM allocation, green contexts per die</li><li>PDL, cluster launch control</li><li>NVLink6 multimem / NVLS</li></ul></div></div>
+<h5>Plan</h5><ol><li>v1 database: INDEX + topics + all briefs (done)</li><li>Answer workstream requests every ~20 min</li><li>Measure on Rhea: hw1 (attrs, FFMA/FFMA2, oversized smem, launch/PDL) + e6 die-local BW; hw2 (HMMA, MUFU, smem atomics, L2 residency, cross-die L2)</li><li>Internal-doc queries: smem operand bandwidth, M64 rate, f8f6f4 2x-K, cross-die L2, HMMA, MUFU, NVLink small-message latency</li><li>4-GPU probes: peer store latency, multimem.st / ld_reduce small-message latency, counted TMA store if ptxas accepts it</li><li>sm_107-native vs sm_100f block-scaled MMA rate microbench (CuTe DSL dense GEMM)</li></ol>
+<p class="blk"><b>Blocked:</b> Rhea pool had no running holds at 12:30 (holds pending); probes wait in wsgpu.sh queue</p>
+<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td class='t'>12:50</td><td>Answered requests D-TOPK-1, P-MLA-1, P-KDA-1 (v1; measured items pending); wrote hw2_probe.cu (HMMA, MUFU, smem atomics, L2 residency, cross-die L2) + redux_f32.cu, queued on Rhea</td><td>answers in hwdb/requests/*.answer.md</td></tr><tr><td class='t'>12:45</td><td>hwdb v1 published: INDEX, 11 topics, 13 briefs, mirrored to Lustre</td><td>/Users/weizha/k31ws-hwdb</td></tr><tr><td class='t'>12:30</td><td>Wrote bench/hw1_probe.cu + run_hw1.sh (toolchain census, attrs, FFMA/FFMA2, oversized smem, graph/PDL launch) + reused e6_ldbw.cu; queued on Rhea pool (-g 1)</td><td>waiting for a free GPU</td></tr><tr><td class='t'>12:20</td><td>Internal-doc queries (batch 1-2)</td><td>confirmed mixed FP8xFP4 rate = FP8 rate; 2x-K idesc encoding; counted TMA semantics; oversized smem attributes; CLC on Rubin; locality-domain attributes; PDL proxy</td></tr><tr><td class='t'>12:05</td><td>Read campaign directives, schema, all workstream status files, memory notes, internal-doc notes, FlashInfer a368c5f66 sm107 MegaMoE and sdec trees</td><td>source inventory for hwdb</td></tr></tbody></table></div>
+<h5>Evidence</h5><ul class="ev"><li><code>/Users/weizha/k31ws-hwdb/INDEX.md</code></li><li><code>/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/hwdb</code></li><li><code>/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/HW</code></li></ul>
+</section><section class="card" id="INFRA">
+<header><span class="wid">INFRA</span><h4>Node pool, 1-node emulations, profiling and integration branch</h4>
+<span class="st st-me">measuring</span></header>
+<div class="meta"><span>Shape: D3-32 DP-rank slice (1 node, DCP4, EP4 emulating EP32) r8/r16/r24 at L132K; P3-16 DEP4-on-1-node slice (EP4 emulating EP16) F16K/F8K at L78K; 24-layer view</span><span>Basis: -</span>
+<span>Branch: <code>wzhao/k31ws-infra @ 4fbaa15189; wzhao/k31ws-int @ 4fbaa15189</code></span><span>Owner: INFRA agent (workflow)</span><span>Updated: 2026-11-18T12:45-08:00</span></div>
+<div class="nums"><div><b>–</b><small>baseline ms</small></div><div><b>–</b><small>now ms</small></div>
+<div><b>–</b><small>model achievable ms</small></div><div><b>–</b><small>target ms</small></div>
+<div><b>–</b><small>step ms</small></div></div>
+<h5>Gap analysis</h5><p>Slices ready, first baselines queued. Key harness finding: the specialized decode fuses the MoE router GEMM into its front (reads moe.gate.weight + e_score_correction_bias directly), so the bench&#x27;s --routing balanced fixture never reached the sdec graph; with dummy router weights each GPU of a 4-GPU slice touched all 224 local experts, 8x the deployed EP32 expert weight traffic (a 24-layer r8 slice measured 12.2 ms vs a 9.9 ms model achievable for the full 93-layer step). Fixed in the bench (no production change) by an expert-count emulation that restricts routing to 28 experts / GPU (decode) or 56 (prefill) at the deployed token-expert pairs per GPU.</p>
+<div class="two"><div><h5>Current inefficiencies</h5><ul><li>Slice deviation: 24-layer view (896 experts x 93 layers do not fit at EP4); model rows rescaled to the same layer counts</li><li>Slice deviation: MegaMoE dispatch/combine over 4 GPUs instead of 32 (decode) / 16 (prefill)</li><li>Slice deviation: DSpark preview drafter (24-layer target ids)</li></ul></div>
+<div><h5>Vera Rubin features used</h5><ul></ul></div></div>
+<h5>Plan</h5><ol><li>Pool: holdd-ws health + holdd.conf tuned to demand (T1 8, P1 6), poolsnap every ~20 min</li><li>step_d.sh (D3-32 DP-rank slice, wsgpu -g 4, per-overlay build) + per-family table vs model achievable: DONE, first profiled baseline queued</li><li>step_p.sh (P3-16 DEP4 slice) + pf_fam.py per-family table: script DONE, baseline queued; parser after first trace</li><li>step_multi.sh d8 / p16 for the hold8 job: DONE (dry-run cfg OK), launch when hold8 nears start</li><li>NVFP4 views of both slices once EN lands loading (model rows already generated for nvfp4_modelopt)</li><li>Integration branch wzhao/k31ws-int (worktree /Users/weizha/k31ws-wt/int): merge landed-ready workstreams + tests + step A/B</li></ol>
+<p class="blk"><b>Blocked:</b> Rhea queue: hold1 requests start 13:06-15:30 PST; hold8 ~03:11 tomorrow.</p>
+<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td class='t'>12:46</td><td>pool: 8 agents waiting for ~18 GPUs; holdd.conf T1 8 P1 6 C1 60 IDLE_MIN 45</td><td>first hold1 est 13:06 PST, hold8 est 03:11 tomorrow</td></tr><tr><td class='t'>12:44</td><td>step_p.sh (P3-16 DEP4 slice), step_multi.sh (d8 full D3-32, p16 full DEP16), mk_model_rows.py (L24 model rows, mxfp4_release + nvfp4_modelopt, decode + prefill)</td><td>L24 model ach: decode r8/r16/r24 3.07/3.65/4.37 ms MXFP4, 2.74/3.30/3.88 NVFP4; prefill F16K 257 ms MXFP4, 165 ms NVFP4</td></tr><tr><td class='t'>12:42</td><td>root-caused the slice&#x27;s MoE deviation: sdec reads moe.gate.weight in its fused front, so the routing fixture never applies to the sdec graph; added bench-only expert-count emulation (selection-bias mask, emulation-aware balanced fixture)</td><td>28 experts/GPU decode, 56/GPU prefill; to be confirmed in the first run log (&#x27;NQ: expert emulation&#x27;)</td></tr><tr><td class='t'>12:40</td><td>ported rhea1n harness to k31ws/tools/stepbench (nq_step.py, cfg2bench, shapes, gap_parse/fam) + step_d.sh / step_inner.sh (4 local ranks in one wsgpu -g 4 task)</td><td>cfg/shape dry-run OK on login node</td></tr><tr><td class='t'>12:35</td><td>claimed; worktree /Users/weizha/k31ws-wt/infra (wzhao/k31ws-infra) + wzhao/k31ws-int at 4fbaa15189 pushed to wzhao18; holdd-ws running</td><td>hold1 x3 + hold8 pending</td></tr></tbody></table></div>
+<h5>Evidence</h5><ul class="ev"><li><code>k31ws/tools/stepbench/README.md</code></li><li><code>k31ws/tools/step_d.sh, step_p.sh, step_multi.sh</code></li><li><code>Rhea: /lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/INFRA/</code></li></ul>
+</section><section class="card" id="EN">
 <header><span class="wid">EN</span><h4>NVFP4 checkpoint enablement</h4>
-<span class="st st-q">queued</span></header>
-<div class="meta"><span>Shape: -</span><span>Basis: -</span>
-<span>Branch: <code></code></span><span>Owner: unassigned</span><span>Updated: 2026-11-18T12:40-08:00</span></div>
+<span class="st st-an">analysis</span></header>
+<div class="meta"><span>Shape: P3-16 F16K L78K and D3-32 r8 (load + smoke; no kernel timing owned)</span><span>Basis: -</span>
+<span>Branch: <code>wzhao/k31ws-en @ 4fbaa15189</code></span><span>Owner: EN agent (workflow)</span><span>Updated: 2026-11-18T15:25-08:00</span></div>
 <div class="nums"><div><b>–</b><small>baseline ms</small></div><div><b>–</b><small>now ms</small></div>
 <div><b>–</b><small>model achievable ms</small></div><div><b>–</b><small>target ms</small></div>
 <div><b>–</b><small>step ms</small></div></div>
 <h5>Gap analysis</h5><p>No NVFP4 number exists: MegaMoE format hard-coded to MXFP4 (model.py:816), Rubin MegaMoE refuses NVFP4 scales (experts.py:289/442), no NVFP4 EP32 decode backend, specialized decode raises on MXFP8 projections.</p>
 <div class="two"><div><h5>Current inefficiencies</h5><ul></ul></div>
 <div><h5>Vera Rubin features used</h5><ul></ul></div></div>
-<h5>Plan</h5><ol></ol>
+<h5>Plan</h5><ol><li>B1 MegaMoE format from checkpoint + ModelOpt name mapping</li><li>B1b native NVFP4 parameter set in megamoe_rubin</li><li>B2 dummy-safe NVFP4 view</li><li>B5 checkpoint facts</li><li>B6 memory feasibility</li><li>MXFP8 stock linears detection</li><li>1-GPU/1-node dummy load + smoke</li></ol>
 
-<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td>No entries yet.</td></tr></tbody></table></div>
-
-</section><section class="card" id="HW">
-<header><span class="wid">HW</span><h4>Vera Rubin hardware reference database</h4>
-<span class="st st-q">queued</span></header>
-<div class="meta"><span>Shape: -</span><span>Basis: -</span>
-<span>Branch: <code></code></span><span>Owner: unassigned</span><span>Updated: 2026-11-18T12:40-08:00</span></div>
-<div class="nums"><div><b>–</b><small>baseline ms</small></div><div><b>–</b><small>now ms</small></div>
-<div><b>–</b><small>model achievable ms</small></div><div><b>–</b><small>target ms</small></div>
-<div><b>–</b><small>step ms</small></div></div>
-<h5>Gap analysis</h5><p>Every kernel workstream needs the VR200-specific features (tcgen05 block-scaled MMA shapes, TMEM, 2-CTA, TMA multicast/.COUNTED, CLC, PDL, locality domains, NVLink6 multimem) and their measured costs in one place.</p>
-<div class="two"><div><h5>Current inefficiencies</h5><ul></ul></div>
-<div><h5>Vera Rubin features used</h5><ul></ul></div></div>
-<h5>Plan</h5><ol></ol>
-
-<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td>No entries yet.</td></tr></tbody></table></div>
-
-</section><section class="card" id="INFRA">
-<header><span class="wid">INFRA</span><h4>Node pool, 1-node emulations, profiling and integration branch</h4>
-<span class="st st-q">queued</span></header>
-<div class="meta"><span>Shape: -</span><span>Basis: -</span>
-<span>Branch: <code></code></span><span>Owner: unassigned</span><span>Updated: 2026-11-18T12:40-08:00</span></div>
-<div class="nums"><div><b>–</b><small>baseline ms</small></div><div><b>–</b><small>now ms</small></div>
-<div><b>–</b><small>model achievable ms</small></div><div><b>–</b><small>target ms</small></div>
-<div><b>–</b><small>step ms</small></div></div>
-<h5>Gap analysis</h5><p>Kernel work must iterate on 1-4 GPUs while 8-node EP32 holds queue: 1-node DP-rank slice of D3-32 and a 1-node DEP16 slice, per-family profile parser vs model at the same shapes, integration branch for verified wins.</p>
-<div class="two"><div><h5>Current inefficiencies</h5><ul></ul></div>
-<div><h5>Vera Rubin features used</h5><ul></ul></div></div>
-<h5>Plan</h5><ol></ol>
-
-<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td>No entries yet.</td></tr></tbody></table></div>
+<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td class='t'>15:25</td><td>claimed workstream, worktree /Users/weizha/k31ws-wt/en on wzhao/k31ws-en @ 4fbaa15189</td><td>reading code</td></tr></tbody></table></div>
 
 </section><section class="card" id="D-GEMM">
 <header><span class="wid">D-GEMM</span><h4>Decode: low-latency dense GEMM family (BF16 + MXFP8)</h4>
-<span class="st st-q">queued</span></header>
-<div class="meta"><span>Shape: D3-32 r24: 96 requests / DP rank (384 verify rows), L≈135K, k=3</span><span>Basis: gap512 EP16 in-step profile B92 (r23), MegaMoE moved to EP32 from the 8-node step delta</span>
-<span>Branch: <code></code></span><span>Owner: unassigned</span><span>Updated: 2026-11-18T12:40-08:00</span></div>
+<span class="st st-im">implementing</span></header>
+<div class="meta"><span>Shape: D3-32 r24: 96 requests / DP rank (384 verify rows R per TP4 group, n = 96 SP shard rows per GPU), L=135K, k=3</span><span>Basis: baseline/current: gap512 EP16 in-step BF16 family (mxfp4 tree, all-BF16 linears). achievable: perf model nvfp4_modelopt D3-32 r24 (model_gemm.py), my ops = KDA in/f_b/o_proj, DSA qkv_a+g_proj, q_b+wq_b, DSA o_proj, router, latent down/up, shared gate_up/down (w_uk/w_uv bmm excluded: MLA q path). mxfp4-tree achievable for the same ops = 4.60 ms.</span>
+<span>Branch: <code>wzhao/k31ws-d-gemm @ 4fbaa15189</code></span><span>Owner: D-GEMM workflow agent</span><span>Updated: 2026-11-18T13:10-08:00</span></div>
 <div class="nums"><div><b>8.90</b><small>baseline ms</small></div><div><b>8.90</b><small>now ms</small></div>
-<div><b>4.70</b><small>model achievable ms</small></div><div><b>5.20</b><small>target ms</small></div>
+<div><b>2.80</b><small>model achievable ms</small></div><div><b>3.08</b><small>target ms</small></div>
 <div><b>30.50</b><small>step ms</small></div></div>
-<h5>Gap analysis</h5><p>Weight-streaming GEMMs at M=32-384 reach 1.8-8.7 TB/s of 13.9 achievable; cuBLAS picks 2-CTA 64xN / 160x64 tiles with 156-448 CTAs; split-K reduce launches ~1.2 ms/step; a CuTe split-K kernel collapses above 200 rows.</p>
-<div class="two"><div><h5>Current inefficiencies</h5><ul><li>Too few bytes in flight per SM for 30-180 MB weight streams</li><li>Separate split-K reduce kernels</li><li>SplitKGemm tile policy collapse above 200 rows</li><li>MXFP8 activation quant as separate kernels (NVFP4 ckpt)</li></ul></div>
-<div><h5>Vera Rubin features used</h5><ul></ul></div></div>
-<h5>Plan</h5><ol></ol>
-
-<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td>No entries yet.</td></tr></tbody></table></div>
-<h5>Evidence</h5><ul class="ev"><li><code>perf-model/microbench/results/gap512/parsed/decode_families.txt</code></li></ul>
+<h5>Gap analysis</h5><p>Seed (gap512 B50-B92, EP16): weight-streaming GEMMs at M=32-384 reach 1.8-8.7 TB/s vs 13.9 achievable; cuBLAS picks 2-CTA 64xN / 160x64 tiles with 156-448 CTAs; split-K reduce launches ~1.2 ms/step; a CuTe SplitKGemm collapses above 200 rows. Under the NVFP4 checkpoint the KDA in/o_proj and shared experts become MXFP8 (half the weight bytes), but the sdec SP path refuses quantized linears today (providers.bf16_weight), so D3-32 NVFP4 decode cannot run at all until B4 lands. Re-measuring every family at the D3-32 per-GPU shapes (R=16/128/256/384, n=4/32/64/96) for BF16 tactics and all MXFP8 backends (FI cute-dsl / cutlass / trtllm, cuBLASLt _scaled_mm) is the first step.</p>
+<div class="two"><div><h5>Current inefficiencies</h5><ul><li>Too few bytes in flight per SM for 30-180 MB weight streams (cuBLAS tile choice) [seed, to re-measure on D3-32 shapes]</li><li>Separate split-K reduce kernels (~1.2 ms/step) [seed]</li><li>SplitKGemm tile policy collapse above 200 rows (identity unverified) [seed]</li><li>MXFP8 activation quant as separate kernels (NVFP4 ckpt) [seed]</li><li>sdec SP path refuses MXFP8 linears: NVFP4 D3-32 decode blocked (B4) [code: runtime/providers.py bf16_weight]</li></ul></div>
+<div><h5>Vera Rubin features used</h5><ul><li>PDL (weights streamed before griddepcontrol.wait)</li><li>tcgen05 block-scaled MXFP8 MMA (swap-AB, weight as the M operand)</li><li>TMA bulk loads / L2 prefetch of the next GEMM&#x27;s weights</li></ul></div></div>
+<h5>Plan</h5><ol><li>1. Microbench every family at D3-32 per-GPU shapes: BF16 tactic table vs cuBLAS/Lt; MXFP8 FI cute-dsl/cutlass/trtllm vs _scaled_mm (+ act quant), chained cold weights in a CUDA graph; compare to model achievable</li><li>2. B4: MXFP8 DecodeProjection (per-shape backend dispatch, pre-quantized MXFP8 input from fused producers) + MXFP8 SpOproj + MXFP8 SpMlp shared expert inside specialized_decode; unit tests vs stock</li><li>3. Weight-streaming kernel redesign for families still &gt; 1.1x achievable (persistent swap-AB, PDL weight prefetch, no separate reduce)</li><li>4. Step A/B on INFRA&#x27;s 1-node harness; landed-ready</li></ol>
+<p class="blk"><b>Blocked:</b> k31ws pool: no hold1 running yet (all pending); bench + test queued via wsgpu</p>
+<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td class='t'>13:10</td><td>B4 first cut: specialized_decode/cutedsl/gemm/mxfp8.py Mxfp8Projection (stock linear storage, no copy; per-R kind fi_cute/fi_cutlass/scaled_mm, GENERIC = stock KimiK3Mxfp8Kernel rule, shared MXFP8 input scratch); wired KDA in_proj (SpAttentionBlock), KDA o_proj (SpOproj mxfp8 tactic: GEMM into SpComm.partial + RS push), shared expert gate_up/down (SpMlp, stock act_mxfp8_into producer); unit test test_specialized_decode_sp_mxfp8_gpu.py</td><td>staged overlay d-gemm-4fbaa15-1; bench1 (all families, D3-32 shapes) + unit test queued on pool (waiting for a hold1)</td></tr><tr><td class='t'>12:35</td><td>claimed workstream; worktree /Users/weizha/k31ws-wt/d-gemm (wzhao/k31ws-d-gemm @ 4fbaa15189); computed model rows at D3-32 r1/8/16/24/32 for both checkpoints</td><td>nvfp4 r24 family achievable 2.80 ms (KDA in 7.40 us x69, shared gu 6.80 / down 3.45 us x92, latent down/up 3.84 us x92 ...); runs-local/D-GEMM/model_gemm.json</td></tr></tbody></table></div>
+<h5>Evidence</h5><ul class="ev"><li><code>perf-model/microbench/results/gap512/parsed/decode_families.txt</code></li><li><code>k31ws/runs-local/D-GEMM/model_gemm.json</code></li></ul>
 </section><section class="card" id="D-MOE">
 <header><span class="wid">D-MOE</span><h4>Decode: MegaMoE NVFP4 EP32 + shared-expert overlap</h4>
-<span class="st st-q">queued</span></header>
-<div class="meta"><span>Shape: D3-32 r24: 96 requests / DP rank (384 verify rows), L≈135K, k=3</span><span>Basis: gap512 EP16 in-step profile B92 (r23), MegaMoE moved to EP32 from the 8-node step delta</span>
-<span>Branch: <code></code></span><span>Owner: unassigned</span><span>Updated: 2026-11-18T12:40-08:00</span></div>
+<span class="st st-me">measuring</span></header>
+<div class="meta"><span>Shape: D3-32 r24: 96 requests / DP rank (384 verify rows), SP shard = 96 MoE tokens per GPU, 28 local experts, top-16, L~135K, k=3</span><span>Basis: baseline: gap512 EP16 in-step profile B92 (r23) moved to EP32 by the 8-node step delta (coordinator seed). Per-layer reference: moe_ep32 FI a368c5f66 standalone EP32 NVFP4 T64/T128 = 62.8/69.1 us vs model ach 36.1/37.8 us</span>
+<span>Branch: <code>wzhao/k31ws-d-moe @ 4fbaa15189</code></span><span>Owner: D-MOE agent (workflow)</span><span>Updated: 2026-11-18T12:50-08:00</span></div>
 <div class="nums"><div><b>8.30</b><small>baseline ms</small></div><div><b>8.30</b><small>now ms</small></div>
 <div><b>4.90</b><small>model achievable ms</small></div><div><b>5.40</b><small>target ms</small></div>
 <div><b>30.50</b><small>step ms</small></div></div>
-<h5>Gap analysis</h5><p>Vendored deep_gemm fp8_fp4 MegaMoE runs 109-122 us/layer vs FI 91-95 us standalone; ~50 us fixed per call; shared experts run serially after MegaMoE; no NVFP4 EP32 decode backend exists yet.</p>
-<div class="two"><div><h5>Current inefficiencies</h5><ul><li>Old vendored kernel</li><li>Fixed per-call chain (~50 us/layer)</li><li>Shared experts not overlapped</li><li>NVFP4 W4A4 path missing at EP32</li></ul></div>
-<div><h5>Vera Rubin features used</h5><ul></ul></div></div>
-<h5>Plan</h5><ol></ol>
-
-<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td>No entries yet.</td></tr></tbody></table></div>
-<h5>Evidence</h5><ul class="ev"><li><code>perf-model/microbench/results/gap512/parsed/decode_families.txt</code></li></ul>
+<h5>Gap analysis</h5><p>Per layer at EP32 NVFP4 (FI a368c5f66 standalone, Hecate): T1 50.4 us vs ach 17.3 (2.9x), T32 60.2 vs 35.2 (1.71x), T~96 ~66 vs ~37 (1.8x). A fixed per-call chain of ~50 us (same at every EP and both quants) dominates decode; the weight stream itself is a minority of the time. In tree today decode D3-32 runs the vendored DeepGEMM fp8_fp4 MegaMoE (no NVFP4 W4A4 EP32 backend exists), and the shared-expert GEMMs run serially after it (the side-stream overlap only exists on the kimi_k3_mega_moe path, which has no EP32 knobs). Next: 1-GPU (28 experts) and EP4 (112 experts) emulation of the EP32 per-GPU shape with FI a368c5f66 on WS_PYTHONPATH, torch-profiler kernel split + stamp buffer for the fixed chain.</p>
+<div class="two"><div><h5>Current inefficiencies</h5><ul><li>MEASURED (Hecate moe_ep32): fixed per-call chain ~50 us at T1 vs model 17 us; same at EP16/28/32 and for MX/NVFP4</li><li>In-tree decode uses vendored DeepGEMM fp8_fp4 MegaMoE (no NVFP4 W4A4 at EP32 in any tree)</li><li>Shared experts (MXFP8 under NVFP4 ckpt) serial after MegaMoE on D3-32 (no side-stream overlap on the deep_gemm path)</li><li>HYPOTHESIS: router/landing + phase-interleave scheduler polling + combine barrier dominate the fixed chain (to be measured with the stamp buffer)</li></ul></div>
+<div><h5>Vera Rubin features used</h5><ul><li>NVFP4 block-scaled tcgen05 MMA (E4M3 block-16 scales)</li><li>NVLink symmetric memory one-sided dispatch/combine (multimem where applicable)</li><li>Mixed CGA clusters (4x1 / 2x1) and TMA multicast</li><li>L2 persistence hints for the decode weight stream</li><li>PDL (programmatic dependent launch) to overlap the MegaMoE prologue with the router GEMM</li></ul></div></div>
+<h5>Plan</h5><ol><li>B0: stage FI a368c5f66 on Lustre (done: runs/D-MOE/fi-a368c) and measure EP1(28 experts)/EP4(112 experts) emulation at T 1/4/32/96/128, NVFP4 + MXFP4, with per-kernel profile</li><li>B3a: decode experts module on FI a368c5f66 MegaMoE (vendored into vllm/models/kimi_k3 packaging, shared with P-MOE), NVFP4 at every decode bucket, bitwise vs FI</li><li>B3b: wire into specialized_decode sp_mlp (EP32), raise at load on unsupported shapes</li><li>C1: root-cause the ~50 us fixed chain with stamps/ncu; cut it (router fold, PDL, barrier/poll latency)</li><li>C2: shared-expert overlap beside the persistent MegaMoE (SM partitioning / side stream), measure net</li><li>C3: 8-node EP32 confirmation on the hold8 (prepared in advance)</li></ol>
+<p class="blk"><b>Blocked:</b> pool GPUs busy (waiting in wsgpu queue)</p>
+<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td class='t'>12:45</td><td>queued b0 benches (EP1 28 experts, EP4 112 experts; NVFP4 + MXFP4; T 1/4/32/96/128) through wsgpu</td><td>waiting for pool GPUs</td></tr><tr><td class='t'>12:35</td><td>claimed; worktree /Users/weizha/k31ws-wt/d-moe on wzhao/k31ws-d-moe @ 4fbaa15189; built FI overlay runs/D-MOE/fi-a368c (a368c5f66 python+csrc+include over the image FI data)</td><td>ok</td></tr></tbody></table></div>
+<h5>Evidence</h5><ul class="ev"><li><code>perf-model/microbench/results/moe_ep32/rows.json</code></li><li><code>perf-model/microbench/results/gap512/parsed/decode_families.txt</code></li><li><code>rhea:/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/D-MOE/</code></li></ul>
 </section><section class="card" id="D-FUSE">
 <header><span class="wid">D-FUSE</span><h4>Decode: small-op fusion, SP collectives, drafter tail</h4>
-<span class="st st-q">queued</span></header>
-<div class="meta"><span>Shape: D3-32 r24: 96 requests / DP rank (384 verify rows), L≈135K, k=3</span><span>Basis: gap512 EP16 in-step profile B92 (r23), MegaMoE moved to EP32 from the 8-node step delta</span>
-<span>Branch: <code></code></span><span>Owner: unassigned</span><span>Updated: 2026-11-18T12:40-08:00</span></div>
+<span class="st st-im">implementing</span></header>
+<div class="meta"><span>Shape: D3-32 r24: 96 requests / DP rank (384 verify rows, 96 SP shard rows per GPU), L~135K, k=3</span><span>Basis: baseline: gap512 EP16 in-step profile B92 (r23) exposed: AttnRes 0.50, SiTU 0.33, latent norm 0.26, MegaMoE prepare 0.22, router top-k 0.21, SP RS 0.99, SP AG 0.69, drafter+final 0.89 ms. Achievable: rhea1n model_rows B96_L135K (attnres 0.147 + router topk/latent norm/shared act 0.006 + SP AG+RS 1.28 + drafter/final tail ~0.39 ms).</span>
+<span>Branch: <code>wzhao/k31ws-d-fuse @ 5c010e38</code></span><span>Owner: D-FUSE workflow agent</span><span>Updated: 2026-11-18T13:40-08:00</span></div>
 <div class="nums"><div><b>3.90</b><small>baseline ms</small></div><div><b>3.90</b><small>now ms</small></div>
-<div><b>1.50</b><small>model achievable ms</small></div><div><b>1.65</b><small>target ms</small></div>
+<div><b>1.82</b><small>model achievable ms</small></div><div><b>2.00</b><small>target ms</small></div>
 <div><b>30.50</b><small>step ms</small></div></div>
-<h5>Gap analysis</h5><p>AttnRes mix 5.8 us x 187 calls vs &lt;1 us; unfused SiLU, latent RMSNorm, router top-k, MegaMoE prep ~1.2 ms; SP RS/AG at the Lamport floor plus separate local-sum kernels; drafter tail 2-3x.</p>
-<div class="two"><div><h5>Current inefficiencies</h5><ul><li>Standalone elementwise kernels the model fuses</li><li>Separate exchange + reduce kernels</li><li>Drafter tail kernels</li></ul></div>
-<div><h5>Vera Rubin features used</h5><ul></ul></div></div>
-<h5>Plan</h5><ol></ol>
+<h5>Gap analysis</h5><p>Per decoder layer the SP step runs 4 standalone latency-bound kernels between the attention o-projection and the MLP GEMMs: stock attn_res pre (~3-6 us), SpAllGather (7.8 us), SpReduceScatter with push (7.9 us), stock attn_res post. The model charges AG/RS at the Lamport floor and AttnRes as a ~0.75 us memory pass; the measured excess is kernel boundaries + the stock AttnRes using only n of the SMs (one row per CTA). The SP path also keeps SiTU-and-mul, the latent RMSNorm, the router grouped top-k and the MegaMoE prepare as separate kernels (2-4 us each, 92 layers). Re-measuring at the D3-32 per-GPU shape (n=96) on Rhea first.</p>
+<div class="two"><div><h5>Current inefficiencies</h5><ul><li>AttnRes pre/post as standalone stock kernels (one row per CTA; 96 of the SMs busy at n=96) (measured gap512)</li><li>SP all-gather and reduce-scatter as separate kernels from the AttnRes they feed / follow (2 extra boundaries per layer)</li><li>R&gt;64 o-proj partial pushed by a separate pass inside the RS kernel (re-reads the partial)</li><li>SiTU-and-mul, latent RMSNorm, router grouped top-k, MegaMoE prepare unfused (92 layers x 4 kernels)</li><li>Drafter tail: NCCL ring AllGather (75 us) for the final aux gather, unfused ArNorm/GQA window kernels (hypothesis pending profile)</li></ul></div>
+<div><h5>Vera Rubin features used</h5><ul><li>thread-block clusters + DSMEM reductions (cluster AttnRes)</li><li>NVLink multicast stores (Lamport all-gather)</li><li>PDL (griddepcontrol) prologue overlap</li><li>TMA bulk loads</li></ul></div></div>
+<h5>Plan</h5><ol><li>Measure the SP layer-boundary chain (AttnRes pre/post + AG + RS) at n=4/32/96 on 4 GPUs (bench_kimi_k3_sdec_sp_chain.py)</li><li>K1: fuse pre-AttnRes + SP all-gather (cluster AttnRes publishing its output rows by multicast, polling the gathered rows)</li><li>K2: fuse SP reduce-scatter owner sum + post-AttnRes (cluster AttnRes reading the TP recv slots as its Lamport delta ring, re-arming slots + gather rows); push from the o-proj epilogue (with D-GEMM) or inside K2</li><li>Router GEMM + grouped top-k + MegaMoE prepare as one kernel (coordinate with D-GEMM/D-MOE)</li><li>SiTU-and-mul (+MXFP8 quant for NVFP4) into the shared gate_up epilogue (with D-GEMM); latent RMSNorm into the combine / latent_up path</li><li>Drafter tail: replace the NCCL final AG by the SP multicast gather; fuse tail kernels</li></ol>
 
-<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td>No entries yet.</td></tr></tbody></table></div>
-<h5>Evidence</h5><ul class="ev"><li><code>perf-model/microbench/results/gap512/parsed/decode_families.txt</code></li></ul>
+<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td class='t'>13:35</td><td>implemented SpAttnResGather (pre-AttnRes + SP AG) and SpReduceAttnRes (o-proj partial push + owner sum + post-AttnRes + re-arm) on ClusterAttnRes (7-CTA cluster/row, DSMEM stats exchange); SpStep.run uses them (4 -&gt; 2 kernels per layer boundary); SpFinalGather replaces the NCCL ring final AG (75 us measured in gap512) by one multicast Lamport kernel; distributed unit test vs stock chain</td><td>unmeasured: queued run3 (4-GPU chain bench stock vs fused at n=4/32/96 + numerics test) on the pool, overlay d-fuse-5c010e38-3</td></tr><tr><td class='t'>12:45</td><td>claimed; worktree /Users/weizha/k31ws-wt/d-fuse (wzhao/k31ws-d-fuse @ 4fbaa15189); read gap512, PLAN_NVFP4, model rows B96; wrote SP chain microbench</td><td>model achievable for the family at r24 ~1.82 ms (SP AG+RS 1.28 at the Lamport floor dominates)</td></tr></tbody></table></div>
+<h5>Evidence</h5><ul class="ev"><li><code>perf-model/microbench/results/gap512/parsed/dec_B92cap.txt</code></li><li><code>perf-model/microbench/rhea1n/model_rows.json (B96_L135K)</code></li><li><code>rhea runs/D-FUSE/run3 (pending)</code></li></ul>
 </section><section class="card" id="D-TOPK">
 <header><span class="wid">D-TOPK</span><h4>Decode: DSA exact top-k + DCP merge</h4>
-<span class="st st-q">queued</span></header>
-<div class="meta"><span>Shape: D3-32 r24: 96 requests / DP rank (384 verify rows), L≈135K, k=3</span><span>Basis: gap512 EP16 in-step profile B92 (r23), MegaMoE moved to EP32 from the 8-node step delta</span>
-<span>Branch: <code></code></span><span>Owner: unassigned</span><span>Updated: 2026-11-18T12:40-08:00</span></div>
+<span class="st st-an">analysis</span></header>
+<div class="meta"><span>Shape: D3-32 r24: 96 requests / DP rank (384 verify rows), L≈135K (local ≈33.75K on DCP4), k=3; also r1 (16 rows), r8 (128 rows)</span><span>Basis: baseline MEASURED in-step (gap512 EP16 B92 profile); achievable = rhea1n model_rows B96_L135K: DSA.topk 46.1 us + P8 DCP top-k merge 180.7 us per step (24 DSA layers: 1.9 + 7.5 us/layer); r8 (B32): 15.4 + ~154 us</span>
+<span>Branch: <code>wzhao/k31ws-d-topk @ 4fbaa15189</code></span><span>Owner: D-TOPK agent</span><span>Updated: 2026-11-18T13:20-08:00</span></div>
 <div class="nums"><div><b>2.30</b><small>baseline ms</small></div><div><b>2.30</b><small>now ms</small></div>
-<div><b>0.22</b><small>model achievable ms</small></div><div><b>0.25</b><small>target ms</small></div>
+<div><b>0.23</b><small>model achievable ms</small></div><div><b>0.25</b><small>target ms</small></div>
 <div><b>30.50</b><small>step ms</small></div></div>
-<h5>Gap analysis</h5><p>topk_merge_kernel&lt;16&gt; 52-77 us/layer vs 6-7 modelled; pp hist/window/win passes 25-45 us vs 1.4; merge grid [2, rows] walks 4 ranks x 2048 candidates serially with remote NVLink reads and flag polls; logits re-read three times; on the critical stream.</p>
-<div class="two"><div><h5>Current inefficiencies</h5><ul><li>2 CTAs per row serial merge over remote reads</li><li>Three passes over logits</li><li>PDL off on the merge</li><li>Critical-stream placement</li></ul></div>
-<div><h5>Vera Rubin features used</h5><ul></ul></div></div>
-<h5>Plan</h5><ol></ol>
-
-<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td>No entries yet.</td></tr></tbody></table></div>
-<h5>Evidence</h5><ul class="ev"><li><code>perf-model/microbench/results/gap512/parsed/decode_families.txt</code></li></ul>
+<h5>Gap analysis</h5><p>Seeded from gap512: topk_merge_kernel&lt;16&gt; 52-77 us/layer vs 6-7 modelled; topk_pp_hist/window/win 25-45 us vs 1.4. Code read (dcp_exchange decode wiring): launch_params bounds the local length by max_model_len/DCP (1M/4 = 262144 keys), which forces cluster=2 CTAs per row (WRITE bitmap holds 131072 keys/CTA) and segmax=0 (keys streamed from global) at every batch, and the pre-pass on, independent of the real contexts (~34K local). PDL is hard-off on the merge (s_pdl_rows = 0) because the trtllm-gen sparse core reads counts before griddepcontrol.wait. Phase breakdown pending (bench with per-row dbg stamps).</p>
+<div class="two"><div><h5>Current inefficiencies</h5><ul><li>launch shape bounded by max_model_len (1M), not the step&#x27;s contexts: 2 CTAs/row + streamed keys + pre-pass everywhere (code read; cost to be measured)</li><li>pre-pass = 3 kernels (hist, window, win) + merge kernel WRITE pass: logits read &gt;= 3x (code read)</li><li>merge kernel PDL off (consumer reads counts before its wait); serial launch chain on the critical stream</li><li>1 NVLink round + tie round per row with flag polls in 2 CTAs/row (hypothesis: latency-bound, to be measured with dbg stamps)</li></ul></div>
+<div><h5>Vera Rubin features used</h5><ul><li>NVLink multicast (multimem.st) for the candidate/histogram exchange</li><li>thread-block clusters + DSMEM for per-row parallel histogram reduce</li><li>PDL (griddepcontrol) chaining with the indexer logits kernel and the sparse core</li><li>TMA bulk loads of logits tiles</li></ul></div></div>
+<h5>Plan</h5><ol><li>1. 4-GPU microbench (DCP4 group) of the in-tree DcpExchange top-k at r1/r8/r24, L=135K, realistic logits; per-kernel CUPTI times + per-row phase stamps + path stats</li><li>2. root-cause the merge/pre-pass time (ncu on the merge kernel)</li><li>3. redesign: single-pass histogram select over the whole GPU, one multicast exchange, parallel resolve + WRITE, PDL</li><li>4. exactness unit test vs stock (bitwise selection sets), graph-safe tie/overflow path</li><li>5. microbench vs model at r1/r8/r24; step A/B with INFRA harness; landed-ready</li></ol>
+<p class="blk"><b>Blocked:</b> no k31ws pool hold running yet (hold1/hold8 pending)</p>
+<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td class='t'>13:20</td><td>read directives, model rows, gap512, dcp_exchange code; worktree /Users/weizha/k31ws-wt/d-topk on wzhao/k31ws-d-topk @ 4fbaa15189</td><td>model target per layer r24: 1.9 us topk + 7.5 us merge; found max_model_len-bound launch shape (cluster 2, streamed, pre-pass) at every batch</td></tr></tbody></table></div>
+<h5>Evidence</h5><ul class="ev"><li><code>perf-model/microbench/results/gap512/parsed/decode_families.txt</code></li><li><code>perf-model/microbench/rhea1n/model_rows.json (B32/B96 DSA.topk + COMM.P8)</code></li></ul>
 </section><section class="card" id="D-ATTN">
 <header><span class="wid">D-ATTN</span><h4>Decode: DSA attention path (q path, sparse MLA, DCP value, indexer)</h4>
-<span class="st st-q">queued</span></header>
-<div class="meta"><span>Shape: D3-32 r24: 96 requests / DP rank (384 verify rows), L≈135K, k=3</span><span>Basis: gap512 EP16 in-step profile B92 (r23), MegaMoE moved to EP32 from the 8-node step delta</span>
-<span>Branch: <code></code></span><span>Owner: unassigned</span><span>Updated: 2026-11-18T12:40-08:00</span></div>
+<span class="st st-im">implementing</span></header>
+<div class="meta"><span>Shape: D3-32 r24: 96 requests / DP rank (384 verify rows), L~135K, k=3 (per GPU: 24 of 96 heads, DCP4 KV shard)</span><span>Basis: MEASURED in-step gap512 EP16 D3 B80/B92cap profiles (perf-model/microbench/results/gap512/parsed); D3-32 r24 transfer</span>
+<span>Branch: <code>wzhao/k31ws-d-attn @ 33b0d1996f</code></span><span>Owner: D-ATTN workflow agent</span><span>Updated: 2026-11-18T12:45-08:00</span></div>
 <div class="nums"><div><b>3.30</b><small>baseline ms</small></div><div><b>3.30</b><small>now ms</small></div>
 <div><b>1.30</b><small>model achievable ms</small></div><div><b>1.45</b><small>target ms</small></div>
 <div><b>30.50</b><small>step ms</small></div></div>
-<h5>Gap analysis</h5><p>MlaQuery q path 28-50 us/layer vs 5-10; sparse MLA fmha 18.7 us vs 5 at B50 (96-&gt;128 head padding, per-row 2048-row gather); indexer re-streams keys for each of a request&#x27;s 4 verify rows.</p>
-<div class="two"><div><h5>Current inefficiencies</h5><ul><li>96-&gt;128 head padding</li><li>Per-row KV re-gather</li><li>Unfused q path</li><li>Indexer 4-row key re-streaming</li></ul></div>
-<div><h5>Vera Rubin features used</h5><ul></ul></div></div>
-<h5>Plan</h5><ol></ol>
-
-<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td>No entries yet.</td></tr></tbody></table></div>
-<h5>Evidence</h5><ul class="ev"><li><code>perf-model/microbench/results/gap512/parsed/decode_families.txt</code></li></ul>
+<h5>Gap analysis</h5><p>Per DSA layer at B92 (368 rows, gap512 in-step): MlaQuery 89 us (side stream, forked against the indexer chain), QueryWait 46 us (polls other ranks&#x27; publishes), trtllm-gen sparse MLA 32 us + LSE 1.3 us, DcpValue 25 us, paged_mqa_logits 35 us, DsaIndex 8.5 us; the indexer wq_b split-K GEMM on the main stream runs 62 us while MlaQuery holds the SMs (model ach ~4 us). Model ach per layer at r24: q path (qb_wq+w_uk) ~5 us + P6 q publish ~17 us, sparse_mla ~9.6 us, P7b+w_uv ~13 us, idx_score ~18 us. MlaQuery tiles 64 rows x 24 heads into 8-CTA per-head clusters (1152 CTAs at 368 rows, ~6.5 cluster rounds) and keeps the GB300 schedule for DSA (Rubin staging disabled): HYPOTHESIS that its time is cluster-round latency, not bytes or FLOPs (measuring standalone now).</p>
+<div class="two"><div><h5>Current inefficiencies</h5><ul><li>MlaQuery: per-head 8-CTA cluster tiling, ~6.5 rounds at 368 rows, 89 us vs ~5 us of GEMM work (hypothesis: round latency; standalone bench running)</li><li>P6 q publish: 24 heads x 576 B x R rows multicast to 3 peers (~16 MB/layer at r24) + QueryWait cross-rank poll on the critical path</li><li>Sparse MLA trtllm-gen: 96-&gt;128 head padding (+33% MMA), per-row 2048-row KV gather (no sharing across a request&#x27;s 4 verify rows), 32 us vs ~10 model</li><li>DcpValue proj: 25 us vs ~9 model (P7b push + W_UV + LSE merge)</li><li>Indexer logits: each of a request&#x27;s 4 verify rows re-streams the keys (35-46 us vs 18 model)</li></ul></div>
+<div><h5>Vera Rubin features used</h5><ul><li>tcgen05 UMMA (FP8 / block-scaled MXFP4) with TMEM accumulators</li><li>2-CTA (cta_group::2) MMA</li><li>TMA gather4 for paged KV / index-key row gathers</li><li>PDL chaining</li><li>NVLink multicast only where a push beats local recompute</li></ul></div></div>
+<h5>Plan</h5><ol><li>1. Measure standalone (1 GPU, deployed rows 128/256/384/512): MlaQuery vs cuBLAS q_b GEMM + W_UK bmm for 24 and all 96 heads</li><li>2. q path redesign: each rank already holds every gathered row&#x27;s q_a, so compute all 96 heads&#x27; FP8 query locally (gathered W_qb / W_UK at build) and drop the P6 publish + QueryWait poll; KV insert of owned slots stays</li><li>3. Sparse MLA: native 96-head FP8 decode sharing each request&#x27;s gathered KV across its 4 verify rows (ncu the trtllm-gen kernel first)</li><li>4. DcpValue: re-measure after 2-3; fuse W_UV + push</li><li>5. Joint 4-row indexer logits</li><li>6. Unit tests vs stock + microbench vs model at r1/r8/r24, step A/B on INFRA harness</li></ol>
+<p class="blk"><b>Blocked:</b> pool: no k31ws hold running since 12:15 PT (hold1 x5 and hold8 pending)</p>
+<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td class='t'>12:40</td><td>implemented LocalQuery (all 96 heads per rank, no P6 publish / QueryWait / q-mailbox re-arm) for SP rows 17-512; DcpValue rearm flag; unit test vs stock; q-path + sparse-MLA microbenches</td><td>committed 33b0d1996f, pushed; GPU runs queued (runs/D-ATTN/run1.log, run2.log), waiting for a pool hold</td></tr><tr><td class='t'>12:15</td><td>read gap512 in-step evidence; worktree wzhao/k31ws-d-attn @ 4fbaa15189</td><td>D-ATTN family at B92: MlaQuery 89 + QueryWait 46 + fmha 32 + DcpValue 25 + logits 35 us/layer</td></tr></tbody></table></div>
+<h5>Evidence</h5><ul class="ev"><li><code>perf-model/microbench/results/gap512/parsed/dec_B80.json</code></li><li><code>perf-model/microbench/results/gap512/parsed/dec_B92cap.json</code></li><li><code>rhea:/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/D-ATTN/</code></li></ul>
 </section><section class="card" id="D-KDA">
 <header><span class="wid">D-KDA</span><h4>Decode: KDA core (FP32 state)</h4>
-<span class="st st-q">queued</span></header>
-<div class="meta"><span>Shape: D3-32 r24: 96 requests / DP rank (384 verify rows), L≈135K, k=3</span><span>Basis: gap512 EP16 in-step profile B92 (r23), MegaMoE moved to EP32 from the 8-node step delta</span>
-<span>Branch: <code></code></span><span>Owner: unassigned</span><span>Updated: 2026-11-18T12:40-08:00</span></div>
+<span class="st st-im">implementing</span></header>
+<div class="meta"><span>Shape: D3-32 r24: 96 requests / DP rank (384 verify rows), L≈135K, k=3; per GPU 24 KDA heads x 96 requests = 2304 (request, head) items/layer</span><span>Basis: MEASURED: Rhea 1-node profile, 93-layer projection (perf-model/microbench/results/rhea1n_d3x32)</span>
+<span>Branch: <code>wzhao/k31ws-d-kda @ 4fbaa15189 (+uncommitted KdaFlow)</code></span><span>Owner: D-KDA agent</span><span>Updated: 2026-11-18T12:50-08:00</span></div>
 <div class="nums"><div><b>3.40</b><small>baseline ms</small></div><div><b>3.40</b><small>now ms</small></div>
-<div><b>1.70</b><small>model achievable ms</small></div><div><b>1.90</b><small>target ms</small></div>
-<div><b>30.50</b><small>step ms</small></div></div>
-<h5>Gap analysis</h5><p>KdaWide 30-49 us/layer vs 14-25 modelled: ~35% of HBM on 166 MB FP32 state per layer; per-(head-group, request) CTA grid latency-bound on the q=4 serial update; KdaWS above B80 is a separate kernel.</p>
-<div class="two"><div><h5>Current inefficiencies</h5><ul><li>Latency-bound CTA grid</li><li>35% HBM utilization on state stream</li><li>Two kernels across batch sizes</li></ul></div>
-<div><h5>Vera Rubin features used</h5><ul></ul></div></div>
-<h5>Plan</h5><ol></ol>
-
-<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td>No entries yet.</td></tr></tbody></table></div>
-<h5>Evidence</h5><ul class="ev"><li><code>perf-model/microbench/results/gap512/parsed/decode_families.txt</code></li></ul>
+<div><b>1.81</b><small>model achievable ms</small></div><div><b>1.99</b><small>target ms</small></div>
+<div><b>29.78</b><small>step ms</small></div></div>
+<h5>Gap analysis</h5><p>KdaWide 30-49 us/layer vs model 8.8 (B32) / 26.3 (B96) us/layer. Model achievable is memory bound: per (request, head) item 64 KB FP32 state read + 64 KB write (deferred fold writes the committed checkpoint once) + ~14 KB conv window + records, at the measured full-chip default-allocation HBM rate. Hypotheses (unmeasured): (1) per-item CTA grid keeps too few state bytes in flight per SM (one 64 KB page per CTA, 2 CTAs/SM, load -&gt; compute -&gt; store serialized), (2) FP32 recurrence work per item (~0.8 MFLOP) is ~55% of the memory time, so compute must overlap with streaming, (3) above n=70 KdaWS is used and it does NOT fold: the step pays a separate flush (state read + write) plus a read in KdaWS = 3 state passes instead of 2. Measurement (baseline microbench + ncu) is next.</p>
+<div class="two"><div><h5>Current inefficiencies</h5><ul><li>HYPOTHESIS: latency-bound per-(head, request) CTA grid: few state bytes in flight per SM</li><li>HYPOTHESIS: KdaWS (n&gt;=71) does not fold the deferred commit: separate flush = 3 state passes instead of 2</li><li>HYPOTHESIS: die-oblivious state streaming: half the bytes cross the die-to-die link (default 4 KiB die interleave)</li><li>Two kernels across batch sizes (KdaWide &lt;=70, KdaWS above)</li></ul></div>
+<div><h5>Vera Rubin features used</h5><ul><li>two-die locality domains: per-4 KiB page home die (default interleave) + %smid -&gt; die map (dies.py)</li><li>bulk async copies (TMA) into a multi-stage shared-memory ring</li><li>packed FP32 FMA (fma.rn.f32x2)</li><li>programmatic dependent launch</li></ul></div></div>
+<h5>Plan</h5><ol><li>Baseline microbench at deployed per-GPU shapes n=32/64/96/128 (r8/r16/r24/r32), deferred fold active, 69 layers over disjoint state sets in one CUDA graph</li><li>ncu KdaWide / KdaWS at n=32 and n=96: dram throughput, bytes in flight, stall reasons</li><li>Design one per-shape persistent kernel family: multi-stage bulk-copy state ring, fold + verify + conv + gate + o_norm fused, deep memory pipeline; die-local row split (value rows are independent) as the step to the die-local roofline</li><li>Bitwise/stock-tolerance unit tests vs the stock commit + verify (reuse test_specialized_decode_sp_kda_fold_gpu.py)</li><li>Microbench vs model at r8/r16/r24/r32; step A/B via INFRA harness; landed-ready</li></ol>
+<p class="blk"><b>Blocked:</b> pool holds pending (Priority), first expected ~13:30</p>
+<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td class='t'>12:50</td><td>wrote KdaFlow (cutedsl/kda/flow.py): persistent warp-specialized record core = KdaWS scan/prep + KdaWide deferred fold (commit-exact) + 2-stage bulk-copy state ring; sp.py kind flow (in FOLDS); bitwise test vs KdaWS triton + stock commit (test_specialized_decode_sp_kda_flow_gpu.py); bench benchmarks/kernels/k31_vr/kda_sp_bench.py</td><td>queued on pool (overlay d-kda-flow-1, run runs/D-KDA/run2.log); no pool hold running yet</td></tr><tr><td class='t'>12:45</td><td>read plan, gap512 decode families, model rows, KdaWide/KdaWS/sp.py dispatch, dies.py; worktree /Users/weizha/k31ws-wt/d-kda on wzhao/k31ws-d-kda @ 4fbaa15189</td><td>model target per layer: B32 8.76 us, B64 17.5, B96 26.3 (x69 = 0.60 / 1.21 / 1.81 ms); gap512 measured 1.47 / 2.66 / 3.36 ms at B32 / B64 / B92</td></tr></tbody></table></div>
+<h5>Evidence</h5><ul class="ev"><li><code>perf-model/microbench/results/gap512/parsed/decode_families.txt</code></li><li><code>perf-model/microbench/rhea1n/model_rows.json</code></li></ul>
 </section><section class="card" id="P-MOE">
 <header><span class="wid">P-MOE</span><h4>Prefill: MegaMoE FI NVFP4 (2x8K) + shared-expert side stream</h4>
-<span class="st st-q">queued</span></header>
-<div class="meta"><span>Shape: DEP16 F16K (3 x 5,456 tok) at L78K, NVFP4</span><span>Basis: PROJECTED (reviewed ledger, perf-model/plan/nvfp4_ledgers_summary.txt)</span>
-<span>Branch: <code></code></span><span>Owner: unassigned</span><span>Updated: 2026-11-18T12:40-08:00</span></div>
+<span class="st st-me">measuring</span></header>
+<div class="meta"><span>Shape: DEP16 F16K (3 x 5,456 tok) at L78K, NVFP4; MegaMoE T=16384 tokens/rank, 56 experts/GPU, 92 layers; shared MXFP8 gate_up [12288,7168] + down [7168,6144]</span><span>Basis: PROJECTED (reviewed ledger); first standalone EP4-emulation measurements queued (r1/r2)</span>
+<span>Branch: <code>wzhao/k31ws-p-moe @ e7f2f4676f</code></span><span>Owner: P-MOE agent (workflow)</span><span>Updated: 2026-11-18T16:25-08:00</span></div>
 <div class="nums"><div><b>320</b><small>baseline ms</small></div><div><b>320</b><small>now ms</small></div>
 <div><b>198</b><small>model achievable ms</small></div><div><b>218</b><small>target ms</small></div>
 <div><b>825</b><small>step ms</small></div></div>
-<h5>Gap analysis</h5><p>Vendored megamoe_rubin NVFP4 in-step inferred 281-358 ms vs FI 230.7 ms standalone (2x8K) vs model 197.9; separate router/reduce staging kernels; link-bound layer (1.97 ms link floor) exposes ~0.68 ms/layer of GEMM; shared experts lose their overlap when staging is removed.</p>
-<div class="two"><div><h5>Current inefficiencies</h5><ul><li>Vendored kernel staging</li><li>Partial GEMM/link overlap</li><li>Shared-expert side stream starved of SMs</li></ul></div>
-<div><h5>Vera Rubin features used</h5><ul></ul></div></div>
-<h5>Plan</h5><ol></ol>
-
-<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td>No entries yet.</td></tr></tbody></table></div>
-<h5>Evidence</h5><ul class="ev"><li><code>perf-model/plan/PLAN_NVFP4.md</code></li></ul>
+<h5>Gap analysis</h5><p>Model (optables nvfp4_modelopt|P3-16|prefill): MegaMoE layer = max(ops 1.05, link 1.97) + exposed = 2.151 ms/layer (197.9 ms/step); shared MXFP8 37.4 ms/step. The NVFP4 EP16 MegaMoE is NVLink-bound on the BF16 combine (FI SOL ledger: 8K call = 1256 us of which combine ~823 us at the measured link rate; MMA ~258 us), so the tensor cores idle ~75% of the layer. Current in-step path (code reading): one 16K-capacity launch with the i8192 S2/N256 record knobs, 4 kernels per call (stage, router, persistent main, top-k reduce), shared experts serial after MegaMoE in the TP1 DEP path (the SP side-stream overlap is not taken at TP1). Vendored vs FI kernel at 8K differs by ~2% in tuner numbers (1282 vs 1254 us), so the ledger&#x27;s 281-358 ms in-step range is unverified; r1 measures vendored 8K/16K vs FI 8K/16K at the per-rank shape, r2 the 2x8K sub-calls with the shared expert overlapped at persistent-grid caps.</p>
+<div class="two"><div><h5>Current inefficiencies</h5><ul><li>Shared experts serial after MegaMoE on the TP1 DEP path (~40-64 ms/step exposed; model hides them under the link-bound MegaMoE) [code + release-tree profile]</li><li>Single 16K-capacity MegaMoE call vs 2x8K sub-calls (FI: 2649 vs 2x1254 us) [FI measured; vendored to measure]</li><li>Router kernel 0.34 ms/layer exclusive in the release-tree F8K profile (sizes round + metadata push; includes rank skew) [measured MX, cause hypothesis]</li><li>BF16 combine at ~1.07 TB/s vs model link 1.146 TB/s; 2.5% of combine bytes avoidable only by an FP32 per-rank pre-reduction (not worth it) [analysis]</li></ul></div>
+<div><h5>Vera Rubin features used</h5><ul><li>tcgen05 2-CTA block-scaled MMA (mxf4nvf4, NVFP4 W4A4)</li><li>TMA bulk copies over NVLink (pull dispatch, bulk-store combine)</li><li>programmatic dependent launch (router -&gt; persistent main kernel)</li><li>persistent-grid SM cap for side-stream overlap (planned: green-context SM partitions)</li></ul></div></div>
+<h5>Plan</h5><ol><li>r1: standalone EP4 emu (56 experts/GPU) vendored NVFP4 T8K/T16K vs FI a368c5f66 T8K/T16K</li><li>r2: 2x8K sub-calls + MXFP8 shared on a side stream at grid caps 0/-16/-32/-48 SMs, per-kernel profile</li><li>specialized_prefill MoE: EP-uniform sub-call count, capacity 8K buckets (smaller symmetric arena), shared-expert overlap at the measured cap; unit test bitwise vs stock</li><li>step A/B on INFRA step_p (DEP4 slice) with the NVFP4 MoE arm</li><li>then the in-kernel items: router/stage/reduce absorption, dispatch/combine interleave across sub-calls</li></ol>
+<p class="blk"><b>Blocked:</b> Rhea pool: no k31ws hold running yet (all pending), r1/r2 queued under wsgpu.</p>
+<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td class='t'>16:20</td><td>code reading of the in-step path + release-tree P3 F8K profile; new bench_megamoe_prefill_overlap.py (sub-calls + shared overlap at grid caps); r2 chained after r1</td><td>findings/P-MOE.md: knob selection at 16K = i8192 S2/N256 record; shared serial on TP1 DEP; MegaMoE combine-link-bound</td></tr><tr><td class='t'>16:05</td><td>bench_megamoe_rubin --num-experts (EP-size emulation), commit e7f2f4676f; FI bench wrapper with expert-count emulation; r1 queued (wsgpu -g 4)</td><td>waiting for pool GPUs (13 waiters, no k31ws hold running)</td></tr><tr><td class='t'>15:40</td><td>claimed workstream; worktree /Users/weizha/k31ws-wt/p-moe on wzhao/k31ws-p-moe @ 4fbaa15189</td><td>reading code</td></tr></tbody></table></div>
+<h5>Evidence</h5><ul class="ev"><li><code>perf-model/plan/PLAN_NVFP4.md</code></li><li><code>perf-model/microbench/results/moe/README.md</code></li><li><code>perf-model/microbench/results/prefill/analysis/p3g.opmap.json</code></li><li><code>rhea:/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-MOE/{r1,r2}</code></li></ul>
 </section><section class="card" id="P-KDA">
 <header><span class="wid">P-KDA</span><h4>Prefill: KDA chain (core + conv + gated o_norm)</h4>
-<span class="st st-q">queued</span></header>
-<div class="meta"><span>Shape: DEP16 F16K (3 x 5,456 tok) at L78K, NVFP4</span><span>Basis: PROJECTED (reviewed ledger, perf-model/plan/nvfp4_ledgers_summary.txt)</span>
-<span>Branch: <code></code></span><span>Owner: unassigned</span><span>Updated: 2026-11-18T12:40-08:00</span></div>
+<span class="st st-im">implementing</span></header>
+<div class="meta"><span>Shape: DEP16 F16K (3 x 5,456 tok) at L78K, NVFP4, 96 KDA heads at TP1, FP32 state (per GPU, per prefill forward, 69 KDA layers)</span><span>Basis: PROJECTED (reviewed ledger); model nvfp4_modelopt|P3-16|prefill per layer: conv 55.1 + gate_beta_norm 18.4 + core_prefill 167.0 + o_norm 12.2 = 252.7 us x 69 = 17.4 ms</span>
+<span>Branch: <code>wzhao/k31ws-p-kda @ 218581f271</code></span><span>Owner: P-KDA agent</span><span>Updated: 2026-11-18T14:10-08:00</span></div>
 <div class="nums"><div><b>78.00</b><small>baseline ms</small></div><div><b>78.00</b><small>now ms</small></div>
-<div><b>16.00</b><small>model achievable ms</small></div><div><b>18.00</b><small>target ms</small></div>
+<div><b>17.40</b><small>model achievable ms</small></div><div><b>19.10</b><small>target ms</small></div>
 <div><b>825</b><small>step ms</small></div></div>
-<h5>Gap analysis</h5><p>96 heads at TP1 fall off the v-split FlashKDA build: 288 CTAs walk 5.4K tokens chunk-serially; prepare is a separate full pass; conv and gated RMSNorm are standalone HBM passes.</p>
-<div class="two"><div><h5>Current inefficiencies</h5><ul><li>No 96-head v-split build</li><li>Separate prepare pass</li><li>Unfused conv and o_norm</li></ul></div>
-<div><h5>Vera Rubin features used</h5><ul></ul></div></div>
-<h5>Plan</h5><ol></ol>
-
-<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td>No entries yet.</td></tr></tbody></table></div>
-<h5>Evidence</h5><ul class="ev"><li><code>perf-model/plan/PLAN_NVFP4.md</code></li></ul>
+<h5>Gap analysis</h5><p>Model prices conv and o_norm with zero activation bytes (fused into the core&#x27;s load / store) and core_prefill as one memory-bound pass (2.0 GB/layer: q,k,v,g in, o out). Today: separate fused-QKV conv pass (reads 1.2 GB, writes 1.2 GB), FlashKDA K1 prepare (reads q,k,g, writes three bf16 [T,H,D] workspaces + tiles), K2 recurrence (reads v + workspaces, writes o), separate gated o_norm + MXFP8 quant pass. 96 heads x 3 seqs exceed the in-tree v-split build&#x27;s one-wave limit, so the stock full-width K2 runs (288 CTAs over 212 SMs, chunk-serial over 341 16-token chunks). Baseline per-kernel breakdown at the deployed shape is being measured.</p>
+<div class="two"><div><h5>Current inefficiencies</h5><ul><li>No 96-head v-split recurrence build (stock full-width K2, 288 CTAs &gt; 1 wave) [ledger, re-measuring]</li><li>Separate prepare pass K1 with ~1.2 GB workspace round trip [code reading; bytes to be measured]</li><li>Unfused conv (2.4 GB HBM pass) and gated o_norm + MXFP8 quant (~1 GB pass) [code reading]</li></ul></div>
+<div><h5>Vera Rubin features used</h5><ul><li>bulk async copies (TMA) for the g / beta / dt_bias tiles, overlapped with the in-load conv</li><li>packed FP32 FMA (fma.rn.f32x2) and packed FP32 mul/add in the conv + SiLU (IEEE per lane)</li><li>planned: tcgen05 MMA with TMEM-resident accumulators for the 96-head recurrence; larger per-SM shared memory for resident state</li></ul></div></div>
+<h5>Plan</h5><ol><li>Baseline per-kernel microbench of the chain at F16K and F8K on 1 VR200 GPU (queued)</li><li>Fuse the Q|K|V short conv into FlashKDA prepare (K1 reads raw rows, writes conv V for K2): removes the 2.4 GB conv pass, adds ~0.8 GB (implemented, test pending)</li><li>Fuse gated o_norm + MXFP8 quant into the full-width recurrence epilogue (removes ~0.8 GB o round trip)</li><li>Hide prepare (K1) under the compute-bound recurrence: concurrent K1/K2 with per-tile ready flags (workspace stays in L2)</li><li>Recurrence throughput: balance 288 (seq, head) items over 212 SMs; tcgen05 recurrence (state FP32 in registers/TMEM, MMAs on the tensor core) if ncu shows the legacy MMA pipe bound</li><li>Wire per-shape dispatch in kda.py (stock wiring only), step A/B, landed-ready</li></ol>
+<p class="blk"><b>Blocked:</b> k31ws 1-GPU holds all pending (Priority) since 13:15; 16 waiters in the pool</p>
+<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td class='t'>14:05</td><td>implemented FusedConv K1 variant in ops/flashkda_split (conv_fused.cuh: kda_qkv_conv FP32-weight arithmetic bit for bit, conv state from the first tile), torch op k3_flashkda_split.fwd_conv, specialized_prefill/kda.py:fused_conv_prefill, bitwise unit test vs qkv_conv + FlashKDA, bench --impl stock|split|fused; commit 218581f271 pushed</td><td>GPU test + A/B queued (overlay p-kda-4fbaa15-2); 1-GPU pool has no running hold since 13:15</td></tr><tr><td class='t'>13:20</td><td>read plan/ledger/model rows/code; worktree /Users/weizha/k31ws-wt/p-kda on wzhao/k31ws-p-kda @ 4fbaa15189; wrote benchmarks/kimi_k3/bench_kda_prefill_chain.py; overlay p-kda-4fbaa15-1</td><td>baseline bench queued on the 1-GPU pool (holds pending)</td></tr></tbody></table></div>
+<h5>Evidence</h5><ul class="ev"><li><code>perf-model/plan/PLAN_NVFP4.md</code></li><li><code>perf-model/microbench/results/ops1 kda-077</code></li></ul>
 </section><section class="card" id="P-MLA">
 <header><span class="wid">P-MLA</span><h4>Prefill: sparse MLA + prologue</h4>
-<span class="st st-q">queued</span></header>
-<div class="meta"><span>Shape: DEP16 F16K (3 x 5,456 tok) at L78K, NVFP4</span><span>Basis: PROJECTED (reviewed ledger, perf-model/plan/nvfp4_ledgers_summary.txt)</span>
-<span>Branch: <code></code></span><span>Owner: unassigned</span><span>Updated: 2026-11-18T12:40-08:00</span></div>
+<span class="st st-an">analysis</span></header>
+<div class="meta"><span>Shape: DEP16 F16K (3 x 5,461 tok) at L78K, NVFP4, 96 heads/GPU, top-2048, FP8 KV 576 B rows; 24 DSA layers</span><span>Basis: MEASURED in-step at F8K x2 (perf-model/microbench/results/prefill rows.json P3-16 pf8k_L78k: sparse_mla 25.43 ms incl. index_remap 0.69, prologue+aux 6.55, gate_mul 1.69 per step); model ach from out/optables.json &#x27;nvfp4_modelopt|P3-16|prefill&#x27; (DSA.sparse_mla 643.1 us + DSA.prologue 10.9 us + DSA.gate_mul 7.7 us per layer x 24)</span>
+<span>Branch: <code>wzhao/k31ws-p-mla @ 4fbaa15189 (bench uncommitted)</code></span><span>Owner: P-MLA workflow agent</span><span>Updated: 2026-11-18T12:45-08:00</span></div>
 <div class="nums"><div><b>67.00</b><small>baseline ms</small></div><div><b>67.00</b><small>now ms</small></div>
-<div><b>16.00</b><small>model achievable ms</small></div><div><b>17.50</b><small>target ms</small></div>
+<div><b>15.90</b><small>model achievable ms</small></div><div><b>17.50</b><small>target ms</small></div>
 <div><b>825</b><small>step ms</small></div></div>
-<h5>Gap analysis</h5><p>Generation-phase trtllm-gen kernel on 3072 ShardQ rows at ~30% of FP8 MMA rate; 96-&gt;128 head padding; V512 split possibly recomputes QK (hypothesis); separate quant/pad/insert prologue kernels plus an unidentified 1 ms CuTe kernel.</p>
-<div class="two"><div><h5>Current inefficiencies</h5><ul><li>Decode-form kernel used for prefill</li><li>Head padding</li><li>Unfused prologue</li></ul></div>
-<div><h5>Vera Rubin features used</h5><ul></ul></div></div>
-<h5>Plan</h5><ol></ol>
-
-<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td>No entries yet.</td></tr></tbody></table></div>
-<h5>Evidence</h5><ul class="ev"><li><code>perf-model/plan/PLAN_NVFP4.md</code></li></ul>
+<h5>Gap analysis</h5><p>Per F8K step (in-step, release tree): trtllm-gen decode-form fmhaSm107a (QkvE4m3 HQk576 HV512 HVPerCta256 SparseP1 Q64Kv128 2Cta) 24.74 ms = 3.2x its model share; standalone at F16K (ops1 sparse_mla-161) 2480 us/layer vs 643 us model ach. Prologue 6.55 ms (scaled_fp8_quant 2.60, _pad_query_heads 2.06, concat_and_cache_mla 0.84, plus ~1 ms unidentified), gate_mul 1.69 ms. Code reading (this tree): at TP1/DCP1 the in-place RoPE concat path leaves q_pe empty, so quantize_decode_query (the fused quant+pad Triton kernel) is skipped and quant + pad run as two passes over a 1.1 GB/1.5 GB query; trtllm-gen writes a 128-head BF16 output that w_uv reads through a strided [:, :96] view. Kernel-level root cause of the 3.2x is not yet measured (ncu run1 queued).</p>
+<div class="two"><div><h5>Current inefficiencies</h5><ul><li>Decode-form trtllm-gen kernel used for prefill: one token per request, 2048 KV rows gathered per token (MEASURED in-step time; per-cause split pending ncu)</li><li>96 -&gt; 128 head padding: 25% of MMA work wasted plus a padded query copy and 128-head output (MEASURED kernel names; cost share pending ncu)</li><li>HVPerCta256: V512 split across CTAs may recompute QK per V half (HYPOTHESIS, ncu pending)</li><li>Query quant and head pad are two separate full passes (scaled_fp8_quant + _pad_query_heads) because the in-place RoPE concat disables the fused quant_pad kernel (code reading, MEASURED 4.66 ms/F8K step)</li><li>gate_mul is a separate pass over the [T, 12288] BF16 output (MEASURED 1.69 ms/F8K step)</li><li>Unidentified ~1 ms kernel in the DSA prologue (to identify in a profile)</li></ul></div>
+<div><h5>Vera Rubin features used</h5><ul><li>tcgen05 FP8 (kind::f8f6f4) MMA with TMEM accumulators, 2-CTA pairs</li><li>extended TMEM column budget on sm_107 (fits S and the full 512-wide O for a 96-head tile)</li><li>TMA gather4 / async bulk copies for paged KV row gather</li><li>redux.sync f32 max for cross-lane softmax reductions (transposed-tile design option)</li><li>PDL (programmatic dependent launch) between prologue, attention and w_uv</li></ul></div></div>
+<h5>Plan</h5><ol><li>1. Measure the stock chain kernel by kernel at F8K/F16K on 1 GPU (bench in branch) and ncu the trtllm-gen kernel: tensor pipe %, DRAM/L2 bytes, QK recompute check</li><li>2. Bench FlashInfer prims_ts sparse MLA at 96/128 heads as an existing alternative (per-shape dispatch candidate)</li><li>3. Quick prologue win: one fused kernel for RoPE-concat + FP8 quant + (if still needed) head pad; fuse gate_mul into the w_uv bmm epilogue (bitwise vs stock)</li><li>4. New prefill-form CuTe DSL sparse MLA (sm_107): native 96 heads, single QK per KV tile feeding the full 512-wide O in TMEM, double-buffered paged-KV gather, FP8 KV as stored</li><li>5. Unit tests vs stock (tolerance of the stock FP8-P kernel), microbench at F8K/F16K vs model, then step A/B on the INFRA 1-node harness</li></ol>
+<p class="blk"><b>Blocked:</b> No running k31ws pool hold at 12:45 (hold1 jobs pending); run1 waits in wsgpu.sh</p>
+<h5>Work log</h5><div class="tw"><table class="log"><tbody><tr><td class='t'>12:45</td><td>Wrote benchmarks/kernels/benchmark_kimi_k3_prefill_sparse_mla.py (stock chain per kernel + prims_ts + ncu script); staged overlay p-mla-4fbaa15-1; run1 queued on the 1-GPU pool</td><td>waiting for a pool hold (all k31ws holds pending)</td></tr><tr><td class='t'>12:40</td><td>Read plan, ledgers, microbench rows; traced the DEP16 DSA path in this tree (dsa.py -&gt; mla_attention.forward_impl -&gt; flashinfer_mla_sparse trtllm-gen)</td><td>stock chain identified; quant+pad unfused due to in-place concat path (code reading)</td></tr></tbody></table></div>
+<h5>Evidence</h5><ul class="ev"><li><code>perf-model/microbench/results/prefill/rows.json (P3-16 pf8k_L78k DSA rows)</code></li><li><code>perf-model/microbench/results/ops1/rows.json sparse_mla-161</code></li><li><code>/lustre/fsw/coreai_comparch_inferencex/weizha/k31ws/runs/P-MLA/run1</code></li></ul>
 </section><section class="card" id="P-GEMM">
 <header><span class="wid">P-GEMM</span><h4>Prefill: MXFP8 / BF16 GEMMs, router/latent, AttnRes, small ops</h4>
 <span class="st st-q">queued</span></header>
