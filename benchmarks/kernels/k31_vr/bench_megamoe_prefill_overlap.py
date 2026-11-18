@@ -58,6 +58,11 @@ def parse_args():
         "negative = SM count minus that many",
     )
     p.add_argument("--modes", default="moe,shared,serial,overlap")
+    p.add_argument(
+        "--routing", choices=("random", "local"), default="random",
+        help="local: every route to this rank's own experts (no NVLink payload; "
+        "the compute-only floor of the layer)",
+    )
     p.add_argument("--hidden", type=int, default=7168)
     p.add_argument("--shared-inter", type=int, default=6144)
     p.add_argument("--samples", type=int, default=10)
@@ -140,8 +145,14 @@ def main():
 
     # inputs: latent rows for the MegaMoE, hidden rows for the shared expert
     lat = torch.randn((T, hdim), generator=gen, device=dev).to(torch.bfloat16)
-    scores = torch.rand((T, problem.num_experts), generator=gen, device=dev)
-    ids = scores.topk(problem.top_k, dim=1).indices.to(torch.int32).contiguous()
+    e_loc = problem.num_experts // world
+    if args.routing == "local":
+        scores = torch.rand((T, e_loc), generator=gen, device=dev)
+        ids = scores.topk(problem.top_k, dim=1).indices + rank * e_loc
+    else:
+        scores = torch.rand((T, problem.num_experts), generator=gen, device=dev)
+        ids = scores.topk(problem.top_k, dim=1).indices
+    ids = ids.to(torch.int32).contiguous()
     wts = torch.rand((T, problem.top_k), generator=gen, device=dev) + 0.05
     wts = (wts / wts.sum(1, keepdim=True)).float().contiguous()
     out = torch.empty((T, hdim), dtype=torch.bfloat16, device=dev)
@@ -248,7 +259,8 @@ def main():
                 dist.barrier(group)
             row = {
                 "mode": mode, "grid_cap": cap, "sms": sms, "tokens": T, "capacity": C,
-                "subcalls": nsub, "world": world, "num_experts": problem.num_experts,
+                "subcalls": nsub, "world": world, "routing": args.routing,
+                "num_experts": problem.num_experts,
                 "out_abs_sum": fp if mode != "shared" else None, **res,
                 "kernels_us": prof,
             }
