@@ -41,13 +41,6 @@ def main():
         r["router_topk"] = kernel_times(
             lambda: prefill_glue.router_topk(logits, bias, 16, True, 2.5))[0]
         r["router_topk_floor_us"] = round(m * 896 * 4 / 13.9e12 * 1e6, 1)
-        lat = torch.randn(m, 3584, device="cuda").bfloat16()
-        lw = torch.ones(3584, device="cuda").bfloat16()
-        from vllm.model_executor.layers.layernorm import RMSNorm
-
-        norm = RMSNorm(3584, eps=1e-6).cuda().to(torch.bfloat16)
-        r["latent_norm"] = kernel_times(lambda: norm(lat))[0]
-        r["latent_norm_floor_us"] = round(m * 3584 * 4 / 13.9e12 * 1e6, 1)
         r["latent_down"] = kernel_times(lambda: torch.mm(x, wd.T))[0]
         side = torch.cuda.Stream()
 
@@ -65,7 +58,6 @@ def main():
 
         r["pair_serial_wall"] = wall_us(serial)
         r["pair_overlap_wall"] = wall_us(overlap)
-        _ = lw
         print(json.dumps(r), flush=True)
 
 

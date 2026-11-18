@@ -50,20 +50,23 @@ def test_attn_res_mxfp8_bitwise(rows, num_blocks, has_delta, write_idx, bf16_out
 
     prefix, delta, blocks, norm_w, qk_w, out_norm_w = _inputs(rows)
     delta = delta if has_delta else None
+    # The kernel updates the prefix in place (prefix += delta): own copies.
+    prefix_ref, prefix_new = prefix.clone(), prefix.clone()
     blocks_ref = blocks.clone()
     ref = ops.kimi_k3_attn_res(
-        prefix, delta, blocks_ref, norm_w, qk_w, out_norm_w,
+        prefix_ref, delta, blocks_ref, norm_w, qk_w, out_norm_w,
         num_blocks, write_idx, EPS, EPS,
     )
     ref_q = mxfp8_act.quantize(ref)
     blocks_new = blocks.clone()
     out, qa = attn_res_mxfp8(
-        prefix, delta, blocks_new, norm_w, qk_w, out_norm_w,
+        prefix_new, delta, blocks_new, norm_w, qk_w, out_norm_w,
         num_blocks, write_idx, EPS, EPS, bf16_out=bf16_out,
     )
     torch.accelerator.synchronize()
     # The block write (when requested) is the native kernel's.
     assert torch.equal(blocks_new, blocks_ref)
+    assert torch.equal(prefix_new, prefix_ref)
     if bf16_out:
         assert torch.equal(out, ref)
     else:
@@ -85,11 +88,11 @@ def test_matches_flashinfer_quantize():
 
     prefix, delta, blocks, norm_w, qk_w, out_norm_w = _inputs(300, seed=1)
     ref = ops.kimi_k3_attn_res(
-        prefix, delta, blocks.clone(), norm_w, qk_w, out_norm_w, 4, -1, EPS, EPS
+        prefix.clone(), delta, blocks.clone(), norm_w, qk_w, out_norm_w, 4, -1, EPS, EPS
     )
     fq, fs = mxfp8_quantize(ref, is_sf_swizzled_layout=True)
     _, qa = attn_res_mxfp8(
-        prefix, delta, blocks.clone(), norm_w, qk_w, out_norm_w, 4, -1, EPS, EPS,
+        prefix.clone(), delta, blocks.clone(), norm_w, qk_w, out_norm_w, 4, -1, EPS, EPS,
         bf16_out=False,
     )
     assert torch.equal(qa.data.view(torch.uint8), fq.view(torch.uint8))

@@ -102,8 +102,15 @@ def use_for(prefix: torch.Tensor) -> bool:
     return prefix.shape[0] >= MIN_ROWS and supported(prefix, 0, True)
 
 
+def ring_depth(num_blocks: int) -> int:
+    """Per-shape row-load ring depth (measured at 16384 / 8192 rows on VR:
+    depth 3 wins from 6 source blocks, depth 2 below)."""
+    return 3 if num_blocks >= 6 else 2
+
+
 def warmup() -> None:
-    _module()
+    _module(2)
+    _module(3)
 
 
 def attn_res_mxfp8(
@@ -118,7 +125,7 @@ def attn_res_mxfp8(
     eps: float,
     output_norm_eps: float,
     bf16_out: bool,
-    chunk_depth: int = 2,
+    chunk_depth: int | None = None,
 ) -> tuple[torch.Tensor | None, QuantizedActivation]:
     """``kimi_k3_attn_res`` (output RMSNorm applied) as MXFP8, and as BF16
     when ``bf16_out``. Returns ``(bf16 or None, QuantizedActivation)``."""
@@ -131,6 +138,8 @@ def attn_res_mxfp8(
         device=prefix.device,
     )
     out = torch.empty_like(prefix) if bf16_out else None
+    if chunk_depth is None:
+        chunk_depth = ring_depth(num_blocks)
     _module(chunk_depth).attn_res_mxfp8(
         prefix,
         delta,

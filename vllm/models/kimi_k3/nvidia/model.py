@@ -1534,13 +1534,12 @@ class KimiDecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         return hidden_states, prefix_sum, residual
 
-    def _attn_res_mxfp8_consumers(
-        self, prefix_sum: torch.Tensor | None
-    ) -> tuple[bool, bool]:
-        """Whether this prefill step's pre-attention / post-attention AttnRes
-        writes its consumer's online-MXFP8 input (specialized_prefill
-        ``attn_res_mxfp8``): the KDA in_proj (the pre-attention AttnRes' only
-        consumer) and the MegaMoE shared experts' gate_up."""
+    def _attn_res_mxfp8_capabilities(self) -> tuple[bool, bool]:
+        """(pre, post): the pre-attention / post-attention AttnRes output feeds
+        an online-MXFP8 projection that can take it as MXFP8 from the AttnRes
+        epilogue (specialized_prefill ``attn_res_mxfp8``): the KDA in_proj (the
+        pre-attention AttnRes' only consumer) and the MegaMoE shared experts'
+        gate_up."""
         caps = getattr(self, "_attn_res_mxfp8_caps", None)
         if caps is None:
             base = self.use_attn_res and not self.use_sequence_parallel
@@ -1555,6 +1554,13 @@ class KimiDecoderLayer(nn.Module):
                 and self.mlp.takes_shared_mxfp8_input()
             )
             caps = self._attn_res_mxfp8_caps = (pre, post)
+        return caps
+
+    def _attn_res_mxfp8_consumers(
+        self, prefix_sum: torch.Tensor | None
+    ) -> tuple[bool, bool]:
+        """The capabilities, for this step's shape (prefill chunks only)."""
+        caps = self._attn_res_mxfp8_capabilities()
         if not (caps[0] or caps[1]) or prefix_sum is None:
             return False, False
         if not prefill_attn_res_mxfp8.use_for(prefix_sum):
@@ -2224,6 +2230,12 @@ class KimiLinearForCausalLM(
         ):
             # Build the fused MXFP8 activation producers at load, not mid-step.
             mxfp8_act.warmup()
+            if any(
+                any(layer._attn_res_mxfp8_capabilities())
+                for layer in self.modules()
+                if isinstance(layer, KimiDecoderLayer)
+            ):
+                prefill_attn_res_mxfp8.warmup()
             logger.info_once(
                 "Kimi K3: online-MXFP8 projections take fused MXFP8 activations."
             )
