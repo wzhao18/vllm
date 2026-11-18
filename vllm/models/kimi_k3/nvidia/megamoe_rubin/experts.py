@@ -12,14 +12,17 @@ FC2 + BF16 combine on torch symmetric memory).
 Differences from DeepGEMM that the caller sees:
 
 - The checkpoint shards are loaded as stored (canonical MXFP4: E2M1 codes and UE8M0
-  scales, gate rows then up rows); :meth:`process_weights_after_loading` converts them
-  to the kernel layout once (``prepare_rubin_megamoe`` runs it for every layer, then
-  the collective warmup) and frees the checkpoint copy.
-- The routed-expert precision is chosen per server by :func:`rubin_quant_kind` from
-  the tokens per rank the layer is sized for (no flag): MXFP8 activations x MXFP4
-  weights up to :data:`RUBIN_MX_MAX_TOKENS_PER_RANK`, else an exact MXFP4 -> NVFP4
-  conversion at load (:class:`NonRepresentableError` when a weight is not exactly
-  representable; nothing is re-quantized).
+  scales; or ModelOpt NVFP4: E2M1 codes, E4M3 block-16 scales and per-expert
+  ``weight_scale_2`` / ``input_scale``; gate rows then up rows);
+  :meth:`process_weights_after_loading` converts them to the kernel layout once
+  (``prepare_rubin_megamoe`` runs it for every layer, then the collective warmup)
+  and frees the checkpoint copy.
+- The routed-expert precision follows the checkpoint (:func:`rubin_quant_kind`, no
+  flag): an NVFP4 checkpoint runs NVFP4 at every size; an MXFP4 one runs MXFP8
+  activations x MXFP4 weights up to :data:`RUBIN_MX_MAX_TOKENS_PER_RANK` tokens per
+  rank, else an exact MXFP4 -> NVFP4 conversion at load
+  (:class:`NonRepresentableError` when a weight is not exactly representable;
+  nothing is re-quantized).
 - One compiled bucket sized to ``max_num_tokens``, plus, on decoding (not P/D
   prefill) inference-kernel servers whose capacity exceeds the token_comm
   decode-landing limit, one decode bucket at that limit
@@ -45,6 +48,7 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import (
     MEGA_MOE_MXFP4,
+    MEGA_MOE_NVFP4,
     MegaMoEActivation,
     MegaMoEWeightFormat,
 )
@@ -66,7 +70,7 @@ from .config import (
     make_buckets,
 )
 from .session import ep_mean_tokens
-from .weights import MX_BLOCK, RubinMoeWeights
+from .weights import MX_BLOCK, NV_BLOCK, RubinMoeWeights
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -151,11 +155,18 @@ def rubin_bucket_capacities(
 RUBIN_SHARED_OVERLAP_MAX_SMS = 148
 
 
-def rubin_quant_kind(max_tokens_per_rank: int) -> QuantKind:
+def rubin_quant_kind(
+    max_tokens_per_rank: int, weight_format: MegaMoEWeightFormat = MEGA_MOE_MXFP4
+) -> QuantKind:
     """Routed-expert precision of a server whose layer sees at most
-    ``max_tokens_per_rank`` tokens per forward (automatic, no flag)."""
+    ``max_tokens_per_rank`` tokens per forward (automatic, no flag). An NVFP4
+    checkpoint runs the NVFP4 kernel at every size (it has no exact MXFP4 form)."""
     if max_tokens_per_rank <= 0:
         raise ValueError(f"max_tokens_per_rank must be positive: {max_tokens_per_rank}")
+    if weight_format is MEGA_MOE_NVFP4:
+        return "nvfp4"
+    if weight_format is not MEGA_MOE_MXFP4:
+        raise ValueError(f"no Rubin MegaMoE kernel for {weight_format.name!r} weights.")
     if max_tokens_per_rank <= RUBIN_MX_MAX_TOKENS_PER_RANK:
         return "mxfp4_mxfp8"
     return "nvfp4"
@@ -277,7 +288,8 @@ class KimiK3MegaMoEExperts(nn.Module):
     Args (as :class:`DeepGemmMegaMoEExperts`):
         num_experts: Physical experts across EP ranks (no redundant experts: the
             kernel places expert ``g`` on rank ``g // num_local_experts``).
-        weight_format: Checkpoint precision; only ``MEGA_MOE_MXFP4``.
+        weight_format: Checkpoint precision, ``MEGA_MOE_MXFP4`` or
+            ``MEGA_MOE_NVFP4`` (ModelOpt export).
         shared_experts: Must be ``None``; the shared expert runs outside the launch.
         max_num_tokens: Most tokens one rank passes to ``forward``; sizes the bucket
             and picks the precision. Defaults to ``max_num_batched_tokens``.
@@ -305,9 +317,9 @@ class KimiK3MegaMoEExperts(nn.Module):
     ):
         super().__init__()
         check_kimi_k3_mega_moe_supported()
-        if weight_format is not MEGA_MOE_MXFP4:
+        if weight_format not in (MEGA_MOE_MXFP4, MEGA_MOE_NVFP4):
             raise NotImplementedError(
-                "Rubin MegaMoE loads MXFP4 expert checkpoints only, not "
+                "Rubin MegaMoE loads MXFP4 or NVFP4 expert checkpoints, not "
                 f"{weight_format.name!r}."
             )
         if activation.name != "situ" or activation.beta <= 0:
@@ -358,7 +370,7 @@ class KimiK3MegaMoEExperts(nn.Module):
         self.shared_spec = None
         self.eplb_state = EplbLayerState()
         self.ep_size = ep_size
-        self.quant_kind = rubin_quant_kind(self.max_num_tokens)
+        self.quant_kind = rubin_quant_kind(self.max_num_tokens, weight_format)
         self.problem = RubinMoeProblem(
             num_experts=num_experts,
             top_k=top_k,
@@ -383,7 +395,9 @@ class KimiK3MegaMoEExperts(nn.Module):
         self.sequence_parallel = False
         if ep_rank == 0:
             logger.info_once(
-                "Rubin MegaMoE: %s %s buckets of %s tokens/rank at EP%d (%s).",
+                "Rubin MegaMoE: %s checkpoint, %s %s buckets of %s tokens/rank at "
+                "EP%d (%s).",
+                weight_format.name,
                 self.quant_kind,
                 self.bucket.variant,
                 tuple(b.max_tokens for b in self.buckets),  # info_once hashes args
@@ -393,7 +407,10 @@ class KimiK3MegaMoEExperts(nn.Module):
         # Kernel-layout weights, set by process_weights_after_loading.
         self.kernel_weights: RubinMoeWeights | None = None
 
-        self._create_weights()
+        if weight_format is MEGA_MOE_NVFP4:
+            self._create_nvfp4_weights()
+        else:
+            self._create_weights()
         for name, param in self.named_parameters(recurse=False):
             set_weight_attrs(param, {"weight_loader": self.weight_loader})
             if name.endswith("weight_scale"):
@@ -436,6 +453,45 @@ class KimiK3MegaMoEExperts(nn.Module):
             data = torch.zeros(shape, dtype=dtype)
             self.register_parameter(name, nn.Parameter(data, requires_grad=False))
 
+    # Dummy values of the NVFP4 scale parameters (``--load-format dummy``): finite,
+    # positive power-of-two scales like the ModelOpt export's (random E4M3 bytes
+    # include NaN; zero scales would zero the experts).
+    _NVFP4_DUMMY_SCALES: ClassVar[dict[str, float]] = {
+        "weight_scale": 1.0,
+        "weight_scale_2": 2.0**-13,
+        "input_scale": 1.0,
+    }
+
+    def _create_nvfp4_weights(self) -> None:
+        """ModelOpt NVFP4 parameters as stored, local expert on dim 0: ``w13`` rows
+        ``[0, I)`` gate (w1), ``[I, 2I)`` up (w3); packed E2M1 codes uint8 ``(rows,
+        K/2)``; E4M3 block-16 scales ``(rows, K/16)``; per-expert fp32
+        ``weight_scale_2`` and ``input_scale`` (``w13_*`` columns: w1, w3)."""
+        e, h, i = self.num_local_experts, self.hidden_size, self.intermediate_size
+        group = 4 * MX_BLOCK
+        if h % group or i % group:
+            raise ValueError(
+                f"Rubin MegaMoE needs hidden and intermediate sizes that are multiples "
+                f"of {group}, got {h} and {i}."
+            )
+        e4m3 = torch.float8_e4m3fn
+        shapes = {
+            "w13_weight": ((e, 2 * i, h // 2), torch.uint8),
+            "w13_weight_scale": ((e, 2 * i, h // NV_BLOCK), e4m3),
+            "w13_weight_scale_2": ((e, 2), torch.float32),
+            "w13_input_scale": ((e, 2), torch.float32),
+            "w2_weight": ((e, h, i // 2), torch.uint8),
+            "w2_weight_scale": ((e, h, i // NV_BLOCK), e4m3),
+            "w2_weight_scale_2": ((e,), torch.float32),
+            "w2_input_scale": ((e,), torch.float32),
+        }
+        for name, (shape, dtype) in shapes.items():
+            param = nn.Parameter(torch.zeros(shape, dtype=dtype), requires_grad=False)
+            self.register_parameter(name, param)
+            suffix = name.split("_", 1)[1]
+            if suffix in self._NVFP4_DUMMY_SCALES:
+                param.dummy_weight_value = self._NVFP4_DUMMY_SCALES[suffix]
+
     def _map_global_expert_id(self, expert_id: int) -> list[int]:
         """Local slots that logical expert ``expert_id`` occupies on this rank."""
         physical_ids: list[int] = []
@@ -458,17 +514,44 @@ class KimiK3MegaMoEExperts(nn.Module):
                 f"{self.prefix}: Rubin MegaMoE converted its experts to the kernel "
                 "layout at load; reloading weights is not supported."
             )
-        if weight_name.endswith(("weight_scale_2", "input_scale")):
+        nvfp4 = self.weight_format is MEGA_MOE_NVFP4
+        is_global = weight_name.endswith(("weight_scale_2", "input_scale"))
+        if is_global and not nvfp4:
             raise ValueError(
-                f"{weight_name}: Rubin MegaMoE loads MXFP4 experts (codes + UE8M0 "
-                "scales) only."
+                f"{weight_name}: this Rubin MegaMoE layer loads MXFP4 experts (codes + "
+                "UE8M0 scales) only."
             )
+        if shard_id not in ("w1", "w2", "w3"):
+            raise ValueError(f"Unsupported expert shard id: {shard_id}")
         local_expert_ids = self._map_global_expert_id(expert_id)
         param_prefix = "w2_" if shard_id == "w2" else "w13_"
         if not local_expert_ids or param_prefix not in weight_name:
             return False if return_success else None
-        if weight_name.endswith("weight_scale") != (param.dtype == torch.int32):
+        if is_global:
+            if loaded_weight.numel() != 1:
+                raise ValueError(
+                    f"{weight_name}: expected one value per expert, got shape "
+                    f"{tuple(loaded_weight.shape)}."
+                )
+            value = loaded_weight.reshape(()).to(torch.float32)
+            for local_expert_id in local_expert_ids:
+                slot = param.data[local_expert_id]
+                if shard_id != "w2":
+                    slot = slot[0 if shard_id == "w1" else 1]
+                slot.copy_(value)
+            return True if return_success else None
+        is_scale = weight_name.endswith("weight_scale")
+        scale_dtype = torch.float8_e4m3fn if nvfp4 else torch.int32
+        if is_scale != (param.dtype == scale_dtype):
             raise ValueError(f"{weight_name} does not match its {param.dtype} param.")
+        if nvfp4 and is_scale and loaded_weight.dtype not in (
+            torch.float8_e4m3fn,
+            torch.uint8,
+        ):
+            raise ValueError(
+                f"{weight_name}: NVFP4 block scales must be E4M3, got "
+                f"{loaded_weight.dtype}."
+            )
         for local_expert_id in local_expert_ids:
             self._load_weight(param.data[local_expert_id], loaded_weight, shard_id)
         return True if return_success else None
@@ -481,7 +564,7 @@ class KimiK3MegaMoEExperts(nn.Module):
             raise ValueError(f"Unsupported expert shard id: {shard_id}")
         if src.element_size() != 1:
             raise ValueError(
-                f"Rubin MegaMoE expects 1-byte MXFP4 codes / UE8M0 scales, got "
+                f"Rubin MegaMoE expects 1-byte FP4 codes / block scales, got "
                 f"{src.dtype}."
             )
         dst = dst.view(torch.uint8)
@@ -505,6 +588,30 @@ class KimiK3MegaMoEExperts(nn.Module):
             self.w2_weight.data.view(torch.uint8),
             self.w2_weight_scale.data.view(torch.uint8),
         )
+
+    def _nvfp4_alphas(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-expert FC1 / FC2 global weight scales of the loaded NVFP4 experts.
+
+        The kernel takes one FC1 scale per expert and quantizes activations with
+        unit global scales, so every ``w1`` / ``w3`` ``weight_scale_2`` pair must be
+        equal and every ``input_scale`` 1.0 (the Kimi K3.1 ModelOpt export stores
+        exactly that); anything else raises instead of changing the math.
+        """
+        ws13 = self.w13_weight_scale_2.data
+        if not torch.equal(ws13[:, 0], ws13[:, 1]):
+            bad = (ws13[:, 0] != ws13[:, 1]).nonzero().flatten()[:8].tolist()
+            raise ValueError(
+                f"{self.prefix}: w1 and w3 weight_scale_2 differ for local experts "
+                f"{bad}; the Rubin NVFP4 kernel takes one FC1 scale per expert."
+            )
+        for name in ("w13_input_scale", "w2_input_scale"):
+            scales = getattr(self, name).data
+            if not bool((scales == 1.0).all()):
+                raise NotImplementedError(
+                    f"{self.prefix}: {name} values {scales.unique()[:8].tolist()}; the "
+                    "Rubin NVFP4 path takes unit activation scales only."
+                )
+        return ws13[:, 0].clone(), self.w2_weight_scale_2.data.clone()
 
     def reserve_sms_for_shared_expert(self) -> None:
         """Cap this layer's persistent grid at :data:`RUBIN_SHARED_OVERLAP_MAX_SMS`
@@ -586,9 +693,15 @@ class KimiK3MegaMoEExperts(nn.Module):
         error: Exception | None = None
         weights = None
         try:
-            weights = runtime.prepare_weights(
-                *self.canonical_weights(), layer_id=self.layer_id
-            )
+            if self.weight_format is MEGA_MOE_NVFP4:
+                alphas = self._nvfp4_alphas()
+                weights = runtime.prepare_nvfp4_checkpoint_weights(
+                    *self.canonical_weights(), *alphas
+                )
+            else:
+                weights = runtime.prepare_weights(
+                    *self.canonical_weights(), layer_id=self.layer_id
+                )
         except Exception as exc:  # re-raised below, after the ranks agree
             error = exc
         ok = torch.tensor([0 if error is not None else 1], dtype=torch.int32)
