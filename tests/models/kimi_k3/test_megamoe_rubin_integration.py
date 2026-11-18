@@ -631,6 +631,229 @@ def test_non_representable_nvfp4_raises_on_every_rank(monkeypatch, ep, small_buc
     assert reduced == [0] and module.kernel_weights is None
 
 
+# -- native NVFP4 checkpoints (ModelOpt export) --------------------------------------
+
+# Key and dtype facts of nvidia/Kimi-K3.1-Pro-NVFP4 (safetensors headers, Nov 2026):
+# experts.{e}.{w1,w3,w2}.{weight U8 (rows, K/2), weight_scale F8_E4M3 (rows, K/16),
+# weight_scale_2 F32 (), input_scale F32 ()}.
+NVFP4_SUFFIXES = ("weight", "weight_scale", "weight_scale_2", "input_scale")
+
+
+def _nvfp4_experts(vllm_config, *, ep, **kw):
+    cfg = dict(SMALL)
+    cfg.update(kw)
+    cfg.setdefault("max_num_tokens", 4096)
+    e_local = cfg["num_experts"] // ep.world_size
+    return X.KimiK3MegaMoEExperts(
+        vllm_config,
+        num_experts=cfg.pop("num_experts"),
+        num_local_experts=e_local,
+        experts_start_idx=ep.rank_in_group * e_local,
+        top_k=cfg.pop("top_k"),
+        hidden_size=cfg.pop("hidden"),
+        intermediate_size=cfg.pop("intermediate"),
+        activation=SITU,
+        weight_format=dg.MEGA_MOE_NVFP4,
+        prefix=cfg.pop("prefix", "model.layers.3.mlp.experts"),
+        **cfg,
+    )
+
+
+def _nvfp4_shards(gen, *, ws2=None):
+    """Every expert's checkpoint tensors {(expert, shard, suffix): tensor}."""
+    h, i = SMALL["hidden"], SMALL["intermediate"]
+    out = {}
+    for expert in range(SMALL["num_experts"]):
+        g13 = ws2(expert) if ws2 else float(2.0 ** -int(torch.randint(10, 14, (1,), generator=gen)))
+        for shard, (rows, cols) in (("w1", (i, h)), ("w3", (i, h)), ("w2", (h, i))):
+            out[expert, shard, "weight"] = torch.randint(
+                0, 256, (rows, cols // 2), generator=gen, dtype=torch.uint8
+            )
+            out[expert, shard, "weight_scale"] = torch.randint(
+                0, 0x7F, (rows, cols // 16), generator=gen, dtype=torch.uint8
+            ).view(torch.float8_e4m3fn)
+            g = g13 if shard != "w2" else 2.0**-12
+            out[expert, shard, "weight_scale_2"] = torch.tensor(g, dtype=torch.float32)
+            out[expert, shard, "input_scale"] = torch.tensor(1.0, dtype=torch.float32)
+    return out
+
+
+def _load_through_mapping(module, shards, layer_prefix="model.layers.3.mlp"):
+    """Feed checkpoint keys through the Kimi K3 MegaMoE expert mapping (the model's
+    load_weights substring match + rename) into the module's weight loader."""
+    mapping = kimi_model.make_kimi_k3_mega_moe_expert_params_mapping(
+        SMALL["num_experts"], module.weight_format
+    )
+    params = dict(module.named_parameters(prefix=f"{layer_prefix}.experts"))
+    loaded = 0
+    for (expert, shard, suffix), tensor in shards.items():
+        name = f"{layer_prefix}.experts.{expert}.{shard}.{suffix}"
+        for param_name, weight_name, expert_id, shard_id in mapping:
+            if weight_name not in name:
+                continue
+            name = name.replace(weight_name, param_name)
+            param = params[name]
+            ok = param.weight_loader(
+                param, tensor, name, shard_id=shard_id, expert_id=expert_id,
+                return_success=True,
+            )  # fmt: skip
+            loaded += bool(ok)
+            break
+        else:
+            raise AssertionError(f"{name} matched no mapping entry")
+    return loaded
+
+
+def test_nvfp4_checkpoint_format_from_quant_config():
+    """The MegaMoE format follows the ModelOpt quantized_layers entry of the block's
+    experts (spelled as in the K3.1 NVFP4 export); other checkpoints stay MXFP4."""
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptMixedPrecisionConfig,
+    )
+
+    prefix = "language_model.model.layers.5.block_sparse_moe"
+    quant = {
+        "quant_method": "modelopt_mixed",
+        "quant_algo": "MIXED_PRECISION",
+        "group_size": 16,
+        "kv_cache_quant_algo": None,
+        "ignore": ["*block_sparse_moe.gate*", "lm_head"],
+        "quantized_layers": {
+            f"{prefix}.experts": {"quant_algo": "NVFP4", "group_size": 16},
+            f"{prefix}.shared_experts.gate_proj": {"quant_algo": "MXFP8"},
+            "language_model.model.layers.6.block_sparse_moe.experts": {
+                "quant_algo": "MXFP8"
+            },
+        },
+    }
+    cfg = ModelOptMixedPrecisionConfig.from_config(quant)
+    fmt = kimi_model.kimi_k3_mega_moe_weight_format
+    assert fmt(cfg, prefix) is dg.MEGA_MOE_NVFP4
+    assert fmt(None, prefix) is dg.MEGA_MOE_MXFP4
+    with pytest.raises(NotImplementedError, match="MXFP8"):
+        fmt(cfg, "language_model.model.layers.6.block_sparse_moe")
+
+
+def test_nvfp4_mapping_covers_the_export_keys():
+    mapping = kimi_model.make_kimi_k3_mega_moe_expert_params_mapping(
+        896, dg.MEGA_MOE_NVFP4
+    )
+    pre = "language_model.model.layers.5.block_sparse_moe.experts"
+    for shard, prefix in (("w1", "w13"), ("w3", "w13"), ("w2", "w2")):
+        for suffix in NVFP4_SUFFIXES:
+            name = f"{pre}.811.{shard}.{suffix}"
+            hits = [m for m in mapping if m[1] in name]
+            assert hits and hits[0][2:] == (811, shard)
+            assert name.replace(hits[0][1], hits[0][0]) == f"{pre}.{prefix}_{suffix}"
+    # the MXFP4 mapping is unchanged
+    mx = kimi_model.make_kimi_k3_mega_moe_expert_params_mapping(2)
+    assert ("experts.w13_weight", "experts.1.w3.weight_packed", 1, "w3") in mx
+
+
+def test_nvfp4_parameters_and_dummy_values(ep, small_bucket):
+    """NVFP4 layers run the NVFP4 kernel at every size (no MX at <= 512 tokens), hold
+    the export's tensors as stored, and dummy-load finite power-of-two scales."""
+    from vllm.model_executor.model_loader.weight_utils import (
+        initialize_single_dummy_weight,
+    )
+
+    ep.world_size, ep.rank_in_group = 16, 3
+    with torch.device("meta"):
+        big = _nvfp4_experts(
+            _vllm_config(), ep=ep, num_experts=896, hidden=3584, intermediate=3072,
+            top_k=16, max_num_tokens=64,
+        )  # fmt: skip
+    assert big.quant_kind == "nvfp4" and big.problem.quant_kind == "nvfp4"
+    assert _params(big) == {
+        "w13_weight": ((56, 6144, 1792), torch.uint8),
+        "w13_weight_scale": ((56, 6144, 224), torch.float8_e4m3fn),
+        "w13_weight_scale_2": ((56, 2), torch.float32),
+        "w13_input_scale": ((56, 2), torch.float32),
+        "w2_weight": ((56, 3584, 1536), torch.uint8),
+        "w2_weight_scale": ((56, 3584, 192), torch.float8_e4m3fn),
+        "w2_weight_scale_2": ((56,), torch.float32),
+        "w2_input_scale": ((56,), torch.float32),
+    }
+    ep.world_size, ep.rank_in_group = 2, 0
+    small = _nvfp4_experts(_vllm_config(), ep=ep)
+    for name, param in small.named_parameters(recurse=False):
+        initialize_single_dummy_weight(param, name=name)
+    for name in ("w13_weight_scale", "w2_weight_scale"):
+        values = getattr(small, name).float()
+        assert bool((values == 1.0).all()), name
+    assert bool((small.w13_weight_scale_2 == 2.0**-13).all())
+    assert bool((small.w2_input_scale == 1.0).all())
+    assert int(small.w13_weight.max()) > 0  # random codes
+
+
+def test_nvfp4_load_and_process(monkeypatch, ep, small_bucket):
+    ep.world_size, ep.rank_in_group = 2, 1
+    module = _nvfp4_experts(_vllm_config(), ep=ep)
+    shards = _nvfp4_shards(torch.Generator().manual_seed(4))
+    assert _load_through_mapping(module, shards) == 4 * 3 * len(NVFP4_SUFFIXES)
+    w13, s13, w2, s2 = module.canonical_weights()
+    for local in range(4):
+        expert = 4 + local
+        part = {k[1:]: v for k, v in shards.items() if k[0] == expert}
+        assert torch.equal(w13[local], torch.cat([part["w1", "weight"], part["w3", "weight"]]))
+        assert torch.equal(
+            s13[local],
+            torch.cat([part["w1", "weight_scale"], part["w3", "weight_scale"]]).view(
+                torch.uint8
+            ),
+        )
+        assert torch.equal(w2[local], part["w2", "weight"])
+        assert float(module.w13_weight_scale_2[local, 1]) == float(
+            part["w3", "weight_scale_2"]
+        )
+
+    class Runtime:
+        def prepare_nvfp4_checkpoint_weights(self, *tensors):
+            return W.prepare_nvfp4_checkpoint_weights(*tensors, hidden=128, intermediate=128)
+
+    monkeypatch.setattr(module, "get_runtime", lambda: Runtime())
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda t, op, group: None)
+    expect_fc1 = module.w13_weight_scale_2[:, 0].clone()
+    module.process_weights_after_loading()
+    w = module.kernel_weights
+    W.validate_kernel_weights(w, quant_kind="nvfp4", experts=4, hidden=128, intermediate=128)
+    assert torch.equal(w.fc1_alpha, expect_fc1)
+    assert torch.equal(w.fc2_alpha, torch.full((4,), 2.0**-12))
+    assert all(p.numel() == 0 for p in module.parameters())
+    assert len(module.get_expert_weights()) == 7
+
+
+@pytest.mark.parametrize("case", ["gate_up_scale_2", "input_scale"])
+def test_nvfp4_refuses_math_it_cannot_run(monkeypatch, ep, small_bucket, case):
+    """Unequal w1 / w3 weight_scale_2 or non-unit input scales raise on every rank
+    instead of loading a different computation."""
+    ep.world_size, ep.rank_in_group = 2, 0
+    module = _nvfp4_experts(_vllm_config(), ep=ep)
+    shards = _nvfp4_shards(torch.Generator().manual_seed(5))
+    if case == "gate_up_scale_2":
+        shards[2, "w3", "weight_scale_2"] = torch.tensor(2.0**-9)
+    else:
+        shards[1, "w2", "input_scale"] = torch.tensor(0.5)
+    _load_through_mapping(module, shards)
+    monkeypatch.setattr(module, "get_runtime", lambda: object())
+    reduced = []
+    monkeypatch.setattr(
+        torch.distributed, "all_reduce", lambda t, op, group: reduced.append(int(t))
+    )
+    err = ValueError if case == "gate_up_scale_2" else NotImplementedError
+    with pytest.raises(err, match="weight_scale_2|input_scale"):
+        module.process_weights_after_loading()
+    assert reduced == [0] and module.kernel_weights is None
+
+
+def test_mxfp4_layer_refuses_nvfp4_scales(ep, small_bucket):
+    ep.world_size, ep.rank_in_group = 2, 1
+    module = _experts(_vllm_config(), ep=ep, **SMALL)
+    param = module.w13_weight_scale
+    with pytest.raises(ValueError, match="MXFP4"):
+        param.weight_loader(param, torch.ones(()), "x.experts.w13_weight_scale_2", "w1", 4)
+
+
 def test_forward_before_conversion_raises(ep):
     with torch.device("meta"):
         module = _experts(
