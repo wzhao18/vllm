@@ -39,7 +39,7 @@ CAP = 512
 BLOCK = 12
 NBLOCKS = 8
 SENTINEL = -0x80000000
-ROWS = (16, 128, 384)  # n = 4 / 32 / 96 per rank at TP4
+SHARDS = (4, 32, 96)  # n rows per rank: r1 / r8 / r24 of D3-32
 LAYERS = (0, 1, 12, 13, 92)  # first, plain, block write, after one, 8 blocks
 
 
@@ -112,8 +112,8 @@ def _worker(env: dict[str, str]) -> None:
         comm = sp_comm.SpComm(group, device, world, rank, rows_cap=CAP)
         eps = (1e-6, 1e-6)
         worst = {}
-        for rows in ROWS:
-            n = rows // world
+        for n in SHARDS:
+            rows = n * world
             blocks0 = _rand((n, NBLOCKS, WIDTH), ("b", rows, rank), device)
             prefix0 = _rand((n, WIDTH), ("p", rows, rank), device)
             delta = _rand((n, WIDTH), ("d", rows, rank), device, 0.1)
@@ -127,7 +127,7 @@ def _worker(env: dict[str, str]) -> None:
                 d = None if layer == 0 else delta
                 bound = sp_fused.SpBoundary(
                     comm, (pre_w, eps), (post_w, eps), prev,
-                    layer // BLOCK if write else -1, CAP // world, {rows: True},
+                    layer // BLOCK if write else -1, max(SHARDS), {rows: True},
                 )  # fmt: skip
                 res = {}
                 for mode in ("stock", "fused"):
@@ -172,8 +172,8 @@ def _worker(env: dict[str, str]) -> None:
         final = sp_comm.SpFinalGather(
             group, device, world, rank, width=width, rows_cap=CAP
         )
-        for rows in ROWS:
-            n = rows // world
+        for n in SHARDS:
+            rows = n * world
             x = _rand((n, width), ("f", rows, rank), device)
             x.view(torch.int32)[:, 7::101] = SENTINEL  # (+0, -0): sanitized to 0
             got = final.run(x)
