@@ -32,9 +32,23 @@ from ...shapes import Choice, Path, Shape, Unsupported, rows_policy
 MX_KINDS = ("fi_cute", "fi_cutlass", "scaled_mm")
 BLOCK = 32  # MXFP8 block along K
 
-# TUNED (VR200, D3-32 per-GPU shapes, D-GEMM bench, chained cold weights): per MXFP8
-# weight [N, K] the kind per rows. Empty rows keep GENERIC (stock's rule).
-MX_TUNED: dict[tuple[int, int], dict] = {}
+# TUNED (VR200, D3-32 per-GPU shapes, 2026-11-18 D-GEMM bench1: 1 GPU, a CUDA graph of
+# 8-64 back-to-back calls each on its own cold weight copy, pre-quantized input; us per
+# call fi_cute / scaled_mm (fi_cutlass 2-6x slower everywhere, trtllm-gen slower above
+# 16 rows)): per MXFP8 weight [N, K] the kind per rows; rows outside keep GENERIC.
+#   kda_in 12448 x 7168  R16 9.55 / 16.20, R128 10.96 / 12.40, R256 11.59 / 13.50,
+#                        R384 16.73 / 14.63
+#   shared_gu 12288 x 7168  n4 9.30 / 14.09, n32 10.01 / 11.98, n64 10.12 / 12.17,
+#                           n96 12.92 / 12.23
+#   shared_down 7168 x 6144  n4 6.09 / 9.85, n32 7.64 / 7.68, n64 7.75 / 8.93,
+#                            n96 8.44 / 7.75
+#   o_proj 7168 x 3072  R16 4.92 / 4.95, R128 5.84 / 5.13, R256 6.33 / 6.03, R384
+#                       7.54 / 6.26 (= stock's rule: no entry)
+MX_TUNED: dict[tuple[int, int], dict] = {
+    (12448, 7168): {"*": "1-320:fi_cute,321-:scaled_mm"},
+    (12288, 7168): {"*": "1-80:fi_cute,81-:scaled_mm"},
+    (7168, 6144): {"*": "1-80:fi_cute,81-:scaled_mm"},
+}  # fmt: skip
 
 
 def stock_kind(n: int, k: int, rows: int) -> str:
