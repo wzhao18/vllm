@@ -87,9 +87,15 @@ __global__ void __launch_bounds__(256) o_norm_mx_kernel(
         amax = fmaxf(amax, fabsf(y[i]));
       }
       amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
-      if (r >= rows) continue;
       float inv;
       const uint32_t e = norm_mx::ue8m0(amax, inv);
+      // The row's 4 block scales are 4 consecutive bytes of the swizzled
+      // layout (col % 4): one 32-bit store from the row's first lane.
+      uint32_t e4 = 0;
+#pragma unroll
+      for (int j = 0; j < 4; ++j)
+        e4 |= __shfl_sync(0xffffffffu, e, (lane & ~7) + 2 * j) << (8 * j);
+      if (r >= rows) continue;
       uint32_t q[4];
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
@@ -103,11 +109,10 @@ __global__ void __launch_bounds__(256) o_norm_mx_kernel(
       *reinterpret_cast<uint4*>(static_cast<uint8_t*>(a.q) + int64_t(tok) * a.q_ld +
                                 head * 128 + part * 16) =
           make_uint4(q[0], q[1], q[2], q[3]);
-      if (part % 2 == 0) {
-        const int col = head * 4 + part / 2;
-        const int off = (col % 4) + (col / 4) * 512 + (tok % 32) * 16 +
-                        ((tok % 128) / 32) * 4 + (tok / 128) * (128 * a.sf_cols);
-        static_cast<uint8_t*>(a.sf)[off] = uint8_t(e);
+      if (part == 0) {
+        const int off = head * 512 + (tok % 32) * 16 + ((tok % 128) / 32) * 4 +
+                        (tok / 128) * (128 * a.sf_cols);
+        *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(a.sf) + off) = e4;
       }
     }
   }
