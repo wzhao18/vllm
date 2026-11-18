@@ -474,9 +474,10 @@ class _FakeRuntime:
         )  # fmt: skip
 
     def forward(
-        self, hidden, ids, weights, kernel_weights, *, bucket, is_padding=None,
-        ep_tokens=None, owner=None,
+        self, hidden, ids, weights, kernel_weights, *, bucket, out=None,
+        is_padding=None, ep_tokens=None, owner=None,
     ):  # fmt: skip
+        assert out is None  # the stock layer lets the runtime allocate
         if is_padding is not None:  # the stager's folded padding mask
             ids = torch.where(is_padding.unsqueeze(1), -1, ids)
         assert ep_tokens == hidden.shape[0]  # DP1: the rank's own (EP-uniform) count
