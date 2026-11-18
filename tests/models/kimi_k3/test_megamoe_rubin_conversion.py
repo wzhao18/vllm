@@ -395,9 +395,19 @@ def test_shipped_knobs_resolve():
             C.SHIPPED_KNOBS,
             problem=problem,
             variant="inference",
-            world_size=32,
+            world_size=24,
             max_tokens=6144,
         )
+    # EP28 / EP32 decode capacities resolve to the FlashInfer a368c5f66 default-knob
+    # records measured at that EP (moe_ep32); N128 up to 64 expected rows per expert.
+    for ws in (28, 32):
+        for cap in (128, 256, 512):
+            knobs, record, _ = C.resolve_knobs(
+                C.SHIPPED_KNOBS, problem=problem, variant="inference",
+                world_size=ws, max_tokens=cap,
+            )
+            assert record["max_tokens"] == cap and record["world_size"] == ws
+            assert knobs.schedule_policy[0] == "phase_interleave"
     with pytest.raises(ValueError):  # genphase N64 + multirank phase_interleave
         C.RubinMoeConfig.make(
             mx,
@@ -686,82 +696,29 @@ def test_cache_keys_and_layout_tag():
     assert S.output_binding_key(strided)[2] != key[2]
 
 
-def test_s2_epilogue_dispatch_policy(monkeypatch):
-    """S2 only on capped (shared-overlap) grids, per launch up to the crossover; both
-    variants of one session must share the workspace layout; the EP-mean token count
-    follows sequence_parallel_chunk's ceil(n / sp) shards."""
+def test_one_kernel_per_session_and_ep_mean_tokens(monkeypatch):
+    """FlashInfer a368c5f66 has one epilogue variant: every session builds one kernel
+    (no S2), and a launch always takes it; the EP-mean token count follows
+    sequence_parallel_chunk's ceil(n / sp) shards."""
     from types import SimpleNamespace
 
     S = _load("session")
-    x = S.S2_MAX_TOKENS_PER_RANK
-
-    class _Ws:
-        def __init__(self, extra=0):
-            self.extra = extra
-
-        def total_bytes(self, space):
-            return 1024 + self.extra
-
-        def regions(self, space):
-            return (SimpleNamespace(name="r", reset="data", dtype="i32"),)
-
-        def offset(self, name):
-            return 0
-
-        def nbytes(self, name):
-            return 64 + self.extra
-
     built = []
 
-    def fake_build(cfg, epilogue_warpgroups=None, *, eligible=True, ws_extra=0):
-        wg = epilogue_warpgroups or (2 if eligible else 1)
+    def fake_build(cfg, epilogue_warpgroups=None):
         built.append(epilogue_warpgroups)
-        return SimpleNamespace(
-            epilogue_warpgroups=wg,
-            _device_workspace=_Ws(ws_extra if wg == 1 else 0),
-        )
-
-    def cfg(cap, sm=148, variant="inference"):
-        return SimpleNamespace(
-            kernel_variant=variant, max_sm_count=sm, max_tokens_per_rank=cap
-        )
+        return SimpleNamespace()
 
     monkeypatch.setattr(S, "build_kernel", fake_build)
-    # uncapped: stock epilogue only, requested explicitly
-    built.clear()
-    ks = S.build_kernels(cfg(8192, sm=None))
-    assert set(ks) == {False} and built == [1]
-    # genphase: the kernel's own single epilogue
-    assert set(S.build_kernels(cfg(1024, variant="genphase"))) == {False}
-    # capped, capacity above the crossover: both variants
-    built.clear()
-    ks = S.build_kernels(cfg(8192))
-    assert set(ks) == {True, False} and built == [None, 1]
-    assert ks[True].epilogue_warpgroups == 2 and ks[False].epilogue_warpgroups == 1
-    # capped, capacity within the S2 range: S2 only
-    assert set(S.build_kernels(cfg(x))) == {True}
-    # capped but not S2-eligible (e.g. a 2048 decode bucket): stock only
-    monkeypatch.setattr(
-        S, "build_kernel", lambda c, w=None: fake_build(c, w, eligible=False)
-    )
-    assert set(S.build_kernels(cfg(2048))) == {False}
-    # variants whose workspace layouts differ must not share a session
-    monkeypatch.setattr(
-        S, "build_kernel", lambda c, w=None: fake_build(c, w, ws_extra=128)
-    )
-    with pytest.raises(RuntimeError, match="workspace layout"):
-        S.build_kernels(cfg(8192))
-
-    def use_s2(kernels, cap, tokens):
-        sess = SimpleNamespace(kernels=kernels, cfg=cfg(cap))
-        return S.RubinMegaMoeSession.use_s2(sess, tokens)
-
-    both = {True: object(), False: object()}
-    assert use_s2(both, 8192, 0) and use_s2(both, 8192, x)
-    assert not use_s2(both, 8192, x + 1) and not use_s2(both, 8192, 8192)
-    assert not use_s2(both, 8192, None)  # None = the capacity
-    assert use_s2({True: object()}, x, None)
-    assert not use_s2({False: object()}, 8192, 0)
+    for variant, cap, sm in (("inference", 8192, None), ("inference", 8192, 148),
+                             ("inference", 128, None), ("genphase", 1024, None)):
+        built.clear()
+        cfg = SimpleNamespace(kernel_variant=variant, max_sm_count=sm, max_tokens_per_rank=cap)
+        ks = S.build_kernels(cfg)
+        assert set(ks) == {False} and built == [None]
+        sess = SimpleNamespace(kernels=ks, cfg=cfg)
+        assert S.RubinMegaMoeSession.use_s2(sess, None) is False
+        assert S.RubinMegaMoeSession.use_s2(sess, 1) is False
 
     t = torch.tensor
     assert S.ep_mean_tokens(t([17400, 17400, 17400, 17400]), 4) == 4350
@@ -835,7 +792,7 @@ def test_vendored_sources_match_manifest():
         for p in src.joinpath("sources").rglob("*.py")
         if "__pycache__" not in p.parts
     }
-    assert len(manifest) == 42 and set(files) == set(manifest)
+    assert len(manifest) == 41 and set(files) == set(manifest)
     for rel, path in files.items():
         assert hashlib.sha256(path.read_bytes()).hexdigest() == manifest[rel], rel
     # no FlashInfer / NVSHMEM import anywhere in the backend

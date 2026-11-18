@@ -173,10 +173,10 @@ def test_kernel_name_and_cache_key_of_the_die_mask():
             pytest.skip(f"kernel construction unavailable: {exc!r}")
         names.add(kernel.name())
         keys.add(compile_cache_key(cfg, kernel.name(), "v", 0))
-        is_die = type(kernel.scheduler).__name__ == "DieSplitPhaseInterleavedFc12Scheduler"
-        assert is_die == (mask is not None)
-        assert ("_diesplit_" in kernel.name()) == (mask is not None)
-    assert len(names) == 2 and len(keys) == 3
+        # FlashInfer a368c5f66 die_split (two-ended expert claim); not in the name,
+        # so the compile key carries the per-GPU mask explicitly.
+        assert bool(getattr(kernel.scheduler, "die_split", False)) == (mask is not None)
+    assert len(names) == 1 and len(keys) == 3
 
 
 @pytest.mark.parametrize(
