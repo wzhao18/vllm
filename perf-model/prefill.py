@@ -46,20 +46,20 @@ def _partition(times, S):
     return best[S][n], bounds[::-1]
 
 
-def run_point(t, ck, col, F, L, f_req=F_REQ, variant="base", detail=False):
+def run_point(t, ck, col, F, L, f_req=F_REQ, variant="base", detail=False, moe_act=None):
     """Variants with O1 take the better of overlap on / off (overlap only where it helps)."""
     v = VARIANTS[variant]
     if v["o1"]:
-        a = _run(t, ck, col, F, L, f_req, True, v["o2"], detail)
-        b = _run(t, ck, col, F, L, f_req, False, v["o2"], detail)
+        a = _run(t, ck, col, F, L, f_req, True, v["o2"], detail, moe_act)
+        b = _run(t, ck, col, F, L, f_req, False, v["o2"], detail, moe_act)
         return a if a["t_ms"] <= b["t_ms"] else b
-    return _run(t, ck, col, F, L, f_req, False, v["o2"], detail)
+    return _run(t, ck, col, F, L, f_req, False, v["o2"], detail, moe_act)
 
 
-def _run(t, ck, col, F, L, f_req, o1, o2, detail):
+def _run(t, ck, col, F, L, f_req, o1, o2, detail, moe_act=None):
     Fe = F / 2.0 if o1 else F
     env = Mdl.env_prefill(Fe, L, f_req=min(f_req, Fe))
-    res = cost.evaluate(t, "prefill", ck, col, env, o2=o2, ops_detail=detail)
+    res = cost.evaluate(t, "prefill", ck, col, env, o2=o2, ops_detail=detail, moe_act=moe_act)
     st = cost.step(res, o1=o1, reps=2 if o1 else 1)
     hw = HWS[col]
     if t.S > 1:
@@ -91,12 +91,14 @@ def _run(t, ck, col, F, L, f_req, o1, o2, detail):
                fam={k: x * 1e3 for k, x in st["fam"].items()}, comm_by={k: x * 1e3 for k, x in st["comm_by"].items()},
                comm_raw={k: x * 1e3 for k, x in st["comm_raw"].items()},
                comp_ms=st["comp"] * 1e3, comm_ms=st["comm"] * 1e3, kern_ms=st["kern"] * 1e3,
+               hops=st["hops"], n_comm=st["n_comm"], topk_select=res["topk_select"],
                flops_gpu=res["flops"] * (2 if o1 else 1), bytes_gpu=res["bytes"] * (2 if o1 else 1))
     if stages:
         out["stages"] = stages
     if detail:
         out["units"] = {k: dict(comp=x["comp"] * 1e3, comm=x["comm"] * 1e3) for k, x in cost.unit_summary(res).items()}
         out["per_layer_ms"] = [x * 1e3 for x in st["per_layer"]]
+        out["glob_ms"] = {k: x * 1e3 for k, x in st["glob"].items()}
         out["ops"] = res["rows"]
         out["comm_rows"] = res["comm_rows"]
     return out

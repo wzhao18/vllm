@@ -64,6 +64,7 @@ tr:hover td { background: var(--surface-2); }
 .legend span.sw { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
 .legend label { cursor: pointer; }
 .note { font-size: 12.5px; color: var(--text-3); }
+.warn { color: var(--crit); font-weight: 600; }
 #tip { position: fixed; pointer-events: none; z-index: 20; background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 7px 9px; font-size: 12px; box-shadow: 0 4px 16px rgba(0,0,0,.15); max-width: 320px; display: none; }
 #tip b { font-weight: 650; }
 .grid2 { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
@@ -143,8 +144,9 @@ Decode: tokens/s per GPU at the requests-per-GPU band, k and checkpoint selected
 
 <h2 id="ops">(e) Op table</h2>
 <div class="ctl" style="flex-wrap:wrap">Topology / regime <select id="oSel"></select> <span class="seg" id="oSort"></span></div>
-<p class="note">Numbers are per GPU, per op instance (one layer); "total" multiplies by the count. t = max(FLOPs/peak, bytes/HBM).
-Bound letters: c = compute, m = memory (SOL / achievable). Hover an op for shapes and code cite.</p>
+<p class="note">Numbers are per GPU, per op instance (one layer); "total" multiplies by the count. t = max(FLOPs/peak, bytes/HBM, SIMT/peak_simt + exp/MUFU);
+a launched kernel costs at least the per-kernel gap (overlapped under PDL). Bound letters: c = tensor compute, m = memory,
+s = SIMT/MUFU (SOL / achievable). Hover an op for shapes and code cite.</p>
 <div class="grid2">
   <div><h3>Per layer type (one instance)</h3><div class="tw"><table id="oUnit"></table></div></div>
   <div><h3>Per-layer timeline (achievable, ms)</h3><div class="legend"><span><span class="sw" style="background:var(--s1)"></span>KDA layer</span><span><span class="sw" style="background:var(--s2)"></span>DSA layer</span></div><div class="chart" id="oLayers"></div></div>
@@ -364,10 +366,12 @@ function decPareto() {
 }
 function decBand() {
   var rows = bandRows(S.ck, S.k, S.col, S.dvar), sol = bandRows(S.ck, S.k, "sol", S.dvar);
-  var h = "<tr><th class=n>requests / GPU</th><th>best topology (" + S.col + ")</th><th class=n>tok/s/GPU</th><th class=n>step ms</th><th>runner-up (margin at band end)</th></tr>";
+  var h = "<tr><th class=n>requests / GPU</th><th>best topology (" + S.col + ")</th><th class=n>tok/s/GPU</th><th class=n>step ms</th><th>runner-up (margin at band end)</th><th class=n>dependent hops / step (band end)</th></tr>";
+  var dr = decRes();
   rows.forEach(function (b) { var x = b.items[b.items.length - 1];
-    h += "<tr><td class=n>" + fmt(b.lo, 3) + (b.hi != b.lo ? " - " + fmt(b.hi, 3) : "") + "</td><td class=win>" + esc(TOPO[b.topo].name) + "</td><td class=n>" + fmt(b.tlo) + " - " + fmt(b.thi) + "</td><td class=n>" + fmt(b.items[0].t_ms, 2) + " - " + fmt(x.t_ms, 2) + "</td><td>" + (x.runner ? esc(TOPO[x.runner].name) + " (+" + fmt(100 * x.margin, 1) + "%)" : "-") + "</td></tr>"; });
-  h += '<tr><td colspan=5 class="note">SOL column bands: ' + sol.map(function (b) { return fmt(b.lo, 3) + (b.hi != b.lo ? "-" + fmt(b.hi, 3) : "") + ": " + b.topo; }).join("; ") + "</td></tr>";
+    var px = (dr[b.topo] || []).filter(function (p) { return Math.abs(p.r - x.r) < 1e-9; })[0];
+    h += "<tr><td class=n>" + fmt(b.lo, 3) + (b.hi != b.lo ? " - " + fmt(b.hi, 3) : "") + "</td><td class=win>" + esc(TOPO[b.topo].name) + "</td><td class=n>" + fmt(b.tlo) + " - " + fmt(b.thi) + "</td><td class=n>" + fmt(b.items[0].t_ms, 2) + " - " + fmt(x.t_ms, 2) + "</td><td>" + (x.runner ? esc(TOPO[x.runner].name) + " (+" + fmt(100 * x.margin, 1) + "%)" : "-") + "</td><td class=n>" + (px && px.hops != null ? fmt(px.hops, 0) + " (" + fmt(px.n_comm, 0) + " events)" : "-") + "</td></tr>"; });
+  h += '<tr><td colspan=6 class="note">Each dependent hop costs one push hand-off (2.86 us measured one-way flag in both columns; NVLS uses its measured alpha in the achievable column), so readers can rescale the latency floor. SOL column bands: ' + sol.map(function (b) { return fmt(b.lo, 3) + (b.hi != b.lo ? "-" + fmt(b.hi, 3) : "") + ": " + b.topo; }).join("; ") + "</td></tr>";
   $("dBand").innerHTML = h;
 }
 function decStack() {
@@ -386,7 +390,7 @@ function decStack() {
     var x = L + i * bw + 3, y0 = H - B;
     GROUPS.forEach(function (g) { var v = val(p, g); if (v <= 0) return; var hgt = (H - B - T) * v / ty[ty.length - 1];
       var r = NS("rect", { x: x, y: y0 - hgt, width: Math.max(1, bw - 6), height: Math.max(0.5, hgt - 1), fill: GCOL[g] }, sv);
-      hover(r, "<b>" + esc(TOPO[S.dTopo].name) + "</b> r = " + fmt(p.r, 2) + "<br>" + g + ": " + fmt(v, 2) + (S.dNorm === "step" ? " ms" : " us/token") + " (" + fmt(100 * v / tot(p)) + "%)<br>step " + fmt(p.t_ms, 2) + " ms, " + fmt(p.tps_gpu) + " tok/s/GPU, " + fmt(p.tps_user) + " tok/s/user"); y0 -= hgt; });
+      hover(r, "<b>" + esc(TOPO[S.dTopo].name) + "</b> r = " + fmt(p.r, 2) + "<br>" + g + ": " + fmt(v, 2) + (S.dNorm === "step" ? " ms" : " us/token") + " (" + fmt(100 * v / tot(p)) + "%)<br>step " + fmt(p.t_ms, 2) + " ms, " + fmt(p.tps_gpu) + " tok/s/GPU, " + fmt(p.tps_user) + " tok/s/user" + (p.hops != null ? "<br>" + fmt(p.hops, 0) + " dependent NVLink hops, " + fmt(p.n_comm, 0) + " comm events per step" : "")); y0 -= hgt; });
     NS("text", { x: x + (bw - 6) / 2, y: H - B + 14, "text-anchor": "middle" }, sv).textContent = fmt(p.r, 2);
   });
   if (!pts.length) NS("text", { x: W / 2, y: H / 2, "text-anchor": "middle" }, sv).textContent = "no feasible point (KV capacity)";
@@ -438,21 +442,26 @@ function staticBits() {
   $("gen").textContent = M.generated;
   $("asmL").innerHTML = M.assumptions.map(function (a) { return "<li>" + esc(a) + "</li>"; }).join("");
   $("oqL").innerHTML = M.open_questions.map(function (a) { return "<li>" + esc(a) + "</li>"; }).join("");
-  var h = "<tr><th>anchor</th><th>measured</th><th>model SOL</th><th>model achievable</th><th>note</th></tr>";
+  var h = "<tr><th>anchor</th><th>point</th><th class=n>measured</th><th class=n>model SOL</th><th class=n>model achievable</th><th class=n>ach / measured speed</th><th class=n>SOL / measured speed</th><th>note</th></tr>";
   M.anchors.forEach(function (a) {
-    if (a.rows) a.rows.forEach(function (r) { h += "<tr><td>" + esc(a.name) + " r=" + r.r + "</td><td class=n>" + fmt(r.measured_ms) + " ms</td><td class=n>" + fmt(r.sol_ms) + " ms</td><td class=n>" + fmt(r.ach_ms) + " ms</td><td class=note>" + esc(a.note) + "</td></tr>"; });
-    else h += "<tr><td>" + esc(a.name) + "</td><td class=n>" + fmt(a.measured_tok_s_gpu) + " tok/s/GPU</td><td class=n>" + fmt(a.sol_tok_s_gpu) + "</td><td class=n>" + fmt(a.ach_tok_s_gpu) + "</td><td class=note>" + esc(a.note) + "</td></tr>";
+    a.rows.forEach(function (r, i) {
+      var bad = r.warn ? ' class="n warn"' : " class=n";
+      h += "<tr>" + (i === 0 ? '<td rowspan="' + a.rows.length + '">' + esc(a.name) + '<div class=note>' + esc(a.note) + "</div></td>" : "") +
+        "<td>" + esc(r.label) + (r.feasible ? "" : ' <span class=warn>(infeasible: ' + esc(r.note) + ")</span>") + "</td><td class=n>" + fmt(r.measured) + " " + esc(r.unit) +
+        "</td><td class=n>" + fmt(r.sol) + "</td><td class=n>" + fmt(r.ach) + "</td><td" + bad + ">" + fmt(r.ratio_ach, 2) + "</td><td class=n>" + fmt(r.ratio_sol, 2) +
+        "</td><td class=note>" + (r.feasible ? esc(r.note) : "") + "</td></tr>";
+    });
   });
   $("ancT").innerHTML = h;
   var mb = [
     ["KDA.in_proj / f_b_proj / o_proj, DSA.*proj, MOE.router/latent/shared, DENSE.*, F.lm_head, DS.qkv/o/gate_up/down/fc/ctx_kv_proj", "GEMM roofline per (M, N, K, dtype) at the per-GPU shard shape", "kernel-microbenchmark: cuBLAS / CuTe GEMM at the exact sharded shapes (M = rows per GPU)"],
     ["KDA.conv + gate_beta_norm + core_prefill / core_decode + o_norm", "FP32 SIMT + BF16 MMA (prefill chunked), state bytes", "FlashKDA prefill chunk bench; sdec KDA recurrence bench (B, q, heads/N)"],
-    ["DSA.prologue, idx_q_quant, idx_score, topk", "MXFP4 MMA + key scan bytes", "indexer score + exact top-k bench (DCP shard / DSA-DP owner / ShardQ rows)"],
-    ["DSA.w_uk, sparse_mla, w_uv, gate_mul", "BF16 MMA + FP8 KV gather 576 B x 2048 rows", "FlashMLA sparse / CuTe sparse MLA bench at heads per GPU"],
-    ["MOE.dispatch, fc1, act, fc2, combine", "expert weight stream (touched experts / E) + FP8/FP4 MMA + P11/P12", "newest packaged MegaMoE at EP size and rows per rank (dispatch / GEMM / combine timed separately)"],
+    ["DSA.prologue, idx_q_quant, idx_score, topk", "MXFP4 MMA vs FP32 epilogue (relu + head-weight FMA over 32 heads) vs key scan bytes; exact top-k via BF16 scratch or two-pass recompute (cheaper)", "DeepGEMM fp4_mqa_logits (times MMA + epilogue together) + exact top-k bench (DCP shard / DSA-DP owner / ShardQ rows)"],
+    ["DSA.w_uk, sparse_mla, w_uv, gate_mul", "FP8 Q x FP8 KV MMA (576-B row) co-bound with one MUFU exp per (row, head, key); FP8 KV gather 576 B x 2048 rows", "FlashMLA sparse / CuTe sparse MLA bench at heads per GPU (FP8 query path)"],
+    ["MOE.dispatch, fc1, act, fc2, combine", "expert weight stream (touched of ceil(896/EP) slots) + FP8/FP4 MMA + fc1->fc2 intermediate spill above 64 MiB + P11/P12", "newest packaged MegaMoE at EP size and rows per rank (dispatch / GEMM / combine timed separately). mxfp4_release: force MXFP8 activations (the Rubin backend switches to NVFP4 above 512 tokens/rank) and assert the logged quant kind, or compare with the O4 row"],
     ["L.attnres_pre/post, F.attnres_final, DS.aux_capture", "memory-bound mixes over up to 9 BF16 sources", "AttnRes mix kernel bench (rows x sources)"],
     ["DS.attn, DS.markov, DS.lm_head, F.rejection", "SWA GQA 2048 window; Markov rank-512 x vocab/N per position", "DSpark draft step bench (sdec) at k and B"],
-    ["comm P1/P1c/P2/P3/P3b/P4/P5/P6/P7b/P8/P9/P13/P14/P16", "hops x hop + max(in, out) / NVLink", "symmbench / ncclbench at the message sizes in the op table comm rows"],
+    ["comm P1/P1b/P1c/P2/P3/P3b/P5/P6/P7b/P8/P9/P13/P14/P16/P18", "push: hops x push hop(N) + max(in, out) / NVLink; NVLS: alpha(N) + M / algbw(N)", "symmbench / ncclbench at the message sizes in the op table comm rows"],
     ["whole layer / step", "sum of the above per layer (layer-level column)", "vllm bench forward (model-microbenchmark) per layer type and full step; compare with per-layer timeline"],
   ];
   $("mbT").innerHTML = "<tr><th>model ops</th><th>model term</th><th>microbench</th></tr>" + mb.map(function (r) { return "<tr><td class=mono>" + esc(r[0]) + "</td><td>" + esc(r[1]) + "</td><td>" + esc(r[2]) + "</td></tr>"; }).join("");

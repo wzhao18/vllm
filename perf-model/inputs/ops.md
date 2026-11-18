@@ -274,8 +274,8 @@ Top ops by unsharded single-GPU roofline time max(FLOPs/peak(dtype), HBM bytes/1
 | DS.ctx_kv_proj | 0.1 | 0.2 | 0.3 | 0.59 | 0.88 | 1.17 |
 | DS.embed | 0.0 | 0.0 | 0.1 | 0.00 | 0.00 | 0.00 |
 | G.embed | 0.0 | 0.0 | 0.1 | 0.00 | 0.00 | 0.00 |
-| MOE.act | 0.0 | 0.0 | 0.0 | 0.22 | 0.33 | 0.43 |
 | DS.ctx_kv_insert | 0.0 | 0.1 | 0.2 | 0.00 | 0.00 | 0.00 |
+| MOE.act | 0.0 | 0.0 | 0.0 | 0.22 | 0.33 | 0.43 |
 | **total** | 1817 | 2131 | 2443 | 1010.0 | 1518.2 | 2026.3 |
 
 ## Findings that matter for the SOL model

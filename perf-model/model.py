@@ -29,9 +29,10 @@ C["IDX_ROW"] = 68
 DSA_KV_PER_TOKEN = C["N_DSA"] * (C["MLA_ROW"] + C["IDX_ROW"])   # 15,456 B
 
 FIELDS = ("flops", "weight_bytes", "act_in_bytes", "act_out_bytes", "kv_read_bytes", "kv_write_bytes",
-          "state_read_bytes", "state_write_bytes")
+          "state_read_bytes", "state_write_bytes", "simt_flops", "sfu_ops")
 SHORT = dict(flops="flops", weight_bytes="w", act_in_bytes="a_in", act_out_bytes="a_out", kv_read_bytes="kv_r",
-             kv_write_bytes="kv_w", state_read_bytes="st_r", state_write_bytes="st_w")
+             kv_write_bytes="kv_w", state_read_bytes="st_r", state_write_bytes="st_w", simt_flops="simt",
+             sfu_ops="sfu")
 
 _SAFE = {"__builtins__": {}, "min": min, "max": max}
 
@@ -61,7 +62,7 @@ class Op:
         c = self.compute
         if "mxf4" in c:
             return "fp4"
-        if "mxf8" in c:
+        if "mxf8" in c or c.startswith("fp8"):
             return "fp8"
         if "bf16" in c:
             return "bf16"
@@ -159,7 +160,20 @@ def ckpt_cfg(name, moe_act=None):
     return c
 
 
+def sparse_mla_dtype(mla_row):
+    """Sparse-MLA MMA dtype implied by the FP8 KV format: the 576-B per-tensor FP8 row (SM10x default) runs FP8 Q x
+    FP8 KV (flashinfer_mla_sparse.py: FP8 query required with an FP8 cache); the 656-B fp8_ds_mla row is
+    dequantized to BF16 on load."""
+    if mla_row == 576:
+        return "fp8"
+    if mla_row == 656:
+        return "bf16"
+    raise ValueError("unknown MLA KV row %r" % mla_row)
+
+
 def op_dtype(op, ck):
+    if op.id == "DSA.sparse_mla":
+        return sparse_mla_dtype(C["MLA_ROW"])
     if op.id in KDA_Q_OPS:
         return ck["kda_dt"]
     if op.id in SHARED_OPS:
@@ -195,7 +209,8 @@ def env_prefill(F, L, f_req=None, o7=True, ckpt_export=1):
              Ltk=n * sum_min_topk(P, f),
              Lu=n * (P + f), R=n,
              Tc=n * min(f, C["D_W"]) if o7 else float(F), Tq=0.0,
-             PREFILL=True, CKPT=ckpt_export, SCRATCH=0 if o7 else 1, E_ACT=C["E"])
+             PREFILL=True, CKPT=ckpt_export, SCRATCH=0 if o7 else 1, O7=1 if o7 else 0, MOE_SPILL=0,
+             E_ACT=C["E"])
     return e
 
 
@@ -215,7 +230,7 @@ def env_decode(B, k, L, AL=None, o7=True):
     e.update(T=float(B * q), B=float(B), nseq=float(B), k=k, q=q, L=float(L), AL=al,
              Lsum=B * q * L, Ltk=B * q * min(L, C["TOPK"]), Lu=B * L, R=float(B * q),
              Tc=B * al if o7 else float(B * q), Tq=float(B * k),
-             PREFILL=False, CKPT=0, SCRATCH=0 if o7 else 1, E_ACT=C["E"])
+             PREFILL=False, CKPT=0, SCRATCH=0 if o7 else 1, O7=1 if o7 else 0, MOE_SPILL=0, E_ACT=C["E"])
     return e
 
 
@@ -231,6 +246,9 @@ def evaluate(op, env, ck):
     elif op.id in EXPERT_GEMMS:
         r["w"] *= ck["exp_wB"] / MXFP4_B
         if op.id == "MOE.fc1":
+            r["a_in"] *= ck["exp_aB"] / MXFP8_B
+            r["a_out"] *= ck["exp_aB"] / MXFP8_B      # spilled intermediate (MOE_SPILL), act dtype
+        else:
             r["a_in"] *= ck["exp_aB"] / MXFP8_B
     elif op.id == "MOE.dispatch":
         r["a_out"] *= ck["exp_aB"] / MXFP8_B
@@ -262,7 +280,7 @@ def per_request_state_bytes(k, L, conv_fp32=True):
     dsa = DSA_KV_PER_TOKEN * L
     kda = C["N_KDA"] * C["Hk"] * C["dk"] * C["dv"] * 4                       # 434.1 MB FP32 recurrent
     conv = C["N_KDA"] * 3 * C["P"] * (C["CONV"] - 1 + k) * (4 if conv_fp32 else 2)
-    recover = 6.78e6 * q                                                      # RecoverSSM verify records
+    recover = C["N_KDA"] * C["Hk"] * C["REC_B"] * q                          # RecoverSSM records (6.78 MB x q)
     swa = 20480 * min(L, C["D_W"])                                            # drafter SWA BF16
     return dict(dsa=dsa, kda=kda, conv=conv, recover=recover, swa=swa)
 

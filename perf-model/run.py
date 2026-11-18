@@ -96,9 +96,8 @@ def run_decode():
     for ck in CKS:
         for k in Dec.K_LIST:
             for t in DECODE:
-                cap = Dec.afd_capacity(t, ck, k, Dec.L_DEC) if t.afd else kv.capacity(t, ck, k, Dec.L_DEC)
-                cap189 = (Dec.afd_capacity(t, ck, k, Mdl.AGENTX["decode_ctx_osl_weighted"]) if t.afd
-                          else kv.capacity(t, ck, k, Mdl.AGENTX["decode_ctx_osl_weighted"]))
+                cap = kv.capacity(t, ck, k, Dec.L_DEC)
+                cap189 = kv.capacity(t, ck, k, Mdl.AGENTX["decode_ctx_osl_weighted"])
                 cap["rmax_189K"] = cap189["rmax"]
                 out["cap"]["%s|%d|%s" % (ck, k, t.id)] = cap
             for col in COLS:
@@ -187,44 +186,77 @@ def run_optables():
 # ---------------------------------------------------------------------------------------------- meta
 ASSUMPTIONS = [
     "SOL column = public VR200 spec peaks (BF16 4 / FP8 17.5 / FP4 35 PF dense, HBM4 22 TB/s, NVLink6 1.8 TB/s per "
-    "direction), hop = one CUDA-graph node (0.78 us), zero per-kernel gap. Achievable column = our Hecate measurements "
-    "(3.65 / 10.9 / 21.1 PF, 13.9 TB/s, 1.25 TB/s ingress, 2.86 us hop, 0.78 us per kernel). No fitted derating.",
-    "FP32 SIMT rate (KDA recurrence, conv) = 212 SMs x 128 lanes x 2 x 2.424 GHz = 131.6 TF in both columns (not measured).",
-    "Per-op roofline t = max(FLOPs/peak[dtype], bytes/HBM); ops are additive (no cross-op overlap) except two-microbatch O1.",
+    "direction), zero per-kernel gap; there is no public NVLink latency figure, so a dependent hop uses our measured "
+    "one-way flag hand-off (2.86 us) and is never set below a measured hand-off. Achievable column = our Hecate "
+    "measurements (3.65 / 10.9 / 21.1 PF, 13.9 TB/s, 1.25 TB/s ingress, 2.86 us push hop + 0.035 us per polled peer, "
+    "NVLS all-reduce alpha 12.6-12.9 us and algbw 0.29-0.46 TB/s from symmbench + ncclbench, 0.78 us graph node). "
+    "No fitted derating.",
+    "FP32 SIMT (131.6 TF) and MUFU exp (8.2 T/s) rates are derived from measured attributes (212 SMs x 128 lanes x 2, "
+    "x 16 MUFU, x 2.424 GHz) in both columns (not measured).",
+    "Per-op roofline t = max(FLOPs/peak[dtype], bytes/HBM, SIMT/peak_simt + SFU/peak_mufu); ops are additive (no "
+    "cross-op overlap) except two-microbatch O1. A launched (non-fused) kernel costs max(roofline, per-kernel gap): "
+    "the gap overlaps the previous kernel under PDL; comm events pay their hop latency only.",
+    "Sparse MLA runs FP8 Q x FP8 KV MMAs (the 576-B per-tensor FP8 row; a 656-B fp8_ds_mla row would be BF16), "
+    "co-bound with one MUFU exp per (row, head, key). The indexer is max(FP4 MMA, FP32 epilogue relu + head-weight FMA "
+    "over 32 heads at the SIMT rate, key bytes).",
     "Ops flagged fused_in_sol (conv, gate/beta norm, o_norm, act, gate_mul, top-k of MoE, latent_norm, ...) carry no "
-    "activation HBM traffic. Op-level SOL fusions (O7) are always on: fused indexer score+select (no logits scratch), "
-    "final AttnRes mix and drafter context rows only for consumed rows (last token / last 2048 per request in prefill, "
-    "accepted rows in decode), Markov vocab shard reused from L2 across the k positions when it fits (<= 64 MiB).",
-    "FP8 MLA KV is the standard 576-B row (512 latent + 64 rope FP8); MXFP4 indexer key 68 B; DSA KV = 15,456 B/token.",
+    "activation HBM traffic, but their second input is read by the consumer (KDA / DSA o_proj read the output gate). "
+    "The MoE fc1->fc2 intermediate stays in L2 up to 64 MiB per GPU (decode) and round-trips HBM above (prefill). "
+    "O7 SOL fusions are always on: exact top-k without a full logits pass when cheaper (min of BF16 scratch write+read "
+    "and a two-pass recompute; the scratch wins everywhere today), final AttnRes mix on the R logit rows and aux "
+    "captures / drafter context rows only for consumed rows in prefill, Markov vocab shard reused from L2 (<= 64 MiB).",
+    "FP8 MLA KV is the standard 576-B row (512 latent + 64 rope FP8); MXFP4 indexer key 68 B; DSA KV = 15,456 B/token. "
+    "Sparse-MLA KV reads use one SOL rule in both phases: the union bound min(Lu, Ltk) (decode: q x 2048 rows per "
+    "request at 135K; the true union of overlapping verify rows is smaller, worth ~2% of a high-r DEP step).",
     "KDA state per request = one FP32 recurrent state (434 MB) + FP32 conv (3+k columns) + RecoverSSM records "
-    "(6.78 MB x q); the deployed allocator reserves far more (workload.md) - that gap is an implementation item.",
+    "(1024 B per row per head = 6.78 MB x q, written for q rows and read for AL rows per step; one constant drives "
+    "traffic and capacity); the deployed allocator reserves far more (workload.md) - that gap is an implementation item.",
     "mxfp4_release routed experts run W4A8 at the FP8 MMA rate with MXFP8 dispatch (3696 B/route); O4 (NVFP4 "
-    "activations, FP4 rate, 2016 B/route) is not in the headline because the mission fixes MXFP8 activations.",
+    "activations, FP4 rate, 2016 B/route) is not in the headline because the mission fixes MXFP8 activations. The "
+    "deployed Rubin MegaMoE switches to NVFP4 above 512 tokens/rank: prefill microbenches must pin MXFP8 or compare to O4.",
     "nvfp4_modelopt: experts NVFP4 W4A4 at FP4 rate (2016 B/route), KDA projections + shared experts MXFP8 at FP8 rate; "
     "MLA, router, latent, dense L0, lm_head BF16. KV/state precision identical to mxfp4_release.",
-    "Routing is uniform: experts touched per GPU = (896/E) x (1 - (1 - 16/896)^(rows in EP domain)); EP imbalance 1.0 "
-    "in both columns (O5 is a sensitivity knob, not applied).",
-    "All-reduce / reduce-scatter take the cheaper of the implemented primitives (NVLS 2 hops vs one-shot / push 1 hop) "
-    "per column; NVLS per-GPU bytes ~M in, M(1+1/N) out (comm.json).",
+    "Routing is uniform: experts touched per GPU = ceil(896/E) x (1 - (1 - 16/896)^(rows in EP domain)); EP sizes that "
+    "do not divide 896 (72, 24) hold ceil(896/E) expert slots per GPU with redundant replicas carrying the load evenly "
+    "(weights charged, imbalance 1.0 in both columns; O5 is a sensitivity knob, not applied).",
+    "All-reduce / reduce-scatter take the cheapest implemented primitive per column: NVLS multimem, one-shot Lamport push "
+    "(1 hop, (N-1)M in) or two-shot push (2 hops). sdec-style Lamport pushes are priced at the flag hop (16-rank "
+    "two-shot owner reduce measured 3.39 us after the last push); the torch one_shot (pull + barrier) bench does not "
+    "apply to them.",
+    "TP-sharded MoE-dense (D7, D8, D10, D11): router/latent_down column shards are transposed to row ownership for "
+    "top-k + dispatch, and the combined latent is transposed back for a K-split latent_up whose partials ride the "
+    "shared-expert RS / AR (2 transposes per MoE layer; no replicated latent_up weights).",
     "Async comm (ShardQ context push on the copy engine) hides under the attention compute of the same layer; all other "
-    "comm is exposed unless O1 (two microbatches, t_layer = max(compute, comm), weights streamed twice) is on.",
-    "DcpExchange top-k merge bytes 1536 B per row per peer (inferred); sharded verify 100 B per row per peer.",
+    "comm is exposed unless O1 (two microbatches, t_layer = max(compute, comm), weights streamed twice) is on. ShardQ "
+    "prefill uses slice-local q_b / W_UK / g with all-head weights (no q scatter) and an out gather before the head-TP "
+    "o_proj.",
+    "DcpExchange top-k merge bytes 1536 B per row per peer (inferred); sharded verify 100 B per row per peer. DSA-DP "
+    "decode push_in/out move 0 bytes (SP shards hold whole requests, the holder is the owner); prefill pays (N-1)/N.",
     "Capacity: HBM budget 272.48 GiB (measured free at vLLM start) - resident weights - 16 GiB reserve (activations, "
     "graphs, symmetric buffers, MegaMoE arena). r_max is per GPU (a group of N holds N x r requests).",
     "Prefill chunks are packed from AgentX requests with 5,456 fresh tokens each over a 72.9K prefix (fresh-weighted "
     "mean); L_ref = 78.4K. Headline = best chunk size per engine in {4K..64K} that fits HBM (0.5 MB per row of live "
-    "activations assumed). KDA state checkpoint export for the prefix cache is counted (CKPT=1).",
+    "activations assumed). KDA state checkpoint export for the prefix cache is counted (CKPT=1). KDA core prefill has a "
+    "chunk-serial latency floor (FlashKDA K2: ~0.49 us per 16-token chunk, kda_segscan.py) relieved by segment-parallel "
+    "scan (3x K2 work + scan) - it matters for TTFT and few-sequence chunks only.",
     "Decode reference context 135K (mission); r_max also reported at the OSL-weighted 189K. AL = golden 3.08/3.81/4.16 "
     "at k=3/5/7. Draft = one parallel 5-layer pass on k query rows + k sequential Markov steps.",
     "DSA-DP owner balance and DP lock-step padding are taken as perfect (SOL); D10 split indexer therefore only adds "
     "comm here - its value is under owner skew, which the SOL model does not price.",
     "PP (P7) stages are balanced by a DP partition over the per-layer times; the boundary push carries the residual + "
     "AttnRes block state (1 + ceil(l/12) rows of 14,336 B per token). Fill/drain bubbles ignored (many chunks in flight).",
-    "AFD (D11): two microbatches ping-pong; per MoE layer max(A layer, F experts, A<->F transfer) per half batch; best "
-    "of the A:F splits 56:16 / 48:24 / 40:32 per r.",
+    "AFD (D11): two microbatches ping-pong; per MoE layer max(A layer, F experts, A<->F transfer) per half batch, "
+    "transfer = max(egress, ingress) per side (full duplex); best of the A:F splits 56:16 / 48:24 / 40:32 per r; one "
+    "capacity function (kv.afd_capacity) reports r_max per split.",
+    "Anchors are sanity checks only (never fitted): D1 e2e (21 runs), C512 D3 decode (r = B/4 per DP4 rank), C512 P2 "
+    "prefill (computed prompt tokens) and PR #20 (24-layer layout ratios); the page flags any anchor where the "
+    "achievable column is slower than measured.",
 ]
 OPEN_Q = [
     "MoE activations for mxfp4_release prefill: MXFP8 (headline) or NVFP4 (the Rubin backend above 512 tokens/rank)?",
+    "C512 P2 prefill slope: the model's marginal cost (achievable ~16.7 ms per 1K chunk tokens, SOL ~13.5) is steeper "
+    "than the quoted 11 ms/1K lower-bound fit; no per-step prefill logs exist to rebuild the measured slope.",
+    "SOL per-hop latency: no public NVLink latency figure; both columns use our measured one-way flag (2.86 us).",
     "Dispatch dedup with per-rank FP32 pre-combine (O2) changes the BF16 rounding order of the routed sum - acceptable as 'order may differ'?",
     "KDA core precision: FlashKDA stages the FP32 state into BF16 MMAs in prefill; FP32/TF32 math would ~2x the prefill KDA core.",
     "DcpExchange per-row bytes (X_topk) and the drafter forward row count per verify outcome are inferred, not read from kernels.",
@@ -233,33 +265,98 @@ OPEN_Q = [
     "The FP32 SIMT rate and the MXFP4 GEMM rate are not measured on VR200; die-local 17.1 TB/s comes from a code docstring.",
     "Spec values are NVIDIA's preliminary public figures and may change.",
 ]
-ANCHORS = [
-    dict(name="C512 hybrid decode step (D3, k=3 assumed)", topo="D3", kind="decode",
-         measured={"4": 21.4, "16": 25.1, "32": 25.2, "50": 30.5, "64": 31.7},
-         note="measured per-rank batch B -> step ms (release C512 step bench); model r = B requests per GPU"),
-    dict(name="C512 hybrid prefill (P2)", topo="P2", kind="prefill", measured_tok_s_gpu=8300.0, F=15600,
-         note="2.1 steps/s x ~15.6K tokens per DP4 engine (4 GPUs) = ~8.3K fresh tok/s/GPU (engine logs); "
-              "lower bound step 165 ms + 11 ms per 1K tokens"),
+ANCHORS_D1 = os.path.join(HERE, "inputs", "anchors_d1.json")   # inputs/anchors_src/extract_d1.py
+C512_DECODE = {"4": 21.4, "16": 25.1, "32": 25.2, "50": 30.5, "64": 31.7}   # release C512 step bench, B per DP rank
+PR20 = [  # Inferact/nvidia-vllm-agentx #20: 24-layer real-weight model, AgentX c3072, fresh tok/s/GPU
+    ("DEP12", 50.0e3, dict(N=1, residual="dep", dsa="local", moe_dense="rep", E=12)),
+    ("TP4xDP3 DSA-DP", 46.1e3, dict(N=4, residual="sp", dsa="dsadp", moe_dense="rep", E=12)),
+    ("DP4xTP4/DCP4", 41.4e3, dict(N=4, residual="sp", dsa="dcp", moe_dense="rep", E=16)),
+    ("TP8+DCP8", 32.2e3, dict(N=8, residual="tp", dsa="dcp", moe_dense="tokenshard", E=8)),
 ]
 
 
+def _row(label, unit, measured, sol, ach, faster_is="lower", feasible=True, note=""):
+    """ratio = model-achievable speed / measured speed (>= 1 expected: the model is an upper bound)."""
+    if faster_is == "lower":
+        ra, rs = measured / ach, measured / sol
+    else:
+        ra, rs = ach / measured, sol / measured
+    return dict(label=label, unit=unit, measured=measured, sol=sol, ach=ach, ratio_ach=ra, ratio_sol=rs,
+                feasible=feasible, warn=bool(ra < 1.0), note=note)
+
+
+def run_anchors():
+    from topologies import Topo
+    out = []
+    # (1) C512 hybrid decode step bench: B is requests per DP rank = one TP4 group of 4 GPUs -> r = B / 4
+    t = ALL["D3"]
+    cap = kv.capacity(t, "mxfp4_release", 3, Dec.L_DEC)["rmax"]
+    rows = []
+    for B, ms in C512_DECODE.items():
+        r = float(B) / t.N
+        s = Dec.run_point(t, "mxfp4_release", "sol", r, 3)
+        h = Dec.run_point(t, "mxfp4_release", "achievable", r, 3)
+        rows.append(_row("B%s per DP4 rank (r=%g)" % (B, r), "ms/step", ms, s["t_ms"], h["t_ms"],
+                         feasible=r <= cap + 1e-9, note="" if r <= cap + 1e-9 else "r > r_max %.1f" % cap))
+    out.append(dict(name="C512 hybrid decode step (D3, k=3, L=135K)", rows=rows,
+                    note="release C512 step bench; B = requests per DP rank (a TP4 group of 4 GPUs), so r = B/4"))
+    # (2) D1 e2e (TP16+DCP16 sdec): step = aiperf mean ITL x engine-logged mean AL at the logged mean running batch
+    with open(ANCHORS_D1) as f:
+        d1 = json.load(f)
+    t = ALL["D1"]
+    rows = []
+    for a in d1:
+        k = int(a["k"])
+        s = Dec.run_point(t, "mxfp4_release", "sol", a["r"], k)
+        h = Dec.run_point(t, "mxfp4_release", "achievable", a["r"], k)
+        rows.append(_row("%s %s (B %.1f, k%d, AL %.2f)" % (a["sweep"].split("-")[1], a["label"], a["B"], k, a["AL"]),
+                         "ms/step", a["step_ms"], s["t_ms"], h["t_ms"], note=a["run"]))
+    out.append(dict(name="D1 e2e decode (TP16+DCP16 sdec, mxfp4, L=135K model)", rows=rows,
+                    note="21 frozen/release AgentX runs; measured step includes host/scheduler time and real contexts "
+                         "(not 135K); a ratio < 1 means the model column is slower than shipped code (flagged)"))
+    # (3) C512 hybrid prefill (P2): computed prompt tokens (incl. Mooncake-miss recompute), not fresh tokens
+    t = ALL["P2"]
+    rows = []
+    for lab, act in (("MXFP8 experts (model headline)", None), ("NVFP4 act (as deployed >512 tok/rank, O4)", "nvfp4")):
+        s = Pre.run_point(t, "mxfp4_release", "sol", 15600, Pre.L_REF, moe_act=act)
+        h = Pre.run_point(t, "mxfp4_release", "achievable", 15600, Pre.L_REF, moe_act=act)
+        rows.append(_row("prompt tok/s/GPU, F=15.6K, " + lab, "tok/s/GPU", 8300.0, s["tok_s_gpu"], h["tok_s_gpu"],
+                         faster_is="higher"))
+    sl = {}
+    for col in COLS:
+        a8 = Pre.run_point(t, "mxfp4_release", col, 8192, Pre.L_REF)["t_ms"]
+        a16 = Pre.run_point(t, "mxfp4_release", col, 16384, Pre.L_REF)["t_ms"]
+        sl[col] = (a16 - a8) / 8.192
+    rows.append(_row("marginal step ms per 1K chunk tokens (8K->16K)", "ms/1K", 11.0, sl["sol"], sl["achievable"],
+                     note="measured slope is a lower-bound fit (165 ms + 11 ms/1K), not rebuilt from per-step logs "
+                          "(none recorded); ratio < 1 = model steeper than the fit (open)"))
+    out.append(dict(name="C512 hybrid prefill (P2 DP4 x TP4/DCP4, mxfp4)", rows=rows,
+                    note="engine logs ~32.6K computed prompt tok/s per DP4 engine = ~8.3K/GPU incl. recompute of "
+                         "Mooncake misses; the fresh-token rate is 4.34 req/s x 5,456 / 4 = ~5.9K/GPU"))
+    # (4) PR #20 (24-layer model): first 24 layers + embed/final/sync, 16K tokens per GPU per step
+    rows = []
+    base = None
+    res = []
+    for lab, meas, kw in PR20:
+        tt = Topo("PR20-" + lab, lab, "prefill", existing=True, **kw)
+        r_ = {}
+        for col in COLS:
+            F = 16384 * tt.N
+            p = Pre.run_point(tt, "mxfp4_release", col, F, Pre.L_REF, detail=True)
+            ms = sum(p["per_layer_ms"][:24]) + p["glob_ms"]["embed"] + p["glob_ms"]["final"] + p["glob_ms"]["step"]
+            r_[col] = F / (tt.N * ms * 1e-3)
+        res.append((lab, meas, r_))
+    m0, a0 = res[0][1], res[0][2]["achievable"]
+    for lab, meas, r_ in res:
+        rows.append(_row(lab + " (rel. to DEP12: meas %.2f, model %.2f)" % (meas / m0, r_["achievable"] / a0),
+                         "tok/s/GPU", meas, r_["sol"], r_["achievable"], faster_is="higher"))
+    out.append(dict(name="PR #20 prefill, 24-layer model (mxfp4, 16K tokens per GPU per step)", rows=rows,
+                    note="only layout-comparative measurement; validates the prefill ranking (model drafter excluded)"))
+    return out
+
+
 def run_meta(dec):
-    anchors = []
-    for a in ANCHORS:
-        t = ALL[a["topo"]]
-        if a["kind"] == "decode":
-            rows = []
-            for B, ms in a["measured"].items():
-                r = float(B)
-                s = Dec.run_point(t, "mxfp4_release", "sol", r, 3)
-                h = Dec.run_point(t, "mxfp4_release", "achievable", r, 3)
-                rows.append(dict(r=r, measured_ms=ms, sol_ms=s["t_ms"], ach_ms=h["t_ms"]))
-            anchors.append(dict(a, rows=rows))
-        else:
-            s = Pre.run_point(t, "mxfp4_release", "sol", a["F"], Pre.L_REF)
-            h = Pre.run_point(t, "mxfp4_release", "achievable", a["F"], Pre.L_REF)
-            anchors.append(dict(a, sol_tok_s_gpu=s["tok_s_gpu"], ach_tok_s_gpu=h["tok_s_gpu"], sol_ms=s["t_ms"],
-                                ach_ms=h["t_ms"]))
+    anchors = run_anchors()
     return dict(
         generated=time.strftime("%Y-%m-%d %H:%M"),
         hw=HWm.constants_table(), hw_cols={c: HWm.HWS[c].as_dict() for c in COLS},
@@ -289,6 +386,11 @@ def main():
             json.dump(rnd(obj), f, separators=(",", ":"))
         print("wrote out/%s.json (%.0f KB)" % (name, os.path.getsize(os.path.join(OUT, name + ".json")) / 1e3))
     summary(pre, dec)
+    for a in meta["anchors"]:
+        for r in a["rows"]:
+            if r["warn"]:
+                print("WARNING anchor %s / %s: model achievable is slower than measured (ratio %.2f)"
+                      % (a["name"], r["label"], r["ratio_ach"]))
 
 
 def summary(pre, dec):

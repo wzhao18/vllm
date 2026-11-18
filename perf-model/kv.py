@@ -22,17 +22,27 @@ def per_request_group_bytes(t, k, L):
     return tot, s
 
 
+def afd_capacity(t, ck_name, k, L):
+    """AFD A-pool capacity (the A pool holds no experts). r_max per total GPU depends on the A:F split; the curve
+    uses the split with the most A GPUs (largest r_max) and run_afd skips any split whose A pool would overflow."""
+    w, by = resident_weights(t, "decode", ck_name)
+    b, parts = per_request_group_bytes(t, k, L)
+    free = HWS["sol"].hbm_budget - w - RESERVE_GIB * GiB
+    rA = max(free, 0.0) / b
+    by_split = {"%d:%d" % (nA, nF): rA * nA / (nA + nF) for (nA, nF) in t.afd["choices"]}
+    return dict(weights_GB=w / 1e9, weights_by={kk: v / 1e9 for kk, v in by.items()}, free_GB=free / 1e9,
+                per_req_GB=b / 1e9, per_req_parts_GB={kk: v / 1e9 for kk, v in parts.items()},
+                rmax=max(by_split.values()), rmax_A=rA, rmax_by_split=by_split, feasible=free > 0)
+
+
 def capacity(t, ck_name, k, L, phase="decode"):
+    if t.afd:
+        return afd_capacity(t, ck_name, k, L)
     w, by = resident_weights(t, phase, ck_name)
     budget = HWS["sol"].hbm_budget
     free = budget - w - RESERVE_GIB * GiB
     b, parts = per_request_group_bytes(t, k, L)
-    if t.afd:
-        nA, nF = t.afd["choices"][1]
-        # A-pool holds no experts; capacity per total GPU scales with nA/(nA+nF)
-        rmax = max(free, 0) / b * nA / (nA + nF)
-    else:
-        rmax = max(free, 0.0) / b
+    rmax = max(free, 0.0) / b
     return dict(weights_GB=w / 1e9, weights_by={kk: v / 1e9 for kk, v in by.items()}, free_GB=free / 1e9,
                 per_req_GB=b / 1e9, per_req_parts_GB={kk: v / 1e9 for kk, v in parts.items()}, rmax=rmax,
                 feasible=free > 0)

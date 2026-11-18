@@ -72,7 +72,7 @@ PREFILL = [
          mapping=M(kda="local", mla="local", indexer="local", dsa_attn="local", moe_dense="local", experts="EP32",
                    lm_head="full", drafter="local"), comm="EP only"),
     Topo("P3-72", "P3 DEP72", "prefill", 1, "dep", "local", "rep", 72, proposal="P3",
-         mapping=M(kda="local", mla="local", indexer="local", dsa_attn="local", moe_dense="local", experts="EP72 (rack)",
+         mapping=M(kda="local", mla="local", indexer="local", dsa_attn="local", moe_dense="local", experts="EP72 (rack): ceil(896/72) = 13 expert slots per GPU, 40 redundant replicas",
                    lm_head="full", drafter="local"), comm="EP only (rack-wide)"),
     Topo("P4-4", "P4 TP4xDP4 DSA-DP SP, EP16", "prefill", 4, "sp", "dsadp", "rep", 16, existing=True, proposal="P4",
          mapping=M(kda="SP AG -> head-TP4 -> RS", mla="DSA-DP owner, all heads, W rep", indexer="owner",
@@ -125,7 +125,7 @@ DECODE = [
          mapping=M(kda="local", mla="local", indexer="local", dsa_attn="local", moe_dense="local", experts="EP32", lm_head="full", drafter="local"),
          comm="EP only"),
     Topo("D4-72", "D4 DEP72", "decode", 1, "dep", "local", "rep", 72, proposal="D4",
-         mapping=M(kda="local", mla="local", indexer="local", dsa_attn="local", moe_dense="local", experts="EP72", lm_head="full", drafter="local"),
+         mapping=M(kda="local", mla="local", indexer="local", dsa_attn="local", moe_dense="local", experts="EP72: 13 expert slots per GPU (40 redundant replicas)", lm_head="full", drafter="local"),
          comm="EP only (rack)"),
     Topo("D5", "D5 TP4 DSA-DP SP, EP16", "decode", 4, "sp", "dsadp", "rep", 16, existing=True, proposal="D5",
          mapping=M(kda="SP + head-TP4", mla="DSA-DP owner, all heads", indexer="owner", dsa_attn="owner region",
@@ -273,22 +273,34 @@ def _dsa_map(i, t, phase):
 
 
 # ---------------------------------------------------------------------------------------------- communication
-def ev(prim, name, in_B, out_B, hops, async_=False):
-    return dict(prim=prim, name=name, in_B=float(in_B), out_B=float(out_B), hops=hops, async_=async_)
+def ev(prim, name, in_B, out_B, hops, async_=False, kind="push", N=2, M=0.0):
+    """One comm event. kind: 'push' (symmetric-memory push / Lamport mailbox: hops x push hop + bytes / NVLink),
+    'nvls_ar' / 'nvls_rs' (multimem: priced by hw.nvls_ar from the message size M), 'ce' (copy engine)."""
+    return dict(prim=prim, name=name, in_B=float(in_B), out_B=float(out_B), hops=hops, async_=async_, kind=kind,
+                N=N, M=float(M))
 
 
 def AR(name, Mb, N):
-    """Best available all-reduce of Mb bytes over N: NVLS (P1, 2 hops) or one-shot multicast (P1c, 1 hop)."""
-    return dict(alts=[ev("P1 AR-NVLS", name, Mb, Mb * (1 + 1.0 / N), 2), ev("P1c AR-oneshot", name, (N - 1) * Mb, Mb, 1)])
+    """Best available all-reduce of Mb bytes over N: NVLS multimem (P1), one-shot Lamport push (P1c, 1 hop) or
+    two-shot push (P1b: RS-push + AG-push, 2 hops)."""
+    return dict(alts=[ev("P1 AR-NVLS", name, Mb, Mb * (1 + 1.0 / N), 2, kind="nvls_ar", N=N, M=Mb),
+                      ev("P1c AR-oneshot", name, (N - 1) * Mb, Mb, 1, N=N),
+                      ev("P1b AR-twoshot", name, 2 * (N - 1) / N * Mb, 2 * (N - 1) / N * Mb, 2, N=N)])
 
 
 def AG(name, n_rows, N, row=ROW):
-    return ev("P2 SP-AG", name, (N - 1) * n_rows * row, (N - 1) * n_rows * row, 1)
+    return ev("P2 SP-AG", name, (N - 1) * n_rows * row, (N - 1) * n_rows * row, 1, N=N)
 
 
 def RS(name, T, N, row=ROW):
-    return dict(alts=[ev("P3 RS-NVLS", name, T * row / N, T * row * (N - 1) / N, 2),
-                      ev("P3b RS-push", name, (N - 1) * T / N * row, (N - 1) * T / N * row, 1)])
+    return dict(alts=[ev("P3 RS-NVLS", name, T * row / N, T * row * (N - 1) / N, 2, kind="nvls_rs", N=N, M=T * row),
+                      ev("P3b RS-push", name, (N - 1) * T / N * row, (N - 1) * T / N * row, 1, N=N)])
+
+
+def XPOSE(name, T, N, row_B):
+    """Column-shard -> row-shard transpose of a [T, row_B] tensor over N ranks (each keeps T/N full rows)."""
+    b = T * (N - 1) / N * row_B / N
+    return ev("P14 TP-MoE transpose", name, b, b, 1, N=N)
 
 
 def ep_events(m, E, ck, dedup, imb=1.0):
@@ -299,8 +311,8 @@ def ep_events(m, E, ck, dedup, imb=1.0):
         U = E * (1 - (1 - 1.0 / E) ** k16)          # destinations per token (rank-level dedup + pre-combine)
         f = U / k16
     a = ck["dispatch_row"]
-    return [ev("P11 EP-dispatch", "MegaMoE dispatch", imb * m * k16 * a * rem * f, m * k16 * a * rem * f, 2),
-            ev("P12 EP-combine", "MegaMoE combine", m * k16 * 7168 * rem * f, imb * m * k16 * 7168 * rem * f, 1)]
+    return [ev("P11 EP-dispatch", "MegaMoE dispatch", imb * m * k16 * a * rem * f, m * k16 * a * rem * f, 2, N=E),
+            ev("P12 EP-combine", "MegaMoE combine", m * k16 * 7168 * rem * f, imb * m * k16 * 7168 * rem * f, 1, N=E)]
 
 
 def comm_events(t, phase, env, ck, imb=1.0, o2=False):
@@ -320,9 +332,12 @@ def comm_events(t, phase, env, ck, imb=1.0, o2=False):
             out["embed"].append(RS("embed RS", T, N))
             out["kda"] += [AG("SP AG", n, N), RS("o_proj RS", T, N)]
             if t.dsa in ("dsadp", "dsadp_split"):
-                push = n * ROW * (N - 1) / N
-                out["dsa"] += [ev("P13 DSA-DP push_in", "push_in rows to owner", push, push, 1),
-                               ev("P13 DSA-DP push_out", "push_out owner rows", push, push, 1)]
+                # prefill: ~5.4K-token request pieces cannot align with SP shards -> (N-1)/N of the rows move.
+                # decode: the scheduler gives each SP shard whole requests, so the SP holder is the owner (0 bytes,
+                # only the hand-off remains).
+                push = n * ROW * (N - 1) / N if phase == "prefill" else 0.0
+                out["dsa"] += [ev("P13 DSA-DP push_in", "push_in rows to owner", push, push, 1, N=N),
+                               ev("P13 DSA-DP push_out", "push_out owner rows", push, push, 1, N=N)]
             else:
                 out["dsa"] += [AG("SP AG", n, N), RS("o_proj RS", T, N)]
     # DSA attention comm
@@ -331,36 +346,40 @@ def comm_events(t, phase, env, ck, imb=1.0, o2=False):
     if t.dsa in ("dcp", "dsacp") and W > 1:
         if phase == "decode":
             hq = C["Nh"] / W
-            out["dsa"] += [ev("P6 DCP q publish", "FP8 MQA q publish", Tw * (W - 1) * hq * 576, Tw * hq * 576, 1),
-                           ev("P8 DCP top-k merge", "exact top-k merge", Tw * (W - 1) * X_TOPK, Tw * (W - 1) * X_TOPK, 2),
-                           ev("P7b DCP value push", "proj value combine", Tw * (W - 1) * hq * 260, Tw * (W - 1) * hq * 260, 1)]
+            out["dsa"] += [ev("P6 DCP q publish", "FP8 MQA q publish", Tw * (W - 1) * hq * 576, Tw * hq * 576, 1, N=W),
+                           ev("P8 DCP top-k merge", "exact top-k merge", Tw * (W - 1) * X_TOPK, Tw * (W - 1) * X_TOPK, 2, N=W),
+                           ev("P7b DCP value push", "proj value combine", Tw * (W - 1) * hq * 260, Tw * (W - 1) * hq * 260, 1, N=W)]
         else:
             ctx = env["Lu"] * (C["MLA_ROW"] + C["IDX_ROW"]) * (W - 1) / W
-            out["dsa"].append(ev("P9 ShardQ ctx push (CE)", "context gather", ctx, ctx, 1, async_=True))
+            out["dsa"].append(ev("P9 ShardQ ctx push (CE)", "context gather", ctx, ctx, 1, async_=True, N=W))
             if t.dsa == "dcp":
-                q = T * (N - 1) / N * (C["Nh"] / N) * 192 * 2
+                # ShardQ variant used here (SOL, consistent with op_map): q_b / W_UK / g run slice-local with
+                # all-head weights, so no P4 q scatter; o_proj stays head-TP, so the P5 out gather remains.
                 o = T * (N - 1) / N * (C["Nh"] / N) * 128 * 2
-                out["dsa"] += [ev("P4 ShardQ q scatter", "q scatter", q, q, 1),
-                               ev("P5 ShardQ out gather", "out gather", o, o, 1)]
+                out["dsa"].append(ev("P5 ShardQ out gather", "out gather", o, o, 1, N=N))
     if t.dsa == "dsadp_split" and N > 1:
         rows_o = T / N
         b = rows_o * (N - 1) * (2200 + X_TOPK) + rows_o * 8192 * (N - 1) / N
-        out["dsa"].append(ev("S1 split-indexer", "indexer q bcast + merge + ids", b, b, 2))
+        out["dsa"].append(ev("S1 split-indexer", "indexer q bcast + merge + ids", b, b, 2, N=N))
     # MoE layers
     md = t.moe_dense
     if md == "tpfront":
         out["moe"].append(ev("P14 TP-MoE front AG", "router logits + latent AG", T * (N - 1) / N * (896 * 4 + 3584 * 2),
-                             T / N * (896 * 4 + 3584 * 2) * (N - 1), 1))
+                             T / N * (896 * 4 + 3584 * 2) * (N - 1), 1, N=N))
         out["moe"] += [AR("latent AR", T * 7168, N), AR("shared/out AR", T * ROW, N)]
     else:
         if N > 1:
             if md == "tp":
+                # router / latent_down column-sharded -> transpose to row ownership for top-k + dispatch (T/N rows
+                # per rank); after combine the rank owns T/N full latent rows -> latent_norm there, then transpose
+                # back to column shards for the K-split latent_up, whose partial sums ride the shared-expert
+                # RS / AR (no extra reduction, no replicated latent_up weights).
+                front = XPOSE("router logits + latent col->row", T, N, 896 * 4 + 3584 * 2)
+                back = XPOSE("combined latent row->col (K-split latent_up)", T, N, 3584 * 2)
                 if t.residual == "sp":
-                    out["moe"] += [AG("MoE-dense AG", n, N), RS("MoE-dense RS", T, N)]
+                    out["moe"] += [AG("MoE-dense AG", n, N), front, back, RS("MoE-dense RS", T, N)]
                 else:
-                    out["moe"].append(ev("P14 TP-MoE front AG", "router + latent AG", T * (N - 1) / N * (896 * 4 + 3584 * 2),
-                                         T / N * (896 * 4 + 3584 * 2) * (N - 1), 1))
-                    out["moe"].append(AR("shared+latent_up AR", T * ROW, N))
+                    out["moe"] += [front, back, AR("shared+latent_up AR", T * ROW, N)]
             elif md == "tokenshard":
                 out["moe"].append(AR("shared partial + routed AR", T * ROW, N))
         if t.experts == "ep" and t.E > 1:
@@ -376,18 +395,22 @@ def comm_events(t, phase, env, ck, imb=1.0, o2=False):
     if N > 1:
         if t.residual == "sp":
             out["final"].append(AG("final AG (rows consumed)", R / N, N))
-        out["final"].append(ev("P16 sharded verify", "vocab-sharded verify", R * (N - 1) * VERIFY_B, R * VERIFY_B, 2 if phase == "decode" else 1))
+        out["final"].append(ev("P16 sharded verify", "vocab-sharded verify", R * (N - 1) * VERIFY_B, R * VERIFY_B, 2 if phase == "decode" else 1, N=N))
     # drafter
     ND = t.ND
     if ND > 1:
         Tc = env["Tc"]
-        out["drafter"].append(ev("P2 drafter ctx AG", "fc/ctx rows AG", Tc * (ND - 1) / ND * ROW, Tc * (ND - 1) / ND * ROW, 1))
+        out["drafter"].append(ev("P2 drafter ctx AG", "fc/ctx rows AG", Tc * (ND - 1) / ND * ROW, Tc * (ND - 1) / ND * ROW, 1, N=ND))
+        if phase == "decode" and t.residual == "sp":
+            # SP residual: the 5 aux captures are row-sharded; the column-sharded fc needs all Tc rows
+            aux = Tc * (ND - 1) / ND * C["D_AUX"] * ROW
+            out["drafter"].append(ev("P18 drafter aux AG", "aux hidden rows AG (5 x 7168)", aux, aux, 1, N=ND))
         if phase == "decode":
             Tq = env["Tq"]
             for s in range(2 * C["D_L"] + 1):
                 out["drafter"].append(AR("ArNorm site %d" % s, Tq * ROW, ND))
             for s in range(int(env["k"])):
-                out["drafter"].append(ev("P16 Markov exchange", "Markov argmax pos %d" % s, env["B"] * (ND - 1) * 16, env["B"] * 16, 1))
+                out["drafter"].append(ev("P16 Markov exchange", "Markov argmax pos %d" % s, env["B"] * (ND - 1) * 16, env["B"] * 16, 1, N=ND))
     if t.E > N and t.experts == "ep":
-        out["step"].append(ev("P19 DP sync", "EP lock-step sync", 0, 0, 1))
+        out["step"].append(ev("P19 DP sync", "EP lock-step sync", 0, 0, 1, N=t.E))
     return out

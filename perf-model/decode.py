@@ -8,7 +8,7 @@ overlap, evaluated at half batch twice).  D11 AFD picks the best A:F pool split 
 """
 import cost
 import model as Mdl
-from kv import capacity
+from kv import afd_capacity, capacity
 from topologies import ALL
 
 R_GRID = [0.0625, 0.125, 0.25, 0.5, 1, 1.5, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256]
@@ -54,7 +54,7 @@ def _run(t, ck, col, r, k, L, o1, v, detail):
     st = cost.step(res, o1=o1, reps=2 if o1 else 1)
     AL = Mdl.AL_GOLDEN[k]
     out = dict(r=r, o1=o1, t_ms=st["t"] * 1e3, tps_gpu=r * AL / st["t"], tps_user=AL / st["t"],
-               groups={g: x * 1e3 for g, x in st["groups"].items()})
+               groups={g: x * 1e3 for g, x in st["groups"].items()}, hops=st["hops"], n_comm=st["n_comm"])
     if detail:
         out["fam"] = {f: x * 1e3 for f, x in st["fam"].items()}
         out["comm_by"] = {p: x * 1e3 for p, x in st["comm_by"].items()}
@@ -79,6 +79,7 @@ def run_afd(t, ck, col, r, k, L, variant):
     q = 1 + k
     hw = cost.HWS[col]
     capA = afd_capacity(t, ck, k, L)["rmax_A"]
+    C = Mdl.C
     for (nA, nF) in t.afd["choices"]:
         rA = r * (nA + nF) / nA
         B = rA * t.N
@@ -89,8 +90,9 @@ def run_afd(t, ck, col, r, k, L, variant):
         st = cost.step(res)
         rows_tot = rA * nA * q / 2.0                           # half-batch rows of the whole A pool
         TF = rows_tot / nF                                     # rows per F GPU (16 routes each)
-        e_act = (Mdl.C["E"] / nF) * Mdl.touched_frac(rows_tot)
-        envF = dict(Mdl.env_decode(1, k, L), T=TF, E_ACT=e_act)
+        e_act = cost.experts_per_gpu(nF) * Mdl.touched_frac(rows_tot)
+        inter = TF * C["TOPK_E"] * C["I_E"] * ckc["exp_aB"]
+        envF = dict(Mdl.env_decode(1, k, L), T=TF, E_ACT=e_act, MOE_SPILL=1 if inter > cost.L2_SPILL_B else 0)
         hbm = hw.hbm_die_local if v["o3"] else hw.hbm
         tf = 0.0
         for oid in cost.EXPERT_OPS:
@@ -103,9 +105,10 @@ def run_afd(t, ck, col, r, k, L, variant):
         f = 1.0
         if v["o2"]:
             f = nF * (1 - (1 - 1.0 / nF) ** 16) / 16.0
-        xa = m * 16 * (ckc["dispatch_row"] + 7168) * f       # A GPU out (dispatch) + in (combine)
-        xf = TF * 16 * (ckc["dispatch_row"] + 7168) * f
-        x = 3 * hw.hop_s + max(xa, xf) / hw.nvl / 2.0 * 2.0
+        # NVLink is full duplex: each side's time is max(egress, ingress) per direction
+        xa = max(m * 16 * ckc["dispatch_row"] * f, m * 16 * 7168 * f)       # A: dispatch out, combine in
+        xf = max(TF * 16 * ckc["dispatch_row"] * f, TF * 16 * 7168 * f)     # F: dispatch in, combine out
+        x = 3 * hw.hop_s + max(xa, xf) / hw.nvl
         tot = 0.0
         wait = 0.0
         for (l, att, mlp), tl in zip(cost.LAYERS, st["per_layer"]):
@@ -127,21 +130,8 @@ def run_afd(t, ck, col, r, k, L, variant):
                 groups={kk: vv * 1e3 for kk, vv in best["groups"].items()}, split=best["split"])
 
 
-def afd_capacity(t, ck, k, L):
-    """A-pool capacity (no experts). rmax per total GPU uses the split with the most A GPUs."""
-    from cost import resident_weights
-    from hw import GiB, HWS
-    from kv import RESERVE_GIB, per_request_group_bytes
-    w, _ = resident_weights(t, "decode", ck)
-    b, _ = per_request_group_bytes(t, k, L)
-    free = HWS["sol"].hbm_budget - w - RESERVE_GIB * GiB
-    nA, nF = t.afd["choices"][0]
-    return dict(weights_GB=w / 1e9, rmax=free / b * nA / (nA + nF), rmax_A=free / b, per_req_GB=b / 1e9,
-                free_GB=free / 1e9, feasible=True, weights_by={}, per_req_parts_GB={})
-
-
 def curve(t, ck, col, k, variant, L=L_DEC):
-    cap = afd_capacity(t, ck, k, L) if t.afd else capacity(t, ck, k, L)
+    cap = capacity(t, ck, k, L)
     pts = []
     for r in r_points(t, cap["rmax"]):
         p = run_point(t, ck, col, r, k, L, variant)
