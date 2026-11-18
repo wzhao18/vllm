@@ -121,6 +121,26 @@
    "p50_ttft_s": 0.927
   },
   {
+   "label": "C160 1P1D llh",
+   "run": "C160-1P1D-llh-a1118807",
+   "topology": "1P1D: P TP8+DCP8, D TP16+DCP16 (k3, lookup flag on)",
+   "chosen": true,
+   "note": "",
+   "gsm8k_strict": 0.9818,
+   "gsm8k_real_al": 3.288,
+   "k": 3,
+   "gpus": 24,
+   "ok": 24118,
+   "err": 3,
+   "span_min": 60.4,
+   "tput_per_gpu": 41284.2,
+   "p90_intvty": 191.04,
+   "p90_e2e_norm_intvty": 39.92,
+   "p90_e2el_s": 15.94,
+   "p90_ttft_s": 5.202,
+   "p50_ttft_s": 1.206
+  },
+  {
    "label": "C512",
    "run": "C512-a1118813",
    "topology": "1P1D hybrid: P and D each DP4 x (TP4+DCP4), EP16",
