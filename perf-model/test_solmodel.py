@@ -127,6 +127,17 @@ class TestModel(unittest.TestCase):
         for x in Cal.MOE_ROWS:
             lay, _ = Cal._row_layer(x)
             self.assertLessEqual(lay * 1e6, x["measured_kernel_us"] * 1.0001, x["case"])
+        # EP16 / EP28 / EP32 rows of the FI SM107 EP32 build (decode T 1-512, prefill T 4096-16384)
+        self.assertGreaterEqual(len(Cal.MOE_EP32_ROWS), 50)
+        for x in Cal.MOE_EP32_ROWS:
+            lay = Cal.megamoe_model_layer(x["ckpt"], x["ep"], x["tokens_per_rank"])
+            self.assertLessEqual(lay * 1e6, x["measured_us"] * 1.0001, x["case"])
+        # every EP32 layout takes the MEASURED EP32 MegaMoE family (no EP16 transfer)
+        for T in (4, 32, 128, 8192, 16384):
+            self.assertEqual(Cal.megamoe_derate("mxfp4_release", 32, T)[1], "measured")
+        import prefill as Pre
+        c = Cal.prefill_calibrated(ALL["P3-32"], "mxfp4_release", 16384, Pre.L_REF)
+        self.assertEqual(c["component"]["experts_tag"], "measured")
 
     def test_megamoe_overlap(self):
         for tid, phase, env in (("P3-16", "prefill", Mdl.env_prefill(16384, 78400)),

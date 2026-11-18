@@ -1,0 +1,1051 @@
+[
+ {
+  "case": "megamoe-ep32-mxfp4_mxfp8-ep16-T1",
+  "ep": 16,
+  "tokens_per_rank": 1,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "ckpt": "mxfp4_release",
+  "mode": "bench",
+  "measured_us": 54.03,
+  "measured_kernel_us": 54.03,
+  "n_repeats": 1,
+  "t_sol_us": 14.07,
+  "t_ach_us": 17.78,
+  "derate": 3.038,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.mxfp4_mxfp8.ep16.r1"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-mxfp4_mxfp8-ep16-T4",
+  "ep": 16,
+  "tokens_per_rank": 4,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "ckpt": "mxfp4_release",
+  "mode": "bench",
+  "measured_us": 77.87,
+  "measured_kernel_us": 77.87,
+  "n_repeats": 1,
+  "t_sol_us": 33.52,
+  "t_ach_us": 42.8,
+  "derate": 1.819,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.mxfp4_mxfp8.ep16.r1"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-mxfp4_mxfp8-ep16-T16",
+  "ep": 16,
+  "tokens_per_rank": 16,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "ckpt": "mxfp4_release",
+  "mode": "bench",
+  "measured_us": 90.27,
+  "measured_kernel_us": 90.27,
+  "n_repeats": 1,
+  "t_sol_us": 47.44,
+  "t_ach_us": 60.7,
+  "derate": 1.487,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.mxfp4_mxfp8.ep16.r1"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-mxfp4_mxfp8-ep16-T32",
+  "ep": 16,
+  "tokens_per_rank": 32,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "ckpt": "mxfp4_release",
+  "mode": "bench",
+  "measured_us": 91.35,
+  "measured_kernel_us": 91.35,
+  "n_repeats": 1,
+  "t_sol_us": 48.24,
+  "t_ach_us": 61.72,
+  "derate": 1.48,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.mxfp4_mxfp8.ep16.r1"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-mxfp4_mxfp8-ep16-T64",
+  "ep": 16,
+  "tokens_per_rank": 64,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "ckpt": "mxfp4_release",
+  "mode": "bench",
+  "measured_us": 93.84,
+  "measured_kernel_us": 93.84,
+  "n_repeats": 1,
+  "t_sol_us": 48.97,
+  "t_ach_us": 62.64,
+  "derate": 1.498,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.mxfp4_mxfp8.ep16.r1"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-mxfp4_mxfp8-ep16-T128",
+  "ep": 16,
+  "tokens_per_rank": 128,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "ckpt": "mxfp4_release",
+  "mode": "bench",
+  "measured_us": 96.76,
+  "measured_kernel_us": 96.76,
+  "n_repeats": 1,
+  "t_sol_us": 50.41,
+  "t_ach_us": 64.45,
+  "derate": 1.501,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.mxfp4_mxfp8.ep16.r1"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-mxfp4_mxfp8-ep16-T256",
+  "ep": 16,
+  "tokens_per_rank": 256,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "ckpt": "mxfp4_release",
+  "mode": "bench",
+  "measured_us": 105.48,
+  "measured_kernel_us": 105.48,
+  "n_repeats": 1,
+  "t_sol_us": 53.3,
+  "t_ach_us": 68.09,
+  "derate": 1.549,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.mxfp4_mxfp8.ep16.r1"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-mxfp4_mxfp8-ep16-T512",
+  "ep": 16,
+  "tokens_per_rank": 512,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "ckpt": "mxfp4_release",
+  "mode": "bench",
+  "measured_us": 154.2,
+  "measured_kernel_us": 154.2,
+  "n_repeats": 1,
+  "t_sol_us": 59.07,
+  "t_ach_us": 83.33,
+  "derate": 1.851,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.mxfp4_mxfp8.ep16.r1"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-mxfp4_mxfp8-ep16-T4096",
+  "ep": 16,
+  "tokens_per_rank": 4096,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "ckpt": "mxfp4_release",
+  "mode": "prefill bench",
+  "measured_us": 860.27,
+  "measured_kernel_us": 860.27,
+  "n_repeats": 1,
+  "t_sol_us": 379.06,
+  "t_ach_us": 641.28,
+  "derate": 1.341,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-pf.r3ep.mxfp4_mxfp8.ep16.r1"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-mxfp4_mxfp8-ep16-T8192",
+  "ep": 16,
+  "tokens_per_rank": 8192,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "ckpt": "mxfp4_release",
+  "mode": "prefill bench",
+  "measured_us": 1717.76,
+  "measured_kernel_us": 1717.76,
+  "n_repeats": 1,
+  "t_sol_us": 755.25,
+  "t_ach_us": 1279.21,
+  "derate": 1.343,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-pf.r3ep.mxfp4_mxfp8.ep16.r1"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-mxfp4_mxfp8-ep16-T16384",
+  "ep": 16,
+  "tokens_per_rank": 16384,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "ckpt": "mxfp4_release",
+  "mode": "prefill bench",
+  "measured_us": 3450.79,
+  "measured_kernel_us": 3450.79,
+  "n_repeats": 1,
+  "t_sol_us": 1507.64,
+  "t_ach_us": 2555.06,
+  "derate": 1.351,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-pf.r3ep.mxfp4_mxfp8.ep16.r1"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-mxfp4_mxfp8-ep28-T1",
+  "ep": 28,
+  "tokens_per_rank": 1,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "ckpt": "mxfp4_release",
+  "mode": "bench",
+  "measured_us": 52.85,
+  "measured_kernel_us": 52.85,
+  "n_repeats": 1,
+  "t_sol_us": 13.0,
+  "t_ach_us": 16.83,
+  "derate": 3.141,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.mxfp4_mxfp8.ep28.r1"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-mxfp4_mxfp8-ep28-T16",
+  "ep": 28,
+  "tokens_per_rank": 16,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "ckpt": "mxfp4_release",
+  "mode": "bench",
+  "measured_us": 67.38,
+  "measured_kernel_us": 67.38,
+  "n_repeats": 1,
+  "t_sol_us": 28.76,
+  "t_ach_us": 37.09,
+  "derate": 1.816,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.mxfp4_mxfp8.ep28.r1"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-mxfp4_mxfp8-ep28-T128",
+  "ep": 28,
+  "tokens_per_rank": 128,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "ckpt": "mxfp4_release",
+  "mode": "bench",
+  "measured_us": 79.16,
+  "measured_kernel_us": 79.16,
+  "n_repeats": 1,
+  "t_sol_us": 31.44,
+  "t_ach_us": 40.53,
+  "derate": 1.953,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.mxfp4_mxfp8.ep28.r1"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-mxfp4_mxfp8-ep28-T512",
+  "ep": 28,
+  "tokens_per_rank": 512,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "ckpt": "mxfp4_release",
+  "mode": "bench",
+  "measured_us": 151.24,
+  "measured_kernel_us": 151.24,
+  "n_repeats": 1,
+  "t_sol_us": 51.74,
+  "t_ach_us": 86.54,
+  "derate": 1.748,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.mxfp4_mxfp8.ep28.r1"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-mxfp4_mxfp8-ep28-T8192",
+  "ep": 28,
+  "tokens_per_rank": 8192,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "ckpt": "mxfp4_release",
+  "mode": "prefill bench",
+  "measured_us": 1790.26,
+  "measured_kernel_us": 1790.26,
+  "n_repeats": 1,
+  "t_sol_us": 784.5,
+  "t_ach_us": 1327.95,
+  "derate": 1.348,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-pf.r3ep.mxfp4_mxfp8.ep28.r1"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-mxfp4_mxfp8-ep32-T1",
+  "ep": 32,
+  "tokens_per_rank": 1,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "ckpt": "mxfp4_release",
+  "mode": "bench",
+  "measured_us": 53.45,
+  "measured_kernel_us": 53.45,
+  "n_repeats": 2,
+  "t_sol_us": 12.67,
+  "t_ach_us": 16.55,
+  "derate": 3.23,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.mxfp4_mxfp8.ep32.r1",
+   "ep32-bn.r3ep.mxfp4_mxfp8.ep32.r2"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-mxfp4_mxfp8-ep32-T4",
+  "ep": 32,
+  "tokens_per_rank": 4,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "ckpt": "mxfp4_release",
+  "mode": "bench",
+  "measured_us": 62.94,
+  "measured_kernel_us": 62.94,
+  "n_repeats": 2,
+  "t_sol_us": 23.07,
+  "t_ach_us": 29.92,
+  "derate": 2.104,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.mxfp4_mxfp8.ep32.r1",
+   "ep32-bn.r3ep.mxfp4_mxfp8.ep32.r2"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-mxfp4_mxfp8-ep32-T16",
+  "ep": 32,
+  "tokens_per_rank": 16,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "ckpt": "mxfp4_release",
+  "mode": "bench",
+  "measured_us": 65.2,
+  "measured_kernel_us": 65.2,
+  "n_repeats": 2,
+  "t_sol_us": 25.58,
+  "t_ach_us": 33.15,
+  "derate": 1.967,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.mxfp4_mxfp8.ep32.r1",
+   "ep32-bn.r3ep.mxfp4_mxfp8.ep32.r2"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-mxfp4_mxfp8-ep32-T32",
+  "ep": 32,
+  "tokens_per_rank": 32,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "ckpt": "mxfp4_release",
+  "mode": "bench",
+  "measured_us": 66.64,
+  "measured_kernel_us": 66.64,
+  "n_repeats": 2,
+  "t_sol_us": 25.97,
+  "t_ach_us": 33.65,
+  "derate": 1.98,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.mxfp4_mxfp8.ep32.r1",
+   "ep32-bn.r3ep.mxfp4_mxfp8.ep32.r2"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-mxfp4_mxfp8-ep32-T64",
+  "ep": 32,
+  "tokens_per_rank": 64,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "ckpt": "mxfp4_release",
+  "mode": "bench",
+  "measured_us": 70.31,
+  "measured_kernel_us": 70.31,
+  "n_repeats": 2,
+  "t_sol_us": 26.75,
+  "t_ach_us": 34.66,
+  "derate": 2.029,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.mxfp4_mxfp8.ep32.r1",
+   "ep32-bn.r3ep.mxfp4_mxfp8.ep32.r2"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-mxfp4_mxfp8-ep32-T128",
+  "ep": 32,
+  "tokens_per_rank": 128,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "ckpt": "mxfp4_release",
+  "mode": "bench",
+  "measured_us": 77.51,
+  "measured_kernel_us": 77.51,
+  "n_repeats": 2,
+  "t_sol_us": 28.3,
+  "t_ach_us": 36.66,
+  "derate": 2.114,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.mxfp4_mxfp8.ep32.r1",
+   "ep32-bn.r3ep.mxfp4_mxfp8.ep32.r2"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-mxfp4_mxfp8-ep32-T256",
+  "ep": 32,
+  "tokens_per_rank": 256,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "ckpt": "mxfp4_release",
+  "mode": "bench",
+  "measured_us": 101.07,
+  "measured_kernel_us": 101.07,
+  "n_repeats": 2,
+  "t_sol_us": 31.41,
+  "t_ach_us": 45.85,
+  "derate": 2.204,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.mxfp4_mxfp8.ep32.r1",
+   "ep32-bn.r3ep.mxfp4_mxfp8.ep32.r2"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-mxfp4_mxfp8-ep32-T512",
+  "ep": 32,
+  "tokens_per_rank": 512,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "ckpt": "mxfp4_release",
+  "mode": "bench",
+  "measured_us": 156.82,
+  "measured_kernel_us": 156.82,
+  "n_repeats": 2,
+  "t_sol_us": 52.1,
+  "t_ach_us": 87.31,
+  "derate": 1.796,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.mxfp4_mxfp8.ep32.r1",
+   "ep32-bn.r3ep.mxfp4_mxfp8.ep32.r2"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-mxfp4_mxfp8-ep32-T4096",
+  "ep": 32,
+  "tokens_per_rank": 4096,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "ckpt": "mxfp4_release",
+  "mode": "prefill bench",
+  "measured_us": 859.3,
+  "measured_kernel_us": 859.3,
+  "n_repeats": 2,
+  "t_sol_us": 396.79,
+  "t_ach_us": 671.06,
+  "derate": 1.28,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-pf.r3ep.mxfp4_mxfp8.ep32.r1",
+   "ep32-pf.r3ep.mxfp4_mxfp8.ep32.r2"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-mxfp4_mxfp8-ep32-T8192",
+  "ep": 32,
+  "tokens_per_rank": 8192,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "ckpt": "mxfp4_release",
+  "mode": "prefill bench",
+  "measured_us": 1775.17,
+  "measured_kernel_us": 1775.17,
+  "n_repeats": 3,
+  "t_sol_us": 790.72,
+  "t_ach_us": 1338.21,
+  "derate": 1.327,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-pf.r3ep.mxfp4_mxfp8.ep32.r1",
+   "ep32-pf.r3ep.mxfp4_mxfp8.ep32.r2",
+   "ep32-pf16g.r3ep.mxfp4_mxfp8.ep32.r1"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-mxfp4_mxfp8-ep32-T16384",
+  "ep": 32,
+  "tokens_per_rank": 16384,
+  "quant_kind": "mxfp4w_mxfp8a",
+  "ckpt": "mxfp4_release",
+  "mode": "prefill bench",
+  "measured_us": 4184.42,
+  "measured_kernel_us": 4184.42,
+  "n_repeats": 2,
+  "t_sol_us": 1578.57,
+  "t_ach_us": 2672.49,
+  "derate": 1.566,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-pf16g.r3ep.mxfp4_mxfp8.ep32.t16k",
+   "ep32-pf16k.r3ep.mxfp4_mxfp8.ep32.r1"
+  ],
+  "notes": "EP32 prefill cliff: +21-30% vs EP16 at T16384 (kernel issue, not modelled)"
+ },
+ {
+  "case": "megamoe-ep32-nvfp4-ep16-T1",
+  "ep": 16,
+  "tokens_per_rank": 1,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "ckpt": "nvfp4_modelopt",
+  "mode": "bench",
+  "measured_us": 51.45,
+  "measured_kernel_us": 51.45,
+  "n_repeats": 1,
+  "t_sol_us": 14.73,
+  "t_ach_us": 18.63,
+  "derate": 2.762,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.nvfp4.ep16.r1"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-nvfp4-ep16-T4",
+  "ep": 16,
+  "tokens_per_rank": 4,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "ckpt": "nvfp4_modelopt",
+  "mode": "bench",
+  "measured_us": 76.11,
+  "measured_kernel_us": 76.11,
+  "n_repeats": 1,
+  "t_sol_us": 35.31,
+  "t_ach_us": 45.1,
+  "derate": 1.688,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.nvfp4.ep16.r1"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-nvfp4-ep16-T16",
+  "ep": 16,
+  "tokens_per_rank": 16,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "ckpt": "nvfp4_modelopt",
+  "mode": "bench",
+  "measured_us": 85.39,
+  "measured_kernel_us": 85.39,
+  "n_repeats": 1,
+  "t_sol_us": 50.0,
+  "t_ach_us": 63.99,
+  "derate": 1.334,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.nvfp4.ep16.r1"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-nvfp4-ep16-T32",
+  "ep": 16,
+  "tokens_per_rank": 32,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "ckpt": "nvfp4_modelopt",
+  "mode": "bench",
+  "measured_us": 85.76,
+  "measured_kernel_us": 85.76,
+  "n_repeats": 1,
+  "t_sol_us": 50.78,
+  "t_ach_us": 64.99,
+  "derate": 1.32,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.nvfp4.ep16.r1"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-nvfp4-ep16-T64",
+  "ep": 16,
+  "tokens_per_rank": 64,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "ckpt": "nvfp4_modelopt",
+  "mode": "bench",
+  "measured_us": 85.78,
+  "measured_kernel_us": 85.78,
+  "n_repeats": 1,
+  "t_sol_us": 51.42,
+  "t_ach_us": 65.79,
+  "derate": 1.304,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.nvfp4.ep16.r1"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-nvfp4-ep16-T128",
+  "ep": 16,
+  "tokens_per_rank": 128,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "ckpt": "nvfp4_modelopt",
+  "mode": "bench",
+  "measured_us": 88.13,
+  "measured_kernel_us": 88.13,
+  "n_repeats": 1,
+  "t_sol_us": 52.7,
+  "t_ach_us": 67.38,
+  "derate": 1.308,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.nvfp4.ep16.r1"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-nvfp4-ep16-T256",
+  "ep": 16,
+  "tokens_per_rank": 256,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "ckpt": "nvfp4_modelopt",
+  "mode": "bench",
+  "measured_us": 99.64,
+  "measured_kernel_us": 99.64,
+  "n_repeats": 1,
+  "t_sol_us": 55.24,
+  "t_ach_us": 70.56,
+  "derate": 1.412,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.nvfp4.ep16.r1"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-nvfp4-ep16-T512",
+  "ep": 16,
+  "tokens_per_rank": 512,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "ckpt": "nvfp4_modelopt",
+  "mode": "bench",
+  "measured_us": 133.45,
+  "measured_kernel_us": 133.45,
+  "n_repeats": 1,
+  "t_sol_us": 60.32,
+  "t_ach_us": 76.91,
+  "derate": 1.735,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.nvfp4.ep16.r1"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-nvfp4-ep16-T4096",
+  "ep": 16,
+  "tokens_per_rank": 4096,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "ckpt": "nvfp4_modelopt",
+  "mode": "prefill bench",
+  "measured_us": 651.9,
+  "measured_kernel_us": 651.9,
+  "n_repeats": 1,
+  "t_sol_us": 319.43,
+  "t_ach_us": 540.36,
+  "derate": 1.206,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-pf.r3ep.nvfp4.ep16.r1"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-nvfp4-ep16-T8192",
+  "ep": 16,
+  "tokens_per_rank": 8192,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "ckpt": "nvfp4_modelopt",
+  "mode": "prefill bench",
+  "measured_us": 1254.98,
+  "measured_kernel_us": 1254.98,
+  "n_repeats": 1,
+  "t_sol_us": 635.97,
+  "t_ach_us": 1077.37,
+  "derate": 1.165,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-pf.r3ep.nvfp4.ep16.r1"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-nvfp4-ep16-T16384",
+  "ep": 16,
+  "tokens_per_rank": 16384,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "ckpt": "nvfp4_modelopt",
+  "mode": "prefill bench",
+  "measured_us": 2660.48,
+  "measured_kernel_us": 2660.48,
+  "n_repeats": 1,
+  "t_sol_us": 1269.07,
+  "t_ach_us": 2151.38,
+  "derate": 1.237,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-pf.r3ep.nvfp4.ep16.r1"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-nvfp4-ep28-T1",
+  "ep": 28,
+  "tokens_per_rank": 1,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "ckpt": "nvfp4_modelopt",
+  "mode": "bench",
+  "measured_us": 50.52,
+  "measured_kernel_us": 50.52,
+  "n_repeats": 1,
+  "t_sol_us": 13.59,
+  "t_ach_us": 17.59,
+  "derate": 2.873,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.nvfp4.ep28.r1"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-nvfp4-ep28-T16",
+  "ep": 28,
+  "tokens_per_rank": 16,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "ckpt": "nvfp4_modelopt",
+  "mode": "bench",
+  "measured_us": 62.53,
+  "measured_kernel_us": 62.53,
+  "n_repeats": 1,
+  "t_sol_us": 30.21,
+  "t_ach_us": 38.96,
+  "derate": 1.605,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.nvfp4.ep28.r1"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-nvfp4-ep28-T128",
+  "ep": 28,
+  "tokens_per_rank": 128,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "ckpt": "nvfp4_modelopt",
+  "mode": "bench",
+  "measured_us": 71.2,
+  "measured_kernel_us": 71.2,
+  "n_repeats": 1,
+  "t_sol_us": 32.57,
+  "t_ach_us": 41.96,
+  "derate": 1.697,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.nvfp4.ep28.r1"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-nvfp4-ep28-T512",
+  "ep": 28,
+  "tokens_per_rank": 512,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "ckpt": "nvfp4_modelopt",
+  "mode": "bench",
+  "measured_us": 140.78,
+  "measured_kernel_us": 140.78,
+  "n_repeats": 1,
+  "t_sol_us": 44.31,
+  "t_ach_us": 73.67,
+  "derate": 1.911,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.nvfp4.ep28.r1"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-nvfp4-ep28-T8192",
+  "ep": 28,
+  "tokens_per_rank": 8192,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "ckpt": "nvfp4_modelopt",
+  "mode": "prefill bench",
+  "measured_us": 1423.88,
+  "measured_kernel_us": 1423.88,
+  "n_repeats": 1,
+  "t_sol_us": 658.49,
+  "t_ach_us": 1115.23,
+  "derate": 1.277,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-pf.r3ep.nvfp4.ep28.r1"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-nvfp4-ep32-T1",
+  "ep": 32,
+  "tokens_per_rank": 1,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "ckpt": "nvfp4_modelopt",
+  "mode": "bench",
+  "measured_us": 50.37,
+  "measured_kernel_us": 50.37,
+  "n_repeats": 2,
+  "t_sol_us": 13.25,
+  "t_ach_us": 17.28,
+  "derate": 2.914,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.nvfp4.ep32.r1",
+   "ep32-bn.r3ep.nvfp4.ep32.r2"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-nvfp4-ep32-T4",
+  "ep": 32,
+  "tokens_per_rank": 4,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "ckpt": "nvfp4_modelopt",
+  "mode": "bench",
+  "measured_us": 59.29,
+  "measured_kernel_us": 59.29,
+  "n_repeats": 2,
+  "t_sol_us": 24.24,
+  "t_ach_us": 31.42,
+  "derate": 1.887,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.nvfp4.ep32.r1",
+   "ep32-bn.r3ep.nvfp4.ep32.r2"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-nvfp4-ep32-T16",
+  "ep": 32,
+  "tokens_per_rank": 16,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "ckpt": "nvfp4_modelopt",
+  "mode": "bench",
+  "measured_us": 59.39,
+  "measured_kernel_us": 59.39,
+  "n_repeats": 2,
+  "t_sol_us": 26.85,
+  "t_ach_us": 34.78,
+  "derate": 1.708,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.nvfp4.ep32.r1",
+   "ep32-bn.r3ep.nvfp4.ep32.r2"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-nvfp4-ep32-T32",
+  "ep": 32,
+  "tokens_per_rank": 32,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "ckpt": "nvfp4_modelopt",
+  "mode": "bench",
+  "measured_us": 60.2,
+  "measured_kernel_us": 60.2,
+  "n_repeats": 2,
+  "t_sol_us": 27.19,
+  "t_ach_us": 35.22,
+  "derate": 1.709,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.nvfp4.ep32.r1",
+   "ep32-bn.r3ep.nvfp4.ep32.r2"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-nvfp4-ep32-T64",
+  "ep": 32,
+  "tokens_per_rank": 64,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "ckpt": "nvfp4_modelopt",
+  "mode": "bench",
+  "measured_us": 62.82,
+  "measured_kernel_us": 62.82,
+  "n_repeats": 2,
+  "t_sol_us": 27.87,
+  "t_ach_us": 36.09,
+  "derate": 1.741,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.nvfp4.ep32.r1",
+   "ep32-bn.r3ep.nvfp4.ep32.r2"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-nvfp4-ep32-T128",
+  "ep": 32,
+  "tokens_per_rank": 128,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "ckpt": "nvfp4_modelopt",
+  "mode": "bench",
+  "measured_us": 69.1,
+  "measured_kernel_us": 69.1,
+  "n_repeats": 2,
+  "t_sol_us": 29.24,
+  "t_ach_us": 37.84,
+  "derate": 1.826,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.nvfp4.ep32.r1",
+   "ep32-bn.r3ep.nvfp4.ep32.r2"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-nvfp4-ep32-T256",
+  "ep": 32,
+  "tokens_per_rank": 256,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "ckpt": "nvfp4_modelopt",
+  "mode": "bench",
+  "measured_us": 94.5,
+  "measured_kernel_us": 94.5,
+  "n_repeats": 2,
+  "t_sol_us": 31.96,
+  "t_ach_us": 41.33,
+  "derate": 2.286,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.nvfp4.ep32.r1",
+   "ep32-bn.r3ep.nvfp4.ep32.r2"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-nvfp4-ep32-T512",
+  "ep": 32,
+  "tokens_per_rank": 512,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "ckpt": "nvfp4_modelopt",
+  "mode": "bench",
+  "measured_us": 143.32,
+  "measured_kernel_us": 143.32,
+  "n_repeats": 2,
+  "t_sol_us": 44.53,
+  "t_ach_us": 74.18,
+  "derate": 1.932,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-bn.r3ep.nvfp4.ep32.r1",
+   "ep32-bn.r3ep.nvfp4.ep32.r2"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-nvfp4-ep32-T4096",
+  "ep": 32,
+  "tokens_per_rank": 4096,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "ckpt": "nvfp4_modelopt",
+  "mode": "prefill bench",
+  "measured_us": 682.11,
+  "measured_kernel_us": 682.11,
+  "n_repeats": 2,
+  "t_sol_us": 332.94,
+  "t_ach_us": 563.35,
+  "derate": 1.211,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-pf.r3ep.nvfp4.ep32.r1",
+   "ep32-pf.r3ep.nvfp4.ep32.r2"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-nvfp4-ep32-T8192",
+  "ep": 32,
+  "tokens_per_rank": 8192,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "ckpt": "nvfp4_modelopt",
+  "mode": "prefill bench",
+  "measured_us": 1373.12,
+  "measured_kernel_us": 1373.12,
+  "n_repeats": 3,
+  "t_sol_us": 663.01,
+  "t_ach_us": 1122.79,
+  "derate": 1.223,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-pf.r3ep.nvfp4.ep32.r1",
+   "ep32-pf.r3ep.nvfp4.ep32.r2",
+   "ep32-pf16g.r3ep.nvfp4.ep32.r1"
+  ],
+  "notes": ""
+ },
+ {
+  "case": "megamoe-ep32-nvfp4-ep32-T16384",
+  "ep": 32,
+  "tokens_per_rank": 16384,
+  "quant_kind": "nvfp4w_nvfp4a",
+  "ckpt": "nvfp4_modelopt",
+  "mode": "prefill bench",
+  "measured_us": 3464.09,
+  "measured_kernel_us": 3464.09,
+  "n_repeats": 1,
+  "t_sol_us": 1323.16,
+  "t_ach_us": 2241.65,
+  "derate": 1.545,
+  "kernel": "FlashInfer SM107 MegaMoE a368c5f66 (lane r3-ep 89fafd77e)",
+  "labels": [
+   "ep32-pf16k.r3ep.nvfp4.ep32.r1"
+  ],
+  "notes": "EP32 prefill cliff: +21-30% vs EP16 at T16384 (kernel issue, not modelled)"
+ }
+]

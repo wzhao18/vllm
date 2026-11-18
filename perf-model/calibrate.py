@@ -3,8 +3,9 @@
 Decode (per point t, r):
     calibrated = experts_ach x d_experts  +  rest_ach x d_rest(front path, r)
   * experts = the routed-expert component (cost.py: whole MegaMoE layer for EP layouts, routed-expert ops for MoE-TP).
-    d_experts: EP -> the MegaMoE family derate (moe lane rows: whole fused layer measured / this model's layer, by EP,
-    tokens per rank and quant; interpolated in log T) x 1.2 for the vendored in-step kernel of the release tree
+    d_experts: EP -> the MegaMoE family derate (moe lane rows + the EP32-build rows in microbench/results/moe_ep32:
+    whole fused layer measured / this model's layer, by EP 8 / 16 / 28 / 32, tokens per rank and quant; interpolated in
+    log T; every EP32 layout uses the measured EP32 rows) x 1.2 for the vendored in-step kernel of the release tree
     (gap512); MoE-TP (D1) -> the sdec MoE-TP16 kernel family (1.19).
   * rest = everything else; d_rest is recomputed from the measured step of the front path at that r:
         d_rest = (measured - experts_ach x d_experts) / rest_ach         (log-r interpolation between measured r)
@@ -22,7 +23,10 @@ Prefill: calibrated step = achievable step x the measured step derate of the pat
   chunk capped at the largest measured F of the path; 64K is reported separately as extrapolated. Analogs:
       P6-16, P6-32 -> P4-2    P6-4-16 -> P4-4    P9, P9-x, P3-32 -> P3-16   (P2b / P5-4 / P5-8 measured in wave 2;
       P3-32 refused at load on the release tree: no EP32 MegaMoE knob record)
-  P6-x are projected WITHOUT dispatch dedup (not implemented; measured dedup was slower).
+  P6-x are projected WITHOUT dispatch dedup (not implemented; measured dedup was slower). EP32 targets (P3-32, P6-32,
+  P9-32) split the analog's measured step into MegaMoE (vendored in-step = FI x 1.22 at EP16) and the rest, and take
+  the measured EP32-build MegaMoE row at their own tokens per rank for the MoE part (incl. the measured T16384 EP32
+  cliff, +21-30% vs EP16: a kernel issue, in the calibrated column only, never in the achievable model).
 Capacity: D1 / D2 / D3 / D3-32 take their measured r_max. TP-front and DEP layouts get an itemised transfer of D1's non-KV
   memory (workload.json hbm: gpu-memory-utilization 0.90, non-torch 23.97 GiB, activations 7.25 GiB, vision tower
   0.84 GiB, replicated latent/router where the model shards them, MoE-TP intermediate padding only for MoE-TP layouts)
@@ -88,6 +92,7 @@ def _load(p):
 
 DER = _load("inputs/derating.json")
 MOE_ROWS = _load("microbench/results/moe/rows.json")
+MOE_EP32_ROWS = _load("microbench/results/moe_ep32/rows.json")    # FI SM107 EP32 build a368c5f66: EP16 / EP28 / EP32
 
 
 def _lerp_log(pts, x):
@@ -107,6 +112,18 @@ def _lerp_log(pts, x):
 _MM = {}
 
 
+def megamoe_model_layer(ck, E, T, col="achievable"):
+    """This model's MegaMoE layer (s) at EP E and T tokens per rank (decode env below 4096 rows, prefill env above)."""
+    from topologies import Topo
+    if T < 4096:
+        t = Topo("mm-ep%d" % E, "MegaMoE probe", "decode", 4, "sp", "dcp", "rep", E)
+        env, ph = Mdl.env_decode(T, K, Dec.L_DEC), "decode"          # D3-type: rows per rank = 4T / 4 = T
+    else:
+        t = Topo("mm-ep%d" % E, "MegaMoE probe", "prefill", 1, "dep", "local", "rep", E)
+        env, ph = Mdl.env_prefill(T, Pre.L_REF), "prefill"
+    return cost.evaluate(t, ph, ck, col, env)["megamoe"]["layer"]
+
+
 def _row_layer(x):
     """This model's achievable MegaMoE layer (s) at a moe-lane row's shape."""
     ck, tid, reg = x["topology"].split("|")
@@ -120,15 +137,22 @@ def _row_layer(x):
 
 
 def megamoe_table(quant):
-    """{EP: [(tokens per rank, measured / model layer)]} from the moe-lane rows (no-dedup layouts only)."""
+    """{EP: [(tokens per rank, measured / model layer)]}: wave-1 moe-lane rows (EP8 / EP16, 6e438852b, no-dedup layouts)
+    plus the EP32-build rows (EP16 / EP28 / EP32, a368c5f66 = 6e438852b + EP32 support, bitwise equal and within 0.3% at
+    EP16); the median derate per (EP, T)."""
     if quant not in _MM:
         tab = {}
         for x in MOE_ROWS:
             if x["quant_kind"] != quant or x["topology"].split("|")[1].startswith("P6"):
                 continue
             lay, _ = _row_layer(x)
-            tab.setdefault(x["ep"], {})[x["tokens_per_rank"]] = x["measured_us"] * 1e-6 / lay
-        _MM[quant] = {ep: sorted(v.items()) for ep, v in tab.items()}
+            tab.setdefault(x["ep"], {}).setdefault(x["tokens_per_rank"], []).append(x["measured_us"] * 1e-6 / lay)
+        for x in MOE_EP32_ROWS:
+            if x["quant_kind"] != quant:
+                continue
+            lay = megamoe_model_layer(x["ckpt"], x["ep"], x["tokens_per_rank"])
+            tab.setdefault(x["ep"], {}).setdefault(x["tokens_per_rank"], []).append(x["measured_us"] * 1e-6 / lay)
+        _MM[quant] = {ep: sorted((T, sorted(v)[len(v) // 2]) for T, v in d.items()) for ep, d in tab.items()}
     return _MM[quant]
 
 
@@ -299,6 +323,13 @@ def prefill_path(tid):
     return tid if tid in PRE_MEASURED else PRE_ANALOG.get(tid)
 
 
+# vendored in-step megamoe_rubin / FI 6e438852b standalone at prefill (moe lane cross-lane note): EP8 T2048 742 vs
+# 511 us (1.45), EP16 T4096 1096 vs 901 us (1.22). Used only to split a measured prefill step into its MegaMoE part
+# and the rest when the target runs a different MegaMoE (EP32: only the FI EP32 build runs it; the release tree's
+# megamoe_rubin raises KnobLookupError at EP32).
+VENDORED_MEGAMOE_PREFILL = {8: 1.45, 16: 1.22}
+
+
 def prefill_calibrated(t, ck, F, L, f_req=None):
     """Calibrated fresh tok/s/GPU at chunk F (base variant). F above the path's largest measured chunk is tagged
     'extrapolated' (derate clamped)."""
@@ -314,8 +345,24 @@ def prefill_calibrated(t, ck, F, L, f_req=None):
     step = a["t_ms"] * d
     tag = "extrapolated" if cl else ("measured" if t.id == path and any(F == x[0] for x in tb["tab"]) and not nv
                                      else "projected")
-    out = dict(path=path, derate=d, F=F, f_req=f, t_ms=step, tok_s_gpu=F / (t.N * step * 1e-3),
-               ach_shipped_t_ms=a["t_ms"], dedup_removed=u is not t, tag=tag, Fmax_measured=tb["Fmax"])
+    comp = None
+    P = ALL[path]
+    if t.experts == "ep" and t.E != P.E and P.E in VENDORED_MEGAMOE_PREFILL:
+        # component transfer: the path's non-MegaMoE derate + the measured MegaMoE family of the target's EP
+        fp = min(tb["f"], F) if path.startswith("P4") else min(Pre.F_REQ, F)
+        ap = Pre.run_point(P, ck, "achievable", F, L, f_req=fp)
+        dmp, _ = megamoe_derate(ck, P.E, ap["rows_per_rank"])
+        mp = ap["experts_ms"] * dmp * VENDORED_MEGAMOE_PREFILL[P.E]
+        d_rest = (ap["t_ms"] * d - mp) / (ap["t_ms"] - ap["experts_ms"])
+        dmt, etag = megamoe_derate(ck, t.E, a["rows_per_rank"])
+        step = a["experts_ms"] * dmt + (a["t_ms"] - a["experts_ms"]) * d_rest
+        comp = dict(d_rest=d_rest, d_experts=dmt, experts_tag=etag, experts_ach_ms=a["experts_ms"],
+                    experts_kernel="FI SM107 EP32 build (measured)" if etag == "measured" else "transfer")
+        if etag == "extrapolated" and tag != "extrapolated":
+            tag = "extrapolated"
+    out = dict(path=path, derate=step / a["t_ms"], F=F, f_req=f, t_ms=step, tok_s_gpu=F / (t.N * step * 1e-3),
+               ach_shipped_t_ms=a["t_ms"], dedup_removed=u is not t, tag=tag, Fmax_measured=tb["Fmax"],
+               component=comp)
     if nv:
         out["transfer"] = "unmeasured transfer: NVFP4-act MoE rows of the release checkpoint"
     return out

@@ -92,6 +92,8 @@ def _run(t, ck, col, F, L, f_req, o1, o2, detail, moe_act=None):
                comm_raw={k: x * 1e3 for k, x in st["comm_raw"].items()},
                comp_ms=st["comp"] * 1e3, comm_ms=st["comm"] * 1e3, kern_ms=st["kern"] * 1e3,
                hops=st["hops"], n_comm=st["n_comm"], topk_select=res["topk_select"],
+               experts_ms=(res["megamoe"]["layer"] * 92 * (2 if o1 else 1) * 1e3) if res.get("megamoe") else 0.0,
+               rows_per_rank=env["T"] / t.N,
                flops_gpu=res["flops"] * (2 if o1 else 1), bytes_gpu=res["bytes"] * (2 if o1 else 1))
     if stages:
         out["stages"] = stages
