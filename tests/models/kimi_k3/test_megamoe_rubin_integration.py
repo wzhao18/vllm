@@ -705,3 +705,18 @@ def test_vendor_records_s1_token_comm():
     assert "sources/communication/nvlink_domain/token_comm.py" in manifest
     upstream = text.split("## Upstream", 1)[1].split("\n## ", 1)[0]
     assert "a368c5f66" in upstream and "S0/S1" in upstream
+
+
+@pytest.mark.parametrize("world", [28, 32])
+def test_wide_ep_decode_bucket_has_its_own_record(world):
+    """EP28/EP32 decode servers: inference kernel at every capacity, a 128-token
+    decode bucket with its own (N128) record below the main bucket."""
+    X.select_rubin_bucket.cache_clear()
+    problem = C.RubinMoeProblem(quant_kind=X.rubin_quant_kind(2048))
+    buckets, notes = X.select_rubin_buckets(problem, world, 2048, prefill_worker=False)
+    assert [b.max_tokens for b in buckets] == [X.RUBIN_WIDE_EP_DECODE_TOKENS, 2048]
+    assert all(b.variant == "inference" for b in buckets)
+    assert tuple(buckets[0].knobs.mma_tiler_mnk)[1] == 128
+    assert any("its own record" in n for n in notes)
+    prefill, _ = X.select_rubin_buckets(problem, world, 2048, prefill_worker=True)
+    assert [b.max_tokens for b in prefill] == [2048]

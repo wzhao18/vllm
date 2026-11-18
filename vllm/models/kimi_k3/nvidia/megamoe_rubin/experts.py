@@ -110,6 +110,13 @@ RUBIN_GENPHASE_MAX_TOKENS_PER_RANK = 1024
 # and keep their one bucket (no extra compile or arena).
 RUBIN_DECODE_BUCKET_MAX_ROUTES = 4096
 
+# Wide EP (RUBIN_INFERENCE_ONLY_EP_SIZES, the D3-32 decode role: SP shards of at most
+# 128 tokens per rank up to r32): the decode bucket is 128 tokens per rank with its own
+# record (N128 tile). Measured on the EP32 per-GPU shape (1 GPU, 28 experts, NVFP4,
+# FlashInfer a368c5f66, hint 64, CUDA graph): capacity 128 / N128 at 32 / 96 / 128
+# live tokens 44.9 / 47.8 / 50.7 us vs capacity 256 / N256 51.0 / 52.8 / 55.9 us.
+RUBIN_WIDE_EP_DECODE_TOKENS = 128
+
 
 def rubin_bucket_capacities(
     max_tokens_per_rank: int, top_k: int, *, prefill_worker: bool, world_size: int = 16
@@ -121,6 +128,8 @@ def rubin_bucket_capacities(
     if top_k <= 0:
         raise ValueError(f"top_k must be positive: {top_k}")
     decode = RUBIN_DECODE_BUCKET_MAX_ROUTES // top_k
+    if world_size in RUBIN_INFERENCE_ONLY_EP_SIZES:
+        decode = min(decode, RUBIN_WIDE_EP_DECODE_TOKENS)
     if (
         not prefill_worker
         and rubin_kernel_variant(max_tokens_per_rank, world_size) == "inference"
@@ -201,14 +210,16 @@ def select_rubin_buckets(
     caps = rubin_bucket_capacities(
         max_tokens, problem.top_k, prefill_worker=prefill_worker, world_size=world_size
     )
-    buckets = [RubinBucket(main.variant, cap, main.knobs) for cap in caps[:-1]]
+    if world_size in RUBIN_INFERENCE_ONLY_EP_SIZES:
+        # wide EP: the decode bucket takes its own record (per-shape tile)
+        buckets = [select_rubin_bucket(problem, world_size, cap)[0] for cap in caps[:-1]]
+        own = "its own record"
+    else:
+        buckets = [RubinBucket(main.variant, cap, main.knobs) for cap in caps[:-1]]
+        own = f"knobs of the {main.max_tokens} bucket"
     for bucket in buckets:
         RubinMoeConfig.make(problem, bucket, rank=0, world_size=world_size)
-    extra = tuple(
-        f"[{b.variant} {b.max_tokens}] decode bucket, knobs of the "
-        f"{main.max_tokens} bucket"
-        for b in buckets
-    )
+    extra = tuple(f"[{b.variant} {b.max_tokens}] decode bucket, {own}" for b in buckets)
     return (*buckets, main), notes + extra
 
 
