@@ -295,6 +295,49 @@ class SpOproj:
         note = f"sp oproj {tactic}" + (f" S{SPLITS}" if tactic == "warp" else "")
         return Choice(Path.GENERIC, tactic, note=note + " (NQ-TUNE)")
 
+    def pushes(self, rows: int) -> bool:
+        """Whether the owner kernel must push this rank's partial at ``rows`` (the
+        GEMM tactics stage it in ``comm.partial``; "warp" pushes from the GEMM)."""
+        return self.tactics[rows] != "warp"
+
+    def produce(self, attn_out: torch.Tensor, parity: int):
+        """The o-projection half only, for an owner kernel that follows
+        (``attn_res.sp_fused.SpReduceAttnRes``): the GEMM tactics write the partial
+        [R, 7168] into ``comm.partial`` and return it (the owner kernel pushes it);
+        "warp" pushes from the GEMM and returns None."""
+        rows = attn_out.shape[0]
+        tactic = self._checked(attn_out)
+        comm = self.comm
+        if tactic == "cublas":
+            partial = comm.partial[:rows]
+            torch.mm(attn_out, self.weight.t(), out=partial)
+            return partial
+        if tactic == "gemm":
+            partial = comm.partial[:rows]
+            self.gemm.run(attn_out, partial)
+            return partial
+        _, _, recv, peers = comm.views(parity)
+        self.codes[rows](
+            to_cute(attn_out), self.wview, recv, peers, Int32(comm.rank),
+            stream(self.weight.device),
+        )  # fmt: skip
+        return None
+
+    def _checked(self, attn_out):
+        rows = attn_out.shape[0]
+        tactic = self.tactics.get(rows)
+        if (
+            tactic is None
+            or attn_out.dtype != torch.bfloat16
+            or attn_out.shape[1] != self.k
+            or attn_out.stride() != (self.k, 1)
+        ):
+            raise Unsupported(
+                "oproj_rs", rows, f"attn_out {tuple(attn_out.shape)} stride "
+                f"{attn_out.stride()} {attn_out.dtype} (prepared: [R, {self.k}] BF16)",
+            )  # fmt: skip
+        return tactic
+
     def run(
         self, attn_out: torch.Tensor, out_shard: torch.Tensor, parity: int
     ) -> torch.Tensor:

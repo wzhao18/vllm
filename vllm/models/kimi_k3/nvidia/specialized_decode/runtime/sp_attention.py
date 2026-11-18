@@ -68,6 +68,7 @@ from vllm.models.common.ops.sequence_parallel import (
 
 from ...dense_draft import is_gqa_dspark
 from ...ops.attn_res import attn_res
+from ..cutedsl.attn_res.sp_fused import SpBoundary
 from ..cutedsl.common.sp_comm import SpComm
 from ..cutedsl.dsa.sp import SpDsaCore, sp_dsa_box, sp_dsa_scratch
 from ..cutedsl.gemm.decode import DecodeProjection
@@ -118,6 +119,37 @@ def sp_layer(decoder, step):
         )  # fmt: skip
 
 
+def sp_boundary(decoder, comm, block, rows):
+    """The layer's fused SP boundaries (``attn_res.sp_fused.SpBoundary``): the stock
+    ``_pre_attn_norm`` / ``_post_attn_norm`` weights, block pattern and epsilons."""
+    pre = (
+        (
+            decoder.self_attention_res_norm.weight,
+            decoder.self_attention_res_proj.weight,
+            decoder.input_layernorm.weight,
+        ),
+        (
+            decoder.self_attention_res_norm.variance_epsilon,
+            decoder.input_layernorm.variance_epsilon,
+        ),
+    )
+    post = (
+        (
+            decoder.mlp_res_norm.weight,
+            decoder.mlp_res_proj.weight,
+            decoder.post_attention_layernorm.weight,
+        ),
+        (
+            decoder.mlp_res_norm.variance_epsilon,
+            decoder.post_attention_layernorm.variance_epsilon,
+        ),
+    )
+    write = decoder.block_write_idx if decoder.is_block_write_layer else -1
+    pushes = {r: block.oproj.pushes(r) for r in rows}
+    n_max = rows[-1] // comm.tp
+    return SpBoundary(comm, pre, post, decoder.prev_valid_blocks, write, n_max, pushes)
+
+
 class SpAttentionBlock:
     """One DSA / KDA layer's all-gather -> in-projection -> core -> o_proj with its
     reduce-scatter (module docstring): ``run(x_shard [n, 7168])`` returns the layer's
@@ -166,6 +198,26 @@ class SpAttentionBlock:
         self.attn_out = step.scratch(f"attn_out.{self.width}", (cap, self.width))
         for parity in range(step.comm.parities):  # every tactic takes the operands
             self.projection.check_operands(step.comm.gather[parity], self.projected)
+
+    def attend(self, gathered, caches, metadata, step):
+        """In-projection + core over the all-gathered rows ``gathered`` [R, 7168]
+        (``attn_res.sp_fused.SpAttnResGather`` filled them), then the o-projection
+        half (``SpOproj.produce``): returns this rank's partial to push, or None when
+        the o-projection pushed it."""
+        rows = gathered.shape[0]
+        projected = self.projected[:rows]
+        self.projection.run(gathered, projected)
+        attn_out = self.attn_out[:rows]
+        if self.kind == "dsa":
+            indexer = get_forward_context().attn_metadata[self.index_prefix]
+            self.core.run(
+                projected, attn_out, cache=caches[0],
+                slots=step.slot_mapping[self.slots],
+                index_slots=indexer.slot_mapping, metadata=metadata, q=step.q,
+            )  # fmt: skip
+        else:
+            self.core.run(projected, attn_out, caches=caches, metadata=metadata)
+        return self.oproj.produce(attn_out, self.parity)
 
     def run(self, x_shard, caches, metadata, step):
         """``x_shard`` [n, 7168] BF16: the stock ``_pre_attn_norm`` output on this
@@ -311,6 +363,12 @@ class SpStep:
             d.layer_idx: SpAttentionBlock(d, self, ordinal)
             for ordinal, d in enumerate(layers)
         }
+        # Each layer's AttnRes pair fused with the SP all-gather / reduce-scatter
+        # (``attn_res.sp_fused``): two kernels per layer boundary instead of four.
+        self.bounds = {
+            d.layer_idx: sp_boundary(d, self.comm, self.blocks[d.layer_idx], rows)
+            for d in layers
+        }
         self.dense = any(not d.is_moe_layer for d in layers)
         self.moe = any(d.is_moe_layer for d in layers)
         # The MegaMoE layers' dense BF16 GEMMs on this rank's shard rows (sp_mlp).
@@ -362,7 +420,7 @@ class SpStep:
         method = getattr(spec, "rejection_sample_method", None)
         declared = {
             "embed": "stock VocabParallelEmbedding",
-            "attn_res": "stock attn_res on the shard",
+            "attn_res": "the final AttnRes: stock attn_res on the shard",
             "final_gather": "stock sp_all_gather",
             "lm_head": "stock",
             "sampler": "stock",
@@ -390,6 +448,10 @@ class SpStep:
         ctx = self.ctx
         for r in self.rows:
             choices = {"ag": self.comm.choice(r)}
+            choices["sp_boundary"] = Choice(
+                Path.GENERIC, "cluster",
+                note="AttnRes + SP AG / RS fused (attn_res.sp_fused)",
+            )  # fmt: skip
             for block in self.blocks.values():
                 for family, choice in block.choices(r).items():
                     choices.setdefault(family, choice)
@@ -473,16 +535,15 @@ class SpStep:
             (hidden.size(0), backbone.num_attn_res_blocks, hidden.size(1))
         )
         prefix_sum, hidden = hidden, None
+        # The prefix sum is updated in place (the embedding shard first): the fused
+        # boundaries store each updated / new prefix row into it.
         for layer, md in zip(self.layers, step.metadata):
             index = layer.layer_idx
-            hidden, prefix_sum, residual = layer._pre_attn_norm(
-                hidden, residual, prefix_sum
-            )
-            block = self.blocks[index]
-            hidden = block.run(hidden, caches_of(layer.self_attn), md, step)
-            hidden, prefix_sum, residual = layer._post_attn_norm(
-                hidden, residual, prefix_sum
-            )
+            block, bound = self.blocks[index], self.bounds[index]
+            gathered = bound.gather(hidden, prefix_sum, residual, block.parity)
+            partial = block.attend(gathered, caches_of(layer.self_attn), md, step)
+            out = prefix_sum.new_empty(prefix_sum.shape)
+            hidden = bound.reduce(prefix_sum, residual, out, block.parity, partial)
             mlp = self.mlps.get(index)
             hidden = layer.mlp(hidden) if mlp is None else mlp.run(hidden)
             if index + 1 in self.aux_layers:
